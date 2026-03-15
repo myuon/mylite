@@ -1485,6 +1485,14 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		if idx.Info.Type == sqlparser.IndexTypePrimary {
 			primaryKeys = nil
 			primaryKeys = append(primaryKeys, idxCols...)
+			// Mark PK columns as NOT NULL (PRIMARY KEY implies NOT NULL)
+			for i, col := range columns {
+				for _, pk := range idxCols {
+					if col.Name == pk {
+						columns[i].Nullable = false
+					}
+				}
+			}
 		} else {
 			isUnique := idx.Info.Type == sqlparser.IndexTypeUnique
 			idxName := idx.Info.Name.String()
@@ -6345,6 +6353,48 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		return e.evalFuncExprWithRow(v, row)
 	case *sqlparser.CaseExpr:
 		return e.evalCaseExprWithRow(v, row)
+	case *sqlparser.ConvertExpr:
+		// CAST(expr AS type) with row context
+		val, err := e.evalRowExpr(v.Expr, row)
+		if err != nil {
+			return nil, err
+		}
+		if v.Type == nil {
+			return val, nil
+		}
+		typeName := strings.ToUpper(v.Type.Type)
+		switch typeName {
+		case "SIGNED", "INT", "INTEGER", "BIGINT":
+			return toInt64(val), nil
+		case "UNSIGNED":
+			return toInt64(val), nil
+		case "CHAR", "VARCHAR", "TEXT":
+			return toString(val), nil
+		case "DECIMAL", "FLOAT", "DOUBLE":
+			return toFloat(val), nil
+		}
+		return val, nil
+	case *sqlparser.CastExpr:
+		// CAST(expr AS type) with row context (CastExpr variant)
+		val, err := e.evalRowExpr(v.Expr, row)
+		if err != nil {
+			return nil, err
+		}
+		if v.Type == nil {
+			return val, nil
+		}
+		typeName := strings.ToUpper(v.Type.Type)
+		switch typeName {
+		case "SIGNED", "INT", "INTEGER", "BIGINT":
+			return toInt64(val), nil
+		case "UNSIGNED":
+			return toInt64(val), nil
+		case "CHAR", "VARCHAR", "TEXT":
+			return toString(val), nil
+		case "DECIMAL", "FLOAT", "DOUBLE":
+			return toFloat(val), nil
+		}
+		return val, nil
 	case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg:
 		// For HAVING clause: look up the aggregate display name in the row
 		displayName := aggregateDisplayName(expr)
@@ -8786,7 +8836,12 @@ func parseLoadDataSQL(query string) (*loadDataOptions, error) {
 		if fieldsIdx >= 0 {
 			afterFields := query[fieldsIdx:]
 			afterFieldsUpper := upper[fieldsIdx:]
-			termIdx := strings.Index(afterFieldsUpper, "TERMINATED BY")
+			// Limit FIELDS clause search to before LINES keyword
+			fieldsSection := afterFieldsUpper
+			if linesPos := strings.Index(afterFieldsUpper, "LINES"); linesPos >= 0 {
+				fieldsSection = afterFieldsUpper[:linesPos]
+			}
+			termIdx := strings.Index(fieldsSection, "TERMINATED BY")
 			if termIdx >= 0 {
 				pos := fieldsIdx + termIdx + len("TERMINATED BY")
 				for pos < len(query) && query[pos] == ' ' {
@@ -9053,8 +9108,11 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 					}
 				}
 			}
-			// Coerce date/time values to match column type (e.g. truncate datetime to date)
+			// Coerce date/time values and pad BINARY columns
 			if v, exists := row[colDef.Name]; exists && v != nil {
+				if padLen := binaryPadLength(colDef.Type); padLen > 0 {
+					v = padBinaryValue(v, padLen)
+				}
 				row[colDef.Name] = coerceDateTimeValue(colDef.Type, v)
 			}
 		}
@@ -9173,7 +9231,7 @@ func (e *Executor) applyLoadDataSet(setExprs string, row storage.Row, varMap map
 			if varVal == nil {
 				exprStr = strings.ReplaceAll(exprStr, varName, "NULL")
 			} else {
-				exprStr = strings.ReplaceAll(exprStr, varName, fmt.Sprintf("%v", varVal))
+				exprStr = strings.ReplaceAll(exprStr, varName, fmt.Sprintf("'%v'", varVal))
 			}
 		}
 		selectSQL := fmt.Sprintf("SELECT %s", exprStr)
@@ -9287,10 +9345,10 @@ func (e *Executor) execSelectIntoOutfile(into *sqlparser.SelectInto, colNames []
 					if !fieldsOptEnclosed {
 						sb.WriteString(fieldsEnclosedBy + s + fieldsEnclosedBy)
 					} else {
-						if _, err := strconv.ParseFloat(s, 64); err != nil {
-							sb.WriteString(fieldsEnclosedBy + s + fieldsEnclosedBy)
-						} else {
+						if isNonStringOutfileValue(s) {
 							sb.WriteString(s)
+						} else {
+							sb.WriteString(fieldsEnclosedBy + s + fieldsEnclosedBy)
 						}
 					}
 				} else {
@@ -9305,14 +9363,43 @@ func (e *Executor) execSelectIntoOutfile(into *sqlparser.SelectInto, colNames []
 	}
 
 	dir := filepath.Dir(fileName)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("cannot create directory for outfile: %v", err)
+	if errDir := os.MkdirAll(dir, 0755); errDir != nil {
+		return nil, fmt.Errorf("cannot create directory for outfile: %v", errDir)
 	}
 	if err := os.WriteFile(fileName, []byte(sb.String()), 0644); err != nil {
 		return nil, fmt.Errorf("cannot write outfile: %v", err)
 	}
 
 	return &Result{AffectedRows: uint64(len(rows))}, nil
+}
+
+// isNonStringOutfileValue returns true if the value should NOT be enclosed
+// by OPTIONALLY ENCLOSED BY. MySQL only encloses string (CHAR/VARCHAR/TEXT) columns;
+// numeric, date, time, datetime, timestamp, and year values are not enclosed.
+func isNonStringOutfileValue(s string) bool {
+	// Numeric values
+	if _, err := strconv.ParseFloat(s, 64); err == nil {
+		return true
+	}
+	// Date: YYYY-MM-DD
+	if _, err := time.Parse("2006-01-02", s); err == nil {
+		return true
+	}
+	// Time: HH:MM:SS
+	if _, err := time.Parse("15:04:05", s); err == nil {
+		return true
+	}
+	// Datetime/Timestamp: YYYY-MM-DD HH:MM:SS
+	if _, err := time.Parse("2006-01-02 15:04:05", s); err == nil {
+		return true
+	}
+	// Year: 4-digit
+	if len(s) == 4 {
+		if _, err := strconv.Atoi(s); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // execCreateFunction handles CREATE FUNCTION name(params) RETURNS type BEGIN...END
