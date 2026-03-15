@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
@@ -28,13 +29,21 @@ type txSavepoint struct {
 	catalogSnap map[string]map[string]*catalog.TableDef
 }
 
+// fullSnapshot holds a complete snapshot of all databases for MYLITE SNAPSHOT commands.
+type fullSnapshot struct {
+	storageSnap map[string]*storage.DatabaseSnapshot
+	catalogSnap map[string]map[string]*catalog.TableDef
+}
+
 // Executor handles SQL execution.
 type Executor struct {
-	Catalog       *catalog.Catalog
-	Storage       *storage.Engine
-	CurrentDB     string
-	inTransaction bool
-	savepoint     *txSavepoint
+	Catalog        *catalog.Catalog
+	Storage        *storage.Engine
+	CurrentDB      string
+	inTransaction  bool
+	savepoint      *txSavepoint
+	snapshots      map[string]*fullSnapshot
+	lastInsertID   int64
 }
 
 func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
@@ -42,11 +51,19 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		Catalog:   cat,
 		Storage:   store,
 		CurrentDB: "test",
+		snapshots: make(map[string]*fullSnapshot),
 	}
 }
 
 // Execute parses and executes a SQL statement.
 func (e *Executor) Execute(query string) (*Result, error) {
+	// Handle MYLITE control commands before passing to the SQL parser.
+	trimmed := strings.TrimSpace(query)
+	upper := strings.ToUpper(trimmed)
+	if strings.HasPrefix(upper, "MYLITE ") {
+		return e.execMyliteCommand(trimmed)
+	}
+
 	stmt, err := sqlparser.NewTestParser().Parse(query)
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %v", err)
@@ -296,6 +313,84 @@ func (e *Executor) execRollback() (*Result, error) {
 	return &Result{}, nil
 }
 
+// execMyliteCommand handles MYLITE-specific control commands:
+//   - MYLITE CREATE SNAPSHOT <name>
+//   - MYLITE RESTORE SNAPSHOT <name>
+//   - MYLITE DROP SNAPSHOT <name>
+func (e *Executor) execMyliteCommand(query string) (*Result, error) {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	// Strip leading "MYLITE " prefix (7 chars).
+	rest := strings.TrimSpace(query[7:])
+	restUpper := strings.TrimSpace(upper[7:])
+
+	if strings.HasPrefix(restUpper, "CREATE SNAPSHOT ") {
+		name := strings.TrimSpace(rest[len("CREATE SNAPSHOT "):])
+		if name == "" {
+			return nil, fmt.Errorf("MYLITE CREATE SNAPSHOT: missing snapshot name")
+		}
+		snap := &fullSnapshot{
+			storageSnap: make(map[string]*storage.DatabaseSnapshot),
+			catalogSnap: make(map[string]map[string]*catalog.TableDef),
+		}
+		for dbName, db := range e.Catalog.Databases {
+			snap.storageSnap[dbName] = e.Storage.SnapshotDatabase(dbName)
+			tablesCopy := make(map[string]*catalog.TableDef, len(db.Tables))
+			for tName, tDef := range db.Tables {
+				tablesCopy[tName] = tDef
+			}
+			snap.catalogSnap[dbName] = tablesCopy
+		}
+		e.snapshots[name] = snap
+		return &Result{}, nil
+	}
+
+	if strings.HasPrefix(restUpper, "RESTORE SNAPSHOT ") {
+		name := strings.TrimSpace(rest[len("RESTORE SNAPSHOT "):])
+		if name == "" {
+			return nil, fmt.Errorf("MYLITE RESTORE SNAPSHOT: missing snapshot name")
+		}
+		snap, ok := e.snapshots[name]
+		if !ok {
+			return nil, fmt.Errorf("MYLITE RESTORE SNAPSHOT: snapshot '%s' not found", name)
+		}
+		// Remove databases created after snapshot.
+		for dbName := range e.Catalog.Databases {
+			if _, existed := snap.catalogSnap[dbName]; !existed {
+				delete(e.Catalog.Databases, dbName)
+				e.Storage.DropDatabase(dbName)
+			}
+		}
+		// Restore each snapshotted database.
+		for dbName, tables := range snap.catalogSnap {
+			db, ok := e.Catalog.Databases[dbName]
+			if !ok {
+				e.Catalog.Databases[dbName] = &catalog.Database{
+					Name:   dbName,
+					Tables: make(map[string]*catalog.TableDef),
+				}
+				db = e.Catalog.Databases[dbName]
+			}
+			db.Tables = tables
+			e.Storage.RestoreDatabase(dbName, snap.storageSnap[dbName])
+		}
+		return &Result{}, nil
+	}
+
+	if strings.HasPrefix(restUpper, "DROP SNAPSHOT ") {
+		name := strings.TrimSpace(rest[len("DROP SNAPSHOT "):])
+		if name == "" {
+			return nil, fmt.Errorf("MYLITE DROP SNAPSHOT: missing snapshot name")
+		}
+		if _, ok := e.snapshots[name]; !ok {
+			return nil, fmt.Errorf("MYLITE DROP SNAPSHOT: snapshot '%s' not found", name)
+		}
+		delete(e.snapshots, name)
+		return &Result{}, nil
+	}
+
+	return nil, fmt.Errorf("unknown MYLITE command: %s", query)
+}
+
 func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	tableName := stmt.Table.TableNameString()
 
@@ -322,6 +417,22 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		return nil, fmt.Errorf("unsupported INSERT format")
 	}
 
+	// Collect primary key column names and unique key column names from the table def.
+	var pkCols []string
+	var uniqueCols []string
+	for _, col := range tbl.Def.Columns {
+		if col.PrimaryKey {
+			pkCols = append(pkCols, col.Name)
+		}
+		if col.Unique {
+			uniqueCols = append(uniqueCols, col.Name)
+		}
+	}
+	// Also use PrimaryKey slice from the TableDef (set from table-level PRIMARY KEY constraint).
+	if len(pkCols) == 0 && len(tbl.Def.PrimaryKey) > 0 {
+		pkCols = tbl.Def.PrimaryKey
+	}
+
 	var lastInsertID int64
 	var affected uint64
 
@@ -331,11 +442,33 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			if i >= len(colNames) {
 				break
 			}
-			v, err := evalExpr(val)
+			v, err := e.evalExpr(val)
 			if err != nil {
 				return nil, err
 			}
 			row[colNames[i]] = v
+		}
+
+		// ON DUPLICATE KEY UPDATE: check for existing row with matching PK or UNIQUE key.
+		if len(stmt.OnDup) > 0 {
+			dupIdx := e.findDuplicateRow(tbl, row, pkCols, uniqueCols)
+			if dupIdx >= 0 {
+				// Apply the ON DUPLICATE KEY UPDATE expressions to the existing row.
+				tbl.Lock()
+				for _, upd := range stmt.OnDup {
+					colName := upd.Name.Name.String()
+					val, err := e.evalExpr(upd.Expr)
+					if err != nil {
+						tbl.Unlock()
+						return nil, err
+					}
+					tbl.Rows[dupIdx][colName] = val
+				}
+				tbl.Unlock()
+				// MySQL counts ON DUPLICATE KEY UPDATE as 2 affected rows when a row is updated.
+				affected += 2
+				continue
+			}
 		}
 
 		id, err := tbl.Insert(row)
@@ -346,10 +479,50 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		affected++
 	}
 
+	e.lastInsertID = lastInsertID
 	return &Result{
 		AffectedRows: affected,
 		InsertID:     uint64(lastInsertID),
 	}, nil
+}
+
+// findDuplicateRow returns the index of an existing row in tbl that has the same
+// primary key or unique key value as the candidate row. Returns -1 if no duplicate found.
+func (e *Executor) findDuplicateRow(tbl *storage.Table, candidate storage.Row, pkCols, uniqueCols []string) int {
+	tbl.Mu.RLock()
+	defer tbl.Mu.RUnlock()
+
+	for i, existing := range tbl.Rows {
+		// Check primary key match.
+		if len(pkCols) > 0 {
+			match := true
+			for _, col := range pkCols {
+				cv, cok := candidate[col]
+				ev, eok := existing[col]
+				if !cok || !eok || cv == nil || ev == nil {
+					match = false
+					break
+				}
+				if fmt.Sprintf("%v", cv) != fmt.Sprintf("%v", ev) {
+					match = false
+					break
+				}
+			}
+			if match {
+				return i
+			}
+		}
+		// Check unique key match (single-column unique keys).
+		for _, col := range uniqueCols {
+			cv, cok := candidate[col]
+			ev, eok := existing[col]
+			if cok && eok && cv != nil && ev != nil &&
+				fmt.Sprintf("%v", cv) == fmt.Sprintf("%v", ev) {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 // buildFromExpr builds rows from any TableExpr (AliasedTableExpr or JoinTableExpr).
@@ -361,6 +534,10 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 		alias, tableName, err := extractTableAliasFromAliased(te)
 		if err != nil {
 			return nil, err
+		}
+		// Handle MySQL's virtual DUAL table: one empty row, no columns.
+		if strings.ToLower(tableName) == "dual" {
+			return []storage.Row{{}}, nil
 		}
 		tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
 		if err != nil {
@@ -417,7 +594,7 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 
 			// Evaluate ON condition
 			if join.Condition != nil && join.Condition.On != nil {
-				match, err := evalWhere(join.Condition.On, combined)
+				match, err := e.evalWhere(join.Condition.On, combined)
 				if err != nil {
 					return nil, err
 				}
@@ -480,7 +657,7 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	if stmt.Where != nil {
 		filtered := make([]storage.Row, 0)
 		for _, row := range allRows {
-			match, err := evalWhere(stmt.Where.Expr, row)
+			match, err := e.evalWhere(stmt.Where.Expr, row)
 			if err != nil {
 				return nil, err
 			}
@@ -509,7 +686,7 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	for _, row := range allRows {
 		resultRow := make([]interface{}, len(colExprs))
 		for i, expr := range colExprs {
-			val, err := evalRowExpr(expr, row)
+			val, err := e.evalRowExpr(expr, row)
 			if err != nil {
 				return nil, err
 			}
@@ -638,7 +815,7 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 			for i, col := range colNames {
 				havingRow[col] = row[i]
 			}
-			match, err := evalWhere(stmt.Having.Expr, havingRow)
+			match, err := e.evalWhere(stmt.Having.Expr, havingRow)
 			if err != nil {
 				return nil, err
 			}
@@ -828,7 +1005,7 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 			}
 			colNames = append(colNames, name)
 
-			v, err := evalExpr(se.Expr)
+			v, err := e.evalExpr(se.Expr)
 			if err != nil {
 				return nil, err
 			}
@@ -871,7 +1048,7 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 	for i, row := range tbl.Rows {
 		match := true
 		if stmt.Where != nil {
-			m, err := evalWhere(stmt.Where.Expr, row)
+			m, err := e.evalWhere(stmt.Where.Expr, row)
 			if err != nil {
 				return nil, err
 			}
@@ -883,7 +1060,7 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 
 		for _, upd := range stmt.Exprs {
 			colName := upd.Name.Name.String()
-			val, err := evalExpr(upd.Expr)
+			val, err := e.evalExpr(upd.Expr)
 			if err != nil {
 				return nil, err
 			}
@@ -922,7 +1099,7 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 	for _, row := range tbl.Rows {
 		match := true
 		if stmt.Where != nil {
-			m, err := evalWhere(stmt.Where.Expr, row)
+			m, err := e.evalWhere(stmt.Where.Expr, row)
 			if err != nil {
 				return nil, err
 			}
@@ -1157,7 +1334,10 @@ func (e *Executor) resolveSelectColumns(exprs []sqlparser.SelectExpr, def *catal
 	return cols, nil
 }
 
-func evalExpr(expr sqlparser.Expr) (interface{}, error) {
+// evalExpr evaluates a SQL expression that does not depend on a row context.
+// It is a method on *Executor so that functions like LAST_INSERT_ID() and
+// DATABASE() can access executor state.
+func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	switch v := expr.(type) {
 	case *sqlparser.Literal:
 		switch v.Type {
@@ -1167,7 +1347,7 @@ func evalExpr(expr sqlparser.Expr) (interface{}, error) {
 				return nil, err
 			}
 			return n, nil
-		case sqlparser.FloatVal:
+		case sqlparser.FloatVal, sqlparser.DecimalVal:
 			f, err := strconv.ParseFloat(v.Val, 64)
 			if err != nil {
 				return nil, err
@@ -1193,12 +1373,26 @@ func evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return "mylite", nil
 		case "version":
 			return "8.4.0-mylite", nil
+		case "max_allowed_packet":
+			return int64(67108864), nil
+		case "character_set_client":
+			return "utf8mb4", nil
+		case "character_set_connection":
+			return "utf8mb4", nil
+		case "character_set_results":
+			return "utf8mb4", nil
+		case "collation_connection":
+			return "utf8mb4_general_ci", nil
+		case "sql_mode":
+			return "", nil
+		case "autocommit":
+			return int64(1), nil
 		}
 		return "", nil
 	case *sqlparser.Default:
 		return nil, nil
 	case *sqlparser.UnaryExpr:
-		val, err := evalExpr(v.Expr)
+		val, err := e.evalExpr(v.Expr)
 		if err != nil {
 			return nil, err
 		}
@@ -1211,62 +1405,692 @@ func evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			}
 		}
 		return val, nil
+	case *sqlparser.FuncExpr:
+		return e.evalFuncExpr(v)
+	case *sqlparser.ConvertExpr:
+		// CAST(expr AS type)
+		val, err := e.evalExpr(v.Expr)
+		if err != nil {
+			return nil, err
+		}
+		if v.Type == nil {
+			return val, nil
+		}
+		typeName := strings.ToUpper(v.Type.Type)
+		switch typeName {
+		case "SIGNED", "INT", "INTEGER", "BIGINT":
+			return toInt64(val), nil
+		case "UNSIGNED":
+			return toInt64(val), nil
+		case "CHAR", "VARCHAR", "TEXT":
+			return toString(val), nil
+		case "DECIMAL", "FLOAT", "DOUBLE":
+			return toFloat(val), nil
+		}
+		return val, nil
+	case *sqlparser.CaseExpr:
+		return e.evalCaseExpr(v)
+	case *sqlparser.BinaryExpr:
+		left, err := e.evalExpr(v.Left)
+		if err != nil {
+			return nil, err
+		}
+		right, err := e.evalExpr(v.Right)
+		if err != nil {
+			return nil, err
+		}
+		return evalBinaryExpr(left, right, v.Operator)
+	case *sqlparser.ComparisonExpr:
+		// Allow comparison expressions to be used as boolean values (e.g. in IF args)
+		left, err := e.evalExpr(v.Left)
+		if err != nil {
+			return nil, err
+		}
+		right, err := e.evalExpr(v.Right)
+		if err != nil {
+			return nil, err
+		}
+		result, err := compareValues(left, right, v.Operator)
+		if err != nil {
+			return nil, err
+		}
+		if result {
+			return int64(1), nil
+		}
+		return int64(0), nil
+	case *sqlparser.TrimFuncExpr:
+		// TRIM / LTRIM / RTRIM parsed as TrimFuncExpr
+		val, err := e.evalExpr(v.StringArg)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		s := toString(val)
+		switch v.TrimFuncType {
+		case sqlparser.LTrimType:
+			return strings.TrimLeft(s, " \t\n\r"), nil
+		case sqlparser.RTrimType:
+			return strings.TrimRight(s, " \t\n\r"), nil
+		default: // NormalTrimType
+			if v.TrimArg != nil {
+				// TRIM(trimChar FROM str) - trim specific char
+				trimVal, err := e.evalExpr(v.TrimArg)
+				if err != nil {
+					return nil, err
+				}
+				trimStr := toString(trimVal)
+				switch v.Type {
+				case sqlparser.LeadingTrimType:
+					return strings.TrimLeft(s, trimStr), nil
+				case sqlparser.TrailingTrimType:
+					return strings.TrimRight(s, trimStr), nil
+				default: // Both
+					return strings.Trim(s, trimStr), nil
+				}
+			}
+			return strings.TrimSpace(s), nil
+		}
+	case *sqlparser.SubstrExpr:
+		// SUBSTRING(str, from, to) parsed as SubstrExpr
+		strVal, err := e.evalExpr(v.Name)
+		if err != nil {
+			return nil, err
+		}
+		if strVal == nil {
+			return nil, nil
+		}
+		s := []rune(toString(strVal))
+		posVal, err := e.evalExpr(v.From)
+		if err != nil {
+			return nil, err
+		}
+		pos := int(toInt64(posVal))
+		if pos > 0 {
+			pos-- // 1-based to 0-based
+		} else if pos < 0 {
+			pos = len(s) + pos
+		}
+		if pos < 0 {
+			pos = 0
+		}
+		if pos >= len(s) {
+			return "", nil
+		}
+		if v.To != nil {
+			lenVal, err := e.evalExpr(v.To)
+			if err != nil {
+				return nil, err
+			}
+			length := int(toInt64(lenVal))
+			if length <= 0 {
+				return "", nil
+			}
+			end := pos + length
+			if end > len(s) {
+				end = len(s)
+			}
+			return string(s[pos:end]), nil
+		}
+		return string(s[pos:]), nil
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
 }
 
-func evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error) {
-	switch v := expr.(type) {
-	case *sqlparser.ComparisonExpr:
-		left, err := evalRowExpr(v.Left, row)
+// evalFuncExpr handles MySQL built-in function calls.
+func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
+	name := strings.ToLower(v.Name.String())
+	switch name {
+	case "last_insert_id":
+		if len(v.Exprs) > 0 {
+			val, err := e.evalExpr(v.Exprs[0])
+			if err != nil {
+				return nil, err
+			}
+			e.lastInsertID = toInt64(val)
+			return e.lastInsertID, nil
+		}
+		return e.lastInsertID, nil
+	case "now", "current_timestamp", "sysdate":
+		return time.Now().Format("2006-01-02 15:04:05"), nil
+	case "curdate", "current_date":
+		return time.Now().Format("2006-01-02"), nil
+	case "curtime", "current_time":
+		return time.Now().Format("15:04:05"), nil
+	case "database", "schema":
+		return e.CurrentDB, nil
+	case "version":
+		return "8.4.0-mylite", nil
+	case "concat":
+		var sb strings.Builder
+		for _, argExpr := range v.Exprs {
+			val, err := e.evalExpr(argExpr)
+			if err != nil {
+				return nil, err
+			}
+			if val == nil {
+				return nil, nil // CONCAT with NULL returns NULL
+			}
+			sb.WriteString(toString(val))
+		}
+		return sb.String(), nil
+	case "concat_ws":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		sepVal, err := e.evalExpr(v.Exprs[0])
 		if err != nil {
-			return false, err
+			return nil, err
 		}
-		right, err := evalRowExpr(v.Right, row)
+		if sepVal == nil {
+			return nil, nil
+		}
+		sep := toString(sepVal)
+		var parts []string
+		for _, argExpr := range v.Exprs[1:] {
+			val, err := e.evalExpr(argExpr)
+			if err != nil {
+				return nil, err
+			}
+			if val == nil {
+				continue // CONCAT_WS skips NULLs
+			}
+			parts = append(parts, toString(val))
+		}
+		return strings.Join(parts, sep), nil
+	case "ifnull", "nvl":
+		if len(v.Exprs) < 2 {
+			return nil, fmt.Errorf("IFNULL requires 2 arguments")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
 		if err != nil {
-			return false, err
+			return nil, err
 		}
-		return compareValues(left, right, v.Operator)
-	case *sqlparser.AndExpr:
-		l, err := evalWhere(v.Left, row)
+		if val != nil {
+			return val, nil
+		}
+		return e.evalExpr(v.Exprs[1])
+	case "coalesce":
+		for _, argExpr := range v.Exprs {
+			val, err := e.evalExpr(argExpr)
+			if err != nil {
+				return nil, err
+			}
+			if val != nil {
+				return val, nil
+			}
+		}
+		return nil, nil
+	case "if":
+		if len(v.Exprs) < 3 {
+			return nil, fmt.Errorf("IF requires 3 arguments")
+		}
+		cond, err := e.evalExpr(v.Exprs[0])
 		if err != nil {
-			return false, err
+			return nil, err
 		}
-		r, err := evalWhere(v.Right, row)
+		if isTruthy(cond) {
+			return e.evalExpr(v.Exprs[1])
+		}
+		return e.evalExpr(v.Exprs[2])
+	case "upper", "ucase":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("UPPER requires 1 argument")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
 		if err != nil {
-			return false, err
+			return nil, err
 		}
-		return l && r, nil
-	case *sqlparser.OrExpr:
-		l, err := evalWhere(v.Left, row)
+		if val == nil {
+			return nil, nil
+		}
+		return strings.ToUpper(toString(val)), nil
+	case "lower", "lcase":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("LOWER requires 1 argument")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
 		if err != nil {
-			return false, err
+			return nil, err
 		}
-		r, err := evalWhere(v.Right, row)
+		if val == nil {
+			return nil, nil
+		}
+		return strings.ToLower(toString(val)), nil
+	case "length", "octet_length":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("LENGTH requires 1 argument")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
 		if err != nil {
-			return false, err
+			return nil, err
 		}
-		return l || r, nil
-	case *sqlparser.IsExpr:
-		val, err := evalRowExpr(v.Left, row)
+		if val == nil {
+			return nil, nil
+		}
+		return int64(len(toString(val))), nil
+	case "char_length", "character_length":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("CHAR_LENGTH requires 1 argument")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
 		if err != nil {
-			return false, err
+			return nil, err
 		}
-		switch v.Right {
-		case sqlparser.IsNullOp:
-			return val == nil, nil
-		case sqlparser.IsNotNullOp:
-			return val != nil, nil
-		case sqlparser.IsTrueOp:
-			return val == true || val == int64(1), nil
-		case sqlparser.IsFalseOp:
-			return val == false || val == int64(0), nil
+		if val == nil {
+			return nil, nil
 		}
+		return int64(len([]rune(toString(val)))), nil
+	case "substring", "substr", "mid":
+		if len(v.Exprs) < 2 {
+			return nil, fmt.Errorf("SUBSTRING requires at least 2 arguments")
+		}
+		strVal, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if strVal == nil {
+			return nil, nil
+		}
+		s := []rune(toString(strVal))
+		posVal, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		pos := int(toInt64(posVal))
+		// MySQL positions are 1-based; negative positions count from end
+		if pos > 0 {
+			pos-- // convert to 0-based
+		} else if pos < 0 {
+			pos = len(s) + pos
+		}
+		if pos < 0 {
+			pos = 0
+		}
+		if pos >= len(s) {
+			return "", nil
+		}
+		if len(v.Exprs) >= 3 {
+			lenVal, err := e.evalExpr(v.Exprs[2])
+			if err != nil {
+				return nil, err
+			}
+			length := int(toInt64(lenVal))
+			if length <= 0 {
+				return "", nil
+			}
+			end := pos + length
+			if end > len(s) {
+				end = len(s)
+			}
+			return string(s[pos:end]), nil
+		}
+		return string(s[pos:]), nil
+	case "trim":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("TRIM requires 1 argument")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		return strings.TrimSpace(toString(val)), nil
+	case "ltrim":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("LTRIM requires 1 argument")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		return strings.TrimLeft(toString(val), " \t\n\r"), nil
+	case "rtrim":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("RTRIM requires 1 argument")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		return strings.TrimRight(toString(val), " \t\n\r"), nil
+	case "replace":
+		if len(v.Exprs) < 3 {
+			return nil, fmt.Errorf("REPLACE requires 3 arguments")
+		}
+		strVal, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		fromVal, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		toVal, err := e.evalExpr(v.Exprs[2])
+		if err != nil {
+			return nil, err
+		}
+		if strVal == nil {
+			return nil, nil
+		}
+		return strings.ReplaceAll(toString(strVal), toString(fromVal), toString(toVal)), nil
+	case "left":
+		if len(v.Exprs) < 2 {
+			return nil, fmt.Errorf("LEFT requires 2 arguments")
+		}
+		strVal, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if strVal == nil {
+			return nil, nil
+		}
+		lenVal, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		s := []rune(toString(strVal))
+		n := int(toInt64(lenVal))
+		if n <= 0 {
+			return "", nil
+		}
+		if n > len(s) {
+			n = len(s)
+		}
+		return string(s[:n]), nil
+	case "right":
+		if len(v.Exprs) < 2 {
+			return nil, fmt.Errorf("RIGHT requires 2 arguments")
+		}
+		strVal, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if strVal == nil {
+			return nil, nil
+		}
+		lenVal, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		s := []rune(toString(strVal))
+		n := int(toInt64(lenVal))
+		if n <= 0 {
+			return "", nil
+		}
+		if n > len(s) {
+			n = len(s)
+		}
+		return string(s[len(s)-n:]), nil
+	case "abs":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("ABS requires 1 argument")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		f := toFloat(val)
+		if f < 0 {
+			f = -f
+		}
+		if f == float64(int64(f)) {
+			return int64(f), nil
+		}
+		return f, nil
+	case "floor":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("FLOOR requires 1 argument")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		f := toFloat(val)
+		return int64(f), nil
+	case "ceil", "ceiling":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("CEIL requires 1 argument")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		f := toFloat(val)
+		n := int64(f)
+		if float64(n) < f {
+			n++
+		}
+		return n, nil
+	case "round":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("ROUND requires at least 1 argument")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		f := toFloat(val)
+		decimals := int64(0)
+		if len(v.Exprs) >= 2 {
+			dv, err := e.evalExpr(v.Exprs[1])
+			if err != nil {
+				return nil, err
+			}
+			decimals = toInt64(dv)
+		}
+		if decimals == 0 {
+			return int64(f + 0.5), nil
+		}
+		factor := 1.0
+		for i := int64(0); i < decimals; i++ {
+			factor *= 10
+		}
+		return float64(int64(f*factor+0.5)) / factor, nil
+	case "mod":
+		if len(v.Exprs) < 2 {
+			return nil, fmt.Errorf("MOD requires 2 arguments")
+		}
+		v0, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		v1, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		if v0 == nil || v1 == nil {
+			return nil, nil
+		}
+		d := toInt64(v1)
+		if d == 0 {
+			return nil, nil
+		}
+		return toInt64(v0) % d, nil
+	case "isnull":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("ISNULL requires 1 argument")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return int64(1), nil
+		}
+		return int64(0), nil
+	case "nullif":
+		if len(v.Exprs) < 2 {
+			return nil, fmt.Errorf("NULLIF requires 2 arguments")
+		}
+		v0, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		v1, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		if fmt.Sprintf("%v", v0) == fmt.Sprintf("%v", v1) {
+			return nil, nil
+		}
+		return v0, nil
 	}
-	return false, fmt.Errorf("unsupported WHERE expression: %T", expr)
+	// Unknown function: return nil rather than error to be lenient
+	return nil, fmt.Errorf("unsupported function: %s", name)
 }
 
-func evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{}, error) {
+// evalCaseExpr handles CASE expressions.
+func (e *Executor) evalCaseExpr(v *sqlparser.CaseExpr) (interface{}, error) {
+	var baseVal interface{}
+	if v.Expr != nil {
+		var err error
+		baseVal, err = e.evalExpr(v.Expr)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, when := range v.Whens {
+		condVal, err := e.evalExpr(when.Cond)
+		if err != nil {
+			return nil, err
+		}
+		matched := false
+		if v.Expr != nil {
+			// Simple CASE: compare base to each WHEN value
+			matched = fmt.Sprintf("%v", baseVal) == fmt.Sprintf("%v", condVal)
+		} else {
+			// Searched CASE: each WHEN is a boolean expression
+			matched = isTruthy(condVal)
+		}
+		if matched {
+			return e.evalExpr(when.Val)
+		}
+	}
+	if v.Else != nil {
+		return e.evalExpr(v.Else)
+	}
+	return nil, nil
+}
+
+// evalBinaryExpr evaluates arithmetic binary expressions.
+func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator) (interface{}, error) {
+	lf := toFloat(left)
+	rf := toFloat(right)
+	var result float64
+	switch op {
+	case sqlparser.PlusOp:
+		result = lf + rf
+	case sqlparser.MinusOp:
+		result = lf - rf
+	case sqlparser.MultOp:
+		result = lf * rf
+	case sqlparser.DivOp:
+		if rf == 0 {
+			return nil, nil // MySQL returns NULL for division by zero
+		}
+		result = lf / rf
+	case sqlparser.IntDivOp:
+		if rf == 0 {
+			return nil, nil
+		}
+		return int64(lf / rf), nil
+	case sqlparser.ModOp:
+		if rf == 0 {
+			return nil, nil
+		}
+		return int64(lf) % int64(rf), nil
+	default:
+		return nil, fmt.Errorf("unsupported binary operator: %v", op)
+	}
+	if result == float64(int64(result)) {
+		return int64(result), nil
+	}
+	return result, nil
+}
+
+// toString converts a value to string.
+func toString(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	switch val := v.(type) {
+	case string:
+		return val
+	case int64:
+		return strconv.FormatInt(val, 10)
+	case float64:
+		return strconv.FormatFloat(val, 'f', -1, 64)
+	case bool:
+		if val {
+			return "1"
+		}
+		return "0"
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+// toInt64 converts a value to int64.
+func toInt64(v interface{}) int64 {
+	switch n := v.(type) {
+	case int64:
+		return n
+	case float64:
+		return int64(n)
+	case string:
+		i, _ := strconv.ParseInt(n, 10, 64)
+		return i
+	case bool:
+		if n {
+			return 1
+		}
+		return 0
+	}
+	return 0
+}
+
+// isTruthy returns true if the value is considered truthy in MySQL.
+func isTruthy(v interface{}) bool {
+	if v == nil {
+		return false
+	}
+	switch val := v.(type) {
+	case bool:
+		return val
+	case int64:
+		return val != 0
+	case float64:
+		return val != 0
+	case string:
+		return val != "" && val != "0"
+	}
+	return false
+}
+
+// evalRowExpr evaluates an expression in the context of a table row.
+// It handles column lookups and delegates other expressions to e.evalExpr.
+func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{}, error) {
 	switch v := expr.(type) {
 	case *sqlparser.ColName:
 		colName := v.Name.String()
@@ -1284,8 +2108,74 @@ func evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{}, error) {
 		}
 		return val, nil
 	default:
-		return evalExpr(expr)
+		return e.evalExpr(expr)
 	}
+}
+
+// evalRowExpr is a package-level shim for backward-compatible callers that
+// do not have access to an executor.  It creates a temporary executor with
+// empty state, which is sufficient for column-lookup and literal evaluation.
+func evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{}, error) {
+	e := &Executor{}
+	return e.evalRowExpr(expr, row)
+}
+
+// evalWhere evaluates a WHERE predicate against a row.
+func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error) {
+	switch v := expr.(type) {
+	case *sqlparser.ComparisonExpr:
+		left, err := e.evalRowExpr(v.Left, row)
+		if err != nil {
+			return false, err
+		}
+		right, err := e.evalRowExpr(v.Right, row)
+		if err != nil {
+			return false, err
+		}
+		return compareValues(left, right, v.Operator)
+	case *sqlparser.AndExpr:
+		l, err := e.evalWhere(v.Left, row)
+		if err != nil {
+			return false, err
+		}
+		r, err := e.evalWhere(v.Right, row)
+		if err != nil {
+			return false, err
+		}
+		return l && r, nil
+	case *sqlparser.OrExpr:
+		l, err := e.evalWhere(v.Left, row)
+		if err != nil {
+			return false, err
+		}
+		r, err := e.evalWhere(v.Right, row)
+		if err != nil {
+			return false, err
+		}
+		return l || r, nil
+	case *sqlparser.IsExpr:
+		val, err := e.evalRowExpr(v.Left, row)
+		if err != nil {
+			return false, err
+		}
+		switch v.Right {
+		case sqlparser.IsNullOp:
+			return val == nil, nil
+		case sqlparser.IsNotNullOp:
+			return val != nil, nil
+		case sqlparser.IsTrueOp:
+			return val == true || val == int64(1), nil
+		case sqlparser.IsFalseOp:
+			return val == false || val == int64(0), nil
+		}
+	}
+	return false, fmt.Errorf("unsupported WHERE expression: %T", expr)
+}
+
+// evalWhere is a package-level shim for backward-compatible callers.
+func evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error) {
+	e := &Executor{}
+	return e.evalWhere(expr, row)
 }
 
 func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator) (bool, error) {
@@ -1380,7 +2270,9 @@ func applyLimit(limit *sqlparser.Limit, rows [][]interface{}) ([][]interface{}, 
 		return rows, nil
 	}
 
-	lim, err := evalExpr(limit.Rowcount)
+	// Use a bare executor: LIMIT values are always literals.
+	e := &Executor{}
+	lim, err := e.evalExpr(limit.Rowcount)
 	if err != nil {
 		return nil, err
 	}
@@ -1391,7 +2283,7 @@ func applyLimit(limit *sqlparser.Limit, rows [][]interface{}) ([][]interface{}, 
 
 	offset := int64(0)
 	if limit.Offset != nil {
-		off, err := evalExpr(limit.Offset)
+		off, err := e.evalExpr(limit.Offset)
 		if err != nil {
 			return nil, err
 		}

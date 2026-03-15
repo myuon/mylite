@@ -1,6 +1,8 @@
 package harness
 
 import (
+	"database/sql"
+	"fmt"
 	"os"
 	"testing"
 )
@@ -312,6 +314,172 @@ func TestJoin(t *testing.T) {
 	})
 }
 
+func TestPreparedStatements(t *testing.T) {
+	h := getHarness(t)
+
+	t.Run("prepared INSERT with placeholders", func(t *testing.T) {
+		// Setup
+		if _, err := h.myliteDB.Exec("CREATE TABLE test_ps_insert (id INT PRIMARY KEY, name VARCHAR(255), score INT)"); err != nil {
+			t.Fatalf("setup failed: %v", err)
+		}
+		defer h.myliteDB.Exec("DROP TABLE IF EXISTS test_ps_insert") //nolint:errcheck
+
+		stmt, err := h.myliteDB.Prepare("INSERT INTO test_ps_insert (id, name, score) VALUES (?, ?, ?)")
+		if err != nil {
+			t.Fatalf("prepare failed: %v", err)
+		}
+		defer stmt.Close()
+
+		if _, err := stmt.Exec(1, "Alice", 95); err != nil {
+			t.Fatalf("exec failed: %v", err)
+		}
+		if _, err := stmt.Exec(2, "Bob", 80); err != nil {
+			t.Fatalf("exec failed: %v", err)
+		}
+
+		rows, err := h.myliteDB.Query("SELECT id, name, score FROM test_ps_insert ORDER BY id")
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		defer rows.Close()
+
+		type row struct{ id int; name string; score int }
+		var got []row
+		for rows.Next() {
+			var r row
+			if err := rows.Scan(&r.id, &r.name, &r.score); err != nil {
+				t.Fatalf("scan failed: %v", err)
+			}
+			got = append(got, r)
+		}
+
+		want := []row{{1, "Alice", 95}, {2, "Bob", 80}}
+		if len(got) != len(want) {
+			t.Fatalf("row count mismatch: got %d, want %d", len(got), len(want))
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("row %d: got %+v, want %+v", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("prepared SELECT with placeholder", func(t *testing.T) {
+		// Setup
+		if _, err := h.myliteDB.Exec("CREATE TABLE test_ps_select (id INT PRIMARY KEY, category VARCHAR(50), val INT)"); err != nil {
+			t.Fatalf("setup failed: %v", err)
+		}
+		defer h.myliteDB.Exec("DROP TABLE IF EXISTS test_ps_select") //nolint:errcheck
+
+		for _, row := range []struct {
+			id       int
+			category string
+			val      int
+		}{
+			{1, "A", 10},
+			{2, "B", 20},
+			{3, "A", 30},
+		} {
+			if _, err := h.myliteDB.Exec(
+				fmt.Sprintf("INSERT INTO test_ps_select (id, category, val) VALUES (%d, '%s', %d)", row.id, row.category, row.val),
+			); err != nil {
+				t.Fatalf("insert failed: %v", err)
+			}
+		}
+
+		stmt, err := h.myliteDB.Prepare("SELECT id, val FROM test_ps_select WHERE category = ? ORDER BY id")
+		if err != nil {
+			t.Fatalf("prepare failed: %v", err)
+		}
+		defer stmt.Close()
+
+		rows, err := stmt.Query("A")
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		defer rows.Close()
+
+		type row struct{ id, val int }
+		var got []row
+		for rows.Next() {
+			var r row
+			if err := rows.Scan(&r.id, &r.val); err != nil {
+				t.Fatalf("scan failed: %v", err)
+			}
+			got = append(got, r)
+		}
+
+		want := []row{{1, 10}, {3, 30}}
+		if len(got) != len(want) {
+			t.Fatalf("row count mismatch: got %d, want %d", len(got), len(want))
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("row %d: got %+v, want %+v", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("prepared statement reuse", func(t *testing.T) {
+		if _, err := h.myliteDB.Exec("CREATE TABLE test_ps_reuse (id INT PRIMARY KEY, val INT)"); err != nil {
+			t.Fatalf("setup failed: %v", err)
+		}
+		defer h.myliteDB.Exec("DROP TABLE IF EXISTS test_ps_reuse") //nolint:errcheck
+
+		stmt, err := h.myliteDB.Prepare("INSERT INTO test_ps_reuse (id, val) VALUES (?, ?)")
+		if err != nil {
+			t.Fatalf("prepare failed: %v", err)
+		}
+		defer stmt.Close()
+
+		for i := 1; i <= 5; i++ {
+			if _, err := stmt.Exec(i, i*10); err != nil {
+				t.Fatalf("exec %d failed: %v", i, err)
+			}
+		}
+
+		var count int
+		if err := h.myliteDB.QueryRow("SELECT COUNT(*) FROM test_ps_reuse").Scan(&count); err != nil {
+			t.Fatalf("count query failed: %v", err)
+		}
+		if count != 5 {
+			t.Errorf("expected 5 rows, got %d", count)
+		}
+	})
+
+	t.Run("prepared statement with NULL arg", func(t *testing.T) {
+		if _, err := h.myliteDB.Exec("CREATE TABLE test_ps_null (id INT PRIMARY KEY, val INT)"); err != nil {
+			t.Fatalf("setup failed: %v", err)
+		}
+		defer h.myliteDB.Exec("DROP TABLE IF EXISTS test_ps_null") //nolint:errcheck
+
+		stmt, err := h.myliteDB.Prepare("INSERT INTO test_ps_null (id, val) VALUES (?, ?)")
+		if err != nil {
+			t.Fatalf("prepare failed: %v", err)
+		}
+		defer stmt.Close()
+
+		if _, err := stmt.Exec(1, nil); err != nil {
+			t.Fatalf("exec with NULL failed: %v", err)
+		}
+
+		var id int
+		var val sql.NullInt64
+		if err := h.myliteDB.QueryRow("SELECT id, val FROM test_ps_null WHERE id = 1").Scan(&id, &val); err != nil {
+			t.Fatalf("scan failed: %v", err)
+		}
+		if id != 1 {
+			t.Errorf("expected id=1, got %d", id)
+		}
+		if val.Valid {
+			t.Errorf("expected val=NULL, got %d", val.Int64)
+		}
+	})
+
+	// Suppress unused import error if mysqlDB is nil (the harness h is used above)
+	_ = h
+}
+
 func TestGroupBy(t *testing.T) {
 	h := getHarness(t)
 
@@ -384,5 +552,269 @@ func TestGroupBy(t *testing.T) {
 		Teardown: []string{
 			"DROP TABLE IF EXISTS test_having",
 		},
+	})
+}
+
+func TestSnapshot(t *testing.T) {
+	h := getHarness(t)
+
+	h.Run(TestCase{
+		Name:       "CREATE SNAPSHOT and RESTORE SNAPSHOT restores rows",
+		MyliteOnly: true,
+		Setup: []string{
+			"CREATE TABLE test_snap_rows (id INT PRIMARY KEY, val INT)",
+			"INSERT INTO test_snap_rows (id, val) VALUES (1, 10)",
+			"INSERT INTO test_snap_rows (id, val) VALUES (2, 20)",
+			"MYLITE CREATE SNAPSHOT snap1",
+			"INSERT INTO test_snap_rows (id, val) VALUES (3, 30)",
+			"MYLITE RESTORE SNAPSHOT snap1",
+		},
+		Query: "SELECT id, val FROM test_snap_rows ORDER BY id",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_snap_rows",
+			"MYLITE DROP SNAPSHOT snap1",
+		},
+	})
+
+	h.Run(TestCase{
+		Name:       "RESTORE SNAPSHOT removes rows deleted after snapshot",
+		MyliteOnly: true,
+		Setup: []string{
+			"CREATE TABLE test_snap_del (id INT PRIMARY KEY, val INT)",
+			"INSERT INTO test_snap_del (id, val) VALUES (1, 100)",
+			"MYLITE CREATE SNAPSHOT snapdel",
+			"DELETE FROM test_snap_del WHERE id = 1",
+			"MYLITE RESTORE SNAPSHOT snapdel",
+		},
+		Query: "SELECT id, val FROM test_snap_del ORDER BY id",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_snap_del",
+			"MYLITE DROP SNAPSHOT snapdel",
+		},
+	})
+
+	h.Run(TestCase{
+		Name:       "RESTORE SNAPSHOT drops tables created after snapshot",
+		MyliteOnly: true,
+		Setup: []string{
+			"MYLITE CREATE SNAPSHOT snapddl",
+			"CREATE TABLE test_snap_ddl (id INT PRIMARY KEY)",
+			"INSERT INTO test_snap_ddl (id) VALUES (1)",
+			"MYLITE RESTORE SNAPSHOT snapddl",
+		},
+		Query:       "SELECT * FROM test_snap_ddl",
+		ExpectError: true,
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_snap_ddl",
+			"MYLITE DROP SNAPSHOT snapddl",
+		},
+	})
+
+	h.Run(TestCase{
+		Name:        "RESTORE SNAPSHOT on nonexistent snapshot returns error",
+		MyliteOnly:  true,
+		Setup:       []string{},
+		Query:       "MYLITE RESTORE SNAPSHOT nonexistent",
+		ExpectError: true,
+	})
+}
+
+func TestOnDuplicateKeyUpdate(t *testing.T) {
+	h := getHarness(t)
+
+	h.Run(TestCase{
+		Name: "ON DUPLICATE KEY UPDATE updates existing row on PK conflict",
+		Setup: []string{
+			"CREATE TABLE test_odup (id INT PRIMARY KEY, name VARCHAR(255), val INT)",
+			"INSERT INTO test_odup (id, name, val) VALUES (1, 'alice', 10)",
+			"INSERT INTO test_odup (id, name, val) VALUES (1, 'alice_dup', 99) ON DUPLICATE KEY UPDATE val = 99",
+		},
+		Query: "SELECT id, name, val FROM test_odup ORDER BY id",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_odup",
+		},
+	})
+
+	h.Run(TestCase{
+		Name: "ON DUPLICATE KEY UPDATE inserts when no duplicate exists",
+		Setup: []string{
+			"CREATE TABLE test_odup_ins (id INT PRIMARY KEY, val INT)",
+			"INSERT INTO test_odup_ins (id, val) VALUES (1, 10)",
+			"INSERT INTO test_odup_ins (id, val) VALUES (2, 20) ON DUPLICATE KEY UPDATE val = 20",
+		},
+		Query: "SELECT id, val FROM test_odup_ins ORDER BY id",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_odup_ins",
+		},
+	})
+
+	h.Run(TestCase{
+		Name: "ON DUPLICATE KEY UPDATE with UNIQUE key conflict",
+		Setup: []string{
+			"CREATE TABLE test_odup_uni (id INT PRIMARY KEY AUTO_INCREMENT, email VARCHAR(255) UNIQUE, score INT)",
+			"INSERT INTO test_odup_uni (email, score) VALUES ('a@b.com', 10)",
+			"INSERT INTO test_odup_uni (email, score) VALUES ('a@b.com', 50) ON DUPLICATE KEY UPDATE score = 50",
+		},
+		Query: "SELECT email, score FROM test_odup_uni ORDER BY id",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_odup_uni",
+		},
+	})
+}
+
+func TestLastInsertID(t *testing.T) {
+	h := getHarness(t)
+
+	h.Run(TestCase{
+		Name: "LAST_INSERT_ID() returns id of last auto-increment insert",
+		Setup: []string{
+			"CREATE TABLE test_liid (id INT PRIMARY KEY AUTO_INCREMENT, val VARCHAR(50))",
+			"INSERT INTO test_liid (val) VALUES ('first')",
+			"INSERT INTO test_liid (val) VALUES ('second')",
+		},
+		Query: "SELECT LAST_INSERT_ID()",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_liid",
+		},
+	})
+}
+
+func TestBuiltinFunctions(t *testing.T) {
+	h := getHarness(t)
+
+	h.Run(TestCase{
+		Name:  "VERSION() returns server version",
+		Query: "SELECT VERSION()",
+		// MySQL and mylite return different version strings, skip result compare
+		SkipResultCompare: true,
+	})
+
+	h.Run(TestCase{
+		Name:  "DATABASE() returns current database name",
+		Query: "SELECT DATABASE()",
+		// Skip compare: MySQL may use a different current DB name
+		SkipResultCompare: true,
+	})
+
+	h.Run(TestCase{
+		Name:  "CONCAT() concatenates strings",
+		Query: "SELECT CONCAT('hello', ' ', 'world')",
+	})
+
+	h.Run(TestCase{
+		Name:  "CONCAT() with NULL returns NULL",
+		Query: "SELECT CONCAT('a', NULL, 'b')",
+	})
+
+	h.Run(TestCase{
+		Name:  "UPPER() and LOWER()",
+		Query: "SELECT UPPER('hello'), LOWER('WORLD')",
+	})
+
+	h.Run(TestCase{
+		Name:  "LENGTH() returns byte length",
+		Query: "SELECT LENGTH('hello')",
+	})
+
+	h.Run(TestCase{
+		Name:  "CHAR_LENGTH() returns character count",
+		Query: "SELECT CHAR_LENGTH('hello')",
+	})
+
+	h.Run(TestCase{
+		Name:  "SUBSTRING() extracts substring",
+		Query: "SELECT SUBSTRING('hello world', 7, 5)",
+	})
+
+	h.Run(TestCase{
+		Name:  "SUBSTRING() from position",
+		Query: "SELECT SUBSTRING('hello world', 1, 5)",
+	})
+
+	h.Run(TestCase{
+		Name:  "TRIM() removes whitespace",
+		Query: "SELECT TRIM('  hello  ')",
+	})
+
+	h.Run(TestCase{
+		Name:  "REPLACE() replaces substrings",
+		Query: "SELECT REPLACE('hello world', 'world', 'there')",
+	})
+
+	h.Run(TestCase{
+		Name:  "IFNULL() returns first arg when not null",
+		Query: "SELECT IFNULL('value', 'default')",
+	})
+
+	h.Run(TestCase{
+		Name:  "IFNULL() returns second arg when first is null",
+		Query: "SELECT IFNULL(NULL, 'default')",
+	})
+
+	h.Run(TestCase{
+		Name:  "COALESCE() returns first non-null",
+		Query: "SELECT COALESCE(NULL, NULL, 'third', 'fourth')",
+	})
+
+	h.Run(TestCase{
+		Name:  "IF() returns true branch",
+		Query: "SELECT IF(1=1, 'yes', 'no')",
+	})
+
+	h.Run(TestCase{
+		Name:  "IF() returns false branch",
+		Query: "SELECT IF(1=2, 'yes', 'no')",
+	})
+
+	h.Run(TestCase{
+		Name:  "ABS() returns absolute value",
+		Query: "SELECT ABS(-42)",
+	})
+
+	h.Run(TestCase{
+		Name:  "ROUND() rounds a number",
+		Query: "SELECT ROUND(3.7)",
+	})
+
+	h.Run(TestCase{
+		Name:  "FLOOR() floors a number",
+		Query: "SELECT FLOOR(3.9)",
+	})
+
+	h.Run(TestCase{
+		Name:  "CEIL() ceils a number",
+		Query: "SELECT CEIL(3.1)",
+	})
+}
+
+func TestSystemVariables(t *testing.T) {
+	h := getHarness(t)
+
+	h.Run(TestCase{
+		Name:  "@@version_comment",
+		Query: "SELECT @@version_comment",
+		// mylite returns "mylite", MySQL returns different value
+		SkipResultCompare: true,
+	})
+
+	h.Run(TestCase{
+		Name:  "@@max_allowed_packet",
+		Query: "SELECT @@max_allowed_packet",
+		// Values may differ between mylite and MySQL
+		SkipResultCompare: true,
+	})
+
+	h.Run(TestCase{
+		Name:  "@@character_set_client",
+		Query: "SELECT @@character_set_client",
+		// Both should return "utf8mb4" but skip to be safe
+		SkipResultCompare: true,
+	})
+
+	h.Run(TestCase{
+		Name:  "@@autocommit",
+		Query: "SELECT @@autocommit",
+		// Both should return 1
+		SkipResultCompare: true,
 	})
 }

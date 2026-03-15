@@ -30,6 +30,9 @@ type TestCase struct {
 	SkipResultCompare bool
 	// ExpectError indicates the query should produce an error on both sides.
 	ExpectError bool
+	// MyliteOnly skips running setup/query/teardown against real MySQL.
+	// Use this for MYLITE-specific commands that are not valid MySQL SQL.
+	MyliteOnly bool
 }
 
 // QueryResult holds the result of executing a query.
@@ -133,12 +136,14 @@ func (h *Harness) Close() {
 // Run executes a test case against both databases and compares results.
 func (h *Harness) Run(tc TestCase) {
 	h.t.Run(tc.Name, func(t *testing.T) {
+		useMySQL := h.mysqlDB != nil && !tc.MyliteOnly
+
 		// Run setup
 		for _, stmt := range tc.Setup {
 			if _, err := h.myliteDB.Exec(stmt); err != nil {
 				t.Fatalf("mylite setup failed: %s: %v", stmt, err)
 			}
-			if h.mysqlDB != nil {
+			if useMySQL {
 				if _, err := h.mysqlDB.Exec(stmt); err != nil {
 					t.Fatalf("mysql setup failed: %s: %v", stmt, err)
 				}
@@ -149,7 +154,7 @@ func (h *Harness) Run(tc TestCase) {
 		defer func() {
 			for _, stmt := range tc.Teardown {
 				h.myliteDB.Exec(stmt) //nolint:errcheck
-				if h.mysqlDB != nil {
+				if useMySQL {
 					h.mysqlDB.Exec(stmt) //nolint:errcheck
 				}
 			}
@@ -170,7 +175,7 @@ func (h *Harness) Run(tc TestCase) {
 		}
 
 		// Compare with MySQL if available
-		if h.mysqlDB != nil {
+		if useMySQL {
 			mysqlResult := executeQuery(h.mysqlDB, tc.Query)
 			t.Logf("mysql result: columns=%v, rows=%d, error=%v", mysqlResult.Columns, len(mysqlResult.Rows), mysqlResult.Error)
 

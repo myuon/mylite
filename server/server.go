@@ -4,12 +4,18 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	gomysql "github.com/go-mysql-org/go-mysql/server"
 	"github.com/myuon/mylite/executor"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
+
 
 // Server is the MySQL-compatible server.
 type Server struct {
@@ -27,10 +33,15 @@ func New(exec *executor.Executor, addr string) *Server {
 	}
 }
 
+// stmtCounter is a global monotonically increasing ID for prepared statements.
+var stmtCounter uint64
+
 // Handler implements go-mysql server.Handler interface.
 type Handler struct {
-	exec *executor.Executor
-	mu   sync.Mutex
+	exec     *executor.Executor
+	mu       sync.Mutex
+	stmtsMu  sync.Mutex
+	stmts    map[uint64]string
 }
 
 func (h *Handler) UseDB(dbName string) error {
@@ -64,15 +75,147 @@ func (h *Handler) HandleFieldList(table string, fieldWildcard string) ([]*mysql.
 }
 
 func (h *Handler) HandleStmtPrepare(query string) (int, int, interface{}, error) {
-	return 0, 0, nil, fmt.Errorf("prepared statements not yet supported")
+	// Count ? placeholders to get param count
+	paramCount := strings.Count(query, "?")
+
+	// Determine column count by parsing the query (without executing it).
+	// Replace ? with a literal placeholder value so the parser can handle it.
+	parseQuery := strings.ReplaceAll(query, "?", "0")
+	columnCount := 0
+	if stmt, err := sqlparser.NewTestParser().Parse(parseQuery); err == nil {
+		if sel, ok := stmt.(*sqlparser.Select); ok {
+			// For star, we can't know without executing; use 1 as a conservative estimate.
+			// Most drivers only use columnCount to pre-allocate, so an over/under-estimate is tolerable.
+			columnCount = len(sel.SelectExprs.Exprs)
+		}
+	}
+
+	// Assign a unique ID and store the query
+	stmtID := atomic.AddUint64(&stmtCounter, 1)
+	h.stmtsMu.Lock()
+	if h.stmts == nil {
+		h.stmts = make(map[uint64]string)
+	}
+	h.stmts[stmtID] = query
+	h.stmtsMu.Unlock()
+
+	return paramCount, columnCount, stmtID, nil
 }
 
 func (h *Handler) HandleStmtExecute(context interface{}, query string, args []interface{}) (*mysql.Result, error) {
-	return nil, fmt.Errorf("prepared statements not yet supported")
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	stmtID, ok := context.(uint64)
+	if !ok {
+		return nil, fmt.Errorf("invalid prepared statement context")
+	}
+
+	h.stmtsMu.Lock()
+	storedQuery, found := h.stmts[stmtID]
+	h.stmtsMu.Unlock()
+	if !found {
+		return nil, fmt.Errorf("prepared statement not found")
+	}
+
+	// Replace ? placeholders with the provided argument values
+	finalQuery := replacePlaceholders(storedQuery, args)
+
+	result, err := h.exec.Execute(finalQuery)
+	if err != nil {
+		return nil, fmt.Errorf("ERROR 1064 (42000): %v", err)
+	}
+
+	if result.IsResultSet {
+		return resultToMySQLBinary(result)
+	}
+
+	return &mysql.Result{
+		AffectedRows: result.AffectedRows,
+		InsertId:     result.InsertID,
+	}, nil
 }
 
 func (h *Handler) HandleStmtClose(context interface{}) error {
+	stmtID, ok := context.(uint64)
+	if !ok {
+		return nil
+	}
+	h.stmtsMu.Lock()
+	delete(h.stmts, stmtID)
+	h.stmtsMu.Unlock()
 	return nil
+}
+
+// replacePlaceholders substitutes ? markers in a SQL query with the provided args
+// converted to SQL literal strings. It iterates through the query character by character,
+// replacing each ? with the next argument value.
+func replacePlaceholders(query string, args []interface{}) string {
+	var sb strings.Builder
+	argIdx := 0
+	for i := 0; i < len(query); i++ {
+		if query[i] == '?' && argIdx < len(args) {
+			sb.WriteString(argToSQL(args[argIdx]))
+			argIdx++
+		} else {
+			sb.WriteByte(query[i])
+		}
+	}
+	return sb.String()
+}
+
+// argToSQL converts a Go interface value to a SQL literal string.
+// Values passed by the go-mysql library include mysql.TypedBytes for string/blob types
+// and various integer types depending on the MySQL column type.
+func argToSQL(v interface{}) string {
+	if v == nil {
+		return "NULL"
+	}
+	switch val := v.(type) {
+	case mysql.TypedBytes:
+		// String, varchar, blob, date, datetime, etc. come as TypedBytes.
+		escaped := strings.ReplaceAll(string(val.Bytes), "'", "''")
+		return "'" + escaped + "'"
+	case int64:
+		return strconv.FormatInt(val, 10)
+	case int32:
+		return strconv.FormatInt(int64(val), 10)
+	case int16:
+		return strconv.FormatInt(int64(val), 10)
+	case int8:
+		return strconv.FormatInt(int64(val), 10)
+	case int:
+		return strconv.Itoa(val)
+	case uint64:
+		return strconv.FormatUint(val, 10)
+	case uint32:
+		return strconv.FormatUint(uint64(val), 10)
+	case uint16:
+		return strconv.FormatUint(uint64(val), 10)
+	case uint8:
+		return strconv.FormatUint(uint64(val), 10)
+	case float64:
+		return strconv.FormatFloat(val, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(val), 'f', -1, 32)
+	case bool:
+		if val {
+			return "1"
+		}
+		return "0"
+	case string:
+		// Escape single quotes within the string
+		escaped := strings.ReplaceAll(val, "'", "''")
+		return "'" + escaped + "'"
+	case []byte:
+		escaped := strings.ReplaceAll(string(val), "'", "''")
+		return "'" + escaped + "'"
+	case time.Time:
+		return "'" + val.Format("2006-01-02 15:04:05") + "'"
+	default:
+		escaped := strings.ReplaceAll(fmt.Sprintf("%v", val), "'", "''")
+		return "'" + escaped + "'"
+	}
 }
 
 func (h *Handler) HandleOtherCommand(cmd byte, data []byte) error {
@@ -134,6 +277,32 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return
 		}
 	}
+}
+
+// resultToMySQLBinary builds a mysql.Result using binary row encoding,
+// required for responses to COM_STMT_EXECUTE (prepared statement execute).
+func resultToMySQLBinary(result *executor.Result) (*mysql.Result, error) {
+	if len(result.Rows) == 0 {
+		r, err := mysql.BuildSimpleResultset(
+			makeFields(result.Columns),
+			[][]interface{}{},
+			true,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return &mysql.Result{Resultset: r}, nil
+	}
+
+	r, err := mysql.BuildSimpleResultset(
+		makeFields(result.Columns),
+		result.Rows,
+		true,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &mysql.Result{Resultset: r}, nil
 }
 
 func resultToMySQL(result *executor.Result) (*mysql.Result, error) {
