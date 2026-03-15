@@ -264,6 +264,33 @@ func (ctx *execContext) executeLines(lines []string) error {
 
 			// Strip inline comments (# outside quotes)
 			t = stripInlineComment(t)
+
+			// When using a custom delimiter, check if this line is a DELIMITER directive
+			// that happens to end with the current delimiter (e.g., "DELIMITER ;//" when delim is "//")
+			if ctx.delimiter != "" && delim != ";" {
+				tLower := strings.ToLower(t)
+				if strings.HasPrefix(tLower, "delimiter ") {
+					// This is a DELIMITER directive, not a SQL statement
+					// Extract the new delimiter value by stripping the current delimiter suffix
+					newDelimVal := t
+					if strings.HasSuffix(newDelimVal, delim) {
+						newDelimVal = newDelimVal[:len(newDelimVal)-len(delim)]
+					}
+					newDelimVal = strings.TrimSpace(newDelimVal[len("delimiter "):])
+					if newDelimVal == ";" {
+						ctx.delimiter = ""
+					} else {
+						ctx.delimiter = newDelimVal
+					}
+					delim = ";"
+					if ctx.delimiter != "" {
+						delim = ctx.delimiter
+					}
+					i++
+					break
+				}
+			}
+
 			rawLines = append(rawLines, t)
 
 			if strings.HasSuffix(t, delim) {
@@ -381,7 +408,15 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		return true, false, ctx.sourceFile(args)
 
 	case "delimiter":
-		ctx.delimiter = strings.TrimSpace(args)
+		newDelim := strings.TrimSpace(args)
+		// If the current delimiter is non-standard and the args end with it,
+		// strip the current delimiter suffix (e.g., ";//" when delimiter is "//" -> ";")
+		if ctx.delimiter != "" && ctx.delimiter != ";" {
+			if strings.HasSuffix(newDelim, ctx.delimiter) {
+				newDelim = strings.TrimSpace(newDelim[:len(newDelim)-len(ctx.delimiter)])
+			}
+		}
+		ctx.delimiter = newDelim
 		if ctx.delimiter == ";" {
 			ctx.delimiter = ""
 		}

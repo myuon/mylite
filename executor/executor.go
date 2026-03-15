@@ -188,16 +188,33 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	// Normalize SQL type aliases that vitess parser doesn't support
 	query = normalizeTypeAliases(query)
 
+	// Handle CREATE TRIGGER before vitess parser (it cannot parse triggers)
+	if strings.HasPrefix(upper, "CREATE TRIGGER") {
+		return e.execCreateTrigger(trimmed)
+	}
+	// Handle DROP TRIGGER
+	if strings.HasPrefix(upper, "DROP TRIGGER") {
+		return e.execDropTrigger(trimmed)
+	}
+	// Handle CREATE PROCEDURE (with BEGIN...END body that vitess can't parse)
+	if strings.HasPrefix(upper, "CREATE PROCEDURE") && strings.Contains(upper, "BEGIN") {
+		return e.execCreateProcedure(trimmed)
+	}
+	// Handle DROP PROCEDURE with IF EXISTS (vitess may not parse all variants)
+	if strings.HasPrefix(upper, "DROP PROCEDURE") {
+		return e.execDropProcedureFallback(trimmed)
+	}
+	// Handle CALL procedure
+	if strings.HasPrefix(upper, "CALL ") {
+		return e.execCallProcedure(trimmed)
+	}
+
 	stmt, err := sqlparser.NewTestParser().Parse(query)
 	if err != nil {
 		// Accept statements that Vitess parser doesn't support
 		if strings.HasPrefix(upper, "SET ") ||
 			strings.HasPrefix(upper, "DROP FUNCTION") ||
 			strings.HasPrefix(upper, "CREATE FUNCTION") ||
-			strings.HasPrefix(upper, "DROP PROCEDURE") ||
-			strings.HasPrefix(upper, "CREATE PROCEDURE") ||
-			strings.HasPrefix(upper, "CREATE TRIGGER") ||
-			strings.HasPrefix(upper, "DROP TRIGGER") ||
 			strings.HasPrefix(upper, "CREATE EVENT") ||
 			strings.HasPrefix(upper, "DROP EVENT") ||
 			strings.HasPrefix(upper, "CREATE USER") ||
@@ -223,10 +240,11 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			strings.HasPrefix(upper, "SIGNAL ") ||
 			strings.HasPrefix(upper, "RESIGNAL") ||
 			strings.HasPrefix(upper, "GET DIAGNOSTICS") ||
-			strings.HasPrefix(upper, "CALL ") ||
 			strings.HasPrefix(upper, "XA ") ||
 			strings.HasPrefix(upper, "SAVEPOINT") ||
 			strings.HasPrefix(upper, "RELEASE SAVEPOINT") ||
+			strings.HasPrefix(upper, "ALTER PROCEDURE") ||
+			strings.HasPrefix(upper, "ALTER FUNCTION") ||
 			strings.HasPrefix(upper, "CHANGE ") ||
 			strings.HasPrefix(upper, "START ") ||
 			strings.HasPrefix(upper, "STOP ") ||
@@ -290,8 +308,7 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			IsResultSet: true,
 		}, nil
 	case *sqlparser.CallProc:
-		// Accept stored procedure calls silently (e.g. mtr.add_suppression)
-		return &Result{}, nil
+		return e.execCallProcFromAST(s)
 	case *sqlparser.Load:
 		// Accept LOAD DATA silently
 		return &Result{}, nil
@@ -302,10 +319,9 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		// Accept ALTER DATABASE silently
 		return &Result{}, nil
 	case *sqlparser.DropProcedure:
-		// Accept DROP PROCEDURE silently
-		return &Result{}, nil
+		return e.execDropProcedureAST(s)
 	case *sqlparser.CreateProcedure:
-		// Accept CREATE PROCEDURE silently
+		// Simple CREATE PROCEDURE without BEGIN...END body (already handled above for complex ones)
 		return &Result{}, nil
 	case *sqlparser.CreateView:
 		// Accept CREATE VIEW silently
@@ -566,6 +582,8 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
 		}
 		e.Storage.DropTable(e.CurrentDB, tableName)
+		// Drop triggers associated with this table (MySQL behavior)
+		e.dropTriggersForTable(db, tableName)
 	}
 	return &Result{}, nil
 }
@@ -856,14 +874,65 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 		}
 
-		// REPLACE: delete existing duplicate row first, then insert
+		// Fill in default/auto_increment values before trigger so NEW.col works
+		fullRow := make(storage.Row, len(row))
+		for k, v := range row {
+			fullRow[k] = v
+		}
+		// Add missing columns with defaults
+		for _, col := range tbl.Def.Columns {
+			if _, exists := fullRow[col.Name]; !exists {
+				if col.AutoIncrement {
+					fullRow[col.Name] = tbl.AutoIncrementValue() + 1
+				} else if col.Default != nil {
+					fullRow[col.Name] = *col.Default
+				} else {
+					fullRow[col.Name] = nil
+				}
+			}
+		}
+
+		// Fire BEFORE INSERT triggers (may modify fullRow via SET NEW.col = val)
+		if err := e.fireTriggers(tableName, "BEFORE", "INSERT", fullRow, nil); err != nil {
+			return nil, err
+		}
+
+		// Apply trigger modifications back to the row being inserted
+		// Only copy columns that were explicitly set by the user or modified by triggers
+		for _, col := range tbl.Def.Columns {
+			if col.AutoIncrement {
+				continue // Don't override auto_increment handling
+			}
+			if v, ok := fullRow[col.Name]; ok {
+				row[col.Name] = v
+			}
+		}
+
+		// REPLACE: delete existing duplicate row (after BEFORE INSERT, before actual insert)
 		if stmt.Action == sqlparser.ReplaceAct {
 			dupIdx := e.findDuplicateRow(tbl, row, pkCols, uniqueCols)
 			if dupIdx >= 0 {
+				tbl.Mu.RLock()
+				oldRow := make(storage.Row, len(tbl.Rows[dupIdx]))
+				for k, v := range tbl.Rows[dupIdx] {
+					oldRow[k] = v
+				}
+				tbl.Mu.RUnlock()
+
+				// Fire BEFORE DELETE trigger for the old row being replaced
+				if err := e.fireTriggers(tableName, "BEFORE", "DELETE", nil, oldRow); err != nil {
+					return nil, err
+				}
+
 				tbl.Lock()
 				tbl.Rows = append(tbl.Rows[:dupIdx], tbl.Rows[dupIdx+1:]...)
 				tbl.Unlock()
 				affected++ // REPLACE counts deleted row + inserted row = 2
+
+				// Fire AFTER DELETE trigger
+				if err := e.fireTriggers(tableName, "AFTER", "DELETE", nil, oldRow); err != nil {
+					return nil, err
+				}
 			}
 		}
 
@@ -877,6 +946,11 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		}
 		lastInsertID = id
 		affected++
+
+		// Fire AFTER INSERT triggers
+		if err := e.fireTriggers(tableName, "AFTER", "INSERT", fullRow, nil); err != nil {
+			return nil, err
+		}
 	}
 
 	e.lastInsertID = lastInsertID
@@ -1709,13 +1783,23 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 			continue
 		}
 
+		// Build OLD and NEW row for triggers
+		oldRow := make(storage.Row, len(row))
+		for k, v := range row {
+			oldRow[k] = v
+		}
+
+		// Compute NEW values using row context for column references
+		newRow := make(storage.Row, len(row))
+		for k, v := range row {
+			newRow[k] = v
+		}
 		for _, upd := range stmt.Exprs {
 			colName := upd.Name.Name.String()
-			val, err := e.evalExpr(upd.Expr)
+			val, err := e.evalRowExpr(upd.Expr, row)
 			if err != nil {
 				return nil, err
 			}
-			// Pad BINARY(N) values.
 			for _, col := range tbl.Def.Columns {
 				if col.Name == colName {
 					if padLen := binaryPadLength(col.Type); padLen > 0 && val != nil {
@@ -1724,9 +1808,36 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 					break
 				}
 			}
-			tbl.Rows[i][colName] = val
+			newRow[colName] = val
+		}
+
+		// Fire BEFORE UPDATE triggers (unlock table to avoid deadlock since trigger may access other tables)
+		// Trigger may modify newRow via SET NEW.col = val
+		tbl.Unlock()
+		if err := e.fireTriggers(tableName, "BEFORE", "UPDATE", newRow, oldRow); err != nil {
+			tbl.Lock()
+			return nil, err
+		}
+		tbl.Lock()
+
+		// Apply the trigger-modified newRow values to the actual row
+		for _, col := range tbl.Def.Columns {
+			if val, ok := newRow[col.Name]; ok {
+				if padLen := binaryPadLength(col.Type); padLen > 0 && val != nil {
+					val = padBinaryValue(val, padLen)
+				}
+				tbl.Rows[i][col.Name] = val
+			}
 		}
 		affected++
+
+		// Fire AFTER UPDATE triggers
+		tbl.Unlock()
+		if err := e.fireTriggers(tableName, "AFTER", "UPDATE", newRow, oldRow); err != nil {
+			tbl.Lock()
+			return nil, err
+		}
+		tbl.Lock()
 	}
 
 	return &Result{AffectedRows: affected}, nil
@@ -1845,7 +1956,23 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 			match = m
 		}
 		if match {
+			// Fire BEFORE DELETE triggers
+			tbl.Unlock()
+			if err := e.fireTriggers(tableName, "BEFORE", "DELETE", nil, row); err != nil {
+				tbl.Lock()
+				return nil, err
+			}
+			tbl.Lock()
+
 			affected++
+
+			// Fire AFTER DELETE triggers
+			tbl.Unlock()
+			if err := e.fireTriggers(tableName, "AFTER", "DELETE", nil, row); err != nil {
+				tbl.Lock()
+				return nil, err
+			}
+			tbl.Lock()
 		} else {
 			newRows = append(newRows, row)
 		}
@@ -3780,6 +3907,33 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			}
 		}
 		return nil, nil
+	case *sqlparser.BinaryExpr:
+		left, err := e.evalRowExpr(v.Left, row)
+		if err != nil {
+			return nil, err
+		}
+		right, err := e.evalRowExpr(v.Right, row)
+		if err != nil {
+			return nil, err
+		}
+		return evalBinaryExpr(left, right, v.Operator)
+	case *sqlparser.UnaryExpr:
+		val, err := e.evalRowExpr(v.Expr, row)
+		if err != nil {
+			return nil, err
+		}
+		if v.Operator == sqlparser.UMinusOp {
+			switch n := val.(type) {
+			case int64:
+				return -n, nil
+			case float64:
+				return -n, nil
+			}
+		}
+		return val, nil
+	case *sqlparser.FuncExpr:
+		// Evaluate function arguments with row context
+		return e.evalFuncExprWithRow(v, row)
 	case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg:
 		// For HAVING clause: look up the aggregate display name in the row
 		displayName := aggregateDisplayName(expr)
@@ -3791,6 +3945,12 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 	default:
 		return e.evalExpr(expr)
 	}
+}
+
+// evalFuncExprWithRow evaluates a function expression with row context for column references.
+func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (interface{}, error) {
+	// For now, fall back to the normal evalExpr which handles most functions
+	return e.evalExpr(v)
 }
 
 // evalRowExpr is a package-level shim for backward-compatible callers that
@@ -4098,4 +4258,697 @@ func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, er
 	}
 	tbl.Truncate()
 	return &Result{AffectedRows: 0, IsResultSet: false}, nil
+}
+
+// ==============================================================================
+// Trigger support
+// ==============================================================================
+
+// execCreateTrigger parses and stores a CREATE TRIGGER statement.
+// Format: CREATE TRIGGER name timing event ON table FOR EACH ROW BEGIN ... END
+func (e *Executor) execCreateTrigger(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
+	// Parse the CREATE TRIGGER statement manually
+	// CREATE TRIGGER <name> <BEFORE|AFTER> <INSERT|UPDATE|DELETE> ON <table> FOR EACH ROW [BEGIN] <body> [END]
+	upper := strings.ToUpper(query)
+	// Remove "CREATE TRIGGER " prefix
+	rest := strings.TrimSpace(query[len("CREATE TRIGGER "):])
+
+	// Extract trigger name
+	parts := strings.Fields(rest)
+	if len(parts) < 6 {
+		return nil, fmt.Errorf("invalid CREATE TRIGGER syntax")
+	}
+	triggerName := parts[0]
+	timing := strings.ToUpper(parts[1])   // BEFORE or AFTER
+	event := strings.ToUpper(parts[2])     // INSERT, UPDATE, or DELETE
+
+	// Find "ON" keyword
+	onIdx := -1
+	for i, p := range parts {
+		if strings.ToUpper(p) == "ON" && i > 2 {
+			onIdx = i
+			break
+		}
+	}
+	if onIdx < 0 {
+		return nil, fmt.Errorf("invalid CREATE TRIGGER syntax: missing ON")
+	}
+	tableName := parts[onIdx+1]
+	tableName = strings.Trim(tableName, "`")
+
+	// Extract body: everything after "FOR EACH ROW"
+	_ = upper // already have it
+	forEachIdx := strings.Index(upper, "FOR EACH ROW")
+	if forEachIdx < 0 {
+		return nil, fmt.Errorf("invalid CREATE TRIGGER syntax: missing FOR EACH ROW")
+	}
+	body := strings.TrimSpace(query[forEachIdx+len("FOR EACH ROW"):])
+
+	// Parse the body into individual SQL statements
+	var bodyStatements []string
+	bodyUpper := strings.ToUpper(strings.TrimSpace(body))
+	if strings.HasPrefix(bodyUpper, "BEGIN") {
+		// Strip BEGIN and END
+		inner := strings.TrimSpace(body[len("BEGIN"):])
+		if strings.HasSuffix(strings.ToUpper(strings.TrimSpace(inner)), "END") {
+			inner = strings.TrimSpace(inner[:len(inner)-len("END")])
+		}
+		// Split by semicolons (respecting quoted strings)
+		bodyStatements = splitTriggerBody(inner)
+	} else {
+		// Single statement trigger
+		body = strings.TrimRight(body, ";")
+		bodyStatements = []string{strings.TrimSpace(body)}
+	}
+
+	// Validate: AFTER triggers cannot modify NEW row
+	if timing == "AFTER" {
+		for _, stmt := range bodyStatements {
+			stmtUpper := strings.ToUpper(stmt)
+			if strings.Contains(stmtUpper, "SET NEW.") {
+				return nil, mysqlError(1362, "HY000", "Updating of NEW row is not allowed in after trigger")
+			}
+		}
+	}
+	// Validate: BEFORE/AFTER DELETE triggers cannot reference NEW
+	if event == "DELETE" {
+		for _, stmt := range bodyStatements {
+			stmtUpper := strings.ToUpper(stmt)
+			if strings.Contains(stmtUpper, "NEW.") {
+				return nil, mysqlError(1363, "HY000", "There is no NEW row in on DELETE trigger")
+			}
+		}
+	}
+	// Validate: BEFORE/AFTER INSERT triggers cannot reference OLD
+	if event == "INSERT" {
+		for _, stmt := range bodyStatements {
+			stmtUpper := strings.ToUpper(stmt)
+			if strings.Contains(stmtUpper, "OLD.") {
+				return nil, mysqlError(1363, "HY000", "There is no OLD row in on INSERT trigger")
+			}
+		}
+	}
+
+	trigDef := &catalog.TriggerDef{
+		Name:   triggerName,
+		Timing: timing,
+		Event:  event,
+		Table:  tableName,
+		Body:   bodyStatements,
+	}
+	db.CreateTrigger(trigDef)
+
+	return &Result{}, nil
+}
+
+// splitTriggerBody splits the body of a trigger/procedure into individual SQL statements.
+func splitTriggerBody(body string) []string {
+	var stmts []string
+	var current strings.Builder
+	inSingle := false
+	inDouble := false
+	depth := 0 // track nested BEGIN...END
+
+	words := body
+	i := 0
+	for i < len(words) {
+		ch := words[i]
+		switch {
+		case ch == '\'' && !inDouble:
+			inSingle = !inSingle
+			current.WriteByte(ch)
+		case ch == '"' && !inSingle:
+			inDouble = !inDouble
+			current.WriteByte(ch)
+		case ch == ';' && !inSingle && !inDouble && depth == 0:
+			stmt := strings.TrimSpace(current.String())
+			if stmt != "" {
+				stmts = append(stmts, stmt)
+			}
+			current.Reset()
+		default:
+			// Track nested BEGIN...END for IF/WHILE blocks
+			if !inSingle && !inDouble {
+				remaining := strings.ToUpper(words[i:])
+				if strings.HasPrefix(remaining, "BEGIN") && (i+5 >= len(words) || !isAlphaNum(words[i+5])) {
+					depth++
+				}
+				if strings.HasPrefix(remaining, "END") && (i+3 >= len(words) || !isAlphaNum(words[i+3])) && depth > 0 {
+					depth--
+				}
+			}
+			current.WriteByte(ch)
+		}
+		i++
+	}
+	rest := strings.TrimSpace(current.String())
+	if rest != "" {
+		stmts = append(stmts, rest)
+	}
+	return stmts
+}
+
+func isAlphaNum(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+// dropTriggersForTable removes all triggers associated with the given table.
+func (e *Executor) dropTriggersForTable(db *catalog.Database, tableName string) {
+	if db.Triggers == nil {
+		return
+	}
+	var toRemove []string
+	for name, tr := range db.Triggers {
+		if strings.EqualFold(tr.Table, tableName) {
+			toRemove = append(toRemove, name)
+		}
+	}
+	for _, name := range toRemove {
+		db.DropTrigger(name)
+	}
+}
+
+// execDropTrigger handles DROP TRIGGER [IF EXISTS] name
+func (e *Executor) execDropTrigger(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	rest := strings.TrimSpace(query[len("DROP TRIGGER"):])
+
+	ifExists := false
+	if strings.HasPrefix(strings.ToUpper(rest), "IF EXISTS") {
+		ifExists = true
+		rest = strings.TrimSpace(rest[len("IF EXISTS"):])
+	}
+	name := strings.TrimRight(strings.TrimSpace(rest), ";")
+	name = strings.Trim(name, "`")
+	_ = upper
+
+	if _, ok := db.Triggers[name]; !ok && !ifExists {
+		return nil, mysqlError(1360, "HY000", fmt.Sprintf("Trigger does not exist"))
+	}
+	db.DropTrigger(name)
+	return &Result{}, nil
+}
+
+// fireTriggers executes all triggers matching the given timing and event for the specified table.
+// The newRow and oldRow maps provide NEW and OLD pseudo-record values.
+// For BEFORE triggers, SET NEW.col = val modifies newRow in place.
+func (e *Executor) fireTriggers(tableName, timing, event string, newRow, oldRow storage.Row) error {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return err
+	}
+
+	triggers := db.GetTriggersForTable(tableName, timing, event)
+	for _, tr := range triggers {
+		for _, stmtStr := range tr.Body {
+			stmtUpper := strings.ToUpper(strings.TrimSpace(stmtStr))
+			// Handle SET NEW.col = value in BEFORE triggers
+			if strings.HasPrefix(stmtUpper, "SET NEW.") && timing == "BEFORE" && newRow != nil {
+				e.handleSetNew(stmtStr, newRow, oldRow)
+				continue
+			}
+			// Substitute NEW.col and OLD.col references
+			resolved := e.resolveNewOldRefs(stmtStr, newRow, oldRow)
+			_, err := e.Execute(resolved)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// handleSetNew processes "SET NEW.col = expr" statements in BEFORE triggers.
+func (e *Executor) handleSetNew(stmtStr string, newRow, oldRow storage.Row) {
+	// Parse: SET NEW.col = expr
+	rest := strings.TrimSpace(stmtStr[len("SET "):])
+	eqIdx := strings.Index(rest, "=")
+	if eqIdx < 0 {
+		return
+	}
+	colRef := strings.TrimSpace(rest[:eqIdx])
+	valExpr := strings.TrimSpace(rest[eqIdx+1:])
+	valExpr = strings.TrimRight(valExpr, ";")
+
+	// Extract column name from NEW.col
+	if !strings.HasPrefix(strings.ToUpper(colRef), "NEW.") {
+		return
+	}
+	colName := colRef[4:] // strip "NEW."
+
+	// Resolve OLD/NEW references in the value expression
+	resolved := e.resolveNewOldRefs(valExpr, newRow, oldRow)
+
+	// Try to parse and evaluate the value expression
+	val, err := e.evaluateSimpleExpr(resolved)
+	if err != nil {
+		return
+	}
+	newRow[colName] = val
+}
+
+// evaluateSimpleExpr evaluates a simple expression string (used for trigger SET NEW.col = expr).
+func (e *Executor) evaluateSimpleExpr(expr string) (interface{}, error) {
+	// Try to parse as a SELECT expression to use the full evaluator
+	selectSQL := "SELECT " + expr
+	stmt, err := sqlparser.NewTestParser().Parse(selectSQL)
+	if err != nil {
+		// Fallback: treat as literal
+		return expr, nil
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok || len(sel.SelectExprs.Exprs) == 0 {
+		return expr, nil
+	}
+	ae, ok := sel.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr)
+	if !ok {
+		return expr, nil
+	}
+	return e.evalExpr(ae.Expr)
+}
+
+// resolveNewOldRefs replaces NEW.col and OLD.col references in a SQL statement
+// with the actual values from the row.
+func (e *Executor) resolveNewOldRefs(stmtStr string, newRow, oldRow storage.Row) string {
+	// Replace NEW.col and OLD.col with actual values
+	result := stmtStr
+
+	// Process NEW.xxx references
+	if newRow != nil {
+		result = replaceRowRefs(result, "NEW", newRow)
+	}
+	// Process OLD.xxx references
+	if oldRow != nil {
+		result = replaceRowRefs(result, "OLD", oldRow)
+	}
+	return result
+}
+
+// replaceRowRefs replaces prefix.col references (e.g. NEW.c1) with actual values.
+func replaceRowRefs(stmt, prefix string, row storage.Row) string {
+	// Find all occurrences of PREFIX.identifier (case-insensitive prefix)
+	result := stmt
+	prefixUpper := strings.ToUpper(prefix)
+	i := 0
+	for i < len(result) {
+		// Look for prefix followed by dot
+		remaining := result[i:]
+		remainingUpper := strings.ToUpper(remaining)
+		if !strings.HasPrefix(remainingUpper, prefixUpper+".") {
+			i++
+			continue
+		}
+		// Check word boundary before prefix
+		if i > 0 && isAlphaNum(result[i-1]) {
+			i++
+			continue
+		}
+		// Extract column name after the dot
+		dotPos := i + len(prefix) + 1
+		end := dotPos
+		for end < len(result) && (isAlphaNum(result[end]) || result[end] == '_') {
+			end++
+		}
+		if end == dotPos {
+			i++
+			continue
+		}
+		colName := result[dotPos:end]
+
+		// Look up value in row (case-insensitive)
+		var val interface{}
+		found := false
+		for k, v := range row {
+			if strings.EqualFold(k, colName) {
+				val = v
+				found = true
+				break
+			}
+		}
+
+		var replacement string
+		if !found || val == nil {
+			replacement = "NULL"
+		} else {
+			switch v := val.(type) {
+			case string:
+				replacement = "'" + strings.ReplaceAll(v, "'", "''") + "'"
+			default:
+				replacement = fmt.Sprintf("%v", v)
+			}
+		}
+		result = result[:i] + replacement + result[end:]
+		i += len(replacement)
+	}
+	return result
+}
+
+// ==============================================================================
+// Stored Procedure support
+// ==============================================================================
+
+// execCreateProcedure parses and stores a CREATE PROCEDURE statement with BEGIN...END body.
+func (e *Executor) execCreateProcedure(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
+	// Parse: CREATE PROCEDURE name (params) [characteristics] BEGIN ... END
+	upper := strings.ToUpper(query)
+	rest := strings.TrimSpace(query[len("CREATE PROCEDURE "):])
+
+	// Extract procedure name (up to first '(')
+	parenIdx := strings.Index(rest, "(")
+	if parenIdx < 0 {
+		return nil, fmt.Errorf("invalid CREATE PROCEDURE syntax: missing parameter list")
+	}
+	procName := strings.TrimSpace(rest[:parenIdx])
+	procName = strings.Trim(procName, "`")
+
+	// Extract params between first '(' and matching ')'
+	paramStart := parenIdx + 1
+	depth := 1
+	paramEnd := paramStart
+	for paramEnd < len(rest) && depth > 0 {
+		if rest[paramEnd] == '(' {
+			depth++
+		} else if rest[paramEnd] == ')' {
+			depth--
+		}
+		if depth > 0 {
+			paramEnd++
+		}
+	}
+	paramStr := strings.TrimSpace(rest[paramStart:paramEnd])
+	params := parseProcParams(paramStr)
+
+	// Extract body: find BEGIN...END
+	_ = upper
+	afterParams := rest[paramEnd+1:]
+	beginIdx := strings.Index(strings.ToUpper(afterParams), "BEGIN")
+	if beginIdx < 0 {
+		return nil, fmt.Errorf("invalid CREATE PROCEDURE syntax: missing BEGIN")
+	}
+	bodyStr := strings.TrimSpace(afterParams[beginIdx+len("BEGIN"):])
+	if strings.HasSuffix(strings.ToUpper(strings.TrimSpace(bodyStr)), "END") {
+		bodyStr = strings.TrimSpace(bodyStr[:len(bodyStr)-len("END")])
+	}
+
+	bodyStmts := splitTriggerBody(bodyStr)
+
+	procDef := &catalog.ProcedureDef{
+		Name:   procName,
+		Params: params,
+		Body:   bodyStmts,
+	}
+	db.CreateProcedure(procDef)
+
+	return &Result{}, nil
+}
+
+// parseProcParams parses a procedure parameter list string.
+func parseProcParams(paramStr string) []catalog.ProcParam {
+	if strings.TrimSpace(paramStr) == "" {
+		return nil
+	}
+	var params []catalog.ProcParam
+	// Split by commas (not inside parens)
+	parts := splitByComma(paramStr)
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		words := strings.Fields(p)
+		param := catalog.ProcParam{}
+		idx := 0
+		// Check for IN/OUT/INOUT prefix
+		if len(words) > 0 {
+			modeUpper := strings.ToUpper(words[0])
+			if modeUpper == "IN" || modeUpper == "OUT" || modeUpper == "INOUT" {
+				param.Mode = modeUpper
+				idx = 1
+			} else {
+				param.Mode = "IN" // default
+			}
+		}
+		if idx < len(words) {
+			param.Name = words[idx]
+			idx++
+		}
+		if idx < len(words) {
+			param.Type = strings.Join(words[idx:], " ")
+		}
+		params = append(params, param)
+	}
+	return params
+}
+
+// splitByComma splits a string by commas, respecting parentheses.
+func splitByComma(s string) []string {
+	var parts []string
+	var current strings.Builder
+	depth := 0
+	for _, ch := range s {
+		switch ch {
+		case '(':
+			depth++
+			current.WriteRune(ch)
+		case ')':
+			depth--
+			current.WriteRune(ch)
+		case ',':
+			if depth == 0 {
+				parts = append(parts, current.String())
+				current.Reset()
+			} else {
+				current.WriteRune(ch)
+			}
+		default:
+			current.WriteRune(ch)
+		}
+	}
+	rest := current.String()
+	if strings.TrimSpace(rest) != "" {
+		parts = append(parts, rest)
+	}
+	return parts
+}
+
+// execDropProcedureFallback handles DROP PROCEDURE [IF EXISTS] name
+func (e *Executor) execDropProcedureFallback(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
+	rest := strings.TrimSpace(query[len("DROP PROCEDURE"):])
+	ifExists := false
+	restUpper := strings.ToUpper(rest)
+	if strings.HasPrefix(restUpper, "IF EXISTS") {
+		ifExists = true
+		rest = strings.TrimSpace(rest[len("IF EXISTS"):])
+	}
+	name := strings.TrimRight(strings.TrimSpace(rest), ";")
+	name = strings.Trim(name, "`")
+
+	if db.GetProcedure(name) == nil && !ifExists {
+		return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", e.CurrentDB, name))
+	}
+	db.DropProcedure(name)
+	return &Result{}, nil
+}
+
+// execDropProcedureAST handles DROP PROCEDURE parsed by vitess.
+func (e *Executor) execDropProcedureAST(stmt *sqlparser.DropProcedure) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+	name := stmt.Name.Name.String()
+	name = strings.Trim(name, "`")
+	if db.GetProcedure(name) == nil && !stmt.IfExists {
+		return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", e.CurrentDB, name))
+	}
+	db.DropProcedure(name)
+	return &Result{}, nil
+}
+
+// execCallProcedure handles CALL procedure_name(args) from text.
+func (e *Executor) execCallProcedure(query string) (*Result, error) {
+	// Parse: CALL proc_name(arg1, arg2, ...)
+	rest := strings.TrimSpace(query[len("CALL "):])
+	rest = strings.TrimRight(rest, ";")
+
+	// Extract procedure name and args
+	parenIdx := strings.Index(rest, "(")
+	var procName string
+	var argStrs []string
+	if parenIdx < 0 {
+		procName = strings.TrimSpace(rest)
+	} else {
+		procName = strings.TrimSpace(rest[:parenIdx])
+		argPart := rest[parenIdx+1:]
+		if closeParen := strings.LastIndex(argPart, ")"); closeParen >= 0 {
+			argPart = argPart[:closeParen]
+		}
+		argStrs = splitByComma(argPart)
+	}
+	procName = strings.Trim(procName, "`")
+
+	// Handle well-known no-op procedures (e.g. mtr.add_suppression)
+	if strings.Contains(procName, ".") {
+		return &Result{}, nil
+	}
+
+	return e.callProcedureByName(procName, argStrs)
+}
+
+// execCallProcFromAST handles CALL parsed by vitess.
+func (e *Executor) execCallProcFromAST(stmt *sqlparser.CallProc) (*Result, error) {
+	procName := stmt.Name.Name.String()
+	procName = strings.Trim(procName, "`")
+
+	// Handle well-known no-op procedures
+	qualifier := stmt.Name.Qualifier.String()
+	if qualifier != "" {
+		return &Result{}, nil
+	}
+
+	var argStrs []string
+	for _, arg := range stmt.Params {
+		argStrs = append(argStrs, sqlparser.String(arg))
+	}
+
+	return e.callProcedureByName(procName, argStrs)
+}
+
+// callProcedureByName looks up and executes a stored procedure.
+func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
+	proc := db.GetProcedure(procName)
+	if proc == nil {
+		// Silently accept calls to non-existent procedures for compatibility
+		return &Result{}, nil
+	}
+
+	// Build parameter mapping: bind IN params, track OUT params
+	paramVars := make(map[string]interface{})
+	outVarMap := make(map[string]string) // param name -> @variable name
+	for i, param := range proc.Params {
+		if i < len(argStrs) {
+			argVal := strings.TrimSpace(argStrs[i])
+			if strings.HasPrefix(argVal, "@") {
+				// User variable reference
+				if param.Mode == "IN" || param.Mode == "INOUT" {
+					// Read current value of user variable (for now, use as string)
+					paramVars[param.Name] = argVal
+				}
+				if param.Mode == "OUT" || param.Mode == "INOUT" {
+					outVarMap[param.Name] = argVal
+				}
+			} else {
+				// Literal value
+				paramVars[param.Name] = argVal
+			}
+		}
+	}
+
+	// Execute body statements
+	for _, stmtStr := range proc.Body {
+		stmtUpper := strings.ToUpper(strings.TrimSpace(stmtStr))
+		// Handle SELECT ... INTO
+		if strings.Contains(stmtUpper, " INTO ") && strings.HasPrefix(stmtUpper, "SELECT") {
+			err := e.execSelectInto(stmtStr, paramVars, outVarMap)
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+		// Handle DECLARE - skip
+		if strings.HasPrefix(stmtUpper, "DECLARE") {
+			continue
+		}
+		// Handle SET
+		if strings.HasPrefix(stmtUpper, "SET") {
+			_, err := e.Execute(stmtStr)
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+		// Execute other statements
+		_, err := e.Execute(stmtStr)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &Result{}, nil
+}
+
+// execSelectInto handles SELECT ... INTO variable inside a stored procedure.
+func (e *Executor) execSelectInto(stmtStr string, paramVars map[string]interface{}, outVarMap map[string]string) error {
+	// Parse: SELECT expr INTO varname FROM ...
+	// We need to extract the INTO clause and rewrite the SELECT without it
+	upper := strings.ToUpper(stmtStr)
+	intoIdx := strings.Index(upper, " INTO ")
+	if intoIdx < 0 {
+		return nil
+	}
+
+	// Find what comes after INTO: variable name, then FROM/WHERE/etc.
+	afterInto := stmtStr[intoIdx+len(" INTO "):]
+	// The variable name ends at the next keyword (FROM, WHERE, etc.) or end of string
+	var varName string
+	var restOfQuery string
+	for _, kw := range []string{" FROM ", " WHERE ", " GROUP ", " ORDER ", " LIMIT ", " HAVING "} {
+		kwIdx := strings.Index(strings.ToUpper(afterInto), kw)
+		if kwIdx >= 0 {
+			varName = strings.TrimSpace(afterInto[:kwIdx])
+			restOfQuery = afterInto[kwIdx:]
+			break
+		}
+	}
+	if varName == "" {
+		varName = strings.TrimSpace(afterInto)
+	}
+
+	// Build a SELECT without the INTO clause
+	selectPart := stmtStr[:intoIdx]
+	rewrittenSQL := selectPart + restOfQuery
+
+	result, err := e.Execute(rewrittenSQL)
+	if err != nil {
+		return err
+	}
+
+	// Assign result to the output variable
+	if result != nil && len(result.Rows) > 0 && len(result.Rows[0]) > 0 {
+		val := result.Rows[0][0]
+		// If varName is a parameter name, look up the OUT variable
+		if outVar, ok := outVarMap[varName]; ok {
+			_ = outVar
+			_ = val
+			// For now, we just store it (user variables @xxx are not fully implemented)
+		}
+		paramVars[varName] = val
+	}
+
+	return nil
 }
