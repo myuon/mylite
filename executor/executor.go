@@ -422,8 +422,7 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	case *sqlparser.CallProc:
 		return e.execCallProcFromAST(s)
 	case *sqlparser.Load:
-		// Accept LOAD DATA silently
-		return &Result{}, nil
+		return e.execLoadData(query)
 	case *sqlparser.PrepareStmt, *sqlparser.ExecuteStmt, *sqlparser.DeallocateStmt:
 		// Accept PREPARE/EXECUTE/DEALLOCATE silently
 		return &Result{}, nil
@@ -1479,6 +1478,28 @@ func (e *Executor) findDuplicateRow(tbl *storage.Table, candidate storage.Row, p
 func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error) {
 	switch te := expr.(type) {
 	case *sqlparser.AliasedTableExpr:
+		// Handle DerivedTable (FROM subquery)
+		if dt, ok := te.Expr.(*sqlparser.DerivedTable); ok {
+			alias := te.As.String()
+			sub := &sqlparser.Subquery{Select: dt.Select}
+			result, err := e.execSubquery(sub, e.correlatedRow)
+			if err != nil {
+				return nil, err
+			}
+			rows := make([]storage.Row, len(result.Rows))
+			for i, resultRow := range result.Rows {
+				row := make(storage.Row, len(result.Columns)*2)
+				for j, col := range result.Columns {
+					row[col] = resultRow[j]
+					if alias != "" {
+						row[alias+"."+col] = resultRow[j]
+					}
+				}
+				rows[i] = row
+			}
+			return rows, nil
+		}
+
 		alias, tableName, err := extractTableAliasFromAliased(te)
 		if err != nil {
 			return nil, err
@@ -1879,6 +1900,11 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		}
 	}
 
+	// Handle SELECT ... INTO OUTFILE
+	if stmt.Into != nil && stmt.Into.Type == sqlparser.IntoOutfile {
+		return e.execSelectIntoOutfile(stmt.Into, colNames, resultRows)
+	}
+
 	return &Result{
 		Columns:     colNames,
 		Rows:        resultRows,
@@ -2029,6 +2055,11 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	// Handle SELECT ... INTO OUTFILE (GROUP BY path)
+	if stmt.Into != nil && stmt.Into.Type == sqlparser.IntoOutfile {
+		return e.execSelectIntoOutfile(stmt.Into, colNames, resultRows)
 	}
 
 	return &Result{
@@ -2209,7 +2240,7 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					}
 				}
 			} else {
-				name = sqlparser.String(se.Expr)
+				name = normalizeSQLDisplayName(sqlparser.String(se.Expr))
 			}
 			cols = append(cols, name)
 			colExprs = append(colExprs, se.Expr)
@@ -2278,6 +2309,75 @@ func (e *Executor) execUnion(stmt *sqlparser.Union) (*Result, error) {
 	}, nil
 }
 
+// execSubquery executes a subquery statement and returns the result.
+// If outerRow is non-nil, it is set as the correlatedRow so that
+// correlated references (e.g. t1.c2 referencing an outer table) resolve.
+func (e *Executor) execSubquery(sub *sqlparser.Subquery, outerRow storage.Row) (*Result, error) {
+	oldCorrelated := e.correlatedRow
+	if outerRow != nil {
+		e.correlatedRow = outerRow
+	}
+	defer func() { e.correlatedRow = oldCorrelated }()
+
+	switch sel := sub.Select.(type) {
+	case *sqlparser.Select:
+		return e.execSelect(sel)
+	case *sqlparser.Union:
+		return e.execUnion(sel)
+	default:
+		// Fallback: serialize and re-execute
+		return e.Execute(sqlparser.String(sub.Select))
+	}
+}
+
+// subqueryHasLimitOrOrderBy checks if a subquery's SELECT has LIMIT or ORDER BY.
+func subqueryHasLimit(sub *sqlparser.Subquery) bool {
+	if sel, ok := sub.Select.(*sqlparser.Select); ok {
+		return sel.Limit != nil
+	}
+	return false
+}
+
+// execSubqueryValues executes a subquery and returns first-column values as a slice.
+func (e *Executor) execSubqueryValues(sub *sqlparser.Subquery, outerRow storage.Row) ([]interface{}, error) {
+	// MySQL error 1235: LIMIT in IN/ALL/ANY/SOME subquery is not supported
+	if subqueryHasLimit(sub) {
+		return nil, mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'LIMIT & IN/ALL/ANY/SOME subquery'")
+	}
+	result, err := e.execSubquery(sub, outerRow)
+	if err != nil {
+		return nil, err
+	}
+	vals := make([]interface{}, len(result.Rows))
+	for i, row := range result.Rows {
+		if len(row) > 0 {
+			vals[i] = row[0]
+		}
+	}
+	return vals, nil
+}
+
+// execSubqueryScalar executes a subquery and returns the single scalar value.
+func (e *Executor) execSubqueryScalar(sub *sqlparser.Subquery, outerRow storage.Row) (interface{}, error) {
+	result, err := e.execSubquery(sub, outerRow)
+	if err != nil {
+		return nil, err
+	}
+	if len(result.Rows) == 0 {
+		return nil, nil
+	}
+	if len(result.Columns) > 1 {
+		return nil, mysqlError(1241, "21000", "Operand should contain 1 column(s)")
+	}
+	if len(result.Rows) > 1 {
+		return nil, mysqlError(1242, "21000", "Subquery returns more than 1 row")
+	}
+	if len(result.Rows[0]) == 0 {
+		return nil, nil
+	}
+	return result.Rows[0][0], nil
+}
+
 func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 	colNames := make([]string, 0)
 	values := make([]interface{}, 0)
@@ -2289,7 +2389,7 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 			if !se.As.IsEmpty() {
 				name = se.As.String()
 			} else {
-				name = sqlparser.String(se.Expr)
+				name = normalizeSQLDisplayName(sqlparser.String(se.Expr))
 			}
 			colNames = append(colNames, name)
 
@@ -2310,6 +2410,49 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 	}, nil
 }
 
+// exprReferencesTable checks if an expression tree contains a reference
+// to the given table name.
+func exprReferencesTable(expr sqlparser.SQLNode, tableName string) bool {
+	found := false
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if found {
+			return false, nil
+		}
+		if tn, ok := node.(sqlparser.TableName); ok {
+			if strings.EqualFold(tn.Name.String(), tableName) {
+				found = true
+				return false, nil
+			}
+		}
+		return true, nil
+	}, expr)
+	return found
+}
+
+// subqueryReferencesTable checks if any SET expression's subquery references
+// the same table being updated.
+func subqueryReferencesTable(exprs sqlparser.UpdateExprs, tableName string) bool {
+	for _, upd := range exprs {
+		found := false
+		_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+			if found {
+				return false, nil
+			}
+			if sub, ok := node.(*sqlparser.Subquery); ok {
+				if exprReferencesTable(sub.Select, tableName) {
+					found = true
+					return false, nil
+				}
+			}
+			return true, nil
+		}, upd.Expr)
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 	if len(stmt.TableExprs) == 0 {
 		return nil, fmt.Errorf("no table specified")
@@ -2327,6 +2470,11 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
 	if err != nil {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
+	}
+
+	// Check for self-referencing subqueries (MySQL error 1093)
+	if subqueryReferencesTable(stmt.Exprs, tableName) {
+		return nil, mysqlError(1093, "HY000", fmt.Sprintf("You can't specify target table '%s' for update in FROM clause", tableName))
 	}
 
 	tbl.Lock()
@@ -3590,6 +3738,9 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		default:
 			return now.Format("2006-01-02 15:04:05"), nil
 		}
+	case *sqlparser.Subquery:
+		// Scalar subquery: execute and return the single value
+		return e.execSubqueryScalar(v, e.correlatedRow)
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
 }
@@ -3701,7 +3852,12 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		if val == nil {
 			return nil, nil
 		}
-		return strings.ToUpper(toString(val)), nil
+		s := toString(val)
+		// If the string contains null bytes, it's likely binary data — don't uppercase
+		if strings.ContainsRune(s, '\x00') {
+			return s, nil
+		}
+		return strings.ToUpper(s), nil
 	case "lower", "lcase":
 		if len(v.Exprs) < 1 {
 			return nil, fmt.Errorf("LOWER requires 1 argument")
@@ -4625,6 +4781,12 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			if val, ok := row[qualified]; ok {
 				return val, nil
 			}
+			// Fall back to correlatedRow for correlated subquery references
+			if e.correlatedRow != nil {
+				if val, ok := e.correlatedRow[qualified]; ok {
+					return val, nil
+				}
+			}
 		}
 		// Fall back to un-prefixed lookup
 		if val, ok := row[colName]; ok {
@@ -4637,7 +4799,22 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				return v, nil
 			}
 		}
+		// Fall back to correlatedRow for correlated subquery
+		if e.correlatedRow != nil {
+			if val, ok := e.correlatedRow[colName]; ok {
+				return val, nil
+			}
+			if !v.Qualifier.IsEmpty() {
+				qualified := v.Qualifier.Name.String() + "." + colName
+				if val, ok := e.correlatedRow[qualified]; ok {
+					return val, nil
+				}
+			}
+		}
 		return nil, nil
+	case *sqlparser.Subquery:
+		// Scalar subquery in row context (correlated)
+		return e.execSubqueryScalar(v, row)
 	case *sqlparser.BinaryExpr:
 		left, err := e.evalRowExpr(v.Left, row)
 		if err != nil {
@@ -4648,6 +4825,24 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			return nil, err
 		}
 		return evalBinaryExpr(left, right, v.Operator)
+	case *sqlparser.ComparisonExpr:
+		// Comparison in row context
+		left, err := e.evalRowExpr(v.Left, row)
+		if err != nil {
+			return nil, err
+		}
+		right, err := e.evalRowExpr(v.Right, row)
+		if err != nil {
+			return nil, err
+		}
+		result, err := compareValues(left, right, v.Operator)
+		if err != nil {
+			return nil, err
+		}
+		if result {
+			return int64(1), nil
+		}
+		return int64(0), nil
 	case *sqlparser.UnaryExpr:
 		val, err := e.evalRowExpr(v.Expr, row)
 		if err != nil {
@@ -4665,6 +4860,8 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 	case *sqlparser.FuncExpr:
 		// Evaluate function arguments with row context
 		return e.evalFuncExprWithRow(v, row)
+	case *sqlparser.CaseExpr:
+		return e.evalCaseExprWithRow(v, row)
 	case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg:
 		// For HAVING clause: look up the aggregate display name in the row
 		displayName := aggregateDisplayName(expr)
@@ -5034,6 +5231,73 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 	}
 }
 
+// evalComparisonWithRow evaluates a comparison expression with row context.
+func (e *Executor) evalComparisonWithRow(v *sqlparser.ComparisonExpr, row storage.Row) (interface{}, error) {
+	left, err := e.evalRowExpr(v.Left, row)
+	if err != nil {
+		return nil, err
+	}
+	right, err := e.evalRowExpr(v.Right, row)
+	if err != nil {
+		return nil, err
+	}
+	// Delegate to evalWhere for the actual comparison logic
+	match, err := e.evalWhere(v, row)
+	if err != nil {
+		return nil, err
+	}
+	_ = left
+	_ = right
+	if match {
+		return int64(1), nil
+	}
+	return int64(0), nil
+}
+
+// evalBinaryExprWithRow evaluates a binary arithmetic expression with row context.
+func (e *Executor) evalBinaryExprWithRow(v *sqlparser.BinaryExpr, row storage.Row) (interface{}, error) {
+	left, err := e.evalRowExpr(v.Left, row)
+	if err != nil {
+		return nil, err
+	}
+	right, err := e.evalRowExpr(v.Right, row)
+	if err != nil {
+		return nil, err
+	}
+	l := toFloat(left)
+	r := toFloat(right)
+	switch v.Operator {
+	case sqlparser.PlusOp:
+		return l + r, nil
+	case sqlparser.MinusOp:
+		return l - r, nil
+	case sqlparser.MultOp:
+		return l * r, nil
+	case sqlparser.DivOp:
+		if r == 0 {
+			return nil, nil
+		}
+		return l / r, nil
+	case sqlparser.IntDivOp:
+		if r == 0 {
+			return nil, nil
+		}
+		return int64(l) / int64(r), nil
+	case sqlparser.ModOp:
+		if r == 0 {
+			return nil, nil
+		}
+		return int64(l) % int64(r), nil
+	}
+	return e.evalExpr(v)
+}
+
+// evalCaseExprWithRow evaluates a CASE expression with row context.
+func (e *Executor) evalCaseExprWithRow(v *sqlparser.CaseExpr, row storage.Row) (interface{}, error) {
+	// For now, delegate to the non-row-aware version
+	return e.evalExpr(v)
+}
+
 // evalRowExpr is a package-level shim for backward-compatible callers that
 // do not have access to an executor.  It creates a temporary executor with
 // empty state, which is sufficient for column-lookup and literal evaluation.
@@ -5087,11 +5351,30 @@ func (e *Executor) addAggregatesToRow(expr sqlparser.Expr, row storage.Row, grou
 func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error) {
 	switch v := expr.(type) {
 	case *sqlparser.ComparisonExpr:
-		// Handle IN / NOT IN specially because the right side is a ValTuple, not a scalar.
+		// Handle IN / NOT IN specially because the right side is a ValTuple or Subquery.
 		if v.Operator == sqlparser.InOp || v.Operator == sqlparser.NotInOp {
 			left, err := e.evalRowExpr(v.Left, row)
 			if err != nil {
 				return false, err
+			}
+			// Handle subquery on right side
+			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+				vals, err := e.execSubqueryValues(sub, row)
+				if err != nil {
+					return false, err
+				}
+				if left == nil {
+					return false, nil
+				}
+				for _, val := range vals {
+					if val == nil {
+						continue
+					}
+					if fmt.Sprintf("%v", left) == fmt.Sprintf("%v", val) {
+						return v.Operator == sqlparser.InOp, nil
+					}
+				}
+				return v.Operator == sqlparser.NotInOp, nil
 			}
 			tuple, ok := v.Right.(sqlparser.ValTuple)
 			if !ok {
@@ -5108,6 +5391,55 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 			}
 			return v.Operator == sqlparser.NotInOp, nil
 		}
+
+		// Handle ANY/SOME (Modifier=1) and ALL (Modifier=2) with subquery
+		if v.Modifier != 0 {
+			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+				left, err := e.evalRowExpr(v.Left, row)
+				if err != nil {
+					return false, err
+				}
+				if left == nil {
+					return false, nil
+				}
+				vals, err := e.execSubqueryValues(sub, row)
+				if err != nil {
+					return false, err
+				}
+				isAny := v.Modifier == 1 // ANY/SOME
+				if isAny {
+					// ANY/SOME: true if comparison holds for at least one non-NULL value
+					for _, val := range vals {
+						if val == nil {
+							continue
+						}
+						match, err := compareValues(left, val, v.Operator)
+						if err != nil {
+							return false, err
+						}
+						if match {
+							return true, nil
+						}
+					}
+					return false, nil
+				}
+				// ALL: true if comparison holds for every non-NULL value
+				for _, val := range vals {
+					if val == nil {
+						continue
+					}
+					match, err := compareValues(left, val, v.Operator)
+					if err != nil {
+						return false, err
+					}
+					if !match {
+						return false, nil
+					}
+				}
+				return true, nil
+			}
+		}
+
 		left, err := e.evalRowExpr(v.Left, row)
 		if err != nil {
 			return false, err
@@ -5184,8 +5516,11 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 		}
 		return !result, nil
 	case *sqlparser.ExistsExpr:
-		// EXISTS subquery - not supported yet, return false
-		return false, nil
+		result, err := e.execSubquery(v.Subquery, row)
+		if err != nil {
+			return false, err
+		}
+		return len(result.Rows) > 0, nil
 	case *sqlparser.NotExpr:
 		inner, err := e.evalWhere(v.Expr, row)
 		if err != nil {
@@ -6367,4 +6702,648 @@ func (e *Executor) execCreateTableSelect(newTableName, selectSQL string) (*Resul
 		tbl.Insert(sRow) //nolint:errcheck
 	}
 	return &Result{}, nil
+}
+
+// ---------- LOAD DATA INFILE ----------
+
+// loadDataOptions holds parsed options from LOAD DATA statement.
+type loadDataOptions struct {
+	filePath        string
+	isLocal         bool
+	tableName       string
+	fieldsTermBy    string
+	fieldsEnclosedBy string
+	fieldsOptEnclosed bool
+	fieldsEscapedBy  string
+	linesTermBy     string
+	linesStartingBy string
+	ignoreLines     int
+	columns         []string // column names or @var names
+	setExprs        string   // raw SET clause
+	isReplace       bool
+	isIgnore        bool
+}
+
+// reLoadData matches LOAD DATA [LOCAL] INFILE 'file' [REPLACE|IGNORE] INTO TABLE tablename ...
+var reLoadDataFile = regexp.MustCompile(`(?i)LOAD\s+DATA\s+(?:CONCURRENT\s+)?(?:LOW_PRIORITY\s+)?(?:(LOCAL)\s+)?INFILE\s+'([^']*)'`)
+var reLoadDataTable = regexp.MustCompile(`(?i)INTO\s+TABLE\s+(\S+)`)
+var reIgnoreLines = regexp.MustCompile(`(?i)IGNORE\s+(\d+)\s+LINES`)
+var reLoadReplace = regexp.MustCompile(`(?i)REPLACE\s+INTO\s+TABLE`)
+var reLoadIgnore = regexp.MustCompile(`(?i)IGNORE\s+INTO\s+TABLE`)
+
+// extractSQLString extracts a SQL quoted string starting at pos in query.
+func extractSQLString(query string, pos int) (string, int) {
+	if pos >= len(query) || query[pos] != '\'' {
+		return "", pos
+	}
+	pos++ // skip opening quote
+	var sb strings.Builder
+	for pos < len(query) {
+		ch := query[pos]
+		if ch == '\\' && pos+1 < len(query) {
+			next := query[pos+1]
+			switch next {
+			case 'n':
+				sb.WriteByte('\n')
+			case 't':
+				sb.WriteByte('\t')
+			case 'r':
+				sb.WriteByte('\r')
+			case '\\':
+				sb.WriteByte('\\')
+			case '\'':
+				sb.WriteByte('\'')
+			default:
+				sb.WriteByte(next)
+			}
+			pos += 2
+			continue
+		}
+		if ch == '\'' {
+			if pos+1 < len(query) && query[pos+1] == '\'' {
+				sb.WriteByte('\'')
+				pos += 2
+				continue
+			}
+			pos++
+			return sb.String(), pos
+		}
+		sb.WriteByte(ch)
+		pos++
+	}
+	return sb.String(), pos
+}
+
+// findKeywordAndExtractString searches for a keyword in query and extracts the following SQL quoted string.
+func findKeywordAndExtractString(query, keyword string) (string, bool) {
+	upper := strings.ToUpper(query)
+	kwUpper := strings.ToUpper(keyword)
+	idx := strings.Index(upper, kwUpper)
+	if idx < 0 {
+		return "", false
+	}
+	pos := idx + len(keyword)
+	for pos < len(query) && query[pos] != '\'' {
+		pos++
+	}
+	if pos >= len(query) {
+		return "", false
+	}
+	val, _ := extractSQLString(query, pos)
+	return val, true
+}
+
+func parseLoadDataSQL(query string) (*loadDataOptions, error) {
+	opts := &loadDataOptions{
+		fieldsTermBy:    "\t",
+		linesTermBy:     "\n",
+		fieldsEscapedBy: "\\",
+	}
+
+	m := reLoadDataFile.FindStringSubmatch(query)
+	if m == nil {
+		return nil, fmt.Errorf("cannot parse LOAD DATA statement")
+	}
+	opts.isLocal = strings.ToUpper(m[1]) == "LOCAL"
+	opts.filePath = m[2]
+
+	mTbl := reLoadDataTable.FindStringSubmatch(query)
+	if mTbl == nil {
+		return nil, fmt.Errorf("cannot parse table name in LOAD DATA")
+	}
+	opts.tableName = strings.Trim(mTbl[1], "`")
+
+	upper := strings.ToUpper(query)
+
+	if strings.Contains(upper, "FIELDS") || strings.Contains(upper, "COLUMNS") {
+		fieldsIdx := strings.Index(upper, "FIELDS")
+		if fieldsIdx < 0 {
+			fieldsIdx = strings.Index(upper, "COLUMNS")
+		}
+		if fieldsIdx >= 0 {
+			afterFields := query[fieldsIdx:]
+			afterFieldsUpper := upper[fieldsIdx:]
+			termIdx := strings.Index(afterFieldsUpper, "TERMINATED BY")
+			if termIdx >= 0 {
+				pos := fieldsIdx + termIdx + len("TERMINATED BY")
+				for pos < len(query) && query[pos] == ' ' {
+					pos++
+				}
+				if pos < len(query) && query[pos] == '\'' {
+					val, _ := extractSQLString(query, pos)
+					opts.fieldsTermBy = val
+				}
+			}
+			_ = afterFields
+			encIdx := strings.Index(afterFieldsUpper, "ENCLOSED BY")
+			if encIdx >= 0 {
+				optIdx := strings.Index(afterFieldsUpper, "OPTIONALLY ENCLOSED BY")
+				if optIdx >= 0 {
+					opts.fieldsOptEnclosed = true
+					pos := fieldsIdx + optIdx + len("OPTIONALLY ENCLOSED BY")
+					for pos < len(query) && query[pos] == ' ' {
+						pos++
+					}
+					if pos < len(query) && query[pos] == '\'' {
+						val, _ := extractSQLString(query, pos)
+						opts.fieldsEnclosedBy = val
+					}
+				} else {
+					pos := fieldsIdx + encIdx + len("ENCLOSED BY")
+					for pos < len(query) && query[pos] == ' ' {
+						pos++
+					}
+					if pos < len(query) && query[pos] == '\'' {
+						val, _ := extractSQLString(query, pos)
+						opts.fieldsEnclosedBy = val
+					}
+				}
+			}
+			escIdx := strings.Index(afterFieldsUpper, "ESCAPED BY")
+			if escIdx >= 0 {
+				pos := fieldsIdx + escIdx + len("ESCAPED BY")
+				for pos < len(query) && query[pos] == ' ' {
+					pos++
+				}
+				if pos < len(query) && query[pos] == '\'' {
+					val, _ := extractSQLString(query, pos)
+					opts.fieldsEscapedBy = val
+				}
+			}
+		}
+	} else if strings.Contains(upper, "ENCLOSED BY") {
+		if val, ok := findKeywordAndExtractString(query, "ENCLOSED BY"); ok {
+			opts.fieldsEnclosedBy = val
+			if strings.Contains(upper, "OPTIONALLY ENCLOSED BY") {
+				opts.fieldsOptEnclosed = true
+			}
+		}
+	}
+	if !strings.Contains(upper, "FIELDS") && strings.Contains(upper, "ESCAPED BY") {
+		if val, ok := findKeywordAndExtractString(query, "ESCAPED BY"); ok {
+			opts.fieldsEscapedBy = val
+		}
+	}
+
+	if strings.Contains(upper, "LINES") {
+		linesIdx := strings.Index(upper, "LINES")
+		if linesIdx >= 0 {
+			afterLines := query[linesIdx:]
+			afterLinesUpper := upper[linesIdx:]
+			if startIdx := strings.Index(afterLinesUpper, "STARTING BY"); startIdx >= 0 {
+				pos := linesIdx + startIdx + len("STARTING BY")
+				for pos < len(query) && query[pos] == ' ' {
+					pos++
+				}
+				if pos < len(query) && query[pos] == '\'' {
+					val, _ := extractSQLString(query, pos)
+					opts.linesStartingBy = val
+				}
+			}
+			_ = afterLines
+			termIdx := strings.Index(afterLinesUpper, "TERMINATED BY")
+			if termIdx >= 0 {
+				pos := linesIdx + termIdx + len("TERMINATED BY")
+				for pos < len(query) && query[pos] == ' ' {
+					pos++
+				}
+				if pos < len(query) && query[pos] == '\'' {
+					val, _ := extractSQLString(query, pos)
+					opts.linesTermBy = val
+				}
+			}
+		}
+	}
+
+	if m := reIgnoreLines.FindStringSubmatch(query); m != nil {
+		opts.ignoreLines, _ = strconv.Atoi(m[1])
+	}
+	opts.isReplace = reLoadReplace.MatchString(query)
+	opts.isIgnore = reLoadIgnore.MatchString(query)
+
+	if idx := findColumnListStart(query); idx >= 0 {
+		end := strings.Index(query[idx:], ")")
+		if end >= 0 {
+			colStr := query[idx+1 : idx+end]
+			cols := strings.Split(colStr, ",")
+			for _, c := range cols {
+				c = strings.TrimSpace(c)
+				if c != "" {
+					opts.columns = append(opts.columns, c)
+				}
+			}
+			afterCols := query[idx+end+1:]
+			setIdx := strings.Index(strings.ToUpper(afterCols), "SET ")
+			if setIdx >= 0 {
+				opts.setExprs = strings.TrimSpace(afterCols[setIdx+4:])
+				opts.setExprs = strings.TrimRight(opts.setExprs, "; ")
+			}
+		}
+	}
+
+	return opts, nil
+}
+
+func findColumnListStart(query string) int {
+	upper := strings.ToUpper(query)
+	tableIdx := strings.Index(upper, "INTO TABLE")
+	if tableIdx < 0 {
+		return -1
+	}
+	rest := query[tableIdx:]
+	parts := strings.Fields(rest)
+	if len(parts) < 3 {
+		return -1
+	}
+	afterTable := tableIdx + strings.Index(rest, parts[2]) + len(parts[2])
+	remaining := query[afterTable:]
+	for i := 0; i < len(remaining); i++ {
+		if remaining[i] == '(' {
+			return afterTable + i
+		}
+	}
+	return -1
+}
+
+func (e *Executor) execLoadData(query string) (*Result, error) {
+	opts, err := parseLoadDataSQL(query)
+	if err != nil {
+		return nil, err
+	}
+
+	filePath := opts.filePath
+	if !filepath.IsAbs(filePath) {
+		resolved := false
+		candidates := []string{filePath}
+		if strings.Contains(filePath, "suite/engines/funcs/") {
+			mapped := strings.Replace(filePath, "suite/engines/funcs/", "engine_funcs/", 1)
+			candidates = append(candidates, mapped)
+		}
+		candidates = append(candidates, filepath.Base(filePath))
+
+		for _, candidate := range candidates {
+			for _, dir := range e.SearchPaths {
+				full := filepath.Join(dir, candidate)
+				if _, err := os.Stat(full); err == nil {
+					filePath = full
+					resolved = true
+					break
+				}
+			}
+			if resolved {
+				break
+			}
+		}
+		if !resolved && e.DataDir != "" {
+			filePath = filepath.Join(e.DataDir, filePath)
+		}
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, mysqlError(29, "HY000", fmt.Sprintf("File '%s' not found (OS errno 2 - No such file or directory)", opts.filePath))
+	}
+
+	content := string(data)
+
+	tbl, err := e.Storage.GetTable(e.CurrentDB, opts.tableName)
+	if err != nil {
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, opts.tableName))
+	}
+
+	tableColNames := make([]string, len(tbl.Def.Columns))
+	for i, col := range tbl.Def.Columns {
+		tableColNames[i] = col.Name
+	}
+
+	var pkCols []string
+	var uniqueCols []string
+	for _, col := range tbl.Def.Columns {
+		if col.PrimaryKey {
+			pkCols = append(pkCols, col.Name)
+		}
+		if col.Unique {
+			uniqueCols = append(uniqueCols, col.Name)
+		}
+	}
+	if len(pkCols) == 0 && len(tbl.Def.PrimaryKey) > 0 {
+		pkCols = tbl.Def.PrimaryKey
+	}
+	for _, idx := range tbl.Def.Indexes {
+		if idx.Unique && len(idx.Columns) == 1 {
+			uniqueCols = append(uniqueCols, idx.Columns[0])
+		}
+	}
+
+	lines := splitLoadDataLines(content, opts.linesTermBy)
+	if opts.ignoreLines > 0 && opts.ignoreLines < len(lines) {
+		lines = lines[opts.ignoreLines:]
+	}
+
+	var affected uint64
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		if opts.linesStartingBy != "" {
+			idx := strings.Index(line, opts.linesStartingBy)
+			if idx < 0 {
+				continue
+			}
+			line = line[idx+len(opts.linesStartingBy):]
+		}
+
+		fields := splitLoadDataFields(line, opts.fieldsTermBy, opts.fieldsEnclosedBy, opts.fieldsEscapedBy)
+		targetCols := tableColNames
+		if len(opts.columns) > 0 {
+			targetCols = opts.columns
+		}
+
+		row := make(storage.Row)
+		varMap := make(map[string]interface{})
+		for i, col := range targetCols {
+			var val interface{}
+			if i < len(fields) {
+				val = processLoadDataField(fields[i], opts.fieldsEscapedBy, opts.fieldsEnclosedBy)
+			}
+			if strings.HasPrefix(col, "@") {
+				varMap[col] = val
+			} else {
+				row[col] = val
+			}
+		}
+
+		if opts.setExprs != "" {
+			if err := e.applyLoadDataSet(opts.setExprs, row, varMap); err != nil {
+				return nil, err
+			}
+		}
+
+		for _, colDef := range tbl.Def.Columns {
+			if _, exists := row[colDef.Name]; !exists {
+				if colDef.AutoIncrement {
+					row[colDef.Name] = tbl.AutoIncrement.Add(1)
+				} else if colDef.Default != nil {
+					v, err := e.evalDefaultValue(*colDef.Default)
+					if err == nil {
+						row[colDef.Name] = v
+					}
+				}
+			}
+		}
+
+		if opts.isReplace {
+			dupIdx := e.findDuplicateRow(tbl, row, pkCols, uniqueCols)
+			if dupIdx >= 0 {
+				tbl.Lock()
+				tbl.Rows = append(tbl.Rows[:dupIdx], tbl.Rows[dupIdx+1:]...)
+				tbl.Unlock()
+			}
+		} else if !opts.isIgnore {
+			if opts.isLocal {
+				dupIdx := e.findDuplicateRow(tbl, row, pkCols, uniqueCols)
+				if dupIdx >= 0 {
+					continue
+				}
+			} else {
+				dupIdx := e.findDuplicateRow(tbl, row, pkCols, uniqueCols)
+				if dupIdx >= 0 {
+					dupKeyName := "PRIMARY"
+					dupKeyVal := ""
+					for _, pk := range pkCols {
+						if v, ok := row[pk]; ok {
+							dupKeyVal = fmt.Sprintf("%v", v)
+							break
+						}
+					}
+					return nil, mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key '%s'", dupKeyVal, dupKeyName))
+				}
+			}
+		} else {
+			dupIdx := e.findDuplicateRow(tbl, row, pkCols, uniqueCols)
+			if dupIdx >= 0 {
+				continue
+			}
+		}
+
+		tbl.Insert(row) //nolint:errcheck
+		affected++
+	}
+
+	return &Result{AffectedRows: affected}, nil
+}
+
+func splitLoadDataLines(content, linesTerm string) []string {
+	if linesTerm == "\n" {
+		content = strings.ReplaceAll(content, "\r\n", "\n")
+		return strings.Split(content, "\n")
+	}
+	return strings.Split(content, linesTerm)
+}
+
+func splitLoadDataFields(line, termBy, enclosedBy, escapedBy string) []string {
+	if enclosedBy == "" {
+		return strings.Split(line, termBy)
+	}
+	var fields []string
+	i := 0
+	for i < len(line) {
+		if strings.HasPrefix(line[i:], enclosedBy) {
+			i += len(enclosedBy)
+			var field strings.Builder
+			for i < len(line) {
+				if escapedBy != "" && strings.HasPrefix(line[i:], escapedBy) && i+len(escapedBy) < len(line) {
+					i += len(escapedBy)
+					if i < len(line) {
+						field.WriteByte(line[i])
+						i++
+					}
+				} else if strings.HasPrefix(line[i:], enclosedBy) {
+					i += len(enclosedBy)
+					break
+				} else {
+					field.WriteByte(line[i])
+					i++
+				}
+			}
+			fields = append(fields, field.String())
+			if strings.HasPrefix(line[i:], termBy) {
+				i += len(termBy)
+			}
+		} else {
+			end := strings.Index(line[i:], termBy)
+			if end < 0 {
+				fields = append(fields, line[i:])
+				break
+			}
+			fields = append(fields, line[i:i+end])
+			i += end + len(termBy)
+		}
+	}
+	return fields
+}
+
+func processLoadDataField(field, escapedBy, enclosedBy string) interface{} {
+	if escapedBy == "\\" && field == "\\N" {
+		return nil
+	}
+	if escapedBy != "" && escapedBy != "\\" && field == escapedBy+"N" {
+		return nil
+	}
+	return field
+}
+
+func (e *Executor) applyLoadDataSet(setExprs string, row storage.Row, varMap map[string]interface{}) error {
+	assignments := splitSetAssignments(setExprs)
+	for _, assign := range assignments {
+		parts := strings.SplitN(assign, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		colName := strings.TrimSpace(parts[0])
+		exprStr := strings.TrimSpace(parts[1])
+		for varName, varVal := range varMap {
+			if varVal == nil {
+				exprStr = strings.ReplaceAll(exprStr, varName, "NULL")
+			} else {
+				exprStr = strings.ReplaceAll(exprStr, varName, fmt.Sprintf("%v", varVal))
+			}
+		}
+		selectSQL := fmt.Sprintf("SELECT %s", exprStr)
+		result, err := e.Execute(selectSQL)
+		if err != nil {
+			return err
+		}
+		if len(result.Rows) > 0 && len(result.Rows[0]) > 0 {
+			row[colName] = result.Rows[0][0]
+		}
+	}
+	return nil
+}
+
+func splitSetAssignments(s string) []string {
+	var result []string
+	depth := 0
+	start := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				result = append(result, strings.TrimSpace(s[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	last := strings.TrimSpace(s[start:])
+	if last != "" {
+		result = append(result, last)
+	}
+	return result
+}
+
+func (e *Executor) evalDefaultValue(defStr string) (interface{}, error) {
+	selectSQL := fmt.Sprintf("SELECT %s", defStr)
+	result, err := e.Execute(selectSQL)
+	if err != nil {
+		return nil, err
+	}
+	if len(result.Rows) > 0 && len(result.Rows[0]) > 0 {
+		return result.Rows[0][0], nil
+	}
+	return nil, nil
+}
+
+// ---------- SELECT INTO OUTFILE ----------
+
+func (e *Executor) execSelectIntoOutfile(into *sqlparser.SelectInto, colNames []string, rows [][]interface{}) (*Result, error) {
+	fileName := into.FileName
+	if len(fileName) >= 2 && fileName[0] == '\'' && fileName[len(fileName)-1] == '\'' {
+		fileName = fileName[1 : len(fileName)-1]
+	}
+	if !filepath.IsAbs(fileName) && e.DataDir != "" {
+		fileName = filepath.Join(e.DataDir, fileName)
+	}
+
+	exportOpt := into.ExportOption
+	fieldsTerm := "\t"
+	fieldsEnclosedBy := ""
+	fieldsOptEnclosed := false
+	linesTerm := "\n"
+	fieldsEscapedBy := "\\"
+
+	if exportOpt != "" {
+		exportUpper := strings.ToUpper(exportOpt)
+		if val, ok := findKeywordAndExtractString(exportOpt, "terminated by"); ok {
+			fieldsIdx := strings.Index(exportUpper, "FIELDS")
+			linesIdx := strings.Index(exportUpper, "LINES")
+			termIdx := strings.Index(exportUpper, "TERMINATED BY")
+			if fieldsIdx >= 0 && (linesIdx < 0 || termIdx < linesIdx) {
+				fieldsTerm = val
+			}
+		}
+		if strings.Contains(exportUpper, "OPTIONALLY ENCLOSED BY") {
+			if val, ok := findKeywordAndExtractString(exportOpt, "optionally enclosed by"); ok {
+				fieldsEnclosedBy = val
+				fieldsOptEnclosed = true
+			}
+		} else if strings.Contains(exportUpper, "ENCLOSED BY") {
+			if val, ok := findKeywordAndExtractString(exportOpt, "enclosed by"); ok {
+				fieldsEnclosedBy = val
+			}
+		}
+		if val, ok := findKeywordAndExtractString(exportOpt, "escaped by"); ok {
+			fieldsEscapedBy = val
+		}
+		if linesIdx := strings.Index(exportUpper, "LINES"); linesIdx >= 0 {
+			afterLines := exportOpt[linesIdx:]
+			if val, ok := findKeywordAndExtractString(afterLines, "terminated by"); ok {
+				linesTerm = val
+			}
+		}
+	}
+
+	var sb strings.Builder
+	for _, row := range rows {
+		for i, val := range row {
+			if i > 0 {
+				sb.WriteString(fieldsTerm)
+			}
+			if val == nil {
+				sb.WriteString(fieldsEscapedBy + "N")
+			} else {
+				s := fmt.Sprintf("%v", val)
+				if fieldsEnclosedBy != "" {
+					if !fieldsOptEnclosed {
+						sb.WriteString(fieldsEnclosedBy + s + fieldsEnclosedBy)
+					} else {
+						if _, err := strconv.ParseFloat(s, 64); err != nil {
+							sb.WriteString(fieldsEnclosedBy + s + fieldsEnclosedBy)
+						} else {
+							sb.WriteString(s)
+						}
+					}
+				} else {
+					if fieldsEscapedBy != "" {
+						s = strings.ReplaceAll(s, fieldsEscapedBy, fieldsEscapedBy+fieldsEscapedBy)
+					}
+					sb.WriteString(s)
+				}
+			}
+		}
+		sb.WriteString(linesTerm)
+	}
+
+	dir := filepath.Dir(fileName)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("cannot create directory for outfile: %v", err)
+	}
+	if err := os.WriteFile(fileName, []byte(sb.String()), 0644); err != nil {
+		return nil, fmt.Errorf("cannot write outfile: %v", err)
+	}
+
+	return &Result{AffectedRows: uint64(len(rows))}, nil
 }

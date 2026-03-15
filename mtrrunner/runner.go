@@ -32,6 +32,7 @@ type Runner struct {
 	DB           *sql.DB
 	IncludePaths []string // directories to search for --source files
 	Verbose      bool
+	TmpDir       string // temporary directory for file operations ($MYSQLTEST_VARDIR)
 }
 
 // RunFile executes a single .test file and compares output to .result file.
@@ -67,6 +68,14 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	// Execute with timeout
 	timeout := 10 * time.Second
 	doneCh := make(chan error, 1)
+
+	tmpDir := r.TmpDir
+	if tmpDir == "" {
+		tmpDir, _ = os.MkdirTemp("", "mylite-mtr-*")
+	}
+	// Ensure tmp subdir exists
+	os.MkdirAll(filepath.Join(tmpDir, "tmp"), 0755) //nolint:errcheck
+
 	ectx := &execContext{
 		runner:          r,
 		db:              r.DB,
@@ -75,8 +84,10 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		queryLogEnabled: true,
 		resultLogEnabled: true,
 		sortResult:      false,
+		tmpDir:          tmpDir,
 		variables: map[string]string{
-			"ENGINE": "InnoDB",
+			"ENGINE":            "InnoDB",
+			"$MYSQLTEST_VARDIR": tmpDir,
 		},
 	}
 
@@ -164,6 +175,7 @@ type execContext struct {
 	expectedError    string // expected error code/name for next statement
 	variables        map[string]string
 	delimiter        string
+	tmpDir           string // temporary directory for file operations
 }
 
 func (ctx *execContext) executeLines(lines []string) error {
@@ -430,6 +442,15 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		}
 		return true, false, nil
 
+	case "remove_file":
+		path := ctx.substituteVars(args)
+		path = ctx.resolveFilePath(path)
+		os.Remove(path) //nolint:errcheck
+		return true, false, nil
+
+	case "copy_file":
+		return true, false, ctx.handleCopyFile(args)
+
 	// Directives we accept but ignore
 	case "character_set", "charset":
 		return true, false, nil
@@ -441,8 +462,8 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"connect", "connection", "disconnect",
 		"send", "reap", "sleep",
 		"replace_result", "replace_regex", "replace_column",
-		"remove_file", "write_file", "append_file", "cat_file",
-		"mkdir", "rmdir", "copy_file", "move_file",
+		"write_file", "append_file", "cat_file",
+		"mkdir", "rmdir", "move_file",
 		"list_files", "file_exists",
 		"exec", "system",
 		"die", "exit",
@@ -526,6 +547,11 @@ func (ctx *execContext) executeQuery(stmt string) error {
 	columns, err := rows.Columns()
 	if err != nil {
 		return err
+	}
+
+	// Skip output for statements that return no columns (e.g., SELECT INTO OUTFILE)
+	if len(columns) == 0 {
+		return nil
 	}
 
 	// Write column headers
@@ -994,3 +1020,52 @@ func computeDiff(expected, actual string) string {
 
 // re for matching error codes
 var reErrorCode = regexp.MustCompile(`^\d+$`)
+
+// resolveFilePath resolves a file path, substituting variables and making absolute.
+func (ctx *execContext) resolveFilePath(path string) string {
+	path = ctx.substituteVars(path)
+	path = strings.TrimSpace(path)
+	if !filepath.IsAbs(path) {
+		// Build candidate paths with MySQL test suite path mappings
+		candidates := []string{path}
+		if strings.Contains(path, "suite/engines/funcs/") {
+			mapped := strings.Replace(path, "suite/engines/funcs/", "engine_funcs/", 1)
+			candidates = append(candidates, mapped)
+		}
+		candidates = append(candidates, filepath.Base(path))
+
+		// Try to resolve relative to search paths
+		for _, candidate := range candidates {
+			for _, dir := range ctx.runner.IncludePaths {
+				full := filepath.Join(dir, candidate)
+				if _, err := os.Stat(full); err == nil {
+					return full
+				}
+			}
+		}
+		// Default to tmpDir
+		if ctx.tmpDir != "" {
+			return filepath.Join(ctx.tmpDir, path)
+		}
+	}
+	return path
+}
+
+// handleCopyFile implements the --copy_file directive.
+func (ctx *execContext) handleCopyFile(args string) error {
+	args = ctx.substituteVars(args)
+	parts := strings.Fields(args)
+	if len(parts) < 2 {
+		return fmt.Errorf("copy_file requires 2 arguments: source dest")
+	}
+	src := ctx.resolveFilePath(parts[0])
+	dst := ctx.resolveFilePath(parts[1])
+
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return fmt.Errorf("copy_file: cannot read source '%s': %v", src, err)
+	}
+	// Ensure destination directory exists
+	os.MkdirAll(filepath.Dir(dst), 0755) //nolint:errcheck
+	return os.WriteFile(dst, data, 0644)
+}

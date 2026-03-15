@@ -46,9 +46,25 @@ func main() {
 	addr := listener.Addr().String()
 	listener.Close()
 
+	// Create a persistent temp directory for this run
+	tmpDir, err := os.MkdirTemp("", "mylite-mtr-*")
+	if err != nil {
+		log.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+	os.MkdirAll(filepath.Join(tmpDir, "tmp"), 0755) //nolint:errcheck
+	// Create a data dir 2 levels deep so that ../../tmp/ resolves to $tmpDir/tmp/
+	dataDir := filepath.Join(tmpDir, "data", "inner")
+	os.MkdirAll(dataDir, 0755) //nolint:errcheck
+
 	cat := catalog.New()
 	store := storage.NewEngine()
 	exec := executor.New(cat, store)
+	// Set DataDir for resolving relative paths in LOAD DATA/SELECT INTO OUTFILE
+	exec.DataDir = dataDir
+	// Set search paths for LOAD DATA LOCAL INFILE
+	exec.SearchPaths = []string{*suiteRoot, *includeRoot}
+
 	srv := server.New(exec, addr)
 	go func() {
 		srv.Start() //nolint:errcheck
@@ -78,6 +94,7 @@ func main() {
 			*includeRoot,
 		},
 		Verbose: *verbose,
+		TmpDir:  tmpDir,
 	}
 
 	target := args[0]
@@ -110,6 +127,8 @@ func main() {
 	}
 	// Add the suite root for relative paths like suite/engines/funcs/t/file.inc
 	runner.IncludePaths = append(runner.IncludePaths, *suiteRoot)
+	// Update executor search paths to include suite-specific paths
+	exec.SearchPaths = append(exec.SearchPaths, runner.IncludePaths...)
 
 	// Specific test within suite?
 	testFilter := ""
