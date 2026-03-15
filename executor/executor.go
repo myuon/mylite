@@ -429,6 +429,17 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	var primaryKeys []string
 
 	for _, col := range stmt.TableSpec.Columns {
+		// Validate ENUM/SET value lengths (MySQL max is 255 characters).
+		colTypeLower := strings.ToLower(col.Type.Type)
+		if colTypeLower == "enum" || colTypeLower == "set" {
+			for _, ev := range col.Type.EnumValues {
+				v := strings.Trim(ev, "'")
+				if len(v) > 255 {
+					return nil, mysqlError(1097, "HY000", fmt.Sprintf("Too long enumeration/set value for column %s.", col.Name.String()))
+				}
+			}
+		}
+
 		// Default: nullable unless NOT NULL is explicitly specified
 		nullable := true
 		if col.Type.Options != nil && col.Type.Options.Null != nil {
@@ -802,6 +813,15 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			if err != nil {
 				return nil, err
 			}
+			// Pad BINARY(N) values with null bytes.
+			for _, col := range tbl.Def.Columns {
+				if col.Name == colNames[i] {
+					if padLen := binaryPadLength(col.Type); padLen > 0 && v != nil {
+						v = padBinaryValue(v, padLen)
+					}
+					break
+				}
+			}
 			row[colNames[i]] = v
 		}
 
@@ -817,6 +837,15 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					if err != nil {
 						tbl.Unlock()
 						return nil, err
+					}
+					// Pad BINARY(N) values.
+					for _, col := range tbl.Def.Columns {
+						if col.Name == colName {
+							if padLen := binaryPadLength(col.Type); padLen > 0 && val != nil {
+								val = padBinaryValue(val, padLen)
+							}
+							break
+						}
 					}
 					tbl.Rows[dupIdx][colName] = val
 				}
@@ -1468,7 +1497,8 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		if count == 0 {
 			return nil, nil
 		}
-		return sum / float64(count), nil
+		// MySQL AVG() returns DECIMAL with 4 decimal places by default.
+		return fmt.Sprintf("%.4f", sum/float64(count)), nil
 	}
 	// Non-aggregate: return value from representative row
 	return evalRowExpr(expr, repRow)
@@ -1685,6 +1715,15 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 			if err != nil {
 				return nil, err
 			}
+			// Pad BINARY(N) values.
+			for _, col := range tbl.Def.Columns {
+				if col.Name == colName {
+					if padLen := binaryPadLength(col.Type); padLen > 0 && val != nil {
+						val = padBinaryValue(val, padLen)
+					}
+					break
+				}
+			}
 			tbl.Rows[i][colName] = val
 		}
 		affected++
@@ -1714,6 +1753,85 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 
 	tbl.Lock()
 	defer tbl.Unlock()
+
+	// If ORDER BY or LIMIT is specified, we need to determine which rows to
+	// delete in order, then limit the deletion count.
+	if stmt.OrderBy != nil || stmt.Limit != nil {
+		// Get table def for column names (needed by applyOrderBy).
+		db, dbErr := e.Catalog.GetDatabase(e.CurrentDB)
+		if dbErr != nil {
+			return nil, dbErr
+		}
+		def, defErr := db.GetTable(tableName)
+		if defErr != nil {
+			return nil, defErr
+		}
+		colNames := make([]string, len(def.Columns))
+		for i, c := range def.Columns {
+			colNames[i] = c.Name
+		}
+
+		// Build a list of candidate row indices that match WHERE.
+		type indexedRow struct {
+			idx int
+			row storage.Row
+		}
+		var candidates []indexedRow
+		for i, row := range tbl.Rows {
+			match := true
+			if stmt.Where != nil {
+				m, wErr := e.evalWhere(stmt.Where.Expr, row)
+				if wErr != nil {
+					return nil, wErr
+				}
+				match = m
+			}
+			if match {
+				candidates = append(candidates, indexedRow{idx: i, row: row})
+			}
+		}
+
+		// Convert candidates to [][]interface{} for applyOrderBy / applyLimit.
+		flatRows := make([][]interface{}, len(candidates))
+		for i, c := range candidates {
+			r := make([]interface{}, len(colNames))
+			for j, cn := range colNames {
+				r[j] = c.row[cn]
+			}
+			// Append original index as last element for tracking.
+			r = append(r, c.idx)
+			flatRows[i] = r
+		}
+
+		if stmt.OrderBy != nil {
+			flatRows, err = applyOrderBy(stmt.OrderBy, colNames, flatRows)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if stmt.Limit != nil {
+			flatRows, err = applyLimit(stmt.Limit, flatRows)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// Collect the original indices to delete.
+		deleteSet := make(map[int]bool, len(flatRows))
+		for _, r := range flatRows {
+			origIdx := r[len(r)-1].(int)
+			deleteSet[origIdx] = true
+		}
+
+		newRows := make([]storage.Row, 0, len(tbl.Rows)-len(deleteSet))
+		for i, row := range tbl.Rows {
+			if !deleteSet[i] {
+				newRows = append(newRows, row)
+			}
+		}
+		tbl.Rows = newRows
+		return &Result{AffectedRows: uint64(len(deleteSet))}, nil
+	}
 
 	newRows := make([]storage.Row, 0)
 	var affected uint64
@@ -1857,7 +1975,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			usingMethod := ""
 			for _, opt := range op.IndexDefinition.Options {
 				if opt.Name == "USING" {
-					usingMethod = opt.String
+					// InnoDB does not support HASH; silently ignore it.
+					if strings.ToUpper(opt.String) != "HASH" {
+						usingMethod = opt.String
+					}
 				}
 			}
 			if isPrimary {
@@ -2156,6 +2277,37 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 // buildColumnTypeString builds a type string from a sqlparser.ColumnType,
 // including length, scale, unsigned, zerofill, and enum values,
 // but excluding options like NOT NULL, AUTO_INCREMENT, etc.
+// binaryPadLength checks if a column type is BINARY(N) (not VARBINARY) and
+// returns the fixed width N. Returns 0 if the column is not a fixed-width binary type.
+func binaryPadLength(colType string) int {
+	lower := strings.ToLower(colType)
+	// Must match "binary(N)" but not "varbinary(N)"
+	if strings.HasPrefix(lower, "binary(") && !strings.HasPrefix(lower, "varbinary") {
+		var n int
+		if _, err := fmt.Sscanf(lower, "binary(%d)", &n); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+// padBinaryValue pads a string value to the given length with null bytes.
+func padBinaryValue(val interface{}, padLen int) interface{} {
+	if val == nil || padLen <= 0 {
+		return val
+	}
+	s, ok := val.(string)
+	if !ok {
+		return val
+	}
+	if len(s) < padLen {
+		s = s + strings.Repeat("\x00", padLen-len(s))
+	} else if len(s) > padLen {
+		s = s[:padLen]
+	}
+	return s
+}
+
 func buildColumnTypeString(ct *sqlparser.ColumnType) string {
 	s := strings.ToLower(ct.Type)
 	if ct.Length != nil && ct.Scale != nil {
@@ -2304,9 +2456,20 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 			if defVal == "NULL" || defVal == "null" {
 				parts = append(parts, "DEFAULT NULL")
 			} else if strings.HasPrefix(defVal, "'") {
-				// Already quoted
+				// Already quoted - pad BINARY default values.
+				if padLen := binaryPadLength(col.Type); padLen > 0 {
+					inner := defVal[1 : len(defVal)-1] // strip quotes
+					if len(inner) < padLen {
+						inner = inner + strings.Repeat("\\0", padLen-len(inner))
+					}
+					defVal = "'" + inner + "'"
+				}
 				parts = append(parts, fmt.Sprintf("DEFAULT %s", defVal))
 			} else {
+				// Pad BINARY default values.
+				if padLen := binaryPadLength(col.Type); padLen > 0 && len(defVal) < padLen {
+					defVal = defVal + strings.Repeat("\\0", padLen-len(defVal))
+				}
 				parts = append(parts, fmt.Sprintf("DEFAULT '%s'", defVal))
 			}
 		} else if col.Nullable {

@@ -13,6 +13,13 @@ import (
 // Values are stored as interface{} (nil for NULL).
 type Row map[string]interface{}
 
+// displayValue formats a value for error messages, stripping trailing null bytes
+// from strings (for BINARY column display).
+func displayValue(v interface{}) string {
+	s := fmt.Sprintf("%v", v)
+	return strings.TrimRight(s, "\x00")
+}
+
 // Table is the in-memory storage for a single table.
 type Table struct {
 	Def           *catalog.TableDef
@@ -145,7 +152,7 @@ func (t *Table) Insert(row Row) (int64, error) {
 			if match {
 				pkVal := make([]string, len(t.Def.PrimaryKey))
 				for i, pk := range t.Def.PrimaryKey {
-					pkVal[i] = fmt.Sprintf("%v", row[pk])
+					pkVal[i] = displayValue(row[pk])
 				}
 				return 0, fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key 'PRIMARY'",
 					strings.Join(pkVal, "-"))
@@ -158,8 +165,8 @@ func (t *Table) Insert(row Row) (int64, error) {
 		if col.PrimaryKey {
 			for _, existing := range t.Rows {
 				if fmt.Sprintf("%v", existing[col.Name]) == fmt.Sprintf("%v", row[col.Name]) {
-					return 0, fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%v' for key 'PRIMARY'",
-						row[col.Name])
+					return 0, fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key 'PRIMARY'",
+						displayValue(row[col.Name]))
 				}
 			}
 		}
@@ -186,7 +193,7 @@ func (t *Table) Insert(row Row) (int64, error) {
 				if match {
 					vals := make([]string, len(idx.Columns))
 					for i, c := range idx.Columns {
-						vals[i] = fmt.Sprintf("%v", row[c])
+						vals[i] = displayValue(row[c])
 					}
 					return 0, fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key '%s'",
 						strings.Join(vals, "-"), idx.Name)
