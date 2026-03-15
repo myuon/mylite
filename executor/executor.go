@@ -968,6 +968,19 @@ func selectExprsHaveAggregates(exprs []sqlparser.SelectExpr) bool {
 	return false
 }
 
+// aggregateDisplayName returns the MySQL-style display name for aggregate expressions.
+// MySQL returns "COUNT(c1)", "SUM(c1)", etc. (uppercase function name).
+func aggregateDisplayName(expr sqlparser.Expr) string {
+	s := sqlparser.String(expr)
+	// Replace lowercase function names with uppercase
+	for _, fn := range []string{"count", "sum", "avg", "min", "max"} {
+		if strings.HasPrefix(s, fn+"(") {
+			return strings.ToUpper(fn) + s[len(fn):]
+		}
+	}
+	return s
+}
+
 func isAggregateExpr(expr sqlparser.Expr) bool {
 	switch expr.(type) {
 	case *sqlparser.CountStar, *sqlparser.Count,
@@ -1010,7 +1023,8 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 			if !se.As.IsEmpty() {
 				colNames = append(colNames, se.As.String())
 			} else if isAggregateExpr(se.Expr) {
-				colNames = append(colNames, sqlparser.String(se.Expr))
+				// MySQL returns aggregate function names in uppercase
+				colNames = append(colNames, aggregateDisplayName(se.Expr))
 			} else if colName, ok := se.Expr.(*sqlparser.ColName); ok {
 				colNames = append(colNames, colName.Name.String())
 			} else {
