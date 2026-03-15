@@ -818,3 +818,163 @@ func TestSystemVariables(t *testing.T) {
 		SkipResultCompare: true,
 	})
 }
+
+func TestCTE(t *testing.T) {
+	h := getHarness(t)
+
+	h.Run(TestCase{
+		Name: "simple CTE with SELECT",
+		Setup: []string{
+			"CREATE TABLE test_cte_orders (id INT PRIMARY KEY, amount INT, status VARCHAR(50))",
+			"INSERT INTO test_cte_orders (id, amount, status) VALUES (1, 100, 'paid')",
+			"INSERT INTO test_cte_orders (id, amount, status) VALUES (2, 200, 'paid')",
+			"INSERT INTO test_cte_orders (id, amount, status) VALUES (3, 50, 'pending')",
+		},
+		Query: `WITH paid_orders AS (
+			SELECT id, amount FROM test_cte_orders WHERE status = 'paid'
+		)
+		SELECT id, amount FROM paid_orders ORDER BY id`,
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_cte_orders",
+		},
+	})
+
+	h.Run(TestCase{
+		Name: "CTE with aggregation",
+		Setup: []string{
+			"CREATE TABLE test_cte_sales (id INT PRIMARY KEY, region VARCHAR(50), amount INT)",
+			"INSERT INTO test_cte_sales (id, region, amount) VALUES (1, 'north', 300)",
+			"INSERT INTO test_cte_sales (id, region, amount) VALUES (2, 'south', 150)",
+			"INSERT INTO test_cte_sales (id, region, amount) VALUES (3, 'north', 200)",
+		},
+		Query: `WITH regional AS (
+			SELECT region, SUM(amount) AS total FROM test_cte_sales GROUP BY region
+		)
+		SELECT region, total FROM regional ORDER BY region`,
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_cte_sales",
+		},
+	})
+
+	h.Run(TestCase{
+		Name: "CTE filtering with WHERE on CTE result",
+		Setup: []string{
+			"CREATE TABLE test_cte_items (id INT PRIMARY KEY, name VARCHAR(100), price INT)",
+			"INSERT INTO test_cte_items (id, name, price) VALUES (1, 'alpha', 10)",
+			"INSERT INTO test_cte_items (id, name, price) VALUES (2, 'beta', 20)",
+			"INSERT INTO test_cte_items (id, name, price) VALUES (3, 'gamma', 30)",
+		},
+		Query: `WITH expensive AS (
+			SELECT id, name, price FROM test_cte_items WHERE price >= 20
+		)
+		SELECT id, name FROM expensive ORDER BY id`,
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_cte_items",
+		},
+	})
+}
+
+func TestTruncate(t *testing.T) {
+	h := getHarness(t)
+
+	h.Run(TestCase{
+		Name: "TRUNCATE TABLE removes all rows",
+		Setup: []string{
+			"CREATE TABLE test_truncate (id INT PRIMARY KEY, val INT)",
+			"INSERT INTO test_truncate (id, val) VALUES (1, 10)",
+			"INSERT INTO test_truncate (id, val) VALUES (2, 20)",
+			"INSERT INTO test_truncate (id, val) VALUES (3, 30)",
+			"TRUNCATE TABLE test_truncate",
+		},
+		Query: "SELECT COUNT(*) FROM test_truncate",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_truncate",
+		},
+	})
+
+	h.Run(TestCase{
+		Name: "TRUNCATE TABLE resets AUTO_INCREMENT",
+		Setup: []string{
+			"CREATE TABLE test_truncate_ai (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(100))",
+			"INSERT INTO test_truncate_ai (name) VALUES ('a')",
+			"INSERT INTO test_truncate_ai (name) VALUES ('b')",
+			"TRUNCATE TABLE test_truncate_ai",
+			"INSERT INTO test_truncate_ai (name) VALUES ('c')",
+		},
+		Query: "SELECT id FROM test_truncate_ai",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_truncate_ai",
+		},
+	})
+}
+
+func TestInformationSchema(t *testing.T) {
+	h := getHarness(t)
+
+	h.Run(TestCase{
+		Name: "INFORMATION_SCHEMA.SCHEMATA lists databases",
+		Setup: []string{
+			"CREATE DATABASE IF NOT EXISTS test_is_db",
+		},
+		Query: "SELECT SCHEMA_NAME FROM information_schema.schemata WHERE SCHEMA_NAME = 'test_is_db'",
+		Teardown: []string{
+			"DROP DATABASE IF EXISTS test_is_db",
+		},
+		MyliteOnly: true,
+	})
+
+	h.Run(TestCase{
+		Name: "INFORMATION_SCHEMA.TABLES lists tables",
+		Setup: []string{
+			"CREATE TABLE test_is_tables (id INT PRIMARY KEY, name VARCHAR(100))",
+		},
+		Query: "SELECT TABLE_NAME, TABLE_TYPE, ENGINE FROM information_schema.tables WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'test_is_tables'",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_is_tables",
+		},
+		MyliteOnly: true,
+	})
+
+	h.Run(TestCase{
+		Name: "INFORMATION_SCHEMA.COLUMNS lists columns",
+		Setup: []string{
+			"CREATE TABLE test_is_cols (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(255) NOT NULL, age INT)",
+		},
+		Query: "SELECT COLUMN_NAME, ORDINAL_POSITION, IS_NULLABLE, EXTRA FROM information_schema.columns WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'test_is_cols' ORDER BY ORDINAL_POSITION",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_is_cols",
+		},
+		MyliteOnly: true,
+	})
+
+	h.Run(TestCase{
+		Name: "INFORMATION_SCHEMA.SCHEMATA column structure",
+		Query: "SELECT CATALOG_NAME, DEFAULT_CHARACTER_SET_NAME FROM information_schema.schemata WHERE SCHEMA_NAME = 'test'",
+		MyliteOnly: true,
+	})
+
+	h.Run(TestCase{
+		Name: "SHOW TABLE STATUS returns rows for current DB",
+		Setup: []string{
+			"CREATE TABLE test_ts_show (id INT PRIMARY KEY)",
+		},
+		Query: "SHOW TABLE STATUS",
+		SkipResultCompare: true,
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_ts_show",
+		},
+		MyliteOnly: true,
+	})
+
+	h.Run(TestCase{
+		Name: "INFORMATION_SCHEMA.TABLES WHERE filter works",
+		Setup: []string{
+			"CREATE TABLE test_is_filter_a (id INT PRIMARY KEY)",
+		},
+		Query: "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.tables WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'test_is_filter_a'",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_is_filter_a",
+		},
+		MyliteOnly: true,
+	})
+}

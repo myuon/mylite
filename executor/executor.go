@@ -35,6 +35,12 @@ type fullSnapshot struct {
 	catalogSnap map[string]map[string]*catalog.TableDef
 }
 
+// cteTable holds pre-computed rows for a Common Table Expression.
+type cteTable struct {
+	columns []string
+	rows    []storage.Row
+}
+
 // Executor handles SQL execution.
 type Executor struct {
 	Catalog        *catalog.Catalog
@@ -44,6 +50,8 @@ type Executor struct {
 	savepoint      *txSavepoint
 	snapshots      map[string]*fullSnapshot
 	lastInsertID   int64
+	// cteMap holds CTE virtual tables for the currently executing query.
+	cteMap         map[string]*cteTable
 }
 
 func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
@@ -53,6 +61,12 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		CurrentDB: "test",
 		snapshots: make(map[string]*fullSnapshot),
 	}
+}
+
+// mysqlError formats an error message in MySQL error style.
+// Format: "ERROR <code> (<state>): <message>"
+func mysqlError(code int, state, message string) error {
+	return fmt.Errorf("ERROR %d (%s): %s", code, state, message)
 }
 
 // Execute parses and executes a SQL statement.
@@ -100,6 +114,8 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return e.execCommit()
 	case *sqlparser.Rollback:
 		return e.execRollback()
+	case *sqlparser.TruncateTable:
+		return e.execTruncateTable(s)
 	case *sqlparser.Set:
 		// Accept SET statements silently
 		return &Result{}, nil
@@ -150,7 +166,7 @@ func (e *Executor) execUse(stmt *sqlparser.Use) (*Result, error) {
 func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error) {
 	db, err := e.Catalog.GetDatabase(e.CurrentDB)
 	if err != nil {
-		return nil, err
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
 	}
 
 	tableName := stmt.Table.Name.String()
@@ -211,7 +227,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		if stmt.IfNotExists {
 			return &Result{}, nil
 		}
-		return nil, err
+		return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", tableName))
 	}
 	e.Storage.CreateTable(e.CurrentDB, def)
 	return &Result{}, nil
@@ -220,7 +236,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 	db, err := e.Catalog.GetDatabase(e.CurrentDB)
 	if err != nil {
-		return nil, err
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
 	}
 
 	for _, table := range stmt.FromTables {
@@ -230,7 +246,7 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 			if stmt.IfExists {
 				continue
 			}
-			return nil, err
+			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
 		}
 		e.Storage.DropTable(e.CurrentDB, tableName)
 	}
@@ -396,7 +412,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 
 	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
 	if err != nil {
-		return nil, err
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
 	}
 
 	// Get column names
@@ -539,9 +555,45 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 		if strings.ToLower(tableName) == "dual" {
 			return []storage.Row{{}}, nil
 		}
+		// Check CTE map first.
+		if e.cteMap != nil {
+			if cteTbl, ok := e.cteMap[tableName]; ok {
+				result := make([]storage.Row, len(cteTbl.rows))
+				for i, row := range cteTbl.rows {
+					newRow := make(storage.Row, len(row)*2)
+					for k, v := range row {
+						newRow[k] = v
+						newRow[alias+"."+k] = v
+					}
+					result[i] = newRow
+				}
+				return result, nil
+			}
+		}
+		// Handle INFORMATION_SCHEMA virtual tables.
+		var qualifier string
+		var bareTableName string
+		if tn, ok := te.Expr.(sqlparser.TableName); ok {
+			qualifier = tn.Qualifier.String()
+			bareTableName = tn.Name.String()
+		} else {
+			bareTableName = tableName
+		}
+		if e.isInformationSchemaTable(qualifier, bareTableName) {
+			isAlias := alias
+			if isAlias == tableName {
+				// No explicit AS alias; use qualifier-qualified name as prefix.
+				if qualifier != "" {
+					isAlias = qualifier + "." + bareTableName
+				} else {
+					isAlias = bareTableName
+				}
+			}
+			return e.buildInformationSchemaRows(bareTableName, isAlias)
+		}
 		tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
 		if err != nil {
-			return nil, err
+			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
 		}
 		raw := tbl.Scan()
 		result := make([]storage.Row, len(raw))
@@ -645,6 +697,46 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// Handle SELECT without FROM (e.g., SELECT 1, SELECT @@version_comment)
 	if len(stmt.From) == 0 {
 		return e.execSelectNoFrom(stmt)
+	}
+
+	// Process WITH clause (Common Table Expressions) if present.
+	if stmt.With != nil && len(stmt.With.CTEs) > 0 {
+		// Save any outer CTE map and restore on exit.
+		outerCTEMap := e.cteMap
+		newCTEMap := make(map[string]*cteTable)
+		if outerCTEMap != nil {
+			for k, v := range outerCTEMap {
+				newCTEMap[k] = v
+			}
+		}
+		e.cteMap = newCTEMap
+		defer func() { e.cteMap = outerCTEMap }()
+
+		for _, cte := range stmt.With.CTEs {
+			cteName := cte.ID.String()
+			// Execute the CTE subquery.
+			subSel, ok := cte.Subquery.(*sqlparser.Select)
+			if !ok {
+				return nil, fmt.Errorf("CTE '%s': only SELECT subqueries are supported", cteName)
+			}
+			subResult, err := e.execSelect(subSel)
+			if err != nil {
+				return nil, fmt.Errorf("CTE '%s': %w", cteName, err)
+			}
+			// Convert result rows into storage.Row maps.
+			cteRows := make([]storage.Row, len(subResult.Rows))
+			for i, row := range subResult.Rows {
+				r := make(storage.Row, len(subResult.Columns))
+				for j, col := range subResult.Columns {
+					r[col] = row[j]
+				}
+				cteRows[i] = r
+			}
+			newCTEMap[cteName] = &cteTable{
+				columns: subResult.Columns,
+				rows:    cteRows,
+			}
+		}
 	}
 
 	// Build rows from FROM clause (handles single table and JOINs)
@@ -1038,7 +1130,7 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 
 	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
 	if err != nil {
-		return nil, err
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
 	}
 
 	tbl.Lock()
@@ -1088,7 +1180,7 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 
 	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
 	if err != nil {
-		return nil, err
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
 	}
 
 	tbl.Lock()
@@ -1147,7 +1239,7 @@ func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 	db, err := e.Catalog.GetDatabase(e.CurrentDB)
 	if err != nil {
-		return nil, err
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
 	}
 
 	tableName := stmt.Table.Name.String()
@@ -1155,7 +1247,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 	// Ensure the storage table exists.
 	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
 	if err != nil {
-		return nil, err
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
 	}
 
 	for _, opt := range stmt.AlterOptions {
@@ -1223,11 +1315,11 @@ func (e *Executor) execDescribe(stmt *sqlparser.ExplainTab) (*Result, error) {
 func (e *Executor) describeTable(tableName string) (*Result, error) {
 	db, err := e.Catalog.GetDatabase(e.CurrentDB)
 	if err != nil {
-		return nil, err
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
 	}
 	tblDef, err := db.GetTable(tableName)
 	if err != nil {
-		return nil, err
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
 	}
 
 	cols := []string{"Field", "Type", "Null", "Key", "Default", "Extra"}
@@ -1268,6 +1360,9 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		case sqlparser.Column:
 			// SHOW COLUMNS FROM <table> / SHOW FULL COLUMNS FROM <table>
 			return e.describeTable(basic.Tbl.Name.String())
+		case sqlparser.TableStatus:
+			// SHOW TABLE STATUS [FROM db] [LIKE ...]
+			return e.showTableStatus()
 		}
 	}
 
@@ -2298,4 +2393,15 @@ func applyLimit(limit *sqlparser.Limit, rows [][]interface{}) ([][]interface{}, 
 		end = int64(len(rows))
 	}
 	return rows[offset:end], nil
+}
+
+// execTruncateTable handles TRUNCATE TABLE statements.
+func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, error) {
+	tableName := stmt.Table.Name.String()
+	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
+	if err != nil {
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
+	}
+	tbl.Truncate()
+	return &Result{}, nil
 }
