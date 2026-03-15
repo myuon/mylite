@@ -20,8 +20,9 @@ type Table struct {
 	Mu            sync.RWMutex
 }
 
-func (t *Table) Lock()   { t.Mu.Lock() }
-func (t *Table) Unlock() { t.Mu.Unlock() }
+func (t *Table) Lock()                   { t.Mu.Lock() }
+func (t *Table) Unlock()                 { t.Mu.Unlock() }
+func (t *Table) AutoIncrementValue() int64 { return t.AutoIncrement.Load() }
 
 // Engine is the in-memory storage engine managing all tables per database.
 type Engine struct {
@@ -58,7 +59,7 @@ func (e *Engine) CreateTable(dbName string, def *catalog.TableDef) {
 		e.databases[dbName] = make(map[string]*Table)
 	}
 	t := &Table{Def: def, Rows: make([]Row, 0)}
-	t.AutoIncrement.Store(1)
+	t.AutoIncrement.Store(0)
 	e.databases[dbName][def.Name] = t
 }
 
@@ -94,7 +95,7 @@ func (t *Table) Insert(row Row) (int64, error) {
 	for _, col := range t.Def.Columns {
 		if col.AutoIncrement {
 			if v, ok := row[col.Name]; !ok || v == nil {
-				id := t.AutoIncrement.Add(1) - 1
+				id := t.AutoIncrement.Add(1)
 				row[col.Name] = id
 				lastInsertID = id
 			} else {

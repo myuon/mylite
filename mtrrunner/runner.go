@@ -75,6 +75,9 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		queryLogEnabled: true,
 		resultLogEnabled: true,
 		sortResult:      false,
+		variables: map[string]string{
+			"ENGINE": "InnoDB",
+		},
 	}
 
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -535,8 +538,10 @@ func (ctx *execContext) setVariable(expr string) error {
 		row := ctx.db.QueryRow(sqlStmt)
 		var result string
 		if err := row.Scan(&result); err != nil {
-			// Store empty string on error (query might return no rows)
-			ctx.variables[name] = ""
+			// On error, keep existing value if set (e.g. $ENGINE default)
+			if _, exists := ctx.variables[name]; !exists {
+				ctx.variables[name] = ""
+			}
 			return nil
 		}
 		ctx.variables[name] = result
@@ -855,7 +860,10 @@ func normalizeExpected(s string) string {
 
 		result = append(result, trimmed)
 	}
-	return strings.TrimRight(strings.Join(result, "\n"), "\n")
+	out := strings.Join(result, "\n")
+	// Normalize ENGINE=ENGINE to ENGINE=InnoDB (dolt test corpus uses placeholder)
+	out = strings.ReplaceAll(out, "ENGINE=ENGINE", "ENGINE=InnoDB")
+	return strings.TrimRight(out, "\n")
 }
 
 var diffContextLines = 3

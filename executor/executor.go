@@ -281,11 +281,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				defStr := sqlparser.String(col.Type.Options.Default)
 				colDef.Default = &defStr
 			}
-			if col.Type.Options.KeyOpt == 1 { // colKeyPrimary
+			switch col.Type.Options.KeyOpt {
+			case sqlparser.ColKeyPrimary, sqlparser.ColKey: // PRIMARY KEY or KEY
 				colDef.PrimaryKey = true
 				primaryKeys = append(primaryKeys, colDef.Name)
-			}
-			if col.Type.Options.KeyOpt == 2 { // colKeyUnique
+			case sqlparser.ColKeyUnique, sqlparser.ColKeyUniqueKey:
 				colDef.Unique = true
 			}
 		}
@@ -322,6 +322,18 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", tableName))
 	}
 	e.Storage.CreateTable(e.CurrentDB, def)
+
+	// Set AUTO_INCREMENT start value from table options
+	for _, opt := range stmt.TableSpec.Options {
+		if strings.ToUpper(opt.Name) == "AUTO_INCREMENT" {
+			if val, err := strconv.ParseInt(opt.Value.Val, 10, 64); err == nil {
+				if tbl, err := e.Storage.GetTable(e.CurrentDB, tableName); err == nil {
+					tbl.AutoIncrement.Store(val - 1) // Store val-1 because next insert increments first
+				}
+			}
+		}
+	}
+
 	return &Result{}, nil
 }
 
@@ -1390,6 +1402,15 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		case *sqlparser.AddConstraintDefinition:
 			// Silently accept constraint additions.
 
+		case sqlparser.TableOptions:
+			for _, to := range op {
+				if strings.ToUpper(to.Name) == "AUTO_INCREMENT" {
+					if val, err := strconv.ParseInt(to.Value.Val, 10, 64); err == nil {
+						tbl.AutoIncrement.Store(val - 1)
+					}
+				}
+			}
+
 		default:
 			// Unsupported ALTER option — ignore silently to stay compatible.
 		}
@@ -1507,6 +1528,46 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 	}, nil
 }
 
+// mysqlDisplayType returns the MySQL display type with width for SHOW CREATE TABLE.
+func mysqlDisplayType(colType string) string {
+	upper := strings.ToUpper(strings.TrimSpace(colType))
+	// Extract base type and any existing parameters
+	base := upper
+	suffix := ""
+	if idx := strings.Index(upper, "("); idx >= 0 {
+		base = upper[:idx]
+		// Already has width specified, just lowercase it
+		return strings.ToLower(colType)
+	}
+	// Check for UNSIGNED suffix
+	if strings.HasSuffix(base, " UNSIGNED") {
+		base = strings.TrimSuffix(base, " UNSIGNED")
+		suffix = " unsigned"
+	}
+
+	// Add default display widths for integer types
+	switch base {
+	case "TINYINT":
+		return "tinyint(4)" + suffix
+	case "SMALLINT":
+		return "smallint(6)" + suffix
+	case "MEDIUMINT":
+		return "mediumint(9)" + suffix
+	case "INT", "INTEGER":
+		return "int(11)" + suffix
+	case "BIGINT":
+		return "bigint(20)" + suffix
+	case "FLOAT":
+		return "float" + suffix
+	case "DOUBLE":
+		return "double" + suffix
+	case "DECIMAL":
+		return "decimal(10,0)" + suffix
+	default:
+		return strings.ToLower(colType)
+	}
+}
+
 func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	db, err := e.Catalog.GetDatabase(e.CurrentDB)
 	if err != nil {
@@ -1517,6 +1578,12 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		return nil, fmt.Errorf("ERROR 1146 (42S02): Table '%s.%s' doesn't exist", e.CurrentDB, tableName)
 	}
 
+	// Get AUTO_INCREMENT value
+	autoIncVal := int64(0)
+	if tbl, err := e.Storage.GetTable(e.CurrentDB, tableName); err == nil {
+		autoIncVal = tbl.AutoIncrementValue()
+	}
+
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("CREATE TABLE `%s` (\n", tableName))
 
@@ -1525,10 +1592,10 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	for _, col := range def.Columns {
 		var parts []string
 		parts = append(parts, fmt.Sprintf("  `%s`", col.Name))
-		parts = append(parts, col.Type)
+		parts = append(parts, mysqlDisplayType(col.Type))
 		if !col.Nullable {
 			parts = append(parts, "NOT NULL")
-		} else {
+		} else if !col.AutoIncrement {
 			parts = append(parts, "DEFAULT NULL")
 		}
 		if col.AutoIncrement {
@@ -1559,7 +1626,13 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		}
 		b.WriteString(fmt.Sprintf("  PRIMARY KEY (%s)\n", strings.Join(quotedPK, ",")))
 	}
-	b.WriteString(") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+
+	trailer := ") ENGINE=InnoDB"
+	if autoIncVal > 0 {
+		trailer += fmt.Sprintf(" AUTO_INCREMENT=%d", autoIncVal+1)
+	}
+	trailer += " DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	b.WriteString(trailer)
 
 	return &Result{
 		Columns:     []string{"Table", "Create Table"},
