@@ -269,7 +269,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	for _, col := range stmt.TableSpec.Columns {
 		colDef := catalog.ColumnDef{
 			Name:     col.Name.String(),
-			Type:     col.Type.Type,
+			Type:     buildColumnTypeString(col.Type),
 			Nullable: col.Type.Options != nil && col.Type.Options.Null != nil && *col.Type.Options.Null,
 		}
 
@@ -1342,7 +1342,7 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 	colDef := catalog.ColumnDef{
 		Name:     col.Name.String(),
-		Type:     col.Type.Type,
+		Type:     buildColumnTypeString(col.Type),
 		Nullable: true, // default nullable unless NOT NULL specified
 	}
 	if col.Type.Options != nil {
@@ -1552,6 +1552,32 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		Rows:        [][]interface{}{},
 		IsResultSet: true,
 	}, nil
+}
+
+// buildColumnTypeString builds a type string from a sqlparser.ColumnType,
+// including length, scale, unsigned, zerofill, and enum values,
+// but excluding options like NOT NULL, AUTO_INCREMENT, etc.
+func buildColumnTypeString(ct *sqlparser.ColumnType) string {
+	s := ct.Type
+	if ct.Length != nil && ct.Scale != nil {
+		s += fmt.Sprintf("(%d,%d)", *ct.Length, *ct.Scale)
+	} else if ct.Length != nil {
+		s += fmt.Sprintf("(%d)", *ct.Length)
+	}
+	if len(ct.EnumValues) > 0 {
+		vals := make([]string, len(ct.EnumValues))
+		for i, v := range ct.EnumValues {
+			vals[i] = fmt.Sprintf("'%s'", v)
+		}
+		s += "(" + strings.Join(vals, ",") + ")"
+	}
+	if ct.Unsigned {
+		s += " UNSIGNED"
+	}
+	if ct.Zerofill {
+		s += " ZEROFILL"
+	}
+	return s
 }
 
 // mysqlDisplayType returns the MySQL display type with width for SHOW CREATE TABLE.
