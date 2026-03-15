@@ -160,6 +160,22 @@ func (ctx *execContext) executeLines(lines []string) error {
 			// If not handled as directive, treat as SQL
 		}
 
+		// Handle bare directives (without -- prefix): eval, let, echo, source, skip,
+		// enable_warnings, disable_warnings, etc.
+		if bareDirective, ok := extractBareDirective(trimmed); ok {
+			handled, skip, err := ctx.handleDirective(bareDirective)
+			if err != nil {
+				return fmt.Errorf("line %d: %v", i+1, err)
+			}
+			if skip {
+				return nil
+			}
+			if handled {
+				i++
+				continue
+			}
+		}
+
 		// Collect multi-line SQL statement (until delimiter)
 		delim := ";"
 		if ctx.delimiter != "" {
@@ -259,8 +275,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		return true, false, nil
 
 	case "let":
-		ctx.setVariable(args)
-		return true, false, nil
+		return true, false, ctx.setVariable(args)
 
 	case "source":
 		return true, false, ctx.sourceFile(args)
@@ -411,18 +426,35 @@ func (ctx *execContext) executeExec(stmt string) error {
 	return nil
 }
 
-func (ctx *execContext) setVariable(expr string) {
+func (ctx *execContext) setVariable(expr string) error {
 	if ctx.variables == nil {
 		ctx.variables = make(map[string]string)
 	}
-	// Format: $var = value
+	// Format: $var = value  or  $var= `SELECT ...`
 	parts := strings.SplitN(expr, "=", 2)
 	if len(parts) != 2 {
-		return
+		return nil
 	}
 	name := strings.TrimSpace(parts[0])
 	value := strings.TrimSpace(parts[1])
+
+	// If value is wrapped in backticks, execute as SQL and use first column of first row
+	if strings.HasPrefix(value, "`") && strings.HasSuffix(value, "`") {
+		sqlStmt := strings.TrimPrefix(strings.TrimSuffix(value, "`"), "`")
+		sqlStmt = ctx.substituteVars(strings.TrimSpace(sqlStmt))
+		row := ctx.db.QueryRow(sqlStmt)
+		var result string
+		if err := row.Scan(&result); err != nil {
+			// Store empty string on error (query might return no rows)
+			ctx.variables[name] = ""
+			return nil
+		}
+		ctx.variables[name] = result
+		return nil
+	}
+
 	ctx.variables[name] = value
+	return nil
 }
 
 func (ctx *execContext) substituteVars(s string) string {
@@ -437,6 +469,8 @@ func (ctx *execContext) substituteVars(s string) string {
 
 func (ctx *execContext) sourceFile(filename string) error {
 	filename = strings.TrimSpace(filename)
+	// Apply variable substitution in filename
+	filename = ctx.substituteVars(filename)
 	// Try include paths
 	for _, dir := range ctx.runner.IncludePaths {
 		path := filepath.Join(dir, filename)
@@ -494,6 +528,49 @@ var directiveKeywords = map[string]bool{
 func isDirectiveKeyword(s string) bool {
 	parts := strings.SplitN(strings.ToLower(s), " ", 2)
 	return directiveKeywords[parts[0]]
+}
+
+// barePrefixKeywords are mysqltest commands that may appear without a leading "--".
+var barePrefixKeywords = []string{
+	"eval ",
+	"let ",
+	"echo ",
+	"source ",
+	"skip",
+	"enable_warnings",
+	"disable_warnings",
+	"enable_query_log",
+	"disable_query_log",
+	"enable_result_log",
+	"disable_result_log",
+	"sorted_result",
+}
+
+// extractBareDirective checks whether trimmed is a bare (no "--") mysqltest directive.
+// If so it returns the directive string (with trailing ";" stripped) ready to pass to
+// handleDirective, and ok=true.
+func extractBareDirective(trimmed string) (string, bool) {
+	lower := strings.ToLower(trimmed)
+	// Strip trailing semicolon for no-arg keywords
+	stripped := strings.TrimRight(trimmed, ";")
+	strippedLower := strings.ToLower(stripped)
+
+	for _, kw := range barePrefixKeywords {
+		kw = strings.TrimRight(kw, " ") // canonical keyword without trailing space
+		kwWithSpace := kw + " "
+
+		if strings.HasPrefix(lower, kwWithSpace) {
+			// keyword with arguments – strip trailing ";" from the arg portion
+			rest := trimmed[len(kwWithSpace):]
+			rest = strings.TrimRight(rest, ";")
+			return kw + " " + strings.TrimSpace(rest), true
+		}
+		if strippedLower == kw {
+			// keyword with no arguments (possibly followed by ";")
+			return stripped, true
+		}
+	}
+	return "", false
 }
 
 func normalizeOutput(s string) string {

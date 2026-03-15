@@ -305,6 +305,78 @@ func resultToMySQLBinary(result *executor.Result) (*mysql.Result, error) {
 	return &mysql.Result{Resultset: r}, nil
 }
 
+// normalizeRows ensures all rows have consistent Go types per column.
+// go-mysql's BuildSimpleResultset will error if two non-null values in the same
+// column have different MySQL types (e.g. int64 vs string).  We resolve this by
+// converting every value in a column to string as soon as we detect a mismatch.
+func normalizeRows(rows [][]interface{}) [][]interface{} {
+	if len(rows) == 0 {
+		return rows
+	}
+	numCols := len(rows[0])
+	// For each column determine the MySQL type category of the first non-null value.
+	// Categories: 0=unknown, 1=int, 2=float, 3=string/bytes, 4=time
+	colCat := make([]int, numCols)
+	colMixed := make([]bool, numCols)
+
+	categoryOf := func(v interface{}) int {
+		switch v.(type) {
+		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+			return 1
+		case float32, float64:
+			return 2
+		case string, []byte:
+			return 3
+		case time.Time:
+			return 4
+		}
+		return 3 // treat unknown as string
+	}
+
+	for _, row := range rows {
+		for j, val := range row {
+			if j >= numCols {
+				break
+			}
+			if val == nil {
+				continue
+			}
+			cat := categoryOf(val)
+			if colCat[j] == 0 {
+				colCat[j] = cat
+			} else if colCat[j] != cat {
+				colMixed[j] = true
+			}
+		}
+	}
+
+	// If no column has mixed types, return as-is.
+	needsNorm := false
+	for _, m := range colMixed {
+		if m {
+			needsNorm = true
+			break
+		}
+	}
+	if !needsNorm {
+		return rows
+	}
+
+	// Build new rows with mixed-type columns converted to string.
+	out := make([][]interface{}, len(rows))
+	for i, row := range rows {
+		newRow := make([]interface{}, len(row))
+		copy(newRow, row)
+		for j, val := range row {
+			if j < numCols && colMixed[j] && val != nil {
+				newRow[j] = fmt.Sprintf("%v", val)
+			}
+		}
+		out[i] = newRow
+	}
+	return out
+}
+
 func resultToMySQL(result *executor.Result) (*mysql.Result, error) {
 	if len(result.Rows) == 0 {
 		// Empty result set
@@ -323,7 +395,7 @@ func resultToMySQL(result *executor.Result) (*mysql.Result, error) {
 
 	r, err := mysql.BuildSimpleResultset(
 		makeFields(result.Columns),
-		result.Rows,
+		normalizeRows(result.Rows),
 		false,
 	)
 	if err != nil {
