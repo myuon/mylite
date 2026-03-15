@@ -160,6 +160,86 @@ func TestShowTables(t *testing.T) {
 	})
 }
 
+func TestTransactions(t *testing.T) {
+	h := getHarness(t)
+
+	h.Run(TestCase{
+		Name: "ROLLBACK restores rows",
+		Setup: []string{
+			"CREATE TABLE test_tx_rollback (id INT PRIMARY KEY, val INT)",
+			"INSERT INTO test_tx_rollback (id, val) VALUES (1, 10)",
+			"BEGIN",
+			"INSERT INTO test_tx_rollback (id, val) VALUES (2, 20)",
+			"ROLLBACK",
+		},
+		Query: "SELECT id, val FROM test_tx_rollback ORDER BY id",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_tx_rollback",
+		},
+	})
+
+	h.Run(TestCase{
+		Name: "COMMIT persists rows",
+		Setup: []string{
+			"CREATE TABLE test_tx_commit (id INT PRIMARY KEY, val INT)",
+			"INSERT INTO test_tx_commit (id, val) VALUES (1, 10)",
+			"BEGIN",
+			"INSERT INTO test_tx_commit (id, val) VALUES (2, 20)",
+			"COMMIT",
+		},
+		Query: "SELECT id, val FROM test_tx_commit ORDER BY id",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_tx_commit",
+		},
+	})
+
+	h.Run(TestCase{
+		Name: "ROLLBACK after UPDATE restores old values",
+		Setup: []string{
+			"CREATE TABLE test_tx_update (id INT PRIMARY KEY, val INT)",
+			"INSERT INTO test_tx_update (id, val) VALUES (1, 100)",
+			"BEGIN",
+			"UPDATE test_tx_update SET val = 999 WHERE id = 1",
+			"ROLLBACK",
+		},
+		Query: "SELECT id, val FROM test_tx_update ORDER BY id",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_tx_update",
+		},
+	})
+
+	h.Run(TestCase{
+		Name: "ROLLBACK after DELETE restores rows",
+		Setup: []string{
+			"CREATE TABLE test_tx_delete (id INT PRIMARY KEY, val INT)",
+			"INSERT INTO test_tx_delete (id, val) VALUES (1, 10)",
+			"INSERT INTO test_tx_delete (id, val) VALUES (2, 20)",
+			"BEGIN",
+			"DELETE FROM test_tx_delete WHERE id = 1",
+			"ROLLBACK",
+		},
+		Query: "SELECT id, val FROM test_tx_delete ORDER BY id",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_tx_delete",
+		},
+	})
+
+	h.Run(TestCase{
+		Name: "ROLLBACK after CREATE TABLE removes table",
+		Setup: []string{
+			"BEGIN",
+			"CREATE TABLE test_tx_ddl (id INT PRIMARY KEY)",
+			"ROLLBACK",
+		},
+		// After rollback the table should not exist; querying it should error.
+		Query:       "SELECT * FROM test_tx_ddl",
+		ExpectError: true,
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_tx_ddl",
+		},
+	})
+}
+
 func TestNullHandling(t *testing.T) {
 	h := getHarness(t)
 
@@ -173,6 +253,136 @@ func TestNullHandling(t *testing.T) {
 		Query: "SELECT id, val FROM test_null ORDER BY id",
 		Teardown: []string{
 			"DROP TABLE IF EXISTS test_null",
+		},
+	})
+}
+
+func TestJoin(t *testing.T) {
+	h := getHarness(t)
+
+	h.Run(TestCase{
+		Name: "INNER JOIN",
+		Setup: []string{
+			"CREATE TABLE test_j_users (id INT PRIMARY KEY, name VARCHAR(255))",
+			"CREATE TABLE test_j_orders (id INT PRIMARY KEY, user_id INT, amount INT)",
+			"INSERT INTO test_j_users (id, name) VALUES (1, 'Alice')",
+			"INSERT INTO test_j_users (id, name) VALUES (2, 'Bob')",
+			"INSERT INTO test_j_orders (id, user_id, amount) VALUES (1, 1, 100)",
+			"INSERT INTO test_j_orders (id, user_id, amount) VALUES (2, 1, 200)",
+			"INSERT INTO test_j_orders (id, user_id, amount) VALUES (3, 2, 150)",
+		},
+		Query: "SELECT test_j_users.name, test_j_orders.amount FROM test_j_users JOIN test_j_orders ON test_j_users.id = test_j_orders.user_id ORDER BY test_j_orders.id",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_j_users",
+			"DROP TABLE IF EXISTS test_j_orders",
+		},
+	})
+
+	h.Run(TestCase{
+		Name: "LEFT JOIN with unmatched rows",
+		Setup: []string{
+			"CREATE TABLE test_lj_users (id INT PRIMARY KEY, name VARCHAR(255))",
+			"CREATE TABLE test_lj_orders (id INT PRIMARY KEY, user_id INT, amount INT)",
+			"INSERT INTO test_lj_users (id, name) VALUES (1, 'Alice')",
+			"INSERT INTO test_lj_users (id, name) VALUES (2, 'Bob')",
+			"INSERT INTO test_lj_users (id, name) VALUES (3, 'Charlie')",
+			"INSERT INTO test_lj_orders (id, user_id, amount) VALUES (1, 1, 100)",
+			"INSERT INTO test_lj_orders (id, user_id, amount) VALUES (2, 2, 200)",
+		},
+		Query: "SELECT test_lj_users.name, test_lj_orders.amount FROM test_lj_users LEFT JOIN test_lj_orders ON test_lj_users.id = test_lj_orders.user_id ORDER BY test_lj_users.id",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_lj_users",
+			"DROP TABLE IF EXISTS test_lj_orders",
+		},
+	})
+
+	h.Run(TestCase{
+		Name: "JOIN with aliases",
+		Setup: []string{
+			"CREATE TABLE test_ja_users (id INT PRIMARY KEY, name VARCHAR(255))",
+			"CREATE TABLE test_ja_orders (id INT PRIMARY KEY, user_id INT, amount INT)",
+			"INSERT INTO test_ja_users (id, name) VALUES (1, 'Alice')",
+			"INSERT INTO test_ja_orders (id, user_id, amount) VALUES (1, 1, 300)",
+		},
+		Query: "SELECT u.name, o.amount FROM test_ja_users u JOIN test_ja_orders o ON u.id = o.user_id",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_ja_users",
+			"DROP TABLE IF EXISTS test_ja_orders",
+		},
+	})
+}
+
+func TestGroupBy(t *testing.T) {
+	h := getHarness(t)
+
+	h.Run(TestCase{
+		Name: "GROUP BY with COUNT(*)",
+		Setup: []string{
+			"CREATE TABLE test_gb_orders (id INT PRIMARY KEY, user_id INT, amount INT)",
+			"INSERT INTO test_gb_orders (id, user_id, amount) VALUES (1, 1, 100)",
+			"INSERT INTO test_gb_orders (id, user_id, amount) VALUES (2, 1, 200)",
+			"INSERT INTO test_gb_orders (id, user_id, amount) VALUES (3, 2, 150)",
+		},
+		Query: "SELECT user_id, COUNT(*) FROM test_gb_orders GROUP BY user_id ORDER BY user_id",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_gb_orders",
+		},
+	})
+
+	h.Run(TestCase{
+		Name: "GROUP BY with SUM",
+		Setup: []string{
+			"CREATE TABLE test_gb_sales (id INT PRIMARY KEY, category VARCHAR(50), amount INT)",
+			"INSERT INTO test_gb_sales (id, category, amount) VALUES (1, 'A', 10)",
+			"INSERT INTO test_gb_sales (id, category, amount) VALUES (2, 'A', 20)",
+			"INSERT INTO test_gb_sales (id, category, amount) VALUES (3, 'B', 30)",
+		},
+		Query: "SELECT category, SUM(amount) FROM test_gb_sales GROUP BY category ORDER BY category",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_gb_sales",
+		},
+	})
+
+	h.Run(TestCase{
+		Name: "GROUP BY with MAX and MIN",
+		Setup: []string{
+			"CREATE TABLE test_gb_scores (id INT PRIMARY KEY, student VARCHAR(50), score INT)",
+			"INSERT INTO test_gb_scores (id, student, score) VALUES (1, 'Alice', 90)",
+			"INSERT INTO test_gb_scores (id, student, score) VALUES (2, 'Alice', 80)",
+			"INSERT INTO test_gb_scores (id, student, score) VALUES (3, 'Bob', 70)",
+			"INSERT INTO test_gb_scores (id, student, score) VALUES (4, 'Bob', 95)",
+		},
+		Query: "SELECT student, MAX(score), MIN(score) FROM test_gb_scores GROUP BY student ORDER BY student",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_gb_scores",
+		},
+	})
+
+	h.Run(TestCase{
+		Name: "COUNT(*) without GROUP BY",
+		Setup: []string{
+			"CREATE TABLE test_cnt (id INT PRIMARY KEY, val INT)",
+			"INSERT INTO test_cnt (id, val) VALUES (1, 10)",
+			"INSERT INTO test_cnt (id, val) VALUES (2, 20)",
+			"INSERT INTO test_cnt (id, val) VALUES (3, 30)",
+		},
+		Query: "SELECT COUNT(*) FROM test_cnt",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_cnt",
+		},
+	})
+
+	h.Run(TestCase{
+		Name: "GROUP BY with HAVING",
+		Setup: []string{
+			"CREATE TABLE test_having (id INT PRIMARY KEY, dept VARCHAR(50), salary INT)",
+			"INSERT INTO test_having (id, dept, salary) VALUES (1, 'eng', 100)",
+			"INSERT INTO test_having (id, dept, salary) VALUES (2, 'eng', 120)",
+			"INSERT INTO test_having (id, dept, salary) VALUES (3, 'hr', 80)",
+		},
+		Query: "SELECT dept, COUNT(*) AS cnt FROM test_having GROUP BY dept HAVING cnt > 1",
+		Teardown: []string{
+			"DROP TABLE IF EXISTS test_having",
 		},
 	})
 }

@@ -145,3 +145,113 @@ func toInt64Val(v interface{}) int64 {
 	val, _ := toInt64(v)
 	return val
 }
+
+// CloneRow returns a deep copy of a Row.
+func CloneRow(row Row) Row {
+	clone := make(Row, len(row))
+	for k, v := range row {
+		clone[k] = v
+	}
+	return clone
+}
+
+// TableSnapshot holds a point-in-time copy of a table's data.
+type TableSnapshot struct {
+	Def           *catalog.TableDef
+	Rows          []Row
+	AutoIncrement int64
+}
+
+// DatabaseSnapshot holds snapshots of all tables in a database.
+type DatabaseSnapshot struct {
+	Tables map[string]*TableSnapshot
+}
+
+// SnapshotDatabase returns a full snapshot of all tables in the given database.
+// Returns nil if the database does not exist.
+func (e *Engine) SnapshotDatabase(dbName string) *DatabaseSnapshot {
+	e.mu.RLock()
+	db, ok := e.databases[dbName]
+	e.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+
+	snap := &DatabaseSnapshot{
+		Tables: make(map[string]*TableSnapshot),
+	}
+
+	// Lock each table individually to copy its data safely.
+	for name, tbl := range db {
+		tbl.Mu.RLock()
+		rowsCopy := make([]Row, len(tbl.Rows))
+		for i, r := range tbl.Rows {
+			rowsCopy[i] = CloneRow(r)
+		}
+		snap.Tables[name] = &TableSnapshot{
+			Def:           tbl.Def,
+			Rows:          rowsCopy,
+			AutoIncrement: tbl.AutoIncrement.Load(),
+		}
+		tbl.Mu.RUnlock()
+	}
+
+	return snap
+}
+
+// AddColumn sets the given key to defaultVal in every existing row of the table.
+func (t *Table) AddColumn(colName string, defaultVal interface{}) {
+	t.Mu.Lock()
+	defer t.Mu.Unlock()
+	for i := range t.Rows {
+		t.Rows[i][colName] = defaultVal
+	}
+}
+
+// DropColumn removes the given key from every existing row of the table.
+func (t *Table) DropColumn(colName string) {
+	t.Mu.Lock()
+	defer t.Mu.Unlock()
+	for i := range t.Rows {
+		delete(t.Rows[i], colName)
+	}
+}
+
+// RenameColumn renames the given key in every existing row of the table.
+func (t *Table) RenameColumn(oldName, newName string) {
+	t.Mu.Lock()
+	defer t.Mu.Unlock()
+	for i := range t.Rows {
+		if v, ok := t.Rows[i][oldName]; ok {
+			t.Rows[i][newName] = v
+			delete(t.Rows[i], oldName)
+		}
+	}
+}
+
+// RestoreDatabase replaces the contents of the given database with the snapshot.
+// Tables that existed in the snapshot but were dropped are recreated.
+// Tables that were created after the snapshot was taken are removed.
+func (e *Engine) RestoreDatabase(dbName string, snap *DatabaseSnapshot) {
+	if snap == nil {
+		return
+	}
+
+	e.mu.Lock()
+	// Replace the entire table map with restored tables.
+	restored := make(map[string]*Table, len(snap.Tables))
+	for name, ts := range snap.Tables {
+		rowsCopy := make([]Row, len(ts.Rows))
+		for i, r := range ts.Rows {
+			rowsCopy[i] = CloneRow(r)
+		}
+		t := &Table{
+			Def:  ts.Def,
+			Rows: rowsCopy,
+		}
+		t.AutoIncrement.Store(ts.AutoIncrement)
+		restored[name] = t
+	}
+	e.databases[dbName] = restored
+	e.mu.Unlock()
+}

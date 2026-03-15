@@ -130,3 +130,78 @@ func (db *Database) ListTables() []string {
 	}
 	return names
 }
+
+// AddColumn appends a new column definition to the table.
+func (db *Database) AddColumn(tableName string, col ColumnDef) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tbl, ok := db.Tables[tableName]
+	if !ok {
+		return fmt.Errorf("table '%s.%s' doesn't exist", db.Name, tableName)
+	}
+	for _, c := range tbl.Columns {
+		if c.Name == col.Name {
+			return fmt.Errorf("column '%s' already exists in table '%s'", col.Name, tableName)
+		}
+	}
+	tbl.Columns = append(tbl.Columns, col)
+	return nil
+}
+
+// DropColumn removes a column from the table definition.
+func (db *Database) DropColumn(tableName, colName string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tbl, ok := db.Tables[tableName]
+	if !ok {
+		return fmt.Errorf("table '%s.%s' doesn't exist", db.Name, tableName)
+	}
+	newCols := make([]ColumnDef, 0, len(tbl.Columns))
+	found := false
+	for _, c := range tbl.Columns {
+		if c.Name == colName {
+			found = true
+			continue
+		}
+		newCols = append(newCols, c)
+	}
+	if !found {
+		return fmt.Errorf("column '%s' doesn't exist in table '%s'", colName, tableName)
+	}
+	tbl.Columns = newCols
+	return nil
+}
+
+// ModifyColumn replaces the definition of an existing column (same name).
+func (db *Database) ModifyColumn(tableName string, col ColumnDef) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tbl, ok := db.Tables[tableName]
+	if !ok {
+		return fmt.Errorf("table '%s.%s' doesn't exist", db.Name, tableName)
+	}
+	for i, c := range tbl.Columns {
+		if c.Name == col.Name {
+			tbl.Columns[i] = col
+			return nil
+		}
+	}
+	return fmt.Errorf("column '%s' doesn't exist in table '%s'", col.Name, tableName)
+}
+
+// ChangeColumn renames a column and updates its definition.
+func (db *Database) ChangeColumn(tableName, oldName string, col ColumnDef) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tbl, ok := db.Tables[tableName]
+	if !ok {
+		return fmt.Errorf("table '%s.%s' doesn't exist", db.Name, tableName)
+	}
+	for i, c := range tbl.Columns {
+		if c.Name == oldName {
+			tbl.Columns[i] = col
+			return nil
+		}
+	}
+	return fmt.Errorf("column '%s' doesn't exist in table '%s'", oldName, tableName)
+}
