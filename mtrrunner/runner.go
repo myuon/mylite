@@ -332,6 +332,8 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		return true, false, nil
 
 	// Directives we accept but ignore
+	case "character_set", "charset":
+		return true, false, nil
 	case "disable_metadata", "enable_metadata",
 		"disable_ps_protocol", "enable_ps_protocol",
 		"disable_cursor_protocol", "enable_cursor_protocol",
@@ -591,6 +593,7 @@ var barePrefixKeywords = []string{
 	"let ",
 	"echo ",
 	"source ",
+	"delimiter ",
 	"skip",
 	"exit",
 	"die ",
@@ -660,8 +663,17 @@ func extractBareDirective(trimmed string) (string, bool) {
 
 		if strings.HasPrefix(lower, kwWithSpace) {
 			// keyword with arguments – strip trailing ";" from the arg portion
+			// For "delimiter", don't strip ";" as it may be the actual delimiter value
 			rest := trimmed[len(kwWithSpace):]
-			rest = strings.TrimRight(rest, ";")
+			if kw != "delimiter" {
+				rest = strings.TrimRight(rest, ";")
+			} else {
+				// For delimiter, only strip a single trailing ";" if present
+				rest = strings.TrimSpace(rest)
+				if strings.HasSuffix(rest, ";") {
+					rest = rest[:len(rest)-1]
+				}
+			}
 			return kw + " " + strings.TrimSpace(rest), true
 		}
 		if strippedLower == kw {

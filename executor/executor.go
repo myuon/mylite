@@ -81,9 +81,50 @@ func (e *Executor) Execute(query string) (*Result, error) {
 
 	stmt, err := sqlparser.NewTestParser().Parse(query)
 	if err != nil {
-		// Vitess parser does not support some MySQL-specific SET syntax
-		// (e.g. SET TIMESTAMP=...). Accept all SET statements silently.
-		if strings.HasPrefix(upper, "SET ") {
+		// Accept statements that Vitess parser doesn't support
+		if strings.HasPrefix(upper, "SET ") ||
+			strings.HasPrefix(upper, "DROP FUNCTION") ||
+			strings.HasPrefix(upper, "CREATE FUNCTION") ||
+			strings.HasPrefix(upper, "DROP PROCEDURE") ||
+			strings.HasPrefix(upper, "CREATE PROCEDURE") ||
+			strings.HasPrefix(upper, "CREATE TRIGGER") ||
+			strings.HasPrefix(upper, "DROP TRIGGER") ||
+			strings.HasPrefix(upper, "CREATE EVENT") ||
+			strings.HasPrefix(upper, "DROP EVENT") ||
+			strings.HasPrefix(upper, "CREATE USER") ||
+			strings.HasPrefix(upper, "DROP USER") ||
+			strings.HasPrefix(upper, "ALTER USER") ||
+			strings.HasPrefix(upper, "GRANT ") ||
+			strings.HasPrefix(upper, "REVOKE ") ||
+			strings.HasPrefix(upper, "FLUSH ") ||
+			strings.HasPrefix(upper, "RESET ") ||
+			strings.HasPrefix(upper, "HANDLER ") ||
+			strings.HasPrefix(upper, "INSTALL ") ||
+			strings.HasPrefix(upper, "UNINSTALL ") ||
+			strings.HasPrefix(upper, "CHECKSUM ") ||
+			strings.HasPrefix(upper, "REPAIR ") ||
+			strings.HasPrefix(upper, "OPTIMIZE ") ||
+			strings.HasPrefix(upper, "CHECK ") ||
+			strings.HasPrefix(upper, "DELIMITER ") ||
+			strings.HasPrefix(upper, "DECLARE ") ||
+			strings.HasPrefix(upper, "RETURN ") ||
+			strings.HasPrefix(upper, "OPEN ") ||
+			strings.HasPrefix(upper, "CLOSE ") ||
+			strings.HasPrefix(upper, "FETCH ") ||
+			strings.HasPrefix(upper, "SIGNAL ") ||
+			strings.HasPrefix(upper, "RESIGNAL") ||
+			strings.HasPrefix(upper, "GET DIAGNOSTICS") ||
+			strings.HasPrefix(upper, "CALL ") ||
+			strings.HasPrefix(upper, "XA ") ||
+			strings.HasPrefix(upper, "SAVEPOINT") ||
+			strings.HasPrefix(upper, "RELEASE SAVEPOINT") ||
+			strings.HasPrefix(upper, "CHANGE ") ||
+			strings.HasPrefix(upper, "START ") ||
+			strings.HasPrefix(upper, "STOP ") ||
+			strings.HasPrefix(upper, "PURGE ") ||
+			strings.HasPrefix(upper, "BINLOG ") ||
+			strings.HasPrefix(upper, "DO ") ||
+			strings.HasPrefix(upper, "END") {
 			return &Result{}, nil
 		}
 		return nil, fmt.Errorf("parse error: %v", err)
