@@ -578,6 +578,12 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	if len(pkCols) == 0 && len(tbl.Def.PrimaryKey) > 0 {
 		pkCols = tbl.Def.PrimaryKey
 	}
+	// Add unique columns from index definitions
+	for _, idx := range tbl.Def.Indexes {
+		if idx.Unique && len(idx.Columns) == 1 {
+			uniqueCols = append(uniqueCols, idx.Columns[0])
+		}
+	}
 
 	var lastInsertID int64
 	var affected uint64
@@ -619,6 +625,10 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 
 		id, err := tbl.Insert(row)
 		if err != nil {
+			// INSERT IGNORE: silently skip duplicate key errors
+			if bool(stmt.Ignore) && strings.Contains(err.Error(), "1062") {
+				continue
+			}
 			return nil, err
 		}
 		lastInsertID = id

@@ -132,6 +132,69 @@ func (t *Table) Insert(row Row) (int64, error) {
 		}
 	}
 
+	// Check PRIMARY KEY uniqueness
+	if len(t.Def.PrimaryKey) > 0 {
+		for _, existing := range t.Rows {
+			match := true
+			for _, pkCol := range t.Def.PrimaryKey {
+				if fmt.Sprintf("%v", existing[pkCol]) != fmt.Sprintf("%v", row[pkCol]) {
+					match = false
+					break
+				}
+			}
+			if match {
+				pkVal := make([]string, len(t.Def.PrimaryKey))
+				for i, pk := range t.Def.PrimaryKey {
+					pkVal[i] = fmt.Sprintf("%v", row[pk])
+				}
+				return 0, fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key 'PRIMARY'",
+					strings.Join(pkVal, "-"))
+			}
+		}
+	}
+
+	// Check column-level PRIMARY KEY
+	for _, col := range t.Def.Columns {
+		if col.PrimaryKey {
+			for _, existing := range t.Rows {
+				if fmt.Sprintf("%v", existing[col.Name]) == fmt.Sprintf("%v", row[col.Name]) {
+					return 0, fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%v' for key 'PRIMARY'",
+						row[col.Name])
+				}
+			}
+		}
+	}
+
+	// Check UNIQUE constraints
+	for _, idx := range t.Def.Indexes {
+		if idx.Unique {
+			for _, existing := range t.Rows {
+				match := true
+				for _, idxCol := range idx.Columns {
+					ev := existing[idxCol]
+					rv := row[idxCol]
+					// NULL values don't violate UNIQUE constraints
+					if ev == nil || rv == nil {
+						match = false
+						break
+					}
+					if fmt.Sprintf("%v", ev) != fmt.Sprintf("%v", rv) {
+						match = false
+						break
+					}
+				}
+				if match {
+					vals := make([]string, len(idx.Columns))
+					for i, c := range idx.Columns {
+						vals[i] = fmt.Sprintf("%v", row[c])
+					}
+					return 0, fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key '%s'",
+						strings.Join(vals, "-"), idx.Name)
+				}
+			}
+		}
+	}
+
 	t.Rows = append(t.Rows, row)
 	return lastInsertID, nil
 }
