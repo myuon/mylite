@@ -103,6 +103,13 @@ func main() {
 	if _, err := os.Stat(suiteInclude); err == nil {
 		runner.IncludePaths = append(runner.IncludePaths, suiteInclude)
 	}
+	// Add the test directory itself (for source files like data1.inc)
+	suiteTestDir := filepath.Join(suiteDir, "t")
+	if _, err := os.Stat(suiteTestDir); err == nil {
+		runner.IncludePaths = append(runner.IncludePaths, suiteTestDir)
+	}
+	// Add the suite root for relative paths like suite/engines/funcs/t/file.inc
+	runner.IncludePaths = append(runner.IncludePaths, *suiteRoot)
 
 	// Specific test within suite?
 	testFilter := ""

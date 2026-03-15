@@ -7,6 +7,14 @@ import (
 	"github.com/myuon/mylite/storage"
 )
 
+// infoSchemaColumnOrder defines the canonical column order for INFORMATION_SCHEMA tables.
+var infoSchemaColumnOrder = map[string][]string{
+	"schemata": {"CATALOG_NAME", "SCHEMA_NAME", "DEFAULT_CHARACTER_SET_NAME", "DEFAULT_COLLATION_NAME", "SQL_PATH"},
+	"tables": {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE", "ENGINE", "VERSION", "ROW_FORMAT", "TABLE_ROWS", "AVG_ROW_LENGTH", "DATA_LENGTH", "MAX_DATA_LENGTH", "INDEX_LENGTH", "DATA_FREE", "AUTO_INCREMENT", "CREATE_TIME", "UPDATE_TIME", "CHECK_TIME", "TABLE_COLLATION", "CHECKSUM", "CREATE_OPTIONS", "TABLE_COMMENT"},
+	"columns":    {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "COLUMN_DEFAULT", "IS_NULLABLE", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH", "CHARACTER_OCTET_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE", "DATETIME_PRECISION", "CHARACTER_SET_NAME", "COLLATION_NAME", "COLUMN_TYPE", "COLUMN_KEY", "EXTRA", "PRIVILEGES", "COLUMN_COMMENT", "GENERATION_EXPRESSION", "SRS_ID"},
+	"statistics": {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "NON_UNIQUE", "INDEX_SCHEMA", "INDEX_NAME", "SEQ_IN_INDEX", "COLUMN_NAME", "COLLATION", "CARDINALITY", "SUB_PART", "PACKED", "NULLABLE", "INDEX_TYPE", "COMMENT", "INDEX_COMMENT", "IS_VISIBLE", "EXPRESSION"},
+}
+
 // isInformationSchemaTable returns (dbName, tableName, true) when the provided
 // AliasedTableExpr refers to an INFORMATION_SCHEMA virtual table, either via an
 // explicit qualifier (information_schema.tables) or when the current database is
@@ -15,11 +23,11 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 	q := strings.ToLower(qualifier)
 	t := strings.ToLower(tableName)
 	if q == "information_schema" {
-		return t == "tables" || t == "columns" || t == "schemata"
+		return t == "tables" || t == "columns" || t == "schemata" || t == "statistics"
 	}
 	// No qualifier: check if current DB is information_schema
 	if q == "" && strings.ToLower(e.CurrentDB) == "information_schema" {
-		return t == "tables" || t == "columns" || t == "schemata"
+		return t == "tables" || t == "columns" || t == "schemata" || t == "statistics"
 	}
 	return false
 }
@@ -36,6 +44,8 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.infoSchemaTables()
 	case "columns":
 		rawRows = e.infoSchemaColumns()
+	case "statistics":
+		rawRows = e.infoSchemaStatistics()
 	}
 
 	result := make([]storage.Row, len(rawRows))
@@ -82,6 +92,11 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 		tableNames := db.ListTables()
 		sort.Strings(tableNames)
 		for _, tblName := range tableNames {
+			tblDef, _ := db.GetTable(tblName)
+			tblComment := ""
+			if tblDef != nil {
+				tblComment = tblDef.Comment
+			}
 			rows = append(rows, storage.Row{
 				"TABLE_CATALOG":   "def",
 				"TABLE_SCHEMA":    dbName,
@@ -103,7 +118,7 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 				"TABLE_COLLATION": "utf8mb4_general_ci",
 				"CHECKSUM":        nil,
 				"CREATE_OPTIONS":  "",
-				"TABLE_COMMENT":   "",
+				"TABLE_COMMENT":   tblComment,
 			})
 		}
 	}
@@ -197,6 +212,83 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 					"GENERATION_EXPRESSION":    "",
 					"SRS_ID":                   nil,
 				})
+			}
+		}
+	}
+	return rows
+}
+
+// infoSchemaStatistics returns rows for INFORMATION_SCHEMA.STATISTICS.
+func (e *Executor) infoSchemaStatistics() []storage.Row {
+	dbNames := e.Catalog.ListDatabases()
+	sort.Strings(dbNames)
+
+	var rows []storage.Row
+	for _, dbName := range dbNames {
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		tableNames := db.ListTables()
+		sort.Strings(tableNames)
+		for _, tblName := range tableNames {
+			tbl, err := db.GetTable(tblName)
+			if err != nil {
+				continue
+			}
+			seqInIndex := int64(0)
+			// Add primary key entries
+			for i, pkCol := range tbl.PrimaryKey {
+				seqInIndex = int64(i + 1)
+				rows = append(rows, storage.Row{
+					"TABLE_CATALOG": "def",
+					"TABLE_SCHEMA":  dbName,
+					"TABLE_NAME":    tblName,
+					"NON_UNIQUE":    int64(0),
+					"INDEX_SCHEMA":  dbName,
+					"INDEX_NAME":    "PRIMARY",
+					"SEQ_IN_INDEX":  seqInIndex,
+					"COLUMN_NAME":   pkCol,
+					"COLLATION":     "A",
+					"CARDINALITY":   nil,
+					"SUB_PART":      nil,
+					"PACKED":        nil,
+					"NULLABLE":      "",
+					"INDEX_TYPE":    "BTREE",
+					"COMMENT":       "",
+					"INDEX_COMMENT": "",
+					"IS_VISIBLE":    "YES",
+					"EXPRESSION":    nil,
+				})
+			}
+			// Add index entries
+			for _, idx := range tbl.Indexes {
+				nonUnique := int64(1)
+				if idx.Unique {
+					nonUnique = 0
+				}
+				for i, col := range idx.Columns {
+					rows = append(rows, storage.Row{
+						"TABLE_CATALOG": "def",
+						"TABLE_SCHEMA":  dbName,
+						"TABLE_NAME":    tblName,
+						"NON_UNIQUE":    nonUnique,
+						"INDEX_SCHEMA":  dbName,
+						"INDEX_NAME":    idx.Name,
+						"SEQ_IN_INDEX":  int64(i + 1),
+						"COLUMN_NAME":   col,
+						"COLLATION":     "A",
+						"CARDINALITY":   nil,
+						"SUB_PART":      nil,
+						"PACKED":        nil,
+						"NULLABLE":      "",
+						"INDEX_TYPE":    "BTREE",
+						"COMMENT":       "",
+						"INDEX_COMMENT": "",
+						"IS_VISIBLE":    "YES",
+						"EXPRESSION":    nil,
+					})
+				}
 			}
 		}
 	}

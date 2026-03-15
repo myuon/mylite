@@ -184,6 +184,22 @@ func (ctx *execContext) executeLines(lines []string) error {
 			continue
 		}
 
+		// Skip { } blocks (from if/while directives)
+		if trimmed == "{" {
+			depth := 1
+			i++
+			for i < len(lines) && depth > 0 {
+				t := strings.TrimSpace(lines[i])
+				if t == "{" {
+					depth++
+				} else if t == "}" {
+					depth--
+				}
+				i++
+			}
+			continue
+		}
+
 		// Handle directives (lines starting with --)
 		if strings.HasPrefix(trimmed, "--") {
 			directive := strings.TrimPrefix(trimmed, "--")
@@ -265,7 +281,13 @@ func (ctx *execContext) executeLines(lines []string) error {
 		}
 
 		// Handle multiple statements on one line (e.g. "DROP TABLE t1; SHOW TABLES")
-		stmts := splitStatements(stmt)
+		// When using a custom delimiter, don't split by semicolon
+		var stmts []string
+		if ctx.delimiter != "" {
+			stmts = []string{stmt}
+		} else {
+			stmts = splitStatements(stmt)
+		}
 
 		if len(stmts) <= 1 {
 			// Single statement: echo raw lines preserving original formatting
@@ -429,7 +451,12 @@ func (ctx *execContext) executeSQLInner(stmt string) error {
 		strings.HasPrefix(upper, "SHOW") ||
 		strings.HasPrefix(upper, "DESCRIBE") ||
 		strings.HasPrefix(upper, "DESC ") ||
-		strings.HasPrefix(upper, "EXPLAIN")
+		strings.HasPrefix(upper, "EXPLAIN") ||
+		strings.HasPrefix(upper, "ANALYZE") ||
+		strings.HasPrefix(upper, "CHECK ") ||
+		strings.HasPrefix(upper, "CHECKSUM ") ||
+		strings.HasPrefix(upper, "OPTIMIZE ") ||
+		strings.HasPrefix(upper, "REPAIR ")
 
 	if isQuery {
 		return ctx.executeQuery(stmt)
@@ -575,15 +602,31 @@ func (ctx *execContext) sourceFile(filename string) error {
 	filename = strings.TrimSpace(filename)
 	// Apply variable substitution in filename
 	filename = ctx.substituteVars(filename)
+
+	// Normalize common MySQL test suite paths
+	// suite/engines/funcs/t/foo.inc -> just the basename (search in include paths)
+	candidates := []string{filename}
+	base := filepath.Base(filename)
+	if base != filename {
+		candidates = append(candidates, base)
+	}
+	// Map suite/engines/funcs/ paths to engine_funcs/
+	if strings.Contains(filename, "suite/engines/funcs/") {
+		mapped := strings.Replace(filename, "suite/engines/funcs/", "engine_funcs/", 1)
+		candidates = append(candidates, mapped)
+	}
+
 	// Try include paths
-	for _, dir := range ctx.runner.IncludePaths {
-		path := filepath.Join(dir, filename)
-		if _, err := os.Stat(path); err == nil {
-			lines, err := readLines(path)
-			if err != nil {
-				return err
+	for _, candidate := range candidates {
+		for _, dir := range ctx.runner.IncludePaths {
+			path := filepath.Join(dir, candidate)
+			if _, err := os.Stat(path); err == nil {
+				lines, err := readLines(path)
+				if err != nil {
+					return err
+				}
+				return ctx.executeLines(lines)
 			}
-			return ctx.executeLines(lines)
 		}
 	}
 	// File not found - skip silently (many includes are optional)
@@ -753,12 +796,17 @@ func formatMySQLError(err error) string {
 	// go-mysql-org errors have format: "Error <code> (<state>): <message>"
 	re := regexp.MustCompile(`Error (\d+) \(([^)]+)\): (.*)`)
 	if m := re.FindStringSubmatch(msg); m != nil {
-		// The nested error format from mylite: "ERROR 1064 (42000): ERROR <code> (<state>): <msg>"
-		innerRe := regexp.MustCompile(`ERROR (\d+) \(([^)]+)\): (.*)`)
 		innerMsg := m[3]
+		// Handle "ERROR XXXX (YYYY): message" format from mylite error wrapping
+		innerRe := regexp.MustCompile(`ERROR (\d+) \(([^)]+)\): (.*)`)
 		if im := innerRe.FindStringSubmatch(innerMsg); im != nil {
 			return fmt.Sprintf("ERROR %s: %s", im[2], im[3])
 		}
+		return fmt.Sprintf("ERROR %s: %s", m[2], m[3])
+	}
+	// Handle bare "ERROR XXXX (YYYY): message" format (no outer Error wrapper)
+	bareRe := regexp.MustCompile(`ERROR (\d+) \(([^)]+)\): (.*)`)
+	if m := bareRe.FindStringSubmatch(msg); m != nil {
 		return fmt.Sprintf("ERROR %s: %s", m[2], m[3])
 	}
 	return "ERROR HY000: " + msg

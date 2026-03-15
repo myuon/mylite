@@ -3,6 +3,7 @@ package executor
 import (
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -71,6 +72,111 @@ func mysqlError(code int, state, message string) error {
 }
 
 // Execute parses and executes a SQL statement.
+// matchLike matches a string against a SQL LIKE pattern.
+// % matches any sequence of characters, _ matches any single character.
+func matchLike(s, pattern string) bool {
+	return matchLikeHelper(s, pattern, 0, 0)
+}
+
+func matchLikeHelper(s, p string, si, pi int) bool {
+	for pi < len(p) {
+		if p[pi] == '%' {
+			pi++
+			for si <= len(s) {
+				if matchLikeHelper(s, p, si, pi) {
+					return true
+				}
+				si++
+			}
+			return false
+		} else if p[pi] == '_' {
+			if si >= len(s) {
+				return false
+			}
+			si++
+			pi++
+		} else {
+			if si >= len(s) || strings.ToLower(string(s[si])) != strings.ToLower(string(p[pi])) {
+				return false
+			}
+			si++
+			pi++
+		}
+	}
+	return si == len(s)
+}
+
+// normalizeTypeAliases replaces MySQL type aliases that the vitess parser
+// doesn't support with their canonical equivalents.
+func normalizeTypeAliases(query string) string {
+	upper := strings.ToUpper(query)
+	// Only apply to CREATE TABLE or ALTER TABLE statements
+	if !strings.Contains(upper, "CREATE TABLE") && !strings.Contains(upper, "ALTER TABLE") {
+		return query
+	}
+	// Replace DOUBLE PRECISION with DOUBLE (case-insensitive, word-boundary aware)
+	result := replaceTypeWord(query, "DOUBLE PRECISION", "DOUBLE")
+	result = replaceTypeWord(result, "DEC", "DECIMAL")
+	result = replaceTypeWord(result, "FIXED", "DECIMAL")
+	result = replaceTypeWord(result, "NUMERIC", "DECIMAL")
+	result = replaceTypeWord(result, "SERIAL", "BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE")
+	return result
+}
+
+// replaceTypeWord replaces a type keyword in a SQL query case-insensitively,
+// only when it appears as a whole word (not part of a larger identifier)
+// and not inside a quoted string.
+func replaceTypeWord(query, old, replacement string) string {
+	upper := strings.ToUpper(query)
+	oldUpper := strings.ToUpper(old)
+	idx := 0
+	for {
+		pos := strings.Index(upper[idx:], oldUpper)
+		if pos == -1 {
+			break
+		}
+		absPos := idx + pos
+		endPos := absPos + len(old)
+
+		// Check if we're inside a quoted string
+		inQuote := false
+		quoteChar := byte(0)
+		for i := 0; i < absPos; i++ {
+			ch := query[i]
+			if !inQuote && (ch == '\'' || ch == '"') {
+				inQuote = true
+				quoteChar = ch
+			} else if inQuote && ch == quoteChar {
+				inQuote = false
+			}
+		}
+		if inQuote {
+			idx = endPos
+			continue
+		}
+
+		// Check word boundaries
+		if absPos > 0 {
+			ch := query[absPos-1]
+			if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_' {
+				idx = endPos
+				continue
+			}
+		}
+		if endPos < len(query) {
+			ch := query[endPos]
+			if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_' || (ch >= '0' && ch <= '9') {
+				idx = endPos
+				continue
+			}
+		}
+		query = query[:absPos] + replacement + query[endPos:]
+		upper = strings.ToUpper(query)
+		idx = absPos + len(replacement)
+	}
+	return query
+}
+
 func (e *Executor) Execute(query string) (*Result, error) {
 	// Handle MYLITE control commands before passing to the SQL parser.
 	trimmed := strings.TrimSpace(query)
@@ -78,6 +184,9 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	if strings.HasPrefix(upper, "MYLITE ") {
 		return e.execMyliteCommand(trimmed)
 	}
+
+	// Normalize SQL type aliases that vitess parser doesn't support
+	query = normalizeTypeAliases(query)
 
 	stmt, err := sqlparser.NewTestParser().Parse(query)
 	if err != nil {
@@ -174,9 +283,10 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return &Result{}, nil
 	case *sqlparser.Analyze:
 		// Return a minimal ANALYZE TABLE result set for compatibility
+		tableName := s.Table.Name.String()
 		return &Result{
 			Columns:     []string{"Table", "Op", "Msg_type", "Msg_text"},
-			Rows:        [][]interface{}{},
+			Rows:        [][]interface{}{{fmt.Sprintf("%s.%s", e.CurrentDB, tableName), "analyze", "status", "OK"}},
 			IsResultSet: true,
 		}, nil
 	case *sqlparser.CallProc:
@@ -204,21 +314,73 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		// Accept DROP VIEW silently
 		return &Result{}, nil
 	case *sqlparser.Union:
-		// TODO: implement UNION
-		return &Result{Columns: []string{}, Rows: [][]interface{}{}, IsResultSet: true}, nil
+		return e.execUnion(s)
+	case *sqlparser.RenameTable:
+		return e.execRenameTable(s)
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %T", s)
 	}
 }
 
+func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error) {
+	for _, pair := range stmt.TablePairs {
+		oldName := pair.FromTable.Name.String()
+		newName := pair.ToTable.Name.String()
+		// Check if target database exists
+		targetDB := e.CurrentDB
+		if !pair.ToTable.Qualifier.IsEmpty() {
+			targetDB = pair.ToTable.Qualifier.String()
+		}
+		if _, err := e.Catalog.GetDatabase(targetDB); err != nil {
+			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", targetDB))
+		}
+		db, err := e.Catalog.GetDatabase(e.CurrentDB)
+		if err != nil {
+			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+		}
+		// Check if new name already exists
+		if _, err := db.GetTable(newName); err == nil {
+			return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newName))
+		}
+		// Get old table def
+		def, err := db.GetTable(oldName)
+		if err != nil {
+			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, oldName))
+		}
+		// Rename in catalog
+		def.Name = newName
+		db.DropTable(oldName)  //nolint:errcheck
+		db.CreateTable(def)    //nolint:errcheck
+		// Rename in storage
+		if tbl, err := e.Storage.GetTable(e.CurrentDB, oldName); err == nil {
+			tbl.Def = def
+			e.Storage.CreateTable(e.CurrentDB, def)
+			// Copy rows
+			if newTbl, err := e.Storage.GetTable(e.CurrentDB, newName); err == nil {
+				newTbl.Rows = tbl.Rows
+				newTbl.AutoIncrement.Store(tbl.AutoIncrementValue())
+			}
+			e.Storage.DropTable(e.CurrentDB, oldName)
+		}
+	}
+	return &Result{}, nil
+}
+
 func (e *Executor) execCreateDatabase(stmt *sqlparser.CreateDatabase) (*Result, error) {
 	name := stmt.DBName.String()
+	// Reject creating system schemas
+	sysSchemas := map[string]bool{
+		"mysql": true, "information_schema": true, "performance_schema": true, "sys": true,
+	}
+	if sysSchemas[strings.ToLower(name)] {
+		return nil, mysqlError(3802, "HY000", fmt.Sprintf("Access to system schema '%s' is rejected.", name))
+	}
 	err := e.Catalog.CreateDatabase(name)
 	if err != nil {
 		if stmt.IfNotExists {
 			return &Result{}, nil
 		}
-		return nil, err
+		return nil, mysqlError(1007, "HY000", fmt.Sprintf("Can't create database '%s'; database exists", name))
 	}
 	e.Storage.EnsureDatabase(name)
 	return &Result{AffectedRows: 1}, nil
@@ -231,7 +393,7 @@ func (e *Executor) execDropDatabase(stmt *sqlparser.DropDatabase) (*Result, erro
 		if stmt.IfExists {
 			return &Result{}, nil
 		}
-		return nil, err
+		return nil, mysqlError(1008, "HY000", fmt.Sprintf("Can't drop database '%s'; database doesn't exist", name))
 	}
 	e.Storage.DropDatabase(name)
 	if e.CurrentDB == name {
@@ -310,7 +472,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	for _, idx := range stmt.TableSpec.Indexes {
 		var idxCols []string
 		for _, idxCol := range idx.Columns {
-			idxCols = append(idxCols, idxCol.Column.String())
+			colStr := idxCol.Column.String()
+			if idxCol.Length != nil {
+				colStr += fmt.Sprintf("(%d)", *idxCol.Length)
+			}
+			idxCols = append(idxCols, colStr)
 		}
 		if idx.Info.Type == sqlparser.IndexTypePrimary {
 			primaryKeys = nil
@@ -356,14 +522,17 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	}
 	e.Storage.CreateTable(e.CurrentDB, def)
 
-	// Set AUTO_INCREMENT start value from table options
+	// Set AUTO_INCREMENT start value and table comment from table options
 	for _, opt := range stmt.TableSpec.Options {
-		if strings.ToUpper(opt.Name) == "AUTO_INCREMENT" {
+		switch strings.ToUpper(opt.Name) {
+		case "AUTO_INCREMENT":
 			if val, err := strconv.ParseInt(opt.Value.Val, 10, 64); err == nil {
 				if tbl, err := e.Storage.GetTable(e.CurrentDB, tableName); err == nil {
 					tbl.AutoIncrement.Store(val - 1) // Store val-1 because next insert increments first
 				}
 			}
+		case "COMMENT":
+			def.Comment = opt.Value.Val
 		}
 	}
 
@@ -565,6 +734,34 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		}
 	}
 
+	// Handle INSERT ... SELECT
+	if sel, ok := stmt.Rows.(*sqlparser.Select); ok {
+		selResult, err := e.execSelect(sel)
+		if err != nil {
+			return nil, err
+		}
+		// Convert SELECT result to Values
+		var valRows sqlparser.Values
+		for _, selRow := range selResult.Rows {
+			var tuple sqlparser.ValTuple
+			for _, v := range selRow {
+				if v == nil {
+					tuple = append(tuple, &sqlparser.NullVal{})
+				} else {
+					tuple = append(tuple, sqlparser.NewStrLiteral(fmt.Sprintf("%v", v)))
+				}
+			}
+			valRows = append(valRows, tuple)
+		}
+		// If no columns specified in INSERT, use source columns
+		if len(colNames) == 0 {
+			for _, col := range tbl.Def.Columns {
+				colNames = append(colNames, col.Name)
+			}
+		}
+		stmt.Rows = valRows
+	}
+
 	rows, ok := stmt.Rows.(sqlparser.Values)
 	if !ok {
 		return nil, fmt.Errorf("unsupported INSERT format")
@@ -630,6 +827,17 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 		}
 
+		// REPLACE: delete existing duplicate row first, then insert
+		if stmt.Action == sqlparser.ReplaceAct {
+			dupIdx := e.findDuplicateRow(tbl, row, pkCols, uniqueCols)
+			if dupIdx >= 0 {
+				tbl.Lock()
+				tbl.Rows = append(tbl.Rows[:dupIdx], tbl.Rows[dupIdx+1:]...)
+				tbl.Unlock()
+				affected++ // REPLACE counts deleted row + inserted row = 2
+			}
+		}
+
 		id, err := tbl.Insert(row)
 		if err != nil {
 			// INSERT IGNORE: silently skip duplicate key errors
@@ -654,6 +862,14 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 func (e *Executor) findDuplicateRow(tbl *storage.Table, candidate storage.Row, pkCols, uniqueCols []string) int {
 	tbl.Mu.RLock()
 	defer tbl.Mu.RUnlock()
+
+	// Also collect multi-column unique indexes
+	var multiColUnique [][]string
+	for _, idx := range tbl.Def.Indexes {
+		if idx.Unique && len(idx.Columns) > 1 {
+			multiColUnique = append(multiColUnique, idx.Columns)
+		}
+	}
 
 	for i, existing := range tbl.Rows {
 		// Check primary key match.
@@ -681,6 +897,25 @@ func (e *Executor) findDuplicateRow(tbl *storage.Table, candidate storage.Row, p
 			ev, eok := existing[col]
 			if cok && eok && cv != nil && ev != nil &&
 				fmt.Sprintf("%v", cv) == fmt.Sprintf("%v", ev) {
+				return i
+			}
+		}
+		// Check multi-column unique indexes.
+		for _, cols := range multiColUnique {
+			match := true
+			for _, col := range cols {
+				cv, cok := candidate[col]
+				ev, eok := existing[col]
+				if !cok || !eok || cv == nil || ev == nil {
+					match = false
+					break
+				}
+				if fmt.Sprintf("%v", cv) != fmt.Sprintf("%v", ev) {
+					match = false
+					break
+				}
+			}
+			if match {
 				return i
 			}
 		}
@@ -948,6 +1183,20 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		resultRows = append(resultRows, resultRow)
 	}
 
+	// Apply SELECT DISTINCT
+	if stmt.Distinct {
+		seen := make(map[string]bool)
+		unique := make([][]interface{}, 0)
+		for _, row := range resultRows {
+			key := fmt.Sprintf("%v", row)
+			if !seen[key] {
+				seen[key] = true
+				unique = append(unique, row)
+			}
+		}
+		resultRows = unique
+	}
+
 	// Apply ORDER BY
 	if stmt.OrderBy != nil {
 		resultRows, err = applyOrderBy(stmt.OrderBy, colNames, resultRows)
@@ -1077,12 +1326,18 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 	// Apply HAVING
 	if stmt.Having != nil {
 		filtered := make([][]interface{}, 0)
-		for _, row := range resultRows {
+		for gi, row := range resultRows {
 			havingRow := make(storage.Row)
 			for i, col := range colNames {
 				havingRow[col] = row[i]
 			}
-			match, err := e.evalWhere(stmt.Having.Expr, havingRow)
+			// Also evaluate aggregates from the HAVING clause against the group rows
+			var groupRows []storage.Row
+			if gi < len(groups) {
+				groupRows = groups[gi].rows
+			}
+			// Evaluate HAVING with aggregate support
+			match, err := e.evalHaving(stmt.Having.Expr, havingRow, groupRows)
 			if err != nil {
 				return nil, err
 			}
@@ -1238,13 +1493,33 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					}
 				}
 			} else if len(rows) > 0 {
-				// Fallback: use row keys (may have non-deterministic order)
-				seen := make(map[string]bool)
-				for k := range rows[0] {
-					if !strings.Contains(k, ".") && !seen[k] {
-						seen[k] = true
-						cols = append(cols, k)
-						colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(k)})
+				// Check if this is an information_schema table by matching row keys
+				// against known column orders.
+				usedOrder := false
+				for _, order := range infoSchemaColumnOrder {
+					if len(order) > 0 {
+						if _, ok := rows[0][order[0]]; ok {
+							// Use predefined column order for information_schema
+							for _, colName := range order {
+								if _, exists := rows[0][colName]; exists {
+									cols = append(cols, colName)
+									colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(colName)})
+								}
+							}
+							usedOrder = true
+							break
+						}
+					}
+				}
+				if !usedOrder {
+					// Fallback: use row keys (may have non-deterministic order)
+					seen := make(map[string]bool)
+					for k := range rows[0] {
+						if !strings.Contains(k, ".") && !seen[k] {
+							seen[k] = true
+							cols = append(cols, k)
+							colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(k)})
+						}
 					}
 				}
 			}
@@ -1254,6 +1529,18 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 				name = se.As.String()
 			} else if colName, ok := se.Expr.(*sqlparser.ColName); ok {
 				name = colName.Name.String()
+				// Case-insensitive column name resolution: if the row has a
+				// key that matches case-insensitively, use that key's case
+				// (needed for information_schema columns which are UPPERCASE).
+				if len(rows) > 0 {
+					upperName := strings.ToUpper(name)
+					for k := range rows[0] {
+						if strings.ToUpper(k) == upperName && !strings.Contains(k, ".") {
+							name = k
+							break
+						}
+					}
+				}
 			} else {
 				name = sqlparser.String(se.Expr)
 			}
@@ -1264,6 +1551,64 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 		}
 	}
 	return cols, colExprs, nil
+}
+
+func (e *Executor) execUnion(stmt *sqlparser.Union) (*Result, error) {
+	// Execute left side
+	leftResult, err := e.Execute(sqlparser.String(stmt.Left))
+	if err != nil {
+		return nil, err
+	}
+
+	// Execute right side
+	rightResult, err := e.Execute(sqlparser.String(stmt.Right))
+	if err != nil {
+		return nil, err
+	}
+
+	// Combine rows
+	allRows := make([][]interface{}, 0, len(leftResult.Rows)+len(rightResult.Rows))
+	allRows = append(allRows, leftResult.Rows...)
+	allRows = append(allRows, rightResult.Rows...)
+
+	// UNION (not UNION ALL) removes duplicates
+	if !stmt.Distinct {
+		// UNION ALL - keep all rows
+	} else {
+		// UNION - remove duplicates
+		seen := make(map[string]bool)
+		unique := make([][]interface{}, 0)
+		for _, row := range allRows {
+			key := fmt.Sprintf("%v", row)
+			if !seen[key] {
+				seen[key] = true
+				unique = append(unique, row)
+			}
+		}
+		allRows = unique
+	}
+
+	// Apply ORDER BY if present
+	if stmt.OrderBy != nil {
+		allRows, err = applyOrderBy(stmt.OrderBy, leftResult.Columns, allRows)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Apply LIMIT
+	if stmt.Limit != nil {
+		allRows, err = applyLimit(stmt.Limit, allRows)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &Result{
+		Columns:     leftResult.Columns,
+		Rows:        allRows,
+		IsResultSet: true,
+	}, nil
 }
 
 func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
@@ -1443,7 +1788,15 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		case *sqlparser.AddColumns:
 			for _, col := range op.Columns {
 				colDef := columnDefFromAST(col)
-				if addErr := db.AddColumn(tableName, colDef); addErr != nil {
+				position := ""
+				afterCol := ""
+				if op.First {
+					position = "FIRST"
+				} else if op.After != nil {
+					position = "AFTER"
+					afterCol = op.After.Name.String()
+				}
+				if addErr := db.AddColumnAt(tableName, colDef, position, afterCol); addErr != nil {
 					return nil, addErr
 				}
 				// Determine the default value to fill in existing rows.
@@ -1457,6 +1810,11 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 		case *sqlparser.DropColumn:
 			colName := op.Name.Name.String()
+			// Check if this would leave the table with no columns
+			tableDef, _ := db.GetTable(tableName)
+			if tableDef != nil && len(tableDef.Columns) <= 1 {
+				return nil, mysqlError(1090, "42000", "You can't delete all columns with ALTER TABLE; use DROP TABLE instead")
+			}
 			if dropErr := db.DropColumn(tableName, colName); dropErr != nil {
 				return nil, dropErr
 			}
@@ -1480,10 +1838,51 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			}
 
 		case *sqlparser.AddIndexDefinition:
-			// Silently accept index additions (no index enforcement in mylite).
+			// Store index definition so SHOW CREATE TABLE can display it.
+			var idxCols []string
+			for _, idxCol := range op.IndexDefinition.Columns {
+				colStr := idxCol.Column.String()
+				if idxCol.Length != nil {
+					colStr += fmt.Sprintf("(%d)", *idxCol.Length)
+				}
+				idxCols = append(idxCols, colStr)
+			}
+			isUnique := op.IndexDefinition.Info.Type == sqlparser.IndexTypeUnique
+			isPrimary := op.IndexDefinition.Info.Type == sqlparser.IndexTypePrimary
+			idxName := op.IndexDefinition.Info.Name.String()
+			if idxName == "" && len(idxCols) > 0 {
+				idxName = idxCols[0]
+			}
+			// Check for USING method
+			usingMethod := ""
+			for _, opt := range op.IndexDefinition.Options {
+				if opt.Name == "USING" {
+					usingMethod = opt.String
+				}
+			}
+			if isPrimary {
+				db.SetPrimaryKey(tableName, idxCols)
+			} else {
+				db.AddIndex(tableName, catalog.IndexDef{
+					Name:    idxName,
+					Columns: idxCols,
+					Unique:  isUnique,
+					Using:   usingMethod,
+				})
+			}
 
 		case *sqlparser.AddConstraintDefinition:
 			// Silently accept constraint additions.
+
+		case *sqlparser.DropKey:
+			if op.Type == sqlparser.PrimaryKeyType {
+				db.DropPrimaryKey(tableName)
+			} else {
+				idxName := op.Name.String()
+				if err := db.DropIndex(tableName, idxName); err != nil {
+					return nil, mysqlError(1091, "42000", fmt.Sprintf("Can't DROP '%s'; check that column/key exists", idxName))
+				}
+			}
 
 		case sqlparser.TableOptions:
 			for _, to := range op {
@@ -1539,7 +1938,7 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 		if col.AutoIncrement {
 			extra = "auto_increment"
 		}
-		rows = append(rows, []interface{}{col.Name, col.Type, nullable, key, defVal, extra})
+		rows = append(rows, []interface{}{col.Name, mysqlDisplayType(col.Type), nullable, key, defVal, extra})
 	}
 
 	return &Result{
@@ -1552,6 +1951,10 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error) {
 	// Dispatch based on the structured ShowBasic command type when available.
 	if basic, ok := stmt.Internal.(*sqlparser.ShowBasic); ok {
+		likePattern := ""
+		if basic.Filter != nil {
+			likePattern = basic.Filter.Like
+		}
 		switch basic.Command {
 		case sqlparser.Column:
 			// SHOW COLUMNS FROM <table> / SHOW FULL COLUMNS FROM <table>
@@ -1559,6 +1962,73 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		case sqlparser.TableStatus:
 			// SHOW TABLE STATUS [FROM db] [LIKE ...]
 			return e.showTableStatus()
+		case sqlparser.Database: // SHOW DATABASES / SHOW SCHEMAS
+			dbs := e.Catalog.ListDatabases()
+			sort.Strings(dbs)
+			rows := make([][]interface{}, 0, len(dbs))
+			for _, d := range dbs {
+				if likePattern != "" && !matchLike(d, likePattern) {
+					continue
+				}
+				rows = append(rows, []interface{}{d})
+			}
+			colName := "Database"
+			if likePattern != "" {
+				colName = fmt.Sprintf("Database (%s)", likePattern)
+			}
+			return &Result{Columns: []string{colName}, Rows: rows, IsResultSet: true}, nil
+		case sqlparser.Charset: // SHOW CHARACTER SET
+			charsets := [][]interface{}{
+				{"armscii8", "ARMSCII-8 Armenian", "armscii8_general_ci", int64(1)},
+				{"ascii", "US ASCII", "ascii_general_ci", int64(1)},
+				{"binary", "Binary pseudo charset", "binary", int64(1)},
+				{"latin1", "cp1252 West European", "latin1_swedish_ci", int64(1)},
+				{"utf8", "UTF-8 Unicode", "utf8_general_ci", int64(3)},
+				{"utf8mb3", "UTF-8 Unicode", "utf8mb3_general_ci", int64(3)},
+				{"utf8mb4", "UTF-8 Unicode", "utf8mb4_0900_ai_ci", int64(4)},
+			}
+			rows := make([][]interface{}, 0)
+			for _, cs := range charsets {
+				if likePattern == "" || matchLike(cs[0].(string), likePattern) {
+					rows = append(rows, cs)
+				}
+			}
+			return &Result{Columns: []string{"Charset", "Description", "Default collation", "Maxlen"}, Rows: rows, IsResultSet: true}, nil
+		case sqlparser.Collation: // SHOW COLLATION
+			collations := [][]interface{}{
+				{"utf8mb4_0900_ai_ci", "utf8mb4", int64(255), "Yes", "Yes", int64(0), "NO PAD"},
+				{"utf8mb4_general_ci", "utf8mb4", int64(45), "", "Yes", int64(1), "PAD SPACE"},
+				{"utf8_general_ci", "utf8", int64(33), "Yes", "Yes", int64(1), "PAD SPACE"},
+				{"latin1_swedish_ci", "latin1", int64(8), "Yes", "Yes", int64(1), "PAD SPACE"},
+				{"ascii_general_ci", "ascii", int64(11), "Yes", "Yes", int64(1), "PAD SPACE"},
+				{"binary", "binary", int64(63), "Yes", "Yes", int64(1), "NO PAD"},
+			}
+			rows := make([][]interface{}, 0)
+			for _, c := range collations {
+				if likePattern == "" || matchLike(c[0].(string), likePattern) {
+					rows = append(rows, c)
+				}
+			}
+			return &Result{Columns: []string{"Collation", "Charset", "Id", "Default", "Compiled", "Sortlen", "Pad_attribute"}, Rows: rows, IsResultSet: true}, nil
+		case sqlparser.Table: // SHOW TABLES
+			db, err := e.Catalog.GetDatabase(e.CurrentDB)
+			if err != nil {
+				return nil, err
+			}
+			tables := db.ListTables()
+			sort.Strings(tables)
+			rows := make([][]interface{}, 0, len(tables))
+			for _, t := range tables {
+				if likePattern != "" && !matchLike(t, likePattern) {
+					continue
+				}
+				rows = append(rows, []interface{}{t})
+			}
+			return &Result{
+				Columns:     []string{fmt.Sprintf("Tables_in_%s", e.CurrentDB)},
+				Rows:        rows,
+				IsResultSet: true,
+			}, nil
 		}
 	}
 
@@ -1570,6 +2040,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			return nil, err
 		}
 		tables := db.ListTables()
+		sort.Strings(tables)
 		rows := make([][]interface{}, len(tables))
 		for i, t := range tables {
 			rows[i] = []interface{}{t}
@@ -1581,14 +2052,85 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		}, nil
 	}
 
-	if strings.HasPrefix(upper, "SHOW DATABASES") {
+	if strings.HasPrefix(upper, "SHOW DATABASES") || strings.HasPrefix(upper, "SHOW SCHEMAS") {
 		dbs := e.Catalog.ListDatabases()
-		rows := make([][]interface{}, len(dbs))
-		for i, d := range dbs {
-			rows[i] = []interface{}{d}
+		sort.Strings(dbs)
+		// Handle LIKE pattern
+		likePattern := ""
+		if idx := strings.Index(upper, "LIKE "); idx >= 0 {
+			rest := strings.TrimSpace(query[idx+5:])
+			likePattern = strings.Trim(rest, "'\"")
+		}
+		rows := make([][]interface{}, 0, len(dbs))
+		for _, d := range dbs {
+			if likePattern != "" && !matchLike(d, likePattern) {
+				continue
+			}
+			rows = append(rows, []interface{}{d})
+		}
+		colName := "Database"
+		if likePattern != "" {
+			colName = fmt.Sprintf("Database (%s)", likePattern)
 		}
 		return &Result{
-			Columns:     []string{"Database"},
+			Columns:     []string{colName},
+			Rows:        rows,
+			IsResultSet: true,
+		}, nil
+	}
+
+	// SHOW CHARACTER SET
+	if strings.HasPrefix(upper, "SHOW CHARACTER SET") || strings.HasPrefix(upper, "SHOW CHARSET") {
+		likePattern := ""
+		if idx := strings.Index(upper, "LIKE "); idx >= 0 {
+			rest := strings.TrimSpace(query[idx+5:])
+			likePattern = strings.Trim(rest, "'\"")
+		}
+		charsets := [][]interface{}{
+			{"armscii8", "ARMSCII-8 Armenian", "armscii8_general_ci", int64(1)},
+			{"ascii", "US ASCII", "ascii_general_ci", int64(1)},
+			{"binary", "Binary pseudo charset", "binary", int64(1)},
+			{"latin1", "cp1252 West European", "latin1_swedish_ci", int64(1)},
+			{"utf8", "UTF-8 Unicode", "utf8_general_ci", int64(3)},
+			{"utf8mb3", "UTF-8 Unicode", "utf8mb3_general_ci", int64(3)},
+			{"utf8mb4", "UTF-8 Unicode", "utf8mb4_0900_ai_ci", int64(4)},
+		}
+		rows := make([][]interface{}, 0)
+		for _, cs := range charsets {
+			if likePattern == "" || matchLike(cs[0].(string), likePattern) {
+				rows = append(rows, cs)
+			}
+		}
+		return &Result{
+			Columns:     []string{"Charset", "Description", "Default collation", "Maxlen"},
+			Rows:        rows,
+			IsResultSet: true,
+		}, nil
+	}
+
+	// SHOW COLLATION
+	if strings.HasPrefix(upper, "SHOW COLLATION") {
+		likePattern := ""
+		if idx := strings.Index(upper, "LIKE "); idx >= 0 {
+			rest := strings.TrimSpace(query[idx+5:])
+			likePattern = strings.Trim(rest, "'\"")
+		}
+		collations := [][]interface{}{
+			{"utf8mb4_0900_ai_ci", "utf8mb4", int64(255), "Yes", "Yes", int64(0), "NO PAD"},
+			{"utf8mb4_general_ci", "utf8mb4", int64(45), "", "Yes", int64(1), "PAD SPACE"},
+			{"utf8_general_ci", "utf8", int64(33), "Yes", "Yes", int64(1), "PAD SPACE"},
+			{"latin1_swedish_ci", "latin1", int64(8), "Yes", "Yes", int64(1), "PAD SPACE"},
+			{"ascii_general_ci", "ascii", int64(11), "Yes", "Yes", int64(1), "PAD SPACE"},
+			{"binary", "binary", int64(63), "Yes", "Yes", int64(1), "NO PAD"},
+		}
+		rows := make([][]interface{}, 0)
+		for _, c := range collations {
+			if likePattern == "" || matchLike(c[0].(string), likePattern) {
+				rows = append(rows, c)
+			}
+		}
+		return &Result{
+			Columns:     []string{"Collation", "Charset", "Id", "Default", "Compiled", "Sortlen", "Pad_attribute"},
 			Rows:        rows,
 			IsResultSet: true,
 		}, nil
@@ -1615,7 +2157,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 // including length, scale, unsigned, zerofill, and enum values,
 // but excluding options like NOT NULL, AUTO_INCREMENT, etc.
 func buildColumnTypeString(ct *sqlparser.ColumnType) string {
-	s := ct.Type
+	s := strings.ToLower(ct.Type)
 	if ct.Length != nil && ct.Scale != nil {
 		s += fmt.Sprintf("(%d,%d)", *ct.Length, *ct.Scale)
 	} else if ct.Length != nil {
@@ -1624,15 +2166,18 @@ func buildColumnTypeString(ct *sqlparser.ColumnType) string {
 	if len(ct.EnumValues) > 0 {
 		vals := make([]string, len(ct.EnumValues))
 		for i, v := range ct.EnumValues {
+			// Vitess parser stores enum values with surrounding quotes;
+			// strip them before re-quoting to avoid double-quoting.
+			v = strings.Trim(v, "'")
 			vals[i] = fmt.Sprintf("'%s'", v)
 		}
 		s += "(" + strings.Join(vals, ",") + ")"
 	}
 	if ct.Unsigned {
-		s += " UNSIGNED"
+		s += " unsigned"
 	}
 	if ct.Zerofill {
-		s += " ZEROFILL"
+		s += " zerofill"
 	}
 	return s
 }
@@ -1645,17 +2190,31 @@ func mysqlDisplayType(colType string) string {
 	suffix := ""
 	if idx := strings.Index(upper, "("); idx >= 0 {
 		// Already has width specified, just lowercase it
-		// But also normalize REAL to DOUBLE
+		// But also normalize REAL to DOUBLE, NUMERIC to DECIMAL, INTEGER to INT
 		result := strings.ToLower(colType)
-		if strings.HasPrefix(strings.ToLower(result), "real") {
+		if strings.HasPrefix(result, "real") {
 			result = "double" + result[4:]
 		}
+		if strings.HasPrefix(result, "numeric") {
+			result = "decimal" + result[7:]
+		}
+		if strings.HasPrefix(result, "integer") {
+			result = "int" + result[7:]
+		}
 		return result
+	}
+	// Check for ZEROFILL suffix (must check before UNSIGNED since ZEROFILL implies UNSIGNED)
+	if strings.HasSuffix(base, " ZEROFILL") {
+		base = strings.TrimSuffix(base, " ZEROFILL")
+		suffix = " zerofill"
 	}
 	// Check for UNSIGNED suffix
 	if strings.HasSuffix(base, " UNSIGNED") {
 		base = strings.TrimSuffix(base, " UNSIGNED")
-		suffix = " unsigned"
+		suffix = " unsigned" + suffix
+	} else if strings.Contains(suffix, "zerofill") {
+		// ZEROFILL implies UNSIGNED in MySQL
+		suffix = " unsigned" + suffix
 	}
 
 	// Add default display widths (differ for signed vs unsigned in MySQL)
@@ -1687,7 +2246,7 @@ func mysqlDisplayType(colType string) string {
 		return "float" + suffix
 	case "DOUBLE", "REAL":
 		return "double" + suffix
-	case "DECIMAL":
+	case "DECIMAL", "NUMERIC":
 		return "decimal(10,0)" + suffix
 	case "CHAR":
 		return "char(1)"
@@ -1729,15 +2288,33 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		var parts []string
 		parts = append(parts, fmt.Sprintf("  `%s`", col.Name))
 		parts = append(parts, mysqlDisplayType(col.Type))
+		colTypeLower := strings.ToLower(col.Type)
+		isTimestamp := strings.HasPrefix(colTypeLower, "timestamp")
 		if !col.Nullable {
 			parts = append(parts, "NOT NULL")
-		} else if !col.AutoIncrement {
-			parts = append(parts, "DEFAULT NULL")
+		} else if isTimestamp {
+			// MySQL explicitly shows NULL for nullable timestamp columns
+			parts = append(parts, "NULL")
 		}
 		if col.AutoIncrement {
 			parts = append(parts, "AUTO_INCREMENT")
 		} else if col.Default != nil {
-			parts = append(parts, fmt.Sprintf("DEFAULT %s", *col.Default))
+			defVal := *col.Default
+			// MySQL SHOW CREATE TABLE quotes default values
+			if defVal == "NULL" || defVal == "null" {
+				parts = append(parts, "DEFAULT NULL")
+			} else if strings.HasPrefix(defVal, "'") {
+				// Already quoted
+				parts = append(parts, fmt.Sprintf("DEFAULT %s", defVal))
+			} else {
+				parts = append(parts, fmt.Sprintf("DEFAULT '%s'", defVal))
+			}
+		} else if col.Nullable {
+			// MySQL doesn't show DEFAULT NULL for BLOB/TEXT types
+			isBlobOrText := strings.Contains(colTypeLower, "blob") || strings.Contains(colTypeLower, "text")
+			if !isBlobOrText {
+				parts = append(parts, "DEFAULT NULL")
+			}
 		}
 		if col.Comment != "" {
 			parts = append(parts, fmt.Sprintf("COMMENT '%s'", col.Comment))
@@ -1775,12 +2352,21 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	for i, idx := range def.Indexes {
 		quotedCols := make([]string, len(idx.Columns))
 		for j, c := range idx.Columns {
-			quotedCols[j] = fmt.Sprintf("`%s`", c)
+			// Handle column with length prefix like "c1(10)"
+			if lparen := strings.Index(c, "("); lparen >= 0 {
+				quotedCols[j] = fmt.Sprintf("`%s`%s", c[:lparen], c[lparen:])
+			} else {
+				quotedCols[j] = fmt.Sprintf("`%s`", c)
+			}
+		}
+		usingStr := ""
+		if idx.Using != "" {
+			usingStr = " USING " + idx.Using
 		}
 		if idx.Unique {
-			b.WriteString(fmt.Sprintf("  UNIQUE KEY `%s` (%s)", idx.Name, strings.Join(quotedCols, ",")))
+			b.WriteString(fmt.Sprintf("  UNIQUE KEY `%s` (%s)%s", idx.Name, strings.Join(quotedCols, ","), usingStr))
 		} else {
-			b.WriteString(fmt.Sprintf("  KEY `%s` (%s)", idx.Name, strings.Join(quotedCols, ",")))
+			b.WriteString(fmt.Sprintf("  KEY `%s` (%s)%s", idx.Name, strings.Join(quotedCols, ","), usingStr))
 		}
 		if i < len(def.Indexes)-1 {
 			b.WriteString(",")
@@ -1793,6 +2379,9 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		trailer += fmt.Sprintf(" AUTO_INCREMENT=%d", autoIncVal+1)
 	}
 	trailer += " DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	if def.Comment != "" {
+		trailer += fmt.Sprintf(" COMMENT='%s'", def.Comment)
+	}
 	b.WriteString(trailer)
 
 	return &Result{
@@ -3017,11 +3606,25 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			}
 		}
 		// Fall back to un-prefixed lookup
-		val, ok := row[colName]
-		if !ok {
-			return nil, nil
+		if val, ok := row[colName]; ok {
+			return val, nil
 		}
-		return val, nil
+		// Case-insensitive fallback (needed for information_schema columns)
+		upperName := strings.ToUpper(colName)
+		for k, v := range row {
+			if strings.ToUpper(k) == upperName {
+				return v, nil
+			}
+		}
+		return nil, nil
+	case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg:
+		// For HAVING clause: look up the aggregate display name in the row
+		displayName := aggregateDisplayName(expr)
+		if val, ok := row[displayName]; ok {
+			return val, nil
+		}
+		// Fallback: compute the aggregate (for single-row context)
+		return e.evalExpr(expr)
 	default:
 		return e.evalExpr(expr)
 	}
@@ -3033,6 +3636,47 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 func evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{}, error) {
 	e := &Executor{}
 	return e.evalRowExpr(expr, row)
+}
+
+// evalHaving evaluates a HAVING predicate, with support for aggregate functions
+// that are computed against the group's rows.
+func (e *Executor) evalHaving(expr sqlparser.Expr, havingRow storage.Row, groupRows []storage.Row) (bool, error) {
+	// Pre-compute any aggregate expressions in the HAVING clause and add to the row
+	enrichedRow := make(storage.Row, len(havingRow))
+	for k, v := range havingRow {
+		enrichedRow[k] = v
+	}
+	// Walk the expression to find aggregates and compute them
+	e.addAggregatesToRow(expr, enrichedRow, groupRows)
+	return e.evalWhere(expr, enrichedRow)
+}
+
+// addAggregatesToRow walks an expression tree and computes any aggregate functions,
+// storing their results in the row with their display names.
+func (e *Executor) addAggregatesToRow(expr sqlparser.Expr, row storage.Row, groupRows []storage.Row) {
+	switch v := expr.(type) {
+	case *sqlparser.ComparisonExpr:
+		e.addAggregatesToRow(v.Left, row, groupRows)
+		e.addAggregatesToRow(v.Right, row, groupRows)
+	case *sqlparser.AndExpr:
+		e.addAggregatesToRow(v.Left, row, groupRows)
+		e.addAggregatesToRow(v.Right, row, groupRows)
+	case *sqlparser.OrExpr:
+		e.addAggregatesToRow(v.Left, row, groupRows)
+		e.addAggregatesToRow(v.Right, row, groupRows)
+	case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg:
+		displayName := aggregateDisplayName(expr)
+		if _, ok := row[displayName]; !ok {
+			repRow := storage.Row{}
+			if len(groupRows) > 0 {
+				repRow = groupRows[0]
+			}
+			val, err := evalAggregateExpr(expr, groupRows, repRow)
+			if err == nil {
+				row[displayName] = val
+			}
+		}
+	}
 }
 
 // evalWhere evaluates a WHERE predicate against a row.
@@ -3290,5 +3934,5 @@ func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, er
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
 	}
 	tbl.Truncate()
-	return &Result{}, nil
+	return &Result{AffectedRows: 0, IsResultSet: false}, nil
 }

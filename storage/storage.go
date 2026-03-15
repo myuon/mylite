@@ -208,12 +208,12 @@ func (t *Table) Scan() []Row {
 	return result
 }
 
-// Truncate removes all rows.
+// Truncate removes all rows and resets AUTO_INCREMENT.
 func (t *Table) Truncate() {
 	t.Mu.Lock()
 	defer t.Mu.Unlock()
 	t.Rows = make([]Row, 0)
-	t.AutoIncrement.Store(1)
+	t.AutoIncrement.Store(0)
 }
 
 func toInt64(v interface{}) (int64, bool) {
