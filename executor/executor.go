@@ -54,6 +54,8 @@ type Executor struct {
 	lastInsertID   int64
 	// cteMap holds CTE virtual tables for the currently executing query.
 	cteMap         map[string]*cteTable
+	// correlatedRow holds the outer row for correlated subquery evaluation.
+	correlatedRow  storage.Row
 }
 
 func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
@@ -104,6 +106,87 @@ func matchLikeHelper(s, p string, si, pi int) bool {
 		}
 	}
 	return si == len(s)
+}
+
+// normalizeSQLDisplayName converts SQL keywords in a string to uppercase and
+// normalizes operator spacing to match MySQL's column display name behavior.
+func normalizeSQLDisplayName(s string) string {
+	s = uppercaseSQLKeywords(s)
+	// MySQL displays comparison operators without surrounding spaces in column names
+	// e.g. "c1=2" not "c1 = 2"
+	for _, op := range []string{" = ", " != ", " <> ", " >= ", " <= ", " > ", " < "} {
+		compact := strings.TrimSpace(op)
+		s = strings.ReplaceAll(s, op, compact)
+	}
+	return s
+}
+
+// uppercaseSQLKeywords converts SQL keywords in a string to uppercase to match MySQL's
+// column display name behavior for subquery expressions.
+func uppercaseSQLKeywords(s string) string {
+	keywords := []string{
+		"select", "from", "where", "and", "or", "not", "in", "exists",
+		"any", "some", "all", "as", "on", "join", "left", "right", "inner",
+		"outer", "cross", "group", "by", "order", "having", "limit", "offset",
+		"union", "except", "intersect", "distinct", "between", "like", "is",
+		"null", "true", "false", "case", "when", "then", "else", "end",
+		"asc", "desc", "count", "sum", "avg", "min", "max", "upper", "lower",
+		"row", "with",
+	}
+	result := []byte(s)
+	for _, kw := range keywords {
+		kwBytes := []byte(kw)
+		upper := []byte(strings.ToUpper(kw))
+		i := 0
+		for i < len(result) {
+			// Skip quoted strings
+			if result[i] == '\'' || result[i] == '"' || result[i] == '`' {
+				q := result[i]
+				i++
+				for i < len(result) && result[i] != q {
+					i++
+				}
+				if i < len(result) {
+					i++
+				}
+				continue
+			}
+			// Check word boundary at start
+			if i > 0 {
+				ch := result[i-1]
+				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (ch >= '0' && ch <= '9') {
+					i++
+					continue
+				}
+			}
+			// Check if keyword matches
+			if i+len(kw) <= len(result) {
+				match := true
+				for j := 0; j < len(kw); j++ {
+					if result[i+j] != kwBytes[j] {
+						match = false
+						break
+					}
+				}
+				if match {
+					// Check word boundary at end
+					end := i + len(kw)
+					if end < len(result) {
+						ch := result[end]
+						if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (ch >= '0' && ch <= '9') {
+							i++
+							continue
+						}
+					}
+					copy(result[i:i+len(kw)], upper)
+					i += len(kw)
+					continue
+				}
+			}
+			i++
+		}
+	}
+	return string(result)
 }
 
 // normalizeTypeAliases replaces MySQL type aliases that the vitess parser
@@ -958,6 +1041,28 @@ func (e *Executor) findDuplicateRow(tbl *storage.Table, candidate storage.Row, p
 func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error) {
 	switch te := expr.(type) {
 	case *sqlparser.AliasedTableExpr:
+		// Handle DerivedTable (FROM subquery)
+		if dt, ok := te.Expr.(*sqlparser.DerivedTable); ok {
+			alias := te.As.String()
+			sub := &sqlparser.Subquery{Select: dt.Select}
+			result, err := e.execSubquery(sub, e.correlatedRow)
+			if err != nil {
+				return nil, err
+			}
+			rows := make([]storage.Row, len(result.Rows))
+			for i, resultRow := range result.Rows {
+				row := make(storage.Row, len(result.Columns)*2)
+				for j, col := range result.Columns {
+					row[col] = resultRow[j]
+					if alias != "" {
+						row[alias+"."+col] = resultRow[j]
+					}
+				}
+				rows[i] = row
+			}
+			return rows, nil
+		}
+
 		alias, tableName, err := extractTableAliasFromAliased(te)
 		if err != nil {
 			return nil, err
@@ -1572,7 +1677,7 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					}
 				}
 			} else {
-				name = sqlparser.String(se.Expr)
+				name = normalizeSQLDisplayName(sqlparser.String(se.Expr))
 			}
 			cols = append(cols, name)
 			colExprs = append(colExprs, se.Expr)
@@ -1641,6 +1746,75 @@ func (e *Executor) execUnion(stmt *sqlparser.Union) (*Result, error) {
 	}, nil
 }
 
+// execSubquery executes a subquery statement and returns the result.
+// If outerRow is non-nil, it is set as the correlatedRow so that
+// correlated references (e.g. t1.c2 referencing an outer table) resolve.
+func (e *Executor) execSubquery(sub *sqlparser.Subquery, outerRow storage.Row) (*Result, error) {
+	oldCorrelated := e.correlatedRow
+	if outerRow != nil {
+		e.correlatedRow = outerRow
+	}
+	defer func() { e.correlatedRow = oldCorrelated }()
+
+	switch sel := sub.Select.(type) {
+	case *sqlparser.Select:
+		return e.execSelect(sel)
+	case *sqlparser.Union:
+		return e.execUnion(sel)
+	default:
+		// Fallback: serialize and re-execute
+		return e.Execute(sqlparser.String(sub.Select))
+	}
+}
+
+// subqueryHasLimitOrOrderBy checks if a subquery's SELECT has LIMIT or ORDER BY.
+func subqueryHasLimit(sub *sqlparser.Subquery) bool {
+	if sel, ok := sub.Select.(*sqlparser.Select); ok {
+		return sel.Limit != nil
+	}
+	return false
+}
+
+// execSubqueryValues executes a subquery and returns first-column values as a slice.
+func (e *Executor) execSubqueryValues(sub *sqlparser.Subquery, outerRow storage.Row) ([]interface{}, error) {
+	// MySQL error 1235: LIMIT in IN/ALL/ANY/SOME subquery is not supported
+	if subqueryHasLimit(sub) {
+		return nil, mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'LIMIT & IN/ALL/ANY/SOME subquery'")
+	}
+	result, err := e.execSubquery(sub, outerRow)
+	if err != nil {
+		return nil, err
+	}
+	vals := make([]interface{}, len(result.Rows))
+	for i, row := range result.Rows {
+		if len(row) > 0 {
+			vals[i] = row[0]
+		}
+	}
+	return vals, nil
+}
+
+// execSubqueryScalar executes a subquery and returns the single scalar value.
+func (e *Executor) execSubqueryScalar(sub *sqlparser.Subquery, outerRow storage.Row) (interface{}, error) {
+	result, err := e.execSubquery(sub, outerRow)
+	if err != nil {
+		return nil, err
+	}
+	if len(result.Rows) == 0 {
+		return nil, nil
+	}
+	if len(result.Columns) > 1 {
+		return nil, mysqlError(1241, "21000", "Operand should contain 1 column(s)")
+	}
+	if len(result.Rows) > 1 {
+		return nil, mysqlError(1242, "21000", "Subquery returns more than 1 row")
+	}
+	if len(result.Rows[0]) == 0 {
+		return nil, nil
+	}
+	return result.Rows[0][0], nil
+}
+
 func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 	colNames := make([]string, 0)
 	values := make([]interface{}, 0)
@@ -1652,7 +1826,7 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 			if !se.As.IsEmpty() {
 				name = se.As.String()
 			} else {
-				name = sqlparser.String(se.Expr)
+				name = normalizeSQLDisplayName(sqlparser.String(se.Expr))
 			}
 			colNames = append(colNames, name)
 
@@ -1673,6 +1847,49 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 	}, nil
 }
 
+// exprReferencesTable checks if an expression tree contains a reference
+// to the given table name.
+func exprReferencesTable(expr sqlparser.SQLNode, tableName string) bool {
+	found := false
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if found {
+			return false, nil
+		}
+		if tn, ok := node.(sqlparser.TableName); ok {
+			if strings.EqualFold(tn.Name.String(), tableName) {
+				found = true
+				return false, nil
+			}
+		}
+		return true, nil
+	}, expr)
+	return found
+}
+
+// subqueryReferencesTable checks if any SET expression's subquery references
+// the same table being updated.
+func subqueryReferencesTable(exprs sqlparser.UpdateExprs, tableName string) bool {
+	for _, upd := range exprs {
+		found := false
+		_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+			if found {
+				return false, nil
+			}
+			if sub, ok := node.(*sqlparser.Subquery); ok {
+				if exprReferencesTable(sub.Select, tableName) {
+					found = true
+					return false, nil
+				}
+			}
+			return true, nil
+		}, upd.Expr)
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 	if len(stmt.TableExprs) == 0 {
 		return nil, fmt.Errorf("no table specified")
@@ -1690,6 +1907,11 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
 	if err != nil {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
+	}
+
+	// Check for self-referencing subqueries (MySQL error 1093)
+	if subqueryReferencesTable(stmt.Exprs, tableName) {
+		return nil, mysqlError(1093, "HY000", fmt.Sprintf("You can't specify target table '%s' for update in FROM clause", tableName))
 	}
 
 	tbl.Lock()
@@ -2803,6 +3025,9 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		default:
 			return now.Format("2006-01-02 15:04:05"), nil
 		}
+	case *sqlparser.Subquery:
+		// Scalar subquery: execute and return the single value
+		return e.execSubqueryScalar(v, e.correlatedRow)
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
 }
@@ -2914,7 +3139,12 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		if val == nil {
 			return nil, nil
 		}
-		return strings.ToUpper(toString(val)), nil
+		s := toString(val)
+		// If the string contains null bytes, it's likely binary data — don't uppercase
+		if strings.ContainsRune(s, '\x00') {
+			return s, nil
+		}
+		return strings.ToUpper(s), nil
 	case "lower", "lcase":
 		if len(v.Exprs) < 1 {
 			return nil, fmt.Errorf("LOWER requires 1 argument")
@@ -3767,6 +3997,12 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			if val, ok := row[qualified]; ok {
 				return val, nil
 			}
+			// Fall back to correlatedRow for correlated subquery references
+			if e.correlatedRow != nil {
+				if val, ok := e.correlatedRow[qualified]; ok {
+					return val, nil
+				}
+			}
 		}
 		// Fall back to un-prefixed lookup
 		if val, ok := row[colName]; ok {
@@ -3779,6 +4015,18 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				return v, nil
 			}
 		}
+		// Fall back to correlatedRow for correlated subquery
+		if e.correlatedRow != nil {
+			if val, ok := e.correlatedRow[colName]; ok {
+				return val, nil
+			}
+			if !v.Qualifier.IsEmpty() {
+				qualified := v.Qualifier.Name.String() + "." + colName
+				if val, ok := e.correlatedRow[qualified]; ok {
+					return val, nil
+				}
+			}
+		}
 		return nil, nil
 	case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg:
 		// For HAVING clause: look up the aggregate display name in the row
@@ -3788,6 +4036,41 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		}
 		// Fallback: compute the aggregate (for single-row context)
 		return e.evalExpr(expr)
+	case *sqlparser.Subquery:
+		// Scalar subquery in row context (correlated)
+		return e.execSubqueryScalar(v, row)
+	case *sqlparser.BinaryExpr:
+		// Arithmetic in row context: resolve column references from the row
+		left, err := e.evalRowExpr(v.Left, row)
+		if err != nil {
+			return nil, err
+		}
+		right, err := e.evalRowExpr(v.Right, row)
+		if err != nil {
+			return nil, err
+		}
+		return evalBinaryExpr(left, right, v.Operator)
+	case *sqlparser.ComparisonExpr:
+		// Comparison in row context
+		left, err := e.evalRowExpr(v.Left, row)
+		if err != nil {
+			return nil, err
+		}
+		right, err := e.evalRowExpr(v.Right, row)
+		if err != nil {
+			return nil, err
+		}
+		result, err := compareValues(left, right, v.Operator)
+		if err != nil {
+			return nil, err
+		}
+		if result {
+			return int64(1), nil
+		}
+		return int64(0), nil
+	case *sqlparser.FuncExpr:
+		// Function call in row context: evaluate args with row context
+		return e.evalFuncExprWithRow(v, row)
 	default:
 		return e.evalExpr(expr)
 	}
@@ -3842,15 +4125,86 @@ func (e *Executor) addAggregatesToRow(expr sqlparser.Expr, row storage.Row, grou
 	}
 }
 
+// evalFuncExprWithRow evaluates a function expression with row context
+// so that arguments containing column references resolve correctly.
+func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (interface{}, error) {
+	// Build new FuncExpr-like evaluation by evaluating args with row context
+	name := strings.ToLower(v.Name.String())
+	// For simple single-arg functions, evaluate arg with row context
+	switch name {
+	case "upper", "ucase":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("UPPER requires 1 argument")
+		}
+		val, err := e.evalRowExpr(v.Exprs[0], row)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		s := toString(val)
+		if strings.ContainsRune(s, '\x00') {
+			return s, nil
+		}
+		return strings.ToUpper(s), nil
+	case "lower", "lcase":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("LOWER requires 1 argument")
+		}
+		val, err := e.evalRowExpr(v.Exprs[0], row)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		s := toString(val)
+		if strings.ContainsRune(s, '\x00') {
+			return s, nil
+		}
+		return strings.ToLower(s), nil
+	default:
+		// Fallback: delegate to evalFuncExpr (no row context for args)
+		return e.evalFuncExpr(v)
+	}
+}
+
 // evalWhere evaluates a WHERE predicate against a row.
 func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error) {
 	switch v := expr.(type) {
 	case *sqlparser.ComparisonExpr:
-		// Handle IN / NOT IN specially because the right side is a ValTuple, not a scalar.
+		// Handle IN / NOT IN specially because the right side is a ValTuple or Subquery.
 		if v.Operator == sqlparser.InOp || v.Operator == sqlparser.NotInOp {
 			left, err := e.evalRowExpr(v.Left, row)
 			if err != nil {
 				return false, err
+			}
+			// IN (SELECT ...)
+			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+				vals, err := e.execSubqueryValues(sub, row)
+				if err != nil {
+					return false, err
+				}
+				// NULL handling: if left is NULL, result is always false for IN
+				if left == nil {
+					return false, nil
+				}
+				hasNull := false
+				for _, val := range vals {
+					if val == nil {
+						hasNull = true
+						continue
+					}
+					if fmt.Sprintf("%v", left) == fmt.Sprintf("%v", val) {
+						return v.Operator == sqlparser.InOp, nil
+					}
+				}
+				// NOT IN with NULL in subquery values: if no match found and NULLs present, return false
+				if v.Operator == sqlparser.NotInOp && hasNull {
+					return false, nil
+				}
+				return v.Operator == sqlparser.NotInOp, nil
 			}
 			tuple, ok := v.Right.(sqlparser.ValTuple)
 			if !ok {
@@ -3867,6 +4221,152 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 			}
 			return v.Operator == sqlparser.NotInOp, nil
 		}
+
+		// Handle ANY/SOME (Modifier=1) and ALL (Modifier=2) with subquery
+		if v.Modifier != 0 {
+			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+				left, err := e.evalRowExpr(v.Left, row)
+				if err != nil {
+					return false, err
+				}
+				if left == nil {
+					return false, nil
+				}
+				vals, err := e.execSubqueryValues(sub, row)
+				if err != nil {
+					return false, err
+				}
+				isAny := v.Modifier == 1 // ANY/SOME
+				if isAny {
+					// ANY/SOME: true if comparison holds for at least one non-NULL value
+					for _, val := range vals {
+						if val == nil {
+							continue
+						}
+						match, err := compareValues(left, val, v.Operator)
+						if err != nil {
+							return false, err
+						}
+						if match {
+							return true, nil
+						}
+					}
+					return false, nil
+				}
+				// ALL: true if comparison holds for all non-NULL values; if any NULL, return false
+				hasNull := false
+				for _, val := range vals {
+					if val == nil {
+						hasNull = true
+						continue
+					}
+					match, err := compareValues(left, val, v.Operator)
+					if err != nil {
+						return false, err
+					}
+					if !match {
+						return false, nil
+					}
+				}
+				if hasNull {
+					return false, nil
+				}
+				// ALL with empty set is true; ALL where all matched is true
+				if len(vals) == 0 {
+					return true, nil
+				}
+				return true, nil
+			}
+		}
+
+		// Handle ValTuple (row subquery) comparisons: (c1,c2) = (SELECT ...) or (c1,c2) = (2,'abc')
+		if leftTuple, ok := v.Left.(sqlparser.ValTuple); ok {
+			// Evaluate left tuple values from row context
+			leftVals := make([]interface{}, len(leftTuple))
+			for i, expr := range leftTuple {
+				val, err := e.evalRowExpr(expr, row)
+				if err != nil {
+					return false, err
+				}
+				leftVals[i] = val
+			}
+
+			// Right side can be a Subquery or a ValTuple
+			var rightVals []interface{}
+			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+				result, err := e.execSubquery(sub, row)
+				if err != nil {
+					return false, err
+				}
+				if len(result.Rows) == 0 {
+					return false, nil
+				}
+				rightVals = result.Rows[0]
+			} else if rightTuple, ok := v.Right.(sqlparser.ValTuple); ok {
+				rightVals = make([]interface{}, len(rightTuple))
+				for i, expr := range rightTuple {
+					val, err := e.evalRowExpr(expr, row)
+					if err != nil {
+						return false, err
+					}
+					rightVals[i] = val
+				}
+			} else {
+				return false, fmt.Errorf("unsupported right side for tuple comparison: %T", v.Right)
+			}
+
+			if len(leftVals) != len(rightVals) {
+				return false, nil
+			}
+			// For EqualOp, all elements must match
+			allMatch := true
+			for i := range leftVals {
+				if leftVals[i] == nil || rightVals[i] == nil {
+					if leftVals[i] != rightVals[i] {
+						allMatch = false
+						break
+					}
+					continue
+				}
+				if fmt.Sprintf("%v", leftVals[i]) != fmt.Sprintf("%v", rightVals[i]) {
+					allMatch = false
+					break
+				}
+			}
+			if v.Operator == sqlparser.EqualOp {
+				return allMatch, nil
+			}
+			if v.Operator == sqlparser.NotEqualOp {
+				return !allMatch, nil
+			}
+			return false, nil
+		}
+
+		// Handle scalar subquery on right side (e.g. WHERE c1 = (SELECT MAX(c1) FROM t2))
+		if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+			left, err := e.evalRowExpr(v.Left, row)
+			if err != nil {
+				return false, err
+			}
+			right, err := e.execSubqueryScalar(sub, row)
+			if err != nil {
+				return false, err
+			}
+			return compareValues(left, right, v.Operator)
+		}
+		// Handle scalar subquery on left side
+		if sub, ok := v.Left.(*sqlparser.Subquery); ok {
+			left, err := e.execSubqueryScalar(sub, row)
+			if err != nil {
+				return false, err
+			}
+			right, err := e.evalRowExpr(v.Right, row)
+			if err != nil {
+				return false, err
+			}
+			return compareValues(left, right, v.Operator)
+		}
+
 		left, err := e.evalRowExpr(v.Left, row)
 		if err != nil {
 			return false, err
@@ -3938,8 +4438,11 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 		}
 		return !result, nil
 	case *sqlparser.ExistsExpr:
-		// EXISTS subquery - not supported yet, return false
-		return false, nil
+		result, err := e.execSubquery(v.Subquery, row)
+		if err != nil {
+			return false, err
+		}
+		return len(result.Rows) > 0, nil
 	case *sqlparser.NotExpr:
 		inner, err := e.evalWhere(v.Expr, row)
 		if err != nil {
