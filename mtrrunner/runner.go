@@ -244,10 +244,17 @@ func (ctx *execContext) executeLines(lines []string) error {
 			continue
 		}
 
-		// Execute SQL
-		err := ctx.executeSQL(stmt)
-		if err != nil {
-			return err
+		// Handle multiple statements on one line (e.g. "DROP TABLE t1; SHOW TABLES")
+		stmts := splitStatements(stmt)
+		for _, s := range stmts {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			err := ctx.executeSQL(s)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -557,6 +564,20 @@ var directiveKeywords = map[string]bool{
 	"sorted_result": true, "connect": true, "disconnect": true,
 	"send": true, "reap": true, "sleep": true,
 	"horizontal_results": true, "vertical_results": true,
+	"exit": true, "connection": true, "die": true,
+	"replace_column": true, "replace_result": true, "replace_regex": true,
+	"remove_file": true, "write_file": true, "append_file": true,
+	"cat_file": true, "diff_files": true, "file_exists": true,
+	"copy_file": true, "chmod": true, "mkdir": true, "rmdir": true,
+	"list_files": true, "move_file": true,
+	"exec": true, "execw": true, "system": true,
+	"perl": true, "if": true, "while": true, "inc": true, "dec": true,
+	"disable_abort_on_error": true, "enable_abort_on_error": true,
+	"real_sleep": true, "query_get_value": true,
+	"save_master_pos": true, "sync_with_master": true,
+	"result_format": true, "change_user": true,
+	"disable_metadata": true, "enable_metadata": true,
+	"disable_info": true, "enable_info": true,
 }
 
 func isDirectiveKeyword(s string) bool {
@@ -571,13 +592,57 @@ var barePrefixKeywords = []string{
 	"echo ",
 	"source ",
 	"skip",
+	"exit",
+	"die ",
+	"connection ",
+	"connect ",
+	"disconnect ",
+	"send ",
+	"reap",
 	"enable_warnings",
 	"disable_warnings",
 	"enable_query_log",
 	"disable_query_log",
 	"enable_result_log",
 	"disable_result_log",
+	"enable_metadata",
+	"disable_metadata",
+	"enable_abort_on_error",
+	"disable_abort_on_error",
 	"sorted_result",
+	"replace_column ",
+	"replace_result ",
+	"replace_regex ",
+	"error ",
+	"if ",
+	"while ",
+	"end",
+	"inc ",
+	"dec ",
+	"horizontal_results",
+	"vertical_results",
+	"real_sleep ",
+	"sleep ",
+	"perl",
+	"exec ",
+	"result_format ",
+	"change_user",
+	"remove_file ",
+	"write_file ",
+	"append_file ",
+	"cat_file ",
+	"mkdir ",
+	"rmdir ",
+	"copy_file ",
+	"move_file ",
+	"list_files ",
+	"file_exists ",
+	"chmod ",
+	"query_get_value",
+	"save_master_pos",
+	"sync_with_master",
+	"disable_info",
+	"enable_info",
 }
 
 // extractBareDirective checks whether trimmed is a bare (no "--") mysqltest directive.
@@ -605,6 +670,50 @@ func extractBareDirective(trimmed string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// splitStatements splits a string that may contain multiple SQL statements
+// separated by semicolons, respecting quoted strings.
+func splitStatements(s string) []string {
+	var stmts []string
+	var current strings.Builder
+	inSingle := false
+	inDouble := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		switch ch {
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+			}
+			current.WriteByte(ch)
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+			current.WriteByte(ch)
+		case ';':
+			if !inSingle && !inDouble {
+				stmt := strings.TrimSpace(current.String())
+				if stmt != "" {
+					stmts = append(stmts, stmt)
+				}
+				current.Reset()
+			} else {
+				current.WriteByte(ch)
+			}
+		default:
+			current.WriteByte(ch)
+		}
+	}
+	rest := strings.TrimSpace(current.String())
+	if rest != "" {
+		stmts = append(stmts, rest)
+	}
+	if len(stmts) == 0 {
+		return []string{s}
+	}
+	return stmts
 }
 
 // stripInlineComment removes trailing # comments from a SQL line,
