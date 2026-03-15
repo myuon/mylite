@@ -22,10 +22,11 @@ func displayValue(v interface{}) string {
 
 // Table is the in-memory storage for a single table.
 type Table struct {
-	Def           *catalog.TableDef
-	Rows          []Row
-	AutoIncrement atomic.Int64
-	Mu            sync.RWMutex
+	Def              *catalog.TableDef
+	Rows             []Row
+	AutoIncrement    atomic.Int64
+	AIExplicitlySet  bool // true if AUTO_INCREMENT was explicitly set via ALTER/CREATE TABLE
+	Mu               sync.RWMutex
 }
 
 func (t *Table) Lock()                   { t.Mu.Lock() }
@@ -103,11 +104,17 @@ func (t *Table) Insert(row Row) (int64, error) {
 	for _, col := range t.Def.Columns {
 		if col.AutoIncrement {
 			if v, ok := row[col.Name]; !ok || v == nil {
-				// MySQL always generates next auto-increment value when NULL is inserted,
-				// regardless of whether the column is nullable.
-				id := t.AutoIncrement.Add(1)
-				row[col.Name] = id
-				lastInsertID = id
+				// For nullable AI columns with explicitly-set AUTO_INCREMENT,
+				// inserting NULL stores NULL.
+				// Otherwise (NOT NULL or default AI), generate the next value.
+				if col.Nullable && ok && v == nil && t.AIExplicitlySet {
+					// Explicit NULL on a nullable AI column with explicit AI start: keep NULL
+					lastInsertID = 0
+				} else {
+					id := t.AutoIncrement.Add(1)
+					row[col.Name] = id
+					lastInsertID = id
+				}
 			} else {
 				// If explicit value provided, update auto_increment counter if needed
 				if intVal, ok := toInt64(v); ok && intVal >= t.AutoIncrement.Load() {

@@ -10,11 +10,60 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
+
+// mysqlCharLen returns the MySQL character count of a string.
+// For valid UTF-8, it returns the rune count.
+// For non-UTF-8 (e.g., cp932, sjis), it heuristically counts multi-byte characters.
+func mysqlCharLen(s string) int {
+	if utf8.ValidString(s) {
+		return utf8.RuneCountInString(s)
+	}
+	// Heuristic for non-UTF-8 multi-byte charsets (cp932, sjis, etc.):
+	// Count bytes that look like double-byte lead bytes as starting a 2-byte character.
+	count := 0
+	i := 0
+	for i < len(s) {
+		b := s[i]
+		// cp932/sjis lead byte ranges
+		if (b >= 0x81 && b <= 0x9F) || (b >= 0xE0 && b <= 0xFC) {
+			i += 2
+		} else {
+			i++
+		}
+		count++
+	}
+	return count
+}
+
+// mysqlTruncateChars truncates a string to at most maxChars MySQL characters.
+func mysqlTruncateChars(s string, maxChars int) string {
+	if utf8.ValidString(s) {
+		runes := []rune(s)
+		if len(runes) > maxChars {
+			return string(runes[:maxChars])
+		}
+		return s
+	}
+	// For non-UTF-8 multi-byte charsets
+	count := 0
+	i := 0
+	for i < len(s) && count < maxChars {
+		b := s[i]
+		if (b >= 0x81 && b <= 0x9F) || (b >= 0xE0 && b <= 0xFC) {
+			i += 2
+		} else {
+			i++
+		}
+		count++
+	}
+	return s[:i]
+}
 
 // Result represents the result of a query execution.
 type Result struct {
@@ -1410,11 +1459,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		// Save comment (MySQL truncates column comments > 1024 chars, errors in strict/traditional mode)
 		if col.Type.Options != nil && col.Type.Options.Comment != nil {
 			comment := col.Type.Options.Comment.Val
-			if len([]rune(comment)) > 1024 {
+			if mysqlCharLen(comment) > 1024 {
 				if e.isStrictMode() {
 					return nil, mysqlError(1629, "HY000", fmt.Sprintf("Comment for field '%s' is too long (max = 1024)", colDef.Name))
 				}
-				comment = string([]rune(comment)[:1024])
+				comment = mysqlTruncateChars(comment, 1024)
 			}
 			colDef.Comment = comment
 		}
@@ -1460,9 +1509,13 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 					usingMethod = strings.ToUpper(opt.String)
 				}
 			}
-			// MySQL truncates index comments to 1024 characters
-			if len([]rune(idxComment)) > 1024 {
-				idxComment = string([]rune(idxComment)[:1024])
+			// MySQL returns error for index comments > 1024 in strict/TRADITIONAL mode;
+			// in non-strict mode it truncates silently.
+			if mysqlCharLen(idxComment) > 1024 {
+				if e.isStrictMode() {
+					return nil, mysqlError(1688, "HY000", fmt.Sprintf("Comment for index '%s' is too long (max = 1024)", idxName))
+				}
+				idxComment = mysqlTruncateChars(idxComment, 1024)
 			}
 			indexes = append(indexes, catalog.IndexDef{
 				Name:    idxName,
@@ -1492,6 +1545,30 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		Indexes:    indexes,
 	}
 
+	// Process table options (comment, charset, collate) BEFORE creating the table,
+	// so that strict-mode errors prevent the table from being created.
+	for _, opt := range stmt.TableSpec.Options {
+		switch strings.ToUpper(opt.Name) {
+		case "COMMENT":
+			comment := opt.Value.Val
+			if mysqlCharLen(comment) > 2048 {
+				if e.isStrictMode() {
+					return nil, mysqlError(1628, "HY000", fmt.Sprintf("Comment for table '%s' is too long (max = 2048)", tableName))
+				}
+				comment = mysqlTruncateChars(comment, 2048)
+			}
+			def.Comment = comment
+		case "CHARSET", "CHARACTER SET":
+			def.Charset = strings.ToLower(opt.String)
+		case "COLLATE":
+			def.Collation = strings.ToLower(opt.String)
+		}
+	}
+	// If charset was set but collation was not, derive default collation
+	if def.Charset != "" && def.Collation == "" {
+		def.Collation = catalog.DefaultCollationForCharset(def.Charset)
+	}
+
 	err = db.CreateTable(def)
 	if err != nil {
 		if stmt.IfNotExists {
@@ -1506,26 +1583,16 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		e.tempTables[tableName] = true
 	}
 
-	// Set AUTO_INCREMENT start value, table comment, and charset from table options
+	// Set AUTO_INCREMENT start value from table options (needs table to exist in storage)
 	for _, opt := range stmt.TableSpec.Options {
-		switch strings.ToUpper(opt.Name) {
-		case "AUTO_INCREMENT":
+		if strings.ToUpper(opt.Name) == "AUTO_INCREMENT" {
 			if val, err := strconv.ParseInt(opt.Value.Val, 10, 64); err == nil {
 				if tbl, err := e.Storage.GetTable(dbName, tableName); err == nil {
 					tbl.AutoIncrement.Store(val - 1) // Store val-1 because next insert increments first
+					tbl.AIExplicitlySet = true
 				}
 			}
-		case "COMMENT":
-			def.Comment = opt.Value.Val
-		case "CHARSET", "CHARACTER SET":
-			def.Charset = strings.ToLower(opt.String)
-		case "COLLATE":
-			def.Collation = strings.ToLower(opt.String)
 		}
-	}
-	// If charset was set but collation was not, derive default collation
-	if def.Charset != "" && def.Collation == "" {
-		def.Collation = catalog.DefaultCollationForCharset(def.Charset)
 	}
 
 	// Handle CREATE TABLE (cols...) SELECT ... : insert rows from the SELECT
@@ -1788,6 +1855,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	// Apply SET INSERT_ID if set
 	if e.nextInsertID > 0 {
 		tbl.AutoIncrement.Store(e.nextInsertID - 1)
+		tbl.AIExplicitlySet = true
 		e.nextInsertID = 0
 	}
 
@@ -3727,13 +3795,12 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			for _, col := range op.Columns {
 				colDef := columnDefFromAST(col)
 				// Check column comment length in strict/traditional mode (MySQL max is 1024 characters)
-				commentRunes := []rune(colDef.Comment)
-				if len(commentRunes) > 1024 && e.isStrictMode() {
+				if mysqlCharLen(colDef.Comment) > 1024 && e.isStrictMode() {
 					return nil, mysqlError(1629, "HY000", fmt.Sprintf("Comment for field '%s' is too long (max = 1024)", colDef.Name))
 				}
 				// Truncate comment to 1024 characters in non-strict mode
-				if len(commentRunes) > 1024 {
-					colDef.Comment = string(commentRunes[:1024])
+				if mysqlCharLen(colDef.Comment) > 1024 {
+					colDef.Comment = mysqlTruncateChars(colDef.Comment, 1024)
 				}
 				position := ""
 				afterCol := ""
@@ -3772,11 +3839,11 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 		case *sqlparser.ModifyColumn:
 			colDef := columnDefFromAST(op.NewColDefinition)
-			if len([]rune(colDef.Comment)) > 1024 {
+			if mysqlCharLen(colDef.Comment) > 1024 {
 				if e.isStrictMode() {
 					return nil, mysqlError(1629, "HY000", fmt.Sprintf("Comment for field '%s' is too long (max = 1024)", colDef.Name))
 				}
-				colDef.Comment = string([]rune(colDef.Comment)[:1024])
+				colDef.Comment = mysqlTruncateChars(colDef.Comment, 1024)
 			}
 			if modErr := db.ModifyColumn(tableName, colDef); modErr != nil {
 				return nil, modErr
@@ -3785,11 +3852,11 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		case *sqlparser.ChangeColumn:
 			oldName := op.OldColumn.Name.String()
 			colDef := columnDefFromAST(op.NewColDefinition)
-			if len([]rune(colDef.Comment)) > 1024 {
+			if mysqlCharLen(colDef.Comment) > 1024 {
 				if e.isStrictMode() {
 					return nil, mysqlError(1629, "HY000", fmt.Sprintf("Comment for field '%s' is too long (max = 1024)", colDef.Name))
 				}
-				colDef.Comment = string([]rune(colDef.Comment)[:1024])
+				colDef.Comment = mysqlTruncateChars(colDef.Comment, 1024)
 			}
 			if chgErr := db.ChangeColumn(tableName, oldName, colDef); chgErr != nil {
 				return nil, chgErr
@@ -3837,9 +3904,13 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			if isPrimary {
 				db.SetPrimaryKey(tableName, idxCols)
 			} else {
-				// MySQL truncates index comments to 1024 characters
-				if len([]rune(idxComment)) > 1024 {
-					idxComment = string([]rune(idxComment)[:1024])
+				// MySQL returns error for index comments > 1024 in strict/TRADITIONAL mode;
+				// in non-strict mode it truncates silently.
+				if mysqlCharLen(idxComment) > 1024 {
+					if e.isStrictMode() {
+						return nil, mysqlError(1688, "HY000", fmt.Sprintf("Comment for index '%s' is too long (max = 1024)", idxName))
+					}
+					idxComment = mysqlTruncateChars(idxComment, 1024)
 				}
 				db.AddIndex(tableName, catalog.IndexDef{
 					Name:    idxName,
@@ -3865,9 +3936,23 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 		case sqlparser.TableOptions:
 			for _, to := range op {
-				if strings.ToUpper(to.Name) == "AUTO_INCREMENT" {
+				switch strings.ToUpper(to.Name) {
+				case "AUTO_INCREMENT":
 					if val, err := strconv.ParseInt(to.Value.Val, 10, 64); err == nil {
 						tbl.AutoIncrement.Store(val - 1)
+						tbl.AIExplicitlySet = true
+					}
+				case "COMMENT":
+					comment := to.Value.Val
+					if mysqlCharLen(comment) > 2048 {
+						if e.isStrictMode() {
+							return nil, mysqlError(1628, "HY000", fmt.Sprintf("Comment for table '%s' is too long (max = 2048)", tableName))
+						}
+						comment = mysqlTruncateChars(comment, 2048)
+					}
+					tableDef, _ := db.GetTable(tableName)
+					if tableDef != nil {
+						tableDef.Comment = comment
 					}
 				}
 			}
@@ -4905,6 +4990,10 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		if strings.ContainsRune(s, '\x00') {
 			return s, nil
 		}
+		// UPPER is a no-op on BINARY/VARBINARY columns
+		if e.isBinaryExpr(v.Exprs[0]) {
+			return s, nil
+		}
 		return strings.ToUpper(s), nil
 	case "lower", "lcase":
 		if len(v.Exprs) < 1 {
@@ -4916,6 +5005,10 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		if val == nil {
 			return nil, nil
+		}
+		// LOWER is a no-op on BINARY/VARBINARY columns
+		if e.isBinaryExpr(v.Exprs[0]) {
+			return toString(val), nil
 		}
 		return strings.ToLower(toString(val)), nil
 	case "length", "octet_length":
@@ -4941,7 +5034,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		if val == nil {
 			return nil, nil
 		}
-		return int64(len([]rune(toString(val)))), nil
+		return int64(mysqlCharLen(toString(val))), nil
 	case "substring", "substr", "mid":
 		if len(v.Exprs) < 2 {
 			return nil, fmt.Errorf("SUBSTRING requires at least 2 arguments")
@@ -5745,7 +5838,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		if parseErr != nil {
 			return nil, nil
 		}
-		yr, wk := t.ISOWeek()
+		yr, wk := mysqlYearWeek(t, 0)
 		return int64(yr*100 + wk), nil
 	case "timestamp":
 		if len(v.Exprs) < 1 {
@@ -5797,6 +5890,85 @@ func mysqlWeekMode0(t time.Time) int64 {
 		return 0
 	}
 	return int64((yday - firstSunday - 1) / 7 + 1)
+}
+
+// isBinaryExpr checks whether an expression references a BINARY or VARBINARY column.
+// This is used to make UPPER/LOWER no-ops on binary data, matching MySQL behavior.
+func (e *Executor) isBinaryExpr(expr sqlparser.Expr) bool {
+	switch ex := expr.(type) {
+	case *sqlparser.ColName:
+		colName := ex.Name.String()
+		// Check columns in all known tables in current query context
+		tableName := ""
+		if !ex.Qualifier.Name.IsEmpty() {
+			tableName = ex.Qualifier.Name.String()
+		}
+		return e.isColumnBinary(tableName, colName)
+	case *sqlparser.Subquery:
+		// Check if the subquery's SELECT column is from a BINARY/VARBINARY column
+		if sel, ok := ex.Select.(*sqlparser.Select); ok && sel.SelectExprs != nil && len(sel.SelectExprs.Exprs) > 0 {
+			if ae, ok := sel.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok {
+				return e.isBinaryExpr(ae.Expr)
+			}
+		}
+	case *sqlparser.FuncExpr:
+		// Functions like UPPER/LOWER inherit the binary-ness of their argument
+		// but we don't recurse here to avoid infinite loops
+	}
+	return false
+}
+
+// isColumnBinary checks if a column in the current database has a BINARY or VARBINARY type.
+func (e *Executor) isColumnBinary(tableName, colName string) bool {
+	if e.CurrentDB == "" {
+		return false
+	}
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return false
+	}
+	var tables []string
+	if tableName != "" {
+		tables = []string{tableName}
+	} else {
+		tables = db.ListTables()
+	}
+	for _, tbl := range tables {
+		tDef, _ := db.GetTable(tbl)
+		if tDef == nil {
+			continue
+		}
+		for _, col := range tDef.Columns {
+			if strings.EqualFold(col.Name, colName) {
+				lower := strings.ToLower(col.Type)
+				if strings.Contains(lower, "binary") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// mysqlYearWeek implements MySQL's YEARWEEK(date, mode) function.
+// Mode 0 (default): first day of week is Sunday, range 0-53.
+// If the date falls in week 0 (before the first Sunday), YEARWEEK returns
+// the last week of the previous year.
+func mysqlYearWeek(t time.Time, mode int) (int, int) {
+	if mode != 0 {
+		// For non-zero modes, fall back to ISO week
+		return t.ISOWeek()
+	}
+	wk := mysqlWeekMode0(t)
+	yr := t.Year()
+	if wk == 0 {
+		// Date is before the first Sunday of the year; belongs to last week of previous year.
+		yr--
+		// Calculate week number of Dec 31 of previous year
+		dec31 := time.Date(yr, 12, 31, 0, 0, 0, 0, time.UTC)
+		wk = mysqlWeekMode0(dec31)
+	}
+	return yr, int(wk)
 }
 
 // mysqlToDays calculates MySQL's TO_DAYS value for a given time.
@@ -6213,7 +6385,11 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if len(args) < 1 || args[0] == nil {
 			return nil, nil
 		}
-		return strings.ToUpper(toString(args[0])), nil
+		s := toString(args[0])
+		if strings.ContainsRune(s, '\x00') || (len(v.Exprs) > 0 && e.isBinaryExpr(v.Exprs[0])) {
+			return s, nil
+		}
+		return strings.ToUpper(s), nil
 	case "lower", "lcase":
 		args, err := evalArgs()
 		if err != nil {
@@ -6222,7 +6398,11 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if len(args) < 1 || args[0] == nil {
 			return nil, nil
 		}
-		return strings.ToLower(toString(args[0])), nil
+		s := toString(args[0])
+		if strings.ContainsRune(s, '\x00') || (len(v.Exprs) > 0 && e.isBinaryExpr(v.Exprs[0])) {
+			return s, nil
+		}
+		return strings.ToLower(s), nil
 	case "concat":
 		args, err := evalArgs()
 		if err != nil {
@@ -6253,7 +6433,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if len(args) < 1 || args[0] == nil {
 			return nil, nil
 		}
-		return int64(len([]rune(toString(args[0])))), nil
+		return int64(mysqlCharLen(toString(args[0]))), nil
 	case "date":
 		args, err := evalArgs()
 		if err != nil {
@@ -6736,7 +6916,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if parseErr != nil {
 			return nil, nil
 		}
-		yr, wk := t.ISOWeek()
+		yr, wk := mysqlYearWeek(t, 0)
 		return int64(yr*100 + wk), nil
 	case "timestamp":
 		args, err := evalArgs()
