@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -108,12 +109,25 @@ func (t *Table) Insert(row Row) (int64, error) {
 		}
 	}
 
-	// Check NOT NULL constraints
+	// Check NOT NULL constraints: in non-strict mode, insert zero value instead of error
 	for _, col := range t.Def.Columns {
 		if !col.Nullable && !col.AutoIncrement {
 			v, exists := row[col.Name]
 			if !exists || v == nil {
-				return 0, fmt.Errorf("ERROR 1048 (23000): Column '%s' cannot be null", col.Name)
+				// Insert type-appropriate zero value (non-strict mode behavior)
+				upper := strings.ToUpper(col.Type)
+				switch {
+				case strings.Contains(upper, "INT") || strings.Contains(upper, "DECIMAL") ||
+					strings.Contains(upper, "FLOAT") || strings.Contains(upper, "DOUBLE"):
+					row[col.Name] = int64(0)
+				case strings.Contains(upper, "CHAR") || strings.Contains(upper, "TEXT") ||
+					strings.Contains(upper, "BLOB") || strings.Contains(upper, "ENUM"):
+					row[col.Name] = ""
+				case strings.Contains(upper, "DATE") || strings.Contains(upper, "TIME"):
+					row[col.Name] = "0000-00-00 00:00:00"
+				default:
+					row[col.Name] = ""
+				}
 			}
 		}
 	}
