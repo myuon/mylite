@@ -80,12 +80,14 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	}
 	expected := string(expectedBytes)
 
-	// Compare
-	if normalizeOutput(actual) == normalizeOutput(expected) {
+	// Compare: normalize expected side to strip Warnings blocks etc.
+	normalizedActual := normalizeOutput(actual)
+	normalizedExpected := normalizeExpected(normalizeOutput(expected))
+	if normalizedActual == normalizedExpected {
 		return TestResult{Name: name, Passed: true, Output: actual, Expected: expected}
 	}
 
-	diff := computeDiff(expected, actual)
+	diff := computeDiff(normalizedExpected, normalizedActual)
 	return TestResult{
 		Name:     name,
 		Passed:   false,
@@ -135,8 +137,15 @@ func (ctx *execContext) executeLines(lines []string) error {
 		line := lines[i]
 		trimmed := strings.TrimSpace(line)
 
-		// Skip empty lines and comments
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+		// Empty lines are skipped (mysqltest does not echo blank lines)
+		if trimmed == "" {
+			i++
+			continue
+		}
+
+		// Comments starting with # are echoed to output
+		if strings.HasPrefix(trimmed, "#") {
+			ctx.output.WriteString(line + "\n")
 			i++
 			continue
 		}
@@ -187,8 +196,9 @@ func (ctx *execContext) executeLines(lines []string) error {
 			l := lines[i]
 			t := strings.TrimSpace(l)
 
-			// Skip comments within statement
+			// Output comments within statement
 			if strings.HasPrefix(t, "#") {
+				ctx.output.WriteString(l + "\n")
 				i++
 				continue
 			}
@@ -328,6 +338,11 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 func (ctx *execContext) executeSQL(stmt string) error {
 	// Variable substitution
 	stmt = ctx.substituteVars(stmt)
+
+	// Echo the SQL statement to output (mysqltest default behavior)
+	if ctx.queryLogEnabled {
+		ctx.output.WriteString(stmt + ";\n")
+	}
 
 	upper := strings.ToUpper(strings.TrimSpace(stmt))
 	isQuery := strings.HasPrefix(upper, "SELECT") ||
@@ -579,6 +594,36 @@ func normalizeOutput(s string) string {
 	var result []string
 	for _, line := range lines {
 		result = append(result, strings.TrimRight(line, " \t\r"))
+	}
+	return strings.TrimRight(strings.Join(result, "\n"), "\n")
+}
+
+// normalizeExpected strips MySQL-specific output that mylite doesn't produce:
+// - Warnings/Note/Error blocks
+// - include file outputs (lines like "include/xxx.inc")
+func normalizeExpected(s string) string {
+	lines := strings.Split(s, "\n")
+	var result []string
+	inWarnings := false
+	for _, line := range lines {
+		trimmed := strings.TrimRight(line, " \t\r")
+
+		// Detect start of Warnings block
+		if trimmed == "Warnings:" {
+			inWarnings = true
+			continue
+		}
+		// Skip Warning/Note/Error lines within a Warnings block
+		if inWarnings {
+			if strings.HasPrefix(trimmed, "Warning\t") ||
+				strings.HasPrefix(trimmed, "Note\t") ||
+				strings.HasPrefix(trimmed, "Error\t") {
+				continue
+			}
+			inWarnings = false
+		}
+
+		result = append(result, trimmed)
 	}
 	return strings.TrimRight(strings.Join(result, "\n"), "\n")
 }

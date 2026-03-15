@@ -1418,10 +1418,80 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		}, nil
 	}
 
+	// SHOW CREATE TABLE <table>
+	if strings.HasPrefix(upper, "SHOW CREATE TABLE") {
+		parts := strings.Fields(query)
+		if len(parts) >= 4 {
+			tableName := strings.Trim(parts[3], "`")
+			return e.showCreateTable(tableName)
+		}
+	}
+
 	// Accept other SHOW statements silently
 	return &Result{
 		Columns:     []string{"Value"},
 		Rows:        [][]interface{}{},
+		IsResultSet: true,
+	}, nil
+}
+
+func (e *Executor) showCreateTable(tableName string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, err
+	}
+	def, err := db.GetTable(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("ERROR 1146 (42S02): Table '%s.%s' doesn't exist", e.CurrentDB, tableName)
+	}
+
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("CREATE TABLE `%s` (\n", tableName))
+
+	var colDefs []string
+	var pkCols []string
+	for _, col := range def.Columns {
+		var parts []string
+		parts = append(parts, fmt.Sprintf("  `%s`", col.Name))
+		parts = append(parts, col.Type)
+		if !col.Nullable {
+			parts = append(parts, "NOT NULL")
+		} else {
+			parts = append(parts, "DEFAULT NULL")
+		}
+		if col.AutoIncrement {
+			parts = append(parts, "AUTO_INCREMENT")
+		} else if col.Default != nil {
+			parts = append(parts, fmt.Sprintf("DEFAULT %s", *col.Default))
+		}
+		colDefs = append(colDefs, strings.Join(parts, " "))
+		if col.PrimaryKey {
+			pkCols = append(pkCols, col.Name)
+		}
+	}
+	if len(pkCols) == 0 {
+		pkCols = def.PrimaryKey
+	}
+
+	for i, cd := range colDefs {
+		b.WriteString(cd)
+		if i < len(colDefs)-1 || len(pkCols) > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("\n")
+	}
+	if len(pkCols) > 0 {
+		quotedPK := make([]string, len(pkCols))
+		for i, pk := range pkCols {
+			quotedPK[i] = fmt.Sprintf("`%s`", pk)
+		}
+		b.WriteString(fmt.Sprintf("  PRIMARY KEY (%s)\n", strings.Join(quotedPK, ",")))
+	}
+	b.WriteString(") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+
+	return &Result{
+		Columns:     []string{"Table", "Create Table"},
+		Rows:        [][]interface{}{{tableName, b.String()}},
 		IsResultSet: true,
 	}, nil
 }
