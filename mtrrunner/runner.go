@@ -323,7 +323,7 @@ func (ctx *execContext) executeLines(lines []string) error {
 				}
 			}
 
-			rawLines = append(rawLines, strings.TrimSpace(l))
+			rawLines = append(rawLines, t)
 
 			// Check delimiter on stripped line, but also on original trimmed line
 			// (in case inline comment stripping removed the trailing delimiter)

@@ -3613,6 +3613,9 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					afterCol = op.After.Name.String()
 				}
 				if addErr := db.AddColumnAt(tableName, colDef, position, afterCol); addErr != nil {
+					if strings.Contains(addErr.Error(), "already exists") {
+						return nil, mysqlError(1060, "42S21", fmt.Sprintf("Duplicate column name '%s'", colDef.Name))
+					}
 					return nil, addErr
 				}
 				// Determine the default value to fill in existing rows.
@@ -4005,7 +4008,9 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 	if strings.HasPrefix(upper, "SHOW CREATE TABLE") {
 		parts := strings.Fields(query)
 		if len(parts) >= 4 {
-			tableName := strings.Trim(parts[3], "`")
+			tableName := strings.Join(parts[3:], " ")
+			tableName = strings.TrimRight(tableName, ";")
+			tableName = strings.ReplaceAll(tableName, "`", "")
 			return e.showCreateTable(tableName)
 		}
 	}

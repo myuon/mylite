@@ -316,7 +316,7 @@ func (db *Database) AddColumnAt(tableName string, col ColumnDef, position string
 	}
 	for _, c := range tbl.Columns {
 		if c.Name == col.Name {
-			return fmt.Errorf("ERROR 1060 (42S21): Duplicate column name '%s'", col.Name)
+			return fmt.Errorf("column '%s' already exists in table '%s'", col.Name, tableName)
 		}
 	}
 	if position == "FIRST" {
