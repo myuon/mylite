@@ -628,6 +628,36 @@ func (e *Executor) isStrictMode() bool {
 		strings.Contains(e.sqlMode, "STRICT_ALL_TABLES")
 }
 
+// findRowIDColumn returns the primary key column name for _rowid access.
+// MySQL's _rowid is an alias for a single-column integer primary key.
+func (e *Executor) findRowIDColumn(row storage.Row) string {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return ""
+	}
+	// Try to find which table this row belongs to by checking table defs
+	for _, tblName := range db.ListTables() {
+		td, err := db.GetTable(tblName)
+		if err != nil || len(td.PrimaryKey) != 1 {
+			continue
+		}
+		pkCol := td.PrimaryKey[0]
+		// Check if row has this column
+		if _, ok := row[pkCol]; ok {
+			// Verify the PK column is an integer type
+			for _, col := range td.Columns {
+				if col.Name == pkCol {
+					upperType := strings.ToUpper(col.Type)
+					if strings.Contains(upperType, "INT") {
+						return pkCol
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
 // extractCharLength returns the max character length from a CHAR(N) or VARCHAR(N) type string.
 func extractCharLength(colType string) int {
 	lower := strings.ToLower(strings.TrimSpace(colType))
@@ -666,6 +696,36 @@ func checkDecimalRange(colType string, v interface{}) error {
 		}
 	}
 	return nil
+}
+
+// coerceDateTimeValue truncates datetime values to match the column type.
+// For DATE columns, "2007-02-13 15:09:33" becomes "2007-02-13".
+// For TIME columns, "2007-02-13 15:09:33" becomes "15:09:33".
+// For YEAR columns, "2007-02-13 15:09:33" becomes "2007".
+func coerceDateTimeValue(colType string, v interface{}) interface{} {
+	upper := strings.ToUpper(strings.TrimSpace(colType))
+	s := fmt.Sprintf("%v", v)
+	if len(s) == 0 {
+		return v
+	}
+	switch upper {
+	case "DATE":
+		// If the value looks like a datetime, truncate to date-only
+		if len(s) > 10 && s[4] == '-' && s[7] == '-' {
+			return s[:10]
+		}
+	case "TIME":
+		// If the value looks like a datetime, extract the time part
+		if idx := strings.Index(s, " "); idx >= 0 && len(s) > idx+1 {
+			return s[idx+1:]
+		}
+	case "YEAR":
+		// Extract year from date/datetime
+		if len(s) >= 5 && s[4] == '-' {
+			return s[:4]
+		}
+	}
+	return v
 }
 
 // validateEnumSetValue validates and normalizes a value for ENUM/SET columns.
@@ -1199,6 +1259,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					if v != nil {
 						v = formatDecimalValue(col.Type, v)
 						v = validateEnumSetValue(col.Type, v)
+						v = coerceDateTimeValue(col.Type, v)
 					}
 					break
 				}
@@ -1659,7 +1720,16 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 	}
 
 	isLeft := joinType == sqlparser.LeftJoinType || joinType == sqlparser.NaturalLeftJoinType
-	isCross := joinType == sqlparser.NormalJoinType
+	// NormalJoinType is CROSS JOIN only if there's no ON or USING condition
+	isCross := joinType == sqlparser.NormalJoinType && (join.Condition == nil || (join.Condition.On == nil && len(join.Condition.Using) == 0))
+
+	// Handle USING clause: build an ON-equivalent condition from USING columns
+	var usingCols []string
+	if join.Condition != nil && len(join.Condition.Using) > 0 {
+		for _, col := range join.Condition.Using {
+			usingCols = append(usingCols, col.String())
+		}
+	}
 
 	var result []storage.Row
 	for _, leftRow := range leftRows {
@@ -1678,6 +1748,25 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 
 			// CROSS JOIN: no condition, all combinations
 			if isCross {
+				result = append(result, combined)
+				matched = true
+				continue
+			}
+
+			// USING clause: match on specified columns
+			if len(usingCols) > 0 {
+				allMatch := true
+				for _, col := range usingCols {
+					lv := leftRow[col]
+					rv := rightRow[col]
+					if lv == nil || rv == nil || fmt.Sprintf("%v", lv) != fmt.Sprintf("%v", rv) {
+						allMatch = false
+						break
+					}
+				}
+				if !allMatch {
+					continue
+				}
 				result = append(result, combined)
 				matched = true
 				continue
@@ -4775,6 +4864,16 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 	switch v := expr.(type) {
 	case *sqlparser.ColName:
 		colName := v.Name.String()
+		// Handle _rowid: MySQL alias for the single-column integer primary key
+		if strings.EqualFold(colName, "_rowid") {
+			pkCol := e.findRowIDColumn(row)
+			if pkCol != "" {
+				if val, ok := row[pkCol]; ok {
+					return val, nil
+				}
+			}
+			return nil, nil
+		}
 		// Try qualified lookup first (alias.col) if qualifier is set
 		if !v.Qualifier.IsEmpty() {
 			qualified := v.Qualifier.Name.String() + "." + colName
