@@ -1151,7 +1151,7 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 			if stmt.IfExists {
 				continue
 			}
-			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
+			return nil, mysqlError(1051, "42S02", fmt.Sprintf("Unknown table '%s.%s'", e.CurrentDB, tableName))
 		}
 		e.Storage.DropTable(e.CurrentDB, tableName)
 		// Drop triggers associated with this table (MySQL behavior)
@@ -2746,7 +2746,8 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 	tbl.Lock()
 	defer tbl.Unlock()
 
-	var affected uint64
+	// Determine matching row indices
+	var matchingIndices []int
 	for i, row := range tbl.Rows {
 		match := true
 		if stmt.Where != nil {
@@ -2756,9 +2757,48 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 			}
 			match = m
 		}
-		if !match {
-			continue
+		if match {
+			matchingIndices = append(matchingIndices, i)
 		}
+	}
+
+	// Apply ORDER BY to matching rows
+	if stmt.OrderBy != nil && len(stmt.OrderBy) > 0 {
+		sort.SliceStable(matchingIndices, func(a, b int) bool {
+			for _, order := range stmt.OrderBy {
+				colName := sqlparser.String(order.Expr)
+				colName = strings.Trim(colName, "`")
+				va := tbl.Rows[matchingIndices[a]][colName]
+				vb := tbl.Rows[matchingIndices[b]][colName]
+				cmp := compareNumeric(va, vb)
+				if cmp == 0 {
+					continue
+				}
+				asc := order.Direction == sqlparser.AscOrder || order.Direction == 0
+				if asc {
+					return cmp < 0
+				}
+				return cmp > 0
+			}
+			return false
+		})
+	}
+
+	// Apply LIMIT
+	if stmt.Limit != nil && stmt.Limit.Rowcount != nil {
+		tmpExec := &Executor{}
+		lim, limErr := tmpExec.evalExpr(stmt.Limit.Rowcount)
+		if limErr == nil {
+			if n, ok := lim.(int64); ok && int(n) < len(matchingIndices) {
+				matchingIndices = matchingIndices[:n]
+			}
+		}
+	}
+
+	var affected uint64
+	for _, i := range matchingIndices {
+		row := tbl.Rows[i]
+		_ = row
 
 		// Build OLD and NEW row for triggers
 		oldRow := make(storage.Row, len(row))
@@ -3172,12 +3212,14 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			if idxName == "" && len(idxCols) > 0 {
 				idxName = idxCols[0]
 			}
-			// Check for USING method
-			usingMethod := ""
+			// Check for USING method (default BTREE for InnoDB)
+			usingMethod := "BTREE"
 			for _, opt := range op.IndexDefinition.Options {
 				if opt.Name == "USING" {
 					// InnoDB does not support HASH; silently ignore it.
-					if strings.ToUpper(opt.String) != "HASH" {
+					if strings.ToUpper(opt.String) == "HASH" {
+						usingMethod = "BTREE"
+					} else {
 						usingMethod = opt.String
 					}
 				}

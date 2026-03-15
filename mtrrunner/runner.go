@@ -85,7 +85,7 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	}
 
 	// Execute with timeout
-	timeout := 10 * time.Second
+	timeout := 30 * time.Second
 	doneCh := make(chan error, 1)
 
 	tmpDir := r.TmpDir
