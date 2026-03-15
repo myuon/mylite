@@ -3,6 +3,9 @@ package executor
 import (
 	"encoding/hex"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -62,6 +65,14 @@ type Executor struct {
 	lastAutoIncID  int64
 	// fixedTimestamp holds a fixed time for SET TIMESTAMP=N support.
 	fixedTimestamp *time.Time
+	// correlatedRow holds the outer row for correlated subquery evaluation.
+	correlatedRow  storage.Row
+	// DataDir is the base directory for resolving relative file paths
+	// used in LOAD DATA INFILE and SELECT INTO OUTFILE.
+	DataDir        string
+	// SearchPaths are directories to search for files referenced in
+	// LOAD DATA LOCAL INFILE statements.
+	SearchPaths    []string
 }
 
 func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
@@ -112,6 +123,87 @@ func matchLikeHelper(s, p string, si, pi int) bool {
 		}
 	}
 	return si == len(s)
+}
+
+// normalizeSQLDisplayName converts SQL keywords in a string to uppercase and
+// normalizes operator spacing to match MySQL's column display name behavior.
+func normalizeSQLDisplayName(s string) string {
+	s = uppercaseSQLKeywords(s)
+	// MySQL displays comparison operators without surrounding spaces in column names
+	// e.g. "c1=2" not "c1 = 2"
+	for _, op := range []string{" = ", " != ", " <> ", " >= ", " <= ", " > ", " < "} {
+		compact := strings.TrimSpace(op)
+		s = strings.ReplaceAll(s, op, compact)
+	}
+	return s
+}
+
+// uppercaseSQLKeywords converts SQL keywords in a string to uppercase to match MySQL's
+// column display name behavior for subquery expressions.
+func uppercaseSQLKeywords(s string) string {
+	keywords := []string{
+		"select", "from", "where", "and", "or", "not", "in", "exists",
+		"any", "some", "all", "as", "on", "join", "left", "right", "inner",
+		"outer", "cross", "group", "by", "order", "having", "limit", "offset",
+		"union", "except", "intersect", "distinct", "between", "like", "is",
+		"null", "true", "false", "case", "when", "then", "else", "end",
+		"asc", "desc", "count", "sum", "avg", "min", "max", "upper", "lower",
+		"row", "with",
+	}
+	result := []byte(s)
+	for _, kw := range keywords {
+		kwBytes := []byte(kw)
+		upper := []byte(strings.ToUpper(kw))
+		i := 0
+		for i < len(result) {
+			// Skip quoted strings
+			if result[i] == '\'' || result[i] == '"' || result[i] == '`' {
+				q := result[i]
+				i++
+				for i < len(result) && result[i] != q {
+					i++
+				}
+				if i < len(result) {
+					i++
+				}
+				continue
+			}
+			// Check word boundary at start
+			if i > 0 {
+				ch := result[i-1]
+				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (ch >= '0' && ch <= '9') {
+					i++
+					continue
+				}
+			}
+			// Check if keyword matches
+			if i+len(kw) <= len(result) {
+				match := true
+				for j := 0; j < len(kw); j++ {
+					if result[i+j] != kwBytes[j] {
+						match = false
+						break
+					}
+				}
+				if match {
+					// Check word boundary at end
+					end := i + len(kw)
+					if end < len(result) {
+						ch := result[end]
+						if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (ch >= '0' && ch <= '9') {
+							i++
+							continue
+						}
+					}
+					copy(result[i:i+len(kw)], upper)
+					i += len(kw)
+					continue
+				}
+			}
+			i++
+		}
+	}
+	return string(result)
 }
 
 // normalizeTypeAliases replaces MySQL type aliases that the vitess parser
@@ -1431,9 +1523,17 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 			}
 			return e.buildInformationSchemaRows(bareTableName, isAlias)
 		}
-		tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
+		lookupDB := e.CurrentDB
+		lookupTable := bareTableName
+		if qualifier != "" && !strings.EqualFold(qualifier, "information_schema") {
+			lookupDB = qualifier
+		}
+		if lookupTable == "" {
+			lookupTable = tableName
+		}
+		tbl, err := e.Storage.GetTable(lookupDB, lookupTable)
 		if err != nil {
-			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
+			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", lookupDB, lookupTable))
 		}
 		raw := tbl.Scan()
 		result := make([]storage.Row, len(raw))
@@ -2448,6 +2548,98 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 	tbl.Rows = newRows
 
 	return &Result{AffectedRows: affected}, nil
+}
+
+// execMultiTableDeleteAST handles multi-table DELETE statements parsed by vitess.
+func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, error) {
+	// Build rows from all source tables (FROM clause = TableExprs)
+	// Start with first table
+	if len(stmt.TableExprs) == 0 {
+		return &Result{}, nil
+	}
+
+	allRows, err := e.buildFromExpr(stmt.TableExprs[0])
+	if err != nil {
+		return nil, err
+	}
+	// Cross join additional tables
+	for i := 1; i < len(stmt.TableExprs); i++ {
+		rightRows, err := e.buildFromExpr(stmt.TableExprs[i])
+		if err != nil {
+			return nil, err
+		}
+		allRows = crossProduct(allRows, rightRows)
+	}
+
+	// Apply WHERE filter
+	if stmt.Where != nil {
+		filtered := make([]storage.Row, 0)
+		for _, row := range allRows {
+			match, err := e.evalWhere(stmt.Where.Expr, row)
+			if err != nil {
+				return nil, err
+			}
+			if match {
+				filtered = append(filtered, row)
+			}
+		}
+		allRows = filtered
+	}
+
+	// Delete matched rows from target tables
+	var totalAffected uint64
+	for _, target := range stmt.Targets {
+		targetName := target.Name.String()
+		targetDB := e.CurrentDB
+		if !target.Qualifier.IsEmpty() {
+			targetDB = target.Qualifier.String()
+		}
+		tbl, err := e.Storage.GetTable(targetDB, targetName)
+		if err != nil {
+			continue
+		}
+		deleteIndices := make(map[int]bool)
+		for _, matchedRow := range allRows {
+			for i, existingRow := range tbl.Rows {
+				if deleteIndices[i] {
+					continue
+				}
+				allMatch := true
+				for _, col := range tbl.Def.Columns {
+					mv, ok := matchedRow[targetName+"."+col.Name]
+					if !ok {
+						mv, ok = matchedRow[col.Name]
+					}
+					if !ok {
+						allMatch = false
+						break
+					}
+					ev := existingRow[col.Name]
+					if fmt.Sprintf("%v", mv) != fmt.Sprintf("%v", ev) {
+						allMatch = false
+						break
+					}
+				}
+				if allMatch {
+					deleteIndices[i] = true
+				}
+			}
+		}
+		if len(deleteIndices) > 0 {
+			tbl.Lock()
+			newRows := make([]storage.Row, 0, len(tbl.Rows)-len(deleteIndices))
+			for i, row := range tbl.Rows {
+				if !deleteIndices[i] {
+					newRows = append(newRows, row)
+				}
+			}
+			tbl.Rows = newRows
+			tbl.Unlock()
+			totalAffected += uint64(len(deleteIndices))
+		}
+	}
+
+	return &Result{AffectedRows: totalAffected}, nil
 }
 
 // columnDefFromAST converts a vitess ColumnDefinition into our catalog.ColumnDef.
@@ -3997,6 +4189,77 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, err
 		}
 		return mysqlDateFormat(t, toString(fmtVal)), nil
+	case "dayname":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		t, err := parseDateTimeValue(val)
+		if err != nil {
+			return nil, err
+		}
+		return t.Format("Monday"), nil
+	case "dayofweek":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		t, err := parseDateTimeValue(val)
+		if err != nil {
+			return nil, err
+		}
+		// MySQL DAYOFWEEK: 1=Sunday, 2=Monday, ...
+		return int64(t.Weekday()) + 1, nil
+	case "weekday":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		t, err := parseDateTimeValue(val)
+		if err != nil {
+			return nil, err
+		}
+		// MySQL WEEKDAY: 0=Monday, 1=Tuesday, ...
+		wd := int64(t.Weekday()) - 1
+		if wd < 0 {
+			wd = 6
+		}
+		return wd, nil
+	case "dayofyear":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		t, err := parseDateTimeValue(val)
+		if err != nil {
+			return nil, err
+		}
+		return int64(t.YearDay()), nil
+	case "monthname":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		t, err := parseDateTimeValue(val)
+		if err != nil {
+			return nil, err
+		}
+		return t.Format("January"), nil
 	case "hex":
 		if len(v.Exprs) < 1 {
 			return nil, nil
@@ -4609,6 +4872,162 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			}
 		}
 		return nil, nil
+	case "dayname":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, err := parseDateTimeValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return t.Format("Monday"), nil
+	case "dayofweek":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, err := parseDateTimeValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return int64(t.Weekday()) + 1, nil
+	case "dayofyear":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, err := parseDateTimeValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return int64(t.YearDay()), nil
+	case "monthname":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, err := parseDateTimeValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return t.Format("January"), nil
+	case "time":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, err := parseDateTimeValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return t.Format("15:04:05"), nil
+	case "abs":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		f := toFloat(args[0])
+		if f < 0 {
+			f = -f
+		}
+		if f == float64(int64(f)) {
+			return int64(f), nil
+		}
+		return f, nil
+	case "mod":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 2 || args[0] == nil || args[1] == nil {
+			return nil, nil
+		}
+		d := toInt64(args[1])
+		if d == 0 {
+			return nil, nil
+		}
+		return toInt64(args[0]) % d, nil
+	case "last_insert_id":
+		if len(v.Exprs) > 0 {
+			args, err := evalArgs()
+			if err != nil {
+				return nil, err
+			}
+			e.lastInsertID = toInt64(args[0])
+			return e.lastInsertID, nil
+		}
+		return e.lastInsertID, nil
+	case "isnull":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return int64(1), nil
+		}
+		return int64(0), nil
+	case "replace":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 3 || args[0] == nil {
+			return nil, nil
+		}
+		return strings.ReplaceAll(toString(args[0]), toString(args[1]), toString(args[2])), nil
+	case "left":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 2 || args[0] == nil {
+			return nil, nil
+		}
+		s := []rune(toString(args[0]))
+		n := int(toInt64(args[1]))
+		if n <= 0 {
+			return "", nil
+		}
+		if n > len(s) {
+			n = len(s)
+		}
+		return string(s[:n]), nil
+	case "right":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 2 || args[0] == nil {
+			return nil, nil
+		}
+		s := []rune(toString(args[0]))
+		n := int(toInt64(args[1]))
+		if n <= 0 {
+			return "", nil
+		}
+		if n > len(s) {
+			n = len(s)
+		}
+		return string(s[len(s)-n:]), nil
 	default:
 		// Fallback: delegate to evalFuncExpr (no row context for args)
 		return e.evalFuncExpr(v)
