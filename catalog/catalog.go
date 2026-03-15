@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -34,11 +35,36 @@ type TableDef struct {
 	Comment    string
 }
 
+// TriggerDef represents a trigger definition.
+type TriggerDef struct {
+	Name    string
+	Timing  string // "BEFORE" or "AFTER"
+	Event   string // "INSERT", "UPDATE", or "DELETE"
+	Table   string
+	Body    []string // SQL statements in the trigger body
+}
+
+// ProcedureDef represents a stored procedure definition.
+type ProcedureDef struct {
+	Name   string
+	Params []ProcParam
+	Body   []string // SQL statements in the procedure body
+}
+
+// ProcParam represents a parameter in a stored procedure.
+type ProcParam struct {
+	Mode string // "IN", "OUT", "INOUT"
+	Name string
+	Type string
+}
+
 // Database represents a database containing tables.
 type Database struct {
-	Name   string
-	Tables map[string]*TableDef
-	mu     sync.RWMutex
+	Name       string
+	Tables     map[string]*TableDef
+	Triggers   map[string]*TriggerDef   // trigger name -> trigger def
+	Procedures map[string]*ProcedureDef // procedure name -> procedure def
+	mu         sync.RWMutex
 }
 
 // Catalog is the top-level catalog managing databases.
@@ -54,8 +80,10 @@ func New() *Catalog {
 	// Create default databases (matching MySQL)
 	for _, name := range []string{"information_schema", "mtr", "mysql", "performance_schema", "sys", "test"} {
 		c.Databases[name] = &Database{
-			Name:   name,
-			Tables: make(map[string]*TableDef),
+			Name:       name,
+			Tables:     make(map[string]*TableDef),
+			Triggers:   make(map[string]*TriggerDef),
+			Procedures: make(map[string]*ProcedureDef),
 		}
 	}
 	return c
@@ -68,8 +96,10 @@ func (c *Catalog) CreateDatabase(name string) error {
 		return fmt.Errorf("database '%s' already exists", name)
 	}
 	c.Databases[name] = &Database{
-		Name:   name,
-		Tables: make(map[string]*TableDef),
+		Name:       name,
+		Tables:     make(map[string]*TableDef),
+		Triggers:   make(map[string]*TriggerDef),
+		Procedures: make(map[string]*ProcedureDef),
 	}
 	return nil
 }
@@ -316,4 +346,60 @@ func (db *Database) DropPrimaryKey(tableName string) {
 		}
 	}
 	tbl.PrimaryKey = nil
+}
+
+// CreateTrigger adds a trigger definition to the database.
+func (db *Database) CreateTrigger(def *TriggerDef) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.Triggers == nil {
+		db.Triggers = make(map[string]*TriggerDef)
+	}
+	db.Triggers[def.Name] = def
+}
+
+// DropTrigger removes a trigger by name.
+func (db *Database) DropTrigger(name string) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	delete(db.Triggers, name)
+}
+
+// GetTriggersForTable returns all triggers for a given table, timing, and event.
+func (db *Database) GetTriggersForTable(table, timing, event string) []*TriggerDef {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	var result []*TriggerDef
+	for _, tr := range db.Triggers {
+		if strings.EqualFold(tr.Table, table) &&
+			strings.EqualFold(tr.Timing, timing) &&
+			strings.EqualFold(tr.Event, event) {
+			result = append(result, tr)
+		}
+	}
+	return result
+}
+
+// CreateProcedure adds a stored procedure definition.
+func (db *Database) CreateProcedure(def *ProcedureDef) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.Procedures == nil {
+		db.Procedures = make(map[string]*ProcedureDef)
+	}
+	db.Procedures[def.Name] = def
+}
+
+// DropProcedure removes a stored procedure by name.
+func (db *Database) DropProcedure(name string) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	delete(db.Procedures, name)
+}
+
+// GetProcedure returns a stored procedure by name.
+func (db *Database) GetProcedure(name string) *ProcedureDef {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.Procedures[name]
 }
