@@ -65,6 +65,8 @@ type Executor struct {
 	lastAutoIncID  int64
 	// fixedTimestamp holds a fixed time for SET TIMESTAMP=N support.
 	fixedTimestamp *time.Time
+	// timeZone holds the session time zone location for SET TIME_ZONE.
+	timeZone       *time.Location
 	// correlatedRow holds the outer row for correlated subquery evaluation.
 	correlatedRow  storage.Row
 	// DataDir is the base directory for resolving relative file paths
@@ -287,6 +289,11 @@ func (e *Executor) Execute(query string) (*Result, error) {
 
 	// Normalize SQL type aliases that vitess parser doesn't support
 	query = normalizeTypeAliases(query)
+
+	// Handle ALTER TABLE ... ORDER BY (vitess parser drops ORDER BY clause)
+	if strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, " ORDER BY ") {
+		return e.execAlterTableOrderBy(trimmed)
+	}
 
 	// Handle CREATE TRIGGER before vitess parser (it cannot parse triggers)
 	if strings.HasPrefix(upper, "CREATE TRIGGER") {
@@ -560,10 +567,12 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				if n == 0 {
 					e.fixedTimestamp = nil
 				} else {
-					t := time.Unix(int64(n), 0)
+					t := time.Unix(int64(n), 0).UTC()
 					e.fixedTimestamp = &t
 				}
 			}
+		case "time_zone":
+			e.parseTimeZone(val)
 		}
 	}
 	return &Result{}, nil
@@ -605,10 +614,19 @@ func (e *Executor) handleRawSet(raw string) {
 				if n == 0 {
 					e.fixedTimestamp = nil
 				} else {
-					t := time.Unix(int64(n), 0)
+					t := time.Unix(int64(n), 0).UTC()
 					e.fixedTimestamp = &t
 				}
 			}
+		}
+	}
+	if strings.Contains(upper, "TIME_ZONE") && !strings.Contains(upper, "TIMESTAMP") {
+		if idx := strings.Index(upper, "="); idx >= 0 {
+			val := strings.TrimSpace(raw[idx+1:])
+			val = strings.Trim(val, "'\"")
+			val = strings.TrimSuffix(val, ";")
+			val = strings.TrimSpace(val)
+			e.parseTimeZone(val)
 		}
 	}
 }
@@ -616,9 +634,43 @@ func (e *Executor) handleRawSet(raw string) {
 // nowTime returns the current time, respecting SET TIMESTAMP.
 func (e *Executor) nowTime() time.Time {
 	if e.fixedTimestamp != nil {
-		return *e.fixedTimestamp
+		t := *e.fixedTimestamp
+		if e.timeZone != nil {
+			t = t.In(e.timeZone)
+		}
+		return t
 	}
-	return time.Now()
+	t := time.Now()
+	if e.timeZone != nil {
+		t = t.In(e.timeZone)
+	}
+	return t
+}
+
+// parseTimeZone parses a time zone string like "+03:00" or "SYSTEM" and sets e.timeZone.
+func (e *Executor) parseTimeZone(val string) {
+	val = strings.Trim(val, "'\"")
+	val = strings.TrimSpace(val)
+	if strings.ToUpper(val) == "SYSTEM" || val == "" {
+		e.timeZone = nil
+		return
+	}
+	// Parse offset like "+03:00" or "-05:00"
+	if (val[0] == '+' || val[0] == '-') && len(val) >= 6 {
+		var hours, mins int
+		if _, err := fmt.Sscanf(val, "%d:%d", &hours, &mins); err == nil {
+			offset := hours*3600 + mins*60
+			if hours < 0 {
+				offset = hours*3600 - mins*60
+			}
+			e.timeZone = time.FixedZone(val, offset)
+			return
+		}
+	}
+	// Try as named timezone
+	if loc, err := time.LoadLocation(val); err == nil {
+		e.timeZone = loc
+	}
 }
 
 // isStrictMode returns true when sql_mode includes STRICT_TRANS_TABLES, STRICT_ALL_TABLES, or TRADITIONAL.
@@ -656,6 +708,67 @@ func (e *Executor) findRowIDColumn(row storage.Row) string {
 		}
 	}
 	return ""
+}
+
+// execAlterTableOrderBy handles ALTER TABLE ... ORDER BY col1, col2, ...
+func (e *Executor) execAlterTableOrderBy(query string) (*Result, error) {
+	upper := strings.ToUpper(query)
+	// Extract table name between ALTER TABLE and ORDER BY
+	altIdx := strings.Index(upper, "ALTER TABLE ") + len("ALTER TABLE ")
+	obIdx := strings.Index(upper, " ORDER BY ")
+	if altIdx < 0 || obIdx < 0 {
+		return &Result{}, nil
+	}
+	tableName := strings.TrimSpace(query[altIdx:obIdx])
+	tableName = strings.Trim(tableName, "`")
+	orderByStr := strings.TrimSpace(query[obIdx+len(" ORDER BY "):])
+
+	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
+	if err != nil {
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
+	}
+
+	// Parse ORDER BY columns
+	type orderCol struct {
+		name string
+		desc bool
+	}
+	var orderCols []orderCol
+	for _, part := range strings.Split(orderByStr, ",") {
+		part = strings.TrimSpace(part)
+		part = strings.TrimSuffix(part, ";")
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		fields := strings.Fields(part)
+		col := orderCol{name: strings.Trim(fields[0], "`")}
+		if len(fields) > 1 && strings.ToUpper(fields[1]) == "DESC" {
+			col.desc = true
+		}
+		orderCols = append(orderCols, col)
+	}
+
+	// Sort the rows in the storage table
+	tbl.Mu.Lock()
+	sort.SliceStable(tbl.Rows, func(i, j int) bool {
+		for _, oc := range orderCols {
+			vi := tbl.Rows[i][oc.name]
+			vj := tbl.Rows[j][oc.name]
+			cmp := compareNumeric(vi, vj)
+			if cmp == 0 {
+				continue
+			}
+			if oc.desc {
+				return cmp > 0
+			}
+			return cmp < 0
+		}
+		return false
+	})
+	tbl.Mu.Unlock()
+
+	return &Result{}, nil
 }
 
 // extractCharLength returns the max character length from a CHAR(N) or VARCHAR(N) type string.
@@ -976,6 +1089,49 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			}
 		case "COMMENT":
 			def.Comment = opt.Value.Val
+		}
+	}
+
+	// Handle CREATE TABLE (cols...) SELECT ... : insert rows from the SELECT
+	if stmt.Select != nil {
+		selectSQL := sqlparser.String(stmt.Select)
+		selResult, selErr := e.Execute(selectSQL)
+		if selErr != nil {
+			return nil, selErr
+		}
+		if selResult != nil && selResult.IsResultSet {
+			tbl, tblErr := e.Storage.GetTable(e.CurrentDB, tableName)
+			if tblErr == nil {
+				// Add any new columns from SELECT that aren't in the table def
+				for _, selCol := range selResult.Columns {
+					found := false
+					for _, defCol := range def.Columns {
+						if strings.EqualFold(defCol.Name, selCol) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						newCol := catalog.ColumnDef{
+							Name:     selCol,
+							Type:     "VARCHAR(255)",
+							Nullable: true,
+						}
+						def.Columns = append(def.Columns, newCol)
+						tbl.AddColumn(selCol, nil)
+					}
+				}
+				// Insert select results
+				for _, selRow := range selResult.Rows {
+					row := make(storage.Row)
+					for j, selCol := range selResult.Columns {
+						if j < len(selRow) {
+							row[selCol] = selRow[j]
+						}
+					}
+					tbl.Insert(row) //nolint:errcheck
+				}
+			}
 		}
 	}
 
@@ -1893,10 +2049,31 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		}
 	}
 
-	// Build rows from FROM clause (handles single table and JOINs)
+	// Build rows from FROM clause (handles single table, JOINs, and implicit cross joins)
 	allRows, err := e.buildFromExpr(stmt.From[0])
 	if err != nil {
 		return nil, err
+	}
+	// Handle implicit cross join: FROM t1, t2, t3
+	for i := 1; i < len(stmt.From); i++ {
+		rightRows, err := e.buildFromExpr(stmt.From[i])
+		if err != nil {
+			return nil, err
+		}
+		var crossed []storage.Row
+		for _, leftRow := range allRows {
+			for _, rightRow := range rightRows {
+				combined := make(storage.Row, len(leftRow)+len(rightRow))
+				for k, v := range leftRow {
+					combined[k] = v
+				}
+				for k, v := range rightRow {
+					combined[k] = v
+				}
+				crossed = append(crossed, combined)
+			}
+		}
+		allRows = crossed
 	}
 
 	// Apply WHERE filter
@@ -3037,6 +3214,50 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					}
 				}
 			}
+
+		case *sqlparser.AlterColumn:
+			colName := op.Column.Name.String()
+			tableDef, _ := db.GetTable(tableName)
+			if tableDef != nil {
+				for i, col := range tableDef.Columns {
+					if col.Name == colName {
+						if op.DropDefault {
+							tableDef.Columns[i].Default = nil
+						} else if op.DefaultVal != nil {
+							defStr := sqlparser.String(op.DefaultVal)
+							defStr = strings.Trim(defStr, "'")
+							tableDef.Columns[i].Default = &defStr
+						}
+						break
+					}
+				}
+			}
+
+		case *sqlparser.RenameTableName:
+			newName := op.Table.Name.String()
+			// Get the current table def
+			def, getErr := db.GetTable(tableName)
+			if getErr != nil {
+				return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
+			}
+			// Check new name doesn't already exist
+			if _, getErr := db.GetTable(newName); getErr == nil {
+				return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newName))
+			}
+			// Rename in catalog
+			def.Name = newName
+			db.DropTable(tableName)  //nolint:errcheck
+			db.CreateTable(def)      //nolint:errcheck
+			// Rename in storage
+			e.Storage.CreateTable(e.CurrentDB, def)
+			if newTbl, getErr := e.Storage.GetTable(e.CurrentDB, newName); getErr == nil {
+				newTbl.Rows = tbl.Rows
+				newTbl.AutoIncrement.Store(tbl.AutoIncrementValue())
+			}
+			e.Storage.DropTable(e.CurrentDB, tableName)
+			// Update tableName for any subsequent ALTER operations
+			tableName = newName
+			tbl, _ = e.Storage.GetTable(e.CurrentDB, newName)
 
 		default:
 			// Unsupported ALTER option — ignore silently to stay compatible.
@@ -4607,6 +4828,78 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return e.evalExpr(v.Exprs[0])
 		}
 		return nil, nil
+	case "from_days":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		days := int(toInt64(val))
+		t := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, days-1)
+		return t.Format("2006-01-02"), nil
+	case "to_days":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		t, parseErr := parseDateTimeValue(val)
+		if parseErr != nil {
+			return nil, nil
+		}
+		epoch := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
+		d := int64(t.Sub(epoch).Hours()/24) + 1
+		return d, nil
+	case "bin":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		n := toInt64(val)
+		return fmt.Sprintf("%b", n), nil
+	case "conv":
+		if len(v.Exprs) < 3 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		fromBaseVal, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		toBaseVal, err := e.evalExpr(v.Exprs[2])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		s := toString(val)
+		fromBase := int(toInt64(fromBaseVal))
+		toBase := int(toInt64(toBaseVal))
+		n, parseErr := strconv.ParseInt(s, fromBase, 64)
+		if parseErr != nil {
+			return nil, nil
+		}
+		return strings.ToUpper(strconv.FormatInt(n, toBase)), nil
 	}
 	// Unknown function: return nil rather than error to be lenient
 	return nil, fmt.Errorf("unsupported function: %s", name)
@@ -5324,6 +5617,77 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			n = len(s)
 		}
 		return string(s[len(s)-n:]), nil
+	case "hex":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		switch tv := args[0].(type) {
+		case int64:
+			return strings.ToUpper(fmt.Sprintf("%X", tv)), nil
+		case float64:
+			return strings.ToUpper(fmt.Sprintf("%X", int64(tv))), nil
+		default:
+			s := toString(args[0])
+			return strings.ToUpper(hex.EncodeToString([]byte(s))), nil
+		}
+	case "bin":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		n := toInt64(args[0])
+		return fmt.Sprintf("%b", n), nil
+	case "conv":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 3 || args[0] == nil {
+			return nil, nil
+		}
+		s := toString(args[0])
+		fromBase := int(toInt64(args[1]))
+		toBase := int(toInt64(args[2]))
+		n, parseErr := strconv.ParseInt(s, fromBase, 64)
+		if parseErr != nil {
+			return nil, nil
+		}
+		return strings.ToUpper(strconv.FormatInt(n, toBase)), nil
+	case "from_days":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		days := int(toInt64(args[0]))
+		// MySQL FROM_DAYS: day 1 = 0001-01-01
+		t := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, days-1)
+		return t.Format("2006-01-02"), nil
+	case "to_days":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, parseErr := parseDateTimeValue(args[0])
+		if parseErr != nil {
+			return nil, nil
+		}
+		// MySQL TO_DAYS: number of days since year 0
+		epoch := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
+		days := int64(t.Sub(epoch).Hours()/24) + 1
+		return days, nil
 	default:
 		// Fallback: delegate to evalFuncExpr (no row context for args)
 		return e.evalFuncExpr(v)
@@ -5671,6 +6035,20 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 }
 
 func compareNumeric(a, b interface{}) int {
+	// If both values are strings (or one is), do string comparison
+	_, aIsStr := a.(string)
+	_, bIsStr := b.(string)
+	if aIsStr || bIsStr {
+		sa := toString(a)
+		sb := toString(b)
+		if sa < sb {
+			return -1
+		}
+		if sa > sb {
+			return 1
+		}
+		return 0
+	}
 	fa := toFloat(a)
 	fb := toFloat(b)
 	if fa < fb {
@@ -5701,36 +6079,48 @@ func toFloat(v interface{}) float64 {
 }
 
 func applyOrderBy(orderBy sqlparser.OrderBy, colNames []string, rows [][]interface{}) ([][]interface{}, error) {
-	// Simple single-column ordering for now
 	if len(orderBy) == 0 {
 		return rows, nil
 	}
 
-	order := orderBy[0]
-	colName := sqlparser.String(order.Expr)
-	colName = strings.Trim(colName, "`")
-
-	colIdx := -1
-	for i, c := range colNames {
-		if c == colName {
-			colIdx = i
-			break
-		}
+	type orderSpec struct {
+		colIdx int
+		asc    bool
 	}
-	if colIdx == -1 {
+	var specs []orderSpec
+	for _, order := range orderBy {
+		colName := sqlparser.String(order.Expr)
+		colName = strings.Trim(colName, "`")
+		colIdx := -1
+		for i, c := range colNames {
+			if strings.EqualFold(c, colName) {
+				colIdx = i
+				break
+			}
+		}
+		if colIdx == -1 {
+			continue
+		}
+		asc := order.Direction == sqlparser.AscOrder || order.Direction == 0
+		specs = append(specs, orderSpec{colIdx: colIdx, asc: asc})
+	}
+	if len(specs) == 0 {
 		return rows, nil
 	}
 
-	// Bubble sort for simplicity
-	asc := order.Direction == sqlparser.AscOrder || order.Direction == 0
-	for i := 0; i < len(rows); i++ {
-		for j := i + 1; j < len(rows); j++ {
-			cmp := compareNumeric(rows[i][colIdx], rows[j][colIdx])
-			if (asc && cmp > 0) || (!asc && cmp < 0) {
-				rows[i], rows[j] = rows[j], rows[i]
+	sort.SliceStable(rows, func(i, j int) bool {
+		for _, spec := range specs {
+			cmp := compareNumeric(rows[i][spec.colIdx], rows[j][spec.colIdx])
+			if cmp == 0 {
+				continue
 			}
+			if spec.asc {
+				return cmp < 0
+			}
+			return cmp > 0
 		}
-	}
+		return false
+	})
 	return rows, nil
 }
 

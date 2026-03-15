@@ -64,6 +64,25 @@ func (r *Runner) RunFile(testPath string) TestResult {
 			r.DB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", t)) //nolint:errcheck
 		}
 	}
+	// Drop user-created databases from previous test (keep system databases)
+	systemDBs := map[string]bool{
+		"information_schema": true, "mysql": true, "performance_schema": true,
+		"sys": true, "test": true, "mtr": true,
+	}
+	if rows, err2 := r.DB.Query("SHOW DATABASES"); err2 == nil {
+		var databases []string
+		for rows.Next() {
+			var d string
+			rows.Scan(&d) //nolint:errcheck
+			if !systemDBs[d] {
+				databases = append(databases, d)
+			}
+		}
+		rows.Close()
+		for _, d := range databases {
+			r.DB.Exec(fmt.Sprintf("DROP DATABASE `%s`", d)) //nolint:errcheck
+		}
+	}
 
 	// Execute with timeout
 	timeout := 10 * time.Second
