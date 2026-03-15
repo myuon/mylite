@@ -899,7 +899,21 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	}
 
 	// Build result columns and rows (non-aggregate path)
-	colNames, colExprs, err := e.resolveSelectExprs(stmt.SelectExprs.Exprs, allRows)
+	// Collect table definitions for proper column ordering in SELECT *
+	var selectTableDefs []*catalog.TableDef
+	if len(stmt.From) > 0 {
+		if ate, ok := stmt.From[0].(*sqlparser.AliasedTableExpr); ok {
+			if tn, ok := ate.Expr.(sqlparser.TableName); ok {
+				tblName := tn.Name.String()
+				if db, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
+					if td, err := db.GetTable(tblName); err == nil {
+						selectTableDefs = append(selectTableDefs, td)
+					}
+				}
+			}
+		}
+	}
+	colNames, colExprs, err := e.resolveSelectExprs(stmt.SelectExprs.Exprs, allRows, selectTableDefs...)
 	if err != nil {
 		return nil, err
 	}
@@ -1176,15 +1190,24 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 
 // resolveSelectExprs returns column names and original expressions for non-aggregate SELECTs.
 // It handles star expansion using actual row data (needed for JOINs).
-func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []storage.Row) ([]string, []sqlparser.Expr, error) {
+// tableDefs is optional; when provided, * expansion uses schema-defined column order.
+func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []storage.Row, tableDefs ...*catalog.TableDef) ([]string, []sqlparser.Expr, error) {
 	cols := make([]string, 0)
 	colExprs := make([]sqlparser.Expr, 0)
 
 	for _, expr := range exprs {
 		switch se := expr.(type) {
 		case *sqlparser.StarExpr:
-			// Expand star using the first row's un-prefixed keys.
-			if len(rows) > 0 {
+			// Expand star using table definition column order if available
+			if len(tableDefs) > 0 {
+				for _, td := range tableDefs {
+					for _, col := range td.Columns {
+						cols = append(cols, col.Name)
+						colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(col.Name)})
+					}
+				}
+			} else if len(rows) > 0 {
+				// Fallback: use row keys (may have non-deterministic order)
 				seen := make(map[string]bool)
 				for k := range rows[0] {
 					if !strings.Contains(k, ".") && !seen[k] {
