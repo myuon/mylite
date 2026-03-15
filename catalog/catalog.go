@@ -59,12 +59,21 @@ type ProcParam struct {
 	Type string
 }
 
+// FunctionDef represents a stored function definition.
+type FunctionDef struct {
+	Name       string
+	Params     []ProcParam
+	ReturnType string
+	Body       []string // SQL statements in the function body
+}
+
 // Database represents a database containing tables.
 type Database struct {
 	Name           string
 	Tables         map[string]*TableDef
 	Triggers       map[string]*TriggerDef   // trigger name -> trigger def
 	Procedures     map[string]*ProcedureDef // procedure name -> procedure def
+	Functions      map[string]*FunctionDef  // function name -> function def
 	CharacterSet   string // e.g. "utf8mb4", "ascii", "binary"
 	CollationName  string // e.g. "utf8mb4_general_ci", "ascii_general_ci"
 	mu             sync.RWMutex
@@ -93,6 +102,7 @@ func New() *Catalog {
 			Tables:        make(map[string]*TableDef),
 			Triggers:      make(map[string]*TriggerDef),
 			Procedures:    make(map[string]*ProcedureDef),
+			Functions:     make(map[string]*FunctionDef),
 			CharacterSet:  charset,
 			CollationName: collation,
 		}
@@ -208,11 +218,12 @@ func (c *Catalog) CreateDatabaseWithCharset(name, charset, collation string) err
 		collation = DefaultCollationForCharset(charset)
 	}
 	c.Databases[name] = &Database{
-		Name:         name,
-		Tables:       make(map[string]*TableDef),
-		Triggers:     make(map[string]*TriggerDef),
-		Procedures:   make(map[string]*ProcedureDef),
-		CharacterSet: charset,
+		Name:          name,
+		Tables:        make(map[string]*TableDef),
+		Triggers:      make(map[string]*TriggerDef),
+		Procedures:    make(map[string]*ProcedureDef),
+		Functions:     make(map[string]*FunctionDef),
+		CharacterSet:  charset,
 		CollationName: collation,
 	}
 	return nil
@@ -305,7 +316,7 @@ func (db *Database) AddColumnAt(tableName string, col ColumnDef, position string
 	}
 	for _, c := range tbl.Columns {
 		if c.Name == col.Name {
-			return fmt.Errorf("column '%s' already exists in table '%s'", col.Name, tableName)
+			return fmt.Errorf("ERROR 1060 (42S21): Duplicate column name '%s'", col.Name)
 		}
 	}
 	if position == "FIRST" {
@@ -516,4 +527,31 @@ func (db *Database) GetProcedure(name string) *ProcedureDef {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	return db.Procedures[name]
+}
+
+// CreateFunction adds a stored function definition.
+func (db *Database) CreateFunction(def *FunctionDef) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.Functions == nil {
+		db.Functions = make(map[string]*FunctionDef)
+	}
+	db.Functions[def.Name] = def
+}
+
+// DropFunction removes a stored function by name.
+func (db *Database) DropFunction(name string) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	delete(db.Functions, name)
+}
+
+// GetFunction returns a stored function by name.
+func (db *Database) GetFunction(name string) *FunctionDef {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.Functions == nil {
+		return nil
+	}
+	return db.Functions[name]
 }

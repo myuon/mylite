@@ -323,9 +323,13 @@ func (ctx *execContext) executeLines(lines []string) error {
 				}
 			}
 
-			rawLines = append(rawLines, t)
+			rawLines = append(rawLines, strings.TrimSpace(l))
 
-			if strings.HasSuffix(t, delim) {
+			// Check delimiter on stripped line, but also on original trimmed line
+			// (in case inline comment stripping removed the trailing delimiter)
+			originalTrimmed := strings.TrimSpace(l)
+			hasDelim := strings.HasSuffix(t, delim) || strings.HasSuffix(originalTrimmed, delim)
+			if hasDelim {
 				stmt += strings.TrimSuffix(t, delim)
 				i++
 				break

@@ -393,6 +393,14 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	if strings.HasPrefix(upper, "DROP TRIGGER") {
 		return e.execDropTrigger(trimmed)
 	}
+	// Handle CREATE FUNCTION (with BEGIN...END body that vitess can't parse)
+	if strings.HasPrefix(upper, "CREATE FUNCTION") && strings.Contains(upper, "BEGIN") {
+		return e.execCreateFunction(trimmed)
+	}
+	// Handle DROP FUNCTION
+	if strings.HasPrefix(upper, "DROP FUNCTION") {
+		return e.execDropFunction(trimmed)
+	}
 	// Handle CREATE PROCEDURE (with BEGIN...END body that vitess can't parse)
 	if strings.HasPrefix(upper, "CREATE PROCEDURE") && strings.Contains(upper, "BEGIN") {
 		return e.execCreateProcedure(trimmed)
@@ -418,9 +426,7 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			nearText = strings.TrimPrefix(nearText, "use ")
 			return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", nearText))
 		}
-		if strings.HasPrefix(upper, "DROP FUNCTION") ||
-			strings.HasPrefix(upper, "CREATE FUNCTION") ||
-			strings.HasPrefix(upper, "CREATE EVENT") ||
+		if strings.HasPrefix(upper, "CREATE EVENT") ||
 			strings.HasPrefix(upper, "DROP EVENT") ||
 			strings.HasPrefix(upper, "CREATE USER") ||
 			strings.HasPrefix(upper, "DROP USER") ||
@@ -552,7 +558,11 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 	for _, pair := range stmt.TablePairs {
 		oldName := pair.FromTable.Name.String()
 		newName := pair.ToTable.Name.String()
-		// Check if target database exists
+		// Determine source and target databases
+		srcDB := e.CurrentDB
+		if !pair.FromTable.Qualifier.IsEmpty() {
+			srcDB = pair.FromTable.Qualifier.String()
+		}
 		targetDB := e.CurrentDB
 		if !pair.ToTable.Qualifier.IsEmpty() {
 			targetDB = pair.ToTable.Qualifier.String()
@@ -560,33 +570,37 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 		if _, err := e.Catalog.GetDatabase(targetDB); err != nil {
 			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", targetDB))
 		}
-		db, err := e.Catalog.GetDatabase(e.CurrentDB)
+		srcCatDB, err := e.Catalog.GetDatabase(srcDB)
 		if err != nil {
-			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", srcDB))
 		}
-		// Check if new name already exists
-		if _, err := db.GetTable(newName); err == nil {
+		targetCatDB, err := e.Catalog.GetDatabase(targetDB)
+		if err != nil {
+			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", targetDB))
+		}
+		// Check if new name already exists in target db
+		if _, err := targetCatDB.GetTable(newName); err == nil {
 			return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newName))
 		}
 		// Get old table def
-		def, err := db.GetTable(oldName)
+		def, err := srcCatDB.GetTable(oldName)
 		if err != nil {
-			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, oldName))
+			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", srcDB, oldName))
 		}
 		// Rename in catalog
 		def.Name = newName
-		db.DropTable(oldName)  //nolint:errcheck
-		db.CreateTable(def)    //nolint:errcheck
+		srcCatDB.DropTable(oldName)       //nolint:errcheck
+		targetCatDB.CreateTable(def)      //nolint:errcheck
 		// Rename in storage
-		if tbl, err := e.Storage.GetTable(e.CurrentDB, oldName); err == nil {
+		if tbl, err := e.Storage.GetTable(srcDB, oldName); err == nil {
 			tbl.Def = def
-			e.Storage.CreateTable(e.CurrentDB, def)
+			e.Storage.CreateTable(targetDB, def)
 			// Copy rows
-			if newTbl, err := e.Storage.GetTable(e.CurrentDB, newName); err == nil {
+			if newTbl, err := e.Storage.GetTable(targetDB, newName); err == nil {
 				newTbl.Rows = tbl.Rows
 				newTbl.AutoIncrement.Store(tbl.AutoIncrementValue())
 			}
-			e.Storage.DropTable(e.CurrentDB, oldName)
+			e.Storage.DropTable(srcDB, oldName)
 		}
 	}
 	return &Result{}, nil
@@ -1290,12 +1304,15 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 }
 
 func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error) {
-	db, err := e.Catalog.GetDatabase(e.CurrentDB)
-	if err != nil {
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
-	}
-
+	dbName := e.CurrentDB
 	tableName := stmt.Table.Name.String()
+	if !stmt.Table.Qualifier.IsEmpty() {
+		dbName = stmt.Table.Qualifier.String()
+	}
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
+	}
 
 	if stmt.TableSpec == nil {
 		// CREATE TABLE ... LIKE
@@ -1428,7 +1445,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 		return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", tableName))
 	}
-	e.Storage.CreateTable(e.CurrentDB, def)
+	e.Storage.CreateTable(dbName, def)
 
 	// Track temporary tables
 	if stmt.Temp {
@@ -1440,7 +1457,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		switch strings.ToUpper(opt.Name) {
 		case "AUTO_INCREMENT":
 			if val, err := strconv.ParseInt(opt.Value.Val, 10, 64); err == nil {
-				if tbl, err := e.Storage.GetTable(e.CurrentDB, tableName); err == nil {
+				if tbl, err := e.Storage.GetTable(dbName, tableName); err == nil {
 					tbl.AutoIncrement.Store(val - 1) // Store val-1 because next insert increments first
 				}
 			}
@@ -1457,7 +1474,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			return nil, selErr
 		}
 		if selResult != nil && selResult.IsResultSet {
-			tbl, tblErr := e.Storage.GetTable(e.CurrentDB, tableName)
+			tbl, tblErr := e.Storage.GetTable(dbName, tableName)
 			if tblErr == nil {
 				// Add any new columns from SELECT that aren't in the table def
 				for _, selCol := range selResult.Columns {
@@ -1688,10 +1705,16 @@ func (e *Executor) execMyliteCommand(query string) (*Result, error) {
 
 func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	tableName := stmt.Table.TableNameString()
+	insertDB := e.CurrentDB
+	if tn, ok := stmt.Table.Expr.(sqlparser.TableName); ok && !tn.Qualifier.IsEmpty() {
+		insertDB = tn.Qualifier.String()
+	} else if strings.Contains(tableName, ".") {
+		insertDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
+	}
 
-	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
+	tbl, err := e.Storage.GetTable(insertDB, tableName)
 	if err != nil {
-		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", insertDB, tableName))
 	}
 
 	// Apply SET INSERT_ID if set
@@ -2493,7 +2516,11 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		if ate, ok := stmt.From[0].(*sqlparser.AliasedTableExpr); ok {
 			if tn, ok := ate.Expr.(sqlparser.TableName); ok {
 				tblName := tn.Name.String()
-				if db, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
+				lookupDB := e.CurrentDB
+				if !tn.Qualifier.IsEmpty() {
+					lookupDB = tn.Qualifier.String()
+				}
+				if db, err := e.Catalog.GetDatabase(lookupDB); err == nil {
 					if td, err := db.GetTable(tblName); err == nil {
 						selectTableDefs = append(selectTableDefs, td)
 					}
@@ -3118,18 +3145,27 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		return nil, fmt.Errorf("no table specified")
 	}
 
+	// Check for multi-table UPDATE (comma-separated tables)
+	if len(stmt.TableExprs) > 1 || isMultiTableUpdate(stmt) {
+		return e.execMultiTableUpdate(stmt)
+	}
+
 	tableName := ""
+	updateDB := e.CurrentDB
 	switch te := stmt.TableExprs[0].(type) {
 	case *sqlparser.AliasedTableExpr:
 		tableName = sqlparser.String(te.Expr)
 		tableName = strings.Trim(tableName, "`")
+		if strings.Contains(tableName, ".") {
+			updateDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
+		}
 	default:
 		return nil, fmt.Errorf("unsupported table expression: %T", te)
 	}
 
-	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
+	tbl, err := e.Storage.GetTable(updateDB, tableName)
 	if err != nil {
-		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", updateDB, tableName))
 	}
 
 	// Check for self-referencing subqueries (MySQL error 1093)
@@ -3271,17 +3307,21 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 	}
 
 	tableName := ""
+	deleteDB := e.CurrentDB
 	switch te := stmt.TableExprs[0].(type) {
 	case *sqlparser.AliasedTableExpr:
 		tableName = sqlparser.String(te.Expr)
 		tableName = strings.Trim(tableName, "`")
+		if strings.Contains(tableName, ".") {
+			deleteDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
+		}
 	default:
 		return nil, fmt.Errorf("unsupported table expression: %T", te)
 	}
 
-	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
+	tbl, err := e.Storage.GetTable(deleteDB, tableName)
 	if err != nil {
-		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", deleteDB, tableName))
 	}
 
 	tbl.Lock()
@@ -3452,6 +3492,11 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 		if err != nil {
 			continue
 		}
+		// Build alias for qualified column lookup (e.g., "d1.t1")
+		targetAlias := targetName
+		if targetDB != e.CurrentDB {
+			targetAlias = targetDB + "." + targetName
+		}
 		deleteIndices := make(map[int]bool)
 		for _, matchedRow := range allRows {
 			for i, existingRow := range tbl.Rows {
@@ -3460,7 +3505,10 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 				}
 				allMatch := true
 				for _, col := range tbl.Def.Columns {
-					mv, ok := matchedRow[targetName+"."+col.Name]
+					mv, ok := matchedRow[targetAlias+"."+col.Name]
+					if !ok {
+						mv, ok = matchedRow[targetName+"."+col.Name]
+					}
 					if !ok {
 						mv, ok = matchedRow[col.Name]
 					}
@@ -3547,6 +3595,15 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		case *sqlparser.AddColumns:
 			for _, col := range op.Columns {
 				colDef := columnDefFromAST(col)
+				// Check column comment length in strict/traditional mode (MySQL max is 1024 characters)
+				commentRunes := []rune(colDef.Comment)
+				if len(commentRunes) > 1024 && e.isStrictMode() {
+					return nil, mysqlError(1629, "HY000", fmt.Sprintf("Comment for field '%s' is too long (max = 1024)", colDef.Name))
+				}
+				// Truncate comment to 1024 characters in non-strict mode
+				if len(commentRunes) > 1024 {
+					colDef.Comment = string(commentRunes[:1024])
+				}
 				position := ""
 				afterCol := ""
 				if op.First {
@@ -4103,18 +4160,22 @@ func mysqlDisplayType(colType string) string {
 }
 
 func (e *Executor) showCreateTable(tableName string) (*Result, error) {
-	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	showDB := e.CurrentDB
+	if strings.Contains(tableName, ".") {
+		showDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
+	}
+	db, err := e.Catalog.GetDatabase(showDB)
 	if err != nil {
 		return nil, err
 	}
 	def, err := db.GetTable(tableName)
 	if err != nil {
-		return nil, fmt.Errorf("ERROR 1146 (42S02): Table '%s.%s' doesn't exist", e.CurrentDB, tableName)
+		return nil, fmt.Errorf("ERROR 1146 (42S02): Table '%s.%s' doesn't exist", showDB, tableName)
 	}
 
 	// Get AUTO_INCREMENT value
 	autoIncVal := int64(0)
-	if tbl, err := e.Storage.GetTable(e.CurrentDB, tableName); err == nil {
+	if tbl, err := e.Storage.GetTable(showDB, tableName); err == nil {
 		autoIncVal = tbl.AutoIncrementValue()
 	}
 
@@ -4509,6 +4570,15 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.Subquery:
 		// Scalar subquery: execute and return the single value
 		return e.execSubqueryScalar(v, e.correlatedRow)
+	case *sqlparser.NotExpr:
+		val, err := e.evalExpr(v.Expr)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(val) {
+			return int64(0), nil
+		}
+		return int64(1), nil
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
 }
@@ -5358,6 +5428,94 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, nil
 		}
 		return strings.ToUpper(strconv.FormatInt(n, toBase)), nil
+	case "last_day":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		t, parseErr := parseDateTimeValue(val)
+		if parseErr != nil {
+			return nil, nil
+		}
+		firstOfNextMonth := time.Date(t.Year(), t.Month()+1, 1, 0, 0, 0, 0, time.UTC)
+		lastDay := firstOfNextMonth.AddDate(0, 0, -1)
+		return lastDay.Format("2006-01-02"), nil
+	case "quarter":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		t, parseErr := parseDateTimeValue(val)
+		if parseErr != nil {
+			return nil, nil
+		}
+		return int64((t.Month()-1)/3 + 1), nil
+	case "week", "weekofyear":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		t, parseErr := parseDateTimeValue(val)
+		if parseErr != nil {
+			return nil, nil
+		}
+		_, wk := t.ISOWeek()
+		return int64(wk), nil
+	case "yearweek":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		t, parseErr := parseDateTimeValue(val)
+		if parseErr != nil {
+			return nil, nil
+		}
+		yr, wk := t.ISOWeek()
+		return int64(yr*100 + wk), nil
+	case "timestamp":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		t, parseErr := parseDateTimeValue(val)
+		if parseErr != nil {
+			return nil, nil
+		}
+		return t.Format("2006-01-02 15:04:05"), nil
+	}
+	// Try user-defined function from catalog
+	if result, err := e.callUserDefinedFunction(name, v.Exprs, nil); err == nil {
+		return result, nil
 	}
 	// Unknown function: return nil rather than error to be lenient
 	return nil, fmt.Errorf("unsupported function: %s", name)
@@ -5631,9 +5789,18 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			if val, ok := row[qualified]; ok {
 				return val, nil
 			}
+			// Try full qualifier (db.table.col) for multi-database references
+			fullQualified := sqlparser.String(v.Qualifier) + "." + colName
+			fullQualified = strings.Trim(fullQualified, "`")
+			if val, ok := row[fullQualified]; ok {
+				return val, nil
+			}
 			// Fall back to correlatedRow for correlated subquery references
 			if e.correlatedRow != nil {
 				if val, ok := e.correlatedRow[qualified]; ok {
+					return val, nil
+				}
+				if val, ok := e.correlatedRow[fullQualified]; ok {
 					return val, nil
 				}
 			}
@@ -5971,6 +6138,23 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			return nil, err
 		}
 		return t.Format("January"), nil
+	case "weekday":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, err := parseDateTimeValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		wd := int64(t.Weekday()) - 1
+		if wd < 0 {
+			wd = 6
+		}
+		return wd, nil
 	case "time":
 		args, err := evalArgs()
 		if err != nil {
@@ -6146,7 +6330,80 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		epoch := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
 		days := int64(t.Sub(epoch).Hours()/24) + 1
 		return days, nil
+	case "last_day":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, parseErr := parseDateTimeValue(args[0])
+		if parseErr != nil {
+			return nil, nil
+		}
+		firstOfNextMonth := time.Date(t.Year(), t.Month()+1, 1, 0, 0, 0, 0, time.UTC)
+		lastDay := firstOfNextMonth.AddDate(0, 0, -1)
+		return lastDay.Format("2006-01-02"), nil
+	case "quarter":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, parseErr := parseDateTimeValue(args[0])
+		if parseErr != nil {
+			return nil, nil
+		}
+		return int64((t.Month()-1)/3 + 1), nil
+	case "week", "weekofyear":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, parseErr := parseDateTimeValue(args[0])
+		if parseErr != nil {
+			return nil, nil
+		}
+		_, wk := t.ISOWeek()
+		return int64(wk), nil
+	case "yearweek":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, parseErr := parseDateTimeValue(args[0])
+		if parseErr != nil {
+			return nil, nil
+		}
+		yr, wk := t.ISOWeek()
+		return int64(yr*100 + wk), nil
+	case "timestamp":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, parseErr := parseDateTimeValue(args[0])
+		if parseErr != nil {
+			return nil, nil
+		}
+		return t.Format("2006-01-02 15:04:05"), nil
 	default:
+		// Try user-defined function from catalog
+		if result, err := e.callUserDefinedFunction(name, v.Exprs, &row); err == nil {
+			return result, nil
+		}
 		// Fallback: delegate to evalFuncExpr (no row context for args)
 		return e.evalFuncExpr(v)
 	}
@@ -6839,6 +7096,40 @@ func isAlphaNum(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
 }
 
+// countOccurrences counts the number of non-overlapping occurrences of substr in s.
+// It only counts whole-word occurrences where "IF " means IF followed by space (not part of END IF).
+func countOccurrences(s, substr string) int {
+	if substr == "IF " {
+		// Count IF that aren't preceded by END
+		count := 0
+		idx := 0
+		for {
+			pos := strings.Index(s[idx:], "IF ")
+			if pos < 0 {
+				break
+			}
+			absPos := idx + pos
+			// Check it's not preceded by "END " or "ELSEIF"
+			if absPos >= 4 && s[absPos-4:absPos] == "END " {
+				idx = absPos + 3
+				continue
+			}
+			if absPos >= 6 && strings.HasSuffix(s[:absPos], "ELSEIF") {
+				idx = absPos + 3
+				continue
+			}
+			if absPos >= 4 && strings.HasSuffix(s[:absPos], "ELSE") {
+				idx = absPos + 3
+				continue
+			}
+			count++
+			idx = absPos + 3
+		}
+		return count
+	}
+	return strings.Count(s, substr)
+}
+
 // dropTriggersForTable removes all triggers associated with the given table.
 func (e *Executor) dropTriggersForTable(db *catalog.Database, tableName string) {
 	if db.Triggers == nil {
@@ -7271,54 +7562,29 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 
 	// Build parameter mapping: bind IN params, track OUT params
 	paramVars := make(map[string]interface{})
-	outVarMap := make(map[string]string) // param name -> @variable name
 	for i, param := range proc.Params {
 		if i < len(argStrs) {
 			argVal := strings.TrimSpace(argStrs[i])
 			if strings.HasPrefix(argVal, "@") {
 				// User variable reference
 				if param.Mode == "IN" || param.Mode == "INOUT" {
-					// Read current value of user variable (for now, use as string)
 					paramVars[param.Name] = argVal
 				}
-				if param.Mode == "OUT" || param.Mode == "INOUT" {
-					outVarMap[param.Name] = argVal
-				}
 			} else {
-				// Literal value
-				paramVars[param.Name] = argVal
+				// Literal value - try to parse as number
+				if n, err := strconv.ParseInt(argVal, 10, 64); err == nil {
+					paramVars[param.Name] = n
+				} else {
+					paramVars[param.Name] = strings.Trim(argVal, "'\"")
+				}
 			}
 		}
 	}
 
-	// Execute body statements
-	for _, stmtStr := range proc.Body {
-		stmtUpper := strings.ToUpper(strings.TrimSpace(stmtStr))
-		// Handle SELECT ... INTO
-		if strings.Contains(stmtUpper, " INTO ") && strings.HasPrefix(stmtUpper, "SELECT") {
-			err := e.execSelectInto(stmtStr, paramVars, outVarMap)
-			if err != nil {
-				return nil, err
-			}
-			continue
-		}
-		// Handle DECLARE - skip
-		if strings.HasPrefix(stmtUpper, "DECLARE") {
-			continue
-		}
-		// Handle SET
-		if strings.HasPrefix(stmtUpper, "SET") {
-			_, err := e.Execute(stmtStr)
-			if err != nil {
-				return nil, err
-			}
-			continue
-		}
-		// Execute other statements
-		_, err := e.Execute(stmtStr)
-		if err != nil {
-			return nil, err
-		}
+	// Execute body using the routine executor with cursor support
+	_, err = e.execRoutineBody(proc.Body, paramVars)
+	if err != nil {
+		return nil, err
 	}
 
 	return &Result{}, nil
@@ -7458,13 +7724,20 @@ func (e *Executor) execMultiTableDelete(query string) (*Result, error) {
 		}
 	}
 
-	// Resolve qualified target names (db.table -> use that db for lookup)
-	// For now just extract the table name part
+	// Resolve qualified target names (db.table -> use the table name part for matching)
+	// But keep track of db for each target
+	deleteTargetDBs := make(map[string]string) // table name -> db name
 	for i, t := range deleteTargets {
-		if parts := strings.Split(t, "."); len(parts) > 1 {
-			deleteTargets[i] = parts[len(parts)-1] // take last part as table name
+		if parts := strings.Split(t, "."); len(parts) == 2 {
+			deleteTargetDBs[parts[1]] = parts[0]
+			deleteTargets[i] = parts[1] // use table name for matching
+		} else if len(parts) > 2 {
+			// db.table.* -> take second to last as table
+			deleteTargetDBs[parts[len(parts)-2]] = parts[0]
+			deleteTargets[i] = parts[len(parts)-2]
 		}
 	}
+	_ = deleteTargetDBs
 
 	// Parse table refs
 	type tableRef struct {
@@ -7487,7 +7760,7 @@ func (e *Executor) execMultiTableDelete(query string) (*Result, error) {
 		if dotParts := strings.Split(name, "."); len(dotParts) == 2 {
 			db = dotParts[0]
 			name = dotParts[1]
-			alias = name
+			alias = dotParts[0] + "." + name // keep d1.t1 as alias for qualified column refs
 		}
 		if len(parts) >= 3 && strings.ToUpper(parts[1]) == "AS" {
 			alias = strings.Trim(parts[2], "`")
@@ -7543,11 +7816,16 @@ func (e *Executor) execMultiTableDelete(query string) (*Result, error) {
 	// Delete matched rows from target tables
 	var totalAffected uint64
 	for _, target := range deleteTargets {
-		// Find the matching table ref (to get the right db)
+		// Find the matching table ref (to get the right db and alias)
 		targetDB := e.CurrentDB
+		targetAlias := target
+		if dbOverride, ok := deleteTargetDBs[target]; ok {
+			targetDB = dbOverride
+		}
 		for _, ref := range tableRefs {
-			if ref.name == target || ref.alias == target {
+			if ref.name == target {
 				targetDB = ref.db
+				targetAlias = ref.alias
 				break
 			}
 		}
@@ -7563,7 +7841,10 @@ func (e *Executor) execMultiTableDelete(query string) (*Result, error) {
 				}
 				allMatch := true
 				for _, col := range tbl.Def.Columns {
-					mv, ok := matchedRow[target+"."+col.Name]
+					mv, ok := matchedRow[targetAlias+"."+col.Name]
+					if !ok {
+						mv, ok = matchedRow[target+"."+col.Name]
+					}
 					if !ok {
 						mv, ok = matchedRow[col.Name]
 					}
@@ -8347,4 +8628,1054 @@ func (e *Executor) execSelectIntoOutfile(into *sqlparser.SelectInto, colNames []
 	}
 
 	return &Result{AffectedRows: uint64(len(rows))}, nil
+}
+
+// execCreateFunction handles CREATE FUNCTION name(params) RETURNS type BEGIN...END
+func (e *Executor) execCreateFunction(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
+	rest := strings.TrimSpace(query[len("CREATE FUNCTION "):])
+
+	// Extract function name (up to first '(')
+	parenIdx := strings.Index(rest, "(")
+	if parenIdx < 0 {
+		return nil, fmt.Errorf("invalid CREATE FUNCTION syntax: missing parameter list")
+	}
+	funcName := strings.TrimSpace(rest[:parenIdx])
+	funcName = strings.Trim(funcName, "`")
+
+	// Extract params between first '(' and matching ')'
+	paramStart := parenIdx + 1
+	depth := 1
+	paramEnd := paramStart
+	for paramEnd < len(rest) && depth > 0 {
+		if rest[paramEnd] == '(' {
+			depth++
+		} else if rest[paramEnd] == ')' {
+			depth--
+		}
+		if depth > 0 {
+			paramEnd++
+		}
+	}
+	paramStr := strings.TrimSpace(rest[paramStart:paramEnd])
+	params := parseProcParams(paramStr)
+
+	// Extract RETURNS type and body
+	afterParams := rest[paramEnd+1:]
+	upperAfter := strings.ToUpper(afterParams)
+
+	// Find RETURNS keyword
+	returnsIdx := strings.Index(upperAfter, "RETURNS ")
+	returnType := ""
+	if returnsIdx >= 0 {
+		afterReturns := strings.TrimSpace(afterParams[returnsIdx+len("RETURNS "):])
+		// Return type ends at BEGIN or at a characteristic keyword
+		beginIdx := strings.Index(strings.ToUpper(afterReturns), "BEGIN")
+		if beginIdx < 0 {
+			return nil, fmt.Errorf("invalid CREATE FUNCTION syntax: missing BEGIN")
+		}
+		returnType = strings.TrimSpace(afterReturns[:beginIdx])
+		// Strip optional characteristics like CONTAINS SQL, NO SQL, READS SQL DATA, etc.
+		for _, kw := range []string{"DETERMINISTIC", "NOT DETERMINISTIC", "CONTAINS SQL", "NO SQL", "READS SQL DATA", "MODIFIES SQL DATA", "SQL SECURITY DEFINER", "SQL SECURITY INVOKER"} {
+			returnType = strings.TrimSuffix(strings.TrimSpace(returnType), kw)
+		}
+		returnType = strings.TrimSpace(returnType)
+	}
+
+	// Extract body: find BEGIN...END
+	beginIdx := strings.Index(strings.ToUpper(afterParams), "BEGIN")
+	if beginIdx < 0 {
+		return nil, fmt.Errorf("invalid CREATE FUNCTION syntax: missing BEGIN")
+	}
+	bodyStr := strings.TrimSpace(afterParams[beginIdx+len("BEGIN"):])
+	if strings.HasSuffix(strings.ToUpper(strings.TrimSpace(bodyStr)), "END") {
+		bodyStr = strings.TrimSpace(bodyStr[:len(bodyStr)-len("END")])
+	}
+
+	bodyStmts := splitTriggerBody(bodyStr)
+
+	funcDef := &catalog.FunctionDef{
+		Name:       funcName,
+		Params:     params,
+		ReturnType: returnType,
+		Body:       bodyStmts,
+	}
+	db.CreateFunction(funcDef)
+
+	return &Result{}, nil
+}
+
+// execDropFunction handles DROP FUNCTION [IF EXISTS] name
+func (e *Executor) execDropFunction(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
+	rest := strings.TrimSpace(query[len("DROP FUNCTION"):])
+	ifExists := false
+	restUpper := strings.ToUpper(strings.TrimSpace(rest))
+	if strings.HasPrefix(restUpper, "IF EXISTS") {
+		ifExists = true
+		rest = strings.TrimSpace(rest[len("IF EXISTS"):])
+		rest = strings.TrimSpace(rest)
+	}
+	name := strings.TrimRight(strings.TrimSpace(rest), ";")
+	name = strings.Trim(name, "`")
+
+	if db.GetFunction(name) == nil && !ifExists {
+		return nil, mysqlError(1305, "42000", fmt.Sprintf("FUNCTION %s.%s does not exist", e.CurrentDB, name))
+	}
+	db.DropFunction(name)
+	return &Result{}, nil
+}
+
+// cursorState holds the state of an open cursor during procedure/function execution.
+type cursorState struct {
+	rows    [][]interface{}
+	columns []string
+	pos     int
+}
+
+// callUserDefinedFunction looks up a user-defined function in the catalog and executes it.
+func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Expr, row *storage.Row) (interface{}, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, fmt.Errorf("no database")
+	}
+
+	fn := db.GetFunction(name)
+	if fn == nil {
+		return nil, fmt.Errorf("function not found: %s", name)
+	}
+
+	// Evaluate arguments
+	paramVars := make(map[string]interface{})
+	for i, param := range fn.Params {
+		if i < len(argExprs) {
+			var val interface{}
+			var evalErr error
+			if row != nil {
+				val, evalErr = e.evalRowExpr(argExprs[i], *row)
+			} else {
+				val, evalErr = e.evalExpr(argExprs[i])
+			}
+			if evalErr != nil {
+				return nil, evalErr
+			}
+			paramVars[param.Name] = val
+		}
+	}
+
+	// Execute function body with local variables, cursors, and handlers
+	return e.execRoutineBody(fn.Body, paramVars)
+}
+
+// routineContext holds shared state for a stored routine execution.
+type routineContext struct {
+	localVars          map[string]interface{}
+	cursors            map[string]*cursorState
+	cursorDefs         map[string]string
+	notFoundHandlerVar string
+	done               bool
+}
+
+// execRoutineBody executes the body of a stored procedure or function, supporting
+// DECLARE, SET, IF, WHILE, REPEAT, CURSOR, HANDLER, RETURN, and general SQL statements.
+func (e *Executor) execRoutineBody(body []string, paramVars map[string]interface{}) (interface{}, error) {
+	ctx := &routineContext{
+		localVars:  make(map[string]interface{}),
+		cursors:    make(map[string]*cursorState),
+		cursorDefs: make(map[string]string),
+	}
+	for k, v := range paramVars {
+		ctx.localVars[k] = v
+	}
+	return e.execRoutineBodyWithContext(body, ctx)
+}
+
+// execRoutineBodyWithContext executes routine body statements with shared context.
+func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext) (interface{}, error) {
+	localVars := ctx.localVars
+	cursors := ctx.cursors
+	cursorDefs := ctx.cursorDefs
+	notFoundHandlerVar := ctx.notFoundHandlerVar
+	done := ctx.done
+
+	var returnVal interface{}
+
+	for i := 0; i < len(body); i++ {
+		stmtStr := strings.TrimSpace(body[i])
+		stmtUpper := strings.ToUpper(stmtStr)
+
+		if stmtStr == "" {
+			continue
+		}
+
+		// Handle DECLARE
+		if strings.HasPrefix(stmtUpper, "DECLARE") {
+			rest := strings.TrimSpace(stmtStr[len("DECLARE"):])
+			restUpper := strings.ToUpper(rest)
+
+			// DECLARE CONTINUE HANDLER FOR NOT FOUND SET var = val
+			// DECLARE CONTINUE HANDLER FOR SQLSTATE '02000' SET var = val
+			if strings.HasPrefix(restUpper, "CONTINUE HANDLER") {
+				afterHandler := strings.TrimSpace(rest[len("CONTINUE HANDLER"):])
+				afterHandlerUpper := strings.ToUpper(afterHandler)
+				// Extract SET variable
+				setIdx := strings.Index(afterHandlerUpper, "SET ")
+				if setIdx >= 0 {
+					setPart := strings.TrimSpace(afterHandler[setIdx+4:])
+					eqIdx := strings.Index(setPart, "=")
+					if eqIdx >= 0 {
+						varName := strings.TrimSpace(setPart[:eqIdx])
+						notFoundHandlerVar = varName
+						ctx.notFoundHandlerVar = varName
+					}
+				}
+				continue
+			}
+
+			// DECLARE cursor_name CURSOR FOR select_stmt
+			if strings.Contains(restUpper, " CURSOR FOR ") {
+				parts := strings.SplitN(rest, " ", 2)
+				cursorName := strings.TrimSpace(parts[0])
+				cursorForIdx := strings.Index(restUpper, "CURSOR FOR ")
+				selectSQL := strings.TrimSpace(rest[cursorForIdx+len("CURSOR FOR "):])
+				cursorDefs[strings.ToLower(cursorName)] = selectSQL
+				continue
+			}
+
+			// DECLARE var1[,var2,...] TYPE [DEFAULT val]
+			// Parse variable declarations
+			declParts := strings.Fields(rest)
+			if len(declParts) >= 2 {
+				// Collect variable names (comma-separated) before the type keyword
+				var varNames []string
+				typeIdx := 0
+				for j, p := range declParts {
+					// Handle comma-separated variable names (e.g., "b,c")
+					subNames := strings.Split(strings.TrimRight(p, ","), ",")
+					isType := false
+					for _, name := range subNames {
+						name = strings.TrimSpace(name)
+						if name == "" {
+							continue
+						}
+						nameUpper := strings.ToUpper(name)
+						if nameUpper == "INT" || nameUpper == "INTEGER" || nameUpper == "BIGINT" ||
+							nameUpper == "SMALLINT" || nameUpper == "TINYINT" || nameUpper == "MEDIUMINT" ||
+							nameUpper == "CHAR" || nameUpper == "VARCHAR" || nameUpper == "TEXT" ||
+							nameUpper == "DECIMAL" || nameUpper == "FLOAT" || nameUpper == "DOUBLE" ||
+							nameUpper == "DATE" || nameUpper == "DATETIME" || nameUpper == "TIMESTAMP" ||
+							strings.HasPrefix(nameUpper, "CHAR(") || strings.HasPrefix(nameUpper, "VARCHAR(") {
+							isType = true
+							break
+						}
+					}
+					if isType {
+						typeIdx = j
+						break
+					}
+					for _, name := range subNames {
+						name = strings.TrimSpace(name)
+						if name != "" {
+							varNames = append(varNames, name)
+						}
+					}
+				}
+				// Find DEFAULT value
+				var defaultVal interface{}
+				defaultVal = int64(0) // MySQL default for numeric types
+				for j := typeIdx; j < len(declParts); j++ {
+					if strings.ToUpper(declParts[j]) == "DEFAULT" && j+1 < len(declParts) {
+						defStr := declParts[j+1]
+						if n, err := strconv.ParseInt(defStr, 10, 64); err == nil {
+							defaultVal = n
+						} else {
+							defaultVal = strings.Trim(defStr, "'\"")
+						}
+						break
+					}
+				}
+				for _, vn := range varNames {
+					localVars[vn] = defaultVal
+				}
+			}
+			continue
+		}
+
+		// Handle OPEN cursor_name
+		if strings.HasPrefix(stmtUpper, "OPEN ") {
+			cursorName := strings.ToLower(strings.TrimSpace(stmtStr[len("OPEN "):]))
+			selectSQL, ok := cursorDefs[cursorName]
+			if !ok {
+				return nil, fmt.Errorf("cursor '%s' is not declared", cursorName)
+			}
+			// Substitute local variables in the SELECT query
+			resolvedSQL := e.substituteLocalVars(selectSQL, localVars)
+			result, err := e.Execute(resolvedSQL)
+			if err != nil {
+				return nil, err
+			}
+			cs := &cursorState{
+				columns: result.Columns,
+				pos:     0,
+			}
+			for _, r := range result.Rows {
+				cs.rows = append(cs.rows, r)
+			}
+			cursors[cursorName] = cs
+			continue
+		}
+
+		// Handle CLOSE cursor_name
+		if strings.HasPrefix(stmtUpper, "CLOSE ") {
+			cursorName := strings.ToLower(strings.TrimSpace(stmtStr[len("CLOSE "):]))
+			delete(cursors, cursorName)
+			continue
+		}
+
+		// Handle FETCH cursor_name INTO var1, var2, ...
+		if strings.HasPrefix(stmtUpper, "FETCH ") {
+			rest := strings.TrimSpace(stmtStr[len("FETCH "):])
+			restUpper := strings.ToUpper(rest)
+			// Skip optional NEXT FROM
+			if strings.HasPrefix(restUpper, "NEXT FROM ") {
+				rest = strings.TrimSpace(rest[len("NEXT FROM "):])
+			}
+			intoIdx := strings.Index(strings.ToUpper(rest), " INTO ")
+			if intoIdx < 0 {
+				continue
+			}
+			cursorName := strings.ToLower(strings.TrimSpace(rest[:intoIdx]))
+			varsPart := strings.TrimSpace(rest[intoIdx+len(" INTO "):])
+			varNames := strings.Split(varsPart, ",")
+			for j := range varNames {
+				varNames[j] = strings.TrimSpace(varNames[j])
+			}
+
+			cs, ok := cursors[cursorName]
+			if !ok {
+				// Cursor not open - trigger NOT FOUND
+				if notFoundHandlerVar != "" {
+					localVars[notFoundHandlerVar] = int64(1)
+					done = true
+				}
+				continue
+			}
+			if cs.pos >= len(cs.rows) {
+				// No more rows - trigger NOT FOUND
+				if notFoundHandlerVar != "" {
+					localVars[notFoundHandlerVar] = int64(1)
+					done = true
+				}
+				continue
+			}
+			row := cs.rows[cs.pos]
+			cs.pos++
+			for j, vn := range varNames {
+				if j < len(row) {
+					localVars[vn] = row[j]
+				}
+			}
+			continue
+		}
+
+		// Handle RETURN value
+		if strings.HasPrefix(stmtUpper, "RETURN ") {
+			exprStr := strings.TrimSpace(stmtStr[len("RETURN "):])
+			exprStr = strings.TrimRight(exprStr, ";")
+			// Try to evaluate as a local variable first
+			if val, ok := localVars[exprStr]; ok {
+				return val, nil
+			}
+			// Try to evaluate as an expression
+			val, err := e.evaluateExprWithVars(exprStr, localVars)
+			if err != nil {
+				return nil, err
+			}
+			return val, nil
+		}
+
+		// Handle SET statements with local variable substitution
+		if strings.HasPrefix(stmtUpper, "SET ") {
+			setPart := strings.TrimSpace(stmtStr[4:])
+			eqIdx := strings.Index(setPart, "=")
+			if eqIdx >= 0 {
+				varName := strings.TrimSpace(setPart[:eqIdx])
+				valStr := strings.TrimSpace(setPart[eqIdx+1:])
+				// Evaluate expression
+				val, err := e.evaluateExprWithVars(valStr, localVars)
+				if err != nil {
+					// Fall back to Execute
+					resolvedSQL := e.substituteLocalVars(stmtStr, localVars)
+					e.Execute(resolvedSQL) //nolint:errcheck
+				} else {
+					localVars[varName] = val
+				}
+			} else {
+				resolvedSQL := e.substituteLocalVars(stmtStr, localVars)
+				e.Execute(resolvedSQL) //nolint:errcheck
+			}
+			continue
+		}
+
+		// Handle IF...THEN...ELSEIF...ELSE...END IF (may span multiple body statements)
+		if strings.HasPrefix(stmtUpper, "IF ") {
+			// Collect the full IF block, tracking nesting
+			ifBlock := stmtStr
+			ifDepth := countOccurrences(strings.ToUpper(ifBlock), "IF ") - countOccurrences(strings.ToUpper(ifBlock), "END IF")
+			for ifDepth > 0 && i+1 < len(body) {
+				i++
+				ifBlock += ";\n" + body[i]
+				ifDepth += countOccurrences(strings.ToUpper(body[i]), "IF ") - countOccurrences(strings.ToUpper(body[i]), "END IF")
+			}
+			_, retVal, err := e.execIfBlockCtx(ifBlock, ctx)
+			if err != nil {
+				return nil, err
+			}
+			if retVal != nil {
+				return retVal, nil
+			}
+			continue
+		}
+
+		// Handle REPEAT...UNTIL...END REPEAT
+		if strings.HasPrefix(stmtUpper, "REPEAT") {
+			// Collect the full REPEAT block
+			repeatBlock := stmtStr
+			for !strings.HasSuffix(strings.ToUpper(strings.TrimSpace(repeatBlock)), "END REPEAT") && i+1 < len(body) {
+				i++
+				repeatBlock += ";\n" + body[i]
+			}
+			retVal, err := e.execRepeatBlockCtx(repeatBlock, ctx)
+			if err != nil {
+				return nil, err
+			}
+			if retVal != nil {
+				return retVal, nil
+			}
+			continue
+		}
+
+		// Handle WHILE...DO...END WHILE
+		if strings.HasPrefix(stmtUpper, "WHILE ") {
+			whileBlock := stmtStr
+			for !strings.HasSuffix(strings.ToUpper(strings.TrimSpace(whileBlock)), "END WHILE") && i+1 < len(body) {
+				i++
+				whileBlock += ";\n" + body[i]
+			}
+			retVal, err := e.execWhileBlockCtx(whileBlock, ctx)
+			if err != nil {
+				return nil, err
+			}
+			if retVal != nil {
+				return retVal, nil
+			}
+			continue
+		}
+
+		// Handle SELECT ... INTO
+		if strings.HasPrefix(stmtUpper, "SELECT") && strings.Contains(stmtUpper, " INTO ") {
+			err := e.execSelectIntoForRoutine(stmtStr, localVars)
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		// General SQL statement - substitute local variables and execute
+		resolvedSQL := e.substituteLocalVars(stmtStr, localVars)
+		_, err := e.Execute(resolvedSQL)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	_ = done
+	return returnVal, nil
+}
+
+// substituteLocalVars replaces local variable references in a SQL string with their values.
+func (e *Executor) substituteLocalVars(sql string, vars map[string]interface{}) string {
+	result := sql
+	// Sort variable names by length descending to avoid partial replacements
+	type kv struct {
+		key string
+		val interface{}
+	}
+	var sorted []kv
+	for k, v := range vars {
+		sorted = append(sorted, kv{k, v})
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return len(sorted[i].key) > len(sorted[j].key)
+	})
+	for _, pair := range sorted {
+		valStr := "NULL"
+		if pair.val != nil {
+			valStr = fmt.Sprintf("%v", pair.val)
+		}
+		// Replace variable references that appear as standalone words
+		result = replaceWordBoundary(result, pair.key, valStr)
+	}
+	return result
+}
+
+// replaceWordBoundary replaces occurrences of word in s only when they appear at word boundaries.
+func replaceWordBoundary(s, word, replacement string) string {
+	var result strings.Builder
+	i := 0
+	wordLen := len(word)
+	for i < len(s) {
+		// Skip quoted strings
+		if s[i] == '\'' || s[i] == '"' || s[i] == '`' {
+			q := s[i]
+			result.WriteByte(q)
+			i++
+			for i < len(s) && s[i] != q {
+				result.WriteByte(s[i])
+				i++
+			}
+			if i < len(s) {
+				result.WriteByte(s[i])
+				i++
+			}
+			continue
+		}
+		if i+wordLen <= len(s) && strings.EqualFold(s[i:i+wordLen], word) {
+			// Check word boundary before
+			if i > 0 {
+				ch := s[i-1]
+				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (ch >= '0' && ch <= '9') || ch == '@' {
+					result.WriteByte(s[i])
+					i++
+					continue
+				}
+			}
+			// Check word boundary after
+			end := i + wordLen
+			if end < len(s) {
+				ch := s[end]
+				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (ch >= '0' && ch <= '9') {
+					result.WriteByte(s[i])
+					i++
+					continue
+				}
+			}
+			result.WriteString(replacement)
+			i += wordLen
+		} else {
+			result.WriteByte(s[i])
+			i++
+		}
+	}
+	return result.String()
+}
+
+// evaluateExprWithVars evaluates a simple expression string, substituting local variables.
+func (e *Executor) evaluateExprWithVars(exprStr string, vars map[string]interface{}) (interface{}, error) {
+	resolved := e.substituteLocalVars(exprStr, vars)
+	// Try to parse and evaluate as a SQL expression
+	selectSQL := "SELECT " + resolved
+	result, err := e.Execute(selectSQL)
+	if err != nil {
+		return nil, err
+	}
+	if result != nil && len(result.Rows) > 0 && len(result.Rows[0]) > 0 {
+		return result.Rows[0][0], nil
+	}
+	return nil, nil
+}
+
+// execSelectIntoForRoutine handles SELECT ... INTO inside a stored routine,
+// properly extracting INTO variable names before substituting local vars.
+func (e *Executor) execSelectIntoForRoutine(stmtStr string, localVars map[string]interface{}) error {
+	upper := strings.ToUpper(stmtStr)
+	intoIdx := strings.Index(upper, " INTO ")
+	if intoIdx < 0 {
+		return nil
+	}
+
+	afterInto := stmtStr[intoIdx+len(" INTO "):]
+	// Extract variable names (they end at a keyword)
+	var varNames []string
+	var restOfQuery string
+	for _, kw := range []string{" FROM ", " WHERE ", " GROUP ", " ORDER ", " LIMIT ", " HAVING "} {
+		kwIdx := strings.Index(strings.ToUpper(afterInto), kw)
+		if kwIdx >= 0 {
+			varPart := strings.TrimSpace(afterInto[:kwIdx])
+			varNames = strings.Split(varPart, ",")
+			restOfQuery = afterInto[kwIdx:]
+			break
+		}
+	}
+	if len(varNames) == 0 {
+		varPart := strings.TrimSpace(afterInto)
+		varNames = strings.Split(varPart, ",")
+	}
+	for j := range varNames {
+		varNames[j] = strings.TrimSpace(varNames[j])
+	}
+
+	// Build SELECT without INTO, then substitute vars only in that part
+	selectPart := stmtStr[:intoIdx]
+	rewrittenSQL := selectPart + restOfQuery
+	// Substitute local vars in the rewritten SQL
+	resolvedSQL := e.substituteLocalVars(rewrittenSQL, localVars)
+
+	result, err := e.Execute(resolvedSQL)
+	if err != nil {
+		return err
+	}
+
+	if result != nil && len(result.Rows) > 0 {
+		row := result.Rows[0]
+		for j, vn := range varNames {
+			if j < len(row) {
+				localVars[vn] = row[j]
+			}
+		}
+	}
+
+	return nil
+}
+
+// execSelectIntoLocal handles SELECT ... INTO local_var inside a routine body.
+func (e *Executor) execSelectIntoLocal(stmtStr string, localVars map[string]interface{}) error {
+	upper := strings.ToUpper(stmtStr)
+	intoIdx := strings.Index(upper, " INTO ")
+	if intoIdx < 0 {
+		return nil
+	}
+
+	afterInto := stmtStr[intoIdx+len(" INTO "):]
+	// The variable names end at the next keyword
+	var varNames []string
+	var restOfQuery string
+	for _, kw := range []string{" FROM ", " WHERE ", " GROUP ", " ORDER ", " LIMIT ", " HAVING "} {
+		kwIdx := strings.Index(strings.ToUpper(afterInto), kw)
+		if kwIdx >= 0 {
+			varPart := strings.TrimSpace(afterInto[:kwIdx])
+			varNames = strings.Split(varPart, ",")
+			restOfQuery = afterInto[kwIdx:]
+			break
+		}
+	}
+	if len(varNames) == 0 {
+		varPart := strings.TrimSpace(afterInto)
+		varNames = strings.Split(varPart, ",")
+	}
+
+	for j := range varNames {
+		varNames[j] = strings.TrimSpace(varNames[j])
+	}
+
+	// Build SELECT without INTO
+	selectPart := stmtStr[:intoIdx]
+	rewrittenSQL := selectPart + restOfQuery
+
+	result, err := e.Execute(rewrittenSQL)
+	if err != nil {
+		return err
+	}
+
+	if result != nil && len(result.Rows) > 0 {
+		row := result.Rows[0]
+		for j, vn := range varNames {
+			if j < len(row) {
+				localVars[vn] = row[j]
+			}
+		}
+	}
+
+	return nil
+}
+
+// execIfBlockCtx executes an IF block with shared routine context.
+func (e *Executor) execIfBlockCtx(block string, ctx *routineContext) (bool, interface{}, error) {
+	return e.execIfBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done)
+}
+
+// execIfBlock executes an IF...THEN...ELSEIF...ELSE...END IF block.
+func (e *Executor) execIfBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool) (bool, interface{}, error) {
+	trimmed := strings.TrimSpace(block)
+	upper := strings.ToUpper(trimmed)
+
+	// Remove trailing END IF (only the outermost)
+	if strings.HasSuffix(upper, "END IF") {
+		trimmed = strings.TrimSpace(trimmed[:len(trimmed)-len("END IF")])
+		// Also remove trailing semicolon if present
+		trimmed = strings.TrimSpace(strings.TrimRight(trimmed, ";"))
+	}
+
+	// Find the first THEN keyword (at the top level, not inside a nested IF)
+	thenIdx := findTopLevelKeyword(trimmed, " THEN")
+	if thenIdx < 0 {
+		return false, nil, nil
+	}
+
+	condStr := strings.TrimSpace(trimmed[3:thenIdx]) // skip "IF "
+	bodyAfterThen := strings.TrimSpace(trimmed[thenIdx+len(" THEN"):])
+
+	// Find top-level ELSE (not inside nested IF/END IF)
+	thenBody, elseBody, hasElse := splitAtTopLevelElse(bodyAfterThen)
+
+	// Evaluate condition
+	condResolved := e.substituteLocalVars(condStr, localVars)
+	condVal, err := e.evaluateExprWithVars(condResolved, map[string]interface{}{})
+	if err != nil {
+		return false, nil, err
+	}
+
+	// Build a temporary context for the block execution that shares the same state
+	blockCtx := &routineContext{
+		localVars:          localVars,
+		cursors:            cursors,
+		cursorDefs:         cursorDefs,
+		notFoundHandlerVar: notFoundHandlerVar,
+		done:               *done,
+	}
+
+	if isTruthy(condVal) {
+		stmts := splitTriggerBody(thenBody)
+		retVal, err := e.execRoutineBodyWithContext(stmts, blockCtx)
+		if err != nil {
+			return false, nil, err
+		}
+		return true, retVal, nil
+	} else if hasElse {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(elseBody)), "IF ") {
+			// ELSEIF case: wrap in IF...END IF and recurse
+			ifBlock := strings.TrimSpace(elseBody)
+			if !strings.HasSuffix(strings.ToUpper(strings.TrimSpace(ifBlock)), "END IF") {
+				ifBlock += "\nEND IF"
+			}
+			return e.execIfBlock(ifBlock, localVars, cursors, cursorDefs, notFoundHandlerVar, done)
+		}
+		stmts := splitTriggerBody(elseBody)
+		retVal, err := e.execRoutineBodyWithContext(stmts, blockCtx)
+		if err != nil {
+			return false, nil, err
+		}
+		return true, retVal, nil
+	}
+
+	return false, nil, nil
+}
+
+// findTopLevelKeyword finds a keyword at the top level (not inside nested IF/END IF blocks).
+func findTopLevelKeyword(s, keyword string) int {
+	upper := strings.ToUpper(s)
+	return strings.Index(upper, keyword)
+}
+
+// splitAtTopLevelElse splits body at the top-level ELSE keyword, respecting nested IF blocks.
+func splitAtTopLevelElse(body string) (thenBody, elseBody string, hasElse bool) {
+	upper := strings.ToUpper(body)
+	depth := 0
+
+	for i := 0; i < len(upper); i++ {
+		// Track IF nesting
+		if i+3 <= len(upper) && upper[i:i+3] == "IF " {
+			if i == 0 || !isAlphaNum(body[i-1]) {
+				// Make sure it's not ELSEIF or END IF
+				if i < 4 || upper[i-4:i] != "END " {
+					if i < 4 || !strings.HasSuffix(upper[:i], "ELSE") {
+						depth++
+					}
+				}
+			}
+		}
+		if i+6 <= len(upper) && upper[i:i+6] == "END IF" {
+			if i == 0 || !isAlphaNum(body[i-1]) {
+				depth--
+			}
+		}
+
+		// Look for ELSE at depth 0
+		if depth == 0 && i+4 <= len(upper) && upper[i:i+4] == "ELSE" {
+			if (i == 0 || !isAlphaNum(body[i-1])) && (i+4 >= len(upper) || !isAlphaNum(body[i+4])) {
+				// Make sure it's not ELSEIF
+				if i+6 <= len(upper) && upper[i:i+6] == "ELSEIF" {
+					// It's ELSEIF - treat as ELSE + IF
+					thenBody = strings.TrimSpace(body[:i])
+					elseBody = strings.TrimSpace(body[i+4:]) // skip ELSE, leave IF
+					return thenBody, elseBody, true
+				}
+				thenBody = strings.TrimSpace(body[:i])
+				elseBody = strings.TrimSpace(body[i+4:]) // skip "ELSE"
+				return thenBody, elseBody, true
+			}
+		}
+	}
+
+	return body, "", false
+}
+
+// execRepeatBlockCtx executes a REPEAT block with shared routine context.
+func (e *Executor) execRepeatBlockCtx(block string, ctx *routineContext) (interface{}, error) {
+	return e.execRepeatBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done)
+}
+
+// execRepeatBlock executes a REPEAT...UNTIL...END REPEAT block.
+func (e *Executor) execRepeatBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool) (interface{}, error) {
+	upper := strings.ToUpper(strings.TrimSpace(block))
+
+	// Remove REPEAT prefix and END REPEAT suffix
+	bodyStr := strings.TrimSpace(block)
+	if strings.HasPrefix(upper, "REPEAT") {
+		bodyStr = strings.TrimSpace(bodyStr[len("REPEAT"):])
+	}
+
+	// Find UNTIL ... END REPEAT
+	bodyUpper := strings.ToUpper(bodyStr)
+	untilIdx := strings.LastIndex(bodyUpper, "UNTIL ")
+	if untilIdx < 0 {
+		return nil, fmt.Errorf("REPEAT without UNTIL")
+	}
+
+	loopBody := strings.TrimSpace(bodyStr[:untilIdx])
+	afterUntil := strings.TrimSpace(bodyStr[untilIdx+len("UNTIL "):])
+	// Remove trailing END REPEAT
+	endRepeatIdx := strings.LastIndex(strings.ToUpper(afterUntil), "END REPEAT")
+	condStr := afterUntil
+	if endRepeatIdx >= 0 {
+		condStr = strings.TrimSpace(afterUntil[:endRepeatIdx])
+	}
+
+	blockCtx := &routineContext{
+		localVars:          localVars,
+		cursors:            cursors,
+		cursorDefs:         cursorDefs,
+		notFoundHandlerVar: notFoundHandlerVar,
+		done:               *done,
+	}
+	for iterations := 0; iterations < 10000; iterations++ {
+		// Execute loop body
+		stmts := splitTriggerBody(loopBody)
+		retVal, err := e.execRoutineBodyWithContext(stmts, blockCtx)
+		if err != nil {
+			return nil, err
+		}
+		if retVal != nil {
+			return retVal, nil
+		}
+
+		// Evaluate UNTIL condition
+		condResolved := e.substituteLocalVars(condStr, localVars)
+		condVal, err := e.evaluateExprWithVars(condResolved, map[string]interface{}{})
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(condVal) {
+			break
+		}
+	}
+
+	return nil, nil
+}
+
+// execWhileBlockCtx executes a WHILE block with shared routine context.
+func (e *Executor) execWhileBlockCtx(block string, ctx *routineContext) (interface{}, error) {
+	return e.execWhileBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done)
+}
+
+// execWhileBlock executes a WHILE...DO...END WHILE block.
+func (e *Executor) execWhileBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool) (interface{}, error) {
+	upper := strings.ToUpper(strings.TrimSpace(block))
+
+	bodyStr := strings.TrimSpace(block)
+	if strings.HasPrefix(upper, "WHILE ") {
+		bodyStr = strings.TrimSpace(bodyStr[len("WHILE "):])
+	}
+
+	// Find DO keyword
+	doIdx := strings.Index(strings.ToUpper(bodyStr), " DO")
+	if doIdx < 0 {
+		return nil, fmt.Errorf("WHILE without DO")
+	}
+	condStr := strings.TrimSpace(bodyStr[:doIdx])
+	afterDo := strings.TrimSpace(bodyStr[doIdx+len(" DO"):])
+
+	// Remove trailing END WHILE
+	bodyUpper := strings.ToUpper(afterDo)
+	endWhileIdx := strings.LastIndex(bodyUpper, "END WHILE")
+	loopBody := afterDo
+	if endWhileIdx >= 0 {
+		loopBody = strings.TrimSpace(afterDo[:endWhileIdx])
+	}
+
+	blockCtx := &routineContext{
+		localVars:          localVars,
+		cursors:            cursors,
+		cursorDefs:         cursorDefs,
+		notFoundHandlerVar: notFoundHandlerVar,
+		done:               *done,
+	}
+	for iterations := 0; iterations < 10000; iterations++ {
+		// Evaluate condition
+		condResolved := e.substituteLocalVars(condStr, localVars)
+		condVal, err := e.evaluateExprWithVars(condResolved, map[string]interface{}{})
+		if err != nil {
+			return nil, err
+		}
+		if !isTruthy(condVal) {
+			break
+		}
+
+		// Execute loop body
+		stmts := splitTriggerBody(loopBody)
+		retVal, err := e.execRoutineBodyWithContext(stmts, blockCtx)
+		if err != nil {
+			return nil, err
+		}
+		if retVal != nil {
+			return retVal, nil
+		}
+	}
+
+	return nil, nil
+}
+
+// resolveTableNameDB resolves a table name that may be qualified with a database name (d1.t1).
+// Returns (dbName, tableName).
+func resolveTableNameDB(name, currentDB string) (string, string) {
+	name = strings.Trim(name, "`")
+	if idx := strings.Index(name, "."); idx >= 0 {
+		dbPart := strings.Trim(name[:idx], "`")
+		tablePart := strings.Trim(name[idx+1:], "`")
+		return dbPart, tablePart
+	}
+	return currentDB, name
+}
+
+// isMultiTableUpdate checks if an UPDATE statement involves multiple tables (join or comma-separated).
+func isMultiTableUpdate(stmt *sqlparser.Update) bool {
+	if len(stmt.TableExprs) > 1 {
+		return true
+	}
+	if len(stmt.TableExprs) == 1 {
+		if _, ok := stmt.TableExprs[0].(*sqlparser.JoinTableExpr); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// execMultiTableUpdate handles multi-table UPDATE statements.
+func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error) {
+	// Build cross product of all tables
+	var allRows []storage.Row
+	var err error
+
+	if len(stmt.TableExprs) == 1 {
+		allRows, err = e.buildFromExpr(stmt.TableExprs[0])
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		allRows, err = e.buildFromExpr(stmt.TableExprs[0])
+		if err != nil {
+			return nil, err
+		}
+		for i := 1; i < len(stmt.TableExprs); i++ {
+			rightRows, err := e.buildFromExpr(stmt.TableExprs[i])
+			if err != nil {
+				return nil, err
+			}
+			allRows = crossProduct(allRows, rightRows)
+		}
+	}
+
+	// Filter by WHERE
+	var matchedRows []storage.Row
+	for _, row := range allRows {
+		if stmt.Where != nil {
+			match, err := e.evalWhere(stmt.Where.Expr, row)
+			if err != nil {
+				return nil, err
+			}
+			if !match {
+				continue
+			}
+		}
+		matchedRows = append(matchedRows, row)
+	}
+
+	var affected uint64
+
+	for _, mrow := range matchedRows {
+		for _, upd := range stmt.Exprs {
+			// Use the AST ColName to resolve the target
+			colName := upd.Name.Name.String()
+			qualStr := sqlparser.String(upd.Name.Qualifier)
+			qualStr = strings.Trim(qualStr, "`")
+
+			var targetDB, targetTable string
+			if strings.Contains(qualStr, ".") {
+				// db.table qualifier
+				parts := strings.SplitN(qualStr, ".", 2)
+				targetDB = parts[0]
+				targetTable = parts[1]
+			} else if qualStr != "" {
+				targetTable = qualStr
+				targetDB = e.CurrentDB
+			} else {
+				targetDB = e.CurrentDB
+				targetTable = ""
+			}
+
+			// Evaluate new value
+			val, err := e.evalRowExpr(upd.Expr, mrow)
+			if err != nil {
+				return nil, err
+			}
+
+			tbl, err := e.Storage.GetTable(targetDB, targetTable)
+			if err != nil {
+				continue
+			}
+
+			// Build alias for row matching
+			targetAlias := targetTable
+			if targetDB != e.CurrentDB {
+				targetAlias = targetDB + "." + targetTable
+			}
+
+			tbl.Lock()
+			for i, srow := range tbl.Rows {
+				isMatch := true
+				matchedCols := 0
+				for k, v := range srow {
+					qualKey := targetAlias + "." + k
+					if mv, ok := mrow[qualKey]; ok {
+						if fmt.Sprintf("%v", mv) != fmt.Sprintf("%v", v) {
+							isMatch = false
+							break
+						}
+						matchedCols++
+					} else if mv, ok := mrow[targetTable+"."+k]; ok {
+						if fmt.Sprintf("%v", mv) != fmt.Sprintf("%v", v) {
+							isMatch = false
+							break
+						}
+						matchedCols++
+					}
+				}
+				if isMatch && matchedCols > 0 {
+					tbl.Rows[i][colName] = val
+				}
+			}
+			tbl.Unlock()
+		}
+		affected++
+	}
+
+	return &Result{AffectedRows: affected}, nil
 }
