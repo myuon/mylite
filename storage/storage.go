@@ -108,6 +108,16 @@ func (t *Table) Insert(row Row) (int64, error) {
 		}
 	}
 
+	// Check NOT NULL constraints
+	for _, col := range t.Def.Columns {
+		if !col.Nullable && !col.AutoIncrement {
+			v, exists := row[col.Name]
+			if !exists || v == nil {
+				return 0, fmt.Errorf("ERROR 1048 (23000): Column '%s' cannot be null", col.Name)
+			}
+		}
+	}
+
 	t.Rows = append(t.Rows, row)
 	return lastInsertID, nil
 }
