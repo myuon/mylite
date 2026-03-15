@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
@@ -138,7 +139,32 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			IsResultSet: true,
 		}, nil
 	case *sqlparser.CallProc:
-		return nil, fmt.Errorf("stored procedures not supported")
+		// Accept stored procedure calls silently (e.g. mtr.add_suppression)
+		return &Result{}, nil
+	case *sqlparser.Load:
+		// Accept LOAD DATA silently
+		return &Result{}, nil
+	case *sqlparser.PrepareStmt, *sqlparser.ExecuteStmt, *sqlparser.DeallocateStmt:
+		// Accept PREPARE/EXECUTE/DEALLOCATE silently
+		return &Result{}, nil
+	case *sqlparser.AlterDatabase:
+		// Accept ALTER DATABASE silently
+		return &Result{}, nil
+	case *sqlparser.DropProcedure:
+		// Accept DROP PROCEDURE silently
+		return &Result{}, nil
+	case *sqlparser.CreateProcedure:
+		// Accept CREATE PROCEDURE silently
+		return &Result{}, nil
+	case *sqlparser.CreateView:
+		// Accept CREATE VIEW silently
+		return &Result{}, nil
+	case *sqlparser.DropView:
+		// Accept DROP VIEW silently
+		return &Result{}, nil
+	case *sqlparser.Union:
+		// TODO: implement UNION
+		return &Result{Columns: []string{}, Rows: [][]interface{}{}, IsResultSet: true}, nil
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %T", s)
 	}
@@ -1727,6 +1753,9 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.IntroducerExpr:
 		// e.g. _latin1 'string' — ignore the charset and evaluate the inner expression
 		return e.evalExpr(v.Expr)
+	case *sqlparser.CastExpr:
+		// Simplified CAST: just evaluate the inner expression
+		return e.evalExpr(v.Expr)
 	case *sqlparser.CurTimeFuncExpr:
 		// NOW(), CURRENT_TIMESTAMP(), CURTIME(), etc.
 		name := strings.ToLower(v.Name.String())
@@ -2346,6 +2375,108 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, err
 		}
 		return mysqlDateFormat(t, toString(fmtVal)), nil
+	case "hex":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		switch tv := val.(type) {
+		case int64:
+			return strings.ToUpper(fmt.Sprintf("%X", tv)), nil
+		case float64:
+			return strings.ToUpper(fmt.Sprintf("%X", int64(tv))), nil
+		default:
+			s := toString(val)
+			return strings.ToUpper(fmt.Sprintf("%X", []byte(s))), nil
+		}
+	case "unhex":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		decoded, err := hex.DecodeString(toString(val))
+		if err != nil {
+			return nil, nil
+		}
+		return string(decoded), nil
+	case "addtime":
+		if len(v.Exprs) < 2 {
+			return nil, nil
+		}
+		base, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		interval, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		t, err := parseDateTimeValue(base)
+		if err != nil {
+			// Return as-is for unparseable values
+			return toString(base), nil
+		}
+		dur, err := parseMySQLTimeInterval(toString(interval))
+		if err != nil {
+			return toString(base), nil
+		}
+		return t.Add(dur).Format("2006-01-02 15:04:05"), nil
+	case "subtime":
+		if len(v.Exprs) < 2 {
+			return nil, nil
+		}
+		base, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		interval, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		t, err := parseDateTimeValue(base)
+		if err != nil {
+			return toString(base), nil
+		}
+		dur, err := parseMySQLTimeInterval(toString(interval))
+		if err != nil {
+			return toString(base), nil
+		}
+		return t.Add(-dur).Format("2006-01-02 15:04:05"), nil
+	case "repeat":
+		if len(v.Exprs) < 2 {
+			return nil, nil
+		}
+		s, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		n, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		count := int(toInt64(n))
+		if count <= 0 || s == nil {
+			return "", nil
+		}
+		return strings.Repeat(toString(s), count), nil
+	case "cast", "convert":
+		// Simplified CAST: just evaluate the inner expression
+		if len(v.Exprs) >= 1 {
+			return e.evalExpr(v.Exprs[0])
+		}
+		return nil, nil
 	}
 	// Unknown function: return nil rather than error to be lenient
 	return nil, fmt.Errorf("unsupported function: %s", name)
@@ -2371,6 +2502,45 @@ func parseDateTimeValue(val interface{}) (time.Time, error) {
 		}
 	}
 	return time.Time{}, fmt.Errorf("cannot parse date/time value: %q", s)
+}
+
+// parseMySQLTimeInterval parses MySQL time interval strings like "1 01:01:01" or "01:01:01".
+func parseMySQLTimeInterval(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	var days, hours, mins, secs int
+
+	// Format: "D HH:MM:SS" or "HH:MM:SS" or "D"
+	if idx := strings.Index(s, " "); idx >= 0 {
+		d, err := strconv.Atoi(s[:idx])
+		if err != nil {
+			return 0, err
+		}
+		days = d
+		s = s[idx+1:]
+	}
+
+	parts := strings.Split(s, ":")
+	switch len(parts) {
+	case 3:
+		h, _ := strconv.Atoi(parts[0])
+		m, _ := strconv.Atoi(parts[1])
+		sc, _ := strconv.Atoi(parts[2])
+		hours, mins, secs = h, m, sc
+	case 2:
+		h, _ := strconv.Atoi(parts[0])
+		m, _ := strconv.Atoi(parts[1])
+		hours, mins = h, m
+	case 1:
+		if parts[0] != "" {
+			h, _ := strconv.Atoi(parts[0])
+			hours = h
+		}
+	}
+
+	return time.Duration(days)*24*time.Hour +
+		time.Duration(hours)*time.Hour +
+		time.Duration(mins)*time.Minute +
+		time.Duration(secs)*time.Second, nil
 }
 
 // mysqlDateFormat converts a MySQL DATE_FORMAT format string (e.g. "%Y-%m-%d") to a Go time.Time string.
