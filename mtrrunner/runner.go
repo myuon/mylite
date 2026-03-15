@@ -175,9 +175,11 @@ func (ctx *execContext) executeLines(lines []string) error {
 			continue
 		}
 
-		// Comments starting with # are echoed to output
+		// Comments starting with # are echoed to output (only when query log is enabled)
 		if strings.HasPrefix(trimmed, "#") {
-			ctx.output.WriteString(line + "\n")
+			if ctx.queryLogEnabled {
+				ctx.output.WriteString(line + "\n")
+			}
 			i++
 			continue
 		}
@@ -230,9 +232,11 @@ func (ctx *execContext) executeLines(lines []string) error {
 			l := lines[i]
 			t := strings.TrimSpace(l)
 
-			// Output comments within statement
+			// Output comments within statement (only when query log is enabled)
 			if strings.HasPrefix(t, "#") {
-				ctx.output.WriteString(l + "\n")
+				if ctx.queryLogEnabled {
+					ctx.output.WriteString(l + "\n")
+				}
 				i++
 				continue
 			}
@@ -425,6 +429,10 @@ func (ctx *execContext) executeQuery(stmt string) error {
 	rows, err := ctx.db.Query(stmt)
 	if err != nil {
 		if ctx.expectedError != "" {
+			// Output the error message (mysqltest format)
+			if ctx.resultLogEnabled {
+				ctx.output.WriteString(formatMySQLError(err) + "\n")
+			}
 			ctx.expectedError = ""
 			return nil
 		}
@@ -494,6 +502,9 @@ func (ctx *execContext) executeExec(stmt string) error {
 	_, err := ctx.db.Exec(stmt)
 	if err != nil {
 		if ctx.expectedError != "" {
+			if ctx.resultLogEnabled {
+				ctx.output.WriteString(formatMySQLError(err) + "\n")
+			}
 			ctx.expectedError = ""
 			return nil
 		}
@@ -718,6 +729,25 @@ func extractBareDirective(trimmed string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// formatMySQLError formats an error into mysqltest expected format.
+// MySQL errors look like: "ERROR SQLSTATE (ERRNO): message"
+// e.g. "ERROR 23000: Column 'c1' cannot be null"
+func formatMySQLError(err error) string {
+	msg := err.Error()
+	// go-mysql-org errors have format: "Error <code> (<state>): <message>"
+	re := regexp.MustCompile(`Error (\d+) \(([^)]+)\): (.*)`)
+	if m := re.FindStringSubmatch(msg); m != nil {
+		// The nested error format from mylite: "ERROR 1064 (42000): ERROR <code> (<state>): <msg>"
+		innerRe := regexp.MustCompile(`ERROR (\d+) \(([^)]+)\): (.*)`)
+		innerMsg := m[3]
+		if im := innerRe.FindStringSubmatch(innerMsg); im != nil {
+			return fmt.Sprintf("ERROR %s: %s", im[2], im[3])
+		}
+		return fmt.Sprintf("ERROR %s: %s", m[2], m[3])
+	}
+	return "ERROR HY000: " + msg
 }
 
 // splitStatements splits a string that may contain multiple SQL statements
