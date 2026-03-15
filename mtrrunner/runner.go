@@ -223,6 +223,8 @@ func (ctx *execContext) executeLines(lines []string) error {
 			delim = ctx.delimiter
 		}
 
+		// Collect raw lines for echoing and build SQL statement
+		var rawLines []string
 		stmt := ""
 		for i < len(lines) {
 			l := lines[i]
@@ -245,19 +247,27 @@ func (ctx *execContext) executeLines(lines []string) error {
 
 			// Strip inline comments (# outside quotes)
 			t = stripInlineComment(t)
+			rawLines = append(rawLines, t)
 
 			if strings.HasSuffix(t, delim) {
 				stmt += strings.TrimSuffix(t, delim)
 				i++
 				break
 			}
-			stmt += t + " "
+			stmt += t + "\n"
 			i++
 		}
 
 		stmt = strings.TrimSpace(stmt)
 		if stmt == "" {
 			continue
+		}
+
+		// Echo the raw SQL to output (mysqltest echoes original formatting)
+		if ctx.queryLogEnabled {
+			for _, rl := range rawLines {
+				ctx.output.WriteString(rl + "\n")
+			}
 		}
 
 		// Handle multiple statements on one line (e.g. "DROP TABLE t1; SHOW TABLES")
@@ -267,7 +277,7 @@ func (ctx *execContext) executeLines(lines []string) error {
 			if s == "" {
 				continue
 			}
-			err := ctx.executeSQL(s)
+			err := ctx.executeSQLNoEcho(s)
 			if err != nil {
 				return err
 			}
@@ -388,6 +398,16 @@ func (ctx *execContext) executeSQL(stmt string) error {
 		ctx.output.WriteString(stmt + ";\n")
 	}
 
+	return ctx.executeSQLInner(stmt)
+}
+
+func (ctx *execContext) executeSQLNoEcho(stmt string) error {
+	// Variable substitution
+	stmt = ctx.substituteVars(stmt)
+	return ctx.executeSQLInner(stmt)
+}
+
+func (ctx *execContext) executeSQLInner(stmt string) error {
 	upper := strings.ToUpper(strings.TrimSpace(stmt))
 	isQuery := strings.HasPrefix(upper, "SELECT") ||
 		strings.HasPrefix(upper, "SHOW") ||
