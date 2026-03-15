@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -198,6 +199,7 @@ type execContext struct {
 	variables        map[string]string
 	delimiter        string
 	tmpDir           string // temporary directory for file operations
+	replaceColumns   map[int]string // column index (1-based) -> replacement value for next query
 	replaceResult    []string // pairs of [from, to] for --replace_result
 }
 
@@ -297,7 +299,9 @@ func (ctx *execContext) executeLines(lines []string) error {
 				}
 			}
 
-			// Strip inline comments (# outside quotes)
+			// For echoing, preserve comments before the delimiter but strip after
+			rawEcho := stripCommentAfterDelimiter(t, delim)
+			// Strip inline comments (# outside quotes) for SQL processing
 			t = stripInlineComment(t)
 
 			// When using a custom delimiter, check if this line is a DELIMITER directive
@@ -326,7 +330,7 @@ func (ctx *execContext) executeLines(lines []string) error {
 				}
 			}
 
-			rawLines = append(rawLines, t)
+			rawLines = append(rawLines, rawEcho)
 
 			// Check delimiter on stripped line, but also on original trimmed line
 			// (in case inline comment stripping removed the trailing delimiter)
@@ -484,6 +488,17 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 	case "copy_file":
 		return true, false, ctx.handleCopyFile(args)
 
+	case "replace_column":
+		// Parse column replacements: --replace_column N1 val1 N2 val2 ...
+		ctx.replaceColumns = make(map[int]string)
+		fields := strings.Fields(args)
+		for i := 0; i+1 < len(fields); i += 2 {
+			if colNum, err := strconv.Atoi(fields[i]); err == nil {
+				ctx.replaceColumns[colNum] = fields[i+1]
+			}
+		}
+		return true, false, nil
+
 	// Directives we accept but ignore
 	case "character_set", "charset":
 		return true, false, nil
@@ -494,7 +509,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"disable_session_track_info", "enable_session_track_info",
 		"connect", "connection", "disconnect",
 		"send", "reap", "sleep",
-		"replace_regex", "replace_column",
+		"replace_regex",
 		"write_file", "append_file", "cat_file",
 		"mkdir", "rmdir", "move_file",
 		"list_files", "file_exists",
@@ -620,6 +635,14 @@ func (ctx *execContext) executeQuery(stmt string) error {
 				}
 			}
 		}
+		// Apply --replace_column
+		if len(ctx.replaceColumns) > 0 {
+			for colIdx, replacement := range ctx.replaceColumns {
+				if colIdx >= 1 && colIdx <= len(parts) {
+					parts[colIdx-1] = replacement
+				}
+			}
+		}
 		resultLines = append(resultLines, strings.Join(parts, "\t"))
 	}
 
@@ -628,6 +651,8 @@ func (ctx *execContext) executeQuery(stmt string) error {
 		sort.Strings(resultLines)
 		ctx.sortResult = false
 	}
+	// Clear replace_columns after use
+	ctx.replaceColumns = nil
 
 	// Apply --replace_result to output
 	if len(ctx.replaceResult) > 0 {
@@ -706,6 +731,14 @@ func (ctx *execContext) executeQueryOrExec(stmt string) error {
 				}
 			}
 		}
+		// Apply --replace_column
+		if len(ctx.replaceColumns) > 0 {
+			for colIdx, replacement := range ctx.replaceColumns {
+				if colIdx >= 1 && colIdx <= len(parts) {
+					parts[colIdx-1] = replacement
+				}
+			}
+		}
 		resultLines = append(resultLines, strings.Join(parts, "\t"))
 	}
 
@@ -714,6 +747,8 @@ func (ctx *execContext) executeQueryOrExec(stmt string) error {
 		sort.Strings(resultLines)
 		ctx.sortResult = false
 	}
+	// Clear replace_columns after use
+	ctx.replaceColumns = nil
 
 	// Apply --replace_result to output
 	if len(ctx.replaceResult) > 0 {
@@ -1100,6 +1135,40 @@ func splitStatements(s string) []string {
 
 // stripInlineComment removes trailing # comments from a SQL line,
 // respecting quoted strings.
+// stripCommentAfterDelimiter strips inline comments (#) that appear AFTER the
+// statement delimiter. Comments before the delimiter are preserved for echoing.
+// e.g. "SET TIMESTAMP=1; # comment" → "SET TIMESTAMP=1;"
+// e.g. "ALTER FUNCTION sf1 #DET# ;" → "ALTER FUNCTION sf1 #DET# ;" (preserved)
+func stripCommentAfterDelimiter(line, delim string) string {
+	// Find the delimiter position (respecting quotes)
+	delimIdx := -1
+	inSingle := false
+	inDouble := false
+	for i, ch := range line {
+		switch ch {
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+		}
+		if !inSingle && !inDouble && strings.HasPrefix(line[i:], delim) {
+			delimIdx = i
+			// Don't break -- find the LAST delimiter on the line
+		}
+	}
+	if delimIdx < 0 {
+		// No delimiter found; strip comment as usual
+		return stripInlineComment(line)
+	}
+	// Keep everything up to and including the delimiter
+	afterDelim := line[delimIdx+len(delim):]
+	return strings.TrimRight(line[:delimIdx+len(delim)]+stripInlineComment(afterDelim), " \t")
+}
+
 func stripInlineComment(line string) string {
 	inSingle := false
 	inDouble := false

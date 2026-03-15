@@ -1280,7 +1280,7 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 	cleanLower := strings.TrimSuffix(strings.TrimSpace(lower), " unsigned")
 	cleanLower = strings.TrimSpace(cleanLower)
 	var prefix string
-	for _, p := range []string{"decimal", "double", "float"} {
+	for _, p := range []string{"decimal", "double", "float", "real"} {
 		if strings.HasPrefix(cleanLower, p+"(") {
 			prefix = p
 			break
@@ -1289,13 +1289,30 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 	if prefix == "" {
 		return v
 	}
+	// For string values, only format if the string is a valid number.
+	// Invalid strings should be returned as-is for strict mode error checking.
+	if s, ok := v.(string); ok {
+		if _, err := strconv.ParseFloat(s, 64); err != nil {
+			return v
+		}
+	}
 	var m, d int
 	if n, err := fmt.Sscanf(cleanLower, prefix+"(%d,%d)", &m, &d); err == nil && n == 2 {
 		f := toFloat(v)
 		if d == 0 {
 			return int64(f)
 		}
-		return fmt.Sprintf("%.*f", d, f)
+		if prefix == "decimal" {
+			// DECIMAL: round to d decimal places (exact arithmetic)
+			return fmt.Sprintf("%.*f", d, f)
+		}
+		// DOUBLE/FLOAT/REAL: truncate toward zero (display truncation)
+		factor := 1.0
+		for i := 0; i < d; i++ {
+			factor *= 10
+		}
+		truncated := float64(int64(f*factor)) / factor
+		return fmt.Sprintf("%.*f", d, truncated)
 	}
 	return v
 }
@@ -1812,6 +1829,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 
 	for _, valTuple := range rows {
 		row := make(storage.Row)
+		origValues := make(storage.Row) // original values before formatting (for strict mode checks)
 		for i, val := range valTuple {
 			if i >= len(colNames) {
 				break
@@ -1823,6 +1841,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				}
 				return nil, err
 			}
+			origValues[colNames[i]] = v
 			// Pad BINARY(N), format DECIMAL, validate ENUM/SET.
 			for _, col := range tbl.Def.Columns {
 				if col.Name == colNames[i] {
@@ -1977,6 +1996,12 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 									return nil, mysqlError(1366, "HY000", fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row 1", val, col.Name))
 								}
 							}
+							// Check unsigned constraint for string-typed decimal values
+							if isUnsigned {
+								if f, perr := strconv.ParseFloat(val, 64); perr == nil && f < 0 {
+									return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+								}
+							}
 						}
 						if isDecimalType && strings.Contains(colUpper, "DECIMAL") {
 							if derr := checkDecimalRange(col.Type, rv); derr != nil {
@@ -1984,10 +2009,14 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							}
 						}
 					}
-					// String length check
+					// String length check (use original value before padding/formatting)
 					isCharType := strings.Contains(colUpper, "CHAR") || strings.Contains(colUpper, "BINARY")
 					if isCharType {
-						if sv, ok := rv.(string); ok {
+						checkVal := rv
+						if ov, ok := origValues[col.Name]; ok && ov != nil {
+							checkVal = ov
+						}
+						if sv, ok := checkVal.(string); ok {
 							maxLen := extractCharLength(col.Type)
 							if maxLen > 0 && len([]rune(sv)) > maxLen {
 								return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row 1", col.Name))
@@ -1999,11 +2028,17 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					isSetType := strings.HasPrefix(strings.ToLower(col.Type), "set(")
 					if isEnumType || isSetType {
 						if sv, ok := rv.(string); ok {
-							// Check if value was modified by validateEnumSetValue
-							origRV := row[col.Name]
-							origStr, _ := origRV.(string)
-							_ = origStr
+							origStr := ""
+							if ov, ok2 := origValues[col.Name]; ok2 {
+								origStr, _ = ov.(string)
+							}
+							// ENUM: empty string is invalid (not in the allowed list)
 							if isEnumType && sv == "" {
+								return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+							}
+							// SET: if the validated value differs from original,
+							// it means some members were invalid
+							if isSetType && origStr != "" && sv != origStr {
 								return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 							}
 						}
@@ -2030,11 +2065,15 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	}
 
 	e.lastInsertID = lastInsertID
-	// Set lastAutoIncID for sql_auto_is_null (only NOT NULL auto-inc columns)
+	// Set lastAutoIncID for sql_auto_is_null.
+	// Only set for NOT NULL auto-increment columns (MySQL behavior:
+	// sql_auto_is_null only applies when the auto-increment column is NOT NULL).
 	if lastInsertID > 0 {
 		for _, col := range tbl.Def.Columns {
-			if col.AutoIncrement && !col.Nullable {
-				e.lastAutoIncID = lastInsertID
+			if col.AutoIncrement {
+				if !col.Nullable {
+					e.lastAutoIncID = lastInsertID
+				}
 				break
 			}
 		}
@@ -3316,8 +3355,13 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		return nil, fmt.Errorf("no table specified")
 	}
 
-	// Multi-table DELETE: when Targets is populated and differs from TableExprs.
-	// DELETE QUICK sets Targets but is still a single-table delete.
+	// Multi-table DELETE: when there are multiple source tables (FROM clause).
+	// Also when Targets is populated with real table names (not just modifiers like QUICK).
+	// Single-table delete always has exactly 1 TableExpr.
+	if len(stmt.TableExprs) > 1 {
+		return e.execMultiTableDeleteAST(stmt)
+	}
+	// DELETE QUICK sets Targets=[QUICK] with 1 TableExpr; that's still single-table.
 	if len(stmt.Targets) > 0 && len(stmt.Targets) != len(stmt.TableExprs) {
 		return e.execMultiTableDeleteAST(stmt)
 	}
@@ -3885,14 +3929,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			}
 			return &Result{Columns: []string{"Charset", "Description", "Default collation", "Maxlen"}, Rows: rows, IsResultSet: true}, nil
 		case sqlparser.Collation: // SHOW COLLATION
-			collations := [][]interface{}{
-				{"utf8mb4_0900_ai_ci", "utf8mb4", int64(255), "Yes", "Yes", int64(0), "NO PAD"},
-				{"utf8mb4_general_ci", "utf8mb4", int64(45), "", "Yes", int64(1), "PAD SPACE"},
-				{"utf8_general_ci", "utf8", int64(33), "Yes", "Yes", int64(1), "PAD SPACE"},
-				{"latin1_swedish_ci", "latin1", int64(8), "Yes", "Yes", int64(1), "PAD SPACE"},
-				{"ascii_general_ci", "ascii", int64(11), "Yes", "Yes", int64(1), "PAD SPACE"},
-				{"binary", "binary", int64(63), "Yes", "Yes", int64(1), "NO PAD"},
-			}
+			collations := allCollations()
 			rows := make([][]interface{}, 0)
 			for _, c := range collations {
 				if likePattern == "" || matchLike(c[0].(string), likePattern) {
@@ -6859,9 +6896,22 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 
 	switch op {
 	case sqlparser.EqualOp:
-		return fmt.Sprintf("%v", left) == fmt.Sprintf("%v", right), nil
+		// For numeric-looking strings, compare numerically
+		ls, rs := fmt.Sprintf("%v", left), fmt.Sprintf("%v", right)
+		if fl, errL := strconv.ParseFloat(ls, 64); errL == nil {
+			if fr, errR := strconv.ParseFloat(rs, 64); errR == nil {
+				return fl == fr, nil
+			}
+		}
+		return ls == rs, nil
 	case sqlparser.NotEqualOp:
-		return fmt.Sprintf("%v", left) != fmt.Sprintf("%v", right), nil
+		ls, rs := fmt.Sprintf("%v", left), fmt.Sprintf("%v", right)
+		if fl, errL := strconv.ParseFloat(ls, 64); errL == nil {
+			if fr, errR := strconv.ParseFloat(rs, 64); errR == nil {
+				return fl != fr, nil
+			}
+		}
+		return ls != rs, nil
 	case sqlparser.LessThanOp:
 		return compareNumeric(left, right) < 0, nil
 	case sqlparser.GreaterThanOp:
@@ -6875,12 +6925,24 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 }
 
 func compareNumeric(a, b interface{}) int {
-	// If both values are strings (or one is), do string comparison
+	// If both values are strings (or one is), try numeric comparison first
 	_, aIsStr := a.(string)
 	_, bIsStr := b.(string)
 	if aIsStr || bIsStr {
 		sa := toString(a)
 		sb := toString(b)
+		// If both can be parsed as numbers, compare numerically
+		fa, errA := strconv.ParseFloat(sa, 64)
+		fb, errB := strconv.ParseFloat(sb, 64)
+		if errA == nil && errB == nil {
+			if fa < fb {
+				return -1
+			}
+			if fa > fb {
+				return 1
+			}
+			return 0
+		}
 		// Normalize date/time comparisons: when one is TIME-like and
 		// the other is DATETIME-like, extract the matching part.
 		sa, sb = normalizeDateTimeForCompare(sa, sb)
@@ -8541,6 +8603,10 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 						row[colDef.Name] = v
 					}
 				}
+			}
+			// Coerce date/time values to match column type (e.g. truncate datetime to date)
+			if v, exists := row[colDef.Name]; exists && v != nil {
+				row[colDef.Name] = coerceDateTimeValue(colDef.Type, v)
 			}
 		}
 
