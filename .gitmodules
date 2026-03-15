@@ -1,0 +1,3 @@
+[submodule "testdata/dolt-mysql-tests"]
+	path = testdata/dolt-mysql-tests
+	url = https://github.com/dolthub/dolt-mysql-tests.git
