@@ -298,13 +298,38 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		columns = append(columns, colDef)
 	}
 
-	// Process index definitions for PRIMARY KEY
+	// Process index definitions
+	var indexes []catalog.IndexDef
 	for _, idx := range stmt.TableSpec.Indexes {
+		var idxCols []string
+		for _, idxCol := range idx.Columns {
+			idxCols = append(idxCols, idxCol.Column.String())
+		}
 		if idx.Info.Type == sqlparser.IndexTypePrimary {
 			primaryKeys = nil
-			for _, idxCol := range idx.Columns {
-				primaryKeys = append(primaryKeys, idxCol.Column.String())
+			primaryKeys = append(primaryKeys, idxCols...)
+		} else {
+			isUnique := idx.Info.Type == sqlparser.IndexTypeUnique
+			idxName := idx.Info.Name.String()
+			if idxName == "" {
+				idxName = idxCols[0]
 			}
+			indexes = append(indexes, catalog.IndexDef{
+				Name:    idxName,
+				Columns: idxCols,
+				Unique:  isUnique,
+			})
+		}
+	}
+
+	// Add UNIQUE KEY from column-level constraints
+	for _, col := range columns {
+		if col.Unique {
+			indexes = append(indexes, catalog.IndexDef{
+				Name:    col.Name,
+				Columns: []string{col.Name},
+				Unique:  true,
+			})
 		}
 	}
 
@@ -312,6 +337,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		Name:       tableName,
 		Columns:    columns,
 		PrimaryKey: primaryKeys,
+		Indexes:    indexes,
 	}
 
 	err = db.CreateTable(def)
@@ -1612,9 +1638,11 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		pkCols = def.PrimaryKey
 	}
 
+	hasTrailingDefs := len(pkCols) > 0 || len(def.Indexes) > 0
+
 	for i, cd := range colDefs {
 		b.WriteString(cd)
-		if i < len(colDefs)-1 || len(pkCols) > 0 {
+		if i < len(colDefs)-1 || hasTrailingDefs {
 			b.WriteString(",")
 		}
 		b.WriteString("\n")
@@ -1624,7 +1652,27 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		for i, pk := range pkCols {
 			quotedPK[i] = fmt.Sprintf("`%s`", pk)
 		}
-		b.WriteString(fmt.Sprintf("  PRIMARY KEY (%s)\n", strings.Join(quotedPK, ",")))
+		hasMore := len(def.Indexes) > 0
+		b.WriteString(fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(quotedPK, ",")))
+		if hasMore {
+			b.WriteString(",")
+		}
+		b.WriteString("\n")
+	}
+	for i, idx := range def.Indexes {
+		quotedCols := make([]string, len(idx.Columns))
+		for j, c := range idx.Columns {
+			quotedCols[j] = fmt.Sprintf("`%s`", c)
+		}
+		if idx.Unique {
+			b.WriteString(fmt.Sprintf("  UNIQUE KEY `%s` (%s)", idx.Name, strings.Join(quotedCols, ",")))
+		} else {
+			b.WriteString(fmt.Sprintf("  KEY `%s` (%s)", idx.Name, strings.Join(quotedCols, ",")))
+		}
+		if i < len(def.Indexes)-1 {
+			b.WriteString(",")
+		}
+		b.WriteString("\n")
 	}
 
 	trailer := ") ENGINE=InnoDB"

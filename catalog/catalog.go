@@ -16,11 +16,19 @@ type ColumnDef struct {
 	Unique        bool
 }
 
+// IndexDef represents an index definition.
+type IndexDef struct {
+	Name    string
+	Columns []string
+	Unique  bool
+}
+
 // TableDef represents a table definition.
 type TableDef struct {
 	Name       string
 	Columns    []ColumnDef
 	PrimaryKey []string // column names
+	Indexes    []IndexDef
 }
 
 // Database represents a database containing tables.
