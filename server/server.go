@@ -313,6 +313,20 @@ func resultToMySQLBinary(result *executor.Result) (*mysql.Result, error) {
 	return &mysql.Result{Resultset: r}, nil
 }
 
+// fixEmptyStrings converts empty string values to []byte{} to work around
+// a go-mysql library bug where empty strings are encoded as NULL due to
+// unsafe.StringData("") returning nil.
+func fixEmptyStrings(rows [][]interface{}) [][]interface{} {
+	for i, row := range rows {
+		for j, val := range row {
+			if s, ok := val.(string); ok && s == "" {
+				rows[i][j] = []byte{}
+			}
+		}
+	}
+	return rows
+}
+
 // normalizeRows ensures all rows have consistent Go types per column.
 // go-mysql's BuildSimpleResultset will error if two non-null values in the same
 // column have different MySQL types (e.g. int64 vs string).  We resolve this by
@@ -403,7 +417,7 @@ func resultToMySQL(result *executor.Result) (*mysql.Result, error) {
 
 	r, err := mysql.BuildSimpleResultset(
 		makeFields(result.Columns),
-		normalizeRows(result.Rows),
+		fixEmptyStrings(normalizeRows(result.Rows)),
 		false,
 	)
 	if err != nil {

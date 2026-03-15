@@ -3,6 +3,9 @@ package executor
 import (
 	"encoding/hex"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,6 +57,12 @@ type Executor struct {
 	lastInsertID   int64
 	// cteMap holds CTE virtual tables for the currently executing query.
 	cteMap         map[string]*cteTable
+	// DataDir is the base directory for resolving relative file paths
+	// used in LOAD DATA INFILE and SELECT INTO OUTFILE.
+	DataDir        string
+	// SearchPaths are directories to search for files referenced in
+	// LOAD DATA LOCAL INFILE statements.
+	SearchPaths    []string
 }
 
 func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
@@ -293,8 +302,7 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		// Accept stored procedure calls silently (e.g. mtr.add_suppression)
 		return &Result{}, nil
 	case *sqlparser.Load:
-		// Accept LOAD DATA silently
-		return &Result{}, nil
+		return e.execLoadData(query)
 	case *sqlparser.PrepareStmt, *sqlparser.ExecuteStmt, *sqlparser.DeallocateStmt:
 		// Accept PREPARE/EXECUTE/DEALLOCATE silently
 		return &Result{}, nil
@@ -1242,6 +1250,11 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		}
 	}
 
+	// Handle SELECT ... INTO OUTFILE
+	if stmt.Into != nil && stmt.Into.Type == sqlparser.IntoOutfile {
+		return e.execSelectIntoOutfile(stmt.Into, colNames, resultRows)
+	}
+
 	return &Result{
 		Columns:     colNames,
 		Rows:        resultRows,
@@ -1392,6 +1405,11 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	// Handle SELECT ... INTO OUTFILE (GROUP BY path)
+	if stmt.Into != nil && stmt.Into.Type == sqlparser.IntoOutfile {
+		return e.execSelectIntoOutfile(stmt.Into, colNames, resultRows)
 	}
 
 	return &Result{
@@ -3788,9 +3806,134 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		}
 		// Fallback: compute the aggregate (for single-row context)
 		return e.evalExpr(expr)
+	case *sqlparser.FuncExpr:
+		return e.evalFuncExprWithRow(v, row)
+	case *sqlparser.CaseExpr:
+		return e.evalCaseExprWithRow(v, row)
+	case *sqlparser.ComparisonExpr:
+		return e.evalComparisonWithRow(v, row)
+	case *sqlparser.BinaryExpr:
+		return e.evalBinaryExprWithRow(v, row)
 	default:
 		return e.evalExpr(expr)
 	}
+}
+
+// evalFuncExprWithRow evaluates a function expression with row context for column resolution.
+func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (interface{}, error) {
+	name := strings.ToLower(v.Name.String())
+	switch name {
+	case "concat":
+		var sb strings.Builder
+		for _, argExpr := range v.Exprs {
+			val, err := e.evalRowExpr(argExpr, row)
+			if err != nil {
+				return nil, err
+			}
+			if val == nil {
+				return nil, nil
+			}
+			sb.WriteString(toString(val))
+		}
+		return sb.String(), nil
+	case "concat_ws":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		sepVal, err := e.evalRowExpr(v.Exprs[0], row)
+		if err != nil {
+			return nil, err
+		}
+		if sepVal == nil {
+			return nil, nil
+		}
+		sep := toString(sepVal)
+		var parts []string
+		for _, argExpr := range v.Exprs[1:] {
+			val, err := e.evalRowExpr(argExpr, row)
+			if err != nil {
+				return nil, err
+			}
+			if val != nil {
+				parts = append(parts, toString(val))
+			}
+		}
+		return strings.Join(parts, sep), nil
+	case "cast":
+		// Delegate to the normal evalFuncExpr for CAST and other functions
+		// that don't typically reference columns directly
+		return e.evalFuncExpr(v)
+	default:
+		// For other functions, try with row-aware argument evaluation
+		return e.evalFuncExpr(v)
+	}
+}
+
+// evalComparisonWithRow evaluates a comparison expression with row context.
+func (e *Executor) evalComparisonWithRow(v *sqlparser.ComparisonExpr, row storage.Row) (interface{}, error) {
+	left, err := e.evalRowExpr(v.Left, row)
+	if err != nil {
+		return nil, err
+	}
+	right, err := e.evalRowExpr(v.Right, row)
+	if err != nil {
+		return nil, err
+	}
+	// Delegate to evalWhere for the actual comparison logic
+	match, err := e.evalWhere(v, row)
+	if err != nil {
+		return nil, err
+	}
+	_ = left
+	_ = right
+	if match {
+		return int64(1), nil
+	}
+	return int64(0), nil
+}
+
+// evalBinaryExprWithRow evaluates a binary arithmetic expression with row context.
+func (e *Executor) evalBinaryExprWithRow(v *sqlparser.BinaryExpr, row storage.Row) (interface{}, error) {
+	left, err := e.evalRowExpr(v.Left, row)
+	if err != nil {
+		return nil, err
+	}
+	right, err := e.evalRowExpr(v.Right, row)
+	if err != nil {
+		return nil, err
+	}
+	l := toFloat(left)
+	r := toFloat(right)
+	switch v.Operator {
+	case sqlparser.PlusOp:
+		return l + r, nil
+	case sqlparser.MinusOp:
+		return l - r, nil
+	case sqlparser.MultOp:
+		return l * r, nil
+	case sqlparser.DivOp:
+		if r == 0 {
+			return nil, nil
+		}
+		return l / r, nil
+	case sqlparser.IntDivOp:
+		if r == 0 {
+			return nil, nil
+		}
+		return int64(l) / int64(r), nil
+	case sqlparser.ModOp:
+		if r == 0 {
+			return nil, nil
+		}
+		return int64(l) % int64(r), nil
+	}
+	return e.evalExpr(v)
+}
+
+// evalCaseExprWithRow evaluates a CASE expression with row context.
+func (e *Executor) evalCaseExprWithRow(v *sqlparser.CaseExpr, row storage.Row) (interface{}, error) {
+	// For now, delegate to the non-row-aware version
+	return e.evalExpr(v)
 }
 
 // evalRowExpr is a package-level shim for backward-compatible callers that
@@ -4098,4 +4241,733 @@ func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, er
 	}
 	tbl.Truncate()
 	return &Result{AffectedRows: 0, IsResultSet: false}, nil
+}
+
+// ---------- LOAD DATA INFILE ----------
+
+// loadDataOptions holds parsed options from LOAD DATA statement.
+type loadDataOptions struct {
+	filePath        string
+	isLocal         bool
+	tableName       string
+	fieldsTermBy    string
+	fieldsEnclosedBy string
+	fieldsOptEnclosed bool
+	fieldsEscapedBy  string
+	linesTermBy     string
+	linesStartingBy string
+	ignoreLines     int
+	columns         []string // column names or @var names
+	setExprs        string   // raw SET clause
+	isReplace       bool
+	isIgnore        bool
+}
+
+// reLoadData matches LOAD DATA [LOCAL] INFILE 'file' [REPLACE|IGNORE] INTO TABLE tablename ...
+var reLoadDataFile = regexp.MustCompile(`(?i)LOAD\s+DATA\s+(?:CONCURRENT\s+)?(?:LOW_PRIORITY\s+)?(?:(LOCAL)\s+)?INFILE\s+'([^']*)'`)
+var reLoadDataTable = regexp.MustCompile(`(?i)INTO\s+TABLE\s+(\S+)`)
+var reIgnoreLines = regexp.MustCompile(`(?i)IGNORE\s+(\d+)\s+LINES`)
+var reLoadReplace = regexp.MustCompile(`(?i)REPLACE\s+INTO\s+TABLE`)
+var reLoadIgnore = regexp.MustCompile(`(?i)IGNORE\s+INTO\s+TABLE`)
+
+// extractSQLString extracts a SQL quoted string starting at pos in query.
+// Returns the unescaped content and the position after the closing quote.
+// Handles both \' and '' escape sequences within single-quoted strings.
+func extractSQLString(query string, pos int) (string, int) {
+	if pos >= len(query) || query[pos] != '\'' {
+		return "", pos
+	}
+	pos++ // skip opening quote
+	var sb strings.Builder
+	for pos < len(query) {
+		ch := query[pos]
+		if ch == '\\' && pos+1 < len(query) {
+			next := query[pos+1]
+			switch next {
+			case 'n':
+				sb.WriteByte('\n')
+			case 't':
+				sb.WriteByte('\t')
+			case 'r':
+				sb.WriteByte('\r')
+			case '\\':
+				sb.WriteByte('\\')
+			case '\'':
+				sb.WriteByte('\'')
+			default:
+				sb.WriteByte(next)
+			}
+			pos += 2
+			continue
+		}
+		if ch == '\'' {
+			// Check for '' escape
+			if pos+1 < len(query) && query[pos+1] == '\'' {
+				sb.WriteByte('\'')
+				pos += 2
+				continue
+			}
+			pos++ // skip closing quote
+			return sb.String(), pos
+		}
+		sb.WriteByte(ch)
+		pos++
+	}
+	return sb.String(), pos
+}
+
+// findKeywordAndExtractString searches for a keyword (case-insensitive) in query
+// and extracts the following SQL quoted string.
+func findKeywordAndExtractString(query, keyword string) (string, bool) {
+	upper := strings.ToUpper(query)
+	kwUpper := strings.ToUpper(keyword)
+	idx := strings.Index(upper, kwUpper)
+	if idx < 0 {
+		return "", false
+	}
+	// Find the next single quote after the keyword
+	pos := idx + len(keyword)
+	for pos < len(query) && query[pos] != '\'' {
+		pos++
+	}
+	if pos >= len(query) {
+		return "", false
+	}
+	val, _ := extractSQLString(query, pos)
+	return val, true
+}
+
+func parseLoadDataSQL(query string) (*loadDataOptions, error) {
+	opts := &loadDataOptions{
+		fieldsTermBy:  "\t",
+		linesTermBy:   "\n",
+		fieldsEscapedBy: "\\",
+	}
+
+	m := reLoadDataFile.FindStringSubmatch(query)
+	if m == nil {
+		return nil, fmt.Errorf("cannot parse LOAD DATA statement")
+	}
+	opts.isLocal = strings.ToUpper(m[1]) == "LOCAL"
+	opts.filePath = m[2]
+
+	mTbl := reLoadDataTable.FindStringSubmatch(query)
+	if mTbl == nil {
+		return nil, fmt.Errorf("cannot parse table name in LOAD DATA")
+	}
+	opts.tableName = strings.Trim(mTbl[1], "`")
+
+	upper := strings.ToUpper(query)
+
+	// Parse FIELDS options using string-aware extraction
+	if strings.Contains(upper, "FIELDS") || strings.Contains(upper, "COLUMNS") {
+		// Find FIELDS (or COLUMNS) clause
+		fieldsIdx := strings.Index(upper, "FIELDS")
+		if fieldsIdx < 0 {
+			fieldsIdx = strings.Index(upper, "COLUMNS")
+		}
+		if fieldsIdx >= 0 {
+			afterFields := query[fieldsIdx:]
+			afterFieldsUpper := upper[fieldsIdx:]
+			termIdx := strings.Index(afterFieldsUpper, "TERMINATED BY")
+			if termIdx >= 0 {
+				pos := fieldsIdx + termIdx + len("TERMINATED BY")
+				for pos < len(query) && query[pos] == ' ' {
+					pos++
+				}
+				if pos < len(query) && query[pos] == '\'' {
+					val, _ := extractSQLString(query, pos)
+					opts.fieldsTermBy = val
+				}
+			}
+			// Check for ENCLOSED BY within FIELDS clause
+			_ = afterFields // suppress unused warning
+			encIdx := strings.Index(afterFieldsUpper, "ENCLOSED BY")
+			if encIdx >= 0 {
+				// Check for OPTIONALLY
+				optIdx := strings.Index(afterFieldsUpper, "OPTIONALLY ENCLOSED BY")
+				if optIdx >= 0 {
+					opts.fieldsOptEnclosed = true
+					pos := fieldsIdx + optIdx + len("OPTIONALLY ENCLOSED BY")
+					for pos < len(query) && query[pos] == ' ' {
+						pos++
+					}
+					if pos < len(query) && query[pos] == '\'' {
+						val, _ := extractSQLString(query, pos)
+						opts.fieldsEnclosedBy = val
+					}
+				} else {
+					pos := fieldsIdx + encIdx + len("ENCLOSED BY")
+					for pos < len(query) && query[pos] == ' ' {
+						pos++
+					}
+					if pos < len(query) && query[pos] == '\'' {
+						val, _ := extractSQLString(query, pos)
+						opts.fieldsEnclosedBy = val
+					}
+				}
+			}
+			// Check for ESCAPED BY within FIELDS clause
+			escIdx := strings.Index(afterFieldsUpper, "ESCAPED BY")
+			if escIdx >= 0 {
+				pos := fieldsIdx + escIdx + len("ESCAPED BY")
+				for pos < len(query) && query[pos] == ' ' {
+					pos++
+				}
+				if pos < len(query) && query[pos] == '\'' {
+					val, _ := extractSQLString(query, pos)
+					opts.fieldsEscapedBy = val
+				}
+			}
+		}
+	} else if strings.Contains(upper, "ENCLOSED BY") {
+		// ENCLOSED BY without FIELDS keyword
+		if val, ok := findKeywordAndExtractString(query, "ENCLOSED BY"); ok {
+			opts.fieldsEnclosedBy = val
+			if strings.Contains(upper, "OPTIONALLY ENCLOSED BY") {
+				opts.fieldsOptEnclosed = true
+			}
+		}
+	}
+	if !strings.Contains(upper, "FIELDS") && strings.Contains(upper, "ESCAPED BY") {
+		if val, ok := findKeywordAndExtractString(query, "ESCAPED BY"); ok {
+			opts.fieldsEscapedBy = val
+		}
+	}
+
+	// Parse LINES options
+	if strings.Contains(upper, "LINES") {
+		linesIdx := strings.Index(upper, "LINES")
+		if linesIdx >= 0 {
+			afterLines := query[linesIdx:]
+			afterLinesUpper := upper[linesIdx:]
+
+			if startIdx := strings.Index(afterLinesUpper, "STARTING BY"); startIdx >= 0 {
+				pos := linesIdx + startIdx + len("STARTING BY")
+				for pos < len(query) && query[pos] == ' ' {
+					pos++
+				}
+				if pos < len(query) && query[pos] == '\'' {
+					val, _ := extractSQLString(query, pos)
+					opts.linesStartingBy = val
+				}
+			}
+
+			// Find TERMINATED BY after LINES (not FIELDS TERMINATED BY)
+			_ = afterLines
+			termIdx := strings.Index(afterLinesUpper, "TERMINATED BY")
+			if termIdx >= 0 {
+				pos := linesIdx + termIdx + len("TERMINATED BY")
+				for pos < len(query) && query[pos] == ' ' {
+					pos++
+				}
+				if pos < len(query) && query[pos] == '\'' {
+					val, _ := extractSQLString(query, pos)
+					opts.linesTermBy = val
+				}
+			}
+		}
+	}
+
+	if m := reIgnoreLines.FindStringSubmatch(query); m != nil {
+		opts.ignoreLines, _ = strconv.Atoi(m[1])
+	}
+	opts.isReplace = reLoadReplace.MatchString(query)
+	opts.isIgnore = reLoadIgnore.MatchString(query)
+
+	// Parse column list - find (...) that comes after table options
+	if idx := findColumnListStart(query); idx >= 0 {
+		end := strings.Index(query[idx:], ")")
+		if end >= 0 {
+			colStr := query[idx+1 : idx+end]
+			cols := strings.Split(colStr, ",")
+			for _, c := range cols {
+				c = strings.TrimSpace(c)
+				if c != "" {
+					opts.columns = append(opts.columns, c)
+				}
+			}
+		}
+		// Parse SET clause after column list
+		afterCols := query[idx+end+1:]
+		setIdx := strings.Index(strings.ToUpper(afterCols), "SET ")
+		if setIdx >= 0 {
+			opts.setExprs = strings.TrimSpace(afterCols[setIdx+4:])
+			opts.setExprs = strings.TrimRight(opts.setExprs, "; ")
+		}
+	}
+
+	return opts, nil
+}
+
+// findColumnListStart finds the index of '(' that starts the column list
+// in a LOAD DATA statement (after table name and FIELDS/LINES options).
+func findColumnListStart(query string) int {
+	upper := strings.ToUpper(query)
+	// Find "INTO TABLE tablename" first
+	tableIdx := strings.Index(upper, "INTO TABLE")
+	if tableIdx < 0 {
+		return -1
+	}
+	// Move past "INTO TABLE tablename"
+	rest := query[tableIdx:]
+	parts := strings.Fields(rest)
+	if len(parts) < 3 {
+		return -1
+	}
+	// Skip past the table name
+	afterTable := tableIdx + strings.Index(rest, parts[2]) + len(parts[2])
+
+	// Now find '(' that is part of column list, not inside FIELDS/LINES options
+	remaining := query[afterTable:]
+	for i := 0; i < len(remaining); i++ {
+		if remaining[i] == '(' {
+			return afterTable + i
+		}
+	}
+	return -1
+}
+
+
+func (e *Executor) execLoadData(query string) (*Result, error) {
+	opts, err := parseLoadDataSQL(query)
+	if err != nil {
+		return nil, err
+	}
+
+	// Resolve file path
+	filePath := opts.filePath
+	if !filepath.IsAbs(filePath) {
+		resolved := false
+		// Build candidate paths with common MySQL test suite path mappings
+		candidates := []string{filePath}
+		if strings.Contains(filePath, "suite/engines/funcs/") {
+			mapped := strings.Replace(filePath, "suite/engines/funcs/", "engine_funcs/", 1)
+			candidates = append(candidates, mapped)
+		}
+		candidates = append(candidates, filepath.Base(filePath))
+
+		// Try search paths first (for LOCAL INFILE with relative paths)
+		for _, candidate := range candidates {
+			for _, dir := range e.SearchPaths {
+				full := filepath.Join(dir, candidate)
+				if _, err := os.Stat(full); err == nil {
+					filePath = full
+					resolved = true
+					break
+				}
+			}
+			if resolved {
+				break
+			}
+		}
+		if !resolved && e.DataDir != "" {
+			filePath = filepath.Join(e.DataDir, filePath)
+		}
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, mysqlError(29, "HY000", fmt.Sprintf("File '%s' not found (OS errno 2 - No such file or directory)", opts.filePath))
+	}
+
+	content := string(data)
+
+	// Get table
+	tbl, err := e.Storage.GetTable(e.CurrentDB, opts.tableName)
+	if err != nil {
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, opts.tableName))
+	}
+
+	// Determine column names from table definition
+	tableColNames := make([]string, len(tbl.Def.Columns))
+	for i, col := range tbl.Def.Columns {
+		tableColNames[i] = col.Name
+	}
+
+	// Get primary key and unique columns
+	var pkCols []string
+	var uniqueCols []string
+	for _, col := range tbl.Def.Columns {
+		if col.PrimaryKey {
+			pkCols = append(pkCols, col.Name)
+		}
+		if col.Unique {
+			uniqueCols = append(uniqueCols, col.Name)
+		}
+	}
+	if len(pkCols) == 0 && len(tbl.Def.PrimaryKey) > 0 {
+		pkCols = tbl.Def.PrimaryKey
+	}
+	for _, idx := range tbl.Def.Indexes {
+		if idx.Unique && len(idx.Columns) == 1 {
+			uniqueCols = append(uniqueCols, idx.Columns[0])
+		}
+	}
+
+	// Split content into lines
+	lines := splitLoadDataLines(content, opts.linesTermBy)
+
+	// Skip IGNORE N LINES
+	if opts.ignoreLines > 0 && opts.ignoreLines < len(lines) {
+		lines = lines[opts.ignoreLines:]
+	}
+
+	var affected uint64
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+
+		// Apply LINES STARTING BY
+		if opts.linesStartingBy != "" {
+			idx := strings.Index(line, opts.linesStartingBy)
+			if idx < 0 {
+				continue // skip lines without the starting marker
+			}
+			line = line[idx+len(opts.linesStartingBy):]
+		}
+
+		// Parse fields
+		fields := splitLoadDataFields(line, opts.fieldsTermBy, opts.fieldsEnclosedBy, opts.fieldsEscapedBy)
+
+		// Determine target columns
+		targetCols := tableColNames
+		if len(opts.columns) > 0 {
+			targetCols = opts.columns
+		}
+
+		// Build row with variable map for @var references
+		row := make(storage.Row)
+		varMap := make(map[string]interface{})
+
+		for i, col := range targetCols {
+			var val interface{}
+			if i < len(fields) {
+				val = processLoadDataField(fields[i], opts.fieldsEscapedBy, opts.fieldsEnclosedBy)
+			}
+			// else val stays nil (fewer fields than columns)
+
+			if strings.HasPrefix(col, "@") {
+				varMap[col] = val
+			} else {
+				row[col] = val
+			}
+		}
+
+		// Apply SET expressions
+		if opts.setExprs != "" {
+			if err := e.applyLoadDataSet(opts.setExprs, row, varMap); err != nil {
+				return nil, err
+			}
+		}
+
+		// Fill defaults for missing columns
+		for _, colDef := range tbl.Def.Columns {
+			if _, exists := row[colDef.Name]; !exists {
+				if colDef.AutoIncrement {
+					row[colDef.Name] = tbl.AutoIncrement.Add(1)
+				} else if colDef.Default != nil {
+					v, err := e.evalDefaultValue(*colDef.Default)
+					if err == nil {
+						row[colDef.Name] = v
+					}
+				}
+			}
+		}
+
+		// Handle duplicate keys
+		if opts.isReplace {
+			// REPLACE: delete existing row with same PK, then insert
+			dupIdx := e.findDuplicateRow(tbl, row, pkCols, uniqueCols)
+			if dupIdx >= 0 {
+				tbl.Lock()
+				tbl.Rows = append(tbl.Rows[:dupIdx], tbl.Rows[dupIdx+1:]...)
+				tbl.Unlock()
+			}
+		} else if !opts.isIgnore {
+			// Default behavior: error on duplicate (for server INFILE)
+			// For LOCAL INFILE, MySQL treats it as IGNORE implicitly
+			if opts.isLocal {
+				dupIdx := e.findDuplicateRow(tbl, row, pkCols, uniqueCols)
+				if dupIdx >= 0 {
+					continue // skip duplicate (LOCAL INFILE ignores duplicates)
+				}
+			} else {
+				dupIdx := e.findDuplicateRow(tbl, row, pkCols, uniqueCols)
+				if dupIdx >= 0 {
+					// Find the duplicate key name and value
+					dupKeyName := "PRIMARY"
+					dupKeyVal := ""
+					for _, pk := range pkCols {
+						if v, ok := row[pk]; ok {
+							dupKeyVal = fmt.Sprintf("%v", v)
+							break
+						}
+					}
+					return nil, mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key '%s'", dupKeyVal, dupKeyName))
+				}
+			}
+		} else {
+			// IGNORE: skip duplicates
+			dupIdx := e.findDuplicateRow(tbl, row, pkCols, uniqueCols)
+			if dupIdx >= 0 {
+				continue
+			}
+		}
+
+		tbl.Insert(row) //nolint:errcheck
+		affected++
+	}
+
+	return &Result{AffectedRows: affected}, nil
+}
+
+// splitLoadDataLines splits content by line terminator.
+func splitLoadDataLines(content, linesTerm string) []string {
+	if linesTerm == "\n" {
+		// Handle both \n and \r\n
+		content = strings.ReplaceAll(content, "\r\n", "\n")
+		return strings.Split(content, "\n")
+	}
+	return strings.Split(content, linesTerm)
+}
+
+// splitLoadDataFields splits a line into fields respecting enclosed-by characters.
+func splitLoadDataFields(line, termBy, enclosedBy, escapedBy string) []string {
+	if enclosedBy == "" {
+		return strings.Split(line, termBy)
+	}
+
+	var fields []string
+	i := 0
+	for i < len(line) {
+		if strings.HasPrefix(line[i:], enclosedBy) {
+			// Enclosed field - find matching end
+			i += len(enclosedBy)
+			var field strings.Builder
+			for i < len(line) {
+				if escapedBy != "" && strings.HasPrefix(line[i:], escapedBy) && i+len(escapedBy) < len(line) {
+					// Escaped character
+					i += len(escapedBy)
+					if i < len(line) {
+						field.WriteByte(line[i])
+						i++
+					}
+				} else if strings.HasPrefix(line[i:], enclosedBy) {
+					i += len(enclosedBy)
+					break
+				} else {
+					field.WriteByte(line[i])
+					i++
+				}
+			}
+			fields = append(fields, field.String())
+			// Skip field terminator
+			if strings.HasPrefix(line[i:], termBy) {
+				i += len(termBy)
+			}
+		} else {
+			// Non-enclosed field
+			end := strings.Index(line[i:], termBy)
+			if end < 0 {
+				fields = append(fields, line[i:])
+				break
+			}
+			fields = append(fields, line[i:i+end])
+			i += end + len(termBy)
+		}
+	}
+	return fields
+}
+
+// processLoadDataField processes a single field value, handling NULL markers and escapes.
+func processLoadDataField(field, escapedBy, enclosedBy string) interface{} {
+	// \N represents NULL (when escaped by backslash)
+	if escapedBy == "\\" && field == "\\N" {
+		return nil
+	}
+	// For custom escaped-by, check for escaped-by + N
+	if escapedBy != "" && escapedBy != "\\" && field == escapedBy+"N" {
+		return nil
+	}
+	return field
+}
+
+// applyLoadDataSet evaluates SET col = expr assignments for LOAD DATA.
+func (e *Executor) applyLoadDataSet(setExprs string, row storage.Row, varMap map[string]interface{}) error {
+	// Parse "col1 = expr1, col2 = expr2"
+	// We need to handle expressions like CAST(@var1 AS SIGNED) and @c1 % 2
+	assignments := splitSetAssignments(setExprs)
+	for _, assign := range assignments {
+		parts := strings.SplitN(assign, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		colName := strings.TrimSpace(parts[0])
+		exprStr := strings.TrimSpace(parts[1])
+
+		// Substitute @variables in expression
+		for varName, varVal := range varMap {
+			if varVal == nil {
+				exprStr = strings.ReplaceAll(exprStr, varName, "NULL")
+			} else {
+				exprStr = strings.ReplaceAll(exprStr, varName, fmt.Sprintf("%v", varVal))
+			}
+		}
+
+		// Evaluate the expression using a SELECT
+		selectSQL := fmt.Sprintf("SELECT %s", exprStr)
+		result, err := e.Execute(selectSQL)
+		if err != nil {
+			return err
+		}
+		if len(result.Rows) > 0 && len(result.Rows[0]) > 0 {
+			row[colName] = result.Rows[0][0]
+		}
+	}
+	return nil
+}
+
+// splitSetAssignments splits "col1 = expr1, col2 = expr2" into individual assignments,
+// respecting parentheses (e.g., CAST(x AS SIGNED)).
+func splitSetAssignments(s string) []string {
+	var result []string
+	depth := 0
+	start := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				result = append(result, strings.TrimSpace(s[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	last := strings.TrimSpace(s[start:])
+	if last != "" {
+		result = append(result, last)
+	}
+	return result
+}
+
+// evalDefaultValue evaluates a column default value expression.
+func (e *Executor) evalDefaultValue(defStr string) (interface{}, error) {
+	// Parse as a SELECT expression
+	selectSQL := fmt.Sprintf("SELECT %s", defStr)
+	result, err := e.Execute(selectSQL)
+	if err != nil {
+		return nil, err
+	}
+	if len(result.Rows) > 0 && len(result.Rows[0]) > 0 {
+		return result.Rows[0][0], nil
+	}
+	return nil, nil
+}
+
+// ---------- SELECT INTO OUTFILE ----------
+
+// execSelectIntoOutfile writes query results to a file.
+func (e *Executor) execSelectIntoOutfile(into *sqlparser.SelectInto, colNames []string, rows [][]interface{}) (*Result, error) {
+	// Parse the filename - remove surrounding quotes
+	fileName := into.FileName
+	if len(fileName) >= 2 && fileName[0] == '\'' && fileName[len(fileName)-1] == '\'' {
+		fileName = fileName[1 : len(fileName)-1]
+	}
+
+	// Resolve relative path
+	if !filepath.IsAbs(fileName) && e.DataDir != "" {
+		fileName = filepath.Join(e.DataDir, fileName)
+	}
+
+	// Parse export options from ExportOption string
+	exportOpt := into.ExportOption
+	fieldsTerm := "\t"
+	fieldsEnclosedBy := ""
+	fieldsOptEnclosed := false
+	linesTerm := "\n"
+	fieldsEscapedBy := "\\"
+
+	if exportOpt != "" {
+		exportUpper := strings.ToUpper(exportOpt)
+		if val, ok := findKeywordAndExtractString(exportOpt, "terminated by"); ok {
+			// Determine whether this is FIELDS or LINES terminated by
+			fieldsIdx := strings.Index(exportUpper, "FIELDS")
+			linesIdx := strings.Index(exportUpper, "LINES")
+			termIdx := strings.Index(exportUpper, "TERMINATED BY")
+			if fieldsIdx >= 0 && (linesIdx < 0 || termIdx < linesIdx) {
+				fieldsTerm = val
+			}
+		}
+		if strings.Contains(exportUpper, "OPTIONALLY ENCLOSED BY") {
+			if val, ok := findKeywordAndExtractString(exportOpt, "optionally enclosed by"); ok {
+				fieldsEnclosedBy = val
+				fieldsOptEnclosed = true
+			}
+		} else if strings.Contains(exportUpper, "ENCLOSED BY") {
+			if val, ok := findKeywordAndExtractString(exportOpt, "enclosed by"); ok {
+				fieldsEnclosedBy = val
+			}
+		}
+		if val, ok := findKeywordAndExtractString(exportOpt, "escaped by"); ok {
+			fieldsEscapedBy = val
+		}
+		if linesIdx := strings.Index(exportUpper, "LINES"); linesIdx >= 0 {
+			afterLines := exportOpt[linesIdx:]
+			if val, ok := findKeywordAndExtractString(afterLines, "terminated by"); ok {
+				linesTerm = val
+			}
+		}
+	}
+
+	// Build output
+	var sb strings.Builder
+	for _, row := range rows {
+		for i, val := range row {
+			if i > 0 {
+				sb.WriteString(fieldsTerm)
+			}
+			if val == nil {
+				sb.WriteString(fieldsEscapedBy + "N")
+			} else {
+				s := fmt.Sprintf("%v", val)
+				// Apply enclosing
+				if fieldsEnclosedBy != "" {
+					if !fieldsOptEnclosed {
+						sb.WriteString(fieldsEnclosedBy + s + fieldsEnclosedBy)
+					} else {
+						// OPTIONALLY ENCLOSED BY: only enclose strings, not numbers
+						if _, err := strconv.ParseFloat(s, 64); err != nil {
+							sb.WriteString(fieldsEnclosedBy + s + fieldsEnclosedBy)
+						} else {
+							sb.WriteString(s)
+						}
+					}
+				} else {
+					// Escape special characters
+					if fieldsEscapedBy != "" {
+						s = strings.ReplaceAll(s, fieldsEscapedBy, fieldsEscapedBy+fieldsEscapedBy)
+					}
+					sb.WriteString(s)
+				}
+			}
+		}
+		sb.WriteString(linesTerm)
+	}
+
+	// Ensure parent directory exists
+	dir := filepath.Dir(fileName)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("cannot create directory for outfile: %v", err)
+	}
+
+	if err := os.WriteFile(fileName, []byte(sb.String()), 0644); err != nil {
+		return nil, fmt.Errorf("cannot write outfile: %v", err)
+	}
+
+	return &Result{AffectedRows: uint64(len(rows))}, nil
 }
