@@ -1727,6 +1727,26 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.IntroducerExpr:
 		// e.g. _latin1 'string' — ignore the charset and evaluate the inner expression
 		return e.evalExpr(v.Expr)
+	case *sqlparser.CurTimeFuncExpr:
+		// NOW(), CURRENT_TIMESTAMP(), CURTIME(), etc.
+		name := strings.ToLower(v.Name.String())
+		now := time.Now()
+		switch name {
+		case "now", "current_timestamp", "localtime", "localtimestamp", "sysdate":
+			return now.Format("2006-01-02 15:04:05"), nil
+		case "curdate", "current_date":
+			return now.Format("2006-01-02"), nil
+		case "curtime", "current_time":
+			return now.Format("15:04:05"), nil
+		case "utc_timestamp":
+			return time.Now().UTC().Format("2006-01-02 15:04:05"), nil
+		case "utc_date":
+			return time.Now().UTC().Format("2006-01-02"), nil
+		case "utc_time":
+			return time.Now().UTC().Format("15:04:05"), nil
+		default:
+			return now.Format("2006-01-02 15:04:05"), nil
+		}
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
 }
@@ -2639,6 +2659,41 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 		case sqlparser.IsFalseOp:
 			return val == false || val == int64(0), nil
 		}
+	case *sqlparser.BetweenExpr:
+		val, err := e.evalRowExpr(v.Left, row)
+		if err != nil {
+			return false, err
+		}
+		from, err := e.evalRowExpr(v.From, row)
+		if err != nil {
+			return false, err
+		}
+		to, err := e.evalRowExpr(v.To, row)
+		if err != nil {
+			return false, err
+		}
+		geFrom, err := compareValues(val, from, sqlparser.GreaterEqualOp)
+		if err != nil {
+			return false, err
+		}
+		leTo, err := compareValues(val, to, sqlparser.LessEqualOp)
+		if err != nil {
+			return false, err
+		}
+		result := geFrom && leTo
+		if v.IsBetween {
+			return result, nil
+		}
+		return !result, nil
+	case *sqlparser.ExistsExpr:
+		// EXISTS subquery - not supported yet, return false
+		return false, nil
+	case *sqlparser.NotExpr:
+		inner, err := e.evalWhere(v.Expr, row)
+		if err != nil {
+			return false, err
+		}
+		return !inner, nil
 	}
 	return false, fmt.Errorf("unsupported WHERE expression: %T", expr)
 }
