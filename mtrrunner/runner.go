@@ -46,6 +46,22 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	// Find result file
 	resultPath := findResultFile(testPath)
 
+	// Reset state: ensure we're in the test database and clean up leftover tables
+	r.DB.Exec("USE test") //nolint:errcheck
+	// Drop all tables from previous test
+	if rows, err2 := r.DB.Query("SHOW TABLES"); err2 == nil {
+		var tables []string
+		for rows.Next() {
+			var t string
+			rows.Scan(&t) //nolint:errcheck
+			tables = append(tables, t)
+		}
+		rows.Close()
+		for _, t := range tables {
+			r.DB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", t)) //nolint:errcheck
+		}
+	}
+
 	// Execute
 	ctx := &execContext{
 		runner:          r,
@@ -210,6 +226,9 @@ func (ctx *execContext) executeLines(lines []string) error {
 					break
 				}
 			}
+
+			// Strip inline comments (# outside quotes)
+			t = stripInlineComment(t)
 
 			if strings.HasSuffix(t, delim) {
 				stmt += strings.TrimSuffix(t, delim)
@@ -586,6 +605,30 @@ func extractBareDirective(trimmed string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// stripInlineComment removes trailing # comments from a SQL line,
+// respecting quoted strings.
+func stripInlineComment(line string) string {
+	inSingle := false
+	inDouble := false
+	for i, ch := range line {
+		switch ch {
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+		case '#':
+			if !inSingle && !inDouble {
+				return strings.TrimSpace(line[:i])
+			}
+		}
+	}
+	return line
 }
 
 func normalizeOutput(s string) string {

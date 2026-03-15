@@ -191,6 +191,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 
 	tableName := stmt.Table.Name.String()
 
+	if stmt.TableSpec == nil {
+		// CREATE TABLE ... LIKE or CREATE TABLE ... SELECT - not fully supported
+		return &Result{}, nil
+	}
+
 	columns := make([]catalog.ColumnDef, 0)
 	var primaryKeys []string
 
