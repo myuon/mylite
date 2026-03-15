@@ -267,10 +267,16 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	var primaryKeys []string
 
 	for _, col := range stmt.TableSpec.Columns {
+		// Default: nullable unless NOT NULL is explicitly specified
+		nullable := true
+		if col.Type.Options != nil && col.Type.Options.Null != nil {
+			nullable = *col.Type.Options.Null
+		}
+
 		colDef := catalog.ColumnDef{
 			Name:     col.Name.String(),
 			Type:     buildColumnTypeString(col.Type),
-			Nullable: col.Type.Options != nil && col.Type.Options.Null != nil && *col.Type.Options.Null,
+			Nullable: nullable,
 		}
 
 		if col.Type.Options != nil {
@@ -284,15 +290,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			switch col.Type.Options.KeyOpt {
 			case sqlparser.ColKeyPrimary, sqlparser.ColKey: // PRIMARY KEY or KEY
 				colDef.PrimaryKey = true
+				colDef.Nullable = false // PRIMARY KEY implies NOT NULL
 				primaryKeys = append(primaryKeys, colDef.Name)
 			case sqlparser.ColKeyUnique, sqlparser.ColKeyUniqueKey:
 				colDef.Unique = true
 			}
-		}
-
-		// If NOT NULL is not explicitly set and no NULL is set, default depends on PK
-		if col.Type.Options != nil && col.Type.Options.Null != nil && !*col.Type.Options.Null {
-			colDef.Nullable = false
 		}
 
 		// Save comment
