@@ -24,6 +24,7 @@ type IndexDef struct {
 	Columns []string
 	Unique  bool
 	Using   string // Index method: BTREE, HASH, etc.
+	Comment string // COMMENT clause on index
 }
 
 // TableDef represents a table definition.

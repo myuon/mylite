@@ -208,7 +208,7 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 					"COLUMN_KEY":               columnKey,
 					"EXTRA":                    extra,
 					"PRIVILEGES":               "select,insert,update,references",
-					"COLUMN_COMMENT":           "",
+					"COLUMN_COMMENT":           col.Comment,
 					"GENERATION_EXPRESSION":    "",
 					"SRS_ID":                   nil,
 				})
@@ -284,7 +284,7 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 						"NULLABLE":      "",
 						"INDEX_TYPE":    "BTREE",
 						"COMMENT":       "",
-						"INDEX_COMMENT": "",
+						"INDEX_COMMENT": idx.Comment,
 						"IS_VISIBLE":    "YES",
 						"EXPRESSION":    nil,
 					})

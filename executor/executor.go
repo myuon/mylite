@@ -54,6 +54,14 @@ type Executor struct {
 	lastInsertID   int64
 	// cteMap holds CTE virtual tables for the currently executing query.
 	cteMap         map[string]*cteTable
+	// sqlMode stores the current SQL mode (e.g. "TRADITIONAL", "STRICT_TRANS_TABLES").
+	sqlMode        string
+	// sqlAutoIsNull enables MySQL sql_auto_is_null behavior.
+	sqlAutoIsNull  bool
+	// lastAutoIncID stores the last auto-increment ID for sql_auto_is_null support.
+	lastAutoIncID  int64
+	// fixedTimestamp holds a fixed time for SET TIMESTAMP=N support.
+	fixedTimestamp *time.Time
 }
 
 func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
@@ -212,8 +220,16 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	stmt, err := sqlparser.NewTestParser().Parse(query)
 	if err != nil {
 		// Accept statements that Vitess parser doesn't support
-		if strings.HasPrefix(upper, "SET ") ||
-			strings.HasPrefix(upper, "DROP FUNCTION") ||
+		if strings.HasPrefix(upper, "SET ") {
+			e.handleRawSet(trimmed)
+			return &Result{}, nil
+		}
+		if strings.HasPrefix(upper, "USE ") {
+			nearText := strings.TrimPrefix(trimmed, "USE ")
+			nearText = strings.TrimPrefix(nearText, "use ")
+			return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", nearText))
+		}
+		if strings.HasPrefix(upper, "DROP FUNCTION") ||
 			strings.HasPrefix(upper, "CREATE FUNCTION") ||
 			strings.HasPrefix(upper, "CREATE EVENT") ||
 			strings.HasPrefix(upper, "DROP EVENT") ||
@@ -254,7 +270,12 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			strings.HasPrefix(upper, "END") {
 			return &Result{}, nil
 		}
-		return nil, fmt.Errorf("parse error: %v", err)
+		// For multi-table DELETE: DELETE t1,t2 FROM t1,t2,t3 WHERE ...
+		// or DELETE [QUICK] FROM t1,t2 USING t1,t2,t3 WHERE ...
+		if strings.HasPrefix(upper, "DELETE ") {
+			return e.execMultiTableDelete(trimmed)
+		}
+		return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", truncateNear(trimmed)))
 	}
 
 	switch s := stmt.(type) {
@@ -291,8 +312,7 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	case *sqlparser.TruncateTable:
 		return e.execTruncateTable(s)
 	case *sqlparser.Set:
-		// Accept SET statements silently
-		return &Result{}, nil
+		return e.execSet(s)
 	case *sqlparser.LockTables:
 		// Accept LOCK TABLES silently
 		return &Result{}, nil
@@ -422,10 +442,239 @@ func (e *Executor) execUse(stmt *sqlparser.Use) (*Result, error) {
 	name := stmt.DBName.String()
 	_, err := e.Catalog.GetDatabase(name)
 	if err != nil {
-		return nil, err
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", name))
 	}
 	e.CurrentDB = name
 	return &Result{}, nil
+}
+
+// execSet handles parsed SET statements.
+func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
+	for _, expr := range stmt.Exprs {
+		name := strings.ToLower(expr.Var.Name.String())
+		val := sqlparser.String(expr.Expr)
+		val = strings.Trim(val, "'\"")
+		switch name {
+		case "sql_mode":
+			if strings.ToUpper(val) == "DEFAULT" {
+				e.sqlMode = ""
+			} else {
+				e.sqlMode = strings.ToUpper(val)
+			}
+		case "sql_auto_is_null":
+			e.sqlAutoIsNull = val == "1" || strings.ToUpper(val) == "ON" || strings.ToUpper(val) == "TRUE"
+		case "timestamp":
+			n, err := strconv.ParseFloat(val, 64)
+			if err == nil {
+				if n == 0 {
+					e.fixedTimestamp = nil
+				} else {
+					t := time.Unix(int64(n), 0)
+					e.fixedTimestamp = &t
+				}
+			}
+		}
+	}
+	return &Result{}, nil
+}
+
+// handleRawSet handles SET statements that the parser couldn't parse.
+func (e *Executor) handleRawSet(raw string) {
+	upper := strings.ToUpper(raw)
+	if strings.Contains(upper, "SQL_MODE") {
+		if idx := strings.Index(upper, "="); idx >= 0 {
+			val := strings.TrimSpace(raw[idx+1:])
+			val = strings.Trim(val, "'\"")
+			val = strings.TrimSuffix(val, ";")
+			val = strings.TrimSpace(val)
+			if strings.ToUpper(val) == "DEFAULT" {
+				e.sqlMode = ""
+			} else {
+				e.sqlMode = strings.ToUpper(val)
+			}
+		}
+	}
+	if strings.Contains(upper, "SQL_AUTO_IS_NULL") {
+		if idx := strings.Index(upper, "="); idx >= 0 {
+			val := strings.TrimSpace(raw[idx+1:])
+			val = strings.Trim(val, "'\"")
+			val = strings.TrimSuffix(val, ";")
+			val = strings.TrimSpace(val)
+			e.sqlAutoIsNull = val == "1" || strings.ToUpper(val) == "ON"
+		}
+	}
+	if strings.Contains(upper, "TIMESTAMP") && !strings.Contains(upper, "SQL_MODE") {
+		if idx := strings.Index(upper, "="); idx >= 0 {
+			val := strings.TrimSpace(raw[idx+1:])
+			val = strings.Trim(val, "'\"")
+			val = strings.TrimSuffix(val, ";")
+			val = strings.TrimSpace(val)
+			n, err := strconv.ParseFloat(val, 64)
+			if err == nil {
+				if n == 0 {
+					e.fixedTimestamp = nil
+				} else {
+					t := time.Unix(int64(n), 0)
+					e.fixedTimestamp = &t
+				}
+			}
+		}
+	}
+}
+
+// nowTime returns the current time, respecting SET TIMESTAMP.
+func (e *Executor) nowTime() time.Time {
+	if e.fixedTimestamp != nil {
+		return *e.fixedTimestamp
+	}
+	return time.Now()
+}
+
+// isStrictMode returns true when sql_mode includes STRICT_TRANS_TABLES, STRICT_ALL_TABLES, or TRADITIONAL.
+func (e *Executor) isStrictMode() bool {
+	return strings.Contains(e.sqlMode, "TRADITIONAL") ||
+		strings.Contains(e.sqlMode, "STRICT_TRANS_TABLES") ||
+		strings.Contains(e.sqlMode, "STRICT_ALL_TABLES")
+}
+
+// extractCharLength returns the max character length from a CHAR(N) or VARCHAR(N) type string.
+func extractCharLength(colType string) int {
+	lower := strings.ToLower(strings.TrimSpace(colType))
+	var n int
+	for _, prefix := range []string{"char(", "varchar(", "binary(", "varbinary("} {
+		if strings.HasPrefix(lower, prefix) {
+			if _, err := fmt.Sscanf(lower[len(prefix)-1:], "(%d)", &n); err == nil {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+// checkDecimalRange checks if a value fits within a DECIMAL(M,D) column's range.
+func checkDecimalRange(colType string, v interface{}) error {
+	lower := strings.ToLower(colType)
+	lower = strings.TrimSuffix(strings.TrimSpace(lower), " unsigned")
+	lower = strings.TrimSpace(lower)
+	var m, d int
+	if n, err := fmt.Sscanf(lower, "decimal(%d,%d)", &m, &d); err == nil && n == 2 {
+		f := toFloat(v)
+		if f < 0 {
+			f = -f
+		}
+		intDigits := m - d
+		if intDigits <= 0 {
+			intDigits = 1
+		}
+		maxVal := 1.0
+		for i := 0; i < intDigits; i++ {
+			maxVal *= 10
+		}
+		if f >= maxVal {
+			return fmt.Errorf("out of range")
+		}
+	}
+	return nil
+}
+
+// validateEnumSetValue validates and normalizes a value for ENUM/SET columns.
+func validateEnumSetValue(colType string, v interface{}) interface{} {
+	lower := strings.ToLower(colType)
+	if !strings.HasPrefix(lower, "enum(") && !strings.HasPrefix(lower, "set(") {
+		return v
+	}
+	s, ok := v.(string)
+	if !ok {
+		return v
+	}
+	isEnum := strings.HasPrefix(lower, "enum(")
+	inner := ""
+	if isEnum {
+		inner = colType[5 : len(colType)-1]
+	} else {
+		inner = colType[4 : len(colType)-1]
+	}
+	var allowed []string
+	for _, part := range splitEnumValues(inner) {
+		part = strings.Trim(part, "'")
+		allowed = append(allowed, part)
+	}
+	if isEnum {
+		if s == "" {
+			return s
+		}
+		for _, a := range allowed {
+			if strings.EqualFold(s, a) {
+				return a
+			}
+		}
+		return ""
+	}
+	// SET validation
+	if s == "" {
+		return s
+	}
+	members := strings.Split(s, ",")
+	var valid []string
+	for _, m := range members {
+		m = strings.TrimSpace(m)
+		for _, a := range allowed {
+			if strings.EqualFold(m, a) {
+				valid = append(valid, a)
+				break
+			}
+		}
+	}
+	return strings.Join(valid, ",")
+}
+
+func splitEnumValues(s string) []string {
+	var result []string
+	var current strings.Builder
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch == '\'' {
+			inQuote = !inQuote
+			current.WriteByte(ch)
+		} else if ch == ',' && !inQuote {
+			result = append(result, strings.TrimSpace(current.String()))
+			current.Reset()
+		} else {
+			current.WriteByte(ch)
+		}
+	}
+	rest := strings.TrimSpace(current.String())
+	if rest != "" {
+		result = append(result, rest)
+	}
+	return result
+}
+
+// formatDecimalValue formats a value for DECIMAL(M,D), DOUBLE(M,D), or FLOAT(M,D) columns.
+func formatDecimalValue(colType string, v interface{}) interface{} {
+	lower := strings.ToLower(colType)
+	cleanLower := strings.TrimSuffix(strings.TrimSpace(lower), " unsigned")
+	cleanLower = strings.TrimSpace(cleanLower)
+	var prefix string
+	for _, p := range []string{"decimal", "double", "float"} {
+		if strings.HasPrefix(cleanLower, p+"(") {
+			prefix = p
+			break
+		}
+	}
+	if prefix == "" {
+		return v
+	}
+	var m, d int
+	if n, err := fmt.Sscanf(cleanLower, prefix+"(%d,%d)", &m, &d); err == nil && n == 2 {
+		f := toFloat(v)
+		if d == 0 {
+			return int64(f)
+		}
+		return fmt.Sprintf("%.*f", d, f)
+	}
+	return v
 }
 
 func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error) {
@@ -437,7 +686,16 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	tableName := stmt.Table.Name.String()
 
 	if stmt.TableSpec == nil {
-		// CREATE TABLE ... LIKE or CREATE TABLE ... SELECT - not fully supported
+		// CREATE TABLE ... LIKE
+		if stmt.OptLike != nil {
+			srcName := stmt.OptLike.LikeTable.Name.String()
+			return e.execCreateTableLike(tableName, srcName)
+		}
+		// CREATE TABLE ... SELECT
+		if stmt.Select != nil {
+			selectSQL := sqlparser.String(stmt.Select)
+			return e.execCreateTableSelect(tableName, selectSQL)
+		}
 		return &Result{}, nil
 	}
 
@@ -514,10 +772,17 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			if idxName == "" {
 				idxName = idxCols[0]
 			}
+			idxComment := ""
+			for _, opt := range idx.Options {
+				if strings.ToUpper(opt.Name) == "COMMENT" {
+					idxComment = opt.String
+				}
+			}
 			indexes = append(indexes, catalog.IndexDef{
 				Name:    idxName,
 				Columns: idxCols,
 				Unique:  isUnique,
+				Comment: idxComment,
 			})
 		}
 	}
@@ -829,13 +1094,20 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 			v, err := e.evalExpr(val)
 			if err != nil {
+				if strings.HasPrefix(err.Error(), "INT_OVERFLOW:") {
+					return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colNames[i]))
+				}
 				return nil, err
 			}
-			// Pad BINARY(N) values with null bytes.
+			// Pad BINARY(N), format DECIMAL, validate ENUM/SET.
 			for _, col := range tbl.Def.Columns {
 				if col.Name == colNames[i] {
 					if padLen := binaryPadLength(col.Type); padLen > 0 && v != nil {
 						v = padBinaryValue(v, padLen)
+					}
+					if v != nil {
+						v = formatDecimalValue(col.Type, v)
+						v = validateEnumSetValue(col.Type, v)
 					}
 					break
 				}
@@ -936,6 +1208,80 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 		}
 
+		// Strict mode validation before insert
+		if e.isStrictMode() {
+			for _, col := range tbl.Def.Columns {
+				// NOT NULL check
+				if !col.Nullable && !col.AutoIncrement {
+					rv, exists := row[col.Name]
+					if !exists || rv == nil {
+						return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
+					}
+				}
+				rv, exists := row[col.Name]
+				if exists && rv != nil {
+					colUpper := strings.ToUpper(col.Type)
+					isIntType := strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER")
+					isDecimalType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE")
+					isNumericType := isIntType || isDecimalType
+					isUnsigned := strings.Contains(colUpper, "UNSIGNED")
+					if isNumericType {
+						switch val := rv.(type) {
+						case int64:
+							if isUnsigned && val < 0 {
+								return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+							}
+						case float64:
+							if isUnsigned && val < 0 {
+								return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+							}
+						case string:
+							if isIntType {
+								if _, perr := strconv.ParseInt(val, 10, 64); perr != nil {
+									if _, perr := strconv.ParseFloat(val, 64); perr != nil {
+										return nil, mysqlError(1366, "HY000", fmt.Sprintf("Incorrect integer value: '%s' for column '%s' at row 1", val, col.Name))
+									}
+								}
+							} else if isDecimalType {
+								if _, perr := strconv.ParseFloat(val, 64); perr != nil {
+									return nil, mysqlError(1366, "HY000", fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row 1", val, col.Name))
+								}
+							}
+						}
+						if isDecimalType && strings.Contains(colUpper, "DECIMAL") {
+							if derr := checkDecimalRange(col.Type, rv); derr != nil {
+								return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+							}
+						}
+					}
+					// String length check
+					isCharType := strings.Contains(colUpper, "CHAR") || strings.Contains(colUpper, "BINARY")
+					if isCharType {
+						if sv, ok := rv.(string); ok {
+							maxLen := extractCharLength(col.Type)
+							if maxLen > 0 && len([]rune(sv)) > maxLen {
+								return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row 1", col.Name))
+							}
+						}
+					}
+					// ENUM/SET validity check in strict mode
+					isEnumType := strings.HasPrefix(strings.ToLower(col.Type), "enum(")
+					isSetType := strings.HasPrefix(strings.ToLower(col.Type), "set(")
+					if isEnumType || isSetType {
+						if sv, ok := rv.(string); ok {
+							// Check if value was modified by validateEnumSetValue
+							origRV := row[col.Name]
+							origStr, _ := origRV.(string)
+							_ = origStr
+							if isEnumType && sv == "" {
+								return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+							}
+						}
+					}
+				}
+			}
+		}
+
 		id, err := tbl.Insert(row)
 		if err != nil {
 			// INSERT IGNORE: silently skip duplicate key errors
@@ -954,6 +1300,15 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	}
 
 	e.lastInsertID = lastInsertID
+	// Set lastAutoIncID for sql_auto_is_null (only NOT NULL auto-inc columns)
+	if lastInsertID > 0 {
+		for _, col := range tbl.Def.Columns {
+			if col.AutoIncrement && !col.Nullable {
+				e.lastAutoIncID = lastInsertID
+				break
+			}
+		}
+	}
 	return &Result{
 		AffectedRows: affected,
 		InsertID:     uint64(lastInsertID),
@@ -1104,17 +1459,86 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 		return nil, err
 	}
 
-	rightAlias, rightTableName, err := extractTableAlias(join.RightExpr)
+	rightRows, err := e.buildFromExpr(join.RightExpr)
 	if err != nil {
 		return nil, err
 	}
-	rightTbl, err := e.Storage.GetTable(e.CurrentDB, rightTableName)
-	if err != nil {
-		return nil, err
-	}
-	rightRows := rightTbl.Scan()
 
-	isLeft := join.Join == sqlparser.LeftJoinType || join.Join == sqlparser.NaturalLeftJoinType
+	// Determine right alias and table def for NULL padding
+	rightAlias, _, _ := extractTableAlias(join.RightExpr)
+	leftAlias, _, _ := extractTableAlias(join.LeftExpr)
+
+	// Get right table columns for NULL padding (LEFT JOIN unmatched)
+	var rightColNames []string
+	if ate, ok := join.RightExpr.(*sqlparser.AliasedTableExpr); ok {
+		_, tName, _ := extractTableAliasFromAliased(ate)
+		if rtbl, err := e.Storage.GetTable(e.CurrentDB, tName); err == nil {
+			for _, col := range rtbl.Def.Columns {
+				rightColNames = append(rightColNames, col.Name)
+			}
+		}
+	}
+	// If we couldn't get columns from storage, derive from rows
+	if len(rightColNames) == 0 && len(rightRows) > 0 {
+		seen := make(map[string]bool)
+		for k := range rightRows[0] {
+			if !strings.Contains(k, ".") && !seen[k] {
+				seen[k] = true
+				rightColNames = append(rightColNames, k)
+			}
+		}
+	}
+
+	var leftColNames []string
+	if ate, ok := join.LeftExpr.(*sqlparser.AliasedTableExpr); ok {
+		_, tName, _ := extractTableAliasFromAliased(ate)
+		if ltbl, err := e.Storage.GetTable(e.CurrentDB, tName); err == nil {
+			for _, col := range ltbl.Def.Columns {
+				leftColNames = append(leftColNames, col.Name)
+			}
+		}
+	}
+	if len(leftColNames) == 0 && len(leftRows) > 0 {
+		seen := make(map[string]bool)
+		for k := range leftRows[0] {
+			if !strings.Contains(k, ".") && !seen[k] {
+				seen[k] = true
+				leftColNames = append(leftColNames, k)
+			}
+		}
+	}
+
+	joinType := join.Join
+
+	// Handle RIGHT JOIN by swapping left and right and treating as LEFT JOIN
+	if joinType == sqlparser.RightJoinType || joinType == sqlparser.NaturalRightJoinType {
+		leftRows, rightRows = rightRows, leftRows
+		leftAlias, rightAlias = rightAlias, leftAlias
+		leftColNames, rightColNames = rightColNames, leftColNames
+		if joinType == sqlparser.RightJoinType {
+			joinType = sqlparser.LeftJoinType
+		} else {
+			joinType = sqlparser.NaturalLeftJoinType
+		}
+	}
+
+	// Build ON condition for NATURAL joins (auto-join on common column names)
+	isNatural := joinType == sqlparser.NaturalJoinType || joinType == sqlparser.NaturalLeftJoinType
+	var naturalCols []string
+	if isNatural {
+		rightSet := make(map[string]bool)
+		for _, c := range rightColNames {
+			rightSet[strings.ToLower(c)] = true
+		}
+		for _, c := range leftColNames {
+			if rightSet[strings.ToLower(c)] {
+				naturalCols = append(naturalCols, c)
+			}
+		}
+	}
+
+	isLeft := joinType == sqlparser.LeftJoinType || joinType == sqlparser.NaturalLeftJoinType
+	isCross := joinType == sqlparser.NormalJoinType
 
 	var result []storage.Row
 	for _, leftRow := range leftRows {
@@ -1126,7 +1550,40 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 			}
 			for k, v := range rightRow {
 				combined[k] = v
-				combined[rightAlias+"."+k] = v
+				if rightAlias != "" {
+					combined[rightAlias+"."+k] = v
+				}
+			}
+
+			// CROSS JOIN: no condition, all combinations
+			if isCross {
+				result = append(result, combined)
+				matched = true
+				continue
+			}
+
+			// NATURAL JOIN: match on common columns
+			if isNatural {
+				if len(naturalCols) == 0 {
+					// No common columns = cross join
+					result = append(result, combined)
+					matched = true
+					continue
+				}
+				allMatch := true
+				for _, col := range naturalCols {
+					lv := leftRow[col]
+					rv := rightRow[col]
+					if lv == nil || rv == nil || fmt.Sprintf("%v", lv) != fmt.Sprintf("%v", rv) {
+						allMatch = false
+						break
+					}
+				}
+				if allMatch {
+					result = append(result, combined)
+					matched = true
+				}
+				continue
 			}
 
 			// Evaluate ON condition
@@ -1149,9 +1606,11 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 			for k, v := range leftRow {
 				combined[k] = v
 			}
-			for _, col := range rightTbl.Def.Columns {
-				combined[col.Name] = nil
-				combined[rightAlias+"."+col.Name] = nil
+			for _, col := range rightColNames {
+				combined[col] = nil
+				if rightAlias != "" {
+					combined[rightAlias+"."+col] = nil
+				}
 			}
 			result = append(result, combined)
 		}
@@ -1243,6 +1702,10 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 			}
 		}
 		allRows = filtered
+		// Clear sql_auto_is_null after WHERE evaluation
+		if e.sqlAutoIsNull && e.lastAutoIncID > 0 {
+			e.lastAutoIncID = 0
+		}
 	}
 
 	// Check if we have GROUP BY or aggregate functions
@@ -1846,6 +2309,11 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 	if len(stmt.TableExprs) == 0 {
 		return nil, fmt.Errorf("no table specified")
+	}
+
+	// Multi-table DELETE: when Targets is populated
+	if len(stmt.Targets) > 0 {
+		return e.execMultiTableDeleteAST(stmt)
 	}
 
 	tableName := ""
@@ -2714,7 +3182,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		case sqlparser.IntVal:
 			n, err := strconv.ParseInt(v.Val, 10, 64)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("INT_OVERFLOW:%s", v.Val)
 			}
 			return n, nil
 		case sqlparser.FloatVal, sqlparser.DecimalVal:
@@ -2754,7 +3222,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		case "collation_connection":
 			return "utf8mb4_general_ci", nil
 		case "sql_mode":
-			return "", nil
+			return e.sqlMode, nil
 		case "autocommit":
 			return int64(1), nil
 		}
@@ -2913,7 +3381,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.CurTimeFuncExpr:
 		// NOW(), CURRENT_TIMESTAMP(), CURTIME(), etc.
 		name := strings.ToLower(v.Name.String())
-		now := time.Now()
+		now := e.nowTime()
 		switch name {
 		case "now", "current_timestamp", "localtime", "localtimestamp", "sysdate":
 			return now.Format("2006-01-02 15:04:05"), nil
@@ -2922,11 +3390,11 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		case "curtime", "current_time":
 			return now.Format("15:04:05"), nil
 		case "utc_timestamp":
-			return time.Now().UTC().Format("2006-01-02 15:04:05"), nil
+			return e.nowTime().UTC().Format("2006-01-02 15:04:05"), nil
 		case "utc_date":
-			return time.Now().UTC().Format("2006-01-02"), nil
+			return e.nowTime().UTC().Format("2006-01-02"), nil
 		case "utc_time":
-			return time.Now().UTC().Format("15:04:05"), nil
+			return e.nowTime().UTC().Format("15:04:05"), nil
 		default:
 			return now.Format("2006-01-02 15:04:05"), nil
 		}
@@ -2949,11 +3417,11 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		return e.lastInsertID, nil
 	case "now", "current_timestamp", "sysdate":
-		return time.Now().Format("2006-01-02 15:04:05"), nil
+		return e.nowTime().Format("2006-01-02 15:04:05"), nil
 	case "curdate", "current_date":
-		return time.Now().Format("2006-01-02"), nil
+		return e.nowTime().Format("2006-01-02"), nil
 	case "curtime", "current_time":
-		return time.Now().Format("15:04:05"), nil
+		return e.nowTime().Format("15:04:05"), nil
 	case "database", "schema":
 		return e.CurrentDB, nil
 	case "version":
@@ -3354,7 +3822,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		return v0, nil
 	case "unix_timestamp":
 		if len(v.Exprs) == 0 {
-			return int64(time.Now().Unix()), nil
+			return int64(e.nowTime().Unix()), nil
 		}
 		val, err := e.evalExpr(v.Exprs[0])
 		if err != nil {
@@ -3949,8 +4417,202 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 
 // evalFuncExprWithRow evaluates a function expression with row context for column references.
 func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (interface{}, error) {
-	// For now, fall back to the normal evalExpr which handles most functions
-	return e.evalExpr(v)
+	// Evaluate function arguments with row context to resolve column references
+	name := strings.ToLower(v.Name.String())
+
+	// Helper to evaluate args with row context
+	evalArgs := func() ([]interface{}, error) {
+		args := make([]interface{}, len(v.Exprs))
+		for i, argExpr := range v.Exprs {
+			val, err := e.evalRowExpr(argExpr, row)
+			if err != nil {
+				return nil, err
+			}
+			args[i] = val
+		}
+		return args, nil
+	}
+
+	switch name {
+	case "upper", "ucase":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		return strings.ToUpper(toString(args[0])), nil
+	case "lower", "lcase":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		return strings.ToLower(toString(args[0])), nil
+	case "concat":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		var sb strings.Builder
+		for _, a := range args {
+			if a == nil {
+				return nil, nil
+			}
+			sb.WriteString(toString(a))
+		}
+		return sb.String(), nil
+	case "length", "octet_length":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		return int64(len(toString(args[0]))), nil
+	case "char_length", "character_length":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		return int64(len([]rune(toString(args[0])))), nil
+	case "date":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, err := parseDateTimeValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return t.Format("2006-01-02"), nil
+	case "year":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, err := parseDateTimeValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return int64(t.Year()), nil
+	case "month":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, err := parseDateTimeValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return int64(t.Month()), nil
+	case "day", "dayofmonth":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, err := parseDateTimeValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return int64(t.Day()), nil
+	case "hour":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, err := parseDateTimeValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return int64(t.Hour()), nil
+	case "minute":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, err := parseDateTimeValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return int64(t.Minute()), nil
+	case "second":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		t, err := parseDateTimeValue(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return int64(t.Second()), nil
+	case "if":
+		if len(v.Exprs) < 3 {
+			return nil, fmt.Errorf("IF requires 3 arguments")
+		}
+		cond, err := e.evalRowExpr(v.Exprs[0], row)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(cond) {
+			return e.evalRowExpr(v.Exprs[1], row)
+		}
+		return e.evalRowExpr(v.Exprs[2], row)
+	case "ifnull", "nvl":
+		if len(v.Exprs) < 2 {
+			return nil, nil
+		}
+		val, err := e.evalRowExpr(v.Exprs[0], row)
+		if err != nil {
+			return nil, err
+		}
+		if val != nil {
+			return val, nil
+		}
+		return e.evalRowExpr(v.Exprs[1], row)
+	case "coalesce":
+		for _, argExpr := range v.Exprs {
+			val, err := e.evalRowExpr(argExpr, row)
+			if err != nil {
+				return nil, err
+			}
+			if val != nil {
+				return val, nil
+			}
+		}
+		return nil, nil
+	default:
+		// Fallback: delegate to evalFuncExpr (no row context for args)
+		return e.evalFuncExpr(v)
+	}
 }
 
 // evalRowExpr is a package-level shim for backward-compatible callers that
@@ -4063,6 +4725,11 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 		}
 		switch v.Right {
 		case sqlparser.IsNullOp:
+			if e.sqlAutoIsNull && e.lastAutoIncID > 0 && val != nil {
+				if fmt.Sprintf("%v", val) == fmt.Sprintf("%v", e.lastAutoIncID) {
+					return true, nil
+				}
+			}
 			return val == nil, nil
 		case sqlparser.IsNotNullOp:
 			return val != nil, nil
@@ -4951,4 +5618,334 @@ func (e *Executor) execSelectInto(stmtStr string, paramVars map[string]interface
 	}
 
 	return nil
+}
+
+// truncateNear truncates a SQL string for error messages (MySQL shows ~80 chars).
+func truncateNear(s string) string {
+	if len(s) > 80 {
+		return s[:80]
+	}
+	return s
+}
+
+// execMultiTableDelete handles multi-table DELETE statements:
+// Syntax 1: DELETE t1,t2 FROM t1,t2,t3 WHERE ...
+// Syntax 2: DELETE FROM t1,t2 USING t1,t2,t3 WHERE ...
+// Supports: QUICK/LOW_PRIORITY/IGNORE modifiers, t1.* syntax, db.table syntax
+func (e *Executor) execMultiTableDelete(query string) (*Result, error) {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	rest := strings.TrimSpace(query[len("DELETE "):])
+	restUpper := strings.ToUpper(rest)
+
+	// Strip modifiers: LOW_PRIORITY, QUICK, IGNORE
+	for _, mod := range []string{"LOW_PRIORITY ", "QUICK ", "IGNORE "} {
+		for strings.HasPrefix(restUpper, mod) {
+			rest = strings.TrimSpace(rest[len(mod):])
+			restUpper = strings.ToUpper(rest)
+		}
+	}
+
+	var deleteTargets []string
+	var fromTablesStr string
+	var whereClause string
+
+	// Detect syntax: "FROM ... USING ..." vs "targets FROM tables WHERE ..."
+	if strings.HasPrefix(restUpper, "FROM ") {
+		// Syntax 2: DELETE [mods] FROM target_tables USING source_tables WHERE ...
+		rest = strings.TrimSpace(rest[len("FROM "):])
+		restUpper = strings.ToUpper(rest)
+		usingIdx := strings.Index(restUpper, " USING ")
+		if usingIdx < 0 {
+			return nil, fmt.Errorf("invalid multi-table DELETE syntax: missing USING")
+		}
+		targetsStr := strings.TrimSpace(rest[:usingIdx])
+		afterUsing := strings.TrimSpace(rest[usingIdx+len(" USING "):])
+		for _, t := range strings.Split(targetsStr, ",") {
+			t = strings.TrimSpace(t)
+			t = strings.Trim(t, "`")
+			t = strings.TrimSuffix(t, ".*")
+			if t != "" {
+				deleteTargets = append(deleteTargets, t)
+			}
+		}
+		whereUpper := strings.ToUpper(afterUsing)
+		if whereIdx := strings.Index(whereUpper, " WHERE "); whereIdx >= 0 {
+			whereClause = strings.TrimSpace(afterUsing[whereIdx+len(" WHERE "):])
+			whereClause = strings.TrimSuffix(whereClause, ";")
+			fromTablesStr = strings.TrimSpace(afterUsing[:whereIdx])
+		} else {
+			fromTablesStr = strings.TrimSuffix(strings.TrimSpace(afterUsing), ";")
+		}
+	} else {
+		// Syntax 1: DELETE target_tables FROM source_tables WHERE ...
+		_ = upper
+		fromIdx := strings.Index(restUpper, " FROM ")
+		if fromIdx < 0 {
+			return nil, fmt.Errorf("invalid multi-table DELETE syntax: missing FROM")
+		}
+		targetsStr := strings.TrimSpace(rest[:fromIdx])
+		afterFrom := strings.TrimSpace(rest[fromIdx+len(" FROM "):])
+		for _, t := range strings.Split(targetsStr, ",") {
+			t = strings.TrimSpace(t)
+			t = strings.Trim(t, "`")
+			t = strings.TrimSuffix(t, ".*")
+			if t != "" {
+				deleteTargets = append(deleteTargets, t)
+			}
+		}
+		whereUpper := strings.ToUpper(afterFrom)
+		if whereIdx := strings.Index(whereUpper, " WHERE "); whereIdx >= 0 {
+			whereClause = strings.TrimSpace(afterFrom[whereIdx+len(" WHERE "):])
+			whereClause = strings.TrimSuffix(whereClause, ";")
+			fromTablesStr = strings.TrimSpace(afterFrom[:whereIdx])
+		} else {
+			fromTablesStr = strings.TrimSuffix(strings.TrimSpace(afterFrom), ";")
+		}
+	}
+
+	// Resolve qualified target names (db.table -> use that db for lookup)
+	// For now just extract the table name part
+	for i, t := range deleteTargets {
+		if parts := strings.Split(t, "."); len(parts) > 1 {
+			deleteTargets[i] = parts[len(parts)-1] // take last part as table name
+		}
+	}
+
+	// Parse table refs
+	type tableRef struct {
+		name  string
+		alias string
+		db    string
+	}
+	var tableRefs []tableRef
+	for _, t := range strings.Split(fromTablesStr, ",") {
+		t = strings.TrimSpace(t)
+		t = strings.Trim(t, ";")
+		parts := strings.Fields(t)
+		if len(parts) == 0 {
+			continue
+		}
+		name := strings.Trim(parts[0], "`")
+		alias := name
+		db := e.CurrentDB
+		// Handle db.table qualified names
+		if dotParts := strings.Split(name, "."); len(dotParts) == 2 {
+			db = dotParts[0]
+			name = dotParts[1]
+			alias = name
+		}
+		if len(parts) >= 3 && strings.ToUpper(parts[1]) == "AS" {
+			alias = strings.Trim(parts[2], "`")
+		} else if len(parts) >= 2 && strings.ToUpper(parts[1]) != "AS" {
+			alias = strings.Trim(parts[1], "`")
+		}
+		tableRefs = append(tableRefs, tableRef{name: name, alias: alias, db: db})
+	}
+
+	if len(tableRefs) == 0 {
+		return &Result{}, nil
+	}
+
+	// Build cross-product of all table rows
+	allRows, err := e.getTableRowsWithAliasDB(tableRefs[0].db, tableRefs[0].name, tableRefs[0].alias)
+	if err != nil {
+		return nil, err
+	}
+	for i := 1; i < len(tableRefs); i++ {
+		tRows, err := e.getTableRowsWithAliasDB(tableRefs[i].db, tableRefs[i].name, tableRefs[i].alias)
+		if err != nil {
+			return nil, err
+		}
+		allRows = crossProduct(allRows, tRows)
+	}
+
+	// Apply WHERE filter
+	if whereClause != "" {
+		// Build a SELECT statement to parse the WHERE clause
+		// Use the first table as a dummy FROM to help vitess parse qualified column refs
+		selectSQL := "SELECT 1 FROM dual WHERE " + whereClause
+		parsedStmt, err := sqlparser.NewTestParser().Parse(selectSQL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse WHERE clause: %v", err)
+		}
+		sel, ok := parsedStmt.(*sqlparser.Select)
+		if !ok || sel.Where == nil {
+			return nil, fmt.Errorf("failed to parse WHERE clause")
+		}
+		filtered := make([]storage.Row, 0)
+		for _, row := range allRows {
+			match, err := e.evalWhere(sel.Where.Expr, row)
+			if err != nil {
+				return nil, err
+			}
+			if match {
+				filtered = append(filtered, row)
+			}
+		}
+		allRows = filtered
+	}
+
+	// Delete matched rows from target tables
+	var totalAffected uint64
+	for _, target := range deleteTargets {
+		// Find the matching table ref (to get the right db)
+		targetDB := e.CurrentDB
+		for _, ref := range tableRefs {
+			if ref.name == target || ref.alias == target {
+				targetDB = ref.db
+				break
+			}
+		}
+		tbl, err := e.Storage.GetTable(targetDB, target)
+		if err != nil {
+			continue
+		}
+		deleteIndices := make(map[int]bool)
+		for _, matchedRow := range allRows {
+			for i, existingRow := range tbl.Rows {
+				if deleteIndices[i] {
+					continue
+				}
+				allMatch := true
+				for _, col := range tbl.Def.Columns {
+					mv, ok := matchedRow[target+"."+col.Name]
+					if !ok {
+						mv, ok = matchedRow[col.Name]
+					}
+					if !ok {
+						allMatch = false
+						break
+					}
+					ev := existingRow[col.Name]
+					if fmt.Sprintf("%v", mv) != fmt.Sprintf("%v", ev) {
+						allMatch = false
+						break
+					}
+				}
+				if allMatch {
+					deleteIndices[i] = true
+				}
+			}
+		}
+		if len(deleteIndices) > 0 {
+			tbl.Lock()
+			newRows := make([]storage.Row, 0, len(tbl.Rows)-len(deleteIndices))
+			for i, row := range tbl.Rows {
+				if !deleteIndices[i] {
+					newRows = append(newRows, row)
+				}
+			}
+			tbl.Rows = newRows
+			tbl.Unlock()
+			totalAffected += uint64(len(deleteIndices))
+		}
+	}
+
+	return &Result{AffectedRows: totalAffected}, nil
+}
+
+func (e *Executor) getTableRowsWithAliasDB(dbName, tableName, alias string) ([]storage.Row, error) {
+	tbl, err := e.Storage.GetTable(dbName, tableName)
+	if err != nil {
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", dbName, tableName))
+	}
+	raw := tbl.Scan()
+	result := make([]storage.Row, len(raw))
+	for i, row := range raw {
+		newRow := make(storage.Row, len(row)*2)
+		for k, v := range row {
+			newRow[k] = v
+			newRow[alias+"."+k] = v
+		}
+		result[i] = newRow
+	}
+	return result, nil
+}
+
+func crossProduct(left, right []storage.Row) []storage.Row {
+	var result []storage.Row
+	for _, l := range left {
+		for _, r := range right {
+			combined := make(storage.Row, len(l)+len(r))
+			for k, v := range l {
+				combined[k] = v
+			}
+			for k, v := range r {
+				combined[k] = v
+			}
+			result = append(result, combined)
+		}
+	}
+	return result
+}
+
+// execCreateTableLike handles CREATE TABLE t2 LIKE t1.
+func (e *Executor) execCreateTableLike(newTableName, srcTableName string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+	srcDef, err := db.GetTable(srcTableName)
+	if err != nil {
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, srcTableName))
+	}
+	newCols := make([]catalog.ColumnDef, len(srcDef.Columns))
+	copy(newCols, srcDef.Columns)
+	newIndexes := make([]catalog.IndexDef, len(srcDef.Indexes))
+	copy(newIndexes, srcDef.Indexes)
+	var newPK []string
+	if srcDef.PrimaryKey != nil {
+		newPK = make([]string, len(srcDef.PrimaryKey))
+		copy(newPK, srcDef.PrimaryKey)
+	}
+	newDef := &catalog.TableDef{
+		Name:       newTableName,
+		Columns:    newCols,
+		PrimaryKey: newPK,
+		Indexes:    newIndexes,
+	}
+	if err := db.CreateTable(newDef); err != nil {
+		return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newTableName))
+	}
+	e.Storage.CreateTable(e.CurrentDB, newDef)
+	return &Result{}, nil
+}
+
+// execCreateTableSelect handles CREATE TABLE t2 [AS] SELECT ...
+func (e *Executor) execCreateTableSelect(newTableName, selectSQL string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+	result, err := e.Execute(selectSQL)
+	if err != nil {
+		return nil, err
+	}
+	var cols []catalog.ColumnDef
+	for _, colName := range result.Columns {
+		cols = append(cols, catalog.ColumnDef{
+			Name:     colName,
+			Type:     "text",
+			Nullable: true,
+		})
+	}
+	newDef := &catalog.TableDef{
+		Name:    newTableName,
+		Columns: cols,
+	}
+	if err := db.CreateTable(newDef); err != nil {
+		return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newTableName))
+	}
+	e.Storage.CreateTable(e.CurrentDB, newDef)
+	tbl, _ := e.Storage.GetTable(e.CurrentDB, newTableName)
+	for _, row := range result.Rows {
+		sRow := make(storage.Row)
+		for i, colName := range result.Columns {
+			if i < len(row) {
+				sRow[colName] = row[i]
+			}
+		}
+		tbl.Insert(sRow) //nolint:errcheck
+	}
+	return &Result{}, nil
 }

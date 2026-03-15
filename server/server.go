@@ -302,6 +302,14 @@ func resultToMySQLBinary(result *executor.Result) (*mysql.Result, error) {
 		return &mysql.Result{Resultset: r}, nil
 	}
 
+	// Fix empty strings for binary result path too
+	for i, row := range result.Rows {
+		for j, val := range row {
+			if s, ok := val.(string); ok && s == "" {
+				result.Rows[i][j] = []byte{}
+			}
+		}
+	}
 	r, err := mysql.BuildSimpleResultset(
 		makeFields(result.Columns),
 		result.Rows,
@@ -367,6 +375,16 @@ func normalizeRows(rows [][]interface{}) [][]interface{} {
 		}
 	}
 	if !needsNorm {
+		// Fix empty strings even when no type normalization is needed.
+		// go-mysql's BuildSimpleResultset encodes Go's "" as NULL because
+		// unsafe.StringData("") returns nil. Convert "" to []byte{} instead.
+		for i, row := range rows {
+			for j, val := range row {
+				if s, ok := val.(string); ok && s == "" {
+					rows[i][j] = []byte{}
+				}
+			}
+		}
 		return rows
 	}
 
@@ -378,6 +396,10 @@ func normalizeRows(rows [][]interface{}) [][]interface{} {
 		for j, val := range row {
 			if j < numCols && colMixed[j] && val != nil {
 				newRow[j] = fmt.Sprintf("%v", val)
+			}
+			// Fix empty strings (see comment above)
+			if s, ok := newRow[j].(string); ok && s == "" {
+				newRow[j] = []byte{}
 			}
 		}
 		out[i] = newRow
