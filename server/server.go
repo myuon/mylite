@@ -57,6 +57,10 @@ func (h *Handler) HandleQuery(query string) (*mysql.Result, error) {
 
 	result, err := h.exec.Execute(query)
 	if err != nil {
+		errMsg := err.Error()
+		if strings.HasPrefix(errMsg, "ERROR ") {
+			return nil, fmt.Errorf("%s", errMsg)
+		}
 		return nil, fmt.Errorf("ERROR 1064 (42000): %v", err)
 	}
 
@@ -123,6 +127,10 @@ func (h *Handler) HandleStmtExecute(context interface{}, query string, args []in
 
 	result, err := h.exec.Execute(finalQuery)
 	if err != nil {
+		errMsg := err.Error()
+		if strings.HasPrefix(errMsg, "ERROR ") {
+			return nil, fmt.Errorf("%s", errMsg)
+		}
 		return nil, fmt.Errorf("ERROR 1064 (42000): %v", err)
 	}
 

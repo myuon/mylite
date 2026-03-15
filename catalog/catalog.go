@@ -14,6 +14,7 @@ type ColumnDef struct {
 	AutoIncrement bool
 	PrimaryKey    bool
 	Unique        bool
+	Comment       string
 }
 
 // IndexDef represents an index definition.

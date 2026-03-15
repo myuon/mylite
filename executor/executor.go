@@ -295,6 +295,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			colDef.Nullable = false
 		}
 
+		// Save comment
+		if col.Type.Options != nil && col.Type.Options.Comment != nil {
+			colDef.Comment = col.Type.Options.Comment.Val
+		}
+
 		columns = append(columns, colDef)
 	}
 
@@ -1409,6 +1414,9 @@ func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 		if col.Type.Options.KeyOpt == 2 { // colKeyUnique
 			colDef.Unique = true
 		}
+		if col.Type.Options.Comment != nil {
+			colDef.Comment = col.Type.Options.Comment.Val
+		}
 	}
 	return colDef
 }
@@ -1634,9 +1642,13 @@ func mysqlDisplayType(colType string) string {
 	base := upper
 	suffix := ""
 	if idx := strings.Index(upper, "("); idx >= 0 {
-		base = upper[:idx]
 		// Already has width specified, just lowercase it
-		return strings.ToLower(colType)
+		// But also normalize REAL to DOUBLE
+		result := strings.ToLower(colType)
+		if strings.HasPrefix(strings.ToLower(result), "real") {
+			result = "double" + result[4:]
+		}
+		return result
 	}
 	// Check for UNSIGNED suffix
 	if strings.HasSuffix(base, " UNSIGNED") {
@@ -1644,21 +1656,34 @@ func mysqlDisplayType(colType string) string {
 		suffix = " unsigned"
 	}
 
-	// Add default display widths
+	// Add default display widths (differ for signed vs unsigned in MySQL)
+	isUnsigned := suffix != ""
 	switch base {
 	case "TINYINT":
+		if isUnsigned {
+			return "tinyint(3)" + suffix
+		}
 		return "tinyint(4)" + suffix
 	case "SMALLINT":
+		if isUnsigned {
+			return "smallint(5)" + suffix
+		}
 		return "smallint(6)" + suffix
 	case "MEDIUMINT":
+		if isUnsigned {
+			return "mediumint(8)" + suffix
+		}
 		return "mediumint(9)" + suffix
 	case "INT", "INTEGER":
+		if isUnsigned {
+			return "int(10)" + suffix
+		}
 		return "int(11)" + suffix
 	case "BIGINT":
 		return "bigint(20)" + suffix
 	case "FLOAT":
 		return "float" + suffix
-	case "DOUBLE":
+	case "DOUBLE", "REAL":
 		return "double" + suffix
 	case "DECIMAL":
 		return "decimal(10,0)" + suffix
@@ -1711,6 +1736,9 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 			parts = append(parts, "AUTO_INCREMENT")
 		} else if col.Default != nil {
 			parts = append(parts, fmt.Sprintf("DEFAULT %s", *col.Default))
+		}
+		if col.Comment != "" {
+			parts = append(parts, fmt.Sprintf("COMMENT '%s'", col.Comment))
 		}
 		colDefs = append(colDefs, strings.Join(parts, " "))
 		if col.PrimaryKey {
