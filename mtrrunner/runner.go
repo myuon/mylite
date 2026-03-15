@@ -5,6 +5,7 @@ package mtrrunner
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 // TestResult represents the outcome of running a single .test file.
@@ -62,8 +64,10 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		}
 	}
 
-	// Execute
-	ctx := &execContext{
+	// Execute with timeout
+	timeout := 10 * time.Second
+	doneCh := make(chan error, 1)
+	ectx := &execContext{
 		runner:          r,
 		db:              r.DB,
 		output:          &strings.Builder{},
@@ -73,7 +77,19 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		sortResult:      false,
 	}
 
-	err = ctx.executeLines(lines)
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	go func() {
+		doneCh <- ectx.executeLines(lines)
+	}()
+
+	select {
+	case err = <-doneCh:
+	case <-timeoutCtx.Done():
+		return TestResult{Name: name, Error: "timeout: test took too long"}
+	}
+	ctx := ectx
 	if err != nil {
 		return TestResult{
 			Name:   name,
