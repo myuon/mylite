@@ -337,6 +337,23 @@ func replaceTypeWord(query, old, replacement string) string {
 	return query
 }
 
+// normalizeAddIndexUsing rewrites "ADD KEY USING BTREE (" and similar forms
+// to "ADD KEY (" since the vitess parser does not handle USING before column list.
+func normalizeAddIndexUsing(query string) string {
+	upper := strings.ToUpper(query)
+	if !strings.Contains(upper, "ALTER TABLE") {
+		return query
+	}
+	// Use regex to match ADD KEY/INDEX ... USING METHOD ... (col) with flexible spacing
+	// Pattern 1: ADD KEY USING BTREE (col) - no index name
+	re1 := regexp.MustCompile(`(?i)(ADD\s+(UNIQUE\s+)?(KEY|INDEX))\s+USING\s+\w+\s*(\()`)
+	query = re1.ReplaceAllString(query, "${1} ${4}")
+	// Pattern 2: ADD KEY name USING BTREE (col) - with index name
+	re2 := regexp.MustCompile(`(?i)(ADD\s+(UNIQUE\s+)?(KEY|INDEX)\s+\w+)\s+USING\s+\w+\s*(\()`)
+	query = re2.ReplaceAllString(query, "${1} ${4}")
+	return query
+}
+
 func (e *Executor) Execute(query string) (*Result, error) {
 	// Handle MYLITE control commands before passing to the SQL parser.
 	trimmed := strings.TrimSpace(query)
@@ -347,6 +364,9 @@ func (e *Executor) Execute(query string) (*Result, error) {
 
 	// Normalize SQL type aliases that vitess parser doesn't support
 	query = normalizeTypeAliases(query)
+	// Fix vitess parser issue: "ADD KEY USING BTREE (col)" is not parsed correctly.
+	// Rewrite to "ADD KEY (col)" since BTREE is the default for InnoDB.
+	query = normalizeAddIndexUsing(query)
 
 	// Handle ALTER DATABASE/SCHEMA ... CHARACTER SET (vitess parser doesn't parse CHARACTER SET)
 	if (strings.HasPrefix(upper, "ALTER DATABASE") || strings.HasPrefix(upper, "ALTER SCHEMA")) &&
@@ -1362,7 +1382,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			isUnique := idx.Info.Type == sqlparser.IndexTypeUnique
 			idxName := idx.Info.Name.String()
 			if idxName == "" {
-				idxName = idxCols[0]
+				if cn := idx.Info.ConstraintName.String(); cn != "" {
+					idxName = cn
+				} else {
+					idxName = idxCols[0]
+				}
 			}
 			idxComment := ""
 			for _, opt := range idx.Options {
@@ -1790,11 +1814,16 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						tbl.Unlock()
 						return nil, err
 					}
-					// Pad BINARY(N) values.
+					// Pad BINARY(N) values, coerce DATE/TIME.
 					for _, col := range tbl.Def.Columns {
 						if col.Name == colName {
 							if padLen := binaryPadLength(col.Type); padLen > 0 && val != nil {
 								val = padBinaryValue(val, padLen)
+							}
+							if val != nil {
+								val = formatDecimalValue(col.Type, val)
+								val = validateEnumSetValue(col.Type, val)
+								val = coerceDateTimeValue(col.Type, val)
 							}
 							break
 						}
@@ -2858,6 +2887,17 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 							break
 						}
 					}
+				} else {
+					// Even with no rows, resolve against information_schema column names
+					upperName := strings.ToUpper(name)
+					for _, order := range infoSchemaColumnOrder {
+						for _, col := range order {
+							if col == upperName {
+								name = col
+								break
+							}
+						}
+					}
 				}
 			} else {
 				name = normalizeSQLDisplayName(sqlparser.String(se.Expr))
@@ -3176,6 +3216,11 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 					if padLen := binaryPadLength(col.Type); padLen > 0 && val != nil {
 						val = padBinaryValue(val, padLen)
 					}
+					if val != nil {
+						val = formatDecimalValue(col.Type, val)
+						val = validateEnumSetValue(col.Type, val)
+						val = coerceDateTimeValue(col.Type, val)
+					}
 					break
 				}
 			}
@@ -3219,8 +3264,9 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		return nil, fmt.Errorf("no table specified")
 	}
 
-	// Multi-table DELETE: when Targets is populated
-	if len(stmt.Targets) > 0 {
+	// Multi-table DELETE: when Targets is populated and differs from TableExprs.
+	// DELETE QUICK sets Targets but is still a single-table delete.
+	if len(stmt.Targets) > 0 && len(stmt.Targets) != len(stmt.TableExprs) {
 		return e.execMultiTableDeleteAST(stmt)
 	}
 
@@ -3563,11 +3609,16 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			isUnique := op.IndexDefinition.Info.Type == sqlparser.IndexTypeUnique
 			isPrimary := op.IndexDefinition.Info.Type == sqlparser.IndexTypePrimary
 			idxName := op.IndexDefinition.Info.Name.String()
-			if idxName == "" && len(idxCols) > 0 {
-				idxName = idxCols[0]
+			if idxName == "" {
+				if cn := op.IndexDefinition.Info.ConstraintName.String(); cn != "" {
+					idxName = cn
+				} else if len(idxCols) > 0 {
+					idxName = idxCols[0]
+				}
 			}
-			// Check for USING method (default BTREE for InnoDB)
+			// Check for USING method (default BTREE for InnoDB) and COMMENT
 			usingMethod := "BTREE"
+			idxComment := ""
 			for _, opt := range op.IndexDefinition.Options {
 				if opt.Name == "USING" {
 					// InnoDB does not support HASH; silently ignore it.
@@ -3576,6 +3627,9 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					} else {
 						usingMethod = opt.String
 					}
+				}
+				if strings.ToUpper(opt.Name) == "COMMENT" {
+					idxComment = opt.String
 				}
 			}
 			if isPrimary {
@@ -3586,6 +3640,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					Columns: idxCols,
 					Unique:  isUnique,
 					Using:   usingMethod,
+					Comment: idxComment,
 				})
 			}
 
@@ -4159,13 +4214,17 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 			}
 		}
 		usingStr := ""
-		if idx.Using != "" {
+		if idx.Using != "" && !strings.EqualFold(idx.Using, "BTREE") {
 			usingStr = " USING " + idx.Using
 		}
+		commentStr := ""
+		if idx.Comment != "" {
+			commentStr = fmt.Sprintf(" COMMENT '%s'", idx.Comment)
+		}
 		if idx.Unique {
-			b.WriteString(fmt.Sprintf("  UNIQUE KEY `%s` (%s)%s", idx.Name, strings.Join(quotedCols, ","), usingStr))
+			b.WriteString(fmt.Sprintf("  UNIQUE KEY `%s` (%s)%s%s", idx.Name, strings.Join(quotedCols, ","), usingStr, commentStr))
 		} else {
-			b.WriteString(fmt.Sprintf("  KEY `%s` (%s)%s", idx.Name, strings.Join(quotedCols, ","), usingStr))
+			b.WriteString(fmt.Sprintf("  KEY `%s` (%s)%s%s", idx.Name, strings.Join(quotedCols, ","), usingStr, commentStr))
 		}
 		if i < len(def.Indexes)-1 {
 			b.WriteString(",")
@@ -6440,6 +6499,9 @@ func compareNumeric(a, b interface{}) int {
 	if aIsStr || bIsStr {
 		sa := toString(a)
 		sb := toString(b)
+		// Normalize date/time comparisons: when one is TIME-like and
+		// the other is DATETIME-like, extract the matching part.
+		sa, sb = normalizeDateTimeForCompare(sa, sb)
 		if sa < sb {
 			return -1
 		}
@@ -6457,6 +6519,57 @@ func compareNumeric(a, b interface{}) int {
 		return 1
 	}
 	return 0
+}
+
+
+// normalizeDateTimeForCompare ensures two date/time string values are
+// compared using the same granularity. When one looks like a TIME (HH:MM:SS)
+// and the other looks like a DATETIME (YYYY-MM-DD HH:MM:SS), the DATETIME is
+// truncated to TIME. Similarly, DATE vs DATETIME extracts the DATE part.
+func normalizeDateTimeForCompare(a, b string) (string, string) {
+	aIsDate := isDateString(a)
+	bIsDate := isDateString(b)
+	aIsTime := isTimeString(a)
+	bIsTime := isTimeString(b)
+	aIsDatetime := isDatetimeString(a)
+	bIsDatetime := isDatetimeString(b)
+
+	// TIME vs DATETIME: extract time part from datetime
+	if aIsTime && bIsDatetime {
+		if idx := strings.Index(b, " "); idx >= 0 {
+			b = b[idx+1:]
+		}
+	} else if bIsTime && aIsDatetime {
+		if idx := strings.Index(a, " "); idx >= 0 {
+			a = a[idx+1:]
+		}
+	}
+
+	// DATE vs DATETIME: extend DATE to DATETIME by appending " 00:00:00"
+	if aIsDate && !aIsDatetime && bIsDatetime {
+		a = a + " 00:00:00"
+	} else if bIsDate && !bIsDatetime && aIsDatetime {
+		b = b + " 00:00:00"
+	}
+
+	return a, b
+}
+
+func isDateString(s string) bool {
+	return len(s) >= 10 && s[4] == '-' && s[7] == '-' && (len(s) == 10 || s[10] == ' ')
+}
+
+func isTimeString(s string) bool {
+	if len(s) < 5 || len(s) > 8 {
+		return false
+	}
+	// HH:MM:SS or H:MM:SS
+	parts := strings.Split(s, ":")
+	return len(parts) == 3
+}
+
+func isDatetimeString(s string) bool {
+	return len(s) == 19 && s[4] == '-' && s[7] == '-' && s[10] == ' ' && s[13] == ':' && s[16] == ':'
 }
 
 func toFloat(v interface{}) float64 {
