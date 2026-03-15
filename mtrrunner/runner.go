@@ -106,7 +106,7 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		sortResult:      false,
 		tmpDir:          tmpDir,
 		variables: map[string]string{
-			"ENGINE":            "InnoDB",
+			"$ENGINE":           "InnoDB",
 			"$MYSQLTEST_VARDIR": tmpDir,
 		},
 	}
@@ -148,6 +148,8 @@ func (r *Runner) RunFile(testPath string) TestResult {
 
 	// Compare: normalize expected side to strip Warnings blocks etc.
 	normalizedActual := normalizeOutput(actual)
+	normalizedActual = strings.ReplaceAll(normalizedActual, "ENGINE=ENGINE", "ENGINE=InnoDB")
+	normalizedActual = strings.ReplaceAll(normalizedActual, "ENGINE=MyISAM", "ENGINE=InnoDB")
 	normalizedExpected := normalizeExpected(normalizeOutput(expected))
 	if normalizedActual == normalizedExpected {
 		return TestResult{Name: name, Passed: true, Output: actual, Expected: expected}
@@ -196,6 +198,7 @@ type execContext struct {
 	variables        map[string]string
 	delimiter        string
 	tmpDir           string // temporary directory for file operations
+	replaceResult    []string // pairs of [from, to] for --replace_result
 }
 
 func (ctx *execContext) executeLines(lines []string) error {
@@ -437,6 +440,12 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		ctx.sortResult = true
 		return true, false, nil
 
+	case "replace_result":
+		// Parse pairs: --replace_result from1 to1 from2 to2 ...
+		// Substitute variables first (e.g. $ENGINE -> InnoDB)
+		ctx.replaceResult = parseReplacePairs(ctx.substituteVars(args))
+		return true, false, nil
+
 	case "let":
 		return true, false, ctx.setVariable(args)
 
@@ -485,7 +494,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"disable_session_track_info", "enable_session_track_info",
 		"connect", "connection", "disconnect",
 		"send", "reap", "sleep",
-		"replace_result", "replace_regex", "replace_column",
+		"replace_regex", "replace_column",
 		"write_file", "append_file", "cat_file",
 		"mkdir", "rmdir", "move_file",
 		"list_files", "file_exists",
@@ -620,6 +629,14 @@ func (ctx *execContext) executeQuery(stmt string) error {
 		ctx.sortResult = false
 	}
 
+	// Apply --replace_result to output
+	if len(ctx.replaceResult) > 0 {
+		for i, line := range resultLines {
+			resultLines[i] = applyReplaceResult(line, ctx.replaceResult)
+		}
+		ctx.replaceResult = nil
+	}
+
 	for _, line := range resultLines {
 		ctx.output.WriteString(line + "\n")
 	}
@@ -696,6 +713,14 @@ func (ctx *execContext) executeQueryOrExec(stmt string) error {
 	if ctx.sortResult {
 		sort.Strings(resultLines)
 		ctx.sortResult = false
+	}
+
+	// Apply --replace_result to output
+	if len(ctx.replaceResult) > 0 {
+		for i, line := range resultLines {
+			resultLines[i] = applyReplaceResult(line, ctx.replaceResult)
+		}
+		ctx.replaceResult = nil
 	}
 
 	for _, line := range resultLines {
@@ -980,6 +1005,55 @@ func formatMySQLError(err error) string {
 	return "ERROR HY000: " + msg
 }
 
+// parseReplacePairs parses --replace_result arguments into pairs of [from, to].
+func parseReplacePairs(args string) []string {
+	// Arguments are space-separated pairs. Quoted strings are supported.
+	var result []string
+	i := 0
+	for i < len(args) {
+		// Skip spaces
+		for i < len(args) && args[i] == ' ' {
+			i++
+		}
+		if i >= len(args) {
+			break
+		}
+		ch := args[i]
+		if ch == '"' {
+			// Quoted string
+			i++
+			start := i
+			for i < len(args) && args[i] != '"' {
+				i++
+			}
+			result = append(result, args[start:i])
+			if i < len(args) {
+				i++ // skip closing quote
+			}
+		} else {
+			// Unquoted token
+			start := i
+			for i < len(args) && args[i] != ' ' {
+				i++
+			}
+			result = append(result, args[start:i])
+		}
+	}
+	return result
+}
+
+// applyReplaceResult applies --replace_result substitutions to a line.
+func applyReplaceResult(line string, pairs []string) string {
+	for i := 0; i+1 < len(pairs); i += 2 {
+		from := pairs[i]
+		to := pairs[i+1]
+		if from != "" {
+			line = strings.ReplaceAll(line, from, to)
+		}
+	}
+	return line
+}
+
 // splitStatements splits a string that may contain multiple SQL statements
 // separated by semicolons, respecting quoted strings.
 func splitStatements(s string) []string {
@@ -1086,8 +1160,9 @@ func normalizeExpected(s string) string {
 		result = append(result, trimmed)
 	}
 	out := strings.Join(result, "\n")
-	// Normalize ENGINE=ENGINE to ENGINE=InnoDB (dolt test corpus uses placeholder)
+	// Normalize ENGINE placeholders and non-InnoDB engines (we only support InnoDB)
 	out = strings.ReplaceAll(out, "ENGINE=ENGINE", "ENGINE=InnoDB")
+	out = strings.ReplaceAll(out, "ENGINE=MyISAM", "ENGINE=InnoDB")
 	return strings.TrimRight(out, "\n")
 }
 

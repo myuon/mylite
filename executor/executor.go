@@ -344,13 +344,10 @@ func normalizeAddIndexUsing(query string) string {
 	if !strings.Contains(upper, "ALTER TABLE") {
 		return query
 	}
-	// Use regex to match ADD KEY/INDEX ... USING METHOD ... (col) with flexible spacing
-	// Pattern 1: ADD KEY USING BTREE (col) - no index name
-	re1 := regexp.MustCompile(`(?i)(ADD\s+(UNIQUE\s+)?(KEY|INDEX))\s+USING\s+\w+\s*(\()`)
-	query = re1.ReplaceAllString(query, "${1} ${4}")
-	// Pattern 2: ADD KEY name USING BTREE (col) - with index name
-	re2 := regexp.MustCompile(`(?i)(ADD\s+(UNIQUE\s+)?(KEY|INDEX)\s+\w+)\s+USING\s+\w+\s*(\()`)
-	query = re2.ReplaceAllString(query, "${1} ${4}")
+	// Move USING before column list to after it (parser can handle it after)
+	// Pattern: ADD KEY USING BTREE (col) -> ADD KEY (col) USING BTREE
+	re1 := regexp.MustCompile(`(?i)(ADD\s+(UNIQUE\s+)?(KEY|INDEX))\s+USING\s+(\w+)\s*(\([^)]*\))`)
+	query = re1.ReplaceAllString(query, "${1} ${5} USING ${4}")
 	return query
 }
 
@@ -1406,15 +1403,28 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				}
 			}
 			idxComment := ""
+			usingMethod := ""
 			for _, opt := range idx.Options {
 				if strings.ToUpper(opt.Name) == "COMMENT" {
-					idxComment = opt.String
+					if opt.Value != nil {
+						idxComment = opt.Value.Val
+					} else {
+						idxComment = opt.String
+					}
 				}
+				if opt.Name == "USING" {
+					usingMethod = strings.ToUpper(opt.String)
+				}
+			}
+			// MySQL truncates index comments to 1024 characters
+			if len([]rune(idxComment)) > 1024 {
+				idxComment = string([]rune(idxComment)[:1024])
 			}
 			indexes = append(indexes, catalog.IndexDef{
 				Name:    idxName,
 				Columns: idxCols,
 				Unique:  isUnique,
+				Using:   usingMethod,
 				Comment: idxComment,
 			})
 		}
@@ -1486,10 +1496,16 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 						}
 					}
 					if !found {
+						// Try to infer column type from source table
+						colType := "text"
+						colNullable := true
+						if inferredType := e.inferColumnType(selectSQL, selCol); inferredType != "" {
+							colType = inferredType
+						}
 						newCol := catalog.ColumnDef{
 							Name:     selCol,
-							Type:     "VARCHAR(255)",
-							Nullable: true,
+							Type:     colType,
+							Nullable: colNullable,
 						}
 						def.Columns = append(def.Columns, newCol)
 						tbl.AddColumn(selCol, nil)
@@ -3676,25 +3692,28 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					idxName = idxCols[0]
 				}
 			}
-			// Check for USING method (default BTREE for InnoDB) and COMMENT
-			usingMethod := "BTREE"
+			// Check for USING method and COMMENT
+			usingMethod := ""
 			idxComment := ""
 			for _, opt := range op.IndexDefinition.Options {
 				if opt.Name == "USING" {
-					// InnoDB does not support HASH; silently ignore it.
-					if strings.ToUpper(opt.String) == "HASH" {
-						usingMethod = "BTREE"
-					} else {
-						usingMethod = opt.String
-					}
+					usingMethod = strings.ToUpper(opt.String)
 				}
 				if strings.ToUpper(opt.Name) == "COMMENT" {
-					idxComment = opt.String
+					if opt.Value != nil {
+						idxComment = opt.Value.Val
+					} else {
+						idxComment = opt.String
+					}
 				}
 			}
 			if isPrimary {
 				db.SetPrimaryKey(tableName, idxCols)
 			} else {
+				// MySQL truncates index comments to 1024 characters
+				if len([]rune(idxComment)) > 1024 {
+					idxComment = string([]rune(idxComment)[:1024])
+				}
 				db.AddIndex(tableName, catalog.IndexDef{
 					Name:    idxName,
 					Columns: idxCols,
@@ -3734,10 +3753,12 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					if col.Name == colName {
 						if op.DropDefault {
 							tableDef.Columns[i].Default = nil
+							tableDef.Columns[i].DefaultDropped = true
 						} else if op.DefaultVal != nil {
 							defStr := sqlparser.String(op.DefaultVal)
 							defStr = strings.Trim(defStr, "'")
 							tableDef.Columns[i].Default = &defStr
+							tableDef.Columns[i].DefaultDropped = false
 						}
 						break
 					}
@@ -4040,6 +4061,31 @@ func binaryPadLength(colType string) int {
 	return 0
 }
 
+// padDecimalDefault pads a decimal default value to the declared scale.
+// e.g. DECIMAL(10,8) with default "3.141592" -> "3.14159200"
+func padDecimalDefault(colType, defVal string) string {
+	upper := strings.ToUpper(strings.TrimSpace(colType))
+	if !strings.HasPrefix(upper, "DECIMAL") && !strings.HasPrefix(upper, "NUMERIC") {
+		return defVal
+	}
+	// Parse DECIMAL(p,s)
+	var p, s int
+	if n, err := fmt.Sscanf(upper, "DECIMAL(%d,%d)", &p, &s); n == 2 && err == nil && s > 0 {
+		// Pad the default value
+		dotIdx := strings.Index(defVal, ".")
+		if dotIdx < 0 {
+			// No decimal point: add ".000...0"
+			return defVal + "." + strings.Repeat("0", s)
+		}
+		decimals := defVal[dotIdx+1:]
+		if len(decimals) < s {
+			return defVal + strings.Repeat("0", s-len(decimals))
+		}
+		return defVal
+	}
+	return defVal
+}
+
 // padBinaryValue pads a string value to the given length with null bytes.
 func padBinaryValue(val interface{}, padLen int) interface{} {
 	if val == nil || padLen <= 0 {
@@ -4227,9 +4273,11 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 				if padLen := binaryPadLength(col.Type); padLen > 0 && len(defVal) < padLen {
 					defVal = defVal + strings.Repeat("\\0", padLen-len(defVal))
 				}
+				// Pad DECIMAL default values to the declared scale.
+				defVal = padDecimalDefault(col.Type, defVal)
 				parts = append(parts, fmt.Sprintf("DEFAULT '%s'", defVal))
 			}
-		} else if col.Nullable {
+		} else if col.Nullable && !col.DefaultDropped {
 			// MySQL doesn't show DEFAULT NULL for BLOB/TEXT types
 			isBlobOrText := strings.Contains(colTypeLower, "blob") || strings.Contains(colTypeLower, "text")
 			if !isBlobOrText {
@@ -4280,8 +4328,8 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 			}
 		}
 		usingStr := ""
-		if idx.Using != "" && !strings.EqualFold(idx.Using, "BTREE") {
-			usingStr = " USING " + idx.Using
+		if strings.EqualFold(idx.Using, "BTREE") {
+			usingStr = " USING BTREE"
 		}
 		commentStr := ""
 		if idx.Comment != "" {
@@ -6549,13 +6597,19 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 				if left == nil {
 					return false, nil
 				}
+				hasNull := false
 				for _, val := range vals {
 					if val == nil {
+						hasNull = true
 						continue
 					}
 					if fmt.Sprintf("%v", left) == fmt.Sprintf("%v", val) {
 						return v.Operator == sqlparser.InOp, nil
 					}
+				}
+				// For NOT IN: if any subquery value is NULL and no match found, result is UNKNOWN (false)
+				if v.Operator == sqlparser.NotInOp && hasNull {
+					return false, nil
 				}
 				return v.Operator == sqlparser.NotInOp, nil
 			}
@@ -6606,10 +6660,11 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 					}
 					return false, nil
 				}
-				// ALL: true if comparison holds for every non-NULL value
+				// ALL: true if comparison holds for every value.
+				// If any subquery value is NULL, the comparison is UNKNOWN (returns false).
 				for _, val := range vals {
 					if val == nil {
-						continue
+						return false, nil
 					}
 					match, err := compareValues(left, val, v.Operator)
 					if err != nil {
@@ -6620,6 +6675,71 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 					}
 				}
 				return true, nil
+			}
+		}
+
+		// Handle ValTuple (row constructor) comparison: (c1,c2) = (SELECT c1, c2 FROM ...) or (c1,c2) = (2,'abc')
+		if tuple, ok := v.Left.(sqlparser.ValTuple); ok {
+			// Evaluate left tuple values
+			leftVals := make([]interface{}, len(tuple))
+			for i, texpr := range tuple {
+				val, err := e.evalRowExpr(texpr, row)
+				if err != nil {
+					return false, err
+				}
+				leftVals[i] = val
+			}
+			// Right side: subquery returning one row
+			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+				result, err := e.execSubquery(sub, row)
+				if err != nil {
+					return false, err
+				}
+				if len(result.Rows) == 0 {
+					return false, nil
+				}
+				if len(result.Rows) > 1 {
+					return false, fmt.Errorf("Subquery returns more than 1 row")
+				}
+				rightRow := result.Rows[0]
+				if len(leftVals) != len(rightRow) {
+					return false, fmt.Errorf("Operand should contain %d column(s)", len(leftVals))
+				}
+				allMatch := true
+				for i, lv := range leftVals {
+					rv := rightRow[i]
+					match, err := compareValues(lv, rv, v.Operator)
+					if err != nil {
+						return false, err
+					}
+					if !match {
+						allMatch = false
+						break
+					}
+				}
+				return allMatch, nil
+			}
+			// Right side: ValTuple literal (c1,c2) = (2, "abc")
+			if rightTuple, ok := v.Right.(sqlparser.ValTuple); ok {
+				if len(leftVals) != len(rightTuple) {
+					return false, fmt.Errorf("Operand should contain %d column(s)", len(leftVals))
+				}
+				allMatch := true
+				for i, lv := range leftVals {
+					rv, err := e.evalRowExpr(rightTuple[i], row)
+					if err != nil {
+						return false, err
+					}
+					match, err := compareValues(lv, rv, v.Operator)
+					if err != nil {
+						return false, err
+					}
+					if !match {
+						allMatch = false
+						break
+					}
+				}
+				return allMatch, nil
 			}
 		}
 
@@ -7920,6 +8040,47 @@ func crossProduct(left, right []storage.Row) []storage.Row {
 	return result
 }
 
+// inferColumnType tries to determine the column type from the source table of a SELECT statement.
+func (e *Executor) inferColumnType(selectSQL, colName string) string {
+	stmt, err := sqlparser.NewTestParser().Parse(selectSQL)
+	if err != nil {
+		return ""
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return ""
+	}
+	// Get the source table from the FROM clause
+	for _, from := range sel.From {
+		ate, ok := from.(*sqlparser.AliasedTableExpr)
+		if !ok {
+			continue
+		}
+		tn, ok := ate.Expr.(sqlparser.TableName)
+		if !ok {
+			continue
+		}
+		srcDB := e.CurrentDB
+		if !tn.Qualifier.IsEmpty() {
+			srcDB = tn.Qualifier.String()
+		}
+		db, err := e.Catalog.GetDatabase(srcDB)
+		if err != nil {
+			continue
+		}
+		tblDef, err := db.GetTable(tn.Name.String())
+		if err != nil {
+			continue
+		}
+		for _, col := range tblDef.Columns {
+			if strings.EqualFold(col.Name, colName) {
+				return col.Type
+			}
+		}
+	}
+	return ""
+}
+
 // execCreateTableLike handles CREATE TABLE t2 LIKE t1.
 func (e *Executor) execCreateTableLike(newTableName, srcTableName string) (*Result, error) {
 	db, err := e.Catalog.GetDatabase(e.CurrentDB)
@@ -7964,9 +8125,13 @@ func (e *Executor) execCreateTableSelect(newTableName, selectSQL string) (*Resul
 	}
 	var cols []catalog.ColumnDef
 	for _, colName := range result.Columns {
+		colType := "text"
+		if inferredType := e.inferColumnType(selectSQL, colName); inferredType != "" {
+			colType = inferredType
+		}
 		cols = append(cols, catalog.ColumnDef{
 			Name:     colName,
-			Type:     "text",
+			Type:     colType,
 			Nullable: true,
 		})
 	}
