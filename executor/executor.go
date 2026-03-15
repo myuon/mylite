@@ -1571,7 +1571,7 @@ func mysqlDisplayType(colType string) string {
 		suffix = " unsigned"
 	}
 
-	// Add default display widths for integer types
+	// Add default display widths
 	switch base {
 	case "TINYINT":
 		return "tinyint(4)" + suffix
@@ -1589,6 +1589,16 @@ func mysqlDisplayType(colType string) string {
 		return "double" + suffix
 	case "DECIMAL":
 		return "decimal(10,0)" + suffix
+	case "CHAR":
+		return "char(1)"
+	case "BINARY":
+		return "binary(1)"
+	case "BIT":
+		return "bit(1)"
+	case "YEAR":
+		return "year(4)"
+	case "BOOL", "BOOLEAN":
+		return "tinyint(1)"
 	default:
 		return strings.ToLower(colType)
 	}

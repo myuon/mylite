@@ -178,11 +178,8 @@ func (ctx *execContext) executeLines(lines []string) error {
 			continue
 		}
 
-		// Comments starting with # are echoed to output (only when query log is enabled)
+		// Comments starting with # are NOT echoed to output (mysqltest behavior)
 		if strings.HasPrefix(trimmed, "#") {
-			if ctx.queryLogEnabled {
-				ctx.output.WriteString(line + "\n")
-			}
 			i++
 			continue
 		}
@@ -235,11 +232,8 @@ func (ctx *execContext) executeLines(lines []string) error {
 			l := lines[i]
 			t := strings.TrimSpace(l)
 
-			// Output comments within statement (only when query log is enabled)
+			// Skip comments within statement
 			if strings.HasPrefix(t, "#") {
-				if ctx.queryLogEnabled {
-					ctx.output.WriteString(l + "\n")
-				}
 				i++
 				continue
 			}
@@ -270,23 +264,38 @@ func (ctx *execContext) executeLines(lines []string) error {
 			continue
 		}
 
-		// Echo the raw SQL to output (mysqltest echoes original formatting)
-		if ctx.queryLogEnabled {
-			for _, rl := range rawLines {
-				ctx.output.WriteString(rl + "\n")
-			}
-		}
-
 		// Handle multiple statements on one line (e.g. "DROP TABLE t1; SHOW TABLES")
 		stmts := splitStatements(stmt)
-		for _, s := range stmts {
-			s = strings.TrimSpace(s)
-			if s == "" {
-				continue
+
+		if len(stmts) <= 1 {
+			// Single statement: echo raw lines preserving original formatting
+			if ctx.queryLogEnabled {
+				for _, rl := range rawLines {
+					ctx.output.WriteString(rl + "\n")
+				}
 			}
-			err := ctx.executeSQLNoEcho(s)
-			if err != nil {
-				return err
+			for _, s := range stmts {
+				s = strings.TrimSpace(s)
+				if s == "" {
+					continue
+				}
+				err := ctx.executeSQLNoEcho(s)
+				if err != nil {
+					return err
+				}
+			}
+		} else {
+			// Multiple statements: echo and execute each individually
+			for _, s := range stmts {
+				s = strings.TrimSpace(s)
+				if s == "" {
+					continue
+				}
+				// Use executeSQL which does echo + execute
+				err := ctx.executeSQL(s)
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}
