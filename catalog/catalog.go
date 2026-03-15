@@ -35,6 +35,8 @@ type TableDef struct {
 	PrimaryKey []string // column names
 	Indexes    []IndexDef
 	Comment    string
+	Charset    string // e.g. "latin1", "utf8mb4"; empty means default (utf8mb4)
+	Collation  string // e.g. "latin1_swedish_ci"; empty means default
 }
 
 // TriggerDef represents a trigger definition.
@@ -346,6 +348,8 @@ func (db *Database) AddColumnAt(tableName string, col ColumnDef, position string
 }
 
 // DropColumn removes a column from the table definition.
+// It also removes any indexes that reference only this column,
+// and removes the column from multi-column indexes.
 func (db *Database) DropColumn(tableName, colName string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -366,6 +370,39 @@ func (db *Database) DropColumn(tableName, colName string) error {
 		return fmt.Errorf("column '%s' doesn't exist in table '%s'", colName, tableName)
 	}
 	tbl.Columns = newCols
+
+	// Remove indexes that reference the dropped column
+	newIndexes := make([]IndexDef, 0, len(tbl.Indexes))
+	for _, idx := range tbl.Indexes {
+		// Remove the dropped column from the index's column list
+		var remainingCols []string
+		for _, c := range idx.Columns {
+			// Handle column with length prefix like "c1(10)"
+			bareCol := c
+			if paren := strings.Index(c, "("); paren >= 0 {
+				bareCol = c[:paren]
+			}
+			if bareCol != colName {
+				remainingCols = append(remainingCols, c)
+			}
+		}
+		if len(remainingCols) > 0 {
+			idx.Columns = remainingCols
+			newIndexes = append(newIndexes, idx)
+		}
+		// If no columns remain, the index is dropped entirely
+	}
+	tbl.Indexes = newIndexes
+
+	// Also remove from primary key if present
+	var newPK []string
+	for _, pk := range tbl.PrimaryKey {
+		if pk != colName {
+			newPK = append(newPK, pk)
+		}
+	}
+	tbl.PrimaryKey = newPK
+
 	return nil
 }
 

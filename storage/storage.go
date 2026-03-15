@@ -103,15 +103,11 @@ func (t *Table) Insert(row Row) (int64, error) {
 	for _, col := range t.Def.Columns {
 		if col.AutoIncrement {
 			if v, ok := row[col.Name]; !ok || v == nil {
-				// Only auto-increment if the column is NOT NULL.
-				// If column is nullable, NULL stays as NULL.
-				if col.Nullable {
-					row[col.Name] = nil
-				} else {
-					id := t.AutoIncrement.Add(1)
-					row[col.Name] = id
-					lastInsertID = id
-				}
+				// MySQL always generates next auto-increment value when NULL is inserted,
+				// regardless of whether the column is nullable.
+				id := t.AutoIncrement.Add(1)
+				row[col.Name] = id
+				lastInsertID = id
 			} else {
 				// If explicit value provided, update auto_increment counter if needed
 				if intVal, ok := toInt64(v); ok && intVal >= t.AutoIncrement.Load() {

@@ -345,9 +345,13 @@ func normalizeAddIndexUsing(query string) string {
 		return query
 	}
 	// Move USING before column list to after it (parser can handle it after)
-	// Pattern: ADD KEY USING BTREE (col) -> ADD KEY (col) USING BTREE
+	// Pattern: ADD KEY [name] USING BTREE (col) -> ADD KEY [name] (col) USING BTREE
+	// Without name:
 	re1 := regexp.MustCompile(`(?i)(ADD\s+(UNIQUE\s+)?(KEY|INDEX))\s+USING\s+(\w+)\s*(\([^)]*\))`)
 	query = re1.ReplaceAllString(query, "${1} ${5} USING ${4}")
+	// With name: ADD KEY i1 USING BTREE (col) -> ADD KEY i1 (col) USING BTREE
+	re2 := regexp.MustCompile(`(?i)(ADD\s+(UNIQUE\s+)?(KEY|INDEX)\s+` + "`?" + `\w+` + "`?" + `)\s+USING\s+(\w+)\s*(\([^)]*\))`)
+	query = re2.ReplaceAllString(query, "${1} ${5} USING ${4}")
 	return query
 }
 
@@ -1196,6 +1200,22 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 		if len(s) >= 5 && s[4] == '-' {
 			return s[:4]
 		}
+	case "TIMESTAMP":
+		// TIMESTAMP range: '1970-01-01 00:00:01' to '2038-01-19 03:14:07' UTC
+		// Out-of-range values are stored as '0000-00-00 00:00:00'
+		if len(s) >= 10 && s[4] == '-' {
+			datePart := s
+			if len(datePart) > 10 {
+				datePart = datePart[:10]
+			}
+			if t, err := time.Parse("2006-01-02", datePart); err == nil {
+				minTS := time.Date(1970, 1, 1, 0, 0, 1, 0, time.UTC)
+				maxTS := time.Date(2038, 1, 19, 3, 14, 7, 0, time.UTC)
+				if t.Before(minTS) || t.After(maxTS) {
+					return "0000-00-00 00:00:00"
+				}
+			}
+		}
 	}
 	return v
 }
@@ -1387,9 +1407,16 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			}
 		}
 
-		// Save comment
+		// Save comment (MySQL truncates column comments > 1024 chars, errors in strict/traditional mode)
 		if col.Type.Options != nil && col.Type.Options.Comment != nil {
-			colDef.Comment = col.Type.Options.Comment.Val
+			comment := col.Type.Options.Comment.Val
+			if len([]rune(comment)) > 1024 {
+				if e.isStrictMode() {
+					return nil, mysqlError(1629, "HY000", fmt.Sprintf("Comment for field '%s' is too long (max = 1024)", colDef.Name))
+				}
+				comment = string([]rune(comment)[:1024])
+			}
+			colDef.Comment = comment
 		}
 
 		columns = append(columns, colDef)
@@ -1479,7 +1506,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		e.tempTables[tableName] = true
 	}
 
-	// Set AUTO_INCREMENT start value and table comment from table options
+	// Set AUTO_INCREMENT start value, table comment, and charset from table options
 	for _, opt := range stmt.TableSpec.Options {
 		switch strings.ToUpper(opt.Name) {
 		case "AUTO_INCREMENT":
@@ -1490,7 +1517,15 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			}
 		case "COMMENT":
 			def.Comment = opt.Value.Val
+		case "CHARSET", "CHARACTER SET":
+			def.Charset = strings.ToLower(opt.String)
+		case "COLLATE":
+			def.Collation = strings.ToLower(opt.String)
 		}
+	}
+	// If charset was set but collation was not, derive default collation
+	if def.Charset != "" && def.Collation == "" {
+		def.Collation = catalog.DefaultCollationForCharset(def.Charset)
 	}
 
 	// Handle CREATE TABLE (cols...) SELECT ... : insert rows from the SELECT
@@ -2027,6 +2062,15 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					isEnumType := strings.HasPrefix(strings.ToLower(col.Type), "enum(")
 					isSetType := strings.HasPrefix(strings.ToLower(col.Type), "set(")
 					if isEnumType || isSetType {
+						// Count allowed values for numeric validation
+						enumInner := ""
+						if isEnumType {
+							enumInner = col.Type[5 : len(col.Type)-1]
+						} else {
+							enumInner = col.Type[4 : len(col.Type)-1]
+						}
+						allowedCount := len(splitEnumValues(enumInner))
+
 						if sv, ok := rv.(string); ok {
 							origStr := ""
 							if ov, ok2 := origValues[col.Name]; ok2 {
@@ -2040,6 +2084,17 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							// it means some members were invalid
 							if isSetType && origStr != "" && sv != origStr {
 								return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+							}
+						} else if nv, ok := rv.(int64); ok {
+							// Numeric values: validate range for ENUM/SET
+							if isEnumType && (nv < 0 || nv > int64(allowedCount)) {
+								return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+							}
+							if isSetType {
+								maxVal := int64((1 << allowedCount) - 1)
+								if nv < 0 || nv > maxVal {
+									return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+								}
 							}
 						}
 					}
@@ -2235,10 +2290,26 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", lookupDB, lookupTable))
 		}
 		raw := tbl.Scan()
+		// Build a set of CHAR(N) column names for trailing-space removal.
+		charCols := make(map[string]bool)
+		if tbl.Def != nil {
+			for _, col := range tbl.Def.Columns {
+				lower := strings.ToLower(strings.TrimSpace(col.Type))
+				if strings.HasPrefix(lower, "char(") || lower == "char" {
+					charCols[col.Name] = true
+				}
+			}
+		}
 		result := make([]storage.Row, len(raw))
 		for i, row := range raw {
 			newRow := make(storage.Row, len(row)*2)
 			for k, v := range row {
+				// MySQL removes trailing spaces from CHAR columns on retrieval.
+				if charCols[k] {
+					if s, ok := v.(string); ok {
+						v = strings.TrimRight(s, " ")
+					}
+				}
 				newRow[k] = v
 				newRow[alias+"."+k] = v
 			}
@@ -3701,6 +3772,12 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 		case *sqlparser.ModifyColumn:
 			colDef := columnDefFromAST(op.NewColDefinition)
+			if len([]rune(colDef.Comment)) > 1024 {
+				if e.isStrictMode() {
+					return nil, mysqlError(1629, "HY000", fmt.Sprintf("Comment for field '%s' is too long (max = 1024)", colDef.Name))
+				}
+				colDef.Comment = string([]rune(colDef.Comment)[:1024])
+			}
 			if modErr := db.ModifyColumn(tableName, colDef); modErr != nil {
 				return nil, modErr
 			}
@@ -3708,6 +3785,12 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		case *sqlparser.ChangeColumn:
 			oldName := op.OldColumn.Name.String()
 			colDef := columnDefFromAST(op.NewColDefinition)
+			if len([]rune(colDef.Comment)) > 1024 {
+				if e.isStrictMode() {
+					return nil, mysqlError(1629, "HY000", fmt.Sprintf("Comment for field '%s' is too long (max = 1024)", colDef.Name))
+				}
+				colDef.Comment = string([]rune(colDef.Comment)[:1024])
+			}
 			if chgErr := db.ChangeColumn(tableName, oldName, colDef); chgErr != nil {
 				return nil, chgErr
 			}
@@ -4387,7 +4470,22 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	if autoIncVal > 0 {
 		trailer += fmt.Sprintf(" AUTO_INCREMENT=%d", autoIncVal+1)
 	}
-	trailer += " DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	charset := "utf8mb4"
+	collation := "utf8mb4_0900_ai_ci"
+	if def.Charset != "" {
+		charset = def.Charset
+		collation = catalog.DefaultCollationForCharset(charset)
+	}
+	if def.Collation != "" {
+		collation = def.Collation
+	}
+	trailer += fmt.Sprintf(" DEFAULT CHARSET=%s", charset)
+	// Show COLLATE when charset is utf8mb4 (MySQL default behavior) or when
+	// an explicit non-default collation is specified.
+	defaultCollation := catalog.DefaultCollationForCharset(charset)
+	if charset == "utf8mb4" || collation != defaultCollation {
+		trailer += fmt.Sprintf(" COLLATE=%s", collation)
+	}
 	if def.Comment != "" {
 		trailer += fmt.Sprintf(" COMMENT='%s'", def.Comment)
 	}
@@ -4446,6 +4544,28 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return v.Val, nil
 		case sqlparser.HexVal:
 			return v.Val, nil
+		case sqlparser.HexNum:
+			// 0x878A -> parse as integer
+			s := v.Val
+			if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+				s = s[2:]
+			}
+			n, err := strconv.ParseInt(s, 16, 64)
+			if err != nil {
+				return v.Val, nil
+			}
+			return n, nil
+		case sqlparser.BitNum:
+			// 0b1010 -> parse as integer
+			s := v.Val
+			if strings.HasPrefix(s, "0b") || strings.HasPrefix(s, "0B") {
+				s = s[2:]
+			}
+			n, err := strconv.ParseInt(s, 2, 64)
+			if err != nil {
+				return v.Val, nil
+			}
+			return n, nil
 		}
 	case *sqlparser.NullVal:
 		return nil, nil
@@ -5213,6 +5333,9 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		if err != nil {
 			return nil, err
 		}
+		if isZeroDate(val) {
+			return "0000-00-00", nil
+		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
 			return nil, err
@@ -5281,6 +5404,9 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		if err != nil {
 			return nil, err
 		}
+		if isZeroDate(val) {
+			return nil, nil
+		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
 			return nil, err
@@ -5293,6 +5419,9 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		val, err := e.evalExpr(v.Exprs[0])
 		if err != nil {
 			return nil, err
+		}
+		if isZeroDate(val) {
+			return nil, nil
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
@@ -5307,6 +5436,9 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		val, err := e.evalExpr(v.Exprs[0])
 		if err != nil {
 			return nil, err
+		}
+		if isZeroDate(val) {
+			return nil, nil
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
@@ -5325,6 +5457,9 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		val, err := e.evalExpr(v.Exprs[0])
 		if err != nil {
 			return nil, err
+		}
+		if isZeroDate(val) {
+			return nil, nil
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
@@ -5458,6 +5593,9 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, nil
 		}
 		days := int(toInt64(val))
+		if days <= 0 {
+			return "0000-00-00", nil
+		}
 		t := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, days-1)
 		return t.Format("2006-01-02"), nil
 	case "to_days":
@@ -5471,13 +5609,14 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		if val == nil {
 			return nil, nil
 		}
+		if isZeroDate(val) {
+			return nil, nil
+		}
 		t, parseErr := parseDateTimeValue(val)
 		if parseErr != nil {
 			return nil, nil
 		}
-		epoch := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
-		d := int64(t.Sub(epoch).Hours()/24) + 1
-		return d, nil
+		return mysqlToDays(t), nil
 	case "bin":
 		if len(v.Exprs) < 1 {
 			return nil, nil
@@ -5552,7 +5691,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, nil
 		}
 		return int64((t.Month()-1)/3 + 1), nil
-	case "week", "weekofyear":
+	case "week":
 		if len(v.Exprs) < 1 {
 			return nil, nil
 		}
@@ -5561,6 +5700,28 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, err
 		}
 		if val == nil {
+			return nil, nil
+		}
+		if isZeroDate(val) {
+			return nil, nil
+		}
+		t, parseErr := parseDateTimeValue(val)
+		if parseErr != nil {
+			return nil, nil
+		}
+		return mysqlWeekMode0(t), nil
+	case "weekofyear":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		if isZeroDate(val) {
 			return nil, nil
 		}
 		t, parseErr := parseDateTimeValue(val)
@@ -5613,11 +5774,54 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 
 // parseDateTimeValue parses a date/time interface value into a time.Time.
 // Supports string formats: "2006-01-02", "2006-01-02 15:04:05", "15:04:05", "2006-01-02T15:04:05".
+// isZeroDate checks if a value represents MySQL's zero date (0000-00-00 ...)
+func isZeroDate(val interface{}) bool {
+	if val == nil {
+		return false
+	}
+	s := toString(val)
+	return strings.HasPrefix(s, "0000-00-00")
+}
+
+// mysqlWeekMode0 calculates MySQL's WEEK(date) with default mode 0.
+// Mode 0: Sunday is first day of week, range 0-53.
+func mysqlWeekMode0(t time.Time) int64 {
+	yday := t.YearDay() // 1-based
+	// Find the weekday of Jan 1 (0=Sunday, ..., 6=Saturday)
+	jan1 := time.Date(t.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+	wdJan1 := int(jan1.Weekday()) // 0=Sunday
+	// First Sunday of the year is at day (7-wdJan1)%7 + 1
+	// If Jan 1 is Sunday, first Sunday is day 1
+	firstSunday := (7 - wdJan1) % 7
+	if yday <= firstSunday {
+		return 0
+	}
+	return int64((yday - firstSunday - 1) / 7 + 1)
+}
+
+// mysqlToDays calculates MySQL's TO_DAYS value for a given time.
+// Uses the proleptic Gregorian calendar.
+func mysqlToDays(t time.Time) int64 {
+	y := int64(t.Year())
+	m := int64(t.Month())
+	d := int64(t.Day())
+	if m <= 2 {
+		y--
+		m += 12
+	}
+	days := 365*y + y/4 - y/100 + y/400 + (153*(m-3)+2)/5 + d + 1721119 - 1
+	return days - 1721059
+}
+
 func parseDateTimeValue(val interface{}) (time.Time, error) {
 	if val == nil {
 		return time.Time{}, fmt.Errorf("NULL date value")
 	}
 	s := toString(val)
+	// Handle zero dates: return a sentinel zero time
+	if strings.HasPrefix(s, "0000-00-00") {
+		return time.Time{}, fmt.Errorf("zero date")
+	}
 	formats := []string{
 		"2006-01-02 15:04:05",
 		"2006-01-02T15:04:05",
@@ -6058,6 +6262,9 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if len(args) < 1 || args[0] == nil {
 			return nil, nil
 		}
+		if isZeroDate(args[0]) {
+			return "0000-00-00", nil
+		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
 			return nil, err
@@ -6070,6 +6277,9 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		}
 		if len(args) < 1 || args[0] == nil {
 			return nil, nil
+		}
+		if isZeroDate(args[0]) {
+			return int64(0), nil
 		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
@@ -6084,6 +6294,9 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if len(args) < 1 || args[0] == nil {
 			return nil, nil
 		}
+		if isZeroDate(args[0]) {
+			return int64(0), nil
+		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
 			return nil, err
@@ -6096,6 +6309,9 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		}
 		if len(args) < 1 || args[0] == nil {
 			return nil, nil
+		}
+		if isZeroDate(args[0]) {
+			return int64(0), nil
 		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
@@ -6184,6 +6400,9 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if len(args) < 1 || args[0] == nil {
 			return nil, nil
 		}
+		if isZeroDate(args[0]) {
+			return nil, nil
+		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
 			return nil, err
@@ -6195,6 +6414,9 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			return nil, err
 		}
 		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		if isZeroDate(args[0]) {
 			return nil, nil
 		}
 		t, err := parseDateTimeValue(args[0])
@@ -6210,6 +6432,9 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if len(args) < 1 || args[0] == nil {
 			return nil, nil
 		}
+		if isZeroDate(args[0]) {
+			return nil, nil
+		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
 			return nil, err
@@ -6223,6 +6448,9 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if len(args) < 1 || args[0] == nil {
 			return nil, nil
 		}
+		if isZeroDate(args[0]) {
+			return nil, nil
+		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
 			return nil, err
@@ -6234,6 +6462,9 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			return nil, err
 		}
 		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		if isZeroDate(args[0]) {
 			return nil, nil
 		}
 		t, err := parseDateTimeValue(args[0])
@@ -6401,6 +6632,9 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			return nil, nil
 		}
 		days := int(toInt64(args[0]))
+		if days <= 0 {
+			return "0000-00-00", nil
+		}
 		// MySQL FROM_DAYS: day 1 = 0001-01-01
 		t := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, days-1)
 		return t.Format("2006-01-02"), nil
@@ -6412,20 +6646,23 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if len(args) < 1 || args[0] == nil {
 			return nil, nil
 		}
+		if isZeroDate(args[0]) {
+			return nil, nil
+		}
 		t, parseErr := parseDateTimeValue(args[0])
 		if parseErr != nil {
 			return nil, nil
 		}
-		// MySQL TO_DAYS: number of days since year 0
-		epoch := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
-		days := int64(t.Sub(epoch).Hours()/24) + 1
-		return days, nil
+		return mysqlToDays(t), nil
 	case "last_day":
 		args, err := evalArgs()
 		if err != nil {
 			return nil, err
 		}
 		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		if isZeroDate(args[0]) {
 			return nil, nil
 		}
 		t, parseErr := parseDateTimeValue(args[0])
@@ -6443,17 +6680,39 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if len(args) < 1 || args[0] == nil {
 			return nil, nil
 		}
+		if isZeroDate(args[0]) {
+			return int64(0), nil
+		}
 		t, parseErr := parseDateTimeValue(args[0])
 		if parseErr != nil {
 			return nil, nil
 		}
 		return int64((t.Month()-1)/3 + 1), nil
-	case "week", "weekofyear":
+	case "week":
 		args, err := evalArgs()
 		if err != nil {
 			return nil, err
 		}
 		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		if isZeroDate(args[0]) {
+			return nil, nil
+		}
+		t, parseErr := parseDateTimeValue(args[0])
+		if parseErr != nil {
+			return nil, nil
+		}
+		return mysqlWeekMode0(t), nil
+	case "weekofyear":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		if isZeroDate(args[0]) {
 			return nil, nil
 		}
 		t, parseErr := parseDateTimeValue(args[0])
@@ -6470,6 +6729,9 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if len(args) < 1 || args[0] == nil {
 			return nil, nil
 		}
+		if isZeroDate(args[0]) {
+			return nil, nil
+		}
 		t, parseErr := parseDateTimeValue(args[0])
 		if parseErr != nil {
 			return nil, nil
@@ -6483,6 +6745,9 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		}
 		if len(args) < 1 || args[0] == nil {
 			return nil, nil
+		}
+		if isZeroDate(args[0]) {
+			return "0000-00-00 00:00:00", nil
 		}
 		t, parseErr := parseDateTimeValue(args[0])
 		if parseErr != nil {
@@ -6931,17 +7196,21 @@ func compareNumeric(a, b interface{}) int {
 	if aIsStr || bIsStr {
 		sa := toString(a)
 		sb := toString(b)
-		// If both can be parsed as numbers, compare numerically
-		fa, errA := strconv.ParseFloat(sa, 64)
-		fb, errB := strconv.ParseFloat(sb, 64)
-		if errA == nil && errB == nil {
-			if fa < fb {
-				return -1
+		// Only try numeric comparison when one value is not a string
+		// (i.e., mixing numeric and string). When both are strings,
+		// always use string comparison (MySQL uses collation-based ordering).
+		if !aIsStr || !bIsStr {
+			fa, errA := strconv.ParseFloat(sa, 64)
+			fb, errB := strconv.ParseFloat(sb, 64)
+			if errA == nil && errB == nil {
+				if fa < fb {
+					return -1
+				}
+				if fa > fb {
+					return 1
+				}
+				return 0
 			}
-			if fa > fb {
-				return 1
-			}
-			return 0
 		}
 		// Normalize date/time comparisons: when one is TIME-like and
 		// the other is DATETIME-like, extract the matching part.
