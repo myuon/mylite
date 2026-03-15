@@ -9,7 +9,7 @@ import (
 
 // infoSchemaColumnOrder defines the canonical column order for INFORMATION_SCHEMA tables.
 var infoSchemaColumnOrder = map[string][]string{
-	"schemata": {"CATALOG_NAME", "SCHEMA_NAME", "DEFAULT_CHARACTER_SET_NAME", "DEFAULT_COLLATION_NAME", "SQL_PATH"},
+	"schemata": {"CATALOG_NAME", "SCHEMA_NAME", "DEFAULT_CHARACTER_SET_NAME", "DEFAULT_COLLATION_NAME", "SQL_PATH", "DEFAULT_ENCRYPTION"},
 	"tables": {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE", "ENGINE", "VERSION", "ROW_FORMAT", "TABLE_ROWS", "AVG_ROW_LENGTH", "DATA_LENGTH", "MAX_DATA_LENGTH", "INDEX_LENGTH", "DATA_FREE", "AUTO_INCREMENT", "CREATE_TIME", "UPDATE_TIME", "CHECK_TIME", "TABLE_COLLATION", "CHECKSUM", "CREATE_OPTIONS", "TABLE_COMMENT"},
 	"columns":    {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "COLUMN_DEFAULT", "IS_NULLABLE", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH", "CHARACTER_OCTET_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE", "DATETIME_PRECISION", "CHARACTER_SET_NAME", "COLLATION_NAME", "COLUMN_TYPE", "COLUMN_KEY", "EXTRA", "PRIVILEGES", "COLUMN_COMMENT", "GENERATION_EXPRESSION", "SRS_ID"},
 	"statistics": {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "NON_UNIQUE", "INDEX_SCHEMA", "INDEX_NAME", "SEQ_IN_INDEX", "COLUMN_NAME", "COLLATION", "CARDINALITY", "SUB_PART", "PACKED", "NULLABLE", "INDEX_TYPE", "COMMENT", "INDEX_COMMENT", "IS_VISIBLE", "EXPRESSION"},
@@ -66,13 +66,24 @@ func (e *Executor) infoSchemaSchemata() []storage.Row {
 	sort.Strings(dbNames)
 
 	rows := make([]storage.Row, 0, len(dbNames))
-	for _, db := range dbNames {
+	for _, dbName := range dbNames {
+		charset := "utf8mb4"
+		collation := "utf8mb4_general_ci"
+		if db, err := e.Catalog.GetDatabase(dbName); err == nil {
+			if db.CharacterSet != "" {
+				charset = db.CharacterSet
+			}
+			if db.CollationName != "" {
+				collation = db.CollationName
+			}
+		}
 		rows = append(rows, storage.Row{
 			"CATALOG_NAME":              "def",
-			"SCHEMA_NAME":               db,
-			"DEFAULT_CHARACTER_SET_NAME": "utf8mb4",
-			"DEFAULT_COLLATION_NAME":    "utf8mb4_general_ci",
+			"SCHEMA_NAME":               dbName,
+			"DEFAULT_CHARACTER_SET_NAME": charset,
+			"DEFAULT_COLLATION_NAME":    collation,
 			"SQL_PATH":                  nil,
+			"DEFAULT_ENCRYPTION":        "NO",
 		})
 	}
 	return rows

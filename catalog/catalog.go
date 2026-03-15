@@ -61,11 +61,13 @@ type ProcParam struct {
 
 // Database represents a database containing tables.
 type Database struct {
-	Name       string
-	Tables     map[string]*TableDef
-	Triggers   map[string]*TriggerDef   // trigger name -> trigger def
-	Procedures map[string]*ProcedureDef // procedure name -> procedure def
-	mu         sync.RWMutex
+	Name           string
+	Tables         map[string]*TableDef
+	Triggers       map[string]*TriggerDef   // trigger name -> trigger def
+	Procedures     map[string]*ProcedureDef // procedure name -> procedure def
+	CharacterSet   string // e.g. "utf8mb4", "ascii", "binary"
+	CollationName  string // e.g. "utf8mb4_general_ci", "ascii_general_ci"
+	mu             sync.RWMutex
 }
 
 // Catalog is the top-level catalog managing databases.
@@ -80,27 +82,138 @@ func New() *Catalog {
 	}
 	// Create default databases (matching MySQL)
 	for _, name := range []string{"information_schema", "mtr", "mysql", "performance_schema", "sys", "test"} {
+		charset := "utf8mb4"
+		collation := "utf8mb4_0900_ai_ci"
+		if name == "information_schema" {
+			charset = "utf8"
+			collation = "utf8_general_ci"
+		}
 		c.Databases[name] = &Database{
-			Name:       name,
-			Tables:     make(map[string]*TableDef),
-			Triggers:   make(map[string]*TriggerDef),
-			Procedures: make(map[string]*ProcedureDef),
+			Name:          name,
+			Tables:        make(map[string]*TableDef),
+			Triggers:      make(map[string]*TriggerDef),
+			Procedures:    make(map[string]*ProcedureDef),
+			CharacterSet:  charset,
+			CollationName: collation,
 		}
 	}
 	return c
 }
 
+// DefaultCollationForCharset returns the default collation for a charset.
+func DefaultCollationForCharset(charset string) string {
+	switch strings.ToLower(charset) {
+	case "utf8mb4":
+		return "utf8mb4_0900_ai_ci"
+	case "utf8", "utf8mb3":
+		return "utf8_general_ci"
+	case "latin1":
+		return "latin1_swedish_ci"
+	case "ascii":
+		return "ascii_general_ci"
+	case "binary":
+		return "binary"
+	case "cp1251":
+		return "cp1251_general_ci"
+	case "swe7":
+		return "swe7_swedish_ci"
+	case "armscii8":
+		return "armscii8_general_ci"
+	case "big5":
+		return "big5_chinese_ci"
+	case "cp1250":
+		return "cp1250_general_ci"
+	case "cp1256":
+		return "cp1256_general_ci"
+	case "cp1257":
+		return "cp1257_general_ci"
+	case "cp850":
+		return "cp850_general_ci"
+	case "cp852":
+		return "cp852_general_ci"
+	case "cp866":
+		return "cp866_general_ci"
+	case "cp932":
+		return "cp932_japanese_ci"
+	case "dec8":
+		return "dec8_swedish_ci"
+	case "eucjpms":
+		return "eucjpms_japanese_ci"
+	case "euckr":
+		return "euckr_korean_ci"
+	case "gb18030":
+		return "gb18030_chinese_ci"
+	case "gb2312":
+		return "gb2312_chinese_ci"
+	case "gbk":
+		return "gbk_chinese_ci"
+	case "geostd8":
+		return "geostd8_general_ci"
+	case "greek":
+		return "greek_general_ci"
+	case "hebrew":
+		return "hebrew_general_ci"
+	case "hp8":
+		return "hp8_english_ci"
+	case "keybcs2":
+		return "keybcs2_general_ci"
+	case "koi8r":
+		return "koi8r_general_ci"
+	case "koi8u":
+		return "koi8u_general_ci"
+	case "latin2":
+		return "latin2_general_ci"
+	case "latin5":
+		return "latin5_turkish_ci"
+	case "latin7":
+		return "latin7_general_ci"
+	case "macce":
+		return "macce_general_ci"
+	case "macroman":
+		return "macroman_general_ci"
+	case "sjis":
+		return "sjis_japanese_ci"
+	case "tis620":
+		return "tis620_thai_ci"
+	case "ucs2":
+		return "ucs2_general_ci"
+	case "ujis":
+		return "ujis_japanese_ci"
+	case "utf16":
+		return "utf16_general_ci"
+	case "utf16le":
+		return "utf16le_general_ci"
+	case "utf32":
+		return "utf32_general_ci"
+	default:
+		return charset + "_general_ci"
+	}
+}
+
 func (c *Catalog) CreateDatabase(name string) error {
+	return c.CreateDatabaseWithCharset(name, "", "")
+}
+
+// CreateDatabaseWithCharset creates a database with optional charset and collation.
+func (c *Catalog) CreateDatabaseWithCharset(name, charset, collation string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, exists := c.Databases[name]; exists {
 		return fmt.Errorf("database '%s' already exists", name)
 	}
+	if charset == "" {
+		charset = "utf8mb4"
+	}
+	if collation == "" {
+		collation = DefaultCollationForCharset(charset)
+	}
 	c.Databases[name] = &Database{
-		Name:       name,
-		Tables:     make(map[string]*TableDef),
-		Triggers:   make(map[string]*TriggerDef),
-		Procedures: make(map[string]*ProcedureDef),
+		Name:         name,
+		Tables:       make(map[string]*TableDef),
+		Triggers:     make(map[string]*TriggerDef),
+		Procedures:   make(map[string]*ProcedureDef),
+		CharacterSet: charset,
+		CollationName: collation,
 	}
 	return nil
 }

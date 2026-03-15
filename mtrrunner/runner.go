@@ -51,7 +51,8 @@ func (r *Runner) RunFile(testPath string) TestResult {
 
 	// Reset state: ensure we're in the test database and clean up leftover tables
 	r.DB.Exec("USE test") //nolint:errcheck
-	// Drop all tables from previous test
+	// Drop all tables from previous test (including temporary tables via MYLITE)
+	r.DB.Exec("MYLITE RESET_TEMP_TABLES") //nolint:errcheck
 	if rows, err2 := r.DB.Query("SHOW TABLES"); err2 == nil {
 		var tables []string
 		for rows.Next() {
@@ -533,6 +534,11 @@ func (ctx *execContext) executeSQLInner(stmt string) error {
 		strings.HasPrefix(upper, "OPTIMIZE ") ||
 		strings.HasPrefix(upper, "REPAIR ")
 
+	// EXECUTE might be either a query or exec depending on the prepared statement
+	if strings.HasPrefix(upper, "EXECUTE ") {
+		return ctx.executeQueryOrExec(stmt)
+	}
+
 	if isQuery {
 		return ctx.executeQuery(stmt)
 	}
@@ -570,6 +576,84 @@ func (ctx *execContext) executeQuery(stmt string) error {
 
 	// Skip output for statements that return no columns (e.g., SELECT INTO OUTFILE)
 	if len(columns) == 0 {
+		return nil
+	}
+
+	// Write column headers
+	ctx.output.WriteString(strings.Join(columns, "\t") + "\n")
+
+	// Collect result rows
+	var resultLines []string
+	for rows.Next() {
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return err
+		}
+
+		parts := make([]string, len(columns))
+		for i, v := range values {
+			if v == nil {
+				parts[i] = "NULL"
+			} else {
+				switch val := v.(type) {
+				case []byte:
+					parts[i] = string(val)
+				default:
+					parts[i] = fmt.Sprintf("%v", val)
+				}
+			}
+		}
+		resultLines = append(resultLines, strings.Join(parts, "\t"))
+	}
+
+	// Apply --sorted_result
+	if ctx.sortResult {
+		sort.Strings(resultLines)
+		ctx.sortResult = false
+	}
+
+	for _, line := range resultLines {
+		ctx.output.WriteString(line + "\n")
+	}
+
+	return nil
+}
+
+// executeQueryOrExec tries to execute a statement as a query first (returning rows),
+// and falls back to exec if the result set has no columns (e.g. INSERT/UPDATE/DELETE).
+func (ctx *execContext) executeQueryOrExec(stmt string) error {
+	rows, err := ctx.db.Query(stmt)
+	if err != nil {
+		if ctx.expectedError != "" {
+			if ctx.resultLogEnabled {
+				ctx.output.WriteString(formatMySQLError(err) + "\n")
+			}
+			ctx.expectedError = ""
+			return nil
+		}
+		return fmt.Errorf("query failed: %s: %v", stmt, err)
+	}
+	defer rows.Close()
+
+	if ctx.expectedError != "" {
+		ctx.expectedError = ""
+	}
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return err
+	}
+
+	// If no columns, it's a non-SELECT statement (INSERT/UPDATE/DELETE)
+	if len(columns) == 0 {
+		return nil
+	}
+
+	if !ctx.resultLogEnabled {
 		return nil
 	}
 

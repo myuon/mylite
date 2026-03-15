@@ -75,14 +75,25 @@ type Executor struct {
 	// SearchPaths are directories to search for files referenced in
 	// LOAD DATA LOCAL INFILE statements.
 	SearchPaths    []string
+	// userVars stores MySQL user variables (SET @var = value).
+	userVars       map[string]interface{}
+	// nextInsertID holds the value from SET INSERT_ID for the next INSERT.
+	nextInsertID   int64
+	// preparedStmts stores PREPARE stmt FROM 'query' statements.
+	preparedStmts  map[string]string
+	// tempTables stores temporary tables per session (table name -> true).
+	tempTables     map[string]bool
 }
 
 func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	return &Executor{
-		Catalog:   cat,
-		Storage:   store,
-		CurrentDB: "test",
-		snapshots: make(map[string]*fullSnapshot),
+		Catalog:       cat,
+		Storage:       store,
+		CurrentDB:     "test",
+		snapshots:     make(map[string]*fullSnapshot),
+		userVars:      make(map[string]interface{}),
+		preparedStmts: make(map[string]string),
+		tempTables:    make(map[string]bool),
 	}
 }
 
@@ -95,6 +106,53 @@ func mysqlError(code int, state, message string) error {
 // Execute parses and executes a SQL statement.
 // matchLike matches a string against a SQL LIKE pattern.
 // % matches any sequence of characters, _ matches any single character.
+// allCharsets returns the full list of MySQL character sets for SHOW CHARACTER SET.
+func allCharsets() [][]interface{} {
+	return [][]interface{}{
+		{"armscii8", "ARMSCII-8 Armenian", "armscii8_general_ci", int64(1)},
+		{"ascii", "US ASCII", "ascii_general_ci", int64(1)},
+		{"big5", "Big5 Traditional Chinese", "big5_chinese_ci", int64(2)},
+		{"binary", "Binary pseudo charset", "binary", int64(1)},
+		{"cp1250", "Windows Central European", "cp1250_general_ci", int64(1)},
+		{"cp1251", "Windows Cyrillic", "cp1251_general_ci", int64(1)},
+		{"cp1256", "Windows Arabic", "cp1256_general_ci", int64(1)},
+		{"cp1257", "Windows Baltic", "cp1257_general_ci", int64(1)},
+		{"cp850", "DOS West European", "cp850_general_ci", int64(1)},
+		{"cp852", "DOS Central European", "cp852_general_ci", int64(1)},
+		{"cp866", "DOS Russian", "cp866_general_ci", int64(1)},
+		{"cp932", "SJIS for Windows Japanese", "cp932_japanese_ci", int64(2)},
+		{"dec8", "DEC West European", "dec8_swedish_ci", int64(1)},
+		{"eucjpms", "UJIS for Windows Japanese", "eucjpms_japanese_ci", int64(3)},
+		{"euckr", "EUC-KR Korean", "euckr_korean_ci", int64(2)},
+		{"gb18030", "China National Standard GB18030", "gb18030_chinese_ci", int64(4)},
+		{"gb2312", "GB2312 Simplified Chinese", "gb2312_chinese_ci", int64(2)},
+		{"gbk", "GBK Simplified Chinese", "gbk_chinese_ci", int64(2)},
+		{"geostd8", "GEOSTD8 Georgian", "geostd8_general_ci", int64(1)},
+		{"greek", "ISO 8859-7 Greek", "greek_general_ci", int64(1)},
+		{"hebrew", "ISO 8859-8 Hebrew", "hebrew_general_ci", int64(1)},
+		{"hp8", "HP West European", "hp8_english_ci", int64(1)},
+		{"keybcs2", "DOS Kamenicky Czech-Slovak", "keybcs2_general_ci", int64(1)},
+		{"koi8r", "KOI8-R Relcom Russian", "koi8r_general_ci", int64(1)},
+		{"koi8u", "KOI8-U Ukrainian", "koi8u_general_ci", int64(1)},
+		{"latin1", "cp1252 West European", "latin1_swedish_ci", int64(1)},
+		{"latin2", "ISO 8859-2 Central European", "latin2_general_ci", int64(1)},
+		{"latin5", "ISO 8859-9 Turkish", "latin5_turkish_ci", int64(1)},
+		{"latin7", "ISO 8859-13 Baltic", "latin7_general_ci", int64(1)},
+		{"macce", "Mac Central European", "macce_general_ci", int64(1)},
+		{"macroman", "Mac West European", "macroman_general_ci", int64(1)},
+		{"sjis", "Shift-JIS Japanese", "sjis_japanese_ci", int64(2)},
+		{"swe7", "7bit Swedish", "swe7_swedish_ci", int64(1)},
+		{"tis620", "TIS620 Thai", "tis620_thai_ci", int64(1)},
+		{"ucs2", "UCS-2 Unicode", "ucs2_general_ci", int64(2)},
+		{"ujis", "EUC-JP Japanese", "ujis_japanese_ci", int64(3)},
+		{"utf16", "UTF-16 Unicode", "utf16_general_ci", int64(4)},
+		{"utf16le", "UTF-16LE Unicode", "utf16le_general_ci", int64(4)},
+		{"utf32", "UTF-32 Unicode", "utf32_general_ci", int64(4)},
+		{"utf8", "UTF-8 Unicode", "utf8_general_ci", int64(3)},
+		{"utf8mb4", "UTF-8 Unicode", "utf8mb4_0900_ai_ci", int64(4)},
+	}
+}
+
 func matchLike(s, pattern string) bool {
 	return matchLikeHelper(s, pattern, 0, 0)
 }
@@ -212,8 +270,8 @@ func uppercaseSQLKeywords(s string) string {
 // doesn't support with their canonical equivalents.
 func normalizeTypeAliases(query string) string {
 	upper := strings.ToUpper(query)
-	// Only apply to CREATE TABLE or ALTER TABLE statements
-	if !strings.Contains(upper, "CREATE TABLE") && !strings.Contains(upper, "ALTER TABLE") {
+	// Only apply to CREATE TABLE (including TEMPORARY) or ALTER TABLE statements
+	if !strings.Contains(upper, "CREATE TABLE") && !strings.Contains(upper, "CREATE TEMPORARY TABLE") && !strings.Contains(upper, "ALTER TABLE") {
 		return query
 	}
 	// Replace DOUBLE PRECISION with DOUBLE (case-insensitive, word-boundary aware)
@@ -289,6 +347,18 @@ func (e *Executor) Execute(query string) (*Result, error) {
 
 	// Normalize SQL type aliases that vitess parser doesn't support
 	query = normalizeTypeAliases(query)
+
+	// Handle ALTER DATABASE/SCHEMA ... CHARACTER SET (vitess parser doesn't parse CHARACTER SET)
+	if (strings.HasPrefix(upper, "ALTER DATABASE") || strings.HasPrefix(upper, "ALTER SCHEMA")) &&
+		(strings.Contains(upper, "CHARACTER SET") || strings.Contains(upper, "COLLATE")) {
+		return e.execAlterDatabaseRaw(trimmed)
+	}
+
+	// Handle CREATE DATABASE/SCHEMA ... CHARACTER SET when parser doesn't extract charset
+	if (strings.HasPrefix(upper, "CREATE DATABASE") || strings.HasPrefix(upper, "CREATE SCHEMA")) &&
+		strings.Contains(upper, "CHARACTER SET") {
+		return e.execCreateDatabaseRaw(trimmed)
+	}
 
 	// Handle ALTER TABLE ... ORDER BY (vitess parser drops ORDER BY clause)
 	if strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, " ORDER BY ") {
@@ -430,12 +500,14 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return e.execCallProcFromAST(s)
 	case *sqlparser.Load:
 		return e.execLoadData(query)
-	case *sqlparser.PrepareStmt, *sqlparser.ExecuteStmt, *sqlparser.DeallocateStmt:
-		// Accept PREPARE/EXECUTE/DEALLOCATE silently
-		return &Result{}, nil
+	case *sqlparser.PrepareStmt:
+		return e.execPrepare(s)
+	case *sqlparser.ExecuteStmt:
+		return e.execExecute(s)
+	case *sqlparser.DeallocateStmt:
+		return e.execDeallocate(s)
 	case *sqlparser.AlterDatabase:
-		// Accept ALTER DATABASE silently
-		return &Result{}, nil
+		return e.execAlterDatabase(s)
 	case *sqlparser.DropProcedure:
 		return e.execDropProcedureAST(s)
 	case *sqlparser.CreateProcedure:
@@ -509,7 +581,18 @@ func (e *Executor) execCreateDatabase(stmt *sqlparser.CreateDatabase) (*Result, 
 	if sysSchemas[strings.ToLower(name)] {
 		return nil, mysqlError(3802, "HY000", fmt.Sprintf("Access to system schema '%s' is rejected.", name))
 	}
-	err := e.Catalog.CreateDatabase(name)
+	// Extract charset and collation from CREATE DATABASE options
+	charset := ""
+	collation := ""
+	for _, opt := range stmt.CreateOptions {
+		switch opt.Type {
+		case sqlparser.CharacterSetType:
+			charset = opt.Value
+		case sqlparser.CollateType:
+			collation = opt.Value
+		}
+	}
+	err := e.Catalog.CreateDatabaseWithCharset(name, charset, collation)
 	if err != nil {
 		if stmt.IfNotExists {
 			return &Result{}, nil
@@ -536,6 +619,206 @@ func (e *Executor) execDropDatabase(stmt *sqlparser.DropDatabase) (*Result, erro
 	return &Result{}, nil
 }
 
+// execAlterDatabase handles ALTER DATABASE ... CHARACTER SET / COLLATE.
+func (e *Executor) execAlterDatabase(stmt *sqlparser.AlterDatabase) (*Result, error) {
+	name := stmt.DBName.String()
+	if name == "" {
+		name = e.CurrentDB
+	}
+	db, err := e.Catalog.GetDatabase(name)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", name))
+	}
+	for _, opt := range stmt.AlterOptions {
+		switch opt.Type {
+		case sqlparser.CharacterSetType:
+			db.CharacterSet = opt.Value
+			// Update collation to default for the new charset
+			db.CollationName = catalog.DefaultCollationForCharset(opt.Value)
+		case sqlparser.CollateType:
+			db.CollationName = opt.Value
+			// Derive charset from collation name (e.g. "utf8_general_ci" -> "utf8")
+			parts := strings.SplitN(opt.Value, "_", 2)
+			if len(parts) > 0 {
+				db.CharacterSet = parts[0]
+			}
+		}
+	}
+	return &Result{}, nil
+}
+
+// execCreateDatabaseRaw handles CREATE DATABASE/SCHEMA ... CHARACTER SET from raw SQL
+// when the vitess parser doesn't correctly extract the charset.
+func (e *Executor) execCreateDatabaseRaw(query string) (*Result, error) {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	rest := ""
+	if strings.HasPrefix(upper, "CREATE DATABASE ") {
+		rest = strings.TrimSpace(query[len("CREATE DATABASE "):])
+	} else if strings.HasPrefix(upper, "CREATE SCHEMA ") {
+		rest = strings.TrimSpace(query[len("CREATE SCHEMA "):])
+	}
+	// Handle IF NOT EXISTS
+	ifNotExists := false
+	restUpper := strings.ToUpper(rest)
+	if strings.HasPrefix(restUpper, "IF NOT EXISTS ") {
+		ifNotExists = true
+		rest = strings.TrimSpace(rest[len("IF NOT EXISTS "):])
+		restUpper = strings.ToUpper(rest)
+	}
+	// Extract database name (first token)
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return &Result{}, nil
+	}
+	dbName := strings.Trim(fields[0], "`")
+
+	// Reject system schemas
+	sysSchemas := map[string]bool{
+		"mysql": true, "information_schema": true, "performance_schema": true, "sys": true,
+	}
+	if sysSchemas[strings.ToLower(dbName)] {
+		return nil, mysqlError(3802, "HY000", fmt.Sprintf("Access to system schema '%s' is rejected.", dbName))
+	}
+
+	// Extract CHARACTER SET and COLLATE from rest
+	charset := ""
+	collation := ""
+	fullUpper := strings.ToUpper(strings.Join(fields[1:], " "))
+	csIdx := strings.Index(fullUpper, "CHARACTER SET ")
+	if csIdx >= 0 {
+		afterCS := strings.TrimSpace(fullUpper[csIdx+len("CHARACTER SET "):])
+		csFields := strings.Fields(afterCS)
+		if len(csFields) > 0 {
+			charset = strings.ToLower(csFields[0])
+		}
+	}
+	collIdx := strings.Index(fullUpper, "COLLATE ")
+	if collIdx >= 0 {
+		afterColl := strings.TrimSpace(fullUpper[collIdx+len("COLLATE "):])
+		collFields := strings.Fields(afterColl)
+		if len(collFields) > 0 {
+			collation = strings.ToLower(collFields[0])
+		}
+	}
+
+	err := e.Catalog.CreateDatabaseWithCharset(dbName, charset, collation)
+	if err != nil {
+		if ifNotExists {
+			return &Result{}, nil
+		}
+		return nil, mysqlError(1007, "HY000", fmt.Sprintf("Can't create database '%s'; database exists", dbName))
+	}
+	e.Storage.EnsureDatabase(dbName)
+	return &Result{AffectedRows: 1}, nil
+}
+
+// execAlterDatabaseRaw handles ALTER DATABASE/SCHEMA ... CHARACTER SET/COLLATE from raw SQL.
+// This is needed because the vitess parser doesn't handle CHARACTER SET in ALTER DATABASE.
+func (e *Executor) execAlterDatabaseRaw(query string) (*Result, error) {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	// Extract database name: ALTER DATABASE <name> or ALTER SCHEMA <name>
+	rest := ""
+	if strings.HasPrefix(upper, "ALTER DATABASE ") {
+		rest = strings.TrimSpace(query[len("ALTER DATABASE "):])
+	} else if strings.HasPrefix(upper, "ALTER SCHEMA ") {
+		rest = strings.TrimSpace(query[len("ALTER SCHEMA "):])
+	}
+	// Parse: <dbname> [DEFAULT] CHARACTER SET <charset> [COLLATE <collation>]
+	// or: <dbname> [DEFAULT] COLLATE <collation>
+	fields := strings.Fields(rest)
+	if len(fields) < 3 {
+		return &Result{}, nil
+	}
+	dbName := strings.Trim(fields[0], "`")
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
+	}
+
+	restUpper := strings.ToUpper(strings.Join(fields[1:], " "))
+	// Extract CHARACTER SET
+	csIdx := strings.Index(restUpper, "CHARACTER SET ")
+	if csIdx >= 0 {
+		afterCS := strings.TrimSpace(restUpper[csIdx+len("CHARACTER SET "):])
+		csFields := strings.Fields(afterCS)
+		if len(csFields) > 0 {
+			charset := strings.ToLower(csFields[0])
+			db.CharacterSet = charset
+			db.CollationName = catalog.DefaultCollationForCharset(charset)
+		}
+	}
+	// Extract COLLATE
+	collIdx := strings.Index(restUpper, "COLLATE ")
+	if collIdx >= 0 {
+		afterColl := strings.TrimSpace(restUpper[collIdx+len("COLLATE "):])
+		collFields := strings.Fields(afterColl)
+		if len(collFields) > 0 {
+			collation := strings.ToLower(collFields[0])
+			db.CollationName = collation
+			// Derive charset from collation
+			parts := strings.SplitN(collation, "_", 2)
+			if len(parts) > 0 {
+				db.CharacterSet = parts[0]
+			}
+		}
+	}
+
+	return &Result{}, nil
+}
+
+// execPrepare handles PREPARE stmt_name FROM 'query'.
+func (e *Executor) execPrepare(stmt *sqlparser.PrepareStmt) (*Result, error) {
+	name := stmt.Name.String()
+	// The statement text is in stmt.Statement
+	query := sqlparser.String(stmt.Statement)
+	query = strings.Trim(query, "'\"")
+	e.preparedStmts[name] = query
+	return &Result{}, nil
+}
+
+// execExecute handles EXECUTE stmt_name [USING @var1, @var2, ...].
+func (e *Executor) execExecute(stmt *sqlparser.ExecuteStmt) (*Result, error) {
+	name := stmt.Name.String()
+	query, ok := e.preparedStmts[name]
+	if !ok {
+		return nil, mysqlError(1243, "HY000", fmt.Sprintf("Unknown prepared statement handler (%s) given to EXECUTE", name))
+	}
+	// Replace ? placeholders with user variable values
+	argIdx := 0
+	var finalQuery strings.Builder
+	for i := 0; i < len(query); i++ {
+		if query[i] == '?' && argIdx < len(stmt.Arguments) {
+			varName := stmt.Arguments[argIdx].Name.String()
+			val, exists := e.userVars[varName]
+			if !exists || val == nil {
+				finalQuery.WriteString("NULL")
+			} else {
+				switch v := val.(type) {
+				case string:
+					finalQuery.WriteString("'" + strings.ReplaceAll(v, "'", "''") + "'")
+				case int64:
+					finalQuery.WriteString(strconv.FormatInt(v, 10))
+				case float64:
+					finalQuery.WriteString(strconv.FormatFloat(v, 'f', -1, 64))
+				default:
+					finalQuery.WriteString("'" + strings.ReplaceAll(fmt.Sprintf("%v", v), "'", "''") + "'")
+				}
+			}
+			argIdx++
+		} else {
+			finalQuery.WriteByte(query[i])
+		}
+	}
+	return e.Execute(finalQuery.String())
+}
+
+// execDeallocate handles DEALLOCATE PREPARE stmt_name.
+func (e *Executor) execDeallocate(stmt *sqlparser.DeallocateStmt) (*Result, error) {
+	name := stmt.Name.String()
+	delete(e.preparedStmts, name)
+	return &Result{}, nil
+}
+
 func (e *Executor) execUse(stmt *sqlparser.Use) (*Result, error) {
 	name := stmt.DBName.String()
 	_, err := e.Catalog.GetDatabase(name)
@@ -549,6 +832,17 @@ func (e *Executor) execUse(stmt *sqlparser.Use) (*Result, error) {
 // execSet handles parsed SET statements.
 func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 	for _, expr := range stmt.Exprs {
+		// Handle user variables (@var)
+		if expr.Var.Scope == sqlparser.VariableScope {
+			varName := expr.Var.Name.String()
+			val, err := e.evalExpr(expr.Expr)
+			if err != nil {
+				// Fallback: use the string representation
+				val = strings.Trim(sqlparser.String(expr.Expr), "'\"")
+			}
+			e.userVars[varName] = val
+			continue
+		}
 		name := strings.ToLower(expr.Var.Name.String())
 		val := sqlparser.String(expr.Expr)
 		val = strings.Trim(val, "'\"")
@@ -573,6 +867,10 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			}
 		case "time_zone":
 			e.parseTimeZone(val)
+		case "insert_id":
+			if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+				e.nextInsertID = n
+			}
 		}
 	}
 	return &Result{}, nil
@@ -580,6 +878,36 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 
 // handleRawSet handles SET statements that the parser couldn't parse.
 func (e *Executor) handleRawSet(raw string) {
+	// Handle user variables: SET @var = value or SET @var := value
+	trimmed := strings.TrimSpace(raw)
+	if strings.HasPrefix(strings.ToUpper(trimmed), "SET ") {
+		rest := strings.TrimSpace(trimmed[4:])
+		if strings.HasPrefix(rest, "@") && !strings.HasPrefix(rest, "@@") {
+			// Find = or :=
+			eqIdx := strings.Index(rest, ":=")
+			if eqIdx < 0 {
+				eqIdx = strings.Index(rest, "=")
+			} else {
+				// For :=, the value starts after :=
+				varName := strings.TrimSpace(rest[1:eqIdx])
+				val := strings.TrimSpace(rest[eqIdx+2:])
+				val = strings.TrimSuffix(val, ";")
+				val = strings.TrimSpace(val)
+				val = strings.Trim(val, "'\"")
+				e.userVars[varName] = val
+				return
+			}
+			if eqIdx > 0 {
+				varName := strings.TrimSpace(rest[1:eqIdx])
+				val := strings.TrimSpace(rest[eqIdx+1:])
+				val = strings.TrimSuffix(val, ";")
+				val = strings.TrimSpace(val)
+				val = strings.Trim(val, "'\"")
+				e.userVars[varName] = val
+				return
+			}
+		}
+	}
 	upper := strings.ToUpper(raw)
 	if strings.Contains(upper, "SQL_MODE") {
 		if idx := strings.Index(upper, "="); idx >= 0 {
@@ -1078,6 +1406,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	}
 	e.Storage.CreateTable(e.CurrentDB, def)
 
+	// Track temporary tables
+	if stmt.Temp {
+		e.tempTables[tableName] = true
+	}
+
 	// Set AUTO_INCREMENT start value and table comment from table options
 	for _, opt := range stmt.TableSpec.Options {
 		switch strings.ToUpper(opt.Name) {
@@ -1154,6 +1487,8 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 			return nil, mysqlError(1051, "42S02", fmt.Sprintf("Unknown table '%s.%s'", e.CurrentDB, tableName))
 		}
 		e.Storage.DropTable(e.CurrentDB, tableName)
+		// Clean up temp table tracking
+		delete(e.tempTables, tableName)
 		// Drop triggers associated with this table (MySQL behavior)
 		e.dropTriggersForTable(db, tableName)
 	}
@@ -1311,6 +1646,19 @@ func (e *Executor) execMyliteCommand(query string) (*Result, error) {
 		return &Result{}, nil
 	}
 
+	if restUpper == "RESET_TEMP_TABLES" {
+		// Drop all temporary tables and clear the temp table tracking
+		db, err := e.Catalog.GetDatabase(e.CurrentDB)
+		if err == nil {
+			for name := range e.tempTables {
+				db.DropTable(name)     //nolint:errcheck
+				e.Storage.DropTable(e.CurrentDB, name)
+			}
+		}
+		e.tempTables = make(map[string]bool)
+		return &Result{}, nil
+	}
+
 	return nil, fmt.Errorf("unknown MYLITE command: %s", query)
 }
 
@@ -1320,6 +1668,12 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
 	if err != nil {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
+	}
+
+	// Apply SET INSERT_ID if set
+	if e.nextInsertID > 0 {
+		tbl.AutoIncrement.Store(e.nextInsertID - 1)
+		e.nextInsertID = 0
 	}
 
 	// Get column names
@@ -3386,15 +3740,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			}
 			return &Result{Columns: []string{colName}, Rows: rows, IsResultSet: true}, nil
 		case sqlparser.Charset: // SHOW CHARACTER SET
-			charsets := [][]interface{}{
-				{"armscii8", "ARMSCII-8 Armenian", "armscii8_general_ci", int64(1)},
-				{"ascii", "US ASCII", "ascii_general_ci", int64(1)},
-				{"binary", "Binary pseudo charset", "binary", int64(1)},
-				{"latin1", "cp1252 West European", "latin1_swedish_ci", int64(1)},
-				{"utf8", "UTF-8 Unicode", "utf8_general_ci", int64(3)},
-				{"utf8mb3", "UTF-8 Unicode", "utf8mb3_general_ci", int64(3)},
-				{"utf8mb4", "UTF-8 Unicode", "utf8mb4_0900_ai_ci", int64(4)},
-			}
+			charsets := allCharsets()
 			rows := make([][]interface{}, 0)
 			for _, cs := range charsets {
 				if likePattern == "" || matchLike(cs[0].(string), likePattern) {
@@ -3427,6 +3773,10 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			sort.Strings(tables)
 			rows := make([][]interface{}, 0, len(tables))
 			for _, t := range tables {
+				// Skip temporary tables in SHOW TABLES
+				if e.tempTables[t] {
+					continue
+				}
 				if likePattern != "" && !matchLike(t, likePattern) {
 					continue
 				}
@@ -3449,9 +3799,12 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		}
 		tables := db.ListTables()
 		sort.Strings(tables)
-		rows := make([][]interface{}, len(tables))
-		for i, t := range tables {
-			rows[i] = []interface{}{t}
+		rows := make([][]interface{}, 0, len(tables))
+		for _, t := range tables {
+			if e.tempTables[t] {
+				continue
+			}
+			rows = append(rows, []interface{}{t})
 		}
 		return &Result{
 			Columns:     []string{fmt.Sprintf("Tables_in_%s", e.CurrentDB)},
@@ -3494,15 +3847,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			rest := strings.TrimSpace(query[idx+5:])
 			likePattern = strings.Trim(rest, "'\"")
 		}
-		charsets := [][]interface{}{
-			{"armscii8", "ARMSCII-8 Armenian", "armscii8_general_ci", int64(1)},
-			{"ascii", "US ASCII", "ascii_general_ci", int64(1)},
-			{"binary", "Binary pseudo charset", "binary", int64(1)},
-			{"latin1", "cp1252 West European", "latin1_swedish_ci", int64(1)},
-			{"utf8", "UTF-8 Unicode", "utf8_general_ci", int64(3)},
-			{"utf8mb3", "UTF-8 Unicode", "utf8mb3_general_ci", int64(3)},
-			{"utf8mb4", "UTF-8 Unicode", "utf8mb4_0900_ai_ci", int64(4)},
-		}
+		charsets := allCharsets()
 		rows := make([][]interface{}, 0)
 		for _, cs := range charsets {
 			if likePattern == "" || matchLike(cs[0].(string), likePattern) {
@@ -3719,7 +4064,11 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("CREATE TABLE `%s` (\n", tableName))
+	if e.tempTables[tableName] {
+		b.WriteString(fmt.Sprintf("CREATE TEMPORARY TABLE `%s` (\n", tableName))
+	} else {
+		b.WriteString(fmt.Sprintf("CREATE TABLE `%s` (\n", tableName))
+	}
 
 	var colDefs []string
 	var pkCols []string
@@ -3896,6 +4245,14 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		// Return column name as string for use in row lookup
 		return v.Name.String(), nil
 	case *sqlparser.Variable:
+		// Handle user variables (@var)
+		if v.Scope == sqlparser.VariableScope {
+			varName := v.Name.String()
+			if val, ok := e.userVars[varName]; ok {
+				return val, nil
+			}
+			return nil, nil
+		}
 		// Handle @@variables
 		name := strings.ToLower(v.Name.String())
 		switch name {
