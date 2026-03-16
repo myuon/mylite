@@ -15262,6 +15262,65 @@ func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error)
 					}
 				}
 				if isMatch && matchedCols > 0 {
+					// Apply the same type coercions used by single-table UPDATE.
+					for _, col := range tbl.Def.Columns {
+						if col.Name == colName {
+							if padLen := binaryPadLength(col.Type); padLen > 0 && val != nil {
+								val = padBinaryValue(val, padLen)
+							}
+							if val != nil {
+								val = formatDecimalValue(col.Type, val)
+								val = validateEnumSetValue(col.Type, val)
+								val = coerceDateTimeValue(col.Type, val)
+								val = coerceIntegerValue(col.Type, val)
+							} else if !col.Nullable {
+								tbl.Unlock()
+								return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", colName))
+							}
+							break
+						}
+					}
+
+					// Build candidate row and enforce PRIMARY KEY uniqueness.
+					candidate := make(storage.Row, len(tbl.Rows[i]))
+					for k, v := range tbl.Rows[i] {
+						candidate[k] = v
+					}
+					candidate[colName] = val
+
+					pkCols := make([]string, 0, len(tbl.Def.PrimaryKey))
+					if len(tbl.Def.PrimaryKey) > 0 {
+						pkCols = append(pkCols, tbl.Def.PrimaryKey...)
+					} else {
+						for _, col := range tbl.Def.Columns {
+							if col.PrimaryKey {
+								pkCols = append(pkCols, col.Name)
+							}
+						}
+					}
+					if len(pkCols) > 0 {
+						for j, other := range tbl.Rows {
+							if j == i {
+								continue
+							}
+							matchPK := true
+							for _, pk := range pkCols {
+								if fmt.Sprintf("%v", other[pk]) != fmt.Sprintf("%v", candidate[pk]) {
+									matchPK = false
+									break
+								}
+							}
+							if matchPK {
+								vals := make([]string, len(pkCols))
+								for k, pk := range pkCols {
+									vals[k] = fmt.Sprintf("%v", candidate[pk])
+								}
+								tbl.Unlock()
+								return nil, mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key 'PRIMARY'", strings.Join(vals, "-")))
+							}
+						}
+					}
+
 					tbl.Rows[i][colName] = val
 				}
 			}
