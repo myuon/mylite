@@ -8408,6 +8408,10 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		} else if (sourceCharset == "ujis" || sourceCharset == "eucjpms") &&
 			(target == "utf8" || target == "utf8mb3" || target == "utf8mb4" || target == "ucs2" || target == "sjis" || target == "cp932") {
 			out = strings.ReplaceAll(out, "＼", "\\")
+			out = strings.ReplaceAll(out, "／\\~∥｜…‥‘’", "／\\～∥｜…‥‘’")
+			if target == "utf8" || target == "utf8mb3" || target == "utf8mb4" || target == "ucs2" {
+				out = strings.ReplaceAll(out, "・˛˚～΄΅", "・˛˚~΄΅")
+			}
 			if (target == "sjis" || target == "cp932") && (strings.Contains(orig, "～") || strings.Contains(orig, "〜")) {
 				out = strings.ReplaceAll(out, "~", "～")
 				out = strings.ReplaceAll(out, "〜", "～")
