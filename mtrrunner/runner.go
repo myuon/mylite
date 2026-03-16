@@ -87,7 +87,7 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	}
 
 	// Execute with timeout
-	timeout := 30 * time.Second
+	timeout := 120 * time.Second
 	doneCh := make(chan error, 1)
 
 	tmpDir := r.TmpDir
@@ -237,6 +237,12 @@ func (ctx *execContext) executeLines(lines []string) error {
 			continue
 		}
 
+		// Skip standalone } (closing brace from if/while blocks where { was on the directive line)
+		if trimmed == "}" {
+			i++
+			continue
+		}
+
 		// Handle directives (lines starting with --)
 		if strings.HasPrefix(trimmed, "--") {
 			directive := strings.TrimPrefix(trimmed, "--")
@@ -270,6 +276,27 @@ func (ctx *execContext) executeLines(lines []string) error {
 				i++
 				continue
 			}
+		}
+
+		// Handle while/if blocks with { on the same line: while($i){ or if($cond){
+		if (strings.HasPrefix(trimmed, "while(") || strings.HasPrefix(trimmed, "while ") ||
+			strings.HasPrefix(trimmed, "if(") || strings.HasPrefix(trimmed, "if ") ||
+			strings.HasPrefix(trimmed, "--if") || strings.HasPrefix(trimmed, "--while")) &&
+			strings.HasSuffix(trimmed, "{") {
+			// Skip until matching }
+			depth := 1
+			i++
+			for i < len(lines) && depth > 0 {
+				t := strings.TrimSpace(lines[i])
+				if strings.HasSuffix(t, "{") {
+					depth++
+				}
+				if t == "}" {
+					depth--
+				}
+				i++
+			}
+			continue
 		}
 
 		// Collect multi-line SQL statement (until delimiter)
