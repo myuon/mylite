@@ -126,8 +126,9 @@ func (t *Table) Insert(row Row) (int64, error) {
 				}
 			} else {
 				// If explicit value provided, update auto_increment counter if needed
+				// Store the value itself (not value+1) because Add(1) will return value+1
 				if intVal, ok := toInt64(v); ok && intVal >= t.AutoIncrement.Load() {
-					t.AutoIncrement.Store(intVal + 1)
+					t.AutoIncrement.Store(intVal)
 				}
 				lastInsertID = toInt64Val(v)
 			}
