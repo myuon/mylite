@@ -2324,28 +2324,12 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 
 	// Handle bare DECIMAL/DOUBLE/FLOAT/REAL without (M,D)
 	if prefix == "" {
-		// Bare FLOAT/DOUBLE/REAL: just return the float value (no rounding)
+		// Bare FLOAT/DOUBLE/REAL: convert to numeric value
 		for _, p := range []string{"double", "float", "real"} {
 			if cleanLower == p {
-				f, cls := decimalParseValue(v)
-				if cls == "invalid" {
-					return v
-				}
-				// FLOAT is single-precision
-				if p == "float" {
-					f = float64(float32(f))
-				}
+				f := toFloat(v)
 				if isUnsigned && f < 0 {
 					f = 0
-				}
-				if cls == "overflow_pos" || math.IsInf(f, 1) {
-					return v
-				}
-				if cls == "overflow_neg" || math.IsInf(f, -1) {
-					if isUnsigned {
-						return float64(0)
-					}
-					return v
 				}
 				// Convert to int64 when the float is an exact integer
 				if f == float64(int64(f)) {
@@ -3121,6 +3105,38 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					if isDecCol {
 						if f, ferr := strconv.ParseFloat(overflowStr, 64); ferr == nil {
 							v = f
+							err = nil
+						}
+					}
+					// For INT columns in non-strict mode, clip to type range
+					if err != nil && !e.isStrictMode() {
+						isIntCol := false
+						isUnsigned := false
+						for _, col := range tbl.Def.Columns {
+							if col.Name == colNames[i] {
+								colUpper := strings.ToUpper(col.Type)
+								if strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER") {
+									isIntCol = true
+									isUnsigned = strings.Contains(colUpper, "UNSIGNED")
+								}
+								break
+							}
+						}
+						if isIntCol {
+							// Clip to type range
+							if strings.HasPrefix(overflowStr, "-") {
+								if isUnsigned {
+									v = int64(0)
+								} else {
+									v = int64(math.MinInt64)
+								}
+							} else {
+								if isUnsigned {
+									v = uint64(math.MaxUint64)
+								} else {
+									v = int64(math.MaxInt64)
+								}
+							}
 							err = nil
 						}
 					}
@@ -6716,9 +6732,6 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 				// Try unsigned 64-bit
 				u, err2 := strconv.ParseUint(v.Val, 10, 64)
 				if err2 != nil {
-					// Check if we're in a context where overflow should be treated as max uint64
-					// For standalone use (e.g., INSERT INTO), return the overflow error
-					// The BinaryExpr handler will catch this for arithmetic operations
 					return nil, &intOverflowError{val: v.Val}
 				}
 				return u, nil
@@ -9622,6 +9635,10 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		e.correlatedRow = row
 		val, err := e.evalExpr(expr)
 		e.correlatedRow = oldCorrelated
+		if err != nil && strings.Contains(err.Error(), "INT_OVERFLOW") {
+			// In row evaluation context, treat overflow as max uint64
+			return uint64(math.MaxUint64), nil
+		}
 		return val, err
 	}
 }
