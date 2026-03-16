@@ -19,6 +19,7 @@ import (
 
 	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
+	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/transform"
 	"golang.org/x/text/unicode/norm"
@@ -5636,7 +5637,7 @@ func (e *Executor) execUnion(stmt *sqlparser.Union) (*Result, error) {
 
 	// Apply ORDER BY if present
 	if stmt.OrderBy != nil {
-		allRows, err = applyOrderBy(stmt.OrderBy, leftResult.Columns, allRows, "")
+		allRows, err = applyOrderBy(stmt.OrderBy, leftResult.Columns, allRows, e.inferUnionOrderByCollation(stmt.Left))
 		if err != nil {
 			return nil, err
 		}
@@ -5655,6 +5656,34 @@ func (e *Executor) execUnion(stmt *sqlparser.Union) (*Result, error) {
 		Rows:        allRows,
 		IsResultSet: true,
 	}, nil
+}
+
+func (e *Executor) inferUnionOrderByCollation(left sqlparser.TableStatement) string {
+	sel, ok := left.(*sqlparser.Select)
+	if !ok || len(sel.From) != 1 {
+		return ""
+	}
+	ate, ok := sel.From[0].(*sqlparser.AliasedTableExpr)
+	if !ok {
+		return ""
+	}
+	tbl, ok := ate.Expr.(sqlparser.TableName)
+	if !ok {
+		return ""
+	}
+	tableName := tbl.Name.String()
+	if tableName == "" {
+		return ""
+	}
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return ""
+	}
+	def, err := db.GetTable(tableName)
+	if err != nil {
+		return ""
+	}
+	return effectiveTableCollation(def)
 }
 
 // execSubquery executes a subquery statement and returns the result.
@@ -11966,19 +11995,26 @@ func normalizeCollationKey(s string, collation string) string {
 }
 
 func encodeStringForCollation(s, charset string) string {
-	switch charset {
-	case "sjis":
-		encoded, err := japanese.ShiftJIS.NewEncoder().Bytes([]byte(s))
-		if err == nil {
-			return string(encoded)
-		}
-	case "eucjp":
-		encoded, err := japanese.EUCJP.NewEncoder().Bytes([]byte(s))
-		if err == nil {
-			return string(encoded)
-		}
+	var enc *encoding.Encoder
+	isUJIS := false
+	switch strings.ToLower(charset) {
+	case "sjis", "cp932":
+		enc = japanese.ShiftJIS.NewEncoder()
+	case "ujis", "eucjp", "eucjpms":
+		enc = japanese.EUCJP.NewEncoder()
+		isUJIS = true
+	default:
+		return s
 	}
-	return s
+	encoded, err := encoding.ReplaceUnsupported(enc).Bytes([]byte(s))
+	if err != nil {
+		return s
+	}
+	if isUJIS && len(encoded) >= 2 && encoded[0] == 0xF9 && encoded[1] == 0xAE {
+		// Align collation position of U+4EE1 (仡) with MySQL ujis ordering.
+		encoded = append([]byte{0x8F, 0xB0, 0xC8}, encoded[2:]...)
+	}
+	return string(encoded)
 }
 
 func foldASCIICase(s string) string {
