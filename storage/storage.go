@@ -103,11 +103,20 @@ func (t *Table) Insert(row Row) (int64, error) {
 	var lastInsertID int64
 	for _, col := range t.Def.Columns {
 		if col.AutoIncrement {
-			if v, ok := row[col.Name]; !ok || v == nil {
+			v, exists := row[col.Name]
+			// In MySQL, inserting 0 into an auto-increment column is treated like NULL
+			// (generates the next auto-increment value), unless NO_AUTO_VALUE_ON_ZERO is set.
+			isZero := false
+			if exists && v != nil {
+				if intVal, ok := toInt64(v); ok && intVal == 0 {
+					isZero = true
+				}
+			}
+			if !exists || v == nil || isZero {
 				// For nullable AI columns with explicitly-set AUTO_INCREMENT,
 				// inserting NULL stores NULL.
 				// Otherwise (NOT NULL or default AI), generate the next value.
-				if col.Nullable && ok && v == nil && t.AIExplicitlySet {
+				if col.Nullable && exists && v == nil && t.AIExplicitlySet {
 					// Explicit NULL on a nullable AI column with explicit AI start: keep NULL
 					lastInsertID = 0
 				} else {

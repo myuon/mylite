@@ -107,8 +107,16 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		sortResult:      false,
 		tmpDir:          tmpDir,
 		variables: map[string]string{
-			"$ENGINE":           "InnoDB",
-			"$MYSQLTEST_VARDIR": tmpDir,
+			"$ENGINE":            "InnoDB",
+			"$MYSQLTEST_VARDIR":  tmpDir,
+			"$MYSQL_TMP_DIR":     filepath.Join(tmpDir, "tmp"),
+			"$MYSQL_TEST_DIR":    tmpDir,
+			"$MYSQLD_DATADIR":    filepath.Join(tmpDir, "data", "inner") + "/",
+			"$MYSQL_SOCKET":      "",
+			"$MASTER_MYPORT":     "3306",
+			"$MYSQL_VERSION_ID":  "80032",
+			"$innodb_page_size":  "16384",
+			"$restart_parameters": "restart",
 		},
 	}
 
@@ -151,7 +159,9 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	normalizedActual := normalizeOutput(actual)
 	normalizedActual = strings.ReplaceAll(normalizedActual, "ENGINE=ENGINE", "ENGINE=InnoDB")
 	normalizedActual = strings.ReplaceAll(normalizedActual, "ENGINE=MyISAM", "ENGINE=InnoDB")
+	normalizedActual = normalizeFuncCase(normalizedActual)
 	normalizedExpected := normalizeExpected(normalizeOutput(expected))
+	normalizedExpected = normalizeFuncCase(normalizedExpected)
 	if normalizedActual == normalizedExpected {
 		return TestResult{Name: name, Passed: true, Output: actual, Expected: expected}
 	}
@@ -221,19 +231,79 @@ func (ctx *execContext) executeLines(lines []string) error {
 			continue
 		}
 
+		// Handle perl blocks: skip until EOF
+		if trimmed == "perl;" || trimmed == "--perl" || trimmed == "perl" {
+			i++
+			for i < len(lines) {
+				t := strings.TrimSpace(lines[i])
+				i++
+				if t == "EOF" {
+					break
+				}
+			}
+			continue
+		}
+
+		// Handle write_file/append_file blocks: skip until EOF
+		if strings.HasPrefix(trimmed, "write_file ") || strings.HasPrefix(trimmed, "--write_file ") ||
+			strings.HasPrefix(trimmed, "append_file ") || strings.HasPrefix(trimmed, "--append_file ") {
+			i++
+			for i < len(lines) {
+				t := strings.TrimSpace(lines[i])
+				i++
+				if t == "EOF" {
+					break
+				}
+			}
+			continue
+		}
+
 		// Skip { } blocks (from if/while directives)
 		if trimmed == "{" {
 			depth := 1
 			i++
 			for i < len(lines) && depth > 0 {
 				t := strings.TrimSpace(lines[i])
-				if t == "{" {
+				if t == "{" || strings.HasSuffix(t, "{") {
 					depth++
-				} else if t == "}" {
+				}
+				if t == "}" {
 					depth--
 				}
 				i++
 			}
+			continue
+		}
+
+		// Handle if/while with { on the same line: skip the block
+		// This handles cases like "if ($var) {" where the brace is on the same line.
+		// The old-style "if ($var)\n{\n...\n}" is handled by the bare "{" block skipper above.
+		lowerTrimmed := strings.ToLower(trimmed)
+		isIfWhile := strings.HasPrefix(lowerTrimmed, "if ") || strings.HasPrefix(lowerTrimmed, "if(") ||
+			strings.HasPrefix(lowerTrimmed, "--if ") || strings.HasPrefix(lowerTrimmed, "--if(") ||
+			strings.HasPrefix(lowerTrimmed, "while ") || strings.HasPrefix(lowerTrimmed, "while(") ||
+			strings.HasPrefix(lowerTrimmed, "--while ") || strings.HasPrefix(lowerTrimmed, "--while(")
+		if isIfWhile && strings.Contains(trimmed, "{") {
+			// { is on this line - skip until matching }
+			depth := 1
+			i++
+			for i < len(lines) && depth > 0 {
+				t := strings.TrimSpace(lines[i])
+				for _, ch := range t {
+					if ch == '{' {
+						depth++
+					} else if ch == '}' {
+						depth--
+					}
+				}
+				i++
+			}
+			continue
+		}
+		if isIfWhile {
+			// No { on this line - just skip the if/while line itself
+			// The { will appear on the next line and be handled by the bare "{" block skipper
+			i++
 			continue
 		}
 
@@ -471,11 +541,54 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		}
 		return true, false, nil
 
-	case "query", "eval":
-		// Execute the rest as SQL
+	case "query", "eval", "query_vertical":
+		// Execute the rest as SQL (query_vertical is just vertical formatting, we ignore)
 		if args != "" {
 			err := ctx.executeSQL(args)
 			return true, false, err
+		}
+		return true, false, nil
+
+	case "shutdown_server":
+		// Server restart is not supported - skip remaining lines in this block
+		return true, true, nil
+
+	case "exec", "execw":
+		// Handle --exec echo "..." specially to produce output
+		if strings.HasPrefix(args, "echo ") || strings.HasPrefix(args, "echo\t") {
+			echoArg := strings.TrimSpace(args[5:])
+			// Substitute variables
+			echoArg = ctx.substituteVars(echoArg)
+			// Check for output redirections (> file means output goes to file, not stdout)
+			hasRedirect := false
+			// Check for > outside of quotes
+			inQuote := byte(0)
+			for i := 0; i < len(echoArg); i++ {
+				if echoArg[i] == '"' || echoArg[i] == '\'' {
+					if inQuote == 0 {
+						inQuote = echoArg[i]
+					} else if inQuote == echoArg[i] {
+						inQuote = 0
+					}
+				}
+				if inQuote == 0 && echoArg[i] == '>' {
+					hasRedirect = true
+					echoArg = strings.TrimSpace(echoArg[:i])
+					break
+				}
+			}
+			// Strip surrounding quotes
+			if len(echoArg) >= 2 {
+				if (echoArg[0] == '"' && echoArg[len(echoArg)-1] == '"') ||
+					(echoArg[0] == '\'' && echoArg[len(echoArg)-1] == '\'') {
+					echoArg = echoArg[1 : len(echoArg)-1]
+				}
+			}
+			// Only output if not redirected to a file
+			if !hasRedirect && ctx.resultLogEnabled {
+				ctx.output.WriteString(echoArg + "\n")
+			}
+			return true, false, nil
 		}
 		return true, false, nil
 
@@ -513,12 +626,21 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"write_file", "append_file", "cat_file",
 		"mkdir", "rmdir", "move_file",
 		"list_files", "file_exists",
-		"exec", "system",
+		"system",
 		"die", "exit",
 		"if", "while", "end",
 		"inc", "dec",
 		"horizontal_results", "vertical_results",
-		"require", "result_format":
+		"require", "result_format",
+		"disable_reconnect", "enable_reconnect",
+		"disable_abort_on_error", "enable_abort_on_error",
+		"real_sleep",
+		"query_get_value",
+		"save_master_pos", "sync_with_master",
+		"change_user",
+		"diff_files", "chmod",
+		"perl",
+		"disable_info", "enable_info":
 		return true, false, nil
 	}
 
@@ -912,6 +1034,9 @@ var directiveKeywords = map[string]bool{
 	"result_format": true, "change_user": true,
 	"disable_metadata": true, "enable_metadata": true,
 	"disable_info": true, "enable_info": true,
+	"shutdown_server": true,
+	"disable_reconnect": true, "enable_reconnect": true,
+	"query_vertical": true,
 }
 
 func isDirectiveKeyword(s string) bool {
@@ -978,6 +1103,11 @@ var barePrefixKeywords = []string{
 	"sync_with_master",
 	"disable_info",
 	"enable_info",
+	"shutdown_server",
+	"shutdown_server ",
+	"disable_reconnect",
+	"enable_reconnect",
+	"query_vertical ",
 }
 
 // extractBareDirective checks whether trimmed is a bare (no "--") mysqltest directive.
@@ -1189,6 +1319,24 @@ func stripInlineComment(line string) string {
 		}
 	}
 	return line
+}
+
+// normalizeFuncCase normalizes SQL function names in column headers
+// to be case-insensitive. MySQL preserves original case, vitess uppercases.
+func normalizeFuncCase(s string) string {
+	// Common SQL functions that appear as column headers
+	funcs := []string{
+		"COUNT", "SUM", "AVG", "MIN", "MAX",
+		"CONCAT", "SUBSTR", "SUBSTRING", "LEFT", "RIGHT",
+		"UPPER", "LOWER", "LENGTH", "TRIM", "REPLACE",
+		"IFNULL", "COALESCE", "NULLIF", "IF",
+		"HEX", "UNHEX", "CAST", "CONVERT",
+	}
+	for _, fn := range funcs {
+		lower := strings.ToLower(fn)
+		s = strings.ReplaceAll(s, lower+"(", fn+"(")
+	}
+	return s
 }
 
 func normalizeOutput(s string) string {

@@ -132,6 +132,8 @@ type Executor struct {
 	preparedStmts  map[string]string
 	// tempTables stores temporary tables per session (table name -> true).
 	tempTables     map[string]bool
+	// globalVars stores SET GLOBAL/SESSION variable overrides.
+	globalVars     map[string]string
 }
 
 func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
@@ -143,6 +145,7 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		userVars:      make(map[string]interface{}),
 		preparedStmts: make(map[string]string),
 		tempTables:    make(map[string]bool),
+		globalVars:    make(map[string]string),
 	}
 }
 
@@ -412,6 +415,23 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return e.execMyliteCommand(trimmed)
 	}
 
+	// Handle BEGIN WORK (equivalent to BEGIN/START TRANSACTION)
+	if upper == "BEGIN WORK" {
+		return e.execBegin()
+	}
+
+	// Handle CREATE TABLESPACE silently (InnoDB internal)
+	if strings.HasPrefix(upper, "CREATE TABLESPACE") ||
+		strings.HasPrefix(upper, "ALTER TABLESPACE") ||
+		strings.HasPrefix(upper, "DROP TABLESPACE") {
+		return &Result{}, nil
+	}
+
+	// Handle ANALYZE TABLE with multiple tables (vitess only handles single table)
+	if strings.HasPrefix(upper, "ANALYZE TABLE") && strings.Contains(trimmed, ",") {
+		return e.execAnalyzeMultiTable(trimmed)
+	}
+
 	// Normalize SQL type aliases that vitess parser doesn't support
 	query = normalizeTypeAliases(query)
 	// Fix vitess parser issue: "ADD KEY USING BTREE (col)" is not parsed correctly.
@@ -512,7 +532,10 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			strings.HasPrefix(upper, "PURGE ") ||
 			strings.HasPrefix(upper, "BINLOG ") ||
 			strings.HasPrefix(upper, "DO ") ||
-			strings.HasPrefix(upper, "END") {
+			strings.HasPrefix(upper, "END") ||
+			strings.HasPrefix(upper, "ALTER INSTANCE") ||
+			strings.HasPrefix(upper, "CREATE UNDO TABLESPACE") ||
+			strings.HasPrefix(upper, "DROP UNDO TABLESPACE") {
 			return &Result{}, nil
 		}
 		// For multi-table DELETE: DELETE t1,t2 FROM t1,t2,t3 WHERE ...
@@ -599,6 +622,26 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return e.execUnion(s)
 	case *sqlparser.RenameTable:
 		return e.execRenameTable(s)
+	case *sqlparser.Savepoint:
+		// Accept SAVEPOINT silently
+		return &Result{}, nil
+	case *sqlparser.SRollback:
+		// Accept ROLLBACK TO SAVEPOINT silently
+		return &Result{}, nil
+	case *sqlparser.Release:
+		// Accept RELEASE SAVEPOINT silently
+		return &Result{}, nil
+	case *sqlparser.ExplainStmt:
+		return e.execExplainStmt(s, query)
+	case *sqlparser.OtherAdmin:
+		// Handle OPTIMIZE TABLE, REPAIR TABLE, CHECK TABLE etc.
+		return e.execOtherAdmin(query)
+	case *sqlparser.CommentOnly:
+		// Accept comment-only statements silently
+		return &Result{}, nil
+	case *sqlparser.Flush:
+		// Accept FLUSH statements silently
+		return &Result{}, nil
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %T", s)
 	}
@@ -955,6 +998,21 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			if n, err := strconv.ParseInt(val, 10, 64); err == nil {
 				e.nextInsertID = n
 			}
+		default:
+			// Store any SET GLOBAL/SESSION variable for later retrieval
+			if name != "" {
+				// Strip scope prefix
+				cleanName := strings.TrimPrefix(name, "global.")
+				cleanName = strings.TrimPrefix(cleanName, "session.")
+				cleanName = strings.TrimPrefix(cleanName, "local.")
+				// Evaluate expression
+				evalVal, err := e.evalExpr(expr.Expr)
+				if err == nil {
+					e.globalVars[cleanName] = fmt.Sprintf("%v", evalVal)
+				} else {
+					e.globalVars[cleanName] = val
+				}
+			}
 		}
 	}
 	return &Result{}, nil
@@ -1039,6 +1097,29 @@ func (e *Executor) handleRawSet(raw string) {
 			val = strings.TrimSuffix(val, ";")
 			val = strings.TrimSpace(val)
 			e.parseTimeZone(val)
+		}
+	}
+	// Store any SET GLOBAL/SESSION variable generically
+	rest := strings.TrimSpace(trimmed[4:])
+	restUpper := strings.ToUpper(rest)
+	rest = strings.TrimPrefix(rest, "GLOBAL ")
+	rest = strings.TrimPrefix(rest, "SESSION ")
+	rest = strings.TrimPrefix(rest, "LOCAL ")
+	rest = strings.TrimPrefix(rest, "@@global.")
+	rest = strings.TrimPrefix(rest, "@@session.")
+	rest = strings.TrimPrefix(rest, "@@local.")
+	rest = strings.TrimPrefix(rest, "@@")
+	_ = restUpper
+	if eqIdx := strings.Index(rest, "="); eqIdx > 0 {
+		varName := strings.TrimSpace(strings.ToLower(rest[:eqIdx]))
+		val := strings.TrimSpace(rest[eqIdx+1:])
+		val = strings.TrimSuffix(val, ";")
+		val = strings.TrimSpace(val)
+		val = strings.Trim(val, "'\"")
+		if strings.ToUpper(val) != "DEFAULT" {
+			e.globalVars[varName] = val
+		} else {
+			delete(e.globalVars, varName)
 		}
 	}
 }
@@ -1413,6 +1494,17 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 
 	columns := make([]catalog.ColumnDef, 0)
 	var primaryKeys []string
+
+	// Check for reserved InnoDB internal column names
+	reservedInnoDBCols := map[string]bool{
+		"db_row_id": true, "db_trx_id": true, "db_roll_ptr": true,
+	}
+	for _, col := range stmt.TableSpec.Columns {
+		colNameLower := strings.ToLower(col.Name.String())
+		if reservedInnoDBCols[colNameLower] {
+			return nil, mysqlError(1166, "42000", fmt.Sprintf("Incorrect column name '%s'", col.Name.String()))
+		}
+	}
 
 	for _, col := range stmt.TableSpec.Columns {
 		// Validate ENUM/SET value lengths (MySQL max is 255 characters).
@@ -4249,9 +4341,145 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		}
 	}
 
+	// SHOW VARIABLES / SHOW GLOBAL VARIABLES / SHOW SESSION VARIABLES
+	if strings.HasPrefix(upper, "SHOW VARIABLES") || strings.HasPrefix(upper, "SHOW GLOBAL VARIABLES") ||
+		strings.HasPrefix(upper, "SHOW SESSION VARIABLES") || strings.HasPrefix(upper, "SHOW LOCAL VARIABLES") {
+		return e.showVariables(upper)
+	}
+
+	// SHOW STATUS / SHOW GLOBAL STATUS
+	if strings.HasPrefix(upper, "SHOW STATUS") || strings.HasPrefix(upper, "SHOW GLOBAL STATUS") ||
+		strings.HasPrefix(upper, "SHOW SESSION STATUS") {
+		return e.showStatus(upper)
+	}
+
+	// SHOW WARNINGS
+	if strings.HasPrefix(upper, "SHOW WARNINGS") || strings.HasPrefix(upper, "SHOW COUNT(*) WARNINGS") {
+		return &Result{
+			Columns:     []string{"Level", "Code", "Message"},
+			Rows:        [][]interface{}{},
+			IsResultSet: true,
+		}, nil
+	}
+
+	// SHOW ERRORS
+	if strings.HasPrefix(upper, "SHOW ERRORS") || strings.HasPrefix(upper, "SHOW COUNT(*) ERRORS") {
+		return &Result{
+			Columns:     []string{"Level", "Code", "Message"},
+			Rows:        [][]interface{}{},
+			IsResultSet: true,
+		}, nil
+	}
+
+	// SHOW ENGINE INNODB STATUS
+	if strings.HasPrefix(upper, "SHOW ENGINE") {
+		return &Result{
+			Columns:     []string{"Type", "Name", "Status"},
+			Rows:        [][]interface{}{{"InnoDB", "", ""}},
+			IsResultSet: true,
+		}, nil
+	}
+
 	// Accept other SHOW statements silently
 	return &Result{
 		Columns:     []string{"Value"},
+		Rows:        [][]interface{}{},
+		IsResultSet: true,
+	}, nil
+}
+
+// showVariables handles SHOW [GLOBAL|SESSION] VARIABLES [LIKE '...']
+func (e *Executor) showVariables(upper string) (*Result, error) {
+	likePattern := ""
+	if idx := strings.Index(upper, "LIKE '"); idx >= 0 {
+		rest := upper[idx+6:]
+		if end := strings.Index(rest, "'"); end >= 0 {
+			likePattern = strings.ToLower(rest[:end])
+		}
+	}
+
+	// Define known variables with their values
+	vars := map[string]string{
+		"innodb_rollback_on_timeout":      "ON",
+		"innodb_file_per_table":           "ON",
+		"innodb_strict_mode":              "ON",
+		"innodb_page_size":                "16384",
+		"innodb_buffer_pool_size":         "134217728",
+		"innodb_default_row_format":       "dynamic",
+		"innodb_lock_wait_timeout":        "50",
+		"innodb_autoinc_lock_mode":        "1",
+		"innodb_stats_persistent":         "ON",
+		"innodb_stats_auto_recalc":        "ON",
+		"innodb_stats_persistent_sample_pages": "20",
+		"innodb_stats_transient_sample_pages": "8",
+		"innodb_log_file_size":            "50331648",
+		"innodb_ft_enable_stopword":       "ON",
+		"innodb_ft_server_stopword_table": "",
+		"innodb_large_prefix":             "ON",
+		"innodb_fill_factor":              "100",
+		"innodb_sort_buffer_size":         "1048576",
+		"innodb_online_alter_log_max_size": "134217728",
+		"innodb_optimize_fulltext_only":   "OFF",
+		"innodb_max_dirty_pages_pct":      "75.000000",
+		"innodb_max_dirty_pages_pct_lwm":  "0.000000",
+		"innodb_change_buffering":         "all",
+		"innodb_change_buffer_max_size":   "25",
+		"innodb_flush_log_at_trx_commit":  "1",
+		"innodb_doublewrite":              "ON",
+		"innodb_checksum_algorithm":       "crc32",
+		"innodb_ft_max_token_size":        "84",
+		"innodb_ft_min_token_size":        "3",
+		"innodb_compression_level":        "6",
+		"innodb_data_file_path":           "ibdata1:12M:autoextend",
+		"auto_increment_increment":        "1",
+		"auto_increment_offset":           "1",
+		"character_set_server":            "utf8mb4",
+		"collation_server":                "utf8mb4_0900_ai_ci",
+		"lower_case_table_names":          "0",
+		"max_allowed_packet":              "67108864",
+		"sql_mode":                        "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+		"default_storage_engine":          "InnoDB",
+		"default_tmp_storage_engine":      "InnoDB",
+		"datadir":                         "/var/lib/mysql/",
+		"tmpdir":                          "/tmp",
+		"version":                         "8.0.32",
+		"version_comment":                 "mylite",
+	}
+
+	// Override with any SET GLOBAL/SESSION values
+	for name, val := range e.globalVars {
+		// Apply minimum/maximum constraints for known variables
+		if name == "innodb_stats_transient_sample_pages" || name == "innodb_stats_persistent_sample_pages" {
+			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n < 1 {
+				val = "1"
+			}
+		}
+		vars[name] = val
+	}
+
+	var rows [][]interface{}
+	for name, val := range vars {
+		if likePattern != "" && !matchLike(name, likePattern) {
+			continue
+		}
+		rows = append(rows, []interface{}{name, val})
+	}
+	// Sort by variable name
+	sort.Slice(rows, func(i, j int) bool {
+		return rows[i][0].(string) < rows[j][0].(string)
+	})
+
+	return &Result{
+		Columns:     []string{"Variable_name", "Value"},
+		Rows:        rows,
+		IsResultSet: true,
+	}, nil
+}
+
+// showStatus handles SHOW [GLOBAL|SESSION] STATUS [LIKE '...']
+func (e *Executor) showStatus(upper string) (*Result, error) {
+	return &Result{
+		Columns:     []string{"Variable_name", "Value"},
 		Rows:        [][]interface{}{},
 		IsResultSet: true,
 	}, nil
@@ -4678,6 +4906,27 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 		// Handle @@variables
 		name := strings.ToLower(v.Name.String())
+		// Strip scope prefix (global., session., local.)
+		name = strings.TrimPrefix(name, "global.")
+		name = strings.TrimPrefix(name, "session.")
+		name = strings.TrimPrefix(name, "local.")
+		// Check for user-set global variables first
+		if gv, ok := e.globalVars[name]; ok {
+			// Apply minimum constraints
+			if name == "innodb_stats_transient_sample_pages" || name == "innodb_stats_persistent_sample_pages" {
+				if n, err := strconv.ParseInt(gv, 10, 64); err == nil && n < 1 {
+					gv = "1"
+				}
+			}
+			// Try to return as int64 if it looks numeric
+			if n, err := strconv.ParseInt(gv, 10, 64); err == nil {
+				return n, nil
+			}
+			if f, err := strconv.ParseFloat(gv, 64); err == nil {
+				return f, nil
+			}
+			return gv, nil
+		}
 		switch name {
 		case "version_comment":
 			return "mylite", nil
@@ -4697,6 +4946,76 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return e.sqlMode, nil
 		case "autocommit":
 			return int64(1), nil
+		case "innodb_file_per_table":
+			return int64(1), nil
+		case "innodb_strict_mode":
+			return int64(1), nil
+		case "innodb_page_size":
+			return int64(16384), nil
+		case "innodb_default_row_format":
+			return "dynamic", nil
+		case "innodb_lock_wait_timeout":
+			return int64(50), nil
+		case "innodb_autoinc_lock_mode":
+			return int64(1), nil
+		case "innodb_stats_on_metadata":
+			return int64(0), nil
+		case "innodb_stats_persistent":
+			return int64(1), nil
+		case "innodb_stats_auto_recalc":
+			return int64(1), nil
+		case "innodb_stats_transient_sample_pages":
+			return int64(8), nil
+		case "innodb_stats_persistent_sample_pages":
+			return int64(20), nil
+		case "innodb_rollback_on_timeout":
+			return int64(1), nil
+		case "innodb_table_locks":
+			return int64(1), nil
+		case "innodb_commit_concurrency":
+			return int64(0), nil
+		case "innodb_log_buffer_size":
+			return int64(1048576), nil
+		case "innodb_buffer_pool_size":
+			return int64(134217728), nil
+		case "innodb_buffer_pool_in_core_file":
+			return int64(1), nil
+		case "innodb_random_read_ahead":
+			return int64(0), nil
+		case "innodb_redo_log_encrypt":
+			return int64(0), nil
+		case "innodb_flush_method":
+			return "O_DIRECT", nil
+		case "innodb_tmpdir":
+			return "", nil
+		case "innodb_data_file_path":
+			return "ibdata1:12M:autoextend", nil
+		case "innodb_change_buffering":
+			return "all", nil
+		case "innodb_fill_factor":
+			return int64(100), nil
+		case "datadir":
+			return "/var/lib/mysql/", nil
+		case "lower_case_table_names":
+			return int64(0), nil
+		case "default_storage_engine":
+			return "InnoDB", nil
+		case "server_id":
+			return int64(1), nil
+		case "auto_increment_increment":
+			return int64(1), nil
+		case "auto_increment_offset":
+			return int64(1), nil
+		case "transaction_isolation":
+			return "REPEATABLE-READ", nil
+		case "tx_isolation":
+			return "REPEATABLE-READ", nil
+		case "character_set_server":
+			return "utf8mb4", nil
+		case "collation_server":
+			return "utf8mb4_0900_ai_ci", nil
+		case "identity", "last_insert_id":
+			return e.lastInsertID, nil
 		}
 		return "", nil
 	case *sqlparser.Default:
@@ -10450,4 +10769,84 @@ func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error)
 	}
 
 	return &Result{AffectedRows: affected}, nil
+}
+
+// execExplainStmt handles EXPLAIN SELECT ... statements.
+// Returns a simplified explain result set for compatibility.
+func (e *Executor) execExplainStmt(s *sqlparser.ExplainStmt, query string) (*Result, error) {
+	// Return a minimal EXPLAIN result for compatibility
+	return &Result{
+		Columns: []string{"id", "select_type", "table", "partitions", "type", "possible_keys", "key", "key_len", "ref", "rows", "filtered", "Extra"},
+		Rows: [][]interface{}{
+			{int64(1), "SIMPLE", nil, nil, "ALL", nil, nil, nil, nil, int64(1), "100.00", nil},
+		},
+		IsResultSet: true,
+	}, nil
+}
+
+// execOtherAdmin handles OPTIMIZE TABLE, REPAIR TABLE, CHECK TABLE, etc.
+func (e *Executor) execOtherAdmin(query string) (*Result, error) {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	// Extract table name(s) for result output
+	var op string
+	var rest string
+	if strings.HasPrefix(upper, "OPTIMIZE TABLE") {
+		op = "optimize"
+		rest = strings.TrimSpace(query[len("OPTIMIZE TABLE"):])
+	} else if strings.HasPrefix(upper, "REPAIR TABLE") {
+		op = "repair"
+		rest = strings.TrimSpace(query[len("REPAIR TABLE"):])
+	} else if strings.HasPrefix(upper, "CHECK TABLE") {
+		op = "check"
+		rest = strings.TrimSpace(query[len("CHECK TABLE"):])
+	} else {
+		return &Result{}, nil
+	}
+
+	// Parse table names (comma-separated)
+	tables := strings.Split(rest, ",")
+	var rows [][]interface{}
+	for _, t := range tables {
+		t = strings.TrimSpace(t)
+		t = strings.TrimRight(t, ";")
+		t = strings.Trim(t, "`")
+		tableName := t
+		if !strings.Contains(tableName, ".") {
+			tableName = e.CurrentDB + "." + tableName
+		}
+		if op == "optimize" {
+			// InnoDB doesn't support optimize; MySQL outputs a note then status OK
+			rows = append(rows, []interface{}{tableName, op, "note", "Table does not support optimize, doing recreate + analyze instead"})
+			rows = append(rows, []interface{}{tableName, op, "status", "OK"})
+		} else {
+			rows = append(rows, []interface{}{tableName, op, "status", "OK"})
+		}
+	}
+	return &Result{
+		Columns:     []string{"Table", "Op", "Msg_type", "Msg_text"},
+		Rows:        rows,
+		IsResultSet: true,
+	}, nil
+}
+
+// execAnalyzeMultiTable handles ANALYZE TABLE t1, t2, ... with multiple tables.
+func (e *Executor) execAnalyzeMultiTable(query string) (*Result, error) {
+	rest := strings.TrimSpace(query[len("ANALYZE TABLE"):])
+	tables := strings.Split(rest, ",")
+	var rows [][]interface{}
+	for _, t := range tables {
+		t = strings.TrimSpace(t)
+		t = strings.TrimRight(t, ";")
+		t = strings.Trim(t, "`")
+		tableName := t
+		if !strings.Contains(tableName, ".") {
+			tableName = e.CurrentDB + "." + tableName
+		}
+		rows = append(rows, []interface{}{tableName, "analyze", "status", "OK"})
+	}
+	return &Result{
+		Columns:     []string{"Table", "Op", "Msg_type", "Msg_text"},
+		Rows:        rows,
+		IsResultSet: true,
+	}, nil
 }
