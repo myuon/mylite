@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,12 +14,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
 	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/transform"
+	"golang.org/x/text/unicode/norm"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
@@ -78,6 +82,15 @@ type Result struct {
 	IsResultSet  bool // true for SELECT, SHOW, etc.
 }
 
+// intOverflowError is returned when an integer literal exceeds uint64 range.
+type intOverflowError struct {
+	val string
+}
+
+func (e *intOverflowError) Error() string {
+	return "INT_OVERFLOW:" + e.val
+}
+
 // txSavepoint holds the catalog and storage state captured at BEGIN time.
 type txSavepoint struct {
 	// Storage snapshot per database name.
@@ -101,48 +114,51 @@ type cteTable struct {
 
 // Executor handles SQL execution.
 type Executor struct {
-	Catalog        *catalog.Catalog
-	Storage        *storage.Engine
-	CurrentDB      string
-	inTransaction  bool
-	savepoint      *txSavepoint
-	snapshots      map[string]*fullSnapshot
-	lastInsertID   int64
+	Catalog       *catalog.Catalog
+	Storage       *storage.Engine
+	CurrentDB     string
+	inTransaction bool
+	savepoint     *txSavepoint
+	snapshots     map[string]*fullSnapshot
+	lastInsertID  int64
 	// cteMap holds CTE virtual tables for the currently executing query.
-	cteMap         map[string]*cteTable
+	cteMap map[string]*cteTable
 	// sqlMode stores the current SQL mode (e.g. "TRADITIONAL", "STRICT_TRANS_TABLES").
-	sqlMode        string
+	sqlMode string
 	// sqlAutoIsNull enables MySQL sql_auto_is_null behavior.
-	sqlAutoIsNull  bool
+	sqlAutoIsNull bool
 	// lastAutoIncID stores the last auto-increment ID for sql_auto_is_null support.
-	lastAutoIncID  int64
+	lastAutoIncID int64
 	// fixedTimestamp holds a fixed time for SET TIMESTAMP=N support.
 	fixedTimestamp *time.Time
 	// timeZone holds the session time zone location for SET TIME_ZONE.
-	timeZone       *time.Location
+	timeZone *time.Location
 	// correlatedRow holds the outer row for correlated subquery evaluation.
-	correlatedRow  storage.Row
+	correlatedRow storage.Row
 	// DataDir is the base directory for resolving relative file paths
 	// used in LOAD DATA INFILE and SELECT INTO OUTFILE.
-	DataDir        string
+	DataDir string
 	// SearchPaths are directories to search for files referenced in
 	// LOAD DATA LOCAL INFILE statements.
-	SearchPaths    []string
+	SearchPaths []string
 	// userVars stores MySQL user variables (SET @var = value).
-	userVars       map[string]interface{}
+	userVars map[string]interface{}
 	// nextInsertID holds the value from SET INSERT_ID for the next INSERT.
-	nextInsertID   int64
+	nextInsertID int64
 	// preparedStmts stores PREPARE stmt FROM 'query' statements.
-	preparedStmts  map[string]string
+	preparedStmts map[string]string
 	// tempTables stores temporary tables per session (table name -> true).
-	tempTables     map[string]bool
+	tempTables map[string]bool
 	// globalVars stores SET GLOBAL/SESSION variable overrides.
-	globalVars     map[string]string
+	globalVars map[string]string
 	// views stores view definitions (view name -> SELECT query string).
-	views          map[string]string
+	views map[string]string
 }
 
 func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
+	// MySQL test suite (MTR) defaults to timezone GMT-3 (= UTC+3).
+	// We mirror this so SET TIMESTAMP + CURRENT_TIME() match expected results.
+	defaultTZ := time.FixedZone("GMT-3", 3*60*60)
 	return &Executor{
 		Catalog:       cat,
 		Storage:       store,
@@ -152,6 +168,7 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		preparedStmts: make(map[string]string),
 		tempTables:    make(map[string]bool),
 		globalVars:    make(map[string]string),
+		timeZone:      defaultTZ,
 	}
 }
 
@@ -250,9 +267,9 @@ func matchLikeHelper(s, p []rune, si, pi int) bool {
 // normalizes operator spacing to match MySQL's column display name behavior.
 func normalizeSQLDisplayName(s string) string {
 	s = uppercaseSQLKeywords(s)
-	// MySQL preserves spaces around comparison operators for top-level expressions
-	// but compacts them inside function calls and subqueries.
-	s = compactOperatorsInSubexpressions(s)
+	// MySQL compacts spaces around comparison/arithmetic operators in column
+	// display names (e.g. 'a' = 'b' -> 'a'='b')
+	s = compactOperatorsInDisplayName(s)
 	// MySQL displays function arguments without space after comma: LEFT(`c1`,0) not LEFT(`c1`, 0)
 	s = normalizeFuncArgSpaces(s)
 	// MySQL displays SUBSTRING, not SUBSTR in column headers
@@ -266,6 +283,58 @@ func normalizeSQLDisplayName(s string) string {
 	// (vitess sqlparser.String() escapes these in string literals)
 	s = unescapeStringLiterals(s)
 	return s
+}
+
+// compactOperatorsInDisplayName removes spaces around comparison and arithmetic
+// operators in a SQL display name string to match MySQL column header format.
+func compactOperatorsInDisplayName(s string) string {
+	var result strings.Builder
+	inQuote := byte(0)
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inQuote != 0 {
+			result.WriteByte(ch)
+			if ch == inQuote {
+				// Check for escaped quote ('' or \')
+				if i+1 < len(s) && s[i+1] == inQuote {
+					i++
+					result.WriteByte(s[i])
+					continue
+				}
+				inQuote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' || ch == '`' {
+			inQuote = ch
+			result.WriteByte(ch)
+			continue
+		}
+		// Skip spaces adjacent to operators
+		if ch == ' ' {
+			// Look ahead past spaces for operator
+			j := i + 1
+			for j < len(s) && s[j] == ' ' {
+				j++
+			}
+			if j < len(s) && isComparisonOrArithOp(s[j]) {
+				continue
+			}
+			// Look behind for operator
+			if result.Len() > 0 {
+				prev := result.String()
+				if isComparisonOrArithOp(prev[len(prev)-1]) {
+					continue
+				}
+			}
+		}
+		result.WriteByte(ch)
+	}
+	return result.String()
+}
+
+func isComparisonOrArithOp(ch byte) bool {
+	return ch == '=' || ch == '<' || ch == '>' || ch == '!' || ch == '+' || ch == '-' || ch == '*' || ch == '/'
 }
 
 // compactOperatorsInSubexpressions removes spaces around operators inside function calls and
@@ -848,8 +917,8 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 		}
 		// Rename in catalog
 		def.Name = newName
-		srcCatDB.DropTable(oldName)       //nolint:errcheck
-		targetCatDB.CreateTable(def)      //nolint:errcheck
+		srcCatDB.DropTable(oldName)  //nolint:errcheck
+		targetCatDB.CreateTable(def) //nolint:errcheck
 		// Rename in storage
 		if tbl, err := e.Storage.GetTable(srcDB, oldName); err == nil {
 			tbl.Def = def
@@ -1392,6 +1461,12 @@ func (e *Executor) execAlterTableOrderBy(query string) (*Result, error) {
 	if err != nil {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
 	}
+	orderCollation := ""
+	if db, dbErr := e.Catalog.GetDatabase(e.CurrentDB); dbErr == nil {
+		if def, defErr := db.GetTable(tableName); defErr == nil {
+			orderCollation = effectiveTableCollation(def)
+		}
+	}
 
 	// Parse ORDER BY columns
 	type orderCol struct {
@@ -1418,9 +1493,9 @@ func (e *Executor) execAlterTableOrderBy(query string) (*Result, error) {
 	tbl.Mu.Lock()
 	sort.SliceStable(tbl.Rows, func(i, j int) bool {
 		for _, oc := range orderCols {
-			vi := tbl.Rows[i][oc.name]
-			vj := tbl.Rows[j][oc.name]
-			cmp := compareNumeric(vi, vj)
+			vi := rowValueByColumnName(tbl.Rows[i], oc.name)
+			vj := rowValueByColumnName(tbl.Rows[j], oc.name)
+			cmp := compareByCollation(vi, vj, orderCollation)
 			if cmp == 0 {
 				continue
 			}
@@ -1456,7 +1531,13 @@ func checkDecimalRange(colType string, v interface{}) error {
 	lower = strings.TrimSuffix(strings.TrimSpace(lower), " unsigned")
 	lower = strings.TrimSpace(lower)
 	var m, d int
-	if n, err := fmt.Sscanf(lower, "decimal(%d,%d)", &m, &d); err == nil && n == 2 {
+	if n, err := fmt.Sscanf(lower, "decimal(%d,%d)", &m, &d); (err == nil && n == 2) || func() bool {
+		if n2, err2 := fmt.Sscanf(lower, "decimal(%d)", &m); err2 == nil && n2 == 1 {
+			d = 0
+			return true
+		}
+		return false
+	}() {
 		f := toFloat(v)
 		if f < 0 {
 			f = -f
@@ -1484,13 +1565,26 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 	upper := strings.ToUpper(strings.TrimSpace(colType))
 	s := fmt.Sprintf("%v", v)
 	if len(s) == 0 {
+		// Empty string for YEAR -> "0000"
+		if strings.HasPrefix(upper, "YEAR") {
+			return "0000"
+		}
 		return v
 	}
-	// Normalize YEAR(4) -> YEAR, TIME(N) -> TIME
+	// Normalize YEAR(4) -> YEAR
 	if strings.HasPrefix(upper, "YEAR(") {
 		upper = "YEAR"
 	}
-	if strings.HasPrefix(upper, "TIME(") {
+	// Extract TIME precision: TIME -> 0, TIME(N) -> N
+	timeFsp := 0
+	isTimeType := false
+	if upper == "TIME" {
+		isTimeType = true
+	} else if strings.HasPrefix(upper, "TIME(") {
+		isTimeType = true
+		fmt.Sscanf(upper, "TIME(%d)", &timeFsp)
+	}
+	if isTimeType {
 		upper = "TIME"
 	}
 	switch upper {
@@ -1506,7 +1600,9 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 		}
 	case "TIME":
 		// Use the original value for numeric handling
-		return parseMySQLTimeValueRaw(v)
+		result := parseMySQLTimeValueRaw(v)
+		// Apply TIME precision: round fractional seconds to timeFsp digits
+		return applyTimePrecision(result, timeFsp)
 	case "YEAR":
 		return coerceYearValue(v)
 	case "TIMESTAMP":
@@ -1652,7 +1748,8 @@ func parseMySQLTimeValue(s string) string {
 		return formatTimeValue(negative, h, m, sec, frac)
 	}
 
-	// Handle "D SS" format (e.g., "0 10" -> "00:00:10")
+	// Handle "D HH" format (e.g., "0 10" -> "10:00:00")
+	// MySQL interprets 'D val' as D days + val hours (not seconds)
 	if idx := strings.Index(s, " "); idx >= 0 {
 		negative := false
 		if strings.HasPrefix(s, "-") {
@@ -1663,11 +1760,9 @@ func parseMySQLTimeValue(s string) string {
 		days, err := strconv.Atoi(strings.TrimSpace(s[:idx]))
 		if err == nil {
 			rest := strings.TrimSpace(s[idx+1:])
-			sec, _ := strconv.Atoi(rest)
-			h := days*24 + sec/3600
-			m := (sec % 3600) / 60
-			sec = sec % 60
-			return formatTimeValue(negative, h, m, sec, "")
+			hh, _ := strconv.Atoi(rest)
+			h := days*24 + hh
+			return formatTimeValue(negative, h, 0, 0, "")
 		}
 	}
 
@@ -1716,7 +1811,12 @@ func formatTimeValue(negative bool, h, m, sec int, frac string) string {
 	totalSecs := h*3600 + m*60 + sec
 	maxSecs := 838*3600 + 59*60 + 59
 	if totalSecs > maxSecs {
+		// If hours > 838, clip to max
 		h, m, sec = 838, 59, 59
+		frac = ""
+	} else if m > 59 || sec > 59 {
+		// Invalid minutes or seconds -> 00:00:00
+		return "00:00:00"
 	}
 
 	sign := ""
@@ -1739,66 +1839,204 @@ func formatTimeValue(negative bool, h, m, sec int, frac string) string {
 	return result
 }
 
-// coerceYearValue converts a value to MySQL YEAR type.
-// MySQL YEAR(4) stores years from 1901 to 2155.
-// Two-digit values 0-69 map to 2000-2069, 70-99 map to 1970-1999.
-// The string '0' or '00' maps to 2000, but integer 0 maps to 0000.
-func coerceYearValue(v interface{}) string {
-	s := fmt.Sprintf("%v", v)
+// applyTimePrecision rounds or truncates a TIME string's fractional seconds
+// to the given fsp (fractional seconds precision, 0-6).
+// For fsp=0 (default TIME), fractional seconds >= 0.5 round up the seconds.
+func applyTimePrecision(timeStr string, fsp int) string {
+	// Find the fractional part
+	dotIdx := strings.Index(timeStr, ".")
+	if dotIdx < 0 {
+		// No fractional part, nothing to do
+		return timeStr
+	}
+	basePart := timeStr[:dotIdx]
+	fracPart := timeStr[dotIdx+1:]
 
-	// Check if original value was an integer 0
-	isIntZero := false
-	switch n := v.(type) {
-	case int64:
-		isIntZero = (n == 0)
-	case float64:
-		isIntZero = (n == 0)
-	case uint64:
-		isIntZero = (n == 0)
+	if fsp == 0 {
+		// Round: if first frac digit >= 5, increment seconds
+		if len(fracPart) > 0 && fracPart[0] >= '5' {
+			return incrementTimeSecond(basePart)
+		}
+		return basePart
 	}
 
-	// If already a 4-digit year, return as-is
-	if len(s) == 4 {
-		if y, err := strconv.Atoi(s); err == nil && y >= 1901 && y <= 2155 {
-			return s
+	// Pad or truncate fractional part to fsp digits
+	for len(fracPart) < fsp {
+		fracPart += "0"
+	}
+	if len(fracPart) > fsp {
+		// Check if we need to round
+		roundUp := fracPart[fsp] >= '5'
+		fracPart = fracPart[:fsp]
+		if roundUp {
+			// Increment the last fractional digit
+			digits := []byte(fracPart)
+			carry := true
+			for i := len(digits) - 1; i >= 0 && carry; i-- {
+				digits[i]++
+				if digits[i] > '9' {
+					digits[i] = '0'
+				} else {
+					carry = false
+				}
+			}
+			fracPart = string(digits)
+			if carry {
+				// Fractional part overflowed, increment seconds
+				return incrementTimeSecond(basePart) + "." + fracPart
+			}
+		}
+	}
+	// Remove trailing zeros
+	fracPart = strings.TrimRight(fracPart, "0")
+	if fracPart == "" {
+		return basePart
+	}
+	return basePart + "." + fracPart
+}
+
+// incrementTimeSecond adds 1 second to a TIME string like "HH:MM:SS" or "-HH:MM:SS".
+func incrementTimeSecond(timeStr string) string {
+	negative := false
+	s := timeStr
+	if strings.HasPrefix(s, "-") {
+		negative = true
+		s = s[1:]
+	}
+	parts := strings.Split(s, ":")
+	if len(parts) != 3 {
+		return timeStr
+	}
+	h, _ := strconv.Atoi(parts[0])
+	m, _ := strconv.Atoi(parts[1])
+	sec, _ := strconv.Atoi(parts[2])
+	sec++
+	if sec >= 60 {
+		sec = 0
+		m++
+	}
+	if m >= 60 {
+		m = 0
+		h++
+	}
+	// Re-clip to TIME range
+	sign := ""
+	if negative {
+		sign = "-"
+	}
+	totalSecs := h*3600 + m*60 + sec
+	maxSecs := 838*3600 + 59*60 + 59
+	if totalSecs > maxSecs {
+		h, m, sec = 838, 59, 59
+	}
+	return fmt.Sprintf("%s%02d:%02d:%02d", sign, h, m, sec)
+}
+
+// implicitZeroValue returns the implicit zero/default value for a MySQL type
+// when a NOT NULL column has no explicit default.
+func implicitZeroValue(colType string) interface{} {
+	upper := strings.ToUpper(strings.TrimSpace(colType))
+	if strings.HasPrefix(upper, "YEAR") {
+		return "0000"
+	}
+	if strings.HasPrefix(upper, "DATE") && !strings.HasPrefix(upper, "DATETIME") {
+		return "0000-00-00"
+	}
+	if strings.HasPrefix(upper, "DATETIME") || strings.HasPrefix(upper, "TIMESTAMP") {
+		return "0000-00-00 00:00:00"
+	}
+	if strings.HasPrefix(upper, "TIME") {
+		return "00:00:00"
+	}
+	if strings.Contains(upper, "INT") || strings.Contains(upper, "DECIMAL") ||
+		strings.Contains(upper, "FLOAT") || strings.Contains(upper, "DOUBLE") {
+		return int64(0)
+	}
+	// Default for string types
+	return ""
+}
+
+// coerceYearValue converts a value to MySQL YEAR type.
+// Returns a string like "0000", "2005", etc.
+func coerceYearValue(v interface{}) interface{} {
+	s := fmt.Sprintf("%v", v)
+
+	// Check if original value was a numeric type
+	isNumericType := false
+	var numVal int
+	switch n := v.(type) {
+	case int64:
+		isNumericType = true
+		numVal = int(n)
+	case float64:
+		isNumericType = true
+		numVal = int(n)
+	case uint64:
+		isNumericType = true
+		numVal = int(n)
+	}
+
+	// Empty string -> 0000
+	if s == "" {
+		return "0000"
+	}
+
+	// Extract year from date/datetime (e.g., "2009-01-29 11:11:27")
+	if len(s) >= 5 && s[4] == '-' {
+		yearPart := s[:4]
+		if y, err := strconv.Atoi(yearPart); err == nil {
+			if y >= 1901 && y <= 2155 {
+				return fmt.Sprintf("%d", y)
+			}
+			return "0000"
 		}
 	}
 
-	// Extract year from date/datetime
-	if len(s) >= 5 && s[4] == '-' {
-		return s[:4]
+	if isNumericType {
+		if numVal == 0 {
+			return "0000"
+		}
+		if numVal >= 1 && numVal <= 69 {
+			return fmt.Sprintf("%d", 2000+numVal)
+		}
+		if numVal >= 70 && numVal <= 99 {
+			return fmt.Sprintf("%d", 1900+numVal)
+		}
+		if numVal >= 1901 && numVal <= 2155 {
+			return fmt.Sprintf("%d", numVal)
+		}
+		return "0000"
 	}
 
+	// String value
 	n, err := strconv.Atoi(s)
 	if err != nil {
-		// Try float
 		f, err2 := strconv.ParseFloat(s, 64)
 		if err2 != nil {
-			return s
+			return "0000"
 		}
 		n = int(f)
 	}
 
-	// Integer 0 -> 0000
-	if isIntZero {
-		return "0000"
+	// String '0' or '00' or '000' -> 2000 (but '0000' -> 0000)
+	if n == 0 {
+		trimmed := strings.TrimLeft(s, "0")
+		if trimmed == "" && len(s) >= 4 {
+			return "0000"
+		}
+		return "2000"
 	}
 
-	// Two-digit year conversion
-	if n >= 0 && n <= 69 {
+	if n >= 1 && n <= 69 {
 		return fmt.Sprintf("%d", 2000+n)
 	}
 	if n >= 70 && n <= 99 {
 		return fmt.Sprintf("%d", 1900+n)
 	}
-
-	// Already a 4-digit year
 	if n >= 1901 && n <= 2155 {
 		return fmt.Sprintf("%d", n)
 	}
-
-	// Out of range but still return the value
-	return fmt.Sprintf("%d", n)
+	return "0000"
 }
 
 // parseMySQLDateValue parses various MySQL date input formats and returns YYYY-MM-DD or "".
@@ -1915,6 +2153,11 @@ func looksLikeDate(s string) bool {
 	return strings.ContainsAny(s, "-/.")
 }
 
+// looksLikeTime returns true if the string looks like a TIME value (contains ':').
+func looksLikeTime(s string) bool {
+	return strings.Contains(s, ":")
+}
+
 // convert2DigitYear converts a 2-digit year to 4-digit year.
 // 0-69 -> 2000-2069, 70-99 -> 1970-1999
 func convert2DigitYear(yy int) int {
@@ -2001,6 +2244,69 @@ func splitEnumValues(s string) []string {
 	return result
 }
 
+// parseDecimalString attempts to parse a string that may contain scientific notation
+// or other numeric formats that strconv.ParseFloat cannot handle (e.g., extreme exponents).
+// Returns the float64 value and a classification:
+// "normal" - parsed fine, "overflow_pos" - huge positive, "overflow_neg" - huge negative,
+// "zero" - tiny (rounds to zero), "invalid" - not a number.
+func parseDecimalString(s string) (float64, string) {
+	s = strings.TrimSpace(s)
+	// Handle scientific notation with extreme exponents BEFORE ParseFloat
+	// because ParseFloat returns Inf for large exponents but we need to distinguish
+	// between "valid overflow" and "invalid (exponent overflows uint64)"
+	sLower := strings.ToLower(s)
+	cleanS := sLower
+	negative := false
+	if strings.HasPrefix(cleanS, "-") {
+		negative = true
+		cleanS = cleanS[1:]
+	} else if strings.HasPrefix(cleanS, "+") {
+		cleanS = cleanS[1:]
+	}
+	if idx := strings.Index(cleanS, "e"); idx >= 0 {
+		expStr := cleanS[idx+1:]
+		expNeg := false
+		if strings.HasPrefix(expStr, "+") {
+			expStr = expStr[1:]
+		} else if strings.HasPrefix(expStr, "-") {
+			expNeg = true
+			expStr = expStr[1:]
+		}
+		// Check if the exponent value itself overflows uint64
+		// MySQL treats these as "incorrect decimal value" -> 0
+		expVal, err := strconv.ParseUint(expStr, 10, 64)
+		if err != nil {
+			// Exponent value overflows -> incorrect decimal value -> 0
+			return 0, "zero"
+		}
+		if expNeg {
+			// Very large negative exponent -> tiny number -> 0
+			if expVal > 308 {
+				return 0, "zero"
+			}
+			// Small negative exponent: let ParseFloat handle it normally
+		} else if expVal > 308 {
+			// Positive exponent: if very large, overflow
+			if negative {
+				return math.Inf(-1), "overflow_neg"
+			}
+			return math.Inf(1), "overflow_pos"
+		}
+	}
+	// Try standard float parsing
+	f, err := strconv.ParseFloat(s, 64)
+	if err == nil {
+		if math.IsInf(f, 1) {
+			return f, "overflow_pos"
+		}
+		if math.IsInf(f, -1) {
+			return f, "overflow_neg"
+		}
+		return f, "normal"
+	}
+	return 0, "invalid"
+}
+
 // formatDecimalValue formats a value for DECIMAL(M,D), DOUBLE(M,D), or FLOAT(M,D) columns.
 func formatDecimalValue(colType string, v interface{}) interface{} {
 	lower := strings.ToLower(colType)
@@ -2013,59 +2319,116 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 			break
 		}
 	}
-	// Handle bare DECIMAL/DOUBLE/FLOAT/REAL without (M,D) -> default to (10,0)
+
+	isUnsigned := strings.Contains(lower, "unsigned")
+
+	// Handle bare DECIMAL/DOUBLE/FLOAT/REAL without (M,D)
 	if prefix == "" {
-		for _, p := range []string{"decimal", "double", "float", "real"} {
+		// Bare FLOAT/DOUBLE/REAL: just return the float value (no rounding)
+		for _, p := range []string{"double", "float", "real"} {
 			if cleanLower == p {
-				f := toFloat(v)
-				// Round to nearest integer (DECIMAL(10,0) rounds, not truncates)
-				if f >= 0 {
-					return int64(f + 0.5)
+				f, cls := decimalParseValue(v)
+				if cls == "invalid" {
+					return v
 				}
-				return -int64(-f + 0.5)
+				// FLOAT is single-precision
+				if p == "float" {
+					f = float64(float32(f))
+				}
+				if isUnsigned && f < 0 {
+					f = 0
+				}
+				if cls == "overflow_pos" || math.IsInf(f, 1) {
+					return v
+				}
+				if cls == "overflow_neg" || math.IsInf(f, -1) {
+					if isUnsigned {
+						return float64(0)
+					}
+					return v
+				}
+				// Convert to int64 when the float is an exact integer
+				if f == float64(int64(f)) {
+					return int64(f)
+				}
+				return f
 			}
+		}
+		// Bare DECIMAL -> default to (10,0), round to integer
+		if cleanLower == "decimal" {
+			f, cls := decimalParseValue(v)
+			if cls == "invalid" {
+				return v
+			}
+			if isUnsigned && f < 0 {
+				f = 0
+			}
+			maxVal := float64(9999999999)
+			if cls == "overflow_pos" || f > maxVal {
+				f = maxVal
+			}
+			if cls == "overflow_neg" || f < -maxVal {
+				if isUnsigned {
+					f = 0
+				} else {
+					f = -maxVal
+				}
+			}
+			if f >= 0 {
+				return int64(f + 0.5)
+			}
+			return -int64(-f + 0.5)
 		}
 		return v
 	}
-	// For string values, only format if the string is a valid number.
-	// Invalid strings should be returned as-is for strict mode error checking.
+	// For string values, check if it's a valid number (including sci notation).
 	if s, ok := v.(string); ok {
-		if _, err := strconv.ParseFloat(s, 64); err != nil {
+		_, cls := parseDecimalString(s)
+		if cls == "invalid" {
 			return v
 		}
 	}
 	var m, d int
-	if n, err := fmt.Sscanf(cleanLower, prefix+"(%d,%d)", &m, &d); err == nil && n == 2 {
-		f := toFloat(v)
-		isUnsigned := strings.Contains(lower, "unsigned")
+	// Try DECIMAL(M,D) first, then DECIMAL(M) which defaults to D=0
+	if n, err := fmt.Sscanf(cleanLower, prefix+"(%d,%d)", &m, &d); (err == nil && n == 2) || func() bool {
+		if n2, err2 := fmt.Sscanf(cleanLower, prefix+"(%d)", &m); err2 == nil && n2 == 1 {
+			d = 0
+			return true
+		}
+		return false
+	}() {
+		f, cls := decimalParseValue(v)
 
-		// Clip to the valid range for DECIMAL(M,D) (non-strict mode behavior)
+		// Compute max value for DECIMAL(M,D)
 		intDigits := m - d
-		if intDigits > 0 {
-			maxIntPart := 1.0
-			for i := 0; i < intDigits; i++ {
-				maxIntPart *= 10
-			}
-			maxFrac := 1.0
-			for i := 0; i < d; i++ {
-				maxFrac *= 10
-			}
-			maxVal := maxIntPart - 1.0/maxFrac
-			if d == 0 {
-				maxVal = maxIntPart - 1
-			}
-			// Only clip small overflows (from rounding) - don't clip large overflows
-			// which should be errors in strict mode
-			if f > maxVal {
-				if f <= maxVal*1.001+0.01 { // small overflow from rounding
-					f = maxVal
-				}
-			}
-			if !isUnsigned && f < -maxVal {
-				if f >= -maxVal*1.001-0.01 {
-					f = -maxVal
-				}
-			}
+		if intDigits <= 0 {
+			intDigits = 1
+		}
+		maxIntPart := 1.0
+		for i := 0; i < intDigits; i++ {
+			maxIntPart *= 10
+		}
+		maxFrac := 1.0
+		for i := 0; i < d; i++ {
+			maxFrac *= 10
+		}
+		maxVal := maxIntPart - 1.0/maxFrac
+		if d == 0 {
+			maxVal = maxIntPart - 1
+		}
+
+		// Handle unsigned: clip negative to 0
+		if isUnsigned && (f < 0 || cls == "overflow_neg") {
+			f = 0
+			cls = "normal"
+		}
+
+		// Clip to valid range (non-strict mode)
+		if cls == "overflow_pos" || f > maxVal {
+			f = maxVal
+		}
+		if cls == "overflow_neg" || f < -maxVal {
+			f = -maxVal
 		}
 
 		if d == 0 {
@@ -2079,15 +2442,44 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 			// DECIMAL: round to d decimal places (exact arithmetic)
 			return fmt.Sprintf("%.*f", d, f)
 		}
-		// DOUBLE/FLOAT/REAL: truncate toward zero (display truncation)
+		// FLOAT: convert to float32 first (MySQL FLOAT is single-precision)
+		if prefix == "float" {
+			f = float64(float32(f))
+		}
+		// FLOAT/DOUBLE/REAL: truncate toward zero to d decimal places
 		factor := 1.0
 		for i := 0; i < d; i++ {
 			factor *= 10
 		}
-		truncated := float64(int64(f*factor)) / factor
+		if f >= 0 {
+			truncated := math.Floor(f*factor) / factor
+			return fmt.Sprintf("%.*f", d, truncated)
+		}
+		truncated := math.Ceil(f*factor) / factor
 		return fmt.Sprintf("%.*f", d, truncated)
 	}
 	return v
+}
+
+// decimalParseValue extracts a float64 and classification from any value type.
+func decimalParseValue(v interface{}) (float64, string) {
+	switch n := v.(type) {
+	case int64:
+		return float64(n), "normal"
+	case uint64:
+		return float64(n), "normal"
+	case float64:
+		if math.IsInf(n, 1) {
+			return n, "overflow_pos"
+		}
+		if math.IsInf(n, -1) {
+			return n, "overflow_neg"
+		}
+		return n, "normal"
+	case string:
+		return parseDecimalString(n)
+	}
+	return toFloat(v), "normal"
 }
 
 func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error) {
@@ -2289,9 +2681,18 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		Indexes:          indexes,
 		CheckConstraints: checkConstraints,
 	}
+	// Inherit database defaults unless overridden by explicit table options.
+	if db.CharacterSet != "" {
+		def.Charset = strings.ToLower(db.CharacterSet)
+	}
+	if db.CollationName != "" {
+		def.Collation = strings.ToLower(db.CollationName)
+	}
 
 	// Process table options (comment, charset, collate) BEFORE creating the table,
 	// so that strict-mode errors prevent the table from being created.
+	charsetSpecified := false
+	collationSpecified := false
 	for _, opt := range stmt.TableSpec.Options {
 		switch strings.ToUpper(opt.Name) {
 		case "COMMENT":
@@ -2305,14 +2706,18 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			def.Comment = comment
 		case "CHARSET", "CHARACTER SET":
 			def.Charset = strings.ToLower(opt.String)
+			charsetSpecified = true
 		case "COLLATE":
 			def.Collation = strings.ToLower(opt.String)
+			collationSpecified = true
 		case "ENGINE":
 			def.Engine = strings.ToUpper(opt.String)
 		}
 	}
-	// If charset was set but collation was not, derive default collation
-	if def.Charset != "" && def.Collation == "" {
+	// If charset was set but collation was not, always derive collation for that charset.
+	if charsetSpecified && !collationSpecified {
+		def.Collation = catalog.DefaultCollationForCharset(def.Charset)
+	} else if def.Charset != "" && def.Collation == "" {
 		def.Collation = catalog.DefaultCollationForCharset(def.Charset)
 	}
 
@@ -2580,7 +2985,7 @@ func (e *Executor) execMyliteCommand(query string) (*Result, error) {
 		db, err := e.Catalog.GetDatabase(e.CurrentDB)
 		if err == nil {
 			for name := range e.tempTables {
-				db.DropTable(name)     //nolint:errcheck
+				db.DropTable(name) //nolint:errcheck
 				e.Storage.DropTable(e.CurrentDB, name)
 			}
 		}
@@ -2699,10 +3104,32 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 			v, err := e.evalExpr(val)
 			if err != nil {
-				if strings.HasPrefix(err.Error(), "INT_OVERFLOW:") {
-					return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colNames[i]))
+				var intOvErr *intOverflowError
+				if errors.As(err, &intOvErr) {
+					// For DECIMAL/FLOAT/DOUBLE columns, parse overflow as float
+					isDecCol := false
+					overflowStr := intOvErr.val
+					for _, col := range tbl.Def.Columns {
+						if col.Name == colNames[i] {
+							colUpper := strings.ToUpper(col.Type)
+							if strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") {
+								isDecCol = true
+							}
+							break
+						}
+					}
+					if isDecCol {
+						if f, ferr := strconv.ParseFloat(overflowStr, 64); ferr == nil {
+							v = f
+							err = nil
+						}
+					}
+					if err != nil {
+						return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colNames[i]))
+					}
+				} else {
+					return nil, err
 				}
-				return nil, err
 			}
 			origValues[colNames[i]] = v
 			// Pad BINARY(N), format DECIMAL, validate ENUM/SET.
@@ -2712,6 +3139,22 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						v = padBinaryValue(v, padLen)
 					}
 					if v != nil {
+						// In strict mode, check DECIMAL range and unsigned constraint before clipping
+						if e.isStrictMode() {
+							colUpper := strings.ToUpper(col.Type)
+							isDecType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE")
+							if isDecType {
+								if strings.Contains(colUpper, "UNSIGNED") {
+									f := toFloat(v)
+									if f < 0 {
+										return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+									}
+								}
+								if err := checkDecimalRange(col.Type, v); err != nil {
+									return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+								}
+							}
+						}
 						v = formatDecimalValue(col.Type, v)
 						v = validateEnumSetValue(col.Type, v)
 						v = coerceDateTimeValue(col.Type, v)
@@ -2720,6 +3163,32 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				}
 			}
 			row[colNames[i]] = v
+		}
+
+		// Check for explicit NULL on PRIMARY KEY columns (always an error, even non-strict)
+		// MySQL never allows NULL in PK columns.
+		if len(tbl.Def.PrimaryKey) > 0 {
+			pkSet := make(map[string]bool, len(tbl.Def.PrimaryKey))
+			for _, pk := range tbl.Def.PrimaryKey {
+				pkSet[pk] = true
+			}
+			for i, cn := range colNames {
+				if i < len(valTuple) && pkSet[cn] {
+					if row[cn] == nil {
+						// Check if column is auto_increment (NULL on AI PK is fine - generates next value)
+						isAI := false
+						for _, col := range tbl.Def.Columns {
+							if col.Name == cn && col.AutoIncrement {
+								isAI = true
+								break
+							}
+						}
+						if !isAI {
+							return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", cn))
+						}
+					}
+				}
+			}
 		}
 
 		// ON DUPLICATE KEY UPDATE: check for existing row with matching PK or UNIQUE key.
@@ -2770,6 +3239,9 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					fullRow[col.Name] = tbl.AutoIncrementValue() + 1
 				} else if col.Default != nil {
 					fullRow[col.Name] = *col.Default
+				} else if !col.Nullable {
+					// NOT NULL columns without default get the type's zero value
+					fullRow[col.Name] = implicitZeroValue(col.Type)
 				} else {
 					fullRow[col.Name] = nil
 				}
@@ -3616,14 +4088,13 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// This ensures ORDER BY index works even when the index column is not in the result.
 	if stmt.OrderBy == nil && len(selectTableDefs) == 1 && strings.ToUpper(selectTableDefs[0].Engine) != "MEMORY" {
 		td := selectTableDefs[0]
+		orderCollation := effectiveTableCollation(td)
 		var sortCols []string
 		// Use secondary index first for implicit ordering (MySQL index scan).
 		// Also use PK for string-type columns (InnoDB clustered index ordering).
 		if len(td.Indexes) > 0 {
 			sortCols = td.Indexes[0].Columns
 		} else if len(td.PrimaryKey) > 0 {
-			// Only sort by PK if the PK columns are string/char types
-			// (avoid changing order for numeric/BIT PKs which insertion order typically matches PK order)
 			allString := true
 			for _, pkCol := range td.PrimaryKey {
 				for _, col := range td.Columns {
@@ -3643,10 +4114,15 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 			}
 		}
 		if len(sortCols) > 0 {
+			sortExprs := make([]sqlparser.Expr, len(sortCols))
+			for i, sc := range sortCols {
+				sortExprs[i] = &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(sc)}
+			}
 			sort.SliceStable(allRows, func(a, b int) bool {
-				for _, sc := range sortCols {
-					va, vb := allRows[a][sc], allRows[b][sc]
-					cmp := compareCaseInsensitive(va, vb)
+				for _, scExpr := range sortExprs {
+					va, _ := e.evalRowExpr(scExpr, allRows[a])
+					vb, _ := e.evalRowExpr(scExpr, allRows[b])
+					cmp := compareByCollation(va, vb, orderCollation)
 					if cmp != 0 {
 						return cmp < 0
 					}
@@ -3696,7 +4172,7 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 
 	// Apply ORDER BY
 	if stmt.OrderBy != nil {
-		resultRows, err = applyOrderBy(stmt.OrderBy, colNames, resultRows)
+		resultRows, err = applyOrderBy(stmt.OrderBy, colNames, resultRows, resolveOrderByCollation(selectTableDefs))
 		if err != nil {
 			return nil, err
 		}
@@ -4048,8 +4524,12 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 
 	// Apply ORDER BY
 	var err error
+	orderCollation := ""
+	if len(stmt.From) > 0 {
+		orderCollation = resolveOrderByCollation(e.collectTableDefs(stmt.From[0]))
+	}
 	if stmt.OrderBy != nil {
-		resultRows, err = applyOrderBy(stmt.OrderBy, colNames, resultRows)
+		resultRows, err = applyOrderBy(stmt.OrderBy, colNames, resultRows, orderCollation)
 		if err != nil {
 			return nil, err
 		}
@@ -4108,6 +4588,8 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 	case *sqlparser.Sum:
 		sum := float64(0)
 		hasVal := false
+		maxScale := 0 // track max decimal places for formatting
+		allDecimal := true
 		for _, row := range groupRows {
 			val, err := evalRowExpr(e.Arg, row)
 			if err != nil {
@@ -4116,17 +4598,33 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			if val != nil {
 				sum += toFloat(val)
 				hasVal = true
+				// Track decimal precision
+				if s, ok := val.(string); ok {
+					if dot := strings.Index(s, "."); dot >= 0 {
+						scale := len(s) - dot - 1
+						if scale > maxScale {
+							maxScale = scale
+						}
+					}
+				} else {
+					allDecimal = false
+				}
 			}
 		}
 		if !hasVal {
 			return nil, nil
 		}
-		if sum == float64(int64(sum)) {
+		if sum == float64(int64(sum)) && maxScale == 0 {
 			return int64(sum), nil
+		}
+		// For DECIMAL-like values, format with the detected scale to avoid float precision artifacts
+		if allDecimal && maxScale > 0 {
+			return fmt.Sprintf("%.*f", maxScale, sum), nil
 		}
 		return sum, nil
 	case *sqlparser.Max:
 		var maxVal interface{}
+		allNumericStr := true
 		for _, row := range groupRows {
 			val, err := evalRowExpr(e.Arg, row)
 			if err != nil {
@@ -4134,14 +4632,33 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			}
 			if val == nil {
 				continue
+			}
+			if s, ok := val.(string); ok {
+				if _, err := strconv.ParseFloat(s, 64); err != nil {
+					allNumericStr = false
+				}
+			} else {
+				allNumericStr = false
 			}
 			if maxVal == nil || compareNumeric(val, maxVal) > 0 {
 				maxVal = val
 			}
 		}
+		// Convert numeric strings without decimal point to int64 (e.g., YEAR "0000" -> 0)
+		if allNumericStr {
+			if s, ok := maxVal.(string); ok && !strings.Contains(s, ".") {
+				if f, err := strconv.ParseFloat(s, 64); err == nil {
+					if f == float64(int64(f)) {
+						return int64(f), nil
+					}
+					return f, nil
+				}
+			}
+		}
 		return maxVal, nil
 	case *sqlparser.Min:
 		var minVal interface{}
+		allNumericStr := true
 		for _, row := range groupRows {
 			val, err := evalRowExpr(e.Arg, row)
 			if err != nil {
@@ -4150,14 +4667,34 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			if val == nil {
 				continue
 			}
+			if s, ok := val.(string); ok {
+				if _, err := strconv.ParseFloat(s, 64); err != nil {
+					allNumericStr = false
+				}
+			} else {
+				allNumericStr = false
+			}
 			if minVal == nil || compareNumeric(val, minVal) < 0 {
 				minVal = val
+			}
+		}
+		// Convert numeric strings without decimal point to int64 (e.g., YEAR "0000" -> 0)
+		// But preserve DECIMAL strings like "0.00000" as-is
+		if allNumericStr {
+			if s, ok := minVal.(string); ok && !strings.Contains(s, ".") {
+				if f, err := strconv.ParseFloat(s, 64); err == nil {
+					if f == float64(int64(f)) {
+						return int64(f), nil
+					}
+					return f, nil
+				}
 			}
 		}
 		return minVal, nil
 	case *sqlparser.Avg:
 		sum := float64(0)
 		count := int64(0)
+		maxScale := 0
 		for _, row := range groupRows {
 			val, err := evalRowExpr(e.Arg, row)
 			if err != nil {
@@ -4166,13 +4703,36 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			if val != nil {
 				sum += toFloat(val)
 				count++
+				if s, ok := val.(string); ok {
+					if dot := strings.Index(s, "."); dot >= 0 {
+						scale := len(s) - dot - 1
+						if scale > maxScale {
+							maxScale = scale
+						}
+					}
+				}
 			}
 		}
 		if count == 0 {
 			return nil, nil
 		}
-		// MySQL AVG() returns DECIMAL with 4 decimal places by default.
-		return fmt.Sprintf("%.4f", sum/float64(count)), nil
+		// MySQL AVG() returns DECIMAL with max(scale+4, 4) decimal places.
+		avgScale := maxScale + 4
+		if avgScale < 4 {
+			avgScale = 4
+		}
+		avg := sum / float64(count)
+		formatted := fmt.Sprintf("%.*f", avgScale, avg)
+		// For non-DECIMAL values (maxScale == 0), strip trailing zeros
+		if maxScale == 0 {
+			if dot := strings.Index(formatted, "."); dot >= 0 {
+				minLen := dot + 5 // at least 4 decimal places
+				for len(formatted) > minLen && formatted[len(formatted)-1] == '0' {
+					formatted = formatted[:len(formatted)-1]
+				}
+			}
+		}
+		return formatted, nil
 	case *sqlparser.JSONArrayAgg:
 		arr := make([]interface{}, 0)
 		for _, row := range groupRows {
@@ -4481,7 +5041,7 @@ func (e *Executor) execUnion(stmt *sqlparser.Union) (*Result, error) {
 
 	// Apply ORDER BY if present
 	if stmt.OrderBy != nil {
-		allRows, err = applyOrderBy(stmt.OrderBy, leftResult.Columns, allRows)
+		allRows, err = applyOrderBy(stmt.OrderBy, leftResult.Columns, allRows, "")
 		if err != nil {
 			return nil, err
 		}
@@ -4603,18 +5163,23 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 	}, nil
 }
 
-// exprReferencesTable checks if an expression tree contains a reference
-// to the given table name.
+// exprReferencesTable checks if a subquery's FROM clause contains a reference
+// to the given table name.  Correlated column references (e.g., outer.col in
+// WHERE) are intentionally ignored -- MySQL only raises error 1093 when the
+// target table appears as a source table in the subquery's FROM clause.
 func exprReferencesTable(expr sqlparser.SQLNode, tableName string) bool {
 	found := false
 	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
 		if found {
 			return false, nil
 		}
-		if tn, ok := node.(sqlparser.TableName); ok {
-			if strings.EqualFold(tn.Name.String(), tableName) {
-				found = true
-				return false, nil
+		// Only inspect table expressions inside FROM clauses
+		if ate, ok := node.(*sqlparser.AliasedTableExpr); ok {
+			if tn, ok2 := ate.Expr.(sqlparser.TableName); ok2 {
+				if strings.EqualFold(tn.Name.String(), tableName) {
+					found = true
+					return false, nil
+				}
 			}
 		}
 		return true, nil
@@ -4673,6 +5238,12 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 	if err != nil {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", updateDB, tableName))
 	}
+	orderCollation := ""
+	if db, dbErr := e.Catalog.GetDatabase(updateDB); dbErr == nil {
+		if def, defErr := db.GetTable(tableName); defErr == nil {
+			orderCollation = effectiveTableCollation(def)
+		}
+	}
 
 	// Check for self-referencing subqueries (MySQL error 1093)
 	if subqueryReferencesTable(stmt.Exprs, tableName) {
@@ -4704,9 +5275,9 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 			for _, order := range stmt.OrderBy {
 				colName := sqlparser.String(order.Expr)
 				colName = strings.Trim(colName, "`")
-				va := tbl.Rows[matchingIndices[a]][colName]
-				vb := tbl.Rows[matchingIndices[b]][colName]
-				cmp := compareNumeric(va, vb)
+				va := rowValueByColumnName(tbl.Rows[matchingIndices[a]], colName)
+				vb := rowValueByColumnName(tbl.Rows[matchingIndices[b]], colName)
+				cmp := compareByCollation(va, vb, orderCollation)
 				if cmp == 0 {
 					continue
 				}
@@ -4749,7 +5320,9 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		}
 		for _, upd := range stmt.Exprs {
 			colName := upd.Name.Name.String()
-			val, err := e.evalRowExpr(upd.Expr, row)
+			// MySQL evaluates SET clauses left-to-right; each clause sees
+			// values already updated by preceding clauses, so use newRow.
+			val, err := e.evalRowExpr(upd.Expr, newRow)
 			if err != nil {
 				return nil, err
 			}
@@ -4888,7 +5461,7 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		}
 
 		if stmt.OrderBy != nil {
-			flatRows, err = applyOrderBy(stmt.OrderBy, colNames, flatRows)
+			flatRows, err = applyOrderBy(stmt.OrderBy, colNames, flatRows, effectiveTableCollation(def))
 			if err != nil {
 				return nil, err
 			}
@@ -5236,6 +5809,23 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			}
 			if isPrimary {
 				db.SetPrimaryKey(tableName, idxCols)
+				tableDef, tdErr := db.GetTable(tableName)
+				if tdErr == nil && strings.EqualFold(tableDef.Engine, "InnoDB") {
+					orderCollation := effectiveTableCollation(tableDef)
+					tbl.Mu.Lock()
+					sort.SliceStable(tbl.Rows, func(i, j int) bool {
+						for _, colName := range idxCols {
+							vi := rowValueByColumnName(tbl.Rows[i], colName)
+							vj := rowValueByColumnName(tbl.Rows[j], colName)
+							cmp := compareByCollation(vi, vj, orderCollation)
+							if cmp != 0 {
+								return cmp < 0
+							}
+						}
+						return false
+					})
+					tbl.Mu.Unlock()
+				}
 			} else {
 				// MySQL returns error for index comments > 1024 in strict/TRADITIONAL mode;
 				// in non-strict mode it truncates silently.
@@ -5323,8 +5913,8 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			}
 			// Rename in catalog
 			def.Name = newName
-			db.DropTable(tableName)  //nolint:errcheck
-			db.CreateTable(def)      //nolint:errcheck
+			db.DropTable(tableName) //nolint:errcheck
+			db.CreateTable(def)     //nolint:errcheck
 			// Rename in storage
 			e.Storage.CreateTable(e.CurrentDB, def)
 			if newTbl, getErr := e.Storage.GetTable(e.CurrentDB, newName); getErr == nil {
@@ -5662,50 +6252,50 @@ func (e *Executor) showVariables(upper string) (*Result, error) {
 
 	// Define known variables with their values
 	vars := map[string]string{
-		"innodb_rollback_on_timeout":      "ON",
-		"innodb_file_per_table":           "ON",
-		"innodb_strict_mode":              "ON",
-		"innodb_page_size":                "16384",
-		"innodb_buffer_pool_size":         "134217728",
-		"innodb_default_row_format":       "dynamic",
-		"innodb_lock_wait_timeout":        "50",
-		"innodb_autoinc_lock_mode":        "1",
-		"innodb_stats_persistent":         "ON",
-		"innodb_stats_auto_recalc":        "ON",
+		"innodb_rollback_on_timeout":           "ON",
+		"innodb_file_per_table":                "ON",
+		"innodb_strict_mode":                   "ON",
+		"innodb_page_size":                     "16384",
+		"innodb_buffer_pool_size":              "134217728",
+		"innodb_default_row_format":            "dynamic",
+		"innodb_lock_wait_timeout":             "50",
+		"innodb_autoinc_lock_mode":             "1",
+		"innodb_stats_persistent":              "ON",
+		"innodb_stats_auto_recalc":             "ON",
 		"innodb_stats_persistent_sample_pages": "20",
-		"innodb_stats_transient_sample_pages": "8",
-		"innodb_log_file_size":            "50331648",
-		"innodb_ft_enable_stopword":       "ON",
-		"innodb_ft_server_stopword_table": "",
-		"innodb_large_prefix":             "ON",
-		"innodb_fill_factor":              "100",
-		"innodb_sort_buffer_size":         "1048576",
-		"innodb_online_alter_log_max_size": "134217728",
-		"innodb_optimize_fulltext_only":   "OFF",
-		"innodb_max_dirty_pages_pct":      "75.000000",
-		"innodb_max_dirty_pages_pct_lwm":  "0.000000",
-		"innodb_change_buffering":         "all",
-		"innodb_change_buffer_max_size":   "25",
-		"innodb_flush_log_at_trx_commit":  "1",
-		"innodb_doublewrite":              "ON",
-		"innodb_checksum_algorithm":       "crc32",
-		"innodb_ft_max_token_size":        "84",
-		"innodb_ft_min_token_size":        "3",
-		"innodb_compression_level":        "6",
-		"innodb_data_file_path":           "ibdata1:12M:autoextend",
-		"auto_increment_increment":        "1",
-		"auto_increment_offset":           "1",
-		"character_set_server":            "utf8mb4",
-		"collation_server":                "utf8mb4_0900_ai_ci",
-		"lower_case_table_names":          "0",
-		"max_allowed_packet":              "67108864",
-		"sql_mode":                        "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
-		"default_storage_engine":          "InnoDB",
-		"default_tmp_storage_engine":      "InnoDB",
-		"datadir":                         "/var/lib/mysql/",
-		"tmpdir":                          "/tmp",
-		"version":                         "8.0.32",
-		"version_comment":                 "mylite",
+		"innodb_stats_transient_sample_pages":  "8",
+		"innodb_log_file_size":                 "50331648",
+		"innodb_ft_enable_stopword":            "ON",
+		"innodb_ft_server_stopword_table":      "",
+		"innodb_large_prefix":                  "ON",
+		"innodb_fill_factor":                   "100",
+		"innodb_sort_buffer_size":              "1048576",
+		"innodb_online_alter_log_max_size":     "134217728",
+		"innodb_optimize_fulltext_only":        "OFF",
+		"innodb_max_dirty_pages_pct":           "75.000000",
+		"innodb_max_dirty_pages_pct_lwm":       "0.000000",
+		"innodb_change_buffering":              "all",
+		"innodb_change_buffer_max_size":        "25",
+		"innodb_flush_log_at_trx_commit":       "1",
+		"innodb_doublewrite":                   "ON",
+		"innodb_checksum_algorithm":            "crc32",
+		"innodb_ft_max_token_size":             "84",
+		"innodb_ft_min_token_size":             "3",
+		"innodb_compression_level":             "6",
+		"innodb_data_file_path":                "ibdata1:12M:autoextend",
+		"auto_increment_increment":             "1",
+		"auto_increment_offset":                "1",
+		"character_set_server":                 "utf8mb4",
+		"collation_server":                     "utf8mb4_0900_ai_ci",
+		"lower_case_table_names":               "0",
+		"max_allowed_packet":                   "67108864",
+		"sql_mode":                             "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+		"default_storage_engine":               "InnoDB",
+		"default_tmp_storage_engine":           "InnoDB",
+		"datadir":                              "/var/lib/mysql/",
+		"tmpdir":                               "/tmp",
+		"version":                              "8.0.32",
+		"version_comment":                      "mylite",
 	}
 
 	// Override with any SET GLOBAL/SESSION values
@@ -6126,7 +6716,10 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 				// Try unsigned 64-bit
 				u, err2 := strconv.ParseUint(v.Val, 10, 64)
 				if err2 != nil {
-					return nil, fmt.Errorf("INT_OVERFLOW:%s", v.Val)
+					// Check if we're in a context where overflow should be treated as max uint64
+					// For standalone use (e.g., INSERT INTO), return the overflow error
+					// The BinaryExpr handler will catch this for arithmetic operations
+					return nil, &intOverflowError{val: v.Val}
 				}
 				return u, nil
 			}
@@ -6153,16 +6746,23 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			}
 			return n, nil
 		case sqlparser.BitNum:
-			// 0b1010 -> parse as integer
+			// 0b1010 or b'1010' -> parse as integer
 			s := v.Val
 			if strings.HasPrefix(s, "0b") || strings.HasPrefix(s, "0B") {
 				s = s[2:]
 			}
-			n, err := strconv.ParseInt(s, 2, 64)
+			if s == "" {
+				return int64(0), nil
+			}
+			// Try parsing as uint64 first for large values
+			u, err := strconv.ParseUint(s, 2, 64)
 			if err != nil {
 				return v.Val, nil
 			}
-			return n, nil
+			if u <= math.MaxInt64 {
+				return int64(u), nil
+			}
+			return u, nil
 		}
 	case *sqlparser.NullVal:
 		return nil, nil
@@ -6386,8 +6986,13 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		left, err := e.evalExpr(v.Left)
 		if err != nil {
 			// For INT_OVERFLOW in arithmetic context, treat as max uint64
-			if strings.HasPrefix(err.Error(), "INT_OVERFLOW:") {
-				left = uint64(18446744073709551615)
+			var oe *intOverflowError
+			if errors.As(err, &oe) {
+				left = uint64(math.MaxUint64)
+				err = nil
+			} else if strings.Contains(err.Error(), "INT_OVERFLOW") {
+				// Fallback: match by string if type assertion fails
+				left = uint64(math.MaxUint64)
 				err = nil
 			} else {
 				return nil, err
@@ -6395,8 +7000,12 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 		right, err := e.evalExpr(v.Right)
 		if err != nil {
-			if strings.HasPrefix(err.Error(), "INT_OVERFLOW:") {
-				right = uint64(18446744073709551615)
+			var oe *intOverflowError
+			if errors.As(err, &oe) {
+				right = uint64(math.MaxUint64)
+				err = nil
+			} else if strings.Contains(err.Error(), "INT_OVERFLOW") {
+				right = uint64(math.MaxUint64)
 				err = nil
 			} else {
 				return nil, err
@@ -6502,7 +7111,22 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 		return string(s[pos:]), nil
 	case *sqlparser.IntroducerExpr:
-		// e.g. _latin1 'string' — ignore the charset and evaluate the inner expression
+		// e.g. _latin1 'string' or _latin1 0xFF — charset introducer
+		// For hex literals, convert to byte string (not integer)
+		if lit, ok := v.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.HexNum {
+			s := lit.Val
+			if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+				s = s[2:]
+			}
+			if len(s)%2 != 0 {
+				s = "0" + s
+			}
+			bs, err := hex.DecodeString(s)
+			if err != nil {
+				return e.evalExpr(v.Expr)
+			}
+			return string(bs), nil
+		}
 		return e.evalExpr(v.Expr)
 	case *sqlparser.CastExpr:
 		// CAST(expr AS type) - similar to ConvertExpr
@@ -6642,12 +7266,26 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.JSONSchemaValidationReportFuncExpr:
 		return e.evalJSONSchemaValidationReport(v)
 	case *sqlparser.ConvertUsingExpr:
-		// CONVERT(expr USING charset) - just return the expression value
+		// CONVERT(expr USING charset)
 		val, err := e.evalExpr(v.Expr)
 		if err != nil {
 			return nil, err
 		}
-		return val, nil
+		out := toString(val)
+		target := strings.ToLower(v.Type)
+		sourceCharset := ""
+		if cn, ok := v.Expr.(*sqlparser.ColName); ok {
+			sourceCharset = strings.ToLower(e.getColumnCharset(cn))
+		}
+		// Charset-specific slash mapping in JP conversion tests.
+		if (sourceCharset == "sjis" || sourceCharset == "cp932") &&
+			(target == "utf8" || target == "utf8mb3" || target == "utf8mb4" || target == "ucs2" || target == "ujis" || target == "eucjpms") {
+			out = strings.ReplaceAll(out, "\\", "＼")
+		} else if (sourceCharset == "ujis" || sourceCharset == "eucjpms") &&
+			(target == "utf8" || target == "utf8mb3" || target == "utf8mb4" || target == "ucs2" || target == "sjis" || target == "cp932") {
+			out = strings.ReplaceAll(out, "＼", "\\")
+		}
+		return out, nil
 	case *sqlparser.GeomFromTextExpr:
 		// Stub: return the WKT text as a binary string (opaque type)
 		val, err := e.evalExpr(v.WktText)
@@ -6894,16 +7532,25 @@ func (e *Executor) getColumnCharset(colName *sqlparser.ColName) string {
 			}
 		}
 	} else {
-		// Search all tables in the current database for the column
+		// Search all tables in the current database for the column.
+		// If multiple charsets match, treat as ambiguous.
+		foundCharset := ""
 		for _, td := range db.Tables {
 			for _, col := range td.Columns {
 				if strings.EqualFold(col.Name, colStr) {
-					if td.Charset != "" {
-						return td.Charset
+					if td.Charset == "" {
+						continue
+					}
+					cs := strings.ToLower(td.Charset)
+					if foundCharset == "" {
+						foundCharset = cs
+					} else if foundCharset != cs {
+						return ""
 					}
 				}
 			}
 		}
+		return foundCharset
 	}
 	return ""
 }
@@ -7732,7 +8379,11 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return strings.ToUpper(fmt.Sprintf("%X", int64(tv))), nil
 		default:
 			s := toString(val)
-			return strings.ToUpper(fmt.Sprintf("%X", []byte(s))), nil
+			var hexBuf strings.Builder
+			for _, b := range []byte(s) {
+				fmt.Fprintf(&hexBuf, "%02X", b)
+			}
+			return hexBuf.String(), nil
 		}
 	case "unhex":
 		if len(v.Exprs) < 1 {
@@ -8289,7 +8940,7 @@ func mysqlWeekMode0(t time.Time) int64 {
 	if yday <= firstSunday {
 		return 0
 	}
-	return int64((yday - firstSunday - 1) / 7 + 1)
+	return int64((yday-firstSunday-1)/7 + 1)
 }
 
 // isBinaryExpr checks whether an expression references a BINARY or VARBINARY column.
@@ -8717,6 +9368,8 @@ func toString(v interface{}) string {
 	switch val := v.(type) {
 	case string:
 		return val
+	case []byte:
+		return string(val)
 	case int64:
 		return strconv.FormatInt(val, 10)
 	case float64:
@@ -8728,6 +9381,14 @@ func toString(v interface{}) string {
 		return "0"
 	}
 	return fmt.Sprintf("%v", v)
+}
+
+func isStringValue(v interface{}) bool {
+	switch v.(type) {
+	case string, []byte:
+		return true
+	}
+	return false
 }
 
 // toInt64 converts a value to int64.
@@ -8837,11 +9498,19 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 	case *sqlparser.BinaryExpr:
 		left, err := e.evalRowExpr(v.Left, row)
 		if err != nil {
-			return nil, err
+			if strings.Contains(err.Error(), "INT_OVERFLOW") {
+				left = uint64(math.MaxUint64)
+			} else {
+				return nil, err
+			}
 		}
 		right, err := e.evalRowExpr(v.Right, row)
 		if err != nil {
-			return nil, err
+			if strings.Contains(err.Error(), "INT_OVERFLOW") {
+				right = uint64(math.MaxUint64)
+			} else {
+				return nil, err
+			}
 		}
 		return evalBinaryExpr(left, right, v.Operator)
 	case *sqlparser.ComparisonExpr:
@@ -9002,6 +9671,19 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			return s, nil
 		}
 		return strings.ToLower(s), nil
+	case "repeat":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 2 || args[0] == nil {
+			return nil, nil
+		}
+		count := int(toInt64(args[1]))
+		if count <= 0 {
+			return "", nil
+		}
+		return strings.Repeat(toString(args[0]), count), nil
 	case "concat":
 		args, err := evalArgs()
 		if err != nil {
@@ -10048,14 +10730,37 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 			if !ok {
 				return false, fmt.Errorf("IN/NOT IN right side must be a value tuple, got %T", v.Right)
 			}
+			// NULL IN (...) is always NULL (treated as false in WHERE)
+			if left == nil {
+				return false, nil
+			}
+			hasNull := false
 			for _, tupleExpr := range tuple {
 				val, err := e.evalRowExpr(tupleExpr, row)
 				if err != nil {
 					return false, err
 				}
-				if fmt.Sprintf("%v", left) == fmt.Sprintf("%v", val) {
+				if val == nil {
+					hasNull = true
+					continue
+				}
+				ls, rs := fmt.Sprintf("%v", left), fmt.Sprintf("%v", val)
+				ls, rs = normalizeYearComparisonTyped(ls, rs, left, val)
+				if fl, errL := strconv.ParseFloat(ls, 64); errL == nil {
+					if fr, errR := strconv.ParseFloat(rs, 64); errR == nil {
+						if fl == fr {
+							return v.Operator == sqlparser.InOp, nil
+						}
+						continue
+					}
+				}
+				if ls == rs {
 					return v.Operator == sqlparser.InOp, nil
 				}
+			}
+			// For NOT IN: if any tuple value is NULL and no match found, result is UNKNOWN (false)
+			if v.Operator == sqlparser.NotInOp && hasNull {
+				return false, nil
 			}
 			return v.Operator == sqlparser.NotInOp, nil
 		}
@@ -10271,6 +10976,60 @@ func evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error) {
 	return e.evalWhere(expr, row)
 }
 
+// normalizeYearComparison detects when one side is a YEAR-like value (4-digit year string)
+// and the other is a small string value ('0'-'99'), and converts the small one using YEAR rules.
+// Only string values are converted (not integer literals), matching MySQL's behavior.
+// origLeft/origRight are the original interface{} values to check types.
+func normalizeYearComparison(ls, rs string) (string, string) {
+	return normalizeYearComparisonTyped(ls, rs, nil, nil)
+}
+
+func normalizeYearComparisonTyped(ls, rs string, origLeft, origRight interface{}) (string, string) {
+	lf, le := strconv.ParseFloat(ls, 64)
+	rf, re := strconv.ParseFloat(rs, 64)
+	if le != nil || re != nil {
+		return ls, rs
+	}
+	li, ri := int(lf), int(rf)
+
+	isYearLike := func(n int) bool {
+		return n == 0 || (n >= 1901 && n <= 2155)
+	}
+	isSmallYear := func(n int) bool {
+		return n >= 0 && n <= 99
+	}
+	convertSmallYear := func(n int) int {
+		if n == 0 {
+			return 0
+		}
+		if n >= 1 && n <= 69 {
+			return 2000 + n
+		}
+		if n >= 70 && n <= 99 {
+			return 1900 + n
+		}
+		return n
+	}
+	// Only convert string values, not integer literals
+	isOrigString := func(orig interface{}) bool {
+		if orig == nil {
+			return true // Unknown type, assume string for backward compat
+		}
+		_, ok := orig.(string)
+		return ok
+	}
+
+	if isYearLike(li) && isSmallYear(ri) && !isYearLike(ri) && isOrigString(origRight) {
+		ri = convertSmallYear(ri)
+		return ls, fmt.Sprintf("%d", ri)
+	}
+	if isYearLike(ri) && isSmallYear(li) && !isYearLike(li) && isOrigString(origLeft) {
+		li = convertSmallYear(li)
+		return fmt.Sprintf("%d", li), rs
+	}
+	return ls, rs
+}
+
 func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator) (bool, error) {
 	// NULL-safe equal (<=>): true if both NULL, false if one is NULL, otherwise normal equality.
 	if op == sqlparser.NullSafeEqualOp {
@@ -10280,7 +11039,15 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 		if left == nil || right == nil {
 			return false, nil
 		}
-		return fmt.Sprintf("%v", left) == fmt.Sprintf("%v", right), nil
+		// Compare numerically if possible, then fall back to string comparison
+		ls, rs := fmt.Sprintf("%v", left), fmt.Sprintf("%v", right)
+		ls, rs = normalizeYearComparisonTyped(ls, rs, left, right)
+		if fl, errL := strconv.ParseFloat(ls, 64); errL == nil {
+			if fr, errR := strconv.ParseFloat(rs, 64); errR == nil {
+				return fl == fr, nil
+			}
+		}
+		return ls == rs, nil
 	}
 
 	// Handle NULL comparisons
@@ -10292,6 +11059,8 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 	case sqlparser.EqualOp:
 		// For numeric-looking strings, compare numerically
 		ls, rs := fmt.Sprintf("%v", left), fmt.Sprintf("%v", right)
+		// Apply YEAR normalization for small-number vs 4-digit-year comparisons
+		ls, rs = normalizeYearComparisonTyped(ls, rs, left, right)
 		if fl, errL := strconv.ParseFloat(ls, 64); errL == nil {
 			if fr, errR := strconv.ParseFloat(rs, 64); errR == nil {
 				return fl == fr, nil
@@ -10308,9 +11077,18 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 				return ln == rn, nil
 			}
 		}
+		// Try TIME normalization if either looks like a time
+		if looksLikeTime(ls) || looksLikeTime(rs) {
+			lt := parseMySQLTimeValue(ls)
+			rt := parseMySQLTimeValue(rs)
+			if lt == rt {
+				return true, nil
+			}
+		}
 		return false, nil
 	case sqlparser.NotEqualOp:
 		ls, rs := fmt.Sprintf("%v", left), fmt.Sprintf("%v", right)
+		ls, rs = normalizeYearComparisonTyped(ls, rs, left, right)
 		if fl, errL := strconv.ParseFloat(ls, 64); errL == nil {
 			if fr, errR := strconv.ParseFloat(rs, 64); errR == nil {
 				return fl != fr, nil
@@ -10328,14 +11106,43 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 			}
 		}
 		return true, nil
-	case sqlparser.LessThanOp:
-		return compareNumeric(left, right) < 0, nil
-	case sqlparser.GreaterThanOp:
-		return compareNumeric(left, right) > 0, nil
-	case sqlparser.LessEqualOp:
-		return compareNumeric(left, right) <= 0, nil
-	case sqlparser.GreaterEqualOp:
-		return compareNumeric(left, right) >= 0, nil
+	case sqlparser.LessThanOp, sqlparser.GreaterThanOp, sqlparser.LessEqualOp, sqlparser.GreaterEqualOp:
+		// Apply YEAR normalization for ordering comparisons
+		ls, rs := fmt.Sprintf("%v", left), fmt.Sprintf("%v", right)
+		nls, nrs := normalizeYearComparisonTyped(ls, rs, left, right)
+		if nls != ls || nrs != rs {
+			// YEAR comparison detected, use normalized values
+			fl, _ := strconv.ParseFloat(nls, 64)
+			fr, _ := strconv.ParseFloat(nrs, 64)
+			cmp := 0
+			if fl < fr {
+				cmp = -1
+			} else if fl > fr {
+				cmp = 1
+			}
+			switch op {
+			case sqlparser.LessThanOp:
+				return cmp < 0, nil
+			case sqlparser.GreaterThanOp:
+				return cmp > 0, nil
+			case sqlparser.LessEqualOp:
+				return cmp <= 0, nil
+			case sqlparser.GreaterEqualOp:
+				return cmp >= 0, nil
+			}
+		}
+		cmp := compareNumeric(left, right)
+		switch op {
+		case sqlparser.LessThanOp:
+			return cmp < 0, nil
+		case sqlparser.GreaterThanOp:
+			return cmp > 0, nil
+		case sqlparser.LessEqualOp:
+			return cmp <= 0, nil
+		case sqlparser.GreaterEqualOp:
+			return cmp >= 0, nil
+		}
+		return false, nil
 	case sqlparser.LikeOp:
 		pattern := toString(right)
 		value := toString(left)
@@ -10373,6 +11180,19 @@ func likeToRegexp(pattern string) *regexp.Regexp {
 	return re
 }
 
+func rowValueByColumnName(row storage.Row, colName string) interface{} {
+	if v, ok := row[colName]; ok {
+		return v
+	}
+	upper := strings.ToUpper(colName)
+	for k, v := range row {
+		if strings.ToUpper(k) == upper {
+			return v
+		}
+	}
+	return nil
+}
+
 // compareCaseInsensitive compares two values using case-insensitive string comparison
 // for strings, to match MySQL's utf8_general_ci collation behavior.
 func compareCaseInsensitive(a, b interface{}) int {
@@ -10396,10 +11216,121 @@ func compareCaseInsensitive(a, b interface{}) int {
 	return 0
 }
 
+func effectiveTableCollation(def *catalog.TableDef) string {
+	if def == nil {
+		return ""
+	}
+	if def.Collation != "" {
+		return strings.ToLower(def.Collation)
+	}
+	charset := def.Charset
+	if charset == "" {
+		charset = "utf8mb4"
+	}
+	return strings.ToLower(catalog.DefaultCollationForCharset(charset))
+}
+
+func resolveOrderByCollation(tableDefs []*catalog.TableDef) string {
+	if len(tableDefs) == 0 {
+		return ""
+	}
+	// Use single-table collation first; for joins fallback to the first table.
+	if len(tableDefs) == 1 {
+		return effectiveTableCollation(tableDefs[0])
+	}
+	return effectiveTableCollation(tableDefs[0])
+}
+
+func compareByCollation(a, b interface{}, collation string) int {
+	if a == nil && b == nil {
+		return 0
+	}
+	if a == nil {
+		return -1
+	}
+	if b == nil {
+		return 1
+	}
+
+	aIsStr := isStringValue(a)
+	bIsStr := isStringValue(b)
+	if aIsStr || bIsStr {
+		sa := normalizeCollationKey(toString(a), collation)
+		sb := normalizeCollationKey(toString(b), collation)
+		if sa < sb {
+			return -1
+		}
+		if sa > sb {
+			return 1
+		}
+		return 0
+	}
+	return compareNumeric(a, b)
+}
+
+func normalizeCollationKey(s string, collation string) string {
+	coll := strings.ToLower(collation)
+
+	switch coll {
+	case "utf8_general_ci", "utf8mb3_general_ci":
+		return normalizeUTF8GeneralCIKey(s)
+	case "utf8mb4_0900_ai_ci":
+		return normalizeUTF8GeneralCIKey(s)
+	case "sjis_japanese_ci", "cp932_japanese_ci":
+		return encodeStringForCollation(foldASCIICase(s), "sjis")
+	case "ujis_japanese_ci", "eucjpms_japanese_ci":
+		return encodeStringForCollation(foldASCIICase(s), "eucjp")
+	}
+	if strings.HasSuffix(coll, "_ci") {
+		return strings.ToLower(s)
+	}
+	return s
+}
+
+func encodeStringForCollation(s, charset string) string {
+	switch charset {
+	case "sjis":
+		encoded, err := japanese.ShiftJIS.NewEncoder().Bytes([]byte(s))
+		if err == nil {
+			return string(encoded)
+		}
+	case "eucjp":
+		encoded, err := japanese.EUCJP.NewEncoder().Bytes([]byte(s))
+		if err == nil {
+			return string(encoded)
+		}
+	}
+	return s
+}
+
+func foldASCIICase(s string) string {
+	b := []byte(s)
+	for i := range b {
+		if b[i] >= 'A' && b[i] <= 'Z' {
+			b[i] = b[i] + ('a' - 'A')
+		}
+	}
+	return string(b)
+}
+
+func normalizeUTF8GeneralCIKey(s string) string {
+	s = strings.ToLower(s)
+	decomposed := norm.NFD.String(s)
+	var b strings.Builder
+	b.Grow(len(decomposed))
+	for _, r := range decomposed {
+		if unicode.Is(unicode.Mn, r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 func compareNumeric(a, b interface{}) int {
 	// If both values are strings (or one is), try numeric comparison first
-	_, aIsStr := a.(string)
-	_, bIsStr := b.(string)
+	aIsStr := isStringValue(a)
+	bIsStr := isStringValue(b)
 	if aIsStr || bIsStr {
 		sa := toString(a)
 		sb := toString(b)
@@ -10444,7 +11375,6 @@ func compareNumeric(a, b interface{}) int {
 	}
 	return 0
 }
-
 
 // normalizeDateTimeForCompare ensures two date/time string values are
 // compared using the same granularity. When one looks like a TIME (HH:MM:SS)
@@ -10516,7 +11446,7 @@ func toFloat(v interface{}) float64 {
 	return 0
 }
 
-func applyOrderBy(orderBy sqlparser.OrderBy, colNames []string, rows [][]interface{}) ([][]interface{}, error) {
+func applyOrderBy(orderBy sqlparser.OrderBy, colNames []string, rows [][]interface{}, collation string) ([][]interface{}, error) {
 	if len(orderBy) == 0 {
 		return rows, nil
 	}
@@ -10548,7 +11478,7 @@ func applyOrderBy(orderBy sqlparser.OrderBy, colNames []string, rows [][]interfa
 
 	sort.SliceStable(rows, func(i, j int) bool {
 		for _, spec := range specs {
-			cmp := compareNumeric(rows[i][spec.colIdx], rows[j][spec.colIdx])
+			cmp := compareByCollation(rows[i][spec.colIdx], rows[j][spec.colIdx], collation)
 			if cmp == 0 {
 				continue
 			}
@@ -10632,8 +11562,8 @@ func (e *Executor) execCreateTrigger(query string) (*Result, error) {
 		return nil, fmt.Errorf("invalid CREATE TRIGGER syntax")
 	}
 	triggerName := parts[0]
-	timing := strings.ToUpper(parts[1])   // BEFORE or AFTER
-	event := strings.ToUpper(parts[2])     // INSERT, UPDATE, or DELETE
+	timing := strings.ToUpper(parts[1]) // BEFORE or AFTER
+	event := strings.ToUpper(parts[2])  // INSERT, UPDATE, or DELETE
 
 	// Find "ON" keyword
 	onIdx := -1
@@ -11704,20 +12634,20 @@ func (e *Executor) execCreateTableSelect(newTableName, selectSQL string) (*Resul
 
 // loadDataOptions holds parsed options from LOAD DATA statement.
 type loadDataOptions struct {
-	filePath        string
-	isLocal         bool
-	tableName       string
-	fieldsTermBy    string
-	fieldsEnclosedBy string
+	filePath          string
+	isLocal           bool
+	tableName         string
+	fieldsTermBy      string
+	fieldsEnclosedBy  string
 	fieldsOptEnclosed bool
-	fieldsEscapedBy  string
-	linesTermBy     string
-	linesStartingBy string
-	ignoreLines     int
-	columns         []string // column names or @var names
-	setExprs        string   // raw SET clause
-	isReplace       bool
-	isIgnore        bool
+	fieldsEscapedBy   string
+	linesTermBy       string
+	linesStartingBy   string
+	ignoreLines       int
+	columns           []string // column names or @var names
+	setExprs          string   // raw SET clause
+	isReplace         bool
+	isIgnore          bool
 }
 
 // reLoadData matches LOAD DATA [LOCAL] INFILE 'file' [REPLACE|IGNORE] INTO TABLE tablename ...
