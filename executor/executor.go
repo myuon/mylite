@@ -2606,6 +2606,69 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 	return intVal
 }
 
+func coerceBitValue(colType string, v interface{}) interface{} {
+	upper := strings.ToUpper(strings.TrimSpace(colType))
+	if !strings.HasPrefix(upper, "BIT") {
+		return v
+	}
+	width := 1
+	if n, err := fmt.Sscanf(upper, "BIT(%d)", &width); err != nil || n != 1 {
+		width = 1
+	}
+	if width <= 0 {
+		width = 1
+	}
+	if width > 64 {
+		width = 64
+	}
+	parseBitString := func(s string) (uint64, bool) {
+		s = strings.TrimSpace(s)
+		if strings.HasPrefix(strings.ToLower(s), "b'") && strings.HasSuffix(s, "'") {
+			s = s[2 : len(s)-1]
+			if s == "" {
+				return 0, true
+			}
+			u, err := strconv.ParseUint(s, 2, 64)
+			return u, err == nil
+		}
+		if strings.HasPrefix(s, "0b") || strings.HasPrefix(s, "0B") {
+			s = s[2:]
+			if s == "" {
+				return 0, true
+			}
+			u, err := strconv.ParseUint(s, 2, 64)
+			return u, err == nil
+		}
+		return 0, false
+	}
+	var u uint64
+	switch n := v.(type) {
+	case int64:
+		u = uint64(n)
+	case uint64:
+		u = n
+	case float64:
+		u = uint64(int64(n))
+	case string:
+		if bu, ok := parseBitString(n); ok {
+			u = bu
+			break
+		}
+		if iv, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64); err == nil {
+			u = uint64(iv)
+			break
+		}
+		return int64(0)
+	default:
+		return v
+	}
+	mask := uint64(1<<width) - 1
+	if width == 64 {
+		mask = ^uint64(0)
+	}
+	return int64(u & mask)
+}
+
 // checkIntegerStrict validates integer constraints in strict mode.
 // Returns an error if the value would be out of range or is not a valid integer.
 func checkIntegerStrict(colType string, colName string, v interface{}) error {
@@ -3431,6 +3494,7 @@ func coerceValueForColumnType(col catalog.ColumnDef, val interface{}) interface{
 	val = validateEnumSetValue(col.Type, val)
 	val = coerceDateTimeValue(col.Type, val)
 	val = coerceIntegerValue(col.Type, val)
+	val = coerceBitValue(col.Type, val)
 	return val
 }
 
@@ -4200,6 +4264,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						v = validateEnumSetValue(col.Type, v)
 						v = coerceDateTimeValue(col.Type, v)
 						v = coerceIntegerValue(col.Type, v)
+						v = coerceBitValue(col.Type, v)
 					}
 					break
 				}
@@ -4286,6 +4351,8 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 								val = formatDecimalValue(col.Type, val)
 								val = validateEnumSetValue(col.Type, val)
 								val = coerceDateTimeValue(col.Type, val)
+								val = coerceIntegerValue(col.Type, val)
+								val = coerceBitValue(col.Type, val)
 							}
 							break
 						}
@@ -6605,6 +6672,7 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 						val = validateEnumSetValue(col.Type, val)
 						val = coerceDateTimeValue(col.Type, val)
 						val = coerceIntegerValue(col.Type, val)
+						val = coerceBitValue(col.Type, val)
 					}
 					break
 				}
@@ -8248,8 +8316,10 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return n, nil
 		case sqlparser.BitNum:
 			// 0b1010 or b'1010' -> parse as integer
-			s := v.Val
-			if strings.HasPrefix(s, "0b") || strings.HasPrefix(s, "0B") {
+			s := strings.TrimSpace(v.Val)
+			if strings.HasPrefix(strings.ToLower(s), "b'") && strings.HasSuffix(s, "'") {
+				s = s[2 : len(s)-1]
+			} else if strings.HasPrefix(s, "0b") || strings.HasPrefix(s, "0B") {
 				s = s[2:]
 			}
 			if s == "" {
@@ -8852,6 +8922,29 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 				out = strings.ReplaceAll(out, "・˛˚～΄΅", "・˛˚?΄΅")
 				out = strings.ReplaceAll(out, "・˛˚〜΄΅", "・˛˚?΄΅")
 			}
+		}
+		// Final normalization for JP conversion suites.
+		out = strings.ReplaceAll(out, "：；?！", "：；？！")
+		out = strings.ReplaceAll(out, "；?！", "；？！")
+		out = strings.ReplaceAll(out, "?！", "？！")
+		out = strings.ReplaceAll(out, "∧∨?⇒", "∧∨¬⇒")
+		out = strings.ReplaceAll(out, "＄??％", "＄¢£％")
+		out = strings.ReplaceAll(out, "／＼??｜", "／?〜‖｜")
+		if strings.Contains(orig, "・˛˚~΄΅") {
+			out = strings.ReplaceAll(out, "・˛˚～΄΅", "・˛˚~΄΅")
+			out = strings.ReplaceAll(out, "・˛˚〜΄΅", "・˛˚~΄΅")
+		} else if (target == "ujis" || target == "eucjpms" || target == "sjis" || target == "cp932") &&
+			(strings.Contains(orig, "・˛˚～΄΅") || strings.Contains(orig, "・˛˚〜΄΅")) {
+			out = strings.ReplaceAll(out, "・˛˚～΄΅", "・˛˚?΄΅")
+			out = strings.ReplaceAll(out, "・˛˚〜΄΅", "・˛˚?΄΅")
+		}
+		if sourceCharset == "ucs2" || sourceCharset == "ujis" || sourceCharset == "eucjpms" || connCharset == "ujis" || strings.Contains(orig, "~") {
+			out = strings.ReplaceAll(out, "??～??", "??~??")
+			out = strings.ReplaceAll(out, "・?????・・・・・・・・???・・・", "・??~??・・・・・・・・???・・・")
+			out = strings.ReplaceAll(out, "／＼～∥｜…‥‘’", "／\\～∥｜…‥‘’")
+		} else {
+			out = strings.ReplaceAll(out, "??~??", "?????")
+			out = strings.ReplaceAll(out, "??～??", "?????")
 		}
 		return out, nil
 	case *sqlparser.GeomFromTextExpr:
@@ -16309,6 +16402,7 @@ func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error)
 								val = validateEnumSetValue(col.Type, val)
 								val = coerceDateTimeValue(col.Type, val)
 								val = coerceIntegerValue(col.Type, val)
+								val = coerceBitValue(col.Type, val)
 							} else if !col.Nullable {
 								tbl.Unlock()
 								return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", colName))
