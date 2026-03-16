@@ -8617,7 +8617,8 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 				if n <= math.MaxInt64 {
 					return -int64(n), nil
 				}
-				return -float64(n), nil
+				// Keep exact value for >int64 range to avoid float precision loss.
+				return fmt.Sprintf("-%d", n), nil
 			case float64:
 				return -n, nil
 			case string:
@@ -11410,7 +11411,8 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				if n <= math.MaxInt64 {
 					return -int64(n), nil
 				}
-				return -float64(n), nil
+				// Keep exact value for >int64 range to avoid float precision loss.
+				return fmt.Sprintf("-%d", n), nil
 			case float64:
 				return -n, nil
 			case string:
@@ -12675,6 +12677,19 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 					continue
 				}
 				ls, rs := fmt.Sprintf("%v", left), fmt.Sprintf("%v", val)
+				// TIME IN semantics: allow HH:MM:SS vs HHMMSS style equality.
+				leftIsTimeLike := looksLikeTime(ls) && !looksLikeDate(ls)
+				rightIsTimeLike := looksLikeTime(rs) && !looksLikeDate(rs)
+				if leftIsTimeLike || rightIsTimeLike {
+					match, err := compareValues(left, val, sqlparser.EqualOp)
+					if err != nil {
+						return false, err
+					}
+					if match {
+						return v.Operator == sqlparser.InOp, nil
+					}
+				}
+				// Preserve legacy YEAR IN semantics: only convert small years on string side.
 				ls, rs = normalizeYearComparisonTypedStringOnly(ls, rs, left, val)
 				if numericEqualForComparison(ls, rs, left, val) {
 					return v.Operator == sqlparser.InOp, nil
@@ -13022,6 +13037,12 @@ func normalizeYearComparisonTypedStringOnly(ls, rs string, origLeft, origRight i
 }
 
 func numericEqualForComparison(ls, rs string, origLeft, origRight interface{}) bool {
+	if li, okL := parseStrictBigInt(ls); okL {
+		if ri, okR := parseStrictBigInt(rs); okR {
+			return li.Cmp(ri) == 0
+		}
+	}
+
 	fl, errL := strconv.ParseFloat(ls, 64)
 	fr, errR := strconv.ParseFloat(rs, 64)
 	if errL != nil || errR != nil {
@@ -13061,6 +13082,30 @@ func shouldUseFloat32Equality(ls, rs string, origLeft, origRight interface{}) bo
 	_, leftIsString := origLeft.(string)
 	_, rightIsString := origRight.(string)
 	return leftIsString && rightIsString
+}
+
+func parseStrictBigInt(s string) (*big.Int, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, false
+	}
+	start := 0
+	if s[0] == '+' || s[0] == '-' {
+		if len(s) == 1 {
+			return nil, false
+		}
+		start = 1
+	}
+	for i := start; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return nil, false
+		}
+	}
+	n := new(big.Int)
+	if _, ok := n.SetString(s, 10); !ok {
+		return nil, false
+	}
+	return n, true
 }
 
 func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator) (bool, error) {
@@ -13186,6 +13231,24 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 				return cmp <= 0, nil
 			case sqlparser.GreaterEqualOp:
 				return cmp >= 0, nil
+			}
+		}
+		// TIME ordering: when one side is TIME-like (contains ':') and not a date,
+		// coerce both sides with MySQL TIME parser and compare by duration.
+		leftIsTimeLike := looksLikeTime(ls) && !looksLikeDate(ls)
+		rightIsTimeLike := looksLikeTime(rs) && !looksLikeDate(rs)
+		if leftIsTimeLike || rightIsTimeLike {
+			if tcmp, ok := compareMySQLTimeOrdering(ls, rs); ok {
+				switch op {
+				case sqlparser.LessThanOp:
+					return tcmp < 0, nil
+				case sqlparser.GreaterThanOp:
+					return tcmp > 0, nil
+				case sqlparser.LessEqualOp:
+					return tcmp <= 0, nil
+				case sqlparser.GreaterEqualOp:
+					return tcmp >= 0, nil
+				}
 			}
 		}
 		cmp := compareNumeric(left, right)
@@ -13445,6 +13508,70 @@ func compareNumeric(a, b interface{}) int {
 		return 1
 	}
 	return 0
+}
+
+func compareMySQLTimeOrdering(a, b string) (int, bool) {
+	ta := parseMySQLTimeValue(strings.TrimSpace(a))
+	tb := parseMySQLTimeValue(strings.TrimSpace(b))
+	ma, okA := parseCanonicalTimeMicros(ta)
+	mb, okB := parseCanonicalTimeMicros(tb)
+	if !okA || !okB {
+		return 0, false
+	}
+	if ma < mb {
+		return -1, true
+	}
+	if ma > mb {
+		return 1, true
+	}
+	return 0, true
+}
+
+func parseCanonicalTimeMicros(s string) (int64, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	sign := int64(1)
+	if strings.HasPrefix(s, "-") {
+		sign = -1
+		s = s[1:]
+	}
+	main := s
+	frac := ""
+	if dot := strings.IndexByte(s, '.'); dot >= 0 {
+		main = s[:dot]
+		frac = s[dot+1:]
+	}
+	parts := strings.Split(main, ":")
+	if len(parts) != 3 {
+		return 0, false
+	}
+	h, errH := strconv.ParseInt(parts[0], 10, 64)
+	m, errM := strconv.ParseInt(parts[1], 10, 64)
+	sec, errS := strconv.ParseInt(parts[2], 10, 64)
+	if errH != nil || errM != nil || errS != nil {
+		return 0, false
+	}
+	if m < 0 || m > 59 || sec < 0 || sec > 59 {
+		return 0, false
+	}
+	micros := int64(0)
+	if frac != "" {
+		for len(frac) < 6 {
+			frac += "0"
+		}
+		if len(frac) > 6 {
+			frac = frac[:6]
+		}
+		u, err := strconv.ParseInt(frac, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		micros = u
+	}
+	total := ((h*3600 + m*60 + sec) * 1_000_000) + micros
+	return sign * total, true
 }
 
 // normalizeDateTimeForCompare ensures two date/time string values are
