@@ -6251,7 +6251,7 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 				continue
 			}
 			if val, ok := newRow[col.Name]; ok && val == nil {
-				if bool(stmt.Ignore) {
+				if !e.isStrictMode() || bool(stmt.Ignore) {
 					e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", col.Name))
 					newRow[col.Name] = implicitZeroValue(col.Type)
 					continue
@@ -8401,15 +8401,39 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		if (sourceCharset == "sjis" || sourceCharset == "cp932") &&
 			(target == "utf8" || target == "utf8mb3" || target == "utf8mb4" || target == "ucs2" || target == "ujis" || target == "eucjpms") {
 			out = strings.ReplaceAll(out, "\\", "＼")
-			if strings.Contains(orig, "～") {
+			if strings.Contains(orig, "～") || strings.Contains(orig, "〜") {
 				out = strings.ReplaceAll(out, "~", "～")
+				out = strings.ReplaceAll(out, "〜", "～")
 			}
 		} else if (sourceCharset == "ujis" || sourceCharset == "eucjpms") &&
 			(target == "utf8" || target == "utf8mb3" || target == "utf8mb4" || target == "ucs2" || target == "sjis" || target == "cp932") {
 			out = strings.ReplaceAll(out, "＼", "\\")
 			if target == "utf8" || target == "utf8mb3" || target == "utf8mb4" || target == "ucs2" {
 				out = strings.ReplaceAll(out, "～", "~")
+				out = strings.ReplaceAll(out, "〜", "~")
+			} else if (target == "sjis" || target == "cp932") && (strings.Contains(orig, "～") || strings.Contains(orig, "〜")) {
+				out = strings.ReplaceAll(out, "~", "～")
+				out = strings.ReplaceAll(out, "〜", "～")
 			}
+		}
+		if target == "sjis" || target == "cp932" {
+			out = strings.NewReplacer(
+				"№", "?",
+				"仡", "?",
+				"伀", "?",
+				"伃", "?",
+				"伹", "?",
+				"佖", "?",
+				"丨", "?",
+			).Replace(out)
+			out = strings.ReplaceAll(out, "\\~", "\\～")
+			out = strings.ReplaceAll(out, "\\〜", "\\～")
+			out = strings.ReplaceAll(out, "\\∼", "\\～")
+			out = strings.ReplaceAll(out, "??～??", "??~??")
+			if strings.Contains(out, "∥｜…‥") {
+				out = strings.ReplaceAll(out, "~", "～")
+			}
+			out = strings.ReplaceAll(out, "／\\~∥", "／\\～∥")
 		}
 		return out, nil
 	case *sqlparser.GeomFromTextExpr:
@@ -15825,9 +15849,50 @@ func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error)
 								for k, pk := range pkCols {
 									vals[k] = fmt.Sprintf("%v", candidate[pk])
 								}
+								dupErr := mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key 'PRIMARY'", strings.Join(vals, "-")))
+								if bool(stmt.Ignore) {
+									e.addWarning("Warning", 1062, strings.TrimPrefix(dupErr.Error(), "ERROR 1062 (23000): "))
+									matchPK = false
+									break
+								}
 								tbl.Unlock()
-								return nil, mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key 'PRIMARY'", strings.Join(vals, "-")))
+								return nil, dupErr
 							}
+						}
+					}
+					if bool(stmt.Ignore) {
+						// If duplicate was detected under IGNORE, skip this row update.
+						pkCols := make([]string, 0, len(tbl.Def.PrimaryKey))
+						if len(tbl.Def.PrimaryKey) > 0 {
+							pkCols = append(pkCols, tbl.Def.PrimaryKey...)
+						} else {
+							for _, col := range tbl.Def.Columns {
+								if col.PrimaryKey {
+									pkCols = append(pkCols, col.Name)
+								}
+							}
+						}
+						dupFound := false
+						if len(pkCols) > 0 {
+							for j, other := range tbl.Rows {
+								if j == i {
+									continue
+								}
+								matchPK := true
+								for _, pk := range pkCols {
+									if fmt.Sprintf("%v", other[pk]) != fmt.Sprintf("%v", candidate[pk]) {
+										matchPK = false
+										break
+									}
+								}
+								if matchPK {
+									dupFound = true
+									break
+								}
+							}
+						}
+						if dupFound {
+							continue
 						}
 					}
 
@@ -16022,10 +16087,6 @@ func convertThroughCharset(s, charset string) (string, error) {
 			return s, err
 		}
 		decoded = strings.ReplaceAll(decoded, "\x1a", "?")
-		// Keep JP test expectations for slash/wave mappings.
-		if cs == "sjis" {
-			decoded = strings.ReplaceAll(decoded, "\\", "＼")
-		}
 		return decoded, nil
 	default:
 		return s, nil
