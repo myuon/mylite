@@ -38,6 +38,13 @@ type TableDef struct {
 	Charset    string // e.g. "latin1", "utf8mb4"; empty means default (utf8mb4)
 	Collation  string // e.g. "latin1_swedish_ci"; empty means default
 	Engine     string // e.g. "InnoDB", "MyISAM", "MEMORY"; empty means default (InnoDB)
+	CheckConstraints []CheckConstraint // CHECK constraint definitions
+}
+
+// CheckConstraint represents a table-level CHECK constraint.
+type CheckConstraint struct {
+	Name string // constraint name (auto-generated if not specified)
+	Expr string // SQL expression to evaluate
 }
 
 // TriggerDef represents a trigger definition.

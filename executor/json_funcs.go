@@ -1596,20 +1596,32 @@ func (e *Executor) evalJSONSchemaValid(v *sqlparser.JSONSchemaValidFuncExpr) (in
 		return nil, nil
 	}
 
+	// Check for excessive nesting depth on raw strings first (before parsing)
+	schemaStr := toString(schemaVal)
+	docStr := toString(docVal)
+	if jsonRawDepth(schemaStr) > 100 || jsonRawDepth(docStr) > 100 {
+		return nil, mysqlError(3157, "22032", "The JSON document exceeds the maximum depth.")
+	}
+
 	// Parse schema
 	var schema interface{}
-	if err := json.Unmarshal([]byte(toString(schemaVal)), &schema); err != nil {
+	if err := json.Unmarshal([]byte(schemaStr), &schema); err != nil {
 		return nil, mysqlError(3141, "22032", "Invalid JSON text in argument 1 to function json_schema_valid.")
 	}
 	// Parse document
 	var doc interface{}
-	if err := json.Unmarshal([]byte(toString(docVal)), &doc); err != nil {
+	if err := json.Unmarshal([]byte(docStr), &doc); err != nil {
 		return nil, mysqlError(3141, "22032", "Invalid JSON text in argument 2 to function json_schema_valid.")
 	}
 
 	schemaObj, ok := schema.(map[string]interface{})
 	if !ok {
 		return nil, mysqlError(3141, "22032", "Invalid JSON text in argument 1 to function json_schema_valid.")
+	}
+
+	// Check for $ref (JSON Schema references not supported)
+	if jsonSchemaHasRef(schemaObj) {
+		return nil, mysqlError(3986, "42000", "This version of MySQL doesn't yet support 'references in JSON Schema'")
 	}
 
 	if jsonSchemaValidate(schemaObj, doc) {
@@ -1663,6 +1675,51 @@ func (e *Executor) evalJSONSchemaValidationReport(v *sqlparser.JSONSchemaValidat
 }
 
 // jsonSchemaValidate does basic JSON Schema validation
+// jsonRawDepth computes the nesting depth of a raw JSON string (without parsing).
+func jsonRawDepth(s string) int {
+	maxDepth := 0
+	depth := 0
+	inString := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inString {
+			if ch == '\\' {
+				i++
+			} else if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inString = true
+		case '[', '{':
+			depth++
+			if depth > maxDepth {
+				maxDepth = depth
+			}
+		case ']', '}':
+			depth--
+		}
+	}
+	return maxDepth
+}
+
+// jsonSchemaHasRef checks if a JSON schema object contains "$ref" keys (unsupported).
+func jsonSchemaHasRef(schema map[string]interface{}) bool {
+	for k, v := range schema {
+		if k == "$ref" {
+			return true
+		}
+		if subObj, ok := v.(map[string]interface{}); ok {
+			if jsonSchemaHasRef(subObj) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func jsonSchemaValidate(schema map[string]interface{}, doc interface{}) bool {
 	return jsonSchemaValidateReport(schema, doc) == ""
 }

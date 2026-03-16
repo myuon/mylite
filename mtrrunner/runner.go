@@ -424,16 +424,17 @@ func (ctx *execContext) executeLines(lines []string) error {
 		// Collect raw lines for echoing and build SQL statement
 		var rawLines []string
 		stmt := ""
+		inStringLiteral := false // track if we're inside a multi-line string literal
 		for i < len(lines) {
 			l := lines[i]
 			t := strings.TrimSpace(l)
 
-			// Skip comments within statement
-			if strings.HasPrefix(t, "#") {
+			// Skip comments within statement (only if not inside a string literal)
+			if !inStringLiteral && strings.HasPrefix(t, "#") {
 				i++
 				continue
 			}
-			if strings.HasPrefix(t, "--") {
+			if !inStringLiteral && strings.HasPrefix(t, "--") {
 				// Could be a directive mid-statement, handle it
 				d := strings.TrimPrefix(t, "--")
 				d = strings.TrimSpace(d)
@@ -442,8 +443,30 @@ func (ctx *execContext) executeLines(lines []string) error {
 				}
 			}
 
-			// For echoing, preserve comments before the delimiter but strip after
-			rawEcho := stripCommentAfterDelimiter(t, delim)
+			// For echoing: if inside a string literal, preserve leading whitespace.
+			// Otherwise, trim leading whitespace (mysqltest behavior).
+			var rawEcho string
+			if inStringLiteral {
+				rawEcho = stripCommentAfterDelimiter(strings.TrimRight(l, " \t\r\n"), delim)
+			} else {
+				rawEcho = stripCommentAfterDelimiter(t, delim)
+			}
+
+			// Track string literal state: count unescaped single quotes on this line
+			for ci := 0; ci < len(t); ci++ {
+				if t[ci] == '\'' {
+					// Check if escaped
+					if ci > 0 && t[ci-1] == '\\' {
+						continue
+					}
+					// Check for '' escape (two consecutive quotes)
+					if ci+1 < len(t) && t[ci+1] == '\'' {
+						ci++ // skip the next quote
+						continue
+					}
+					inStringLiteral = !inStringLiteral
+				}
+			}
 			// Strip inline comments (# outside quotes) for SQL processing
 			t = stripInlineComment(t)
 

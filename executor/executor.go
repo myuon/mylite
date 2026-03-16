@@ -247,14 +247,9 @@ func matchLikeHelper(s, p string, si, pi int) bool {
 // normalizes operator spacing to match MySQL's column display name behavior.
 func normalizeSQLDisplayName(s string) string {
 	s = uppercaseSQLKeywords(s)
-	// MySQL displays comparison operators without surrounding spaces in column names
-	// e.g. "c1=2" not "c1 = 2"
-	for _, op := range []string{" = ", " != ", " <> ", " >= ", " <= ", " > ", " < "} {
-		compact := strings.TrimSpace(op)
-		s = strings.ReplaceAll(s, op, compact)
-	}
-	// MySQL displays function arguments without space after comma: LEFT(`c1`,0) not LEFT(`c1`, 0)
-	s = normalizeFuncArgSpaces(s)
+	// MySQL preserves spaces around comparison operators for top-level expressions
+	// but compacts them inside function calls and subqueries.
+	s = compactOperatorsInSubexpressions(s)
 	// MySQL displays SUBSTRING, not SUBSTR in column headers
 	if strings.HasPrefix(s, "SUBSTR(") && !strings.HasPrefix(s, "SUBSTRING(") {
 		s = "SUBSTRING" + s[6:]
@@ -262,7 +257,115 @@ func normalizeSQLDisplayName(s string) string {
 	if strings.HasPrefix(s, "substr(") && !strings.HasPrefix(s, "substring(") {
 		s = "substring" + s[6:]
 	}
+	// Unescape literal \n and \t in string literals back to actual newlines/tabs
+	// (vitess sqlparser.String() escapes these in string literals)
+	s = unescapeStringLiterals(s)
 	return s
+}
+
+// compactOperatorsInSubexpressions removes spaces around operators inside function calls and
+// subqueries (parenthesized expressions), matching MySQL's column display name behavior.
+// Top-level operators keep their spaces.
+func compactOperatorsInSubexpressions(s string) string {
+	var result strings.Builder
+	parenDepth := 0
+	inQuote := byte(0)
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inQuote != 0 {
+			result.WriteByte(ch)
+			if ch == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' || ch == '`' {
+			inQuote = ch
+			result.WriteByte(ch)
+			continue
+		}
+		if ch == '(' {
+			parenDepth++
+			result.WriteByte(ch)
+			continue
+		}
+		if ch == ')' {
+			parenDepth--
+			result.WriteByte(ch)
+			continue
+		}
+		// Only compact operators when inside parentheses
+		if parenDepth > 0 && ch == ' ' {
+			// Check if this space is around an operator
+			// Look ahead for operator patterns: " = ", " != ", " <> ", " >= ", " <= ", " > ", " < "
+			for _, op := range []string{" = ", " != ", " <> ", " >= ", " <= ", " > ", " < "} {
+				if i+len(op) <= len(s) && s[i:i+len(op)] == op {
+					compact := strings.TrimSpace(op)
+					result.WriteString(compact)
+					i += len(op) - 1
+					goto nextChar
+				}
+			}
+			// Also compact ", " -> "," inside parentheses
+			if i+2 <= len(s) && s[i:i+2] == ", " {
+				result.WriteByte(',')
+				i++ // skip the space
+				continue
+			}
+		}
+		result.WriteByte(ch)
+	nextChar:
+	}
+	return result.String()
+}
+
+// unescapeStringLiterals replaces escaped \n and \t inside quoted strings with actual newlines/tabs.
+func unescapeStringLiterals(s string) string {
+	if !strings.Contains(s, "\\") {
+		return s
+	}
+	var result strings.Builder
+	inQuote := byte(0)
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inQuote != 0 {
+			if ch == '\\' && i+1 < len(s) {
+				next := s[i+1]
+				switch next {
+				case 'n':
+					result.WriteByte('\n')
+					i++
+					continue
+				case 't':
+					result.WriteByte('\t')
+					i++
+					continue
+				case '\\':
+					result.WriteByte('\\')
+					i++
+					continue
+				case '\'':
+					result.WriteByte('\'')
+					i++
+					continue
+				case '"':
+					result.WriteByte('"')
+					i++
+					continue
+				}
+			}
+			if ch == inQuote {
+				inQuote = 0
+			}
+			result.WriteByte(ch)
+			continue
+		}
+		if ch == '\'' || ch == '"' {
+			inQuote = ch
+		}
+		result.WriteByte(ch)
+	}
+	return result.String()
 }
 
 // normalizeFuncArgSpaces removes spaces after commas inside function calls,
@@ -958,6 +1061,8 @@ func (e *Executor) execPrepare(stmt *sqlparser.PrepareStmt) (*Result, error) {
 	query := sqlparser.String(stmt.Statement)
 	query = strings.Trim(query, "'\"")
 	// Unescape backslash-escaped characters from vitess serialization
+	query = strings.ReplaceAll(query, "\\n", "\n")
+	query = strings.ReplaceAll(query, "\\t", "\t")
 	query = strings.ReplaceAll(query, "\\'", "'")
 	query = strings.ReplaceAll(query, "\\\"", "\"")
 	query = strings.ReplaceAll(query, "\\\\", "\\")
@@ -2155,11 +2260,29 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 	}
 
+	// Extract CHECK constraints
+	var checkConstraints []catalog.CheckConstraint
+	checkIdx := 0
+	for _, constraint := range stmt.TableSpec.Constraints {
+		if checkDef, ok := constraint.Details.(*sqlparser.CheckConstraintDefinition); ok {
+			name := constraint.Name.String()
+			if name == "" {
+				checkIdx++
+				name = fmt.Sprintf("%s_chk_%d", tableName, checkIdx)
+			}
+			checkConstraints = append(checkConstraints, catalog.CheckConstraint{
+				Name: name,
+				Expr: sqlparser.String(checkDef.Expr),
+			})
+		}
+	}
+
 	def := &catalog.TableDef{
-		Name:       tableName,
-		Columns:    columns,
-		PrimaryKey: primaryKeys,
-		Indexes:    indexes,
+		Name:             tableName,
+		Columns:          columns,
+		PrimaryKey:       primaryKeys,
+		Indexes:          indexes,
+		CheckConstraints: checkConstraints,
 	}
 
 	// Process table options (comment, charset, collate) BEFORE creating the table,
@@ -2497,13 +2620,8 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		}
 	}
 
-	// Handle INSERT ... SELECT
-	if sel, ok := stmt.Rows.(*sqlparser.Select); ok {
-		selResult, err := e.execSelect(sel)
-		if err != nil {
-			return nil, err
-		}
-		// Convert SELECT result to Values
+	// Handle INSERT ... SELECT (including UNION)
+	convertSelectResult := func(selResult *Result) {
 		var valRows sqlparser.Values
 		for _, selRow := range selResult.Rows {
 			var tuple sqlparser.ValTuple
@@ -2516,13 +2634,25 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 			valRows = append(valRows, tuple)
 		}
-		// If no columns specified in INSERT, use source columns
 		if len(colNames) == 0 {
 			for _, col := range tbl.Def.Columns {
 				colNames = append(colNames, col.Name)
 			}
 		}
 		stmt.Rows = valRows
+	}
+	if sel, ok := stmt.Rows.(*sqlparser.Select); ok {
+		selResult, err := e.execSelect(sel)
+		if err != nil {
+			return nil, err
+		}
+		convertSelectResult(selResult)
+	} else if union, ok := stmt.Rows.(*sqlparser.Union); ok {
+		unionResult, err := e.execUnion(union)
+		if err != nil {
+			return nil, err
+		}
+		convertSelectResult(unionResult)
 	}
 
 	rows, ok := stmt.Rows.(sqlparser.Values)
@@ -2795,6 +2925,19 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 		}
 
+		// Enforce CHECK constraints
+		if tbl.Def != nil && len(tbl.Def.CheckConstraints) > 0 {
+			for _, cc := range tbl.Def.CheckConstraints {
+				checkResult, err := e.evaluateCheckConstraint(cc.Expr, row)
+				if err != nil {
+					continue // if we can't evaluate, skip
+				}
+				if !checkResult {
+					return nil, mysqlError(3819, "HY000", fmt.Sprintf("Check constraint '%s' is violated.", cc.Name))
+				}
+			}
+		}
+
 		id, err := tbl.Insert(row)
 		if err != nil {
 			// INSERT IGNORE: silently skip duplicate key errors
@@ -2813,6 +2956,9 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	}
 
 	e.lastInsertID = lastInsertID
+
+	// evaluateCheckConstraint is defined below.
+
 	// Set lastAutoIncID for sql_auto_is_null.
 	// Only set for NOT NULL auto-increment columns (MySQL behavior:
 	// sql_auto_is_null only applies when the auto-increment column is NOT NULL).
@@ -2912,9 +3058,11 @@ func (e *Executor) collectTableDefs(expr sqlparser.TableExpr) []*catalog.TableDe
 			if !tn.Qualifier.IsEmpty() {
 				lookupDB = tn.Qualifier.String()
 			}
-			if db, err := e.Catalog.GetDatabase(lookupDB); err == nil {
-				if td, err := db.GetTable(tblName); err == nil {
-					return []*catalog.TableDef{td}
+			if e.Catalog != nil {
+				if db, err := e.Catalog.GetDatabase(lookupDB); err == nil {
+					if td, err := db.GetTable(tblName); err == nil {
+						return []*catalog.TableDef{td}
+					}
 				}
 			}
 		}
@@ -2922,6 +3070,12 @@ func (e *Executor) collectTableDefs(expr sqlparser.TableExpr) []*catalog.TableDe
 		left := e.collectTableDefs(te.LeftExpr)
 		right := e.collectTableDefs(te.RightExpr)
 		return append(left, right...)
+	case *sqlparser.ParenTableExpr:
+		var result []*catalog.TableDef
+		for _, inner := range te.Exprs {
+			result = append(result, e.collectTableDefs(inner)...)
+		}
+		return result
 	}
 	return nil
 }
@@ -3003,6 +3157,9 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 		if lookupTable == "" {
 			lookupTable = tableName
 		}
+		if e.Storage == nil {
+			return nil, fmt.Errorf("no storage available")
+		}
 		tbl, err := e.Storage.GetTable(lookupDB, lookupTable)
 		if err != nil {
 			// Check if it's a view
@@ -3014,8 +3171,11 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 					}
 					// Convert view result to storage.Rows
 					rows := make([]storage.Row, 0, len(viewResult.Rows))
+					// Store column order as a special metadata key for SELECT * resolution
+					colOrderStr := strings.Join(viewResult.Columns, "\x00")
 					for _, vrow := range viewResult.Rows {
 						row := make(storage.Row)
+						row["__column_order__"] = colOrderStr
 						for ci, col := range viewResult.Columns {
 							if ci < len(vrow) {
 								row[col] = vrow[ci]
@@ -3058,6 +3218,40 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 		return result, nil
 	case *sqlparser.JoinTableExpr:
 		return e.buildJoinedRowsFromJoin(te)
+	case *sqlparser.ParenTableExpr:
+		// Parenthesized table expressions: process each inner table expr
+		// For single table, just return its rows. For multiple (joins), process sequentially.
+		if len(te.Exprs) == 1 {
+			return e.buildFromExpr(te.Exprs[0])
+		}
+		// Multiple tables: treat as implicit cross join / join chain
+		var result []storage.Row
+		for i, innerExpr := range te.Exprs {
+			rows, err := e.buildFromExpr(innerExpr)
+			if err != nil {
+				return nil, err
+			}
+			if i == 0 {
+				result = rows
+			} else {
+				// Cross join
+				var newResult []storage.Row
+				for _, leftRow := range result {
+					for _, rightRow := range rows {
+						merged := make(storage.Row)
+						for k, v := range leftRow {
+							merged[k] = v
+						}
+						for k, v := range rightRow {
+							merged[k] = v
+						}
+						newResult = append(newResult, merged)
+					}
+				}
+				result = newResult
+			}
+		}
+		return result, nil
 	default:
 		return nil, fmt.Errorf("unsupported table expression: %T", expr)
 	}
@@ -3636,6 +3830,155 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 		resultRows = append(resultRows, resultRow)
 	}
 
+	// Apply WITH ROLLUP: add super-aggregate rows
+	if stmt.GroupBy != nil && stmt.GroupBy.WithRollup && len(stmt.GroupBy.Exprs) > 0 {
+		groupByExprs := stmt.GroupBy.Exprs
+		numGroupCols := len(groupByExprs)
+
+		// Helper: check if a select expression corresponds to a rolled-up group-by column
+		isRolledUpExpr := func(ae *sqlparser.AliasedExpr, level int) bool {
+			for gi := level; gi < numGroupCols; gi++ {
+				gbStr := sqlparser.String(groupByExprs[gi])
+				// Check direct column name match
+				if colName, ok := ae.Expr.(*sqlparser.ColName); ok {
+					if gbCol, ok := groupByExprs[gi].(*sqlparser.ColName); ok {
+						if strings.EqualFold(colName.Name.String(), gbCol.Name.String()) {
+							return true
+						}
+					}
+				}
+				// Check alias match
+				if !ae.As.IsEmpty() {
+					if strings.EqualFold(ae.As.String(), gbStr) {
+						return true
+					}
+				}
+				// Check expression string match
+				if strings.EqualFold(sqlparser.String(ae.Expr), gbStr) {
+					return true
+				}
+			}
+			return false
+		}
+
+		// Helper: build a rollup row for a set of source rows at a given level
+		buildRollupRow := func(sourceRows []storage.Row, level int) ([]interface{}, error) {
+			repRow := storage.Row{}
+			if len(sourceRows) > 0 {
+				repRow = sourceRows[0]
+			}
+			rollupRow := make([]interface{}, 0, len(stmt.SelectExprs.Exprs))
+			for _, expr := range stmt.SelectExprs.Exprs {
+				ae, ok := expr.(*sqlparser.AliasedExpr)
+				if !ok {
+					rollupRow = append(rollupRow, nil)
+					continue
+				}
+				if isRolledUpExpr(ae, level) {
+					rollupRow = append(rollupRow, nil)
+				} else {
+					val, err := evalAggregateExpr(ae.Expr, sourceRows, repRow)
+					if err != nil {
+						return nil, err
+					}
+					rollupRow = append(rollupRow, val)
+				}
+			}
+			return rollupRow, nil
+		}
+
+		// Build interleaved result with rollup rows.
+		// For GROUP BY a, b WITH ROLLUP:
+		// - After all rows with same (a), insert rollup row (a, NULL)
+		// - After all rows, insert grand total (NULL, NULL)
+		//
+		// We need to process from the deepest level up.
+		// For each level from numGroupCols-1 down to 0:
+		// Insert rollup rows after each change in the prefix key at that level.
+
+		// First, collect rollup rows to insert. Work from deepest to shallowest.
+		// We need the original row data (allRows) grouped by prefix.
+		// Map from group key (from groups) to its allRows subset.
+		groupAllRows := make(map[string][]storage.Row) // group key -> raw rows
+		if stmt.GroupBy != nil && len(stmt.GroupBy.Exprs) > 0 {
+			for _, row := range allRows {
+				key := computeGroupKey(stmt.GroupBy.Exprs, row)
+				groupAllRows[key] = append(groupAllRows[key], row)
+			}
+		}
+
+		// Now insert rollup rows. Process the resultRows and groups.
+		newResult := make([][]interface{}, 0, len(resultRows)*2)
+		for level := numGroupCols - 1; level >= 0; level-- {
+			// Track prefix key changes at this level
+			prevPrefix := ""
+			var prefixRows []storage.Row
+			source := resultRows
+			if level < numGroupCols-1 {
+				source = newResult
+				newResult = make([][]interface{}, 0, len(source)*2)
+			}
+			for gi, row := range source {
+				// Determine the prefix key for this row from the original groups
+				var thisPrefix string
+				if level == 0 {
+					thisPrefix = ""
+				} else if gi < len(groups) {
+					if len(groups[gi].rows) > 0 {
+						thisPrefix = computeGroupKey(groupByExprs[:level], groups[gi].rows[0])
+					}
+				} else {
+					// This is a rollup row from a previous level
+					thisPrefix = "__rollup__"
+				}
+
+				if gi > 0 && gi <= len(groups) && thisPrefix != prevPrefix && prevPrefix != "__rollup__" {
+					// Prefix changed: insert rollup row for previous prefix
+					rollupRow, err := buildRollupRow(prefixRows, level)
+					if err != nil {
+						return nil, err
+					}
+					newResult = append(newResult, rollupRow)
+					prefixRows = nil
+				}
+
+				if gi < len(groups) && thisPrefix != "__rollup__" {
+					if thisPrefix != prevPrefix {
+						prefixRows = nil
+					}
+					prefixRows = append(prefixRows, groups[gi].rows...)
+					prevPrefix = thisPrefix
+				}
+
+				newResult = append(newResult, row)
+			}
+			// Insert final rollup row for the last prefix (or grand total at level 0)
+			if level == 0 {
+				rollupRow, err := buildRollupRow(allRows, 0)
+				if err != nil {
+					return nil, err
+				}
+				newResult = append(newResult, rollupRow)
+			} else if len(prefixRows) > 0 {
+				rollupRow, err := buildRollupRow(prefixRows, level)
+				if err != nil {
+					return nil, err
+				}
+				newResult = append(newResult, rollupRow)
+			}
+		}
+		if numGroupCols == 1 {
+			// For single group-by column, just append the grand total
+			newResult = resultRows
+			rollupRow, err := buildRollupRow(allRows, 0)
+			if err != nil {
+				return nil, err
+			}
+			newResult = append(newResult, rollupRow)
+		}
+		resultRows = newResult
+	}
+
 	// Apply HAVING
 	if stmt.Having != nil {
 		filtered := make([][]interface{}, 0)
@@ -3957,10 +4300,22 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					}
 				}
 				if !usedOrder {
+					// Check for __column_order__ metadata (from views/CTEs)
+					if orderStr, ok := rows[0]["__column_order__"]; ok {
+						if s, ok := orderStr.(string); ok && s != "" {
+							for _, colName := range strings.Split(s, "\x00") {
+								cols = append(cols, colName)
+								colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(colName)})
+							}
+							usedOrder = true
+						}
+					}
+				}
+				if !usedOrder {
 					// Fallback: use row keys (may have non-deterministic order)
 					seen := make(map[string]bool)
 					for k := range rows[0] {
-						if !strings.Contains(k, ".") && !seen[k] {
+						if !strings.Contains(k, ".") && !seen[k] && k != "__column_order__" {
 							seen[k] = true
 							cols = append(cols, k)
 							colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(k)})
@@ -3977,12 +4332,18 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 				// Case-insensitive column name resolution: if the row has a
 				// key that matches case-insensitively, use that key's case
 				// (needed for information_schema columns which are UPPERCASE).
+				// Prefer exact case match to avoid non-deterministic map iteration.
 				if len(rows) > 0 {
 					upperName := strings.ToUpper(name)
-					for k := range rows[0] {
-						if strings.ToUpper(k) == upperName && !strings.Contains(k, ".") {
-							name = k
-							break
+					// First try exact match
+					if _, ok := rows[0][name]; ok {
+						// name already matches exactly, keep it
+					} else {
+						for k := range rows[0] {
+							if strings.ToUpper(k) == upperName && !strings.Contains(k, ".") {
+								name = k
+								break
+							}
 						}
 					}
 				} else {
@@ -7503,6 +7864,62 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		pad = pad[:needed]
 		return string(append(s, pad...)), nil
+	case "least":
+		if len(v.Exprs) < 2 {
+			return nil, fmt.Errorf("LEAST requires at least 2 arguments")
+		}
+		var result interface{}
+		allNull := true
+		for _, argExpr := range v.Exprs {
+			val, err := e.evalExpr(argExpr)
+			if err != nil {
+				return nil, err
+			}
+			if val == nil {
+				return nil, nil // LEAST with NULL returns NULL
+			}
+			allNull = false
+			if result == nil {
+				result = val
+			} else {
+				cmp := compareNumeric(val, result)
+				if cmp < 0 {
+					result = val
+				}
+			}
+		}
+		if allNull {
+			return nil, nil
+		}
+		return result, nil
+	case "greatest":
+		if len(v.Exprs) < 2 {
+			return nil, fmt.Errorf("GREATEST requires at least 2 arguments")
+		}
+		var result interface{}
+		allNull := true
+		for _, argExpr := range v.Exprs {
+			val, err := e.evalExpr(argExpr)
+			if err != nil {
+				return nil, err
+			}
+			if val == nil {
+				return nil, nil // GREATEST with NULL returns NULL
+			}
+			allNull = false
+			if result == nil {
+				result = val
+			} else {
+				cmp := compareNumeric(val, result)
+				if cmp > 0 {
+					result = val
+				}
+			}
+		}
+		if allNull {
+			return nil, nil
+		}
+		return result, nil
 	}
 	// Try user-defined function from catalog
 	if result, err := e.callUserDefinedFunction(name, v.Exprs, nil); err == nil {
@@ -12788,4 +13205,32 @@ func decodeEUCJP(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// evaluateCheckConstraint evaluates a CHECK constraint expression against a row.
+// Returns true if the constraint is satisfied, false otherwise.
+func (e *Executor) evaluateCheckConstraint(exprStr string, row storage.Row) (bool, error) {
+	// Parse the expression
+	selectSQL := "SELECT " + exprStr
+	parsed, err := sqlparser.NewTestParser().Parse(selectSQL)
+	if err != nil {
+		return true, err // can't parse, assume valid
+	}
+	sel, ok := parsed.(*sqlparser.Select)
+	if !ok || len(sel.SelectExprs.Exprs) == 0 {
+		return true, fmt.Errorf("could not parse check expression")
+	}
+	ae, ok := sel.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr)
+	if !ok {
+		return true, fmt.Errorf("could not parse check expression")
+	}
+	// Evaluate the expression with row context
+	val, err := e.evalRowExpr(ae.Expr, row)
+	if err != nil {
+		return true, err
+	}
+	if val == nil {
+		return true, nil // NULL result means constraint is satisfied (MySQL behavior)
+	}
+	return isTruthy(val), nil
 }
