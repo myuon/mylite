@@ -8408,10 +8408,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		} else if (sourceCharset == "ujis" || sourceCharset == "eucjpms") &&
 			(target == "utf8" || target == "utf8mb3" || target == "utf8mb4" || target == "ucs2" || target == "sjis" || target == "cp932") {
 			out = strings.ReplaceAll(out, "＼", "\\")
-			if target == "utf8" || target == "utf8mb3" || target == "utf8mb4" || target == "ucs2" {
-				out = strings.ReplaceAll(out, "～", "~")
-				out = strings.ReplaceAll(out, "〜", "~")
-			} else if (target == "sjis" || target == "cp932") && (strings.Contains(orig, "～") || strings.Contains(orig, "〜")) {
+			if (target == "sjis" || target == "cp932") && (strings.Contains(orig, "～") || strings.Contains(orig, "〜")) {
 				out = strings.ReplaceAll(out, "~", "～")
 				out = strings.ReplaceAll(out, "〜", "～")
 			}
@@ -8429,6 +8426,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			out = strings.ReplaceAll(out, "\\~", "\\～")
 			out = strings.ReplaceAll(out, "\\〜", "\\～")
 			out = strings.ReplaceAll(out, "\\∼", "\\～")
+			out = strings.ReplaceAll(out, "\\˜", "\\～")
 			out = strings.ReplaceAll(out, "??～??", "??~??")
 			if strings.Contains(out, "∥｜…‥") {
 				out = strings.ReplaceAll(out, "~", "～")
@@ -15849,50 +15847,9 @@ func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error)
 								for k, pk := range pkCols {
 									vals[k] = fmt.Sprintf("%v", candidate[pk])
 								}
-								dupErr := mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key 'PRIMARY'", strings.Join(vals, "-")))
-								if bool(stmt.Ignore) {
-									e.addWarning("Warning", 1062, strings.TrimPrefix(dupErr.Error(), "ERROR 1062 (23000): "))
-									matchPK = false
-									break
-								}
 								tbl.Unlock()
-								return nil, dupErr
+								return nil, mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key 'PRIMARY'", strings.Join(vals, "-")))
 							}
-						}
-					}
-					if bool(stmt.Ignore) {
-						// If duplicate was detected under IGNORE, skip this row update.
-						pkCols := make([]string, 0, len(tbl.Def.PrimaryKey))
-						if len(tbl.Def.PrimaryKey) > 0 {
-							pkCols = append(pkCols, tbl.Def.PrimaryKey...)
-						} else {
-							for _, col := range tbl.Def.Columns {
-								if col.PrimaryKey {
-									pkCols = append(pkCols, col.Name)
-								}
-							}
-						}
-						dupFound := false
-						if len(pkCols) > 0 {
-							for j, other := range tbl.Rows {
-								if j == i {
-									continue
-								}
-								matchPK := true
-								for _, pk := range pkCols {
-									if fmt.Sprintf("%v", other[pk]) != fmt.Sprintf("%v", candidate[pk]) {
-										matchPK = false
-										break
-									}
-								}
-								if matchPK {
-									dupFound = true
-									break
-								}
-							}
-						}
-						if dupFound {
-							continue
 						}
 					}
 
