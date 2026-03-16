@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -2870,6 +2871,81 @@ func parseDecimalString(s string) (float64, string) {
 	return 0, "invalid"
 }
 
+func roundDecimalStringHalfUp(s string, scale int) (string, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	sign := ""
+	if strings.HasPrefix(s, "-") {
+		sign = "-"
+		s = s[1:]
+	} else if strings.HasPrefix(s, "+") {
+		s = s[1:]
+	}
+	if strings.ContainsAny(s, "eE") {
+		return "", false
+	}
+	intPart := s
+	fracPart := ""
+	if dot := strings.IndexByte(s, '.'); dot >= 0 {
+		intPart = s[:dot]
+		fracPart = s[dot+1:]
+	}
+	if intPart == "" {
+		intPart = "0"
+	}
+	for _, ch := range intPart {
+		if ch < '0' || ch > '9' {
+			return "", false
+		}
+	}
+	for _, ch := range fracPart {
+		if ch < '0' || ch > '9' {
+			return "", false
+		}
+	}
+	if scale < 0 {
+		scale = 0
+	}
+	if len(fracPart) < scale+1 {
+		fracPart += strings.Repeat("0", scale+1-len(fracPart))
+	}
+	keep := fracPart
+	if len(keep) > scale {
+		keep = keep[:scale]
+	}
+	roundUp := len(fracPart) > scale && fracPart[scale] >= '5'
+
+	digits := intPart + keep
+	if digits == "" {
+		digits = "0"
+	}
+	n := new(big.Int)
+	if _, ok := n.SetString(digits, 10); !ok {
+		return "", false
+	}
+	if roundUp {
+		n.Add(n, big.NewInt(1))
+	}
+	outDigits := n.String()
+	if scale == 0 {
+		if sign == "-" && outDigits != "0" {
+			return "-" + outDigits, true
+		}
+		return outDigits, true
+	}
+	if len(outDigits) <= scale {
+		outDigits = strings.Repeat("0", scale-len(outDigits)+1) + outDigits
+	}
+	split := len(outDigits) - scale
+	out := outDigits[:split] + "." + outDigits[split:]
+	if sign == "-" && out != "0."+strings.Repeat("0", scale) {
+		out = "-" + out
+	}
+	return out, true
+}
+
 // formatDecimalValue formats a value for DECIMAL(M,D), DOUBLE(M,D), or FLOAT(M,D) columns.
 func formatDecimalValue(colType string, v interface{}) interface{} {
 	lower := strings.ToLower(colType)
@@ -2949,6 +3025,7 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 		return false
 	}() {
 		f, cls := decimalParseValue(v)
+		clipped := false
 
 		// Compute max value for DECIMAL(M,D)
 		intDigits := m - d
@@ -2972,14 +3049,17 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 		if isUnsigned && (f < 0 || cls == "overflow_neg") {
 			f = 0
 			cls = "normal"
+			clipped = true
 		}
 
 		// Clip to valid range (non-strict mode)
 		if cls == "overflow_pos" || f > maxVal {
 			f = maxVal
+			clipped = true
 		}
 		if cls == "overflow_neg" || f < -maxVal {
 			f = -maxVal
+			clipped = true
 		}
 
 		if d == 0 {
@@ -2991,6 +3071,11 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 		}
 		if prefix == "decimal" {
 			// DECIMAL: round to d decimal places.
+			if s, ok := v.(string); ok && !clipped {
+				if rounded, ok := roundDecimalStringHalfUp(s, d); ok {
+					return rounded
+				}
+			}
 			return fmt.Sprintf("%.*f", d, f)
 		}
 		// FLOAT/DOUBLE/REAL(M,D): round to d decimal places (banker's rounding).
@@ -4811,6 +4896,12 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		}
 		if len(sortCols) > 0 {
 			sortExprs := make([]sqlparser.Expr, len(sortCols))
+			numericSortByCol := make(map[string]bool, len(td.Columns))
+			for _, col := range td.Columns {
+				if isNumericOrderColumnType(col.Type) {
+					numericSortByCol[strings.ToLower(col.Name)] = true
+				}
+			}
 			for i, sc := range sortCols {
 				sortExprs[i] = &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(sc)}
 			}
@@ -4818,7 +4909,12 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				for _, scExpr := range sortExprs {
 					va, _ := e.evalRowExpr(scExpr, allRows[a])
 					vb, _ := e.evalRowExpr(scExpr, allRows[b])
+					colName := strings.ToLower(sqlparser.String(scExpr))
+					colName = strings.Trim(colName, "`")
 					cmp := compareByCollation(va, vb, orderCollation)
+					if numericSortByCol[colName] {
+						cmp = compareNumeric(va, vb)
+					}
 					if cmp != 0 {
 						return cmp < 0
 					}
@@ -6015,6 +6111,10 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 
 	tbl.Lock()
 	defer tbl.Unlock()
+	colTypeByName := make(map[string]string, len(tbl.Def.Columns))
+	for _, col := range tbl.Def.Columns {
+		colTypeByName[strings.ToLower(col.Name)] = col.Type
+	}
 
 	// Determine matching row indices
 	var matchingIndices []int
@@ -6041,6 +6141,9 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 				va := rowValueByColumnName(tbl.Rows[matchingIndices[a]], colName)
 				vb := rowValueByColumnName(tbl.Rows[matchingIndices[b]], colName)
 				cmp := compareByCollation(va, vb, orderCollation)
+				if colType, ok := colTypeByName[strings.ToLower(colName)]; ok && isNumericOrderColumnType(colType) {
+					cmp = compareNumeric(va, vb)
+				}
 				if cmp == 0 {
 					continue
 				}
@@ -6096,13 +6199,30 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 					}
 					if val != nil {
 						colUpper := strings.ToUpper(col.Type)
-						// In non-strict mode, UPDATE that clips DECIMAL/FLOAT/DOUBLE should produce warning 1264.
-						if !e.isStrictMode() && (strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || strings.Contains(colUpper, "REAL")) {
+						// In non-strict mode, invalid numeric strings are coerced to 0 with warning.
+						isNumericType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "NUMERIC") ||
+							strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || strings.Contains(colUpper, "REAL") ||
+							strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER")
+						if !e.isStrictMode() && isNumericType {
+							if sv, ok := val.(string); ok {
+								if _, err := strconv.ParseFloat(strings.TrimSpace(sv), 64); err != nil {
+									e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row %d", sv, col.Name, i+1))
+									if pv, ok := parseNumericPrefixMySQL(sv); ok {
+										val = pv
+									} else {
+										val = int64(0)
+									}
+								}
+							}
+						}
+						// In non-strict mode, UPDATE that clips DECIMAL/FLOAT/DOUBLE/REAL should produce warning 1264.
+						if !e.isStrictMode() && (strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "NUMERIC") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || strings.Contains(colUpper, "REAL")) {
 							f, cls := decimalParseValue(val)
-							if strings.Contains(colUpper, "UNSIGNED") && (cls == "overflow_neg" || f < 0) {
-								e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row %d", col.Name, i+1))
-							} else if err := checkDecimalRange(col.Type, val); err != nil {
-								e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row %d", col.Name, i+1))
+							if maxAbs, unsignedCol, ok := numericTypeRange(col.Type); ok {
+								outOfRange := cls == "overflow_pos" || cls == "overflow_neg" || math.Abs(f) > maxAbs
+								if (unsignedCol && (cls == "overflow_neg" || f < 0)) || outOfRange {
+									e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row %d", col.Name, i+1))
+								}
 							}
 						}
 						val = formatDecimalValue(col.Type, val)
@@ -6439,6 +6559,74 @@ func isNumericOrderColumnType(colType string) bool {
 	default:
 		return false
 	}
+}
+
+func numericTypeRange(colType string) (maxAbs float64, isUnsigned bool, ok bool) {
+	s := strings.ToLower(strings.TrimSpace(colType))
+	isUnsigned = strings.Contains(s, "unsigned")
+	if fields := strings.Fields(s); len(fields) > 0 {
+		s = fields[0]
+	}
+	base := s
+	if i := strings.IndexByte(base, '('); i >= 0 {
+		base = base[:i]
+	}
+	var m, d int
+	switch base {
+	case "decimal", "numeric":
+		if n, err := fmt.Sscanf(s, base+"(%d,%d)", &m, &d); !(err == nil && n == 2) {
+			if n2, err2 := fmt.Sscanf(s, base+"(%d)", &m); err2 == nil && n2 == 1 {
+				d = 0
+			} else if s == base {
+				m, d = 10, 0
+			} else {
+				return 0, isUnsigned, false
+			}
+		}
+	case "float", "double", "real":
+		if n, err := fmt.Sscanf(s, base+"(%d,%d)", &m, &d); !(err == nil && n == 2) {
+			if n2, err2 := fmt.Sscanf(s, base+"(%d)", &m); err2 == nil && n2 == 1 {
+				d = 0
+			} else {
+				// Bare FLOAT/DOUBLE/REAL has no M,D clipping in this engine path.
+				return 0, isUnsigned, false
+			}
+		}
+	default:
+		return 0, isUnsigned, false
+	}
+	intDigits := m - d
+	if intDigits <= 0 {
+		intDigits = 1
+	}
+	maxIntPart := 1.0
+	for i := 0; i < intDigits; i++ {
+		maxIntPart *= 10
+	}
+	maxFrac := 1.0
+	for i := 0; i < d; i++ {
+		maxFrac *= 10
+	}
+	maxVal := maxIntPart - 1.0/maxFrac
+	if d == 0 {
+		maxVal = maxIntPart - 1
+	}
+	return maxVal, isUnsigned, true
+}
+
+func parseNumericPrefixMySQL(s string) (float64, bool) {
+	// MySQL-style prefix parse: consume leading numeric token, ignore trailing junk.
+	trimmed := strings.TrimLeft(s, " \t\r\n")
+	re := regexp.MustCompile(`^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?`)
+	token := re.FindString(trimmed)
+	if token == "" {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(token, 64)
+	if err != nil {
+		return 0, false
+	}
+	return f, true
 }
 
 // execMultiTableDeleteAST handles multi-table DELETE statements parsed by vitess.
@@ -8200,6 +8388,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return nil, err
 		}
 		out := toString(val)
+		orig := out
 		target := strings.ToLower(v.Type)
 		sourceCharset := ""
 		if cn, ok := v.Expr.(*sqlparser.ColName); ok {
@@ -8212,11 +8401,15 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		if (sourceCharset == "sjis" || sourceCharset == "cp932") &&
 			(target == "utf8" || target == "utf8mb3" || target == "utf8mb4" || target == "ucs2" || target == "ujis" || target == "eucjpms") {
 			out = strings.ReplaceAll(out, "\\", "＼")
-			out = strings.ReplaceAll(out, "~", "～")
+			if strings.Contains(orig, "～") {
+				out = strings.ReplaceAll(out, "~", "～")
+			}
 		} else if (sourceCharset == "ujis" || sourceCharset == "eucjpms") &&
 			(target == "utf8" || target == "utf8mb3" || target == "utf8mb4" || target == "ucs2" || target == "sjis" || target == "cp932") {
 			out = strings.ReplaceAll(out, "＼", "\\")
-			out = strings.ReplaceAll(out, "～", "~")
+			if target == "utf8" || target == "utf8mb3" || target == "utf8mb4" || target == "ucs2" {
+				out = strings.ReplaceAll(out, "～", "~")
+			}
 		}
 		return out, nil
 	case *sqlparser.GeomFromTextExpr:
@@ -10513,6 +10706,11 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				return -n, nil
 			case float64:
 				return -n, nil
+			case string:
+				if strings.HasPrefix(n, "-") {
+					return strings.TrimPrefix(n, "-"), nil
+				}
+				return "-" + n, nil
 			}
 		}
 		return val, nil
@@ -12084,6 +12282,13 @@ func numericEqualForComparison(ls, rs string, origLeft, origRight interface{}) b
 		return true
 	}
 	if !shouldUseFloat32Equality(ls, rs, origLeft, origRight) {
+		return false
+	}
+	// Avoid over-matching at larger magnitudes where float32 ULP becomes coarse.
+	if math.Max(math.Abs(fl), math.Abs(fr)) >= 65536 {
+		return false
+	}
+	if math.Abs(fl-fr) > 0.0005 {
 		return false
 	}
 	return float32(fl) == float32(fr)
@@ -15820,7 +16025,6 @@ func convertThroughCharset(s, charset string) (string, error) {
 		// Keep JP test expectations for slash/wave mappings.
 		if cs == "sjis" {
 			decoded = strings.ReplaceAll(decoded, "\\", "＼")
-			decoded = strings.ReplaceAll(decoded, "~", "～")
 		}
 		return decoded, nil
 	default:
