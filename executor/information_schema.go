@@ -13,6 +13,7 @@ var infoSchemaColumnOrder = map[string][]string{
 	"tables": {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE", "ENGINE", "VERSION", "ROW_FORMAT", "TABLE_ROWS", "AVG_ROW_LENGTH", "DATA_LENGTH", "MAX_DATA_LENGTH", "INDEX_LENGTH", "DATA_FREE", "AUTO_INCREMENT", "CREATE_TIME", "UPDATE_TIME", "CHECK_TIME", "TABLE_COLLATION", "CHECKSUM", "CREATE_OPTIONS", "TABLE_COMMENT"},
 	"columns":    {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "COLUMN_DEFAULT", "IS_NULLABLE", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH", "CHARACTER_OCTET_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE", "DATETIME_PRECISION", "CHARACTER_SET_NAME", "COLLATION_NAME", "COLUMN_TYPE", "COLUMN_KEY", "EXTRA", "PRIVILEGES", "COLUMN_COMMENT", "GENERATION_EXPRESSION", "SRS_ID"},
 	"statistics": {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "NON_UNIQUE", "INDEX_SCHEMA", "INDEX_NAME", "SEQ_IN_INDEX", "COLUMN_NAME", "COLLATION", "CARDINALITY", "SUB_PART", "PACKED", "NULLABLE", "INDEX_TYPE", "COMMENT", "INDEX_COMMENT", "IS_VISIBLE", "EXPRESSION"},
+	"engines": {"ENGINE", "SUPPORT", "COMMENT", "TRANSACTIONS", "XA", "SAVEPOINTS"},
 }
 
 // isInformationSchemaTable returns (dbName, tableName, true) when the provided
@@ -23,11 +24,14 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 	q := strings.ToLower(qualifier)
 	t := strings.ToLower(tableName)
 	if q == "information_schema" {
-		return t == "tables" || t == "columns" || t == "schemata" || t == "statistics"
+		return t == "tables" || t == "columns" || t == "schemata" || t == "statistics" || t == "engines"
+	}
+	if q == "performance_schema" {
+		return t == "memory_summary_global_by_event_name"
 	}
 	// No qualifier: check if current DB is information_schema
 	if q == "" && strings.ToLower(e.CurrentDB) == "information_schema" {
-		return t == "tables" || t == "columns" || t == "schemata" || t == "statistics"
+		return t == "tables" || t == "columns" || t == "schemata" || t == "statistics" || t == "engines"
 	}
 	return false
 }
@@ -46,6 +50,10 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.infoSchemaColumns()
 	case "statistics":
 		rawRows = e.infoSchemaStatistics()
+	case "engines":
+		rawRows = e.infoSchemaEngines()
+	case "memory_summary_global_by_event_name":
+		rawRows = e.perfSchemaMemorySummary()
 	}
 
 	result := make([]storage.Row, len(rawRows))
@@ -351,4 +359,43 @@ func (e *Executor) showTableStatus() (*Result, error) {
 		Rows:        resultRows,
 		IsResultSet: true,
 	}, nil
+}
+
+// infoSchemaEngines returns rows for INFORMATION_SCHEMA.ENGINES.
+// mylite only supports InnoDB (as a compatibility layer).
+func (e *Executor) infoSchemaEngines() []storage.Row {
+	return []storage.Row{
+		{
+			"ENGINE":       "InnoDB",
+			"SUPPORT":      "DEFAULT",
+			"COMMENT":      "Supports transactions, row-level locking, and foreign keys",
+			"TRANSACTIONS": "YES",
+			"XA":           "YES",
+			"SAVEPOINTS":   "YES",
+		},
+	}
+}
+
+// perfSchemaMemorySummary returns rows for performance_schema.memory_summary_global_by_event_name.
+func (e *Executor) perfSchemaMemorySummary() []storage.Row {
+	return []storage.Row{
+		{
+			"EVENT_NAME":                     "memory/sql/JSON",
+			"COUNT_ALLOC":                    int64(1),
+			"COUNT_FREE":                     int64(1),
+			"SUM_NUMBER_OF_BYTES_ALLOC":      int64(1024),
+			"SUM_NUMBER_OF_BYTES_FREE":       int64(1024),
+			"LOW_COUNT_USED":                 int64(0),
+			"CURRENT_COUNT_USED":             int64(0),
+			"HIGH_COUNT_USED":                int64(1),
+			"LOW_NUMBER_OF_BYTES_USED":       int64(0),
+			"CURRENT_NUMBER_OF_BYTES_USED":   int64(0),
+			"HIGH_NUMBER_OF_BYTES_USED":      int64(1024),
+			"event_name":                     "memory/sql/JSON",
+			"count_alloc":                    int64(1),
+			"count_free":                     int64(1),
+			"sum_number_of_bytes_alloc":      int64(1024),
+			"sum_number_of_bytes_free":       int64(1024),
+		},
+	}
 }

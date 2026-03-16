@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,6 +22,9 @@ import (
 	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/transform"
 )
+
+// errSkipTest is a sentinel error indicating the test should be skipped.
+var errSkipTest = errors.New("skip test")
 
 // TestResult represents the outcome of running a single .test file.
 type TestResult struct {
@@ -138,6 +142,9 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		return TestResult{Name: name, Error: "timeout: test took too long"}
 	}
 	ctx := ectx
+	if errors.Is(err, errSkipTest) {
+		return TestResult{Name: name, Skipped: true}
+	}
 	if err != nil {
 		return TestResult{
 			Name:   name,
@@ -265,34 +272,17 @@ func (ctx *execContext) executeLines(lines []string) error {
 			continue
 		}
 
-		// Handle perl blocks: skip until EOF
-		if trimmed == "perl;" || trimmed == "--perl" || trimmed == "perl" {
-			i++
-			for i < len(lines) {
-				t := strings.TrimSpace(lines[i])
-				i++
-				if t == "EOF" {
-					break
-				}
+		// Handle if/while blocks
+		ifHandled, ifSkip, newI := ctx.handleIfBlock(lines, i)
+		if ifHandled {
+			if ifSkip {
+				return errSkipTest
 			}
+			i = newI
 			continue
 		}
 
-		// Handle write_file/append_file blocks: skip until EOF
-		if strings.HasPrefix(trimmed, "write_file ") || strings.HasPrefix(trimmed, "--write_file ") ||
-			strings.HasPrefix(trimmed, "append_file ") || strings.HasPrefix(trimmed, "--append_file ") {
-			i++
-			for i < len(lines) {
-				t := strings.TrimSpace(lines[i])
-				i++
-				if t == "EOF" {
-					break
-				}
-			}
-			continue
-		}
-
-		// Skip { } blocks (from if/while directives)
+		// Skip { } blocks (from unhandled if/while directives)
 		if trimmed == "{" {
 			depth := 1
 			i++
@@ -347,11 +337,11 @@ func (ctx *execContext) executeLines(lines []string) error {
 			directive = strings.TrimSpace(directive)
 
 			handled, skip, err := ctx.handleDirective(directive)
-			if err != nil {
+			if err != nil && !errors.Is(err, errSkipTest) {
 				return fmt.Errorf("line %d: %v", i+1, err)
 			}
 			if skip {
-				return nil // --skip: stop execution
+				return errSkipTest
 			}
 			if handled {
 				i++
@@ -363,12 +353,38 @@ func (ctx *execContext) executeLines(lines []string) error {
 		// Handle bare directives (without -- prefix): eval, let, echo, source, skip,
 		// enable_warnings, disable_warnings, etc.
 		if bareDirective, ok := extractBareDirective(trimmed); ok {
+			// For 'let' directives, collect multiline values until ';'
+			// but only if the value doesn't end with a backtick (single-line query)
+			bdLower := strings.ToLower(bareDirective)
+			if strings.HasPrefix(bdLower, "let ") {
+				letVal := strings.TrimSpace(bareDirective)
+				// Check if value is incomplete (doesn't end with ';' and not a backtick expression)
+				isBacktickExpr := false
+				if eqIdx := strings.Index(letVal, "="); eqIdx >= 0 {
+					rhs := strings.TrimSpace(letVal[eqIdx+1:])
+					isBacktickExpr = strings.HasPrefix(rhs, "`") && strings.HasSuffix(rhs, "`")
+				}
+				if !isBacktickExpr && !strings.HasSuffix(letVal, ";") {
+					fullDirective := bareDirective
+					i++
+					for i < len(lines) {
+						l := strings.TrimSpace(lines[i])
+						fullDirective += "\n" + l
+						i++
+						if strings.HasSuffix(l, ";") {
+							fullDirective = strings.TrimSuffix(fullDirective, ";")
+							break
+						}
+					}
+					bareDirective = fullDirective
+				}
+			}
 			handled, skip, err := ctx.handleDirective(bareDirective)
-			if err != nil {
+			if err != nil && !errors.Is(err, errSkipTest) {
 				return fmt.Errorf("line %d: %v", i+1, err)
 			}
 			if skip {
-				return nil
+				return errSkipTest
 			}
 			if handled {
 				i++
@@ -511,8 +527,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 
 	switch name {
 	case "skip":
-		ctx.skipped = true
-		return true, true, nil
+		return true, true, errSkipTest
 
 	case "error":
 		ctx.expectedError = args
@@ -559,7 +574,11 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		return true, false, ctx.setVariable(args)
 
 	case "source":
-		return true, false, ctx.sourceFile(args)
+		err := ctx.sourceFile(args)
+		if errors.Is(err, errSkipTest) {
+			return true, true, errSkipTest
+		}
+		return true, false, err
 
 	case "delimiter":
 		newDelim := strings.TrimSpace(args)
@@ -688,6 +707,177 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 	return false, false, nil
 }
 
+// handleIfBlock checks if the current line is an "if" construct and handles it.
+// Returns (handled, skip, newIndex).
+// "skip" is true when --skip was executed inside the block.
+func (ctx *execContext) handleIfBlock(lines []string, i int) (handled bool, skip bool, newI int) {
+	trimmed := strings.TrimSpace(lines[i])
+
+	// Check for if directive: --if or bare if
+	var condStr string
+	if strings.HasPrefix(trimmed, "--") {
+		d := strings.TrimSpace(strings.TrimPrefix(trimmed, "--"))
+		dl := strings.ToLower(d)
+		if !strings.HasPrefix(dl, "if ") && !strings.HasPrefix(dl, "if(") {
+			return false, false, i
+		}
+		condStr = strings.TrimSpace(d[2:])
+	} else if strings.HasPrefix(strings.ToLower(trimmed), "if (") || strings.HasPrefix(strings.ToLower(trimmed), "if(") {
+		condStr = strings.TrimSpace(trimmed[2:])
+	} else {
+		return false, false, i
+	}
+
+	i++ // consume the if line
+
+	// The condition may span multiple lines until we find the closing )
+	// Collect the full condition
+	for !isConditionComplete(condStr) && i < len(lines) {
+		condStr += "\n" + strings.TrimSpace(lines[i])
+		i++
+	}
+
+	// Now find the { and collect the block
+	for i < len(lines) {
+		t := strings.TrimSpace(lines[i])
+		if t == "" || strings.HasPrefix(t, "#") {
+			i++
+			continue
+		}
+		if t == "{" {
+			i++
+			break
+		}
+		// Opening brace might be on the same line as if condition
+		break
+	}
+
+	// Collect block lines
+	var blockLines []string
+	depth := 1
+	for i < len(lines) && depth > 0 {
+		t := strings.TrimSpace(lines[i])
+		if t == "{" {
+			depth++
+		} else if t == "}" {
+			depth--
+			if depth == 0 {
+				i++
+				break
+			}
+		}
+		if depth > 0 {
+			blockLines = append(blockLines, lines[i])
+		}
+		i++
+	}
+
+	// Evaluate condition
+	condResult := ctx.evaluateIfCondition(condStr)
+	if condResult {
+		err := ctx.executeLines(blockLines)
+		if errors.Is(err, errSkipTest) {
+			return true, true, i
+		}
+		if err != nil {
+			// Non-skip error - continue past the block
+			return true, false, i
+		}
+	}
+
+	return true, false, i
+}
+
+func isConditionComplete(s string) bool {
+	// Count parentheses
+	depth := 0
+	inBacktick := false
+	for _, c := range s {
+		if c == '`' {
+			inBacktick = !inBacktick
+		}
+		if !inBacktick {
+			if c == '(' {
+				depth++
+			} else if c == ')' {
+				depth--
+			}
+		}
+	}
+	return depth <= 0
+}
+
+func (ctx *execContext) evaluateIfCondition(condStr string) bool {
+	// Remove outer parentheses
+	condStr = strings.TrimSpace(condStr)
+	if strings.HasPrefix(condStr, "(") && strings.HasSuffix(condStr, ")") {
+		condStr = condStr[1 : len(condStr)-1]
+		condStr = strings.TrimSpace(condStr)
+	}
+
+	// Handle negation
+	negated := false
+	if strings.HasPrefix(condStr, "!") {
+		negated = true
+		condStr = strings.TrimSpace(condStr[1:])
+	}
+
+	evalCond := func() bool {
+		// Check for backtick query expression
+		return ctx.evaluateIfConditionInner(condStr)
+	}
+
+	result := evalCond()
+	if negated {
+		return !result
+	}
+	return result
+}
+
+func (ctx *execContext) evaluateIfConditionInner(condStr string) bool {
+	// Check for backtick query expression
+	if strings.HasPrefix(condStr, "`") && strings.HasSuffix(condStr, "`") {
+		query := condStr[1 : len(condStr)-1]
+		query = ctx.substituteVars(query)
+		// Execute query and check result
+		rows, err := ctx.db.Query(query)
+		if err != nil {
+			return false
+		}
+		defer rows.Close()
+		if rows.Next() {
+			var val interface{}
+			if err := rows.Scan(&val); err != nil {
+				return false
+			}
+			if val == nil {
+				return false
+			}
+			s := fmt.Sprintf("%v", val)
+			// In mysqltest, backtick returns "1" for true
+			return s != "0" && s != "" && s != "FALSE"
+		}
+		return false
+	}
+
+	// Check for variable comparison
+	condStr = ctx.substituteVars(condStr)
+
+	// Simple variable truth check: $var
+	if strings.HasPrefix(condStr, "$") {
+		val, ok := ctx.variables[condStr]
+		return ok && val != "" && val != "0"
+	}
+
+	// Numeric check
+	n, err := strconv.Atoi(condStr)
+	if err == nil {
+		return n != 0
+	}
+
+	return condStr != "" && condStr != "0"
+}
+
 func (ctx *execContext) executeSQL(stmt string) error {
 	// Variable substitution
 	stmt = ctx.substituteVars(stmt)
@@ -707,6 +897,23 @@ func (ctx *execContext) executeSQLNoEcho(stmt string) error {
 }
 
 func (ctx *execContext) executeSQLInner(stmt string) error {
+	// Strip trailing # comments from SQL (MySQL treats # as line comment)
+	lines := strings.Split(stmt, "\n")
+	for i, l := range lines {
+		if idx := strings.Index(l, " #"); idx >= 0 {
+			// Only strip if not inside a string
+			inStr := false
+			for j := 0; j < idx; j++ {
+				if l[j] == '\'' {
+					inStr = !inStr
+				}
+			}
+			if !inStr {
+				lines[i] = l[:idx]
+			}
+		}
+	}
+	stmt = strings.TrimSpace(strings.Join(lines, "\n"))
 	upper := strings.ToUpper(strings.TrimSpace(stmt))
 	isQuery := strings.HasPrefix(upper, "SELECT") ||
 		strings.HasPrefix(upper, "SHOW") ||

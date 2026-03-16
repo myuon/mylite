@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -137,6 +138,8 @@ type Executor struct {
 	tempTables     map[string]bool
 	// globalVars stores SET GLOBAL/SESSION variable overrides.
 	globalVars     map[string]string
+	// views stores view definitions (view name -> SELECT query string).
+	views          map[string]string
 }
 
 func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
@@ -301,8 +304,13 @@ func uppercaseSQLKeywords(s string) string {
 		"union", "except", "intersect", "distinct", "between", "like", "is",
 		"null", "true", "false", "case", "when", "then", "else", "end",
 		"asc", "desc", "count", "sum", "avg", "min", "max", "upper", "lower",
-		"row", "with",
-		"leading", "trailing", "both",
+		"row", "with", "cast", "convert", "json_extract", "json_valid", "json_type",
+		"json_depth", "json_length", "json_keys", "json_array", "json_object",
+		"json_merge_preserve", "json_merge_patch", "json_contains", "json_contains_path",
+		"json_set", "json_insert", "json_replace", "json_remove", "json_unquote",
+		"json_quote", "json_pretty", "json_storage_size", "json_storage_free",
+		"json_overlaps", "json_search", "json_value", "json_arrayagg", "json_objectagg",
+		"json_schema_valid", "json_schema_validation_report",
 	}
 	result := []byte(s)
 	for _, kw := range keywords {
@@ -613,6 +621,13 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return e.execShow(s, query)
 	case *sqlparser.ExplainTab:
 		return e.execDescribe(s)
+	case *sqlparser.ExplainStmt:
+		// EXPLAIN SELECT ... - return a dummy explain result
+		return &Result{
+			Columns:     []string{"id", "select_type", "table", "partitions", "type", "possible_keys", "key", "key_len", "ref", "rows", "filtered", "Extra"},
+			Rows:        [][]interface{}{{int64(1), "SIMPLE", nil, nil, "ALL", nil, nil, nil, nil, int64(1), "100.00", nil}},
+			IsResultSet: true,
+		}, nil
 	case *sqlparser.Begin:
 		return e.execBegin()
 	case *sqlparser.Commit:
@@ -655,34 +670,29 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		// Simple CREATE PROCEDURE without BEGIN...END body (already handled above for complex ones)
 		return &Result{}, nil
 	case *sqlparser.CreateView:
-		// Accept CREATE VIEW silently
+		// Store view definition
+		viewName := s.ViewName.Name.String()
+		selectSQL := sqlparser.String(s.Select)
+		if e.views == nil {
+			e.views = make(map[string]string)
+		}
+		e.views[viewName] = selectSQL
 		return &Result{}, nil
 	case *sqlparser.DropView:
-		// Accept DROP VIEW silently
+		// Remove view definitions
+		for _, name := range s.FromTables {
+			viewName := name.Name.String()
+			if e.views != nil {
+				delete(e.views, viewName)
+			}
+		}
 		return &Result{}, nil
 	case *sqlparser.Union:
 		return e.execUnion(s)
 	case *sqlparser.RenameTable:
 		return e.execRenameTable(s)
-	case *sqlparser.Savepoint:
-		// Accept SAVEPOINT silently
-		return &Result{}, nil
-	case *sqlparser.SRollback:
-		// Accept ROLLBACK TO SAVEPOINT silently
-		return &Result{}, nil
-	case *sqlparser.Release:
-		// Accept RELEASE SAVEPOINT silently
-		return &Result{}, nil
-	case *sqlparser.ExplainStmt:
-		return e.execExplainStmt(s, query)
-	case *sqlparser.OtherAdmin:
-		// Handle OPTIMIZE TABLE, REPAIR TABLE, CHECK TABLE etc.
-		return e.execOtherAdmin(query)
-	case *sqlparser.CommentOnly:
-		// Accept comment-only statements silently
-		return &Result{}, nil
 	case *sqlparser.Flush:
-		// Accept FLUSH statements silently
+		// FLUSH STATUS, FLUSH TABLES, etc. - no-op
 		return &Result{}, nil
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %T", s)
@@ -941,6 +951,10 @@ func (e *Executor) execPrepare(stmt *sqlparser.PrepareStmt) (*Result, error) {
 	// The statement text is in stmt.Statement
 	query := sqlparser.String(stmt.Statement)
 	query = strings.Trim(query, "'\"")
+	// Unescape backslash-escaped characters from vitess serialization
+	query = strings.ReplaceAll(query, "\\'", "'")
+	query = strings.ReplaceAll(query, "\\\"", "\"")
+	query = strings.ReplaceAll(query, "\\\\", "\\")
 	e.preparedStmts[name] = query
 	return &Result{}, nil
 }
@@ -2534,6 +2548,28 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 		}
 		tbl, err := e.Storage.GetTable(lookupDB, lookupTable)
 		if err != nil {
+			// Check if it's a view
+			if e.views != nil {
+				if viewSQL, ok := e.views[lookupTable]; ok {
+					viewResult, err := e.Execute(viewSQL)
+					if err != nil {
+						return nil, err
+					}
+					// Convert view result to storage.Rows
+					rows := make([]storage.Row, 0, len(viewResult.Rows))
+					for _, vrow := range viewResult.Rows {
+						row := make(storage.Row)
+						for ci, col := range viewResult.Columns {
+							if ci < len(vrow) {
+								row[col] = vrow[ci]
+								row[alias+"."+col] = vrow[ci]
+							}
+						}
+						rows = append(rows, row)
+					}
+					return rows, nil
+				}
+			}
 			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", lookupDB, lookupTable))
 		}
 		raw := tbl.Scan()
@@ -2993,14 +3029,57 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	}, nil
 }
 
-// selectExprsHaveAggregates returns true if any select expression is an aggregate function.
+// selectExprsHaveAggregates returns true if any select expression is or contains an aggregate function.
 func selectExprsHaveAggregates(exprs []sqlparser.SelectExpr) bool {
 	for _, expr := range exprs {
 		ae, ok := expr.(*sqlparser.AliasedExpr)
 		if !ok {
 			continue
 		}
-		if isAggregateExpr(ae.Expr) {
+		if containsAggregate(ae.Expr) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsAggregate recursively checks if an expression contains an aggregate function.
+func containsAggregate(expr sqlparser.Expr) bool {
+	if isAggregateExpr(expr) {
+		return true
+	}
+	switch v := expr.(type) {
+	case *sqlparser.ComparisonExpr:
+		return containsAggregate(v.Left) || containsAggregate(v.Right)
+	case *sqlparser.BinaryExpr:
+		return containsAggregate(v.Left) || containsAggregate(v.Right)
+	case *sqlparser.FuncExpr:
+		for _, arg := range v.Exprs {
+			if containsAggregate(arg) {
+				return true
+			}
+		}
+	case *sqlparser.JSONValueMergeExpr:
+		if containsAggregate(v.JSONDoc) {
+			return true
+		}
+		for _, d := range v.JSONDocList {
+			if containsAggregate(d) {
+				return true
+			}
+		}
+	case *sqlparser.NotExpr:
+		return containsAggregate(v.Expr)
+	case *sqlparser.CaseExpr:
+		if v.Expr != nil && containsAggregate(v.Expr) {
+			return true
+		}
+		for _, w := range v.Whens {
+			if containsAggregate(w.Cond) || containsAggregate(w.Val) {
+				return true
+			}
+		}
+		if v.Else != nil && containsAggregate(v.Else) {
 			return true
 		}
 	}
@@ -3012,18 +3091,22 @@ func selectExprsHaveAggregates(exprs []sqlparser.SelectExpr) bool {
 func aggregateDisplayName(expr sqlparser.Expr) string {
 	s := sqlparser.String(expr)
 	// Replace lowercase function names with uppercase
-	for _, fn := range []string{"count", "sum", "avg", "min", "max"} {
+	for _, fn := range []string{"count", "sum", "avg", "min", "max", "json_arrayagg", "json_objectagg"} {
 		if strings.HasPrefix(s, fn+"(") {
-			return strings.ToUpper(fn) + s[len(fn):]
+			s = strings.ToUpper(fn) + s[len(fn):]
+			break
 		}
 	}
+	// Uppercase DISTINCT within aggregate
+	s = strings.ReplaceAll(s, "(distinct ", "(DISTINCT ")
 	return s
 }
 
 func isAggregateExpr(expr sqlparser.Expr) bool {
 	switch expr.(type) {
 	case *sqlparser.CountStar, *sqlparser.Count,
-		*sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg:
+		*sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg,
+		*sqlparser.JSONArrayAgg, *sqlparser.JSONObjectAgg:
 		return true
 	}
 	return false
@@ -3067,7 +3150,7 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 			} else if colName, ok := se.Expr.(*sqlparser.ColName); ok {
 				colNames = append(colNames, colName.Name.String())
 			} else {
-				colNames = append(colNames, sqlparser.String(se.Expr))
+				colNames = append(colNames, normalizeSQLDisplayName(sqlparser.String(se.Expr)))
 			}
 		default:
 			return nil, fmt.Errorf("unsupported select expression in GROUP BY: %T", expr)
@@ -3248,6 +3331,123 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		}
 		// MySQL AVG() returns DECIMAL with 4 decimal places by default.
 		return fmt.Sprintf("%.4f", sum/float64(count)), nil
+	case *sqlparser.JSONArrayAgg:
+		arr := make([]interface{}, 0)
+		for _, row := range groupRows {
+			val, err := evalRowExpr(e.Expr, row)
+			if err != nil {
+				return nil, err
+			}
+			arr = append(arr, toJSONValue(val))
+		}
+		return jsonMarshalMySQL(arr), nil
+	case *sqlparser.JSONObjectAgg:
+		obj := make(map[string]interface{})
+		// Need ordered keys for deterministic output, but MySQL uses insertion order
+		var keys []string
+		for _, row := range groupRows {
+			keyVal, err := evalRowExpr(e.Key, row)
+			if err != nil {
+				return nil, err
+			}
+			valVal, err := evalRowExpr(e.Value, row)
+			if err != nil {
+				return nil, err
+			}
+			k := toString(keyVal)
+			if _, exists := obj[k]; !exists {
+				keys = append(keys, k)
+			}
+			obj[k] = toJSONValue(valVal)
+		}
+		// Build JSON object in insertion order
+		var parts []string
+		for _, k := range keys {
+			kb, _ := json.Marshal(k)
+			parts = append(parts, string(kb)+": "+jsonMarshalMySQL(obj[k]))
+		}
+		return "{" + strings.Join(parts, ", ") + "}", nil
+	case *sqlparser.ComparisonExpr:
+		// Handle expressions like COUNT(*) = 0
+		left, err := evalAggregateExpr(e.Left, groupRows, repRow)
+		if err != nil {
+			return nil, err
+		}
+		right, err := evalAggregateExpr(e.Right, groupRows, repRow)
+		if err != nil {
+			return nil, err
+		}
+		result, err := compareValues(left, right, e.Operator)
+		if err != nil {
+			return nil, err
+		}
+		if result {
+			return int64(1), nil
+		}
+		return int64(0), nil
+	case *sqlparser.BinaryExpr:
+		left, err := evalAggregateExpr(e.Left, groupRows, repRow)
+		if err != nil {
+			return nil, err
+		}
+		right, err := evalAggregateExpr(e.Right, groupRows, repRow)
+		if err != nil {
+			return nil, err
+		}
+		return evalBinaryExpr(left, right, e.Operator)
+	case *sqlparser.FuncExpr:
+		// Handle functions wrapping aggregates, e.g. JSON_MERGE_PRESERVE(JSON_ARRAYAGG(b), ...)
+		if containsAggregate(e) {
+			tmpExec := &Executor{}
+			resolvedExprs := make([]sqlparser.Expr, len(e.Exprs))
+			for i, arg := range e.Exprs {
+				val, err := evalAggregateExpr(arg, groupRows, repRow)
+				if err != nil {
+					return nil, err
+				}
+				if val == nil {
+					resolvedExprs[i] = &sqlparser.NullVal{}
+				} else {
+					resolvedExprs[i] = &sqlparser.Literal{Type: sqlparser.StrVal, Val: toString(val)}
+				}
+			}
+			newFunc := *e
+			newFunc.Exprs = resolvedExprs
+			return tmpExec.evalFuncExpr(&newFunc)
+		}
+	case *sqlparser.JSONValueMergeExpr:
+		// Handle JSON_MERGE_PRESERVE(JSON_ARRAYAGG(b), ...)
+		if containsAggregate(expr) {
+			tmpExec := &Executor{}
+			docVal, err := evalAggregateExpr(e.JSONDoc, groupRows, repRow)
+			if err != nil {
+				return nil, err
+			}
+			resolvedDocList := make([]sqlparser.Expr, len(e.JSONDocList))
+			for i, d := range e.JSONDocList {
+				val, err := evalAggregateExpr(d, groupRows, repRow)
+				if err != nil {
+					return nil, err
+				}
+				if val == nil {
+					resolvedDocList[i] = &sqlparser.NullVal{}
+				} else {
+					resolvedDocList[i] = &sqlparser.Literal{Type: sqlparser.StrVal, Val: toString(val)}
+				}
+			}
+			var docExpr sqlparser.Expr
+			if docVal == nil {
+				docExpr = &sqlparser.NullVal{}
+			} else {
+				docExpr = &sqlparser.Literal{Type: sqlparser.StrVal, Val: toString(docVal)}
+			}
+			newMerge := &sqlparser.JSONValueMergeExpr{
+				Type:        e.Type,
+				JSONDoc:     docExpr,
+				JSONDocList: resolvedDocList,
+			}
+			return tmpExec.evalJSONValueMerge(newMerge)
+		}
 	}
 	// Non-aggregate: return value from representative row
 	return evalRowExpr(expr, repRow)
@@ -4993,7 +5193,12 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		case sqlparser.IntVal:
 			n, err := strconv.ParseInt(v.Val, 10, 64)
 			if err != nil {
-				return nil, fmt.Errorf("INT_OVERFLOW:%s", v.Val)
+				// Try unsigned 64-bit
+				u, err2 := strconv.ParseUint(v.Val, 10, 64)
+				if err2 != nil {
+					return nil, fmt.Errorf("INT_OVERFLOW:%s", v.Val)
+				}
+				return u, nil
 			}
 			return n, nil
 		case sqlparser.FloatVal, sqlparser.DecimalVal:
@@ -5034,6 +5239,26 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case sqlparser.BoolVal:
 		return bool(v), nil
 	case *sqlparser.ColName:
+		// If we have a row context (correlatedRow), look up the actual value
+		if e.correlatedRow != nil {
+			colName := v.Name.String()
+			if !v.Qualifier.IsEmpty() {
+				qualified := v.Qualifier.Name.String() + "." + colName
+				if val, ok := e.correlatedRow[qualified]; ok {
+					return val, nil
+				}
+			}
+			if val, ok := e.correlatedRow[colName]; ok {
+				return val, nil
+			}
+			// Case-insensitive fallback
+			upperName := strings.ToUpper(colName)
+			for k, rv := range e.correlatedRow {
+				if strings.ToUpper(k) == upperName {
+					return rv, nil
+				}
+			}
+		}
 		// Return column name as string for use in row lookup
 		return v.Name.String(), nil
 	case *sqlparser.Variable:
@@ -5196,6 +5421,33 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return toString(val), nil
 		case "DECIMAL", "FLOAT", "DOUBLE":
 			return toFloat(val), nil
+		case "DATETIME", "DATE", "TIME", "TIMESTAMP":
+			if val == nil {
+				return nil, nil
+			}
+			return toString(val), nil
+		case "BINARY", "VARBINARY":
+			return toString(val), nil
+		case "YEAR":
+			return toInt64(val), nil
+		case "JSON":
+			if val == nil {
+				return nil, nil
+			}
+			s := toString(val)
+			var js interface{}
+			if err := json.Unmarshal([]byte(s), &js); err != nil {
+				// Non-JSON types (datetime, date, etc.) get wrapped as JSON strings
+				switch val.(type) {
+				case int64:
+					return jsonMarshalMySQL(float64(toInt64(val))), nil
+				case float64:
+					return jsonMarshalMySQL(val), nil
+				}
+				b, _ := json.Marshal(s)
+				return string(b), nil
+			}
+			return jsonMarshalMySQL(js), nil
 		}
 		return val, nil
 	case *sqlparser.CaseExpr:
@@ -5312,8 +5564,47 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		// e.g. _latin1 'string' — ignore the charset and evaluate the inner expression
 		return e.evalExpr(v.Expr)
 	case *sqlparser.CastExpr:
-		// Simplified CAST: just evaluate the inner expression
-		return e.evalExpr(v.Expr)
+		// CAST(expr AS type) - similar to ConvertExpr
+		val, err := e.evalExpr(v.Expr)
+		if err != nil {
+			return nil, err
+		}
+		if v.Type != nil {
+			typeName := strings.ToUpper(v.Type.Type)
+			switch typeName {
+			case "SIGNED", "INT", "INTEGER", "BIGINT":
+				return toInt64(val), nil
+			case "UNSIGNED":
+				return toInt64(val), nil
+			case "CHAR", "VARCHAR", "TEXT":
+				return toString(val), nil
+			case "DECIMAL", "FLOAT", "DOUBLE":
+				return toFloat(val), nil
+			case "DATETIME", "DATE", "TIME", "TIMESTAMP":
+				if val == nil {
+					return nil, nil
+				}
+				return toString(val), nil
+			case "JSON":
+				if val == nil {
+					return nil, nil
+				}
+				s := toString(val)
+				var js interface{}
+				if err := json.Unmarshal([]byte(s), &js); err != nil {
+					switch val.(type) {
+					case int64:
+						return jsonMarshalMySQL(float64(toInt64(val))), nil
+					case float64:
+						return jsonMarshalMySQL(val), nil
+					}
+					b, _ := json.Marshal(s)
+					return string(b), nil
+				}
+				return jsonMarshalMySQL(js), nil
+			}
+		}
+		return val, nil
 	case *sqlparser.CurTimeFuncExpr:
 		// NOW(), CURRENT_TIMESTAMP(), CURTIME(), etc.
 		name := strings.ToLower(v.Name.String())
@@ -5346,94 +5637,81 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return int64(0), nil
 		}
 		return int64(1), nil
-	case *sqlparser.InsertExpr:
-		// INSERT(str, pos, len, newstr) - inserts newstr into str at position pos, replacing len characters.
-		strVal, err := e.evalExpr(v.Str)
+	case *sqlparser.IsExpr:
+		val, err := e.evalExpr(v.Left)
 		if err != nil {
 			return nil, err
 		}
-		if strVal == nil {
-			return nil, nil
+		var result bool
+		switch v.Right {
+		case sqlparser.IsNullOp:
+			result = val == nil
+		case sqlparser.IsNotNullOp:
+			result = val != nil
+		case sqlparser.IsTrueOp:
+			result = isTruthy(val)
+		case sqlparser.IsFalseOp:
+			result = !isTruthy(val)
 		}
-		posVal, err := e.evalExpr(v.Pos)
-		if err != nil {
-			return nil, err
-		}
-		lenVal, err := e.evalExpr(v.Len)
-		if err != nil {
-			return nil, err
-		}
-		newStrVal, err := e.evalExpr(v.NewStr)
-		if err != nil {
-			return nil, err
-		}
-		if posVal == nil || lenVal == nil || newStrVal == nil {
-			return nil, nil
-		}
-		s := []rune(toString(strVal))
-		pos := int(toInt64(posVal))
-		length := int(toInt64(lenVal))
-		newStr := toString(newStrVal)
-		if pos < 1 || pos > len(s)+1 {
-			return toString(strVal), nil
-		}
-		pos-- // 1-based to 0-based
-		end := pos + length
-		if end > len(s) {
-			end = len(s)
-		}
-		result := string(s[:pos]) + newStr + string(s[end:])
-		return result, nil
-	case *sqlparser.LocateExpr:
-		// LOCATE(substr, str[, pos]) - returns position of first occurrence of substr in str.
-		subVal, err := e.evalExpr(v.SubStr)
-		if err != nil {
-			return nil, err
-		}
-		strVal, err := e.evalExpr(v.Str)
-		if err != nil {
-			return nil, err
-		}
-		if subVal == nil || strVal == nil {
-			return nil, nil
-		}
-		s := []rune(toString(strVal))
-		sub := []rune(toString(subVal))
-		startPos := 0
-		if v.Pos != nil {
-			posVal, err := e.evalExpr(v.Pos)
-			if err != nil {
-				return nil, err
-			}
-			startPos = int(toInt64(posVal)) - 1 // 1-based to 0-based
-			if startPos < 0 {
-				startPos = 0
-			}
-		}
-		if len(sub) == 0 {
-			return int64(startPos + 1), nil
-		}
-		for i := startPos; i <= len(s)-len(sub); i++ {
-			match := true
-			for j := 0; j < len(sub); j++ {
-				if s[i+j] != sub[j] {
-					match = false
-					break
-				}
-			}
-			if match {
-				return int64(i + 1), nil // 1-based
-			}
+		if result {
+			return int64(1), nil
 		}
 		return int64(0), nil
+	// JSON functions
+	case *sqlparser.JSONExtractExpr:
+		return e.evalJSONExtract(v)
+	case *sqlparser.JSONAttributesExpr:
+		return e.evalJSONAttributes(v)
+	case *sqlparser.JSONObjectExpr:
+		return e.evalJSONObject(v)
+	case *sqlparser.JSONArrayExpr:
+		return e.evalJSONArray(v)
+	case *sqlparser.JSONContainsExpr:
+		return e.evalJSONContains(v)
+	case *sqlparser.JSONContainsPathExpr:
+		return e.evalJSONContainsPath(v)
+	case *sqlparser.JSONKeysExpr:
+		return e.evalJSONKeys(v)
+	case *sqlparser.JSONSearchExpr:
+		return e.evalJSONSearch(v)
+	case *sqlparser.JSONRemoveExpr:
+		return e.evalJSONRemove(v)
+	case *sqlparser.JSONValueModifierExpr:
+		return e.evalJSONValueModifier(v)
+	case *sqlparser.JSONValueMergeExpr:
+		return e.evalJSONValueMerge(v)
+	case *sqlparser.JSONQuoteExpr:
+		return e.evalJSONQuote(v)
+	case *sqlparser.JSONUnquoteExpr:
+		return e.evalJSONUnquote(v)
+	case *sqlparser.JSONPrettyExpr:
+		return e.evalJSONPretty(v)
+	case *sqlparser.JSONStorageSizeExpr:
+		return e.evalJSONStorageSize(v)
+	case *sqlparser.JSONStorageFreeExpr:
+		return e.evalJSONStorageFree(v)
+	case *sqlparser.JSONOverlapsExpr:
+		return e.evalJSONOverlaps(v)
+	case *sqlparser.MemberOfExpr:
+		return e.evalMemberOf(v)
+	case *sqlparser.JSONValueExpr:
+		return e.evalJSONValue(v)
+	case *sqlparser.JSONSchemaValidFuncExpr:
+		return e.evalJSONSchemaValid(v)
+	case *sqlparser.JSONSchemaValidationReportFuncExpr:
+		return e.evalJSONSchemaValidationReport(v)
 	case *sqlparser.ConvertUsingExpr:
-		// CONVERT(expr USING charset) - for our purposes, just return the string value.
+		// CONVERT(expr USING charset) - just return the expression value
 		val, err := e.evalExpr(v.Expr)
 		if err != nil {
 			return nil, err
 		}
-		if val == nil {
-			return nil, nil
+		return val, nil
+	case *sqlparser.GeomFromTextExpr:
+		// Stub: return the WKT text as a binary string (opaque type)
+		val, err := e.evalExpr(v.WktText)
+		if err != nil {
+			return nil, err
 		}
 		return toString(val), nil
 	}
@@ -7054,217 +7332,19 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 	case *sqlparser.CaseExpr:
 		return e.evalCaseExprWithRow(v, row)
 	case *sqlparser.ConvertExpr:
-		// CAST(expr AS type) with row context
-		val, err := e.evalRowExpr(v.Expr, row)
-		if err != nil {
-			return nil, err
-		}
-		if v.Type == nil {
-			return val, nil
-		}
-		typeName := strings.ToUpper(v.Type.Type)
-		switch typeName {
-		case "SIGNED", "INT", "INTEGER", "BIGINT":
-			return toInt64(val), nil
-		case "UNSIGNED":
-			return toInt64(val), nil
-		case "CHAR", "VARCHAR", "TEXT":
-			return toString(val), nil
-		case "DECIMAL", "FLOAT", "DOUBLE":
-			return toFloat(val), nil
-		}
-		return val, nil
+		// CAST(expr AS type) with row context - delegate to evalExpr via default
+		oldCorrelated := e.correlatedRow
+		e.correlatedRow = row
+		val, err := e.evalExpr(expr)
+		e.correlatedRow = oldCorrelated
+		return val, err
 	case *sqlparser.CastExpr:
-		// CAST(expr AS type) with row context (CastExpr variant)
-		val, err := e.evalRowExpr(v.Expr, row)
-		if err != nil {
-			return nil, err
-		}
-		if v.Type == nil {
-			return val, nil
-		}
-		typeName := strings.ToUpper(v.Type.Type)
-		switch typeName {
-		case "SIGNED", "INT", "INTEGER", "BIGINT":
-			return toInt64(val), nil
-		case "UNSIGNED":
-			return toInt64(val), nil
-		case "CHAR", "VARCHAR", "TEXT":
-			return toString(val), nil
-		case "DECIMAL", "FLOAT", "DOUBLE":
-			return toFloat(val), nil
-		}
-		return val, nil
-	case *sqlparser.TrimFuncExpr:
-		// TRIM / LTRIM / RTRIM with row context
-		val, err := e.evalRowExpr(v.StringArg, row)
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		s := toString(val)
-		switch v.TrimFuncType {
-		case sqlparser.LTrimType:
-			return strings.TrimLeft(s, " \t\n\r"), nil
-		case sqlparser.RTrimType:
-			return strings.TrimRight(s, " \t\n\r"), nil
-		default: // NormalTrimType
-			if v.TrimArg != nil {
-				trimVal, err := e.evalRowExpr(v.TrimArg, row)
-				if err != nil {
-					return nil, err
-				}
-				trimStr := toString(trimVal)
-				switch v.Type {
-				case sqlparser.LeadingTrimType:
-					return strings.TrimLeft(s, trimStr), nil
-				case sqlparser.TrailingTrimType:
-					return strings.TrimRight(s, trimStr), nil
-				default:
-					return strings.Trim(s, trimStr), nil
-				}
-			}
-			return strings.TrimSpace(s), nil
-		}
-	case *sqlparser.SubstrExpr:
-		// SUBSTRING(str, from, to) with row context
-		strVal, err := e.evalRowExpr(v.Name, row)
-		if err != nil {
-			return nil, err
-		}
-		if strVal == nil {
-			return nil, nil
-		}
-		s := []rune(toString(strVal))
-		posVal, err := e.evalRowExpr(v.From, row)
-		if err != nil {
-			return nil, err
-		}
-		pos := int(toInt64(posVal))
-		if pos == 0 {
-			return "", nil
-		}
-		if pos > 0 {
-			pos--
-		} else if pos < 0 {
-			pos = len(s) + pos
-		}
-		if pos < 0 {
-			pos = 0
-		}
-		if pos >= len(s) {
-			return "", nil
-		}
-		if v.To != nil {
-			lenVal, err := e.evalRowExpr(v.To, row)
-			if err != nil {
-				return nil, err
-			}
-			length := int(toInt64(lenVal))
-			if length <= 0 {
-				return "", nil
-			}
-			end := pos + length
-			if end > len(s) {
-				end = len(s)
-			}
-			return string(s[pos:end]), nil
-		}
-		return string(s[pos:]), nil
-	case *sqlparser.InsertExpr:
-		// INSERT(str, pos, len, newstr) with row context
-		strVal, err := e.evalRowExpr(v.Str, row)
-		if err != nil {
-			return nil, err
-		}
-		if strVal == nil {
-			return nil, nil
-		}
-		posVal, err := e.evalRowExpr(v.Pos, row)
-		if err != nil {
-			return nil, err
-		}
-		lenVal, err := e.evalRowExpr(v.Len, row)
-		if err != nil {
-			return nil, err
-		}
-		newStrVal, err := e.evalRowExpr(v.NewStr, row)
-		if err != nil {
-			return nil, err
-		}
-		if posVal == nil || lenVal == nil || newStrVal == nil {
-			return nil, nil
-		}
-		s := []rune(toString(strVal))
-		pos := int(toInt64(posVal))
-		length := int(toInt64(lenVal))
-		newStr := toString(newStrVal)
-		if pos < 1 || pos > len(s)+1 {
-			return toString(strVal), nil
-		}
-		pos-- // 1-based to 0-based
-		end := pos + length
-		if end > len(s) {
-			end = len(s)
-		}
-		result := string(s[:pos]) + newStr + string(s[end:])
-		return result, nil
-	case *sqlparser.LocateExpr:
-		// LOCATE(substr, str[, pos]) with row context
-		subVal, err := e.evalRowExpr(v.SubStr, row)
-		if err != nil {
-			return nil, err
-		}
-		strVal, err := e.evalRowExpr(v.Str, row)
-		if err != nil {
-			return nil, err
-		}
-		if subVal == nil || strVal == nil {
-			return nil, nil
-		}
-		s := []rune(toString(strVal))
-		sub := []rune(toString(subVal))
-		startPos := 0
-		if v.Pos != nil {
-			posVal, err := e.evalRowExpr(v.Pos, row)
-			if err != nil {
-				return nil, err
-			}
-			startPos = int(toInt64(posVal)) - 1
-			if startPos < 0 {
-				startPos = 0
-			}
-		}
-		if len(sub) == 0 {
-			return int64(startPos + 1), nil
-		}
-		for i := startPos; i <= len(s)-len(sub); i++ {
-			match := true
-			for j := 0; j < len(sub); j++ {
-				if s[i+j] != sub[j] {
-					match = false
-					break
-				}
-			}
-			if match {
-				return int64(i + 1), nil
-			}
-		}
-		return int64(0), nil
-	case *sqlparser.ConvertUsingExpr:
-		// CONVERT(expr USING charset) with row context
-		val, err := e.evalRowExpr(v.Expr, row)
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		return toString(val), nil
-	case *sqlparser.IntroducerExpr:
-		return e.evalRowExpr(v.Expr, row)
+		// CAST(expr AS type) with row context - delegate to evalExpr via default
+		oldCorrelated := e.correlatedRow
+		e.correlatedRow = row
+		val, err := e.evalExpr(expr)
+		e.correlatedRow = oldCorrelated
+		return val, err
 	case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg:
 		// For HAVING clause: look up the aggregate display name in the row
 		displayName := aggregateDisplayName(expr)
@@ -7274,7 +7354,13 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		// Fallback: compute the aggregate (for single-row context)
 		return e.evalExpr(expr)
 	default:
-		return e.evalExpr(expr)
+		// For JSON and other expressions, set row context via correlatedRow
+		// so that ColName lookups in evalExpr can find row values
+		oldCorrelated := e.correlatedRow
+		e.correlatedRow = row
+		val, err := e.evalExpr(expr)
+		e.correlatedRow = oldCorrelated
+		return val, err
 	}
 }
 
@@ -8131,7 +8217,8 @@ func (e *Executor) addAggregatesToRow(expr sqlparser.Expr, row storage.Row, grou
 	case *sqlparser.OrExpr:
 		e.addAggregatesToRow(v.Left, row, groupRows)
 		e.addAggregatesToRow(v.Right, row, groupRows)
-	case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg:
+	case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg,
+		*sqlparser.JSONArrayAgg, *sqlparser.JSONObjectAgg:
 		displayName := aggregateDisplayName(expr)
 		if _, ok := row[displayName]; !ok {
 			repRow := storage.Row{}
@@ -8452,11 +8539,39 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 	case sqlparser.GreaterEqualOp:
 		return compareNumeric(left, right) >= 0, nil
 	case sqlparser.LikeOp:
-		return matchLike(toString(left), toString(right)), nil
+		pattern := toString(right)
+		value := toString(left)
+		re := likeToRegexp(pattern)
+		return re.MatchString(value), nil
 	case sqlparser.NotLikeOp:
-		return !matchLike(toString(left), toString(right)), nil
+		pattern := toString(right)
+		value := toString(left)
+		re := likeToRegexp(pattern)
+		return !re.MatchString(value), nil
 	}
 	return false, fmt.Errorf("unsupported comparison operator: %s", op.ToString())
+}
+
+// likeToRegexp converts a SQL LIKE pattern to a Go regexp.
+func likeToRegexp(pattern string) *regexp.Regexp {
+	var sb strings.Builder
+	sb.WriteString("(?i)^") // case-insensitive
+	for i := 0; i < len(pattern); i++ {
+		c := pattern[i]
+		if c == '\\' && i+1 < len(pattern) {
+			sb.WriteString(regexp.QuoteMeta(string(pattern[i+1])))
+			i++
+		} else if c == '%' {
+			sb.WriteString(".*")
+		} else if c == '_' {
+			sb.WriteString(".")
+		} else {
+			sb.WriteString(regexp.QuoteMeta(string(c)))
+		}
+	}
+	sb.WriteString("$")
+	re, _ := regexp.Compile(sb.String())
+	return re
 }
 
 // compareCaseInsensitive compares two values using case-insensitive string comparison
