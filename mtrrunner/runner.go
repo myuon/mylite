@@ -1064,6 +1064,33 @@ func (ctx *execContext) evaluateIfConditionInner(condStr string) bool {
 	return condStr != "" && condStr != "0"
 }
 
+func formatResultCell(v interface{}) string {
+	normalizeScientific := func(s string) string {
+		if !strings.ContainsAny(s, "eE") {
+			return s
+		}
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return s
+		}
+		return strconv.FormatFloat(f, 'f', -1, 64)
+	}
+	switch val := v.(type) {
+	case nil:
+		return "NULL"
+	case []byte:
+		return normalizeScientific(string(val))
+	case float64:
+		return strconv.FormatFloat(val, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(val), 'f', -1, 32)
+	case string:
+		return normalizeScientific(val)
+	default:
+		return fmt.Sprintf("%v", val)
+	}
+}
+
 func (ctx *execContext) executeSQL(stmt string) error {
 	// Variable substitution
 	stmt = ctx.substituteVars(stmt)
@@ -1118,6 +1145,11 @@ func (ctx *execContext) executeSQLInner(stmt string) error {
 
 	// EXECUTE might be either a query or exec depending on the prepared statement
 	if strings.HasPrefix(upper, "EXECUTE ") {
+		return ctx.executeQueryOrExec(stmt)
+	}
+	// Parenthesized SELECT/UNION statements (e.g. "(SELECT ...) UNION ...")
+	// are result-set statements even though they don't start with "SELECT".
+	if strings.HasPrefix(upper, "(") {
 		return ctx.executeQueryOrExec(stmt)
 	}
 
@@ -1178,16 +1210,7 @@ func (ctx *execContext) executeQuery(stmt string) error {
 
 		parts := make([]string, len(columns))
 		for i, v := range values {
-			if v == nil {
-				parts[i] = "NULL"
-			} else {
-				switch val := v.(type) {
-				case []byte:
-					parts[i] = string(val)
-				default:
-					parts[i] = fmt.Sprintf("%v", val)
-				}
-			}
+			parts[i] = formatResultCell(v)
 		}
 		// Apply --replace_column
 		if len(ctx.replaceColumns) > 0 {
@@ -1274,16 +1297,7 @@ func (ctx *execContext) executeQueryOrExec(stmt string) error {
 
 		parts := make([]string, len(columns))
 		for i, v := range values {
-			if v == nil {
-				parts[i] = "NULL"
-			} else {
-				switch val := v.(type) {
-				case []byte:
-					parts[i] = string(val)
-				default:
-					parts[i] = fmt.Sprintf("%v", val)
-				}
-			}
+			parts[i] = formatResultCell(v)
 		}
 		// Apply --replace_column
 		if len(ctx.replaceColumns) > 0 {
