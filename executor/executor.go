@@ -156,6 +156,20 @@ type Executor struct {
 	// queryTableDef holds the table definition for the current query context,
 	// used for column-level checks (e.g., IS NULL on NOT NULL columns).
 	queryTableDef *catalog.TableDef
+	// warnings stores the warnings from the last executed statement.
+	warnings []Warning
+}
+
+// Warning represents a MySQL warning.
+type Warning struct {
+	Level   string // "Warning", "Note", "Error"
+	Code    int
+	Message string
+}
+
+// addWarning adds a warning to the current statement's warning list.
+func (e *Executor) addWarning(level string, code int, message string) {
+	e.warnings = append(e.warnings, Warning{Level: level, Code: code, Message: message})
 }
 
 func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
@@ -639,6 +653,9 @@ func normalizeAddIndexUsing(query string) string {
 }
 
 func (e *Executor) Execute(query string) (*Result, error) {
+	// Clear warnings from previous statement
+	e.warnings = nil
+
 	// Handle MYLITE control commands before passing to the SQL parser.
 	trimmed := strings.TrimSpace(query)
 	upper := strings.ToUpper(trimmed)
@@ -6014,6 +6031,20 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 			if err != nil {
 				return nil, err
 			}
+		} else if stmt.Limit != nil && len(def.PrimaryKey) > 0 {
+			// When LIMIT without ORDER BY, InnoDB scans in PRIMARY KEY order.
+			// Build an ORDER BY clause from the primary key columns.
+			var orderBy sqlparser.OrderBy
+			for _, pkCol := range def.PrimaryKey {
+				orderBy = append(orderBy, &sqlparser.Order{
+					Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(pkCol)},
+					Direction: sqlparser.AscOrder,
+				})
+			}
+			flatRows, err = applyOrderBy(orderBy, colNames, flatRows, effectiveTableCollation(def))
+			if err != nil {
+				return nil, err
+			}
 		}
 		if stmt.Limit != nil {
 			flatRows, err = applyLimit(stmt.Limit, flatRows)
@@ -6753,9 +6784,13 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 
 	// SHOW WARNINGS
 	if strings.HasPrefix(upper, "SHOW WARNINGS") || strings.HasPrefix(upper, "SHOW COUNT(*) WARNINGS") {
+		rows := make([][]interface{}, 0, len(e.warnings))
+		for _, w := range e.warnings {
+			rows = append(rows, []interface{}{w.Level, int64(w.Code), w.Message})
+		}
 		return &Result{
 			Columns:     []string{"Level", "Code", "Message"},
-			Rows:        [][]interface{}{},
+			Rows:        rows,
 			IsResultSet: true,
 		}, nil
 	}
@@ -6773,7 +6808,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 	if strings.Contains(upper, "WARNING_COUNT") || strings.Contains(upper, "ERROR_COUNT") {
 		return &Result{
 			Columns:     []string{"@@warning_count"},
-			Rows:        [][]interface{}{{int64(0)}},
+			Rows:        [][]interface{}{{int64(len(e.warnings))}},
 			IsResultSet: true,
 		}, nil
 	}
@@ -9742,12 +9777,21 @@ func evalIntervalDateExpr(dateVal, intervalVal interface{}, unit sqlparser.Inter
 		}
 		t = t.Add(dur)
 	default:
-		// Try to parse as a time interval for unsupported types
-		dur, _ := parseMySQLTimeInterval(iStr)
-		if isSubtract {
-			dur = -dur
+		// For ADDDATE/SUBDATE shorthand (IntervalNone), the interval is in days
+		if unit == sqlparser.IntervalNone && (syntax == sqlparser.IntervalDateExprAdddate || syntax == sqlparser.IntervalDateExprSubdate) {
+			n, _ := strconv.Atoi(extractLeadingInt(iStr))
+			if isSubtract {
+				n = -n
+			}
+			t = t.AddDate(0, 0, n)
+		} else {
+			// Try to parse as a time interval for unsupported types
+			dur, _ := parseMySQLTimeInterval(iStr)
+			if isSubtract {
+				dur = -dur
+			}
+			t = t.Add(dur)
 		}
-		t = t.Add(dur)
 	}
 
 	// Format output based on whether the original had time component
