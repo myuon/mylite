@@ -3677,6 +3677,31 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			row[colNames[i]] = v
 		}
 
+		// Check explicit NULL on NOT NULL columns (always an error, even non-strict)
+		{
+			colNameSet := make(map[string]bool, len(colNames))
+			for _, cn := range colNames {
+				colNameSet[cn] = true
+			}
+			for _, col := range tbl.Def.Columns {
+				// In strict mode, missing NOT NULL columns without defaults are errors
+				if e.isStrictMode() && !col.Nullable && !col.AutoIncrement && col.Default == nil && !colNameSet[col.Name] {
+					return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
+				}
+				// Explicit NULL into NOT NULL column
+				if !col.Nullable && !col.AutoIncrement && colNameSet[col.Name] {
+					if v, ok := row[col.Name]; ok && v == nil {
+						if e.isStrictMode() {
+							return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
+						}
+						// Non-strict mode: generate warning and use zero value
+						e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", col.Name))
+						row[col.Name] = implicitZeroValue(col.Type)
+					}
+				}
+			}
+		}
+
 		// Check for explicit NULL on PRIMARY KEY columns (always an error, even non-strict)
 		// MySQL never allows NULL in PK columns.
 		if len(tbl.Def.PrimaryKey) > 0 {
