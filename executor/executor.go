@@ -3967,6 +3967,23 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			}
 
 		case *sqlparser.AddIndexDefinition:
+			// Validate that all index columns exist in the table
+			tableDef, tdErr := db.GetTable(tableName)
+			if tdErr == nil {
+				for _, idxCol := range op.IndexDefinition.Columns {
+					colName := idxCol.Column.String()
+					found := false
+					for _, col := range tableDef.Columns {
+						if strings.EqualFold(col.Name, colName) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						return nil, mysqlError(1072, "42000", fmt.Sprintf("Key column '%s' doesn't exist in table", colName))
+					}
+				}
+			}
 			// Store index definition so SHOW CREATE TABLE can display it.
 			var idxCols []string
 			for _, idxCol := range op.IndexDefinition.Columns {
