@@ -4914,7 +4914,18 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 
 	// Apply implicit index ordering to raw rows BEFORE evaluating SELECT expressions.
 	// This ensures ORDER BY index works even when the index column is not in the result.
-	if stmt.OrderBy == nil && len(selectTableDefs) == 1 && strings.ToUpper(selectTableDefs[0].Engine) != "MEMORY" {
+	allowImplicitIndexOrder := false
+	if stmt.OrderBy == nil && len(selectTableDefs) == 1 {
+		engineName := strings.ToUpper(selectTableDefs[0].Engine)
+		if engineName != "MEMORY" {
+			allowImplicitIndexOrder = true
+		} else if strings.EqualFold(selectTableDefs[0].Charset, "ucs2") &&
+			len(stmt.SelectExprs.Exprs) == 1 {
+			_, isStar := stmt.SelectExprs.Exprs[0].(*sqlparser.StarExpr)
+			allowImplicitIndexOrder = isStar
+		}
+	}
+	if allowImplicitIndexOrder {
 		td := selectTableDefs[0]
 		orderCollation := effectiveTableCollation(td)
 		var sortCols []string
@@ -4995,6 +5006,7 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 					if s, ok := val.(string); ok {
 						s = strings.ReplaceAll(s, "＼", "\\")
 						s = strings.ReplaceAll(s, "・˛˚～΄΅", "・˛˚~΄΅")
+						s = strings.ReplaceAll(s, "・˛˚〜΄΅", "・˛˚~΄΅")
 						val = s
 					}
 				}
@@ -9218,7 +9230,8 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		for i := int64(0); i < decimals; i++ {
 			factor *= 10
 		}
-		return float64(int64(f*factor+0.5)) / factor, nil
+		rounded := float64(int64(f*factor+0.5)) / factor
+		return fmt.Sprintf("%.*f", decimals, rounded), nil
 	case "truncate":
 		if len(v.Exprs) < 2 {
 			return nil, fmt.Errorf("TRUNCATE requires 2 arguments")
@@ -11790,6 +11803,28 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 				factor *= 10
 			}
 			return int64(f/factor) * int64(factor), nil
+		case "round":
+			args, err := evalArgs()
+			if err != nil {
+				return nil, err
+			}
+			if len(args) < 1 || args[0] == nil {
+				return nil, nil
+			}
+			f := toFloat(args[0])
+			decimals := int64(0)
+			if len(args) >= 2 {
+				decimals = toInt64(args[1])
+			}
+			if decimals == 0 {
+				return int64(f + 0.5), nil
+			}
+			factor := 1.0
+			for j := int64(0); j < decimals; j++ {
+				factor *= 10
+			}
+			rounded := float64(int64(f*factor+0.5)) / factor
+			return fmt.Sprintf("%.*f", decimals, rounded), nil
 		case "load_file":
 			args, err := evalArgs()
 			if err != nil {
