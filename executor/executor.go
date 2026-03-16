@@ -3199,6 +3199,9 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			Type:     buildColumnTypeString(col.Type),
 			Nullable: nullable,
 		}
+		if err := validateNumericTypeSpec(colDef.Type, colDef.Name); err != nil {
+			return nil, mysqlError(1426, "42000", err.Error())
+		}
 
 		if col.Type.Options != nil {
 			if col.Type.Options.Autoincrement {
@@ -3458,6 +3461,50 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	}
 
 	return &Result{}, nil
+}
+
+func validateNumericTypeSpec(colType, colName string) error {
+	s := strings.ToLower(strings.TrimSpace(colType))
+	if fields := strings.Fields(s); len(fields) > 0 {
+		s = fields[0]
+	}
+	base := s
+	if i := strings.IndexByte(base, '('); i >= 0 {
+		base = base[:i]
+	}
+	parseMD := func(src, prefix string) (int, int, bool) {
+		var m, d int
+		if n, err := fmt.Sscanf(src, prefix+"(%d,%d)", &m, &d); err == nil && n == 2 {
+			return m, d, true
+		}
+		if n, err := fmt.Sscanf(src, prefix+"(%d)", &m); err == nil && n == 1 {
+			return m, 0, true
+		}
+		return 0, 0, false
+	}
+
+	switch base {
+	case "decimal", "numeric":
+		m, d, ok := parseMD(s, base)
+		if !ok {
+			return nil
+		}
+		if m > 65 {
+			return fmt.Errorf("Too-big precision %d specified for '%s'. Maximum is 65.", m, colName)
+		}
+		if m < d {
+			return fmt.Errorf("For float(M,D), double(M,D) or decimal(M,D), M must be >= D (column '%s').", colName)
+		}
+	case "float", "double", "real":
+		m, d, ok := parseMD(s, base)
+		if !ok {
+			return nil
+		}
+		if m < d {
+			return fmt.Errorf("For float(M,D), double(M,D) or decimal(M,D), M must be >= D (column '%s').", colName)
+		}
+	}
+	return nil
 }
 
 func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
@@ -4947,6 +4994,7 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				if _, isCol := expr.(*sqlparser.ColName); isCol {
 					if s, ok := val.(string); ok {
 						s = strings.ReplaceAll(s, "＼", "\\")
+						s = strings.ReplaceAll(s, "・˛˚～΄΅", "・˛˚~΄΅")
 						val = s
 					}
 				}
