@@ -465,6 +465,12 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return e.execMyliteCommand(trimmed)
 	}
 
+	// Rewrite DROP TABLES to DROP TABLE (MySQL synonym, vitess doesn't parse TABLES).
+	if strings.HasPrefix(upper, "DROP TABLES ") {
+		query = "DROP TABLE " + query[len("DROP TABLES "):]
+		upper = strings.ToUpper(query)
+	}
+
 	// Handle BEGIN WORK (equivalent to BEGIN/START TRANSACTION)
 	if upper == "BEGIN WORK" {
 		return e.execBegin()
@@ -1370,23 +1376,46 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 	if len(s) == 0 {
 		return v
 	}
+	// Normalize YEAR(4) -> YEAR, TIME(N) -> TIME
+	if strings.HasPrefix(upper, "YEAR(") {
+		upper = "YEAR"
+	}
+	if strings.HasPrefix(upper, "TIME(") {
+		upper = "TIME"
+	}
 	switch upper {
 	case "DATE":
 		// If the value looks like a datetime, truncate to date-only
 		if len(s) > 10 && s[4] == '-' && s[7] == '-' {
 			return s[:10]
 		}
+		// Try parsing various MySQL DATE formats
+		parsed := parseMySQLDateValue(s)
+		if parsed != "" {
+			return parsed
+		}
 	case "TIME":
-		// If the value looks like a datetime, extract the time part
-		if idx := strings.Index(s, " "); idx >= 0 && len(s) > idx+1 {
-			return s[idx+1:]
-		}
+		// Use the original value for numeric handling
+		return parseMySQLTimeValueRaw(v)
 	case "YEAR":
-		// Extract year from date/datetime
-		if len(s) >= 5 && s[4] == '-' {
-			return s[:4]
-		}
+		return coerceYearValue(v)
 	case "TIMESTAMP":
+		// Try parsing various date formats first
+		parsed := parseMySQLDateValue(s)
+		if parsed != "" {
+			s = parsed
+			// Check if we need to append time
+			if len(s) == 10 {
+				// date only, check original for time part
+				origS := fmt.Sprintf("%v", v)
+				if idx := strings.Index(origS, " "); idx >= 0 {
+					timePart := strings.TrimSpace(origS[idx+1:])
+					if timePart != "" {
+						s = s + " " + timePart
+					}
+				}
+			}
+		}
 		// TIMESTAMP range: '1970-01-01 00:00:01' to '2038-01-19 03:14:07' UTC
 		// Out-of-range values are stored as '0000-00-00 00:00:00'
 		if len(s) >= 10 && s[4] == '-' {
@@ -1402,8 +1431,390 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 				}
 			}
 		}
+		return s
+	case "DATETIME":
+		// Try parsing various date formats
+		parsed := parseMySQLDateValue(s)
+		if parsed != "" {
+			origS := fmt.Sprintf("%v", v)
+			if idx := strings.Index(origS, " "); idx >= 0 {
+				timePart := strings.TrimSpace(origS[idx+1:])
+				if timePart != "" {
+					// Normalize time separator chars to ':'
+					timePart = normalizeDateTimeSeparators(timePart)
+					return parsed + " " + timePart
+				}
+			}
+			return parsed + " 00:00:00"
+		}
 	}
 	return v
+}
+
+// parseMySQLTimeValueRaw handles raw interface values for TIME conversion.
+// This properly handles numeric values (int64, float64) using HHMMSS format.
+func parseMySQLTimeValueRaw(v interface{}) string {
+	switch n := v.(type) {
+	case int64:
+		negative := n < 0
+		if negative {
+			n = -n
+		}
+		sec := int(n % 100)
+		m := int((n / 100) % 100)
+		h := int(n / 10000)
+		return formatTimeValue(negative, h, m, sec, "")
+	case float64:
+		negative := n < 0
+		if negative {
+			n = -n
+		}
+		intPart := int64(n)
+		fracPart := n - float64(intPart)
+		sec := int(intPart % 100)
+		m := int((intPart / 100) % 100)
+		h := int(intPart / 10000)
+		frac := ""
+		if fracPart > 0 {
+			fracStr := fmt.Sprintf("%.6f", fracPart)
+			frac = strings.TrimPrefix(fracStr, "0.")
+			frac = strings.TrimRight(frac, "0")
+		}
+		return formatTimeValue(negative, h, m, sec, frac)
+	case uint64:
+		sec := int(n % 100)
+		m := int((n / 100) % 100)
+		h := int(n / 10000)
+		return formatTimeValue(false, h, m, sec, "")
+	}
+	return parseMySQLTimeValue(fmt.Sprintf("%v", v))
+}
+
+// parseMySQLTimeValue parses a value into MySQL TIME format (HH:MM:SS).
+// Supports various MySQL TIME input formats and clips to valid range.
+func parseMySQLTimeValue(s string) string {
+	if s == "" {
+		return "00:00:00"
+	}
+
+	// If the value looks like a datetime (YYYY-MM-DD HH:MM:SS), extract the time part
+	if len(s) >= 19 && s[4] == '-' && s[7] == '-' && s[10] == ' ' {
+		return s[11:]
+	}
+	// If the value looks like a date (YYYY-MM-DD), return 00:00:00
+	if len(s) == 10 && s[4] == '-' && s[7] == '-' {
+		return "00:00:00"
+	}
+
+	// Already in HH:MM:SS or H:MM:SS format (with optional sign and fractional seconds)
+	if strings.Contains(s, ":") {
+		// Handle "D HH:MM:SS" format (days prefix)
+		negative := false
+		if strings.HasPrefix(s, "-") {
+			negative = true
+			s = s[1:]
+		}
+		days := 0
+		if idx := strings.Index(s, " "); idx >= 0 {
+			d, err := strconv.Atoi(strings.TrimSpace(s[:idx]))
+			if err == nil {
+				days = d
+				s = strings.TrimSpace(s[idx+1:])
+			}
+		}
+		parts := strings.Split(s, ":")
+		h, m, sec := 0, 0, 0
+		frac := ""
+		switch len(parts) {
+		case 2: // HH:MM
+			h, _ = strconv.Atoi(parts[0])
+			m, _ = strconv.Atoi(parts[1])
+		case 3: // HH:MM:SS or HH:MM:SS.frac
+			h, _ = strconv.Atoi(parts[0])
+			m, _ = strconv.Atoi(parts[1])
+			secParts := strings.SplitN(parts[2], ".", 2)
+			sec, _ = strconv.Atoi(secParts[0])
+			if len(secParts) > 1 {
+				frac = secParts[1]
+			}
+		}
+		h += days * 24
+		return formatTimeValue(negative, h, m, sec, frac)
+	}
+
+	// Handle "D SS" format (e.g., "0 10" -> "00:00:10")
+	if idx := strings.Index(s, " "); idx >= 0 {
+		negative := false
+		if strings.HasPrefix(s, "-") {
+			negative = true
+			s = s[1:]
+			idx--
+		}
+		days, err := strconv.Atoi(strings.TrimSpace(s[:idx]))
+		if err == nil {
+			rest := strings.TrimSpace(s[idx+1:])
+			sec, _ := strconv.Atoi(rest)
+			h := days*24 + sec/3600
+			m := (sec % 3600) / 60
+			sec = sec % 60
+			return formatTimeValue(negative, h, m, sec, "")
+		}
+	}
+
+	// Handle numeric and string "HHMMSS" or "SS" format
+	negative := false
+	if strings.HasPrefix(s, "-") {
+		negative = true
+		s = s[1:]
+	}
+
+	// Handle fractional seconds in numeric format (e.g., "123556.99")
+	frac := ""
+	if dotIdx := strings.Index(s, "."); dotIdx >= 0 {
+		frac = s[dotIdx+1:]
+		s = s[:dotIdx]
+	}
+
+	// Pad to at least 2 digits
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		// Not a valid number, return as-is
+		return s
+	}
+
+	var h, m, sec int
+	if n < 100 {
+		// SS format
+		sec = int(n)
+	} else if n < 10000 {
+		// MMSS format
+		sec = int(n % 100)
+		m = int(n / 100)
+	} else {
+		// HHMMSS format
+		sec = int(n % 100)
+		m = int((n / 100) % 100)
+		h = int(n / 10000)
+	}
+
+	return formatTimeValue(negative, h, m, sec, frac)
+}
+
+// formatTimeValue formats time components into MySQL TIME string, clipping to valid range.
+func formatTimeValue(negative bool, h, m, sec int, frac string) string {
+	// Clip to MySQL TIME range: -838:59:59 to 838:59:59
+	totalSecs := h*3600 + m*60 + sec
+	maxSecs := 838*3600 + 59*60 + 59
+	if totalSecs > maxSecs {
+		h, m, sec = 838, 59, 59
+	}
+
+	sign := ""
+	if negative {
+		sign = "-"
+	}
+
+	result := fmt.Sprintf("%s%02d:%02d:%02d", sign, h, m, sec)
+	if frac != "" {
+		// Truncate fractional seconds to microseconds (6 digits)
+		if len(frac) > 6 {
+			frac = frac[:6]
+		}
+		// Remove trailing zeros
+		frac = strings.TrimRight(frac, "0")
+		if frac != "" {
+			result += "." + frac
+		}
+	}
+	return result
+}
+
+// coerceYearValue converts a value to MySQL YEAR type.
+// MySQL YEAR(4) stores years from 1901 to 2155.
+// Two-digit values 0-69 map to 2000-2069, 70-99 map to 1970-1999.
+// The string '0' or '00' maps to 2000, but integer 0 maps to 0000.
+func coerceYearValue(v interface{}) string {
+	s := fmt.Sprintf("%v", v)
+
+	// Check if original value was an integer 0
+	isIntZero := false
+	switch n := v.(type) {
+	case int64:
+		isIntZero = (n == 0)
+	case float64:
+		isIntZero = (n == 0)
+	case uint64:
+		isIntZero = (n == 0)
+	}
+
+	// If already a 4-digit year, return as-is
+	if len(s) == 4 {
+		if y, err := strconv.Atoi(s); err == nil && y >= 1901 && y <= 2155 {
+			return s
+		}
+	}
+
+	// Extract year from date/datetime
+	if len(s) >= 5 && s[4] == '-' {
+		return s[:4]
+	}
+
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		// Try float
+		f, err2 := strconv.ParseFloat(s, 64)
+		if err2 != nil {
+			return s
+		}
+		n = int(f)
+	}
+
+	// Integer 0 -> 0000
+	if isIntZero {
+		return "0000"
+	}
+
+	// Two-digit year conversion
+	if n >= 0 && n <= 69 {
+		return fmt.Sprintf("%d", 2000+n)
+	}
+	if n >= 70 && n <= 99 {
+		return fmt.Sprintf("%d", 1900+n)
+	}
+
+	// Already a 4-digit year
+	if n >= 1901 && n <= 2155 {
+		return fmt.Sprintf("%d", n)
+	}
+
+	// Out of range but still return the value
+	return fmt.Sprintf("%d", n)
+}
+
+// parseMySQLDateValue parses various MySQL date input formats and returns YYYY-MM-DD or "".
+func parseMySQLDateValue(s string) string {
+	// Already in standard format
+	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
+		return s[:10]
+	}
+
+	// Strip time part for datetime strings
+	datePart := s
+	if idx := strings.Index(s, " "); idx >= 0 {
+		datePart = s[:idx]
+	}
+
+	// Try YYYYMMDD or YYYYMMDDHHMMSS format (no delimiters)
+	isAllDigits := true
+	for _, c := range datePart {
+		if c < '0' || c > '9' {
+			isAllDigits = false
+			break
+		}
+	}
+	if isAllDigits {
+		switch len(datePart) {
+		case 8: // YYYYMMDD
+			y, _ := strconv.Atoi(datePart[:4])
+			m, _ := strconv.Atoi(datePart[4:6])
+			d, _ := strconv.Atoi(datePart[6:8])
+			if m >= 1 && m <= 12 && d >= 1 && d <= 31 {
+				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
+			}
+		case 14: // YYYYMMDDHHMMSS - extract date part
+			y, _ := strconv.Atoi(datePart[:4])
+			m, _ := strconv.Atoi(datePart[4:6])
+			d, _ := strconv.Atoi(datePart[6:8])
+			if m >= 1 && m <= 12 && d >= 1 && d <= 31 {
+				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
+			}
+		case 6: // YYMMDD
+			yy, _ := strconv.Atoi(datePart[:2])
+			m, _ := strconv.Atoi(datePart[2:4])
+			d, _ := strconv.Atoi(datePart[4:6])
+			y := convert2DigitYear(yy)
+			if m >= 1 && m <= 12 && d >= 1 && d <= 31 {
+				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
+			}
+		case 12: // YYMMDDHHMMSS - extract date part
+			yy, _ := strconv.Atoi(datePart[:2])
+			m, _ := strconv.Atoi(datePart[2:4])
+			d, _ := strconv.Atoi(datePart[4:6])
+			y := convert2DigitYear(yy)
+			if m >= 1 && m <= 12 && d >= 1 && d <= 31 {
+				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
+			}
+		}
+		return ""
+	}
+
+	// Handle 2-digit year with delimiters: YY-MM-DD or YY/MM/DD etc.
+	// Replace various delimiters with -
+	normalized := normalizeDateDelimiters(datePart)
+	parts := strings.Split(normalized, "-")
+	if len(parts) == 3 {
+		yStr, mStr, dStr := parts[0], parts[1], parts[2]
+		y, errY := strconv.Atoi(yStr)
+		m, errM := strconv.Atoi(mStr)
+		d, errD := strconv.Atoi(dStr)
+		if errY == nil && errM == nil && errD == nil && m >= 0 && m <= 12 && d >= 0 && d <= 31 {
+			if len(yStr) <= 2 {
+				y = convert2DigitYear(y)
+			}
+			return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
+		}
+	}
+
+	return ""
+}
+
+// normalizeDateDelimiters replaces various date delimiters with '-'.
+func normalizeDateDelimiters(s string) string {
+	var result strings.Builder
+	for _, c := range s {
+		switch c {
+		case '/', '.', '@':
+			result.WriteByte('-')
+		default:
+			result.WriteRune(c)
+		}
+	}
+	return result.String()
+}
+
+// normalizeDateTimeSeparators replaces various time separator characters with ':'.
+func normalizeDateTimeSeparators(s string) string {
+	var result strings.Builder
+	for _, c := range s {
+		switch c {
+		case '*', '+', '^':
+			result.WriteByte(':')
+		default:
+			result.WriteRune(c)
+		}
+	}
+	return result.String()
+}
+
+// looksLikeDate checks if a string looks like a date value (contains date separators).
+func looksLikeDate(s string) bool {
+	// Contains date-like separator and has digits
+	if len(s) < 6 {
+		return false
+	}
+	return strings.ContainsAny(s, "-/.")
+}
+
+// convert2DigitYear converts a 2-digit year to 4-digit year.
+// 0-69 -> 2000-2069, 70-99 -> 1970-1999
+func convert2DigitYear(yy int) int {
+	if yy >= 0 && yy <= 69 {
+		return 2000 + yy
+	}
+	if yy >= 70 && yy <= 99 {
+		return 1900 + yy
+	}
+	return yy
 }
 
 // validateEnumSetValue validates and normalizes a value for ENUM/SET columns.
@@ -1492,7 +1903,18 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 			break
 		}
 	}
+	// Handle bare DECIMAL/DOUBLE/FLOAT/REAL without (M,D) -> default to (10,0)
 	if prefix == "" {
+		for _, p := range []string{"decimal", "double", "float", "real"} {
+			if cleanLower == p {
+				f := toFloat(v)
+				// Round to nearest integer (DECIMAL(10,0) rounds, not truncates)
+				if f >= 0 {
+					return int64(f + 0.5)
+				}
+				return -int64(-f + 0.5)
+			}
+		}
 		return v
 	}
 	// For string values, only format if the string is a valid number.
@@ -1505,8 +1927,43 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 	var m, d int
 	if n, err := fmt.Sscanf(cleanLower, prefix+"(%d,%d)", &m, &d); err == nil && n == 2 {
 		f := toFloat(v)
+		isUnsigned := strings.Contains(lower, "unsigned")
+
+		// Clip to the valid range for DECIMAL(M,D) (non-strict mode behavior)
+		intDigits := m - d
+		if intDigits > 0 {
+			maxIntPart := 1.0
+			for i := 0; i < intDigits; i++ {
+				maxIntPart *= 10
+			}
+			maxFrac := 1.0
+			for i := 0; i < d; i++ {
+				maxFrac *= 10
+			}
+			maxVal := maxIntPart - 1.0/maxFrac
+			if d == 0 {
+				maxVal = maxIntPart - 1
+			}
+			// Only clip small overflows (from rounding) - don't clip large overflows
+			// which should be errors in strict mode
+			if f > maxVal {
+				if f <= maxVal*1.001+0.01 { // small overflow from rounding
+					f = maxVal
+				}
+			}
+			if !isUnsigned && f < -maxVal {
+				if f >= -maxVal*1.001-0.01 {
+					f = -maxVal
+				}
+			}
+		}
+
 		if d == 0 {
-			return int64(f)
+			// Round to nearest integer (MySQL DECIMAL rounds, not truncates)
+			if f >= 0 {
+				return int64(f + 0.5)
+			}
+			return -int64(-f + 0.5)
 		}
 		if prefix == "decimal" {
 			// DECIMAL: round to d decimal places (exact arithmetic)
@@ -4712,6 +5169,15 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		}, nil
 	}
 
+	// Handle @@warning_count / @@error_count
+	if strings.Contains(upper, "WARNING_COUNT") || strings.Contains(upper, "ERROR_COUNT") {
+		return &Result{
+			Columns:     []string{"@@warning_count"},
+			Rows:        [][]interface{}{{int64(0)}},
+			IsResultSet: true,
+		}, nil
+	}
+
 	// SHOW ENGINE INNODB STATUS
 	if strings.HasPrefix(upper, "SHOW ENGINE") {
 		return &Result{
@@ -5455,11 +5921,22 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.BinaryExpr:
 		left, err := e.evalExpr(v.Left)
 		if err != nil {
-			return nil, err
+			// For INT_OVERFLOW in arithmetic context, treat as max uint64
+			if strings.HasPrefix(err.Error(), "INT_OVERFLOW:") {
+				left = uint64(18446744073709551615)
+				err = nil
+			} else {
+				return nil, err
+			}
 		}
 		right, err := e.evalExpr(v.Right)
 		if err != nil {
-			return nil, err
+			if strings.HasPrefix(err.Error(), "INT_OVERFLOW:") {
+				right = uint64(18446744073709551615)
+				err = nil
+			} else {
+				return nil, err
+			}
 		}
 		return evalBinaryExpr(left, right, v.Operator)
 	case *sqlparser.ComparisonExpr:
@@ -5714,6 +6191,53 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return nil, err
 		}
 		return toString(val), nil
+	case *sqlparser.CharExpr:
+		// CHAR(N1, N2, ...) — convert integers to characters
+		var sb strings.Builder
+		for _, argExpr := range v.Exprs {
+			val, err := e.evalExpr(argExpr)
+			if err != nil {
+				return nil, err
+			}
+			if val == nil {
+				continue
+			}
+			n := toInt64(val)
+			if n >= 0 && n <= 255 {
+				sb.WriteByte(byte(n))
+			}
+		}
+		return sb.String(), nil
+	case *sqlparser.CollateExpr:
+		// Ignore COLLATE clause and evaluate inner expression
+		return e.evalExpr(v.Expr)
+	case *sqlparser.IntervalDateExpr:
+		// DATE_ADD / DATE_SUB / ADDDATE / SUBDATE
+		dateVal, err := e.evalExpr(v.Date)
+		if err != nil {
+			return nil, err
+		}
+		if dateVal == nil {
+			return nil, nil
+		}
+		intervalVal, err := e.evalExpr(v.Interval)
+		if err != nil {
+			return nil, err
+		}
+		return evalIntervalDateExpr(dateVal, intervalVal, v.Unit, v.Syntax)
+	case *sqlparser.AssignmentExpr:
+		// @var := expr — evaluate the right side, assign to user variable, return value
+		val, err := e.evalExpr(v.Right)
+		if err != nil {
+			return nil, err
+		}
+		varName := strings.TrimPrefix(sqlparser.String(v.Left), "@")
+		varName = strings.Trim(varName, "`")
+		if e.userVars == nil {
+			e.userVars = make(map[string]interface{})
+		}
+		e.userVars[varName] = val
+		return val, nil
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
 }
@@ -5875,6 +6399,66 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, nil
 		}
 		return int64(mysqlCharLen(toString(val))), nil
+	case "ascii", "ord":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("ASCII requires 1 argument")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		s := toString(val)
+		if len(s) == 0 {
+			return int64(0), nil
+		}
+		return int64(s[0]), nil
+	case "load_file":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		filePath := toString(val)
+		// Try SearchPaths if not absolute
+		if !filepath.IsAbs(filePath) && len(e.SearchPaths) > 0 {
+			for _, sp := range e.SearchPaths {
+				candidate := filepath.Join(sp, filePath)
+				if _, err := os.Stat(candidate); err == nil {
+					filePath = candidate
+					break
+				}
+			}
+		}
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			return nil, nil // MySQL returns NULL if file cannot be read
+		}
+		return string(data), nil
+	case "char":
+		// CHAR(N1, N2, ...) returns the string from the character codes
+		var sb strings.Builder
+		for _, argExpr := range v.Exprs {
+			val, err := e.evalExpr(argExpr)
+			if err != nil {
+				return nil, err
+			}
+			if val == nil {
+				continue
+			}
+			n := toInt64(val)
+			if n >= 0 && n <= 255 {
+				sb.WriteByte(byte(n))
+			}
+		}
+		return sb.String(), nil
 	case "substring", "substr", "mid":
 		if len(v.Exprs) < 2 {
 			return nil, fmt.Errorf("SUBSTRING requires at least 2 arguments")
@@ -6105,6 +6689,45 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			factor *= 10
 		}
 		return float64(int64(f*factor+0.5)) / factor, nil
+	case "truncate":
+		if len(v.Exprs) < 2 {
+			return nil, fmt.Errorf("TRUNCATE requires 2 arguments")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		dv, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		f := toFloat(val)
+		decimals := toInt64(dv)
+		if decimals == 0 {
+			if f >= 0 {
+				return int64(f), nil
+			}
+			return -int64(-f), nil
+		}
+		if decimals > 0 {
+			factor := 1.0
+			for j := int64(0); j < decimals; j++ {
+				factor *= 10
+			}
+			if f >= 0 {
+				return float64(int64(f*factor)) / factor, nil
+			}
+			return -float64(int64(-f*factor)) / factor, nil
+		}
+		// Negative decimals: truncate to the left of decimal point
+		factor := 1.0
+		for j := int64(0); j < -decimals; j++ {
+			factor *= 10
+		}
+		return int64(f/factor) * int64(factor), nil
 	case "mod":
 		if len(v.Exprs) < 2 {
 			return nil, fmt.Errorf("MOD requires 2 arguments")
@@ -6452,6 +7075,61 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, nil
 		}
 		return string(decoded), nil
+	case "strcmp":
+		if len(v.Exprs) < 2 {
+			return nil, fmt.Errorf("STRCMP requires 2 arguments")
+		}
+		v0, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		v1, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		if v0 == nil || v1 == nil {
+			return nil, nil
+		}
+		s0 := strings.ToLower(toString(v0))
+		s1 := strings.ToLower(toString(v1))
+		if s0 < s1 {
+			return int64(-1), nil
+		} else if s0 > s1 {
+			return int64(1), nil
+		}
+		return int64(0), nil
+	case "reverse":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		runes := []rune(toString(val))
+		for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
+			runes[i], runes[j] = runes[j], runes[i]
+		}
+		return string(runes), nil
+	case "oct":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		n := toInt64(val)
+		if n < 0 {
+			return fmt.Sprintf("%o", uint64(n)), nil
+		}
+		return fmt.Sprintf("%o", n), nil
 	case "addtime":
 		if len(v.Exprs) < 2 {
 			return nil, nil
@@ -6752,23 +7430,6 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			}
 		}
 		return int64(0), nil
-	case "reverse":
-		// REVERSE(str) reverses the string.
-		if len(v.Exprs) < 1 {
-			return nil, fmt.Errorf("REVERSE requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		runes := []rune(toString(val))
-		for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
-			runes[i], runes[j] = runes[j], runes[i]
-		}
-		return string(runes), nil
 	case "lpad":
 		// LPAD(str, len, padstr) left-pads str with padstr to len characters.
 		if len(v.Exprs) < 3 {
@@ -6992,7 +7653,131 @@ func parseDateTimeValue(val interface{}) (time.Time, error) {
 			return t, nil
 		}
 	}
+	// Try to parse using parseMySQLDateValue for various formats (2-digit year, delimiters, etc.)
+	parsed := parseMySQLDateValue(s)
+	if parsed != "" {
+		// Check if there's a time part after the date
+		timePart := ""
+		if idx := strings.Index(s, " "); idx >= 0 {
+			timePart = strings.TrimSpace(s[idx+1:])
+			timePart = normalizeDateTimeSeparators(timePart)
+		}
+		dateStr := parsed
+		if timePart != "" {
+			dateStr = parsed + " " + timePart
+		}
+		for _, f := range formats {
+			if t, err := time.Parse(f, dateStr); err == nil {
+				return t, nil
+			}
+		}
+		// At least try parsing the date portion
+		if t, err := time.Parse("2006-01-02", parsed); err == nil {
+			return t, nil
+		}
+	}
+	// Fallback: manually parse YYYY-MM-DD (handles invalid dates like 2009-04-31, 2010-00-01)
+	if len(s) >= 10 && (s[4] == '-') && (s[7] == '-') {
+		y, ey := strconv.Atoi(s[:4])
+		m, em := strconv.Atoi(s[5:7])
+		d, ed := strconv.Atoi(s[8:10])
+		if ey == nil && em == nil && ed == nil && m >= 0 && m <= 12 && d >= 0 && d <= 31 {
+			// Clamp invalid month/day for Go's time.Date (which normalizes)
+			if m == 0 {
+				m = 1
+			}
+			if d == 0 {
+				d = 1
+			}
+			// Create approximate time (may not be exact for invalid dates)
+			t := time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC)
+			// If there's a time part, parse it
+			if len(s) > 10 && s[10] == ' ' {
+				parts := strings.Split(s[11:], ":")
+				if len(parts) >= 3 {
+					h, _ := strconv.Atoi(parts[0])
+					mi, _ := strconv.Atoi(parts[1])
+					sec, _ := strconv.Atoi(strings.Split(parts[2], ".")[0])
+					t = time.Date(y, time.Month(m), d, h, mi, sec, 0, time.UTC)
+				}
+			}
+			return t, nil
+		}
+	}
 	return time.Time{}, fmt.Errorf("cannot parse date/time value: %q", s)
+}
+
+// evalIntervalDateExpr evaluates DATE_ADD/DATE_SUB expressions.
+func evalIntervalDateExpr(dateVal, intervalVal interface{}, unit sqlparser.IntervalType, syntax sqlparser.IntervalExprSyntax) (interface{}, error) {
+	t, err := parseDateTimeValue(dateVal)
+	if err != nil {
+		return toString(dateVal), nil
+	}
+	iStr := toString(intervalVal)
+	isSubtract := syntax == sqlparser.IntervalDateExprDateSub || syntax == sqlparser.IntervalDateExprSubdate
+
+	switch unit {
+	case sqlparser.IntervalDay:
+		n, _ := strconv.Atoi(iStr)
+		if isSubtract {
+			n = -n
+		}
+		t = t.AddDate(0, 0, n)
+	case sqlparser.IntervalMonth:
+		n, _ := strconv.Atoi(iStr)
+		if isSubtract {
+			n = -n
+		}
+		t = t.AddDate(0, n, 0)
+	case sqlparser.IntervalYear:
+		n, _ := strconv.Atoi(iStr)
+		if isSubtract {
+			n = -n
+		}
+		t = t.AddDate(n, 0, 0)
+	case sqlparser.IntervalHour:
+		n, _ := strconv.Atoi(iStr)
+		d := time.Duration(n) * time.Hour
+		if isSubtract {
+			d = -d
+		}
+		t = t.Add(d)
+	case sqlparser.IntervalMinute:
+		n, _ := strconv.Atoi(iStr)
+		d := time.Duration(n) * time.Minute
+		if isSubtract {
+			d = -d
+		}
+		t = t.Add(d)
+	case sqlparser.IntervalSecond:
+		n, _ := strconv.Atoi(iStr)
+		d := time.Duration(n) * time.Second
+		if isSubtract {
+			d = -d
+		}
+		t = t.Add(d)
+	case sqlparser.IntervalDaySecond:
+		// Format: 'D HH:MM:SS' or 'D H:M:S'
+		dur, _ := parseMySQLTimeInterval(iStr)
+		if isSubtract {
+			dur = -dur
+		}
+		t = t.Add(dur)
+	default:
+		// Try to parse as a time interval for unsupported types
+		dur, _ := parseMySQLTimeInterval(iStr)
+		if isSubtract {
+			dur = -dur
+		}
+		t = t.Add(dur)
+	}
+
+	// Format output based on whether the original had time component
+	ds := toString(dateVal)
+	if strings.Contains(ds, " ") || strings.Contains(ds, ":") || t.Hour() != 0 || t.Minute() != 0 || t.Second() != 0 {
+		return t.Format("2006-01-02 15:04:05"), nil
+	}
+	return t.Format("2006-01-02"), nil
 }
 
 // parseMySQLTimeInterval parses MySQL time interval strings like "1 01:01:01" or "01:01:01".
@@ -7152,6 +7937,16 @@ func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator) (i
 			return nil, nil
 		}
 		return int64(lf) % int64(rf), nil
+	case sqlparser.ShiftLeftOp:
+		return uint64(int64(lf)) << uint64(int64(rf)), nil
+	case sqlparser.ShiftRightOp:
+		return uint64(int64(lf)) >> uint64(int64(rf)), nil
+	case sqlparser.BitAndOp:
+		return uint64(int64(lf)) & uint64(int64(rf)), nil
+	case sqlparser.BitOrOp:
+		return uint64(int64(lf)) | uint64(int64(rf)), nil
+	case sqlparser.BitXorOp:
+		return uint64(int64(lf)) ^ uint64(int64(rf)), nil
 	default:
 		return nil, fmt.Errorf("unsupported binary operator: %v", op)
 	}
@@ -7187,6 +7982,8 @@ func toInt64(v interface{}) int64 {
 	switch n := v.(type) {
 	case int64:
 		return n
+	case uint64:
+		return int64(n)
 	case float64:
 		return int64(n)
 	case string:
@@ -7345,6 +8142,49 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		val, err := e.evalExpr(expr)
 		e.correlatedRow = oldCorrelated
 		return val, err
+	case *sqlparser.CharExpr:
+		// CHAR(N1, N2, ...) with row context
+		var sb strings.Builder
+		for _, argExpr := range v.Exprs {
+			val, err := e.evalRowExpr(argExpr, row)
+			if err != nil {
+				return nil, err
+			}
+			if val == nil {
+				continue
+			}
+			n := toInt64(val)
+			if n >= 0 && n <= 255 {
+				sb.WriteByte(byte(n))
+			}
+		}
+		return sb.String(), nil
+	case *sqlparser.CollateExpr:
+		// Ignore COLLATE and evaluate inner expression with row context
+		return e.evalRowExpr(v.Expr, row)
+	case *sqlparser.IntervalDateExpr:
+		dateVal, err := e.evalRowExpr(v.Date, row)
+		if err != nil {
+			return nil, err
+		}
+		intervalVal, err := e.evalRowExpr(v.Interval, row)
+		if err != nil {
+			return nil, err
+		}
+		return evalIntervalDateExpr(dateVal, intervalVal, v.Unit, v.Syntax)
+	case *sqlparser.AssignmentExpr:
+		// @var := expr with row context
+		val, err := e.evalRowExpr(v.Right, row)
+		if err != nil {
+			return nil, err
+		}
+		varName := strings.TrimPrefix(sqlparser.String(v.Left), "@")
+		varName = strings.Trim(varName, "`")
+		if e.userVars == nil {
+			e.userVars = make(map[string]interface{})
+		}
+		e.userVars[varName] = val
+		return val, nil
 	case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg:
 		// For HAVING clause: look up the aggregate display name in the row
 		displayName := aggregateDisplayName(expr)
@@ -8108,6 +8948,146 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		return strings.TrimRight(toString(args[0]), " \t\n\r"), nil
 	default:
 		// Try user-defined function from catalog
+		// Row-context versions of common functions
+		switch name {
+		case "ascii", "ord":
+			args, err := evalArgs()
+			if err != nil {
+				return nil, err
+			}
+			if len(args) < 1 || args[0] == nil {
+				return nil, nil
+			}
+			s := toString(args[0])
+			if len(s) == 0 {
+				return int64(0), nil
+			}
+			return int64(s[0]), nil
+		case "char":
+			args, err := evalArgs()
+			if err != nil {
+				return nil, err
+			}
+			var sb strings.Builder
+			for _, arg := range args {
+				if arg == nil {
+					continue
+				}
+				n := toInt64(arg)
+				if n >= 0 && n <= 255 {
+					sb.WriteByte(byte(n))
+				}
+			}
+			return sb.String(), nil
+		case "strcmp":
+			args, err := evalArgs()
+			if err != nil {
+				return nil, err
+			}
+			if len(args) < 2 || args[0] == nil || args[1] == nil {
+				return nil, nil
+			}
+			s0, s1 := strings.ToLower(toString(args[0])), strings.ToLower(toString(args[1]))
+			if s0 < s1 {
+				return int64(-1), nil
+			} else if s0 > s1 {
+				return int64(1), nil
+			}
+			return int64(0), nil
+		case "reverse":
+			args, err := evalArgs()
+			if err != nil {
+				return nil, err
+			}
+			if len(args) < 1 || args[0] == nil {
+				return nil, nil
+			}
+			runes := []rune(toString(args[0]))
+			for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
+				runes[i], runes[j] = runes[j], runes[i]
+			}
+			return string(runes), nil
+		case "oct":
+			args, err := evalArgs()
+			if err != nil {
+				return nil, err
+			}
+			if len(args) < 1 || args[0] == nil {
+				return nil, nil
+			}
+			n := toInt64(args[0])
+			if n < 0 {
+				return fmt.Sprintf("%o", uint64(n)), nil
+			}
+			return fmt.Sprintf("%o", n), nil
+		case "bin":
+			args, err := evalArgs()
+			if err != nil {
+				return nil, err
+			}
+			if len(args) < 1 || args[0] == nil {
+				return nil, nil
+			}
+			n := toInt64(args[0])
+			if n < 0 {
+				return fmt.Sprintf("%b", uint64(n)), nil
+			}
+			return fmt.Sprintf("%b", n), nil
+		case "truncate":
+			args, err := evalArgs()
+			if err != nil {
+				return nil, err
+			}
+			if len(args) < 2 || args[0] == nil {
+				return nil, nil
+			}
+			f := toFloat(args[0])
+			decimals := toInt64(args[1])
+			if decimals == 0 {
+				if f >= 0 {
+					return int64(f), nil
+				}
+				return -int64(-f), nil
+			}
+			if decimals > 0 {
+				factor := 1.0
+				for j := int64(0); j < decimals; j++ {
+					factor *= 10
+				}
+				if f >= 0 {
+					return float64(int64(f*factor)) / factor, nil
+				}
+				return -float64(int64(-f*factor)) / factor, nil
+			}
+			factor := 1.0
+			for j := int64(0); j < -decimals; j++ {
+				factor *= 10
+			}
+			return int64(f/factor) * int64(factor), nil
+		case "load_file":
+			args, err := evalArgs()
+			if err != nil {
+				return nil, err
+			}
+			if len(args) < 1 || args[0] == nil {
+				return nil, nil
+			}
+			filePath := toString(args[0])
+			if !filepath.IsAbs(filePath) && len(e.SearchPaths) > 0 {
+				for _, sp := range e.SearchPaths {
+					candidate := filepath.Join(sp, filePath)
+					if _, statErr := os.Stat(candidate); statErr == nil {
+						filePath = candidate
+						break
+					}
+				}
+			}
+			data, readErr := os.ReadFile(filePath)
+			if readErr != nil {
+				return nil, nil
+			}
+			return string(data), nil
+		}
 		if result, err := e.callUserDefinedFunction(name, v.Exprs, &row); err == nil {
 			return result, nil
 		}
@@ -8173,6 +9153,16 @@ func (e *Executor) evalBinaryExprWithRow(v *sqlparser.BinaryExpr, row storage.Ro
 			return nil, nil
 		}
 		return int64(l) % int64(r), nil
+	case sqlparser.ShiftLeftOp:
+		return uint64(int64(l)) << uint64(int64(r)), nil
+	case sqlparser.ShiftRightOp:
+		return uint64(int64(l)) >> uint64(int64(r)), nil
+	case sqlparser.BitAndOp:
+		return uint64(int64(l)) & uint64(int64(r)), nil
+	case sqlparser.BitOrOp:
+		return uint64(int64(l)) | uint64(int64(r)), nil
+	case sqlparser.BitXorOp:
+		return uint64(int64(l)) ^ uint64(int64(r)), nil
 	}
 	return e.evalExpr(v)
 }
@@ -8521,7 +9511,18 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 				return fl == fr, nil
 			}
 		}
-		return ls == rs, nil
+		if ls == rs {
+			return true, nil
+		}
+		// Try date normalization if strings look like dates
+		if looksLikeDate(ls) || looksLikeDate(rs) {
+			ln := parseMySQLDateValue(ls)
+			rn := parseMySQLDateValue(rs)
+			if ln != "" && rn != "" {
+				return ln == rn, nil
+			}
+		}
+		return false, nil
 	case sqlparser.NotEqualOp:
 		ls, rs := fmt.Sprintf("%v", left), fmt.Sprintf("%v", right)
 		if fl, errL := strconv.ParseFloat(ls, 64); errL == nil {
@@ -8529,7 +9530,18 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 				return fl != fr, nil
 			}
 		}
-		return ls != rs, nil
+		if ls == rs {
+			return false, nil
+		}
+		// Try date normalization
+		if looksLikeDate(ls) || looksLikeDate(rs) {
+			ln := parseMySQLDateValue(ls)
+			rn := parseMySQLDateValue(rs)
+			if ln != "" && rn != "" {
+				return ln != rn, nil
+			}
+		}
+		return true, nil
 	case sqlparser.LessThanOp:
 		return compareNumeric(left, right) < 0, nil
 	case sqlparser.GreaterThanOp:
@@ -8604,10 +9616,14 @@ func compareNumeric(a, b interface{}) int {
 	if aIsStr || bIsStr {
 		sa := toString(a)
 		sb := toString(b)
-		// Only try numeric comparison when one value is not a string
-		// (i.e., mixing numeric and string). When both are strings,
-		// always use string comparison (MySQL uses collation-based ordering).
-		if !aIsStr || !bIsStr {
+		// Try numeric comparison when at least one value is not a string,
+		// or when both are short numeric-looking strings (like "99999.99999" vs "-99999")
+		shouldTryNumeric := !aIsStr || !bIsStr
+		if !shouldTryNumeric && len(sa) <= 20 && len(sb) <= 20 {
+			// Both are strings, but short enough to be valid numbers
+			shouldTryNumeric = true
+		}
+		if shouldTryNumeric {
 			fa, errA := strconv.ParseFloat(sa, 64)
 			fb, errB := strconv.ParseFloat(sb, 64)
 			if errA == nil && errB == nil {
@@ -8696,6 +9712,8 @@ func isDatetimeString(s string) bool {
 func toFloat(v interface{}) float64 {
 	switch n := v.(type) {
 	case int64:
+		return float64(n)
+	case uint64:
 		return float64(n)
 	case float64:
 		return n
