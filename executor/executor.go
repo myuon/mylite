@@ -1578,6 +1578,10 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			}
 			if col.Type.Options.Default != nil {
 				defStr := sqlparser.String(col.Type.Options.Default)
+				// Strip surrounding quotes from default values (vitess adds them)
+				if len(defStr) >= 2 && defStr[0] == '\'' && defStr[len(defStr)-1] == '\'' {
+					defStr = defStr[1 : len(defStr)-1]
+				}
 				colDef.Default = &defStr
 			}
 			switch col.Type.Options.KeyOpt {
@@ -3975,6 +3979,10 @@ func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 		}
 		if col.Type.Options.Default != nil {
 			defStr := sqlparser.String(col.Type.Options.Default)
+			// Strip surrounding quotes from default values (vitess adds them)
+			if len(defStr) >= 2 && defStr[0] == '\'' && defStr[len(defStr)-1] == '\'' {
+				defStr = defStr[1 : len(defStr)-1]
+			}
 			colDef.Default = &defStr
 		}
 		if col.Type.Options.KeyOpt == 1 { // colKeyPrimary
