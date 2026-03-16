@@ -3686,15 +3686,20 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			for _, col := range tbl.Def.Columns {
 				// In strict mode, missing NOT NULL columns without defaults are errors
 				if e.isStrictMode() && !col.Nullable && !col.AutoIncrement && col.Default == nil && !colNameSet[col.Name] {
-					return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
+					return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
 				}
 				// Explicit NULL into NOT NULL column
 				if !col.Nullable && !col.AutoIncrement && colNameSet[col.Name] {
 					if v, ok := row[col.Name]; ok && v == nil {
-						if e.isStrictMode() {
+						// In multi-row INSERT non-strict mode: convert NULL to zero + warning
+						// In single-row INSERT or strict mode: error
+						isMultiRow := false
+						if valTuples, ok := stmt.Rows.(sqlparser.Values); ok {
+							isMultiRow = len(valTuples) > 1
+						}
+						if e.isStrictMode() || !isMultiRow {
 							return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
 						}
-						// Non-strict mode: generate warning and use zero value
 						e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", col.Name))
 						row[col.Name] = implicitZeroValue(col.Type)
 					}
