@@ -1748,21 +1748,27 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 }
 
 func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
-	db, err := e.Catalog.GetDatabase(e.CurrentDB)
-	if err != nil {
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
-	}
-
 	for _, table := range stmt.FromTables {
 		tableName := table.Name.String()
-		err := db.DropTable(tableName)
+		dbName := e.CurrentDB
+		if !table.Qualifier.IsEmpty() {
+			dbName = table.Qualifier.String()
+		}
+		db, err := e.Catalog.GetDatabase(dbName)
 		if err != nil {
 			if stmt.IfExists {
 				continue
 			}
-			return nil, mysqlError(1051, "42S02", fmt.Sprintf("Unknown table '%s.%s'", e.CurrentDB, tableName))
+			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
 		}
-		e.Storage.DropTable(e.CurrentDB, tableName)
+		err = db.DropTable(tableName)
+		if err != nil {
+			if stmt.IfExists {
+				continue
+			}
+			return nil, mysqlError(1051, "42S02", fmt.Sprintf("Unknown table '%s.%s'", dbName, tableName))
+		}
+		e.Storage.DropTable(dbName, tableName)
 		// Clean up temp table tracking
 		delete(e.tempTables, tableName)
 		// Drop triggers associated with this table (MySQL behavior)
