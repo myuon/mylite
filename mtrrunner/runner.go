@@ -141,6 +141,11 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		}
 	}
 
+	// Check if test was skipped via --skip directive
+	if ctx.skipped {
+		return TestResult{Name: name, Skipped: true}
+	}
+
 	actual := ctx.output.String()
 
 	// If no result file, pass if no errors
@@ -211,6 +216,7 @@ type execContext struct {
 	tmpDir           string // temporary directory for file operations
 	replaceColumns   map[int]string // column index (1-based) -> replacement value for next query
 	replaceResult    []string // pairs of [from, to] for --replace_result
+	skipped          bool   // set to true when --skip directive is encountered
 }
 
 func (ctx *execContext) executeLines(lines []string) error {
@@ -477,6 +483,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 
 	switch name {
 	case "skip":
+		ctx.skipped = true
 		return true, true, nil
 
 	case "error":
