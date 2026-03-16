@@ -4943,6 +4943,14 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 			if err != nil {
 				return nil, err
 			}
+			if len(selectTableDefs) == 1 && strings.EqualFold(selectTableDefs[0].Charset, "ucs2") {
+				if _, isCol := expr.(*sqlparser.ColName); isCol {
+					if s, ok := val.(string); ok {
+						s = strings.ReplaceAll(s, "＼", "\\")
+						val = s
+					}
+				}
+			}
 			resultRow[i] = val
 		}
 		resultRows = append(resultRows, resultRow)
