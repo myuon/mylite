@@ -5976,6 +5976,94 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		}
 		tbl.Lock()
 
+		// Enforce NOT NULL constraints on final NEW values.
+		for _, col := range tbl.Def.Columns {
+			if col.Nullable {
+				continue
+			}
+			if val, ok := newRow[col.Name]; ok && val == nil {
+				if bool(stmt.Ignore) {
+					e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", col.Name))
+					newRow[col.Name] = implicitZeroValue(col.Type)
+					continue
+				}
+				return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
+			}
+		}
+
+		// Enforce PRIMARY KEY / UNIQUE constraints for the updated row.
+		dupErr := func() error {
+			// Resolve primary key columns (table-level or column-level declaration).
+			pkCols := make([]string, 0, len(tbl.Def.PrimaryKey))
+			if len(tbl.Def.PrimaryKey) > 0 {
+				pkCols = append(pkCols, tbl.Def.PrimaryKey...)
+			} else {
+				for _, col := range tbl.Def.Columns {
+					if col.PrimaryKey {
+						pkCols = append(pkCols, col.Name)
+					}
+				}
+			}
+			if len(pkCols) > 0 {
+				for j, other := range tbl.Rows {
+					if j == i {
+						continue
+					}
+					match := true
+					for _, pk := range pkCols {
+						if fmt.Sprintf("%v", other[pk]) != fmt.Sprintf("%v", newRow[pk]) {
+							match = false
+							break
+						}
+					}
+					if match {
+						keyVals := make([]string, len(pkCols))
+						for k, pk := range pkCols {
+							keyVals[k] = fmt.Sprintf("%v", newRow[pk])
+						}
+						return mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key 'PRIMARY'", strings.Join(keyVals, "-")))
+					}
+				}
+			}
+			for _, idx := range tbl.Def.Indexes {
+				if !idx.Unique {
+					continue
+				}
+				for j, other := range tbl.Rows {
+					if j == i {
+						continue
+					}
+					match := true
+					vals := make([]string, 0, len(idx.Columns))
+					for _, c := range idx.Columns {
+						nv := newRow[c]
+						ov := other[c]
+						// NULL values do not conflict under UNIQUE.
+						if nv == nil || ov == nil {
+							match = false
+							break
+						}
+						if fmt.Sprintf("%v", nv) != fmt.Sprintf("%v", ov) {
+							match = false
+							break
+						}
+						vals = append(vals, fmt.Sprintf("%v", nv))
+					}
+					if match {
+						return mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key '%s'", strings.Join(vals, "-"), idx.Name))
+					}
+				}
+			}
+			return nil
+		}()
+		if dupErr != nil {
+			if bool(stmt.Ignore) {
+				e.addWarning("Warning", 1062, strings.TrimPrefix(dupErr.Error(), "ERROR 1062 (23000): "))
+				continue
+			}
+			return nil, dupErr
+		}
+
 		// Apply the trigger-modified newRow values to the actual row
 		for _, col := range tbl.Def.Columns {
 			if val, ok := newRow[col.Name]; ok {
@@ -9993,6 +10081,10 @@ func (e *Executor) evalCaseExpr(v *sqlparser.CaseExpr) (interface{}, error) {
 
 // evalBinaryExpr evaluates arithmetic binary expressions.
 func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator) (interface{}, error) {
+	// MySQL arithmetic/bit operations with NULL yield NULL.
+	if left == nil || right == nil {
+		return nil, nil
+	}
 	lf := toFloat(left)
 	rf := toFloat(right)
 	var result float64
@@ -11278,6 +11370,10 @@ func (e *Executor) evalBinaryExprWithRow(v *sqlparser.BinaryExpr, row storage.Ro
 	if err != nil {
 		return nil, err
 	}
+	// MySQL arithmetic/bit operations with NULL yield NULL.
+	if left == nil || right == nil {
+		return nil, nil
+	}
 	l := toFloat(left)
 	r := toFloat(right)
 	switch v.Operator {
@@ -11427,7 +11523,7 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 					continue
 				}
 				ls, rs := fmt.Sprintf("%v", left), fmt.Sprintf("%v", val)
-				ls, rs = normalizeYearComparisonTyped(ls, rs, left, val)
+				ls, rs = normalizeYearComparisonTypedStringOnly(ls, rs, left, val)
 				if fl, errL := strconv.ParseFloat(ls, 64); errL == nil {
 					if fr, errR := strconv.ParseFloat(rs, 64); errR == nil {
 						if fl == fr {
@@ -11702,10 +11798,61 @@ func normalizeYearComparisonTyped(ls, rs string, origLeft, origRight interface{}
 		}
 		return n
 	}
-	// Only convert string values, not integer literals
+	// Prefer conversions when at least one side is originally string-typed.
+	// YEAR columns are stored as strings in this engine, while many non-YEAR
+	// numeric columns stay numeric. This avoids forcing year conversion when
+	// both sides are plain numeric values.
 	isOrigString := func(orig interface{}) bool {
 		if orig == nil {
 			return true // Unknown type, assume string for backward compat
+		}
+		_, ok := orig.(string)
+		return ok
+	}
+
+	if isYearLike(li) && isSmallYear(ri) && !isYearLike(ri) && (isOrigString(origLeft) || isOrigString(origRight)) {
+		ri = convertSmallYear(ri)
+		return ls, fmt.Sprintf("%d", ri)
+	}
+	if isYearLike(ri) && isSmallYear(li) && !isYearLike(li) && (isOrigString(origLeft) || isOrigString(origRight)) {
+		li = convertSmallYear(li)
+		return fmt.Sprintf("%d", li), rs
+	}
+	return ls, rs
+}
+
+// normalizeYearComparisonTypedStringOnly is a stricter YEAR normalization used
+// by IN/NOT IN where this engine expects only string-side small years
+// ('1'..'99') to be converted.
+func normalizeYearComparisonTypedStringOnly(ls, rs string, origLeft, origRight interface{}) (string, string) {
+	lf, le := strconv.ParseFloat(ls, 64)
+	rf, re := strconv.ParseFloat(rs, 64)
+	if le != nil || re != nil {
+		return ls, rs
+	}
+	li, ri := int(lf), int(rf)
+
+	isYearLike := func(n int) bool {
+		return n == 0 || (n >= 1901 && n <= 2155)
+	}
+	isSmallYear := func(n int) bool {
+		return n >= 0 && n <= 99
+	}
+	convertSmallYear := func(n int) int {
+		if n == 0 {
+			return 0
+		}
+		if n >= 1 && n <= 69 {
+			return 2000 + n
+		}
+		if n >= 70 && n <= 99 {
+			return 1900 + n
+		}
+		return n
+	}
+	isOrigString := func(orig interface{}) bool {
+		if orig == nil {
+			return true
 		}
 		_, ok := orig.(string)
 		return ok
