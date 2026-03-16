@@ -345,14 +345,16 @@ func normalizeRows(rows [][]interface{}) [][]interface{} {
 	}
 	numCols := len(rows[0])
 	// For each column determine the MySQL type category of the first non-null value.
-	// Categories: 0=unknown, 1=int, 2=float, 3=string/bytes, 4=time
+	// Categories: 0=unknown, 1=signed int, 2=float, 3=string/bytes, 4=time, 5=unsigned int
 	colCat := make([]int, numCols)
 	colMixed := make([]bool, numCols)
 
 	categoryOf := func(v interface{}) int {
 		switch v.(type) {
-		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		case int, int8, int16, int32, int64:
 			return 1
+		case uint, uint8, uint16, uint32, uint64:
+			return 5
 		case float32, float64:
 			return 2
 		case string, []byte:
