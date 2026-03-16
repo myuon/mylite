@@ -65,7 +65,9 @@ func main() {
 	// Set DataDir for resolving relative paths in LOAD DATA/SELECT INTO OUTFILE
 	exec.DataDir = dataDir
 	// Set search paths for LOAD DATA LOCAL INFILE
-	exec.SearchPaths = []string{*suiteRoot, *includeRoot}
+	// Include the parent of suiteRoot so that paths like "suite/jp/std_data/file.dat" resolve correctly
+	suiteParent := filepath.Dir(*suiteRoot)
+	exec.SearchPaths = []string{*suiteRoot, *includeRoot, suiteParent}
 
 	srv := server.New(exec, addr)
 	go func() {

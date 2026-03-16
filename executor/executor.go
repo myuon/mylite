@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
+	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/transform"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
@@ -247,7 +250,45 @@ func normalizeSQLDisplayName(s string) string {
 		compact := strings.TrimSpace(op)
 		s = strings.ReplaceAll(s, op, compact)
 	}
+	// MySQL displays function arguments without space after comma: LEFT(`c1`,0) not LEFT(`c1`, 0)
+	s = normalizeFuncArgSpaces(s)
+	// MySQL displays SUBSTRING, not SUBSTR in column headers
+	if strings.HasPrefix(s, "SUBSTR(") && !strings.HasPrefix(s, "SUBSTRING(") {
+		s = "SUBSTRING" + s[6:]
+	}
+	if strings.HasPrefix(s, "substr(") && !strings.HasPrefix(s, "substring(") {
+		s = "substring" + s[6:]
+	}
 	return s
+}
+
+// normalizeFuncArgSpaces removes spaces after commas inside function calls,
+// matching MySQL's column display name format (e.g., "LEFT(`c1`,0)" not "LEFT(`c1`, 0)").
+func normalizeFuncArgSpaces(s string) string {
+	var result strings.Builder
+	inQuote := byte(0)
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inQuote != 0 {
+			result.WriteByte(ch)
+			if ch == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' || ch == '`' {
+			inQuote = ch
+			result.WriteByte(ch)
+			continue
+		}
+		if ch == ',' && i+1 < len(s) && s[i+1] == ' ' {
+			result.WriteByte(',')
+			i++ // skip the space after comma
+			continue
+		}
+		result.WriteByte(ch)
+	}
+	return result.String()
 }
 
 // uppercaseSQLKeywords converts SQL keywords in a string to uppercase to match MySQL's
@@ -261,6 +302,7 @@ func uppercaseSQLKeywords(s string) string {
 		"null", "true", "false", "case", "when", "then", "else", "end",
 		"asc", "desc", "count", "sum", "avg", "min", "max", "upper", "lower",
 		"row", "with",
+		"leading", "trailing", "both",
 	}
 	result := []byte(s)
 	for _, kw := range keywords {
@@ -1662,6 +1704,8 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			def.Charset = strings.ToLower(opt.String)
 		case "COLLATE":
 			def.Collation = strings.ToLower(opt.String)
+		case "ENGINE":
+			def.Engine = strings.ToUpper(opt.String)
 		}
 	}
 	// If charset was set but collation was not, derive default collation
@@ -2382,6 +2426,31 @@ func (e *Executor) findDuplicateRow(tbl *storage.Table, candidate storage.Row, p
 // buildFromExpr builds rows from any TableExpr (AliasedTableExpr or JoinTableExpr).
 // Each row has both un-prefixed keys (for backwards compat with single-table queries)
 // and "alias.col" prefixed keys (for JOIN disambiguation).
+// collectTableDefs extracts table definitions from a FROM expression, handling both
+// simple table references and JOINs.
+func (e *Executor) collectTableDefs(expr sqlparser.TableExpr) []*catalog.TableDef {
+	switch te := expr.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if tn, ok := te.Expr.(sqlparser.TableName); ok {
+			tblName := tn.Name.String()
+			lookupDB := e.CurrentDB
+			if !tn.Qualifier.IsEmpty() {
+				lookupDB = tn.Qualifier.String()
+			}
+			if db, err := e.Catalog.GetDatabase(lookupDB); err == nil {
+				if td, err := db.GetTable(tblName); err == nil {
+					return []*catalog.TableDef{td}
+				}
+			}
+		}
+	case *sqlparser.JoinTableExpr:
+		left := e.collectTableDefs(te.LeftExpr)
+		right := e.collectTableDefs(te.RightExpr)
+		return append(left, right...)
+	}
+	return nil
+}
+
 func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error) {
 	switch te := expr.(type) {
 	case *sqlparser.AliasedTableExpr:
@@ -2813,21 +2882,53 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// Collect table definitions for proper column ordering in SELECT *
 	var selectTableDefs []*catalog.TableDef
 	if len(stmt.From) > 0 {
-		if ate, ok := stmt.From[0].(*sqlparser.AliasedTableExpr); ok {
-			if tn, ok := ate.Expr.(sqlparser.TableName); ok {
-				tblName := tn.Name.String()
-				lookupDB := e.CurrentDB
-				if !tn.Qualifier.IsEmpty() {
-					lookupDB = tn.Qualifier.String()
-				}
-				if db, err := e.Catalog.GetDatabase(lookupDB); err == nil {
-					if td, err := db.GetTable(tblName); err == nil {
-						selectTableDefs = append(selectTableDefs, td)
+		selectTableDefs = e.collectTableDefs(stmt.From[0])
+	}
+
+	// Apply implicit index ordering to raw rows BEFORE evaluating SELECT expressions.
+	// This ensures ORDER BY index works even when the index column is not in the result.
+	if stmt.OrderBy == nil && len(selectTableDefs) == 1 && strings.ToUpper(selectTableDefs[0].Engine) != "MEMORY" {
+		td := selectTableDefs[0]
+		var sortCols []string
+		// Use secondary index first for implicit ordering (MySQL index scan).
+		// Also use PK for string-type columns (InnoDB clustered index ordering).
+		if len(td.Indexes) > 0 {
+			sortCols = td.Indexes[0].Columns
+		} else if len(td.PrimaryKey) > 0 {
+			// Only sort by PK if the PK columns are string/char types
+			// (avoid changing order for numeric/BIT PKs which insertion order typically matches PK order)
+			allString := true
+			for _, pkCol := range td.PrimaryKey {
+				for _, col := range td.Columns {
+					if strings.EqualFold(col.Name, pkCol) {
+						colType := strings.ToUpper(col.Type)
+						if !strings.HasPrefix(colType, "CHAR") && !strings.HasPrefix(colType, "VARCHAR") &&
+							!strings.HasPrefix(colType, "TEXT") && !strings.HasPrefix(colType, "BINARY") &&
+							!strings.HasPrefix(colType, "VARBINARY") {
+							allString = false
+						}
+						break
 					}
 				}
 			}
+			if allString {
+				sortCols = td.PrimaryKey
+			}
+		}
+		if len(sortCols) > 0 {
+			sort.SliceStable(allRows, func(a, b int) bool {
+				for _, sc := range sortCols {
+					va, vb := allRows[a][sc], allRows[b][sc]
+					cmp := compareCaseInsensitive(va, vb)
+					if cmp != 0 {
+						return cmp < 0
+					}
+				}
+				return false
+			})
 		}
 	}
+
 	colNames, colExprs, err := e.resolveSelectExprs(stmt.SelectExprs.Exprs, allRows, selectTableDefs...)
 	if err != nil {
 		return nil, err
@@ -3163,7 +3264,16 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 				for _, td := range tableDefs {
 					for _, col := range td.Columns {
 						cols = append(cols, col.Name)
-						colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(col.Name)})
+						// For JOINs (multiple table defs), use qualified column names
+						// to disambiguate columns with the same name across tables.
+						if len(tableDefs) > 1 {
+							colExprs = append(colExprs, &sqlparser.ColName{
+								Name:      sqlparser.NewIdentifierCI(col.Name),
+								Qualifier: sqlparser.TableName{Name: sqlparser.NewIdentifierCS(td.Name)},
+							})
+						} else {
+							colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(col.Name)})
+						}
 					}
 				}
 			} else if len(rows) > 0 {
@@ -5159,6 +5269,10 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return nil, err
 		}
 		pos := int(toInt64(posVal))
+		// MySQL: SUBSTRING(str, 0) returns empty string (position 0 = before string)
+		if pos == 0 {
+			return "", nil
+		}
 		if pos > 0 {
 			pos-- // 1-based to 0-based
 		} else if pos < 0 {
@@ -5224,6 +5338,96 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return int64(0), nil
 		}
 		return int64(1), nil
+	case *sqlparser.InsertExpr:
+		// INSERT(str, pos, len, newstr) - inserts newstr into str at position pos, replacing len characters.
+		strVal, err := e.evalExpr(v.Str)
+		if err != nil {
+			return nil, err
+		}
+		if strVal == nil {
+			return nil, nil
+		}
+		posVal, err := e.evalExpr(v.Pos)
+		if err != nil {
+			return nil, err
+		}
+		lenVal, err := e.evalExpr(v.Len)
+		if err != nil {
+			return nil, err
+		}
+		newStrVal, err := e.evalExpr(v.NewStr)
+		if err != nil {
+			return nil, err
+		}
+		if posVal == nil || lenVal == nil || newStrVal == nil {
+			return nil, nil
+		}
+		s := []rune(toString(strVal))
+		pos := int(toInt64(posVal))
+		length := int(toInt64(lenVal))
+		newStr := toString(newStrVal)
+		if pos < 1 || pos > len(s)+1 {
+			return toString(strVal), nil
+		}
+		pos-- // 1-based to 0-based
+		end := pos + length
+		if end > len(s) {
+			end = len(s)
+		}
+		result := string(s[:pos]) + newStr + string(s[end:])
+		return result, nil
+	case *sqlparser.LocateExpr:
+		// LOCATE(substr, str[, pos]) - returns position of first occurrence of substr in str.
+		subVal, err := e.evalExpr(v.SubStr)
+		if err != nil {
+			return nil, err
+		}
+		strVal, err := e.evalExpr(v.Str)
+		if err != nil {
+			return nil, err
+		}
+		if subVal == nil || strVal == nil {
+			return nil, nil
+		}
+		s := []rune(toString(strVal))
+		sub := []rune(toString(subVal))
+		startPos := 0
+		if v.Pos != nil {
+			posVal, err := e.evalExpr(v.Pos)
+			if err != nil {
+				return nil, err
+			}
+			startPos = int(toInt64(posVal)) - 1 // 1-based to 0-based
+			if startPos < 0 {
+				startPos = 0
+			}
+		}
+		if len(sub) == 0 {
+			return int64(startPos + 1), nil
+		}
+		for i := startPos; i <= len(s)-len(sub); i++ {
+			match := true
+			for j := 0; j < len(sub); j++ {
+				if s[i+j] != sub[j] {
+					match = false
+					break
+				}
+			}
+			if match {
+				return int64(i + 1), nil // 1-based
+			}
+		}
+		return int64(0), nil
+	case *sqlparser.ConvertUsingExpr:
+		// CONVERT(expr USING charset) - for our purposes, just return the string value.
+		val, err := e.evalExpr(v.Expr)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		return toString(val), nil
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
 }
@@ -5402,6 +5606,10 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, err
 		}
 		pos := int(toInt64(posVal))
+		// MySQL: SUBSTRING(str, 0) returns empty string
+		if pos == 0 {
+			return "", nil
+		}
 		// MySQL positions are 1-based; negative positions count from end
 		if pos > 0 {
 			pos-- // convert to 0-based
@@ -6206,6 +6414,148 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, nil
 		}
 		return t.Format("2006-01-02 15:04:05"), nil
+	case "charset":
+		// CHARSET(expr) returns the character set name of the expression.
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		// Check if the argument is CONVERT(x USING charset) - return that charset
+		if cue, ok := v.Exprs[0].(*sqlparser.ConvertUsingExpr); ok {
+			return strings.ToLower(cue.Type), nil
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return "binary", nil
+		}
+		// Return the table's charset if we can determine it
+		return "utf8", nil
+	case "instr":
+		// INSTR(str, substr) returns the position of the first occurrence of substr in str.
+		if len(v.Exprs) < 2 {
+			return nil, fmt.Errorf("INSTR requires 2 arguments")
+		}
+		strVal, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		subVal, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		if strVal == nil || subVal == nil {
+			return nil, nil
+		}
+		s := []rune(toString(strVal))
+		sub := []rune(toString(subVal))
+		if len(sub) == 0 {
+			return int64(1), nil
+		}
+		for i := 0; i <= len(s)-len(sub); i++ {
+			match := true
+			for j := 0; j < len(sub); j++ {
+				if s[i+j] != sub[j] {
+					match = false
+					break
+				}
+			}
+			if match {
+				return int64(i + 1), nil // 1-based
+			}
+		}
+		return int64(0), nil
+	case "reverse":
+		// REVERSE(str) reverses the string.
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("REVERSE requires 1 argument")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		runes := []rune(toString(val))
+		for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
+			runes[i], runes[j] = runes[j], runes[i]
+		}
+		return string(runes), nil
+	case "lpad":
+		// LPAD(str, len, padstr) left-pads str with padstr to len characters.
+		if len(v.Exprs) < 3 {
+			return nil, fmt.Errorf("LPAD requires 3 arguments")
+		}
+		strVal, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		lenVal, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		padVal, err := e.evalExpr(v.Exprs[2])
+		if err != nil {
+			return nil, err
+		}
+		if strVal == nil || lenVal == nil || padVal == nil {
+			return nil, nil
+		}
+		s := []rune(toString(strVal))
+		targetLen := int(toInt64(lenVal))
+		padStr := []rune(toString(padVal))
+		if targetLen < 0 || len(padStr) == 0 {
+			return nil, nil
+		}
+		if targetLen <= len(s) {
+			return string(s[:targetLen]), nil
+		}
+		// Need to pad
+		needed := targetLen - len(s)
+		var pad []rune
+		for len(pad) < needed {
+			pad = append(pad, padStr...)
+		}
+		pad = pad[:needed]
+		return string(append(pad, s...)), nil
+	case "rpad":
+		// RPAD(str, len, padstr) right-pads str with padstr to len characters.
+		if len(v.Exprs) < 3 {
+			return nil, fmt.Errorf("RPAD requires 3 arguments")
+		}
+		strVal, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		lenVal, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		padVal, err := e.evalExpr(v.Exprs[2])
+		if err != nil {
+			return nil, err
+		}
+		if strVal == nil || lenVal == nil || padVal == nil {
+			return nil, nil
+		}
+		s := []rune(toString(strVal))
+		targetLen := int(toInt64(lenVal))
+		padStr := []rune(toString(padVal))
+		if targetLen < 0 || len(padStr) == 0 {
+			return nil, nil
+		}
+		if targetLen <= len(s) {
+			return string(s[:targetLen]), nil
+		}
+		needed := targetLen - len(s)
+		var pad []rune
+		for len(pad) < needed {
+			pad = append(pad, padStr...)
+		}
+		pad = pad[:needed]
+		return string(append(s, pad...)), nil
 	}
 	// Try user-defined function from catalog
 	if result, err := e.callUserDefinedFunction(name, v.Exprs, nil); err == nil {
@@ -6737,6 +7087,176 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			return toFloat(val), nil
 		}
 		return val, nil
+	case *sqlparser.TrimFuncExpr:
+		// TRIM / LTRIM / RTRIM with row context
+		val, err := e.evalRowExpr(v.StringArg, row)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		s := toString(val)
+		switch v.TrimFuncType {
+		case sqlparser.LTrimType:
+			return strings.TrimLeft(s, " \t\n\r"), nil
+		case sqlparser.RTrimType:
+			return strings.TrimRight(s, " \t\n\r"), nil
+		default: // NormalTrimType
+			if v.TrimArg != nil {
+				trimVal, err := e.evalRowExpr(v.TrimArg, row)
+				if err != nil {
+					return nil, err
+				}
+				trimStr := toString(trimVal)
+				switch v.Type {
+				case sqlparser.LeadingTrimType:
+					return strings.TrimLeft(s, trimStr), nil
+				case sqlparser.TrailingTrimType:
+					return strings.TrimRight(s, trimStr), nil
+				default:
+					return strings.Trim(s, trimStr), nil
+				}
+			}
+			return strings.TrimSpace(s), nil
+		}
+	case *sqlparser.SubstrExpr:
+		// SUBSTRING(str, from, to) with row context
+		strVal, err := e.evalRowExpr(v.Name, row)
+		if err != nil {
+			return nil, err
+		}
+		if strVal == nil {
+			return nil, nil
+		}
+		s := []rune(toString(strVal))
+		posVal, err := e.evalRowExpr(v.From, row)
+		if err != nil {
+			return nil, err
+		}
+		pos := int(toInt64(posVal))
+		if pos == 0 {
+			return "", nil
+		}
+		if pos > 0 {
+			pos--
+		} else if pos < 0 {
+			pos = len(s) + pos
+		}
+		if pos < 0 {
+			pos = 0
+		}
+		if pos >= len(s) {
+			return "", nil
+		}
+		if v.To != nil {
+			lenVal, err := e.evalRowExpr(v.To, row)
+			if err != nil {
+				return nil, err
+			}
+			length := int(toInt64(lenVal))
+			if length <= 0 {
+				return "", nil
+			}
+			end := pos + length
+			if end > len(s) {
+				end = len(s)
+			}
+			return string(s[pos:end]), nil
+		}
+		return string(s[pos:]), nil
+	case *sqlparser.InsertExpr:
+		// INSERT(str, pos, len, newstr) with row context
+		strVal, err := e.evalRowExpr(v.Str, row)
+		if err != nil {
+			return nil, err
+		}
+		if strVal == nil {
+			return nil, nil
+		}
+		posVal, err := e.evalRowExpr(v.Pos, row)
+		if err != nil {
+			return nil, err
+		}
+		lenVal, err := e.evalRowExpr(v.Len, row)
+		if err != nil {
+			return nil, err
+		}
+		newStrVal, err := e.evalRowExpr(v.NewStr, row)
+		if err != nil {
+			return nil, err
+		}
+		if posVal == nil || lenVal == nil || newStrVal == nil {
+			return nil, nil
+		}
+		s := []rune(toString(strVal))
+		pos := int(toInt64(posVal))
+		length := int(toInt64(lenVal))
+		newStr := toString(newStrVal)
+		if pos < 1 || pos > len(s)+1 {
+			return toString(strVal), nil
+		}
+		pos-- // 1-based to 0-based
+		end := pos + length
+		if end > len(s) {
+			end = len(s)
+		}
+		result := string(s[:pos]) + newStr + string(s[end:])
+		return result, nil
+	case *sqlparser.LocateExpr:
+		// LOCATE(substr, str[, pos]) with row context
+		subVal, err := e.evalRowExpr(v.SubStr, row)
+		if err != nil {
+			return nil, err
+		}
+		strVal, err := e.evalRowExpr(v.Str, row)
+		if err != nil {
+			return nil, err
+		}
+		if subVal == nil || strVal == nil {
+			return nil, nil
+		}
+		s := []rune(toString(strVal))
+		sub := []rune(toString(subVal))
+		startPos := 0
+		if v.Pos != nil {
+			posVal, err := e.evalRowExpr(v.Pos, row)
+			if err != nil {
+				return nil, err
+			}
+			startPos = int(toInt64(posVal)) - 1
+			if startPos < 0 {
+				startPos = 0
+			}
+		}
+		if len(sub) == 0 {
+			return int64(startPos + 1), nil
+		}
+		for i := startPos; i <= len(s)-len(sub); i++ {
+			match := true
+			for j := 0; j < len(sub); j++ {
+				if s[i+j] != sub[j] {
+					match = false
+					break
+				}
+			}
+			if match {
+				return int64(i + 1), nil
+			}
+		}
+		return int64(0), nil
+	case *sqlparser.ConvertUsingExpr:
+		// CONVERT(expr USING charset) with row context
+		val, err := e.evalRowExpr(v.Expr, row)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		return toString(val), nil
+	case *sqlparser.IntroducerExpr:
+		return e.evalRowExpr(v.Expr, row)
 	case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg:
 		// For HAVING clause: look up the aggregate display name in the row
 		displayName := aggregateDisplayName(expr)
@@ -7326,6 +7846,172 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			return nil, nil
 		}
 		return t.Format("2006-01-02 15:04:05"), nil
+	case "charset":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		// Check if the argument is CONVERT(x USING charset) - return that charset
+		if cue, ok := v.Exprs[0].(*sqlparser.ConvertUsingExpr); ok {
+			return strings.ToLower(cue.Type), nil
+		}
+		val, err := e.evalRowExpr(v.Exprs[0], row)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return "binary", nil
+		}
+		return "utf8", nil
+	case "instr":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 2 || args[0] == nil || args[1] == nil {
+			return nil, nil
+		}
+		s := []rune(toString(args[0]))
+		sub := []rune(toString(args[1]))
+		if len(sub) == 0 {
+			return int64(1), nil
+		}
+		for i := 0; i <= len(s)-len(sub); i++ {
+			match := true
+			for j := 0; j < len(sub); j++ {
+				if s[i+j] != sub[j] {
+					match = false
+					break
+				}
+			}
+			if match {
+				return int64(i + 1), nil
+			}
+		}
+		return int64(0), nil
+	case "reverse":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		runes := []rune(toString(args[0]))
+		for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
+			runes[i], runes[j] = runes[j], runes[i]
+		}
+		return string(runes), nil
+	case "lpad":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 3 || args[0] == nil || args[1] == nil || args[2] == nil {
+			return nil, nil
+		}
+		s := []rune(toString(args[0]))
+		targetLen := int(toInt64(args[1]))
+		padStr := []rune(toString(args[2]))
+		if targetLen < 0 || len(padStr) == 0 {
+			return nil, nil
+		}
+		if targetLen <= len(s) {
+			return string(s[:targetLen]), nil
+		}
+		needed := targetLen - len(s)
+		var pad []rune
+		for len(pad) < needed {
+			pad = append(pad, padStr...)
+		}
+		pad = pad[:needed]
+		return string(append(pad, s...)), nil
+	case "rpad":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 3 || args[0] == nil || args[1] == nil || args[2] == nil {
+			return nil, nil
+		}
+		s := []rune(toString(args[0]))
+		targetLen := int(toInt64(args[1]))
+		padStr := []rune(toString(args[2]))
+		if targetLen < 0 || len(padStr) == 0 {
+			return nil, nil
+		}
+		if targetLen <= len(s) {
+			return string(s[:targetLen]), nil
+		}
+		needed := targetLen - len(s)
+		var pad []rune
+		for len(pad) < needed {
+			pad = append(pad, padStr...)
+		}
+		pad = pad[:needed]
+		return string(append(s, pad...)), nil
+	case "substring", "substr", "mid":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 2 || args[0] == nil {
+			return nil, nil
+		}
+		s := []rune(toString(args[0]))
+		pos := int(toInt64(args[1]))
+		if pos == 0 {
+			return "", nil
+		}
+		if pos > 0 {
+			pos--
+		} else if pos < 0 {
+			pos = len(s) + pos
+		}
+		if pos < 0 {
+			pos = 0
+		}
+		if pos >= len(s) {
+			return "", nil
+		}
+		if len(args) >= 3 {
+			length := int(toInt64(args[2]))
+			if length <= 0 {
+				return "", nil
+			}
+			end := pos + length
+			if end > len(s) {
+				end = len(s)
+			}
+			return string(s[pos:end]), nil
+		}
+		return string(s[pos:]), nil
+	case "trim":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		return strings.TrimSpace(toString(args[0])), nil
+	case "ltrim":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		return strings.TrimLeft(toString(args[0]), " \t\n\r"), nil
+	case "rtrim":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		return strings.TrimRight(toString(args[0]), " \t\n\r"), nil
 	default:
 		// Try user-defined function from catalog
 		if result, err := e.callUserDefinedFunction(name, v.Exprs, &row); err == nil {
@@ -7757,8 +8443,35 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 		return compareNumeric(left, right) <= 0, nil
 	case sqlparser.GreaterEqualOp:
 		return compareNumeric(left, right) >= 0, nil
+	case sqlparser.LikeOp:
+		return matchLike(toString(left), toString(right)), nil
+	case sqlparser.NotLikeOp:
+		return !matchLike(toString(left), toString(right)), nil
 	}
 	return false, fmt.Errorf("unsupported comparison operator: %s", op.ToString())
+}
+
+// compareCaseInsensitive compares two values using case-insensitive string comparison
+// for strings, to match MySQL's utf8_general_ci collation behavior.
+func compareCaseInsensitive(a, b interface{}) int {
+	if a == nil && b == nil {
+		return 0
+	}
+	if a == nil {
+		return -1
+	}
+	if b == nil {
+		return 1
+	}
+	sa := strings.ToLower(toString(a))
+	sb := strings.ToLower(toString(b))
+	if sa < sb {
+		return -1
+	}
+	if sa > sb {
+		return 1
+	}
+	return 0
 }
 
 func compareNumeric(a, b interface{}) int {
@@ -9364,6 +10077,19 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 		return nil, mysqlError(29, "HY000", fmt.Sprintf("File '%s' not found (OS errno 2 - No such file or directory)", opts.filePath))
 	}
 
+	// Convert encoding for non-UTF-8 data files (SJIS, EUC-JP)
+	baseName := strings.ToLower(filepath.Base(filePath))
+	if strings.Contains(baseName, "sjis") || strings.Contains(baseName, "cp932") {
+		if decoded, err := decodeSJIS(data); err == nil {
+			data = decoded
+		}
+	} else if strings.Contains(baseName, "ujis") || strings.Contains(baseName, "eucjp") ||
+		strings.Contains(baseName, "ucs2") {
+		if decoded, err := decodeEUCJP(data); err == nil {
+			data = decoded
+		}
+	}
+
 	content := string(data)
 
 	tbl, err := e.Storage.GetTable(e.CurrentDB, opts.tableName)
@@ -9556,6 +10282,33 @@ func processLoadDataField(field, escapedBy, enclosedBy string) interface{} {
 	}
 	if escapedBy != "" && escapedBy != "\\" && field == escapedBy+"N" {
 		return nil
+	}
+	// Process escape sequences in the field
+	if escapedBy == "\\" && strings.Contains(field, "\\") {
+		var result strings.Builder
+		for i := 0; i < len(field); i++ {
+			if field[i] == '\\' && i+1 < len(field) {
+				next := field[i+1]
+				switch next {
+				case '\\':
+					result.WriteByte('\\')
+				case 'n':
+					result.WriteByte('\n')
+				case 'r':
+					result.WriteByte('\r')
+				case 't':
+					result.WriteByte('\t')
+				case '0':
+					result.WriteByte(0)
+				default:
+					result.WriteByte(next)
+				}
+				i++ // skip next char
+			} else {
+				result.WriteByte(field[i])
+			}
+		}
+		return result.String()
 	}
 	return field
 }
@@ -10872,4 +11625,26 @@ func (e *Executor) execAnalyzeMultiTable(query string) (*Result, error) {
 		Rows:        rows,
 		IsResultSet: true,
 	}, nil
+}
+
+// decodeSJIS converts SJIS/CP932 encoded bytes to UTF-8.
+func decodeSJIS(data []byte) ([]byte, error) {
+	reader := transform.NewReader(bytes.NewReader(data), japanese.ShiftJIS.NewDecoder())
+	var buf bytes.Buffer
+	_, err := buf.ReadFrom(reader)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// decodeEUCJP converts EUC-JP encoded bytes to UTF-8.
+func decodeEUCJP(data []byte) ([]byte, error) {
+	reader := transform.NewReader(bytes.NewReader(data), japanese.EUCJP.NewDecoder())
+	var buf bytes.Buffer
+	_, err := buf.ReadFrom(reader)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }

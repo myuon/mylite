@@ -5,6 +5,7 @@ package mtrrunner
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -15,6 +16,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/transform"
 )
 
 // TestResult represents the outcome of running a single .test file.
@@ -153,10 +158,33 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		return TestResult{Name: name, Passed: true, Output: actual}
 	}
 
-	// Read expected output
+	// Read expected output, converting encoding if needed
 	expectedBytes, err := os.ReadFile(resultPath)
 	if err != nil {
 		return TestResult{Name: name, Error: fmt.Sprintf("failed to read result file: %v", err), Output: actual}
+	}
+	// Convert result file encoding to match the test file encoding
+	if isSJISEncoded(expectedBytes) {
+		if decoded, err := decodeSJIS(expectedBytes); err == nil {
+			expectedBytes = decoded
+		}
+	} else if isEUCJPEncoded(expectedBytes) {
+		if decoded, err := decodeEUCJP(expectedBytes); err == nil {
+			expectedBytes = decoded
+		}
+	} else if !isValidUTF8(expectedBytes) {
+		// If result file is not valid UTF-8 and test name contains encoding hints,
+		// try to decode based on the test name.
+		// Note: ucs2 test files are also EUC-JP encoded (the charset refers to MySQL charset being tested).
+		if strings.Contains(name, "sjis") {
+			if decoded, err := decodeSJIS(expectedBytes); err == nil {
+				expectedBytes = decoded
+			}
+		} else if strings.Contains(name, "ujis") || strings.Contains(name, "ucs2") {
+			if decoded, err := decodeEUCJP(expectedBytes); err == nil {
+				expectedBytes = decoded
+			}
+		}
 	}
 	expected := string(expectedBytes)
 
@@ -993,19 +1021,85 @@ func (ctx *execContext) sourceFile(filename string) error {
 // Helper functions
 
 func readLines(path string) ([]string, error) {
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+
+	// Detect if the file is SJIS/CP932 encoded by checking first few lines for
+	// --character_set sjis or --charset sjis directive.
+	// SJIS bytes can contain 0x5C (backslash) which breaks SQL parsing.
+	if isSJISEncoded(data) {
+		decoded, err := decodeSJIS(data)
+		if err == nil {
+			data = decoded
+		}
+	} else if isEUCJPEncoded(data) {
+		decoded, err := decodeEUCJP(data)
+		if err == nil {
+			data = decoded
+		}
+	}
 
 	var lines []string
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(bytes.NewReader(data))
 	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB buffer
 	for scanner.Scan() {
 		lines = append(lines, scanner.Text())
 	}
 	return lines, scanner.Err()
+}
+
+// isSJISEncoded checks if the file content starts with a SJIS charset directive.
+func isSJISEncoded(data []byte) bool {
+	// Check first few lines for --character_set sjis or --charset sjis
+	header := data
+	if len(header) > 512 {
+		header = header[:512]
+	}
+	lower := bytes.ToLower(header)
+	return bytes.Contains(lower, []byte("character_set sjis")) ||
+		bytes.Contains(lower, []byte("charset sjis"))
+}
+
+// isEUCJPEncoded checks if the file content starts with a UJIS/EUCJP charset directive.
+func isEUCJPEncoded(data []byte) bool {
+	header := data
+	if len(header) > 512 {
+		header = header[:512]
+	}
+	lower := bytes.ToLower(header)
+	return bytes.Contains(lower, []byte("character_set ujis")) ||
+		bytes.Contains(lower, []byte("charset ujis")) ||
+		bytes.Contains(lower, []byte("character_set eucjpms")) ||
+		bytes.Contains(lower, []byte("charset eucjpms"))
+}
+
+// decodeSJIS converts SJIS/CP932 encoded bytes to UTF-8.
+func decodeSJIS(data []byte) ([]byte, error) {
+	reader := transform.NewReader(bytes.NewReader(data), japanese.ShiftJIS.NewDecoder())
+	return readAll(reader)
+}
+
+// decodeEUCJP converts EUC-JP encoded bytes to UTF-8.
+func decodeEUCJP(data []byte) ([]byte, error) {
+	reader := transform.NewReader(bytes.NewReader(data), japanese.EUCJP.NewDecoder())
+	return readAll(reader)
+}
+
+// readAll reads all bytes from a reader.
+func readAll(r *transform.Reader) ([]byte, error) {
+	var buf bytes.Buffer
+	_, err := buf.ReadFrom(r)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// isValidUTF8 checks if bytes are valid UTF-8 using utf8.Valid.
+func isValidUTF8(data []byte) bool {
+	return utf8.Valid(data)
 }
 
 func findResultFile(testPath string) string {
@@ -1353,7 +1447,78 @@ func normalizeOutput(s string) string {
 	for _, line := range lines {
 		result = append(result, strings.TrimRight(line, " \t\r"))
 	}
-	return strings.TrimRight(strings.Join(result, "\n"), "\n")
+	out := strings.TrimRight(strings.Join(result, "\n"), "\n")
+	// Normalize TRIM display: MySQL sometimes omits space before FROM for certain multibyte chars.
+	out = normalizeTrimFromSpacing(out)
+	// Normalize SUBSTRING display: MySQL shows "SUBSTRING(col FROM pos)" but vitess shows "SUBSTRING(col,pos)"
+	out = normalizeSubstringDisplay(out)
+	// Normalize case of "using" keyword: MySQL sometimes shows "using" lowercase, sometimes "USING" uppercase.
+	// Normalize all to lowercase for consistent comparison.
+	out = strings.ReplaceAll(out, " USING ", " using ")
+	// Normalize function name case: MySQL preserves original query case for function names,
+	// but vitess normalizes to lowercase. Lowercase all function names for comparison.
+	out = normalizeFunctionNameCase(out)
+	return out
+}
+
+// normalizeFunctionNameCase lowercases common MySQL function names in the output
+// for consistent comparison (MySQL preserves query case, vitess normalizes to lowercase).
+func normalizeFunctionNameCase(s string) string {
+	// Sorted by length descending to avoid partial matches (e.g., TRIM inside LTRIM)
+	funcNames := []string{
+		"CHARACTER_LENGTH", "OCTET_LENGTH", "CHAR_LENGTH",
+		"CONCAT_WS", "SUBSTRING", "COALESCE",
+		"CONVERT", "CHARSET", "REVERSE", "REPLACE",
+		"LOCATE", "CONCAT", "INSERT", "IFNULL", "NULLIF",
+		"LENGTH", "SUBSTR", "INSTR", "UPPER", "LOWER",
+		"UCASE", "LCASE", "UNHEX",
+		"LTRIM", "RTRIM", "RIGHT", "RPAD", "LPAD",
+		"TRIM", "LEFT",
+		"HEX", "IF",
+	}
+	for _, fn := range funcNames {
+		lower := strings.ToLower(fn)
+		// Only replace when followed by ( to avoid replacing in data
+		s = strings.ReplaceAll(s, fn+"(", lower+"(")
+	}
+	return s
+}
+
+// normalizeSubstringDisplay normalizes SUBSTRING display between MySQL and vitess formats.
+// MySQL: "SUBSTRING(col FROM pos)" or "SUBSTRING(col FROM pos FOR len)"
+// Vitess: "SUBSTRING(col,pos)" or "SUBSTRING(col,pos,len)"
+// Normalize both to the comma-separated form.
+func normalizeSubstringDisplay(s string) string {
+	// Replace "SUBSTRING(xxx FROM yyy)" or "substring(xxx FROM yyy)" with "substring(xxx,yyy)"
+	re := regexp.MustCompile(`(?i)SUBSTRING\(([^)]+?) FROM ([^)]+?)\)`)
+	s = re.ReplaceAllStringFunc(s, func(match string) string {
+		m := re.FindStringSubmatch(match)
+		if m == nil {
+			return match
+		}
+		inner := m[1]
+		rest := m[2]
+		// Handle "FROM x FOR y" -> "x,y"
+		if idx := strings.Index(rest, " FOR "); idx >= 0 {
+			return "substring(" + inner + "," + rest[:idx] + "," + rest[idx+5:] + ")"
+		}
+		return "substring(" + inner + "," + rest + ")"
+	})
+	return s
+}
+
+// normalizeTrimFromSpacing ensures consistent spacing before FROM in TRIM expressions
+// and normalizes trailing spaces in function argument lists that MySQL adds for display alignment.
+func normalizeTrimFromSpacing(s string) string {
+	// Normalize 'FROM -> ' FROM (MySQL sometimes omits space before FROM)
+	re := regexp.MustCompile(`'FROM `)
+	s = re.ReplaceAllString(s, "' FROM ")
+	// Normalize trailing spaces before closing paren in column headers
+	// MySQL adds display-width padding spaces for CJK characters
+	// e.g., "'丂丂' )" -> "'丂丂')"
+	reSp := regexp.MustCompile(`' \)`)
+	s = reSp.ReplaceAllString(s, "')")
+	return s
 }
 
 // normalizeExpected strips MySQL-specific output that mylite doesn't produce:

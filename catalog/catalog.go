@@ -37,6 +37,7 @@ type TableDef struct {
 	Comment    string
 	Charset    string // e.g. "latin1", "utf8mb4"; empty means default (utf8mb4)
 	Collation  string // e.g. "latin1_swedish_ci"; empty means default
+	Engine     string // e.g. "InnoDB", "MyISAM", "MEMORY"; empty means default (InnoDB)
 }
 
 // TriggerDef represents a trigger definition.
