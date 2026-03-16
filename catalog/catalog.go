@@ -8,15 +8,16 @@ import (
 
 // ColumnDef represents a column definition in a table.
 type ColumnDef struct {
-	Name           string
-	Type           string // MySQL type string (e.g. "INT", "VARCHAR(255)")
-	Nullable       bool
-	Default        *string
-	AutoIncrement  bool
-	PrimaryKey     bool
-	Unique         bool
-	Comment        string
-	DefaultDropped bool // true when ALTER TABLE ... DROP DEFAULT was used
+	Name                    string
+	Type                    string // MySQL type string (e.g. "INT", "VARCHAR(255)")
+	Nullable                bool
+	Default                 *string
+	AutoIncrement           bool
+	PrimaryKey              bool
+	Unique                  bool
+	Comment                 string
+	DefaultDropped          bool // true when ALTER TABLE ... DROP DEFAULT was used
+	OnUpdateCurrentTimestamp bool // true for TIMESTAMP/DATETIME with ON UPDATE CURRENT_TIMESTAMP
 }
 
 // IndexDef represents an index definition.

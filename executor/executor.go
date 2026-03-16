@@ -153,6 +153,9 @@ type Executor struct {
 	globalVars map[string]string
 	// views stores view definitions (view name -> SELECT query string).
 	views map[string]string
+	// queryTableDef holds the table definition for the current query context,
+	// used for column-level checks (e.g., IS NULL on NOT NULL columns).
+	queryTableDef *catalog.TableDef
 }
 
 func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
@@ -163,6 +166,7 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		Catalog:       cat,
 		Storage:       store,
 		CurrentDB:     "test",
+		sqlMode:       "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
 		snapshots:     make(map[string]*fullSnapshot),
 		userVars:      make(map[string]interface{}),
 		preparedStmts: make(map[string]string),
@@ -1214,6 +1218,10 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		name := strings.ToLower(expr.Var.Name.String())
 		val := sqlparser.String(expr.Expr)
 		val = strings.Trim(val, "'\"")
+		// Try evaluating the expression (handles @user_var, @@system_var references)
+		if evalVal, err := e.evalExpr(expr.Expr); err == nil && evalVal != nil {
+			val = fmt.Sprintf("%v", evalVal)
+		}
 		switch name {
 		case "sql_mode":
 			if strings.ToUpper(val) == "DEFAULT" {
@@ -1229,7 +1237,10 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				if n == 0 {
 					e.fixedTimestamp = nil
 				} else {
-					t := time.Unix(int64(n), 0).UTC()
+					t := time.Unix(int64(n), 0)
+					if e.timeZone != nil {
+						t = t.In(e.timeZone)
+					}
 					e.fixedTimestamp = &t
 				}
 			}
@@ -1259,6 +1270,35 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 	return &Result{}, nil
 }
 
+// resolveSystemVarInValue resolves @@system_var and @user_var references in a value string.
+func (e *Executor) resolveSystemVarInValue(val string) string {
+	trimVal := strings.TrimSpace(val)
+	if strings.HasPrefix(trimVal, "@@") {
+		// Resolve system variable
+		varName := strings.TrimPrefix(trimVal, "@@")
+		varName = strings.TrimPrefix(varName, "SESSION.")
+		varName = strings.TrimPrefix(varName, "GLOBAL.")
+		varName = strings.TrimPrefix(varName, "session.")
+		varName = strings.TrimPrefix(varName, "global.")
+		resolved, err := e.evalExpr(&sqlparser.ColName{Name: sqlparser.NewIdentifierCI(varName)})
+		if err == nil && resolved != nil {
+			return fmt.Sprintf("%v", resolved)
+		}
+		// Try known variables
+		switch strings.ToLower(varName) {
+		case "sql_mode":
+			return e.sqlMode
+		}
+	} else if strings.HasPrefix(trimVal, "@") {
+		// Resolve user variable
+		uvName := strings.TrimPrefix(trimVal, "@")
+		if uv, ok := e.userVars[uvName]; ok {
+			return fmt.Sprintf("%v", uv)
+		}
+	}
+	return val
+}
+
 // handleRawSet handles SET statements that the parser couldn't parse.
 func (e *Executor) handleRawSet(raw string) {
 	// Handle user variables: SET @var = value or SET @var := value
@@ -1277,6 +1317,7 @@ func (e *Executor) handleRawSet(raw string) {
 				val = strings.TrimSuffix(val, ";")
 				val = strings.TrimSpace(val)
 				val = strings.Trim(val, "'\"")
+				val = e.resolveSystemVarInValue(val)
 				e.userVars[varName] = val
 				return
 			}
@@ -1286,6 +1327,7 @@ func (e *Executor) handleRawSet(raw string) {
 				val = strings.TrimSuffix(val, ";")
 				val = strings.TrimSpace(val)
 				val = strings.Trim(val, "'\"")
+				val = e.resolveSystemVarInValue(val)
 				e.userVars[varName] = val
 				return
 			}
@@ -1298,6 +1340,8 @@ func (e *Executor) handleRawSet(raw string) {
 			val = strings.Trim(val, "'\"")
 			val = strings.TrimSuffix(val, ";")
 			val = strings.TrimSpace(val)
+			// Resolve @user_var and @@system_var references
+			val = e.resolveSystemVarInValue(val)
 			if strings.ToUpper(val) == "DEFAULT" {
 				e.sqlMode = ""
 			} else {
@@ -1325,7 +1369,10 @@ func (e *Executor) handleRawSet(raw string) {
 				if n == 0 {
 					e.fixedTimestamp = nil
 				} else {
-					t := time.Unix(int64(n), 0).UTC()
+					t := time.Unix(int64(n), 0)
+					if e.timeZone != nil {
+						t = t.In(e.timeZone)
+					}
 					e.fixedTimestamp = &t
 				}
 			}
@@ -1569,6 +1616,15 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 		if strings.HasPrefix(upper, "YEAR") {
 			return "0000"
 		}
+		// Empty string -> zero date/datetime
+		switch upper {
+		case "DATE":
+			return "0000-00-00"
+		case "DATETIME":
+			return "0000-00-00 00:00:00"
+		case "TIMESTAMP":
+			return "0000-00-00 00:00:00"
+		}
 		return v
 	}
 	// Normalize YEAR(4) -> YEAR
@@ -1591,13 +1647,21 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 	case "DATE":
 		// If the value looks like a datetime, truncate to date-only
 		if len(s) > 10 && s[4] == '-' && s[7] == '-' {
-			return s[:10]
+			dateStr := s[:10]
+			// Validate the extracted date
+			parsed := parseMySQLDateValue(dateStr)
+			if parsed != "" {
+				return parsed
+			}
+			return "0000-00-00"
 		}
 		// Try parsing various MySQL DATE formats
 		parsed := parseMySQLDateValue(s)
 		if parsed != "" {
 			return parsed
 		}
+		// Invalid date value -> zero date
+		return "0000-00-00"
 	case "TIME":
 		// Use the original value for numeric handling
 		result := parseMySQLTimeValueRaw(v)
@@ -1608,18 +1672,18 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 	case "TIMESTAMP":
 		// Try parsing various date formats first
 		parsed := parseMySQLDateValue(s)
-		if parsed != "" {
-			s = parsed
-			// Check if we need to append time
-			if len(s) == 10 {
-				// date only, check original for time part
-				origS := fmt.Sprintf("%v", v)
-				if idx := strings.Index(origS, " "); idx >= 0 {
-					timePart := strings.TrimSpace(origS[idx+1:])
-					if timePart != "" {
-						s = s + " " + timePart
-					}
-				}
+		if parsed == "" {
+			// Invalid date value -> zero timestamp
+			return "0000-00-00 00:00:00"
+		}
+		s = parsed
+		// Check if we need to append time from the original value
+		if len(s) == 10 {
+			timePart := extractTimePart(v, s)
+			if timePart != "" {
+				// Normalize time separator chars to ':'
+				timePart = normalizeDateTimeSeparators(timePart)
+				s = s + " " + timePart
 			}
 		}
 		// TIMESTAMP range: '1970-01-01 00:00:01' to '2038-01-19 03:14:07' UTC
@@ -1637,24 +1701,92 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 				}
 			}
 		}
+		// Ensure TIMESTAMP always has time component
+		if len(s) == 10 && s[4] == '-' && s[7] == '-' {
+			s = s + " 00:00:00"
+		}
 		return s
 	case "DATETIME":
 		// Try parsing various date formats
 		parsed := parseMySQLDateValue(s)
 		if parsed != "" {
-			origS := fmt.Sprintf("%v", v)
-			if idx := strings.Index(origS, " "); idx >= 0 {
-				timePart := strings.TrimSpace(origS[idx+1:])
-				if timePart != "" {
-					// Normalize time separator chars to ':'
-					timePart = normalizeDateTimeSeparators(timePart)
-					return parsed + " " + timePart
-				}
+			timePart := extractTimePart(v, s)
+			if timePart != "" {
+				// Normalize time separator chars to ':'
+				timePart = normalizeDateTimeSeparators(timePart)
+				return parsed + " " + timePart
 			}
 			return parsed + " 00:00:00"
 		}
+		// Invalid date value -> zero datetime
+		return "0000-00-00 00:00:00"
 	}
 	return v
+}
+
+// extractTimePart extracts the time component from a datetime value.
+// It handles both string values with space separators and numeric YYYYMMDDHHMMSS/YYMMDDHHMMSS formats.
+func extractTimePart(v interface{}, parsedDate string) string {
+	origS := fmt.Sprintf("%v", v)
+
+	// Check for space-separated time part (e.g., "98-12-31 11:30:45")
+	if idx := strings.Index(origS, " "); idx >= 0 {
+		timePart := strings.TrimSpace(origS[idx+1:])
+		if timePart != "" {
+			return timePart
+		}
+	}
+
+	// Check for numeric YYYYMMDDHHMMSS or YYMMDDHHMMSS format
+	isAllDigits := true
+	for _, c := range origS {
+		if c < '0' || c > '9' {
+			isAllDigits = false
+			break
+		}
+	}
+	if isAllDigits {
+		switch len(origS) {
+		case 14: // YYYYMMDDHHMMSS
+			h, _ := strconv.Atoi(origS[8:10])
+			m, _ := strconv.Atoi(origS[10:12])
+			sec, _ := strconv.Atoi(origS[12:14])
+			return fmt.Sprintf("%02d:%02d:%02d", h, m, sec)
+		case 12: // YYMMDDHHMMSS
+			h, _ := strconv.Atoi(origS[6:8])
+			m, _ := strconv.Atoi(origS[8:10])
+			sec, _ := strconv.Atoi(origS[10:12])
+			return fmt.Sprintf("%02d:%02d:%02d", h, m, sec)
+		}
+	}
+
+	// Also handle numeric int64/float64 values that were converted to string
+	switch n := v.(type) {
+	case int64:
+		if n >= 10000000000 { // At least YYMMDDHHMMSS
+			sec := int(n % 100)
+			m := int((n / 100) % 100)
+			h := int((n / 10000) % 100)
+			return fmt.Sprintf("%02d:%02d:%02d", h, m, sec)
+		}
+	case float64:
+		in := int64(n)
+		if in >= 10000000000 { // At least YYMMDDHHMMSS
+			sec := int(in % 100)
+			m := int((in / 100) % 100)
+			h := int((in / 10000) % 100)
+			return fmt.Sprintf("%02d:%02d:%02d", h, m, sec)
+		}
+	case uint64:
+		if n >= 10000000000 { // At least YYMMDDHHMMSS
+			sec := int(n % 100)
+			m := int((n / 100) % 100)
+			h := int((n / 10000) % 100)
+			return fmt.Sprintf("%02d:%02d:%02d", h, m, sec)
+		}
+	}
+
+	return ""
 }
 
 // parseMySQLTimeValueRaw handles raw interface values for TIME conversion.
@@ -2043,7 +2175,15 @@ func coerceYearValue(v interface{}) interface{} {
 func parseMySQLDateValue(s string) string {
 	// Already in standard format
 	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
-		return s[:10]
+		dateStr := s[:10]
+		// Validate the date
+		y, _ := strconv.Atoi(dateStr[:4])
+		m, _ := strconv.Atoi(dateStr[5:7])
+		d, _ := strconv.Atoi(dateStr[8:10])
+		if !isValidDate(y, m, d) {
+			return "" // Invalid date like 2008-04-31
+		}
+		return dateStr
 	}
 
 	// Strip time part for datetime strings
@@ -2066,14 +2206,14 @@ func parseMySQLDateValue(s string) string {
 			y, _ := strconv.Atoi(datePart[:4])
 			m, _ := strconv.Atoi(datePart[4:6])
 			d, _ := strconv.Atoi(datePart[6:8])
-			if m >= 1 && m <= 12 && d >= 1 && d <= 31 {
+			if isValidDate(y, m, d) {
 				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
 			}
 		case 14: // YYYYMMDDHHMMSS - extract date part
 			y, _ := strconv.Atoi(datePart[:4])
 			m, _ := strconv.Atoi(datePart[4:6])
 			d, _ := strconv.Atoi(datePart[6:8])
-			if m >= 1 && m <= 12 && d >= 1 && d <= 31 {
+			if isValidDate(y, m, d) {
 				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
 			}
 		case 6: // YYMMDD
@@ -2081,7 +2221,7 @@ func parseMySQLDateValue(s string) string {
 			m, _ := strconv.Atoi(datePart[2:4])
 			d, _ := strconv.Atoi(datePart[4:6])
 			y := convert2DigitYear(yy)
-			if m >= 1 && m <= 12 && d >= 1 && d <= 31 {
+			if isValidDate(y, m, d) {
 				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
 			}
 		case 12: // YYMMDDHHMMSS - extract date part
@@ -2089,7 +2229,7 @@ func parseMySQLDateValue(s string) string {
 			m, _ := strconv.Atoi(datePart[2:4])
 			d, _ := strconv.Atoi(datePart[4:6])
 			y := convert2DigitYear(yy)
-			if m >= 1 && m <= 12 && d >= 1 && d <= 31 {
+			if isValidDate(y, m, d) {
 				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
 			}
 		}
@@ -2105,15 +2245,72 @@ func parseMySQLDateValue(s string) string {
 		y, errY := strconv.Atoi(yStr)
 		m, errM := strconv.Atoi(mStr)
 		d, errD := strconv.Atoi(dStr)
-		if errY == nil && errM == nil && errD == nil && m >= 0 && m <= 12 && d >= 0 && d <= 31 {
+		if errY == nil && errM == nil && errD == nil {
+			// Special case: all-zero date (e.g., 00-00-00) -> 0000-00-00
+			if y == 0 && m == 0 && d == 0 {
+				return "0000-00-00"
+			}
 			if len(yStr) <= 2 {
 				y = convert2DigitYear(y)
 			}
-			return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
+			if isValidDate(y, m, d) {
+				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
+			}
 		}
 	}
 
 	return ""
+}
+
+// isValidDate checks if a date is valid (or is the zero date 0000-00-00).
+func isValidDate(y, m, d int) bool {
+	// Zero date is always valid
+	if y == 0 && m == 0 && d == 0 {
+		return true
+	}
+	// Allow zero month/day for MySQL partial zero dates
+	if m == 0 || d == 0 {
+		return m >= 0 && m <= 12 && d >= 0 && d <= 31
+	}
+	if m < 1 || m > 12 || d < 1 {
+		return false
+	}
+	// Days in month
+	daysInMonth := [13]int{0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
+	maxDay := daysInMonth[m]
+	if m == 2 && isLeapYear(y) {
+		maxDay = 29
+	}
+	return d <= maxDay
+}
+
+// isLeapYear checks if a year is a leap year.
+func isLeapYear(y int) bool {
+	return (y%4 == 0 && y%100 != 0) || y%400 == 0
+}
+
+// extractColumnName extracts the column name from a sqlparser expression.
+// Returns empty string if the expression is not a simple column reference.
+func extractColumnName(expr sqlparser.Expr) string {
+	switch e := expr.(type) {
+	case *sqlparser.ColName:
+		return e.Name.String()
+	}
+	return ""
+}
+
+// isColumnNotNull checks if a column is defined as NOT NULL in the current query's table.
+func (e *Executor) isColumnNotNull(colName string) bool {
+	if e.queryTableDef == nil {
+		return false
+	}
+	colNameLower := strings.ToLower(colName)
+	for _, col := range e.queryTableDef.Columns {
+		if strings.ToLower(col.Name) == colNameLower {
+			return !col.Nullable
+		}
+	}
+	return false
 }
 
 // normalizeDateDelimiters replaces various date delimiters with '-'.
@@ -2158,6 +2355,25 @@ func looksLikeTime(s string) bool {
 	return strings.Contains(s, ":")
 }
 
+// normalizeDateTimeString normalizes a date or datetime string into canonical form.
+// For date-only values: returns "YYYY-MM-DD".
+// For datetime values: returns "YYYY-MM-DD HH:MM:SS".
+// Returns "" if the string cannot be parsed as a date.
+func normalizeDateTimeString(s string) string {
+	datePart := parseMySQLDateValue(s)
+	if datePart == "" {
+		return ""
+	}
+	// Check if original has a time component
+	timePart := extractTimePart(s, datePart)
+	if timePart != "" {
+		timePart = normalizeDateTimeSeparators(timePart)
+		return datePart + " " + timePart
+	}
+	return datePart
+}
+
+
 // convert2DigitYear converts a 2-digit year to 4-digit year.
 // 0-69 -> 2000-2069, 70-99 -> 1970-1999
 func convert2DigitYear(yy int) int {
@@ -2168,6 +2384,258 @@ func convert2DigitYear(yy int) int {
 		return 1900 + yy
 	}
 	return yy
+}
+
+// coerceIntegerValue converts values for integer columns (TINYINT, SMALLINT, MEDIUMINT, INT, BIGINT).
+// In non-strict mode: empty string -> 0, non-numeric string -> 0 (or extract leading number),
+// negative -> 0 for UNSIGNED, out-of-range -> clipped.
+func coerceIntegerValue(colType string, v interface{}) interface{} {
+	upper := strings.ToUpper(strings.TrimSpace(colType))
+	// Remove display width like INT(11)
+	baseType := upper
+	if idx := strings.Index(baseType, "("); idx >= 0 {
+		baseType = baseType[:idx]
+	}
+	isUnsigned := strings.Contains(upper, "UNSIGNED")
+	// Strip UNSIGNED, ZEROFILL etc. for base type check
+	baseType = strings.TrimSpace(strings.Replace(strings.Replace(baseType, "UNSIGNED", "", 1), "ZEROFILL", "", 1))
+
+	// Check if this is an integer type
+	isIntType := false
+	var minVal, maxVal int64
+	var maxUnsigned uint64
+	switch baseType {
+	case "TINYINT":
+		isIntType = true
+		minVal, maxVal = -128, 127
+		maxUnsigned = 255
+	case "SMALLINT":
+		isIntType = true
+		minVal, maxVal = -32768, 32767
+		maxUnsigned = 65535
+	case "MEDIUMINT":
+		isIntType = true
+		minVal, maxVal = -8388608, 8388607
+		maxUnsigned = 16777215
+	case "INT", "INTEGER":
+		isIntType = true
+		minVal, maxVal = -2147483648, 2147483647
+		maxUnsigned = 4294967295
+	case "BIGINT":
+		isIntType = true
+		minVal, maxVal = -9223372036854775808, 9223372036854775807
+		maxUnsigned = 18446744073709551615
+	}
+	if !isIntType {
+		return v
+	}
+
+	// Convert value to int64
+	var intVal int64
+	switch val := v.(type) {
+	case int64:
+		intVal = val
+	case float64:
+		intVal = int64(val)
+	case uint64:
+		if isUnsigned {
+			if val > maxUnsigned {
+				return int64(maxUnsigned)
+			}
+			return int64(val)
+		}
+		intVal = int64(val)
+	case string:
+		if val == "" {
+			return int64(0)
+		}
+		// Try parsing as number - extract leading numeric part
+		val = strings.TrimSpace(val)
+		// Parse leading numeric portion
+		numStr := ""
+		hasDot := false
+		for i, c := range val {
+			if c == '-' && i == 0 {
+				numStr += string(c)
+			} else if c >= '0' && c <= '9' {
+				numStr += string(c)
+			} else if c == '.' && !hasDot {
+				hasDot = true
+				numStr += string(c)
+			} else {
+				break
+			}
+		}
+		if numStr == "" || numStr == "-" {
+			return int64(0)
+		}
+		if hasDot {
+			f, err := strconv.ParseFloat(numStr, 64)
+			if err != nil {
+				return int64(0)
+			}
+			intVal = int64(f)
+		} else {
+			n, err := strconv.ParseInt(numStr, 10, 64)
+			if err != nil {
+				// Might be too large for int64
+				f, err2 := strconv.ParseFloat(numStr, 64)
+				if err2 != nil {
+					return int64(0)
+				}
+				intVal = int64(f)
+			} else {
+				intVal = n
+			}
+		}
+	default:
+		return v
+	}
+
+	// Apply range constraints
+	if isUnsigned {
+		if intVal < 0 {
+			return int64(0)
+		}
+		if uint64(intVal) > maxUnsigned {
+			return int64(maxUnsigned)
+		}
+	} else {
+		if intVal < minVal {
+			return minVal
+		}
+		if intVal > maxVal {
+			return maxVal
+		}
+	}
+	return intVal
+}
+
+// checkIntegerStrict validates integer constraints in strict mode.
+// Returns an error if the value would be out of range or is not a valid integer.
+func checkIntegerStrict(colType string, colName string, v interface{}) error {
+	upper := strings.ToUpper(strings.TrimSpace(colType))
+	baseType := upper
+	if idx := strings.Index(baseType, "("); idx >= 0 {
+		baseType = baseType[:idx]
+	}
+	isUnsigned := strings.Contains(upper, "UNSIGNED")
+	baseType = strings.TrimSpace(strings.Replace(strings.Replace(baseType, "UNSIGNED", "", 1), "ZEROFILL", "", 1))
+
+	isIntType := false
+	var minVal, maxVal int64
+	var maxUnsigned uint64
+	switch baseType {
+	case "TINYINT":
+		isIntType = true
+		minVal, maxVal = -128, 127
+		maxUnsigned = 255
+	case "SMALLINT":
+		isIntType = true
+		minVal, maxVal = -32768, 32767
+		maxUnsigned = 65535
+	case "MEDIUMINT":
+		isIntType = true
+		minVal, maxVal = -8388608, 8388607
+		maxUnsigned = 16777215
+	case "INT", "INTEGER":
+		isIntType = true
+		minVal, maxVal = -2147483648, 2147483647
+		maxUnsigned = 4294967295
+	case "BIGINT":
+		isIntType = true
+		minVal, maxVal = -9223372036854775808, 9223372036854775807
+		maxUnsigned = 18446744073709551615
+	}
+	if !isIntType {
+		return nil
+	}
+
+	// Check string values for non-numeric content
+	if s, ok := v.(string); ok {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return nil // empty string -> 0 is OK even in strict mode for non-strict numeric
+		}
+		// Check if it's a valid number
+		_, errInt := strconv.ParseInt(s, 10, 64)
+		_, errFloat := strconv.ParseFloat(s, 64)
+		if errInt != nil && errFloat != nil {
+			// Try to extract leading numeric part
+			hasNumeric := false
+			for _, c := range s {
+				if (c >= '0' && c <= '9') || c == '-' || c == '.' {
+					hasNumeric = true
+					break
+				}
+			}
+			if !hasNumeric {
+				return mysqlError(1366, "HY000", fmt.Sprintf("Incorrect integer value: '%s' for column '%s' at row 1", s, colName))
+			}
+		}
+	}
+
+	// Check range for numeric values
+	var intVal int64
+	switch val := v.(type) {
+	case int64:
+		intVal = val
+	case float64:
+		intVal = int64(val)
+	case uint64:
+		if isUnsigned && val > maxUnsigned {
+			return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+		}
+		return nil
+	case string:
+		val = strings.TrimSpace(val)
+		if val == "" {
+			return nil
+		}
+		numStr := ""
+		hasDot := false
+		for i, c := range val {
+			if c == '-' && i == 0 {
+				numStr += string(c)
+			} else if c >= '0' && c <= '9' {
+				numStr += string(c)
+			} else if c == '.' && !hasDot {
+				hasDot = true
+				numStr += string(c)
+			} else {
+				break
+			}
+		}
+		if numStr == "" || numStr == "-" {
+			return nil
+		}
+		if hasDot {
+			f, _ := strconv.ParseFloat(numStr, 64)
+			intVal = int64(f)
+		} else {
+			n, err := strconv.ParseInt(numStr, 10, 64)
+			if err != nil {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+			}
+			intVal = n
+		}
+	default:
+		return nil
+	}
+
+	if isUnsigned {
+		if intVal < 0 {
+			return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+		}
+		if uint64(intVal) > maxUnsigned {
+			return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+		}
+	} else {
+		if intVal < minVal || intVal > maxVal {
+			return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+		}
+	}
+	return nil
 }
 
 // validateEnumSetValue validates and normalizes a value for ENUM/SET columns.
@@ -2540,6 +3008,12 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 					defStr = defStr[1 : len(defStr)-1]
 				}
 				colDef.Default = &defStr
+			}
+			if col.Type.Options.OnUpdate != nil {
+				onUpdateStr := strings.ToUpper(sqlparser.String(col.Type.Options.OnUpdate))
+				if strings.Contains(onUpdateStr, "CURRENT_TIMESTAMP") || strings.Contains(onUpdateStr, "NOW") {
+					colDef.OnUpdateCurrentTimestamp = true
+				}
 			}
 			switch col.Type.Options.KeyOpt {
 			case sqlparser.ColKeyPrimary, sqlparser.ColKey: // PRIMARY KEY or KEY
@@ -3170,10 +3644,15 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 									return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
 								}
 							}
+							// Strict mode: check integer type constraints
+							if err := checkIntegerStrict(col.Type, col.Name, v); err != nil {
+								return nil, err
+							}
 						}
 						v = formatDecimalValue(col.Type, v)
 						v = validateEnumSetValue(col.Type, v)
 						v = coerceDateTimeValue(col.Type, v)
+						v = coerceIntegerValue(col.Type, v)
 					}
 					break
 				}
@@ -3236,6 +3715,23 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					}
 					tbl.Rows[dupIdx][colName] = val
 				}
+				// Apply ON UPDATE CURRENT_TIMESTAMP for columns with that property
+				for _, col := range tbl.Def.Columns {
+					if col.OnUpdateCurrentTimestamp {
+						// Only update if the column wasn't explicitly set in the ON DUP clause
+						explicitlySet := false
+						for _, upd := range stmt.OnDup {
+							if upd.Name.Name.String() == col.Name {
+								explicitlySet = true
+								break
+							}
+						}
+						if !explicitlySet {
+							nowStr := e.nowTime().Format("2006-01-02 15:04:05")
+							tbl.Rows[dupIdx][col.Name] = nowStr
+						}
+					}
+				}
 				tbl.Unlock()
 				// MySQL counts ON DUPLICATE KEY UPDATE as 2 affected rows when a row is updated.
 				affected += 2
@@ -3254,7 +3750,14 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				if col.AutoIncrement {
 					fullRow[col.Name] = tbl.AutoIncrementValue() + 1
 				} else if col.Default != nil {
-					fullRow[col.Name] = *col.Default
+					defVal := *col.Default
+					defUpper := strings.ToUpper(defVal)
+					// Evaluate dynamic defaults
+					if defUpper == "CURRENT_TIMESTAMP" || defUpper == "CURRENT_TIMESTAMP()" ||
+						defUpper == "NOW()" {
+						defVal = e.nowTime().Format("2006-01-02 15:04:05")
+					}
+					fullRow[col.Name] = defVal
 				} else if !col.Nullable {
 					// NOT NULL columns without default get the type's zero value
 					fullRow[col.Name] = implicitZeroValue(col.Type)
@@ -3308,13 +3811,25 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 		}
 
+
 		// Strict mode validation before insert
 		if e.isStrictMode() {
 			for _, col := range tbl.Def.Columns {
 				// NOT NULL check
 				if !col.Nullable && !col.AutoIncrement {
 					rv, exists := row[col.Name]
-					if !exists || rv == nil {
+					// Check if column was explicitly specified in the INSERT
+					explicitlySpecified := false
+					for _, cn := range colNames {
+						if strings.EqualFold(cn, col.Name) {
+							explicitlySpecified = true
+							break
+						}
+					}
+					if !explicitlySpecified && col.Default == nil {
+						// Column not specified and has no default -> error 1364
+						return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
+					} else if exists && rv == nil && explicitlySpecified {
 						return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
 					}
 				}
@@ -3997,6 +4512,23 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// Handle SELECT without FROM (e.g., SELECT 1, SELECT @@version_comment)
 	if len(stmt.From) == 0 {
 		return e.execSelectNoFrom(stmt)
+	}
+
+	// Set queryTableDef for column-level checks (e.g., IS NULL on NOT NULL columns).
+	oldQueryTableDef := e.queryTableDef
+	e.queryTableDef = nil
+	defer func() { e.queryTableDef = oldQueryTableDef }()
+	if len(stmt.From) > 0 {
+		if tbl, ok := stmt.From[0].(*sqlparser.AliasedTableExpr); ok {
+			if tn, ok := tbl.Expr.(sqlparser.TableName); ok {
+				tableName := tn.Name.String()
+				if db, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
+					if td, ok := db.Tables[tableName]; ok {
+						e.queryTableDef = td
+					}
+				}
+			}
+		}
 	}
 
 	// Process WITH clause (Common Table Expressions) if present.
@@ -5351,6 +5883,7 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 						val = formatDecimalValue(col.Type, val)
 						val = validateEnumSetValue(col.Type, val)
 						val = coerceDateTimeValue(col.Type, val)
+						val = coerceIntegerValue(col.Type, val)
 					}
 					break
 				}
@@ -5665,6 +6198,12 @@ func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 				defStr = defStr[1 : len(defStr)-1]
 			}
 			colDef.Default = &defStr
+		}
+		if col.Type.Options.OnUpdate != nil {
+			onUpdateStr := strings.ToUpper(sqlparser.String(col.Type.Options.OnUpdate))
+			if strings.Contains(onUpdateStr, "CURRENT_TIMESTAMP") || strings.Contains(onUpdateStr, "NOW") {
+				colDef.OnUpdateCurrentTimestamp = true
+			}
 		}
 		if col.Type.Options.KeyOpt == 1 { // colKeyPrimary
 			colDef.PrimaryKey = true
@@ -9124,6 +9663,28 @@ func parseDateTimeValue(val interface{}) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("cannot parse date/time value: %q", s)
 }
 
+// extractLeadingInt extracts the leading integer portion of a string.
+// For example, "1 01:01:01" -> "1", "123abc" -> "123", "-5" -> "-5".
+func extractLeadingInt(s string) string {
+	s = strings.TrimSpace(s)
+	end := 0
+	for i, c := range s {
+		if c == '-' && i == 0 {
+			end = 1
+			continue
+		}
+		if c >= '0' && c <= '9' {
+			end = i + 1
+		} else {
+			break
+		}
+	}
+	if end == 0 {
+		return "0"
+	}
+	return s[:end]
+}
+
 // evalIntervalDateExpr evaluates DATE_ADD/DATE_SUB expressions.
 func evalIntervalDateExpr(dateVal, intervalVal interface{}, unit sqlparser.IntervalType, syntax sqlparser.IntervalExprSyntax) (interface{}, error) {
 	t, err := parseDateTimeValue(dateVal)
@@ -9135,39 +9696,39 @@ func evalIntervalDateExpr(dateVal, intervalVal interface{}, unit sqlparser.Inter
 
 	switch unit {
 	case sqlparser.IntervalDay:
-		n, _ := strconv.Atoi(iStr)
+		n, _ := strconv.Atoi(extractLeadingInt(iStr))
 		if isSubtract {
 			n = -n
 		}
 		t = t.AddDate(0, 0, n)
 	case sqlparser.IntervalMonth:
-		n, _ := strconv.Atoi(iStr)
+		n, _ := strconv.Atoi(extractLeadingInt(iStr))
 		if isSubtract {
 			n = -n
 		}
 		t = t.AddDate(0, n, 0)
 	case sqlparser.IntervalYear:
-		n, _ := strconv.Atoi(iStr)
+		n, _ := strconv.Atoi(extractLeadingInt(iStr))
 		if isSubtract {
 			n = -n
 		}
 		t = t.AddDate(n, 0, 0)
 	case sqlparser.IntervalHour:
-		n, _ := strconv.Atoi(iStr)
+		n, _ := strconv.Atoi(extractLeadingInt(iStr))
 		d := time.Duration(n) * time.Hour
 		if isSubtract {
 			d = -d
 		}
 		t = t.Add(d)
 	case sqlparser.IntervalMinute:
-		n, _ := strconv.Atoi(iStr)
+		n, _ := strconv.Atoi(extractLeadingInt(iStr))
 		d := time.Duration(n) * time.Minute
 		if isSubtract {
 			d = -d
 		}
 		t = t.Add(d)
 	case sqlparser.IntervalSecond:
-		n, _ := strconv.Atoi(iStr)
+		n, _ := strconv.Atoi(extractLeadingInt(iStr))
 		d := time.Duration(n) * time.Second
 		if isSubtract {
 			d = -d
@@ -10733,7 +11294,8 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 						hasNull = true
 						continue
 					}
-					if fmt.Sprintf("%v", left) == fmt.Sprintf("%v", val) {
+					match, _ := compareValues(left, val, sqlparser.EqualOp)
+					if match {
 						return v.Operator == sqlparser.InOp, nil
 					}
 				}
@@ -10937,7 +11499,17 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 					return true, nil
 				}
 			}
-			return val == nil, nil
+			if val == nil {
+				return true, nil
+			}
+			// MySQL: 0000-00-00 IS NULL = TRUE for NOT NULL date columns
+			if isZeroDate(val) {
+				colName := extractColumnName(v.Left)
+				if colName != "" && e.isColumnNotNull(colName) {
+					return true, nil
+				}
+			}
+			return false, nil
 		case sqlparser.IsNotNullOp:
 			return val != nil, nil
 		case sqlparser.IsTrueOp:
@@ -11064,7 +11636,19 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 				return fl == fr, nil
 			}
 		}
-		return ls == rs, nil
+		if ls == rs {
+			return true, nil
+		}
+		// Try date normalization
+		if looksLikeDate(ls) || looksLikeDate(rs) {
+			ln := normalizeDateTimeString(ls)
+			rn := normalizeDateTimeString(rs)
+			if ln != "" && rn != "" {
+				ln, rn = normalizeDateTimeForCompare(ln, rn)
+				return ln == rn, nil
+			}
+		}
+		return false, nil
 	}
 
 	// Handle NULL comparisons
@@ -11086,11 +11670,13 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 		if ls == rs {
 			return true, nil
 		}
-		// Try date normalization if strings look like dates
+		// Try datetime normalization if strings look like dates
 		if looksLikeDate(ls) || looksLikeDate(rs) {
-			ln := parseMySQLDateValue(ls)
-			rn := parseMySQLDateValue(rs)
+			ln := normalizeDateTimeString(ls)
+			rn := normalizeDateTimeString(rs)
 			if ln != "" && rn != "" {
+				// Use the two-arg normalizer to align date vs datetime granularity
+				ln, rn = normalizeDateTimeForCompare(ln, rn)
 				return ln == rn, nil
 			}
 		}
@@ -11114,11 +11700,12 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 		if ls == rs {
 			return false, nil
 		}
-		// Try date normalization
+		// Try datetime normalization
 		if looksLikeDate(ls) || looksLikeDate(rs) {
-			ln := parseMySQLDateValue(ls)
-			rn := parseMySQLDateValue(rs)
+			ln := normalizeDateTimeString(ls)
+			rn := normalizeDateTimeString(rs)
 			if ln != "" && rn != "" {
+				ln, rn = normalizeDateTimeForCompare(ln, rn)
 				return ln != rn, nil
 			}
 		}
@@ -11370,6 +11957,13 @@ func compareNumeric(a, b interface{}) int {
 				}
 				return 0
 			}
+		}
+		// Normalize date values first (e.g., "20070523091528" -> "2007-05-23 09:15:28")
+		if na := normalizeDateTimeString(sa); na != "" {
+			sa = na
+		}
+		if nb := normalizeDateTimeString(sb); nb != "" {
+			sb = nb
 		}
 		// Normalize date/time comparisons: when one is TIME-like and
 		// the other is DATETIME-like, extract the matching part.

@@ -25,6 +25,15 @@ import (
 )
 
 func main() {
+	// MySQL MTR framework uses --timezone=GMT-3 (POSIX convention: GMT-3 = UTC+3).
+	// Set process timezone to match so that SET TIMESTAMP results are consistent.
+	os.Setenv("TZ", "Etc/GMT-3")
+	// Force Go's time package to pick up the new TZ.
+	// Note: time.Local is set at init time, but LoadLocation honors TZ env.
+	if loc, err := time.LoadLocation("Etc/GMT-3"); err == nil {
+		time.Local = loc
+	}
+
 	// Resolve testdata path: prefer the main repo's copy so worktrees don't need submodule init.
 	defaultTestdata := resolveTestdataRoot()
 	suiteRoot := flag.String("suite-root", filepath.Join(defaultTestdata, "suite"), "root directory for test suites")

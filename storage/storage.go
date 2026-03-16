@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -250,6 +251,16 @@ func toInt64(v interface{}) (int64, bool) {
 		return val, true
 	case float64:
 		return int64(val), true
+	case uint64:
+		return int64(val), true
+	case string:
+		if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+			return n, true
+		}
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			return int64(f), true
+		}
+		return 0, false
 	default:
 		return 0, false
 	}

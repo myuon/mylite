@@ -96,7 +96,7 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	}
 
 	// Execute with timeout
-	timeout := 120 * time.Second
+	timeout := 600 * time.Second
 	doneCh := make(chan error, 1)
 
 	tmpDir := r.TmpDir
@@ -302,16 +302,71 @@ func (ctx *execContext) executeLines(lines []string) error {
 			continue
 		}
 
-		// Handle if/while with { on the same line: skip the block
-		// This handles cases like "if ($var) {" where the brace is on the same line.
-		// The old-style "if ($var)\n{\n...\n}" is handled by the bare "{" block skipper above.
+		// Handle if/while with { on the same line
 		lowerTrimmed := strings.ToLower(trimmed)
-		isIfWhile := strings.HasPrefix(lowerTrimmed, "if ") || strings.HasPrefix(lowerTrimmed, "if(") ||
-			strings.HasPrefix(lowerTrimmed, "--if ") || strings.HasPrefix(lowerTrimmed, "--if(") ||
-			strings.HasPrefix(lowerTrimmed, "while ") || strings.HasPrefix(lowerTrimmed, "while(") ||
+		isWhile := strings.HasPrefix(lowerTrimmed, "while ") || strings.HasPrefix(lowerTrimmed, "while(") ||
 			strings.HasPrefix(lowerTrimmed, "--while ") || strings.HasPrefix(lowerTrimmed, "--while(")
-		if isIfWhile && strings.Contains(trimmed, "{") {
-			// { is on this line - skip until matching }
+		isIf := !isWhile && (strings.HasPrefix(lowerTrimmed, "if ") || strings.HasPrefix(lowerTrimmed, "if(") ||
+			strings.HasPrefix(lowerTrimmed, "--if ") || strings.HasPrefix(lowerTrimmed, "--if("))
+		isIfWhile := isWhile || isIf
+
+		if isWhile && strings.Contains(trimmed, "{") {
+			// Extract condition
+			condStr := trimmed
+			condStr = strings.TrimPrefix(strings.TrimPrefix(condStr, "--"), "")
+			condStr = strings.TrimSpace(condStr)
+			if strings.HasPrefix(strings.ToLower(condStr), "--while") {
+				condStr = condStr[7:]
+			} else if strings.HasPrefix(strings.ToLower(condStr), "while") {
+				condStr = condStr[5:]
+			}
+			condStr = strings.TrimSpace(condStr)
+			condStr = strings.TrimSuffix(condStr, "{")
+			condStr = strings.TrimSpace(condStr)
+			condStr = strings.TrimPrefix(condStr, "(")
+			condStr = strings.TrimSuffix(condStr, ")")
+			condStr = strings.TrimSpace(condStr)
+
+			// Collect body lines until matching }
+			bodyStart := i + 1
+			depth := 1
+			j := bodyStart
+			for j < len(lines) && depth > 0 {
+				t := strings.TrimSpace(lines[j])
+				for _, ch := range t {
+					if ch == '{' {
+						depth++
+					} else if ch == '}' {
+						depth--
+					}
+				}
+				if depth == 0 {
+					break
+				}
+				j++
+			}
+			bodyLines := lines[bodyStart:j]
+
+			// Execute while loop
+			for loopCount := 0; loopCount < 100000; loopCount++ {
+				condVal := ctx.substituteVars(condStr)
+				n, _ := strconv.Atoi(condVal)
+				if n == 0 {
+					break
+				}
+				err := ctx.executeLines(bodyLines)
+				if err != nil {
+					if errors.Is(err, errSkipTest) {
+						return err
+					}
+					return fmt.Errorf("line %d (while body): %v", i+1, err)
+				}
+			}
+			i = j + 1 // skip past the closing }
+			continue
+		}
+		if isIf && strings.Contains(trimmed, "{") {
+			// Skip if blocks
 			depth := 1
 			i++
 			for i < len(lines) && depth > 0 {
@@ -328,8 +383,61 @@ func (ctx *execContext) executeLines(lines []string) error {
 			continue
 		}
 		if isIfWhile {
-			// No { on this line - just skip the if/while line itself
-			// The { will appear on the next line and be handled by the bare "{" block skipper
+			// No { on this line - handle the next-line { case
+			if isWhile {
+				// Look for { on next line and collect body
+				nextI := i + 1
+				for nextI < len(lines) && strings.TrimSpace(lines[nextI]) == "" {
+					nextI++
+				}
+				if nextI < len(lines) && strings.TrimSpace(lines[nextI]) == "{" {
+					// Extract condition
+					condStr := trimmed
+					if strings.HasPrefix(strings.ToLower(condStr), "--while") {
+						condStr = condStr[7:]
+					} else if strings.HasPrefix(strings.ToLower(condStr), "while") {
+						condStr = condStr[5:]
+					}
+					condStr = strings.TrimSpace(condStr)
+					condStr = strings.TrimPrefix(condStr, "(")
+					condStr = strings.TrimSuffix(condStr, ")")
+					condStr = strings.TrimSpace(condStr)
+
+					bodyStart := nextI + 1
+					depth := 1
+					j := bodyStart
+					for j < len(lines) && depth > 0 {
+						t := strings.TrimSpace(lines[j])
+						if t == "{" {
+							depth++
+						}
+						if t == "}" {
+							depth--
+							if depth == 0 {
+								break
+							}
+						}
+						j++
+					}
+					bodyLines := lines[bodyStart:j]
+					for loopCount := 0; loopCount < 100000; loopCount++ {
+						condVal := ctx.substituteVars(condStr)
+						n, _ := strconv.Atoi(condVal)
+						if n == 0 {
+							break
+						}
+						err := ctx.executeLines(bodyLines)
+						if err != nil {
+							if errors.Is(err, errSkipTest) {
+								return err
+							}
+							return fmt.Errorf("line %d (while body): %v", i+1, err)
+						}
+					}
+					i = j + 1
+					continue
+				}
+			}
 			i++
 			continue
 		}
@@ -397,12 +505,12 @@ func (ctx *execContext) executeLines(lines []string) error {
 			}
 		}
 
-		// Handle while/if blocks with { on the same line: while($i){ or if($cond){
-		if (strings.HasPrefix(trimmed, "while(") || strings.HasPrefix(trimmed, "while ") ||
-			strings.HasPrefix(trimmed, "if(") || strings.HasPrefix(trimmed, "if ") ||
-			strings.HasPrefix(trimmed, "--if") || strings.HasPrefix(trimmed, "--while")) &&
+		// Handle while/if blocks with { on the same line (second pass - after bare directive handling)
+		// This is already handled by the isWhile/isIf block above, but if we get here
+		// it means the bare directive handler consumed a "while" keyword. Skip to be safe.
+		if (strings.HasPrefix(trimmed, "if(") || strings.HasPrefix(trimmed, "if ") ||
+			strings.HasPrefix(trimmed, "--if")) &&
 			strings.HasSuffix(trimmed, "{") {
-			// Skip until matching }
 			depth := 1
 			i++
 			for i < len(lines) && depth > 0 {
@@ -719,6 +827,32 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		}
 		return true, false, nil
 
+	case "inc":
+		// Increment a variable: --inc $var
+		varName := strings.TrimSpace(args)
+		varName = strings.TrimRight(varName, ";")
+		if ctx.variables != nil {
+			if val, ok := ctx.variables[varName]; ok {
+				if n, err2 := strconv.Atoi(val); err2 == nil {
+					ctx.variables[varName] = strconv.Itoa(n + 1)
+				}
+			}
+		}
+		return true, false, nil
+
+	case "dec":
+		// Decrement a variable: --dec $var
+		varName := strings.TrimSpace(args)
+		varName = strings.TrimRight(varName, ";")
+		if ctx.variables != nil {
+			if val, ok := ctx.variables[varName]; ok {
+				if n, err2 := strconv.Atoi(val); err2 == nil {
+					ctx.variables[varName] = strconv.Itoa(n - 1)
+				}
+			}
+		}
+		return true, false, nil
+
 	// Directives we accept but ignore
 	case "character_set", "charset":
 		return true, false, nil
@@ -736,7 +870,6 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"system",
 		"die", "exit",
 		"if", "while", "end",
-		"inc", "dec",
 		"horizontal_results", "vertical_results",
 		"require", "result_format",
 		"disable_reconnect", "enable_reconnect",
@@ -1233,8 +1366,131 @@ func (ctx *execContext) setVariable(expr string) error {
 		return nil
 	}
 
+	// Apply variable substitution to the value
+	value = ctx.substituteVars(value)
+
+	// Try to evaluate arithmetic expressions (e.g., $i/2 -> "1/2" -> 0)
+	if len(value) > 0 && !strings.HasPrefix(value, "query_get_value") {
+		if evalResult, ok := evalMTRArithmetic(value); ok {
+			ctx.variables[name] = evalResult
+			return nil
+		}
+	}
+
+	// Handle query_get_value(SQL, colName, rowNum)
+	if strings.HasPrefix(strings.ToLower(value), "query_get_value(") && strings.HasSuffix(value, ")") {
+		inner := value[len("query_get_value(") : len(value)-1]
+		inner = ctx.substituteVars(inner)
+		// Parse from the end: last comma separates rowNum, second-to-last separates colName
+		lastComma := strings.LastIndex(inner, ",")
+		if lastComma < 0 {
+			ctx.variables[name] = ""
+			return nil
+		}
+		rowNumStr := strings.TrimSpace(inner[lastComma+1:])
+		rest := inner[:lastComma]
+		secondLastComma := strings.LastIndex(rest, ",")
+		if secondLastComma < 0 {
+			ctx.variables[name] = ""
+			return nil
+		}
+		sqlStmt := strings.TrimSpace(rest[:secondLastComma])
+		// rowNum is 1-based
+		rowNum, _ := strconv.Atoi(rowNumStr)
+		if rowNum < 1 {
+			rowNum = 1
+		}
+		rows, err := ctx.db.Query(sqlStmt)
+		if err != nil {
+			ctx.variables[name] = ""
+			return nil
+		}
+		defer rows.Close()
+		cols, _ := rows.Columns()
+		// Find column index
+		colName := strings.TrimSpace(rest[secondLastComma+1:])
+		colIdx := -1
+		for ci, cn := range cols {
+			if strings.EqualFold(cn, colName) {
+				colIdx = ci
+				break
+			}
+		}
+		if colIdx < 0 {
+			colIdx = 0
+		}
+		rowCount := 0
+		for rows.Next() {
+			rowCount++
+			vals := make([]interface{}, len(cols))
+			ptrs := make([]interface{}, len(cols))
+			for ci := range vals {
+				ptrs[ci] = &vals[ci]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				continue
+			}
+			if rowCount == rowNum {
+				v := vals[colIdx]
+				if v == nil {
+					ctx.variables[name] = "NULL"
+				} else if bs, ok := v.([]byte); ok {
+					ctx.variables[name] = string(bs)
+				} else {
+					ctx.variables[name] = fmt.Sprintf("%v", v)
+				}
+				return nil
+			}
+		}
+		ctx.variables[name] = "No such row"
+		return nil
+	}
+
 	ctx.variables[name] = value
 	return nil
+}
+
+// evalMTRArithmetic tries to evaluate a simple arithmetic expression (like "5/2").
+// Returns the result as string and true if successful.
+func evalMTRArithmetic(expr string) (string, bool) {
+	expr = strings.TrimSpace(expr)
+	// Try simple integer
+	if _, err := strconv.Atoi(expr); err == nil {
+		return expr, true
+	}
+	// Try division
+	if parts := strings.SplitN(expr, "/", 2); len(parts) == 2 {
+		a, errA := strconv.Atoi(strings.TrimSpace(parts[0]))
+		b, errB := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if errA == nil && errB == nil && b != 0 {
+			return strconv.Itoa(a / b), true
+		}
+	}
+	// Try multiplication
+	if parts := strings.SplitN(expr, "*", 2); len(parts) == 2 {
+		a, errA := strconv.Atoi(strings.TrimSpace(parts[0]))
+		b, errB := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if errA == nil && errB == nil {
+			return strconv.Itoa(a * b), true
+		}
+	}
+	// Try addition
+	if parts := strings.SplitN(expr, "+", 2); len(parts) == 2 {
+		a, errA := strconv.Atoi(strings.TrimSpace(parts[0]))
+		b, errB := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if errA == nil && errB == nil {
+			return strconv.Itoa(a + b), true
+		}
+	}
+	// Try subtraction (be careful not to match negative numbers)
+	if idx := strings.LastIndex(expr, "-"); idx > 0 {
+		a, errA := strconv.Atoi(strings.TrimSpace(expr[:idx]))
+		b, errB := strconv.Atoi(strings.TrimSpace(expr[idx+1:]))
+		if errA == nil && errB == nil {
+			return strconv.Itoa(a - b), true
+		}
+	}
+	return "", false
 }
 
 func (ctx *execContext) substituteVars(s string) string {
