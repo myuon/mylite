@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,15 +24,15 @@ func displayValue(v interface{}) string {
 
 // Table is the in-memory storage for a single table.
 type Table struct {
-	Def              *catalog.TableDef
-	Rows             []Row
-	AutoIncrement    atomic.Int64
-	AIExplicitlySet  bool // true if AUTO_INCREMENT was explicitly set via ALTER/CREATE TABLE
-	Mu               sync.RWMutex
+	Def             *catalog.TableDef
+	Rows            []Row
+	AutoIncrement   atomic.Int64
+	AIExplicitlySet bool // true if AUTO_INCREMENT was explicitly set via ALTER/CREATE TABLE
+	Mu              sync.RWMutex
 }
 
-func (t *Table) Lock()                   { t.Mu.Lock() }
-func (t *Table) Unlock()                 { t.Mu.Unlock() }
+func (t *Table) Lock()                     { t.Mu.Lock() }
+func (t *Table) Unlock()                   { t.Mu.Unlock() }
 func (t *Table) AutoIncrementValue() int64 { return t.AutoIncrement.Load() }
 
 // Engine is the in-memory storage engine managing all tables per database.
@@ -121,13 +122,46 @@ func (t *Table) Insert(row Row) (int64, error) {
 					// Explicit NULL on a nullable AI column with explicit AI start: keep NULL
 					lastInsertID = 0
 				} else {
-					id := t.AutoIncrement.Add(1)
+					maxID, hasMax, isUnsignedBigint := autoIncrementMaxForType(col.Type)
+					cur := t.AutoIncrement.Load()
+					if isUnsignedBigint && cur >= math.MaxInt64 {
+						return 0, fmt.Errorf("Failed to read auto-increment value from storage engine")
+					}
+					id := cur + 1
+					// Signed int64 overflow guard (BIGINT signed max case).
+					if id < cur {
+						id = cur
+					}
+					// MySQL auto_increment on bounded integer types saturates at type max;
+					// next inserts then hit duplicate-key on the saturated value.
+					if hasMax && id > maxID {
+						id = maxID
+					}
+					t.AutoIncrement.Store(id)
 					row[col.Name] = id
 					lastInsertID = id
 				}
 			} else {
 				// If explicit value provided, update auto_increment counter if needed
 				// Store the value itself (not value+1) because Add(1) will return value+1
+				if uv, ok := v.(uint64); ok {
+					_, _, isUnsignedBigint := autoIncrementMaxForType(col.Type)
+					if isUnsignedBigint {
+						if uv > math.MaxInt64 {
+							t.AutoIncrement.Store(math.MaxInt64)
+						} else if int64(uv) >= t.AutoIncrement.Load() {
+							t.AutoIncrement.Store(int64(uv))
+						}
+					} else if uv <= math.MaxInt64 && int64(uv) >= t.AutoIncrement.Load() {
+						t.AutoIncrement.Store(int64(uv))
+					}
+					if uv <= math.MaxInt64 {
+						lastInsertID = int64(uv)
+					} else {
+						lastInsertID = 0
+					}
+					continue
+				}
 				if intVal, ok := toInt64(v); ok && intVal >= t.AutoIncrement.Load() {
 					t.AutoIncrement.Store(intVal)
 				}
@@ -224,6 +258,46 @@ func (t *Table) Insert(row Row) (int64, error) {
 
 	t.Rows = append(t.Rows, row)
 	return lastInsertID, nil
+}
+
+func autoIncrementMaxForType(colType string) (int64, bool, bool) {
+	upper := strings.ToUpper(strings.TrimSpace(colType))
+	base := upper
+	if i := strings.IndexByte(base, '('); i >= 0 {
+		base = base[:i]
+	}
+	isUnsigned := strings.Contains(upper, "UNSIGNED")
+	base = strings.TrimSpace(strings.Replace(strings.Replace(base, "UNSIGNED", "", 1), "ZEROFILL", "", 1))
+	switch base {
+	case "TINYINT":
+		if isUnsigned {
+			return 255, true, false
+		}
+		return 127, true, false
+	case "SMALLINT":
+		if isUnsigned {
+			return 65535, true, false
+		}
+		return 32767, true, false
+	case "MEDIUMINT":
+		if isUnsigned {
+			return 16777215, true, false
+		}
+		return 8388607, true, false
+	case "INT", "INTEGER":
+		if isUnsigned {
+			return 4294967295, true, false
+		}
+		return 2147483647, true, false
+	case "BIGINT":
+		if isUnsigned {
+			// uint64 max does not fit int64 storage path.
+			// Signal caller to raise ER_AUTOINC_READ_FAILED at int64 boundary.
+			return math.MaxInt64, false, true
+		}
+		return math.MaxInt64, true, false
+	}
+	return 0, false, false
 }
 
 // Scan returns all rows (snapshot).

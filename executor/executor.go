@@ -2531,15 +2531,31 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 	case int64:
 		intVal = val
 	case float64:
-		intVal = int64(val)
+		if val > float64(maxVal) {
+			intVal = maxVal
+		} else if val < float64(minVal) {
+			intVal = minVal
+		} else {
+			intVal = int64(val)
+		}
 	case uint64:
 		if isUnsigned {
 			if val > maxUnsigned {
+				if baseType == "BIGINT" {
+					return maxUnsigned
+				}
 				return int64(maxUnsigned)
+			}
+			if baseType == "BIGINT" {
+				return val
 			}
 			return int64(val)
 		}
-		intVal = int64(val)
+		if val > uint64(math.MaxInt64) {
+			intVal = maxVal
+		} else {
+			intVal = int64(val)
+		}
 	case string:
 		if val == "" {
 			return int64(0)
@@ -2569,7 +2585,13 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 			if err != nil {
 				return int64(0)
 			}
-			intVal = int64(f)
+			if f > float64(maxVal) {
+				intVal = maxVal
+			} else if f < float64(minVal) {
+				intVal = minVal
+			} else {
+				intVal = int64(f)
+			}
 		} else {
 			n, err := strconv.ParseInt(numStr, 10, 64)
 			if err != nil {
@@ -2578,7 +2600,13 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 				if err2 != nil {
 					return int64(0)
 				}
-				intVal = int64(f)
+				if f > float64(maxVal) {
+					intVal = maxVal
+				} else if f < float64(minVal) {
+					intVal = minVal
+				} else {
+					intVal = int64(f)
+				}
 			} else {
 				intVal = n
 			}
@@ -2590,10 +2618,19 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 	// Apply range constraints
 	if isUnsigned {
 		if intVal < 0 {
+			if baseType == "BIGINT" {
+				return uint64(0)
+			}
 			return int64(0)
 		}
 		if uint64(intVal) > maxUnsigned {
+			if baseType == "BIGINT" {
+				return maxUnsigned
+			}
 			return int64(maxUnsigned)
+		}
+		if baseType == "BIGINT" {
+			return uint64(intVal)
 		}
 	} else {
 		if intVal < minVal {
@@ -2623,20 +2660,33 @@ func coerceBitValue(colType string, v interface{}) interface{} {
 	}
 	parseBitString := func(s string) (uint64, bool) {
 		s = strings.TrimSpace(s)
-		if strings.HasPrefix(strings.ToLower(s), "b'") && strings.HasSuffix(s, "'") {
-			s = s[2 : len(s)-1]
-			if s == "" {
+		if strings.HasPrefix(strings.ToLower(s), "b'") {
+			body := s[2:]
+			if idx := strings.Index(body, "'"); idx >= 0 {
+				body = body[:idx]
+			}
+			i := 0
+			for i < len(body) && (body[i] == '0' || body[i] == '1') {
+				i++
+			}
+			body = body[:i]
+			if body == "" {
 				return 0, true
 			}
-			u, err := strconv.ParseUint(s, 2, 64)
+			u, err := strconv.ParseUint(body, 2, 64)
 			return u, err == nil
 		}
 		if strings.HasPrefix(s, "0b") || strings.HasPrefix(s, "0B") {
-			s = s[2:]
-			if s == "" {
+			body := s[2:]
+			i := 0
+			for i < len(body) && (body[i] == '0' || body[i] == '1') {
+				i++
+			}
+			body = body[:i]
+			if body == "" {
 				return 0, true
 			}
-			u, err := strconv.ParseUint(s, 2, 64)
+			u, err := strconv.ParseUint(body, 2, 64)
 			return u, err == nil
 		}
 		return 0, false
@@ -2644,18 +2694,30 @@ func coerceBitValue(colType string, v interface{}) interface{} {
 	var u uint64
 	switch n := v.(type) {
 	case int64:
-		u = uint64(n)
+		if n < 0 {
+			u = 0
+		} else {
+			u = uint64(n)
+		}
 	case uint64:
 		u = n
 	case float64:
-		u = uint64(int64(n))
+		if n < 0 {
+			u = 0
+		} else {
+			u = uint64(int64(n))
+		}
 	case string:
 		if bu, ok := parseBitString(n); ok {
 			u = bu
 			break
 		}
 		if iv, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64); err == nil {
-			u = uint64(iv)
+			if iv < 0 {
+				u = 0
+			} else {
+				u = uint64(iv)
+			}
 			break
 		}
 		return int64(0)
@@ -2666,7 +2728,10 @@ func coerceBitValue(colType string, v interface{}) interface{} {
 	if width == 64 {
 		mask = ^uint64(0)
 	}
-	return int64(u & mask)
+	if u > mask {
+		u = mask
+	}
+	return int64(u)
 }
 
 // checkIntegerStrict validates integer constraints in strict mode.
@@ -3560,6 +3625,14 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			Type:     buildColumnTypeString(col.Type),
 			Nullable: nullable,
 		}
+		if tUpper := strings.ToUpper(strings.TrimSpace(colDef.Type)); strings.HasPrefix(tUpper, "BIT(") {
+			var width int
+			if n, err := fmt.Sscanf(tUpper, "BIT(%d)", &width); err == nil && n == 1 {
+				if width < 1 || width > 64 {
+					return nil, mysqlError(1439, "42000", fmt.Sprintf("Display width out of range for column '%s' (max = 64)", colDef.Name))
+				}
+			}
+		}
 		if err := validateNumericTypeSpec(colDef.Type, colDef.Name); err != nil {
 			return nil, mysqlError(1426, "42000", err.Error())
 		}
@@ -4162,7 +4235,15 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	}
 
 	var lastInsertID int64
+	var firstAutoInsertID int64
 	var affected uint64
+	autoColName := ""
+	for _, col := range tbl.Def.Columns {
+		if col.AutoIncrement {
+			autoColName = col.Name
+			break
+		}
+	}
 
 	for _, valTuple := range rows {
 		row := make(storage.Row)
@@ -4589,15 +4670,39 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 		}
 
+		autoGeneratedThisRow := false
+		if autoColName != "" {
+			if v, exists := row[autoColName]; !exists || v == nil {
+				autoGeneratedThisRow = true
+			} else {
+				switch av := v.(type) {
+				case int64:
+					autoGeneratedThisRow = av == 0
+				case uint64:
+					autoGeneratedThisRow = av == 0
+				case float64:
+					autoGeneratedThisRow = int64(av) == 0
+				case string:
+					autoGeneratedThisRow = strings.TrimSpace(av) == "" || strings.TrimSpace(av) == "0"
+				}
+			}
+		}
+
 		id, err := tbl.Insert(row)
 		if err != nil {
 			// INSERT IGNORE: silently skip duplicate key errors
 			if bool(stmt.Ignore) && strings.Contains(err.Error(), "1062") {
 				continue
 			}
+			if strings.Contains(err.Error(), "Failed to read auto-increment value from storage engine") {
+				return nil, mysqlError(1467, "HY000", "Failed to read auto-increment value from storage engine")
+			}
 			return nil, err
 		}
 		lastInsertID = id
+		if autoGeneratedThisRow && firstAutoInsertID == 0 && id > 0 {
+			firstAutoInsertID = id
+		}
 		affected++
 
 		// Fire AFTER INSERT triggers
@@ -4606,6 +4711,9 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		}
 	}
 
+	if firstAutoInsertID > 0 {
+		lastInsertID = firstAutoInsertID
+	}
 	e.lastInsertID = lastInsertID
 
 	// evaluateCheckConstraint is defined below.
@@ -7068,6 +7176,12 @@ func parseNumericPrefixMySQL(s string) (float64, bool) {
 	}
 	f, err := strconv.ParseFloat(token, 64)
 	if err != nil {
+		if errors.Is(err, strconv.ErrRange) {
+			if strings.HasPrefix(token, "-") {
+				return math.Inf(-1), true
+			}
+			return math.Inf(1), true
+		}
 		return 0, false
 	}
 	return f, true
@@ -8496,6 +8610,14 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			switch n := val.(type) {
 			case int64:
 				return -n, nil
+			case uint64:
+				if n == 1<<63 {
+					return int64(math.MinInt64), nil
+				}
+				if n <= math.MaxInt64 {
+					return -int64(n), nil
+				}
+				return -float64(n), nil
 			case float64:
 				return -n, nil
 			case string:
@@ -10193,7 +10315,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		if err != nil {
 			return nil, err
 		}
-		count := int(toInt64(n))
+		count := int(math.Round(toFloat(n)))
 		if count <= 0 || s == nil {
 			return "", nil
 		}
@@ -11281,6 +11403,14 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			switch n := val.(type) {
 			case int64:
 				return -n, nil
+			case uint64:
+				if n == 1<<63 {
+					return int64(math.MinInt64), nil
+				}
+				if n <= math.MaxInt64 {
+					return -int64(n), nil
+				}
+				return -float64(n), nil
 			case float64:
 				return -n, nil
 			case string:
@@ -11429,7 +11559,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if len(args) < 2 || args[0] == nil {
 			return nil, nil
 		}
-		count := int(toInt64(args[1]))
+		count := int(math.Round(toFloat(args[1])))
 		if count <= 0 {
 			return "", nil
 		}
@@ -13376,8 +13506,66 @@ func toFloat(v interface{}) float64 {
 	case float64:
 		return n
 	case string:
-		f, _ := strconv.ParseFloat(n, 64)
-		return f
+		s := strings.TrimSpace(n)
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f
+		} else if errors.Is(err, strconv.ErrRange) {
+			if strings.HasPrefix(s, "-") {
+				return math.Inf(-1)
+			}
+			return math.Inf(1)
+		}
+		// MySQL numeric context for TIME string: HH:MM:SS[.frac] -> HHMMSS[.frac]
+		if strings.Count(s, ":") == 2 {
+			sign := 1.0
+			if strings.HasPrefix(s, "-") {
+				sign = -1.0
+				s = strings.TrimPrefix(s, "-")
+			}
+			main := s
+			fracPart := ""
+			if dot := strings.IndexByte(s, '.'); dot >= 0 {
+				main = s[:dot]
+				fracPart = s[dot+1:]
+			}
+			tparts := strings.Split(main, ":")
+			if len(tparts) == 3 {
+				h, eh := strconv.Atoi(tparts[0])
+				m, em := strconv.Atoi(tparts[1])
+				sec, es := strconv.Atoi(tparts[2])
+				if eh == nil && em == nil && es == nil {
+					base := float64(h*10000 + m*100 + sec)
+					if fracPart != "" {
+						if fracDigits, err := strconv.ParseFloat("0."+fracPart, 64); err == nil {
+							base += fracDigits
+						}
+					}
+					return sign * base
+				}
+			}
+		}
+		// MySQL numeric context for DATE/DATETIME strings.
+		if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
+			y, ey := strconv.Atoi(s[0:4])
+			mo, em := strconv.Atoi(s[5:7])
+			d, ed := strconv.Atoi(s[8:10])
+			if ey == nil && em == nil && ed == nil {
+				base := float64(y*10000 + mo*100 + d)
+				if len(s) >= 19 && s[10] == ' ' && s[13] == ':' && s[16] == ':' {
+					h, eh := strconv.Atoi(s[11:13])
+					mi, emi := strconv.Atoi(s[14:16])
+					se, es := strconv.Atoi(s[17:19])
+					if eh == nil && emi == nil && es == nil {
+						base = float64((y*10000+mo*100+d)*1000000 + h*10000 + mi*100 + se)
+					}
+				}
+				return base
+			}
+		}
+		if f, ok := parseNumericPrefixMySQL(s); ok {
+			return f
+		}
+		return 0
 	case bool:
 		if n {
 			return 1

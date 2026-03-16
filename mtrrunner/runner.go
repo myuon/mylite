@@ -1404,14 +1404,6 @@ func (ctx *execContext) setVariable(expr string) error {
 	// Apply variable substitution to the value
 	value = ctx.substituteVars(value)
 
-	// Try to evaluate arithmetic expressions (e.g., $i/2 -> "1/2" -> 0)
-	if len(value) > 0 && !strings.HasPrefix(value, "query_get_value") {
-		if evalResult, ok := evalMTRArithmetic(value); ok {
-			ctx.variables[name] = evalResult
-			return nil
-		}
-	}
-
 	// Handle query_get_value(SQL, colName, rowNum)
 	if strings.HasPrefix(strings.ToLower(value), "query_get_value(") && strings.HasSuffix(value, ")") {
 		inner := value[len("query_get_value(") : len(value)-1]
