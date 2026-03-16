@@ -2017,6 +2017,7 @@ func normalizeOutput(s string) string {
 func normalizeFunctionNameCase(s string) string {
 	// Sorted by length descending to avoid partial matches (e.g., TRIM inside LTRIM)
 	funcNames := []string{
+		"COUNT", "MIN", "MAX", "SUM", "AVG",
 		"CHARACTER_LENGTH", "OCTET_LENGTH", "CHAR_LENGTH",
 		"CONCAT_WS", "SUBSTRING", "COALESCE",
 		"CONVERT", "CHARSET", "REVERSE", "REPLACE",
