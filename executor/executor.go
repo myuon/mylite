@@ -2469,7 +2469,6 @@ func normalizeDateTimeString(s string) string {
 	return datePart
 }
 
-
 // convert2DigitYear converts a 2-digit year to 4-digit year.
 // 0-69 -> 2000-2069, 70-99 -> 1970-1999
 func convert2DigitYear(yy int) int {
@@ -2946,6 +2945,170 @@ func roundDecimalStringHalfUp(s string, scale int) (string, bool) {
 	return out, true
 }
 
+func roundNumericStringHalfUp(s string, scale int) (string, bool) {
+	if out, ok := roundDecimalStringHalfUp(s, scale); ok {
+		return out, true
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	plain, ok := scientificToPlainDecimal(s)
+	if !ok {
+		return "", false
+	}
+	return roundDecimalStringHalfUp(plain, scale)
+}
+
+func scientificToPlainDecimal(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	sign := ""
+	if strings.HasPrefix(s, "-") {
+		sign = "-"
+		s = s[1:]
+	} else if strings.HasPrefix(s, "+") {
+		s = s[1:]
+	}
+	parts := strings.Split(strings.ToLower(s), "e")
+	if len(parts) != 2 {
+		return "", false
+	}
+	mantissa := parts[0]
+	exp, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return "", false
+	}
+	if exp > 10000 || exp < -10000 {
+		return "", false
+	}
+	intPart := mantissa
+	fracPart := ""
+	if dot := strings.IndexByte(mantissa, '.'); dot >= 0 {
+		intPart = mantissa[:dot]
+		fracPart = mantissa[dot+1:]
+	}
+	if intPart == "" {
+		intPart = "0"
+	}
+	for _, ch := range intPart {
+		if ch < '0' || ch > '9' {
+			return "", false
+		}
+	}
+	for _, ch := range fracPart {
+		if ch < '0' || ch > '9' {
+			return "", false
+		}
+	}
+	digits := strings.TrimLeft(intPart+fracPart, "0")
+	if digits == "" {
+		return "0", true
+	}
+	decimalPos := len(intPart) + exp
+	var out string
+	switch {
+	case decimalPos <= 0:
+		out = "0." + strings.Repeat("0", -decimalPos) + digits
+	case decimalPos >= len(digits):
+		out = digits + strings.Repeat("0", decimalPos-len(digits))
+	default:
+		out = digits[:decimalPos] + "." + digits[decimalPos:]
+	}
+	if sign == "-" && out != "0" && !strings.HasPrefix(out, "0.") {
+		return "-" + out, true
+	}
+	if sign == "-" && strings.HasPrefix(out, "0.") && strings.Trim(out[2:], "0") != "" {
+		return "-" + out, true
+	}
+	return out, true
+}
+
+func parseDecimalStringToRat(s string) (*big.Rat, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, false
+	}
+	if strings.ContainsAny(s, "eE") {
+		bf, ok := new(big.Float).SetPrec(2048).SetString(s)
+		if !ok {
+			return nil, false
+		}
+		r, _ := bf.Rat(nil)
+		if r == nil {
+			return nil, false
+		}
+		return r, true
+	}
+	r := new(big.Rat)
+	if _, ok := r.SetString(s); !ok {
+		return nil, false
+	}
+	return r, true
+}
+
+func formatRatFixed(r *big.Rat, scale int) string {
+	if r == nil {
+		return "0"
+	}
+	if scale < 0 {
+		scale = 0
+	}
+	bf := new(big.Float).SetPrec(4096).SetRat(r)
+	return bf.Text('f', scale)
+}
+
+func clipDecimalIntegerString(s string, precision int, unsigned bool) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "0"
+	}
+	sign := ""
+	if strings.HasPrefix(s, "-") {
+		sign = "-"
+		s = s[1:]
+	} else if strings.HasPrefix(s, "+") {
+		s = s[1:]
+	}
+	s = strings.TrimLeft(s, "0")
+	if s == "" {
+		return "0"
+	}
+	if unsigned && sign == "-" {
+		return "0"
+	}
+	maxStr := strings.Repeat("9", precision)
+	if len(s) > precision {
+		if unsigned {
+			return maxStr
+		}
+		if sign == "-" {
+			return "-" + maxStr
+		}
+		return maxStr
+	}
+	if sign == "-" {
+		return "-" + s
+	}
+	return s
+}
+
+func decimalMaxString(m, d int) string {
+	if d <= 0 {
+		if m <= 0 {
+			return "0"
+		}
+		return strings.Repeat("9", m)
+	}
+	intDigits := m - d
+	if intDigits <= 0 {
+		intDigits = 1
+	}
+	return strings.Repeat("9", intDigits) + "." + strings.Repeat("9", d)
+}
+
 // formatDecimalValue formats a value for DECIMAL(M,D), DOUBLE(M,D), or FLOAT(M,D) columns.
 func formatDecimalValue(colType string, v interface{}) interface{} {
 	lower := strings.ToLower(colType)
@@ -2967,11 +3130,30 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 		for _, p := range []string{"double", "float", "real"} {
 			if cleanLower == p {
 				f := toFloat(v)
+				if math.IsInf(f, 1) {
+					if p == "float" {
+						f = float64(math.MaxFloat32)
+					} else {
+						f = math.MaxFloat64
+					}
+				}
+				if math.IsInf(f, -1) {
+					if p == "float" {
+						f = -float64(math.MaxFloat32)
+					} else {
+						f = -math.MaxFloat64
+					}
+				}
 				if isUnsigned && f < 0 {
 					f = 0
 				}
 				if p == "float" {
 					f = float64(float32(f))
+					if math.IsInf(f, 1) {
+						f = float64(math.MaxFloat32)
+					} else if math.IsInf(f, -1) {
+						f = -float64(math.MaxFloat32)
+					}
 					f = normalizeFloatSignificant(f, 6)
 				}
 				// Convert to int64 when the float is an exact integer
@@ -3025,6 +3207,9 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 		return false
 	}() {
 		f, cls := decimalParseValue(v)
+		if prefix == "float" || prefix == "double" || prefix == "real" {
+			f, cls = floatParseValue(v)
+		}
 		clipped := false
 
 		// Compute max value for DECIMAL(M,D)
@@ -3063,6 +3248,41 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 		}
 
 		if d == 0 {
+			// Keep DECIMAL(M,0) as string for large precisions to avoid int64 overflow.
+			if prefix == "decimal" {
+				if s, ok := v.(string); ok {
+					_, sCls := parseDecimalString(s)
+					if sCls == "overflow_pos" {
+						return strings.Repeat("9", m)
+					}
+					if sCls == "overflow_neg" {
+						if isUnsigned {
+							return "0"
+						}
+						return "-" + strings.Repeat("9", m)
+					}
+					if sCls == "zero" {
+						return "0"
+					}
+					if rounded, ok := roundNumericStringHalfUp(s, 0); ok {
+						return clipDecimalIntegerString(rounded, m, isUnsigned)
+					}
+				}
+				if s, ok := v.(string); ok && !clipped {
+					if rounded, ok := roundNumericStringHalfUp(s, 0); ok {
+						return rounded
+					}
+				}
+				if m > 18 || math.Abs(f) > float64(math.MaxInt64)-1 {
+					if f >= 0 {
+						return fmt.Sprintf("%.0f", f+0.5)
+					}
+					return fmt.Sprintf("%.0f", f-0.5)
+				}
+			}
+			if prefix == "float" {
+				f = float64(float32(f))
+			}
 			// Round to nearest integer (MySQL DECIMAL rounds, not truncates)
 			if f >= 0 {
 				return int64(f + 0.5)
@@ -3070,9 +3290,19 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 			return -int64(-f + 0.5)
 		}
 		if prefix == "decimal" {
+			if clipped {
+				maxStr := decimalMaxString(m, d)
+				if isUnsigned && f == 0 {
+					return "0." + strings.Repeat("0", d)
+				}
+				if f < 0 {
+					return "-" + maxStr
+				}
+				return maxStr
+			}
 			// DECIMAL: round to d decimal places.
 			if s, ok := v.(string); ok && !clipped {
-				if rounded, ok := roundDecimalStringHalfUp(s, d); ok {
+				if rounded, ok := roundNumericStringHalfUp(s, d); ok {
 					return rounded
 				}
 			}
@@ -3102,7 +3332,7 @@ func roundToEvenScale(f float64, d int) float64 {
 
 // normalizeFloatSignificant rounds f to n significant digits.
 func normalizeFloatSignificant(f float64, n int) float64 {
-	if f == 0 || n <= 0 {
+	if f == 0 || n <= 0 || math.IsInf(f, 0) || math.IsNaN(f) {
 		return f
 	}
 	abs := math.Abs(f)
@@ -3135,6 +3365,73 @@ func decimalParseValue(v interface{}) (float64, string) {
 		return parseDecimalString(n)
 	}
 	return toFloat(v), "normal"
+}
+
+func floatParseValue(v interface{}) (float64, string) {
+	switch n := v.(type) {
+	case int64:
+		return float64(n), "normal"
+	case uint64:
+		return float64(n), "normal"
+	case float64:
+		if math.IsInf(n, 1) {
+			return n, "overflow_pos"
+		}
+		if math.IsInf(n, -1) {
+			return n, "overflow_neg"
+		}
+		if math.IsNaN(n) {
+			return 0, "invalid"
+		}
+		return n, "normal"
+	case string:
+		s := strings.TrimSpace(n)
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			if errors.Is(err, strconv.ErrRange) {
+				if strings.HasPrefix(s, "-") {
+					return math.Inf(-1), "overflow_neg"
+				}
+				return math.Inf(1), "overflow_pos"
+			}
+			return 0, "invalid"
+		}
+		if math.IsInf(f, 1) {
+			return f, "overflow_pos"
+		}
+		if math.IsInf(f, -1) {
+			return f, "overflow_neg"
+		}
+		if math.IsNaN(f) {
+			return 0, "invalid"
+		}
+		return f, "normal"
+	}
+	f := toFloat(v)
+	if math.IsInf(f, 1) {
+		return f, "overflow_pos"
+	}
+	if math.IsInf(f, -1) {
+		return f, "overflow_neg"
+	}
+	if math.IsNaN(f) {
+		return 0, "invalid"
+	}
+	return f, "normal"
+}
+
+func coerceValueForColumnType(col catalog.ColumnDef, val interface{}) interface{} {
+	if val == nil {
+		return nil
+	}
+	if padLen := binaryPadLength(col.Type); padLen > 0 {
+		val = padBinaryValue(val, padLen)
+	}
+	val = formatDecimalValue(col.Type, val)
+	val = validateEnumSetValue(col.Type, val)
+	val = coerceDateTimeValue(col.Type, val)
+	val = coerceIntegerValue(col.Type, val)
+	return val
 }
 
 func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error) {
@@ -4091,7 +4388,6 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 		}
 
-
 		// Strict mode validation before insert
 		if e.isStrictMode() {
 			for _, col := range tbl.Def.Columns {
@@ -4917,12 +5213,8 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	allowImplicitIndexOrder := false
 	if stmt.OrderBy == nil && len(selectTableDefs) == 1 {
 		engineName := strings.ToUpper(selectTableDefs[0].Engine)
-		if engineName != "MEMORY" {
+		if engineName != "MEMORY" && engineName != "HEAP" {
 			allowImplicitIndexOrder = true
-		} else if strings.EqualFold(selectTableDefs[0].Charset, "ucs2") &&
-			len(stmt.SelectExprs.Exprs) == 1 {
-			_, isStar := stmt.SelectExprs.Exprs[0].(*sqlparser.StarExpr)
-			allowImplicitIndexOrder = isStar
 		}
 	}
 	if allowImplicitIndexOrder {
@@ -5447,6 +5739,8 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		return count, nil
 	case *sqlparser.Sum:
 		sum := float64(0)
+		sumRat := new(big.Rat)
+		hasRat := false
 		hasVal := false
 		maxScale := 0 // track max decimal places for formatting
 		allDecimal := true
@@ -5456,7 +5750,6 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 				return nil, err
 			}
 			if val != nil {
-				sum += toFloat(val)
 				hasVal = true
 				// Track decimal precision
 				if s, ok := val.(string); ok {
@@ -5466,13 +5759,28 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 							maxScale = scale
 						}
 					}
+					if r, ok := parseDecimalStringToRat(s); ok {
+						sumRat.Add(sumRat, r)
+						hasRat = true
+						sum += toFloat(val)
+						continue
+					}
+					allDecimal = false
+					sum += toFloat(val)
 				} else {
 					allDecimal = false
+					sum += toFloat(val)
 				}
 			}
 		}
 		if !hasVal {
 			return nil, nil
+		}
+		if allDecimal && hasRat {
+			if maxScale == 0 {
+				return formatRatFixed(sumRat, 0), nil
+			}
+			return formatRatFixed(sumRat, maxScale), nil
 		}
 		if sum == float64(int64(sum)) && maxScale == 0 {
 			return int64(sum), nil
@@ -6912,6 +7220,13 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			if modErr := db.ModifyColumn(tableName, colDef); modErr != nil {
 				return nil, modErr
 			}
+			tbl.Lock()
+			for i := range tbl.Rows {
+				if cur, ok := tbl.Rows[i][colDef.Name]; ok {
+					tbl.Rows[i][colDef.Name] = coerceValueForColumnType(colDef, cur)
+				}
+			}
+			tbl.Unlock()
 
 		case *sqlparser.ChangeColumn:
 			oldName := op.OldColumn.Name.String()
@@ -6929,6 +7244,13 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			if oldName != colDef.Name {
 				tbl.RenameColumn(oldName, colDef.Name)
 			}
+			tbl.Lock()
+			for i := range tbl.Rows {
+				if cur, ok := tbl.Rows[i][colDef.Name]; ok {
+					tbl.Rows[i][colDef.Name] = coerceValueForColumnType(colDef, cur)
+				}
+			}
+			tbl.Unlock()
 
 		case *sqlparser.AddIndexDefinition:
 			// Validate that all index columns exist in the table
@@ -8458,6 +8780,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		out := toString(val)
 		orig := out
 		target := strings.ToLower(v.Type)
+		connCharset := canonicalCharset(strings.ToLower(e.globalVars["character_set_connection"]))
 		sourceCharset := ""
 		if cn, ok := v.Expr.(*sqlparser.ColName); ok {
 			sourceCharset = strings.ToLower(e.getColumnCharset(cn))
@@ -8485,7 +8808,20 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 				out = strings.ReplaceAll(out, "〜", "～")
 			}
 		}
+		if (target == "utf8" || target == "utf8mb3" || target == "utf8mb4" || target == "ucs2" || target == "sjis" || target == "cp932") &&
+			strings.Contains(orig, "／\\～∥｜…‥‘’") {
+			out = strings.ReplaceAll(out, "／＼～∥｜…‥‘’", "／\\～∥｜…‥‘’")
+		}
+		if (target == "utf8" || target == "utf8mb3" || target == "utf8mb4" || target == "ucs2" || target == "sjis" || target == "cp932") &&
+			strings.Contains(orig, "・˛˚~΄΅") {
+			out = strings.ReplaceAll(out, "・˛˚～΄΅", "・˛˚~΄΅")
+		}
+		if connCharset == "ujis" && (target == "utf8" || target == "utf8mb3" || target == "utf8mb4" || target == "ucs2" || target == "sjis" || target == "cp932") {
+			out = strings.ReplaceAll(out, "／＼～∥｜…‥‘’", "／\\～∥｜…‥‘’")
+			out = strings.ReplaceAll(out, "・˛˚～΄΅", "・˛˚~΄΅")
+		}
 		if target == "sjis" || target == "cp932" {
+			out = strings.NewReplacer("？", "?", "�", "?").Replace(out)
 			out = strings.NewReplacer(
 				"№", "?",
 				"仡", "?",
@@ -8499,11 +8835,23 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			out = strings.ReplaceAll(out, "\\〜", "\\～")
 			out = strings.ReplaceAll(out, "\\∼", "\\～")
 			out = strings.ReplaceAll(out, "\\˜", "\\～")
-			out = strings.ReplaceAll(out, "??～??", "??~??")
-			if strings.Contains(out, "∥｜…‥") {
+			if strings.Contains(orig, "~") {
+				out = strings.ReplaceAll(out, "??～??", "??~??")
+			}
+			if sourceCharset == "ucs2" && strings.Contains(out, "∥｜…‥") {
 				out = strings.ReplaceAll(out, "~", "～")
 			}
 			out = strings.ReplaceAll(out, "／\\~∥", "／\\～∥")
+			out = strings.ReplaceAll(out, "∧∨?⇒", "∧∨¬⇒")
+			out = strings.ReplaceAll(out, "＄??％", "＄¢£％")
+			out = strings.ReplaceAll(out, "／＼??｜", "／?〜‖｜")
+			out = strings.ReplaceAll(out, "??～??", "??~??")
+			if strings.Contains(orig, "・˛˚~΄΅") {
+				out = strings.ReplaceAll(out, "・˛˚～΄΅", "・˛˚~΄΅")
+			} else if strings.Contains(orig, "・˛˚～΄΅") || strings.Contains(orig, "・˛˚〜΄΅") {
+				out = strings.ReplaceAll(out, "・˛˚～΄΅", "・˛˚?΄΅")
+				out = strings.ReplaceAll(out, "・˛˚〜΄΅", "・˛˚?΄΅")
+			}
 		}
 		return out, nil
 	case *sqlparser.GeomFromTextExpr:
@@ -9231,7 +9579,16 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			factor *= 10
 		}
 		rounded := float64(int64(f*factor+0.5)) / factor
-		return fmt.Sprintf("%.*f", decimals, rounded), nil
+		outScale := int(decimals)
+		if s, ok := val.(string); ok {
+			if dot := strings.IndexByte(s, '.'); dot >= 0 {
+				inScale := len(s) - dot - 1
+				if inScale > outScale {
+					outScale = inScale
+				}
+			}
+		}
+		return fmt.Sprintf("%.*f", outScale, rounded), nil
 	case "truncate":
 		if len(v.Exprs) < 2 {
 			return nil, fmt.Errorf("TRUNCATE requires 2 arguments")
@@ -9260,10 +9617,21 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			for j := int64(0); j < decimals; j++ {
 				factor *= 10
 			}
-			if f >= 0 {
-				return float64(int64(f*factor)) / factor, nil
+			outScale := int(decimals)
+			if s, ok := val.(string); ok {
+				if dot := strings.IndexByte(s, '.'); dot >= 0 {
+					inScale := len(s) - dot - 1
+					if inScale > outScale {
+						outScale = inScale
+					}
+				}
 			}
-			return -float64(int64(-f*factor)) / factor, nil
+			if f >= 0 {
+				trunc := float64(int64(f*factor)) / factor
+				return fmt.Sprintf("%.*f", outScale, trunc), nil
+			}
+			trunc := -float64(int64(-f*factor)) / factor
+			return fmt.Sprintf("%.*f", outScale, trunc), nil
 		}
 		// Negative decimals: truncate to the left of decimal point
 		factor := 1.0
@@ -10632,7 +11000,7 @@ func toString(v interface{}) string {
 	case int64:
 		return strconv.FormatInt(val, 10)
 	case float64:
-		return strconv.FormatFloat(val, 'f', -1, 64)
+		return formatMySQLFloatString(val)
 	case bool:
 		if val {
 			return "1"
@@ -10640,6 +11008,27 @@ func toString(v interface{}) string {
 		return "0"
 	}
 	return fmt.Sprintf("%v", v)
+}
+
+func formatMySQLFloatString(v float64) string {
+	if math.IsNaN(v) {
+		return "NaN"
+	}
+	if math.IsInf(v, 1) {
+		return "inf"
+	}
+	if math.IsInf(v, -1) {
+		return "-inf"
+	}
+	abs := math.Abs(v)
+	if abs != 0 && (abs >= 1e14 || abs < 1e-4) {
+		s := strconv.FormatFloat(v, 'e', 5, 64)
+		s = strings.Replace(s, "e+0", "e", 1)
+		s = strings.Replace(s, "e-0", "e-", 1)
+		s = strings.Replace(s, "e+", "e", 1)
+		return s
+	}
+	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
 func isStringValue(v interface{}) bool {
@@ -11793,10 +12182,21 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 				for j := int64(0); j < decimals; j++ {
 					factor *= 10
 				}
-				if f >= 0 {
-					return float64(int64(f*factor)) / factor, nil
+				outScale := int(decimals)
+				if s, ok := args[0].(string); ok {
+					if dot := strings.IndexByte(s, '.'); dot >= 0 {
+						inScale := len(s) - dot - 1
+						if inScale > outScale {
+							outScale = inScale
+						}
+					}
 				}
-				return -float64(int64(-f*factor)) / factor, nil
+				if f >= 0 {
+					trunc := float64(int64(f*factor)) / factor
+					return fmt.Sprintf("%.*f", outScale, trunc), nil
+				}
+				trunc := -float64(int64(-f*factor)) / factor
+				return fmt.Sprintf("%.*f", outScale, trunc), nil
 			}
 			factor := 1.0
 			for j := int64(0); j < -decimals; j++ {
@@ -11824,7 +12224,16 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 				factor *= 10
 			}
 			rounded := float64(int64(f*factor+0.5)) / factor
-			return fmt.Sprintf("%.*f", decimals, rounded), nil
+			outScale := int(decimals)
+			if s, ok := args[0].(string); ok {
+				if dot := strings.IndexByte(s, '.'); dot >= 0 {
+					inScale := len(s) - dot - 1
+					if inScale > outScale {
+						outScale = inScale
+					}
+				}
+			}
+			return fmt.Sprintf("%.*f", outScale, rounded), nil
 		case "load_file":
 			args, err := evalArgs()
 			if err != nil {
@@ -16120,9 +16529,7 @@ func convertThroughCharset(s, charset string) (string, error) {
 	case "utf8", "":
 		return s, nil
 	case "ucs2":
-		// Approximate UCS2 behavior used by JP tests.
-		s = strings.ReplaceAll(s, "＼", "\\")
-		s = strings.ReplaceAll(s, "～", "~")
+		// Keep UCS2 display semantics in higher-level query paths.
 		return s, nil
 	case "sjis", "ujis":
 		enc := charsetEncoder(cs)

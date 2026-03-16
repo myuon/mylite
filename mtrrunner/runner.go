@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -107,27 +108,27 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	os.MkdirAll(filepath.Join(tmpDir, "tmp"), 0755) //nolint:errcheck
 
 	ectx := &execContext{
-		runner:          r,
-		db:              r.DB,
-		output:          &strings.Builder{},
-		warningsEnabled: true,
-		queryLogEnabled: true,
+		runner:           r,
+		db:               r.DB,
+		output:           &strings.Builder{},
+		warningsEnabled:  true,
+		queryLogEnabled:  true,
 		resultLogEnabled: true,
-		sortResult:      false,
-		tmpDir:          tmpDir,
+		sortResult:       false,
+		tmpDir:           tmpDir,
 		variables: map[string]string{
-			"$ENGINE":            "InnoDB",
-			"$MYSQLTEST_VARDIR":  tmpDir,
-			"$MYSQL_TMP_DIR":     filepath.Join(tmpDir, "tmp"),
-			"$MYSQL_TEST_DIR":    tmpDir,
-			"$MYSQLD_DATADIR":    filepath.Join(tmpDir, "data", "inner") + "/",
-			"$MYSQL_SOCKET":      "",
-			"$MASTER_MYPORT":     "3306",
-			"$MYSQL_VERSION_ID":  "80032",
-			"$innodb_page_size":  "16384",
+			"$ENGINE":             "InnoDB",
+			"$MYSQLTEST_VARDIR":   tmpDir,
+			"$MYSQL_TMP_DIR":      filepath.Join(tmpDir, "tmp"),
+			"$MYSQL_TEST_DIR":     tmpDir,
+			"$MYSQLD_DATADIR":     filepath.Join(tmpDir, "data", "inner") + "/",
+			"$MYSQL_SOCKET":       "",
+			"$MASTER_MYPORT":      "3306",
+			"$MYSQL_VERSION_ID":   "80032",
+			"$innodb_page_size":   "16384",
 			"$restart_parameters": "restart",
-		"$BIG_TEST":           "1",
-		"$VALGRIND_TEST":      "0",
+			"$BIG_TEST":           "1",
+			"$VALGRIND_TEST":      "0",
 		},
 	}
 
@@ -251,10 +252,10 @@ type execContext struct {
 	expectedError    string // expected error code/name for next statement
 	variables        map[string]string
 	delimiter        string
-	tmpDir           string // temporary directory for file operations
+	tmpDir           string         // temporary directory for file operations
 	replaceColumns   map[int]string // column index (1-based) -> replacement value for next query
-	replaceResult    []string // pairs of [from, to] for --replace_result
-	skipped          bool   // set to true when --skip directive is encountered
+	replaceResult    []string       // pairs of [from, to] for --replace_result
+	skipped          bool           // set to true when --skip directive is encountered
 }
 
 func (ctx *execContext) executeLines(lines []string) error {
@@ -1065,6 +1066,26 @@ func (ctx *execContext) evaluateIfConditionInner(condStr string) bool {
 }
 
 func formatResultCell(v interface{}) string {
+	formatMySQLFloat := func(f float64, bitSize int) string {
+		if math.IsNaN(f) {
+			return "NaN"
+		}
+		if math.IsInf(f, 1) {
+			return "inf"
+		}
+		if math.IsInf(f, -1) {
+			return "-inf"
+		}
+		abs := math.Abs(f)
+		if abs != 0 && (abs >= 1e14 || abs < 1e-4) {
+			s := strconv.FormatFloat(f, 'e', 5, bitSize)
+			s = strings.Replace(s, "e+0", "e", 1)
+			s = strings.Replace(s, "e-0", "e-", 1)
+			s = strings.Replace(s, "e+", "e", 1)
+			return s
+		}
+		return strconv.FormatFloat(f, 'f', -1, bitSize)
+	}
 	normalizeScientific := func(s string) string {
 		if !strings.ContainsAny(s, "eE") {
 			return s
@@ -1073,7 +1094,7 @@ func formatResultCell(v interface{}) string {
 		if err != nil {
 			return s
 		}
-		return strconv.FormatFloat(f, 'f', -1, 64)
+		return formatMySQLFloat(f, 64)
 	}
 	switch val := v.(type) {
 	case nil:
@@ -1081,9 +1102,9 @@ func formatResultCell(v interface{}) string {
 	case []byte:
 		return normalizeScientific(string(val))
 	case float64:
-		return strconv.FormatFloat(val, 'f', -1, 64)
+		return formatMySQLFloat(val, 64)
 	case float32:
-		return strconv.FormatFloat(float64(val), 'f', -1, 32)
+		return formatMySQLFloat(float64(val), 32)
 	case string:
 		return normalizeScientific(val)
 	default:
@@ -1669,7 +1690,7 @@ var directiveKeywords = map[string]bool{
 	"result_format": true, "change_user": true,
 	"disable_metadata": true, "enable_metadata": true,
 	"disable_info": true, "enable_info": true,
-	"shutdown_server": true,
+	"shutdown_server":   true,
 	"disable_reconnect": true, "enable_reconnect": true,
 	"query_vertical": true,
 }
