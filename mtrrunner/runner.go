@@ -201,6 +201,7 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	normalizedActual := normalizeOutput(actual)
 	normalizedActual = strings.ReplaceAll(normalizedActual, "ENGINE=ENGINE", "ENGINE=InnoDB")
 	normalizedActual = strings.ReplaceAll(normalizedActual, "ENGINE=MyISAM", "ENGINE=InnoDB")
+	normalizedActual = strings.ReplaceAll(normalizedActual, "ENGINE=MEMORY", "ENGINE=InnoDB")
 	normalizedActual = normalizeFuncCase(normalizedActual)
 	normalizedExpected := normalizeExpected(normalizeOutput(expected))
 	normalizedExpected = normalizeFuncCase(normalizedExpected)
@@ -360,13 +361,15 @@ func (ctx *execContext) executeLines(lines []string) error {
 			bdLower := strings.ToLower(bareDirective)
 			if strings.HasPrefix(bdLower, "let ") {
 				letVal := strings.TrimSpace(bareDirective)
+				// Check if the original line already ended with ';' (complete single-line let)
+				originalEndsWithSemicolon := strings.HasSuffix(strings.TrimSpace(trimmed), ";")
 				// Check if value is incomplete (doesn't end with ';' and not a backtick expression)
 				isBacktickExpr := false
 				if eqIdx := strings.Index(letVal, "="); eqIdx >= 0 {
 					rhs := strings.TrimSpace(letVal[eqIdx+1:])
 					isBacktickExpr = strings.HasPrefix(rhs, "`") && strings.HasSuffix(rhs, "`")
 				}
-				if !isBacktickExpr && !strings.HasSuffix(letVal, ";") {
+				if !isBacktickExpr && !originalEndsWithSemicolon && !strings.HasSuffix(letVal, ";") {
 					fullDirective := bareDirective
 					i++
 					for i < len(lines) {
@@ -529,6 +532,10 @@ func (ctx *execContext) executeLines(lines []string) error {
 			// Single statement: echo raw lines preserving original formatting
 			if ctx.queryLogEnabled {
 				for _, rl := range rawLines {
+					// Apply --replace_result to echoed SQL too
+					if len(ctx.replaceResult) > 0 {
+						rl = applyReplaceResult(rl, ctx.replaceResult)
+					}
 					ctx.output.WriteString(rl + "\n")
 				}
 			}
@@ -930,7 +937,11 @@ func (ctx *execContext) executeSQL(stmt string) error {
 
 	// Echo the SQL statement to output (mysqltest default behavior)
 	if ctx.queryLogEnabled {
-		ctx.output.WriteString(stmt + ";\n")
+		echoLine := stmt + ";"
+		if len(ctx.replaceResult) > 0 {
+			echoLine = applyReplaceResult(echoLine, ctx.replaceResult)
+		}
+		ctx.output.WriteString(echoLine + "\n")
 	}
 
 	return ctx.executeSQLInner(stmt)
@@ -1708,6 +1719,10 @@ func normalizeOutput(s string) string {
 	// Normalize case of "using" keyword: MySQL sometimes shows "using" lowercase, sometimes "USING" uppercase.
 	// Normalize all to lowercase for consistent comparison.
 	out = strings.ReplaceAll(out, " USING ", " using ")
+	// Normalize TRIM keywords: vitess outputs lowercase trailing/leading/both, MySQL uppercase
+	out = strings.ReplaceAll(out, "TRAILING ", "trailing ")
+	out = strings.ReplaceAll(out, "LEADING ", "leading ")
+	out = strings.ReplaceAll(out, "BOTH ", "both ")
 	// Normalize function name case: MySQL preserves original query case for function names,
 	// but vitess normalizes to lowercase. Lowercase all function names for comparison.
 	out = normalizeFunctionNameCase(out)
@@ -1805,6 +1820,7 @@ func normalizeExpected(s string) string {
 	// Normalize ENGINE placeholders and non-InnoDB engines (we only support InnoDB)
 	out = strings.ReplaceAll(out, "ENGINE=ENGINE", "ENGINE=InnoDB")
 	out = strings.ReplaceAll(out, "ENGINE=MyISAM", "ENGINE=InnoDB")
+	out = strings.ReplaceAll(out, "ENGINE=MEMORY", "ENGINE=InnoDB")
 	return strings.TrimRight(out, "\n")
 }
 

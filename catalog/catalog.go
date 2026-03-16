@@ -424,6 +424,19 @@ func (db *Database) ModifyColumn(tableName string, col ColumnDef) error {
 	}
 	for i, c := range tbl.Columns {
 		if c.Name == col.Name {
+			// Preserve PrimaryKey/Unique/Nullable flags from constraints
+			// if the column is part of the primary key
+			for _, pk := range tbl.PrimaryKey {
+				if strings.EqualFold(pk, col.Name) {
+					col.PrimaryKey = true
+					col.Nullable = false
+					break
+				}
+			}
+			// Preserve Unique flag from indexes
+			if !col.Unique && c.Unique {
+				col.Unique = true
+			}
 			tbl.Columns[i] = col
 			return nil
 		}
@@ -439,13 +452,52 @@ func (db *Database) ChangeColumn(tableName, oldName string, col ColumnDef) error
 	if !ok {
 		return fmt.Errorf("table '%s.%s' doesn't exist", db.Name, tableName)
 	}
+	found := false
 	for i, c := range tbl.Columns {
 		if c.Name == oldName {
+			// Preserve PrimaryKey/Unique/Nullable flags from constraints
+			for _, pk := range tbl.PrimaryKey {
+				if strings.EqualFold(pk, oldName) {
+					col.PrimaryKey = true
+					col.Nullable = false
+					break
+				}
+			}
+			if !col.Unique && c.Unique {
+				col.Unique = true
+			}
 			tbl.Columns[i] = col
-			return nil
+			found = true
+			break
 		}
 	}
-	return fmt.Errorf("column '%s' doesn't exist in table '%s'", oldName, tableName)
+	if !found {
+		return fmt.Errorf("column '%s' doesn't exist in table '%s'", oldName, tableName)
+	}
+	// Update index references if column name changed
+	if oldName != col.Name {
+		for i, idx := range tbl.Indexes {
+			for j, c := range idx.Columns {
+				// Strip length suffix for comparison
+				colName := c
+				suffix := ""
+				if parenIdx := strings.Index(c, "("); parenIdx >= 0 {
+					colName = c[:parenIdx]
+					suffix = c[parenIdx:]
+				}
+				if strings.EqualFold(colName, oldName) {
+					tbl.Indexes[i].Columns[j] = col.Name + suffix
+				}
+			}
+		}
+		// Update primary key references
+		for i, pk := range tbl.PrimaryKey {
+			if strings.EqualFold(pk, oldName) {
+				tbl.PrimaryKey[i] = col.Name
+			}
+		}
+	}
+	return nil
 }
 
 // AddIndex adds an index definition to the table.
@@ -457,6 +509,20 @@ func (db *Database) AddIndex(tableName string, idx IndexDef) {
 		return
 	}
 	tbl.Indexes = append(tbl.Indexes, idx)
+	// If this is a UNIQUE index, mark the column as unique
+	if idx.Unique && len(idx.Columns) == 1 {
+		colName := idx.Columns[0]
+		// Strip length suffix
+		if parenIdx := strings.Index(colName, "("); parenIdx >= 0 {
+			colName = colName[:parenIdx]
+		}
+		for i, col := range tbl.Columns {
+			if strings.EqualFold(col.Name, colName) {
+				tbl.Columns[i].Unique = true
+				break
+			}
+		}
+	}
 }
 
 // SetPrimaryKey sets the primary key columns for the table.

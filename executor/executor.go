@@ -212,10 +212,13 @@ func allCharsets() [][]interface{} {
 }
 
 func matchLike(s, pattern string) bool {
-	return matchLikeHelper(s, pattern, 0, 0)
+	// Convert to runes for proper multibyte character handling
+	sr := []rune(strings.ToLower(s))
+	pr := []rune(strings.ToLower(pattern))
+	return matchLikeHelper(sr, pr, 0, 0)
 }
 
-func matchLikeHelper(s, p string, si, pi int) bool {
+func matchLikeHelper(s, p []rune, si, pi int) bool {
 	for pi < len(p) {
 		if p[pi] == '%' {
 			pi++
@@ -233,7 +236,7 @@ func matchLikeHelper(s, p string, si, pi int) bool {
 			si++
 			pi++
 		} else {
-			if si >= len(s) || strings.ToLower(string(s[si])) != strings.ToLower(string(p[pi])) {
+			if si >= len(s) || s[si] != p[pi] {
 				return false
 			}
 			si++
@@ -250,6 +253,8 @@ func normalizeSQLDisplayName(s string) string {
 	// MySQL preserves spaces around comparison operators for top-level expressions
 	// but compacts them inside function calls and subqueries.
 	s = compactOperatorsInSubexpressions(s)
+	// MySQL displays function arguments without space after comma: LEFT(`c1`,0) not LEFT(`c1`, 0)
+	s = normalizeFuncArgSpaces(s)
 	// MySQL displays SUBSTRING, not SUBSTR in column headers
 	if strings.HasPrefix(s, "SUBSTR(") && !strings.HasPrefix(s, "SUBSTRING(") {
 		s = "SUBSTRING" + s[6:]
@@ -3080,6 +3085,24 @@ func (e *Executor) collectTableDefs(expr sqlparser.TableExpr) []*catalog.TableDe
 	return nil
 }
 
+// extractJoinUsingCols extracts column names from JOIN ... USING(...) clauses.
+func extractJoinUsingCols(expr sqlparser.TableExpr) []string {
+	switch te := expr.(type) {
+	case *sqlparser.JoinTableExpr:
+		var cols []string
+		if te.Condition != nil && len(te.Condition.Using) > 0 {
+			for _, col := range te.Condition.Using {
+				cols = append(cols, col.String())
+			}
+		}
+		// Also check nested JOINs
+		cols = append(cols, extractJoinUsingCols(te.LeftExpr)...)
+		cols = append(cols, extractJoinUsingCols(te.RightExpr)...)
+		return cols
+	}
+	return nil
+}
+
 func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error) {
 	switch te := expr.(type) {
 	case *sqlparser.AliasedTableExpr:
@@ -3438,7 +3461,20 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 			for k, v := range leftRow {
 				combined[k] = v
 			}
+			// Build set of USING columns to avoid overwriting the unqualified name with NULL
+			usingSet := make(map[string]bool)
+			for _, uc := range usingCols {
+				usingSet[strings.ToLower(uc)] = true
+			}
 			for _, col := range rightColNames {
+				if usingSet[strings.ToLower(col)] {
+					// For USING columns, keep the unqualified name (COALESCE behavior)
+					// but NULL the qualified name (right_alias.col should be NULL)
+					if rightAlias != "" {
+						combined[rightAlias+"."+col] = nil
+					}
+					continue
+				}
 				combined[col] = nil
 				if rightAlias != "" {
 					combined[rightAlias+"."+col] = nil
@@ -3620,7 +3656,13 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		}
 	}
 
-	colNames, colExprs, err := e.resolveSelectExprs(stmt.SelectExprs.Exprs, allRows, selectTableDefs...)
+	// Extract USING columns from JOIN for proper star expansion
+	// In MySQL, JOIN ... USING(col) merges the col and shows it only once in SELECT *
+	var joinUsingCols []string
+	if len(stmt.From) > 0 {
+		joinUsingCols = extractJoinUsingCols(stmt.From[0])
+	}
+	colNames, colExprs, err := e.resolveSelectExprs(stmt.SelectExprs.Exprs, allRows, joinUsingCols, selectTableDefs...)
 	if err != nil {
 		return nil, err
 	}
@@ -4255,28 +4297,60 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 
 // resolveSelectExprs returns column names and original expressions for non-aggregate SELECTs.
 // It handles star expansion using actual row data (needed for JOINs).
+// joinUsingCols contains columns from JOIN ... USING(...) that should appear only once.
 // tableDefs is optional; when provided, * expansion uses schema-defined column order.
-func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []storage.Row, tableDefs ...*catalog.TableDef) ([]string, []sqlparser.Expr, error) {
+func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []storage.Row, joinUsingCols []string, tableDefs ...*catalog.TableDef) ([]string, []sqlparser.Expr, error) {
 	cols := make([]string, 0)
 	colExprs := make([]sqlparser.Expr, 0)
+
+	// Build a set of USING column names for quick lookup
+	usingColSet := make(map[string]bool)
+	for _, c := range joinUsingCols {
+		usingColSet[strings.ToLower(c)] = true
+	}
 
 	for _, expr := range exprs {
 		switch se := expr.(type) {
 		case *sqlparser.StarExpr:
 			// Expand star using table definition column order if available
 			if len(tableDefs) > 0 {
-				for _, td := range tableDefs {
-					for _, col := range td.Columns {
-						cols = append(cols, col.Name)
-						// For JOINs (multiple table defs), use qualified column names
-						// to disambiguate columns with the same name across tables.
-						if len(tableDefs) > 1 {
+				// For JOIN ... USING, USING columns appear first (from left table only),
+				// then remaining columns from left table, then remaining from right tables.
+				if len(tableDefs) > 1 && len(joinUsingCols) > 0 {
+					// First: add USING columns (unqualified, resolves to COALESCE of both tables)
+					for _, uc := range joinUsingCols {
+						cols = append(cols, uc)
+						colExprs = append(colExprs, &sqlparser.ColName{
+							Name: sqlparser.NewIdentifierCI(uc),
+						})
+					}
+					// Then: add remaining columns from each table, skipping USING cols
+					for _, td := range tableDefs {
+						for _, col := range td.Columns {
+							if usingColSet[strings.ToLower(col.Name)] {
+								continue
+							}
+							cols = append(cols, col.Name)
 							colExprs = append(colExprs, &sqlparser.ColName{
 								Name:      sqlparser.NewIdentifierCI(col.Name),
 								Qualifier: sqlparser.TableName{Name: sqlparser.NewIdentifierCS(td.Name)},
 							})
-						} else {
-							colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(col.Name)})
+						}
+					}
+				} else {
+					for _, td := range tableDefs {
+						for _, col := range td.Columns {
+							cols = append(cols, col.Name)
+							// For JOINs (multiple table defs), use qualified column names
+							// to disambiguate columns with the same name across tables.
+							if len(tableDefs) > 1 {
+								colExprs = append(colExprs, &sqlparser.ColName{
+									Name:      sqlparser.NewIdentifierCI(col.Name),
+									Qualifier: sqlparser.TableName{Name: sqlparser.NewIdentifierCS(td.Name)},
+								})
+							} else {
+								colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(col.Name)})
+							}
 						}
 					}
 				}
@@ -5298,14 +5372,34 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 			key = "PRI"
 		} else if col.Unique {
 			key = "UNI"
+		} else {
+			// Check if this column is the first column in any non-unique index (MUL)
+			for _, idx := range tblDef.Indexes {
+				if !idx.Unique && len(idx.Columns) > 0 {
+					// Strip length suffix from index column name (e.g. "col(10)" -> "col")
+					idxCol := idx.Columns[0]
+					if parenIdx := strings.Index(idxCol, "("); parenIdx >= 0 {
+						idxCol = idxCol[:parenIdx]
+					}
+					if strings.EqualFold(idxCol, col.Name) {
+						key = "MUL"
+						break
+					}
+				}
+			}
 		}
 		var defVal interface{}
 		if col.Default != nil {
 			defVal = *col.Default
 		}
-		extra := ""
+		var extra interface{}
+		extra = ""
 		if col.AutoIncrement {
 			extra = "auto_increment"
+		}
+		// For TEMPORARY tables, MySQL returns NULL for the Extra column when empty
+		if e.tempTables[tableName] && extra == "" {
+			extra = nil
 		}
 		rows = append(rows, []interface{}{col.Name, mysqlDisplayType(col.Type), nullable, key, defVal, extra})
 	}
@@ -5926,7 +6020,16 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		}
 		b.WriteString("\n")
 	}
-	for i, idx := range def.Indexes {
+	// Sort indexes: UNIQUE keys first, then regular keys (MySQL convention)
+	sortedIndexes := make([]catalog.IndexDef, len(def.Indexes))
+	copy(sortedIndexes, def.Indexes)
+	sort.SliceStable(sortedIndexes, func(a, b int) bool {
+		if sortedIndexes[a].Unique != sortedIndexes[b].Unique {
+			return sortedIndexes[a].Unique // unique first
+		}
+		return false // preserve order within same type
+	})
+	for i, idx := range sortedIndexes {
 		quotedCols := make([]string, len(idx.Columns))
 		for j, c := range idx.Columns {
 			// Handle column with length prefix like "c1(10)"
@@ -5949,7 +6052,7 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		} else {
 			b.WriteString(fmt.Sprintf("  KEY `%s` (%s)%s%s", idx.Name, strings.Join(quotedCols, ","), usingStr, commentStr))
 		}
-		if i < len(def.Indexes)-1 {
+		if i < len(sortedIndexes)-1 {
 			b.WriteString(",")
 		}
 		b.WriteString("\n")
@@ -6599,8 +6702,210 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 		e.userVars[varName] = val
 		return val, nil
+	case *sqlparser.InsertExpr:
+		return e.evalInsertExpr(v)
+	case *sqlparser.LocateExpr:
+		return e.evalLocateExpr(v)
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
+}
+
+// evalInsertExpr implements the MySQL INSERT(str, pos, len, newstr) function.
+// INSERT() returns the string str, with the substring beginning at position pos
+// and len characters long replaced by the string newstr.
+func (e *Executor) evalInsertExpr(v *sqlparser.InsertExpr) (interface{}, error) {
+	strVal, err := e.evalExpr(v.Str)
+	if err != nil {
+		return nil, err
+	}
+	if strVal == nil {
+		return nil, nil
+	}
+	posVal, err := e.evalExpr(v.Pos)
+	if err != nil {
+		return nil, err
+	}
+	if posVal == nil {
+		return nil, nil
+	}
+	lenVal, err := e.evalExpr(v.Len)
+	if err != nil {
+		return nil, err
+	}
+	if lenVal == nil {
+		return nil, nil
+	}
+	newStrVal, err := e.evalExpr(v.NewStr)
+	if err != nil {
+		return nil, err
+	}
+	if newStrVal == nil {
+		return nil, nil
+	}
+
+	str := []rune(toString(strVal))
+	pos := int(toInt64(posVal))
+	length := int(toInt64(lenVal))
+	newStr := toString(newStrVal)
+
+	// MySQL INSERT() uses 1-based positions
+	// If pos < 1 or pos > len(str)+1, return original string
+	if pos < 1 || pos > len(str)+1 {
+		return string(str), nil
+	}
+
+	// Convert to 0-based index
+	idx := pos - 1
+
+	// Calculate the end of the replaced portion
+	end := idx + length
+	if end > len(str) {
+		end = len(str)
+	}
+
+	// Build result: str[:idx] + newStr + str[end:]
+	result := string(str[:idx]) + newStr + string(str[end:])
+	return result, nil
+}
+
+// evalLocateExpr implements the MySQL LOCATE(substr, str [, pos]) function.
+// Returns the position of the first occurrence of substr in str, starting from pos.
+func (e *Executor) evalLocateExpr(v *sqlparser.LocateExpr) (interface{}, error) {
+	subStrVal, err := e.evalExpr(v.SubStr)
+	if err != nil {
+		return nil, err
+	}
+	if subStrVal == nil {
+		return nil, nil
+	}
+	strVal, err := e.evalExpr(v.Str)
+	if err != nil {
+		return nil, err
+	}
+	if strVal == nil {
+		return nil, nil
+	}
+
+	subStr := []rune(toString(subStrVal))
+	str := []rune(toString(strVal))
+	startPos := 1
+
+	if v.Pos != nil {
+		posVal, err := e.evalExpr(v.Pos)
+		if err != nil {
+			return nil, err
+		}
+		if posVal != nil {
+			startPos = int(toInt64(posVal))
+		}
+	}
+
+	if startPos < 1 {
+		return int64(0), nil
+	}
+
+	// Convert to 0-based index
+	startIdx := startPos - 1
+	if startIdx >= len(str) {
+		if len(subStr) == 0 {
+			return int64(0), nil
+		}
+		return int64(0), nil
+	}
+
+	// Search for substr in str starting at startIdx
+	searchStr := str[startIdx:]
+	subStrStr := string(subStr)
+	searchStrStr := string(searchStr)
+	idx := strings.Index(searchStrStr, subStrStr)
+	if idx < 0 {
+		return int64(0), nil
+	}
+
+	// Convert byte index back to rune index
+	runeIdx := len([]rune(searchStrStr[:idx]))
+	return int64(runeIdx + startPos), nil
+}
+
+// charsetByteLength returns the byte length of a UTF-8 string when encoded in the given charset.
+func charsetByteLength(s string, charset string) (int64, error) {
+	switch strings.ToLower(charset) {
+	case "sjis", "cp932":
+		encoded, err := japanese.ShiftJIS.NewEncoder().Bytes([]byte(s))
+		if err != nil {
+			// Fallback: estimate using character ranges
+			count := int64(0)
+			for _, r := range s {
+				if r < 0x80 {
+					count++
+				} else if r >= 0xFF61 && r <= 0xFF9F {
+					count++
+				} else {
+					count += 2
+				}
+			}
+			return count, nil
+		}
+		return int64(len(encoded)), nil
+	case "ujis", "eucjpms":
+		encoded, err := japanese.EUCJP.NewEncoder().Bytes([]byte(s))
+		if err != nil {
+			// Fallback: estimate
+			count := int64(0)
+			for _, r := range s {
+				if r < 0x80 {
+					count++
+				} else {
+					count += 2
+				}
+			}
+			return count, nil
+		}
+		return int64(len(encoded)), nil
+	case "ucs2":
+		// UCS-2: every character is 2 bytes
+		return int64(len([]rune(s)) * 2), nil
+	case "utf8", "utf8mb3":
+		return int64(len(s)), nil
+	case "utf8mb4":
+		return int64(len(s)), nil
+	case "":
+		return int64(len(s)), nil
+	default:
+		return int64(len(s)), nil
+	}
+}
+
+// getColumnCharset returns the charset of a column by looking up the table definition.
+func (e *Executor) getColumnCharset(colName *sqlparser.ColName) string {
+	tableName := ""
+	if !colName.Qualifier.Name.IsEmpty() {
+		tableName = colName.Qualifier.Name.String()
+	}
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return ""
+	}
+	colStr := colName.Name.String()
+	if tableName != "" {
+		if td, err := db.GetTable(tableName); err == nil {
+			if td.Charset != "" {
+				return td.Charset
+			}
+		}
+	} else {
+		// Search all tables in the current database for the column
+		for _, td := range db.Tables {
+			for _, col := range td.Columns {
+				if strings.EqualFold(col.Name, colStr) {
+					if td.Charset != "" {
+						return td.Charset
+					}
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // evalFuncExpr handles MySQL built-in function calls.
@@ -6747,7 +7052,16 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		if val == nil {
 			return nil, nil
 		}
-		return int64(len(toString(val))), nil
+		s := toString(val)
+		// Check if the expression references a column with a specific charset
+		// MySQL LENGTH() returns byte count in the column's charset, not UTF-8
+		if colName, ok := v.Exprs[0].(*sqlparser.ColName); ok {
+			cs := e.getColumnCharset(colName)
+			if byteLen, err := charsetByteLength(s, cs); err == nil {
+				return byteLen, nil
+			}
+		}
+		return int64(len(s)), nil
 	case "char_length", "character_length":
 		if len(v.Exprs) < 1 {
 			return nil, fmt.Errorf("CHAR_LENGTH requires 1 argument")
@@ -7755,7 +8069,29 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		if val == nil {
 			return "binary", nil
 		}
-		// Return the table's charset if we can determine it
+		// Return the table's charset if we can determine it from column reference
+		colStr := ""
+		if colName, ok := v.Exprs[0].(*sqlparser.ColName); ok {
+			colStr = colName.Name.String()
+			cs := e.getColumnCharset(colName)
+			if cs != "" {
+				return cs, nil
+			}
+		}
+		// Fallback: search all tables in current DB for the column
+		if colStr != "" {
+			if db, err2 := e.Catalog.GetDatabase(e.CurrentDB); err2 == nil {
+				for _, tblDef := range db.Tables {
+					if tblDef.Charset != "" {
+						for _, col := range tblDef.Columns {
+							if strings.EqualFold(col.Name, colStr) {
+								return tblDef.Charset, nil
+							}
+						}
+					}
+				}
+			}
+		}
 		return "utf8", nil
 	case "instr":
 		// INSTR(str, substr) returns the position of the first occurrence of substr in str.
@@ -8687,7 +9023,15 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if len(args) < 1 || args[0] == nil {
 			return nil, nil
 		}
-		return int64(len(toString(args[0]))), nil
+		s := toString(args[0])
+		// Check if the expression references a column with a specific charset
+		if colName, ok := v.Exprs[0].(*sqlparser.ColName); ok {
+			cs := e.getColumnCharset(colName)
+			if byteLen, err2 := charsetByteLength(s, cs); err2 == nil {
+				return byteLen, nil
+			}
+		}
+		return int64(len(s)), nil
 	case "char_length", "character_length":
 		args, err := evalArgs()
 		if err != nil {
@@ -9211,6 +9555,31 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		}
 		if val == nil {
 			return "binary", nil
+		}
+		// Return the table's charset if we can determine it from column reference
+		if colName, ok := v.Exprs[0].(*sqlparser.ColName); ok {
+			cs := e.getColumnCharset(colName)
+			if cs != "" {
+				return cs, nil
+			}
+		}
+		// Fallback: search all tables in current DB for the column
+		colStr := ""
+		if cn, ok := v.Exprs[0].(*sqlparser.ColName); ok {
+			colStr = cn.Name.String()
+		}
+		if colStr != "" {
+			if db, err2 := e.Catalog.GetDatabase(e.CurrentDB); err2 == nil {
+				for _, tblDef := range db.Tables {
+					if tblDef.Charset != "" {
+						for _, col := range tblDef.Columns {
+							if strings.EqualFold(col.Name, colStr) {
+								return tblDef.Charset, nil
+							}
+						}
+					}
+				}
+			}
 		}
 		return "utf8", nil
 	case "instr":
@@ -9985,10 +10354,11 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 func likeToRegexp(pattern string) *regexp.Regexp {
 	var sb strings.Builder
 	sb.WriteString("(?i)^") // case-insensitive
-	for i := 0; i < len(pattern); i++ {
-		c := pattern[i]
-		if c == '\\' && i+1 < len(pattern) {
-			sb.WriteString(regexp.QuoteMeta(string(pattern[i+1])))
+	runes := []rune(pattern)
+	for i := 0; i < len(runes); i++ {
+		c := runes[i]
+		if c == '\\' && i+1 < len(runes) {
+			sb.WriteString(regexp.QuoteMeta(string(runes[i+1])))
 			i++
 		} else if c == '%' {
 			sb.WriteString(".*")
