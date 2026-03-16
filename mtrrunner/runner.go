@@ -126,6 +126,8 @@ func (r *Runner) RunFile(testPath string) TestResult {
 			"$MYSQL_VERSION_ID":  "80032",
 			"$innodb_page_size":  "16384",
 			"$restart_parameters": "restart",
+		"$BIG_TEST":           "1",
+		"$VALGRIND_TEST":      "0",
 		},
 	}
 
