@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -306,7 +307,92 @@ func (t *Table) Scan() []Row {
 	defer t.Mu.RUnlock()
 	result := make([]Row, len(t.Rows))
 	copy(result, t.Rows)
+	// InnoDB table scans are clustered by PRIMARY KEY.
+	// Keep scan order deterministic and MySQL-compatible for tests that rely on it.
+	if t.Def != nil && len(t.Def.PrimaryKey) > 0 && len(result) > 1 {
+		pkCols := append([]string(nil), t.Def.PrimaryKey...)
+		sort.SliceStable(result, func(i, j int) bool {
+			ri, rj := result[i], result[j]
+			for _, pk := range pkCols {
+				cmp := compareRowValue(ri[pk], rj[pk])
+				if cmp < 0 {
+					return true
+				}
+				if cmp > 0 {
+					return false
+				}
+			}
+			return false
+		})
+	}
 	return result
+}
+
+func compareRowValue(a, b interface{}) int {
+	if a == nil && b == nil {
+		return 0
+	}
+	if a == nil {
+		return -1
+	}
+	if b == nil {
+		return 1
+	}
+	af, aok := toComparableFloat(a)
+	bf, bok := toComparableFloat(b)
+	if aok && bok {
+		if af < bf {
+			return -1
+		}
+		if af > bf {
+			return 1
+		}
+		return 0
+	}
+	as := fmt.Sprintf("%v", a)
+	bs := fmt.Sprintf("%v", b)
+	if as < bs {
+		return -1
+	}
+	if as > bs {
+		return 1
+	}
+	return 0
+}
+
+func toComparableFloat(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case int:
+		return float64(n), true
+	case int8:
+		return float64(n), true
+	case int16:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case uint:
+		return float64(n), true
+	case uint8:
+		return float64(n), true
+	case uint16:
+		return float64(n), true
+	case uint32:
+		return float64(n), true
+	case uint64:
+		return float64(n), true
+	case float32:
+		return float64(n), true
+	case float64:
+		return n, true
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		if err == nil {
+			return f, true
+		}
+	}
+	return 0, false
 }
 
 // Truncate removes all rows and resets AUTO_INCREMENT.
