@@ -1761,6 +1761,10 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 	case "TIME":
 		// Use the original value for numeric handling
 		result := parseMySQLTimeValueRaw(v)
+		// Invalid TIME text should coerce to zero time in non-strict behavior.
+		if strings.Count(result, ":") != 2 {
+			result = "00:00:00"
+		}
 		// Apply TIME precision: round fractional seconds to timeFsp digits
 		return applyTimePrecision(result, timeFsp)
 	case "YEAR":
@@ -2035,6 +2039,11 @@ func parseMySQLTimeValue(s string) string {
 
 // formatTimeValue formats time components into MySQL TIME string, clipping to valid range.
 func formatTimeValue(negative bool, h, m, sec int, frac string) string {
+	// Invalid minutes/seconds produce zero time in MySQL numeric TIME context.
+	if m > 59 || sec > 59 || m < 0 || sec < 0 {
+		return "00:00:00"
+	}
+
 	// Clip to MySQL TIME range: -838:59:59 to 838:59:59
 	totalSecs := h*3600 + m*60 + sec
 	maxSecs := 838*3600 + 59*60 + 59
@@ -2042,9 +2051,6 @@ func formatTimeValue(negative bool, h, m, sec int, frac string) string {
 		// If hours > 838, clip to max
 		h, m, sec = 838, 59, 59
 		frac = ""
-	} else if m > 59 || sec > 59 {
-		// Invalid minutes or seconds -> 00:00:00
-		return "00:00:00"
 	}
 
 	sign := ""
@@ -6763,6 +6769,14 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 									} else {
 										val = int64(0)
 									}
+								}
+							}
+						}
+						if !e.isStrictMode() && strings.HasPrefix(colUpper, "TIME") {
+							if sv, ok := val.(string); ok {
+								parsed := parseMySQLTimeValue(sv)
+								if strings.Count(parsed, ":") != 2 {
+									e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", col.Name, i+1))
 								}
 							}
 						}
@@ -14551,6 +14565,14 @@ func (e *Executor) execSelectInto(stmtStr string, paramVars map[string]interface
 
 // truncateNear truncates a SQL string for error messages (MySQL shows ~80 chars).
 func truncateNear(s string) string {
+	// MySQL parse errors around unquoted time-like tokens (e.g. 11:11:11)
+	// typically show the snippet starting from ':'.
+	if idx := strings.IndexByte(s, ':'); idx > 0 {
+		prev := s[idx-1]
+		if prev >= '0' && prev <= '9' {
+			s = s[idx:]
+		}
+	}
 	if len(s) > 80 {
 		return s[:80]
 	}
