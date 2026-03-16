@@ -25,8 +25,10 @@ import (
 )
 
 func main() {
-	suiteRoot := flag.String("suite-root", "testdata/dolt-mysql-tests/files/suite", "root directory for test suites")
-	includeRoot := flag.String("include-root", "testdata/dolt-mysql-tests/files/include", "root directory for include files")
+	// Resolve testdata path: prefer the main repo's copy so worktrees don't need submodule init.
+	defaultTestdata := resolveTestdataRoot()
+	suiteRoot := flag.String("suite-root", filepath.Join(defaultTestdata, "suite"), "root directory for test suites")
+	includeRoot := flag.String("include-root", filepath.Join(defaultTestdata, "include"), "root directory for include files")
 	verbose := flag.Bool("verbose", false, "verbose output")
 	maxTests := flag.Int("max", 0, "maximum number of tests to run (0=all)")
 	flag.Parse()
@@ -217,6 +219,39 @@ func indent(s string) string {
 		lines[i] = "  " + l
 	}
 	return strings.Join(lines, "\n")
+}
+
+// resolveTestdataRoot finds the testdata directory.
+// In a worktree, the local testdata/dolt-mysql-tests may not exist (no submodule),
+// so we walk up to find the main repo's copy via .git or commondir.
+func resolveTestdataRoot() string {
+	// First, try the local relative path
+	local := "testdata/dolt-mysql-tests/files"
+	if fi, err := os.Stat(filepath.Join(local, "suite")); err == nil && fi.IsDir() {
+		return local
+	}
+
+	// Try to find the main worktree path from .git file
+	gitPath := ".git"
+	data, err := os.ReadFile(gitPath)
+	if err == nil {
+		content := strings.TrimSpace(string(data))
+		if strings.HasPrefix(content, "gitdir: ") {
+			// This is a worktree - .git file points to the real git dir
+			// e.g., "gitdir: /path/to/main/.git/worktrees/agent-xxx"
+			gitdir := strings.TrimPrefix(content, "gitdir: ")
+			// Navigate up from .git/worktrees/xxx to the main repo
+			mainRepo := filepath.Join(gitdir, "..", "..", "..")
+			candidate := filepath.Join(mainRepo, "testdata", "dolt-mysql-tests", "files")
+			if fi, err := os.Stat(filepath.Join(candidate, "suite")); err == nil && fi.IsDir() {
+				abs, _ := filepath.Abs(candidate)
+				return abs
+			}
+		}
+	}
+
+	// Fallback
+	return local
 }
 
 func resetDB(db *sql.DB) {
