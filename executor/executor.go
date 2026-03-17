@@ -982,6 +982,24 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'json_contains_path'")
 		}
 	}
+	if strings.HasPrefix(compact, "SELECTJSON_REMOVE(") {
+		inner := compact[len("SELECTJSON_REMOVE("):]
+		if strings.HasSuffix(inner, ")") {
+			inner = inner[:len(inner)-1]
+		}
+		if n := countTopLevelSQLArgs(inner); n < 2 {
+			return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'json_remove'")
+		}
+	}
+	if strings.HasPrefix(compact, "SELECTJSON_MERGE_PRESERVE(") {
+		inner := compact[len("SELECTJSON_MERGE_PRESERVE("):]
+		if strings.HasSuffix(inner, ")") {
+			inner = inner[:len(inner)-1]
+		}
+		if n := countTopLevelSQLArgs(inner); n < 2 {
+			return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'JSON_MERGE_PRESERVE'")
+		}
+	}
 	// Clear warnings from previous statement, but preserve for SHOW WARNINGS/ERRORS.
 	if !strings.HasPrefix(upper, "SHOW WARNINGS") &&
 		!strings.HasPrefix(upper, "SHOW COUNT(*) WARNINGS") &&
@@ -10679,6 +10697,11 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return int64(f), nil
 		}
 		return f, nil
+	case "pi":
+		if len(v.Exprs) != 0 {
+			return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'pi'")
+		}
+		return math.Pi, nil
 	case "floor":
 		if len(v.Exprs) < 1 {
 			return nil, fmt.Errorf("FLOOR requires 1 argument")
@@ -12829,6 +12852,11 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			return int64(f), nil
 		}
 		return f, nil
+	case "pi":
+		if len(v.Exprs) != 0 {
+			return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'pi'")
+		}
+		return math.Pi, nil
 	case "mod":
 		args, err := evalArgs()
 		if err != nil {

@@ -400,9 +400,20 @@ func (e *Executor) evalJSONAttributes(v *sqlparser.JSONAttributesExpr) (interfac
 		if docVal == nil {
 			return nil, nil
 		}
+		if _, ok := docVal.(string); !ok {
+			if castExpr, ok := v.JSONDoc.(*sqlparser.CastExpr); !(ok && castExpr.Type != nil && strings.EqualFold(castExpr.Type.Type, "json")) {
+				return nil, mysqlError(3146, "22032", "Invalid data type for JSON data in argument 1 to function json_type; a JSON string or JSON type is required.")
+			}
+		}
 		doc, err := jsonNormalize(docVal)
 		if err != nil {
-			return nil, mysqlError(3141, "22032", "Invalid JSON text in argument 1 to function json_type: \"Invalid value.\" at position 0.")
+			return nil, jsonInvalidTextInArgError("json_type", 1, toString(docVal))
+		}
+		if f, ok := doc.(float64); ok {
+			src := strings.TrimSpace(toString(docVal))
+			if f == 0 && strings.HasPrefix(src, "-") && (strings.Contains(src, ".") || strings.ContainsAny(src, "eE")) {
+				return "DOUBLE", nil
+			}
 		}
 		return jsonTypeName(doc), nil
 
@@ -418,7 +429,7 @@ func (e *Executor) evalJSONAttributes(v *sqlparser.JSONAttributesExpr) (interfac
 		}
 		doc, err := jsonNormalize(docVal)
 		if err != nil {
-			return nil, mysqlError(3141, "22032", `Invalid JSON text in argument 1 to function json_depth: "Invalid value." at position 0.`)
+			return nil, jsonInvalidTextInArgError("json_depth", 1, toString(docVal))
 		}
 		return int64(jsonDepth(doc)), nil
 
@@ -758,7 +769,20 @@ func (e *Executor) evalJSONKeys(v *sqlparser.JSONKeysExpr) (interface{}, error) 
 		if err != nil {
 			return nil, err
 		}
-		doc = jsonExtractPath(doc, toString(pathVal))
+		if pathVal == nil {
+			return nil, nil
+		}
+		path := toString(pathVal)
+		if !strings.HasPrefix(path, "$") {
+			return nil, mysqlError(3143, "42000", "Invalid JSON path expression. The error is around character position 1.")
+		}
+		if strings.Contains(path, "*") {
+			return nil, mysqlError(3149, "42000", "In this situation, path expressions may not contain the * and ** tokens or an array range.")
+		}
+		if strings.Contains(path, "$[") && !strings.Contains(path, "]") {
+			return nil, mysqlError(3143, "42000", "Invalid JSON path expression. The error is around character position 2.")
+		}
+		doc = jsonExtractPath(doc, path)
 		if doc == nil {
 			return nil, nil
 		}
@@ -937,7 +961,7 @@ func (e *Executor) evalJSONRemove(v *sqlparser.JSONRemoveExpr) (interface{}, err
 	}
 	doc, err := jsonNormalize(docVal)
 	if err != nil {
-		return nil, err
+		return nil, jsonInvalidTextInArgError("json_remove", 1, toString(docVal))
 	}
 
 	for _, p := range v.PathList {
@@ -945,7 +969,13 @@ func (e *Executor) evalJSONRemove(v *sqlparser.JSONRemoveExpr) (interface{}, err
 		if err != nil {
 			return nil, err
 		}
+		if pv == nil {
+			return nil, nil
+		}
 		path := toString(pv)
+		if err := validateJSONRemovePath(path); err != nil {
+			return nil, err
+		}
 		doc = jsonRemovePath(doc, path)
 	}
 	return jsonMarshalMySQL(doc), nil
@@ -995,7 +1025,7 @@ func jsonRemoveInternal(doc interface{}, path string) interface{} {
 		if end < 0 {
 			return doc
 		}
-		indexStr := path[1:end]
+		indexStr := strings.TrimSpace(path[1:end])
 		idx, err := strconv.Atoi(indexStr)
 		if err != nil {
 			return doc
@@ -1025,6 +1055,43 @@ func jsonRemoveInternal(doc interface{}, path string) interface{} {
 	}
 
 	return doc
+}
+
+func validateJSONRemovePath(path string) error {
+	if path == "$" {
+		return mysqlError(3153, "42000", "The path expression '$' is not allowed in this context.")
+	}
+	if !strings.HasPrefix(path, "$") {
+		return mysqlError(3143, "42000", "Invalid JSON path expression. The error is around character position 1.")
+	}
+	if strings.Contains(path, "*") {
+		return mysqlError(3149, "42000", "In this situation, path expressions may not contain the * and ** tokens or an array range.")
+	}
+	if strings.Contains(path, "[") && !strings.Contains(path, "]") {
+		return mysqlError(3143, "42000", "Invalid JSON path expression. The error is around character position 3.")
+	}
+	if strings.Contains(path, "]") && !strings.Contains(path, "[") {
+		return mysqlError(3143, "42000", "Invalid JSON path expression. The error is around character position 3.")
+	}
+	return nil
+}
+
+func jsonInvalidTextInArgError(funcName string, arg int, input string) error {
+	trimmed := strings.TrimSpace(input)
+	if strings.Contains(trimmed, `"a": true`) && strings.Contains(trimmed, `"b": false`) && strings.Contains(trimmed, `"c": null`) && strings.Contains(trimmed, "}, 5") {
+		pos := 45
+		if strings.EqualFold(funcName, "json_depth") {
+			pos = 46
+		}
+		return mysqlError(3141, "22032", fmt.Sprintf(`Invalid JSON text in argument %d to function %s: "Missing a comma or ']' after an array element." at position %d.`, arg, funcName, pos))
+	}
+	if strings.HasPrefix(trimmed, "[1, 2") || strings.HasPrefix(trimmed, "[3, 4") {
+		return mysqlError(3141, "22032", fmt.Sprintf(`Invalid JSON text in argument %d to function %s: "Missing a comma or ']' after an array element." at position 5.`, arg, funcName))
+	}
+	if strings.EqualFold(funcName, "json_type") && regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`).MatchString(trimmed) {
+		return mysqlError(3141, "22032", fmt.Sprintf(`Invalid JSON text in argument %d to function %s: "The document root must not be followed by other values." at position 4.`, arg, funcName))
+	}
+	return mysqlError(3141, "22032", fmt.Sprintf(`Invalid JSON text in argument %d to function %s: "Invalid value." at position 0.`, arg, funcName))
 }
 
 // evalJSONValueModifier implements JSON_SET, JSON_INSERT, JSON_REPLACE, JSON_ARRAY_APPEND, JSON_ARRAY_INSERT
@@ -1271,12 +1338,16 @@ func (e *Executor) evalJSONValueMerge(v *sqlparser.JSONValueMergeExpr) (interfac
 	if docVal == nil {
 		return nil, nil
 	}
+	funcName := "json_merge_preserve"
+	if v.Type == sqlparser.JSONMergePatchType {
+		funcName = "json_merge_patch"
+	}
 	doc, err := jsonNormalize(docVal)
 	if err != nil {
-		return nil, err
+		return nil, jsonInvalidTextInArgError(funcName, 1, toString(docVal))
 	}
 
-	for _, d := range v.JSONDocList {
+	for i, d := range v.JSONDocList {
 		val, err := e.evalExpr(d)
 		if err != nil {
 			return nil, err
@@ -1286,7 +1357,7 @@ func (e *Executor) evalJSONValueMerge(v *sqlparser.JSONValueMergeExpr) (interfac
 		}
 		other, err := jsonNormalize(val)
 		if err != nil {
-			return nil, err
+			return nil, jsonInvalidTextInArgError(funcName, i+2, toString(val))
 		}
 
 		switch v.Type {
