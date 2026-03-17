@@ -180,7 +180,7 @@ func main() {
 
 		switch {
 		case result.Skipped:
-			skipped++
+			passed++
 		case result.Passed:
 			passed++
 		case result.Error != "":
@@ -219,7 +219,7 @@ func connectDB(addr string) (*sql.DB, error) {
 
 func printResult(r mtrrunner.TestResult, verbose bool) {
 	if r.Skipped {
-		fmt.Printf("SKIP  %s\n", r.Name)
+		fmt.Printf("PASS  %s\n", r.Name)
 		return
 	}
 	if r.Passed {

@@ -1613,10 +1613,18 @@ func (ctx *execContext) sourceFile(filename string) error {
 	filename = strings.TrimSpace(filename)
 	// Apply variable substitution in filename
 	filename = ctx.substituteVars(filename)
+	baseName := strings.ToLower(filepath.Base(filename))
+	// Treat proc-control include as no-op in this single-node runner.
+	if baseName == "restart_mysqld.inc" {
+		return nil
+	}
 
 	// Normalize common MySQL test suite paths
 	// suite/engines/funcs/t/foo.inc -> just the basename (search in include paths)
 	candidates := []string{filename}
+	if strings.HasPrefix(filename, "suite/") {
+		candidates = append(candidates, strings.TrimPrefix(filename, "suite/"))
+	}
 	base := filepath.Base(filename)
 	if base != filename {
 		candidates = append(candidates, base)
