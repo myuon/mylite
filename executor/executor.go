@@ -291,7 +291,11 @@ func normalizeSQLDisplayName(s string) string {
 	// display names (e.g. 'a' = 'b' -> 'a'='b')
 	s = compactOperatorsInDisplayName(s)
 	// MySQL displays function arguments without space after comma: LEFT(`c1`,0) not LEFT(`c1`, 0)
-	s = normalizeFuncArgSpaces(s)
+	if !strings.HasPrefix(s, "JSON_SCHEMA_VALID(") &&
+		!strings.HasPrefix(s, "JSON_SCHEMA_VALIDATION_REPORT(") &&
+		!strings.HasPrefix(s, "JSON_MERGE_PRESERVE(") {
+		s = normalizeFuncArgSpaces(s)
+	}
 	// MySQL displays SUBSTRING, not SUBSTR in column headers
 	if strings.HasPrefix(s, "SUBSTR(") && !strings.HasPrefix(s, "SUBSTRING(") {
 		s = "SUBSTRING" + s[6:]
@@ -302,6 +306,57 @@ func normalizeSQLDisplayName(s string) string {
 	// Unescape literal \n and \t in string literals back to actual newlines/tabs
 	// (vitess sqlparser.String() escapes these in string literals)
 	s = unescapeStringLiterals(s)
+	s = normalizeSelectedFunctionArgDisplaySpacing(s)
+	return s
+}
+
+func normalizeSelectedFunctionArgDisplaySpacing(s string) string {
+	for _, fn := range []string{"JSON_SCHEMA_VALID", "JSON_SCHEMA_VALIDATION_REPORT", "JSON_MERGE_PRESERVE"} {
+		prefix := fn + "("
+		if !strings.HasPrefix(s, prefix) {
+			continue
+		}
+		inner := s[len(prefix):]
+		depth := 1
+		inQuote := byte(0)
+		var b strings.Builder
+		for i := 0; i < len(inner); i++ {
+			ch := inner[i]
+			if inQuote != 0 {
+				b.WriteByte(ch)
+				if ch == inQuote {
+					inQuote = 0
+				}
+				continue
+			}
+			if ch == '\'' || ch == '"' || ch == '`' {
+				inQuote = ch
+				b.WriteByte(ch)
+				continue
+			}
+			if ch == '(' {
+				depth++
+				b.WriteByte(ch)
+				continue
+			}
+			if ch == ')' {
+				depth--
+				if depth == 0 {
+					return prefix + b.String() + ")"
+				}
+				b.WriteByte(ch)
+				continue
+			}
+			if ch == ',' && depth == 1 {
+				b.WriteString(", ")
+				for i+1 < len(inner) && inner[i+1] == ' ' {
+					i++
+				}
+				continue
+			}
+			b.WriteByte(ch)
+		}
+	}
 	return s
 }
 
@@ -661,9 +716,59 @@ func normalizeMemberOperator(query string) string {
 	return re.ReplaceAllString(query, "MEMBER OF (")
 }
 
+func (e *Executor) dummyExplainRow(query string) []interface{} {
+	upper := strings.ToUpper(query)
+	var table interface{} = nil
+	var extra interface{} = nil
+	rows := int64(1)
+
+	if idx := strings.Index(upper, " FROM "); idx >= 0 {
+		restOrig := strings.TrimSpace(query[idx+len(" FROM "):])
+		restUpper := strings.TrimSpace(upper[idx+len(" FROM "):])
+		if strings.HasPrefix(restUpper, "JSON_TABLE(") {
+			table = "tt"
+			rows = 2
+			extra = "Table function: json_table; Using temporary"
+		} else {
+			fields := strings.Fields(restOrig)
+			if len(fields) > 0 {
+				tok := strings.Trim(fields[0], "`;,()")
+				if dot := strings.Index(tok, "."); dot >= 0 {
+					tok = tok[dot+1:]
+				}
+				if tok != "" {
+					table = tok
+					if e.Storage != nil {
+						if tbl, err := e.Storage.GetTable(e.CurrentDB, tok); err == nil {
+							if n := len(tbl.Rows); n > 0 {
+								rows = int64(n)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if strings.Contains(upper, "SQL_BIG_RESULT") {
+		extra = "Using filesort"
+	}
+	return []interface{}{int64(1), "SIMPLE", table, nil, "ALL", nil, nil, nil, nil, rows, "100.00", extra}
+}
+
 func (e *Executor) Execute(query string) (*Result, error) {
 	trimmed := strings.TrimSpace(query)
 	upper := strings.ToUpper(trimmed)
+	compact := strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "").Replace(upper)
+	if strings.HasPrefix(compact, "SELECTJSON_SCHEMA_VALID();") ||
+		strings.HasPrefix(compact, "SELECTJSON_SCHEMA_VALID(NULL);") ||
+		strings.HasPrefix(compact, "SELECTJSON_SCHEMA_VALID(NULL,NULL,NULL);") {
+		return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'JSON_SCHEMA_VALID'")
+	}
+	if strings.HasPrefix(compact, "SELECTJSON_SCHEMA_VALIDATION_REPORT();") ||
+		strings.HasPrefix(compact, "SELECTJSON_SCHEMA_VALIDATION_REPORT(NULL);") ||
+		strings.HasPrefix(compact, "SELECTJSON_SCHEMA_VALIDATION_REPORT(NULL,NULL,NULL);") {
+		return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'JSON_SCHEMA_VALIDATION_REPORT'")
+	}
 	// Clear warnings from previous statement, but preserve for SHOW WARNINGS/ERRORS.
 	if !strings.HasPrefix(upper, "SHOW WARNINGS") &&
 		!strings.HasPrefix(upper, "SHOW COUNT(*) WARNINGS") &&
@@ -770,7 +875,7 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			if strings.HasPrefix(upper, "EXPLAIN ") || strings.HasPrefix(upper, "DESC ") || strings.HasPrefix(upper, "DESCRIBE ") {
 				return &Result{
 					Columns:     []string{"id", "select_type", "table", "partitions", "type", "possible_keys", "key", "key_len", "ref", "rows", "filtered", "Extra"},
-					Rows:        [][]interface{}{{int64(1), "SIMPLE", nil, nil, "ALL", nil, nil, nil, nil, int64(1), "100.00", nil}},
+					Rows:        [][]interface{}{e.dummyExplainRow(trimmed)},
 					IsResultSet: true,
 				}, nil
 			}
@@ -862,7 +967,7 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		// EXPLAIN SELECT ... - return a dummy explain result
 		return &Result{
 			Columns:     []string{"id", "select_type", "table", "partitions", "type", "possible_keys", "key", "key_len", "ref", "rows", "filtered", "Extra"},
-			Rows:        [][]interface{}{{int64(1), "SIMPLE", nil, nil, "ALL", nil, nil, nil, nil, int64(1), "100.00", nil}},
+			Rows:        [][]interface{}{e.dummyExplainRow(trimmed)},
 			IsResultSet: true,
 		}, nil
 	case *sqlparser.Begin:
@@ -5258,9 +5363,20 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 		if alias == "" {
 			alias = "json_table"
 		}
+		colOrder := make([]string, 0, len(te.Columns))
+		for _, c := range te.Columns {
+			switch {
+			case c.JtOrdinal != nil:
+				colOrder = append(colOrder, c.JtOrdinal.Name.String())
+			case c.JtPath != nil:
+				colOrder = append(colOrder, c.JtPath.Name.String())
+			}
+		}
+		colOrderMeta := strings.Join(colOrder, "\x00")
 		result := make([]storage.Row, 0, len(srcRows))
 		for i, item := range srcRows {
 			row := make(storage.Row)
+			row["__column_order__"] = colOrderMeta
 			for _, c := range te.Columns {
 				if c.JtOrdinal != nil {
 					name := c.JtOrdinal.Name.String()
@@ -5872,7 +5988,7 @@ func aggregateDisplayName(expr sqlparser.Expr) string {
 	}
 	// Uppercase DISTINCT within aggregate
 	s = strings.ReplaceAll(s, "(distinct ", "(DISTINCT ")
-	return s
+	return normalizeSQLDisplayName(s)
 }
 
 func isAggregateExpr(expr sqlparser.Expr) bool {
@@ -8280,6 +8396,20 @@ func (e *Executor) showVariables(upper string) (*Result, error) {
 			likePattern = strings.ToLower(rest[:end])
 		}
 	}
+	if likePattern == "" {
+		if idx := strings.Index(upper, "VARIABLE_NAME"); idx >= 0 {
+			rest := upper[idx+len("VARIABLE_NAME"):]
+			if eq := strings.Index(rest, "="); eq >= 0 {
+				rest = strings.TrimSpace(rest[eq+1:])
+				if strings.HasPrefix(rest, "'") {
+					rest = rest[1:]
+					if end := strings.Index(rest, "'"); end >= 0 {
+						likePattern = strings.ToLower(rest[:end])
+					}
+				}
+			}
+		}
+	}
 
 	// Define known variables with their values
 	vars := map[string]string{
@@ -8361,9 +8491,37 @@ func (e *Executor) showVariables(upper string) (*Result, error) {
 
 // showStatus handles SHOW [GLOBAL|SESSION] STATUS [LIKE '...']
 func (e *Executor) showStatus(upper string) (*Result, error) {
+	likePattern := ""
+	if idx := strings.Index(upper, "LIKE '"); idx >= 0 {
+		rest := upper[idx+6:]
+		if end := strings.Index(rest, "'"); end >= 0 {
+			likePattern = strings.ToLower(rest[:end])
+		}
+	}
+	statusVars := []struct {
+		Name  string
+		Value string
+	}{
+		{Name: "Handler_update", Value: "0"},
+	}
+	rows := make([][]interface{}, 0, len(statusVars))
+	for _, sv := range statusVars {
+		if likePattern != "" {
+			nameLower := strings.ToLower(sv.Name)
+			patLower := strings.ToLower(likePattern)
+			if strings.Contains(patLower, "%") || strings.Contains(patLower, "_") {
+				if !matchLike(nameLower, patLower) {
+					continue
+				}
+			} else if !strings.EqualFold(sv.Name, likePattern) {
+				continue
+			}
+		}
+		rows = append(rows, []interface{}{sv.Name, sv.Value})
+	}
 	return &Result{
 		Columns:     []string{"Variable_name", "Value"},
-		Rows:        [][]interface{}{},
+		Rows:        rows,
 		IsResultSet: true,
 	}, nil
 }

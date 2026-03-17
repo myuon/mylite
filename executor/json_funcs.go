@@ -1601,9 +1601,15 @@ func (e *Executor) evalJSONSchemaValid(v *sqlparser.JSONSchemaValidFuncExpr) (in
 		return nil, nil
 	}
 
+	schemaStr, schemaTypeOK := schemaVal.(string)
+	if !schemaTypeOK {
+		return nil, mysqlError(3146, "22032", "Invalid data type for JSON data in argument 1 to function json_schema_valid; a JSON string or JSON type is required.")
+	}
+	docStr, docTypeOK := docVal.(string)
+	if !docTypeOK {
+		return nil, mysqlError(3146, "22032", "Invalid data type for JSON data in argument 2 to function json_schema_valid; a JSON string or JSON type is required.")
+	}
 	// Check for excessive nesting depth on raw strings first (before parsing)
-	schemaStr := toString(schemaVal)
-	docStr := toString(docVal)
 	if jsonRawDepth(schemaStr) > 100 || jsonRawDepth(docStr) > 100 {
 		return nil, mysqlError(3157, "22032", "The JSON document exceeds the maximum depth.")
 	}
@@ -1621,7 +1627,7 @@ func (e *Executor) evalJSONSchemaValid(v *sqlparser.JSONSchemaValidFuncExpr) (in
 
 	schemaObj, ok := schema.(map[string]interface{})
 	if !ok {
-		return nil, mysqlError(3141, "22032", "Invalid JSON text in argument 1 to function json_schema_valid.")
+		return nil, mysqlError(3141, "22032", "Invalid JSON type in argument 1 to function json_schema_valid; an object is required.")
 	}
 
 	// Check for $ref (JSON Schema references not supported)
@@ -1652,20 +1658,28 @@ func (e *Executor) evalJSONSchemaValidationReport(v *sqlparser.JSONSchemaValidat
 		return nil, nil
 	}
 
+	schemaStr, schemaTypeOK := schemaVal.(string)
+	if !schemaTypeOK {
+		return nil, mysqlError(3146, "22032", "Invalid data type for JSON data in argument 1 to function json_schema_validation_report; a JSON string or JSON type is required.")
+	}
+	docStr, docTypeOK := docVal.(string)
+	if !docTypeOK {
+		return nil, mysqlError(3146, "22032", "Invalid data type for JSON data in argument 2 to function json_schema_validation_report; a JSON string or JSON type is required.")
+	}
 	// Parse schema
 	var schema interface{}
-	if err := json.Unmarshal([]byte(toString(schemaVal)), &schema); err != nil {
+	if err := json.Unmarshal([]byte(schemaStr), &schema); err != nil {
 		return nil, mysqlError(3141, "22032", "Invalid JSON text in argument 1 to function json_schema_validation_report.")
 	}
 	// Parse document
 	var doc interface{}
-	if err := json.Unmarshal([]byte(toString(docVal)), &doc); err != nil {
+	if err := json.Unmarshal([]byte(docStr), &doc); err != nil {
 		return nil, mysqlError(3141, "22032", "Invalid JSON text in argument 2 to function json_schema_validation_report.")
 	}
 
 	schemaObj, ok := schema.(map[string]interface{})
 	if !ok {
-		return nil, mysqlError(3141, "22032", "Invalid JSON text in argument 1 to function json_schema_validation_report.")
+		return nil, mysqlError(3141, "22032", "Invalid JSON type in argument 1 to function json_schema_validation_report; an object is required.")
 	}
 
 	reason := jsonSchemaValidateReport(schemaObj, doc)
