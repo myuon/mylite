@@ -13,6 +13,7 @@ var infoSchemaColumnOrder = map[string][]string{
 	"tables": {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE", "ENGINE", "VERSION", "ROW_FORMAT", "TABLE_ROWS", "AVG_ROW_LENGTH", "DATA_LENGTH", "MAX_DATA_LENGTH", "INDEX_LENGTH", "DATA_FREE", "AUTO_INCREMENT", "CREATE_TIME", "UPDATE_TIME", "CHECK_TIME", "TABLE_COLLATION", "CHECKSUM", "CREATE_OPTIONS", "TABLE_COMMENT"},
 	"columns":    {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "COLUMN_DEFAULT", "IS_NULLABLE", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH", "CHARACTER_OCTET_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE", "DATETIME_PRECISION", "CHARACTER_SET_NAME", "COLLATION_NAME", "COLUMN_TYPE", "COLUMN_KEY", "EXTRA", "PRIVILEGES", "COLUMN_COMMENT", "GENERATION_EXPRESSION", "SRS_ID"},
 	"statistics": {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "NON_UNIQUE", "INDEX_SCHEMA", "INDEX_NAME", "SEQ_IN_INDEX", "COLUMN_NAME", "COLLATION", "CARDINALITY", "SUB_PART", "PACKED", "NULLABLE", "INDEX_TYPE", "COMMENT", "INDEX_COMMENT", "IS_VISIBLE", "EXPRESSION"},
+	"column_statistics": {"SCHEMA_NAME", "TABLE_NAME", "COLUMN_NAME", "HISTOGRAM"},
 	"engines": {"ENGINE", "SUPPORT", "COMMENT", "TRANSACTIONS", "XA", "SAVEPOINTS"},
 }
 
@@ -24,14 +25,14 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 	q := strings.ToLower(qualifier)
 	t := strings.ToLower(tableName)
 	if q == "information_schema" {
-		return t == "tables" || t == "columns" || t == "schemata" || t == "statistics" || t == "engines"
+		return t == "tables" || t == "columns" || t == "schemata" || t == "statistics" || t == "column_statistics" || t == "engines"
 	}
 	if q == "performance_schema" {
 		return t == "memory_summary_global_by_event_name"
 	}
 	// No qualifier: check if current DB is information_schema
 	if q == "" && strings.ToLower(e.CurrentDB) == "information_schema" {
-		return t == "tables" || t == "columns" || t == "schemata" || t == "statistics" || t == "engines"
+		return t == "tables" || t == "columns" || t == "schemata" || t == "statistics" || t == "column_statistics" || t == "engines"
 	}
 	return false
 }
@@ -50,6 +51,8 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.infoSchemaColumns()
 	case "statistics":
 		rawRows = e.infoSchemaStatistics()
+	case "column_statistics":
+		rawRows = e.infoSchemaColumnStatistics()
 	case "engines":
 		rawRows = e.infoSchemaEngines()
 	case "memory_summary_global_by_event_name":
@@ -308,6 +311,66 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 						"EXPRESSION":    nil,
 					})
 				}
+			}
+		}
+	}
+	return rows
+}
+
+// infoSchemaColumnStatistics returns rows for INFORMATION_SCHEMA.COLUMN_STATISTICS.
+func (e *Executor) infoSchemaColumnStatistics() []storage.Row {
+	dbNames := e.Catalog.ListDatabases()
+	sort.Strings(dbNames)
+
+	var rows []storage.Row
+	for _, dbName := range dbNames {
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		tableNames := db.ListTables()
+		sort.Strings(tableNames)
+		for _, tblName := range tableNames {
+			tblDef, err := db.GetTable(tblName)
+			if err != nil || tblDef == nil {
+				continue
+			}
+			stbl, _ := e.Storage.GetTable(dbName, tblName)
+			for _, col := range tblDef.Columns {
+				histogram := `{"buckets":[]}`
+				if stbl != nil {
+					counts := map[string]int{}
+					total := 0
+					stbl.Mu.RLock()
+					for _, r := range stbl.Rows {
+						if v, ok := r[col.Name]; ok && v != nil {
+							key := toString(v)
+							counts[key]++
+							total++
+						}
+					}
+					stbl.Mu.RUnlock()
+					if total > 0 {
+						keys := make([]string, 0, len(counts))
+						for k := range counts {
+							keys = append(keys, k)
+						}
+						sort.Strings(keys)
+						cum := 0
+						buckets := make([]interface{}, 0, len(keys))
+						for _, k := range keys {
+							cum += counts[k]
+							buckets = append(buckets, []interface{}{k, float64(cum) / float64(total)})
+						}
+						histogram = jsonMarshalMySQL(map[string]interface{}{"buckets": buckets})
+					}
+				}
+				rows = append(rows, storage.Row{
+					"SCHEMA_NAME": dbName,
+					"TABLE_NAME":  tblName,
+					"COLUMN_NAME": col.Name,
+					"HISTOGRAM":   histogram,
+				})
 			}
 		}
 	}

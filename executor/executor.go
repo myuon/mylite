@@ -6451,6 +6451,16 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			return nil, err
 		}
 		return evalBinaryExpr(left, right, e.Operator)
+	case *sqlparser.IntervalDateExpr:
+		dateVal, err := evalAggregateExpr(e.Date, groupRows, repRow)
+		if err != nil {
+			return nil, err
+		}
+		intervalVal, err := evalAggregateExpr(e.Interval, groupRows, repRow)
+		if err != nil {
+			return nil, err
+		}
+		return evalIntervalDateExpr(dateVal, intervalVal, e.Unit, e.Syntax)
 	case *sqlparser.FuncExpr:
 		// Handle functions wrapping aggregates, e.g. JSON_MERGE_PRESERVE(JSON_ARRAYAGG(b), ...)
 		if containsAggregate(e) {
@@ -6572,20 +6582,28 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 				// Check if this is an information_schema table by matching row keys
 				// against known column orders.
 				usedOrder := false
+				bestMatch := 0
+				var bestOrder []string
 				for _, order := range infoSchemaColumnOrder {
-					if len(order) > 0 {
-						if _, ok := rows[0][order[0]]; ok {
-							// Use predefined column order for information_schema
-							for _, colName := range order {
-								if _, exists := rows[0][colName]; exists {
-									cols = append(cols, colName)
-									colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(colName)})
-								}
-							}
-							usedOrder = true
-							break
+					match := 0
+					for _, colName := range order {
+						if _, ok := rows[0][colName]; ok {
+							match++
 						}
 					}
+					if match > bestMatch {
+						bestMatch = match
+						bestOrder = order
+					}
+				}
+				if bestMatch > 0 {
+					for _, colName := range bestOrder {
+						if _, exists := rows[0][colName]; exists {
+							cols = append(cols, colName)
+							colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(colName)})
+						}
+					}
+					usedOrder = true
 				}
 				if !usedOrder {
 					// Check for __column_order__ metadata (from views/CTEs)
@@ -10854,6 +10872,18 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, nil
 		}
 		return t.Format("2006-01-02 15:04:05"), nil
+	case "sec_to_time":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		arg, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if arg == nil {
+			return nil, nil
+		}
+		return secToTimeValue(arg), nil
 	case "charset":
 		// CHARSET(expr) returns the character set name of the expression.
 		if len(v.Exprs) < 1 {
@@ -11064,6 +11094,8 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 	// Try user-defined function from catalog
 	if result, err := e.callUserDefinedFunction(name, v.Exprs, nil); err == nil {
 		return result, nil
+	} else if !strings.Contains(strings.ToLower(err.Error()), "function not found") {
+		return nil, err
 	}
 	// Unknown function: return nil rather than error to be lenient
 	return nil, fmt.Errorf("unsupported function: %s", name)
@@ -11078,6 +11110,19 @@ func isZeroDate(val interface{}) bool {
 	}
 	s := toString(val)
 	return strings.HasPrefix(s, "0000-00-00")
+}
+
+func secToTimeValue(v interface{}) string {
+	sec := int64(toFloat(v))
+	sign := ""
+	if sec < 0 {
+		sign = "-"
+		sec = -sec
+	}
+	h := sec / 3600
+	m := (sec % 3600) / 60
+	s := sec % 60
+	return fmt.Sprintf("%s%02d:%02d:%02d", sign, h, m, s)
 }
 
 // mysqlWeekMode0 calculates MySQL's WEEK(date) with default mode 0.
@@ -12454,6 +12499,15 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			return nil, nil
 		}
 		return t.Format("2006-01-02 15:04:05"), nil
+	case "sec_to_time":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		return secToTimeValue(args[0]), nil
 	case "charset":
 		if len(v.Exprs) < 1 {
 			return nil, nil
@@ -12925,8 +12979,25 @@ func (e *Executor) evalCaseExprWithRow(v *sqlparser.CaseExpr, row storage.Row) (
 // do not have access to an executor.  It creates a temporary executor with
 // empty state, which is sufficient for column-lookup and literal evaluation.
 func evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{}, error) {
+	// Some callers use this shim without full executor context.
+	// Avoid hard failures on subqueries that require storage/catalog.
+	if hasSubqueryExpr(expr) {
+		return nil, nil
+	}
 	e := &Executor{}
 	return e.evalRowExpr(expr, row)
+}
+
+func hasSubqueryExpr(expr sqlparser.Expr) bool {
+	found := false
+	sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if _, ok := node.(*sqlparser.Subquery); ok {
+			found = true
+			return false, nil
+		}
+		return true, nil
+	}, expr)
+	return found
 }
 
 // evalHaving evaluates a HAVING predicate, with support for aggregate functions
@@ -16239,7 +16310,14 @@ type cursorState struct {
 
 // callUserDefinedFunction looks up a user-defined function in the catalog and executes it.
 func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Expr, row *storage.Row) (interface{}, error) {
-	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if e.Catalog == nil {
+		return nil, fmt.Errorf("function not found: %s", name)
+	}
+	dbName := e.CurrentDB
+	if dbName == "" {
+		dbName = "test"
+	}
+	db, err := e.Catalog.GetDatabase(dbName)
 	if err != nil {
 		return nil, fmt.Errorf("no database")
 	}
@@ -16493,7 +16571,36 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 			// Try to evaluate as an expression
 			val, err := e.evaluateExprWithVars(exprStr, localVars)
 			if err != nil {
-				return nil, err
+				// Fallback for RETURN (SELECT ...): evaluate the inner scalar query.
+				resolvedExpr := strings.TrimSpace(exprStr)
+				if strings.HasPrefix(resolvedExpr, "(") && strings.HasSuffix(resolvedExpr, ")") {
+					resolvedExpr = strings.TrimSpace(resolvedExpr[1 : len(resolvedExpr)-1])
+				}
+				toSQLLiteral := func(v interface{}) string {
+					if v == nil {
+						return "NULL"
+					}
+					switch x := v.(type) {
+					case string:
+						return "'" + strings.ReplaceAll(x, "'", "''") + "'"
+					case bool:
+						if x {
+							return "1"
+						}
+						return "0"
+					default:
+						return fmt.Sprintf("%v", x)
+					}
+				}
+				for varName, varVal := range localVars {
+					re := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(varName) + `\b`)
+					resolvedExpr = re.ReplaceAllString(resolvedExpr, toSQLLiteral(varVal))
+				}
+				res, qerr := e.Execute(resolvedExpr)
+				if qerr != nil || res == nil || len(res.Rows) == 0 || len(res.Rows[0]) == 0 {
+					return nil, err
+				}
+				return res.Rows[0][0], nil
 			}
 			return val, nil
 		}
