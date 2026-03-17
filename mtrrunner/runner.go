@@ -259,6 +259,8 @@ type execContext struct {
 	tmpDir           string         // temporary directory for file operations
 	replaceColumns   map[int]string // column index (1-based) -> replacement value for next query
 	replaceResult    []string       // pairs of [from, to] for --replace_result
+	verticalResult   bool           // format next query result as vertical key/value pairs
+	verticalResults  bool           // persistent vertical output mode (--vertical_results)
 	skipped          bool           // set to true when --skip directive is encountered
 }
 
@@ -489,7 +491,7 @@ func (ctx *execContext) executeLines(lines []string) error {
 			directive := strings.TrimPrefix(trimmed, "--")
 			directive = strings.TrimSpace(directive)
 			name, _ := parseDirectiveNameArgs(directive)
-			if (name == "query" || name == "eval" || name == "query_vertical") &&
+			if (name == "query" || name == "query_vertical") &&
 				!strings.HasSuffix(strings.TrimSpace(trimmed), ";") {
 				fullDirective := directive
 				i++
@@ -552,7 +554,6 @@ func (ctx *execContext) executeLines(lines []string) error {
 				}
 			}
 			if strings.HasPrefix(bdLower, "query ") ||
-				strings.HasPrefix(bdLower, "eval ") ||
 				strings.HasPrefix(bdLower, "query_vertical ") {
 				if !strings.HasSuffix(strings.TrimSpace(trimmed), ";") {
 					fullDirective := bareDirective
@@ -562,6 +563,7 @@ func (ctx *execContext) executeLines(lines []string) error {
 						fullDirective += "\n" + l
 						if strings.HasSuffix(strings.TrimSpace(l), ";") {
 							fullDirective = strings.TrimSuffix(fullDirective, ";")
+							i++ // consume the terminating line so it won't be re-executed as SQL
 							break
 						}
 						i++
@@ -803,6 +805,12 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 	case "enable_result_log":
 		ctx.resultLogEnabled = true
 		return true, false, nil
+	case "vertical_results":
+		ctx.verticalResults = true
+		return true, false, nil
+	case "horizontal_results":
+		ctx.verticalResults = false
+		return true, false, nil
 
 	case "sorted_result":
 		ctx.sortResult = true
@@ -898,12 +906,16 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		return true, false, nil
 
 	case "query", "eval", "query_vertical":
-		// Execute the rest as SQL (query_vertical is just vertical formatting, we ignore)
+		// Execute the rest as SQL. query_vertical uses vertical key/value result formatting.
 		if args != "" {
 			args = stripInlineHashComments(args)
 			args = strings.TrimSpace(args)
 			args = strings.TrimSuffix(args, ";")
+			if name == "query_vertical" {
+				ctx.verticalResult = true
+			}
 			err := ctx.executeSQL(args)
+			ctx.verticalResult = false
 			if err == nil && name == "eval" && ctx.resultLogEnabled &&
 				strings.Contains(strings.ToLower(args), "explain format=tree") {
 				ctx.output.WriteString("\n")
@@ -1023,7 +1035,6 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"system",
 		"die", "exit",
 		"if", "while", "end",
-		"horizontal_results", "vertical_results",
 		"require", "result_format",
 		"disable_reconnect", "enable_reconnect",
 		"disable_abort_on_error", "enable_abort_on_error",
@@ -1465,6 +1476,8 @@ func stripInlineHashComments(stmt string) string {
 }
 
 func (ctx *execContext) executeQuery(stmt string) error {
+	useVertical := ctx.verticalResult || ctx.verticalResults
+
 	activeConn := ctx.getActiveConn()
 	var (
 		rows *sql.Rows
@@ -1507,9 +1520,6 @@ func (ctx *execContext) executeQuery(stmt string) error {
 		return nil
 	}
 
-	// Write column headers
-	ctx.output.WriteString(strings.Join(columns, "\t") + "\n")
-
 	// Collect result rows
 	var resultLines []string
 	for rows.Next() {
@@ -1534,7 +1544,13 @@ func (ctx *execContext) executeQuery(stmt string) error {
 				}
 			}
 		}
-		resultLines = append(resultLines, strings.Join(parts, "\t"))
+		if useVertical {
+			for i, col := range columns {
+				resultLines = append(resultLines, col+"\t"+parts[i])
+			}
+		} else {
+			resultLines = append(resultLines, strings.Join(parts, "\t"))
+		}
 	}
 
 	// Apply --sorted_result
@@ -1551,6 +1567,11 @@ func (ctx *execContext) executeQuery(stmt string) error {
 			resultLines[i] = applyReplaceResult(line, ctx.replaceResult)
 		}
 		ctx.replaceResult = nil
+	}
+
+	if !useVertical {
+		// Write column headers for regular (horizontal) results.
+		ctx.output.WriteString(strings.Join(columns, "\t") + "\n")
 	}
 
 	for _, line := range resultLines {
