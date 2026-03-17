@@ -104,6 +104,19 @@ func main() {
 
 	// Check if it's a direct .test file path
 	if strings.HasSuffix(target, ".test") {
+		// Add suite-specific include paths for direct test execution as well.
+		suiteDir := filepath.Dir(filepath.Dir(target))
+		suiteInclude := filepath.Join(suiteDir, "include")
+		if _, err := os.Stat(suiteInclude); err == nil {
+			runner.IncludePaths = append(runner.IncludePaths, suiteInclude)
+		}
+		suiteTestDir := filepath.Join(suiteDir, "t")
+		if _, err := os.Stat(suiteTestDir); err == nil {
+			runner.IncludePaths = append(runner.IncludePaths, suiteTestDir)
+		}
+		runner.IncludePaths = append(runner.IncludePaths, *suiteRoot)
+		exec.SearchPaths = append(exec.SearchPaths, runner.IncludePaths...)
+
 		result := runner.RunFile(target)
 		printResult(result, *verbose)
 		if !result.Passed && !result.Skipped {
