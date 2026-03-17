@@ -471,7 +471,7 @@ func resetDB(db *sql.DB) {
 		}
 	}
 	for _, d := range databases {
-		if d == "information_schema" || d == "performance_schema" || d == "mysql" || d == "test" {
+		if d == "information_schema" || d == "performance_schema" || d == "mysql" || d == "test" || d == "mtr" || d == "sys" {
 			continue
 		}
 		db.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", d)) //nolint:errcheck
