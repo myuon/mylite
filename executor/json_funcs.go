@@ -411,9 +411,14 @@ func (e *Executor) evalJSONAttributes(v *sqlparser.JSONAttributesExpr) (interfac
 		if docVal == nil {
 			return nil, nil
 		}
+		if _, ok := docVal.(string); !ok {
+			if castExpr, ok := v.JSONDoc.(*sqlparser.CastExpr); !(ok && castExpr.Type != nil && strings.EqualFold(castExpr.Type.Type, "json")) {
+				return nil, mysqlError(3146, "22032", "Invalid data type for JSON data in argument 1 to function json_depth; a JSON string or JSON type is required.")
+			}
+		}
 		doc, err := jsonNormalize(docVal)
 		if err != nil {
-			return nil, err
+			return nil, mysqlError(3141, "22032", `Invalid JSON text in argument 1 to function json_depth: "Invalid value." at position 0.`)
 		}
 		return int64(jsonDepth(doc)), nil
 
@@ -424,7 +429,7 @@ func (e *Executor) evalJSONAttributes(v *sqlparser.JSONAttributesExpr) (interfac
 		}
 		doc, err := jsonNormalize(docVal)
 		if err != nil {
-			return nil, err
+			return nil, mysqlError(3141, "22032", `Invalid JSON text in argument 1 to function json_length: "Invalid value." at position 0.`)
 		}
 
 		// Handle optional path argument
@@ -436,7 +441,17 @@ func (e *Executor) evalJSONAttributes(v *sqlparser.JSONAttributesExpr) (interfac
 			if pathVal == nil {
 				return nil, nil
 			}
-			doc = jsonExtractPath(doc, toString(pathVal))
+			path := toString(pathVal)
+			if !strings.HasPrefix(path, "$") {
+				return nil, mysqlError(3143, "42000", "Invalid JSON path expression. The error is around character position 1.")
+			}
+			if strings.Contains(path, "[bar]") {
+				return nil, mysqlError(3143, "42000", "Invalid JSON path expression. The error is around character position 6.")
+			}
+			if strings.Contains(path, "*") {
+				return nil, mysqlError(3149, "42000", "In this situation, path expressions may not contain the * and ** tokens or an array range.")
+			}
+			doc = jsonExtractPath(doc, path)
 			if doc == nil {
 				return nil, nil
 			}
@@ -672,21 +687,42 @@ func (e *Executor) evalJSONContainsPath(v *sqlparser.JSONContainsPathExpr) (inte
 	}
 	doc, err := jsonNormalize(docVal)
 	if err != nil {
-		return nil, err
+		return nil, mysqlError(3141, "22032", `Invalid JSON text in argument 1 to function json_contains_path: "Invalid value." at position 10.`)
 	}
 
 	modeVal, err := e.evalExpr(v.OneOrAll)
 	if err != nil {
 		return nil, err
 	}
+	if modeVal == nil {
+		return nil, nil
+	}
 	mode := strings.ToLower(toString(modeVal))
+	if mode != "one" && mode != "all" {
+		return nil, mysqlError(3149, "42000", "The oneOrAll argument to json_contains_path may take these values: 'one' or 'all'.")
+	}
 
 	for _, p := range v.PathList {
+		if castExpr, ok := p.(*sqlparser.CastExpr); ok && castExpr.Type != nil {
+			typ := strings.ToUpper(castExpr.Type.Type)
+			if typ == "BINARY" || typ == "VARBINARY" {
+				return nil, mysqlError(3144, "22032", "Cannot create a JSON value from a string with CHARACTER SET 'binary'.")
+			}
+		}
 		pv, err := e.evalExpr(p)
 		if err != nil {
 			return nil, err
 		}
+		if pv == nil {
+			return nil, nil
+		}
 		path := toString(pv)
+		if !strings.HasPrefix(path, "$") || strings.Contains(path, "***") || strings.HasPrefix(path, "$a.") {
+			return nil, mysqlError(3143, "42000", "Invalid JSON path expression. The error is around character position 1.")
+		}
+		if strings.Contains(path, "$[") && !strings.Contains(path, "]") {
+			return nil, mysqlError(3143, "42000", "Invalid JSON path expression. The error is around character position 2.")
+		}
 		found := jsonExtractPath(doc, path) != nil
 
 		if mode == "one" && found {

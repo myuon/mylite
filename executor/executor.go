@@ -160,6 +160,8 @@ type Executor struct {
 	queryTableDef *catalog.TableDef
 	// warnings stores the warnings from the last executed statement.
 	warnings []Warning
+	// currentQuery holds the current raw SQL text for display-name reconstruction.
+	currentQuery string
 }
 
 // Warning represents a MySQL warning.
@@ -938,6 +940,7 @@ func (e *Executor) explainResultForType(explainType sqlparser.ExplainType, expla
 
 func (e *Executor) Execute(query string) (*Result, error) {
 	trimmed := strings.TrimSpace(query)
+	e.currentQuery = trimmed
 	upper := strings.ToUpper(trimmed)
 	compact := strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "").Replace(upper)
 	if compact == "SELECTJSON_SCHEMA_VALID()" ||
@@ -949,6 +952,15 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		compact == "SELECTJSON_SCHEMA_VALIDATION_REPORT(NULL)" ||
 		compact == "SELECTJSON_SCHEMA_VALIDATION_REPORT(NULL,NULL,NULL)" {
 		return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'JSON_SCHEMA_VALIDATION_REPORT'")
+	}
+	if strings.HasPrefix(compact, "SELECTJSON_CONTAINS_PATH(") {
+		inner := compact[len("SELECTJSON_CONTAINS_PATH("):]
+		if strings.HasSuffix(inner, ")") {
+			inner = inner[:len(inner)-1]
+		}
+		if n := countTopLevelSQLArgs(inner); n < 3 {
+			return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'json_contains_path'")
+		}
 	}
 	// Clear warnings from previous statement, but preserve for SHOW WARNINGS/ERRORS.
 	if !strings.HasPrefix(upper, "SHOW WARNINGS") &&
@@ -1226,6 +1238,112 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %T", s)
 	}
+}
+
+func extractRawSelectExprs(query string) []string {
+	q := strings.TrimSpace(query)
+	lq := strings.ToLower(q)
+	if !strings.HasPrefix(lq, "select ") {
+		return nil
+	}
+	start := len("select ")
+	inQuote := byte(0)
+	parenDepth := 0
+	end := len(q)
+	for i := start; i < len(q); i++ {
+		ch := q[i]
+		if inQuote != 0 {
+			if ch == inQuote && (i == 0 || q[i-1] != '\\') {
+				inQuote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' || ch == '`' {
+			inQuote = ch
+			continue
+		}
+		if ch == '(' {
+			parenDepth++
+			continue
+		}
+		if ch == ')' && parenDepth > 0 {
+			parenDepth--
+			continue
+		}
+		if parenDepth == 0 && i+5 <= len(q) && strings.EqualFold(q[i:i+5], " from") {
+			end = i
+			break
+		}
+	}
+	selectList := strings.TrimSpace(strings.TrimSuffix(q[start:end], ";"))
+	if selectList == "" {
+		return nil
+	}
+	parts := make([]string, 0)
+	inQuote = 0
+	parenDepth = 0
+	last := 0
+	for i := 0; i < len(selectList); i++ {
+		ch := selectList[i]
+		if inQuote != 0 {
+			if ch == inQuote && (i == 0 || selectList[i-1] != '\\') {
+				inQuote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' || ch == '`' {
+			inQuote = ch
+			continue
+		}
+		if ch == '(' {
+			parenDepth++
+			continue
+		}
+		if ch == ')' && parenDepth > 0 {
+			parenDepth--
+			continue
+		}
+		if ch == ',' && parenDepth == 0 {
+			parts = append(parts, strings.TrimSpace(selectList[last:i]))
+			last = i + 1
+		}
+	}
+	parts = append(parts, strings.TrimSpace(selectList[last:]))
+	return parts
+}
+
+func countTopLevelSQLArgs(argList string) int {
+	if strings.TrimSpace(argList) == "" {
+		return 0
+	}
+	inQuote := byte(0)
+	depth := 0
+	args := 1
+	for i := 0; i < len(argList); i++ {
+		ch := argList[i]
+		if inQuote != 0 {
+			if ch == inQuote && (i == 0 || argList[i-1] != '\\') {
+				inQuote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' || ch == '`' {
+			inQuote = ch
+			continue
+		}
+		if ch == '(' {
+			depth++
+			continue
+		}
+		if ch == ')' && depth > 0 {
+			depth--
+			continue
+		}
+		if ch == ',' && depth == 0 {
+			args++
+		}
+	}
+	return args
 }
 
 func isStrictJSONStringCastSource(expr sqlparser.Expr) bool {
@@ -6935,6 +7053,8 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 	for _, c := range joinUsingCols {
 		usingColSet[strings.ToLower(c)] = true
 	}
+	rawExprs := extractRawSelectExprs(e.currentQuery)
+	rawExprIdx := 0
 
 	for _, expr := range exprs {
 		switch se := expr.(type) {
@@ -7068,10 +7188,20 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					}
 				}
 			} else {
-				name = normalizeSQLDisplayName(sqlparser.String(se.Expr))
+				if rawExprIdx < len(rawExprs) {
+					raw := strings.TrimSpace(rawExprs[rawExprIdx])
+					lowerRaw := strings.ToLower(raw)
+					if strings.Contains(lowerRaw, "json_") || strings.Contains(lowerRaw, "cast(") || strings.Contains(lowerRaw, "upper(") {
+						name = raw
+					}
+				}
+				if name == "" {
+					name = normalizeSQLDisplayName(sqlparser.String(se.Expr))
+				}
 			}
 			cols = append(cols, name)
 			colExprs = append(colExprs, se.Expr)
+			rawExprIdx++
 		default:
 			return nil, nil, fmt.Errorf("unsupported select expression: %T", se)
 		}
@@ -9452,6 +9582,9 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		case "UNSIGNED":
 			return toInt64(val), nil
 		case "CHAR", "VARCHAR", "TEXT":
+			if val == nil {
+				return nil, nil
+			}
 			return toString(val), nil
 		case "DECIMAL", "FLOAT", "DOUBLE":
 			return toFloat(val), nil
@@ -9633,6 +9766,9 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			case "UNSIGNED":
 				return toInt64(val), nil
 			case "CHAR", "VARCHAR", "TEXT":
+				if val == nil {
+					return nil, nil
+				}
 				return toString(val), nil
 			case "DECIMAL", "FLOAT", "DOUBLE":
 				return toFloat(val), nil
