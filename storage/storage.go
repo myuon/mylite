@@ -309,7 +309,9 @@ func (t *Table) Scan() []Row {
 	copy(result, t.Rows)
 	// InnoDB table scans are clustered by PRIMARY KEY.
 	// Keep scan order deterministic and MySQL-compatible for tests that rely on it.
-	if t.Def != nil && len(t.Def.PrimaryKey) > 0 && len(result) > 1 {
+	// Skip sorting for charsets where Go's byte-order comparison does not match
+	// the MySQL collation order (e.g. sjis, cp932, ujis, eucjpms).
+	if t.Def != nil && len(t.Def.PrimaryKey) > 0 && len(result) > 1 && !hasNonSortableCharset(t.Def.Charset) {
 		pkCols := append([]string(nil), t.Def.PrimaryKey...)
 		sort.SliceStable(result, func(i, j int) bool {
 			ri, rj := result[i], result[j]
@@ -393,6 +395,18 @@ func toComparableFloat(v interface{}) (float64, bool) {
 		}
 	}
 	return 0, false
+}
+
+// hasNonSortableCharset returns true when the table uses a character set whose
+// collation order cannot be approximated by Go's default byte-level string
+// comparison.  For these charsets we fall back to insertion order instead of
+// attempting an incorrect PK sort.
+func hasNonSortableCharset(cs string) bool {
+	switch strings.ToLower(cs) {
+	case "sjis", "cp932", "ujis", "eucjpms", "euckr", "gb2312", "gbk", "gb18030", "big5":
+		return true
+	}
+	return false
 }
 
 // Truncate removes all rows and resets AUTO_INCREMENT.
