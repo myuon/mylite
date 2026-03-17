@@ -1068,7 +1068,11 @@ func castToJSONValue(val interface{}, strictStringLiteral bool) (interface{}, er
 		var js interface{}
 		if err := json.Unmarshal([]byte(v), &js); err != nil {
 			if strictStringLiteral {
-				return nil, mysqlError(3141, "22032", `Invalid JSON text in argument 1 to function cast_as_json: "Invalid value." at position 0.`)
+				pos := 0
+				if serr, ok := err.(*json.SyntaxError); ok && serr.Offset > 0 {
+					pos = int(serr.Offset - 1)
+				}
+				return nil, mysqlError(3141, "22032", fmt.Sprintf(`Invalid JSON text in argument 1 to function cast_as_json: "Invalid value." at position %d.`, pos))
 			}
 			b, _ := json.Marshal(v)
 			return string(b), nil
@@ -1079,7 +1083,11 @@ func castToJSONValue(val interface{}, strictStringLiteral bool) (interface{}, er
 		var js interface{}
 		if err := json.Unmarshal([]byte(s), &js); err != nil {
 			if strictStringLiteral {
-				return nil, mysqlError(3141, "22032", `Invalid JSON text in argument 1 to function cast_as_json: "Invalid value." at position 0.`)
+				pos := 0
+				if serr, ok := err.(*json.SyntaxError); ok && serr.Offset > 0 {
+					pos = int(serr.Offset - 1)
+				}
+				return nil, mysqlError(3141, "22032", fmt.Sprintf(`Invalid JSON text in argument 1 to function cast_as_json: "Invalid value." at position %d.`, pos))
 			}
 			b, _ := json.Marshal(s)
 			return string(b), nil

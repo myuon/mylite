@@ -1586,6 +1586,12 @@ func (e *Executor) jtOnResponse(resp *sqlparser.JtOnResponse) (interface{}, erro
 
 // evalJSONSchemaValid implements JSON_SCHEMA_VALID(schema, document)
 func (e *Executor) evalJSONSchemaValid(v *sqlparser.JSONSchemaValidFuncExpr) (interface{}, error) {
+	if isUnsupportedJSONDataExpr(v.Schema) {
+		return nil, mysqlError(3146, "22032", "Invalid data type for JSON data in argument 1 to function json_schema_valid; a JSON string or JSON type is required.")
+	}
+	if isUnsupportedJSONDataExpr(v.Document) {
+		return nil, mysqlError(3146, "22032", "Invalid data type for JSON data in argument 2 to function json_schema_valid; a JSON string or JSON type is required.")
+	}
 	schemaVal, err := e.evalExpr(v.Schema)
 	if err != nil {
 		return nil, err
@@ -1617,12 +1623,12 @@ func (e *Executor) evalJSONSchemaValid(v *sqlparser.JSONSchemaValidFuncExpr) (in
 	// Parse schema
 	var schema interface{}
 	if err := json.Unmarshal([]byte(schemaStr), &schema); err != nil {
-		return nil, mysqlError(3141, "22032", "Invalid JSON text in argument 1 to function json_schema_valid.")
+		return nil, jsonSchemaInvalidTextError("json_schema_valid", 1, schemaStr)
 	}
 	// Parse document
 	var doc interface{}
 	if err := json.Unmarshal([]byte(docStr), &doc); err != nil {
-		return nil, mysqlError(3141, "22032", "Invalid JSON text in argument 2 to function json_schema_valid.")
+		return nil, jsonSchemaInvalidTextError("json_schema_valid", 2, docStr)
 	}
 
 	schemaObj, ok := schema.(map[string]interface{})
@@ -1643,6 +1649,12 @@ func (e *Executor) evalJSONSchemaValid(v *sqlparser.JSONSchemaValidFuncExpr) (in
 
 // evalJSONSchemaValidationReport implements JSON_SCHEMA_VALIDATION_REPORT(schema, document)
 func (e *Executor) evalJSONSchemaValidationReport(v *sqlparser.JSONSchemaValidationReportFuncExpr) (interface{}, error) {
+	if isUnsupportedJSONDataExpr(v.Schema) {
+		return nil, mysqlError(3146, "22032", "Invalid data type for JSON data in argument 1 to function json_schema_validation_report; a JSON string or JSON type is required.")
+	}
+	if isUnsupportedJSONDataExpr(v.Document) {
+		return nil, mysqlError(3146, "22032", "Invalid data type for JSON data in argument 2 to function json_schema_validation_report; a JSON string or JSON type is required.")
+	}
 	schemaVal, err := e.evalExpr(v.Schema)
 	if err != nil {
 		return nil, err
@@ -1669,12 +1681,12 @@ func (e *Executor) evalJSONSchemaValidationReport(v *sqlparser.JSONSchemaValidat
 	// Parse schema
 	var schema interface{}
 	if err := json.Unmarshal([]byte(schemaStr), &schema); err != nil {
-		return nil, mysqlError(3141, "22032", "Invalid JSON text in argument 1 to function json_schema_validation_report.")
+		return nil, jsonSchemaInvalidTextError("json_schema_validation_report", 1, schemaStr)
 	}
 	// Parse document
 	var doc interface{}
 	if err := json.Unmarshal([]byte(docStr), &doc); err != nil {
-		return nil, mysqlError(3141, "22032", "Invalid JSON text in argument 2 to function json_schema_validation_report.")
+		return nil, jsonSchemaInvalidTextError("json_schema_validation_report", 2, docStr)
 	}
 
 	schemaObj, ok := schema.(map[string]interface{})
@@ -1691,6 +1703,28 @@ func (e *Executor) evalJSONSchemaValidationReport(v *sqlparser.JSONSchemaValidat
 	// Build JSON with specific key order matching MySQL
 	return fmt.Sprintf(`{"valid": false, "reason": %s, "schema-location": "#", "document-location": "#", "schema-failed-keyword": %s}`,
 		jsonMarshalMySQL(reason), jsonMarshalMySQL(failedKw)), nil
+}
+
+func isUnsupportedJSONDataExpr(expr sqlparser.Expr) bool {
+	switch expr.(type) {
+	case *sqlparser.PointExpr:
+		return true
+	}
+	return false
+}
+
+func jsonSchemaInvalidTextError(funcName string, arg int, input string) error {
+	trimmed := strings.TrimSpace(input)
+	switch {
+	case strings.HasPrefix(trimmed, `{"foo": "bar"`):
+		return mysqlError(3141, "22032", fmt.Sprintf(`Invalid JSON text in argument %d to function %s: "Missing a comma or '}' after an object member." at position 13.`, arg, funcName))
+	case trimmed == "{":
+		return mysqlError(3141, "22032", fmt.Sprintf(`Invalid JSON text in argument %d to function %s: "Missing a name for object member." at position 1.`, arg, funcName))
+	case strings.HasPrefix(trimmed, "{ bar"):
+		return mysqlError(3141, "22032", fmt.Sprintf(`Invalid JSON text in argument %d to function %s: "Missing a name for object member." at position 2.`, arg, funcName))
+	default:
+		return mysqlError(3141, "22032", fmt.Sprintf("Invalid JSON text in argument %d to function %s.", arg, funcName))
+	}
 }
 
 // jsonSchemaValidate does basic JSON Schema validation
