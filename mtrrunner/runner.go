@@ -764,6 +764,9 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 	case "query", "eval", "query_vertical":
 		// Execute the rest as SQL (query_vertical is just vertical formatting, we ignore)
 		if args != "" {
+			args = stripInlineHashComments(args)
+			args = strings.TrimSpace(args)
+			args = strings.TrimSuffix(args, ";")
 			err := ctx.executeSQL(args)
 			return true, false, err
 		}
@@ -1182,6 +1185,24 @@ func (ctx *execContext) executeSQLInner(stmt string) error {
 		return ctx.executeQuery(stmt)
 	}
 	return ctx.executeExec(stmt)
+}
+
+func stripInlineHashComments(stmt string) string {
+	lines := strings.Split(stmt, "\n")
+	for i, l := range lines {
+		if idx := strings.Index(l, " #"); idx >= 0 {
+			inStr := false
+			for j := 0; j < idx; j++ {
+				if l[j] == '\'' {
+					inStr = !inStr
+				}
+			}
+			if !inStr {
+				lines[i] = l[:idx]
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (ctx *execContext) executeQuery(stmt string) error {

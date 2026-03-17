@@ -716,6 +716,13 @@ func normalizeMemberOperator(query string) string {
 	return re.ReplaceAllString(query, "MEMBER OF (")
 }
 
+// normalizeJSONTableDefaultOrder rewrites JSON_TABLE path-column clauses where
+// ON ERROR appears before ON EMPTY, since the parser expects ON EMPTY first.
+func normalizeJSONTableDefaultOrder(query string) string {
+	re := regexp.MustCompile(`(?is)(default\s+'[^']*'\s+on\s+error)\s+(default\s+'[^']*'\s+on\s+empty)`)
+	return re.ReplaceAllString(query, "${2} ${1}")
+}
+
 func (e *Executor) dummyExplainRow(query string) []interface{} {
 	upper := strings.ToUpper(query)
 	var table interface{} = nil
@@ -985,6 +992,7 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	// Rewrite to "ADD KEY (col)" since BTREE is the default for InnoDB.
 	query = normalizeAddIndexUsing(query)
 	query = normalizeMemberOperator(query)
+	query = normalizeJSONTableDefaultOrder(query)
 	trimmed = strings.TrimSpace(query)
 	upper = strings.ToUpper(trimmed)
 	// Multi-value index does not allow explicit ASC/DESC on key part.
@@ -5596,6 +5604,44 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 		alias := te.Alias.String()
 		if alias == "" {
 			alias = "json_table"
+		}
+		// Validate default ON EMPTY/ON ERROR values for non-JSON path columns.
+		for _, c := range te.Columns {
+			if c.JtPath == nil || c.JtPath.JtColExists {
+				continue
+			}
+			colType := strings.ToLower(sqlparser.String(c.JtPath.Type))
+			if strings.HasPrefix(colType, "json") {
+				continue
+			}
+			checkResp := func(resp *sqlparser.JtOnResponse) error {
+				if resp == nil || resp.ResponseType != sqlparser.DefaultJSONType || resp.Expr == nil {
+					return nil
+				}
+				v, err := e.evalExpr(resp.Expr)
+				if err != nil || v == nil {
+					return nil
+				}
+				s := toString(v)
+				if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
+					s = s[1 : len(s)-1]
+				}
+				var js interface{}
+				if err := json.Unmarshal([]byte(s), &js); err != nil {
+					return nil
+				}
+				switch js.(type) {
+				case []interface{}, map[string]interface{}:
+					return mysqlError(1067, "42000", fmt.Sprintf("Invalid default value for '%s'", c.JtPath.Name.String()))
+				}
+				return nil
+			}
+			if err := checkResp(c.JtPath.EmptyOnResponse); err != nil {
+				return nil, err
+			}
+			if err := checkResp(c.JtPath.ErrorOnResponse); err != nil {
+				return nil, err
+			}
 		}
 		colOrder := make([]string, 0, len(te.Columns))
 		for _, c := range te.Columns {
