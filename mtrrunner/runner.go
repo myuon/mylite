@@ -465,6 +465,7 @@ func (ctx *execContext) executeLines(lines []string) error {
 		// Handle bare directives (without -- prefix): eval, let, echo, source, skip,
 		// enable_warnings, disable_warnings, etc.
 		if bareDirective, ok := extractBareDirective(trimmed); ok {
+			advancedLine := false
 			// For 'let' directives, collect multiline values until ';'
 			// but only if the value doesn't end with a backtick (single-line query)
 			bdLower := strings.ToLower(bareDirective)
@@ -491,6 +492,7 @@ func (ctx *execContext) executeLines(lines []string) error {
 						}
 					}
 					bareDirective = fullDirective
+					advancedLine = true
 				}
 			}
 			handled, skip, err := ctx.handleDirective(bareDirective)
@@ -501,7 +503,9 @@ func (ctx *execContext) executeLines(lines []string) error {
 				return errSkipTest
 			}
 			if handled {
-				i++
+				if !advancedLine {
+					i++
+				}
 				continue
 			}
 		}
