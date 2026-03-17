@@ -562,8 +562,10 @@ func (ctx *execContext) executeLines(lines []string) error {
 			// For echoing: if inside a string literal, preserve leading whitespace.
 			// Otherwise, trim leading whitespace (mysqltest behavior).
 			var rawEcho string
+			stmtLine := t
 			if inStringLiteral {
 				rawEcho = stripCommentAfterDelimiter(strings.TrimRight(l, " \t\r\n"), delim)
+				stmtLine = strings.TrimRight(l, " \t\r\n")
 			} else {
 				rawEcho = stripCommentAfterDelimiter(t, delim)
 			}
@@ -584,7 +586,10 @@ func (ctx *execContext) executeLines(lines []string) error {
 				}
 			}
 			// Strip inline comments (# outside quotes) for SQL processing
-			t = stripInlineComment(t)
+			if !inStringLiteral {
+				t = stripInlineComment(t)
+				stmtLine = t
+			}
 
 			// When using a custom delimiter, check if this line is a DELIMITER directive
 			// that happens to end with the current delimiter (e.g., "DELIMITER ;//" when delim is "//")
@@ -619,11 +624,11 @@ func (ctx *execContext) executeLines(lines []string) error {
 			originalTrimmed := strings.TrimSpace(l)
 			hasDelim := strings.HasSuffix(t, delim) || strings.HasSuffix(originalTrimmed, delim)
 			if hasDelim {
-				stmt += strings.TrimSuffix(t, delim)
+				stmt += strings.TrimSuffix(stmtLine, delim)
 				i++
 				break
 			}
-			stmt += t + "\n"
+			stmt += stmtLine + "\n"
 			i++
 		}
 

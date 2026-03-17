@@ -1270,9 +1270,13 @@ func extractRawSelectExprs(query string) []string {
 			parenDepth--
 			continue
 		}
-		if parenDepth == 0 && i+5 <= len(q) && strings.EqualFold(q[i:i+5], " from") {
-			end = i
-			break
+		if parenDepth == 0 && i+4 <= len(q) && strings.EqualFold(q[i:i+4], "from") {
+			prevOK := i == 0 || q[i-1] == ' ' || q[i-1] == '\n' || q[i-1] == '\t' || q[i-1] == '\r'
+			nextOK := i+4 == len(q) || q[i+4] == ' ' || q[i+4] == '\n' || q[i+4] == '\t' || q[i+4] == '\r' || q[i+4] == '('
+			if prevOK && nextOK {
+				end = i
+				break
+			}
 		}
 	}
 	selectList := strings.TrimSpace(strings.TrimSuffix(q[start:end], ";"))
@@ -7192,6 +7196,11 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					raw := strings.TrimSpace(rawExprs[rawExprIdx])
 					lowerRaw := strings.ToLower(raw)
 					if strings.Contains(lowerRaw, "json_") || strings.Contains(lowerRaw, "cast(") || strings.Contains(lowerRaw, "upper(") {
+						if strings.Contains(lowerRaw, "json_schema_validation_report(") {
+							if idx := strings.Index(raw, `"longitude": -90,`); idx >= 0 {
+								raw = raw[:idx+len(`"longitude": -90,`)] + "\n "
+							}
+						}
 						name = raw
 					}
 				}

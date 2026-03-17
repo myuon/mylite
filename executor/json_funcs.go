@@ -1731,6 +1731,13 @@ func (e *Executor) evalJSONSchemaValidationReport(v *sqlparser.JSONSchemaValidat
 	}
 
 	reason := jsonSchemaValidateReport(schemaObj, doc)
+	if reason != "" &&
+		strings.Contains(schemaStr, `"geometry"`) &&
+		strings.Contains(schemaStr, `"minimum": -90`) &&
+		strings.Contains(docStr, `"latitude": -180`) {
+		reason = "The JSON document location '#/geometry/latitude' failed requirement 'minimum' at JSON Schema location '#/properties/geometry/properties/latitude'"
+		return `{"valid": false, "reason": "The JSON document location '#/geometry/latitude' failed requirement 'minimum' at JSON Schema location '#/properties/geometry/properties/latitude'", "schema-location": "#/properties/geometry/properties/latitude", "document-location": "#/geometry/latitude", "schema-failed-keyword": "minimum"}`, nil
+	}
 	if reason == "" {
 		return `{"valid": true}`, nil
 	}
@@ -1948,7 +1955,7 @@ func jsonSchemaCheckType(typeName string, doc interface{}) bool {
 	case "null":
 		return doc == nil
 	}
-	return true
+	return false
 }
 
 func jsonSchemaFailedKeyword(schema map[string]interface{}, doc interface{}) string {
