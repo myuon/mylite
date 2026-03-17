@@ -768,6 +768,10 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 			args = strings.TrimSpace(args)
 			args = strings.TrimSuffix(args, ";")
 			err := ctx.executeSQL(args)
+			if err == nil && name == "eval" && ctx.resultLogEnabled &&
+				strings.Contains(strings.ToLower(args), "explain format=tree") {
+				ctx.output.WriteString("\n")
+			}
 			return true, false, err
 		}
 		return true, false, nil
