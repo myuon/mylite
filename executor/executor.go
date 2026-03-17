@@ -8409,17 +8409,21 @@ func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 }
 
 func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
-	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	dbName := e.CurrentDB
+	if !stmt.Table.Qualifier.IsEmpty() {
+		dbName = stmt.Table.Qualifier.String()
+	}
+	db, err := e.Catalog.GetDatabase(dbName)
 	if err != nil {
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
 	}
 
 	tableName := stmt.Table.Name.String()
 
 	// Ensure the storage table exists.
-	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
+	tbl, err := e.Storage.GetTable(dbName, tableName)
 	if err != nil {
-		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", dbName, tableName))
 	}
 
 	for _, opt := range stmt.AlterOptions {
@@ -8675,7 +8679,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			// Get the current table def
 			def, getErr := db.GetTable(tableName)
 			if getErr != nil {
-				return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
+				return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", dbName, tableName))
 			}
 			// Check new name doesn't already exist
 			if _, getErr := db.GetTable(newName); getErr == nil {
@@ -8686,15 +8690,15 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			db.DropTable(tableName) //nolint:errcheck
 			db.CreateTable(def)     //nolint:errcheck
 			// Rename in storage
-			e.Storage.CreateTable(e.CurrentDB, def)
-			if newTbl, getErr := e.Storage.GetTable(e.CurrentDB, newName); getErr == nil {
+			e.Storage.CreateTable(dbName, def)
+			if newTbl, getErr := e.Storage.GetTable(dbName, newName); getErr == nil {
 				newTbl.Rows = tbl.Rows
 				newTbl.AutoIncrement.Store(tbl.AutoIncrementValue())
 			}
-			e.Storage.DropTable(e.CurrentDB, tableName)
+			e.Storage.DropTable(dbName, tableName)
 			// Update tableName for any subsequent ALTER operations
 			tableName = newName
-			tbl, _ = e.Storage.GetTable(e.CurrentDB, newName)
+			tbl, _ = e.Storage.GetTable(dbName, newName)
 
 		default:
 			// Unsupported ALTER option — ignore silently to stay compatible.
