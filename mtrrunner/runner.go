@@ -688,13 +688,11 @@ func (ctx *execContext) executeLines(lines []string) error {
 func (ctx *execContext) handleDirective(directive string) (handled bool, skip bool, err error) {
 	lower := strings.ToLower(directive)
 
-	// Parse directive name and args
-	parts := strings.SplitN(directive, " ", 2)
-	name := strings.ToLower(parts[0])
-	args := ""
-	if len(parts) > 1 {
-		args = strings.TrimSpace(parts[1])
-	}
+	// Parse directive name and args. mysqltest allows forms like:
+	//   --connect(...)
+	//   --reap;
+	// in addition to the usual "--name args".
+	name, args := parseDirectiveNameArgs(directive)
 
 	switch name {
 	case "skip":
@@ -879,7 +877,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"disable_view_protocol", "enable_view_protocol",
 		"disable_session_track_info", "enable_session_track_info",
 		"connect", "connection", "disconnect",
-		"send", "reap", "sleep",
+		"send", "reap", "sleep", "send_shutdown",
 		"replace_regex",
 		"write_file", "append_file", "cat_file",
 		"mkdir", "rmdir", "move_file",
@@ -1770,13 +1768,15 @@ var directiveKeywords = map[string]bool{
 	"disable_metadata": true, "enable_metadata": true,
 	"disable_info": true, "enable_info": true,
 	"shutdown_server":   true,
+	"send_shutdown":     true,
 	"disable_reconnect": true, "enable_reconnect": true,
 	"query_vertical": true,
+	"require": true,
 }
 
 func isDirectiveKeyword(s string) bool {
-	parts := strings.SplitN(strings.ToLower(s), " ", 2)
-	return directiveKeywords[parts[0]]
+	name, _ := parseDirectiveNameArgs(s)
+	return directiveKeywords[name]
 }
 
 // barePrefixKeywords are mysqltest commands that may appear without a leading "--".
@@ -1785,6 +1785,7 @@ var barePrefixKeywords = []string{
 	"let ",
 	"echo ",
 	"source ",
+	"require ",
 	"delimiter ",
 	"skip",
 	"exit",
@@ -1878,7 +1879,45 @@ func extractBareDirective(trimmed string) (string, bool) {
 			return stripped, true
 		}
 	}
+
+	// Also support bare parenthesized form, e.g.:
+	//   connect(con1,localhost,root,,test);
+	//   connection(default);
+	name, args := parseDirectiveNameArgs(stripped)
+	if name != "" && directiveKeywords[name] && strings.HasPrefix(strings.TrimSpace(lower), name+"(") {
+		if args != "" {
+			return name + " " + args, true
+		}
+		return name, true
+	}
 	return "", false
+}
+
+func parseDirectiveNameArgs(directive string) (name, args string) {
+	d := strings.TrimSpace(directive)
+	if d == "" {
+		return "", ""
+	}
+
+	// Support parenthesized forms like "connect(...)".
+	// If both '(' and whitespace exist, whichever appears first defines the split.
+	wsIdx := strings.IndexAny(d, " \t")
+	parIdx := strings.IndexByte(d, '(')
+	if parIdx >= 0 && (wsIdx < 0 || parIdx < wsIdx) {
+		name = strings.ToLower(strings.TrimSpace(d[:parIdx]))
+		args = strings.TrimSpace(d[parIdx:])
+		return strings.TrimRight(name, ";"), args
+	}
+
+	// Otherwise prefer the first whitespace separator when present.
+	if wsIdx >= 0 {
+		name = strings.ToLower(strings.TrimSpace(d[:wsIdx]))
+		args = strings.TrimSpace(d[wsIdx+1:])
+		return strings.TrimRight(name, ";"), args
+	}
+
+	// Support trailing semicolon in no-arg form, e.g. "reap;".
+	return strings.ToLower(strings.TrimRight(d, ";")), ""
 }
 
 // formatMySQLError formats an error into mysqltest expected format.
