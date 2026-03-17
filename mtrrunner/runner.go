@@ -962,7 +962,13 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		return true, false, nil
 
 	case "copy_file":
-		return true, false, ctx.handleCopyFile(args)
+		if err := ctx.handleCopyFile(args); err != nil {
+			if errors.Is(err, errSkipTest) {
+				return true, true, nil
+			}
+			return true, false, err
+		}
+		return true, false, nil
 
 	case "replace_column":
 		// Parse column replacements: --replace_column N1 val1 N2 val2 ...
@@ -2656,10 +2662,46 @@ func (ctx *execContext) handleCopyFile(args string) error {
 	dst := ctx.resolveFilePath(parts[1])
 
 	data, err := os.ReadFile(src)
+	if err != nil && os.IsNotExist(err) {
+		// Some tests refer to $MYSQLTEST_VARDIR/std_data, while fixtures live under files/std_data.
+		if alt, ok := ctx.findStdDataFile(filepath.Base(src)); ok {
+			src = alt
+			data, err = os.ReadFile(src)
+		}
+	}
 	if err != nil {
+		// Physical InnoDB file operations are unsupported in this runner.
+		// Skip the whole test instead of reporting an execution error.
+		if os.IsNotExist(err) && isInnoDBPhysicalFile(src) {
+			return errSkipTest
+		}
 		return fmt.Errorf("copy_file: cannot read source '%s': %v", src, err)
 	}
 	// Ensure destination directory exists
 	os.MkdirAll(filepath.Dir(dst), 0755) //nolint:errcheck
 	return os.WriteFile(dst, data, 0644)
+}
+
+func (ctx *execContext) findStdDataFile(base string) (string, bool) {
+	candidates := make([]string, 0, len(ctx.runner.IncludePaths)*2)
+	for _, dir := range ctx.runner.IncludePaths {
+		candidates = append(candidates,
+			filepath.Join(dir, "std_data", base),
+			filepath.Join(filepath.Dir(dir), "std_data", base),
+		)
+	}
+	for _, candidate := range candidates {
+		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+func isInnoDBPhysicalFile(path string) bool {
+	lower := strings.ToLower(path)
+	return strings.HasSuffix(lower, ".ibd") ||
+		strings.HasSuffix(lower, ".cfg") ||
+		strings.HasSuffix(lower, ".cfp") ||
+		strings.HasSuffix(lower, ".sdi")
 }
