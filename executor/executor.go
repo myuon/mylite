@@ -14943,6 +14943,12 @@ func applyLimit(limit *sqlparser.Limit, rows [][]interface{}) ([][]interface{}, 
 		offset, _ = off.(int64)
 	}
 
+	if n < 0 {
+		n = 0
+	}
+	if offset < 0 {
+		offset = 0
+	}
 	if offset >= int64(len(rows)) {
 		return [][]interface{}{}, nil
 	}
