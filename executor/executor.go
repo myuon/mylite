@@ -4462,6 +4462,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	hasArrayMVIIndex := false
 	for _, idx := range stmt.TableSpec.Indexes {
 		var idxCols []string
+		var idxOrders []string
 		for _, idxCol := range idx.Columns {
 			if err := validateArrayIndexExpression(idxCol.Expression); err != nil {
 				return nil, err
@@ -4476,6 +4477,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				colStr += fmt.Sprintf("(%d)", *idxCol.Length)
 			}
 			idxCols = append(idxCols, colStr)
+			if idxCol.Direction == sqlparser.DescOrder {
+				idxOrders = append(idxOrders, "DESC")
+			} else {
+				idxOrders = append(idxOrders, "")
+			}
 		}
 		if idx.Info.Type == sqlparser.IndexTypePrimary {
 			primaryKeys = nil
@@ -4490,6 +4496,12 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			}
 		} else {
 			isUnique := idx.Info.Type == sqlparser.IndexTypeUnique
+			idxType := ""
+			if idx.Info.Type == sqlparser.IndexTypeFullText {
+				idxType = "FULLTEXT"
+			} else if idx.Info.Type == sqlparser.IndexTypeSpatial {
+				idxType = "SPATIAL"
+			}
 			idxName := idx.Info.Name.String()
 			if idxName == "" {
 				if cn := idx.Info.ConstraintName.String(); cn != "" {
@@ -4523,7 +4535,9 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			indexes = append(indexes, catalog.IndexDef{
 				Name:    idxName,
 				Columns: idxCols,
+				Orders:  idxOrders,
 				Unique:  isUnique,
+				Type:    idxType,
 				Using:   usingMethod,
 				Comment: idxComment,
 			})
@@ -4596,6 +4610,14 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			collationSpecified = true
 		case "ENGINE":
 			def.Engine = strings.ToUpper(opt.String)
+		case "ROW_FORMAT":
+			def.RowFormat = strings.ToUpper(tableOptionString(opt))
+		case "KEY_BLOCK_SIZE":
+			def.KeyBlockSize = parseTableOptionInt(opt)
+		case "STATS_PERSISTENT":
+			def.StatsPersistent = parseTableOptionInt(opt)
+		case "STATS_AUTO_RECALC":
+			def.StatsAutoRecalc = parseTableOptionInt(opt)
 		}
 	}
 	if hasArrayMVIIndex && def.Engine != "" && !strings.EqualFold(def.Engine, "INNODB") {
@@ -8547,6 +8569,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			}
 			// Store index definition so SHOW CREATE TABLE can display it.
 			var idxCols []string
+			var idxOrders []string
 			for _, idxCol := range op.IndexDefinition.Columns {
 				colStr := idxCol.Column.String()
 				if idxCol.Expression != nil {
@@ -8555,9 +8578,20 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					colStr += fmt.Sprintf("(%d)", *idxCol.Length)
 				}
 				idxCols = append(idxCols, colStr)
+				if idxCol.Direction == sqlparser.DescOrder {
+					idxOrders = append(idxOrders, "DESC")
+				} else {
+					idxOrders = append(idxOrders, "")
+				}
 			}
 			isUnique := op.IndexDefinition.Info.Type == sqlparser.IndexTypeUnique
 			isPrimary := op.IndexDefinition.Info.Type == sqlparser.IndexTypePrimary
+			idxType := ""
+			if op.IndexDefinition.Info.Type == sqlparser.IndexTypeFullText {
+				idxType = "FULLTEXT"
+			} else if op.IndexDefinition.Info.Type == sqlparser.IndexTypeSpatial {
+				idxType = "SPATIAL"
+			}
 			idxName := op.IndexDefinition.Info.Name.String()
 			if idxName == "" {
 				if cn := op.IndexDefinition.Info.ConstraintName.String(); cn != "" {
@@ -8612,7 +8646,9 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				db.AddIndex(tableName, catalog.IndexDef{
 					Name:    idxName,
 					Columns: idxCols,
+					Orders:  idxOrders,
 					Unique:  isUnique,
+					Type:    idxType,
 					Using:   usingMethod,
 					Comment: idxComment,
 				})
@@ -8650,6 +8686,26 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					tableDef, _ := db.GetTable(tableName)
 					if tableDef != nil {
 						tableDef.Comment = comment
+					}
+				case "ROW_FORMAT":
+					tableDef, _ := db.GetTable(tableName)
+					if tableDef != nil {
+						tableDef.RowFormat = strings.ToUpper(tableOptionString(to))
+					}
+				case "KEY_BLOCK_SIZE":
+					tableDef, _ := db.GetTable(tableName)
+					if tableDef != nil {
+						tableDef.KeyBlockSize = parseTableOptionInt(to)
+					}
+				case "STATS_PERSISTENT":
+					tableDef, _ := db.GetTable(tableName)
+					if tableDef != nil {
+						tableDef.StatsPersistent = parseTableOptionInt(to)
+					}
+				case "STATS_AUTO_RECALC":
+					tableDef, _ := db.GetTable(tableName)
+					if tableDef != nil {
+						tableDef.StatsAutoRecalc = parseTableOptionInt(to)
 					}
 				}
 			}
@@ -9273,6 +9329,32 @@ func buildColumnTypeString(ct *sqlparser.ColumnType) string {
 	return s
 }
 
+func tableOptionString(opt *sqlparser.TableOption) string {
+	if opt == nil {
+		return ""
+	}
+	if opt.String != "" {
+		return opt.String
+	}
+	if opt.Value != nil {
+		return opt.Value.Val
+	}
+	return ""
+}
+
+func parseTableOptionInt(opt *sqlparser.TableOption) *int {
+	raw := strings.TrimSpace(tableOptionString(opt))
+	if raw == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return nil
+	}
+	v := n
+	return &v
+}
+
 // mysqlDisplayType returns the MySQL display type with width for SHOW CREATE TABLE.
 func mysqlDisplayType(colType string) string {
 	upper := strings.ToUpper(strings.TrimSpace(colType))
@@ -9354,6 +9436,35 @@ func mysqlDisplayType(colType string) string {
 	}
 }
 
+func isClusterPreferredUniqueIndex(idx catalog.IndexDef, cols []catalog.ColumnDef) bool {
+	if !idx.Unique || len(idx.Columns) == 0 {
+		return false
+	}
+	colByName := make(map[string]catalog.ColumnDef, len(cols))
+	for _, c := range cols {
+		colByName[strings.ToLower(c.Name)] = c
+	}
+	for _, raw := range idx.Columns {
+		c := strings.TrimSpace(raw)
+		if strings.HasPrefix(c, "(") && strings.HasSuffix(c, ")") {
+			return false
+		}
+		if lparen := strings.Index(c, "("); lparen >= 0 {
+			// Prefix-length index parts are not clustered-primary candidates.
+			return false
+		}
+		base := c
+		if fields := strings.Fields(c); len(fields) > 0 {
+			base = fields[0]
+		}
+		def, ok := colByName[strings.ToLower(base)]
+		if !ok || def.Nullable {
+			return false
+		}
+	}
+	return true
+}
+
 func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	showDB := e.CurrentDB
 	if strings.Contains(tableName, ".") {
@@ -9390,6 +9501,7 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		parts = append(parts, mysqlDisplayType(col.Type))
 		colTypeLower := strings.ToLower(col.Type)
 		isTimestamp := strings.HasPrefix(colTypeLower, "timestamp")
+		isGenerated := generatedColumnExpr(col.Type) != ""
 		if !col.Nullable {
 			parts = append(parts, "NOT NULL")
 		} else if isTimestamp {
@@ -9398,7 +9510,7 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		}
 		if col.AutoIncrement {
 			parts = append(parts, "AUTO_INCREMENT")
-		} else if col.Default != nil {
+		} else if !isGenerated && col.Default != nil {
 			defVal := *col.Default
 			// MySQL SHOW CREATE TABLE quotes default values
 			if defVal == "NULL" || defVal == "null" {
@@ -9422,7 +9534,7 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 				defVal = padDecimalDefault(col.Type, defVal)
 				parts = append(parts, fmt.Sprintf("DEFAULT '%s'", defVal))
 			}
-		} else if col.Nullable && !col.DefaultDropped {
+		} else if !isGenerated && col.Nullable && !col.DefaultDropped {
 			// MySQL doesn't show DEFAULT NULL for BLOB/TEXT types
 			isBlobOrText := strings.Contains(colTypeLower, "blob") || strings.Contains(colTypeLower, "text")
 			if !isBlobOrText {
@@ -9433,8 +9545,13 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 			parts = append(parts, fmt.Sprintf("COMMENT '%s'", col.Comment))
 		}
 		colDefs = append(colDefs, strings.Join(parts, " "))
-		if col.PrimaryKey {
-			pkCols = append(pkCols, col.Name)
+	}
+	pkCols = append(pkCols, def.PrimaryKey...)
+	if len(pkCols) == 0 {
+		for _, col := range def.Columns {
+			if col.PrimaryKey {
+				pkCols = append(pkCols, col.Name)
+			}
 		}
 	}
 	if len(pkCols) == 0 {
@@ -9453,7 +9570,14 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	if len(pkCols) > 0 {
 		quotedPK := make([]string, len(pkCols))
 		for i, pk := range pkCols {
-			quotedPK[i] = fmt.Sprintf("`%s`", pk)
+			trimmed := strings.TrimSpace(pk)
+			if strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")") {
+				quotedPK[i] = trimmed
+			} else if lparen := strings.Index(trimmed, "("); lparen >= 0 {
+				quotedPK[i] = fmt.Sprintf("`%s`%s", trimmed[:lparen], trimmed[lparen:])
+			} else {
+				quotedPK[i] = fmt.Sprintf("`%s`", trimmed)
+			}
 		}
 		hasMore := len(def.Indexes) > 0
 		b.WriteString(fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(quotedPK, ",")))
@@ -9462,25 +9586,30 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		}
 		b.WriteString("\n")
 	}
-	// Sort indexes: UNIQUE keys first, then regular keys (MySQL convention)
-	sortedIndexes := make([]catalog.IndexDef, len(def.Indexes))
-	copy(sortedIndexes, def.Indexes)
-	sort.SliceStable(sortedIndexes, func(a, b int) bool {
-		if sortedIndexes[a].Unique != sortedIndexes[b].Unique {
-			return sortedIndexes[a].Unique // unique first
-		}
-		return false // preserve order within same type
+	displayIndexes := make([]catalog.IndexDef, len(def.Indexes))
+	copy(displayIndexes, def.Indexes)
+	sort.SliceStable(displayIndexes, func(i, j int) bool {
+		left := isClusterPreferredUniqueIndex(displayIndexes[i], def.Columns)
+		right := isClusterPreferredUniqueIndex(displayIndexes[j], def.Columns)
+		return left && !right
 	})
-	for i, idx := range sortedIndexes {
+	for i, idx := range displayIndexes {
 		quotedCols := make([]string, len(idx.Columns))
 		for j, c := range idx.Columns {
-			if strings.HasPrefix(c, "(") && strings.HasSuffix(c, ")") {
-				quotedCols[j] = c
-			} else if lparen := strings.Index(c, "("); lparen >= 0 {
+			direction := ""
+			if j < len(idx.Orders) && strings.EqualFold(idx.Orders[j], "DESC") {
+				direction = " DESC"
+			} else if j < len(idx.Orders) && strings.EqualFold(idx.Orders[j], "ASC") {
+				direction = " ASC"
+			}
+			trimmed := strings.TrimSpace(c)
+			if strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")") {
+				quotedCols[j] = trimmed + direction
+			} else if lparen := strings.Index(trimmed, "("); lparen >= 0 {
 				// Handle column with length prefix like "c1(10)"
-				quotedCols[j] = fmt.Sprintf("`%s`%s", c[:lparen], c[lparen:])
+				quotedCols[j] = fmt.Sprintf("`%s`%s%s", trimmed[:lparen], trimmed[lparen:], direction)
 			} else {
-				quotedCols[j] = fmt.Sprintf("`%s`", c)
+				quotedCols[j] = fmt.Sprintf("`%s`%s", trimmed, direction)
 			}
 		}
 		usingStr := ""
@@ -9491,12 +9620,20 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		if idx.Comment != "" {
 			commentStr = fmt.Sprintf(" COMMENT '%s'", idx.Comment)
 		}
-		if idx.Unique {
+		prefix := "KEY"
+		if idx.Type == "FULLTEXT" {
+			prefix = "FULLTEXT KEY"
+		} else if idx.Type == "SPATIAL" {
+			prefix = "SPATIAL KEY"
+		} else if idx.Unique {
+			prefix = "UNIQUE KEY"
+		}
+		if prefix == "UNIQUE KEY" {
 			b.WriteString(fmt.Sprintf("  UNIQUE KEY `%s` (%s)%s%s", idx.Name, strings.Join(quotedCols, ","), usingStr, commentStr))
 		} else {
-			b.WriteString(fmt.Sprintf("  KEY `%s` (%s)%s%s", idx.Name, strings.Join(quotedCols, ","), usingStr, commentStr))
+			b.WriteString(fmt.Sprintf("  %s `%s` (%s)%s%s", prefix, idx.Name, strings.Join(quotedCols, ","), usingStr, commentStr))
 		}
-		if i < len(sortedIndexes)-1 {
+		if i < len(displayIndexes)-1 {
 			b.WriteString(",")
 		}
 		b.WriteString("\n")
@@ -9524,6 +9661,18 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	}
 	if def.Comment != "" {
 		trailer += fmt.Sprintf(" COMMENT='%s'", def.Comment)
+	}
+	if def.RowFormat != "" {
+		trailer += fmt.Sprintf(" ROW_FORMAT=%s", strings.ToUpper(def.RowFormat))
+	}
+	if def.KeyBlockSize != nil {
+		trailer += fmt.Sprintf(" KEY_BLOCK_SIZE=%d", *def.KeyBlockSize)
+	}
+	if def.StatsPersistent != nil {
+		trailer += fmt.Sprintf(" STATS_PERSISTENT=%d", *def.StatsPersistent)
+	}
+	if def.StatsAutoRecalc != nil {
+		trailer += fmt.Sprintf(" STATS_AUTO_RECALC=%d", *def.StatsAutoRecalc)
 	}
 	b.WriteString(trailer)
 

@@ -8,15 +8,15 @@ import (
 
 // ColumnDef represents a column definition in a table.
 type ColumnDef struct {
-	Name                    string
-	Type                    string // MySQL type string (e.g. "INT", "VARCHAR(255)")
-	Nullable                bool
-	Default                 *string
-	AutoIncrement           bool
-	PrimaryKey              bool
-	Unique                  bool
-	Comment                 string
-	DefaultDropped          bool // true when ALTER TABLE ... DROP DEFAULT was used
+	Name                     string
+	Type                     string // MySQL type string (e.g. "INT", "VARCHAR(255)")
+	Nullable                 bool
+	Default                  *string
+	AutoIncrement            bool
+	PrimaryKey               bool
+	Unique                   bool
+	Comment                  string
+	DefaultDropped           bool // true when ALTER TABLE ... DROP DEFAULT was used
 	OnUpdateCurrentTimestamp bool // true for TIMESTAMP/DATETIME with ON UPDATE CURRENT_TIMESTAMP
 }
 
@@ -24,21 +24,27 @@ type ColumnDef struct {
 type IndexDef struct {
 	Name    string
 	Columns []string
+	Orders  []string // per-column order: "", "ASC", "DESC"
 	Unique  bool
+	Type    string // "", "FULLTEXT", "SPATIAL"
 	Using   string // Index method: BTREE, HASH, etc.
 	Comment string // COMMENT clause on index
 }
 
 // TableDef represents a table definition.
 type TableDef struct {
-	Name       string
-	Columns    []ColumnDef
-	PrimaryKey []string // column names
-	Indexes    []IndexDef
-	Comment    string
-	Charset    string // e.g. "latin1", "utf8mb4"; empty means default (utf8mb4)
-	Collation  string // e.g. "latin1_swedish_ci"; empty means default
-	Engine     string // e.g. "InnoDB", "MyISAM", "MEMORY"; empty means default (InnoDB)
+	Name             string
+	Columns          []ColumnDef
+	PrimaryKey       []string // column names
+	Indexes          []IndexDef
+	Comment          string
+	Charset          string // e.g. "latin1", "utf8mb4"; empty means default (utf8mb4)
+	Collation        string // e.g. "latin1_swedish_ci"; empty means default
+	Engine           string // e.g. "InnoDB", "MyISAM", "MEMORY"; empty means default (InnoDB)
+	RowFormat        string // e.g. "DYNAMIC", "COMPACT", "REDUNDANT", "COMPRESSED"
+	KeyBlockSize     *int
+	StatsPersistent  *int
+	StatsAutoRecalc  *int
 	CheckConstraints []CheckConstraint // CHECK constraint definitions
 }
 
@@ -50,11 +56,11 @@ type CheckConstraint struct {
 
 // TriggerDef represents a trigger definition.
 type TriggerDef struct {
-	Name    string
-	Timing  string // "BEFORE" or "AFTER"
-	Event   string // "INSERT", "UPDATE", or "DELETE"
-	Table   string
-	Body    []string // SQL statements in the trigger body
+	Name   string
+	Timing string // "BEFORE" or "AFTER"
+	Event  string // "INSERT", "UPDATE", or "DELETE"
+	Table  string
+	Body   []string // SQL statements in the trigger body
 }
 
 // ProcedureDef represents a stored procedure definition.
@@ -81,14 +87,14 @@ type FunctionDef struct {
 
 // Database represents a database containing tables.
 type Database struct {
-	Name           string
-	Tables         map[string]*TableDef
-	Triggers       map[string]*TriggerDef   // trigger name -> trigger def
-	Procedures     map[string]*ProcedureDef // procedure name -> procedure def
-	Functions      map[string]*FunctionDef  // function name -> function def
-	CharacterSet   string // e.g. "utf8mb4", "ascii", "binary"
-	CollationName  string // e.g. "utf8mb4_general_ci", "ascii_general_ci"
-	mu             sync.RWMutex
+	Name          string
+	Tables        map[string]*TableDef
+	Triggers      map[string]*TriggerDef   // trigger name -> trigger def
+	Procedures    map[string]*ProcedureDef // procedure name -> procedure def
+	Functions     map[string]*FunctionDef  // function name -> function def
+	CharacterSet  string                   // e.g. "utf8mb4", "ascii", "binary"
+	CollationName string                   // e.g. "utf8mb4_general_ci", "ascii_general_ci"
+	mu            sync.RWMutex
 }
 
 // Catalog is the top-level catalog managing databases.
