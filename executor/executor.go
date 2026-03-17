@@ -11514,9 +11514,13 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		e.correlatedRow = row
 		val, err := e.evalExpr(expr)
 		e.correlatedRow = oldCorrelated
-		if err != nil && strings.Contains(err.Error(), "INT_OVERFLOW") {
-			// In row evaluation context, treat overflow as max uint64
-			return uint64(math.MaxUint64), nil
+		if err != nil {
+			var oe *intOverflowError
+			if errors.As(err, &oe) {
+				// Preserve the original integer literal text so comparisons can
+				// use exact bigint semantics instead of float64-rounded max uint.
+				return oe.val, nil
+			}
 		}
 		return val, err
 	}
@@ -13122,6 +13126,45 @@ func parseStrictBigInt(s string) (*big.Int, bool) {
 	return n, true
 }
 
+func toStrictBigInt(v interface{}) (*big.Int, bool) {
+	switch n := v.(type) {
+	case int:
+		return big.NewInt(int64(n)), true
+	case int8:
+		return big.NewInt(int64(n)), true
+	case int16:
+		return big.NewInt(int64(n)), true
+	case int32:
+		return big.NewInt(int64(n)), true
+	case int64:
+		return big.NewInt(n), true
+	case uint:
+		z := new(big.Int)
+		z.SetUint64(uint64(n))
+		return z, true
+	case uint8:
+		z := new(big.Int)
+		z.SetUint64(uint64(n))
+		return z, true
+	case uint16:
+		z := new(big.Int)
+		z.SetUint64(uint64(n))
+		return z, true
+	case uint32:
+		z := new(big.Int)
+		z.SetUint64(uint64(n))
+		return z, true
+	case uint64:
+		z := new(big.Int)
+		z.SetUint64(n)
+		return z, true
+	case string:
+		return parseStrictBigInt(n)
+	default:
+		return nil, false
+	}
+}
+
 func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator) (bool, error) {
 	// NULL-safe equal (<=>): true if both NULL, false if one is NULL, otherwise normal equality.
 	if op == sqlparser.NullSafeEqualOp {
@@ -13223,6 +13266,25 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 		}
 		return true, nil
 	case sqlparser.LessThanOp, sqlparser.GreaterThanOp, sqlparser.LessEqualOp, sqlparser.GreaterEqualOp:
+		if li, okL := toStrictBigInt(left); okL {
+			if ri, okR := toStrictBigInt(right); okR {
+				// Use bigint ordering only for values outside signed 64-bit range;
+				// keep existing YEAR/small-number behavior for ordinary integers.
+				if li.BitLen() > 63 || ri.BitLen() > 63 {
+					cmp := li.Cmp(ri)
+					switch op {
+					case sqlparser.LessThanOp:
+						return cmp < 0, nil
+					case sqlparser.GreaterThanOp:
+						return cmp > 0, nil
+					case sqlparser.LessEqualOp:
+						return cmp <= 0, nil
+					case sqlparser.GreaterEqualOp:
+						return cmp >= 0, nil
+					}
+				}
+			}
+		}
 		// Apply YEAR normalization for ordering comparisons
 		ls, rs := fmt.Sprintf("%v", left), fmt.Sprintf("%v", right)
 		nls, nrs := normalizeYearComparisonTyped(ls, rs, left, right)
