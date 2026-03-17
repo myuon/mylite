@@ -476,6 +476,21 @@ func (ctx *execContext) executeLines(lines []string) error {
 		if strings.HasPrefix(trimmed, "--") {
 			directive := strings.TrimPrefix(trimmed, "--")
 			directive = strings.TrimSpace(directive)
+			name, _ := parseDirectiveNameArgs(directive)
+			if (name == "query" || name == "eval" || name == "query_vertical") &&
+				!strings.HasSuffix(strings.TrimSpace(trimmed), ";") {
+				fullDirective := directive
+				i++
+				for i < len(lines) {
+					l := strings.TrimSpace(lines[i])
+					fullDirective += "\n" + l
+					if strings.HasSuffix(strings.TrimSpace(l), ";") {
+						break
+					}
+					i++
+				}
+				directive = fullDirective
+			}
 
 			handled, skip, err := ctx.handleDirective(directive)
 			if err != nil && !errors.Is(err, errSkipTest) {
@@ -519,6 +534,25 @@ func (ctx *execContext) executeLines(lines []string) error {
 							fullDirective = strings.TrimSuffix(fullDirective, ";")
 							break
 						}
+					}
+					bareDirective = fullDirective
+					advancedLine = true
+				}
+			}
+			if strings.HasPrefix(bdLower, "query ") ||
+				strings.HasPrefix(bdLower, "eval ") ||
+				strings.HasPrefix(bdLower, "query_vertical ") {
+				if !strings.HasSuffix(strings.TrimSpace(trimmed), ";") {
+					fullDirective := bareDirective
+					i++
+					for i < len(lines) {
+						l := strings.TrimSpace(lines[i])
+						fullDirective += "\n" + l
+						if strings.HasSuffix(strings.TrimSpace(l), ";") {
+							fullDirective = strings.TrimSuffix(fullDirective, ";")
+							break
+						}
+						i++
 					}
 					bareDirective = fullDirective
 					advancedLine = true
@@ -923,6 +957,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"save_master_pos", "sync_with_master",
 		"change_user",
 		"diff_files", "chmod",
+		"remove_files", "remove_files_wildcard",
 		"perl",
 		"disable_info", "enable_info":
 		return true, false, nil
@@ -1691,6 +1726,9 @@ func (ctx *execContext) sourceFile(filename string) error {
 	baseName := strings.ToLower(filepath.Base(filename))
 	// Treat proc-control include as no-op in this single-node runner.
 	if baseName == "restart_mysqld.inc" {
+		if ctx.resultLogEnabled {
+			ctx.output.WriteString("# restart\n")
+		}
 		return nil
 	}
 
@@ -1836,6 +1874,7 @@ var directiveKeywords = map[string]bool{
 	"cat_file": true, "diff_files": true, "file_exists": true,
 	"copy_file": true, "chmod": true, "mkdir": true, "rmdir": true,
 	"list_files": true, "move_file": true,
+	"remove_files": true, "remove_files_wildcard": true,
 	"exec": true, "execw": true, "system": true,
 	"perl": true, "if": true, "while": true, "inc": true, "dec": true,
 	"disable_abort_on_error": true, "enable_abort_on_error": true,
@@ -1907,6 +1946,8 @@ var barePrefixKeywords = []string{
 	"mkdir ",
 	"rmdir ",
 	"copy_file ",
+	"remove_files ",
+	"remove_files_wildcard ",
 	"move_file ",
 	"list_files ",
 	"file_exists ",
