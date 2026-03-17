@@ -311,6 +311,11 @@ func jsonExtractPathInternal(doc interface{}, path string) interface{} {
 		}
 		arr, ok := doc.([]interface{})
 		if !ok {
+			// MySQL-compatible behavior used by JSON generated columns:
+			// scalar JSON values can be addressed as $[0].
+			if idx == 0 {
+				return jsonExtractPathInternal(doc, remaining)
+			}
 			return nil
 		}
 		if idx < 0 || idx >= len(arr) {
@@ -1484,7 +1489,7 @@ func (e *Executor) evalMemberOf(v *sqlparser.MemberOfExpr) (interface{}, error) 
 	}
 	arrVal, err := e.evalExpr(v.JSONArr)
 	if err != nil {
-		return nil, err
+		return int64(0), nil
 	}
 	if arrVal == nil {
 		return nil, nil
@@ -1492,7 +1497,7 @@ func (e *Executor) evalMemberOf(v *sqlparser.MemberOfExpr) (interface{}, error) 
 
 	arr, err := jsonNormalize(arrVal)
 	if err != nil {
-		return nil, err
+		return int64(0), nil
 	}
 
 	jsonArr, ok := arr.([]interface{})

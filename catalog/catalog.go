@@ -649,14 +649,14 @@ func (db *Database) CreateFunction(def *FunctionDef) {
 	if db.Functions == nil {
 		db.Functions = make(map[string]*FunctionDef)
 	}
-	db.Functions[def.Name] = def
+	db.Functions[strings.ToLower(def.Name)] = def
 }
 
 // DropFunction removes a stored function by name.
 func (db *Database) DropFunction(name string) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	delete(db.Functions, name)
+	delete(db.Functions, strings.ToLower(name))
 }
 
 // GetFunction returns a stored function by name.
@@ -666,5 +666,5 @@ func (db *Database) GetFunction(name string) *FunctionDef {
 	if db.Functions == nil {
 		return nil
 	}
-	return db.Functions[name]
+	return db.Functions[strings.ToLower(name)]
 }

@@ -654,6 +654,13 @@ func normalizeAddIndexUsing(query string) string {
 	return query
 }
 
+// normalizeMemberOperator rewrites legacy "expr MEMBER (json_doc)" to
+// "expr MEMBER OF (json_doc)" for parser compatibility.
+func normalizeMemberOperator(query string) string {
+	re := regexp.MustCompile(`(?i)\bMEMBER\s*\(`)
+	return re.ReplaceAllString(query, "MEMBER OF (")
+}
+
 func (e *Executor) Execute(query string) (*Result, error) {
 	trimmed := strings.TrimSpace(query)
 	upper := strings.ToUpper(trimmed)
@@ -698,6 +705,14 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	// Fix vitess parser issue: "ADD KEY USING BTREE (col)" is not parsed correctly.
 	// Rewrite to "ADD KEY (col)" since BTREE is the default for InnoDB.
 	query = normalizeAddIndexUsing(query)
+	query = normalizeMemberOperator(query)
+	trimmed = strings.TrimSpace(query)
+	upper = strings.ToUpper(trimmed)
+	// Multi-value index does not allow explicit ASC/DESC on key part.
+	if (strings.HasPrefix(upper, "CREATE TABLE") || strings.HasPrefix(upper, "ALTER TABLE") || strings.HasPrefix(upper, "CREATE INDEX")) &&
+		regexp.MustCompile(`(?i)ARRAY\)\)\s+ASC\b`).MatchString(trimmed) {
+		return nil, mysqlError(1221, "HY000", "Incorrect usage of ASC and key part")
+	}
 
 	// Handle ALTER DATABASE/SCHEMA ... CHARACTER SET (vitess parser doesn't parse CHARACTER SET)
 	if (strings.HasPrefix(upper, "ALTER DATABASE") || strings.HasPrefix(upper, "ALTER SCHEMA")) &&
@@ -724,8 +739,12 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	if strings.HasPrefix(upper, "DROP TRIGGER") {
 		return e.execDropTrigger(trimmed)
 	}
-	// Handle CREATE FUNCTION (with BEGIN...END body that vitess can't parse)
-	if strings.HasPrefix(upper, "CREATE FUNCTION") && strings.Contains(upper, "BEGIN") {
+	// Handle CREATE FUNCTION (vitess parser support is limited).
+	if strings.HasPrefix(upper, "CREATE FUNCTION") &&
+		regexp.MustCompile(`(?is)\bCAST\s*\(.*\bAS\s+[^)]*\bARRAY\b`).MatchString(trimmed) {
+		return nil, mysqlError(1221, "HY000", "Incorrect usage of function and CAST to ARRAY")
+	}
+	if strings.HasPrefix(upper, "CREATE FUNCTION") {
 		return e.execCreateFunction(trimmed)
 	}
 	// Handle DROP FUNCTION
@@ -2793,6 +2812,10 @@ func checkIntegerStrict(colType string, colName string, v interface{}) error {
 		if s == "" {
 			return nil // empty string -> 0 is OK even in strict mode for non-strict numeric
 		}
+		sl := strings.ToLower(s)
+		if sl == "true" || sl == "false" {
+			return nil
+		}
 		// Check if it's a valid number
 		_, errInt := strconv.ParseInt(s, 10, 64)
 		_, errFloat := strconv.ParseFloat(s, 64)
@@ -2827,6 +2850,15 @@ func checkIntegerStrict(colType string, colName string, v interface{}) error {
 		val = strings.TrimSpace(val)
 		if val == "" {
 			return nil
+		}
+		vLower := strings.ToLower(val)
+		if vLower == "true" {
+			intVal = 1
+			break
+		}
+		if vLower == "false" {
+			intVal = 0
+			break
 		}
 		numStr := ""
 		hasDot := false
@@ -3622,10 +3654,13 @@ func validateArrayIndexExpression(expr sqlparser.Expr) error {
 	}
 	typeName := strings.ToUpper(castExpr.Type.Type)
 	switch typeName {
-	case "UNSIGNED", "SIGNED", "DECIMAL":
+	case "UNSIGNED", "SIGNED", "INT", "INTEGER", "BIGINT", "DECIMAL", "DATE", "TIME", "DATETIME":
 		return nil
-	case "CHAR":
+	case "CHAR", "BINARY":
 		if castExpr.Type.Length == nil || *castExpr.Type.Length > 1024 {
+			return mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'CAST-ing data to array type'")
+		}
+		if castExpr.Type.Charset.Name != "" {
 			return mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'CAST-ing data to array type'")
 		}
 		return nil
@@ -3712,6 +3747,9 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			if col.Type.Options.As != nil && hasArrayCastExpr(col.Type.Options.As) {
 				return nil, mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'CAST-ing data to array type'")
 			}
+			if col.Type.Options.Default != nil && hasArrayCastExpr(col.Type.Options.Default) {
+				return nil, mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'CAST-ing data to array type'")
+			}
 			if col.Type.Options.Autoincrement {
 				colDef.AutoIncrement = true
 			}
@@ -3756,11 +3794,15 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 
 	// Process index definitions
 	var indexes []catalog.IndexDef
+	hasArrayMVIIndex := false
 	for _, idx := range stmt.TableSpec.Indexes {
 		var idxCols []string
 		for _, idxCol := range idx.Columns {
 			if err := validateArrayIndexExpression(idxCol.Expression); err != nil {
 				return nil, err
+			}
+			if hasArrayCastExpr(idxCol.Expression) {
+				hasArrayMVIIndex = true
 			}
 			colStr := idxCol.Column.String()
 			if idxCol.Expression != nil {
@@ -3890,6 +3932,9 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		case "ENGINE":
 			def.Engine = strings.ToUpper(opt.String)
 		}
+	}
+	if hasArrayMVIIndex && def.Engine != "" && !strings.EqualFold(def.Engine, "INNODB") {
+		return nil, mysqlError(1178, "42000", "The storage engine for the table doesn't support check")
 	}
 	// If charset was set but collation was not, always derive collation for that charset.
 	if charsetSpecified && !collationSpecified {
@@ -4431,21 +4476,25 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 			row[colNames[i]] = v
 		}
+		if err := e.populateGeneratedColumns(row, tbl.Def.Columns); err != nil {
+			return nil, err
+		}
 
 		// Check explicit NULL on NOT NULL columns (always an error, even non-strict)
-		{
-			colNameSet := make(map[string]bool, len(colNames))
-			for _, cn := range colNames {
-				colNameSet[cn] = true
-			}
-			for _, col := range tbl.Def.Columns {
-				// In strict mode, missing NOT NULL columns without defaults are errors
-				if e.isStrictMode() && !col.Nullable && !col.AutoIncrement && col.Default == nil && !colNameSet[col.Name] {
-					return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
+			{
+				colNameSet := make(map[string]bool, len(colNames))
+				for _, cn := range colNames {
+					colNameSet[cn] = true
 				}
-				// Explicit NULL into NOT NULL column
-				if !col.Nullable && !col.AutoIncrement && colNameSet[col.Name] {
-					if v, ok := row[col.Name]; ok && v == nil {
+				for _, col := range tbl.Def.Columns {
+					isAutoGenCol := col.AutoIncrement || isGeneratedColumnType(col.Type)
+					// In strict mode, missing NOT NULL columns without defaults are errors
+					if e.isStrictMode() && !col.Nullable && !isAutoGenCol && col.Default == nil && !colNameSet[col.Name] {
+						return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
+					}
+					// Explicit NULL into NOT NULL column
+					if !col.Nullable && !isAutoGenCol && colNameSet[col.Name] {
+						if v, ok := row[col.Name]; ok && v == nil {
 						// In multi-row INSERT non-strict mode: convert NULL to zero + warning
 						// In single-row INSERT or strict mode: error
 						isMultiRow := false
@@ -4552,7 +4601,13 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		for _, col := range tbl.Def.Columns {
 			if _, exists := fullRow[col.Name]; !exists {
 				if col.AutoIncrement {
-					fullRow[col.Name] = tbl.AutoIncrementValue() + 1
+					// BEFORE INSERT triggers can read NEW.auto_col, but this must not
+					// consume the counter before the actual insert.
+					fullRow[col.Name] = tbl.AutoIncrement.Load() + 1
+				} else if genExpr := generatedColumnExpr(col.Type); genExpr != "" {
+					if v, err := e.evalGeneratedColumnExpr(genExpr, fullRow); err == nil {
+						fullRow[col.Name] = v
+					}
 				} else if col.Default != nil {
 					defVal := *col.Default
 					defUpper := strings.ToUpper(defVal)
@@ -4615,12 +4670,13 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 		}
 
-		// Strict mode validation before insert
-		if e.isStrictMode() {
-			for _, col := range tbl.Def.Columns {
-				// NOT NULL check
-				if !col.Nullable && !col.AutoIncrement {
-					rv, exists := row[col.Name]
+			// Strict mode validation before insert
+			if e.isStrictMode() {
+				for _, col := range tbl.Def.Columns {
+					isAutoGenCol := col.AutoIncrement || isGeneratedColumnType(col.Type)
+					// NOT NULL check
+					if !col.Nullable && !isAutoGenCol {
+						rv, exists := row[col.Name]
 					// Check if column was explicitly specified in the INSERT
 					explicitlySpecified := false
 					for _, cn := range colNames {
@@ -4629,10 +4685,10 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							break
 						}
 					}
-					if !explicitlySpecified && col.Default == nil {
-						// Column not specified and has no default -> error 1364
-						return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
-					} else if exists && rv == nil && explicitlySpecified {
+						if !explicitlySpecified && col.Default == nil {
+							// Column not specified and has no default -> error 1364
+								return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
+						} else if exists && rv == nil && explicitlySpecified {
 						return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
 					}
 				}
@@ -4654,20 +4710,33 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 								return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
 							}
 						case string:
+							numText := strings.TrimSpace(val)
+							if uq, uerr := strconv.Unquote(numText); uerr == nil {
+								numText = strings.TrimSpace(uq)
+							}
 							if isIntType {
-								if _, perr := strconv.ParseInt(val, 10, 64); perr != nil {
-									if _, perr := strconv.ParseFloat(val, 64); perr != nil {
+								lv := strings.ToLower(numText)
+								if lv == "true" {
+									row[col.Name] = int64(1)
+									break
+								}
+								if lv == "false" {
+									row[col.Name] = int64(0)
+									break
+								}
+								if _, perr := strconv.ParseInt(numText, 10, 64); perr != nil {
+									if _, perr := strconv.ParseFloat(numText, 64); perr != nil {
 										return nil, mysqlError(1366, "HY000", fmt.Sprintf("Incorrect integer value: '%s' for column '%s' at row 1", val, col.Name))
 									}
 								}
 							} else if isDecimalType {
-								if _, perr := strconv.ParseFloat(val, 64); perr != nil {
+								if _, perr := strconv.ParseFloat(numText, 64); perr != nil {
 									return nil, mysqlError(1366, "HY000", fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row 1", val, col.Name))
 								}
 							}
 							// Check unsigned constraint for string-typed decimal values
 							if isUnsigned {
-								if f, perr := strconv.ParseFloat(val, 64); perr == nil && f < 0 {
+								if f, perr := strconv.ParseFloat(numText, 64); perr == nil && f < 0 {
 									return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
 								}
 							}
@@ -4814,6 +4883,67 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		AffectedRows: affected,
 		InsertID:     uint64(lastInsertID),
 	}, nil
+}
+
+func generatedColumnExpr(colType string) string {
+	upper := strings.ToUpper(colType)
+	const marker = " GENERATED ALWAYS AS ("
+	start := strings.Index(upper, marker)
+	if start < 0 {
+		return ""
+	}
+	i := start + len(marker)
+	depth := 1
+	for ; i < len(colType); i++ {
+		switch colType[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return strings.TrimSpace(colType[start+len(marker) : i])
+			}
+		}
+	}
+	return ""
+}
+
+func isGeneratedColumnType(colType string) bool {
+	return generatedColumnExpr(colType) != ""
+}
+
+func (e *Executor) evalGeneratedColumnExpr(expr string, row storage.Row) (interface{}, error) {
+	stmt, err := sqlparser.NewTestParser().Parse("SELECT " + expr)
+	if err != nil {
+		return nil, err
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok || len(sel.SelectExprs.Exprs) != 1 {
+		return nil, fmt.Errorf("invalid generated column expression")
+	}
+	aliased, ok := sel.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr)
+	if !ok {
+		return nil, fmt.Errorf("invalid generated column expression")
+	}
+	return e.evalRowExpr(aliased.Expr, row)
+}
+
+func (e *Executor) populateGeneratedColumns(row storage.Row, cols []catalog.ColumnDef) error {
+	for _, col := range cols {
+		if _, exists := row[col.Name]; exists {
+			continue
+		}
+		expr := generatedColumnExpr(col.Type)
+		if expr == "" {
+			continue
+		}
+		v, err := e.evalGeneratedColumnExpr(expr, row)
+		if err != nil {
+			return err
+		}
+		row[col.Name] = v
+	}
+	return nil
 }
 
 // findDuplicateRow returns the index of an existing row in tbl that has the same
@@ -5106,6 +5236,72 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 				}
 				result = newResult
 			}
+		}
+		return result, nil
+	case *sqlparser.JSONTableExpr:
+		docVal, err := e.evalExpr(te.Expr)
+		if err != nil {
+			return []storage.Row{}, nil
+		}
+		if docVal == nil {
+			return []storage.Row{}, nil
+		}
+		normDoc, err := jsonNormalize(docVal)
+		if err != nil {
+			return []storage.Row{}, nil
+		}
+		srcRows, ok := normDoc.([]interface{})
+		if !ok {
+			return []storage.Row{}, nil
+		}
+		alias := te.Alias.String()
+		if alias == "" {
+			alias = "json_table"
+		}
+		result := make([]storage.Row, 0, len(srcRows))
+		for i, item := range srcRows {
+			row := make(storage.Row)
+			for _, c := range te.Columns {
+				if c.JtOrdinal != nil {
+					name := c.JtOrdinal.Name.String()
+					row[name] = int64(i + 1)
+					row[alias+"."+name] = int64(i + 1)
+					continue
+				}
+				if c.JtPath == nil {
+					continue
+				}
+				name := c.JtPath.Name.String()
+				pathVal, err := e.evalExpr(c.JtPath.Path)
+				if err != nil {
+					pathVal = "$"
+				}
+				path := toString(pathVal)
+				extracted := jsonExtractPath(item, path)
+				if c.JtPath.JtColExists {
+					exists := int64(0)
+					if extracted != nil {
+						exists = int64(1)
+					}
+					row[name] = exists
+					row[alias+"."+name] = exists
+					continue
+				}
+				if extracted == nil {
+					row[name] = nil
+					row[alias+"."+name] = nil
+					continue
+				}
+				colType := strings.ToLower(sqlparser.String(c.JtPath.Type))
+				if strings.HasPrefix(colType, "json") {
+					row[name] = jsonMarshalMySQL(extracted)
+					row[alias+"."+name] = row[name]
+				} else {
+					row[name] = toJSONValue(extracted)
+					row[alias+"."+name] = row[name]
+				}
+			}
+			result = append(result, row)
 		}
 		return result, nil
 	default:
@@ -5683,7 +5879,7 @@ func isAggregateExpr(expr sqlparser.Expr) bool {
 	switch expr.(type) {
 	case *sqlparser.CountStar, *sqlparser.Count,
 		*sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg,
-		*sqlparser.JSONArrayAgg, *sqlparser.JSONObjectAgg:
+		*sqlparser.JSONArrayAgg, *sqlparser.JSONObjectAgg, *sqlparser.GroupConcatExpr:
 		return true
 	}
 	return false
@@ -6193,6 +6389,40 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			parts = append(parts, string(kb)+": "+jsonMarshalMySQL(obj[k]))
 		}
 		return "{" + strings.Join(parts, ", ") + "}", nil
+	case *sqlparser.GroupConcatExpr:
+		sep := e.Separator
+		if sep == "" {
+			sep = ","
+		}
+		distinct := make(map[string]struct{})
+		out := make([]string, 0, len(groupRows))
+		for _, row := range groupRows {
+			var part strings.Builder
+			hasNull := false
+			for _, arg := range e.Exprs {
+				v, err := evalRowExpr(arg, row)
+				if err != nil {
+					return nil, err
+				}
+				if v == nil {
+					hasNull = true
+					break
+				}
+				part.WriteString(toString(v))
+			}
+			if hasNull {
+				continue
+			}
+			s := part.String()
+			if e.Distinct {
+				if _, ok := distinct[s]; ok {
+					continue
+				}
+				distinct[s] = struct{}{}
+			}
+			out = append(out, s)
+		}
+		return strings.Join(out, sep), nil
 	case *sqlparser.ComparisonExpr:
 		// Handle expressions like COUNT(*) = 0
 		left, err := evalAggregateExpr(e.Left, groupRows, repRow)
@@ -7531,6 +7761,9 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					if err := validateArrayIndexExpression(idxCol.Expression); err != nil {
 						return nil, err
 					}
+					if hasArrayCastExpr(idxCol.Expression) && tableDef.Engine != "" && !strings.EqualFold(tableDef.Engine, "INNODB") {
+						return nil, mysqlError(1178, "42000", "The storage engine for the table doesn't support check")
+					}
 					if idxCol.Expression != nil {
 						continue
 					}
@@ -8199,6 +8432,13 @@ func buildColumnTypeString(ct *sqlparser.ColumnType) string {
 	if ct.Zerofill {
 		s += " zerofill"
 	}
+	if ct.Options != nil && ct.Options.As != nil {
+		storage := " virtual"
+		if ct.Options.Storage == sqlparser.StoredStorage {
+			storage = " stored"
+		}
+		s += " generated always as (" + sqlparser.String(ct.Options.As) + ")" + storage
+	}
 	return s
 }
 
@@ -8527,7 +8767,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 				return v.Val, nil
 			}
 			return n, nil
-		case sqlparser.BitNum:
+			case sqlparser.BitNum:
 			// 0b1010 or b'1010' -> parse as integer
 			s := strings.TrimSpace(v.Val)
 			if strings.HasPrefix(strings.ToLower(s), "b'") && strings.HasSuffix(s, "'") {
@@ -8543,11 +8783,14 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			if err != nil {
 				return v.Val, nil
 			}
-			if u <= math.MaxInt64 {
-				return int64(u), nil
+				if u <= math.MaxInt64 {
+					return int64(u), nil
+				}
+				return u, nil
+			default:
+				// Handle timestamp/date/time typed literals as plain string values.
+				return v.Val, nil
 			}
-			return u, nil
-		}
 	case *sqlparser.NullVal:
 		return nil, nil
 	case sqlparser.BoolVal:
@@ -11587,7 +11830,7 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		}
 		e.userVars[varName] = val
 		return val, nil
-	case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg:
+	case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg, *sqlparser.GroupConcatExpr:
 		// For HAVING clause: look up the aggregate display name in the row
 		displayName := aggregateDisplayName(expr)
 		if val, ok := row[displayName]; ok {
@@ -12712,7 +12955,7 @@ func (e *Executor) addAggregatesToRow(expr sqlparser.Expr, row storage.Row, grou
 	case *sqlparser.OrExpr:
 		e.addAggregatesToRow(v.Left, row, groupRows)
 		e.addAggregatesToRow(v.Right, row, groupRows)
-	case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg,
+	case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg, *sqlparser.GroupConcatExpr,
 		*sqlparser.JSONArrayAgg, *sqlparser.JSONObjectAgg:
 		displayName := aggregateDisplayName(expr)
 		if _, ok := row[displayName]; !ok {
@@ -13027,8 +13270,40 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 			return false, err
 		}
 		return !inner, nil
+	case *sqlparser.MemberOfExpr:
+		val, err := e.evalRowExpr(v, row)
+		if err != nil {
+			return false, err
+		}
+		switch x := val.(type) {
+		case bool:
+			return x, nil
+		case int64:
+			return x != 0, nil
+		case uint64:
+			return x != 0, nil
+		default:
+			return toInt64(val) != 0, nil
+		}
 	}
-	return false, fmt.Errorf("unsupported WHERE expression: %T", expr)
+	val, err := e.evalRowExpr(expr, row)
+	if err != nil {
+		return false, err
+	}
+	switch x := val.(type) {
+	case bool:
+		return x, nil
+	case int64:
+		return x != 0, nil
+	case uint64:
+		return x != 0, nil
+	case float64:
+		return x != 0, nil
+	case string:
+		return strings.TrimSpace(x) != "" && x != "0", nil
+	default:
+		return toInt64(val) != 0, nil
+	}
 }
 
 // evalWhere is a package-level shim for backward-compatible callers.
@@ -15882,12 +16157,17 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 	returnType := ""
 	if returnsIdx >= 0 {
 		afterReturns := strings.TrimSpace(afterParams[returnsIdx+len("RETURNS "):])
-		// Return type ends at BEGIN or at a characteristic keyword
+		// Return type ends at BEGIN/RETURN or at a characteristic keyword
 		beginIdx := strings.Index(strings.ToUpper(afterReturns), "BEGIN")
-		if beginIdx < 0 {
-			return nil, fmt.Errorf("invalid CREATE FUNCTION syntax: missing BEGIN")
+		returnIdx := strings.Index(strings.ToUpper(afterReturns), "RETURN ")
+		endIdx := beginIdx
+		if endIdx < 0 || (returnIdx >= 0 && returnIdx < endIdx) {
+			endIdx = returnIdx
 		}
-		returnType = strings.TrimSpace(afterReturns[:beginIdx])
+		if endIdx < 0 {
+			endIdx = len(afterReturns)
+		}
+		returnType = strings.TrimSpace(afterReturns[:endIdx])
 		// Strip optional characteristics like CONTAINS SQL, NO SQL, READS SQL DATA, etc.
 		for _, kw := range []string{"DETERMINISTIC", "NOT DETERMINISTIC", "CONTAINS SQL", "NO SQL", "READS SQL DATA", "MODIFIES SQL DATA", "SQL SECURITY DEFINER", "SQL SECURITY INVOKER"} {
 			returnType = strings.TrimSuffix(strings.TrimSpace(returnType), kw)
@@ -15895,17 +16175,24 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 		returnType = strings.TrimSpace(returnType)
 	}
 
-	// Extract body: find BEGIN...END
+	// Extract body: BEGIN...END or single RETURN expression.
+	var bodyStmts []string
 	beginIdx := strings.Index(strings.ToUpper(afterParams), "BEGIN")
-	if beginIdx < 0 {
-		return nil, fmt.Errorf("invalid CREATE FUNCTION syntax: missing BEGIN")
+	if beginIdx >= 0 {
+		bodyStr := strings.TrimSpace(afterParams[beginIdx+len("BEGIN"):])
+		if strings.HasSuffix(strings.ToUpper(strings.TrimSpace(bodyStr)), "END") {
+			bodyStr = strings.TrimSpace(bodyStr[:len(bodyStr)-len("END")])
+		}
+		bodyStmts = splitTriggerBody(bodyStr)
+	} else {
+		returnIdx := strings.Index(strings.ToUpper(afterParams), "RETURN ")
+		if returnIdx < 0 {
+			return nil, fmt.Errorf("invalid CREATE FUNCTION syntax: missing RETURN")
+		}
+		returnExpr := strings.TrimSpace(afterParams[returnIdx:])
+		returnExpr = strings.TrimSuffix(returnExpr, ";")
+		bodyStmts = []string{returnExpr}
 	}
-	bodyStr := strings.TrimSpace(afterParams[beginIdx+len("BEGIN"):])
-	if strings.HasSuffix(strings.ToUpper(strings.TrimSpace(bodyStr)), "END") {
-		bodyStr = strings.TrimSpace(bodyStr[:len(bodyStr)-len("END")])
-	}
-
-	bodyStmts := splitTriggerBody(bodyStr)
 
 	funcDef := &catalog.FunctionDef{
 		Name:       funcName,
