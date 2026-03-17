@@ -287,9 +287,9 @@ func matchLikeHelper(s, p []rune, si, pi int) bool {
 // normalizes operator spacing to match MySQL's column display name behavior.
 func normalizeSQLDisplayName(s string) string {
 	s = uppercaseSQLKeywords(s)
-	// MySQL compacts spaces around comparison/arithmetic operators in column
-	// display names (e.g. 'a' = 'b' -> 'a'='b')
-	s = compactOperatorsInDisplayName(s)
+	// Compact operators only in nested subexpressions, while keeping top-level
+	// spacing (e.g. "a = b") used by some result headers.
+	s = compactOperatorsInSubexpressions(s)
 	// MySQL displays function arguments without space after comma: LEFT(`c1`,0) not LEFT(`c1`, 0)
 	if !strings.HasPrefix(s, "JSON_SCHEMA_VALID(") &&
 		!strings.HasPrefix(s, "JSON_SCHEMA_VALIDATION_REPORT(") &&
@@ -759,14 +759,14 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	trimmed := strings.TrimSpace(query)
 	upper := strings.ToUpper(trimmed)
 	compact := strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "").Replace(upper)
-	if strings.HasPrefix(compact, "SELECTJSON_SCHEMA_VALID();") ||
-		strings.HasPrefix(compact, "SELECTJSON_SCHEMA_VALID(NULL);") ||
-		strings.HasPrefix(compact, "SELECTJSON_SCHEMA_VALID(NULL,NULL,NULL);") {
+	if compact == "SELECTJSON_SCHEMA_VALID()" ||
+		compact == "SELECTJSON_SCHEMA_VALID(NULL)" ||
+		compact == "SELECTJSON_SCHEMA_VALID(NULL,NULL,NULL)" {
 		return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'JSON_SCHEMA_VALID'")
 	}
-	if strings.HasPrefix(compact, "SELECTJSON_SCHEMA_VALIDATION_REPORT();") ||
-		strings.HasPrefix(compact, "SELECTJSON_SCHEMA_VALIDATION_REPORT(NULL);") ||
-		strings.HasPrefix(compact, "SELECTJSON_SCHEMA_VALIDATION_REPORT(NULL,NULL,NULL);") {
+	if compact == "SELECTJSON_SCHEMA_VALIDATION_REPORT()" ||
+		compact == "SELECTJSON_SCHEMA_VALIDATION_REPORT(NULL)" ||
+		compact == "SELECTJSON_SCHEMA_VALIDATION_REPORT(NULL,NULL,NULL)" {
 		return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'JSON_SCHEMA_VALIDATION_REPORT'")
 	}
 	// Clear warnings from previous statement, but preserve for SHOW WARNINGS/ERRORS.
@@ -1038,6 +1038,53 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return &Result{}, nil
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %T", s)
+	}
+}
+
+func isStrictJSONStringCastSource(expr sqlparser.Expr) bool {
+	switch t := expr.(type) {
+	case *sqlparser.Literal:
+		return t.Type == sqlparser.StrVal
+	case *sqlparser.IntroducerExpr:
+		if lit, ok := t.Expr.(*sqlparser.Literal); ok {
+			return lit.Type == sqlparser.StrVal
+		}
+	}
+	return false
+}
+
+func castToJSONValue(val interface{}, strictStringLiteral bool) (interface{}, error) {
+	if val == nil {
+		return nil, nil
+	}
+	switch v := val.(type) {
+	case int64:
+		return jsonMarshalMySQL(float64(v)), nil
+	case float64:
+		return jsonMarshalMySQL(v), nil
+	case bool:
+		return jsonMarshalMySQL(v), nil
+	case string:
+		var js interface{}
+		if err := json.Unmarshal([]byte(v), &js); err != nil {
+			if strictStringLiteral {
+				return nil, mysqlError(3141, "22032", `Invalid JSON text in argument 1 to function cast_as_json: "Invalid value." at position 0.`)
+			}
+			b, _ := json.Marshal(v)
+			return string(b), nil
+		}
+		return jsonMarshalMySQL(js), nil
+	default:
+		s := toString(val)
+		var js interface{}
+		if err := json.Unmarshal([]byte(s), &js); err != nil {
+			if strictStringLiteral {
+				return nil, mysqlError(3141, "22032", `Invalid JSON text in argument 1 to function cast_as_json: "Invalid value." at position 0.`)
+			}
+			b, _ := json.Marshal(s)
+			return string(b), nil
+		}
+		return jsonMarshalMySQL(js), nil
 	}
 }
 
@@ -9178,23 +9225,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		case "YEAR":
 			return toInt64(val), nil
 		case "JSON":
-			if val == nil {
-				return nil, nil
-			}
-			s := toString(val)
-			var js interface{}
-			if err := json.Unmarshal([]byte(s), &js); err != nil {
-				// Non-JSON types (datetime, date, etc.) get wrapped as JSON strings
-				switch val.(type) {
-				case int64:
-					return jsonMarshalMySQL(float64(toInt64(val))), nil
-				case float64:
-					return jsonMarshalMySQL(val), nil
-				}
-				b, _ := json.Marshal(s)
-				return string(b), nil
-			}
-			return jsonMarshalMySQL(js), nil
+			return castToJSONValue(val, isStrictJSONStringCastSource(v.Expr))
 		}
 		return val, nil
 	case *sqlparser.CaseExpr:
@@ -9371,22 +9402,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 				}
 				return toString(val), nil
 			case "JSON":
-				if val == nil {
-					return nil, nil
-				}
-				s := toString(val)
-				var js interface{}
-				if err := json.Unmarshal([]byte(s), &js); err != nil {
-					switch val.(type) {
-					case int64:
-						return jsonMarshalMySQL(float64(toInt64(val))), nil
-					case float64:
-						return jsonMarshalMySQL(val), nil
-					}
-					b, _ := json.Marshal(s)
-					return string(b), nil
-				}
-				return jsonMarshalMySQL(js), nil
+				return castToJSONValue(val, isStrictJSONStringCastSource(v.Expr))
 			}
 		}
 		return val, nil
