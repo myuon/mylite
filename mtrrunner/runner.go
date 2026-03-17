@@ -110,6 +110,7 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	ectx := &execContext{
 		runner:           r,
 		db:               r.DB,
+		connByName:       map[string]*sql.Conn{},
 		output:           &strings.Builder{},
 		warningsEnabled:  true,
 		queryLogEnabled:  true,
@@ -145,6 +146,7 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		return TestResult{Name: name, Error: "timeout: test took too long"}
 	}
 	ctx := ectx
+	ctx.closeConnections()
 	if errors.Is(err, errSkipTest) {
 		return TestResult{Name: name, Skipped: true}
 	}
@@ -244,6 +246,8 @@ func (r *Runner) RunSuite(suiteDir string) []TestResult {
 type execContext struct {
 	runner           *Runner
 	db               *sql.DB
+	connByName       map[string]*sql.Conn // mysqltest named connections
+	currentConn      string               // empty means default connection
 	output           *strings.Builder
 	warningsEnabled  bool
 	queryLogEnabled  bool
@@ -269,8 +273,16 @@ func (ctx *execContext) executeLines(lines []string) error {
 			i = skipPerlBlock(lines, i)
 			continue
 		}
-		// Skip heredoc bodies used by write_file/append_file directives.
+		// Handle heredoc file directives (write_file / append_file).
 		if isHereDocDirectiveStart(trimmed) {
+			handled, newI, err := ctx.handleHereDocDirective(lines, i)
+			if err != nil {
+				return err
+			}
+			if handled {
+				i = newI
+				continue
+			}
 			i = skipHereDoc(lines, i)
 			continue
 		}
@@ -812,6 +824,64 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		}
 		return true, false, err
 
+	case "connect":
+		connName, dbName := parseConnectDirectiveArgs(args)
+		if connName == "" {
+			return true, false, nil
+		}
+		key := strings.ToLower(connName)
+		if existing := ctx.connByName[key]; existing != nil {
+			existing.Close() //nolint:errcheck
+			delete(ctx.connByName, key)
+		}
+		conn, err := ctx.db.Conn(context.Background())
+		if err != nil {
+			return true, false, err
+		}
+		if dbName != "" {
+			if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("USE `%s`", dbName)); err != nil {
+				conn.Close() //nolint:errcheck
+				return true, false, err
+			}
+		}
+		ctx.connByName[key] = conn
+		ctx.currentConn = key
+		return true, false, nil
+
+	case "connection":
+		target := strings.TrimSpace(args)
+		target = strings.Trim(target, "()")
+		target = strings.TrimSpace(target)
+		if target == "" || strings.EqualFold(target, "default") {
+			ctx.currentConn = ""
+			return true, false, nil
+		}
+		key := strings.ToLower(target)
+		if _, ok := ctx.connByName[key]; ok {
+			ctx.currentConn = key
+		}
+		return true, false, nil
+
+	case "disconnect":
+		target := strings.TrimSpace(args)
+		target = strings.Trim(target, "()")
+		target = strings.TrimSpace(target)
+		if target == "" {
+			target = ctx.currentConn
+		}
+		if target == "" || strings.EqualFold(target, "default") {
+			return true, false, nil
+		}
+		key := strings.ToLower(target)
+		if conn := ctx.connByName[key]; conn != nil {
+			conn.Close() //nolint:errcheck
+			delete(ctx.connByName, key)
+		}
+		if ctx.currentConn == key {
+			ctx.currentConn = ""
+		}
+		return true, false, nil
+
 	case "delimiter":
 		newDelim := strings.TrimSpace(args)
 		// If the current delimiter is non-standard and the args end with it,
@@ -939,7 +1009,6 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"disable_cursor_protocol", "enable_cursor_protocol",
 		"disable_view_protocol", "enable_view_protocol",
 		"disable_session_track_info", "enable_session_track_info",
-		"connect", "connection", "disconnect",
 		"send", "reap", "sleep", "send_shutdown",
 		"replace_regex",
 		"write_file", "append_file", "cat_file",
@@ -1118,6 +1187,71 @@ func skipHereDoc(lines []string, i int) int {
 		i++
 	}
 	return i
+}
+
+func (ctx *execContext) handleHereDocDirective(lines []string, i int) (bool, int, error) {
+	trimmed := strings.TrimSpace(lines[i])
+	if !isHereDocDirectiveStart(trimmed) {
+		return false, i, nil
+	}
+
+	directive := strings.TrimSpace(trimmed)
+	if strings.HasPrefix(directive, "--") {
+		directive = strings.TrimSpace(strings.TrimPrefix(directive, "--"))
+	}
+	name, args := parseDirectiveNameArgs(directive)
+	if name != "write_file" && name != "append_file" {
+		return false, i, nil
+	}
+
+	pathArg := strings.TrimSpace(strings.TrimRight(args, ";"))
+	pathArg = ctx.substituteVars(pathArg)
+	if pathArg == "" {
+		return false, i, fmt.Errorf("%s requires a file path", name)
+	}
+	path := ctx.resolveFilePath(pathArg)
+
+	j := i + 1
+	var body []string
+	for j < len(lines) {
+		t := strings.TrimSpace(lines[j])
+		if strings.EqualFold(t, "EOF") || strings.EqualFold(t, "EOF;") {
+			break
+		}
+		body = append(body, lines[j])
+		j++
+	}
+	if j >= len(lines) {
+		return false, i, fmt.Errorf("%s: missing EOF terminator", name)
+	}
+
+	content := strings.Join(body, "\n")
+	if len(body) > 0 {
+		content += "\n"
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return false, i, err
+	}
+	if name == "append_file" {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return false, i, err
+		}
+		_, werr := f.WriteString(content)
+		cerr := f.Close()
+		if werr != nil {
+			return false, i, werr
+		}
+		if cerr != nil {
+			return false, i, cerr
+		}
+	} else {
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			return false, i, err
+		}
+	}
+
+	return true, j + 1, nil
 }
 
 func (ctx *execContext) evaluateIfCondition(condStr string) bool {
@@ -1325,7 +1459,16 @@ func stripInlineHashComments(stmt string) string {
 }
 
 func (ctx *execContext) executeQuery(stmt string) error {
-	rows, err := ctx.db.Query(stmt)
+	activeConn := ctx.getActiveConn()
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if activeConn != nil {
+		rows, err = activeConn.QueryContext(context.Background(), stmt)
+	} else {
+		rows, err = ctx.db.Query(stmt)
+	}
 	if err != nil {
 		if ctx.expectedError != "" {
 			// Output the error message (mysqltest format)
@@ -1414,7 +1557,16 @@ func (ctx *execContext) executeQuery(stmt string) error {
 // executeQueryOrExec tries to execute a statement as a query first (returning rows),
 // and falls back to exec if the result set has no columns (e.g. INSERT/UPDATE/DELETE).
 func (ctx *execContext) executeQueryOrExec(stmt string) error {
-	rows, err := ctx.db.Query(stmt)
+	activeConn := ctx.getActiveConn()
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if activeConn != nil {
+		rows, err = activeConn.QueryContext(context.Background(), stmt)
+	} else {
+		rows, err = ctx.db.Query(stmt)
+	}
 	if err != nil {
 		if ctx.expectedError != "" {
 			if ctx.resultLogEnabled {
@@ -1504,7 +1656,13 @@ func (ctx *execContext) executeExec(stmt string) error {
 		// we can retrieve warnings via SHOW WARNINGS on the same connection.
 		return ctx.executeExecWithExpectedError(stmt)
 	}
-	_, err := ctx.db.Exec(stmt)
+	activeConn := ctx.getActiveConn()
+	var err error
+	if activeConn != nil {
+		_, err = activeConn.ExecContext(context.Background(), stmt)
+	} else {
+		_, err = ctx.db.Exec(stmt)
+	}
 	if err != nil {
 		return fmt.Errorf("exec failed: %s: %v", stmt, err)
 	}
@@ -1518,11 +1676,19 @@ func (ctx *execContext) executeExecWithExpectedError(stmt string) error {
 	expectedCode := ctx.expectedError
 	ctx.expectedError = ""
 
-	conn, err := ctx.db.Conn(context.Background())
-	if err != nil {
-		return fmt.Errorf("failed to acquire connection: %v", err)
+	conn := ctx.getActiveConn()
+	ownedConn := false
+	if conn == nil {
+		var err error
+		conn, err = ctx.db.Conn(context.Background())
+		if err != nil {
+			return fmt.Errorf("failed to acquire connection: %v", err)
+		}
+		ownedConn = true
 	}
-	defer conn.Close()
+	if ownedConn {
+		defer conn.Close()
+	}
 
 	_, execErr := conn.ExecContext(context.Background(), stmt)
 	if execErr != nil {
@@ -1558,6 +1724,22 @@ func (ctx *execContext) outputWarningsOnConn(conn *sql.Conn, expectedCode string
 		sqlstate := mysqlCodeToSQLState(code)
 		ctx.output.WriteString(fmt.Sprintf("ERROR %s: %s\n", sqlstate, message))
 		return // Only show first warning
+	}
+}
+
+func (ctx *execContext) getActiveConn() *sql.Conn {
+	if ctx.currentConn == "" {
+		return nil
+	}
+	return ctx.connByName[strings.ToLower(ctx.currentConn)]
+}
+
+func (ctx *execContext) closeConnections() {
+	for name, conn := range ctx.connByName {
+		if conn != nil {
+			conn.Close() //nolint:errcheck
+		}
+		delete(ctx.connByName, name)
 	}
 }
 
@@ -2036,6 +2218,29 @@ func parseDirectiveNameArgs(directive string) (name, args string) {
 
 	// Support trailing semicolon in no-arg form, e.g. "reap;".
 	return strings.ToLower(strings.TrimRight(d, ";")), ""
+}
+
+func parseConnectDirectiveArgs(args string) (connName string, dbName string) {
+	trimmed := strings.TrimSpace(args)
+	trimmed = strings.TrimSuffix(trimmed, ";")
+	trimmed = strings.TrimSpace(trimmed)
+	if strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")") {
+		trimmed = strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+	}
+	if trimmed == "" {
+		return "", ""
+	}
+
+	parts := strings.Split(trimmed, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+		parts[i] = strings.Trim(parts[i], "`\"'")
+	}
+	connName = parts[0]
+	if len(parts) >= 5 {
+		dbName = parts[4]
+	}
+	return connName, dbName
 }
 
 // formatMySQLError formats an error into mysqltest expected format.
