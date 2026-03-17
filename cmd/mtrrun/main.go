@@ -13,7 +13,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -26,20 +29,17 @@ import (
 
 func main() {
 	// MySQL MTR framework uses --timezone=GMT-3 (POSIX convention: GMT-3 = UTC+3).
-	// Set process timezone to match so that SET TIMESTAMP results are consistent.
 	os.Setenv("TZ", "Etc/GMT-3")
-	// Force Go's time package to pick up the new TZ.
-	// Note: time.Local is set at init time, but LoadLocation honors TZ env.
 	if loc, err := time.LoadLocation("Etc/GMT-3"); err == nil {
 		time.Local = loc
 	}
 
-	// Resolve testdata path: prefer the main repo's copy so worktrees don't need submodule init.
 	defaultTestdata := resolveTestdataRoot()
 	suiteRoot := flag.String("suite-root", filepath.Join(defaultTestdata, "suite"), "root directory for test suites")
 	includeRoot := flag.String("include-root", filepath.Join(defaultTestdata, "include"), "root directory for include files")
 	verbose := flag.Bool("verbose", false, "verbose output")
 	maxTests := flag.Int("max", 0, "maximum number of tests to run (0=all)")
+	jobs := flag.Int("j", 0, "number of parallel test workers (0=auto, 1=sequential)")
 	flag.Parse()
 
 	args := flag.Args()
@@ -49,79 +49,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Start mylite server
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		log.Fatalf("failed to find free port: %v", err)
-	}
-	addr := listener.Addr().String()
-	listener.Close()
-
-	// Create a persistent temp directory for this run
-	tmpDir, err := os.MkdirTemp("", "mylite-mtr-*")
-	if err != nil {
-		log.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-	os.MkdirAll(filepath.Join(tmpDir, "tmp"), 0755) //nolint:errcheck
-	// Create a data dir 2 levels deep so that ../../tmp/ resolves to $tmpDir/tmp/
-	dataDir := filepath.Join(tmpDir, "data", "inner")
-	os.MkdirAll(dataDir, 0755) //nolint:errcheck
-
-	cat := catalog.New()
-	store := storage.NewEngine()
-	exec := executor.New(cat, store)
-	// Set DataDir for resolving relative paths in LOAD DATA/SELECT INTO OUTFILE
-	exec.DataDir = dataDir
-	// Set search paths for LOAD DATA LOCAL INFILE
-	// Include the parent of suiteRoot so that paths like "suite/jp/std_data/file.dat" resolve correctly
-	suiteParent := filepath.Dir(*suiteRoot)
-	exec.SearchPaths = []string{*suiteRoot, *includeRoot, suiteParent}
-
-	srv := server.New(exec, addr)
-	go func() {
-		srv.Start() //nolint:errcheck
-	}()
-	defer srv.Close()
-
-	// Wait for server
-	db, err := connectDB(addr)
-	if err != nil {
-		log.Fatalf("failed to connect to mylite: %v", err)
-	}
-	defer db.Close()
-
-	runner := &mtrrunner.Runner{
-		DB: db,
-		IncludePaths: []string{
-			*includeRoot,
-		},
-		Verbose: *verbose,
-		TmpDir:  tmpDir,
-	}
-
 	target := args[0]
 
-	// Check if it's a direct .test file path
+	// Check if it's a direct .test file path — always run sequentially
 	if strings.HasSuffix(target, ".test") {
-		// Add suite-specific include paths for direct test execution as well.
-		suiteDir := filepath.Dir(filepath.Dir(target))
-		suiteInclude := filepath.Join(suiteDir, "include")
-		if _, err := os.Stat(suiteInclude); err == nil {
-			runner.IncludePaths = append(runner.IncludePaths, suiteInclude)
-		}
-		suiteTestDir := filepath.Join(suiteDir, "t")
-		if _, err := os.Stat(suiteTestDir); err == nil {
-			runner.IncludePaths = append(runner.IncludePaths, suiteTestDir)
-		}
-		runner.IncludePaths = append(runner.IncludePaths, *suiteRoot)
-		exec.SearchPaths = append(exec.SearchPaths, runner.IncludePaths...)
-
-		result := runner.RunFile(target)
-		printResult(result, *verbose)
-		if !result.Passed && !result.Skipped {
-			os.Exit(1)
-		}
+		runSingleTest(target, *suiteRoot, *includeRoot, *verbose)
 		return
 	}
 
@@ -131,20 +63,20 @@ func main() {
 		log.Fatalf("suite directory not found: %s", suiteDir)
 	}
 
-	// Add suite-specific includes
+	// Build include paths for this suite
+	includePaths := []string{*includeRoot}
 	suiteInclude := filepath.Join(suiteDir, "include")
 	if _, err := os.Stat(suiteInclude); err == nil {
-		runner.IncludePaths = append(runner.IncludePaths, suiteInclude)
+		includePaths = append(includePaths, suiteInclude)
 	}
-	// Add the test directory itself (for source files like data1.inc)
 	suiteTestDir := filepath.Join(suiteDir, "t")
 	if _, err := os.Stat(suiteTestDir); err == nil {
-		runner.IncludePaths = append(runner.IncludePaths, suiteTestDir)
+		includePaths = append(includePaths, suiteTestDir)
 	}
-	// Add the suite root for relative paths like suite/engines/funcs/t/file.inc
-	runner.IncludePaths = append(runner.IncludePaths, *suiteRoot)
-	// Update executor search paths to include suite-specific paths
-	exec.SearchPaths = append(exec.SearchPaths, runner.IncludePaths...)
+	includePaths = append(includePaths, *suiteRoot)
+
+	searchPaths := []string{*suiteRoot, *includeRoot, filepath.Dir(*suiteRoot)}
+	searchPaths = append(searchPaths, includePaths...)
 
 	// Specific test within suite?
 	testFilter := ""
@@ -159,9 +91,7 @@ func main() {
 		log.Fatalf("cannot read test dir: %v", err)
 	}
 
-	var passed, failed, skipped, errors int
-	total := 0
-
+	var testPaths []string
 	for _, entry := range entries {
 		if !strings.HasSuffix(entry.Name(), ".test") {
 			continue
@@ -170,26 +100,230 @@ func main() {
 		if testFilter != "" && testName != testFilter {
 			continue
 		}
-
-		if *maxTests > 0 && total >= *maxTests {
+		testPaths = append(testPaths, filepath.Join(testDir, entry.Name()))
+		if *maxTests > 0 && len(testPaths) >= *maxTests {
 			break
 		}
-		total++
+	}
 
-		// Each test gets a fresh DB session to reset session state (e.g. SQL_MODE, TIMESTAMP).
-		db.Close() //nolint:errcheck
-		db, err = connectDB(addr)
-		if err != nil {
-			log.Fatalf("failed to reconnect to mylite: %v", err)
+	// Determine parallelism
+	numJobs := *jobs
+	if numJobs <= 0 {
+		numJobs = runtime.NumCPU()
+		if numJobs > 8 {
+			numJobs = 8
 		}
-		runner.DB = db
-		// Also drop all remaining tables from previous tests.
-		resetDB(db)
-		resetSessionState(db)
+	}
+	// Don't use more workers than tests
+	if numJobs > len(testPaths) {
+		numJobs = len(testPaths)
+	}
 
-		testPath := filepath.Join(testDir, entry.Name())
-		result := runner.RunFile(testPath)
-		printResult(result, *verbose)
+	if numJobs <= 1 {
+		// Sequential mode (original behavior)
+		runSequential(testPaths, includePaths, searchPaths, *verbose)
+		return
+	}
+
+	// Parallel mode
+	runParallel(testPaths, includePaths, searchPaths, *verbose, numJobs)
+}
+
+// worker represents a dedicated mylite server instance for running tests.
+type worker struct {
+	srv         *server.Server
+	exec        *executor.Executor
+	cat         *catalog.Catalog
+	store       *storage.Engine
+	addr        string
+	tmpDir      string
+	searchPaths []string
+}
+
+func newWorker(searchPaths []string) (*worker, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("failed to find free port: %v", err)
+	}
+	addr := listener.Addr().String()
+	listener.Close()
+
+	tmpDir, err := os.MkdirTemp("", "mylite-mtr-*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp dir: %v", err)
+	}
+	os.MkdirAll(filepath.Join(tmpDir, "tmp"), 0755) //nolint:errcheck
+	dataDir := filepath.Join(tmpDir, "data", "inner")
+	os.MkdirAll(dataDir, 0755) //nolint:errcheck
+
+	cat := catalog.New()
+	store := storage.NewEngine()
+	exec := executor.New(cat, store)
+	exec.DataDir = dataDir
+	exec.SearchPaths = searchPaths
+
+	srv := server.New(exec, addr)
+	go func() {
+		srv.Start() //nolint:errcheck
+	}()
+
+	return &worker{
+		srv:         srv,
+		exec:        exec,
+		cat:         cat,
+		store:       store,
+		addr:        addr,
+		tmpDir:      tmpDir,
+		searchPaths: searchPaths,
+	}, nil
+}
+
+func (w *worker) close() {
+	w.srv.Close()
+	os.RemoveAll(w.tmpDir)
+}
+
+func (w *worker) runTest(testPath string, includePaths []string, verbose bool) mtrrunner.TestResult {
+	db, err := connectDB(w.addr)
+	if err != nil {
+		return mtrrunner.TestResult{
+			Name:  strings.TrimSuffix(filepath.Base(testPath), ".test"),
+			Error: fmt.Sprintf("failed to connect: %v", err),
+		}
+	}
+	defer db.Close()
+
+	resetDB(db)
+	resetSessionState(db)
+
+	runner := &mtrrunner.Runner{
+		DB:           db,
+		IncludePaths: includePaths,
+		Verbose:      verbose,
+		TmpDir:       w.tmpDir,
+	}
+
+	return runner.RunFile(testPath)
+}
+
+type indexedResult struct {
+	index  int
+	result mtrrunner.TestResult
+}
+
+func runParallel(testPaths []string, includePaths, searchPaths []string, verbose bool, numJobs int) {
+	start := time.Now()
+
+	// Create worker pool
+	workers := make([]*worker, numJobs)
+	for i := 0; i < numJobs; i++ {
+		w, err := newWorker(searchPaths)
+		if err != nil {
+			log.Fatalf("failed to create worker %d: %v", i, err)
+		}
+		workers[i] = w
+	}
+	defer func() {
+		for _, w := range workers {
+			w.close()
+		}
+	}()
+
+	// Wait for all workers to be ready
+	for _, w := range workers {
+		db, err := connectDB(w.addr)
+		if err != nil {
+			log.Fatalf("failed to connect to worker: %v", err)
+		}
+		db.Close()
+	}
+
+	// Distribute tests to workers via channel
+	testCh := make(chan struct {
+		index int
+		path  string
+	}, len(testPaths))
+	for i, p := range testPaths {
+		testCh <- struct {
+			index int
+			path  string
+		}{i, p}
+	}
+	close(testCh)
+
+	resultCh := make(chan indexedResult, len(testPaths))
+
+	var wg sync.WaitGroup
+	for i := 0; i < numJobs; i++ {
+		wg.Add(1)
+		go func(w *worker) {
+			defer wg.Done()
+			for t := range testCh {
+				result := w.runTest(t.path, includePaths, verbose)
+				resultCh <- indexedResult{index: t.index, result: result}
+			}
+		}(workers[i])
+	}
+
+	// Close result channel when all workers are done
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	// Collect results
+	results := make([]mtrrunner.TestResult, len(testPaths))
+	for ir := range resultCh {
+		results[ir.index] = ir.result
+	}
+
+	// Print results in original order
+	var passed, failed, skipped, errors int
+	for _, r := range results {
+		printResult(r, verbose)
+		switch {
+		case r.Skipped:
+			passed++
+		case r.Passed:
+			passed++
+		case r.Error != "":
+			errors++
+		default:
+			failed++
+		}
+	}
+
+	elapsed := time.Since(start)
+	fmt.Printf("\n=== Summary ===\n")
+	fmt.Printf("Total: %d, Passed: %d, Failed: %d, Skipped: %d, Errors: %d\n",
+		len(testPaths), passed, failed, skipped, errors)
+	fmt.Printf("Time: %.1fs (%d workers)\n", elapsed.Seconds(), numJobs)
+
+	if failed+errors > 0 {
+		os.Exit(1)
+	}
+}
+
+func runSequential(testPaths []string, includePaths, searchPaths []string, verbose bool) {
+	start := time.Now()
+
+	w, err := newWorker(searchPaths)
+	if err != nil {
+		log.Fatalf("failed to create worker: %v", err)
+	}
+	defer w.close()
+
+	// Wait for server ready
+	db, err := connectDB(w.addr)
+	if err != nil {
+		log.Fatalf("failed to connect to mylite: %v", err)
+	}
+	db.Close()
+
+	var passed, failed, skipped, errors int
+	for _, testPath := range testPaths {
+		result := w.runTest(testPath, includePaths, verbose)
+		printResult(result, verbose)
 
 		switch {
 		case result.Skipped:
@@ -203,11 +337,48 @@ func main() {
 		}
 	}
 
+	elapsed := time.Since(start)
 	fmt.Printf("\n=== Summary ===\n")
 	fmt.Printf("Total: %d, Passed: %d, Failed: %d, Skipped: %d, Errors: %d\n",
-		total, passed, failed, skipped, errors)
+		len(testPaths), passed, failed, skipped, errors)
+	fmt.Printf("Time: %.1fs\n", elapsed.Seconds())
 
 	if failed+errors > 0 {
+		os.Exit(1)
+	}
+}
+
+func runSingleTest(target, suiteRoot, includeRoot string, verbose bool) {
+	searchPaths := []string{suiteRoot, includeRoot, filepath.Dir(suiteRoot)}
+	includePaths := []string{includeRoot}
+
+	suiteDir := filepath.Dir(filepath.Dir(target))
+	suiteInclude := filepath.Join(suiteDir, "include")
+	if _, err := os.Stat(suiteInclude); err == nil {
+		includePaths = append(includePaths, suiteInclude)
+	}
+	suiteTestDir := filepath.Join(suiteDir, "t")
+	if _, err := os.Stat(suiteTestDir); err == nil {
+		includePaths = append(includePaths, suiteTestDir)
+	}
+	includePaths = append(includePaths, suiteRoot)
+	searchPaths = append(searchPaths, includePaths...)
+
+	w, err := newWorker(searchPaths)
+	if err != nil {
+		log.Fatalf("failed to create worker: %v", err)
+	}
+	defer w.close()
+
+	db, err := connectDB(w.addr)
+	if err != nil {
+		log.Fatalf("failed to connect to mylite: %v", err)
+	}
+	db.Close()
+
+	result := w.runTest(target, includePaths, verbose)
+	printResult(result, verbose)
+	if !result.Passed && !result.Skipped {
 		os.Exit(1)
 	}
 }
@@ -260,26 +431,18 @@ func indent(s string) string {
 	return strings.Join(lines, "\n")
 }
 
-// resolveTestdataRoot finds the testdata directory.
-// In a worktree, the local testdata/dolt-mysql-tests may not exist (no submodule),
-// so we walk up to find the main repo's copy via .git or commondir.
 func resolveTestdataRoot() string {
-	// First, try the local relative path
 	local := "testdata/dolt-mysql-tests/files"
 	if fi, err := os.Stat(filepath.Join(local, "suite")); err == nil && fi.IsDir() {
 		return local
 	}
 
-	// Try to find the main worktree path from .git file
 	gitPath := ".git"
 	data, err := os.ReadFile(gitPath)
 	if err == nil {
 		content := strings.TrimSpace(string(data))
 		if strings.HasPrefix(content, "gitdir: ") {
-			// This is a worktree - .git file points to the real git dir
-			// e.g., "gitdir: /path/to/main/.git/worktrees/agent-xxx"
 			gitdir := strings.TrimPrefix(content, "gitdir: ")
-			// Navigate up from .git/worktrees/xxx to the main repo
 			mainRepo := filepath.Join(gitdir, "..", "..", "..")
 			candidate := filepath.Join(mainRepo, "testdata", "dolt-mysql-tests", "files")
 			if fi, err := os.Stat(filepath.Join(candidate, "suite")); err == nil && fi.IsDir() {
@@ -289,32 +452,53 @@ func resolveTestdataRoot() string {
 		}
 	}
 
-	// Fallback
 	return local
 }
 
 func resetDB(db *sql.DB) {
-	rows, err := db.Query("SHOW TABLES")
+	// Drop all databases except system ones, then recreate 'test'
+	rows, err := db.Query("SHOW DATABASES")
 	if err != nil {
 		return
 	}
 	defer rows.Close()
 
-	var tables []string
+	var databases []string
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err == nil {
+			databases = append(databases, name)
+		}
+	}
+	for _, d := range databases {
+		if d == "information_schema" || d == "performance_schema" || d == "mysql" || d == "test" {
+			continue
+		}
+		db.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", d)) //nolint:errcheck
+	}
+
+	// Drop tables in test database
+	rows2, err := db.Query("SHOW TABLES")
+	if err != nil {
+		return
+	}
+	defer rows2.Close()
+
+	var tables []string
+	for rows2.Next() {
+		var name string
+		if err := rows2.Scan(&name); err == nil {
 			tables = append(tables, name)
 		}
 	}
+	sort.Strings(tables)
 	for _, t := range tables {
 		db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", t)) //nolint:errcheck
 	}
 }
 
 func resetSessionState(db *sql.DB) {
-	// Keep each test deterministic even if previous tests changed modes.
 	db.Exec("SET SQL_MODE='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'") //nolint:errcheck
 	db.Exec("SET @@GLOBAL.SQL_MODE='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'") //nolint:errcheck
-	db.Exec("SET TIMESTAMP=DEFAULT")                                                                                                //nolint:errcheck
+	db.Exec("SET TIMESTAMP=DEFAULT") //nolint:errcheck
 }
