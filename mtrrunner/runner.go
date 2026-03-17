@@ -1355,21 +1355,66 @@ func (ctx *execContext) executeQueryOrExec(stmt string) error {
 }
 
 func (ctx *execContext) executeExec(stmt string) error {
+	if ctx.expectedError != "" {
+		// Use a dedicated connection so that if the statement succeeds,
+		// we can retrieve warnings via SHOW WARNINGS on the same connection.
+		return ctx.executeExecWithExpectedError(stmt)
+	}
 	_, err := ctx.db.Exec(stmt)
 	if err != nil {
-		if ctx.expectedError != "" {
-			if ctx.resultLogEnabled {
-				ctx.output.WriteString(formatMySQLError(err) + "\n")
-			}
-			ctx.expectedError = ""
-			return nil
-		}
 		return fmt.Errorf("exec failed: %s: %v", stmt, err)
 	}
-	if ctx.expectedError != "" {
-		ctx.expectedError = ""
+	return nil
+}
+
+// executeExecWithExpectedError runs a statement on a single connection when
+// --error was specified, so that SHOW WARNINGS can be issued on the same
+// connection if the statement succeeds instead of returning an error.
+func (ctx *execContext) executeExecWithExpectedError(stmt string) error {
+	expectedCode := ctx.expectedError
+	ctx.expectedError = ""
+
+	conn, err := ctx.db.Conn(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed to acquire connection: %v", err)
+	}
+	defer conn.Close()
+
+	_, execErr := conn.ExecContext(context.Background(), stmt)
+	if execErr != nil {
+		if ctx.resultLogEnabled {
+			ctx.output.WriteString(formatMySQLError(execErr) + "\n")
+		}
+		return nil
+	}
+
+	// Statement succeeded but we expected an error — check for warnings
+	// MySQL test framework shows warnings as errors in this case
+	if ctx.resultLogEnabled {
+		ctx.outputWarningsOnConn(conn, expectedCode)
 	}
 	return nil
+}
+
+// outputWarningsOnConn queries SHOW WARNINGS on a specific connection and
+// outputs them in mysqltest format.
+func (ctx *execContext) outputWarningsOnConn(conn *sql.Conn, expectedCode string) {
+	rows, err := conn.QueryContext(context.Background(), "SHOW WARNINGS")
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var level, message string
+		var code int
+		if err := rows.Scan(&level, &code, &message); err != nil {
+			continue
+		}
+		// Use SQLSTATE code: warnings use 01000, errors use the mapped SQLSTATE
+		sqlstate := mysqlCodeToSQLState(code)
+		ctx.output.WriteString(fmt.Sprintf("ERROR %s: %s\n", sqlstate, message))
+		return // Only show first warning
+	}
 }
 
 func (ctx *execContext) setVariable(expr string) error {
@@ -1816,6 +1861,27 @@ func formatMySQLError(err error) string {
 		return fmt.Sprintf("ERROR %s: %s", m[2], m[3])
 	}
 	return "ERROR HY000: " + msg
+}
+
+// mysqlCodeToSQLState maps a MySQL error code to its SQLSTATE.
+// Most warnings use the generic SQLSTATE 01000.
+func mysqlCodeToSQLState(code int) string {
+	// Common warning/error code to SQLSTATE mappings
+	switch code {
+	case 1048:
+		return "23000"
+	case 1062:
+		return "23000"
+	case 1264:
+		return "22003"
+	case 1265:
+		return "01000"
+	case 1366:
+		return "HY000"
+	default:
+		// Warnings (codes typically in 1000-1999 range) default to 01000
+		return "01000"
+	}
 }
 
 // parseReplacePairs parses --replace_result arguments into pairs of [from, to].

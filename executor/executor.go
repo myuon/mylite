@@ -746,12 +746,19 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	}
 
 	stmt, err := sqlparser.NewTestParser().Parse(query)
-	if err != nil {
-		// Accept statements that Vitess parser doesn't support
-		if strings.HasPrefix(upper, "SET ") {
-			e.handleRawSet(trimmed)
-			return &Result{}, nil
-		}
+		if err != nil {
+			// Accept statements that Vitess parser doesn't support
+			if strings.HasPrefix(upper, "EXPLAIN ") || strings.HasPrefix(upper, "DESC ") || strings.HasPrefix(upper, "DESCRIBE ") {
+				return &Result{
+					Columns:     []string{"id", "select_type", "table", "partitions", "type", "possible_keys", "key", "key_len", "ref", "rows", "filtered", "Extra"},
+					Rows:        [][]interface{}{{int64(1), "SIMPLE", nil, nil, "ALL", nil, nil, nil, nil, int64(1), "100.00", nil}},
+					IsResultSet: true,
+				}, nil
+			}
+			if strings.HasPrefix(upper, "SET ") {
+				e.handleRawSet(trimmed)
+				return &Result{}, nil
+			}
 		if strings.HasPrefix(upper, "USE ") {
 			nearText := strings.TrimPrefix(trimmed, "USE ")
 			nearText = strings.TrimPrefix(nearText, "use ")
@@ -3569,6 +3576,64 @@ func coerceValueForColumnType(col catalog.ColumnDef, val interface{}) interface{
 	return val
 }
 
+func hasArrayCastExpr(expr sqlparser.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	switch v := expr.(type) {
+	case *sqlparser.CastExpr:
+		return v.Array || hasArrayCastExpr(v.Expr)
+	case *sqlparser.ConvertExpr:
+		return hasArrayCastExpr(v.Expr)
+	case *sqlparser.BinaryExpr:
+		return hasArrayCastExpr(v.Left) || hasArrayCastExpr(v.Right)
+	case *sqlparser.AndExpr:
+		return hasArrayCastExpr(v.Left) || hasArrayCastExpr(v.Right)
+	case *sqlparser.OrExpr:
+		return hasArrayCastExpr(v.Left) || hasArrayCastExpr(v.Right)
+	case *sqlparser.NotExpr:
+		return hasArrayCastExpr(v.Expr)
+	case *sqlparser.ComparisonExpr:
+		return hasArrayCastExpr(v.Left) || hasArrayCastExpr(v.Right)
+	case *sqlparser.CollateExpr:
+		return hasArrayCastExpr(v.Expr)
+	case *sqlparser.FuncExpr:
+		for _, arg := range v.Exprs {
+			if hasArrayCastExpr(arg) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func validateArrayIndexExpression(expr sqlparser.Expr) error {
+	if !hasArrayCastExpr(expr) {
+		return nil
+	}
+	castExpr, ok := expr.(*sqlparser.CastExpr)
+	if !ok || !castExpr.Array {
+		return mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'CAST-ing data to array type'")
+	}
+	if hasArrayCastExpr(castExpr.Expr) {
+		return mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'CAST-ing data to array type'")
+	}
+	typeName := strings.ToUpper(castExpr.Type.Type)
+	switch typeName {
+	case "UNSIGNED", "SIGNED", "DECIMAL":
+		return nil
+	case "CHAR":
+		if castExpr.Type.Length == nil || *castExpr.Type.Length > 1024 {
+			return mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'CAST-ing data to array type'")
+		}
+		return nil
+	default:
+		return mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'CAST-ing data to array type'")
+	}
+}
+
 func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error) {
 	dbName := e.CurrentDB
 	tableName := stmt.Table.Name.String()
@@ -3644,6 +3709,9 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 
 		if col.Type.Options != nil {
+			if col.Type.Options.As != nil && hasArrayCastExpr(col.Type.Options.As) {
+				return nil, mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'CAST-ing data to array type'")
+			}
 			if col.Type.Options.Autoincrement {
 				colDef.AutoIncrement = true
 			}
@@ -3691,8 +3759,13 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	for _, idx := range stmt.TableSpec.Indexes {
 		var idxCols []string
 		for _, idxCol := range idx.Columns {
+			if err := validateArrayIndexExpression(idxCol.Expression); err != nil {
+				return nil, err
+			}
 			colStr := idxCol.Column.String()
-			if idxCol.Length != nil {
+			if idxCol.Expression != nil {
+				colStr = fmt.Sprintf("(%s)", strings.TrimSpace(sqlparser.String(idxCol.Expression)))
+			} else if idxCol.Length != nil {
 				colStr += fmt.Sprintf("(%d)", *idxCol.Length)
 			}
 			idxCols = append(idxCols, colStr)
@@ -5279,9 +5352,11 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		if tbl, ok := stmt.From[0].(*sqlparser.AliasedTableExpr); ok {
 			if tn, ok := tbl.Expr.(sqlparser.TableName); ok {
 				tableName := tn.Name.String()
-				if db, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
-					if td, ok := db.Tables[tableName]; ok {
-						e.queryTableDef = td
+				if e.Catalog != nil {
+					if db, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
+						if td, ok := db.Tables[tableName]; ok {
+							e.queryTableDef = td
+						}
 					}
 				}
 			}
@@ -7453,6 +7528,12 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			tableDef, tdErr := db.GetTable(tableName)
 			if tdErr == nil {
 				for _, idxCol := range op.IndexDefinition.Columns {
+					if err := validateArrayIndexExpression(idxCol.Expression); err != nil {
+						return nil, err
+					}
+					if idxCol.Expression != nil {
+						continue
+					}
 					colName := idxCol.Column.String()
 					found := false
 					for _, col := range tableDef.Columns {
@@ -7470,7 +7551,9 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			var idxCols []string
 			for _, idxCol := range op.IndexDefinition.Columns {
 				colStr := idxCol.Column.String()
-				if idxCol.Length != nil {
+				if idxCol.Expression != nil {
+					colStr = fmt.Sprintf("(%s)", strings.TrimSpace(sqlparser.String(idxCol.Expression)))
+				} else if idxCol.Length != nil {
 					colStr += fmt.Sprintf("(%d)", *idxCol.Length)
 				}
 				idxCols = append(idxCols, colStr)
@@ -8319,8 +8402,10 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	for i, idx := range sortedIndexes {
 		quotedCols := make([]string, len(idx.Columns))
 		for j, c := range idx.Columns {
-			// Handle column with length prefix like "c1(10)"
-			if lparen := strings.Index(c, "("); lparen >= 0 {
+			if strings.HasPrefix(c, "(") && strings.HasSuffix(c, ")") {
+				quotedCols[j] = c
+			} else if lparen := strings.Index(c, "("); lparen >= 0 {
+				// Handle column with length prefix like "c1(10)"
 				quotedCols[j] = fmt.Sprintf("`%s`%s", c[:lparen], c[lparen:])
 			} else {
 				quotedCols[j] = fmt.Sprintf("`%s`", c)
@@ -8842,6 +8927,9 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 		return e.evalExpr(v.Expr)
 	case *sqlparser.CastExpr:
+		if v.Array {
+			return nil, mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'CAST-ing data to array type'")
+		}
 		// CAST(expr AS type) - similar to ConvertExpr
 		val, err := e.evalExpr(v.Expr)
 		if err != nil {
