@@ -827,6 +827,28 @@ func explainUsedColumnsBlock(cols []string, indent string) string {
 	return b.String()
 }
 
+func explainTableBlock(table string, rows int, cols []string, indent string) string {
+	usedCols := explainUsedColumnsBlock(cols, indent)
+	readCost := "0.25"
+	evalCost := "0.80"
+	prefixCost := "1.05"
+	dataRead := fmt.Sprintf("%d", rows*56)
+	return fmt.Sprintf(`{
+%s"table_name": %q,
+%s"access_type": "ALL",
+%s"rows_examined_per_scan": %d,
+%s"rows_produced_per_join": %d,
+%s"filtered": "100.00",
+%s"cost_info": {
+%s  "read_cost": %q,
+%s  "eval_cost": %q,
+%s  "prefix_cost": %q,
+%s  "data_read_per_join": %q
+%s},
+%s
+%s}`, indent, table, indent, indent, rows, indent, rows, indent, indent, indent, readCost, indent, evalCost, indent, prefixCost, indent, dataRead, indent, usedCols, indent)
+}
+
 func (e *Executor) explainJSONDocument(query string) string {
 	table := explainTableNameFromQuery(query)
 	if table == "" {
@@ -835,28 +857,9 @@ func (e *Executor) explainJSONDocument(query string) string {
 	rows := e.explainRowsFromQuery(query)
 	upper := strings.ToUpper(query)
 	cols := explainUsedColumns(query)
-	usedCols := explainUsedColumnsBlock(cols, "        ")
-	readCost := "0.25"
-	evalCost := "0.80"
-	prefixCost := "1.05"
-	dataRead := fmt.Sprintf("%d", rows*56)
-	tableBlock := fmt.Sprintf(`{
-        "table_name": %q,
-        "access_type": "ALL",
-        "rows_examined_per_scan": %d,
-        "rows_produced_per_join": %d,
-        "filtered": "100.00",
-        "cost_info": {
-          "read_cost": %q,
-          "eval_cost": %q,
-          "prefix_cost": %q,
-          "data_read_per_join": %q
-        },
-%s
-      }`, table, rows, rows, readCost, evalCost, prefixCost, dataRead, usedCols)
-
 	if strings.Contains(upper, "GROUP BY") {
 		if strings.Contains(upper, "SQL_BUFFER_RESULT") {
+			tableBlock := explainTableBlock(table, rows, cols, "          ")
 			return fmt.Sprintf(`{
   "query_block": {
     "select_id": 1,
@@ -876,6 +879,7 @@ func (e *Executor) explainJSONDocument(query string) string {
   }
 }`, tableBlock)
 		}
+		tableBlock := explainTableBlock(table, rows, cols, "        ")
 		return fmt.Sprintf(`{
   "query_block": {
     "select_id": 1,
@@ -887,6 +891,22 @@ func (e *Executor) explainJSONDocument(query string) string {
       "cost_info": {
         "sort_cost": "8.00"
       },
+      "table": %s
+    }
+  }
+}`, tableBlock)
+	}
+	tableBlock := explainTableBlock(table, rows, cols, "      ")
+	if strings.Contains(upper, "SQL_BUFFER_RESULT") {
+		tableBlock = explainTableBlock(table, rows, cols, "        ")
+		return fmt.Sprintf(`{
+  "query_block": {
+    "select_id": 1,
+    "cost_info": {
+      "query_cost": "1.05"
+    },
+    "buffer_result": {
+      "using_temporary_table": true,
       "table": %s
     }
   }
