@@ -264,6 +264,17 @@ func (ctx *execContext) executeLines(lines []string) error {
 		line := lines[i]
 		trimmed := strings.TrimSpace(line)
 
+		// Skip mysqltest perl blocks entirely.
+		if isPerlBlockStart(trimmed) {
+			i = skipPerlBlock(lines, i)
+			continue
+		}
+		// Skip heredoc bodies used by write_file/append_file directives.
+		if isHereDocDirectiveStart(trimmed) {
+			i = skipHereDoc(lines, i)
+			continue
+		}
+
 		// Empty lines are skipped (mysqltest does not echo blank lines)
 		if trimmed == "" {
 			i++
@@ -272,6 +283,24 @@ func (ctx *execContext) executeLines(lines []string) error {
 
 		// Comments starting with # are NOT echoed to output (mysqltest behavior)
 		if strings.HasPrefix(trimmed, "#") {
+			i++
+			continue
+		}
+
+		// Standalone block terminators from skipped mysqltest/perl blocks.
+		if trimmed == "}" || trimmed == "};" {
+			i++
+			continue
+		}
+
+		// Some mysqltest includes execute SQL via a bare variable line ($var).
+		if strings.HasPrefix(trimmed, "$") && !strings.ContainsAny(trimmed, " \t") {
+			expanded := strings.TrimSpace(ctx.substituteVars(trimmed))
+			if expanded != "" && expanded != trimmed {
+				if err := ctx.executeSQL(expanded); err != nil {
+					return err
+				}
+			}
 			i++
 			continue
 		}
@@ -1006,6 +1035,54 @@ func isConditionComplete(s string) bool {
 		}
 	}
 	return depth <= 0
+}
+
+func isPerlBlockStart(trimmed string) bool {
+	t := strings.TrimSpace(trimmed)
+	if strings.HasPrefix(t, "--") {
+		t = strings.TrimSpace(strings.TrimPrefix(t, "--"))
+	}
+	t = strings.ToLower(t)
+	return t == "perl" || t == "perl;" || strings.HasPrefix(t, "perl ")
+}
+
+func skipPerlBlock(lines []string, i int) int {
+	// mysqltest perl blocks usually end at a line containing "EOF",
+	// optionally followed by a standalone ";" on the next line.
+	i++
+	for i < len(lines) {
+		t := strings.TrimSpace(lines[i])
+		if strings.EqualFold(t, "EOF") || strings.EqualFold(t, "EOF;") {
+			i++
+			if i < len(lines) && strings.TrimSpace(lines[i]) == ";" {
+				i++
+			}
+			return i
+		}
+		i++
+	}
+	return i
+}
+
+func isHereDocDirectiveStart(trimmed string) bool {
+	t := strings.TrimSpace(trimmed)
+	if strings.HasPrefix(t, "--") {
+		t = strings.TrimSpace(strings.TrimPrefix(t, "--"))
+	}
+	name, _ := parseDirectiveNameArgs(t)
+	return name == "write_file" || name == "append_file"
+}
+
+func skipHereDoc(lines []string, i int) int {
+	i++
+	for i < len(lines) {
+		t := strings.TrimSpace(lines[i])
+		if strings.EqualFold(t, "EOF") || strings.EqualFold(t, "EOF;") {
+			return i + 1
+		}
+		i++
+	}
+	return i
 }
 
 func (ctx *execContext) evaluateIfCondition(condStr string) bool {
@@ -1771,7 +1848,7 @@ var directiveKeywords = map[string]bool{
 	"send_shutdown":     true,
 	"disable_reconnect": true, "enable_reconnect": true,
 	"query_vertical": true,
-	"require": true,
+	"require":        true,
 }
 
 func isDirectiveKeyword(s string) bool {

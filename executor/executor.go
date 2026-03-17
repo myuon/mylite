@@ -180,7 +180,7 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	// MySQL test suite (MTR) defaults to timezone GMT-3 (= UTC+3).
 	// We mirror this so SET TIMESTAMP + CURRENT_TIME() match expected results.
 	defaultTZ := time.FixedZone("GMT-3", 3*60*60)
-	return &Executor{
+	e := &Executor{
 		Catalog:       cat,
 		Storage:       store,
 		CurrentDB:     "test",
@@ -192,6 +192,156 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		globalVars:    make(map[string]string),
 		timeZone:      defaultTZ,
 	}
+	e.initSystemTables()
+	return e
+}
+
+func (e *Executor) initSystemTables() {
+	if e.Catalog == nil || e.Storage == nil {
+		return
+	}
+
+	ensure := func(dbName string, def *catalog.TableDef) {
+		e.Storage.EnsureDatabase(dbName)
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			return
+		}
+		if _, err := db.GetTable(def.Name); err != nil {
+			db.CreateTable(def) //nolint:errcheck
+			e.Storage.CreateTable(dbName, def)
+		}
+	}
+
+	ensure("mysql", &catalog.TableDef{
+		Name: "innodb_table_stats",
+		Columns: []catalog.ColumnDef{
+			{Name: "database_name", Type: "VARCHAR(64)"},
+			{Name: "table_name", Type: "VARCHAR(199)"},
+			{Name: "last_update", Type: "TIMESTAMP"},
+			{Name: "n_rows", Type: "BIGINT"},
+			{Name: "clustered_index_size", Type: "BIGINT"},
+			{Name: "sum_of_other_index_sizes", Type: "BIGINT"},
+		},
+	})
+
+	ensure("mysql", &catalog.TableDef{
+		Name: "innodb_index_stats",
+		Columns: []catalog.ColumnDef{
+			{Name: "database_name", Type: "VARCHAR(64)"},
+			{Name: "table_name", Type: "VARCHAR(199)"},
+			{Name: "index_name", Type: "VARCHAR(64)"},
+			{Name: "last_update", Type: "TIMESTAMP"},
+			{Name: "stat_name", Type: "VARCHAR(64)"},
+			{Name: "stat_value", Type: "BIGINT"},
+			{Name: "sample_size", Type: "BIGINT"},
+			{Name: "stat_description", Type: "VARCHAR(1024)"},
+		},
+	})
+
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "setup_instruments",
+		Columns: []catalog.ColumnDef{
+			{Name: "NAME", Type: "VARCHAR(128)"},
+			{Name: "ENABLED", Type: "VARCHAR(8)"},
+			{Name: "TIMED", Type: "VARCHAR(8)"},
+		},
+	})
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "setup_consumers",
+		Columns: []catalog.ColumnDef{
+			{Name: "NAME", Type: "VARCHAR(128)"},
+			{Name: "ENABLED", Type: "VARCHAR(8)"},
+		},
+	})
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "session_status",
+		Columns: []catalog.ColumnDef{
+			{Name: "VARIABLE_NAME", Type: "VARCHAR(64)"},
+			{Name: "VARIABLE_VALUE", Type: "VARCHAR(1024)"},
+		},
+	})
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "global_status",
+		Columns: []catalog.ColumnDef{
+			{Name: "VARIABLE_NAME", Type: "VARCHAR(64)"},
+			{Name: "VARIABLE_VALUE", Type: "VARCHAR(1024)"},
+		},
+	})
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "file_summary_by_event_name",
+		Columns: []catalog.ColumnDef{
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "COUNT_STAR", Type: "BIGINT"},
+		},
+	})
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "events_stages_history",
+		Columns: []catalog.ColumnDef{
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "WORK_COMPLETED", Type: "BIGINT"},
+			{Name: "WORK_ESTIMATED", Type: "BIGINT"},
+		},
+	})
+
+	ensure("information_schema", &catalog.TableDef{
+		Name: "INNODB_TRX",
+		Columns: []catalog.ColumnDef{
+			{Name: "trx_id", Type: "VARCHAR(32)"},
+			{Name: "trx_state", Type: "VARCHAR(32)"},
+			{Name: "trx_started", Type: "DATETIME"},
+		},
+	})
+	ensure("information_schema", &catalog.TableDef{
+		Name: "INNODB_BUFFER_POOL_STATS",
+		Columns: []catalog.ColumnDef{
+			{Name: "POOL_ID", Type: "BIGINT"},
+			{Name: "POOL_SIZE", Type: "BIGINT"},
+		},
+	})
+	ensure("information_schema", &catalog.TableDef{
+		Name: "INNODB_FOREIGN_COLS",
+		Columns: []catalog.ColumnDef{
+			{Name: "ID", Type: "VARCHAR(255)"},
+			{Name: "FOR_COL_NAME", Type: "VARCHAR(64)"},
+			{Name: "REF_COL_NAME", Type: "VARCHAR(64)"},
+			{Name: "POS", Type: "BIGINT"},
+		},
+	})
+	ensure("information_schema", &catalog.TableDef{
+		Name: "INNODB_INDEXES",
+		Columns: []catalog.ColumnDef{
+			{Name: "INDEX_ID", Type: "BIGINT"},
+			{Name: "NAME", Type: "VARCHAR(255)"},
+			{Name: "TABLE_ID", Type: "BIGINT"},
+			{Name: "TYPE", Type: "BIGINT"},
+		},
+	})
+	ensure("information_schema", &catalog.TableDef{
+		Name: "INNODB_BUFFER_PAGE",
+		Columns: []catalog.ColumnDef{
+			{Name: "SPACE", Type: "BIGINT"},
+			{Name: "PAGE_NUMBER", Type: "BIGINT"},
+			{Name: "PAGE_TYPE", Type: "VARCHAR(64)"},
+			{Name: "NUMBER_RECORDS", Type: "BIGINT"},
+		},
+	})
+	ensure("information_schema", &catalog.TableDef{
+		Name: "OPTIMIZER_TRACE",
+		Columns: []catalog.ColumnDef{
+			{Name: "QUERY", Type: "LONGTEXT"},
+			{Name: "TRACE", Type: "LONGTEXT"},
+		},
+	})
+	ensure("information_schema", &catalog.TableDef{
+		Name: "INNODB_TEMP_TABLE_INFO",
+		Columns: []catalog.ColumnDef{
+			{Name: "TABLE_ID", Type: "BIGINT"},
+			{Name: "NAME", Type: "VARCHAR(255)"},
+			{Name: "N_COLS", Type: "BIGINT"},
+			{Name: "SPACE", Type: "BIGINT"},
+		},
+	})
 }
 
 // mysqlError formats an error message in MySQL error style.
@@ -1102,25 +1252,25 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	}
 
 	stmt, err := sqlparser.NewTestParser().Parse(query)
-		if err != nil {
-			// Accept statements that Vitess parser doesn't support
-			if strings.HasPrefix(upper, "EXPLAIN ") || strings.HasPrefix(upper, "DESC ") || strings.HasPrefix(upper, "DESCRIBE ") {
-				explainType := sqlparser.TraditionalType
-				if strings.Contains(upper, "FORMAT=JSON") {
-					explainType = sqlparser.JSONType
-				} else if strings.Contains(upper, "FORMAT=TREE") {
-					explainType = sqlparser.TreeType
-				}
-				explainedQuery := trimmed
-				if idx := strings.Index(strings.ToUpper(trimmed), "SELECT "); idx >= 0 {
-					explainedQuery = strings.TrimSpace(trimmed[idx:])
-				}
-				return e.explainResultForType(explainType, explainedQuery), nil
+	if err != nil {
+		// Accept statements that Vitess parser doesn't support
+		if strings.HasPrefix(upper, "EXPLAIN ") || strings.HasPrefix(upper, "DESC ") || strings.HasPrefix(upper, "DESCRIBE ") {
+			explainType := sqlparser.TraditionalType
+			if strings.Contains(upper, "FORMAT=JSON") {
+				explainType = sqlparser.JSONType
+			} else if strings.Contains(upper, "FORMAT=TREE") {
+				explainType = sqlparser.TreeType
 			}
-			if strings.HasPrefix(upper, "SET ") {
-				e.handleRawSet(trimmed)
-				return &Result{}, nil
+			explainedQuery := trimmed
+			if idx := strings.Index(strings.ToUpper(trimmed), "SELECT "); idx >= 0 {
+				explainedQuery = strings.TrimSpace(trimmed[idx:])
 			}
+			return e.explainResultForType(explainType, explainedQuery), nil
+		}
+		if strings.HasPrefix(upper, "SET ") {
+			e.handleRawSet(trimmed)
+			return &Result{}, nil
+		}
 		if strings.HasPrefix(upper, "USE ") {
 			nearText := strings.TrimPrefix(trimmed, "USE ")
 			nearText = strings.TrimPrefix(nearText, "use ")
@@ -1213,6 +1363,12 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return e.execCommit()
 	case *sqlparser.Rollback:
 		return e.execRollback()
+	case *sqlparser.SRollback:
+		// ROLLBACK TO SAVEPOINT: accepted as a no-op for compatibility.
+		return &Result{}, nil
+	case *sqlparser.Savepoint:
+		// SAVEPOINT: accepted as a no-op for compatibility.
+		return &Result{}, nil
 	case *sqlparser.TruncateTable:
 		return e.execTruncateTable(s)
 	case *sqlparser.Set:
@@ -1273,6 +1429,8 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	case *sqlparser.Flush:
 		// FLUSH STATUS, FLUSH TABLES, etc. - no-op
 		return &Result{}, nil
+	case *sqlparser.OtherAdmin:
+		return e.execOtherAdmin(query)
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %T", s)
 	}
@@ -4988,20 +5146,20 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		}
 
 		// Check explicit NULL on NOT NULL columns (always an error, even non-strict)
-			{
-				colNameSet := make(map[string]bool, len(colNames))
-				for _, cn := range colNames {
-					colNameSet[cn] = true
+		{
+			colNameSet := make(map[string]bool, len(colNames))
+			for _, cn := range colNames {
+				colNameSet[cn] = true
+			}
+			for _, col := range tbl.Def.Columns {
+				isAutoGenCol := col.AutoIncrement || isGeneratedColumnType(col.Type)
+				// In strict mode, missing NOT NULL columns without defaults are errors
+				if e.isStrictMode() && !col.Nullable && !isAutoGenCol && col.Default == nil && !colNameSet[col.Name] {
+					return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
 				}
-				for _, col := range tbl.Def.Columns {
-					isAutoGenCol := col.AutoIncrement || isGeneratedColumnType(col.Type)
-					// In strict mode, missing NOT NULL columns without defaults are errors
-					if e.isStrictMode() && !col.Nullable && !isAutoGenCol && col.Default == nil && !colNameSet[col.Name] {
-						return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
-					}
-					// Explicit NULL into NOT NULL column
-					if !col.Nullable && !isAutoGenCol && colNameSet[col.Name] {
-						if v, ok := row[col.Name]; ok && v == nil {
+				// Explicit NULL into NOT NULL column
+				if !col.Nullable && !isAutoGenCol && colNameSet[col.Name] {
+					if v, ok := row[col.Name]; ok && v == nil {
 						// In multi-row INSERT non-strict mode: convert NULL to zero + warning
 						// In single-row INSERT or strict mode: error
 						isMultiRow := false
@@ -5177,13 +5335,13 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 		}
 
-			// Strict mode validation before insert
-			if e.isStrictMode() {
-				for _, col := range tbl.Def.Columns {
-					isAutoGenCol := col.AutoIncrement || isGeneratedColumnType(col.Type)
-					// NOT NULL check
-					if !col.Nullable && !isAutoGenCol {
-						rv, exists := row[col.Name]
+		// Strict mode validation before insert
+		if e.isStrictMode() {
+			for _, col := range tbl.Def.Columns {
+				isAutoGenCol := col.AutoIncrement || isGeneratedColumnType(col.Type)
+				// NOT NULL check
+				if !col.Nullable && !isAutoGenCol {
+					rv, exists := row[col.Name]
 					// Check if column was explicitly specified in the INSERT
 					explicitlySpecified := false
 					for _, cn := range colNames {
@@ -5192,10 +5350,10 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							break
 						}
 					}
-						if !explicitlySpecified && col.Default == nil {
-							// Column not specified and has no default -> error 1364
-								return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
-						} else if exists && rv == nil && explicitlySpecified {
+					if !explicitlySpecified && col.Default == nil {
+						// Column not specified and has no default -> error 1364
+						return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
+					} else if exists && rv == nil && explicitlySpecified {
 						return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
 					}
 				}
@@ -7836,6 +7994,11 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 	if len(stmt.TableExprs) > 1 {
 		return e.execMultiTableDeleteAST(stmt)
 	}
+	if len(stmt.TableExprs) == 1 {
+		if _, ok := stmt.TableExprs[0].(*sqlparser.JoinTableExpr); ok {
+			return e.execMultiTableDeleteAST(stmt)
+		}
+	}
 	// DELETE QUICK sets Targets=[QUICK] with 1 TableExpr; that's still single-table.
 	if len(stmt.Targets) > 0 && len(stmt.Targets) != len(stmt.TableExprs) {
 		return e.execMultiTableDeleteAST(stmt)
@@ -8543,19 +8706,43 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 // execDescribe handles DESCRIBE <table> and DESC <table> (parsed as *sqlparser.ExplainTab).
 func (e *Executor) execDescribe(stmt *sqlparser.ExplainTab) (*Result, error) {
-	return e.describeTable(stmt.Table.Name.String())
+	tableName := stmt.Table.Name.String()
+	if q := stmt.Table.Qualifier.String(); q != "" {
+		tableName = q + "." + tableName
+	}
+	return e.describeTable(tableName)
+}
+
+func findTableDefCaseInsensitive(db *catalog.Database, tableName string) (*catalog.TableDef, string, error) {
+	if def, err := db.GetTable(tableName); err == nil {
+		return def, tableName, nil
+	}
+	for _, name := range db.ListTables() {
+		if strings.EqualFold(name, tableName) {
+			def, err := db.GetTable(name)
+			if err == nil {
+				return def, name, nil
+			}
+		}
+	}
+	return nil, tableName, fmt.Errorf("table '%s' doesn't exist", tableName)
 }
 
 // describeTable returns column metadata for a table, matching MySQL DESCRIBE output.
 func (e *Executor) describeTable(tableName string) (*Result, error) {
-	db, err := e.Catalog.GetDatabase(e.CurrentDB)
-	if err != nil {
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	descDB := e.CurrentDB
+	if strings.Contains(tableName, ".") {
+		descDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
 	}
-	tblDef, err := db.GetTable(tableName)
+	db, err := e.Catalog.GetDatabase(descDB)
 	if err != nil {
-		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", descDB))
 	}
+	tblDef, resolvedTableName, err := findTableDefCaseInsensitive(db, tableName)
+	if err != nil {
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", descDB, tableName))
+	}
+	tableName = resolvedTableName
 
 	cols := []string{"Field", "Type", "Null", "Key", "Default", "Extra"}
 	rows := make([][]interface{}, 0, len(tblDef.Columns))
@@ -9172,10 +9359,11 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	def, err := db.GetTable(tableName)
+	def, resolvedTableName, err := findTableDefCaseInsensitive(db, tableName)
 	if err != nil {
 		return nil, fmt.Errorf("ERROR 1146 (42S02): Table '%s.%s' doesn't exist", showDB, tableName)
 	}
+	tableName = resolvedTableName
 
 	// Get AUTO_INCREMENT value
 	autoIncVal := int64(0)
@@ -9407,7 +9595,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 				return v.Val, nil
 			}
 			return n, nil
-			case sqlparser.BitNum:
+		case sqlparser.BitNum:
 			// 0b1010 or b'1010' -> parse as integer
 			s := strings.TrimSpace(v.Val)
 			if strings.HasPrefix(strings.ToLower(s), "b'") && strings.HasSuffix(s, "'") {
@@ -9423,14 +9611,14 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			if err != nil {
 				return v.Val, nil
 			}
-				if u <= math.MaxInt64 {
-					return int64(u), nil
-				}
-				return u, nil
-			default:
-				// Handle timestamp/date/time typed literals as plain string values.
-				return v.Val, nil
+			if u <= math.MaxInt64 {
+				return int64(u), nil
 			}
+			return u, nil
+		default:
+			// Handle timestamp/date/time typed literals as plain string values.
+			return v.Val, nil
+		}
 	case *sqlparser.NullVal:
 		return nil, nil
 	case sqlparser.BoolVal:
