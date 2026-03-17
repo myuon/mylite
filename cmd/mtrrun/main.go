@@ -85,17 +85,7 @@ func main() {
 	defer srv.Close()
 
 	// Wait for server
-	var db *sql.DB
-	for i := 0; i < 50; i++ {
-		db, err = sql.Open("mysql", fmt.Sprintf("root:@tcp(%s)/test", addr))
-		if err == nil {
-			err = db.Ping()
-			if err == nil {
-				break
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	db, err := connectDB(addr)
 	if err != nil {
 		log.Fatalf("failed to connect to mylite: %v", err)
 	}
@@ -173,9 +163,16 @@ func main() {
 		}
 		total++
 
-		// Each test gets a fresh DB state - reconnect to reset
-		// For now, just DROP all tables before each test
+		// Each test gets a fresh DB session to reset session state (e.g. SQL_MODE, TIMESTAMP).
+		db.Close() //nolint:errcheck
+		db, err = connectDB(addr)
+		if err != nil {
+			log.Fatalf("failed to reconnect to mylite: %v", err)
+		}
+		runner.DB = db
+		// Also drop all remaining tables from previous tests.
 		resetDB(db)
+		resetSessionState(db)
 
 		testPath := filepath.Join(testDir, entry.Name())
 		result := runner.RunFile(testPath)
@@ -200,6 +197,24 @@ func main() {
 	if failed+errors > 0 {
 		os.Exit(1)
 	}
+}
+
+func connectDB(addr string) (*sql.DB, error) {
+	var db *sql.DB
+	var err error
+	for i := 0; i < 50; i++ {
+		db, err = sql.Open("mysql", fmt.Sprintf("root:@tcp(%s)/test", addr))
+		if err == nil {
+			pingErr := db.Ping()
+			if pingErr == nil {
+				return db, nil
+			}
+			db.Close() //nolint:errcheck
+			err = pingErr
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return nil, err
 }
 
 func printResult(r mtrrunner.TestResult, verbose bool) {
@@ -282,4 +297,11 @@ func resetDB(db *sql.DB) {
 	for _, t := range tables {
 		db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", t)) //nolint:errcheck
 	}
+}
+
+func resetSessionState(db *sql.DB) {
+	// Keep each test deterministic even if previous tests changed modes.
+	db.Exec("SET SQL_MODE='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'") //nolint:errcheck
+	db.Exec("SET @@GLOBAL.SQL_MODE='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'") //nolint:errcheck
+	db.Exec("SET TIMESTAMP=DEFAULT")                                                                                                //nolint:errcheck
 }
