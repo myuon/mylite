@@ -10264,6 +10264,9 @@ func (e *Executor) getColumnCharset(colName *sqlparser.ColName) string {
 	if !colName.Qualifier.Name.IsEmpty() {
 		tableName = colName.Qualifier.Name.String()
 	}
+	if e.CurrentDB == "" {
+		return ""
+	}
 	db, err := e.Catalog.GetDatabase(e.CurrentDB)
 	if err != nil {
 		return ""
