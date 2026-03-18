@@ -349,6 +349,148 @@ func (e *Executor) initSystemTables() {
 	})
 }
 
+func isSystemSchemaName(name string) bool {
+	switch strings.ToLower(name) {
+	case "information_schema", "mysql", "performance_schema", "sys":
+		return true
+	default:
+		return false
+	}
+}
+
+func statsIndexColName(raw string) string {
+	if idx := strings.Index(raw, "("); idx >= 0 {
+		return strings.TrimSpace(raw[:idx])
+	}
+	return strings.TrimSpace(raw)
+}
+
+func (e *Executor) innodbStatsPersistentEnabled(def *catalog.TableDef) bool {
+	if def != nil && def.StatsPersistent != nil {
+		return *def.StatsPersistent != 0
+	}
+	if v, ok := e.globalVars["innodb_stats_persistent"]; ok && v != "" {
+		return v != "0" && !strings.EqualFold(v, "OFF")
+	}
+	return true
+}
+
+func (e *Executor) refreshInnoDBStatsTables() {
+	if e.Catalog == nil || e.Storage == nil {
+		return
+	}
+	mysqlDB, err := e.Catalog.GetDatabase("mysql")
+	if err != nil {
+		return
+	}
+	tblStats, err := e.Storage.GetTable("mysql", "innodb_table_stats")
+	if err != nil {
+		return
+	}
+	idxStats, err := e.Storage.GetTable("mysql", "innodb_index_stats")
+	if err != nil {
+		return
+	}
+
+	lastUpdate := time.Now().UTC().Format("2006-01-02 15:04:05")
+	tableRows := make([]storage.Row, 0, 256)
+	indexRows := make([]storage.Row, 0, 1024)
+
+	for dbName, db := range e.Catalog.Databases {
+		if isSystemSchemaName(dbName) {
+			continue
+		}
+		for tableName, def := range db.Tables {
+			if def == nil {
+				continue
+			}
+			if def.Engine != "" && !strings.EqualFold(def.Engine, "InnoDB") {
+				continue
+			}
+			if !e.innodbStatsPersistentEnabled(def) {
+				continue
+			}
+			var rowCount int64
+			if t, err := e.Storage.GetTable(dbName, tableName); err == nil {
+				t.Mu.RLock()
+				rowCount = int64(len(t.Rows))
+				t.Mu.RUnlock()
+			}
+			tableRows = append(tableRows, storage.Row{
+				"database_name":            dbName,
+				"table_name":               tableName,
+				"last_update":              lastUpdate,
+				"n_rows":                   rowCount,
+				"clustered_index_size":     int64(1),
+				"sum_of_other_index_sizes": int64(len(def.Indexes)),
+			})
+
+			indexDefs := make([]catalog.IndexDef, 0, len(def.Indexes)+1)
+			if len(def.PrimaryKey) > 0 {
+				indexDefs = append(indexDefs, catalog.IndexDef{Name: "PRIMARY", Columns: append([]string(nil), def.PrimaryKey...)})
+			}
+			indexDefs = append(indexDefs, def.Indexes...)
+			if len(indexDefs) == 0 {
+				indexDefs = append(indexDefs, catalog.IndexDef{Name: "GEN_CLUST_INDEX", Columns: []string{"DB_ROW_ID"}})
+			}
+			for _, idx := range indexDefs {
+				indexName := idx.Name
+				if indexName == "" {
+					indexName = "PRIMARY"
+				}
+				firstCol := "id"
+				if len(idx.Columns) > 0 {
+					firstCol = statsIndexColName(idx.Columns[0])
+				}
+				indexRows = append(indexRows,
+					storage.Row{
+						"database_name":    dbName,
+						"table_name":       tableName,
+						"index_name":       indexName,
+						"last_update":      lastUpdate,
+						"stat_name":        "n_diff_pfx01",
+						"stat_value":       rowCount,
+						"sample_size":      rowCount,
+						"stat_description": firstCol,
+					},
+					storage.Row{
+						"database_name":    dbName,
+						"table_name":       tableName,
+						"index_name":       indexName,
+						"last_update":      lastUpdate,
+						"stat_name":        "n_leaf_pages",
+						"stat_value":       int64(1),
+						"sample_size":      nil,
+						"stat_description": "Number of leaf pages in the index",
+					},
+					storage.Row{
+						"database_name":    dbName,
+						"table_name":       tableName,
+						"index_name":       indexName,
+						"last_update":      lastUpdate,
+						"stat_name":        "size",
+						"stat_value":       int64(1),
+						"sample_size":      nil,
+						"stat_description": "Number of pages in the index",
+					},
+				)
+			}
+		}
+	}
+
+	// Keep table definition existence checked to avoid writing into stale tables.
+	if _, err := mysqlDB.GetTable("innodb_table_stats"); err == nil {
+		tblStats.Mu.Lock()
+		tblStats.Rows = tableRows
+		tblStats.Mu.Unlock()
+	}
+	if _, err := mysqlDB.GetTable("innodb_index_stats"); err == nil {
+		idxStats.Mu.Lock()
+		idxStats.Rows = indexRows
+		idxStats.Mu.Unlock()
+	}
+}
+
 // mysqlError formats an error message in MySQL error style.
 // Format: "ERROR <code> (<state>): <message>"
 func mysqlError(code int, state, message string) error {
@@ -1117,6 +1259,9 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	trimmed := strings.TrimSpace(query)
 	e.currentQuery = trimmed
 	upper := strings.ToUpper(trimmed)
+	if strings.Contains(upper, "MYSQL.INNODB_TABLE_STATS") || strings.Contains(upper, "MYSQL.INNODB_INDEX_STATS") {
+		e.refreshInnoDBStatsTables()
+	}
 	compact := strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "").Replace(upper)
 	if compact == "SELECTJSON_SCHEMA_VALID()" ||
 		compact == "SELECTJSON_SCHEMA_VALID(NULL)" ||
