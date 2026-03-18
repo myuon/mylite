@@ -1175,6 +1175,20 @@ func replaceTypeWord(query, old, replacement string) string {
 	return query
 }
 
+// normalizeStorageClause strips "STORAGE DISK" and "STORAGE MEMORY" from
+// column definitions. The vitess parser does not recognise these MySQL column
+// attributes and silently produces a nil TableSpec for CREATE TABLE statements
+// that contain them. Since mylite is an in-memory engine the storage attribute
+// is irrelevant.
+func normalizeStorageClause(query string) string {
+	upper := strings.ToUpper(query)
+	if !strings.Contains(upper, "STORAGE DISK") && !strings.Contains(upper, "STORAGE MEMORY") {
+		return query
+	}
+	re := regexp.MustCompile(`(?i)\bSTORAGE\s+(DISK|MEMORY)\b`)
+	return re.ReplaceAllString(query, "")
+}
+
 // normalizeAddIndexUsing rewrites "ADD KEY USING BTREE (" and similar forms
 // to "ADD KEY (" since the vitess parser does not handle USING before column list.
 func normalizeAddIndexUsing(query string) string {
@@ -1520,6 +1534,7 @@ func (e *Executor) Execute(query string) (*Result, error) {
 
 	// Normalize SQL type aliases that vitess parser doesn't support
 	query = normalizeTypeAliases(query)
+	query = normalizeStorageClause(query)
 	// Fix vitess parser issue: "ADD KEY USING BTREE (col)" is not parsed correctly.
 	// Rewrite to "ADD KEY (col)" since BTREE is the default for InnoDB.
 	query = normalizeAddIndexUsing(query)
@@ -4800,6 +4815,10 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	var indexes []catalog.IndexDef
 	hasArrayMVIIndex := false
 	for _, idx := range stmt.TableSpec.Indexes {
+		// Reject the reserved InnoDB clustered index name.
+		if strings.EqualFold(idx.Info.Name.String(), "GEN_CLUST_INDEX") {
+			return nil, mysqlError(1280, "42000", "Incorrect index name 'GEN_CLUST_INDEX'")
+		}
 		var idxCols []string
 		var idxOrders []string
 		for _, idxCol := range idx.Columns {
@@ -9021,6 +9040,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			tbl.Unlock()
 
 		case *sqlparser.AddIndexDefinition:
+			// Reject the reserved InnoDB clustered index name.
+			if strings.EqualFold(op.IndexDefinition.Info.Name.String(), "GEN_CLUST_INDEX") {
+				return nil, mysqlError(1280, "42000", "Incorrect index name 'GEN_CLUST_INDEX'")
+			}
 			// Validate that all index columns exist in the table
 			tableDef, tdErr := db.GetTable(tableName)
 			if tdErr == nil {
