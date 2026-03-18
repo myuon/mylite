@@ -13063,7 +13063,11 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		if count <= 0 || s == nil {
 			return "", nil
 		}
-		return strings.Repeat(toString(s), count), nil
+		str := toString(s)
+		if int64(count)*int64(len(str)) > 67108864 {
+			return nil, nil
+		}
+		return strings.Repeat(str, count), nil
 	case "cast", "convert":
 		// Simplified CAST: just evaluate the inner expression
 		if len(v.Exprs) >= 1 {
@@ -13362,13 +13366,20 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, nil
 		}
 		s := []rune(toString(strVal))
-		targetLen := int(toInt64(lenVal))
-		padStr := []rune(toString(padVal))
-		if targetLen < 0 || len(padStr) == 0 {
+		targetLen64 := toInt64(lenVal)
+		if targetLen64 < 0 {
 			return nil, nil
 		}
+		if targetLen64 > 67108864 {
+			return nil, nil
+		}
+		targetLen := int(targetLen64)
+		padStr := []rune(toString(padVal))
 		if targetLen <= len(s) {
 			return string(s[:targetLen]), nil
+		}
+		if len(padStr) == 0 {
+			return "", nil
 		}
 		// Need to pad
 		needed := targetLen - len(s)
@@ -13399,13 +13410,20 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, nil
 		}
 		s := []rune(toString(strVal))
-		targetLen := int(toInt64(lenVal))
-		padStr := []rune(toString(padVal))
-		if targetLen < 0 || len(padStr) == 0 {
+		targetLen64 := toInt64(lenVal)
+		if targetLen64 < 0 {
 			return nil, nil
 		}
+		if targetLen64 > 67108864 {
+			return nil, nil
+		}
+		targetLen := int(targetLen64)
+		padStr := []rune(toString(padVal))
 		if targetLen <= len(s) {
 			return string(s[:targetLen]), nil
+		}
+		if len(padStr) == 0 {
+			return "", nil
 		}
 		needed := targetLen - len(s)
 		var pad []rune
@@ -14343,7 +14361,11 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if count <= 0 {
 			return "", nil
 		}
-		return strings.Repeat(toString(args[0]), count), nil
+		str := toString(args[0])
+		if int64(count)*int64(len(str)) > 67108864 {
+			return nil, nil
+		}
+		return strings.Repeat(str, count), nil
 	case "concat":
 		args, err := evalArgs()
 		if err != nil {
@@ -15012,13 +15034,20 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			return nil, nil
 		}
 		s := []rune(toString(args[0]))
-		targetLen := int(toInt64(args[1]))
-		padStr := []rune(toString(args[2]))
-		if targetLen < 0 || len(padStr) == 0 {
+		targetLen64 := toInt64(args[1])
+		if targetLen64 < 0 {
 			return nil, nil
 		}
+		if targetLen64 > 67108864 {
+			return nil, nil
+		}
+		targetLen := int(targetLen64)
+		padStr := []rune(toString(args[2]))
 		if targetLen <= len(s) {
 			return string(s[:targetLen]), nil
+		}
+		if len(padStr) == 0 {
+			return "", nil
 		}
 		needed := targetLen - len(s)
 		var pad []rune
@@ -15036,13 +15065,20 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			return nil, nil
 		}
 		s := []rune(toString(args[0]))
-		targetLen := int(toInt64(args[1]))
-		padStr := []rune(toString(args[2]))
-		if targetLen < 0 || len(padStr) == 0 {
+		targetLen64 := toInt64(args[1])
+		if targetLen64 < 0 {
 			return nil, nil
 		}
+		if targetLen64 > 67108864 {
+			return nil, nil
+		}
+		targetLen := int(targetLen64)
+		padStr := []rune(toString(args[2]))
 		if targetLen <= len(s) {
 			return string(s[:targetLen]), nil
+		}
+		if len(padStr) == 0 {
+			return "", nil
 		}
 		needed := targetLen - len(s)
 		var pad []rune
