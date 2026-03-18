@@ -19,6 +19,12 @@ go run ./cmd/mtrrun -verbose
 go run ./cmd/mtrrun
 ```
 
+## エージェントの活用
+
+- 作業は適宜Agentに振って作業すること。その際`isolation: "worktree"`を指定することで作業が競合しないようにすると良い。
+- エージェントの成果はworktreeに残るので、`/usr/bin/diff -u` でパッチを取得し `patch -p0` でmainに適用する。
+- 適用後は必ず `go build ./...` と `go test ./... -count=1 -timeout 60s` で検証する。
+
 ## agmux codexセッションの使い方
 
 codex providerのセッションはエージェントとして使える。
