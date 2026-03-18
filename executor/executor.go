@@ -155,6 +155,9 @@ type Executor struct {
 	tempTables map[string]bool
 	// globalVars stores SET GLOBAL/SESSION variable overrides.
 	globalVars map[string]string
+	// startupVars stores variable values set at server startup (e.g., from master.opt).
+	// These are used as default values when SET ... = DEFAULT is used.
+	startupVars map[string]string
 	// views stores view definitions (view name -> SELECT query string).
 	views map[string]string
 	// queryTableDef holds the table definition for the current query context,
@@ -195,10 +198,19 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		preparedStmts: make(map[string]string),
 		tempTables:    make(map[string]bool),
 		globalVars:    make(map[string]string),
-		timeZone:      defaultTZ,
+		startupVars: map[string]string{
+			"innodb_commit_concurrency": "0",
+		},
+		timeZone: defaultTZ,
 	}
 	e.initSystemTables()
 	return e
+}
+
+// SetStartupVar sets a variable as a startup default. This is used by the test
+// runner to apply master.opt settings before running tests.
+func (e *Executor) SetStartupVar(name, value string) {
+	e.startupVars[strings.ToLower(name)] = value
 }
 
 func (e *Executor) initSystemTables() {
@@ -489,6 +501,14 @@ func (e *Executor) upsertInnoDBStatsRows(dbName, tableName string, rowCount int6
 		statsTbl.Mu.Unlock()
 	}
 
+	// Load table rows for distinct count computation
+	var tableRows []storage.Row
+	if tbl, err := e.Storage.GetTable(dbName, tableName); err == nil {
+		tbl.Mu.RLock()
+		tableRows = tbl.Rows
+		tbl.Mu.RUnlock()
+	}
+
 	idxTbl, err := e.Storage.GetTable("mysql", "innodb_index_stats")
 	if err != nil {
 		return
@@ -518,14 +538,15 @@ func (e *Executor) upsertInnoDBStatsRows(dbName, tableName string, rowCount int6
 			for j := 0; j <= i; j++ {
 				descCols = append(descCols, statsIndexColName(statCols[j]))
 			}
+			statValue := computeDistinctCount(tableRows, statCols[:i+1])
 			idxTbl.Rows = append(idxTbl.Rows, storage.Row{
 				"database_name":    dbName,
 				"table_name":       tableName,
 				"index_name":       indexName,
 				"last_update":      lastUpdate,
 				"stat_name":        statName,
-				"stat_value":       rowCount,
-				"sample_size":      sampleSize,
+				"stat_value":       statValue,
+				"sample_size":      int64(1),
 				"stat_description": strings.Join(descCols, ","),
 			})
 		}
@@ -553,6 +574,36 @@ func (e *Executor) upsertInnoDBStatsRows(dbName, tableName string, rowCount int6
 		)
 	}
 	idxTbl.Mu.Unlock()
+}
+
+// computeDistinctCount counts the number of distinct value combinations for the given
+// column prefix across table rows. For DB_ROW_ID (implicit row ID), each row is unique.
+func computeDistinctCount(rows []storage.Row, cols []string) int64 {
+	if len(rows) == 0 {
+		return int64(0)
+	}
+	if len(cols) > 0 && cols[len(cols)-1] == "DB_ROW_ID" {
+		return int64(len(rows))
+	}
+	seen := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		var key strings.Builder
+		for ci, col := range cols {
+			if ci > 0 {
+				key.WriteByte(0)
+			}
+			var val interface{}
+			for k, v := range row {
+				if strings.EqualFold(k, col) {
+					val = v
+					break
+				}
+			}
+			fmt.Fprintf(&key, "%v", val)
+		}
+		seen[key.String()] = struct{}{}
+	}
+	return int64(len(seen))
 }
 
 func (e *Executor) refreshInnoDBStatsTables() {
