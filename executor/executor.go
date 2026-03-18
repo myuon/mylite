@@ -308,9 +308,31 @@ func (e *Executor) initSystemTables() {
 	ensure("information_schema", &catalog.TableDef{
 		Name: "INNODB_TRX",
 		Columns: []catalog.ColumnDef{
-			{Name: "trx_id", Type: "VARCHAR(32)"},
-			{Name: "trx_state", Type: "VARCHAR(32)"},
+			{Name: "trx_id", Type: "VARCHAR(18)"},
+			{Name: "trx_state", Type: "VARCHAR(13)"},
 			{Name: "trx_started", Type: "DATETIME"},
+			{Name: "trx_requested_lock_id", Type: "VARCHAR(105)", Nullable: true},
+			{Name: "trx_wait_started", Type: "DATETIME", Nullable: true},
+			{Name: "trx_weight", Type: "BIGINT UNSIGNED"},
+			{Name: "trx_mysql_thread_id", Type: "BIGINT UNSIGNED"},
+			{Name: "trx_query", Type: "VARCHAR(1024)", Nullable: true},
+			{Name: "trx_operation_state", Type: "VARCHAR(64)", Nullable: true},
+			{Name: "trx_tables_in_use", Type: "BIGINT UNSIGNED"},
+			{Name: "trx_tables_locked", Type: "BIGINT UNSIGNED"},
+			{Name: "trx_lock_structs", Type: "BIGINT UNSIGNED"},
+			{Name: "trx_lock_memory_bytes", Type: "BIGINT UNSIGNED"},
+			{Name: "trx_rows_locked", Type: "BIGINT UNSIGNED"},
+			{Name: "trx_rows_modified", Type: "BIGINT UNSIGNED"},
+			{Name: "trx_concurrency_tickets", Type: "BIGINT UNSIGNED"},
+			{Name: "trx_isolation_level", Type: "VARCHAR(16)"},
+			{Name: "trx_unique_checks", Type: "INT"},
+			{Name: "trx_foreign_key_checks", Type: "INT"},
+			{Name: "trx_last_foreign_key_error", Type: "VARCHAR(256)", Nullable: true},
+			{Name: "trx_adaptive_hash_latched", Type: "INT"},
+			{Name: "trx_adaptive_hash_timeout", Type: "BIGINT UNSIGNED"},
+			{Name: "trx_is_read_only", Type: "INT"},
+			{Name: "trx_autocommit_non_locking", Type: "INT"},
+			{Name: "trx_schedule_weight", Type: "BIGINT UNSIGNED", Nullable: true},
 		},
 	})
 	ensure("information_schema", &catalog.TableDef{
@@ -9703,6 +9725,10 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 		var defVal interface{}
 		if col.Default != nil {
 			defVal = *col.Default
+		} else if col.Nullable {
+			defVal = nil // NULL for nullable columns without explicit default
+		} else {
+			defVal = "" // empty string for NOT NULL columns without explicit default
 		}
 		var extra interface{}
 		extra = ""
@@ -10516,6 +10542,9 @@ func mysqlDisplayType(colType string) string {
 		}
 		return "int(11)" + suffix
 	case "BIGINT":
+		if isUnsigned {
+			return "bigint(21)" + suffix
+		}
 		return "bigint(20)" + suffix
 	case "FLOAT":
 		return "float" + suffix
