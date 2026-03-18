@@ -262,6 +262,7 @@ type execContext struct {
 	replaceResult    []string       // pairs of [from, to] for --replace_result
 	verticalResult   bool           // format next query result as vertical key/value pairs
 	verticalResults  bool           // persistent vertical output mode (--vertical_results)
+	infoEnabled      bool           // --enable_info: show affected rows and info after DML
 	skipped          bool           // set to true when --skip directive is encountered
 	ttsBackups       map[string]tableSnapshot
 }
@@ -1052,8 +1053,13 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"change_user",
 		"diff_files", "chmod",
 		"remove_files", "remove_files_wildcard",
-		"perl",
-		"disable_info", "enable_info":
+		"perl":
+		return true, false, nil
+	case "enable_info":
+		ctx.infoEnabled = true
+		return true, false, nil
+	case "disable_info":
+		ctx.infoEnabled = false
 		return true, false, nil
 	}
 
@@ -1790,14 +1796,24 @@ func (ctx *execContext) executeExec(stmt string) error {
 		return ctx.executeExecWithExpectedError(stmt)
 	}
 	activeConn := ctx.getActiveConn()
+	var result sql.Result
 	var err error
 	if activeConn != nil {
-		_, err = activeConn.ExecContext(context.Background(), stmt)
+		result, err = activeConn.ExecContext(context.Background(), stmt)
 	} else {
-		_, err = ctx.db.Exec(stmt)
+		result, err = ctx.db.Exec(stmt)
 	}
 	if err != nil {
 		return fmt.Errorf("exec failed: %s: %v", stmt, err)
+	}
+	if ctx.infoEnabled && result != nil {
+		affected, _ := result.RowsAffected()
+		ctx.output.WriteString(fmt.Sprintf("affected rows: %d\n", affected))
+		upper := strings.ToUpper(strings.TrimSpace(stmt))
+		if strings.HasPrefix(upper, "ALTER TABLE") || strings.HasPrefix(upper, "LOAD DATA") ||
+			strings.HasPrefix(upper, "CREATE INDEX") || strings.HasPrefix(upper, "DROP INDEX") {
+			ctx.output.WriteString(fmt.Sprintf("info: Records: %d  Duplicates: 0  Warnings: 0\n", affected))
+		}
 	}
 	return nil
 }

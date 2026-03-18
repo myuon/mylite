@@ -5801,7 +5801,13 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						if sv, ok := checkVal.(string); ok {
 							maxLen := extractCharLength(col.Type)
 							if maxLen > 0 && len([]rune(sv)) > maxLen {
-								return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row 1", col.Name))
+								if bool(stmt.Ignore) {
+									// INSERT IGNORE: truncate the value instead of error
+									row[col.Name] = string([]rune(sv)[:maxLen])
+									rv = row[col.Name]
+								} else {
+									return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row 1", col.Name))
+								}
 							}
 						}
 					}
