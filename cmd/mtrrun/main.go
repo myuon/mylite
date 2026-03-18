@@ -98,15 +98,45 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 
 	var totalPassed, totalFailed, totalSkipped, totalErrors, totalTests int
 
+	type suiteResult struct {
+		name    string
+		results []mtrrunner.TestResult
+		elapsed time.Duration
+	}
+
+	resultsCh := make(chan suiteResult, len(suiteNames))
+	var wg sync.WaitGroup
 	for _, suite := range suiteNames {
-		results := runSuite(suite, "", suiteRoot, includeRoot, verbose, maxTests, jobs, timeout)
-		p, f, s, e := countResults(results)
-		printSuiteSummaryCompact(suite, len(results), p, f, s, e)
+		wg.Add(1)
+		go func(s string) {
+			defer wg.Done()
+			t0 := time.Now()
+			res := runSuite(s, "", suiteRoot, includeRoot, verbose, maxTests, jobs, timeout)
+			resultsCh <- suiteResult{name: s, results: res, elapsed: time.Since(t0)}
+		}(suite)
+	}
+	go func() {
+		wg.Wait()
+		close(resultsCh)
+	}()
+
+	// Collect results and print in completion order
+	var allResults []suiteResult
+	for sr := range resultsCh {
+		allResults = append(allResults, sr)
+	}
+	// Sort by suite name for deterministic output
+	sort.Slice(allResults, func(i, j int) bool {
+		return allResults[i].name < allResults[j].name
+	})
+	for _, sr := range allResults {
+		p, f, s, e := countResults(sr.results)
+		printSuiteSummaryCompact(sr.name, len(sr.results), p, f, s, e, sr.elapsed)
 		totalPassed += p
 		totalFailed += f
 		totalSkipped += s
 		totalErrors += e
-		totalTests += len(results)
+		totalTests += len(sr.results)
 	}
 
 	elapsed := time.Since(start)
@@ -417,13 +447,13 @@ func printSuiteSummary(suiteName string, results []mtrrunner.TestResult) {
 		len(results), p, f, s, e)
 }
 
-func printSuiteSummaryCompact(suiteName string, total, passed, failed, skipped, errors int) {
+func printSuiteSummaryCompact(suiteName string, total, passed, failed, skipped, errors int, elapsed time.Duration) {
 	status := "OK"
 	if failed+errors > 0 {
 		status = "FAIL"
 	}
-	fmt.Printf("%-30s %4d tests: %4d passed, %4d failed, %4d skipped, %4d errors  [%s]\n",
-		suiteName, total, passed, failed, skipped, errors, status)
+	fmt.Printf("%-30s %4d tests: %4d passed, %4d failed, %4d skipped, %4d errors  [%s]  (%.1fs)\n",
+		suiteName, total, passed, failed, skipped, errors, status, elapsed.Seconds())
 }
 
 func runSingleTest(target, suiteRoot, includeRoot string, verbose bool) {
