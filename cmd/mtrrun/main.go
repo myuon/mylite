@@ -96,7 +96,7 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		}
 	}
 
-	var totalPassed, totalFailed, totalSkipped, totalErrors, totalTests int
+	var totalPassed, totalFailed, totalSkipped, totalErrors, totalTimeouts, totalTests int
 
 	type suiteResult struct {
 		name    string
@@ -139,19 +139,20 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		return allResults[i].name < allResults[j].name
 	})
 	for _, sr := range allResults {
-		p, f, s, e := countResults(sr.results)
-		printSuiteSummaryCompact(sr.name, len(sr.results), p, f, s, e, sr.elapsed)
+		p, f, s, e, t := countResults(sr.results)
+		printSuiteSummaryCompact(sr.name, len(sr.results), p, f, s, e, t, sr.elapsed)
 		totalPassed += p
 		totalFailed += f
 		totalSkipped += s
 		totalErrors += e
+		totalTimeouts += t
 		totalTests += len(sr.results)
 	}
 
 	elapsed := time.Since(start)
 	fmt.Printf("\n=== Grand Total ===\n")
-	fmt.Printf("Suites: %d, Total: %d, Passed: %d, Failed: %d, Skipped: %d, Errors: %d\n",
-		len(suiteNames), totalTests, totalPassed, totalFailed, totalSkipped, totalErrors)
+	fmt.Printf("Suites: %d, Total: %d, Passed: %d, Failed: %d, Skipped: %d, Errors: %d, Timeouts: %d\n",
+		len(suiteNames), totalTests, totalPassed, totalFailed, totalSkipped, totalErrors, totalTimeouts)
 	fmt.Printf("Time: %.1fs\n", elapsed.Seconds())
 
 	if totalFailed+totalErrors > 0 {
@@ -281,6 +282,7 @@ func (w *worker) close() {
 
 func (w *worker) runTest(testPath string, includePaths []string, verbose bool, timeout time.Duration) mtrrunner.TestResult {
 	testName := strings.TrimSuffix(filepath.Base(testPath), ".test")
+	t0 := time.Now()
 
 	if timeout > 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -293,17 +295,20 @@ func (w *worker) runTest(testPath string, includePaths []string, verbose bool, t
 
 		select {
 		case result := <-ch:
+			result.Elapsed = time.Since(t0)
 			return result
 		case <-ctx.Done():
 			return mtrrunner.TestResult{
 				Name:    testName,
-				Error:   fmt.Sprintf("timeout after %s", timeout),
-				Skipped: true,
+				Timeout: true,
+				Elapsed: time.Since(t0),
 			}
 		}
 	}
 
-	return w.runTestInner(testPath, includePaths, verbose)
+	result := w.runTestInner(testPath, includePaths, verbose)
+	result.Elapsed = time.Since(t0)
+	return result
 }
 
 func (w *worker) runTestInner(testPath string, includePaths []string, verbose bool) mtrrunner.TestResult {
@@ -421,9 +426,11 @@ func runSequential(testPaths []string, includePaths, searchPaths []string, verbo
 	return results
 }
 
-func countResults(results []mtrrunner.TestResult) (passed, failed, skipped, errors int) {
+func countResults(results []mtrrunner.TestResult) (passed, failed, skipped, errors, timeouts int) {
 	for _, r := range results {
 		switch {
+		case r.Timeout:
+			timeouts++
 		case r.Skipped:
 			skipped++
 		case r.Passed:
@@ -439,7 +446,7 @@ func countResults(results []mtrrunner.TestResult) (passed, failed, skipped, erro
 
 func hasFailures(results []mtrrunner.TestResult) bool {
 	for _, r := range results {
-		if !r.Passed && !r.Skipped {
+		if !r.Passed && !r.Skipped && !r.Timeout {
 			return true
 		}
 	}
@@ -450,19 +457,19 @@ func printSuiteSummary(suiteName string, results []mtrrunner.TestResult) {
 	for _, r := range results {
 		printResult(r, false)
 	}
-	p, f, s, e := countResults(results)
+	p, f, s, e, t := countResults(results)
 	fmt.Printf("\n=== Summary ===\n")
-	fmt.Printf("Total: %d, Passed: %d, Failed: %d, Skipped: %d, Errors: %d\n",
-		len(results), p, f, s, e)
+	fmt.Printf("Total: %d, Passed: %d, Failed: %d, Skipped: %d, Errors: %d, Timeouts: %d\n",
+		len(results), p, f, s, e, t)
 }
 
-func printSuiteSummaryCompact(suiteName string, total, passed, failed, skipped, errors int, elapsed time.Duration) {
+func printSuiteSummaryCompact(suiteName string, total, passed, failed, skipped, errors, timeouts int, elapsed time.Duration) {
 	status := "OK"
 	if failed+errors > 0 {
 		status = "FAIL"
 	}
-	fmt.Printf("%-30s %4d tests: %4d passed, %4d failed, %4d skipped, %4d errors  [%s]  (%.1fs)\n",
-		suiteName, total, passed, failed, skipped, errors, status, elapsed.Seconds())
+	fmt.Printf("%-30s %4d tests: %4d passed, %4d failed, %4d skipped, %4d errors, %4d timeouts  [%s]  (%.1fs)\n",
+		suiteName, total, passed, failed, skipped, errors, timeouts, status, elapsed.Seconds())
 }
 
 func runSingleTest(target, suiteRoot, includeRoot string, verbose bool) {
@@ -519,22 +526,27 @@ func connectDB(addr string) (*sql.DB, error) {
 }
 
 func printResult(r mtrrunner.TestResult, verbose bool) {
+	timeStr := fmt.Sprintf("(%.1fs)", r.Elapsed.Seconds())
+	if r.Timeout {
+		fmt.Printf("TIMEOUT %-38s %s\n", r.Name, timeStr)
+		return
+	}
 	if r.Skipped {
-		fmt.Printf("PASS  %s\n", r.Name)
+		fmt.Printf("SKIP  %-40s %s\n", r.Name, timeStr)
 		return
 	}
 	if r.Passed {
-		fmt.Printf("PASS  %s\n", r.Name)
+		fmt.Printf("PASS  %-40s %s\n", r.Name, timeStr)
 		return
 	}
 	if r.Error != "" {
-		fmt.Printf("ERROR %s: %s\n", r.Name, r.Error)
+		fmt.Printf("ERROR %-40s %s: %s\n", r.Name, timeStr, r.Error)
 		if verbose && r.Output != "" {
 			fmt.Printf("  Output:\n%s\n", indent(r.Output))
 		}
 		return
 	}
-	fmt.Printf("FAIL  %s\n", r.Name)
+	fmt.Printf("FAIL  %-40s %s\n", r.Name, timeStr)
 	if r.Diff != "" {
 		fmt.Printf("%s\n", indent(r.Diff))
 	}

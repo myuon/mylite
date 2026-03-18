@@ -32,10 +32,12 @@ type TestResult struct {
 	Name     string
 	Passed   bool
 	Skipped  bool
+	Timeout  bool
 	Error    string
 	Output   string
 	Expected string
 	Diff     string
+	Elapsed  time.Duration
 }
 
 // Runner executes .test files against a MySQL-compatible server.
