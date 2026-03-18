@@ -1823,6 +1823,20 @@ func (ctx *execContext) executeExec(stmt string) error {
 		if strings.HasPrefix(upper, "ALTER TABLE") || strings.HasPrefix(upper, "LOAD DATA") ||
 			strings.HasPrefix(upper, "CREATE INDEX") || strings.HasPrefix(upper, "DROP INDEX") {
 			ctx.output.WriteString(fmt.Sprintf("info: Records: %d  Duplicates: 0  Warnings: 0\n", affected))
+		} else if strings.HasPrefix(upper, "UPDATE") {
+			// Query the server for the update info message (Rows matched/Changed)
+			var info string
+			if activeConn != nil {
+				row := activeConn.QueryRowContext(context.Background(), "MYLITE LAST_UPDATE_INFO")
+				if err := row.Scan(&info); err == nil && info != "" {
+					ctx.output.WriteString(fmt.Sprintf("info: %s\n", info))
+				}
+			} else {
+				row := ctx.db.QueryRow("MYLITE LAST_UPDATE_INFO")
+				if err := row.Scan(&info); err == nil && info != "" {
+					ctx.output.WriteString(fmt.Sprintf("info: %s\n", info))
+				}
+			}
 		}
 	}
 	return nil

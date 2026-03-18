@@ -84,6 +84,9 @@ type Result struct {
 	AffectedRows uint64
 	InsertID     uint64
 	IsResultSet  bool // true for SELECT, SHOW, etc.
+	MatchedRows  uint64 // for UPDATE: rows that matched WHERE clause
+	ChangedRows  uint64 // for UPDATE: rows actually modified
+	InfoMessage  string // optional info message (e.g. "Rows matched: 2  Changed: 1  Warnings: 0")
 }
 
 // intOverflowError is returned when an integer literal exceeds uint64 range.
@@ -125,6 +128,7 @@ type Executor struct {
 	savepoint     *txSavepoint
 	snapshots     map[string]*fullSnapshot
 	lastInsertID  int64
+	lastUpdateInfo string // stores info message from last UPDATE (e.g. "Rows matched: 2  Changed: 1  Warnings: 0")
 	// cteMap holds CTE virtual tables for the currently executing query.
 	cteMap map[string]*cteTable
 	// sqlMode stores the current SQL mode (e.g. "TRADITIONAL", "STRICT_TRANS_TABLES").
@@ -1765,6 +1769,17 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	if (strings.HasPrefix(upper, "CREATE DATABASE") || strings.HasPrefix(upper, "CREATE SCHEMA")) &&
 		strings.Contains(upper, "CHARACTER SET") {
 		return e.execCreateDatabaseRaw(trimmed)
+	}
+
+	// Handle CHECK TABLE before parser (vitess can't parse CHECK TABLE)
+	if strings.HasPrefix(upper, "CHECK TABLE") {
+		return e.execOtherAdmin(trimmed)
+	}
+
+	// Handle ALTER TABLE ... DISCARD/IMPORT TABLESPACE (InnoDB transportable tablespace, no-op)
+	if strings.HasPrefix(upper, "ALTER TABLE") &&
+		(strings.Contains(upper, "DISCARD TABLESPACE") || strings.Contains(upper, "IMPORT TABLESPACE")) {
+		return &Result{}, nil
 	}
 
 	// Handle ALTER TABLE ... ORDER BY (vitess parser drops ORDER BY clause)
@@ -5649,6 +5664,18 @@ func (e *Executor) execMyliteCommand(query string) (*Result, error) {
 		return &Result{}, nil
 	}
 
+	if restUpper == "LAST_UPDATE_INFO" {
+		info := e.lastUpdateInfo
+		if info == "" {
+			info = ""
+		}
+		return &Result{
+			Columns:     []string{"info"},
+			Rows:        [][]interface{}{{info}},
+			IsResultSet: true,
+		}, nil
+	}
+
 	if restUpper == "RESET_TEMP_TABLES" {
 		// Drop all temporary tables and clear the temp table tracking
 		db, err := e.Catalog.GetDatabase(e.CurrentDB)
@@ -8634,6 +8661,7 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 	}
 
 	var affected uint64
+	var matchedRows uint64
 	for _, i := range matchingIndices {
 		row := tbl.Rows[i]
 		_ = row
@@ -8822,15 +8850,24 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		}
 
 		// Apply the trigger-modified newRow values to the actual row
+		// and detect whether any column actually changed
+		rowChanged := false
 		for _, col := range tbl.Def.Columns {
 			if val, ok := newRow[col.Name]; ok {
 				if padLen := binaryPadLength(col.Type); padLen > 0 && val != nil {
 					val = padBinaryValue(val, padLen)
 				}
+				oldVal := tbl.Rows[i][col.Name]
+				if !valuesEqual(oldVal, val) {
+					rowChanged = true
+				}
 				tbl.Rows[i][col.Name] = val
 			}
 		}
-		affected++
+		matchedRows++
+		if rowChanged {
+			affected++
+		}
 
 		// Fire AFTER UPDATE triggers
 		tbl.Unlock()
@@ -8841,7 +8878,15 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		tbl.Lock()
 	}
 
-	return &Result{AffectedRows: affected}, nil
+	warnCount := len(e.warnings)
+	infoMsg := fmt.Sprintf("Rows matched: %d  Changed: %d  Warnings: %d", matchedRows, affected, warnCount)
+	e.lastUpdateInfo = infoMsg
+	return &Result{
+		AffectedRows: affected,
+		MatchedRows:  matchedRows,
+		ChangedRows:  affected,
+		InfoMessage:  infoMsg,
+	}, nil
 }
 
 func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
@@ -10198,6 +10243,8 @@ func (e *Executor) showVariables(upper string) (*Result, error) {
 		"innodb_change_buffer_max_size":        "25",
 		"innodb_flush_log_at_trx_commit":       "1",
 		"innodb_doublewrite":                   "ON",
+		"innodb_flush_method":                  "O_DIRECT",
+		"innodb_tmpdir":                        "",
 		"innodb_checksum_algorithm":            "crc32",
 		"innodb_ft_max_token_size":             "84",
 		"innodb_ft_min_token_size":             "3",
@@ -15280,6 +15327,10 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 					return false, err
 				}
 				if left == nil {
+					// NULL IN (empty set) = FALSE; NULL NOT IN (empty set) = TRUE
+					if len(vals) == 0 {
+						return v.Operator == sqlparser.NotInOp, nil
+					}
 					return false, nil
 				}
 				hasNull := false
@@ -15818,6 +15869,18 @@ func toStrictBigInt(v interface{}) (*big.Int, bool) {
 	default:
 		return nil, false
 	}
+}
+
+// valuesEqual checks if two values are semantically equal for UPDATE change detection.
+func valuesEqual(a, b interface{}) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	// Convert both to string representation for comparison
+	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
 }
 
 func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator) (bool, error) {
