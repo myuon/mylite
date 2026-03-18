@@ -4894,6 +4894,60 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 	}
 
+	// Validate foreign key constraints: detect duplicate constraint names (ER_FK_DUP_NAME)
+	// and create implicit indexes for foreign key columns (MySQL auto-creates these).
+	fkNames := make(map[string]bool)
+	fkIdx := 0
+	for _, constraint := range stmt.TableSpec.Constraints {
+		if fkDef, ok := constraint.Details.(*sqlparser.ForeignKeyDefinition); ok {
+			name := constraint.Name.String()
+			nameLower := strings.ToLower(name)
+			if nameLower != "" {
+				if fkNames[nameLower] {
+					return nil, mysqlError(1826, "HY000", fmt.Sprintf("Duplicate foreign key constraint name '%s'", name))
+				}
+				fkNames[nameLower] = true
+			}
+			// Create implicit index for FK columns (MySQL does this automatically)
+			var fkCols []string
+			for _, col := range fkDef.Source {
+				fkCols = append(fkCols, col.String())
+			}
+			if len(fkCols) > 0 {
+				// Check if an index already covers these columns
+				covered := false
+				for _, idx := range indexes {
+					if len(idx.Columns) >= len(fkCols) {
+						match := true
+						for k, fc := range fkCols {
+							if !strings.EqualFold(idx.Columns[k], fc) {
+								match = false
+								break
+							}
+						}
+						if match {
+							covered = true
+							break
+						}
+					}
+				}
+				if !covered {
+					idxName := name
+					if idxName == "" {
+						fkIdx++
+						idxName = fmt.Sprintf("%s_ibfk_%d", tableName, fkIdx)
+					}
+					idxOrders := make([]string, len(fkCols))
+					indexes = append(indexes, catalog.IndexDef{
+						Name:    idxName,
+						Columns: fkCols,
+						Orders:  idxOrders,
+					})
+				}
+			}
+		}
+	}
+
 	// Extract CHECK constraints
 	var checkConstraints []catalog.CheckConstraint
 	checkIdx := 0
@@ -9081,11 +9135,52 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			}
 
 		case *sqlparser.AddConstraintDefinition:
-			// Silently accept constraint additions.
+			// Create implicit index for foreign key constraints (MySQL auto-creates these).
+			if fkDef, ok := op.ConstraintDefinition.Details.(*sqlparser.ForeignKeyDefinition); ok {
+				var fkCols []string
+				for _, col := range fkDef.Source {
+					fkCols = append(fkCols, col.String())
+				}
+				if len(fkCols) > 0 {
+					idxName := op.ConstraintDefinition.Name.String()
+					if idxName == "" {
+						idxName = fkCols[0]
+					}
+					// Check if an index already covers these columns
+					covered := false
+					tableDef, _ := db.GetTable(tableName)
+					if tableDef != nil {
+						for _, idx := range tableDef.Indexes {
+							if len(idx.Columns) >= len(fkCols) {
+								match := true
+								for k, fc := range fkCols {
+									if !strings.EqualFold(idx.Columns[k], fc) {
+										match = false
+										break
+									}
+								}
+								if match {
+									covered = true
+									break
+								}
+							}
+						}
+					}
+					if !covered {
+						db.AddIndex(tableName, catalog.IndexDef{
+							Name:    idxName,
+							Columns: fkCols,
+							Orders:  make([]string, len(fkCols)),
+						})
+					}
+				}
+			}
 
 		case *sqlparser.DropKey:
 			if op.Type == sqlparser.PrimaryKeyType {
 				db.DropPrimaryKey(tableName)
+			} else if op.Type == sqlparser.ForeignKeyType || op.Type == sqlparser.CheckKeyType {
+				// Foreign keys and CHECK constraints are not enforced; silently accept DROP.
 			} else {
 				idxName := op.Name.String()
 				if err := db.DropIndex(tableName, idxName); err != nil {
