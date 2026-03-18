@@ -155,6 +155,9 @@ type Executor struct {
 	tempTables map[string]bool
 	// globalVars stores SET GLOBAL/SESSION variable overrides.
 	globalVars map[string]string
+	// startupVars stores variable values set at server startup (e.g., from master.opt).
+	// These are used as default values when SET ... = DEFAULT is used.
+	startupVars map[string]string
 	// views stores view definitions (view name -> SELECT query string).
 	views map[string]string
 	// queryTableDef holds the table definition for the current query context,
@@ -195,10 +198,21 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		preparedStmts: make(map[string]string),
 		tempTables:    make(map[string]bool),
 		globalVars:    make(map[string]string),
-		timeZone:      defaultTZ,
+		startupVars: map[string]string{
+			// Pre-seed startup defaults for variables with special constraints
+			"innodb_commit_concurrency": "0",
+		},
+		timeZone: defaultTZ,
 	}
 	e.initSystemTables()
 	return e
+}
+
+// SetStartupVar sets a variable as a startup default. This is used by the test
+// runner to apply master.opt settings before test execution.
+func (e *Executor) SetStartupVar(name, value string) {
+	e.startupVars[strings.ToLower(name)] = value
+	e.globalVars[strings.ToLower(name)] = value
 }
 
 func (e *Executor) initSystemTables() {
@@ -415,14 +429,15 @@ func (e *Executor) hasInnoDBTableStatsRow(dbName, tableName string) bool {
 }
 
 func indexDefsForStats(def *catalog.TableDef) []catalog.IndexDef {
-	indexDefs := make([]catalog.IndexDef, 0, len(def.Indexes)+1)
+	indexDefs := make([]catalog.IndexDef, 0, len(def.Indexes)+2)
 	if len(def.PrimaryKey) > 0 {
 		indexDefs = append(indexDefs, catalog.IndexDef{Name: "PRIMARY", Columns: append([]string(nil), def.PrimaryKey...)})
-	}
-	indexDefs = append(indexDefs, def.Indexes...)
-	if len(indexDefs) == 0 {
+	} else {
+		// InnoDB always has a clustered index. When there's no PRIMARY KEY,
+		// it uses an internal GEN_CLUST_INDEX with an implicit DB_ROW_ID.
 		indexDefs = append(indexDefs, catalog.IndexDef{Name: "GEN_CLUST_INDEX", Columns: []string{"DB_ROW_ID"}})
 	}
+	indexDefs = append(indexDefs, def.Indexes...)
 	return indexDefs
 }
 
@@ -493,6 +508,14 @@ func (e *Executor) upsertInnoDBStatsRows(dbName, tableName string, rowCount int6
 	if err != nil {
 		return
 	}
+	// Load table rows for distinct count computation
+	var tableRows []storage.Row
+	if tbl, err := e.Storage.GetTable(dbName, tableName); err == nil {
+		tbl.Mu.RLock()
+		tableRows = tbl.Rows
+		tbl.Mu.RUnlock()
+	}
+
 	idxTbl.Mu.Lock()
 	for _, idx := range indexDefsForStats(def) {
 		indexName := idx.Name
@@ -508,24 +531,22 @@ func (e *Executor) upsertInnoDBStatsRows(dbName, tableName string, rowCount int6
 				statCols = append(statCols, "DB_ROW_ID")
 			}
 		}
-		sampleSize := rowCount
-		if sampleSize < 1 {
-			sampleSize = 1
-		}
 		for i := range statCols {
 			statName := fmt.Sprintf("n_diff_pfx%02d", i+1)
 			descCols := make([]string, 0, i+1)
 			for j := 0; j <= i; j++ {
 				descCols = append(descCols, statsIndexColName(statCols[j]))
 			}
+			// Compute distinct count for the prefix columns
+			statValue := computeDistinctCount(tableRows, statCols[:i+1])
 			idxTbl.Rows = append(idxTbl.Rows, storage.Row{
 				"database_name":    dbName,
 				"table_name":       tableName,
 				"index_name":       indexName,
 				"last_update":      lastUpdate,
 				"stat_name":        statName,
-				"stat_value":       rowCount,
-				"sample_size":      sampleSize,
+				"stat_value":       statValue,
+				"sample_size":      int64(1),
 				"stat_description": strings.Join(descCols, ","),
 			})
 		}
@@ -553,6 +574,38 @@ func (e *Executor) upsertInnoDBStatsRows(dbName, tableName string, rowCount int6
 		)
 	}
 	idxTbl.Mu.Unlock()
+}
+
+// computeDistinctCount counts the number of distinct value combinations for the given
+// column prefix across table rows. For DB_ROW_ID (implicit row ID), each row is unique.
+func computeDistinctCount(rows []storage.Row, cols []string) int64 {
+	if len(rows) == 0 {
+		return int64(0)
+	}
+	// If the last column is DB_ROW_ID, each row is unique
+	if len(cols) > 0 && cols[len(cols)-1] == "DB_ROW_ID" {
+		return int64(len(rows))
+	}
+	seen := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		var key strings.Builder
+		for ci, col := range cols {
+			if ci > 0 {
+				key.WriteByte(0)
+			}
+			// Try case-insensitive column name lookup
+			var val interface{}
+			for k, v := range row {
+				if strings.EqualFold(k, col) {
+					val = v
+					break
+				}
+			}
+			fmt.Fprintf(&key, "%v", val)
+		}
+		seen[key.String()] = struct{}{}
+	}
+	return int64(len(seen))
 }
 
 func (e *Executor) refreshInnoDBStatsTables() {
@@ -605,14 +658,13 @@ func (e *Executor) refreshInnoDBStatsTables() {
 				"sum_of_other_index_sizes": int64(len(def.Indexes)),
 			})
 
-			indexDefs := make([]catalog.IndexDef, 0, len(def.Indexes)+1)
+			indexDefs := make([]catalog.IndexDef, 0, len(def.Indexes)+2)
 			if len(def.PrimaryKey) > 0 {
 				indexDefs = append(indexDefs, catalog.IndexDef{Name: "PRIMARY", Columns: append([]string(nil), def.PrimaryKey...)})
-			}
-			indexDefs = append(indexDefs, def.Indexes...)
-			if len(indexDefs) == 0 {
+			} else {
 				indexDefs = append(indexDefs, catalog.IndexDef{Name: "GEN_CLUST_INDEX", Columns: []string{"DB_ROW_ID"}})
 			}
+			indexDefs = append(indexDefs, def.Indexes...)
 			for _, idx := range indexDefs {
 				indexName := idx.Name
 				if indexName == "" {
@@ -630,7 +682,7 @@ func (e *Executor) refreshInnoDBStatsTables() {
 						"last_update":      lastUpdate,
 						"stat_name":        "n_diff_pfx01",
 						"stat_value":       rowCount,
-						"sample_size":      rowCount,
+						"sample_size":      int64(1),
 						"stat_description": firstCol,
 					},
 					storage.Row{
@@ -2525,13 +2577,42 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				cleanName := strings.TrimPrefix(name, "global.")
 				cleanName = strings.TrimPrefix(cleanName, "session.")
 				cleanName = strings.TrimPrefix(cleanName, "local.")
+
+				// Handle DEFAULT keyword: restore startup value or delete override
+				if strings.EqualFold(val, "default") || strings.EqualFold(val, "DEFAULT") {
+					if sv, ok := e.startupVars[cleanName]; ok {
+						e.globalVars[cleanName] = sv
+					} else {
+						delete(e.globalVars, cleanName)
+					}
+					continue
+				}
+
 				// Evaluate expression
 				evalVal, err := e.evalExpr(expr.Expr)
+				var finalVal string
 				if err == nil {
-					e.globalVars[cleanName] = fmt.Sprintf("%v", evalVal)
+					finalVal = fmt.Sprintf("%v", evalVal)
 				} else {
-					e.globalVars[cleanName] = val
+					finalVal = val
 				}
+
+				// Enforce innodb_commit_concurrency constraint:
+				// If startup value is 0, cannot set to nonzero.
+				// If startup value is nonzero, cannot set to 0.
+				if cleanName == "innodb_commit_concurrency" {
+					newVal, _ := strconv.ParseInt(finalVal, 10, 64)
+					// Determine the startup/initial value
+					startupVal := int64(0) // default is 0
+					if sv, ok := e.startupVars[cleanName]; ok {
+						startupVal, _ = strconv.ParseInt(sv, 10, 64)
+					}
+					if (startupVal == 0 && newVal != 0) || (startupVal != 0 && newVal == 0) {
+						return nil, fmt.Errorf("ERROR 1231 (42000): Variable 'innodb_commit_concurrency' can't be set to the value of '%d'", newVal)
+					}
+				}
+
+				e.globalVars[cleanName] = finalVal
 			}
 		}
 	}
@@ -2569,9 +2650,26 @@ func (e *Executor) resolveSystemVarInValue(val string) string {
 
 // handleRawSet handles SET statements that the parser couldn't parse.
 func (e *Executor) handleRawSet(raw string) {
-	// Handle user variables: SET @var = value or SET @var := value
 	trimmed := strings.TrimSpace(raw)
-	if strings.HasPrefix(strings.ToUpper(trimmed), "SET ") {
+	upper := strings.ToUpper(trimmed)
+
+	// Handle SET STARTUP var = val (special mylite command for startup defaults)
+	if strings.HasPrefix(upper, "SET STARTUP ") {
+		rest := strings.TrimSpace(trimmed[len("SET STARTUP "):])
+		if eqIdx := strings.Index(rest, "="); eqIdx > 0 {
+			varName := strings.TrimSpace(strings.ToLower(rest[:eqIdx]))
+			val := strings.TrimSpace(rest[eqIdx+1:])
+			val = strings.TrimSuffix(val, ";")
+			val = strings.TrimSpace(val)
+			val = strings.Trim(val, "'\"")
+			e.startupVars[varName] = val
+			e.globalVars[varName] = val
+		}
+		return
+	}
+
+	// Handle user variables: SET @var = value or SET @var := value
+	if strings.HasPrefix(upper, "SET ") {
 		rest := strings.TrimSpace(trimmed[4:])
 		if strings.HasPrefix(rest, "@") && !strings.HasPrefix(rest, "@@") {
 			// Find = or :=
@@ -2601,7 +2699,7 @@ func (e *Executor) handleRawSet(raw string) {
 			}
 		}
 	}
-	upper := strings.ToUpper(raw)
+	upper = strings.ToUpper(raw)
 	if strings.Contains(upper, "SQL_MODE") {
 		if idx := strings.Index(upper, "="); idx >= 0 {
 			val := strings.TrimSpace(raw[idx+1:])
@@ -2675,7 +2773,11 @@ func (e *Executor) handleRawSet(raw string) {
 		if strings.ToUpper(val) != "DEFAULT" {
 			e.globalVars[varName] = val
 		} else {
-			delete(e.globalVars, varName)
+			if sv, ok := e.startupVars[varName]; ok {
+				e.globalVars[varName] = sv
+			} else {
+				delete(e.globalVars, varName)
+			}
 		}
 	}
 	if strings.HasPrefix(upper, "SET NAMES ") {
@@ -7244,6 +7346,20 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		return e.execSelectIntoOutfile(stmt.Into, colNames, resultRows)
 	}
 
+	// Handle SELECT ... INTO @var1, @var2, ...
+	if stmt.Into != nil && len(stmt.Into.VarList) > 0 {
+		if len(resultRows) > 0 {
+			row := resultRows[0]
+			for i, v := range stmt.Into.VarList {
+				varName := v.Name.String()
+				if i < len(row) {
+					e.userVars[varName] = row[i]
+				}
+			}
+		}
+		return &Result{}, nil
+	}
+
 	return &Result{
 		Columns:     colNames,
 		Rows:        resultRows,
@@ -7599,6 +7715,20 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 	// Handle SELECT ... INTO OUTFILE (GROUP BY path)
 	if stmt.Into != nil && stmt.Into.Type == sqlparser.IntoOutfile {
 		return e.execSelectIntoOutfile(stmt.Into, colNames, resultRows)
+	}
+
+	// Handle SELECT ... INTO @var1, @var2, ... (GROUP BY path)
+	if stmt.Into != nil && len(stmt.Into.VarList) > 0 {
+		if len(resultRows) > 0 {
+			row := resultRows[0]
+			for i, v := range stmt.Into.VarList {
+				varName := v.Name.String()
+				if i < len(row) {
+					e.userVars[varName] = row[i]
+				}
+			}
+		}
+		return &Result{}, nil
 	}
 
 	return &Result{

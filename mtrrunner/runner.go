@@ -2085,12 +2085,13 @@ func applyMasterOpt(content string, ctx *execContext) {
 					val = strconv.Itoa(n * 1024 * 1024)
 				}
 			}
-			// Set as variable
+			// Normalize hyphens to underscores for MySQL variable names
+			varKey := strings.ReplaceAll(key, "-", "_")
+			// Set as variable (keep original key for $variable compatibility)
 			ctx.variables["$"+key] = val
-			// Also apply server-level settings via SET
-			if strings.EqualFold(key, "innodb_page_size") {
-				ctx.db.Exec(fmt.Sprintf("SET GLOBAL innodb_page_size = %s", val)) //nolint:errcheck
-			}
+			ctx.variables["$"+varKey] = val
+			// Apply as startup variable (SET STARTUP is a special mylite command)
+			ctx.db.Exec(fmt.Sprintf("SET STARTUP %s = %s", varKey, val)) //nolint:errcheck
 		}
 	}
 }
