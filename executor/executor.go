@@ -7145,34 +7145,178 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	}
 
 	// Build rows from FROM clause (handles single table, JOINs, and implicit cross joins)
+	// Fast-path: SELECT COUNT(*) FROM t1, t2, ... (no GROUP BY/HAVING/ORDER BY)
+	// Avoid materializing the full cross product -- either multiply counts (no WHERE)
+	// or stream through the nested loop counting matches (with WHERE).
+	if len(stmt.From) > 1 &&
+		(stmt.GroupBy == nil || len(stmt.GroupBy.Exprs) == 0) &&
+		stmt.Having == nil && stmt.OrderBy == nil {
+		isOnlyCountStar := false
+		if len(stmt.SelectExprs.Exprs) == 1 {
+			if ae, ok := stmt.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok {
+				if _, ok := ae.Expr.(*sqlparser.CountStar); ok {
+					isOnlyCountStar = true
+				}
+			}
+		}
+		if isOnlyCountStar {
+			colName := "COUNT(*)"
+			if ae, ok := stmt.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok && !ae.As.IsEmpty() {
+				colName = ae.As.String()
+			}
+			// Collect row sets from all FROM tables
+			allTableRows := make([][]storage.Row, len(stmt.From))
+			for idx, fromExpr := range stmt.From {
+				rows, err := e.buildFromExpr(fromExpr)
+				if err != nil {
+					return nil, err
+				}
+				allTableRows[idx] = rows
+			}
+			if stmt.Where == nil {
+				// No WHERE: count = product of all table row counts
+				totalCount := int64(1)
+				for _, rows := range allTableRows {
+					totalCount *= int64(len(rows))
+				}
+				return &Result{
+					Columns: []string{colName},
+					Rows:    [][]interface{}{{totalCount}},
+				}, nil
+			}
+			// WITH WHERE: stream through nested loops counting matches
+			// without allocating a row per combination.
+			totalCount := int64(0)
+			scratch := make(storage.Row)
+			var countNested func(depth int) error
+			countNested = func(depth int) error {
+				if depth == len(allTableRows) {
+					match, err := e.evalWhere(stmt.Where.Expr, scratch)
+					if err != nil {
+						return err
+					}
+					if match {
+						totalCount++
+					}
+					return nil
+				}
+				for _, row := range allTableRows[depth] {
+					for k, v := range row {
+						scratch[k] = v
+					}
+					if err := countNested(depth + 1); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			if err := countNested(0); err != nil {
+				return nil, err
+			}
+			// Clear sql_auto_is_null after WHERE evaluation
+			if e.sqlAutoIsNull && e.lastAutoIncID > 0 {
+				e.lastAutoIncID = 0
+			}
+			return &Result{
+				Columns: []string{colName},
+				Rows:    [][]interface{}{{totalCount}},
+			}, nil
+		}
+	}
+
 	allRows, err := e.buildFromExpr(stmt.From[0])
 	if err != nil {
 		return nil, err
 	}
 	// Handle implicit cross join: FROM t1, t2, t3
-	for i := 1; i < len(stmt.From); i++ {
-		rightRows, err := e.buildFromExpr(stmt.From[i])
-		if err != nil {
-			return nil, err
-		}
-		var crossed []storage.Row
-		for _, leftRow := range allRows {
-			for _, rightRow := range rightRows {
-				combined := make(storage.Row, len(leftRow)+len(rightRow))
-				for k, v := range leftRow {
-					combined[k] = v
-				}
-				for k, v := range rightRow {
-					combined[k] = v
-				}
-				crossed = append(crossed, combined)
+	// When a WHERE clause is present, we fuse the cross join with the WHERE
+	// filter (streaming nested-loop join) to avoid materializing the full
+	// cartesian product in memory.
+	whereApplied := false
+	if len(stmt.From) > 1 && stmt.Where != nil {
+		whereApplied = true
+		for i := 1; i < len(stmt.From); i++ {
+			rightRows, err := e.buildFromExpr(stmt.From[i])
+			if err != nil {
+				return nil, err
 			}
+			isLastJoin := i == len(stmt.From)-1
+			var crossed []storage.Row
+			// For the last join step, use a reusable scratch map for WHERE eval
+			// to avoid allocating a map per pair when most pairs are filtered out.
+			var scratch storage.Row
+			if isLastJoin && len(allRows) > 0 && len(rightRows) > 0 {
+				scratch = make(storage.Row, len(allRows[0])+len(rightRows[0]))
+			}
+			for _, leftRow := range allRows {
+				for _, rightRow := range rightRows {
+					if isLastJoin {
+						// Reuse scratch map: clear and repopulate
+						for k := range scratch {
+							delete(scratch, k)
+						}
+						for k, v := range leftRow {
+							scratch[k] = v
+						}
+						for k, v := range rightRow {
+							scratch[k] = v
+						}
+						match, err := e.evalWhere(stmt.Where.Expr, scratch)
+						if err != nil {
+							return nil, err
+						}
+						if !match {
+							continue
+						}
+						// Match found: allocate a new row to keep
+						combined := make(storage.Row, len(leftRow)+len(rightRow))
+						for k, v := range scratch {
+							combined[k] = v
+						}
+						crossed = append(crossed, combined)
+					} else {
+						combined := make(storage.Row, len(leftRow)+len(rightRow))
+						for k, v := range leftRow {
+							combined[k] = v
+						}
+						for k, v := range rightRow {
+							combined[k] = v
+						}
+						crossed = append(crossed, combined)
+					}
+				}
+			}
+			allRows = crossed
 		}
-		allRows = crossed
+		// Clear sql_auto_is_null after WHERE evaluation
+		if e.sqlAutoIsNull && e.lastAutoIncID > 0 {
+			e.lastAutoIncID = 0
+		}
+	} else {
+		for i := 1; i < len(stmt.From); i++ {
+			rightRows, err := e.buildFromExpr(stmt.From[i])
+			if err != nil {
+				return nil, err
+			}
+			var crossed []storage.Row
+			for _, leftRow := range allRows {
+				for _, rightRow := range rightRows {
+					combined := make(storage.Row, len(leftRow)+len(rightRow))
+					for k, v := range leftRow {
+						combined[k] = v
+					}
+					for k, v := range rightRow {
+						combined[k] = v
+					}
+					crossed = append(crossed, combined)
+				}
+			}
+			allRows = crossed
+		}
 	}
 
-	// Apply WHERE filter
-	if stmt.Where != nil {
+	// Apply WHERE filter (skip if already applied during streaming cross join)
+	if stmt.Where != nil && !whereApplied {
 		filtered := make([]storage.Row, 0)
 		for _, row := range allRows {
 			match, err := e.evalWhere(stmt.Where.Expr, row)
