@@ -12569,7 +12569,11 @@ func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator) (i
 		if rf == 0 {
 			return nil, nil
 		}
-		return int64(lf) % int64(rf), nil
+		mod := math.Mod(lf, rf)
+		if mod == float64(int64(mod)) {
+			return int64(mod), nil
+		}
+		return mod, nil
 	case sqlparser.ShiftLeftOp:
 		return uint64(int64(lf)) << uint64(int64(rf)), nil
 	case sqlparser.ShiftRightOp:
