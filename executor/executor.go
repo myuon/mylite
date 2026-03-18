@@ -325,14 +325,13 @@ func (e *Executor) initSystemTables() {
 			{Name: "trx_rows_modified", Type: "BIGINT UNSIGNED"},
 			{Name: "trx_concurrency_tickets", Type: "BIGINT UNSIGNED"},
 			{Name: "trx_isolation_level", Type: "VARCHAR(16)"},
-			{Name: "trx_unique_checks", Type: "INT"},
-			{Name: "trx_foreign_key_checks", Type: "INT"},
+			{Name: "trx_unique_checks", Type: "INT(1)"},
+			{Name: "trx_foreign_key_checks", Type: "INT(1)"},
 			{Name: "trx_last_foreign_key_error", Type: "VARCHAR(256)", Nullable: true},
-			{Name: "trx_adaptive_hash_latched", Type: "INT"},
+			{Name: "trx_adaptive_hash_latched", Type: "INT(1)"},
 			{Name: "trx_adaptive_hash_timeout", Type: "BIGINT UNSIGNED"},
-			{Name: "trx_is_read_only", Type: "INT"},
-			{Name: "trx_autocommit_non_locking", Type: "INT"},
-			{Name: "trx_schedule_weight", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "trx_is_read_only", Type: "INT(1)"},
+			{Name: "trx_autocommit_non_locking", Type: "INT(1)"},
 		},
 	})
 	ensure("information_schema", &catalog.TableDef{
@@ -9677,6 +9676,10 @@ func findDatabaseCaseInsensitive(cat *catalog.Catalog, dbName string) (*catalog.
 	return nil, dbName, fmt.Errorf("unknown database '%s'", dbName)
 }
 
+func isInfoSchemaTable(dbName string) bool {
+	return strings.EqualFold(dbName, "information_schema")
+}
+
 // describeTable returns column metadata for a table, matching MySQL DESCRIBE output.
 func (e *Executor) describeTable(tableName string) (*Result, error) {
 	descDB := e.CurrentDB
@@ -9725,10 +9728,10 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 		var defVal interface{}
 		if col.Default != nil {
 			defVal = *col.Default
-		} else if col.Nullable {
-			defVal = nil // NULL for nullable columns without explicit default
+		} else if col.Nullable && !isInfoSchemaTable(descDB) {
+			defVal = nil // NULL for nullable columns without explicit default (user tables)
 		} else {
-			defVal = "" // empty string for NOT NULL columns without explicit default
+			defVal = "" // empty for NOT NULL or INFORMATION_SCHEMA columns
 		}
 		var extra interface{}
 		extra = ""
