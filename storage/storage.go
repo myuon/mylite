@@ -512,7 +512,11 @@ func (t *Table) DropColumn(colName string) {
 	t.Mu.Lock()
 	defer t.Mu.Unlock()
 	for i := range t.Rows {
-		delete(t.Rows[i], colName)
+		for k := range t.Rows[i] {
+			if strings.EqualFold(k, colName) {
+				delete(t.Rows[i], k)
+			}
+		}
 	}
 }
 
@@ -521,9 +525,12 @@ func (t *Table) RenameColumn(oldName, newName string) {
 	t.Mu.Lock()
 	defer t.Mu.Unlock()
 	for i := range t.Rows {
-		if v, ok := t.Rows[i][oldName]; ok {
-			t.Rows[i][newName] = v
-			delete(t.Rows[i], oldName)
+		for k, v := range t.Rows[i] {
+			if strings.EqualFold(k, oldName) {
+				t.Rows[i][newName] = v
+				delete(t.Rows[i], k)
+				break
+			}
 		}
 	}
 }

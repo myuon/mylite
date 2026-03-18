@@ -333,7 +333,7 @@ func (db *Database) AddColumnAt(tableName string, col ColumnDef, position string
 		return fmt.Errorf("table '%s.%s' doesn't exist", db.Name, tableName)
 	}
 	for _, c := range tbl.Columns {
-		if c.Name == col.Name {
+		if strings.EqualFold(c.Name, col.Name) {
 			return fmt.Errorf("column '%s' already exists in table '%s'", col.Name, tableName)
 		}
 	}
@@ -342,7 +342,7 @@ func (db *Database) AddColumnAt(tableName string, col ColumnDef, position string
 	} else if position == "AFTER" && afterCol != "" {
 		idx := -1
 		for i, c := range tbl.Columns {
-			if c.Name == afterCol {
+			if strings.EqualFold(c.Name, afterCol) {
 				idx = i
 				break
 			}
@@ -375,7 +375,7 @@ func (db *Database) DropColumn(tableName, colName string) error {
 	newCols := make([]ColumnDef, 0, len(tbl.Columns))
 	found := false
 	for _, c := range tbl.Columns {
-		if c.Name == colName {
+		if strings.EqualFold(c.Name, colName) {
 			found = true
 			continue
 		}
@@ -397,7 +397,7 @@ func (db *Database) DropColumn(tableName, colName string) error {
 			if paren := strings.Index(c, "("); paren >= 0 {
 				bareCol = c[:paren]
 			}
-			if bareCol != colName {
+			if !strings.EqualFold(bareCol, colName) {
 				remainingCols = append(remainingCols, c)
 			}
 		}
@@ -412,7 +412,7 @@ func (db *Database) DropColumn(tableName, colName string) error {
 	// Also remove from primary key if present
 	var newPK []string
 	for _, pk := range tbl.PrimaryKey {
-		if pk != colName {
+		if !strings.EqualFold(pk, colName) {
 			newPK = append(newPK, pk)
 		}
 	}
@@ -430,7 +430,7 @@ func (db *Database) ModifyColumn(tableName string, col ColumnDef) error {
 		return fmt.Errorf("table '%s.%s' doesn't exist", db.Name, tableName)
 	}
 	for i, c := range tbl.Columns {
-		if c.Name == col.Name {
+		if strings.EqualFold(c.Name, col.Name) {
 			// Preserve PrimaryKey/Unique/Nullable flags from constraints
 			// if the column is part of the primary key
 			for _, pk := range tbl.PrimaryKey {
@@ -444,6 +444,8 @@ func (db *Database) ModifyColumn(tableName string, col ColumnDef) error {
 			if !col.Unique && c.Unique {
 				col.Unique = true
 			}
+			// Keep the existing canonical column name for MODIFY.
+			col.Name = c.Name
 			tbl.Columns[i] = col
 			return nil
 		}
@@ -460,8 +462,9 @@ func (db *Database) ChangeColumn(tableName, oldName string, col ColumnDef) error
 		return fmt.Errorf("table '%s.%s' doesn't exist", db.Name, tableName)
 	}
 	found := false
+	oldCanonicalName := oldName
 	for i, c := range tbl.Columns {
-		if c.Name == oldName {
+		if strings.EqualFold(c.Name, oldName) {
 			// Preserve PrimaryKey/Unique/Nullable flags from constraints
 			for _, pk := range tbl.PrimaryKey {
 				if strings.EqualFold(pk, oldName) {
@@ -473,6 +476,7 @@ func (db *Database) ChangeColumn(tableName, oldName string, col ColumnDef) error
 			if !col.Unique && c.Unique {
 				col.Unique = true
 			}
+			oldCanonicalName = c.Name
 			tbl.Columns[i] = col
 			found = true
 			break
@@ -482,7 +486,7 @@ func (db *Database) ChangeColumn(tableName, oldName string, col ColumnDef) error
 		return fmt.Errorf("column '%s' doesn't exist in table '%s'", oldName, tableName)
 	}
 	// Update index references if column name changed
-	if oldName != col.Name {
+	if !strings.EqualFold(oldCanonicalName, col.Name) {
 		for i, idx := range tbl.Indexes {
 			for j, c := range idx.Columns {
 				// Strip length suffix for comparison
@@ -492,14 +496,14 @@ func (db *Database) ChangeColumn(tableName, oldName string, col ColumnDef) error
 					colName = c[:parenIdx]
 					suffix = c[parenIdx:]
 				}
-				if strings.EqualFold(colName, oldName) {
+				if strings.EqualFold(colName, oldCanonicalName) {
 					tbl.Indexes[i].Columns[j] = col.Name + suffix
 				}
 			}
 		}
 		// Update primary key references
 		for i, pk := range tbl.PrimaryKey {
-			if strings.EqualFold(pk, oldName) {
+			if strings.EqualFold(pk, oldCanonicalName) {
 				tbl.PrimaryKey[i] = col.Name
 			}
 		}
