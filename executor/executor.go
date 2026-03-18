@@ -82,8 +82,10 @@ type Result struct {
 	Columns      []string
 	Rows         [][]interface{}
 	AffectedRows uint64
+	MatchedRows  uint64 // for UPDATE: number of rows matched by WHERE
 	InsertID     uint64
 	IsResultSet  bool // true for SELECT, SHOW, etc.
+	InfoString   string
 }
 
 // intOverflowError is returned when an integer literal exceeds uint64 range.
@@ -167,6 +169,8 @@ type Executor struct {
 	// onDupValuesRow holds the candidate INSERT row while evaluating
 	// ON DUPLICATE KEY UPDATE expressions (for VALUES(col) support).
 	onDupValuesRow storage.Row
+	// lastUpdateInfo stores the info string from the last UPDATE statement.
+	lastUpdateInfo string
 }
 
 // Warning represents a MySQL warning.
@@ -174,6 +178,11 @@ type Warning struct {
 	Level   string // "Warning", "Note", "Error"
 	Code    int
 	Message string
+}
+
+// LastUpdateInfo returns the info string from the last UPDATE statement.
+func (e *Executor) LastUpdateInfo() string {
+	return e.lastUpdateInfo
 }
 
 // addWarning adds a warning to the current statement's warning list.
@@ -765,10 +774,11 @@ func matchLikeHelper(s, p []rune, si, pi int) bool {
 // normalizeSQLDisplayName converts SQL keywords in a string to uppercase and
 // normalizes operator spacing to match MySQL's column display name behavior.
 func normalizeSQLDisplayName(s string) string {
+	// Strip backticks from identifiers (MySQL doesn't show them in column headers)
+	s = strings.ReplaceAll(s, "`", "")
 	s = uppercaseSQLKeywords(s)
-	// Compact operators only in nested subexpressions, while keeping top-level
-	// spacing (e.g. "a = b") used by some result headers.
-	s = compactOperatorsInSubexpressions(s)
+	// Compact comparison operators everywhere (MySQL shows c!=@var, a=b, etc.)
+	s = compactComparisonOperators(s)
 	// MySQL displays function arguments without space after comma: LEFT(`c1`,0) not LEFT(`c1`, 0)
 	if !strings.HasPrefix(s, "JSON_SCHEMA_VALID(") &&
 		!strings.HasPrefix(s, "JSON_SCHEMA_VALIDATION_REPORT(") &&
@@ -894,6 +904,43 @@ func compactOperatorsInDisplayName(s string) string {
 
 func isComparisonOrArithOp(ch byte) bool {
 	return ch == '=' || ch == '<' || ch == '>' || ch == '!' || ch == '+' || ch == '-' || ch == '*' || ch == '/'
+}
+
+// compactComparisonOperators removes spaces around non-equality comparison operators
+// everywhere in a string, matching MySQL's column display name behavior.
+// MySQL compacts "!=", "<>", ">=", "<=", ">", "<" but keeps spaces around "=".
+func compactComparisonOperators(s string) string {
+	var result strings.Builder
+	inQuote := byte(0)
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inQuote != 0 {
+			result.WriteByte(ch)
+			if ch == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' || ch == '`' {
+			inQuote = ch
+			result.WriteByte(ch)
+			continue
+		}
+		if ch == ' ' {
+			// Check for " op " patterns and compact them (but NOT " = ")
+			for _, op := range []string{" != ", " <> ", " >= ", " <= ", " > ", " < "} {
+				if i+len(op) <= len(s) && s[i:i+len(op)] == op {
+					compact := strings.TrimSpace(op)
+					result.WriteString(compact)
+					i += len(op) - 1
+					goto nextCharCompact
+				}
+			}
+		}
+		result.WriteByte(ch)
+	nextCharCompact:
+	}
+	return result.String()
 }
 
 // compactOperatorsInSubexpressions removes spaces around operators inside function calls and
@@ -2388,12 +2435,29 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				cleanName := strings.TrimPrefix(name, "global.")
 				cleanName = strings.TrimPrefix(cleanName, "session.")
 				cleanName = strings.TrimPrefix(cleanName, "local.")
-				// Evaluate expression
-				evalVal, err := e.evalExpr(expr.Expr)
-				if err == nil {
-					e.globalVars[cleanName] = fmt.Sprintf("%v", evalVal)
+				// Handle DEFAULT: remove from globalVars so the built-in default is used
+				if strings.EqualFold(val, "DEFAULT") {
+					delete(e.globalVars, cleanName)
 				} else {
-					e.globalVars[cleanName] = val
+					// Special handling for innodb_commit_concurrency:
+					// once non-zero, can't be set to 0 and vice versa
+					if cleanName == "innodb_commit_concurrency" {
+						newVal, _ := strconv.ParseInt(val, 10, 64)
+						curVal := int64(0) // default
+						if cv, ok := e.globalVars[cleanName]; ok {
+							curVal, _ = strconv.ParseInt(cv, 10, 64)
+						}
+						if (curVal == 0 && newVal != 0) || (curVal != 0 && newVal == 0) {
+							return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'innodb_commit_concurrency' can't be set to the value of '%d'", newVal))
+						}
+					}
+					// Evaluate expression
+					evalVal, err := e.evalExpr(expr.Expr)
+					if err == nil {
+						e.globalVars[cleanName] = fmt.Sprintf("%v", evalVal)
+					} else {
+						e.globalVars[cleanName] = val
+					}
 				}
 			}
 		}
@@ -5381,6 +5445,19 @@ func (e *Executor) execMyliteCommand(query string) (*Result, error) {
 		return &Result{}, nil
 	}
 
+	// MYLITE SET_INIT var=val: set a global variable bypassing validation
+	// (used to simulate startup configuration from master.opt files)
+	if strings.HasPrefix(restUpper, "SET_INIT ") {
+		kv := strings.TrimSpace(rest[len("SET_INIT "):])
+		if idx := strings.Index(kv, "="); idx > 0 {
+			varName := strings.TrimSpace(kv[:idx])
+			varVal := strings.TrimSpace(kv[idx+1:])
+			e.globalVars[strings.ToLower(varName)] = varVal
+			return &Result{}, nil
+		}
+		return nil, fmt.Errorf("MYLITE SET_INIT: invalid format, expected var=val")
+	}
+
 	return nil, fmt.Errorf("unknown MYLITE command: %s", query)
 }
 
@@ -7037,6 +7114,11 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		return e.execSelectIntoOutfile(stmt.Into, colNames, resultRows)
 	}
 
+	// Handle SELECT ... INTO @variable
+	if stmt.Into != nil && stmt.Into.Type == sqlparser.IntoVariables {
+		return e.execSelectIntoVars(stmt.Into, colNames, resultRows)
+	}
+
 	return &Result{
 		Columns:     colNames,
 		Rows:        resultRows,
@@ -7392,6 +7474,11 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 	// Handle SELECT ... INTO OUTFILE (GROUP BY path)
 	if stmt.Into != nil && stmt.Into.Type == sqlparser.IntoOutfile {
 		return e.execSelectIntoOutfile(stmt.Into, colNames, resultRows)
+	}
+
+	// Handle SELECT ... INTO @variable (GROUP BY path)
+	if stmt.Into != nil && stmt.Into.Type == sqlparser.IntoVariables {
+		return e.execSelectIntoVars(stmt.Into, colNames, resultRows)
 	}
 
 	return &Result{
@@ -8482,15 +8569,22 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		}
 
 		// Apply the trigger-modified newRow values to the actual row
+		changed := false
 		for _, col := range tbl.Def.Columns {
 			if val, ok := newRow[col.Name]; ok {
 				if padLen := binaryPadLength(col.Type); padLen > 0 && val != nil {
 					val = padBinaryValue(val, padLen)
 				}
+				oldVal := tbl.Rows[i][col.Name]
 				tbl.Rows[i][col.Name] = val
+				if fmt.Sprintf("%v", oldVal) != fmt.Sprintf("%v", val) {
+					changed = true
+				}
 			}
 		}
-		affected++
+		if changed {
+			affected++
+		}
 
 		// Fire AFTER UPDATE triggers
 		tbl.Unlock()
@@ -8501,7 +8595,14 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		tbl.Lock()
 	}
 
-	return &Result{AffectedRows: affected}, nil
+	matched := uint64(len(matchingIndices))
+	infoStr := fmt.Sprintf("Rows matched: %d  Changed: %d  Warnings: %d", matched, affected, len(e.warnings))
+	e.lastUpdateInfo = infoStr
+	return &Result{
+		AffectedRows: affected,
+		MatchedRows:  matched,
+		InfoString:   infoStr,
+	}, nil
 }
 
 func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
@@ -9146,7 +9247,58 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					}
 					idxComment = mysqlTruncateChars(idxComment, 1024)
 				}
-				db.AddIndex(tableName, catalog.IndexDef{
+				// Validate UNIQUE constraint against existing data
+			if isUnique && tbl != nil {
+				tbl.Mu.Lock()
+				seen := make(map[string]bool)
+				// Parse prefix lengths from index columns
+				prefixLens := make([]int, len(idxCols))
+				bareCols := make([]string, len(idxCols))
+				for k, colName := range idxCols {
+					bareCol := colName
+					prefixLen := 0
+					if pIdx := strings.Index(bareCol, "("); pIdx > 0 {
+						lenStr := bareCol[pIdx+1 : len(bareCol)-1]
+						bareCol = bareCol[:pIdx]
+						prefixLen, _ = strconv.Atoi(lenStr)
+					}
+					bareCols[k] = bareCol
+					prefixLens[k] = prefixLen
+				}
+				for _, row := range tbl.Rows {
+					keyParts := make([]string, len(idxCols))
+					allNull := true
+					for k := range idxCols {
+						v := rowValueByColumnName(row, bareCols[k])
+						if v != nil {
+							allNull = false
+						}
+						s := fmt.Sprintf("%v", v)
+						// Apply prefix length truncation
+						if prefixLens[k] > 0 && len(s) > prefixLens[k] {
+							s = s[:prefixLens[k]]
+						}
+						keyParts[k] = s
+					}
+					if allNull {
+						continue
+					}
+					key := strings.Join(keyParts, "\x00")
+					if seen[key] {
+						tbl.Mu.Unlock()
+						// Trim trailing spaces/nulls for error message
+						dispParts := make([]string, len(keyParts))
+						for k, p := range keyParts {
+							dispParts[k] = strings.TrimRight(strings.TrimRight(p, "\x00"), " ")
+						}
+						dupVal := strings.Join(dispParts, "-")
+						return nil, mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key '%s'", dupVal, idxName))
+					}
+					seen[key] = true
+				}
+				tbl.Mu.Unlock()
+			}
+			db.AddIndex(tableName, catalog.IndexDef{
 					Name:    idxName,
 					Columns: idxCols,
 					Orders:  idxOrders,
@@ -9651,9 +9803,16 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 
 	// SHOW ENGINE INNODB STATUS
 	if strings.HasPrefix(upper, "SHOW ENGINE") {
+		status := "=====================================\n" +
+			"SEMAPHORES\n" +
+			"----------\n" +
+			"RW-shared spins 0, rounds 0, OS waits 0\n" +
+			"RW-excl spins 0, rounds 0, OS waits 0\n" +
+			"RW-sx spins 0, rounds 0, OS waits 0\n" +
+			"Spin rounds per wait: 0.00 RW-shared, 0.00 RW-excl, 0.00 RW-sx\n"
 		return &Result{
 			Columns:     []string{"Type", "Name", "Status"},
-			Rows:        [][]interface{}{{"InnoDB", "", ""}},
+			Rows:        [][]interface{}{{"InnoDB", "", status}},
 			IsResultSet: true,
 		}, nil
 	}
@@ -9807,6 +9966,29 @@ func (e *Executor) showVariables(upper string) (*Result, error) {
 		"innodb_ft_min_token_size":             "3",
 		"innodb_compression_level":             "6",
 		"innodb_data_file_path":                "ibdata1:12M:autoextend",
+		"innodb_flush_method":                  "O_DIRECT",
+		"innodb_log_buffer_size":               "1048576",
+		"innodb_buffer_pool_dump_pct":          "25",
+		"innodb_buffer_pool_filename":          "ib_buffer_pool",
+		"innodb_buffer_pool_dump_now":          "OFF",
+		"innodb_buffer_pool_load_now":          "OFF",
+		"innodb_commit_concurrency":            "0",
+		"innodb_fast_shutdown":                 "1",
+		"innodb_read_only":                     "OFF",
+		"innodb_adaptive_hash_index":           "ON",
+		"innodb_redo_log_encrypt":              "OFF",
+		"innodb_undo_log_encrypt":              "OFF",
+		"innodb_undo_log_truncate":             "ON",
+		"innodb_buffer_pool_in_core_file":      "ON",
+		"innodb_random_read_ahead":             "OFF",
+		"innodb_deadlock_detect":               "ON",
+		"innodb_table_locks":                   "ON",
+		"innodb_monitor_enable":                "",
+		"innodb_monitor_disable":               "",
+		"innodb_spin_wait_delay":               "6",
+		"innodb_log_spin_cpu_abs_lwm":          "0",
+		"innodb_log_spin_cpu_pct_hwm":          "50",
+		"innodb_log_wait_for_flush_spin_hwm":   "400",
 		"auto_increment_increment":             "1",
 		"auto_increment_offset":                "1",
 		"character_set_server":                 "utf8mb4",
@@ -17783,6 +17965,29 @@ func (e *Executor) evalDefaultValue(defStr string) (interface{}, error) {
 		return result.Rows[0][0], nil
 	}
 	return nil, nil
+}
+
+// ---------- SELECT INTO @variable ----------
+
+func (e *Executor) execSelectIntoVars(into *sqlparser.SelectInto, colNames []string, rows [][]interface{}) (*Result, error) {
+	if len(rows) == 0 {
+		// No rows: set all variables to NULL
+		for _, v := range into.VarList {
+			varName := v.Name.String()
+			e.userVars[varName] = nil
+		}
+		return &Result{}, nil
+	}
+	row := rows[0]
+	for i, v := range into.VarList {
+		varName := v.Name.String()
+		if i < len(row) {
+			e.userVars[varName] = row[i]
+		} else {
+			e.userVars[varName] = nil
+		}
+	}
+	return &Result{}, nil
 }
 
 // ---------- SELECT INTO OUTFILE ----------

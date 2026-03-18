@@ -134,6 +134,28 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		},
 	}
 
+	// Apply master.opt settings (e.g. --innodb_commit_concurrency=1)
+	// Use MYLITE SET_INIT to bypass validation (simulates startup config).
+	optPath := strings.TrimSuffix(testPath, ".test") + "-master.opt"
+	if optData, optErr := os.ReadFile(optPath); optErr == nil {
+		for _, opt := range strings.Fields(string(optData)) {
+			opt = strings.TrimSpace(opt)
+			if strings.HasPrefix(opt, "--") {
+				opt = opt[2:]
+			}
+			opt = strings.ReplaceAll(opt, "-", "_")
+			if idx := strings.Index(opt, "="); idx > 0 {
+				varName := opt[:idx]
+				varVal := opt[idx+1:]
+				// Use MYLITE SET_INIT for bypass, fallback to SET GLOBAL
+				cmd := fmt.Sprintf("MYLITE SET_INIT %s=%s", varName, varVal)
+				if _, setErr := r.DB.Exec(cmd); setErr != nil {
+					r.DB.Exec(fmt.Sprintf("SET GLOBAL %s = %s", varName, varVal)) //nolint:errcheck
+				}
+			}
+		}
+	}
+
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 

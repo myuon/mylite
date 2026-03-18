@@ -90,7 +90,7 @@ var infoSchemaColumnOrder = map[string][]string{
 	"innodb_columns":           {"TABLE_ID", "NAME", "POS", "MTYPE", "PRTYPE", "LEN"},
 	"innodb_virtual":           {"TABLE_ID", "POS", "BASE_POS"},
 	"innodb_foreign":           {"ID", "FOR_NAME", "REF_NAME", "N_COLS"},
-	"innodb_metrics":           {"NAME", "COUNT", "TYPE"},
+	"innodb_metrics":           {"NAME", "COUNT", "TYPE", "STATUS", "SUBSYSTEM", "COMMENT"},
 	"innodb_cached_indexes":    {"INDEX_ID", "N_FIELDS", "SPACE", "PAGE_NO"},
 	"innodb_indexes":           {"INDEX_ID", "NAME", "TABLE_ID", "TYPE"},
 	"innodb_buffer_page_lru":   {"POOL_ID", "LRU_POSITION", "SPACE", "PAGE_NUMBER"},
@@ -171,7 +171,7 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 	case "innodb_foreign":
 		rawRows = []storage.Row{{"ID": "", "FOR_NAME": "", "REF_NAME": "", "N_COLS": int64(0)}}
 	case "innodb_metrics":
-		rawRows = []storage.Row{{"NAME": "", "COUNT": int64(0), "TYPE": "counter"}}
+		rawRows = e.infoSchemaInnoDBMetrics()
 	case "innodb_cached_indexes":
 		rawRows = []storage.Row{{"INDEX_ID": int64(0), "N_FIELDS": int64(0), "SPACE": int64(0), "PAGE_NO": int64(0)}}
 	case "innodb_indexes":
@@ -735,4 +735,150 @@ func (e *Executor) perfSchemaMemorySummary() []storage.Row {
 			"sum_number_of_bytes_free":     int64(1024),
 		},
 	}
+}
+
+// innoDBMetricDef defines a single InnoDB metric entry for INFORMATION_SCHEMA.INNODB_METRICS.
+type innoDBMetricDef struct {
+	name      string
+	subsystem string
+	mtype     string
+}
+
+// innoDBMetrics is a list of known InnoDB metrics, mirroring the MySQL 8.0 set.
+var innoDBMetrics = []innoDBMetricDef{
+	{"metadata_table_reference_count", "metadata", "counter"},
+	{"metadata_table_handles_opened", "metadata", "counter"},
+	{"metadata_table_handles_closed", "metadata", "counter"},
+	{"lock_deadlocks", "lock", "counter"},
+	{"lock_deadlock_false_positives", "lock", "counter"},
+	{"lock_deadlock_rounds", "counter", "counter"},
+	{"lock_timeouts", "lock", "counter"},
+	{"lock_rec_lock_waits", "lock", "counter"},
+	{"lock_table_lock_waits", "lock", "counter"},
+	{"lock_rec_lock_requests", "lock", "counter"},
+	{"lock_rec_release_attempts", "lock", "counter"},
+	{"lock_rec_grant_attempts", "lock", "counter"},
+	{"lock_rec_lock_created", "lock", "counter"},
+	{"lock_rec_lock_removed", "lock", "counter"},
+	{"lock_table_lock_created", "lock", "counter"},
+	{"lock_table_lock_removed", "lock", "counter"},
+	{"lock_table_locks", "lock", "counter"},
+	{"lock_row_lock_current_waits", "lock", "counter"},
+	{"lock_row_lock_time", "lock", "counter"},
+	{"lock_row_lock_time_max", "lock", "counter"},
+	{"lock_row_lock_waits", "lock", "counter"},
+	{"lock_row_lock_time_avg", "lock", "counter"},
+	{"lock_schedule_refreshes", "lock", "counter"},
+	{"buffer_pool_size", "buffer", "value"},
+	{"buffer_pool_reads", "buffer", "status_counter"},
+	{"buffer_pool_read_requests", "buffer", "status_counter"},
+	{"buffer_pool_write_requests", "buffer", "status_counter"},
+	{"buffer_pool_pages_total", "buffer", "value"},
+	{"buffer_pool_pages_data", "buffer", "value"},
+	{"buffer_pool_pages_dirty", "buffer", "value"},
+	{"buffer_pool_pages_free", "buffer", "value"},
+	{"buffer_data_written", "buffer", "status_counter"},
+	{"buffer_data_read", "buffer", "status_counter"},
+	{"os_data_reads", "os", "status_counter"},
+	{"os_data_writes", "os", "status_counter"},
+	{"os_data_fsyncs", "os", "status_counter"},
+	{"trx_rw_commits", "transaction", "counter"},
+	{"trx_ro_commits", "transaction", "counter"},
+	{"trx_nl_ro_commits", "transaction", "counter"},
+	{"trx_commits_insert_update", "transaction", "counter"},
+	{"trx_rollbacks", "transaction", "counter"},
+	{"trx_rollbacks_savepoint", "transaction", "counter"},
+	{"trx_active_transactions", "transaction", "counter"},
+	{"trx_rseg_history_len", "transaction", "value"},
+	{"trx_undo_slots_used", "transaction", "counter"},
+	{"trx_undo_slots_cached", "transaction", "counter"},
+	{"purge_del_mark_records", "purge", "counter"},
+	{"purge_upd_exist_or_extern_records", "purge", "counter"},
+	{"purge_invoked", "purge", "counter"},
+	{"purge_undo_log_pages", "purge", "counter"},
+	{"purge_dml_delay_usec", "purge", "value"},
+	{"purge_stop_count", "purge", "value"},
+	{"purge_resume_count", "purge", "value"},
+	{"purge_truncate_history_count", "purge", "counter"},
+	{"purge_truncate_history_usec", "purge", "counter"},
+	{"log_lsn_last_flush", "recovery", "value"},
+	{"log_lsn_last_checkpoint", "recovery", "value"},
+	{"log_lsn_current", "recovery", "value"},
+	{"log_lsn_archived", "recovery", "value"},
+	{"log_lsn_checkpoint_age", "recovery", "value"},
+	{"log_lsn_buf_dirty_pages_added", "recovery", "value"},
+	{"log_lsn_buf_pool_oldest_approx", "recovery", "value"},
+	{"log_lsn_buf_pool_oldest_lwm", "recovery", "value"},
+	{"log_max_modified_age_async", "recovery", "value"},
+	{"log_max_modified_age_sync", "recovery", "value"},
+	{"log_waits", "recovery", "status_counter"},
+	{"log_write_requests", "recovery", "status_counter"},
+	{"log_writes", "recovery", "status_counter"},
+	{"log_padded", "recovery", "status_counter"},
+	{"compress_pages_compressed", "compression", "counter"},
+	{"compress_pages_decompressed", "compression", "counter"},
+	{"index_page_splits", "index", "counter"},
+	{"index_page_merge_attempts", "index", "counter"},
+	{"index_page_merge_successful", "index", "counter"},
+	{"adaptive_hash_searches", "adaptive_hash_index", "status_counter"},
+	{"adaptive_hash_searches_btree", "adaptive_hash_index", "status_counter"},
+	{"file_num_open_files", "file_system", "value"},
+	{"ibuf_merges_insert", "change_buffer", "status_counter"},
+	{"ibuf_merges_delete_mark", "change_buffer", "status_counter"},
+	{"ibuf_merges_delete", "change_buffer", "status_counter"},
+	{"ibuf_merges_discard_insert", "change_buffer", "status_counter"},
+	{"ibuf_merges_discard_delete_mark", "change_buffer", "status_counter"},
+	{"ibuf_merges_discard_delete", "change_buffer", "status_counter"},
+	{"ibuf_merges", "change_buffer", "status_counter"},
+	{"ibuf_size", "change_buffer", "value"},
+	{"innodb_dblwr_pages_written", "dblwr", "status_counter"},
+	{"innodb_dblwr_writes", "dblwr", "status_counter"},
+	{"innodb_page_size", "server", "value"},
+	{"innodb_rwlock_s_spin_waits", "server", "status_counter"},
+	{"innodb_rwlock_x_spin_waits", "server", "status_counter"},
+	{"innodb_rwlock_sx_spin_waits", "server", "status_counter"},
+	{"innodb_rwlock_s_spin_rounds", "server", "status_counter"},
+	{"innodb_rwlock_x_spin_rounds", "server", "status_counter"},
+	{"innodb_rwlock_sx_spin_rounds", "server", "status_counter"},
+	{"innodb_rwlock_s_os_waits", "server", "status_counter"},
+	{"innodb_rwlock_x_os_waits", "server", "status_counter"},
+	{"innodb_rwlock_sx_os_waits", "server", "status_counter"},
+	{"dml_inserts", "dml", "status_counter"},
+	{"dml_deletes", "dml", "status_counter"},
+	{"dml_updates", "dml", "status_counter"},
+	{"dml_system_inserts", "dml", "status_counter"},
+	{"dml_system_deletes", "dml", "status_counter"},
+	{"dml_system_updates", "dml", "status_counter"},
+	{"sampled_pages_read", "sampling", "counter"},
+	{"sampled_pages_skipped", "sampling", "counter"},
+	{"ddl_background_drop_indexes", "ddl", "counter"},
+	{"ddl_background_drop_tables", "ddl", "counter"},
+	{"ddl_online_create_index", "ddl", "counter"},
+	{"ddl_pending_alter_table", "ddl", "counter"},
+	{"ddl_sort_file_alter_table", "ddl", "counter"},
+	{"ddl_log_file_alter_table", "ddl", "counter"},
+	{"icp_attempts", "icp", "counter"},
+	{"icp_no_match", "icp", "counter"},
+	{"icp_out_of_range", "icp", "counter"},
+	{"icp_match", "icp", "counter"},
+	{"cpu_utime_abs", "cpu", "value"},
+	{"cpu_stime_abs", "cpu", "value"},
+	{"cpu_utime_pct", "cpu", "value"},
+	{"cpu_stime_pct", "cpu", "value"},
+	{"cpu_n", "cpu", "value"},
+}
+
+func (e *Executor) infoSchemaInnoDBMetrics() []storage.Row {
+	rows := make([]storage.Row, 0, len(innoDBMetrics))
+	for _, m := range innoDBMetrics {
+		rows = append(rows, storage.Row{
+			"NAME":      m.name,
+			"COUNT":     int64(0),
+			"TYPE":      m.mtype,
+			"STATUS":    "disabled",
+			"SUBSYSTEM": m.subsystem,
+			"COMMENT":   "",
+		})
+	}
+	return rows
 }
