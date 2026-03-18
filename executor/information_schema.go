@@ -1,11 +1,46 @@
 package executor
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/myuon/mylite/storage"
 )
+
+func asInt64Or(v interface{}, fallback int64) int64 {
+	switch x := v.(type) {
+	case int:
+		return int64(x)
+	case int8:
+		return int64(x)
+	case int16:
+		return int64(x)
+	case int32:
+		return int64(x)
+	case int64:
+		return x
+	case uint:
+		return int64(x)
+	case uint8:
+		return int64(x)
+	case uint16:
+		return int64(x)
+	case uint32:
+		return int64(x)
+	case uint64:
+		return int64(x)
+	default:
+		return fallback
+	}
+}
+
+func normalizeIndexColumnName(col string) string {
+	if idx := strings.Index(col, "("); idx >= 0 {
+		return strings.TrimSpace(col[:idx])
+	}
+	return strings.TrimSpace(col)
+}
 
 // infoSchemaColumnOrder defines the canonical column order for INFORMATION_SCHEMA tables.
 var infoSchemaColumnOrder = map[string][]string{
@@ -239,6 +274,20 @@ func (e *Executor) infoSchemaSchemata() []storage.Row {
 
 // infoSchemaTables returns rows for INFORMATION_SCHEMA.TABLES.
 func (e *Executor) infoSchemaTables() []storage.Row {
+	tableStatsByKey := map[string]storage.Row{}
+	if tbl, err := e.Storage.GetTable("mysql", "innodb_table_stats"); err == nil {
+		tbl.Mu.RLock()
+		for _, r := range tbl.Rows {
+			dbName := strings.ToLower(toString(r["database_name"]))
+			tableName := strings.ToLower(toString(r["table_name"]))
+			if dbName == "" || tableName == "" {
+				continue
+			}
+			tableStatsByKey[dbName+"."+tableName] = r
+		}
+		tbl.Mu.RUnlock()
+	}
+
 	dbNames := e.Catalog.ListDatabases()
 	sort.Strings(dbNames)
 
@@ -253,8 +302,25 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 		for _, tblName := range tableNames {
 			tblDef, _ := db.GetTable(tblName)
 			tblComment := ""
+			createOptions := ""
+			tableRows := int64(0)
+			avgRowLength := int64(0)
+			maxDataLength := int64(0)
+			indexLength := int64(0)
 			if tblDef != nil {
 				tblComment = tblDef.Comment
+				opts := make([]string, 0, 2)
+				if tblDef.StatsPersistent != nil {
+					opts = append(opts, fmt.Sprintf("stats_persistent=%d", *tblDef.StatsPersistent))
+				}
+				if tblDef.StatsAutoRecalc != nil {
+					opts = append(opts, fmt.Sprintf("stats_auto_recalc=%d", *tblDef.StatsAutoRecalc))
+				}
+				createOptions = strings.Join(opts, " ")
+			}
+			if stats, ok := tableStatsByKey[strings.ToLower(dbName+"."+tblName)]; ok {
+				tableRows = asInt64Or(stats["n_rows"], 0)
+				indexLength = asInt64Or(stats["sum_of_other_index_sizes"], 0) * 16384
 			}
 			rows = append(rows, storage.Row{
 				"TABLE_CATALOG":   "def",
@@ -264,11 +330,11 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 				"ENGINE":          "InnoDB",
 				"VERSION":         int64(10),
 				"ROW_FORMAT":      "Dynamic",
-				"TABLE_ROWS":      nil,
-				"AVG_ROW_LENGTH":  nil,
+				"TABLE_ROWS":      tableRows,
+				"AVG_ROW_LENGTH":  avgRowLength,
 				"DATA_LENGTH":     nil,
-				"MAX_DATA_LENGTH": nil,
-				"INDEX_LENGTH":    nil,
+				"MAX_DATA_LENGTH": maxDataLength,
+				"INDEX_LENGTH":    indexLength,
 				"DATA_FREE":       nil,
 				"AUTO_INCREMENT":  nil,
 				"CREATE_TIME":     nil,
@@ -276,7 +342,7 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 				"CHECK_TIME":      nil,
 				"TABLE_COLLATION": "utf8mb4_general_ci",
 				"CHECKSUM":        nil,
-				"CREATE_OPTIONS":  "",
+				"CREATE_OPTIONS":  createOptions,
 				"TABLE_COMMENT":   tblComment,
 			})
 		}
@@ -379,6 +445,22 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 
 // infoSchemaStatistics returns rows for INFORMATION_SCHEMA.STATISTICS.
 func (e *Executor) infoSchemaStatistics() []storage.Row {
+	cardinalityByKey := map[string]int64{}
+	if tbl, err := e.Storage.GetTable("mysql", "innodb_index_stats"); err == nil {
+		tbl.Mu.RLock()
+		for _, r := range tbl.Rows {
+			dbName := strings.ToLower(toString(r["database_name"]))
+			tableName := strings.ToLower(toString(r["table_name"]))
+			indexName := strings.ToLower(toString(r["index_name"]))
+			statName := strings.ToLower(toString(r["stat_name"]))
+			if dbName == "" || tableName == "" || indexName == "" || !strings.HasPrefix(statName, "n_diff_pfx") {
+				continue
+			}
+			cardinalityByKey[dbName+"."+tableName+"."+indexName+"."+statName] = asInt64Or(r["stat_value"], 0)
+		}
+		tbl.Mu.RUnlock()
+	}
+
 	dbNames := e.Catalog.ListDatabases()
 	sort.Strings(dbNames)
 
@@ -399,6 +481,7 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 			// Add primary key entries
 			for i, pkCol := range tbl.PrimaryKey {
 				seqInIndex = int64(i + 1)
+				statKey := strings.ToLower(dbName + "." + tblName + ".primary." + fmt.Sprintf("n_diff_pfx%02d", i+1))
 				rows = append(rows, storage.Row{
 					"TABLE_CATALOG": "def",
 					"TABLE_SCHEMA":  dbName,
@@ -409,7 +492,7 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 					"SEQ_IN_INDEX":  seqInIndex,
 					"COLUMN_NAME":   pkCol,
 					"COLLATION":     "A",
-					"CARDINALITY":   nil,
+					"CARDINALITY":   cardinalityByKey[statKey],
 					"SUB_PART":      nil,
 					"PACKED":        nil,
 					"NULLABLE":      "",
@@ -427,6 +510,8 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 					nonUnique = 0
 				}
 				for i, col := range idx.Columns {
+					colName := normalizeIndexColumnName(col)
+					statKey := strings.ToLower(dbName + "." + tblName + "." + idx.Name + "." + fmt.Sprintf("n_diff_pfx%02d", i+1))
 					rows = append(rows, storage.Row{
 						"TABLE_CATALOG": "def",
 						"TABLE_SCHEMA":  dbName,
@@ -435,9 +520,9 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 						"INDEX_SCHEMA":  dbName,
 						"INDEX_NAME":    idx.Name,
 						"SEQ_IN_INDEX":  int64(i + 1),
-						"COLUMN_NAME":   col,
+						"COLUMN_NAME":   colName,
 						"COLLATION":     "A",
-						"CARDINALITY":   nil,
+						"CARDINALITY":   cardinalityByKey[statKey],
 						"SUB_PART":      nil,
 						"PACKED":        nil,
 						"NULLABLE":      "",

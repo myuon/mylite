@@ -375,6 +375,165 @@ func (e *Executor) innodbStatsPersistentEnabled(def *catalog.TableDef) bool {
 	return true
 }
 
+func (e *Executor) innodbStatsAutoRecalcEnabled(def *catalog.TableDef) bool {
+	if def != nil && def.StatsAutoRecalc != nil {
+		return *def.StatsAutoRecalc != 0
+	}
+	if v, ok := e.globalVars["innodb_stats_auto_recalc"]; ok && v != "" {
+		return v != "0" && !strings.EqualFold(v, "OFF")
+	}
+	return true
+}
+
+func (e *Executor) tableRowCount(dbName, tableName string) int64 {
+	tbl, err := e.Storage.GetTable(dbName, tableName)
+	if err != nil {
+		return 0
+	}
+	tbl.Mu.RLock()
+	defer tbl.Mu.RUnlock()
+	return int64(len(tbl.Rows))
+}
+
+func (e *Executor) hasInnoDBTableStatsRow(dbName, tableName string) bool {
+	statsTbl, err := e.Storage.GetTable("mysql", "innodb_table_stats")
+	if err != nil {
+		return false
+	}
+	statsTbl.Mu.RLock()
+	defer statsTbl.Mu.RUnlock()
+	for _, r := range statsTbl.Rows {
+		if strings.EqualFold(toString(r["database_name"]), dbName) && strings.EqualFold(toString(r["table_name"]), tableName) {
+			return true
+		}
+	}
+	return false
+}
+
+func indexDefsForStats(def *catalog.TableDef) []catalog.IndexDef {
+	indexDefs := make([]catalog.IndexDef, 0, len(def.Indexes)+1)
+	if len(def.PrimaryKey) > 0 {
+		indexDefs = append(indexDefs, catalog.IndexDef{Name: "PRIMARY", Columns: append([]string(nil), def.PrimaryKey...)})
+	}
+	indexDefs = append(indexDefs, def.Indexes...)
+	if len(indexDefs) == 0 {
+		indexDefs = append(indexDefs, catalog.IndexDef{Name: "GEN_CLUST_INDEX", Columns: []string{"DB_ROW_ID"}})
+	}
+	return indexDefs
+}
+
+func (e *Executor) removeInnoDBStatsRows(dbName, tableName string) {
+	statsTbl, err := e.Storage.GetTable("mysql", "innodb_table_stats")
+	if err == nil {
+		statsTbl.Mu.Lock()
+		filtered := make([]storage.Row, 0, len(statsTbl.Rows))
+		for _, r := range statsTbl.Rows {
+			if strings.EqualFold(toString(r["database_name"]), dbName) && strings.EqualFold(toString(r["table_name"]), tableName) {
+				continue
+			}
+			filtered = append(filtered, r)
+		}
+		statsTbl.Rows = filtered
+		statsTbl.Mu.Unlock()
+	}
+	idxTbl, err := e.Storage.GetTable("mysql", "innodb_index_stats")
+	if err == nil {
+		idxTbl.Mu.Lock()
+		filtered := make([]storage.Row, 0, len(idxTbl.Rows))
+		for _, r := range idxTbl.Rows {
+			if strings.EqualFold(toString(r["database_name"]), dbName) && strings.EqualFold(toString(r["table_name"]), tableName) {
+				continue
+			}
+			filtered = append(filtered, r)
+		}
+		idxTbl.Rows = filtered
+		idxTbl.Mu.Unlock()
+	}
+}
+
+func (e *Executor) upsertInnoDBStatsRows(dbName, tableName string, rowCount int64) {
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		return
+	}
+	def, err := db.GetTable(tableName)
+	if err != nil || def == nil {
+		return
+	}
+	if def.Engine != "" && !strings.EqualFold(def.Engine, "InnoDB") {
+		return
+	}
+	if !e.innodbStatsPersistentEnabled(def) {
+		e.removeInnoDBStatsRows(dbName, tableName)
+		return
+	}
+
+	e.removeInnoDBStatsRows(dbName, tableName)
+	lastUpdate := time.Now().UTC().Format("2006-01-02 15:04:05")
+
+	statsTbl, err := e.Storage.GetTable("mysql", "innodb_table_stats")
+	if err == nil {
+		statsTbl.Mu.Lock()
+		statsTbl.Rows = append(statsTbl.Rows, storage.Row{
+			"database_name":            dbName,
+			"table_name":               tableName,
+			"last_update":              lastUpdate,
+			"n_rows":                   rowCount,
+			"clustered_index_size":     int64(1),
+			"sum_of_other_index_sizes": int64(len(def.Indexes)),
+		})
+		statsTbl.Mu.Unlock()
+	}
+
+	idxTbl, err := e.Storage.GetTable("mysql", "innodb_index_stats")
+	if err != nil {
+		return
+	}
+	idxTbl.Mu.Lock()
+	for _, idx := range indexDefsForStats(def) {
+		indexName := idx.Name
+		if indexName == "" {
+			indexName = "PRIMARY"
+		}
+		for i, col := range idx.Columns {
+			statName := fmt.Sprintf("n_diff_pfx%02d", i+1)
+			idxTbl.Rows = append(idxTbl.Rows, storage.Row{
+				"database_name":    dbName,
+				"table_name":       tableName,
+				"index_name":       indexName,
+				"last_update":      lastUpdate,
+				"stat_name":        statName,
+				"stat_value":       rowCount,
+				"sample_size":      rowCount,
+				"stat_description": statsIndexColName(col),
+			})
+		}
+		idxTbl.Rows = append(idxTbl.Rows,
+			storage.Row{
+				"database_name":    dbName,
+				"table_name":       tableName,
+				"index_name":       indexName,
+				"last_update":      lastUpdate,
+				"stat_name":        "n_leaf_pages",
+				"stat_value":       int64(1),
+				"sample_size":      nil,
+				"stat_description": "Number of leaf pages in the index",
+			},
+			storage.Row{
+				"database_name":    dbName,
+				"table_name":       tableName,
+				"index_name":       indexName,
+				"last_update":      lastUpdate,
+				"stat_name":        "size",
+				"stat_value":       int64(1),
+				"sample_size":      nil,
+				"stat_description": "Number of pages in the index",
+			},
+		)
+	}
+	idxTbl.Mu.Unlock()
+}
+
 func (e *Executor) refreshInnoDBStatsTables() {
 	if e.Catalog == nil || e.Storage == nil {
 		return
@@ -1259,9 +1418,6 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	trimmed := strings.TrimSpace(query)
 	e.currentQuery = trimmed
 	upper := strings.ToUpper(trimmed)
-	if strings.Contains(upper, "MYSQL.INNODB_TABLE_STATS") || strings.Contains(upper, "MYSQL.INNODB_INDEX_STATS") {
-		e.refreshInnoDBStatsTables()
-	}
 	compact := strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "").Replace(upper)
 	if compact == "SELECTJSON_SCHEMA_VALID()" ||
 		compact == "SELECTJSON_SCHEMA_VALID(NULL)" ||
@@ -1530,8 +1686,13 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		// Accept UNLOCK TABLES silently
 		return &Result{}, nil
 	case *sqlparser.Analyze:
-		// Return a minimal ANALYZE TABLE result set for compatibility
 		tableName := s.Table.Name.String()
+		if db, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
+			if def, err := db.GetTable(tableName); err == nil && def != nil && e.innodbStatsPersistentEnabled(def) {
+				e.upsertInnoDBStatsRows(e.CurrentDB, tableName, e.tableRowCount(e.CurrentDB, tableName))
+			}
+		}
+		// Return a minimal ANALYZE TABLE result set for compatibility
 		return &Result{
 			Columns:     []string{"Table", "Op", "Msg_type", "Msg_text"},
 			Rows:        [][]interface{}{{fmt.Sprintf("%s.%s", e.CurrentDB, tableName), "analyze", "status", "OK"}},
@@ -1799,6 +1960,8 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 			}
 			e.Storage.DropTable(srcDB, oldName)
 		}
+		e.removeInnoDBStatsRows(srcDB, oldName)
+		e.upsertInnoDBStatsRows(targetDB, newName, e.tableRowCount(targetDB, newName))
 	}
 	return &Result{}, nil
 }
@@ -4855,6 +5018,8 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 	}
 
+	e.upsertInnoDBStatsRows(dbName, tableName, e.tableRowCount(dbName, tableName))
+
 	return &Result{}, nil
 }
 
@@ -4924,6 +5089,7 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 			return nil, mysqlError(1051, "42S02", fmt.Sprintf("Unknown table '%s.%s'", dbName, tableName))
 		}
 		e.Storage.DropTable(dbName, tableName)
+		e.removeInnoDBStatsRows(dbName, tableName)
 		// Clean up temp table tracking
 		delete(e.tempTables, tableName)
 		// Drop triggers associated with this table (MySQL behavior)
@@ -6446,6 +6612,37 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 					}
 				}
 			}
+		}
+	}
+	// If persistent stats are enabled and stats rows are missing, reading the table
+	// can regenerate stats (models InnoDB auto recalc on table open).
+	for _, fromExpr := range stmt.From {
+		tbl, ok := fromExpr.(*sqlparser.AliasedTableExpr)
+		if !ok {
+			continue
+		}
+		tn, ok := tbl.Expr.(sqlparser.TableName)
+		if !ok {
+			continue
+		}
+		dbName := e.CurrentDB
+		if !tn.Qualifier.IsEmpty() {
+			dbName = tn.Qualifier.String()
+		}
+		tableName := tn.Name.String()
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		def, err := db.GetTable(tableName)
+		if err != nil || def == nil {
+			continue
+		}
+		if !e.innodbStatsPersistentEnabled(def) || !e.innodbStatsAutoRecalcEnabled(def) {
+			continue
+		}
+		if !e.hasInnoDBTableStatsRow(dbName, tableName) {
+			e.upsertInnoDBStatsRows(dbName, tableName, e.tableRowCount(dbName, tableName))
 		}
 	}
 
@@ -16590,6 +16787,7 @@ func (e *Executor) execCreateTableLike(newTableName, srcTableName string) (*Resu
 		return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newTableName))
 	}
 	e.Storage.CreateTable(e.CurrentDB, newDef)
+	e.upsertInnoDBStatsRows(e.CurrentDB, newTableName, 0)
 	return &Result{}, nil
 }
 
@@ -16633,6 +16831,7 @@ func (e *Executor) execCreateTableSelect(newTableName, selectSQL string) (*Resul
 		}
 		tbl.Insert(sRow) //nolint:errcheck
 	}
+	e.upsertInnoDBStatsRows(e.CurrentDB, newTableName, e.tableRowCount(e.CurrentDB, newTableName))
 	return &Result{}, nil
 }
 
