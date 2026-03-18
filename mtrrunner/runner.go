@@ -408,8 +408,7 @@ func (ctx *execContext) executeLines(lines []string) error {
 			// Execute while loop
 			for loopCount := 0; loopCount < 100000; loopCount++ {
 				condVal := ctx.substituteVars(condStr)
-				n, _ := strconv.Atoi(condVal)
-				if n == 0 {
+				if !evalWhileCondition(condVal) {
 					break
 				}
 				err := ctx.executeLines(bodyLines)
@@ -480,8 +479,7 @@ func (ctx *execContext) executeLines(lines []string) error {
 					bodyLines := lines[bodyStart:j]
 					for loopCount := 0; loopCount < 100000; loopCount++ {
 						condVal := ctx.substituteVars(condStr)
-						n, _ := strconv.Atoi(condVal)
-						if n == 0 {
+						if !evalWhileCondition(condVal) {
 							break
 						}
 						err := ctx.executeLines(bodyLines)
@@ -2094,6 +2092,50 @@ func applyMasterOpt(content string, ctx *execContext) {
 			ctx.db.Exec(fmt.Sprintf("SET STARTUP %s = %s", varKey, val)) //nolint:errcheck
 		}
 	}
+}
+
+// evalWhileCondition evaluates a mysqltest while/if condition string.
+// It handles comparison operators (>, <, >=, <=, ==, !=) and plain numeric values.
+// Returns true if the condition is satisfied (non-zero for plain numbers).
+func evalWhileCondition(condVal string) bool {
+	condVal = strings.TrimSpace(condVal)
+	// Try comparison operators
+	for _, op := range []string{">=", "<=", "!=", "==", ">", "<"} {
+		if idx := strings.Index(condVal, op); idx >= 0 {
+			left := strings.TrimSpace(condVal[:idx])
+			right := strings.TrimSpace(condVal[idx+len(op):])
+			l, errL := strconv.Atoi(left)
+			r, errR := strconv.Atoi(right)
+			if errL != nil || errR != nil {
+				// Non-numeric comparison: use string comparison
+				switch op {
+				case "==":
+					return left == right
+				case "!=":
+					return left != right
+				default:
+					return false
+				}
+			}
+			switch op {
+			case ">":
+				return l > r
+			case "<":
+				return l < r
+			case ">=":
+				return l >= r
+			case "<=":
+				return l <= r
+			case "==":
+				return l == r
+			case "!=":
+				return l != r
+			}
+		}
+	}
+	// Plain numeric value: non-zero is true
+	n, _ := strconv.Atoi(condVal)
+	return n != 0
 }
 
 // stripUndefinedVars removes remaining $variable references that were not

@@ -305,6 +305,14 @@ func (e *Executor) initSystemTables() {
 		},
 	})
 
+	ensure("mtr", &catalog.TableDef{
+		Name:   "test_suppressions",
+		Engine: "InnoDB",
+		Columns: []catalog.ColumnDef{
+			{Name: "pattern", Type: "VARCHAR(255)"},
+		},
+	})
+
 	ensure("information_schema", &catalog.TableDef{
 		Name: "INNODB_TRX",
 		Columns: []catalog.ColumnDef{
@@ -6287,6 +6295,16 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 		}
 	}
+
+	// Auto-recalc InnoDB persistent stats after DML
+	if affected > 0 {
+		if db, dbErr := e.Catalog.GetDatabase(insertDB); dbErr == nil {
+			if def, defErr := db.GetTable(tableName); defErr == nil && e.innodbStatsAutoRecalcEnabled(def) && e.innodbStatsPersistentEnabled(def) {
+				e.upsertInnoDBStatsRows(insertDB, tableName, e.tableRowCount(insertDB, tableName))
+			}
+		}
+	}
+
 	return &Result{
 		AffectedRows: affected,
 		InsertID:     uint64(lastInsertID),
@@ -6360,17 +6378,14 @@ func (e *Executor) findDuplicateRow(tbl *storage.Table, candidate storage.Row, p
 	tbl.Mu.RLock()
 	defer tbl.Mu.RUnlock()
 
-	// Also collect multi-column unique indexes
-	var multiColUnique [][]string
-	for _, idx := range tbl.Def.Indexes {
-		if idx.Unique && len(idx.Columns) > 1 {
-			multiColUnique = append(multiColUnique, idx.Columns)
-		}
-	}
+	// MySQL checks constraints in order: PRIMARY KEY first across all rows,
+	// then each UNIQUE key in definition order across all rows.
+	// This ensures that when multiple keys conflict with different rows,
+	// the PRIMARY KEY match takes precedence.
 
-	for i, existing := range tbl.Rows {
-		// Check primary key match.
-		if len(pkCols) > 0 {
+	// 1. Check primary key match across all rows first.
+	if len(pkCols) > 0 {
+		for i, existing := range tbl.Rows {
 			match := true
 			for _, col := range pkCols {
 				baseCol := stripPrefixLengthFromCol(col)
@@ -6389,20 +6404,32 @@ func (e *Executor) findDuplicateRow(tbl *storage.Table, candidate storage.Row, p
 				return i
 			}
 		}
-		// Check unique key match (single-column unique keys).
-		for _, col := range uniqueCols {
-			baseCol := stripPrefixLengthFromCol(col)
-			cv, cok := candidate[baseCol]
+	}
+
+	// 2. Check each unique key in definition order across all rows.
+	// Single-column unique keys
+	for _, col := range uniqueCols {
+		baseCol := stripPrefixLengthFromCol(col)
+		cv, cok := candidate[baseCol]
+		if !cok || cv == nil {
+			continue
+		}
+		for i, existing := range tbl.Rows {
 			ev, eok := existing[baseCol]
-			if cok && eok && cv != nil && ev != nil &&
-				fmt.Sprintf("%v", cv) == fmt.Sprintf("%v", ev) {
+			if eok && ev != nil && fmt.Sprintf("%v", cv) == fmt.Sprintf("%v", ev) {
 				return i
 			}
 		}
-		// Check multi-column unique indexes.
-		for _, cols := range multiColUnique {
+	}
+
+	// 3. Check multi-column unique indexes in definition order.
+	for _, idx := range tbl.Def.Indexes {
+		if !idx.Unique || len(idx.Columns) <= 1 {
+			continue
+		}
+		for i, existing := range tbl.Rows {
 			match := true
-			for _, col := range cols {
+			for _, col := range idx.Columns {
 				baseCol := stripPrefixLengthFromCol(col)
 				cv, cok := candidate[baseCol]
 				ev, eok := existing[baseCol]
@@ -8176,13 +8203,32 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 						}
 					}
 				} else {
-					// Even with no rows, resolve against information_schema column names
+					// Even with no rows, resolve column name from table definition first
+					resolved := false
 					upperName := strings.ToUpper(name)
-					for _, order := range infoSchemaColumnOrder {
-						for _, col := range order {
-							if col == upperName {
-								name = col
+					for _, td := range tableDefs {
+						if td == nil {
+							continue
+						}
+						for _, col := range td.Columns {
+							if strings.ToUpper(col.Name) == upperName {
+								name = col.Name
+								resolved = true
 								break
+							}
+						}
+						if resolved {
+							break
+						}
+					}
+					// Fall back to information_schema column names only if not resolved
+					if !resolved {
+						for _, order := range infoSchemaColumnOrder {
+							for _, col := range order {
+								if col == upperName {
+									name = col
+									break
+								}
 							}
 						}
 					}
@@ -8191,14 +8237,15 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 				if rawExprIdx < len(rawExprs) {
 					raw := strings.TrimSpace(rawExprs[rawExprIdx])
 					lowerRaw := strings.ToLower(raw)
-					if strings.Contains(lowerRaw, "json_") || strings.Contains(lowerRaw, "cast(") || strings.Contains(lowerRaw, "upper(") {
-						if strings.Contains(lowerRaw, "json_schema_validation_report(") {
-							if idx := strings.Index(raw, `"longitude": -90,`); idx >= 0 {
-								raw = raw[:idx+len(`"longitude": -90,`)] + "\n "
-							}
+					if strings.Contains(lowerRaw, "json_schema_validation_report(") {
+						if idx := strings.Index(raw, `"longitude": -90,`); idx >= 0 {
+							raw = raw[:idx+len(`"longitude": -90,`)] + "\n "
 						}
-						name = raw
 					}
+					// Use raw expression text from the original query to preserve
+					// MySQL's behavior of keeping the original formatting (e.g.
+					// spacing after commas in function calls).
+					name = raw
 				}
 				if name == "" {
 					name = normalizeSQLDisplayName(sqlparser.String(se.Expr))
@@ -8661,6 +8708,18 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 				}
 			}
 			newRow[colName] = val
+		}
+
+		// Recalculate generated/virtual columns after SET clauses are applied,
+		// since their base columns may have changed.
+		for _, col := range tbl.Def.Columns {
+			genExpr := generatedColumnExpr(col.Type)
+			if genExpr == "" {
+				continue
+			}
+			if v, err := e.evalGeneratedColumnExpr(genExpr, newRow); err == nil {
+				newRow[col.Name] = v
+			}
 		}
 
 		// Fire BEFORE UPDATE triggers (unlock table to avoid deadlock since trigger may access other tables)
@@ -11584,6 +11643,9 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		return e.evalInsertExpr(v)
 	case *sqlparser.LocateExpr:
 		return e.evalLocateExpr(v)
+	case sqlparser.ValTuple:
+		// A row constructor (tuple) used in a scalar context is an error in MySQL
+		return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain 1 column(s)"))
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
 }
