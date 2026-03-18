@@ -501,8 +501,12 @@ func (e *Executor) upsertInnoDBStatsRows(dbName, tableName string, rowCount int6
 		}
 		statCols := make([]string, 0, len(idx.Columns)+1)
 		statCols = append(statCols, idx.Columns...)
-		if !strings.EqualFold(indexName, "PRIMARY") && len(def.PrimaryKey) > 0 {
-			statCols = append(statCols, def.PrimaryKey...)
+		if !strings.EqualFold(indexName, "PRIMARY") && !strings.EqualFold(indexName, "GEN_CLUST_INDEX") {
+			if len(def.PrimaryKey) > 0 {
+				statCols = append(statCols, def.PrimaryKey...)
+			} else {
+				statCols = append(statCols, "DB_ROW_ID")
+			}
 		}
 		sampleSize := rowCount
 		if sampleSize < 1 {
@@ -782,6 +786,11 @@ func normalizeSQLDisplayName(s string) string {
 	// (vitess sqlparser.String() escapes these in string literals)
 	s = unescapeStringLiterals(s)
 	s = normalizeSelectedFunctionArgDisplaySpacing(s)
+	// MySQL displays string literal column headers without quotes:
+	// SELECT 'hello' -> column name is "hello" not "'hello'"
+	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
+		s = s[1 : len(s)-1]
+	}
 	return s
 }
 
