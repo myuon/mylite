@@ -155,9 +155,8 @@ type Executor struct {
 	tempTables map[string]bool
 	// globalVars stores SET GLOBAL/SESSION variable overrides.
 	globalVars map[string]string
-	// startupVars stores variable values set at server startup (e.g., from master.opt).
-	// These are used as default values when SET ... = DEFAULT is used.
-	startupVars map[string]string
+	// innodbMetricStatus stores per-metric enabled/disabled status for INNODB_METRICS.
+	innodbMetricStatus map[string]string
 	// views stores view definitions (view name -> SELECT query string).
 	views map[string]string
 	// queryTableDef holds the table definition for the current query context,
@@ -198,21 +197,10 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		preparedStmts: make(map[string]string),
 		tempTables:    make(map[string]bool),
 		globalVars:    make(map[string]string),
-		startupVars: map[string]string{
-			// Pre-seed startup defaults for variables with special constraints
-			"innodb_commit_concurrency": "0",
-		},
-		timeZone: defaultTZ,
+		timeZone:      defaultTZ,
 	}
 	e.initSystemTables()
 	return e
-}
-
-// SetStartupVar sets a variable as a startup default. This is used by the test
-// runner to apply master.opt settings before test execution.
-func (e *Executor) SetStartupVar(name, value string) {
-	e.startupVars[strings.ToLower(name)] = value
-	e.globalVars[strings.ToLower(name)] = value
 }
 
 func (e *Executor) initSystemTables() {
@@ -310,9 +298,30 @@ func (e *Executor) initSystemTables() {
 	ensure("information_schema", &catalog.TableDef{
 		Name: "INNODB_TRX",
 		Columns: []catalog.ColumnDef{
-			{Name: "trx_id", Type: "VARCHAR(32)"},
-			{Name: "trx_state", Type: "VARCHAR(32)"},
+			{Name: "trx_id", Type: "VARCHAR(18)"},
+			{Name: "trx_state", Type: "VARCHAR(13)"},
 			{Name: "trx_started", Type: "DATETIME"},
+			{Name: "trx_requested_lock_id", Type: "VARCHAR(105)", Nullable: true},
+			{Name: "trx_wait_started", Type: "DATETIME", Nullable: true},
+			{Name: "trx_weight", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "trx_mysql_thread_id", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "trx_query", Type: "VARCHAR(1024)", Nullable: true},
+			{Name: "trx_operation_state", Type: "VARCHAR(64)", Nullable: true},
+			{Name: "trx_tables_in_use", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "trx_tables_locked", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "trx_lock_structs", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "trx_lock_memory_bytes", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "trx_rows_locked", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "trx_rows_modified", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "trx_concurrency_tickets", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "trx_isolation_level", Type: "VARCHAR(16)"},
+			{Name: "trx_unique_checks", Type: "INT(1)"},
+			{Name: "trx_foreign_key_checks", Type: "INT(1)"},
+			{Name: "trx_last_foreign_key_error", Type: "VARCHAR(256)", Nullable: true},
+			{Name: "trx_adaptive_hash_latched", Type: "INT(1)"},
+			{Name: "trx_adaptive_hash_timeout", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "trx_is_read_only", Type: "INT(1)"},
+			{Name: "trx_autocommit_non_locking", Type: "INT(1)"},
 		},
 	})
 	ensure("information_schema", &catalog.TableDef{
@@ -338,6 +347,7 @@ func (e *Executor) initSystemTables() {
 			{Name: "NAME", Type: "VARCHAR(255)"},
 			{Name: "TABLE_ID", Type: "BIGINT"},
 			{Name: "TYPE", Type: "BIGINT"},
+			{Name: "SPACE", Type: "BIGINT"},
 		},
 	})
 	ensure("information_schema", &catalog.TableDef{
@@ -429,15 +439,14 @@ func (e *Executor) hasInnoDBTableStatsRow(dbName, tableName string) bool {
 }
 
 func indexDefsForStats(def *catalog.TableDef) []catalog.IndexDef {
-	indexDefs := make([]catalog.IndexDef, 0, len(def.Indexes)+2)
+	indexDefs := make([]catalog.IndexDef, 0, len(def.Indexes)+1)
 	if len(def.PrimaryKey) > 0 {
 		indexDefs = append(indexDefs, catalog.IndexDef{Name: "PRIMARY", Columns: append([]string(nil), def.PrimaryKey...)})
-	} else {
-		// InnoDB always has a clustered index. When there's no PRIMARY KEY,
-		// it uses an internal GEN_CLUST_INDEX with an implicit DB_ROW_ID.
-		indexDefs = append(indexDefs, catalog.IndexDef{Name: "GEN_CLUST_INDEX", Columns: []string{"DB_ROW_ID"}})
 	}
 	indexDefs = append(indexDefs, def.Indexes...)
+	if len(indexDefs) == 0 {
+		indexDefs = append(indexDefs, catalog.IndexDef{Name: "GEN_CLUST_INDEX", Columns: []string{"DB_ROW_ID"}})
+	}
 	return indexDefs
 }
 
@@ -508,14 +517,6 @@ func (e *Executor) upsertInnoDBStatsRows(dbName, tableName string, rowCount int6
 	if err != nil {
 		return
 	}
-	// Load table rows for distinct count computation
-	var tableRows []storage.Row
-	if tbl, err := e.Storage.GetTable(dbName, tableName); err == nil {
-		tbl.Mu.RLock()
-		tableRows = tbl.Rows
-		tbl.Mu.RUnlock()
-	}
-
 	idxTbl.Mu.Lock()
 	for _, idx := range indexDefsForStats(def) {
 		indexName := idx.Name
@@ -531,22 +532,24 @@ func (e *Executor) upsertInnoDBStatsRows(dbName, tableName string, rowCount int6
 				statCols = append(statCols, "DB_ROW_ID")
 			}
 		}
+		sampleSize := rowCount
+		if sampleSize < 1 {
+			sampleSize = 1
+		}
 		for i := range statCols {
 			statName := fmt.Sprintf("n_diff_pfx%02d", i+1)
 			descCols := make([]string, 0, i+1)
 			for j := 0; j <= i; j++ {
 				descCols = append(descCols, statsIndexColName(statCols[j]))
 			}
-			// Compute distinct count for the prefix columns
-			statValue := computeDistinctCount(tableRows, statCols[:i+1])
 			idxTbl.Rows = append(idxTbl.Rows, storage.Row{
 				"database_name":    dbName,
 				"table_name":       tableName,
 				"index_name":       indexName,
 				"last_update":      lastUpdate,
 				"stat_name":        statName,
-				"stat_value":       statValue,
-				"sample_size":      int64(1),
+				"stat_value":       rowCount,
+				"sample_size":      sampleSize,
 				"stat_description": strings.Join(descCols, ","),
 			})
 		}
@@ -574,38 +577,6 @@ func (e *Executor) upsertInnoDBStatsRows(dbName, tableName string, rowCount int6
 		)
 	}
 	idxTbl.Mu.Unlock()
-}
-
-// computeDistinctCount counts the number of distinct value combinations for the given
-// column prefix across table rows. For DB_ROW_ID (implicit row ID), each row is unique.
-func computeDistinctCount(rows []storage.Row, cols []string) int64 {
-	if len(rows) == 0 {
-		return int64(0)
-	}
-	// If the last column is DB_ROW_ID, each row is unique
-	if len(cols) > 0 && cols[len(cols)-1] == "DB_ROW_ID" {
-		return int64(len(rows))
-	}
-	seen := make(map[string]struct{}, len(rows))
-	for _, row := range rows {
-		var key strings.Builder
-		for ci, col := range cols {
-			if ci > 0 {
-				key.WriteByte(0)
-			}
-			// Try case-insensitive column name lookup
-			var val interface{}
-			for k, v := range row {
-				if strings.EqualFold(k, col) {
-					val = v
-					break
-				}
-			}
-			fmt.Fprintf(&key, "%v", val)
-		}
-		seen[key.String()] = struct{}{}
-	}
-	return int64(len(seen))
 }
 
 func (e *Executor) refreshInnoDBStatsTables() {
@@ -658,13 +629,14 @@ func (e *Executor) refreshInnoDBStatsTables() {
 				"sum_of_other_index_sizes": int64(len(def.Indexes)),
 			})
 
-			indexDefs := make([]catalog.IndexDef, 0, len(def.Indexes)+2)
+			indexDefs := make([]catalog.IndexDef, 0, len(def.Indexes)+1)
 			if len(def.PrimaryKey) > 0 {
 				indexDefs = append(indexDefs, catalog.IndexDef{Name: "PRIMARY", Columns: append([]string(nil), def.PrimaryKey...)})
-			} else {
-				indexDefs = append(indexDefs, catalog.IndexDef{Name: "GEN_CLUST_INDEX", Columns: []string{"DB_ROW_ID"}})
 			}
 			indexDefs = append(indexDefs, def.Indexes...)
+			if len(indexDefs) == 0 {
+				indexDefs = append(indexDefs, catalog.IndexDef{Name: "GEN_CLUST_INDEX", Columns: []string{"DB_ROW_ID"}})
+			}
 			for _, idx := range indexDefs {
 				indexName := idx.Name
 				if indexName == "" {
@@ -682,7 +654,7 @@ func (e *Executor) refreshInnoDBStatsTables() {
 						"last_update":      lastUpdate,
 						"stat_name":        "n_diff_pfx01",
 						"stat_value":       rowCount,
-						"sample_size":      int64(1),
+						"sample_size":      rowCount,
 						"stat_description": firstCol,
 					},
 					storage.Row{
@@ -2577,42 +2549,28 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				cleanName := strings.TrimPrefix(name, "global.")
 				cleanName = strings.TrimPrefix(cleanName, "session.")
 				cleanName = strings.TrimPrefix(cleanName, "local.")
-
-				// Handle DEFAULT keyword: restore startup value or delete override
-				if strings.EqualFold(val, "default") || strings.EqualFold(val, "DEFAULT") {
-					if sv, ok := e.startupVars[cleanName]; ok {
-						e.globalVars[cleanName] = sv
-					} else {
-						delete(e.globalVars, cleanName)
-					}
-					continue
-				}
-
 				// Evaluate expression
 				evalVal, err := e.evalExpr(expr.Expr)
-				var finalVal string
 				if err == nil {
-					finalVal = fmt.Sprintf("%v", evalVal)
+					e.globalVars[cleanName] = fmt.Sprintf("%v", evalVal)
 				} else {
-					finalVal = val
+					e.globalVars[cleanName] = val
 				}
-
-				// Enforce innodb_commit_concurrency constraint:
-				// If startup value is 0, cannot set to nonzero.
-				// If startup value is nonzero, cannot set to 0.
-				if cleanName == "innodb_commit_concurrency" {
-					newVal, _ := strconv.ParseInt(finalVal, 10, 64)
-					// Determine the startup/initial value
-					startupVal := int64(0) // default is 0
-					if sv, ok := e.startupVars[cleanName]; ok {
-						startupVal, _ = strconv.ParseInt(sv, 10, 64)
-					}
-					if (startupVal == 0 && newVal != 0) || (startupVal != 0 && newVal == 0) {
-						return nil, fmt.Errorf("ERROR 1231 (42000): Variable 'innodb_commit_concurrency' can't be set to the value of '%d'", newVal)
+				// Handle innodb_monitor_enable/disable/reset/reset_all
+				if strings.ToUpper(val) != "DEFAULT" {
+					switch cleanName {
+					case "innodb_monitor_enable":
+						if err := e.innodbMonitorSet(val, "enabled"); err != nil {
+							return nil, err
+						}
+					case "innodb_monitor_disable":
+						e.innodbMonitorSet(val, "disabled") //nolint:errcheck
+					case "innodb_monitor_reset":
+						// Reset just resets counter values (no-op for us since counters are always 0)
+					case "innodb_monitor_reset_all":
+						e.innodbMonitorResetAll(val)
 					}
 				}
-
-				e.globalVars[cleanName] = finalVal
 			}
 		}
 	}
@@ -2650,26 +2608,9 @@ func (e *Executor) resolveSystemVarInValue(val string) string {
 
 // handleRawSet handles SET statements that the parser couldn't parse.
 func (e *Executor) handleRawSet(raw string) {
-	trimmed := strings.TrimSpace(raw)
-	upper := strings.ToUpper(trimmed)
-
-	// Handle SET STARTUP var = val (special mylite command for startup defaults)
-	if strings.HasPrefix(upper, "SET STARTUP ") {
-		rest := strings.TrimSpace(trimmed[len("SET STARTUP "):])
-		if eqIdx := strings.Index(rest, "="); eqIdx > 0 {
-			varName := strings.TrimSpace(strings.ToLower(rest[:eqIdx]))
-			val := strings.TrimSpace(rest[eqIdx+1:])
-			val = strings.TrimSuffix(val, ";")
-			val = strings.TrimSpace(val)
-			val = strings.Trim(val, "'\"")
-			e.startupVars[varName] = val
-			e.globalVars[varName] = val
-		}
-		return
-	}
-
 	// Handle user variables: SET @var = value or SET @var := value
-	if strings.HasPrefix(upper, "SET ") {
+	trimmed := strings.TrimSpace(raw)
+	if strings.HasPrefix(strings.ToUpper(trimmed), "SET ") {
 		rest := strings.TrimSpace(trimmed[4:])
 		if strings.HasPrefix(rest, "@") && !strings.HasPrefix(rest, "@@") {
 			// Find = or :=
@@ -2699,7 +2640,7 @@ func (e *Executor) handleRawSet(raw string) {
 			}
 		}
 	}
-	upper = strings.ToUpper(raw)
+	upper := strings.ToUpper(raw)
 	if strings.Contains(upper, "SQL_MODE") {
 		if idx := strings.Index(upper, "="); idx >= 0 {
 			val := strings.TrimSpace(raw[idx+1:])
@@ -2770,14 +2711,23 @@ func (e *Executor) handleRawSet(raw string) {
 		val = strings.TrimSuffix(val, ";")
 		val = strings.TrimSpace(val)
 		val = strings.Trim(val, "'\"")
+		// Handle innodb_monitor_enable/disable/reset/reset_all
+		if strings.ToUpper(val) != "DEFAULT" {
+			switch varName {
+			case "innodb_monitor_enable":
+				e.innodbMonitorSet(val, "enabled") //nolint:errcheck
+			case "innodb_monitor_disable":
+				e.innodbMonitorSet(val, "disabled") //nolint:errcheck
+			case "innodb_monitor_reset":
+				// no-op: counters are always 0
+			case "innodb_monitor_reset_all":
+				e.innodbMonitorResetAll(val)
+			}
+		}
 		if strings.ToUpper(val) != "DEFAULT" {
 			e.globalVars[varName] = val
 		} else {
-			if sv, ok := e.startupVars[varName]; ok {
-				e.globalVars[varName] = sv
-			} else {
-				delete(e.globalVars, varName)
-			}
+			delete(e.globalVars, varName)
 		}
 	}
 	if strings.HasPrefix(upper, "SET NAMES ") {
@@ -2789,6 +2739,112 @@ func (e *Executor) handleRawSet(raw string) {
 			e.globalVars["character_set_connection"] = charset
 			e.globalVars["character_set_results"] = charset
 		}
+	}
+}
+
+// innodbMonitorSet enables or disables InnoDB metrics matching the given pattern.
+// pattern can be "all", "All", a metric name, or a LIKE pattern with %.
+func (e *Executor) innodbMonitorSet(pattern, status string) error {
+	if e.innodbMetricStatus == nil {
+		e.innodbMetricStatus = make(map[string]string)
+	}
+	pattern = strings.Trim(pattern, "'\"")
+	upper := strings.ToUpper(pattern)
+	if upper == "ALL" {
+		for _, m := range innoDBMetrics {
+			e.innodbMetricStatus[m.name] = status
+		}
+		return nil
+	}
+	// Check if it's a LIKE pattern (contains %)
+	if strings.Contains(pattern, "%") {
+		matched := false
+		for _, m := range innoDBMetrics {
+			if matchLike(m.name, pattern) {
+				e.innodbMetricStatus[m.name] = status
+				matched = true
+			}
+		}
+		if !matched {
+			return mysqlError(1231, "42000", fmt.Sprintf("Variable 'innodb_monitor_%s' can't be set to the value of '%s'",
+				strings.TrimPrefix(status+"_x", "enabled_x"), pattern))
+		}
+		return nil
+	}
+	// Exact match by metric name
+	for _, m := range innoDBMetrics {
+		if strings.EqualFold(m.name, pattern) {
+			e.innodbMetricStatus[m.name] = status
+			return nil
+		}
+	}
+	// Try as module name (module_<subsystem>)
+	lowerPattern := strings.ToLower(pattern)
+	if strings.HasPrefix(lowerPattern, "module_") {
+		moduleSuffix := lowerPattern[7:]
+		// Map MySQL module names to internal subsystem names
+		moduleToSubsystems := map[string][]string{
+			"trx":              {"transaction"},
+			"metadata":         {"metadata"},
+			"lock":             {"lock"},
+			"buffer":           {"buffer"},
+			"buffer_page":      {"buffer_page_io"},
+			"os":               {"os"},
+			"purge":            {"purge"},
+			"compress":         {"compression"},
+			"file":             {"file_system"},
+			"index":            {"index"},
+			"adaptive_hash":    {"adaptive_hash_index"},
+			"ibuf":             {"change_buffer"},
+			"srv":              {"server"},
+			"dml":              {"dml"},
+			"ddl":              {"ddl"},
+			"icp":              {"icp"},
+			"log":              {"recovery"},
+			"cpu":              {"cpu"},
+			"page_track":       {"page_tracking"},
+			"undo":             {"undo"},
+			"sampling":         {"sampling"},
+			"dblwr":            {"dblwr"},
+		}
+		matched := false
+		if subsystems, ok := moduleToSubsystems[moduleSuffix]; ok {
+			for _, m := range innoDBMetrics {
+				for _, sub := range subsystems {
+					if strings.EqualFold(m.subsystem, sub) {
+						e.innodbMetricStatus[m.name] = status
+						matched = true
+					}
+				}
+			}
+		}
+		if matched {
+			return nil
+		}
+	}
+	// Also try as direct subsystem name
+	matched := false
+	for _, m := range innoDBMetrics {
+		if strings.EqualFold(m.subsystem, lowerPattern) {
+			e.innodbMetricStatus[m.name] = status
+			matched = true
+		}
+	}
+	if matched {
+		return nil
+	}
+	varSuffix := "enable"
+	if status == "disabled" {
+		varSuffix = "disable"
+	}
+	return mysqlError(1231, "42000", fmt.Sprintf("Variable 'innodb_monitor_%s' can't be set to the value of '%s'", varSuffix, pattern))
+}
+
+// innodbMonitorResetAll resets count for metrics matching the pattern.
+func (e *Executor) innodbMonitorResetAll(pattern string) {
+	// For now, reset_all just ensures the status map exists (counts are always 0 in mylite)
+	if e.innodbMetricStatus == nil {
+		e.innodbMetricStatus = make(map[string]string)
 	}
 }
 
@@ -7346,20 +7402,6 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		return e.execSelectIntoOutfile(stmt.Into, colNames, resultRows)
 	}
 
-	// Handle SELECT ... INTO @var1, @var2, ...
-	if stmt.Into != nil && len(stmt.Into.VarList) > 0 {
-		if len(resultRows) > 0 {
-			row := resultRows[0]
-			for i, v := range stmt.Into.VarList {
-				varName := v.Name.String()
-				if i < len(row) {
-					e.userVars[varName] = row[i]
-				}
-			}
-		}
-		return &Result{}, nil
-	}
-
 	return &Result{
 		Columns:     colNames,
 		Rows:        resultRows,
@@ -7715,20 +7757,6 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 	// Handle SELECT ... INTO OUTFILE (GROUP BY path)
 	if stmt.Into != nil && stmt.Into.Type == sqlparser.IntoOutfile {
 		return e.execSelectIntoOutfile(stmt.Into, colNames, resultRows)
-	}
-
-	// Handle SELECT ... INTO @var1, @var2, ... (GROUP BY path)
-	if stmt.Into != nil && len(stmt.Into.VarList) > 0 {
-		if len(resultRows) > 0 {
-			row := resultRows[0]
-			for i, v := range stmt.Into.VarList {
-				varName := v.Name.String()
-				if i < len(row) {
-					e.userVars[varName] = row[i]
-				}
-			}
-		}
-		return &Result{}, nil
 	}
 
 	return &Result{
@@ -9783,6 +9811,10 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 		if col.Default != nil {
 			defVal = *col.Default
 		}
+		// For INFORMATION_SCHEMA tables, MySQL shows empty Default (not NULL)
+		if strings.EqualFold(descDB, "information_schema") && defVal == nil {
+			defVal = ""
+		}
 		var extra interface{}
 		extra = ""
 		if col.AutoIncrement {
@@ -10395,15 +10427,157 @@ func parseTableOptionInt(opt *sqlparser.TableOption) *int {
 }
 
 // mysqlDisplayType returns the MySQL display type with width for SHOW CREATE TABLE.
+// mysqlGeneratedClause formats a generated column clause for SHOW CREATE TABLE.
+// It takes the raw expression string and storage type (virtual/stored) and returns
+// something like: GENERATED ALWAYS AS ((`a` + LENGTH(`d`))) STORED
+func mysqlGeneratedClause(exprStr string, colType string) string {
+	upper := strings.ToUpper(colType)
+	storage := "VIRTUAL"
+	if strings.HasSuffix(upper, " STORED") {
+		storage = "STORED"
+	}
+
+	// Parse the expression and reformat it MySQL-style
+	formattedExpr := mysqlFormatGenExpr(exprStr)
+
+	return fmt.Sprintf("GENERATED ALWAYS AS (%s) %s", formattedExpr, storage)
+}
+
+// mysqlFormatGenExpr formats a generated column expression in MySQL style:
+// backtick-quoted column refs, no spaces after commas in function args,
+// _utf8mb4 prefix for string literals, extra outer parens for non-function expressions.
+func mysqlFormatGenExpr(exprStr string) string {
+	parser := sqlparser.NewTestParser()
+	stmt, err := parser.Parse("SELECT " + exprStr)
+	if err != nil {
+		// Fallback: return as-is
+		return exprStr
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok || len(sel.SelectExprs.Exprs) != 1 {
+		return exprStr
+	}
+	aliased, ok := sel.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr)
+	if !ok {
+		return exprStr
+	}
+	inner := mysqlGenExprNode(aliased.Expr)
+	// MySQL wraps non-function/non-call expressions in extra parens
+	switch aliased.Expr.(type) {
+	case *sqlparser.FuncExpr, *sqlparser.SubstrExpr,
+		*sqlparser.JSONUnquoteExpr, *sqlparser.JSONExtractExpr,
+		*sqlparser.CastExpr:
+		// Function-like expressions: no extra parens
+		return inner
+	default:
+		// Binary expressions, column refs, etc: wrap in parens
+		return "(" + inner + ")"
+	}
+}
+
+// mysqlGenExprNode recursively formats an expression node in MySQL SHOW CREATE TABLE style.
+func mysqlGenExprNode(expr sqlparser.Expr) string {
+	switch e := expr.(type) {
+	case *sqlparser.ColName:
+		return fmt.Sprintf("`%s`", e.Name.String())
+	case *sqlparser.BinaryExpr:
+		return fmt.Sprintf("%s %s %s", mysqlGenExprNode(e.Left), e.Operator.ToString(), mysqlGenExprNode(e.Right))
+	case *sqlparser.FuncExpr:
+		args := make([]string, len(e.Exprs))
+		for i, arg := range e.Exprs {
+			args[i] = mysqlGenExprNode(arg)
+		}
+		name := e.Name.String()
+		// MySQL preserves function name case; JSON functions are lowercase,
+		// standard SQL functions are typically uppercase in SHOW CREATE TABLE.
+		upperName := strings.ToUpper(name)
+		switch {
+		case strings.HasPrefix(strings.ToLower(name), "json_"):
+			// JSON functions stay lowercase
+			name = strings.ToLower(name)
+		default:
+			// Standard functions: uppercase
+			name = upperName
+		}
+		return name + "(" + strings.Join(args, ",") + ")"
+	case *sqlparser.Literal:
+		if e.Type == sqlparser.StrVal {
+			return "_utf8mb4'" + e.Val + "'"
+		}
+		return e.Val
+	case *sqlparser.UnaryExpr:
+		return e.Operator.ToString() + mysqlGenExprNode(e.Expr)
+	case *sqlparser.SubstrExpr:
+		parts := []string{mysqlGenExprNode(e.Name)}
+		if e.From != nil {
+			parts = append(parts, mysqlGenExprNode(e.From))
+		}
+		if e.To != nil {
+			parts = append(parts, mysqlGenExprNode(e.To))
+		}
+		return "SUBSTR(" + strings.Join(parts, ",") + ")"
+	case *sqlparser.JSONUnquoteExpr:
+		return "json_unquote(" + mysqlGenExprNode(e.JSONValue) + ")"
+	case *sqlparser.JSONExtractExpr:
+		parts := []string{mysqlGenExprNode(e.JSONDoc)}
+		for _, p := range e.PathList {
+			parts = append(parts, mysqlGenExprNode(p))
+		}
+		return "json_extract(" + strings.Join(parts, ",") + ")"
+	case *sqlparser.CastExpr:
+		return "cast(" + mysqlGenExprNode(e.Expr) + " as " + strings.ToLower(e.Type.Type) + ")"
+	case *sqlparser.IntroducerExpr:
+		return e.CharacterSet + mysqlGenExprNode(e.Expr)
+	case *sqlparser.IsExpr:
+		op := strings.ToLower(e.Right.ToString())
+		return mysqlGenExprNode(e.Left) + " is " + op
+	case *sqlparser.CaseExpr:
+		var b strings.Builder
+		b.WriteString("case")
+		if e.Expr != nil {
+			b.WriteString(" ")
+			b.WriteString(mysqlGenExprNode(e.Expr))
+		}
+		for _, w := range e.Whens {
+			b.WriteString(" when ")
+			b.WriteString(mysqlGenExprNode(w.Cond))
+			b.WriteString(" then ")
+			b.WriteString(mysqlGenExprNode(w.Val))
+		}
+		if e.Else != nil {
+			b.WriteString(" else ")
+			b.WriteString(mysqlGenExprNode(e.Else))
+		}
+		b.WriteString(" end")
+		return b.String()
+	case *sqlparser.ComparisonExpr:
+		return mysqlGenExprNode(e.Left) + " " + e.Operator.ToString() + " " + mysqlGenExprNode(e.Right)
+	case *sqlparser.NullVal:
+		return "NULL"
+	case *sqlparser.NotExpr:
+		return "not(" + mysqlGenExprNode(e.Expr) + ")"
+	default:
+		// Fallback to sqlparser.String for unhandled types
+		return sqlparser.String(expr)
+	}
+}
+
 func mysqlDisplayType(colType string) string {
-	upper := strings.ToUpper(strings.TrimSpace(colType))
+	// Strip generated column clause before processing the base type
+	stripped := colType
+	upperCheck := strings.ToUpper(colType)
+	if idx := strings.Index(upperCheck, " GENERATED ALWAYS AS "); idx >= 0 {
+		stripped = strings.TrimSpace(colType[:idx])
+	}
+
+	upper := strings.ToUpper(strings.TrimSpace(stripped))
 	// Extract base type and any existing parameters
 	base := upper
 	suffix := ""
 	if idx := strings.Index(upper, "("); idx >= 0 {
 		// Already has width specified, just lowercase it
 		// But also normalize REAL to DOUBLE, NUMERIC to DECIMAL, INTEGER to INT
-		result := strings.ToLower(colType)
+		result := strings.ToLower(stripped)
 		if strings.HasPrefix(result, "real") {
 			result = "double" + result[4:]
 		}
@@ -10471,7 +10645,7 @@ func mysqlDisplayType(colType string) string {
 	case "BOOL", "BOOLEAN":
 		return "tinyint(1)"
 	default:
-		return strings.ToLower(colType)
+		return strings.ToLower(stripped)
 	}
 }
 
@@ -10541,7 +10715,12 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		parts = append(parts, mysqlDisplayType(col.Type))
 		colTypeLower := strings.ToLower(col.Type)
 		isTimestamp := strings.HasPrefix(colTypeLower, "timestamp")
-		isGenerated := generatedColumnExpr(col.Type) != ""
+		genExpr := generatedColumnExpr(col.Type)
+		isGenerated := genExpr != ""
+		if isGenerated {
+			// Append GENERATED ALWAYS AS (...) VIRTUAL/STORED in MySQL format
+			parts = append(parts, mysqlGeneratedClause(genExpr, col.Type))
+		}
 		if !col.Nullable {
 			parts = append(parts, "NOT NULL")
 		} else if isTimestamp {
