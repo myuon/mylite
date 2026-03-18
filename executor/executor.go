@@ -9199,16 +9199,32 @@ func findTableDefCaseInsensitive(db *catalog.Database, tableName string) (*catal
 	return nil, tableName, fmt.Errorf("table '%s' doesn't exist", tableName)
 }
 
+func findDatabaseCaseInsensitive(cat *catalog.Catalog, dbName string) (*catalog.Database, string, error) {
+	if db, err := cat.GetDatabase(dbName); err == nil {
+		return db, dbName, nil
+	}
+	for _, name := range cat.ListDatabases() {
+		if strings.EqualFold(name, dbName) {
+			db, err := cat.GetDatabase(name)
+			if err == nil {
+				return db, name, nil
+			}
+		}
+	}
+	return nil, dbName, fmt.Errorf("unknown database '%s'", dbName)
+}
+
 // describeTable returns column metadata for a table, matching MySQL DESCRIBE output.
 func (e *Executor) describeTable(tableName string) (*Result, error) {
 	descDB := e.CurrentDB
 	if strings.Contains(tableName, ".") {
 		descDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
 	}
-	db, err := e.Catalog.GetDatabase(descDB)
+	db, resolvedDBName, err := findDatabaseCaseInsensitive(e.Catalog, descDB)
 	if err != nil {
 		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", descDB))
 	}
+	descDB = resolvedDBName
 	tblDef, resolvedTableName, err := findTableDefCaseInsensitive(db, tableName)
 	if err != nil {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", descDB, tableName))
@@ -9548,10 +9564,11 @@ func parseShowIndexTarget(query, currentDB string) (dbName, tableName string, ok
 }
 
 func (e *Executor) showIndexes(dbName, tableName string) (*Result, error) {
-	db, err := e.Catalog.GetDatabase(dbName)
+	db, resolvedDBName, err := findDatabaseCaseInsensitive(e.Catalog, dbName)
 	if err != nil {
 		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
 	}
+	dbName = resolvedDBName
 	if _, resolvedTableName, err := findTableDefCaseInsensitive(db, tableName); err == nil {
 		tableName = resolvedTableName
 	} else {
@@ -9972,10 +9989,11 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	if strings.Contains(tableName, ".") {
 		showDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
 	}
-	db, err := e.Catalog.GetDatabase(showDB)
+	db, resolvedDBName, err := findDatabaseCaseInsensitive(e.Catalog, showDB)
 	if err != nil {
 		return nil, err
 	}
+	showDB = resolvedDBName
 	def, resolvedTableName, err := findTableDefCaseInsensitive(db, tableName)
 	if err != nil {
 		return nil, fmt.Errorf("ERROR 1146 (42S02): Table '%s.%s' doesn't exist", showDB, tableName)
