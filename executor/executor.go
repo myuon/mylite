@@ -444,6 +444,56 @@ func (e *Executor) tableRowCount(dbName, tableName string) int64 {
 	return int64(len(tbl.Rows))
 }
 
+// shouldRecalcInnoDBStats returns true if the stats for the given table need
+// recalculation. MySQL's InnoDB auto-recalc triggers when ~10% of the table
+// has changed. We replicate this behavior to avoid O(n^2) cost on sequential
+// single-row INSERTs.
+func (e *Executor) shouldRecalcInnoDBStats(dbName, tableName string, currentRowCount int64) bool {
+	statsTbl, err := e.Storage.GetTable("mysql", "innodb_table_stats")
+	if err != nil {
+		return true // no stats table, always recalc
+	}
+	statsTbl.Mu.RLock()
+	defer statsTbl.Mu.RUnlock()
+	for _, r := range statsTbl.Rows {
+		if strings.EqualFold(toString(r["database_name"]), dbName) && strings.EqualFold(toString(r["table_name"]), tableName) {
+			prevCount := toInt64ValForStats(r["n_rows"])
+			if prevCount <= 0 {
+				return true
+			}
+			diff := currentRowCount - prevCount
+			if diff < 0 {
+				diff = -diff
+			}
+			// Recalc if change is >= 10% of previous count, or if table is small (< 200 rows)
+			threshold := prevCount / 10
+			if threshold < 1 {
+				threshold = 1
+			}
+			return diff >= threshold || prevCount < 200
+		}
+	}
+	return true // no stats row found, first time
+}
+
+func toInt64ValForStats(v interface{}) int64 {
+	switch val := v.(type) {
+	case int64:
+		return val
+	case int:
+		return int64(val)
+	case float64:
+		return int64(val)
+	case uint64:
+		return int64(val)
+	case string:
+		if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
 func (e *Executor) hasInnoDBTableStatsRow(dbName, tableName string) bool {
 	statsTbl, err := e.Storage.GetTable("mysql", "innodb_table_stats")
 	if err != nil {
@@ -5802,6 +5852,338 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		}
 	}
 
+	// Determine if we can use the bulk insert fast path.
+	// Conditions: many rows, no ON DUPLICATE KEY UPDATE, no REPLACE, no IGNORE,
+	// no triggers, no CHECK constraints, no generated columns.
+	canBulkInsert := len(rows) >= 100 && len(stmt.OnDup) == 0 &&
+		stmt.Action != sqlparser.ReplaceAct && !bool(stmt.Ignore)
+	if canBulkInsert {
+		// Check for triggers
+		if db, dbErr := e.Catalog.GetDatabase(insertDB); dbErr == nil {
+			if len(db.GetTriggersForTable(tableName, "BEFORE", "INSERT")) > 0 ||
+				len(db.GetTriggersForTable(tableName, "AFTER", "INSERT")) > 0 {
+				canBulkInsert = false
+			}
+		}
+	}
+	if canBulkInsert {
+		// Check for CHECK constraints and generated columns
+		if tbl.Def != nil && len(tbl.Def.CheckConstraints) > 0 {
+			canBulkInsert = false
+		}
+		for _, col := range tbl.Def.Columns {
+			if isGeneratedColumnType(col.Type) {
+				canBulkInsert = false
+				break
+			}
+		}
+	}
+
+	if canBulkInsert {
+		// === BULK INSERT FAST PATH ===
+		preparedRows := make([]storage.Row, 0, len(rows))
+		for _, valTuple := range rows {
+			row := make(storage.Row)
+			origValues := make(storage.Row)
+			for i, val := range valTuple {
+				if i >= len(colNames) {
+					break
+				}
+				v, err := e.evalExpr(val)
+				if err != nil {
+					var intOvErr *intOverflowError
+					if errors.As(err, &intOvErr) {
+						overflowStr := intOvErr.val
+						isDecCol := false
+						for _, col := range tbl.Def.Columns {
+							if col.Name == colNames[i] {
+								colUpper := strings.ToUpper(col.Type)
+								if strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") {
+									isDecCol = true
+								}
+								break
+							}
+						}
+						if isDecCol {
+							if f, ferr := strconv.ParseFloat(overflowStr, 64); ferr == nil {
+								v = f
+								err = nil
+							}
+						}
+						if err != nil && !e.isStrictMode() {
+							isIntCol := false
+							isUnsigned := false
+							for _, col := range tbl.Def.Columns {
+								if col.Name == colNames[i] {
+									colUpper := strings.ToUpper(col.Type)
+									if strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER") {
+										isIntCol = true
+										isUnsigned = strings.Contains(colUpper, "UNSIGNED")
+									}
+									break
+								}
+							}
+							if isIntCol {
+								if strings.HasPrefix(overflowStr, "-") {
+									if isUnsigned {
+										v = int64(0)
+									} else {
+										v = int64(math.MinInt64)
+									}
+								} else {
+									if isUnsigned {
+										v = uint64(math.MaxUint64)
+									} else {
+										v = int64(math.MaxInt64)
+									}
+								}
+								err = nil
+							}
+						}
+						if err != nil {
+							return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colNames[i]))
+						}
+					} else {
+						return nil, err
+					}
+				}
+				origValues[colNames[i]] = v
+				for _, col := range tbl.Def.Columns {
+					if col.Name == colNames[i] {
+						if padLen := binaryPadLength(col.Type); padLen > 0 && v != nil {
+							v = padBinaryValue(v, padLen)
+						}
+						if v != nil {
+							if e.isStrictMode() {
+								colUpper := strings.ToUpper(col.Type)
+								isDecType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE")
+								if isDecType {
+									if strings.Contains(colUpper, "UNSIGNED") {
+										f := toFloat(v)
+										if f < 0 {
+											return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+										}
+									}
+									if err := checkDecimalRange(col.Type, v); err != nil {
+										return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+									}
+								}
+								if err := checkIntegerStrict(col.Type, col.Name, v); err != nil {
+									return nil, err
+								}
+							}
+							v = formatDecimalValue(col.Type, v)
+							v = validateEnumSetValue(col.Type, v)
+							v = coerceDateTimeValue(col.Type, v)
+							v = coerceIntegerValue(col.Type, v)
+							v = coerceBitValue(col.Type, v)
+						}
+						break
+					}
+				}
+				row[colNames[i]] = v
+			}
+
+			// Fill in default values for missing columns
+			for _, col := range tbl.Def.Columns {
+				if _, exists := row[col.Name]; !exists {
+					if col.AutoIncrement {
+						// Will be handled by BulkInsert
+					} else if col.Default != nil {
+						defVal := *col.Default
+						defUpper := strings.ToUpper(defVal)
+						if defUpper == "CURRENT_TIMESTAMP" || defUpper == "CURRENT_TIMESTAMP()" ||
+							defUpper == "NOW()" {
+							defVal = e.nowTime().Format("2006-01-02 15:04:05")
+						}
+						row[col.Name] = defVal
+					} else if !col.Nullable {
+						row[col.Name] = implicitZeroValue(col.Type)
+					} else {
+						row[col.Name] = nil
+					}
+				}
+			}
+
+			// Check NOT NULL constraints
+			{
+				colNameSet := make(map[string]bool, len(colNames))
+				for _, cn := range colNames {
+					colNameSet[cn] = true
+				}
+				for _, col := range tbl.Def.Columns {
+					isAutoGenCol := col.AutoIncrement
+					if e.isStrictMode() && !col.Nullable && !isAutoGenCol && col.Default == nil && !colNameSet[col.Name] {
+						return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
+					}
+					if !col.Nullable && !isAutoGenCol && colNameSet[col.Name] {
+						if v, ok := row[col.Name]; ok && v == nil {
+							isMultiRow := len(rows) > 1
+							if e.isStrictMode() || !isMultiRow {
+								return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
+							}
+							e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", col.Name))
+							row[col.Name] = implicitZeroValue(col.Type)
+						}
+					}
+				}
+			}
+
+			// Check PK NULL
+			if len(tbl.Def.PrimaryKey) > 0 {
+				pkSetLocal := make(map[string]bool, len(tbl.Def.PrimaryKey))
+				for _, pk := range tbl.Def.PrimaryKey {
+					pkSetLocal[pk] = true
+				}
+				for i, cn := range colNames {
+					if i < len(valTuple) && pkSetLocal[cn] {
+						if row[cn] == nil {
+							isAI := false
+							for _, col := range tbl.Def.Columns {
+								if col.Name == cn && col.AutoIncrement {
+									isAI = true
+									break
+								}
+							}
+							if !isAI {
+								return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", cn))
+							}
+						}
+					}
+				}
+			}
+
+			// Strict mode validation
+			if e.isStrictMode() {
+				for _, col := range tbl.Def.Columns {
+					isAutoGenCol := col.AutoIncrement
+					if !col.Nullable && !isAutoGenCol {
+						rv, exists := row[col.Name]
+						explicitlySpecified := false
+						for _, cn := range colNames {
+							if strings.EqualFold(cn, col.Name) {
+								explicitlySpecified = true
+								break
+							}
+						}
+						if !explicitlySpecified && col.Default == nil {
+							return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
+						} else if exists && rv == nil && explicitlySpecified {
+							return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
+						}
+					}
+					rv, exists := row[col.Name]
+					if exists && rv != nil {
+						colUpper := strings.ToUpper(col.Type)
+						isCharType := strings.Contains(colUpper, "CHAR") || strings.Contains(colUpper, "BINARY")
+						if isCharType {
+							checkVal := rv
+							if ov, ok := origValues[col.Name]; ok && ov != nil {
+								checkVal = ov
+							}
+							if sv, ok := checkVal.(string); ok {
+								maxLen := extractCharLength(col.Type)
+								if maxLen > 0 && len([]rune(sv)) > maxLen {
+									return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row 1", col.Name))
+								}
+							}
+						}
+					}
+				}
+			}
+
+			// Determine auto-increment state for tracking firstAutoInsertID
+			autoGeneratedThisRow := false
+			if autoColName != "" {
+				if v, exists := row[autoColName]; !exists || v == nil {
+					autoGeneratedThisRow = true
+				} else {
+					switch av := v.(type) {
+					case int64:
+						autoGeneratedThisRow = av == 0
+					case uint64:
+						autoGeneratedThisRow = av == 0
+					case float64:
+						autoGeneratedThisRow = int64(av) == 0
+					case string:
+						autoGeneratedThisRow = strings.TrimSpace(av) == "" || strings.TrimSpace(av) == "0"
+					}
+				}
+			}
+			_ = autoGeneratedThisRow // tracked after BulkInsert via IDs
+
+			preparedRows = append(preparedRows, row)
+		}
+
+		// Perform bulk insert
+		ids, err := tbl.BulkInsert(preparedRows)
+		if err != nil {
+			return nil, err
+		}
+
+		affected = uint64(len(ids))
+		// Track auto-increment IDs
+		for ri, id := range ids {
+			if id > 0 {
+				lastInsertID = id
+				if firstAutoInsertID == 0 {
+					// Check if this row auto-generated its ID
+					if autoColName != "" {
+						origVal := rows[ri]
+						autoGenerated := true
+						for ci, cn := range colNames {
+							if cn == autoColName && ci < len(origVal) {
+								// The row had an explicit value - check if it was 0/NULL
+								v, _ := e.evalExpr(origVal[ci])
+								if v != nil {
+									if intVal, ok := v.(int64); ok && intVal != 0 {
+										autoGenerated = false
+									} else if sv, ok := v.(string); ok && strings.TrimSpace(sv) != "" && strings.TrimSpace(sv) != "0" {
+										autoGenerated = false
+									}
+								}
+								break
+							}
+						}
+						if autoGenerated {
+							firstAutoInsertID = id
+						}
+					}
+				}
+			}
+		}
+
+		if firstAutoInsertID > 0 {
+			lastInsertID = firstAutoInsertID
+		}
+		e.lastInsertID = lastInsertID
+
+		if lastInsertID > 0 {
+			for _, col := range tbl.Def.Columns {
+				if col.AutoIncrement {
+					if !col.Nullable {
+						e.lastAutoIncID = lastInsertID
+					}
+					break
+				}
+			}
+		}
+
+		// Auto-recalc InnoDB persistent stats after DML
+		if affected > 0 {
+			if db, dbErr := e.Catalog.GetDatabase(insertDB); dbErr == nil {
+				if def, defErr := db.GetTable(tableName); defErr == nil && e.innodbStatsAutoRecalcEnabled(def) && e.innodbStatsPersistentEnabled(def) {
+					e.upsertInnoDBStatsRows(insertDB, tableName, e.tableRowCount(insertDB, tableName))
+				}
+			}
+		}
+
+		return &Result{
+			AffectedRows: affected,
+			InsertID:     uint64(lastInsertID),
+		}, nil
+	}
+
 	for _, valTuple := range rows {
 		row := make(storage.Row)
 		origValues := make(storage.Row) // original values before formatting (for strict mode checks)
@@ -6323,11 +6705,14 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		}
 	}
 
-	// Auto-recalc InnoDB persistent stats after DML
+	// Auto-recalc InnoDB persistent stats after DML (with threshold to avoid O(n^2) on sequential inserts)
 	if affected > 0 {
 		if db, dbErr := e.Catalog.GetDatabase(insertDB); dbErr == nil {
 			if def, defErr := db.GetTable(tableName); defErr == nil && e.innodbStatsAutoRecalcEnabled(def) && e.innodbStatsPersistentEnabled(def) {
-				e.upsertInnoDBStatsRows(insertDB, tableName, e.tableRowCount(insertDB, tableName))
+				rowCount := e.tableRowCount(insertDB, tableName)
+				if e.shouldRecalcInnoDBStats(insertDB, tableName, rowCount) {
+					e.upsertInnoDBStatsRows(insertDB, tableName, rowCount)
+				}
 			}
 		}
 	}
@@ -6919,139 +7304,23 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 		}
 	}
 
-	// Hash join optimization: for equi-join ON conditions, build a hash index
-	// on the right table to avoid O(n*m) nested loop.
-	type hashJoinInfo struct {
-		leftCol  string // column name to look up in left row
-		rightCol string // column name to look up in right row
-		index    map[string][]int // hash key -> indices into rightRows
-		residual sqlparser.Expr   // remaining non-equi conditions (nil if pure equi-join)
-	}
-	var hashJoin *hashJoinInfo
-	if !isCross && !isNatural && len(usingCols) == 0 && join.Condition != nil && join.Condition.On != nil {
-		// Try to extract simple equi-join condition: col1 = col2
-		if cmp, ok := join.Condition.On.(*sqlparser.ComparisonExpr); ok && cmp.Operator == sqlparser.EqualOp {
-			var lCol, rCol string
-			if ln, ok := cmp.Left.(*sqlparser.ColName); ok {
-				lCol = ln.Name.String()
-				if !ln.Qualifier.Name.IsEmpty() {
-					lCol = ln.Qualifier.Name.String() + "." + lCol
-				}
-			}
-			if rn, ok := cmp.Right.(*sqlparser.ColName); ok {
-				rCol = rn.Name.String()
-				if !rn.Qualifier.Name.IsEmpty() {
-					rCol = rn.Qualifier.Name.String() + "." + rCol
-				}
-			}
-			if lCol != "" && rCol != "" {
-				// Determine which column refers to left vs right table
-				// Try lCol in leftRows and rCol in rightRows first
-				leftKey, rightKey := lCol, rCol
-				if len(leftRows) > 0 {
-					if _, ok := leftRows[0][leftKey]; !ok {
-						// Swap: maybe lCol is in right and rCol is in left
-						leftKey, rightKey = rCol, lCol
-					}
-				}
-				// Build hash index on right table
-				idx := make(map[string][]int, len(rightRows))
-				for i, rr := range rightRows {
-					kv := fmt.Sprintf("%v", rr[rightKey])
-					idx[kv] = append(idx[kv], i)
-				}
-				hashJoin = &hashJoinInfo{leftCol: leftKey, rightCol: rightKey, index: idx}
-			}
-		} else if and, ok := join.Condition.On.(*sqlparser.AndExpr); ok {
-			// Try to extract equi-join from AND: (col1 = col2) AND (residual)
-			if cmp, ok := and.Left.(*sqlparser.ComparisonExpr); ok && cmp.Operator == sqlparser.EqualOp {
-				var lCol, rCol string
-				if ln, ok := cmp.Left.(*sqlparser.ColName); ok {
-					lCol = ln.Name.String()
-					if !ln.Qualifier.Name.IsEmpty() {
-						lCol = ln.Qualifier.Name.String() + "." + lCol
-					}
-				}
-				if rn, ok := cmp.Right.(*sqlparser.ColName); ok {
-					rCol = rn.Name.String()
-					if !rn.Qualifier.Name.IsEmpty() {
-						rCol = rn.Qualifier.Name.String() + "." + rCol
-					}
-				}
-				if lCol != "" && rCol != "" {
-					leftKey, rightKey := lCol, rCol
-					if len(leftRows) > 0 {
-						if _, ok := leftRows[0][leftKey]; !ok {
-							leftKey, rightKey = rCol, lCol
-						}
-					}
-					idx := make(map[string][]int, len(rightRows))
-					for i, rr := range rightRows {
-						kv := fmt.Sprintf("%v", rr[rightKey])
-						idx[kv] = append(idx[kv], i)
-					}
-					hashJoin = &hashJoinInfo{leftCol: leftKey, rightCol: rightKey, index: idx, residual: and.Right}
-				}
-			}
-		}
-	}
-
 	var result []storage.Row
-	// Reusable scratch map for ON condition evaluation (non-hash path)
-	var scratch storage.Row
-	if hashJoin == nil && len(leftRows) > 0 && len(rightRows) > 0 {
-		scratch = make(storage.Row, len(leftRows[0])+len(rightRows[0])*2)
-	}
 	for _, leftRow := range leftRows {
 		matched := false
-
-		// Hash join fast path
-		if hashJoin != nil {
-			lookupKey := fmt.Sprintf("%v", leftRow[hashJoin.leftCol])
-			candidates := hashJoin.index[lookupKey]
-			for _, ri := range candidates {
-				rightRow := rightRows[ri]
-				combined := make(storage.Row, len(leftRow)+len(rightRow)*2)
-				for k, v := range leftRow {
-					combined[k] = v
-				}
-				for k, v := range rightRow {
-					combined[k] = v
-					if rightAlias != "" {
-						combined[rightAlias+"."+k] = v
-					}
-				}
-				if hashJoin.residual != nil {
-					m, err := e.evalWhere(hashJoin.residual, combined)
-					if err != nil {
-						return nil, err
-					}
-					if !m {
-						continue
-					}
-				}
-				result = append(result, combined)
-				matched = true
-			}
-			if isLeft && !matched {
-				goto leftPad
-			}
-			continue
-		}
-
 		for _, rightRow := range rightRows {
+			combined := make(storage.Row)
+			for k, v := range leftRow {
+				combined[k] = v
+			}
+			for k, v := range rightRow {
+				combined[k] = v
+				if rightAlias != "" {
+					combined[rightAlias+"."+k] = v
+				}
+			}
+
 			// CROSS JOIN: no condition, all combinations
 			if isCross {
-				combined := make(storage.Row, len(leftRow)+len(rightRow)*2)
-				for k, v := range leftRow {
-					combined[k] = v
-				}
-				for k, v := range rightRow {
-					combined[k] = v
-					if rightAlias != "" {
-						combined[rightAlias+"."+k] = v
-					}
-				}
 				result = append(result, combined)
 				matched = true
 				continue
@@ -7071,16 +7340,6 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 				if !allMatch {
 					continue
 				}
-				combined := make(storage.Row, len(leftRow)+len(rightRow)*2)
-				for k, v := range leftRow {
-					combined[k] = v
-				}
-				for k, v := range rightRow {
-					combined[k] = v
-					if rightAlias != "" {
-						combined[rightAlias+"."+k] = v
-					}
-				}
 				result = append(result, combined)
 				matched = true
 				continue
@@ -7090,16 +7349,6 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 			if isNatural {
 				if len(naturalCols) == 0 {
 					// No common columns = cross join
-					combined := make(storage.Row, len(leftRow)+len(rightRow)*2)
-					for k, v := range leftRow {
-						combined[k] = v
-					}
-					for k, v := range rightRow {
-						combined[k] = v
-						if rightAlias != "" {
-							combined[rightAlias+"."+k] = v
-						}
-					}
 					result = append(result, combined)
 					matched = true
 					continue
@@ -7114,68 +7363,26 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 					}
 				}
 				if allMatch {
-					combined := make(storage.Row, len(leftRow)+len(rightRow)*2)
-					for k, v := range leftRow {
-						combined[k] = v
-					}
-					for k, v := range rightRow {
-						combined[k] = v
-						if rightAlias != "" {
-							combined[rightAlias+"."+k] = v
-						}
-					}
 					result = append(result, combined)
 					matched = true
 				}
 				continue
 			}
 
-			// Evaluate ON condition using scratch map to avoid allocation
+			// Evaluate ON condition
 			if join.Condition != nil && join.Condition.On != nil {
-				for k := range scratch {
-					delete(scratch, k)
-				}
-				for k, v := range leftRow {
-					scratch[k] = v
-				}
-				for k, v := range rightRow {
-					scratch[k] = v
-					if rightAlias != "" {
-						scratch[rightAlias+"."+k] = v
-					}
-				}
-				match, err := e.evalWhere(join.Condition.On, scratch)
+				match, err := e.evalWhere(join.Condition.On, combined)
 				if err != nil {
 					return nil, err
 				}
 				if !match {
 					continue
 				}
-				// Matched: allocate a new row to keep in result
-				combined := make(storage.Row, len(scratch))
-				for k, v := range scratch {
-					combined[k] = v
-				}
-				result = append(result, combined)
-				matched = true
-				continue
-			}
-			// No condition (shouldn't happen for non-cross joins, but handle gracefully)
-			combined := make(storage.Row, len(leftRow)+len(rightRow)*2)
-			for k, v := range leftRow {
-				combined[k] = v
-			}
-			for k, v := range rightRow {
-				combined[k] = v
-				if rightAlias != "" {
-					combined[rightAlias+"."+k] = v
-				}
 			}
 			result = append(result, combined)
 			matched = true
 		}
 
-	leftPad:
 		// LEFT JOIN: include left row with NULLs for right columns when no match
 		if isLeft && !matched {
 			combined := make(storage.Row)
@@ -10630,24 +10837,7 @@ func (e *Executor) showStatus(upper string) (*Result, error) {
 		Name  string
 		Value string
 	}{
-		{Name: "Handler_commit", Value: "0"},
-		{Name: "Handler_delete", Value: "0"},
-		{Name: "Handler_discover", Value: "0"},
-		{Name: "Handler_external_lock", Value: "0"},
-		{Name: "Handler_mrr_init", Value: "0"},
-		{Name: "Handler_prepare", Value: "0"},
-		{Name: "Handler_read_first", Value: "0"},
-		{Name: "Handler_read_key", Value: "0"},
-		{Name: "Handler_read_last", Value: "0"},
-		{Name: "Handler_read_next", Value: "0"},
-		{Name: "Handler_read_prev", Value: "0"},
-		{Name: "Handler_read_rnd", Value: "0"},
-		{Name: "Handler_read_rnd_next", Value: "0"},
-		{Name: "Handler_rollback", Value: "0"},
-		{Name: "Handler_savepoint", Value: "0"},
-		{Name: "Handler_savepoint_rollback", Value: "0"},
 		{Name: "Handler_update", Value: "0"},
-		{Name: "Handler_write", Value: "0"},
 	}
 	rows := make([][]interface{}, 0, len(statusVars))
 	for _, sv := range statusVars {

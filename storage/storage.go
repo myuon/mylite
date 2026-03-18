@@ -271,6 +271,254 @@ func (t *Table) Insert(row Row) (int64, error) {
 	return lastInsertID, nil
 }
 
+// BulkInsert appends multiple rows under a single lock acquisition.
+// It handles AUTO_INCREMENT, NOT NULL defaults, and PK/UNIQUE checks.
+// Returns (lastInsertIDs slice, error). Each element corresponds to the
+// auto-increment ID for that row (0 if not auto-generated).
+func (t *Table) BulkInsert(rows []Row) ([]int64, error) {
+	t.Mu.Lock()
+	defer t.Mu.Unlock()
+
+	// Find auto-increment column info once
+	var autoCol *catalog.ColumnDef
+	for i := range t.Def.Columns {
+		if t.Def.Columns[i].AutoIncrement {
+			autoCol = &t.Def.Columns[i]
+			break
+		}
+	}
+
+	var autoMaxID int64
+	var autoHasMax, autoIsUnsignedBigint bool
+	if autoCol != nil {
+		autoMaxID, autoHasMax, autoIsUnsignedBigint = autoIncrementMaxForType(autoCol.Type)
+	}
+
+	// Determine if we need PK/UNIQUE checks
+	hasPK := len(t.Def.PrimaryKey) > 0
+	hasPKCol := false
+	for _, col := range t.Def.Columns {
+		if col.PrimaryKey {
+			hasPKCol = true
+			break
+		}
+	}
+	hasUnique := false
+	for _, idx := range t.Def.Indexes {
+		if idx.Unique {
+			hasUnique = true
+			break
+		}
+	}
+
+	needsUniquenessCheck := hasPK || hasPKCol || hasUnique
+
+	// Build hash sets for PK/UNIQUE checks if needed
+	var pkSet map[string]bool
+	var colPKSets map[string]map[string]bool
+	var uniqueSets map[string]map[string]bool // index name -> set of formatted key
+
+	if needsUniquenessCheck {
+		if hasPK {
+			pkSet = make(map[string]bool, len(t.Rows))
+			for _, existing := range t.Rows {
+				key := bulkPKKey(existing, t.Def.PrimaryKey)
+				pkSet[key] = true
+			}
+		}
+		if hasPKCol {
+			colPKSets = make(map[string]map[string]bool)
+			for _, col := range t.Def.Columns {
+				if col.PrimaryKey {
+					s := make(map[string]bool, len(t.Rows))
+					for _, existing := range t.Rows {
+						s[fmt.Sprintf("%v", existing[col.Name])] = true
+					}
+					colPKSets[col.Name] = s
+				}
+			}
+		}
+		if hasUnique {
+			uniqueSets = make(map[string]map[string]bool)
+			for _, idx := range t.Def.Indexes {
+				if idx.Unique {
+					s := make(map[string]bool, len(t.Rows))
+					for _, existing := range t.Rows {
+						key := bulkUniqueKey(existing, idx.Columns)
+						if key != "" { // empty means has NULL, skip
+							s[key] = true
+						}
+					}
+					uniqueSets[idx.Name] = s
+				}
+			}
+		}
+	}
+
+	ids := make([]int64, len(rows))
+
+	for ri, row := range rows {
+		var lastInsertID int64
+
+		// Handle AUTO_INCREMENT
+		if autoCol != nil {
+			v, exists := row[autoCol.Name]
+			isZero := false
+			if exists && v != nil {
+				if intVal, ok := toInt64(v); ok && intVal == 0 {
+					isZero = true
+				}
+			}
+			if !exists || v == nil || isZero {
+				if autoCol.Nullable && exists && v == nil && t.AIExplicitlySet {
+					lastInsertID = 0
+				} else {
+					if autoIsUnsignedBigint && t.AutoIncrement.Load() >= math.MaxInt64 {
+						return ids[:ri], fmt.Errorf("Failed to read auto-increment value from storage engine")
+					}
+					cur := t.AutoIncrement.Load()
+					id := cur + 1
+					if id < cur {
+						id = cur
+					}
+					if autoHasMax && id > autoMaxID {
+						id = autoMaxID
+					}
+					t.AutoIncrement.Store(id)
+					row[autoCol.Name] = id
+					lastInsertID = id
+				}
+			} else {
+				if uv, ok := v.(uint64); ok {
+					if autoIsUnsignedBigint {
+						if uv > math.MaxInt64 {
+							t.AutoIncrement.Store(math.MaxInt64)
+						} else if int64(uv) >= t.AutoIncrement.Load() {
+							t.AutoIncrement.Store(int64(uv))
+						}
+					} else if uv <= math.MaxInt64 && int64(uv) >= t.AutoIncrement.Load() {
+						t.AutoIncrement.Store(int64(uv))
+					}
+					if uv <= math.MaxInt64 {
+						lastInsertID = int64(uv)
+					}
+				} else {
+					if intVal, ok := toInt64(v); ok && intVal >= t.AutoIncrement.Load() {
+						t.AutoIncrement.Store(intVal)
+					}
+					lastInsertID = toInt64Val(v)
+				}
+			}
+		}
+
+		// Check NOT NULL constraints
+		for _, col := range t.Def.Columns {
+			if !col.Nullable && !col.AutoIncrement {
+				v, exists := row[col.Name]
+				if !exists || v == nil {
+					upper := strings.ToUpper(col.Type)
+					switch {
+					case strings.Contains(upper, "INT") || strings.Contains(upper, "DECIMAL") ||
+						strings.Contains(upper, "FLOAT") || strings.Contains(upper, "DOUBLE"):
+						row[col.Name] = int64(0)
+					case strings.Contains(upper, "CHAR") || strings.Contains(upper, "TEXT") ||
+						strings.Contains(upper, "BLOB") || strings.Contains(upper, "ENUM"):
+						row[col.Name] = ""
+					case strings.Contains(upper, "DATE") || strings.Contains(upper, "TIME"):
+						row[col.Name] = "0000-00-00 00:00:00"
+					default:
+						row[col.Name] = ""
+					}
+				}
+			}
+		}
+
+		// PK/UNIQUE checks using hash sets
+		if needsUniquenessCheck {
+			if hasPK {
+				key := bulkPKKey(row, t.Def.PrimaryKey)
+				if pkSet[key] {
+					pkVal := make([]string, len(t.Def.PrimaryKey))
+					for i, pk := range t.Def.PrimaryKey {
+						pkVal[i] = displayValue(row[stripPrefixLength(pk)])
+					}
+					return ids[:ri], fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key 'PRIMARY'",
+						strings.Join(pkVal, "-"))
+				}
+				pkSet[key] = true
+			}
+			if hasPKCol {
+				for _, col := range t.Def.Columns {
+					if col.PrimaryKey {
+						key := fmt.Sprintf("%v", row[col.Name])
+						if colPKSets[col.Name][key] {
+							return ids[:ri], fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key 'PRIMARY'",
+								displayValue(row[col.Name]))
+						}
+						colPKSets[col.Name][key] = true
+					}
+				}
+			}
+			if hasUnique {
+				for _, idx := range t.Def.Indexes {
+					if idx.Unique {
+						key := bulkUniqueKey(row, idx.Columns)
+						if key != "" && uniqueSets[idx.Name][key] {
+							vals := make([]string, len(idx.Columns))
+							for i, c := range idx.Columns {
+								vals[i] = displayValue(row[c])
+							}
+							return ids[:ri], fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key '%s'",
+								strings.Join(vals, "-"), idx.Name)
+						}
+						if key != "" {
+							uniqueSets[idx.Name][key] = true
+						}
+					}
+				}
+			}
+		}
+
+		t.Rows = append(t.Rows, row)
+		ids[ri] = lastInsertID
+	}
+
+	return ids, nil
+}
+
+// bulkPKKey builds a hash key for composite primary key lookup.
+func bulkPKKey(row Row, pkCols []string) string {
+	if len(pkCols) == 1 {
+		return fmt.Sprintf("%v", row[stripPrefixLength(pkCols[0])])
+	}
+	parts := make([]string, len(pkCols))
+	for i, pk := range pkCols {
+		parts[i] = fmt.Sprintf("%v", row[stripPrefixLength(pk)])
+	}
+	return strings.Join(parts, "\x00")
+}
+
+// bulkUniqueKey builds a hash key for unique index lookup.
+// Returns "" if any column is NULL (NULL doesn't violate UNIQUE).
+func bulkUniqueKey(row Row, cols []string) string {
+	if len(cols) == 1 {
+		v := row[cols[0]]
+		if v == nil {
+			return ""
+		}
+		return fmt.Sprintf("%v", v)
+	}
+	parts := make([]string, len(cols))
+	for i, c := range cols {
+		v := row[c]
+		if v == nil {
+			return ""
+		}
+		parts[i] = fmt.Sprintf("%v", v)
+	}
+	return strings.Join(parts, "\x00")
+}
+
 func autoIncrementMaxForType(colType string) (int64, bool, bool) {
 	upper := strings.ToUpper(strings.TrimSpace(colType))
 	base := upper
