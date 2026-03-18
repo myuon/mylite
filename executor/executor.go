@@ -444,56 +444,6 @@ func (e *Executor) tableRowCount(dbName, tableName string) int64 {
 	return int64(len(tbl.Rows))
 }
 
-// shouldRecalcInnoDBStats returns true if the stats for the given table need
-// recalculation. MySQL's InnoDB auto-recalc triggers when ~10% of the table
-// has changed. We replicate this behavior to avoid O(n^2) cost on sequential
-// single-row INSERTs.
-func (e *Executor) shouldRecalcInnoDBStats(dbName, tableName string, currentRowCount int64) bool {
-	statsTbl, err := e.Storage.GetTable("mysql", "innodb_table_stats")
-	if err != nil {
-		return true // no stats table, always recalc
-	}
-	statsTbl.Mu.RLock()
-	defer statsTbl.Mu.RUnlock()
-	for _, r := range statsTbl.Rows {
-		if strings.EqualFold(toString(r["database_name"]), dbName) && strings.EqualFold(toString(r["table_name"]), tableName) {
-			prevCount := toInt64ValForStats(r["n_rows"])
-			if prevCount <= 0 {
-				return true
-			}
-			diff := currentRowCount - prevCount
-			if diff < 0 {
-				diff = -diff
-			}
-			// Recalc if change is >= 10% of previous count, or if table is small (< 200 rows)
-			threshold := prevCount / 10
-			if threshold < 1 {
-				threshold = 1
-			}
-			return diff >= threshold || prevCount < 200
-		}
-	}
-	return true // no stats row found, first time
-}
-
-func toInt64ValForStats(v interface{}) int64 {
-	switch val := v.(type) {
-	case int64:
-		return val
-	case int:
-		return int64(val)
-	case float64:
-		return int64(val)
-	case uint64:
-		return int64(val)
-	case string:
-		if n, err := strconv.ParseInt(val, 10, 64); err == nil {
-			return n
-		}
-	}
-	return 0
-}
-
 func (e *Executor) hasInnoDBTableStatsRow(dbName, tableName string) bool {
 	statsTbl, err := e.Storage.GetTable("mysql", "innodb_table_stats")
 	if err != nil {
@@ -5852,338 +5802,6 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		}
 	}
 
-	// Determine if we can use the bulk insert fast path.
-	// Conditions: many rows, no ON DUPLICATE KEY UPDATE, no REPLACE, no IGNORE,
-	// no triggers, no CHECK constraints, no generated columns.
-	canBulkInsert := len(rows) >= 100 && len(stmt.OnDup) == 0 &&
-		stmt.Action != sqlparser.ReplaceAct && !bool(stmt.Ignore)
-	if canBulkInsert {
-		// Check for triggers
-		if db, dbErr := e.Catalog.GetDatabase(insertDB); dbErr == nil {
-			if len(db.GetTriggersForTable(tableName, "BEFORE", "INSERT")) > 0 ||
-				len(db.GetTriggersForTable(tableName, "AFTER", "INSERT")) > 0 {
-				canBulkInsert = false
-			}
-		}
-	}
-	if canBulkInsert {
-		// Check for CHECK constraints and generated columns
-		if tbl.Def != nil && len(tbl.Def.CheckConstraints) > 0 {
-			canBulkInsert = false
-		}
-		for _, col := range tbl.Def.Columns {
-			if isGeneratedColumnType(col.Type) {
-				canBulkInsert = false
-				break
-			}
-		}
-	}
-
-	if canBulkInsert {
-		// === BULK INSERT FAST PATH ===
-		preparedRows := make([]storage.Row, 0, len(rows))
-		for _, valTuple := range rows {
-			row := make(storage.Row)
-			origValues := make(storage.Row)
-			for i, val := range valTuple {
-				if i >= len(colNames) {
-					break
-				}
-				v, err := e.evalExpr(val)
-				if err != nil {
-					var intOvErr *intOverflowError
-					if errors.As(err, &intOvErr) {
-						overflowStr := intOvErr.val
-						isDecCol := false
-						for _, col := range tbl.Def.Columns {
-							if col.Name == colNames[i] {
-								colUpper := strings.ToUpper(col.Type)
-								if strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") {
-									isDecCol = true
-								}
-								break
-							}
-						}
-						if isDecCol {
-							if f, ferr := strconv.ParseFloat(overflowStr, 64); ferr == nil {
-								v = f
-								err = nil
-							}
-						}
-						if err != nil && !e.isStrictMode() {
-							isIntCol := false
-							isUnsigned := false
-							for _, col := range tbl.Def.Columns {
-								if col.Name == colNames[i] {
-									colUpper := strings.ToUpper(col.Type)
-									if strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER") {
-										isIntCol = true
-										isUnsigned = strings.Contains(colUpper, "UNSIGNED")
-									}
-									break
-								}
-							}
-							if isIntCol {
-								if strings.HasPrefix(overflowStr, "-") {
-									if isUnsigned {
-										v = int64(0)
-									} else {
-										v = int64(math.MinInt64)
-									}
-								} else {
-									if isUnsigned {
-										v = uint64(math.MaxUint64)
-									} else {
-										v = int64(math.MaxInt64)
-									}
-								}
-								err = nil
-							}
-						}
-						if err != nil {
-							return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colNames[i]))
-						}
-					} else {
-						return nil, err
-					}
-				}
-				origValues[colNames[i]] = v
-				for _, col := range tbl.Def.Columns {
-					if col.Name == colNames[i] {
-						if padLen := binaryPadLength(col.Type); padLen > 0 && v != nil {
-							v = padBinaryValue(v, padLen)
-						}
-						if v != nil {
-							if e.isStrictMode() {
-								colUpper := strings.ToUpper(col.Type)
-								isDecType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE")
-								if isDecType {
-									if strings.Contains(colUpper, "UNSIGNED") {
-										f := toFloat(v)
-										if f < 0 {
-											return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
-										}
-									}
-									if err := checkDecimalRange(col.Type, v); err != nil {
-										return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
-									}
-								}
-								if err := checkIntegerStrict(col.Type, col.Name, v); err != nil {
-									return nil, err
-								}
-							}
-							v = formatDecimalValue(col.Type, v)
-							v = validateEnumSetValue(col.Type, v)
-							v = coerceDateTimeValue(col.Type, v)
-							v = coerceIntegerValue(col.Type, v)
-							v = coerceBitValue(col.Type, v)
-						}
-						break
-					}
-				}
-				row[colNames[i]] = v
-			}
-
-			// Fill in default values for missing columns
-			for _, col := range tbl.Def.Columns {
-				if _, exists := row[col.Name]; !exists {
-					if col.AutoIncrement {
-						// Will be handled by BulkInsert
-					} else if col.Default != nil {
-						defVal := *col.Default
-						defUpper := strings.ToUpper(defVal)
-						if defUpper == "CURRENT_TIMESTAMP" || defUpper == "CURRENT_TIMESTAMP()" ||
-							defUpper == "NOW()" {
-							defVal = e.nowTime().Format("2006-01-02 15:04:05")
-						}
-						row[col.Name] = defVal
-					} else if !col.Nullable {
-						row[col.Name] = implicitZeroValue(col.Type)
-					} else {
-						row[col.Name] = nil
-					}
-				}
-			}
-
-			// Check NOT NULL constraints
-			{
-				colNameSet := make(map[string]bool, len(colNames))
-				for _, cn := range colNames {
-					colNameSet[cn] = true
-				}
-				for _, col := range tbl.Def.Columns {
-					isAutoGenCol := col.AutoIncrement
-					if e.isStrictMode() && !col.Nullable && !isAutoGenCol && col.Default == nil && !colNameSet[col.Name] {
-						return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
-					}
-					if !col.Nullable && !isAutoGenCol && colNameSet[col.Name] {
-						if v, ok := row[col.Name]; ok && v == nil {
-							isMultiRow := len(rows) > 1
-							if e.isStrictMode() || !isMultiRow {
-								return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
-							}
-							e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", col.Name))
-							row[col.Name] = implicitZeroValue(col.Type)
-						}
-					}
-				}
-			}
-
-			// Check PK NULL
-			if len(tbl.Def.PrimaryKey) > 0 {
-				pkSetLocal := make(map[string]bool, len(tbl.Def.PrimaryKey))
-				for _, pk := range tbl.Def.PrimaryKey {
-					pkSetLocal[pk] = true
-				}
-				for i, cn := range colNames {
-					if i < len(valTuple) && pkSetLocal[cn] {
-						if row[cn] == nil {
-							isAI := false
-							for _, col := range tbl.Def.Columns {
-								if col.Name == cn && col.AutoIncrement {
-									isAI = true
-									break
-								}
-							}
-							if !isAI {
-								return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", cn))
-							}
-						}
-					}
-				}
-			}
-
-			// Strict mode validation
-			if e.isStrictMode() {
-				for _, col := range tbl.Def.Columns {
-					isAutoGenCol := col.AutoIncrement
-					if !col.Nullable && !isAutoGenCol {
-						rv, exists := row[col.Name]
-						explicitlySpecified := false
-						for _, cn := range colNames {
-							if strings.EqualFold(cn, col.Name) {
-								explicitlySpecified = true
-								break
-							}
-						}
-						if !explicitlySpecified && col.Default == nil {
-							return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
-						} else if exists && rv == nil && explicitlySpecified {
-							return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
-						}
-					}
-					rv, exists := row[col.Name]
-					if exists && rv != nil {
-						colUpper := strings.ToUpper(col.Type)
-						isCharType := strings.Contains(colUpper, "CHAR") || strings.Contains(colUpper, "BINARY")
-						if isCharType {
-							checkVal := rv
-							if ov, ok := origValues[col.Name]; ok && ov != nil {
-								checkVal = ov
-							}
-							if sv, ok := checkVal.(string); ok {
-								maxLen := extractCharLength(col.Type)
-								if maxLen > 0 && len([]rune(sv)) > maxLen {
-									return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row 1", col.Name))
-								}
-							}
-						}
-					}
-				}
-			}
-
-			// Determine auto-increment state for tracking firstAutoInsertID
-			autoGeneratedThisRow := false
-			if autoColName != "" {
-				if v, exists := row[autoColName]; !exists || v == nil {
-					autoGeneratedThisRow = true
-				} else {
-					switch av := v.(type) {
-					case int64:
-						autoGeneratedThisRow = av == 0
-					case uint64:
-						autoGeneratedThisRow = av == 0
-					case float64:
-						autoGeneratedThisRow = int64(av) == 0
-					case string:
-						autoGeneratedThisRow = strings.TrimSpace(av) == "" || strings.TrimSpace(av) == "0"
-					}
-				}
-			}
-			_ = autoGeneratedThisRow // tracked after BulkInsert via IDs
-
-			preparedRows = append(preparedRows, row)
-		}
-
-		// Perform bulk insert
-		ids, err := tbl.BulkInsert(preparedRows)
-		if err != nil {
-			return nil, err
-		}
-
-		affected = uint64(len(ids))
-		// Track auto-increment IDs
-		for ri, id := range ids {
-			if id > 0 {
-				lastInsertID = id
-				if firstAutoInsertID == 0 {
-					// Check if this row auto-generated its ID
-					if autoColName != "" {
-						origVal := rows[ri]
-						autoGenerated := true
-						for ci, cn := range colNames {
-							if cn == autoColName && ci < len(origVal) {
-								// The row had an explicit value - check if it was 0/NULL
-								v, _ := e.evalExpr(origVal[ci])
-								if v != nil {
-									if intVal, ok := v.(int64); ok && intVal != 0 {
-										autoGenerated = false
-									} else if sv, ok := v.(string); ok && strings.TrimSpace(sv) != "" && strings.TrimSpace(sv) != "0" {
-										autoGenerated = false
-									}
-								}
-								break
-							}
-						}
-						if autoGenerated {
-							firstAutoInsertID = id
-						}
-					}
-				}
-			}
-		}
-
-		if firstAutoInsertID > 0 {
-			lastInsertID = firstAutoInsertID
-		}
-		e.lastInsertID = lastInsertID
-
-		if lastInsertID > 0 {
-			for _, col := range tbl.Def.Columns {
-				if col.AutoIncrement {
-					if !col.Nullable {
-						e.lastAutoIncID = lastInsertID
-					}
-					break
-				}
-			}
-		}
-
-		// Auto-recalc InnoDB persistent stats after DML
-		if affected > 0 {
-			if db, dbErr := e.Catalog.GetDatabase(insertDB); dbErr == nil {
-				if def, defErr := db.GetTable(tableName); defErr == nil && e.innodbStatsAutoRecalcEnabled(def) && e.innodbStatsPersistentEnabled(def) {
-					e.upsertInnoDBStatsRows(insertDB, tableName, e.tableRowCount(insertDB, tableName))
-				}
-			}
-		}
-
-		return &Result{
-			AffectedRows: affected,
-			InsertID:     uint64(lastInsertID),
-		}, nil
-	}
-
 	for _, valTuple := range rows {
 		row := make(storage.Row)
 		origValues := make(storage.Row) // original values before formatting (for strict mode checks)
@@ -6705,14 +6323,11 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		}
 	}
 
-	// Auto-recalc InnoDB persistent stats after DML (with threshold to avoid O(n^2) on sequential inserts)
+	// Auto-recalc InnoDB persistent stats after DML
 	if affected > 0 {
 		if db, dbErr := e.Catalog.GetDatabase(insertDB); dbErr == nil {
 			if def, defErr := db.GetTable(tableName); defErr == nil && e.innodbStatsAutoRecalcEnabled(def) && e.innodbStatsPersistentEnabled(def) {
-				rowCount := e.tableRowCount(insertDB, tableName)
-				if e.shouldRecalcInnoDBStats(insertDB, tableName, rowCount) {
-					e.upsertInnoDBStatsRows(insertDB, tableName, rowCount)
-				}
+				e.upsertInnoDBStatsRows(insertDB, tableName, e.tableRowCount(insertDB, tableName))
 			}
 		}
 	}
@@ -7433,6 +7048,146 @@ func extractTableAliasFromAliased(te *sqlparser.AliasedTableExpr) (alias, tableN
 	return al, tName, nil
 }
 
+// collectTableAliases extracts the alias (or table name) for each FROM table expression.
+func collectTableAliases(fromExprs sqlparser.TableExprs) []string {
+	aliases := make([]string, len(fromExprs))
+	for i, fe := range fromExprs {
+		if ate, ok := fe.(*sqlparser.AliasedTableExpr); ok {
+			a, _, _ := extractTableAliasFromAliased(ate)
+			aliases[i] = a
+		}
+	}
+	return aliases
+}
+
+// exprReferencedTables returns the set of table aliases referenced by column
+// names in expr. The aliases parameter is the list of known table aliases.
+func exprReferencedTables(expr sqlparser.Expr, aliases []string) map[int]bool {
+	refs := make(map[int]bool)
+	aliasLower := make([]string, len(aliases))
+	for i, a := range aliases {
+		aliasLower[i] = strings.ToLower(a)
+	}
+	var walk func(e sqlparser.Expr)
+	walk = func(e sqlparser.Expr) {
+		switch v := e.(type) {
+		case *sqlparser.ColName:
+			if !v.Qualifier.IsEmpty() {
+				q := strings.ToLower(v.Qualifier.Name.String())
+				for i, a := range aliasLower {
+					if q == a {
+						refs[i] = true
+						return
+					}
+				}
+			}
+			// Unqualified column — could be any table; mark all
+			for i := range aliases {
+				refs[i] = true
+			}
+		case *sqlparser.AndExpr:
+			walk(v.Left)
+			walk(v.Right)
+		case *sqlparser.OrExpr:
+			walk(v.Left)
+			walk(v.Right)
+		case *sqlparser.ComparisonExpr:
+			walk(v.Left)
+			walk(v.Right)
+		case *sqlparser.NotExpr:
+			walk(v.Expr)
+		case *sqlparser.IsExpr:
+			walk(v.Left)
+		case *sqlparser.FuncExpr:
+			for _, arg := range v.Exprs {
+				walk(arg)
+			}
+		case *sqlparser.BetweenExpr:
+			walk(v.Left)
+			walk(v.From)
+			walk(v.To)
+		case *sqlparser.CaseExpr:
+			if v.Expr != nil {
+				walk(v.Expr)
+			}
+			for _, when := range v.Whens {
+				walk(when.Cond)
+				walk(when.Val)
+			}
+			if v.Else != nil {
+				walk(v.Else)
+			}
+		case *sqlparser.BinaryExpr:
+			walk(v.Left)
+			walk(v.Right)
+		case *sqlparser.UnaryExpr:
+			walk(v.Expr)
+		}
+	}
+	walk(expr)
+	return refs
+}
+
+// decomposeAndPredicates flattens an AND-connected expression into individual
+// conjuncts. For example (A AND B) AND C becomes [A, B, C].
+func decomposeAndPredicates(expr sqlparser.Expr) []sqlparser.Expr {
+	if and, ok := expr.(*sqlparser.AndExpr); ok {
+		return append(decomposeAndPredicates(and.Left), decomposeAndPredicates(and.Right)...)
+	}
+	return []sqlparser.Expr{expr}
+}
+
+// composeAndPredicates rebuilds an AND chain from a slice of predicates.
+// Returns nil if the slice is empty.
+func composeAndPredicates(preds []sqlparser.Expr) sqlparser.Expr {
+	if len(preds) == 0 {
+		return nil
+	}
+	result := preds[0]
+	for i := 1; i < len(preds); i++ {
+		result = &sqlparser.AndExpr{Left: result, Right: preds[i]}
+	}
+	return result
+}
+
+// classifyPredicatesForCrossJoin splits WHERE predicates into:
+//   - perTable: predicates that reference only a single table (indexed by table position)
+//   - joinPreds: predicates that reference multiple tables (or no specific table)
+func classifyPredicatesForCrossJoin(where sqlparser.Expr, aliases []string) (perTable map[int][]sqlparser.Expr, joinPreds []sqlparser.Expr) {
+	preds := decomposeAndPredicates(where)
+	perTable = make(map[int][]sqlparser.Expr)
+	for _, p := range preds {
+		refs := exprReferencedTables(p, aliases)
+		if len(refs) == 1 {
+			for idx := range refs {
+				perTable[idx] = append(perTable[idx], p)
+			}
+		} else {
+			joinPreds = append(joinPreds, p)
+		}
+	}
+	return perTable, joinPreds
+}
+
+// preFilterRows applies single-table predicates to filter a set of rows.
+func (e *Executor) preFilterRows(rows []storage.Row, preds []sqlparser.Expr) ([]storage.Row, error) {
+	if len(preds) == 0 {
+		return rows, nil
+	}
+	expr := composeAndPredicates(preds)
+	filtered := make([]storage.Row, 0, len(rows)/2)
+	for _, row := range rows {
+		match, err := e.evalWhere(expr, row)
+		if err != nil {
+			return nil, err
+		}
+		if match {
+			filtered = append(filtered, row)
+		}
+	}
+	return filtered, nil
+}
+
 func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// Handle SELECT without FROM (e.g., SELECT 1, SELECT @@version_comment)
 	if len(stmt.From) == 0 {
@@ -7569,34 +7324,54 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 					Rows:    [][]interface{}{{totalCount}},
 				}, nil
 			}
-			// WITH WHERE: stream through nested loops counting matches
-			// without allocating a row per combination.
+			// WITH WHERE: pre-filter each table's rows using single-table
+			// predicates, then stream through nested loops with only
+			// the remaining join predicates.
+			aliases := collectTableAliases(stmt.From)
+			perTable, joinPreds := classifyPredicatesForCrossJoin(stmt.Where.Expr, aliases)
+			for idx, preds := range perTable {
+				filtered, err := e.preFilterRows(allTableRows[idx], preds)
+				if err != nil {
+					return nil, err
+				}
+				allTableRows[idx] = filtered
+			}
+			joinExpr := composeAndPredicates(joinPreds)
+
 			totalCount := int64(0)
-			scratch := make(storage.Row)
-			var countNested func(depth int) error
-			countNested = func(depth int) error {
-				if depth == len(allTableRows) {
-					match, err := e.evalWhere(stmt.Where.Expr, scratch)
-					if err != nil {
-						return err
+			if joinExpr == nil {
+				// All predicates were single-table; count = product of filtered sizes
+				totalCount = int64(1)
+				for _, rows := range allTableRows {
+					totalCount *= int64(len(rows))
+				}
+			} else {
+				scratch := make(storage.Row)
+				var countNested func(depth int) error
+				countNested = func(depth int) error {
+					if depth == len(allTableRows) {
+						match, err := e.evalWhere(joinExpr, scratch)
+						if err != nil {
+							return err
+						}
+						if match {
+							totalCount++
+						}
+						return nil
 					}
-					if match {
-						totalCount++
+					for _, row := range allTableRows[depth] {
+						for k, v := range row {
+							scratch[k] = v
+						}
+						if err := countNested(depth + 1); err != nil {
+							return err
+						}
 					}
 					return nil
 				}
-				for _, row := range allTableRows[depth] {
-					for k, v := range row {
-						scratch[k] = v
-					}
-					if err := countNested(depth + 1); err != nil {
-						return err
-					}
+				if err := countNested(0); err != nil {
+					return nil, err
 				}
-				return nil
-			}
-			if err := countNested(0); err != nil {
-				return nil, err
 			}
 			// Clear sql_auto_is_null after WHERE evaluation
 			if e.sqlAutoIsNull && e.lastAutoIncID > 0 {
@@ -7617,25 +7392,43 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// When a WHERE clause is present, we fuse the cross join with the WHERE
 	// filter (streaming nested-loop join) to avoid materializing the full
 	// cartesian product in memory.
+	// Pre-filter: apply single-table predicates to each table before joining.
 	whereApplied := false
 	if len(stmt.From) > 1 && stmt.Where != nil {
 		whereApplied = true
+		aliases := collectTableAliases(stmt.From)
+		perTable, joinPreds := classifyPredicatesForCrossJoin(stmt.Where.Expr, aliases)
+		// Pre-filter the first table (allRows = FROM[0])
+		if preds, ok := perTable[0]; ok {
+			allRows, err = e.preFilterRows(allRows, preds)
+			if err != nil {
+				return nil, err
+			}
+		}
+		joinExpr := composeAndPredicates(joinPreds)
 		for i := 1; i < len(stmt.From); i++ {
 			rightRows, err := e.buildFromExpr(stmt.From[i])
 			if err != nil {
 				return nil, err
+			}
+			// Pre-filter right table rows
+			if preds, ok := perTable[i]; ok {
+				rightRows, err = e.preFilterRows(rightRows, preds)
+				if err != nil {
+					return nil, err
+				}
 			}
 			isLastJoin := i == len(stmt.From)-1
 			var crossed []storage.Row
 			// For the last join step, use a reusable scratch map for WHERE eval
 			// to avoid allocating a map per pair when most pairs are filtered out.
 			var scratch storage.Row
-			if isLastJoin && len(allRows) > 0 && len(rightRows) > 0 {
+			if isLastJoin && joinExpr != nil && len(allRows) > 0 && len(rightRows) > 0 {
 				scratch = make(storage.Row, len(allRows[0])+len(rightRows[0]))
 			}
 			for _, leftRow := range allRows {
 				for _, rightRow := range rightRows {
-					if isLastJoin {
+					if isLastJoin && joinExpr != nil {
 						// Reuse scratch map: clear and repopulate
 						for k := range scratch {
 							delete(scratch, k)
@@ -7646,7 +7439,7 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 						for k, v := range rightRow {
 							scratch[k] = v
 						}
-						match, err := e.evalWhere(stmt.Where.Expr, scratch)
+						match, err := e.evalWhere(joinExpr, scratch)
 						if err != nil {
 							return nil, err
 						}
@@ -13448,7 +13241,11 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		if count <= 0 || s == nil {
 			return "", nil
 		}
-		return strings.Repeat(toString(s), count), nil
+		str := toString(s)
+		if int64(count)*int64(len(str)) > 67108864 {
+			return nil, nil
+		}
+		return strings.Repeat(str, count), nil
 	case "cast", "convert":
 		// Simplified CAST: just evaluate the inner expression
 		if len(v.Exprs) >= 1 {
@@ -13747,13 +13544,20 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, nil
 		}
 		s := []rune(toString(strVal))
-		targetLen := int(toInt64(lenVal))
-		padStr := []rune(toString(padVal))
-		if targetLen < 0 || len(padStr) == 0 {
+		targetLen64 := toInt64(lenVal)
+		if targetLen64 < 0 {
 			return nil, nil
 		}
+		if targetLen64 > 67108864 {
+			return nil, nil
+		}
+		targetLen := int(targetLen64)
+		padStr := []rune(toString(padVal))
 		if targetLen <= len(s) {
 			return string(s[:targetLen]), nil
+		}
+		if len(padStr) == 0 {
+			return "", nil
 		}
 		// Need to pad
 		needed := targetLen - len(s)
@@ -13784,13 +13588,20 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, nil
 		}
 		s := []rune(toString(strVal))
-		targetLen := int(toInt64(lenVal))
-		padStr := []rune(toString(padVal))
-		if targetLen < 0 || len(padStr) == 0 {
+		targetLen64 := toInt64(lenVal)
+		if targetLen64 < 0 {
 			return nil, nil
 		}
+		if targetLen64 > 67108864 {
+			return nil, nil
+		}
+		targetLen := int(targetLen64)
+		padStr := []rune(toString(padVal))
 		if targetLen <= len(s) {
 			return string(s[:targetLen]), nil
+		}
+		if len(padStr) == 0 {
+			return "", nil
 		}
 		needed := targetLen - len(s)
 		var pad []rune
@@ -14728,7 +14539,11 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if count <= 0 {
 			return "", nil
 		}
-		return strings.Repeat(toString(args[0]), count), nil
+		str := toString(args[0])
+		if int64(count)*int64(len(str)) > 67108864 {
+			return nil, nil
+		}
+		return strings.Repeat(str, count), nil
 	case "concat":
 		args, err := evalArgs()
 		if err != nil {
@@ -15397,13 +15212,20 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			return nil, nil
 		}
 		s := []rune(toString(args[0]))
-		targetLen := int(toInt64(args[1]))
-		padStr := []rune(toString(args[2]))
-		if targetLen < 0 || len(padStr) == 0 {
+		targetLen64 := toInt64(args[1])
+		if targetLen64 < 0 {
 			return nil, nil
 		}
+		if targetLen64 > 67108864 {
+			return nil, nil
+		}
+		targetLen := int(targetLen64)
+		padStr := []rune(toString(args[2]))
 		if targetLen <= len(s) {
 			return string(s[:targetLen]), nil
+		}
+		if len(padStr) == 0 {
+			return "", nil
 		}
 		needed := targetLen - len(s)
 		var pad []rune
@@ -15421,13 +15243,20 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			return nil, nil
 		}
 		s := []rune(toString(args[0]))
-		targetLen := int(toInt64(args[1]))
-		padStr := []rune(toString(args[2]))
-		if targetLen < 0 || len(padStr) == 0 {
+		targetLen64 := toInt64(args[1])
+		if targetLen64 < 0 {
 			return nil, nil
 		}
+		if targetLen64 > 67108864 {
+			return nil, nil
+		}
+		targetLen := int(targetLen64)
+		padStr := []rune(toString(args[2]))
 		if targetLen <= len(s) {
 			return string(s[:targetLen]), nil
+		}
+		if len(padStr) == 0 {
+			return "", nil
 		}
 		needed := targetLen - len(s)
 		var pad []rune
