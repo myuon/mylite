@@ -12,6 +12,15 @@ import (
 	"github.com/myuon/mylite/catalog"
 )
 
+// stripPrefixLength strips the prefix length from a column name.
+// e.g., "col_1_text(3072)" -> "col_1_text"
+func stripPrefixLength(col string) string {
+	if idx := strings.Index(col, "("); idx >= 0 {
+		return col[:idx]
+	}
+	return col
+}
+
 // Row represents a single row as a map of column name to value.
 // Values are stored as interface{} (nil for NULL).
 type Row map[string]interface{}
@@ -199,7 +208,8 @@ func (t *Table) Insert(row Row) (int64, error) {
 		for _, existing := range t.Rows {
 			match := true
 			for _, pkCol := range t.Def.PrimaryKey {
-				if fmt.Sprintf("%v", existing[pkCol]) != fmt.Sprintf("%v", row[pkCol]) {
+				col := stripPrefixLength(pkCol)
+				if fmt.Sprintf("%v", existing[col]) != fmt.Sprintf("%v", row[col]) {
 					match = false
 					break
 				}
@@ -207,7 +217,7 @@ func (t *Table) Insert(row Row) (int64, error) {
 			if match {
 				pkVal := make([]string, len(t.Def.PrimaryKey))
 				for i, pk := range t.Def.PrimaryKey {
-					pkVal[i] = displayValue(row[pk])
+					pkVal[i] = displayValue(row[stripPrefixLength(pk)])
 				}
 				return 0, fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key 'PRIMARY'",
 					strings.Join(pkVal, "-"))

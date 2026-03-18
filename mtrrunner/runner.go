@@ -134,26 +134,10 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		},
 	}
 
-	// Apply master.opt settings (e.g. --innodb_commit_concurrency=1)
-	// Use MYLITE SET_INIT to bypass validation (simulates startup config).
-	optPath := strings.TrimSuffix(testPath, ".test") + "-master.opt"
-	if optData, optErr := os.ReadFile(optPath); optErr == nil {
-		for _, opt := range strings.Fields(string(optData)) {
-			opt = strings.TrimSpace(opt)
-			if strings.HasPrefix(opt, "--") {
-				opt = opt[2:]
-			}
-			opt = strings.ReplaceAll(opt, "-", "_")
-			if idx := strings.Index(opt, "="); idx > 0 {
-				varName := opt[:idx]
-				varVal := opt[idx+1:]
-				// Use MYLITE SET_INIT for bypass, fallback to SET GLOBAL
-				cmd := fmt.Sprintf("MYLITE SET_INIT %s=%s", varName, varVal)
-				if _, setErr := r.DB.Exec(cmd); setErr != nil {
-					r.DB.Exec(fmt.Sprintf("SET GLOBAL %s = %s", varName, varVal)) //nolint:errcheck
-				}
-			}
-		}
+	// Read master.opt to apply server options (e.g., --innodb_page_size=32k)
+	masterOptPath := filepath.Join(filepath.Dir(testPath), name+"-master.opt")
+	if optData, err := os.ReadFile(masterOptPath); err == nil {
+		applyMasterOpt(string(optData), ectx)
 	}
 
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -942,6 +926,12 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 			args = stripInlineHashComments(args)
 			args = strings.TrimSpace(args)
 			args = strings.TrimSuffix(args, ";")
+			if name == "eval" {
+				// In eval context, undefined variables expand to empty string
+				args = ctx.substituteVars(args)
+				args = stripUndefinedVars(args)
+				args = strings.TrimSpace(args)
+			}
 			if name == "query_vertical" {
 				ctx.verticalResult = true
 			}
@@ -1924,6 +1914,10 @@ func (ctx *execContext) setVariable(expr string) error {
 		return nil
 	}
 	name := strings.TrimSpace(parts[0])
+	// In mysqltest, 'let create = ...' defines '$create'. Ensure '$' prefix.
+	if !strings.HasPrefix(name, "$") && !strings.HasPrefix(name, "@") {
+		name = "$" + name
+	}
 	value := strings.TrimSpace(parts[1])
 
 	// If value is wrapped in backticks, execute as SQL and use first column of first row
@@ -2070,6 +2064,44 @@ func (ctx *execContext) substituteVars(s string) string {
 		s = strings.ReplaceAll(s, name, value)
 	}
 	return s
+}
+
+// applyMasterOpt parses a master.opt file and applies relevant options to the
+// exec context variables (e.g., --innodb_page_size=32k sets $innodb_page_size).
+func applyMasterOpt(content string, ctx *execContext) {
+	for _, token := range strings.Fields(content) {
+		token = strings.TrimPrefix(token, "--")
+		if strings.Contains(token, "=") {
+			parts := strings.SplitN(token, "=", 2)
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			// Convert size suffixes (k, m, g)
+			if strings.HasSuffix(strings.ToLower(val), "k") {
+				if n, err := strconv.Atoi(val[:len(val)-1]); err == nil {
+					val = strconv.Itoa(n * 1024)
+				}
+			} else if strings.HasSuffix(strings.ToLower(val), "m") {
+				if n, err := strconv.Atoi(val[:len(val)-1]); err == nil {
+					val = strconv.Itoa(n * 1024 * 1024)
+				}
+			}
+			// Set as variable
+			ctx.variables["$"+key] = val
+			// Also apply server-level settings via SET
+			if strings.EqualFold(key, "innodb_page_size") {
+				ctx.db.Exec(fmt.Sprintf("SET GLOBAL innodb_page_size = %s", val)) //nolint:errcheck
+			}
+		}
+	}
+}
+
+// stripUndefinedVars removes remaining $variable references that were not
+// substituted. In MySQL's mysqltest, undefined variables in eval context
+// expand to empty string.
+func stripUndefinedVars(s string) string {
+	// Match $identifier or ${identifier} patterns
+	re := regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*`)
+	return re.ReplaceAllString(s, "")
 }
 
 func (ctx *execContext) sourceFile(filename string) error {
@@ -2591,18 +2623,23 @@ func stripCommentAfterDelimiter(line, delim string) string {
 func stripInlineComment(line string) string {
 	inSingle := false
 	inDouble := false
+	inBacktick := false
 	for i, ch := range line {
 		switch ch {
 		case '\'':
-			if !inDouble {
+			if !inDouble && !inBacktick {
 				inSingle = !inSingle
 			}
 		case '"':
-			if !inSingle {
+			if !inSingle && !inBacktick {
 				inDouble = !inDouble
 			}
-		case '#':
+		case '`':
 			if !inSingle && !inDouble {
+				inBacktick = !inBacktick
+			}
+		case '#':
+			if !inSingle && !inDouble && !inBacktick {
 				return strings.TrimSpace(line[:i])
 			}
 		}
