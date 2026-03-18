@@ -4971,6 +4971,15 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		def.Collation = catalog.DefaultCollationForCharset(def.Charset)
 	}
 
+	// Temporary tables are connection-scoped in MySQL, but this simplified engine
+	// uses a shared catalog. Recreate temporary tables idempotently to avoid
+	// cross-session name collisions in MTR multi-connection tests.
+	if stmt.Temp {
+		_ = db.DropTable(tableName)
+		e.Storage.DropTable(dbName, tableName)
+		delete(e.tempTables, tableName)
+	}
+
 	err = db.CreateTable(def)
 	if err != nil {
 		if stmt.IfNotExists {
