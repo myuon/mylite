@@ -305,6 +305,7 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 			createOptions := ""
 			tableRows := int64(0)
 			avgRowLength := int64(0)
+			dataLength := int64(0)
 			maxDataLength := int64(0)
 			indexLength := int64(0)
 			if tblDef != nil {
@@ -320,7 +321,11 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 			}
 			if stats, ok := tableStatsByKey[strings.ToLower(dbName+"."+tblName)]; ok {
 				tableRows = asInt64Or(stats["n_rows"], 0)
+				dataLength = asInt64Or(stats["clustered_index_size"], 0) * 16384
 				indexLength = asInt64Or(stats["sum_of_other_index_sizes"], 0) * 16384
+				if tableRows > 0 {
+					avgRowLength = dataLength / tableRows
+				}
 			}
 			rows = append(rows, storage.Row{
 				"TABLE_CATALOG":   "def",
@@ -332,7 +337,7 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 				"ROW_FORMAT":      "Dynamic",
 				"TABLE_ROWS":      tableRows,
 				"AVG_ROW_LENGTH":  avgRowLength,
-				"DATA_LENGTH":     nil,
+				"DATA_LENGTH":     dataLength,
 				"MAX_DATA_LENGTH": maxDataLength,
 				"INDEX_LENGTH":    indexLength,
 				"DATA_FREE":       nil,
@@ -477,48 +482,17 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 			if err != nil {
 				continue
 			}
-			seqInIndex := int64(0)
-			// Add primary key entries
-			for i, pkCol := range tbl.PrimaryKey {
-				seqInIndex = int64(i + 1)
-				statKey := strings.ToLower(dbName + "." + tblName + ".primary." + fmt.Sprintf("n_diff_pfx%02d", i+1))
-				rows = append(rows, storage.Row{
-					"TABLE_CATALOG": "def",
-					"TABLE_SCHEMA":  dbName,
-					"TABLE_NAME":    tblName,
-					"NON_UNIQUE":    int64(0),
-					"INDEX_SCHEMA":  dbName,
-					"INDEX_NAME":    "PRIMARY",
-					"SEQ_IN_INDEX":  seqInIndex,
-					"COLUMN_NAME":   pkCol,
-					"COLLATION":     "A",
-					"CARDINALITY":   cardinalityByKey[statKey],
-					"SUB_PART":      nil,
-					"PACKED":        nil,
-					"NULLABLE":      "",
-					"INDEX_TYPE":    "BTREE",
-					"COMMENT":       "",
-					"INDEX_COMMENT": "",
-					"IS_VISIBLE":    "YES",
-					"EXPRESSION":    nil,
-				})
-			}
-			// Add index entries
-			for _, idx := range tbl.Indexes {
-				nonUnique := int64(1)
-				if idx.Unique {
-					nonUnique = 0
-				}
-				for i, col := range idx.Columns {
+			appendIndexRows := func(indexName string, cols []string, nonUnique int64, idxComment string) {
+				for i, col := range cols {
 					colName := normalizeIndexColumnName(col)
-					statKey := strings.ToLower(dbName + "." + tblName + "." + idx.Name + "." + fmt.Sprintf("n_diff_pfx%02d", i+1))
+					statKey := strings.ToLower(dbName + "." + tblName + "." + indexName + "." + fmt.Sprintf("n_diff_pfx%02d", i+1))
 					rows = append(rows, storage.Row{
 						"TABLE_CATALOG": "def",
 						"TABLE_SCHEMA":  dbName,
 						"TABLE_NAME":    tblName,
 						"NON_UNIQUE":    nonUnique,
 						"INDEX_SCHEMA":  dbName,
-						"INDEX_NAME":    idx.Name,
+						"INDEX_NAME":    indexName,
 						"SEQ_IN_INDEX":  int64(i + 1),
 						"COLUMN_NAME":   colName,
 						"COLLATION":     "A",
@@ -528,11 +502,26 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 						"NULLABLE":      "",
 						"INDEX_TYPE":    "BTREE",
 						"COMMENT":       "",
-						"INDEX_COMMENT": idx.Comment,
+						"INDEX_COMMENT": idxComment,
 						"IS_VISIBLE":    "YES",
 						"EXPRESSION":    nil,
 					})
 				}
+			}
+
+			// InnoDB secondary index metadata includes PK columns as suffix.
+			for _, idx := range tbl.Indexes {
+				nonUnique := int64(1)
+				if idx.Unique {
+					nonUnique = 0
+				}
+				statCols := make([]string, 0, len(idx.Columns)+len(tbl.PrimaryKey))
+				statCols = append(statCols, idx.Columns...)
+				statCols = append(statCols, tbl.PrimaryKey...)
+				appendIndexRows(idx.Name, statCols, nonUnique, idx.Comment)
+			}
+			if len(tbl.PrimaryKey) > 0 {
+				appendIndexRows("PRIMARY", tbl.PrimaryKey, 0, "")
 			}
 		}
 	}

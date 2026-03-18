@@ -219,7 +219,9 @@ func (e *Executor) initSystemTables() {
 	}
 
 	ensure("mysql", &catalog.TableDef{
-		Name: "innodb_table_stats",
+		Name:      "innodb_table_stats",
+		Charset:   "utf8mb4",
+		Collation: "utf8mb4_bin",
 		Columns: []catalog.ColumnDef{
 			{Name: "database_name", Type: "VARCHAR(64)"},
 			{Name: "table_name", Type: "VARCHAR(199)"},
@@ -231,7 +233,9 @@ func (e *Executor) initSystemTables() {
 	})
 
 	ensure("mysql", &catalog.TableDef{
-		Name: "innodb_index_stats",
+		Name:      "innodb_index_stats",
+		Charset:   "utf8mb4",
+		Collation: "utf8mb4_bin",
 		Columns: []catalog.ColumnDef{
 			{Name: "database_name", Type: "VARCHAR(64)"},
 			{Name: "table_name", Type: "VARCHAR(199)"},
@@ -495,8 +499,21 @@ func (e *Executor) upsertInnoDBStatsRows(dbName, tableName string, rowCount int6
 		if indexName == "" {
 			indexName = "PRIMARY"
 		}
-		for i, col := range idx.Columns {
+		statCols := make([]string, 0, len(idx.Columns)+1)
+		statCols = append(statCols, idx.Columns...)
+		if !strings.EqualFold(indexName, "PRIMARY") && len(def.PrimaryKey) > 0 {
+			statCols = append(statCols, def.PrimaryKey...)
+		}
+		sampleSize := rowCount
+		if sampleSize < 1 {
+			sampleSize = 1
+		}
+		for i := range statCols {
 			statName := fmt.Sprintf("n_diff_pfx%02d", i+1)
+			descCols := make([]string, 0, i+1)
+			for j := 0; j <= i; j++ {
+				descCols = append(descCols, statsIndexColName(statCols[j]))
+			}
 			idxTbl.Rows = append(idxTbl.Rows, storage.Row{
 				"database_name":    dbName,
 				"table_name":       tableName,
@@ -504,8 +521,8 @@ func (e *Executor) upsertInnoDBStatsRows(dbName, tableName string, rowCount int6
 				"last_update":      lastUpdate,
 				"stat_name":        statName,
 				"stat_value":       rowCount,
-				"sample_size":      rowCount,
-				"stat_description": statsIndexColName(col),
+				"sample_size":      sampleSize,
+				"stat_description": strings.Join(descCols, ","),
 			})
 		}
 		idxTbl.Rows = append(idxTbl.Rows,
@@ -15232,7 +15249,7 @@ func effectiveTableCollation(def *catalog.TableDef) string {
 
 func resolveOrderByCollation(tableDefs []*catalog.TableDef) string {
 	if len(tableDefs) == 0 {
-		return ""
+		return "utf8mb4_0900_ai_ci"
 	}
 	// Use single-table collation first; for joins fallback to the first table.
 	if len(tableDefs) == 1 {
