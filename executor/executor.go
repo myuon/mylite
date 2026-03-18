@@ -6919,23 +6919,139 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 		}
 	}
 
-	var result []storage.Row
-	for _, leftRow := range leftRows {
-		matched := false
-		for _, rightRow := range rightRows {
-			combined := make(storage.Row)
-			for k, v := range leftRow {
-				combined[k] = v
-			}
-			for k, v := range rightRow {
-				combined[k] = v
-				if rightAlias != "" {
-					combined[rightAlias+"."+k] = v
+	// Hash join optimization: for equi-join ON conditions, build a hash index
+	// on the right table to avoid O(n*m) nested loop.
+	type hashJoinInfo struct {
+		leftCol  string // column name to look up in left row
+		rightCol string // column name to look up in right row
+		index    map[string][]int // hash key -> indices into rightRows
+		residual sqlparser.Expr   // remaining non-equi conditions (nil if pure equi-join)
+	}
+	var hashJoin *hashJoinInfo
+	if !isCross && !isNatural && len(usingCols) == 0 && join.Condition != nil && join.Condition.On != nil {
+		// Try to extract simple equi-join condition: col1 = col2
+		if cmp, ok := join.Condition.On.(*sqlparser.ComparisonExpr); ok && cmp.Operator == sqlparser.EqualOp {
+			var lCol, rCol string
+			if ln, ok := cmp.Left.(*sqlparser.ColName); ok {
+				lCol = ln.Name.String()
+				if !ln.Qualifier.Name.IsEmpty() {
+					lCol = ln.Qualifier.Name.String() + "." + lCol
 				}
 			}
+			if rn, ok := cmp.Right.(*sqlparser.ColName); ok {
+				rCol = rn.Name.String()
+				if !rn.Qualifier.Name.IsEmpty() {
+					rCol = rn.Qualifier.Name.String() + "." + rCol
+				}
+			}
+			if lCol != "" && rCol != "" {
+				// Determine which column refers to left vs right table
+				// Try lCol in leftRows and rCol in rightRows first
+				leftKey, rightKey := lCol, rCol
+				if len(leftRows) > 0 {
+					if _, ok := leftRows[0][leftKey]; !ok {
+						// Swap: maybe lCol is in right and rCol is in left
+						leftKey, rightKey = rCol, lCol
+					}
+				}
+				// Build hash index on right table
+				idx := make(map[string][]int, len(rightRows))
+				for i, rr := range rightRows {
+					kv := fmt.Sprintf("%v", rr[rightKey])
+					idx[kv] = append(idx[kv], i)
+				}
+				hashJoin = &hashJoinInfo{leftCol: leftKey, rightCol: rightKey, index: idx}
+			}
+		} else if and, ok := join.Condition.On.(*sqlparser.AndExpr); ok {
+			// Try to extract equi-join from AND: (col1 = col2) AND (residual)
+			if cmp, ok := and.Left.(*sqlparser.ComparisonExpr); ok && cmp.Operator == sqlparser.EqualOp {
+				var lCol, rCol string
+				if ln, ok := cmp.Left.(*sqlparser.ColName); ok {
+					lCol = ln.Name.String()
+					if !ln.Qualifier.Name.IsEmpty() {
+						lCol = ln.Qualifier.Name.String() + "." + lCol
+					}
+				}
+				if rn, ok := cmp.Right.(*sqlparser.ColName); ok {
+					rCol = rn.Name.String()
+					if !rn.Qualifier.Name.IsEmpty() {
+						rCol = rn.Qualifier.Name.String() + "." + rCol
+					}
+				}
+				if lCol != "" && rCol != "" {
+					leftKey, rightKey := lCol, rCol
+					if len(leftRows) > 0 {
+						if _, ok := leftRows[0][leftKey]; !ok {
+							leftKey, rightKey = rCol, lCol
+						}
+					}
+					idx := make(map[string][]int, len(rightRows))
+					for i, rr := range rightRows {
+						kv := fmt.Sprintf("%v", rr[rightKey])
+						idx[kv] = append(idx[kv], i)
+					}
+					hashJoin = &hashJoinInfo{leftCol: leftKey, rightCol: rightKey, index: idx, residual: and.Right}
+				}
+			}
+		}
+	}
 
+	var result []storage.Row
+	// Reusable scratch map for ON condition evaluation (non-hash path)
+	var scratch storage.Row
+	if hashJoin == nil && len(leftRows) > 0 && len(rightRows) > 0 {
+		scratch = make(storage.Row, len(leftRows[0])+len(rightRows[0])*2)
+	}
+	for _, leftRow := range leftRows {
+		matched := false
+
+		// Hash join fast path
+		if hashJoin != nil {
+			lookupKey := fmt.Sprintf("%v", leftRow[hashJoin.leftCol])
+			candidates := hashJoin.index[lookupKey]
+			for _, ri := range candidates {
+				rightRow := rightRows[ri]
+				combined := make(storage.Row, len(leftRow)+len(rightRow)*2)
+				for k, v := range leftRow {
+					combined[k] = v
+				}
+				for k, v := range rightRow {
+					combined[k] = v
+					if rightAlias != "" {
+						combined[rightAlias+"."+k] = v
+					}
+				}
+				if hashJoin.residual != nil {
+					m, err := e.evalWhere(hashJoin.residual, combined)
+					if err != nil {
+						return nil, err
+					}
+					if !m {
+						continue
+					}
+				}
+				result = append(result, combined)
+				matched = true
+			}
+			if isLeft && !matched {
+				goto leftPad
+			}
+			continue
+		}
+
+		for _, rightRow := range rightRows {
 			// CROSS JOIN: no condition, all combinations
 			if isCross {
+				combined := make(storage.Row, len(leftRow)+len(rightRow)*2)
+				for k, v := range leftRow {
+					combined[k] = v
+				}
+				for k, v := range rightRow {
+					combined[k] = v
+					if rightAlias != "" {
+						combined[rightAlias+"."+k] = v
+					}
+				}
 				result = append(result, combined)
 				matched = true
 				continue
@@ -6955,6 +7071,16 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 				if !allMatch {
 					continue
 				}
+				combined := make(storage.Row, len(leftRow)+len(rightRow)*2)
+				for k, v := range leftRow {
+					combined[k] = v
+				}
+				for k, v := range rightRow {
+					combined[k] = v
+					if rightAlias != "" {
+						combined[rightAlias+"."+k] = v
+					}
+				}
 				result = append(result, combined)
 				matched = true
 				continue
@@ -6964,6 +7090,16 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 			if isNatural {
 				if len(naturalCols) == 0 {
 					// No common columns = cross join
+					combined := make(storage.Row, len(leftRow)+len(rightRow)*2)
+					for k, v := range leftRow {
+						combined[k] = v
+					}
+					for k, v := range rightRow {
+						combined[k] = v
+						if rightAlias != "" {
+							combined[rightAlias+"."+k] = v
+						}
+					}
 					result = append(result, combined)
 					matched = true
 					continue
@@ -6978,26 +7114,68 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 					}
 				}
 				if allMatch {
+					combined := make(storage.Row, len(leftRow)+len(rightRow)*2)
+					for k, v := range leftRow {
+						combined[k] = v
+					}
+					for k, v := range rightRow {
+						combined[k] = v
+						if rightAlias != "" {
+							combined[rightAlias+"."+k] = v
+						}
+					}
 					result = append(result, combined)
 					matched = true
 				}
 				continue
 			}
 
-			// Evaluate ON condition
+			// Evaluate ON condition using scratch map to avoid allocation
 			if join.Condition != nil && join.Condition.On != nil {
-				match, err := e.evalWhere(join.Condition.On, combined)
+				for k := range scratch {
+					delete(scratch, k)
+				}
+				for k, v := range leftRow {
+					scratch[k] = v
+				}
+				for k, v := range rightRow {
+					scratch[k] = v
+					if rightAlias != "" {
+						scratch[rightAlias+"."+k] = v
+					}
+				}
+				match, err := e.evalWhere(join.Condition.On, scratch)
 				if err != nil {
 					return nil, err
 				}
 				if !match {
 					continue
 				}
+				// Matched: allocate a new row to keep in result
+				combined := make(storage.Row, len(scratch))
+				for k, v := range scratch {
+					combined[k] = v
+				}
+				result = append(result, combined)
+				matched = true
+				continue
+			}
+			// No condition (shouldn't happen for non-cross joins, but handle gracefully)
+			combined := make(storage.Row, len(leftRow)+len(rightRow)*2)
+			for k, v := range leftRow {
+				combined[k] = v
+			}
+			for k, v := range rightRow {
+				combined[k] = v
+				if rightAlias != "" {
+					combined[rightAlias+"."+k] = v
+				}
 			}
 			result = append(result, combined)
 			matched = true
 		}
 
+	leftPad:
 		// LEFT JOIN: include left row with NULLs for right columns when no match
 		if isLeft && !matched {
 			combined := make(storage.Row)
@@ -10452,7 +10630,24 @@ func (e *Executor) showStatus(upper string) (*Result, error) {
 		Name  string
 		Value string
 	}{
+		{Name: "Handler_commit", Value: "0"},
+		{Name: "Handler_delete", Value: "0"},
+		{Name: "Handler_discover", Value: "0"},
+		{Name: "Handler_external_lock", Value: "0"},
+		{Name: "Handler_mrr_init", Value: "0"},
+		{Name: "Handler_prepare", Value: "0"},
+		{Name: "Handler_read_first", Value: "0"},
+		{Name: "Handler_read_key", Value: "0"},
+		{Name: "Handler_read_last", Value: "0"},
+		{Name: "Handler_read_next", Value: "0"},
+		{Name: "Handler_read_prev", Value: "0"},
+		{Name: "Handler_read_rnd", Value: "0"},
+		{Name: "Handler_read_rnd_next", Value: "0"},
+		{Name: "Handler_rollback", Value: "0"},
+		{Name: "Handler_savepoint", Value: "0"},
+		{Name: "Handler_savepoint_rollback", Value: "0"},
 		{Name: "Handler_update", Value: "0"},
+		{Name: "Handler_write", Value: "0"},
 	}
 	rows := make([][]interface{}, 0, len(statusVars))
 	for _, sv := range statusVars {
@@ -13063,11 +13258,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		if count <= 0 || s == nil {
 			return "", nil
 		}
-		str := toString(s)
-		if int64(count)*int64(len(str)) > 67108864 {
-			return nil, nil
-		}
-		return strings.Repeat(str, count), nil
+		return strings.Repeat(toString(s), count), nil
 	case "cast", "convert":
 		// Simplified CAST: just evaluate the inner expression
 		if len(v.Exprs) >= 1 {
@@ -13366,20 +13557,13 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, nil
 		}
 		s := []rune(toString(strVal))
-		targetLen64 := toInt64(lenVal)
-		if targetLen64 < 0 {
-			return nil, nil
-		}
-		if targetLen64 > 67108864 {
-			return nil, nil
-		}
-		targetLen := int(targetLen64)
+		targetLen := int(toInt64(lenVal))
 		padStr := []rune(toString(padVal))
+		if targetLen < 0 || len(padStr) == 0 {
+			return nil, nil
+		}
 		if targetLen <= len(s) {
 			return string(s[:targetLen]), nil
-		}
-		if len(padStr) == 0 {
-			return "", nil
 		}
 		// Need to pad
 		needed := targetLen - len(s)
@@ -13410,20 +13594,13 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, nil
 		}
 		s := []rune(toString(strVal))
-		targetLen64 := toInt64(lenVal)
-		if targetLen64 < 0 {
-			return nil, nil
-		}
-		if targetLen64 > 67108864 {
-			return nil, nil
-		}
-		targetLen := int(targetLen64)
+		targetLen := int(toInt64(lenVal))
 		padStr := []rune(toString(padVal))
+		if targetLen < 0 || len(padStr) == 0 {
+			return nil, nil
+		}
 		if targetLen <= len(s) {
 			return string(s[:targetLen]), nil
-		}
-		if len(padStr) == 0 {
-			return "", nil
 		}
 		needed := targetLen - len(s)
 		var pad []rune
@@ -14361,11 +14538,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if count <= 0 {
 			return "", nil
 		}
-		str := toString(args[0])
-		if int64(count)*int64(len(str)) > 67108864 {
-			return nil, nil
-		}
-		return strings.Repeat(str, count), nil
+		return strings.Repeat(toString(args[0]), count), nil
 	case "concat":
 		args, err := evalArgs()
 		if err != nil {
@@ -15034,20 +15207,13 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			return nil, nil
 		}
 		s := []rune(toString(args[0]))
-		targetLen64 := toInt64(args[1])
-		if targetLen64 < 0 {
-			return nil, nil
-		}
-		if targetLen64 > 67108864 {
-			return nil, nil
-		}
-		targetLen := int(targetLen64)
+		targetLen := int(toInt64(args[1]))
 		padStr := []rune(toString(args[2]))
+		if targetLen < 0 || len(padStr) == 0 {
+			return nil, nil
+		}
 		if targetLen <= len(s) {
 			return string(s[:targetLen]), nil
-		}
-		if len(padStr) == 0 {
-			return "", nil
 		}
 		needed := targetLen - len(s)
 		var pad []rune
@@ -15065,20 +15231,13 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			return nil, nil
 		}
 		s := []rune(toString(args[0]))
-		targetLen64 := toInt64(args[1])
-		if targetLen64 < 0 {
-			return nil, nil
-		}
-		if targetLen64 > 67108864 {
-			return nil, nil
-		}
-		targetLen := int(targetLen64)
+		targetLen := int(toInt64(args[1]))
 		padStr := []rune(toString(args[2]))
+		if targetLen < 0 || len(padStr) == 0 {
+			return nil, nil
+		}
 		if targetLen <= len(s) {
 			return string(s[:targetLen]), nil
-		}
-		if len(padStr) == 0 {
-			return "", nil
 		}
 		needed := targetLen - len(s)
 		var pad []rune
