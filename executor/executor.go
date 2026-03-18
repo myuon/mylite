@@ -2,12 +2,14 @@ package executor
 
 import (
 	"bytes"
+	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"math/big"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -162,6 +164,9 @@ type Executor struct {
 	warnings []Warning
 	// currentQuery holds the current raw SQL text for display-name reconstruction.
 	currentQuery string
+	// onDupValuesRow holds the candidate INSERT row while evaluating
+	// ON DUPLICATE KEY UPDATE expressions (for VALUES(col) support).
+	onDupValuesRow storage.Row
 }
 
 // Warning represents a MySQL warning.
@@ -5230,10 +5235,13 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			if dupIdx >= 0 {
 				// Apply the ON DUPLICATE KEY UPDATE expressions to the existing row.
 				tbl.Lock()
+				prevOnDupValuesRow := e.onDupValuesRow
+				e.onDupValuesRow = row
 				for _, upd := range stmt.OnDup {
 					colName := upd.Name.Name.String()
 					val, err := e.evalExpr(upd.Expr)
 					if err != nil {
+						e.onDupValuesRow = prevOnDupValuesRow
 						tbl.Unlock()
 						return nil, err
 					}
@@ -5255,6 +5263,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					}
 					tbl.Rows[dupIdx][colName] = val
 				}
+				e.onDupValuesRow = prevOnDupValuesRow
 				// Apply ON UPDATE CURRENT_TIMESTAMP for columns with that property
 				for _, col := range tbl.Def.Columns {
 					if col.OnUpdateCurrentTimestamp {
@@ -9799,6 +9808,21 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 		// Return column name as string for use in row lookup
 		return v.Name.String(), nil
+	case *sqlparser.ValuesFuncExpr:
+		// VALUES(col) is used by INSERT ... ON DUPLICATE KEY UPDATE.
+		if e.onDupValuesRow == nil || v.Name == nil {
+			return nil, nil
+		}
+		colName := v.Name.Name.String()
+		if val, ok := e.onDupValuesRow[colName]; ok {
+			return val, nil
+		}
+		for k, val := range e.onDupValuesRow {
+			if strings.EqualFold(k, colName) {
+				return val, nil
+			}
+		}
+		return nil, nil
 	case *sqlparser.Variable:
 		// Handle user variables (@var)
 		if v.Scope == sqlparser.VariableScope {
@@ -10680,6 +10704,32 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			sb.WriteString(toString(val))
 		}
 		return sb.String(), nil
+	case "md5":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("MD5 requires 1 argument")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		sum := md5.Sum([]byte(toString(val)))
+		return hex.EncodeToString(sum[:]), nil
+	case "rand":
+		if len(v.Exprs) == 0 {
+			return rand.Float64(), nil
+		}
+		seedVal, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if seedVal == nil {
+			return rand.Float64(), nil
+		}
+		r := rand.New(rand.NewSource(toInt64(seedVal)))
+		return r.Float64(), nil
 	case "concat_ws":
 		if len(v.Exprs) < 1 {
 			return nil, nil
@@ -12919,6 +12969,29 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			sb.WriteString(toString(a))
 		}
 		return sb.String(), nil
+	case "md5":
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return nil, nil
+		}
+		sum := md5.Sum([]byte(toString(args[0])))
+		return hex.EncodeToString(sum[:]), nil
+	case "rand":
+		if len(v.Exprs) == 0 {
+			return rand.Float64(), nil
+		}
+		args, err := evalArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) < 1 || args[0] == nil {
+			return rand.Float64(), nil
+		}
+		r := rand.New(rand.NewSource(toInt64(args[0])))
+		return r.Float64(), nil
 	case "length", "octet_length":
 		args, err := evalArgs()
 		if err != nil {
