@@ -104,12 +104,21 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		elapsed time.Duration
 	}
 
+	// Limit concurrent suites to avoid resource exhaustion (each suite spawns up to 8 workers)
+	maxConcurrentSuites := runtime.NumCPU()
+	if maxConcurrentSuites > 8 {
+		maxConcurrentSuites = 8
+	}
+	sem := make(chan struct{}, maxConcurrentSuites)
+
 	resultsCh := make(chan suiteResult, len(suiteNames))
 	var wg sync.WaitGroup
 	for _, suite := range suiteNames {
 		wg.Add(1)
 		go func(s string) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			t0 := time.Now()
 			res := runSuite(s, "", suiteRoot, includeRoot, verbose, maxTests, jobs, timeout)
 			resultsCh <- suiteResult{name: s, results: res, elapsed: time.Since(t0)}
