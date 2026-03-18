@@ -155,8 +155,6 @@ type Executor struct {
 	tempTables map[string]bool
 	// globalVars stores SET GLOBAL/SESSION variable overrides.
 	globalVars map[string]string
-	// innodbMetricStatus stores per-metric enabled/disabled status for INNODB_METRICS.
-	innodbMetricStatus map[string]string
 	// views stores view definitions (view name -> SELECT query string).
 	views map[string]string
 	// queryTableDef holds the table definition for the current query context,
@@ -298,30 +296,9 @@ func (e *Executor) initSystemTables() {
 	ensure("information_schema", &catalog.TableDef{
 		Name: "INNODB_TRX",
 		Columns: []catalog.ColumnDef{
-			{Name: "trx_id", Type: "VARCHAR(18)"},
-			{Name: "trx_state", Type: "VARCHAR(13)"},
+			{Name: "trx_id", Type: "VARCHAR(32)"},
+			{Name: "trx_state", Type: "VARCHAR(32)"},
 			{Name: "trx_started", Type: "DATETIME"},
-			{Name: "trx_requested_lock_id", Type: "VARCHAR(105)", Nullable: true},
-			{Name: "trx_wait_started", Type: "DATETIME", Nullable: true},
-			{Name: "trx_weight", Type: "BIGINT(21) UNSIGNED"},
-			{Name: "trx_mysql_thread_id", Type: "BIGINT(21) UNSIGNED"},
-			{Name: "trx_query", Type: "VARCHAR(1024)", Nullable: true},
-			{Name: "trx_operation_state", Type: "VARCHAR(64)", Nullable: true},
-			{Name: "trx_tables_in_use", Type: "BIGINT(21) UNSIGNED"},
-			{Name: "trx_tables_locked", Type: "BIGINT(21) UNSIGNED"},
-			{Name: "trx_lock_structs", Type: "BIGINT(21) UNSIGNED"},
-			{Name: "trx_lock_memory_bytes", Type: "BIGINT(21) UNSIGNED"},
-			{Name: "trx_rows_locked", Type: "BIGINT(21) UNSIGNED"},
-			{Name: "trx_rows_modified", Type: "BIGINT(21) UNSIGNED"},
-			{Name: "trx_concurrency_tickets", Type: "BIGINT(21) UNSIGNED"},
-			{Name: "trx_isolation_level", Type: "VARCHAR(16)"},
-			{Name: "trx_unique_checks", Type: "INT(1)"},
-			{Name: "trx_foreign_key_checks", Type: "INT(1)"},
-			{Name: "trx_last_foreign_key_error", Type: "VARCHAR(256)", Nullable: true},
-			{Name: "trx_adaptive_hash_latched", Type: "INT(1)"},
-			{Name: "trx_adaptive_hash_timeout", Type: "BIGINT(21) UNSIGNED"},
-			{Name: "trx_is_read_only", Type: "INT(1)"},
-			{Name: "trx_autocommit_non_locking", Type: "INT(1)"},
 		},
 	})
 	ensure("information_schema", &catalog.TableDef{
@@ -347,7 +324,6 @@ func (e *Executor) initSystemTables() {
 			{Name: "NAME", Type: "VARCHAR(255)"},
 			{Name: "TABLE_ID", Type: "BIGINT"},
 			{Name: "TYPE", Type: "BIGINT"},
-			{Name: "SPACE", Type: "BIGINT"},
 		},
 	})
 	ensure("information_schema", &catalog.TableDef{
@@ -2556,21 +2532,6 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				} else {
 					e.globalVars[cleanName] = val
 				}
-				// Handle innodb_monitor_enable/disable/reset/reset_all
-				if strings.ToUpper(val) != "DEFAULT" {
-					switch cleanName {
-					case "innodb_monitor_enable":
-						if err := e.innodbMonitorSet(val, "enabled"); err != nil {
-							return nil, err
-						}
-					case "innodb_monitor_disable":
-						e.innodbMonitorSet(val, "disabled") //nolint:errcheck
-					case "innodb_monitor_reset":
-						// Reset just resets counter values (no-op for us since counters are always 0)
-					case "innodb_monitor_reset_all":
-						e.innodbMonitorResetAll(val)
-					}
-				}
 			}
 		}
 	}
@@ -2711,19 +2672,6 @@ func (e *Executor) handleRawSet(raw string) {
 		val = strings.TrimSuffix(val, ";")
 		val = strings.TrimSpace(val)
 		val = strings.Trim(val, "'\"")
-		// Handle innodb_monitor_enable/disable/reset/reset_all
-		if strings.ToUpper(val) != "DEFAULT" {
-			switch varName {
-			case "innodb_monitor_enable":
-				e.innodbMonitorSet(val, "enabled") //nolint:errcheck
-			case "innodb_monitor_disable":
-				e.innodbMonitorSet(val, "disabled") //nolint:errcheck
-			case "innodb_monitor_reset":
-				// no-op: counters are always 0
-			case "innodb_monitor_reset_all":
-				e.innodbMonitorResetAll(val)
-			}
-		}
 		if strings.ToUpper(val) != "DEFAULT" {
 			e.globalVars[varName] = val
 		} else {
@@ -2739,112 +2687,6 @@ func (e *Executor) handleRawSet(raw string) {
 			e.globalVars["character_set_connection"] = charset
 			e.globalVars["character_set_results"] = charset
 		}
-	}
-}
-
-// innodbMonitorSet enables or disables InnoDB metrics matching the given pattern.
-// pattern can be "all", "All", a metric name, or a LIKE pattern with %.
-func (e *Executor) innodbMonitorSet(pattern, status string) error {
-	if e.innodbMetricStatus == nil {
-		e.innodbMetricStatus = make(map[string]string)
-	}
-	pattern = strings.Trim(pattern, "'\"")
-	upper := strings.ToUpper(pattern)
-	if upper == "ALL" {
-		for _, m := range innoDBMetrics {
-			e.innodbMetricStatus[m.name] = status
-		}
-		return nil
-	}
-	// Check if it's a LIKE pattern (contains %)
-	if strings.Contains(pattern, "%") {
-		matched := false
-		for _, m := range innoDBMetrics {
-			if matchLike(m.name, pattern) {
-				e.innodbMetricStatus[m.name] = status
-				matched = true
-			}
-		}
-		if !matched {
-			return mysqlError(1231, "42000", fmt.Sprintf("Variable 'innodb_monitor_%s' can't be set to the value of '%s'",
-				strings.TrimPrefix(status+"_x", "enabled_x"), pattern))
-		}
-		return nil
-	}
-	// Exact match by metric name
-	for _, m := range innoDBMetrics {
-		if strings.EqualFold(m.name, pattern) {
-			e.innodbMetricStatus[m.name] = status
-			return nil
-		}
-	}
-	// Try as module name (module_<subsystem>)
-	lowerPattern := strings.ToLower(pattern)
-	if strings.HasPrefix(lowerPattern, "module_") {
-		moduleSuffix := lowerPattern[7:]
-		// Map MySQL module names to internal subsystem names
-		moduleToSubsystems := map[string][]string{
-			"trx":              {"transaction"},
-			"metadata":         {"metadata"},
-			"lock":             {"lock"},
-			"buffer":           {"buffer"},
-			"buffer_page":      {"buffer_page_io"},
-			"os":               {"os"},
-			"purge":            {"purge"},
-			"compress":         {"compression"},
-			"file":             {"file_system"},
-			"index":            {"index"},
-			"adaptive_hash":    {"adaptive_hash_index"},
-			"ibuf":             {"change_buffer"},
-			"srv":              {"server"},
-			"dml":              {"dml"},
-			"ddl":              {"ddl"},
-			"icp":              {"icp"},
-			"log":              {"recovery"},
-			"cpu":              {"cpu"},
-			"page_track":       {"page_tracking"},
-			"undo":             {"undo"},
-			"sampling":         {"sampling"},
-			"dblwr":            {"dblwr"},
-		}
-		matched := false
-		if subsystems, ok := moduleToSubsystems[moduleSuffix]; ok {
-			for _, m := range innoDBMetrics {
-				for _, sub := range subsystems {
-					if strings.EqualFold(m.subsystem, sub) {
-						e.innodbMetricStatus[m.name] = status
-						matched = true
-					}
-				}
-			}
-		}
-		if matched {
-			return nil
-		}
-	}
-	// Also try as direct subsystem name
-	matched := false
-	for _, m := range innoDBMetrics {
-		if strings.EqualFold(m.subsystem, lowerPattern) {
-			e.innodbMetricStatus[m.name] = status
-			matched = true
-		}
-	}
-	if matched {
-		return nil
-	}
-	varSuffix := "enable"
-	if status == "disabled" {
-		varSuffix = "disable"
-	}
-	return mysqlError(1231, "42000", fmt.Sprintf("Variable 'innodb_monitor_%s' can't be set to the value of '%s'", varSuffix, pattern))
-}
-
-// innodbMonitorResetAll resets count for metrics matching the pattern.
-func (e *Executor) innodbMonitorResetAll(pattern string) {
-	// For now, reset_all just ensures the status map exists (counts are always 0 in mylite)
-	if e.innodbMetricStatus == nil {
-		e.innodbMetricStatus = make(map[string]string)
 	}
 }
 
@@ -9811,10 +9653,6 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 		if col.Default != nil {
 			defVal = *col.Default
 		}
-		// For INFORMATION_SCHEMA tables, MySQL shows empty Default (not NULL)
-		if strings.EqualFold(descDB, "information_schema") && defVal == nil {
-			defVal = ""
-		}
 		var extra interface{}
 		extra = ""
 		if col.AutoIncrement {
@@ -10426,7 +10264,6 @@ func parseTableOptionInt(opt *sqlparser.TableOption) *int {
 	return &v
 }
 
-// mysqlDisplayType returns the MySQL display type with width for SHOW CREATE TABLE.
 // mysqlGeneratedClause formats a generated column clause for SHOW CREATE TABLE.
 // It takes the raw expression string and storage type (virtual/stored) and returns
 // something like: GENERATED ALWAYS AS ((`a` + LENGTH(`d`))) STORED
@@ -10496,7 +10333,7 @@ func mysqlGenExprNode(expr sqlparser.Expr) string {
 			// JSON functions stay lowercase
 			name = strings.ToLower(name)
 		default:
-			// Standard functions: uppercase
+			// Standard functions: preserve original case from parser
 			name = upperName
 		}
 		return name + "(" + strings.Join(args, ",") + ")"
@@ -10562,6 +10399,7 @@ func mysqlGenExprNode(expr sqlparser.Expr) string {
 	}
 }
 
+// mysqlDisplayType returns the MySQL display type with width for SHOW CREATE TABLE.
 func mysqlDisplayType(colType string) string {
 	// Strip generated column clause before processing the base type
 	stripped := colType
@@ -10645,7 +10483,7 @@ func mysqlDisplayType(colType string) string {
 	case "BOOL", "BOOLEAN":
 		return "tinyint(1)"
 	default:
-		return strings.ToLower(stripped)
+		return strings.ToLower(colType)
 	}
 }
 
@@ -10718,7 +10556,7 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		genExpr := generatedColumnExpr(col.Type)
 		isGenerated := genExpr != ""
 		if isGenerated {
-			// Append GENERATED ALWAYS AS (...) VIRTUAL/STORED in MySQL format
+			// Append GENERATED ALWAYS AS (...) VIRTUAL/STORED
 			parts = append(parts, mysqlGeneratedClause(genExpr, col.Type))
 		}
 		if !col.Nullable {
