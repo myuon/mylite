@@ -117,6 +117,7 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		resultLogEnabled: true,
 		sortResult:       false,
 		tmpDir:           tmpDir,
+		ttsBackups:       map[string]tableSnapshot{},
 		variables: map[string]string{
 			"$ENGINE":             "InnoDB",
 			"$MYSQLTEST_VARDIR":   tmpDir,
@@ -262,6 +263,12 @@ type execContext struct {
 	verticalResult   bool           // format next query result as vertical key/value pairs
 	verticalResults  bool           // persistent vertical output mode (--vertical_results)
 	skipped          bool           // set to true when --skip directive is encountered
+	ttsBackups       map[string]tableSnapshot
+}
+
+type tableSnapshot struct {
+	columns []string
+	rows    [][]interface{}
 }
 
 func (ctx *execContext) executeLines(lines []string) error {
@@ -272,7 +279,7 @@ func (ctx *execContext) executeLines(lines []string) error {
 
 		// Skip mysqltest perl blocks entirely.
 		if isPerlBlockStart(trimmed) {
-			i = skipPerlBlock(lines, i)
+			i = ctx.handlePerlBlock(lines, i)
 			continue
 		}
 		// Handle heredoc file directives (write_file / append_file).
@@ -554,7 +561,8 @@ func (ctx *execContext) executeLines(lines []string) error {
 				}
 			}
 			if strings.HasPrefix(bdLower, "query ") ||
-				strings.HasPrefix(bdLower, "query_vertical ") {
+				strings.HasPrefix(bdLower, "query_vertical ") ||
+				strings.HasPrefix(bdLower, "eval ") {
 				if !strings.HasSuffix(strings.TrimSpace(trimmed), ";") {
 					fullDirective := bareDirective
 					i++
@@ -1183,6 +1191,104 @@ func skipPerlBlock(lines []string, i int) int {
 		i++
 	}
 	return i
+}
+
+var (
+	perlBackupRe  = regexp.MustCompile(`(?i)ib_backup_tablespaces\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)`)
+	perlRestoreRe = regexp.MustCompile(`(?i)ib_restore_tablespaces\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)`)
+)
+
+func (ctx *execContext) handlePerlBlock(lines []string, i int) int {
+	j := i + 1
+	for j < len(lines) {
+		t := strings.TrimSpace(lines[j])
+		if strings.EqualFold(t, "EOF") || strings.EqualFold(t, "EOF;") {
+			j++
+			if j < len(lines) && strings.TrimSpace(lines[j]) == ";" {
+				j++
+			}
+			return j
+		}
+		if m := perlBackupRe.FindStringSubmatch(t); m != nil {
+			dbName, tblName := m[1], m[2]
+			ctx.captureTableSnapshot(dbName, tblName)
+			ctx.output.WriteString("backup: " + tblName + "\n")
+		}
+		if m := perlRestoreRe.FindStringSubmatch(t); m != nil {
+			dbName, tblName := m[1], m[2]
+			ctx.restoreTableSnapshot(dbName, tblName)
+			ctx.output.WriteString("restore: " + tblName + " .ibd and .cfg files\n")
+		}
+		j++
+	}
+	return j
+}
+
+func (ctx *execContext) captureTableSnapshot(dbName, tableName string) {
+	query := fmt.Sprintf("SELECT * FROM `%s`.`%s`", dbName, tableName)
+	rows, err := ctx.db.Query(query)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return
+	}
+	snap := tableSnapshot{columns: cols, rows: make([][]interface{}, 0)}
+	for rows.Next() {
+		vals := make([]interface{}, len(cols))
+		ptrs := make([]interface{}, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return
+		}
+		copied := make([]interface{}, len(vals))
+		for i, v := range vals {
+			if bs, ok := v.([]byte); ok {
+				copied[i] = string(bs)
+			} else {
+				copied[i] = v
+			}
+		}
+		snap.rows = append(snap.rows, copied)
+	}
+	ctx.ttsBackups[strings.ToLower(dbName+"."+tableName)] = snap
+}
+
+func (ctx *execContext) restoreTableSnapshot(dbName, tableName string) {
+	key := strings.ToLower(dbName + "." + tableName)
+	snap, ok := ctx.ttsBackups[key]
+	if !ok {
+		return
+	}
+	if _, err := ctx.db.Exec(fmt.Sprintf("DELETE FROM `%s`.`%s`", dbName, tableName)); err != nil {
+		return
+	}
+	if len(snap.columns) == 0 || len(snap.rows) == 0 {
+		return
+	}
+	colParts := make([]string, len(snap.columns))
+	qs := make([]string, len(snap.columns))
+	for i, c := range snap.columns {
+		colParts[i] = fmt.Sprintf("`%s`", c)
+		qs[i] = "?"
+	}
+	insertSQL := fmt.Sprintf(
+		"INSERT INTO `%s`.`%s` (%s) VALUES (%s)",
+		dbName,
+		tableName,
+		strings.Join(colParts, ","),
+		strings.Join(qs, ","),
+	)
+	for _, r := range snap.rows {
+		if _, err := ctx.db.Exec(insertSQL, r...); err != nil {
+			return
+		}
+	}
 }
 
 func isHereDocDirectiveStart(trimmed string) bool {

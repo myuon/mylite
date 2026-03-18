@@ -4921,8 +4921,12 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	// so that strict-mode errors prevent the table from being created.
 	charsetSpecified := false
 	collationSpecified := false
+	tablespaceName := ""
+	hasDataDirectory := false
 	for _, opt := range stmt.TableSpec.Options {
-		switch strings.ToUpper(opt.Name) {
+		optName := strings.ToUpper(strings.TrimSpace(opt.Name))
+		optVal := tableOptionString(opt)
+		switch optName {
 		case "COMMENT":
 			comment := opt.Value.Val
 			if mysqlCharLen(comment) > 2048 {
@@ -4948,7 +4952,14 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			def.StatsPersistent = parseTableOptionInt(opt)
 		case "STATS_AUTO_RECALC":
 			def.StatsAutoRecalc = parseTableOptionInt(opt)
+		case "TABLESPACE":
+			tablespaceName = strings.ToLower(strings.Trim(strings.TrimSpace(optVal), "`'\""))
+		case "DATA DIRECTORY":
+			hasDataDirectory = strings.TrimSpace(optVal) != ""
 		}
+	}
+	if strings.EqualFold(def.Engine, "INNODB") && hasDataDirectory && tablespaceName == "innodb_system" {
+		return nil, mysqlError(1478, "HY000", "Table storage engine 'InnoDB' does not support the create option 'DATA DIRECTORY'")
 	}
 	if hasArrayMVIIndex && def.Engine != "" && !strings.EqualFold(def.Engine, "INNODB") {
 		return nil, mysqlError(1178, "42000", "The storage engine for the table doesn't support check")
@@ -6848,6 +6859,29 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		return nil, err
 	}
 
+	preSortedOrderBy := false
+	// If ORDER BY references base columns that are not projected, pre-sort source rows.
+	if stmt.OrderBy != nil && needsPreProjectionOrderBy(stmt.OrderBy, colNames) {
+		orderCollation := resolveOrderByCollation(selectTableDefs)
+		sort.SliceStable(allRows, func(a, b int) bool {
+			for _, order := range stmt.OrderBy {
+				va := resolveOrderByExprValue(e, order.Expr, allRows[a])
+				vb := resolveOrderByExprValue(e, order.Expr, allRows[b])
+				cmp := compareByCollation(va, vb, orderCollation)
+				if cmp == 0 {
+					continue
+				}
+				asc := order.Direction == sqlparser.AscOrder || order.Direction == 0
+				if asc {
+					return cmp < 0
+				}
+				return cmp > 0
+			}
+			return false
+		})
+		preSortedOrderBy = true
+	}
+
 	resultRows := make([][]interface{}, 0, len(allRows))
 	for _, row := range allRows {
 		resultRow := make([]interface{}, len(colExprs))
@@ -6886,7 +6920,7 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	}
 
 	// Apply ORDER BY
-	if stmt.OrderBy != nil {
+	if stmt.OrderBy != nil && !preSortedOrderBy {
 		resultRows, err = applyOrderBy(stmt.OrderBy, colNames, resultRows, resolveOrderByCollation(selectTableDefs))
 		if err != nil {
 			return nil, err
@@ -9406,6 +9440,14 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		}
 	}
 
+	// SHOW INDEX/INDEXES/KEYS FROM <table>
+	if strings.HasPrefix(upper, "SHOW INDEX ") || strings.HasPrefix(upper, "SHOW INDEXES ") || strings.HasPrefix(upper, "SHOW KEYS ") {
+		showDB, showTable, ok := parseShowIndexTarget(query, e.CurrentDB)
+		if ok {
+			return e.showIndexes(showDB, showTable)
+		}
+	}
+
 	// SHOW VARIABLES / SHOW GLOBAL VARIABLES / SHOW SESSION VARIABLES
 	if strings.HasPrefix(upper, "SHOW VARIABLES") || strings.HasPrefix(upper, "SHOW GLOBAL VARIABLES") ||
 		strings.HasPrefix(upper, "SHOW SESSION VARIABLES") || strings.HasPrefix(upper, "SHOW LOCAL VARIABLES") {
@@ -9462,6 +9504,89 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 	return &Result{
 		Columns:     []string{"Value"},
 		Rows:        [][]interface{}{},
+		IsResultSet: true,
+	}, nil
+}
+
+func parseShowIndexTarget(query, currentDB string) (dbName, tableName string, ok bool) {
+	trimmed := strings.TrimSpace(strings.TrimRight(query, ";"))
+	fields := strings.Fields(trimmed)
+	if len(fields) < 4 {
+		return "", "", false
+	}
+	// SHOW INDEX|INDEXES|KEYS FROM|IN <table> ...
+	if !strings.EqualFold(fields[0], "show") {
+		return "", "", false
+	}
+	if !(strings.EqualFold(fields[1], "index") || strings.EqualFold(fields[1], "indexes") || strings.EqualFold(fields[1], "keys")) {
+		return "", "", false
+	}
+	if !(strings.EqualFold(fields[2], "from") || strings.EqualFold(fields[2], "in")) {
+		return "", "", false
+	}
+	target := strings.Trim(fields[3], "`")
+	target = strings.TrimRight(target, ",")
+	dbName = currentDB
+	tableName = target
+	if dot := strings.Index(target, "."); dot >= 0 {
+		dbName = strings.Trim(target[:dot], "`")
+		tableName = strings.Trim(target[dot+1:], "`")
+	}
+	if dbName == "" || tableName == "" {
+		return "", "", false
+	}
+	return dbName, tableName, true
+}
+
+func (e *Executor) showIndexes(dbName, tableName string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
+	}
+	if _, resolvedTableName, err := findTableDefCaseInsensitive(db, tableName); err == nil {
+		tableName = resolvedTableName
+	} else {
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", dbName, tableName))
+	}
+
+	rows := make([][]interface{}, 0)
+	for _, r := range e.infoSchemaStatistics() {
+		if !strings.EqualFold(toString(r["TABLE_SCHEMA"]), dbName) || !strings.EqualFold(toString(r["TABLE_NAME"]), tableName) {
+			continue
+		}
+		rows = append(rows, []interface{}{
+			r["TABLE_NAME"],    // Table
+			r["NON_UNIQUE"],    // Non_unique
+			r["INDEX_NAME"],    // Key_name
+			r["SEQ_IN_INDEX"],  // Seq_in_index
+			r["COLUMN_NAME"],   // Column_name
+			r["COLLATION"],     // Collation
+			r["CARDINALITY"],   // Cardinality
+			r["SUB_PART"],      // Sub_part
+			r["PACKED"],        // Packed
+			r["NULLABLE"],      // Null
+			r["INDEX_TYPE"],    // Index_type
+			r["COMMENT"],       // Comment
+			r["INDEX_COMMENT"], // Index_comment
+			r["IS_VISIBLE"],    // Visible
+			r["EXPRESSION"],    // Expression
+		})
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		ki := toString(rows[i][2])
+		kj := toString(rows[j][2])
+		if ki != kj {
+			return strings.ToLower(ki) < strings.ToLower(kj)
+		}
+		return toInt64(rows[i][3]) < toInt64(rows[j][3])
+	})
+	return &Result{
+		Columns: []string{
+			"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name",
+			"Collation", "Cardinality", "Sub_part", "Packed", "Null",
+			"Index_type", "Comment", "Index_comment", "Visible", "Expression",
+		},
+		Rows:        rows,
 		IsResultSet: true,
 	}, nil
 }
@@ -15643,6 +15768,46 @@ func applyOrderBy(orderBy sqlparser.OrderBy, colNames []string, rows [][]interfa
 		return false
 	})
 	return rows, nil
+}
+
+func needsPreProjectionOrderBy(orderBy sqlparser.OrderBy, colNames []string) bool {
+	for _, order := range orderBy {
+		col, ok := order.Expr.(*sqlparser.ColName)
+		if !ok || col == nil {
+			continue
+		}
+		name := strings.Trim(col.Name.String(), "`")
+		found := false
+		for _, c := range colNames {
+			if strings.EqualFold(c, name) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveOrderByExprValue(e *Executor, expr sqlparser.Expr, row storage.Row) interface{} {
+	if col, ok := expr.(*sqlparser.ColName); ok && col != nil {
+		name := strings.Trim(col.Name.String(), "`")
+		if v, ok := row[name]; ok {
+			return v
+		}
+		for k, v := range row {
+			if strings.EqualFold(k, name) {
+				return v
+			}
+			if dot := strings.LastIndex(k, "."); dot >= 0 && strings.EqualFold(k[dot+1:], name) {
+				return v
+			}
+		}
+	}
+	val, _ := e.evalRowExpr(expr, row)
+	return val
 }
 
 func applyOrderByWithTypeHints(orderBy sqlparser.OrderBy, colNames []string, rows [][]interface{}, collation string, numericCols map[int]bool) ([][]interface{}, error) {
