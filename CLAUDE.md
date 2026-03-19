@@ -22,6 +22,7 @@ go run ./cmd/mtrrun
 ## エージェントの活用
 
 - 作業は適宜Agentに振って作業すること。その際`isolation: "worktree"`を指定することで作業が競合しないようにすると良い。
+- 複数のステップからなるタスクは競合しない場所を見つけてworktreeで環境を隔離して並列化すること。
 - エージェントの成果はworktreeに残るので、`/usr/bin/diff -u` でパッチを取得し `patch -p0` でmainに適用する。
 - 適用後は必ず `go build ./...` と `go test ./... -count=1 -timeout 60s` で検証する。
 
