@@ -2181,12 +2181,6 @@ func extractRawSelectExprs(query string) []string {
 		return nil
 	}
 	start := len("select ")
-	// Skip DISTINCT keyword so column names don't include it
-	rest := strings.TrimSpace(q[start:])
-	restLower := strings.ToLower(rest)
-	if strings.HasPrefix(restLower, "distinct ") {
-		start = len(q) - len(rest) + len("distinct ")
-	}
 	inQuote := byte(0)
 	parenDepth := 0
 	end := len(q)
@@ -11082,10 +11076,10 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 		var defVal interface{}
 		if col.Default != nil {
 			defVal = *col.Default
-		} else if !isInfoSchemaTable(descDB) {
-			defVal = nil // NULL for columns without explicit default (user tables)
+		} else if col.Nullable && !isInfoSchemaTable(descDB) {
+			defVal = nil // NULL for nullable columns without explicit default (user tables)
 		} else {
-			defVal = "" // empty for INFORMATION_SCHEMA columns
+			defVal = "" // empty for NOT NULL or INFORMATION_SCHEMA columns
 		}
 		var extra interface{}
 		extra = ""
@@ -11908,7 +11902,7 @@ func mysqlDisplayType(colType string) string {
 		return "int(11)" + suffix
 	case "BIGINT":
 		if isUnsigned {
-			return "bigint(21)" + suffix
+			return "bigint(20)" + suffix
 		}
 		return "bigint(20)" + suffix
 	case "FLOAT":
@@ -12091,11 +12085,9 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	displayIndexes := make([]catalog.IndexDef, len(def.Indexes))
 	copy(displayIndexes, def.Indexes)
 	sort.SliceStable(displayIndexes, func(i, j int) bool {
-		// MySQL orders UNIQUE indexes before non-unique indexes in SHOW CREATE TABLE
-		if displayIndexes[i].Unique != displayIndexes[j].Unique {
-			return displayIndexes[i].Unique
-		}
-		return false
+		left := isClusterPreferredUniqueIndex(displayIndexes[i], def.Columns)
+		right := isClusterPreferredUniqueIndex(displayIndexes[j], def.Columns)
+		return left && !right
 	})
 	for i, idx := range displayIndexes {
 		quotedCols := make([]string, len(idx.Columns))
@@ -17640,13 +17632,39 @@ func compareByCollation(a, b interface{}, collation string) int {
 	aIsStr := isStringValue(a)
 	bIsStr := isStringValue(b)
 	if aIsStr || bIsStr {
-		sa := normalizeCollationKey(toString(a), collation)
-		sb := normalizeCollationKey(toString(b), collation)
+		aStr := toString(a)
+		bStr := toString(b)
+		sa := normalizeCollationKey(aStr, collation)
+		sb := normalizeCollationKey(bStr, collation)
 		if sa < sb {
 			return -1
 		}
 		if sa > sb {
 			return 1
+		}
+		// Tie-break: for case-insensitive collations (like utf8mb4_0900_ai_ci),
+		// uppercase letters sort before lowercase in MySQL.
+		// Use native charset encoding for tie-break to match MySQL byte ordering.
+		coll := strings.ToLower(collation)
+		if strings.HasSuffix(coll, "_ci") {
+			var aTie, bTie string
+			switch coll {
+			case "sjis_japanese_ci", "cp932_japanese_ci":
+				aTie = encodeStringForCollation(aStr, "sjis")
+				bTie = encodeStringForCollation(bStr, "sjis")
+			case "ujis_japanese_ci", "eucjpms_japanese_ci":
+				aTie = encodeStringForCollation(aStr, "eucjp")
+				bTie = encodeStringForCollation(bStr, "eucjp")
+			default:
+				aTie = aStr
+				bTie = bStr
+			}
+			if aTie < bTie {
+				return -1
+			}
+			if aTie > bTie {
+				return 1
+			}
 		}
 		return 0
 	}
