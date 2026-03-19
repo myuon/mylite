@@ -182,6 +182,9 @@ type Executor struct {
 	executeDepth int
 	// sqlParser is a cached SQL parser instance to avoid allocation on every query.
 	sqlParser *sqlparser.Parser
+	// lastFoundRows stores the row count from the last SELECT before LIMIT was applied.
+	// Used by the FOUND_ROWS() function.
+	lastFoundRows int64
 }
 
 // Warning represents a MySQL warning.
@@ -8385,6 +8388,9 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		}
 	}
 
+	// Track row count before LIMIT for FOUND_ROWS()
+	e.lastFoundRows = int64(len(resultRows))
+
 	// Apply LIMIT
 	if stmt.Limit != nil {
 		resultRows, err = applyLimit(stmt.Limit, resultRows)
@@ -8746,6 +8752,9 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 			return nil, err
 		}
 	}
+
+	// Track row count before LIMIT for FOUND_ROWS()
+	e.lastFoundRows = int64(len(resultRows))
 
 	// Apply LIMIT
 	if stmt.Limit != nil {
@@ -9366,6 +9375,9 @@ func (e *Executor) execUnion(stmt *sqlparser.Union) (*Result, error) {
 			return nil, err
 		}
 	}
+
+	// Track row count before LIMIT for FOUND_ROWS()
+	e.lastFoundRows = int64(len(allRows))
 
 	// Apply LIMIT
 	if stmt.Limit != nil {
@@ -12941,6 +12953,44 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case sqlparser.ValTuple:
 		// A row constructor (tuple) used in a scalar context is an error in MySQL
 		return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain 1 column(s)"))
+	case *sqlparser.WeightStringFuncExpr:
+		// WEIGHT_STRING(str [AS CHAR(n)|BINARY(n)])
+		val, err := e.evalExpr(v.Expr)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		s := toString(val)
+		// If AS BINARY(n) is specified, pad/truncate to n bytes
+		if v.As != nil {
+			typeName := strings.ToUpper(v.As.Type)
+			n := 0
+			if v.As.Length != nil {
+				n = *v.As.Length
+			}
+			if typeName == "BINARY" && n > 0 {
+				bs := []byte(s)
+				if len(bs) > n {
+					bs = bs[:n]
+				} else {
+					for len(bs) < n {
+						bs = append(bs, 0)
+					}
+				}
+				return string(bs), nil
+			}
+			if (typeName == "CHAR" || typeName == "VARCHAR") && n > 0 {
+				runes := []rune(s)
+				if len(runes) > n {
+					runes = runes[:n]
+				}
+				s = string(runes)
+			}
+		}
+		// Return raw bytes as the weight string
+		return s, nil
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
 }
@@ -14592,6 +14642,82 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, nil
 		}
 		return result, nil
+	case "current_user":
+		return "root@localhost", nil
+	case "connection_id":
+		return int64(1), nil
+	case "found_rows":
+		return e.lastFoundRows, nil
+	case "collation":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		// Check if argument is CONVERT(x USING charset)
+		if cue, ok := v.Exprs[0].(*sqlparser.ConvertUsingExpr); ok {
+			cs := strings.ToLower(cue.Type)
+			switch cs {
+			case "utf8", "utf8mb3":
+				return "utf8mb3_general_ci", nil
+			case "utf8mb4":
+				return "utf8mb4_0900_ai_ci", nil
+			case "latin1":
+				return "latin1_swedish_ci", nil
+			case "binary":
+				return "binary", nil
+			default:
+				return cs + "_general_ci", nil
+			}
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return "binary", nil
+		}
+		// Check column charset via column reference
+		if colName, ok := v.Exprs[0].(*sqlparser.ColName); ok {
+			cs := e.getColumnCharset(colName)
+			if cs != "" {
+				switch cs {
+				case "utf8", "utf8mb3":
+					return "utf8mb3_general_ci", nil
+				case "utf8mb4":
+					return "utf8mb4_0900_ai_ci", nil
+				case "latin1":
+					return "latin1_swedish_ci", nil
+				case "binary":
+					return "binary", nil
+				default:
+					return cs + "_general_ci", nil
+				}
+			}
+		}
+		return "utf8mb4_0900_ai_ci", nil
+	case "bit_length":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("BIT_LENGTH requires 1 argument")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		return int64(len(toString(val))) * 8, nil
+	case "soundex":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("SOUNDEX requires 1 argument")
+		}
+		val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		return soundex(toString(val)), nil
 	}
 	// Try user-defined function from catalog
 	if result, err := e.callUserDefinedFunction(name, v.Exprs, nil); err == nil {
@@ -17353,6 +17479,59 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 		return !re.MatchString(value), nil
 	}
 	return false, fmt.Errorf("unsupported comparison operator: %s", op.ToString())
+}
+
+// soundex implements the MySQL SOUNDEX() function.
+// It returns a 4-character Soundex code for the input string.
+func soundex(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	// Map of letters to soundex digits
+	code := map[byte]byte{
+		'B': '1', 'F': '1', 'P': '1', 'V': '1',
+		'C': '2', 'G': '2', 'J': '2', 'K': '2', 'Q': '2', 'S': '2', 'X': '2', 'Z': '2',
+		'D': '3', 'T': '3',
+		'L': '4',
+		'M': '5', 'N': '5',
+		'R': '6',
+	}
+	upper := strings.ToUpper(s)
+	var result []byte
+	// Find first letter
+	firstIdx := -1
+	for i := 0; i < len(upper); i++ {
+		if upper[i] >= 'A' && upper[i] <= 'Z' {
+			firstIdx = i
+			break
+		}
+	}
+	if firstIdx < 0 {
+		return "0000"
+	}
+	result = append(result, upper[firstIdx])
+	lastCode := code[upper[firstIdx]]
+	for i := firstIdx + 1; i < len(upper) && len(result) < 4; i++ {
+		c := upper[i]
+		if c < 'A' || c > 'Z' {
+			lastCode = 0
+			continue
+		}
+		if d, ok := code[c]; ok {
+			if d != lastCode {
+				result = append(result, d)
+				lastCode = d
+			}
+		} else {
+			// A, E, I, O, U, H, W, Y — not coded but reset adjacency
+			lastCode = 0
+		}
+	}
+	for len(result) < 4 {
+		result = append(result, '0')
+	}
+	return string(result)
 }
 
 // likeToRegexp converts a SQL LIKE pattern to a Go regexp.
