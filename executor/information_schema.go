@@ -126,6 +126,96 @@ var infoSchemaColumnOrder = map[string][]string{
 	"column_privileges":                {"GRANTEE", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "PRIVILEGE_TYPE", "IS_GRANTABLE"},
 	"routines":                         {"SPECIFIC_NAME", "ROUTINE_CATALOG", "ROUTINE_SCHEMA", "ROUTINE_NAME", "ROUTINE_TYPE", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH", "CHARACTER_OCTET_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE", "DATETIME_PRECISION", "CHARACTER_SET_NAME", "COLLATION_NAME", "DTD_IDENTIFIER", "ROUTINE_BODY", "ROUTINE_DEFINITION", "EXTERNAL_NAME", "EXTERNAL_LANGUAGE", "PARAMETER_STYLE", "IS_DETERMINISTIC", "SQL_DATA_ACCESS", "SQL_PATH", "SECURITY_TYPE", "CREATED", "LAST_ALTERED", "SQL_MODE", "ROUTINE_COMMENT", "DEFINER", "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION", "DATABASE_COLLATION"},
 	"views":                            {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "VIEW_DEFINITION", "CHECK_OPTION", "IS_UPDATABLE", "DEFINER", "SECURITY_TYPE", "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION"},
+	// performance_schema stub tables
+	"accounts":                         {"USER", "HOST", "CURRENT_CONNECTIONS", "TOTAL_CONNECTIONS"},
+	"users":                            {"USER", "CURRENT_CONNECTIONS", "TOTAL_CONNECTIONS"},
+	"hosts":                            {"HOST", "CURRENT_CONNECTIONS", "TOTAL_CONNECTIONS"},
+	"setup_objects":                    {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "ENABLED", "TIMED"},
+	"setup_instruments":                {"NAME", "ENABLED", "TIMED", "PROPERTIES", "FLAGS", "VOLATILITY", "DOCUMENTATION"},
+	"setup_threads":                    {"NAME", "ENABLED", "HISTORY", "PROPERTIES", "VOLATILITY", "DOCUMENTATION"},
+	"persisted_variables":              {"VARIABLE_NAME", "VARIABLE_VALUE"},
+	"variables_info":                   {"VARIABLE_NAME", "VARIABLE_SOURCE", "VARIABLE_PATH", "MIN_VALUE", "MAX_VALUE", "SET_TIME", "SET_USER", "SET_HOST"},
+	"variables_by_thread":              {"THREAD_ID", "VARIABLE_NAME", "VARIABLE_VALUE"},
+	"mutex_instances":                  {"NAME", "OBJECT_INSTANCE_BEGIN", "LOCKED_BY_THREAD_ID"},
+	"rwlock_instances":                 {"NAME", "OBJECT_INSTANCE_BEGIN", "WRITE_LOCKED_BY_THREAD_ID", "READ_LOCKED_BY_COUNT"},
+	"cond_instances":                   {"NAME", "OBJECT_INSTANCE_BEGIN"},
+	"file_instances":                   {"FILE_NAME", "EVENT_NAME", "OPEN_COUNT"},
+	"file_summary_by_instance":         {"FILE_NAME", "EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "COUNT_STAR", "SUM_TIMER_WAIT"},
+	"socket_instances":                 {"EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "THREAD_ID", "SOCKET_ID", "IP", "PORT", "STATE"},
+	"socket_summary_by_event_name":     {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"socket_summary_by_instance":       {"EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "COUNT_STAR", "SUM_TIMER_WAIT"},
+	"table_handles":                    {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "OBJECT_INSTANCE_BEGIN", "OWNER_THREAD_ID", "OWNER_EVENT_ID", "INTERNAL_LOCK", "EXTERNAL_LOCK"},
+	"table_io_waits_summary_by_table":  {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "COUNT_READ", "COUNT_WRITE", "COUNT_FETCH", "COUNT_INSERT", "COUNT_UPDATE", "COUNT_DELETE"},
+	"table_io_waits_summary_by_index_usage": {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "INDEX_NAME", "COUNT_STAR", "SUM_TIMER_WAIT"},
+	"table_lock_waits_summary_by_table": {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT"},
+	"events_waits_history":             {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SPINS", "OBJECT_SCHEMA", "OBJECT_NAME", "INDEX_NAME", "OBJECT_TYPE", "OBJECT_INSTANCE_BEGIN", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE", "OPERATION", "NUMBER_OF_BYTES", "FLAGS"},
+	"events_stages_current":            {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "WORK_COMPLETED", "WORK_ESTIMATED", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
+	"events_stages_history":            {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "WORK_COMPLETED", "WORK_ESTIMATED", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
+	"events_statements_current":        {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SQL_TEXT", "DIGEST", "DIGEST_TEXT", "CURRENT_SCHEMA", "ROWS_AFFECTED", "ROWS_SENT", "ROWS_EXAMINED", "CREATED_TMP_DISK_TABLES", "CREATED_TMP_TABLES", "ERRORS", "WARNINGS", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
+	"events_statements_history":        {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SQL_TEXT", "DIGEST", "DIGEST_TEXT"},
+	"events_transactions_current":      {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "STATE", "TRX_ID", "GTID", "XID_FORMAT_ID", "XID_GTRID", "XID_BQUAL", "XA_STATE", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "ACCESS_MODE", "ISOLATION_LEVEL", "AUTOCOMMIT", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
+	"events_transactions_history":      {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "STATE", "TRX_ID", "GTID", "XID_FORMAT_ID", "XID_GTRID", "XID_BQUAL", "XA_STATE", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "ACCESS_MODE", "ISOLATION_LEVEL", "AUTOCOMMIT", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
+	"events_transactions_history_long": {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "STATE", "TRX_ID", "GTID", "XID_FORMAT_ID", "XID_GTRID", "XID_BQUAL", "XA_STATE", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "ACCESS_MODE", "ISOLATION_LEVEL", "AUTOCOMMIT", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
+	"events_waits_summary_by_account_by_event_name":  {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_waits_summary_by_host_by_event_name":     {"HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_waits_summary_by_instance":               {"EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_waits_summary_by_thread_by_event_name":   {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_waits_summary_by_user_by_event_name":     {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_waits_summary_global_by_event_name":      {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_stages_summary_by_account_by_event_name": {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_stages_summary_by_host_by_event_name":    {"HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_stages_summary_by_thread_by_event_name":  {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_stages_summary_by_user_by_event_name":    {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_stages_summary_global_by_event_name":     {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_statements_summary_by_account_by_event_name": {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED"},
+	"events_statements_summary_by_digest":           {"SCHEMA_NAME", "DIGEST", "DIGEST_TEXT", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "FIRST_SEEN", "LAST_SEEN"},
+	"events_statements_summary_by_host_by_event_name":   {"HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED"},
+	"events_statements_summary_by_thread_by_event_name": {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED"},
+	"events_statements_summary_by_user_by_event_name":   {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED"},
+	"events_statements_summary_global_by_event_name":    {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED"},
+	"events_statements_histogram_by_digest":  {"SCHEMA_NAME", "DIGEST", "BUCKET_NUMBER", "BUCKET_TIMER_LOW", "BUCKET_TIMER_HIGH", "COUNT_BUCKET", "COUNT_BUCKET_AND_LOWER", "BUCKET_QUANTILE"},
+	"events_statements_histogram_global":     {"BUCKET_NUMBER", "BUCKET_TIMER_LOW", "BUCKET_TIMER_HIGH", "COUNT_BUCKET", "COUNT_BUCKET_AND_LOWER", "BUCKET_QUANTILE"},
+	"events_transactions_summary_by_account_by_event_name": {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_transactions_summary_by_host_by_event_name":    {"HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_transactions_summary_by_thread_by_event_name":  {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_transactions_summary_by_user_by_event_name":    {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_transactions_summary_global_by_event_name":     {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_errors_summary_by_account_by_error": {"USER", "HOST", "ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
+	"events_errors_summary_by_host_by_error":    {"HOST", "ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
+	"events_errors_summary_by_thread_by_error":  {"THREAD_ID", "ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
+	"events_errors_summary_by_user_by_error":    {"USER", "ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
+	"events_errors_summary_global_by_error":     {"ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
+	"memory_summary_by_account_by_event_name":   {"USER", "HOST", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "CURRENT_COUNT_USED", "CURRENT_NUMBER_OF_BYTES_USED"},
+	"memory_summary_by_host_by_event_name":      {"HOST", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "CURRENT_COUNT_USED", "CURRENT_NUMBER_OF_BYTES_USED"},
+	"memory_summary_by_thread_by_event_name":    {"THREAD_ID", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "CURRENT_COUNT_USED", "CURRENT_NUMBER_OF_BYTES_USED"},
+	"memory_summary_by_user_by_event_name":      {"USER", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "CURRENT_COUNT_USED", "CURRENT_NUMBER_OF_BYTES_USED"},
+	"status_by_account":                {"USER", "HOST", "VARIABLE_NAME", "VARIABLE_VALUE"},
+	"status_by_host":                   {"HOST", "VARIABLE_NAME", "VARIABLE_VALUE"},
+	"status_by_thread":                 {"THREAD_ID", "VARIABLE_NAME", "VARIABLE_VALUE"},
+	"status_by_user":                   {"USER", "VARIABLE_NAME", "VARIABLE_VALUE"},
+	"replication_connection_configuration": {"CHANNEL_NAME", "HOST", "PORT", "USER", "NETWORK_INTERFACE", "AUTO_POSITION", "SSL_ALLOWED", "SSL_CA_FILE", "SSL_CA_PATH", "SSL_CERTIFICATE", "SSL_CIPHER", "SSL_KEY"},
+	"replication_connection_status":    {"CHANNEL_NAME", "GROUP_NAME", "SOURCE_UUID", "THREAD_ID", "SERVICE_STATE"},
+	"replication_applier_configuration": {"CHANNEL_NAME", "DESIRED_DELAY"},
+	"replication_applier_status":       {"CHANNEL_NAME", "SERVICE_STATE", "REMAINING_DELAY", "COUNT_TRANSACTIONS_RETRIES"},
+	"replication_applier_status_by_coordinator": {"CHANNEL_NAME", "THREAD_ID", "SERVICE_STATE"},
+	"replication_applier_status_by_worker": {"CHANNEL_NAME", "WORKER_ID", "THREAD_ID", "SERVICE_STATE"},
+	"replication_applier_filters":      {"CHANNEL_NAME", "FILTER_NAME", "FILTER_RULE", "CONFIGURED_BY", "ACTIVE_SINCE"},
+	"replication_applier_global_filters": {"FILTER_NAME", "FILTER_RULE", "CONFIGURED_BY", "ACTIVE_SINCE"},
+	"replication_group_members":        {"CHANNEL_NAME", "MEMBER_ID", "MEMBER_HOST", "MEMBER_PORT", "MEMBER_STATE", "MEMBER_ROLE", "MEMBER_VERSION", "MEMBER_COMMUNICATION_STACK"},
+	"replication_group_member_stats":   {"CHANNEL_NAME", "VIEW_ID", "MEMBER_ID", "COUNT_TRANSACTIONS_IN_QUEUE", "COUNT_TRANSACTIONS_CHECKED", "COUNT_CONFLICTS_DETECTED", "COUNT_TRANSACTIONS_ROWS_VALIDATING"},
+	"keyring_keys":                     {"KEY_ID", "KEY_OWNER", "BACKEND_KEY_ID"},
+	"host_cache":                       {"IP", "HOST", "HOST_VALIDATED", "SUM_CONNECT_ERRORS", "COUNT_HOST_BLOCKED_ERRORS", "COUNT_NAMEINFO_TRANSIENT_ERRORS", "COUNT_NAMEINFO_PERMANENT_ERRORS", "COUNT_FORMAT_ERRORS", "COUNT_ADDRINFO_TRANSIENT_ERRORS", "COUNT_ADDRINFO_PERMANENT_ERRORS", "COUNT_FCRDNS_ERRORS", "COUNT_HOST_ACL_ERRORS", "COUNT_NO_AUTH_PLUGIN_ERRORS", "COUNT_AUTH_PLUGIN_ERRORS", "COUNT_HANDSHAKE_ERRORS", "COUNT_PROXY_USER_ERRORS", "COUNT_PROXY_USER_ACL_ERRORS", "COUNT_AUTHENTICATION_ERRORS", "COUNT_SSL_ERRORS", "COUNT_MAX_USER_CONNECTIONS_ERRORS", "COUNT_MAX_USER_CONNECTIONS_PER_HOUR_ERRORS", "COUNT_DEFAULT_DATABASE_ERRORS", "COUNT_INIT_CONNECT_ERRORS", "COUNT_LOCAL_ERRORS", "COUNT_UNKNOWN_ERRORS", "FIRST_SEEN", "LAST_SEEN", "FIRST_ERROR_SEEN", "LAST_ERROR_SEEN"},
+	"log_status":                       {"SERVER_UUID", "LOCAL", "REPLICATION", "STORAGE_ENGINES"},
+	"objects_summary_global_by_type":   {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT"},
+	"prepared_statements_instances":    {"OBJECT_INSTANCE_BEGIN", "STATEMENT_ID", "STATEMENT_NAME", "SQL_TEXT", "OWNER_THREAD_ID", "OWNER_EVENT_ID", "OWNER_OBJECT_TYPE", "OWNER_OBJECT_SCHEMA", "OWNER_OBJECT_NAME", "COUNT_REPREPARE", "COUNT_EXECUTE", "SUM_TIMER_EXECUTE"},
+	"user_defined_functions":           {"UDF_NAME", "UDF_RETURN_TYPE", "UDF_TYPE", "UDF_LIBRARY", "UDF_USAGE_COUNT"},
+	"user_variables_by_thread":         {"THREAD_ID", "VARIABLE_NAME", "VARIABLE_VALUE"},
+	"session_connect_attrs":            {"PROCESSLIST_ID", "ATTR_NAME", "ATTR_VALUE", "ORDINAL_POSITION"},
+	"session_account_connect_attrs":    {"PROCESSLIST_ID", "ATTR_NAME", "ATTR_VALUE", "ORDINAL_POSITION"},
+	"metadata_locks":                   {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COLUMN_NAME", "OBJECT_INSTANCE_BEGIN", "LOCK_TYPE", "LOCK_DURATION", "LOCK_STATUS", "SOURCE", "OWNER_THREAD_ID", "OWNER_EVENT_ID"},
+	"data_locks":                       {"ENGINE", "ENGINE_LOCK_ID", "ENGINE_TRANSACTION_ID", "THREAD_ID", "EVENT_ID", "OBJECT_SCHEMA", "OBJECT_NAME", "PARTITION_NAME", "SUBPARTITION_NAME", "INDEX_NAME", "OBJECT_INSTANCE_BEGIN", "LOCK_TYPE", "LOCK_MODE", "LOCK_STATUS", "LOCK_DATA"},
+	"setup_consumers":                  {"NAME", "ENABLED"},
+	"data_lock_waits":                  {"ENGINE", "REQUESTING_ENGINE_LOCK_ID", "REQUESTING_ENGINE_TRANSACTION_ID", "REQUESTING_THREAD_ID", "REQUESTING_EVENT_ID", "REQUESTING_OBJECT_INSTANCE_BEGIN", "BLOCKING_ENGINE_LOCK_ID", "BLOCKING_ENGINE_TRANSACTION_ID", "BLOCKING_THREAD_ID", "BLOCKING_EVENT_ID", "BLOCKING_OBJECT_INSTANCE_BEGIN"},
 }
 
 // isInformationSchemaTable returns (dbName, tableName, true) when the provided
@@ -155,11 +245,67 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 		switch t {
 		case "memory_summary_global_by_event_name",
 			"global_variables", "session_variables",
-			"events_waits_history_long", "events_waits_current",
+			"events_waits_history_long", "events_waits_current", "events_waits_history",
 			"events_statements_history_long", "events_stages_history_long",
+			"events_statements_current", "events_statements_history",
+			"events_stages_current", "events_stages_history",
+			"events_transactions_current", "events_transactions_history", "events_transactions_history_long",
 			"performance_timers", "threads",
 			"session_connect_attrs", "session_account_connect_attrs",
-			"metadata_locks", "data_locks", "data_lock_waits":
+			"metadata_locks", "data_locks", "data_lock_waits",
+			"accounts", "users", "hosts",
+			"setup_actors", "setup_objects", "setup_instruments", "setup_threads",
+			"persisted_variables", "variables_info", "variables_by_thread",
+			"mutex_instances", "rwlock_instances", "cond_instances",
+			"file_instances", "file_summary_by_instance",
+			"socket_instances", "socket_summary_by_event_name", "socket_summary_by_instance",
+			"table_handles",
+			"table_io_waits_summary_by_table", "table_io_waits_summary_by_index_usage",
+			"table_lock_waits_summary_by_table",
+			"events_waits_summary_by_account_by_event_name",
+			"events_waits_summary_by_host_by_event_name",
+			"events_waits_summary_by_instance",
+			"events_waits_summary_by_thread_by_event_name",
+			"events_waits_summary_by_user_by_event_name",
+			"events_waits_summary_global_by_event_name",
+			"events_stages_summary_by_account_by_event_name",
+			"events_stages_summary_by_host_by_event_name",
+			"events_stages_summary_by_thread_by_event_name",
+			"events_stages_summary_by_user_by_event_name",
+			"events_stages_summary_global_by_event_name",
+			"events_statements_summary_by_account_by_event_name",
+			"events_statements_summary_by_digest",
+			"events_statements_summary_by_host_by_event_name",
+			"events_statements_summary_by_thread_by_event_name",
+			"events_statements_summary_by_user_by_event_name",
+			"events_statements_summary_global_by_event_name",
+			"events_statements_histogram_by_digest",
+			"events_statements_histogram_global",
+			"events_transactions_summary_by_account_by_event_name",
+			"events_transactions_summary_by_host_by_event_name",
+			"events_transactions_summary_by_thread_by_event_name",
+			"events_transactions_summary_by_user_by_event_name",
+			"events_transactions_summary_global_by_event_name",
+			"events_errors_summary_by_account_by_error",
+			"events_errors_summary_by_host_by_error",
+			"events_errors_summary_by_thread_by_error",
+			"events_errors_summary_by_user_by_error",
+			"events_errors_summary_global_by_error",
+			"memory_summary_by_account_by_event_name",
+			"memory_summary_by_host_by_event_name",
+			"memory_summary_by_thread_by_event_name",
+			"memory_summary_by_user_by_event_name",
+			"status_by_account", "status_by_host", "status_by_thread", "status_by_user",
+			"replication_connection_configuration", "replication_connection_status",
+			"replication_applier_configuration", "replication_applier_status",
+			"replication_applier_status_by_coordinator", "replication_applier_status_by_worker",
+			"replication_applier_filters", "replication_applier_global_filters",
+			"replication_group_members", "replication_group_member_stats",
+			"keyring_keys", "host_cache", "log_status",
+			"objects_summary_global_by_type",
+			"prepared_statements_instances",
+			"user_defined_functions", "user_variables_by_thread",
+			"setup_consumers":
 			return true
 		}
 		// For any other performance_schema table, check if it exists in the catalog.
@@ -285,6 +431,149 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.infoSchemaRoutines()
 	case "views":
 		rawRows = e.infoSchemaViews()
+	// performance_schema stub tables – return empty result sets
+	case "accounts":
+		rawRows = []storage.Row{}
+	case "users":
+		rawRows = []storage.Row{}
+	case "hosts":
+		rawRows = []storage.Row{}
+	case "setup_actors":
+		rawRows = e.perfSchemaSetupActors()
+	case "setup_objects":
+		rawRows = []storage.Row{
+			{"OBJECT_TYPE": "EVENT", "OBJECT_SCHEMA": "mysql", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+			{"OBJECT_TYPE": "EVENT", "OBJECT_SCHEMA": "performance_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+			{"OBJECT_TYPE": "EVENT", "OBJECT_SCHEMA": "information_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+			{"OBJECT_TYPE": "EVENT", "OBJECT_SCHEMA": "%", "OBJECT_NAME": "%", "ENABLED": "YES", "TIMED": "YES"},
+			{"OBJECT_TYPE": "FUNCTION", "OBJECT_SCHEMA": "mysql", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+			{"OBJECT_TYPE": "FUNCTION", "OBJECT_SCHEMA": "performance_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+			{"OBJECT_TYPE": "FUNCTION", "OBJECT_SCHEMA": "information_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+			{"OBJECT_TYPE": "FUNCTION", "OBJECT_SCHEMA": "%", "OBJECT_NAME": "%", "ENABLED": "YES", "TIMED": "YES"},
+			{"OBJECT_TYPE": "PROCEDURE", "OBJECT_SCHEMA": "mysql", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+			{"OBJECT_TYPE": "PROCEDURE", "OBJECT_SCHEMA": "performance_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+			{"OBJECT_TYPE": "PROCEDURE", "OBJECT_SCHEMA": "information_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+			{"OBJECT_TYPE": "PROCEDURE", "OBJECT_SCHEMA": "%", "OBJECT_NAME": "%", "ENABLED": "YES", "TIMED": "YES"},
+			{"OBJECT_TYPE": "TABLE", "OBJECT_SCHEMA": "mysql", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+			{"OBJECT_TYPE": "TABLE", "OBJECT_SCHEMA": "performance_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+			{"OBJECT_TYPE": "TABLE", "OBJECT_SCHEMA": "information_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+			{"OBJECT_TYPE": "TABLE", "OBJECT_SCHEMA": "%", "OBJECT_NAME": "%", "ENABLED": "YES", "TIMED": "YES"},
+			{"OBJECT_TYPE": "TRIGGER", "OBJECT_SCHEMA": "mysql", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+			{"OBJECT_TYPE": "TRIGGER", "OBJECT_SCHEMA": "performance_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+			{"OBJECT_TYPE": "TRIGGER", "OBJECT_SCHEMA": "information_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+			{"OBJECT_TYPE": "TRIGGER", "OBJECT_SCHEMA": "%", "OBJECT_NAME": "%", "ENABLED": "YES", "TIMED": "YES"},
+		}
+	case "setup_instruments":
+		rawRows = e.perfSchemaSetupInstruments()
+	case "setup_threads":
+		rawRows = []storage.Row{
+			{"NAME": "thread/sql/main", "ENABLED": "YES", "HISTORY": "YES", "PROPERTIES": "singleton", "VOLATILITY": int64(0), "DOCUMENTATION": nil},
+			{"NAME": "thread/sql/one_connection", "ENABLED": "YES", "HISTORY": "YES", "PROPERTIES": "user", "VOLATILITY": int64(0), "DOCUMENTATION": nil},
+		}
+	case "persisted_variables":
+		rawRows = []storage.Row{}
+	case "variables_info":
+		rawRows = e.perfSchemaVariablesInfo()
+	case "variables_by_thread":
+		rawRows = []storage.Row{}
+	case "mutex_instances", "rwlock_instances", "cond_instances",
+		"file_instances", "file_summary_by_instance",
+		"socket_instances", "socket_summary_by_event_name", "socket_summary_by_instance",
+		"table_handles",
+		"table_io_waits_summary_by_table", "table_io_waits_summary_by_index_usage",
+		"table_lock_waits_summary_by_table":
+		rawRows = []storage.Row{}
+	case "events_waits_history":
+		rawRows = []storage.Row{}
+	case "events_stages_current", "events_stages_history":
+		rawRows = []storage.Row{}
+	case "events_statements_current", "events_statements_history":
+		rawRows = []storage.Row{}
+	case "events_transactions_current", "events_transactions_history", "events_transactions_history_long":
+		rawRows = []storage.Row{}
+	case "events_waits_summary_by_account_by_event_name",
+		"events_waits_summary_by_host_by_event_name",
+		"events_waits_summary_by_instance",
+		"events_waits_summary_by_thread_by_event_name",
+		"events_waits_summary_by_user_by_event_name",
+		"events_waits_summary_global_by_event_name",
+		"events_stages_summary_by_account_by_event_name",
+		"events_stages_summary_by_host_by_event_name",
+		"events_stages_summary_by_thread_by_event_name",
+		"events_stages_summary_by_user_by_event_name",
+		"events_stages_summary_global_by_event_name",
+		"events_statements_summary_by_account_by_event_name",
+		"events_statements_summary_by_digest",
+		"events_statements_summary_by_host_by_event_name",
+		"events_statements_summary_by_thread_by_event_name",
+		"events_statements_summary_by_user_by_event_name",
+		"events_statements_summary_global_by_event_name",
+		"events_statements_histogram_by_digest",
+		"events_statements_histogram_global",
+		"events_transactions_summary_by_account_by_event_name",
+		"events_transactions_summary_by_host_by_event_name",
+		"events_transactions_summary_by_thread_by_event_name",
+		"events_transactions_summary_by_user_by_event_name",
+		"events_transactions_summary_global_by_event_name",
+		"events_errors_summary_by_account_by_error",
+		"events_errors_summary_by_host_by_error",
+		"events_errors_summary_by_thread_by_error",
+		"events_errors_summary_by_user_by_error",
+		"events_errors_summary_global_by_error":
+		rawRows = []storage.Row{}
+	case "memory_summary_by_account_by_event_name",
+		"memory_summary_by_host_by_event_name",
+		"memory_summary_by_thread_by_event_name",
+		"memory_summary_by_user_by_event_name":
+		rawRows = []storage.Row{}
+	case "status_by_account", "status_by_host", "status_by_thread", "status_by_user":
+		rawRows = []storage.Row{}
+	case "replication_connection_configuration", "replication_connection_status",
+		"replication_applier_configuration", "replication_applier_status",
+		"replication_applier_status_by_coordinator", "replication_applier_status_by_worker",
+		"replication_applier_filters", "replication_applier_global_filters",
+		"replication_group_members", "replication_group_member_stats":
+		rawRows = []storage.Row{}
+	case "keyring_keys":
+		rawRows = []storage.Row{}
+	case "host_cache":
+		rawRows = []storage.Row{}
+	case "log_status":
+		rawRows = []storage.Row{}
+	case "objects_summary_global_by_type":
+		rawRows = []storage.Row{}
+	case "prepared_statements_instances":
+		rawRows = []storage.Row{}
+	case "user_defined_functions":
+		rawRows = []storage.Row{}
+	case "user_variables_by_thread":
+		rawRows = []storage.Row{}
+	case "session_connect_attrs", "session_account_connect_attrs":
+		rawRows = []storage.Row{}
+	case "metadata_locks":
+		rawRows = []storage.Row{}
+	case "data_locks":
+		rawRows = []storage.Row{}
+	case "data_lock_waits":
+		rawRows = []storage.Row{}
+	case "setup_consumers":
+		rawRows = []storage.Row{
+			{"NAME": "events_stages_current", "ENABLED": "YES"},
+			{"NAME": "events_stages_history", "ENABLED": "YES"},
+			{"NAME": "events_stages_history_long", "ENABLED": "NO"},
+			{"NAME": "events_statements_current", "ENABLED": "YES"},
+			{"NAME": "events_statements_history", "ENABLED": "YES"},
+			{"NAME": "events_statements_history_long", "ENABLED": "NO"},
+			{"NAME": "events_transactions_current", "ENABLED": "YES"},
+			{"NAME": "events_transactions_history", "ENABLED": "YES"},
+			{"NAME": "events_transactions_history_long", "ENABLED": "NO"},
+			{"NAME": "events_waits_current", "ENABLED": "YES"},
+			{"NAME": "events_waits_history", "ENABLED": "YES"},
+			{"NAME": "events_waits_history_long", "ENABLED": "NO"},
+			{"NAME": "global_instrumentation", "ENABLED": "YES"},
+			{"NAME": "statements_digest", "ENABLED": "YES"},
+			{"NAME": "thread_instrumentation", "ENABLED": "YES"},
+		}
 	}
 
 	result := make([]storage.Row, len(rawRows))
@@ -1026,6 +1315,59 @@ func (e *Executor) perfSchemaSetupActors() []storage.Row {
 	return []storage.Row{
 		{"HOST": "%", "USER": "%", "ROLE": "%", "ENABLED": "YES", "HISTORY": "YES"},
 	}
+}
+
+// perfSchemaSetupInstruments returns stub rows for performance_schema.setup_instruments.
+func (e *Executor) perfSchemaSetupInstruments() []storage.Row {
+	// Return a representative set of instrument categories
+	instruments := []struct{ name, enabled, timed string }{
+		{"wait/synch/mutex/sql/THD_LOCK_INFO::mutex", "YES", "YES"},
+		{"wait/synch/rwlock/sql/LOCK_grant", "YES", "YES"},
+		{"wait/synch/cond/sql/COND_open", "YES", "YES"},
+		{"wait/io/file/sql/binlog", "YES", "YES"},
+		{"wait/io/table/sql/handler", "YES", "YES"},
+		{"wait/lock/table/sql/handler", "YES", "YES"},
+		{"stage/sql/After create", "YES", "YES"},
+		{"statement/sql/select", "YES", "YES"},
+		{"statement/sql/insert", "YES", "YES"},
+		{"statement/sql/update", "YES", "YES"},
+		{"statement/sql/delete", "YES", "YES"},
+		{"transaction", "YES", "YES"},
+		{"memory/sql/THD::main_mem_root", "YES", "YES"},
+		{"idle", "YES", "YES"},
+	}
+	rows := make([]storage.Row, 0, len(instruments))
+	for _, inst := range instruments {
+		rows = append(rows, storage.Row{
+			"NAME": inst.name, "ENABLED": inst.enabled, "TIMED": inst.timed,
+			"PROPERTIES": "", "FLAGS": nil, "VOLATILITY": int64(0), "DOCUMENTATION": nil,
+		})
+	}
+	return rows
+}
+
+// perfSchemaVariablesInfo returns rows for performance_schema.variables_info.
+func (e *Executor) perfSchemaVariablesInfo() []storage.Row {
+	vars := e.buildVariablesMap()
+	names := make([]string, 0, len(vars))
+	for n := range vars {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	rows := make([]storage.Row, 0, len(names))
+	for _, n := range names {
+		rows = append(rows, storage.Row{
+			"VARIABLE_NAME":   n,
+			"VARIABLE_SOURCE": "COMPILED",
+			"VARIABLE_PATH":   "",
+			"MIN_VALUE":       "0",
+			"MAX_VALUE":       "0",
+			"SET_TIME":        nil,
+			"SET_USER":        nil,
+			"SET_HOST":        nil,
+		})
+	}
+	return rows
 }
 
 // infoSchemaTriggers returns rows for INFORMATION_SCHEMA.TRIGGERS.
