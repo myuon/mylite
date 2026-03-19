@@ -343,6 +343,18 @@ func normalizeRows(rows [][]interface{}) [][]interface{} {
 	if len(rows) == 0 {
 		return rows
 	}
+	// Convert bool values to int64 (go-mysql doesn't handle bool)
+	for i, row := range rows {
+		for j, val := range row {
+			if b, ok := val.(bool); ok {
+				if b {
+					rows[i][j] = int64(1)
+				} else {
+					rows[i][j] = int64(0)
+				}
+			}
+		}
+	}
 	numCols := len(rows[0])
 	// For each column determine the MySQL type category of the first non-null value.
 	// Categories: 0=unknown, 1=signed int, 2=float, 3=string/bytes, 4=time, 5=unsigned int
