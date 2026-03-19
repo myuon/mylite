@@ -233,6 +233,8 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 			"innodb_indexes", "innodb_buffer_page_lru", "innodb_buffer_page", "innodb_buffer_pool_stats",
 			"innodb_trx", "innodb_foreign_cols", "innodb_fields", "optimizer_trace", "files", "processlist",
 			"key_column_usage", "referential_constraints", "innodb_temp_table_info",
+			"innodb_ft_default_stopword", "innodb_ft_index_cache", "innodb_ft_index_table",
+			"innodb_ft_config", "innodb_ft_being_deleted", "innodb_ft_deleted",
 			"triggers", "table_constraints", "character_sets", "collations",
 			"collation_character_set_applicability", "user_privileges", "schema_privileges",
 			"table_privileges", "column_privileges", "routines", "views", "check_constraints",
@@ -393,6 +395,29 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = []storage.Row{{"CONSTRAINT_CATALOG": "def", "CONSTRAINT_SCHEMA": "", "CONSTRAINT_NAME": "", "UNIQUE_CONSTRAINT_CATALOG": "def", "UNIQUE_CONSTRAINT_SCHEMA": "", "UNIQUE_CONSTRAINT_NAME": "", "MATCH_OPTION": "NONE", "UPDATE_RULE": "RESTRICT", "DELETE_RULE": "RESTRICT", "TABLE_NAME": "", "REFERENCED_TABLE_NAME": ""}}
 	case "innodb_temp_table_info":
 		rawRows = []storage.Row{{"TABLE_ID": int64(0), "NAME": "", "N_COLS": int64(0), "SPACE": int64(0)}}
+	case "innodb_ft_default_stopword":
+		// MySQL default fulltext stopword list
+		rawRows = []storage.Row{
+			{"value": "a"}, {"value": "about"}, {"value": "an"}, {"value": "are"},
+			{"value": "as"}, {"value": "at"}, {"value": "be"}, {"value": "by"},
+			{"value": "com"}, {"value": "de"}, {"value": "en"}, {"value": "for"},
+			{"value": "from"}, {"value": "how"}, {"value": "i"}, {"value": "in"},
+			{"value": "is"}, {"value": "it"}, {"value": "la"}, {"value": "of"},
+			{"value": "on"}, {"value": "or"}, {"value": "that"}, {"value": "the"},
+			{"value": "this"}, {"value": "to"}, {"value": "was"}, {"value": "what"},
+			{"value": "when"}, {"value": "where"}, {"value": "who"}, {"value": "will"},
+			{"value": "with"}, {"value": "und"}, {"value": "the"}, {"value": "www"},
+		}
+	case "innodb_ft_index_cache":
+		rawRows = []storage.Row{}
+	case "innodb_ft_index_table":
+		rawRows = []storage.Row{}
+	case "innodb_ft_config":
+		rawRows = []storage.Row{}
+	case "innodb_ft_being_deleted":
+		rawRows = []storage.Row{}
+	case "innodb_ft_deleted":
+		rawRows = []storage.Row{}
 	case "memory_summary_global_by_event_name":
 		rawRows = e.perfSchemaMemorySummary()
 	case "global_variables", "session_variables":
@@ -906,10 +931,19 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 			for _, c := range tbl.Columns {
 				colNullable[strings.ToLower(c.Name)] = c.Nullable
 			}
-			appendIndexRows := func(indexName string, cols []string, nonUnique int64, idxComment string) {
+			appendIndexRows := func(indexName string, cols []string, nonUnique int64, idxComment string, idxType string) {
 				var dynamic []int64
 				if !readPersistent {
 					dynamic = distinctPrefixCounts(dataRows, cols)
+				}
+				indexTypeStr := "BTREE"
+				collation := interface{}("A")
+				if idxType == "FULLTEXT" {
+					indexTypeStr = "FULLTEXT"
+					collation = nil
+				} else if idxType == "SPATIAL" {
+					indexTypeStr = "SPATIAL"
+					collation = nil
 				}
 				for i, col := range cols {
 					colName := normalizeIndexColumnName(col)
@@ -933,12 +967,12 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 						"INDEX_NAME":    indexName,
 						"SEQ_IN_INDEX":  int64(i + 1),
 						"COLUMN_NAME":   colName,
-						"COLLATION":     "A",
+						"COLLATION":     collation,
 						"CARDINALITY":   cardinality,
 						"SUB_PART":      nil,
 						"PACKED":        nil,
 						"NULLABLE":      nullable,
-						"INDEX_TYPE":    "BTREE",
+						"INDEX_TYPE":    indexTypeStr,
 						"COMMENT":       "",
 						"INDEX_COMMENT": idxComment,
 						"IS_VISIBLE":    "YES",
@@ -953,10 +987,10 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 				if idx.Unique {
 					nonUnique = 0
 				}
-				appendIndexRows(idx.Name, idx.Columns, nonUnique, idx.Comment)
+				appendIndexRows(idx.Name, idx.Columns, nonUnique, idx.Comment, idx.Type)
 			}
 			if len(tbl.PrimaryKey) > 0 {
-				appendIndexRows("PRIMARY", tbl.PrimaryKey, 0, "")
+				appendIndexRows("PRIMARY", tbl.PrimaryKey, 0, "", "")
 			}
 		}
 	}

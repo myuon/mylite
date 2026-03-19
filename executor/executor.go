@@ -2556,6 +2556,9 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	case *sqlparser.Savepoint:
 		// SAVEPOINT: accepted as a no-op for compatibility.
 		return &Result{}, nil
+	case *sqlparser.Release:
+		// RELEASE SAVEPOINT: accepted as a no-op for compatibility.
+		return &Result{}, nil
 	case *sqlparser.TruncateTable:
 		return e.execTruncateTable(s)
 	case *sqlparser.Set:
@@ -5614,6 +5617,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		// CREATE TABLE ... SELECT
 		if stmt.Select != nil {
 			selectSQL := sqlparser.String(stmt.Select)
+			return e.execCreateTableSelect(tableName, selectSQL)
+		}
+		// Fallback: parser may fail to capture SELECT when ENGINE=... precedes AS SELECT.
+		// Extract SELECT from raw query text.
+		if selectSQL := extractCreateTableSelectSQL(e.currentQuery); selectSQL != "" {
 			return e.execCreateTableSelect(tableName, selectSQL)
 		}
 		return &Result{}, nil
@@ -14031,6 +14039,38 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 				}
 				return int64(0), nil
 			}
+			// Handle IN (subquery)
+			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+				result, err := e.execSubquery(sub, e.correlatedRow)
+				if err != nil {
+					return nil, err
+				}
+				hasNull := false
+				for _, row := range result.Rows {
+					if len(row) == 0 {
+						continue
+					}
+					val := row[0]
+					if val == nil {
+						hasNull = true
+						continue
+					}
+					match, _ := compareValues(left, val, sqlparser.EqualOp)
+					if match {
+						if v.Operator == sqlparser.InOp {
+							return int64(1), nil
+						}
+						return int64(0), nil
+					}
+				}
+				if hasNull {
+					return nil, nil
+				}
+				if v.Operator == sqlparser.NotInOp {
+					return int64(1), nil
+				}
+				return int64(0), nil
+			}
 		}
 		// Allow comparison expressions to be used as boolean values (e.g. in IF args)
 		left, err := e.evalExpr(v.Left)
@@ -14813,7 +14853,9 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 		return fmt.Sprintf("POINT(%v %v)", xVal, yVal), nil
 	case *sqlparser.MatchExpr:
-		return float64(0), nil
+		// Stub: return 1.0 so WHERE MATCH(...) AGAINST(...) returns all rows
+		// rather than filtering everything out.
+		return float64(1), nil
 	case *sqlparser.CountStar:
 		return int64(0), nil
 	case *sqlparser.LagLeadExpr:
@@ -18674,6 +18716,38 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 					if err != nil {
 						return nil, err
 					}
+					if val == nil {
+						hasNull = true
+						continue
+					}
+					match, _ := compareValues(left, val, sqlparser.EqualOp)
+					if match {
+						if v.Operator == sqlparser.InOp {
+							return int64(1), nil
+						}
+						return int64(0), nil
+					}
+				}
+				if hasNull {
+					return nil, nil
+				}
+				if v.Operator == sqlparser.NotInOp {
+					return int64(1), nil
+				}
+				return int64(0), nil
+			}
+			// Handle IN (subquery) in row expression context
+			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+				result, err := e.execSubquery(sub, row)
+				if err != nil {
+					return nil, err
+				}
+				hasNull := false
+				for _, r := range result.Rows {
+					if len(r) == 0 {
+						continue
+					}
+					val := r[0]
 					if val == nil {
 						hasNull = true
 						continue
@@ -22625,6 +22699,27 @@ func (e *Executor) execCreateTableLike(newTableName, srcTableName string) (*Resu
 	e.Storage.CreateTable(e.CurrentDB, newDef)
 	e.upsertInnoDBStatsRows(e.CurrentDB, newTableName, 0)
 	return &Result{}, nil
+}
+
+// extractCreateTableSelectSQL extracts the SELECT portion from a
+// CREATE TABLE ... [ENGINE=...] [AS] SELECT ... query when the parser
+// fails to capture it (e.g. when table options precede AS SELECT).
+func extractCreateTableSelectSQL(query string) string {
+	upper := strings.ToUpper(query)
+	// Look for AS SELECT or just SELECT after table options
+	idx := strings.Index(upper, " AS SELECT ")
+	if idx >= 0 {
+		return strings.TrimSpace(query[idx+4:]) // skip " AS "
+	}
+	idx = strings.Index(upper, " SELECT ")
+	if idx >= 0 {
+		// Make sure it's after CREATE TABLE and not inside a subquery
+		before := upper[:idx]
+		if strings.Contains(before, "CREATE") && strings.Contains(before, "TABLE") {
+			return strings.TrimSpace(query[idx+1:])
+		}
+	}
+	return ""
 }
 
 // execCreateTableSelect handles CREATE TABLE t2 [AS] SELECT ...
