@@ -114,6 +114,18 @@ var infoSchemaColumnOrder = map[string][]string{
 	"performance_timers":              {"TIMER_NAME", "TIMER_FREQUENCY", "TIMER_RESOLUTION", "TIMER_OVERHEAD"},
 	"threads":                         {"THREAD_ID", "NAME", "TYPE", "PROCESSLIST_ID", "PROCESSLIST_USER", "PROCESSLIST_HOST", "PROCESSLIST_DB", "PROCESSLIST_COMMAND", "PROCESSLIST_TIME", "PROCESSLIST_STATE", "PROCESSLIST_INFO", "PARENT_THREAD_ID", "ROLE", "INSTRUMENTED", "HISTORY", "CONNECTION_TYPE", "THREAD_OS_ID", "RESOURCE_GROUP"},
 	"setup_actors":                    {"HOST", "USER", "ROLE", "ENABLED", "HISTORY"},
+	"triggers":                        {"TRIGGER_CATALOG", "TRIGGER_SCHEMA", "TRIGGER_NAME", "EVENT_MANIPULATION", "EVENT_OBJECT_CATALOG", "EVENT_OBJECT_SCHEMA", "EVENT_OBJECT_TABLE", "ACTION_ORDER", "ACTION_CONDITION", "ACTION_STATEMENT", "ACTION_ORIENTATION", "ACTION_TIMING", "ACTION_REFERENCE_OLD_TABLE", "ACTION_REFERENCE_NEW_TABLE", "ACTION_REFERENCE_OLD_ROW", "ACTION_REFERENCE_NEW_ROW", "CREATED", "SQL_MODE", "DEFINER", "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION", "DATABASE_COLLATION"},
+	"table_constraints":               {"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "TABLE_SCHEMA", "TABLE_NAME", "CONSTRAINT_TYPE", "ENFORCED"},
+	"check_constraints":               {"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "CHECK_CLAUSE"},
+	"character_sets":                   {"CHARACTER_SET_NAME", "DEFAULT_COLLATE_NAME", "DESCRIPTION", "MAXLEN"},
+	"collations":                       {"COLLATION_NAME", "CHARACTER_SET_NAME", "ID", "IS_DEFAULT", "IS_COMPILED", "SORTLEN", "PAD_ATTRIBUTE"},
+	"collation_character_set_applicability": {"COLLATION_NAME", "CHARACTER_SET_NAME"},
+	"user_privileges":                  {"GRANTEE", "TABLE_CATALOG", "PRIVILEGE_TYPE", "IS_GRANTABLE"},
+	"schema_privileges":                {"GRANTEE", "TABLE_CATALOG", "TABLE_SCHEMA", "PRIVILEGE_TYPE", "IS_GRANTABLE"},
+	"table_privileges":                 {"GRANTEE", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "PRIVILEGE_TYPE", "IS_GRANTABLE"},
+	"column_privileges":                {"GRANTEE", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "PRIVILEGE_TYPE", "IS_GRANTABLE"},
+	"routines":                         {"SPECIFIC_NAME", "ROUTINE_CATALOG", "ROUTINE_SCHEMA", "ROUTINE_NAME", "ROUTINE_TYPE", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH", "CHARACTER_OCTET_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE", "DATETIME_PRECISION", "CHARACTER_SET_NAME", "COLLATION_NAME", "DTD_IDENTIFIER", "ROUTINE_BODY", "ROUTINE_DEFINITION", "EXTERNAL_NAME", "EXTERNAL_LANGUAGE", "PARAMETER_STYLE", "IS_DETERMINISTIC", "SQL_DATA_ACCESS", "SQL_PATH", "SECURITY_TYPE", "CREATED", "LAST_ALTERED", "SQL_MODE", "ROUTINE_COMMENT", "DEFINER", "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION", "DATABASE_COLLATION"},
+	"views":                            {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "VIEW_DEFINITION", "CHECK_OPTION", "IS_UPDATABLE", "DEFINER", "SECURITY_TYPE", "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION"},
 }
 
 // isInformationSchemaTable returns (dbName, tableName, true) when the provided
@@ -130,7 +142,10 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 			"innodb_virtual", "innodb_foreign", "innodb_metrics", "innodb_cached_indexes",
 			"innodb_indexes", "innodb_buffer_page_lru", "innodb_buffer_page", "innodb_buffer_pool_stats",
 			"innodb_trx", "innodb_foreign_cols", "innodb_fields", "optimizer_trace", "files", "processlist",
-			"key_column_usage", "referential_constraints", "innodb_temp_table_info":
+			"key_column_usage", "referential_constraints", "innodb_temp_table_info",
+			"triggers", "table_constraints", "character_sets", "collations",
+			"collation_character_set_applicability", "user_privileges", "schema_privileges",
+			"table_privileges", "column_privileges", "routines", "views", "check_constraints":
 			return true
 		}
 		return false
@@ -243,6 +258,30 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.perfSchemaPerformanceTimers()
 	case "threads":
 		rawRows = e.perfSchemaThreads()
+	case "triggers":
+		rawRows = e.infoSchemaTriggers()
+	case "table_constraints":
+		rawRows = e.infoSchemaTableConstraints()
+	case "check_constraints":
+		rawRows = []storage.Row{} // empty
+	case "character_sets":
+		rawRows = e.infoSchemaCharacterSets()
+	case "collations":
+		rawRows = e.infoSchemaCollations()
+	case "collation_character_set_applicability":
+		rawRows = e.infoSchemaCollCharSetAppl()
+	case "user_privileges":
+		rawRows = e.infoSchemaUserPrivileges()
+	case "schema_privileges":
+		rawRows = []storage.Row{} // empty – no grants tracked
+	case "table_privileges":
+		rawRows = []storage.Row{} // empty – no grants tracked
+	case "column_privileges":
+		rawRows = []storage.Row{} // empty – no grants tracked
+	case "routines":
+		rawRows = e.infoSchemaRoutines()
+	case "views":
+		rawRows = e.infoSchemaViews()
 	}
 
 	result := make([]storage.Row, len(rawRows))
@@ -984,4 +1023,303 @@ func (e *Executor) perfSchemaSetupActors() []storage.Row {
 	return []storage.Row{
 		{"HOST": "%", "USER": "%", "ROLE": "%", "ENABLED": "YES", "HISTORY": "YES"},
 	}
+}
+
+// infoSchemaTriggers returns rows for INFORMATION_SCHEMA.TRIGGERS.
+func (e *Executor) infoSchemaTriggers() []storage.Row {
+	var rows []storage.Row
+	dbNames := e.Catalog.ListDatabases()
+	sort.Strings(dbNames)
+	for _, dbName := range dbNames {
+		if isSystemSchemaName(dbName) {
+			continue
+		}
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		if db.Triggers == nil {
+			continue
+		}
+		trigNames := make([]string, 0, len(db.Triggers))
+		for n := range db.Triggers {
+			trigNames = append(trigNames, n)
+		}
+		sort.Strings(trigNames)
+		for _, trigName := range trigNames {
+			tr := db.Triggers[trigName]
+			body := strings.Join(tr.Body, ";\n")
+			rows = append(rows, storage.Row{
+				"TRIGGER_CATALOG":            "def",
+				"TRIGGER_SCHEMA":             dbName,
+				"TRIGGER_NAME":               tr.Name,
+				"EVENT_MANIPULATION":          tr.Event,
+				"EVENT_OBJECT_CATALOG":        "def",
+				"EVENT_OBJECT_SCHEMA":         dbName,
+				"EVENT_OBJECT_TABLE":          tr.Table,
+				"ACTION_ORDER":               int64(1),
+				"ACTION_CONDITION":           nil,
+				"ACTION_STATEMENT":            body,
+				"ACTION_ORIENTATION":          "ROW",
+				"ACTION_TIMING":              tr.Timing,
+				"ACTION_REFERENCE_OLD_TABLE": nil,
+				"ACTION_REFERENCE_NEW_TABLE": nil,
+				"ACTION_REFERENCE_OLD_ROW":   "OLD",
+				"ACTION_REFERENCE_NEW_ROW":   "NEW",
+				"CREATED":                    nil,
+				"SQL_MODE":                   "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+				"DEFINER":                    "root@localhost",
+				"CHARACTER_SET_CLIENT":       "utf8mb4",
+				"COLLATION_CONNECTION":       "utf8mb4_general_ci",
+				"DATABASE_COLLATION":         "utf8mb4_general_ci",
+			})
+		}
+	}
+	return rows
+}
+
+// infoSchemaTableConstraints returns rows for INFORMATION_SCHEMA.TABLE_CONSTRAINTS.
+func (e *Executor) infoSchemaTableConstraints() []storage.Row {
+	var rows []storage.Row
+	dbNames := e.Catalog.ListDatabases()
+	sort.Strings(dbNames)
+	for _, dbName := range dbNames {
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		tableNames := db.ListTables()
+		sort.Strings(tableNames)
+		for _, tblName := range tableNames {
+			tblDef, _ := db.GetTable(tblName)
+			if tblDef == nil {
+				continue
+			}
+			// PRIMARY KEY constraint
+			if len(tblDef.PrimaryKey) > 0 {
+				rows = append(rows, storage.Row{
+					"CONSTRAINT_CATALOG": "def",
+					"CONSTRAINT_SCHEMA":  dbName,
+					"CONSTRAINT_NAME":    "PRIMARY",
+					"TABLE_SCHEMA":       dbName,
+					"TABLE_NAME":         tblName,
+					"CONSTRAINT_TYPE":    "PRIMARY KEY",
+					"ENFORCED":           "YES",
+				})
+			}
+			// UNIQUE constraints from indexes
+			for _, idx := range tblDef.Indexes {
+				if idx.Unique {
+					rows = append(rows, storage.Row{
+						"CONSTRAINT_CATALOG": "def",
+						"CONSTRAINT_SCHEMA":  dbName,
+						"CONSTRAINT_NAME":    idx.Name,
+						"TABLE_SCHEMA":       dbName,
+						"TABLE_NAME":         tblName,
+						"CONSTRAINT_TYPE":    "UNIQUE",
+						"ENFORCED":           "YES",
+					})
+				}
+			}
+		}
+	}
+	return rows
+}
+
+// infoSchemaCharacterSets returns rows for INFORMATION_SCHEMA.CHARACTER_SETS.
+func (e *Executor) infoSchemaCharacterSets() []storage.Row {
+	return []storage.Row{
+		{"CHARACTER_SET_NAME": "utf8mb4", "DEFAULT_COLLATE_NAME": "utf8mb4_general_ci", "DESCRIPTION": "UTF-8 Unicode", "MAXLEN": int64(4)},
+		{"CHARACTER_SET_NAME": "utf8mb3", "DEFAULT_COLLATE_NAME": "utf8mb3_general_ci", "DESCRIPTION": "UTF-8 Unicode", "MAXLEN": int64(3)},
+		{"CHARACTER_SET_NAME": "utf8", "DEFAULT_COLLATE_NAME": "utf8_general_ci", "DESCRIPTION": "UTF-8 Unicode", "MAXLEN": int64(3)},
+		{"CHARACTER_SET_NAME": "latin1", "DEFAULT_COLLATE_NAME": "latin1_swedish_ci", "DESCRIPTION": "cp1252 West European", "MAXLEN": int64(1)},
+		{"CHARACTER_SET_NAME": "binary", "DEFAULT_COLLATE_NAME": "binary", "DESCRIPTION": "Binary pseudo charset", "MAXLEN": int64(1)},
+		{"CHARACTER_SET_NAME": "ascii", "DEFAULT_COLLATE_NAME": "ascii_general_ci", "DESCRIPTION": "US ASCII", "MAXLEN": int64(1)},
+	}
+}
+
+// infoSchemaCollations returns rows for INFORMATION_SCHEMA.COLLATIONS.
+func (e *Executor) infoSchemaCollations() []storage.Row {
+	return []storage.Row{
+		{"COLLATION_NAME": "utf8mb4_general_ci", "CHARACTER_SET_NAME": "utf8mb4", "ID": int64(45), "IS_DEFAULT": "Yes", "IS_COMPILED": "Yes", "SORTLEN": int64(1), "PAD_ATTRIBUTE": "PAD SPACE"},
+		{"COLLATION_NAME": "utf8mb4_bin", "CHARACTER_SET_NAME": "utf8mb4", "ID": int64(46), "IS_DEFAULT": "", "IS_COMPILED": "Yes", "SORTLEN": int64(1), "PAD_ATTRIBUTE": "PAD SPACE"},
+		{"COLLATION_NAME": "utf8mb4_0900_ai_ci", "CHARACTER_SET_NAME": "utf8mb4", "ID": int64(255), "IS_DEFAULT": "", "IS_COMPILED": "Yes", "SORTLEN": int64(0), "PAD_ATTRIBUTE": "NO PAD"},
+		{"COLLATION_NAME": "utf8_general_ci", "CHARACTER_SET_NAME": "utf8", "ID": int64(33), "IS_DEFAULT": "Yes", "IS_COMPILED": "Yes", "SORTLEN": int64(1), "PAD_ATTRIBUTE": "PAD SPACE"},
+		{"COLLATION_NAME": "utf8_bin", "CHARACTER_SET_NAME": "utf8", "ID": int64(83), "IS_DEFAULT": "", "IS_COMPILED": "Yes", "SORTLEN": int64(1), "PAD_ATTRIBUTE": "PAD SPACE"},
+		{"COLLATION_NAME": "latin1_swedish_ci", "CHARACTER_SET_NAME": "latin1", "ID": int64(8), "IS_DEFAULT": "Yes", "IS_COMPILED": "Yes", "SORTLEN": int64(1), "PAD_ATTRIBUTE": "PAD SPACE"},
+		{"COLLATION_NAME": "latin1_bin", "CHARACTER_SET_NAME": "latin1", "ID": int64(47), "IS_DEFAULT": "", "IS_COMPILED": "Yes", "SORTLEN": int64(1), "PAD_ATTRIBUTE": "PAD SPACE"},
+		{"COLLATION_NAME": "binary", "CHARACTER_SET_NAME": "binary", "ID": int64(63), "IS_DEFAULT": "Yes", "IS_COMPILED": "Yes", "SORTLEN": int64(1), "PAD_ATTRIBUTE": "NO PAD"},
+		{"COLLATION_NAME": "ascii_general_ci", "CHARACTER_SET_NAME": "ascii", "ID": int64(11), "IS_DEFAULT": "Yes", "IS_COMPILED": "Yes", "SORTLEN": int64(1), "PAD_ATTRIBUTE": "PAD SPACE"},
+	}
+}
+
+// infoSchemaCollCharSetAppl returns rows for INFORMATION_SCHEMA.COLLATION_CHARACTER_SET_APPLICABILITY.
+func (e *Executor) infoSchemaCollCharSetAppl() []storage.Row {
+	colls := e.infoSchemaCollations()
+	rows := make([]storage.Row, 0, len(colls))
+	for _, c := range colls {
+		rows = append(rows, storage.Row{
+			"COLLATION_NAME":     c["COLLATION_NAME"],
+			"CHARACTER_SET_NAME": c["CHARACTER_SET_NAME"],
+		})
+	}
+	return rows
+}
+
+// infoSchemaUserPrivileges returns rows for INFORMATION_SCHEMA.USER_PRIVILEGES.
+func (e *Executor) infoSchemaUserPrivileges() []storage.Row {
+	privTypes := []string{
+		"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "RELOAD",
+		"SHUTDOWN", "PROCESS", "FILE", "REFERENCES", "INDEX", "ALTER",
+		"SHOW DATABASES", "SUPER", "CREATE TEMPORARY TABLES", "LOCK TABLES",
+		"EXECUTE", "REPLICATION SLAVE", "REPLICATION CLIENT", "CREATE VIEW",
+		"SHOW VIEW", "CREATE ROUTINE", "ALTER ROUTINE", "CREATE USER", "EVENT",
+		"TRIGGER", "CREATE TABLESPACE", "CREATE ROLE", "DROP ROLE",
+	}
+	rows := make([]storage.Row, 0, len(privTypes))
+	for _, p := range privTypes {
+		rows = append(rows, storage.Row{
+			"GRANTEE":        "'root'@'localhost'",
+			"TABLE_CATALOG":  "def",
+			"PRIVILEGE_TYPE": p,
+			"IS_GRANTABLE":  "YES",
+		})
+	}
+	return rows
+}
+
+// infoSchemaRoutines returns rows for INFORMATION_SCHEMA.ROUTINES.
+func (e *Executor) infoSchemaRoutines() []storage.Row {
+	var rows []storage.Row
+	dbNames := e.Catalog.ListDatabases()
+	sort.Strings(dbNames)
+	for _, dbName := range dbNames {
+		if isSystemSchemaName(dbName) {
+			continue
+		}
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		// Procedures
+		if db.Procedures != nil {
+			procNames := make([]string, 0, len(db.Procedures))
+			for n := range db.Procedures {
+				procNames = append(procNames, n)
+			}
+			sort.Strings(procNames)
+			for _, pName := range procNames {
+				p := db.Procedures[pName]
+				rows = append(rows, storage.Row{
+					"SPECIFIC_NAME":             p.Name,
+					"ROUTINE_CATALOG":           "def",
+					"ROUTINE_SCHEMA":            dbName,
+					"ROUTINE_NAME":              p.Name,
+					"ROUTINE_TYPE":              "PROCEDURE",
+					"DATA_TYPE":                 "",
+					"CHARACTER_MAXIMUM_LENGTH":  nil,
+					"CHARACTER_OCTET_LENGTH":    nil,
+					"NUMERIC_PRECISION":         nil,
+					"NUMERIC_SCALE":             nil,
+					"DATETIME_PRECISION":        nil,
+					"CHARACTER_SET_NAME":        nil,
+					"COLLATION_NAME":            nil,
+					"DTD_IDENTIFIER":            nil,
+					"ROUTINE_BODY":              "SQL",
+					"ROUTINE_DEFINITION":        strings.Join(p.Body, ";\n"),
+					"EXTERNAL_NAME":             nil,
+					"EXTERNAL_LANGUAGE":         "SQL",
+					"PARAMETER_STYLE":           "SQL",
+					"IS_DETERMINISTIC":          "NO",
+					"SQL_DATA_ACCESS":           "CONTAINS SQL",
+					"SQL_PATH":                  nil,
+					"SECURITY_TYPE":             "DEFINER",
+					"CREATED":                   "2024-01-01 00:00:00",
+					"LAST_ALTERED":              "2024-01-01 00:00:00",
+					"SQL_MODE":                  "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+					"ROUTINE_COMMENT":           "",
+					"DEFINER":                   "root@localhost",
+					"CHARACTER_SET_CLIENT":      "utf8mb4",
+					"COLLATION_CONNECTION":      "utf8mb4_general_ci",
+					"DATABASE_COLLATION":        "utf8mb4_general_ci",
+				})
+			}
+		}
+		// Functions
+		if db.Functions != nil {
+			funcNames := make([]string, 0, len(db.Functions))
+			for n := range db.Functions {
+				funcNames = append(funcNames, n)
+			}
+			sort.Strings(funcNames)
+			for _, fName := range funcNames {
+				f := db.Functions[fName]
+				det := "NO"
+				if f.Deterministic {
+					det = "YES"
+				}
+				rows = append(rows, storage.Row{
+					"SPECIFIC_NAME":             f.Name,
+					"ROUTINE_CATALOG":           "def",
+					"ROUTINE_SCHEMA":            dbName,
+					"ROUTINE_NAME":              f.Name,
+					"ROUTINE_TYPE":              "FUNCTION",
+					"DATA_TYPE":                 f.ReturnType,
+					"CHARACTER_MAXIMUM_LENGTH":  nil,
+					"CHARACTER_OCTET_LENGTH":    nil,
+					"NUMERIC_PRECISION":         nil,
+					"NUMERIC_SCALE":             nil,
+					"DATETIME_PRECISION":        nil,
+					"CHARACTER_SET_NAME":        nil,
+					"COLLATION_NAME":            nil,
+					"DTD_IDENTIFIER":            f.ReturnType,
+					"ROUTINE_BODY":              "SQL",
+					"ROUTINE_DEFINITION":        strings.Join(f.Body, ";\n"),
+					"EXTERNAL_NAME":             nil,
+					"EXTERNAL_LANGUAGE":         "SQL",
+					"PARAMETER_STYLE":           "SQL",
+					"IS_DETERMINISTIC":          det,
+					"SQL_DATA_ACCESS":           "CONTAINS SQL",
+					"SQL_PATH":                  nil,
+					"SECURITY_TYPE":             "DEFINER",
+					"CREATED":                   "2024-01-01 00:00:00",
+					"LAST_ALTERED":              "2024-01-01 00:00:00",
+					"SQL_MODE":                  "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+					"ROUTINE_COMMENT":           "",
+					"DEFINER":                   "root@localhost",
+					"CHARACTER_SET_CLIENT":      "utf8mb4",
+					"COLLATION_CONNECTION":      "utf8mb4_general_ci",
+					"DATABASE_COLLATION":        "utf8mb4_general_ci",
+				})
+			}
+		}
+	}
+	return rows
+}
+
+// infoSchemaViews returns rows for INFORMATION_SCHEMA.VIEWS.
+func (e *Executor) infoSchemaViews() []storage.Row {
+	var rows []storage.Row
+	if e.views != nil {
+		viewNames := make([]string, 0, len(e.views))
+		for n := range e.views {
+			viewNames = append(viewNames, n)
+		}
+		sort.Strings(viewNames)
+		for _, vName := range viewNames {
+			rows = append(rows, storage.Row{
+				"TABLE_CATALOG":        "def",
+				"TABLE_SCHEMA":         e.CurrentDB,
+				"TABLE_NAME":           vName,
+				"VIEW_DEFINITION":      e.views[vName],
+				"CHECK_OPTION":         "NONE",
+				"IS_UPDATABLE":         "YES",
+				"DEFINER":              "root@localhost",
+				"SECURITY_TYPE":        "DEFINER",
+				"CHARACTER_SET_CLIENT": "utf8mb4",
+				"COLLATION_CONNECTION": "utf8mb4_general_ci",
+			})
+		}
+	}
+	return rows
 }

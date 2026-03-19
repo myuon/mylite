@@ -537,19 +537,24 @@ func (ctx *execContext) executeLines(lines []string) error {
 			directive := strings.TrimPrefix(trimmed, "--")
 			directive = strings.TrimSpace(directive)
 			name, _ := parseDirectiveNameArgs(directive)
-			if (name == "query" || name == "query_vertical") &&
-				!strings.HasSuffix(strings.TrimSpace(trimmed), ";") {
-				fullDirective := directive
-				i++
-				for i < len(lines) {
-					l := strings.TrimSpace(lines[i])
-					fullDirective += "\n" + l
-					if strings.HasSuffix(strings.TrimSpace(l), ";") {
-						break
-					}
-					i++
+			if (name == "query" || name == "query_vertical") {
+				termDelim := ";"
+				if ctx.delimiter != "" {
+					termDelim = ctx.delimiter
 				}
-				directive = fullDirective
+				if !strings.HasSuffix(strings.TrimSpace(trimmed), termDelim) {
+					fullDirective := directive
+					i++
+					for i < len(lines) {
+						l := strings.TrimSpace(lines[i])
+						fullDirective += "\n" + l
+						if strings.HasSuffix(strings.TrimSpace(l), termDelim) {
+							break
+						}
+						i++
+					}
+					directive = fullDirective
+				}
 			}
 
 			handled, skip, err := ctx.handleDirective(directive)
@@ -602,14 +607,19 @@ func (ctx *execContext) executeLines(lines []string) error {
 			if strings.HasPrefix(bdLower, "query ") ||
 				strings.HasPrefix(bdLower, "query_vertical ") ||
 				strings.HasPrefix(bdLower, "eval ") {
-				if !strings.HasSuffix(strings.TrimSpace(trimmed), ";") {
+				// Use the current delimiter for multi-line collection
+				termDelim := ";"
+				if ctx.delimiter != "" {
+					termDelim = ctx.delimiter
+				}
+				if !strings.HasSuffix(strings.TrimSpace(trimmed), termDelim) {
 					fullDirective := bareDirective
 					i++
 					for i < len(lines) {
 						l := strings.TrimSpace(lines[i])
 						fullDirective += "\n" + l
-						if strings.HasSuffix(strings.TrimSpace(l), ";") {
-							fullDirective = strings.TrimSuffix(fullDirective, ";")
+						if strings.HasSuffix(strings.TrimSpace(l), termDelim) {
+							fullDirective = strings.TrimSuffix(fullDirective, termDelim)
 							i++ // consume the terminating line so it won't be re-executed as SQL
 							break
 						}
