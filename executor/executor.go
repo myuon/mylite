@@ -178,6 +178,8 @@ type Executor struct {
 	// within the same top-level query execution.  Keyed by the SQL
 	// string of the subquery.
 	subqueryValCache map[string][]interface{}
+	// executeDepth tracks the recursion depth of EXECUTE/CALL to prevent stack overflow.
+	executeDepth int
 }
 
 // Warning represents a MySQL warning.
@@ -2500,6 +2502,13 @@ func (e *Executor) execPrepare(stmt *sqlparser.PrepareStmt) (*Result, error) {
 
 // execExecute handles EXECUTE stmt_name [USING @var1, @var2, ...].
 func (e *Executor) execExecute(stmt *sqlparser.ExecuteStmt) (*Result, error) {
+	const maxExecuteDepth = 128
+	if e.executeDepth >= maxExecuteDepth {
+		return nil, mysqlError(1456, "HY000", "Prepared statement contains a stored routine call that refers to that same statement. It's not allowed to execute a prepared statement in such a recursive manner")
+	}
+	e.executeDepth++
+	defer func() { e.executeDepth-- }()
+
 	name := stmt.Name.String()
 	query, ok := e.preparedStmts[name]
 	if !ok {
@@ -7500,6 +7509,9 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 						}
 						crossed = append(crossed, combined)
 					} else {
+						if len(crossed) >= maxCrossProductRows {
+							break
+						}
 						combined := make(storage.Row, len(leftRow)+len(rightRow))
 						for k, v := range leftRow {
 							combined[k] = v
@@ -7509,6 +7521,9 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 						}
 						crossed = append(crossed, combined)
 					}
+				}
+				if !isLastJoin && len(crossed) >= maxCrossProductRows {
+					break
 				}
 			}
 			allRows = crossed
@@ -7526,6 +7541,9 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 			var crossed []storage.Row
 			for _, leftRow := range allRows {
 				for _, rightRow := range rightRows {
+					if len(crossed) >= maxCrossProductRows {
+						break
+					}
 					combined := make(storage.Row, len(leftRow)+len(rightRow))
 					for k, v := range leftRow {
 						combined[k] = v
@@ -7534,6 +7552,9 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 						combined[k] = v
 					}
 					crossed = append(crossed, combined)
+				}
+				if len(crossed) >= maxCrossProductRows {
+					break
 				}
 			}
 			allRows = crossed
@@ -7737,6 +7758,11 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// Handle SELECT ... INTO OUTFILE
 	if stmt.Into != nil && stmt.Into.Type == sqlparser.IntoOutfile {
 		return e.execSelectIntoOutfile(stmt.Into, colNames, resultRows)
+	}
+
+	// Handle SELECT ... INTO @var1, @var2, ...
+	if stmt.Into != nil && stmt.Into.Type == sqlparser.IntoVariables {
+		return e.execSelectIntoUserVars(stmt.Into, colNames, resultRows)
 	}
 
 	return &Result{
@@ -8094,6 +8120,11 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 	// Handle SELECT ... INTO OUTFILE (GROUP BY path)
 	if stmt.Into != nil && stmt.Into.Type == sqlparser.IntoOutfile {
 		return e.execSelectIntoOutfile(stmt.Into, colNames, resultRows)
+	}
+
+	// Handle SELECT ... INTO @var1, @var2, ... (GROUP BY path)
+	if stmt.Into != nil && stmt.Into.Type == sqlparser.IntoVariables {
+		return e.execSelectIntoUserVars(stmt.Into, colNames, resultRows)
 	}
 
 	return &Result{
@@ -18180,10 +18211,22 @@ func (e *Executor) getTableRowsWithAliasDB(dbName, tableName, alias string) ([]s
 	return result, nil
 }
 
+// maxCrossProductRows limits the result of a cross product to prevent
+// memory exhaustion from multi-way Cartesian products.
+const maxCrossProductRows = 10_000
+
 func crossProduct(left, right []storage.Row) []storage.Row {
-	var result []storage.Row
+	estimated := len(left) * len(right)
+	if estimated > maxCrossProductRows {
+		// Allocate up to the limit
+		estimated = maxCrossProductRows
+	}
+	result := make([]storage.Row, 0, estimated)
 	for _, l := range left {
 		for _, r := range right {
+			if len(result) >= maxCrossProductRows {
+				return result
+			}
 			combined := make(storage.Row, len(l)+len(r))
 			for k, v := range l {
 				combined[k] = v
@@ -19042,6 +19085,29 @@ func isNonStringOutfileValue(s string) bool {
 		}
 	}
 	return false
+}
+
+// execSelectIntoUserVars handles SELECT ... INTO @var1, @var2, ...
+// It assigns the first row's column values to the specified user variables.
+func (e *Executor) execSelectIntoUserVars(into *sqlparser.SelectInto, colNames []string, rows [][]interface{}) (*Result, error) {
+	if len(rows) == 0 {
+		// No rows: set all variables to NULL
+		for _, v := range into.VarList {
+			varName := v.Name.String()
+			e.userVars[varName] = nil
+		}
+		return &Result{}, nil
+	}
+	row := rows[0]
+	for i, v := range into.VarList {
+		varName := v.Name.String()
+		if i < len(row) {
+			e.userVars[varName] = row[i]
+		} else {
+			e.userVars[varName] = nil
+		}
+	}
+	return &Result{}, nil
 }
 
 // execCreateFunction handles CREATE FUNCTION name(params) RETURNS type BEGIN...END
