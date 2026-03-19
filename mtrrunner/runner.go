@@ -146,6 +146,11 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	defer cancel()
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				doneCh <- fmt.Errorf("panic during test execution: %v", r)
+			}
+		}()
 		doneCh <- ectx.executeLines(lines)
 	}()
 
@@ -272,6 +277,7 @@ type execContext struct {
 	verticalResults  bool           // persistent vertical output mode (--vertical_results)
 	infoEnabled      bool           // --enable_info: show affected rows and info after DML
 	skipped          bool           // set to true when --skip directive is encountered
+	sourceDepth      int            // current --source recursion depth
 	ttsBackups       map[string]tableSnapshot
 }
 
@@ -408,7 +414,7 @@ func (ctx *execContext) executeLines(lines []string) error {
 			bodyLines := lines[bodyStart:j]
 
 			// Execute while loop
-			for loopCount := 0; loopCount < 100000; loopCount++ {
+			for loopCount := 0; loopCount < 10000; loopCount++ {
 				condVal := ctx.substituteVars(condStr)
 				if !evalWhileCondition(condVal) {
 					break
@@ -479,7 +485,7 @@ func (ctx *execContext) executeLines(lines []string) error {
 						j++
 					}
 					bodyLines := lines[bodyStart:j]
-					for loopCount := 0; loopCount < 100000; loopCount++ {
+					for loopCount := 0; loopCount < 10000; loopCount++ {
 						condVal := ctx.substituteVars(condStr)
 						if !evalWhileCondition(condVal) {
 							break
@@ -2164,6 +2170,13 @@ func stripUndefinedVars(s string) string {
 }
 
 func (ctx *execContext) sourceFile(filename string) error {
+	const maxSourceDepth = 10
+	if ctx.sourceDepth >= maxSourceDepth {
+		return fmt.Errorf("--source recursion depth exceeded (max %d): %s", maxSourceDepth, filename)
+	}
+	ctx.sourceDepth++
+	defer func() { ctx.sourceDepth-- }()
+
 	filename = strings.TrimSpace(filename)
 	// Apply variable substitution in filename
 	filename = ctx.substituteVars(filename)

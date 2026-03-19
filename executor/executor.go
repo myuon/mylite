@@ -174,6 +174,9 @@ type Executor struct {
 	// onDupValuesRow holds the candidate INSERT row while evaluating
 	// ON DUPLICATE KEY UPDATE expressions (for VALUES(col) support).
 	onDupValuesRow storage.Row
+	// routineDepth tracks the current stored procedure/function call depth
+	// to prevent stack overflow from recursive calls.
+	routineDepth int
 }
 
 // Warning represents a MySQL warning.
@@ -19062,6 +19065,13 @@ type routineContext struct {
 // execRoutineBody executes the body of a stored procedure or function, supporting
 // DECLARE, SET, IF, WHILE, REPEAT, CURSOR, HANDLER, RETURN, and general SQL statements.
 func (e *Executor) execRoutineBody(body []string, paramVars map[string]interface{}) (interface{}, error) {
+	const maxRoutineDepth = 100
+	if e.routineDepth >= maxRoutineDepth {
+		return nil, fmt.Errorf("Error 1456 (HY000): Recursive stored routine call depth limit %d exceeded", maxRoutineDepth)
+	}
+	e.routineDepth++
+	defer func() { e.routineDepth-- }()
+
 	ctx := &routineContext{
 		localVars:  make(map[string]interface{}),
 		cursors:    make(map[string]*cursorState),
