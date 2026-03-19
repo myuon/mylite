@@ -745,6 +745,34 @@ func (e *Executor) initSystemTables() {
 			{Name: "Timestamp", Type: "TIMESTAMP"},
 		},
 	})
+
+	// Initialize sys schema stub tables/views
+	if sysDB, err := e.Catalog.GetDatabase("sys"); err == nil {
+		initSysSchema(sysDB)
+		// Create storage-backed tables and seed data for sys.version and sys.sys_config
+		e.Storage.EnsureDatabase("sys")
+		for _, tbl := range sysDB.Tables {
+			e.Storage.CreateTable("sys", tbl)
+		}
+		// Seed sys.version
+		if vt, err := e.Storage.GetTable("sys", "version"); err == nil {
+			vt.Insert(storage.Row{"sys_version": "2.1.0", "mysql_version": "8.0.36"}) //nolint:errcheck
+		}
+		// Seed sys.sys_config
+		if sct, err := e.Storage.GetTable("sys", "sys_config"); err == nil {
+			sysConfigRows := []storage.Row{
+				{"variable": "diagnostics.allow_i_s_tables", "value": "OFF", "set_time": nil, "set_by": nil},
+				{"variable": "diagnostics.include_raw", "value": "OFF", "set_time": nil, "set_by": nil},
+				{"variable": "ps_thread_trx_info.max_length", "value": "65535", "set_time": nil, "set_by": nil},
+				{"variable": "statement_performance_analyzer.limit", "value": "100", "set_time": nil, "set_by": nil},
+				{"variable": "statement_performance_analyzer.view", "value": nil, "set_time": nil, "set_by": nil},
+				{"variable": "statement_truncate_len", "value": "64", "set_time": nil, "set_by": nil},
+			}
+			for _, row := range sysConfigRows {
+				sct.Insert(row) //nolint:errcheck
+			}
+		}
+	}
 }
 
 func isSystemSchemaName(name string) bool {
@@ -754,6 +782,10 @@ func isSystemSchemaName(name string) bool {
 	default:
 		return false
 	}
+}
+
+func isSysSchemaName(name string) bool {
+	return strings.EqualFold(name, "sys")
 }
 
 func statsIndexColName(raw string) string {
@@ -11809,6 +11841,8 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 			defVal = *col.Default
 		} else if col.Nullable && !isInfoSchemaTable(descDB) {
 			defVal = nil // NULL for nullable columns without explicit default (user tables)
+		} else if isSysSchemaName(descDB) {
+			defVal = nil // NULL for sys schema view columns without explicit default
 		} else {
 			defVal = "" // empty for NOT NULL or INFORMATION_SCHEMA columns
 		}
@@ -11816,6 +11850,8 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 		extra = ""
 		if col.AutoIncrement {
 			extra = "auto_increment"
+		} else if col.OnUpdateCurrentTimestamp && col.Default != nil && strings.EqualFold(*col.Default, "CURRENT_TIMESTAMP") {
+			extra = "DEFAULT_GENERATED on update CURRENT_TIMESTAMP"
 		}
 		// For TEMPORARY tables, MySQL returns NULL for the Extra column when empty
 		if e.tempTables[tableName] && extra == "" {
@@ -13300,7 +13336,15 @@ func mysqlDisplayType(colType string) string {
 	base := upper
 	suffix := ""
 	if idx := strings.Index(upper, "("); idx >= 0 {
-		// Already has width specified, just lowercase it
+		// Already has width specified
+		// For ENUM/SET, preserve the case of values inside parentheses
+		basePrefix := strings.ToUpper(stripped[:idx])
+		if basePrefix == "ENUM" || basePrefix == "SET" {
+			// Lowercase only the type keyword, preserve values
+			result := strings.ToLower(stripped[:idx]) + stripped[idx:]
+			return result
+		}
+		// For other types, just lowercase everything
 		// But also normalize REAL to DOUBLE, NUMERIC to DECIMAL, INTEGER to INT
 		result := strings.ToLower(stripped)
 		if strings.HasPrefix(result, "real") {
