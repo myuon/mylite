@@ -2181,6 +2181,12 @@ func extractRawSelectExprs(query string) []string {
 		return nil
 	}
 	start := len("select ")
+	// Skip DISTINCT keyword so column names don't include it
+	rest := strings.TrimSpace(q[start:])
+	restLower := strings.ToLower(rest)
+	if strings.HasPrefix(restLower, "distinct ") {
+		start = len(q) - len(rest) + len("distinct ")
+	}
 	inQuote := byte(0)
 	parenDepth := 0
 	end := len(q)
@@ -11076,10 +11082,10 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 		var defVal interface{}
 		if col.Default != nil {
 			defVal = *col.Default
-		} else if col.Nullable && !isInfoSchemaTable(descDB) {
-			defVal = nil // NULL for nullable columns without explicit default (user tables)
+		} else if !isInfoSchemaTable(descDB) {
+			defVal = nil // NULL for columns without explicit default (user tables)
 		} else {
-			defVal = "" // empty for NOT NULL or INFORMATION_SCHEMA columns
+			defVal = "" // empty for INFORMATION_SCHEMA columns
 		}
 		var extra interface{}
 		extra = ""
@@ -12085,9 +12091,11 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	displayIndexes := make([]catalog.IndexDef, len(def.Indexes))
 	copy(displayIndexes, def.Indexes)
 	sort.SliceStable(displayIndexes, func(i, j int) bool {
-		left := isClusterPreferredUniqueIndex(displayIndexes[i], def.Columns)
-		right := isClusterPreferredUniqueIndex(displayIndexes[j], def.Columns)
-		return left && !right
+		// MySQL orders UNIQUE indexes before non-unique indexes in SHOW CREATE TABLE
+		if displayIndexes[i].Unique != displayIndexes[j].Unique {
+			return displayIndexes[i].Unique
+		}
+		return false
 	})
 	for i, idx := range displayIndexes {
 		quotedCols := make([]string, len(idx.Columns))
