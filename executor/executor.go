@@ -8074,7 +8074,84 @@ func (e *Executor) preFilterRows(rows []storage.Row, preds []sqlparser.Expr) ([]
 	return filtered, nil
 }
 
+// checkGlobalOnlyVarSessionAccess checks SELECT expressions for explicit
+// SESSION/LOCAL access to GLOBAL-only variables. It walks each top-level
+// AliasedExpr. For comparison expressions like "col = @@SESSION.var", MySQL
+// errors on the unknown column first, so we replicate that behavior.
+func (e *Executor) checkGlobalOnlyVarSessionAccess(stmt *sqlparser.Select) error {
+	upperQ := strings.ToUpper(e.currentQuery)
+	for _, expr := range stmt.SelectExprs.Exprs {
+		ae, ok := expr.(*sqlparser.AliasedExpr)
+		if !ok {
+			continue
+		}
+		// Check if top-level is a comparison with a bare ColName on one side
+		if cmp, ok := ae.Expr.(*sqlparser.ComparisonExpr); ok {
+			// Check if left or right is a bare ColName (not a real table column)
+			colName := ""
+			if cn, ok := cmp.Left.(*sqlparser.ColName); ok && cn.Qualifier.IsEmpty() {
+				colName = cn.Name.String()
+			} else if cn, ok := cmp.Right.(*sqlparser.ColName); ok && cn.Qualifier.IsEmpty() {
+				colName = cn.Name.String()
+			}
+			if colName != "" {
+				// Check if the other side has a session-scoped global-only variable
+				var hasSessionVar bool
+				sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+					v, ok := node.(*sqlparser.Variable)
+					if !ok || v.Scope != sqlparser.SessionScope {
+						return true, nil
+					}
+					varName := strings.ToLower(v.Name.String())
+					if sysVarGlobalOnly[varName] {
+						upperName := strings.ToUpper(varName)
+						if strings.Contains(upperQ, "@@SESSION."+upperName) ||
+							strings.Contains(upperQ, "@@LOCAL."+upperName) {
+							hasSessionVar = true
+						}
+					}
+					return true, nil
+				}, ae.Expr)
+				if hasSessionVar {
+					return mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'field list'", colName))
+				}
+			}
+		}
+		// For non-comparison expressions, check for session access to global-only vars
+		var walkErr error
+		sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+			if walkErr != nil {
+				return false, nil
+			}
+			v, ok := node.(*sqlparser.Variable)
+			if !ok || v.Scope != sqlparser.SessionScope {
+				return true, nil
+			}
+			varName := strings.ToLower(v.Name.String())
+			varName = strings.TrimPrefix(varName, "session.")
+			varName = strings.TrimPrefix(varName, "local.")
+			if !sysVarGlobalOnly[varName] {
+				return true, nil
+			}
+			upperName := strings.ToUpper(varName)
+			if strings.Contains(upperQ, "@@SESSION."+upperName) ||
+				strings.Contains(upperQ, "@@LOCAL."+upperName) {
+				walkErr = mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a GLOBAL variable", varName))
+			}
+			return true, nil
+		}, ae.Expr)
+		if walkErr != nil {
+			return walkErr
+		}
+	}
+	return nil
+}
+
 func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
+	// Pre-check: detect explicit SESSION/LOCAL access to GLOBAL-only variables.
+	if err := e.checkGlobalOnlyVarSessionAccess(stmt); err != nil {
+		return nil, err
+	}
 	// Handle SELECT without FROM (e.g., SELECT 1, SELECT @@version_comment)
 	if len(stmt.From) == 0 {
 		return e.execSelectNoFrom(stmt)
@@ -8690,6 +8767,11 @@ func isAggregateExpr(expr sqlparser.Expr) bool {
 
 // execSelectGroupBy handles SELECT with GROUP BY or aggregate functions.
 func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.Row) (*Result, error) {
+	// Pass currentQuery to the free evalRowExpr shim so global-only variable
+	// scope checking works inside aggregate expressions (e.g., COUNT(@@SESSION.var)).
+	evalRowExprCurrentQuery = e.currentQuery
+	defer func() { evalRowExprCurrentQuery = "" }()
+
 	type group struct {
 		key  string
 		rows []storage.Row
@@ -8715,19 +8797,45 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 
 	// Compute column names
 	colNames := make([]string, 0, len(stmt.SelectExprs.Exprs))
+	rawExprsGB := extractRawSelectExprs(e.currentQuery)
+	rawExprIdxGB := 0
 	for _, expr := range stmt.SelectExprs.Exprs {
 		switch se := expr.(type) {
 		case *sqlparser.AliasedExpr:
 			if !se.As.IsEmpty() {
 				colNames = append(colNames, se.As.String())
 			} else if isAggregateExpr(se.Expr) {
-				// MySQL returns aggregate function names in uppercase
-				colNames = append(colNames, aggregateDisplayName(se.Expr))
+				// Use raw expression text to preserve @@GLOBAL./@@SESSION. case
+				name := ""
+				if rawExprIdxGB < len(rawExprsGB) {
+					raw := strings.TrimSpace(rawExprsGB[rawExprIdxGB])
+					// Uppercase the aggregate function name to match MySQL behavior
+					lRaw := strings.ToLower(raw)
+					for _, fn := range []string{"count", "sum", "avg", "min", "max", "json_arrayagg", "json_objectagg"} {
+						if strings.HasPrefix(lRaw, fn+"(") {
+							raw = strings.ToUpper(fn) + raw[len(fn):]
+							break
+						}
+					}
+					name = raw
+				}
+				if name == "" {
+					name = aggregateDisplayName(se.Expr)
+				}
+				colNames = append(colNames, name)
 			} else if colName, ok := se.Expr.(*sqlparser.ColName); ok {
 				colNames = append(colNames, colName.Name.String())
 			} else {
-				colNames = append(colNames, normalizeSQLDisplayName(sqlparser.String(se.Expr)))
+				name := ""
+				if rawExprIdxGB < len(rawExprsGB) {
+					name = strings.TrimSpace(rawExprsGB[rawExprIdxGB])
+				}
+				if name == "" {
+					name = normalizeSQLDisplayName(sqlparser.String(se.Expr))
+				}
+				colNames = append(colNames, name)
 			}
+			rawExprIdxGB++
 		default:
 			return nil, fmt.Errorf("unsupported select expression in GROUP BY: %T", expr)
 		}
@@ -9838,15 +9946,28 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 	colNames := make([]string, 0)
 	values := make([]interface{}, 0)
 
+	rawExprsNF := extractRawSelectExprs(e.currentQuery)
+	rawExprIdxNF := 0
+
 	for _, expr := range stmt.SelectExprs.Exprs {
 		switch se := expr.(type) {
 		case *sqlparser.AliasedExpr:
 			name := ""
 			if !se.As.IsEmpty() {
 				name = se.As.String()
+			} else if colName, ok := se.Expr.(*sqlparser.ColName); ok {
+				name = colName.Name.String()
 			} else {
-				name = normalizeSQLDisplayName(sqlparser.String(se.Expr))
+				// Use raw expression text from original query to preserve
+				// case of @@GLOBAL./@@SESSION. prefixes (vitess lowercases them).
+				if rawExprIdxNF < len(rawExprsNF) {
+					name = strings.TrimSpace(rawExprsNF[rawExprIdxNF])
+				}
+				if name == "" {
+					name = normalizeSQLDisplayName(sqlparser.String(se.Expr))
+				}
 			}
+			rawExprIdxNF++
 			colNames = append(colNames, name)
 
 			v, err := e.evalExpr(se.Expr)
@@ -11771,118 +11892,375 @@ var sysVarReadOnly = map[string]bool{
 	"caching_sha2_password_public_key_path": true,
 }
 
-// sysVarGlobalOnly contains system variables that can only be SET at GLOBAL scope.
-// Only includes variables where we are 100% certain they are GLOBAL-only in MySQL 8.0.
+// sysVarGlobalOnly contains system variables that can only be accessed at GLOBAL scope.
+// Accessing these via @@SESSION. or @@LOCAL. produces ER_INCORRECT_GLOBAL_LOCAL_VAR.
 var sysVarGlobalOnly = map[string]bool{
-	"avoid_temporal_upgrade":          true,
-	"binlog_cache_size":               true,
-	"binlog_error_action":             true,
-	"binlog_expire_logs_seconds":      true,
-	"binlog_group_commit_sync_delay":  true,
+	"admin_address": true,
+	"admin_port": true,
+	"automatic_sp_privileges": true,
+	"avoid_temporal_upgrade": true,
+	"back_log": true,
+	"basedir": true,
+	"bind_address": true,
+	"binlog_cache_size": true,
+	"binlog_checksum": true,
+	"binlog_encryption": true,
+	"binlog_error_action": true,
+	"binlog_expire_logs_seconds": true,
+	"binlog_group_commit_sync_delay": true,
 	"binlog_group_commit_sync_no_delay_count": true,
-	"binlog_max_flush_queue_time":     true,
-	"binlog_order_commits":            true,
-	"binlog_stmt_cache_size":          true,
-	"check_proxy_users":               true,
-	"connect_timeout":                 true,
-	"default_authentication_plugin":   true,
-	"default_password_lifetime":       true,
-	"disconnect_on_expired_password":  true,
-	"expire_logs_days":                true,
-	"flush":                           true,
-	"flush_time":                      true,
-	"general_log":                     true,
-	"general_log_file":                true,
+	"binlog_gtid_simple_recovery": true,
+	"binlog_max_flush_queue_time": true,
+	"binlog_order_commits": true,
+	"binlog_rotate_encryption_master_key_at_startup": true,
+	"binlog_row_metadata": true,
+	"binlog_stmt_cache_size": true,
+	"character_set_system": true,
+	"character_sets_dir": true,
+	"check_proxy_users": true,
+	"concurrent_insert": true,
+	"connect_timeout": true,
+	"create_admin_listener_thread": true,
+	"datadir": true,
+	"default_authentication_plugin": true,
+	"default_password_lifetime": true,
+	"delay_key_write": true,
+	"delayed_insert_limit": true,
+	"delayed_insert_timeout": true,
+	"delayed_queue_size": true,
+	"disconnect_on_expired_password": true,
+	"enforce_gtid_consistency": true,
+	"event_scheduler": true,
+	"expire_logs_days": true,
+	"flush": true,
+	"flush_time": true,
+	"ft_boolean_syntax": true,
+	"ft_max_word_len": true,
+	"ft_min_word_len": true,
+	"ft_query_expansion_limit": true,
+	"ft_stopword_file": true,
+	"general_log": true,
+	"general_log_file": true,
+	"gtid_executed": true,
 	"gtid_executed_compression_period": true,
-	"innodb_adaptive_flushing":        true,
-	"innodb_adaptive_flushing_lwm":    true,
-	"innodb_adaptive_hash_index":      true,
+	"gtid_mode": true,
+	"gtid_purged": true,
+	"have_compress": true,
+	"have_dynamic_loading": true,
+	"have_geometry": true,
+	"have_openssl": true,
+	"have_profiling": true,
+	"have_query_cache": true,
+	"have_rtree_keys": true,
+	"have_ssl": true,
+	"have_symlink": true,
+	"host_cache_size": true,
+	"hostname": true,
+	"init_file": true,
+	"init_slave": true,
+	"innodb_adaptive_flushing": true,
+	"innodb_adaptive_flushing_lwm": true,
+	"innodb_adaptive_hash_index": true,
 	"innodb_adaptive_hash_index_parts": true,
 	"innodb_adaptive_max_sleep_delay": true,
+	"innodb_api_bk_commit_interval": true,
+	"innodb_api_disable_rowlock": true,
+	"innodb_api_enable_binlog": true,
+	"innodb_api_enable_mdl": true,
+	"innodb_api_trx_level": true,
+	"innodb_buffer_pool_chunk_size": true,
 	"innodb_buffer_pool_dump_at_shutdown": true,
-	"innodb_buffer_pool_dump_now":     true,
-	"innodb_buffer_pool_dump_pct":     true,
-	"innodb_buffer_pool_filename":     true,
+	"innodb_buffer_pool_dump_now": true,
+	"innodb_buffer_pool_dump_pct": true,
+	"innodb_buffer_pool_filename": true,
 	"innodb_buffer_pool_in_core_file": true,
-	"innodb_buffer_pool_load_abort":   true,
-	"innodb_buffer_pool_load_now":     true,
-	"innodb_buffer_pool_size":         true,
-	"innodb_change_buffer_max_size":   true,
-	"innodb_cmp_per_index_enabled":    true,
-	"innodb_commit_concurrency":       true,
+	"innodb_buffer_pool_instances": true,
+	"innodb_buffer_pool_load_abort": true,
+	"innodb_buffer_pool_load_now": true,
+	"innodb_buffer_pool_size": true,
+	"innodb_change_buffer_max_size": true,
+	"innodb_change_buffering": true,
+	"innodb_cmp_per_index_enabled": true,
+	"innodb_commit_concurrency": true,
 	"innodb_compression_failure_threshold_pct": true,
-	"innodb_compression_pad_pct_max":  true,
-	"innodb_concurrency_tickets":      true,
-	"innodb_deadlock_detect":          true,
-	"innodb_disable_sort_file_cache":  true,
-	"innodb_fast_shutdown":            true,
-	"innodb_flush_log_at_timeout":     true,
-	"innodb_flush_neighbors":          true,
-	"innodb_flush_sync":               true,
-	"innodb_flushing_avg_loops":       true,
-	"innodb_ft_enable_diag_print":     true,
-	"innodb_ft_num_word_optimize":     true,
-	"innodb_ft_result_cache_limit":    true,
-	"innodb_io_capacity":              true,
-	"innodb_io_capacity_max":          true,
-	"innodb_lru_scan_depth":           true,
-	"innodb_max_dirty_pages_pct":      true,
-	"innodb_max_dirty_pages_pct_lwm":  true,
-	"innodb_max_purge_lag":            true,
-	"innodb_max_purge_lag_delay":      true,
-	"innodb_max_undo_log_size":        true,
-	"innodb_monitor_disable":          true,
-	"innodb_monitor_enable":           true,
-	"innodb_monitor_reset":            true,
-	"innodb_monitor_reset_all":        true,
-	"innodb_old_blocks_pct":           true,
-	"innodb_old_blocks_time":          true,
+	"innodb_compression_level": true,
+	"innodb_compression_pad_pct_max": true,
+	"innodb_concurrency_tickets": true,
+	"innodb_data_file_path": true,
+	"innodb_data_home_dir": true,
+	"innodb_deadlock_detect": true,
+	"innodb_directories": true,
+	"innodb_disable_sort_file_cache": true,
+	"innodb_doublewrite": true,
+	"innodb_fast_shutdown": true,
+	"innodb_file_per_table": true,
+	"innodb_fill_factor": true,
+	"innodb_flush_log_at_timeout": true,
+	"innodb_flush_method": true,
+	"innodb_flush_neighbors": true,
+	"innodb_flush_sync": true,
+	"innodb_flushing_avg_loops": true,
+	"innodb_force_load_corrupted": true,
+	"innodb_force_recovery": true,
+	"innodb_ft_aux_table": true,
+	"innodb_ft_cache_size": true,
+	"innodb_ft_enable_diag_print": true,
+	"innodb_ft_max_token_size": true,
+	"innodb_ft_min_token_size": true,
+	"innodb_ft_num_word_optimize": true,
+	"innodb_ft_result_cache_limit": true,
+	"innodb_ft_server_stopword_table": true,
+	"innodb_ft_sort_pll_degree": true,
+	"innodb_ft_total_cache_size": true,
+	"innodb_io_capacity": true,
+	"innodb_io_capacity_max": true,
+	"innodb_log_buffer_size": true,
+	"innodb_log_compressed_pages": true,
+	"innodb_log_file_size": true,
+	"innodb_log_files_in_group": true,
+	"innodb_log_group_home_dir": true,
+	"innodb_log_spin_cpu_abs_lwm": true,
+	"innodb_log_spin_cpu_pct_hwm": true,
+	"innodb_log_wait_for_flush_spin_hwm": true,
+	"innodb_log_write_ahead_size": true,
+	"innodb_lru_scan_depth": true,
+	"innodb_max_dirty_pages_pct": true,
+	"innodb_max_dirty_pages_pct_lwm": true,
+	"innodb_max_purge_lag": true,
+	"innodb_max_purge_lag_delay": true,
+	"innodb_max_undo_log_size": true,
+	"innodb_monitor_disable": true,
+	"innodb_monitor_enable": true,
+	"innodb_monitor_reset": true,
+	"innodb_monitor_reset_all": true,
+	"innodb_numa_interleave": true,
+	"innodb_old_blocks_pct": true,
+	"innodb_old_blocks_time": true,
 	"innodb_online_alter_log_max_size": true,
-	"innodb_optimize_fulltext_only":   true,
-	"innodb_print_all_deadlocks":      true,
-	"innodb_print_ddl_log":            true,
-	"innodb_purge_batch_size":         true,
+	"innodb_open_files": true,
+	"innodb_optimize_fulltext_only": true,
+	"innodb_page_cleaners": true,
+	"innodb_print_all_deadlocks": true,
+	"innodb_print_ddl_log": true,
+	"innodb_purge_batch_size": true,
 	"innodb_purge_rseg_truncate_frequency": true,
-	"innodb_random_read_ahead":        true,
-	"innodb_read_ahead_threshold":     true,
-	"innodb_redo_log_encrypt":         true,
-	"innodb_replication_delay":        true,
-	"innodb_spin_wait_delay":          true,
+	"innodb_purge_threads": true,
+	"innodb_random_read_ahead": true,
+	"innodb_read_ahead_threshold": true,
+	"innodb_read_io_threads": true,
+	"innodb_read_only": true,
+	"innodb_redo_log_archive_dirs": true,
+	"innodb_redo_log_encrypt": true,
+	"innodb_replication_delay": true,
+	"innodb_rollback_on_timeout": true,
+	"innodb_rollback_segments": true,
+	"innodb_sort_buffer_size": true,
+	"innodb_spin_wait_delay": true,
 	"innodb_spin_wait_pause_multiplier": true,
 	"innodb_stats_include_delete_marked": true,
-	"innodb_stats_on_metadata":        true,
-	"innodb_status_output":            true,
-	"innodb_status_output_locks":      true,
-	"innodb_sync_spin_loops":          true,
-	"innodb_thread_concurrency":       true,
-	"innodb_thread_sleep_delay":       true,
-	"innodb_undo_log_encrypt":         true,
-	"log_error_verbosity":             true,
-	"log_error_suppression_list":      true,
-	"log_error_services":              true,
+	"innodb_stats_method": true,
+	"innodb_stats_on_metadata": true,
+	"innodb_stats_persistent_sample_pages": true,
+	"innodb_stats_transient_sample_pages": true,
+	"innodb_status_output": true,
+	"innodb_status_output_locks": true,
+	"innodb_sync_array_size": true,
+	"innodb_sync_spin_loops": true,
+	"innodb_temp_data_file_path": true,
+	"innodb_temp_tablespaces_dir": true,
+	"innodb_thread_concurrency": true,
+	"innodb_thread_sleep_delay": true,
+	"innodb_undo_directory": true,
+	"innodb_undo_log_encrypt": true,
+	"innodb_undo_log_truncate": true,
+	"innodb_undo_tablespaces": true,
+	"innodb_use_native_aio": true,
+	"innodb_write_io_threads": true,
+	"key_buffer_size": true,
+	"key_cache_age_threshold": true,
+	"key_cache_block_size": true,
+	"key_cache_division_limit": true,
+	"large_files_support": true,
+	"large_page_size": true,
+	"large_pages": true,
+	"license": true,
+	"local_infile": true,
+	"lock_order": true,
+	"lock_order_debug_loop": true,
+	"lock_order_debug_missing_arc": true,
+	"lock_order_debug_missing_key": true,
+	"lock_order_debug_missing_unlock": true,
+	"lock_order_dependencies": true,
+	"lock_order_extra_dependencies": true,
+	"lock_order_output_directory": true,
+	"lock_order_print_txt": true,
+	"lock_order_trace_loop": true,
+	"lock_order_trace_missing_arc": true,
+	"lock_order_trace_missing_key": true,
+	"lock_order_trace_missing_unlock": true,
+	"locked_in_memory": true,
 	"log_bin_trust_function_creators": true,
-	"max_connections":                 true,
-	"max_connect_errors":              true,
+	"log_bin_use_v1_row_events": true,
+	"log_error": true,
+	"log_error_services": true,
+	"log_error_suppression_list": true,
+	"log_error_verbosity": true,
+	"log_output": true,
+	"log_queries_not_using_indexes": true,
+	"log_slow_admin_statements": true,
+	"log_slow_slave_statements": true,
+	"log_statements_unsafe_for_binlog": true,
+	"lower_case_file_system": true,
+	"lower_case_table_names": true,
+	"master_info_repository": true,
+	"master_verify_checksum": true,
+	"max_binlog_cache_size": true,
+	"max_binlog_size": true,
+	"max_binlog_stmt_cache_size": true,
+	"max_connect_errors": true,
+	"max_connections": true,
+	"max_digest_length": true,
+	"max_prepared_stmt_count": true,
+	"max_relay_log_size": true,
+	"myisam_data_pointer_size": true,
+	"myisam_max_sort_file_size": true,
+	"myisam_mmap_size": true,
+	"myisam_recover_options": true,
+	"myisam_use_mmap": true,
 	"mysql_native_password_proxy_users": true,
-	"sha256_password_proxy_users":     true,
-	"mysqlx_connect_timeout":          true,
+	"mysqlx_bind_address": true,
+	"mysqlx_connect_timeout": true,
 	"mysqlx_document_id_unique_prefix": true,
-	"mysqlx_enable_hello_notice":      true,
+	"mysqlx_enable_hello_notice": true,
 	"mysqlx_idle_worker_thread_timeout": true,
-	"mysqlx_max_allowed_packet":       true,
-	"mysqlx_max_connections":          true,
-	"mysqlx_min_worker_threads":       true,
-	"password_history":                true,
-	"password_reuse_interval":         true,
-	"password_require_current":        true,
-	"sync_binlog":                     true,
-	"table_open_cache":                true,
-	"table_open_cache_instances":      true,
-	"table_definition_cache":          true,
-	"thread_cache_size":               true,
-	"delayed_insert_limit":            true,
-	"delayed_insert_timeout":          true,
-	"delayed_queue_size":              true,
+	"mysqlx_interactive_timeout": true,
+	"mysqlx_max_allowed_packet": true,
+	"mysqlx_max_connections": true,
+	"mysqlx_min_worker_threads": true,
+	"mysqlx_port_open_timeout": true,
+	"mysqlx_ssl_capath": true,
+	"mysqlx_ssl_cert": true,
+	"mysqlx_ssl_cipher": true,
+	"named_pipe": true,
+	"named_pipe_full_access_group": true,
+	"ngram_token_size": true,
+	"offline_mode": true,
+	"old": true,
+	"open_files_limit": true,
+	"password_history": true,
+	"password_require_current": true,
+	"password_reuse_interval": true,
+	"performance_schema": true,
+	"performance_schema_accounts_size": true,
+	"performance_schema_digests_size": true,
+	"performance_schema_error_size": true,
+	"performance_schema_events_stages_history_long_size": true,
+	"performance_schema_events_stages_history_size": true,
+	"performance_schema_events_statements_history_long_size": true,
+	"performance_schema_events_statements_history_size": true,
+	"performance_schema_events_transactions_history_long_size": true,
+	"performance_schema_events_transactions_history_size": true,
+	"performance_schema_events_waits_history_long_size": true,
+	"performance_schema_events_waits_history_size": true,
+	"performance_schema_hosts_size": true,
+	"performance_schema_max_cond_classes": true,
+	"performance_schema_max_cond_instances": true,
+	"performance_schema_max_digest_length": true,
+	"performance_schema_max_file_classes": true,
+	"performance_schema_max_file_handles": true,
+	"performance_schema_max_file_instances": true,
+	"performance_schema_max_index_stat": true,
+	"performance_schema_max_memory_classes": true,
+	"performance_schema_max_metadata_locks": true,
+	"performance_schema_max_mutex_classes": true,
+	"performance_schema_max_mutex_instances": true,
+	"performance_schema_max_prepared_statements_instances": true,
+	"performance_schema_max_program_instances": true,
+	"performance_schema_max_rwlock_classes": true,
+	"performance_schema_max_rwlock_instances": true,
+	"performance_schema_max_socket_classes": true,
+	"performance_schema_max_socket_instances": true,
+	"performance_schema_max_sql_text_length": true,
+	"performance_schema_max_stage_classes": true,
+	"performance_schema_max_statement_classes": true,
+	"performance_schema_max_statement_stack": true,
+	"performance_schema_max_table_handles": true,
+	"performance_schema_max_table_instances": true,
+	"performance_schema_max_table_lock_stat": true,
+	"performance_schema_max_thread_classes": true,
+	"performance_schema_max_thread_instances": true,
+	"performance_schema_session_connect_attrs_size": true,
+	"performance_schema_setup_actors_size": true,
+	"performance_schema_setup_objects_size": true,
+	"performance_schema_users_size": true,
+	"persisted_globals_load": true,
+	"protocol_version": true,
+	"read_only": true,
+	"relay_log": true,
+	"relay_log_basename": true,
+	"relay_log_index": true,
+	"relay_log_info_file": true,
+	"relay_log_info_repository": true,
+	"relay_log_purge": true,
+	"relay_log_recovery": true,
+	"relay_log_space_limit": true,
+	"report_host": true,
+	"report_password": true,
+	"report_port": true,
+	"report_user": true,
+	"require_secure_transport": true,
+	"rpl_read_size": true,
+	"rpl_stop_slave_timeout": true,
+	"schema_definition_cache": true,
+	"server_id": true,
+	"server_id_bits": true,
+	"server_uuid": true,
+	"sha256_password_proxy_users": true,
+	"shared_memory": true,
+	"shared_memory_base_name": true,
+	"skip_external_locking": true,
+	"skip_name_resolve": true,
+	"skip_networking": true,
+	"skip_show_database": true,
+	"slave_allow_batching": true,
+	"slave_checkpoint_group": true,
+	"slave_checkpoint_period": true,
+	"slave_compressed_protocol": true,
+	"slave_max_allowed_packet": true,
+	"slave_net_timeout": true,
+	"slave_parallel_workers": true,
+	"slave_pending_jobs_size_max": true,
+	"slave_preserve_commit_order": true,
+	"slave_skip_errors": true,
+	"slave_sql_verify_checksum": true,
+	"slave_transaction_retries": true,
+	"slow_launch_time": true,
+	"slow_query_log": true,
+	"sql_slave_skip_counter": true,
+	"ssl_capath": true,
+	"ssl_cipher": true,
+	"stored_program_cache": true,
+	"stored_program_definition_cache": true,
+	"super_read_only": true,
+	"sync_binlog": true,
+	"sync_master_info": true,
+	"sync_relay_log": true,
+	"sync_relay_log_info": true,
+	"system_time_zone": true,
+	"table_definition_cache": true,
+	"table_open_cache": true,
+	"table_open_cache_instances": true,
+	"tablespace_definition_cache": true,
+	"temptable_max_ram": true,
+	"thread_cache_size": true,
+	"thread_handling": true,
+	"thread_stack": true,
+	"tmpdir": true,
+	"version": true,
+	"version_comment": true,
+	"version_compile_machine": true,
+	"version_compile_os": true,
+	"version_compile_zlib": true,
 }
 
 // sysVarEnumSet contains system variables that are ENUM types where ON/OFF
@@ -13316,9 +13694,17 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		name = strings.TrimPrefix(name, "global.")
 		name = strings.TrimPrefix(name, "session.")
 		name = strings.TrimPrefix(name, "local.")
-		// Note: We cannot distinguish @@var from @@session.var in the AST
-		// (both have Scope=SessionScope), so we don't error on session access
-		// to GLOBAL-only variables. This allows @@var to work correctly.
+		// Check if a GLOBAL-only variable is accessed with explicit SESSION/LOCAL scope.
+		// The AST cannot distinguish @@var from @@session.var (both SessionScope),
+		// so we check the original query text for explicit qualifiers.
+		if v.Scope == sqlparser.SessionScope && sysVarGlobalOnly[name] {
+			upperQ := strings.ToUpper(e.currentQuery)
+			upperName := strings.ToUpper(name)
+			if strings.Contains(upperQ, "@@SESSION."+upperName) ||
+				strings.Contains(upperQ, "@@LOCAL."+upperName) {
+				return nil, mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a GLOBAL variable", name))
+			}
+		}
 		// Check for user-set global variables first
 		if gv, ok := e.globalVars[name]; ok {
 			// Apply minimum constraints
@@ -17869,13 +18255,17 @@ func (e *Executor) evalCaseExprWithRow(v *sqlparser.CaseExpr, row storage.Row) (
 // evalRowExpr is a package-level shim for backward-compatible callers that
 // do not have access to an executor.  It creates a temporary executor with
 // empty state, which is sufficient for column-lookup and literal evaluation.
+// evalRowExprCurrentQuery is set by execSelectGroupBy to pass currentQuery
+// to the free evalRowExpr shim for global-only variable scope checking.
+var evalRowExprCurrentQuery string
+
 func evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{}, error) {
 	// Some callers use this shim without full executor context.
 	// Avoid hard failures on subqueries that require storage/catalog.
 	if hasSubqueryExpr(expr) {
 		return nil, nil
 	}
-	e := &Executor{}
+	e := &Executor{currentQuery: evalRowExprCurrentQuery}
 	return e.evalRowExpr(expr, row)
 }
 
