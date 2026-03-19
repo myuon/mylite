@@ -145,7 +145,8 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 			"key_column_usage", "referential_constraints", "innodb_temp_table_info",
 			"triggers", "table_constraints", "character_sets", "collations",
 			"collation_character_set_applicability", "user_privileges", "schema_privileges",
-			"table_privileges", "column_privileges", "routines", "views", "check_constraints":
+			"table_privileges", "column_privileges", "routines", "views", "check_constraints",
+			"events", "partitions", "resource_groups", "view_table_usage":
 			return true
 		}
 		return false
@@ -156,7 +157,9 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 			"global_variables", "session_variables",
 			"events_waits_history_long", "events_waits_current",
 			"events_statements_history_long", "events_stages_history_long",
-			"performance_timers", "threads":
+			"performance_timers", "threads",
+			"session_connect_attrs", "session_account_connect_attrs",
+			"metadata_locks", "data_locks", "data_lock_waits":
 			return true
 		}
 		// For any other performance_schema table, check if it exists in the catalog.
@@ -434,9 +437,6 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 				}
 				if tblDef.StatsAutoRecalc != nil {
 					opts = append(opts, fmt.Sprintf("stats_auto_recalc=%d", *tblDef.StatsAutoRecalc))
-				}
-				if tblDef.StatsSamplePages != nil {
-					opts = append(opts, fmt.Sprintf("stats_sample_pages=%d", *tblDef.StatsSamplePages))
 				}
 				createOptions = strings.Join(opts, " ")
 			}
