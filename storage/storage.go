@@ -42,7 +42,8 @@ type Table struct {
 	// pkIndex is a hash set of primary key values for O(1) uniqueness checks.
 	// Lazily built on first Insert and maintained during Insert/BulkInsert.
 	// Invalidated (set to nil) on delete/update/truncate operations.
-	pkIndex map[string]bool
+	pkIndex    map[string]bool
+	pkRowIndex map[string]int
 	// colPKIndex maps column-level PK column names to their value sets.
 	colPKIndex map[string]map[string]bool
 	// uniqueIndex maps unique index names to their value sets.
@@ -63,8 +64,39 @@ func (t *Table) AutoIncrementValue() int64 { return t.AutoIncrement.Load() }
 // Must be called (or indexes will be stale) after delete/update/truncate/row-removal.
 func (t *Table) InvalidateIndexes() {
 	t.pkIndex = nil
+	t.pkRowIndex = nil
 	t.colPKIndex = nil
 	t.uniqueIndex = nil
+}
+
+// InvalidateNonPKIndexes clears uniqueness indexes but preserves pkRowIndex.
+func (t *Table) InvalidateNonPKIndexes() {
+	t.pkIndex = nil
+	t.colPKIndex = nil
+	t.uniqueIndex = nil
+}
+
+// EnsurePKRowIndex lazily builds a map from PK key string to row index.
+func (t *Table) EnsurePKRowIndex() {
+	if t.pkRowIndex != nil || len(t.Def.PrimaryKey) == 0 {
+		return
+	}
+	t.pkRowIndex = make(map[string]int, len(t.Rows))
+	for i, row := range t.Rows {
+		key := bulkPKKey(row, t.Def.PrimaryKey)
+		t.pkRowIndex[key] = i
+	}
+}
+
+// LookupRowIndexByPK returns the row index for the given PK key, or -1.
+func (t *Table) LookupRowIndexByPK(key string) int {
+	if t.pkRowIndex == nil {
+		return -1
+	}
+	if idx, ok := t.pkRowIndex[key]; ok {
+		return idx
+	}
+	return -1
 }
 
 // ensureIndexes lazily builds hash-set indexes for PK and UNIQUE constraints.

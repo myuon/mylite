@@ -178,14 +178,8 @@ type Executor struct {
 	// within the same top-level query execution.  Keyed by the SQL
 	// string of the subquery.
 	subqueryValCache map[string][]interface{}
-	// deterministicFuncCache caches results of DETERMINISTIC stored functions
-	// within the same top-level query execution.  Keyed by "funcName\x00arg1\x00arg2...".
-	deterministicFuncCache map[string]interface{}
 	// executeDepth tracks the recursion depth of EXECUTE/CALL to prevent stack overflow.
 	executeDepth int
-	// execNestDepth tracks nesting depth of Execute() to avoid clearing
-	// per-query caches during recursive calls from stored functions.
-	execNestDepth int
 	// sqlParser is a cached SQL parser instance to avoid allocation on every query.
 	sqlParser *sqlparser.Parser
 }
@@ -1726,14 +1720,9 @@ func (e *Executor) explainResultForType(explainType sqlparser.ExplainType, expla
 func (e *Executor) Execute(query string) (*Result, error) {
 	trimmed := strings.TrimSpace(query)
 	e.currentQuery = trimmed
-	// Clear per-query caches only at the top-level Execute call, not when
-	// called recursively from within a stored function (evaluateExprWithVars).
-	e.execNestDepth++
-	defer func() { e.execNestDepth-- }()
-	if e.execNestDepth == 1 {
-		e.subqueryValCache = nil
-		e.deterministicFuncCache = nil
-	}
+	// Clear per-query subquery cache so non-correlated IN subqueries
+	// are only evaluated once within the same top-level statement.
+	e.subqueryValCache = nil
 	upper := strings.ToUpper(trimmed)
 	// Only compute compact form for SELECT queries that might contain JSON function checks
 	if strings.HasPrefix(upper, "SELECT") && strings.Contains(upper, "JSON_") {
@@ -9681,17 +9670,45 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 
 	// Determine matching row indices
 	var matchingIndices []int
-	for i, row := range tbl.Rows {
-		match := true
-		if stmt.Where != nil {
-			m, err := e.evalWhere(stmt.Where.Expr, row)
-			if err != nil {
-				return nil, err
+
+	// Fast path: PK equality lookup for single-column PK without ORDER BY/LIMIT
+	usedPKFastPath := false
+	if stmt.Where != nil && len(tbl.Def.PrimaryKey) == 1 && stmt.OrderBy == nil && stmt.Limit == nil {
+		pkCol := stripPrefixLengthFromCol(tbl.Def.PrimaryKey[0])
+		if pkVal, remainExpr := extractPKEquality(stmt.Where.Expr, pkCol); pkVal != nil {
+			tbl.EnsurePKRowIndex()
+			keyStr := fmt.Sprintf("%v", pkVal)
+			rowIdx := tbl.LookupRowIndexByPK(keyStr)
+			if rowIdx >= 0 {
+				if remainExpr != nil {
+					m, err := e.evalWhere(remainExpr, tbl.Rows[rowIdx])
+					if err != nil {
+						return nil, err
+					}
+					if m {
+						matchingIndices = append(matchingIndices, rowIdx)
+					}
+				} else {
+					matchingIndices = append(matchingIndices, rowIdx)
+				}
 			}
-			match = m
+			usedPKFastPath = true
 		}
-		if match {
-			matchingIndices = append(matchingIndices, i)
+	}
+
+	if !usedPKFastPath {
+		for i, row := range tbl.Rows {
+			match := true
+			if stmt.Where != nil {
+				m, err := e.evalWhere(stmt.Where.Expr, row)
+				if err != nil {
+					return nil, err
+				}
+				match = m
+			}
+			if match {
+				matchingIndices = append(matchingIndices, i)
+			}
 		}
 	}
 
@@ -9859,29 +9876,58 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 				}
 			}
 			if len(pkCols) > 0 {
-				for j, other := range tbl.Rows {
-					if j == i {
-						continue
-					}
-					match := true
-					for _, pk := range pkCols {
-						basePk := stripPrefixLengthFromCol(pk)
-						if fmt.Sprintf("%v", other[basePk]) != fmt.Sprintf("%v", newRow[basePk]) {
-							match = false
-							break
-						}
-					}
-					if match {
-						keyVals := make([]string, len(pkCols))
-						for k, pk := range pkCols {
-							keyVals[k] = fmt.Sprintf("%v", newRow[stripPrefixLengthFromCol(pk)])
-						}
-						return mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key 'PRIMARY'", strings.Join(keyVals, "-")))
+				// Check if any PK column was actually modified.
+				pkModified := false
+				for _, pk := range pkCols {
+					basePk := stripPrefixLengthFromCol(pk)
+					oldVal := fmt.Sprintf("%v", oldRow[basePk])
+					newVal := fmt.Sprintf("%v", newRow[basePk])
+					if oldVal != newVal {
+						pkModified = true
+						break
 					}
 				}
+				if pkModified {
+					// PK value changed -- check for duplicates via full scan
+					for j, other := range tbl.Rows {
+						if j == i {
+							continue
+						}
+						match := true
+						for _, pk := range pkCols {
+							basePk := stripPrefixLengthFromCol(pk)
+							if fmt.Sprintf("%v", other[basePk]) != fmt.Sprintf("%v", newRow[basePk]) {
+								match = false
+								break
+							}
+						}
+						if match {
+							keyVals := make([]string, len(pkCols))
+							for k, pk := range pkCols {
+								keyVals[k] = fmt.Sprintf("%v", newRow[stripPrefixLengthFromCol(pk)])
+							}
+							return mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key 'PRIMARY'", strings.Join(keyVals, "-")))
+						}
+					}
+				}
+				// If PK not modified, no duplicate is possible since the row already existed.
 			}
 			for _, idx := range tbl.Def.Indexes {
 				if !idx.Unique {
+					continue
+				}
+				// Check if any unique index column was actually modified.
+				idxModified := false
+				for _, c := range idx.Columns {
+					baseC := stripPrefixLengthFromCol(c)
+					ov := fmt.Sprintf("%v", oldRow[baseC])
+					nv := fmt.Sprintf("%v", newRow[baseC])
+					if ov != nv {
+						idxModified = true
+						break
+					}
+				}
+				if !idxModified {
 					continue
 				}
 				for j, other := range tbl.Rows {
@@ -9950,7 +9996,24 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 	}
 
 	if affected > 0 {
-		tbl.InvalidateIndexes()
+		updatesPK := false
+		if len(tbl.Def.PrimaryKey) > 0 {
+			pkSet := make(map[string]bool, len(tbl.Def.PrimaryKey))
+			for _, pk := range tbl.Def.PrimaryKey {
+				pkSet[strings.ToLower(stripPrefixLengthFromCol(pk))] = true
+			}
+			for _, upd := range stmt.Exprs {
+				if pkSet[strings.ToLower(upd.Name.Name.String())] {
+					updatesPK = true
+					break
+				}
+			}
+		}
+		if updatesPK {
+			tbl.InvalidateIndexes()
+		} else {
+			tbl.InvalidateNonPKIndexes()
+		}
 	}
 
 	warnCount := len(e.warnings)
@@ -19748,26 +19811,11 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 		bodyStmts = []string{returnExpr}
 	}
 
-	// Check if the function is declared DETERMINISTIC.
-	isDeterministic := false
-	{
-		upper := strings.ToUpper(afterParams)
-		// DETERMINISTIC must appear, but NOT DETERMINISTIC should not match.
-		if idx := strings.Index(upper, "DETERMINISTIC"); idx >= 0 {
-			// Make sure it's not preceded by "NOT "
-			prefix := strings.TrimSpace(upper[:idx])
-			if !strings.HasSuffix(prefix, "NOT") {
-				isDeterministic = true
-			}
-		}
-	}
-
 	funcDef := &catalog.FunctionDef{
-		Name:          funcName,
-		Params:        params,
-		ReturnType:    returnType,
-		Body:          bodyStmts,
-		Deterministic: isDeterministic,
+		Name:       funcName,
+		Params:     params,
+		ReturnType: returnType,
+		Body:       bodyStmts,
 	}
 	db.CreateFunction(funcDef)
 
@@ -19827,7 +19875,6 @@ func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Exp
 
 	// Evaluate arguments
 	paramVars := make(map[string]interface{})
-	argVals := make([]interface{}, 0, len(fn.Params))
 	for i, param := range fn.Params {
 		if i < len(argExprs) {
 			var val interface{}
@@ -19841,43 +19888,11 @@ func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Exp
 				return nil, evalErr
 			}
 			paramVars[param.Name] = val
-			argVals = append(argVals, val)
 		}
-	}
-
-	// For DETERMINISTIC functions, check the per-query cache.
-	if fn.Deterministic {
-		cacheKey := buildFuncCacheKey(name, argVals)
-		if e.deterministicFuncCache != nil {
-			if cached, ok := e.deterministicFuncCache[cacheKey]; ok {
-				return cached, nil
-			}
-		}
-		result, err := e.execRoutineBody(fn.Body, paramVars)
-		if err != nil {
-			return nil, err
-		}
-		if e.deterministicFuncCache == nil {
-			e.deterministicFuncCache = make(map[string]interface{})
-		}
-		e.deterministicFuncCache[cacheKey] = result
-		return result, nil
 	}
 
 	// Execute function body with local variables, cursors, and handlers
 	return e.execRoutineBody(fn.Body, paramVars)
-}
-
-// buildFuncCacheKey builds a cache key for a deterministic function call.
-func buildFuncCacheKey(name string, args []interface{}) string {
-	// Use a simple separator that won't appear in normal values.
-	var b strings.Builder
-	b.WriteString(name)
-	for _, arg := range args {
-		b.WriteByte(0)
-		fmt.Fprintf(&b, "%v", arg)
-	}
-	return b.String()
 }
 
 // routineContext holds shared state for a stored routine execution.
@@ -21118,4 +21133,97 @@ func (e *Executor) evaluateCheckConstraint(exprStr string, row storage.Row) (boo
 		return true, nil // NULL result means constraint is satisfied (MySQL behavior)
 	}
 	return isTruthy(val), nil
+}
+
+// extractPKEquality checks if expr contains an equality on pkCol.
+func extractPKEquality(expr sqlparser.Expr, pkCol string) (pkVal interface{}, remaining sqlparser.Expr) {
+	switch e := expr.(type) {
+	case *sqlparser.ComparisonExpr:
+		if e.Operator != sqlparser.EqualOp {
+			return nil, nil
+		}
+		colName, val := extractColLiteralForPK(e)
+		if colName == "" || !strings.EqualFold(colName, pkCol) {
+			return nil, nil
+		}
+		return val, nil
+	case *sqlparser.AndExpr:
+		if val, _ := extractPKEquality(e.Left, pkCol); val != nil {
+			return val, e.Right
+		}
+		if val, _ := extractPKEquality(e.Right, pkCol); val != nil {
+			return val, e.Left
+		}
+		return nil, nil
+	default:
+		return nil, nil
+	}
+}
+
+func extractColLiteralForPK(cmp *sqlparser.ComparisonExpr) (string, interface{}) {
+	if cn, ok := cmp.Left.(*sqlparser.ColName); ok {
+		if v := evalLiteralForPK(cmp.Right); v != nil {
+			return cn.Name.String(), v
+		}
+	}
+	if cn, ok := cmp.Right.(*sqlparser.ColName); ok {
+		if v := evalLiteralForPK(cmp.Left); v != nil {
+			return cn.Name.String(), v
+		}
+	}
+	return "", nil
+}
+
+func evalLiteralForPK(expr sqlparser.Expr) interface{} {
+	switch v := expr.(type) {
+	case *sqlparser.Literal:
+		switch v.Type {
+		case sqlparser.IntVal:
+			n, err := strconv.ParseInt(v.Val, 10, 64)
+			if err != nil {
+				u, err2 := strconv.ParseUint(v.Val, 10, 64)
+				if err2 != nil {
+					return nil
+				}
+				return u
+			}
+			return n
+		case sqlparser.HexNum:
+			s := v.Val
+			if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+				s = s[2:]
+			}
+			n, err := strconv.ParseInt(s, 16, 64)
+			if err != nil {
+				return nil
+			}
+			return n
+		case sqlparser.StrVal:
+			return v.Val
+		case sqlparser.HexVal:
+			return v.Val
+		case sqlparser.FloatVal:
+			f, err := strconv.ParseFloat(v.Val, 64)
+			if err != nil {
+				return nil
+			}
+			return f
+		default:
+			return nil
+		}
+	case *sqlparser.UnaryExpr:
+		if v.Operator == sqlparser.UMinusOp {
+			if inner := evalLiteralForPK(v.Expr); inner != nil {
+				switch n := inner.(type) {
+				case int64:
+					return -n
+				case float64:
+					return -n
+				}
+			}
+		}
+		return nil
+	default:
+		return nil
+	}
 }
