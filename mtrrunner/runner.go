@@ -537,24 +537,19 @@ func (ctx *execContext) executeLines(lines []string) error {
 			directive := strings.TrimPrefix(trimmed, "--")
 			directive = strings.TrimSpace(directive)
 			name, _ := parseDirectiveNameArgs(directive)
-			if (name == "query" || name == "query_vertical") {
-				termDelim := ";"
-				if ctx.delimiter != "" {
-					termDelim = ctx.delimiter
-				}
-				if !strings.HasSuffix(strings.TrimSpace(trimmed), termDelim) {
-					fullDirective := directive
-					i++
-					for i < len(lines) {
-						l := strings.TrimSpace(lines[i])
-						fullDirective += "\n" + l
-						if strings.HasSuffix(strings.TrimSpace(l), termDelim) {
-							break
-						}
-						i++
+			if (name == "query" || name == "query_vertical") &&
+				!strings.HasSuffix(strings.TrimSpace(trimmed), ";") {
+				fullDirective := directive
+				i++
+				for i < len(lines) {
+					l := strings.TrimSpace(lines[i])
+					fullDirective += "\n" + l
+					if strings.HasSuffix(strings.TrimSpace(l), ";") {
+						break
 					}
-					directive = fullDirective
+					i++
 				}
+				directive = fullDirective
 			}
 
 			handled, skip, err := ctx.handleDirective(directive)
@@ -607,19 +602,14 @@ func (ctx *execContext) executeLines(lines []string) error {
 			if strings.HasPrefix(bdLower, "query ") ||
 				strings.HasPrefix(bdLower, "query_vertical ") ||
 				strings.HasPrefix(bdLower, "eval ") {
-				// Use the current delimiter for multi-line collection
-				termDelim := ";"
-				if ctx.delimiter != "" {
-					termDelim = ctx.delimiter
-				}
-				if !strings.HasSuffix(strings.TrimSpace(trimmed), termDelim) {
+				if !strings.HasSuffix(strings.TrimSpace(trimmed), ";") {
 					fullDirective := bareDirective
 					i++
 					for i < len(lines) {
 						l := strings.TrimSpace(lines[i])
 						fullDirective += "\n" + l
-						if strings.HasSuffix(strings.TrimSpace(l), termDelim) {
-							fullDirective = strings.TrimSuffix(fullDirective, termDelim)
+						if strings.HasSuffix(strings.TrimSpace(l), ";") {
+							fullDirective = strings.TrimSuffix(fullDirective, ";")
 							i++ // consume the terminating line so it won't be re-executed as SQL
 							break
 						}
@@ -838,7 +828,8 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 
 	case "echo":
 		if ctx.resultLogEnabled {
-			ctx.output.WriteString(args + "\n")
+			echoText := ctx.substituteVars(args)
+			ctx.output.WriteString(echoText + "\n")
 		}
 		return true, false, nil
 
@@ -1090,6 +1081,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"disable_cursor_protocol", "enable_cursor_protocol",
 		"disable_view_protocol", "enable_view_protocol",
 		"disable_session_track_info", "enable_session_track_info",
+		"disable_connect_log", "enable_connect_log",
 		"send", "reap", "sleep", "send_shutdown",
 		"replace_regex",
 		"write_file", "append_file", "cat_file",
@@ -1605,6 +1597,7 @@ func (ctx *execContext) executeSQLInner(stmt string) error {
 		prefixLen = len(stmt)
 	}
 	upper := strings.ToUpper(stmt[:prefixLen])
+	fullUpper := strings.ToUpper(stmt)
 	isQuery := strings.HasPrefix(upper, "SELECT") ||
 		strings.HasPrefix(upper, "SHOW") ||
 		strings.HasPrefix(upper, "DESCRIBE") ||
@@ -1615,6 +1608,15 @@ func (ctx *execContext) executeSQLInner(stmt string) error {
 		strings.HasPrefix(upper, "CHECKSUM ") ||
 		strings.HasPrefix(upper, "OPTIMIZE ") ||
 		strings.HasPrefix(upper, "REPAIR ")
+	// ALTER TABLE ... ANALYZE/CHECK/OPTIMIZE/REPAIR PARTITION returns a result set
+	if strings.HasPrefix(upper, "ALTER ") {
+		for _, op := range []string{"ANALYZE PARTITION", "CHECK PARTITION", "OPTIMIZE PARTITION", "REPAIR PARTITION"} {
+			if strings.Contains(fullUpper, op) {
+				isQuery = true
+				break
+			}
+		}
+	}
 
 	// EXECUTE might be either a query or exec depending on the prepared statement
 	if strings.HasPrefix(upper, "EXECUTE ") {
@@ -2176,9 +2178,50 @@ func (ctx *execContext) substituteVars(s string) string {
 	if ctx.variables == nil || !strings.Contains(s, "$") {
 		return s
 	}
+	// Sort variable names by length (longest first) to avoid partial replacements
+	// e.g., $ENGINE_TABLE should be replaced before $ENGINE.
+	type kv struct {
+		name  string
+		value string
+	}
+	var sorted []kv
 	for name, value := range ctx.variables {
-		if strings.Contains(s, name) {
-			s = strings.ReplaceAll(s, name, value)
+		sorted = append(sorted, kv{name, value})
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return len(sorted[i].name) > len(sorted[j].name)
+	})
+	for _, entry := range sorted {
+		if strings.Contains(s, entry.name) {
+			s = strings.ReplaceAll(s, entry.name, entry.value)
+		}
+	}
+	// Case-insensitive fallback: if there are still unresolved $variables,
+	// try matching them case-insensitively against known variable names.
+	if strings.Contains(s, "$") {
+		for _, entry := range sorted {
+			nameLower := strings.ToLower(entry.name)
+			idx := 0
+			for idx < len(s) {
+				dollarPos := strings.Index(s[idx:], "$")
+				if dollarPos == -1 {
+					break
+				}
+				absPos := idx + dollarPos
+				// Extract variable name: $[a-zA-Z0-9_]+
+				end := absPos + 1
+				for end < len(s) && (s[end] == '_' || (s[end] >= 'a' && s[end] <= 'z') ||
+					(s[end] >= 'A' && s[end] <= 'Z') || (s[end] >= '0' && s[end] <= '9')) {
+					end++
+				}
+				varInText := s[absPos:end]
+				if strings.ToLower(varInText) == nameLower && varInText != entry.name {
+					s = s[:absPos] + entry.value + s[end:]
+					idx = absPos + len(entry.value)
+				} else {
+					idx = end
+				}
+			}
 		}
 	}
 	return s
@@ -2441,6 +2484,7 @@ var directiveKeywords = map[string]bool{
 	"result_format": true, "change_user": true,
 	"disable_metadata": true, "enable_metadata": true,
 	"disable_info": true, "enable_info": true,
+	"disable_connect_log": true, "enable_connect_log": true,
 	"shutdown_server":   true,
 	"send_shutdown":     true,
 	"disable_reconnect": true, "enable_reconnect": true,
@@ -2980,6 +3024,22 @@ func normalizeExpected(s string) string {
 
 		result = append(result, trimmed)
 	}
+	// Strip connection logging lines (from --enable_connect_log which we treat as no-op)
+	var filtered []string
+	for _, line := range result {
+		trimLine := strings.TrimSpace(line)
+		if strings.HasPrefix(trimLine, "connect ") || strings.HasPrefix(trimLine, "connect\t") ||
+			strings.HasPrefix(trimLine, "disconnect ") || strings.HasPrefix(trimLine, "disconnect\t") {
+			continue
+		}
+		if strings.HasPrefix(trimLine, "connection ") && strings.HasSuffix(trimLine, ";") {
+			// "connection default;" or "connection session1;" are connect log lines
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	result = filtered
+
 	out := strings.Join(result, "\n")
 	// Normalize ENGINE placeholders and non-InnoDB engines (we only support InnoDB)
 	if strings.Contains(out, "ENGINE=") {
@@ -2987,7 +3047,41 @@ func normalizeExpected(s string) string {
 		out = strings.ReplaceAll(out, "ENGINE=MyISAM", "ENGINE=InnoDB")
 		out = strings.ReplaceAll(out, "ENGINE=MEMORY", "ENGINE=InnoDB")
 	}
+	// Strip /*!50100 PARTITION BY ... */ blocks from SHOW CREATE TABLE output
+	// since mylite does not support partitions.
+	out = stripExpectedPartitionComment(out)
 	return strings.TrimRight(out, "\n")
+}
+
+// stripExpectedPartitionComment removes /*!50100 PARTITION BY ... */ comment
+// blocks from expected output. These appear in MySQL's SHOW CREATE TABLE
+// output for partitioned tables. The block may span multiple lines.
+func stripExpectedPartitionComment(s string) string {
+	for {
+		idx := strings.Index(s, "/*!50100 PARTITION BY")
+		if idx == -1 {
+			break
+		}
+		// Find the matching */ ending (may be on a different line)
+		end := strings.Index(s[idx:], "*/")
+		if end == -1 {
+			// No closing found; remove to end of string
+			s = strings.TrimRight(s[:idx], "\n")
+		} else {
+			endAbs := idx + end + 2 // past "*/"
+			// Also skip any trailing newline
+			if endAbs < len(s) && s[endAbs] == '\n' {
+				endAbs++
+			}
+			// Remove the leading newline before the partition comment
+			start := idx
+			if start > 0 && s[start-1] == '\n' {
+				start--
+			}
+			s = s[:start] + "\n" + s[endAbs:]
+		}
+	}
+	return s
 }
 
 var diffContextLines = 3

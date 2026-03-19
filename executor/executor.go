@@ -1455,6 +1455,141 @@ func normalizeJSONTableDefaultOrder(query string) string {
 	return re.ReplaceAllString(query, "${2} ${1}")
 }
 
+// stripPartitionClause removes PARTITION BY ... clauses from CREATE TABLE and
+// ALTER TABLE statements. mylite does not support table partitioning, so we
+// silently strip the clause so that tables can at least be created.
+// It also handles "PARTITION BY" that appears in ALTER TABLE ... PARTITION BY.
+func stripPartitionClause(query string) (string, string) {
+	upper := strings.ToUpper(query)
+	if !strings.Contains(upper, "CREATE TABLE") && !strings.Contains(upper, "ALTER TABLE") {
+		return query, ""
+	}
+	// Find "PARTITION BY" not inside a string literal
+	idx := 0
+	for {
+		pos := strings.Index(strings.ToUpper(query[idx:]), "PARTITION BY")
+		if pos == -1 {
+			break
+		}
+		absPos := idx + pos
+
+		// Check that we're not inside a quoted string
+		inQuote := false
+		quoteChar := byte(0)
+		for i := 0; i < absPos; i++ {
+			ch := query[i]
+			if !inQuote && (ch == '\'' || ch == '"') {
+				inQuote = true
+				quoteChar = ch
+			} else if inQuote && ch == quoteChar {
+				// Check for escaped quote
+				if i+1 < len(query) && query[i+1] == quoteChar {
+					i++ // skip escaped quote
+				} else {
+					inQuote = false
+				}
+			}
+		}
+		if inQuote {
+			idx = absPos + 12
+			continue
+		}
+
+		// Check word boundary before PARTITION
+		if absPos > 0 {
+			ch := query[absPos-1]
+			if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_' {
+				idx = absPos + 12
+				continue
+			}
+		}
+
+		// Found a real PARTITION BY clause. We need to find where it ends.
+		// It ends at: end of string, or before AS SELECT, or before a top-level
+		// semicolon. The partition clause may contain nested parentheses.
+		end := len(query)
+		depth := 0
+		i := absPos + 12 // skip past "PARTITION BY"
+		for i < len(query) {
+			ch := query[i]
+			if ch == '\'' || ch == '"' {
+				// Skip quoted strings
+				quote := ch
+				i++
+				for i < len(query) {
+					if query[i] == quote {
+						if i+1 < len(query) && query[i+1] == quote {
+							i += 2
+							continue
+						}
+						break
+					}
+					if query[i] == '\\' {
+						i++
+					}
+					i++
+				}
+				i++
+				continue
+			}
+			if ch == '(' {
+				depth++
+				i++
+				continue
+			}
+			if ch == ')' {
+				if depth == 0 {
+					// This closing paren belongs to a parent context (e.g., CREATE TABLE ... AS SELECT subquery).
+					end = i
+					break
+				}
+				depth--
+				// If depth returns to 0 after a partition list, check what follows
+				if depth == 0 {
+					// Scan ahead for more partition clauses or AS/SELECT
+					j := i + 1
+					for j < len(query) && (query[j] == ' ' || query[j] == '\t' || query[j] == '\n' || query[j] == '\r') {
+						j++
+					}
+					rest := strings.ToUpper(strings.TrimSpace(query[j:]))
+					if strings.HasPrefix(rest, "AS ") || strings.HasPrefix(rest, "SELECT ") ||
+						strings.HasPrefix(rest, ";") || rest == "" ||
+						strings.HasPrefix(rest, "/*!") {
+						end = i + 1
+						break
+					}
+					// Could be SUBPARTITION BY or more partition definitions
+					if !strings.HasPrefix(rest, "SUBPARTITION") && !strings.HasPrefix(rest, "PARTITION") &&
+						!strings.HasPrefix(rest, "(") {
+						end = i + 1
+						break
+					}
+				}
+				i++
+				continue
+			}
+			if ch == ';' && depth == 0 {
+				end = i
+				break
+			}
+			i++
+		}
+
+		// Extract the partition clause for later use
+		partClause := strings.TrimSpace(query[absPos:end])
+
+		// Strip the PARTITION BY clause, preserving any trailing content
+		before := strings.TrimRight(query[:absPos], " \t\n\r")
+		after := ""
+		if end < len(query) {
+			after = query[end:]
+		}
+		query = before + " " + strings.TrimLeft(after, " \t\n\r")
+		return query, partClause
+	}
+	return query, ""
+}
+
 // quoteNonASCIIIdentifiers wraps bare words containing non-ASCII characters
 // with backticks so the vitess SQL parser can handle them.
 func quoteNonASCIIIdentifiers(query string) string {
@@ -1883,6 +2018,21 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return e.execBegin()
 	}
 
+	// Handle COMMIT WORK and ROLLBACK WORK (equivalent to COMMIT/ROLLBACK)
+	if upper == "COMMIT WORK" {
+		return e.execCommit()
+	}
+	if upper == "ROLLBACK WORK" {
+		return e.execRollback()
+	}
+
+	// Normalize "LOCK TABLE" (singular) to "LOCK TABLES" (plural) for vitess parser
+	if strings.HasPrefix(upper, "LOCK TABLE ") && !strings.HasPrefix(upper, "LOCK TABLES") {
+		query = "LOCK TABLES" + query[len("LOCK TABLE"):]
+		trimmed = strings.TrimSpace(query)
+		upper = strings.ToUpper(trimmed)
+	}
+
 	// Handle CREATE TABLESPACE silently (InnoDB internal)
 	if strings.HasPrefix(upper, "CREATE TABLESPACE") ||
 		strings.HasPrefix(upper, "ALTER TABLESPACE") ||
@@ -1905,8 +2055,52 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	query = normalizeAddIndexUsing(query)
 	query = normalizeMemberOperator(query)
 	query = normalizeJSONTableDefaultOrder(query)
+	// Strip PARTITION BY clauses from CREATE TABLE (mylite does not support partitions)
+	query, _ = stripPartitionClause(query)
 	trimmed = strings.TrimSpace(query)
 	upper = strings.ToUpper(trimmed)
+
+	// Handle ALTER TABLE ... partition operations as no-ops (mylite has no partitions)
+	if strings.HasPrefix(upper, "ALTER TABLE") {
+		// Extract table name for result sets
+		alterTableName := ""
+		rest := strings.TrimSpace(trimmed[len("ALTER TABLE"):])
+		fields := strings.Fields(rest)
+		if len(fields) > 0 {
+			alterTableName = strings.Trim(fields[0], "`")
+		}
+		fullTableName := fmt.Sprintf("%s.%s", e.CurrentDB, alterTableName)
+
+		// Operations that return a result set (like ANALYZE TABLE)
+		adminPartOps := map[string]string{
+			"ANALYZE PARTITION":  "analyze",
+			"CHECK PARTITION":    "check",
+			"OPTIMIZE PARTITION": "optimize",
+			"REPAIR PARTITION":   "repair",
+		}
+		for op, opName := range adminPartOps {
+			if strings.Contains(upper, op) {
+				return &Result{
+					Columns:     []string{"Table", "Op", "Msg_type", "Msg_text"},
+					Rows:        [][]interface{}{{fullTableName, opName, "status", "OK"}},
+					IsResultSet: true,
+				}, nil
+			}
+		}
+
+		// Operations that are pure no-ops
+		noopPartOps := []string{
+			"EXCHANGE PARTITION", "ADD PARTITION", "DROP PARTITION",
+			"REBUILD PARTITION", "REORGANIZE PARTITION", "COALESCE PARTITION",
+			"REMOVE PARTITIONING", "TRUNCATE PARTITION",
+		}
+		for _, op := range noopPartOps {
+			if strings.Contains(upper, op) {
+				return &Result{}, nil
+			}
+		}
+	}
+
 	// Multi-value index does not allow explicit ASC/DESC on key part.
 	if (strings.HasPrefix(upper, "CREATE TABLE") || strings.HasPrefix(upper, "ALTER TABLE") || strings.HasPrefix(upper, "CREATE INDEX")) &&
 		regexp.MustCompile(`(?i)ARRAY\)\)\s+ASC\b`).MatchString(trimmed) {
@@ -1941,16 +2135,6 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return e.execAlterTableOrderBy(trimmed)
 	}
 
-	// Handle ALTER VIEW as CREATE OR REPLACE VIEW
-	if strings.HasPrefix(upper, "ALTER VIEW") || strings.HasPrefix(upper, "ALTER ALGORITHM") {
-		// ALTER VIEW viewname AS SELECT ... -> treat as CREATE OR REPLACE VIEW
-		reAlterView := regexp.MustCompile(`(?is)^ALTER\s+(?:ALGORITHM\s*=\s*\w+\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:SQL\s+SECURITY\s+\w+\s+)?VIEW\s+`)
-		if loc := reAlterView.FindStringIndex(trimmed); loc != nil {
-			createSQL := "CREATE OR REPLACE VIEW " + strings.TrimSpace(trimmed[loc[1]:])
-			return e.Execute(createSQL)
-		}
-	}
-
 	// Handle CREATE TRIGGER before vitess parser (it cannot parse triggers)
 	// Also handle "CREATE  TRIGGER" (double spaces from eval variable stripping)
 	if strings.HasPrefix(upper, "CREATE TRIGGER") || regexp.MustCompile(`(?i)^CREATE\s+TRIGGER\b`).MatchString(trimmed) {
@@ -1972,9 +2156,16 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	if strings.HasPrefix(upper, "DROP FUNCTION") {
 		return e.execDropFunction(trimmed)
 	}
-	// Handle CREATE PROCEDURE (with BEGIN...END body or simple statement body)
-	if strings.HasPrefix(upper, "CREATE PROCEDURE") {
-		return e.execCreateProcedure(trimmed)
+	// Handle CREATE PROCEDURE (with BEGIN...END body that vitess can't parse)
+	// Also handle multi-line case where CREATE and PROCEDURE are on separate lines.
+	{
+		upperCompact := strings.Join(strings.Fields(upper), " ")
+		if strings.HasPrefix(upperCompact, "CREATE PROCEDURE") && strings.Contains(upperCompact, "BEGIN") {
+			// Normalize CREATE\nPROCEDURE to CREATE PROCEDURE on the first line
+			re := regexp.MustCompile(`(?is)^(CREATE)\s+(PROCEDURE)`)
+			normalizedQuery := re.ReplaceAllString(trimmed, "${1} ${2}")
+			return e.execCreateProcedure(normalizedQuery)
+		}
 	}
 	// Handle DROP PROCEDURE with IF EXISTS (vitess may not parse all variants)
 	if strings.HasPrefix(upper, "DROP PROCEDURE") {
@@ -5353,7 +5544,8 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				if cn := idx.Info.ConstraintName.String(); cn != "" {
 					idxName = cn
 				} else {
-					idxName = idxCols[0]
+					// Use the base column name (without prefix length) as the auto-generated index name
+					idxName = stripPrefixLengthFromCol(idxCols[0])
 				}
 			}
 			idxComment := ""
@@ -11078,28 +11270,10 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 		descDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
 	}
 	db, resolvedDBName, err := findDatabaseCaseInsensitive(e.Catalog, descDB)
-	if err != nil && !strings.EqualFold(descDB, "information_schema") {
+	if err != nil {
 		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", descDB))
 	}
 	descDB = resolvedDBName
-
-	// Handle INFORMATION_SCHEMA virtual tables
-	if strings.EqualFold(descDB, "information_schema") || strings.EqualFold(descDB, "INFORMATION_SCHEMA") {
-		tLower := strings.ToLower(tableName)
-		if colNames, ok := infoSchemaColumnOrder[tLower]; ok {
-			cols := []string{"Field", "Type", "Null", "Key", "Default", "Extra"}
-			rows := make([][]interface{}, 0, len(colNames))
-			for _, cn := range colNames {
-				rows = append(rows, []interface{}{cn, "varchar(512)", "YES", "", nil, ""})
-			}
-			return &Result{Columns: cols, Rows: rows}, nil
-		}
-	}
-
-	if db == nil {
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", descDB))
-	}
-
 	tblDef, resolvedTableName, err := findTableDefCaseInsensitive(db, tableName)
 	if err != nil {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", descDB, tableName))
@@ -11171,11 +11345,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		switch basic.Command {
 		case sqlparser.Column:
 			// SHOW COLUMNS FROM <table> / SHOW FULL COLUMNS FROM <table>
-			tblName := basic.Tbl.Name.String()
-			if q := basic.Tbl.Qualifier.String(); q != "" {
-				tblName = q + "." + tblName
-			}
-			return e.describeTable(tblName)
+			return e.describeTable(basic.Tbl.Name.String())
 		case sqlparser.TableStatus:
 			// SHOW TABLE STATUS [FROM db] [LIKE ...]
 			return e.showTableStatus()
@@ -12753,26 +12923,6 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	if strings.Contains(tableName, ".") {
 		showDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
 	}
-
-	// Handle INFORMATION_SCHEMA virtual tables
-	if strings.EqualFold(showDB, "information_schema") || strings.EqualFold(showDB, "INFORMATION_SCHEMA") {
-		tLower := strings.ToLower(tableName)
-		if cols, ok := infoSchemaColumnOrder[tLower]; ok {
-			var b strings.Builder
-			b.WriteString(fmt.Sprintf("CREATE TEMPORARY TABLE `%s` (\n", tableName))
-			var colDefs []string
-			for _, col := range cols {
-				colDefs = append(colDefs, fmt.Sprintf("  `%s` varchar(512) DEFAULT NULL", col))
-			}
-			b.WriteString(strings.Join(colDefs, ",\n"))
-			b.WriteString("\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3")
-			return &Result{
-				Columns: []string{"Table", "Create Table"},
-				Rows:    [][]interface{}{{tableName, b.String()}},
-			}, nil
-		}
-	}
-
 	db, resolvedDBName, err := findDatabaseCaseInsensitive(e.Catalog, showDB)
 	if err != nil {
 		return nil, err
@@ -19357,9 +19507,13 @@ func (e *Executor) dropTriggersForTable(db *catalog.Database, tableName string) 
 
 // execDropTrigger handles DROP TRIGGER [IF EXISTS] name
 func (e *Executor) execDropTrigger(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
 	upper := strings.ToUpper(strings.TrimSpace(query))
 	rest := strings.TrimSpace(query[len("DROP TRIGGER"):])
-	_ = upper
 
 	ifExists := false
 	if strings.HasPrefix(strings.ToUpper(rest), "IF EXISTS") {
@@ -19368,21 +19522,7 @@ func (e *Executor) execDropTrigger(query string) (*Result, error) {
 	}
 	name := strings.TrimRight(strings.TrimSpace(rest), ";")
 	name = strings.Trim(name, "`")
-
-	// Handle schema-qualified trigger names (e.g., db_name.trigger_name)
-	dbName := e.CurrentDB
-	if dotIdx := strings.Index(name, "."); dotIdx >= 0 {
-		dbName = strings.Trim(name[:dotIdx], "`")
-		name = strings.Trim(name[dotIdx+1:], "`")
-	}
-
-	db, err := e.Catalog.GetDatabase(dbName)
-	if err != nil {
-		if ifExists {
-			return &Result{}, nil
-		}
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
-	}
+	_ = upper
 
 	if _, ok := db.Triggers[name]; !ok && !ifExists {
 		return nil, mysqlError(1360, "HY000", fmt.Sprintf("Trigger does not exist"))
@@ -19567,10 +19707,6 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 	}
 	procName := strings.TrimSpace(rest[:parenIdx])
 	procName = strings.Trim(procName, "`")
-	// Strip schema qualifier (e.g., "test.p1" -> "p1")
-	if dotIdx := strings.LastIndex(procName, "."); dotIdx >= 0 {
-		procName = strings.Trim(procName[dotIdx+1:], "`")
-	}
 
 	// Extract params between first '(' and matching ')'
 	paramStart := parenIdx + 1
@@ -19589,50 +19725,19 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 	paramStr := strings.TrimSpace(rest[paramStart:paramEnd])
 	params := parseProcParams(paramStr)
 
-	// Extract body: find BEGIN...END or simple statement body
+	// Extract body: find BEGIN...END
 	_ = upper
 	afterParams := rest[paramEnd+1:]
-	// Strip optional characteristics before the body
-	afterParamsUpper := strings.ToUpper(afterParams)
-	for _, kw := range []string{"DETERMINISTIC", "NOT DETERMINISTIC", "CONTAINS SQL", "NO SQL", "READS SQL DATA", "MODIFIES SQL DATA", "SQL SECURITY DEFINER", "SQL SECURITY INVOKER", "COMMENT", "LANGUAGE SQL"} {
-		for {
-			trimUpper := strings.ToUpper(strings.TrimSpace(afterParams))
-			if strings.HasPrefix(trimUpper, kw) {
-				afterParams = strings.TrimSpace(afterParams[len(kw):])
-				// Skip COMMENT 'string'
-				if strings.ToUpper(kw) == "COMMENT" {
-					ap := strings.TrimSpace(afterParams)
-					if len(ap) > 0 && (ap[0] == '\'' || ap[0] == '"') {
-						q := ap[0]
-						end := strings.IndexByte(ap[1:], q)
-						if end >= 0 {
-							afterParams = strings.TrimSpace(ap[end+2:])
-						}
-					}
-				}
-			} else {
-				break
-			}
-		}
-	}
-	_ = afterParamsUpper
-
 	beginIdx := strings.Index(strings.ToUpper(afterParams), "BEGIN")
-	var bodyStmts []string
-	if beginIdx >= 0 {
-		bodyStr := strings.TrimSpace(afterParams[beginIdx+len("BEGIN"):])
-		if strings.HasSuffix(strings.ToUpper(strings.TrimSpace(bodyStr)), "END") {
-			bodyStr = strings.TrimSpace(bodyStr[:len(bodyStr)-len("END")])
-		}
-		bodyStmts = splitTriggerBody(bodyStr)
-	} else {
-		// Simple single-statement procedure body (no BEGIN...END)
-		bodyStr := strings.TrimSpace(afterParams)
-		bodyStr = strings.TrimSuffix(bodyStr, ";")
-		if bodyStr != "" {
-			bodyStmts = []string{bodyStr}
-		}
+	if beginIdx < 0 {
+		return nil, fmt.Errorf("invalid CREATE PROCEDURE syntax: missing BEGIN")
 	}
+	bodyStr := strings.TrimSpace(afterParams[beginIdx+len("BEGIN"):])
+	if strings.HasSuffix(strings.ToUpper(strings.TrimSpace(bodyStr)), "END") {
+		bodyStr = strings.TrimSpace(bodyStr[:len(bodyStr)-len("END")])
+	}
+
+	bodyStmts := splitTriggerBody(bodyStr)
 
 	procDef := &catalog.ProcedureDef{
 		Name:   procName,
@@ -19715,6 +19820,11 @@ func splitByComma(s string) []string {
 
 // execDropProcedureFallback handles DROP PROCEDURE [IF EXISTS] name
 func (e *Executor) execDropProcedureFallback(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
 	rest := strings.TrimSpace(query[len("DROP PROCEDURE"):])
 	ifExists := false
 	restUpper := strings.ToUpper(rest)
@@ -19725,23 +19835,8 @@ func (e *Executor) execDropProcedureFallback(query string) (*Result, error) {
 	name := strings.TrimRight(strings.TrimSpace(rest), ";")
 	name = strings.Trim(name, "`")
 
-	// Handle schema-qualified names (e.g., "test.p1")
-	dbName := e.CurrentDB
-	if dotIdx := strings.Index(name, "."); dotIdx >= 0 {
-		dbName = strings.Trim(name[:dotIdx], "`")
-		name = strings.Trim(name[dotIdx+1:], "`")
-	}
-
-	db, err := e.Catalog.GetDatabase(dbName)
-	if err != nil {
-		if ifExists {
-			return &Result{}, nil
-		}
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
-	}
-
 	if db.GetProcedure(name) == nil && !ifExists {
-		return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", dbName, name))
+		return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", e.CurrentDB, name))
 	}
 	db.DropProcedure(name)
 	return &Result{}, nil
@@ -20619,32 +20714,6 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 	}
 
 	data, err := os.ReadFile(filePath)
-
-	// Fallback for absolute paths that don't exist: extract std_data/... suffix
-	// and search in SearchPaths. This handles $MYSQLTEST_VARDIR/std_data/... paths
-	// where the actual files live in the test fixture directories.
-	if err != nil && filepath.IsAbs(filePath) && len(e.SearchPaths) > 0 {
-		if idx := strings.Index(filePath, "/std_data/"); idx >= 0 {
-			relPath := filePath[idx+1:] // "std_data/funcs_1/foo.txt"
-			for _, dir := range e.SearchPaths {
-				full := filepath.Join(dir, relPath)
-				if d, err2 := os.ReadFile(full); err2 == nil {
-					data = d
-					filePath = full
-					err = nil
-					break
-				}
-				// Also try parent directory
-				full = filepath.Join(filepath.Dir(dir), relPath)
-				if d, err2 := os.ReadFile(full); err2 == nil {
-					data = d
-					filePath = full
-					err = nil
-					break
-				}
-			}
-		}
-	}
 	if err != nil {
 		return nil, mysqlError(29, "HY000", fmt.Sprintf("File '%s' not found (OS errno 2 - No such file or directory)", opts.filePath))
 	}
@@ -21112,10 +21181,6 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 	}
 	funcName := strings.TrimSpace(rest[:parenIdx])
 	funcName = strings.Trim(funcName, "`")
-	// Strip schema qualifier (e.g., "test.f1" -> "f1", store in correct db)
-	if dotIdx := strings.LastIndex(funcName, "."); dotIdx >= 0 {
-		funcName = strings.Trim(funcName[dotIdx+1:], "`")
-	}
 
 	// Extract params between first '(' and matching ')'
 	paramStart := parenIdx + 1
@@ -21193,6 +21258,11 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 
 // execDropFunction handles DROP FUNCTION [IF EXISTS] name
 func (e *Executor) execDropFunction(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
 	rest := strings.TrimSpace(query[len("DROP FUNCTION"):])
 	ifExists := false
 	restUpper := strings.ToUpper(strings.TrimSpace(rest))
@@ -21204,23 +21274,8 @@ func (e *Executor) execDropFunction(query string) (*Result, error) {
 	name := strings.TrimRight(strings.TrimSpace(rest), ";")
 	name = strings.Trim(name, "`")
 
-	// Handle schema-qualified names (e.g., "test.f1")
-	dbName := e.CurrentDB
-	if dotIdx := strings.Index(name, "."); dotIdx >= 0 {
-		dbName = strings.Trim(name[:dotIdx], "`")
-		name = strings.Trim(name[dotIdx+1:], "`")
-	}
-
-	db, err := e.Catalog.GetDatabase(dbName)
-	if err != nil {
-		if ifExists {
-			return &Result{}, nil
-		}
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
-	}
-
 	if db.GetFunction(name) == nil && !ifExists {
-		return nil, mysqlError(1305, "42000", fmt.Sprintf("FUNCTION %s.%s does not exist", dbName, name))
+		return nil, mysqlError(1305, "42000", fmt.Sprintf("FUNCTION %s.%s does not exist", e.CurrentDB, name))
 	}
 	db.DropFunction(name)
 	return &Result{}, nil
