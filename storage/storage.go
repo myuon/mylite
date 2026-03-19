@@ -39,11 +39,82 @@ type Table struct {
 	AutoIncrement   atomic.Int64
 	AIExplicitlySet bool // true if AUTO_INCREMENT was explicitly set via ALTER/CREATE TABLE
 	Mu              sync.RWMutex
+	// pkIndex is a hash set of primary key values for O(1) uniqueness checks.
+	// Lazily built on first Insert and maintained during Insert/BulkInsert.
+	// Invalidated (set to nil) on delete/update/truncate operations.
+	pkIndex map[string]bool
+	// colPKIndex maps column-level PK column names to their value sets.
+	colPKIndex map[string]map[string]bool
+	// uniqueIndex maps unique index names to their value sets.
+	uniqueIndex map[string]map[string]bool
 }
 
 func (t *Table) Lock()                     { t.Mu.Lock() }
 func (t *Table) Unlock()                   { t.Mu.Unlock() }
 func (t *Table) AutoIncrementValue() int64 { return t.AutoIncrement.Load() }
+
+// InvalidateIndexes clears cached PK/UNIQUE indexes so they are rebuilt on next Insert.
+// Must be called (or indexes will be stale) after delete/update/truncate/row-removal.
+func (t *Table) InvalidateIndexes() {
+	t.pkIndex = nil
+	t.colPKIndex = nil
+	t.uniqueIndex = nil
+}
+
+// ensureIndexes lazily builds hash-set indexes for PK and UNIQUE constraints.
+// Caller must hold t.Mu (at least read lock).
+func (t *Table) ensureIndexes() {
+	if len(t.Def.PrimaryKey) > 0 && t.pkIndex == nil {
+		t.pkIndex = make(map[string]bool, len(t.Rows))
+		for _, existing := range t.Rows {
+			key := bulkPKKey(existing, t.Def.PrimaryKey)
+			t.pkIndex[key] = true
+		}
+	}
+	// Column-level PK
+	hasPKCol := false
+	for _, col := range t.Def.Columns {
+		if col.PrimaryKey {
+			hasPKCol = true
+			break
+		}
+	}
+	if hasPKCol && t.colPKIndex == nil {
+		t.colPKIndex = make(map[string]map[string]bool)
+		for _, col := range t.Def.Columns {
+			if col.PrimaryKey {
+				s := make(map[string]bool, len(t.Rows))
+				for _, existing := range t.Rows {
+					s[fmt.Sprintf("%v", existing[col.Name])] = true
+				}
+				t.colPKIndex[col.Name] = s
+			}
+		}
+	}
+	// Unique indexes
+	hasUnique := false
+	for _, idx := range t.Def.Indexes {
+		if idx.Unique {
+			hasUnique = true
+			break
+		}
+	}
+	if hasUnique && t.uniqueIndex == nil {
+		t.uniqueIndex = make(map[string]map[string]bool)
+		for _, idx := range t.Def.Indexes {
+			if idx.Unique {
+				s := make(map[string]bool, len(t.Rows))
+				for _, existing := range t.Rows {
+					key := bulkUniqueKey(existing, idx.Columns)
+					if key != "" {
+						s[key] = true
+					}
+				}
+				t.uniqueIndex[idx.Name] = s
+			}
+		}
+	}
+}
 
 // Engine is the in-memory storage engine managing all tables per database.
 type Engine struct {
@@ -203,33 +274,28 @@ func (t *Table) Insert(row Row) (int64, error) {
 		}
 	}
 
-	// Check PRIMARY KEY uniqueness
+	// Build/ensure hash indexes for O(1) uniqueness checks
+	t.ensureIndexes()
+
+	// Check PRIMARY KEY uniqueness using hash index
 	if len(t.Def.PrimaryKey) > 0 {
-		for _, existing := range t.Rows {
-			match := true
-			for _, pkCol := range t.Def.PrimaryKey {
-				col := stripPrefixLength(pkCol)
-				if fmt.Sprintf("%v", existing[col]) != fmt.Sprintf("%v", row[col]) {
-					match = false
-					break
-				}
+		key := bulkPKKey(row, t.Def.PrimaryKey)
+		if t.pkIndex[key] {
+			pkVal := make([]string, len(t.Def.PrimaryKey))
+			for i, pk := range t.Def.PrimaryKey {
+				pkVal[i] = displayValue(row[stripPrefixLength(pk)])
 			}
-			if match {
-				pkVal := make([]string, len(t.Def.PrimaryKey))
-				for i, pk := range t.Def.PrimaryKey {
-					pkVal[i] = displayValue(row[stripPrefixLength(pk)])
-				}
-				return 0, fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key 'PRIMARY'",
-					strings.Join(pkVal, "-"))
-			}
+			return 0, fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key 'PRIMARY'",
+				strings.Join(pkVal, "-"))
 		}
 	}
 
-	// Check column-level PRIMARY KEY
-	for _, col := range t.Def.Columns {
-		if col.PrimaryKey {
-			for _, existing := range t.Rows {
-				if fmt.Sprintf("%v", existing[col.Name]) == fmt.Sprintf("%v", row[col.Name]) {
+	// Check column-level PRIMARY KEY using hash index
+	if t.colPKIndex != nil {
+		for _, col := range t.Def.Columns {
+			if col.PrimaryKey {
+				valKey := fmt.Sprintf("%v", row[col.Name])
+				if t.colPKIndex[col.Name][valKey] {
 					return 0, fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key 'PRIMARY'",
 						displayValue(row[col.Name]))
 				}
@@ -237,25 +303,12 @@ func (t *Table) Insert(row Row) (int64, error) {
 		}
 	}
 
-	// Check UNIQUE constraints
-	for _, idx := range t.Def.Indexes {
-		if idx.Unique {
-			for _, existing := range t.Rows {
-				match := true
-				for _, idxCol := range idx.Columns {
-					ev := existing[idxCol]
-					rv := row[idxCol]
-					// NULL values don't violate UNIQUE constraints
-					if ev == nil || rv == nil {
-						match = false
-						break
-					}
-					if fmt.Sprintf("%v", ev) != fmt.Sprintf("%v", rv) {
-						match = false
-						break
-					}
-				}
-				if match {
+	// Check UNIQUE constraints using hash index
+	if t.uniqueIndex != nil {
+		for _, idx := range t.Def.Indexes {
+			if idx.Unique {
+				key := bulkUniqueKey(row, idx.Columns)
+				if key != "" && t.uniqueIndex[idx.Name][key] {
 					vals := make([]string, len(idx.Columns))
 					for i, c := range idx.Columns {
 						vals[i] = displayValue(row[c])
@@ -268,6 +321,29 @@ func (t *Table) Insert(row Row) (int64, error) {
 	}
 
 	t.Rows = append(t.Rows, row)
+
+	// Maintain indexes after successful insert
+	if t.pkIndex != nil && len(t.Def.PrimaryKey) > 0 {
+		t.pkIndex[bulkPKKey(row, t.Def.PrimaryKey)] = true
+	}
+	if t.colPKIndex != nil {
+		for _, col := range t.Def.Columns {
+			if col.PrimaryKey {
+				t.colPKIndex[col.Name][fmt.Sprintf("%v", row[col.Name])] = true
+			}
+		}
+	}
+	if t.uniqueIndex != nil {
+		for _, idx := range t.Def.Indexes {
+			if idx.Unique {
+				key := bulkUniqueKey(row, idx.Columns)
+				if key != "" {
+					t.uniqueIndex[idx.Name][key] = true
+				}
+			}
+		}
+	}
+
 	return lastInsertID, nil
 }
 
@@ -483,6 +559,9 @@ func (t *Table) BulkInsert(rows []Row) ([]int64, error) {
 		ids[ri] = lastInsertID
 	}
 
+	// Invalidate cached indexes since we added rows
+	t.InvalidateIndexes()
+
 	return ids, nil
 }
 
@@ -673,6 +752,7 @@ func (t *Table) Truncate() {
 	defer t.Mu.Unlock()
 	t.Rows = make([]Row, 0)
 	t.AutoIncrement.Store(0)
+	t.InvalidateIndexes()
 }
 
 func toInt64(v interface{}) (int64, bool) {
@@ -763,6 +843,7 @@ func (t *Table) AddColumn(colName string, defaultVal interface{}) {
 	for i := range t.Rows {
 		t.Rows[i][colName] = defaultVal
 	}
+	t.InvalidateIndexes()
 }
 
 // DropColumn removes the given key from every existing row of the table.
@@ -776,6 +857,7 @@ func (t *Table) DropColumn(colName string) {
 			}
 		}
 	}
+	t.InvalidateIndexes()
 }
 
 // RenameColumn renames the given key in every existing row of the table.
@@ -791,6 +873,7 @@ func (t *Table) RenameColumn(oldName, newName string) {
 			}
 		}
 	}
+	t.InvalidateIndexes()
 }
 
 // RestoreDatabase replaces the contents of the given database with the snapshot.

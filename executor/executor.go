@@ -6022,6 +6022,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						}
 					}
 				}
+				tbl.InvalidateIndexes()
 				tbl.Unlock()
 				// MySQL counts ON DUPLICATE KEY UPDATE as 2 affected rows when a row is updated.
 				affected += 2
@@ -6097,6 +6098,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 
 				tbl.Lock()
 				tbl.Rows = append(tbl.Rows[:dupIdx], tbl.Rows[dupIdx+1:]...)
+				tbl.InvalidateIndexes()
 				tbl.Unlock()
 				affected++ // REPLACE counts deleted row + inserted row = 2
 
@@ -9200,6 +9202,10 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		tbl.Lock()
 	}
 
+	if affected > 0 {
+		tbl.InvalidateIndexes()
+	}
+
 	warnCount := len(e.warnings)
 	infoMsg := fmt.Sprintf("Rows matched: %d  Changed: %d  Warnings: %d", matchedRows, affected, warnCount)
 	e.lastUpdateInfo = infoMsg
@@ -9344,6 +9350,7 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 			}
 		}
 		tbl.Rows = newRows
+		tbl.InvalidateIndexes()
 		return &Result{AffectedRows: uint64(len(deleteSet))}, nil
 	}
 
@@ -9381,6 +9388,7 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		}
 	}
 	tbl.Rows = newRows
+	tbl.InvalidateIndexes()
 
 	return &Result{AffectedRows: affected}, nil
 }
@@ -9587,6 +9595,7 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 				}
 			}
 			tbl.Rows = newRows
+			tbl.InvalidateIndexes()
 			tbl.Unlock()
 			totalAffected += uint64(len(deleteIndices))
 		}
@@ -17986,6 +17995,7 @@ func (e *Executor) execMultiTableDelete(query string) (*Result, error) {
 				}
 			}
 			tbl.Rows = newRows
+			tbl.InvalidateIndexes()
 			tbl.Unlock()
 			totalAffected += uint64(len(deleteIndices))
 		}
@@ -18568,6 +18578,7 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 			if dupIdx >= 0 {
 				tbl.Lock()
 				tbl.Rows = append(tbl.Rows[:dupIdx], tbl.Rows[dupIdx+1:]...)
+				tbl.InvalidateIndexes()
 				tbl.Unlock()
 			}
 		} else if !opts.isIgnore {
