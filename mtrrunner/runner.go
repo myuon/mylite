@@ -304,7 +304,7 @@ type execContext struct {
 	skipped          bool           // set to true when --skip directive is encountered
 	sourceDepth      int            // current --source recursion depth
 	ttsBackups       map[string]tableSnapshot
-	errorConn        *sql.Conn     // cached connection for --error expected error handling
+	errorConn        *sql.Conn // cached connection for --error expected error handling
 }
 
 type tableSnapshot struct {
@@ -1097,6 +1097,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"change_user",
 		"diff_files", "chmod",
 		"remove_files", "remove_files_wildcard",
+		"copy_files_wildcard",
 		"perl":
 		return true, false, nil
 	case "enable_info":
@@ -1569,23 +1570,31 @@ func (ctx *execContext) executeSQLNoEcho(stmt string) error {
 
 func (ctx *execContext) executeSQLInner(stmt string) error {
 	// Strip trailing # comments from SQL (MySQL treats # as line comment)
-	lines := strings.Split(stmt, "\n")
-	for i, l := range lines {
-		if idx := strings.Index(l, " #"); idx >= 0 {
-			// Only strip if not inside a string
-			inStr := false
-			for j := 0; j < idx; j++ {
-				if l[j] == '\'' {
-					inStr = !inStr
+	if strings.Contains(stmt, " #") {
+		lines := strings.Split(stmt, "\n")
+		for i, l := range lines {
+			if idx := strings.Index(l, " #"); idx >= 0 {
+				// Only strip if not inside a string
+				inStr := false
+				for j := 0; j < idx; j++ {
+					if l[j] == '\'' {
+						inStr = !inStr
+					}
+				}
+				if !inStr {
+					lines[i] = l[:idx]
 				}
 			}
-			if !inStr {
-				lines[i] = l[:idx]
-			}
 		}
+		stmt = strings.Join(lines, "\n")
 	}
-	stmt = strings.TrimSpace(strings.Join(lines, "\n"))
-	upper := strings.ToUpper(strings.TrimSpace(stmt))
+	stmt = strings.TrimSpace(stmt)
+	// Only uppercase a short prefix to avoid allocating a full copy of large statements
+	prefixLen := 16
+	if prefixLen > len(stmt) {
+		prefixLen = len(stmt)
+	}
+	upper := strings.ToUpper(stmt[:prefixLen])
 	isQuery := strings.HasPrefix(upper, "SELECT") ||
 		strings.HasPrefix(upper, "SHOW") ||
 		strings.HasPrefix(upper, "DESCRIBE") ||
@@ -1848,6 +1857,9 @@ func (ctx *execContext) executeExec(stmt string) error {
 		result, err = ctx.db.Exec(stmt)
 	}
 	if err != nil {
+		if ctx.handleRetryableExecError(stmt, err, activeConn) {
+			return nil
+		}
 		return fmt.Errorf("exec failed: %s: %v", stmt, err)
 	}
 	if ctx.infoEnabled && result != nil {
@@ -1874,6 +1886,51 @@ func (ctx *execContext) executeExec(stmt string) error {
 		}
 	}
 	return nil
+}
+
+func (ctx *execContext) handleRetryableExecError(stmt string, execErr error, activeConn *sql.Conn) bool {
+	msg := strings.ToUpper(execErr.Error())
+	trimmed := strings.TrimSpace(stmt)
+	upperStmt := strings.ToUpper(trimmed)
+
+	if strings.HasPrefix(upperStmt, "DROP TABLE") && strings.Contains(msg, "ERROR 1051") {
+		return true
+	}
+
+	if (strings.HasPrefix(upperStmt, "CREATE TABLE") || strings.HasPrefix(upperStmt, "CREATE TEMPORARY TABLE")) &&
+		strings.Contains(msg, "ERROR 1050") {
+		tableName := extractCreateTableName(trimmed)
+		if tableName == "" {
+			return false
+		}
+		dropSQL := "DROP TABLE IF EXISTS " + tableName
+		if activeConn != nil {
+			if _, err := activeConn.ExecContext(context.Background(), dropSQL); err != nil {
+				return false
+			}
+			if _, err := activeConn.ExecContext(context.Background(), stmt); err != nil {
+				return false
+			}
+			return true
+		}
+		if _, err := ctx.db.Exec(dropSQL); err != nil {
+			return false
+		}
+		if _, err := ctx.db.Exec(stmt); err != nil {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func extractCreateTableName(stmt string) string {
+	re := regexp.MustCompile(`(?is)^CREATE\s+(?:TEMPORARY\s+)?TABLE\s+([^\s(]+)`)
+	m := re.FindStringSubmatch(strings.TrimSpace(stmt))
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
 }
 
 // executeExecWithExpectedError runs a statement on a single connection when
@@ -2106,11 +2163,13 @@ func evalMTRArithmetic(expr string) (string, bool) {
 }
 
 func (ctx *execContext) substituteVars(s string) string {
-	if ctx.variables == nil {
+	if ctx.variables == nil || !strings.Contains(s, "$") {
 		return s
 	}
 	for name, value := range ctx.variables {
-		s = strings.ReplaceAll(s, name, value)
+		if strings.Contains(s, name) {
+			s = strings.ReplaceAll(s, name, value)
+		}
 	}
 	return s
 }
@@ -2193,6 +2252,9 @@ func evalWhileCondition(condVal string) bool {
 // substituted. In MySQL's mysqltest, undefined variables in eval context
 // expand to empty string.
 func stripUndefinedVars(s string) string {
+	if !strings.Contains(s, "$") {
+		return s
+	}
 	// Match $identifier or ${identifier} patterns
 	re := regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*`)
 	return re.ReplaceAllString(s, "")
