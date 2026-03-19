@@ -111,6 +111,9 @@ var infoSchemaColumnOrder = map[string][]string{
 	"events_waits_current":            {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SPINS", "OBJECT_SCHEMA", "OBJECT_NAME", "INDEX_NAME", "OBJECT_TYPE", "OBJECT_INSTANCE_BEGIN", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE", "OPERATION", "NUMBER_OF_BYTES", "FLAGS"},
 	"events_statements_history_long":  {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SQL_TEXT", "DIGEST", "DIGEST_TEXT"},
 	"events_stages_history_long":      {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT"},
+	"performance_timers":              {"TIMER_NAME", "TIMER_FREQUENCY", "TIMER_RESOLUTION", "TIMER_OVERHEAD"},
+	"threads":                         {"THREAD_ID", "NAME", "TYPE", "PROCESSLIST_ID", "PROCESSLIST_USER", "PROCESSLIST_HOST", "PROCESSLIST_DB", "PROCESSLIST_COMMAND", "PROCESSLIST_TIME", "PROCESSLIST_STATE", "PROCESSLIST_INFO", "PARENT_THREAD_ID", "ROLE", "INSTRUMENTED", "HISTORY", "CONNECTION_TYPE", "THREAD_OS_ID", "RESOURCE_GROUP"},
+	"setup_actors":                    {"HOST", "USER", "ROLE", "ENABLED", "HISTORY"},
 }
 
 // isInformationSchemaTable returns (dbName, tableName, true) when the provided
@@ -137,8 +140,15 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 		case "memory_summary_global_by_event_name",
 			"global_variables", "session_variables",
 			"events_waits_history_long", "events_waits_current",
-			"events_statements_history_long", "events_stages_history_long":
+			"events_statements_history_long", "events_stages_history_long",
+			"performance_timers", "threads":
 			return true
+		}
+		// For any other performance_schema table, check if it exists in the catalog.
+		if db, err := e.Catalog.GetDatabase("performance_schema"); err == nil {
+			if _, err := db.GetTable(t); err == nil {
+				return false // found in catalog; use normal storage path
+			}
 		}
 		return false
 	}
@@ -229,6 +239,10 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = []storage.Row{}
 	case "events_stages_history_long":
 		rawRows = []storage.Row{}
+	case "performance_timers":
+		rawRows = e.perfSchemaPerformanceTimers()
+	case "threads":
+		rawRows = e.perfSchemaThreads()
 	}
 
 	result := make([]storage.Row, len(rawRows))
@@ -926,4 +940,48 @@ func (e *Executor) infoSchemaInnoDBMetrics() []storage.Row {
 		})
 	}
 	return rows
+}
+
+// perfSchemaPerformanceTimers returns the fixed rows for performance_schema.performance_timers.
+func (e *Executor) perfSchemaPerformanceTimers() []storage.Row {
+	return []storage.Row{
+		{"TIMER_NAME": "CYCLE", "TIMER_FREQUENCY": int64(2400000000), "TIMER_RESOLUTION": int64(1), "TIMER_OVERHEAD": int64(37)},
+		{"TIMER_NAME": "NANOSECOND", "TIMER_FREQUENCY": int64(1000000000), "TIMER_RESOLUTION": int64(1), "TIMER_OVERHEAD": int64(56)},
+		{"TIMER_NAME": "MICROSECOND", "TIMER_FREQUENCY": int64(1000000), "TIMER_RESOLUTION": int64(1), "TIMER_OVERHEAD": int64(56)},
+		{"TIMER_NAME": "MILLISECOND", "TIMER_FREQUENCY": int64(1000), "TIMER_RESOLUTION": int64(1), "TIMER_OVERHEAD": int64(56)},
+		{"TIMER_NAME": "TICK", "TIMER_FREQUENCY": int64(100), "TIMER_RESOLUTION": int64(1), "TIMER_OVERHEAD": int64(400)},
+	}
+}
+
+// perfSchemaThreads returns a stub row for performance_schema.threads.
+func (e *Executor) perfSchemaThreads() []storage.Row {
+	return []storage.Row{
+		{
+			"THREAD_ID":           int64(1),
+			"NAME":                "thread/sql/main",
+			"TYPE":                "BACKGROUND",
+			"PROCESSLIST_ID":      nil,
+			"PROCESSLIST_USER":    nil,
+			"PROCESSLIST_HOST":    nil,
+			"PROCESSLIST_DB":      nil,
+			"PROCESSLIST_COMMAND": nil,
+			"PROCESSLIST_TIME":    nil,
+			"PROCESSLIST_STATE":   nil,
+			"PROCESSLIST_INFO":    nil,
+			"PARENT_THREAD_ID":    nil,
+			"ROLE":                nil,
+			"INSTRUMENTED":        "YES",
+			"HISTORY":             "YES",
+			"CONNECTION_TYPE":     nil,
+			"THREAD_OS_ID":        int64(0),
+			"RESOURCE_GROUP":      "SYS_default",
+		},
+	}
+}
+
+// perfSchemaSetupActors returns the default rows for performance_schema.setup_actors.
+func (e *Executor) perfSchemaSetupActors() []storage.Row {
+	return []storage.Row{
+		{"HOST": "%", "USER": "%", "ROLE": "%", "ENABLED": "YES", "HISTORY": "YES"},
+	}
 }

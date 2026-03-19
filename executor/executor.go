@@ -419,6 +419,1043 @@ func (e *Executor) initSystemTables() {
 		},
 	})
 
+	// ── performance_timers ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "performance_timers",
+		Columns: []catalog.ColumnDef{
+			{Name: "TIMER_NAME", Type: "VARCHAR(64)"},
+			{Name: "TIMER_FREQUENCY", Type: "BIGINT"},
+			{Name: "TIMER_RESOLUTION", Type: "BIGINT"},
+			{Name: "TIMER_OVERHEAD", Type: "BIGINT"},
+		},
+	})
+	// ── threads ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "threads",
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "NAME", Type: "VARCHAR(128)"},
+			{Name: "TYPE", Type: "VARCHAR(10)"},
+			{Name: "PROCESSLIST_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "PROCESSLIST_USER", Type: "VARCHAR(32)"},
+			{Name: "PROCESSLIST_HOST", Type: "VARCHAR(255)"},
+			{Name: "PROCESSLIST_DB", Type: "VARCHAR(64)"},
+			{Name: "PROCESSLIST_COMMAND", Type: "VARCHAR(16)"},
+			{Name: "PROCESSLIST_TIME", Type: "BIGINT"},
+			{Name: "PROCESSLIST_STATE", Type: "VARCHAR(64)"},
+			{Name: "PROCESSLIST_INFO", Type: "LONGTEXT"},
+			{Name: "PARENT_THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "ROLE", Type: "VARCHAR(64)"},
+			{Name: "INSTRUMENTED", Type: "VARCHAR(3)"},
+			{Name: "HISTORY", Type: "VARCHAR(3)"},
+			{Name: "CONNECTION_TYPE", Type: "VARCHAR(16)"},
+			{Name: "THREAD_OS_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "RESOURCE_GROUP", Type: "VARCHAR(64)"},
+		},
+	})
+	// ── accounts ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "accounts",
+		Columns: []catalog.ColumnDef{
+			{Name: "USER", Type: "VARCHAR(32)"},
+			{Name: "HOST", Type: "VARCHAR(255)"},
+			{Name: "CURRENT_CONNECTIONS", Type: "BIGINT"},
+			{Name: "TOTAL_CONNECTIONS", Type: "BIGINT"},
+		},
+	})
+	// ── users ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "users",
+		Columns: []catalog.ColumnDef{
+			{Name: "USER", Type: "VARCHAR(32)"},
+			{Name: "CURRENT_CONNECTIONS", Type: "BIGINT"},
+			{Name: "TOTAL_CONNECTIONS", Type: "BIGINT"},
+		},
+	})
+	// ── hosts ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "hosts",
+		Columns: []catalog.ColumnDef{
+			{Name: "HOST", Type: "VARCHAR(255)"},
+			{Name: "CURRENT_CONNECTIONS", Type: "BIGINT"},
+			{Name: "TOTAL_CONNECTIONS", Type: "BIGINT"},
+		},
+	})
+	// ── setup_actors ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "setup_actors",
+		Columns: []catalog.ColumnDef{
+			{Name: "HOST", Type: "VARCHAR(255)"},
+			{Name: "USER", Type: "VARCHAR(32)"},
+			{Name: "ROLE", Type: "VARCHAR(255)"},
+			{Name: "ENABLED", Type: "VARCHAR(3)"},
+			{Name: "HISTORY", Type: "VARCHAR(3)"},
+		},
+	})
+	// Seed default row for setup_actors if empty
+	if saTable, err := e.Storage.GetTable("performance_schema", "setup_actors"); err == nil {
+		saTable.Mu.RLock()
+		empty := len(saTable.Rows) == 0
+		saTable.Mu.RUnlock()
+		if empty {
+			saTable.Insert(storage.Row{"HOST": "%", "USER": "%", "ROLE": "%", "ENABLED": "YES", "HISTORY": "YES"}) //nolint:errcheck
+		}
+	}
+	// ── setup_objects ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "setup_objects",
+		Columns: []catalog.ColumnDef{
+			{Name: "OBJECT_TYPE", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_SCHEMA", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_NAME", Type: "VARCHAR(64)"},
+			{Name: "ENABLED", Type: "VARCHAR(3)"},
+			{Name: "TIMED", Type: "VARCHAR(3)"},
+		},
+	})
+	// ── setup_threads ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "setup_threads",
+		Columns: []catalog.ColumnDef{
+			{Name: "NAME", Type: "VARCHAR(128)"},
+			{Name: "ENABLED", Type: "VARCHAR(3)"},
+			{Name: "HISTORY", Type: "VARCHAR(3)"},
+			{Name: "PROPERTIES", Type: "VARCHAR(64)"},
+			{Name: "VOLATILITY", Type: "INT"},
+			{Name: "DOCUMENTATION", Type: "LONGTEXT"},
+		},
+	})
+	// ── mutex_instances ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "mutex_instances",
+		Columns: []catalog.ColumnDef{
+			{Name: "NAME", Type: "VARCHAR(128)"},
+			{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+			{Name: "LOCKED_BY_THREAD_ID", Type: "BIGINT UNSIGNED"},
+		},
+	})
+	// ── rwlock_instances ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "rwlock_instances",
+		Columns: []catalog.ColumnDef{
+			{Name: "NAME", Type: "VARCHAR(128)"},
+			{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+			{Name: "WRITE_LOCKED_BY_THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "READ_LOCKED_BY_COUNT", Type: "INT UNSIGNED"},
+		},
+	})
+	// ── cond_instances ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "cond_instances",
+		Columns: []catalog.ColumnDef{
+			{Name: "NAME", Type: "VARCHAR(128)"},
+			{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+		},
+	})
+	// ── file_instances ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "file_instances",
+		Columns: []catalog.ColumnDef{
+			{Name: "FILE_NAME", Type: "VARCHAR(512)"},
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "OPEN_COUNT", Type: "INT UNSIGNED"},
+		},
+	})
+	// ── file_summary_by_instance ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "file_summary_by_instance",
+		Columns: []catalog.ColumnDef{
+			{Name: "FILE_NAME", Type: "VARCHAR(512)"},
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_STAR", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_READ", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_READ", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_READ", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_READ", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_READ", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_NUMBER_OF_BYTES_READ", Type: "BIGINT"},
+			{Name: "COUNT_WRITE", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_WRITE", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_WRITE", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_WRITE", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_WRITE", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_NUMBER_OF_BYTES_WRITE", Type: "BIGINT"},
+			{Name: "COUNT_MISC", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_MISC", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_MISC", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_MISC", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_MISC", Type: "BIGINT UNSIGNED"},
+		},
+	})
+	// ── socket_instances ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "socket_instances",
+		Columns: []catalog.ColumnDef{
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "SOCKET_ID", Type: "INT"},
+			{Name: "IP", Type: "VARCHAR(64)"},
+			{Name: "PORT", Type: "INT"},
+			{Name: "STATE", Type: "VARCHAR(64)"},
+		},
+	})
+	// ── socket_summary_by_instance ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "socket_summary_by_instance",
+		Columns: []catalog.ColumnDef{
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_STAR", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_READ", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_READ", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_NUMBER_OF_BYTES_READ", Type: "BIGINT"},
+			{Name: "COUNT_WRITE", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_WRITE", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_NUMBER_OF_BYTES_WRITE", Type: "BIGINT"},
+			{Name: "COUNT_MISC", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_MISC", Type: "BIGINT UNSIGNED"},
+		},
+	})
+	// ── socket_summary_by_event_name ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "socket_summary_by_event_name",
+		Columns: []catalog.ColumnDef{
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "COUNT_STAR", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_READ", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_READ", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_NUMBER_OF_BYTES_READ", Type: "BIGINT"},
+			{Name: "COUNT_WRITE", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_WRITE", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_NUMBER_OF_BYTES_WRITE", Type: "BIGINT"},
+			{Name: "COUNT_MISC", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_MISC", Type: "BIGINT UNSIGNED"},
+		},
+	})
+	// ── events_waits_history ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "events_waits_history",
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "SOURCE", Type: "VARCHAR(64)"},
+			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "SPINS", Type: "INT UNSIGNED"},
+			{Name: "OBJECT_SCHEMA", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_NAME", Type: "VARCHAR(512)"},
+			{Name: "INDEX_NAME", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_TYPE", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+			{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "NESTING_EVENT_TYPE", Type: "VARCHAR(64)"},
+			{Name: "OPERATION", Type: "VARCHAR(32)"},
+			{Name: "NUMBER_OF_BYTES", Type: "BIGINT"},
+			{Name: "FLAGS", Type: "INT UNSIGNED"},
+		},
+	})
+	// ── events_waits_summary_by_* ──
+	for _, sfx := range []string{
+		"events_waits_summary_global_by_event_name",
+		"events_waits_summary_by_thread_by_event_name",
+		"events_waits_summary_by_account_by_event_name",
+		"events_waits_summary_by_user_by_event_name",
+		"events_waits_summary_by_host_by_event_name",
+		"events_waits_summary_by_instance",
+	} {
+		cols := []catalog.ColumnDef{
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "COUNT_STAR", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+		}
+		if strings.Contains(sfx, "thread") {
+			cols = append([]catalog.ColumnDef{{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"}}, cols...)
+		}
+		if strings.Contains(sfx, "account") {
+			cols = append([]catalog.ColumnDef{{Name: "USER", Type: "VARCHAR(32)"}, {Name: "HOST", Type: "VARCHAR(255)"}}, cols...)
+		}
+		if strings.Contains(sfx, "user") {
+			cols = append([]catalog.ColumnDef{{Name: "USER", Type: "VARCHAR(32)"}}, cols...)
+		}
+		if strings.Contains(sfx, "host_by") {
+			cols = append([]catalog.ColumnDef{{Name: "HOST", Type: "VARCHAR(255)"}}, cols...)
+		}
+		if strings.Contains(sfx, "instance") {
+			cols = append([]catalog.ColumnDef{{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"}}, cols...)
+		}
+		ensure("performance_schema", &catalog.TableDef{Name: sfx, Columns: cols})
+	}
+	// ── events_stages_current ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "events_stages_current",
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "SOURCE", Type: "VARCHAR(64)"},
+			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "WORK_COMPLETED", Type: "BIGINT UNSIGNED"},
+			{Name: "WORK_ESTIMATED", Type: "BIGINT UNSIGNED"},
+			{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "NESTING_EVENT_TYPE", Type: "VARCHAR(64)"},
+		},
+	})
+	// ── events_stages_summary_by_* ──
+	for _, sfx := range []string{
+		"events_stages_summary_global_by_event_name",
+		"events_stages_summary_by_thread_by_event_name",
+		"events_stages_summary_by_account_by_event_name",
+		"events_stages_summary_by_user_by_event_name",
+		"events_stages_summary_by_host_by_event_name",
+	} {
+		cols := []catalog.ColumnDef{
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "COUNT_STAR", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+		}
+		if strings.Contains(sfx, "thread") {
+			cols = append([]catalog.ColumnDef{{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"}}, cols...)
+		}
+		if strings.Contains(sfx, "account") {
+			cols = append([]catalog.ColumnDef{{Name: "USER", Type: "VARCHAR(32)"}, {Name: "HOST", Type: "VARCHAR(255)"}}, cols...)
+		}
+		if strings.Contains(sfx, "user") {
+			cols = append([]catalog.ColumnDef{{Name: "USER", Type: "VARCHAR(32)"}}, cols...)
+		}
+		if strings.Contains(sfx, "host_by") {
+			cols = append([]catalog.ColumnDef{{Name: "HOST", Type: "VARCHAR(255)"}}, cols...)
+		}
+		ensure("performance_schema", &catalog.TableDef{Name: sfx, Columns: cols})
+	}
+	// ── events_statements_current ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "events_statements_current",
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "SOURCE", Type: "VARCHAR(64)"},
+			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "LOCK_TIME", Type: "BIGINT UNSIGNED"},
+			{Name: "SQL_TEXT", Type: "LONGTEXT"},
+			{Name: "DIGEST", Type: "VARCHAR(64)"},
+			{Name: "DIGEST_TEXT", Type: "LONGTEXT"},
+			{Name: "CURRENT_SCHEMA", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_TYPE", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_SCHEMA", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_NAME", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+			{Name: "MYSQL_ERRNO", Type: "INT UNSIGNED"},
+			{Name: "RETURNED_SQLSTATE", Type: "VARCHAR(5)"},
+			{Name: "MESSAGE_TEXT", Type: "VARCHAR(128)"},
+			{Name: "ERRORS", Type: "BIGINT UNSIGNED"},
+			{Name: "WARNINGS", Type: "BIGINT UNSIGNED"},
+			{Name: "ROWS_AFFECTED", Type: "BIGINT UNSIGNED"},
+			{Name: "ROWS_SENT", Type: "BIGINT UNSIGNED"},
+			{Name: "ROWS_EXAMINED", Type: "BIGINT UNSIGNED"},
+			{Name: "CREATED_TMP_DISK_TABLES", Type: "BIGINT UNSIGNED"},
+			{Name: "CREATED_TMP_TABLES", Type: "BIGINT UNSIGNED"},
+			{Name: "SELECT_FULL_JOIN", Type: "BIGINT UNSIGNED"},
+			{Name: "SELECT_FULL_RANGE_JOIN", Type: "BIGINT UNSIGNED"},
+			{Name: "SELECT_RANGE", Type: "BIGINT UNSIGNED"},
+			{Name: "SELECT_RANGE_CHECK", Type: "BIGINT UNSIGNED"},
+			{Name: "SELECT_SCAN", Type: "BIGINT UNSIGNED"},
+			{Name: "SORT_MERGE_PASSES", Type: "BIGINT UNSIGNED"},
+			{Name: "SORT_RANGE", Type: "BIGINT UNSIGNED"},
+			{Name: "SORT_ROWS", Type: "BIGINT UNSIGNED"},
+			{Name: "SORT_SCAN", Type: "BIGINT UNSIGNED"},
+			{Name: "NO_INDEX_USED", Type: "BIGINT UNSIGNED"},
+			{Name: "NO_GOOD_INDEX_USED", Type: "BIGINT UNSIGNED"},
+			{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "NESTING_EVENT_TYPE", Type: "VARCHAR(64)"},
+			{Name: "NESTING_EVENT_LEVEL", Type: "INT"},
+			{Name: "STATEMENT_ID", Type: "BIGINT UNSIGNED"},
+		},
+	})
+	// ── events_statements_history ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "events_statements_history",
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "SOURCE", Type: "VARCHAR(64)"},
+			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "LOCK_TIME", Type: "BIGINT UNSIGNED"},
+			{Name: "SQL_TEXT", Type: "LONGTEXT"},
+			{Name: "DIGEST", Type: "VARCHAR(64)"},
+			{Name: "DIGEST_TEXT", Type: "LONGTEXT"},
+			{Name: "CURRENT_SCHEMA", Type: "VARCHAR(64)"},
+			{Name: "ROWS_AFFECTED", Type: "BIGINT UNSIGNED"},
+			{Name: "ROWS_SENT", Type: "BIGINT UNSIGNED"},
+			{Name: "ROWS_EXAMINED", Type: "BIGINT UNSIGNED"},
+		},
+	})
+	// ── events_statements_summary_by_digest ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "events_statements_summary_by_digest",
+		Columns: []catalog.ColumnDef{
+			{Name: "SCHEMA_NAME", Type: "VARCHAR(64)"},
+			{Name: "DIGEST", Type: "VARCHAR(64)"},
+			{Name: "DIGEST_TEXT", Type: "LONGTEXT"},
+			{Name: "COUNT_STAR", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_LOCK_TIME", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_ERRORS", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_WARNINGS", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_ROWS_AFFECTED", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_ROWS_SENT", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_ROWS_EXAMINED", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_CREATED_TMP_DISK_TABLES", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_CREATED_TMP_TABLES", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SELECT_FULL_JOIN", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SELECT_FULL_RANGE_JOIN", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SELECT_RANGE", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SELECT_RANGE_CHECK", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SELECT_SCAN", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SORT_MERGE_PASSES", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SORT_RANGE", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SORT_ROWS", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SORT_SCAN", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_NO_INDEX_USED", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_NO_GOOD_INDEX_USED", Type: "BIGINT UNSIGNED"},
+			{Name: "FIRST_SEEN", Type: "TIMESTAMP"},
+			{Name: "LAST_SEEN", Type: "TIMESTAMP"},
+			{Name: "QUANTILE_95", Type: "BIGINT UNSIGNED"},
+			{Name: "QUANTILE_99", Type: "BIGINT UNSIGNED"},
+			{Name: "QUANTILE_999", Type: "BIGINT UNSIGNED"},
+			{Name: "QUERY_SAMPLE_TEXT", Type: "LONGTEXT"},
+			{Name: "QUERY_SAMPLE_SEEN", Type: "TIMESTAMP"},
+			{Name: "QUERY_SAMPLE_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+		},
+	})
+	// ── events_statements_summary_by_{account,user,host,thread,global}_by_event_name ──
+	for _, sfx := range []string{
+		"events_statements_summary_global_by_event_name",
+		"events_statements_summary_by_thread_by_event_name",
+		"events_statements_summary_by_account_by_event_name",
+		"events_statements_summary_by_user_by_event_name",
+		"events_statements_summary_by_host_by_event_name",
+	} {
+		cols := []catalog.ColumnDef{
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "COUNT_STAR", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_LOCK_TIME", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_ERRORS", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_WARNINGS", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_ROWS_AFFECTED", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_ROWS_SENT", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_ROWS_EXAMINED", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_CREATED_TMP_DISK_TABLES", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_CREATED_TMP_TABLES", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SELECT_FULL_JOIN", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SELECT_FULL_RANGE_JOIN", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SELECT_RANGE", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SELECT_RANGE_CHECK", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SELECT_SCAN", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SORT_MERGE_PASSES", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SORT_RANGE", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SORT_ROWS", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_SORT_SCAN", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_NO_INDEX_USED", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_NO_GOOD_INDEX_USED", Type: "BIGINT UNSIGNED"},
+		}
+		if strings.Contains(sfx, "thread") {
+			cols = append([]catalog.ColumnDef{{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"}}, cols...)
+		}
+		if strings.Contains(sfx, "account") {
+			cols = append([]catalog.ColumnDef{{Name: "USER", Type: "VARCHAR(32)"}, {Name: "HOST", Type: "VARCHAR(255)"}}, cols...)
+		}
+		if strings.Contains(sfx, "user") {
+			cols = append([]catalog.ColumnDef{{Name: "USER", Type: "VARCHAR(32)"}}, cols...)
+		}
+		if strings.Contains(sfx, "host_by") {
+			cols = append([]catalog.ColumnDef{{Name: "HOST", Type: "VARCHAR(255)"}}, cols...)
+		}
+		ensure("performance_schema", &catalog.TableDef{Name: sfx, Columns: cols})
+	}
+	// ── events_statements_histogram_by_digest ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "events_statements_histogram_by_digest",
+		Columns: []catalog.ColumnDef{
+			{Name: "SCHEMA_NAME", Type: "VARCHAR(64)"},
+			{Name: "DIGEST", Type: "VARCHAR(64)"},
+			{Name: "BUCKET_NUMBER", Type: "INT UNSIGNED"},
+			{Name: "BUCKET_TIMER_LOW", Type: "BIGINT UNSIGNED"},
+			{Name: "BUCKET_TIMER_HIGH", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_BUCKET", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_BUCKET_AND_LOWER", Type: "BIGINT UNSIGNED"},
+			{Name: "BUCKET_QUANTILE", Type: "DOUBLE"},
+		},
+	})
+	// ── events_statements_histogram_global ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "events_statements_histogram_global",
+		Columns: []catalog.ColumnDef{
+			{Name: "BUCKET_NUMBER", Type: "INT UNSIGNED"},
+			{Name: "BUCKET_TIMER_LOW", Type: "BIGINT UNSIGNED"},
+			{Name: "BUCKET_TIMER_HIGH", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_BUCKET", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_BUCKET_AND_LOWER", Type: "BIGINT UNSIGNED"},
+			{Name: "BUCKET_QUANTILE", Type: "DOUBLE"},
+		},
+	})
+	// ── events_transactions_current ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "events_transactions_current",
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "STATE", Type: "VARCHAR(64)"},
+			{Name: "TRX_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "GTID", Type: "VARCHAR(64)"},
+			{Name: "XID_FORMAT_ID", Type: "INT"},
+			{Name: "XID_GTRID", Type: "VARCHAR(130)"},
+			{Name: "XID_BQUAL", Type: "VARCHAR(130)"},
+			{Name: "XA_STATE", Type: "VARCHAR(64)"},
+			{Name: "SOURCE", Type: "VARCHAR(64)"},
+			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "ACCESS_MODE", Type: "VARCHAR(64)"},
+			{Name: "ISOLATION_LEVEL", Type: "VARCHAR(64)"},
+			{Name: "AUTOCOMMIT", Type: "VARCHAR(64)"},
+			{Name: "NUMBER_OF_SAVEPOINTS", Type: "BIGINT UNSIGNED"},
+			{Name: "NUMBER_OF_ROLLBACK_TO_SAVEPOINT", Type: "BIGINT UNSIGNED"},
+			{Name: "NUMBER_OF_RELEASE_SAVEPOINT", Type: "BIGINT UNSIGNED"},
+			{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+			{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "NESTING_EVENT_TYPE", Type: "VARCHAR(64)"},
+		},
+	})
+	// ── events_transactions_history ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "events_transactions_history",
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "STATE", Type: "VARCHAR(64)"},
+			{Name: "TRX_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "GTID", Type: "VARCHAR(64)"},
+			{Name: "SOURCE", Type: "VARCHAR(64)"},
+			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "ACCESS_MODE", Type: "VARCHAR(64)"},
+			{Name: "ISOLATION_LEVEL", Type: "VARCHAR(64)"},
+			{Name: "AUTOCOMMIT", Type: "VARCHAR(64)"},
+		},
+	})
+	// ── events_transactions_history_long ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "events_transactions_history_long",
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "STATE", Type: "VARCHAR(64)"},
+			{Name: "TRX_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "GTID", Type: "VARCHAR(64)"},
+			{Name: "SOURCE", Type: "VARCHAR(64)"},
+			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "ACCESS_MODE", Type: "VARCHAR(64)"},
+			{Name: "ISOLATION_LEVEL", Type: "VARCHAR(64)"},
+			{Name: "AUTOCOMMIT", Type: "VARCHAR(64)"},
+		},
+	})
+	// ── events_transactions_summary_by_* ──
+	for _, sfx := range []string{
+		"events_transactions_summary_global_by_event_name",
+		"events_transactions_summary_by_thread_by_event_name",
+		"events_transactions_summary_by_account_by_event_name",
+		"events_transactions_summary_by_user_by_event_name",
+		"events_transactions_summary_by_host_by_event_name",
+	} {
+		cols := []catalog.ColumnDef{
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "COUNT_STAR", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+		}
+		if strings.Contains(sfx, "thread") {
+			cols = append([]catalog.ColumnDef{{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"}}, cols...)
+		}
+		if strings.Contains(sfx, "account") {
+			cols = append([]catalog.ColumnDef{{Name: "USER", Type: "VARCHAR(32)"}, {Name: "HOST", Type: "VARCHAR(255)"}}, cols...)
+		}
+		if strings.Contains(sfx, "user") {
+			cols = append([]catalog.ColumnDef{{Name: "USER", Type: "VARCHAR(32)"}}, cols...)
+		}
+		if strings.Contains(sfx, "host_by") {
+			cols = append([]catalog.ColumnDef{{Name: "HOST", Type: "VARCHAR(255)"}}, cols...)
+		}
+		ensure("performance_schema", &catalog.TableDef{Name: sfx, Columns: cols})
+	}
+	// ── events_errors_summary_by_* ──
+	for _, sfx := range []string{
+		"events_errors_summary_global_by_error",
+		"events_errors_summary_by_thread_by_error",
+		"events_errors_summary_by_account_by_error",
+		"events_errors_summary_by_user_by_error",
+		"events_errors_summary_by_host_by_error",
+	} {
+		cols := []catalog.ColumnDef{
+			{Name: "ERROR_NUMBER", Type: "INT"},
+			{Name: "ERROR_NAME", Type: "VARCHAR(64)"},
+			{Name: "SQL_STATE", Type: "VARCHAR(5)"},
+			{Name: "SUM_ERROR_RAISED", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_ERROR_HANDLED", Type: "BIGINT UNSIGNED"},
+			{Name: "FIRST_SEEN", Type: "TIMESTAMP"},
+			{Name: "LAST_SEEN", Type: "TIMESTAMP"},
+		}
+		if strings.Contains(sfx, "thread") {
+			cols = append([]catalog.ColumnDef{{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"}}, cols...)
+		}
+		if strings.Contains(sfx, "account") {
+			cols = append([]catalog.ColumnDef{{Name: "USER", Type: "VARCHAR(32)"}, {Name: "HOST", Type: "VARCHAR(255)"}}, cols...)
+		}
+		if strings.Contains(sfx, "user") {
+			cols = append([]catalog.ColumnDef{{Name: "USER", Type: "VARCHAR(32)"}}, cols...)
+		}
+		if strings.Contains(sfx, "host_by") {
+			cols = append([]catalog.ColumnDef{{Name: "HOST", Type: "VARCHAR(255)"}}, cols...)
+		}
+		ensure("performance_schema", &catalog.TableDef{Name: sfx, Columns: cols})
+	}
+	// ── table_io_waits_summary_by_table ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "table_io_waits_summary_by_table",
+		Columns: []catalog.ColumnDef{
+			{Name: "OBJECT_TYPE", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_SCHEMA", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_NAME", Type: "VARCHAR(64)"},
+			{Name: "COUNT_STAR", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_FETCH", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_FETCH", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_FETCH", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_FETCH", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_FETCH", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_INSERT", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_INSERT", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_INSERT", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_INSERT", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_INSERT", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_UPDATE", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_UPDATE", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_UPDATE", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_UPDATE", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_UPDATE", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_DELETE", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_DELETE", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_DELETE", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_DELETE", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_DELETE", Type: "BIGINT UNSIGNED"},
+		},
+	})
+	// ── table_io_waits_summary_by_index_usage ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "table_io_waits_summary_by_index_usage",
+		Columns: []catalog.ColumnDef{
+			{Name: "OBJECT_TYPE", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_SCHEMA", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_NAME", Type: "VARCHAR(64)"},
+			{Name: "INDEX_NAME", Type: "VARCHAR(64)"},
+			{Name: "COUNT_STAR", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_FETCH", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_FETCH", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_FETCH", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_FETCH", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_FETCH", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_INSERT", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_INSERT", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_INSERT", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_INSERT", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_INSERT", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_UPDATE", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_UPDATE", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_UPDATE", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_UPDATE", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_UPDATE", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_DELETE", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_DELETE", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_DELETE", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_DELETE", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_DELETE", Type: "BIGINT UNSIGNED"},
+		},
+	})
+	// ── table_lock_waits_summary_by_table ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "table_lock_waits_summary_by_table",
+		Columns: []catalog.ColumnDef{
+			{Name: "OBJECT_TYPE", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_SCHEMA", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_NAME", Type: "VARCHAR(64)"},
+			{Name: "COUNT_STAR", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+		},
+	})
+	// ── table_handles ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "table_handles",
+		Columns: []catalog.ColumnDef{
+			{Name: "OBJECT_TYPE", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_SCHEMA", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_NAME", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+			{Name: "OWNER_THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "OWNER_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "INTERNAL_LOCK", Type: "VARCHAR(64)"},
+			{Name: "EXTERNAL_LOCK", Type: "VARCHAR(64)"},
+		},
+	})
+	// ── objects_summary_global_by_type ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "objects_summary_global_by_type",
+		Columns: []catalog.ColumnDef{
+			{Name: "OBJECT_TYPE", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_SCHEMA", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_NAME", Type: "VARCHAR(64)"},
+			{Name: "COUNT_STAR", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+		},
+	})
+	// ── data_locks ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "data_locks",
+		Columns: []catalog.ColumnDef{
+			{Name: "ENGINE", Type: "VARCHAR(32)"},
+			{Name: "ENGINE_LOCK_ID", Type: "VARCHAR(128)"},
+			{Name: "ENGINE_TRANSACTION_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "OBJECT_SCHEMA", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_NAME", Type: "VARCHAR(64)"},
+			{Name: "PARTITION_NAME", Type: "VARCHAR(64)"},
+			{Name: "SUBPARTITION_NAME", Type: "VARCHAR(64)"},
+			{Name: "INDEX_NAME", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+			{Name: "LOCK_TYPE", Type: "VARCHAR(32)"},
+			{Name: "LOCK_MODE", Type: "VARCHAR(64)"},
+			{Name: "LOCK_STATUS", Type: "VARCHAR(32)"},
+			{Name: "LOCK_DATA", Type: "VARCHAR(8192)"},
+		},
+	})
+	// ── data_lock_waits ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "data_lock_waits",
+		Columns: []catalog.ColumnDef{
+			{Name: "ENGINE", Type: "VARCHAR(32)"},
+			{Name: "REQUESTING_ENGINE_LOCK_ID", Type: "VARCHAR(128)"},
+			{Name: "REQUESTING_ENGINE_TRANSACTION_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "REQUESTING_THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "REQUESTING_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "REQUESTING_OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+			{Name: "BLOCKING_ENGINE_LOCK_ID", Type: "VARCHAR(128)"},
+			{Name: "BLOCKING_ENGINE_TRANSACTION_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "BLOCKING_THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "BLOCKING_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "BLOCKING_OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+		},
+	})
+	// ── metadata_locks ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "metadata_locks",
+		Columns: []catalog.ColumnDef{
+			{Name: "OBJECT_TYPE", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_SCHEMA", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_NAME", Type: "VARCHAR(64)"},
+			{Name: "COLUMN_NAME", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+			{Name: "LOCK_TYPE", Type: "VARCHAR(32)"},
+			{Name: "LOCK_DURATION", Type: "VARCHAR(32)"},
+			{Name: "LOCK_STATUS", Type: "VARCHAR(32)"},
+			{Name: "SOURCE", Type: "VARCHAR(64)"},
+			{Name: "OWNER_THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "OWNER_EVENT_ID", Type: "BIGINT UNSIGNED"},
+		},
+	})
+	// ── memory_summary_by_* ──
+	for _, sfx := range []string{
+		"memory_summary_by_thread_by_event_name",
+		"memory_summary_by_account_by_event_name",
+		"memory_summary_by_user_by_event_name",
+		"memory_summary_by_host_by_event_name",
+	} {
+		cols := []catalog.ColumnDef{
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "COUNT_ALLOC", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_FREE", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_NUMBER_OF_BYTES_ALLOC", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_NUMBER_OF_BYTES_FREE", Type: "BIGINT UNSIGNED"},
+			{Name: "LOW_COUNT_USED", Type: "BIGINT"},
+			{Name: "CURRENT_COUNT_USED", Type: "BIGINT"},
+			{Name: "HIGH_COUNT_USED", Type: "BIGINT"},
+			{Name: "LOW_NUMBER_OF_BYTES_USED", Type: "BIGINT"},
+			{Name: "CURRENT_NUMBER_OF_BYTES_USED", Type: "BIGINT"},
+			{Name: "HIGH_NUMBER_OF_BYTES_USED", Type: "BIGINT"},
+		}
+		if strings.Contains(sfx, "thread") {
+			cols = append([]catalog.ColumnDef{{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"}}, cols...)
+		}
+		if strings.Contains(sfx, "account") {
+			cols = append([]catalog.ColumnDef{{Name: "USER", Type: "VARCHAR(32)"}, {Name: "HOST", Type: "VARCHAR(255)"}}, cols...)
+		}
+		if strings.Contains(sfx, "user") {
+			cols = append([]catalog.ColumnDef{{Name: "USER", Type: "VARCHAR(32)"}}, cols...)
+		}
+		if strings.Contains(sfx, "host") {
+			cols = append([]catalog.ColumnDef{{Name: "HOST", Type: "VARCHAR(255)"}}, cols...)
+		}
+		ensure("performance_schema", &catalog.TableDef{Name: sfx, Columns: cols})
+	}
+	// ── variables_info ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "variables_info",
+		Columns: []catalog.ColumnDef{
+			{Name: "VARIABLE_NAME", Type: "VARCHAR(64)"},
+			{Name: "VARIABLE_SOURCE", Type: "VARCHAR(64)"},
+			{Name: "VARIABLE_PATH", Type: "VARCHAR(1024)"},
+			{Name: "MIN_VALUE", Type: "VARCHAR(64)"},
+			{Name: "MAX_VALUE", Type: "VARCHAR(64)"},
+			{Name: "SET_TIME", Type: "TIMESTAMP"},
+			{Name: "SET_USER", Type: "VARCHAR(32)"},
+			{Name: "SET_HOST", Type: "VARCHAR(255)"},
+		},
+	})
+	// ── variables_by_thread ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "variables_by_thread",
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "VARIABLE_NAME", Type: "VARCHAR(64)"},
+			{Name: "VARIABLE_VALUE", Type: "VARCHAR(1024)"},
+		},
+	})
+	// ── persisted_variables ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "persisted_variables",
+		Columns: []catalog.ColumnDef{
+			{Name: "VARIABLE_NAME", Type: "VARCHAR(64)"},
+			{Name: "VARIABLE_VALUE", Type: "VARCHAR(1024)"},
+		},
+	})
+	// ── user_variables_by_thread ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "user_variables_by_thread",
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "VARIABLE_NAME", Type: "VARCHAR(64)"},
+			{Name: "VARIABLE_VALUE", Type: "LONGBLOB"},
+		},
+	})
+	// ── session_connect_attrs ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "session_connect_attrs",
+		Columns: []catalog.ColumnDef{
+			{Name: "PROCESSLIST_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "ATTR_NAME", Type: "VARCHAR(32)"},
+			{Name: "ATTR_VALUE", Type: "VARCHAR(1024)"},
+			{Name: "ORDINAL_POSITION", Type: "INT"},
+		},
+	})
+	// ── session_account_connect_attrs ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "session_account_connect_attrs",
+		Columns: []catalog.ColumnDef{
+			{Name: "PROCESSLIST_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "ATTR_NAME", Type: "VARCHAR(32)"},
+			{Name: "ATTR_VALUE", Type: "VARCHAR(1024)"},
+			{Name: "ORDINAL_POSITION", Type: "INT"},
+		},
+	})
+	// ── status_by_account/host/user/thread ──
+	for _, sfx := range []string{"status_by_account", "status_by_host", "status_by_user", "status_by_thread"} {
+		cols := []catalog.ColumnDef{
+			{Name: "VARIABLE_NAME", Type: "VARCHAR(64)"},
+			{Name: "VARIABLE_VALUE", Type: "VARCHAR(1024)"},
+		}
+		if strings.Contains(sfx, "account") {
+			cols = append([]catalog.ColumnDef{{Name: "USER", Type: "VARCHAR(32)"}, {Name: "HOST", Type: "VARCHAR(255)"}}, cols...)
+		}
+		if strings.Contains(sfx, "user") && !strings.Contains(sfx, "account") {
+			cols = append([]catalog.ColumnDef{{Name: "USER", Type: "VARCHAR(32)"}}, cols...)
+		}
+		if sfx == "status_by_host" {
+			cols = append([]catalog.ColumnDef{{Name: "HOST", Type: "VARCHAR(255)"}}, cols...)
+		}
+		if sfx == "status_by_thread" {
+			cols = append([]catalog.ColumnDef{{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"}}, cols...)
+		}
+		ensure("performance_schema", &catalog.TableDef{Name: sfx, Columns: cols})
+	}
+	// ── host_cache ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "host_cache",
+		Columns: []catalog.ColumnDef{
+			{Name: "IP", Type: "VARCHAR(64)"},
+			{Name: "HOST", Type: "VARCHAR(255)"},
+			{Name: "HOST_VALIDATED", Type: "VARCHAR(3)"},
+			{Name: "SUM_CONNECT_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_HOST_BLOCKED_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_NAMEINFO_TRANSIENT_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_NAMEINFO_PERMANENT_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_FORMAT_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_ADDRINFO_TRANSIENT_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_ADDRINFO_PERMANENT_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_FCRDNS_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_HOST_ACL_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_NO_AUTH_PLUGIN_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_AUTH_PLUGIN_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_HANDSHAKE_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_PROXY_USER_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_PROXY_USER_ACL_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_AUTHENTICATION_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_SSL_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_MAX_USER_CONNECTIONS_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_MAX_USER_CONNECTIONS_PER_HOUR_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_DEFAULT_DATABASE_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_INIT_CONNECT_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_LOCAL_ERRORS", Type: "BIGINT"},
+			{Name: "COUNT_UNKNOWN_ERRORS", Type: "BIGINT"},
+			{Name: "FIRST_SEEN", Type: "TIMESTAMP"},
+			{Name: "LAST_SEEN", Type: "TIMESTAMP"},
+			{Name: "FIRST_ERROR_SEEN", Type: "TIMESTAMP"},
+			{Name: "LAST_ERROR_SEEN", Type: "TIMESTAMP"},
+		},
+	})
+	// ── replication tables (stubs) ──
+	for _, name := range []string{
+		"replication_connection_configuration",
+		"replication_connection_status",
+		"replication_applier_configuration",
+		"replication_applier_status",
+		"replication_applier_status_by_coordinator",
+		"replication_applier_status_by_worker",
+		"replication_group_members",
+		"replication_group_member_stats",
+		"replication_applier_filters",
+		"replication_applier_global_filters",
+	} {
+		ensure("performance_schema", &catalog.TableDef{
+			Name: name,
+			Columns: []catalog.ColumnDef{
+				{Name: "CHANNEL_NAME", Type: "VARCHAR(64)"},
+			},
+		})
+	}
+	// ── keyring_keys ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "keyring_keys",
+		Columns: []catalog.ColumnDef{
+			{Name: "KEY_ID", Type: "VARCHAR(255)"},
+			{Name: "KEY_OWNER", Type: "VARCHAR(255)"},
+			{Name: "BACKEND_KEY_ID", Type: "VARCHAR(255)"},
+		},
+	})
+	// ── user_defined_functions ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "user_defined_functions",
+		Columns: []catalog.ColumnDef{
+			{Name: "UDF_NAME", Type: "VARCHAR(64)"},
+			{Name: "UDF_RETURN_TYPE", Type: "VARCHAR(20)"},
+			{Name: "UDF_TYPE", Type: "VARCHAR(20)"},
+			{Name: "UDF_LIBRARY", Type: "VARCHAR(1024)"},
+			{Name: "UDF_USAGE_COUNT", Type: "BIGINT"},
+		},
+	})
+	// ── prepared_statements_instances ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "prepared_statements_instances",
+		Columns: []catalog.ColumnDef{
+			{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+			{Name: "STATEMENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "STATEMENT_NAME", Type: "VARCHAR(64)"},
+			{Name: "SQL_TEXT", Type: "LONGTEXT"},
+			{Name: "OWNER_THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "OWNER_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "OWNER_OBJECT_TYPE", Type: "VARCHAR(64)"},
+			{Name: "OWNER_OBJECT_SCHEMA", Type: "VARCHAR(64)"},
+			{Name: "OWNER_OBJECT_NAME", Type: "VARCHAR(64)"},
+			{Name: "COUNT_REPREPARE", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_EXECUTE", Type: "BIGINT UNSIGNED"},
+			{Name: "SUM_TIMER_EXECUTE", Type: "BIGINT UNSIGNED"},
+			{Name: "MIN_TIMER_EXECUTE", Type: "BIGINT UNSIGNED"},
+			{Name: "AVG_TIMER_EXECUTE", Type: "BIGINT UNSIGNED"},
+			{Name: "MAX_TIMER_EXECUTE", Type: "BIGINT UNSIGNED"},
+		},
+	})
+	// ── log_status ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "log_status",
+		Columns: []catalog.ColumnDef{
+			{Name: "SERVER_UUID", Type: "VARCHAR(36)"},
+			{Name: "LOCAL", Type: "JSON"},
+			{Name: "REPLICATION", Type: "JSON"},
+			{Name: "STORAGE_ENGINES", Type: "JSON"},
+		},
+	})
+
 	ensure("mtr", &catalog.TableDef{
 		Name:   "test_suppressions",
 		Engine: "InnoDB",
