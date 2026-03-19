@@ -79,10 +79,11 @@ type ProcParam struct {
 
 // FunctionDef represents a stored function definition.
 type FunctionDef struct {
-	Name       string
-	Params     []ProcParam
-	ReturnType string
-	Body       []string // SQL statements in the function body
+	Name          string
+	Params        []ProcParam
+	ReturnType    string
+	Body          []string // SQL statements in the function body
+	Deterministic bool     // true if declared DETERMINISTIC
 }
 
 // Database represents a database containing tables.

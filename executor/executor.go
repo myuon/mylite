@@ -178,8 +178,14 @@ type Executor struct {
 	// within the same top-level query execution.  Keyed by the SQL
 	// string of the subquery.
 	subqueryValCache map[string][]interface{}
+	// deterministicFuncCache caches results of DETERMINISTIC stored functions
+	// within the same top-level query execution.  Keyed by "funcName\x00arg1\x00arg2...".
+	deterministicFuncCache map[string]interface{}
 	// executeDepth tracks the recursion depth of EXECUTE/CALL to prevent stack overflow.
 	executeDepth int
+	// execNestDepth tracks nesting depth of Execute() to avoid clearing
+	// per-query caches during recursive calls from stored functions.
+	execNestDepth int
 	// sqlParser is a cached SQL parser instance to avoid allocation on every query.
 	sqlParser *sqlparser.Parser
 }
@@ -1720,9 +1726,14 @@ func (e *Executor) explainResultForType(explainType sqlparser.ExplainType, expla
 func (e *Executor) Execute(query string) (*Result, error) {
 	trimmed := strings.TrimSpace(query)
 	e.currentQuery = trimmed
-	// Clear per-query subquery cache so non-correlated IN subqueries
-	// are only evaluated once within the same top-level statement.
-	e.subqueryValCache = nil
+	// Clear per-query caches only at the top-level Execute call, not when
+	// called recursively from within a stored function (evaluateExprWithVars).
+	e.execNestDepth++
+	defer func() { e.execNestDepth-- }()
+	if e.execNestDepth == 1 {
+		e.subqueryValCache = nil
+		e.deterministicFuncCache = nil
+	}
 	upper := strings.ToUpper(trimmed)
 	// Only compute compact form for SELECT queries that might contain JSON function checks
 	if strings.HasPrefix(upper, "SELECT") && strings.Contains(upper, "JSON_") {
@@ -19737,11 +19748,26 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 		bodyStmts = []string{returnExpr}
 	}
 
+	// Check if the function is declared DETERMINISTIC.
+	isDeterministic := false
+	{
+		upper := strings.ToUpper(afterParams)
+		// DETERMINISTIC must appear, but NOT DETERMINISTIC should not match.
+		if idx := strings.Index(upper, "DETERMINISTIC"); idx >= 0 {
+			// Make sure it's not preceded by "NOT "
+			prefix := strings.TrimSpace(upper[:idx])
+			if !strings.HasSuffix(prefix, "NOT") {
+				isDeterministic = true
+			}
+		}
+	}
+
 	funcDef := &catalog.FunctionDef{
-		Name:       funcName,
-		Params:     params,
-		ReturnType: returnType,
-		Body:       bodyStmts,
+		Name:          funcName,
+		Params:        params,
+		ReturnType:    returnType,
+		Body:          bodyStmts,
+		Deterministic: isDeterministic,
 	}
 	db.CreateFunction(funcDef)
 
@@ -19801,6 +19827,7 @@ func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Exp
 
 	// Evaluate arguments
 	paramVars := make(map[string]interface{})
+	argVals := make([]interface{}, 0, len(fn.Params))
 	for i, param := range fn.Params {
 		if i < len(argExprs) {
 			var val interface{}
@@ -19814,11 +19841,43 @@ func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Exp
 				return nil, evalErr
 			}
 			paramVars[param.Name] = val
+			argVals = append(argVals, val)
 		}
+	}
+
+	// For DETERMINISTIC functions, check the per-query cache.
+	if fn.Deterministic {
+		cacheKey := buildFuncCacheKey(name, argVals)
+		if e.deterministicFuncCache != nil {
+			if cached, ok := e.deterministicFuncCache[cacheKey]; ok {
+				return cached, nil
+			}
+		}
+		result, err := e.execRoutineBody(fn.Body, paramVars)
+		if err != nil {
+			return nil, err
+		}
+		if e.deterministicFuncCache == nil {
+			e.deterministicFuncCache = make(map[string]interface{})
+		}
+		e.deterministicFuncCache[cacheKey] = result
+		return result, nil
 	}
 
 	// Execute function body with local variables, cursors, and handlers
 	return e.execRoutineBody(fn.Body, paramVars)
+}
+
+// buildFuncCacheKey builds a cache key for a deterministic function call.
+func buildFuncCacheKey(name string, args []interface{}) string {
+	// Use a simple separator that won't appear in normal values.
+	var b strings.Builder
+	b.WriteString(name)
+	for _, arg := range args {
+		b.WriteByte(0)
+		fmt.Fprintf(&b, "%v", arg)
+	}
+	return b.String()
 }
 
 // routineContext holds shared state for a stored routine execution.
