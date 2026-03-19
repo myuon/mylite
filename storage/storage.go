@@ -364,6 +364,9 @@ func (t *Table) Insert(row Row) (int64, error) {
 	if t.pkIndex != nil && len(t.Def.PrimaryKey) > 0 {
 		t.pkIndex[bulkPKKey(row, t.Def.PrimaryKey)] = true
 	}
+	if t.pkRowIndex != nil && len(t.Def.PrimaryKey) > 0 {
+		t.pkRowIndex[bulkPKKey(row, t.Def.PrimaryKey)] = len(t.Rows) - 1
+	}
 	if t.colPKIndex != nil {
 		for _, col := range t.Def.Columns {
 			if col.PrimaryKey {
