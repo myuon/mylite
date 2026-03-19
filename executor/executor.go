@@ -1455,141 +1455,6 @@ func normalizeJSONTableDefaultOrder(query string) string {
 	return re.ReplaceAllString(query, "${2} ${1}")
 }
 
-// stripPartitionClause removes PARTITION BY ... clauses from CREATE TABLE and
-// ALTER TABLE statements. mylite does not support table partitioning, so we
-// silently strip the clause so that tables can at least be created.
-// It also handles "PARTITION BY" that appears in ALTER TABLE ... PARTITION BY.
-func stripPartitionClause(query string) (string, string) {
-	upper := strings.ToUpper(query)
-	if !strings.Contains(upper, "CREATE TABLE") && !strings.Contains(upper, "ALTER TABLE") {
-		return query, ""
-	}
-	// Find "PARTITION BY" not inside a string literal
-	idx := 0
-	for {
-		pos := strings.Index(strings.ToUpper(query[idx:]), "PARTITION BY")
-		if pos == -1 {
-			break
-		}
-		absPos := idx + pos
-
-		// Check that we're not inside a quoted string
-		inQuote := false
-		quoteChar := byte(0)
-		for i := 0; i < absPos; i++ {
-			ch := query[i]
-			if !inQuote && (ch == '\'' || ch == '"') {
-				inQuote = true
-				quoteChar = ch
-			} else if inQuote && ch == quoteChar {
-				// Check for escaped quote
-				if i+1 < len(query) && query[i+1] == quoteChar {
-					i++ // skip escaped quote
-				} else {
-					inQuote = false
-				}
-			}
-		}
-		if inQuote {
-			idx = absPos + 12
-			continue
-		}
-
-		// Check word boundary before PARTITION
-		if absPos > 0 {
-			ch := query[absPos-1]
-			if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_' {
-				idx = absPos + 12
-				continue
-			}
-		}
-
-		// Found a real PARTITION BY clause. We need to find where it ends.
-		// It ends at: end of string, or before AS SELECT, or before a top-level
-		// semicolon. The partition clause may contain nested parentheses.
-		end := len(query)
-		depth := 0
-		i := absPos + 12 // skip past "PARTITION BY"
-		for i < len(query) {
-			ch := query[i]
-			if ch == '\'' || ch == '"' {
-				// Skip quoted strings
-				quote := ch
-				i++
-				for i < len(query) {
-					if query[i] == quote {
-						if i+1 < len(query) && query[i+1] == quote {
-							i += 2
-							continue
-						}
-						break
-					}
-					if query[i] == '\\' {
-						i++
-					}
-					i++
-				}
-				i++
-				continue
-			}
-			if ch == '(' {
-				depth++
-				i++
-				continue
-			}
-			if ch == ')' {
-				if depth == 0 {
-					// This closing paren belongs to a parent context (e.g., CREATE TABLE ... AS SELECT subquery).
-					end = i
-					break
-				}
-				depth--
-				// If depth returns to 0 after a partition list, check what follows
-				if depth == 0 {
-					// Scan ahead for more partition clauses or AS/SELECT
-					j := i + 1
-					for j < len(query) && (query[j] == ' ' || query[j] == '\t' || query[j] == '\n' || query[j] == '\r') {
-						j++
-					}
-					rest := strings.ToUpper(strings.TrimSpace(query[j:]))
-					if strings.HasPrefix(rest, "AS ") || strings.HasPrefix(rest, "SELECT ") ||
-						strings.HasPrefix(rest, ";") || rest == "" ||
-						strings.HasPrefix(rest, "/*!") {
-						end = i + 1
-						break
-					}
-					// Could be SUBPARTITION BY or more partition definitions
-					if !strings.HasPrefix(rest, "SUBPARTITION") && !strings.HasPrefix(rest, "PARTITION") &&
-						!strings.HasPrefix(rest, "(") {
-						end = i + 1
-						break
-					}
-				}
-				i++
-				continue
-			}
-			if ch == ';' && depth == 0 {
-				end = i
-				break
-			}
-			i++
-		}
-
-		// Extract the partition clause for later use
-		partClause := strings.TrimSpace(query[absPos:end])
-
-		// Strip the PARTITION BY clause, preserving any trailing content
-		before := strings.TrimRight(query[:absPos], " \t\n\r")
-		after := ""
-		if end < len(query) {
-			after = query[end:]
-		}
-		query = before + " " + strings.TrimLeft(after, " \t\n\r")
-		return query, partClause
-	}
-	return query, ""
-}
-
 // quoteNonASCIIIdentifiers wraps bare words containing non-ASCII characters
 // with backticks so the vitess SQL parser can handle them.
 func quoteNonASCIIIdentifiers(query string) string {
@@ -2018,21 +1883,6 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return e.execBegin()
 	}
 
-	// Handle COMMIT WORK and ROLLBACK WORK (equivalent to COMMIT/ROLLBACK)
-	if upper == "COMMIT WORK" {
-		return e.execCommit()
-	}
-	if upper == "ROLLBACK WORK" {
-		return e.execRollback()
-	}
-
-	// Normalize "LOCK TABLE" (singular) to "LOCK TABLES" (plural) for vitess parser
-	if strings.HasPrefix(upper, "LOCK TABLE ") && !strings.HasPrefix(upper, "LOCK TABLES") {
-		query = "LOCK TABLES" + query[len("LOCK TABLE"):]
-		trimmed = strings.TrimSpace(query)
-		upper = strings.ToUpper(trimmed)
-	}
-
 	// Handle CREATE TABLESPACE silently (InnoDB internal)
 	if strings.HasPrefix(upper, "CREATE TABLESPACE") ||
 		strings.HasPrefix(upper, "ALTER TABLESPACE") ||
@@ -2055,52 +1905,8 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	query = normalizeAddIndexUsing(query)
 	query = normalizeMemberOperator(query)
 	query = normalizeJSONTableDefaultOrder(query)
-	// Strip PARTITION BY clauses from CREATE TABLE (mylite does not support partitions)
-	query, _ = stripPartitionClause(query)
 	trimmed = strings.TrimSpace(query)
 	upper = strings.ToUpper(trimmed)
-
-	// Handle ALTER TABLE ... partition operations as no-ops (mylite has no partitions)
-	if strings.HasPrefix(upper, "ALTER TABLE") {
-		// Extract table name for result sets
-		alterTableName := ""
-		rest := strings.TrimSpace(trimmed[len("ALTER TABLE"):])
-		fields := strings.Fields(rest)
-		if len(fields) > 0 {
-			alterTableName = strings.Trim(fields[0], "`")
-		}
-		fullTableName := fmt.Sprintf("%s.%s", e.CurrentDB, alterTableName)
-
-		// Operations that return a result set (like ANALYZE TABLE)
-		adminPartOps := map[string]string{
-			"ANALYZE PARTITION":  "analyze",
-			"CHECK PARTITION":    "check",
-			"OPTIMIZE PARTITION": "optimize",
-			"REPAIR PARTITION":   "repair",
-		}
-		for op, opName := range adminPartOps {
-			if strings.Contains(upper, op) {
-				return &Result{
-					Columns:     []string{"Table", "Op", "Msg_type", "Msg_text"},
-					Rows:        [][]interface{}{{fullTableName, opName, "status", "OK"}},
-					IsResultSet: true,
-				}, nil
-			}
-		}
-
-		// Operations that are pure no-ops
-		noopPartOps := []string{
-			"EXCHANGE PARTITION", "ADD PARTITION", "DROP PARTITION",
-			"REBUILD PARTITION", "REORGANIZE PARTITION", "COALESCE PARTITION",
-			"REMOVE PARTITIONING", "TRUNCATE PARTITION",
-		}
-		for _, op := range noopPartOps {
-			if strings.Contains(upper, op) {
-				return &Result{}, nil
-			}
-		}
-	}
-
 	// Multi-value index does not allow explicit ASC/DESC on key part.
 	if (strings.HasPrefix(upper, "CREATE TABLE") || strings.HasPrefix(upper, "ALTER TABLE") || strings.HasPrefix(upper, "CREATE INDEX")) &&
 		regexp.MustCompile(`(?i)ARRAY\)\)\s+ASC\b`).MatchString(trimmed) {
@@ -2157,15 +1963,8 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return e.execDropFunction(trimmed)
 	}
 	// Handle CREATE PROCEDURE (with BEGIN...END body that vitess can't parse)
-	// Also handle multi-line case where CREATE and PROCEDURE are on separate lines.
-	{
-		upperCompact := strings.Join(strings.Fields(upper), " ")
-		if strings.HasPrefix(upperCompact, "CREATE PROCEDURE") && strings.Contains(upperCompact, "BEGIN") {
-			// Normalize CREATE\nPROCEDURE to CREATE PROCEDURE on the first line
-			re := regexp.MustCompile(`(?is)^(CREATE)\s+(PROCEDURE)`)
-			normalizedQuery := re.ReplaceAllString(trimmed, "${1} ${2}")
-			return e.execCreateProcedure(normalizedQuery)
-		}
+	if strings.HasPrefix(upper, "CREATE PROCEDURE") && strings.Contains(upper, "BEGIN") {
+		return e.execCreateProcedure(trimmed)
 	}
 	// Handle DROP PROCEDURE with IF EXISTS (vitess may not parse all variants)
 	if strings.HasPrefix(upper, "DROP PROCEDURE") {
@@ -5361,6 +5160,34 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	columns := make([]catalog.ColumnDef, 0)
 	var primaryKeys []string
 
+	// Check for unsupported storage engines with generated columns
+	{
+		engine := "InnoDB" // default
+		// Check explicit ENGINE= in CREATE TABLE
+		for _, opt := range stmt.TableSpec.Options {
+			if strings.EqualFold(opt.Name, "ENGINE") || strings.EqualFold(opt.Name, "engine") {
+				engine = tableOptionString(opt)
+				break
+			}
+		}
+		// If no explicit engine, check session default_storage_engine
+		if engine == "InnoDB" {
+			if e.globalVars != nil {
+				if eng, ok := e.globalVars["default_storage_engine"]; ok && eng != "" {
+					engine = eng
+				}
+			}
+		}
+		engineUpper := strings.ToUpper(engine)
+		if engineUpper == "MEMORY" || engineUpper == "MERGE" || engineUpper == "MRG_MYISAM" {
+			for _, col := range stmt.TableSpec.Columns {
+				if col.Type.Options != nil && col.Type.Options.As != nil {
+					return nil, mysqlError(3106, "HY000", "'Specified storage engine' is not supported for generated columns.")
+				}
+			}
+		}
+	}
+
 	// Check for reserved InnoDB internal column names
 	reservedInnoDBCols := map[string]bool{
 		"db_row_id": true, "db_trx_id": true, "db_roll_ptr": true,
@@ -5381,6 +5208,28 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				if len(v) > 255 {
 					return nil, mysqlError(1097, "HY000", fmt.Sprintf("Too long enumeration/set value for column %s.", col.Name.String()))
 				}
+			}
+		}
+
+		// Check virtual generated column with KEY/PRIMARY KEY
+		if col.Type.Options != nil && col.Type.Options.As != nil &&
+			col.Type.Options.Storage != sqlparser.StoredStorage &&
+			(col.Type.Options.KeyOpt == 1 || col.Type.Options.KeyOpt == 6) {
+			return nil, mysqlError(3106, "HY000", "'Defining a virtual generated column as primary key' is not supported for generated columns.")
+		}
+
+		// Validate generated column expressions for blocked functions
+		if col.Type.Options != nil && col.Type.Options.As != nil {
+			blocked, found := findBlockedFunctionInExpr(col.Type.Options.As)
+			if found {
+				if blocked != "" {
+					return nil, mysqlError(3102, "HY000",
+						fmt.Sprintf("Expression of generated column '%s' contains a disallowed function: %s.",
+							col.Name.String(), blocked))
+				}
+				return nil, mysqlError(3102, "HY000",
+					fmt.Sprintf("Expression of generated column '%s' contains a disallowed function.",
+						col.Name.String()))
 			}
 		}
 
@@ -5544,8 +5393,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				if cn := idx.Info.ConstraintName.String(); cn != "" {
 					idxName = cn
 				} else {
-					// Use the base column name (without prefix length) as the auto-generated index name
-					idxName = stripPrefixLengthFromCol(idxCols[0])
+					idxName = idxCols[0]
 				}
 			}
 			idxComment := ""
@@ -6416,6 +6264,17 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			if i >= len(colNames) {
 				break
 			}
+			// Check if value is being inserted into a generated column
+			// MySQL rejects any non-DEFAULT value (including NULL) for generated columns
+			if _, isDefault := val.(*sqlparser.Default); !isDefault {
+				for _, col := range tbl.Def.Columns {
+					if col.Name == colNames[i] && isGeneratedColumnType(col.Type) {
+						return nil, mysqlError(3105, "HY000",
+							fmt.Sprintf("The value specified for generated column '%s' in table '%s' is not allowed.",
+								colNames[i], tbl.Def.Name))
+					}
+				}
+			}
 			v, err := e.evalExpr(val)
 			if err != nil {
 				var intOvErr *intOverflowError
@@ -6990,13 +6849,108 @@ func (e *Executor) evalGeneratedColumnExpr(expr string, row storage.Row) (interf
 	return e.evalRowExpr(aliased.Expr, row)
 }
 
+// blockedGcolFunctions is the set of functions not allowed in generated column expressions.
+var blockedGcolFunctions = map[string]string{
+	"rand":              "rand",
+	"load_file":         "load_file",
+	"curdate":           "curdate",
+	"current_date":      "curdate",
+	"curtime":           "curtime",
+	"current_time":      "curtime",
+	"now":               "now",
+	"current_timestamp": "now",
+	"localtime":         "now",
+	"localtimestamp":     "now",
+	"unix_timestamp":    "unix_timestamp",
+	"utc_date":          "utc_date",
+	"utc_time":          "utc_time",
+	"utc_timestamp":     "utc_timestamp",
+	"uuid":              "uuid",
+	"uuid_short":        "uuid_short",
+	"connection_id":     "connection_id",
+	"current_user":      "current_user",
+	"found_rows":        "found_rows",
+	"last_insert_id":    "last_insert_id",
+	"row_count":         "row_count",
+	"session_user":      "user",
+	"system_user":       "user",
+	"user":              "user",
+	"version":           "version",
+	"sleep":                "sleep",
+	"sysdate":              "sysdate",
+	"statement_digest":     "statement_digest",
+	"statement_digest_text": "statement_digest_text",
+	"get_lock":              "get_lock",
+	"is_free_lock":          "is_free_lock",
+	"is_used_lock":          "is_used_lock",
+	"release_lock":          "release_lock",
+	"release_all_locks":     "release_all_locks",
+	"benchmark":             "benchmark",
+	"name_const":            "",
+	"values":                "values",
+	"database":              "database",
+	"schema":                "database",
+	"master_pos_wait":       "master_pos_wait",
+	"source_pos_wait":       "source_pos_wait",
+	"encrypt":               "encrypt",
+	"updatexml":             "updatexml",
+	"json_merge":            "json_merge",
+}
+
+// findBlockedFunctionInExpr walks an expression tree and returns the name of the
+// first disallowed function found, or "" if none.
+func findBlockedFunctionInExpr(expr sqlparser.Expr) (string, bool) {
+	var blocked string
+	found := false
+	sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if found {
+			return false, nil
+		}
+		switch v := node.(type) {
+		case *sqlparser.FuncExpr:
+			name := strings.ToLower(v.Name.String())
+			if b, ok := blockedGcolFunctions[name]; ok {
+				blocked = b
+				found = true
+				return false, nil
+			}
+		case *sqlparser.CurTimeFuncExpr:
+			name := strings.ToLower(v.Name.String())
+			if b, ok := blockedGcolFunctions[name]; ok {
+				blocked = b
+				found = true
+				return false, nil
+			}
+		case *sqlparser.LockingFunc:
+			name := strings.ToLower(sqlparser.String(v))
+			if idx := strings.Index(name, "("); idx > 0 {
+				name = strings.TrimSpace(name[:idx])
+			}
+			if b, ok := blockedGcolFunctions[name]; ok {
+				blocked = b
+				found = true
+				return false, nil
+			}
+		case *sqlparser.ValuesFuncExpr:
+			blocked = "values"
+			found = true
+			return false, nil
+		}
+		return true, nil
+	}, expr)
+	return blocked, found
+}
+
 func (e *Executor) populateGeneratedColumns(row storage.Row, cols []catalog.ColumnDef) error {
 	for _, col := range cols {
-		if _, exists := row[col.Name]; exists {
-			continue
-		}
 		expr := generatedColumnExpr(col.Type)
 		if expr == "" {
+			continue
+		}
+		// Always evaluate the generated column expression, even if the key
+		// already exists with a nil value (e.g., DEFAULT was specified).
+		// Only skip if a non-nil value was explicitly provided.
+		if val, exists := row[col.Name]; exists && val != nil {
 			continue
 		}
 		v, err := e.evalGeneratedColumnExpr(expr, row)
@@ -10853,6 +10807,30 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 		case *sqlparser.AddColumns:
 			for _, col := range op.Columns {
+				// Check virtual generated column with KEY/PRIMARY KEY
+				if col.Type.Options != nil && col.Type.Options.As != nil &&
+					col.Type.Options.Storage != sqlparser.StoredStorage &&
+					(col.Type.Options.KeyOpt == 1 || col.Type.Options.KeyOpt == 6) {
+					return nil, mysqlError(3106, "HY000", "'Defining a virtual generated column as primary key' is not supported for generated columns.")
+				}
+				// Check unsupported storage engine for generated columns
+				if col.Type.Options != nil && col.Type.Options.As != nil {
+					tableEngine := ""
+					if tableDef, tdErr := db.GetTable(tableName); tdErr == nil {
+						tableEngine = strings.ToUpper(tableDef.Engine)
+					}
+					if tableEngine == "" {
+						// Check session default_storage_engine
+						if e.globalVars != nil {
+							if eng, ok := e.globalVars["default_storage_engine"]; ok {
+								tableEngine = strings.ToUpper(eng)
+							}
+						}
+					}
+					if tableEngine == "MEMORY" || tableEngine == "MERGE" || tableEngine == "MRG_MYISAM" {
+						return nil, mysqlError(3106, "HY000", "'Specified storage engine' is not supported for generated columns.")
+					}
+				}
 				colDef := columnDefFromAST(col)
 				// Check column comment length in strict/traditional mode (MySQL max is 1024 characters)
 				if mysqlCharLen(colDef.Comment) > 1024 && e.isStrictMode() {
@@ -10877,12 +10855,31 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					return nil, addErr
 				}
 				// Determine the default value to fill in existing rows.
-				var defVal interface{}
-				if colDef.Default != nil {
-					// Parse the default string as a literal if possible.
-					defVal = *colDef.Default
+				genExpr := generatedColumnExpr(colDef.Type)
+				if genExpr != "" {
+					// For generated columns, compute values for existing rows
+					tbl.AddColumn(colDef.Name, nil)
+					tbl.Mu.Lock()
+					for i := range tbl.Rows {
+						v, err := e.evalGeneratedColumnExpr(genExpr, tbl.Rows[i])
+						if err != nil {
+							tbl.Mu.Unlock()
+							// If evaluation fails (e.g., out of range), rollback the column addition
+							db.DropColumn(tableName, colDef.Name)
+							tbl.DropColumn(colDef.Name)
+							return nil, err
+						}
+						tbl.Rows[i][colDef.Name] = v
+					}
+					tbl.Mu.Unlock()
+				} else {
+					var defVal interface{}
+					if colDef.Default != nil {
+						// Parse the default string as a literal if possible.
+						defVal = *colDef.Default
+					}
+					tbl.AddColumn(colDef.Name, defVal)
 				}
-				tbl.AddColumn(colDef.Name, defVal)
 			}
 
 		case *sqlparser.DropColumn:
@@ -10905,16 +10902,44 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				}
 				colDef.Comment = mysqlTruncateChars(colDef.Comment, 1024)
 			}
+			// Check for STORED<->VIRTUAL change on generated columns
+			if tableDef, tdErr := db.GetTable(tableName); tdErr == nil {
+				for _, existCol := range tableDef.Columns {
+					if strings.EqualFold(existCol.Name, colDef.Name) {
+						oldIsGen := isGeneratedColumnType(existCol.Type)
+						newIsGen := isGeneratedColumnType(colDef.Type)
+						if oldIsGen && newIsGen {
+							oldStored := strings.Contains(strings.ToUpper(existCol.Type), "STORED")
+							newStored := strings.Contains(strings.ToUpper(colDef.Type), "STORED")
+							if oldStored != newStored {
+								return nil, mysqlError(3106, "HY000", "'Changing the STORED status' is not supported for generated columns.")
+							}
+						}
+						break
+					}
+				}
+			}
 			if modErr := db.ModifyColumn(tableName, colDef); modErr != nil {
 				return nil, modErr
 			}
-			tbl.Lock()
-			for i := range tbl.Rows {
-				if cur, ok := tbl.Rows[i][colDef.Name]; ok {
-					tbl.Rows[i][colDef.Name] = coerceValueForColumnType(colDef, cur)
+			// Recompute generated column values if expression changed
+			if genExpr := generatedColumnExpr(colDef.Type); genExpr != "" {
+				tbl.Lock()
+				for i := range tbl.Rows {
+					if v, err := e.evalGeneratedColumnExpr(genExpr, tbl.Rows[i]); err == nil {
+						tbl.Rows[i][colDef.Name] = v
+					}
 				}
+				tbl.Unlock()
+			} else {
+				tbl.Lock()
+				for i := range tbl.Rows {
+					if cur, ok := tbl.Rows[i][colDef.Name]; ok {
+						tbl.Rows[i][colDef.Name] = coerceValueForColumnType(colDef, cur)
+					}
+				}
+				tbl.Unlock()
 			}
-			tbl.Unlock()
 
 		case *sqlparser.ChangeColumn:
 			oldName := op.OldColumn.Name.String()
@@ -10932,13 +10957,24 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			if oldName != colDef.Name {
 				tbl.RenameColumn(oldName, colDef.Name)
 			}
-			tbl.Lock()
-			for i := range tbl.Rows {
-				if cur, ok := tbl.Rows[i][colDef.Name]; ok {
-					tbl.Rows[i][colDef.Name] = coerceValueForColumnType(colDef, cur)
+			// Recompute generated column values if expression changed
+			if genExpr := generatedColumnExpr(colDef.Type); genExpr != "" {
+				tbl.Lock()
+				for i := range tbl.Rows {
+					if v, err := e.evalGeneratedColumnExpr(genExpr, tbl.Rows[i]); err == nil {
+						tbl.Rows[i][colDef.Name] = v
+					}
 				}
+				tbl.Unlock()
+			} else {
+				tbl.Lock()
+				for i := range tbl.Rows {
+					if cur, ok := tbl.Rows[i][colDef.Name]; ok {
+						tbl.Rows[i][colDef.Name] = coerceValueForColumnType(colDef, cur)
+					}
+				}
+				tbl.Unlock()
 			}
-			tbl.Unlock()
 
 		case *sqlparser.AddIndexDefinition:
 			// Reject the reserved InnoDB clustered index name.
@@ -12724,17 +12760,9 @@ func mysqlGenExprNode(expr sqlparser.Expr) string {
 			args[i] = mysqlGenExprNode(arg)
 		}
 		name := e.Name.String()
-		// MySQL preserves function name case; JSON functions are lowercase,
-		// standard SQL functions are typically uppercase in SHOW CREATE TABLE.
-		upperName := strings.ToUpper(name)
-		switch {
-		case strings.HasPrefix(strings.ToLower(name), "json_"):
-			// JSON functions stay lowercase
-			name = strings.ToLower(name)
-		default:
-			// Standard functions: preserve original case from parser
-			name = upperName
-		}
+		// MySQL outputs function names in lowercase in SHOW CREATE TABLE
+		// for generated column expressions.
+		name = strings.ToLower(name)
 		return name + "(" + strings.Join(args, ",") + ")"
 	case *sqlparser.Literal:
 		if e.Type == sqlparser.StrVal {
@@ -14068,6 +14096,24 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return int64(0), nil
 		}
 		return int64(1), nil
+	case *sqlparser.XorExpr:
+		left, err := e.evalExpr(v.Left)
+		if err != nil {
+			return nil, err
+		}
+		right, err := e.evalExpr(v.Right)
+		if err != nil {
+			return nil, err
+		}
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		lb := isTruthy(left)
+		rb := isTruthy(right)
+		if (lb && !rb) || (!lb && rb) {
+			return int64(1), nil
+		}
+		return int64(0), nil
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
 }
@@ -15433,7 +15479,17 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		if parseErr != nil {
 			return nil, nil
 		}
-		return mysqlWeekMode0(t), nil
+		mode := int64(0)
+		if len(v.Exprs) >= 2 {
+			if modeVal, modeErr := e.evalExpr(v.Exprs[1]); modeErr == nil && modeVal != nil {
+				mode = toInt64(modeVal)
+			}
+		}
+		if mode == 0 {
+			return mysqlWeekMode0(t), nil
+		}
+		_, wk := t.ISOWeek()
+		return int64(wk), nil
 	case "weekofyear":
 		if len(v.Exprs) < 1 {
 			return nil, nil
@@ -17141,6 +17197,9 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		s := toString(args[0])
 		fromBase := int(toInt64(args[1]))
 		toBase := int(toInt64(args[2]))
+		if fromBase < 2 || fromBase > 36 || toBase < 2 || toBase > 36 {
+			return nil, nil
+		}
 		n, parseErr := strconv.ParseInt(s, fromBase, 64)
 		if parseErr != nil {
 			return nil, nil
@@ -17226,7 +17285,16 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if parseErr != nil {
 			return nil, nil
 		}
-		return mysqlWeekMode0(t), nil
+		mode := int64(0)
+		if len(args) >= 2 && args[1] != nil {
+			mode = toInt64(args[1])
+		}
+		if mode == 0 {
+			return mysqlWeekMode0(t), nil
+		}
+		// Mode 1: week starts Monday, range 0-53, first week has >3 days this year
+		_, wk := t.ISOWeek()
+		return int64(wk), nil
 	case "weekofyear":
 		args, err := evalArgs()
 		if err != nil {
@@ -17763,8 +17831,39 @@ func (e *Executor) evalBinaryExprWithRow(v *sqlparser.BinaryExpr, row storage.Ro
 
 // evalCaseExprWithRow evaluates a CASE expression with row context.
 func (e *Executor) evalCaseExprWithRow(v *sqlparser.CaseExpr, row storage.Row) (interface{}, error) {
-	// For now, delegate to the non-row-aware version
-	return e.evalExpr(v)
+	// Evaluate CASE expression with row context for column resolution
+	if v.Expr != nil {
+		// Simple CASE: CASE expr WHEN val THEN result ...
+		caseVal, err := e.evalRowExpr(v.Expr, row)
+		if err != nil {
+			return nil, err
+		}
+		for _, when := range v.Whens {
+			whenVal, err := e.evalRowExpr(when.Cond, row)
+			if err != nil {
+				return nil, err
+			}
+			match, _ := compareValues(caseVal, whenVal, sqlparser.EqualOp)
+			if match {
+				return e.evalRowExpr(when.Val, row)
+			}
+		}
+	} else {
+		// Searched CASE: CASE WHEN cond THEN result ...
+		for _, when := range v.Whens {
+			cond, err := e.evalWhere(when.Cond, row)
+			if err != nil {
+				return nil, err
+			}
+			if cond {
+				return e.evalRowExpr(when.Val, row)
+			}
+		}
+	}
+	if v.Else != nil {
+		return e.evalRowExpr(v.Else, row)
+	}
+	return nil, nil
 }
 
 // evalRowExpr is a package-level shim for backward-compatible callers that
@@ -20254,6 +20353,24 @@ func (e *Executor) getTableRowsWithAliasDB(dbName, tableName, alias string) ([]s
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", dbName, tableName))
 	}
 	raw := tbl.Scan()
+	// Evaluate virtual generated columns on read
+	hasVirtual := false
+	if tbl.Def != nil {
+		for _, col := range tbl.Def.Columns {
+			if genExpr := generatedColumnExpr(col.Type); genExpr != "" {
+				colUpper := strings.ToUpper(col.Type)
+				if !strings.Contains(colUpper, "STORED") {
+					hasVirtual = true
+					break
+				}
+			}
+		}
+	}
+	if hasVirtual {
+		for _, row := range raw {
+			e.populateGeneratedColumns(row, tbl.Def.Columns)
+		}
+	}
 	result := make([]storage.Row, len(raw))
 	for i, row := range raw {
 		newRow := make(storage.Row, len(row)*2)
