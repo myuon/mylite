@@ -47,6 +47,12 @@ type Table struct {
 	colPKIndex map[string]map[string]bool
 	// uniqueIndex maps unique index names to their value sets.
 	uniqueIndex map[string]map[string]bool
+	// DMLChangesSinceStats tracks the number of DML operations since the
+	// last InnoDB persistent stats recalculation.  Used to implement the
+	// 10% change threshold that MySQL uses for auto-recalc.
+	DMLChangesSinceStats int64
+	// RowCountAtLastStats holds the row count at the time stats were last computed.
+	RowCountAtLastStats int64
 }
 
 func (t *Table) Lock()                     { t.Mu.Lock() }
@@ -338,6 +344,9 @@ func (t *Table) Insert(row Row) (int64, error) {
 			if idx.Unique {
 				key := bulkUniqueKey(row, idx.Columns)
 				if key != "" {
+					if t.uniqueIndex[idx.Name] == nil {
+						t.uniqueIndex[idx.Name] = make(map[string]bool)
+					}
 					t.uniqueIndex[idx.Name][key] = true
 				}
 			}

@@ -174,9 +174,10 @@ type Executor struct {
 	// onDupValuesRow holds the candidate INSERT row while evaluating
 	// ON DUPLICATE KEY UPDATE expressions (for VALUES(col) support).
 	onDupValuesRow storage.Row
-	// routineDepth tracks the current stored procedure/function call depth
-	// to prevent stack overflow from recursive calls.
-	routineDepth int
+	// subqueryValCache caches results of non-correlated IN subqueries
+	// within the same top-level query execution.  Keyed by the SQL
+	// string of the subquery.
+	subqueryValCache map[string][]interface{}
 }
 
 // Warning represents a MySQL warning.
@@ -501,6 +502,37 @@ func (e *Executor) removeInnoDBStatsRows(dbName, tableName string) {
 		idxTbl.Rows = filtered
 		idxTbl.Mu.Unlock()
 	}
+}
+
+// maybeRecalcStats implements MySQL's InnoDB auto-recalc threshold:
+// stats are recomputed only when the cumulative DML change count exceeds
+// 10% of the row count at the time stats were last calculated (minimum 200).
+func (e *Executor) maybeRecalcStats(dbName, tableName string, changes int64) {
+	tbl, err := e.Storage.GetTable(dbName, tableName)
+	if err != nil {
+		return
+	}
+	tbl.Mu.Lock()
+	tbl.DMLChangesSinceStats += changes
+	pending := tbl.DMLChangesSinceStats
+	lastCount := tbl.RowCountAtLastStats
+	tbl.Mu.Unlock()
+
+	threshold := lastCount / 10
+	if threshold < 200 {
+		threshold = 200
+	}
+	if pending < threshold {
+		return
+	}
+
+	rowCount := e.tableRowCount(dbName, tableName)
+	e.upsertInnoDBStatsRows(dbName, tableName, rowCount)
+
+	tbl.Mu.Lock()
+	tbl.DMLChangesSinceStats = 0
+	tbl.RowCountAtLastStats = rowCount
+	tbl.Mu.Unlock()
 }
 
 func (e *Executor) upsertInnoDBStatsRows(dbName, tableName string, rowCount int64) {
@@ -1384,6 +1416,13 @@ func quoteNonASCIIIdentifiers(query string) string {
 			for i < len(query) {
 				r, size := utf8.DecodeRuneInString(query[i:])
 				if r == utf8.RuneError && size <= 1 {
+					// Invalid UTF-8 byte: include it as part of the
+					// identifier (latin1 / cp1252 column names) and
+					// advance past it so we don't loop forever.
+					if query[i] > 127 {
+						i++
+						continue
+					}
 					break
 				}
 				if isIdentPart(r) || r > 127 {
@@ -1669,6 +1708,9 @@ func (e *Executor) explainResultForType(explainType sqlparser.ExplainType, expla
 func (e *Executor) Execute(query string) (*Result, error) {
 	trimmed := strings.TrimSpace(query)
 	e.currentQuery = trimmed
+	// Clear per-query subquery cache so non-correlated IN subqueries
+	// are only evaluated once within the same top-level statement.
+	e.subqueryValCache = nil
 	upper := strings.ToUpper(trimmed)
 	compact := strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "").Replace(upper)
 	if compact == "SELECTJSON_SCHEMA_VALID()" ||
@@ -6328,11 +6370,11 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		}
 	}
 
-	// Auto-recalc InnoDB persistent stats after DML
+	// Auto-recalc InnoDB persistent stats after DML (MySQL 10% threshold)
 	if affected > 0 {
 		if db, dbErr := e.Catalog.GetDatabase(insertDB); dbErr == nil {
 			if def, defErr := db.GetTable(tableName); defErr == nil && e.innodbStatsAutoRecalcEnabled(def) && e.innodbStatsPersistentEnabled(def) {
-				e.upsertInnoDBStatsRows(insertDB, tableName, e.tableRowCount(insertDB, tableName))
+				e.maybeRecalcStats(insertDB, tableName, int64(affected))
 			}
 		}
 	}
@@ -8769,12 +8811,116 @@ func subqueryHasLimit(sub *sqlparser.Subquery) bool {
 	return false
 }
 
+// isNonCorrelatedSubquery returns true when the subquery only references
+// tables declared in its own FROM clause.  This is a conservative check:
+// if we can't determine the answer, we return false (correlated).
+func isNonCorrelatedSubquery(sub *sqlparser.Subquery) bool {
+	sel, ok := sub.Select.(*sqlparser.Select)
+	if !ok {
+		return false
+	}
+	// Collect table names / aliases from the subquery's FROM clause.
+	fromTables := map[string]bool{}
+	for _, te := range sel.From {
+		switch t := te.(type) {
+		case *sqlparser.AliasedTableExpr:
+			if tn, ok2 := t.Expr.(sqlparser.TableName); ok2 {
+				fromTables[strings.ToLower(tn.Name.String())] = true
+			}
+			if !t.As.IsEmpty() {
+				fromTables[strings.ToLower(t.As.String())] = true
+			}
+		case *sqlparser.JoinTableExpr:
+			if ate, ok2 := t.LeftExpr.(*sqlparser.AliasedTableExpr); ok2 {
+				if tn, ok3 := ate.Expr.(sqlparser.TableName); ok3 {
+					fromTables[strings.ToLower(tn.Name.String())] = true
+				}
+				if !ate.As.IsEmpty() {
+					fromTables[strings.ToLower(ate.As.String())] = true
+				}
+			}
+			if ate, ok2 := t.RightExpr.(*sqlparser.AliasedTableExpr); ok2 {
+				if tn, ok3 := ate.Expr.(sqlparser.TableName); ok3 {
+					fromTables[strings.ToLower(tn.Name.String())] = true
+				}
+				if !ate.As.IsEmpty() {
+					fromTables[strings.ToLower(ate.As.String())] = true
+				}
+			}
+		default:
+			return false // unknown FROM structure, assume correlated
+		}
+	}
+	if len(fromTables) == 0 {
+		return false
+	}
+	// Walk all ColName nodes in WHERE and SELECT and check qualifiers.
+	correlated := false
+	var walkExpr func(e sqlparser.SQLNode)
+	walkExpr = func(node sqlparser.SQLNode) {
+		if correlated {
+			return
+		}
+		if node == nil {
+			return
+		}
+		switch n := node.(type) {
+		case *sqlparser.ColName:
+			if !n.Qualifier.Name.IsEmpty() {
+				q := strings.ToLower(n.Qualifier.Name.String())
+				if !fromTables[q] {
+					correlated = true
+				}
+			}
+		case *sqlparser.Subquery:
+			// Don't descend into nested subqueries – they have their own scope.
+			return
+		case *sqlparser.ComparisonExpr:
+			walkExpr(n.Left)
+			walkExpr(n.Right)
+		case *sqlparser.AndExpr:
+			walkExpr(n.Left)
+			walkExpr(n.Right)
+		case *sqlparser.OrExpr:
+			walkExpr(n.Left)
+			walkExpr(n.Right)
+		case *sqlparser.AliasedExpr:
+			walkExpr(n.Expr)
+		case *sqlparser.FuncExpr:
+			for _, arg := range n.Exprs {
+				walkExpr(arg)
+			}
+		case sqlparser.ValTuple:
+			for _, v := range n {
+				walkExpr(v)
+			}
+		}
+	}
+	if sel.Where != nil {
+		walkExpr(sel.Where.Expr)
+	}
+	for _, se := range sel.SelectExprs.Exprs {
+		walkExpr(se)
+	}
+	return !correlated
+}
+
 // execSubqueryValues executes a subquery and returns first-column values as a slice.
 func (e *Executor) execSubqueryValues(sub *sqlparser.Subquery, outerRow storage.Row) ([]interface{}, error) {
 	// MySQL error 1235: LIMIT in IN/ALL/ANY/SOME subquery is not supported
 	if subqueryHasLimit(sub) {
 		return nil, mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'LIMIT & IN/ALL/ANY/SOME subquery'")
 	}
+
+	// For non-correlated subqueries, return cached values if available.
+	cacheKey := ""
+	if isNonCorrelatedSubquery(sub) {
+		cacheKey = sqlparser.String(sub)
+		if cached, ok := e.subqueryValCache[cacheKey]; ok {
+			return cached, nil
+		}
+	}
+
 	result, err := e.execSubquery(sub, outerRow)
 	if err != nil {
 		return nil, err
@@ -8785,6 +8931,15 @@ func (e *Executor) execSubqueryValues(sub *sqlparser.Subquery, outerRow storage.
 			vals[i] = row[0]
 		}
 	}
+
+	// Cache the result for non-correlated subqueries.
+	if cacheKey != "" {
+		if e.subqueryValCache == nil {
+			e.subqueryValCache = map[string][]interface{}{}
+		}
+		e.subqueryValCache[cacheKey] = vals
+	}
+
 	return vals, nil
 }
 
@@ -19065,13 +19220,6 @@ type routineContext struct {
 // execRoutineBody executes the body of a stored procedure or function, supporting
 // DECLARE, SET, IF, WHILE, REPEAT, CURSOR, HANDLER, RETURN, and general SQL statements.
 func (e *Executor) execRoutineBody(body []string, paramVars map[string]interface{}) (interface{}, error) {
-	const maxRoutineDepth = 100
-	if e.routineDepth >= maxRoutineDepth {
-		return nil, fmt.Errorf("Error 1456 (HY000): Recursive stored routine call depth limit %d exceeded", maxRoutineDepth)
-	}
-	e.routineDepth++
-	defer func() { e.routineDepth-- }()
-
 	ctx := &routineContext{
 		localVars:  make(map[string]interface{}),
 		cursors:    make(map[string]*cursorState),
