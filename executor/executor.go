@@ -1584,7 +1584,7 @@ func (e *Executor) dummyExplainRow(query string) []interface{} {
 	var extra interface{} = nil
 	rows := int64(1)
 
-	if idx := strings.Index(upper, " FROM "); idx >= 0 {
+	if idx := strings.Index(upper, " FROM "); idx >= 0 && idx+len(" FROM ") <= len(query) {
 		restOrig := strings.TrimSpace(query[idx+len(" FROM "):])
 		restUpper := strings.TrimSpace(upper[idx+len(" FROM "):])
 		if strings.HasPrefix(restUpper, "JSON_TABLE(") {
