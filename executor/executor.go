@@ -180,6 +180,8 @@ type Executor struct {
 	subqueryValCache map[string][]interface{}
 	// executeDepth tracks the recursion depth of EXECUTE/CALL to prevent stack overflow.
 	executeDepth int
+	// sqlParser is a cached SQL parser instance to avoid allocation on every query.
+	sqlParser *sqlparser.Parser
 }
 
 // Warning represents a MySQL warning.
@@ -192,6 +194,14 @@ type Warning struct {
 // addWarning adds a warning to the current statement's warning list.
 func (e *Executor) addWarning(level string, code int, message string) {
 	e.warnings = append(e.warnings, Warning{Level: level, Code: code, Message: message})
+}
+
+// parser returns the cached SQL parser, creating it lazily.
+func (e *Executor) parser() *sqlparser.Parser {
+	if e.sqlParser == nil {
+		e.sqlParser = sqlparser.NewTestParser()
+	}
+	return e.sqlParser
 }
 
 func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
@@ -1714,42 +1724,45 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	// are only evaluated once within the same top-level statement.
 	e.subqueryValCache = nil
 	upper := strings.ToUpper(trimmed)
-	compact := strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "").Replace(upper)
-	if compact == "SELECTJSON_SCHEMA_VALID()" ||
-		compact == "SELECTJSON_SCHEMA_VALID(NULL)" ||
-		compact == "SELECTJSON_SCHEMA_VALID(NULL,NULL,NULL)" {
-		return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'JSON_SCHEMA_VALID'")
-	}
-	if compact == "SELECTJSON_SCHEMA_VALIDATION_REPORT()" ||
-		compact == "SELECTJSON_SCHEMA_VALIDATION_REPORT(NULL)" ||
-		compact == "SELECTJSON_SCHEMA_VALIDATION_REPORT(NULL,NULL,NULL)" {
-		return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'JSON_SCHEMA_VALIDATION_REPORT'")
-	}
-	if strings.HasPrefix(compact, "SELECTJSON_CONTAINS_PATH(") {
-		inner := compact[len("SELECTJSON_CONTAINS_PATH("):]
-		if strings.HasSuffix(inner, ")") {
-			inner = inner[:len(inner)-1]
+	// Only compute compact form for SELECT queries that might contain JSON function checks
+	if strings.HasPrefix(upper, "SELECT") && strings.Contains(upper, "JSON_") {
+		compact := strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "").Replace(upper)
+		if compact == "SELECTJSON_SCHEMA_VALID()" ||
+			compact == "SELECTJSON_SCHEMA_VALID(NULL)" ||
+			compact == "SELECTJSON_SCHEMA_VALID(NULL,NULL,NULL)" {
+			return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'JSON_SCHEMA_VALID'")
 		}
-		if n := countTopLevelSQLArgs(inner); n < 3 {
-			return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'json_contains_path'")
+		if compact == "SELECTJSON_SCHEMA_VALIDATION_REPORT()" ||
+			compact == "SELECTJSON_SCHEMA_VALIDATION_REPORT(NULL)" ||
+			compact == "SELECTJSON_SCHEMA_VALIDATION_REPORT(NULL,NULL,NULL)" {
+			return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'JSON_SCHEMA_VALIDATION_REPORT'")
 		}
-	}
-	if strings.HasPrefix(compact, "SELECTJSON_REMOVE(") {
-		inner := compact[len("SELECTJSON_REMOVE("):]
-		if strings.HasSuffix(inner, ")") {
-			inner = inner[:len(inner)-1]
+		if strings.HasPrefix(compact, "SELECTJSON_CONTAINS_PATH(") {
+			inner := compact[len("SELECTJSON_CONTAINS_PATH("):]
+			if strings.HasSuffix(inner, ")") {
+				inner = inner[:len(inner)-1]
+			}
+			if n := countTopLevelSQLArgs(inner); n < 3 {
+				return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'json_contains_path'")
+			}
 		}
-		if n := countTopLevelSQLArgs(inner); n < 2 {
-			return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'json_remove'")
+		if strings.HasPrefix(compact, "SELECTJSON_REMOVE(") {
+			inner := compact[len("SELECTJSON_REMOVE("):]
+			if strings.HasSuffix(inner, ")") {
+				inner = inner[:len(inner)-1]
+			}
+			if n := countTopLevelSQLArgs(inner); n < 2 {
+				return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'json_remove'")
+			}
 		}
-	}
-	if strings.HasPrefix(compact, "SELECTJSON_MERGE_PRESERVE(") {
-		inner := compact[len("SELECTJSON_MERGE_PRESERVE("):]
-		if strings.HasSuffix(inner, ")") {
-			inner = inner[:len(inner)-1]
-		}
-		if n := countTopLevelSQLArgs(inner); n < 2 {
-			return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'JSON_MERGE_PRESERVE'")
+		if strings.HasPrefix(compact, "SELECTJSON_MERGE_PRESERVE(") {
+			inner := compact[len("SELECTJSON_MERGE_PRESERVE("):]
+			if strings.HasSuffix(inner, ")") {
+				inner = inner[:len(inner)-1]
+			}
+			if n := countTopLevelSQLArgs(inner); n < 2 {
+				return nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'JSON_MERGE_PRESERVE'")
+			}
 		}
 	}
 	// Clear warnings from previous statement, but preserve for SHOW WARNINGS/ERRORS.
@@ -1873,7 +1886,7 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	trimmed = strings.TrimSpace(query)
 	upper = strings.ToUpper(trimmed)
 
-	stmt, err := sqlparser.NewTestParser().Parse(query)
+	stmt, err := e.parser().Parse(query)
 	if err != nil {
 		// Accept statements that Vitess parser doesn't support
 		if strings.HasPrefix(upper, "EXPLAIN ") || strings.HasPrefix(upper, "DESC ") || strings.HasPrefix(upper, "DESCRIBE ") {
@@ -5784,7 +5797,212 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	}
 
 	// Handle INSERT ... SELECT (including UNION)
-	convertSelectResult := func(selResult *Result) {
+	// Fast path: directly build storage rows from SELECT results, bypassing
+	// AST string-literal roundtrip and per-row evalExpr overhead.
+	insertSelectFastPath := func(selResult *Result) (*Result, error) {
+		if len(colNames) == 0 {
+			for _, col := range tbl.Def.Columns {
+				colNames = append(colNames, col.Name)
+			}
+		}
+
+		// Check if fast path is applicable: no ON DUPLICATE KEY, no REPLACE, no IGNORE
+		canFastPath := len(stmt.OnDup) == 0 &&
+			stmt.Action != sqlparser.ReplaceAct &&
+			!bool(stmt.Ignore)
+
+		if !canFastPath {
+			return nil, nil // fall through to slow path
+		}
+
+		// Check for triggers on this table
+		if db, dbErr := e.Catalog.GetDatabase(insertDB); dbErr == nil {
+			if len(db.GetTriggersForTable(tableName, "BEFORE", "INSERT")) > 0 ||
+				len(db.GetTriggersForTable(tableName, "AFTER", "INSERT")) > 0 {
+				return nil, nil // fall through to slow path
+			}
+		}
+
+		// Precompute column metadata for coercion
+		type colMeta struct {
+			idx       int
+			col       catalog.ColumnDef
+			padLen    int
+			hasGenExpr bool
+		}
+		colMetaMap := make(map[string]*colMeta, len(tbl.Def.Columns))
+		hasGeneratedCols := false
+		autoColName := ""
+		for ci, col := range tbl.Def.Columns {
+			cm := &colMeta{idx: ci, col: col, padLen: binaryPadLength(col.Type)}
+			cm.hasGenExpr = generatedColumnExpr(col.Type) != ""
+			if cm.hasGenExpr {
+				hasGeneratedCols = true
+			}
+			if col.AutoIncrement {
+				autoColName = col.Name
+			}
+			colMetaMap[col.Name] = cm
+		}
+
+		var lastInsertID int64
+		var firstAutoInsertID int64
+		var affected uint64
+
+		// Pre-allocate bulk rows
+		bulkRows := make([]storage.Row, 0, len(selResult.Rows))
+
+		for _, selRow := range selResult.Rows {
+			row := make(storage.Row, len(colNames)+4) // slight over-alloc for defaults
+			for i, v := range selRow {
+				if i >= len(colNames) {
+					break
+				}
+				colName := colNames[i]
+				if v != nil {
+					if cm, ok := colMetaMap[colName]; ok {
+						if cm.padLen > 0 {
+							v = padBinaryValue(v, cm.padLen)
+						}
+						v = formatDecimalValue(cm.col.Type, v)
+						v = validateEnumSetValue(cm.col.Type, v)
+						v = coerceDateTimeValue(cm.col.Type, v)
+						v = coerceIntegerValue(cm.col.Type, v)
+						v = coerceBitValue(cm.col.Type, v)
+					}
+				}
+				row[colName] = v
+			}
+
+			// Populate generated columns
+			if hasGeneratedCols {
+				if err := e.populateGeneratedColumns(row, tbl.Def.Columns); err != nil {
+					return nil, err
+				}
+			}
+
+			// Fill in defaults for missing columns
+			for _, col := range tbl.Def.Columns {
+				if _, exists := row[col.Name]; !exists {
+					if col.AutoIncrement {
+						// Let storage handle it
+					} else if genExpr := generatedColumnExpr(col.Type); genExpr != "" {
+						if v, err := e.evalGeneratedColumnExpr(genExpr, row); err == nil {
+							row[col.Name] = v
+						}
+					} else if col.Default != nil {
+						defVal := *col.Default
+						defUpper := strings.ToUpper(defVal)
+						if defUpper == "CURRENT_TIMESTAMP" || defUpper == "CURRENT_TIMESTAMP()" || defUpper == "NOW()" {
+							defVal = e.nowTime().Format("2006-01-02 15:04:05")
+						}
+						row[col.Name] = defVal
+					} else if !col.Nullable {
+						row[col.Name] = implicitZeroValue(col.Type)
+					}
+				}
+			}
+
+			// Strict mode NOT NULL checks
+			if e.isStrictMode() {
+				for _, col := range tbl.Def.Columns {
+					isAutoGenCol := col.AutoIncrement || isGeneratedColumnType(col.Type)
+					if !col.Nullable && !isAutoGenCol {
+						explicitlySpecified := false
+						for _, cn := range colNames {
+							if strings.EqualFold(cn, col.Name) {
+								explicitlySpecified = true
+								break
+							}
+						}
+						if !explicitlySpecified && col.Default == nil {
+							return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
+						}
+						if rv, exists := row[col.Name]; exists && rv == nil && explicitlySpecified {
+							return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
+						}
+					}
+				}
+			}
+
+			bulkRows = append(bulkRows, row)
+		}
+
+		// Use BulkInsert for efficiency
+		if autoColName == "" && len(bulkRows) > 0 {
+			ids, err := tbl.BulkInsert(bulkRows)
+			if err != nil {
+				return nil, err
+			}
+			affected = uint64(len(ids))
+		} else {
+			// Has auto-increment: insert one by one for correct ID tracking
+			for _, row := range bulkRows {
+				autoGeneratedThisRow := false
+				if autoColName != "" {
+					if v, exists := row[autoColName]; !exists || v == nil {
+						autoGeneratedThisRow = true
+					} else {
+						switch av := v.(type) {
+						case int64:
+							autoGeneratedThisRow = av == 0
+						case uint64:
+							autoGeneratedThisRow = av == 0
+						case float64:
+							autoGeneratedThisRow = int64(av) == 0
+						case string:
+							autoGeneratedThisRow = strings.TrimSpace(av) == "" || strings.TrimSpace(av) == "0"
+						}
+					}
+				}
+				id, err := tbl.Insert(row)
+				if err != nil {
+					return nil, err
+				}
+				lastInsertID = id
+				if autoGeneratedThisRow && firstAutoInsertID == 0 && id > 0 {
+					firstAutoInsertID = id
+				}
+				affected++
+			}
+		}
+
+		if firstAutoInsertID > 0 {
+			lastInsertID = firstAutoInsertID
+		}
+		e.lastInsertID = lastInsertID
+
+		if lastInsertID > 0 {
+			for _, col := range tbl.Def.Columns {
+				if col.AutoIncrement && !col.Nullable {
+					e.lastAutoIncID = lastInsertID
+					break
+				}
+			}
+		}
+
+		if affected > 0 {
+			if db, dbErr := e.Catalog.GetDatabase(insertDB); dbErr == nil {
+				if def, defErr := db.GetTable(tableName); defErr == nil && e.innodbStatsAutoRecalcEnabled(def) && e.innodbStatsPersistentEnabled(def) {
+					e.maybeRecalcStats(insertDB, tableName, int64(affected))
+				}
+			}
+		}
+
+		return &Result{AffectedRows: affected, InsertID: uint64(lastInsertID)}, nil
+	}
+
+	if sel, ok := stmt.Rows.(*sqlparser.Select); ok {
+		selResult, err := e.execSelect(sel)
+		if err != nil {
+			return nil, err
+		}
+		if result, err := insertSelectFastPath(selResult); err != nil {
+			return nil, err
+		} else if result != nil {
+			return result, nil
+		}
+		// Fall through to slow path
 		var valRows sqlparser.Values
 		for _, selRow := range selResult.Rows {
 			var tuple sqlparser.ValTuple
@@ -5797,25 +6015,31 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 			valRows = append(valRows, tuple)
 		}
-		if len(colNames) == 0 {
-			for _, col := range tbl.Def.Columns {
-				colNames = append(colNames, col.Name)
-			}
-		}
 		stmt.Rows = valRows
-	}
-	if sel, ok := stmt.Rows.(*sqlparser.Select); ok {
-		selResult, err := e.execSelect(sel)
-		if err != nil {
-			return nil, err
-		}
-		convertSelectResult(selResult)
 	} else if union, ok := stmt.Rows.(*sqlparser.Union); ok {
 		unionResult, err := e.execUnion(union)
 		if err != nil {
 			return nil, err
 		}
-		convertSelectResult(unionResult)
+		if result, err := insertSelectFastPath(unionResult); err != nil {
+			return nil, err
+		} else if result != nil {
+			return result, nil
+		}
+		// Fall through to slow path
+		var valRows sqlparser.Values
+		for _, selRow := range unionResult.Rows {
+			var tuple sqlparser.ValTuple
+			for _, v := range selRow {
+				if v == nil {
+					tuple = append(tuple, &sqlparser.NullVal{})
+				} else {
+					tuple = append(tuple, sqlparser.NewStrLiteral(fmt.Sprintf("%v", v)))
+				}
+			}
+			valRows = append(valRows, tuple)
+		}
+		stmt.Rows = valRows
 	}
 
 	rows, ok := stmt.Rows.(sqlparser.Values)
@@ -6422,7 +6646,7 @@ func isGeneratedColumnType(colType string) bool {
 }
 
 func (e *Executor) evalGeneratedColumnExpr(expr string, row storage.Row) (interface{}, error) {
-	stmt, err := sqlparser.NewTestParser().Parse("SELECT " + expr)
+	stmt, err := e.parser().Parse("SELECT " + expr)
 	if err != nil {
 		return nil, err
 	}
@@ -6877,6 +7101,329 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 	default:
 		return nil, fmt.Errorf("unsupported table expression: %T", expr)
 	}
+}
+
+// buildFromExprWithWhere wraps buildFromExpr but applies WHERE predicate
+// pushdown for JoinTableExpr to reduce cross-product size. For non-join
+// expressions, it falls through to buildFromExpr.
+func (e *Executor) buildFromExprWithWhere(expr sqlparser.TableExpr, where *sqlparser.Where) ([]storage.Row, error) {
+	join, ok := expr.(*sqlparser.JoinTableExpr)
+	if !ok || where == nil {
+		return e.buildFromExpr(expr)
+	}
+	return e.buildJoinedRowsFromJoinWithWhere(join, where.Expr)
+}
+
+// buildJoinedRowsFromJoinWithWhere is like buildJoinedRowsFromJoin but
+// pre-filters each side of the join using WHERE predicates that reference
+// only that side, dramatically reducing cross-product size.
+func (e *Executor) buildJoinedRowsFromJoinWithWhere(join *sqlparser.JoinTableExpr, where sqlparser.Expr) ([]storage.Row, error) {
+	leftRows, err := e.buildFromExpr(join.LeftExpr)
+	if err != nil {
+		return nil, err
+	}
+	rightRows, err := e.buildFromExpr(join.RightExpr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Extract table aliases
+	leftAlias, _, _ := extractTableAlias(join.LeftExpr)
+	rightAlias, _, _ := extractTableAlias(join.RightExpr)
+
+	// Classify WHERE predicates into left-only, right-only, and cross-table
+	if where != nil {
+		leftPreds, rightPreds := classifyPredsForJoinSides(where, leftAlias, rightAlias)
+
+		// Pre-filter left rows
+		if len(leftPreds) > 0 {
+			filtered := make([]storage.Row, 0, len(leftRows)/2)
+			for _, row := range leftRows {
+				allMatch := true
+				for _, pred := range leftPreds {
+					match, err := e.evalWhere(pred, row)
+					if err != nil {
+						allMatch = false
+						break
+					}
+					if !match {
+						allMatch = false
+						break
+					}
+				}
+				if allMatch {
+					filtered = append(filtered, row)
+				}
+			}
+			leftRows = filtered
+		}
+
+		// Pre-filter right rows
+		if len(rightPreds) > 0 {
+			filtered := make([]storage.Row, 0, len(rightRows)/2)
+			for _, row := range rightRows {
+				allMatch := true
+				for _, pred := range rightPreds {
+					match, err := e.evalWhere(pred, row)
+					if err != nil {
+						allMatch = false
+						break
+					}
+					if !match {
+						allMatch = false
+						break
+					}
+				}
+				if allMatch {
+					filtered = append(filtered, row)
+				}
+			}
+			rightRows = filtered
+		}
+	}
+
+	// Now build the join with pre-filtered rows (delegate to normal join logic
+	// by temporarily swapping in pre-filtered rows)
+	return e.buildJoinedRowsFromJoinPrefiltered(join, leftRows, rightRows)
+}
+
+// classifyPredsForJoinSides splits AND-connected WHERE predicates into those
+// that reference only the left table alias and those that reference only the
+// right table alias. Predicates that reference both or neither are ignored.
+func classifyPredsForJoinSides(where sqlparser.Expr, leftAlias, rightAlias string) (leftOnly, rightOnly []sqlparser.Expr) {
+	preds := splitANDPredicates(where)
+	for _, pred := range preds {
+		cols := extractColumnRefs(pred)
+		hasLeft, hasRight, hasOther := false, false, false
+		for _, col := range cols {
+			qualifier := ""
+			if cn, ok := col.(*sqlparser.ColName); ok {
+				qualifier = cn.Qualifier.Name.String()
+			}
+			if qualifier == "" {
+				hasOther = true
+			} else if strings.EqualFold(qualifier, leftAlias) {
+				hasLeft = true
+			} else if strings.EqualFold(qualifier, rightAlias) {
+				hasRight = true
+			} else {
+				hasOther = true
+			}
+		}
+		if hasOther {
+			continue
+		}
+		if hasLeft && !hasRight {
+			leftOnly = append(leftOnly, pred)
+		} else if hasRight && !hasLeft {
+			rightOnly = append(rightOnly, pred)
+		}
+	}
+	return
+}
+
+// splitANDPredicates splits an expression tree along AND operators into a flat list.
+func splitANDPredicates(expr sqlparser.Expr) []sqlparser.Expr {
+	if and, ok := expr.(*sqlparser.AndExpr); ok {
+		return append(splitANDPredicates(and.Left), splitANDPredicates(and.Right)...)
+	}
+	return []sqlparser.Expr{expr}
+}
+
+// extractColumnRefs collects all ColName expressions from an expression tree.
+func extractColumnRefs(expr sqlparser.Expr) []sqlparser.Expr {
+	var refs []sqlparser.Expr
+	sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if cn, ok := node.(*sqlparser.ColName); ok {
+			refs = append(refs, cn)
+		}
+		return true, nil
+	}, expr)
+	return refs
+}
+
+// buildJoinedRowsFromJoinPrefiltered builds join results from pre-filtered left and right rows.
+func (e *Executor) buildJoinedRowsFromJoinPrefiltered(join *sqlparser.JoinTableExpr, leftRows, rightRows []storage.Row) ([]storage.Row, error) {
+	rightAlias, _, _ := extractTableAlias(join.RightExpr)
+	leftAlias, _, _ := extractTableAlias(join.LeftExpr)
+
+	var rightColNames []string
+	if ate, ok := join.RightExpr.(*sqlparser.AliasedTableExpr); ok {
+		_, tName, _ := extractTableAliasFromAliased(ate)
+		if rtbl, err := e.Storage.GetTable(e.CurrentDB, tName); err == nil {
+			for _, col := range rtbl.Def.Columns {
+				rightColNames = append(rightColNames, col.Name)
+			}
+		}
+	}
+	if len(rightColNames) == 0 && len(rightRows) > 0 {
+		seen := make(map[string]bool)
+		for k := range rightRows[0] {
+			if !strings.Contains(k, ".") && !seen[k] {
+				seen[k] = true
+				rightColNames = append(rightColNames, k)
+			}
+		}
+	}
+
+	var leftColNames []string
+	if ate, ok := join.LeftExpr.(*sqlparser.AliasedTableExpr); ok {
+		_, tName, _ := extractTableAliasFromAliased(ate)
+		if ltbl, err := e.Storage.GetTable(e.CurrentDB, tName); err == nil {
+			for _, col := range ltbl.Def.Columns {
+				leftColNames = append(leftColNames, col.Name)
+			}
+		}
+	}
+	if len(leftColNames) == 0 && len(leftRows) > 0 {
+		seen := make(map[string]bool)
+		for k := range leftRows[0] {
+			if !strings.Contains(k, ".") && !seen[k] {
+				seen[k] = true
+				leftColNames = append(leftColNames, k)
+			}
+		}
+	}
+
+	joinType := join.Join
+	if joinType == sqlparser.RightJoinType || joinType == sqlparser.NaturalRightJoinType {
+		leftRows, rightRows = rightRows, leftRows
+		leftAlias, rightAlias = rightAlias, leftAlias
+		leftColNames, rightColNames = rightColNames, leftColNames
+		if joinType == sqlparser.RightJoinType {
+			joinType = sqlparser.LeftJoinType
+		} else {
+			joinType = sqlparser.NaturalLeftJoinType
+		}
+	}
+
+	isNatural := joinType == sqlparser.NaturalJoinType || joinType == sqlparser.NaturalLeftJoinType
+	var naturalCols []string
+	if isNatural {
+		rightSet := make(map[string]bool)
+		for _, c := range rightColNames {
+			rightSet[strings.ToLower(c)] = true
+		}
+		for _, c := range leftColNames {
+			if rightSet[strings.ToLower(c)] {
+				naturalCols = append(naturalCols, c)
+			}
+		}
+	}
+
+	isLeft := joinType == sqlparser.LeftJoinType || joinType == sqlparser.NaturalLeftJoinType
+	isCross := joinType == sqlparser.NormalJoinType && (join.Condition == nil || (join.Condition.On == nil && len(join.Condition.Using) == 0))
+
+	var usingCols []string
+	if join.Condition != nil && len(join.Condition.Using) > 0 {
+		for _, col := range join.Condition.Using {
+			usingCols = append(usingCols, col.String())
+		}
+	}
+
+	// Cap cross product size to prevent OOM
+	maxProduct := int64(len(leftRows)) * int64(len(rightRows))
+	if maxProduct > 10_000_000 {
+		// If the cross product is too large, limit right side to avoid OOM
+		maxRight := 10_000_000 / int64(len(leftRows)+1)
+		if maxRight < 1 {
+			maxRight = 1
+		}
+		if int64(len(rightRows)) > maxRight {
+			rightRows = rightRows[:maxRight]
+		}
+	}
+
+	var result []storage.Row
+	for _, leftRow := range leftRows {
+		matched := false
+		for _, rightRow := range rightRows {
+			combined := make(storage.Row)
+			for k, v := range leftRow {
+				combined[k] = v
+			}
+			for k, v := range rightRow {
+				combined[k] = v
+				if rightAlias != "" {
+					combined[rightAlias+"."+k] = v
+				}
+			}
+
+			if isCross {
+				result = append(result, combined)
+				matched = true
+				continue
+			}
+
+			if len(usingCols) > 0 {
+				allMatch := true
+				for _, col := range usingCols {
+					lv := leftRow[col]
+					rv := rightRow[col]
+					if lv == nil || rv == nil || fmt.Sprintf("%v", lv) != fmt.Sprintf("%v", rv) {
+						allMatch = false
+						break
+					}
+				}
+				if !allMatch {
+					continue
+				}
+				result = append(result, combined)
+				matched = true
+				continue
+			}
+
+			if isNatural {
+				if len(naturalCols) == 0 {
+					result = append(result, combined)
+					matched = true
+					continue
+				}
+				allMatch := true
+				for _, col := range naturalCols {
+					lv := leftRow[col]
+					rv := rightRow[col]
+					if lv == nil || rv == nil || fmt.Sprintf("%v", lv) != fmt.Sprintf("%v", rv) {
+						allMatch = false
+						break
+					}
+				}
+				if allMatch {
+					result = append(result, combined)
+					matched = true
+				}
+				continue
+			}
+
+			if join.Condition != nil && join.Condition.On != nil {
+				match, err := e.evalWhere(join.Condition.On, combined)
+				if err != nil {
+					return nil, err
+				}
+				if !match {
+					continue
+				}
+			}
+			result = append(result, combined)
+			matched = true
+		}
+
+		if isLeft && !matched {
+			combined := make(storage.Row)
+			for k, v := range leftRow {
+				combined[k] = v
+			}
+			for _, col := range rightColNames {
+				combined[col] = nil
+				if rightAlias != "" {
+					combined[rightAlias+"."+col] = nil
+				}
+			}
+			result = append(result, combined)
+		}
+	}
+	_ = leftAlias // suppress unused warning
+	return result, nil
 }
 
 func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]storage.Row, error) {
@@ -9700,7 +10247,7 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 		return &Result{}, nil
 	}
 
-	allRows, err := e.buildFromExpr(stmt.TableExprs[0])
+	allRows, err := e.buildFromExprWithWhere(stmt.TableExprs[0], stmt.Where)
 	if err != nil {
 		return nil, err
 	}
@@ -17538,7 +18085,7 @@ func (e *Executor) handleSetNew(stmtStr string, newRow, oldRow storage.Row) {
 func (e *Executor) evaluateSimpleExpr(expr string) (interface{}, error) {
 	// Try to parse as a SELECT expression to use the full evaluator
 	selectSQL := "SELECT " + expr
-	stmt, err := sqlparser.NewTestParser().Parse(selectSQL)
+	stmt, err := e.parser().Parse(selectSQL)
 	if err != nil {
 		// Fallback: treat as literal
 		return expr, nil
@@ -18104,7 +18651,7 @@ func (e *Executor) execMultiTableDelete(query string) (*Result, error) {
 		// Build a SELECT statement to parse the WHERE clause
 		// Use the first table as a dummy FROM to help vitess parse qualified column refs
 		selectSQL := "SELECT 1 FROM dual WHERE " + whereClause
-		parsedStmt, err := sqlparser.NewTestParser().Parse(selectSQL)
+		parsedStmt, err := e.parser().Parse(selectSQL)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse WHERE clause: %v", err)
 		}
@@ -18242,7 +18789,7 @@ func crossProduct(left, right []storage.Row) []storage.Row {
 
 // inferColumnType tries to determine the column type from the source table of a SELECT statement.
 func (e *Executor) inferColumnType(selectSQL, colName string) string {
-	stmt, err := sqlparser.NewTestParser().Parse(selectSQL)
+	stmt, err := e.parser().Parse(selectSQL)
 	if err != nil {
 		return ""
 	}
@@ -20098,17 +20645,17 @@ func isMultiTableUpdate(stmt *sqlparser.Update) bool {
 
 // execMultiTableUpdate handles multi-table UPDATE statements.
 func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error) {
-	// Build cross product of all tables
+	// Build cross product of all tables, with WHERE predicate pushdown
 	var allRows []storage.Row
 	var err error
 
 	if len(stmt.TableExprs) == 1 {
-		allRows, err = e.buildFromExpr(stmt.TableExprs[0])
+		allRows, err = e.buildFromExprWithWhere(stmt.TableExprs[0], stmt.Where)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		allRows, err = e.buildFromExpr(stmt.TableExprs[0])
+		allRows, err = e.buildFromExprWithWhere(stmt.TableExprs[0], stmt.Where)
 		if err != nil {
 			return nil, err
 		}
@@ -20491,7 +21038,7 @@ func decodeUCS2(data []byte) ([]byte, error) {
 func (e *Executor) evaluateCheckConstraint(exprStr string, row storage.Row) (bool, error) {
 	// Parse the expression
 	selectSQL := "SELECT " + exprStr
-	parsed, err := sqlparser.NewTestParser().Parse(selectSQL)
+	parsed, err := e.parser().Parse(selectSQL)
 	if err != nil {
 		return true, err // can't parse, assume valid
 	}

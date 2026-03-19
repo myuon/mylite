@@ -214,11 +214,36 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	}
 	expected := string(expectedBytes)
 
+	// Fast path: if lengths differ by more than 50%, skip expensive normalization
+	// of the expected output and compute diff with minimal normalization.
+	actualLen := len(actual)
+	expectedLen := len(expected)
+	if expectedLen > 0 && (actualLen < expectedLen/2 || actualLen > expectedLen*2) {
+		// Quick normalization for actual only
+		normalizedActual := normalizeOutput(actual)
+		// Light normalization of expected: just trim whitespace per line
+		expLines := strings.Split(expected, "\n")
+		for i, l := range expLines {
+			expLines[i] = strings.TrimRight(l, " \t\r")
+		}
+		normalizedExpected := strings.TrimRight(strings.Join(expLines, "\n"), "\n")
+		diff := computeDiff(normalizedExpected, normalizedActual)
+		return TestResult{
+			Name:     name,
+			Passed:   false,
+			Output:   actual,
+			Expected: expected,
+			Diff:     diff,
+		}
+	}
+
 	// Compare: normalize expected side to strip Warnings blocks etc.
 	normalizedActual := normalizeOutput(actual)
-	normalizedActual = strings.ReplaceAll(normalizedActual, "ENGINE=ENGINE", "ENGINE=InnoDB")
-	normalizedActual = strings.ReplaceAll(normalizedActual, "ENGINE=MyISAM", "ENGINE=InnoDB")
-	normalizedActual = strings.ReplaceAll(normalizedActual, "ENGINE=MEMORY", "ENGINE=InnoDB")
+	if strings.Contains(normalizedActual, "ENGINE=") {
+		normalizedActual = strings.ReplaceAll(normalizedActual, "ENGINE=ENGINE", "ENGINE=InnoDB")
+		normalizedActual = strings.ReplaceAll(normalizedActual, "ENGINE=MyISAM", "ENGINE=InnoDB")
+		normalizedActual = strings.ReplaceAll(normalizedActual, "ENGINE=MEMORY", "ENGINE=InnoDB")
+	}
 	normalizedActual = normalizeFuncCase(normalizedActual)
 	normalizedExpected := normalizeExpected(normalizeOutput(expected))
 	normalizedExpected = normalizeFuncCase(normalizedExpected)
@@ -279,6 +304,7 @@ type execContext struct {
 	skipped          bool           // set to true when --skip directive is encountered
 	sourceDepth      int            // current --source recursion depth
 	ttsBackups       map[string]tableSnapshot
+	errorConn        *sql.Conn     // cached connection for --error expected error handling
 }
 
 type tableSnapshot struct {
@@ -1858,17 +1884,16 @@ func (ctx *execContext) executeExecWithExpectedError(stmt string) error {
 	ctx.expectedError = ""
 
 	conn := ctx.getActiveConn()
-	ownedConn := false
 	if conn == nil {
-		var err error
-		conn, err = ctx.db.Conn(context.Background())
-		if err != nil {
-			return fmt.Errorf("failed to acquire connection: %v", err)
+		// Reuse cached error connection to avoid per-statement connection creation
+		if ctx.errorConn == nil {
+			var err error
+			ctx.errorConn, err = ctx.db.Conn(context.Background())
+			if err != nil {
+				return fmt.Errorf("failed to acquire connection: %v", err)
+			}
 		}
-		ownedConn = true
-	}
-	if ownedConn {
-		defer conn.Close()
+		conn = ctx.errorConn
 	}
 
 	_, execErr := conn.ExecContext(context.Background(), stmt)
@@ -1921,6 +1946,10 @@ func (ctx *execContext) closeConnections() {
 			conn.Close() //nolint:errcheck
 		}
 		delete(ctx.connByName, name)
+	}
+	if ctx.errorConn != nil {
+		ctx.errorConn.Close() //nolint:errcheck
+		ctx.errorConn = nil
 	}
 }
 
@@ -2730,9 +2759,16 @@ func normalizeFuncCase(s string) string {
 		"IFNULL", "COALESCE", "NULLIF", "IF",
 		"HEX", "UNHEX", "CAST", "CONVERT",
 	}
+	// Quick check: if no '(' in string, no function calls to normalize
+	if !strings.Contains(s, "(") {
+		return s
+	}
 	for _, fn := range funcs {
 		lower := strings.ToLower(fn)
-		s = strings.ReplaceAll(s, lower+"(", fn+"(")
+		target := lower + "("
+		if strings.Contains(s, target) {
+			s = strings.ReplaceAll(s, target, fn+"(")
+		}
 	}
 	return s
 }
@@ -2751,11 +2787,19 @@ func normalizeOutput(s string) string {
 	out = normalizeSubstringDisplay(out)
 	// Normalize case of "using" keyword: MySQL sometimes shows "using" lowercase, sometimes "USING" uppercase.
 	// Normalize all to lowercase for consistent comparison.
-	out = strings.ReplaceAll(out, " USING ", " using ")
+	if strings.Contains(out, " USING ") {
+		out = strings.ReplaceAll(out, " USING ", " using ")
+	}
 	// Normalize TRIM keywords: vitess outputs lowercase trailing/leading/both, MySQL uppercase
-	out = strings.ReplaceAll(out, "TRAILING ", "trailing ")
-	out = strings.ReplaceAll(out, "LEADING ", "leading ")
-	out = strings.ReplaceAll(out, "BOTH ", "both ")
+	if strings.Contains(out, "TRAILING ") {
+		out = strings.ReplaceAll(out, "TRAILING ", "trailing ")
+	}
+	if strings.Contains(out, "LEADING ") {
+		out = strings.ReplaceAll(out, "LEADING ", "leading ")
+	}
+	if strings.Contains(out, "BOTH ") {
+		out = strings.ReplaceAll(out, "BOTH ", "both ")
+	}
 	// Normalize function name case: MySQL preserves original query case for function names,
 	// but vitess normalizes to lowercase. Lowercase all function names for comparison.
 	out = normalizeFunctionNameCase(out)
@@ -2765,6 +2809,10 @@ func normalizeOutput(s string) string {
 // normalizeFunctionNameCase lowercases common MySQL function names in the output
 // for consistent comparison (MySQL preserves query case, vitess normalizes to lowercase).
 func normalizeFunctionNameCase(s string) string {
+	// Quick check: if no '(' in string, no function calls to normalize
+	if !strings.Contains(s, "(") {
+		return s
+	}
 	// Sorted by length descending to avoid partial matches (e.g., TRIM inside LTRIM)
 	funcNames := []string{
 		"COUNT", "MIN", "MAX", "SUM", "AVG",
@@ -2779,9 +2827,11 @@ func normalizeFunctionNameCase(s string) string {
 		"HEX", "IF",
 	}
 	for _, fn := range funcNames {
-		lower := strings.ToLower(fn)
-		// Only replace when followed by ( to avoid replacing in data
-		s = strings.ReplaceAll(s, fn+"(", lower+"(")
+		target := fn + "("
+		if strings.Contains(s, target) {
+			lower := strings.ToLower(fn)
+			s = strings.ReplaceAll(s, target, lower+"(")
+		}
 	}
 	return s
 }
@@ -2791,6 +2841,10 @@ func normalizeFunctionNameCase(s string) string {
 // Vitess: "SUBSTRING(col,pos)" or "SUBSTRING(col,pos,len)"
 // Normalize both to the comma-separated form.
 func normalizeSubstringDisplay(s string) string {
+	// Quick check: skip if no SUBSTRING in the string
+	if !strings.Contains(s, "SUBSTRING(") && !strings.Contains(s, "substring(") && !strings.Contains(s, "Substring(") {
+		return s
+	}
 	// Replace "SUBSTRING(xxx FROM yyy)" or "substring(xxx FROM yyy)" with "substring(xxx,yyy)"
 	re := regexp.MustCompile(`(?i)SUBSTRING\(([^)]+?) FROM ([^)]+?)\)`)
 	s = re.ReplaceAllStringFunc(s, func(match string) string {
@@ -2812,6 +2866,10 @@ func normalizeSubstringDisplay(s string) string {
 // normalizeTrimFromSpacing ensures consistent spacing before FROM in TRIM expressions
 // and normalizes trailing spaces in function argument lists that MySQL adds for display alignment.
 func normalizeTrimFromSpacing(s string) string {
+	// Quick check: if no 'FROM pattern, skip
+	if !strings.Contains(s, "'FROM ") && !strings.Contains(s, " )") {
+		return s
+	}
 	// Normalize 'FROM -> ' FROM (MySQL sometimes omits space before FROM)
 	re := regexp.MustCompile(`'FROM `)
 	s = re.ReplaceAllString(s, "' FROM ")
@@ -2852,9 +2910,11 @@ func normalizeExpected(s string) string {
 	}
 	out := strings.Join(result, "\n")
 	// Normalize ENGINE placeholders and non-InnoDB engines (we only support InnoDB)
-	out = strings.ReplaceAll(out, "ENGINE=ENGINE", "ENGINE=InnoDB")
-	out = strings.ReplaceAll(out, "ENGINE=MyISAM", "ENGINE=InnoDB")
-	out = strings.ReplaceAll(out, "ENGINE=MEMORY", "ENGINE=InnoDB")
+	if strings.Contains(out, "ENGINE=") {
+		out = strings.ReplaceAll(out, "ENGINE=ENGINE", "ENGINE=InnoDB")
+		out = strings.ReplaceAll(out, "ENGINE=MyISAM", "ENGINE=InnoDB")
+		out = strings.ReplaceAll(out, "ENGINE=MEMORY", "ENGINE=InnoDB")
+	}
 	return strings.TrimRight(out, "\n")
 }
 
