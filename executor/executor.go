@@ -506,225 +506,6 @@ func (e *Executor) initSystemTables() {
 			{Name: "SPACE", Type: "BIGINT"},
 		},
 	})
-
-	// mysql.* system tables (stubs for compatibility)
-	ensure("mysql", &catalog.TableDef{
-		Name: "user",
-		Columns: []catalog.ColumnDef{
-			{Name: "Host", Type: "CHAR(255)"},
-			{Name: "User", Type: "CHAR(32)"},
-			{Name: "Select_priv", Type: "ENUM('N','Y')"},
-			{Name: "Insert_priv", Type: "ENUM('N','Y')"},
-			{Name: "Update_priv", Type: "ENUM('N','Y')"},
-			{Name: "Delete_priv", Type: "ENUM('N','Y')"},
-			{Name: "Create_priv", Type: "ENUM('N','Y')"},
-			{Name: "Drop_priv", Type: "ENUM('N','Y')"},
-			{Name: "Reload_priv", Type: "ENUM('N','Y')"},
-			{Name: "Shutdown_priv", Type: "ENUM('N','Y')"},
-			{Name: "Process_priv", Type: "ENUM('N','Y')"},
-			{Name: "File_priv", Type: "ENUM('N','Y')"},
-			{Name: "Grant_priv", Type: "ENUM('N','Y')"},
-			{Name: "References_priv", Type: "ENUM('N','Y')"},
-			{Name: "Index_priv", Type: "ENUM('N','Y')"},
-			{Name: "Alter_priv", Type: "ENUM('N','Y')"},
-			{Name: "Show_db_priv", Type: "ENUM('N','Y')"},
-			{Name: "Super_priv", Type: "ENUM('N','Y')"},
-			{Name: "Create_tmp_table_priv", Type: "ENUM('N','Y')"},
-			{Name: "Lock_tables_priv", Type: "ENUM('N','Y')"},
-			{Name: "Execute_priv", Type: "ENUM('N','Y')"},
-			{Name: "Repl_slave_priv", Type: "ENUM('N','Y')"},
-			{Name: "Repl_client_priv", Type: "ENUM('N','Y')"},
-			{Name: "Create_view_priv", Type: "ENUM('N','Y')"},
-			{Name: "Show_view_priv", Type: "ENUM('N','Y')"},
-			{Name: "Create_routine_priv", Type: "ENUM('N','Y')"},
-			{Name: "Alter_routine_priv", Type: "ENUM('N','Y')"},
-			{Name: "Create_user_priv", Type: "ENUM('N','Y')"},
-			{Name: "Event_priv", Type: "ENUM('N','Y')"},
-			{Name: "Trigger_priv", Type: "ENUM('N','Y')"},
-			{Name: "Create_tablespace_priv", Type: "ENUM('N','Y')"},
-			{Name: "ssl_type", Type: "ENUM('','ANY','X509','SPECIFIED')"},
-			{Name: "ssl_cipher", Type: "BLOB", Nullable: true},
-			{Name: "x509_issuer", Type: "BLOB", Nullable: true},
-			{Name: "x509_subject", Type: "BLOB", Nullable: true},
-			{Name: "max_questions", Type: "INT UNSIGNED"},
-			{Name: "max_updates", Type: "INT UNSIGNED"},
-			{Name: "max_connections", Type: "INT UNSIGNED"},
-			{Name: "max_user_connections", Type: "INT UNSIGNED"},
-			{Name: "plugin", Type: "CHAR(64)"},
-			{Name: "authentication_string", Type: "TEXT", Nullable: true},
-			{Name: "password_expired", Type: "ENUM('N','Y')"},
-			{Name: "account_locked", Type: "ENUM('N','Y')"},
-		},
-	})
-	ensure("mysql", &catalog.TableDef{
-		Name: "db",
-		Columns: []catalog.ColumnDef{
-			{Name: "Host", Type: "CHAR(255)"},
-			{Name: "Db", Type: "CHAR(64)"},
-			{Name: "User", Type: "CHAR(32)"},
-			{Name: "Select_priv", Type: "ENUM('N','Y')"},
-			{Name: "Insert_priv", Type: "ENUM('N','Y')"},
-			{Name: "Update_priv", Type: "ENUM('N','Y')"},
-			{Name: "Delete_priv", Type: "ENUM('N','Y')"},
-			{Name: "Create_priv", Type: "ENUM('N','Y')"},
-			{Name: "Drop_priv", Type: "ENUM('N','Y')"},
-			{Name: "Grant_priv", Type: "ENUM('N','Y')"},
-			{Name: "References_priv", Type: "ENUM('N','Y')"},
-			{Name: "Index_priv", Type: "ENUM('N','Y')"},
-			{Name: "Alter_priv", Type: "ENUM('N','Y')"},
-			{Name: "Create_tmp_table_priv", Type: "ENUM('N','Y')"},
-			{Name: "Lock_tables_priv", Type: "ENUM('N','Y')"},
-			{Name: "Create_view_priv", Type: "ENUM('N','Y')"},
-			{Name: "Show_view_priv", Type: "ENUM('N','Y')"},
-			{Name: "Create_routine_priv", Type: "ENUM('N','Y')"},
-			{Name: "Alter_routine_priv", Type: "ENUM('N','Y')"},
-			{Name: "Execute_priv", Type: "ENUM('N','Y')"},
-			{Name: "Event_priv", Type: "ENUM('N','Y')"},
-			{Name: "Trigger_priv", Type: "ENUM('N','Y')"},
-		},
-	})
-	ensure("mysql", &catalog.TableDef{
-		Name: "general_log",
-		Columns: []catalog.ColumnDef{
-			{Name: "event_time", Type: "TIMESTAMP(6)"},
-			{Name: "user_host", Type: "MEDIUMTEXT"},
-			{Name: "thread_id", Type: "BIGINT UNSIGNED"},
-			{Name: "server_id", Type: "INT UNSIGNED"},
-			{Name: "command_type", Type: "VARCHAR(64)"},
-			{Name: "argument", Type: "MEDIUMBLOB"},
-		},
-	})
-	ensure("mysql", &catalog.TableDef{
-		Name: "slow_log",
-		Columns: []catalog.ColumnDef{
-			{Name: "start_time", Type: "TIMESTAMP(6)"},
-			{Name: "user_host", Type: "MEDIUMTEXT"},
-			{Name: "query_time", Type: "TIME(6)"},
-			{Name: "lock_time", Type: "TIME(6)"},
-			{Name: "rows_sent", Type: "INT"},
-			{Name: "rows_examined", Type: "INT"},
-			{Name: "db", Type: "VARCHAR(512)"},
-			{Name: "last_insert_id", Type: "INT"},
-			{Name: "insert_id", Type: "INT"},
-			{Name: "server_id", Type: "INT UNSIGNED"},
-			{Name: "sql_text", Type: "MEDIUMBLOB"},
-			{Name: "thread_id", Type: "BIGINT UNSIGNED"},
-		},
-	})
-	ensure("mysql", &catalog.TableDef{
-		Name: "server_cost",
-		Columns: []catalog.ColumnDef{
-			{Name: "cost_name", Type: "VARCHAR(64)"},
-			{Name: "cost_value", Type: "FLOAT", Nullable: true},
-			{Name: "last_update", Type: "TIMESTAMP"},
-			{Name: "comment", Type: "VARCHAR(1024)", Nullable: true},
-			{Name: "default_value", Type: "FLOAT", Nullable: true},
-		},
-	})
-	ensure("mysql", &catalog.TableDef{
-		Name: "engine_cost",
-		Columns: []catalog.ColumnDef{
-			{Name: "engine_name", Type: "VARCHAR(64)"},
-			{Name: "device_type", Type: "INT"},
-			{Name: "cost_name", Type: "VARCHAR(64)"},
-			{Name: "cost_value", Type: "FLOAT", Nullable: true},
-			{Name: "last_update", Type: "TIMESTAMP"},
-			{Name: "comment", Type: "VARCHAR(1024)", Nullable: true},
-			{Name: "default_value", Type: "FLOAT", Nullable: true},
-		},
-	})
-	ensure("mysql", &catalog.TableDef{
-		Name: "tables_priv",
-		Columns: []catalog.ColumnDef{
-			{Name: "Host", Type: "CHAR(255)"},
-			{Name: "Db", Type: "CHAR(64)"},
-			{Name: "User", Type: "CHAR(32)"},
-			{Name: "Table_name", Type: "CHAR(64)"},
-			{Name: "Grantor", Type: "VARCHAR(288)"},
-			{Name: "Timestamp", Type: "TIMESTAMP"},
-			{Name: "Table_priv", Type: "SET('Select','Insert','Update','Delete','Create','Drop','Grant','References','Index','Alter','Create View','Show view','Trigger')"},
-			{Name: "Column_priv", Type: "SET('Select','Insert','Update','References')"},
-		},
-	})
-	ensure("mysql", &catalog.TableDef{
-		Name: "columns_priv",
-		Columns: []catalog.ColumnDef{
-			{Name: "Host", Type: "CHAR(255)"},
-			{Name: "Db", Type: "CHAR(64)"},
-			{Name: "User", Type: "CHAR(32)"},
-			{Name: "Table_name", Type: "CHAR(64)"},
-			{Name: "Column_name", Type: "CHAR(64)"},
-			{Name: "Timestamp", Type: "TIMESTAMP"},
-			{Name: "Column_priv", Type: "SET('Select','Insert','Update','References')"},
-		},
-	})
-	ensure("mysql", &catalog.TableDef{
-		Name: "procs_priv",
-		Columns: []catalog.ColumnDef{
-			{Name: "Host", Type: "CHAR(255)"},
-			{Name: "Db", Type: "CHAR(64)"},
-			{Name: "User", Type: "CHAR(32)"},
-			{Name: "Routine_name", Type: "CHAR(64)"},
-			{Name: "Routine_type", Type: "ENUM('FUNCTION','PROCEDURE')"},
-			{Name: "Grantor", Type: "VARCHAR(288)"},
-			{Name: "Proc_priv", Type: "SET('Execute','Alter Routine','Grant')"},
-			{Name: "Timestamp", Type: "TIMESTAMP"},
-		},
-	})
-	ensure("mysql", &catalog.TableDef{
-		Name: "role_edges",
-		Columns: []catalog.ColumnDef{
-			{Name: "FROM_HOST", Type: "CHAR(255)"},
-			{Name: "FROM_USER", Type: "CHAR(32)"},
-			{Name: "TO_HOST", Type: "CHAR(255)"},
-			{Name: "TO_USER", Type: "CHAR(32)"},
-			{Name: "WITH_ADMIN_OPTION", Type: "ENUM('N','Y')"},
-		},
-	})
-	ensure("mysql", &catalog.TableDef{
-		Name: "default_roles",
-		Columns: []catalog.ColumnDef{
-			{Name: "HOST", Type: "CHAR(255)"},
-			{Name: "USER", Type: "CHAR(32)"},
-			{Name: "DEFAULT_ROLE_HOST", Type: "CHAR(255)"},
-			{Name: "DEFAULT_ROLE_USER", Type: "CHAR(32)"},
-		},
-	})
-	ensure("mysql", &catalog.TableDef{
-		Name: "func",
-		Columns: []catalog.ColumnDef{
-			{Name: "name", Type: "CHAR(64)"},
-			{Name: "ret", Type: "TINYINT"},
-			{Name: "dl", Type: "CHAR(128)"},
-			{Name: "type", Type: "ENUM('function','aggregate')"},
-		},
-	})
-	ensure("mysql", &catalog.TableDef{
-		Name: "global_grants",
-		Columns: []catalog.ColumnDef{
-			{Name: "USER", Type: "CHAR(32)"},
-			{Name: "HOST", Type: "CHAR(255)"},
-			{Name: "PRIV", Type: "CHAR(32)"},
-			{Name: "WITH_GRANT_OPTION", Type: "ENUM('N','Y')"},
-		},
-	})
-	// performance_schema.threads for processlist queries
-	ensure("performance_schema", &catalog.TableDef{
-		Name: "threads",
-		Columns: []catalog.ColumnDef{
-			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
-			{Name: "NAME", Type: "VARCHAR(128)"},
-			{Name: "TYPE", Type: "VARCHAR(10)"},
-			{Name: "PROCESSLIST_ID", Type: "BIGINT UNSIGNED", Nullable: true},
-			{Name: "PROCESSLIST_USER", Type: "VARCHAR(32)", Nullable: true},
-			{Name: "PROCESSLIST_HOST", Type: "VARCHAR(255)", Nullable: true},
-			{Name: "PROCESSLIST_DB", Type: "VARCHAR(64)", Nullable: true},
-			{Name: "PROCESSLIST_COMMAND", Type: "VARCHAR(16)", Nullable: true},
-			{Name: "PROCESSLIST_TIME", Type: "BIGINT", Nullable: true},
-			{Name: "PROCESSLIST_STATE", Type: "VARCHAR(64)", Nullable: true},
-			{Name: "PROCESSLIST_INFO", Type: "LONGTEXT", Nullable: true},
-		},
-	})
 }
 
 func isSystemSchemaName(name string) bool {
@@ -2036,12 +1817,6 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	// Clear per-query subquery cache so non-correlated IN subqueries
 	// are only evaluated once within the same top-level statement.
 	e.subqueryValCache = nil
-
-	// Silently ignore MTR test directives that start with -- (not SQL)
-	if strings.HasPrefix(trimmed, "--") {
-		return &Result{}, nil
-	}
-
 	upper := strings.ToUpper(trimmed)
 	// Only compute compact form for SELECT queries that might contain JSON function checks
 	if strings.HasPrefix(upper, "SELECT") && strings.Contains(upper, "JSON_") {
@@ -2103,26 +1878,8 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		upper = strings.ToUpper(query)
 	}
 
-	// Rewrite LOCK TABLE (singular) to LOCK TABLES (vitess only parses TABLES).
-	if strings.HasPrefix(upper, "LOCK TABLE ") && !strings.HasPrefix(upper, "LOCK TABLES ") {
-		query = "LOCK TABLES " + query[len("LOCK TABLE "):]
-		upper = strings.ToUpper(query)
-	}
-
 	// Handle BEGIN WORK (equivalent to BEGIN/START TRANSACTION)
 	if upper == "BEGIN WORK" {
-		return e.execBegin()
-	}
-
-	// Handle COMMIT WORK AND CHAIN / COMMIT AND CHAIN / ROLLBACK AND CHAIN
-	if strings.HasPrefix(upper, "COMMIT") && strings.Contains(upper, "AND CHAIN") {
-		// COMMIT WORK AND CHAIN = COMMIT + implicit BEGIN
-		if _, err := e.execCommit(); err != nil {
-			return nil, err
-		}
-		return e.execBegin()
-	}
-	if strings.HasPrefix(upper, "ROLLBACK") && strings.Contains(upper, "AND CHAIN") {
 		return e.execBegin()
 	}
 
@@ -2220,8 +1977,6 @@ func (e *Executor) Execute(query string) (*Result, error) {
 
 	// Quote non-ASCII bare identifiers so vitess can parse them.
 	query = quoteNonASCIIIdentifiers(query)
-	// Rewrite "SOUNDS LIKE" to SOUNDEX comparison (vitess doesn't parse it).
-	query = rewriteSoundsLike(query)
 	trimmed = strings.TrimSpace(query)
 	upper = strings.ToUpper(trimmed)
 
@@ -2259,10 +2014,6 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			strings.HasPrefix(upper, "CREATE USER") ||
 			strings.HasPrefix(upper, "DROP USER") ||
 			strings.HasPrefix(upper, "ALTER USER") ||
-			strings.HasPrefix(upper, "CREATE ROLE") ||
-			strings.HasPrefix(upper, "DROP ROLE") ||
-			strings.HasPrefix(upper, "SET DEFAULT ROLE") ||
-			strings.HasPrefix(upper, "SET ROLE") ||
 			strings.HasPrefix(upper, "GRANT ") ||
 			strings.HasPrefix(upper, "REVOKE ") ||
 			strings.HasPrefix(upper, "FLUSH ") ||
@@ -2415,9 +2166,6 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return e.execRenameTable(s)
 	case *sqlparser.Flush:
 		// FLUSH STATUS, FLUSH TABLES, etc. - no-op
-		return &Result{}, nil
-	case *sqlparser.CommentOnly:
-		// SQL comment-only statements - no-op
 		return &Result{}, nil
 	case *sqlparser.OtherAdmin:
 		return e.execOtherAdmin(query)
@@ -5562,7 +5310,9 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				if cn := idx.Info.ConstraintName.String(); cn != "" {
 					idxName = cn
 				} else {
-					idxName = idxCols[0]
+					// MySQL auto-generates index name from the first column name
+					// without the prefix length suffix
+					idxName = stripPrefixLengthFromCol(idxCols[0])
 				}
 			}
 			idxComment := ""
@@ -6462,7 +6212,9 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						for _, col := range tbl.Def.Columns {
 							if col.Name == colNames[i] {
 								colUpper := strings.ToUpper(col.Type)
-								if strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER") {
+								isGeom := colUpper == "POINT" || colUpper == "GEOMETRY" || colUpper == "LINESTRING" ||
+									colUpper == "POLYGON" || strings.HasPrefix(colUpper, "POINT ") || strings.HasPrefix(colUpper, "GEOMETRY ")
+								if !isGeom && (strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER")) {
 									isIntCol = true
 									isUnsigned = strings.Contains(colUpper, "UNSIGNED")
 								}
@@ -6673,12 +6425,16 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				} else if col.Default != nil {
 					defVal := *col.Default
 					defUpper := strings.ToUpper(defVal)
-					// Evaluate dynamic defaults
-					if defUpper == "CURRENT_TIMESTAMP" || defUpper == "CURRENT_TIMESTAMP()" ||
+					// DEFAULT NULL should store actual nil, not the string "null"
+					if defUpper == "NULL" {
+						fullRow[col.Name] = nil
+					} else if defUpper == "CURRENT_TIMESTAMP" || defUpper == "CURRENT_TIMESTAMP()" ||
 						defUpper == "NOW()" {
 						defVal = e.nowTime().Format("2006-01-02 15:04:05")
+						fullRow[col.Name] = defVal
+					} else {
+						fullRow[col.Name] = defVal
 					}
-					fullRow[col.Name] = defVal
 				} else if !col.Nullable {
 					// NOT NULL columns without default get the type's zero value
 					fullRow[col.Name] = implicitZeroValue(col.Type)
@@ -6758,7 +6514,12 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				rv, exists := row[col.Name]
 				if exists && rv != nil {
 					colUpper := strings.ToUpper(col.Type)
-					isIntType := strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER")
+					// Geometry types should not be treated as numeric
+					isGeomType := colUpper == "POINT" || colUpper == "GEOMETRY" || colUpper == "LINESTRING" ||
+						colUpper == "POLYGON" || colUpper == "MULTIPOINT" || colUpper == "MULTILINESTRING" ||
+						colUpper == "MULTIPOLYGON" || colUpper == "GEOMETRYCOLLECTION" ||
+						strings.HasPrefix(colUpper, "POINT ") || strings.HasPrefix(colUpper, "GEOMETRY ")
+					isIntType := !isGeomType && (strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER"))
 					isDecimalType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE")
 					isNumericType := isIntType || isDecimalType
 					isUnsigned := strings.Contains(colUpper, "UNSIGNED")
@@ -6819,10 +6580,22 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						}
 						if sv, ok := checkVal.(string); ok {
 							maxLen := extractCharLength(col.Type)
-							if maxLen > 0 && len([]rune(sv)) > maxLen {
+							// For BINARY/VARBINARY, measure in bytes; for CHAR/VARCHAR, measure in characters (runes)
+							isBinaryType := strings.Contains(colUpper, "BINARY")
+							var valueLen int
+							if isBinaryType {
+								valueLen = len(sv)
+							} else {
+								valueLen = len([]rune(sv))
+							}
+							if maxLen > 0 && valueLen > maxLen {
 								if bool(stmt.Ignore) {
 									// INSERT IGNORE: truncate the value instead of error
-									row[col.Name] = string([]rune(sv)[:maxLen])
+									if isBinaryType {
+										row[col.Name] = sv[:maxLen]
+									} else {
+										row[col.Name] = string([]rune(sv)[:maxLen])
+									}
 									rv = row[col.Name]
 								} else {
 									return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row 1", col.Name))
@@ -10336,6 +10109,21 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 				tbl.Rows[i][col.Name] = val
 			}
 		}
+		// Update auto-increment counter when an AI column is updated to a larger value.
+		// In MySQL, UPDATE t SET ai_col = 105 WHERE ... will advance the AI counter
+		// so that the next auto-generated value is 106.
+		for _, col := range tbl.Def.Columns {
+			if col.AutoIncrement {
+				if newVal, ok := newRow[col.Name]; ok && newVal != nil {
+					intVal := toInt64(newVal)
+					if intVal >= tbl.AutoIncrement.Load() {
+						tbl.AutoIncrement.Store(intVal)
+					}
+				}
+				break
+			}
+		}
+
 		matchedRows++
 		if rowChanged {
 			affected++
@@ -10828,19 +10616,40 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", dbName, tableName))
 	}
 
+	// Pre-check: LOCK=NONE rejects operations that require a table copy (e.g., adding AUTO_INCREMENT columns)
+	{
+		hasLockNone := false
+		hasAutoIncrAdd := false
+		for _, opt := range stmt.AlterOptions {
+			if lo, ok := opt.(*sqlparser.LockOption); ok && lo.Type == sqlparser.NoneType {
+				hasLockNone = true
+			}
+			if ac, ok := opt.(*sqlparser.AddColumns); ok {
+				for _, col := range ac.Columns {
+					if col.Type.Options != nil && col.Type.Options.Autoincrement {
+						hasAutoIncrAdd = true
+					}
+				}
+			}
+		}
+		if hasLockNone && hasAutoIncrAdd {
+			return nil, mysqlError(1846, "0A000", "LOCK=NONE is not supported. Reason: Adding an auto-increment column requires a lock. Try LOCK=SHARED.")
+		}
+	}
+
 	// Pre-check: AUTO_INCREMENT columns must have an accompanying index
 	{
 		autoIncrCols := map[string]bool{}
 		indexedCols := map[string]bool{}
-		// Collect existing indexed columns
+		// Collect existing indexed columns (only first column of each index qualifies for AUTO_INCREMENT)
 		tableDef, _ := db.GetTable(tableName)
 		if tableDef != nil {
-			for _, pk := range tableDef.PrimaryKey {
-				indexedCols[strings.ToLower(stripPrefixLengthFromCol(pk))] = true
+			if len(tableDef.PrimaryKey) > 0 {
+				indexedCols[strings.ToLower(stripPrefixLengthFromCol(tableDef.PrimaryKey[0]))] = true
 			}
 			for _, idx := range tableDef.Indexes {
-				for _, c := range idx.Columns {
-					indexedCols[strings.ToLower(stripPrefixLengthFromCol(c))] = true
+				if len(idx.Columns) > 0 {
+					indexedCols[strings.ToLower(stripPrefixLengthFromCol(idx.Columns[0]))] = true
 				}
 			}
 		}
@@ -10851,10 +10660,21 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					if col.Type.Options != nil && col.Type.Options.Autoincrement {
 						autoIncrCols[strings.ToLower(col.Name.String())] = true
 					}
+					// Column-level PRIMARY KEY declaration also makes it indexed
+					if col.Type.Options != nil && col.Type.Options.KeyOpt == 1 {
+						indexedCols[strings.ToLower(col.Name.String())] = true
+					}
 				}
 			case *sqlparser.AddIndexDefinition:
-				for _, idxCol := range op.IndexDefinition.Columns {
-					indexedCols[strings.ToLower(idxCol.Column.String())] = true
+				// Only the first column of an index qualifies for AUTO_INCREMENT
+				if len(op.IndexDefinition.Columns) > 0 {
+					indexedCols[strings.ToLower(op.IndexDefinition.Columns[0].Column.String())] = true
+				}
+				// PRIMARY KEY makes all columns indexed for AI purposes
+				if op.IndexDefinition.Info.Type == sqlparser.IndexTypePrimary {
+					for _, idxCol := range op.IndexDefinition.Columns {
+						indexedCols[strings.ToLower(idxCol.Column.String())] = true
+					}
 				}
 			}
 		}
@@ -10865,7 +10685,23 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		}
 	}
 
+	// Process ALTER options in two passes:
+	// Pass 1: DROP operations (DropColumn, DropKey, DropPrimaryKey) must execute first
+	//         so that ADD operations with the same name don't conflict.
+	// Pass 2: Everything else.
+	dropOpts := make([]sqlparser.AlterOption, 0)
+	otherOpts := make([]sqlparser.AlterOption, 0)
 	for _, opt := range stmt.AlterOptions {
+		switch opt.(type) {
+		case *sqlparser.DropColumn, *sqlparser.DropKey:
+			dropOpts = append(dropOpts, opt)
+		default:
+			otherOpts = append(otherOpts, opt)
+		}
+	}
+	reorderedOpts := append(dropOpts, otherOpts...)
+
+	for _, opt := range reorderedOpts {
 		switch op := opt.(type) {
 
 		case *sqlparser.AddColumns:
@@ -10896,8 +10732,15 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				// Determine the default value to fill in existing rows.
 				var defVal interface{}
 				if colDef.Default != nil {
-					// Parse the default string as a literal if possible.
-					defVal = *colDef.Default
+					defStr := *colDef.Default
+					if strings.EqualFold(defStr, "NULL") {
+						defVal = nil
+					} else {
+						defVal = defStr
+					}
+				} else if !colDef.Nullable && !colDef.AutoIncrement {
+					// NOT NULL columns without explicit DEFAULT get type-appropriate zero value
+					defVal = implicitZeroValue(colDef.Type)
 				}
 				tbl.AddColumn(colDef.Name, defVal)
 			}
@@ -11029,7 +10872,9 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				if cn := op.IndexDefinition.Info.ConstraintName.String(); cn != "" {
 					idxName = cn
 				} else if len(idxCols) > 0 {
-					idxName = idxCols[0]
+					// MySQL auto-generates index name from the first column name
+					// without the prefix length suffix, e.g., "d" not "d(10)"
+					idxName = stripPrefixLengthFromCol(idxCols[0])
 				}
 			}
 			// Check for USING method and COMMENT
@@ -12154,7 +11999,7 @@ func mysqlDisplayType(colType string) string {
 		return "int(11)" + suffix
 	case "BIGINT":
 		if isUnsigned {
-			return "bigint(20)" + suffix
+			return "bigint(21)" + suffix
 		}
 		return "bigint(20)" + suffix
 	case "FLOAT":
@@ -12493,7 +12338,15 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			}
 			n, err := strconv.ParseInt(s, 16, 64)
 			if err != nil {
-				return v.Val, nil
+				// Overflow: decode as binary bytes (for BINARY/VARBINARY columns)
+				if len(s)%2 != 0 {
+					s = "0" + s
+				}
+				bs, hexErr := hex.DecodeString(s)
+				if hexErr != nil {
+					return v.Val, nil
+				}
+				return string(bs), nil
 			}
 			return n, nil
 		case sqlparser.BitNum:
@@ -13243,325 +13096,6 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 		// Return raw bytes as the weight string
 		return s, nil
-	case *sqlparser.LockingFunc:
-		// Advisory lock functions: GET_LOCK, RELEASE_LOCK, IS_FREE_LOCK, IS_USED_LOCK, RELEASE_ALL_LOCKS
-		switch v.Type {
-		case sqlparser.GetLock:
-			return int64(1), nil // always succeeds
-		case sqlparser.ReleaseLock:
-			return int64(1), nil // always succeeds
-		case sqlparser.IsFreeLock:
-			return int64(1), nil // always free
-		case sqlparser.IsUsedLock:
-			return nil, nil // not used by anyone
-		case sqlparser.ReleaseAllLocks:
-			return int64(0), nil // released 0 locks
-		}
-		return int64(1), nil
-	case *sqlparser.PointExpr:
-		// POINT(x, y) — return a stub geometry string
-		xVal, err := e.evalExpr(v.XCordinate)
-		if err != nil {
-			return nil, err
-		}
-		yVal, err := e.evalExpr(v.YCordinate)
-		if err != nil {
-			return nil, err
-		}
-		return fmt.Sprintf("POINT(%v %v)", xVal, yVal), nil
-	case *sqlparser.CountStar:
-		// COUNT(*) used in scalar context outside of aggregation: return display name
-		displayName := "count(*)"
-		if e.correlatedRow != nil {
-			if val, ok := e.correlatedRow[displayName]; ok {
-				return val, nil
-			}
-		}
-		return int64(0), nil
-	case *sqlparser.AndExpr:
-		// Boolean AND in expression context (e.g., SELECT NULL AND 1)
-		leftVal, err := e.evalExpr(v.Left)
-		if err != nil {
-			return nil, err
-		}
-		rightVal, err := e.evalExpr(v.Right)
-		if err != nil {
-			return nil, err
-		}
-		leftNull := leftVal == nil
-		rightNull := rightVal == nil
-		leftTrue := !leftNull && toBool(leftVal)
-		rightTrue := !rightNull && toBool(rightVal)
-		leftFalse := !leftNull && !leftTrue
-		rightFalse := !rightNull && !rightTrue
-		if leftFalse || rightFalse {
-			return int64(0), nil
-		}
-		if leftNull || rightNull {
-			return nil, nil
-		}
-		if leftTrue && rightTrue {
-			return int64(1), nil
-		}
-		return int64(0), nil
-	case *sqlparser.OrExpr:
-		// Boolean OR in expression context (e.g., SELECT 2 OR 3)
-		leftVal, err := e.evalExpr(v.Left)
-		if err != nil {
-			return nil, err
-		}
-		rightVal, err := e.evalExpr(v.Right)
-		if err != nil {
-			return nil, err
-		}
-		leftNull := leftVal == nil
-		rightNull := rightVal == nil
-		leftTrue := !leftNull && toBool(leftVal)
-		rightTrue := !rightNull && toBool(rightVal)
-		if leftTrue || rightTrue {
-			return int64(1), nil
-		}
-		if leftNull || rightNull {
-			return nil, nil
-		}
-		return int64(0), nil
-	case *sqlparser.XorExpr:
-		// Boolean XOR in expression context
-		leftVal, err := e.evalExpr(v.Left)
-		if err != nil {
-			return nil, err
-		}
-		rightVal, err := e.evalExpr(v.Right)
-		if err != nil {
-			return nil, err
-		}
-		if leftVal == nil || rightVal == nil {
-			return nil, nil
-		}
-		l := toBool(leftVal)
-		r := toBool(rightVal)
-		if l != r {
-			return int64(1), nil
-		}
-		return int64(0), nil
-	case *sqlparser.ExtractFuncExpr:
-		// EXTRACT(unit FROM expr)
-		val, err := e.evalExpr(v.Expr)
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		return evalExtractFunc(toString(val), v.IntervalType)
-	case *sqlparser.RegexpLikeExpr:
-		// REGEXP_LIKE(expr, pat [, match_type])
-		exprVal, err := e.evalExpr(v.Expr)
-		if err != nil {
-			return nil, err
-		}
-		patVal, err := e.evalExpr(v.Pattern)
-		if err != nil {
-			return nil, err
-		}
-		if exprVal == nil || patVal == nil {
-			return nil, nil
-		}
-		re, err := regexp.Compile("(?i)" + toString(patVal))
-		if err != nil {
-			return int64(0), nil
-		}
-		if re.MatchString(toString(exprVal)) {
-			return int64(1), nil
-		}
-		return int64(0), nil
-	case *sqlparser.RegexpInstrExpr:
-		// REGEXP_INSTR(expr, pat) — return position of match (1-based) or 0
-		exprVal, err := e.evalExpr(v.Expr)
-		if err != nil {
-			return nil, err
-		}
-		patVal, err := e.evalExpr(v.Pattern)
-		if err != nil {
-			return nil, err
-		}
-		if exprVal == nil || patVal == nil {
-			return nil, nil
-		}
-		re, err := regexp.Compile("(?i)" + toString(patVal))
-		if err != nil {
-			return int64(0), nil
-		}
-		loc := re.FindStringIndex(toString(exprVal))
-		if loc == nil {
-			return int64(0), nil
-		}
-		return int64(loc[0] + 1), nil
-	case *sqlparser.MatchExpr:
-		// MATCH(col) AGAINST('text') — stub: always return 0 (no match)
-		return float64(0), nil
-	case *sqlparser.ExtractValueExpr:
-		// ExtractValue(xml, xpath) — stub: return empty string
-		return "", nil
-	case *sqlparser.IntervalFuncExpr:
-		// INTERVAL(N, N1, N2, ...) — returns index of interval
-		if len(v.Exprs) < 1 {
-			return int64(-1), nil
-		}
-		nVal, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if nVal == nil {
-			return int64(-1), nil
-		}
-		n := toFloat(nVal)
-		result := int64(0)
-		for i := 1; i < len(v.Exprs); i++ {
-			val, err := e.evalExpr(v.Exprs[i])
-			if err != nil {
-				return nil, err
-			}
-			if val == nil {
-				continue
-			}
-			if n < toFloat(val) {
-				return result, nil
-			}
-			result = int64(i)
-		}
-		return result, nil
-	case *sqlparser.Avg:
-		// AVG() in expression context
-		displayName := aggregateDisplayName(expr)
-		if e.correlatedRow != nil {
-			if val, ok := e.correlatedRow[displayName]; ok {
-				return val, nil
-			}
-		}
-		return nil, nil
-	case *sqlparser.Max:
-		// MAX() in expression context
-		displayName := aggregateDisplayName(expr)
-		if e.correlatedRow != nil {
-			if val, ok := e.correlatedRow[displayName]; ok {
-				return val, nil
-			}
-		}
-		return nil, nil
-	case *sqlparser.Min:
-		// MIN() in expression context
-		displayName := aggregateDisplayName(expr)
-		if e.correlatedRow != nil {
-			if val, ok := e.correlatedRow[displayName]; ok {
-				return val, nil
-			}
-		}
-		return nil, nil
-	case *sqlparser.Sum:
-		// SUM() in expression context
-		displayName := aggregateDisplayName(expr)
-		if e.correlatedRow != nil {
-			if val, ok := e.correlatedRow[displayName]; ok {
-				return val, nil
-			}
-		}
-		return nil, nil
-	case *sqlparser.Count:
-		// COUNT() in expression context
-		displayName := aggregateDisplayName(expr)
-		if e.correlatedRow != nil {
-			if val, ok := e.correlatedRow[displayName]; ok {
-				return val, nil
-			}
-		}
-		return int64(0), nil
-	case *sqlparser.Std:
-		// STD/STDDEV in expression context
-		displayName := aggregateDisplayName(expr)
-		if e.correlatedRow != nil {
-			if val, ok := e.correlatedRow[displayName]; ok {
-				return val, nil
-			}
-		}
-		return nil, nil
-	case *sqlparser.GroupConcatExpr:
-		// GROUP_CONCAT in expression context
-		displayName := aggregateDisplayName(expr)
-		if e.correlatedRow != nil {
-			if val, ok := e.correlatedRow[displayName]; ok {
-				return val, nil
-			}
-		}
-		return nil, nil
-	case *sqlparser.UpdateXMLExpr:
-		// UpdateXML(xml, xpath, new_value) — stub: return original XML
-		val, err := e.evalExpr(v.Target)
-		if err != nil {
-			return nil, err
-		}
-		return val, nil
-	case *sqlparser.BetweenExpr:
-		// expr BETWEEN low AND high
-		val, err := e.evalExpr(v.Left)
-		if err != nil {
-			return nil, err
-		}
-		lo, err := e.evalExpr(v.From)
-		if err != nil {
-			return nil, err
-		}
-		hi, err := e.evalExpr(v.To)
-		if err != nil {
-			return nil, err
-		}
-		if val == nil || lo == nil || hi == nil {
-			return nil, nil
-		}
-		geLow, _ := compareValues(val, lo, sqlparser.GreaterEqualOp)
-		leHigh, _ := compareValues(val, hi, sqlparser.LessEqualOp)
-		result := geLow && leHigh
-		if v.IsBetween {
-			if result {
-				return int64(1), nil
-			}
-			return int64(0), nil
-		}
-		// NOT BETWEEN
-		if !result {
-			return int64(1), nil
-		}
-		return int64(0), nil
-	case *sqlparser.Variance:
-		// VARIANCE/VAR_POP in expression context
-		displayName := aggregateDisplayName(expr)
-		if e.correlatedRow != nil {
-			if val, ok := e.correlatedRow[displayName]; ok {
-				return val, nil
-			}
-		}
-		return nil, nil
-	case *sqlparser.VarSamp:
-		// VAR_SAMP in expression context
-		displayName := aggregateDisplayName(expr)
-		if e.correlatedRow != nil {
-			if val, ok := e.correlatedRow[displayName]; ok {
-				return val, nil
-			}
-		}
-		return nil, nil
-	case *sqlparser.LagLeadExpr:
-		// LAG/LEAD window functions — stub: return NULL
-		return nil, nil
-	case *sqlparser.NTHValueExpr:
-		// NTH_VALUE window function — stub: return NULL
-		return nil, nil
-	case *sqlparser.FirstOrLastValueExpr:
-		// FIRST_VALUE/LAST_VALUE window function — stub: return NULL
-		return nil, nil
-	case *sqlparser.ArgumentLessWindowExpr:
-		// ROW_NUMBER/RANK/DENSE_RANK/etc window functions — stub: return 1
-		return int64(1), nil
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
 }
@@ -15289,979 +14823,6 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, nil
 		}
 		return soundex(toString(val)), nil
-	case "bit_count":
-		if len(v.Exprs) < 1 {
-			return nil, fmt.Errorf("BIT_COUNT requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		n := toInt64(val)
-		count := int64(0)
-		// Count bits in absolute value for negative numbers
-		un := uint64(n)
-		for un != 0 {
-			count += int64(un & 1)
-			un >>= 1
-		}
-		return count, nil
-	case "field":
-		// FIELD(str, str1, str2, ...) — returns index of str in remaining args (1-based), or 0
-		if len(v.Exprs) < 2 {
-			return int64(0), nil
-		}
-		target, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if target == nil {
-			return int64(0), nil
-		}
-		targetStr := toString(target)
-		for i := 1; i < len(v.Exprs); i++ {
-			val, err := e.evalExpr(v.Exprs[i])
-			if err != nil {
-				return nil, err
-			}
-			if val != nil && toString(val) == targetStr {
-				return int64(i), nil
-			}
-		}
-		return int64(0), nil
-	case "find_in_set":
-		// FIND_IN_SET(str, strlist) — returns position of str in comma-delimited strlist
-		if len(v.Exprs) < 2 {
-			return int64(0), nil
-		}
-		strVal, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		listVal, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, err
-		}
-		if strVal == nil || listVal == nil {
-			return nil, nil
-		}
-		needle := toString(strVal)
-		parts := strings.Split(toString(listVal), ",")
-		for i, p := range parts {
-			if p == needle {
-				return int64(i + 1), nil
-			}
-		}
-		return int64(0), nil
-	case "is_ipv4":
-		if len(v.Exprs) < 1 {
-			return int64(0), nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return int64(0), nil
-		}
-		s := toString(val)
-		parts := strings.Split(s, ".")
-		if len(parts) != 4 {
-			return int64(0), nil
-		}
-		for _, p := range parts {
-			n, err := strconv.Atoi(p)
-			if err != nil || n < 0 || n > 255 {
-				return int64(0), nil
-			}
-		}
-		return int64(1), nil
-	case "is_ipv6":
-		if len(v.Exprs) < 1 {
-			return int64(0), nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return int64(0), nil
-		}
-		s := toString(val)
-		if strings.Contains(s, ":") && !strings.Contains(s, " ") {
-			return int64(1), nil
-		}
-		return int64(0), nil
-	case "sign":
-		if len(v.Exprs) < 1 {
-			return nil, fmt.Errorf("SIGN requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		f := toFloat(val)
-		if f > 0 {
-			return int64(1), nil
-		} else if f < 0 {
-			return int64(-1), nil
-		}
-		return int64(0), nil
-	case "sqrt":
-		if len(v.Exprs) < 1 {
-			return nil, fmt.Errorf("SQRT requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		f := toFloat(val)
-		if f < 0 {
-			return nil, nil
-		}
-		return math.Sqrt(f), nil
-	case "to_base64":
-		if len(v.Exprs) < 1 {
-			return nil, fmt.Errorf("TO_BASE64 requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		import_b64 := []byte(toString(val))
-		encoded := make([]byte, ((len(import_b64)+2)/3)*4)
-		b64Encode(encoded, import_b64)
-		return string(encoded[:((len(import_b64)+2)/3)*4]), nil
-	case "from_base64":
-		if len(v.Exprs) < 1 {
-			return nil, fmt.Errorf("FROM_BASE64 requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		decoded, err := b64Decode(toString(val))
-		if err != nil {
-			return nil, nil
-		}
-		return string(decoded), nil
-	case "time_to_sec":
-		if len(v.Exprs) < 1 {
-			return nil, fmt.Errorf("TIME_TO_SEC requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		s := toString(val)
-		// Parse HH:MM:SS or -HH:MM:SS
-		neg := false
-		if strings.HasPrefix(s, "-") {
-			neg = true
-			s = s[1:]
-		}
-		// Also handle date-time by extracting time portion
-		if idx := strings.Index(s, " "); idx >= 0 {
-			s = s[idx+1:]
-		}
-		parts := strings.Split(s, ":")
-		if len(parts) != 3 {
-			return int64(0), nil
-		}
-		h, _ := strconv.Atoi(parts[0])
-		m, _ := strconv.Atoi(parts[1])
-		sec, _ := strconv.Atoi(parts[2])
-		total := int64(h*3600 + m*60 + sec)
-		if neg {
-			total = -total
-		}
-		return total, nil
-	case "substring_index":
-		if len(v.Exprs) < 3 {
-			return nil, fmt.Errorf("SUBSTRING_INDEX requires 3 arguments")
-		}
-		strVal, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if strVal == nil {
-			return nil, nil
-		}
-		delimVal, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, err
-		}
-		countVal, err := e.evalExpr(v.Exprs[2])
-		if err != nil {
-			return nil, err
-		}
-		s := toString(strVal)
-		delim := toString(delimVal)
-		count := int(toInt64(countVal))
-		if delim == "" {
-			return s, nil
-		}
-		parts := strings.Split(s, delim)
-		if count > 0 {
-			if count >= len(parts) {
-				return s, nil
-			}
-			return strings.Join(parts[:count], delim), nil
-		} else {
-			count = -count
-			if count >= len(parts) {
-				return s, nil
-			}
-			return strings.Join(parts[len(parts)-count:], delim), nil
-		}
-	case "format":
-		// FORMAT(X, D [, locale]) — format number with commas
-		if len(v.Exprs) < 2 {
-			return nil, fmt.Errorf("FORMAT requires at least 2 arguments")
-		}
-		xVal, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if xVal == nil {
-			return nil, nil
-		}
-		dVal, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, err
-		}
-		x := toFloat(xVal)
-		d := int(toInt64(dVal))
-		if d < 0 {
-			d = 0
-		}
-		formatted := fmt.Sprintf("%.*f", d, x)
-		// Add thousand separators
-		parts := strings.SplitN(formatted, ".", 2)
-		intPart := parts[0]
-		neg := ""
-		if strings.HasPrefix(intPart, "-") {
-			neg = "-"
-			intPart = intPart[1:]
-		}
-		// Add commas
-		var result strings.Builder
-		for i, c := range intPart {
-			if i > 0 && (len(intPart)-i)%3 == 0 {
-				result.WriteByte(',')
-			}
-			result.WriteRune(c)
-		}
-		out := neg + result.String()
-		if len(parts) > 1 {
-			out += "." + parts[1]
-		}
-		return out, nil
-	case "period_add":
-		// PERIOD_ADD(P, N) — add N months to period P (YYMM or YYYYMM)
-		if len(v.Exprs) < 2 {
-			return nil, fmt.Errorf("PERIOD_ADD requires 2 arguments")
-		}
-		pVal, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		nVal, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, err
-		}
-		if pVal == nil || nVal == nil {
-			return nil, nil
-		}
-		p := toInt64(pVal)
-		n := toInt64(nVal)
-		var year, month int64
-		if p > 9999 {
-			year = p / 100
-			month = p % 100
-		} else {
-			year = p/100 + 1900
-			if p/100 < 70 {
-				year += 100
-			}
-			month = p % 100
-		}
-		month += n
-		for month > 12 {
-			year++
-			month -= 12
-		}
-		for month < 1 {
-			year--
-			month += 12
-		}
-		return year*100 + month, nil
-	case "sleep":
-		// SLEEP(N) — we don't actually sleep, just return 0
-		return int64(0), nil
-	case "current_role":
-		// CURRENT_ROLE() — return NONE (no roles)
-		return "NONE", nil
-	case "uuid_to_bin":
-		// UUID_TO_BIN(uuid) — convert UUID string to binary
-		if len(v.Exprs) < 1 {
-			return nil, fmt.Errorf("UUID_TO_BIN requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		s := strings.ReplaceAll(toString(val), "-", "")
-		bs, err := hex.DecodeString(s)
-		if err != nil {
-			return nil, nil
-		}
-		return string(bs), nil
-	case "bin_to_uuid":
-		// BIN_TO_UUID(bin) — convert binary to UUID string
-		if len(v.Exprs) < 1 {
-			return nil, fmt.Errorf("BIN_TO_UUID requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		bs := []byte(toString(val))
-		if len(bs) != 16 {
-			return nil, nil
-		}
-		h := hex.EncodeToString(bs)
-		return fmt.Sprintf("%s-%s-%s-%s-%s", h[0:8], h[8:12], h[12:16], h[16:20], h[20:32]), nil
-	case "uncompress":
-		// UNCOMPRESS(data) — stub: return NULL (no zlib support)
-		return nil, nil
-	case "compress":
-		// COMPRESS(data) — stub: return NULL
-		return nil, nil
-	case "aes_encrypt", "aes_decrypt":
-		// AES functions — stub: return NULL
-		return nil, nil
-	case "statement_digest", "statement_digest_text":
-		// Statement digest functions — stub: return hash of input
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		h := md5.Sum([]byte(toString(val)))
-		return hex.EncodeToString(h[:]), nil
-	case "master_pos_wait", "source_pos_wait":
-		// Replication wait functions — stub: return 0 (success)
-		return int64(0), nil
-	case "inet_ntoa":
-		// INET_NTOA(n) — convert integer to IP address
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		n := toInt64(val)
-		return fmt.Sprintf("%d.%d.%d.%d", (n>>24)&0xFF, (n>>16)&0xFF, (n>>8)&0xFF, n&0xFF), nil
-	case "space":
-		// SPACE(N) — return a string of N spaces
-		if len(v.Exprs) < 1 {
-			return nil, fmt.Errorf("SPACE requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		n := int(toInt64(val))
-		if n < 0 {
-			n = 0
-		}
-		if n > 1048576 {
-			n = 1048576
-		}
-		return strings.Repeat(" ", n), nil
-	case "elt":
-		// ELT(N, str1, str2, ...) — return Nth string
-		if len(v.Exprs) < 2 {
-			return nil, nil
-		}
-		idxVal, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if idxVal == nil {
-			return nil, nil
-		}
-		idx := int(toInt64(idxVal))
-		if idx < 1 || idx >= len(v.Exprs) {
-			return nil, nil
-		}
-		return e.evalExpr(v.Exprs[idx])
-	case "exp":
-		// EXP(X) — return e^X
-		if len(v.Exprs) < 1 {
-			return nil, fmt.Errorf("EXP requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		return math.Exp(toFloat(val)), nil
-	case "user", "session_user", "system_user":
-		return "root@localhost", nil
-	case "coercibility":
-		// COERCIBILITY(expr) — return coercibility value
-		return int64(2), nil // 2 = implicit coercibility
-	case "microsecond":
-		// MICROSECOND(expr) — extract microsecond from time/datetime
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		s := toString(val)
-		// Look for .microseconds part
-		if dot := strings.LastIndex(s, "."); dot >= 0 {
-			frac := s[dot+1:]
-			for len(frac) < 6 {
-				frac += "0"
-			}
-			if len(frac) > 6 {
-				frac = frac[:6]
-			}
-			n, _ := strconv.ParseInt(frac, 10, 64)
-			return n, nil
-		}
-		return int64(0), nil
-	case "period_diff":
-		// PERIOD_DIFF(P1, P2) — return number of months between periods
-		if len(v.Exprs) < 2 {
-			return nil, fmt.Errorf("PERIOD_DIFF requires 2 arguments")
-		}
-		p1Val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		p2Val, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, err
-		}
-		if p1Val == nil || p2Val == nil {
-			return nil, nil
-		}
-		p1 := toInt64(p1Val)
-		p2 := toInt64(p2Val)
-		// Convert to year+month
-		y1, m1 := periodToYearMonth(p1)
-		y2, m2 := periodToYearMonth(p2)
-		return (y1*12 + m1) - (y2*12 + m2), nil
-	case "is_uuid":
-		// IS_UUID(str) — check if string is a valid UUID
-		if len(v.Exprs) < 1 {
-			return int64(0), nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		s := toString(val)
-		s = strings.ReplaceAll(s, "-", "")
-		if len(s) == 32 {
-			for _, c := range s {
-				if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-					return int64(0), nil
-				}
-			}
-			return int64(1), nil
-		}
-		return int64(0), nil
-	case "uuid":
-		// UUID() — generate a UUID
-		return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-			rand.Int31(), rand.Int31n(0xFFFF), rand.Int31n(0xFFFF),
-			rand.Int31n(0xFFFF), rand.Int63n(0xFFFFFFFFFFFF)), nil
-	case "random_bytes":
-		// RANDOM_BYTES(len) — return random bytes
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		n := int(toInt64(val))
-		if n < 1 || n > 1024 {
-			return nil, nil
-		}
-		bs := make([]byte, n)
-		rand.Read(bs)
-		return string(bs), nil
-	case "inet6_aton":
-		// INET6_ATON(addr) — stub: return binary representation
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		// Simple stub: return the string as-is
-		return toString(val), nil
-	case "uncompressed_length":
-		// UNCOMPRESSED_LENGTH(data) — stub: return 0
-		return int64(0), nil
-	case "roles_graphml":
-		// ROLES_GRAPHML() — return empty roles graph
-		return "<?xml version=\"1.0\" encoding=\"UTF-8\"?><graphml />", nil
-	case "make_set":
-		// MAKE_SET(bits, str1, str2, ...) — return a set of strings selected by bits
-		if len(v.Exprs) < 2 {
-			return "", nil
-		}
-		bitsVal, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if bitsVal == nil {
-			return nil, nil
-		}
-		bits := uint64(toInt64(bitsVal))
-		var parts []string
-		for i := 1; i < len(v.Exprs); i++ {
-			if bits&(1<<uint(i-1)) != 0 {
-				val, err := e.evalExpr(v.Exprs[i])
-				if err != nil {
-					return nil, err
-				}
-				if val != nil {
-					parts = append(parts, toString(val))
-				}
-			}
-		}
-		return strings.Join(parts, ","), nil
-	case "export_set":
-		// EXPORT_SET(bits, on, off [, separator [, number_of_bits]])
-		if len(v.Exprs) < 3 {
-			return nil, nil
-		}
-		bitsVal, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		onVal, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, err
-		}
-		offVal, err := e.evalExpr(v.Exprs[2])
-		if err != nil {
-			return nil, err
-		}
-		if bitsVal == nil || onVal == nil || offVal == nil {
-			return nil, nil
-		}
-		bits := uint64(toInt64(bitsVal))
-		on := toString(onVal)
-		off := toString(offVal)
-		sep := ","
-		numBits := 64
-		if len(v.Exprs) >= 4 {
-			sepVal, err := e.evalExpr(v.Exprs[3])
-			if err == nil && sepVal != nil {
-				sep = toString(sepVal)
-			}
-		}
-		if len(v.Exprs) >= 5 {
-			nbVal, err := e.evalExpr(v.Exprs[4])
-			if err == nil && nbVal != nil {
-				numBits = int(toInt64(nbVal))
-			}
-		}
-		if numBits > 64 {
-			numBits = 64
-		}
-		var parts []string
-		for i := 0; i < numBits; i++ {
-			if bits&(1<<uint(i)) != 0 {
-				parts = append(parts, on)
-			} else {
-				parts = append(parts, off)
-			}
-		}
-		return strings.Join(parts, sep), nil
-	case "convert_tz":
-		// CONVERT_TZ(dt, from_tz, to_tz) — stub: return dt unchanged
-		if len(v.Exprs) < 3 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		return val, nil
-	case "log":
-		// LOG(X) or LOG(B, X) — natural log or log base B
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		if len(v.Exprs) == 1 {
-			val, err := e.evalExpr(v.Exprs[0])
-			if err != nil {
-				return nil, err
-			}
-			if val == nil {
-				return nil, nil
-			}
-			f := toFloat(val)
-			if f <= 0 {
-				return nil, nil
-			}
-			return math.Log(f), nil
-		}
-		// LOG(B, X)
-		bVal, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		xVal, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, err
-		}
-		if bVal == nil || xVal == nil {
-			return nil, nil
-		}
-		b := toFloat(bVal)
-		x := toFloat(xVal)
-		if b <= 0 || b == 1 || x <= 0 {
-			return nil, nil
-		}
-		return math.Log(x) / math.Log(b), nil
-	case "ln":
-		// LN(X) — natural log (same as LOG(X))
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		f := toFloat(val)
-		if f <= 0 {
-			return nil, nil
-		}
-		return math.Log(f), nil
-	case "log2":
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		f := toFloat(val)
-		if f <= 0 {
-			return nil, nil
-		}
-		return math.Log2(f), nil
-	case "log10":
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		f := toFloat(val)
-		if f <= 0 {
-			return nil, nil
-		}
-		return math.Log10(f), nil
-	case "sin":
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		return math.Sin(toFloat(val)), nil
-	case "cos":
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		return math.Cos(toFloat(val)), nil
-	case "tan":
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		return math.Tan(toFloat(val)), nil
-	case "asin":
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		f := toFloat(val)
-		if f < -1 || f > 1 {
-			return nil, nil
-		}
-		return math.Asin(f), nil
-	case "acos":
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		f := toFloat(val)
-		if f < -1 || f > 1 {
-			return nil, nil
-		}
-		return math.Acos(f), nil
-	case "atan", "atan2":
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		if len(v.Exprs) >= 2 {
-			val2, err := e.evalExpr(v.Exprs[1])
-			if err != nil {
-				return nil, err
-			}
-			if val2 == nil {
-				return nil, nil
-			}
-			return math.Atan2(toFloat(val), toFloat(val2)), nil
-		}
-		return math.Atan(toFloat(val)), nil
-	case "cot":
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		f := toFloat(val)
-		if f == 0 {
-			return nil, nil
-		}
-		return 1.0 / math.Tan(f), nil
-	case "degrees":
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		return toFloat(val) * 180.0 / math.Pi, nil
-	case "radians":
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		return toFloat(val) * math.Pi / 180.0, nil
-	case "benchmark":
-		// BENCHMARK(count, expr) — execute expr count times, return 0
-		return int64(0), nil
-	case "pow", "power":
-		// POW(X, Y) — return X raised to power Y
-		if len(v.Exprs) < 2 {
-			return nil, nil
-		}
-		xVal, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		yVal, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, err
-		}
-		if xVal == nil || yVal == nil {
-			return nil, nil
-		}
-		return math.Pow(toFloat(xVal), toFloat(yVal)), nil
-	case "inet6_ntoa":
-		// INET6_NTOA(addr) — stub: return string representation
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		return toString(val), nil
-	case "time_format":
-		// TIME_FORMAT(time, format) — format time value
-		if len(v.Exprs) < 2 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		fmtVal, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil || fmtVal == nil {
-			return nil, nil
-		}
-		return mysqlTimeFormat(toString(val), toString(fmtVal)), nil
-	case "st_equals":
-		// ST_Equals(g1, g2) — stub geometry comparison
-		if len(v.Exprs) < 2 {
-			return int64(0), nil
-		}
-		g1, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		g2, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, err
-		}
-		if g1 == nil || g2 == nil {
-			return nil, nil
-		}
-		if toString(g1) == toString(g2) {
-			return int64(1), nil
-		}
-		return int64(0), nil
-	case "inet_aton":
-		// INET_ATON(addr) — convert IP address to integer
-		if len(v.Exprs) < 1 {
-			return nil, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return nil, nil
-		}
-		parts := strings.Split(toString(val), ".")
-		if len(parts) != 4 {
-			return nil, nil
-		}
-		var result int64
-		for _, p := range parts {
-			n, err := strconv.Atoi(p)
-			if err != nil {
-				return nil, nil
-			}
-			result = result*256 + int64(n)
-		}
-		return result, nil
 	}
 	// Try user-defined function from catalog
 	if result, err := e.callUserDefinedFunction(name, v.Exprs, nil); err == nil {
@@ -16894,6 +15455,11 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 					return val, nil
 				}
 				if val, ok := e.correlatedRow[fullQualified]; ok {
+					return val, nil
+				}
+				// Row keys are typically unqualified (just column name),
+				// so also try lookup by bare column name in correlatedRow.
+				if val, ok := e.correlatedRow[colName]; ok {
 					return val, nil
 				}
 			}
@@ -19021,22 +17587,6 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 		value := toString(left)
 		re := likeToRegexp(pattern)
 		return !re.MatchString(value), nil
-	case sqlparser.RegexpOp:
-		pattern := toString(right)
-		value := toString(left)
-		re, err := regexp.Compile("(?i)" + pattern)
-		if err != nil {
-			return false, nil
-		}
-		return re.MatchString(value), nil
-	case sqlparser.NotRegexpOp:
-		pattern := toString(right)
-		value := toString(left)
-		re, err := regexp.Compile("(?i)" + pattern)
-		if err != nil {
-			return true, nil
-		}
-		return !re.MatchString(value), nil
 	}
 	return false, fmt.Errorf("unsupported comparison operator: %s", op.ToString())
 }
@@ -19092,189 +17642,6 @@ func soundex(s string) string {
 		result = append(result, '0')
 	}
 	return string(result)
-}
-
-// mysqlTimeFormat formats a time string according to MySQL TIME_FORMAT specifiers.
-func mysqlTimeFormat(timeStr, format string) string {
-	// Parse time
-	neg := false
-	s := timeStr
-	if strings.HasPrefix(s, "-") {
-		neg = true
-		s = s[1:]
-	}
-	// Extract time portion if datetime
-	if idx := strings.Index(s, " "); idx >= 0 {
-		s = s[idx+1:]
-	}
-	parts := strings.Split(s, ":")
-	h, m, sec := 0, 0, 0
-	if len(parts) >= 1 {
-		h, _ = strconv.Atoi(parts[0])
-	}
-	if len(parts) >= 2 {
-		m, _ = strconv.Atoi(parts[1])
-	}
-	if len(parts) >= 3 {
-		sec, _ = strconv.Atoi(strings.Split(parts[2], ".")[0])
-	}
-	if neg {
-		h = -h
-	}
-
-	result := format
-	result = strings.ReplaceAll(result, "%H", fmt.Sprintf("%02d", h))
-	result = strings.ReplaceAll(result, "%k", fmt.Sprintf("%d", h))
-	h12 := h % 12
-	if h12 == 0 {
-		h12 = 12
-	}
-	result = strings.ReplaceAll(result, "%h", fmt.Sprintf("%02d", h12))
-	result = strings.ReplaceAll(result, "%I", fmt.Sprintf("%02d", h12))
-	result = strings.ReplaceAll(result, "%l", fmt.Sprintf("%d", h12))
-	result = strings.ReplaceAll(result, "%i", fmt.Sprintf("%02d", m))
-	result = strings.ReplaceAll(result, "%S", fmt.Sprintf("%02d", sec))
-	result = strings.ReplaceAll(result, "%s", fmt.Sprintf("%02d", sec))
-	ampm := "AM"
-	if h >= 12 {
-		ampm = "PM"
-	}
-	result = strings.ReplaceAll(result, "%p", ampm)
-	result = strings.ReplaceAll(result, "%r", fmt.Sprintf("%02d:%02d:%02d %s", h12, m, sec, ampm))
-	result = strings.ReplaceAll(result, "%T", fmt.Sprintf("%02d:%02d:%02d", h, m, sec))
-	return result
-}
-
-// periodToYearMonth converts a MySQL period (YYMM or YYYYMM) to year and month.
-func periodToYearMonth(p int64) (int64, int64) {
-	if p == 0 {
-		return 0, 0
-	}
-	var year, month int64
-	if p > 9999 {
-		year = p / 100
-		month = p % 100
-	} else {
-		year = p/100 + 1900
-		if p/100 < 70 {
-			year += 100
-		}
-		month = p % 100
-	}
-	return year, month
-}
-
-// rewriteSoundsLike rewrites "a SOUNDS LIKE b" to "SOUNDEX(a) = SOUNDEX(b)".
-// This is done as text preprocessing because vitess doesn't parse SOUNDS LIKE.
-var soundsLikeRe = regexp.MustCompile(`(?i)\b(\w+(?:\.\w+)?)\s+SOUNDS\s+LIKE\s+(\w+(?:\.\w+)?)`)
-
-func rewriteSoundsLike(query string) string {
-	return soundsLikeRe.ReplaceAllString(query, "SOUNDEX($1) = SOUNDEX($2)")
-}
-
-// evalExtractFunc implements EXTRACT(unit FROM expr).
-func evalExtractFunc(s string, unit sqlparser.IntervalType) (interface{}, error) {
-	// Try parsing as datetime
-	var t time.Time
-	var parsed bool
-	for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02", "15:04:05"} {
-		if tt, err := time.Parse(layout, s); err == nil {
-			t = tt
-			parsed = true
-			break
-		}
-	}
-	if !parsed {
-		return nil, nil
-	}
-	switch strings.ToUpper(string(unit)) {
-	case "YEAR":
-		return int64(t.Year()), nil
-	case "MONTH":
-		return int64(t.Month()), nil
-	case "DAY":
-		return int64(t.Day()), nil
-	case "HOUR":
-		return int64(t.Hour()), nil
-	case "MINUTE":
-		return int64(t.Minute()), nil
-	case "SECOND":
-		return int64(t.Second()), nil
-	case "YEAR_MONTH":
-		return int64(t.Year()*100 + int(t.Month())), nil
-	case "DAY_HOUR":
-		return int64(t.Day()*100 + t.Hour()), nil
-	default:
-		return nil, nil
-	}
-}
-
-// b64Encode is a simple base64 encoder for TO_BASE64.
-func b64Encode(dst, src []byte) {
-	const table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	di := 0
-	for si := 0; si < len(src); si += 3 {
-		n := int(src[si]) << 16
-		remaining := len(src) - si
-		if remaining > 1 {
-			n |= int(src[si+1]) << 8
-		}
-		if remaining > 2 {
-			n |= int(src[si+2])
-		}
-		dst[di+0] = table[(n>>18)&0x3f]
-		dst[di+1] = table[(n>>12)&0x3f]
-		if remaining > 1 {
-			dst[di+2] = table[(n>>6)&0x3f]
-		} else {
-			dst[di+2] = '='
-		}
-		if remaining > 2 {
-			dst[di+3] = table[n&0x3f]
-		} else {
-			dst[di+3] = '='
-		}
-		di += 4
-	}
-}
-
-// b64Decode decodes base64.
-func b64Decode(s string) ([]byte, error) {
-	const table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	s = strings.TrimRight(s, "=")
-	s = strings.Map(func(r rune) rune {
-		if strings.ContainsRune(table+"=", r) {
-			return r
-		}
-		return -1
-	}, s)
-	var result []byte
-	for i := 0; i < len(s); i += 4 {
-		chunk := s[i:]
-		if len(chunk) > 4 {
-			chunk = chunk[:4]
-		}
-		var n uint32
-		for j := 0; j < len(chunk); j++ {
-			idx := strings.IndexByte(table, chunk[j])
-			if idx < 0 {
-				continue
-			}
-			n = (n << 6) | uint32(idx)
-		}
-		// Pad missing characters
-		for j := len(chunk); j < 4; j++ {
-			n <<= 6
-		}
-		result = append(result, byte(n>>16))
-		if len(chunk) > 2 {
-			result = append(result, byte(n>>8))
-		}
-		if len(chunk) > 3 {
-			result = append(result, byte(n))
-		}
-	}
-	return result, nil
 }
 
 // likeToRegexp converts a SQL LIKE pattern to a Go regexp.
@@ -19375,39 +17742,13 @@ func compareByCollation(a, b interface{}, collation string) int {
 	aIsStr := isStringValue(a)
 	bIsStr := isStringValue(b)
 	if aIsStr || bIsStr {
-		aStr := toString(a)
-		bStr := toString(b)
-		sa := normalizeCollationKey(aStr, collation)
-		sb := normalizeCollationKey(bStr, collation)
+		sa := normalizeCollationKey(toString(a), collation)
+		sb := normalizeCollationKey(toString(b), collation)
 		if sa < sb {
 			return -1
 		}
 		if sa > sb {
 			return 1
-		}
-		// Tie-break: for case-insensitive collations (like utf8mb4_0900_ai_ci),
-		// uppercase letters sort before lowercase in MySQL.
-		// Use native charset encoding for tie-break to match MySQL byte ordering.
-		coll := strings.ToLower(collation)
-		if strings.HasSuffix(coll, "_ci") {
-			var aTie, bTie string
-			switch coll {
-			case "sjis_japanese_ci", "cp932_japanese_ci":
-				aTie = encodeStringForCollation(aStr, "sjis")
-				bTie = encodeStringForCollation(bStr, "sjis")
-			case "ujis_japanese_ci", "eucjpms_japanese_ci":
-				aTie = encodeStringForCollation(aStr, "eucjp")
-				bTie = encodeStringForCollation(bStr, "eucjp")
-			default:
-				aTie = aStr
-				bTie = bStr
-			}
-			if aTie < bTie {
-				return -1
-			}
-			if aTie > bTie {
-				return 1
-			}
 		}
 		return 0
 	}
@@ -19726,34 +18067,6 @@ func toFloat(v interface{}) float64 {
 		return 0
 	}
 	return 0
-}
-
-// toBool converts a value to a MySQL boolean (truthy/falsy).
-// In MySQL, 0, empty string, and NULL are false; everything else is true.
-func toBool(v interface{}) bool {
-	if v == nil {
-		return false
-	}
-	switch n := v.(type) {
-	case bool:
-		return n
-	case int64:
-		return n != 0
-	case uint64:
-		return n != 0
-	case float64:
-		return n != 0
-	case string:
-		if n == "" || n == "0" {
-			return false
-		}
-		f, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
-		if err == nil {
-			return f != 0
-		}
-		return true
-	}
-	return true
 }
 
 func applyOrderBy(orderBy sqlparser.OrderBy, colNames []string, rows [][]interface{}, collation string) ([][]interface{}, error) {
@@ -23286,7 +21599,15 @@ func evalLiteralForPK(expr sqlparser.Expr) interface{} {
 			}
 			n, err := strconv.ParseInt(s, 16, 64)
 			if err != nil {
-				return nil
+				// Overflow: decode as binary bytes
+				if len(s)%2 != 0 {
+					s = "0" + s
+				}
+				bs, hexErr := hex.DecodeString(s)
+				if hexErr != nil {
+					return nil
+				}
+				return string(bs)
 			}
 			return n
 		case sqlparser.StrVal:

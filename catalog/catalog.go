@@ -568,7 +568,7 @@ func (db *Database) DropIndex(tableName, indexName string) error {
 	newIndexes := make([]IndexDef, 0, len(tbl.Indexes))
 	found := false
 	for _, idx := range tbl.Indexes {
-		if idx.Name == indexName {
+		if strings.EqualFold(idx.Name, indexName) {
 			found = true
 			continue
 		}
