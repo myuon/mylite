@@ -324,6 +324,97 @@ func (e *Executor) initSystemTables() {
 			{Name: "WORK_ESTIMATED", Type: "BIGINT"},
 		},
 	})
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "global_variables",
+		Columns: []catalog.ColumnDef{
+			{Name: "VARIABLE_NAME", Type: "VARCHAR(64)"},
+			{Name: "VARIABLE_VALUE", Type: "VARCHAR(1024)"},
+		},
+	})
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "session_variables",
+		Columns: []catalog.ColumnDef{
+			{Name: "VARIABLE_NAME", Type: "VARCHAR(64)"},
+			{Name: "VARIABLE_VALUE", Type: "VARCHAR(1024)"},
+		},
+	})
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "events_waits_history_long",
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "SOURCE", Type: "VARCHAR(64)"},
+			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "SPINS", Type: "INT UNSIGNED"},
+			{Name: "OBJECT_SCHEMA", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_NAME", Type: "VARCHAR(512)"},
+			{Name: "INDEX_NAME", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_TYPE", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+			{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "NESTING_EVENT_TYPE", Type: "VARCHAR(64)"},
+			{Name: "OPERATION", Type: "VARCHAR(32)"},
+			{Name: "NUMBER_OF_BYTES", Type: "BIGINT"},
+			{Name: "FLAGS", Type: "INT UNSIGNED"},
+		},
+	})
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "events_waits_current",
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "SOURCE", Type: "VARCHAR(64)"},
+			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "SPINS", Type: "INT UNSIGNED"},
+			{Name: "OBJECT_SCHEMA", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_NAME", Type: "VARCHAR(512)"},
+			{Name: "INDEX_NAME", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_TYPE", Type: "VARCHAR(64)"},
+			{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+			{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "NESTING_EVENT_TYPE", Type: "VARCHAR(64)"},
+			{Name: "OPERATION", Type: "VARCHAR(32)"},
+			{Name: "NUMBER_OF_BYTES", Type: "BIGINT"},
+			{Name: "FLAGS", Type: "INT UNSIGNED"},
+		},
+	})
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "events_statements_history_long",
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "SOURCE", Type: "VARCHAR(64)"},
+			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "SQL_TEXT", Type: "LONGTEXT"},
+			{Name: "DIGEST", Type: "VARCHAR(64)"},
+			{Name: "DIGEST_TEXT", Type: "LONGTEXT"},
+		},
+	})
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "events_stages_history_long",
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "SOURCE", Type: "VARCHAR(64)"},
+			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+		},
+	})
 
 	ensure("mtr", &catalog.TableDef{
 		Name:   "test_suppressions",
@@ -11333,30 +11424,9 @@ func (e *Executor) showIndexes(dbName, tableName string) (*Result, error) {
 }
 
 // showVariables handles SHOW [GLOBAL|SESSION] VARIABLES [LIKE '...']
-func (e *Executor) showVariables(upper string) (*Result, error) {
-	likePattern := ""
-	if idx := strings.Index(upper, "LIKE '"); idx >= 0 {
-		rest := upper[idx+6:]
-		if end := strings.Index(rest, "'"); end >= 0 {
-			likePattern = strings.ToLower(rest[:end])
-		}
-	}
-	if likePattern == "" {
-		if idx := strings.Index(upper, "VARIABLE_NAME"); idx >= 0 {
-			rest := upper[idx+len("VARIABLE_NAME"):]
-			if eq := strings.Index(rest, "="); eq >= 0 {
-				rest = strings.TrimSpace(rest[eq+1:])
-				if strings.HasPrefix(rest, "'") {
-					rest = rest[1:]
-					if end := strings.Index(rest, "'"); end >= 0 {
-						likePattern = strings.ToLower(rest[:end])
-					}
-				}
-			}
-		}
-	}
-
-	// Define known variables with their values
+// buildVariablesMap returns the full map of system variable name -> value,
+// including any overrides from SET GLOBAL/SESSION.
+func (e *Executor) buildVariablesMap() map[string]string {
 	vars := map[string]string{
 		"innodb_rollback_on_timeout":           "ON",
 		"innodb_file_per_table":                "ON",
@@ -11416,6 +11486,33 @@ func (e *Executor) showVariables(upper string) (*Result, error) {
 		}
 		vars[name] = val
 	}
+	return vars
+}
+
+func (e *Executor) showVariables(upper string) (*Result, error) {
+	likePattern := ""
+	if idx := strings.Index(upper, "LIKE '"); idx >= 0 {
+		rest := upper[idx+6:]
+		if end := strings.Index(rest, "'"); end >= 0 {
+			likePattern = strings.ToLower(rest[:end])
+		}
+	}
+	if likePattern == "" {
+		if idx := strings.Index(upper, "VARIABLE_NAME"); idx >= 0 {
+			rest := upper[idx+len("VARIABLE_NAME"):]
+			if eq := strings.Index(rest, "="); eq >= 0 {
+				rest = strings.TrimSpace(rest[eq+1:])
+				if strings.HasPrefix(rest, "'") {
+					rest = rest[1:]
+					if end := strings.Index(rest, "'"); end >= 0 {
+						likePattern = strings.ToLower(rest[:end])
+					}
+				}
+			}
+		}
+	}
+
+	vars := e.buildVariablesMap()
 
 	var rows [][]interface{}
 	for name, val := range vars {
@@ -12778,6 +12875,16 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		val, err := e.evalExpr(v.WktText)
 		if err != nil {
 			return nil, err
+		}
+		return toString(val), nil
+	case *sqlparser.GeomFormatExpr:
+		// ST_AsText/ST_AsWKT and similar geometry formatting wrappers.
+		val, err := e.evalExpr(v.Geom)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
 		}
 		return toString(val), nil
 	case *sqlparser.CharExpr:
@@ -17856,9 +17963,17 @@ func applyLimit(limit *sqlparser.Limit, rows [][]interface{}) ([][]interface{}, 
 // execTruncateTable handles TRUNCATE TABLE statements.
 func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, error) {
 	tableName := stmt.Table.Name.String()
-	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
+	dbName := e.CurrentDB
+	if q := stmt.Table.Qualifier.String(); q != "" {
+		dbName = q
+	}
+	// Silently succeed for performance_schema tables (they are virtual/stub).
+	if strings.ToLower(dbName) == "performance_schema" {
+		return &Result{AffectedRows: 0, IsResultSet: false}, nil
+	}
+	tbl, err := e.Storage.GetTable(dbName, tableName)
 	if err != nil {
-		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", dbName, tableName))
 	}
 	tbl.Truncate()
 	return &Result{AffectedRows: 0, IsResultSet: false}, nil

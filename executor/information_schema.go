@@ -104,7 +104,13 @@ var infoSchemaColumnOrder = map[string][]string{
 	"processlist":              {"ID", "USER", "HOST", "DB", "COMMAND", "TIME", "STATE", "INFO"},
 	"key_column_usage":         {"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "POSITION_IN_UNIQUE_CONSTRAINT", "REFERENCED_TABLE_SCHEMA", "REFERENCED_TABLE_NAME", "REFERENCED_COLUMN_NAME"},
 	"referential_constraints":  {"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "UNIQUE_CONSTRAINT_CATALOG", "UNIQUE_CONSTRAINT_SCHEMA", "UNIQUE_CONSTRAINT_NAME", "MATCH_OPTION", "UPDATE_RULE", "DELETE_RULE", "TABLE_NAME", "REFERENCED_TABLE_NAME"},
-	"innodb_temp_table_info":   {"TABLE_ID", "NAME", "N_COLS", "SPACE"},
+	"innodb_temp_table_info":          {"TABLE_ID", "NAME", "N_COLS", "SPACE"},
+	"global_variables":                {"VARIABLE_NAME", "VARIABLE_VALUE"},
+	"session_variables":               {"VARIABLE_NAME", "VARIABLE_VALUE"},
+	"events_waits_history_long":       {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SPINS", "OBJECT_SCHEMA", "OBJECT_NAME", "INDEX_NAME", "OBJECT_TYPE", "OBJECT_INSTANCE_BEGIN", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE", "OPERATION", "NUMBER_OF_BYTES", "FLAGS"},
+	"events_waits_current":            {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SPINS", "OBJECT_SCHEMA", "OBJECT_NAME", "INDEX_NAME", "OBJECT_TYPE", "OBJECT_INSTANCE_BEGIN", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE", "OPERATION", "NUMBER_OF_BYTES", "FLAGS"},
+	"events_statements_history_long":  {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SQL_TEXT", "DIGEST", "DIGEST_TEXT"},
+	"events_stages_history_long":      {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT"},
 }
 
 // isInformationSchemaTable returns (dbName, tableName, true) when the provided
@@ -127,15 +133,28 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 		return false
 	}
 	if q == "performance_schema" {
-		return t == "memory_summary_global_by_event_name"
+		switch t {
+		case "memory_summary_global_by_event_name",
+			"global_variables", "session_variables",
+			"events_waits_history_long", "events_waits_current",
+			"events_statements_history_long", "events_stages_history_long":
+			return true
+		}
+		return false
 	}
-	// No qualifier: check if current DB is information_schema
+	// No qualifier: check if current DB is information_schema or performance_schema
 	if q == "" && strings.ToLower(e.CurrentDB) == "information_schema" {
 		return e.isInformationSchemaTable("information_schema", tableName)
 	}
+	if q == "" && strings.ToLower(e.CurrentDB) == "performance_schema" {
+		return e.isInformationSchemaTable("performance_schema", tableName)
+	}
 	// Some mysql tests reference these INFORMATION_SCHEMA tables without qualifier.
 	if q == "" {
-		return e.isInformationSchemaTable("information_schema", tableName)
+		if e.isInformationSchemaTable("information_schema", tableName) {
+			return true
+		}
+		return e.isInformationSchemaTable("performance_schema", tableName)
 	}
 	return false
 }
@@ -202,6 +221,14 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = []storage.Row{{"TABLE_ID": int64(0), "NAME": "", "N_COLS": int64(0), "SPACE": int64(0)}}
 	case "memory_summary_global_by_event_name":
 		rawRows = e.perfSchemaMemorySummary()
+	case "global_variables", "session_variables":
+		rawRows = e.perfSchemaVariables()
+	case "events_waits_history_long", "events_waits_current":
+		rawRows = []storage.Row{}
+	case "events_statements_history_long":
+		rawRows = []storage.Row{}
+	case "events_stages_history_long":
+		rawRows = []storage.Row{}
 	}
 
 	result := make([]storage.Row, len(rawRows))
@@ -735,6 +762,24 @@ func (e *Executor) perfSchemaMemorySummary() []storage.Row {
 			"sum_number_of_bytes_free":     int64(1024),
 		},
 	}
+}
+
+// perfSchemaVariables returns sorted rows for performance_schema.global_variables / session_variables.
+func (e *Executor) perfSchemaVariables() []storage.Row {
+	vars := e.buildVariablesMap()
+	names := make([]string, 0, len(vars))
+	for n := range vars {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	rows := make([]storage.Row, 0, len(names))
+	for _, n := range names {
+		rows = append(rows, storage.Row{
+			"VARIABLE_NAME":  n,
+			"VARIABLE_VALUE": vars[n],
+		})
+	}
+	return rows
 }
 
 // innoDBMetricDef defines a single InnoDB metric entry for INFORMATION_SCHEMA.INNODB_METRICS.
