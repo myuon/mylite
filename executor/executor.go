@@ -1997,7 +1997,9 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			return e.explainResultForType(explainType, explainedQuery), nil
 		}
 		if strings.HasPrefix(upper, "SET ") {
-			e.handleRawSet(trimmed)
+			if err := e.handleRawSet(trimmed); err != nil {
+				return nil, err
+			}
 			return &Result{}, nil
 		}
 		// KILL [CONNECTION | QUERY] thread_id: accept as no-op
@@ -2733,6 +2735,19 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			continue
 		}
 		name := strings.ToLower(expr.Var.Name.String())
+		// Strip scope prefix for variable name lookup
+		cleanVarName := strings.TrimPrefix(name, "global.")
+		cleanVarName = strings.TrimPrefix(cleanVarName, "session.")
+		cleanVarName = strings.TrimPrefix(cleanVarName, "local.")
+		// Check if variable is read-only
+		if sysVarReadOnly[cleanVarName] {
+			return nil, mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a read only variable", cleanVarName))
+		}
+		// Check if GLOBAL-only variable is being set at SESSION scope
+		scope := expr.Var.Scope
+		if sysVarGlobalOnly[cleanVarName] && scope != sqlparser.GlobalScope {
+			return nil, mysqlError(1228, "HY000", fmt.Sprintf("Variable '%s' is a GLOBAL variable and should be set with SET GLOBAL", cleanVarName))
+		}
 		val := sqlparser.String(expr.Expr)
 		val = strings.Trim(val, "'\"")
 		// Try evaluating the expression (handles @user_var, @@system_var references)
@@ -2781,12 +2796,20 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				cleanName := strings.TrimPrefix(name, "global.")
 				cleanName = strings.TrimPrefix(cleanName, "session.")
 				cleanName = strings.TrimPrefix(cleanName, "local.")
-				// Evaluate expression
-				evalVal, err := e.evalExpr(expr.Expr)
-				if err == nil {
-					e.globalVars[cleanName] = fmt.Sprintf("%v", evalVal)
+				// Handle DEFAULT: restore the variable to its default value
+				if _, isDefault := expr.Expr.(*sqlparser.Default); isDefault || strings.ToUpper(val) == "DEFAULT" {
+					delete(e.globalVars, cleanName)
 				} else {
-					e.globalVars[cleanName] = val
+					// Evaluate expression
+					evalVal, err := e.evalExpr(expr.Expr)
+					if err == nil && evalVal != nil {
+						e.globalVars[cleanName] = fmt.Sprintf("%v", evalVal)
+					} else if err == nil && evalVal == nil {
+						// nil means NULL - store empty or delete
+						delete(e.globalVars, cleanName)
+					} else {
+						e.globalVars[cleanName] = val
+					}
 				}
 			}
 		}
@@ -2824,7 +2847,7 @@ func (e *Executor) resolveSystemVarInValue(val string) string {
 }
 
 // handleRawSet handles SET statements that the parser couldn't parse.
-func (e *Executor) handleRawSet(raw string) {
+func (e *Executor) handleRawSet(raw string) error {
 	// Handle user variables: SET @var = value or SET @var := value
 	trimmed := strings.TrimSpace(raw)
 	if strings.HasPrefix(strings.ToUpper(trimmed), "SET ") {
@@ -2843,7 +2866,7 @@ func (e *Executor) handleRawSet(raw string) {
 				val = strings.Trim(val, "'\"")
 				val = e.resolveSystemVarInValue(val)
 				e.userVars[varName] = val
-				return
+				return nil
 			}
 			if eqIdx > 0 {
 				varName := strings.TrimSpace(rest[1:eqIdx])
@@ -2853,7 +2876,7 @@ func (e *Executor) handleRawSet(raw string) {
 				val = strings.Trim(val, "'\"")
 				val = e.resolveSystemVarInValue(val)
 				e.userVars[varName] = val
-				return
+				return nil
 			}
 		}
 	}
@@ -2914,6 +2937,7 @@ func (e *Executor) handleRawSet(raw string) {
 	// Store any SET GLOBAL/SESSION variable generically
 	rest := strings.TrimSpace(trimmed[4:])
 	restUpper := strings.ToUpper(rest)
+	isGlobalScope := strings.HasPrefix(restUpper, "GLOBAL ") || strings.HasPrefix(restUpper, "@@GLOBAL.")
 	rest = strings.TrimPrefix(rest, "GLOBAL ")
 	rest = strings.TrimPrefix(rest, "SESSION ")
 	rest = strings.TrimPrefix(rest, "LOCAL ")
@@ -2924,6 +2948,14 @@ func (e *Executor) handleRawSet(raw string) {
 	_ = restUpper
 	if eqIdx := strings.Index(rest, "="); eqIdx > 0 {
 		varName := strings.TrimSpace(strings.ToLower(rest[:eqIdx]))
+		// Check read-only
+		if sysVarReadOnly[varName] {
+			return mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a read only variable", varName))
+		}
+		// Check GLOBAL-only
+		if sysVarGlobalOnly[varName] && !isGlobalScope {
+			return mysqlError(1228, "HY000", fmt.Sprintf("Variable '%s' is a GLOBAL variable and should be set with SET GLOBAL", varName))
+		}
 		val := strings.TrimSpace(rest[eqIdx+1:])
 		val = strings.TrimSuffix(val, ";")
 		val = strings.TrimSpace(val)
@@ -2944,6 +2976,7 @@ func (e *Executor) handleRawSet(raw string) {
 			e.globalVars["character_set_results"] = charset
 		}
 	}
+	return nil
 }
 
 // nowTime returns the current time, respecting SET TIMESTAMP.
@@ -5310,9 +5343,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				if cn := idx.Info.ConstraintName.String(); cn != "" {
 					idxName = cn
 				} else {
-					// MySQL auto-generates index name from the first column name
-					// without the prefix length suffix
-					idxName = stripPrefixLengthFromCol(idxCols[0])
+					idxName = idxCols[0]
 				}
 			}
 			idxComment := ""
@@ -6212,9 +6243,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						for _, col := range tbl.Def.Columns {
 							if col.Name == colNames[i] {
 								colUpper := strings.ToUpper(col.Type)
-								isGeom := colUpper == "POINT" || colUpper == "GEOMETRY" || colUpper == "LINESTRING" ||
-									colUpper == "POLYGON" || strings.HasPrefix(colUpper, "POINT ") || strings.HasPrefix(colUpper, "GEOMETRY ")
-								if !isGeom && (strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER")) {
+								if strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER") {
 									isIntCol = true
 									isUnsigned = strings.Contains(colUpper, "UNSIGNED")
 								}
@@ -6425,16 +6454,12 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				} else if col.Default != nil {
 					defVal := *col.Default
 					defUpper := strings.ToUpper(defVal)
-					// DEFAULT NULL should store actual nil, not the string "null"
-					if defUpper == "NULL" {
-						fullRow[col.Name] = nil
-					} else if defUpper == "CURRENT_TIMESTAMP" || defUpper == "CURRENT_TIMESTAMP()" ||
+					// Evaluate dynamic defaults
+					if defUpper == "CURRENT_TIMESTAMP" || defUpper == "CURRENT_TIMESTAMP()" ||
 						defUpper == "NOW()" {
 						defVal = e.nowTime().Format("2006-01-02 15:04:05")
-						fullRow[col.Name] = defVal
-					} else {
-						fullRow[col.Name] = defVal
 					}
+					fullRow[col.Name] = defVal
 				} else if !col.Nullable {
 					// NOT NULL columns without default get the type's zero value
 					fullRow[col.Name] = implicitZeroValue(col.Type)
@@ -6514,12 +6539,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				rv, exists := row[col.Name]
 				if exists && rv != nil {
 					colUpper := strings.ToUpper(col.Type)
-					// Geometry types should not be treated as numeric
-					isGeomType := colUpper == "POINT" || colUpper == "GEOMETRY" || colUpper == "LINESTRING" ||
-						colUpper == "POLYGON" || colUpper == "MULTIPOINT" || colUpper == "MULTILINESTRING" ||
-						colUpper == "MULTIPOLYGON" || colUpper == "GEOMETRYCOLLECTION" ||
-						strings.HasPrefix(colUpper, "POINT ") || strings.HasPrefix(colUpper, "GEOMETRY ")
-					isIntType := !isGeomType && (strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER"))
+					isIntType := strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER")
 					isDecimalType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE")
 					isNumericType := isIntType || isDecimalType
 					isUnsigned := strings.Contains(colUpper, "UNSIGNED")
@@ -6580,22 +6600,10 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						}
 						if sv, ok := checkVal.(string); ok {
 							maxLen := extractCharLength(col.Type)
-							// For BINARY/VARBINARY, measure in bytes; for CHAR/VARCHAR, measure in characters (runes)
-							isBinaryType := strings.Contains(colUpper, "BINARY")
-							var valueLen int
-							if isBinaryType {
-								valueLen = len(sv)
-							} else {
-								valueLen = len([]rune(sv))
-							}
-							if maxLen > 0 && valueLen > maxLen {
+							if maxLen > 0 && len([]rune(sv)) > maxLen {
 								if bool(stmt.Ignore) {
 									// INSERT IGNORE: truncate the value instead of error
-									if isBinaryType {
-										row[col.Name] = sv[:maxLen]
-									} else {
-										row[col.Name] = string([]rune(sv)[:maxLen])
-									}
+									row[col.Name] = string([]rune(sv)[:maxLen])
 									rv = row[col.Name]
 								} else {
 									return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row 1", col.Name))
@@ -9278,7 +9286,6 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					}
 				}
 			}
-			rawExprIdx++ // advance past the '*' in raw expressions
 		case *sqlparser.AliasedExpr:
 			name := ""
 			if !se.As.IsEmpty() {
@@ -9807,11 +9814,6 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		if pkVal, remainExpr := extractPKEquality(stmt.Where.Expr, pkCol); pkVal != nil {
 			tbl.EnsurePKRowIndex()
 			keyStr := fmt.Sprintf("%v", pkVal)
-			// Coerce the lookup key to match the stored format for the PK column type
-			// (e.g., numeric 111127 -> TIME "11:11:27", or "10:45:15" -> DATE "0000-00-00")
-			if pkColType, ok := colTypeByName[strings.ToLower(pkCol)]; ok {
-				keyStr = fmt.Sprintf("%v", coerceDateTimeValue(pkColType, pkVal))
-			}
 			rowIdx := tbl.LookupRowIndexByPK(keyStr)
 			if rowIdx >= 0 {
 				if remainExpr != nil {
@@ -10115,21 +10117,6 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 				tbl.Rows[i][col.Name] = val
 			}
 		}
-		// Update auto-increment counter when an AI column is updated to a larger value.
-		// In MySQL, UPDATE t SET ai_col = 105 WHERE ... will advance the AI counter
-		// so that the next auto-generated value is 106.
-		for _, col := range tbl.Def.Columns {
-			if col.AutoIncrement {
-				if newVal, ok := newRow[col.Name]; ok && newVal != nil {
-					intVal := toInt64(newVal)
-					if intVal >= tbl.AutoIncrement.Load() {
-						tbl.AutoIncrement.Store(intVal)
-					}
-				}
-				break
-			}
-		}
-
 		matchedRows++
 		if rowChanged {
 			affected++
@@ -10470,87 +10457,20 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 		return &Result{}, nil
 	}
 
-	// Pre-filter each table by its applicable WHERE predicates before
-	// building the cross product to avoid exceeding maxCrossProductRows.
-	var tableAliases []string
-	for _, te := range stmt.TableExprs {
-		alias, _, _ := extractTableAlias(te)
-		tableAliases = append(tableAliases, alias)
-	}
-
-	// Split WHERE into per-table predicates and cross-table predicates
-	var perTablePreds map[string][]sqlparser.Expr
-	if stmt.Where != nil && len(stmt.TableExprs) > 1 {
-		perTablePreds = make(map[string][]sqlparser.Expr)
-		flatPreds := splitANDPredicates(stmt.Where.Expr)
-		for _, pred := range flatPreds {
-			cols := extractColumnRefs(pred)
-			tables := make(map[string]bool)
-			for _, col := range cols {
-				if cn, ok := col.(*sqlparser.ColName); ok {
-					q := cn.Qualifier.Name.String()
-					if q != "" {
-						tables[q] = true
-					}
-				}
-			}
-			if len(tables) == 1 {
-				for tbl := range tables {
-					perTablePreds[tbl] = append(perTablePreds[tbl], pred)
-				}
-			}
-		}
-	}
-
-	allRows, err := e.buildFromExpr(stmt.TableExprs[0])
+	allRows, err := e.buildFromExprWithWhere(stmt.TableExprs[0], stmt.Where)
 	if err != nil {
 		return nil, err
 	}
-	if preds, ok := perTablePreds[tableAliases[0]]; ok && len(preds) > 0 {
-		filtered := make([]storage.Row, 0)
-		for _, row := range allRows {
-			allMatch := true
-			for _, pred := range preds {
-				m, err := e.evalWhere(pred, row)
-				if err != nil || !m {
-					allMatch = false
-					break
-				}
-			}
-			if allMatch {
-				filtered = append(filtered, row)
-			}
-		}
-		allRows = filtered
-	}
-
-	// Cross join additional tables (each pre-filtered by its predicates)
+	// Cross join additional tables
 	for i := 1; i < len(stmt.TableExprs); i++ {
 		rightRows, err := e.buildFromExpr(stmt.TableExprs[i])
 		if err != nil {
 			return nil, err
 		}
-		if preds, ok := perTablePreds[tableAliases[i]]; ok && len(preds) > 0 {
-			filtered := make([]storage.Row, 0)
-			for _, row := range rightRows {
-				allMatch := true
-				for _, pred := range preds {
-					m, err := e.evalWhere(pred, row)
-					if err != nil || !m {
-						allMatch = false
-						break
-					}
-				}
-				if allMatch {
-					filtered = append(filtered, row)
-				}
-			}
-			rightRows = filtered
-		}
 		allRows = crossProduct(allRows, rightRows)
 	}
 
-	// Apply full WHERE filter (handles cross-table predicates)
+	// Apply WHERE filter
 	if stmt.Where != nil {
 		filtered := make([]storage.Row, 0)
 		for _, row := range allRows {
@@ -10689,40 +10609,19 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", dbName, tableName))
 	}
 
-	// Pre-check: LOCK=NONE rejects operations that require a table copy (e.g., adding AUTO_INCREMENT columns)
-	{
-		hasLockNone := false
-		hasAutoIncrAdd := false
-		for _, opt := range stmt.AlterOptions {
-			if lo, ok := opt.(*sqlparser.LockOption); ok && lo.Type == sqlparser.NoneType {
-				hasLockNone = true
-			}
-			if ac, ok := opt.(*sqlparser.AddColumns); ok {
-				for _, col := range ac.Columns {
-					if col.Type.Options != nil && col.Type.Options.Autoincrement {
-						hasAutoIncrAdd = true
-					}
-				}
-			}
-		}
-		if hasLockNone && hasAutoIncrAdd {
-			return nil, mysqlError(1846, "0A000", "LOCK=NONE is not supported. Reason: Adding an auto-increment column requires a lock. Try LOCK=SHARED.")
-		}
-	}
-
 	// Pre-check: AUTO_INCREMENT columns must have an accompanying index
 	{
 		autoIncrCols := map[string]bool{}
 		indexedCols := map[string]bool{}
-		// Collect existing indexed columns (only first column of each index qualifies for AUTO_INCREMENT)
+		// Collect existing indexed columns
 		tableDef, _ := db.GetTable(tableName)
 		if tableDef != nil {
-			if len(tableDef.PrimaryKey) > 0 {
-				indexedCols[strings.ToLower(stripPrefixLengthFromCol(tableDef.PrimaryKey[0]))] = true
+			for _, pk := range tableDef.PrimaryKey {
+				indexedCols[strings.ToLower(stripPrefixLengthFromCol(pk))] = true
 			}
 			for _, idx := range tableDef.Indexes {
-				if len(idx.Columns) > 0 {
-					indexedCols[strings.ToLower(stripPrefixLengthFromCol(idx.Columns[0]))] = true
+				for _, c := range idx.Columns {
+					indexedCols[strings.ToLower(stripPrefixLengthFromCol(c))] = true
 				}
 			}
 		}
@@ -10733,21 +10632,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					if col.Type.Options != nil && col.Type.Options.Autoincrement {
 						autoIncrCols[strings.ToLower(col.Name.String())] = true
 					}
-					// Column-level PRIMARY KEY declaration also makes it indexed
-					if col.Type.Options != nil && col.Type.Options.KeyOpt == 1 {
-						indexedCols[strings.ToLower(col.Name.String())] = true
-					}
 				}
 			case *sqlparser.AddIndexDefinition:
-				// Only the first column of an index qualifies for AUTO_INCREMENT
-				if len(op.IndexDefinition.Columns) > 0 {
-					indexedCols[strings.ToLower(op.IndexDefinition.Columns[0].Column.String())] = true
-				}
-				// PRIMARY KEY makes all columns indexed for AI purposes
-				if op.IndexDefinition.Info.Type == sqlparser.IndexTypePrimary {
-					for _, idxCol := range op.IndexDefinition.Columns {
-						indexedCols[strings.ToLower(idxCol.Column.String())] = true
-					}
+				for _, idxCol := range op.IndexDefinition.Columns {
+					indexedCols[strings.ToLower(idxCol.Column.String())] = true
 				}
 			}
 		}
@@ -10758,23 +10646,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		}
 	}
 
-	// Process ALTER options in two passes:
-	// Pass 1: DROP operations (DropColumn, DropKey, DropPrimaryKey) must execute first
-	//         so that ADD operations with the same name don't conflict.
-	// Pass 2: Everything else.
-	dropOpts := make([]sqlparser.AlterOption, 0)
-	otherOpts := make([]sqlparser.AlterOption, 0)
 	for _, opt := range stmt.AlterOptions {
-		switch opt.(type) {
-		case *sqlparser.DropColumn, *sqlparser.DropKey:
-			dropOpts = append(dropOpts, opt)
-		default:
-			otherOpts = append(otherOpts, opt)
-		}
-	}
-	reorderedOpts := append(dropOpts, otherOpts...)
-
-	for _, opt := range reorderedOpts {
 		switch op := opt.(type) {
 
 		case *sqlparser.AddColumns:
@@ -10805,15 +10677,8 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				// Determine the default value to fill in existing rows.
 				var defVal interface{}
 				if colDef.Default != nil {
-					defStr := *colDef.Default
-					if strings.EqualFold(defStr, "NULL") {
-						defVal = nil
-					} else {
-						defVal = defStr
-					}
-				} else if !colDef.Nullable && !colDef.AutoIncrement {
-					// NOT NULL columns without explicit DEFAULT get type-appropriate zero value
-					defVal = implicitZeroValue(colDef.Type)
+					// Parse the default string as a literal if possible.
+					defVal = *colDef.Default
 				}
 				tbl.AddColumn(colDef.Name, defVal)
 			}
@@ -10945,9 +10810,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				if cn := op.IndexDefinition.Info.ConstraintName.String(); cn != "" {
 					idxName = cn
 				} else if len(idxCols) > 0 {
-					// MySQL auto-generates index name from the first column name
-					// without the prefix length suffix, e.g., "d" not "d(10)"
-					idxName = stripPrefixLengthFromCol(idxCols[0])
+					idxName = idxCols[0]
 				}
 			}
 			// Check for USING method and COMMENT
@@ -11608,8 +11471,271 @@ func (e *Executor) showIndexes(dbName, tableName string) (*Result, error) {
 // showVariables handles SHOW [GLOBAL|SESSION] VARIABLES [LIKE '...']
 // buildVariablesMap returns the full map of system variable name -> value,
 // including any overrides from SET GLOBAL/SESSION.
+// sysVarReadOnly contains system variables that cannot be SET.
+var sysVarReadOnly = map[string]bool{
+	"basedir": true, "character_set_system": true, "character_sets_dir": true,
+	"datadir": true, "have_compress": true, "have_dynamic_loading": true,
+	"have_geometry": true, "have_openssl": true, "have_profiling": true,
+	"have_query_cache": true, "have_rtree_keys": true, "have_ssl": true,
+	"have_symlink": true, "have_statement_timeout": true,
+	"hostname": true, "innodb_page_size": true, "innodb_read_only": true,
+	"innodb_version": true, "large_files_support": true, "large_page_size": true,
+	"lc_messages_dir": true, "license": true, "locked_in_memory": true,
+	"log_bin": true, "log_bin_basename": true, "log_bin_index": true,
+	"lower_case_file_system": true, "lower_case_table_names": true,
+	"max_digest_length": true, "mysqlx_port": true, "open_files_limit": true,
+	"pid_file": true, "plugin_dir": true, "port": true, "protocol_version": true,
+	"server_uuid": true, "skip_networking": true, "socket": true,
+	"system_time_zone": true, "thread_stack": true, "tmpdir": true,
+	"version": true, "version_comment": true, "version_compile_machine": true,
+	"version_compile_os": true, "innodb_buffer_pool_chunk_size": true,
+	"innodb_buffer_pool_load_at_startup": true,
+	"innodb_data_file_path": true, "innodb_data_home_dir": true,
+	"innodb_dedicated_server": true, "innodb_force_recovery": true,
+	"innodb_log_file_size": true, "innodb_temp_data_file_path": true,
+	"innodb_undo_directory": true,
+	"performance_schema": true, "skip_show_database": true,
+	"back_log": true, "bind_address": true, "admin_address": true,
+	"admin_port": true, "core_file": true,
+	"disabled_storage_engines": true, "ft_max_word_len": true,
+	"ft_min_word_len": true, "ft_query_expansion_limit": true,
+	"ft_stopword_file": true, "innodb_autoinc_lock_mode": true,
+	"innodb_buffer_pool_instances": true, "innodb_doublewrite_dir": true,
+	"innodb_doublewrite_files": true, "innodb_doublewrite_pages": true,
+	"innodb_force_load_corrupted": true, "innodb_ft_cache_size": true,
+	"innodb_ft_max_token_size": true, "innodb_ft_min_token_size": true,
+	"innodb_ft_sort_pll_degree": true, "innodb_ft_total_cache_size": true,
+	"innodb_numa_interleave": true,
+	"innodb_open_files": true, "innodb_purge_threads": true,
+	"innodb_read_io_threads": true,
+	"innodb_sort_buffer_size": true, "innodb_sync_array_size": true,
+	"innodb_temp_tablespaces_dir": true,
+	"innodb_use_native_aio": true, "innodb_validate_tablespace_paths": true,
+	"innodb_write_io_threads": true,
+	"ngram_token_size": true, "secure_file_priv": true,
+	"binlog_gtid_simple_recovery": true, "binlog_row_event_max_size": true,
+	"binlog_rotate_encryption_master_key_at_startup": true,
+	"create_admin_listener_thread": true,
+	"external_user": true, "proxy_user": true,
+	"tls_version": true, "tls_ciphersuites": true,
+	"ssl_ca": true, "ssl_capath": true, "ssl_cert": true, "ssl_cipher": true,
+	"ssl_key": true, "ssl_crl": true, "ssl_crlpath": true,
+	"mysqlx_ssl_ca": true, "mysqlx_ssl_capath": true, "mysqlx_ssl_cert": true,
+	"mysqlx_ssl_cipher": true, "mysqlx_ssl_key": true,
+	"mysqlx_ssl_crl": true, "mysqlx_ssl_crlpath": true,
+	"mysqlx_socket": true, "mysqlx_bind_address": true,
+	"auto_generate_certs": true,
+	"sha256_password_auto_generate_rsa_keys": true,
+	"caching_sha2_password_auto_generate_rsa_keys": true,
+	"sha256_password_private_key_path": true,
+	"sha256_password_public_key_path": true,
+	"caching_sha2_password_private_key_path": true,
+	"caching_sha2_password_public_key_path": true,
+}
+
+// sysVarGlobalOnly contains system variables that can only be SET at GLOBAL scope.
+// Only includes variables where we are 100% certain they are GLOBAL-only in MySQL 8.0.
+var sysVarGlobalOnly = map[string]bool{
+	"avoid_temporal_upgrade":          true,
+	"binlog_cache_size":               true,
+	"binlog_error_action":             true,
+	"binlog_expire_logs_seconds":      true,
+	"binlog_group_commit_sync_delay":  true,
+	"binlog_group_commit_sync_no_delay_count": true,
+	"binlog_max_flush_queue_time":     true,
+	"binlog_order_commits":            true,
+	"binlog_stmt_cache_size":          true,
+	"check_proxy_users":               true,
+	"connect_timeout":                 true,
+	"default_authentication_plugin":   true,
+	"default_password_lifetime":       true,
+	"disconnect_on_expired_password":  true,
+	"expire_logs_days":                true,
+	"flush":                           true,
+	"flush_time":                      true,
+	"general_log":                     true,
+	"general_log_file":                true,
+	"gtid_executed_compression_period": true,
+	"innodb_adaptive_flushing":        true,
+	"innodb_adaptive_flushing_lwm":    true,
+	"innodb_adaptive_hash_index":      true,
+	"innodb_adaptive_hash_index_parts": true,
+	"innodb_adaptive_max_sleep_delay": true,
+	"innodb_buffer_pool_dump_at_shutdown": true,
+	"innodb_buffer_pool_dump_now":     true,
+	"innodb_buffer_pool_dump_pct":     true,
+	"innodb_buffer_pool_filename":     true,
+	"innodb_buffer_pool_in_core_file": true,
+	"innodb_buffer_pool_load_abort":   true,
+	"innodb_buffer_pool_load_now":     true,
+	"innodb_buffer_pool_size":         true,
+	"innodb_change_buffer_max_size":   true,
+	"innodb_cmp_per_index_enabled":    true,
+	"innodb_commit_concurrency":       true,
+	"innodb_compression_failure_threshold_pct": true,
+	"innodb_compression_pad_pct_max":  true,
+	"innodb_concurrency_tickets":      true,
+	"innodb_deadlock_detect":          true,
+	"innodb_disable_sort_file_cache":  true,
+	"innodb_fast_shutdown":            true,
+	"innodb_flush_log_at_timeout":     true,
+	"innodb_flush_neighbors":          true,
+	"innodb_flush_sync":               true,
+	"innodb_flushing_avg_loops":       true,
+	"innodb_ft_enable_diag_print":     true,
+	"innodb_ft_num_word_optimize":     true,
+	"innodb_ft_result_cache_limit":    true,
+	"innodb_io_capacity":              true,
+	"innodb_io_capacity_max":          true,
+	"innodb_lru_scan_depth":           true,
+	"innodb_max_dirty_pages_pct":      true,
+	"innodb_max_dirty_pages_pct_lwm":  true,
+	"innodb_max_purge_lag":            true,
+	"innodb_max_purge_lag_delay":      true,
+	"innodb_max_undo_log_size":        true,
+	"innodb_monitor_disable":          true,
+	"innodb_monitor_enable":           true,
+	"innodb_monitor_reset":            true,
+	"innodb_monitor_reset_all":        true,
+	"innodb_old_blocks_pct":           true,
+	"innodb_old_blocks_time":          true,
+	"innodb_online_alter_log_max_size": true,
+	"innodb_optimize_fulltext_only":   true,
+	"innodb_print_all_deadlocks":      true,
+	"innodb_print_ddl_log":            true,
+	"innodb_purge_batch_size":         true,
+	"innodb_purge_rseg_truncate_frequency": true,
+	"innodb_random_read_ahead":        true,
+	"innodb_read_ahead_threshold":     true,
+	"innodb_redo_log_encrypt":         true,
+	"innodb_replication_delay":        true,
+	"innodb_spin_wait_delay":          true,
+	"innodb_spin_wait_pause_multiplier": true,
+	"innodb_stats_include_delete_marked": true,
+	"innodb_stats_on_metadata":        true,
+	"innodb_status_output":            true,
+	"innodb_status_output_locks":      true,
+	"innodb_sync_spin_loops":          true,
+	"innodb_thread_concurrency":       true,
+	"innodb_thread_sleep_delay":       true,
+	"innodb_undo_log_encrypt":         true,
+	"log_error_verbosity":             true,
+	"log_error_suppression_list":      true,
+	"log_error_services":              true,
+	"log_bin_trust_function_creators": true,
+	"max_connections":                 true,
+	"max_connect_errors":              true,
+	"mysql_native_password_proxy_users": true,
+	"sha256_password_proxy_users":     true,
+	"mysqlx_connect_timeout":          true,
+	"mysqlx_document_id_unique_prefix": true,
+	"mysqlx_enable_hello_notice":      true,
+	"mysqlx_idle_worker_thread_timeout": true,
+	"mysqlx_max_allowed_packet":       true,
+	"mysqlx_max_connections":          true,
+	"mysqlx_min_worker_threads":       true,
+	"password_history":                true,
+	"password_reuse_interval":         true,
+	"password_require_current":        true,
+	"sync_binlog":                     true,
+	"table_open_cache":                true,
+	"table_open_cache_instances":      true,
+	"table_definition_cache":          true,
+	"thread_cache_size":               true,
+	"delayed_insert_limit":            true,
+	"delayed_insert_timeout":          true,
+	"delayed_queue_size":              true,
+}
+
+// sysVarEnumSet contains system variables that are ENUM types where ON/OFF
+// should be returned as strings, not converted to 0/1.
+var sysVarEnumSet = map[string]bool{
+	"delay_key_write":               true,
+	"enforce_gtid_consistency":      true,
+	"event_scheduler":               true,
+	"gtid_mode":                     true,
+	"myisam_recover_options":        true,
+	"session_track_transaction_info": true,
+	"slave_skip_errors":             true,
+	"replica_skip_errors":           true,
+	"concurrent_insert":             true,
+	"completion_type":               true,
+	"binlog_format":                 true,
+	"binlog_row_image":              true,
+	"binlog_row_metadata":           true,
+	"binlog_error_action":           true,
+	"binlog_checksum":               true,
+	"innodb_change_buffering":       true,
+	"innodb_default_row_format":     true,
+	"innodb_checksum_algorithm":     true,
+	"innodb_flush_method":           true,
+	"innodb_doublewrite":            true,
+	"transaction_isolation":         true,
+	"tx_isolation":                  true,
+	"default_storage_engine":        true,
+	"default_tmp_storage_engine":    true,
+	"block_encryption_mode":         true,
+	"internal_tmp_mem_storage_engine": true,
+	"optimizer_switch":              true,
+	"optimizer_trace":               true,
+	"optimizer_trace_features":      true,
+	"sql_mode":                      true,
+	"default_authentication_plugin": true,
+	"innodb_stats_method":           true,
+	"myisam_stats_method":           true,
+	"lc_messages":                   true,
+	"lc_time_names":                 true,
+	"log_output":                    true,
+	"log_error_services":            true,
+	"log_timestamps":                true,
+	"tls_version":                   true,
+	"use_secondary_engine":          true,
+	"session_track_system_variables": true,
+	"have_compress":                 true,
+	"have_dynamic_loading":          true,
+	"have_geometry":                 true,
+	"have_openssl":                  true,
+	"have_profiling":                true,
+	"have_query_cache":              true,
+	"have_rtree_keys":               true,
+	"have_ssl":                      true,
+	"have_symlink":                  true,
+	"have_statement_timeout":        true,
+	"secure_file_priv":              true,
+	"updatable_views_with_limit":    true,
+}
+
+// sysVarStringToSelectValue converts a system variable string value to the value
+// returned by SELECT @@var. Boolean ON/OFF become 1/0, numeric strings become int64/float64.
+func sysVarStringToSelectValue(val string) interface{} {
+	return sysVarStringToSelectValueForVar(val, "")
+}
+
+// sysVarStringToSelectValueForVar converts with variable name awareness.
+// For enum-type variables, ON/OFF strings are preserved; for booleans they become 0/1.
+func sysVarStringToSelectValueForVar(val string, varName string) interface{} {
+	upper := strings.ToUpper(val)
+	// For enum variables, don't convert ON/OFF to 0/1
+	if !sysVarEnumSet[varName] {
+		if upper == "ON" || upper == "YES" || upper == "TRUE" {
+			return int64(1)
+		}
+		if upper == "OFF" || upper == "NO" || upper == "FALSE" {
+			return int64(0)
+		}
+	}
+	if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+		return n
+	}
+	if f, err := strconv.ParseFloat(val, 64); err == nil {
+		return f
+	}
+	return val
+}
+
 func (e *Executor) buildVariablesMap() map[string]string {
 	vars := map[string]string{
+		// InnoDB variables
 		"innodb_rollback_on_timeout":           "ON",
 		"innodb_file_per_table":                "ON",
 		"innodb_strict_mode":                   "ON",
@@ -11643,19 +11769,484 @@ func (e *Executor) buildVariablesMap() map[string]string {
 		"innodb_ft_min_token_size":             "3",
 		"innodb_compression_level":             "6",
 		"innodb_data_file_path":                "ibdata1:12M:autoextend",
-		"auto_increment_increment":             "1",
-		"auto_increment_offset":                "1",
-		"character_set_server":                 "utf8mb4",
-		"collation_server":                     "utf8mb4_0900_ai_ci",
-		"lower_case_table_names":               "0",
-		"max_allowed_packet":                   "67108864",
-		"sql_mode":                             "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
-		"default_storage_engine":               "InnoDB",
-		"default_tmp_storage_engine":           "InnoDB",
-		"datadir":                              "/var/lib/mysql/",
-		"tmpdir":                               "/tmp",
-		"version":                              "8.0.32",
-		"version_comment":                      "mylite",
+		"innodb_adaptive_flushing":             "ON",
+		"innodb_adaptive_flushing_lwm":         "10",
+		"innodb_adaptive_hash_index":           "ON",
+		"innodb_adaptive_hash_index_parts":     "8",
+		"innodb_adaptive_max_sleep_delay":      "150000",
+		"innodb_api_bk_commit_interval":        "5",
+		"innodb_api_disable_rowlock":           "OFF",
+		"innodb_api_enable_binlog":             "OFF",
+		"innodb_api_enable_mdl":                "OFF",
+		"innodb_api_trx_level":                 "0",
+		"innodb_autoextend_increment":          "64",
+		"innodb_buffer_pool_chunk_size":        "134217728",
+		"innodb_buffer_pool_dump_at_shutdown":  "ON",
+		"innodb_buffer_pool_dump_now":          "OFF",
+		"innodb_buffer_pool_dump_pct":          "25",
+		"innodb_buffer_pool_filename":          "ib_buffer_pool",
+		"innodb_buffer_pool_in_core_file":      "ON",
+		"innodb_buffer_pool_instances":         "1",
+		"innodb_buffer_pool_load_abort":        "OFF",
+		"innodb_buffer_pool_load_at_startup":   "ON",
+		"innodb_buffer_pool_load_now":          "OFF",
+		"innodb_cmp_per_index_enabled":         "OFF",
+		"innodb_commit_concurrency":            "0",
+		"innodb_compression_failure_threshold_pct": "5",
+		"innodb_compression_pad_pct_max":       "50",
+		"innodb_concurrency_tickets":           "5000",
+		"innodb_data_home_dir":                 "",
+		"innodb_deadlock_detect":               "ON",
+		"innodb_dedicated_server":              "OFF",
+		"innodb_disable_sort_file_cache":       "OFF",
+		"innodb_doublewrite_batch_size":        "0",
+		"innodb_doublewrite_dir":               "",
+		"innodb_doublewrite_files":             "2",
+		"innodb_doublewrite_pages":             "4",
+		"innodb_fast_shutdown":                 "1",
+		"innodb_flush_log_at_timeout":          "1",
+		"innodb_flush_neighbors":               "0",
+		"innodb_flush_sync":                    "ON",
+		"innodb_flushing_avg_loops":            "30",
+		"innodb_force_load_corrupted":          "OFF",
+		"innodb_force_recovery":                "0",
+		"innodb_ft_aux_table":                  "",
+		"innodb_ft_cache_size":                 "8000000",
+		"innodb_ft_enable_diag_print":          "OFF",
+		"innodb_ft_num_word_optimize":          "2000",
+		"innodb_ft_result_cache_limit":         "2000000000",
+		"innodb_ft_sort_pll_degree":            "2",
+		"innodb_ft_total_cache_size":           "640000000",
+		"innodb_ft_user_stopword_table":        "",
+		"innodb_io_capacity":                   "200",
+		"innodb_io_capacity_max":               "2000",
+		"innodb_log_buffer_size":               "16777216",
+		"innodb_log_checksums":                 "ON",
+		"innodb_log_compressed_pages":          "ON",
+		"innodb_log_spin_cpu_abs_lwm":          "80",
+		"innodb_log_spin_cpu_pct_hwm":          "50",
+		"innodb_log_wait_for_flush_spin_hwm":   "400",
+		"innodb_log_write_ahead_size":          "8192",
+		"innodb_log_writer_threads":            "ON",
+		"innodb_lru_scan_depth":                "1024",
+		"innodb_max_purge_lag":                 "0",
+		"innodb_max_purge_lag_delay":           "0",
+		"innodb_max_undo_log_size":             "1073741824",
+		"innodb_monitor_disable":               "",
+		"innodb_monitor_enable":                "",
+		"innodb_monitor_reset":                 "",
+		"innodb_monitor_reset_all":             "",
+		"innodb_numa_interleave":               "OFF",
+		"innodb_old_blocks_pct":                "37",
+		"innodb_old_blocks_time":               "1000",
+		"innodb_open_files":                    "4000",
+		"innodb_parallel_read_threads":         "4",
+		"innodb_print_all_deadlocks":           "OFF",
+		"innodb_print_ddl_log":                 "OFF",
+		"innodb_purge_batch_size":              "300",
+		"innodb_purge_rseg_truncate_frequency": "128",
+		"innodb_purge_threads":                 "4",
+		"innodb_random_read_ahead":             "OFF",
+		"innodb_read_ahead_threshold":          "56",
+		"innodb_read_io_threads":               "4",
+		"innodb_read_only":                     "OFF",
+		"innodb_redo_log_capacity":             "104857600",
+		"innodb_redo_log_encrypt":              "OFF",
+		"innodb_replication_delay":             "0",
+		"innodb_rollback_segments":             "128",
+		"innodb_spin_wait_delay":               "6",
+		"innodb_spin_wait_pause_multiplier":    "50",
+		"innodb_stats_include_delete_marked":   "OFF",
+		"innodb_stats_method":                  "nulls_equal",
+		"innodb_stats_on_metadata":             "OFF",
+		"innodb_status_output":                 "OFF",
+		"innodb_status_output_locks":           "OFF",
+		"innodb_sync_array_size":               "1",
+		"innodb_sync_spin_loops":               "30",
+		"innodb_table_locks":                   "ON",
+		"innodb_temp_data_file_path":           "ibtmp1:12M:autoextend",
+		"innodb_temp_tablespaces_dir":          "./#innodb_temp/",
+		"innodb_thread_concurrency":            "0",
+		"innodb_thread_sleep_delay":            "10000",
+		"innodb_undo_directory":                "./",
+		"innodb_undo_log_encrypt":              "OFF",
+		"innodb_undo_log_truncate":             "ON",
+		"innodb_undo_tablespaces":              "2",
+		"innodb_use_native_aio":                "ON",
+		"innodb_validate_tablespace_paths":     "ON",
+		"innodb_write_io_threads":              "4",
+
+		// Auto increment
+		"auto_increment_increment": "1",
+		"auto_increment_offset":    "1",
+
+		// Character set / collation
+		"character_set_server":     "utf8mb4",
+		"character_set_database":   "utf8mb4",
+		"character_set_client":     "utf8mb4",
+		"character_set_connection": "utf8mb4",
+		"character_set_results":    "utf8mb4",
+		"character_set_filesystem": "binary",
+		"character_set_system":     "utf8mb3",
+		"character_sets_dir":       "/usr/share/mysql/charsets/",
+		"collation_server":        "utf8mb4_0900_ai_ci",
+		"collation_database":      "utf8mb4_0900_ai_ci",
+		"collation_connection":    "utf8mb4_0900_ai_ci",
+
+		// Server identity
+		"version":         "8.0.32",
+		"version_comment": "mylite",
+		"version_compile_machine": "x86_64",
+		"version_compile_os":      "Linux",
+		"server_id":               "1",
+		"server_uuid":             "00000000-0000-0000-0000-000000000000",
+		"hostname":                "localhost",
+		"port":                    "3306",
+		"socket":                  "/var/run/mysqld/mysqld.sock",
+		"pid_file":                "/var/run/mysqld/mysqld.pid",
+		"basedir":                 "/usr/",
+		"datadir":                 "/var/lib/mysql/",
+		"tmpdir":                  "/tmp",
+		"plugin_dir":              "/usr/lib/mysql/plugin/",
+		"log_error":               "stderr",
+
+		// SQL modes and behavior
+		"sql_mode":              "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+		"lower_case_table_names": "0",
+		"max_allowed_packet":    "67108864",
+		"default_storage_engine":     "InnoDB",
+		"default_tmp_storage_engine": "InnoDB",
+
+		// Connection and timeout
+		"connect_timeout":       "60",
+		"wait_timeout":          "28800",
+		"interactive_timeout":   "28800",
+		"net_read_timeout":      "30",
+		"net_write_timeout":     "60",
+		"net_retry_count":       "10",
+		"net_buffer_length":     "16384",
+		"max_connections":       "151",
+		"max_connect_errors":    "100",
+		"max_user_connections":  "0",
+		"back_log":              "151",
+		"thread_cache_size":     "9",
+		"thread_stack":          "1048576",
+
+		// Query and buffer sizes
+		"max_heap_table_size":     "16777216",
+		"tmp_table_size":          "16777216",
+		"sort_buffer_size":        "262144",
+		"join_buffer_size":        "262144",
+		"read_buffer_size":        "131072",
+		"read_rnd_buffer_size":    "262144",
+		"bulk_insert_buffer_size": "8388608",
+		"max_sort_length":         "1024",
+		"max_length_for_sort_data": "4096",
+		"group_concat_max_len":    "1024",
+		"preload_buffer_size":     "32768",
+
+		// Logging
+		"general_log":      "ON",
+		"general_log_file": "localhost.log",
+		"slow_query_log":   "OFF",
+		"slow_query_log_file": "localhost-slow.log",
+		"long_query_time":  "10.000000",
+		"log_output":       "FILE",
+		"log_queries_not_using_indexes": "OFF",
+		"log_slow_admin_statements":     "OFF",
+		"log_slow_extra":                "OFF",
+		"log_slow_replica_statements":   "OFF",
+		"log_slow_slave_statements":     "OFF",
+		"log_timestamps":                "UTC",
+		"log_error_verbosity":           "2",
+		"log_error_suppression_list":    "",
+		"log_error_services":            "log_filter_internal; log_sink_internal",
+		"log_bin":                        "ON",
+		"log_bin_basename":              "",
+		"log_bin_index":                 "",
+		"log_bin_trust_function_creators": "OFF",
+
+		// Binary log
+		"binlog_cache_size":                       "32768",
+		"binlog_stmt_cache_size":                  "32768",
+		"binlog_format":                           "ROW",
+		"binlog_row_image":                        "FULL",
+		"binlog_row_metadata":                     "MINIMAL",
+		"binlog_rows_query_log_events":            "OFF",
+		"binlog_direct_non_transactional_updates": "OFF",
+		"binlog_order_commits":                    "ON",
+		"binlog_error_action":                     "ABORT_SERVER",
+		"binlog_expire_logs_seconds":              "0",
+		"binlog_group_commit_sync_delay":          "0",
+		"binlog_group_commit_sync_no_delay_count": "0",
+		"binlog_gtid_simple_recovery":             "ON",
+		"binlog_max_flush_queue_time":             "0",
+		"binlog_checksum":                         "CRC32",
+		"binlog_encryption":                       "OFF",
+		"binlog_rotate_encryption_master_key_at_startup": "OFF",
+		"binlog_row_event_max_size":               "8192",
+		"binlog_transaction_compression":          "OFF",
+		"binlog_transaction_compression_level_zstd": "3",
+		"binlog_transaction_dependency_history_size": "25000",
+		"binlog_transaction_dependency_tracking":  "COMMIT_ORDER",
+
+		// GTID
+		"gtid_mode":              "OFF",
+		"gtid_executed":          "",
+		"gtid_purged":            "",
+		"gtid_owned":             "",
+		"enforce_gtid_consistency": "OFF",
+		"gtid_executed_compression_period": "1000",
+		"gtid_next":              "AUTOMATIC",
+
+		// Replication
+		"relay_log":             "",
+		"relay_log_basename":    "",
+		"relay_log_index":       "",
+		"relay_log_info_file":   "relay-log.info",
+		"relay_log_purge":       "ON",
+		"relay_log_recovery":    "OFF",
+		"relay_log_space_limit": "0",
+		"replica_net_timeout":   "60",
+		"replica_skip_errors":   "OFF",
+		"replica_type_conversions": "",
+		"sync_binlog":           "1",
+
+		// Transaction
+		"transaction_isolation":    "REPEATABLE-READ",
+		"transaction_read_only":    "OFF",
+		"autocommit":              "ON",
+		"completion_type":         "NO_CHAIN",
+
+		// Security
+		"secure_file_priv":                  "",
+		"require_secure_transport":           "OFF",
+		"default_authentication_plugin":      "caching_sha2_password",
+		"default_password_lifetime":          "0",
+		"disconnect_on_expired_password":     "ON",
+		"password_history":                   "0",
+		"password_reuse_interval":            "0",
+		"password_require_current":           "OFF",
+		"check_proxy_users":                  "OFF",
+		"mysql_native_password_proxy_users":  "OFF",
+		"sha256_password_proxy_users":        "OFF",
+		"automatic_sp_privileges":            "ON",
+		"skip_name_resolve":                  "OFF",
+		"skip_networking":                    "OFF",
+		"skip_show_database":                 "OFF",
+		"local_infile":                       "OFF",
+
+		// Optimizer
+		"optimizer_switch": "index_merge=on,index_merge_union=on,index_merge_sort_union=on,index_merge_intersection=on,engine_condition_pushdown=on,index_condition_pushdown=on,mrr=on,mrr_cost_based=on,block_nested_loop=on,batched_key_access=off,materialization=on,semijoin=on,loosescan=on,firstmatch=on,duplicateweedout=on,subquery_materialization_cost_based=on,use_index_extensions=on,condition_fanout_filter=on,derived_merge=on,use_invisible_indexes=off,skip_scan=on,hash_join=on,subquery_to_derived=off,prefer_ordering_index=on,hypergraph_optimizer=off,derived_condition_pushdown=on",
+		"optimizer_trace":  "enabled=off,one_line=off",
+		"optimizer_trace_features": "greedy_search=on,range_optimizer=on,dynamic_range=on,repeated_subselect=on",
+		"optimizer_trace_limit":    "1",
+		"optimizer_trace_max_mem_size": "1048576",
+		"optimizer_trace_offset":   "-1",
+		"optimizer_prune_level":    "1",
+		"optimizer_search_depth":   "62",
+		"eq_range_index_dive_limit": "200",
+		"range_optimizer_max_mem_size": "8388608",
+
+		// Keys and indexes
+		"key_buffer_size":        "8388608",
+		"key_cache_age_threshold": "300",
+		"key_cache_block_size":   "1024",
+		"key_cache_division_limit": "100",
+		"myisam_sort_buffer_size": "8388608",
+		"myisam_max_sort_file_size": "9223372036853727232",
+		"myisam_repair_threads":  "1",
+		"myisam_recover_options": "OFF",
+		"myisam_use_mmap":        "OFF",
+		"myisam_stats_method":    "nulls_unequal",
+		"myisam_data_pointer_size": "6",
+
+		// Table and file settings
+		"table_open_cache":       "4000",
+		"table_open_cache_instances": "16",
+		"table_definition_cache": "2000",
+		"open_files_limit":       "1048576",
+		"max_tmp_tables":         "32",
+		"max_write_lock_count":   "18446744073709551615",
+		"concurrent_insert":      "AUTO",
+		"delay_key_write":        "ON",
+		"flush":                  "OFF",
+		"flush_time":             "0",
+		"lock_wait_timeout":      "31536000",
+		"low_priority_updates":   "OFF",
+		"max_delayed_threads":    "20",
+		"delayed_insert_limit":   "100",
+		"delayed_insert_timeout": "300",
+		"delayed_queue_size":     "1000",
+
+		// Full-text search
+		"ft_boolean_syntax":      "+ -><()~*:\"\"&|",
+		"ft_max_word_len":        "84",
+		"ft_min_word_len":        "4",
+		"ft_query_expansion_limit": "20",
+		"ft_stopword_file":       "(built-in)",
+
+		// Misc variables
+		"big_tables":             "OFF",
+		"block_encryption_mode":  "aes-128-ecb",
+		"div_precision_increment": "4",
+		"end_markers_in_json":    "OFF",
+		"explicit_defaults_for_timestamp": "ON",
+		"foreign_key_checks":     "ON",
+		"unique_checks":          "ON",
+		"sql_auto_is_null":       "OFF",
+		"sql_big_selects":        "ON",
+		"sql_buffer_result":      "OFF",
+		"sql_log_bin":            "ON",
+		"sql_notes":              "ON",
+		"sql_quote_show_create":  "ON",
+		"sql_safe_updates":       "OFF",
+		"sql_select_limit":       "18446744073709551615",
+		"sql_warnings":           "OFF",
+		"updatable_views_with_limit": "YES",
+		"max_error_count":        "1024",
+		"max_execution_time":     "0",
+		"max_join_size":          "18446744073709551615",
+		"max_points_in_geometry": "65536",
+		"max_seeks_for_key":      "18446744073709551615",
+		"max_sp_recursion_depth": "0",
+		"max_prepared_stmt_count": "16382",
+		"stored_program_cache":   "256",
+		"stored_program_definition_cache": "256",
+		"event_scheduler":        "ON",
+		"default_week_format":    "0",
+		"default_collation_for_utf8mb4": "utf8mb4_0900_ai_ci",
+		"information_schema_stats_expiry": "86400",
+		"ngram_token_size":       "2",
+		"regexp_stack_limit":     "8000000",
+		"regexp_time_limit":      "32",
+		"cte_max_recursion_depth": "1000",
+		"internal_tmp_mem_storage_engine": "TempTable",
+		"temptable_max_mmap":     "1073741824",
+		"temptable_max_ram":      "1073741824",
+		"temptable_use_mmap":     "ON",
+		"windowing_use_high_precision": "ON",
+		"histogram_generation_max_mem_size": "20000000",
+		"use_secondary_engine":   "ON",
+		"secondary_engine_cost_threshold": "100000.000000",
+		"show_create_table_verbosity": "OFF",
+		"show_old_temporals":     "OFF",
+		"session_track_gtids":    "OFF",
+		"session_track_schema":   "ON",
+		"session_track_state_change": "OFF",
+		"session_track_system_variables": "time_zone,autocommit,character_set_client,character_set_results,character_set_connection",
+		"session_track_transaction_info": "OFF",
+		"avoid_temporal_upgrade": "OFF",
+		"show_compatibility_56":  "OFF",
+		"lc_messages":            "en_US",
+		"lc_messages_dir":        "/usr/share/mysql/",
+		"lc_time_names":          "en_US",
+
+		// Performance schema
+		"performance_schema": "ON",
+
+		// Admin
+		"admin_address": "",
+		"admin_port":    "33062",
+		"create_admin_listener_thread": "OFF",
+
+		// Bind address
+		"bind_address": "*",
+
+		// Profiling
+		"profiling":           "OFF",
+		"profiling_history_size": "15",
+
+		// Error handling
+		"error_count": "0",
+		"warning_count": "0",
+
+		// Timestamps and time
+		"timestamp":  "0",
+		"time_zone":  "SYSTEM",
+		"system_time_zone": "UTC",
+
+		// SSL/TLS
+		"have_ssl":       "YES",
+		"have_openssl":   "YES",
+		"ssl_ca":         "",
+		"ssl_capath":     "",
+		"ssl_cert":       "",
+		"ssl_cipher":     "",
+		"ssl_crl":        "",
+		"ssl_crlpath":    "",
+		"ssl_key":        "",
+		"tls_version":    "TLSv1.2,TLSv1.3",
+		"tls_ciphersuites": "",
+		"auto_generate_certs": "ON",
+		"sha256_password_auto_generate_rsa_keys": "ON",
+		"caching_sha2_password_auto_generate_rsa_keys": "ON",
+		"sha256_password_private_key_path": "private_key.pem",
+		"sha256_password_public_key_path":  "public_key.pem",
+		"caching_sha2_password_private_key_path": "private_key.pem",
+		"caching_sha2_password_public_key_path":  "public_key.pem",
+
+		// Query cache (removed in 8.0 but variables may still appear)
+		"have_query_cache":  "NO",
+		"query_cache_type":  "OFF",
+
+		// Various features
+		"have_compress":       "YES",
+		"have_dynamic_loading": "YES",
+		"have_geometry":       "YES",
+		"have_profiling":      "YES",
+		"have_rtree_keys":     "YES",
+		"have_symlink":        "DISABLED",
+		"have_statement_timeout": "YES",
+		"disabled_storage_engines": "",
+		"init_connect":        "",
+		"init_file":           "",
+
+		// MySQLX
+		"mysqlx_bind_address":                "0.0.0.0",
+		"mysqlx_connect_timeout":             "30",
+		"mysqlx_document_id_unique_prefix":   "0",
+		"mysqlx_enable_hello_notice":         "ON",
+		"mysqlx_idle_worker_thread_timeout":  "60",
+		"mysqlx_interactive_timeout":         "28800",
+		"mysqlx_max_allowed_packet":          "67108864",
+		"mysqlx_max_connections":             "100",
+		"mysqlx_min_worker_threads":          "2",
+		"mysqlx_port":                        "33060",
+		"mysqlx_port_open_timeout":           "0",
+		"mysqlx_read_timeout":                "30",
+		"mysqlx_socket":                      "/var/run/mysqld/mysqlx.sock",
+		"mysqlx_ssl_ca":                      "",
+		"mysqlx_ssl_capath":                  "",
+		"mysqlx_ssl_cert":                    "",
+		"mysqlx_ssl_cipher":                  "",
+		"mysqlx_ssl_crl":                     "",
+		"mysqlx_ssl_crlpath":                 "",
+		"mysqlx_ssl_key":                     "",
+		"mysqlx_wait_timeout":                "28800",
+		"mysqlx_write_timeout":               "60",
+		"mysqlx_compression_algorithms":      "deflate_stream,lz4_message,zstd_stream",
+		"mysqlx_deflate_default_compression_level": "3",
+		"mysqlx_deflate_max_client_compression_level": "5",
+		"mysqlx_lz4_default_compression_level": "2",
+		"mysqlx_lz4_max_client_compression_level": "8",
+		"mysqlx_zstd_default_compression_level": "3",
+		"mysqlx_zstd_max_client_compression_level": "11",
+
+		// Expire logs
+		"expire_logs_days": "0",
+
+		// Misc
+		"max_digest_length":    "1024",
+		"max_insert_delayed_threads": "20",
+		"min_examined_row_limit": "0",
+		"new":                  "OFF",
+		"old":                  "OFF",
+		"old_alter_table":      "OFF",
+		"protocol_version":     "10",
+		"select_into_buffer_size": "131072",
+		"select_into_disk_sync": "OFF",
+		"select_into_disk_sync_delay": "0",
 	}
 
 	// Override with any SET GLOBAL/SESSION values
@@ -12072,7 +12663,7 @@ func mysqlDisplayType(colType string) string {
 		return "int(11)" + suffix
 	case "BIGINT":
 		if isUnsigned {
-			return "bigint(21)" + suffix
+			return "bigint(20)" + suffix
 		}
 		return "bigint(20)" + suffix
 	case "FLOAT":
@@ -12411,15 +13002,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			}
 			n, err := strconv.ParseInt(s, 16, 64)
 			if err != nil {
-				// Overflow: decode as binary bytes (for BINARY/VARBINARY columns)
-				if len(s)%2 != 0 {
-					s = "0" + s
-				}
-				bs, hexErr := hex.DecodeString(s)
-				if hexErr != nil {
-					return v.Val, nil
-				}
-				return string(bs), nil
+				return v.Val, nil
 			}
 			return n, nil
 		case sqlparser.BitNum:
@@ -12503,6 +13086,9 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		name = strings.TrimPrefix(name, "global.")
 		name = strings.TrimPrefix(name, "session.")
 		name = strings.TrimPrefix(name, "local.")
+		// Note: We cannot distinguish @@var from @@session.var in the AST
+		// (both have Scope=SessionScope), so we don't error on session access
+		// to GLOBAL-only variables. This allows @@var to work correctly.
 		// Check for user-set global variables first
 		if gv, ok := e.globalVars[name]; ok {
 			// Apply minimum constraints
@@ -12511,14 +13097,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 					gv = "1"
 				}
 			}
-			// Try to return as int64 if it looks numeric
-			if n, err := strconv.ParseInt(gv, 10, 64); err == nil {
-				return n, nil
-			}
-			if f, err := strconv.ParseFloat(gv, 64); err == nil {
-				return f, nil
-			}
-			return gv, nil
+			return sysVarStringToSelectValueForVar(gv, name), nil
 		}
 		switch name {
 		case "version_comment":
@@ -12534,7 +13113,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		case "character_set_results":
 			return "utf8mb4", nil
 		case "collation_connection":
-			return "utf8mb4_general_ci", nil
+			return "utf8mb4_0900_ai_ci", nil
 		case "sql_mode":
 			return e.sqlMode, nil
 		case "autocommit":
@@ -12609,6 +13188,18 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return "utf8mb4_0900_ai_ci", nil
 		case "identity", "last_insert_id":
 			return e.lastInsertID, nil
+		// Variables that return NULL by default
+		case "external_user", "proxy_user",
+			"ssl_crl", "ssl_crlpath",
+			"mysqlx_ssl_crl", "mysqlx_ssl_crlpath",
+			"innodb_ft_aux_table",
+			"init_file":
+			return nil, nil
+		}
+		// Fall back to the full variables map (SHOW VARIABLES / performance_schema)
+		allVars := e.buildVariablesMap()
+		if val, ok := allVars[name]; ok {
+			return sysVarStringToSelectValueForVar(val, name), nil
 		}
 		return "", nil
 	case *sqlparser.Default:
@@ -12711,6 +13302,43 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 		return evalBinaryExpr(left, right, v.Operator)
 	case *sqlparser.ComparisonExpr:
+		// Handle IN / NOT IN specially: right side is a ValTuple
+		if v.Operator == sqlparser.InOp || v.Operator == sqlparser.NotInOp {
+			left, err := e.evalExpr(v.Left)
+			if err != nil {
+				return nil, err
+			}
+			if left == nil {
+				return nil, nil
+			}
+			if tuple, ok := v.Right.(sqlparser.ValTuple); ok {
+				hasNull := false
+				for _, item := range tuple {
+					val, err := e.evalExpr(item)
+					if err != nil {
+						return nil, err
+					}
+					if val == nil {
+						hasNull = true
+						continue
+					}
+					match, _ := compareValues(left, val, sqlparser.EqualOp)
+					if match {
+						if v.Operator == sqlparser.InOp {
+							return int64(1), nil
+						}
+						return int64(0), nil
+					}
+				}
+				if hasNull {
+					return nil, nil
+				}
+				if v.Operator == sqlparser.NotInOp {
+					return int64(1), nil
+				}
+				return int64(0), nil
+			}
+		}
 		// Allow comparison expressions to be used as boolean values (e.g. in IF args)
 		left, err := e.evalExpr(v.Left)
 		if err != nil {
@@ -13169,6 +13797,75 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 		// Return raw bytes as the weight string
 		return s, nil
+	case *sqlparser.AndExpr:
+		left, err := e.evalExpr(v.Left)
+		if err != nil {
+			return nil, err
+		}
+		right, err := e.evalExpr(v.Right)
+		if err != nil {
+			return nil, err
+		}
+		lb := isTruthy(left)
+		rb := isTruthy(right)
+		if left == nil || right == nil {
+			if (left != nil && !lb) || (right != nil && !rb) {
+				return int64(0), nil
+			}
+			return nil, nil
+		}
+		if lb && rb {
+			return int64(1), nil
+		}
+		return int64(0), nil
+	case *sqlparser.OrExpr:
+		left, err := e.evalExpr(v.Left)
+		if err != nil {
+			return nil, err
+		}
+		right, err := e.evalExpr(v.Right)
+		if err != nil {
+			return nil, err
+		}
+		lb := isTruthy(left)
+		rb := isTruthy(right)
+		if lb || rb {
+			return int64(1), nil
+		}
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		return int64(0), nil
+	case *sqlparser.BetweenExpr:
+		val, err := e.evalExpr(v.Left)
+		if err != nil {
+			return nil, err
+		}
+		from, err := e.evalExpr(v.From)
+		if err != nil {
+			return nil, err
+		}
+		to, err := e.evalExpr(v.To)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil || from == nil || to == nil {
+			return nil, nil
+		}
+		geFrom, _ := compareValues(val, from, sqlparser.GreaterEqualOp)
+		leTo, _ := compareValues(val, to, sqlparser.LessEqualOp)
+		result := geFrom && leTo
+		if v.IsBetween {
+			if result {
+				return int64(1), nil
+			}
+			return int64(0), nil
+		}
+		// NOT BETWEEN
+		if result {
+			return int64(0), nil
+		}
+		return int64(1), nil
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
 }
@@ -15530,11 +16227,6 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				if val, ok := e.correlatedRow[fullQualified]; ok {
 					return val, nil
 				}
-				// Row keys are typically unqualified (just column name),
-				// so also try lookup by bare column name in correlatedRow.
-				if val, ok := e.correlatedRow[colName]; ok {
-					return val, nil
-				}
 			}
 		}
 		// Fall back to un-prefixed lookup
@@ -15583,6 +16275,43 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		}
 		return evalBinaryExpr(left, right, v.Operator)
 	case *sqlparser.ComparisonExpr:
+		// Handle IN / NOT IN specially: right side is a ValTuple
+		if v.Operator == sqlparser.InOp || v.Operator == sqlparser.NotInOp {
+			left, err := e.evalRowExpr(v.Left, row)
+			if err != nil {
+				return nil, err
+			}
+			if left == nil {
+				return nil, nil
+			}
+			if tuple, ok := v.Right.(sqlparser.ValTuple); ok {
+				hasNull := false
+				for _, item := range tuple {
+					val, err := e.evalRowExpr(item, row)
+					if err != nil {
+						return nil, err
+					}
+					if val == nil {
+						hasNull = true
+						continue
+					}
+					match, _ := compareValues(left, val, sqlparser.EqualOp)
+					if match {
+						if v.Operator == sqlparser.InOp {
+							return int64(1), nil
+						}
+						return int64(0), nil
+					}
+				}
+				if hasNull {
+					return nil, nil
+				}
+				if v.Operator == sqlparser.NotInOp {
+					return int64(1), nil
+				}
+				return int64(0), nil
+			}
+		}
 		// Comparison in row context
 		left, err := e.evalRowExpr(v.Left, row)
 		if err != nil {
@@ -17815,13 +18544,39 @@ func compareByCollation(a, b interface{}, collation string) int {
 	aIsStr := isStringValue(a)
 	bIsStr := isStringValue(b)
 	if aIsStr || bIsStr {
-		sa := normalizeCollationKey(toString(a), collation)
-		sb := normalizeCollationKey(toString(b), collation)
+		aStr := toString(a)
+		bStr := toString(b)
+		sa := normalizeCollationKey(aStr, collation)
+		sb := normalizeCollationKey(bStr, collation)
 		if sa < sb {
 			return -1
 		}
 		if sa > sb {
 			return 1
+		}
+		// Tie-break: for case-insensitive collations (like utf8mb4_0900_ai_ci),
+		// uppercase letters sort before lowercase in MySQL.
+		// Use native charset encoding for tie-break to match MySQL byte ordering.
+		coll := strings.ToLower(collation)
+		if strings.HasSuffix(coll, "_ci") {
+			var aTie, bTie string
+			switch coll {
+			case "sjis_japanese_ci", "cp932_japanese_ci":
+				aTie = encodeStringForCollation(aStr, "sjis")
+				bTie = encodeStringForCollation(bStr, "sjis")
+			case "ujis_japanese_ci", "eucjpms_japanese_ci":
+				aTie = encodeStringForCollation(aStr, "eucjp")
+				bTie = encodeStringForCollation(bStr, "eucjp")
+			default:
+				aTie = aStr
+				bTie = bStr
+			}
+			if aTie < bTie {
+				return -1
+			}
+			if aTie > bTie {
+				return 1
+			}
 		}
 		return 0
 	}
@@ -21672,15 +22427,7 @@ func evalLiteralForPK(expr sqlparser.Expr) interface{} {
 			}
 			n, err := strconv.ParseInt(s, 16, 64)
 			if err != nil {
-				// Overflow: decode as binary bytes
-				if len(s)%2 != 0 {
-					s = "0" + s
-				}
-				bs, hexErr := hex.DecodeString(s)
-				if hexErr != nil {
-					return nil
-				}
-				return string(bs)
+				return nil
 			}
 			return n
 		case sqlparser.StrVal:
