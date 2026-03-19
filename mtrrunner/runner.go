@@ -2328,7 +2328,13 @@ func (ctx *execContext) sourceFile(filename string) error {
 	// Treat proc-control include as no-op in this single-node runner.
 	if baseName == "restart_mysqld.inc" {
 		if ctx.resultLogEnabled {
-			ctx.output.WriteString("# restart\n")
+			restartMsg := "restart"
+			if v, ok := ctx.variables["$restart_parameters"]; ok && v != "" {
+				restartMsg = v
+			}
+			ctx.output.WriteString("# " + restartMsg + "\n")
+			// Reset $restart_parameters to default after use
+			ctx.variables["$restart_parameters"] = "restart"
 		}
 		return nil
 	}

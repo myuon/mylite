@@ -2848,8 +2848,16 @@ func (e *Executor) resolveSystemVarInValue(val string) string {
 
 // handleRawSet handles SET statements that the parser couldn't parse.
 func (e *Executor) handleRawSet(raw string) error {
-	// Handle user variables: SET @var = value or SET @var := value
+	// Handle SET STARTUP: rewrite to SET GLOBAL
 	trimmed := strings.TrimSpace(raw)
+	if strings.HasPrefix(strings.ToUpper(trimmed), "SET ") {
+		rest := strings.TrimSpace(trimmed[4:])
+		if strings.HasPrefix(strings.ToUpper(rest), "STARTUP ") {
+			rewritten := "SET GLOBAL " + strings.TrimSpace(rest[8:])
+			return e.handleRawSet(rewritten)
+		}
+	}
+	// Handle user variables: SET @var = value or SET @var := value
 	if strings.HasPrefix(strings.ToUpper(trimmed), "SET ") {
 		rest := strings.TrimSpace(trimmed[4:])
 		if strings.HasPrefix(rest, "@") && !strings.HasPrefix(rest, "@@") {
@@ -5159,6 +5167,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 
 	columns := make([]catalog.ColumnDef, 0)
 	var primaryKeys []string
+	var primaryKeyOrders []string
 
 	// Check for unsupported storage engines with generated columns
 	{
@@ -5371,7 +5380,9 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 		if idx.Info.Type == sqlparser.IndexTypePrimary {
 			primaryKeys = nil
+			primaryKeyOrders = nil
 			primaryKeys = append(primaryKeys, idxCols...)
+			primaryKeyOrders = append(primaryKeyOrders, idxOrders...)
 			// Mark PK columns as NOT NULL (PRIMARY KEY implies NOT NULL)
 			for i, col := range columns {
 				for _, pk := range idxCols {
@@ -5516,6 +5527,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		Name:             tableName,
 		Columns:          columns,
 		PrimaryKey:       primaryKeys,
+		PrimaryKeyOrders: primaryKeyOrders,
 		Indexes:          indexes,
 		CheckConstraints: checkConstraints,
 	}
@@ -5562,6 +5574,8 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			def.StatsPersistent = parseTableOptionInt(opt)
 		case "STATS_AUTO_RECALC":
 			def.StatsAutoRecalc = parseTableOptionInt(opt)
+		case "STATS_SAMPLE_PAGES":
+			def.StatsSamplePages = parseTableOptionInt(opt)
 		case "TABLESPACE":
 			tablespaceName = strings.ToLower(strings.Trim(strings.TrimSpace(optVal), "`'\""))
 		case "DATA DIRECTORY":
@@ -9616,6 +9630,12 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					// Use raw expression text from the original query to preserve
 					// MySQL's behavior of keeping the original formatting (e.g.
 					// spacing after commas in function calls).
+					// Strip surrounding single quotes for string literals so the
+					// column header matches MySQL behavior (e.g. SELECT 'hello'
+					// shows column "hello", not "'hello'").
+					if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' {
+						raw = raw[1 : len(raw)-1]
+					}
 					name = raw
 				}
 				if name == "" {
@@ -11319,6 +11339,11 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					tableDef, _ := db.GetTable(tableName)
 					if tableDef != nil {
 						tableDef.StatsAutoRecalc = parseTableOptionInt(to)
+					}
+				case "STATS_SAMPLE_PAGES":
+					tableDef, _ := db.GetTable(tableName)
+					if tableDef != nil {
+						tableDef.StatsSamplePages = parseTableOptionInt(to)
 					}
 				}
 			}
@@ -13436,12 +13461,16 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		quotedPK := make([]string, len(pkCols))
 		for i, pk := range pkCols {
 			trimmed := strings.TrimSpace(pk)
+			direction := ""
+			if i < len(def.PrimaryKeyOrders) && strings.EqualFold(def.PrimaryKeyOrders[i], "DESC") {
+				direction = " DESC"
+			}
 			if strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")") {
-				quotedPK[i] = trimmed
+				quotedPK[i] = trimmed + direction
 			} else if lparen := strings.Index(trimmed, "("); lparen >= 0 {
-				quotedPK[i] = fmt.Sprintf("`%s`%s", trimmed[:lparen], trimmed[lparen:])
+				quotedPK[i] = fmt.Sprintf("`%s`%s%s", trimmed[:lparen], trimmed[lparen:], direction)
 			} else {
-				quotedPK[i] = fmt.Sprintf("`%s`", trimmed)
+				quotedPK[i] = fmt.Sprintf("`%s`%s", trimmed, direction)
 			}
 		}
 		hasMore := len(def.Indexes) > 0
@@ -13538,6 +13567,9 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	}
 	if def.StatsAutoRecalc != nil {
 		trailer += fmt.Sprintf(" STATS_AUTO_RECALC=%d", *def.StatsAutoRecalc)
+	}
+	if def.StatsSamplePages != nil {
+		trailer += fmt.Sprintf(" STATS_SAMPLE_PAGES=%d", *def.StatsSamplePages)
 	}
 	b.WriteString(trailer)
 

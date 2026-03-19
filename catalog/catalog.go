@@ -43,8 +43,10 @@ type TableDef struct {
 	Engine           string // e.g. "InnoDB", "MyISAM", "MEMORY"; empty means default (InnoDB)
 	RowFormat        string // e.g. "DYNAMIC", "COMPACT", "REDUNDANT", "COMPRESSED"
 	KeyBlockSize     *int
+	PrimaryKeyOrders []string // per-PK-column order: "", "ASC", "DESC"
 	StatsPersistent  *int
 	StatsAutoRecalc  *int
+	StatsSamplePages *int
 	CheckConstraints []CheckConstraint // CHECK constraint definitions
 }
 

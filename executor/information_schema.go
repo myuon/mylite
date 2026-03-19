@@ -435,6 +435,9 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 				if tblDef.StatsAutoRecalc != nil {
 					opts = append(opts, fmt.Sprintf("stats_auto_recalc=%d", *tblDef.StatsAutoRecalc))
 				}
+				if tblDef.StatsSamplePages != nil {
+					opts = append(opts, fmt.Sprintf("stats_sample_pages=%d", *tblDef.StatsSamplePages))
+				}
 				createOptions = strings.Join(opts, " ")
 			}
 			if stats, ok := tableStatsByKey[strings.ToLower(dbName+"."+tblName)]; ok {
