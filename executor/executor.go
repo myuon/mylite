@@ -745,34 +745,6 @@ func (e *Executor) initSystemTables() {
 			{Name: "Timestamp", Type: "TIMESTAMP"},
 		},
 	})
-
-	// Initialize sys schema stub tables/views
-	if sysDB, err := e.Catalog.GetDatabase("sys"); err == nil {
-		initSysSchema(sysDB)
-		// Create storage-backed tables and seed data for sys.version and sys.sys_config
-		e.Storage.EnsureDatabase("sys")
-		for _, tbl := range sysDB.Tables {
-			e.Storage.CreateTable("sys", tbl)
-		}
-		// Seed sys.version
-		if vt, err := e.Storage.GetTable("sys", "version"); err == nil {
-			vt.Insert(storage.Row{"sys_version": "2.1.0", "mysql_version": "8.0.36"}) //nolint:errcheck
-		}
-		// Seed sys.sys_config
-		if sct, err := e.Storage.GetTable("sys", "sys_config"); err == nil {
-			sysConfigRows := []storage.Row{
-				{"variable": "diagnostics.allow_i_s_tables", "value": "OFF", "set_time": nil, "set_by": nil},
-				{"variable": "diagnostics.include_raw", "value": "OFF", "set_time": nil, "set_by": nil},
-				{"variable": "ps_thread_trx_info.max_length", "value": "65535", "set_time": nil, "set_by": nil},
-				{"variable": "statement_performance_analyzer.limit", "value": "100", "set_time": nil, "set_by": nil},
-				{"variable": "statement_performance_analyzer.view", "value": nil, "set_time": nil, "set_by": nil},
-				{"variable": "statement_truncate_len", "value": "64", "set_time": nil, "set_by": nil},
-			}
-			for _, row := range sysConfigRows {
-				sct.Insert(row) //nolint:errcheck
-			}
-		}
-	}
 }
 
 func isSystemSchemaName(name string) bool {
@@ -782,10 +754,6 @@ func isSystemSchemaName(name string) bool {
 	default:
 		return false
 	}
-}
-
-func isSysSchemaName(name string) bool {
-	return strings.EqualFold(name, "sys")
 }
 
 func statsIndexColName(raw string) string {
@@ -2522,6 +2490,8 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			strings.HasPrefix(upper, "ALTER INSTANCE") ||
 			strings.HasPrefix(upper, "CREATE UNDO TABLESPACE") ||
 			strings.HasPrefix(upper, "DROP UNDO TABLESPACE") ||
+			strings.HasPrefix(upper, "CREATE SPATIAL REFERENCE SYSTEM") ||
+			strings.HasPrefix(upper, "DROP SPATIAL REFERENCE SYSTEM") ||
 			strings.HasPrefix(upper, "LOCK TABLE ") ||
 			strings.HasPrefix(upper, "LOCK TABLES ") ||
 			strings.HasPrefix(upper, "UNLOCK TABLE") {
@@ -7092,7 +7062,8 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				rv, exists := row[col.Name]
 				if exists && rv != nil {
 					colUpper := strings.ToUpper(col.Type)
-					isIntType := strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER")
+					isSpatialType := strings.Contains(colUpper, "POINT") || strings.Contains(colUpper, "LINESTRING") || strings.Contains(colUpper, "POLYGON") || strings.Contains(colUpper, "GEOMETRY") || strings.Contains(colUpper, "GEOMCOLLECTION")
+					isIntType := !isSpatialType && (strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER"))
 					isDecimalType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE")
 					isNumericType := isIntType || isDecimalType
 					isUnsigned := strings.Contains(colUpper, "UNSIGNED")
@@ -11841,8 +11812,6 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 			defVal = *col.Default
 		} else if col.Nullable && !isInfoSchemaTable(descDB) {
 			defVal = nil // NULL for nullable columns without explicit default (user tables)
-		} else if isSysSchemaName(descDB) {
-			defVal = nil // NULL for sys schema view columns without explicit default
 		} else {
 			defVal = "" // empty for NOT NULL or INFORMATION_SCHEMA columns
 		}
@@ -11850,8 +11819,6 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 		extra = ""
 		if col.AutoIncrement {
 			extra = "auto_increment"
-		} else if col.OnUpdateCurrentTimestamp && col.Default != nil && strings.EqualFold(*col.Default, "CURRENT_TIMESTAMP") {
-			extra = "DEFAULT_GENERATED on update CURRENT_TIMESTAMP"
 		}
 		// For TEMPORARY tables, MySQL returns NULL for the Extra column when empty
 		if e.tempTables[tableName] && extra == "" {
@@ -13336,15 +13303,7 @@ func mysqlDisplayType(colType string) string {
 	base := upper
 	suffix := ""
 	if idx := strings.Index(upper, "("); idx >= 0 {
-		// Already has width specified
-		// For ENUM/SET, preserve the case of values inside parentheses
-		basePrefix := strings.ToUpper(stripped[:idx])
-		if basePrefix == "ENUM" || basePrefix == "SET" {
-			// Lowercase only the type keyword, preserve values
-			result := strings.ToLower(stripped[:idx]) + stripped[idx:]
-			return result
-		}
-		// For other types, just lowercase everything
+		// Already has width specified, just lowercase it
 		// But also normalize REAL to DOUBLE, NUMERIC to DECIMAL, INTEGER to INT
 		result := strings.ToLower(stripped)
 		if strings.HasPrefix(result, "real") {
@@ -14423,14 +14382,17 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 		return out, nil
 	case *sqlparser.GeomFromTextExpr:
-		// Stub: return the WKT text as a binary string (opaque type)
+		// ST_GeomFromText, ST_PointFromText, ST_LineStringFromText, etc.
 		val, err := e.evalExpr(v.WktText)
 		if err != nil {
 			return nil, err
 		}
+		if val == nil {
+			return nil, nil
+		}
 		return toString(val), nil
 	case *sqlparser.GeomFormatExpr:
-		// ST_AsText/ST_AsWKT and similar geometry formatting wrappers.
+		// ST_AsText/ST_AsWKT/ST_AsBinary/ST_AsWKB
 		val, err := e.evalExpr(v.Geom)
 		if err != nil {
 			return nil, err
@@ -14439,6 +14401,213 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return nil, nil
 		}
 		return toString(val), nil
+	case *sqlparser.GeomFromWKBExpr:
+		// ST_GeomFromWKB, ST_PointFromWKB, etc. — treat WKB as passthrough
+		val, err := e.evalExpr(v.WkbBlob)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, nil
+		}
+		return toString(val), nil
+	case *sqlparser.PointPropertyFuncExpr:
+		// ST_X, ST_Y, ST_Latitude, ST_Longitude
+		ptVal, err := e.evalExpr(v.Point)
+		if err != nil {
+			return nil, err
+		}
+		if ptVal == nil {
+			return nil, nil
+		}
+		// If setter form (ST_X(pt, val)), return modified geometry
+		if v.ValueToSet != nil {
+			newVal, err := e.evalExpr(v.ValueToSet)
+			if err != nil {
+				return nil, err
+			}
+			return setSpatialPointCoord(toString(ptVal), v.Property, newVal)
+		}
+		return extractSpatialPointCoord(toString(ptVal), v.Property)
+	case *sqlparser.GeomPropertyFuncExpr:
+		// ST_IsSimple, ST_IsEmpty, ST_Dimension, ST_GeometryType, ST_Envelope, ST_SRID
+		geomVal, err := e.evalExpr(v.Geom)
+		if err != nil {
+			return nil, err
+		}
+		if geomVal == nil {
+			return nil, nil
+		}
+		return evalGeomProperty(toString(geomVal), v.Property)
+	case *sqlparser.LinestrPropertyFuncExpr:
+		// ST_EndPoint, ST_IsClosed, ST_Length, ST_NumPoints, ST_PointN, ST_StartPoint
+		lsVal, err := e.evalExpr(v.Linestring)
+		if err != nil {
+			return nil, err
+		}
+		if lsVal == nil {
+			return nil, nil
+		}
+		var propArg interface{}
+		if v.PropertyDefArg != nil {
+			propArg, err = e.evalExpr(v.PropertyDefArg)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return evalLinestrProperty(toString(lsVal), v.Property, propArg)
+	case *sqlparser.PolygonPropertyFuncExpr:
+		// ST_Area, ST_Centroid, ST_ExteriorRing, ST_InteriorRingN, ST_NumInteriorRings
+		polyVal, err := e.evalExpr(v.Polygon)
+		if err != nil {
+			return nil, err
+		}
+		if polyVal == nil {
+			return nil, nil
+		}
+		var polyArg interface{}
+		if v.PropertyDefArg != nil {
+			polyArg, err = e.evalExpr(v.PropertyDefArg)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return evalPolygonProperty(toString(polyVal), v.Property, polyArg)
+	case *sqlparser.GeomCollPropertyFuncExpr:
+		// ST_GeometryN, ST_NumGeometries
+		gcVal, err := e.evalExpr(v.GeomColl)
+		if err != nil {
+			return nil, err
+		}
+		if gcVal == nil {
+			return nil, nil
+		}
+		var gcArg interface{}
+		if v.PropertyDefArg != nil {
+			gcArg, err = e.evalExpr(v.PropertyDefArg)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return evalGeomCollProperty(toString(gcVal), v.Property, gcArg)
+	case *sqlparser.GeoJSONFromGeomExpr:
+		// ST_AsGeoJSON
+		geomVal, err := e.evalExpr(v.Geom)
+		if err != nil {
+			return nil, err
+		}
+		if geomVal == nil {
+			return nil, nil
+		}
+		return wktToGeoJSON(toString(geomVal))
+	case *sqlparser.GeomFromGeoJSONExpr:
+		// ST_GeomFromGeoJSON
+		jsonVal, err := e.evalExpr(v.GeoJSON)
+		if err != nil {
+			return nil, err
+		}
+		if jsonVal == nil {
+			return nil, nil
+		}
+		return geoJSONToWkt(toString(jsonVal))
+	case *sqlparser.GeomFromGeoHashExpr:
+		// ST_LatFromGeoHash, ST_LongFromGeoHash, ST_PointFromGeoHash
+		hashVal, err := e.evalExpr(v.GeoHash)
+		if err != nil {
+			return nil, err
+		}
+		if hashVal == nil {
+			return nil, nil
+		}
+		return evalGeomFromGeoHash(toString(hashVal), v.GeomType)
+	case *sqlparser.GeoHashFromLatLongExpr:
+		// ST_GeoHash(lat, long, maxlen)
+		latVal, err := e.evalExpr(v.Latitude)
+		if err != nil {
+			return nil, err
+		}
+		lonVal, err := e.evalExpr(v.Longitude)
+		if err != nil {
+			return nil, err
+		}
+		maxLenVal, err := e.evalExpr(v.MaxLength)
+		if err != nil {
+			return nil, err
+		}
+		if latVal == nil || lonVal == nil || maxLenVal == nil {
+			return nil, nil
+		}
+		return evalGeoHash(toFloat(latVal), toFloat(lonVal), int(toInt64(maxLenVal)))
+	case *sqlparser.GeoHashFromPointExpr:
+		// ST_GeoHash(point, maxlen)
+		ptVal, err := e.evalExpr(v.Point)
+		if err != nil {
+			return nil, err
+		}
+		maxLenVal, err := e.evalExpr(v.MaxLength)
+		if err != nil {
+			return nil, err
+		}
+		if ptVal == nil || maxLenVal == nil {
+			return nil, nil
+		}
+		coords := parseSpatialPointCoords(toString(ptVal))
+		if coords == nil {
+			return nil, nil
+		}
+		return evalGeoHash(coords[0], coords[1], int(toInt64(maxLenVal)))
+	case *sqlparser.LineStringExpr:
+		// LINESTRING(pt, pt, ...)
+		var parts []string
+		for _, p := range v.PointParams {
+			pv, err := e.evalExpr(p)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, extractPointCoords(toString(pv)))
+		}
+		return fmt.Sprintf("LINESTRING(%s)", strings.Join(parts, ",")), nil
+	case *sqlparser.PolygonExpr:
+		// POLYGON(ls, ...)
+		var rings []string
+		for _, ls := range v.LinestringParams {
+			lv, err := e.evalExpr(ls)
+			if err != nil {
+				return nil, err
+			}
+			rings = append(rings, extractRingCoords(toString(lv)))
+		}
+		return fmt.Sprintf("POLYGON(%s)", strings.Join(rings, ",")), nil
+	case *sqlparser.MultiPointExpr:
+		var parts []string
+		for _, p := range v.PointParams {
+			pv, err := e.evalExpr(p)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, extractPointCoords(toString(pv)))
+		}
+		return fmt.Sprintf("MULTIPOINT(%s)", strings.Join(parts, ",")), nil
+	case *sqlparser.MultiLinestringExpr:
+		var parts []string
+		for _, ls := range v.LinestringParams {
+			lv, err := e.evalExpr(ls)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, extractRingCoords(toString(lv)))
+		}
+		return fmt.Sprintf("MULTILINESTRING(%s)", strings.Join(parts, ",")), nil
+	case *sqlparser.MultiPolygonExpr:
+		var parts []string
+		for _, p := range v.PolygonParams {
+			pv, err := e.evalExpr(p)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, extractPolygonCoords(toString(pv)))
+		}
+		return fmt.Sprintf("MULTIPOLYGON(%s)", strings.Join(parts, ",")), nil
 	case *sqlparser.CharExpr:
 		// CHAR(N1, N2, ...) — convert integers to characters
 		var sb strings.Builder
@@ -14689,8 +14858,6 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.Variance:
 		return nil, nil
 	case *sqlparser.VarPop:
-		return nil, nil
-	case *sqlparser.GeomPropertyFuncExpr:
 		return nil, nil
 	case *sqlparser.RegexpSubstrExpr:
 		rsExprVal, err := e.evalExpr(v.Expr)
@@ -17805,6 +17972,10 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return int64(1), nil
 		}
 		return int64(0), nil
+	}
+	// Try spatial functions
+	if result, handled, err := evalSpatialFunc(e, name, v.Exprs); handled {
+		return result, err
 	}
 	// Try user-defined function from catalog
 	if result, err := e.callUserDefinedFunction(name, v.Exprs, nil); err == nil {

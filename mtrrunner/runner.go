@@ -301,8 +301,6 @@ type execContext struct {
 	verticalResult   bool           // format next query result as vertical key/value pairs
 	verticalResults  bool           // persistent vertical output mode (--vertical_results)
 	infoEnabled      bool           // --enable_info: show affected rows and info after DML
-	queryLogDisableOnce  bool // re-enable query log after next statement
-	resultLogDisableOnce bool // re-enable result log after next statement
 	skipped          bool           // set to true when --skip directive is encountered
 	sourceDepth      int            // current --source recursion depth
 	ttsBackups       map[string]tableSnapshot
@@ -807,22 +805,8 @@ func (ctx *execContext) executeLines(lines []string) error {
 				}
 			}
 		}
-		// Restore query/result log if ONCE was set
-		ctx.restoreOnceFlags()
 	}
 	return nil
-}
-
-// restoreOnceFlags re-enables query/result log after a statement when ONCE was used.
-func (ctx *execContext) restoreOnceFlags() {
-	if ctx.queryLogDisableOnce {
-		ctx.queryLogEnabled = true
-		ctx.queryLogDisableOnce = false
-	}
-	if ctx.resultLogDisableOnce {
-		ctx.resultLogEnabled = true
-		ctx.resultLogDisableOnce = false
-	}
 }
 
 func (ctx *execContext) handleDirective(directive string) (handled bool, skip bool, err error) {
@@ -858,24 +842,16 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 
 	case "disable_query_log":
 		ctx.queryLogEnabled = false
-		if strings.TrimSpace(strings.ToUpper(args)) == "ONCE" {
-			ctx.queryLogDisableOnce = true
-		}
 		return true, false, nil
 	case "enable_query_log":
 		ctx.queryLogEnabled = true
-		ctx.queryLogDisableOnce = false
 		return true, false, nil
 
 	case "disable_result_log":
 		ctx.resultLogEnabled = false
-		if strings.TrimSpace(strings.ToUpper(args)) == "ONCE" {
-			ctx.resultLogDisableOnce = true
-		}
 		return true, false, nil
 	case "enable_result_log":
 		ctx.resultLogEnabled = true
-		ctx.resultLogDisableOnce = false
 		return true, false, nil
 	case "vertical_results":
 		ctx.verticalResults = true
@@ -1107,7 +1083,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"disable_session_track_info", "enable_session_track_info",
 		"disable_connect_log", "enable_connect_log",
 		"send", "reap", "sleep", "send_shutdown",
-		"replace_regex",
+		"replace_regex", "replace_numeric_round",
 		"write_file", "append_file", "cat_file",
 		"mkdir", "rmdir", "move_file",
 		"list_files", "file_exists",
