@@ -198,6 +198,104 @@ var skipTests = map[string]bool{
 	"innodb_fts/tablespace_location": true,
 	// Requires innodb_ft_server_stopword_table SET validation and FTS stopword configuration
 	"innodb_fts/stopword": true,
+
+	// === binlog_gtid suite ===
+	// Requires BINLOG statement (binary log event replay) - replication feature
+	"binlog_gtid/binlog_gtid_not_yet_determined_reacquire": true,
+	// Requires GTID_NEXT session variable and GTID ownership tracking
+	"binlog_gtid/binlog_gtid_select_taking_write_locks": true,
+	// Requires SHOW BINLOG EVENTS and binary log position tracking
+	"binlog_gtid/binlog_gtid_show_binlog_events": true,
+	// Requires XA transaction recovery with GTID - hangs waiting for binlog
+	"binlog_gtid/binlog_gtid_unknown_xid": true,
+	// Requires GTID_SUBSET/GTID_SUBTRACT functions and GTID arithmetic
+	"binlog_gtid/binlog_gtid_utils": true,
+	// Requires mysql.gtid_executed system table
+	"binlog_gtid/binlog_shutdown_hang": true,
+
+	// === parts suite ===
+	// Partition-specific error: blocked SQL functions in partition expressions
+	"parts/part_blocked_sql_func_innodb": true,
+	// EXCHANGE PARTITION requires partition-aware table management
+	"parts/part_exch_valid_hash_innodb":  true,
+	"parts/part_exch_valid_key_innodb":   true,
+	"parts/part_exch_valid_list_innodb":  true,
+	"parts/part_exch_valid_range_innodb": true,
+	// Partition DML tests require partition-aware row ordering and partition pruning
+	"parts/partition-dml-1-1-innodb-modes": true,
+	"parts/partition-dml-1-1-innodb":       true,
+	"parts/partition-dml-1-10-innodb":      true,
+	"parts/partition-dml-1-11-innodb":      true,
+	"parts/partition-dml-1-12-innodb":      true,
+	// Requires CREATE PROCEDURE with cursor/loop control flow
+	"parts/partition-dml-1-2-innodb": true,
+	"parts/partition-dml-1-3-innodb": true,
+	"parts/partition-dml-1-4-innodb": true,
+	"parts/partition-dml-1-5-innodb": true,
+	"parts/partition-dml-1-6-innodb": true,
+	"parts/partition-dml-1-7-innodb": true,
+	"parts/partition-dml-1-8-innodb": true,
+	"parts/partition-dml-1-9-innodb": true,
+	// ALTER TABLE with partition reorganization (ADD/DROP/REORGANIZE PARTITION)
+	"parts/partition_alter3_innodb": true,
+	// ANALYZE TABLE output includes partition-specific status rows
+	"parts/partition_analyze": true,
+	// Partition auto-increment with multi-column PRIMARY KEY across partitions
+	"parts/partition_auto_increment_innodb": true,
+	// DATA DIRECTORY / INDEX DIRECTORY with partitions (symlink-based)
+	"parts/partition_basic_symlink_innodb": true,
+	// BIT type ordering differs across partitions
+	"parts/partition_bit_innodb": true,
+	// CHAR type ordering differs across partitions
+	"parts/partition_char_innodb": true,
+	// Partition-specific error validation (duplicate definitions, etc.) stripped by mylite
+	"parts/partition_check": true,
+	// DATETIME ordering differs across partitions
+	"parts/partition_datetime_innodb": true,
+	// DECIMAL out-of-range handling differs with partition constraints
+	"parts/partition_decimal_innodb": true,
+	// Requires COUNT(*) IN (...) subquery form and partition transaction isolation
+	"parts/partition_engine_innodb": true,
+	// EXCHANGE PARTITION between partitioned and non-partitioned tables
+	"parts/partition_exch_innodb":         true,
+	"parts/partition_exch_myisam_innodb":  true,
+	"parts/partition_exch_qa_10":          true,
+	"parts/partition_exch_qa_11":          true,
+	"parts/partition_exch_qa_12":          true,
+	"parts/partition_exch_qa_13":          true,
+	"parts/partition_exch_qa_15":          true,
+	"parts/partition_exch_qa_1_innodb":    true,
+	"parts/partition_exch_qa_2":           true,
+	"parts/partition_exch_qa_3":           true,
+	"parts/partition_exch_qa_4_innodb":    true,
+	"parts/partition_exch_qa_5_innodb":    true,
+	"parts/partition_exch_qa_6":           true,
+	"parts/partition_exch_qa_7_innodb":    true,
+	"parts/partition_exch_qa_8_innodb":    true,
+	// FLOAT ordering differs across partitions
+	"parts/partition_float_innodb": true,
+	// EXPLAIN output differences (index condition pushdown with partitions)
+	"parts/partition_icp": true,
+	// Requires InnoDB status file and lock wait timeout with partitions
+	"parts/partition_innodb_status_file": true,
+	// INT ordering differs across partitions
+	"parts/partition_int_innodb": true,
+	// Partition-specific error validation (duplicate list values, duplicate names)
+	"parts/partition_list_error": true,
+	// REORGANIZE PARTITION (divide) requires partition management
+	"parts/partition_reorg_divide": true,
+	// REORGANIZE PARTITION (merge) requires partition management
+	"parts/partition_reorg_merge": true,
+	// Reverse scan with ICP differs in partition ordering
+	"parts/partition_reverse_scan_icp": true,
+	// Requires multi-connection lock timeout with partitioned tables
+	"parts/partition_special_innodb": true,
+	// Partition syntax validation errors stripped by mylite (duplicate names, overlapping ranges)
+	"parts/partition_syntax_innodb": true,
+	// Partition-specific value range error validation stripped by mylite
+	"parts/partition_value_error": true,
+	// Replication with partitioned DML
+	"parts/rpl-partition-dml-1-1-innodb": true,
 }
 
 func main() {
@@ -265,6 +363,8 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		"gcol":         true,
 		"gis":          true,
 		"innodb_fts":   true,
+		"binlog_gtid":  true,
+		"parts":        true,
 		// collations: skipped — requires MySQL UCA 0900 weight tables (DUCET + tailoring)
 	}
 
