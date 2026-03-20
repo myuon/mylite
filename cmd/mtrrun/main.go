@@ -372,6 +372,284 @@ var skipTests = map[string]bool{
 	"secondary_engine/query_preparation":  true,
 	"secondary_engine/system_variables":   true,
 	"secondary_engine/uninstall":          true,
+
+	// === innodb suite ===
+	// ERROR: ALTER TABLE RENAME requires source table to exist
+	"innodb/alter_rename_existing": true,
+	// ERROR: Auto-increment duplicate entry on INSERT with 0
+	"innodb/autoinc_persist": true,
+	// TIMEOUT: Requires replication setup
+	"innodb/create_tablespace_replication": true,
+	// ERROR: CREATE TABLE with ROW_FORMAT not persisted correctly
+	"innodb/default_row_format_16k": true,
+	// ERROR: ALTER TABLE ROW_FORMAT on tablespace tables
+	"innodb/default_row_format_tablespace": true,
+	// ERROR: Foreign key constraint with long table names
+	"innodb/foreign_key": true,
+	// TIMEOUT: Multi-connection high priority transaction tests
+	"innodb/high_prio_trx_1":         true,
+	"innodb/high_prio_trx_2":         true,
+	"innodb/high_prio_trx_3":         true,
+	"innodb/high_prio_trx_4":         true,
+	"innodb/high_prio_trx_6":         true,
+	"innodb/high_prio_trx_fk":        true,
+	"innodb/high_prio_trx_predicate": true,
+	"innodb/high_prio_trx_rpl":       true,
+	// ERROR: ALTER TABLE ADD column that already exists
+	"innodb/innodb-alter-autoinc": true,
+	// TIMEOUT: ALTER TABLE nullable column changes
+	"innodb/innodb-alter-nullable": true,
+	// ERROR: ALTER TABLE CHANGE with incomplete syntax
+	"innodb/innodb-alter": true,
+	// ERROR: Auto-increment duplicate entry
+	"innodb/innodb-autoinc-44030": true,
+	// ERROR: Auto-increment duplicate entry with negative values
+	"innodb/innodb-autoinc": true,
+	// TIMEOUT: Multi-connection bug test
+	"innodb/innodb-bug12552164": true,
+	// TIMEOUT: Import partition with replication
+	"innodb/innodb-import-partition-rpl": true,
+	// ERROR: CREATE INDEX on non-existent column
+	"innodb/innodb-index": true,
+	// ERROR: Cross-database table references
+	"innodb/innodb-wl6445-2": true,
+	"innodb/innodb-wl6445":   true,
+	// TIMEOUT: WL6742 feature test
+	"innodb/innodb-wl6742": true,
+	// ERROR: Auto-increment duplicate entry
+	"innodb/innodb": true,
+	// ERROR: User variable assignment in REPLACE INTO with views
+	"innodb/innodb_buffer_pool_resize":             true,
+	"innodb/innodb_buffer_pool_resize_with_chunks": true,
+	// ERROR: DROP PROCEDURE that doesn't exist
+	"innodb/innodb_bug30919": true,
+	// ERROR: Unsupported innodb_commit_concurrency variable
+	"innodb/innodb_bug42101-nonzero": true,
+	// ERROR: Subquery returns more than 1 row
+	"innodb/innodb_bug42419": true,
+	// ERROR: Data too long for column with multi-byte chars
+	"innodb/innodb_bug44032": true,
+	// ERROR: CREATE TABLE parse error
+	"innodb/innodb_bug48024": true,
+	// ERROR: Duplicate entry on INSERT
+	"innodb/innodb_bug53046": true,
+	// TIMEOUT: Multi-connection bug test
+	"innodb/innodb_bug59641": true,
+	// ERROR: CHECK TABLE not supported
+	"innodb/innodb_bulk_create_index":       true,
+	"innodb/innodb_bulk_create_index_small": true,
+	// TIMEOUT: Replication bulk create index
+	"innodb/innodb_bulk_create_index_replication": true,
+	// ERROR: Table doesn't exist after force recovery
+	"innodb/innodb_force_recovery": true,
+	// TIMEOUT: INFORMATION_SCHEMA INNODB_TRX table
+	"innodb/innodb_i_s_innodb_trx": true,
+	// TIMEOUT: Multi-connection lock wait timeout
+	"innodb/innodb_lock_wait_timeout_1": true,
+	// TIMEOUT: Complex misc test with multi-connection
+	"innodb/innodb_misc1": true,
+	// TIMEOUT: Server restart with prefix index
+	"innodb/innodb_prefix_index_restart_server": true,
+	// ERROR: ALTER TABLE RENAME INDEX with DROP INDEX
+	"innodb/innodb_rename_index": true,
+	// ERROR: INSERT INTO mysql.innodb_index_stats system table
+	"innodb/innodb_stats_rename_table_if_exists": true,
+	// TIMEOUT: Multi-connection timeout rollback
+	"innodb/innodb_timeout_rollback": true,
+	// ERROR: Duplicate entry on INSERT
+	"innodb/innodb_wl6470": true,
+	// ERROR: Data too long for VARBINARY column
+	"innodb/instant_add_column_basic": true,
+	// ERROR: Duplicate entry on INSERT
+	"innodb/instant_add_column_clear": true,
+	// ERROR: ALTER TABLE ADD duplicate column
+	"innodb/instant_add_column_limitations": true,
+	// TIMEOUT: INSERT ON DUPLICATE KEY UPDATE multi-connection
+	"innodb/iodku": true,
+	// TIMEOUT: JSON partial update tests
+	"innodb/json_small_partial_update_00": true,
+	"innodb/json_small_partial_update_01": true,
+	"innodb/json_small_partial_update_02": true,
+	"innodb/json_small_partial_update_03": true,
+	// ERROR: Table doesn't exist after encryption
+	"innodb/log_encrypt_3": true,
+	// TIMEOUT: Multi-value index test
+	"innodb/multi_value_basic": true,
+	// ERROR: DELETE with alias and subquery
+	"innodb/partition": true,
+	// ERROR: Unsupported function innodb_redo_log_archive_start
+	"innodb/redo_log_archive_01": true,
+	// ERROR: CREATE TABLE LIKE cross-database
+	"innodb/table_compress": true,
+	// TIMEOUT: Table encryption test
+	"innodb/table_encrypt_3": true,
+	// ERROR: Table doesn't exist after encryption
+	"innodb/table_encrypt_5":      true,
+	"innodb/tablespace_encrypt_6": true,
+	// ERROR: SAVEPOINT/ROLLBACK TO with temp tables
+	"innodb/temp_table_savepoint": true,
+	// TIMEOUT: Virtual column basic operations
+	"innodb/virtual_basic": true,
+	// ERROR: ALTER TABLE ADD generated column
+	"innodb/virtual_index": true,
+
+	// === innodb suite FAIL tests ===
+	// ALTER TABLE with page size validation
+	"innodb/alter_page_size": true,
+	// ALTER TABLE RENAME with extra features
+	"innodb/alter_rename_existing_xtra": true,
+	// ALTER TABLE stage progress monitoring
+	"innodb/alter_table_stage_progress": true,
+	// ALTER TABLE with tablespace partitions
+	"innodb/alter_tablespace_partition": true,
+	// IBD file size validation
+	"innodb/check_ibd_filesize_16k": true,
+	// CREATE INDEX edge cases
+	"innodb/create-index": true,
+	// CREATE TABLESPACE with partitions
+	"innodb/create_tablespace_partition": true,
+	// Multi-connection deadlock detection
+	"innodb/deadlock_detect": true,
+	// DEFAULT ROW_FORMAT system variable
+	"innodb/default_row_format": true,
+	// EVENT with temp table path
+	"innodb/events-merge-tmp-path": true,
+	// Index tree operation internals
+	"innodb/index_tree_operation": true,
+	// ALTER TABLE WL6554 feature
+	"innodb/innodb-alter-wl6554": true,
+	// Bug fix test with specific InnoDB behavior
+	"innodb/innodb-bug14219515": true,
+	// IMPORT/EXPORT partition
+	"innodb/innodb-import-partition": true,
+	// Index with UCS2 charset
+	"innodb/innodb-index_ucs2": true,
+	// Large prefix index
+	"innodb/innodb-large-prefix": true,
+	// Semi-consistent read (multi-connection)
+	"innodb/innodb-semi-consistent": true,
+	// TRUNCATE TABLE edge cases
+	"innodb/innodb-truncate": true,
+	// UCS2 charset handling
+	"innodb/innodb-ucs2": true,
+	// UPDATE then INSERT ordering
+	"innodb/innodb-update-insert": true,
+	// IMPORT/EXPORT tablespace WL5522
+	"innodb/innodb-wl5522-1": true,
+	// 32K page size specific behavior
+	"innodb/innodb_32k": true,
+	// Auto-increment lock mode zero
+	"innodb/innodb_autoinc_lock_mode_zero": true,
+	// Buffer pool dump percentage
+	"innodb/innodb_buffer_pool_dump_pct": true,
+	// InnoDB bug fix tests
+	"innodb/innodb_bug11789106": true,
+	"innodb/innodb_bug11933790": true,
+	"innodb/innodb_bug12661768": true,
+	"innodb/innodb_bug21704":    true,
+	"innodb/innodb_bug46000":    true,
+	"innodb/innodb_bug46676":    true,
+	"innodb/innodb_bug47777":    true,
+	"innodb/innodb_bug51378":    true,
+	"innodb/innodb_bug51920":    true,
+	"innodb/innodb_bug53592":    true,
+	"innodb/innodb_bug54044":    true,
+	"innodb/innodb_bug57904":    true,
+	// LDML collation test
+	"innodb/innodb_ctype_ldml": true,
+	// INFORMATION_SCHEMA cached indexes
+	"innodb/innodb_i_s_cached_indexes": true,
+	// INFORMATION_SCHEMA multi-file tablespace
+	"innodb/innodb_i_s_multi_file_tablespace": true,
+	// INFORMATION_SCHEMA buffer pool
+	"innodb/innodb_information_schema_buffer": true,
+	// IO prefetch settings
+	"innodb/innodb_io_pf": true,
+	// InnoDB rollback behavior
+	"innodb/innodb_mysql_rbk": true,
+	// InnoDB stats auto recalc
+	"innodb/innodb_stats_auto_recalc":     true,
+	"innodb/innodb_stats_auto_recalc_ddl": true,
+	"innodb/innodb_stats_drop_locked":     true,
+	"innodb/innodb_stats_flag_global_off": true,
+	"innodb/innodb_stats_long_names":      true,
+	"innodb/innodb_stats_sample_pages":    true,
+	"innodb/innodb_stats_table_flag_sample_pages": true,
+	// WL6469 online DDL
+	"innodb/innodb_wl6469_1": true,
+	// WL6915 feature
+	"innodb/innodb_wl6915": true,
+	// WL8114 feature
+	"innodb/innodb_wl8114": true,
+	// Instant add column with auto-increment
+	"innodb/instant_add_column_autoinc": true,
+	// Instant add column long
+	"innodb/instant_add_column_long": true,
+	// LOB (large object) operations
+	"innodb/lob_compact":        true,
+	"innodb/lob_import_export":  true,
+	"innodb/lob_mvcc":           true,
+	"innodb/lob_vjhi":           true,
+	// Log buffer size settings
+	"innodb/log_buffer_size": true,
+	// Log spin variables
+	"innodb/log_spin_vars": true,
+	// InnoDB monitor output
+	"innodb/monitor": true,
+	// Partition auto-increment
+	"innodb/partition_autoinc": true,
+	// Buffer pool eviction percentage
+	"innodb/pct_cached_evict": true,
+	// Read-only mode
+	"innodb/readonly": true,
+	// Redo log archive
+	"innodb/redo_log_archive_04": true,
+	// Foreign key rename operations
+	"innodb/rename_fk_1": true,
+	"innodb/rename_fk_2": true,
+	// SKIP LOCKED / NOWAIT with isolation levels
+	"innodb/skip_locked_nowait_isolation": true,
+	// Stored foreign key operations
+	"innodb/stored_fk": true,
+	// Strict mode validation
+	"innodb/strict_mode": true,
+	// Subpartition operations
+	"innodb/subpartition": true,
+	// Tablespace per table (non-Windows)
+	"innodb/tablespace_per_table_not_windows": true,
+	// Tablespace portability
+	"innodb/tablespace_portability": true,
+	// Temp table operations
+	"innodb/temp_table": true,
+	// Temporary table optimization
+	"innodb/temporary_table_optimization": true,
+	// Timestamp handling
+	"innodb/timestamp": true,
+	// Tmpdir configuration
+	"innodb/tmpdir": true,
+	// TRUNCATE TABLE
+	"innodb/truncate": true,
+	// Undo tablespace
+	"innodb/undo": true,
+	// UPDATE_TIME WL6658
+	"innodb/update_time_wl6658": true,
+	// Virtual column foreign key
+	"innodb/virtual_fk":         true,
+	"innodb/virtual_fk_restart": true,
+	// Virtual column purge
+	"innodb/virtual_purge": true,
+	// Virtual column statistics
+	"innodb/virtual_stats": true,
+	// ZLOB import/export
+	"innodb/zlob_import_export": true,
+	// ZLOB redundant partial update
+	"innodb/zlob_redundant_partial_update": true,
+
+	// === stress suite ===
+	// TIMEOUT: DDL stress tests that exceed timeout
+	"stress/ddl_csv":    true,
+	"stress/ddl_innodb": true,
+	"stress/ddl_memory": true,
 }
 
 func main() {
@@ -443,6 +721,8 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		"parts":        true,
 		"funcs_1":      true,
 		"secondary_engine": true,
+		"innodb":           true,
+		"stress":           true,
 		// collations: skipped — requires MySQL UCA 0900 weight tables (DUCET + tailoring)
 	}
 
