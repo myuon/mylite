@@ -1191,6 +1191,38 @@ func allCharsets() [][]interface{} {
 	}
 }
 
+// isKnownCharset returns true if the charset name is a valid MySQL character set.
+func isKnownCharset(name string) bool {
+	name = strings.ToLower(name)
+	// Also accept utf8mb3 as alias for utf8
+	if name == "utf8mb3" {
+		return true
+	}
+	for _, cs := range allCharsets() {
+		if strings.ToLower(cs[0].(string)) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// isKnownCollation returns true if the collation name is a valid MySQL collation.
+// This is a simplified check that accepts any collation name that starts with a known charset prefix.
+func isKnownCollation(name string) bool {
+	name = strings.ToLower(name)
+	for _, cs := range allCharsets() {
+		csName := strings.ToLower(cs[0].(string))
+		if strings.HasPrefix(name, csName+"_") || name == csName {
+			return true
+		}
+	}
+	// Also check utf8mb3_ prefix
+	if strings.HasPrefix(name, "utf8mb3_") {
+		return true
+	}
+	return false
+}
+
 func matchLike(s, pattern string) bool {
 	// Convert to runes for proper multibyte character handling
 	sr := []rune(strings.ToLower(s))
@@ -1582,6 +1614,16 @@ func normalizeTypeAliases(query string) string {
 	result = replaceTypeWord(result, "FIXED", "DECIMAL")
 	result = replaceTypeWord(result, "NUMERIC", "DECIMAL")
 	result = replaceTypeWord(result, "SERIAL", "BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE")
+	result = replaceTypeWord(result, "INT1", "TINYINT")
+	result = replaceTypeWord(result, "INT2", "SMALLINT")
+	result = replaceTypeWord(result, "INT3", "MEDIUMINT")
+	result = replaceTypeWord(result, "INT4", "INT")
+	result = replaceTypeWord(result, "INT8", "BIGINT")
+	result = replaceTypeWord(result, "MIDDLEINT", "MEDIUMINT")
+	result = replaceTypeWord(result, "FLOAT4", "FLOAT")
+	result = replaceTypeWord(result, "FLOAT8", "DOUBLE")
+	result = replaceTypeWord(result, "LONG VARBINARY", "MEDIUMBLOB")
+	result = replaceTypeWord(result, "LONG VARCHAR", "MEDIUMTEXT")
 	return result
 }
 
@@ -1677,6 +1719,104 @@ func normalizeAddIndexUsing(query string) string {
 	// With name: ADD KEY i1 USING BTREE (col) -> ADD KEY i1 (col) USING BTREE
 	re2 := regexp.MustCompile(`(?i)(ADD\s+(UNIQUE\s+)?(KEY|INDEX)\s+` + "`?" + `\w+` + "`?" + `)\s+USING\s+(\w+)\s*(\([^)]*\))`)
 	query = re2.ReplaceAllString(query, "${1} ${5} USING ${4}")
+	return query
+}
+
+// isIdentChar returns true if the byte could be part of a SQL identifier.
+func isIdentChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b == '$'
+}
+
+// normalizeCreateTableEngineSelect strips table options (ENGINE=, CHARSET=, etc.)
+// between the table name and SELECT clause in CREATE TABLE statements so the
+// vitess parser can handle them. The engine is ignored since mylite uses its
+// own storage engine for all tables.
+func normalizeCreateTableEngineSelect(query string) string {
+	upper := strings.ToUpper(query)
+	if !strings.HasPrefix(upper, "CREATE TABLE") && !strings.HasPrefix(upper, "CREATE TEMPORARY TABLE") {
+		return query
+	}
+	// Find SELECT keyword (not inside parentheses)
+	depth := 0
+	selectIdx := -1
+	for i := 0; i < len(query)-7; i++ {
+		switch query[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case '\'':
+			// Skip string literals
+			for i++; i < len(query) && query[i] != '\''; i++ {
+				if query[i] == '\\' {
+					i++
+				}
+			}
+		}
+		if depth == 0 && (query[i] == 's' || query[i] == 'S') {
+			if i+7 <= len(query) && strings.EqualFold(query[i:i+7], "SELECT ") {
+				// Ensure SELECT is a standalone keyword (preceded by space/newline, not part of identifier)
+				if i == 0 || !isIdentChar(query[i-1]) {
+					selectIdx = i
+					break
+				}
+			}
+		}
+	}
+	if selectIdx < 0 {
+		return query
+	}
+	// Check if there are table options between the table name and SELECT
+	// CREATE [TEMPORARY] TABLE name [options] SELECT ...
+	prefix := query[:selectIdx]
+	upperPrefix := strings.ToUpper(prefix)
+	// Strip known table options: ENGINE=x, DEFAULT CHARSET=x, COLLATE=x, ROW_FORMAT=x, etc.
+	reOpts := regexp.MustCompile(`(?i)\b(?:ENGINE|TYPE|ROW_FORMAT|KEY_BLOCK_SIZE|AVG_ROW_LENGTH|MIN_ROWS|MAX_ROWS|PACK_KEYS|CHECKSUM|DELAY_KEY_WRITE|DATA\s+DIRECTORY|INDEX\s+DIRECTORY|AUTO_INCREMENT|INSERT_METHOD|STATS_AUTO_RECALC|STATS_PERSISTENT|STATS_SAMPLE_PAGES)\s*=\s*\S+`)
+	cleaned := reOpts.ReplaceAllString(prefix, " ")
+	reCharset := regexp.MustCompile(`(?i)\bDEFAULT\s+(?:CHARSET|CHARACTER\s+SET)\s*=?\s*\S+`)
+	cleaned = reCharset.ReplaceAllString(cleaned, " ")
+	reCharset2 := regexp.MustCompile(`(?i)\b(?:CHARSET|CHARACTER\s+SET)\s*=?\s*\S+`)
+	cleaned = reCharset2.ReplaceAllString(cleaned, " ")
+	reCollate := regexp.MustCompile(`(?i)\bCOLLATE\s*=?\s*\S+`)
+	cleaned = reCollate.ReplaceAllString(cleaned, " ")
+	reComment := regexp.MustCompile(`(?i)\bCOMMENT\s*=?\s*'[^']*'`)
+	cleaned = reComment.ReplaceAllString(cleaned, " ")
+	_ = upperPrefix
+	// Collapse multiple spaces
+	cleaned = regexp.MustCompile(`\s+`).ReplaceAllString(cleaned, " ")
+	return strings.TrimSpace(cleaned) + " " + query[selectIdx:]
+}
+
+// normalizeCreateTableIndexUsing rewrites "PRIMARY KEY USING BTREE (cols)" and
+// "KEY name USING BTREE (cols)" in CREATE TABLE to move USING after the column list
+// so the vitess parser can handle it.
+func normalizeCreateTableIndexUsing(query string) string {
+	upper := strings.ToUpper(query)
+	if !strings.Contains(upper, " USING ") {
+		return query
+	}
+	if !strings.Contains(upper, "CREATE TABLE") && !strings.Contains(upper, "CREATE TEMPORARY TABLE") {
+		return query
+	}
+	// PRIMARY KEY USING BTREE/HASH (cols) -> PRIMARY KEY (cols)
+	re1 := regexp.MustCompile(`(?i)(PRIMARY\s+KEY)\s+USING\s+(\w+)\s*(\([^)]*\))`)
+	query = re1.ReplaceAllString(query, "${1} ${3} USING ${2}")
+	// UNIQUE KEY [name] USING BTREE (cols) -> UNIQUE KEY [name] (cols) USING BTREE
+	re2 := regexp.MustCompile("(?i)(UNIQUE\\s+(?:KEY|INDEX))\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
+	query = re2.ReplaceAllString(query, "${1} ${3} USING ${2}")
+	re3 := regexp.MustCompile("(?i)(UNIQUE\\s+(?:KEY|INDEX)\\s+`?\\w+`?)\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
+	query = re3.ReplaceAllString(query, "${1} ${3} USING ${2}")
+	// KEY/INDEX [name] USING BTREE (cols) -> KEY [name] (cols) USING BTREE
+	re4 := regexp.MustCompile("(?i)((?:KEY|INDEX))\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
+	query = re4.ReplaceAllString(query, "${1} ${3} USING ${2}")
+	re5 := regexp.MustCompile("(?i)((?:KEY|INDEX)\\s+`?\\w+`?)\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
+	query = re5.ReplaceAllString(query, "${1} ${3} USING ${2}")
+	// UNIQUE name USING BTREE (cols) -> UNIQUE KEY name (cols) USING BTREE
+	re6 := regexp.MustCompile("(?i)(UNIQUE)\\s+(`?\\w+`?)\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
+	query = re6.ReplaceAllString(query, "${1} KEY ${2} ${4} USING ${3}")
+	// UNIQUE USING BTREE (cols) -> UNIQUE KEY (cols) USING BTREE (no name)
+	re7 := regexp.MustCompile("(?i)(UNIQUE)\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
+	query = re7.ReplaceAllString(query, "${1} KEY ${3} USING ${2}")
 	return query
 }
 
@@ -2341,9 +2481,13 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	// Fix vitess parser issue: "ADD KEY USING BTREE (col)" is not parsed correctly.
 	// Rewrite to "ADD KEY (col)" since BTREE is the default for InnoDB.
 	query = normalizeAddIndexUsing(query)
+	// Fix CREATE TABLE with "KEY/INDEX/PRIMARY KEY USING BTREE/HASH (cols)" syntax
+	query = normalizeCreateTableIndexUsing(query)
 	query = normalizeForShareOf(query)
 	query = normalizeMemberOperator(query)
 	query = normalizeJSONTableDefaultOrder(query)
+	// Fix CREATE TABLE name ENGINE=xxx SELECT ... (vitess fails to parse engine+select combo)
+	query = normalizeCreateTableEngineSelect(query)
 	trimmed = strings.TrimSpace(query)
 	upper = strings.ToUpper(trimmed)
 	// Multi-value index does not allow explicit ASC/DESC on key part.
@@ -2380,10 +2524,32 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return e.execAlterTableOrderBy(trimmed)
 	}
 
+	// Handle PREPARE stmt FROM @user_variable (vitess can't parse user variable here)
+	if strings.HasPrefix(upper, "PREPARE ") {
+		if re := regexp.MustCompile(`(?i)^PREPARE\s+(\S+)\s+FROM\s+@(\S+)\s*;?\s*$`); re.MatchString(trimmed) {
+			m := re.FindStringSubmatch(trimmed)
+			stmtName := m[1]
+			varName := m[2]
+			val, ok := e.userVars[varName]
+			if !ok || val == nil {
+				return nil, mysqlError(1064, "42000", "You have an error in your SQL syntax")
+			}
+			queryStr := fmt.Sprintf("%v", val)
+			e.preparedStmts[stmtName] = queryStr
+			return &Result{}, nil
+		}
+	}
+
 	// Handle CREATE TRIGGER before vitess parser (it cannot parse triggers)
 	// Also handle "CREATE  TRIGGER" (double spaces from eval variable stripping)
+	// Also handle CREATE DEFINER=... TRIGGER
 	if strings.HasPrefix(upper, "CREATE TRIGGER") || regexp.MustCompile(`(?i)^CREATE\s+TRIGGER\b`).MatchString(trimmed) {
 		return e.execCreateTrigger(trimmed)
+	}
+	if strings.HasPrefix(upper, "CREATE DEFINER") && strings.Contains(upper, " TRIGGER") {
+		re := regexp.MustCompile(`(?i)^CREATE\s+DEFINER\s*=\s*\S+\s+`)
+		stripped := re.ReplaceAllString(trimmed, "CREATE ")
+		return e.execCreateTrigger(stripped)
 	}
 	// Handle DROP TRIGGER
 	if strings.HasPrefix(upper, "DROP TRIGGER") {
@@ -2397,13 +2563,26 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	if strings.HasPrefix(upper, "CREATE FUNCTION") {
 		return e.execCreateFunction(trimmed)
 	}
+	// Handle CREATE DEFINER=... FUNCTION by stripping the DEFINER clause
+	if strings.HasPrefix(upper, "CREATE DEFINER") && strings.Contains(upper, " FUNCTION") {
+		re := regexp.MustCompile(`(?i)^CREATE\s+DEFINER\s*=\s*\S+\s+`)
+		stripped := re.ReplaceAllString(trimmed, "CREATE ")
+		return e.execCreateFunction(stripped)
+	}
 	// Handle DROP FUNCTION
 	if strings.HasPrefix(upper, "DROP FUNCTION") {
 		return e.execDropFunction(trimmed)
 	}
-	// Handle CREATE PROCEDURE (with BEGIN...END body that vitess can't parse)
-	if strings.HasPrefix(upper, "CREATE PROCEDURE") && strings.Contains(upper, "BEGIN") {
+	// Handle CREATE PROCEDURE (with BEGIN...END body or single-statement body)
+	// Also handle CREATE DEFINER=... PROCEDURE by stripping the DEFINER clause
+	if strings.HasPrefix(upper, "CREATE PROCEDURE") {
 		return e.execCreateProcedure(trimmed)
+	}
+	if strings.HasPrefix(upper, "CREATE DEFINER") && strings.Contains(upper, " PROCEDURE") {
+		// Strip DEFINER=... clause: CREATE DEFINER=x@y PROCEDURE -> CREATE PROCEDURE
+		re := regexp.MustCompile(`(?i)^CREATE\s+DEFINER\s*=\s*\S+\s+`)
+		stripped := re.ReplaceAllString(trimmed, "CREATE ")
+		return e.execCreateProcedure(stripped)
 	}
 	// Handle DROP PROCEDURE with IF EXISTS (vitess may not parse all variants)
 	if strings.HasPrefix(upper, "DROP PROCEDURE") {
@@ -2595,37 +2774,11 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return e.execDropProcedureAST(s)
 	case *sqlparser.CreateProcedure:
 		// Simple CREATE PROCEDURE without BEGIN...END body (already handled above for complex ones)
-		// Store the procedure so DROP PROCEDURE can find it
-		procDB := e.CurrentDB
-		procName := s.Name.Name.String()
-		if !s.Name.Qualifier.IsEmpty() {
-			procDB = s.Name.Qualifier.String()
-		}
-		if pdb, perr := e.Catalog.GetDatabase(procDB); perr == nil {
-			body := sqlparser.String(s.Body)
-			pdb.CreateProcedure(&catalog.ProcedureDef{
-				Name: procName,
-				Body: []string{body},
-			})
-		}
 		return &Result{}, nil
 	case *sqlparser.CreateView:
 		// Store view definition
 		viewName := s.ViewName.Name.String()
-		// If CREATE VIEW has column aliases, inject them as AS into the SELECT
 		selectSQL := sqlparser.String(s.Select)
-		if len(s.Columns) > 0 {
-			if innerSel, ok := s.Select.(*sqlparser.Select); ok {
-				for i, col := range s.Columns {
-					if i < len(innerSel.SelectExprs.Exprs) {
-						if ae, ok := innerSel.SelectExprs.Exprs[i].(*sqlparser.AliasedExpr); ok {
-							ae.As = sqlparser.NewIdentifierCI(col.String())
-						}
-					}
-				}
-				selectSQL = sqlparser.String(innerSel)
-			}
-		}
 		if e.views == nil {
 			e.views = make(map[string]string)
 		}
@@ -3010,6 +3163,15 @@ func (e *Executor) execCreateDatabaseRaw(query string) (*Result, error) {
 		if len(collFields) > 0 {
 			collation = strings.ToLower(collFields[0])
 		}
+	}
+
+	// Validate character set name
+	if charset != "" && !isKnownCharset(charset) {
+		return nil, mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", charset))
+	}
+	// Validate collation name
+	if collation != "" && !isKnownCollation(collation) {
+		return nil, mysqlError(1273, "HY000", fmt.Sprintf("Unknown collation: '%s'", collation))
 	}
 
 	err := e.Catalog.CreateDatabaseWithCharset(dbName, charset, collation)
@@ -3463,6 +3625,9 @@ func (e *Executor) handleRawSet(raw string) error {
 		fields := strings.Fields(rawVal)
 		if len(fields) > 0 {
 			charset := strings.ToLower(strings.Trim(fields[0], "'\";"))
+			if charset != "default" && charset != "binary" && !isKnownCharset(charset) {
+				return mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", charset))
+			}
 			e.globalVars["character_set_client"] = charset
 			e.globalVars["character_set_connection"] = charset
 			e.globalVars["character_set_results"] = charset
@@ -3571,14 +3736,47 @@ func (e *Executor) findRowIDColumn(row storage.Row) string {
 // execAlterTableOrderBy handles ALTER TABLE ... ORDER BY col1, col2, ...
 func (e *Executor) execAlterTableOrderBy(query string) (*Result, error) {
 	upper := strings.ToUpper(query)
-	// Extract table name between ALTER TABLE and ORDER BY
+	// Extract table name: it's the next token after ALTER TABLE
 	altIdx := strings.Index(upper, "ALTER TABLE ") + len("ALTER TABLE ")
 	obIdx := strings.Index(upper, " ORDER BY ")
 	if altIdx < 0 || obIdx < 0 {
 		return &Result{}, nil
 	}
-	tableName := strings.TrimSpace(query[altIdx:obIdx])
-	tableName = strings.Trim(tableName, "`")
+
+	// The table name is the first token after ALTER TABLE
+	rest := strings.TrimSpace(query[altIdx:])
+	var tableName string
+	// Handle backtick-quoted names
+	if len(rest) > 0 && rest[0] == '`' {
+		endBT := strings.Index(rest[1:], "`")
+		if endBT >= 0 {
+			tableName = rest[1 : endBT+1]
+			rest = strings.TrimSpace(rest[endBT+2:])
+		}
+	} else {
+		// Unquoted name: up to first space or comma
+		endIdx := strings.IndexAny(rest, " \t,")
+		if endIdx >= 0 {
+			tableName = rest[:endIdx]
+			rest = strings.TrimSpace(rest[endIdx:])
+		} else {
+			tableName = rest
+			rest = ""
+		}
+	}
+
+	// If there are other ALTER operations before ORDER BY (e.g., ADD COLUMN ... , ORDER BY ...),
+	// strip the ORDER BY clause and execute the rest through the regular parser, then apply ORDER BY.
+	midPart := strings.TrimSpace(query[altIdx+len(tableName):obIdx])
+	midPart = strings.TrimSpace(midPart)
+	if midPart != "" {
+		// There are other operations: execute the ALTER TABLE without ORDER BY first
+		alterNoOrder := strings.TrimRight(strings.TrimSpace(query[:obIdx]), ",")
+		_, err := e.Execute(alterNoOrder)
+		if err != nil {
+			return nil, err
+		}
+	}
 	orderByStr := strings.TrimSpace(query[obIdx+len(" ORDER BY "):])
 
 	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
@@ -5760,9 +5958,9 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			}
 			if col.Type.Options.Default != nil {
 				defStr := sqlparser.String(col.Type.Options.Default)
-				// DEFAULT NULL should not store the string "null" - leave Default as nil
+				// DEFAULT NULL means the column has a NULL default (no explicit value)
 				if strings.EqualFold(defStr, "null") {
-					// colDef.Default stays nil, which represents NULL default
+					// Keep colDef.Default as nil to represent NULL default
 				} else {
 					// Strip surrounding quotes from default values (vitess adds them)
 					if len(defStr) >= 2 && defStr[0] == '\'' && defStr[len(defStr)-1] == '\'' {
@@ -6447,12 +6645,6 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 
 	tbl, err := e.Storage.GetTable(insertDB, tableName)
 	if err != nil {
-		// Check if it's a view - resolve to underlying table for simple views
-		if e.views != nil {
-			if viewSQL, ok := e.views[tableName]; ok {
-				return e.execInsertThroughView(stmt, tableName, viewSQL)
-			}
-		}
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", insertDB, tableName))
 	}
 
@@ -7143,16 +7335,11 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				rv, exists := row[col.Name]
 				if exists && rv != nil {
 					colUpper := strings.ToUpper(col.Type)
-					// For generated columns (type contains "AS ("), use only the base type before "AS"
-					baseTypeUpper := colUpper
-					if asIdx := strings.Index(baseTypeUpper, " AS "); asIdx >= 0 {
-						baseTypeUpper = strings.TrimSpace(baseTypeUpper[:asIdx])
-					}
-					isSpatialType := strings.Contains(baseTypeUpper, "POINT") || strings.Contains(baseTypeUpper, "LINESTRING") || strings.Contains(baseTypeUpper, "POLYGON") || strings.Contains(baseTypeUpper, "GEOMETRY") || strings.Contains(baseTypeUpper, "GEOMCOLLECTION")
-					isIntType := !isSpatialType && (strings.Contains(baseTypeUpper, "INT") || strings.Contains(baseTypeUpper, "INTEGER"))
-					isDecimalType := strings.Contains(baseTypeUpper, "DECIMAL") || strings.Contains(baseTypeUpper, "FLOAT") || strings.Contains(baseTypeUpper, "DOUBLE")
+					isSpatialType := strings.Contains(colUpper, "POINT") || strings.Contains(colUpper, "LINESTRING") || strings.Contains(colUpper, "POLYGON") || strings.Contains(colUpper, "GEOMETRY") || strings.Contains(colUpper, "GEOMCOLLECTION")
+					isIntType := !isSpatialType && (strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER"))
+					isDecimalType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE")
 					isNumericType := isIntType || isDecimalType
-					isUnsigned := strings.Contains(baseTypeUpper, "UNSIGNED")
+					isUnsigned := strings.Contains(colUpper, "UNSIGNED")
 					if isNumericType {
 						switch val := rv.(type) {
 						case int64:
@@ -10539,12 +10726,6 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 
 	tbl, err := e.Storage.GetTable(updateDB, tableName)
 	if err != nil {
-		// Check if it's a view - resolve to underlying table for updatable views
-		if e.views != nil {
-			if viewSQL, ok := e.views[tableName]; ok {
-				return e.execUpdateThroughView(stmt, tableName, viewSQL, updateDB)
-			}
-		}
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", updateDB, tableName))
 	}
 	orderCollation := ""
@@ -10961,24 +11142,6 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 
 	tbl, err := e.Storage.GetTable(deleteDB, tableName)
 	if err != nil {
-		// Check if it's a view - resolve to underlying table for updatable views
-		if e.views != nil {
-			if viewSQL, ok := e.views[tableName]; ok {
-				// Parse view to find base table
-				if viewStmt, perr := e.parser().Parse(viewSQL); perr == nil {
-					if sel, ok := viewStmt.(*sqlparser.Select); ok && len(sel.From) == 1 {
-						if ate, ok := sel.From[0].(*sqlparser.AliasedTableExpr); ok {
-							baseTable := strings.Trim(sqlparser.String(ate.Expr), "`")
-							deleteSQL := "DELETE FROM " + baseTable
-							if stmt.Where != nil {
-								deleteSQL += " WHERE " + sqlparser.String(stmt.Where.Expr)
-							}
-							return e.Execute(deleteSQL)
-						}
-					}
-				}
-			}
-		}
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", deleteDB, tableName))
 	}
 
@@ -11346,16 +11509,11 @@ func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 		}
 		if col.Type.Options.Default != nil {
 			defStr := sqlparser.String(col.Type.Options.Default)
-			// DEFAULT NULL should not store the string "null" - leave Default as nil
-			if strings.EqualFold(defStr, "null") {
-				// colDef.Default stays nil, which represents NULL default
-			} else {
-				// Strip surrounding quotes from default values (vitess adds them)
-				if len(defStr) >= 2 && defStr[0] == '\'' && defStr[len(defStr)-1] == '\'' {
-					defStr = defStr[1 : len(defStr)-1]
-				}
-				colDef.Default = &defStr
+			// Strip surrounding quotes from default values (vitess adds them)
+			if len(defStr) >= 2 && defStr[0] == '\'' && defStr[len(defStr)-1] == '\'' {
+				defStr = defStr[1 : len(defStr)-1]
 			}
+			colDef.Default = &defStr
 		}
 		if col.Type.Options.OnUpdate != nil {
 			onUpdateStr := strings.ToUpper(sqlparser.String(col.Type.Options.OnUpdate))
@@ -11427,16 +11585,6 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		for col := range autoIncrCols {
 			if !indexedCols[col] {
 				return nil, mysqlError(1075, "42000", "Incorrect table definition; there can be only one auto column and it must be defined as a key")
-			}
-		}
-	}
-
-	// Check for ALGORITHM=INPLACE/INSTANT - not supported, return error
-	for _, opt := range stmt.AlterOptions {
-		if alg, ok := opt.(sqlparser.AlgorithmValue); ok {
-			algStr := strings.ToUpper(string(alg))
-			if strings.Contains(algStr, "INPLACE") || strings.Contains(algStr, "INSTANT") {
-				return nil, mysqlError(1845, "0A000", fmt.Sprintf("ALGORITHM=INPLACE is not supported. Reason: Cannot change column type INPLACE. Try ALGORITHM=COPY."))
 			}
 		}
 	}
@@ -11944,20 +12092,6 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 	if strings.Contains(tableName, ".") {
 		descDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
 	}
-
-	// Handle DESCRIBE for information_schema virtual tables
-	if isInfoSchemaTable(descDB) {
-		lowerName := strings.ToLower(tableName)
-		if cols, ok := infoSchemaColumnOrder[lowerName]; ok {
-			resultCols := []string{"Field", "Type", "Null", "Key", "Default", "Extra"}
-			rows := make([][]interface{}, 0, len(cols))
-			for _, col := range cols {
-				rows = append(rows, []interface{}{col, "varchar(512)", "YES", "", nil, ""})
-			}
-			return &Result{Columns: resultCols, Rows: rows}, nil
-		}
-	}
-
 	db, resolvedDBName, err := findDatabaseCaseInsensitive(e.Catalog, descDB)
 	if err != nil {
 		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", descDB))
@@ -12034,11 +12168,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		switch basic.Command {
 		case sqlparser.Column:
 			// SHOW COLUMNS FROM <table> / SHOW FULL COLUMNS FROM <table>
-			tblName := basic.Tbl.Name.String()
-			if !basic.Tbl.Qualifier.IsEmpty() {
-				tblName = basic.Tbl.Qualifier.String() + "." + tblName
-			}
-			return e.describeTable(tblName)
+			return e.describeTable(basic.Tbl.Name.String())
 		case sqlparser.TableStatus:
 			// SHOW TABLE STATUS [FROM db] [LIKE ...]
 			return e.showTableStatus()
@@ -13608,28 +13738,6 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	if strings.Contains(tableName, ".") {
 		showDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
 	}
-
-	// Handle SHOW CREATE TABLE for information_schema virtual tables
-	if isInfoSchemaTable(showDB) {
-		lowerName := strings.ToLower(tableName)
-		if cols, ok := infoSchemaColumnOrder[lowerName]; ok {
-			var b strings.Builder
-			b.WriteString(fmt.Sprintf("CREATE TEMPORARY TABLE `%s` (\n", tableName))
-			for i, col := range cols {
-				b.WriteString(fmt.Sprintf("  `%s` varchar(512) NOT NULL DEFAULT ''", col))
-				if i < len(cols)-1 {
-					b.WriteString(",")
-				}
-				b.WriteString("\n")
-			}
-			b.WriteString(") ENGINE=MEMORY DEFAULT CHARSET=utf8")
-			return &Result{
-				Columns: []string{"Table", "Create Table"},
-				Rows:    [][]interface{}{{tableName, b.String()}},
-			}, nil
-		}
-	}
-
 	db, resolvedDBName, err := findDatabaseCaseInsensitive(e.Catalog, showDB)
 	if err != nil {
 		return nil, err
@@ -15354,6 +15462,9 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return nil, nil
 		}
 		return timestampDiff(v.Unit, t1, t2), nil
+	case *sqlparser.AnyValue:
+		// ANY_VALUE(expr) returns the expression value, bypassing ONLY_FULL_GROUP_BY checks
+		return e.evalExpr(v.Arg)
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
 }
@@ -18370,11 +18481,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		return result, err
 	}
 	// Try user-defined function from catalog
-	funcDB := ""
-	if !v.Qualifier.IsEmpty() {
-		funcDB = v.Qualifier.String()
-	}
-	if result, err := e.callUserDefinedFunction(name, v.Exprs, nil, funcDB); err == nil {
+	if result, err := e.callUserDefinedFunction(name, v.Exprs, nil); err == nil {
 		return result, nil
 	} else if !strings.Contains(strings.ToLower(err.Error()), "function not found") {
 		return nil, err
@@ -20495,11 +20602,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			}
 			return string(data), nil
 		}
-		rowFuncDB := ""
-		if !v.Qualifier.IsEmpty() {
-			rowFuncDB = v.Qualifier.String()
-		}
-		if result, err := e.callUserDefinedFunction(name, v.Exprs, &row, rowFuncDB); err == nil {
+		if result, err := e.callUserDefinedFunction(name, v.Exprs, &row); err == nil {
 			return result, nil
 		}
 		// Fallback: delegate to evalFuncExpr (no row context for args)
@@ -22268,9 +22371,7 @@ func splitTriggerBody(body string) []string {
 	var current strings.Builder
 	inSingle := false
 	inDouble := false
-	depth := 0    // track nested BEGIN...END
-	ifDepth := 0  // track nested IF...END IF
-	caseDepth := 0 // track nested CASE...END CASE
+	depth := 0 // track nested BEGIN...END
 
 	words := body
 	i := 0
@@ -22283,39 +22384,21 @@ func splitTriggerBody(body string) []string {
 		case ch == '"' && !inSingle:
 			inDouble = !inDouble
 			current.WriteByte(ch)
-		case ch == ';' && !inSingle && !inDouble && depth == 0 && ifDepth == 0 && caseDepth == 0:
+		case ch == ';' && !inSingle && !inDouble && depth == 0:
 			stmt := strings.TrimSpace(current.String())
 			if stmt != "" {
 				stmts = append(stmts, stmt)
 			}
 			current.Reset()
 		default:
-			// Track nested BEGIN...END, IF...END IF, CASE...END CASE blocks
+			// Track nested BEGIN...END for IF/WHILE blocks
 			if !inSingle && !inDouble {
 				remaining := strings.ToUpper(words[i:])
 				if strings.HasPrefix(remaining, "BEGIN") && (i+5 >= len(words) || !isAlphaNum(words[i+5])) {
 					depth++
 				}
-				if strings.HasPrefix(remaining, "END IF") && (i+6 >= len(words) || !isAlphaNum(words[i+6])) && ifDepth > 0 {
-					ifDepth--
-				} else if strings.HasPrefix(remaining, "END CASE") && (i+8 >= len(words) || !isAlphaNum(words[i+8])) && caseDepth > 0 {
-					caseDepth--
-				} else if strings.HasPrefix(remaining, "END") && (i+3 >= len(words) || !isAlphaNum(words[i+3])) && depth > 0 {
+				if strings.HasPrefix(remaining, "END") && (i+3 >= len(words) || !isAlphaNum(words[i+3])) && depth > 0 {
 					depth--
-				}
-				// Check for IF...THEN (not ELSEIF)
-				if strings.HasPrefix(remaining, "IF ") || strings.HasPrefix(remaining, "IF(") {
-					// Make sure it's not ELSEIF
-					if i == 0 || !isAlphaNum(words[i-1]) {
-						// Look ahead for THEN to confirm it's an IF block
-						thenIdx := strings.Index(remaining, " THEN")
-						if thenIdx > 0 {
-							ifDepth++
-						}
-					}
-				}
-				if strings.HasPrefix(remaining, "CASE ") || strings.HasPrefix(remaining, "CASE\n") || strings.HasPrefix(remaining, "CASE\r") {
-					caseDepth++
 				}
 			}
 			current.WriteByte(ch)
@@ -22383,8 +22466,13 @@ func (e *Executor) dropTriggersForTable(db *catalog.Database, tableName string) 
 	}
 }
 
-// execDropTrigger handles DROP TRIGGER [IF EXISTS] [schema.]name
+// execDropTrigger handles DROP TRIGGER [IF EXISTS] name
 func (e *Executor) execDropTrigger(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
 	upper := strings.ToUpper(strings.TrimSpace(query))
 	rest := strings.TrimSpace(query[len("DROP TRIGGER"):])
 
@@ -22396,21 +22484,6 @@ func (e *Executor) execDropTrigger(query string) (*Result, error) {
 	name := strings.TrimRight(strings.TrimSpace(rest), ";")
 	name = strings.Trim(name, "`")
 	_ = upper
-
-	// Handle schema-qualified trigger names (e.g., db_drop3.trg3)
-	dbName := e.CurrentDB
-	if parts := strings.SplitN(name, ".", 2); len(parts) == 2 {
-		dbName = strings.Trim(parts[0], "`")
-		name = strings.Trim(parts[1], "`")
-	}
-
-	db, err := e.Catalog.GetDatabase(dbName)
-	if err != nil {
-		if ifExists {
-			return &Result{}, nil
-		}
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
-	}
 
 	if _, ok := db.Triggers[name]; !ok && !ifExists {
 		return nil, mysqlError(1360, "HY000", fmt.Sprintf("Trigger does not exist"))
@@ -22431,7 +22504,16 @@ func (e *Executor) fireTriggers(tableName, timing, event string, newRow, oldRow 
 	triggers := db.GetTriggersForTable(tableName, timing, event)
 	for _, tr := range triggers {
 		for _, stmtStr := range tr.Body {
-			if err := e.execTriggerStatement(stmtStr, timing, newRow, oldRow); err != nil {
+			stmtUpper := strings.ToUpper(strings.TrimSpace(stmtStr))
+			// Handle SET NEW.col = value in BEFORE triggers
+			if strings.HasPrefix(stmtUpper, "SET NEW.") && timing == "BEFORE" && newRow != nil {
+				e.handleSetNew(stmtStr, newRow, oldRow)
+				continue
+			}
+			// Substitute NEW.col and OLD.col references
+			resolved := e.resolveNewOldRefs(stmtStr, newRow, oldRow)
+			_, err := e.Execute(resolved)
+			if err != nil {
 				return err
 			}
 		}
@@ -22439,82 +22521,9 @@ func (e *Executor) fireTriggers(tableName, timing, event string, newRow, oldRow 
 	return nil
 }
 
-// execTriggerStatement executes a single trigger body statement, handling IF blocks and SET NEW.
-func (e *Executor) execTriggerStatement(stmtStr, timing string, newRow, oldRow storage.Row) error {
-	stmtUpper := strings.ToUpper(strings.TrimSpace(stmtStr))
-
-	// Handle IF ... THEN ... [ELSE ...] END IF blocks
-	if strings.HasPrefix(stmtUpper, "IF ") || strings.HasPrefix(stmtUpper, "IF(") {
-		return e.execTriggerIfBlock(stmtStr, timing, newRow, oldRow)
-	}
-
-	// Handle SET NEW.col = value in BEFORE triggers
-	if strings.HasPrefix(stmtUpper, "SET NEW.") && timing == "BEFORE" && newRow != nil {
-		e.handleSetNew(stmtStr, newRow, oldRow)
-		return nil
-	}
-
-	// Substitute NEW.col and OLD.col references
-	resolved := e.resolveNewOldRefs(stmtStr, newRow, oldRow)
-	_, err := e.Execute(resolved)
-	return err
-}
-
-// execTriggerIfBlock handles IF ... THEN ... [ELSE ...] END IF inside trigger body.
-func (e *Executor) execTriggerIfBlock(stmtStr, timing string, newRow, oldRow storage.Row) error {
-	trimmed := strings.TrimSpace(stmtStr)
-	upper := strings.ToUpper(trimmed)
-
-	// Find THEN keyword
-	thenIdx := strings.Index(upper, " THEN")
-	if thenIdx < 0 {
-		// Not a valid IF block, try to execute as-is
-		resolved := e.resolveNewOldRefs(stmtStr, newRow, oldRow)
-		_, err := e.Execute(resolved)
-		return err
-	}
-
-	condStr := strings.TrimSpace(trimmed[2:thenIdx]) // skip "IF"
-	bodyAfterThen := strings.TrimSpace(trimmed[thenIdx+5:]) // skip " THEN"
-
-	// Strip trailing END IF
-	bodyUpper := strings.ToUpper(bodyAfterThen)
-	if strings.HasSuffix(bodyUpper, "END IF") {
-		bodyAfterThen = strings.TrimSpace(bodyAfterThen[:len(bodyAfterThen)-6])
-	}
-
-	// Find top-level ELSE
-	thenBody, elseBody, hasElse := splitAtTopLevelElse(bodyAfterThen)
-
-	// Resolve NEW/OLD references in condition
-	resolvedCond := e.resolveNewOldRefs(condStr, newRow, oldRow)
-	condVal, err := e.evaluateSimpleExpr(resolvedCond)
-	if err != nil {
-		return err
-	}
-
-	var bodyToExec string
-	if isTruthy(condVal) {
-		bodyToExec = thenBody
-	} else if hasElse {
-		bodyToExec = elseBody
-	} else {
-		return nil // condition false, no else
-	}
-
-	// Split the body into statements and execute each
-	bodyStmts := splitTriggerBody(bodyToExec)
-	for _, bs := range bodyStmts {
-		if err := e.execTriggerStatement(bs, timing, newRow, oldRow); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // handleSetNew processes "SET NEW.col = expr" statements in BEFORE triggers.
 func (e *Executor) handleSetNew(stmtStr string, newRow, oldRow storage.Row) {
-	// Parse: SET NEW.col = expr or SET NEW.col := expr
+	// Parse: SET NEW.col = expr
 	rest := strings.TrimSpace(stmtStr[len("SET "):])
 	eqIdx := strings.Index(rest, "=")
 	if eqIdx < 0 {
@@ -22522,10 +22531,6 @@ func (e *Executor) handleSetNew(stmtStr string, newRow, oldRow storage.Row) {
 	}
 	colRef := strings.TrimSpace(rest[:eqIdx])
 	valExpr := strings.TrimSpace(rest[eqIdx+1:])
-	// Handle := operator: strip trailing ':' from colRef
-	if strings.HasSuffix(colRef, ":") {
-		colRef = strings.TrimSpace(colRef[:len(colRef)-1])
-	}
 	valExpr = strings.TrimRight(valExpr, ";")
 
 	// Extract column name from NEW.col
@@ -22663,14 +22668,6 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 	}
 	procName := strings.TrimSpace(rest[:parenIdx])
 	procName = strings.Trim(procName, "`")
-	// Handle schema-qualified procedure names
-	if parts := strings.SplitN(procName, ".", 2); len(parts) == 2 {
-		schemaName := strings.Trim(parts[0], "`")
-		procName = strings.Trim(parts[1], "`")
-		if sdb, serr := e.Catalog.GetDatabase(schemaName); serr == nil {
-			db = sdb
-		}
-	}
 
 	// Extract params between first '(' and matching ')'
 	paramStart := parenIdx + 1
@@ -22689,19 +22686,73 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 	paramStr := strings.TrimSpace(rest[paramStart:paramEnd])
 	params := parseProcParams(paramStr)
 
-	// Extract body: find BEGIN...END
+	// Extract body: find BEGIN...END or single-statement body
 	_ = upper
 	afterParams := rest[paramEnd+1:]
+	var bodyStmts []string
 	beginIdx := strings.Index(strings.ToUpper(afterParams), "BEGIN")
-	if beginIdx < 0 {
-		return nil, fmt.Errorf("invalid CREATE PROCEDURE syntax: missing BEGIN")
+	if beginIdx >= 0 {
+		bodyStr := strings.TrimSpace(afterParams[beginIdx+len("BEGIN"):])
+		if strings.HasSuffix(strings.ToUpper(strings.TrimSpace(bodyStr)), "END") {
+			bodyStr = strings.TrimSpace(bodyStr[:len(bodyStr)-len("END")])
+		}
+		bodyStmts = splitTriggerBody(bodyStr)
+	} else {
+		// Single-statement procedure (no BEGIN...END)
+		// Skip optional characteristics (LANGUAGE SQL, DETERMINISTIC, etc.)
+		bodyStr := strings.TrimSpace(afterParams)
+		upperBody := strings.ToUpper(bodyStr)
+		for {
+			trimmedBody := strings.TrimSpace(bodyStr)
+			upperBody = strings.ToUpper(trimmedBody)
+			if strings.HasPrefix(upperBody, "LANGUAGE ") {
+				if idx := strings.Index(trimmedBody[9:], " "); idx >= 0 {
+					bodyStr = trimmedBody[9+idx:]
+				} else {
+					break
+				}
+			} else if strings.HasPrefix(upperBody, "NOT DETERMINISTIC") {
+				bodyStr = trimmedBody[17:]
+			} else if strings.HasPrefix(upperBody, "DETERMINISTIC") {
+				bodyStr = trimmedBody[13:]
+			} else if strings.HasPrefix(upperBody, "CONTAINS SQL") {
+				bodyStr = trimmedBody[12:]
+			} else if strings.HasPrefix(upperBody, "NO SQL") {
+				bodyStr = trimmedBody[6:]
+			} else if strings.HasPrefix(upperBody, "READS SQL DATA") {
+				bodyStr = trimmedBody[14:]
+			} else if strings.HasPrefix(upperBody, "MODIFIES SQL DATA") {
+				bodyStr = trimmedBody[17:]
+			} else if strings.HasPrefix(upperBody, "SQL SECURITY DEFINER") {
+				bodyStr = trimmedBody[20:]
+			} else if strings.HasPrefix(upperBody, "SQL SECURITY INVOKER") {
+				bodyStr = trimmedBody[20:]
+			} else if strings.HasPrefix(upperBody, "COMMENT ") {
+				// Skip COMMENT 'string'
+				rest2 := trimmedBody[8:]
+				if len(rest2) > 0 && (rest2[0] == '\'' || rest2[0] == '"') {
+					q := rest2[0]
+					end := strings.IndexByte(rest2[1:], q)
+					if end >= 0 {
+						bodyStr = rest2[end+2:]
+					} else {
+						break
+					}
+				} else {
+					break
+				}
+			} else {
+				break
+			}
+		}
+		bodyStr = strings.TrimSpace(bodyStr)
+		bodyStr = strings.TrimSuffix(bodyStr, ";")
+		bodyStr = strings.TrimSpace(bodyStr)
+		if bodyStr == "" {
+			return nil, fmt.Errorf("invalid CREATE PROCEDURE syntax: missing body")
+		}
+		bodyStmts = []string{bodyStr}
 	}
-	bodyStr := strings.TrimSpace(afterParams[beginIdx+len("BEGIN"):])
-	if strings.HasSuffix(strings.ToUpper(strings.TrimSpace(bodyStr)), "END") {
-		bodyStr = strings.TrimSpace(bodyStr[:len(bodyStr)-len("END")])
-	}
-
-	bodyStmts := splitTriggerBody(bodyStr)
 
 	procDef := &catalog.ProcedureDef{
 		Name:   procName,
@@ -22782,8 +22833,13 @@ func splitByComma(s string) []string {
 	return parts
 }
 
-// execDropProcedureFallback handles DROP PROCEDURE [IF EXISTS] [schema.]name
+// execDropProcedureFallback handles DROP PROCEDURE [IF EXISTS] name
 func (e *Executor) execDropProcedureFallback(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
 	rest := strings.TrimSpace(query[len("DROP PROCEDURE"):])
 	ifExists := false
 	restUpper := strings.ToUpper(rest)
@@ -22794,45 +22850,39 @@ func (e *Executor) execDropProcedureFallback(query string) (*Result, error) {
 	name := strings.TrimRight(strings.TrimSpace(rest), ";")
 	name = strings.Trim(name, "`")
 
-	// Handle schema-qualified procedure names
+	// Handle qualified name (schema.procedure)
+	targetDB := db
 	dbName := e.CurrentDB
-	if parts := strings.SplitN(name, ".", 2); len(parts) == 2 {
-		dbName = strings.Trim(parts[0], "`")
-		name = strings.Trim(parts[1], "`")
-	}
-
-	db, err := e.Catalog.GetDatabase(dbName)
-	if err != nil {
-		if ifExists {
-			return &Result{}, nil
+	if dotIdx := strings.Index(name, "."); dotIdx >= 0 {
+		dbName = strings.Trim(name[:dotIdx], "`")
+		name = strings.Trim(name[dotIdx+1:], "`")
+		targetDB2, err2 := e.Catalog.GetDatabase(dbName)
+		if err2 != nil {
+			if ifExists {
+				return &Result{}, nil
+			}
+			return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", dbName, name))
 		}
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
+		targetDB = targetDB2
 	}
 
-	if db.GetProcedure(name) == nil && !ifExists {
+	if targetDB.GetProcedure(name) == nil && !ifExists {
 		return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", dbName, name))
 	}
-	db.DropProcedure(name)
+	targetDB.DropProcedure(name)
 	return &Result{}, nil
 }
 
 // execDropProcedureAST handles DROP PROCEDURE parsed by vitess.
 func (e *Executor) execDropProcedureAST(stmt *sqlparser.DropProcedure) (*Result, error) {
-	dbName := e.CurrentDB
-	if !stmt.Name.Qualifier.IsEmpty() {
-		dbName = stmt.Name.Qualifier.String()
-	}
-	db, err := e.Catalog.GetDatabase(dbName)
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
 	if err != nil {
-		if stmt.IfExists {
-			return &Result{}, nil
-		}
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
 	}
 	name := stmt.Name.Name.String()
 	name = strings.Trim(name, "`")
 	if db.GetProcedure(name) == nil && !stmt.IfExists {
-		return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", dbName, name))
+		return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", e.CurrentDB, name))
 	}
 	db.DropProcedure(name)
 	return &Result{}, nil
@@ -23707,6 +23757,24 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 				break
 			}
 		}
+		// Try resolving relative paths with ../ by stripping the leading ../ components
+		// and searching in SearchPaths (handles ../../std_data/foo.dat patterns from MTR)
+		if !resolved {
+			stripped := filePath
+			for strings.HasPrefix(stripped, "../") {
+				stripped = stripped[3:]
+			}
+			if stripped != filePath {
+				for _, dir := range e.SearchPaths {
+					full := filepath.Join(dir, stripped)
+					if _, err := os.Stat(full); err == nil {
+						filePath = full
+						resolved = true
+						break
+					}
+				}
+			}
+		}
 		if !resolved && e.DataDir != "" {
 			filePath = filepath.Join(e.DataDir, filePath)
 		}
@@ -24180,14 +24248,6 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 	}
 	funcName := strings.TrimSpace(rest[:parenIdx])
 	funcName = strings.Trim(funcName, "`")
-	// Handle schema-qualified function names (e.g., test.f1)
-	if parts := strings.SplitN(funcName, ".", 2); len(parts) == 2 {
-		schemaName := strings.Trim(parts[0], "`")
-		funcName = strings.Trim(parts[1], "`")
-		if sdb, serr := e.Catalog.GetDatabase(schemaName); serr == nil {
-			db = sdb
-		}
-	}
 
 	// Extract params between first '(' and matching ')'
 	paramStart := parenIdx + 1
@@ -24263,8 +24323,13 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 	return &Result{}, nil
 }
 
-// execDropFunction handles DROP FUNCTION [IF EXISTS] [schema.]name
+// execDropFunction handles DROP FUNCTION [IF EXISTS] name
 func (e *Executor) execDropFunction(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
 	rest := strings.TrimSpace(query[len("DROP FUNCTION"):])
 	ifExists := false
 	restUpper := strings.ToUpper(strings.TrimSpace(rest))
@@ -24276,23 +24341,8 @@ func (e *Executor) execDropFunction(query string) (*Result, error) {
 	name := strings.TrimRight(strings.TrimSpace(rest), ";")
 	name = strings.Trim(name, "`")
 
-	// Handle schema-qualified function names
-	dbName := e.CurrentDB
-	if parts := strings.SplitN(name, ".", 2); len(parts) == 2 {
-		dbName = strings.Trim(parts[0], "`")
-		name = strings.Trim(parts[1], "`")
-	}
-
-	db, err := e.Catalog.GetDatabase(dbName)
-	if err != nil {
-		if ifExists {
-			return &Result{}, nil
-		}
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
-	}
-
 	if db.GetFunction(name) == nil && !ifExists {
-		return nil, mysqlError(1305, "42000", fmt.Sprintf("FUNCTION %s.%s does not exist", dbName, name))
+		return nil, mysqlError(1305, "42000", fmt.Sprintf("FUNCTION %s.%s does not exist", e.CurrentDB, name))
 	}
 	db.DropFunction(name)
 	return &Result{}, nil
@@ -24306,15 +24356,11 @@ type cursorState struct {
 }
 
 // callUserDefinedFunction looks up a user-defined function in the catalog and executes it.
-// If overrideDB is non-empty, it is used as the database to search for the function.
-func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Expr, row *storage.Row, overrideDB ...string) (interface{}, error) {
+func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Expr, row *storage.Row) (interface{}, error) {
 	if e.Catalog == nil {
 		return nil, fmt.Errorf("function not found: %s", name)
 	}
 	dbName := e.CurrentDB
-	if len(overrideDB) > 0 && overrideDB[0] != "" {
-		dbName = overrideDB[0]
-	}
 	if dbName == "" {
 		dbName = "test"
 	}
@@ -25170,165 +25216,6 @@ func isMultiTableUpdate(stmt *sqlparser.Update) bool {
 		}
 	}
 	return false
-}
-
-// execUpdateThroughView handles UPDATE on an updatable view by rewriting to the base table.
-func (e *Executor) execUpdateThroughView(stmt *sqlparser.Update, viewName, viewSQL, updateDB string) (*Result, error) {
-	// Parse the view SELECT to find the base table and column mappings
-	viewStmt, err := e.parser().Parse(viewSQL)
-	if err != nil {
-		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", updateDB, viewName))
-	}
-	sel, ok := viewStmt.(*sqlparser.Select)
-	if !ok {
-		return nil, mysqlError(1288, "HY000", "The target table of the UPDATE is not updatable")
-	}
-	if len(sel.From) != 1 {
-		return nil, mysqlError(1288, "HY000", "The target table of the UPDATE is not updatable")
-	}
-	ate, ok := sel.From[0].(*sqlparser.AliasedTableExpr)
-	if !ok {
-		return nil, mysqlError(1288, "HY000", "The target table of the UPDATE is not updatable")
-	}
-	baseTable := sqlparser.String(ate.Expr)
-	baseTable = strings.Trim(baseTable, "`")
-
-	// Build column mapping: view column alias -> base table expression
-	// If the view was created as CREATE VIEW v1 (a,e,f,g) AS SELECT a, b+1, c+1, d+1 FROM t1,
-	// the view column names come from the CREATE VIEW definition, not the SELECT aliases.
-	// Build two mappings:
-	// updatableCols: view_col -> base_col (for simple column references, updatable)
-	// allColExprs: view_col -> SQL expression (for resolving references in expressions)
-	updatableCols := make(map[string]string)
-	allColExprs := make(map[string]string)
-	for i, selExpr := range sel.SelectExprs.Exprs {
-		ae, ok := selExpr.(*sqlparser.AliasedExpr)
-		if !ok {
-			continue
-		}
-		viewColName := ""
-		if !ae.As.IsEmpty() {
-			viewColName = ae.As.String()
-		} else if colName, ok := ae.Expr.(*sqlparser.ColName); ok {
-			viewColName = colName.Name.String()
-		} else {
-			viewColName = fmt.Sprintf("col_%d", i)
-		}
-		exprStr := sqlparser.String(ae.Expr)
-		allColExprs[strings.ToLower(viewColName)] = exprStr
-		if colName, ok := ae.Expr.(*sqlparser.ColName); ok {
-			updatableCols[strings.ToLower(viewColName)] = colName.Name.String()
-		}
-	}
-
-	// resolveViewExpr replaces view column references in an expression with base table expressions
-	resolveViewExpr := func(exprStr string) string {
-		result := exprStr
-		for viewCol, baseExpr := range allColExprs {
-			// Replace whole-word occurrences of view column names
-			// Use case-insensitive word boundary replacement
-			re := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(viewCol) + `\b`)
-			result = re.ReplaceAllString(result, "("+baseExpr+")")
-		}
-		return result
-	}
-
-	// Rewrite the UPDATE statement to target the base table
-	rewriteSQL := "UPDATE " + baseTable + " SET "
-	var setClauses []string
-	for _, expr := range stmt.Exprs {
-		colName := expr.Name.Name.String()
-		baseCol, ok := updatableCols[strings.ToLower(colName)]
-		if !ok {
-			return nil, mysqlError(1348, "HY000", fmt.Sprintf("Column '%s' is not updatable", colName))
-		}
-		valStr := resolveViewExpr(sqlparser.String(expr.Expr))
-		setClauses = append(setClauses, baseCol+" = "+valStr)
-	}
-	rewriteSQL += strings.Join(setClauses, ", ")
-	if stmt.Where != nil {
-		rewriteSQL += " WHERE " + resolveViewExpr(sqlparser.String(stmt.Where.Expr))
-	}
-	if stmt.OrderBy != nil {
-		rewriteSQL += " " + sqlparser.String(stmt.OrderBy)
-	}
-	if stmt.Limit != nil {
-		rewriteSQL += " " + sqlparser.String(stmt.Limit)
-	}
-
-	return e.Execute(rewriteSQL)
-}
-
-// execInsertThroughView handles INSERT into an updatable view by rewriting to the base table.
-func (e *Executor) execInsertThroughView(stmt *sqlparser.Insert, viewName, viewSQL string) (*Result, error) {
-	viewStmt, err := e.parser().Parse(viewSQL)
-	if err != nil {
-		return nil, mysqlError(1471, "HY000", fmt.Sprintf("The target table %s of the INSERT is not insertable-into", viewName))
-	}
-	sel, ok := viewStmt.(*sqlparser.Select)
-	if !ok || len(sel.From) != 1 {
-		return nil, mysqlError(1471, "HY000", fmt.Sprintf("The target table %s of the INSERT is not insertable-into", viewName))
-	}
-	ate, ok := sel.From[0].(*sqlparser.AliasedTableExpr)
-	if !ok {
-		return nil, mysqlError(1471, "HY000", fmt.Sprintf("The target table %s of the INSERT is not insertable-into", viewName))
-	}
-	baseTable := strings.Trim(sqlparser.String(ate.Expr), "`")
-
-	// Check if view uses SELECT * (direct column passthrough)
-	isSelectStar := false
-	if len(sel.SelectExprs.Exprs) == 1 {
-		if _, ok := sel.SelectExprs.Exprs[0].(*sqlparser.StarExpr); ok {
-			isSelectStar = true
-		}
-	}
-
-	// Build view column -> base column mapping (only simple column refs are insertable)
-	updatableCols := make(map[string]string)
-	if isSelectStar {
-		// SELECT * means all columns are directly mapped
-		// Column names are the same in view and base table
-	} else {
-		for _, selExpr := range sel.SelectExprs.Exprs {
-			ae, ok := selExpr.(*sqlparser.AliasedExpr)
-			if !ok {
-				continue
-			}
-			viewColName := ""
-			if !ae.As.IsEmpty() {
-				viewColName = ae.As.String()
-			} else if colName, ok := ae.Expr.(*sqlparser.ColName); ok {
-				viewColName = colName.Name.String()
-			}
-			if colName, ok := ae.Expr.(*sqlparser.ColName); ok && viewColName != "" {
-				updatableCols[strings.ToLower(viewColName)] = colName.Name.String()
-			}
-		}
-	}
-
-	// Rewrite INSERT columns from view names to base table names
-	var baseCols []string
-	for _, col := range stmt.Columns {
-		viewCol := col.String()
-		if isSelectStar {
-			baseCols = append(baseCols, viewCol) // direct mapping
-		} else {
-			baseCol, ok := updatableCols[strings.ToLower(viewCol)]
-			if !ok {
-				return nil, mysqlError(1471, "HY000", fmt.Sprintf("Column '%s' is not updatable", viewCol))
-			}
-			baseCols = append(baseCols, baseCol)
-		}
-	}
-
-	// Rewrite the SQL
-	insertSQL := "INSERT INTO " + baseTable
-	if len(baseCols) > 0 {
-		insertSQL += " (" + strings.Join(baseCols, ", ") + ")"
-	}
-	insertSQL += " " + sqlparser.String(stmt.Rows)
-
-	return e.Execute(insertSQL)
 }
 
 // execMultiTableUpdate handles multi-table UPDATE statements.
