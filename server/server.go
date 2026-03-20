@@ -24,12 +24,14 @@ type Server struct {
 	listener net.Listener
 	mu       sync.Mutex
 	closed   bool
+	conns    map[net.Conn]struct{}
 }
 
 func New(exec *executor.Executor, addr string) *Server {
 	return &Server{
 		Executor: exec,
 		Addr:     addr,
+		conns:    make(map[net.Conn]struct{}),
 	}
 }
 
@@ -253,14 +255,21 @@ func (s *Server) Start() error {
 			log.Printf("accept error: %v", err)
 			continue
 		}
+		s.mu.Lock()
+		s.conns[conn] = struct{}{}
+		s.mu.Unlock()
 		go s.handleConnection(conn)
 	}
 }
 
-// Close stops the server.
+// Close stops the server and all active connections.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	s.closed = true
+	for c := range s.conns {
+		c.Close()
+	}
+	s.conns = make(map[net.Conn]struct{})
 	s.mu.Unlock()
 	if s.listener != nil {
 		return s.listener.Close()
@@ -269,7 +278,12 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		conn.Close()
+		s.mu.Lock()
+		delete(s.conns, conn)
+		s.mu.Unlock()
+	}()
 
 	handler := &Handler{srv: s}
 

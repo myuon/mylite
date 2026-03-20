@@ -98,7 +98,13 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 	var totalPassed, totalFailed, totalSkipped, totalErrors, totalTimeouts, totalTests int
 
 	for _, sn := range suiteNames {
+		fmt.Fprintf(os.Stderr, "[%s] starting suite %s...\n", time.Now().Format("15:04:05"), sn)
 		results := runSuite(sn, "", suiteRoot, includeRoot, verbose, maxTests, jobs, timeout)
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		fmt.Fprintf(os.Stderr, "[%s] finished suite %s (%d tests) goroutines=%d heap=%.0fMB\n",
+			time.Now().Format("15:04:05"), sn, len(results), runtime.NumGoroutine(), float64(m.HeapInuse)/1024/1024)
+		runtime.GC()
 		if len(results) == 0 {
 			continue
 		}
@@ -174,9 +180,12 @@ func runSuite(suiteName, testFilter, suiteRoot, includeRoot string, verbose bool
 	// Determine parallelism
 	numJobs := jobs
 	if numJobs <= 0 {
-		numJobs = runtime.NumCPU()
-		if numJobs > 8 {
-			numJobs = 8
+		numJobs = runtime.NumCPU() / 2
+		if numJobs < 2 {
+			numJobs = 2
+		}
+		if numJobs > 4 {
+			numJobs = 4
 		}
 	}
 	if numJobs > len(testPaths) {
@@ -299,9 +308,9 @@ func (w *worker) runTest(testPath string, includePaths []string, verbose bool, t
 			result.Elapsed = time.Since(t0)
 			return result
 		case <-ctx.Done():
-			// Force reset state so the old executor is released for GC,
-			// even though the timed-out goroutine may still be running.
-			w.resetState()
+			// Abandon the stuck worker entirely and rebuild from scratch.
+			// The old goroutine will eventually die when its connections error out.
+			w.rebuild()
 			return mtrrunner.TestResult{
 				Name:    testName,
 				Timeout: true,
@@ -315,14 +324,70 @@ func (w *worker) runTest(testPath string, includePaths []string, verbose bool, t
 	return result
 }
 
+// rebuild tears down the current server and creates a fresh one.
+// The old server's goroutines are abandoned but will exit when their
+// connections are closed by the OS or when the process exits.
+func (w *worker) rebuild() {
+	// Close server to break TCP connections of stuck goroutines
+	if w.srv != nil {
+		w.srv.Close()
+	}
+	if w.db != nil {
+		w.db.Close()
+		w.db = nil
+	}
+	// Nil out references so old executor/catalog/storage can be GC'd
+	// once the stuck goroutine's stack is collected
+	w.exec = nil
+	w.cat = nil
+	w.store = nil
+
+	// Create fresh server
+	listener, _ := net.Listen("tcp", "127.0.0.1:0")
+	w.addr = listener.Addr().String()
+	listener.Close()
+
+	w.cat = catalog.New()
+	w.store = storage.NewEngine()
+	w.exec = executor.New(w.cat, w.store)
+	w.exec.DataDir = filepath.Join(w.tmpDir, "data", "inner")
+	w.exec.SearchPaths = w.searchPaths
+	w.srv = server.New(w.exec, w.addr)
+	go w.srv.Start()
+
+	// Reconnect DB
+	for i := 0; i < 50; i++ {
+		db, err := connectDB(w.addr)
+		if err == nil {
+			db.SetMaxIdleConns(1)
+			db.SetMaxOpenConns(2)
+			w.db = db
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func (w *worker) runTestInner(testPath string, includePaths []string, verbose bool) mtrrunner.TestResult {
 	// Reset executor state for full isolation between tests
 	w.resetState()
 
 	resetSessionState(w.db)
 
+	// Use a dedicated DB connection for this test so timeout can close it
+	testDB, err := connectDB(w.addr)
+	if err != nil {
+		return mtrrunner.TestResult{
+			Name:  strings.TrimSuffix(filepath.Base(testPath), ".test"),
+			Error: fmt.Sprintf("failed to connect: %v", err),
+		}
+	}
+	defer testDB.Close()
+	testDB.SetMaxIdleConns(1)
+	testDB.SetMaxOpenConns(2)
+
 	runner := &mtrrunner.Runner{
-		DB:           w.db,
+		DB:           testDB,
 		IncludePaths: includePaths,
 		Verbose:      verbose,
 		TmpDir:       w.tmpDir,
