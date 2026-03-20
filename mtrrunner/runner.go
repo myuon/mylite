@@ -2441,7 +2441,8 @@ func (ctx *execContext) sourceFile(filename string) error {
 	baseName := strings.ToLower(filepath.Base(filename))
 	// Treat proc-control include as no-op in this single-node runner.
 	if baseName == "restart_mysqld.inc" {
-		// Dolt test suite result files do not include "# restart" output.
+		// MySQL MTR result files include "# restart" when server is restarted.
+		ctx.output.WriteString("# restart\n")
 		// Reset $restart_parameters to default after use.
 		ctx.variables["$restart_parameters"] = "restart"
 		return nil

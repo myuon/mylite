@@ -151,6 +151,53 @@ var skipTests = map[string]bool{
 	"gis/geojson_functions": true,
 	// Requires geometry validation errors, proper centroid, and SRID-aware operations
 	"gis/gis_bugs_crashes": true,
+
+	// === innodb_fts suite ===
+	// Requires exact MySQL IDF/BM25 relevance scores and row ordering by relevance
+	"innodb_fts/basic":             true,
+	"innodb_fts/fic":               true,
+	"innodb_fts/ddl":               true,
+	"innodb_fts/fulltext_cache":    true,
+	"innodb_fts/fulltext_multi":    true,
+	"innodb_fts/fulltext_order_by": true,
+	"innodb_fts/multiple_index":    true,
+	"innodb_fts/misc":              true,
+	"innodb_fts/subexpr":           true,
+	"innodb_fts/transaction":       true,
+	// Requires EXPLAIN output matching MySQL's fulltext access type
+	"innodb_fts/fulltext":      true,
+	"innodb_fts/fulltext_misc": true,
+	// Requires foreign key constraint enforcement
+	"innodb_fts/foreign_key_check":  true,
+	"innodb_fts/foreign_key_update": true,
+	"innodb_fts/misc_1":             true,
+	// Requires INFORMATION_SCHEMA INNODB_FT_* tables
+	"innodb_fts/phrase": true,
+	// Requires gb18030 character set support
+	"innodb_fts/fulltext3": true,
+	// Requires latin1 charset handling and multi-byte encoding
+	"innodb_fts/fulltext2": true,
+	// Requires exact relevance score matching and row ordering
+	"innodb_fts/fulltext_left_join": true,
+	"innodb_fts/fulltext_distinct":  true,
+	// Requires ft_boolean_syntax and other FTS-specific system variables
+	"innodb_fts/fulltext_var": true,
+	// Requires LOAD DATA INFILE with generated tmp files
+	"innodb_fts/large_records": true,
+	// Requires RENAME TABLE when target already exists (IF EXISTS)
+	"innodb_fts/ngram_2": true,
+	// Requires ngram parser and double-space handling in echo
+	"innodb_fts/ngram_1": true,
+	// Requires subquery IN semantics (scalar subquery check)
+	"innodb_fts/opt": true,
+	// Requires stopword handling with boolean mode row ordering
+	"innodb_fts/proximity": true,
+	// Requires RELEASE SAVEPOINT statement support
+	"innodb_fts/savepoint": true,
+	// Requires INFORMATION_SCHEMA tablespace and file tables
+	"innodb_fts/tablespace_location": true,
+	// Requires innodb_ft_server_stopword_table SET validation and FTS stopword configuration
+	"innodb_fts/stopword": true,
 }
 
 func main() {
@@ -217,6 +264,7 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		"json":         true,
 		"gcol":         true,
 		"gis":          true,
+		"innodb_fts":   true,
 		// collations: skipped — requires MySQL UCA 0900 weight tables (DUCET + tailoring)
 	}
 
@@ -299,6 +347,7 @@ func runSuite(suiteName, testFilter, suiteRoot, includeRoot string, verbose bool
 	}
 
 	var testPaths []string
+	var skippedResults []mtrrunner.TestResult
 	for _, entry := range entries {
 		if !strings.HasSuffix(entry.Name(), ".test") {
 			continue
@@ -308,6 +357,10 @@ func runSuite(suiteName, testFilter, suiteRoot, includeRoot string, verbose bool
 			continue
 		}
 		if skipTests[suiteName+"/"+testName] {
+			skippedResults = append(skippedResults, mtrrunner.TestResult{
+				Name:    testName,
+				Skipped: true,
+			})
 			continue
 		}
 		testPaths = append(testPaths, filepath.Join(testDir, entry.Name()))
@@ -317,7 +370,7 @@ func runSuite(suiteName, testFilter, suiteRoot, includeRoot string, verbose bool
 	}
 
 	if len(testPaths) == 0 {
-		return nil
+		return skippedResults
 	}
 
 	// Determine parallelism
@@ -335,10 +388,13 @@ func runSuite(suiteName, testFilter, suiteRoot, includeRoot string, verbose bool
 		numJobs = len(testPaths)
 	}
 
+	var results []mtrrunner.TestResult
 	if numJobs <= 1 {
-		return runSequential(testPaths, includePaths, searchPaths, verbose, timeout)
+		results = runSequential(testPaths, includePaths, searchPaths, verbose, timeout)
+	} else {
+		results = runParallel(testPaths, includePaths, searchPaths, verbose, numJobs, timeout)
 	}
-	return runParallel(testPaths, includePaths, searchPaths, verbose, numJobs, timeout)
+	return append(skippedResults, results...)
 }
 
 // worker represents a dedicated mylite server instance for running tests.

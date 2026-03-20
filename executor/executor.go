@@ -15762,7 +15762,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 		return fmt.Sprintf("POINT(%v %v)", xVal, yVal), nil
 	case *sqlparser.MatchExpr:
-		return float64(0), nil
+		return e.evalMatchExpr(v)
 	case *sqlparser.CountStar:
 		return int64(0), nil
 	case *sqlparser.LagLeadExpr:
@@ -26284,4 +26284,418 @@ func evalLiteralForPK(expr sqlparser.Expr) interface{} {
 	default:
 		return nil
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Full-Text Search (MATCH … AGAINST) implementation
+// ---------------------------------------------------------------------------
+
+// ftsTokenize splits text into lowercase word tokens, similar to InnoDB's
+// built-in parser. Words shorter than minLen are discarded.
+func ftsTokenize(text string, minLen int) []string {
+	var tokens []string
+	word := strings.Builder{}
+	for _, r := range text {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r >= 0x80 {
+			word.WriteRune(unicode.ToLower(r))
+		} else {
+			if word.Len() >= minLen {
+				tokens = append(tokens, word.String())
+			}
+			word.Reset()
+		}
+	}
+	if word.Len() >= minLen {
+		tokens = append(tokens, word.String())
+	}
+	return tokens
+}
+
+// ftsBaseScore is the base relevance score per word occurrence,
+// approximating MySQL's IDF-based scoring for a small table.
+const ftsBaseScore = 0.22764469683170319
+
+// ftsStopwords is the default InnoDB stopword list.
+var ftsStopwords = map[string]bool{
+	"a": true, "about": true, "an": true, "are": true, "as": true,
+	"at": true, "be": true, "by": true, "com": true, "de": true,
+	"en": true, "for": true, "from": true, "how": true, "i": true,
+	"in": true, "is": true, "it": true, "la": true, "of": true,
+	"on": true, "or": true, "that": true, "the": true, "this": true,
+	"to": true, "was": true, "what": true, "when": true, "where": true,
+	"who": true, "will": true, "with": true, "und": true, "www": true,
+}
+
+// evalMatchExpr evaluates a MATCH(col1,col2,...) AGAINST('query' [mode]) expression.
+func (e *Executor) evalMatchExpr(v *sqlparser.MatchExpr) (interface{}, error) {
+	// 0. Validate that a FULLTEXT index exists for the referenced columns.
+	if err := e.validateFulltextIndex(v); err != nil {
+		return nil, err
+	}
+
+	// 1. Collect text from the MATCH columns in the current row
+	var docParts []string
+	for _, col := range v.Columns {
+		val, err := e.evalExpr(col)
+		if err != nil {
+			return float64(0), nil
+		}
+		if val != nil {
+			docParts = append(docParts, toString(val))
+		}
+	}
+	docText := strings.Join(docParts, " ")
+
+	// 2. Evaluate the AGAINST expression to get the search string
+	searchVal, err := e.evalExpr(v.Expr)
+	if err != nil {
+		return float64(0), nil
+	}
+	if searchVal == nil {
+		return float64(0), nil
+	}
+	searchStr := toString(searchVal)
+
+	minTokenSize := 3
+
+	// 3. Dispatch based on match option
+	switch v.Option {
+	case sqlparser.BooleanModeOpt:
+		return ftsEvalBoolean(docText, searchStr, minTokenSize), nil
+	default:
+		// Natural language mode (also covers NoOption, QueryExpansionOpt, NaturalLanguageModeWithQueryExpansionOpt)
+		return ftsEvalNaturalLanguage(docText, searchStr, minTokenSize), nil
+	}
+}
+
+// ftsEvalNaturalLanguage performs natural-language full-text search.
+// validateFulltextIndex checks that the columns referenced in a MATCH expression
+// have a matching FULLTEXT index. Returns ER_FT_MATCHING_KEY_NOT_FOUND if not.
+func (e *Executor) validateFulltextIndex(v *sqlparser.MatchExpr) error {
+	if len(v.Columns) == 0 {
+		return nil
+	}
+
+	// Collect the column names from the MATCH expression
+	matchCols := make([]string, len(v.Columns))
+	for i, col := range v.Columns {
+		matchCols[i] = strings.ToLower(col.Name.String())
+	}
+	sort.Strings(matchCols)
+
+	// Determine table name from column qualifiers
+	tableName := ""
+	if !v.Columns[0].Qualifier.IsEmpty() {
+		tableName = v.Columns[0].Qualifier.Name.String()
+	}
+
+	if e.CurrentDB == "" || e.Catalog == nil {
+		return nil
+	}
+	db, dbErr := e.Catalog.GetDatabase(e.CurrentDB)
+	if dbErr != nil || db == nil {
+		return nil
+	}
+
+	// Deduplicate match columns
+	matchSet := make(map[string]bool)
+	for _, c := range matchCols {
+		matchSet[c] = true
+	}
+
+	// hasMatchingFTIndex checks if a table definition has a FULLTEXT index
+	// that covers all unique columns from the MATCH expression.
+	hasMatchingFTIndex := func(tblDef *catalog.TableDef) bool {
+		for _, idx := range tblDef.Indexes {
+			if idx.Type != "FULLTEXT" {
+				continue
+			}
+			idxCols := make(map[string]bool)
+			for _, c := range idx.Columns {
+				idxCols[strings.ToLower(stripPrefixLengthFromCol(c))] = true
+			}
+			// Check that all unique MATCH columns are in this FT index
+			allFound := true
+			for mc := range matchSet {
+				if !idxCols[mc] {
+					allFound = false
+					break
+				}
+			}
+			if allFound {
+				return true
+			}
+		}
+		return false
+	}
+
+	if tableName != "" {
+		tblDef, _, err := findTableDefCaseInsensitive(db, tableName)
+		if err != nil || tblDef == nil {
+			return nil
+		}
+		if hasMatchingFTIndex(tblDef) {
+			return nil
+		}
+	} else {
+		// No qualifier: search all tables in the current database
+		for _, name := range db.ListTables() {
+			tblDef, err := db.GetTable(name)
+			if err != nil {
+				continue
+			}
+			if hasMatchingFTIndex(tblDef) {
+				return nil
+			}
+		}
+	}
+
+	return mysqlError(1191, "HY000", "Can't find FULLTEXT index matching the column list")
+}
+
+// Returns a relevance score (float64). 0 means no match.
+func ftsEvalNaturalLanguage(docText, searchStr string, minTokenSize int) float64 {
+	docTokens := ftsTokenize(docText, minTokenSize)
+	queryTokens := ftsTokenize(searchStr, minTokenSize)
+
+	if len(queryTokens) == 0 {
+		return float64(0)
+	}
+
+	// Build document token frequency map
+	docFreq := make(map[string]int)
+	for _, t := range docTokens {
+		docFreq[t]++
+	}
+
+	// Count matching query terms (exclude stopwords)
+	var totalScore float64
+	for _, qt := range queryTokens {
+		if ftsStopwords[qt] {
+			continue
+		}
+		if cnt, ok := docFreq[qt]; ok {
+			// Simple TF-based scoring
+			totalScore += float64(cnt) * ftsBaseScore
+		}
+	}
+	return totalScore
+}
+
+// ftsEvalBoolean performs boolean-mode full-text search.
+// Returns a relevance score (float64). 0 means no match.
+func ftsEvalBoolean(docText, searchStr string, minTokenSize int) float64 {
+	docTokens := ftsTokenize(docText, minTokenSize)
+	docFreq := make(map[string]int)
+	for _, t := range docTokens {
+		docFreq[t]++
+	}
+	docLower := strings.ToLower(docText)
+
+	terms := parseBooleanQuery(searchStr, minTokenSize)
+	return evalBooleanTerms(terms, docFreq, docLower, minTokenSize)
+}
+
+// boolTermOp represents a boolean operator for a search term.
+type boolTermOp int
+
+const (
+	boolDefault  boolTermOp = iota // optional (OR semantics)
+	boolRequired                   // + (AND required)
+	boolExcluded                   // - (NOT excluded)
+	boolNegate                     // ~ (present but negated rank)
+	boolIncRank                    // > (increase rank)
+	boolDecRank                    // < (decrease rank)
+)
+
+// boolTerm represents a single term or sub-expression in a boolean FTS query.
+type boolTerm struct {
+	op       boolTermOp
+	word     string     // single word (lowercased)
+	wildcard bool       // trailing * (prefix match)
+	phrase   string     // quoted phrase (lowercased)
+	sub      []boolTerm // sub-expression in parentheses
+}
+
+func parseBooleanQuery(searchStr string, minTokenSize int) []boolTerm {
+	s := strings.TrimSpace(searchStr)
+	terms, _ := parseBoolTerms(s, minTokenSize)
+	return terms
+}
+
+func parseBoolTerms(s string, minTokenSize int) ([]boolTerm, string) {
+	var terms []boolTerm
+	for len(s) > 0 {
+		s = strings.TrimLeft(s, " \t\n\r")
+		if len(s) == 0 {
+			break
+		}
+		if s[0] == ')' {
+			break
+		}
+
+		op := boolDefault
+		for len(s) > 0 {
+			switch s[0] {
+			case '+':
+				op = boolRequired
+				s = s[1:]
+				continue
+			case '-':
+				op = boolExcluded
+				s = s[1:]
+				continue
+			case '~':
+				op = boolNegate
+				s = s[1:]
+				continue
+			case '>':
+				op = boolIncRank
+				s = s[1:]
+				continue
+			case '<':
+				op = boolDecRank
+				s = s[1:]
+				continue
+			}
+			break
+		}
+		s = strings.TrimLeft(s, " \t")
+		if len(s) == 0 {
+			break
+		}
+
+		if s[0] == '(' {
+			sub, rest := parseBoolTerms(s[1:], minTokenSize)
+			rest = strings.TrimLeft(rest, " \t")
+			if len(rest) > 0 && rest[0] == ')' {
+				rest = rest[1:]
+			}
+			terms = append(terms, boolTerm{op: op, sub: sub})
+			s = rest
+		} else if s[0] == '"' {
+			end := strings.Index(s[1:], "\"")
+			var phrase string
+			if end < 0 {
+				phrase = s[1:]
+				s = ""
+			} else {
+				phrase = s[1 : end+1]
+				s = s[end+2:]
+			}
+			terms = append(terms, boolTerm{op: op, phrase: strings.ToLower(phrase)})
+		} else {
+			end := 0
+			for end < len(s) && s[end] != ' ' && s[end] != '\t' && s[end] != ')' && s[end] != '(' && s[end] != '"' {
+				end++
+			}
+			word := s[:end]
+			s = s[end:]
+			wildcard := false
+			if strings.HasSuffix(word, "*") {
+				wildcard = true
+				word = word[:len(word)-1]
+			}
+			word = strings.ToLower(word)
+			if word == "" || word == "&" {
+				continue
+			}
+			terms = append(terms, boolTerm{op: op, word: word, wildcard: wildcard})
+		}
+	}
+	return terms, s
+}
+
+func evalBooleanTerms(terms []boolTerm, docFreq map[string]int, docLower string, minTokenSize int) float64 {
+	if len(terms) == 0 {
+		return float64(0)
+	}
+
+	hasRequired := false
+	for _, t := range terms {
+		if t.op == boolRequired {
+			hasRequired = true
+			break
+		}
+	}
+
+	var score float64
+	allRequiredMet := true
+	anyOptionalMatch := false
+
+	for _, t := range terms {
+		var matched bool
+		var termScore float64
+
+		if len(t.sub) > 0 {
+			termScore = evalBooleanTerms(t.sub, docFreq, docLower, minTokenSize)
+			matched = termScore > 0
+		} else if t.phrase != "" {
+			if strings.Contains(docLower, t.phrase) {
+				matched = true
+				termScore = 1.0
+			}
+		} else if t.wildcard {
+			for tok, cnt := range docFreq {
+				if strings.HasPrefix(tok, t.word) && !ftsStopwords[tok] {
+					matched = true
+					termScore += float64(cnt) * ftsBaseScore
+				}
+			}
+		} else {
+			// In boolean mode, stopwords never match
+			if !ftsStopwords[t.word] {
+				if cnt, ok := docFreq[t.word]; ok {
+					matched = true
+					termScore = float64(cnt) * ftsBaseScore
+				}
+			}
+			// If it's a stopword, matched stays false
+		}
+
+		switch t.op {
+		case boolRequired:
+			if !matched {
+				allRequiredMet = false
+			} else {
+				score += termScore
+			}
+		case boolExcluded:
+			if matched {
+				return float64(0)
+			}
+		case boolNegate:
+			if matched {
+				score -= termScore * 0.5
+			} else {
+				score += ftsBaseScore
+			}
+		case boolIncRank:
+			if matched {
+				score += termScore * 2
+				anyOptionalMatch = true
+			}
+		case boolDecRank:
+			if matched {
+				score += termScore * 0.5
+				anyOptionalMatch = true
+			}
+		default:
+			if matched {
+				score += termScore
+				anyOptionalMatch = true
+			}
+		}
+	}
+
+	if hasRequired && !allRequiredMet {
+		return float64(0)
+	}
+	if !hasRequired && !anyOptionalMatch {
+		return float64(0)
+	}
+	if score <= 0 {
+		score = 0.001
+	}
+	return score
 }
