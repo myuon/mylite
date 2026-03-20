@@ -8344,6 +8344,50 @@ func extractColumnRefs(expr sqlparser.Expr) []sqlparser.Expr {
 	return refs
 }
 
+// classifyDeletePredsForTables splits AND predicates into per-table buckets
+// and cross-table predicates. A predicate goes to table i if all its column
+// references use the same qualifier matching tableAliases[i].
+func classifyDeletePredsForTables(where sqlparser.Expr, tableAliases []string) (perTable [][]sqlparser.Expr, cross []sqlparser.Expr) {
+	perTable = make([][]sqlparser.Expr, len(tableAliases))
+	preds := splitANDPredicates(where)
+	for _, pred := range preds {
+		cols := extractColumnRefs(pred)
+		matchedTable := -1
+		allSameTable := true
+		for _, col := range cols {
+			cn, ok := col.(*sqlparser.ColName)
+			if !ok || cn.Qualifier.IsEmpty() {
+				allSameTable = false
+				break
+			}
+			qualifier := cn.Qualifier.Name.String()
+			found := -1
+			for i, alias := range tableAliases {
+				if strings.EqualFold(qualifier, alias) {
+					found = i
+					break
+				}
+			}
+			if found < 0 {
+				allSameTable = false
+				break
+			}
+			if matchedTable < 0 {
+				matchedTable = found
+			} else if matchedTable != found {
+				allSameTable = false
+				break
+			}
+		}
+		if allSameTable && matchedTable >= 0 {
+			perTable[matchedTable] = append(perTable[matchedTable], pred)
+		} else {
+			cross = append(cross, pred)
+		}
+	}
+	return
+}
+
 // buildJoinedRowsFromJoinPrefiltered builds join results from pre-filtered left and right rows.
 func (e *Executor) buildJoinedRowsFromJoinPrefiltered(join *sqlparser.JoinTableExpr, leftRows, rightRows []storage.Row) ([]storage.Row, error) {
 	rightAlias, _, _ := extractTableAlias(join.RightExpr)
@@ -10826,6 +10870,14 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		if pkVal, remainExpr := extractPKEquality(stmt.Where.Expr, pkCol); pkVal != nil {
 			tbl.EnsurePKRowIndex()
 			keyStr := fmt.Sprintf("%v", pkVal)
+			// Coerce the PK value through the column type so that numeric TIME/YEAR
+			// values match the stored formatted strings (e.g. 111127 -> "11:11:27").
+			if pkColType, ok := colTypeByName[strings.ToLower(pkCol)]; ok {
+				coerced := coerceValueForColumnType(catalog.ColumnDef{Type: pkColType}, pkVal)
+				if coerced != nil {
+					keyStr = fmt.Sprintf("%v", coerced)
+				}
+			}
 			rowIdx := tbl.LookupRowIndexByPK(keyStr)
 			if rowIdx >= 0 {
 				if remainExpr != nil {
@@ -11469,24 +11521,65 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 		return &Result{}, nil
 	}
 
-	allRows, err := e.buildFromExprWithWhere(stmt.TableExprs[0], stmt.Where)
-	if err != nil {
-		return nil, err
+	// Collect table aliases for per-table predicate classification
+	var tableAliases []string
+	for _, te := range stmt.TableExprs {
+		alias, _, _ := extractTableAlias(te)
+		tableAliases = append(tableAliases, alias)
 	}
-	// Cross join additional tables
-	for i := 1; i < len(stmt.TableExprs); i++ {
-		rightRows, err := e.buildFromExpr(stmt.TableExprs[i])
+
+	// Classify WHERE predicates into per-table-only predicates
+	var perTablePreds [][]sqlparser.Expr
+	var crossPreds []sqlparser.Expr
+	if stmt.Where != nil {
+		perTablePreds, crossPreds = classifyDeletePredsForTables(stmt.Where.Expr, tableAliases)
+	} else {
+		perTablePreds = make([][]sqlparser.Expr, len(tableAliases))
+	}
+
+	// Build rows from each table, pre-filtering with table-specific predicates
+	allTableRows := make([][]storage.Row, len(stmt.TableExprs))
+	for i, te := range stmt.TableExprs {
+		rows, err := e.buildFromExpr(te)
 		if err != nil {
 			return nil, err
 		}
-		allRows = crossProduct(allRows, rightRows)
+		// Apply per-table predicates to filter rows before cross-joining
+		if len(perTablePreds[i]) > 0 {
+			var pred sqlparser.Expr = perTablePreds[i][0]
+			for j := 1; j < len(perTablePreds[i]); j++ {
+				pred = &sqlparser.AndExpr{Left: pred, Right: perTablePreds[i][j]}
+			}
+			filtered := make([]storage.Row, 0)
+			for _, row := range rows {
+				match, err := e.evalWhere(pred, row)
+				if err != nil {
+					continue
+				}
+				if match {
+					filtered = append(filtered, row)
+				}
+			}
+			rows = filtered
+		}
+		allTableRows[i] = rows
 	}
 
-	// Apply WHERE filter
-	if stmt.Where != nil {
+	// Cross join the pre-filtered tables
+	allRows := allTableRows[0]
+	for i := 1; i < len(allTableRows); i++ {
+		allRows = crossProduct(allRows, allTableRows[i])
+	}
+
+	// Apply remaining cross-table WHERE predicates
+	if len(crossPreds) > 0 {
+		var crossPred sqlparser.Expr = crossPreds[0]
+		for j := 1; j < len(crossPreds); j++ {
+			crossPred = &sqlparser.AndExpr{Left: crossPred, Right: crossPreds[j]}
+		}
 		filtered := make([]storage.Row, 0)
 		for _, row := range allRows {
-			match, err := e.evalWhere(stmt.Where.Expr, row)
+			match, err := e.evalWhere(crossPred, row)
 			if err != nil {
 				return nil, err
 			}
