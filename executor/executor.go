@@ -2853,6 +2853,11 @@ func extractRawSelectExprs(query string) []string {
 		return nil
 	}
 	start := len("select ")
+	// Skip DISTINCT keyword so it doesn't appear in column headers
+	rest := strings.TrimSpace(q[start:])
+	if strings.HasPrefix(strings.ToLower(rest), "distinct ") {
+		start = len(q) - len(rest) + len("distinct ")
+	}
 	inQuote := byte(0)
 	parenDepth := 0
 	end := len(q)
@@ -3375,10 +3380,29 @@ func (e *Executor) execExecute(stmt *sqlparser.ExecuteStmt) (*Result, error) {
 		return nil, err
 	}
 	if res != nil && res.IsResultSet && len(argSQLLiterals) > 0 {
+		// Determine which column positions are derived from SELECT expressions containing ?
+		origSelectExprs := extractRawSelectExprs(query)
+		questionCols := make(map[int]bool)
+		for idx, expr := range origSelectExprs {
+			if strings.Contains(expr, "?") {
+				questionCols[idx] = true
+			}
+		}
 		for i := range res.Columns {
 			col := res.Columns[i]
+			// Only replace in columns derived from SELECT expressions that had ?
+			if len(origSelectExprs) > 0 && !questionCols[i] {
+				continue
+			}
 			for _, lit := range argSQLLiterals {
 				col = strings.ReplaceAll(col, lit, "?")
+				// Also replace unquoted string values (column headers strip quotes from string literals)
+				if len(lit) >= 2 && lit[0] == '\'' && lit[len(lit)-1] == '\'' {
+					unquoted := lit[1 : len(lit)-1]
+					unquoted = strings.ReplaceAll(unquoted, "\\'", "'")
+					unquoted = strings.ReplaceAll(unquoted, "\\\\", "\\")
+					col = strings.ReplaceAll(col, unquoted, "?")
+				}
 			}
 			res.Columns[i] = col
 		}
@@ -12296,10 +12320,10 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 		var defVal interface{}
 		if col.Default != nil {
 			defVal = *col.Default
-		} else if col.Nullable && !isInfoSchemaTable(descDB) {
-			defVal = nil // NULL for nullable columns without explicit default (user tables)
+		} else if isInfoSchemaTable(descDB) {
+			defVal = "" // empty for INFORMATION_SCHEMA columns
 		} else {
-			defVal = "" // empty for NOT NULL or INFORMATION_SCHEMA columns
+			defVal = nil // NULL for columns without explicit default (user tables)
 		}
 		var extra interface{}
 		extra = ""
@@ -14057,9 +14081,8 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	displayIndexes := make([]catalog.IndexDef, len(def.Indexes))
 	copy(displayIndexes, def.Indexes)
 	sort.SliceStable(displayIndexes, func(i, j int) bool {
-		left := isClusterPreferredUniqueIndex(displayIndexes[i], def.Columns)
-		right := isClusterPreferredUniqueIndex(displayIndexes[j], def.Columns)
-		return left && !right
+		// MySQL orders UNIQUE KEY before non-unique KEY in SHOW CREATE TABLE
+		return displayIndexes[i].Unique && !displayIndexes[j].Unique
 	})
 	for i, idx := range displayIndexes {
 		quotedCols := make([]string, len(idx.Columns))

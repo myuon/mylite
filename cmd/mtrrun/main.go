@@ -97,7 +97,7 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		// Phase 1: Core engine (high pass rate)
 		"engine_funcs": true,
 		"engine_iuds":  true,
-		// "jp":           true,
+		"jp":           true,
 		// "json":         true,
 	}
 
