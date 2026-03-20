@@ -3450,9 +3450,31 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				cleanName := strings.TrimPrefix(name, "global.")
 				cleanName = strings.TrimPrefix(cleanName, "session.")
 				cleanName = strings.TrimPrefix(cleanName, "local.")
-				// Handle DEFAULT: restore the variable to its default value
+					// Handle DEFAULT: restore the variable to its default value
 				if _, isDefault := expr.Expr.(*sqlparser.Default); isDefault || strings.ToUpper(val) == "DEFAULT" {
 					delete(e.globalVars, cleanName)
+				} else if cleanName == "innodb_tmpdir" {
+					// innodb_tmpdir must be a valid path
+					evalVal, _ := e.evalExpr(expr.Expr)
+					tmpPath := toString(evalVal)
+					if tmpPath != "" {
+						if _, err := os.Stat(tmpPath); os.IsNotExist(err) {
+							errMsg := fmt.Sprintf("Variable 'innodb_tmpdir' can't be set to the value of '%s'", tmpPath)
+							e.warnings = append(e.warnings,
+								Warning{Level: "Warning", Code: 1210, Message: "InnoDB: Path doesn't exist."},
+								Warning{Level: "Error", Code: 1231, Message: errMsg},
+							)
+							return nil, mysqlError(1231, "42000", errMsg)
+						}
+					}
+					e.globalVars[cleanName] = tmpPath
+				} else if cleanName == "innodb_commit_concurrency" {
+					// innodb_commit_concurrency can only remain at 0 once set to 0
+					evalVal, _ := e.evalExpr(expr.Expr)
+					if toInt64(evalVal) != 0 {
+						return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'innodb_commit_concurrency' can't be set to the value of '%v'", evalVal))
+					}
+					e.globalVars[cleanName] = "0"
 				} else {
 					// Evaluate expression
 					evalVal, err := e.evalExpr(expr.Expr)
@@ -6088,7 +6110,8 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				if cn := idx.Info.ConstraintName.String(); cn != "" {
 					idxName = cn
 				} else {
-					idxName = idxCols[0]
+					// Use column name without prefix length for default index name
+					idxName = stripPrefixLengthFromCol(idxCols[0])
 				}
 			}
 			idxComment := ""
@@ -10229,6 +10252,7 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					}
 				}
 			}
+			rawExprIdx++
 		case *sqlparser.AliasedExpr:
 			name := ""
 			if !se.As.IsEmpty() {
@@ -10295,6 +10319,17 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					// Use raw expression text from the original query to preserve
 					// MySQL's behavior of keeping the original formatting (e.g.
 					// spacing after commas in function calls).
+					// MySQL displays string literal column headers without quotes:
+					// SELECT 'hello' -> column name is "hello" not "'hello'"
+					if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' {
+						raw = raw[1 : len(raw)-1]
+					}
+					// MySQL displays j->'$.key' as JSON_EXTRACT(j,'$.key') in column headers
+					if arrowIdx := strings.Index(raw, "->>'"); arrowIdx >= 0 {
+						raw = "JSON_UNQUOTE(JSON_EXTRACT(" + raw[:arrowIdx] + "," + raw[arrowIdx+3:] + "))"
+					} else if arrowIdx := strings.Index(raw, "->'"); arrowIdx >= 0 {
+						raw = "JSON_EXTRACT(" + raw[:arrowIdx] + "," + raw[arrowIdx+2:] + ")"
+					}
 					name = raw
 				}
 				if name == "" {
@@ -11835,7 +11870,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				if cn := op.IndexDefinition.Info.ConstraintName.String(); cn != "" {
 					idxName = cn
 				} else if len(idxCols) > 0 {
-					idxName = idxCols[0]
+					idxName = stripPrefixLengthFromCol(idxCols[0])
 				}
 			}
 			// Check for USING method and COMMENT

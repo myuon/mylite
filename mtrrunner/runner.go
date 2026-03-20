@@ -542,6 +542,58 @@ func (ctx *execContext) executeLines(lines []string) error {
 					continue
 				}
 			}
+			if isIf {
+				// Look for { on next line and collect body
+				nextI := i + 1
+				for nextI < len(lines) && strings.TrimSpace(lines[nextI]) == "" {
+					nextI++
+				}
+				if nextI < len(lines) && strings.TrimSpace(lines[nextI]) == "{" {
+					// Extract condition
+					condStr := trimmed
+					if strings.HasPrefix(strings.ToLower(condStr), "--if") {
+						condStr = condStr[4:]
+					} else if strings.HasPrefix(strings.ToLower(condStr), "if") {
+						condStr = condStr[2:]
+					}
+					condStr = strings.TrimSpace(condStr)
+					condStr = strings.TrimPrefix(condStr, "(")
+					condStr = strings.TrimSuffix(condStr, ")")
+					condStr = strings.TrimSpace(condStr)
+
+					bodyStart := nextI + 1
+					depth := 1
+					j := bodyStart
+					for j < len(lines) && depth > 0 {
+						t := strings.TrimSpace(lines[j])
+						if t == "{" {
+							depth++
+						}
+						if t == "}" {
+							depth--
+							if depth == 0 {
+								break
+							}
+						}
+						j++
+					}
+					bodyLines := lines[bodyStart:j]
+					condVal := ctx.substituteVars(condStr)
+					// Replace unresolved $variables with empty string for condition evaluation
+					condVal = regexp.MustCompile(`\$[a-zA-Z_][a-zA-Z0-9_]*`).ReplaceAllString(condVal, "")
+					if evalWhileCondition(condVal) {
+						err := ctx.executeLines(bodyLines)
+						if err != nil {
+							if errors.Is(err, errSkipTest) {
+								return err
+							}
+							return fmt.Errorf("line %d (if body): %v", i+1, err)
+						}
+					}
+					i = j + 1
+					continue
+				}
+			}
 			i++
 			continue
 		}
@@ -1509,9 +1561,44 @@ func (ctx *execContext) evaluateIfConditionInner(condStr string) bool {
 	condStr = ctx.substituteVars(condStr)
 
 	// Simple variable truth check: $var
-	if strings.HasPrefix(condStr, "$") {
+	if strings.HasPrefix(condStr, "$") && !strings.ContainsAny(condStr, " \t") {
 		val, ok := ctx.variables[condStr]
 		return ok && val != "" && val != "0"
+	}
+
+	// Comparison operators
+	for _, op := range []string{"!=", "==", ">=", "<=", ">", "<"} {
+		if idx := strings.Index(condStr, op); idx >= 0 {
+			left := strings.TrimSpace(condStr[:idx])
+			right := strings.TrimSpace(condStr[idx+len(op):])
+			lNum, lErr := strconv.ParseFloat(left, 64)
+			rNum, rErr := strconv.ParseFloat(right, 64)
+			if lErr == nil && rErr == nil {
+				switch op {
+				case "!=":
+					return lNum != rNum
+				case "==":
+					return lNum == rNum
+				case ">=":
+					return lNum >= rNum
+				case "<=":
+					return lNum <= rNum
+				case ">":
+					return lNum > rNum
+				case "<":
+					return lNum < rNum
+				}
+			}
+			// String comparison
+			switch op {
+			case "!=":
+				return left != right
+			case "==":
+				return left == right
+			default:
+				return false
+			}
+		}
 	}
 
 	// Numeric check
@@ -1901,7 +1988,8 @@ func (ctx *execContext) executeExec(stmt string) error {
 		ctx.output.WriteString(fmt.Sprintf("affected rows: %d\n", affected))
 		upper := strings.ToUpper(strings.TrimSpace(stmt))
 		if strings.HasPrefix(upper, "ALTER TABLE") || strings.HasPrefix(upper, "LOAD DATA") ||
-			strings.HasPrefix(upper, "CREATE INDEX") || strings.HasPrefix(upper, "DROP INDEX") {
+			strings.HasPrefix(upper, "CREATE INDEX") || strings.HasPrefix(upper, "DROP INDEX") ||
+			strings.HasPrefix(upper, "INSERT") || strings.HasPrefix(upper, "REPLACE") {
 			ctx.output.WriteString(fmt.Sprintf("info: Records: %d  Duplicates: 0  Warnings: 0\n", affected))
 		} else if strings.HasPrefix(upper, "UPDATE") {
 			// Query the server for the update info message (Rows matched/Changed)
