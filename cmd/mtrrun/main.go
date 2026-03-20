@@ -81,6 +81,76 @@ var skipTests = map[string]bool{
 	// Foreign key constraint enforcement not implemented (InnoDB FK checks fail)
 	"gcol/gcol_ins_upd_innodb": true,
 	"gcol/gcol_ins_upd_myisam": true,
+
+	// === GIS suite ===
+	// Stored procedures using DO inside CALL + full WKB/SRID binary format required
+	"gis/all_geometry_types_instantiable": true,
+	"gis/geometry_class_attri_prop":       true,
+	"gis/geometry_property_functions":     true,
+	"gis/wkb":                             true,
+	"gis/wkt":                             true,
+	// Requires INFORMATION_SCHEMA.ST_GEOMETRY_COLUMNS virtual table
+	"gis/ddl": true,
+	// Requires full SRS catalog (ST_SPATIAL_REFERENCE_SYSTEMS, SRID validation, projection)
+	"gis/srs":          true,
+	"gis/st_transform": true,
+	// Requires SRID-aware coordinate validation and geographic coordinate swapping
+	"gis/st_x":                                    true,
+	"gis/st_y":                                    true,
+	"gis/st_latitude":                              true,
+	"gis/st_longitude":                             true,
+	"gis/spatial_utility_function_srid":             true,
+	"gis/spatial_utility_function_validate":         true,
+	"gis/spatial_utility_function_distance_sphere":  true,
+	// Requires WKB binary format with SRID for proper round-trip and coordinate swapping
+	"gis/wkt_geometry_representation": true,
+	"gis/wkb_geometry_representation": true,
+	"gis/spatial_utility_function_swapxy": true,
+	"gis/spatial_utility_functions_xy":    true,
+	// Requires LINESTRING/POLYGON validation (min 2 points, self-intersection detection)
+	"gis/geometry_property_function_issimple": true,
+	"gis/spatial_utility_function_isvalid":    true,
+	// Requires geometry type validation errors (ST_AREA on non-polygon, etc.) and proper centroid computation
+	"gis/spatial_analysis_functions_area":     true,
+	"gis/spatial_analysis_functions_centroid": true,
+	// Requires proper bounding box (envelope) computation for all geometry types
+	"gis/spatial_analysis_functions_envelope": true,
+	// Requires ST_MakeEnvelope degenerate case handling (point/line envelopes)
+	"gis/spatial_utility_function_make_envelope": true,
+	// Requires computational geometry (convex hull algorithm)
+	"gis/spatial_analysis_functions_convexhull": true,
+	// Requires full computational geometry (ST_BUFFER with proper curve generation)
+	"gis/spatial_analysis_functions_buffer": true,
+	// Requires full computational geometry (ST_DISTANCE with SRID + DO inside stored procs)
+	"gis/spatial_analysis_functions_distance": true,
+	// Requires spatial index error validation and SRID column constraints
+	"gis/spatial_indexing": true,
+	// Requires full computational geometry operators (ST_INTERSECTION, ST_UNION, ST_DIFFERENCE, ST_SYMDIFFERENCE)
+	"gis/spatial_operators_intersection":  true,
+	"gis/spatial_operators_union":         true,
+	"gis/spatial_operators_difference":    true,
+	"gis/spatial_operators_symdifference": true,
+	// Requires full computational geometry testing functions (ST_CONTAINS, ST_WITHIN, etc.)
+	"gis/spatial_testing_functions_contains":   true,
+	"gis/spatial_testing_functions_coveredby":  true,
+	"gis/spatial_testing_functions_covers":     true,
+	"gis/spatial_testing_functions_crosses":    true,
+	"gis/spatial_testing_functions_disjoint":   true,
+	"gis/spatial_testing_functions_equals":     true,
+	"gis/spatial_testing_functions_intersects": true,
+	"gis/spatial_testing_functions_overlaps":   true,
+	"gis/spatial_testing_functions_touches":    true,
+	"gis/spatial_testing_functions_within":     true,
+	// Requires full computational geometry mixed testing + error handling
+	"gis/spatial_op_testingfunc_mix": true,
+	// Requires Douglas-Peucker simplification algorithm
+	"gis/spatial_utility_function_simplify": true,
+	// Requires precise geohash decode with proper rounding
+	"gis/geohash_functions": true,
+	// Requires full GeoJSON round-trip with SRID and proper ST_SRID handling
+	"gis/geojson_functions": true,
+	// Requires geometry validation errors, proper centroid, and SRID-aware operations
+	"gis/gis_bugs_crashes": true,
 }
 
 func main() {
@@ -146,6 +216,7 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		"jp":           true,
 		"json":         true,
 		"gcol":         true,
+		"gis":          true,
 		// collations: skipped — requires MySQL UCA 0900 weight tables (DUCET + tailoring)
 	}
 
