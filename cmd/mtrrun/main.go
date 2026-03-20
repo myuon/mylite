@@ -357,6 +357,7 @@ type worker struct {
 	addr        string
 	tmpDir      string
 	searchPaths []string
+	db          *sql.DB // reusable DB connection pool for this worker
 }
 
 func newWorker(searchPaths []string) (*worker, error) {
@@ -398,6 +399,16 @@ func newWorker(searchPaths []string) (*worker, error) {
 		srv.Start() //nolint:errcheck
 	}()
 
+	// Create a reusable DB connection pool for this worker
+	db, err := connectDB(addr)
+	if err != nil {
+		srv.Close()
+		os.RemoveAll(tmpDir)
+		return nil, fmt.Errorf("failed to connect to worker: %v", err)
+	}
+	db.SetMaxIdleConns(1)
+	db.SetMaxOpenConns(2)
+
 	return &worker{
 		srv:         srv,
 		exec:        exec,
@@ -406,10 +417,14 @@ func newWorker(searchPaths []string) (*worker, error) {
 		addr:        addr,
 		tmpDir:      tmpDir,
 		searchPaths: searchPaths,
+		db:          db,
 	}, nil
 }
 
 func (w *worker) close() {
+	if w.db != nil {
+		w.db.Close()
+	}
 	w.srv.Close()
 	os.RemoveAll(w.tmpDir)
 }
@@ -443,6 +458,9 @@ func (w *worker) runTest(testPath string, includePaths []string, verbose bool, t
 			result.Elapsed = time.Since(t0)
 			return result
 		case <-ctx.Done():
+			// Force reset state so the old executor is released for GC,
+			// even though the timed-out goroutine may still be running.
+			w.resetState()
 			return mtrrunner.TestResult{
 				Name:    testName,
 				Timeout: true,
@@ -460,19 +478,10 @@ func (w *worker) runTestInner(testPath string, includePaths []string, verbose bo
 	// Reset executor state for full isolation between tests
 	w.resetState()
 
-	db, err := connectDB(w.addr)
-	if err != nil {
-		return mtrrunner.TestResult{
-			Name:  strings.TrimSuffix(filepath.Base(testPath), ".test"),
-			Error: fmt.Sprintf("failed to connect: %v", err),
-		}
-	}
-	defer db.Close()
-
-	resetSessionState(db)
+	resetSessionState(w.db)
 
 	runner := &mtrrunner.Runner{
-		DB:           db,
+		DB:           w.db,
 		IncludePaths: includePaths,
 		Verbose:      verbose,
 		TmpDir:       w.tmpDir,

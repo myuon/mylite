@@ -157,6 +157,7 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	select {
 	case err = <-doneCh:
 	case <-timeoutCtx.Done():
+		ectx.closeConnections()
 		return TestResult{Name: name, Error: "timeout: test took too long"}
 	}
 	ctx := ectx

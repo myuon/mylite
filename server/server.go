@@ -38,7 +38,7 @@ var stmtCounter uint64
 
 // Handler implements go-mysql server.Handler interface.
 type Handler struct {
-	exec     *executor.Executor
+	srv      *Server
 	mu       sync.Mutex
 	stmtsMu  sync.Mutex
 	stmts    map[uint64]string
@@ -47,7 +47,7 @@ type Handler struct {
 func (h *Handler) UseDB(dbName string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	_, err := h.exec.Execute(fmt.Sprintf("USE `%s`", dbName))
+	_, err := h.srv.Executor.Execute(fmt.Sprintf("USE `%s`", dbName))
 	return err
 }
 
@@ -55,7 +55,7 @@ func (h *Handler) HandleQuery(query string) (*mysql.Result, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	result, err := h.exec.Execute(query)
+	result, err := h.srv.Executor.Execute(query)
 	if err != nil {
 		errMsg := err.Error()
 		if strings.HasPrefix(errMsg, "ERROR ") {
@@ -125,7 +125,7 @@ func (h *Handler) HandleStmtExecute(context interface{}, query string, args []in
 	// Replace ? placeholders with the provided argument values
 	finalQuery := replacePlaceholders(storedQuery, args)
 
-	result, err := h.exec.Execute(finalQuery)
+	result, err := h.srv.Executor.Execute(finalQuery)
 	if err != nil {
 		errMsg := err.Error()
 		if strings.HasPrefix(errMsg, "ERROR ") {
@@ -271,7 +271,7 @@ func (s *Server) Close() error {
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	handler := &Handler{exec: s.Executor}
+	handler := &Handler{srv: s}
 
 	// Create a MySQL connection with no auth
 	mysqlConn, err := gomysql.NewConn(conn, "root", "", handler)
