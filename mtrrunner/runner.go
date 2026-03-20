@@ -2507,7 +2507,7 @@ func readLines(path string) ([]string, error) {
 
 	var lines []string
 	scanner := bufio.NewScanner(bytes.NewReader(data))
-	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB buffer
+	scanner.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024) // 64MB buffer
 	for scanner.Scan() {
 		lines = append(lines, scanner.Text())
 	}

@@ -498,6 +498,35 @@ func (e *Executor) initSystemTables() {
 		},
 	})
 	ensure("information_schema", &catalog.TableDef{
+		Name: "INNODB_CMP_PER_INDEX",
+		Columns: []catalog.ColumnDef{
+			{Name: "database_name", Type: "VARCHAR(192)"},
+			{Name: "table_name", Type: "VARCHAR(192)"},
+			{Name: "index_name", Type: "VARCHAR(192)"},
+			{Name: "compress_ops", Type: "INT"},
+			{Name: "compress_ops_ok", Type: "INT"},
+			{Name: "compress_time", Type: "INT"},
+			{Name: "uncompress_ops", Type: "INT"},
+			{Name: "uncompress_time", Type: "INT"},
+		},
+	})
+	ensure("information_schema", &catalog.TableDef{
+		Name: "PLUGINS",
+		Columns: []catalog.ColumnDef{
+			{Name: "PLUGIN_NAME", Type: "VARCHAR(64)"},
+			{Name: "PLUGIN_VERSION", Type: "VARCHAR(20)"},
+			{Name: "PLUGIN_STATUS", Type: "VARCHAR(10)"},
+			{Name: "PLUGIN_TYPE", Type: "VARCHAR(80)"},
+			{Name: "PLUGIN_TYPE_VERSION", Type: "VARCHAR(20)"},
+			{Name: "PLUGIN_LIBRARY", Type: "VARCHAR(64)"},
+			{Name: "PLUGIN_LIBRARY_VERSION", Type: "VARCHAR(20)"},
+			{Name: "PLUGIN_AUTHOR", Type: "VARCHAR(64)"},
+			{Name: "PLUGIN_DESCRIPTION", Type: "LONGTEXT"},
+			{Name: "PLUGIN_LICENSE", Type: "VARCHAR(80)"},
+			{Name: "LOAD_OPTION", Type: "VARCHAR(64)"},
+		},
+	})
+	ensure("information_schema", &catalog.TableDef{
 		Name: "INNODB_TEMP_TABLE_INFO",
 		Columns: []catalog.ColumnDef{
 			{Name: "TABLE_ID", Type: "BIGINT"},
@@ -3471,10 +3500,15 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				} else if cleanName == "innodb_commit_concurrency" {
 					// innodb_commit_concurrency can only remain at 0 once set to 0
 					evalVal, _ := e.evalExpr(expr.Expr)
-					if toInt64(evalVal) != 0 {
+					newVal := toInt64(evalVal)
+					currentVal := e.globalVars[cleanName]
+					if currentVal == "" {
+						currentVal = e.startupVars[cleanName]
+					}
+					if currentVal == "0" && newVal != 0 {
 						return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'innodb_commit_concurrency' can't be set to the value of '%v'", evalVal))
 					}
-					e.globalVars[cleanName] = "0"
+					e.globalVars[cleanName] = fmt.Sprintf("%d", newVal)
 				} else {
 					// Evaluate expression
 					evalVal, err := e.evalExpr(expr.Expr)
@@ -12203,7 +12237,11 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		switch basic.Command {
 		case sqlparser.Column:
 			// SHOW COLUMNS FROM <table> / SHOW FULL COLUMNS FROM <table>
-			return e.describeTable(basic.Tbl.Name.String())
+			tblName := basic.Tbl.Name.String()
+			if !basic.Tbl.Qualifier.IsEmpty() {
+				tblName = basic.Tbl.Qualifier.String() + "." + tblName
+			}
+			return e.describeTable(tblName)
 		case sqlparser.TableStatus:
 			// SHOW TABLE STATUS [FROM db] [LIKE ...]
 			return e.showTableStatus()
@@ -12363,6 +12401,34 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			Rows:        rows,
 			IsResultSet: true,
 		}, nil
+	}
+
+	// SHOW CREATE DATABASE <db>
+	if strings.HasPrefix(upper, "SHOW CREATE DATABASE") || strings.HasPrefix(upper, "SHOW CREATE SCHEMA") {
+		parts := strings.Fields(query)
+		if len(parts) >= 4 {
+			dbName := parts[3]
+			dbName = strings.TrimRight(dbName, ";")
+			dbName = strings.ReplaceAll(dbName, "`", "")
+			db, resolvedName, err := findDatabaseCaseInsensitive(e.Catalog, dbName)
+			if err != nil {
+				return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
+			}
+			charset := "utf8mb4"
+			collation := "utf8mb4_0900_ai_ci"
+			if db.CharacterSet != "" {
+				charset = db.CharacterSet
+			}
+			if db.CollationName != "" {
+				collation = db.CollationName
+			}
+			createSQL := fmt.Sprintf("CREATE DATABASE `%s` /*!40100 DEFAULT CHARACTER SET %s COLLATE %s */ /*!80016 DEFAULT ENCRYPTION='N' */", resolvedName, charset, collation)
+			return &Result{
+				Columns:     []string{"Database", "Create Database"},
+				Rows:        [][]interface{}{{resolvedName, createSQL}},
+				IsResultSet: true,
+			}, nil
+		}
 	}
 
 	// SHOW CREATE TABLE <table>

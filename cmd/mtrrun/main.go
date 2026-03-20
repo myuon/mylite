@@ -105,9 +105,12 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 	}
 
 	// Limit concurrent suites to avoid resource exhaustion (each suite spawns up to 8 workers)
-	maxConcurrentSuites := runtime.NumCPU()
-	if maxConcurrentSuites > 8 {
-		maxConcurrentSuites = 8
+	maxConcurrentSuites := runtime.NumCPU() / 2
+	if maxConcurrentSuites < 2 {
+		maxConcurrentSuites = 2
+	}
+	if maxConcurrentSuites > 4 {
+		maxConcurrentSuites = 4
 	}
 	sem := make(chan struct{}, maxConcurrentSuites)
 
