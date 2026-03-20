@@ -296,6 +296,82 @@ var skipTests = map[string]bool{
 	"parts/partition_value_error": true,
 	// Replication with partitioned DML
 	"parts/rpl-partition-dml-1-1-innodb": true,
+
+	// === funcs_1 suite ===
+	// Charset/collation comparison differences
+	"funcs_1/charset_collation": true,
+	// BIT type handling differences
+	"funcs_1/innodb_bitdata": true,
+	"funcs_1/memory_bitdata": true,
+	// Cursors in stored procedures not implemented
+	"funcs_1/innodb_cursors": true,
+	"funcs_1/memory_cursors": true,
+	// Updatable views not implemented
+	"funcs_1/innodb_func_view":  true,
+	"funcs_1/memory_func_view":  true,
+	"funcs_1/innodb_views":      true,
+	"funcs_1/memory_views":      true,
+	// Complex trigger chains with LOAD DATA
+	"funcs_1/innodb_trig_0102":   true,
+	"funcs_1/innodb_trig_03":     true,
+	"funcs_1/innodb_trig_03e":    true,
+	"funcs_1/innodb_trig_0407":   true,
+	"funcs_1/innodb_trig_08":     true,
+	"funcs_1/innodb_trig_09":     true,
+	"funcs_1/innodb_trig_1011ext": true,
+	"funcs_1/innodb_trig_frkey":  true,
+	"funcs_1/memory_trig_0102":   true,
+	"funcs_1/memory_trig_03":     true,
+	"funcs_1/memory_trig_03e":    true,
+	"funcs_1/memory_trig_0407":   true,
+	"funcs_1/memory_trig_08":     true,
+	"funcs_1/memory_trig_09":     true,
+	"funcs_1/memory_trig_1011ext": true,
+	// INFORMATION_SCHEMA query differences
+	"funcs_1/is_basics_mixed":                       true,
+	"funcs_1/is_character_sets":                     true,
+	"funcs_1/is_cml_innodb":                         true,
+	"funcs_1/is_cml_memory":                         true,
+	"funcs_1/is_coll_char_set_appl":                 true,
+	"funcs_1/is_collations":                         true,
+	"funcs_1/is_column_privileges":                  true,
+	"funcs_1/is_column_privileges_is_mysql_test":    true,
+	"funcs_1/is_columns_mysql":                      true,
+	"funcs_1/is_engines":                            true,
+	"funcs_1/is_engines_csv":                        true,
+	"funcs_1/is_engines_memory":                     true,
+	"funcs_1/is_engines_merge":                      true,
+	"funcs_1/is_schema_privileges":                  true,
+	"funcs_1/is_schema_privileges_is_mysql_test":    true,
+	"funcs_1/is_schemata_is_mysql_test":             true,
+	"funcs_1/is_statistics_is":                      true,
+	"funcs_1/is_statistics_mysql":                   true,
+	"funcs_1/is_table_constraints_is":               true,
+	"funcs_1/is_table_constraints_mysql":            true,
+	"funcs_1/is_table_privileges":                   true,
+	"funcs_1/is_tables_innodb":                      true,
+	"funcs_1/is_tables_is":                          true,
+	"funcs_1/is_tables_memory":                      true,
+	"funcs_1/is_tables_mysql":                       true,
+	"funcs_1/is_user_privileges":                    true,
+	// PROCESSLIST queries require real process management
+	"funcs_1/processlist_priv_no_prot": true,
+	"funcs_1/processlist_val_no_prot":  true,
+	// Complex stored procedure features
+	"funcs_1/storedproc": true,
+
+	// === secondary_engine suite ===
+	// All tests require secondary engine plugin
+	"secondary_engine/cost_threshold":     true,
+	"secondary_engine/define":             true,
+	"secondary_engine/histogram":          true,
+	"secondary_engine/index_statistics":   true,
+	"secondary_engine/install":            true,
+	"secondary_engine/load":               true,
+	"secondary_engine/no_constant_tables": true,
+	"secondary_engine/query_preparation":  true,
+	"secondary_engine/system_variables":   true,
+	"secondary_engine/uninstall":          true,
 }
 
 func main() {
@@ -365,6 +441,8 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		"innodb_fts":   true,
 		"binlog_gtid":  true,
 		"parts":        true,
+		"funcs_1":      true,
+		"secondary_engine": true,
 		// collations: skipped — requires MySQL UCA 0900 weight tables (DUCET + tailoring)
 	}
 
