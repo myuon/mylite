@@ -43,6 +43,16 @@ var skipTests = map[string]bool{
 	"json/json_conversions": true,
 	// JSON_TABLE requires complex virtual table functionality; test hangs
 	"json/json_table": true,
+	// Requires UPDATE through views (updatable views not implemented) - errors out
+	"gcol/gcol_view_innodb":  true,
+	"gcol/gcol_view_myisam":  true,
+	// Requires IF/THEN/END IF control flow in trigger bodies (not implemented) - errors out
+	"gcol/gcol_trigger_sp_innodb": true,
+	"gcol/gcol_trigger_sp_myisam": true,
+	// Uses MySQL version-specific comment syntax (/*! IGNORE */) causing parse error
+	"gcol/gcol_bugfixes": true,
+	// Replication test - requires server restart/multiple servers
+	"gcol/rpl_gcol": true,
 }
 
 func main() {
@@ -107,6 +117,8 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		"engine_iuds":  true,
 		"jp":           true,
 		"json":         true,
+		"gcol":         true,
+		// collations: skipped — requires MySQL UCA 0900 weight tables (DUCET + tailoring)
 	}
 
 
