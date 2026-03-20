@@ -27,6 +27,9 @@ import (
 // errSkipTest is a sentinel error indicating the test should be skipped.
 var errSkipTest = errors.New("skip test")
 
+// errExitTest is a sentinel error indicating the test called exit; (stop processing, compare output normally).
+var errExitTest = errors.New("exit test")
+
 // TestResult represents the outcome of running a single .test file.
 type TestResult struct {
 	Name     string
@@ -163,6 +166,9 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	ctx.closeConnections()
 	if errors.Is(err, errSkipTest) {
 		return TestResult{Name: name, Skipped: true}
+	}
+	if errors.Is(err, errExitTest) {
+		err = nil // exit; means stop processing but compare output normally
 	}
 	if err != nil {
 		return TestResult{
@@ -447,7 +453,7 @@ func (ctx *execContext) executeLines(lines []string) error {
 				}
 				err := ctx.executeLines(bodyLines)
 				if err != nil {
-					if errors.Is(err, errSkipTest) {
+					if errors.Is(err, errSkipTest) || errors.Is(err, errExitTest) {
 						return err
 					}
 					return fmt.Errorf("line %d (while body): %v", i+1, err)
@@ -518,7 +524,7 @@ func (ctx *execContext) executeLines(lines []string) error {
 						}
 						err := ctx.executeLines(bodyLines)
 						if err != nil {
-							if errors.Is(err, errSkipTest) {
+							if errors.Is(err, errSkipTest) || errors.Is(err, errExitTest) {
 								return err
 							}
 							return fmt.Errorf("line %d (while body): %v", i+1, err)
@@ -553,8 +559,11 @@ func (ctx *execContext) executeLines(lines []string) error {
 			}
 
 			handled, skip, err := ctx.handleDirective(directive)
-			if err != nil && !errors.Is(err, errSkipTest) {
+			if err != nil && !errors.Is(err, errSkipTest) && !errors.Is(err, errExitTest) {
 				return fmt.Errorf("line %d: %v", i+1, err)
+			}
+			if errors.Is(err, errExitTest) {
+				return errExitTest
 			}
 			if skip {
 				return errSkipTest
@@ -602,14 +611,19 @@ func (ctx *execContext) executeLines(lines []string) error {
 			if strings.HasPrefix(bdLower, "query ") ||
 				strings.HasPrefix(bdLower, "query_vertical ") ||
 				strings.HasPrefix(bdLower, "eval ") {
-				if !strings.HasSuffix(strings.TrimSpace(trimmed), ";") {
+				// Determine the effective delimiter for multiline collection
+				evalDelim := ";"
+				if ctx.delimiter != "" {
+					evalDelim = ctx.delimiter
+				}
+				if !strings.HasSuffix(strings.TrimSpace(trimmed), evalDelim) {
 					fullDirective := bareDirective
 					i++
 					for i < len(lines) {
 						l := strings.TrimSpace(lines[i])
 						fullDirective += "\n" + l
-						if strings.HasSuffix(strings.TrimSpace(l), ";") {
-							fullDirective = strings.TrimSuffix(fullDirective, ";")
+						if strings.HasSuffix(strings.TrimSpace(l), evalDelim) {
+							fullDirective = strings.TrimSuffix(fullDirective, evalDelim)
 							i++ // consume the terminating line so it won't be re-executed as SQL
 							break
 						}
@@ -620,8 +634,11 @@ func (ctx *execContext) executeLines(lines []string) error {
 				}
 			}
 			handled, skip, err := ctx.handleDirective(bareDirective)
-			if err != nil && !errors.Is(err, errSkipTest) {
+			if err != nil && !errors.Is(err, errSkipTest) && !errors.Is(err, errExitTest) {
 				return fmt.Errorf("line %d: %v", i+1, err)
+			}
+			if errors.Is(err, errExitTest) {
+				return errExitTest
 			}
 			if skip {
 				return errSkipTest
@@ -822,6 +839,9 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 	case "skip":
 		return true, true, errSkipTest
 
+	case "exit":
+		return true, false, errExitTest
+
 	case "error":
 		ctx.expectedError = args
 		return true, false, nil
@@ -877,6 +897,9 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		err := ctx.sourceFile(args)
 		if errors.Is(err, errSkipTest) {
 			return true, true, errSkipTest
+		}
+		if errors.Is(err, errExitTest) {
+			return true, false, errExitTest
 		}
 		return true, false, err
 
@@ -1088,7 +1111,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"mkdir", "rmdir", "move_file",
 		"list_files", "file_exists",
 		"system",
-		"die", "exit",
+		"die",
 		"if", "while", "end",
 		"require", "result_format",
 		"disable_reconnect", "enable_reconnect",

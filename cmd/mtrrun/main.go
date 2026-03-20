@@ -253,6 +253,18 @@ func newWorker(searchPaths []string) (*worker, error) {
 	dataDir := filepath.Join(tmpDir, "data", "inner")
 	os.MkdirAll(dataDir, 0755) //nolint:errcheck
 
+	// Symlink std_data into temp dir so LOAD DATA with $MYSQLTEST_VARDIR/std_data/... works
+	for _, sp := range searchPaths {
+		stdData := filepath.Join(sp, "std_data")
+		if fi, err := os.Stat(stdData); err == nil && fi.IsDir() {
+			target := filepath.Join(tmpDir, "std_data")
+			if _, err := os.Lstat(target); os.IsNotExist(err) {
+				os.Symlink(stdData, target) //nolint:errcheck
+			}
+			break
+		}
+	}
+
 	cat := catalog.New()
 	store := storage.NewEngine()
 	exec := executor.New(cat, store)
