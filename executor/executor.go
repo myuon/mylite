@@ -6414,6 +6414,11 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		insertDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
 	}
 
+	// Silently accept INSERTs into performance_schema tables (they are virtual/stub).
+	if strings.ToLower(insertDB) == "performance_schema" {
+		return &Result{AffectedRows: 1, IsResultSet: false}, nil
+	}
+
 	tbl, err := e.Storage.GetTable(insertDB, tableName)
 	if err != nil {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", insertDB, tableName))
@@ -10495,6 +10500,11 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		return nil, fmt.Errorf("unsupported table expression: %T", te)
 	}
 
+	// Silently accept UPDATEs on performance_schema tables (they are virtual/stub).
+	if strings.ToLower(updateDB) == "performance_schema" {
+		return &Result{AffectedRows: 0, IsResultSet: false}, nil
+	}
+
 	tbl, err := e.Storage.GetTable(updateDB, tableName)
 	if err != nil {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", updateDB, tableName))
@@ -10909,6 +10919,11 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		}
 	default:
 		return nil, fmt.Errorf("unsupported table expression: %T", te)
+	}
+
+	// Silently accept DELETEs on performance_schema tables (they are virtual/stub).
+	if strings.ToLower(deleteDB) == "performance_schema" {
+		return &Result{AffectedRows: 0, IsResultSet: false}, nil
 	}
 
 	tbl, err := e.Storage.GetTable(deleteDB, tableName)
