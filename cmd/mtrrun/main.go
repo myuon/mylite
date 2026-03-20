@@ -42,7 +42,7 @@ func main() {
 	verbose := flag.Bool("verbose", false, "verbose output")
 	maxTests := flag.Int("max", 0, "maximum number of tests to run per suite (0=all)")
 	jobs := flag.Int("j", 0, "number of parallel test workers (0=auto, 1=sequential)")
-	timeout := flag.Duration("timeout", 30*time.Second, "timeout per test (0=no timeout)")
+	timeout := flag.Duration("timeout", 20*time.Second, "timeout per test (0=no timeout)")
 	flag.Parse()
 
 	args := flag.Args()
@@ -75,15 +75,7 @@ func main() {
 	}
 }
 
-// testItem represents a single test to run, with its suite context.
-type testItem struct {
-	suiteName    string
-	testPath     string
-	includePaths []string
-	index        int // index within suite for ordering
-}
-
-// runAllSuites discovers and runs all test suites using a shared global worker pool.
+// runAllSuites discovers and runs all test suites sequentially.
 func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs int, timeout time.Duration) {
 	start := time.Now()
 
@@ -103,161 +95,10 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		}
 	}
 
-	// Collect all tests from all suites into a single queue
-	var allTests []testItem
-	// Track per-suite test counts for result grouping
-	suiteTestCounts := make(map[string]int)
-
-	// Build a common searchPaths for the worker pool (superset of all suites)
-	globalSearchPaths := []string{suiteRoot, includeRoot, filepath.Dir(suiteRoot)}
-
-	for _, suiteName := range suiteNames {
-		suiteDir := filepath.Join(suiteRoot, suiteName)
-
-		// Build include paths for this suite
-		includePaths := []string{includeRoot}
-		suiteInclude := filepath.Join(suiteDir, "include")
-		if _, err := os.Stat(suiteInclude); err == nil {
-			includePaths = append(includePaths, suiteInclude)
-		}
-		suiteTestDir := filepath.Join(suiteDir, "t")
-		if _, err := os.Stat(suiteTestDir); err == nil {
-			includePaths = append(includePaths, suiteTestDir)
-		}
-		includePaths = append(includePaths, suiteRoot)
-
-		// Add suite-specific paths to global search paths
-		for _, p := range includePaths {
-			globalSearchPaths = append(globalSearchPaths, p)
-		}
-
-		// Discover tests in this suite
-		testDir := filepath.Join(suiteDir, "t")
-		testEntries, err := os.ReadDir(testDir)
-		if err != nil {
-			continue
-		}
-
-		idx := 0
-		for _, entry := range testEntries {
-			if !strings.HasSuffix(entry.Name(), ".test") {
-				continue
-			}
-			allTests = append(allTests, testItem{
-				suiteName:    suiteName,
-				testPath:     filepath.Join(testDir, entry.Name()),
-				includePaths: includePaths,
-				index:        idx,
-			})
-			idx++
-			if maxTests > 0 && idx >= maxTests {
-				break
-			}
-		}
-		suiteTestCounts[suiteName] = idx
-	}
-
-	// Deduplicate globalSearchPaths
-	seen := make(map[string]bool)
-	var dedupPaths []string
-	for _, p := range globalSearchPaths {
-		if !seen[p] {
-			seen[p] = true
-			dedupPaths = append(dedupPaths, p)
-		}
-	}
-	globalSearchPaths = dedupPaths
-
-	// Determine worker pool size
-	numJobs := jobs
-	if numJobs <= 0 {
-		numJobs = runtime.NumCPU() / 2
-		if numJobs < 2 {
-			numJobs = 2
-		}
-		if numJobs > 4 {
-			numJobs = 4
-		}
-	}
-	if numJobs > len(allTests) {
-		numJobs = len(allTests)
-	}
-	if numJobs < 1 {
-		numJobs = 1
-	}
-
-	// Create global worker pool
-	workers := make([]*worker, numJobs)
-	for i := 0; i < numJobs; i++ {
-		w, err := newWorker(globalSearchPaths)
-		if err != nil {
-			log.Fatalf("failed to create worker %d: %v", i, err)
-		}
-		workers[i] = w
-	}
-	defer func() {
-		for _, w := range workers {
-			w.close()
-		}
-	}()
-
-	// Wait for all workers to be ready
-	for _, w := range workers {
-		db, err := connectDB(w.addr)
-		if err != nil {
-			log.Fatalf("failed to connect to worker: %v", err)
-		}
-		db.Close()
-	}
-
-	// Dispatch all tests through the shared pool
-	type taggedResult struct {
-		suiteName string
-		index     int
-		result    mtrrunner.TestResult
-	}
-
-	testCh := make(chan testItem, len(allTests))
-	for _, t := range allTests {
-		testCh <- t
-	}
-	close(testCh)
-
-	resultCh := make(chan taggedResult, len(allTests))
-
-	var wg sync.WaitGroup
-	for i := 0; i < numJobs; i++ {
-		wg.Add(1)
-		go func(w *worker) {
-			defer wg.Done()
-			for t := range testCh {
-				result := w.runTest(t.testPath, t.includePaths, verbose, timeout)
-				resultCh <- taggedResult{suiteName: t.suiteName, index: t.index, result: result}
-			}
-		}(workers[i])
-	}
-
-	go func() {
-		wg.Wait()
-		close(resultCh)
-	}()
-
-	// Collect results grouped by suite
-	suiteResults := make(map[string][]mtrrunner.TestResult)
-	for _, sn := range suiteNames {
-		if cnt := suiteTestCounts[sn]; cnt > 0 {
-			suiteResults[sn] = make([]mtrrunner.TestResult, cnt)
-		}
-	}
-
-	for tr := range resultCh {
-		suiteResults[tr.suiteName][tr.index] = tr.result
-	}
-
-	// Print results sorted by suite name
 	var totalPassed, totalFailed, totalSkipped, totalErrors, totalTimeouts, totalTests int
+
 	for _, sn := range suiteNames {
-		results := suiteResults[sn]
+		results := runSuite(sn, "", suiteRoot, includeRoot, verbose, maxTests, jobs, timeout)
 		if len(results) == 0 {
 			continue
 		}
