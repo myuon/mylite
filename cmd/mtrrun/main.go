@@ -17,7 +17,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -76,7 +75,15 @@ func main() {
 	}
 }
 
-// runAllSuites discovers and runs all test suites.
+// testItem represents a single test to run, with its suite context.
+type testItem struct {
+	suiteName    string
+	testPath     string
+	includePaths []string
+	index        int // index within suite for ordering
+}
+
+// runAllSuites discovers and runs all test suites using a shared global worker pool.
 func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs int, timeout time.Duration) {
 	start := time.Now()
 
@@ -96,60 +103,172 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		}
 	}
 
-	var totalPassed, totalFailed, totalSkipped, totalErrors, totalTimeouts, totalTests int
+	// Collect all tests from all suites into a single queue
+	var allTests []testItem
+	// Track per-suite test counts for result grouping
+	suiteTestCounts := make(map[string]int)
 
-	type suiteResult struct {
-		name    string
-		results []mtrrunner.TestResult
-		elapsed time.Duration
+	// Build a common searchPaths for the worker pool (superset of all suites)
+	globalSearchPaths := []string{suiteRoot, includeRoot, filepath.Dir(suiteRoot)}
+
+	for _, suiteName := range suiteNames {
+		suiteDir := filepath.Join(suiteRoot, suiteName)
+
+		// Build include paths for this suite
+		includePaths := []string{includeRoot}
+		suiteInclude := filepath.Join(suiteDir, "include")
+		if _, err := os.Stat(suiteInclude); err == nil {
+			includePaths = append(includePaths, suiteInclude)
+		}
+		suiteTestDir := filepath.Join(suiteDir, "t")
+		if _, err := os.Stat(suiteTestDir); err == nil {
+			includePaths = append(includePaths, suiteTestDir)
+		}
+		includePaths = append(includePaths, suiteRoot)
+
+		// Add suite-specific paths to global search paths
+		for _, p := range includePaths {
+			globalSearchPaths = append(globalSearchPaths, p)
+		}
+
+		// Discover tests in this suite
+		testDir := filepath.Join(suiteDir, "t")
+		testEntries, err := os.ReadDir(testDir)
+		if err != nil {
+			continue
+		}
+
+		idx := 0
+		for _, entry := range testEntries {
+			if !strings.HasSuffix(entry.Name(), ".test") {
+				continue
+			}
+			allTests = append(allTests, testItem{
+				suiteName:    suiteName,
+				testPath:     filepath.Join(testDir, entry.Name()),
+				includePaths: includePaths,
+				index:        idx,
+			})
+			idx++
+			if maxTests > 0 && idx >= maxTests {
+				break
+			}
+		}
+		suiteTestCounts[suiteName] = idx
 	}
 
-	// Limit concurrent suites to avoid resource exhaustion (each suite spawns up to 8 workers)
-	maxConcurrentSuites := runtime.NumCPU() / 2
-	if maxConcurrentSuites < 2 {
-		maxConcurrentSuites = 2
+	// Deduplicate globalSearchPaths
+	seen := make(map[string]bool)
+	var dedupPaths []string
+	for _, p := range globalSearchPaths {
+		if !seen[p] {
+			seen[p] = true
+			dedupPaths = append(dedupPaths, p)
+		}
 	}
-	if maxConcurrentSuites > 4 {
-		maxConcurrentSuites = 4
-	}
-	sem := make(chan struct{}, maxConcurrentSuites)
+	globalSearchPaths = dedupPaths
 
-	resultsCh := make(chan suiteResult, len(suiteNames))
-	var wg sync.WaitGroup
-	for _, suite := range suiteNames {
-		wg.Add(1)
-		go func(s string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			t0 := time.Now()
-			res := runSuite(s, "", suiteRoot, includeRoot, verbose, maxTests, jobs, timeout)
-			resultsCh <- suiteResult{name: s, results: res, elapsed: time.Since(t0)}
-		}(suite)
+	// Determine worker pool size
+	numJobs := jobs
+	if numJobs <= 0 {
+		numJobs = runtime.NumCPU() / 2
+		if numJobs < 2 {
+			numJobs = 2
+		}
+		if numJobs > 4 {
+			numJobs = 4
+		}
 	}
-	go func() {
-		wg.Wait()
-		close(resultsCh)
+	if numJobs > len(allTests) {
+		numJobs = len(allTests)
+	}
+	if numJobs < 1 {
+		numJobs = 1
+	}
+
+	// Create global worker pool
+	workers := make([]*worker, numJobs)
+	for i := 0; i < numJobs; i++ {
+		w, err := newWorker(globalSearchPaths)
+		if err != nil {
+			log.Fatalf("failed to create worker %d: %v", i, err)
+		}
+		workers[i] = w
+	}
+	defer func() {
+		for _, w := range workers {
+			w.close()
+		}
 	}()
 
-	// Collect results and print in completion order
-	var allResults []suiteResult
-	for sr := range resultsCh {
-		allResults = append(allResults, sr)
+	// Wait for all workers to be ready
+	for _, w := range workers {
+		db, err := connectDB(w.addr)
+		if err != nil {
+			log.Fatalf("failed to connect to worker: %v", err)
+		}
+		db.Close()
 	}
-	// Sort by suite name for deterministic output
-	sort.Slice(allResults, func(i, j int) bool {
-		return allResults[i].name < allResults[j].name
-	})
-	for _, sr := range allResults {
-		p, f, s, e, t := countResults(sr.results)
-		printSuiteSummaryCompact(sr.name, len(sr.results), p, f, s, e, t, sr.elapsed)
+
+	// Dispatch all tests through the shared pool
+	type taggedResult struct {
+		suiteName string
+		index     int
+		result    mtrrunner.TestResult
+	}
+
+	testCh := make(chan testItem, len(allTests))
+	for _, t := range allTests {
+		testCh <- t
+	}
+	close(testCh)
+
+	resultCh := make(chan taggedResult, len(allTests))
+
+	var wg sync.WaitGroup
+	for i := 0; i < numJobs; i++ {
+		wg.Add(1)
+		go func(w *worker) {
+			defer wg.Done()
+			for t := range testCh {
+				result := w.runTest(t.testPath, t.includePaths, verbose, timeout)
+				resultCh <- taggedResult{suiteName: t.suiteName, index: t.index, result: result}
+			}
+		}(workers[i])
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	// Collect results grouped by suite
+	suiteResults := make(map[string][]mtrrunner.TestResult)
+	for _, sn := range suiteNames {
+		if cnt := suiteTestCounts[sn]; cnt > 0 {
+			suiteResults[sn] = make([]mtrrunner.TestResult, cnt)
+		}
+	}
+
+	for tr := range resultCh {
+		suiteResults[tr.suiteName][tr.index] = tr.result
+	}
+
+	// Print results sorted by suite name
+	var totalPassed, totalFailed, totalSkipped, totalErrors, totalTimeouts, totalTests int
+	for _, sn := range suiteNames {
+		results := suiteResults[sn]
+		if len(results) == 0 {
+			continue
+		}
+		p, f, s, e, t := countResults(results)
+		printSuiteSummaryCompact(sn, len(results), p, f, s, e, t, 0)
 		totalPassed += p
 		totalFailed += f
 		totalSkipped += s
 		totalErrors += e
 		totalTimeouts += t
-		totalTests += len(sr.results)
+		totalTests += len(results)
 	}
 
 	elapsed := time.Since(start)
@@ -295,6 +414,17 @@ func (w *worker) close() {
 	os.RemoveAll(w.tmpDir)
 }
 
+// resetState creates a fresh catalog/storage/executor and swaps it into the server.
+// This ensures complete isolation between tests without restarting the TCP listener.
+func (w *worker) resetState() {
+	w.cat = catalog.New()
+	w.store = storage.NewEngine()
+	w.exec = executor.New(w.cat, w.store)
+	w.exec.DataDir = filepath.Join(w.tmpDir, "data", "inner")
+	w.exec.SearchPaths = w.searchPaths
+	w.srv.Executor = w.exec
+}
+
 func (w *worker) runTest(testPath string, includePaths []string, verbose bool, timeout time.Duration) mtrrunner.TestResult {
 	testName := strings.TrimSuffix(filepath.Base(testPath), ".test")
 	t0 := time.Now()
@@ -327,6 +457,9 @@ func (w *worker) runTest(testPath string, includePaths []string, verbose bool, t
 }
 
 func (w *worker) runTestInner(testPath string, includePaths []string, verbose bool) mtrrunner.TestResult {
+	// Reset executor state for full isolation between tests
+	w.resetState()
+
 	db, err := connectDB(w.addr)
 	if err != nil {
 		return mtrrunner.TestResult{
@@ -336,7 +469,6 @@ func (w *worker) runTestInner(testPath string, includePaths []string, verbose bo
 	}
 	defer db.Close()
 
-	resetDB(db)
 	resetSessionState(db)
 
 	runner := &mtrrunner.Runner{
@@ -597,48 +729,6 @@ func resolveTestdataRoot() string {
 	}
 
 	return local
-}
-
-func resetDB(db *sql.DB) {
-	// Drop all databases except system ones, then recreate 'test'
-	rows, err := db.Query("SHOW DATABASES")
-	if err != nil {
-		return
-	}
-	defer rows.Close()
-
-	var databases []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err == nil {
-			databases = append(databases, name)
-		}
-	}
-	for _, d := range databases {
-		if d == "information_schema" || d == "performance_schema" || d == "mysql" || d == "test" || d == "mtr" || d == "sys" {
-			continue
-		}
-		db.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", d)) //nolint:errcheck
-	}
-
-	// Drop tables in test database
-	rows2, err := db.Query("SHOW TABLES")
-	if err != nil {
-		return
-	}
-	defer rows2.Close()
-
-	var tables []string
-	for rows2.Next() {
-		var name string
-		if err := rows2.Scan(&name); err == nil {
-			tables = append(tables, name)
-		}
-	}
-	sort.Strings(tables)
-	for _, t := range tables {
-		db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", t)) //nolint:errcheck
-	}
 }
 
 func resetSessionState(db *sql.DB) {
