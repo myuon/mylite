@@ -2502,6 +2502,27 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	trimmed = strings.TrimSpace(query)
 	upper = strings.ToUpper(trimmed)
 
+	// Pre-parse check: generated column with DEFAULT, AUTO_INCREMENT, SERIAL DEFAULT VALUE, or ON UPDATE
+	// Must be done BEFORE normalizeTypeAliases which replaces SERIAL with BIGINT...
+	if (strings.HasPrefix(upper, "CREATE TABLE") || strings.HasPrefix(upper, "CREATE TEMPORARY TABLE") || strings.HasPrefix(upper, "ALTER TABLE")) {
+		gcolDefaultRe := regexp.MustCompile(`(?i)(VIRTUAL|STORED)\s+(DEFAULT\s)`)
+		gcolAIRe := regexp.MustCompile(`(?i)(VIRTUAL|STORED)\s+(AUTO_INCREMENT)`)
+		gcolSerialRe := regexp.MustCompile(`(?i)(VIRTUAL|STORED)\s+(SERIAL\s+DEFAULT\s+VALUE)`)
+		gcolOnUpdateRe := regexp.MustCompile(`(?i)(VIRTUAL|STORED)\s+(ON\s+UPDATE)`)
+		if gcolDefaultRe.MatchString(trimmed) {
+			return nil, mysqlError(1221, "HY000", "Incorrect usage of DEFAULT and generated column")
+		}
+		if gcolAIRe.MatchString(trimmed) {
+			return nil, mysqlError(1221, "HY000", "Incorrect usage of AUTO_INCREMENT and generated column")
+		}
+		if gcolSerialRe.MatchString(trimmed) {
+			return nil, mysqlError(1221, "HY000", "Incorrect usage of SERIAL DEFAULT VALUE and generated column")
+		}
+		if gcolOnUpdateRe.MatchString(trimmed) {
+			return nil, mysqlError(1221, "HY000", "Incorrect usage of ON UPDATE and generated column")
+		}
+	}
+
 	// Normalize SQL type aliases that vitess parser doesn't support
 	query = normalizeTypeAliases(query)
 	query = normalizeStorageClause(query)
@@ -5987,6 +6008,19 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			return nil, mysqlError(3106, "HY000", "'Defining a virtual generated column as primary key' is not supported for generated columns.")
 		}
 
+		// Reject generated columns with DEFAULT, AUTO_INCREMENT, SERIAL DEFAULT VALUE, or ON UPDATE
+		if col.Type.Options != nil && col.Type.Options.As != nil {
+			if col.Type.Options.Default != nil {
+				return nil, mysqlError(1221, "HY000", "Incorrect usage of DEFAULT and generated column")
+			}
+			if col.Type.Options.Autoincrement {
+				return nil, mysqlError(1221, "HY000", "Incorrect usage of AUTO_INCREMENT and generated column")
+			}
+			if col.Type.Options.OnUpdate != nil {
+				return nil, mysqlError(1221, "HY000", "Incorrect usage of ON UPDATE and generated column")
+			}
+		}
+
 		// Validate generated column expressions for blocked functions
 		if col.Type.Options != nil && col.Type.Options.As != nil {
 			blocked, found := findBlockedFunctionInExpr(col.Type.Options.As)
@@ -6166,6 +6200,26 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				idxType = "FULLTEXT"
 			} else if idx.Info.Type == sqlparser.IndexTypeSpatial {
 				idxType = "SPATIAL"
+				// SPATIAL indexes require geometrical column types
+				for _, ic := range idxCols {
+					icName := stripPrefixLengthFromCol(ic)
+					isGeo := false
+					for _, col := range columns {
+						if strings.EqualFold(col.Name, icName) {
+							colUpper := strings.ToUpper(col.Type)
+							if strings.Contains(colUpper, "GEOMETRY") || strings.Contains(colUpper, "POINT") ||
+								strings.Contains(colUpper, "LINESTRING") || strings.Contains(colUpper, "POLYGON") ||
+								strings.Contains(colUpper, "MULTIPOINT") || strings.Contains(colUpper, "MULTILINESTRING") ||
+								strings.Contains(colUpper, "MULTIPOLYGON") || strings.Contains(colUpper, "GEOMETRYCOLLECTION") {
+								isGeo = true
+							}
+							break
+						}
+					}
+					if !isGeo {
+						return nil, mysqlError(1687, "42000", "A SPATIAL index may only contain a geometrical type column")
+					}
+				}
 			}
 			idxName := idx.Info.Name.String()
 			if idxName == "" {
@@ -6234,6 +6288,34 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 					return nil, mysqlError(1826, "HY000", fmt.Sprintf("Duplicate foreign key constraint name '%s'", name))
 				}
 				fkNames[nameLower] = true
+			}
+			// Reject FK on virtual generated columns and certain FK actions on stored generated columns
+			for _, srcCol := range fkDef.Source {
+				srcName := srcCol.String()
+				for _, col := range columns {
+					if strings.EqualFold(col.Name, srcName) && isGeneratedColumnType(col.Type) {
+						if !strings.Contains(strings.ToUpper(col.Type), "STORED") {
+							// Virtual generated column cannot have FK
+							// MySQL includes the FK name and column name; approximate with generic message
+									fkName := constraint.Name.String()
+									if fkName == "" {
+										fkName = fmt.Sprintf("%s_ibfk_%d", tableName, fkIdx+1)
+									}
+									return nil, mysqlError(3108, "HY000", fmt.Sprintf("Foreign key '%s' uses virtual column '%s' which is not supported.", fkName, srcName))
+						}
+						if fkDef.ReferenceDefinition != nil {
+							if fkDef.ReferenceDefinition.OnUpdate == sqlparser.SetNull {
+								return nil, mysqlError(3104, "HY000", "Cannot define foreign key with ON UPDATE SET NULL clause on a generated column.")
+							}
+							if fkDef.ReferenceDefinition.OnUpdate == sqlparser.Cascade {
+								return nil, mysqlError(3104, "HY000", "Cannot define foreign key with ON UPDATE CASCADE clause on a generated column.")
+							}
+							if fkDef.ReferenceDefinition.OnDelete == sqlparser.SetNull {
+								return nil, mysqlError(3104, "HY000", "Cannot define foreign key with ON DELETE SET NULL clause on a generated column.")
+							}
+						}
+					}
+				}
 			}
 			// Create implicit index for FK columns (MySQL does this automatically)
 			var fkCols []string
@@ -6763,6 +6845,18 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 		}
 
+		// Check if any explicitly specified column is a generated column
+		// MySQL rejects INSERT ... SELECT when generated columns are in the target list
+		for _, cn := range colNames {
+			for _, col := range tbl.Def.Columns {
+				if strings.EqualFold(col.Name, cn) && isGeneratedColumnType(col.Type) {
+					return nil, mysqlError(3105, "HY000",
+						fmt.Sprintf("The value specified for generated column '%s' in table '%s' is not allowed.",
+							cn, tbl.Def.Name))
+				}
+			}
+		}
+
 		// Check if fast path is applicable: no ON DUPLICATE KEY, no REPLACE, no IGNORE
 		canFastPath := len(stmt.OnDup) == 0 &&
 			stmt.Action != sqlparser.ReplaceAct &&
@@ -7180,8 +7274,44 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 			row[colNames[i]] = v
 		}
+		// Fill in defaults for non-generated, non-specified columns BEFORE computing generated columns.
+		// This ensures generated column expressions can reference base columns with default values.
+		{
+			colNameSet := make(map[string]bool, len(colNames))
+			for _, cn := range colNames {
+				colNameSet[cn] = true
+			}
+			for _, col := range tbl.Def.Columns {
+				if colNameSet[col.Name] || isGeneratedColumnType(col.Type) || col.AutoIncrement {
+					continue
+				}
+				if _, exists := row[col.Name]; !exists {
+					if col.Default != nil {
+						defVal := *col.Default
+						defUpper := strings.ToUpper(defVal)
+						if defUpper == "CURRENT_TIMESTAMP" || defUpper == "CURRENT_TIMESTAMP()" || defUpper == "NOW()" {
+							row[col.Name] = e.nowTime().Format("2006-01-02 15:04:05")
+						} else if defUpper == "NULL" {
+							row[col.Name] = nil
+						} else {
+							row[col.Name] = strings.Trim(defVal, "'")
+						}
+					}
+				}
+			}
+		}
+
 		if err := e.populateGeneratedColumns(row, tbl.Def.Columns); err != nil {
 			return nil, err
+		}
+
+		// Check NOT NULL constraint on generated columns after computing their values
+		for _, col := range tbl.Def.Columns {
+			if isGeneratedColumnType(col.Type) && !col.Nullable {
+				if val, ok := row[col.Name]; ok && val == nil {
+					return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
+				}
+			}
 		}
 
 		// Check explicit NULL on NOT NULL columns (always an error, even non-strict)
@@ -7281,6 +7411,21 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					tbl.Rows[dupIdx][colName] = val
 				}
 				e.onDupValuesRow = prevOnDupValuesRow
+				// Recompute generated columns after ON DUPLICATE KEY UPDATE
+				for _, col := range tbl.Def.Columns {
+					if isGeneratedColumnType(col.Type) {
+						expr := generatedColumnExpr(col.Type)
+						if expr != "" {
+							val, err := e.evalGeneratedColumnExpr(expr, tbl.Rows[dupIdx])
+							if err == nil {
+								val = coerceIntegerValue(col.Type, val)
+								val = formatDecimalValue(col.Type, val)
+								val = coerceDateTimeValue(col.Type, val)
+								tbl.Rows[dupIdx][col.Name] = val
+							}
+						}
+					}
+				}
 				// Apply ON UPDATE CURRENT_TIMESTAMP for columns with that property
 				for _, col := range tbl.Def.Columns {
 					if col.OnUpdateCurrentTimestamp {
@@ -7722,7 +7867,7 @@ var blockedGcolFunctions = map[string]string{
 	"session_user":      "user",
 	"system_user":       "user",
 	"user":              "user",
-	"version":           "version",
+	"version":           "version()",
 	"sleep":                "sleep",
 	"sysdate":              "sysdate",
 	"statement_digest":     "statement_digest",
@@ -7739,7 +7884,7 @@ var blockedGcolFunctions = map[string]string{
 	"schema":                "database",
 	"master_pos_wait":       "master_pos_wait",
 	"source_pos_wait":       "source_pos_wait",
-	"encrypt":               "encrypt",
+	"encrypt":               "`encrypt`",
 	"updatexml":             "updatexml",
 	"json_merge":            "json_merge",
 }
@@ -10983,6 +11128,20 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		}
 	}
 
+	// Check if any SET targets a generated column (MySQL error 3105)
+	for _, upd := range stmt.Exprs {
+		colName := upd.Name.Name.String()
+		if _, isDefault := upd.Expr.(*sqlparser.Default); !isDefault {
+			for _, col := range tbl.Def.Columns {
+				if strings.EqualFold(col.Name, colName) && isGeneratedColumnType(col.Type) {
+					return nil, mysqlError(3105, "HY000",
+						fmt.Sprintf("The value specified for generated column '%s' in table '%s' is not allowed.",
+							colName, tbl.Def.Name))
+				}
+			}
+		}
+	}
+
 	var affected uint64
 	var matchedRows uint64
 	for _, i := range matchingIndices {
@@ -11749,6 +11908,37 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", dbName, tableName))
 	}
 
+	// Pre-check: ALGORITHM=INPLACE rejection for operations that require COPY
+	{
+		isInplace := false
+		hasStoredGcolAdd := false
+		hasAlterDefault := false
+		for _, opt := range stmt.AlterOptions {
+			switch av := opt.(type) {
+			case sqlparser.AlgorithmValue:
+				if strings.EqualFold(string(av), "INPLACE") {
+					isInplace = true
+				}
+			case *sqlparser.AddColumns:
+				for _, col := range av.Columns {
+					if col.Type.Options != nil && col.Type.Options.As != nil {
+						colTypeStr := strings.ToUpper(sqlparser.String(col.Type))
+						if strings.Contains(colTypeStr, "STORED") {
+							hasStoredGcolAdd = true
+						}
+					}
+				}
+			case *sqlparser.AlterColumn:
+				if av.DefaultVal != nil {
+					hasAlterDefault = true
+				}
+			}
+		}
+		if isInplace && (hasStoredGcolAdd || hasAlterDefault) {
+			return nil, mysqlError(1845, "0A000", "ALGORITHM=INPLACE is not supported. Reason: Cannot change column type INPLACE. Try ALGORITHM=COPY.")
+		}
+	}
+
 	// Pre-check: AUTO_INCREMENT columns must have an accompanying index
 	{
 		autoIncrCols := map[string]bool{}
@@ -11791,6 +11981,29 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 		case *sqlparser.AddColumns:
 			for _, col := range op.Columns {
+				// Reject generated columns with DEFAULT, AUTO_INCREMENT, or ON UPDATE
+				if col.Type.Options != nil && col.Type.Options.As != nil {
+					if col.Type.Options.Default != nil {
+						return nil, mysqlError(1221, "HY000", "Incorrect usage of DEFAULT and generated column")
+					}
+					if col.Type.Options.Autoincrement {
+						return nil, mysqlError(1221, "HY000", "Incorrect usage of AUTO_INCREMENT and generated column")
+					}
+					if col.Type.Options.OnUpdate != nil {
+						return nil, mysqlError(1221, "HY000", "Incorrect usage of ON UPDATE and generated column")
+					}
+				}
+				// Check for multiple primary key before virtual PK check
+				if col.Type.Options != nil && (col.Type.Options.KeyOpt == 1 || col.Type.Options.KeyOpt == 6) {
+					// KeyOpt 1 = PRIMARY KEY, 6 = KEY
+					if col.Type.Options.KeyOpt == 1 {
+						// Check if table already has a primary key
+						tableDef, _ := db.GetTable(tableName)
+						if tableDef != nil && len(tableDef.PrimaryKey) > 0 {
+							return nil, mysqlError(1068, "42000", "Multiple primary key defined")
+						}
+					}
+				}
 				// Check virtual generated column with KEY/PRIMARY KEY
 				if col.Type.Options != nil && col.Type.Options.As != nil &&
 					col.Type.Options.Storage != sqlparser.StoredStorage &&
@@ -12029,6 +12242,29 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				idxType = "FULLTEXT"
 			} else if op.IndexDefinition.Info.Type == sqlparser.IndexTypeSpatial {
 				idxType = "SPATIAL"
+				// SPATIAL indexes require geometrical column types
+				tableDef, _ := db.GetTable(tableName)
+				if tableDef != nil {
+					for _, ic := range idxCols {
+						icName := stripPrefixLengthFromCol(ic)
+						isGeo := false
+						for _, col := range tableDef.Columns {
+							if strings.EqualFold(col.Name, icName) {
+								colUpper := strings.ToUpper(col.Type)
+								if strings.Contains(colUpper, "GEOMETRY") || strings.Contains(colUpper, "POINT") ||
+									strings.Contains(colUpper, "LINESTRING") || strings.Contains(colUpper, "POLYGON") ||
+									strings.Contains(colUpper, "MULTIPOINT") || strings.Contains(colUpper, "MULTILINESTRING") ||
+									strings.Contains(colUpper, "MULTIPOLYGON") || strings.Contains(colUpper, "GEOMETRYCOLLECTION") {
+									isGeo = true
+								}
+								break
+							}
+						}
+						if !isGeo {
+							return nil, mysqlError(1687, "42000", "A SPATIAL index may only contain a geometrical type column")
+						}
+					}
+				}
 			}
 			idxName := op.IndexDefinition.Info.Name.String()
 			if idxName == "" {
@@ -12095,6 +12331,36 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		case *sqlparser.AddConstraintDefinition:
 			// Create implicit index for foreign key constraints (MySQL auto-creates these).
 			if fkDef, ok := op.ConstraintDefinition.Details.(*sqlparser.ForeignKeyDefinition); ok {
+				// Reject FK on virtual generated columns and certain FK actions on stored generated columns
+				tableDef0, _ := db.GetTable(tableName)
+				if tableDef0 != nil {
+					for _, srcCol := range fkDef.Source {
+						srcName := srcCol.String()
+						for _, col := range tableDef0.Columns {
+							if strings.EqualFold(col.Name, srcName) && isGeneratedColumnType(col.Type) {
+								if !strings.Contains(strings.ToUpper(col.Type), "STORED") {
+									// MySQL includes the FK name and column name
+									altFkName := op.ConstraintDefinition.Name.String()
+									if altFkName == "" {
+										altFkName = tableName + "_ibfk_1"
+									}
+									return nil, mysqlError(3108, "HY000", fmt.Sprintf("Foreign key '%s' uses virtual column '%s' which is not supported.", altFkName, srcName))
+								}
+								if fkDef.ReferenceDefinition != nil {
+									if fkDef.ReferenceDefinition.OnUpdate == sqlparser.SetNull {
+										return nil, mysqlError(3104, "HY000", "Cannot define foreign key with ON UPDATE SET NULL clause on a generated column.")
+									}
+									if fkDef.ReferenceDefinition.OnUpdate == sqlparser.Cascade {
+										return nil, mysqlError(3104, "HY000", "Cannot define foreign key with ON UPDATE CASCADE clause on a generated column.")
+									}
+									if fkDef.ReferenceDefinition.OnDelete == sqlparser.SetNull {
+										return nil, mysqlError(3104, "HY000", "Cannot define foreign key with ON DELETE SET NULL clause on a generated column.")
+									}
+								}
+							}
+						}
+					}
+				}
 				var fkCols []string
 				for _, col := range fkDef.Source {
 					fkCols = append(fkCols, col.String())
@@ -12240,7 +12506,37 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		}
 	}
 
-	return &Result{}, nil
+	// ALTER TABLE affected rows: MySQL reports the number of rows when data modification
+	// is required (adding stored columns, modifying column types, etc.). Adding only virtual
+	// generated columns doesn't require row rewrite so affected rows = 0.
+	var alterAffected uint64
+	requiresRowRewrite := false
+	for _, opt := range stmt.AlterOptions {
+		switch op := opt.(type) {
+		case *sqlparser.AddColumns:
+			for _, col := range op.Columns {
+				if col.Type.Options != nil && col.Type.Options.As != nil {
+					// Stored generated column requires row rewrite
+					if col.Type.Options.Storage == sqlparser.StoredStorage {
+						requiresRowRewrite = true
+					}
+				} else {
+					// Regular (non-generated) column doesn't require row rewrite for virtual-only ALTERs
+					// but does if there are stored columns too
+				}
+			}
+		case *sqlparser.ModifyColumn:
+			requiresRowRewrite = true
+		case *sqlparser.ChangeColumn:
+			requiresRowRewrite = true
+		case *sqlparser.AlterColumn:
+			// ALTER COLUMN SET DEFAULT doesn't require row rewrite
+		}
+	}
+	if requiresRowRewrite && tbl != nil {
+		alterAffected = uint64(len(tbl.Scan()))
+	}
+	return &Result{AffectedRows: alterAffected}, nil
 }
 
 // execDescribe handles DESCRIBE <table> and DESC <table> (parsed as *sqlparser.ExplainTab).
@@ -12311,21 +12607,34 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 			nullable = "NO"
 		}
 		key := ""
-		if col.PrimaryKey {
+		isPK := col.PrimaryKey
+		if !isPK {
+			for _, pk := range tblDef.PrimaryKey {
+				if strings.EqualFold(stripPrefixLengthFromCol(pk), col.Name) {
+					isPK = true
+					break
+				}
+			}
+		}
+		if isPK {
 			key = "PRI"
 		} else if col.Unique {
 			key = "UNI"
 		} else {
-			// Check if this column is the first column in any non-unique index (MUL)
+			// Check indexes for this column
 			for _, idx := range tblDef.Indexes {
-				if !idx.Unique && len(idx.Columns) > 0 {
+				if len(idx.Columns) > 0 {
 					// Strip length suffix from index column name (e.g. "col(10)" -> "col")
 					idxCol := idx.Columns[0]
 					if parenIdx := strings.Index(idxCol, "("); parenIdx >= 0 {
 						idxCol = idxCol[:parenIdx]
 					}
 					if strings.EqualFold(idxCol, col.Name) {
-						key = "MUL"
+						if idx.Unique && len(idx.Columns) == 1 {
+							key = "UNI"
+						} else {
+							key = "MUL"
+						}
 						break
 					}
 				}
@@ -12343,6 +12652,12 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 		extra = ""
 		if col.AutoIncrement {
 			extra = "auto_increment"
+		} else if isGeneratedColumnType(col.Type) {
+			if strings.Contains(strings.ToUpper(col.Type), "STORED") {
+				extra = "STORED GENERATED"
+			} else {
+				extra = "VIRTUAL GENERATED"
+			}
 		}
 		// For TEMPORARY tables, MySQL returns NULL for the Extra column when empty
 		if e.tempTables[tableName] && extra == "" {
@@ -13731,7 +14046,7 @@ func mysqlGeneratedClause(exprStr string, colType string) string {
 	// Parse the expression and reformat it MySQL-style
 	formattedExpr := mysqlFormatGenExpr(exprStr)
 
-	return fmt.Sprintf("generated always as (%s) %s", formattedExpr, strings.ToLower(storage))
+	return fmt.Sprintf("GENERATED ALWAYS AS (%s) %s", formattedExpr, storage)
 }
 
 // mysqlFormatGenExpr formats a generated column expression in MySQL style:
@@ -13770,7 +14085,7 @@ func mysqlFormatGenExpr(exprStr string) string {
 func mysqlGenExprNode(expr sqlparser.Expr) string {
 	switch e := expr.(type) {
 	case *sqlparser.ColName:
-		return e.Name.String()
+		return "`" + e.Name.String() + "`"
 	case *sqlparser.BinaryExpr:
 		return fmt.Sprintf("%s %s %s", mysqlGenExprNode(e.Left), e.Operator.ToString(), mysqlGenExprNode(e.Right))
 	case *sqlparser.FuncExpr:
@@ -13782,7 +14097,7 @@ func mysqlGenExprNode(expr sqlparser.Expr) string {
 		// MySQL outputs function names in lowercase in SHOW CREATE TABLE
 		// for generated column expressions.
 		name = strings.ToLower(name)
-		return name + "(" + strings.Join(args, ", ") + ")"
+		return name + "(" + strings.Join(args, ",") + ")"
 	case *sqlparser.Literal:
 		if e.Type == sqlparser.StrVal {
 			return "'" + e.Val + "'"
@@ -13798,7 +14113,7 @@ func mysqlGenExprNode(expr sqlparser.Expr) string {
 		if e.To != nil {
 			parts = append(parts, mysqlGenExprNode(e.To))
 		}
-		return "substr(" + strings.Join(parts, ", ") + ")"
+		return "substr(" + strings.Join(parts, ",") + ")"
 	case *sqlparser.JSONUnquoteExpr:
 		return "json_unquote(" + mysqlGenExprNode(e.JSONValue) + ")"
 	case *sqlparser.JSONExtractExpr:
@@ -13806,7 +14121,7 @@ func mysqlGenExprNode(expr sqlparser.Expr) string {
 		for _, p := range e.PathList {
 			parts = append(parts, mysqlGenExprNode(p))
 		}
-		return "json_extract(" + strings.Join(parts, ", ") + ")"
+		return "json_extract(" + strings.Join(parts, ",") + ")"
 	case *sqlparser.CastExpr:
 		return "cast(" + mysqlGenExprNode(e.Expr) + " as " + strings.ToLower(e.Type.Type) + ")"
 	case *sqlparser.IntroducerExpr:
@@ -25654,6 +25969,16 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 		return &Result{AffectedRows: 0}, nil
 	}
 
+	// Strip trailing options (QUICK, FAST, MEDIUM, EXTENDED, CHANGED, FOR UPGRADE, etc.)
+	{
+		restUpper := strings.ToUpper(rest)
+		checkOpts := []string{"QUICK", "FAST", "MEDIUM", "EXTENDED", "CHANGED", "FOR UPGRADE"}
+		for _, co := range checkOpts {
+			if strings.HasSuffix(strings.TrimSpace(strings.TrimRight(restUpper, ";")), co) {
+				rest = strings.TrimSpace(rest[:len(strings.TrimSpace(strings.TrimRight(rest, ";")))-len(co)])
+			}
+		}
+	}
 	// Parse table names (comma-separated)
 	tables := strings.Split(rest, ",")
 	var rows [][]interface{}

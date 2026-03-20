@@ -841,6 +841,9 @@ func (ctx *execContext) executeLines(lines []string) error {
 			// Single statement: echo raw lines preserving original formatting
 			if ctx.queryLogEnabled {
 				for _, rl := range rawLines {
+					if rl == "" {
+						continue // Skip blank lines in SQL echo (mysqltest doesn't output them)
+					}
 					// Apply --replace_result to echoed SQL too
 					if len(ctx.replaceResult) > 0 {
 						rl = applyReplaceResult(rl, ctx.replaceResult)
