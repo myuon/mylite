@@ -2556,9 +2556,6 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	case *sqlparser.Savepoint:
 		// SAVEPOINT: accepted as a no-op for compatibility.
 		return &Result{}, nil
-	case *sqlparser.Release:
-		// RELEASE SAVEPOINT: accepted as a no-op for compatibility.
-		return &Result{}, nil
 	case *sqlparser.TruncateTable:
 		return e.execTruncateTable(s)
 	case *sqlparser.Set:
@@ -3018,6 +3015,10 @@ func (e *Executor) execAlterDatabaseRaw(query string) (*Result, error) {
 		return &Result{}, nil
 	}
 	dbName := strings.Trim(fields[0], "`")
+	// ALTER DATABASE DEFAULT CHARACTER SET ... means alter the current database
+	if strings.ToUpper(dbName) == "DEFAULT" {
+		dbName = e.CurrentDB
+	}
 	db, err := e.Catalog.GetDatabase(dbName)
 	if err != nil {
 		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
@@ -5619,11 +5620,6 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			selectSQL := sqlparser.String(stmt.Select)
 			return e.execCreateTableSelect(tableName, selectSQL)
 		}
-		// Fallback: parser may fail to capture SELECT when ENGINE=... precedes AS SELECT.
-		// Extract SELECT from raw query text.
-		if selectSQL := extractCreateTableSelectSQL(e.currentQuery); selectSQL != "" {
-			return e.execCreateTableSelect(tableName, selectSQL)
-		}
 		return &Result{}, nil
 	}
 
@@ -6746,6 +6742,31 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				}
 			}
 			v, err := e.evalExpr(val)
+			// If the expression is DEFAULT keyword, resolve the column's actual default
+			if _, isDefault := val.(*sqlparser.Default); isDefault {
+				for _, col := range tbl.Def.Columns {
+					if col.Name == colNames[i] {
+						if col.Default != nil {
+							defVal := *col.Default
+							defUpper := strings.ToUpper(defVal)
+							if defUpper == "CURRENT_TIMESTAMP" || defUpper == "CURRENT_TIMESTAMP()" || defUpper == "NOW()" {
+								v = e.nowTime().Format("2006-01-02 15:04:05")
+							} else if defUpper == "NULL" {
+								v = nil
+							} else {
+								// Try to parse as expression; fallback to string
+								v = strings.Trim(defVal, "'")
+							}
+						} else if strings.HasPrefix(strings.ToUpper(col.Type), "TIMESTAMP") {
+							// TIMESTAMP columns implicitly default to CURRENT_TIMESTAMP
+							v = e.nowTime().Format("2006-01-02 15:04:05")
+						} else if col.AutoIncrement {
+							v = nil // AUTO_INCREMENT will be handled later
+						}
+						break
+					}
+				}
+			}
 			if err != nil {
 				var intOvErr *intOverflowError
 				if errors.As(err, &intOvErr) {
@@ -6859,7 +6880,12 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				isAutoGenCol := col.AutoIncrement || isGeneratedColumnType(col.Type)
 				// In strict mode, missing NOT NULL columns without defaults are errors
 				if e.isStrictMode() && !col.Nullable && !isAutoGenCol && col.Default == nil && !colNameSet[col.Name] {
-					return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
+					if bool(stmt.Ignore) {
+						e.addWarning("Warning", 1364, fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
+						row[col.Name] = implicitZeroValue(col.Type)
+					} else {
+						return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
+					}
 				}
 				// Explicit NULL into NOT NULL column
 				if !col.Nullable && !isAutoGenCol && colNameSet[col.Name] {
@@ -6870,7 +6896,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						if valTuples, ok := stmt.Rows.(sqlparser.Values); ok {
 							isMultiRow = len(valTuples) > 1
 						}
-						if e.isStrictMode() || !isMultiRow {
+						if (e.isStrictMode() || !isMultiRow) && !bool(stmt.Ignore) {
 							return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
 						}
 						e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", col.Name))
@@ -7062,9 +7088,19 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					}
 					if !explicitlySpecified && col.Default == nil {
 						// Column not specified and has no default -> error 1364
-						return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
+						if bool(stmt.Ignore) {
+							e.addWarning("Warning", 1364, fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
+							row[col.Name] = implicitZeroValue(col.Type)
+						} else {
+							return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
+						}
 					} else if exists && rv == nil && explicitlySpecified {
-						return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
+						if bool(stmt.Ignore) {
+							e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", col.Name))
+							row[col.Name] = implicitZeroValue(col.Type)
+						} else {
+							return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
+						}
 					}
 				}
 				rv, exists := row[col.Name]
@@ -7102,11 +7138,21 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 								}
 								if _, perr := strconv.ParseInt(numText, 10, 64); perr != nil {
 									if _, perr := strconv.ParseFloat(numText, 64); perr != nil {
+										if bool(stmt.Ignore) {
+											e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect integer value: '%s' for column '%s' at row 1", val, col.Name))
+											row[col.Name] = int64(0)
+											break
+										}
 										return nil, mysqlError(1366, "HY000", fmt.Sprintf("Incorrect integer value: '%s' for column '%s' at row 1", val, col.Name))
 									}
 								}
 							} else if isDecimalType {
 								if _, perr := strconv.ParseFloat(numText, 64); perr != nil {
+									if bool(stmt.Ignore) {
+										e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row 1", val, col.Name))
+										row[col.Name] = float64(0)
+										break
+									}
 									return nil, mysqlError(1366, "HY000", fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row 1", val, col.Name))
 								}
 							}
@@ -7163,22 +7209,38 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							}
 							// ENUM: empty string is invalid (not in the allowed list)
 							if isEnumType && sv == "" {
-								return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+								if bool(stmt.Ignore) {
+									e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+								} else {
+									return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+								}
 							}
 							// SET: if the validated value differs from original,
 							// it means some members were invalid
 							if isSetType && origStr != "" && sv != origStr {
-								return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+								if bool(stmt.Ignore) {
+									e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+								} else {
+									return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+								}
 							}
 						} else if nv, ok := rv.(int64); ok {
 							// Numeric values: validate range for ENUM/SET
 							if isEnumType && (nv < 0 || nv > int64(allowedCount)) {
-								return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+								if bool(stmt.Ignore) {
+									e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+								} else {
+									return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+								}
 							}
 							if isSetType {
 								maxVal := int64((1 << allowedCount) - 1)
 								if nv < 0 || nv > maxVal {
-									return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+									if bool(stmt.Ignore) {
+										e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+									} else {
+										return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+									}
 								}
 							}
 						}
@@ -9199,6 +9261,17 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 			} else {
 				colNames = append(colNames, normalizeSQLDisplayName(sqlparser.String(se.Expr)))
 			}
+		case *sqlparser.StarExpr:
+			// SELECT * with GROUP BY: expand to all columns from the first row
+			if len(groups) > 0 && len(groups[0].rows) > 0 {
+				repRow := groups[0].rows[0]
+				keys := make([]string, 0, len(repRow))
+				for k := range repRow {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				colNames = append(colNames, keys...)
+			}
 		default:
 			return nil, fmt.Errorf("unsupported select expression in GROUP BY: %T", expr)
 		}
@@ -9213,6 +9286,20 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 		}
 		resultRow := make([]interface{}, 0, len(stmt.SelectExprs.Exprs))
 		for _, expr := range stmt.SelectExprs.Exprs {
+			switch se := expr.(type) {
+			case *sqlparser.StarExpr:
+				// Expand * to all column values from representative row
+				keys := make([]string, 0, len(repRow))
+				for k := range repRow {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				for _, k := range keys {
+					resultRow = append(resultRow, repRow[k])
+				}
+				_ = se
+				continue
+			}
 			ae, ok := expr.(*sqlparser.AliasedExpr)
 			if !ok {
 				return nil, fmt.Errorf("unsupported select expression in GROUP BY: %T", expr)
@@ -13938,7 +14025,33 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.ConvertExpr:
 		// CAST(expr AS type)
 		val, err := e.evalExpr(v.Expr)
-		if err != nil {
+		if v.Type != nil {
+			typeName := strings.ToUpper(v.Type.Type)
+			// Handle INT_OVERFLOW for integer casts
+			if err != nil {
+				var oe *intOverflowError
+				if errors.As(err, &oe) {
+					switch typeName {
+					case "SIGNED", "INT", "INTEGER", "BIGINT":
+						// Check if the original value had a negative sign
+						if strings.HasPrefix(strings.TrimSpace(oe.val), "-") {
+							return int64(math.MinInt64), nil
+						}
+						return int64(math.MaxInt64), nil
+					case "UNSIGNED":
+						return uint64(math.MaxUint64), nil
+					case "DECIMAL", "FLOAT", "DOUBLE":
+						// Try to parse as float for decimal casts
+						f, parseErr := strconv.ParseFloat(oe.val, 64)
+						if parseErr == nil {
+							return f, nil
+						}
+						return nil, err
+					}
+				}
+				return nil, err
+			}
+		} else if err != nil {
 			return nil, err
 		}
 		if v.Type == nil {
@@ -14039,38 +14152,40 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 				}
 				return int64(0), nil
 			}
-			// Handle IN (subquery)
-			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
-				result, err := e.execSubquery(sub, e.correlatedRow)
+		}
+		// Handle ROW/tuple comparisons: ROW(a,b) = ROW(c,d) or (a,b) = (c,d)
+		leftTuple, leftIsTuple := v.Left.(sqlparser.ValTuple)
+		rightTuple, rightIsTuple := v.Right.(sqlparser.ValTuple)
+		if leftIsTuple && rightIsTuple {
+			if len(leftTuple) != len(rightTuple) {
+				return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTuple)))
+			}
+			allMatch := true
+			for i := 0; i < len(leftTuple); i++ {
+				lv, err := e.evalExpr(leftTuple[i])
 				if err != nil {
 					return nil, err
 				}
-				hasNull := false
-				for _, row := range result.Rows {
-					if len(row) == 0 {
-						continue
-					}
-					val := row[0]
-					if val == nil {
-						hasNull = true
-						continue
-					}
-					match, _ := compareValues(left, val, sqlparser.EqualOp)
-					if match {
-						if v.Operator == sqlparser.InOp {
-							return int64(1), nil
-						}
-						return int64(0), nil
-					}
+				rv, err := e.evalExpr(rightTuple[i])
+				if err != nil {
+					return nil, err
 				}
-				if hasNull {
-					return nil, nil
+				if lv == nil || rv == nil {
+					return nil, nil // NULL comparison -> NULL
 				}
-				if v.Operator == sqlparser.NotInOp {
-					return int64(1), nil
+				match, err := compareValues(lv, rv, v.Operator)
+				if err != nil {
+					return nil, err
 				}
-				return int64(0), nil
+				if !match {
+					allMatch = false
+					break
+				}
 			}
+			if allMatch {
+				return int64(1), nil
+			}
+			return int64(0), nil
 		}
 		// Allow comparison expressions to be used as boolean values (e.g. in IF args)
 		left, err := e.evalExpr(v.Left)
@@ -14194,6 +14309,25 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		// CAST(expr AS type) - similar to ConvertExpr
 		val, err := e.evalExpr(v.Expr)
 		if err != nil {
+			// Handle INT_OVERFLOW for integer casts
+			var oe *intOverflowError
+			if errors.As(err, &oe) && v.Type != nil {
+				typeName := strings.ToUpper(v.Type.Type)
+				switch typeName {
+				case "SIGNED", "INT", "INTEGER", "BIGINT":
+					if strings.HasPrefix(strings.TrimSpace(oe.val), "-") {
+						return int64(math.MinInt64), nil
+					}
+					return int64(math.MaxInt64), nil
+				case "UNSIGNED":
+					return uint64(math.MaxUint64), nil
+				case "DECIMAL", "FLOAT", "DOUBLE":
+					f, parseErr := strconv.ParseFloat(oe.val, 64)
+					if parseErr == nil {
+						return f, nil
+					}
+				}
+			}
 			return nil, err
 		}
 		if v.Type != nil {
@@ -14853,9 +14987,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 		return fmt.Sprintf("POINT(%v %v)", xVal, yVal), nil
 	case *sqlparser.MatchExpr:
-		// Stub: return 1.0 so WHERE MATCH(...) AGAINST(...) returns all rows
-		// rather than filtering everything out.
-		return float64(1), nil
+		return float64(0), nil
 	case *sqlparser.CountStar:
 		return int64(0), nil
 	case *sqlparser.LagLeadExpr:
@@ -15080,6 +15212,27 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		return nil, nil
 	case *sqlparser.Count:
 		return int64(0), nil
+	case *sqlparser.TimestampDiffExpr:
+		v1, err := e.evalExpr(v.Expr1)
+		if err != nil {
+			return nil, err
+		}
+		v2, err := e.evalExpr(v.Expr2)
+		if err != nil {
+			return nil, err
+		}
+		if v1 == nil || v2 == nil {
+			return nil, nil
+		}
+		t1, err := parseDateTimeValue(v1)
+		if err != nil {
+			return nil, nil
+		}
+		t2, err := parseDateTimeValue(v2)
+		if err != nil {
+			return nil, nil
+		}
+		return timestampDiff(v.Unit, t1, t2), nil
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
 }
@@ -15314,6 +15467,12 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		return e.nowTime().Format("2006-01-02"), nil
 	case "curtime", "current_time":
 		return e.nowTime().Format("15:04:05"), nil
+	case "utc_date":
+		return e.nowTime().UTC().Format("2006-01-02"), nil
+	case "utc_time":
+		return e.nowTime().UTC().Format("15:04:05"), nil
+	case "utc_timestamp":
+		return e.nowTime().UTC().Format("2006-01-02 15:04:05"), nil
 	case "database", "schema":
 		return e.CurrentDB, nil
 	case "version":
@@ -15899,7 +16058,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return int64(t.Unix()), nil
 	case "from_unixtime":
@@ -15930,7 +16089,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return int64(t.Year()), nil
 	case "month":
@@ -15943,7 +16102,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return int64(t.Month()), nil
 	case "day", "dayofmonth":
@@ -15956,7 +16115,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return int64(t.Day()), nil
 	case "hour":
@@ -15969,7 +16128,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return int64(t.Hour()), nil
 	case "minute":
@@ -15982,7 +16141,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return int64(t.Minute()), nil
 	case "second":
@@ -15995,7 +16154,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return int64(t.Second()), nil
 	case "date":
@@ -16027,7 +16186,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return t.Format("15:04:05"), nil
 	case "datediff":
@@ -16072,9 +16231,45 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		t, err := parseDateTimeValue(dateVal)
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return mysqlDateFormat(t, toString(fmtVal)), nil
+	case "str_to_date":
+		if len(v.Exprs) < 2 {
+			return nil, fmt.Errorf("STR_TO_DATE requires 2 arguments")
+		}
+		strVal, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		fmtVal2, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		if strVal == nil || fmtVal2 == nil {
+			return nil, nil
+		}
+		parsed := mysqlStrToDate(toString(strVal), toString(fmtVal2))
+		if parsed == nil {
+			return nil, nil
+		}
+		return *parsed, nil
+	case "get_format":
+		if len(v.Exprs) < 2 {
+			return nil, fmt.Errorf("GET_FORMAT requires 2 arguments")
+		}
+		typeVal, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		localeVal, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		if typeVal == nil || localeVal == nil {
+			return nil, nil
+		}
+		return mysqlGetFormat(strings.ToUpper(toString(typeVal)), strings.ToUpper(toString(localeVal))), nil
 	case "dayname":
 		if len(v.Exprs) < 1 {
 			return nil, nil
@@ -16088,7 +16283,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return t.Format("Monday"), nil
 	case "dayofweek":
@@ -16104,7 +16299,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		// MySQL DAYOFWEEK: 1=Sunday, 2=Monday, ...
 		return int64(t.Weekday()) + 1, nil
@@ -16121,7 +16316,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		// MySQL WEEKDAY: 0=Monday, 1=Tuesday, ...
 		wd := int64(t.Weekday()) - 1
@@ -16142,7 +16337,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return int64(t.YearDay()), nil
 	case "monthname":
@@ -16155,7 +16350,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return t.Format("January"), nil
 	case "hex":
@@ -17433,6 +17628,23 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			}
 		}
 		return strings.Join(msParts, ","), nil
+	case "ln":
+		// LN(x) is natural logarithm, same as LOG(x) with 1 arg
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("LN requires 1 argument")
+		}
+		lnVal, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if lnVal == nil {
+			return nil, nil
+		}
+		lnF := toFloat(lnVal)
+		if lnF <= 0 {
+			return nil, nil
+		}
+		return math.Log(lnF), nil
 	case "log":
 		if len(v.Exprs) == 1 {
 			logVal, err := e.evalExpr(v.Exprs[0])
@@ -17740,6 +17952,23 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return nil, nil
 		}
 		return math.Tan(toFloat(tanVal)), nil
+	case "cot":
+		if len(v.Exprs) < 1 {
+			return nil, nil
+		}
+		cotVal, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if cotVal == nil {
+			return nil, nil
+		}
+		cotF := toFloat(cotVal)
+		sinV := math.Sin(cotF)
+		if sinV == 0 {
+			return nil, nil
+		}
+		return math.Cos(cotF) / sinV, nil
 	case "benchmark":
 		// BENCHMARK(count, expr) - return 0 immediately
 		return int64(0), nil
@@ -18438,6 +18667,189 @@ func mysqlDateFormat(t time.Time, format string) string {
 	return sb.String()
 }
 
+// timestampDiff computes the difference between two timestamps in the given unit.
+func timestampDiff(unit sqlparser.IntervalType, t1, t2 time.Time) int64 {
+	switch unit {
+	case sqlparser.IntervalMicrosecond:
+		return t2.Sub(t1).Microseconds()
+	case sqlparser.IntervalSecond:
+		return int64(t2.Sub(t1).Seconds())
+	case sqlparser.IntervalMinute:
+		return int64(t2.Sub(t1).Minutes())
+	case sqlparser.IntervalHour:
+		return int64(t2.Sub(t1).Hours())
+	case sqlparser.IntervalDay:
+		return int64(t2.Sub(t1).Hours() / 24)
+	case sqlparser.IntervalWeek:
+		return int64(t2.Sub(t1).Hours() / (24 * 7))
+	case sqlparser.IntervalMonth:
+		y1, m1, _ := t1.Date()
+		y2, m2, d2 := t2.Date()
+		months := int64((y2-y1)*12 + int(m2-m1))
+		// If the day of t2 is before the day of t1, subtract one month
+		_, _, d1 := t1.Date()
+		if d2 < d1 {
+			months--
+		}
+		return months
+	case sqlparser.IntervalQuarter:
+		y1, m1, _ := t1.Date()
+		y2, m2, d2 := t2.Date()
+		months := int64((y2-y1)*12 + int(m2-m1))
+		_, _, d1 := t1.Date()
+		if d2 < d1 {
+			months--
+		}
+		return months / 3
+	case sqlparser.IntervalYear:
+		y1, m1, d1 := t1.Date()
+		y2, m2, d2 := t2.Date()
+		years := int64(y2 - y1)
+		if m2 < m1 || (m2 == m1 && d2 < d1) {
+			years--
+		}
+		return years
+	}
+	return 0
+}
+
+// mysqlStrToDate parses a date string using a MySQL format string (like STR_TO_DATE).
+// Returns nil if the string cannot be parsed.
+func mysqlStrToDate(dateStr, format string) *string {
+	// Convert MySQL format specifiers to Go time layout
+	goLayout := mysqlFormatToGoLayout(format)
+	t, err := time.Parse(goLayout, dateStr)
+	if err != nil {
+		return nil
+	}
+	// Determine output format based on what format specifiers were present
+	hasDate := strings.Contains(format, "%Y") || strings.Contains(format, "%y") ||
+		strings.Contains(format, "%m") || strings.Contains(format, "%d") ||
+		strings.Contains(format, "%c") || strings.Contains(format, "%e")
+	hasTime := strings.Contains(format, "%H") || strings.Contains(format, "%h") ||
+		strings.Contains(format, "%i") || strings.Contains(format, "%s") ||
+		strings.Contains(format, "%S") || strings.Contains(format, "%T") ||
+		strings.Contains(format, "%r")
+	hasMicro := strings.Contains(format, "%f")
+	var result string
+	if hasDate && hasTime {
+		if hasMicro {
+			result = t.Format("2006-01-02 15:04:05.000000")
+		} else {
+			result = t.Format("2006-01-02 15:04:05")
+		}
+	} else if hasDate {
+		result = t.Format("2006-01-02")
+	} else if hasTime {
+		result = t.Format("15:04:05")
+	} else {
+		result = t.Format("2006-01-02 15:04:05")
+	}
+	return &result
+}
+
+// mysqlFormatToGoLayout converts a MySQL date format string to a Go time layout.
+func mysqlFormatToGoLayout(format string) string {
+	var sb strings.Builder
+	i := 0
+	for i < len(format) {
+		if format[i] == '%' && i+1 < len(format) {
+			i++
+			switch format[i] {
+			case 'Y':
+				sb.WriteString("2006")
+			case 'y':
+				sb.WriteString("06")
+			case 'm':
+				sb.WriteString("01")
+			case 'c':
+				sb.WriteString("1")
+			case 'd':
+				sb.WriteString("02")
+			case 'e':
+				sb.WriteString("2")
+			case 'H':
+				sb.WriteString("15")
+			case 'h', 'I':
+				sb.WriteString("03")
+			case 'k':
+				sb.WriteString("15") // 24-hour unpadded, Go doesn't have exact match
+			case 'l':
+				sb.WriteString("3")
+			case 'i':
+				sb.WriteString("04")
+			case 's', 'S':
+				sb.WriteString("05")
+			case 'p':
+				sb.WriteString("PM")
+			case 'T':
+				sb.WriteString("15:04:05")
+			case 'r':
+				sb.WriteString("03:04:05 PM")
+			case 'f':
+				sb.WriteString("000000")
+			case 'W':
+				sb.WriteString("Monday")
+			case 'M':
+				sb.WriteString("January")
+			case 'b':
+				sb.WriteString("Jan")
+			case 'a':
+				sb.WriteString("Mon")
+			case '%':
+				sb.WriteByte('%')
+			default:
+				sb.WriteByte('%')
+				sb.WriteByte(format[i])
+			}
+		} else {
+			sb.WriteByte(format[i])
+		}
+		i++
+	}
+	return sb.String()
+}
+
+// mysqlGetFormat returns the format string for a given date type and locale.
+func mysqlGetFormat(dateType, locale string) string {
+	switch dateType {
+	case "DATE":
+		switch locale {
+		case "USA":
+			return "%m.%d.%Y"
+		case "JIS", "ISO":
+			return "%Y-%m-%d"
+		case "EUR":
+			return "%d.%m.%Y"
+		case "INTERNAL":
+			return "%Y%m%d"
+		}
+	case "DATETIME", "TIMESTAMP":
+		switch locale {
+		case "USA":
+			return "%Y-%m-%d %H.%i.%s"
+		case "JIS", "ISO":
+			return "%Y-%m-%d %H:%i:%s"
+		case "EUR":
+			return "%Y-%m-%d %H.%i.%s"
+		case "INTERNAL":
+			return "%Y%m%d%H%i%s"
+		}
+	case "TIME":
+		switch locale {
+		case "USA":
+			return "%h:%i:%s %p"
+		case "JIS", "ISO":
+			return "%H:%i:%s"
+		case "EUR":
+			return "%H.%i.%s"
+		case "INTERNAL":
+			return "%H%i%s"
+		}
+	}
+	return ""
+}
+
 // evalCaseExpr handles CASE expressions.
 func (e *Executor) evalCaseExpr(v *sqlparser.CaseExpr) (interface{}, error) {
 	var baseVal interface{}
@@ -18736,38 +19148,51 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				}
 				return int64(0), nil
 			}
-			// Handle IN (subquery) in row expression context
-			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
-				result, err := e.execSubquery(sub, row)
+		}
+		// Handle ROW/tuple comparisons: ROW(a,b) = ROW(c,d) or (a,b) = (c,d)
+		leftTuple, leftIsTuple := v.Left.(sqlparser.ValTuple)
+		rightTuple, rightIsTuple := v.Right.(sqlparser.ValTuple)
+		if leftIsTuple && rightIsTuple {
+			if len(leftTuple) != len(rightTuple) {
+				return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTuple)))
+			}
+			allMatch := true
+			for i := 0; i < len(leftTuple); i++ {
+				lv, err := e.evalRowExpr(leftTuple[i], row)
 				if err != nil {
 					return nil, err
 				}
-				hasNull := false
-				for _, r := range result.Rows {
-					if len(r) == 0 {
-						continue
-					}
-					val := r[0]
-					if val == nil {
-						hasNull = true
-						continue
-					}
-					match, _ := compareValues(left, val, sqlparser.EqualOp)
-					if match {
-						if v.Operator == sqlparser.InOp {
-							return int64(1), nil
-						}
-						return int64(0), nil
-					}
+				rv, err := e.evalRowExpr(rightTuple[i], row)
+				if err != nil {
+					return nil, err
 				}
-				if hasNull {
+				if lv == nil || rv == nil {
 					return nil, nil
 				}
-				if v.Operator == sqlparser.NotInOp {
-					return int64(1), nil
+				match, err := compareValues(lv, rv, v.Operator)
+				if err != nil {
+					return nil, err
 				}
-				return int64(0), nil
+				if !match {
+					allMatch = false
+					break
+				}
 			}
+			if allMatch {
+				return int64(1), nil
+			}
+			return int64(0), nil
+		}
+		if leftIsTuple {
+			// Left is tuple, right is subquery or something else - delegate to evalWhere
+			match, err := e.evalWhere(v, row)
+			if err != nil {
+				return nil, err
+			}
+			if match {
+				return int64(1), nil
+			}
+			return int64(0), nil
 		}
 		// Comparison in row context
 		left, err := e.evalRowExpr(v.Left, row)
@@ -19040,7 +19465,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return t.Format("2006-01-02"), nil
 	case "year":
@@ -19056,7 +19481,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return int64(t.Year()), nil
 	case "month":
@@ -19072,7 +19497,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return int64(t.Month()), nil
 	case "day", "dayofmonth":
@@ -19088,7 +19513,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return int64(t.Day()), nil
 	case "hour":
@@ -19101,7 +19526,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return int64(t.Hour()), nil
 	case "minute":
@@ -19114,7 +19539,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return int64(t.Minute()), nil
 	case "second":
@@ -19127,7 +19552,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return int64(t.Second()), nil
 	case "if":
@@ -19178,7 +19603,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return t.Format("Monday"), nil
 	case "dayofweek":
@@ -19194,7 +19619,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return int64(t.Weekday()) + 1, nil
 	case "dayofyear":
@@ -19210,7 +19635,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return int64(t.YearDay()), nil
 	case "monthname":
@@ -19226,7 +19651,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return t.Format("January"), nil
 	case "weekday":
@@ -19242,7 +19667,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		wd := int64(t.Weekday()) - 1
 		if wd < 0 {
@@ -19259,7 +19684,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		}
 		t, err := parseDateTimeValue(args[0])
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		return t.Format("15:04:05"), nil
 	case "abs":
@@ -19955,21 +20380,11 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 
 // evalComparisonWithRow evaluates a comparison expression with row context.
 func (e *Executor) evalComparisonWithRow(v *sqlparser.ComparisonExpr, row storage.Row) (interface{}, error) {
-	left, err := e.evalRowExpr(v.Left, row)
-	if err != nil {
-		return nil, err
-	}
-	right, err := e.evalRowExpr(v.Right, row)
-	if err != nil {
-		return nil, err
-	}
-	// Delegate to evalWhere for the actual comparison logic
+	// Delegate to evalWhere for the actual comparison logic (it handles tuples, subqueries, etc.)
 	match, err := e.evalWhere(v, row)
 	if err != nil {
 		return nil, err
 	}
-	_ = left
-	_ = right
 	if match {
 		return int64(1), nil
 	}
@@ -22699,27 +23114,6 @@ func (e *Executor) execCreateTableLike(newTableName, srcTableName string) (*Resu
 	e.Storage.CreateTable(e.CurrentDB, newDef)
 	e.upsertInnoDBStatsRows(e.CurrentDB, newTableName, 0)
 	return &Result{}, nil
-}
-
-// extractCreateTableSelectSQL extracts the SELECT portion from a
-// CREATE TABLE ... [ENGINE=...] [AS] SELECT ... query when the parser
-// fails to capture it (e.g. when table options precede AS SELECT).
-func extractCreateTableSelectSQL(query string) string {
-	upper := strings.ToUpper(query)
-	// Look for AS SELECT or just SELECT after table options
-	idx := strings.Index(upper, " AS SELECT ")
-	if idx >= 0 {
-		return strings.TrimSpace(query[idx+4:]) // skip " AS "
-	}
-	idx = strings.Index(upper, " SELECT ")
-	if idx >= 0 {
-		// Make sure it's after CREATE TABLE and not inside a subquery
-		before := upper[:idx]
-		if strings.Contains(before, "CREATE") && strings.Contains(before, "TABLE") {
-			return strings.TrimSpace(query[idx+1:])
-		}
-	}
-	return ""
 }
 
 // execCreateTableSelect handles CREATE TABLE t2 [AS] SELECT ...
