@@ -247,6 +247,7 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 		switch t {
 		case "memory_summary_global_by_event_name",
 			"global_variables", "session_variables",
+			"global_status", "session_status",
 			"events_waits_history_long", "events_waits_current", "events_waits_history",
 			"events_statements_history_long", "events_stages_history_long",
 			"events_statements_current", "events_statements_history",
@@ -422,6 +423,8 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.perfSchemaMemorySummary()
 	case "global_variables", "session_variables":
 		rawRows = e.perfSchemaVariables()
+	case "global_status", "session_status":
+		rawRows = e.perfSchemaStatus()
 	case "events_waits_history_long", "events_waits_current":
 		rawRows = []storage.Row{}
 	case "events_statements_history_long":
@@ -1156,6 +1159,28 @@ func (e *Executor) perfSchemaVariables() []storage.Row {
 		rows = append(rows, storage.Row{
 			"VARIABLE_NAME":  n,
 			"VARIABLE_VALUE": vars[n],
+		})
+	}
+	return rows
+}
+
+// perfSchemaStatus returns rows for performance_schema.global_status / session_status.
+// This provides a minimal set of status variables needed by MTR tests.
+func (e *Executor) perfSchemaStatus() []storage.Row {
+	// Status variables: expose key InnoDB/server status values that MTR tests check.
+	statusVars := map[string]string{
+		"Innodb_page_size": "16384",
+	}
+	names := make([]string, 0, len(statusVars))
+	for n := range statusVars {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	rows := make([]storage.Row, 0, len(names))
+	for _, n := range names {
+		rows = append(rows, storage.Row{
+			"VARIABLE_NAME":  n,
+			"VARIABLE_VALUE": statusVars[n],
 		})
 	}
 	return rows

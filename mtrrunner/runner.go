@@ -2438,15 +2438,9 @@ func (ctx *execContext) sourceFile(filename string) error {
 	baseName := strings.ToLower(filepath.Base(filename))
 	// Treat proc-control include as no-op in this single-node runner.
 	if baseName == "restart_mysqld.inc" {
-		if ctx.resultLogEnabled {
-			restartMsg := "restart"
-			if v, ok := ctx.variables["$restart_parameters"]; ok && v != "" {
-				restartMsg = v
-			}
-			ctx.output.WriteString("# " + restartMsg + "\n")
-			// Reset $restart_parameters to default after use
-			ctx.variables["$restart_parameters"] = "restart"
-		}
+		// Dolt test suite result files do not include "# restart" output.
+		// Reset $restart_parameters to default after use.
+		ctx.variables["$restart_parameters"] = "restart"
 		return nil
 	}
 
@@ -2777,6 +2771,10 @@ func parseConnectDirectiveArgs(args string) (connName string, dbName string) {
 	connName = parts[0]
 	if len(parts) >= 5 {
 		dbName = parts[4]
+		// *NO-ONE* is a MySQL test convention meaning "connect without a default database"
+		if dbName == "*NO-ONE*" {
+			dbName = ""
+		}
 	}
 	return connName, dbName
 }
@@ -2791,7 +2789,7 @@ func formatMySQLError(err error) string {
 	if m := re.FindStringSubmatch(msg); m != nil {
 		innerMsg := m[3]
 		// Handle "ERROR XXXX (YYYY): message" format from mylite error wrapping
-		innerRe := regexp.MustCompile(`ERROR (\d+) \(([^)]+)\): (.*)`)
+		innerRe := regexp.MustCompile(`(?i)ERROR (\d+) \(([^)]+)\): (.*)`)
 		if im := innerRe.FindStringSubmatch(innerMsg); im != nil {
 			return fmt.Sprintf("ERROR %s: %s", im[2], im[3])
 		}

@@ -2693,7 +2693,6 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			strings.HasPrefix(upper, "STOP ") ||
 			strings.HasPrefix(upper, "PURGE ") ||
 			strings.HasPrefix(upper, "BINLOG ") ||
-			strings.HasPrefix(upper, "DO ") ||
 			strings.HasPrefix(upper, "END") ||
 			strings.HasPrefix(upper, "ALTER INSTANCE") ||
 			strings.HasPrefix(upper, "CREATE UNDO TABLESPACE") ||
@@ -6119,9 +6118,14 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			}
 		}
 		// Check for duplicate column names in the index (ER_DUP_FIELDNAME = 1060)
+		// Skip functional index expressions (those starting with '(') since they
+		// don't map to real column names and stripPrefixLengthFromCol returns "".
 		{
 			seen := make(map[string]bool, len(idxCols))
 			for _, c := range idxCols {
+				if strings.HasPrefix(c, "(") {
+					continue // functional index expression, skip duplicate check
+				}
 				base := strings.ToLower(stripPrefixLengthFromCol(c))
 				if seen[base] {
 					return nil, mysqlError(1060, "42S21", fmt.Sprintf("Duplicate column name '%s'", stripPrefixLengthFromCol(c)))
@@ -10432,6 +10436,13 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					} else if arrowIdx := strings.Index(raw, "->'"); arrowIdx >= 0 {
 						raw = "JSON_EXTRACT(" + raw[:arrowIdx] + "," + raw[arrowIdx+2:] + ")"
 					}
+					// MySQL always displays "member of" even when written as bare "member"
+				{
+					memberRe := regexp.MustCompile(`(?i)\bmember\s*\(`)
+					raw = memberRe.ReplaceAllStringFunc(raw, func(m string) string {
+						return "member of ("
+					})
+				}
 					name = raw
 				}
 				if name == "" {
@@ -12001,6 +12012,9 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			{
 				seen := make(map[string]bool, len(idxCols))
 				for _, c := range idxCols {
+					if strings.HasPrefix(c, "(") {
+						continue // functional index expression
+					}
 					base := strings.ToLower(stripPrefixLengthFromCol(c))
 					if seen[base] {
 						return nil, mysqlError(1060, "42S21", fmt.Sprintf("Duplicate column name '%s'", stripPrefixLengthFromCol(c)))
@@ -13717,7 +13731,7 @@ func mysqlGeneratedClause(exprStr string, colType string) string {
 	// Parse the expression and reformat it MySQL-style
 	formattedExpr := mysqlFormatGenExpr(exprStr)
 
-	return fmt.Sprintf("GENERATED ALWAYS AS (%s) %s", formattedExpr, storage)
+	return fmt.Sprintf("generated always as (%s) %s", formattedExpr, strings.ToLower(storage))
 }
 
 // mysqlFormatGenExpr formats a generated column expression in MySQL style:
@@ -13756,7 +13770,7 @@ func mysqlFormatGenExpr(exprStr string) string {
 func mysqlGenExprNode(expr sqlparser.Expr) string {
 	switch e := expr.(type) {
 	case *sqlparser.ColName:
-		return fmt.Sprintf("`%s`", e.Name.String())
+		return e.Name.String()
 	case *sqlparser.BinaryExpr:
 		return fmt.Sprintf("%s %s %s", mysqlGenExprNode(e.Left), e.Operator.ToString(), mysqlGenExprNode(e.Right))
 	case *sqlparser.FuncExpr:
@@ -13768,10 +13782,10 @@ func mysqlGenExprNode(expr sqlparser.Expr) string {
 		// MySQL outputs function names in lowercase in SHOW CREATE TABLE
 		// for generated column expressions.
 		name = strings.ToLower(name)
-		return name + "(" + strings.Join(args, ",") + ")"
+		return name + "(" + strings.Join(args, ", ") + ")"
 	case *sqlparser.Literal:
 		if e.Type == sqlparser.StrVal {
-			return "_utf8mb4'" + e.Val + "'"
+			return "'" + e.Val + "'"
 		}
 		return e.Val
 	case *sqlparser.UnaryExpr:
@@ -13784,7 +13798,7 @@ func mysqlGenExprNode(expr sqlparser.Expr) string {
 		if e.To != nil {
 			parts = append(parts, mysqlGenExprNode(e.To))
 		}
-		return "SUBSTR(" + strings.Join(parts, ",") + ")"
+		return "substr(" + strings.Join(parts, ", ") + ")"
 	case *sqlparser.JSONUnquoteExpr:
 		return "json_unquote(" + mysqlGenExprNode(e.JSONValue) + ")"
 	case *sqlparser.JSONExtractExpr:
@@ -13792,7 +13806,7 @@ func mysqlGenExprNode(expr sqlparser.Expr) string {
 		for _, p := range e.PathList {
 			parts = append(parts, mysqlGenExprNode(p))
 		}
-		return "json_extract(" + strings.Join(parts, ",") + ")"
+		return "json_extract(" + strings.Join(parts, ", ") + ")"
 	case *sqlparser.CastExpr:
 		return "cast(" + mysqlGenExprNode(e.Expr) + " as " + strings.ToLower(e.Type.Type) + ")"
 	case *sqlparser.IntroducerExpr:
@@ -25636,7 +25650,8 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 		op = "check"
 		rest = strings.TrimSpace(query[len("CHECK TABLE"):])
 	} else {
-		return &Result{}, nil
+		// DO, CACHE INDEX, etc. — silently succeed
+		return &Result{AffectedRows: 0}, nil
 	}
 
 	// Parse table names (comma-separated)

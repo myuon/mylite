@@ -1604,7 +1604,9 @@ func (e *Executor) evalMemberOf(v *sqlparser.MemberOfExpr) (interface{}, error) 
 
 	arr, err := jsonNormalize(arrVal)
 	if err != nil {
-		return int64(0), nil
+		// MySQL error 3141: ER_INVALID_JSON_TEXT_IN_PARAM
+		arrStr := fmt.Sprintf("%v", arrVal)
+		return nil, mysqlError(3141, "22032", fmt.Sprintf("Invalid JSON text in argument 2 to function json_member_of: \"Invalid value.\" at position 0 in '%s'", arrStr))
 	}
 
 	jsonArr, ok := arr.([]interface{})
