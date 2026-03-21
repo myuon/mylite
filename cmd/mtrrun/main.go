@@ -1380,7 +1380,6 @@ var skipTests = map[string]bool{
 	"sys_vars/innodb_table_locks_func":                        true,
 	"sys_vars/innodb_temp_tablespaces_dir_basic":              true,
 	"sys_vars/innodb_thread_concurrency_basic":                true,
-	"sys_vars/innodb_thread_sleep_delay_basic":                true,
 	"sys_vars/innodb_tmpdir_basic":                            true,
 	"sys_vars/innodb_undo_directory_basic":                    true,
 	"sys_vars/innodb_undo_log_encrypt_basic":                  true,
