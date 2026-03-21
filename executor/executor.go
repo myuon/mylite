@@ -7930,10 +7930,18 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						}
 					}
 					if err != nil {
-						return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colNames[i]))
+						if bool(stmt.Ignore) {
+							e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", colNames[i]))
+						} else {
+							return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colNames[i]))
+						}
 					}
 				} else {
-					return nil, err
+					if bool(stmt.Ignore) {
+						e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", colNames[i]))
+					} else {
+						return nil, err
+					}
 				}
 			}
 			origValues[colNames[i]] = v
@@ -7952,16 +7960,30 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 								if strings.Contains(colUpper, "UNSIGNED") {
 									f := toFloat(v)
 									if f < 0 {
-										return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+										if bool(stmt.Ignore) {
+											e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+											v = int64(0)
+										} else {
+											return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+										}
 									}
 								}
 								if err := checkDecimalRange(col.Type, v); err != nil {
-									return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+									if bool(stmt.Ignore) {
+										e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+									} else {
+										return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+									}
 								}
 							}
 							// Strict mode: check integer type constraints
 							if err := checkIntegerStrict(col.Type, col.Name, v); err != nil {
-								return nil, err
+								if bool(stmt.Ignore) {
+									e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+									v = coerceIntegerValue(col.Type, v)
+								} else {
+									return nil, err
+								}
 							}
 						}
 						v = formatDecimalValue(col.Type, v)
@@ -8275,11 +8297,21 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						switch val := rv.(type) {
 						case int64:
 							if isUnsigned && val < 0 {
-								return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+								if bool(stmt.Ignore) {
+									e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+									row[col.Name] = int64(0)
+								} else {
+									return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+								}
 							}
 						case float64:
 							if isUnsigned && val < 0 {
-								return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+								if bool(stmt.Ignore) {
+									e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+									row[col.Name] = int64(0)
+								} else {
+									return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+								}
 							}
 						case string:
 							numText := strings.TrimSpace(val)
@@ -8319,13 +8351,22 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							// Check unsigned constraint for string-typed decimal values
 							if isUnsigned {
 								if f, perr := strconv.ParseFloat(numText, 64); perr == nil && f < 0 {
-									return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+									if bool(stmt.Ignore) {
+										e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+										row[col.Name] = int64(0)
+									} else {
+										return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+									}
 								}
 							}
 						}
 						if isDecimalType && strings.Contains(colUpper, "DECIMAL") {
 							if derr := checkDecimalRange(col.Type, rv); derr != nil {
-								return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+								if bool(stmt.Ignore) {
+									e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+								} else {
+									return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+								}
 							}
 						}
 					}
@@ -12305,6 +12346,19 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		matchedRows++
 		if rowChanged {
 			affected++
+			// If an auto-increment column was updated, advance the AI counter
+			// so subsequent INSERT with NULL/0 won't generate a duplicate.
+			for _, col := range tbl.Def.Columns {
+				if col.AutoIncrement {
+					if newVal, ok := newRow[col.Name]; ok && newVal != nil {
+						iv := toInt64(newVal)
+						if iv > tbl.AutoIncrement.Load() {
+							tbl.AutoIncrement.Store(iv)
+						}
+					}
+					break
+				}
+			}
 		}
 
 		// Fire AFTER UPDATE triggers
@@ -27158,6 +27212,20 @@ func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Exp
 	return e.execRoutineBody(fn.Body, paramVars)
 }
 
+// leaveError is a sentinel error used to implement LEAVE label in stored routines.
+type leaveError struct {
+	label string
+}
+
+func (e *leaveError) Error() string { return "LEAVE " + e.label }
+
+// iterateError is a sentinel error used to implement ITERATE label in stored routines.
+type iterateError struct {
+	label string
+}
+
+func (e *iterateError) Error() string { return "ITERATE " + e.label }
+
 // routineContext holds shared state for a stored routine execution.
 type routineContext struct {
 	localVars          map[string]interface{}
@@ -27490,6 +27558,154 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 				return retVal, nil
 			}
 			continue
+		}
+
+		// Handle LEAVE label
+		if strings.HasPrefix(stmtUpper, "LEAVE ") {
+			label := strings.TrimSpace(stmtStr[len("LEAVE "):])
+			label = strings.TrimRight(label, ";")
+			return nil, &leaveError{label: label}
+		}
+
+		// Handle ITERATE label
+		if strings.HasPrefix(stmtUpper, "ITERATE ") {
+			label := strings.TrimSpace(stmtStr[len("ITERATE "):])
+			label = strings.TrimRight(label, ";")
+			return nil, &iterateError{label: label}
+		}
+
+		// Handle LOOP...END LOOP (with optional label)
+		if strings.HasPrefix(stmtUpper, "LOOP") || (strings.Contains(stmtUpper, ":") && strings.Contains(stmtUpper, "LOOP")) {
+			// Check for labeled loop: label: LOOP ... END LOOP [label]
+			loopBlock := stmtStr
+			loopLabel := ""
+			startUpper := stmtUpper
+			if colonIdx := strings.Index(startUpper, ":"); colonIdx >= 0 {
+				possibleLabel := strings.TrimSpace(stmtStr[:colonIdx])
+				afterColon := strings.TrimSpace(stmtStr[colonIdx+1:])
+				if strings.HasPrefix(strings.ToUpper(afterColon), "LOOP") {
+					loopLabel = possibleLabel
+					loopBlock = afterColon
+				}
+			}
+			// Collect the full LOOP block
+			for !strings.HasSuffix(strings.ToUpper(strings.TrimSpace(loopBlock)), "END LOOP") &&
+				!strings.HasSuffix(strings.ToUpper(strings.TrimSpace(loopBlock)), "END LOOP "+strings.ToUpper(loopLabel)) && i+1 < len(body) {
+				i++
+				loopBlock += ";\n" + body[i]
+			}
+			retVal, err := e.execLoopBlockCtx(loopBlock, loopLabel, ctx)
+			if err != nil {
+				return nil, err
+			}
+			if retVal != nil {
+				return retVal, nil
+			}
+			continue
+		}
+
+		// Handle labeled WHILE: label: WHILE ... END WHILE
+		if strings.Contains(stmtUpper, ":") && !strings.HasPrefix(stmtUpper, "WHILE ") {
+			colonIdx := strings.Index(stmtStr, ":")
+			if colonIdx >= 0 {
+				afterColon := strings.TrimSpace(stmtStr[colonIdx+1:])
+				afterColonUpper := strings.ToUpper(afterColon)
+				if strings.HasPrefix(afterColonUpper, "WHILE ") {
+					loopLabel := strings.TrimSpace(stmtStr[:colonIdx])
+					whileBlock := afterColon
+					for !strings.HasSuffix(strings.ToUpper(strings.TrimSpace(whileBlock)), "END WHILE") &&
+						!strings.HasSuffix(strings.ToUpper(strings.TrimSpace(whileBlock)), "END WHILE "+strings.ToUpper(loopLabel)) && i+1 < len(body) {
+						i++
+						whileBlock += ";\n" + body[i]
+					}
+					retVal, err := e.execWhileBlockWithLabel(whileBlock, loopLabel, ctx)
+					if err != nil {
+						return nil, err
+					}
+					if retVal != nil {
+						return retVal, nil
+					}
+					continue
+				}
+				if strings.HasPrefix(afterColonUpper, "REPEAT") {
+					loopLabel := strings.TrimSpace(stmtStr[:colonIdx])
+					repeatBlock := afterColon
+					for !strings.HasSuffix(strings.ToUpper(strings.TrimSpace(repeatBlock)), "END REPEAT") &&
+						!strings.HasSuffix(strings.ToUpper(strings.TrimSpace(repeatBlock)), "END REPEAT "+strings.ToUpper(loopLabel)) && i+1 < len(body) {
+						i++
+						repeatBlock += ";\n" + body[i]
+					}
+					retVal, err := e.execRepeatBlockWithLabel(repeatBlock, loopLabel, ctx)
+					if err != nil {
+						return nil, err
+					}
+					if retVal != nil {
+						return retVal, nil
+					}
+					continue
+				}
+				if strings.HasPrefix(afterColonUpper, "LOOP") {
+					loopLabel := strings.TrimSpace(stmtStr[:colonIdx])
+					loopBlock := afterColon
+					for !strings.HasSuffix(strings.ToUpper(strings.TrimSpace(loopBlock)), "END LOOP") &&
+						!strings.HasSuffix(strings.ToUpper(strings.TrimSpace(loopBlock)), "END LOOP "+strings.ToUpper(loopLabel)) && i+1 < len(body) {
+						i++
+						loopBlock += ";\n" + body[i]
+					}
+					retVal, err := e.execLoopBlockCtx(loopBlock, loopLabel, ctx)
+					if err != nil {
+						return nil, err
+					}
+					if retVal != nil {
+						return retVal, nil
+					}
+					continue
+				}
+				// Handle labeled BEGIN...END block
+				if strings.HasPrefix(afterColonUpper, "BEGIN") {
+					label := strings.TrimSpace(stmtStr[:colonIdx])
+					beginBlock := afterColon
+					beginDepth := 1
+					for beginDepth > 0 && i+1 < len(body) {
+						i++
+						line := body[i]
+						lineUpper := strings.ToUpper(strings.TrimSpace(line))
+						if strings.HasPrefix(lineUpper, "BEGIN") {
+							beginDepth++
+						}
+						if strings.HasPrefix(lineUpper, "END") {
+							beginDepth--
+						}
+						beginBlock += ";\n" + line
+					}
+					// Strip BEGIN ... END wrapper
+					inner := strings.TrimSpace(beginBlock)
+					if strings.HasPrefix(strings.ToUpper(inner), "BEGIN") {
+						inner = strings.TrimSpace(inner[len("BEGIN"):])
+					}
+					innerUpper := strings.ToUpper(strings.TrimSpace(inner))
+					if strings.HasSuffix(innerUpper, "END "+strings.ToUpper(label)) {
+						inner = strings.TrimSpace(inner[:len(inner)-len("END ")-len(label)])
+					} else if strings.HasSuffix(innerUpper, "END") {
+						inner = strings.TrimSpace(inner[:len(inner)-len("END")])
+					}
+					inner = strings.TrimRight(inner, ";")
+					stmts := splitTriggerBody(inner)
+					retVal, err := e.execRoutineBodyWithContext(stmts, ctx)
+					if err != nil {
+						// Handle LEAVE for this labeled block
+						var le *leaveError
+						if errors.As(err, &le) && strings.EqualFold(le.label, label) {
+							continue
+						}
+						return nil, err
+					}
+					if retVal != nil {
+						return retVal, nil
+					}
+					continue
+				}
+			}
 		}
 
 		// Handle SELECT ... INTO
@@ -27873,6 +28089,7 @@ func (e *Executor) execRepeatBlock(block string, localVars map[string]interface{
 		stmts := splitTriggerBody(loopBody)
 		retVal, err := e.execRoutineBodyWithContext(stmts, blockCtx)
 		if err != nil {
+			// LEAVE/ITERATE propagate up to the caller
 			return nil, err
 		}
 		if retVal != nil {
@@ -27952,6 +28169,195 @@ func (e *Executor) execWhileBlock(block string, localVars map[string]interface{}
 		}
 	}
 
+	return nil, nil
+}
+
+// execLoopBlockCtx executes a LOOP...END LOOP block with optional LEAVE label.
+func (e *Executor) execLoopBlockCtx(block string, label string, ctx *routineContext) (interface{}, error) {
+	upper := strings.ToUpper(strings.TrimSpace(block))
+	bodyStr := strings.TrimSpace(block)
+
+	// Remove LOOP prefix
+	if strings.HasPrefix(upper, "LOOP") {
+		bodyStr = strings.TrimSpace(bodyStr[len("LOOP"):])
+	}
+
+	// Remove trailing END LOOP [label]
+	bodyUpper := strings.ToUpper(bodyStr)
+	endSuffix := "END LOOP"
+	if label != "" {
+		endWithLabel := "END LOOP " + strings.ToUpper(label)
+		if idx := strings.LastIndex(bodyUpper, endWithLabel); idx >= 0 {
+			bodyStr = strings.TrimSpace(bodyStr[:idx])
+		} else if idx := strings.LastIndex(bodyUpper, endSuffix); idx >= 0 {
+			bodyStr = strings.TrimSpace(bodyStr[:idx])
+		}
+	} else if idx := strings.LastIndex(bodyUpper, endSuffix); idx >= 0 {
+		bodyStr = strings.TrimSpace(bodyStr[:idx])
+	}
+	bodyStr = strings.TrimRight(bodyStr, ";")
+
+	blockCtx := &routineContext{
+		localVars:          ctx.localVars,
+		cursors:            ctx.cursors,
+		cursorDefs:         ctx.cursorDefs,
+		notFoundHandlerVar: ctx.notFoundHandlerVar,
+		done:               ctx.done,
+	}
+
+	for iterations := 0; iterations < 10000; iterations++ {
+		stmts := splitTriggerBody(bodyStr)
+		retVal, err := e.execRoutineBodyWithContext(stmts, blockCtx)
+		if err != nil {
+			// Handle LEAVE for this loop
+			var le *leaveError
+			if errors.As(err, &le) {
+				if label == "" || strings.EqualFold(le.label, label) {
+					return nil, nil // exit the loop
+				}
+				return nil, err // propagate to outer block
+			}
+			// Handle ITERATE for this loop
+			var ie *iterateError
+			if errors.As(err, &ie) {
+				if label == "" || strings.EqualFold(ie.label, label) {
+					continue // restart loop iteration
+				}
+				return nil, err // propagate to outer block
+			}
+			return nil, err
+		}
+		if retVal != nil {
+			return retVal, nil
+		}
+	}
+	return nil, nil
+}
+
+// execWhileBlockWithLabel executes a labeled WHILE block, supporting LEAVE/ITERATE.
+func (e *Executor) execWhileBlockWithLabel(block string, label string, ctx *routineContext) (interface{}, error) {
+	upper := strings.ToUpper(strings.TrimSpace(block))
+	bodyStr := strings.TrimSpace(block)
+	if strings.HasPrefix(upper, "WHILE ") {
+		bodyStr = strings.TrimSpace(bodyStr[len("WHILE "):])
+	}
+
+	doIdx := strings.Index(strings.ToUpper(bodyStr), " DO")
+	if doIdx < 0 {
+		return nil, fmt.Errorf("WHILE without DO")
+	}
+	condStr := strings.TrimSpace(bodyStr[:doIdx])
+	afterDo := strings.TrimSpace(bodyStr[doIdx+len(" DO"):])
+
+	// Remove trailing END WHILE [label]
+	bodyUpper := strings.ToUpper(afterDo)
+	endSuffix := "END WHILE"
+	if label != "" {
+		endWithLabel := "END WHILE " + strings.ToUpper(label)
+		if idx := strings.LastIndex(bodyUpper, endWithLabel); idx >= 0 {
+			afterDo = strings.TrimSpace(afterDo[:idx])
+		} else if idx := strings.LastIndex(bodyUpper, endSuffix); idx >= 0 {
+			afterDo = strings.TrimSpace(afterDo[:idx])
+		}
+	} else if idx := strings.LastIndex(bodyUpper, endSuffix); idx >= 0 {
+		afterDo = strings.TrimSpace(afterDo[:idx])
+	}
+
+	blockCtx := &routineContext{
+		localVars:          ctx.localVars,
+		cursors:            ctx.cursors,
+		cursorDefs:         ctx.cursorDefs,
+		notFoundHandlerVar: ctx.notFoundHandlerVar,
+		done:               ctx.done,
+	}
+
+	for iterations := 0; iterations < 10000; iterations++ {
+		condResolved := e.substituteLocalVars(condStr, ctx.localVars)
+		condVal, err := e.evaluateExprWithVars(condResolved, map[string]interface{}{})
+		if err != nil {
+			return nil, err
+		}
+		if !isTruthy(condVal) {
+			break
+		}
+
+		stmts := splitTriggerBody(afterDo)
+		retVal, err := e.execRoutineBodyWithContext(stmts, blockCtx)
+		if err != nil {
+			var le *leaveError
+			if errors.As(err, &le) && strings.EqualFold(le.label, label) {
+				return nil, nil
+			}
+			var ie *iterateError
+			if errors.As(err, &ie) && strings.EqualFold(ie.label, label) {
+				continue
+			}
+			return nil, err
+		}
+		if retVal != nil {
+			return retVal, nil
+		}
+	}
+	return nil, nil
+}
+
+// execRepeatBlockWithLabel executes a labeled REPEAT block, supporting LEAVE/ITERATE.
+func (e *Executor) execRepeatBlockWithLabel(block string, label string, ctx *routineContext) (interface{}, error) {
+	upper := strings.ToUpper(strings.TrimSpace(block))
+	bodyStr := strings.TrimSpace(block)
+	if strings.HasPrefix(upper, "REPEAT") {
+		bodyStr = strings.TrimSpace(bodyStr[len("REPEAT"):])
+	}
+
+	bodyUpper := strings.ToUpper(bodyStr)
+	untilIdx := strings.LastIndex(bodyUpper, "UNTIL ")
+	if untilIdx < 0 {
+		return nil, fmt.Errorf("REPEAT without UNTIL")
+	}
+
+	loopBody := strings.TrimSpace(bodyStr[:untilIdx])
+	afterUntil := strings.TrimSpace(bodyStr[untilIdx+len("UNTIL "):])
+	endRepeatIdx := strings.LastIndex(strings.ToUpper(afterUntil), "END REPEAT")
+	condStr := afterUntil
+	if endRepeatIdx >= 0 {
+		condStr = strings.TrimSpace(afterUntil[:endRepeatIdx])
+	}
+
+	blockCtx := &routineContext{
+		localVars:          ctx.localVars,
+		cursors:            ctx.cursors,
+		cursorDefs:         ctx.cursorDefs,
+		notFoundHandlerVar: ctx.notFoundHandlerVar,
+		done:               ctx.done,
+	}
+
+	for iterations := 0; iterations < 10000; iterations++ {
+		stmts := splitTriggerBody(loopBody)
+		retVal, err := e.execRoutineBodyWithContext(stmts, blockCtx)
+		if err != nil {
+			var le *leaveError
+			if errors.As(err, &le) && strings.EqualFold(le.label, label) {
+				return nil, nil
+			}
+			var ie *iterateError
+			if errors.As(err, &ie) && strings.EqualFold(ie.label, label) {
+				goto checkCond
+			}
+			return nil, err
+		}
+		if retVal != nil {
+			return retVal, nil
+		}
+	checkCond:
+		condResolved := e.substituteLocalVars(condStr, ctx.localVars)
+		condVal, err := e.evaluateExprWithVars(condResolved, map[string]interface{}{})
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(condVal) {
+			break
+		}
+	}
 	return nil, nil
 }
 

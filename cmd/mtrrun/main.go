@@ -1894,7 +1894,7 @@ var skipTests = map[string]bool{
 	"other/lead_lag_explain":                       true,
 	"other/limit":                                  true,
 	"other/locale":                                 true,
-	"other/lock_tables_lost_commit":                true,
+	// "other/lock_tables_lost_commit":                true, // already passes
 	"other/locking_part":                           true,
 	"other/lowercase_table_grant":                  true,
 	"other/multi_update_innodb":                    true,
@@ -1904,7 +1904,7 @@ var skipTests = map[string]bool{
 	"other/mysql_os_user":                          true,
 	"other/mysql_os_user_unix":                     true,
 	"other/mysql_protocols":                        true,
-	"other/mysql_ssl":                              true,
+	// "other/mysql_ssl":                              true, // already passes
 	"other/mysql_ssl_default":                      true,
 	"other/mysql_upgrade":                          true,
 	"other/mysql_upgrade_with_inf_schema_user":     true,
@@ -2071,7 +2071,7 @@ var skipTests = map[string]bool{
 	"other/group_by_fd_no_prot":              true,
 	"other/having":                           true,
 	"other/heap":                             true,
-	"other/heap_auto_increment":              true,
+	// "other/heap_auto_increment":              true, // now passes (UPDATE AI counter fix)
 	"other/help":                             true,
 	"other/histogram_equi_height":            true,
 	"other/histogram_singleton":              true,
@@ -2178,7 +2178,7 @@ var skipTests = map[string]bool{
 	"other/type_temporal_fractional":         true,
 	"other/type_timestamp":                   true,
 	"other/type_timestamp_explicit":          true,
-	"other/type_uint":                        true,
+	// "other/type_uint":                        true, // now passes (INSERT IGNORE range fix)
 	"other/union":                            true,
 	"other/update":                           true,
 	"other/user_password_history":            true,
@@ -2341,7 +2341,7 @@ var skipTests = map[string]bool{
 	"other/server_offline_4": true,
 	"other/server_offline_5": true,
 	"other/server_offline_6": true,
-	"other/status_bug17954": true,
+	// "other/status_bug17954": true, // already passes
 	"other/varbinary": true,
 	"other/warnings_engine_disabled": true,
 	"other/wl3836": true,
