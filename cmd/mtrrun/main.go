@@ -1382,7 +1382,6 @@ var skipTests = map[string]bool{
 	"sys_vars/innodb_stats_method_basic":                      true,
 	"sys_vars/innodb_stats_on_metadata_basic":                 true,
 	"sys_vars/innodb_stats_persistent_basic":                  true,
-	"sys_vars/innodb_stats_persistent_sample_pages_basic":     true,
 	"sys_vars/innodb_status_output_basic":                     true,
 	"sys_vars/innodb_status_output_locks_basic":               true,
 	"sys_vars/innodb_strict_mode_basic":                       true,
