@@ -1706,13 +1706,22 @@ func (ctx *execContext) executeSQLInner(stmt string) error {
 		stmt = strings.Join(lines, "\n")
 	}
 	stmt = strings.TrimSpace(stmt)
+	// Strip leading C-style block comments for statement type detection
+	stmtForPrefix := stmt
+	for strings.HasPrefix(stmtForPrefix, "/*") {
+		if end := strings.Index(stmtForPrefix, "*/"); end >= 0 {
+			stmtForPrefix = strings.TrimSpace(stmtForPrefix[end+2:])
+		} else {
+			break
+		}
+	}
 	// Only uppercase a short prefix to avoid allocating a full copy of large statements
 	prefixLen := 16
-	if prefixLen > len(stmt) {
-		prefixLen = len(stmt)
+	if prefixLen > len(stmtForPrefix) {
+		prefixLen = len(stmtForPrefix)
 	}
-	upper := strings.ToUpper(stmt[:prefixLen])
-	fullUpper := strings.ToUpper(stmt)
+	upper := strings.ToUpper(stmtForPrefix[:prefixLen])
+	fullUpper := strings.ToUpper(stmtForPrefix)
 	isQuery := strings.HasPrefix(upper, "SELECT") ||
 		strings.HasPrefix(upper, "SHOW") ||
 		strings.HasPrefix(upper, "DESCRIBE") ||
