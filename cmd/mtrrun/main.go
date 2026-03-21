@@ -2074,7 +2074,6 @@ var skipTests = map[string]bool{
 	"other/join_outer_innodb":                      true,
 	"other/key":                                    true,
 	"other/key_diff":                               true,
-	"other/key_primary":                            true,
 	"other/lead_lag_explain":                       true,
 	"other/limit":                                  true,
 	"other/locale":                                 true,
