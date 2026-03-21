@@ -1321,7 +1321,6 @@ var skipTests = map[string]bool{
 	"sys_vars/innodb_flushing_avg_loops_basic":                true,
 	"sys_vars/innodb_force_load_corrupted_basic":              true,
 	"sys_vars/innodb_force_recovery_basic":                    true,
-	"sys_vars/innodb_fsync_threshold_basic":                   true,
 	"sys_vars/innodb_ft_aux_table_basic":                      true,
 	"sys_vars/innodb_ft_enable_diag_print_basic":              true,
 	"sys_vars/innodb_ft_enable_stopword_basic":                true,

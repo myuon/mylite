@@ -4016,6 +4016,17 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						n = 0
 					}
 					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+				} else if cleanName == "innodb_fsync_threshold" {
+					// Must be non-negative and aligned to InnoDB page size (4KB); otherwise 0.
+					evalVal, err := e.evalExpr(expr.Expr)
+					if err != nil || evalVal == nil {
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+					}
+					n := toInt64(evalVal)
+					if n < 0 || (n != 0 && n%4096 != 0) {
+						n = 0
+					}
+					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_fill_factor" {
 					evalVal, err := e.evalExpr(expr.Expr)
 					if err != nil || evalVal == nil {
