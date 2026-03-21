@@ -9735,6 +9735,14 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	if err := e.checkSelectScopeErrors(stmt); err != nil {
 		return nil, err
 	}
+	// Vitess may synthesize stmt.From for SELECT local.var/session.var/global.var
+	// even when the query has no explicit FROM clause. In MySQL these are
+	// resolved as table-qualified columns and must return unknown-table errors.
+	if !hasTopLevelFromClause(e.currentQuery) {
+		if err := validateImplicitScopeQualifiedCols(stmt); err != nil {
+			return nil, err
+		}
+	}
 	// Handle SELECT without FROM (e.g., SELECT 1, SELECT @@version_comment)
 	if len(stmt.From) == 0 {
 		return e.execSelectNoFrom(stmt)
@@ -10263,6 +10271,23 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		Rows:        resultRows,
 		IsResultSet: true,
 	}, nil
+}
+
+func validateImplicitScopeQualifiedCols(stmt *sqlparser.Select) error {
+	var walkErr error
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		col, ok := node.(*sqlparser.ColName)
+		if !ok || col.Qualifier.IsEmpty() {
+			return true, nil
+		}
+		q := strings.ToLower(col.Qualifier.Name.String())
+		if q == "local" || q == "session" || q == "global" {
+			walkErr = mysqlError(1051, "42S02", fmt.Sprintf("Unknown table '%s' in field list", q))
+			return false, nil
+		}
+		return true, nil
+	}, stmt)
+	return walkErr
 }
 
 // selectExprsHaveAggregates returns true if any select expression is or contains an aggregate function.
