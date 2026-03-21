@@ -3972,6 +3972,50 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						n = maxVal
 					}
 					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+				} else if cleanName == "innodb_replication_delay" {
+					// INTEGER only; negative values clamp to 0, positive uint64 values are accepted.
+					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
+						litStr := strings.TrimSpace(sqlparser.String(lit))
+						if strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"") || strings.ContainsAny(litStr, ".eE") {
+							return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+						}
+						if strings.HasPrefix(litStr, "-") {
+							parsed, err := strconv.ParseInt(litStr, 10, 64)
+							if err != nil {
+								return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+							}
+							if parsed < 0 {
+								e.warnings = append(e.warnings, Warning{
+									Level:   "Warning",
+									Code:    1292,
+									Message: fmt.Sprintf("Truncated incorrect %s value: '%d'", cleanName, parsed),
+								})
+								parsed = 0
+							}
+							e.globalVars[cleanName] = fmt.Sprintf("%d", parsed)
+							continue
+						}
+						parsed, err := strconv.ParseUint(litStr, 10, 64)
+						if err != nil {
+							return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+						}
+						e.globalVars[cleanName] = fmt.Sprintf("%d", parsed)
+						continue
+					}
+					evalVal, err := e.evalExpr(expr.Expr)
+					if err != nil || evalVal == nil {
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+					}
+					n := toInt64(evalVal)
+					if n < 0 {
+						e.warnings = append(e.warnings, Warning{
+							Level:   "Warning",
+							Code:    1292,
+							Message: fmt.Sprintf("Truncated incorrect %s value: '%d'", cleanName, n),
+						})
+						n = 0
+					}
+					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_fill_factor" {
 					evalVal, err := e.evalExpr(expr.Expr)
 					if err != nil || evalVal == nil {

@@ -1359,7 +1359,6 @@ var skipTests = map[string]bool{
 	"sys_vars/innodb_random_read_ahead_basic":                 true,
 	"sys_vars/innodb_redo_log_archive_dirs_basic":             true,
 	"sys_vars/innodb_redo_log_encrypt_basic":                  true,
-	"sys_vars/innodb_replication_delay_basic":                 true,
 	"sys_vars/innodb_rollback_on_timeout_basic":               true,
 	"sys_vars/innodb_rollback_segments_basic":                 true,
 	"sys_vars/innodb_stats_auto_recalc_basic":                 true,
