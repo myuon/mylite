@@ -2981,6 +2981,74 @@ func extractRawSelectExprs(query string) []string {
 	return parts
 }
 
+func hasTopLevelFromClause(query string) bool {
+	q := strings.TrimSpace(query)
+	lq := strings.ToLower(q)
+	if !strings.HasPrefix(lq, "select ") {
+		return false
+	}
+	inQuote := byte(0)
+	parenDepth := 0
+	inLineComment := false
+	inBlockComment := false
+	for i := 0; i < len(q); i++ {
+		ch := q[i]
+		next := byte(0)
+		if i+1 < len(q) {
+			next = q[i+1]
+		}
+		if inLineComment {
+			if ch == '\n' {
+				inLineComment = false
+			}
+			continue
+		}
+		if inBlockComment {
+			if ch == '*' && next == '/' {
+				inBlockComment = false
+				i++
+			}
+			continue
+		}
+		if inQuote != 0 {
+			if ch == inQuote && (i == 0 || q[i-1] != '\\') {
+				inQuote = 0
+			}
+			continue
+		}
+		if ch == '-' && next == '-' {
+			inLineComment = true
+			i++
+			continue
+		}
+		if ch == '/' && next == '*' {
+			inBlockComment = true
+			i++
+			continue
+		}
+		if ch == '\'' || ch == '"' || ch == '`' {
+			inQuote = ch
+			continue
+		}
+		if ch == '(' {
+			parenDepth++
+			continue
+		}
+		if ch == ')' && parenDepth > 0 {
+			parenDepth--
+			continue
+		}
+		if parenDepth == 0 && i+4 <= len(q) && strings.EqualFold(q[i:i+4], "from") {
+			prevOK := i == 0 || !isIdentChar(q[i-1])
+			nextOK := i+4 == len(q) || !isIdentChar(q[i+4])
+			if prevOK && nextOK {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func countTopLevelSQLArgs(argList string) int {
 	if strings.TrimSpace(argList) == "" {
 		return 0
@@ -9663,6 +9731,10 @@ func (e *Executor) preFilterRows(rows []storage.Row, preds []sqlparser.Expr) ([]
 }
 
 func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
+	// Apply system-variable scope checks before any SELECT execution path.
+	if err := e.checkSelectScopeErrors(stmt); err != nil {
+		return nil, err
+	}
 	// Handle SELECT without FROM (e.g., SELECT 1, SELECT @@version_comment)
 	if len(stmt.From) == 0 {
 		return e.execSelectNoFrom(stmt)
