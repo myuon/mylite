@@ -3792,6 +3792,62 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						}
 					}
 					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+				} else if cleanName == "innodb_spin_wait_pause_multiplier" {
+					// INTEGER only, range 0..100.
+					var (
+						n                int64
+						haveParsedNumber bool
+						positiveOverflow bool
+					)
+					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
+						litStr := strings.TrimSpace(sqlparser.String(lit))
+						if strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"") || strings.ContainsAny(litStr, ".eE") {
+							return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+						}
+						if strings.HasPrefix(litStr, "-") {
+							parsed, err := strconv.ParseInt(litStr, 10, 64)
+							if err != nil {
+								return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+							}
+							n = parsed
+							haveParsedNumber = true
+						} else {
+							parsed, err := strconv.ParseUint(litStr, 10, 64)
+							if err != nil {
+								return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+							}
+							if parsed > math.MaxInt64 {
+								positiveOverflow = true
+							} else {
+								n = int64(parsed)
+							}
+							haveParsedNumber = true
+						}
+					}
+					if !haveParsedNumber {
+						evalVal, err := e.evalExpr(expr.Expr)
+						if err != nil || evalVal == nil {
+							return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+						}
+						n = toInt64(evalVal)
+					}
+					if n < 0 || n > 100 || positiveOverflow {
+						displayVal := fmt.Sprintf("%d", n)
+						if positiveOverflow {
+							displayVal = fmt.Sprintf("%v", sqlparser.String(expr.Expr))
+						}
+						e.warnings = append(e.warnings, Warning{
+							Level:   "Warning",
+							Code:    1292,
+							Message: fmt.Sprintf("Truncated incorrect %s value: '%s'", cleanName, strings.Trim(displayVal, "'\"")),
+						})
+						if n < 0 {
+							n = 0
+						} else {
+							n = 100
+						}
+					}
+					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_thread_sleep_delay" {
 					// INTEGER only, range 0..1000000.
 					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {

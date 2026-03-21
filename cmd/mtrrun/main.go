@@ -1363,7 +1363,6 @@ var skipTests = map[string]bool{
 	"sys_vars/innodb_replication_delay_basic":                 true,
 	"sys_vars/innodb_rollback_on_timeout_basic":               true,
 	"sys_vars/innodb_rollback_segments_basic":                 true,
-	"sys_vars/innodb_spin_wait_pause_multiplier_basic":        true,
 	"sys_vars/innodb_stats_auto_recalc_basic":                 true,
 	"sys_vars/innodb_stats_include_delete_marked_basic":       true,
 	"sys_vars/innodb_stats_method_basic":                      true,
