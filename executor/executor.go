@@ -3879,6 +3879,28 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						}
 					}
 					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+				} else if cleanName == "innodb_ft_num_word_optimize" {
+					// INTEGER only, minimum 1000.
+					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
+						litStr := strings.TrimSpace(sqlparser.String(lit))
+						if strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"") || strings.ContainsAny(litStr, ".eE") {
+							return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+						}
+					}
+					evalVal, err := e.evalExpr(expr.Expr)
+					if err != nil || evalVal == nil {
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+					}
+					n := toInt64(evalVal)
+					if n < 1000 {
+						e.warnings = append(e.warnings, Warning{
+							Level:   "Warning",
+							Code:    1292,
+							Message: fmt.Sprintf("Truncated incorrect %s value: '%d'", cleanName, n),
+						})
+						n = 1000
+					}
+					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_fill_factor" {
 					evalVal, err := e.evalExpr(expr.Expr)
 					if err != nil || evalVal == nil {

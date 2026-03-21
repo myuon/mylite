@@ -1325,7 +1325,6 @@ var skipTests = map[string]bool{
 	"sys_vars/innodb_ft_aux_table_basic":                      true,
 	"sys_vars/innodb_ft_enable_diag_print_basic":              true,
 	"sys_vars/innodb_ft_enable_stopword_basic":                true,
-	"sys_vars/innodb_ft_num_word_optimize_basic":              true,
 	"sys_vars/innodb_ft_result_cache_limit_basic":             true,
 	"sys_vars/innodb_ft_server_stopword_table_basic":          true,
 	"sys_vars/innodb_ft_user_stopword_table_basic":            true,
