@@ -1360,7 +1360,6 @@ var skipTests = map[string]bool{
 	"sys_vars/innodb_purge_rseg_truncate_frequency_basic":     true,
 	"sys_vars/innodb_purge_threads_basic":                     true,
 	"sys_vars/innodb_random_read_ahead_basic":                 true,
-	"sys_vars/innodb_read_ahead_threshold_basic":              true,
 	"sys_vars/innodb_redo_log_archive_dirs_basic":             true,
 	"sys_vars/innodb_redo_log_encrypt_basic":                  true,
 	"sys_vars/innodb_replication_delay_basic":                 true,
