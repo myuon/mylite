@@ -1301,7 +1301,6 @@ var skipTests = map[string]bool{
 	"sys_vars/innodb_cmp_per_index_enabled_basic":             true,
 	"sys_vars/innodb_commit_concurrency_basic":                true,
 	"sys_vars/innodb_compression_failure_threshold_pct_basic": true,
-	"sys_vars/innodb_compression_level_basic":                 true,
 	"sys_vars/innodb_compression_pad_pct_max_basic":           true,
 	"sys_vars/innodb_concurrency_tickets_basic":               true,
 	"sys_vars/innodb_data_home_dir_basic":                     true,

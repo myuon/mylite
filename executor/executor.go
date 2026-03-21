@@ -3853,6 +3853,32 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						}
 					}
 					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+				} else if cleanName == "innodb_compression_level" {
+					// INTEGER only, range 0..9.
+					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
+						litStr := strings.TrimSpace(sqlparser.String(lit))
+						if strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"") || strings.ContainsAny(litStr, ".eE") {
+							return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+						}
+					}
+					evalVal, err := e.evalExpr(expr.Expr)
+					if err != nil || evalVal == nil {
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+					}
+					n := toInt64(evalVal)
+					if n < 0 || n > 9 {
+						e.warnings = append(e.warnings, Warning{
+							Level:   "Warning",
+							Code:    1292,
+							Message: fmt.Sprintf("Truncated incorrect %s value: '%d'", cleanName, n),
+						})
+						if n < 0 {
+							n = 0
+						} else {
+							n = 9
+						}
+					}
+					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_fill_factor" {
 					evalVal, err := e.evalExpr(expr.Expr)
 					if err != nil || evalVal == nil {
@@ -13638,6 +13664,7 @@ var sysVarGlobalOnly = map[string]bool{
 	"innodb_change_buffer_max_size":            true,
 	"innodb_cmp_per_index_enabled":             true,
 	"innodb_commit_concurrency":                true,
+	"innodb_compression_level":                 true,
 	"innodb_compression_failure_threshold_pct": true,
 	"innodb_compression_pad_pct_max":           true,
 	"innodb_concurrency_tickets":               true,
