@@ -570,7 +570,6 @@ var skipTests = map[string]bool{
 	"innodb/innodb_stats_auto_recalc":             true,
 	"innodb/innodb_stats_auto_recalc_ddl":         true,
 	"innodb/innodb_stats_drop_locked":             true,
-	"innodb/innodb_stats_flag_global_off":         true,
 	"innodb/innodb_stats_long_names":              true,
 	"innodb/innodb_stats_sample_pages":            true,
 	"innodb/innodb_stats_table_flag_sample_pages": true,
