@@ -2294,7 +2294,8 @@ func (e *Executor) explainResultForType(explainType sqlparser.ExplainType, expla
 }
 
 func (e *Executor) Execute(query string) (*Result, error) {
-	trimmed := strings.TrimSpace(query)
+	trimmed := stripLeadingCStyleComments(strings.TrimSpace(query))
+	query = trimmed
 	e.currentQuery = trimmed
 	// Clear per-query subquery cache so non-correlated IN subqueries
 	// are only evaluated once within the same top-level statement.
@@ -2867,6 +2868,22 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return &Result{}, nil
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %T", s)
+	}
+}
+
+// stripLeadingCStyleComments removes leading /* ... */ comment blocks and
+// surrounding whitespace.
+func stripLeadingCStyleComments(s string) string {
+	for {
+		trimmed := strings.TrimSpace(s)
+		if !strings.HasPrefix(trimmed, "/*") {
+			return trimmed
+		}
+		end := strings.Index(trimmed, "*/")
+		if end < 0 {
+			return trimmed
+		}
+		s = trimmed[end+2:]
 	}
 }
 
@@ -3762,14 +3779,16 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					}
 					e.globalVars[cleanName] = tmpPath
 				} else if cleanName == "innodb_commit_concurrency" {
-					// innodb_commit_concurrency can only remain at 0 once set to 0
+					// innodb_commit_concurrency cannot transition between 0 and non-zero.
 					evalVal, _ := e.evalExpr(expr.Expr)
 					newVal := toInt64(evalVal)
 					currentVal := e.globalVars[cleanName]
 					if currentVal == "" {
 						currentVal = e.startupVars[cleanName]
 					}
-					if currentVal == "0" && newVal != 0 {
+					curIsZero := currentVal == "0"
+					newIsZero := newVal == 0
+					if curIsZero != newIsZero {
 						return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'innodb_commit_concurrency' can't be set to the value of '%v'", evalVal))
 					}
 					e.globalVars[cleanName] = fmt.Sprintf("%d", newVal)
@@ -3860,6 +3879,22 @@ func (e *Executor) resolveSystemVarInValue(val string) string {
 func (e *Executor) handleRawSet(raw string) error {
 	// Handle user variables: SET @var = value or SET @var := value
 	trimmed := strings.TrimSpace(raw)
+	upperTrimmed := strings.ToUpper(trimmed)
+	if strings.HasPrefix(upperTrimmed, "SET STARTUP ") {
+		rest := strings.TrimSpace(trimmed[len("SET STARTUP "):])
+		if eqIdx := strings.Index(rest, "="); eqIdx > 0 {
+			varName := strings.TrimSpace(strings.ToLower(rest[:eqIdx]))
+			if err := e.handleRawSet("SET GLOBAL " + rest); err != nil {
+				return err
+			}
+			if gv, ok := e.globalVars[varName]; ok {
+				e.startupVars[varName] = gv
+			} else {
+				delete(e.startupVars, varName)
+			}
+			return nil
+		}
+	}
 	if strings.HasPrefix(strings.ToUpper(trimmed), "SET ") {
 		rest := strings.TrimSpace(trimmed[4:])
 		if strings.HasPrefix(rest, "@") && !strings.HasPrefix(rest, "@@") {
@@ -14508,6 +14543,28 @@ func (e *Executor) buildVariablesMap() map[string]string {
 	}
 
 	// Override with any SET GLOBAL/SESSION values
+	for name, val := range e.startupVars {
+		// Apply minimum/maximum constraints for known variables
+		if name == "innodb_stats_transient_sample_pages" || name == "innodb_stats_persistent_sample_pages" {
+			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n < 1 {
+				val = "1"
+			}
+		}
+		if defaultVal, ok := vars[name]; ok {
+			upperDefault := strings.ToUpper(defaultVal)
+			if upperDefault == "ON" || upperDefault == "OFF" {
+				upperVal := strings.ToUpper(val)
+				if upperVal == "1" || upperVal == "ON" || upperVal == "TRUE" || upperVal == "YES" {
+					val = "ON"
+				} else if upperVal == "0" || upperVal == "OFF" || upperVal == "FALSE" || upperVal == "NO" {
+					val = "OFF"
+				}
+			}
+		}
+		vars[name] = val
+	}
+
+	// Override with any SET GLOBAL/SESSION values
 	for name, val := range e.globalVars {
 		// Apply minimum/maximum constraints for known variables
 		if name == "innodb_stats_transient_sample_pages" || name == "innodb_stats_persistent_sample_pages" {
@@ -15396,6 +15453,15 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 				}
 			}
 			return sysVarStringToSelectValueForVar(gv, name), nil
+		}
+		// Fall back to startup variables if present.
+		if sv, ok := e.startupVars[name]; ok {
+			if name == "innodb_stats_transient_sample_pages" || name == "innodb_stats_persistent_sample_pages" {
+				if n, err := strconv.ParseInt(sv, 10, 64); err == nil && n < 1 {
+					sv = "1"
+				}
+			}
+			return sysVarStringToSelectValueForVar(sv, name), nil
 		}
 		switch name {
 		case "version_comment":

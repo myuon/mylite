@@ -424,7 +424,6 @@ var skipTests = map[string]bool{
 	// ERROR: DROP PROCEDURE that doesn't exist
 	"innodb/innodb_bug30919": true,
 	// ERROR: Unsupported innodb_commit_concurrency variable
-	"innodb/innodb_bug42101-nonzero": true,
 	// ERROR: Subquery returns more than 1 row
 	"innodb/innodb_bug42419": true,
 	// ERROR: Data too long for column with multi-byte chars
