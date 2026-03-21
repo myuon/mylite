@@ -3559,11 +3559,19 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				cleanName = strings.TrimPrefix(cleanName, "local.")
 				// Handle DEFAULT: restore to default value (or emulate known MySQL special defaults).
 				if _, isDefault := expr.Expr.(*sqlparser.Default); isDefault || strings.ToUpper(val) == "DEFAULT" {
-					if cleanName == "innodb_io_capacity_max" {
+					if cleanName == "connect_timeout" {
+						e.globalVars[cleanName] = "10"
+					} else if cleanName == "innodb_io_capacity_max" {
 						e.globalVars[cleanName] = "4294967295"
 					} else {
 						delete(e.globalVars, cleanName)
 					}
+				} else if rng, ok := sysVarIntRange[cleanName]; ok {
+					clamped, err := e.clampIntVar(cleanName, expr.Expr, rng.Min, rng.Max, rng.IsUnsigned)
+					if err != nil {
+						return nil, err
+					}
+					e.globalVars[cleanName] = clamped
 				} else if cleanName == "innodb_io_capacity_max" {
 					// INTEGER only, minimum 100, and cannot be set lower than innodb_io_capacity.
 					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
@@ -4078,43 +4086,13 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				} else {
 					// Evaluate expression
 					evalVal, err := e.evalExpr(expr.Expr)
-					if err == nil && evalVal != nil {
-						// For boolean variables, validate the value
-						if isBooleanVariable(cleanName) {
-							if _, isLit := expr.Expr.(*sqlparser.Literal); isLit {
-								litStr := sqlparser.String(expr.Expr)
-								// Remove quotes for string literals
-								unq := strings.Trim(litStr, "'\"")
-								// Reject float literals (1.1, 1e1, etc.)
-								if strings.ContainsAny(litStr, ".eE") && !strings.EqualFold(unq, "ON") && !strings.EqualFold(unq, "OFF") {
-									return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
-								}
-								// Reject invalid string values (not ON/OFF/0/1/TRUE/FALSE/YES/NO)
-								upperUnq := strings.ToUpper(unq)
-								if strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"") {
-									if upperUnq != "ON" && upperUnq != "OFF" && upperUnq != "0" && upperUnq != "1" &&
-										upperUnq != "TRUE" && upperUnq != "FALSE" && upperUnq != "YES" && upperUnq != "NO" {
-										return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", cleanName, unq))
-									}
-								}
-							}
-							// For integer values, clamp: any non-zero integer -> "1" (ON), zero -> "0" (OFF)
-							valStr := fmt.Sprintf("%v", evalVal)
-							if n, err := strconv.ParseInt(valStr, 10, 64); err == nil {
-								if n != 0 && n != 1 {
-									e.warnings = append(e.warnings, Warning{
-										Level:   "Warning",
-										Code:    1292,
-										Message: fmt.Sprintf("Truncated incorrect %s value: '%s'", cleanName, valStr),
-									})
-								}
-								if n != 0 {
-									evalVal = int64(1)
-								} else {
-									evalVal = int64(0)
-								}
-							}
+					if isBooleanVariable(cleanName) {
+						boolVal, bErr := normalizeBooleanSetValue(cleanName, expr.Expr, evalVal)
+						if bErr != nil {
+							return nil, bErr
 						}
+						e.globalVars[cleanName] = boolVal
+					} else if err == nil && evalVal != nil {
 						e.globalVars[cleanName] = fmt.Sprintf("%v", evalVal)
 					} else if err == nil && evalVal == nil {
 						// nil means NULL - store empty or delete
@@ -11526,6 +11504,9 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 	for _, expr := range stmt.SelectExprs.Exprs {
 		switch se := expr.(type) {
 		case *sqlparser.AliasedExpr:
+			if err := validateNoFromExprRefs(se.Expr); err != nil {
+				return nil, err
+			}
 			name := ""
 			if !se.As.IsEmpty() {
 				name = se.As.String()
@@ -11557,6 +11538,23 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 		Rows:        [][]interface{}{values},
 		IsResultSet: true,
 	}, nil
+}
+
+func validateNoFromExprRefs(expr sqlparser.Expr) error {
+	var walkErr error
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		col, ok := node.(*sqlparser.ColName)
+		if !ok {
+			return true, nil
+		}
+		if !col.Qualifier.IsEmpty() {
+			walkErr = mysqlError(1051, "42S02", fmt.Sprintf("Unknown table '%s' in field list", col.Qualifier.Name.String()))
+			return false, nil
+		}
+		walkErr = mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'field list'", col.Name.String()))
+		return false, nil
+	}, expr)
+	return walkErr
 }
 
 // exprReferencesTable checks if a subquery's FROM clause contains a reference
@@ -14064,6 +14062,270 @@ var sysVarBoolean = map[string]bool{
 
 func isBooleanVariable(name string) bool {
 	return sysVarBoolean[name]
+}
+
+type intVarRange struct {
+	Min        int64
+	Max        uint64
+	IsUnsigned bool
+}
+
+var sysVarIntRange = map[string]intVarRange{
+	"auto_increment_increment":                 {Min: 1, Max: 65535, IsUnsigned: true},
+	"auto_increment_offset":                    {Min: 1, Max: 65535, IsUnsigned: true},
+	"connect_timeout":                          {Min: 2, Max: 31536000, IsUnsigned: true},
+	"default_week_format":                      {Min: 0, Max: 7, IsUnsigned: true},
+	"delayed_insert_timeout":                   {Min: 1, Max: 4294967286, IsUnsigned: true},
+	"div_precision_increment":                  {Min: 0, Max: 30, IsUnsigned: true},
+	"innodb_compression_failure_threshold_pct": {Min: 0, Max: 100, IsUnsigned: true},
+	"innodb_compression_pad_pct_max":           {Min: 0, Max: 75, IsUnsigned: true},
+	"innodb_flush_log_at_timeout":              {Min: 0, Max: 2700, IsUnsigned: true},
+	"innodb_flushing_avg_loops":                {Min: 0, Max: 70, IsUnsigned: true},
+	"innodb_max_purge_lag":                     {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"innodb_max_purge_lag_delay":               {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"innodb_purge_batch_size":                  {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"innodb_purge_rseg_truncate_frequency":     {Min: 1, Max: 128, IsUnsigned: true},
+	"innodb_sync_spin_loops":                   {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"innodb_thread_concurrency":                {Min: 0, Max: 1000, IsUnsigned: true},
+	"lock_wait_timeout":                        {Min: 1, Max: 31536000, IsUnsigned: true},
+	"max_connections":                          {Min: 1, Max: 100000, IsUnsigned: true},
+	"mysqlx_connect_timeout":                   {Min: 1, Max: 31536000, IsUnsigned: true},
+	"mysqlx_max_connections":                   {Min: 1, Max: 100000, IsUnsigned: true},
+	"rpl_stop_slave_timeout":                   {Min: 2, Max: 31536000, IsUnsigned: true},
+	"sync_binlog":                              {Min: 0, Max: 4294967295, IsUnsigned: true},
+}
+
+func parseStrictIntegerAssignment(expr sqlparser.Expr, evalVal interface{}) (int64, uint64, bool, string, error) {
+	if lit, isLit := expr.(*sqlparser.Literal); isLit {
+		litStr := strings.TrimSpace(sqlparser.String(lit))
+		raw := strings.Trim(litStr, "'\"")
+		if strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"") || strings.ContainsAny(litStr, ".eE") {
+			return 0, 0, false, raw, errors.New("non-integer literal")
+		}
+		if strings.HasPrefix(litStr, "-") {
+			n, err := strconv.ParseInt(litStr, 10, 64)
+			if err != nil {
+				return 0, 0, false, raw, errors.New("invalid integer")
+			}
+			return n, 0, true, raw, nil
+		}
+		u, err := strconv.ParseUint(litStr, 10, 64)
+		if err != nil {
+			return 0, 0, false, raw, errors.New("invalid integer")
+		}
+		return 0, u, false, raw, nil
+	}
+	switch v := evalVal.(type) {
+	case int:
+		n := int64(v)
+		return n, uint64(n), n < 0, strconv.FormatInt(n, 10), nil
+	case int8:
+		n := int64(v)
+		return n, uint64(n), n < 0, strconv.FormatInt(n, 10), nil
+	case int16:
+		n := int64(v)
+		return n, uint64(n), n < 0, strconv.FormatInt(n, 10), nil
+	case int32:
+		n := int64(v)
+		return n, uint64(n), n < 0, strconv.FormatInt(n, 10), nil
+	case int64:
+		return v, uint64(v), v < 0, strconv.FormatInt(v, 10), nil
+	case uint:
+		u := uint64(v)
+		return int64(u), u, false, strconv.FormatUint(u, 10), nil
+	case uint8:
+		u := uint64(v)
+		return int64(u), u, false, strconv.FormatUint(u, 10), nil
+	case uint16:
+		u := uint64(v)
+		return int64(u), u, false, strconv.FormatUint(u, 10), nil
+	case uint32:
+		u := uint64(v)
+		return int64(u), u, false, strconv.FormatUint(u, 10), nil
+	case uint64:
+		return int64(v), v, false, strconv.FormatUint(v, 10), nil
+	case bool:
+		if v {
+			return 1, 1, false, "1", nil
+		}
+		return 0, 0, false, "0", nil
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return 0, 0, false, s, errors.New("non-integer string")
+		}
+		up := strings.ToUpper(s)
+		if up == "TRUE" {
+			return 1, 1, false, "1", nil
+		}
+		if up == "FALSE" {
+			return 0, 0, false, "0", nil
+		}
+		if strings.ContainsAny(s, ".eE") {
+			return 0, 0, false, s, errors.New("non-integer string")
+		}
+		if strings.HasPrefix(s, "-") {
+			n, err := strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				return 0, 0, false, s, errors.New("invalid integer")
+			}
+			return n, 0, true, s, nil
+		}
+		u, err := strconv.ParseUint(s, 10, 64)
+		if err != nil {
+			return 0, 0, false, s, errors.New("invalid integer")
+		}
+		return 0, u, false, s, nil
+	default:
+		return 0, 0, false, fmt.Sprintf("%v", evalVal), errors.New("unsupported type")
+	}
+}
+
+func (e *Executor) clampIntVar(name string, expr sqlparser.Expr, min int64, max uint64, isUnsigned bool) (string, error) {
+	evalVal, err := e.evalExpr(expr)
+	if err != nil {
+		evalVal = nil
+	}
+	n, u, isNegative, raw, parseErr := parseStrictIntegerAssignment(expr, evalVal)
+	if parseErr != nil {
+		return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+	}
+	warn := func() {
+		e.warnings = append(e.warnings, Warning{
+			Level:   "Warning",
+			Code:    1292,
+			Message: fmt.Sprintf("Truncated incorrect %s value: '%s'", name, raw),
+		})
+	}
+	if isUnsigned {
+		var out uint64
+		if isNegative {
+			out = uint64(min)
+			warn()
+		} else {
+			out = u
+		}
+		if out < uint64(min) {
+			out = uint64(min)
+			warn()
+		}
+		if out > max {
+			out = max
+			warn()
+		}
+		return strconv.FormatUint(out, 10), nil
+	}
+	maxI := int64(max)
+	out := n
+	if !isNegative {
+		if u > math.MaxInt64 {
+			out = math.MaxInt64
+			warn()
+		} else {
+			out = int64(u)
+		}
+	}
+	if out < min {
+		out = min
+		warn()
+	}
+	if out > maxI {
+		out = maxI
+		warn()
+	}
+	return strconv.FormatInt(out, 10), nil
+}
+
+func normalizeBooleanToken(raw string) (int64, bool, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0, false, false
+	}
+	up := strings.ToUpper(strings.Trim(s, "'\""))
+	switch up {
+	case "ON", "TRUE", "YES":
+		return 1, true, false
+	case "OFF", "FALSE", "NO":
+		return 0, true, false
+	}
+	if strings.Contains(s, ".") {
+		if _, err := strconv.ParseFloat(s, 64); err == nil {
+			return 0, false, true
+		}
+	}
+	if strings.ContainsAny(s, "eE") {
+		if _, err := strconv.ParseFloat(s, 64); err == nil {
+			return 0, false, true
+		}
+	}
+	if strings.HasPrefix(s, "'") || strings.HasPrefix(s, "\"") {
+		inner := strings.Trim(s, "'\"")
+		if inner == "0" {
+			return 0, true, false
+		}
+		if inner == "1" {
+			return 1, true, false
+		}
+		return 0, false, false
+	}
+	if strings.HasPrefix(s, "-") {
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return 0, false, false
+		}
+		if n == 0 || n == 1 {
+			return n, true, false
+		}
+		return n, false, false
+	}
+	if u, err := strconv.ParseUint(s, 10, 64); err == nil {
+		if u == 0 || u == 1 {
+			return int64(u), true, false
+		}
+		return int64(u), false, false
+	}
+	return 0, false, false
+}
+
+func normalizeBooleanSetValue(name string, expr sqlparser.Expr, evalVal interface{}) (string, error) {
+	if lit, isLit := expr.(*sqlparser.Literal); isLit {
+		litStr := strings.TrimSpace(sqlparser.String(lit))
+		n, ok, typeErr := normalizeBooleanToken(litStr)
+		if typeErr {
+			return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+		}
+		if !ok {
+			unq := strings.Trim(litStr, "'\"")
+			return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", name, unq))
+		}
+		return strconv.FormatInt(n, 10), nil
+	}
+	switch v := evalVal.(type) {
+	case bool:
+		if v {
+			return "1", nil
+		}
+		return "0", nil
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		n, ok, _ := normalizeBooleanToken(fmt.Sprintf("%v", v))
+		if !ok {
+			return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%v'", name, v))
+		}
+		return strconv.FormatInt(n, 10), nil
+	case float32, float64:
+		return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+	case string:
+		n, ok, typeErr := normalizeBooleanToken(v)
+		if typeErr {
+			return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+		}
+		if !ok {
+			return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", name, strings.Trim(v, "'\"")))
+		}
+		return strconv.FormatInt(n, 10), nil
+	default:
+		return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%v'", name, evalVal))
+	}
 }
 
 // checkSelectScopeErrors checks if a SELECT statement contains @@session.X or @@local.X
@@ -17698,6 +17960,10 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		lenVal, err := e.evalExpr(v.Exprs[1])
 		if err != nil {
+			var ov *intOverflowError
+			if errors.As(err, &ov) {
+				return nil, nil
+			}
 			return nil, err
 		}
 		s := []rune(toString(strVal))
@@ -17722,6 +17988,10 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		lenVal, err := e.evalExpr(v.Exprs[1])
 		if err != nil {
+			var ov *intOverflowError
+			if errors.As(err, &ov) {
+				return nil, nil
+			}
 			return nil, err
 		}
 		s := []rune(toString(strVal))
@@ -18685,6 +18955,14 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		lenVal, err := e.evalExpr(v.Exprs[1])
 		if err != nil {
+			var ov *intOverflowError
+			if errors.As(err, &ov) {
+				if lit, ok := v.Exprs[1].(*sqlparser.Literal); ok && lit.Type == sqlparser.IntVal {
+					if bi, ok := new(big.Int).SetString(lit.Val, 10); ok && bi.Sign() >= 0 && bi.Cmp(big.NewInt(67108864)) > 0 {
+						return nil, nil
+					}
+				}
+			}
 			return nil, err
 		}
 		padVal, err := e.evalExpr(v.Exprs[2])
@@ -18729,6 +19007,14 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		lenVal, err := e.evalExpr(v.Exprs[1])
 		if err != nil {
+			var ov *intOverflowError
+			if errors.As(err, &ov) {
+				if lit, ok := v.Exprs[1].(*sqlparser.Literal); ok && lit.Type == sqlparser.IntVal {
+					if bi, ok := new(big.Int).SetString(lit.Val, 10); ok && bi.Sign() >= 0 && bi.Cmp(big.NewInt(67108864)) > 0 {
+						return nil, nil
+					}
+				}
+			}
 			return nil, err
 		}
 		padVal, err := e.evalExpr(v.Exprs[2])
@@ -21945,6 +22231,10 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 	case "lpad":
 		args, err := evalArgs()
 		if err != nil {
+			var ov *intOverflowError
+			if errors.As(err, &ov) {
+				return nil, nil
+			}
 			return nil, err
 		}
 		if len(args) < 3 || args[0] == nil || args[1] == nil || args[2] == nil {
@@ -21976,6 +22266,10 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 	case "rpad":
 		args, err := evalArgs()
 		if err != nil {
+			var ov *intOverflowError
+			if errors.As(err, &ov) {
+				return nil, nil
+			}
 			return nil, err
 		}
 		if len(args) < 3 || args[0] == nil || args[1] == nil || args[2] == nil {
