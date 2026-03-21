@@ -1344,7 +1344,6 @@ var skipTests = map[string]bool{
 	"sys_vars/innodb_log_spin_cpu_pct_hwm":                    true,
 	"sys_vars/innodb_log_wait_for_flush_spin_hwm":             true,
 	"sys_vars/innodb_log_write_ahead_size_basic":              true,
-	"sys_vars/innodb_lru_scan_depth_basic":                    true,
 	"sys_vars/innodb_max_dirty_pages_pct_basic":               true,
 	"sys_vars/innodb_max_dirty_pages_pct_lwm_basic":           true,
 	"sys_vars/innodb_max_purge_lag_basic":                     true,
