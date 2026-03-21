@@ -4154,7 +4154,46 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				} else {
 					// Evaluate expression
 					evalVal, err := e.evalExpr(expr.Expr)
-					if isBooleanVariable(cleanName) {
+					if enumVals, isEnum := sysVarEnumValues[cleanName]; isEnum && len(enumVals) > 0 {
+						enumVal, enumErr := normalizeEnumSetValue(cleanName, expr.Expr, evalVal)
+						if enumErr != nil {
+							return nil, enumErr
+						}
+						e.globalVars[cleanName] = enumVal
+					} else if isBooleanVariable(cleanName) {
+						// MySQL keeps the old value for this historical bug-compat path.
+						if cleanName == "innodb_adaptive_flushing" {
+							if lit, ok := expr.Expr.(*sqlparser.Literal); ok {
+								litStr := strings.TrimSpace(sqlparser.String(lit))
+								if strings.HasPrefix(litStr, "-") {
+									if n, pErr := strconv.ParseInt(litStr, 10, 64); pErr == nil && n < 0 {
+										continue
+									}
+								}
+							}
+							switch v := evalVal.(type) {
+							case int:
+								if v < 0 {
+									continue
+								}
+							case int8:
+								if v < 0 {
+									continue
+								}
+							case int16:
+								if v < 0 {
+									continue
+								}
+							case int32:
+								if v < 0 {
+									continue
+								}
+							case int64:
+								if v < 0 {
+									continue
+								}
+							}
+						}
 						boolVal, bErr := normalizeBooleanSetValue(cleanName, expr.Expr, evalVal)
 						if bErr != nil {
 							return nil, bErr
@@ -14091,6 +14130,18 @@ var sysVarEnumSet = map[string]bool{
 	"relay_log_info_repository":       true,
 }
 
+// sysVarEnumValues maps numeric/string assignments to canonical enum names.
+var sysVarEnumValues = map[string]map[string]string{
+	"binlog_format": {
+		"0":         "MIXED",
+		"1":         "STATEMENT",
+		"2":         "ROW",
+		"MIXED":     "MIXED",
+		"STATEMENT": "STATEMENT",
+		"ROW":       "ROW",
+	},
+}
+
 // sysVarSessionOnly contains system variables that only exist at SESSION scope.
 // SELECT @@global.var for these should return error 1238.
 var sysVarSessionOnly = map[string]bool{
@@ -14382,6 +14433,37 @@ func normalizeBooleanToken(raw string) (int64, bool, bool) {
 		return int64(u), false, false
 	}
 	return 0, false, false
+}
+
+func normalizeEnumSetValue(name string, expr sqlparser.Expr, evalVal interface{}) (string, error) {
+	enumMap, ok := sysVarEnumValues[name]
+	if !ok {
+		return "", fmt.Errorf("unknown enum variable")
+	}
+	normalize := func(s string) (string, bool) {
+		up := strings.ToUpper(strings.TrimSpace(strings.Trim(s, "'\"")))
+		v, ok := enumMap[up]
+		return v, ok
+	}
+	if lit, isLit := expr.(*sqlparser.Literal); isLit {
+		litStr := strings.TrimSpace(sqlparser.String(lit))
+		if strings.ContainsAny(litStr, ".eE") {
+			return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+		}
+		if v, ok := normalize(litStr); ok {
+			return v, nil
+		}
+		return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", name, strings.Trim(litStr, "'\"")))
+	}
+	switch v := evalVal.(type) {
+	case float32, float64:
+		return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+	default:
+		if mapped, ok := normalize(fmt.Sprintf("%v", v)); ok {
+			return mapped, nil
+		}
+		return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%v'", name, v))
+	}
 }
 
 func normalizeBooleanSetValue(name string, expr sqlparser.Expr, evalVal interface{}) (string, error) {
