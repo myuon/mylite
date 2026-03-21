@@ -436,7 +436,6 @@ var skipTests = map[string]bool{
 	"innodb/innodb_bug59641": true,
 	// ERROR: CHECK TABLE not supported
 	"innodb/innodb_bulk_create_index":       true,
-	"innodb/innodb_bulk_create_index_small": true,
 	// TIMEOUT: Replication bulk create index
 	"innodb/innodb_bulk_create_index_replication": true,
 	// ERROR: Table doesn't exist after force recovery
