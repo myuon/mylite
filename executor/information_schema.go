@@ -44,7 +44,7 @@ func normalizeIndexColumnName(col string) string {
 }
 
 func (e *Executor) informationSchemaStatsExpiryZero() bool {
-	v, ok := e.globalVars["information_schema_stats_expiry"]
+	v, ok := e.getSysVar("information_schema_stats_expiry")
 	if !ok {
 		return false
 	}

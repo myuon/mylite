@@ -2357,6 +2357,19 @@ func (ctx *execContext) substituteVars(s string) string {
 func applyMasterOpt(content string, ctx *execContext) {
 	for _, token := range strings.Fields(content) {
 		token = strings.TrimPrefix(token, "--")
+		// Handle boolean flags without = (e.g., --loose-enable-performance-schema)
+		if !strings.Contains(token, "=") {
+			key := token
+			key = strings.TrimPrefix(key, "loose-")
+			if strings.HasPrefix(key, "enable-") {
+				key = strings.TrimPrefix(key, "enable-")
+				varKey := strings.ReplaceAll(key, "-", "_")
+				ctx.variables["$"+key] = "1"
+				ctx.variables["$"+varKey] = "1"
+				ctx.db.Exec(fmt.Sprintf("SET STARTUP %s = 1", varKey)) //nolint:errcheck
+			}
+			continue
+		}
 		if strings.Contains(token, "=") {
 			parts := strings.SplitN(token, "=", 2)
 			key := strings.TrimSpace(parts[0])
@@ -2369,6 +2382,15 @@ func applyMasterOpt(content string, ctx *execContext) {
 			} else if strings.HasSuffix(strings.ToLower(val), "m") {
 				if n, err := strconv.Atoi(val[:len(val)-1]); err == nil {
 					val = strconv.Itoa(n * 1024 * 1024)
+				}
+			}
+			// Strip MySQL --loose- prefix (accepts unknown options without error)
+			key = strings.TrimPrefix(key, "loose-")
+			// Strip --enable- prefix (boolean true)
+			if strings.HasPrefix(key, "enable-") {
+				key = strings.TrimPrefix(key, "enable-")
+				if val == "" {
+					val = "1"
 				}
 			}
 			// Normalize hyphens to underscores for MySQL variable names

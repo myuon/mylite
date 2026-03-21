@@ -157,8 +157,10 @@ type Executor struct {
 	preparedStmts map[string]string
 	// tempTables stores temporary tables per session (table name -> true).
 	tempTables map[string]bool
-	// globalVars stores SET GLOBAL/SESSION variable overrides.
-	globalVars map[string]string
+	// globalScopeVars stores SET GLOBAL variable overrides.
+	globalScopeVars map[string]string
+	// sessionScopeVars stores SET SESSION/LOCAL variable overrides.
+	sessionScopeVars map[string]string
 	// startupVars stores variable values set at server startup (e.g., from master.opt).
 	// These are used as default values when SET ... = DEFAULT is used.
 	startupVars map[string]string
@@ -199,6 +201,53 @@ func (e *Executor) addWarning(level string, code int, message string) {
 	e.warnings = append(e.warnings, Warning{Level: level, Code: code, Message: message})
 }
 
+// getSysVar reads a system variable with proper scope resolution:
+// session -> global -> (not found). Used for reads that don't specify scope.
+func (e *Executor) getSysVar(name string) (string, bool) {
+	if v, ok := e.sessionScopeVars[name]; ok {
+		return v, true
+	}
+	if v, ok := e.globalScopeVars[name]; ok {
+		return v, true
+	}
+	return "", false
+}
+
+// getSysVarGlobal reads a global-scoped system variable.
+func (e *Executor) getSysVarGlobal(name string) (string, bool) {
+	v, ok := e.globalScopeVars[name]
+	return v, ok
+}
+
+// getSysVarSession reads a session-scoped system variable (session then global).
+func (e *Executor) getSysVarSession(name string) (string, bool) {
+	if v, ok := e.sessionScopeVars[name]; ok {
+		return v, true
+	}
+	if v, ok := e.globalScopeVars[name]; ok {
+		return v, true
+	}
+	return "", false
+}
+
+// setSysVar stores a system variable in the appropriate scope map.
+func (e *Executor) setSysVar(name string, value string, isGlobal bool) {
+	if isGlobal {
+		e.globalScopeVars[name] = value
+	} else {
+		e.sessionScopeVars[name] = value
+	}
+}
+
+// deleteSysVar deletes a system variable from the appropriate scope map (for DEFAULT).
+func (e *Executor) deleteSysVar(name string, isGlobal bool) {
+	if isGlobal {
+		delete(e.globalScopeVars, name)
+	} else {
+		delete(e.sessionScopeVars, name)
+	}
+}
+
 // parser returns the cached SQL parser, creating it lazily.
 func (e *Executor) parser() *sqlparser.Parser {
 	if e.sqlParser == nil {
@@ -220,7 +269,8 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		userVars:      make(map[string]interface{}),
 		preparedStmts: make(map[string]string),
 		tempTables:    make(map[string]bool),
-		globalVars:    make(map[string]string),
+		globalScopeVars:  make(map[string]string),
+		sessionScopeVars: make(map[string]string),
 		startupVars: map[string]string{
 			"innodb_commit_concurrency": "0",
 		},
@@ -796,7 +846,7 @@ func (e *Executor) innodbStatsPersistentEnabled(def *catalog.TableDef) bool {
 	if def != nil && def.StatsPersistent != nil {
 		return *def.StatsPersistent != 0
 	}
-	if v, ok := e.globalVars["innodb_stats_persistent"]; ok && v != "" {
+	if v, ok := e.getSysVar("innodb_stats_persistent"); ok && v != "" {
 		return v != "0" && !strings.EqualFold(v, "OFF")
 	}
 	return true
@@ -806,7 +856,7 @@ func (e *Executor) innodbStatsAutoRecalcEnabled(def *catalog.TableDef) bool {
 	if def != nil && def.StatsAutoRecalc != nil {
 		return *def.StatsAutoRecalc != 0
 	}
-	if v, ok := e.globalVars["innodb_stats_auto_recalc"]; ok && v != "" {
+	if v, ok := e.getSysVar("innodb_stats_auto_recalc"); ok && v != "" {
 		return v != "0" && !strings.EqualFold(v, "OFF")
 	}
 	return true
@@ -3586,9 +3636,9 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		switch name {
 		case "names":
 			charset := strings.ToLower(val)
-			e.globalVars["character_set_client"] = charset
-			e.globalVars["character_set_connection"] = charset
-			e.globalVars["character_set_results"] = charset
+			e.sessionScopeVars["character_set_client"] = charset
+			e.sessionScopeVars["character_set_connection"] = charset
+			e.sessionScopeVars["character_set_results"] = charset
 		case "sql_mode":
 			if strings.ToUpper(val) == "DEFAULT" {
 				e.sqlMode = ""
@@ -3617,7 +3667,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				e.nextInsertID = n
 			}
 		case "character_set_client", "character_set_connection", "character_set_results":
-			e.globalVars[name] = strings.ToLower(val)
+			e.sessionScopeVars[name] = strings.ToLower(val)
 		default:
 			// Store any SET GLOBAL/SESSION variable for later retrieval
 			if name != "" {
@@ -3625,21 +3675,28 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				cleanName := strings.TrimPrefix(name, "global.")
 				cleanName = strings.TrimPrefix(cleanName, "session.")
 				cleanName = strings.TrimPrefix(cleanName, "local.")
+				isGlobal := scope == sqlparser.GlobalScope
 				// Handle DEFAULT: restore to default value (or emulate known MySQL special defaults).
 				if _, isDefault := expr.Expr.(*sqlparser.Default); isDefault || strings.ToUpper(val) == "DEFAULT" {
 					if cleanName == "connect_timeout" {
-						e.globalVars[cleanName] = "10"
+						e.setSysVar(cleanName, "10", isGlobal)
 					} else if cleanName == "innodb_io_capacity_max" {
-						e.globalVars[cleanName] = "4294967295"
+						e.setSysVar(cleanName, "4294967295", isGlobal)
 					} else {
-						delete(e.globalVars, cleanName)
+						e.deleteSysVar(cleanName, isGlobal)
 					}
 				} else if rng, ok := sysVarIntRange[cleanName]; ok {
-					clamped, err := e.clampIntVar(cleanName, expr.Expr, rng.Min, rng.Max, rng.IsUnsigned)
+					var clamped string
+				var err error
+				if rng.BlockSize > 0 {
+					clamped, err = e.clampIntVar(cleanName, expr.Expr, rng.Min, rng.Max, rng.IsUnsigned, rng.BlockSize)
+				} else {
+					clamped, err = e.clampIntVar(cleanName, expr.Expr, rng.Min, rng.Max, rng.IsUnsigned)
+				}
 					if err != nil {
 						return nil, err
 					}
-					e.globalVars[cleanName] = clamped
+					e.sessionScopeVars[cleanName] = clamped
 				} else if cleanName == "innodb_io_capacity_max" {
 					// INTEGER only, minimum 100, and cannot be set lower than innodb_io_capacity.
 					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
@@ -3662,7 +3719,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						n = 100
 					}
 					minVal := int64(200)
-					if curMin, ok := e.globalVars["innodb_io_capacity"]; ok && curMin != "" {
+					if curMin, ok := e.getSysVar("innodb_io_capacity"); ok && curMin != "" {
 						if parsed, err := strconv.ParseInt(curMin, 10, 64); err == nil {
 							minVal = parsed
 						}
@@ -3678,7 +3735,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						)
 						n = minVal
 					}
-					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_stats_transient_sample_pages" || cleanName == "innodb_stats_persistent_sample_pages" {
 					// These vars accept integer values only. Float/scientific/string values are rejected.
 					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
@@ -3732,7 +3789,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						})
 						n = 1
 					}
-					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_io_capacity" {
 					// INTEGER only, minimum 100, and cannot exceed innodb_io_capacity_max.
 					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
@@ -3755,7 +3812,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						n = 100
 					}
 					maxVal := int64(2000)
-					if curMax, ok := e.globalVars["innodb_io_capacity_max"]; ok && curMax != "" {
+					if curMax, ok := e.getSysVar("innodb_io_capacity_max"); ok && curMax != "" {
 						if parsed, err := strconv.ParseInt(curMax, 10, 64); err == nil {
 							maxVal = parsed
 						}
@@ -3771,7 +3828,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						)
 						n = maxVal
 					}
-					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_lru_scan_depth" {
 					// INTEGER only, minimum 100.
 					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
@@ -3793,7 +3850,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						})
 						n = 100
 					}
-					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_old_blocks_pct" {
 					// INTEGER only, range 5..95.
 					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
@@ -3819,7 +3876,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							n = 95
 						}
 					}
-					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_old_blocks_time" {
 					// INTEGER only, minimum 0.
 					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
@@ -3841,7 +3898,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						})
 						n = 0
 					}
-					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_spin_wait_delay" {
 					// INTEGER only, range 0..1000.
 					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
@@ -3867,7 +3924,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							n = 1000
 						}
 					}
-					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_spin_wait_pause_multiplier" {
 					// INTEGER only, range 0..100.
 					var (
@@ -3923,7 +3980,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							n = 100
 						}
 					}
-					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_thread_sleep_delay" {
 					// INTEGER only, range 0..1000000.
 					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
@@ -3958,7 +4015,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							n = 1000000
 						}
 					}
-					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_read_ahead_threshold" {
 					// INTEGER only, range 0..64.
 					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
@@ -3984,7 +4041,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							n = 64
 						}
 					}
-					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_compression_level" {
 					// INTEGER only, range 0..9.
 					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
@@ -4010,7 +4067,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							n = 9
 						}
 					}
-					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_ft_num_word_optimize" {
 					// INTEGER only, minimum 1000.
 					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
@@ -4032,7 +4089,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						})
 						n = 1000
 					}
-					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_ft_result_cache_limit" {
 					// INTEGER only, range 1000000..4294967295.
 					evalVal, err := e.evalExpr(expr.Expr)
@@ -4047,7 +4104,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					if n > maxVal {
 						n = maxVal
 					}
-					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_replication_delay" {
 					// INTEGER only; negative values clamp to 0, positive uint64 values are accepted.
 					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
@@ -4068,14 +4125,14 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 								})
 								parsed = 0
 							}
-							e.globalVars[cleanName] = fmt.Sprintf("%d", parsed)
+							e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", parsed)
 							continue
 						}
 						parsed, err := strconv.ParseUint(litStr, 10, 64)
 						if err != nil {
 							return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
 						}
-						e.globalVars[cleanName] = fmt.Sprintf("%d", parsed)
+						e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", parsed)
 						continue
 					}
 					evalVal, err := e.evalExpr(expr.Expr)
@@ -4091,7 +4148,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						})
 						n = 0
 					}
-					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_fsync_threshold" {
 					// Must be non-negative and aligned to InnoDB page size (4KB); otherwise 0.
 					evalVal, err := e.evalExpr(expr.Expr)
@@ -4102,7 +4159,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					if n < 0 || (n != 0 && n%4096 != 0) {
 						n = 0
 					}
-					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_fill_factor" {
 					evalVal, err := e.evalExpr(expr.Expr)
 					if err != nil || evalVal == nil {
@@ -4121,7 +4178,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							n = 100
 						}
 					}
-					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_tmpdir" {
 					// innodb_tmpdir must be a valid path
 					evalVal, _ := e.evalExpr(expr.Expr)
@@ -4136,12 +4193,12 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							return nil, mysqlError(1231, "42000", errMsg)
 						}
 					}
-					e.globalVars[cleanName] = tmpPath
+					e.sessionScopeVars[cleanName] = tmpPath
 				} else if cleanName == "innodb_commit_concurrency" {
 					// innodb_commit_concurrency cannot transition between 0 and non-zero.
 					evalVal, _ := e.evalExpr(expr.Expr)
 					newVal := toInt64(evalVal)
-					currentVal := e.globalVars[cleanName]
+					currentVal, _ := e.getSysVar(cleanName)
 					if currentVal == "" {
 						currentVal = e.startupVars[cleanName]
 					}
@@ -4150,7 +4207,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					if curIsZero != newIsZero {
 						return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'innodb_commit_concurrency' can't be set to the value of '%v'", evalVal))
 					}
-					e.globalVars[cleanName] = fmt.Sprintf("%d", newVal)
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", newVal)
 				} else {
 					// Evaluate expression
 					evalVal, err := e.evalExpr(expr.Expr)
@@ -4159,7 +4216,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						if enumErr != nil {
 							return nil, enumErr
 						}
-						e.globalVars[cleanName] = enumVal
+						e.sessionScopeVars[cleanName] = enumVal
 					} else if isBooleanVariable(cleanName) {
 						// MySQL keeps the old value for this historical bug-compat path.
 						if cleanName == "innodb_adaptive_flushing" {
@@ -4198,14 +4255,21 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						if bErr != nil {
 							return nil, bErr
 						}
-						e.globalVars[cleanName] = boolVal
+						e.sessionScopeVars[cleanName] = boolVal
 					} else if err == nil && evalVal != nil {
-						e.globalVars[cleanName] = fmt.Sprintf("%v", evalVal)
+						e.sessionScopeVars[cleanName] = fmt.Sprintf("%v", evalVal)
 					} else if err == nil && evalVal == nil {
 						// nil means NULL - store empty or delete
-						delete(e.globalVars, cleanName)
+						delete(e.sessionScopeVars, cleanName)
 					} else {
-						e.globalVars[cleanName] = val
+						e.sessionScopeVars[cleanName] = val
+					}
+				}
+				// If SET GLOBAL was used, move the value from session to global scope.
+				if isGlobal {
+					if v, ok := e.sessionScopeVars[cleanName]; ok {
+						e.globalScopeVars[cleanName] = v
+						delete(e.sessionScopeVars, cleanName)
 					}
 				}
 			}
@@ -4252,14 +4316,14 @@ func (e *Executor) handleRawSet(raw string) error {
 		rest := strings.TrimSpace(trimmed[len("SET STARTUP "):])
 		if eqIdx := strings.Index(rest, "="); eqIdx > 0 {
 			varName := strings.TrimSpace(strings.ToLower(rest[:eqIdx]))
-			if err := e.handleRawSet("SET GLOBAL " + rest); err != nil {
-				return err
-			}
-			if gv, ok := e.globalVars[varName]; ok {
-				e.startupVars[varName] = gv
-			} else {
-				delete(e.startupVars, varName)
-			}
+			val := strings.TrimSpace(rest[eqIdx+1:])
+			val = strings.TrimSuffix(val, ";")
+			val = strings.TrimSpace(val)
+			val = strings.Trim(val, "'\"")
+			// SET STARTUP bypasses read-only and scope checks.
+			// Store directly in both globalScopeVars and startupVars.
+			e.globalScopeVars[varName] = val
+			e.startupVars[varName] = val
 			return nil
 		}
 	}
@@ -4347,6 +4411,17 @@ func (e *Executor) handleRawSet(raw string) error {
 			e.parseTimeZone(val)
 		}
 	}
+	// Detect invalid SET local.X / SET global.X / SET session.X (without @@)
+	{
+		restCheck := strings.TrimSpace(trimmed[4:])
+		restCheckLower := strings.ToLower(restCheck)
+		for _, prefix := range []string{"local.", "global.", "session."} {
+			if strings.HasPrefix(restCheckLower, prefix) && !strings.HasPrefix(restCheckLower, "@@") {
+				// This is SET local.X = Y which is a syntax error in MySQL
+				return mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", restCheck))
+			}
+		}
+	}
 	// Store any SET GLOBAL/SESSION variable generically
 	rest := strings.TrimSpace(trimmed[4:])
 	restUpper := strings.ToUpper(rest)
@@ -4374,9 +4449,9 @@ func (e *Executor) handleRawSet(raw string) error {
 		val = strings.TrimSpace(val)
 		val = strings.Trim(val, "'\"")
 		if strings.ToUpper(val) != "DEFAULT" {
-			e.globalVars[varName] = val
+			e.setSysVar(varName, val, isGlobalScope)
 		} else {
-			delete(e.globalVars, varName)
+			e.deleteSysVar(varName, isGlobalScope)
 		}
 	}
 	if strings.HasPrefix(upper, "SET NAMES ") {
@@ -4387,9 +4462,9 @@ func (e *Executor) handleRawSet(raw string) error {
 			if charset != "default" && charset != "binary" && !isKnownCharset(charset) {
 				return mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", charset))
 			}
-			e.globalVars["character_set_client"] = charset
-			e.globalVars["character_set_connection"] = charset
-			e.globalVars["character_set_results"] = charset
+			e.sessionScopeVars["character_set_client"] = charset
+			e.sessionScopeVars["character_set_connection"] = charset
+			e.sessionScopeVars["character_set_results"] = charset
 		}
 	}
 	return nil
@@ -4446,7 +4521,7 @@ func (e *Executor) isStrictMode() bool {
 
 // isInnoDBStrictMode returns true when innodb_strict_mode is ON.
 func (e *Executor) isInnoDBStrictMode() bool {
-	if v, ok := e.globalVars["innodb_strict_mode"]; ok {
+	if v, ok := e.getSysVar("innodb_strict_mode"); ok {
 		return strings.EqualFold(v, "ON") || v == "1"
 	}
 	return true // default is ON
@@ -4454,7 +4529,7 @@ func (e *Executor) isInnoDBStrictMode() bool {
 
 // getInnoDBPageSize returns the configured innodb_page_size (default 16384).
 func (e *Executor) getInnoDBPageSize() int {
-	if v, ok := e.globalVars["innodb_page_size"]; ok {
+	if v, ok := e.getSysVar("innodb_page_size"); ok {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
 		}
@@ -6621,8 +6696,8 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 		// If no explicit engine, check session default_storage_engine
 		if engine == "InnoDB" {
-			if e.globalVars != nil {
-				if eng, ok := e.globalVars["default_storage_engine"]; ok && eng != "" {
+			if e.sessionScopeVars != nil || e.globalScopeVars != nil {
+				if eng, ok := e.getSysVar("default_storage_engine"); ok && eng != "" {
 					engine = eng
 				}
 			}
@@ -9770,6 +9845,33 @@ func (e *Executor) preFilterRows(rows []storage.Row, preds []sqlparser.Expr) ([]
 }
 
 func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
+	// For no-FROM queries (without CTEs), check for bare column references FIRST.
+	// MySQL returns "Unknown column" for bare names even when the expression
+	// also contains @@session.global_var references.
+	// Note: The Vitess parser may synthesize a "dual" FROM table for queries
+	// without explicit FROM, so check both len(stmt.From)==0 and !hasTopLevelFromClause.
+	// For no-FROM queries, check for bare column references at the top level
+	// of each select expression. This catches "SELECT basedir = @@SESSION.basedir"
+	// but does NOT walk into function arguments (which may legitimately have bare names).
+	// Determine if this is a "logical" no-FROM query (original query has no FROM clause).
+	// The parser may synthesize a "dual" FROM table, and INSERT...SELECT inherits
+	// the outer query in currentQuery, so we check multiple conditions.
+	logicalNoFrom := !hasTopLevelFromClause(e.currentQuery) &&
+		!strings.HasPrefix(strings.ToLower(strings.TrimSpace(e.currentQuery)), "with ") &&
+		!strings.HasPrefix(strings.ToLower(strings.TrimSpace(e.currentQuery)), "insert ")
+	isNoFromQuery := logicalNoFrom &&
+		(stmt.With == nil || len(stmt.With.CTEs) == 0) &&
+		e.cteMap == nil
+	if isNoFromQuery {
+		for _, expr := range stmt.SelectExprs.Exprs {
+			if se, ok := expr.(*sqlparser.AliasedExpr); ok {
+				if err := validateNoFromTopLevelColRefs(se.Expr); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
 	// Apply system-variable scope checks before any SELECT execution path.
 	if err := e.checkSelectScopeErrors(stmt); err != nil {
 		return nil, err
@@ -11625,8 +11727,19 @@ func (e *Executor) execSubqueryScalar(sub *sqlparser.Subquery, outerRow storage.
 }
 
 func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
-	// Pre-check for scope errors: if the query contains @@session.X or @@local.X
-	// for a global-only variable, error immediately.
+	// Check for bare column references FIRST (before scope errors),
+	// because MySQL returns "Unknown column" for bare names in no-FROM queries
+	// even when the same expression also has a @@session.global_var reference.
+	for _, expr := range stmt.SelectExprs.Exprs {
+		if se, ok := expr.(*sqlparser.AliasedExpr); ok {
+			if err := validateNoFromExprRefs(se.Expr); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// Now check for scope errors: if the query contains @@session.X or @@local.X
+	// for a global-only variable, error.
 	if err := e.checkSelectScopeErrors(stmt); err != nil {
 		return nil, err
 	}
@@ -11640,9 +11753,6 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 	for _, expr := range stmt.SelectExprs.Exprs {
 		switch se := expr.(type) {
 		case *sqlparser.AliasedExpr:
-			if err := validateNoFromExprRefs(se.Expr); err != nil {
-				return nil, err
-			}
 			name := ""
 			if !se.As.IsEmpty() {
 				name = se.As.String()
@@ -11674,6 +11784,36 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 		Rows:        [][]interface{}{values},
 		IsResultSet: true,
 	}, nil
+}
+
+// validateNoFromTopLevelColRefs checks for bare column references at the
+// top level of an expression (not inside function calls). This is used
+// in the early check in execSelect for no-FROM queries to return
+// "Unknown column" before scope checks fire.
+func validateNoFromTopLevelColRefs(expr sqlparser.Expr) error {
+	switch e := expr.(type) {
+	case *sqlparser.ColName:
+		if !e.Qualifier.IsEmpty() {
+			return mysqlError(1051, "42S02", fmt.Sprintf("Unknown table '%s' in field list", e.Qualifier.Name.String()))
+		}
+		return mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'field list'", e.Name.String()))
+	case *sqlparser.ComparisonExpr:
+		if err := validateNoFromTopLevelColRefs(e.Left); err != nil {
+			return err
+		}
+		return validateNoFromTopLevelColRefs(e.Right)
+	case *sqlparser.BinaryExpr:
+		if err := validateNoFromTopLevelColRefs(e.Left); err != nil {
+			return err
+		}
+		return validateNoFromTopLevelColRefs(e.Right)
+	case *sqlparser.IsExpr:
+		return validateNoFromTopLevelColRefs(e.Left)
+	case *sqlparser.UnaryExpr:
+		return validateNoFromTopLevelColRefs(e.Expr)
+	}
+	// For function calls, subqueries, etc., don't check - let them through
+	return nil
 }
 
 func validateNoFromExprRefs(expr sqlparser.Expr) error {
@@ -12765,8 +12905,8 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					}
 					if tableEngine == "" {
 						// Check session default_storage_engine
-						if e.globalVars != nil {
-							if eng, ok := e.globalVars["default_storage_engine"]; ok {
+						if e.sessionScopeVars != nil || e.globalScopeVars != nil {
+							if eng, ok := e.getSysVar("default_storage_engine"); ok {
 								tableEngine = strings.ToUpper(eng)
 							}
 						}
@@ -14063,6 +14203,48 @@ var sysVarGlobalOnly = map[string]bool{
 	"innodb_redo_log_archive_dirs":             true,
 	"innodb_fsync_threshold":                   true,
 	"sql_slave_skip_counter":                   true,
+	// Additional global-only variables discovered from test failures
+	"binlog_checksum":                          true,
+	"binlog_row_metadata":                      true,
+	"enforce_gtid_consistency":                 true,
+	"gtid_executed":                            true,
+	"init_file":                                true,
+	"innodb_api_bk_commit_interval":            true,
+	"innodb_api_trx_level":                     true,
+	"innodb_autoextend_increment":              true,
+	"innodb_change_buffering":                  true,
+	"innodb_file_per_table":                    true,
+	"innodb_flush_log_at_trx_commit":           true,
+	"innodb_ft_aux_table":                      true,
+	"innodb_log_checksums":                     true,
+	"innodb_log_compressed_pages":              true,
+	"innodb_log_write_ahead_size":              true,
+	"innodb_rollback_segments":                 true,
+	"innodb_stats_method":                      true,
+	"innodb_undo_log_truncate":                 true,
+	"local_infile":                             true,
+	"log_bin_use_v1_row_events":                true,
+	"log_error":                                true,
+	"log_slow_extra":                           true,
+	"log_timestamps":                           true,
+	"myisam_data_pointer_size":                 true,
+	"myisam_mmap_size":                         true,
+	"myisam_recover_options":                   true,
+	"myisam_use_mmap":                          true,
+	"mysqlx_interactive_timeout":               true,
+	"old":                                      true,
+	"performance_schema_max_digest_sample_age": true,
+	"read_only":                                true,
+	"relay_log":                                true,
+	"relay_log_info_file":                      true,
+	"relay_log_recovery":                       true,
+	"relay_log_space_limit":                    true,
+	"require_secure_transport":                 true,
+	"server_id":                                true,
+	"server_id_bits":                           true,
+	"slave_skip_errors":                        true,
+	"stored_program_definition_cache":          true,
+	"temptable_max_ram":                        true,
 }
 
 // sysVarEnumSet contains system variables that are ENUM types where ON/OFF
@@ -14216,6 +14398,7 @@ type intVarRange struct {
 	Min        int64
 	Max        uint64
 	IsUnsigned bool
+	BlockSize  uint64 // if non-zero, value is rounded down to nearest multiple
 }
 
 var sysVarIntRange = map[string]intVarRange{
@@ -14241,6 +14424,144 @@ var sysVarIntRange = map[string]intVarRange{
 	"mysqlx_max_connections":                   {Min: 1, Max: 100000, IsUnsigned: true},
 	"rpl_stop_slave_timeout":                   {Min: 2, Max: 31536000, IsUnsigned: true},
 	"sync_binlog":                              {Min: 0, Max: 4294967295, IsUnsigned: true},
+	// Additional integer variables with ranges
+	"bulk_insert_buffer_size":                  {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"binlog_cache_size":                        {Min: 4096, Max: 18446744073709547520, IsUnsigned: true, BlockSize: 4096},
+	"binlog_stmt_cache_size":                   {Min: 4096, Max: 18446744073709547520, IsUnsigned: true, BlockSize: 4096},
+	"binlog_expire_logs_seconds":               {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"binlog_group_commit_sync_delay":           {Min: 0, Max: 1000000, IsUnsigned: true},
+	"binlog_group_commit_sync_no_delay_count":  {Min: 0, Max: 1000000, IsUnsigned: true},
+	"binlog_max_flush_queue_time":              {Min: 0, Max: 10000, IsUnsigned: true},
+	"binlog_transaction_dependency_history_size": {Min: 1, Max: 1000000, IsUnsigned: true},
+	"cte_max_recursion_depth":                  {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"default_password_lifetime":                {Min: 0, Max: 65535, IsUnsigned: true},
+	"delayed_insert_limit":                     {Min: 1, Max: 4294967295, IsUnsigned: true},
+	"delayed_queue_size":                       {Min: 1, Max: 4294967295, IsUnsigned: true},
+	"eq_range_index_dive_limit":                {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"expire_logs_days":                         {Min: 0, Max: 99, IsUnsigned: true},
+	"flush_time":                               {Min: 0, Max: 31536000, IsUnsigned: true},
+	"group_concat_max_len":                     {Min: 4, Max: 18446744073709551615, IsUnsigned: true},
+	"gtid_executed_compression_period":         {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"histogram_generation_max_mem_size":        {Min: 1000000, Max: 18446744073709551615, IsUnsigned: true},
+	"host_cache_size":                          {Min: 0, Max: 65536, IsUnsigned: true},
+	"information_schema_stats_expiry":          {Min: 0, Max: 86400, IsUnsigned: true},
+	"innodb_adaptive_flushing_lwm":             {Min: 0, Max: 70, IsUnsigned: true},
+	"innodb_adaptive_hash_index_parts":         {Min: 1, Max: 512, IsUnsigned: true},
+	"innodb_adaptive_max_sleep_delay":          {Min: 0, Max: 1000000, IsUnsigned: true},
+	"innodb_buffer_pool_dump_pct":              {Min: 1, Max: 100, IsUnsigned: true},
+	"innodb_buffer_pool_size":                  {Min: 5242880, Max: 18446744073709551615, IsUnsigned: true},
+	"innodb_change_buffer_max_size":            {Min: 0, Max: 50, IsUnsigned: true},
+	"innodb_concurrency_tickets":               {Min: 1, Max: 4294967295, IsUnsigned: true},
+	"innodb_fast_shutdown":                     {Min: 0, Max: 2, IsUnsigned: true},
+	"innodb_flush_neighbors":                   {Min: 0, Max: 2, IsUnsigned: true},
+	"innodb_max_dirty_pages_pct_lwm":           {Min: 0, Max: 99, IsUnsigned: true},
+	"innodb_max_undo_log_size":                 {Min: 10485760, Max: 18446744073709551615, IsUnsigned: true},
+	"innodb_online_alter_log_max_size":         {Min: 65536, Max: 18446744073709551615, IsUnsigned: true},
+	"join_buffer_size":                         {Min: 128, Max: 18446744073709551615, IsUnsigned: true, BlockSize: 128},
+	"key_buffer_size":                          {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"key_cache_age_threshold":                  {Min: 100, Max: 18446744073709551615, IsUnsigned: true},
+	"key_cache_block_size":                     {Min: 512, Max: 16384, IsUnsigned: true},
+	"key_cache_division_limit":                 {Min: 1, Max: 100, IsUnsigned: true},
+	"log_error_verbosity":                      {Min: 1, Max: 3, IsUnsigned: true},
+	"log_throttle_queries_not_using_indexes":   {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"long_query_time":                          {Min: 0, Max: 31536000, IsUnsigned: false},
+	"max_binlog_cache_size":                    {Min: 4096, Max: 18446744073709547520, IsUnsigned: true, BlockSize: 4096},
+	"max_binlog_size":                          {Min: 4096, Max: 1073741824, IsUnsigned: true},
+	"max_binlog_stmt_cache_size":               {Min: 4096, Max: 18446744073709547520, IsUnsigned: true, BlockSize: 4096},
+	"max_connect_errors":                       {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
+	"max_delayed_threads":                      {Min: 0, Max: 16384, IsUnsigned: true},
+	"max_error_count":                          {Min: 0, Max: 65535, IsUnsigned: true},
+	"max_execution_time":                       {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"max_heap_table_size":                      {Min: 16384, Max: 18446744073709551615, IsUnsigned: true},
+	"max_insert_delayed_threads":               {Min: 0, Max: 16384, IsUnsigned: true},
+	"max_join_size":                            {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
+	"max_length_for_sort_data":                 {Min: 4, Max: 8388608, IsUnsigned: true},
+	"max_points_in_geometry":                   {Min: 3, Max: 1048576, IsUnsigned: true},
+	"max_prepared_stmt_count":                  {Min: 0, Max: 4194304, IsUnsigned: true},
+	"max_relay_log_size":                       {Min: 0, Max: 1073741824, IsUnsigned: true},
+	"max_seeks_for_key":                        {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
+	"max_sort_length":                          {Min: 4, Max: 8388608, IsUnsigned: true},
+	"max_sp_recursion_depth":                   {Min: 0, Max: 255, IsUnsigned: true},
+	"max_user_connections":                     {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"max_write_lock_count":                     {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
+	"min_examined_row_limit":                   {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"myisam_max_sort_file_size":                {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"myisam_repair_threads":                    {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
+	"myisam_sort_buffer_size":                  {Min: 4096, Max: 18446744073709551615, IsUnsigned: true},
+	"mysqlx_document_id_unique_prefix":         {Min: 0, Max: 65535, IsUnsigned: true},
+	"mysqlx_idle_worker_thread_timeout":        {Min: 0, Max: 3600, IsUnsigned: true},
+	"mysqlx_max_allowed_packet":                {Min: 512, Max: 1073741824, IsUnsigned: true},
+	"mysqlx_min_worker_threads":                {Min: 1, Max: 100, IsUnsigned: true},
+	"net_buffer_length":                        {Min: 1024, Max: 1048576, IsUnsigned: true},
+	"net_read_timeout":                         {Min: 1, Max: 31536000, IsUnsigned: true},
+	"net_retry_count":                          {Min: 1, Max: 4294967295, IsUnsigned: true},
+	"net_write_timeout":                        {Min: 1, Max: 31536000, IsUnsigned: true},
+	"ngram_token_size":                         {Min: 1, Max: 10, IsUnsigned: true},
+	"optimizer_prune_level":                    {Min: 0, Max: 1, IsUnsigned: true},
+	"optimizer_search_depth":                   {Min: 0, Max: 62, IsUnsigned: true},
+	"optimizer_trace_limit":                    {Min: 0, Max: 2147483647, IsUnsigned: false},
+	"optimizer_trace_max_mem_size":             {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"optimizer_trace_offset":                   {Min: -2147483648, Max: 2147483647, IsUnsigned: false},
+	"parser_max_mem_size":                      {Min: 10000000, Max: 18446744073709551615, IsUnsigned: true},
+	"password_history":                         {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"password_reuse_interval":                  {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"preload_buffer_size":                      {Min: 1024, Max: 1073741824, IsUnsigned: true},
+	"profiling_history_size":                   {Min: 0, Max: 100, IsUnsigned: true},
+	"query_alloc_block_size":                   {Min: 1024, Max: 4294967295, IsUnsigned: true, BlockSize: 1024},
+	"query_prealloc_size":                      {Min: 8192, Max: 18446744073709551615, IsUnsigned: true},
+	"range_alloc_block_size":                   {Min: 4096, Max: 18446744073709551615, IsUnsigned: true, BlockSize: 1024},
+	"range_optimizer_max_mem_size":             {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"read_buffer_size":                         {Min: 8192, Max: 2147483647, IsUnsigned: true, BlockSize: 4096},
+	"read_rnd_buffer_size":                     {Min: 1, Max: 2147483647, IsUnsigned: true},
+	"regexp_stack_limit":                       {Min: 0, Max: 2147483647, IsUnsigned: true},
+	"regexp_time_limit":                        {Min: 0, Max: 2147483647, IsUnsigned: true},
+	"rpl_read_size":                            {Min: 8192, Max: 4294967295, IsUnsigned: true},
+	"schema_definition_cache":                  {Min: 256, Max: 524288, IsUnsigned: true},
+	"select_into_buffer_size":                  {Min: 8192, Max: 2147483647, IsUnsigned: true},
+	"select_into_disk_sync_delay":              {Min: 0, Max: 31536000, IsUnsigned: true},
+	"slave_checkpoint_group":                   {Min: 32, Max: 524280, IsUnsigned: true},
+	"slave_checkpoint_period":                  {Min: 1, Max: 4294967295, IsUnsigned: true},
+	"slave_max_allowed_packet":                 {Min: 1024, Max: 1073741824, IsUnsigned: true},
+	"slave_net_timeout":                        {Min: 1, Max: 31536000, IsUnsigned: true},
+	"slave_parallel_workers":                   {Min: 0, Max: 1024, IsUnsigned: true},
+	"slave_pending_jobs_size_max":              {Min: 1024, Max: 18446744073709551615, IsUnsigned: true, BlockSize: 1024},
+	"slave_transaction_retries":                {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"slow_launch_time":                         {Min: 0, Max: 31536000, IsUnsigned: true},
+	"sort_buffer_size":                         {Min: 32768, Max: 18446744073709551615, IsUnsigned: true, BlockSize: 1024},
+	"sql_select_limit":                         {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"stored_program_cache":                     {Min: 16, Max: 524288, IsUnsigned: true},
+	"stored_program_definition_cache":          {Min: 256, Max: 524288, IsUnsigned: true},
+	"sync_master_info":                         {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"sync_relay_log":                           {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"sync_relay_log_info":                      {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"table_definition_cache":                   {Min: 400, Max: 524288, IsUnsigned: true},
+	"table_open_cache":                         {Min: 1, Max: 524288, IsUnsigned: true},
+	"table_open_cache_instances":               {Min: 1, Max: 64, IsUnsigned: true},
+	"tablespace_definition_cache":              {Min: 256, Max: 524288, IsUnsigned: true},
+	"temptable_max_mmap":                       {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"temptable_max_ram":                        {Min: 1048576, Max: 18446744073709551615, IsUnsigned: true},
+	"thread_cache_size":                        {Min: 0, Max: 16384, IsUnsigned: true},
+	"tmp_table_size":                           {Min: 1024, Max: 18446744073709551615, IsUnsigned: true},
+	"transaction_alloc_block_size":             {Min: 1024, Max: 131072, IsUnsigned: true, BlockSize: 1024},
+	"transaction_prealloc_size":                {Min: 1024, Max: 131072, IsUnsigned: true, BlockSize: 1024},
+	"wait_timeout":                             {Min: 1, Max: 31536000, IsUnsigned: true},
+	"interactive_timeout":                      {Min: 1, Max: 31536000, IsUnsigned: true},
+	"innodb_stats_transient_sample_pages":      {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
+	"innodb_stats_persistent_sample_pages":     {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
+	"max_allowed_packet":                       {Min: 1024, Max: 1073741824, IsUnsigned: true, BlockSize: 1024},
+	"performance_schema_max_digest_sample_age": {Min: 0, Max: 1048576, IsUnsigned: true},
+	"server_id":                                {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"innodb_api_bk_commit_interval":            {Min: 1, Max: 1073741824, IsUnsigned: true},
+	"innodb_api_trx_level":                     {Min: 0, Max: 3, IsUnsigned: true},
+	"innodb_autoextend_increment":              {Min: 1, Max: 1000, IsUnsigned: true},
+	"innodb_flush_log_at_trx_commit":           {Min: 0, Max: 2, IsUnsigned: true},
+	"innodb_log_write_ahead_size":              {Min: 512, Max: 16384, IsUnsigned: true},
+	"innodb_rollback_segments":                 {Min: 1, Max: 128, IsUnsigned: true},
+	"innodb_max_dirty_pages_pct":               {Min: 0, Max: 99, IsUnsigned: true},
+	"myisam_data_pointer_size":                 {Min: 2, Max: 7, IsUnsigned: true},
+	"myisam_mmap_size":                         {Min: 7, Max: 18446744073709551615, IsUnsigned: true},
+	"relay_log_space_limit":                    {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"sql_slave_skip_counter":                   {Min: 0, Max: 4294967295, IsUnsigned: true},
 }
 
 func parseStrictIntegerAssignment(expr sqlparser.Expr, evalVal interface{}) (int64, uint64, bool, string, error) {
@@ -14329,7 +14650,7 @@ func parseStrictIntegerAssignment(expr sqlparser.Expr, evalVal interface{}) (int
 	}
 }
 
-func (e *Executor) clampIntVar(name string, expr sqlparser.Expr, min int64, max uint64, isUnsigned bool) (string, error) {
+func (e *Executor) clampIntVar(name string, expr sqlparser.Expr, min int64, max uint64, isUnsigned bool, blockSize ...uint64) (string, error) {
 	evalVal, err := e.evalExpr(expr)
 	if err != nil {
 		evalVal = nil
@@ -14360,6 +14681,10 @@ func (e *Executor) clampIntVar(name string, expr sqlparser.Expr, min int64, max 
 		if out > max {
 			out = max
 			warn()
+		}
+		// Apply block_size alignment (round down)
+		if len(blockSize) > 0 && blockSize[0] > 0 && out > 0 {
+			out = (out / blockSize[0]) * blockSize[0]
 		}
 		return strconv.FormatUint(out, 10), nil
 	}
@@ -14623,6 +14948,10 @@ func sysVarStringToSelectValueForVar(val string, varName string) interface{} {
 }
 
 func (e *Executor) buildVariablesMap() map[string]string {
+	return e.buildVariablesMapScoped(false)
+}
+
+func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 	vars := map[string]string{
 		// InnoDB variables
 		"innodb_rollback_on_timeout":               "ON",
@@ -15289,8 +15618,33 @@ func (e *Executor) buildVariablesMap() map[string]string {
 		vars[name] = val
 	}
 
-	// Override with any SET GLOBAL/SESSION values
-	for name, val := range e.globalVars {
+	// Override with SET GLOBAL values
+	for name, val := range e.globalScopeVars {
+		// Apply minimum/maximum constraints for known variables
+		if name == "innodb_stats_transient_sample_pages" || name == "innodb_stats_persistent_sample_pages" {
+			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n < 1 {
+				val = "1"
+			}
+		}
+		if defaultVal, ok := vars[name]; ok {
+			upperDefault := strings.ToUpper(defaultVal)
+			if upperDefault == "ON" || upperDefault == "OFF" {
+				upperVal := strings.ToUpper(val)
+				if upperVal == "1" || upperVal == "ON" || upperVal == "TRUE" || upperVal == "YES" {
+					val = "ON"
+				} else if upperVal == "0" || upperVal == "OFF" || upperVal == "FALSE" || upperVal == "NO" {
+					val = "OFF"
+				}
+			}
+		}
+		vars[name] = val
+	}
+
+	// Override with SET SESSION values (skip for SHOW GLOBAL VARIABLES)
+	if globalOnly {
+		return vars
+	}
+	for name, val := range e.sessionScopeVars {
 		// Apply minimum/maximum constraints for known variables
 		if name == "innodb_stats_transient_sample_pages" || name == "innodb_stats_persistent_sample_pages" {
 			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n < 1 {
@@ -15338,7 +15692,8 @@ func (e *Executor) showVariables(upper string) (*Result, error) {
 		}
 	}
 
-	vars := e.buildVariablesMap()
+	isGlobalShow := strings.Contains(upper, "GLOBAL")
+	vars := e.buildVariablesMapScoped(isGlobalShow)
 
 	var rows [][]interface{}
 	for name, val := range vars {
@@ -16169,8 +16524,15 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return nil, mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a SESSION variable", name))
 		}
 
-		// Check for user-set global variables first
-		if gv, ok := e.globalVars[name]; ok {
+		// Check for user-set variables with proper scope resolution.
+		var gv string
+		var gvOK bool
+		if v.Scope == sqlparser.GlobalScope {
+			gv, gvOK = e.getSysVarGlobal(name)
+		} else {
+			gv, gvOK = e.getSysVarSession(name)
+		}
+		if gvOK {
 			// Apply minimum constraints
 			if name == "innodb_stats_transient_sample_pages" || name == "innodb_stats_persistent_sample_pages" {
 				if n, err := strconv.ParseInt(gv, 10, 64); err == nil && n < 1 {
@@ -16286,7 +16648,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return nil, nil
 		}
 		// Fall back to the full variables map (SHOW VARIABLES / performance_schema)
-		allVars := e.buildVariablesMap()
+		allVars := e.buildVariablesMapScoped(v.Scope == sqlparser.GlobalScope)
 		if val, ok := allVars[name]; ok {
 			return sysVarStringToSelectValueForVar(val, name), nil
 		}
@@ -16759,7 +17121,8 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		out := toString(val)
 		orig := out
 		target := strings.ToLower(v.Type)
-		connCharset := canonicalCharset(strings.ToLower(e.globalVars["character_set_connection"]))
+		connCharsetVal, _ := e.getSysVar("character_set_connection")
+		connCharset := canonicalCharset(strings.ToLower(connCharsetVal))
 		sourceCharset := ""
 		if cn, ok := v.Expr.(*sqlparser.ColName); ok {
 			sourceCharset = strings.ToLower(e.getColumnCharset(cn))
@@ -19085,7 +19448,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 				}
 			}
 		}
-		if cs, ok := e.globalVars["character_set_connection"]; ok && cs != "" {
+		if cs, ok := e.getSysVar("character_set_connection"); ok && cs != "" {
 			return strings.ToLower(cs), nil
 		}
 		return "utf8", nil
@@ -22364,7 +22727,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 				}
 			}
 		}
-		if cs, ok := e.globalVars["character_set_connection"]; ok && cs != "" {
+		if cs, ok := e.getSysVar("character_set_connection"); ok && cs != "" {
 			return strings.ToLower(cs), nil
 		}
 		return "utf8", nil
