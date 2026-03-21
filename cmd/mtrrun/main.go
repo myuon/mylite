@@ -1333,7 +1333,6 @@ var skipTests = map[string]bool{
 	"sys_vars/innodb_ft_result_cache_limit_basic":             true,
 	"sys_vars/innodb_ft_server_stopword_table_basic":          true,
 	"sys_vars/innodb_ft_user_stopword_table_basic":            true,
-	"sys_vars/innodb_io_capacity_max_basic":                   true,
 	"sys_vars/innodb_lock_wait_timeout_basic":                 true,
 	"sys_vars/innodb_log_buffer_size_basic":                   true,
 	"sys_vars/innodb_log_checksums_basic":                     true,

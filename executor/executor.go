@@ -3540,9 +3540,52 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				cleanName := strings.TrimPrefix(name, "global.")
 				cleanName = strings.TrimPrefix(cleanName, "session.")
 				cleanName = strings.TrimPrefix(cleanName, "local.")
-				// Handle DEFAULT: restore the variable to its default value
+				// Handle DEFAULT: restore to default value (or emulate known MySQL special defaults).
 				if _, isDefault := expr.Expr.(*sqlparser.Default); isDefault || strings.ToUpper(val) == "DEFAULT" {
-					delete(e.globalVars, cleanName)
+					if cleanName == "innodb_io_capacity_max" {
+						e.globalVars[cleanName] = "4294967295"
+					} else {
+						delete(e.globalVars, cleanName)
+					}
+				} else if cleanName == "innodb_io_capacity_max" {
+					// INTEGER only, minimum 100, and cannot be set lower than innodb_io_capacity.
+					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
+						litStr := strings.TrimSpace(sqlparser.String(lit))
+						if strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"") || strings.ContainsAny(litStr, ".eE") {
+							return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+						}
+					}
+					evalVal, err := e.evalExpr(expr.Expr)
+					if err != nil || evalVal == nil {
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+					}
+					n := toInt64(evalVal)
+					if n < 100 {
+						e.warnings = append(e.warnings, Warning{
+							Level:   "Warning",
+							Code:    1292,
+							Message: fmt.Sprintf("Truncated incorrect %s value: '%d'", cleanName, n),
+						})
+						n = 100
+					}
+					minVal := int64(200)
+					if curMin, ok := e.globalVars["innodb_io_capacity"]; ok && curMin != "" {
+						if parsed, err := strconv.ParseInt(curMin, 10, 64); err == nil {
+							minVal = parsed
+						}
+					} else if startupMin := e.startupVars["innodb_io_capacity"]; startupMin != "" {
+						if parsed, err := strconv.ParseInt(startupMin, 10, 64); err == nil {
+							minVal = parsed
+						}
+					}
+					if n < minVal {
+						e.warnings = append(e.warnings,
+							Warning{Level: "Warning", Code: 1210, Message: "innodb_io_capacity_max cannot be set lower than innodb_io_capacity."},
+							Warning{Level: "Warning", Code: 1210, Message: fmt.Sprintf("Setting innodb_io_capacity_max to %d", minVal)},
+						)
+						n = minVal
+					}
+					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_stats_transient_sample_pages" || cleanName == "innodb_stats_persistent_sample_pages" {
 					// These vars accept integer values only. Float/scientific/string values are rejected.
 					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
