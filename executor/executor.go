@@ -2873,11 +2873,24 @@ func extractRawSelectExprs(query string) []string {
 		return nil
 	}
 	start := len("select ")
-	// Skip DISTINCT keyword so it doesn't appear in column headers
+	// Skip DISTINCT keyword and SQL hints so they don't appear in column headers
 	rest := strings.TrimSpace(q[start:])
-	if strings.HasPrefix(strings.ToLower(rest), "distinct ") {
-		start = len(q) - len(rest) + len("distinct ")
+	for {
+		restLower := strings.ToLower(rest)
+		skipped := false
+		for _, hint := range []string{"distinct ", "all ", "sql_big_result ", "sql_small_result ",
+			"sql_buffer_result ", "sql_calc_found_rows ", "high_priority ", "straight_join "} {
+			if strings.HasPrefix(restLower, hint) {
+				rest = strings.TrimSpace(rest[len(hint):])
+				skipped = true
+				break
+			}
+		}
+		if !skipped {
+			break
+		}
 	}
+	start = len(q) - len(rest)
 	inQuote := byte(0)
 	parenDepth := 0
 	end := len(q)
@@ -3557,6 +3570,42 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					// Evaluate expression
 					evalVal, err := e.evalExpr(expr.Expr)
 					if err == nil && evalVal != nil {
+						// For boolean variables, validate the value
+						if isBooleanVariable(cleanName) {
+							if _, isLit := expr.Expr.(*sqlparser.Literal); isLit {
+								litStr := sqlparser.String(expr.Expr)
+								// Remove quotes for string literals
+								unq := strings.Trim(litStr, "'\"")
+								// Reject float literals (1.1, 1e1, etc.)
+								if strings.ContainsAny(litStr, ".eE") && !strings.EqualFold(unq, "ON") && !strings.EqualFold(unq, "OFF") {
+									return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+								}
+								// Reject invalid string values (not ON/OFF/0/1/TRUE/FALSE/YES/NO)
+								upperUnq := strings.ToUpper(unq)
+								if strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"") {
+									if upperUnq != "ON" && upperUnq != "OFF" && upperUnq != "0" && upperUnq != "1" &&
+										upperUnq != "TRUE" && upperUnq != "FALSE" && upperUnq != "YES" && upperUnq != "NO" {
+										return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", cleanName, unq))
+									}
+								}
+							}
+							// For integer values, clamp: any non-zero integer -> "1" (ON), zero -> "0" (OFF)
+							valStr := fmt.Sprintf("%v", evalVal)
+							if n, err := strconv.ParseInt(valStr, 10, 64); err == nil {
+								if n != 0 && n != 1 {
+									e.warnings = append(e.warnings, Warning{
+										Level:   "Warning",
+										Code:    1292,
+										Message: fmt.Sprintf("Truncated incorrect %s value: '%s'", cleanName, valStr),
+									})
+								}
+								if n != 0 {
+									evalVal = int64(1)
+								} else {
+									evalVal = int64(0)
+								}
+							}
+						}
 						e.globalVars[cleanName] = fmt.Sprintf("%v", evalVal)
 					} else if err == nil && evalVal == nil {
 						// nil means NULL - store empty or delete
@@ -9750,6 +9799,8 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 	}
 
 	// Compute column names
+	rawExprs := extractRawSelectExprs(e.currentQuery)
+	rawExprIdx := 0
 	colNames := make([]string, 0, len(stmt.SelectExprs.Exprs))
 	for _, expr := range stmt.SelectExprs.Exprs {
 		switch se := expr.(type) {
@@ -9757,13 +9808,33 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 			if !se.As.IsEmpty() {
 				colNames = append(colNames, se.As.String())
 			} else if isAggregateExpr(se.Expr) {
-				// MySQL returns aggregate function names in uppercase
-				colNames = append(colNames, aggregateDisplayName(se.Expr))
+				// Use raw expression text for aggregates containing @@var to preserve scope case
+				if rawExprIdx < len(rawExprs) {
+					raw := strings.TrimSpace(rawExprs[rawExprIdx])
+					if strings.Contains(strings.ToLower(raw), "@@") {
+						colNames = append(colNames, raw)
+					} else {
+						colNames = append(colNames, aggregateDisplayName(se.Expr))
+					}
+				} else {
+					colNames = append(colNames, aggregateDisplayName(se.Expr))
+				}
 			} else if colName, ok := se.Expr.(*sqlparser.ColName); ok {
 				colNames = append(colNames, colName.Name.String())
+			} else if rawExprIdx < len(rawExprs) {
+				raw := strings.TrimSpace(rawExprs[rawExprIdx])
+				if strings.Contains(strings.ToLower(raw), "@@") {
+					if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' {
+						raw = raw[1 : len(raw)-1]
+					}
+					colNames = append(colNames, raw)
+				} else {
+					colNames = append(colNames, normalizeSQLDisplayName(sqlparser.String(se.Expr)))
+				}
 			} else {
 				colNames = append(colNames, normalizeSQLDisplayName(sqlparser.String(se.Expr)))
 			}
+			rawExprIdx++
 		case *sqlparser.StarExpr:
 			// SELECT * with GROUP BY: expand to all columns from the first row
 			if len(groups) > 0 && len(groups[0].rows) > 0 {
@@ -10915,8 +10986,17 @@ func (e *Executor) execSubqueryScalar(sub *sqlparser.Subquery, outerRow storage.
 }
 
 func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
+	// Pre-check for scope errors: if the query contains @@session.X or @@local.X
+	// for a global-only variable, error immediately.
+	if err := e.checkSelectScopeErrors(stmt); err != nil {
+		return nil, err
+	}
+
 	colNames := make([]string, 0)
 	values := make([]interface{}, 0)
+
+	rawExprs := extractRawSelectExprs(e.currentQuery)
+	rawExprIdx := 0
 
 	for _, expr := range stmt.SelectExprs.Exprs {
 		switch se := expr.(type) {
@@ -10924,10 +11004,18 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 			name := ""
 			if !se.As.IsEmpty() {
 				name = se.As.String()
+			} else if rawExprIdx < len(rawExprs) {
+				raw := strings.TrimSpace(rawExprs[rawExprIdx])
+				// MySQL displays string literal column headers without quotes
+				if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' {
+					raw = raw[1 : len(raw)-1]
+				}
+				name = raw
 			} else {
 				name = normalizeSQLDisplayName(sqlparser.String(se.Expr))
 			}
 			colNames = append(colNames, name)
+			rawExprIdx++
 
 			v, err := e.evalExpr(se.Expr)
 			if err != nil {
@@ -13067,6 +13155,56 @@ var sysVarReadOnly = map[string]bool{
 	"innodb_log_file_size": true, "innodb_temp_data_file_path": true,
 	"innodb_undo_directory": true,
 	"performance_schema": true, "skip_show_database": true,
+	"skip_external_locking": true,
+	"performance_schema_accounts_size": true, "performance_schema_digests_size": true,
+	"performance_schema_error_size": true,
+	"performance_schema_events_stages_history_size": true,
+	"performance_schema_events_stages_history_long_size": true,
+	"performance_schema_events_statements_history_size": true,
+	"performance_schema_events_statements_history_long_size": true,
+	"performance_schema_events_transactions_history_size": true,
+	"performance_schema_events_transactions_history_long_size": true,
+	"performance_schema_events_waits_history_size": true,
+	"performance_schema_events_waits_history_long_size": true,
+	"performance_schema_hosts_size": true,
+	"performance_schema_max_cond_classes": true,
+	"performance_schema_max_cond_instances": true,
+	"performance_schema_max_digest_length": true,
+	// performance_schema_max_digest_sample_age is settable in MySQL
+	"performance_schema_max_file_classes": true,
+	"performance_schema_max_file_handles": true,
+	"performance_schema_max_file_instances": true,
+	"performance_schema_max_index_stat": true,
+	"performance_schema_max_memory_classes": true,
+	"performance_schema_max_metadata_locks": true,
+	"performance_schema_max_mutex_classes": true,
+	"performance_schema_max_mutex_instances": true,
+	"performance_schema_max_prepared_statements_instances": true,
+	"performance_schema_max_program_instances": true,
+	"performance_schema_max_rwlock_classes": true,
+	"performance_schema_max_rwlock_instances": true,
+	"performance_schema_max_socket_classes": true,
+	"performance_schema_max_socket_instances": true,
+	"performance_schema_max_sql_text_length": true,
+	"performance_schema_max_stage_classes": true,
+	"performance_schema_max_statement_classes": true,
+	"performance_schema_max_statement_stack": true,
+	"performance_schema_max_table_handles": true,
+	"performance_schema_max_table_instances": true,
+	"performance_schema_max_table_lock_stat": true,
+	"performance_schema_max_thread_classes": true,
+	"performance_schema_max_thread_instances": true,
+	"performance_schema_session_connect_attrs_size": true,
+	"performance_schema_setup_actors_size": true,
+	"performance_schema_setup_objects_size": true,
+	"performance_schema_users_size": true,
+	"persisted_globals_load": true,
+	"large_pages": true,
+	"version_compile_zlib": true,
+	"innodb_log_files_in_group": true, "innodb_log_group_home_dir": true,
+	"innodb_page_cleaners": true,
+	"thread_handling": true,
+	// server_id_bits is settable (removed from read-only)
 	"back_log": true, "bind_address": true, "admin_address": true,
 	"admin_port": true, "core_file": true,
 	"disabled_storage_engines": true, "ft_max_word_len": true,
@@ -13088,7 +13226,7 @@ var sysVarReadOnly = map[string]bool{
 	"binlog_gtid_simple_recovery": true, "binlog_row_event_max_size": true,
 	"binlog_rotate_encryption_master_key_at_startup": true,
 	"create_admin_listener_thread": true,
-	"external_user": true, "proxy_user": true,
+	// external_user and proxy_user are session-only (removed from read-only)
 	"tls_version": true, "tls_ciphersuites": true,
 	"ssl_ca": true, "ssl_capath": true, "ssl_cert": true, "ssl_cipher": true,
 	"ssl_key": true, "ssl_crl": true, "ssl_crlpath": true,
@@ -13217,6 +13355,46 @@ var sysVarGlobalOnly = map[string]bool{
 	"delayed_insert_limit":            true,
 	"delayed_insert_timeout":          true,
 	"delayed_queue_size":              true,
+	"host_cache_size":                 true,
+	"init_slave":                      true,
+	"master_info_repository":          true,
+	"master_verify_checksum":          true,
+	"max_binlog_cache_size":           true,
+	"max_binlog_size":                 true,
+	"max_binlog_stmt_cache_size":      true,
+	"max_relay_log_size":              true,
+	"offline_mode":                    true,
+	"relay_log_info_repository":       true,
+	"report_host":                     true,
+	"report_password":                 true,
+	"report_port":                     true,
+	"report_user":                     true,
+	"rpl_read_size":                   true,
+	"rpl_stop_slave_timeout":          true,
+	"schema_definition_cache":         true,
+	"slave_allow_batching":            true,
+	"slave_checkpoint_group":          true,
+	"slave_checkpoint_period":         true,
+	"slave_compressed_protocol":       true,
+	"slave_max_allowed_packet":        true,
+	"slave_net_timeout":               true,
+	"slave_parallel_type":             true,
+	"slave_parallel_workers":          true,
+	"slave_pending_jobs_size_max":     true,
+	"slave_preserve_commit_order":     true,
+	"slave_rows_search_algorithms":    true,
+	"slave_sql_verify_checksum":       true,
+	"slave_transaction_retries":       true,
+	"slow_launch_time":                true,
+	"super_read_only":                 true,
+	"sync_master_info":                true,
+	"sync_relay_log":                  true,
+	"sync_relay_log_info":             true,
+	"table_encryption_privilege_check": true,
+	"tablespace_definition_cache":     true,
+	"innodb_redo_log_archive_dirs":    true,
+	"innodb_fsync_threshold":          true,
+	"sql_slave_skip_counter":          true,
 }
 
 // sysVarEnumSet contains system variables that are ENUM types where ON/OFF
@@ -13275,7 +13453,168 @@ var sysVarEnumSet = map[string]bool{
 	"have_statement_timeout":        true,
 	"secure_file_priv":              true,
 	"updatable_views_with_limit":    true,
+	"slave_parallel_type":           true,
+	"slave_rows_search_algorithms":  true,
+	"slave_type_conversions":        true,
+	"rbr_exec_mode":                 true,
+	"thread_handling":               true,
+	"master_info_repository":        true,
+	"relay_log_info_repository":     true,
 }
+
+// sysVarSessionOnly contains system variables that only exist at SESSION scope.
+// SELECT @@global.var for these should return error 1238.
+var sysVarSessionOnly = map[string]bool{
+	"identity":                 true,
+	"last_insert_id":           true,
+	"insert_id":                true,
+	"pseudo_thread_id":         true,
+	"rand_seed1":               true,
+	"rand_seed2":               true,
+	"gtid_next":                true,
+	"pseudo_slave_mode":        true,
+	"transaction_allow_batching": true,
+	"sql_log_bin":              true,
+}
+
+// sysVarBoolean contains system variables that are boolean type (ON/OFF).
+// For these, float/scientific notation values are rejected with "Incorrect argument type".
+var sysVarBoolean = map[string]bool{
+	"innodb_adaptive_flushing": true, "innodb_adaptive_hash_index": true,
+	"innodb_disable_sort_file_cache": true, "innodb_flush_sync": true,
+	"innodb_ft_enable_diag_print": true, "innodb_ft_enable_stopword": true,
+	"innodb_optimize_fulltext_only": true, "innodb_print_all_deadlocks": true,
+	"innodb_print_ddl_log": true, "innodb_random_read_ahead": true,
+	"innodb_redo_log_encrypt": true, "innodb_stats_include_delete_marked": true,
+	"innodb_stats_on_metadata": true, "innodb_status_output": true,
+	"innodb_status_output_locks": true, "innodb_strict_mode": true,
+	"innodb_table_locks": true, "innodb_undo_log_encrypt": true,
+	"innodb_cmp_per_index_enabled": true, "innodb_file_per_table": true,
+	"innodb_stats_persistent": true, "innodb_stats_auto_recalc": true,
+	"innodb_rollback_on_timeout": true, "innodb_deadlock_detect": true,
+	"innodb_buffer_pool_dump_at_shutdown": true, "innodb_buffer_pool_dump_now": true,
+	"innodb_buffer_pool_in_core_file": true, "innodb_buffer_pool_load_abort": true,
+	"innodb_buffer_pool_load_now": true, "innodb_log_checksums": true,
+	"innodb_log_compressed_pages": true, "innodb_log_writer_threads": true,
+	"big_tables": true, "foreign_key_checks": true, "unique_checks": true,
+	"sql_auto_is_null": true, "sql_big_selects": true, "sql_buffer_result": true,
+	"sql_log_bin": true, "sql_notes": true, "sql_quote_show_create": true,
+	"sql_safe_updates": true, "sql_warnings": true, "autocommit": true,
+	"end_markers_in_json": true, "explicit_defaults_for_timestamp": true,
+	"general_log": true, "slow_query_log": true, "profiling": true,
+	"low_priority_updates": true, "flush": true, "new": true, "old": true,
+	"old_alter_table": true, "keep_files_on_create": true,
+	"log_queries_not_using_indexes": true, "log_slow_admin_statements": true,
+	"log_slow_extra": true, "log_slow_replica_statements": true,
+	"log_slow_slave_statements": true, "log_bin_trust_function_creators": true,
+	"binlog_order_commits": true, "binlog_rows_query_log_events": true,
+	"binlog_direct_non_transactional_updates": true, "binlog_encryption": true,
+	"binlog_transaction_compression": true,
+	"check_proxy_users": true, "mysql_native_password_proxy_users": true,
+	"sha256_password_proxy_users": true, "require_secure_transport": true,
+	"disconnect_on_expired_password": true, "password_require_current": true,
+	"avoid_temporal_upgrade": true, "show_create_table_verbosity": true,
+	"show_old_temporals": true, "windowing_use_high_precision": true,
+	"session_track_schema": true, "session_track_state_change": true,
+	"select_into_disk_sync": true, "transaction_read_only": true,
+	"read_only": true, "super_read_only": true, "offline_mode": true,
+	"relay_log_purge": true, "relay_log_recovery": true,
+	"master_verify_checksum": true, "slave_allow_batching": true,
+	"slave_compressed_protocol": true, "slave_preserve_commit_order": true,
+	"slave_sql_verify_checksum": true, "print_identified_with_as_hex": true,
+	"default_table_encryption": true, "table_encryption_privilege_check": true,
+	"local_infile": true, "myisam_use_mmap": true,
+	"temptable_use_mmap": true, "sql_log_off": true,
+	"innodb_doublewrite": true,
+}
+
+func isBooleanVariable(name string) bool {
+	return sysVarBoolean[name]
+}
+
+// checkSelectScopeErrors checks if a SELECT statement contains @@session.X or @@local.X
+// references to global-only variables, and returns an error if so.
+func (e *Executor) checkSelectScopeErrors(stmt *sqlparser.Select) error {
+	q := strings.ToLower(e.currentQuery)
+	// Walk all variables in the expression tree
+	var checkExpr func(expr sqlparser.Expr) error
+	checkExpr = func(expr sqlparser.Expr) error {
+		switch v := expr.(type) {
+		case *sqlparser.Variable:
+			if v.Scope == sqlparser.SessionScope {
+				name := strings.ToLower(v.Name.String())
+				if sysVarReadOnly[name] || sysVarGlobalOnly[name] {
+					// Check if the raw query has @@session. or @@local. prefix
+					for _, prefix := range []string{"@@session.", "@@local."} {
+						pattern := prefix + name
+						if strings.Contains(q, pattern) {
+							return mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a GLOBAL variable", name))
+						}
+					}
+				}
+			}
+			if v.Scope == sqlparser.GlobalScope {
+				name := strings.ToLower(v.Name.String())
+				if sysVarSessionOnly[name] {
+					return mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a SESSION variable", name))
+				}
+			}
+		case *sqlparser.Count:
+			for _, arg := range v.Args {
+				if err := checkExpr(arg); err != nil {
+					return err
+				}
+			}
+		case *sqlparser.Sum:
+			if err := checkExpr(v.Arg); err != nil {
+				return err
+			}
+		case *sqlparser.ComparisonExpr:
+			if err := checkExpr(v.Left); err != nil {
+				return err
+			}
+			if err := checkExpr(v.Right); err != nil {
+				return err
+			}
+		case *sqlparser.FuncExpr:
+			for _, arg := range v.Exprs {
+				if err := checkExpr(arg); err != nil {
+					return err
+				}
+			}
+		case *sqlparser.CaseExpr:
+			if v.Expr != nil {
+				if err := checkExpr(v.Expr); err != nil {
+					return err
+				}
+			}
+			for _, w := range v.Whens {
+				if err := checkExpr(w.Cond); err != nil {
+					return err
+				}
+				if err := checkExpr(w.Val); err != nil {
+					return err
+				}
+			}
+			if v.Else != nil {
+				if err := checkExpr(v.Else); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	for _, expr := range stmt.SelectExprs.Exprs {
+		if ae, ok := expr.(*sqlparser.AliasedExpr); ok {
+			if err := checkExpr(ae.Expr); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 
 // sysVarStringToSelectValue converts a system variable string value to the value
 // returned by SELECT @@var. Boolean ON/OFF become 1/0, numeric strings become int64/float64.
@@ -13298,6 +13637,10 @@ func sysVarStringToSelectValueForVar(val string, varName string) interface{} {
 	}
 	if n, err := strconv.ParseInt(val, 10, 64); err == nil {
 		return n
+	}
+	// Try unsigned int before float to preserve precision for large values like max uint64
+	if u, err := strconv.ParseUint(val, 10, 64); err == nil {
+		return u
 	}
 	if f, err := strconv.ParseFloat(val, 64); err == nil {
 		return f
@@ -13819,6 +14162,135 @@ func (e *Executor) buildVariablesMap() map[string]string {
 		"select_into_buffer_size": "131072",
 		"select_into_disk_sync": "OFF",
 		"select_into_disk_sync_delay": "0",
+
+		// Missing variables referenced by sys_vars tests
+		"default_table_encryption":    "OFF",
+		"host_cache_size":             "128",
+		"identity":                    "0",
+		"insert_id":                   "0",
+		"immediate_server_version":    "999999",
+		"original_server_version":     "999999",
+		"original_commit_timestamp":   "36028797018963968",
+		"init_slave":                  "",
+		"keep_files_on_create":        "OFF",
+		"large_files_support":         "ON",
+		"large_pages":                 "OFF",
+		"large_page_size":             "0",
+		"locked_in_memory":            "OFF",
+		"log_bin_use_v1_row_events":   "OFF",
+		"log_statements_unsafe_for_binlog": "ON",
+		"log_throttle_queries_not_using_indexes": "0",
+		"master_info_repository":      "TABLE",
+		"master_verify_checksum":      "OFF",
+		"max_binlog_cache_size":       "18446744073709547520",
+		"max_binlog_size":             "1073741824",
+		"max_binlog_stmt_cache_size":  "18446744073709547520",
+		"max_relay_log_size":          "0",
+		"myisam_mmap_size":            "18446744073709551615",
+		"offline_mode":                "OFF",
+		"parser_max_mem_size":         "18446744073709551615",
+		"persisted_globals_load":      "ON",
+		"print_identified_with_as_hex": "OFF",
+		"pseudo_slave_mode":           "OFF",
+		"pseudo_thread_id":            "0",
+		"query_alloc_block_size":      "8192",
+		"query_prealloc_size":         "8192",
+		"rand_seed1":                  "0",
+		"rand_seed2":                  "0",
+		"range_alloc_block_size":      "4096",
+		"rbr_exec_mode":               "STRICT",
+		"read_only":                   "OFF",
+		"relay_log_info_repository":   "TABLE",
+		"report_host":                 "",
+		"report_password":             "",
+		"report_port":                 "0",
+		"report_user":                 "",
+		"rpl_read_size":               "8192",
+		"rpl_stop_slave_timeout":      "31536000",
+		"schema_definition_cache":     "256",
+		"server_id_bits":              "32",
+		"skip_external_locking":       "ON",
+		"slave_allow_batching":        "OFF",
+		"slave_checkpoint_group":      "512",
+		"slave_checkpoint_period":     "300",
+		"slave_compressed_protocol":   "OFF",
+		"slave_max_allowed_packet":    "1073741824",
+		"slave_net_timeout":           "60",
+		"slave_parallel_type":         "DATABASE",
+		"slave_parallel_workers":      "0",
+		"slave_pending_jobs_size_max": "134217728",
+		"slave_preserve_commit_order": "OFF",
+		"slave_rows_search_algorithms": "INDEX_SCAN,HASH_SCAN",
+		"slave_skip_errors":           "OFF",
+		"slave_sql_verify_checksum":   "ON",
+		"slave_transaction_retries":   "10",
+		"slave_type_conversions":      "",
+		"slow_launch_time":            "2",
+		"sql_log_off":                 "OFF",
+		"sql_slave_skip_counter":      "0",
+		"super_read_only":             "OFF",
+		"sync_master_info":            "10000",
+		"sync_relay_log":              "10000",
+		"sync_relay_log_info":         "10000",
+		"table_encryption_privilege_check": "OFF",
+		"tablespace_definition_cache": "256",
+		"thread_handling":             "one-thread-per-connection",
+		"transaction_alloc_block_size": "8192",
+		"transaction_allow_batching":  "OFF",
+		"transaction_prealloc_size":   "4096",
+		"version_compile_zlib":        "1.2.13",
+		"innodb_directories":          "",
+		"innodb_log_files_in_group":   "2",
+		"innodb_log_group_home_dir":   "./",
+		"innodb_page_cleaners":        "4",
+		"innodb_redo_log_archive_dirs": "",
+		"innodb_fsync_threshold":      "0",
+		"innodb_version":              "8.0.32",
+
+		// Performance schema sizing variables (pfs_*)
+		"performance_schema_accounts_size":                    "-1",
+		"performance_schema_digests_size":                     "10000",
+		"performance_schema_error_size":                       "5124",
+		"performance_schema_events_stages_history_size":       "10",
+		"performance_schema_events_stages_history_long_size":  "10000",
+		"performance_schema_events_statements_history_size":   "10",
+		"performance_schema_events_statements_history_long_size": "10000",
+		"performance_schema_events_transactions_history_size": "10",
+		"performance_schema_events_transactions_history_long_size": "10000",
+		"performance_schema_events_waits_history_size":        "10",
+		"performance_schema_events_waits_history_long_size":   "10000",
+		"performance_schema_hosts_size":                       "-1",
+		"performance_schema_max_cond_classes":                 "150",
+		"performance_schema_max_cond_instances":               "-1",
+		"performance_schema_max_digest_length":                "1024",
+		"performance_schema_max_digest_sample_age":            "60",
+		"performance_schema_max_file_classes":                 "80",
+		"performance_schema_max_file_handles":                 "32768",
+		"performance_schema_max_file_instances":               "-1",
+		"performance_schema_max_index_stat":                   "-1",
+		"performance_schema_max_memory_classes":               "450",
+		"performance_schema_max_metadata_locks":               "-1",
+		"performance_schema_max_mutex_classes":                "350",
+		"performance_schema_max_mutex_instances":              "-1",
+		"performance_schema_max_prepared_statements_instances": "-1",
+		"performance_schema_max_program_instances":            "-1",
+		"performance_schema_max_rwlock_classes":               "60",
+		"performance_schema_max_rwlock_instances":             "-1",
+		"performance_schema_max_socket_classes":               "10",
+		"performance_schema_max_socket_instances":             "-1",
+		"performance_schema_max_sql_text_length":              "1024",
+		"performance_schema_max_stage_classes":                "175",
+		"performance_schema_max_statement_classes":            "218",
+		"performance_schema_max_statement_stack":              "10",
+		"performance_schema_max_table_handles":                "-1",
+		"performance_schema_max_table_instances":              "-1",
+		"performance_schema_max_table_lock_stat":              "-1",
+		"performance_schema_max_thread_classes":               "100",
+		"performance_schema_max_thread_instances":             "-1",
+		"performance_schema_session_connect_attrs_size":       "512",
+		"performance_schema_setup_actors_size":                "-1",
+		"performance_schema_setup_objects_size":               "-1",
+		"performance_schema_users_size":                       "-1",
 	}
 
 	// Override with any SET GLOBAL/SESSION values
@@ -13827,6 +14299,19 @@ func (e *Executor) buildVariablesMap() map[string]string {
 		if name == "innodb_stats_transient_sample_pages" || name == "innodb_stats_persistent_sample_pages" {
 			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n < 1 {
 				val = "1"
+			}
+		}
+		// For boolean variables (default is ON/OFF), normalize 1/0/on/off/true/false
+		// to ON/OFF for SHOW VARIABLES / performance_schema display.
+		if defaultVal, ok := vars[name]; ok {
+			upperDefault := strings.ToUpper(defaultVal)
+			if upperDefault == "ON" || upperDefault == "OFF" {
+				upperVal := strings.ToUpper(val)
+				if upperVal == "1" || upperVal == "ON" || upperVal == "TRUE" || upperVal == "YES" {
+					val = "ON"
+				} else if upperVal == "0" || upperVal == "OFF" || upperVal == "FALSE" || upperVal == "NO" {
+					val = "OFF"
+				}
 			}
 		}
 		vars[name] = val
@@ -14649,9 +15134,45 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		name = strings.TrimPrefix(name, "global.")
 		name = strings.TrimPrefix(name, "session.")
 		name = strings.TrimPrefix(name, "local.")
-		// Note: We cannot distinguish @@var from @@session.var in the AST
-		// (both have Scope=SessionScope), so we don't error on session access
-		// to GLOBAL-only variables. This allows @@var to work correctly.
+
+		// Check if the user explicitly wrote @@session.var or @@local.var
+		// (as opposed to just @@var). We detect this from the raw query text
+		// because the AST doesn't distinguish @@var from @@session.var.
+		if v.Scope == sqlparser.SessionScope && (sysVarReadOnly[name] || sysVarGlobalOnly[name]) {
+			q := strings.ToLower(e.currentQuery)
+			// Check for explicit @@session.name or @@local.name anywhere in the query
+			// Use word boundary: the name must be followed by non-word char or end
+			hasSessionScope := false
+			for _, prefix := range []string{"@@session.", "@@local."} {
+				pattern := prefix + name
+				idx := strings.Index(q, pattern)
+				for idx >= 0 {
+					endPos := idx + len(pattern)
+					if endPos >= len(q) || !isIdentChar(q[endPos]) {
+						hasSessionScope = true
+						break
+					}
+					// Continue searching
+					next := strings.Index(q[endPos:], pattern)
+					if next < 0 {
+						break
+					}
+					idx = endPos + next
+				}
+				if hasSessionScope {
+					break
+				}
+			}
+			if hasSessionScope {
+				return nil, mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a GLOBAL variable", name))
+			}
+		}
+
+		// Check for @@global.session_only_var
+		if v.Scope == sqlparser.GlobalScope && sysVarSessionOnly[name] {
+			return nil, mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a SESSION variable", name))
+		}
+
 		// Check for user-set global variables first
 		if gv, ok := e.globalVars[name]; ok {
 			// Apply minimum constraints
@@ -15986,6 +16507,18 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.Sum:
 		return nil, nil
 	case *sqlparser.Count:
+		// In no-FROM context (e.g., SELECT COUNT(@@var)), evaluate the argument
+		// to propagate errors (e.g., scope errors) and count non-null values.
+		if len(v.Args) > 0 {
+			val, err := e.evalExpr(v.Args[0])
+			if err != nil {
+				return nil, err
+			}
+			if val != nil {
+				return int64(1), nil
+			}
+			return int64(0), nil
+		}
 		return int64(0), nil
 	case *sqlparser.TimestampDiffExpr:
 		v1, err := e.evalExpr(v.Expr1)
