@@ -435,7 +435,7 @@ var skipTests = map[string]bool{
 	// TIMEOUT: Multi-connection bug test
 	"innodb/innodb_bug59641": true,
 	// ERROR: CHECK TABLE not supported
-	"innodb/innodb_bulk_create_index":       true,
+	"innodb/innodb_bulk_create_index": true,
 	// TIMEOUT: Replication bulk create index
 	"innodb/innodb_bulk_create_index_replication": true,
 	// ERROR: Table doesn't exist after force recovery
@@ -1350,7 +1350,6 @@ var skipTests = map[string]bool{
 	"sys_vars/innodb_monitor_reset_all_basic":                 true,
 	"sys_vars/innodb_monitor_reset_basic":                     true,
 	"sys_vars/innodb_numa_interleave_basic":                   true,
-	"sys_vars/innodb_old_blocks_time_basic":                   true,
 	"sys_vars/innodb_online_alter_log_max_size_basic":         true,
 	"sys_vars/innodb_open_files_basic":                        true,
 	"sys_vars/innodb_optimize_fulltext_only_basic":            true,
