@@ -1316,7 +1316,6 @@ var skipTests = map[string]bool{
 	"sys_vars/innodb_fast_shutdown_basic":                     true,
 	"sys_vars/innodb_file_io_threads_basic":                   true,
 	"sys_vars/innodb_file_per_table_basic":                    true,
-	"sys_vars/innodb_fill_factor_basic":                       true,
 	"sys_vars/innodb_flush_log_at_timeout_basic":              true,
 	"sys_vars/innodb_flush_log_at_trx_commit_basic":           true,
 	"sys_vars/innodb_flush_method_basic":                      true,

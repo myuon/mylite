@@ -3597,6 +3597,25 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						n = 1
 					}
 					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+				} else if cleanName == "innodb_fill_factor" {
+					evalVal, err := e.evalExpr(expr.Expr)
+					if err != nil || evalVal == nil {
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+					}
+					n := toInt64(evalVal)
+					if n < 10 || n > 100 {
+						e.warnings = append(e.warnings, Warning{
+							Level:   "Warning",
+							Code:    1292,
+							Message: fmt.Sprintf("Truncated incorrect %s value: '%d'", cleanName, n),
+						})
+						if n < 10 {
+							n = 10
+						} else {
+							n = 100
+						}
+					}
+					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_tmpdir" {
 					// innodb_tmpdir must be a valid path
 					evalVal, _ := e.evalExpr(expr.Expr)
@@ -13354,6 +13373,7 @@ var sysVarGlobalOnly = map[string]bool{
 	"innodb_flush_log_at_timeout":              true,
 	"innodb_flush_neighbors":                   true,
 	"innodb_flush_sync":                        true,
+	"innodb_fill_factor":                       true,
 	"innodb_flushing_avg_loops":                true,
 	"innodb_ft_enable_diag_print":              true,
 	"innodb_ft_num_word_optimize":              true,
