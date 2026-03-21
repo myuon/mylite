@@ -2092,6 +2092,10 @@ func (e *Executor) dummyExplainRow(query string) []interface{} {
 	if strings.Contains(upper, "GROUP BY") || strings.Contains(upper, "SQL_BIG_RESULT") {
 		extra = "Using filesort"
 	}
+	if table == nil {
+		extra = "No tables used"
+		return []interface{}{int64(1), "SIMPLE", nil, nil, nil, nil, nil, nil, nil, nil, nil, extra}
+	}
 	return []interface{}{int64(1), "SIMPLE", table, nil, "ALL", nil, nil, nil, nil, rows, "100.00", extra}
 }
 
@@ -12937,6 +12941,11 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		}, nil
 	}
 
+	// SHOW PROCEDURE CODE / SHOW FUNCTION CODE - feature disabled (requires debug build)
+	if strings.HasPrefix(upper, "SHOW PROCEDURE CODE") || strings.HasPrefix(upper, "SHOW FUNCTION CODE") {
+		return nil, mysqlError(1289, "HY000", "The 'SHOW PROCEDURE|FUNCTION CODE' feature is disabled; you need MySQL built with '--with-debug' to have it working")
+	}
+
 	// SHOW CREATE DATABASE <db>
 	if strings.HasPrefix(upper, "SHOW CREATE DATABASE") || strings.HasPrefix(upper, "SHOW CREATE SCHEMA") {
 		parts := strings.Fields(query)
@@ -20310,7 +20319,13 @@ func toInt64(v interface{}) int64 {
 	case float64:
 		return int64(n)
 	case string:
-		i, _ := strconv.ParseInt(n, 10, 64)
+		i, err := strconv.ParseInt(n, 10, 64)
+		if err != nil {
+			// Try parsing as float and truncating (handles "1.6000" etc.)
+			if f, ferr := strconv.ParseFloat(n, 64); ferr == nil {
+				return int64(f)
+			}
+		}
 		return i
 	case bool:
 		if n {
