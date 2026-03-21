@@ -3957,6 +3957,21 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						n = 1000
 					}
 					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+				} else if cleanName == "innodb_ft_result_cache_limit" {
+					// INTEGER only, range 1000000..4294967295.
+					evalVal, err := e.evalExpr(expr.Expr)
+					if err != nil || evalVal == nil {
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+					}
+					n := toInt64(evalVal)
+					if n < 1000000 {
+						n = 1000000
+					}
+					const maxVal int64 = 4294967295
+					if n > maxVal {
+						n = maxVal
+					}
+					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_fill_factor" {
 					evalVal, err := e.evalExpr(expr.Expr)
 					if err != nil || evalVal == nil {
