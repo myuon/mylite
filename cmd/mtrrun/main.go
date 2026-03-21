@@ -1353,7 +1353,6 @@ var skipTests = map[string]bool{
 	"sys_vars/innodb_monitor_reset_all_basic":                 true,
 	"sys_vars/innodb_monitor_reset_basic":                     true,
 	"sys_vars/innodb_numa_interleave_basic":                   true,
-	"sys_vars/innodb_old_blocks_pct_basic":                    true,
 	"sys_vars/innodb_old_blocks_time_basic":                   true,
 	"sys_vars/innodb_online_alter_log_max_size_basic":         true,
 	"sys_vars/innodb_open_files_basic":                        true,
