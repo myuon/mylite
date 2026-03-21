@@ -3597,6 +3597,45 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						n = 1
 					}
 					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
+				} else if cleanName == "innodb_io_capacity" {
+					// INTEGER only, minimum 100, and cannot exceed innodb_io_capacity_max.
+					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
+						litStr := strings.TrimSpace(sqlparser.String(lit))
+						if strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"") || strings.ContainsAny(litStr, ".eE") {
+							return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+						}
+					}
+					evalVal, err := e.evalExpr(expr.Expr)
+					if err != nil || evalVal == nil {
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+					}
+					n := toInt64(evalVal)
+					if n < 100 {
+						e.warnings = append(e.warnings, Warning{
+							Level:   "Warning",
+							Code:    1292,
+							Message: fmt.Sprintf("Truncated incorrect %s value: '%d'", cleanName, n),
+						})
+						n = 100
+					}
+					maxVal := int64(2000)
+					if curMax, ok := e.globalVars["innodb_io_capacity_max"]; ok && curMax != "" {
+						if parsed, err := strconv.ParseInt(curMax, 10, 64); err == nil {
+							maxVal = parsed
+						}
+					} else if startupMax := e.startupVars["innodb_io_capacity_max"]; startupMax != "" {
+						if parsed, err := strconv.ParseInt(startupMax, 10, 64); err == nil {
+							maxVal = parsed
+						}
+					}
+					if n > maxVal {
+						e.warnings = append(e.warnings,
+							Warning{Level: "Warning", Code: 1210, Message: "innodb_io_capacity cannot be set higher than innodb_io_capacity_max."},
+							Warning{Level: "Warning", Code: 1210, Message: fmt.Sprintf("Setting innodb_io_capacity to %d", maxVal)},
+						)
+						n = maxVal
+					}
+					e.globalVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_fill_factor" {
 					evalVal, err := e.evalExpr(expr.Expr)
 					if err != nil || evalVal == nil {
