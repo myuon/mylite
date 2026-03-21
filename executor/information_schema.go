@@ -421,8 +421,10 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = []storage.Row{}
 	case "memory_summary_global_by_event_name":
 		rawRows = e.perfSchemaMemorySummary()
-	case "global_variables", "session_variables":
-		rawRows = e.perfSchemaVariables()
+	case "global_variables":
+		rawRows = e.perfSchemaVariablesScoped(true)
+	case "session_variables":
+		rawRows = e.perfSchemaVariablesScoped(false)
 	case "global_status", "session_status":
 		rawRows = e.perfSchemaStatus()
 	case "events_waits_history_long", "events_waits_current":
@@ -1148,7 +1150,12 @@ func (e *Executor) perfSchemaMemorySummary() []storage.Row {
 
 // perfSchemaVariables returns sorted rows for performance_schema.global_variables / session_variables.
 func (e *Executor) perfSchemaVariables() []storage.Row {
-	vars := e.buildVariablesMap()
+	return e.perfSchemaVariablesScoped(false)
+}
+
+// perfSchemaVariablesScoped returns sorted rows scoped to global or session.
+func (e *Executor) perfSchemaVariablesScoped(globalOnly bool) []storage.Row {
+	vars := e.buildVariablesMapScoped(globalOnly)
 	names := make([]string, 0, len(vars))
 	for n := range vars {
 		names = append(names, n)

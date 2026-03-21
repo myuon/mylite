@@ -4218,39 +4218,6 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						}
 						e.sessionScopeVars[cleanName] = enumVal
 					} else if isBooleanVariable(cleanName) {
-						// MySQL keeps the old value for this historical bug-compat path.
-						if cleanName == "innodb_adaptive_flushing" {
-							if lit, ok := expr.Expr.(*sqlparser.Literal); ok {
-								litStr := strings.TrimSpace(sqlparser.String(lit))
-								if strings.HasPrefix(litStr, "-") {
-									if n, pErr := strconv.ParseInt(litStr, 10, 64); pErr == nil && n < 0 {
-										continue
-									}
-								}
-							}
-							switch v := evalVal.(type) {
-							case int:
-								if v < 0 {
-									continue
-								}
-							case int8:
-								if v < 0 {
-									continue
-								}
-							case int16:
-								if v < 0 {
-									continue
-								}
-							case int32:
-								if v < 0 {
-									continue
-								}
-							case int64:
-								if v < 0 {
-									continue
-								}
-							}
-						}
 						boolVal, bErr := normalizeBooleanSetValue(cleanName, expr.Expr, evalVal)
 						if bErr != nil {
 							return nil, bErr
@@ -14045,12 +14012,41 @@ var sysVarReadOnly = map[string]bool{
 	"sha256_password_public_key_path":              true,
 	"caching_sha2_password_private_key_path":       true,
 	"caching_sha2_password_public_key_path":        true,
+	"error_count":                                  true,
+	"warning_count":                                true,
+	"innodb_redo_log_capacity":                     true,
+	"innodb_doublewrite":                           true,
+	"innodb_rollback_on_timeout":                   true,
+	"default_authentication_plugin":                true,
+	"disconnect_on_expired_password":               true,
+	"gtid_executed":                                true,
+	"gtid_owned":                                   true,
+	"relay_log":                                    true,
+	"relay_log_info_file":                          true,
+	"relay_log_recovery":                           true,
+	"relay_log_space_limit":                        true,
+	"relay_log_basename":                           true,
+	"relay_log_index":                              true,
+	"slave_skip_errors":                            true,
+	"table_open_cache_instances":                   true,
+	"report_host":                                  true,
+	"report_port":                                  true,
+	"report_user":                                  true,
+	"report_password":                              true,
+	"skip_name_resolve":                            true,
+	"innodb_directories":                           true,
+	"innodb_undo_tablespaces":                      true,
 }
 
 // sysVarGlobalOnly contains system variables that can only be SET at GLOBAL scope.
 // Only includes variables where we are 100% certain they are GLOBAL-only in MySQL 8.0.
 var sysVarGlobalOnly = map[string]bool{
+	"automatic_sp_privileges":                  true,
 	"avoid_temporal_upgrade":                   true,
+	"relay_log_purge":                         true,
+	"stored_program_cache":                    true,
+	"slow_query_log":                          true,
+	"slow_query_log_file":                     true,
 	"binlog_cache_size":                        true,
 	"binlog_error_action":                      true,
 	"binlog_expire_logs_seconds":               true,
@@ -14337,6 +14333,12 @@ var sysVarSessionOnly = map[string]bool{
 	"pseudo_slave_mode":          true,
 	"transaction_allow_batching": true,
 	"sql_log_bin":                true,
+	"error_count":                true,
+	"warning_count":              true,
+	"original_commit_timestamp":  true,
+	"original_server_version":    true,
+	"immediate_server_version":   true,
+	"rbr_exec_mode":              true,
 }
 
 // sysVarBoolean contains system variables that are boolean type (ON/OFF).
@@ -14388,10 +14390,45 @@ var sysVarBoolean = map[string]bool{
 	"local_infile": true, "myisam_use_mmap": true,
 	"temptable_use_mmap": true, "sql_log_off": true,
 	"innodb_doublewrite": true,
+	"automatic_sp_privileges": true,
 }
 
 func isBooleanVariable(name string) bool {
 	return sysVarBoolean[name]
+}
+
+// sysVarBoolAcceptNegative contains boolean variables that accept negative integers
+// as ON due to MySQL BUG#50643. Normal boolean variables reject negatives.
+var sysVarBoolAcceptNegative = map[string]bool{
+	"innodb_adaptive_flushing":       true,
+	"innodb_adaptive_hash_index":     true,
+	"innodb_disable_sort_file_cache": true,
+	"innodb_flush_sync":              true,
+	"innodb_ft_enable_diag_print":    true,
+	"innodb_ft_enable_stopword":      true,
+	"innodb_optimize_fulltext_only":  true,
+	"innodb_parallel_read_threads":   true,
+	"innodb_print_all_deadlocks":     true,
+	"innodb_random_read_ahead":       true,
+	"innodb_stats_on_metadata":       true,
+	"innodb_status_output":           true,
+	"innodb_status_output_locks":     true,
+	"innodb_strict_mode":             true,
+	"innodb_cmp_per_index_enabled":   true,
+	"innodb_redo_log_encrypt":        true,
+	"innodb_undo_log_encrypt":        true,
+	"innodb_table_locks":             true,
+	"innodb_deadlock_detect":         true,
+	"innodb_log_checksums":           true,
+	"innodb_log_compressed_pages":    true,
+	"innodb_log_writer_threads":      true,
+	"innodb_print_ddl_log":           true,
+	"innodb_stats_include_delete_marked": true,
+	"innodb_buffer_pool_dump_at_shutdown": true,
+	"innodb_buffer_pool_dump_now":    true,
+	"innodb_buffer_pool_in_core_file": true,
+	"innodb_buffer_pool_load_abort":  true,
+	"innodb_buffer_pool_load_now":    true,
 }
 
 type intVarRange struct {
@@ -14406,12 +14443,12 @@ var sysVarIntRange = map[string]intVarRange{
 	"auto_increment_offset":                    {Min: 1, Max: 65535, IsUnsigned: true},
 	"connect_timeout":                          {Min: 2, Max: 31536000, IsUnsigned: true},
 	"default_week_format":                      {Min: 0, Max: 7, IsUnsigned: true},
-	"delayed_insert_timeout":                   {Min: 1, Max: 4294967286, IsUnsigned: true},
+	"delayed_insert_timeout":                   {Min: 1, Max: 31536000, IsUnsigned: true},
 	"div_precision_increment":                  {Min: 0, Max: 30, IsUnsigned: true},
 	"innodb_compression_failure_threshold_pct": {Min: 0, Max: 100, IsUnsigned: true},
 	"innodb_compression_pad_pct_max":           {Min: 0, Max: 75, IsUnsigned: true},
 	"innodb_flush_log_at_timeout":              {Min: 0, Max: 2700, IsUnsigned: true},
-	"innodb_flushing_avg_loops":                {Min: 0, Max: 70, IsUnsigned: true},
+	"innodb_flushing_avg_loops":                {Min: 1, Max: 1000, IsUnsigned: true},
 	"innodb_max_purge_lag":                     {Min: 0, Max: 4294967295, IsUnsigned: true},
 	"innodb_max_purge_lag_delay":               {Min: 0, Max: 4294967295, IsUnsigned: true},
 	"innodb_purge_batch_size":                  {Min: 0, Max: 4294967295, IsUnsigned: true},
@@ -14435,8 +14472,8 @@ var sysVarIntRange = map[string]intVarRange{
 	"binlog_transaction_dependency_history_size": {Min: 1, Max: 1000000, IsUnsigned: true},
 	"cte_max_recursion_depth":                  {Min: 0, Max: 4294967295, IsUnsigned: true},
 	"default_password_lifetime":                {Min: 0, Max: 65535, IsUnsigned: true},
-	"delayed_insert_limit":                     {Min: 1, Max: 4294967295, IsUnsigned: true},
-	"delayed_queue_size":                       {Min: 1, Max: 4294967295, IsUnsigned: true},
+	"delayed_insert_limit":                     {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
+	"delayed_queue_size":                       {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
 	"eq_range_index_dive_limit":                {Min: 0, Max: 4294967295, IsUnsigned: true},
 	"expire_logs_days":                         {Min: 0, Max: 99, IsUnsigned: true},
 	"flush_time":                               {Min: 0, Max: 31536000, IsUnsigned: true},
@@ -14749,12 +14786,14 @@ func normalizeBooleanToken(raw string) (int64, bool, bool) {
 		if n == 0 || n == 1 {
 			return n, true, false
 		}
+		// Negative integers: not normally accepted. BUG#50643 handling is in normalizeBooleanSetValue.
 		return n, false, false
 	}
 	if u, err := strconv.ParseUint(s, 10, 64); err == nil {
 		if u == 0 || u == 1 {
 			return int64(u), true, false
 		}
+		// Positive integers > 1 are rejected
 		return int64(u), false, false
 	}
 	return 0, false, false
@@ -14787,11 +14826,16 @@ func normalizeEnumSetValue(name string, expr sqlparser.Expr, evalVal interface{}
 		if mapped, ok := normalize(fmt.Sprintf("%v", v)); ok {
 			return mapped, nil
 		}
-		return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%v'", name, v))
+		valStr := "NULL"
+		if v != nil {
+			valStr = fmt.Sprintf("%v", v)
+		}
+		return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", name, valStr))
 	}
 }
 
 func normalizeBooleanSetValue(name string, expr sqlparser.Expr, evalVal interface{}) (string, error) {
+	acceptNeg := sysVarBoolAcceptNegative[name]
 	if lit, isLit := expr.(*sqlparser.Literal); isLit {
 		litStr := strings.TrimSpace(sqlparser.String(lit))
 		n, ok, typeErr := normalizeBooleanToken(litStr)
@@ -14799,6 +14843,12 @@ func normalizeBooleanSetValue(name string, expr sqlparser.Expr, evalVal interfac
 			return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
 		}
 		if !ok {
+			// Check if it's a negative integer for BUG#50643 variables
+			if acceptNeg && strings.HasPrefix(litStr, "-") {
+				if _, err := strconv.ParseInt(litStr, 10, 64); err == nil {
+					return "1", nil // negative → ON
+				}
+			}
 			unq := strings.Trim(litStr, "'\"")
 			return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", name, unq))
 		}
@@ -14813,6 +14863,13 @@ func normalizeBooleanSetValue(name string, expr sqlparser.Expr, evalVal interfac
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 		n, ok, _ := normalizeBooleanToken(fmt.Sprintf("%v", v))
 		if !ok {
+			// Check if it's a negative integer for BUG#50643 variables
+			if acceptNeg {
+				s := fmt.Sprintf("%v", v)
+				if strings.HasPrefix(s, "-") {
+					return "1", nil // negative → ON
+				}
+			}
 			return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%v'", name, v))
 		}
 		return strconv.FormatInt(n, 10), nil
@@ -14824,11 +14881,20 @@ func normalizeBooleanSetValue(name string, expr sqlparser.Expr, evalVal interfac
 			return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
 		}
 		if !ok {
+			if acceptNeg && strings.HasPrefix(v, "-") {
+				if _, err := strconv.ParseInt(v, 10, 64); err == nil {
+					return "1", nil
+				}
+			}
 			return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", name, strings.Trim(v, "'\"")))
 		}
 		return strconv.FormatInt(n, 10), nil
 	default:
-		return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%v'", name, evalVal))
+		valStr := "NULL"
+		if evalVal != nil {
+			valStr = fmt.Sprintf("%v", evalVal)
+		}
+		return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", name, valStr))
 	}
 }
 
@@ -14843,7 +14909,7 @@ func (e *Executor) checkSelectScopeErrors(stmt *sqlparser.Select) error {
 		case *sqlparser.Variable:
 			if v.Scope == sqlparser.SessionScope {
 				name := strings.ToLower(v.Name.String())
-				if sysVarReadOnly[name] || sysVarGlobalOnly[name] {
+				if !sysVarSessionOnly[name] && (sysVarReadOnly[name] || sysVarGlobalOnly[name]) {
 					// Check if the raw query has @@session. or @@local. prefix
 					for _, prefix := range []string{"@@session.", "@@local."} {
 						pattern := prefix + name
@@ -15112,7 +15178,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"collation_connection":     "utf8mb4_0900_ai_ci",
 
 		// Server identity
-		"version":                 "8.0.32",
+		"version":                 "8.4.0-mylite",
 		"version_comment":         "mylite",
 		"version_compile_machine": "x86_64",
 		"version_compile_os":      "Linux",
@@ -15131,6 +15197,9 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		// SQL modes and behavior
 		"sql_mode":                   "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
 		"lower_case_table_names":     "0",
+		"lower_case_file_system":     "OFF",
+		"license":                    "GPL",
+		"core_file":                  "ON",
 		"max_allowed_packet":         "67108864",
 		"default_storage_engine":     "InnoDB",
 		"default_tmp_storage_engine": "InnoDB",
@@ -15164,7 +15233,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"preload_buffer_size":      "32768",
 
 		// Logging
-		"general_log":                     "ON",
+		"general_log":                     "OFF",
 		"general_log_file":                "localhost.log",
 		"slow_query_log":                  "OFF",
 		"slow_query_log_file":             "localhost-slow.log",
@@ -15194,7 +15263,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"binlog_direct_non_transactional_updates":        "OFF",
 		"binlog_order_commits":                           "ON",
 		"binlog_error_action":                            "ABORT_SERVER",
-		"binlog_expire_logs_seconds":                     "0",
+		"binlog_expire_logs_seconds":                     "2592000",
 		"binlog_group_commit_sync_delay":                 "0",
 		"binlog_group_commit_sync_no_delay_count":        "0",
 		"binlog_gtid_simple_recovery":                    "ON",
@@ -15620,7 +15689,6 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 
 	// Override with SET GLOBAL values
 	for name, val := range e.globalScopeVars {
-		// Apply minimum/maximum constraints for known variables
 		if name == "innodb_stats_transient_sample_pages" || name == "innodb_stats_persistent_sample_pages" {
 			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n < 1 {
 				val = "1"
@@ -16431,7 +16499,10 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.NullVal:
 		return nil, nil
 	case sqlparser.BoolVal:
-		return bool(v), nil
+		if bool(v) {
+			return int64(1), nil
+		}
+		return int64(0), nil
 	case *sqlparser.ColName:
 		// If we have a row context (correlatedRow), look up the actual value
 		if e.correlatedRow != nil {
@@ -16489,7 +16560,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		// Check if the user explicitly wrote @@session.var or @@local.var
 		// (as opposed to just @@var). We detect this from the raw query text
 		// because the AST doesn't distinguish @@var from @@session.var.
-		if v.Scope == sqlparser.SessionScope && (sysVarReadOnly[name] || sysVarGlobalOnly[name]) {
+		if v.Scope == sqlparser.SessionScope && !sysVarSessionOnly[name] && (sysVarReadOnly[name] || sysVarGlobalOnly[name]) {
 			q := strings.ToLower(e.currentQuery)
 			// Check for explicit @@session.name or @@local.name anywhere in the query
 			// Use word boundary: the name must be followed by non-word char or end
@@ -16610,7 +16681,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		case "innodb_flush_method":
 			return "O_DIRECT", nil
 		case "innodb_tmpdir":
-			return "", nil
+			return nil, nil
 		case "innodb_data_file_path":
 			return "ibdata1:12M:autoextend", nil
 		case "innodb_change_buffering":
@@ -16644,7 +16715,11 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			"ssl_crl", "ssl_crlpath",
 			"mysqlx_ssl_crl", "mysqlx_ssl_crlpath",
 			"innodb_ft_aux_table",
-			"init_file":
+			"init_file",
+			"report_host", "report_user", "report_password",
+			"innodb_directories",
+			"innodb_ft_server_stopword_table", "innodb_ft_user_stopword_table",
+			"innodb_data_home_dir":
 			return nil, nil
 		}
 		// Fall back to the full variables map (SHOW VARIABLES / performance_schema)
@@ -16999,7 +17074,11 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			case "SIGNED", "INT", "INTEGER", "BIGINT":
 				return toInt64(val), nil
 			case "UNSIGNED":
-				return toInt64(val), nil
+				n := toInt64(val)
+				if n < 0 {
+					return uint64(n), nil
+				}
+				return uint64(n), nil
 			case "CHAR", "VARCHAR", "TEXT":
 				if val == nil {
 					return nil, nil
