@@ -8822,7 +8822,15 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 		}
 		// Check CTE map first.
 		if e.cteMap != nil {
-			if cteTbl, ok := e.cteMap[tableName]; ok {
+			cteLookup := tableName
+			// Schema-qualified CTE: strip schema prefix (e.g. test.qn -> qn)
+			if strings.Contains(cteLookup, ".") {
+				parts := strings.SplitN(cteLookup, ".", 2)
+				if _, ok := e.cteMap[parts[1]]; ok {
+					cteLookup = parts[1]
+				}
+			}
+			if cteTbl, ok := e.cteMap[cteLookup]; ok {
 				result := make([]storage.Row, len(cteTbl.rows))
 				for i, row := range cteTbl.rows {
 					newRow := make(storage.Row, len(row)*2)
@@ -9921,26 +9929,47 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 
 		for _, cte := range stmt.With.CTEs {
 			cteName := cte.ID.String()
-			// Execute the CTE subquery.
-			subSel, ok := cte.Subquery.(*sqlparser.Select)
-			if !ok {
-				return nil, fmt.Errorf("CTE '%s': only SELECT subqueries are supported", cteName)
+			// Execute the CTE subquery (supports both SELECT and UNION).
+			var subResult *Result
+			switch sub := cte.Subquery.(type) {
+			case *sqlparser.Select:
+				var err error
+				subResult, err = e.execSelect(sub)
+				if err != nil {
+					return nil, fmt.Errorf("CTE '%s': %w", cteName, err)
+				}
+			case *sqlparser.Union:
+				var err error
+				subResult, err = e.execUnion(sub)
+				if err != nil {
+					return nil, fmt.Errorf("CTE '%s': %w", cteName, err)
+				}
+			default:
+				return nil, fmt.Errorf("CTE '%s': unsupported subquery type", cteName)
 			}
-			subResult, err := e.execSelect(subSel)
-			if err != nil {
-				return nil, fmt.Errorf("CTE '%s': %w", cteName, err)
+			columns := make([]string, len(subResult.Columns))
+			copy(columns, subResult.Columns)
+			// Apply CTE column aliases if specified: WITH qn(a,b) AS (...)
+			if len(cte.Columns) > 0 {
+				for ci, ca := range cte.Columns {
+					if ci < len(columns) {
+						columns[ci] = ca.String()
+					}
+				}
 			}
 			// Convert result rows into storage.Row maps.
 			cteRows := make([]storage.Row, len(subResult.Rows))
 			for i, row := range subResult.Rows {
-				r := make(storage.Row, len(subResult.Columns))
-				for j, col := range subResult.Columns {
-					r[col] = row[j]
+				r := make(storage.Row, len(columns))
+				for j, col := range columns {
+					if j < len(row) {
+						r[col] = row[j]
+					}
 				}
 				cteRows[i] = r
 			}
 			newCTEMap[cteName] = &cteTable{
-				columns: subResult.Columns,
+				columns: columns,
 				rows:    cteRows,
 			}
 		}
@@ -11384,6 +11413,50 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 }
 
 func (e *Executor) execUnion(stmt *sqlparser.Union) (*Result, error) {
+	// Process WITH clause (Common Table Expressions) if present on the UNION.
+	if stmt.With != nil && len(stmt.With.CTEs) > 0 {
+		outerCTEMap := e.cteMap
+		newCTEMap := make(map[string]*cteTable)
+		if outerCTEMap != nil {
+			for k, v := range outerCTEMap {
+				newCTEMap[k] = v
+			}
+		}
+		e.cteMap = newCTEMap
+		defer func() { e.cteMap = outerCTEMap }()
+
+		for _, cte := range stmt.With.CTEs {
+			cteName := cte.ID.String()
+			subResult, err := e.execTableStmtForUnion(cte.Subquery)
+			if err != nil {
+				return nil, fmt.Errorf("CTE '%s': %w", cteName, err)
+			}
+			columns := subResult.Columns
+			// Apply CTE column aliases if specified.
+			if len(cte.Columns) > 0 {
+				for ci, ca := range cte.Columns {
+					if ci < len(columns) {
+						columns[ci] = ca.String()
+					}
+				}
+			}
+			cteRows := make([]storage.Row, len(subResult.Rows))
+			for i, row := range subResult.Rows {
+				r := make(storage.Row, len(columns))
+				for j, col := range columns {
+					if j < len(row) {
+						r[col] = row[j]
+					}
+				}
+				cteRows[i] = r
+			}
+			newCTEMap[cteName] = &cteTable{
+				columns: columns,
+				rows:    cteRows,
+			}
+		}
+	}
+
 	// Execute left side directly from AST so nested UNION semantics stay intact.
 	leftResult, err := e.execTableStmtForUnion(stmt.Left)
 	if err != nil {
@@ -13449,6 +13522,22 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 	descDB = resolvedDBName
 	tblDef, resolvedTableName, err := findTableDefCaseInsensitive(db, tableName)
 	if err != nil {
+		// Check if it's a view — derive column info from executing the view's SELECT.
+		if e.views != nil {
+			viewLookup := tableName
+			if _, ok := e.views[viewLookup]; !ok {
+				// Try case-insensitive lookup
+				for vn := range e.views {
+					if strings.EqualFold(vn, viewLookup) {
+						viewLookup = vn
+						break
+					}
+				}
+			}
+			if viewSQL, ok := e.views[viewLookup]; ok {
+				return e.describeView(viewSQL)
+			}
+		}
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", descDB, tableName))
 	}
 	tableName = resolvedTableName
@@ -13520,6 +13609,42 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 		rows = append(rows, []interface{}{col.Name, mysqlDisplayType(col.Type), nullable, key, defVal, extra})
 	}
 
+	return &Result{
+		Columns:     cols,
+		Rows:        rows,
+		IsResultSet: true,
+	}, nil
+}
+
+// describeView derives DESCRIBE-style column info by executing the view's SELECT
+// and inferring types from the result set.
+func (e *Executor) describeView(viewSQL string) (*Result, error) {
+	viewResult, err := e.Execute(viewSQL)
+	if err != nil {
+		return nil, err
+	}
+	cols := []string{"Field", "Type", "Null", "Key", "Default", "Extra"}
+	rows := make([][]interface{}, 0, len(viewResult.Columns))
+	for i, colName := range viewResult.Columns {
+		// Infer type from the first non-nil value in this column
+		colType := "varchar(255)" // default for unknown
+		if len(viewResult.Rows) > 0 {
+			for _, row := range viewResult.Rows {
+				if i < len(row) && row[i] != nil {
+					switch row[i].(type) {
+					case int64, uint64:
+						colType = "bigint"
+					case float64:
+						colType = "double"
+					default:
+						colType = "varchar(255)"
+					}
+					break
+				}
+			}
+		}
+		rows = append(rows, []interface{}{colName, colType, "YES", "", nil, ""})
+	}
 	return &Result{
 		Columns:     cols,
 		Rows:        rows,
@@ -15795,7 +15920,31 @@ func (e *Executor) showStatus(upper string) (*Result, error) {
 		Name  string
 		Value string
 	}{
+		{Name: "Aborted_clients", Value: "0"},
+		{Name: "Aborted_connects", Value: "0"},
+		{Name: "Bytes_received", Value: "0"},
+		{Name: "Bytes_sent", Value: "0"},
+		{Name: "Com_select", Value: "1"},
+		{Name: "Connections", Value: "1"},
+		{Name: "Handler_read_first", Value: "0"},
+		{Name: "Handler_read_key", Value: "0"},
+		{Name: "Handler_read_next", Value: "0"},
+		{Name: "Handler_read_prev", Value: "0"},
+		{Name: "Handler_read_rnd", Value: "0"},
+		{Name: "Handler_read_rnd_next", Value: "0"},
 		{Name: "Handler_update", Value: "0"},
+		{Name: "Handler_write", Value: "0"},
+		{Name: "Max_used_connections", Value: "1"},
+		{Name: "Open_tables", Value: "0"},
+		{Name: "Opened_tables", Value: "0"},
+		{Name: "Queries", Value: "1"},
+		{Name: "Questions", Value: "1"},
+		{Name: "Slow_queries", Value: "0"},
+		{Name: "Threads_cached", Value: "0"},
+		{Name: "Threads_connected", Value: "1"},
+		{Name: "Threads_created", Value: "1"},
+		{Name: "Threads_running", Value: "1"},
+		{Name: "Uptime", Value: "1"},
 	}
 	rows := make([][]interface{}, 0, len(statusVars))
 	for _, sv := range statusVars {
@@ -16196,6 +16345,26 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	showDB = resolvedDBName
 	def, resolvedTableName, err := findTableDefCaseInsensitive(db, tableName)
 	if err != nil {
+		// Check if it's a view — return SHOW CREATE VIEW style output.
+		if e.views != nil {
+			viewLookup := tableName
+			if _, ok := e.views[viewLookup]; !ok {
+				for vn := range e.views {
+					if strings.EqualFold(vn, viewLookup) {
+						viewLookup = vn
+						break
+					}
+				}
+			}
+			if viewSQL, ok := e.views[viewLookup]; ok {
+				createView := fmt.Sprintf("CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `%s` AS %s", viewLookup, viewSQL)
+				return &Result{
+					Columns:     []string{"View", "Create View", "character_set_client", "collation_connection"},
+					Rows:        [][]interface{}{{viewLookup, createView, "utf8mb4", "utf8mb4_0900_ai_ci"}},
+					IsResultSet: true,
+				}, nil
+			}
+		}
 		return nil, fmt.Errorf("ERROR 1146 (42S02): Table '%s.%s' doesn't exist", showDB, tableName)
 	}
 	tableName = resolvedTableName
@@ -23427,6 +23596,16 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 				if ls == rs {
 					return v.Operator == sqlparser.InOp, nil
 				}
+				// Case-insensitive match for INFORMATION_SCHEMA rows
+				if row["__is_info_schema__"] != nil {
+					if _, isLS := left.(string); isLS {
+						if _, isRS := val.(string); isRS {
+							if strings.EqualFold(ls, rs) {
+								return v.Operator == sqlparser.InOp, nil
+							}
+						}
+					}
+				}
 			}
 			// For NOT IN: if any tuple value is NULL and no match found, result is UNKNOWN (false)
 			if v.Operator == sqlparser.NotInOp && hasNull {
@@ -23557,7 +23736,26 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 		if err != nil {
 			return false, err
 		}
-		return compareValues(left, right, v.Operator)
+		result, err := compareValues(left, right, v.Operator)
+		if err != nil {
+			return false, err
+		}
+		// For INFORMATION_SCHEMA rows, apply case-insensitive string comparison
+		// to match MySQL's default utf8mb4_0900_ai_ci collation behavior.
+		if !result && row["__is_info_schema__"] != nil {
+			if ls, lok := left.(string); lok {
+				if rs, rok := right.(string); rok {
+					ci := strings.EqualFold(ls, rs)
+					switch v.Operator {
+					case sqlparser.EqualOp:
+						return ci, nil
+					case sqlparser.NotEqualOp:
+						return !ci, nil
+					}
+				}
+			}
+		}
+		return result, err
 	case *sqlparser.AndExpr:
 		l, err := e.evalWhere(v.Left, row)
 		if err != nil {

@@ -1511,8 +1511,11 @@ func (ctx *execContext) handleHereDocDirective(lines []string, i int) (bool, int
 }
 
 func (ctx *execContext) evaluateIfCondition(condStr string) bool {
-	// Remove outer parentheses
+	// Remove trailing { that may be attached to the condition
 	condStr = strings.TrimSpace(condStr)
+	condStr = strings.TrimRight(condStr, " \t{")
+	condStr = strings.TrimSpace(condStr)
+	// Remove outer parentheses
 	if strings.HasPrefix(condStr, "(") && strings.HasSuffix(condStr, ")") {
 		condStr = condStr[1 : len(condStr)-1]
 		condStr = strings.TrimSpace(condStr)

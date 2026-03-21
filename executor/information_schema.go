@@ -608,7 +608,9 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 
 	result := make([]storage.Row, len(rawRows))
 	for i, row := range rawRows {
-		newRow := make(storage.Row, len(row)*2)
+		newRow := make(storage.Row, len(row)*3+1)
+		// Mark row as INFORMATION_SCHEMA for case-insensitive WHERE comparison
+		newRow["__is_info_schema__"] = true
 		for k, v := range row {
 			newRow[k] = v
 			newRow[alias+"."+k] = v
@@ -1110,7 +1112,9 @@ func (e *Executor) showTableStatus() (*Result, error) {
 }
 
 // infoSchemaEngines returns rows for INFORMATION_SCHEMA.ENGINES.
-// mylite only supports InnoDB (as a compatibility layer).
+// mylite treats all engines as InnoDB internally, but reports MyISAM, MEMORY,
+// CSV, etc. as available so that tests using --source include/have_myisam.inc
+// (and similar) do not self-skip.
 func (e *Executor) infoSchemaEngines() []storage.Row {
 	return []storage.Row{
 		{
@@ -1120,6 +1124,70 @@ func (e *Executor) infoSchemaEngines() []storage.Row {
 			"TRANSACTIONS": "YES",
 			"XA":           "YES",
 			"SAVEPOINTS":   "YES",
+		},
+		{
+			"ENGINE":       "MyISAM",
+			"SUPPORT":      "YES",
+			"COMMENT":      "MyISAM storage engine",
+			"TRANSACTIONS": "NO",
+			"XA":           "NO",
+			"SAVEPOINTS":   "NO",
+		},
+		{
+			"ENGINE":       "MEMORY",
+			"SUPPORT":      "YES",
+			"COMMENT":      "Hash based, stored in memory, useful for temporary tables",
+			"TRANSACTIONS": "NO",
+			"XA":           "NO",
+			"SAVEPOINTS":   "NO",
+		},
+		{
+			"ENGINE":       "CSV",
+			"SUPPORT":      "YES",
+			"COMMENT":      "CSV storage engine",
+			"TRANSACTIONS": "NO",
+			"XA":           "NO",
+			"SAVEPOINTS":   "NO",
+		},
+		{
+			"ENGINE":       "ARCHIVE",
+			"SUPPORT":      "YES",
+			"COMMENT":      "Archive storage engine",
+			"TRANSACTIONS": "NO",
+			"XA":           "NO",
+			"SAVEPOINTS":   "NO",
+		},
+		{
+			"ENGINE":       "BLACKHOLE",
+			"SUPPORT":      "YES",
+			"COMMENT":      "/dev/null storage engine",
+			"TRANSACTIONS": "NO",
+			"XA":           "NO",
+			"SAVEPOINTS":   "NO",
+		},
+		{
+			"ENGINE":       "FEDERATED",
+			"SUPPORT":      "NO",
+			"COMMENT":      "Federated MySQL storage engine",
+			"TRANSACTIONS": "NO",
+			"XA":           "NO",
+			"SAVEPOINTS":   "NO",
+		},
+		{
+			"ENGINE":       "MRG_MYISAM",
+			"SUPPORT":      "YES",
+			"COMMENT":      "Collection of identical MyISAM tables",
+			"TRANSACTIONS": "NO",
+			"XA":           "NO",
+			"SAVEPOINTS":   "NO",
+		},
+		{
+			"ENGINE":       "PERFORMANCE_SCHEMA",
+			"SUPPORT":      "YES",
+			"COMMENT":      "Performance Schema",
+			"TRANSACTIONS": "NO",
+			"XA":           "NO",
+			"SAVEPOINTS":   "NO",
 		},
 	}
 }
