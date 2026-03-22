@@ -14541,7 +14541,6 @@ var sysVarReadOnly = map[string]bool{
 	"report_password":                              true,
 	"skip_name_resolve":                            true,
 	"innodb_directories":                           true,
-	"innodb_undo_tablespaces":                      true,
 }
 
 // sysVarGlobalOnly contains system variables that can only be SET at GLOBAL scope.
@@ -14562,7 +14561,11 @@ var sysVarGlobalOnly = map[string]bool{
 	"binlog_order_commits":                     true,
 	"binlog_stmt_cache_size":                   true,
 	"check_proxy_users":                        true,
+	"concurrent_insert":                        true,
 	"connect_timeout":                          true,
+	"innodb_undo_tablespaces":                  true,
+	"max_allowed_packet":                       true,
+	"max_prepared_stmt_count":                  true,
 	"default_authentication_plugin":            true,
 	"default_password_lifetime":                true,
 	"disconnect_on_expired_password":           true,
@@ -14836,6 +14839,179 @@ var sysVarEnumValues = map[string]map[string]string{
 		"NOBLOB":  "NOBLOB",
 		"FULL":    "FULL",
 	},
+	"binlog_row_metadata": {
+		"0":       "MINIMAL",
+		"1":       "FULL",
+		"MINIMAL": "MINIMAL",
+		"FULL":    "FULL",
+	},
+	"binlog_checksum": {
+		"0":    "NONE",
+		"1":    "CRC32",
+		"NONE": "NONE",
+		"CRC32": "CRC32",
+	},
+	"binlog_error_action": {
+		"0":            "IGNORE_ERROR",
+		"1":            "ABORT_SERVER",
+		"IGNORE_ERROR": "IGNORE_ERROR",
+		"ABORT_SERVER":  "ABORT_SERVER",
+	},
+	"innodb_stats_method": {
+		"0":              "nulls_equal",
+		"1":              "nulls_unequal",
+		"2":              "nulls_ignored",
+		"NULLS_EQUAL":    "nulls_equal",
+		"NULLS_UNEQUAL":  "nulls_unequal",
+		"NULLS_IGNORED":  "nulls_ignored",
+	},
+	"myisam_stats_method": {
+		"0":              "nulls_unequal",
+		"1":              "nulls_equal",
+		"2":              "nulls_ignored",
+		"NULLS_UNEQUAL":  "nulls_unequal",
+		"NULLS_EQUAL":    "nulls_equal",
+		"NULLS_IGNORED":  "nulls_ignored",
+	},
+	"completion_type": {
+		"0":        "NO_CHAIN",
+		"1":        "CHAIN",
+		"2":        "RELEASE",
+		"NO_CHAIN": "NO_CHAIN",
+		"CHAIN":    "CHAIN",
+		"RELEASE":  "RELEASE",
+	},
+	"concurrent_insert": {
+		"0":      "NEVER",
+		"1":      "AUTO",
+		"2":      "ALWAYS",
+		"NEVER":  "NEVER",
+		"AUTO":   "AUTO",
+		"ALWAYS": "ALWAYS",
+	},
+	"delay_key_write": {
+		"0":   "OFF",
+		"1":   "ON",
+		"2":   "ALL",
+		"OFF": "OFF",
+		"ON":  "ON",
+		"ALL": "ALL",
+	},
+	"enforce_gtid_consistency": {
+		"0":    "OFF",
+		"1":    "ON",
+		"2":    "WARN",
+		"OFF":  "OFF",
+		"ON":   "ON",
+		"WARN": "WARN",
+	},
+	"innodb_change_buffering": {
+		"0":       "none",
+		"1":       "inserts",
+		"2":       "deletes",
+		"3":       "changes",
+		"4":       "purges",
+		"5":       "all",
+		"NONE":    "none",
+		"INSERTS": "inserts",
+		"DELETES": "deletes",
+		"CHANGES": "changes",
+		"PURGES":  "purges",
+		"ALL":     "all",
+	},
+	"innodb_checksum_algorithm": {
+		"0":              "crc32",
+		"1":              "strict_crc32",
+		"2":              "innodb",
+		"3":              "strict_innodb",
+		"4":              "none",
+		"5":              "strict_none",
+		"CRC32":          "crc32",
+		"STRICT_CRC32":   "strict_crc32",
+		"INNODB":         "innodb",
+		"STRICT_INNODB":  "strict_innodb",
+		"NONE":           "none",
+		"STRICT_NONE":    "strict_none",
+	},
+	"innodb_default_row_format": {
+		"0":         "redundant",
+		"1":         "compact",
+		"2":         "dynamic",
+		"REDUNDANT": "redundant",
+		"COMPACT":   "compact",
+		"DYNAMIC":   "dynamic",
+	},
+	"innodb_flush_method": {
+		"FSYNC":          "fsync",
+		"O_DSYNC":        "O_DSYNC",
+		"LITTLESYNC":     "littlesync",
+		"NOSYNC":         "nosync",
+		"O_DIRECT":       "O_DIRECT",
+		"O_DIRECT_NO_FSYNC": "O_DIRECT_NO_FSYNC",
+	},
+	"log_timestamps": {
+		"0":     "UTC",
+		"1":     "SYSTEM",
+		"UTC":   "UTC",
+		"SYSTEM": "SYSTEM",
+	},
+	"log_error_verbosity": {
+		"1": "1",
+		"2": "2",
+		"3": "3",
+	},
+	"use_secondary_engine": {
+		"0":     "OFF",
+		"1":     "ON",
+		"2":     "FORCED",
+		"OFF":   "OFF",
+		"ON":    "ON",
+		"FORCED": "FORCED",
+	},
+	"session_track_transaction_info": {
+		"0":              "OFF",
+		"1":              "STATE",
+		"2":              "CHARACTERISTICS",
+		"OFF":            "OFF",
+		"STATE":          "STATE",
+		"CHARACTERISTICS": "CHARACTERISTICS",
+	},
+	"transaction_isolation": {
+		"READ-UNCOMMITTED": "READ-UNCOMMITTED",
+		"READ-COMMITTED":   "READ-COMMITTED",
+		"REPEATABLE-READ":  "REPEATABLE-READ",
+		"SERIALIZABLE":     "SERIALIZABLE",
+	},
+	"internal_tmp_mem_storage_engine": {
+		"TEMPTABLE": "TempTable",
+		"MEMORY":    "MEMORY",
+	},
+	"block_encryption_mode": {
+		"0":             "aes-128-ecb",
+		"1":             "aes-192-ecb",
+		"2":             "aes-256-ecb",
+		"3":             "aes-128-cbc",
+		"4":             "aes-192-cbc",
+		"5":             "aes-256-cbc",
+		"AES-128-ECB":   "aes-128-ecb",
+		"AES-192-ECB":   "aes-192-ecb",
+		"AES-256-ECB":   "aes-256-ecb",
+		"AES-128-CBC":   "aes-128-cbc",
+		"AES-192-CBC":   "aes-192-cbc",
+		"AES-256-CBC":   "aes-256-cbc",
+		"AES-128-CFB1":  "aes-128-cfb1",
+		"AES-192-CFB1":  "aes-192-cfb1",
+		"AES-256-CFB1":  "aes-256-cfb1",
+		"AES-128-CFB8":  "aes-128-cfb8",
+		"AES-192-CFB8":  "aes-192-cfb8",
+		"AES-256-CFB8":  "aes-256-cfb8",
+		"AES-128-CFB128": "aes-128-cfb128",
+		"AES-192-CFB128": "aes-192-cfb128",
+		"AES-256-CFB128": "aes-256-cfb128",
+		"AES-128-OFB":   "aes-128-ofb",
+		"AES-192-OFB":   "aes-192-ofb",
+		"AES-256-OFB":   "aes-256-ofb",
+	},
 }
 
 // sysVarSessionOnly contains system variables that only exist at SESSION scope.
@@ -15040,7 +15216,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"max_join_size":                            {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
 	"max_length_for_sort_data":                 {Min: 4, Max: 8388608, IsUnsigned: true},
 	"max_points_in_geometry":                   {Min: 3, Max: 1048576, IsUnsigned: true},
-	"max_prepared_stmt_count":                  {Min: 0, Max: 4194304, IsUnsigned: true},
+	"max_prepared_stmt_count":                  {Min: 0, Max: 1048576, IsUnsigned: true},
 	"max_relay_log_size":                       {Min: 0, Max: 1073741824, IsUnsigned: true, BlockSize: 4096},
 	"max_seeks_for_key":                        {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
 	"max_sort_length":                          {Min: 4, Max: 8388608, IsUnsigned: true},
@@ -15055,6 +15231,10 @@ var sysVarIntRange = map[string]intVarRange{
 	"mysqlx_idle_worker_thread_timeout":        {Min: 0, Max: 3600, IsUnsigned: true},
 	"mysqlx_max_allowed_packet":                {Min: 512, Max: 1073741824, IsUnsigned: true},
 	"mysqlx_min_worker_threads":                {Min: 1, Max: 100, IsUnsigned: true},
+	"mysqlx_write_timeout":                     {Min: 1, Max: 2147483, IsUnsigned: true},
+	"mysqlx_read_timeout":                      {Min: 1, Max: 2147483, IsUnsigned: true},
+	"mysqlx_wait_timeout":                      {Min: 1, Max: 2147483647, IsUnsigned: true},
+	"mysqlx_interactive_timeout":               {Min: 1, Max: 2147483647, IsUnsigned: true},
 	"net_buffer_length":                        {Min: 1024, Max: 1048576, IsUnsigned: true},
 	"net_read_timeout":                         {Min: 1, Max: 31536000, IsUnsigned: true},
 	"net_retry_count":                          {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
@@ -15124,6 +15304,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"myisam_data_pointer_size":                 {Min: 2, Max: 7, IsUnsigned: true},
 	"myisam_mmap_size":                         {Min: 7, Max: 18446744073709551615, IsUnsigned: true},
 	"relay_log_space_limit":                    {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"innodb_undo_tablespaces":                 {Min: 2, Max: 127, IsUnsigned: true},
 	"sql_slave_skip_counter":                   {Min: 0, Max: 4294967295, IsUnsigned: true},
 }
 
@@ -15345,17 +15526,38 @@ func normalizeEnumSetValue(name string, expr sqlparser.Expr, evalVal interface{}
 	}
 	if lit, isLit := expr.(*sqlparser.Literal); isLit {
 		litStr := strings.TrimSpace(sqlparser.String(lit))
-		if strings.ContainsAny(litStr, ".eE") {
-			return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
-		}
+		// First try to normalize the value as an enum (handles quoted strings like 'RELEASE')
 		if v, ok := normalize(litStr); ok {
 			return v, nil
 		}
-		return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", name, strings.Trim(litStr, "'\"")))
+		// Only reject float/scientific notation for unquoted numeric-looking values
+		isQuoted := strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"")
+		if !isQuoted && strings.ContainsAny(litStr, ".eE") {
+			return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+		}
+		displayVal := strings.Trim(litStr, "'\"")
+		// The parser lowercases unquoted keywords like OFF/ON to 'off'/'on'.
+		// MySQL shows them uppercase in error messages, so restore the case
+		// for well-known SQL keywords.
+		switch strings.ToUpper(displayVal) {
+		case "ON", "OFF", "TRUE", "FALSE", "YES", "NO":
+			displayVal = strings.ToUpper(displayVal)
+		}
+		return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", name, displayVal))
 	}
 	switch v := evalVal.(type) {
 	case float32, float64:
 		return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+	case bool:
+		// TRUE/FALSE → "1"/"0" for enum lookup
+		boolStr := "0"
+		if v {
+			boolStr = "1"
+		}
+		if mapped, ok := normalize(boolStr); ok {
+			return mapped, nil
+		}
+		return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", name, boolStr))
 	default:
 		if mapped, ok := normalize(fmt.Sprintf("%v", v)); ok {
 			return mapped, nil

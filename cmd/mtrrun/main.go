@@ -962,9 +962,7 @@ var skipTests = map[string]bool{
 		"sys_vars/binlog_max_flush_queue_time_basic":                      true,
 		"sys_vars/binlog_row_event_max_size_basic":                        true,
 		// "sys_vars/binlog_row_image_basic":                                 true, // fixed: added enum mapping
-		"sys_vars/binlog_row_metadata_basic":                              true,
 		"sys_vars/binlog_rows_query_log_events_basic":                     true,
-		"sys_vars/block_encryption_mode_basic":                            true,
 		"sys_vars/character_set_client_basic":                             true,
 		"sys_vars/character_set_client_func":                              true,
 		"sys_vars/character_set_connection_basic":                         true,
@@ -984,9 +982,7 @@ var skipTests = map[string]bool{
 		"sys_vars/collation_database_func":                                true,
 		"sys_vars/collation_server_basic":                                 true,
 		"sys_vars/collation_server_func":                                  true,
-		"sys_vars/completion_type_basic":                                  true,
 		"sys_vars/completion_type_func":                                   true,
-		"sys_vars/concurrent_insert_basic":                                true,
 		"sys_vars/create_admin_listener_thread_basic":                     true,
 		"sys_vars/cte_max_recursion_depth_func":                           true,
 		"sys_vars/default_collation_for_utf8mb4":                          true,
@@ -1033,12 +1029,9 @@ var skipTests = map[string]bool{
 		"sys_vars/innodb_buffer_pool_filename_basic":                      true,
 		"sys_vars/innodb_buffer_pool_load_now_basic":                      true,
 		"sys_vars/innodb_buffer_pool_size_basic":                          true,
-		"sys_vars/innodb_change_buffering_basic":                          true,
-		"sys_vars/innodb_checksum_algorithm_basic":                        true,
 		"sys_vars/innodb_cmp_per_index_enabled_basic":                     true,
 		"sys_vars/innodb_commit_concurrency_basic":                        true,
 		"sys_vars/innodb_data_home_dir_basic":                             true,
-		"sys_vars/innodb_default_row_format_basic":                        true,
 		"sys_vars/innodb_flush_method_basic":                              true,
 		"sys_vars/innodb_flush_method_unix":                               true,
 		"sys_vars/innodb_ft_aux_table_basic":                              true,
@@ -1062,7 +1055,6 @@ var skipTests = map[string]bool{
 		"sys_vars/innodb_redo_log_archive_dirs_basic":                     true,
 		"sys_vars/innodb_redo_log_encrypt_basic":                          true,
 		"sys_vars/innodb_replication_delay_basic":                         true,
-		"sys_vars/innodb_stats_method_basic":                              true,
 		"sys_vars/innodb_table_locks_basic":                               true,
 		"sys_vars/innodb_table_locks_func":                                true,
 		"sys_vars/innodb_temp_tablespaces_dir_basic":                      true,
@@ -1073,7 +1065,6 @@ var skipTests = map[string]bool{
 		"sys_vars/insert_id_func":                                         true,
 		
 		"sys_vars/interactive_timeout_func":                               true,
-		"sys_vars/internal_tmp_mem_storage_engine_basic":                  true,
 		
 		"sys_vars/keep_files_on_create_basic":                             true,
 		"sys_vars/key_buffer_size_basic":                                  true,
@@ -1098,7 +1089,6 @@ var skipTests = map[string]bool{
 		"sys_vars/log_slow_slave_statements_basic":                        true,
 		"sys_vars/log_statements_unsafe_for_binlog_basic":                 true,
 		// "sys_vars/log_throttle_qni_basic":                                 true, // fixed: added to sysVarGlobalOnly
-		"sys_vars/log_timestamps_basic":                                   true,
 		"sys_vars/long_query_time_basic":                                  true,
 		"sys_vars/low_priority_updates_basic":                             true,
 		"sys_vars/max_allowed_packet_basic":                               true,
@@ -1111,7 +1101,6 @@ var skipTests = map[string]bool{
 		"sys_vars/max_join_size_basic":                                    true,
 		
 		
-		"sys_vars/max_prepared_stmt_count_basic":                          true,
 		"sys_vars/max_prepared_stmt_count_func":                           true,
 		// "sys_vars/max_relay_log_size_basic":                               true, // fixed: BlockSize 4096
 		
@@ -1127,16 +1116,13 @@ var skipTests = map[string]bool{
 		// "sys_vars/myisam_mmap_size_basic":                                 true, // fixed: myisam_mmap_size is read-only
 		"sys_vars/myisam_recover_options_basic":                           true,
 		
-		"sys_vars/myisam_stats_method_basic":                              true,
 		"sys_vars/mysql_native_password_proxy_users_func":                 true,
 		"sys_vars/mysqlx_enable_hello_notice_basic":                       true,
 		"sys_vars/mysqlx_interactive_timeout_basic":                       true,
 		"sys_vars/mysqlx_port_open_timeout_basic":                         true,
-		"sys_vars/mysqlx_read_timeout_basic":                              true,
 		"sys_vars/mysqlx_ssl_capath_basic":                                true,
 		"sys_vars/mysqlx_ssl_cipher_basic":                                true,
 		"sys_vars/mysqlx_wait_timeout_basic":                              true,
-		"sys_vars/mysqlx_write_timeout_basic":                             true,
 		"sys_vars/net_buffer_length_basic":                                true,
 		
 		// "sys_vars/net_retry_count_basic_64":                               true, // fixed: max range uint32→uint64
