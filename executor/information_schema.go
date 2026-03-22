@@ -436,7 +436,13 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 	case "performance_timers":
 		rawRows = e.perfSchemaPerformanceTimers()
 	case "threads":
-		rawRows = e.perfSchemaThreads()
+		if v, ok := e.startupVars["performance_schema_max_thread_classes"]; ok && v == "0" {
+			rawRows = []storage.Row{}
+		} else if v, ok := e.startupVars["performance_schema_max_thread_instances"]; ok && v == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = e.perfSchemaThreads()
+		}
 	case "triggers":
 		rawRows = e.infoSchemaTriggers()
 	case "table_constraints":
@@ -469,8 +475,21 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 	case "hosts":
 		rawRows = []storage.Row{}
 	case "setup_actors":
-		rawRows = e.perfSchemaSetupActors()
+		if e.psTruncated != nil && e.psTruncated["setup_actors"] {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = e.perfSchemaSetupActors()
+		}
 	case "setup_objects":
+		if e.psTruncated != nil && e.psTruncated["setup_objects"] {
+			rawRows = []storage.Row{}
+			break
+		}
+		// If performance_schema_setup_objects_size=0, return empty
+		if v, ok := e.startupVars["performance_schema_setup_objects_size"]; ok && v == "0" {
+			rawRows = []storage.Row{}
+			break
+		}
 		rawRows = []storage.Row{
 			{"OBJECT_TYPE": "EVENT", "OBJECT_SCHEMA": "mysql", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
 			{"OBJECT_TYPE": "EVENT", "OBJECT_SCHEMA": "performance_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
@@ -1233,7 +1252,9 @@ func (e *Executor) perfSchemaVariablesScoped(globalOnly bool) []storage.Row {
 	for _, n := range names {
 		rows = append(rows, storage.Row{
 			"VARIABLE_NAME":  n,
+			"variable_name":  n,
 			"VARIABLE_VALUE": vars[n],
+			"variable_value": vars[n],
 		})
 	}
 	return rows
@@ -1289,9 +1310,12 @@ func (e *Executor) perfSchemaStatus() []storage.Row {
 					val = "1"
 				}
 			}
+			upperName := strings.ToUpper(name)
 			rows = append(rows, storage.Row{
-				"VARIABLE_NAME":  strings.ToUpper(name),
+				"VARIABLE_NAME":  upperName,
+				"variable_name":  upperName,
 				"VARIABLE_VALUE": val,
+				"variable_value": val,
 			})
 		}
 	}
@@ -1482,6 +1506,10 @@ func (e *Executor) perfSchemaThreads() []storage.Row {
 
 // perfSchemaSetupActors returns the default rows for performance_schema.setup_actors.
 func (e *Executor) perfSchemaSetupActors() []storage.Row {
+	// If performance_schema_setup_actors_size=0, return empty
+	if v, ok := e.startupVars["performance_schema_setup_actors_size"]; ok && v == "0" {
+		return []storage.Row{}
+	}
 	return []storage.Row{
 		{"HOST": "%", "USER": "%", "ROLE": "%", "ENABLED": "YES", "HISTORY": "YES"},
 	}
@@ -1496,6 +1524,7 @@ func (e *Executor) perfSchemaSetupInstruments() []storage.Row {
 		{"wait/synch/cond/sql/COND_open", "YES", "YES"},
 		{"wait/io/file/sql/binlog", "YES", "YES"},
 		{"wait/io/table/sql/handler", "YES", "YES"},
+		{"wait/io/socket/sql/server_tcpip_socket", "YES", "YES"},
 		{"wait/lock/table/sql/handler", "YES", "YES"},
 		{"stage/sql/After create", "YES", "YES"},
 		{"statement/sql/select", "YES", "YES"},
@@ -1506,8 +1535,39 @@ func (e *Executor) perfSchemaSetupInstruments() []storage.Row {
 		{"memory/sql/THD::main_mem_root", "YES", "YES"},
 		{"idle", "YES", "YES"},
 	}
+
+	// Check startup variables that disable instrument categories.
+	// When performance_schema_max_*_classes=0, the corresponding instruments are excluded.
+	disabledPrefixes := map[string]string{
+		"performance_schema_max_cond_classes":      "wait/synch/cond/",
+		"performance_schema_max_mutex_classes":     "wait/synch/mutex/",
+		"performance_schema_max_rwlock_classes":    "wait/synch/rwlock/",
+		"performance_schema_max_file_classes":      "wait/io/file/",
+		"performance_schema_max_socket_classes":    "wait/io/socket/",
+		"performance_schema_max_stage_classes":     "stage/",
+		"performance_schema_max_statement_classes": "statement/",
+		"performance_schema_max_thread_classes":    "thread/",
+		"performance_schema_max_memory_classes":    "memory/",
+	}
+	excludedPrefixes := make([]string, 0)
+	for varName, prefix := range disabledPrefixes {
+		if v, ok := e.startupVars[varName]; ok && v == "0" {
+			excludedPrefixes = append(excludedPrefixes, prefix)
+		}
+	}
+
 	rows := make([]storage.Row, 0, len(instruments))
 	for _, inst := range instruments {
+		excluded := false
+		for _, prefix := range excludedPrefixes {
+			if strings.HasPrefix(inst.name, prefix) {
+				excluded = true
+				break
+			}
+		}
+		if excluded {
+			continue
+		}
 		rows = append(rows, storage.Row{
 			"NAME": inst.name, "ENABLED": inst.enabled, "TIMED": inst.timed,
 			"PROPERTIES": "", "VOLATILITY": int64(0), "DOCUMENTATION": nil,
@@ -1526,9 +1586,14 @@ func (e *Executor) perfSchemaVariablesInfo() []storage.Row {
 	sort.Strings(names)
 	rows := make([]storage.Row, 0, len(names))
 	for _, n := range names {
+		source := "COMPILED"
+		// Check if this variable was set via startup options (master.opt / command line)
+		if _, ok := e.startupVars[n]; ok {
+			source = "COMMAND_LINE"
+		}
 		rows = append(rows, storage.Row{
 			"VARIABLE_NAME":   n,
-			"VARIABLE_SOURCE": "COMPILED",
+			"VARIABLE_SOURCE": source,
 			"VARIABLE_PATH":   "",
 			"MIN_VALUE":       "0",
 			"MAX_VALUE":       "0",

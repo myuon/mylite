@@ -187,6 +187,9 @@ type Executor struct {
 	// lastFoundRows stores the row count from the last SELECT before LIMIT was applied.
 	// Used by the FOUND_ROWS() function.
 	lastFoundRows int64
+	// psTruncated tracks performance_schema tables that have been TRUNCATED.
+	// These tables return empty result sets until data is re-inserted.
+	psTruncated map[string]bool
 }
 
 // Warning represents a MySQL warning.
@@ -238,6 +241,10 @@ func (e *Executor) getSysVarSession(name string) (string, bool) {
 
 // setSysVar stores a system variable in the appropriate scope map.
 func (e *Executor) setSysVar(name string, value string, isGlobal bool) {
+	// Trigger variables reset immediately after being set
+	if triggerSysVars[name] {
+		value = "OFF"
+	}
 	if isGlobal {
 		e.globalScopeVars[name] = value
 	} else {
@@ -275,7 +282,10 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		userVars:      make(map[string]interface{}),
 		preparedStmts: make(map[string]string),
 		tempTables:    make(map[string]bool),
-		globalScopeVars:  make(map[string]string),
+		globalScopeVars: map[string]string{
+			"general_log":    "ON",
+			"slow_query_log": "ON",
+		},
 		sessionScopeVars: make(map[string]string),
 		startupVars: map[string]string{
 			"innodb_commit_concurrency": "0",
@@ -4360,6 +4370,10 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				if isGlobal {
 					if v, ok := e.sessionScopeVars[cleanName]; ok {
 						e.globalScopeVars[cleanName] = v
+						// Trigger variables reset immediately after being set
+						if triggerSysVars[cleanName] {
+							e.globalScopeVars[cleanName] = "OFF"
+						}
 						// Restore the previous session value or remove if there wasn't one.
 						if prevVal, had := savedSessionVal[cleanName]; had {
 							e.sessionScopeVars[cleanName] = prevVal
@@ -4521,10 +4535,12 @@ func (e *Executor) handleRawSet(raw string) error {
 	// Store any SET GLOBAL/SESSION variable generically
 	rest := strings.TrimSpace(trimmed[4:])
 	restUpper := strings.ToUpper(rest)
-	isGlobalScope := strings.HasPrefix(restUpper, "GLOBAL ") || strings.HasPrefix(restUpper, "@@GLOBAL.")
+	isGlobalScope := strings.HasPrefix(restUpper, "GLOBAL ") || strings.HasPrefix(restUpper, "@@GLOBAL.") || strings.HasPrefix(restUpper, "PERSIST ") || strings.HasPrefix(restUpper, "PERSIST_ONLY ")
 	rest = strings.TrimPrefix(rest, "GLOBAL ")
 	rest = strings.TrimPrefix(rest, "SESSION ")
 	rest = strings.TrimPrefix(rest, "LOCAL ")
+	rest = strings.TrimPrefix(rest, "PERSIST_ONLY ")
+	rest = strings.TrimPrefix(rest, "PERSIST ")
 	rest = strings.TrimPrefix(rest, "@@global.")
 	rest = strings.TrimPrefix(rest, "@@session.")
 	rest = strings.TrimPrefix(rest, "@@local.")
@@ -4548,6 +4564,10 @@ func (e *Executor) handleRawSet(raw string) error {
 			e.setSysVar(varName, val, isGlobalScope)
 		} else {
 			e.deleteSysVar(varName, isGlobalScope)
+		}
+		// Trigger variables reset to OFF immediately after being set
+		if triggerSysVars[varName] {
+			e.setSysVar(varName, "OFF", isGlobalScope)
 		}
 	}
 	if strings.HasPrefix(upper, "SET NAMES ") {
@@ -7658,7 +7678,10 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		if lowerTable != "setup_actors" && lowerTable != "setup_objects" {
 			return nil, mysqlError(1142, "42000", fmt.Sprintf("INSERT command denied to user 'root'@'localhost' for table '%s'", tableName))
 		}
-		// For setup_actors/setup_objects, silently succeed
+		// For setup_actors/setup_objects, silently succeed and clear truncated flag
+		if e.psTruncated != nil {
+			delete(e.psTruncated, lowerTable)
+		}
 		return &Result{AffectedRows: 1}, nil
 	}
 
@@ -12210,9 +12233,9 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 			allowedCols := map[string]map[string]bool{
 				"setup_consumers":   {"enabled": true},
 				"setup_instruments": {"enabled": true, "timed": true},
-				"setup_actors":      {"enabled": true, "history": true},
-				"setup_objects":     {"enabled": true, "timed": true},
-				"setup_threads":     {"instrumented": true, "history": true},
+				"setup_actors":      {"host": true, "user": true, "role": true, "enabled": true, "history": true},
+				"setup_objects":     {"object_type": true, "object_schema": true, "object_name": true, "enabled": true, "timed": true},
+				"setup_threads":     {"enabled": true, "instrumented": true, "history": true},
 				"threads":           {"instrumented": true, "history": true},
 			}
 			if allowed, ok := allowedCols[lowerTable]; ok {
@@ -14926,6 +14949,14 @@ var sysVarBoolAcceptNegative = map[string]bool{
 	"innodb_buffer_pool_load_now":    true,
 }
 
+// triggerSysVars are variables that act as triggers: setting them to ON
+// performs an action, and then the variable immediately resets to OFF.
+var triggerSysVars = map[string]bool{
+	"innodb_buffer_pool_load_abort": true,
+	"innodb_buffer_pool_load_now":   true,
+	"innodb_buffer_pool_dump_now":   true,
+}
+
 type intVarRange struct {
 	Min        int64
 	Max        uint64
@@ -16135,7 +16166,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"performance_schema_events_waits_history_size":             "10",
 		"performance_schema_events_waits_history_long_size":        "10000",
 		"performance_schema_hosts_size":                            "-1",
-		"performance_schema_max_cond_classes":                      "150",
+		"performance_schema_max_cond_classes":                      "100",
 		"performance_schema_max_cond_instances":                    "-1",
 		"performance_schema_max_digest_length":                     "1024",
 		"performance_schema_max_digest_sample_age":                 "60",
@@ -16145,7 +16176,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"performance_schema_max_index_stat":                        "-1",
 		"performance_schema_max_memory_classes":                    "450",
 		"performance_schema_max_metadata_locks":                    "-1",
-		"performance_schema_max_mutex_classes":                     "350",
+		"performance_schema_max_mutex_classes":                     "300",
 		"performance_schema_max_mutex_instances":                   "-1",
 		"performance_schema_max_prepared_statements_instances":     "-1",
 		"performance_schema_max_program_instances":                 "-1",
@@ -16462,6 +16493,7 @@ func (e *Executor) populatePerfSchemaTable(tbl *storage.Table, tableName string)
 				r["VARIABLE_NAME"] = upperName
 				r["variable_name"] = upperName
 				r["VARIABLE_VALUE"] = val
+				r["variable_value"] = val
 				r["variable_value"] = val
 				tbl.Rows = append(tbl.Rows, r)
 			}
@@ -18700,6 +18732,74 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.AnyValue:
 		// ANY_VALUE(expr) returns the expression value, bypassing ONLY_FULL_GROUP_BY checks
 		return e.evalExpr(v.Arg)
+	case *sqlparser.PerformanceSchemaFuncExpr:
+		switch v.Type {
+		case sqlparser.PsCurrentThreadIDType:
+			// ps_current_thread_id() returns the thread ID for the current connection.
+			// Return NULL since we don't have real PS thread instrumentation.
+			return nil, nil
+		case sqlparser.PsThreadIDType:
+			// ps_thread_id(connection_id) returns the thread ID for a given connection.
+			// Return NULL since we don't have real PS thread instrumentation.
+			return nil, nil
+		case sqlparser.FormatBytesType:
+			// format_bytes(count) formats a byte count into a human-readable string.
+			if v.Argument == nil {
+				return nil, nil
+			}
+			arg, err := e.evalExpr(v.Argument)
+			if err != nil {
+				return nil, err
+			}
+			if arg == nil {
+				return nil, nil
+			}
+			n, _ := strconv.ParseFloat(fmt.Sprintf("%v", arg), 64)
+			switch {
+			case n >= 1099511627776: // 1 TiB
+				return fmt.Sprintf("%.2f TiB", n/1099511627776), nil
+			case n >= 1073741824: // 1 GiB
+				return fmt.Sprintf("%.2f GiB", n/1073741824), nil
+			case n >= 1048576: // 1 MiB
+				return fmt.Sprintf("%.2f MiB", n/1048576), nil
+			case n >= 1024: // 1 KiB
+				return fmt.Sprintf("%.2f KiB", n/1024), nil
+			default:
+				return fmt.Sprintf("%.0f bytes", n), nil
+			}
+		case sqlparser.FormatPicoTimeType:
+			// format_pico_time(time_val) formats a picosecond value into a human-readable string.
+			if v.Argument == nil {
+				return nil, nil
+			}
+			arg, err := e.evalExpr(v.Argument)
+			if err != nil {
+				return nil, err
+			}
+			if arg == nil {
+				return nil, nil
+			}
+			ps, _ := strconv.ParseFloat(fmt.Sprintf("%v", arg), 64)
+			switch {
+			case ps >= 86400e12: // days
+				return fmt.Sprintf("%.2f d", ps/86400e12), nil
+			case ps >= 3600e12: // hours
+				return fmt.Sprintf("%.2f h", ps/3600e12), nil
+			case ps >= 60e12: // minutes
+				return fmt.Sprintf("%.2f min", ps/60e12), nil
+			case ps >= 1e12: // seconds
+				return fmt.Sprintf("%.2f s", ps/1e12), nil
+			case ps >= 1e9: // milliseconds
+				return fmt.Sprintf("%.2f ms", ps/1e9), nil
+			case ps >= 1e6: // microseconds
+				return fmt.Sprintf("%.2f us", ps/1e6), nil
+			case ps >= 1e3: // nanoseconds
+				return fmt.Sprintf("%.2f ns", ps/1e3), nil
+			default:
+				return fmt.Sprintf("%.0f ps", ps), nil
+			}
+		}
+		return nil, fmt.Errorf("unsupported performance schema function type: %d", v.Type)
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
 }
@@ -25556,6 +25656,11 @@ func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, er
 		if perfSchemaTruncateDenied(tableName) {
 			return nil, mysqlError(1142, "42000", fmt.Sprintf("DROP command denied to user 'root'@'localhost' for table '%s'", tableName))
 		}
+		// Track truncated PS tables so they return empty result sets
+		if e.psTruncated == nil {
+			e.psTruncated = make(map[string]bool)
+		}
+		e.psTruncated[strings.ToLower(tableName)] = true
 		return &Result{AffectedRows: 0, IsResultSet: false}, nil
 	}
 	tbl, err := e.Storage.GetTable(dbName, tableName)

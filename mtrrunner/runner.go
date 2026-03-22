@@ -3227,6 +3227,8 @@ func normalizeOutput(s string) string {
 		result = append(result, trimmed)
 	}
 	out := strings.TrimRight(strings.Join(result, "\n"), "\n")
+	// Normalize negative zero: -0.0...0 → 0.0...0
+	out = normalizeNegativeZero(out)
 	// Normalize TRIM display: MySQL sometimes omits space before FROM for certain multibyte chars.
 	out = normalizeTrimFromSpacing(out)
 	// Normalize SUBSTRING display: MySQL shows "SUBSTRING(col FROM pos)" but vitess shows "SUBSTRING(col,pos)"
@@ -3339,6 +3341,42 @@ func normalizeTrimFromSpacing(s string) string {
 	reSp := regexp.MustCompile(`' \)`)
 	s = reSp.ReplaceAllString(s, "')")
 	return s
+}
+
+// normalizeNegativeZero converts -0.0...0 to 0.0...0 in tab-separated or standalone values.
+// MySQL normalizes negative zero to positive zero in output.
+func normalizeNegativeZero(s string) string {
+	if !strings.Contains(s, "-0.") {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		if !strings.Contains(line, "-0.") {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		changed := false
+		for j, part := range parts {
+			if strings.HasPrefix(part, "-0.") {
+				// Check if all digits after the dot are zeros
+				allZero := true
+				for _, c := range part[3:] {
+					if c != '0' {
+						allZero = false
+						break
+					}
+				}
+				if allZero && len(part) > 3 {
+					parts[j] = part[1:] // Remove the leading '-'
+					changed = true
+				}
+			}
+		}
+		if changed {
+			lines[i] = strings.Join(parts, "\t")
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // normalizeExpected strips MySQL-specific output that mylite doesn't produce:
