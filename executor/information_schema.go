@@ -1242,21 +1242,58 @@ func (e *Executor) perfSchemaVariablesScoped(globalOnly bool) []storage.Row {
 // perfSchemaStatus returns rows for performance_schema.global_status / session_status.
 // This provides a minimal set of status variables needed by MTR tests.
 func (e *Executor) perfSchemaStatus() []storage.Row {
-	// Status variables: expose key InnoDB/server status values that MTR tests check.
-	statusVars := map[string]string{
-		"Innodb_page_size": "16384",
+	// Use the same status data as SHOW STATUS
+	statusResult, _ := e.showStatus("")
+	if statusResult == nil {
+		return nil
 	}
-	names := make([]string, 0, len(statusVars))
-	for n := range statusVars {
-		names = append(names, n)
+	// Build mapping of PS lost counters to their size variables
+	psLostToSize := map[string]string{
+		"Performance_schema_accounts_lost":             "performance_schema_accounts_size",
+		"Performance_schema_cond_classes_lost":         "performance_schema_max_cond_classes",
+		"Performance_schema_cond_instances_lost":       "performance_schema_max_cond_instances",
+		"Performance_schema_file_classes_lost":         "performance_schema_max_file_classes",
+		"Performance_schema_file_handles_lost":         "performance_schema_max_file_handles",
+		"Performance_schema_file_instances_lost":       "performance_schema_max_file_instances",
+		"Performance_schema_hosts_lost":                "performance_schema_hosts_size",
+		"Performance_schema_index_stat_lost":           "performance_schema_max_index_stat",
+		"Performance_schema_memory_classes_lost":       "performance_schema_max_memory_classes",
+		"Performance_schema_metadata_lock_lost":        "performance_schema_max_metadata_locks",
+		"Performance_schema_mutex_classes_lost":        "performance_schema_max_mutex_classes",
+		"Performance_schema_mutex_instances_lost":      "performance_schema_max_mutex_instances",
+		"Performance_schema_prepared_statements_lost":  "performance_schema_max_prepared_statements_instances",
+		"Performance_schema_program_lost":              "performance_schema_max_program_instances",
+		"Performance_schema_rwlock_classes_lost":       "performance_schema_max_rwlock_classes",
+		"Performance_schema_rwlock_instances_lost":     "performance_schema_max_rwlock_instances",
+		"Performance_schema_session_connect_attrs_lost": "performance_schema_session_connect_attrs_size",
+		"Performance_schema_socket_classes_lost":       "performance_schema_max_socket_classes",
+		"Performance_schema_socket_instances_lost":     "performance_schema_max_socket_instances",
+		"Performance_schema_stage_classes_lost":        "performance_schema_max_stage_classes",
+		"Performance_schema_statement_classes_lost":    "performance_schema_max_statement_classes",
+		"Performance_schema_table_handles_lost":        "performance_schema_max_table_handles",
+		"Performance_schema_table_instances_lost":      "performance_schema_max_table_instances",
+		"Performance_schema_table_lock_stat_lost":      "performance_schema_max_table_lock_stat",
+		"Performance_schema_thread_classes_lost":       "performance_schema_max_thread_classes",
+		"Performance_schema_thread_instances_lost":     "performance_schema_max_thread_instances",
+		"Performance_schema_users_lost":                "performance_schema_users_size",
 	}
-	sort.Strings(names)
-	rows := make([]storage.Row, 0, len(names))
-	for _, n := range names {
-		rows = append(rows, storage.Row{
-			"VARIABLE_NAME":  n,
-			"VARIABLE_VALUE": statusVars[n],
-		})
+	rows := make([]storage.Row, 0, len(statusResult.Rows))
+	for _, srow := range statusResult.Rows {
+		if len(srow) >= 2 {
+			name := fmt.Sprintf("%v", srow[0])
+			val := fmt.Sprintf("%v", srow[1])
+			// If this is a PS lost counter and the corresponding size var is 0,
+			// report the lost counter as 1 (indicating data was lost).
+			if sizeVar, ok := psLostToSize[name]; ok {
+				if sizeVal, found := e.startupVars[sizeVar]; found && sizeVal == "0" {
+					val = "1"
+				}
+			}
+			rows = append(rows, storage.Row{
+				"VARIABLE_NAME":  strings.ToUpper(name),
+				"VARIABLE_VALUE": val,
+			})
+		}
 	}
 	return rows
 }

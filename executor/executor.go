@@ -2424,6 +2424,10 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	trimmed := stripLeadingCStyleComments(strings.TrimSpace(query))
 	query = trimmed
 	e.currentQuery = trimmed
+	// Empty query (e.g. comment-only) is a no-op.
+	if trimmed == "" {
+		return &Result{}, nil
+	}
 	// Clear per-query subquery cache so non-correlated IN subqueries
 	// are only evaluated once within the same top-level statement.
 	e.subqueryValCache = nil
@@ -9058,6 +9062,10 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 			}
 			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", lookupDB, lookupTable))
 		}
+		// Dynamically populate certain performance_schema virtual tables before scan.
+		if strings.EqualFold(lookupDB, "performance_schema") {
+			e.populatePerfSchemaTable(tbl, lookupTable)
+		}
 		raw := tbl.Scan()
 		// Build a set of CHAR(N) column names for trailing-space removal.
 		charCols := make(map[string]bool)
@@ -13040,6 +13048,47 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 }
 
 // columnDefFromAST converts a vitess ColumnDefinition into our catalog.ColumnDef.
+// implicitDefaultForType returns the implicit default value for a NOT NULL column
+// that has no explicit DEFAULT clause. MySQL uses the type's zero value:
+// 0 for numeric types, "" for string types, "0000-00-00" for date, etc.
+func implicitDefaultForType(colType string) interface{} {
+	upper := strings.ToUpper(colType)
+	// Strip length/precision like INT(11), DECIMAL(10,2), etc.
+	base := upper
+	if idx := strings.IndexByte(base, '('); idx >= 0 {
+		base = base[:idx]
+	}
+	base = strings.TrimSpace(base)
+	// Remove UNSIGNED / ZEROFILL suffix
+	base = strings.TrimSuffix(base, " UNSIGNED")
+	base = strings.TrimSuffix(base, " ZEROFILL")
+	base = strings.TrimSpace(base)
+
+	switch base {
+	case "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT", "BIT":
+		return int64(0)
+	case "FLOAT", "DOUBLE", "REAL":
+		return float64(0)
+	case "DECIMAL", "NUMERIC", "DEC", "FIXED":
+		return "0"
+	case "DATE":
+		return "0000-00-00"
+	case "TIME":
+		return "00:00:00"
+	case "DATETIME", "TIMESTAMP":
+		return "0000-00-00 00:00:00"
+	case "YEAR":
+		return "0000"
+	case "ENUM":
+		return ""
+	case "SET":
+		return ""
+	default:
+		// All string/blob/binary types default to empty string
+		return ""
+	}
+}
+
 func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 	colDef := catalog.ColumnDef{
 		Name:     col.Name.String(),
@@ -13269,6 +13318,9 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					if colDef.Default != nil {
 						// Parse the default string as a literal if possible.
 						defVal = *colDef.Default
+					} else if !colDef.Nullable {
+						// NOT NULL column without explicit DEFAULT gets the type's zero value
+						defVal = implicitDefaultForType(colDef.Type)
 					}
 					tbl.AddColumn(colDef.Name, defVal)
 				}
@@ -16139,6 +16191,14 @@ func (e *Executor) showVariables(upper string) (*Result, error) {
 		}
 	}
 	if likePattern == "" {
+		if idx := strings.Index(upper, `LIKE "`); idx >= 0 {
+			rest := upper[idx+6:]
+			if end := strings.Index(rest, `"`); end >= 0 {
+				likePattern = strings.ToLower(rest[:end])
+			}
+		}
+	}
+	if likePattern == "" {
 		if idx := strings.Index(upper, "VARIABLE_NAME"); idx >= 0 {
 			rest := upper[idx+len("VARIABLE_NAME"):]
 			if eq := strings.Index(rest, "="); eq >= 0 {
@@ -16184,6 +16244,14 @@ func (e *Executor) showStatus(upper string) (*Result, error) {
 			likePattern = strings.ToLower(rest[:end])
 		}
 	}
+	if likePattern == "" {
+		if idx := strings.Index(upper, `LIKE "`); idx >= 0 {
+			rest := upper[idx+6:]
+			if end := strings.Index(rest, `"`); end >= 0 {
+				likePattern = strings.ToLower(rest[:end])
+			}
+		}
+	}
 	statusVars := []struct {
 		Name  string
 		Value string
@@ -16213,6 +16281,40 @@ func (e *Executor) showStatus(upper string) (*Result, error) {
 		{Name: "Threads_created", Value: "1"},
 		{Name: "Threads_running", Value: "1"},
 		{Name: "Uptime", Value: "1"},
+		// InnoDB status variables
+		{Name: "Innodb_page_size", Value: "16384"},
+		// Performance Schema status variables
+		{Name: "Performance_schema_accounts_lost", Value: "0"},
+		{Name: "Performance_schema_cond_classes_lost", Value: "0"},
+		{Name: "Performance_schema_cond_instances_lost", Value: "0"},
+		{Name: "Performance_schema_digest_lost", Value: "0"},
+		{Name: "Performance_schema_file_classes_lost", Value: "0"},
+		{Name: "Performance_schema_file_handles_lost", Value: "0"},
+		{Name: "Performance_schema_file_instances_lost", Value: "0"},
+		{Name: "Performance_schema_hosts_lost", Value: "0"},
+		{Name: "Performance_schema_index_stat_lost", Value: "0"},
+		{Name: "Performance_schema_locker_lost", Value: "0"},
+		{Name: "Performance_schema_memory_classes_lost", Value: "0"},
+		{Name: "Performance_schema_metadata_lock_lost", Value: "0"},
+		{Name: "Performance_schema_mutex_classes_lost", Value: "0"},
+		{Name: "Performance_schema_mutex_instances_lost", Value: "0"},
+		{Name: "Performance_schema_nested_statement_lost", Value: "0"},
+		{Name: "Performance_schema_prepared_statements_lost", Value: "0"},
+		{Name: "Performance_schema_program_lost", Value: "0"},
+		{Name: "Performance_schema_rwlock_classes_lost", Value: "0"},
+		{Name: "Performance_schema_rwlock_instances_lost", Value: "0"},
+		{Name: "Performance_schema_session_connect_attrs_longest_seen", Value: "0"},
+		{Name: "Performance_schema_session_connect_attrs_lost", Value: "0"},
+		{Name: "Performance_schema_socket_classes_lost", Value: "0"},
+		{Name: "Performance_schema_socket_instances_lost", Value: "0"},
+		{Name: "Performance_schema_stage_classes_lost", Value: "0"},
+		{Name: "Performance_schema_statement_classes_lost", Value: "0"},
+		{Name: "Performance_schema_table_handles_lost", Value: "0"},
+		{Name: "Performance_schema_table_instances_lost", Value: "0"},
+		{Name: "Performance_schema_table_lock_stat_lost", Value: "0"},
+		{Name: "Performance_schema_thread_classes_lost", Value: "0"},
+		{Name: "Performance_schema_thread_instances_lost", Value: "0"},
+		{Name: "Performance_schema_users_lost", Value: "0"},
 	}
 	rows := make([][]interface{}, 0, len(statusVars))
 	for _, sv := range statusVars {
@@ -16234,6 +16336,108 @@ func (e *Executor) showStatus(upper string) (*Result, error) {
 		Rows:        rows,
 		IsResultSet: true,
 	}, nil
+}
+
+// populatePerfSchemaTable dynamically populates certain performance_schema tables
+// with live data before they are scanned by SELECT.
+func (e *Executor) populatePerfSchemaTable(tbl *storage.Table, tableName string) {
+	lower := strings.ToLower(tableName)
+	switch lower {
+	case "global_status", "session_status":
+		// Populate with the same data as SHOW STATUS
+		statusResult, err := e.showStatus("")
+		if err != nil || statusResult == nil {
+			return
+		}
+		// Build a mapping of PS lost counters to their size variables.
+		// If a size is set to 0, the lost counter should be > 0 (since connections exist).
+		psLostToSize := map[string]string{
+			"Performance_schema_accounts_lost":           "performance_schema_accounts_size",
+			"Performance_schema_cond_classes_lost":       "performance_schema_max_cond_classes",
+			"Performance_schema_cond_instances_lost":     "performance_schema_max_cond_instances",
+			"Performance_schema_file_classes_lost":       "performance_schema_max_file_classes",
+			"Performance_schema_file_handles_lost":       "performance_schema_max_file_handles",
+			"Performance_schema_file_instances_lost":     "performance_schema_max_file_instances",
+			"Performance_schema_hosts_lost":              "performance_schema_hosts_size",
+			"Performance_schema_index_stat_lost":         "performance_schema_max_index_stat",
+			"Performance_schema_memory_classes_lost":     "performance_schema_max_memory_classes",
+			"Performance_schema_metadata_lock_lost":      "performance_schema_max_metadata_locks",
+			"Performance_schema_mutex_classes_lost":      "performance_schema_max_mutex_classes",
+			"Performance_schema_mutex_instances_lost":    "performance_schema_max_mutex_instances",
+			"Performance_schema_prepared_statements_lost": "performance_schema_max_prepared_statements_instances",
+			"Performance_schema_program_lost":            "performance_schema_max_program_instances",
+			"Performance_schema_rwlock_classes_lost":     "performance_schema_max_rwlock_classes",
+			"Performance_schema_rwlock_instances_lost":   "performance_schema_max_rwlock_instances",
+			"Performance_schema_session_connect_attrs_lost": "performance_schema_session_connect_attrs_size",
+			"Performance_schema_socket_classes_lost":     "performance_schema_max_socket_classes",
+			"Performance_schema_socket_instances_lost":   "performance_schema_max_socket_instances",
+			"Performance_schema_stage_classes_lost":      "performance_schema_max_stage_classes",
+			"Performance_schema_statement_classes_lost":  "performance_schema_max_statement_classes",
+			"Performance_schema_table_handles_lost":      "performance_schema_max_table_handles",
+			"Performance_schema_table_instances_lost":    "performance_schema_max_table_instances",
+			"Performance_schema_table_lock_stat_lost":    "performance_schema_max_table_lock_stat",
+			"Performance_schema_thread_classes_lost":     "performance_schema_max_thread_classes",
+			"Performance_schema_thread_instances_lost":   "performance_schema_max_thread_instances",
+			"Performance_schema_users_lost":              "performance_schema_users_size",
+		}
+		tbl.Mu.Lock()
+		tbl.Rows = nil
+		for _, row := range statusResult.Rows {
+			if len(row) >= 2 {
+				r := make(storage.Row)
+				name := fmt.Sprintf("%v", row[0])
+				val := fmt.Sprintf("%v", row[1])
+				// If this is a PS lost counter and the corresponding size var is 0,
+				// report the lost counter as 1 (indicating data was lost).
+				if sizeVar, ok := psLostToSize[name]; ok {
+					if sizeVal, found := e.startupVars[sizeVar]; found && sizeVal == "0" {
+						val = "1"
+					}
+				}
+				// Store with both cases for column name lookups
+				upperName := strings.ToUpper(name)
+				r["VARIABLE_NAME"] = upperName
+				r["variable_name"] = upperName
+				r["VARIABLE_VALUE"] = val
+				r["variable_value"] = val
+				tbl.Rows = append(tbl.Rows, r)
+			}
+		}
+		tbl.Mu.Unlock()
+	case "global_variables":
+		vars := e.buildVariablesMapScoped(true)
+		tbl.Mu.Lock()
+		tbl.Rows = nil
+		// Sort by name for deterministic output
+		names := make([]string, 0, len(vars))
+		for name := range vars {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			r := make(storage.Row)
+			r["VARIABLE_NAME"] = name
+			r["VARIABLE_VALUE"] = vars[name]
+			tbl.Rows = append(tbl.Rows, r)
+		}
+		tbl.Mu.Unlock()
+	case "session_variables":
+		vars := e.buildVariablesMapScoped(false)
+		tbl.Mu.Lock()
+		tbl.Rows = nil
+		names := make([]string, 0, len(vars))
+		for name := range vars {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			r := make(storage.Row)
+			r["VARIABLE_NAME"] = name
+			r["VARIABLE_VALUE"] = vars[name]
+			tbl.Rows = append(tbl.Rows, r)
+		}
+		tbl.Mu.Unlock()
+	}
 }
 
 // buildColumnTypeString builds a type string from a sqlparser.ColumnType,
