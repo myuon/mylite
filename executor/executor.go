@@ -1220,6 +1220,80 @@ func mysqlError(code int, state, message string) error {
 	return fmt.Errorf("ERROR %d (%s): %s", code, state, message)
 }
 
+// perfSchemaTruncateDenied returns true if TRUNCATE is denied on the given
+// performance_schema table. Most PS tables allow TRUNCATE (resets statistics),
+// but certain tables with live/config data deny it.
+func perfSchemaTruncateDenied(tableName string) bool {
+	switch strings.ToLower(tableName) {
+	case "cond_instances", "data_lock_waits", "data_locks",
+		"file_instances", "global_variables", "keyring_keys",
+		"log_status", "metadata_locks", "mutex_instances",
+		"performance_timers", "persisted_variables",
+		"replication_applier_configuration", "replication_applier_filters",
+		"replication_applier_global_filters", "replication_applier_status",
+		"replication_applier_status_by_coordinator",
+		"replication_applier_status_by_worker",
+		"replication_connection_configuration",
+		"replication_connection_status",
+		"replication_group_member_stats", "replication_group_members",
+		"rwlock_instances",
+		"session_account_connect_attrs", "session_connect_attrs",
+		"session_status", "session_variables",
+		"setup_consumers", "setup_instruments", "setup_threads",
+		"socket_instances", "table_handles", "threads",
+		"user_defined_functions", "user_variables_by_thread",
+		"variables_by_thread", "variables_info":
+		return true
+	}
+	return false
+}
+
+// perfSchemaWritableTable returns true if the given performance_schema table
+// allows DML (INSERT/UPDATE/DELETE) or LOCK TABLES without error.
+func perfSchemaWritableTable(tableName string) bool {
+	switch strings.ToLower(tableName) {
+	case "setup_instruments", "setup_consumers", "setup_threads", "threads",
+		"setup_actors", "setup_objects":
+		return true
+	}
+	return false
+}
+
+// extractPerfSchemaLockTable extracts a non-writable performance_schema table name from a LOCK TABLES statement.
+// Returns the table name if a non-writable performance_schema table is found, empty string otherwise.
+func extractPerfSchemaLockTable(query string) string {
+	// LOCK TABLES tbl1 READ, tbl2 WRITE, ...
+	// or: LOCK TABLES `performance_schema`.`tbl` READ
+	upper := strings.ToUpper(query)
+	rest := query
+	if strings.HasPrefix(upper, "LOCK TABLES ") {
+		rest = query[len("LOCK TABLES "):]
+	} else if strings.HasPrefix(upper, "LOCK TABLE ") {
+		rest = query[len("LOCK TABLE "):]
+	}
+	// Split by comma for multiple tables
+	parts := strings.Split(rest, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		// Remove lock type suffix (READ, WRITE, READ LOCAL, LOW_PRIORITY WRITE)
+		tokens := strings.Fields(part)
+		if len(tokens) == 0 {
+			continue
+		}
+		tblRef := tokens[0]
+		tblRef = strings.Trim(tblRef, "`")
+		if strings.Contains(tblRef, ".") {
+			dbTbl := strings.SplitN(tblRef, ".", 2)
+			dbName := strings.Trim(dbTbl[0], "`")
+			tblName := strings.Trim(dbTbl[1], "`")
+			if strings.EqualFold(dbName, "performance_schema") && !perfSchemaWritableTable(tblName) {
+				return tblName
+			}
+		}
+	}
+	return ""
+}
+
 // Execute parses and executes a SQL statement.
 // matchLike matches a string against a SQL LIKE pattern.
 // % matches any sequence of characters, _ matches any single character.
@@ -2775,9 +2849,14 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			strings.HasPrefix(upper, "DROP UNDO TABLESPACE") ||
 			strings.HasPrefix(upper, "CREATE SPATIAL REFERENCE SYSTEM") ||
 			strings.HasPrefix(upper, "DROP SPATIAL REFERENCE SYSTEM") ||
-			strings.HasPrefix(upper, "LOCK TABLE ") ||
-			strings.HasPrefix(upper, "LOCK TABLES ") ||
 			strings.HasPrefix(upper, "UNLOCK TABLE") {
+			return &Result{}, nil
+		}
+		// LOCK TABLES: check for performance_schema tables
+		if strings.HasPrefix(upper, "LOCK TABLE ") || strings.HasPrefix(upper, "LOCK TABLES ") {
+			if tblName := extractPerfSchemaLockTable(trimmed); tblName != "" {
+				return nil, mysqlError(1142, "42000", fmt.Sprintf("SELECT, LOCK TABLES command denied to user 'root'@'localhost' for table '%s'", tblName))
+			}
 			return &Result{}, nil
 		}
 		// For multi-table DELETE: DELETE t1,t2 FROM t1,t2,t3 WHERE ...
@@ -2844,7 +2923,16 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	case *sqlparser.Set:
 		return e.execSet(s)
 	case *sqlparser.LockTables:
-		// Accept LOCK TABLES silently
+		// Check for non-writable performance_schema tables
+		for _, tl := range s.Tables {
+			if ate, ok := tl.Table.(*sqlparser.AliasedTableExpr); ok {
+				if tn, ok := ate.Expr.(sqlparser.TableName); ok {
+					if strings.EqualFold(tn.Qualifier.String(), "performance_schema") && !perfSchemaWritableTable(tn.Name.String()) {
+						return nil, mysqlError(1142, "42000", fmt.Sprintf("SELECT, LOCK TABLES command denied to user 'root'@'localhost' for table '%s'", tn.Name.String()))
+					}
+				}
+			}
+		}
 		return &Result{}, nil
 	case *sqlparser.UnlockTables:
 		// Accept UNLOCK TABLES silently
@@ -7511,6 +7599,16 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		insertDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
 	}
 
+	// Reject INSERT on performance_schema tables (except writable setup tables)
+	if strings.EqualFold(insertDB, "performance_schema") {
+		lowerTable := strings.ToLower(tableName)
+		if lowerTable != "setup_actors" && lowerTable != "setup_objects" {
+			return nil, mysqlError(1142, "42000", fmt.Sprintf("INSERT command denied to user 'root'@'localhost' for table '%s'", tableName))
+		}
+		// For setup_actors/setup_objects, silently succeed
+		return &Result{AffectedRows: 1}, nil
+	}
+
 	tbl, err := e.Storage.GetTable(insertDB, tableName)
 	if err != nil {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", insertDB, tableName))
@@ -11985,6 +12083,19 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		return nil, fmt.Errorf("unsupported table expression: %T", te)
 	}
 
+	// Handle performance_schema tables
+	if strings.EqualFold(updateDB, "performance_schema") {
+		lowerTable := strings.ToLower(tableName)
+		switch lowerTable {
+		case "setup_instruments", "setup_consumers", "setup_threads", "threads",
+			"setup_actors", "setup_objects":
+			// Writable performance_schema tables: silently succeed
+			return &Result{AffectedRows: 0}, nil
+		default:
+			return nil, mysqlError(1142, "42000", fmt.Sprintf("UPDATE command denied to user 'root'@'localhost' for table '%s'", tableName))
+		}
+	}
+
 	tbl, err := e.Storage.GetTable(updateDB, tableName)
 	if err != nil {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", updateDB, tableName))
@@ -12436,6 +12547,16 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		return nil, fmt.Errorf("unsupported table expression: %T", te)
 	}
 
+	// Handle performance_schema tables
+	if strings.EqualFold(deleteDB, "performance_schema") {
+		lowerTable := strings.ToLower(tableName)
+		if lowerTable == "setup_actors" || lowerTable == "setup_objects" {
+			// Writable performance_schema tables: silently succeed
+			return &Result{AffectedRows: 0}, nil
+		}
+		return nil, mysqlError(1142, "42000", fmt.Sprintf("DELETE command denied to user 'root'@'localhost' for table '%s'", tableName))
+	}
+
 	tbl, err := e.Storage.GetTable(deleteDB, tableName)
 	if err != nil {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", deleteDB, tableName))
@@ -12876,6 +12997,11 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 	if !stmt.Table.Qualifier.IsEmpty() {
 		dbName = stmt.Table.Qualifier.String()
 	}
+	// Reject DDL on performance_schema tables
+	if strings.EqualFold(dbName, "performance_schema") {
+		return nil, mysqlError(1044, "42000", "Access denied for user 'root'@'localhost' to database 'performance_schema'")
+	}
+
 	db, err := e.Catalog.GetDatabase(dbName)
 	if err != nil {
 		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
@@ -25063,8 +25189,11 @@ func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, er
 	if q := stmt.Table.Qualifier.String(); q != "" {
 		dbName = q
 	}
-	// Silently succeed for performance_schema tables (they are virtual/stub).
-	if strings.ToLower(dbName) == "performance_schema" {
+	// Handle performance_schema tables
+	if strings.EqualFold(dbName, "performance_schema") {
+		if perfSchemaTruncateDenied(tableName) {
+			return nil, mysqlError(1142, "42000", fmt.Sprintf("DROP command denied to user 'root'@'localhost' for table '%s'", tableName))
+		}
 		return &Result{AffectedRows: 0, IsResultSet: false}, nil
 	}
 	tbl, err := e.Storage.GetTable(dbName, tableName)

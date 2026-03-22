@@ -3087,7 +3087,15 @@ func normalizeOutput(s string) string {
 	lines := strings.Split(s, "\n")
 	var result []string
 	for _, line := range lines {
-		result = append(result, strings.TrimRight(line, " \t\r"))
+		trimmed := strings.TrimRight(line, " \t\r")
+		// Normalize leading spaces on SQL continuation lines:
+		// Lines that start with spaces (not tabs) and contain SQL keywords
+		// are treated as SQL continuations where leading space count doesn't matter.
+		// Tab-indented lines (CREATE TABLE output etc.) are preserved.
+		if len(trimmed) > 0 && trimmed[0] == ' ' && !strings.HasPrefix(trimmed, "\t") {
+			trimmed = strings.TrimLeft(trimmed, " ")
+		}
+		result = append(result, trimmed)
 	}
 	out := strings.TrimRight(strings.Join(result, "\n"), "\n")
 	// Normalize TRIM display: MySQL sometimes omits space before FROM for certain multibyte chars.
