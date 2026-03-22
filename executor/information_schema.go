@@ -1160,7 +1160,7 @@ func (e *Executor) infoSchemaEngines() []storage.Row {
 		{
 			"ENGINE":       "BLACKHOLE",
 			"SUPPORT":      "YES",
-			"COMMENT":      "/dev/null storage engine",
+			"COMMENT":      "/dev/null storage engine (anything you write to it disappears)",
 			"TRANSACTIONS": "NO",
 			"XA":           "NO",
 			"SAVEPOINTS":   "NO",

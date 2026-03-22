@@ -219,13 +219,19 @@ func (e *Executor) getSysVarGlobal(name string) (string, bool) {
 	return v, ok
 }
 
-// getSysVarSession reads a session-scoped system variable (session then global).
+// getSysVarSession reads a session-scoped system variable.
+// For global-only variables, falls back to globalScopeVars.
+// For session-capable variables, only checks sessionScopeVars so that
+// SET @@global.var = X does not affect the session value.
 func (e *Executor) getSysVarSession(name string) (string, bool) {
 	if v, ok := e.sessionScopeVars[name]; ok {
 		return v, true
 	}
-	if v, ok := e.globalScopeVars[name]; ok {
-		return v, true
+	// For global-only variables, fall back to global scope
+	if sysVarGlobalOnly[name] {
+		if v, ok := e.globalScopeVars[name]; ok {
+			return v, true
+		}
 	}
 	return "", false
 }
@@ -3771,15 +3777,36 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				cleanName = strings.TrimPrefix(cleanName, "session.")
 				cleanName = strings.TrimPrefix(cleanName, "local.")
 				isGlobal := scope == sqlparser.GlobalScope
+				// Save previous session value before SET GLOBAL overwrites it.
+				savedSessionVal := map[string]string{}
+				if isGlobal {
+					if prev, ok := e.sessionScopeVars[cleanName]; ok {
+						savedSessionVal[cleanName] = prev
+					}
+				}
 				// Handle DEFAULT: restore to default value (or emulate known MySQL special defaults).
 				if _, isDefault := expr.Expr.(*sqlparser.Default); isDefault || strings.ToUpper(val) == "DEFAULT" {
 					if cleanName == "connect_timeout" {
 						e.setSysVar(cleanName, "10", isGlobal)
 					} else if cleanName == "innodb_io_capacity_max" {
 						e.setSysVar(cleanName, "4294967295", isGlobal)
+					} else if isGlobal {
+						// For SET GLOBAL var = DEFAULT, delete the global override
+						// so the value falls back to the compiled default.
+						e.deleteSysVar(cleanName, true)
 					} else {
-						e.deleteSysVar(cleanName, isGlobal)
+						// For SET SESSION var = DEFAULT, set session to current global value.
+						// In MySQL, DEFAULT for session means "current global value".
+						if gv, ok := e.globalScopeVars[cleanName]; ok {
+							e.sessionScopeVars[cleanName] = gv
+						} else {
+							// No global override, fall back to compiled default
+							delete(e.sessionScopeVars, cleanName)
+						}
 					}
+					// Skip the isGlobal move-to-global block below since DEFAULT
+					// already handled the proper scope placement.
+					continue
 				} else if rng, ok := sysVarIntRange[cleanName]; ok {
 					var clamped string
 				var err error
@@ -4327,11 +4354,18 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						e.sessionScopeVars[cleanName] = val
 					}
 				}
-				// If SET GLOBAL was used, move the value from session to global scope.
+				// If SET GLOBAL was used, move the newly-stored value to global scope
+			// while preserving the previous session value (SET GLOBAL should not
+			// affect the current session's variable value).
 				if isGlobal {
 					if v, ok := e.sessionScopeVars[cleanName]; ok {
 						e.globalScopeVars[cleanName] = v
-						delete(e.sessionScopeVars, cleanName)
+						// Restore the previous session value or remove if there wasn't one.
+						if prevVal, had := savedSessionVal[cleanName]; had {
+							e.sessionScopeVars[cleanName] = prevVal
+						} else {
+							delete(e.sessionScopeVars, cleanName)
+						}
 					}
 				}
 			}
@@ -10707,14 +10741,18 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 			if !se.As.IsEmpty() {
 				colNames = append(colNames, se.As.String())
 			} else if isAggregateExpr(se.Expr) {
-				// Use raw expression text for aggregates containing @@var to preserve scope case
+				// Use raw expression text for aggregates to preserve original formatting
+				// (e.g., space after comma in JSON_OBJECTAGG(k, b))
 				if rawExprIdx < len(rawExprs) {
 					raw := strings.TrimSpace(rawExprs[rawExprIdx])
-					if strings.Contains(strings.ToLower(raw), "@@") {
-						colNames = append(colNames, raw)
-					} else {
-						colNames = append(colNames, aggregateDisplayName(se.Expr))
+					// Uppercase known aggregate function names
+					for _, fn := range []string{"count", "sum", "avg", "min", "max", "json_arrayagg", "json_objectagg", "group_concat"} {
+						if strings.HasPrefix(strings.ToLower(raw), fn+"(") {
+							raw = strings.ToUpper(fn) + raw[len(fn):]
+							break
+						}
 					}
+					colNames = append(colNames, raw)
 				} else {
 					colNames = append(colNames, aggregateDisplayName(se.Expr))
 				}
@@ -14568,8 +14606,10 @@ var sysVarGlobalOnly = map[string]bool{
 	"innodb_replication_delay":                 true,
 	"innodb_spin_wait_delay":                   true,
 	"innodb_spin_wait_pause_multiplier":        true,
+	"innodb_stats_auto_recalc":                 true,
 	"innodb_stats_include_delete_marked":       true,
 	"innodb_stats_on_metadata":                 true,
+	"innodb_stats_persistent":                  true,
 	"innodb_stats_persistent_sample_pages":     true,
 	"innodb_stats_transient_sample_pages":      true,
 	"innodb_status_output":                     true,
@@ -14584,6 +14624,7 @@ var sysVarGlobalOnly = map[string]bool{
 	"log_bin_trust_function_creators":          true,
 	"max_connections":                          true,
 	"max_connect_errors":                       true,
+	"max_write_lock_count":                     true,
 	"mysql_native_password_proxy_users":        true,
 	"sha256_password_proxy_users":              true,
 	"mysqlx_connect_timeout":                   true,
@@ -16132,8 +16173,13 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		vars[name] = val
 	}
 
-	// Override with SET GLOBAL values
+	// Override with SET GLOBAL values.
+	// For session scope (!globalOnly), only apply global overrides for global-only
+	// variables because SET @@global.var should not affect @@session.var.
 	for name, val := range e.globalScopeVars {
+		if !globalOnly && !sysVarGlobalOnly[name] {
+			continue
+		}
 		if name == "innodb_stats_transient_sample_pages" || name == "innodb_stats_persistent_sample_pages" {
 			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n < 1 {
 				val = "1"
@@ -17243,6 +17289,11 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			gv, gvOK = e.getSysVarGlobal(name)
 		} else {
 			gv, gvOK = e.getSysVarSession(name)
+			// For global-only variables accessed without explicit scope,
+			// fall back to global scope since they have no session value.
+			if !gvOK && sysVarGlobalOnly[name] {
+				gv, gvOK = e.getSysVarGlobal(name)
+			}
 		}
 		if gvOK {
 			// Apply minimum constraints
