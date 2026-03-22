@@ -1814,7 +1814,11 @@ func (ctx *execContext) executeQuery(stmt string) error {
 		if ctx.expectedError != "" {
 			// Output the error message (mysqltest format)
 			if ctx.resultLogEnabled {
-				ctx.output.WriteString(formatMySQLError(err) + "\n")
+				if strings.Contains(ctx.expectedError, ",") {
+					ctx.output.WriteString("Got one of the listed errors\n")
+				} else {
+					ctx.output.WriteString(formatMySQLError(err) + "\n")
+				}
 			}
 			ctx.expectedError = ""
 			return nil
@@ -1926,7 +1930,11 @@ func (ctx *execContext) executeQueryOrExec(stmt string) error {
 	if err != nil {
 		if ctx.expectedError != "" {
 			if ctx.resultLogEnabled {
-				ctx.output.WriteString(formatMySQLError(err) + "\n")
+				if strings.Contains(ctx.expectedError, ",") {
+					ctx.output.WriteString("Got one of the listed errors\n")
+				} else {
+					ctx.output.WriteString(formatMySQLError(err) + "\n")
+				}
 			}
 			ctx.expectedError = ""
 			return nil
@@ -2128,7 +2136,11 @@ func (ctx *execContext) executeExecWithExpectedError(stmt string) error {
 	_, execErr := conn.ExecContext(context.Background(), stmt)
 	if execErr != nil {
 		if ctx.resultLogEnabled {
-			ctx.output.WriteString(formatMySQLError(execErr) + "\n")
+			if strings.Contains(expectedCode, ",") {
+				ctx.output.WriteString("Got one of the listed errors\n")
+			} else {
+				ctx.output.WriteString(formatMySQLError(execErr) + "\n")
+			}
 		}
 		return nil
 	}

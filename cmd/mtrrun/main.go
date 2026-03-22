@@ -979,7 +979,7 @@ var skipTests = map[string]bool{
 		"sys_vars/binlog_group_commit_sync_no_delay_count_basic":          true,
 		"sys_vars/binlog_max_flush_queue_time_basic":                      true,
 		"sys_vars/binlog_row_event_max_size_basic":                        true,
-		"sys_vars/binlog_row_image_basic":                                 true,
+		// "sys_vars/binlog_row_image_basic":                                 true, // fixed: added enum mapping
 		"sys_vars/binlog_row_metadata_basic":                              true,
 		"sys_vars/binlog_rows_query_log_events_basic":                     true,
 		"sys_vars/block_encryption_mode_basic":                            true,
@@ -1037,17 +1037,17 @@ var skipTests = map[string]bool{
 		"sys_vars/identity_basic":                                         true,
 		"sys_vars/identity_func":                                          true,
 		"sys_vars/immediate_server_version_basic":                         true,
-		"sys_vars/information_schema_stats_expiry_basic":                  true,
+		// "sys_vars/information_schema_stats_expiry_basic":                  true, // fixed: max range 86400→31536000
 		"sys_vars/init_connect_basic":                                     true,
-		"sys_vars/init_file_basic":                                        true,
+		// "sys_vars/init_file_basic":                                        true, // fixed: init_file is read-only
 		"sys_vars/init_slave_basic":                                       true,
 		"sys_vars/innodb_adaptive_hash_index_parts_basic":                 true,
 		"sys_vars/innodb_api_disable_rowlock_basic":                       true,
 		"sys_vars/innodb_api_enable_binlog_basic":                         true,
 		"sys_vars/innodb_api_enable_mdl_basic":                            true,
-		"sys_vars/innodb_autoinc_lock_mode_basic":                         true,
+		// "sys_vars/innodb_autoinc_lock_mode_basic":                         true, // fixed: default 1→2
 		"sys_vars/innodb_autoinc_lock_mode_func":                          true,
-		"sys_vars/innodb_buffer_pool_dump_at_shutdown_basic":              true,
+		// "sys_vars/innodb_buffer_pool_dump_at_shutdown_basic":              true, // fixed: Got one of listed errors
 		"sys_vars/innodb_buffer_pool_dump_now_basic":                      true,
 		"sys_vars/innodb_buffer_pool_filename_basic":                      true,
 		"sys_vars/innodb_buffer_pool_load_abort_basic":                    true,
@@ -1076,9 +1076,9 @@ var skipTests = map[string]bool{
 		"sys_vars/innodb_monitor_enable_basic":                            true,
 		"sys_vars/innodb_monitor_reset_all_basic":                         true,
 		"sys_vars/innodb_monitor_reset_basic":                             true,
-		"sys_vars/innodb_page_cleaners_basic":                             true,
+		// "sys_vars/innodb_page_cleaners_basic":                             true, // fixed: default 4→1
 		"sys_vars/innodb_parallel_read_threads_basic":                     true,
-		"sys_vars/innodb_purge_batch_size_basic":                          true,
+		// "sys_vars/innodb_purge_batch_size_basic":                          true, // fixed: max 4294967295→5000
 		"sys_vars/innodb_redo_log_archive_dirs_basic":                     true,
 		"sys_vars/innodb_redo_log_encrypt_basic":                          true,
 		"sys_vars/innodb_replication_delay_basic":                         true,
@@ -1118,23 +1118,23 @@ var skipTests = map[string]bool{
 		"sys_vars/log_slow_admin_statements_func":                         true,
 		"sys_vars/log_slow_slave_statements_basic":                        true,
 		"sys_vars/log_statements_unsafe_for_binlog_basic":                 true,
-		"sys_vars/log_throttle_qni_basic":                                 true,
+		// "sys_vars/log_throttle_qni_basic":                                 true, // fixed: added to sysVarGlobalOnly
 		"sys_vars/log_timestamps_basic":                                   true,
 		"sys_vars/long_query_time_basic":                                  true,
 		"sys_vars/low_priority_updates_basic":                             true,
 		"sys_vars/max_allowed_packet_basic":                               true,
 		"sys_vars/max_allowed_packet_func":                                true,
-		"sys_vars/max_binlog_size_basic":                                  true,
+		// "sys_vars/max_binlog_size_basic":                                  true, // fixed: BlockSize 4096
 		"sys_vars/max_delayed_threads_basic":                              true,
 		
-		"sys_vars/max_heap_table_size_basic":                              true,
+		// "sys_vars/max_heap_table_size_basic":                              true, // fixed: BlockSize 1024 + 64-bit max
 		"sys_vars/max_insert_delayed_threads_basic":                       true,
 		"sys_vars/max_join_size_basic":                                    true,
 		
 		
 		"sys_vars/max_prepared_stmt_count_basic":                          true,
 		"sys_vars/max_prepared_stmt_count_func":                           true,
-		"sys_vars/max_relay_log_size_basic":                               true,
+		// "sys_vars/max_relay_log_size_basic":                               true, // fixed: BlockSize 4096
 		
 		"sys_vars/max_seeks_for_key_func":                                 true,
 		
@@ -1145,7 +1145,7 @@ var skipTests = map[string]bool{
 		"sys_vars/maximum_basic":                                          true,
 		
 		"sys_vars/myisam_max_sort_file_size_basic_64":                     true,
-		"sys_vars/myisam_mmap_size_basic":                                 true,
+		// "sys_vars/myisam_mmap_size_basic":                                 true, // fixed: myisam_mmap_size is read-only
 		"sys_vars/myisam_recover_options_basic":                           true,
 		
 		"sys_vars/myisam_stats_method_basic":                              true,
@@ -1160,13 +1160,13 @@ var skipTests = map[string]bool{
 		"sys_vars/mysqlx_write_timeout_basic":                             true,
 		"sys_vars/net_buffer_length_basic":                                true,
 		
-		"sys_vars/net_retry_count_basic_64":                               true,
+		// "sys_vars/net_retry_count_basic_64":                               true, // fixed: max range uint32→uint64
 		
 		"sys_vars/new_basic":                                              true,
 		"sys_vars/ngram_token_size_basic":                                 true,
 		"sys_vars/offline_mode_basic":                                     true,
 		
-		"sys_vars/old_basic":                                              true,
+		// "sys_vars/old_basic":                                              true, // fixed: old is read-only
 		"sys_vars/optimizer_prune_level_basic":                            true,
 		
 		"sys_vars/optimizer_switch_basic":                                 true,
@@ -1186,11 +1186,11 @@ var skipTests = map[string]bool{
 		"sys_vars/pseudo_slave_mode_basic":                                true,
 		"sys_vars/pseudo_thread_id_basic":                                 true,
 		
-		"sys_vars/query_prealloc_size_basic":                              true,
+		// "sys_vars/query_prealloc_size_basic":                              true, // fixed: BlockSize 1024
 		"sys_vars/query_prealloc_size_func":                               true,
 		"sys_vars/rand_seed1_basic":                                       true,
 		"sys_vars/rand_seed2_basic":                                       true,
-		"sys_vars/range_alloc_block_size_basic":                           true,
+		// "sys_vars/range_alloc_block_size_basic":                           true, // fixed: max 4294966272
 		"sys_vars/range_optimizer_max_mem_size_basic":                     true,
 		"sys_vars/rbr_exec_mode_basic":                                    true,
 		
@@ -1211,10 +1211,10 @@ var skipTests = map[string]bool{
 		"sys_vars/session_track_system_variables_basic":                   true,
 		"sys_vars/session_track_transaction_info_basic":                   true,
 		"sys_vars/show_old_temporals_basic":                               true,
-		"sys_vars/skip_name_resolve_basic":                                true,
+		// "sys_vars/skip_name_resolve_basic":                                true, // fixed: default OFF→ON
 		"sys_vars/slave_allow_batching_basic":                             true,
 		"sys_vars/slave_compressed_protocol_basic":                        true,
-		"sys_vars/slave_max_allowed_packet_basic":                         true,
+		// "sys_vars/slave_max_allowed_packet_basic":                         true, // fixed: BlockSize 1024
 		"sys_vars/slave_parallel_type_basic":                              true,
 		"sys_vars/slave_parallel_workers_basic":                           true,
 		"sys_vars/slave_pending_jobs_size_max_basic":                      true,
@@ -1223,7 +1223,7 @@ var skipTests = map[string]bool{
 		"sys_vars/slow_query_log_basic":                                   true,
 		"sys_vars/slow_query_log_file_basic":                              true,
 		"sys_vars/slow_query_log_func":                                    true,
-		"sys_vars/sort_buffer_size_basic_64":                              true,
+		// "sys_vars/sort_buffer_size_basic_64":                              true, // fixed: removed BlockSize rounding
 		"sys_vars/sql_auto_is_null_basic":                                 true,
 		"sys_vars/sql_big_selects_basic":                                  true,
 		"sys_vars/sql_buffer_result_basic":                                true,
@@ -1248,8 +1248,8 @@ var skipTests = map[string]bool{
 		"sys_vars/super_read_only_basic":                                  true,
 		"sys_vars/super_read_only_func":                                   true,
 		"sys_vars/table_encryption_privilege_check_basic":                 true,
-		"sys_vars/temptable_max_ram_basic":                                true,
-		"sys_vars/thread_stack_basic":                                     true,
+		// "sys_vars/temptable_max_ram_basic":                                true, // fixed: min 1MB→2MB
+		// "sys_vars/thread_stack_basic":                                     true, // fixed: default 1048576→262144
 		"sys_vars/time_zone_basic":                                        true,
 		"sys_vars/time_zone_func":                                         true,
 		"sys_vars/timestamp_basic":                                        true,
@@ -1737,7 +1737,7 @@ var skipTests = map[string]bool{
 	"other/opt_hints_pfs":                          true,
 	"other/opt_hints_subquery":                     true,
 	"other/order_by_limit":                         true,
-	"other/overflow":                               true,
+	// "other/overflow":                               true, // now passes
 	"other/parser_bug21114_innodb":                 true,
 	"other/parser_precedence":                      true,
 	"other/partition_bug18198":                     true,
@@ -2376,6 +2376,161 @@ var skipTests = map[string]bool{
 	"other/view_myisam": true,
 	"other/window_functions_myisam": true,
 	"other/wl6219-myisam": true,
+
+	// === encryption suite ===
+	"encryption/engine": true,
+
+	// === large_tests suite ===
+	"large_tests/innodb_innochecksum_3gb": true,
+	"large_tests/rpl_slave_net_timeout":   true,
+
+	// === binlog_nogtid suite ===
+	"binlog_nogtid/binlog_mysqlbinlog_row_myisam":            true,
+	"binlog_nogtid/binlog_mysqlbinlog_row_trans":              true,
+	"binlog_nogtid/binlog_nogtid_not_yet_determined_reacquire": true,
+	"binlog_nogtid/binlog_nogtid_select_taking_write_locks":   true,
+	"binlog_nogtid/binlog_row_insert_select":                  true,
+
+	// === innodb_undo suite ===
+	"innodb_undo/undo_ddl_vs_dml": true,
+
+	// === innodb_zip suite ===
+	"innodb_zip/bug52745":          true,
+	"innodb_zip/bug53591":          true,
+	"innodb_zip/bug56680":          true,
+	"innodb_zip/cmp_drop_table":    true,
+	"innodb_zip/cmp_per_index":     true,
+	"innodb_zip/create_options":    true,
+	"innodb_zip/prefix_index_liftedlimit": true,
+	"innodb_zip/restart":           true,
+	"innodb_zip/wl6915_1":          true,
+	"innodb_zip/zip":               true,
+
+	// === gcol_ndb suite ===
+	"gcol_ndb/gcol_column_def_options_ndb": true,
+
+	// === innodb_gis suite ===
+	"innodb_gis/alter_spatial_index":  true,
+	"innodb_gis/bug16236208":          true,
+	"innodb_gis/create_spatial_index": true,
+	"innodb_gis/gis":                  true,
+	"innodb_gis/point_basic":          true,
+	"innodb_gis/precise":              true,
+	"innodb_gis/repeatable_spatial":   true,
+	"innodb_gis/row_format":           true,
+	"innodb_gis/rtree":                true,
+	"innodb_gis/rtree_multi_pk":       true,
+	"innodb_gis/rtree_old":            true,
+	"innodb_gis/rtree_search":         true,
+	"innodb_gis/rtree_undo":           true,
+
+	// === innodb_stress suite ===
+	"innodb_stress/innodb_bigstress":                       true,
+	"innodb_stress/innodb_bigstress_blob":                  true,
+	"innodb_stress/innodb_bigstress_blob_nocompress":       true,
+	"innodb_stress/innodb_bigstress_crash":                 true,
+	"innodb_stress/innodb_bigstress_crash_blob":            true,
+	"innodb_stress/innodb_bigstress_crash_blob_nocompress": true,
+	"innodb_stress/innodb_bigstress_crash_nocompress":      true,
+	"innodb_stress/innodb_bigstress_nocompress":            true,
+	"innodb_stress/innodb_hugestress":                      true,
+	"innodb_stress/innodb_hugestress_blob":                 true,
+	"innodb_stress/innodb_hugestress_blob_nocompress":      true,
+	"innodb_stress/innodb_hugestress_crash":                true,
+	"innodb_stress/innodb_hugestress_crash_blob":           true,
+	"innodb_stress/innodb_hugestress_crash_blob_nocompress": true,
+	"innodb_stress/innodb_hugestress_crash_nocompress":     true,
+	"innodb_stress/innodb_hugestress_nocompress":           true,
+	"innodb_stress/innodb_stress":                          true,
+	"innodb_stress/innodb_stress_blob":                     true,
+	"innodb_stress/innodb_stress_blob_nocompress":          true,
+	"innodb_stress/innodb_stress_crash":                    true,
+	"innodb_stress/innodb_stress_crash_blob":               true,
+	"innodb_stress/innodb_stress_crash_blob_nocompress":    true,
+	"innodb_stress/innodb_stress_crash_nocompress":         true,
+	"innodb_stress/innodb_stress_nocompress":               true,
+
+	// === max_parts suite ===
+	"max_parts/partition_max_parts_hash_innodb":            true,
+	"max_parts/partition_max_parts_inv_innodb":             true,
+	"max_parts/partition_max_parts_key_innodb":             true,
+	"max_parts/partition_max_parts_list_innodb":            true,
+	"max_parts/partition_max_parts_range_innodb":           true,
+	"max_parts/partition_max_sub_parts_key_list_innodb":    true,
+	"max_parts/partition_max_sub_parts_key_range_innodb":   true,
+	"max_parts/partition_max_sub_parts_list_innodb":        true,
+	"max_parts/partition_max_sub_parts_range_innodb":       true,
+
+	// === opt_trace suite ===
+	"opt_trace/bugs_no_prot_all":       true,
+	"opt_trace/bugs_no_prot_none":      true,
+	"opt_trace/bugs_ps_prot_all":       true,
+	"opt_trace/bugs_ps_prot_none":      true,
+	"opt_trace/charset":                true,
+	"opt_trace/filesort_pack":          true,
+	"opt_trace/filesort_pq":            true,
+	"opt_trace/fulltext":               true,
+	"opt_trace/general2_no_prot":       true,
+	"opt_trace/general2_ps_prot":       true,
+	"opt_trace/general_no_prot_all":    true,
+	"opt_trace/general_no_prot_none":   true,
+	"opt_trace/general_ps_prot_all":    true,
+	"opt_trace/general_ps_prot_none":   true,
+	"opt_trace/histograms":             true,
+	"opt_trace/opt_hints_index_merge":  true,
+	"opt_trace/range_no_prot":          true,
+	"opt_trace/range_ps_prot":          true,
+	"opt_trace/security_no_prot":       true,
+	"opt_trace/skip_scan":              true,
+	"opt_trace/subquery_no_prot":       true,
+	"opt_trace/subquery_ps_prot":       true,
+	"opt_trace/temp_table":             true,
+
+	// === auth_sec suite ===
+	"auth_sec/anonymous_grants":                true,
+	"auth_sec/install_keyring_file":            true,
+	"auth_sec/key_rotation":                    true,
+	"auth_sec/key_rotation_qa":                 true,
+	"auth_sec/keyring_file_data":               true,
+	"auth_sec/keyring_file_data_qa":            true,
+	"auth_sec/keyring_udf":                     true,
+	"auth_sec/mandatory_roles":                 true,
+	"auth_sec/multiple_passwords":              true,
+	"auth_sec/mysql_protocol_types":            true,
+	"auth_sec/noacl_imply_nonet":               true,
+	"auth_sec/partial_revokes_add_remove":      true,
+	"auth_sec/partial_revokes_dml":             true,
+	"auth_sec/password_expiry":                 true,
+	"auth_sec/password_require_current":        true,
+	"auth_sec/require_secure_transport":        true,
+	"auth_sec/secure_file_priv_warnings_not_win": true,
+	"auth_sec/skip_grant_protocols":            true,
+	"auth_sec/ssl_mode":                        true,
+	"auth_sec/system_user_kill_connection":      true,
+	"auth_sec/system_user_priv":                true,
+
+	// === binlog suite ===
+	"binlog/binlog_create_drop_temporary_table":                        true,
+	"binlog/binlog_database":                                           true,
+	"binlog/binlog_enforce_gtid_consistency_create_select_consistent":  true,
+	"binlog/binlog_enforce_gtid_consistency_create_select_violation":   true,
+	"binlog/binlog_enforce_gtid_consistency_trx_nontrx_consistent":    true,
+	"binlog/binlog_enforce_gtid_consistency_trx_nontrx_violation":     true,
+	"binlog/binlog_expire_logs_seconds":                                true,
+	"binlog/binlog_grant_alter_user":                                   true,
+	"binlog/binlog_innodb_row":                                         true,
+	"binlog/binlog_mysqlbinlog_linux":                                  true,
+	"binlog/binlog_mysqlbinlog_raw":                                    true,
+	"binlog/binlog_restart_server_with_exhausted_index_value":          true,
+	"binlog/binlog_row_delete_all_rows":                                true,
+	"binlog/binlog_row_mix_drop_tmp_tbl":                               true,
+	"binlog/binlog_same_basename_relaylog":                             true,
+	"binlog/binlog_stm_row":                                            true,
+	"binlog/binlog_switch_inside_trans":                                 true,
+	"binlog/binlog_temp_table_prevents_switch_session_binlog_format":   true,
+	"binlog/binlog_truncate_myisam":                                    true,
+	"binlog/binlog_user_if_exists":                                     true,
+	"binlog/print_identified_with_as_hex":                              true,
 }
 
 func main() {
@@ -2454,6 +2609,19 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		"sys_vars":         true,
 		"sysschema":        true,
 		"x":                true,
+		"funcs_2":          true,
+		"encryption":       true,
+		"large_tests":      true,
+		"binlog_nogtid":    true,
+		"innodb_undo":      true,
+		"innodb_zip":       true,
+		"gcol_ndb":         true,
+		"innodb_gis":       true,
+		"innodb_stress":    true,
+		"max_parts":        true,
+		"opt_trace":        true,
+		"auth_sec":         true,
+		"binlog":           true,
 		// collations: skipped — requires MySQL UCA 0900 weight tables (DUCET + tailoring)
 	}
 

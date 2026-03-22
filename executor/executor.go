@@ -14407,7 +14407,7 @@ var sysVarReadOnly = map[string]bool{
 	"innodb_data_file_path":              true, "innodb_data_home_dir": true,
 	"innodb_dedicated_server": true, "innodb_force_recovery": true,
 	"innodb_log_file_size": true, "innodb_temp_data_file_path": true,
-	"innodb_undo_directory": true,
+	"innodb_undo_directory": true, "init_file": true, "myisam_mmap_size": true, "old": true,
 	"performance_schema":    true, "skip_show_database": true,
 	"skip_external_locking":            true,
 	"performance_schema_accounts_size": true, "performance_schema_digests_size": true,
@@ -14622,6 +14622,7 @@ var sysVarGlobalOnly = map[string]bool{
 	"log_error_suppression_list":               true,
 	"log_error_services":                       true,
 	"log_bin_trust_function_creators":          true,
+	"log_throttle_queries_not_using_indexes":   true,
 	"max_connections":                          true,
 	"max_connect_errors":                       true,
 	"max_write_lock_count":                     true,
@@ -14804,6 +14805,14 @@ var sysVarEnumValues = map[string]map[string]string{
 		"STATEMENT": "STATEMENT",
 		"ROW":       "ROW",
 	},
+	"binlog_row_image": {
+		"0":       "MINIMAL",
+		"1":       "NOBLOB",
+		"2":       "FULL",
+		"MINIMAL": "MINIMAL",
+		"NOBLOB":  "NOBLOB",
+		"FULL":    "FULL",
+	},
 }
 
 // sysVarSessionOnly contains system variables that only exist at SESSION scope.
@@ -14937,7 +14946,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"innodb_flushing_avg_loops":                {Min: 1, Max: 1000, IsUnsigned: true},
 	"innodb_max_purge_lag":                     {Min: 0, Max: 4294967295, IsUnsigned: true},
 	"innodb_max_purge_lag_delay":               {Min: 0, Max: 4294967295, IsUnsigned: true},
-	"innodb_purge_batch_size":                  {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"innodb_purge_batch_size":                  {Min: 1, Max: 5000, IsUnsigned: true},
 	"innodb_purge_rseg_truncate_frequency":     {Min: 1, Max: 128, IsUnsigned: true},
 	"innodb_sync_spin_loops":                   {Min: 0, Max: 4294967295, IsUnsigned: true},
 	"innodb_thread_concurrency":                {Min: 0, Max: 1000, IsUnsigned: true},
@@ -14967,7 +14976,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"gtid_executed_compression_period":         {Min: 0, Max: 4294967295, IsUnsigned: true},
 	"histogram_generation_max_mem_size":        {Min: 1000000, Max: 18446744073709551615, IsUnsigned: true},
 	"host_cache_size":                          {Min: 0, Max: 65536, IsUnsigned: true},
-	"information_schema_stats_expiry":          {Min: 0, Max: 86400, IsUnsigned: true},
+	"information_schema_stats_expiry":          {Min: 0, Max: 31536000, IsUnsigned: true},
 	"innodb_adaptive_flushing_lwm":             {Min: 0, Max: 70, IsUnsigned: true},
 	"innodb_adaptive_hash_index_parts":         {Min: 1, Max: 512, IsUnsigned: true},
 	"innodb_adaptive_max_sleep_delay":          {Min: 0, Max: 1000000, IsUnsigned: true},
@@ -14989,19 +14998,19 @@ var sysVarIntRange = map[string]intVarRange{
 	"log_throttle_queries_not_using_indexes":   {Min: 0, Max: 4294967295, IsUnsigned: true},
 	"long_query_time":                          {Min: 0, Max: 31536000, IsUnsigned: false},
 	"max_binlog_cache_size":                    {Min: 4096, Max: 18446744073709547520, IsUnsigned: true, BlockSize: 4096},
-	"max_binlog_size":                          {Min: 4096, Max: 1073741824, IsUnsigned: true},
+	"max_binlog_size":                          {Min: 4096, Max: 1073741824, IsUnsigned: true, BlockSize: 4096},
 	"max_binlog_stmt_cache_size":               {Min: 4096, Max: 18446744073709547520, IsUnsigned: true, BlockSize: 4096},
 	"max_connect_errors":                       {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
 	"max_delayed_threads":                      {Min: 0, Max: 16384, IsUnsigned: true},
 	"max_error_count":                          {Min: 0, Max: 65535, IsUnsigned: true},
 	"max_execution_time":                       {Min: 0, Max: 4294967295, IsUnsigned: true},
-	"max_heap_table_size":                      {Min: 16384, Max: 18446744073709551615, IsUnsigned: true},
+	"max_heap_table_size":                      {Min: 16384, Max: 18446744073709550592, IsUnsigned: true, BlockSize: 1024},
 	"max_insert_delayed_threads":               {Min: 0, Max: 16384, IsUnsigned: true},
 	"max_join_size":                            {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
 	"max_length_for_sort_data":                 {Min: 4, Max: 8388608, IsUnsigned: true},
 	"max_points_in_geometry":                   {Min: 3, Max: 1048576, IsUnsigned: true},
 	"max_prepared_stmt_count":                  {Min: 0, Max: 4194304, IsUnsigned: true},
-	"max_relay_log_size":                       {Min: 0, Max: 1073741824, IsUnsigned: true},
+	"max_relay_log_size":                       {Min: 0, Max: 1073741824, IsUnsigned: true, BlockSize: 4096},
 	"max_seeks_for_key":                        {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
 	"max_sort_length":                          {Min: 4, Max: 8388608, IsUnsigned: true},
 	"max_sp_recursion_depth":                   {Min: 0, Max: 255, IsUnsigned: true},
@@ -15017,7 +15026,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"mysqlx_min_worker_threads":                {Min: 1, Max: 100, IsUnsigned: true},
 	"net_buffer_length":                        {Min: 1024, Max: 1048576, IsUnsigned: true},
 	"net_read_timeout":                         {Min: 1, Max: 31536000, IsUnsigned: true},
-	"net_retry_count":                          {Min: 1, Max: 4294967295, IsUnsigned: true},
+	"net_retry_count":                          {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
 	"net_write_timeout":                        {Min: 1, Max: 31536000, IsUnsigned: true},
 	"ngram_token_size":                         {Min: 1, Max: 10, IsUnsigned: true},
 	"optimizer_prune_level":                    {Min: 0, Max: 1, IsUnsigned: true},
@@ -15031,8 +15040,8 @@ var sysVarIntRange = map[string]intVarRange{
 	"preload_buffer_size":                      {Min: 1024, Max: 1073741824, IsUnsigned: true},
 	"profiling_history_size":                   {Min: 0, Max: 100, IsUnsigned: true},
 	"query_alloc_block_size":                   {Min: 1024, Max: 4294967295, IsUnsigned: true, BlockSize: 1024},
-	"query_prealloc_size":                      {Min: 8192, Max: 18446744073709551615, IsUnsigned: true},
-	"range_alloc_block_size":                   {Min: 4096, Max: 18446744073709551615, IsUnsigned: true, BlockSize: 1024},
+	"query_prealloc_size":                      {Min: 8192, Max: 18446744073709551615, IsUnsigned: true, BlockSize: 1024},
+	"range_alloc_block_size":                   {Min: 4096, Max: 4294966272, IsUnsigned: true, BlockSize: 1024},
 	"range_optimizer_max_mem_size":             {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
 	"read_buffer_size":                         {Min: 8192, Max: 2147483647, IsUnsigned: true, BlockSize: 4096},
 	"read_rnd_buffer_size":                     {Min: 1, Max: 2147483647, IsUnsigned: true},
@@ -15044,13 +15053,13 @@ var sysVarIntRange = map[string]intVarRange{
 	"select_into_disk_sync_delay":              {Min: 0, Max: 31536000, IsUnsigned: true},
 	"slave_checkpoint_group":                   {Min: 32, Max: 524280, IsUnsigned: true},
 	"slave_checkpoint_period":                  {Min: 1, Max: 4294967295, IsUnsigned: true},
-	"slave_max_allowed_packet":                 {Min: 1024, Max: 1073741824, IsUnsigned: true},
+	"slave_max_allowed_packet":                 {Min: 1024, Max: 1073741824, IsUnsigned: true, BlockSize: 1024},
 	"slave_net_timeout":                        {Min: 1, Max: 31536000, IsUnsigned: true},
 	"slave_parallel_workers":                   {Min: 0, Max: 1024, IsUnsigned: true},
 	"slave_pending_jobs_size_max":              {Min: 1024, Max: 18446744073709551615, IsUnsigned: true, BlockSize: 1024},
 	"slave_transaction_retries":                {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
 	"slow_launch_time":                         {Min: 0, Max: 31536000, IsUnsigned: true},
-	"sort_buffer_size":                         {Min: 32768, Max: 18446744073709551615, IsUnsigned: true, BlockSize: 1024},
+	"sort_buffer_size":                         {Min: 32768, Max: 18446744073709551615, IsUnsigned: true},
 	"sql_select_limit":                         {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
 	"stored_program_cache":                     {Min: 16, Max: 524288, IsUnsigned: true},
 	"stored_program_definition_cache":          {Min: 256, Max: 524288, IsUnsigned: true},
@@ -15062,7 +15071,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"table_open_cache_instances":               {Min: 1, Max: 64, IsUnsigned: true},
 	"tablespace_definition_cache":              {Min: 256, Max: 524288, IsUnsigned: true},
 	"temptable_max_mmap":                       {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
-	"temptable_max_ram":                        {Min: 1048576, Max: 18446744073709551615, IsUnsigned: true},
+	"temptable_max_ram":                        {Min: 2097152, Max: 18446744073709551615, IsUnsigned: true},
 	"thread_cache_size":                        {Min: 0, Max: 16384, IsUnsigned: true},
 	"tmp_table_size":                           {Min: 1024, Max: 18446744073709551615, IsUnsigned: true},
 	"transaction_alloc_block_size":             {Min: 1024, Max: 131072, IsUnsigned: true, BlockSize: 1024},
@@ -15237,7 +15246,22 @@ func normalizeBooleanToken(raw string) (int64, bool, bool) {
 	if s == "" {
 		return 0, false, false
 	}
+	isQuoted := strings.HasPrefix(s, "'") || strings.HasPrefix(s, "\"")
 	up := strings.ToUpper(strings.Trim(s, "'\""))
+	if isQuoted {
+		// Quoted strings: only accept "ON", "OFF", "0", "1"
+		switch up {
+		case "ON":
+			return 1, true, false
+		case "OFF":
+			return 0, true, false
+		case "0":
+			return 0, true, false
+		case "1":
+			return 1, true, false
+		}
+		return 0, false, false
+	}
 	switch up {
 	case "ON", "TRUE", "YES":
 		return 1, true, false
@@ -15254,14 +15278,7 @@ func normalizeBooleanToken(raw string) (int64, bool, bool) {
 			return 0, false, true
 		}
 	}
-	if strings.HasPrefix(s, "'") || strings.HasPrefix(s, "\"") {
-		inner := strings.Trim(s, "'\"")
-		if inner == "0" {
-			return 0, true, false
-		}
-		if inner == "1" {
-			return 1, true, false
-		}
+	if isQuoted {
 		return 0, false, false
 	}
 	if strings.HasPrefix(s, "-") {
@@ -15513,7 +15530,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"innodb_buffer_pool_size":                  "134217728",
 		"innodb_default_row_format":                "dynamic",
 		"innodb_lock_wait_timeout":                 "50",
-		"innodb_autoinc_lock_mode":                 "1",
+		"innodb_autoinc_lock_mode":                 "2",
 		"innodb_stats_persistent":                  "ON",
 		"innodb_stats_auto_recalc":                 "ON",
 		"innodb_stats_persistent_sample_pages":     "20",
@@ -15703,7 +15720,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"max_user_connections": "0",
 		"back_log":             "151",
 		"thread_cache_size":    "9",
-		"thread_stack":         "1048576",
+		"thread_stack":         "262144",
 
 		// Query and buffer sizes
 		"max_heap_table_size":      "16777216",
@@ -15804,7 +15821,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"mysql_native_password_proxy_users": "OFF",
 		"sha256_password_proxy_users":       "OFF",
 		"automatic_sp_privileges":           "ON",
-		"skip_name_resolve":                 "OFF",
+		"skip_name_resolve":                 "ON",
 		"skip_networking":                   "OFF",
 		"skip_show_database":                "OFF",
 		"local_infile":                      "OFF",
@@ -16100,7 +16117,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"innodb_directories":                     "",
 		"innodb_log_files_in_group":              "2",
 		"innodb_log_group_home_dir":              "./",
-		"innodb_page_cleaners":                   "4",
+		"innodb_page_cleaners":                   "1",
 		"innodb_redo_log_archive_dirs":           "",
 		"innodb_fsync_threshold":                 "0",
 		"innodb_version":                         "8.0.32",
@@ -17343,7 +17360,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		case "innodb_lock_wait_timeout":
 			return int64(50), nil
 		case "innodb_autoinc_lock_mode":
-			return int64(1), nil
+			return int64(2), nil
 		case "innodb_stats_on_metadata":
 			return int64(0), nil
 		case "innodb_stats_persistent":
