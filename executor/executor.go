@@ -339,6 +339,9 @@ func (e *Executor) initSystemTables() {
 			{Name: "NAME", Type: "VARCHAR(128)"},
 			{Name: "ENABLED", Type: "VARCHAR(8)"},
 			{Name: "TIMED", Type: "VARCHAR(8)"},
+			{Name: "PROPERTIES", Type: "VARCHAR(256)"},
+			{Name: "VOLATILITY", Type: "INT"},
+			{Name: "DOCUMENTATION", Type: "TEXT"},
 		},
 	})
 	ensure("performance_schema", &catalog.TableDef{
@@ -5342,6 +5345,8 @@ func coerceYearValue(v interface{}) interface{} {
 }
 
 // parseMySQLDateValue parses various MySQL date input formats and returns YYYY-MM-DD or "".
+var flexDateRe = regexp.MustCompile(`^(\d{4})-(\d{1,2})-(\d{1,2})`)
+
 func parseMySQLDateValue(s string) string {
 	// Already in standard format
 	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
@@ -5354,6 +5359,16 @@ func parseMySQLDateValue(s string) string {
 			return "" // Invalid date like 2008-04-31
 		}
 		return dateStr
+	}
+
+	// Try flexible YYYY-M-D format (non-zero-padded)
+	if m := flexDateRe.FindStringSubmatch(s); m != nil {
+		y, _ := strconv.Atoi(m[1])
+		mo, _ := strconv.Atoi(m[2])
+		d, _ := strconv.Atoi(m[3])
+		if isValidDate(y, mo, d) {
+			return fmt.Sprintf("%04d-%02d-%02d", y, mo, d)
+		}
 	}
 
 	// Strip time part for datetime strings
@@ -11340,6 +11355,42 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 
 // resolveSelectExprs returns column names and original expressions for non-aggregate SELECTs.
 // It handles star expansion using actual row data (needed for JOINs).
+// extractStarTableName extracts the table name from the current query's FROM clause
+// for a SELECT * with no rows. It uses the star expression's qualifier or falls back
+// to parsing the current query's FROM table name.
+func (e *Executor) extractStarTableName(se *sqlparser.StarExpr, allExprs []sqlparser.SelectExpr) string {
+	// If the star has a qualifier (e.g. t1.* or performance_schema.threads.*), use it
+	if !se.TableName.IsEmpty() {
+		return se.TableName.Name.String()
+	}
+	// Otherwise, extract from the currentQuery's FROM clause
+	query := e.currentQuery
+	upper := strings.ToUpper(query)
+	fromIdx := strings.Index(upper, " FROM ")
+	if fromIdx < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(query[fromIdx+6:])
+	// Normalize whitespace (newlines to spaces) for keyword detection
+	rest = strings.ReplaceAll(rest, "\n", " ")
+	rest = strings.ReplaceAll(rest, "\r", " ")
+	// Remove WHERE/ORDER BY/LIMIT etc.
+	upperRest := strings.ToUpper(rest)
+	for _, kw := range []string{" WHERE ", " ORDER ", " LIMIT ", " GROUP ", " HAVING ", ";"} {
+		if idx := strings.Index(upperRest, kw); idx >= 0 {
+			rest = rest[:idx]
+			break
+		}
+	}
+	rest = strings.TrimSpace(rest)
+	// Handle schema.table format
+	if strings.Contains(rest, ".") {
+		parts := strings.SplitN(rest, ".", 2)
+		return strings.Trim(parts[1], "` ")
+	}
+	return strings.Trim(rest, "` ")
+}
+
 // joinUsingCols contains columns from JOIN ... USING(...) that should appear only once.
 // tableDefs is optional; when provided, * expansion uses schema-defined column order.
 func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []storage.Row, joinUsingCols []string, tableDefs ...*catalog.TableDef) ([]string, []sqlparser.Expr, error) {
@@ -11384,17 +11435,24 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					}
 				} else {
 					for _, td := range tableDefs {
-						for _, col := range td.Columns {
-							cols = append(cols, col.Name)
-							// For JOINs (multiple table defs), use qualified column names
-							// to disambiguate columns with the same name across tables.
-							if len(tableDefs) > 1 {
-								colExprs = append(colExprs, &sqlparser.ColName{
-									Name:      sqlparser.NewIdentifierCI(col.Name),
-									Qualifier: sqlparser.TableName{Name: sqlparser.NewIdentifierCS(td.Name)},
-								})
-							} else {
-								colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(col.Name)})
+						// For IS/PS tables, prefer canonical column order (more complete)
+						lowerName := strings.ToLower(td.Name)
+						if order, ok := infoSchemaColumnOrder[lowerName]; ok && len(order) > len(td.Columns) {
+							for _, colName := range order {
+								cols = append(cols, colName)
+								colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(colName)})
+							}
+						} else {
+							for _, col := range td.Columns {
+								cols = append(cols, col.Name)
+								if len(tableDefs) > 1 {
+									colExprs = append(colExprs, &sqlparser.ColName{
+										Name:      sqlparser.NewIdentifierCI(col.Name),
+										Qualifier: sqlparser.TableName{Name: sqlparser.NewIdentifierCS(td.Name)},
+									})
+								} else {
+									colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(col.Name)})
+								}
 							}
 						}
 					}
@@ -11446,6 +11504,19 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 							seen[k] = true
 							cols = append(cols, k)
 							colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(k)})
+						}
+					}
+				}
+			} else {
+				// Empty result set: try to resolve column names from the query's FROM table
+				// by looking up known info schema / performance schema column orders.
+				tableName := e.extractStarTableName(se, exprs)
+				if tableName != "" {
+					lowerTable := strings.ToLower(tableName)
+					if order, ok := infoSchemaColumnOrder[lowerTable]; ok {
+						for _, colName := range order {
+							cols = append(cols, colName)
+							colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(colName)})
 						}
 					}
 				}
@@ -12089,7 +12160,24 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		switch lowerTable {
 		case "setup_instruments", "setup_consumers", "setup_threads", "threads",
 			"setup_actors", "setup_objects":
-			// Writable performance_schema tables: silently succeed
+			// Writable performance_schema tables: check that only allowed columns are updated
+			allowedCols := map[string]map[string]bool{
+				"setup_consumers":   {"enabled": true},
+				"setup_instruments": {"enabled": true, "timed": true},
+				"setup_actors":      {"enabled": true, "history": true},
+				"setup_objects":     {"enabled": true, "timed": true},
+				"setup_threads":     {"instrumented": true, "history": true},
+				"threads":           {"instrumented": true, "history": true},
+			}
+			if allowed, ok := allowedCols[lowerTable]; ok {
+				for _, expr := range stmt.Exprs {
+					colName := strings.ToLower(expr.Name.Name.String())
+					if !allowed[colName] {
+						return nil, mysqlError(1683, "HY000", "Invalid performance_schema usage.")
+					}
+				}
+			}
+			// Silently succeed for valid updates
 			return &Result{AffectedRows: 0}, nil
 		default:
 			return nil, mysqlError(1142, "42000", fmt.Sprintf("UPDATE command denied to user 'root'@'localhost' for table '%s'", tableName))
@@ -21380,7 +21468,8 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		return result, err
 	}
 	// Try user-defined function from catalog
-	if result, err := e.callUserDefinedFunction(name, v.Exprs, nil); err == nil {
+	qualifier := v.Qualifier.String()
+	if result, err := e.callUserDefinedFunction(name, v.Exprs, nil, qualifier); err == nil {
 		return result, nil
 	} else if !strings.Contains(strings.ToLower(err.Error()), "function not found") {
 		return nil, err
@@ -23515,7 +23604,8 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 			}
 			return string(data), nil
 		}
-		if result, err := e.callUserDefinedFunction(name, v.Exprs, &row); err == nil {
+		qualifier := v.Qualifier.String()
+		if result, err := e.callUserDefinedFunction(name, v.Exprs, &row, qualifier); err == nil {
 			return result, nil
 		}
 		// Fallback: delegate to evalFuncExpr (no row context for args)
@@ -25244,6 +25334,15 @@ func (e *Executor) execCreateTrigger(query string) (*Result, error) {
 	}
 	tableName := parts[onIdx+1]
 	tableName = strings.Trim(tableName, "`")
+
+	// Check if table references performance_schema — deny CREATE TRIGGER on PS tables
+	if strings.Contains(tableName, ".") {
+		dbTbl := strings.SplitN(tableName, ".", 2)
+		trigDB := strings.Trim(dbTbl[0], "`")
+		if strings.EqualFold(trigDB, "performance_schema") {
+			return nil, mysqlError(1044, "42000", fmt.Sprintf("Access denied for user 'root'@'localhost' to database 'performance_schema'"))
+		}
+	}
 
 	// Extract body: everything after "FOR EACH ROW"
 	_ = upper // already have it
@@ -27194,6 +27293,16 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 	funcName := strings.TrimSpace(rest[:parenIdx])
 	funcName = strings.Trim(funcName, "`")
 
+	// Handle schema-qualified function names (e.g. test.f or `test`.`f`)
+	if dotIdx := strings.Index(funcName, "."); dotIdx >= 0 {
+		schemaName := strings.Trim(funcName[:dotIdx], "`")
+		funcName = strings.Trim(funcName[dotIdx+1:], "`")
+		db, err = e.Catalog.GetDatabase(schemaName)
+		if err != nil {
+			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", schemaName))
+		}
+	}
+
 	// Extract params between first '(' and matching ')'
 	paramStart := parenIdx + 1
 	depth := 1
@@ -27286,6 +27395,19 @@ func (e *Executor) execDropFunction(query string) (*Result, error) {
 	name := strings.TrimRight(strings.TrimSpace(rest), ";")
 	name = strings.Trim(name, "`")
 
+	// Handle schema-qualified function names (e.g. test.f or `test`.`f`)
+	if dotIdx := strings.Index(name, "."); dotIdx >= 0 {
+		schemaName := strings.Trim(name[:dotIdx], "`")
+		name = strings.Trim(name[dotIdx+1:], "`")
+		db, err = e.Catalog.GetDatabase(schemaName)
+		if err != nil {
+			if ifExists {
+				return &Result{}, nil
+			}
+			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", schemaName))
+		}
+	}
+
 	if db.GetFunction(name) == nil && !ifExists {
 		return nil, mysqlError(1305, "42000", fmt.Sprintf("FUNCTION %s.%s does not exist", e.CurrentDB, name))
 	}
@@ -27301,11 +27423,15 @@ type cursorState struct {
 }
 
 // callUserDefinedFunction looks up a user-defined function in the catalog and executes it.
-func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Expr, row *storage.Row) (interface{}, error) {
+// qualifier is the optional schema qualifier (e.g. "test" in "test.f()").
+func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Expr, row *storage.Row, qualifier ...string) (interface{}, error) {
 	if e.Catalog == nil {
 		return nil, fmt.Errorf("function not found: %s", name)
 	}
 	dbName := e.CurrentDB
+	if len(qualifier) > 0 && qualifier[0] != "" {
+		dbName = qualifier[0]
+	}
 	if dbName == "" {
 		dbName = "test"
 	}

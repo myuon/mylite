@@ -27,6 +27,12 @@ import (
 // errSkipTest is a sentinel error indicating the test should be skipped.
 var errSkipTest = errors.New("skip test")
 
+// regexReplace holds a compiled regex and its replacement string for --replace_regex.
+type regexReplace struct {
+	re   *regexp.Regexp
+	repl string
+}
+
 // TestResult represents the outcome of running a single .test file.
 type TestResult struct {
 	Name     string
@@ -301,6 +307,7 @@ type execContext struct {
 	tmpDir           string         // temporary directory for file operations
 	replaceColumns   map[int]string // column index (1-based) -> replacement value for next query
 	replaceResult    []string       // pairs of [from, to] for --replace_result
+	replaceRegex     []regexReplace // regex pairs for --replace_regex
 	verticalResult   bool           // format next query result as vertical key/value pairs
 	verticalResults  bool           // persistent vertical output mode (--vertical_results)
 	infoEnabled      bool           // --enable_info: show affected rows and info after DML
@@ -846,9 +853,12 @@ func (ctx *execContext) executeLines(lines []string) error {
 					if rl == "" {
 						continue // Skip blank lines in SQL echo (mysqltest doesn't output them)
 					}
-					// Apply --replace_result to echoed SQL too
+					// Apply --replace_result and --replace_regex to echoed SQL too
 					if len(ctx.replaceResult) > 0 {
 						rl = applyReplaceResult(rl, ctx.replaceResult)
+					}
+					if len(ctx.replaceRegex) > 0 {
+						rl = applyReplaceRegex(rl, ctx.replaceRegex)
 					}
 					ctx.output.WriteString(rl + "\n")
 				}
@@ -940,6 +950,11 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		// Parse pairs: --replace_result from1 to1 from2 to2 ...
 		// Substitute variables first (e.g. $ENGINE -> InnoDB)
 		ctx.replaceResult = parseReplacePairs(ctx.substituteVars(args))
+		return true, false, nil
+
+	case "replace_regex":
+		// Parse /pattern/replacement/ pairs from args
+		ctx.replaceRegex = parseReplaceRegex(ctx.substituteVars(args))
 		return true, false, nil
 
 	case "let":
@@ -1155,7 +1170,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"disable_session_track_info", "enable_session_track_info",
 		"disable_connect_log", "enable_connect_log",
 		"send", "reap", "sleep", "send_shutdown",
-		"replace_regex", "replace_numeric_round",
+		"replace_numeric_round",
 		"write_file", "append_file", "cat_file",
 		"mkdir", "rmdir", "move_file",
 		"list_files", "file_exists",
@@ -1676,6 +1691,9 @@ func (ctx *execContext) executeSQL(stmt string) error {
 		if len(ctx.replaceResult) > 0 {
 			echoLine = applyReplaceResult(echoLine, ctx.replaceResult)
 		}
+		if len(ctx.replaceRegex) > 0 {
+			echoLine = applyReplaceRegex(echoLine, ctx.replaceRegex)
+		}
 		ctx.output.WriteString(echoLine + "\n")
 	}
 
@@ -1872,6 +1890,13 @@ func (ctx *execContext) executeQuery(stmt string) error {
 		}
 		ctx.replaceResult = nil
 	}
+	// Apply --replace_regex to output
+	if len(ctx.replaceRegex) > 0 {
+		for i, line := range resultLines {
+			resultLines[i] = applyReplaceRegex(line, ctx.replaceRegex)
+		}
+		ctx.replaceRegex = nil
+	}
 
 	if !useVertical {
 		// Write column headers for regular (horizontal) results.
@@ -1972,6 +1997,13 @@ func (ctx *execContext) executeQueryOrExec(stmt string) error {
 			resultLines[i] = applyReplaceResult(line, ctx.replaceResult)
 		}
 		ctx.replaceResult = nil
+	}
+	// Apply --replace_regex to output
+	if len(ctx.replaceRegex) > 0 {
+		for i, line := range resultLines {
+			resultLines[i] = applyReplaceRegex(line, ctx.replaceRegex)
+		}
+		ctx.replaceRegex = nil
 	}
 
 	for _, line := range resultLines {
@@ -2911,6 +2943,91 @@ func applyReplaceResult(line string, pairs []string) string {
 		if from != "" {
 			line = strings.ReplaceAll(line, from, to)
 		}
+	}
+	return line
+}
+
+// parseReplaceRegex parses --replace_regex arguments in the form /pattern/replacement/[flags] ...
+// Multiple pairs can be specified separated by spaces.
+func parseReplaceRegex(args string) []regexReplace {
+	var result []regexReplace
+	i := 0
+	for i < len(args) {
+		// Skip whitespace
+		for i < len(args) && (args[i] == ' ' || args[i] == '\t') {
+			i++
+		}
+		if i >= len(args) {
+			break
+		}
+		delim := args[i]
+		if delim != '/' {
+			// Try to skip to the next / delimiter
+			for i < len(args) && args[i] != '/' {
+				i++
+			}
+			continue
+		}
+		i++ // skip opening delimiter
+
+		// Read pattern
+		pattern := ""
+		for i < len(args) && args[i] != delim {
+			if args[i] == '\\' && i+1 < len(args) {
+				pattern += string(args[i : i+2])
+				i += 2
+			} else {
+				pattern += string(args[i])
+				i++
+			}
+		}
+		if i < len(args) {
+			i++ // skip delimiter
+		}
+
+		// Read replacement
+		replacement := ""
+		for i < len(args) && args[i] != delim {
+			if args[i] == '\\' && i+1 < len(args) {
+				replacement += string(args[i : i+2])
+				i += 2
+			} else {
+				replacement += string(args[i])
+				i++
+			}
+		}
+		if i < len(args) {
+			i++ // skip closing delimiter
+		}
+
+		// Read optional flags (i, g, etc.)
+		flags := ""
+		for i < len(args) && args[i] != ' ' && args[i] != '\t' && args[i] != '/' {
+			flags += string(args[i])
+			i++
+		}
+
+		// Build Go regex pattern with flags
+		goPattern := pattern
+		if strings.Contains(flags, "i") {
+			goPattern = "(?i)" + goPattern
+		}
+
+		re, err := regexp.Compile(goPattern)
+		if err != nil {
+			// Skip invalid patterns silently
+			continue
+		}
+
+		result = append(result, regexReplace{re: re, repl: replacement})
+	}
+	return result
+}
+
+// applyReplaceRegex applies --replace_regex substitutions to a line.
+func applyReplaceRegex(line string, pairs []regexReplace) string {
+	for _, rr := range pairs {
+		line = rr.re.ReplaceAllString(line, rr.repl)
 	}
 	return line
 }
