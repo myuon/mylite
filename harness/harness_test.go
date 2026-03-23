@@ -227,15 +227,15 @@ func TestTransactions(t *testing.T) {
 	})
 
 	h.Run(TestCase{
-		Name: "ROLLBACK after CREATE TABLE removes table",
+		Name: "DDL causes implicit COMMIT - table persists after ROLLBACK",
 		Setup: []string{
 			"BEGIN",
 			"CREATE TABLE test_tx_ddl (id INT PRIMARY KEY)",
 			"ROLLBACK",
 		},
-		// After rollback the table should not exist; querying it should error.
-		Query:       "SELECT * FROM test_tx_ddl",
-		ExpectError: true,
+		// In MySQL, DDL (CREATE TABLE) causes an implicit COMMIT, so ROLLBACK
+		// has nothing to undo. The table persists.
+		Query: "SELECT * FROM test_tx_ddl",
 		Teardown: []string{
 			"DROP TABLE IF EXISTS test_tx_ddl",
 		},

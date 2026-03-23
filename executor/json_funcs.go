@@ -550,7 +550,12 @@ func (e *Executor) evalJSONObject(v *sqlparser.JSONObjectExpr) (interface{}, err
 		if err != nil {
 			return nil, err
 		}
-		obj[toString(keyVal)] = toJSONValue(valVal)
+		// Preserve boolean type for TRUE/FALSE literals
+		if bv, ok := p.Value.(sqlparser.BoolVal); ok {
+			obj[toString(keyVal)] = toJSONValue(bool(bv))
+		} else {
+			obj[toString(keyVal)] = toJSONValue(valVal)
+		}
 	}
 	return jsonMarshalMySQL(obj), nil
 }
@@ -563,7 +568,12 @@ func (e *Executor) evalJSONArray(v *sqlparser.JSONArrayExpr) (interface{}, error
 		if err != nil {
 			return nil, err
 		}
-		arr = append(arr, toJSONValue(val))
+		// Preserve boolean type for TRUE/FALSE literals
+		if bv, ok := p.(sqlparser.BoolVal); ok {
+			arr = append(arr, toJSONValue(bool(bv)))
+		} else {
+			arr = append(arr, toJSONValue(val))
+		}
 	}
 	return jsonMarshalMySQL(arr), nil
 }
@@ -1119,7 +1129,13 @@ func (e *Executor) evalJSONValueModifier(v *sqlparser.JSONValueModifierExpr) (in
 		}
 
 		path := toString(pathVal)
-		newVal := toJSONValue(valVal)
+		// Preserve boolean type for TRUE/FALSE literals
+		var newVal interface{}
+		if bv, ok := p.Value.(sqlparser.BoolVal); ok {
+			newVal = toJSONValue(bool(bv))
+		} else {
+			newVal = toJSONValue(valVal)
+		}
 
 		switch v.Type {
 		case sqlparser.JSONSetType:

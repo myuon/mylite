@@ -1041,7 +1041,11 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		}
 		key := strings.ToLower(target)
 		if conn := ctx.connByName[key]; conn != nil {
-			conn.Close() //nolint:errcheck
+			// Clean up transaction state before returning the connection to the pool.
+			// Without this, a pooled connection may retain inTransaction/row-lock state
+			// that leaks into the next user of the same underlying connection.
+			conn.ExecContext(context.Background(), "ROLLBACK") //nolint:errcheck
+			conn.Close()                                       //nolint:errcheck
 			delete(ctx.connByName, key)
 		}
 		if ctx.currentConn == key {
@@ -2594,17 +2598,17 @@ func (ctx *execContext) substituteVars(s string) string {
 func applyMasterOpt(content string, ctx *execContext) {
 	for _, token := range strings.Fields(content) {
 		token = strings.TrimPrefix(token, "--")
-		// Handle boolean flags without = (e.g., --loose-enable-performance-schema)
+		// Handle boolean flags without = (e.g., --loose-enable-performance-schema, --innodb_rollback_on_timeout)
 		if !strings.Contains(token, "=") {
 			key := token
 			key = strings.TrimPrefix(key, "loose-")
 			if strings.HasPrefix(key, "enable-") {
 				key = strings.TrimPrefix(key, "enable-")
-				varKey := strings.ReplaceAll(key, "-", "_")
-				ctx.variables["$"+key] = "1"
-				ctx.variables["$"+varKey] = "1"
-				ctx.getActiveConn().ExecContext(context.Background(), fmt.Sprintf("SET STARTUP %s = 1", varKey)) //nolint:errcheck
 			}
+			varKey := strings.ReplaceAll(key, "-", "_")
+			ctx.variables["$"+key] = "1"
+			ctx.variables["$"+varKey] = "1"
+			ctx.getActiveConn().ExecContext(context.Background(), fmt.Sprintf("SET STARTUP %s = 1", varKey)) //nolint:errcheck
 			continue
 		}
 		if strings.Contains(token, "=") {

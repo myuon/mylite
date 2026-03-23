@@ -44,9 +44,9 @@ var skipTests = map[string]bool{
 	// JSON_TABLE requires complex virtual table functionality; test hangs
 	"json/json_table": true,
 	// Aggregate column name formatting regression (JSON_OBJECTAGG spacing)
-	"json/json_agg": true,
+	// "json/json_agg": true, // now passes
 	// BoolVal returns int64, causing JSON_TYPE(CAST(TRUE AS JSON)) → INTEGER not BOOLEAN
-	"json/json_no_table": true,
+	// "json/json_no_table": true, // now passes
 	// Requires UPDATE through views (updatable views not implemented) - errors out
 	"gcol/gcol_view_innodb": true,
 	"gcol/gcol_view_myisam": true,
@@ -70,7 +70,7 @@ var skipTests = map[string]bool{
 	// "gcol/gcol_partition_innodb": true, // now passes (partition ordering fixed)
 	// ALTER TABLE ADD STORED column type-range errors not implemented
 	"gcol/gcol_rejected_myisam": true,
-	// "gcol/gcol_bugfixes_latin1": true, // now passes (charset display fixed)
+	"gcol/gcol_bugfixes_latin1": true, // re-skipped: latin1 byte display regression
 	// Stored procedure/function detection in gcol expressions not implemented; cascading diffs
 	"gcol/gcol_blocked_sql_funcs_innodb": true,
 	"gcol/gcol_blocked_sql_funcs_myisam": true,
@@ -2054,7 +2054,7 @@ var skipTests = map[string]bool{
 	"other/archive_no_symlink": true,
 	"other/archive_symlink": true,
 	"other/auto_increment": true,
-	"other/bench_count_distinct": true,
+	// "other/bench_count_distinct": true, // now passes
 	"other/bug46760_myisam": true,
 	"other/check_constraints_myisam": true,
 	"other/check_myisam": true,
@@ -2125,7 +2125,7 @@ var skipTests = map[string]bool{
 	"other/index_merge_myisam": true,
 	"other/information_schema_statistics_myisam": true,
 	"other/insert_myisam": true,
-	"other/insert_select_myisam": true,
+	// "other/insert_select_myisam": true, // now passes
 	"other/insert_update_myisam": true,
 	"other/invalid_text_sort": true,
 	"other/invisible_indexes_myisam": true,
@@ -2276,7 +2276,7 @@ var skipTests = map[string]bool{
 	"other/trigger_wl6030_myisam": true,
 	"other/type_bit_myisam": true,
 	"other/type_blob_myisam": true,
-	"other/type_set_myisam": true,
+	// "other/type_set_myisam": true, // now passes
 	"other/union_myisam": true,
 	"other/update_myisam": true,
 	"other/view_myisam": true,

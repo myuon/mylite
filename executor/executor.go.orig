@@ -2070,7 +2070,7 @@ func uppercaseSQLKeywords(s string) string {
 		"select", "from", "where", "and", "or", "not", "in", "exists",
 		"any", "some", "all", "as", "on", "join", "left", "right", "inner",
 		"outer", "cross", "group", "by", "order", "having", "limit", "offset",
-		"union", "except", "intersect", "between", "like", "is",
+		"union", "except", "intersect", "distinct", "between", "like", "is",
 		"null", "true", "false", "case", "when", "then", "else", "end",
 		"asc", "desc", "count", "sum", "avg", "min", "max", "upper", "lower",
 		"row", "with", "cast", "convert", "json_extract", "json_valid", "json_type",
@@ -7380,11 +7380,6 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 					if len(defStr) >= 2 && defStr[0] == '\'' && defStr[len(defStr)-1] == '\'' {
 						defStr = defStr[1 : len(defStr)-1]
 					}
-					// MySQL strips trailing spaces from SET/ENUM default values
-					colTypeLower := strings.ToLower(col.Type.Type)
-					if colTypeLower == "set" || colTypeLower == "enum" {
-						defStr = strings.TrimRight(defStr, " ")
-					}
 					colDef.Default = &defStr
 				}
 			}
@@ -11934,21 +11929,6 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		if len(e.Args) == 0 {
 			return int64(len(groupRows)), nil
 		}
-		if e.Distinct {
-			// COUNT(DISTINCT expr) - count unique non-NULL values
-			seen := make(map[string]bool)
-			for _, row := range groupRows {
-				val, err := evalRowExpr(e.Args[0], row)
-				if err != nil {
-					return nil, err
-				}
-				if val != nil {
-					key := fmt.Sprintf("%v", val)
-					seen[key] = true
-				}
-			}
-			return int64(len(seen)), nil
-		}
 		count := int64(0)
 		for _, row := range groupRows {
 			val, err := evalRowExpr(e.Args[0], row)
@@ -11961,35 +11941,13 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		}
 		return count, nil
 	case *sqlparser.Sum:
-		// For SUM(DISTINCT expr), filter to unique values first
-		rows := groupRows
-		if e.Distinct {
-			seen := make(map[string]bool)
-			var filtered []storage.Row
-			for _, row := range groupRows {
-				val, err := evalRowExpr(e.Arg, row)
-				if err != nil {
-					return nil, err
-				}
-				if val != nil {
-					key := fmt.Sprintf("%v", val)
-					if !seen[key] {
-						seen[key] = true
-						filtered = append(filtered, row)
-					}
-				} else {
-					filtered = append(filtered, row)
-				}
-			}
-			rows = filtered
-		}
 		sum := float64(0)
 		sumRat := new(big.Rat)
 		hasRat := false
 		hasVal := false
 		maxScale := 0 // track max decimal places for formatting
 		allDecimal := true
-		for _, row := range rows {
+		for _, row := range groupRows {
 			val, err := evalRowExpr(e.Arg, row)
 			if err != nil {
 				return nil, err
@@ -12105,32 +12063,10 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		}
 		return minVal, nil
 	case *sqlparser.Avg:
-		// For AVG(DISTINCT expr), filter to unique values first
-		avgRows := groupRows
-		if e.Distinct {
-			seen := make(map[string]bool)
-			var filtered []storage.Row
-			for _, row := range groupRows {
-				val, err := evalRowExpr(e.Arg, row)
-				if err != nil {
-					return nil, err
-				}
-				if val != nil {
-					key := fmt.Sprintf("%v", val)
-					if !seen[key] {
-						seen[key] = true
-						filtered = append(filtered, row)
-					}
-				} else {
-					filtered = append(filtered, row)
-				}
-			}
-			avgRows = filtered
-		}
 		sum := float64(0)
 		count := int64(0)
 		maxScale := 0
-		for _, row := range avgRows {
+		for _, row := range groupRows {
 			val, err := evalRowExpr(e.Arg, row)
 			if err != nil {
 				return nil, err
@@ -12586,11 +12522,6 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 						raw = memberRe.ReplaceAllStringFunc(raw, func(m string) string {
 							return "member of ("
 						})
-					}
-					// Uppercase SQL keyword literals (null, true, false) to match MySQL
-					switch strings.ToLower(raw) {
-					case "null", "true", "false":
-						raw = strings.ToUpper(raw)
 					}
 					name = raw
 				}
@@ -17933,15 +17864,10 @@ func buildColumnTypeString(ct *sqlparser.ColumnType) string {
 	}
 	if len(ct.EnumValues) > 0 {
 		vals := make([]string, len(ct.EnumValues))
-		isSet := strings.EqualFold(ct.Type, "set")
 		for i, v := range ct.EnumValues {
 			// Vitess parser stores enum values with surrounding quotes;
 			// strip them before re-quoting to avoid double-quoting.
 			v = strings.Trim(v, "'")
-			// MySQL strips trailing spaces from SET/ENUM values
-			if isSet || strings.EqualFold(ct.Type, "enum") {
-				v = strings.TrimRight(v, " ")
-			}
 			vals[i] = fmt.Sprintf("'%s'", v)
 		}
 		s += "(" + strings.Join(vals, ",") + ")"
