@@ -2438,6 +2438,40 @@ var skipTests = map[string]bool{
 	"binlog/binlog_truncate_myisam":                                    true,
 	"binlog/binlog_user_if_exists":                                     true,
 	"binlog/print_identified_with_as_hex":                              true,
+
+	// === collations suite === (requires UCA 0900 weight tables)
+	"collations/chinese":         true,
+	"collations/classic_latin":   true,
+	"collations/codepoint_order": true,
+	"collations/croatian":        true,
+	"collations/czech":           true,
+	"collations/danish":          true,
+	"collations/esperanto":       true,
+	"collations/estonian":        true,
+	"collations/german":          true,
+	"collations/hungarian":       true,
+	"collations/icelandic":       true,
+	"collations/japanese":        true,
+	"collations/latvian":         true,
+	"collations/lithuanian":      true,
+	"collations/polish":          true,
+	"collations/romanian":        true,
+	"collations/root":            true,
+	"collations/russian":         true,
+	"collations/slovak":          true,
+	"collations/slovenian":       true,
+	"collations/spanish":         true,
+	"collations/swedish":         true,
+	"collations/turkish":         true,
+	"collations/vietnamese":      true,
+
+	// === query_rewrite_plugins suite === (requires rewriter plugin)
+	"query_rewrite_plugins/basic":              true,
+	"query_rewrite_plugins/logging_general":    true,
+	"query_rewrite_plugins/logging_general_raw": true,
+	"query_rewrite_plugins/rpl_ddl_rewriter":   true,
+	"query_rewrite_plugins/schema":             true,
+	"query_rewrite_plugins/warnings":           true,
 }
 
 func main() {
@@ -2528,8 +2562,9 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		"max_parts":        true,
 		"opt_trace":        true,
 		"auth_sec":         true,
-		"binlog":           true,
-		// collations: skipped — requires MySQL UCA 0900 weight tables (DUCET + tailoring)
+		"binlog":                 true,
+		"collations":             true,
+		"query_rewrite_plugins": true,
 	}
 
 	var suiteNames []string
