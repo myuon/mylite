@@ -395,7 +395,7 @@ func normalizeRows(rows [][]interface{}) [][]interface{} {
 	if len(rows) == 0 {
 		return rows
 	}
-	// Convert bool values to int64 (go-mysql doesn't handle bool)
+	// Convert bool values to int64 and divisionResult to formatted string
 	for i, row := range rows {
 		for j, val := range row {
 			if b, ok := val.(bool); ok {
@@ -404,6 +404,8 @@ func normalizeRows(rows [][]interface{}) [][]interface{} {
 				} else {
 					rows[i][j] = int64(0)
 				}
+			} else if d, ok := val.(executor.DivisionResult); ok {
+				rows[i][j] = fmt.Sprintf("%.4f", float64(d))
 			}
 		}
 	}

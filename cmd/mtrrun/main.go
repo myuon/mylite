@@ -536,7 +536,7 @@ var skipTests = map[string]bool{
 	// 32K page size specific behavior
 	"innodb/innodb_32k": true,
 	// Auto-increment lock mode zero
-	"innodb/innodb_autoinc_lock_mode_zero": true,
+	// "innodb/innodb_autoinc_lock_mode_zero": true,
 	// Buffer pool dump percentage
 	"innodb/innodb_buffer_pool_dump_pct": true,
 	// InnoDB bug fix tests
@@ -1570,7 +1570,7 @@ var skipTests = map[string]bool{
 	"other/func_if":                                true,
 	"other/func_isnull":                            true,
 	"other/func_like":                              true,
-	"other/func_op":                                true,
+	// "other/func_op":                                true,
 	"other/func_prefix_key":                        true,
 	"other/func_regexp":                            true,
 	"other/func_rollback":                          true,
