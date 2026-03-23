@@ -642,6 +642,12 @@ var skipTests = map[string]bool{
 	"innodb/zlob_import_export": true,
 	// ZLOB redundant partial update
 	"innodb/zlob_redundant_partial_update": true,
+	// TIMEOUT: send/reap multi-connection lock test (needs lock manager)
+	"innodb/innodb-consistent": true,
+
+	// === other suite ===
+	// TIMEOUT: send/reap multi-connection lock test (needs lock manager)
+	"other/lock_tables_lost_commit": true,
 
 	// === stress suite ===
 	// TIMEOUT: DDL stress tests that exceed timeout

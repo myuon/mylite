@@ -296,6 +296,30 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	return e
 }
 
+// Clone creates a new Executor that shares the same Catalog, Storage,
+// globalScopeVars, and startupVars but has its own fresh per-session state.
+// This is used to give each connection its own executor instance.
+func (e *Executor) Clone() *Executor {
+	defaultTZ := time.FixedZone("GMT-3", 3*60*60)
+	return &Executor{
+		Catalog:          e.Catalog,
+		Storage:          e.Storage,
+		CurrentDB:        "test",
+		sqlMode:          "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+		snapshots:        make(map[string]*fullSnapshot),
+		userVars:         make(map[string]interface{}),
+		preparedStmts:    make(map[string]string),
+		tempTables:       make(map[string]bool),
+		globalScopeVars:  e.globalScopeVars,
+		sessionScopeVars: make(map[string]string),
+		startupVars:      e.startupVars,
+		timeZone:         defaultTZ,
+		DataDir:          e.DataDir,
+		SearchPaths:      e.SearchPaths,
+		psTruncated:      e.psTruncated,
+	}
+}
+
 // SetStartupVar sets a variable as a startup default. This is used by the test
 // runner to apply master.opt settings before running tests.
 func (e *Executor) SetStartupVar(name, value string) {

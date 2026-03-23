@@ -68,44 +68,6 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	// Find result file
 	resultPath := findResultFile(testPath)
 
-	// Reset state: ensure we're in the test database and clean up leftover tables
-	r.DB.Exec("USE test") //nolint:errcheck
-	// Reset session state (lastInsertID, user vars, sql_mode, etc.)
-	r.DB.Exec("MYLITE RESET_SESSION") //nolint:errcheck
-	// Drop all tables from previous test (including temporary tables via MYLITE)
-	r.DB.Exec("MYLITE RESET_TEMP_TABLES") //nolint:errcheck
-	if rows, err2 := r.DB.Query("SHOW TABLES"); err2 == nil {
-		var tables []string
-		for rows.Next() {
-			var t string
-			rows.Scan(&t) //nolint:errcheck
-			tables = append(tables, t)
-		}
-		rows.Close()
-		for _, t := range tables {
-			r.DB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", t)) //nolint:errcheck
-		}
-	}
-	// Drop user-created databases from previous test (keep system databases)
-	systemDBs := map[string]bool{
-		"information_schema": true, "mysql": true, "performance_schema": true,
-		"sys": true, "test": true, "mtr": true,
-	}
-	if rows, err2 := r.DB.Query("SHOW DATABASES"); err2 == nil {
-		var databases []string
-		for rows.Next() {
-			var d string
-			rows.Scan(&d) //nolint:errcheck
-			if !systemDBs[d] {
-				databases = append(databases, d)
-			}
-		}
-		rows.Close()
-		for _, d := range databases {
-			r.DB.Exec(fmt.Sprintf("DROP DATABASE `%s`", d)) //nolint:errcheck
-		}
-	}
-
 	// Execute with timeout
 	timeout := 600 * time.Second
 	doneCh := make(chan error, 1)
@@ -117,9 +79,52 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	// Ensure tmp subdir exists
 	os.MkdirAll(filepath.Join(tmpDir, "tmp"), 0755) //nolint:errcheck
 
+	defaultConn, err := r.DB.Conn(context.Background())
+	if err != nil {
+		return TestResult{Name: name, Error: fmt.Sprintf("default conn: %v", err)}
+	}
+	defer defaultConn.Close()
+
+	// Reset state using the dedicated default connection
+	defaultConn.ExecContext(context.Background(), "USE test") //nolint:errcheck
+	defaultConn.ExecContext(context.Background(), "MYLITE RESET_SESSION") //nolint:errcheck
+	defaultConn.ExecContext(context.Background(), "MYLITE RESET_TEMP_TABLES") //nolint:errcheck
+	if rows, err2 := defaultConn.QueryContext(context.Background(), "SHOW TABLES"); err2 == nil {
+		var tables []string
+		for rows.Next() {
+			var t string
+			rows.Scan(&t) //nolint:errcheck
+			tables = append(tables, t)
+		}
+		rows.Close()
+		for _, t := range tables {
+			defaultConn.ExecContext(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS `%s`", t)) //nolint:errcheck
+		}
+	}
+	// Drop user-created databases from previous test (keep system databases)
+	systemDBs := map[string]bool{
+		"information_schema": true, "mysql": true, "performance_schema": true,
+		"sys": true, "test": true, "mtr": true,
+	}
+	if rows, err2 := defaultConn.QueryContext(context.Background(), "SHOW DATABASES"); err2 == nil {
+		var databases []string
+		for rows.Next() {
+			var d string
+			rows.Scan(&d) //nolint:errcheck
+			if !systemDBs[d] {
+				databases = append(databases, d)
+			}
+		}
+		rows.Close()
+		for _, d := range databases {
+			defaultConn.ExecContext(context.Background(), fmt.Sprintf("DROP DATABASE `%s`", d)) //nolint:errcheck
+		}
+	}
+
 	ectx := &execContext{
 		runner:           r,
 		db:               r.DB,
+		defaultConn:      defaultConn,
 		connByName:       map[string]*sql.Conn{},
 		output:           &strings.Builder{},
 		warningsEnabled:  true,
@@ -296,6 +301,7 @@ func (r *Runner) RunSuite(suiteDir string) []TestResult {
 type execContext struct {
 	runner           *Runner
 	db               *sql.DB
+	defaultConn      *sql.Conn            // dedicated default connection (not pooled)
 	connByName       map[string]*sql.Conn // mysqltest named connections
 	currentConn      string               // empty means default connection
 	output           *strings.Builder
@@ -318,11 +324,23 @@ type execContext struct {
 	sourceDepth      int            // current --source recursion depth
 	ttsBackups       map[string]tableSnapshot
 	errorConn        *sql.Conn // cached connection for --error expected error handling
+	pendingSendByConn map[string]*pendingSend // keyed by connection name ("" for default)
 }
 
 type tableSnapshot struct {
 	columns []string
 	rows    [][]interface{}
+}
+
+// sendResult holds the result of an asynchronously sent query.
+type sendResult struct {
+	output string
+	err    error
+}
+
+// pendingSend tracks a query that was dispatched via the "send" directive.
+type pendingSend struct {
+	resultCh chan sendResult
 }
 
 func (ctx *execContext) executeLines(lines []string) error {
@@ -1162,6 +1180,90 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		}
 		return true, false, nil
 
+	case "send", "send_eval":
+		// send <query> — dispatch query asynchronously on the current connection
+		query := strings.TrimSpace(args)
+		query = strings.TrimSuffix(query, ";")
+		query = strings.TrimSpace(query)
+		if query == "" {
+			return true, false, fmt.Errorf("send directive has no query")
+		}
+		// Variable substitution for send_eval
+		if name == "send_eval" {
+			query = ctx.substituteVars(query)
+		}
+		connKey := ctx.currentConn
+		if ctx.pendingSendByConn == nil {
+			ctx.pendingSendByConn = map[string]*pendingSend{}
+		}
+		ch := make(chan sendResult, 1)
+		ctx.pendingSendByConn[connKey] = &pendingSend{resultCh: ch}
+		// Capture query-formatting state at send time
+		sendQueryLogEnabled := ctx.queryLogEnabled
+		sendResultLogEnabled := ctx.resultLogEnabled
+		sendExpectedError := ctx.expectedError
+		ctx.expectedError = "" // consumed by send
+		sendVerticalResult := ctx.verticalResult
+		ctx.verticalResult = false // consumed by send
+		sendVerticalResults := ctx.verticalResults
+		sendSortResult := ctx.sortResult
+		ctx.sortResult = false // consumed by send
+		sendReplaceColumns := ctx.replaceColumns
+		ctx.replaceColumns = nil // consumed by send
+		sendReplaceResult := ctx.replaceResult
+		ctx.replaceResult = nil // consumed by send
+		sendReplaceRegex := ctx.replaceRegex
+		ctx.replaceRegex = nil // consumed by send
+		sendInfoEnabled := ctx.infoEnabled
+
+		go func() {
+			// Create a temporary execContext for the goroutine to format output
+			tmpCtx := &execContext{
+				runner:           ctx.runner,
+				db:               ctx.db,
+				connByName:       ctx.connByName,
+				currentConn:      connKey,
+				output:           &strings.Builder{},
+				warningsEnabled:  ctx.warningsEnabled,
+				queryLogEnabled:  sendQueryLogEnabled,
+				resultLogEnabled: sendResultLogEnabled,
+				sortResult:       sendSortResult,
+				tmpDir:           ctx.tmpDir,
+				variables:        ctx.variables,
+				verticalResult:   sendVerticalResult,
+				verticalResults:  sendVerticalResults,
+				replaceColumns:   sendReplaceColumns,
+				replaceResult:    sendReplaceResult,
+				replaceRegex:     sendReplaceRegex,
+				infoEnabled:      sendInfoEnabled,
+				expectedError:    sendExpectedError,
+			}
+			err := tmpCtx.executeSQLInner(query)
+			ch <- sendResult{output: tmpCtx.output.String(), err: err}
+		}()
+		return true, false, nil
+
+	case "reap":
+		// reap — wait for the previously sent query to complete
+		connKey := ctx.currentConn
+		if ctx.pendingSendByConn == nil {
+			ctx.pendingSendByConn = map[string]*pendingSend{}
+		}
+		pending, ok := ctx.pendingSendByConn[connKey]
+		if !ok || pending == nil {
+			// No pending send, just ignore (some tests may have conditional sends)
+			return true, false, nil
+		}
+		result := <-pending.resultCh
+		delete(ctx.pendingSendByConn, connKey)
+		if result.output != "" {
+			ctx.output.WriteString(result.output)
+		}
+		if result.err != nil {
+			return true, false, result.err
+		}
+		return true, false, nil
+
 	// Directives we accept but ignore
 	case "character_set", "charset":
 		return true, false, nil
@@ -1171,7 +1273,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"disable_view_protocol", "enable_view_protocol",
 		"disable_session_track_info", "enable_session_track_info",
 		"disable_connect_log", "enable_connect_log",
-		"send", "reap", "sleep", "send_shutdown",
+		"sleep", "send_shutdown",
 		"replace_numeric_round",
 		"write_file", "append_file", "cat_file",
 		"mkdir", "rmdir", "move_file",
@@ -1376,7 +1478,7 @@ func (ctx *execContext) handlePerlBlock(lines []string, i int) int {
 
 func (ctx *execContext) captureTableSnapshot(dbName, tableName string) {
 	query := fmt.Sprintf("SELECT * FROM `%s`.`%s`", dbName, tableName)
-	rows, err := ctx.db.Query(query)
+	rows, err := ctx.getActiveConn().QueryContext(context.Background(), query)
 	if err != nil {
 		return
 	}
@@ -1415,7 +1517,7 @@ func (ctx *execContext) restoreTableSnapshot(dbName, tableName string) {
 	if !ok {
 		return
 	}
-	if _, err := ctx.db.Exec(fmt.Sprintf("DELETE FROM `%s`.`%s`", dbName, tableName)); err != nil {
+	if _, err := ctx.getActiveConn().ExecContext(context.Background(), fmt.Sprintf("DELETE FROM `%s`.`%s`", dbName, tableName)); err != nil {
 		return
 	}
 	if len(snap.columns) == 0 || len(snap.rows) == 0 {
@@ -1435,7 +1537,7 @@ func (ctx *execContext) restoreTableSnapshot(dbName, tableName string) {
 		strings.Join(qs, ","),
 	)
 	for _, r := range snap.rows {
-		if _, err := ctx.db.Exec(insertSQL, r...); err != nil {
+		if _, err := ctx.getActiveConn().ExecContext(context.Background(), insertSQL, r...); err != nil {
 			return
 		}
 	}
@@ -1563,7 +1665,7 @@ func (ctx *execContext) evaluateIfConditionInner(condStr string) bool {
 		query := condStr[1 : len(condStr)-1]
 		query = ctx.substituteVars(query)
 		// Execute query and check result
-		rows, err := ctx.db.Query(query)
+		rows, err := ctx.getActiveConn().QueryContext(context.Background(), query)
 		if err != nil {
 			return false
 		}
@@ -2178,7 +2280,7 @@ func (ctx *execContext) outputWarningsOnConn(conn *sql.Conn, expectedCode string
 
 func (ctx *execContext) getActiveConn() *sql.Conn {
 	if ctx.currentConn == "" {
-		return nil
+		return ctx.defaultConn
 	}
 	return ctx.connByName[strings.ToLower(ctx.currentConn)]
 }
@@ -2216,14 +2318,23 @@ func (ctx *execContext) setVariable(expr string) error {
 	if strings.HasPrefix(value, "`") && strings.HasSuffix(value, "`") {
 		sqlStmt := strings.TrimPrefix(strings.TrimSuffix(value, "`"), "`")
 		sqlStmt = ctx.substituteVars(strings.TrimSpace(sqlStmt))
-		row := ctx.db.QueryRow(sqlStmt)
-		var result string
-		if err := row.Scan(&result); err != nil {
-			// On error, keep existing value if set (e.g. $ENGINE default)
+		activeConn := ctx.getActiveConn()
+		rows, err := activeConn.QueryContext(context.Background(), sqlStmt)
+		if err != nil {
 			if _, exists := ctx.variables[name]; !exists {
 				ctx.variables[name] = ""
 			}
 			return nil
+		}
+		defer rows.Close()
+		var result string
+		if rows.Next() {
+			if err := rows.Scan(&result); err != nil {
+				if _, exists := ctx.variables[name]; !exists {
+					ctx.variables[name] = ""
+				}
+				return nil
+			}
 		}
 		ctx.variables[name] = result
 		return nil
@@ -2255,7 +2366,8 @@ func (ctx *execContext) setVariable(expr string) error {
 		if rowNum < 1 {
 			rowNum = 1
 		}
-		rows, err := ctx.db.Query(sqlStmt)
+		activeConn2 := ctx.getActiveConn()
+		rows, err := activeConn2.QueryContext(context.Background(), sqlStmt)
 		if err != nil {
 			ctx.variables[name] = ""
 			return nil
@@ -2415,7 +2527,7 @@ func applyMasterOpt(content string, ctx *execContext) {
 				varKey := strings.ReplaceAll(key, "-", "_")
 				ctx.variables["$"+key] = "1"
 				ctx.variables["$"+varKey] = "1"
-				ctx.db.Exec(fmt.Sprintf("SET STARTUP %s = 1", varKey)) //nolint:errcheck
+				ctx.getActiveConn().ExecContext(context.Background(), fmt.Sprintf("SET STARTUP %s = 1", varKey)) //nolint:errcheck
 			}
 			continue
 		}
@@ -2448,7 +2560,7 @@ func applyMasterOpt(content string, ctx *execContext) {
 			ctx.variables["$"+key] = val
 			ctx.variables["$"+varKey] = val
 			// Apply as startup variable (SET STARTUP is a special mylite command)
-			ctx.db.Exec(fmt.Sprintf("SET STARTUP %s = %s", varKey, val)) //nolint:errcheck
+			ctx.getActiveConn().ExecContext(context.Background(), fmt.Sprintf("SET STARTUP %s = %s", varKey, val)) //nolint:errcheck
 		}
 	}
 }
@@ -2664,7 +2776,7 @@ var directiveKeywords = map[string]bool{
 	"disable_query_log": true, "enable_query_log": true,
 	"disable_result_log": true, "enable_result_log": true,
 	"sorted_result": true, "connect": true, "disconnect": true,
-	"send": true, "reap": true, "sleep": true,
+	"send": true, "send_eval": true, "reap": true, "sleep": true,
 	"horizontal_results": true, "vertical_results": true,
 	"exit": true, "connection": true, "die": true,
 	"replace_column": true, "replace_result": true, "replace_regex": true,
