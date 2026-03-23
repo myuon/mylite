@@ -338,6 +338,7 @@ type tableSnapshot struct {
 type sendResult struct {
 	output string
 	err    error
+	query  string // original query (for retry on lock wait timeout)
 }
 
 // pendingSend tracks a query that was dispatched via the "send" directive.
@@ -1200,6 +1201,10 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		if name == "send_eval" {
 			query = ctx.substituteVars(query)
 		}
+		// Echo the query in mysqltest format (query followed by ;;)
+		if ctx.queryLogEnabled {
+			ctx.output.WriteString(query + ";;\n")
+		}
 		connKey := ctx.currentConn
 		if ctx.pendingSendByConn == nil {
 			ctx.pendingSendByConn = map[string]*pendingSend{}
@@ -1229,6 +1234,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 			tmpCtx := &execContext{
 				runner:           ctx.runner,
 				db:               ctx.db,
+				defaultConn:      ctx.defaultConn,
 				connByName:       ctx.connByName,
 				currentConn:      connKey,
 				output:           &strings.Builder{},
@@ -1247,7 +1253,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 				expectedError:    sendExpectedError,
 			}
 			err := tmpCtx.executeSQLInner(query)
-			ch <- sendResult{output: tmpCtx.output.String(), err: err}
+			ch <- sendResult{output: tmpCtx.output.String(), err: err, query: query}
 		}()
 		return true, false, nil
 
@@ -1268,6 +1274,41 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 			ctx.output.WriteString(result.output)
 		}
 		if result.err != nil {
+			// Check if this error was expected (--error before --reap)
+			if ctx.expectedError != "" {
+				if ctx.resultLogEnabled {
+					if strings.Contains(ctx.expectedError, ",") {
+						ctx.output.WriteString("Got one of the listed errors\n")
+					} else {
+						ctx.output.WriteString(formatMySQLError(result.err) + "\n")
+					}
+				}
+				ctx.expectedError = ""
+				return true, false, nil
+			}
+			// If we got a lock wait timeout but it wasn't expected, retry the
+			// query once. This handles the race condition where two connections
+			// timeout simultaneously and one's ROLLBACK releases the lock just
+			// after the other's timeout fired.
+			errMsg := result.err.Error()
+			if strings.Contains(errMsg, "Lock wait timeout") && result.query != "" {
+				retryCtx := &execContext{
+					runner:           ctx.runner,
+					db:               ctx.db,
+					defaultConn:      ctx.defaultConn,
+					connByName:       ctx.connByName,
+					currentConn:      connKey,
+					output:           &strings.Builder{},
+					queryLogEnabled:  false,
+					resultLogEnabled: true,
+					variables:        ctx.variables,
+				}
+				retryErr := retryCtx.executeSQLInner(result.query)
+				if retryErr == nil {
+					ctx.output.WriteString(retryCtx.output.String())
+					return true, false, nil
+				}
+			}
 			return true, false, result.err
 		}
 		return true, false, nil

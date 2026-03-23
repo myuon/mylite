@@ -70,6 +70,11 @@ func (h *Handler) HandleQuery(query string) (*mysql.Result, error) {
 	if err != nil {
 		errMsg := err.Error()
 		if strings.HasPrefix(errMsg, "ERROR ") {
+			// Parse "ERROR <code> (<state>): <message>" into a proper MyError
+			// so the go-mysql server sends the correct error code and state to the client.
+			if myErr := parseMySQLError(errMsg); myErr != nil {
+				return nil, myErr
+			}
 			return nil, fmt.Errorf("%s", errMsg)
 		}
 		return nil, fmt.Errorf("ERROR 1064 (42000): %v", err)
@@ -148,6 +153,9 @@ func (h *Handler) HandleStmtExecute(context interface{}, query string, args []in
 	if err != nil {
 		errMsg := err.Error()
 		if strings.HasPrefix(errMsg, "ERROR ") {
+			if myErr := parseMySQLError(errMsg); myErr != nil {
+				return nil, myErr
+			}
 			return nil, fmt.Errorf("%s", errMsg)
 		}
 		return nil, fmt.Errorf("ERROR 1064 (42000): %v", err)
@@ -510,4 +518,44 @@ func resultToMySQL(result *executor.Result) (*mysql.Result, error) {
 
 func makeFields(columns []string) []string {
 	return columns
+}
+
+// parseMySQLError parses an error message in the format "ERROR <code> (<state>): <message>"
+// and returns a *mysql.MyError with the correct code, state, and message.
+// Returns nil if the format doesn't match.
+func parseMySQLError(errMsg string) *mysql.MyError {
+	// Match "ERROR <code> (<state>): <message>"
+	if !strings.HasPrefix(errMsg, "ERROR ") {
+		return nil
+	}
+	rest := errMsg[6:] // skip "ERROR "
+	// Parse code
+	spaceIdx := strings.IndexByte(rest, ' ')
+	if spaceIdx < 0 {
+		return nil
+	}
+	code, err := strconv.Atoi(rest[:spaceIdx])
+	if err != nil {
+		return nil
+	}
+	rest = rest[spaceIdx+1:]
+	// Parse (state)
+	if len(rest) < 2 || rest[0] != '(' {
+		return nil
+	}
+	closeIdx := strings.IndexByte(rest, ')')
+	if closeIdx < 0 {
+		return nil
+	}
+	state := rest[1:closeIdx]
+	rest = rest[closeIdx+1:]
+	// Skip ": "
+	if len(rest) >= 2 && rest[0] == ':' && rest[1] == ' ' {
+		rest = rest[2:]
+	}
+	return &mysql.MyError{
+		Code:    uint16(code),
+		State:   state,
+		Message: rest,
+	}
 }

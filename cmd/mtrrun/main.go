@@ -443,7 +443,7 @@ var skipTests = map[string]bool{
 	"innodb/innodb_force_recovery": true,
 	// TIMEOUT: INFORMATION_SCHEMA INNODB_TRX table
 	"innodb/innodb_i_s_innodb_trx": true,
-	// TIMEOUT: Multi-connection lock wait timeout
+	// ROW LOCKING: Multi-connection lock wait timeout (needs INSERT-level row locking)
 	"innodb/innodb_lock_wait_timeout_1": true,
 	// TIMEOUT: Complex misc test with multi-connection
 	"innodb/innodb_misc1": true,
@@ -453,7 +453,7 @@ var skipTests = map[string]bool{
 	"innodb/innodb_rename_index": true,
 	// ERROR: INSERT INTO mysql.innodb_index_stats system table
 	"innodb/innodb_stats_rename_table_if_exists": true,
-	// TIMEOUT: Multi-connection timeout rollback
+	// ROW LOCKING: Multi-connection timeout rollback (needs INSERT-level row locking)
 	"innodb/innodb_timeout_rollback": true,
 	// ERROR: Duplicate entry on INSERT
 	"innodb/innodb_wl6470": true,
@@ -506,8 +506,8 @@ var skipTests = map[string]bool{
 	"innodb/create-index": true,
 	// CREATE TABLESPACE with partitions
 	"innodb/create_tablespace_partition": true,
-	// Multi-connection deadlock detection
-	"innodb/deadlock_detect": true,
+	// ROW LOCKING: Multi-connection deadlock detection (enabled)
+	// "innodb/deadlock_detect": true,
 	// DEFAULT ROW_FORMAT system variable
 	"innodb/default_row_format": true,
 	// EVENT with temp table path
@@ -604,6 +604,8 @@ var skipTests = map[string]bool{
 	// Foreign key rename operations
 	"innodb/rename_fk_1": true,
 	"innodb/rename_fk_2": true,
+	// SKIP LOCKED / NOWAIT (requires SKIP LOCKED row locking behavior)
+	"innodb/skip_locked_nowait": true,
 	// SKIP LOCKED / NOWAIT with isolation levels
 	"innodb/skip_locked_nowait_isolation": true,
 	// Stored foreign key operations
