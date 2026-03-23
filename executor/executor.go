@@ -13133,6 +13133,29 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		matchedRows++
 		if rowChanged {
 			affected++
+			// Apply ON UPDATE CURRENT_TIMESTAMP for columns not explicitly set
+			for _, col := range tbl.Def.Columns {
+				if col.OnUpdateCurrentTimestamp {
+					explicitlySet := false
+					for _, upd := range stmt.Exprs {
+						if strings.EqualFold(upd.Name.Name.String(), col.Name) {
+							explicitlySet = true
+							break
+						}
+					}
+					if !explicitlySet {
+						nowStr := e.nowTime().Format("2006-01-02 15:04:05")
+						// Use fractional seconds if column type has precision
+						colUpper := strings.ToUpper(col.Type)
+						if strings.Contains(colUpper, "TIMESTAMP(6)") || strings.Contains(colUpper, "DATETIME(6)") {
+							nowStr = e.nowTime().Format("2006-01-02 15:04:05.000000")
+						} else if strings.Contains(colUpper, "TIMESTAMP(3)") || strings.Contains(colUpper, "DATETIME(3)") {
+							nowStr = e.nowTime().Format("2006-01-02 15:04:05.000")
+						}
+						tbl.Rows[i][col.Name] = nowStr
+					}
+				}
+			}
 			// If an auto-increment column was updated, advance the AI counter
 			// so subsequent INSERT with NULL/0 won't generate a duplicate.
 			for _, col := range tbl.Def.Columns {
@@ -14164,6 +14187,52 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					} else {
 						idxComment = opt.String
 					}
+				}
+			}
+			// Check for duplicate values in existing data when adding UNIQUE/PRIMARY index
+			if isUnique || isPrimary {
+				// Extract prefix lengths from idxCols (e.g., "f1(4)" -> 4)
+				baseCols := make([]string, len(idxCols))
+				prefixLens := make([]int, len(idxCols))
+				for ci, c := range idxCols {
+					baseCols[ci] = stripPrefixLengthFromCol(c)
+					// Parse prefix length if present
+					if idx := strings.Index(c, "("); idx >= 0 {
+						end := strings.Index(c, ")")
+						if end > idx {
+							if pl, err := strconv.Atoi(c[idx+1 : end]); err == nil {
+								prefixLens[ci] = pl
+							}
+						}
+					}
+				}
+				seen := make(map[string]bool)
+				for _, row := range tbl.Rows {
+					keyParts := make([]string, len(baseCols))
+					allNull := true
+					for ci, c := range baseCols {
+						v := rowValueByColumnName(row, c)
+						if v == nil {
+							keyParts[ci] = "NULL"
+						} else {
+							s := fmt.Sprintf("%v", v)
+							// Apply prefix length and trim trailing nulls/spaces
+							if prefixLens[ci] > 0 && len(s) > prefixLens[ci] {
+								s = s[:prefixLens[ci]]
+							}
+							s = strings.TrimRight(s, "\x00 ")
+							keyParts[ci] = s
+							allNull = false
+						}
+					}
+					if allNull {
+						continue // NULL values don't conflict
+					}
+					key := strings.Join(keyParts, "-")
+					if seen[key] {
+						return nil, mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key '%s'", strings.Join(keyParts, "-"), idxName))
+					}
+					seen[key] = true
 				}
 			}
 			if isPrimary {
@@ -29914,6 +29983,33 @@ func resolveTableNameDB(name, currentDB string) (string, string) {
 }
 
 // isMultiTableUpdate checks if an UPDATE statement involves multiple tables (join or comma-separated).
+// resolveColumnTable resolves an unqualified column name to a table name
+// by searching through the table expressions in the FROM clause.
+func resolveColumnTable(te sqlparser.TableExpr, colName string, e *Executor) string {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		tblName := sqlparser.String(t.Expr)
+		tblName = strings.Trim(tblName, "`")
+		tbl, err := e.Storage.GetTable(e.CurrentDB, tblName)
+		if err != nil {
+			return ""
+		}
+		for _, col := range tbl.Def.Columns {
+			if strings.EqualFold(col.Name, colName) {
+				return tblName
+			}
+		}
+	case *sqlparser.JoinTableExpr:
+		if r := resolveColumnTable(t.LeftExpr, colName, e); r != "" {
+			return r
+		}
+		if r := resolveColumnTable(t.RightExpr, colName, e); r != "" {
+			return r
+		}
+	}
+	return ""
+}
+
 func isMultiTableUpdate(stmt *sqlparser.Update) bool {
 	if len(stmt.TableExprs) > 1 {
 		return true
@@ -29987,6 +30083,14 @@ func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error)
 			} else {
 				targetDB = e.CurrentDB
 				targetTable = ""
+				// Resolve unqualified column by scanning tables in FROM clause
+				for _, te := range stmt.TableExprs {
+					resolved := resolveColumnTable(te, colName, e)
+					if resolved != "" {
+						targetTable = resolved
+						break
+					}
+				}
 			}
 
 			// Evaluate new value
@@ -30087,7 +30191,27 @@ func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error)
 						}
 					}
 
+					oldVal := tbl.Rows[i][colName]
 					tbl.Rows[i][colName] = val
+					// Apply ON UPDATE CURRENT_TIMESTAMP if the value actually changed
+					if !valuesEqual(oldVal, val) {
+						explicitCols := make(map[string]bool)
+						for _, u := range stmt.Exprs {
+							explicitCols[strings.ToLower(u.Name.Name.String())] = true
+						}
+						for _, col := range tbl.Def.Columns {
+							if col.OnUpdateCurrentTimestamp && !explicitCols[strings.ToLower(col.Name)] {
+								nowStr := e.nowTime().Format("2006-01-02 15:04:05")
+								colUpper := strings.ToUpper(col.Type)
+								if strings.Contains(colUpper, "TIMESTAMP(6)") || strings.Contains(colUpper, "DATETIME(6)") {
+									nowStr = e.nowTime().Format("2006-01-02 15:04:05.000000")
+								} else if strings.Contains(colUpper, "TIMESTAMP(3)") || strings.Contains(colUpper, "DATETIME(3)") {
+									nowStr = e.nowTime().Format("2006-01-02 15:04:05.000")
+								}
+								tbl.Rows[i][col.Name] = nowStr
+							}
+						}
+					}
 				}
 			}
 			tbl.Unlock()

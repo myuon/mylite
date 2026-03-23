@@ -503,7 +503,7 @@ var skipTests = map[string]bool{
 	// IBD file size validation
 	"innodb/check_ibd_filesize_16k": true,
 	// CREATE INDEX edge cases
-	"innodb/create-index": true,
+	// "innodb/create-index": true, // now passes
 	// CREATE TABLESPACE with partitions
 	"innodb/create_tablespace_partition": true,
 	// ROW LOCKING: Multi-connection deadlock detection (enabled)
@@ -517,7 +517,7 @@ var skipTests = map[string]bool{
 	// ALTER TABLE WL6554 feature
 	"innodb/innodb-alter-wl6554": true,
 	// Bug fix test with specific InnoDB behavior
-	"innodb/innodb-bug14219515": true,
+	// "innodb/innodb-bug14219515": true, // now passes
 	// IMPORT/EXPORT partition
 	"innodb/innodb-import-partition": true,
 	// Index with UCS2 charset
@@ -623,7 +623,7 @@ var skipTests = map[string]bool{
 	// Temporary table optimization
 	"innodb/temporary_table_optimization": true,
 	// Timestamp handling
-	"innodb/timestamp": true,
+	// "innodb/timestamp": true, // now passes
 	// Tmpdir configuration
 	"innodb/tmpdir": true,
 	// TRUNCATE TABLE
