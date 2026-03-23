@@ -642,12 +642,6 @@ var skipTests = map[string]bool{
 	"innodb/zlob_import_export": true,
 	// ZLOB redundant partial update
 	"innodb/zlob_redundant_partial_update": true,
-	// TIMEOUT: send/reap multi-connection lock test (needs lock manager)
-	"innodb/innodb-consistent": true,
-
-	// === other suite ===
-	// TIMEOUT: send/reap multi-connection lock test (needs lock manager)
-	"other/lock_tables_lost_commit": true,
 
 	// === stress suite ===
 	// TIMEOUT: DDL stress tests that exceed timeout
@@ -2886,8 +2880,8 @@ func (w *worker) runTestInner(testPath string, includePaths []string, verbose bo
 		}
 	}
 	defer testDB.Close()
-	testDB.SetMaxIdleConns(1)
-	testDB.SetMaxOpenConns(2)
+	testDB.SetMaxIdleConns(4)
+	testDB.SetMaxOpenConns(16)
 
 	runner := &mtrrunner.Runner{
 		DB:           testDB,
