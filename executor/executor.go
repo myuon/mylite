@@ -7717,27 +7717,29 @@ func (e *Executor) execBegin() (*Result, error) {
 }
 
 func (e *Executor) execCommit() (*Result, error) {
+	// Always release row locks on COMMIT (covers autocommit=0 implicit transactions)
+	if e.rowLockManager != nil {
+		e.rowLockManager.ReleaseRowLocks(e.connectionID)
+	}
 	if !e.inTransaction {
 		return &Result{}, nil
 	}
 	e.inTransaction = false
 	e.savepoint = nil
-	if e.rowLockManager != nil {
-		e.rowLockManager.ReleaseRowLocks(e.connectionID)
-	}
 	return &Result{}, nil
 }
 
 func (e *Executor) execRollback() (*Result, error) {
+	// Always release row locks on ROLLBACK (covers autocommit=0 implicit transactions)
+	if e.rowLockManager != nil {
+		e.rowLockManager.ReleaseRowLocks(e.connectionID)
+	}
 	if !e.inTransaction {
 		return &Result{}, nil
 	}
 	sp := e.savepoint
 	e.inTransaction = false
 	e.savepoint = nil
-	if e.rowLockManager != nil {
-		e.rowLockManager.ReleaseRowLocks(e.connectionID)
-	}
 
 	if sp == nil {
 		return &Result{}, nil
@@ -10640,6 +10642,9 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		}
 	}
 
+	// Save pre-WHERE rows for REPEATABLE READ full-scan locking
+	preWhereRows := allRows
+
 	// Apply WHERE filter (skip if already applied during streaming cross join)
 	if stmt.Where != nil && !whereApplied {
 		filtered := make([]storage.Row, 0)
@@ -10659,9 +10664,9 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		}
 	}
 
-	// Acquire row locks for SELECT ... FOR UPDATE
-	if stmt.Lock == sqlparser.ForUpdateLock && e.rowLockManager != nil && len(allRows) > 0 {
-		if err := e.acquireRowLocksForSelect(stmt, allRows); err != nil {
+	// Acquire row locks for SELECT ... FOR UPDATE / LOCK IN SHARE MODE / FOR SHARE
+	if (stmt.Lock == sqlparser.ForUpdateLock || stmt.Lock == sqlparser.ShareModeLock || stmt.Lock == sqlparser.ForShareLock) && e.rowLockManager != nil && len(allRows) > 0 {
+		if err := e.acquireRowLocksForSelect(stmt, allRows, preWhereRows); err != nil {
 			return nil, err
 		}
 	}
@@ -10892,11 +10897,10 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	}, nil
 }
 
-// acquireRowLocksForSelect acquires row-level locks for SELECT ... FOR UPDATE.
-// It identifies the primary key columns from the queried table and locks each
-// matching row. If a lock cannot be acquired within innodb_lock_wait_timeout,
-// it returns an error.
-func (e *Executor) acquireRowLocksForSelect(stmt *sqlparser.Select, rows []storage.Row) error {
+// acquireRowLocksForSelect acquires row-level locks for SELECT ... FOR UPDATE / LOCK IN SHARE MODE.
+// In REPEATABLE READ, it locks ALL rows from preWhereRows (simulating InnoDB full table scan locking).
+// In READ COMMITTED, it locks only the filtered result rows.
+func (e *Executor) acquireRowLocksForSelect(stmt *sqlparser.Select, rows []storage.Row, preWhereRows []storage.Row) error {
 	// Determine timeout from innodb_lock_wait_timeout
 	timeout := 50.0 // default
 	if v, ok := e.getSysVar("innodb_lock_wait_timeout"); ok {
@@ -10904,6 +10908,13 @@ func (e *Executor) acquireRowLocksForSelect(stmt *sqlparser.Select, rows []stora
 			timeout = t
 		}
 	}
+
+	// Check isolation level
+	isoLevel, _ := e.getSysVar("transaction_isolation")
+	if isoLevel == "" {
+		isoLevel, _ = e.getSysVar("tx_isolation")
+	}
+	isReadCommitted := strings.EqualFold(isoLevel, "READ-COMMITTED") || strings.EqualFold(isoLevel, "READ COMMITTED")
 
 	// Extract table name(s) from FROM clause to get PK columns
 	for _, fromExpr := range stmt.From {
@@ -10932,30 +10943,59 @@ func (e *Executor) acquireRowLocksForSelect(stmt *sqlparser.Select, rows []stora
 		}
 
 		pkCols := def.PrimaryKey
-		if len(pkCols) == 0 {
-			// No primary key - lock the entire table by a synthetic key
-			lockKey := dbName + ":" + tableName + ":__table__"
-			if err := e.rowLockManager.AcquireRowLock(e.connectionID, lockKey, timeout); err != nil {
-				return mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
-			}
-			continue
-		}
 
-		// Lock each row by its PK value
-		for _, row := range rows {
-			pkParts := make([]string, len(pkCols))
-			for i, pk := range pkCols {
-				colName := pk
-				// Strip prefix length notation e.g. "col(10)" -> "col"
-				if idx := strings.Index(colName, "("); idx >= 0 {
-					colName = colName[:idx]
-				}
-				pkParts[i] = fmt.Sprintf("%v", row[colName])
+		// Determine whether to lock all rows (full scan) or only result rows.
+		// In REPEATABLE READ without LIMIT and without PK-based point lookup, lock all rows.
+		hasLimit := stmt.Limit != nil && stmt.Limit.Rowcount != nil
+		isPKLookup := len(pkCols) > 0 && isWherePKEquality(stmt, pkCols)
+		lockAll := !isReadCommitted && !hasLimit && !isPKLookup
+
+		if len(pkCols) > 0 {
+			// Has PK: lock rows by PK value
+			lockRows := rows
+			if lockAll {
+				lockRows = preWhereRows
 			}
-			pkVal := strings.Join(pkParts, "\x00")
-			lockKey := dbName + ":" + tableName + ":" + pkVal
-			if err := e.rowLockManager.AcquireRowLock(e.connectionID, lockKey, timeout); err != nil {
-				return mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
+			for _, row := range lockRows {
+				lockKey := buildRowLockKey(dbName, tableName, pkCols, row)
+				if err := e.rowLockManager.AcquireRowLock(e.connectionID, lockKey, timeout); err != nil {
+					return mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
+				}
+			}
+		} else {
+			// No PK: lock rows by index in the storage table.
+			storTbl, storErr := e.Storage.GetTable(dbName, tableName)
+			if storErr != nil {
+				continue
+			}
+			if lockAll {
+				// Lock all rows by index (full table scan)
+				for i := 0; i < len(storTbl.Rows); i++ {
+					lockKey := buildRowLockKeyByIndex(dbName, tableName, i)
+					if err := e.rowLockManager.AcquireRowLock(e.connectionID, lockKey, timeout); err != nil {
+						return mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
+					}
+				}
+			} else {
+				// With LIMIT or READ COMMITTED: lock all rows scanned up to
+				// the last matching row (InnoDB locks every row it touches during scan).
+				maxIdx := -1
+				for _, row := range rows {
+					for i, sRow := range storTbl.Rows {
+						if rowsEqual(row, sRow, def) {
+							if i > maxIdx {
+								maxIdx = i
+							}
+							break
+						}
+					}
+				}
+				for i := 0; i <= maxIdx; i++ {
+					lockKey := buildRowLockKeyByIndex(dbName, tableName, i)
+					if err := e.rowLockManager.AcquireRowLock(e.connectionID, lockKey, timeout); err != nil {
+						return mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
+					}
+				}
 			}
 		}
 	}
@@ -10974,35 +11014,109 @@ func (e *Executor) acquireRowLocksForRows(dbName, tableName string, def *catalog
 	}
 
 	pkCols := def.PrimaryKey
-	if len(pkCols) == 0 {
-		// No PK - lock the whole table
-		lockKey := dbName + ":" + tableName + ":__table__"
-		if err := e.rowLockManager.AcquireRowLock(e.connectionID, lockKey, timeout); err != nil {
-			return mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
-		}
-		return nil
-	}
 
 	for _, idx := range indices {
 		if idx < 0 || idx >= len(rows) {
 			continue
 		}
-		row := rows[idx]
-		pkParts := make([]string, len(pkCols))
-		for i, pk := range pkCols {
-			colName := pk
-			if ci := strings.Index(colName, "("); ci >= 0 {
-				colName = colName[:ci]
-			}
-			pkParts[i] = fmt.Sprintf("%v", row[colName])
+		var lockKey string
+		if len(pkCols) > 0 {
+			lockKey = buildRowLockKey(dbName, tableName, pkCols, rows[idx])
+		} else {
+			lockKey = buildRowLockKeyByIndex(dbName, tableName, idx)
 		}
-		pkVal := strings.Join(pkParts, "\x00")
-		lockKey := dbName + ":" + tableName + ":" + pkVal
 		if err := e.rowLockManager.AcquireRowLock(e.connectionID, lockKey, timeout); err != nil {
 			return mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
 		}
 	}
 	return nil
+}
+
+// buildRowLockKey generates a lock key for a row using its PK values.
+func buildRowLockKey(dbName, tableName string, pkCols []string, row storage.Row) string {
+	pkParts := make([]string, len(pkCols))
+	for i, pk := range pkCols {
+		colName := pk
+		if ci := strings.Index(colName, "("); ci >= 0 {
+			colName = colName[:ci]
+		}
+		pkParts[i] = fmt.Sprintf("%v", row[colName])
+	}
+	return dbName + ":" + tableName + ":" + strings.Join(pkParts, "\x00")
+}
+
+// buildRowLockKeyByIndex generates a lock key for a row by its index (for tables without PK).
+func buildRowLockKeyByIndex(dbName, tableName string, idx int) string {
+	return fmt.Sprintf("%s:%s:__rowIdx__:%d", dbName, tableName, idx)
+}
+
+// shouldAcquireRowLocks returns true if the current statement should acquire row locks.
+// Row locks are needed when in an explicit transaction (BEGIN) or when autocommit is off.
+// In autocommit mode without an explicit transaction, each statement auto-commits
+// and row locks would be immediately released, so they're only acquired to block
+// on rows locked by other connections.
+func (e *Executor) shouldAcquireRowLocks() bool {
+	if e.inTransaction {
+		return true
+	}
+	// Check if autocommit is off (implicit transaction)
+	if v, ok := e.getSysVar("autocommit"); ok {
+		upper := strings.ToUpper(v)
+		if upper == "0" || upper == "OFF" {
+			return true
+		}
+	}
+	return false
+}
+
+// isWherePKEquality checks if the WHERE clause is a simple equality (or AND of equalities)
+// on all primary key columns. This indicates a point lookup rather than a full table scan.
+func isWherePKEquality(stmt *sqlparser.Select, pkCols []string) bool {
+	if stmt.Where == nil {
+		return false
+	}
+	// Collect column names referenced in equality comparisons
+	eqCols := make(map[string]bool)
+	collectEqCols(stmt.Where.Expr, eqCols)
+	// Check if all PK columns are covered
+	for _, pk := range pkCols {
+		colName := pk
+		if ci := strings.Index(colName, "("); ci >= 0 {
+			colName = colName[:ci]
+		}
+		if !eqCols[strings.ToLower(colName)] {
+			return false
+		}
+	}
+	return true
+}
+
+// collectEqCols collects column names that appear in equality comparisons in the expression.
+func collectEqCols(expr sqlparser.Expr, cols map[string]bool) {
+	switch e := expr.(type) {
+	case *sqlparser.ComparisonExpr:
+		if e.Operator == sqlparser.EqualOp {
+			if col, ok := e.Left.(*sqlparser.ColName); ok {
+				cols[strings.ToLower(col.Name.String())] = true
+			}
+			if col, ok := e.Right.(*sqlparser.ColName); ok {
+				cols[strings.ToLower(col.Name.String())] = true
+			}
+		}
+	case *sqlparser.AndExpr:
+		collectEqCols(e.Left, cols)
+		collectEqCols(e.Right, cols)
+	}
+}
+
+// rowsEqual checks if two rows have the same values for all columns defined in the table.
+func rowsEqual(a, b storage.Row, def *catalog.TableDef) bool {
+	for _, col := range def.Columns {
+		if fmt.Sprintf("%v", a[col.Name]) != fmt.Sprintf("%v", b[col.Name]) {
+			return false
+		}
+	}
+	return true
 }
 
 func validateImplicitScopeQualifiedCols(stmt *sqlparser.Select) error {
@@ -12754,13 +12868,32 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		}
 	}
 
-	// Acquire row locks for matching rows when in a transaction
-	if e.inTransaction && e.rowLockManager != nil && len(matchingIndices) > 0 {
-		tbl.Unlock() // release table lock while waiting for row locks
-		err := e.acquireRowLocksForRows(updateDB, tableName, tbl.Def, tbl.Rows, matchingIndices)
-		tbl.Lock() // re-acquire table lock
-		if err != nil {
-			return nil, err
+	// Acquire row locks for UPDATE.
+	// In REPEATABLE READ with full table scan (no PK lookup), lock ALL rows.
+	// In READ COMMITTED or with PK lookup, lock only matching rows.
+	if e.rowLockManager != nil && len(tbl.Rows) > 0 && e.shouldAcquireRowLocks() {
+		isoLevel, _ := e.getSysVar("transaction_isolation")
+		if isoLevel == "" {
+			isoLevel, _ = e.getSysVar("tx_isolation")
+		}
+		isReadCommitted := strings.EqualFold(isoLevel, "READ-COMMITTED") || strings.EqualFold(isoLevel, "READ COMMITTED")
+		var lockIndices []int
+		if isReadCommitted || usedPKFastPath {
+			lockIndices = matchingIndices
+		} else {
+			// REPEATABLE READ full table scan: lock all rows
+			lockIndices = make([]int, len(tbl.Rows))
+			for i := range tbl.Rows {
+				lockIndices[i] = i
+			}
+		}
+		if len(lockIndices) > 0 {
+			tbl.Unlock() // release table lock while waiting for row locks
+			err := e.acquireRowLocksForRows(updateDB, tableName, tbl.Def, tbl.Rows, lockIndices)
+			tbl.Lock() // re-acquire table lock
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -13192,8 +13325,8 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 			deleteSet[origIdx] = true
 		}
 
-		// Acquire row locks for rows to be deleted when in a transaction
-		if e.inTransaction && e.rowLockManager != nil && len(deleteSet) > 0 {
+		// Acquire row locks for rows to be deleted (blocks if rows are locked by another connection)
+		if e.rowLockManager != nil && len(deleteSet) > 0 && e.shouldAcquireRowLocks() {
 			delIndices := make([]int, 0, len(deleteSet))
 			for idx := range deleteSet {
 				delIndices = append(delIndices, idx)
@@ -13217,8 +13350,8 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		return &Result{AffectedRows: uint64(len(deleteSet))}, nil
 	}
 
-	// Acquire row locks for matching rows when in a transaction
-	if e.inTransaction && e.rowLockManager != nil {
+	// Acquire row locks for matching rows (blocks if rows are locked by another connection)
+	if e.rowLockManager != nil && e.shouldAcquireRowLocks() {
 		var matchIndices []int
 		for i, row := range tbl.Rows {
 			match := true

@@ -525,7 +525,7 @@ var skipTests = map[string]bool{
 	// Large prefix index
 	"innodb/innodb-large-prefix": true,
 	// Semi-consistent read (multi-connection)
-	"innodb/innodb-semi-consistent": true,
+	// "innodb/innodb-semi-consistent": true, // now passes
 	// TRUNCATE TABLE edge cases
 	"innodb/innodb-truncate": true,
 	// UCS2 charset handling
@@ -564,7 +564,7 @@ var skipTests = map[string]bool{
 	// IO prefetch settings
 	"innodb/innodb_io_pf": true,
 	// InnoDB rollback behavior
-	"innodb/innodb_mysql_rbk": true,
+	// "innodb/innodb_mysql_rbk": true, // now passes
 	// InnoDB stats auto recalc
 	"innodb/innodb_stats_auto_recalc":             true,
 	"innodb/innodb_stats_auto_recalc_ddl":         true,
@@ -579,7 +579,7 @@ var skipTests = map[string]bool{
 	// WL8114 feature
 	"innodb/innodb_wl8114": true,
 	// Instant add column with auto-increment
-	"innodb/instant_add_column_autoinc": true,
+	// "innodb/instant_add_column_autoinc": true, // now passes
 	// Instant add column long
 	"innodb/instant_add_column_long": true,
 	// LOB (large object) operations
