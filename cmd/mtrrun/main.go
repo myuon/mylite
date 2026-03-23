@@ -1290,6 +1290,7 @@ var skipTests = map[string]bool{
 	"x/client_close_abort":                           true,
 	"x/client_session":                               true,
 	"x/connection":                                   true,
+	"x/connection_auth_plugin_unsupported":           true, // TIMEOUT: xplugin wait loop with real_sleep
 	"x/connection_auth_same_user_name":               true,
 	"x/connection_default_schema":                    true,
 	"x/connection_expire":                            true,

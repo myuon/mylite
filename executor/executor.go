@@ -21236,6 +21236,16 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		}
 		return bcCount, nil
 	case "sleep":
+		if len(v.Exprs) > 0 {
+			dur, err := e.evalExpr(v.Exprs[0])
+			if err != nil {
+				return nil, err
+			}
+			secs := toFloat(dur)
+			if secs > 0 && secs <= 300 {
+				time.Sleep(time.Duration(secs * float64(time.Second)))
+			}
+		}
 		return int64(0), nil
 	case "user", "session_user", "system_user":
 		return "root@localhost", nil

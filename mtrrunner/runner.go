@@ -1271,6 +1271,16 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		}
 		return true, false, nil
 
+	case "sleep", "real_sleep":
+		// sleep <seconds> — pause execution for the given duration
+		if args != "" {
+			secs, err := strconv.ParseFloat(strings.TrimSpace(args), 64)
+			if err == nil && secs > 0 && secs <= 300 {
+				time.Sleep(time.Duration(secs * float64(time.Second)))
+			}
+		}
+		return true, false, nil
+
 	// Directives we accept but ignore
 	case "character_set", "charset":
 		return true, false, nil
@@ -1280,7 +1290,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"disable_view_protocol", "enable_view_protocol",
 		"disable_session_track_info", "enable_session_track_info",
 		"disable_connect_log", "enable_connect_log",
-		"sleep", "send_shutdown",
+		"send_shutdown",
 		"replace_numeric_round",
 		"write_file", "append_file", "cat_file",
 		"mkdir", "rmdir", "move_file",
@@ -1291,7 +1301,6 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"require", "result_format",
 		"disable_reconnect", "enable_reconnect",
 		"disable_abort_on_error", "enable_abort_on_error",
-		"real_sleep",
 		"query_get_value",
 		"save_master_pos", "sync_with_master",
 		"change_user",
