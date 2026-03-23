@@ -17,7 +17,9 @@ type ColumnDef struct {
 	Unique                   bool
 	Comment                  string
 	DefaultDropped           bool // true when ALTER TABLE ... DROP DEFAULT was used
-	OnUpdateCurrentTimestamp bool // true for TIMESTAMP/DATETIME with ON UPDATE CURRENT_TIMESTAMP
+	OnUpdateCurrentTimestamp bool   // true for TIMESTAMP/DATETIME with ON UPDATE CURRENT_TIMESTAMP
+	Charset                 string // column-level charset override (e.g. "latin1"); empty means inherit table default
+	Collation               string // column-level collation override; empty means inherit table default
 }
 
 // IndexDef represents an index definition.
@@ -47,7 +49,9 @@ type TableDef struct {
 	StatsPersistent  *int
 	StatsAutoRecalc  *int
 	StatsSamplePages *int
-	CheckConstraints []CheckConstraint // CHECK constraint definitions
+	CheckConstraints  []CheckConstraint // CHECK constraint definitions
+	PartitionType     string             // "RANGE", "LIST", "HASH", "KEY" or "" for non-partitioned
+	PartitionColumns  []string           // column names used in partition expression (for ordering)
 }
 
 // CheckConstraint represents a table-level CHECK constraint.

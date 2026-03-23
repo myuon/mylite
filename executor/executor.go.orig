@@ -7080,11 +7080,6 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			Type:     buildColumnTypeString(col.Type),
 			Nullable: nullable,
 		}
-		// Capture column-level charset if explicitly specified
-		if col.Type.Charset.Name != "" {
-			colDef.Charset = strings.ToLower(col.Type.Charset.Name)
-			colDef.Collation = catalog.DefaultCollationForCharset(colDef.Charset)
-		}
 		if tUpper := strings.ToUpper(strings.TrimSpace(colDef.Type)); strings.HasPrefix(tUpper, "BIT(") {
 			var width int
 			if n, err := fmt.Sscanf(tUpper, "BIT(%d)", &width); err == nil && n == 1 {
@@ -17147,7 +17142,7 @@ func parseTableOptionInt(opt *sqlparser.TableOption) *int {
 // mysqlGeneratedClause formats a generated column clause for SHOW CREATE TABLE.
 // It takes the raw expression string and storage type (virtual/stored) and returns
 // something like: GENERATED ALWAYS AS ((`a` + LENGTH(`d`))) STORED
-func mysqlGeneratedClause(exprStr string, colType string, colCharset string) string {
+func mysqlGeneratedClause(exprStr string, colType string) string {
 	upper := strings.ToUpper(colType)
 	storage := "VIRTUAL"
 	if strings.HasSuffix(upper, " STORED") {
@@ -17155,7 +17150,7 @@ func mysqlGeneratedClause(exprStr string, colType string, colCharset string) str
 	}
 
 	// Parse the expression and reformat it MySQL-style
-	formattedExpr := mysqlFormatGenExpr(exprStr, colCharset)
+	formattedExpr := mysqlFormatGenExpr(exprStr)
 
 	return fmt.Sprintf("GENERATED ALWAYS AS (%s) %s", formattedExpr, storage)
 }
@@ -17163,8 +17158,7 @@ func mysqlGeneratedClause(exprStr string, colType string, colCharset string) str
 // mysqlFormatGenExpr formats a generated column expression in MySQL style:
 // backtick-quoted column refs, no spaces after commas in function args,
 // _utf8mb4 prefix for string literals, extra outer parens for non-function expressions.
-// colCharset is the column-level charset (e.g. "latin1"); empty means default (no prefix needed).
-func mysqlFormatGenExpr(exprStr string, colCharset string) string {
+func mysqlFormatGenExpr(exprStr string) string {
 	parser := sqlparser.NewTestParser()
 	stmt, err := parser.Parse("SELECT " + exprStr)
 	if err != nil {
@@ -17179,7 +17173,7 @@ func mysqlFormatGenExpr(exprStr string, colCharset string) string {
 	if !ok {
 		return exprStr
 	}
-	inner := mysqlGenExprNode(aliased.Expr, colCharset)
+	inner := mysqlGenExprNode(aliased.Expr)
 	// MySQL wraps non-function/non-call expressions in extra parens
 	switch aliased.Expr.(type) {
 	case *sqlparser.FuncExpr, *sqlparser.SubstrExpr,
@@ -17187,13 +17181,6 @@ func mysqlFormatGenExpr(exprStr string, colCharset string) string {
 		*sqlparser.CastExpr:
 		// Function-like expressions: no extra parens
 		return inner
-	case *sqlparser.Literal:
-		// When column has explicit charset, the charset introducer makes the
-		// literal a complete expression (e.g. _latin1'...') — no extra parens.
-		if colCharset != "" {
-			return inner
-		}
-		return "(" + inner + ")"
 	default:
 		// Binary expressions, column refs, etc: wrap in parens
 		return "(" + inner + ")"
@@ -17201,17 +17188,16 @@ func mysqlFormatGenExpr(exprStr string, colCharset string) string {
 }
 
 // mysqlGenExprNode recursively formats an expression node in MySQL SHOW CREATE TABLE style.
-// colCharset is the column-level charset; when non-empty, string literals get a charset introducer prefix.
-func mysqlGenExprNode(expr sqlparser.Expr, colCharset string) string {
+func mysqlGenExprNode(expr sqlparser.Expr) string {
 	switch e := expr.(type) {
 	case *sqlparser.ColName:
 		return "`" + e.Name.String() + "`"
 	case *sqlparser.BinaryExpr:
-		return fmt.Sprintf("%s %s %s", mysqlGenExprNode(e.Left, colCharset), e.Operator.ToString(), mysqlGenExprNode(e.Right, colCharset))
+		return fmt.Sprintf("%s %s %s", mysqlGenExprNode(e.Left), e.Operator.ToString(), mysqlGenExprNode(e.Right))
 	case *sqlparser.FuncExpr:
 		args := make([]string, len(e.Exprs))
 		for i, arg := range e.Exprs {
-			args[i] = mysqlGenExprNode(arg, colCharset)
+			args[i] = mysqlGenExprNode(arg)
 		}
 		name := e.Name.String()
 		// MySQL outputs function names in lowercase in SHOW CREATE TABLE
@@ -17220,63 +17206,60 @@ func mysqlGenExprNode(expr sqlparser.Expr, colCharset string) string {
 		return name + "(" + strings.Join(args, ",") + ")"
 	case *sqlparser.Literal:
 		if e.Type == sqlparser.StrVal {
-			if colCharset != "" {
-				return "_" + colCharset + "'" + e.Val + "'"
-			}
 			return "'" + e.Val + "'"
 		}
 		return e.Val
 	case *sqlparser.UnaryExpr:
-		return e.Operator.ToString() + mysqlGenExprNode(e.Expr, colCharset)
+		return e.Operator.ToString() + mysqlGenExprNode(e.Expr)
 	case *sqlparser.SubstrExpr:
-		parts := []string{mysqlGenExprNode(e.Name, colCharset)}
+		parts := []string{mysqlGenExprNode(e.Name)}
 		if e.From != nil {
-			parts = append(parts, mysqlGenExprNode(e.From, colCharset))
+			parts = append(parts, mysqlGenExprNode(e.From))
 		}
 		if e.To != nil {
-			parts = append(parts, mysqlGenExprNode(e.To, colCharset))
+			parts = append(parts, mysqlGenExprNode(e.To))
 		}
 		return "substr(" + strings.Join(parts, ",") + ")"
 	case *sqlparser.JSONUnquoteExpr:
-		return "json_unquote(" + mysqlGenExprNode(e.JSONValue, colCharset) + ")"
+		return "json_unquote(" + mysqlGenExprNode(e.JSONValue) + ")"
 	case *sqlparser.JSONExtractExpr:
-		parts := []string{mysqlGenExprNode(e.JSONDoc, colCharset)}
+		parts := []string{mysqlGenExprNode(e.JSONDoc)}
 		for _, p := range e.PathList {
-			parts = append(parts, mysqlGenExprNode(p, colCharset))
+			parts = append(parts, mysqlGenExprNode(p))
 		}
 		return "json_extract(" + strings.Join(parts, ",") + ")"
 	case *sqlparser.CastExpr:
-		return "cast(" + mysqlGenExprNode(e.Expr, colCharset) + " as " + strings.ToLower(e.Type.Type) + ")"
+		return "cast(" + mysqlGenExprNode(e.Expr) + " as " + strings.ToLower(e.Type.Type) + ")"
 	case *sqlparser.IntroducerExpr:
-		return e.CharacterSet + mysqlGenExprNode(e.Expr, colCharset)
+		return e.CharacterSet + mysqlGenExprNode(e.Expr)
 	case *sqlparser.IsExpr:
 		op := strings.ToLower(e.Right.ToString())
-		return mysqlGenExprNode(e.Left, colCharset) + " is " + op
+		return mysqlGenExprNode(e.Left) + " is " + op
 	case *sqlparser.CaseExpr:
 		var b strings.Builder
 		b.WriteString("case")
 		if e.Expr != nil {
 			b.WriteString(" ")
-			b.WriteString(mysqlGenExprNode(e.Expr, colCharset))
+			b.WriteString(mysqlGenExprNode(e.Expr))
 		}
 		for _, w := range e.Whens {
 			b.WriteString(" when ")
-			b.WriteString(mysqlGenExprNode(w.Cond, colCharset))
+			b.WriteString(mysqlGenExprNode(w.Cond))
 			b.WriteString(" then ")
-			b.WriteString(mysqlGenExprNode(w.Val, colCharset))
+			b.WriteString(mysqlGenExprNode(w.Val))
 		}
 		if e.Else != nil {
 			b.WriteString(" else ")
-			b.WriteString(mysqlGenExprNode(e.Else, colCharset))
+			b.WriteString(mysqlGenExprNode(e.Else))
 		}
 		b.WriteString(" end")
 		return b.String()
 	case *sqlparser.ComparisonExpr:
-		return mysqlGenExprNode(e.Left, colCharset) + " " + e.Operator.ToString() + " " + mysqlGenExprNode(e.Right, colCharset)
+		return mysqlGenExprNode(e.Left) + " " + e.Operator.ToString() + " " + mysqlGenExprNode(e.Right)
 	case *sqlparser.NullVal:
 		return "NULL"
 	case *sqlparser.NotExpr:
-		return "not(" + mysqlGenExprNode(e.Expr, colCharset) + ")"
+		return "not(" + mysqlGenExprNode(e.Expr) + ")"
 	default:
 		// Fallback to sqlparser.String for unhandled types
 		return sqlparser.String(expr)
@@ -17458,27 +17441,13 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		var parts []string
 		parts = append(parts, fmt.Sprintf("  `%s`", col.Name))
 		parts = append(parts, mysqlDisplayType(col.Type))
-		// Column-level CHARACTER SET / COLLATE (when different from table default)
-		if col.Charset != "" {
-			tableCharset := def.Charset
-			if tableCharset == "" {
-				tableCharset = "utf8mb4"
-			}
-			if !strings.EqualFold(col.Charset, tableCharset) {
-				collation := col.Collation
-				if collation == "" {
-					collation = catalog.DefaultCollationForCharset(col.Charset)
-				}
-				parts = append(parts, fmt.Sprintf("CHARACTER SET %s COLLATE %s", col.Charset, collation))
-			}
-		}
 		colTypeLower := strings.ToLower(col.Type)
 		isTimestamp := strings.HasPrefix(colTypeLower, "timestamp")
 		genExpr := generatedColumnExpr(col.Type)
 		isGenerated := genExpr != ""
 		if isGenerated {
 			// Append GENERATED ALWAYS AS (...) VIRTUAL/STORED
-			parts = append(parts, mysqlGeneratedClause(genExpr, col.Type, col.Charset))
+			parts = append(parts, mysqlGeneratedClause(genExpr, col.Type))
 		}
 		if !col.Nullable {
 			parts = append(parts, "NOT NULL")

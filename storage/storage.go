@@ -707,6 +707,24 @@ func (t *Table) Scan() []Row {
 			}
 			return false
 		})
+	} else if t.Def != nil && len(t.Def.PrimaryKey) == 0 && len(t.Def.PartitionColumns) > 0 &&
+		t.Def.PartitionType == "RANGE" && len(result) > 1 {
+		// For RANGE-partitioned tables without a PRIMARY KEY, MySQL returns
+		// rows in partition order (ascending on the partition expression).
+		partCols := append([]string(nil), t.Def.PartitionColumns...)
+		sort.SliceStable(result, func(i, j int) bool {
+			ri, rj := result[i], result[j]
+			for _, pc := range partCols {
+				cmp := compareRowValue(ri[pc], rj[pc])
+				if cmp < 0 {
+					return true
+				}
+				if cmp > 0 {
+					return false
+				}
+			}
+			return false
+		})
 	}
 	return result
 }

@@ -67,12 +67,10 @@ var skipTests = map[string]bool{
 	// (functions like acos/asin/atan/ceil return 0 or wrong values; passes standalone)
 	"gcol/gcol_supported_sql_funcs_innodb": true,
 	"gcol/gcol_supported_sql_funcs_myisam": true,
-	// Partition ordering differs (MySQL returns rows in partition order, we return storage order)
-	"gcol/gcol_partition_innodb": true,
+	// "gcol/gcol_partition_innodb": true, // now passes (partition ordering fixed)
 	// ALTER TABLE ADD STORED column type-range errors not implemented
 	"gcol/gcol_rejected_myisam": true,
-	// CHARACTER SET latin1 in generated column SHOW CREATE TABLE not implemented
-	"gcol/gcol_bugfixes_latin1": true,
+	// "gcol/gcol_bugfixes_latin1": true, // now passes (charset display fixed)
 	// Stored procedure/function detection in gcol expressions not implemented; cascading diffs
 	"gcol/gcol_blocked_sql_funcs_innodb": true,
 	"gcol/gcol_blocked_sql_funcs_myisam": true,
@@ -183,7 +181,7 @@ var skipTests = map[string]bool{
 	"innodb_fts/fulltext2": true,
 	// Requires exact relevance score matching and row ordering
 	"innodb_fts/fulltext_left_join": true,
-	"innodb_fts/fulltext_distinct":  true,
+	// "innodb_fts/fulltext_distinct":  true, // now passes (ordering fixed)
 	// Requires ft_boolean_syntax and other FTS-specific system variables
 	"innodb_fts/fulltext_var": true,
 	// Requires LOAD DATA INFILE with generated tmp files
