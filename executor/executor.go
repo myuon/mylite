@@ -3795,7 +3795,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					}
 				}
 				// Handle DEFAULT: restore to default value (or emulate known MySQL special defaults).
-				if _, isDefault := expr.Expr.(*sqlparser.Default); isDefault || strings.ToUpper(val) == "DEFAULT" {
+				if _, isDefault := expr.Expr.(*sqlparser.Default); isDefault {
 					if cleanName == "connect_timeout" {
 						e.setSysVar(cleanName, "10", isGlobal)
 					} else if cleanName == "innodb_io_capacity_max" {
@@ -4531,11 +4531,19 @@ func (e *Executor) handleRawSet(raw string) error {
 				return mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", restCheck))
 			}
 		}
+		// Detect SET @@SESSION varname / SET @@GLOBAL varname (space instead of dot)
+		for _, prefix := range []string{"@@global ", "@@session ", "@@local "} {
+			if strings.HasPrefix(restCheckLower, prefix) {
+				nearText := restCheck[len(prefix):]
+				return mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", nearText))
+			}
+		}
 	}
 	// Store any SET GLOBAL/SESSION variable generically
 	rest := strings.TrimSpace(trimmed[4:])
 	restUpper := strings.ToUpper(rest)
-	isGlobalScope := strings.HasPrefix(restUpper, "GLOBAL ") || strings.HasPrefix(restUpper, "@@GLOBAL.") || strings.HasPrefix(restUpper, "PERSIST ") || strings.HasPrefix(restUpper, "PERSIST_ONLY ")
+	isPersistOnly := strings.HasPrefix(restUpper, "PERSIST_ONLY ")
+	isGlobalScope := strings.HasPrefix(restUpper, "GLOBAL ") || strings.HasPrefix(restUpper, "@@GLOBAL.") || strings.HasPrefix(restUpper, "PERSIST ") || isPersistOnly
 	rest = strings.TrimPrefix(rest, "GLOBAL ")
 	rest = strings.TrimPrefix(rest, "SESSION ")
 	rest = strings.TrimPrefix(rest, "LOCAL ")
@@ -4550,6 +4558,9 @@ func (e *Executor) handleRawSet(raw string) error {
 		varName := strings.TrimSpace(strings.ToLower(rest[:eqIdx]))
 		// Check read-only
 		if sysVarReadOnly[varName] {
+			if isPersistOnly {
+				return mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a non persistent read only variable", varName))
+			}
 			return mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a read only variable", varName))
 		}
 		// Check GLOBAL-only
@@ -4559,6 +4570,11 @@ func (e *Executor) handleRawSet(raw string) error {
 		val := strings.TrimSpace(rest[eqIdx+1:])
 		val = strings.TrimSuffix(val, ";")
 		val = strings.TrimSpace(val)
+		// If the value is an unquoted SQL reserved keyword, vitess rejected it for good reason.
+		// Propagate as syntax error, but only for non-enum variables (enum vars often use reserved words as values).
+		if !strings.HasPrefix(val, "'") && !strings.HasPrefix(val, "\"") && sqlReservedKeywords[strings.ToUpper(val)] && !sysVarEnumSet[varName] {
+			return mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", val))
+		}
 		val = strings.Trim(val, "'\"")
 		if strings.ToUpper(val) != "DEFAULT" {
 			e.setSysVar(varName, val, isGlobalScope)
@@ -14541,6 +14557,9 @@ var sysVarReadOnly = map[string]bool{
 	"report_password":                              true,
 	"skip_name_resolve":                            true,
 	"innodb_directories":                           true,
+	"myisam_recover_options":                       true,
+	"lock_order":                                   true,
+	"log_error":                                    true,
 }
 
 // sysVarGlobalOnly contains system variables that can only be SET at GLOBAL scope.
@@ -14733,12 +14752,10 @@ var sysVarGlobalOnly = map[string]bool{
 	"innodb_undo_log_truncate":                 true,
 	"local_infile":                             true,
 	"log_bin_use_v1_row_events":                true,
-	"log_error":                                true,
 	"log_slow_extra":                           true,
 	"log_timestamps":                           true,
 	"myisam_data_pointer_size":                 true,
 	"myisam_mmap_size":                         true,
-	"myisam_recover_options":                   true,
 	"myisam_use_mmap":                          true,
 	"mysqlx_interactive_timeout":               true,
 	"old":                                      true,
@@ -14754,6 +14771,11 @@ var sysVarGlobalOnly = map[string]bool{
 	"slave_skip_errors":                        true,
 	"stored_program_definition_cache":          true,
 	"temptable_max_ram":                        true,
+	"log_queries_not_using_indexes":            true,
+	"log_slow_admin_statements":                true,
+	"log_slow_slave_statements":                true,
+	"log_statements_unsafe_for_binlog":         true,
+	"delay_key_write":                          true,
 }
 
 // sysVarEnumSet contains system variables that are ENUM types where ON/OFF
@@ -15125,12 +15147,42 @@ var sysVarBoolAcceptNegative = map[string]bool{
 	"innodb_buffer_pool_load_now":    true,
 }
 
+// sqlReservedKeywords contains SQL reserved keywords that cannot be used as unquoted
+// values in SET statements. When vitess rejects a SET statement with one of these
+// as a value, we propagate the syntax error instead of silently accepting it.
+var sqlReservedKeywords = map[string]bool{
+	"OF": true, "FROM": true, "TO": true, "BY": true, "AS": true,
+	"IN": true, "IS": true, "OR": true, "AND": true, "NOT": true,
+	"FOR": true, "WITH": true, "SELECT": true, "INSERT": true,
+	"UPDATE": true, "DELETE": true, "WHERE": true, "SET": true,
+	"TABLE": true, "INTO": true, "VALUES": true, "ORDER": true,
+	"GROUP": true, "HAVING": true, "LIMIT": true, "JOIN": true,
+	"INNER": true, "OUTER": true, "LEFT": true, "RIGHT": true,
+	"CROSS": true, "UNION": true, "ALL": true, "ANY": true,
+	"EXISTS": true, "BETWEEN": true, "LIKE": true, "CASE": true,
+	"WHEN": true, "THEN": true, "ELSE": true, "END": true,
+	"IF": true, "WHILE": true, "DO": true, "REPEAT": true,
+	"UNTIL": true, "LOOP": true, "LEAVE": true, "ITERATE": true,
+	"RETURN": true, "CALL": true, "DROP": true, "CREATE": true,
+	"ALTER": true, "INDEX": true, "PRIMARY": true, "KEY": true,
+	"FOREIGN": true, "REFERENCES": true, "CHECK": true,
+	"CONSTRAINT": true, "UNIQUE": true, "ADD": true,
+	"COLUMN": true, "CHANGE": true, "MODIFY": true, "RENAME": true,
+	"EACH": true, "ROW": true, "ROWS": true, "OVER": true,
+	"PARTITION": true, "WINDOW": true, "RANGE": true,
+	"BOTH": true, "LEADING": true, "TRAILING": true,
+	"SIGNAL": true, "RESIGNAL": true, "UNDO": true,
+	"USAGE": true, "OPTION": true, "GRANT": true, "REVOKE": true,
+}
+
 // triggerSysVars are variables that act as triggers: setting them to ON
 // performs an action, and then the variable immediately resets to OFF.
 var triggerSysVars = map[string]bool{
 	"innodb_buffer_pool_load_abort": true,
 	"innodb_buffer_pool_load_now":   true,
 	"innodb_buffer_pool_dump_now":   true,
+	"innodb_undo_log_encrypt":       true,
+	"innodb_redo_log_encrypt":       true,
 }
 
 type intVarRange struct {
@@ -15475,9 +15527,9 @@ func normalizeBooleanToken(raw string) (int64, bool, bool) {
 		return 0, false, false
 	}
 	switch up {
-	case "ON", "TRUE", "YES":
+	case "ON", "TRUE":
 		return 1, true, false
-	case "OFF", "FALSE", "NO":
+	case "OFF", "FALSE":
 		return 0, true, false
 	}
 	if strings.Contains(s, ".") {
@@ -16096,6 +16148,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"flush":                      "OFF",
 		"flush_time":                 "0",
 		"lock_wait_timeout":          "31536000",
+		"lock_order":                 "ON",
 		"low_priority_updates":       "OFF",
 		"max_delayed_threads":        "20",
 		"delayed_insert_limit":       "100",

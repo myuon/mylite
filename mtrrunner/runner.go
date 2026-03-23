@@ -3255,7 +3255,27 @@ func normalizeOutput(s string) string {
 	// actual error point, but our parser may show a different starting position.
 	// Normalize: strip the near '...' portion from syntax error messages.
 	out = normalizeSyntaxErrorNear(out)
+	// Normalize "can't be set to the value of 'XYZ'" → lowercase the value portion
+	out = normalizeSetValueErrorCase(out)
+	// Normalize double semicolons: ";;" → ";"
+	out = strings.ReplaceAll(out, ";;", ";")
 	return out
+}
+
+// normalizeSetValueErrorCase lowercases the value portion of
+// "can't be set to the value of 'XYZ'" error messages for consistent comparison.
+func normalizeSetValueErrorCase(s string) string {
+	if !strings.Contains(s, "can't be set to the value of") {
+		return s
+	}
+	re := regexp.MustCompile(`(can't be set to the value of ')([^']*)(')`)
+	return re.ReplaceAllStringFunc(s, func(match string) string {
+		m := re.FindStringSubmatch(match)
+		if m == nil {
+			return match
+		}
+		return m[1] + strings.ToLower(m[2]) + m[3]
+	})
 }
 
 // normalizeSyntaxErrorNear normalizes the "near '...'" portion of syntax error
