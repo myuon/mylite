@@ -1364,6 +1364,46 @@ func allCharsets() [][]interface{} {
 }
 
 // isKnownCharset returns true if the charset name is a valid MySQL character set.
+// expandSQLMode expands MySQL combination sql_mode values into their component modes.
+func expandSQLMode(mode string) string {
+	switch strings.TrimSpace(mode) {
+	case "ANSI":
+		return "REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,ANSI"
+	case "TRADITIONAL":
+		return "STRICT_TRANS_TABLES,STRICT_ALL_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION,TRADITIONAL"
+	default:
+		return mode
+	}
+}
+
+// normalizeEngineName returns the canonical MySQL engine name for a given input.
+func normalizeEngineName(name string) string {
+	switch strings.ToUpper(name) {
+	case "INNODB":
+		return "InnoDB"
+	case "MYISAM":
+		return "MyISAM"
+	case "MERGE", "MRG_MYISAM":
+		return "MRG_MYISAM"
+	case "MEMORY", "HEAP":
+		return "MEMORY"
+	case "CSV":
+		return "CSV"
+	case "ARCHIVE":
+		return "ARCHIVE"
+	case "BLACKHOLE":
+		return "BLACKHOLE"
+	case "FEDERATED":
+		return "FEDERATED"
+	case "NDB", "NDBCLUSTER":
+		return "ndbcluster"
+	case "PERFORMANCE_SCHEMA":
+		return "PERFORMANCE_SCHEMA"
+	default:
+		return name
+	}
+}
+
 func isKnownCharset(name string) bool {
 	name = strings.ToLower(name)
 	// Also accept utf8mb3 as alias for utf8
@@ -3754,7 +3794,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			if strings.ToUpper(val) == "DEFAULT" {
 				e.sqlMode = ""
 			} else {
-				e.sqlMode = strings.ToUpper(val)
+				e.sqlMode = expandSQLMode(strings.ToUpper(val))
 			}
 		case "sql_auto_is_null":
 			e.sqlAutoIsNull = val == "1" || strings.ToUpper(val) == "ON" || strings.ToUpper(val) == "TRUE"
@@ -4340,6 +4380,48 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'innodb_commit_concurrency' can't be set to the value of '%v'", evalVal))
 					}
 					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", newVal)
+				} else if cleanName == "default_storage_engine" || cleanName == "default_tmp_storage_engine" || cleanName == "storage_engine" {
+					// Normalize engine names for storage engine variables
+					if _, isNull := expr.Expr.(*sqlparser.NullVal); isNull {
+						return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of 'NULL'", cleanName))
+					}
+					isNumeric := false
+					if _, isUnary := expr.Expr.(*sqlparser.UnaryExpr); isUnary {
+						isNumeric = true
+					}
+					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
+						litStr := strings.TrimSpace(sqlparser.String(lit))
+						unquoted := strings.Trim(litStr, "'\"")
+						if _, numErr := strconv.ParseFloat(unquoted, 64); numErr == nil {
+							isNumeric = true
+						}
+					}
+					if !isNumeric {
+						testVal := strings.Trim(val, "'\"")
+						if _, numErr := strconv.ParseFloat(testVal, 64); numErr == nil && testVal != "" {
+							isNumeric = true
+						}
+					}
+					if isNumeric {
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+					}
+					normalized := normalizeEngineName(val)
+					knownEngines := map[string]bool{
+						"InnoDB": true, "MyISAM": true, "MRG_MYISAM": true, "MEMORY": true,
+						"CSV": true, "ARCHIVE": true, "BLACKHOLE": true, "FEDERATED": true,
+						"PERFORMANCE_SCHEMA": true, "ndbcluster": true, "TEMPTABLE": true,
+					}
+					if !knownEngines[normalized] {
+						return nil, mysqlError(1286, "42000", fmt.Sprintf("Unknown storage engine '%s'", val))
+					}
+					if isGlobal {
+						e.globalScopeVars[cleanName] = normalized
+						if prevVal, had := savedSessionVal[cleanName]; had {
+							e.sessionScopeVars[cleanName] = prevVal
+						}
+					} else {
+						e.sessionScopeVars[cleanName] = normalized
+					}
 				} else {
 					// Evaluate expression
 					evalVal, err := e.evalExpr(expr.Expr)
@@ -4576,6 +4658,13 @@ func (e *Executor) handleRawSet(raw string) error {
 			return mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", val))
 		}
 		val = strings.Trim(val, "'\"")
+		// Normalize engine names for storage engine variables
+		if varName == "default_storage_engine" || varName == "default_tmp_storage_engine" || varName == "storage_engine" {
+			if _, err := strconv.ParseFloat(val, 64); err == nil {
+				return mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", varName))
+			}
+			val = normalizeEngineName(val)
+		}
 		if strings.ToUpper(val) != "DEFAULT" {
 			e.setSysVar(varName, val, isGlobalScope)
 		} else {
@@ -7670,6 +7759,17 @@ func (e *Executor) execMyliteCommand(query string) (*Result, error) {
 			}
 		}
 		e.tempTables = make(map[string]bool)
+		return &Result{}, nil
+	}
+
+	if restUpper == "RESET_SESSION" {
+		// Reset session state between tests
+		e.lastInsertID = 0
+		e.lastAutoIncID = 0
+		e.sessionScopeVars = make(map[string]string)
+		e.sqlMode = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+		e.userVars = make(map[string]interface{})
+		e.preparedStmts = make(map[string]string)
 		return &Result{}, nil
 	}
 

@@ -986,9 +986,9 @@ var skipTests = map[string]bool{
 	"sys_vars/create_admin_listener_thread_basic":            true,
 	"sys_vars/cte_max_recursion_depth_func":                  true,
 	"sys_vars/default_collation_for_utf8mb4":                 true,
-	"sys_vars/default_storage_engine_basic":                  true,
+	// "sys_vars/default_storage_engine_basic": true, // now passes - engine name normalization
 	"sys_vars/default_table_encryption_basic":                true,
-	"sys_vars/default_tmp_storage_engine_basic":              true,
+	// "sys_vars/default_tmp_storage_engine_basic": true, // now passes - engine name normalization
 	"sys_vars/default_week_format_func":                      true,
 	"sys_vars/delay_key_write_basic":                         true,
 	"sys_vars/delayed_insert_timeout_basic":                  true,

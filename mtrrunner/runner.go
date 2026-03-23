@@ -70,6 +70,8 @@ func (r *Runner) RunFile(testPath string) TestResult {
 
 	// Reset state: ensure we're in the test database and clean up leftover tables
 	r.DB.Exec("USE test") //nolint:errcheck
+	// Reset session state (lastInsertID, user vars, sql_mode, etc.)
+	r.DB.Exec("MYLITE RESET_SESSION") //nolint:errcheck
 	// Drop all tables from previous test (including temporary tables via MYLITE)
 	r.DB.Exec("MYLITE RESET_TEMP_TABLES") //nolint:errcheck
 	if rows, err2 := r.DB.Query("SHOW TABLES"); err2 == nil {
