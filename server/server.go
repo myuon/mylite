@@ -286,7 +286,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 		s.mu.Unlock()
 	}()
 
-	handler := &Handler{srv: s, executor: s.Executor.Clone()}
+	connExec := s.Executor.Clone()
+	handler := &Handler{srv: s, executor: connExec}
+	defer connExec.OnDisconnect()
 
 	// Create a MySQL connection with no auth
 	mysqlConn, err := gomysql.NewConn(conn, "root", "", handler)

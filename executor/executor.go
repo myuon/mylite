@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -190,6 +191,12 @@ type Executor struct {
 	// psTruncated tracks performance_schema tables that have been TRUNCATED.
 	// These tables return empty result sets until data is re-inserted.
 	psTruncated map[string]bool
+	// connectionID is the unique ID for this executor's connection.
+	connectionID int64
+	// nextConnID is a shared atomic counter for generating connection IDs.
+	nextConnID *atomic.Int64
+	// lockManager manages user-level named locks (GET_LOCK, RELEASE_LOCK, etc.).
+	lockManager *LockManager
 }
 
 // Warning represents a MySQL warning.
@@ -202,6 +209,40 @@ type Warning struct {
 // addWarning adds a warning to the current statement's warning list.
 func (e *Executor) addWarning(level string, code int, message string) {
 	e.warnings = append(e.warnings, Warning{Level: level, Code: code, Message: message})
+}
+
+// Clone creates a new Executor that shares the same Catalog, Storage,
+// globalScopeVars, startupVars, and lockManager but has its own fresh
+// per-session state. Used to give each connection its own executor.
+func (e *Executor) Clone() *Executor {
+	defaultTZ := time.FixedZone("GMT-3", 3*60*60)
+	return &Executor{
+		Catalog:          e.Catalog,
+		Storage:          e.Storage,
+		CurrentDB:        "test",
+		sqlMode:          "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+		snapshots:        make(map[string]*fullSnapshot),
+		userVars:         make(map[string]interface{}),
+		preparedStmts:    make(map[string]string),
+		tempTables:       make(map[string]bool),
+		globalScopeVars:  e.globalScopeVars,
+		sessionScopeVars: make(map[string]string),
+		startupVars:      e.startupVars,
+		timeZone:         defaultTZ,
+		DataDir:          e.DataDir,
+		SearchPaths:      e.SearchPaths,
+		psTruncated:      e.psTruncated,
+		nextConnID:       e.nextConnID,
+		connectionID:     e.nextConnID.Add(1),
+		lockManager:      e.lockManager,
+	}
+}
+
+// OnDisconnect releases all named locks held by this executor's connection.
+func (e *Executor) OnDisconnect() {
+	if e.lockManager != nil {
+		e.lockManager.ReleaseAllLocks(e.connectionID)
+	}
 }
 
 // getSysVar reads a system variable with proper scope resolution:
@@ -273,6 +314,7 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	// MySQL test suite (MTR) defaults to timezone GMT-3 (= UTC+3).
 	// We mirror this so SET TIMESTAMP + CURRENT_TIME() match expected results.
 	defaultTZ := time.FixedZone("GMT-3", 3*60*60)
+	nextConnID := &atomic.Int64{}
 	e := &Executor{
 		Catalog:       cat,
 		Storage:       store,
@@ -290,34 +332,13 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		startupVars: map[string]string{
 			"innodb_commit_concurrency": "0",
 		},
-		timeZone: defaultTZ,
+		timeZone:     defaultTZ,
+		nextConnID:   nextConnID,
+		connectionID: nextConnID.Add(1),
+		lockManager:  NewLockManager(),
 	}
 	e.initSystemTables()
 	return e
-}
-
-// Clone creates a new Executor that shares the same Catalog, Storage,
-// globalScopeVars, and startupVars but has its own fresh per-session state.
-// This is used to give each connection its own executor instance.
-func (e *Executor) Clone() *Executor {
-	defaultTZ := time.FixedZone("GMT-3", 3*60*60)
-	return &Executor{
-		Catalog:          e.Catalog,
-		Storage:          e.Storage,
-		CurrentDB:        "test",
-		sqlMode:          "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
-		snapshots:        make(map[string]*fullSnapshot),
-		userVars:         make(map[string]interface{}),
-		preparedStmts:    make(map[string]string),
-		tempTables:       make(map[string]bool),
-		globalScopeVars:  e.globalScopeVars,
-		sessionScopeVars: make(map[string]string),
-		startupVars:      e.startupVars,
-		timeZone:         defaultTZ,
-		DataDir:          e.DataDir,
-		SearchPaths:      e.SearchPaths,
-		psTruncated:      e.psTruncated,
-	}
 }
 
 // SetStartupVar sets a variable as a startup default. This is used by the test
@@ -18827,15 +18848,47 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.LockingFunc:
 		switch v.Type {
 		case sqlparser.GetLock:
-			return int64(1), nil
+			nameVal, err := e.evalExpr(v.Name)
+			if err != nil {
+				return nil, err
+			}
+			if nameVal == nil {
+				return nil, nil
+			}
+			timeoutVal, err := e.evalExpr(v.Timeout)
+			if err != nil {
+				return nil, err
+			}
+			return e.lockManager.GetLock(e.connectionID, toString(nameVal), toFloat(timeoutVal)), nil
 		case sqlparser.IsFreeLock:
-			return int64(1), nil
+			nameVal, err := e.evalExpr(v.Name)
+			if err != nil {
+				return nil, err
+			}
+			if nameVal == nil {
+				return nil, nil
+			}
+			return e.lockManager.IsFreeLock(toString(nameVal)), nil
 		case sqlparser.IsUsedLock:
-			return nil, nil
+			nameVal, err := e.evalExpr(v.Name)
+			if err != nil {
+				return nil, err
+			}
+			if nameVal == nil {
+				return nil, nil
+			}
+			return e.lockManager.IsUsedLock(toString(nameVal)), nil
 		case sqlparser.ReleaseLock:
-			return int64(1), nil
+			nameVal, err := e.evalExpr(v.Name)
+			if err != nil {
+				return nil, err
+			}
+			if nameVal == nil {
+				return nil, nil
+			}
+			return e.lockManager.ReleaseLock(e.connectionID, toString(nameVal)), nil
 		case sqlparser.ReleaseAllLocks:
-			return int64(0), nil
+			return e.lockManager.ReleaseAllLocks(e.connectionID), nil
 		default:
 			return int64(0), nil
 		}
@@ -20915,7 +20968,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 	case "current_user":
 		return "root@localhost", nil
 	case "connection_id":
-		return int64(1), nil
+		return e.connectionID, nil
 	case "found_rows":
 		return e.lastFoundRows, nil
 	case "collation":
@@ -21131,6 +21184,60 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		return bcCount, nil
 	case "sleep":
 		return int64(0), nil
+	case "get_lock":
+		if len(v.Exprs) < 2 {
+			return nil, fmt.Errorf("GET_LOCK requires 2 arguments")
+		}
+		glName, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		glTimeout, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		if glName == nil {
+			return nil, nil
+		}
+		return e.lockManager.GetLock(e.connectionID, toString(glName), toFloat(glTimeout)), nil
+	case "release_lock":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("RELEASE_LOCK requires 1 argument")
+		}
+		rlName, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if rlName == nil {
+			return nil, nil
+		}
+		return e.lockManager.ReleaseLock(e.connectionID, toString(rlName)), nil
+	case "is_free_lock":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("IS_FREE_LOCK requires 1 argument")
+		}
+		iflName, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if iflName == nil {
+			return nil, nil
+		}
+		return e.lockManager.IsFreeLock(toString(iflName)), nil
+	case "is_used_lock":
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("IS_USED_LOCK requires 1 argument")
+		}
+		iulName, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if iulName == nil {
+			return nil, nil
+		}
+		return e.lockManager.IsUsedLock(toString(iulName)), nil
+	case "release_all_locks":
+		return e.lockManager.ReleaseAllLocks(e.connectionID), nil
 	case "user", "session_user", "system_user":
 		return "root@localhost", nil
 	case "space":

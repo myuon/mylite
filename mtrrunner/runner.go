@@ -325,6 +325,8 @@ type execContext struct {
 	ttsBackups       map[string]tableSnapshot
 	errorConn        *sql.Conn // cached connection for --error expected error handling
 	pendingSendByConn map[string]*pendingSend // keyed by connection name ("" for default)
+	pendingSendNext   bool                    // next SQL statement should be sent asynchronously
+	pendingSendEval   bool                    // pending send should use variable substitution
 }
 
 type tableSnapshot struct {
@@ -1182,11 +1184,16 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 
 	case "send", "send_eval":
 		// send <query> — dispatch query asynchronously on the current connection
+		// If no query on the same line, it will be provided on the next line
+		// (handled by the caller setting pendingSendNext)
 		query := strings.TrimSpace(args)
 		query = strings.TrimSuffix(query, ";")
 		query = strings.TrimSpace(query)
 		if query == "" {
-			return true, false, fmt.Errorf("send directive has no query")
+			// Mark that the next SQL statement should be sent asynchronously
+			ctx.pendingSendNext = true
+			ctx.pendingSendEval = (name == "send_eval")
+			return true, false, nil
 		}
 		// Variable substitution for send_eval
 		if name == "send_eval" {
@@ -1788,6 +1795,15 @@ func formatResultCell(v interface{}) string {
 func (ctx *execContext) executeSQL(stmt string) error {
 	// Variable substitution
 	stmt = ctx.substituteVars(stmt)
+
+	// If pendingSendNext is set, dispatch this SQL asynchronously via send
+	if ctx.pendingSendNext {
+		ctx.pendingSendNext = false
+		ctx.pendingSendEval = false
+		// Reuse the send handler by calling handleDirective with the query
+		_, _, err := ctx.handleDirective("send " + stmt)
+		return err
+	}
 
 	// Echo the SQL statement to output (mysqltest default behavior)
 	if ctx.queryLogEnabled {
