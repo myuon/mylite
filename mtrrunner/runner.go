@@ -870,7 +870,8 @@ func (ctx *execContext) executeLines(lines []string) error {
 
 		if len(stmts) <= 1 {
 			// Single statement: echo raw lines preserving original formatting
-			if ctx.queryLogEnabled {
+			// Don't echo if this is a pending send (async dispatch)
+			if ctx.queryLogEnabled && !ctx.pendingSendNext {
 				for _, rl := range rawLines {
 					if rl == "" {
 						continue // Skip blank lines in SQL echo (mysqltest doesn't output them)
@@ -1832,6 +1833,15 @@ func (ctx *execContext) executeSQL(stmt string) error {
 func (ctx *execContext) executeSQLNoEcho(stmt string) error {
 	// Variable substitution
 	stmt = ctx.substituteVars(stmt)
+
+	// If pendingSendNext is set, dispatch this SQL asynchronously via send
+	if ctx.pendingSendNext {
+		ctx.pendingSendNext = false
+		ctx.pendingSendEval = false
+		_, _, err := ctx.handleDirective("send " + stmt)
+		return err
+	}
+
 	return ctx.executeSQLInner(stmt)
 }
 

@@ -21021,7 +21021,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 	case "current_user":
 		return "root@localhost", nil
 	case "connection_id":
-		return int64(1), nil
+		return e.connectionID, nil
 	case "found_rows":
 		return e.lastFoundRows, nil
 	case "collation":

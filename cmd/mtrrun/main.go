@@ -1974,7 +1974,7 @@ var skipTests = map[string]bool{
 	"other/type_enum":                           true,
 	"other/unsafe_binlog_innodb":                true,
 	"other/user_limits":                         true,
-	"other/user_lock":                           true,
+	"other/user_lock":                           true, // hangs at deadlock detection (FT-11)
 	"other/window_functions_big":                true,
 	"other/wl6661":                              true,
 	"other/xa_applier_crash_mdl":                true,
