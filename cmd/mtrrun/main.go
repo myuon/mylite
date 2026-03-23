@@ -520,8 +520,7 @@ var skipTests = map[string]bool{
 	// "innodb/innodb-bug14219515": true, // now passes
 	// IMPORT/EXPORT partition
 	"innodb/innodb-import-partition": true,
-	// Index with UCS2 charset
-	"innodb/innodb-index_ucs2": true,
+	// "innodb/innodb-index_ucs2": true, // now passes
 	// Large prefix index
 	"innodb/innodb-large-prefix": true,
 	// Semi-consistent read (multi-connection)
@@ -1105,7 +1104,7 @@ var skipTests = map[string]bool{
 	"sys_vars/net_buffer_length_basic":                       true,
 	"sys_vars/new_basic":                                     true,
 	"sys_vars/ngram_token_size_basic":                        true,
-	"sys_vars/offline_mode_basic":                            true,
+	// "sys_vars/offline_mode_basic": true, // now passes
 	"sys_vars/optimizer_switch_basic":                        true,
 	"sys_vars/optimizer_trace_basic":                         true,
 	"sys_vars/optimizer_trace_features_basic":                true,
@@ -1117,7 +1116,7 @@ var skipTests = map[string]bool{
 	"sys_vars/print_identified_with_as_hex_basic":            true,
 	"sys_vars/pseudo_slave_mode_basic":                       true,
 	"sys_vars/pseudo_thread_id_basic":                        true,
-	"sys_vars/query_prealloc_size_func":                      true,
+	// "sys_vars/query_prealloc_size_func": true, // now passes
 	"sys_vars/rand_seed1_basic":                              true,
 	"sys_vars/rand_seed2_basic":                              true,
 	"sys_vars/range_optimizer_max_mem_size_basic":            true,
@@ -1133,7 +1132,7 @@ var skipTests = map[string]bool{
 	"sys_vars/server_id_bits_basic":                          true,
 	"sys_vars/session_track_gtids_basic":                     true,
 	"sys_vars/session_track_schema_basic":                    true,
-	"sys_vars/session_track_state_change_basic":              true,
+	// "sys_vars/session_track_state_change_basic": true, // now passes
 	"sys_vars/session_track_system_variables_basic":          true,
 	"sys_vars/show_old_temporals_basic":                      true,
 	"sys_vars/slave_parallel_type_basic":                     true,
@@ -1147,7 +1146,7 @@ var skipTests = map[string]bool{
 	"sys_vars/sql_buffer_result_basic":                       true,
 	"sys_vars/sql_buffer_result_func":                        true,
 	"sys_vars/sql_log_bin_basic":                             true,
-	"sys_vars/sql_log_off_func":                              true,
+	// "sys_vars/sql_log_off_func": true, // now passes
 	"sys_vars/sql_mode_basic":                                true,
 	"sys_vars/sql_mode_func":                                 true,
 	"sys_vars/sql_notes_func":                                true,
@@ -1695,7 +1694,7 @@ var skipTests = map[string]bool{
 	"other/subquery_sj_innodb_none_bka_nixbnl":     true,
 	"other/subselect_innodb":                       true,
 	"other/sum_distinct":                           true,
-	"other/synchronization":                        true,
+	// "other/synchronization": true, // now passes
 	"other/table_lock_skip_lock_nowait":            true,
 	"other/tablelock":                              true,
 	"other/temptable_disk":                         true,
@@ -2034,7 +2033,7 @@ var skipTests = map[string]bool{
 	"other/server_offline_1": true,
 	"other/server_offline_2": true,
 	"other/server_offline_3": true,
-	"other/server_offline_3_myisam": true,
+	// "other/server_offline_3_myisam": true, // now passes
 	"other/server_offline_4": true,
 	"other/server_offline_5": true,
 	"other/server_offline_6": true,
@@ -2093,7 +2092,7 @@ var skipTests = map[string]bool{
 	"other/fulltext2": true,
 	"other/fulltext3": true,
 	"other/fulltext_cache": true,
-	"other/fulltext_distinct": true,
+	// "other/fulltext_distinct": true, // now passes
 	"other/fulltext_left_join": true,
 	"other/fulltext_multi": true,
 	"other/fulltext_order_by": true,
