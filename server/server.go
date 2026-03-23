@@ -58,6 +58,14 @@ func (h *Handler) HandleQuery(query string) (*mysql.Result, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	// Set query info in process list
+	pl := h.executor.GetProcessList()
+	connID := h.executor.GetConnectionID()
+	if pl != nil {
+		pl.SetQuery(connID, query, "executing")
+		defer pl.ClearQuery(connID)
+	}
+
 	result, err := h.executor.Execute(query)
 	if err != nil {
 		errMsg := err.Error()
@@ -127,6 +135,14 @@ func (h *Handler) HandleStmtExecute(context interface{}, query string, args []in
 
 	// Replace ? placeholders with the provided argument values
 	finalQuery := replacePlaceholders(storedQuery, args)
+
+	// Set query info in process list
+	pl := h.executor.GetProcessList()
+	connID := h.executor.GetConnectionID()
+	if pl != nil {
+		pl.SetQuery(connID, finalQuery, "executing")
+		defer pl.ClearQuery(connID)
+	}
 
 	result, err := h.executor.Execute(finalQuery)
 	if err != nil {
@@ -279,16 +295,27 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
+	connExec := s.Executor.Clone()
+	handler := &Handler{srv: s, executor: connExec}
+	connID := connExec.GetConnectionID()
+
+	// Register connection in the process list
+	pl := connExec.GetProcessList()
+	if pl != nil {
+		pl.RegisterWithID(connID, "root", conn.RemoteAddr().String(), connExec.CurrentDB)
+	}
+
 	defer func() {
+		connExec.OnDisconnect()
+		// Unregister from process list
+		if pl != nil {
+			pl.Unregister(connID)
+		}
 		conn.Close()
 		s.mu.Lock()
 		delete(s.conns, conn)
 		s.mu.Unlock()
 	}()
-
-	connExec := s.Executor.Clone()
-	handler := &Handler{srv: s, executor: connExec}
-	defer connExec.OnDisconnect()
 
 	// Create a MySQL connection with no auth
 	mysqlConn, err := gomysql.NewConn(conn, "root", "", handler)

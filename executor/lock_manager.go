@@ -5,134 +5,147 @@ import (
 	"time"
 )
 
-// LockManager manages user-level named locks (GET_LOCK, RELEASE_LOCK, etc.).
+// LockManager manages MySQL user-level locks (GET_LOCK/RELEASE_LOCK).
 type LockManager struct {
-	mu     sync.Mutex
-	named  map[string]*namedLockEntry
-	byConn map[int64]map[string]bool
+	mu    sync.Mutex
+	locks map[string]*userLock // lock name -> lock info
 }
 
-type namedLockEntry struct {
-	owner int64
-	ch    chan struct{} // closed when released
+type userLock struct {
+	ownerID int64         // connection ID that owns the lock
+	ch      chan struct{} // closed when the lock is released
 }
 
 // NewLockManager creates a new LockManager.
 func NewLockManager() *LockManager {
 	return &LockManager{
-		named:  make(map[string]*namedLockEntry),
-		byConn: make(map[int64]map[string]bool),
+		locks: make(map[string]*userLock),
 	}
 }
 
-// GetLock acquires a named lock. Returns 1 on success, 0 on timeout.
-func (lm *LockManager) GetLock(connID int64, name string, timeoutSec float64) interface{} {
-	// Truncate name to 64 chars (MySQL behavior)
-	if len(name) > 64 {
-		name = name[:64]
-	}
+// GetLock tries to acquire a named lock with a timeout (in seconds).
+// Returns 1 if acquired, 0 if timed out, nil if error.
+// The connID identifies the connection requesting the lock.
+// If setStateFn is non-nil, it is called with "User lock" before blocking
+// and with "" after acquiring.
+func (lm *LockManager) GetLock(name string, timeout float64, connID int64, setStateFn func(string)) int64 {
+	lm.mu.Lock()
 
-	for {
-		lm.mu.Lock()
-		entry := lm.named[name]
-
-		if entry == nil || entry.owner == 0 {
-			// Lock is free, acquire it
-			lm.named[name] = &namedLockEntry{owner: connID, ch: make(chan struct{})}
-			if lm.byConn[connID] == nil {
-				lm.byConn[connID] = make(map[string]bool)
-			}
-			lm.byConn[connID][name] = true
-			lm.mu.Unlock()
-			return int64(1)
-		}
-
-		if entry.owner == connID {
-			// Re-entrant: same connection already holds this lock
-			lm.mu.Unlock()
-			return int64(1)
-		}
-
-		// Lock held by another connection, wait
-		waitCh := entry.ch
+	existing, exists := lm.locks[name]
+	if exists && existing.ownerID == connID {
+		// Already own it - re-entrant
 		lm.mu.Unlock()
+		return 1
+	}
 
-		if timeoutSec <= 0 {
-			return int64(0)
+	if !exists {
+		// Lock is free, acquire it
+		lm.locks[name] = &userLock{
+			ownerID: connID,
+			ch:      make(chan struct{}),
 		}
+		lm.mu.Unlock()
+		return 1
+	}
 
-		timer := time.NewTimer(time.Duration(timeoutSec * float64(time.Second)))
-		select {
-		case <-waitCh:
-			timer.Stop()
-			// Lock was released, try to acquire (loop back)
-			timeoutSec = 0 // Only try once more without waiting
-			continue
-		case <-timer.C:
-			return int64(0)
+	// Lock is held by another connection - we need to wait
+	waitCh := existing.ch
+	lm.mu.Unlock()
+
+	// Set state to "User lock" while waiting
+	if setStateFn != nil {
+		setStateFn("User lock")
+	}
+
+	if timeout <= 0 {
+		// No wait
+		if setStateFn != nil {
+			setStateFn("")
 		}
+		return 0
+	}
+
+	timer := time.NewTimer(time.Duration(timeout * float64(time.Second)))
+	defer timer.Stop()
+
+	select {
+	case <-waitCh:
+		// Lock was released, try to acquire
+		if setStateFn != nil {
+			setStateFn("")
+		}
+		lm.mu.Lock()
+		// Check again - someone else might have grabbed it
+		if _, stillExists := lm.locks[name]; !stillExists {
+			lm.locks[name] = &userLock{
+				ownerID: connID,
+				ch:      make(chan struct{}),
+			}
+			lm.mu.Unlock()
+			return 1
+		}
+		lm.mu.Unlock()
+		return 0
+	case <-timer.C:
+		if setStateFn != nil {
+			setStateFn("")
+		}
+		return 0
 	}
 }
 
-// ReleaseLock releases a named lock. Returns 1 if released, 0 if not held by this conn, nil if doesn't exist.
-func (lm *LockManager) ReleaseLock(connID int64, name string) interface{} {
-	if len(name) > 64 {
-		name = name[:64]
-	}
+// ReleaseLock releases a named lock. Returns 1 if released, 0 if not owned by this connection, nil if not exists.
+func (lm *LockManager) ReleaseLock(name string, connID int64) interface{} {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
-	entry := lm.named[name]
-	if entry == nil {
+	existing, exists := lm.locks[name]
+	if !exists {
 		return nil
 	}
-	if entry.owner != connID {
+	if existing.ownerID != connID {
 		return int64(0)
 	}
 
-	close(entry.ch)
-	entry.owner = 0
-	delete(lm.byConn[connID], name)
-	delete(lm.named, name)
+	close(existing.ch)
+	delete(lm.locks, name)
 	return int64(1)
 }
 
-// IsFreeLock returns 1 if the named lock is free, 0 if in use.
-func (lm *LockManager) IsFreeLock(name string) int64 {
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-	entry := lm.named[name]
-	if entry == nil || entry.owner == 0 {
-		return 1
-	}
-	return 0
-}
-
-// IsUsedLock returns the connectionID holding the lock, or nil if free.
-func (lm *LockManager) IsUsedLock(name string) interface{} {
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-	entry := lm.named[name]
-	if entry == nil || entry.owner == 0 {
-		return nil
-	}
-	return entry.owner
-}
-
-// ReleaseAllLocks releases all named locks held by a connection. Returns count released.
+// ReleaseAllLocks releases all locks held by a connection. Returns the count released.
 func (lm *LockManager) ReleaseAllLocks(connID int64) int64 {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
-	locks := lm.byConn[connID]
-	count := int64(0)
-	for name := range locks {
-		if entry := lm.named[name]; entry != nil && entry.owner == connID {
-			close(entry.ch)
-			delete(lm.named, name)
+	var count int64
+	for name, lock := range lm.locks {
+		if lock.ownerID == connID {
+			close(lock.ch)
+			delete(lm.locks, name)
 			count++
 		}
 	}
-	delete(lm.byConn, connID)
 	return count
+}
+
+// IsFreeLock checks if a lock name is free. Returns 1 if free, 0 if in use.
+func (lm *LockManager) IsFreeLock(name string) int64 {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	if _, exists := lm.locks[name]; exists {
+		return 0
+	}
+	return 1
+}
+
+// IsUsedLock checks if a lock is in use. Returns the connection ID of the owner, or nil.
+func (lm *LockManager) IsUsedLock(name string) interface{} {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	if lock, exists := lm.locks[name]; exists {
+		return lock.ownerID
+	}
+	return nil
 }

@@ -191,11 +191,15 @@ type Executor struct {
 	// psTruncated tracks performance_schema tables that have been TRUNCATED.
 	// These tables return empty result sets until data is re-inserted.
 	psTruncated map[string]bool
-	// connectionID is the unique ID for this executor's connection.
+	// processList is a shared registry of active connections and their states.
+	// It is shared across all executor instances (connections).
+	processList *ProcessList
+	// connectionID is the unique ID of this connection.
 	connectionID int64
-	// nextConnID is a shared atomic counter for generating connection IDs.
+	// nextConnID is a shared counter for generating unique connection IDs.
 	nextConnID *atomic.Int64
-	// lockManager manages user-level named locks (GET_LOCK, RELEASE_LOCK, etc.).
+	// lockManager manages user-level locks (GET_LOCK/RELEASE_LOCK).
+	// Shared across all executor instances.
 	lockManager *LockManager
 }
 
@@ -209,40 +213,6 @@ type Warning struct {
 // addWarning adds a warning to the current statement's warning list.
 func (e *Executor) addWarning(level string, code int, message string) {
 	e.warnings = append(e.warnings, Warning{Level: level, Code: code, Message: message})
-}
-
-// Clone creates a new Executor that shares the same Catalog, Storage,
-// globalScopeVars, startupVars, and lockManager but has its own fresh
-// per-session state. Used to give each connection its own executor.
-func (e *Executor) Clone() *Executor {
-	defaultTZ := time.FixedZone("GMT-3", 3*60*60)
-	return &Executor{
-		Catalog:          e.Catalog,
-		Storage:          e.Storage,
-		CurrentDB:        "test",
-		sqlMode:          "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
-		snapshots:        make(map[string]*fullSnapshot),
-		userVars:         make(map[string]interface{}),
-		preparedStmts:    make(map[string]string),
-		tempTables:       make(map[string]bool),
-		globalScopeVars:  e.globalScopeVars,
-		sessionScopeVars: make(map[string]string),
-		startupVars:      e.startupVars,
-		timeZone:         defaultTZ,
-		DataDir:          e.DataDir,
-		SearchPaths:      e.SearchPaths,
-		psTruncated:      e.psTruncated,
-		nextConnID:       e.nextConnID,
-		connectionID:     e.nextConnID.Add(1),
-		lockManager:      e.lockManager,
-	}
-}
-
-// OnDisconnect releases all named locks held by this executor's connection.
-func (e *Executor) OnDisconnect() {
-	if e.lockManager != nil {
-		e.lockManager.ReleaseAllLocks(e.connectionID)
-	}
 }
 
 // getSysVar reads a system variable with proper scope resolution:
@@ -314,7 +284,6 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	// MySQL test suite (MTR) defaults to timezone GMT-3 (= UTC+3).
 	// We mirror this so SET TIMESTAMP + CURRENT_TIME() match expected results.
 	defaultTZ := time.FixedZone("GMT-3", 3*60*60)
-	nextConnID := &atomic.Int64{}
 	e := &Executor{
 		Catalog:       cat,
 		Storage:       store,
@@ -332,13 +301,65 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		startupVars: map[string]string{
 			"innodb_commit_concurrency": "0",
 		},
-		timeZone:     defaultTZ,
-		nextConnID:   nextConnID,
-		connectionID: nextConnID.Add(1),
-		lockManager:  NewLockManager(),
+		timeZone:   defaultTZ,
+		nextConnID: &atomic.Int64{},
 	}
+	e.connectionID = e.nextConnID.Add(1)
+	e.processList = NewProcessList()
+	e.lockManager = NewLockManager()
 	e.initSystemTables()
 	return e
+}
+
+// GetProcessList returns the shared ProcessList.
+func (e *Executor) GetProcessList() *ProcessList {
+	return e.processList
+}
+
+// GetLockManager returns the shared LockManager.
+func (e *Executor) GetLockManager() *LockManager {
+	return e.lockManager
+}
+
+// GetConnectionID returns the connection ID for this executor instance.
+func (e *Executor) GetConnectionID() int64 {
+	return e.connectionID
+}
+
+// Clone creates a new Executor that shares Catalog, Storage, globalScopeVars,
+// startupVars, lockManager, processList, and psTruncated, but has its own
+// fresh per-session state. Used to give each connection its own executor.
+func (e *Executor) Clone() *Executor {
+	defaultTZ := time.FixedZone("GMT-3", 3*60*60)
+	connID := e.nextConnID.Add(1)
+	return &Executor{
+		Catalog:          e.Catalog,
+		Storage:          e.Storage,
+		CurrentDB:        "test",
+		sqlMode:          "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+		snapshots:        make(map[string]*fullSnapshot),
+		userVars:         make(map[string]interface{}),
+		preparedStmts:    make(map[string]string),
+		tempTables:       make(map[string]bool),
+		globalScopeVars:  e.globalScopeVars,
+		sessionScopeVars: make(map[string]string),
+		startupVars:      e.startupVars,
+		timeZone:         defaultTZ,
+		DataDir:          e.DataDir,
+		SearchPaths:      e.SearchPaths,
+		psTruncated:      e.psTruncated,
+		nextConnID:       e.nextConnID,
+		connectionID:     connID,
+		lockManager:      e.lockManager,
+		processList:      e.processList,
+	}
+}
+
+// OnDisconnect releases all named locks held by this executor's connection.
+func (e *Executor) OnDisconnect() {
+	if e.lockManager != nil {
+		e.lockManager.ReleaseAllLocks(e.connectionID)
+	}
 }
 
 // SetStartupVar sets a variable as a startup default. This is used by the test
@@ -18848,6 +18869,9 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.LockingFunc:
 		switch v.Type {
 		case sqlparser.GetLock:
+			if e.lockManager == nil {
+				return int64(1), nil
+			}
 			nameVal, err := e.evalExpr(v.Name)
 			if err != nil {
 				return nil, err
@@ -18855,12 +18879,29 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			if nameVal == nil {
 				return nil, nil
 			}
-			timeoutVal, err := e.evalExpr(v.Timeout)
-			if err != nil {
-				return nil, err
+			lockName := fmt.Sprintf("%v", nameVal)
+			timeout := 0.0
+			if v.Timeout != nil {
+				tv, err := e.evalExpr(v.Timeout)
+				if err != nil {
+					return nil, err
+				}
+				timeout = toFloat(tv)
 			}
-			return e.lockManager.GetLock(e.connectionID, toString(nameVal), toFloat(timeoutVal)), nil
+			var setStateFn func(string)
+			if e.processList != nil && e.connectionID > 0 {
+				connID := e.connectionID
+				pl := e.processList
+				setStateFn = func(state string) {
+					pl.SetState(connID, state)
+				}
+			}
+			result := e.lockManager.GetLock(lockName, timeout, e.connectionID, setStateFn)
+			return result, nil
 		case sqlparser.IsFreeLock:
+			if e.lockManager == nil {
+				return int64(1), nil
+			}
 			nameVal, err := e.evalExpr(v.Name)
 			if err != nil {
 				return nil, err
@@ -18868,8 +18909,12 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			if nameVal == nil {
 				return nil, nil
 			}
-			return e.lockManager.IsFreeLock(toString(nameVal)), nil
+			lockName := fmt.Sprintf("%v", nameVal)
+			return e.lockManager.IsFreeLock(lockName), nil
 		case sqlparser.IsUsedLock:
+			if e.lockManager == nil {
+				return nil, nil
+			}
 			nameVal, err := e.evalExpr(v.Name)
 			if err != nil {
 				return nil, err
@@ -18877,8 +18922,12 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			if nameVal == nil {
 				return nil, nil
 			}
-			return e.lockManager.IsUsedLock(toString(nameVal)), nil
+			lockName := fmt.Sprintf("%v", nameVal)
+			return e.lockManager.IsUsedLock(lockName), nil
 		case sqlparser.ReleaseLock:
+			if e.lockManager == nil {
+				return int64(1), nil
+			}
 			nameVal, err := e.evalExpr(v.Name)
 			if err != nil {
 				return nil, err
@@ -18886,8 +18935,12 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			if nameVal == nil {
 				return nil, nil
 			}
-			return e.lockManager.ReleaseLock(e.connectionID, toString(nameVal)), nil
+			lockName := fmt.Sprintf("%v", nameVal)
+			return e.lockManager.ReleaseLock(lockName, e.connectionID), nil
 		case sqlparser.ReleaseAllLocks:
+			if e.lockManager == nil {
+				return int64(0), nil
+			}
 			return e.lockManager.ReleaseAllLocks(e.connectionID), nil
 		default:
 			return int64(0), nil
@@ -20968,7 +21021,7 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 	case "current_user":
 		return "root@localhost", nil
 	case "connection_id":
-		return e.connectionID, nil
+		return int64(1), nil
 	case "found_rows":
 		return e.lastFoundRows, nil
 	case "collation":
@@ -21184,60 +21237,6 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		return bcCount, nil
 	case "sleep":
 		return int64(0), nil
-	case "get_lock":
-		if len(v.Exprs) < 2 {
-			return nil, fmt.Errorf("GET_LOCK requires 2 arguments")
-		}
-		glName, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		glTimeout, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, err
-		}
-		if glName == nil {
-			return nil, nil
-		}
-		return e.lockManager.GetLock(e.connectionID, toString(glName), toFloat(glTimeout)), nil
-	case "release_lock":
-		if len(v.Exprs) < 1 {
-			return nil, fmt.Errorf("RELEASE_LOCK requires 1 argument")
-		}
-		rlName, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if rlName == nil {
-			return nil, nil
-		}
-		return e.lockManager.ReleaseLock(e.connectionID, toString(rlName)), nil
-	case "is_free_lock":
-		if len(v.Exprs) < 1 {
-			return nil, fmt.Errorf("IS_FREE_LOCK requires 1 argument")
-		}
-		iflName, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if iflName == nil {
-			return nil, nil
-		}
-		return e.lockManager.IsFreeLock(toString(iflName)), nil
-	case "is_used_lock":
-		if len(v.Exprs) < 1 {
-			return nil, fmt.Errorf("IS_USED_LOCK requires 1 argument")
-		}
-		iulName, err := e.evalExpr(v.Exprs[0])
-		if err != nil {
-			return nil, err
-		}
-		if iulName == nil {
-			return nil, nil
-		}
-		return e.lockManager.IsUsedLock(toString(iulName)), nil
-	case "release_all_locks":
-		return e.lockManager.ReleaseAllLocks(e.connectionID), nil
 	case "user", "session_user", "system_user":
 		return "root@localhost", nil
 	case "space":

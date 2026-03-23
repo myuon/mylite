@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/myuon/mylite/storage"
 )
@@ -389,7 +390,39 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 	case "files":
 		rawRows = []storage.Row{{"FILE_NAME": "", "FILE_TYPE": "", "TABLESPACE_NAME": ""}}
 	case "processlist":
-		rawRows = []storage.Row{{"ID": int64(1), "USER": "root", "HOST": "localhost", "DB": e.CurrentDB, "COMMAND": "Sleep", "TIME": int64(0), "STATE": "", "INFO": nil}}
+		if e.processList != nil {
+			entries := e.processList.Snapshot()
+			rawRows = make([]storage.Row, 0, len(entries))
+			now := time.Now()
+			for _, entry := range entries {
+				elapsed := int64(now.Sub(entry.StartTime).Seconds())
+				var info interface{}
+				if entry.Info != "" {
+					info = entry.Info
+				} else {
+					info = nil
+				}
+				db := entry.DB
+				if db == "" {
+					db = "test"
+				}
+				rawRows = append(rawRows, storage.Row{
+					"ID":      entry.ID,
+					"USER":    entry.User,
+					"HOST":    entry.Host,
+					"DB":      db,
+					"COMMAND": entry.Command,
+					"TIME":    elapsed,
+					"STATE":   entry.State,
+					"INFO":    info,
+				})
+			}
+			if len(rawRows) == 0 {
+				rawRows = []storage.Row{{"ID": int64(1), "USER": "root", "HOST": "localhost", "DB": e.CurrentDB, "COMMAND": "Query", "TIME": int64(0), "STATE": "executing", "INFO": nil}}
+			}
+		} else {
+			rawRows = []storage.Row{{"ID": int64(1), "USER": "root", "HOST": "localhost", "DB": e.CurrentDB, "COMMAND": "Query", "TIME": int64(0), "STATE": "executing", "INFO": nil}}
+		}
 	case "key_column_usage":
 		rawRows = []storage.Row{{"CONSTRAINT_CATALOG": "def", "CONSTRAINT_SCHEMA": "", "CONSTRAINT_NAME": "", "TABLE_CATALOG": "def", "TABLE_SCHEMA": "", "TABLE_NAME": "", "COLUMN_NAME": "", "ORDINAL_POSITION": int64(1), "POSITION_IN_UNIQUE_CONSTRAINT": nil, "REFERENCED_TABLE_SCHEMA": nil, "REFERENCED_TABLE_NAME": nil, "REFERENCED_COLUMN_NAME": nil}}
 	case "referential_constraints":
