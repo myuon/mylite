@@ -495,8 +495,7 @@ var skipTests = map[string]bool{
 	"innodb/virtual_index": true,
 
 	// === innodb suite FAIL tests ===
-	// ALTER TABLE with page size validation
-	"innodb/alter_page_size": true,
+	// "innodb/alter_page_size": true, // now passes
 	// ALTER TABLE RENAME with extra features
 	"innodb/alter_rename_existing_xtra": true,
 	// ALTER TABLE stage progress monitoring
