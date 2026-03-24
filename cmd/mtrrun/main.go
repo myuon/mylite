@@ -687,9 +687,9 @@ var skipTests = map[string]bool{
 	"perfschema/digest_null_literal": true,
 	"perfschema/digest_table_full": true,
 	"perfschema/dml_esms_by_program": true,
-	"perfschema/dml_ews_by_account_by_event_name": true,
-	"perfschema/dml_ews_by_host_by_event_name": true,
-	"perfschema/dml_ews_by_user_by_event_name": true,
+	// "perfschema/dml_ews_by_account_by_event_name": true, // now passes
+	// "perfschema/dml_ews_by_host_by_event_name": true, // now passes
+	// "perfschema/dml_ews_by_user_by_event_name": true, // now passes
 	"perfschema/dml_file_instances": true,
 	"perfschema/dml_handler": true,
 	"perfschema/dml_os_global_by_type": true,
@@ -714,7 +714,7 @@ var skipTests = map[string]bool{
 	"perfschema/global_objects": true,
 	"perfschema/global_read_lock": true,
 	"perfschema/histograms": true,
-	"perfschema/idx_accounts": true,
+	// "perfschema/idx_accounts": true, // now passes
 	"perfschema/idx_compare_replication_applier_configuration": true,
 	"perfschema/idx_compare_replication_applier_status": true,
 	"perfschema/idx_compare_replication_applier_status_by_coordinator": true,
@@ -723,32 +723,32 @@ var skipTests = map[string]bool{
 	"perfschema/idx_compare_replication_connection_status": true,
 	// "perfschema/idx_cond_instances": true, // now passes
 	"perfschema/idx_data_lock_waits": true,
-	"perfschema/idx_ees_by_account_by_error": true,
-	"perfschema/idx_ees_by_host_by_error": true,
-	"perfschema/idx_ees_by_thread_by_error": true,
-	"perfschema/idx_ees_by_user_by_error": true,
-	"perfschema/idx_ees_global_by_error": true,
-	"perfschema/idx_esgs_by_account_by_event_name": true,
-	"perfschema/idx_esgs_by_host_by_event_name": true,
-	"perfschema/idx_esgs_by_thread_by_event_name": true,
-	"perfschema/idx_esgs_by_user_by_event_name": true,
-	"perfschema/idx_esgs_global_by_event_name": true,
+	// "perfschema/idx_ees_by_account_by_error": true, // now passes
+	// "perfschema/idx_ees_by_host_by_error": true, // now passes
+	// "perfschema/idx_ees_by_thread_by_error": true, // now passes
+	// "perfschema/idx_ees_by_user_by_error": true, // now passes
+	// "perfschema/idx_ees_global_by_error": true, // now passes
+	// "perfschema/idx_esgs_by_account_by_event_name": true, // now passes
+	// "perfschema/idx_esgs_by_host_by_event_name": true, // now passes
+	// "perfschema/idx_esgs_by_thread_by_event_name": true, // now passes
+	// "perfschema/idx_esgs_by_user_by_event_name": true, // now passes
+	// "perfschema/idx_esgs_global_by_event_name": true, // now passes
 	"perfschema/idx_esmh_by_digest": true,
-	"perfschema/idx_esmh_global": true,
-	"perfschema/idx_esms_by_account_by_event_name": true,
+	// "perfschema/idx_esmh_global": true, // now passes
+	// "perfschema/idx_esms_by_account_by_event_name": true, // now passes
 	"perfschema/idx_esms_by_digest": true,
-	"perfschema/idx_esms_by_host_by_event_name": true,
+	// "perfschema/idx_esms_by_host_by_event_name": true, // now passes
 	"perfschema/idx_esms_by_program": true,
-	"perfschema/idx_esms_by_thread_by_event_name": true,
+	// "perfschema/idx_esms_by_thread_by_event_name": true, // now passes
 	"perfschema/idx_esms_by_user_by_event_name": true,
-	"perfschema/idx_esms_global_by_event_name": true,
-	"perfschema/idx_ets_by_account_by_event_name": true,
-	"perfschema/idx_ets_by_host_by_event_name": true,
-	"perfschema/idx_ets_by_thread_by_event_name": true,
-	"perfschema/idx_ets_by_user_by_event_name": true,
-	"perfschema/idx_ets_global_by_event_name": true,
+	// "perfschema/idx_esms_global_by_event_name": true, // now passes
+	// "perfschema/idx_ets_by_account_by_event_name": true, // now passes
+	// "perfschema/idx_ets_by_host_by_event_name": true, // now passes
+	// "perfschema/idx_ets_by_thread_by_event_name": true, // now passes
+	// "perfschema/idx_ets_by_user_by_event_name": true, // now passes
+	// "perfschema/idx_ets_global_by_event_name": true, // now passes
 	"perfschema/idx_events_stages_current": true,
-	"perfschema/idx_events_stages_history": true,
+	// "perfschema/idx_events_stages_history": true, // now passes
 	"perfschema/idx_events_stages_history_long": true,
 	"perfschema/idx_events_statements_current": true,
 	"perfschema/idx_events_statements_history": true,
@@ -759,25 +759,25 @@ var skipTests = map[string]bool{
 	"perfschema/idx_events_waits_current": true,
 	"perfschema/idx_events_waits_history": true,
 	"perfschema/idx_events_waits_history_long": true,
-	"perfschema/idx_ews_by_account_by_event_name": true,
-	"perfschema/idx_ews_by_host_by_event_name": true,
-	"perfschema/idx_ews_by_instance": true,
-	"perfschema/idx_ews_by_thread_by_event_name": true,
-	"perfschema/idx_ews_by_user_by_event_name": true,
-	"perfschema/idx_ews_global_by_event_name": true,
+	// "perfschema/idx_ews_by_account_by_event_name": true, // now passes
+	// "perfschema/idx_ews_by_host_by_event_name": true, // now passes
+	// "perfschema/idx_ews_by_instance": true, // now passes
+	// "perfschema/idx_ews_by_thread_by_event_name": true, // now passes
+	// "perfschema/idx_ews_by_user_by_event_name": true, // now passes
+	// "perfschema/idx_ews_global_by_event_name": true, // now passes
 	// "perfschema/idx_file_instances": true, // now passes
-	"perfschema/idx_fs_by_event_name": true,
+	// "perfschema/idx_fs_by_event_name": true, // now passes
 	// "perfschema/idx_fs_by_instance": true, // now passes
 	// "perfschema/idx_global_status": true, // now passes
 	// "perfschema/idx_global_variables": true, // now passes
-	"perfschema/idx_hosts": true,
+	// "perfschema/idx_hosts": true, // now passes
 	"perfschema/idx_joins": true,
 	"perfschema/idx_keyring_keys": true,
-	"perfschema/idx_mems_by_account_by_event_name": true,
-	"perfschema/idx_mems_by_host_by_event_name": true,
-	"perfschema/idx_mems_by_thread_by_event_name": true,
-	"perfschema/idx_mems_by_user_by_event_name": true,
-	"perfschema/idx_mems_global_by_event_name": true,
+	// "perfschema/idx_mems_by_account_by_event_name": true, // now passes
+	// "perfschema/idx_mems_by_host_by_event_name": true, // now passes
+	// "perfschema/idx_mems_by_thread_by_event_name": true, // now passes
+	// "perfschema/idx_mems_by_user_by_event_name": true, // now passes
+	// "perfschema/idx_mems_global_by_event_name": true, // now passes
 	// "perfschema/idx_mutex_instances": true, // now passes
 	"perfschema/idx_os_global_by_type": true,
 	"perfschema/idx_performance_timers": true,
@@ -812,7 +812,7 @@ var skipTests = map[string]bool{
 	"perfschema/idx_tiws_by_index_usage": true,
 	"perfschema/idx_tiws_by_table": true,
 	"perfschema/idx_tlws_by_table": true,
-	"perfschema/idx_users": true,
+	// "perfschema/idx_users": true, // now passes
 	"perfschema/idx_uvar_by_thread": true,
 	"perfschema/idx_variables_by_thread": true,
 	"perfschema/idx_variables_info": true,
@@ -2043,7 +2043,7 @@ var skipTests = map[string]bool{
 	"other/archive": true,
 	"other/archive_bitfield": true,
 	"other/archive_gis": true,
-	"other/archive_no_symlink": true,
+	// "other/archive_no_symlink": true, // now passes
 	"other/archive_symlink": true,
 	"other/auto_increment": true,
 	// "other/bench_count_distinct": true, // now passes
