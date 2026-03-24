@@ -274,6 +274,9 @@ type Executor struct {
 	// tableLockManager manages LOCK TABLE READ/WRITE per connection.
 	// Shared across all executor instances.
 	tableLockManager *TableLockManager
+	// handlerReadKey counts the number of index-based reads (SELECT queries).
+	// Incremented per SELECT, reset on FLUSH STATUS.
+	handlerReadKey int64
 }
 
 // Warning represents a MySQL warning.
@@ -3730,7 +3733,12 @@ func (e *Executor) Execute(query string) (*Result, error) {
 				}
 			}
 		}
-		// FLUSH STATUS, FLUSH TABLES, etc. - no-op
+		// FLUSH STATUS resets session status counters.
+		for _, opt := range s.FlushOptions {
+			if strings.ToUpper(opt) == "STATUS" {
+				e.handlerReadKey = 0
+			}
+		}
 		return &Result{}, nil
 	case *sqlparser.OtherAdmin:
 		return e.execOtherAdmin(query)
@@ -4729,6 +4737,12 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			}
 		case "sql_auto_is_null":
 			e.sqlAutoIsNull = val == "1" || strings.ToUpper(val) == "ON" || strings.ToUpper(val) == "TRUE"
+			// Also store in session scope so @@sql_auto_is_null reads it back.
+			if e.sqlAutoIsNull {
+				e.sessionScopeVars["sql_auto_is_null"] = "ON"
+			} else {
+				e.sessionScopeVars["sql_auto_is_null"] = "OFF"
+			}
 		case "timestamp":
 			n, err := strconv.ParseFloat(val, 64)
 			if err == nil {
@@ -5503,6 +5517,11 @@ func (e *Executor) handleRawSet(raw string) error {
 			val = strings.TrimSuffix(val, ";")
 			val = strings.TrimSpace(val)
 			e.sqlAutoIsNull = val == "1" || strings.ToUpper(val) == "ON"
+			if e.sqlAutoIsNull {
+				e.sessionScopeVars["sql_auto_is_null"] = "ON"
+			} else {
+				e.sessionScopeVars["sql_auto_is_null"] = "OFF"
+			}
 		}
 	}
 	if strings.Contains(upper, "TIMESTAMP") && !strings.Contains(upper, "SQL_MODE") {
@@ -5557,11 +5576,18 @@ func (e *Executor) handleRawSet(raw string) error {
 	restUpper := strings.ToUpper(rest)
 	isPersistOnly := strings.HasPrefix(restUpper, "PERSIST_ONLY ")
 	isGlobalScope := strings.HasPrefix(restUpper, "GLOBAL ") || strings.HasPrefix(restUpper, "@@GLOBAL.") || strings.HasPrefix(restUpper, "PERSIST ") || isPersistOnly
-	rest = strings.TrimPrefix(rest, "GLOBAL ")
-	rest = strings.TrimPrefix(rest, "SESSION ")
-	rest = strings.TrimPrefix(rest, "LOCAL ")
-	rest = strings.TrimPrefix(rest, "PERSIST_ONLY ")
-	rest = strings.TrimPrefix(rest, "PERSIST ")
+	// Use case-insensitive prefix stripping for scope keywords
+	if strings.HasPrefix(restUpper, "GLOBAL ") {
+		rest = rest[len("GLOBAL "):]
+	} else if strings.HasPrefix(restUpper, "SESSION ") {
+		rest = rest[len("SESSION "):]
+	} else if strings.HasPrefix(restUpper, "LOCAL ") {
+		rest = rest[len("LOCAL "):]
+	} else if strings.HasPrefix(restUpper, "PERSIST_ONLY ") {
+		rest = rest[len("PERSIST_ONLY "):]
+	} else if strings.HasPrefix(restUpper, "PERSIST ") {
+		rest = rest[len("PERSIST "):]
+	}
 	rest = strings.TrimPrefix(rest, "@@global.")
 	rest = strings.TrimPrefix(rest, "@@session.")
 	rest = strings.TrimPrefix(rest, "@@local.")
@@ -11446,6 +11472,8 @@ func (e *Executor) preFilterRows(rows []storage.Row, preds []sqlparser.Expr) ([]
 }
 
 func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
+	// Increment handler_read_key for SELECT queries (used by SHOW SESSION STATUS).
+	e.handlerReadKey++
 	// For no-FROM queries (without CTEs), check for bare column references FIRST.
 	// MySQL returns "Unknown column" for bare names even when the expression
 	// also contains @@session.global_var references.
@@ -16624,8 +16652,20 @@ var sysVarReadOnly = map[string]bool{
 	"skip_name_resolve":                            true,
 	"innodb_directories":                           true,
 	"myisam_recover_options":                       true,
-	"lock_order":                                   true,
-	"log_error":                                    true,
+	"lock_order":                              true,
+	"lock_order_debug_loop":                   true,
+	"lock_order_debug_missing_arc":            true,
+	"lock_order_debug_missing_key":            true,
+	"lock_order_debug_missing_unlock":         true,
+	"lock_order_dependencies":                 true,
+	"lock_order_extra_dependencies":           true,
+	"lock_order_output_directory":             true,
+	"lock_order_print_txt":                    true,
+	"lock_order_trace_loop":                   true,
+	"lock_order_trace_missing_arc":            true,
+	"lock_order_trace_missing_key":            true,
+	"lock_order_trace_missing_unlock":         true,
+	"log_error":                               true,
 }
 
 // sysVarGlobalOnly contains system variables that can only be SET at GLOBAL scope.
@@ -16758,6 +16798,19 @@ var sysVarGlobalOnly = map[string]bool{
 	"delayed_insert_timeout":                   true,
 	"delayed_queue_size":                       true,
 	"host_cache_size":                          true,
+	"lock_order":                               true,
+	"lock_order_debug_loop":                    true,
+	"lock_order_debug_missing_arc":             true,
+	"lock_order_debug_missing_key":             true,
+	"lock_order_debug_missing_unlock":          true,
+	"lock_order_dependencies":                  true,
+	"lock_order_extra_dependencies":            true,
+	"lock_order_output_directory":              true,
+	"lock_order_print_txt":                     true,
+	"lock_order_trace_loop":                    true,
+	"lock_order_trace_missing_arc":             true,
+	"lock_order_trace_missing_key":             true,
+	"lock_order_trace_missing_unlock":          true,
 	"init_slave":                               true,
 	"master_info_repository":                   true,
 	"master_verify_checksum":                   true,
@@ -18214,7 +18267,19 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"flush":                      "OFF",
 		"flush_time":                 "0",
 		"lock_wait_timeout":          "31536000",
-		"lock_order":                 "ON",
+		"lock_order":                          "ON",
+		"lock_order_debug_loop":                "OFF",
+		"lock_order_debug_missing_arc":         "OFF",
+		"lock_order_debug_missing_key":         "OFF",
+		"lock_order_debug_missing_unlock":      "OFF",
+		"lock_order_dependencies":              "",
+		"lock_order_extra_dependencies":        "",
+		"lock_order_output_directory":          "",
+		"lock_order_print_txt":                 "OFF",
+		"lock_order_trace_loop":                "OFF",
+		"lock_order_trace_missing_arc":         "OFF",
+		"lock_order_trace_missing_key":         "OFF",
+		"lock_order_trace_missing_unlock":      "OFF",
 		"low_priority_updates":       "OFF",
 		"max_delayed_threads":        "20",
 		"delayed_insert_limit":       "100",
@@ -18678,7 +18743,7 @@ func (e *Executor) showStatus(upper string) (*Result, error) {
 		{Name: "Com_select", Value: "1"},
 		{Name: "Connections", Value: "1"},
 		{Name: "Handler_read_first", Value: "0"},
-		{Name: "Handler_read_key", Value: "0"},
+		{Name: "Handler_read_key", Value: fmt.Sprintf("%d", e.handlerReadKey)},
 		{Name: "Handler_read_next", Value: "0"},
 		{Name: "Handler_read_prev", Value: "0"},
 		{Name: "Handler_read_rnd", Value: "0"},

@@ -2694,13 +2694,18 @@ func applyMasterOpt(content string, ctx *execContext) {
 		if !strings.Contains(token, "=") {
 			key := token
 			key = strings.TrimPrefix(key, "loose-")
+			val := "1"
+			if strings.HasPrefix(key, "disable-") {
+				key = strings.TrimPrefix(key, "disable-")
+				val = "0"
+			}
 			if strings.HasPrefix(key, "enable-") {
 				key = strings.TrimPrefix(key, "enable-")
 			}
 			varKey := strings.ReplaceAll(key, "-", "_")
-			ctx.variables["$"+key] = "1"
-			ctx.variables["$"+varKey] = "1"
-			ctx.getActiveConn().ExecContext(context.Background(), fmt.Sprintf("SET STARTUP %s = 1", varKey)) //nolint:errcheck
+			ctx.variables["$"+key] = val
+			ctx.variables["$"+varKey] = val
+			ctx.getActiveConn().ExecContext(context.Background(), fmt.Sprintf("SET STARTUP %s = %s", varKey, val)) //nolint:errcheck
 			continue
 		}
 		if strings.Contains(token, "=") {

@@ -703,7 +703,7 @@ var skipTests = map[string]bool{
 	"perfschema/idx_compare_replication_applier_status_by_worker": true,
 	"perfschema/idx_compare_replication_connection_configuration": true,
 	"perfschema/idx_compare_replication_connection_status": true,
-	"perfschema/idx_cond_instances": true,
+	// "perfschema/idx_cond_instances": true, // now passes
 	"perfschema/idx_data_lock_waits": true,
 	"perfschema/idx_ees_by_account_by_error": true,
 	"perfschema/idx_ees_by_host_by_error": true,
@@ -747,11 +747,11 @@ var skipTests = map[string]bool{
 	"perfschema/idx_ews_by_thread_by_event_name": true,
 	"perfschema/idx_ews_by_user_by_event_name": true,
 	"perfschema/idx_ews_global_by_event_name": true,
-	"perfschema/idx_file_instances": true,
+	// "perfschema/idx_file_instances": true, // now passes
 	"perfschema/idx_fs_by_event_name": true,
-	"perfschema/idx_fs_by_instance": true,
-	"perfschema/idx_global_status": true,
-	"perfschema/idx_global_variables": true,
+	// "perfschema/idx_fs_by_instance": true, // now passes
+	// "perfschema/idx_global_status": true, // now passes
+	// "perfschema/idx_global_variables": true, // now passes
 	"perfschema/idx_hosts": true,
 	"perfschema/idx_joins": true,
 	"perfschema/idx_keyring_keys": true,
@@ -760,7 +760,7 @@ var skipTests = map[string]bool{
 	"perfschema/idx_mems_by_thread_by_event_name": true,
 	"perfschema/idx_mems_by_user_by_event_name": true,
 	"perfschema/idx_mems_global_by_event_name": true,
-	"perfschema/idx_mutex_instances": true,
+	// "perfschema/idx_mutex_instances": true, // now passes
 	"perfschema/idx_os_global_by_type": true,
 	"perfschema/idx_performance_timers": true,
 	"perfschema/idx_persisted_variables": true,
@@ -775,15 +775,15 @@ var skipTests = map[string]bool{
 	"perfschema/idx_rwlock_instances": true,
 	"perfschema/idx_session_account_connect_attrs": true,
 	"perfschema/idx_session_connect_attrs": true,
-	"perfschema/idx_session_status": true,
-	"perfschema/idx_session_variables": true,
+	// "perfschema/idx_session_status": true, // now passes
+	// "perfschema/idx_session_variables": true, // now passes
 	"perfschema/idx_setup_actors": true,
-	"perfschema/idx_setup_consumers": true,
-	"perfschema/idx_setup_instruments": true,
+	// "perfschema/idx_setup_consumers": true, // now passes
+	// "perfschema/idx_setup_instruments": true, // now passes
 	"perfschema/idx_setup_objects": true,
-	"perfschema/idx_setup_threads": true,
+	// "perfschema/idx_setup_threads": true, // now passes
 	"perfschema/idx_show_status": true,
-	"perfschema/idx_socket_instances": true,
+	// "perfschema/idx_socket_instances": true, // now passes
 	"perfschema/idx_socket_summary_by_event_name": true,
 	"perfschema/idx_socket_summary_by_instance": true,
 	"perfschema/idx_status_by_account": true,
@@ -1062,18 +1062,18 @@ var skipTests = map[string]bool{
 	"sys_vars/last_insert_id_func":                           true,
 	"sys_vars/lc_messages_basic":                             true,
 	"sys_vars/lc_time_names_basic":                           true,
-	"sys_vars/lo_debug_loop_basic": true,
-	"sys_vars/lo_debug_missing_arc_basic": true,
-	"sys_vars/lo_debug_missing_key_basic": true,
-	"sys_vars/lo_debug_missing_unlock_basic":                 true,
-	"sys_vars/lo_dependencies_basic": true,
-	"sys_vars/lo_extra_dependencies_basic": true,
-	"sys_vars/lo_output_directory_basic": true,
-	"sys_vars/lo_print_txt_basic": true,
-	"sys_vars/lo_trace_loop_basic": true,
-	"sys_vars/lo_trace_missing_arc_basic": true,
-	"sys_vars/lo_trace_missing_key_basic": true,
-	"sys_vars/lo_trace_missing_unlock_basic":                 true,
+	// "sys_vars/lo_debug_loop_basic": true, // now passes
+	// "sys_vars/lo_debug_missing_arc_basic": true, // now passes
+	// "sys_vars/lo_debug_missing_key_basic": true, // now passes
+	// "sys_vars/lo_debug_missing_unlock_basic": true, // now passes
+	// "sys_vars/lo_dependencies_basic": true, // now passes
+	// "sys_vars/lo_extra_dependencies_basic": true, // now passes
+	// "sys_vars/lo_output_directory_basic": true, // now passes
+	// "sys_vars/lo_print_txt_basic": true, // now passes
+	// "sys_vars/lo_trace_loop_basic": true, // now passes
+	// "sys_vars/lo_trace_missing_arc_basic": true, // now passes
+	// "sys_vars/lo_trace_missing_key_basic": true, // now passes
+	// "sys_vars/lo_trace_missing_unlock_basic": true, // now passes
 	"sys_vars/log_bin_trust_function_creators_basic":         true,
 	"sys_vars/log_error_func":                                true,
 	"sys_vars/log_error_func2":                               true,
@@ -1146,8 +1146,8 @@ var skipTests = map[string]bool{
 	"sys_vars/slave_type_conversions_basic":                  true,
 	"sys_vars/slow_query_log_file_basic":                     true,
 	"sys_vars/slow_query_log_func":                           true,
-	"sys_vars/sql_auto_is_null_basic": true,
-	"sys_vars/sql_buffer_result_basic": true,
+	// "sys_vars/sql_auto_is_null_basic": true, // now passes
+	// "sys_vars/sql_buffer_result_basic": true, // now passes
 	"sys_vars/sql_buffer_result_func":                        true,
 	"sys_vars/sql_log_bin_basic":                             true,
 	// "sys_vars/sql_log_off_func": true, // now passes
