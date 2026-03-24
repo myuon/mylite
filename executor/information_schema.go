@@ -889,17 +889,129 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 				var charOctetLen interface{}
 				var numPrecision interface{}
 				var numScale interface{}
-				switch strings.ToUpper(strings.TrimSpace(col.Type[:min(len(col.Type), 10)])) {
-				case "CHAR", "VARCHAR", "TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT":
-					charMaxLen = nil
-					charOctetLen = nil
-				case "INT", "TINYINT", "SMALLINT", "MEDIUMINT", "BIGINT":
-					numPrecision = int64(10)
-					numScale = int64(0)
-				case "FLOAT", "DOUBLE", "DECIMAL":
-					numPrecision = nil
-					numScale = nil
+				colTypeUpper := strings.ToUpper(strings.TrimSpace(col.Type))
+			baseType := colTypeUpper
+			if idx := strings.Index(baseType, "("); idx >= 0 {
+				baseType = strings.TrimSpace(baseType[:idx])
+			}
+			// Strip UNSIGNED, ZEROFILL, etc.
+			baseType = strings.TrimSpace(strings.Split(baseType, " ")[0])
+
+			switch baseType {
+			case "CHAR", "VARCHAR", "TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT":
+				// Extract character length from type spec
+				charLen := int64(-1) // -1 means not found
+				if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
+					end := strings.Index(colTypeUpper[idx:], ")")
+					if end > 0 {
+						n, err := strconv.ParseInt(colTypeUpper[idx+1:idx+end], 10, 64)
+						if err == nil {
+							charLen = n
+						}
+					}
 				}
+				if baseType == "CHAR" && charLen == -1 {
+					charLen = 1 // CHAR without length defaults to CHAR(1)
+				} else if baseType == "VARCHAR" && charLen == -1 {
+					charLen = 0
+				} else if charLen == -1 {
+					charLen = 0
+				}
+				// For TEXT types, CHARACTER_MAXIMUM_LENGTH is in characters
+				// which depends on the charset's max bytes per char
+				colCharset := strings.ToLower(col.Charset)
+				if colCharset == "" {
+					colCharset = "utf8mb4"
+				}
+				charsetMaxBytes := int64(4) // default utf8mb4
+				switch {
+				case colCharset == "latin1" || colCharset == "ascii" || colCharset == "binary":
+					charsetMaxBytes = 1
+				case colCharset == "ucs2":
+					charsetMaxBytes = 2
+				case colCharset == "utf16" || colCharset == "utf16le":
+					charsetMaxBytes = 4 // surrogate pairs
+				case colCharset == "utf8" || colCharset == "utf8mb3":
+					charsetMaxBytes = 3
+				case colCharset == "utf8mb4":
+					charsetMaxBytes = 4
+				case colCharset == "utf32":
+					charsetMaxBytes = 4
+				}
+				isTextType := false
+				var textByteLen int64
+				if baseType == "TINYTEXT" {
+					charLen = 255 / charsetMaxBytes
+					textByteLen = 255
+					isTextType = true
+				} else if baseType == "TEXT" {
+					charLen = 65535 / charsetMaxBytes
+					textByteLen = 65535
+					isTextType = true
+				} else if baseType == "MEDIUMTEXT" {
+					charLen = 16777215 / charsetMaxBytes
+					textByteLen = 16777215
+					isTextType = true
+				} else if baseType == "LONGTEXT" {
+					charLen = 4294967295 / charsetMaxBytes
+					textByteLen = 4294967295
+					isTextType = true
+				}
+				{
+					charMaxLen = charLen
+					if isTextType {
+						charOctetLen = textByteLen
+					} else {
+						charOctetLen = charLen * charsetMaxBytes
+					}
+				}
+			case "INT", "TINYINT", "SMALLINT", "MEDIUMINT", "BIGINT":
+				numPrecision = int64(10)
+				numScale = int64(0)
+			case "FLOAT", "DOUBLE", "DECIMAL":
+				numPrecision = nil
+				numScale = nil
+			}
+
+			// Determine character set and collation for string types
+			var charSetName interface{} = nil
+			var collationName interface{} = nil
+			switch baseType {
+			case "CHAR", "VARCHAR", "TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT", "ENUM", "SET":
+				cs := col.Charset
+				if cs == "" {
+					cs = "utf8mb4"
+				}
+				charSetName = cs
+				// Determine default collation for charset
+				switch strings.ToLower(cs) {
+				case "utf8mb4":
+					collationName = "utf8mb4_0900_ai_ci"
+				case "utf8", "utf8mb3":
+					collationName = "utf8_general_ci"
+					if cs == "utf8mb3" {
+						collationName = "utf8mb3_general_ci"
+					}
+				case "latin1":
+					collationName = "latin1_swedish_ci"
+				case "binary":
+					collationName = "binary"
+				case "ascii":
+					collationName = "ascii_general_ci"
+				case "ucs2":
+					collationName = "ucs2_general_ci"
+				case "utf16":
+					collationName = "utf16_general_ci"
+				case "utf32":
+					collationName = "utf32_general_ci"
+				default:
+					collationName = cs + "_general_ci"
+				}
+				// Use column-specific collation if set
+				if col.Collation != "" {
+					collationName = col.Collation
+				}
+			}
 
 				columnKey := ""
 				extra := ""
@@ -926,8 +1038,8 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 					"NUMERIC_PRECISION":        numPrecision,
 					"NUMERIC_SCALE":            numScale,
 					"DATETIME_PRECISION":       nil,
-					"CHARACTER_SET_NAME":       nil,
-					"COLLATION_NAME":           nil,
+					"CHARACTER_SET_NAME":       charSetName,
+					"COLLATION_NAME":           collationName,
 					"COLUMN_TYPE":              strings.ToLower(col.Type),
 					"COLUMN_KEY":               columnKey,
 					"EXTRA":                    extra,

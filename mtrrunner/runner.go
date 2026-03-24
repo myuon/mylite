@@ -701,14 +701,15 @@ func (ctx *execContext) executeLines(lines []string) error {
 			if strings.HasPrefix(bdLower, "query ") ||
 				strings.HasPrefix(bdLower, "query_vertical ") ||
 				strings.HasPrefix(bdLower, "eval ") {
-				if !strings.HasSuffix(strings.TrimSpace(trimmed), ";") {
+				if !lineEndsWithSemicolon(trimmed) {
 					fullDirective := bareDirective
 					i++
 					for i < len(lines) {
 						l := strings.TrimSpace(lines[i])
 						fullDirective += "\n" + l
-						if strings.HasSuffix(strings.TrimSpace(l), ";") {
-							fullDirective = strings.TrimSuffix(fullDirective, ";")
+						if lineEndsWithSemicolon(l) {
+							// Strip the trailing semicolon (and any comment before it)
+							fullDirective = stripTrailingSemicolonAndComment(fullDirective)
 							i++ // consume the terminating line so it won't be re-executed as SQL
 							break
 						}
@@ -1975,6 +1976,46 @@ func (ctx *execContext) executeSQLInner(stmt string) error {
 	return ctx.executeExec(stmt)
 }
 
+// lineEndsWithSemicolon checks if a line ends with a semicolon, ignoring trailing
+// inline comments (# ...). This handles cases like: where col < "2"; # comment
+func lineEndsWithSemicolon(line string) bool {
+	l := strings.TrimSpace(line)
+	if strings.HasSuffix(l, ";") {
+		return true
+	}
+	// Check if there's a semicolon before a trailing # comment
+	if idx := strings.Index(l, " #"); idx >= 0 {
+		before := strings.TrimSpace(l[:idx])
+		if strings.HasSuffix(before, ";") {
+			return true
+		}
+	}
+	return false
+}
+
+// stripTrailingSemicolonAndComment removes the trailing semicolon (and any
+// inline # comment after it) from the last line of a multi-line statement.
+func stripTrailingSemicolonAndComment(stmt string) string {
+	lines := strings.Split(stmt, "\n")
+	last := lines[len(lines)-1]
+	// Strip inline comment first
+	if idx := strings.Index(last, " #"); idx >= 0 {
+		inStr := false
+		for j := 0; j < idx; j++ {
+			if last[j] == '\'' {
+				inStr = !inStr
+			}
+		}
+		if !inStr {
+			last = last[:idx]
+		}
+	}
+	last = strings.TrimSpace(last)
+	last = strings.TrimSuffix(last, ";")
+	lines[len(lines)-1] = last
+	return strings.Join(lines, "\n")
+}
+
 func stripInlineHashComments(stmt string) string {
 	lines := strings.Split(stmt, "\n")
 	for i, l := range lines {
@@ -2438,6 +2479,12 @@ func (ctx *execContext) setVariable(expr string) error {
 		name = "$" + name
 	}
 	value := strings.TrimSpace(parts[1])
+	// Strip trailing semicolons from simple values (mysqltest convention).
+	// Don't strip if value is a backtick query or contains embedded semicolons in strings.
+	if !strings.HasPrefix(value, "`") {
+		value = strings.TrimRight(value, ";")
+		value = strings.TrimSpace(value)
+	}
 
 	// If value is wrapped in backticks, execute as SQL and use first column of first row
 	if strings.HasPrefix(value, "`") && strings.HasSuffix(value, "`") {

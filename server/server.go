@@ -303,6 +303,11 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic in connection handler: %v", r)
+		}
+	}()
 	connExec := s.Executor.Clone()
 	handler := &Handler{srv: s, executor: connExec}
 	connID := connExec.GetConnectionID()

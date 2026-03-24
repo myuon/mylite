@@ -2873,8 +2873,12 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 func explainTableNameFromQuery(query string) string {
 	upper := strings.ToUpper(query)
 	if idx := strings.Index(upper, " FROM "); idx >= 0 {
-		restOrig := strings.TrimSpace(query[idx+len(" FROM "):])
-		restUpper := strings.TrimSpace(upper[idx+len(" FROM "):])
+		fromEnd := idx + len(" FROM ")
+		if fromEnd > len(query) {
+			return ""
+		}
+		restOrig := strings.TrimSpace(query[fromEnd:])
+		restUpper := strings.TrimSpace(upper[fromEnd:])
 		if strings.HasPrefix(restUpper, "JSON_TABLE(") {
 			return "tt"
 		}
@@ -3606,6 +3610,9 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	case *sqlparser.Savepoint:
 		// SAVEPOINT: accepted as a no-op for compatibility.
 		return &Result{}, nil
+	case *sqlparser.Release:
+		// RELEASE SAVEPOINT: accepted as a no-op for compatibility.
+		return &Result{}, nil
 	case *sqlparser.TruncateTable:
 		return e.execTruncateTable(s)
 	case *sqlparser.Set:
@@ -3776,6 +3783,14 @@ func extractRawSelectExprs(query string) []string {
 				rest = strings.TrimSpace(rest[len(hint):])
 				skipped = true
 				break
+			}
+		}
+		// Also skip optimizer hints /*+ ... */
+		if strings.HasPrefix(rest, "/*+") {
+			endIdx := strings.Index(rest, "*/")
+			if endIdx >= 0 {
+				rest = strings.TrimSpace(rest[endIdx+2:])
+				skipped = true
 			}
 		}
 		if !skipped {
@@ -11882,6 +11897,27 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	var selectTableDefs []*catalog.TableDef
 	if len(stmt.From) > 0 {
 		selectTableDefs = e.collectTableDefs(stmt.From[0])
+	}
+
+	// Implicit FTS relevance ordering: when WHERE contains MATCH AGAINST
+	// and there's no explicit ORDER BY, MySQL returns results ordered by
+	// relevance score descending.
+	if stmt.OrderBy == nil && stmt.Where != nil {
+		if matchExpr := findMatchExprInWhere(stmt.Where.Expr); matchExpr != nil {
+			sort.SliceStable(allRows, func(a, b int) bool {
+				scoreA, _ := e.evalRowExpr(matchExpr, allRows[a])
+				scoreB, _ := e.evalRowExpr(matchExpr, allRows[b])
+				fA, okA := scoreA.(float64)
+				if !okA {
+					fA = 0
+				}
+				fB, okB := scoreB.(float64)
+				if !okB {
+					fB = 0
+				}
+				return fA > fB // descending by relevance
+			})
+		}
 	}
 
 	// Apply implicit index ordering to raw rows BEFORE evaluating SELECT expressions.
@@ -32280,6 +32316,33 @@ func evalLiteralForPK(expr sqlparser.Expr) interface{} {
 }
 
 // ---------------------------------------------------------------------------
+// findMatchExprInWhere recursively searches an expression tree for a MATCH AGAINST
+// expression and returns the first one found, or nil if none.
+func findMatchExprInWhere(expr sqlparser.Expr) *sqlparser.MatchExpr {
+	switch v := expr.(type) {
+	case *sqlparser.MatchExpr:
+		return v
+	case *sqlparser.AndExpr:
+		if m := findMatchExprInWhere(v.Left); m != nil {
+			return m
+		}
+		return findMatchExprInWhere(v.Right)
+	case *sqlparser.OrExpr:
+		if m := findMatchExprInWhere(v.Left); m != nil {
+			return m
+		}
+		return findMatchExprInWhere(v.Right)
+	case *sqlparser.ComparisonExpr:
+		if m := findMatchExprInWhere(v.Left); m != nil {
+			return m
+		}
+		return findMatchExprInWhere(v.Right)
+	case *sqlparser.NotExpr:
+		return findMatchExprInWhere(v.Expr)
+	}
+	return nil
+}
+
 // Full-Text Search (MATCH … AGAINST) implementation
 // ---------------------------------------------------------------------------
 
