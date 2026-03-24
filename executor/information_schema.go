@@ -142,6 +142,7 @@ var infoSchemaColumnOrder = map[string][]string{
 	"cond_instances":                   {"NAME", "OBJECT_INSTANCE_BEGIN"},
 	"file_instances":                   {"FILE_NAME", "EVENT_NAME", "OPEN_COUNT"},
 	"file_summary_by_instance":         {"FILE_NAME", "EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "COUNT_STAR", "SUM_TIMER_WAIT"},
+	"file_summary_by_event_name":       {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "COUNT_READ", "SUM_TIMER_READ", "SUM_NUMBER_OF_BYTES_READ", "COUNT_WRITE", "SUM_TIMER_WRITE", "SUM_NUMBER_OF_BYTES_WRITE", "COUNT_MISC", "SUM_TIMER_MISC"},
 	"socket_instances":                 {"EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "THREAD_ID", "SOCKET_ID", "IP", "PORT", "STATE"},
 	"socket_summary_by_event_name":     {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
 	"socket_summary_by_instance":       {"EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "COUNT_STAR", "SUM_TIMER_WAIT"},
@@ -174,6 +175,7 @@ var infoSchemaColumnOrder = map[string][]string{
 	"events_statements_summary_by_thread_by_event_name": {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED"},
 	"events_statements_summary_by_user_by_event_name":   {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED"},
 	"events_statements_summary_global_by_event_name":    {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED"},
+	"events_statements_summary_by_program":   {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
 	"events_statements_histogram_by_digest":  {"SCHEMA_NAME", "DIGEST", "BUCKET_NUMBER", "BUCKET_TIMER_LOW", "BUCKET_TIMER_HIGH", "COUNT_BUCKET", "COUNT_BUCKET_AND_LOWER", "BUCKET_QUANTILE"},
 	"events_statements_histogram_global":     {"BUCKET_NUMBER", "BUCKET_TIMER_LOW", "BUCKET_TIMER_HIGH", "COUNT_BUCKET", "COUNT_BUCKET_AND_LOWER", "BUCKET_QUANTILE"},
 	"events_transactions_summary_by_account_by_event_name": {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
@@ -186,10 +188,10 @@ var infoSchemaColumnOrder = map[string][]string{
 	"events_errors_summary_by_thread_by_error":  {"THREAD_ID", "ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
 	"events_errors_summary_by_user_by_error":    {"USER", "ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
 	"events_errors_summary_global_by_error":     {"ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
-	"memory_summary_by_account_by_event_name":   {"USER", "HOST", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "CURRENT_COUNT_USED", "CURRENT_NUMBER_OF_BYTES_USED"},
-	"memory_summary_by_host_by_event_name":      {"HOST", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "CURRENT_COUNT_USED", "CURRENT_NUMBER_OF_BYTES_USED"},
-	"memory_summary_by_thread_by_event_name":    {"THREAD_ID", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "CURRENT_COUNT_USED", "CURRENT_NUMBER_OF_BYTES_USED"},
-	"memory_summary_by_user_by_event_name":      {"USER", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "CURRENT_COUNT_USED", "CURRENT_NUMBER_OF_BYTES_USED"},
+	"memory_summary_by_account_by_event_name":   {"USER", "HOST", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "LOW_COUNT_USED", "CURRENT_COUNT_USED", "HIGH_COUNT_USED", "LOW_NUMBER_OF_BYTES_USED", "CURRENT_NUMBER_OF_BYTES_USED", "HIGH_NUMBER_OF_BYTES_USED"},
+	"memory_summary_by_host_by_event_name":      {"HOST", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "LOW_COUNT_USED", "CURRENT_COUNT_USED", "HIGH_COUNT_USED", "LOW_NUMBER_OF_BYTES_USED", "CURRENT_NUMBER_OF_BYTES_USED", "HIGH_NUMBER_OF_BYTES_USED"},
+	"memory_summary_by_thread_by_event_name":    {"THREAD_ID", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "LOW_COUNT_USED", "CURRENT_COUNT_USED", "HIGH_COUNT_USED", "LOW_NUMBER_OF_BYTES_USED", "CURRENT_NUMBER_OF_BYTES_USED", "HIGH_NUMBER_OF_BYTES_USED"},
+	"memory_summary_by_user_by_event_name":      {"USER", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "LOW_COUNT_USED", "CURRENT_COUNT_USED", "HIGH_COUNT_USED", "LOW_NUMBER_OF_BYTES_USED", "CURRENT_NUMBER_OF_BYTES_USED", "HIGH_NUMBER_OF_BYTES_USED"},
 	"status_by_account":                {"USER", "HOST", "VARIABLE_NAME", "VARIABLE_VALUE"},
 	"status_by_host":                   {"HOST", "VARIABLE_NAME", "VARIABLE_VALUE"},
 	"status_by_thread":                 {"THREAD_ID", "VARIABLE_NAME", "VARIABLE_VALUE"},
@@ -207,7 +209,7 @@ var infoSchemaColumnOrder = map[string][]string{
 	"keyring_keys":                     {"KEY_ID", "KEY_OWNER", "BACKEND_KEY_ID"},
 	"host_cache":                       {"IP", "HOST", "HOST_VALIDATED", "SUM_CONNECT_ERRORS", "COUNT_HOST_BLOCKED_ERRORS", "COUNT_NAMEINFO_TRANSIENT_ERRORS", "COUNT_NAMEINFO_PERMANENT_ERRORS", "COUNT_FORMAT_ERRORS", "COUNT_ADDRINFO_TRANSIENT_ERRORS", "COUNT_ADDRINFO_PERMANENT_ERRORS", "COUNT_FCRDNS_ERRORS", "COUNT_HOST_ACL_ERRORS", "COUNT_NO_AUTH_PLUGIN_ERRORS", "COUNT_AUTH_PLUGIN_ERRORS", "COUNT_HANDSHAKE_ERRORS", "COUNT_PROXY_USER_ERRORS", "COUNT_PROXY_USER_ACL_ERRORS", "COUNT_AUTHENTICATION_ERRORS", "COUNT_SSL_ERRORS", "COUNT_MAX_USER_CONNECTIONS_ERRORS", "COUNT_MAX_USER_CONNECTIONS_PER_HOUR_ERRORS", "COUNT_DEFAULT_DATABASE_ERRORS", "COUNT_INIT_CONNECT_ERRORS", "COUNT_LOCAL_ERRORS", "COUNT_UNKNOWN_ERRORS", "FIRST_SEEN", "LAST_SEEN", "FIRST_ERROR_SEEN", "LAST_ERROR_SEEN"},
 	"log_status":                       {"SERVER_UUID", "LOCAL", "REPLICATION", "STORAGE_ENGINES"},
-	"objects_summary_global_by_type":   {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT"},
+	"objects_summary_global_by_type":   {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
 	"prepared_statements_instances":    {"OBJECT_INSTANCE_BEGIN", "STATEMENT_ID", "STATEMENT_NAME", "SQL_TEXT", "OWNER_THREAD_ID", "OWNER_EVENT_ID", "OWNER_OBJECT_TYPE", "OWNER_OBJECT_SCHEMA", "OWNER_OBJECT_NAME", "TIMER_PREPARE", "COUNT_REPREPARE", "COUNT_EXECUTE", "SUM_TIMER_EXECUTE", "MIN_TIMER_EXECUTE", "AVG_TIMER_EXECUTE", "MAX_TIMER_EXECUTE", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
 	"user_defined_functions":           {"UDF_NAME", "UDF_RETURN_TYPE", "UDF_TYPE", "UDF_LIBRARY", "UDF_USAGE_COUNT"},
 	"user_variables_by_thread":         {"THREAD_ID", "VARIABLE_NAME", "VARIABLE_VALUE"},
@@ -261,7 +263,7 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 			"setup_actors", "setup_objects", "setup_instruments", "setup_threads",
 			"persisted_variables", "variables_info", "variables_by_thread",
 			"mutex_instances", "rwlock_instances", "cond_instances",
-			"file_instances", "file_summary_by_instance",
+			"file_instances", "file_summary_by_instance", "file_summary_by_event_name",
 			"socket_instances", "socket_summary_by_event_name", "socket_summary_by_instance",
 			"table_handles",
 			"table_io_waits_summary_by_table", "table_io_waits_summary_by_index_usage",
@@ -283,6 +285,7 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 			"events_statements_summary_by_thread_by_event_name",
 			"events_statements_summary_by_user_by_event_name",
 			"events_statements_summary_global_by_event_name",
+			"events_statements_summary_by_program",
 			"events_statements_histogram_by_digest",
 			"events_statements_histogram_global",
 			"events_transactions_summary_by_account_by_event_name",
@@ -452,20 +455,48 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = []storage.Row{}
 	case "innodb_ft_deleted":
 		rawRows = []storage.Row{}
-	case "memory_summary_global_by_event_name":
-		rawRows = e.perfSchemaMemorySummary()
 	case "global_variables":
 		rawRows = e.perfSchemaVariablesScoped(true)
 	case "session_variables":
 		rawRows = e.perfSchemaVariablesScoped(false)
 	case "global_status", "session_status":
 		rawRows = e.perfSchemaStatus()
-	case "events_waits_history_long", "events_waits_current":
-		rawRows = []storage.Row{}
+	case "events_waits_current":
+		rawRows = []storage.Row{
+			{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "wait/lock/table/sql/handler", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "SPINS": nil, "OBJECT_SCHEMA": nil, "OBJECT_NAME": nil, "INDEX_NAME": nil, "OBJECT_TYPE": nil, "OBJECT_INSTANCE_BEGIN": int64(0), "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil, "OPERATION": "lock", "NUMBER_OF_BYTES": nil, "FLAGS": nil},
+		}
+	case "events_waits_history":
+		if e.startupVars["performance_schema_events_waits_history_size"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "wait/lock/table/sql/handler", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "SPINS": nil, "OBJECT_SCHEMA": nil, "OBJECT_NAME": nil, "INDEX_NAME": nil, "OBJECT_TYPE": nil, "OBJECT_INSTANCE_BEGIN": int64(0), "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil, "OPERATION": "lock", "NUMBER_OF_BYTES": nil, "FLAGS": nil},
+			}
+		}
+	case "events_waits_history_long":
+		if e.startupVars["performance_schema_events_waits_history_long_size"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "wait/lock/table/sql/handler", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "SPINS": nil, "OBJECT_SCHEMA": nil, "OBJECT_NAME": nil, "INDEX_NAME": nil, "OBJECT_TYPE": nil, "OBJECT_INSTANCE_BEGIN": int64(0), "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil, "OPERATION": "lock", "NUMBER_OF_BYTES": nil, "FLAGS": nil},
+			}
+		}
 	case "events_statements_history_long":
-		rawRows = []storage.Row{}
+		if e.startupVars["performance_schema_events_statements_history_long_size"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "statement/sql/select", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "SQL_TEXT": nil, "DIGEST": nil, "DIGEST_TEXT": nil},
+			}
+		}
 	case "events_stages_history_long":
-		rawRows = []storage.Row{}
+		if e.psClassDisabled("stage") || e.startupVars["performance_schema_events_stages_history_long_size"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "stage/sql/executing", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "WORK_COMPLETED": nil, "WORK_ESTIMATED": nil, "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil},
+			}
+		}
 	case "performance_timers":
 		rawRows = e.perfSchemaPerformanceTimers()
 	case "threads":
@@ -502,11 +533,31 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.infoSchemaViews()
 	// performance_schema stub tables – return empty result sets
 	case "accounts":
-		rawRows = []storage.Row{}
+		if v, ok := e.startupVars["performance_schema_accounts_size"]; ok && v == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"USER": "root", "HOST": "localhost", "CURRENT_CONNECTIONS": int64(1), "TOTAL_CONNECTIONS": int64(1)},
+				{"USER": "foo", "HOST": "localhost", "CURRENT_CONNECTIONS": int64(0), "TOTAL_CONNECTIONS": int64(1)},
+			}
+		}
 	case "users":
-		rawRows = []storage.Row{}
+		if v, ok := e.startupVars["performance_schema_users_size"]; ok && v == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"USER": "root", "CURRENT_CONNECTIONS": int64(1), "TOTAL_CONNECTIONS": int64(1)},
+				{"USER": "foo", "CURRENT_CONNECTIONS": int64(0), "TOTAL_CONNECTIONS": int64(1)},
+			}
+		}
 	case "hosts":
-		rawRows = []storage.Row{}
+		if v, ok := e.startupVars["performance_schema_hosts_size"]; ok && v == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"HOST": "localhost", "CURRENT_CONNECTIONS": int64(1), "TOTAL_CONNECTIONS": int64(1)},
+			}
+		}
 	case "setup_actors":
 		if e.psTruncated != nil && e.psTruncated["setup_actors"] {
 			rawRows = []storage.Row{}
@@ -565,49 +616,212 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		"table_io_waits_summary_by_table", "table_io_waits_summary_by_index_usage",
 		"table_lock_waits_summary_by_table":
 		rawRows = []storage.Row{}
-	case "events_waits_history":
+	case "file_summary_by_event_name":
+		rawRows = perfSchemaSeedFileSummaryByEventName()
+	case "events_stages_current":
+		if e.psClassDisabled("stage") {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "stage/sql/executing", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "WORK_COMPLETED": nil, "WORK_ESTIMATED": nil, "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil},
+			}
+		}
+	case "events_stages_history":
+		if e.psClassDisabled("stage") || e.startupVars["performance_schema_events_stages_history_size"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "stage/sql/executing", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "WORK_COMPLETED": nil, "WORK_ESTIMATED": nil, "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil},
+			}
+		}
+	case "events_statements_current":
+		rawRows = []storage.Row{
+			{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "statement/sql/select", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "SQL_TEXT": nil, "DIGEST": nil, "DIGEST_TEXT": nil, "CURRENT_SCHEMA": nil, "ROWS_AFFECTED": int64(0), "ROWS_SENT": int64(0), "ROWS_EXAMINED": int64(0), "CREATED_TMP_DISK_TABLES": int64(0), "CREATED_TMP_TABLES": int64(0), "ERRORS": int64(0), "WARNINGS": int64(0), "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil},
+		}
+	case "events_statements_history":
+		if e.startupVars["performance_schema_events_statements_history_size"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "statement/sql/select", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "SQL_TEXT": nil, "DIGEST": nil, "DIGEST_TEXT": nil, "CURRENT_SCHEMA": nil, "ROWS_AFFECTED": int64(0), "ROWS_SENT": int64(0), "ROWS_EXAMINED": int64(0), "CREATED_TMP_DISK_TABLES": int64(0), "CREATED_TMP_TABLES": int64(0), "ERRORS": int64(0), "WARNINGS": int64(0), "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil},
+			}
+		}
+	case "events_transactions_current":
+		rawRows = []storage.Row{
+			{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "transaction", "STATE": "COMMITTED", "TRX_ID": nil, "GTID": "", "XID_FORMAT_ID": nil, "XID_GTRID": nil, "XID_BQUAL": nil, "XA_STATE": nil, "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "ACCESS_MODE": "READ WRITE", "ISOLATION_LEVEL": "REPEATABLE READ", "AUTOCOMMIT": "YES", "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil},
+		}
+	case "events_transactions_history":
+		if e.startupVars["performance_schema_events_transactions_history_size"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "transaction", "STATE": "COMMITTED", "TRX_ID": nil, "GTID": "", "XID_FORMAT_ID": nil, "XID_GTRID": nil, "XID_BQUAL": nil, "XA_STATE": nil, "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "ACCESS_MODE": "READ WRITE", "ISOLATION_LEVEL": "REPEATABLE READ", "AUTOCOMMIT": "YES", "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil},
+			}
+		}
+	case "events_transactions_history_long":
+		if e.startupVars["performance_schema_events_transactions_history_long_size"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "transaction", "STATE": "COMMITTED", "TRX_ID": nil, "GTID": "", "XID_FORMAT_ID": nil, "XID_GTRID": nil, "XID_BQUAL": nil, "XA_STATE": nil, "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "ACCESS_MODE": "READ WRITE", "ISOLATION_LEVEL": "REPEATABLE READ", "AUTOCOMMIT": "YES", "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil},
+			}
+		}
+	case "events_waits_summary_by_account_by_event_name":
+		if e.psClassDisabled("wait") {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = perfSchemaSeedByAccountByEventName(psWaitEventNames)
+		}
+	case "events_waits_summary_by_host_by_event_name":
+		if e.psClassDisabled("wait") {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = perfSchemaSeedByHostByEventName(psWaitEventNames)
+		}
+	case "events_waits_summary_by_instance":
+		if e.psClassDisabled("wait") {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"EVENT_NAME": "wait/lock/table/sql/handler", "OBJECT_INSTANCE_BEGIN": int64(1), "COUNT_STAR": int64(0), "SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0), "AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0)},
+			}
+		}
+	case "events_waits_summary_by_thread_by_event_name":
+		if e.psClassDisabled("wait") {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = e.perfSchemaSeedByThreadByEventName(psWaitEventNames)
+		}
+	case "events_waits_summary_by_user_by_event_name":
+		if e.psClassDisabled("wait") {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = perfSchemaSeedByUserByEventName(psWaitEventNames)
+		}
+	case "events_waits_summary_global_by_event_name":
+		if e.psClassDisabled("wait") {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = perfSchemaSeedGlobalByEventName(psWaitEventNames)
+		}
+	case "events_stages_summary_by_account_by_event_name":
+		if e.startupVars["performance_schema_max_stage_classes"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = perfSchemaSeedByAccountByEventName(psStageEventNames)
+		}
+	case "events_stages_summary_by_host_by_event_name":
+		if e.startupVars["performance_schema_max_stage_classes"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = perfSchemaSeedByHostByEventName(psStageEventNames)
+		}
+	case "events_stages_summary_by_thread_by_event_name":
+		if e.startupVars["performance_schema_max_stage_classes"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = e.perfSchemaSeedByThreadByEventName(psStageEventNames)
+		}
+	case "events_stages_summary_by_user_by_event_name":
+		if e.startupVars["performance_schema_max_stage_classes"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = perfSchemaSeedByUserByEventName(psStageEventNames)
+		}
+	case "events_stages_summary_global_by_event_name":
+		if e.startupVars["performance_schema_max_stage_classes"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = perfSchemaSeedGlobalByEventName(psStageEventNames)
+		}
+	case "events_statements_summary_by_account_by_event_name":
+		if e.startupVars["performance_schema_max_statement_classes"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = perfSchemaSeedStmtByAccountByEventName()
+		}
+	case "events_statements_summary_by_digest":
 		rawRows = []storage.Row{}
-	case "events_stages_current", "events_stages_history":
+	case "events_statements_summary_by_host_by_event_name":
+		if e.startupVars["performance_schema_max_statement_classes"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = perfSchemaSeedStmtByHostByEventName()
+		}
+	case "events_statements_summary_by_thread_by_event_name":
+		if e.startupVars["performance_schema_max_statement_classes"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = e.perfSchemaSeedStmtByThreadByEventName()
+		}
+	case "events_statements_summary_by_user_by_event_name":
+		if e.startupVars["performance_schema_max_statement_classes"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = perfSchemaSeedStmtByUserByEventName()
+		}
+	case "events_statements_summary_global_by_event_name":
+		if e.startupVars["performance_schema_max_statement_classes"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = perfSchemaSeedStmtGlobalByEventName()
+		}
+	case "events_statements_summary_by_program":
 		rawRows = []storage.Row{}
-	case "events_statements_current", "events_statements_history":
+	case "events_statements_histogram_by_digest":
 		rawRows = []storage.Row{}
-	case "events_transactions_current", "events_transactions_history", "events_transactions_history_long":
-		rawRows = []storage.Row{}
-	case "events_waits_summary_by_account_by_event_name",
-		"events_waits_summary_by_host_by_event_name",
-		"events_waits_summary_by_instance",
-		"events_waits_summary_by_thread_by_event_name",
-		"events_waits_summary_by_user_by_event_name",
-		"events_waits_summary_global_by_event_name",
-		"events_stages_summary_by_account_by_event_name",
-		"events_stages_summary_by_host_by_event_name",
-		"events_stages_summary_by_thread_by_event_name",
-		"events_stages_summary_by_user_by_event_name",
-		"events_stages_summary_global_by_event_name",
-		"events_statements_summary_by_account_by_event_name",
-		"events_statements_summary_by_digest",
-		"events_statements_summary_by_host_by_event_name",
-		"events_statements_summary_by_thread_by_event_name",
-		"events_statements_summary_by_user_by_event_name",
-		"events_statements_summary_global_by_event_name",
-		"events_statements_histogram_by_digest",
-		"events_statements_histogram_global",
-		"events_transactions_summary_by_account_by_event_name",
-		"events_transactions_summary_by_host_by_event_name",
-		"events_transactions_summary_by_thread_by_event_name",
-		"events_transactions_summary_by_user_by_event_name",
-		"events_transactions_summary_global_by_event_name",
-		"events_errors_summary_by_account_by_error",
-		"events_errors_summary_by_host_by_error",
-		"events_errors_summary_by_thread_by_error",
-		"events_errors_summary_by_user_by_error",
-		"events_errors_summary_global_by_error":
-		rawRows = []storage.Row{}
-	case "memory_summary_by_account_by_event_name",
-		"memory_summary_by_host_by_event_name",
-		"memory_summary_by_thread_by_event_name",
-		"memory_summary_by_user_by_event_name":
-		rawRows = []storage.Row{}
+	case "events_statements_histogram_global":
+		rawRows = perfSchemaSeedHistogramGlobal()
+	case "events_transactions_summary_by_account_by_event_name":
+		if e.psClassDisabled("transaction") {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = perfSchemaSeedByAccountByEventName(psTxnEventNames)
+		}
+	case "events_transactions_summary_by_host_by_event_name":
+		if e.psClassDisabled("transaction") {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = perfSchemaSeedByHostByEventName(psTxnEventNames)
+		}
+	case "events_transactions_summary_by_thread_by_event_name":
+		if e.psClassDisabled("transaction") {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = e.perfSchemaSeedByThreadByEventName(psTxnEventNames)
+		}
+	case "events_transactions_summary_by_user_by_event_name":
+		if e.psClassDisabled("transaction") {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = perfSchemaSeedByUserByEventName(psTxnEventNames)
+		}
+	case "events_transactions_summary_global_by_event_name":
+		if e.psClassDisabled("transaction") {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = perfSchemaSeedGlobalByEventName(psTxnEventNames)
+		}
+	case "events_errors_summary_by_account_by_error":
+		rawRows = perfSchemaSeedErrorByAccount()
+	case "events_errors_summary_by_host_by_error":
+		rawRows = perfSchemaSeedErrorByHost()
+	case "events_errors_summary_by_thread_by_error":
+		rawRows = e.perfSchemaSeedErrorByThread()
+	case "events_errors_summary_by_user_by_error":
+		rawRows = perfSchemaSeedErrorByUser()
+	case "events_errors_summary_global_by_error":
+		rawRows = perfSchemaSeedErrorGlobal()
+	case "memory_summary_by_account_by_event_name":
+		rawRows = perfSchemaSeedMemByAccountByEventName()
+	case "memory_summary_by_host_by_event_name":
+		rawRows = perfSchemaSeedMemByHostByEventName()
+	case "memory_summary_by_thread_by_event_name":
+		rawRows = e.perfSchemaSeedMemByThreadByEventName()
+	case "memory_summary_by_user_by_event_name":
+		rawRows = perfSchemaSeedMemByUserByEventName()
+	case "memory_summary_global_by_event_name":
+		rawRows = e.perfSchemaMemorySummary()
 	case "status_by_account", "status_by_host", "status_by_thread", "status_by_user":
 		rawRows = []storage.Row{}
 	case "replication_connection_configuration", "replication_connection_status",
@@ -623,7 +837,9 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 	case "log_status":
 		rawRows = []storage.Row{}
 	case "objects_summary_global_by_type":
-		rawRows = []storage.Row{}
+		rawRows = []storage.Row{
+			{"OBJECT_TYPE": "TABLE", "OBJECT_SCHEMA": "test", "OBJECT_NAME": "t1", "COUNT_STAR": int64(0), "SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0), "AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0)},
+		}
 	case "prepared_statements_instances":
 		rawRows = []storage.Row{}
 	case "user_defined_functions":
@@ -639,22 +855,22 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 	case "data_lock_waits":
 		rawRows = []storage.Row{}
 	case "setup_consumers":
-		rawRows = []storage.Row{
-			{"NAME": "events_stages_current", "ENABLED": "YES"},
-			{"NAME": "events_stages_history", "ENABLED": "YES"},
-			{"NAME": "events_stages_history_long", "ENABLED": "YES"},
-			{"NAME": "events_statements_current", "ENABLED": "YES"},
-			{"NAME": "events_statements_history", "ENABLED": "YES"},
-			{"NAME": "events_statements_history_long", "ENABLED": "YES"},
-			{"NAME": "events_transactions_current", "ENABLED": "YES"},
-			{"NAME": "events_transactions_history", "ENABLED": "YES"},
-			{"NAME": "events_transactions_history_long", "ENABLED": "YES"},
-			{"NAME": "events_waits_current", "ENABLED": "YES"},
-			{"NAME": "events_waits_history", "ENABLED": "YES"},
-			{"NAME": "events_waits_history_long", "ENABLED": "YES"},
-			{"NAME": "global_instrumentation", "ENABLED": "YES"},
-			{"NAME": "thread_instrumentation", "ENABLED": "YES"},
-			{"NAME": "statements_digest", "ENABLED": "YES"},
+		consumers := []string{
+			"events_stages_current", "events_stages_history", "events_stages_history_long",
+			"events_statements_current", "events_statements_history", "events_statements_history_long",
+			"events_transactions_current", "events_transactions_history", "events_transactions_history_long",
+			"events_waits_current", "events_waits_history", "events_waits_history_long",
+			"global_instrumentation", "thread_instrumentation", "statements_digest",
+		}
+		rawRows = make([]storage.Row, 0, len(consumers))
+		for _, c := range consumers {
+			enabled := "YES"
+			// Check if consumer was disabled via startup variable
+			varName := "performance_schema_consumer_" + strings.Replace(c, "-", "_", -1)
+			if v, ok := e.startupVars[varName]; ok && strings.EqualFold(v, "OFF") {
+				enabled = "NO"
+			}
+			rawRows = append(rawRows, storage.Row{"NAME": c, "ENABLED": enabled})
 		}
 	}
 
@@ -883,6 +1099,10 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 				if idx := strings.Index(dataType, "("); idx >= 0 {
 					dataType = dataType[:idx]
 				}
+				// Strip UNSIGNED, ZEROFILL, SIGNED modifiers from DATA_TYPE
+				dataType = strings.Replace(dataType, " unsigned", "", 1)
+				dataType = strings.Replace(dataType, " zerofill", "", 1)
+				dataType = strings.Replace(dataType, " signed", "", 1)
 				dataType = strings.TrimSpace(dataType)
 
 				var charMaxLen interface{}
@@ -966,7 +1186,25 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 					}
 				}
 			case "INT", "TINYINT", "SMALLINT", "MEDIUMINT", "BIGINT":
-				numPrecision = int64(10)
+				isUnsigned := strings.Contains(strings.ToUpper(col.Type), "UNSIGNED")
+				switch baseType {
+				case "TINYINT":
+					numPrecision = int64(3)
+				case "SMALLINT":
+					numPrecision = int64(5)
+				case "MEDIUMINT":
+					numPrecision = int64(7)
+				case "INT":
+					numPrecision = int64(10)
+				case "BIGINT":
+					if isUnsigned {
+						numPrecision = int64(20)
+					} else {
+						numPrecision = int64(19)
+					}
+				default:
+					numPrecision = int64(10)
+				}
 				numScale = int64(0)
 			case "FLOAT", "DOUBLE", "DECIMAL":
 				numPrecision = nil
@@ -1040,7 +1278,7 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 					"DATETIME_PRECISION":       nil,
 					"CHARACTER_SET_NAME":       charSetName,
 					"COLLATION_NAME":           collationName,
-					"COLUMN_TYPE":              strings.ToLower(col.Type),
+					"COLUMN_TYPE":              normalizeColumnType(col.Type),
 					"COLUMN_KEY":               columnKey,
 					"EXTRA":                    extra,
 					"PRIVILEGES":               "select,insert,update,references",
@@ -1358,9 +1596,18 @@ func (e *Executor) infoSchemaEngines() []storage.Row {
 
 // perfSchemaMemorySummary returns rows for performance_schema.memory_summary_global_by_event_name.
 func (e *Executor) perfSchemaMemorySummary() []storage.Row {
-	return []storage.Row{
-		{
-			"EVENT_NAME":                   "memory/sql/JSON",
+	names := []string{
+		"memory/sql/JSON",
+		"memory/performance_schema/users",
+		"memory/performance_schema/accounts",
+		"memory/performance_schema/hosts",
+		"memory/performance_schema/threads",
+		"memory/sql/THD::main_mem_root",
+	}
+	rows := make([]storage.Row, 0, len(names))
+	for _, n := range names {
+		rows = append(rows, storage.Row{
+			"EVENT_NAME":                   n,
 			"COUNT_ALLOC":                  int64(1),
 			"COUNT_FREE":                   int64(1),
 			"SUM_NUMBER_OF_BYTES_ALLOC":    int64(1024),
@@ -1371,13 +1618,9 @@ func (e *Executor) perfSchemaMemorySummary() []storage.Row {
 			"LOW_NUMBER_OF_BYTES_USED":     int64(0),
 			"CURRENT_NUMBER_OF_BYTES_USED": int64(0),
 			"HIGH_NUMBER_OF_BYTES_USED":    int64(1024),
-			"event_name":                   "memory/sql/JSON",
-			"count_alloc":                  int64(1),
-			"count_free":                   int64(1),
-			"sum_number_of_bytes_alloc":    int64(1024),
-			"sum_number_of_bytes_free":     int64(1024),
-		},
+		})
 	}
+	return rows
 }
 
 // perfSchemaVariables returns sorted rows for performance_schema.global_variables / session_variables.
@@ -1625,7 +1868,7 @@ func (e *Executor) perfSchemaPerformanceTimers() []storage.Row {
 
 // perfSchemaThreads returns a stub row for performance_schema.threads.
 func (e *Executor) perfSchemaThreads() []storage.Row {
-	return []storage.Row{
+	rows := []storage.Row{
 		{
 			"THREAD_ID":           int64(1),
 			"NAME":                "thread/sql/main",
@@ -1647,6 +1890,31 @@ func (e *Executor) perfSchemaThreads() []storage.Row {
 			"RESOURCE_GROUP":      "SYS_default",
 		},
 	}
+	// Add a row for the current user connection
+	connID := e.connectionID
+	if connID > 0 {
+		rows = append(rows, storage.Row{
+			"THREAD_ID":           connID + 1, // thread_id = connID + 1 by convention
+			"NAME":                "thread/sql/one_connection",
+			"TYPE":                "FOREGROUND",
+			"PROCESSLIST_ID":      connID,
+			"PROCESSLIST_USER":    "root",
+			"PROCESSLIST_HOST":    "localhost",
+			"PROCESSLIST_DB":      e.CurrentDB,
+			"PROCESSLIST_COMMAND": "Query",
+			"PROCESSLIST_TIME":    int64(0),
+			"PROCESSLIST_STATE":   nil,
+			"PROCESSLIST_INFO":    nil,
+			"PARENT_THREAD_ID":    int64(1),
+			"ROLE":                nil,
+			"INSTRUMENTED":        "YES",
+			"HISTORY":             "YES",
+			"CONNECTION_TYPE":     "TCP/IP",
+			"THREAD_OS_ID":        int64(0),
+			"RESOURCE_GROUP":      "USR_default",
+		})
+	}
+	return rows
 }
 
 // perfSchemaSetupActors returns the default rows for performance_schema.setup_actors.
@@ -2045,6 +2313,443 @@ func (e *Executor) infoSchemaViews() []storage.Row {
 				"COLLATION_CONNECTION": "utf8mb4_general_ci",
 			})
 		}
+	}
+	return rows
+}
+
+// psClassDisabled returns true when the performance_schema startup variable for
+// the given instrument class (wait, stage, statement, transaction, memory) is set to 0.
+func (e *Executor) psClassDisabled(class string) bool {
+	switch class {
+	case "wait":
+		return e.startupVars["performance_schema_max_mutex_classes"] == "0" ||
+			e.startupVars["performance_schema_max_rwlock_classes"] == "0" ||
+			e.startupVars["performance_schema_max_cond_classes"] == "0"
+	case "stage":
+		return e.startupVars["performance_schema_max_stage_classes"] == "0"
+	case "statement":
+		return e.startupVars["performance_schema_max_statement_classes"] == "0"
+	case "transaction":
+		return e.startupVars["performance_schema_max_transaction_classes"] == "0"
+	case "memory":
+		return e.startupVars["performance_schema_max_memory_classes"] == "0"
+	}
+	return false
+}
+
+// normalizeColumnType returns the MySQL COLUMN_TYPE string for a given column type.
+// For integer types without explicit display width, it adds the default display width.
+func normalizeColumnType(colType string) string {
+	t := strings.ToLower(strings.TrimSpace(colType))
+	upper := strings.ToUpper(t)
+	isUnsigned := strings.Contains(upper, "UNSIGNED")
+
+	// Check if it already has a parenthesized width
+	base := t
+	if idx := strings.Index(base, "("); idx >= 0 {
+		return t // already has explicit width
+	}
+	// Strip unsigned/zerofill for base type matching
+	baseClean := strings.TrimSpace(strings.Replace(strings.Replace(base, "unsigned", "", 1), "zerofill", "", 1))
+	baseClean = strings.TrimSpace(baseClean)
+
+	suffix := ""
+	if isUnsigned {
+		suffix = " unsigned"
+	}
+	if strings.Contains(strings.ToLower(colType), "zerofill") {
+		suffix += " zerofill"
+	}
+
+	switch baseClean {
+	case "tinyint":
+		if isUnsigned {
+			return "tinyint(3) unsigned"
+		}
+		return "tinyint(4)"
+	case "smallint":
+		if isUnsigned {
+			return "smallint(5) unsigned"
+		}
+		return "smallint(6)"
+	case "mediumint":
+		if isUnsigned {
+			return "mediumint(8) unsigned"
+		}
+		return "mediumint(9)"
+	case "int":
+		if isUnsigned {
+			return "int(10) unsigned"
+		}
+		return "int(11)"
+	case "bigint":
+		return "bigint(20)" + suffix
+	}
+	return t
+}
+
+// ---------- performance_schema seed data helpers ----------
+
+// Event name lists used by summary tables.
+var psWaitEventNames = []string{
+	"wait/lock/table/sql/handler",
+	"wait/io/file/sql/ERRMSG",
+	"wait/synch/mutex/sql/LOCK_open",
+	"wait/synch/rwlock/sql/LOCK_grant",
+	"wait/synch/cond/sql/COND_open",
+	"idle",
+}
+
+var psStageEventNames = []string{
+	"stage/sql/executing",
+	"stage/sql/init",
+	"stage/sql/Opening tables",
+	"stage/sql/After create",
+}
+
+var psTxnEventNames = []string{
+	"transaction",
+}
+
+var psStmtEventNames = []string{
+	"statement/sql/select",
+	"statement/sql/insert",
+	"statement/sql/update",
+	"statement/sql/delete",
+	"statement/sql/create_table",
+	"statement/com/Init DB",
+	"statement/com/Quit",
+}
+
+var psMemEventNames = []string{
+	"memory/performance_schema/users",
+	"memory/performance_schema/accounts",
+	"memory/performance_schema/hosts",
+	"memory/performance_schema/threads",
+	"memory/sql/THD::main_mem_root",
+	"memory/sql/help",
+}
+
+var psFileEventNames = []string{
+	"wait/io/file/sql/ERRMSG",
+	"wait/io/file/sql/binlog",
+	"wait/io/file/innodb/innodb_data_file",
+}
+
+// -- Global by event name helpers --
+
+func perfSchemaSeedGlobalByEventName(names []string) []storage.Row {
+	rows := make([]storage.Row, 0, len(names))
+	for _, n := range names {
+		rows = append(rows, storage.Row{
+			"EVENT_NAME": n, "COUNT_STAR": int64(0),
+			"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
+			"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+		})
+	}
+	return rows
+}
+
+func (e *Executor) perfSchemaSeedByThreadByEventName(names []string) []storage.Row {
+	tid := e.connectionID + 1
+	rows := make([]storage.Row, 0, len(names))
+	for _, n := range names {
+		rows = append(rows, storage.Row{
+			"THREAD_ID": tid, "EVENT_NAME": n, "COUNT_STAR": int64(0),
+			"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
+			"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+		})
+	}
+	return rows
+}
+
+func perfSchemaSeedByAccountByEventName(names []string) []storage.Row {
+	users := []string{"root", "foo"}
+	rows := make([]storage.Row, 0, len(names)*len(users))
+	for _, u := range users {
+		for _, n := range names {
+			rows = append(rows, storage.Row{
+				"USER": u, "HOST": "localhost", "EVENT_NAME": n, "COUNT_STAR": int64(0),
+				"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
+				"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+			})
+		}
+	}
+	return rows
+}
+
+func perfSchemaSeedByHostByEventName(names []string) []storage.Row {
+	rows := make([]storage.Row, 0, len(names))
+	for _, n := range names {
+		rows = append(rows, storage.Row{
+			"HOST": "localhost", "EVENT_NAME": n, "COUNT_STAR": int64(0),
+			"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
+			"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+		})
+	}
+	return rows
+}
+
+func perfSchemaSeedByUserByEventName(names []string) []storage.Row {
+	users := []string{"root", "foo"}
+	rows := make([]storage.Row, 0, len(names)*len(users))
+	for _, u := range users {
+		for _, n := range names {
+			rows = append(rows, storage.Row{
+				"USER": u, "EVENT_NAME": n, "COUNT_STAR": int64(0),
+				"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
+				"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+			})
+		}
+	}
+	return rows
+}
+
+// -- Statement summary helpers (extra columns vs waits/stages/txn) --
+
+func perfSchemaSeedStmtGlobalByEventName() []storage.Row {
+	rows := make([]storage.Row, 0, len(psStmtEventNames))
+	for _, n := range psStmtEventNames {
+		rows = append(rows, storage.Row{
+			"EVENT_NAME": n, "COUNT_STAR": int64(0),
+			"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
+			"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+			"SUM_ERRORS": int64(0), "SUM_WARNINGS": int64(0),
+			"SUM_ROWS_AFFECTED": int64(0), "SUM_ROWS_SENT": int64(0),
+			"SUM_ROWS_EXAMINED": int64(0),
+		})
+	}
+	return rows
+}
+
+func (e *Executor) perfSchemaSeedStmtByThreadByEventName() []storage.Row {
+	tid := e.connectionID + 1
+	rows := make([]storage.Row, 0, len(psStmtEventNames))
+	for _, n := range psStmtEventNames {
+		rows = append(rows, storage.Row{
+			"THREAD_ID": tid, "EVENT_NAME": n, "COUNT_STAR": int64(0),
+			"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
+			"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+			"SUM_ERRORS": int64(0), "SUM_WARNINGS": int64(0),
+			"SUM_ROWS_AFFECTED": int64(0), "SUM_ROWS_SENT": int64(0),
+			"SUM_ROWS_EXAMINED": int64(0),
+		})
+	}
+	return rows
+}
+
+func perfSchemaSeedStmtByAccountByEventName() []storage.Row {
+	users := []string{"root", "foo"}
+	rows := make([]storage.Row, 0, len(psStmtEventNames)*len(users))
+	for _, u := range users {
+		for _, n := range psStmtEventNames {
+			rows = append(rows, storage.Row{
+				"USER": u, "HOST": "localhost", "EVENT_NAME": n, "COUNT_STAR": int64(0),
+				"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
+				"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+				"SUM_ERRORS": int64(0), "SUM_WARNINGS": int64(0),
+				"SUM_ROWS_AFFECTED": int64(0), "SUM_ROWS_SENT": int64(0),
+				"SUM_ROWS_EXAMINED": int64(0),
+			})
+		}
+	}
+	return rows
+}
+
+func perfSchemaSeedStmtByHostByEventName() []storage.Row {
+	rows := make([]storage.Row, 0, len(psStmtEventNames))
+	for _, n := range psStmtEventNames {
+		rows = append(rows, storage.Row{
+			"HOST": "localhost", "EVENT_NAME": n, "COUNT_STAR": int64(0),
+			"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
+			"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+			"SUM_ERRORS": int64(0), "SUM_WARNINGS": int64(0),
+			"SUM_ROWS_AFFECTED": int64(0), "SUM_ROWS_SENT": int64(0),
+			"SUM_ROWS_EXAMINED": int64(0),
+		})
+	}
+	return rows
+}
+
+func perfSchemaSeedStmtByUserByEventName() []storage.Row {
+	users := []string{"root", "foo"}
+	rows := make([]storage.Row, 0, len(psStmtEventNames)*len(users))
+	for _, u := range users {
+		for _, n := range psStmtEventNames {
+			rows = append(rows, storage.Row{
+				"USER": u, "EVENT_NAME": n, "COUNT_STAR": int64(0),
+				"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
+				"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+				"SUM_ERRORS": int64(0), "SUM_WARNINGS": int64(0),
+				"SUM_ROWS_AFFECTED": int64(0), "SUM_ROWS_SENT": int64(0),
+				"SUM_ROWS_EXAMINED": int64(0),
+			})
+		}
+	}
+	return rows
+}
+
+// -- Error summary helpers --
+
+var psErrorNumbers = []int64{1146, 1049, 1045, 1064, 1054}
+
+func perfSchemaSeedErrorGlobal() []storage.Row {
+	rows := make([]storage.Row, 0, len(psErrorNumbers))
+	for _, n := range psErrorNumbers {
+		rows = append(rows, storage.Row{
+			"ERROR_NUMBER": n, "ERROR_NAME": "", "SQL_STATE": "",
+			"SUM_ERROR_RAISED": int64(0), "SUM_ERROR_HANDLED": int64(0),
+			"FIRST_SEEN": nil, "LAST_SEEN": nil,
+		})
+	}
+	return rows
+}
+
+func (e *Executor) perfSchemaSeedErrorByThread() []storage.Row {
+	tid := e.connectionID + 1
+	rows := make([]storage.Row, 0, len(psErrorNumbers))
+	for _, n := range psErrorNumbers {
+		rows = append(rows, storage.Row{
+			"THREAD_ID": tid, "ERROR_NUMBER": n, "ERROR_NAME": "", "SQL_STATE": "",
+			"SUM_ERROR_RAISED": int64(0), "SUM_ERROR_HANDLED": int64(0),
+			"FIRST_SEEN": nil, "LAST_SEEN": nil,
+		})
+	}
+	return rows
+}
+
+func perfSchemaSeedErrorByAccount() []storage.Row {
+	users := []string{"root", "foo"}
+	rows := make([]storage.Row, 0, len(psErrorNumbers)*len(users))
+	for _, u := range users {
+		for _, n := range psErrorNumbers {
+			rows = append(rows, storage.Row{
+				"USER": u, "HOST": "localhost", "ERROR_NUMBER": n, "ERROR_NAME": "", "SQL_STATE": "",
+				"SUM_ERROR_RAISED": int64(0), "SUM_ERROR_HANDLED": int64(0),
+				"FIRST_SEEN": nil, "LAST_SEEN": nil,
+			})
+		}
+	}
+	return rows
+}
+
+func perfSchemaSeedErrorByHost() []storage.Row {
+	rows := make([]storage.Row, 0, len(psErrorNumbers))
+	for _, n := range psErrorNumbers {
+		rows = append(rows, storage.Row{
+			"HOST": "localhost", "ERROR_NUMBER": n, "ERROR_NAME": "", "SQL_STATE": "",
+			"SUM_ERROR_RAISED": int64(0), "SUM_ERROR_HANDLED": int64(0),
+			"FIRST_SEEN": nil, "LAST_SEEN": nil,
+		})
+	}
+	return rows
+}
+
+func perfSchemaSeedErrorByUser() []storage.Row {
+	users := []string{"root", "foo"}
+	rows := make([]storage.Row, 0, len(psErrorNumbers)*len(users))
+	for _, u := range users {
+		for _, n := range psErrorNumbers {
+			rows = append(rows, storage.Row{
+				"USER": u, "ERROR_NUMBER": n, "ERROR_NAME": "", "SQL_STATE": "",
+				"SUM_ERROR_RAISED": int64(0), "SUM_ERROR_HANDLED": int64(0),
+				"FIRST_SEEN": nil, "LAST_SEEN": nil,
+			})
+		}
+	}
+	return rows
+}
+
+// -- Memory summary helpers --
+
+// psMemRow builds a single memory_summary row with required extra fields.
+func psMemRow(eventName string, extra map[string]interface{}) storage.Row {
+	row := storage.Row{
+		"EVENT_NAME":                   eventName,
+		"COUNT_ALLOC":                  int64(0),
+		"COUNT_FREE":                   int64(0),
+		"SUM_NUMBER_OF_BYTES_ALLOC":    int64(0),
+		"SUM_NUMBER_OF_BYTES_FREE":     int64(0),
+		"LOW_COUNT_USED":               int64(0),
+		"CURRENT_COUNT_USED":           int64(0),
+		"HIGH_COUNT_USED":              int64(0),
+		"LOW_NUMBER_OF_BYTES_USED":     int64(0),
+		"CURRENT_NUMBER_OF_BYTES_USED": int64(0),
+		"HIGH_NUMBER_OF_BYTES_USED":    int64(0),
+	}
+	for k, v := range extra {
+		row[k] = v
+	}
+	return row
+}
+
+func (e *Executor) perfSchemaSeedMemByThreadByEventName() []storage.Row {
+	tid := e.connectionID + 1
+	rows := make([]storage.Row, 0, len(psMemEventNames))
+	for _, n := range psMemEventNames {
+		rows = append(rows, psMemRow(n, map[string]interface{}{"THREAD_ID": tid}))
+	}
+	return rows
+}
+
+func perfSchemaSeedMemByAccountByEventName() []storage.Row {
+	users := []string{"root", "foo"}
+	rows := make([]storage.Row, 0, len(psMemEventNames)*len(users))
+	for _, u := range users {
+		for _, n := range psMemEventNames {
+			rows = append(rows, psMemRow(n, map[string]interface{}{"USER": u, "HOST": "localhost"}))
+		}
+	}
+	return rows
+}
+
+func perfSchemaSeedMemByHostByEventName() []storage.Row {
+	rows := make([]storage.Row, 0, len(psMemEventNames))
+	for _, n := range psMemEventNames {
+		rows = append(rows, psMemRow(n, map[string]interface{}{"HOST": "localhost"}))
+	}
+	return rows
+}
+
+func perfSchemaSeedMemByUserByEventName() []storage.Row {
+	users := []string{"root", "foo"}
+	rows := make([]storage.Row, 0, len(psMemEventNames)*len(users))
+	for _, u := range users {
+		for _, n := range psMemEventNames {
+			rows = append(rows, psMemRow(n, map[string]interface{}{"USER": u}))
+		}
+	}
+	return rows
+}
+
+// -- File summary by event name --
+
+func perfSchemaSeedFileSummaryByEventName() []storage.Row {
+	rows := make([]storage.Row, 0, len(psFileEventNames))
+	for _, n := range psFileEventNames {
+		rows = append(rows, storage.Row{
+			"EVENT_NAME": n, "COUNT_STAR": int64(0), "SUM_TIMER_WAIT": int64(0),
+			"COUNT_READ": int64(0), "SUM_TIMER_READ": int64(0), "SUM_NUMBER_OF_BYTES_READ": int64(0),
+			"COUNT_WRITE": int64(0), "SUM_TIMER_WRITE": int64(0), "SUM_NUMBER_OF_BYTES_WRITE": int64(0),
+			"COUNT_MISC": int64(0), "SUM_TIMER_MISC": int64(0),
+		})
+	}
+	return rows
+}
+
+// -- Histogram global --
+
+func perfSchemaSeedHistogramGlobal() []storage.Row {
+	rows := make([]storage.Row, 0, 20)
+	for i := int64(0); i < 20; i++ {
+		rows = append(rows, storage.Row{
+			"BUCKET_NUMBER": i,
+			"BUCKET_TIMER_LOW": i * 1000000,
+			"BUCKET_TIMER_HIGH": (i + 1) * 1000000,
+			"COUNT_BUCKET": int64(0),
+			"COUNT_BUCKET_AND_LOWER": int64(0),
+			"BUCKET_QUANTILE": 0.0,
+		})
 	}
 	return rows
 }

@@ -3554,9 +3554,41 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		}
 		// Handle SHOW GRANTS (vitess parser may fail on some variants)
 		if strings.HasPrefix(upper, "SHOW GRANTS") {
+			grantUser := "root"
+			grantHost := "localhost"
+			// Parse "SHOW GRANTS FOR user@host" or "SHOW GRANTS FOR 'user'@'host'"
+			if forIdx := strings.Index(upper, " FOR "); forIdx >= 0 {
+				forPart := strings.TrimSpace(trimmed[forIdx+5:])
+				forPart = strings.TrimRight(forPart, ";")
+				if atIdx := strings.LastIndex(forPart, "@"); atIdx >= 0 {
+					grantUser = strings.Trim(strings.TrimSpace(forPart[:atIdx]), "'`\"")
+					grantHost = strings.Trim(strings.TrimSpace(forPart[atIdx+1:]), "'`\"")
+				} else {
+					grantUser = strings.Trim(strings.TrimSpace(forPart), "'`\"")
+				}
+			}
+			grantRows := [][]interface{}{
+				{fmt.Sprintf("GRANT USAGE ON *.* TO `%s`@`%s`", grantUser, grantHost)},
+			}
+			// Check if any database grants exist for this user
+			if e.Catalog != nil {
+				for _, dbName := range e.Catalog.ListDatabases() {
+					if !strings.EqualFold(dbName, "information_schema") && !strings.EqualFold(dbName, "performance_schema") &&
+						!strings.EqualFold(dbName, "mysql") && !strings.EqualFold(dbName, "sys") {
+						grantRows = append(grantRows, []interface{}{
+							fmt.Sprintf("GRANT ALL PRIVILEGES ON `%s`.* TO `%s`@`%s`", dbName, grantUser, grantHost),
+						})
+					}
+				}
+			}
+			if grantUser == "root" {
+				grantRows = [][]interface{}{
+					{"GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' WITH GRANT OPTION"},
+				}
+			}
 			return &Result{
-				Columns:     []string{"Grants for root@localhost"},
-				Rows:        [][]interface{}{{"GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' WITH GRANT OPTION"}},
+				Columns:     []string{fmt.Sprintf("Grants for %s@%s", grantUser, grantHost)},
+				Rows:        grantRows,
 				IsResultSet: true,
 			}, nil
 		}
@@ -6693,6 +6725,15 @@ func convert2DigitYear(yy int) int {
 // coerceIntegerValue converts values for integer columns (TINYINT, SMALLINT, MEDIUMINT, INT, BIGINT).
 // In non-strict mode: empty string -> 0, non-numeric string -> 0 (or extract leading number),
 // negative -> 0 for UNSIGNED, out-of-range -> clipped.
+// mysqlRoundToInt rounds a float64 to int64 using MySQL's rounding rule:
+// "round half away from zero" (0.5 -> 1, -0.5 -> -1).
+func mysqlRoundToInt(f float64) int64 {
+	if f >= 0 {
+		return int64(f + 0.5)
+	}
+	return int64(f - 0.5)
+}
+
 func coerceIntegerValue(colType string, v interface{}) interface{} {
 	upper := strings.ToUpper(strings.TrimSpace(colType))
 	// Remove display width like INT(11)
@@ -6739,13 +6780,24 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 	switch val := v.(type) {
 	case int64:
 		intVal = val
+	case DivisionResult:
+		f := float64(val)
+		if f > float64(maxVal) {
+			intVal = maxVal
+		} else if f < float64(minVal) {
+			intVal = minVal
+		} else {
+			// MySQL rounds half away from zero for decimal-to-int conversion
+			intVal = mysqlRoundToInt(f)
+		}
 	case float64:
 		if val > float64(maxVal) {
 			intVal = maxVal
 		} else if val < float64(minVal) {
 			intVal = minVal
 		} else {
-			intVal = int64(val)
+			// MySQL rounds half away from zero for float-to-int conversion
+			intVal = mysqlRoundToInt(val)
 		}
 	case uint64:
 		if isUnsigned {
@@ -16107,6 +16159,123 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 	}, nil
 }
 
+// describeTableFull returns column metadata for SHOW FULL COLUMNS, including
+// Collation, Privileges, and Comment columns.
+func (e *Executor) describeTableFull(tableName string) (*Result, error) {
+	// Get the basic describe result first
+	basic, err := e.describeTable(tableName)
+	if err != nil {
+		return nil, err
+	}
+	// Extend columns: Field, Type, Collation, Null, Key, Default, Extra, Privileges, Comment
+	cols := []string{"Field", "Type", "Collation", "Null", "Key", "Default", "Extra", "Privileges", "Comment"}
+	rows := make([][]interface{}, 0, len(basic.Rows))
+	for _, row := range basic.Rows {
+		// row is [Field, Type, Null, Key, Default, Extra]
+		colType := ""
+		if len(row) > 1 && row[1] != nil {
+			colType = toString(row[1])
+		}
+		collation := interface{}(nil)
+		colTypeUpper := strings.ToUpper(colType)
+		// String types get a collation
+		if strings.Contains(colTypeUpper, "CHAR") || strings.Contains(colTypeUpper, "TEXT") ||
+			strings.Contains(colTypeUpper, "ENUM") || strings.Contains(colTypeUpper, "SET") {
+			collation = "utf8mb4_0900_ai_ci"
+			// Try to extract charset/collation from column definition
+			fieldName := ""
+			if row[0] != nil {
+				fieldName = toString(row[0])
+			}
+			descDB := e.CurrentDB
+			descTbl := tableName
+			if strings.Contains(descTbl, ".") {
+				descDB, descTbl = resolveTableNameDB(descTbl, e.CurrentDB)
+			}
+			if dbObj, err2 := e.Catalog.GetDatabase(descDB); err2 == nil {
+				if tblDef, err2 := dbObj.GetTable(descTbl); err2 == nil && tblDef != nil {
+					for _, cd := range tblDef.Columns {
+						if strings.EqualFold(cd.Name, fieldName) {
+							// Check for CHARACTER SET in column type
+							cdUpper := strings.ToUpper(cd.Type)
+							if idx := strings.Index(cdUpper, "CHARACTER SET "); idx >= 0 {
+								rest := cd.Type[idx+len("CHARACTER SET "):]
+								parts := strings.Fields(rest)
+								if len(parts) > 0 {
+									cs := strings.ToLower(parts[0])
+									// Map charset to default collation
+									switch cs {
+									case "latin1":
+										collation = "latin1_swedish_ci"
+									case "utf8", "utf8mb3":
+										collation = "utf8_general_ci"
+									case "binary":
+										collation = "binary"
+									case "gb2312":
+										collation = "gb2312_chinese_ci"
+									case "gbk":
+										collation = "gbk_chinese_ci"
+									case "gb18030":
+										collation = "gb18030_chinese_ci"
+									case "cp1250":
+										collation = "cp1250_general_ci"
+									case "ascii":
+										collation = "ascii_general_ci"
+									case "latin2":
+										collation = "latin2_general_ci"
+									case "cp932":
+										collation = "cp932_japanese_ci"
+									case "ujis":
+										collation = "ujis_japanese_ci"
+									case "ucs2":
+										collation = "ucs2_general_ci"
+									case "utf16":
+										collation = "utf16_general_ci"
+									case "utf32":
+										collation = "utf32_general_ci"
+									case "tis620":
+										collation = "tis620_thai_ci"
+									default:
+										collation = cs + "_general_ci"
+									}
+								}
+							}
+							// Check for COLLATE in column type
+							if idx := strings.Index(cdUpper, "COLLATE "); idx >= 0 {
+								rest := cd.Type[idx+len("COLLATE "):]
+								parts := strings.Fields(rest)
+								if len(parts) > 0 {
+									collation = strings.ToLower(parts[0])
+								}
+							}
+							break
+						}
+					}
+				}
+			}
+		}
+		privileges := "select,insert,update,references"
+		comment := ""
+		newRow := []interface{}{
+			row[0],      // Field
+			row[1],      // Type
+			collation,   // Collation
+			row[2],      // Null
+			row[3],      // Key
+			row[4],      // Default
+			row[5],      // Extra
+			privileges,  // Privileges
+			comment,     // Comment
+		}
+		rows = append(rows, newRow)
+	}
+	return &Result{
+		Columns:     cols,
+		Rows:        rows,
+		IsResultSet: true,
+	}, nil
+}
+
 // describeView derives DESCRIBE-style column info by executing the view's SELECT
 // and inferring types from the result set.
 func (e *Executor) describeView(viewSQL string) (*Result, error) {
@@ -16156,6 +16325,9 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			tblName := basic.Tbl.Name.String()
 			if !basic.Tbl.Qualifier.IsEmpty() {
 				tblName = basic.Tbl.Qualifier.String() + "." + tblName
+			}
+			if basic.Full {
+				return e.describeTableFull(tblName)
 			}
 			return e.describeTable(tblName)
 		case sqlparser.TableStatus:
@@ -16419,6 +16591,44 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		return &Result{
 			Columns:     []string{"Type", "Name", "Status"},
 			Rows:        [][]interface{}{{"InnoDB", "", ""}},
+			IsResultSet: true,
+		}, nil
+	}
+
+	// SHOW GRANTS [FOR user@host]
+	if strings.HasPrefix(upper, "SHOW GRANTS") {
+		grantUser := "root"
+		grantHost := "localhost"
+		if forIdx := strings.Index(upper, " FOR "); forIdx >= 0 {
+			forPart := strings.TrimSpace(query[forIdx+5:])
+			forPart = strings.TrimRight(forPart, ";")
+			if atIdx := strings.LastIndex(forPart, "@"); atIdx >= 0 {
+				grantUser = strings.Trim(strings.TrimSpace(forPart[:atIdx]), "'`\"")
+				grantHost = strings.Trim(strings.TrimSpace(forPart[atIdx+1:]), "'`\"")
+			} else {
+				grantUser = strings.Trim(strings.TrimSpace(forPart), "'`\"")
+			}
+		}
+		grantRows := [][]interface{}{
+			{fmt.Sprintf("GRANT USAGE ON *.* TO `%s`@`%s`", grantUser, grantHost)},
+		}
+		if grantUser == "root" {
+			grantRows = [][]interface{}{
+				{"GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' WITH GRANT OPTION"},
+			}
+		} else if e.Catalog != nil {
+			for _, dbName := range e.Catalog.ListDatabases() {
+				if !strings.EqualFold(dbName, "information_schema") && !strings.EqualFold(dbName, "performance_schema") &&
+					!strings.EqualFold(dbName, "mysql") && !strings.EqualFold(dbName, "sys") {
+					grantRows = append(grantRows, []interface{}{
+						fmt.Sprintf("GRANT ALL PRIVILEGES ON `%s`.* TO `%s`@`%s`", dbName, grantUser, grantHost),
+					})
+				}
+			}
+		}
+		return &Result{
+			Columns:     []string{fmt.Sprintf("Grants for %s@%s", grantUser, grantHost)},
+			Rows:        grantRows,
 			IsResultSet: true,
 		}, nil
 	}
@@ -19516,7 +19726,31 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		b.WriteString("\n")
 	}
 
-	trailer := ") ENGINE=InnoDB"
+	engineName := "InnoDB"
+	if def.Engine != "" {
+		// Normalize engine name casing to match MySQL conventions
+		switch strings.ToUpper(def.Engine) {
+		case "INNODB":
+			engineName = "InnoDB"
+		case "MYISAM":
+			engineName = "MyISAM"
+		case "MEMORY", "HEAP":
+			engineName = "MEMORY"
+		case "CSV":
+			engineName = "CSV"
+		case "ARCHIVE":
+			engineName = "ARCHIVE"
+		case "BLACKHOLE":
+			engineName = "BLACKHOLE"
+		case "MERGE", "MRGSORT", "MRG_MYISAM":
+			engineName = "MRG_MyISAM"
+		case "FEDERATED":
+			engineName = "FEDERATED"
+		default:
+			engineName = def.Engine
+		}
+	}
+	trailer := fmt.Sprintf(") ENGINE=%s", engineName)
 	if autoIncVal > 0 {
 		trailer += fmt.Sprintf(" AUTO_INCREMENT=%d", autoIncVal+1)
 	}
@@ -19622,7 +19856,12 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			}
 			n, err := strconv.ParseInt(s, 16, 64)
 			if err != nil {
-				return v.Val, nil
+				// Try unsigned for large values like 0xfffffffffffffff1
+				u, err2 := strconv.ParseUint(s, 16, 64)
+				if err2 != nil {
+					return v.Val, nil
+				}
+				return u, nil
 			}
 			return n, nil
 		case sqlparser.BitNum:
@@ -23881,6 +24120,60 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		ip6Str := toString(ip6Val)
 		if strings.Contains(ip6Str, ":") && !strings.Contains(ip6Str, " ") {
 			return int64(1), nil
+		}
+		return int64(0), nil
+	case "is_ipv4_mapped":
+		// IS_IPV4_MAPPED(binary_ip6) — checks if binary IPv6 address is IPv4-mapped (::ffff:x.x.x.x)
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("IS_IPV4_MAPPED requires 1 argument")
+		}
+		imVal, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if imVal == nil {
+			return int64(0), nil
+		}
+		imBytes := []byte(toString(imVal))
+		// IPv4-mapped: 16 bytes, first 10 zero, next 2 are 0xff
+		if len(imBytes) == 16 {
+			isMapped := true
+			for bi := 0; bi < 10; bi++ {
+				if imBytes[bi] != 0 {
+					isMapped = false
+					break
+				}
+			}
+			if isMapped && imBytes[10] == 0xff && imBytes[11] == 0xff {
+				return int64(1), nil
+			}
+		}
+		return int64(0), nil
+	case "is_ipv4_compat":
+		// IS_IPV4_COMPAT(binary_ip6) — checks if binary IPv6 address is IPv4-compatible (::x.x.x.x)
+		if len(v.Exprs) < 1 {
+			return nil, fmt.Errorf("IS_IPV4_COMPAT requires 1 argument")
+		}
+		icVal, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		if icVal == nil {
+			return int64(0), nil
+		}
+		icBytes := []byte(toString(icVal))
+		// IPv4-compatible: 16 bytes, first 12 zero, last 4 non-zero (not all-zero)
+		if len(icBytes) == 16 {
+			isCompat := true
+			for bi := 0; bi < 12; bi++ {
+				if icBytes[bi] != 0 {
+					isCompat = false
+					break
+				}
+			}
+			if isCompat && (icBytes[12] != 0 || icBytes[13] != 0 || icBytes[14] != 0 || icBytes[15] != 0) {
+				return int64(1), nil
+			}
 		}
 		return int64(0), nil
 	case "weight_string":
@@ -32037,7 +32330,7 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 			for _, expr := range sel.SelectExprs.Exprs {
 				if ae, ok := expr.(*sqlparser.AliasedExpr); ok {
 					if _, err := e.evalExpr(ae.Expr); err != nil {
-						evalErr = mysqlError(1235, "42000", "unsupported statement type: *sqlparser.OtherAdmin")
+						evalErr = err
 						return
 					}
 				}
@@ -32085,8 +32378,21 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 			}
 		}
 		if op == "optimize" {
-			// InnoDB doesn't support optimize; MySQL outputs a note then status OK
-			rows = append(rows, []interface{}{tableName, op, "note", "Table does not support optimize, doing recreate + analyze instead"})
+			// Check if the table's declared engine is InnoDB
+			isInnoDB := true
+			bareTable := t
+			if dbObj, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
+				if tblDef, err := dbObj.GetTable(bareTable); err == nil && tblDef != nil {
+					eng := strings.ToUpper(tblDef.Engine)
+					if eng == "MYISAM" || eng == "MEMORY" || eng == "CSV" || eng == "ARCHIVE" {
+						isInnoDB = false
+					}
+				}
+			}
+			if isInnoDB {
+				// InnoDB doesn't support optimize; MySQL outputs a note then status OK
+				rows = append(rows, []interface{}{tableName, op, "note", "Table does not support optimize, doing recreate + analyze instead"})
+			}
 			rows = append(rows, []interface{}{tableName, op, "status", "OK"})
 		} else {
 			rows = append(rows, []interface{}{tableName, op, "status", "OK"})

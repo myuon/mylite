@@ -967,7 +967,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		ctx.verticalResults = false
 		return true, false, nil
 
-	case "sorted_result":
+	case "sorted_result", "partially_sorted_result":
 		ctx.sortResult = true
 		return true, false, nil
 
@@ -2952,7 +2952,7 @@ var directiveKeywords = map[string]bool{
 	"disable_warnings": true, "enable_warnings": true,
 	"disable_query_log": true, "enable_query_log": true,
 	"disable_result_log": true, "enable_result_log": true,
-	"sorted_result": true, "connect": true, "disconnect": true,
+	"sorted_result": true, "partially_sorted_result": true, "connect": true, "disconnect": true,
 	"send": true, "send_eval": true, "reap": true, "sleep": true,
 	"horizontal_results": true, "vertical_results": true,
 	"exit": true, "connection": true, "die": true,
