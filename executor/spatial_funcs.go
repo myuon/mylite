@@ -1081,3 +1081,58 @@ func makeSpatialEnvelope(a, b string) interface{} {
 		formatSpatialFloat(minX), formatSpatialFloat(maxY),
 		formatSpatialFloat(minX), formatSpatialFloat(minY))
 }
+
+// wktBoundingBox extracts the bounding box (MBR) from a WKT geometry string.
+// Returns [minX, minY, maxX, maxY] or nil if the geometry can't be parsed.
+func wktBoundingBox(wkt string) []float64 {
+	wkt = strings.TrimSpace(wkt)
+	upper := strings.ToUpper(wkt)
+
+	var allPoints [][]float64
+
+	switch {
+	case strings.HasPrefix(upper, "POINT"):
+		coords := parseSpatialPointCoords(wkt)
+		if coords == nil {
+			return nil
+		}
+		allPoints = append(allPoints, coords)
+	case strings.HasPrefix(upper, "LINESTRING"):
+		pts := parseLineStringPoints(wkt)
+		allPoints = append(allPoints, pts...)
+	case strings.HasPrefix(upper, "POLYGON"), strings.HasPrefix(upper, "MULTIPOLYGON"):
+		rings := parsePolygonRings(wkt)
+		for _, ring := range rings {
+			allPoints = append(allPoints, ring...)
+		}
+	case strings.HasPrefix(upper, "MULTIPOINT"):
+		rings := parsePolygonRings(wkt)
+		for _, ring := range rings {
+			allPoints = append(allPoints, ring...)
+		}
+	default:
+		return nil
+	}
+
+	if len(allPoints) == 0 {
+		return nil
+	}
+
+	minX, minY := allPoints[0][0], allPoints[0][1]
+	maxX, maxY := minX, minY
+	for _, p := range allPoints[1:] {
+		if p[0] < minX {
+			minX = p[0]
+		}
+		if p[1] < minY {
+			minY = p[1]
+		}
+		if p[0] > maxX {
+			maxX = p[0]
+		}
+		if p[1] > maxY {
+			maxY = p[1]
+		}
+	}
+	return []float64{minX, minY, maxX, maxY}
+}

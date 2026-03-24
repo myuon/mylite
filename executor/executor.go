@@ -267,6 +267,13 @@ type Executor struct {
 	// txnActiveSet is a shared set tracking which connections are currently in a transaction.
 	// Used for filtering uncommitted rows from other connections during reads.
 	txnActiveSet *TxnActiveSet
+	// selectSkipLocked is set when the current SELECT uses SKIP LOCKED.
+	selectSkipLocked bool
+	// selectNowait is set when the current SELECT uses NOWAIT.
+	selectNowait bool
+	// tableLockManager manages LOCK TABLE READ/WRITE per connection.
+	// Shared across all executor instances.
+	tableLockManager *TableLockManager
 }
 
 // Warning represents a MySQL warning.
@@ -375,6 +382,7 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	e.lockManager = NewLockManager()
 	e.rowLockManager = NewRowLockManager()
 	e.txnActiveSet = NewTxnActiveSet()
+	e.tableLockManager = NewTableLockManager()
 	e.initSystemTables()
 	return e
 }
@@ -422,6 +430,7 @@ func (e *Executor) Clone() *Executor {
 		rowLockManager:   e.rowLockManager,
 		processList:      e.processList,
 		txnActiveSet:     e.txnActiveSet,
+		tableLockManager: e.tableLockManager,
 	}
 }
 
@@ -432,6 +441,9 @@ func (e *Executor) OnDisconnect() {
 	}
 	if e.rowLockManager != nil {
 		e.rowLockManager.ReleaseRowLocks(e.connectionID)
+	}
+	if e.tableLockManager != nil {
+		e.tableLockManager.UnlockAll(e.connectionID)
 	}
 }
 
@@ -3302,6 +3314,13 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	query = normalizeAddIndexUsing(query)
 	// Fix CREATE TABLE with "KEY/INDEX/PRIMARY KEY USING BTREE/HASH (cols)" syntax
 	query = normalizeCreateTableIndexUsing(query)
+	// Detect SKIP LOCKED / NOWAIT before stripping them so that
+	// acquireRowLocksForSelect can use the correct lock semantics.
+	{
+		uq := strings.ToUpper(query)
+		e.selectSkipLocked = strings.Contains(uq, "SKIP LOCKED")
+		e.selectNowait = strings.Contains(uq, "NOWAIT")
+	}
 	query = normalizeForShareOf(query)
 	query = normalizeMemberOperator(query)
 	query = normalizeJSONTableDefaultOrder(query)
@@ -3417,6 +3436,13 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	trimmed = strings.TrimSpace(query)
 	upper = strings.ToUpper(trimmed)
 
+	// Normalize "LOCK TABLE" (singular) to "LOCK TABLES" (plural) for vitess parser
+	if strings.HasPrefix(upper, "LOCK TABLE ") && !strings.HasPrefix(upper, "LOCK TABLES ") {
+		query = "LOCK TABLES " + query[len("LOCK TABLE "):]
+		trimmed = strings.TrimSpace(query)
+		upper = strings.ToUpper(trimmed)
+	}
+
 	stmt, err := e.parser().Parse(query)
 	if err != nil {
 		// Accept statements that Vitess parser doesn't support
@@ -3515,6 +3541,13 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", truncateNear(trimmed)))
 	}
 
+	// Enforce LOCK TABLES restrictions before dispatching
+	if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
+		if lockErr := e.checkTableLockRestrictions(stmt); lockErr != nil {
+			return nil, lockErr
+		}
+	}
+
 	switch s := stmt.(type) {
 	case *sqlparser.CreateDatabase:
 		return e.execCreateDatabase(s)
@@ -3563,19 +3596,52 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	case *sqlparser.Set:
 		return e.execSet(s)
 	case *sqlparser.LockTables:
-		// Check for non-writable performance_schema tables
+		// Release any previously held table locks (MySQL behavior: LOCK TABLES implicitly unlocks)
+		if e.tableLockManager != nil {
+			e.tableLockManager.UnlockAll(e.connectionID)
+		}
+		// Check for non-writable performance_schema tables and record locks
 		for _, tl := range s.Tables {
 			if ate, ok := tl.Table.(*sqlparser.AliasedTableExpr); ok {
 				if tn, ok := ate.Expr.(sqlparser.TableName); ok {
 					if strings.EqualFold(tn.Qualifier.String(), "performance_schema") && !perfSchemaWritableTable(tn.Name.String()) {
 						return nil, mysqlError(1142, "42000", fmt.Sprintf("SELECT, LOCK TABLES command denied to user 'root'@'localhost' for table '%s'", tn.Name.String()))
 					}
+					// Record table lock
+					if e.tableLockManager != nil {
+						dbName := e.CurrentDB
+						if !tn.Qualifier.IsEmpty() {
+							dbName = tn.Qualifier.String()
+						}
+						tableName := tn.Name.String()
+						// Also record alias if present
+						alias := ""
+						if !ate.As.IsEmpty() {
+							alias = ate.As.String()
+						}
+						var mode string
+						switch tl.Lock {
+						case sqlparser.Read, sqlparser.ReadLocal:
+							mode = "READ"
+						default:
+							mode = "WRITE"
+						}
+						if alias != "" {
+							// When alias is used, only record the alias (not the base name)
+							// to avoid overwriting a different lock mode on the same table.
+							e.tableLockManager.LockTable(e.connectionID, dbName+"."+alias, mode)
+						} else {
+							e.tableLockManager.LockTable(e.connectionID, dbName+"."+tableName, mode)
+						}
+					}
 				}
 			}
 		}
 		return &Result{}, nil
 	case *sqlparser.UnlockTables:
-		// Accept UNLOCK TABLES silently
+		if e.tableLockManager != nil {
+			e.tableLockManager.UnlockAll(e.connectionID)
+		}
 		return &Result{}, nil
 	case *sqlparser.Analyze:
 		tableName := s.Table.Name.String()
@@ -3914,6 +3980,252 @@ func castToJSONValue(val interface{}, strictStringLiteral bool) (interface{}, er
 		}
 		return jsonMarshalMySQL(js), nil
 	}
+}
+
+// checkTableLockRestrictions enforces LOCK TABLE restrictions when a session
+// holds table-level locks via LOCK TABLES. It returns a MySQL error when:
+//   - A write operation targets a READ-locked table (error 1099)
+//   - Any operation targets a table not in the lock set (error 1100)
+func (e *Executor) checkTableLockRestrictions(stmt sqlparser.Statement) error {
+	switch s := stmt.(type) {
+	case *sqlparser.Update:
+		// Check each table in the UPDATE
+		for _, te := range s.TableExprs {
+			if ate, ok := te.(*sqlparser.AliasedTableExpr); ok {
+				if tn, ok := ate.Expr.(sqlparser.TableName); ok {
+					tableName := tn.Name.String()
+					dbName := e.CurrentDB
+					if !tn.Qualifier.IsEmpty() {
+						dbName = tn.Qualifier.String()
+					}
+					key := dbName + "." + tableName
+					locked, mode := e.tableLockManager.IsLocked(e.connectionID, key)
+					if !locked {
+						return mysqlError(1100, "HY000", fmt.Sprintf("Table '%s' was not locked with LOCK TABLES", tableName))
+					}
+					if mode == "READ" {
+						return mysqlError(1099, "HY000", fmt.Sprintf("Table '%s' was locked with a READ lock and can't be updated", tableName))
+					}
+				}
+			}
+		}
+	case *sqlparser.Insert:
+		var tableName, dbName string
+		dbName = e.CurrentDB
+		if tn, ok := s.Table.Expr.(sqlparser.TableName); ok {
+			tableName = tn.Name.String()
+			if !tn.Qualifier.IsEmpty() {
+				dbName = tn.Qualifier.String()
+			}
+		} else {
+			return nil
+		}
+		key := dbName + "." + tableName
+		locked, mode := e.tableLockManager.IsLocked(e.connectionID, key)
+		if !locked {
+			return mysqlError(1100, "HY000", fmt.Sprintf("Table '%s' was not locked with LOCK TABLES", tableName))
+		}
+		if mode == "READ" {
+			return mysqlError(1099, "HY000", fmt.Sprintf("Table '%s' was locked with a READ lock and can't be updated", tableName))
+		}
+		// Also check source tables in INSERT ... SELECT
+		if s.Rows != nil {
+			if sel, ok := s.Rows.(*sqlparser.Select); ok {
+				for _, te := range sel.From {
+					if ate, ok := te.(*sqlparser.AliasedTableExpr); ok {
+						if tn, ok := ate.Expr.(sqlparser.TableName); ok {
+							srcName := tn.Name.String()
+							srcDB := e.CurrentDB
+							if !tn.Qualifier.IsEmpty() {
+								srcDB = tn.Qualifier.String()
+							}
+							// Use alias name for lock check if present
+							checkName := srcName
+							if !ate.As.IsEmpty() {
+								checkName = ate.As.String()
+							}
+							srcKey := srcDB + "." + checkName
+							srcLocked, _ := e.tableLockManager.IsLocked(e.connectionID, srcKey)
+							if !srcLocked {
+								return mysqlError(1100, "HY000", fmt.Sprintf("Table '%s' was not locked with LOCK TABLES", srcName))
+							}
+							// MySQL requires a separate lock alias when reading
+							// from the same table that is being inserted into.
+							// If source == target (same name, no alias), deny.
+							if strings.EqualFold(srcName, tableName) && ate.As.IsEmpty() {
+								return mysqlError(1100, "HY000", fmt.Sprintf("Table '%s' was not locked with LOCK TABLES", srcName))
+							}
+						}
+					}
+				}
+			}
+		}
+	case *sqlparser.Delete:
+		for _, te := range s.TableExprs {
+			if ate, ok := te.(*sqlparser.AliasedTableExpr); ok {
+				if tn, ok := ate.Expr.(sqlparser.TableName); ok {
+					tableName := tn.Name.String()
+					dbName := e.CurrentDB
+					if !tn.Qualifier.IsEmpty() {
+						dbName = tn.Qualifier.String()
+					}
+					key := dbName + "." + tableName
+					locked, mode := e.tableLockManager.IsLocked(e.connectionID, key)
+					if !locked {
+						return mysqlError(1100, "HY000", fmt.Sprintf("Table '%s' was not locked with LOCK TABLES", tableName))
+					}
+					if mode == "READ" {
+						return mysqlError(1099, "HY000", fmt.Sprintf("Table '%s' was locked with a READ lock and can't be updated", tableName))
+					}
+				}
+			}
+		}
+	case *sqlparser.CreateTable:
+		// CREATE TABLE when LOCK TABLES is active: the new table must be locked
+		tableName := s.Table.Name.String()
+		dbName := e.CurrentDB
+		if !s.Table.Qualifier.IsEmpty() {
+			dbName = s.Table.Qualifier.String()
+		}
+		// Temp tables are exempt from LOCK TABLE checks
+		if s.Temp {
+			return nil
+		}
+		key := dbName + "." + tableName
+		locked, _ := e.tableLockManager.IsLocked(e.connectionID, key)
+		if !locked {
+			return mysqlError(1100, "HY000", fmt.Sprintf("Table '%s' was not locked with LOCK TABLES", tableName))
+		}
+	case *sqlparser.DropTable:
+		// Temp tables are exempt from LOCK TABLE checks
+		if s.Temp {
+			return nil
+		}
+		for _, tn := range s.FromTables {
+			tableName := tn.Name.String()
+			dbName := e.CurrentDB
+			if !tn.Qualifier.IsEmpty() {
+				dbName = tn.Qualifier.String()
+			}
+			// Check if this is a temp table (also check without lowercase)
+			if e.tempTables != nil && (e.tempTables[tableName] || e.tempTables[strings.ToLower(tableName)]) {
+				continue
+			}
+			// If IfExists is set and table doesn't exist normally, skip lock check
+			if s.IfExists {
+				tbl, tblErr := e.Storage.GetTable(dbName, tableName)
+				if tblErr != nil || tbl == nil {
+					continue
+				}
+			}
+			key := dbName + "." + tableName
+			locked, _ := e.tableLockManager.IsLocked(e.connectionID, key)
+			if !locked {
+				return mysqlError(1100, "HY000", fmt.Sprintf("Table '%s' was not locked with LOCK TABLES", tableName))
+			}
+		}
+	}
+	return nil
+}
+
+// checkGapLockForInsert checks if the INSERT's new row PK falls within a gap
+// lock held by another connection. Returns true if the INSERT should be blocked.
+// This simulates InnoDB gap locks in REPEATABLE READ for PK-based index scans.
+func (e *Executor) checkGapLockForInsert(dbName, tableName string, stmt *sqlparser.Insert) bool {
+	if e.rowLockManager == nil {
+		return false
+	}
+	// Get the table definition for PK columns
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		return false
+	}
+	def, err := db.GetTable(tableName)
+	if err != nil || def == nil || len(def.PrimaryKey) == 0 {
+		return false
+	}
+
+	// Only check single-column integer PKs for gap lock (common case)
+	if len(def.PrimaryKey) != 1 {
+		return false
+	}
+	pkCol := def.PrimaryKey[0]
+
+	// Find the PK column index in the INSERT columns
+	pkIdx := -1
+	for i, col := range stmt.Columns {
+		if strings.EqualFold(col.String(), pkCol) {
+			pkIdx = i
+			break
+		}
+	}
+	// If no explicit column list, use column position from table def
+	if pkIdx == -1 && len(stmt.Columns) == 0 {
+		for i, col := range def.Columns {
+			if strings.EqualFold(col.Name, pkCol) {
+				pkIdx = i
+				break
+			}
+		}
+	}
+	if pkIdx < 0 {
+		return false
+	}
+
+	// Extract PK values from the INSERT VALUES
+	valuesStmt, ok := stmt.Rows.(sqlparser.Values)
+	if !ok || len(valuesStmt) == 0 {
+		return false
+	}
+	for _, vt := range valuesStmt {
+		if pkIdx >= len(vt) {
+			continue
+		}
+		lit, ok := vt[pkIdx].(*sqlparser.Literal)
+		if !ok {
+			continue
+		}
+		insertPKVal, err := strconv.ParseInt(lit.Val, 10, 64)
+		if err != nil {
+			continue
+		}
+
+		// Get all locked PK values for this table from other connections
+		prefix := dbName + ":" + tableName + ":"
+		lockedPKs := e.rowLockManager.GetOtherLockedKeysWithPrefix(e.connectionID, prefix)
+		if len(lockedPKs) == 0 {
+			return false
+		}
+
+		// Parse locked PK values and check if the insert PK falls between them
+		var lockedVals []int64
+		for _, key := range lockedPKs {
+			// Key format: "db:table:pkval"
+			parts := strings.SplitN(key, ":", 3)
+			if len(parts) < 3 {
+				continue
+			}
+			v, err := strconv.ParseInt(parts[2], 10, 64)
+			if err != nil {
+				continue
+			}
+			lockedVals = append(lockedVals, v)
+		}
+		if len(lockedVals) < 2 {
+			return false
+		}
+
+		// Sort locked values
+		sort.Slice(lockedVals, func(i, j int) bool { return lockedVals[i] < lockedVals[j] })
+
+		// Check if insertPKVal falls between any two consecutive locked values
+		for i := 0; i < len(lockedVals)-1; i++ {
+			if insertPKVal > lockedVals[i] && insertPKVal < lockedVals[i+1] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error) {
@@ -7490,7 +7802,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		// CREATE TABLE ... SELECT
 		if stmt.Select != nil {
 			selectSQL := sqlparser.String(stmt.Select)
-			return e.execCreateTableSelect(tableName, selectSQL)
+			result, err := e.execCreateTableSelect(tableName, selectSQL)
+			if err == nil && stmt.Temp {
+				e.tempTables[tableName] = true
+			}
+			return result, err
 		}
 		return &Result{}, nil
 	}
@@ -8621,6 +8937,40 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			delete(e.psTruncated, lowerTable)
 		}
 		return &Result{AffectedRows: 1}, nil
+	}
+
+	// Gap lock simulation: in REPEATABLE READ (or stricter), if another
+	// connection holds row locks on this table, the INSERT may be blocked
+	// by gap locks when the new row's PK falls between two locked PKs.
+	if e.rowLockManager != nil && e.shouldAcquireRowLocks() {
+		isoLevel, _ := e.getSysVar("transaction_isolation")
+		if isoLevel == "" {
+			isoLevel, _ = e.getSysVar("tx_isolation")
+		}
+		isReadCommitted := strings.EqualFold(isoLevel, "READ-COMMITTED") || strings.EqualFold(isoLevel, "READ COMMITTED")
+		isReadUncommitted := strings.EqualFold(isoLevel, "READ-UNCOMMITTED") || strings.EqualFold(isoLevel, "READ UNCOMMITTED")
+		if !isReadCommitted && !isReadUncommitted {
+			// Check if the new row's PK falls between locked PKs (gap lock)
+			if blocked := e.checkGapLockForInsert(insertDB, tableName, stmt); blocked {
+				timeout := 50.0
+				if v, ok := e.getSysVar("innodb_lock_wait_timeout"); ok {
+					if t, err := strconv.ParseFloat(v, 64); err == nil {
+						timeout = t
+					}
+				}
+				// Wait up to timeout, checking periodically
+				deadline := time.Now().Add(time.Duration(timeout * float64(time.Second)))
+				for time.Now().Before(deadline) {
+					if !e.checkGapLockForInsert(insertDB, tableName, stmt) {
+						break
+					}
+					time.Sleep(50 * time.Millisecond)
+				}
+				if e.checkGapLockForInsert(insertDB, tableName, stmt) {
+					return nil, mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
+				}
+			}
+		}
 	}
 
 	tbl, err := e.Storage.GetTable(insertDB, tableName)
@@ -11471,9 +11821,24 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 			needsRowLock = true
 		}
 	}
+	// SERIALIZABLE isolation: all reads are implicitly FOR SHARE when in a transaction
+	if !needsRowLock && e.shouldAcquireRowLocks() {
+		isoLevel, _ := e.getSysVar("transaction_isolation")
+		if isoLevel == "" {
+			isoLevel, _ = e.getSysVar("tx_isolation")
+		}
+		if strings.EqualFold(isoLevel, "SERIALIZABLE") {
+			needsRowLock = true
+		}
+	}
 	if needsRowLock && e.rowLockManager != nil && len(allRows) > 0 {
-		if err := e.acquireRowLocksForSelect(stmt, allRows, preWhereRows); err != nil {
+		filteredRows, err := e.acquireRowLocksForSelect(stmt, allRows, preWhereRows)
+		if err != nil {
 			return nil, err
+		}
+		if filteredRows != nil {
+			// SKIP LOCKED: use only the rows we could lock
+			allRows = filteredRows
 		}
 	}
 
@@ -11706,7 +12071,10 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 // acquireRowLocksForSelect acquires row-level locks for SELECT ... FOR UPDATE / LOCK IN SHARE MODE.
 // In REPEATABLE READ, it locks ALL rows from preWhereRows (simulating InnoDB full table scan locking).
 // In READ COMMITTED, it locks only the filtered result rows.
-func (e *Executor) acquireRowLocksForSelect(stmt *sqlparser.Select, rows []storage.Row, preWhereRows []storage.Row) error {
+// When SKIP LOCKED is active, returns the subset of rows that were successfully locked (non-nil).
+// When NOWAIT is active, returns an immediate error if any row is locked.
+// Otherwise returns (nil, nil) on success (caller keeps original rows).
+func (e *Executor) acquireRowLocksForSelect(stmt *sqlparser.Select, rows []storage.Row, preWhereRows []storage.Row) ([]storage.Row, error) {
 	// Determine timeout from innodb_lock_wait_timeout
 	timeout := 50.0 // default
 	if v, ok := e.getSysVar("innodb_lock_wait_timeout"); ok {
@@ -11714,6 +12082,17 @@ func (e *Executor) acquireRowLocksForSelect(stmt *sqlparser.Select, rows []stora
 			timeout = t
 		}
 	}
+
+	skipLocked := e.selectSkipLocked
+	nowait := e.selectNowait
+
+	// For NOWAIT, use zero timeout (immediate failure)
+	if nowait {
+		timeout = 0
+	}
+
+	// Determine if FOR UPDATE (exclusive) or FOR SHARE (shared)
+	exclusive := stmt.Lock == sqlparser.ForUpdateLock
 
 	// Check isolation level
 	isoLevel, _ := e.getSysVar("transaction_isolation")
@@ -11756,17 +12135,55 @@ func (e *Executor) acquireRowLocksForSelect(stmt *sqlparser.Select, rows []stora
 		isPKLookup := len(pkCols) > 0 && isWherePKEquality(stmt, pkCols)
 		lockAll := !isReadCommitted && !hasLimit && !isPKLookup
 
+		// Track lock keys that couldn't be acquired (for SKIP LOCKED)
+		var failedLockKeys map[string]bool
+		if skipLocked {
+			failedLockKeys = make(map[string]bool)
+		}
+
 		if len(pkCols) > 0 {
 			// Has PK: lock rows by PK value
 			lockRows := rows
 			if lockAll {
 				lockRows = preWhereRows
+			} else if hasLimit && stmt.Limit != nil && stmt.Limit.Rowcount != nil && !skipLocked {
+				// When LIMIT is present (and not SKIP LOCKED), lock only up to
+				// LIMIT rows to emulate InnoDB PK index scan stopping early.
+				if limitExpr, ok := stmt.Limit.Rowcount.(*sqlparser.Literal); ok {
+					if n, err := strconv.Atoi(limitExpr.Val); err == nil && n < len(lockRows) {
+						lockRows = lockRows[:n]
+					}
+				}
 			}
 			for _, row := range lockRows {
 				lockKey := buildRowLockKey(dbName, tableName, pkCols, row)
-				if err := e.rowLockManager.AcquireRowLock(e.connectionID, lockKey, timeout); err != nil {
-					return mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
+				if skipLocked || nowait {
+					acquired, _ := e.rowLockManager.TryAcquireRowLock(e.connectionID, lockKey, exclusive)
+					if !acquired {
+						if nowait {
+							return nil, mysqlError(3572, "HY000", "Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set.")
+						}
+						// SKIP LOCKED: remember failed key
+						failedLockKeys[lockKey] = true
+						continue
+					}
+				} else {
+					if err := e.rowLockManager.AcquireRowLock(e.connectionID, lockKey, timeout); err != nil {
+						return nil, mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
+					}
 				}
+			}
+
+			// For SKIP LOCKED: filter result rows to exclude those with failed locks
+			if skipLocked && len(failedLockKeys) > 0 {
+				var filtered []storage.Row
+				for _, row := range rows {
+					lockKey := buildRowLockKey(dbName, tableName, pkCols, row)
+					if !failedLockKeys[lockKey] {
+						filtered = append(filtered, row)
+					}
+				}
+				return filtered, nil
 			}
 		} else {
 			// No PK: lock rows by index in the storage table.
@@ -11774,12 +12191,30 @@ func (e *Executor) acquireRowLocksForSelect(stmt *sqlparser.Select, rows []stora
 			if storErr != nil {
 				continue
 			}
+			// Track locked storage indices for SKIP LOCKED filtering
+			var lockedStorIdx map[int]bool
+			if skipLocked {
+				lockedStorIdx = make(map[int]bool)
+			}
 			if lockAll {
 				// Lock all rows by index (full table scan)
 				for i := 0; i < len(storTbl.Rows); i++ {
 					lockKey := buildRowLockKeyByIndex(dbName, tableName, i)
-					if err := e.rowLockManager.AcquireRowLock(e.connectionID, lockKey, timeout); err != nil {
-						return mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
+					if skipLocked || nowait {
+						acquired, _ := e.rowLockManager.TryAcquireRowLock(e.connectionID, lockKey, exclusive)
+						if !acquired {
+							if nowait {
+								return nil, mysqlError(3572, "HY000", "Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set.")
+							}
+							continue
+						}
+						if skipLocked {
+							lockedStorIdx[i] = true
+						}
+					} else {
+						if err := e.rowLockManager.AcquireRowLock(e.connectionID, lockKey, timeout); err != nil {
+							return nil, mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
+						}
 					}
 				}
 			} else {
@@ -11798,14 +12233,43 @@ func (e *Executor) acquireRowLocksForSelect(stmt *sqlparser.Select, rows []stora
 				}
 				for i := 0; i <= maxIdx; i++ {
 					lockKey := buildRowLockKeyByIndex(dbName, tableName, i)
-					if err := e.rowLockManager.AcquireRowLock(e.connectionID, lockKey, timeout); err != nil {
-						return mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
+					if skipLocked || nowait {
+						acquired, _ := e.rowLockManager.TryAcquireRowLock(e.connectionID, lockKey, exclusive)
+						if !acquired {
+							if nowait {
+								return nil, mysqlError(3572, "HY000", "Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set.")
+							}
+							continue
+						}
+						if skipLocked {
+							lockedStorIdx[i] = true
+						}
+					} else {
+						if err := e.rowLockManager.AcquireRowLock(e.connectionID, lockKey, timeout); err != nil {
+							return nil, mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
+						}
 					}
 				}
 			}
+			// For SKIP LOCKED with no PK: filter result rows by storage index
+			if skipLocked && lockedStorIdx != nil {
+				var filtered []storage.Row
+				for _, row := range rows {
+					for i, sRow := range storTbl.Rows {
+						if rowsEqual(row, sRow, def) {
+							if lockedStorIdx[i] {
+								filtered = append(filtered, row)
+							}
+							break
+						}
+					}
+				}
+				return filtered, nil
+			}
 		}
 	}
-	return nil
+
+	return nil, nil
 }
 
 // acquireRowLocksForRows acquires row-level locks on specific rows identified by
@@ -23095,6 +23559,49 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 			return int64(1), nil
 		}
 		return int64(0), nil
+	case "mbrintersects", "st_intersects", "mbrwithin", "st_within", "mbrcontains", "st_contains":
+		// MBRWithin(g1, g2) — check if g1's MBR is within g2's MBR
+		// MBRContains(g1, g2) — check if g1's MBR contains g2's MBR
+		if len(v.Exprs) < 2 {
+			return nil, fmt.Errorf("%s requires 2 arguments", strings.ToUpper(name))
+		}
+		g1Val, err := e.evalExpr(v.Exprs[0])
+		if err != nil {
+			return nil, err
+		}
+		g2Val, err := e.evalExpr(v.Exprs[1])
+		if err != nil {
+			return nil, err
+		}
+		if g1Val == nil || g2Val == nil {
+			return nil, nil
+		}
+		g1Str := toString(g1Val)
+		g2Str := toString(g2Val)
+		mbr1 := wktBoundingBox(g1Str)
+		mbr2 := wktBoundingBox(g2Str)
+		if mbr1 == nil || mbr2 == nil {
+			return nil, nil
+		}
+		if name == "mbrintersects" || name == "st_intersects" {
+			// MBRIntersects: true if MBRs overlap (not disjoint)
+			if mbr1[2] >= mbr2[0] && mbr2[2] >= mbr1[0] && mbr1[3] >= mbr2[1] && mbr2[3] >= mbr1[1] {
+				return int64(1), nil
+			}
+			return int64(0), nil
+		}
+		if name == "mbrwithin" || name == "st_within" {
+			// g1 within g2: g1's MBR is entirely inside g2's MBR
+			if mbr1[0] >= mbr2[0] && mbr1[1] >= mbr2[1] && mbr1[2] <= mbr2[2] && mbr1[3] <= mbr2[3] {
+				return int64(1), nil
+			}
+			return int64(0), nil
+		}
+		// contains: g1's MBR contains g2's MBR
+		if mbr2[0] >= mbr1[0] && mbr2[1] >= mbr1[1] && mbr2[2] <= mbr1[2] && mbr2[3] <= mbr1[3] {
+			return int64(1), nil
+		}
+		return int64(0), nil
 	case "roles_graphml":
 		return "<graphml/>", nil
 	case "make_set":
@@ -25916,8 +26423,20 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		if result, err := e.callUserDefinedFunction(name, v.Exprs, &row, qualifier); err == nil {
 			return result, nil
 		}
-		// Fallback: delegate to evalFuncExpr (no row context for args)
-		return e.evalFuncExpr(v)
+		// Fallback: delegate to evalFuncExpr.
+		// For spatial functions that need column values (MBRWithin, MBRIntersects, etc.),
+		// set correlatedRow so column references resolve to actual values.
+		funcNameLower := strings.ToLower(v.Name.String())
+		switch funcNameLower {
+		case "mbrwithin", "st_within", "mbrcontains", "st_contains", "mbrintersects", "st_intersects":
+			oldCorrelated := e.correlatedRow
+			e.correlatedRow = row
+			result, err := e.evalFuncExpr(v)
+			e.correlatedRow = oldCorrelated
+			return result, err
+		default:
+			return e.evalFuncExpr(v)
+		}
 	}
 }
 
@@ -31280,7 +31799,7 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 	// Strip trailing options (QUICK, FAST, MEDIUM, EXTENDED, CHANGED, FOR UPGRADE, etc.)
 	{
 		restUpper := strings.ToUpper(rest)
-		checkOpts := []string{"QUICK", "FAST", "MEDIUM", "EXTENDED", "CHANGED", "FOR UPGRADE"}
+		checkOpts := []string{"QUICK", "FAST", "MEDIUM", "EXTENDED", "CHANGED", "FOR UPGRADE", "USE_FRM"}
 		for _, co := range checkOpts {
 			if strings.HasSuffix(strings.TrimSpace(strings.TrimRight(restUpper, ";")), co) {
 				rest = strings.TrimSpace(rest[:len(strings.TrimSpace(strings.TrimRight(rest, ";")))-len(co)])
@@ -31297,6 +31816,17 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 		tableName := t
 		if !strings.Contains(tableName, ".") {
 			tableName = e.CurrentDB + "." + tableName
+		}
+		// Check table lock restrictions for CHECK/REPAIR when LOCK TABLES is active
+		if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
+			bareTable := t
+			lockKey := e.CurrentDB + "." + bareTable
+			locked, _ := e.tableLockManager.IsLocked(e.connectionID, lockKey)
+			if !locked {
+				rows = append(rows, []interface{}{tableName, op, "Error", fmt.Sprintf("Table '%s' was not locked with LOCK TABLES", bareTable)})
+				rows = append(rows, []interface{}{tableName, op, "status", "Operation failed"})
+				continue
+			}
 		}
 		if op == "optimize" {
 			// InnoDB doesn't support optimize; MySQL outputs a note then status OK

@@ -1078,7 +1078,9 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 				// In eval context, undefined variables expand to empty string
 				args = ctx.substituteVars(args)
 				args = stripUndefinedVars(args)
-				args = strings.TrimSpace(args)
+				// Don't TrimSpace here: preserve trailing space before semicolon
+				// so that "LIMIT 2 $for_share;" echoes as "LIMIT 2 ;" when $for_share is empty
+				args = strings.TrimRight(args, "\t\r\n")
 			}
 			if name == "query_vertical" {
 				ctx.verticalResult = true
@@ -1282,7 +1284,17 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 			if ctx.expectedError != "" {
 				if ctx.resultLogEnabled {
 					if strings.Contains(ctx.expectedError, ",") {
-						ctx.output.WriteString("Got one of the listed errors\n")
+						codes := strings.Split(ctx.expectedError, ",")
+						includesZero := false
+						for _, c := range codes {
+							if strings.TrimSpace(c) == "0" {
+								includesZero = true
+								break
+							}
+						}
+						if !includesZero {
+							ctx.output.WriteString("Got one of the listed errors\n")
+						}
 					} else {
 						ctx.output.WriteString(formatMySQLError(result.err) + "\n")
 					}
@@ -1999,7 +2011,20 @@ func (ctx *execContext) executeQuery(stmt string) error {
 			// Output the error message (mysqltest format)
 			if ctx.resultLogEnabled {
 				if strings.Contains(ctx.expectedError, ",") {
-					ctx.output.WriteString("Got one of the listed errors\n")
+					// When expected error list includes 0 (success allowed),
+					// errors are silently absorbed with no output line.
+					// Otherwise, output "Got one of the listed errors".
+					codes := strings.Split(ctx.expectedError, ",")
+					includesZero := false
+					for _, c := range codes {
+						if strings.TrimSpace(c) == "0" {
+							includesZero = true
+							break
+						}
+					}
+					if !includesZero {
+						ctx.output.WriteString("Got one of the listed errors\n")
+					}
 				} else {
 					ctx.output.WriteString(formatMySQLError(err) + "\n")
 				}
@@ -2115,7 +2140,17 @@ func (ctx *execContext) executeQueryOrExec(stmt string) error {
 		if ctx.expectedError != "" {
 			if ctx.resultLogEnabled {
 				if strings.Contains(ctx.expectedError, ",") {
-					ctx.output.WriteString("Got one of the listed errors\n")
+					codes := strings.Split(ctx.expectedError, ",")
+					includesZero := false
+					for _, c := range codes {
+						if strings.TrimSpace(c) == "0" {
+							includesZero = true
+							break
+						}
+					}
+					if !includesZero {
+						ctx.output.WriteString("Got one of the listed errors\n")
+					}
 				} else {
 					ctx.output.WriteString(formatMySQLError(err) + "\n")
 				}
@@ -2321,7 +2356,17 @@ func (ctx *execContext) executeExecWithExpectedError(stmt string) error {
 	if execErr != nil {
 		if ctx.resultLogEnabled {
 			if strings.Contains(expectedCode, ",") {
-				ctx.output.WriteString("Got one of the listed errors\n")
+				codes := strings.Split(expectedCode, ",")
+				includesZero := false
+				for _, c := range codes {
+					if strings.TrimSpace(c) == "0" {
+						includesZero = true
+						break
+					}
+				}
+				if !includesZero {
+					ctx.output.WriteString("Got one of the listed errors\n")
+				}
 			} else {
 				ctx.output.WriteString(formatMySQLError(execErr) + "\n")
 			}

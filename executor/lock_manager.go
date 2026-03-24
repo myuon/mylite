@@ -343,7 +343,94 @@ func (rlm *RowLockManager) HasOtherLocksWithPrefix(connID int64, prefix string) 
 	return false
 }
 
+// GetOtherLockedKeysWithPrefix returns all lock keys held by other connections
+// that match the given prefix.
+func (rlm *RowLockManager) GetOtherLockedKeysWithPrefix(connID int64, prefix string) []string {
+	rlm.mu.Lock()
+	defer rlm.mu.Unlock()
+
+	var keys []string
+	for key, entry := range rlm.locks {
+		if strings.HasPrefix(key, prefix) {
+			for ownerID := range entry.owners {
+				if ownerID != connID {
+					keys = append(keys, key)
+					break
+				}
+			}
+		}
+	}
+	return keys
+}
+
 // errLockWaitTimeout is a sentinel used internally; the executor wraps it with
 // the proper MySQL error code when returning to the client.
 var errLockWaitTimeout = fmt.Errorf("lock_wait_timeout")
+
+// TableLockManager manages LOCK TABLE READ/WRITE per connection.
+// When a connection holds LOCK TABLE, only those tables are accessible and
+// the lock mode (READ vs WRITE) restricts operations.
+type TableLockManager struct {
+	mu sync.Mutex
+	// locks maps connID -> table (lowercase "db.table") -> lock mode ("READ" or "WRITE")
+	locks map[int64]map[string]string
+}
+
+// NewTableLockManager creates a new TableLockManager.
+func NewTableLockManager() *TableLockManager {
+	return &TableLockManager{
+		locks: make(map[int64]map[string]string),
+	}
+}
+
+// LockTable records a table lock for the given connection.
+func (tlm *TableLockManager) LockTable(connID int64, dbTable string, mode string) {
+	tlm.mu.Lock()
+	defer tlm.mu.Unlock()
+	if tlm.locks[connID] == nil {
+		tlm.locks[connID] = make(map[string]string)
+	}
+	tlm.locks[connID][strings.ToLower(dbTable)] = strings.ToUpper(mode)
+}
+
+// UnlockAll releases all table locks for a connection.
+func (tlm *TableLockManager) UnlockAll(connID int64) {
+	tlm.mu.Lock()
+	defer tlm.mu.Unlock()
+	delete(tlm.locks, connID)
+}
+
+// HasLocks returns true if the connection currently holds any LOCK TABLE locks.
+func (tlm *TableLockManager) HasLocks(connID int64) bool {
+	tlm.mu.Lock()
+	defer tlm.mu.Unlock()
+	return len(tlm.locks[connID]) > 0
+}
+
+// GetLockMode returns the lock mode for a table, or "" if no lock is held.
+func (tlm *TableLockManager) GetLockMode(connID int64, dbTable string) string {
+	tlm.mu.Lock()
+	defer tlm.mu.Unlock()
+	if m, ok := tlm.locks[connID]; ok {
+		return m[strings.ToLower(dbTable)]
+	}
+	return ""
+}
+
+// IsLocked checks if a table is locked by the given connection and returns
+// whether the table is accessible and the lock mode.
+func (tlm *TableLockManager) IsLocked(connID int64, dbTable string) (locked bool, mode string) {
+	tlm.mu.Lock()
+	defer tlm.mu.Unlock()
+	m, hasLocks := tlm.locks[connID]
+	if !hasLocks {
+		// No active LOCK TABLE session - all tables are accessible
+		return false, ""
+	}
+	mode, ok := m[strings.ToLower(dbTable)]
+	if !ok {
+		return false, ""
+	}
+	return true, mode
+}
 

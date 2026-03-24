@@ -610,7 +610,7 @@ var skipTests = map[string]bool{
 	// SKIP LOCKED / NOWAIT (requires SKIP LOCKED row locking behavior)
 	"innodb/skip_locked_nowait": true,
 	// SKIP LOCKED / NOWAIT with isolation levels
-	"innodb/skip_locked_nowait_isolation": true,
+	// "innodb/skip_locked_nowait_isolation": true, // unskipped: fixing GIS + lock issues
 	// Stored foreign key operations
 	"innodb/stored_fk": true,
 	// Strict mode validation
@@ -2148,7 +2148,7 @@ var skipTests = map[string]bool{
 	"other/key_myisam": true,
 	"other/lock_backup_ddl_myisam": true,
 	"other/lock_multi": true,
-	"other/lock_myisam": true,
+	// "other/lock_myisam": true, // unskipped: fixing LOCK TABLES issues
 	"other/log_tables_myisam": true,
 	"other/log_tables_upgrade": true,
 	"other/merge_innodb": true,
@@ -2174,7 +2174,7 @@ var skipTests = map[string]bool{
 	"other/myisam_mrr_none": true,
 	"other/myisam_recover": true,
 	"other/myisam_row_rpl": true,
-	"other/myisam_skip_lock_nowait": true,
+	// "other/myisam_skip_lock_nowait": true, // unskipped: fixing SKIP LOCKED issues
 	"other/myisampack": true,
 	"other/mysqlbinlog_base64_flag": true,
 	"other/mysqlbinlog_mixed_or_statment": true,
