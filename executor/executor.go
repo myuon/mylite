@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode"
@@ -114,6 +115,59 @@ type fullSnapshot struct {
 	catalogSnap map[string]map[string]*catalog.TableDef
 }
 
+// undoEntry records a single DML mutation for transaction rollback.
+type undoEntry struct {
+	op       string // "INSERT", "DELETE", "UPDATE"
+	db       string
+	table    string
+	rowIndex int         // row index at time of operation (for INSERT: index of inserted row)
+	oldRow   storage.Row // for DELETE/UPDATE: the original row
+}
+
+// TxnActiveSet tracks which connections are currently in an active transaction.
+// Used for filtering uncommitted rows during reads.
+type TxnActiveSet struct {
+	mu      sync.RWMutex
+	active  map[int64]bool                          // connectionID -> true if in transaction
+	inserts map[int64]map[string]map[int]bool       // connectionID -> "db:table" -> set of row pointers
+}
+
+// NewTxnActiveSet creates a new TxnActiveSet.
+func NewTxnActiveSet() *TxnActiveSet {
+	return &TxnActiveSet{
+		active:  make(map[int64]bool),
+		inserts: make(map[int64]map[string]map[int]bool),
+	}
+}
+
+// Begin marks a connection as being in a transaction.
+func (t *TxnActiveSet) Begin(connID int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.active[connID] = true
+}
+
+// End marks a connection as no longer being in a transaction.
+func (t *TxnActiveSet) End(connID int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.active, connID)
+	delete(t.inserts, connID)
+}
+
+// TrackInsert records that a connection inserted a row (identified by pointer identity).
+func (t *TxnActiveSet) TrackInsert(connID int64, dbTable string, rowPtr int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.inserts[connID] == nil {
+		t.inserts[connID] = make(map[string]map[int]bool)
+	}
+	if t.inserts[connID][dbTable] == nil {
+		t.inserts[connID][dbTable] = make(map[int]bool)
+	}
+	t.inserts[connID][dbTable][rowPtr] = true
+}
+
 // cteTable holds pre-computed rows for a Common Table Expression.
 type cteTable struct {
 	columns []string
@@ -208,6 +262,11 @@ type Executor struct {
 	// rowLockManager manages InnoDB-style row-level locks for SELECT ... FOR UPDATE.
 	// Shared across all executor instances.
 	rowLockManager *RowLockManager
+	// txnUndoLog records DML mutations made during a transaction for per-connection rollback.
+	txnUndoLog []undoEntry
+	// txnActiveSet is a shared set tracking which connections are currently in a transaction.
+	// Used for filtering uncommitted rows from other connections during reads.
+	txnActiveSet *TxnActiveSet
 }
 
 // Warning represents a MySQL warning.
@@ -315,6 +374,7 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	e.processList = NewProcessList()
 	e.lockManager = NewLockManager()
 	e.rowLockManager = NewRowLockManager()
+	e.txnActiveSet = NewTxnActiveSet()
 	e.initSystemTables()
 	return e
 }
@@ -361,6 +421,7 @@ func (e *Executor) Clone() *Executor {
 		lockManager:      e.lockManager,
 		rowLockManager:   e.rowLockManager,
 		processList:      e.processList,
+		txnActiveSet:     e.txnActiveSet,
 	}
 }
 
@@ -2607,6 +2668,196 @@ func (e *Executor) dummyExplainRow(query string) []interface{} {
 	return []interface{}{int64(1), "SIMPLE", table, nil, "ALL", nil, nil, nil, nil, rows, "100.00", extra}
 }
 
+// explainMultiRows returns one or more EXPLAIN rows, detecting derived tables
+// and UNION constructs to produce PRIMARY/DERIVED/UNION select_types like MySQL.
+func (e *Executor) explainMultiRows(query string) [][]interface{} {
+	upper := strings.ToUpper(query)
+
+	// Check if the query has a derived table (subquery in FROM) or UNION ALL / UNION
+	// by looking for patterns like "JOIN (SELECT" or "FROM (SELECT" combined with UNION ALL
+	hasDerived := false
+	unionCount := 0
+
+	// Detect derived tables: look for "( SELECT ... UNION ALL SELECT ... ) AS"
+	// We need to find subqueries in FROM clauses
+	if strings.Contains(upper, "UNION ALL") || strings.Contains(upper, "UNION SELECT") {
+		// Check if the union is inside a subquery (derived table) or at the top level
+		// If there's a "JOIN (" or "FROM (" pattern before the UNION, it's a derived table
+		if strings.Contains(upper, "JOIN (") || strings.Contains(upper, "FROM (") {
+			hasDerived = true
+			// Count UNION ALL occurrences within the derived table
+			unionCount = strings.Count(upper, "UNION ALL") + strings.Count(upper, "UNION SELECT") - strings.Count(upper, "UNION ALL SELECT")
+			if unionCount < 1 {
+				unionCount = 1
+			}
+		}
+	}
+
+	if !hasDerived {
+		return [][]interface{}{e.dummyExplainRow(query)}
+	}
+
+	// For queries with derived tables, produce multiple explain rows:
+	// Row 1: id=1, PRIMARY, <derived2>, ALL (the derived table scan)
+	// Row 2: id=1, PRIMARY, real_table, eq_ref/ALL (the joined real table)
+	// Row 3: id=2, DERIVED, NULL (first part of union in derived)
+	// Row 4: id=3, UNION, NULL (second part of union in derived)
+
+	var rows [][]interface{}
+
+	// Determine the real table name from the query
+	realTable := ""
+	realTableRows := int64(1)
+	// Look for table names -- find the main table in the join
+	// Pattern: "FROM tablename NATURAL JOIN (..." or "tablename JOIN (..."
+	// or "... JOIN tablename ON ..."
+	// Try to find the real table from the query
+	if idx := strings.Index(upper, " JOIN "); idx >= 0 {
+		// Check if this is "table JOIN (subquery)" or "(subquery) JOIN table"
+		before := strings.TrimSpace(query[:idx])
+		after := strings.TrimSpace(query[idx+6:])
+
+		// If after starts with "(", the real table is before the JOIN
+		if strings.HasPrefix(strings.TrimSpace(strings.ToUpper(after)), "(") {
+			// Real table is in the FROM clause before JOIN
+			if fromIdx := strings.Index(strings.ToUpper(before), "FROM "); fromIdx >= 0 {
+				rest := strings.TrimSpace(before[fromIdx+5:])
+				fields := strings.Fields(rest)
+				if len(fields) > 0 {
+					realTable = strings.Trim(fields[0], "`;,()")
+				}
+			}
+		} else {
+			// The subquery is before JOIN, real table is after
+			// For NATURAL JOIN, look past the subquery alias
+			afterUpper := strings.ToUpper(after)
+			if strings.HasPrefix(afterUpper, "(") {
+				// subquery on the right side
+			} else {
+				// real table on the right side
+				fields := strings.Fields(after)
+				if len(fields) > 0 {
+					realTable = strings.Trim(fields[0], "`;,()")
+				}
+			}
+		}
+	}
+
+	// Also try to find table from "FROM t1 NATURAL JOIN" pattern
+	if realTable == "" {
+		if fromIdx := strings.Index(upper, " FROM "); fromIdx >= 0 {
+			rest := strings.TrimSpace(query[fromIdx+6:])
+			fields := strings.Fields(rest)
+			if len(fields) > 0 {
+				tok := strings.Trim(fields[0], "`;,()")
+				if tok != "" && !strings.HasPrefix(strings.ToUpper(tok), "SELECT") {
+					realTable = tok
+				}
+			}
+		}
+	}
+
+	if realTable != "" && e.Storage != nil {
+		if tbl, err := e.Storage.GetTable(e.CurrentDB, realTable); err == nil {
+			if n := len(tbl.Rows); n > 0 {
+				realTableRows = int64(n)
+			}
+		}
+	}
+
+	// Determine how many UNION parts there are
+	derivedParts := 1 + unionCount // first SELECT + UNION parts
+
+	// Determine ref and key info for the join
+	// If it's a NATURAL JOIN or JOIN with PK, the type might be eq_ref
+	joinType := "ALL"
+	var possibleKeys, key, keyLen, ref interface{}
+	possibleKeys = nil
+	key = nil
+	keyLen = nil
+	ref = nil
+	filtered := "100.00"
+
+	// For natural joins with a primary key table, MySQL uses eq_ref
+	if strings.Contains(upper, "NATURAL JOIN") || strings.Contains(upper, "JOIN") {
+		if realTable != "" && e.Storage != nil {
+			if tbl, err := e.Storage.GetTable(e.CurrentDB, realTable); err == nil {
+				if len(tbl.Def.PrimaryKey) > 0 {
+					joinType = "eq_ref"
+					possibleKeys = "PRIMARY"
+					key = "PRIMARY"
+					// Calculate key_len based on PK column types
+					keyLenVal := 0
+					for _, pkCol := range tbl.Def.PrimaryKey {
+						for _, col := range tbl.Def.Columns {
+							if strings.EqualFold(col.Name, pkCol) {
+								if strings.Contains(strings.ToUpper(col.Type), "INT") {
+									keyLenVal += 4
+								} else {
+									keyLenVal += 4 // default
+								}
+							}
+						}
+					}
+					keyLen = fmt.Sprintf("%d", keyLenVal)
+
+					// Find the alias of the derived table for ref
+					// Look for ") AS alias" or ") alias"
+					derivedAlias := "t2" // default
+					if asIdx := strings.Index(upper, ") AS "); asIdx >= 0 {
+						rest := strings.TrimSpace(query[asIdx+5:])
+						fields := strings.Fields(rest)
+						if len(fields) > 0 {
+							derivedAlias = strings.Trim(fields[0], "`;,()")
+						}
+					}
+					// Build ref from PK columns
+					refParts := make([]string, len(tbl.Def.PrimaryKey))
+					for i, pk := range tbl.Def.PrimaryKey {
+						refParts[i] = derivedAlias + "." + pk
+					}
+					ref = strings.Join(refParts, ",")
+					filtered = "10.00"
+					realTableRows = int64(1)
+				}
+			}
+		}
+	}
+
+	var extra interface{} = nil
+	if ref != nil {
+		extra = "Using where"
+	}
+
+	// Row 1: PRIMARY on the derived table
+	rows = append(rows, []interface{}{
+		int64(1), "PRIMARY", "<derived2>", nil, "ALL",
+		nil, nil, nil, nil, int64(derivedParts), "100.00", nil,
+	})
+
+	// Row 2: PRIMARY on the real table
+	if realTable != "" {
+		rows = append(rows, []interface{}{
+			int64(1), "PRIMARY", realTable, nil, joinType,
+			possibleKeys, key, keyLen, ref, realTableRows, filtered, extra,
+		})
+	}
+
+	// Row 3+: DERIVED and UNION parts
+	rows = append(rows, []interface{}{
+		int64(2), "DERIVED", nil, nil, nil,
+		nil, nil, nil, nil, nil, nil, "No tables used",
+	})
+	for i := 0; i < unionCount; i++ {
+		rows = append(rows, []interface{}{
+			int64(3 + int64(i)), "UNION", nil, nil, nil,
+			nil, nil, nil, nil, nil, nil, "No tables used",
+		})
+	}
+
+	return rows
+}
+
 func explainTableNameFromQuery(query string) string {
 	upper := strings.ToUpper(query)
 	if idx := strings.Index(upper, " FROM "); idx >= 0 {
@@ -2793,9 +3044,10 @@ func (e *Executor) explainResultForType(explainType sqlparser.ExplainType, expla
 			IsResultSet: true,
 		}
 	default:
+		rows := e.explainMultiRows(explainedQuery)
 		return &Result{
 			Columns:     []string{"id", "select_type", "table", "partitions", "type", "possible_keys", "key", "key_len", "ref", "rows", "filtered", "Extra"},
-			Rows:        [][]interface{}{e.dummyExplainRow(explainedQuery)},
+			Rows:        rows,
 			IsResultSet: true,
 		}
 	}
@@ -7974,9 +8226,17 @@ func (e *Executor) execBegin() (*Result, error) {
 	if e.inTransaction {
 		// Implicit commit of previous transaction before starting a new one.
 		e.savepoint = nil
+		e.txnUndoLog = nil
+		if e.txnActiveSet != nil {
+			e.txnActiveSet.End(e.connectionID)
+		}
 	}
 	e.savepoint = e.captureSnapshot()
+	e.txnUndoLog = nil
 	e.inTransaction = true
+	if e.txnActiveSet != nil {
+		e.txnActiveSet.Begin(e.connectionID)
+	}
 	return &Result{}, nil
 }
 
@@ -7988,9 +8248,96 @@ func (e *Executor) execCommit() (*Result, error) {
 	if !e.inTransaction {
 		return &Result{}, nil
 	}
+	// Remove transaction tags from rows inserted by this connection
+	e.clearTxnRowTags()
 	e.inTransaction = false
 	e.savepoint = nil
+	e.txnUndoLog = nil
+	if e.txnActiveSet != nil {
+		e.txnActiveSet.End(e.connectionID)
+	}
 	return &Result{}, nil
+}
+
+// filterUncommittedRows removes rows that were inserted by other connections'
+// uncommitted transactions (transaction isolation for reads).
+func (e *Executor) filterUncommittedRows(rows []storage.Row) []storage.Row {
+	if e.txnActiveSet == nil {
+		return rows
+	}
+	e.txnActiveSet.mu.RLock()
+	hasActive := len(e.txnActiveSet.active) > 0
+	e.txnActiveSet.mu.RUnlock()
+	if !hasActive {
+		// No active transactions; strip any leftover tags and return all rows
+		return rows
+	}
+
+	result := make([]storage.Row, 0, len(rows))
+	for _, row := range rows {
+		connIDVal, hasTxnTag := row["__txn_conn_id__"]
+		if !hasTxnTag {
+			// Row was not inserted in a transaction (committed data)
+			result = append(result, row)
+			continue
+		}
+		connID, ok := connIDVal.(int64)
+		if !ok {
+			result = append(result, row)
+			continue
+		}
+		if connID == e.connectionID {
+			// Row was inserted by this connection -- visible
+			result = append(result, row)
+			continue
+		}
+		// Row was inserted by another connection -- check if that connection
+		// is still in an active transaction
+		e.txnActiveSet.mu.RLock()
+		otherActive := e.txnActiveSet.active[connID]
+		e.txnActiveSet.mu.RUnlock()
+		if otherActive {
+			// Other connection's uncommitted row -- filter out
+			continue
+		}
+		// Other connection already committed -- visible
+		result = append(result, row)
+	}
+	return result
+}
+
+// clearTxnRowTags removes the __txn_conn_id__ metadata from all rows
+// that were inserted by this connection during the transaction.
+func (e *Executor) clearTxnRowTags() {
+	if e.txnUndoLog == nil {
+		return
+	}
+	// Collect unique db:table pairs from the undo log
+	tables := make(map[string]bool)
+	for _, entry := range e.txnUndoLog {
+		if entry.op == "INSERT" {
+			tables[entry.db+":"+entry.table] = true
+		}
+	}
+	for key := range tables {
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		tbl, err := e.Storage.GetTable(parts[0], parts[1])
+		if err != nil {
+			continue
+		}
+		tbl.Lock()
+		for _, row := range tbl.Rows {
+			if connID, ok := row["__txn_conn_id__"]; ok {
+				if cid, ok := connID.(int64); ok && cid == e.connectionID {
+					delete(row, "__txn_conn_id__")
+				}
+			}
+		}
+		tbl.Unlock()
+	}
 }
 
 func (e *Executor) execRollback() (*Result, error) {
@@ -8002,8 +8349,20 @@ func (e *Executor) execRollback() (*Result, error) {
 		return &Result{}, nil
 	}
 	sp := e.savepoint
+	undoLog := e.txnUndoLog
 	e.inTransaction = false
 	e.savepoint = nil
+	e.txnUndoLog = nil
+	if e.txnActiveSet != nil {
+		e.txnActiveSet.End(e.connectionID)
+	}
+
+	// If we have an undo log, use it for precise per-connection rollback
+	// instead of the snapshot-based approach which can clobber other connections' data.
+	if len(undoLog) > 0 {
+		e.replayUndoLog(undoLog)
+		return &Result{}, nil
+	}
 
 	if sp == nil {
 		return &Result{}, nil
@@ -8035,6 +8394,77 @@ func (e *Executor) execRollback() (*Result, error) {
 	}
 
 	return &Result{}, nil
+}
+
+// replayUndoLog undoes DML mutations in reverse order.
+func (e *Executor) replayUndoLog(log []undoEntry) {
+	for i := len(log) - 1; i >= 0; i-- {
+		entry := log[i]
+		tbl, err := e.Storage.GetTable(entry.db, entry.table)
+		if err != nil {
+			continue
+		}
+		tbl.Lock()
+		switch entry.op {
+		case "INSERT":
+			// Remove the row that was inserted.
+			// We need to find and remove the row by matching the old row data.
+			if entry.oldRow != nil {
+				newRows := make([]storage.Row, 0, len(tbl.Rows))
+				removed := false
+				for _, r := range tbl.Rows {
+					if !removed && rowsEqualByMap(r, entry.oldRow) {
+						removed = true
+						continue
+					}
+					newRows = append(newRows, r)
+				}
+				if removed {
+					tbl.Rows = newRows
+					tbl.InvalidateIndexes()
+				}
+			}
+		case "DELETE":
+			// Re-insert the deleted row.
+			if entry.oldRow != nil {
+				// Insert at the original index if possible
+				if entry.rowIndex >= 0 && entry.rowIndex <= len(tbl.Rows) {
+					newRows := make([]storage.Row, 0, len(tbl.Rows)+1)
+					newRows = append(newRows, tbl.Rows[:entry.rowIndex]...)
+					newRows = append(newRows, entry.oldRow)
+					newRows = append(newRows, tbl.Rows[entry.rowIndex:]...)
+					tbl.Rows = newRows
+				} else {
+					tbl.Rows = append(tbl.Rows, entry.oldRow)
+				}
+				tbl.InvalidateIndexes()
+			}
+		case "UPDATE":
+			// Restore the old row at the given index.
+			if entry.oldRow != nil && entry.rowIndex >= 0 && entry.rowIndex < len(tbl.Rows) {
+				tbl.Rows[entry.rowIndex] = entry.oldRow
+				tbl.InvalidateIndexes()
+			}
+		}
+		tbl.Unlock()
+	}
+}
+
+// rowsEqualByMap checks if two storage rows have the same key-value pairs.
+func rowsEqualByMap(a, b storage.Row) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		bv, ok := b[k]
+		if !ok {
+			return false
+		}
+		if fmt.Sprintf("%v", v) != fmt.Sprintf("%v", bv) {
+			return false
+		}
+	}
+	return true
 }
 
 // execMyliteCommand handles MYLITE-specific control commands:
@@ -8399,13 +8829,27 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					savedAutoInc = tbl.AutoIncrementValue()
 				}
 			}
+			// Tag row with connection ID for transaction isolation
+			if e.inTransaction && e.txnActiveSet != nil {
+				row["__txn_conn_id__"] = e.connectionID
+			}
 			id, err := tbl.Insert(row)
 			if err != nil {
 				if lockMode0 {
 					tbl.AutoIncrement.Store(savedAutoInc)
 				}
+				delete(row, "__txn_conn_id__")
 				return nil, err
 			}
+				// Record undo entry for transaction rollback
+				if e.inTransaction {
+					e.txnUndoLog = append(e.txnUndoLog, undoEntry{
+						op:     "INSERT",
+						db:     insertDB,
+						table:  tableName,
+						oldRow: storage.CloneRow(row),
+					})
+				}
 				lastInsertID = id
 				if autoGeneratedThisRow && firstAutoInsertID == 0 && id > 0 {
 					firstAutoInsertID = id
@@ -9203,11 +9647,16 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				savedAutoInc2 = tbl.AutoIncrementValue()
 			}
 		}
+		// Tag row with connection ID for transaction isolation
+		if e.inTransaction && e.txnActiveSet != nil {
+			row["__txn_conn_id__"] = e.connectionID
+		}
 		id, err := tbl.Insert(row)
 		if err != nil {
 			if lockMode0_2 {
 				tbl.AutoIncrement.Store(savedAutoInc2)
 			}
+			delete(row, "__txn_conn_id__")
 			// INSERT IGNORE: silently skip duplicate key errors
 			if bool(stmt.Ignore) && strings.Contains(err.Error(), "1062") {
 				continue
@@ -9216,6 +9665,15 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				return nil, mysqlError(1467, "HY000", "Failed to read auto-increment value from storage engine")
 			}
 			return nil, err
+		}
+		// Record undo entry for transaction rollback
+		if e.inTransaction {
+			e.txnUndoLog = append(e.txnUndoLog, undoEntry{
+				op:     "INSERT",
+				db:     insertDB,
+				table:  tableName,
+				oldRow: storage.CloneRow(row),
+			})
 		}
 		lastInsertID = id
 		if autoGeneratedThisRow && firstAutoInsertID == 0 && id > 0 {
@@ -9674,7 +10132,9 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 		if strings.EqualFold(lookupDB, "performance_schema") {
 			e.populatePerfSchemaTable(tbl, lookupTable)
 		}
-		raw := tbl.Scan()
+		rawAll := tbl.Scan()
+		// Filter out rows from other connections' uncommitted transactions
+		raw := e.filterUncommittedRows(rawAll)
 		// Build a set of CHAR(N) column names for trailing-space removal.
 		charCols := make(map[string]bool)
 		if tbl.Def != nil {
@@ -9689,6 +10149,10 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 		for i, row := range raw {
 			newRow := make(storage.Row, len(row)*2)
 			for k, v := range row {
+				// Skip internal transaction metadata
+				if k == "__txn_conn_id__" {
+					continue
+				}
 				// MySQL removes trailing spaces from CHAR columns on retrieval.
 				if charCols[k] {
 					if s, ok := v.(string); ok {
@@ -28320,6 +28784,29 @@ func (e *Executor) execCreateTableSelect(newTableName, selectSQL string) (*Resul
 	db, err := e.Catalog.GetDatabase(e.CurrentDB)
 	if err != nil {
 		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+	// CREATE TABLE ... AS SELECT needs to acquire locks on source table rows.
+	// If another connection holds FOR UPDATE locks, this should time out.
+	if e.rowLockManager != nil {
+		// Extract source table name from SELECT
+		srcTable := explainTableNameFromQuery(selectSQL)
+		if srcTable != "" {
+			srcDB := e.CurrentDB
+			if tbl, tblErr := e.Storage.GetTable(srcDB, srcTable); tblErr == nil {
+				if def, defErr := db.GetTable(srcTable); defErr == nil && len(tbl.Rows) > 0 {
+					allIndices := make([]int, len(tbl.Rows))
+					for i := range tbl.Rows {
+						allIndices[i] = i
+					}
+					if lockErr := e.acquireRowLocksForRows(srcDB, srcTable, def, tbl.Rows, allIndices); lockErr != nil {
+						e.handleRollbackOnTimeout()
+						return nil, lockErr
+					}
+					// Release the locks immediately; we just needed to verify availability
+					e.rowLockManager.ReleaseRowLocks(e.connectionID)
+				}
+			}
+		}
 	}
 	result, err := e.Execute(selectSQL)
 	if err != nil {

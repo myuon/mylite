@@ -3615,6 +3615,13 @@ func normalizeExpected(s string) string {
 				strings.HasPrefix(trimmed, "Error\t") {
 				continue
 			}
+			// Also handle vertical-format Warnings blocks (from EXPLAIN with --vertical_results):
+			// Level\tNote, Code\t1003, Message\t...
+			if strings.HasPrefix(trimmed, "Level\t") ||
+				strings.HasPrefix(trimmed, "Code\t") ||
+				strings.HasPrefix(trimmed, "Message\t") {
+				continue
+			}
 			inWarnings = false
 		}
 

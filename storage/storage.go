@@ -687,7 +687,13 @@ func (t *Table) Scan() []Row {
 	t.Mu.RLock()
 	defer t.Mu.RUnlock()
 	result := make([]Row, len(t.Rows))
-	copy(result, t.Rows)
+	for i, row := range t.Rows {
+		copied := make(Row, len(row))
+		for k, v := range row {
+			copied[k] = v
+		}
+		result[i] = copied
+	}
 	// InnoDB table scans are clustered by PRIMARY KEY.
 	// Keep scan order deterministic and MySQL-compatible for tests that rely on it.
 	// Skip sorting for charsets where Go's byte-order comparison does not match

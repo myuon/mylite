@@ -443,7 +443,9 @@ var skipTests = map[string]bool{
 	"innodb/innodb_force_recovery": true,
 	// TIMEOUT: INFORMATION_SCHEMA INNODB_TRX table
 	"innodb/innodb_i_s_innodb_trx": true,
-	// ROW LOCKING: Multi-connection lock wait timeout (needs INSERT-level row locking)
+	// ROW LOCKING: Multi-connection lock wait timeout — EXPLAIN+subquery part passes,
+	// but complex JOIN-based row locking in Bug#41756 section requires InnoDB-level
+	// per-row lock tracking for JOINs with derived tables
 	"innodb/innodb_lock_wait_timeout_1": true,
 	// TIMEOUT: Complex misc test with multi-connection
 	"innodb/innodb_misc1": true,
@@ -454,7 +456,7 @@ var skipTests = map[string]bool{
 	// ERROR: INSERT INTO mysql.innodb_index_stats system table
 	"innodb/innodb_stats_rename_table_if_exists": true,
 	// ROW LOCKING: Multi-connection timeout rollback (needs INSERT-level row locking)
-	"innodb/innodb_timeout_rollback": true,
+	// "innodb/innodb_timeout_rollback": true,
 	// ERROR: Duplicate entry on INSERT
 	"innodb/innodb_wl6470": true,
 	// ERROR: Data too long for VARBINARY column
@@ -463,7 +465,9 @@ var skipTests = map[string]bool{
 	"innodb/instant_add_column_clear": true,
 	// ERROR: ALTER TABLE ADD duplicate column
 	"innodb/instant_add_column_limitations": true,
-	// TIMEOUT: INSERT ON DUPLICATE KEY UPDATE multi-connection
+	// TIMEOUT: INSERT ON DUPLICATE KEY UPDATE multi-connection — requires --send/reap
+	// async query pattern, wait_condition with information_schema.innodb_trx,
+	// and TRIGGER execution during IODKU
 	"innodb/iodku": true,
 	// TIMEOUT: JSON partial update tests
 	"innodb/json_small_partial_update_00": true,

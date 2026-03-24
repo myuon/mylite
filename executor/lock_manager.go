@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -151,16 +152,20 @@ func (lm *LockManager) IsUsedLock(name string) interface{} {
 	return nil
 }
 
-// RowLockManager manages InnoDB-style row-level locks for SELECT ... FOR UPDATE.
+// RowLockManager manages InnoDB-style row-level locks for SELECT ... FOR UPDATE / FOR SHARE.
 // Row locks are keyed by "db:table:pkValue" and held until COMMIT/ROLLBACK.
+// Supports both shared (S) and exclusive (X) lock modes:
+//   - Multiple shared locks from different connections are compatible.
+//   - An exclusive lock is incompatible with any other lock from a different connection.
 type RowLockManager struct {
 	mu    sync.Mutex
 	locks map[string]*rowLockEntry // lockKey -> entry
 }
 
 type rowLockEntry struct {
-	owner int64        // connectionID that holds the lock
-	ch    chan struct{} // closed when the lock is released
+	exclusive bool           // true = X lock, false = S lock
+	owners    map[int64]bool // connectionIDs that hold the lock
+	ch        chan struct{}   // closed when the lock state changes (released or downgraded)
 }
 
 // NewRowLockManager creates a new RowLockManager.
@@ -174,29 +179,63 @@ func NewRowLockManager() *RowLockManager {
 // If the lock is held by another connection, it blocks until the lock is released
 // or the timeout expires. Returns nil on success, error on timeout.
 func (rlm *RowLockManager) AcquireRowLock(connID int64, key string, timeoutSec float64) error {
+	return rlm.acquireRowLockInner(connID, key, true, timeoutSec)
+}
+
+// AcquireSharedRowLock tries to acquire a shared lock on a row identified by key.
+// Shared locks are compatible with other shared locks but block on exclusive locks.
+func (rlm *RowLockManager) AcquireSharedRowLock(connID int64, key string, timeoutSec float64) error {
+	return rlm.acquireRowLockInner(connID, key, false, timeoutSec)
+}
+
+func (rlm *RowLockManager) acquireRowLockInner(connID int64, key string, exclusive bool, timeoutSec float64) error {
 	deadline := time.Now().Add(time.Duration(timeoutSec * float64(time.Second)))
 
 	for {
 		rlm.mu.Lock()
 		existing, exists := rlm.locks[key]
 
-		if exists && existing.owner == connID {
-			// Already own it (re-entrant)
-			rlm.mu.Unlock()
-			return nil
-		}
-
 		if !exists {
 			// Lock is free, acquire it
 			rlm.locks[key] = &rowLockEntry{
-				owner: connID,
-				ch:    make(chan struct{}),
+				exclusive: exclusive,
+				owners:    map[int64]bool{connID: true},
+				ch:        make(chan struct{}),
 			}
 			rlm.mu.Unlock()
 			return nil
 		}
 
-		// Lock held by another connection - wait
+		// Check if we already own it
+		if existing.owners[connID] {
+			// Upgrade shared -> exclusive if needed
+			if exclusive && !existing.exclusive {
+				if len(existing.owners) == 1 {
+					// Only we hold it, upgrade
+					existing.exclusive = true
+				}
+				// If others hold shared locks too, we need to wait
+				// (fall through to wait below only if len > 1)
+				if len(existing.owners) == 1 {
+					rlm.mu.Unlock()
+					return nil
+				}
+			} else {
+				// Already own compatible lock (re-entrant)
+				rlm.mu.Unlock()
+				return nil
+			}
+		}
+
+		// Check compatibility
+		if !exclusive && !existing.exclusive {
+			// Shared + shared = compatible, add ourselves
+			existing.owners[connID] = true
+			rlm.mu.Unlock()
+			return nil
+		}
+
+		// Incompatible: wait for lock state change
 		waitCh := existing.ch
 		rlm.mu.Unlock()
 
@@ -226,17 +265,82 @@ func (rlm *RowLockManager) AcquireRowLock(connID int64, key string, timeoutSec f
 	}
 }
 
+// TryAcquireRowLock attempts to acquire an exclusive row lock without blocking.
+// Returns (true, nil) if the lock was acquired, (false, nil) if the row is
+// locked by another connection (used for SKIP LOCKED), or (false, error) on error.
+func (rlm *RowLockManager) TryAcquireRowLock(connID int64, key string, exclusive bool) (acquired bool, err error) {
+	rlm.mu.Lock()
+	defer rlm.mu.Unlock()
+
+	existing, exists := rlm.locks[key]
+	if !exists {
+		// Lock is free, acquire it
+		rlm.locks[key] = &rowLockEntry{
+			exclusive: exclusive,
+			owners:    map[int64]bool{connID: true},
+			ch:        make(chan struct{}),
+		}
+		return true, nil
+	}
+
+	// Already own it?
+	if existing.owners[connID] {
+		if exclusive && !existing.exclusive && len(existing.owners) > 1 {
+			// Can't upgrade with other shared holders
+			return false, nil
+		}
+		if exclusive && !existing.exclusive && len(existing.owners) == 1 {
+			existing.exclusive = true
+		}
+		return true, nil
+	}
+
+	// Shared + shared = compatible
+	if !exclusive && !existing.exclusive {
+		existing.owners[connID] = true
+		return true, nil
+	}
+
+	// Incompatible
+	return false, nil
+}
+
 // ReleaseRowLocks releases all row locks held by a connection.
 func (rlm *RowLockManager) ReleaseRowLocks(connID int64) {
 	rlm.mu.Lock()
 	defer rlm.mu.Unlock()
 
 	for key, entry := range rlm.locks {
-		if entry.owner == connID {
-			close(entry.ch)
-			delete(rlm.locks, key)
+		if entry.owners[connID] {
+			delete(entry.owners, connID)
+			if len(entry.owners) == 0 {
+				close(entry.ch)
+				delete(rlm.locks, key)
+			} else {
+				// Signal waiters that state changed (e.g. one shared holder left)
+				close(entry.ch)
+				entry.ch = make(chan struct{})
+			}
 		}
 	}
+}
+
+// HasOtherLocksWithPrefix checks if any other connection holds locks with keys
+// matching the given prefix. Used for gap lock simulation.
+func (rlm *RowLockManager) HasOtherLocksWithPrefix(connID int64, prefix string) bool {
+	rlm.mu.Lock()
+	defer rlm.mu.Unlock()
+
+	for key, entry := range rlm.locks {
+		if strings.HasPrefix(key, prefix) {
+			for ownerID := range entry.owners {
+				if ownerID != connID {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // errLockWaitTimeout is a sentinel used internally; the executor wraps it with
