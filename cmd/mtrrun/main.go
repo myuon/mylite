@@ -571,7 +571,7 @@ var skipTests = map[string]bool{
 	// InnoDB stats auto recalc
 	"innodb/innodb_stats_auto_recalc":             true,
 	"innodb/innodb_stats_auto_recalc_ddl":         true,
-	"innodb/innodb_stats_drop_locked":             true,
+	"innodb/innodb_stats_drop_locked":             true, // needs InnoDB stats row locking
 	"innodb/innodb_stats_long_names":              true,
 	"innodb/innodb_stats_sample_pages":            true,
 	"innodb/innodb_stats_table_flag_sample_pages": true,
@@ -1500,13 +1500,13 @@ var skipTests = map[string]bool{
 	"other/bug28940878":                            true,
 	"other/bug47671":                               true,
 	"other/bug58669":                               true,
-	"other/bulk_replace":                           true,
+	"other/bulk_replace":                           true, // row ordering after REPLACE
 	"other/case":                                   true,
 	"other/check":                                  true,
 	"other/client_xml":                             true,
 	"other/comment_column2":                        true,
 	"other/compare":                                true,
-	"other/component_backup_lock_service":          true,
+	"other/component_backup_lock_service":          true, // needs INSTALL COMPONENT
 	"other/component_string_service":               true,
 	"other/component_string_service_charset":       true,
 	"other/component_string_service_long":          true,
@@ -1614,7 +1614,7 @@ var skipTests = map[string]bool{
 	// "other/lock_tables_lost_commit":                true, // already passes
 	"other/locking_part":                           true,
 	"other/lowercase_table_grant":                  true,
-	"other/multi_update_innodb":                    true,
+	"other/multi_update_innodb":                    true, // needs self-join UPDATE + out-of-range + EXPLAIN
 	"other/multi_update_tiny_hash":                 true,
 	"other/mysql_comments":                         true,
 	"other/mysql_not_windows":                      true,
@@ -1699,7 +1699,7 @@ var skipTests = map[string]bool{
 	"other/subselect_innodb":                       true,
 	"other/sum_distinct":                           true,
 	// "other/synchronization": true, // now passes
-	"other/table_lock_skip_lock_nowait":            true,
+	"other/table_lock_skip_lock_nowait":            true, // needs multi-connection SKIP LOCKED
 	"other/tablelock":                              true,
 	"other/temptable_disk":                         true,
 	"other/temptable_no_pad_collation":             true,
@@ -1707,7 +1707,7 @@ var skipTests = map[string]bool{
 	"other/time_truncate_fractional_strict":        true,
 	"other/timezone4":                              true,
 	"other/timezone_grant":                         true,
-	"other/truth_value_transform":                  true,
+	// "other/truth_value_transform":                  true, // testing
 	"other/type_binary":                            true,
 	"other/type_decimal":                           true,
 	"other/type_time":                              true,
@@ -1809,7 +1809,7 @@ var skipTests = map[string]bool{
 	"other/lock":                             true,
 	"other/lock_backup":                      true,
 	"other/lock_backup_ddl":                  true,
-	"other/locking_clause_privileges":        true,
+	"other/locking_clause_privileges":        true, // needs lock privilege enforcement
 	"other/log_errchk":                       true,
 	"other/log_tables":                       true,
 	"other/lowercase_table":                  true,
@@ -1944,15 +1944,15 @@ var skipTests = map[string]bool{
 	"other/innodb_pk_extension_off":             true,
 	"other/innodb_pk_extension_on":              true,
 	"other/invisible_indexes":                   true,
-	"other/lock_backup_sessions":                true,
+	"other/lock_backup_sessions":                true, // needs LOCK INSTANCE FOR BACKUP
 	"other/lock_multi_bug38499":                 true,
 	"other/lock_multi_bug38691":                 true,
-	"other/locking_clause":                      true,
+	"other/locking_clause":                      true, // needs stored procedures
 	"other/locking_readonly_db":                 true,
 	"other/locking_with_out_key":                true,
 	"other/log_state":                           true,
 	"other/partition_innodb":                    true,
-	"other/partition_locking_4":                 true,
+	"other/partition_locking_4":                 true, // needs multi-connection lock wait timeout
 	"other/resource_group":                      true,
 	"other/resource_group_thr_prio_unsupported": true,
 	"other/roles":                               true,
@@ -2090,7 +2090,7 @@ var skipTests = map[string]bool{
 	"other/filter_single_col_idx_big_myisam": true,
 	"other/filter_single_col_idx_small_myisam": true,
 	"other/flush_myisam": true,
-	"other/flush_table_myisam": true,
+	// "other/flush_table_myisam": true, // testing
 	"other/foreign_key_myisam": true,
 	"other/fulltext": true,
 	"other/fulltext2": true,
@@ -2146,7 +2146,7 @@ var skipTests = map[string]bool{
 	"other/join_outer_bka_nixbnl": true,
 	"other/key_cache": true,
 	"other/key_myisam": true,
-	"other/lock_backup_ddl_myisam": true,
+	"other/lock_backup_ddl_myisam": true, // needs LOCK INSTANCE FOR BACKUP
 	"other/lock_multi": true,
 	// "other/lock_myisam": true, // unskipped: fixing LOCK TABLES issues
 	"other/log_tables_myisam": true,
@@ -2200,7 +2200,7 @@ var skipTests = map[string]bool{
 	"other/partition_check_myisam": true,
 	"other/partition_error": true,
 	"other/partition_exchange_myisam": true,
-	"other/partition_innodb_semi_consistent": true,
+	"other/partition_innodb_semi_consistent": true, // needs semi-consistent read
 	"other/partition_myisam": true,
 	"other/partition_not_supported_myisam": true,
 	"other/preload": true,

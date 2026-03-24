@@ -3474,6 +3474,21 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			nearText = strings.TrimPrefix(nearText, "use ")
 			return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", nearText))
 		}
+		// FLUSH TABLE(S) ... FOR EXPORT on non-InnoDB engines returns an error
+		if strings.HasPrefix(upper, "FLUSH TABLE") && strings.Contains(upper, "FOR EXPORT") {
+			// Extract table name: FLUSH TABLE t1 FOR EXPORT or FLUSH TABLES t1 FOR EXPORT
+			parts := strings.Fields(trimmed)
+			if len(parts) >= 3 {
+				tblName := strings.TrimRight(parts[2], ";")
+				if tbl, err := e.Storage.GetTable(e.CurrentDB, tblName); err == nil {
+					eng := strings.ToLower(tbl.Def.Engine)
+					if eng != "" && eng != "innodb" {
+						return nil, mysqlError(1031, "HY000", fmt.Sprintf("Table storage engine for '%s' doesn't have this option", tblName))
+					}
+				}
+			}
+			return &Result{}, nil
+		}
 		if strings.HasPrefix(upper, "CREATE EVENT") ||
 			strings.HasPrefix(upper, "DROP EVENT") ||
 			strings.HasPrefix(upper, "CREATE USER") ||
@@ -3696,6 +3711,18 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	case *sqlparser.RenameTable:
 		return e.execRenameTable(s)
 	case *sqlparser.Flush:
+		// FLUSH TABLE ... FOR EXPORT on non-InnoDB engines returns an error
+		if s.ForExport && len(s.TableNames) > 0 {
+			for _, tn := range s.TableNames {
+				tblName := tn.Name.String()
+				if tbl, err := e.Storage.GetTable(e.CurrentDB, tblName); err == nil {
+					eng := strings.ToLower(tbl.Def.Engine)
+					if eng != "" && eng != "innodb" {
+						return nil, mysqlError(1031, "HY000", fmt.Sprintf("Table storage engine for '%s' doesn't have this option", tblName))
+					}
+				}
+			}
+		}
 		// FLUSH STATUS, FLUSH TABLES, etc. - no-op
 		return &Result{}, nil
 	case *sqlparser.OtherAdmin:
@@ -19964,6 +19991,10 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		if err != nil {
 			return nil, err
 		}
+		// NULL comparison returns NULL (except for NULL-safe equal <=>)
+		if (left == nil || right == nil) && v.Operator != sqlparser.NullSafeEqualOp {
+			return nil, nil
+		}
 		result, err := compareValues(left, right, v.Operator)
 		if err != nil {
 			return nil, err
@@ -20158,6 +20189,9 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		if err != nil {
 			return nil, err
 		}
+		if val == nil {
+			return nil, nil // NOT NULL = NULL
+		}
 		if isTruthy(val) {
 			return int64(0), nil
 		}
@@ -20174,9 +20208,17 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		case sqlparser.IsNotNullOp:
 			result = val != nil
 		case sqlparser.IsTrueOp:
-			result = isTruthy(val)
+			// NULL IS TRUE = FALSE; non-NULL: check truthiness
+			result = val != nil && isTruthy(val)
 		case sqlparser.IsFalseOp:
-			result = !isTruthy(val)
+			// NULL IS FALSE = FALSE; non-NULL: check falsiness
+			result = val != nil && !isTruthy(val)
+		case sqlparser.IsNotTrueOp:
+			// NULL IS NOT TRUE = TRUE; non-NULL: check !truthiness
+			result = val == nil || !isTruthy(val)
+		case sqlparser.IsNotFalseOp:
+			// NULL IS NOT FALSE = TRUE; non-NULL: check truthiness
+			result = val == nil || isTruthy(val)
 		}
 		if result {
 			return int64(1), nil
@@ -26899,9 +26941,13 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 		case sqlparser.IsNotNullOp:
 			return val != nil, nil
 		case sqlparser.IsTrueOp:
-			return val == true || val == int64(1), nil
+			return val != nil && isTruthy(val), nil
 		case sqlparser.IsFalseOp:
-			return val == false || val == int64(0), nil
+			return val != nil && !isTruthy(val), nil
+		case sqlparser.IsNotTrueOp:
+			return val == nil || !isTruthy(val), nil
+		case sqlparser.IsNotFalseOp:
+			return val == nil || isTruthy(val), nil
 		}
 	case *sqlparser.BetweenExpr:
 		val, err := e.evalRowExpr(v.Left, row)
@@ -31527,8 +31573,117 @@ func isMultiTableUpdate(stmt *sqlparser.Update) bool {
 	return false
 }
 
+// collectTableRefAliases walks the table expressions from an UPDATE statement
+// and returns a map of alias -> real table name (lowercase) for all table references.
+// If the executor is provided, views are resolved to their underlying table.
+func (e *Executor) collectTableRefAliases(tes sqlparser.TableExprs) map[string]string {
+	m := make(map[string]string)
+	var walk func(te sqlparser.TableExpr)
+	walk = func(te sqlparser.TableExpr) {
+		switch t := te.(type) {
+		case *sqlparser.AliasedTableExpr:
+			if tn, ok := t.Expr.(sqlparser.TableName); ok {
+				realName := strings.ToLower(tn.Name.String())
+				// Resolve views to their underlying table
+				if e != nil {
+					if viewSQL, ok := e.views[realName]; ok {
+						// Try to extract the underlying table from the view
+						if viewStmt, err := e.parser().Parse(viewSQL); err == nil {
+							if sel, ok := viewStmt.(*sqlparser.Select); ok && len(sel.From) == 1 {
+								if ate, ok := sel.From[0].(*sqlparser.AliasedTableExpr); ok {
+									if vtn, ok := ate.Expr.(sqlparser.TableName); ok {
+										realName = strings.ToLower(vtn.Name.String())
+									}
+								}
+							}
+						}
+					}
+				}
+				alias := strings.ToLower(tn.Name.String())
+				if !t.As.IsEmpty() {
+					alias = strings.ToLower(t.As.String())
+				}
+				m[alias] = realName
+			}
+		case *sqlparser.JoinTableExpr:
+			walk(t.LeftExpr)
+			walk(t.RightExpr)
+		case *sqlparser.ParenTableExpr:
+			for _, ex := range t.Exprs {
+				walk(ex)
+			}
+		}
+	}
+	for _, te := range tes {
+		walk(te)
+	}
+	return m
+}
+
 // execMultiTableUpdate handles multi-table UPDATE statements.
 func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error) {
+	// Check for PK/partition key update conflict: if the same underlying table
+	// appears more than once (with different aliases) and a PK column is being
+	// updated, MySQL returns an error.
+	aliasToReal := e.collectTableRefAliases(stmt.TableExprs)
+	// Build reverse map: real table name -> list of aliases
+	realToAliases := make(map[string][]string)
+	for alias, real := range aliasToReal {
+		realToAliases[real] = append(realToAliases[real], alias)
+	}
+	// For tables that appear more than once, check if any SET expression
+	// updates a PK column.
+	for realName, aliases := range realToAliases {
+		if len(aliases) < 2 {
+			continue
+		}
+		// Get PK columns for this table
+		tbl, err := e.Storage.GetTable(e.CurrentDB, realName)
+		if err != nil {
+			continue
+		}
+		pkCols := make(map[string]bool)
+		for _, col := range tbl.Def.Columns {
+			if col.PrimaryKey {
+				pkCols[strings.ToLower(col.Name)] = true
+			}
+		}
+		// Also use the PrimaryKey slice from the table definition
+		for _, pk := range tbl.Def.PrimaryKey {
+			pkCols[strings.ToLower(pk)] = true
+		}
+		if len(pkCols) == 0 {
+			continue
+		}
+		// Check SET clauses for PK column updates
+		for _, upd := range stmt.Exprs {
+			colName := strings.ToLower(upd.Name.Name.String())
+			if !pkCols[colName] {
+				continue
+			}
+			// PK column is being updated — check if the qualifier matches one of the aliases
+			qual := strings.ToLower(strings.Trim(sqlparser.String(upd.Name.Qualifier), "`"))
+			if qual == "" {
+				// Unqualified — if the column belongs to this table, it's a conflict
+				for _, col := range tbl.Def.Columns {
+					if strings.EqualFold(col.Name, colName) {
+						// Find two alias names (uppercased) for the error message
+						sort.Strings(aliases)
+						return nil, mysqlError(1706, "HY000", fmt.Sprintf("Primary key/partition key update is not allowed since the table is updated both as '%s' and '%s'.",
+							strings.ToUpper(aliases[0]), strings.ToUpper(aliases[1])))
+					}
+				}
+			}
+			for _, a := range aliases {
+				if qual == a {
+					sort.Strings(aliases)
+					return nil, mysqlError(1706, "HY000", fmt.Sprintf("Primary key/partition key update is not allowed since the table is updated both as '%s' and '%s'.",
+						strings.ToUpper(aliases[0]), strings.ToUpper(aliases[1])))
+				}
+			}
+		}
+	}
+
 	// Build cross product of all tables, with WHERE predicate pushdown
 	var allRows []storage.Row
 	var err error
