@@ -12177,6 +12177,13 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		resultRows = append(resultRows, resultRow)
 	}
 
+	// Apply window functions (ROW_NUMBER, RANK, LAG, SUM OVER, etc.)
+	if selectExprsHaveWindowFuncs(stmt.SelectExprs.Exprs) {
+		if err := e.processWindowFunctions(colExprs, allRows, resultRows); err != nil {
+			return nil, err
+		}
+	}
+
 	// Apply SELECT DISTINCT
 	if stmt.Distinct {
 		seen := make(map[string]bool)
@@ -12651,6 +12658,10 @@ func aggregateDisplayName(expr sqlparser.Expr) string {
 }
 
 func isAggregateExpr(expr sqlparser.Expr) bool {
+	// Window aggregates (SUM/AVG/COUNT/MIN/MAX with OVER clause) are NOT group-by aggregates.
+	if isWindowAggregateExpr(expr) {
+		return false
+	}
 	switch expr.(type) {
 	case *sqlparser.CountStar, *sqlparser.Count,
 		*sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg,
@@ -21485,8 +21496,15 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 	case *sqlparser.ArgumentLessWindowExpr:
 		// ROW_NUMBER(), RANK(), DENSE_RANK(), etc. - stub returning 1
+		// Actual values computed by processWindowFunctions
+		return int64(1), nil
+	case *sqlparser.NtileExpr:
+		// NTILE(n) - stub returning 1
+		// Actual values computed by processWindowFunctions
 		return int64(1), nil
 	case *sqlparser.NTHValueExpr:
+		// NTH_VALUE - stub returning NULL
+		// Actual values computed by processWindowFunctions
 		return nil, nil
 	case *sqlparser.ExistsExpr:
 		// EXISTS subquery - try to evaluate via execSelect/execUnion
