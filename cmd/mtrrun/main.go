@@ -1544,7 +1544,7 @@ var skipTests = map[string]bool{
 	"other/execution_constants":                    true,
 	"other/explain_tree":                           true,
 	"other/file_contents":                          true,
-	"other/filesort":                               true,
+	// "other/filesort": true, // unskipped: now passes
 	"other/filesort_json":                          true,
 	"other/filesort_pack":                          true,
 	"other/filter_single_col_idx_big":              true,
@@ -1627,7 +1627,7 @@ var skipTests = map[string]bool{
 	"other/opt_costmodel":                          true,
 	"other/opt_costmodel_flush":                    true,
 	"other/opt_costmodel_pfs":                      true,
-	"other/opt_hints_index_merge":                  true,
+	// "other/opt_hints_index_merge": true, // unskipped: now passes
 	"other/opt_hints_pfs":                          true,
 	"other/opt_hints_subquery":                     true,
 	"other/order_by_limit":                         true,
@@ -1696,7 +1696,7 @@ var skipTests = map[string]bool{
 	"other/type_time":                              true,
 	"other/type_varchar":                           true,
 	"other/type_year":                              true,
-	"other/upgrade":                                true,
+	// "other/upgrade": true, // unskipped: now passes
 	"other/user_if_exists":                         true,
 	"other/variables_dynamic_privs":                true,
 	"other/with_explain":                           true,
@@ -1926,7 +1926,7 @@ var skipTests = map[string]bool{
 	"other/innodb_pk_extension_on":              true,
 	"other/invisible_indexes":                   true,
 	"other/lock_backup_sessions":                true, // needs LOCK INSTANCE FOR BACKUP
-	"other/lock_multi_bug38499":                 true,
+	// "other/lock_multi_bug38499": true, // unskipped: now passes
 	"other/lock_multi_bug38691":                 true,
 	"other/locking_clause":                      true, // needs stored procedures
 	"other/locking_readonly_db":                 true,
@@ -2030,7 +2030,7 @@ var skipTests = map[string]bool{
 	"other/check_myisam": true,
 	"other/create_myisam": true,
 	"other/create_select_tmp_myisam": true,
-	"other/csv_myisam": true,
+	// "other/csv_myisam": true, // unskipped: now passes
 	"other/ctype_binary_myisam": true,
 	"other/ctype_cp1251_myisam": true,
 	"other/ctype_gb18030_binlog": true,

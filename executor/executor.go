@@ -2683,194 +2683,364 @@ func (e *Executor) dummyExplainRow(query string) []interface{} {
 	return []interface{}{int64(1), "SIMPLE", table, nil, "ALL", nil, nil, nil, nil, rows, "100.00", extra}
 }
 
-// explainMultiRows returns one or more EXPLAIN rows, detecting derived tables
-// and UNION constructs to produce PRIMARY/DERIVED/UNION select_types like MySQL.
+// explainSelectType describes one row in the EXPLAIN output.
+type explainSelectType struct {
+	id         interface{} // int64 or nil (for UNION RESULT)
+	selectType string
+	table      interface{} // string or nil
+	extra      interface{} // string or nil
+	rows       interface{} // int64 or nil
+	filtered   interface{} // string or nil
+	accessType interface{} // string or nil
+}
+
+// explainMultiRows returns one or more EXPLAIN rows, detecting subqueries,
+// derived tables, and UNION constructs to produce correct select_types like MySQL.
 func (e *Executor) explainMultiRows(query string) [][]interface{} {
-	upper := strings.ToUpper(query)
-
-	// Check if the query has a derived table (subquery in FROM) or UNION ALL / UNION
-	// by looking for patterns like "JOIN (SELECT" or "FROM (SELECT" combined with UNION ALL
-	hasDerived := false
-	unionCount := 0
-
-	// Detect derived tables: look for "( SELECT ... UNION ALL SELECT ... ) AS"
-	// We need to find subqueries in FROM clauses
-	if strings.Contains(upper, "UNION ALL") || strings.Contains(upper, "UNION SELECT") {
-		// Check if the union is inside a subquery (derived table) or at the top level
-		// If there's a "JOIN (" or "FROM (" pattern before the UNION, it's a derived table
-		if strings.Contains(upper, "JOIN (") || strings.Contains(upper, "FROM (") {
-			hasDerived = true
-			// Count UNION ALL occurrences within the derived table
-			unionCount = strings.Count(upper, "UNION ALL") + strings.Count(upper, "UNION SELECT") - strings.Count(upper, "UNION ALL SELECT")
-			if unionCount < 1 {
-				unionCount = 1
-			}
-		}
-	}
-
-	if !hasDerived {
+	// Try to parse the query with the SQL parser for AST-based analysis
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		// Fall back to the simple row if parsing fails
 		return [][]interface{}{e.dummyExplainRow(query)}
 	}
 
-	// For queries with derived tables, produce multiple explain rows:
-	// Row 1: id=1, PRIMARY, <derived2>, ALL (the derived table scan)
-	// Row 2: id=1, PRIMARY, real_table, eq_ref/ALL (the joined real table)
-	// Row 3: id=2, DERIVED, NULL (first part of union in derived)
-	// Row 4: id=3, UNION, NULL (second part of union in derived)
+	var result []explainSelectType
+	idCounter := int64(1)
 
-	var rows [][]interface{}
+	switch s := stmt.(type) {
+	case *sqlparser.Union:
+		// Top-level UNION: first SELECT is PRIMARY, rest are UNION, plus UNION RESULT
+		result = e.explainUnion(s, &idCounter, true)
+	case *sqlparser.Select:
+		// Check if this SELECT has subqueries, derived tables, etc.
+		if e.queryHasComplexParts(s) {
+			result = e.explainSelect(s, &idCounter, "PRIMARY")
+		} else {
+			// Simple query
+			result = e.explainSelect(s, &idCounter, "SIMPLE")
+		}
+	default:
+		return [][]interface{}{e.dummyExplainRow(query)}
+	}
 
-	// Determine the real table name from the query
-	realTable := ""
-	realTableRows := int64(1)
-	// Look for table names -- find the main table in the join
-	// Pattern: "FROM tablename NATURAL JOIN (..." or "tablename JOIN (..."
-	// or "... JOIN tablename ON ..."
-	// Try to find the real table from the query
-	if idx := strings.Index(upper, " JOIN "); idx >= 0 {
-		// Check if this is "table JOIN (subquery)" or "(subquery) JOIN table"
-		before := strings.TrimSpace(query[:idx])
-		after := strings.TrimSpace(query[idx+6:])
+	// Convert to row format
+	rows := make([][]interface{}, len(result))
+	for i, r := range result {
+		rows[i] = []interface{}{
+			r.id, r.selectType, r.table, nil, r.accessType,
+			nil, nil, nil, nil, r.rows, r.filtered, r.extra,
+		}
+	}
+	return rows
+}
 
-		// If after starts with "(", the real table is before the JOIN
-		if strings.HasPrefix(strings.TrimSpace(strings.ToUpper(after)), "(") {
-			// Real table is in the FROM clause before JOIN
-			if fromIdx := strings.Index(strings.ToUpper(before), "FROM "); fromIdx >= 0 {
-				rest := strings.TrimSpace(before[fromIdx+5:])
-				fields := strings.Fields(rest)
-				if len(fields) > 0 {
-					realTable = strings.Trim(fields[0], "`;,()")
+// queryHasComplexParts returns true if the SELECT contains subqueries or derived tables.
+func (e *Executor) queryHasComplexParts(sel *sqlparser.Select) bool {
+	hasComplex := false
+	// Check FROM clause for derived tables
+	for _, te := range sel.From {
+		if e.tableExprHasSubquery(te) {
+			hasComplex = true
+			break
+		}
+	}
+	if hasComplex {
+		return true
+	}
+	// Check for subqueries in SELECT expressions, WHERE, HAVING
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		switch n := node.(type) {
+		case *sqlparser.Subquery:
+			_ = n
+			hasComplex = true
+			return false, nil
+		}
+		return true, nil
+	}, sel.SelectExprs, sel.Where, sel.Having)
+	return hasComplex
+}
+
+// tableExprHasSubquery checks if a table expression contains a derived table (subquery in FROM).
+func (e *Executor) tableExprHasSubquery(te sqlparser.TableExpr) bool {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if _, ok := t.Expr.(*sqlparser.DerivedTable); ok {
+			return true
+		}
+	case *sqlparser.JoinTableExpr:
+		return e.tableExprHasSubquery(t.LeftExpr) || e.tableExprHasSubquery(t.RightExpr)
+	case *sqlparser.ParenTableExpr:
+		for _, expr := range t.Exprs {
+			if e.tableExprHasSubquery(expr) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// explainSelect produces EXPLAIN rows for a SELECT statement.
+func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, selectType string) []explainSelectType {
+	myID := *idCounter
+	var result []explainSelectType
+
+	// Determine table name and row count for this SELECT
+	table, rowCount, extra := e.explainTableInfo(sel)
+
+	// Check for GROUP BY / SQL_BIG_RESULT
+	queryStr := sqlparser.String(sel)
+	upperQ := strings.ToUpper(queryStr)
+	if extra == nil && (strings.Contains(upperQ, "GROUP BY") || strings.Contains(upperQ, "SQL_BIG_RESULT")) {
+		extra = "Using filesort"
+	}
+
+	var accessType interface{} = "ALL"
+	var filtered interface{} = "100.00"
+	if table == nil {
+		accessType = nil
+		filtered = nil
+		extra = "No tables used"
+	}
+
+	result = append(result, explainSelectType{
+		id:         myID,
+		selectType: selectType,
+		table:      table,
+		extra:      extra,
+		rows:       rowCount,
+		filtered:   filtered,
+		accessType: accessType,
+	})
+
+	// Process FROM clause for derived tables
+	for _, te := range sel.From {
+		e.explainFromExpr(te, idCounter, &result)
+	}
+
+	// Process subqueries in SELECT expressions, WHERE, HAVING
+	e.explainSubqueries(sel, idCounter, &result)
+
+	return result
+}
+
+// explainFromExpr processes table expressions to find derived tables.
+func (e *Executor) explainFromExpr(te sqlparser.TableExpr, idCounter *int64, result *[]explainSelectType) {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if dt, ok := t.Expr.(*sqlparser.DerivedTable); ok {
+			// This is a derived table (subquery in FROM)
+			*idCounter++
+			switch inner := dt.Select.(type) {
+			case *sqlparser.Union:
+				derived := e.explainUnion(inner, idCounter, false)
+				// The first element should be DERIVED
+				if len(derived) > 0 {
+					derived[0].selectType = "DERIVED"
 				}
+				*result = append(*result, derived...)
+			case *sqlparser.Select:
+				innerRows := e.explainSelect(inner, idCounter, "DERIVED")
+				// Fix the id counter: the DERIVED row gets the next id
+				// (already incremented above)
+				if len(innerRows) > 0 {
+					innerRows[0].id = *idCounter
+				}
+				*result = append(*result, innerRows...)
+			}
+		}
+	case *sqlparser.JoinTableExpr:
+		e.explainFromExpr(t.LeftExpr, idCounter, result)
+		e.explainFromExpr(t.RightExpr, idCounter, result)
+	case *sqlparser.ParenTableExpr:
+		for _, expr := range t.Exprs {
+			e.explainFromExpr(expr, idCounter, result)
+		}
+	}
+}
+
+// explainSubqueries finds subqueries in SELECT expressions, WHERE, and HAVING clauses.
+func (e *Executor) explainSubqueries(sel *sqlparser.Select, idCounter *int64, result *[]explainSelectType) {
+	// Walk the SELECT expressions, WHERE, and HAVING to find subqueries
+	// We need to avoid descending into FROM clause (handled separately)
+	nodes := []sqlparser.SQLNode{}
+	if sel.SelectExprs != nil {
+		nodes = append(nodes, sel.SelectExprs)
+	}
+	if sel.Where != nil {
+		nodes = append(nodes, sel.Where)
+	}
+	if sel.Having != nil {
+		nodes = append(nodes, sel.Having)
+	}
+	if sel.OrderBy != nil {
+		nodes = append(nodes, sel.OrderBy)
+	}
+
+	for _, node := range nodes {
+		e.walkForSubqueries(node, idCounter, result)
+	}
+}
+
+// walkForSubqueries walks a node tree to find subqueries (not descending into FROM).
+func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, result *[]explainSelectType) {
+	if node == nil {
+		return
+	}
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		switch sub := n.(type) {
+		case *sqlparser.Subquery:
+			*idCounter++
+			switch inner := sub.Select.(type) {
+			case *sqlparser.Union:
+				unionRows := e.explainUnion(inner, idCounter, false)
+				// The first part becomes SUBQUERY
+				if len(unionRows) > 0 {
+					unionRows[0].selectType = "SUBQUERY"
+				}
+				*result = append(*result, unionRows...)
+			case *sqlparser.Select:
+				subRows := e.explainSelect(inner, idCounter, "SUBQUERY")
+				if len(subRows) > 0 {
+					subRows[0].id = *idCounter
+				}
+				*result = append(*result, subRows...)
+			}
+			return false, nil // Don't descend further into this subquery
+		}
+		return true, nil
+	}, node)
+}
+
+// explainUnion produces EXPLAIN rows for a UNION statement.
+func (e *Executor) explainUnion(u *sqlparser.Union, idCounter *int64, isTopLevel bool) []explainSelectType {
+	var result []explainSelectType
+	var unionIDs []int64
+
+	// Collect all SELECT statements from the union
+	selects := e.flattenUnion(u)
+
+	for i, sel := range selects {
+		var selectType string
+		if i == 0 {
+			if isTopLevel {
+				selectType = "PRIMARY"
+			} else {
+				selectType = "DERIVED"
 			}
 		} else {
-			// The subquery is before JOIN, real table is after
-			// For NATURAL JOIN, look past the subquery alias
-			afterUpper := strings.ToUpper(after)
-			if strings.HasPrefix(afterUpper, "(") {
-				// subquery on the right side
-			} else {
-				// real table on the right side
-				fields := strings.Fields(after)
-				if len(fields) > 0 {
-					realTable = strings.Trim(fields[0], "`;,()")
-				}
+			selectType = "UNION"
+		}
+
+		switch s := sel.(type) {
+		case *sqlparser.Select:
+			myID := *idCounter
+			unionIDs = append(unionIDs, myID)
+			rows := e.explainSelect(s, idCounter, selectType)
+			if len(rows) > 0 {
+				rows[0].id = myID
+				rows[0].selectType = selectType
 			}
+			result = append(result, rows...)
+			*idCounter++
+		case *sqlparser.Union:
+			// Nested union - shouldn't normally happen after flatten
+			nestedRows := e.explainUnion(s, idCounter, false)
+			result = append(result, nestedRows...)
 		}
 	}
 
-	// Also try to find table from "FROM t1 NATURAL JOIN" pattern
-	if realTable == "" {
-		if fromIdx := strings.Index(upper, " FROM "); fromIdx >= 0 {
-			rest := strings.TrimSpace(query[fromIdx+6:])
-			fields := strings.Fields(rest)
-			if len(fields) > 0 {
-				tok := strings.Trim(fields[0], "`;,()")
-				if tok != "" && !strings.HasPrefix(strings.ToUpper(tok), "SELECT") {
-					realTable = tok
-				}
-			}
+	// Add UNION RESULT row
+	if isTopLevel || len(selects) > 1 {
+		// Build <unionN,M,...> table name
+		unionTableParts := make([]string, len(unionIDs))
+		for i, id := range unionIDs {
+			unionTableParts[i] = strconv.FormatInt(id, 10)
 		}
+		unionTable := "<union" + strings.Join(unionTableParts, ",") + ">"
+		result = append(result, explainSelectType{
+			id:         nil,
+			selectType: "UNION RESULT",
+			table:      unionTable,
+			extra:      "Using temporary",
+			rows:       nil,
+			filtered:   nil,
+			accessType: "ALL",
+		})
 	}
 
-	if realTable != "" && e.Storage != nil {
-		if tbl, err := e.Storage.GetTable(e.CurrentDB, realTable); err == nil {
+	return result
+}
+
+// flattenUnion flattens a UNION tree into a slice of TableStatement.
+func (e *Executor) flattenUnion(u *sqlparser.Union) []sqlparser.TableStatement {
+	var result []sqlparser.TableStatement
+	// Left side
+	switch left := u.Left.(type) {
+	case *sqlparser.Union:
+		result = append(result, e.flattenUnion(left)...)
+	default:
+		result = append(result, left)
+	}
+	// Right side
+	switch right := u.Right.(type) {
+	case *sqlparser.Union:
+		result = append(result, e.flattenUnion(right)...)
+	default:
+		result = append(result, right)
+	}
+	return result
+}
+
+// explainTableInfo extracts table name, row count, and extra info for a SELECT.
+func (e *Executor) explainTableInfo(sel *sqlparser.Select) (table interface{}, rows interface{}, extra interface{}) {
+	if len(sel.From) == 0 {
+		return nil, nil, "No tables used"
+	}
+
+	// Get the first real table from FROM
+	tableName := e.extractFirstTableName(sel.From[0])
+	if tableName == "" {
+		// Could be a derived table or dual
+		return nil, nil, "No tables used"
+	}
+
+	var rowCount int64 = 1
+	if e.Storage != nil {
+		if tbl, err := e.Storage.GetTable(e.CurrentDB, tableName); err == nil {
 			if n := len(tbl.Rows); n > 0 {
-				realTableRows = int64(n)
+				rowCount = int64(n)
 			}
 		}
 	}
 
-	// Determine how many UNION parts there are
-	derivedParts := 1 + unionCount // first SELECT + UNION parts
+	return tableName, rowCount, nil
+}
 
-	// Determine ref and key info for the join
-	// If it's a NATURAL JOIN or JOIN with PK, the type might be eq_ref
-	joinType := "ALL"
-	var possibleKeys, key, keyLen, ref interface{}
-	possibleKeys = nil
-	key = nil
-	keyLen = nil
-	ref = nil
-	filtered := "100.00"
-
-	// For natural joins with a primary key table, MySQL uses eq_ref
-	if strings.Contains(upper, "NATURAL JOIN") || strings.Contains(upper, "JOIN") {
-		if realTable != "" && e.Storage != nil {
-			if tbl, err := e.Storage.GetTable(e.CurrentDB, realTable); err == nil {
-				if len(tbl.Def.PrimaryKey) > 0 {
-					joinType = "eq_ref"
-					possibleKeys = "PRIMARY"
-					key = "PRIMARY"
-					// Calculate key_len based on PK column types
-					keyLenVal := 0
-					for _, pkCol := range tbl.Def.PrimaryKey {
-						for _, col := range tbl.Def.Columns {
-							if strings.EqualFold(col.Name, pkCol) {
-								if strings.Contains(strings.ToUpper(col.Type), "INT") {
-									keyLenVal += 4
-								} else {
-									keyLenVal += 4 // default
-								}
-							}
-						}
-					}
-					keyLen = fmt.Sprintf("%d", keyLenVal)
-
-					// Find the alias of the derived table for ref
-					// Look for ") AS alias" or ") alias"
-					derivedAlias := "t2" // default
-					if asIdx := strings.Index(upper, ") AS "); asIdx >= 0 {
-						rest := strings.TrimSpace(query[asIdx+5:])
-						fields := strings.Fields(rest)
-						if len(fields) > 0 {
-							derivedAlias = strings.Trim(fields[0], "`;,()")
-						}
-					}
-					// Build ref from PK columns
-					refParts := make([]string, len(tbl.Def.PrimaryKey))
-					for i, pk := range tbl.Def.PrimaryKey {
-						refParts[i] = derivedAlias + "." + pk
-					}
-					ref = strings.Join(refParts, ",")
-					filtered = "10.00"
-					realTableRows = int64(1)
-				}
+// extractFirstTableName gets the first real table name from a table expression.
+func (e *Executor) extractFirstTableName(te sqlparser.TableExpr) string {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if _, ok := t.Expr.(*sqlparser.DerivedTable); ok {
+			return "" // derived table, not a real table
+		}
+		if tn, ok := t.Expr.(sqlparser.TableName); ok {
+			return tn.Name.String()
+		}
+	case *sqlparser.JoinTableExpr:
+		name := e.extractFirstTableName(t.LeftExpr)
+		if name != "" {
+			return name
+		}
+		return e.extractFirstTableName(t.RightExpr)
+	case *sqlparser.ParenTableExpr:
+		for _, expr := range t.Exprs {
+			name := e.extractFirstTableName(expr)
+			if name != "" {
+				return name
 			}
 		}
 	}
-
-	var extra interface{} = nil
-	if ref != nil {
-		extra = "Using where"
-	}
-
-	// Row 1: PRIMARY on the derived table
-	rows = append(rows, []interface{}{
-		int64(1), "PRIMARY", "<derived2>", nil, "ALL",
-		nil, nil, nil, nil, int64(derivedParts), "100.00", nil,
-	})
-
-	// Row 2: PRIMARY on the real table
-	if realTable != "" {
-		rows = append(rows, []interface{}{
-			int64(1), "PRIMARY", realTable, nil, joinType,
-			possibleKeys, key, keyLen, ref, realTableRows, filtered, extra,
-		})
-	}
-
-	// Row 3+: DERIVED and UNION parts
-	rows = append(rows, []interface{}{
-		int64(2), "DERIVED", nil, nil, nil,
-		nil, nil, nil, nil, nil, nil, "No tables used",
-	})
-	for i := 0; i < unionCount; i++ {
-		rows = append(rows, []interface{}{
-			int64(3 + int64(i)), "UNION", nil, nil, nil,
-			nil, nil, nil, nil, nil, nil, "No tables used",
-		})
-	}
-
-	return rows
+	return ""
 }
 
 func explainTableNameFromQuery(query string) string {
@@ -32389,14 +32559,12 @@ func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error)
 // execExplainStmt handles EXPLAIN SELECT ... statements.
 // Returns a simplified explain result set for compatibility.
 func (e *Executor) execExplainStmt(s *sqlparser.ExplainStmt, query string) (*Result, error) {
-	// Return a minimal EXPLAIN result for compatibility
-	return &Result{
-		Columns: []string{"id", "select_type", "table", "partitions", "type", "possible_keys", "key", "key_len", "ref", "rows", "filtered", "Extra"},
-		Rows: [][]interface{}{
-			{int64(1), "SIMPLE", nil, nil, "ALL", nil, nil, nil, nil, int64(1), "100.00", nil},
-		},
-		IsResultSet: true,
-	}, nil
+	// Use explainResultForType which delegates to explainMultiRows for proper select_type detection
+	explainedQuery := query
+	if s.Statement != nil {
+		explainedQuery = sqlparser.String(s.Statement)
+	}
+	return e.explainResultForType(s.Type, explainedQuery), nil
 }
 
 // execOtherAdmin handles OPTIMIZE TABLE, REPAIR TABLE, CHECK TABLE, etc.
