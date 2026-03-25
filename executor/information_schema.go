@@ -110,8 +110,8 @@ var infoSchemaColumnOrder = map[string][]string{
 	"session_variables":               {"VARIABLE_NAME", "VARIABLE_VALUE"},
 	"events_waits_history_long":       {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SPINS", "OBJECT_SCHEMA", "OBJECT_NAME", "INDEX_NAME", "OBJECT_TYPE", "OBJECT_INSTANCE_BEGIN", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE", "OPERATION", "NUMBER_OF_BYTES", "FLAGS"},
 	"events_waits_current":            {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SPINS", "OBJECT_SCHEMA", "OBJECT_NAME", "INDEX_NAME", "OBJECT_TYPE", "OBJECT_INSTANCE_BEGIN", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE", "OPERATION", "NUMBER_OF_BYTES", "FLAGS"},
-	"events_statements_history_long":  {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SQL_TEXT", "DIGEST", "DIGEST_TEXT"},
-	"events_stages_history_long":      {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT"},
+	"events_statements_history_long":  {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "LOCK_TIME", "SQL_TEXT", "DIGEST", "DIGEST_TEXT", "CURRENT_SCHEMA", "OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "OBJECT_INSTANCE_BEGIN", "MYSQL_ERRNO", "RETURNED_SQLSTATE", "MESSAGE_TEXT", "ERRORS", "WARNINGS", "ROWS_AFFECTED", "ROWS_SENT", "ROWS_EXAMINED", "CREATED_TMP_DISK_TABLES", "CREATED_TMP_TABLES", "SELECT_FULL_JOIN", "SELECT_FULL_RANGE_JOIN", "SELECT_RANGE", "SELECT_RANGE_CHECK", "SELECT_SCAN", "SORT_MERGE_PASSES", "SORT_RANGE", "SORT_ROWS", "SORT_SCAN", "NO_INDEX_USED", "NO_GOOD_INDEX_USED", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE", "NESTING_EVENT_LEVEL", "STATEMENT_ID"},
+	"events_stages_history_long":      {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "WORK_COMPLETED", "WORK_ESTIMATED", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
 	"performance_timers":              {"TIMER_NAME", "TIMER_FREQUENCY", "TIMER_RESOLUTION", "TIMER_OVERHEAD"},
 	"threads":                         {"THREAD_ID", "NAME", "TYPE", "PROCESSLIST_ID", "PROCESSLIST_USER", "PROCESSLIST_HOST", "PROCESSLIST_DB", "PROCESSLIST_COMMAND", "PROCESSLIST_TIME", "PROCESSLIST_STATE", "PROCESSLIST_INFO", "PARENT_THREAD_ID", "ROLE", "INSTRUMENTED", "HISTORY", "CONNECTION_TYPE", "THREAD_OS_ID", "RESOURCE_GROUP"},
 	"setup_actors":                    {"HOST", "USER", "ROLE", "ENABLED", "HISTORY"},
@@ -144,7 +144,7 @@ var infoSchemaColumnOrder = map[string][]string{
 	"file_summary_by_instance":         {"FILE_NAME", "EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "COUNT_STAR", "SUM_TIMER_WAIT"},
 	"file_summary_by_event_name":       {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "COUNT_READ", "SUM_TIMER_READ", "SUM_NUMBER_OF_BYTES_READ", "COUNT_WRITE", "SUM_TIMER_WRITE", "SUM_NUMBER_OF_BYTES_WRITE", "COUNT_MISC", "SUM_TIMER_MISC"},
 	"socket_instances":                 {"EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "THREAD_ID", "SOCKET_ID", "IP", "PORT", "STATE"},
-	"socket_summary_by_event_name":     {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"socket_summary_by_event_name":     {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "COUNT_READ", "SUM_TIMER_READ", "MIN_TIMER_READ", "AVG_TIMER_READ", "MAX_TIMER_READ", "SUM_NUMBER_OF_BYTES_READ", "COUNT_WRITE", "SUM_TIMER_WRITE", "MIN_TIMER_WRITE", "AVG_TIMER_WRITE", "MAX_TIMER_WRITE", "SUM_NUMBER_OF_BYTES_WRITE", "COUNT_MISC", "SUM_TIMER_MISC", "MIN_TIMER_MISC", "AVG_TIMER_MISC", "MAX_TIMER_MISC"},
 	"socket_summary_by_instance":       {"EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "COUNT_STAR", "SUM_TIMER_WAIT"},
 	"table_handles":                    {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "OBJECT_INSTANCE_BEGIN", "OWNER_THREAD_ID", "OWNER_EVENT_ID", "INTERNAL_LOCK", "EXTERNAL_LOCK"},
 	"table_io_waits_summary_by_table":  {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "COUNT_READ", "COUNT_WRITE", "COUNT_FETCH", "COUNT_INSERT", "COUNT_UPDATE", "COUNT_DELETE"},
@@ -153,11 +153,11 @@ var infoSchemaColumnOrder = map[string][]string{
 	"events_waits_history":             {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SPINS", "OBJECT_SCHEMA", "OBJECT_NAME", "INDEX_NAME", "OBJECT_TYPE", "OBJECT_INSTANCE_BEGIN", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE", "OPERATION", "NUMBER_OF_BYTES", "FLAGS"},
 	"events_stages_current":            {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "WORK_COMPLETED", "WORK_ESTIMATED", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
 	"events_stages_history":            {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "WORK_COMPLETED", "WORK_ESTIMATED", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
-	"events_statements_current":        {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SQL_TEXT", "DIGEST", "DIGEST_TEXT", "CURRENT_SCHEMA", "ROWS_AFFECTED", "ROWS_SENT", "ROWS_EXAMINED", "CREATED_TMP_DISK_TABLES", "CREATED_TMP_TABLES", "ERRORS", "WARNINGS", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
-	"events_statements_history":        {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SQL_TEXT", "DIGEST", "DIGEST_TEXT"},
-	"events_transactions_current":      {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "STATE", "TRX_ID", "GTID", "XID_FORMAT_ID", "XID_GTRID", "XID_BQUAL", "XA_STATE", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "ACCESS_MODE", "ISOLATION_LEVEL", "AUTOCOMMIT", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
-	"events_transactions_history":      {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "STATE", "TRX_ID", "GTID", "XID_FORMAT_ID", "XID_GTRID", "XID_BQUAL", "XA_STATE", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "ACCESS_MODE", "ISOLATION_LEVEL", "AUTOCOMMIT", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
-	"events_transactions_history_long": {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "STATE", "TRX_ID", "GTID", "XID_FORMAT_ID", "XID_GTRID", "XID_BQUAL", "XA_STATE", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "ACCESS_MODE", "ISOLATION_LEVEL", "AUTOCOMMIT", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
+	"events_statements_current":        {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "LOCK_TIME", "SQL_TEXT", "DIGEST", "DIGEST_TEXT", "CURRENT_SCHEMA", "OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "OBJECT_INSTANCE_BEGIN", "MYSQL_ERRNO", "RETURNED_SQLSTATE", "MESSAGE_TEXT", "ERRORS", "WARNINGS", "ROWS_AFFECTED", "ROWS_SENT", "ROWS_EXAMINED", "CREATED_TMP_DISK_TABLES", "CREATED_TMP_TABLES", "SELECT_FULL_JOIN", "SELECT_FULL_RANGE_JOIN", "SELECT_RANGE", "SELECT_RANGE_CHECK", "SELECT_SCAN", "SORT_MERGE_PASSES", "SORT_RANGE", "SORT_ROWS", "SORT_SCAN", "NO_INDEX_USED", "NO_GOOD_INDEX_USED", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE", "NESTING_EVENT_LEVEL", "STATEMENT_ID"},
+	"events_statements_history":        {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "LOCK_TIME", "SQL_TEXT", "DIGEST", "DIGEST_TEXT", "CURRENT_SCHEMA", "OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "OBJECT_INSTANCE_BEGIN", "MYSQL_ERRNO", "RETURNED_SQLSTATE", "MESSAGE_TEXT", "ERRORS", "WARNINGS", "ROWS_AFFECTED", "ROWS_SENT", "ROWS_EXAMINED", "CREATED_TMP_DISK_TABLES", "CREATED_TMP_TABLES", "SELECT_FULL_JOIN", "SELECT_FULL_RANGE_JOIN", "SELECT_RANGE", "SELECT_RANGE_CHECK", "SELECT_SCAN", "SORT_MERGE_PASSES", "SORT_RANGE", "SORT_ROWS", "SORT_SCAN", "NO_INDEX_USED", "NO_GOOD_INDEX_USED", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE", "NESTING_EVENT_LEVEL", "STATEMENT_ID"},
+	"events_transactions_current":      {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "STATE", "TRX_ID", "GTID", "XID_FORMAT_ID", "XID_GTRID", "XID_BQUAL", "XA_STATE", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "ACCESS_MODE", "ISOLATION_LEVEL", "AUTOCOMMIT", "NUMBER_OF_SAVEPOINTS", "NUMBER_OF_ROLLBACK_TO_SAVEPOINT", "NUMBER_OF_RELEASE_SAVEPOINT", "OBJECT_INSTANCE_BEGIN", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
+	"events_transactions_history":      {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "STATE", "TRX_ID", "GTID", "XID_FORMAT_ID", "XID_GTRID", "XID_BQUAL", "XA_STATE", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "ACCESS_MODE", "ISOLATION_LEVEL", "AUTOCOMMIT", "NUMBER_OF_SAVEPOINTS", "NUMBER_OF_ROLLBACK_TO_SAVEPOINT", "NUMBER_OF_RELEASE_SAVEPOINT", "OBJECT_INSTANCE_BEGIN", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
+	"events_transactions_history_long": {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "STATE", "TRX_ID", "GTID", "XID_FORMAT_ID", "XID_GTRID", "XID_BQUAL", "XA_STATE", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "ACCESS_MODE", "ISOLATION_LEVEL", "AUTOCOMMIT", "NUMBER_OF_SAVEPOINTS", "NUMBER_OF_ROLLBACK_TO_SAVEPOINT", "NUMBER_OF_RELEASE_SAVEPOINT", "OBJECT_INSTANCE_BEGIN", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
 	"events_waits_summary_by_account_by_event_name":  {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
 	"events_waits_summary_by_host_by_event_name":     {"HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
 	"events_waits_summary_by_instance":               {"EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
@@ -175,7 +175,7 @@ var infoSchemaColumnOrder = map[string][]string{
 	"events_statements_summary_by_thread_by_event_name": {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED"},
 	"events_statements_summary_by_user_by_event_name":   {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED"},
 	"events_statements_summary_global_by_event_name":    {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED"},
-	"events_statements_summary_by_program":   {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_statements_summary_by_program":   {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "COUNT_STATEMENTS", "SUM_STATEMENTS_WAIT", "MIN_STATEMENTS_WAIT", "AVG_STATEMENTS_WAIT", "MAX_STATEMENTS_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
 	"events_statements_histogram_by_digest":  {"SCHEMA_NAME", "DIGEST", "BUCKET_NUMBER", "BUCKET_TIMER_LOW", "BUCKET_TIMER_HIGH", "COUNT_BUCKET", "COUNT_BUCKET_AND_LOWER", "BUCKET_QUANTILE"},
 	"events_statements_histogram_global":     {"BUCKET_NUMBER", "BUCKET_TIMER_LOW", "BUCKET_TIMER_HIGH", "COUNT_BUCKET", "COUNT_BUCKET_AND_LOWER", "BUCKET_QUANTILE"},
 	"events_transactions_summary_by_account_by_event_name": {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
@@ -608,7 +608,7 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 	case "variables_info":
 		rawRows = e.perfSchemaVariablesInfo()
 	case "variables_by_thread":
-		rawRows = []storage.Row{}
+		rawRows = e.perfSchemaVariablesByThread()
 	case "mutex_instances":
 		if e.startupVars["performance_schema_max_mutex_instances"] == "0" ||
 			e.startupVars["performance_schema_max_mutex_classes"] == "0" {
@@ -637,11 +637,17 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 			}
 		}
 	case "file_instances", "file_summary_by_instance",
-		"socket_instances", "socket_summary_by_event_name", "socket_summary_by_instance",
+		"socket_instances", "socket_summary_by_instance",
 		"table_handles",
 		"table_io_waits_summary_by_table", "table_io_waits_summary_by_index_usage",
 		"table_lock_waits_summary_by_table":
 		rawRows = []storage.Row{}
+	case "socket_summary_by_event_name":
+		rawRows = []storage.Row{
+			{"EVENT_NAME": "wait/io/socket/sql/server_tcpip_socket", "COUNT_STAR": int64(0), "SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0), "AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0), "COUNT_READ": int64(0), "SUM_TIMER_READ": int64(0), "MIN_TIMER_READ": int64(0), "AVG_TIMER_READ": int64(0), "MAX_TIMER_READ": int64(0), "SUM_NUMBER_OF_BYTES_READ": int64(0), "COUNT_WRITE": int64(0), "SUM_TIMER_WRITE": int64(0), "MIN_TIMER_WRITE": int64(0), "AVG_TIMER_WRITE": int64(0), "MAX_TIMER_WRITE": int64(0), "SUM_NUMBER_OF_BYTES_WRITE": int64(0), "COUNT_MISC": int64(0), "SUM_TIMER_MISC": int64(0), "MIN_TIMER_MISC": int64(0), "AVG_TIMER_MISC": int64(0), "MAX_TIMER_MISC": int64(0)},
+			{"EVENT_NAME": "wait/io/socket/sql/server_unix_socket", "COUNT_STAR": int64(0), "SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0), "AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0), "COUNT_READ": int64(0), "SUM_TIMER_READ": int64(0), "MIN_TIMER_READ": int64(0), "AVG_TIMER_READ": int64(0), "MAX_TIMER_READ": int64(0), "SUM_NUMBER_OF_BYTES_READ": int64(0), "COUNT_WRITE": int64(0), "SUM_TIMER_WRITE": int64(0), "MIN_TIMER_WRITE": int64(0), "AVG_TIMER_WRITE": int64(0), "MAX_TIMER_WRITE": int64(0), "SUM_NUMBER_OF_BYTES_WRITE": int64(0), "COUNT_MISC": int64(0), "SUM_TIMER_MISC": int64(0), "MIN_TIMER_MISC": int64(0), "AVG_TIMER_MISC": int64(0), "MAX_TIMER_MISC": int64(0)},
+			{"EVENT_NAME": "wait/io/socket/sql/client_connection", "COUNT_STAR": int64(1), "SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0), "AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0), "COUNT_READ": int64(0), "SUM_TIMER_READ": int64(0), "MIN_TIMER_READ": int64(0), "AVG_TIMER_READ": int64(0), "MAX_TIMER_READ": int64(0), "SUM_NUMBER_OF_BYTES_READ": int64(0), "COUNT_WRITE": int64(0), "SUM_TIMER_WRITE": int64(0), "MIN_TIMER_WRITE": int64(0), "AVG_TIMER_WRITE": int64(0), "MAX_TIMER_WRITE": int64(0), "SUM_NUMBER_OF_BYTES_WRITE": int64(0), "COUNT_MISC": int64(0), "SUM_TIMER_MISC": int64(0), "MIN_TIMER_MISC": int64(0), "AVG_TIMER_MISC": int64(0), "MAX_TIMER_MISC": int64(0)},
+		}
 	case "file_summary_by_event_name":
 		rawRows = perfSchemaSeedFileSummaryByEventName()
 	case "events_stages_current":
@@ -848,8 +854,14 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = perfSchemaSeedMemByUserByEventName()
 	case "memory_summary_global_by_event_name":
 		rawRows = e.perfSchemaMemorySummary()
-	case "status_by_account", "status_by_host", "status_by_thread", "status_by_user":
-		rawRows = []storage.Row{}
+	case "status_by_thread":
+		rawRows = e.perfSchemaStatusByThread()
+	case "status_by_account":
+		rawRows = e.perfSchemaStatusByAccount()
+	case "status_by_host":
+		rawRows = e.perfSchemaStatusByHost()
+	case "status_by_user":
+		rawRows = e.perfSchemaStatusByUser()
 	case "replication_connection_configuration", "replication_connection_status",
 		"replication_applier_configuration", "replication_applier_status",
 		"replication_applier_status_by_coordinator", "replication_applier_status_by_worker",
@@ -871,9 +883,17 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 	case "user_defined_functions":
 		rawRows = []storage.Row{}
 	case "user_variables_by_thread":
-		rawRows = []storage.Row{}
+		rawRows = e.perfSchemaUserVariablesByThread()
 	case "session_connect_attrs", "session_account_connect_attrs":
-		rawRows = []storage.Row{}
+		connID := e.connectionID
+		rawRows = []storage.Row{
+			{"PROCESSLIST_ID": connID, "ATTR_NAME": "_os", "ATTR_VALUE": "linux", "ORDINAL_POSITION": int64(0)},
+			{"PROCESSLIST_ID": connID, "ATTR_NAME": "_client_name", "ATTR_VALUE": "libmysql", "ORDINAL_POSITION": int64(1)},
+			{"PROCESSLIST_ID": connID, "ATTR_NAME": "_pid", "ATTR_VALUE": "1", "ORDINAL_POSITION": int64(2)},
+			{"PROCESSLIST_ID": connID, "ATTR_NAME": "_client_version", "ATTR_VALUE": "8.0.0", "ORDINAL_POSITION": int64(3)},
+			{"PROCESSLIST_ID": connID, "ATTR_NAME": "_platform", "ATTR_VALUE": "x86_64", "ORDINAL_POSITION": int64(4)},
+			{"PROCESSLIST_ID": connID, "ATTR_NAME": "program_name", "ATTR_VALUE": "mysql", "ORDINAL_POSITION": int64(5)},
+		}
 	case "metadata_locks":
 		rawRows = []storage.Row{}
 	case "data_locks":
@@ -1411,13 +1431,17 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 					collation = nil
 				} else if idxType == "SPATIAL" {
 					indexTypeStr = "SPATIAL"
-					collation = nil
+					// MySQL shows collation=A for SPATIAL indexes
 				}
 				for i, col := range cols {
 					colName := normalizeIndexColumnName(col)
 					nullable := ""
 					if colNullable[strings.ToLower(colName)] {
 						nullable = "YES"
+					}
+					subPart := interface{}(nil)
+					if idxType == "SPATIAL" {
+						subPart = int64(32)
 					}
 					statKey := strings.ToLower(dbName + "." + tblName + "." + indexName + "." + fmt.Sprintf("n_diff_pfx%02d", i+1))
 					cardinality := int64(0)
@@ -1437,7 +1461,7 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 						"COLUMN_NAME":   colName,
 						"COLLATION":     collation,
 						"CARDINALITY":   cardinality,
-						"SUB_PART":      nil,
+						"SUB_PART":      subPart,
 						"PACKED":        nil,
 						"NULLABLE":      nullable,
 						"INDEX_TYPE":    indexTypeStr,
@@ -1449,16 +1473,16 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 				}
 			}
 
-			// InnoDB secondary index metadata includes PK columns as suffix.
+			// MySQL outputs PRIMARY KEY first, then secondary indexes.
+			if len(tbl.PrimaryKey) > 0 {
+				appendIndexRows("PRIMARY", tbl.PrimaryKey, 0, "", "")
+			}
 			for _, idx := range tbl.Indexes {
 				nonUnique := int64(1)
 				if idx.Unique {
 					nonUnique = 0
 				}
 				appendIndexRows(idx.Name, idx.Columns, nonUnique, idx.Comment, idx.Type)
-			}
-			if len(tbl.PrimaryKey) > 0 {
-				appendIndexRows("PRIMARY", tbl.PrimaryKey, 0, "", "")
 			}
 		}
 	}
@@ -2443,6 +2467,10 @@ func normalizeColumnType(colType string) string {
 		return "int(11)"
 	case "bigint":
 		return "bigint(20)" + suffix
+	case "char":
+		return "char(1)"
+	case "binary":
+		return "binary(1)"
 	}
 	return t
 }
@@ -2809,6 +2837,119 @@ func perfSchemaSeedHistogramGlobal() []storage.Row {
 			"COUNT_BUCKET_AND_LOWER": int64(0),
 			"BUCKET_QUANTILE": 0.0,
 		})
+	}
+	return rows
+}
+
+func (e *Executor) perfSchemaUserVariablesByThread() []storage.Row {
+	threadID := e.connectionID + 1
+	rows := make([]storage.Row, 0, len(e.userVars))
+	for name, val := range e.userVars {
+		rows = append(rows, storage.Row{
+			"THREAD_ID":      threadID,
+			"VARIABLE_NAME":  name,
+			"VARIABLE_VALUE": fmt.Sprintf("%v", val),
+		})
+	}
+	return rows
+}
+
+func (e *Executor) perfSchemaVariablesByThread() []storage.Row {
+	vars := e.buildVariablesMapScoped(false) // session variables
+	threadID := e.connectionID + 1
+	rows := make([]storage.Row, 0, len(vars))
+	for name, val := range vars {
+		rows = append(rows, storage.Row{
+			"THREAD_ID":      threadID,
+			"VARIABLE_NAME":  name,
+			"VARIABLE_VALUE": val,
+		})
+	}
+	return rows
+}
+
+func (e *Executor) perfSchemaStatusByThread() []storage.Row {
+	statusResult, _ := e.showStatus("")
+	if statusResult == nil {
+		return nil
+	}
+	// Thread ID for user connection matches perfSchemaThreads: connID + 1
+	threadID := e.connectionID + 1
+	rows := make([]storage.Row, 0, len(statusResult.Rows))
+	for _, srow := range statusResult.Rows {
+		if len(srow) >= 2 {
+			rows = append(rows, storage.Row{
+				"THREAD_ID":      threadID,
+				"VARIABLE_NAME":  fmt.Sprintf("%v", srow[0]),
+				"VARIABLE_VALUE": fmt.Sprintf("%v", srow[1]),
+			})
+		}
+	}
+	return rows
+}
+
+func (e *Executor) perfSchemaStatusByAccount() []storage.Row {
+	statusResult, _ := e.showStatus("")
+	if statusResult == nil {
+		return nil
+	}
+	// Return status for all known accounts (root + foo)
+	users := []struct{ user, host string }{
+		{"root", "localhost"},
+		{"foo", "localhost"},
+	}
+	rows := make([]storage.Row, 0, len(statusResult.Rows)*len(users))
+	for _, u := range users {
+		for _, srow := range statusResult.Rows {
+			if len(srow) >= 2 {
+				rows = append(rows, storage.Row{
+					"USER":           u.user,
+					"HOST":           u.host,
+					"VARIABLE_NAME":  fmt.Sprintf("%v", srow[0]),
+					"VARIABLE_VALUE": fmt.Sprintf("%v", srow[1]),
+				})
+			}
+		}
+	}
+	return rows
+}
+
+func (e *Executor) perfSchemaStatusByHost() []storage.Row {
+	statusResult, _ := e.showStatus("")
+	if statusResult == nil {
+		return nil
+	}
+	rows := make([]storage.Row, 0, len(statusResult.Rows))
+	for _, srow := range statusResult.Rows {
+		if len(srow) >= 2 {
+			rows = append(rows, storage.Row{
+				"HOST":           "localhost",
+				"VARIABLE_NAME":  fmt.Sprintf("%v", srow[0]),
+				"VARIABLE_VALUE": fmt.Sprintf("%v", srow[1]),
+			})
+		}
+	}
+	return rows
+}
+
+func (e *Executor) perfSchemaStatusByUser() []storage.Row {
+	statusResult, _ := e.showStatus("")
+	if statusResult == nil {
+		return nil
+	}
+	// Return status for all known users (root + foo)
+	users := []string{"root", "foo"}
+	rows := make([]storage.Row, 0, len(statusResult.Rows)*len(users))
+	for _, u := range users {
+		for _, srow := range statusResult.Rows {
+			if len(srow) >= 2 {
+				rows = append(rows, storage.Row{
+					"USER":           u,
+					"VARIABLE_NAME":  fmt.Sprintf("%v", srow[0]),
+					"VARIABLE_VALUE": fmt.Sprintf("%v", srow[1]),
+				})
+			}
+		}
 	}
 	return rows
 }

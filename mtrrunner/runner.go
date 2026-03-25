@@ -700,7 +700,8 @@ func (ctx *execContext) executeLines(lines []string) error {
 			}
 			if strings.HasPrefix(bdLower, "query ") ||
 				strings.HasPrefix(bdLower, "query_vertical ") ||
-				strings.HasPrefix(bdLower, "eval ") {
+				strings.HasPrefix(bdLower, "eval ") ||
+				bdLower == "eval" || bdLower == "query" || bdLower == "query_vertical" {
 				if !lineEndsWithSemicolon(trimmed) {
 					fullDirective := bareDirective
 					i++
@@ -3126,6 +3127,12 @@ func parseDirectiveNameArgs(directive string) (name, args string) {
 		name = strings.ToLower(strings.TrimSpace(d[:parIdx]))
 		args = strings.TrimSpace(d[parIdx:])
 		return strings.TrimRight(name, ";"), args
+	}
+
+	// Also check for newline separator (for multi-line directives like standalone eval)
+	nlIdx := strings.IndexByte(d, '\n')
+	if nlIdx >= 0 && (wsIdx < 0 || nlIdx < wsIdx) {
+		wsIdx = nlIdx
 	}
 
 	// Otherwise prefer the first whitespace separator when present.

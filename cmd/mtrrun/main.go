@@ -289,8 +289,7 @@ var skipTests = map[string]bool{
 	"parts/partition_icp": true,
 	// Requires InnoDB status file and lock wait timeout with partitions
 	"parts/partition_innodb_status_file": true,
-	// INT ordering differs across partitions
-	"parts/partition_int_innodb": true,
+	// "parts/partition_int_innodb": true, // now passes
 	// Partition-specific error validation (duplicate list values, duplicate names)
 	"parts/partition_list_error": true,
 	// REORGANIZE PARTITION (divide) requires partition management
@@ -341,8 +340,8 @@ var skipTests = map[string]bool{
 	// INFORMATION_SCHEMA query differences
 	"funcs_1/is_basics_mixed":                    true,
 	"funcs_1/is_character_sets":                  true,
-	"funcs_1/is_cml_innodb":                      true,
-	"funcs_1/is_cml_memory":                      true,
+	// "funcs_1/is_cml_innodb": true, // now passes
+	// "funcs_1/is_cml_memory": true, // now passes (eval multiline + char(1) fix)
 	"funcs_1/is_coll_char_set_appl":              true,
 	"funcs_1/is_collations":                      true,
 	"funcs_1/is_column_privileges":               true,
@@ -677,10 +676,6 @@ var skipTests = map[string]bool{
 	// "perfschema/ddl_events_stages_history_long": true, // now passes
 	"perfschema/digest_null_literal": true,
 	"perfschema/digest_table_full": true,
-	"perfschema/dml_esms_by_program": true,
-	// "perfschema/dml_ews_by_account_by_event_name": true, // now passes
-	// "perfschema/dml_ews_by_host_by_event_name": true, // now passes
-	// "perfschema/dml_ews_by_user_by_event_name": true, // now passes
 	"perfschema/dml_file_instances": true,
 	"perfschema/dml_handler": true,
 	"perfschema/dml_os_global_by_type": true,
@@ -705,39 +700,17 @@ var skipTests = map[string]bool{
 	"perfschema/global_objects": true,
 	"perfschema/global_read_lock": true,
 	"perfschema/histograms": true,
-	// "perfschema/idx_accounts": true, // now passes
 	"perfschema/idx_compare_replication_applier_configuration": true,
 	"perfschema/idx_compare_replication_applier_status": true,
 	"perfschema/idx_compare_replication_applier_status_by_coordinator": true,
 	"perfschema/idx_compare_replication_applier_status_by_worker": true,
 	"perfschema/idx_compare_replication_connection_configuration": true,
 	"perfschema/idx_compare_replication_connection_status": true,
-	// "perfschema/idx_cond_instances": true, // now passes
 	"perfschema/idx_data_lock_waits": true,
-	// "perfschema/idx_ees_by_account_by_error": true, // now passes
-	// "perfschema/idx_ees_by_host_by_error": true, // now passes
-	// "perfschema/idx_ees_by_thread_by_error": true, // now passes
-	// "perfschema/idx_ees_by_user_by_error": true, // now passes
-	// "perfschema/idx_ees_global_by_error": true, // now passes
-	// "perfschema/idx_esgs_by_account_by_event_name": true, // now passes
-	// "perfschema/idx_esgs_by_host_by_event_name": true, // now passes
-	// "perfschema/idx_esgs_by_thread_by_event_name": true, // now passes
-	// "perfschema/idx_esgs_by_user_by_event_name": true, // now passes
-	// "perfschema/idx_esgs_global_by_event_name": true, // now passes
 	"perfschema/idx_esmh_by_digest": true,
-	// "perfschema/idx_esmh_global": true, // now passes
-	// "perfschema/idx_esms_by_account_by_event_name": true, // now passes
 	"perfschema/idx_esms_by_digest": true,
-	// "perfschema/idx_esms_by_host_by_event_name": true, // now passes
 	"perfschema/idx_esms_by_program": true,
-	// "perfschema/idx_esms_by_thread_by_event_name": true, // now passes
 	"perfschema/idx_esms_by_user_by_event_name": true,
-	// "perfschema/idx_esms_global_by_event_name": true, // now passes
-	// "perfschema/idx_ets_by_account_by_event_name": true, // now passes
-	// "perfschema/idx_ets_by_host_by_event_name": true, // now passes
-	// "perfschema/idx_ets_by_thread_by_event_name": true, // now passes
-	// "perfschema/idx_ets_by_user_by_event_name": true, // now passes
-	// "perfschema/idx_ets_global_by_event_name": true, // now passes
 	"perfschema/idx_events_stages_current": true,
 	// "perfschema/idx_events_stages_history": true, // now passes
 	// "perfschema/idx_events_stages_history_long": true, // now passes
@@ -787,18 +760,9 @@ var skipTests = map[string]bool{
 	// "perfschema/idx_session_status": true, // now passes
 	// "perfschema/idx_session_variables": true, // now passes
 	"perfschema/idx_setup_actors": true,
-	// "perfschema/idx_setup_consumers": true, // now passes
-	// "perfschema/idx_setup_instruments": true, // now passes
 	"perfschema/idx_setup_objects": true,
-	// "perfschema/idx_setup_threads": true, // now passes
 	"perfschema/idx_show_status": true,
-	// "perfschema/idx_socket_instances": true, // now passes
-	"perfschema/idx_socket_summary_by_event_name": true,
 	"perfschema/idx_socket_summary_by_instance": true,
-	"perfschema/idx_status_by_account": true,
-	"perfschema/idx_status_by_host": true,
-	"perfschema/idx_status_by_thread": true,
-	"perfschema/idx_status_by_user": true,
 	"perfschema/idx_threads": true,
 	"perfschema/idx_tiws_by_index_usage": true,
 	"perfschema/idx_tiws_by_table": true,
@@ -1525,7 +1489,7 @@ var skipTests = map[string]bool{
 	"other/dd_string":                              true,
 	"other/alias":                                  true,
 	"other/alter_table_partition":                  true,
-	"other/analyze":                                true,
+	// "other/analyze":                                true, // now passes (OPTIMIZE TABLE EXTENDED error + "Table is already up to date" fix)
 	"other/ansi":                                   true,
 	"other/big_packets":                            true,
 	"other/bigint":                                 true,
@@ -1533,7 +1497,7 @@ var skipTests = map[string]bool{
 	"other/bool":                                   true,
 	"other/boot_coll_server_binary":                true,
 	"other/bug17666696":                            true,
-	"other/bug26331795":                            true,
+	// "other/bug26331795":                            true, // now passes (SET GLOBAL NULL rejection fix)
 	"other/bug28940878":                            true,
 	"other/bug47671":                               true,
 	"other/bug58669":                               true,
@@ -1671,7 +1635,7 @@ var skipTests = map[string]bool{
 	"other/mysqldump_gtid":                         true,
 	"other/mysqldumpslow":                          true,
 	"other/mysqlimport":                            true,
-	"other/negation_elimination":                   true,
+	// "other/negation_elimination":                   true, // now passes (NOT NULL fix in evalWhere)
 	"other/nth":                                    true,
 	"other/nth_explain":                            true,
 	"other/null":                                   true,
@@ -2023,7 +1987,7 @@ var skipTests = map[string]bool{
 
 	// === Newly un-skipped tests that fail (MyISAM/ARCHIVE engine tests now run but fail) ===
 	"binlog_gtid/binlog_gtid_mysqlbinlog_row_myisam": true,
-	"funcs_1/is_cml_myisam": true,
+	// "funcs_1/is_cml_myisam": true, // now passes
 	"funcs_1/is_columns_myisam": true,
 	"funcs_1/is_tables_myisam": true,
 	"funcs_1/myisam_bitdata": true,
@@ -2082,7 +2046,7 @@ var skipTests = map[string]bool{
 	"other/archive_symlink": true,
 	"other/auto_increment": true,
 	// "other/bench_count_distinct": true, // now passes
-	"other/bug46760_myisam": true,
+	// "other/bug46760_myisam": true, // now passes (OPTIMIZE TABLE "Table is already up to date" for MyISAM)
 	"other/check_constraints_myisam": true,
 	"other/check_myisam": true,
 	"other/create_myisam": true,
