@@ -2716,13 +2716,17 @@ func (e *Executor) dummyExplainRow(query string) []interface{} {
 
 // explainSelectType describes one row in the EXPLAIN output.
 type explainSelectType struct {
-	id         interface{} // int64 or nil (for UNION RESULT)
-	selectType string
-	table      interface{} // string or nil
-	extra      interface{} // string or nil
-	rows       interface{} // int64 or nil
-	filtered   interface{} // string or nil
-	accessType interface{} // string or nil
+	id           interface{} // int64 or nil (for UNION RESULT)
+	selectType   string
+	table        interface{} // string or nil
+	extra        interface{} // string or nil
+	rows         interface{} // int64 or nil
+	filtered     interface{} // string or nil
+	accessType   interface{} // string or nil
+	possibleKeys interface{} // string (comma-separated) or nil
+	key          interface{} // string or nil
+	keyLen       interface{} // string or nil
+	ref          interface{} // string (comma-separated) or nil
 }
 
 // explainMultiRows returns one or more EXPLAIN rows, detecting subqueries,
@@ -2759,7 +2763,7 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 	for i, r := range result {
 		rows[i] = []interface{}{
 			r.id, r.selectType, r.table, nil, r.accessType,
-			nil, nil, nil, nil, r.rows, r.filtered, r.extra,
+			r.possibleKeys, r.key, r.keyLen, r.ref, r.rows, r.filtered, r.extra,
 		}
 	}
 	return rows
@@ -2827,20 +2831,41 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 
 	var accessType interface{} = "ALL"
 	var filtered interface{} = "100.00"
+	var possibleKeys interface{} = nil
+	var key interface{} = nil
+	var keyLen interface{} = nil
+	var ref interface{} = nil
 	if table == nil {
 		accessType = nil
 		filtered = nil
 		extra = "No tables used"
+	} else if tableName, ok := table.(string); ok {
+		// Detect access type based on WHERE clause and available indexes
+		accessInfo := e.explainDetectAccessType(sel, tableName)
+		accessType = accessInfo.accessType
+		possibleKeys = accessInfo.possibleKeys
+		key = accessInfo.key
+		keyLen = accessInfo.keyLen
+		ref = accessInfo.ref
+
+		// Adjust row estimate for const access
+		if accessInfo.accessType == "const" {
+			rowCount = int64(1)
+		}
 	}
 
 	result = append(result, explainSelectType{
-		id:         myID,
-		selectType: selectType,
-		table:      table,
-		extra:      extra,
-		rows:       rowCount,
-		filtered:   filtered,
-		accessType: accessType,
+		id:           myID,
+		selectType:   selectType,
+		table:        table,
+		extra:        extra,
+		rows:         rowCount,
+		filtered:     filtered,
+		accessType:   accessType,
+		possibleKeys: possibleKeys,
+		key:          key,
+		keyLen:       keyLen,
+		ref:          ref,
 	})
 
 	// Process FROM clause for derived tables
@@ -3020,6 +3045,430 @@ func (e *Executor) flattenUnion(u *sqlparser.Union) []sqlparser.TableStatement {
 		result = append(result, right)
 	}
 	return result
+}
+
+// explainGetTableDef returns the catalog TableDef for the given table name, or nil.
+func (e *Executor) explainGetTableDef(tableName string) *catalog.TableDef {
+	if e.Catalog == nil || tableName == "" {
+		return nil
+	}
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil
+	}
+	td, err := db.GetTable(tableName)
+	if err != nil {
+		return nil
+	}
+	return td
+}
+
+// charsetBytesPerChar returns the maximum bytes per character for a given charset.
+func charsetBytesPerChar(charset string) int {
+	switch strings.ToLower(charset) {
+	case "latin1", "binary", "ascii":
+		return 1
+	case "utf8", "utf8mb3":
+		return 3
+	case "utf8mb4", "":
+		return 4
+	default:
+		return 4 // default to utf8mb4
+	}
+}
+
+// decimalStorageBytes computes the storage size for DECIMAL(M,D) using MySQL's formula.
+// Each group of 9 digits uses 4 bytes; leftover digits use ceil-mapped sizes.
+func decimalStorageBytes(precision, scale int) int {
+	// Bytes needed for leftover digits (1-8 digits after groups of 9)
+	leftoverBytes := []int{0, 1, 1, 2, 2, 3, 3, 4, 4} // index 0..8
+
+	intgDigits := precision - scale
+	fracDigits := scale
+
+	intgFull := intgDigits / 9
+	intgLeft := intgDigits % 9
+	fracFull := fracDigits / 9
+	fracLeft := fracDigits % 9
+
+	return intgFull*4 + leftoverBytes[intgLeft] + fracFull*4 + leftoverBytes[fracLeft]
+}
+
+// explainKeyLen computes the MySQL key_len for a column used in an index lookup.
+// MySQL reports key_len in bytes. For nullable columns, add 1 byte.
+// The tableCharset parameter is the table-level charset; column-level charset overrides it.
+func explainKeyLen(col *catalog.ColumnDef, tableCharset string) int {
+	upper := strings.ToUpper(col.Type)
+	baseLen := 0
+
+	// Determine effective charset for this column
+	charset := col.Charset
+	if charset == "" {
+		charset = tableCharset
+	}
+
+	switch {
+	case strings.HasPrefix(upper, "BIGINT"):
+		baseLen = 8
+	case strings.HasPrefix(upper, "INT") || strings.HasPrefix(upper, "INTEGER"):
+		baseLen = 4
+	case strings.HasPrefix(upper, "MEDIUMINT"):
+		baseLen = 3
+	case strings.HasPrefix(upper, "SMALLINT"):
+		baseLen = 2
+	case strings.HasPrefix(upper, "TINYINT"):
+		baseLen = 1
+	case strings.HasPrefix(upper, "FLOAT"):
+		baseLen = 4
+	case strings.HasPrefix(upper, "DOUBLE") || strings.HasPrefix(upper, "REAL"):
+		baseLen = 8
+	case strings.HasPrefix(upper, "DECIMAL") || strings.HasPrefix(upper, "NUMERIC"):
+		// DECIMAL(M,D): use MySQL's compact binary storage formula
+		precision := 10 // default M
+		scale := 0      // default D
+		start := strings.Index(upper, "(")
+		end := strings.Index(upper, ")")
+		if start >= 0 && end > start+1 {
+			parts := strings.Split(upper[start+1:end], ",")
+			if len(parts) >= 1 {
+				if p, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil {
+					precision = p
+				}
+			}
+			if len(parts) >= 2 {
+				if d, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil {
+					scale = d
+				}
+			}
+		}
+		baseLen = decimalStorageBytes(precision, scale)
+	case strings.HasPrefix(upper, "DATE"):
+		baseLen = 3
+	case strings.HasPrefix(upper, "DATETIME") || strings.HasPrefix(upper, "TIMESTAMP"):
+		baseLen = 5
+	case strings.HasPrefix(upper, "TIME"):
+		baseLen = 3
+	case strings.HasPrefix(upper, "YEAR"):
+		baseLen = 1
+	case strings.HasPrefix(upper, "CHAR"):
+		n := extractTypeLength(upper, 1)
+		baseLen = n * charsetBytesPerChar(charset)
+	case strings.HasPrefix(upper, "VARCHAR"):
+		n := extractTypeLength(upper, 255)
+		baseLen = n*charsetBytesPerChar(charset) + 2
+	case strings.HasPrefix(upper, "BINARY"):
+		n := extractTypeLength(upper, 1)
+		baseLen = n
+	case strings.HasPrefix(upper, "VARBINARY"):
+		n := extractTypeLength(upper, 255)
+		baseLen = n + 2
+	case strings.HasPrefix(upper, "ENUM"):
+		baseLen = 2
+	case strings.HasPrefix(upper, "SET"):
+		baseLen = 8
+	default:
+		// TEXT, BLOB, etc. - use a reasonable default
+		baseLen = 768 + 2 // prefix index length
+	}
+
+	if col.Nullable {
+		baseLen++
+	}
+	return baseLen
+}
+
+// extractTypeLength extracts the length parameter from a type like VARCHAR(255), CHAR(10), etc.
+func extractTypeLength(upper string, defaultLen int) int {
+	start := strings.Index(upper, "(")
+	end := strings.Index(upper, ")")
+	if start >= 0 && end > start+1 {
+		s := upper[start+1 : end]
+		// For DECIMAL(M,D), take M
+		if comma := strings.Index(s, ","); comma >= 0 {
+			s = s[:comma]
+		}
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultLen
+}
+
+// explainAccessInfo holds information about how a table will be accessed.
+type explainAccessInfo struct {
+	accessType   string      // "const", "eq_ref", "ref", "range", "index", "ALL"
+	possibleKeys interface{} // comma-separated string or nil
+	key          interface{} // chosen key name or nil
+	keyLen       interface{} // string representation of key length or nil
+	ref          interface{} // "const", column ref, or nil
+}
+
+// explainDetectAccessType analyzes a SELECT's WHERE clause against available indexes
+// to determine the access type, possible_keys, key, key_len, and ref.
+func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName string) explainAccessInfo {
+	result := explainAccessInfo{accessType: "ALL"}
+	td := e.explainGetTableDef(tableName)
+	if td == nil {
+		return result
+	}
+
+	// Extract WHERE conditions as column = expr or column op expr
+	var whereCols []explainWhereCondition
+	if sel.Where != nil {
+		whereCols = explainExtractWhereConditions(sel.Where.Expr, tableName)
+	}
+
+	if len(whereCols) == 0 {
+		// No WHERE conditions, check if all selected columns are covered by an index → "index" type
+		return result
+	}
+
+	// Build a set of columns referenced in equality conditions
+	eqCols := map[string]bool{}
+	rangeCols := map[string]bool{}
+	for _, wc := range whereCols {
+		if wc.isEquality {
+			eqCols[strings.ToLower(wc.column)] = true
+		}
+		if wc.isRange {
+			rangeCols[strings.ToLower(wc.column)] = true
+		}
+	}
+
+	// Check primary key
+	if len(td.PrimaryKey) > 0 {
+		allPKMatch := true
+		for _, pkCol := range td.PrimaryKey {
+			if !eqCols[strings.ToLower(pkCol)] {
+				allPKMatch = false
+				break
+			}
+		}
+		if allPKMatch {
+			// All PK columns matched by equality → const
+			pkKeyLen := 0
+			for _, pkCol := range td.PrimaryKey {
+				colDef := findColumnDef(td, pkCol)
+				if colDef != nil {
+					pkKeyLen += explainKeyLen(colDef, td.Charset)
+				}
+			}
+			result.accessType = "const"
+			result.possibleKeys = "PRIMARY"
+			result.key = "PRIMARY"
+			result.keyLen = strconv.Itoa(pkKeyLen)
+			result.ref = "const"
+			return result
+		}
+	}
+
+	// Check secondary indexes
+	type indexMatch struct {
+		index      catalog.IndexDef
+		matchedEq  int  // number of leading equality columns matched
+		matchedAll bool // all columns in the index matched by equality
+		hasRange   bool // at least one column matched by range
+		isPrimary  bool
+	}
+
+	var matches []indexMatch
+
+	// Add primary key as a candidate
+	if len(td.PrimaryKey) > 0 {
+		pkIdx := catalog.IndexDef{Name: "PRIMARY", Columns: td.PrimaryKey, Unique: true}
+		matchEq := 0
+		for _, c := range pkIdx.Columns {
+			if eqCols[strings.ToLower(c)] {
+				matchEq++
+			} else {
+				break
+			}
+		}
+		hasRange := false
+		for _, c := range pkIdx.Columns {
+			if rangeCols[strings.ToLower(c)] {
+				hasRange = true
+				break
+			}
+		}
+		if matchEq > 0 || hasRange {
+			matches = append(matches, indexMatch{
+				index:      pkIdx,
+				matchedEq:  matchEq,
+				matchedAll: matchEq == len(pkIdx.Columns),
+				hasRange:   hasRange,
+				isPrimary:  true,
+			})
+		}
+	}
+
+	for _, idx := range td.Indexes {
+		matchEq := 0
+		for _, c := range idx.Columns {
+			if eqCols[strings.ToLower(c)] {
+				matchEq++
+			} else {
+				break
+			}
+		}
+		hasRange := false
+		for _, c := range idx.Columns {
+			if rangeCols[strings.ToLower(c)] {
+				hasRange = true
+				break
+			}
+		}
+		if matchEq > 0 || hasRange {
+			matches = append(matches, indexMatch{
+				index:      idx,
+				matchedEq:  matchEq,
+				matchedAll: matchEq == len(idx.Columns),
+				hasRange:   hasRange,
+			})
+		}
+	}
+
+	if len(matches) == 0 {
+		return result
+	}
+
+	// Build possible_keys
+	possibleKeyNames := make([]string, len(matches))
+	for i, m := range matches {
+		possibleKeyNames[i] = m.index.Name
+	}
+	result.possibleKeys = strings.Join(possibleKeyNames, ",")
+
+	// Choose the best index: prefer const > eq_ref > ref > range
+	best := matches[0]
+	for _, m := range matches[1:] {
+		// Prefer more equality matches, then unique indexes
+		if m.matchedEq > best.matchedEq {
+			best = m
+		} else if m.matchedEq == best.matchedEq && m.index.Unique && !best.index.Unique {
+			best = m
+		}
+	}
+
+	// Compute key_len for matched prefix
+	keyLen := 0
+	matchCount := best.matchedEq
+	if matchCount == 0 && best.hasRange {
+		// Range on first column
+		matchCount = 1
+	}
+	for i := 0; i < matchCount && i < len(best.index.Columns); i++ {
+		colDef := findColumnDef(td, best.index.Columns[i])
+		if colDef != nil {
+			keyLen += explainKeyLen(colDef, td.Charset)
+		}
+	}
+
+	result.key = best.index.Name
+	result.keyLen = strconv.Itoa(keyLen)
+
+	// Determine access type
+	// Check if query involves a join (eq_ref only applies in join context)
+	isJoin := false
+	for _, te := range sel.From {
+		if _, ok := te.(*sqlparser.JoinTableExpr); ok {
+			isJoin = true
+			break
+		}
+	}
+	if best.matchedAll && best.index.Unique {
+		if best.isPrimary || !isJoin {
+			// Use "const" for PK lookups or unique index lookups in standalone queries
+			result.accessType = "const"
+		} else {
+			// Use "eq_ref" only for unique index lookups driven by a join
+			result.accessType = "eq_ref"
+		}
+		// Build ref string
+		refs := make([]string, best.matchedEq)
+		for i := range refs {
+			refs[i] = "const"
+		}
+		result.ref = strings.Join(refs, ",")
+	} else if best.matchedEq > 0 {
+		result.accessType = "ref"
+		refs := make([]string, best.matchedEq)
+		for i := range refs {
+			refs[i] = "const"
+		}
+		result.ref = strings.Join(refs, ",")
+	} else if best.hasRange {
+		result.accessType = "range"
+	}
+
+	return result
+}
+
+// explainWhereCondition represents a column condition extracted from a WHERE clause.
+type explainWhereCondition struct {
+	column     string
+	isEquality bool // col = value, col IS NULL, col IN (...)
+	isRange    bool // col > value, col < value, col BETWEEN, col IN (...)
+}
+
+// explainExtractWhereConditions recursively extracts column conditions from a WHERE expression.
+func explainExtractWhereConditions(expr sqlparser.Expr, tableName string) []explainWhereCondition {
+	if expr == nil {
+		return nil
+	}
+	switch e := expr.(type) {
+	case *sqlparser.AndExpr:
+		left := explainExtractWhereConditions(e.Left, tableName)
+		right := explainExtractWhereConditions(e.Right, tableName)
+		return append(left, right...)
+	case *sqlparser.ComparisonExpr:
+		colName := explainExtractColumnName(e.Left)
+		if colName == "" {
+			colName = explainExtractColumnName(e.Right)
+		}
+		if colName != "" {
+			switch e.Operator {
+			case sqlparser.EqualOp, sqlparser.NullSafeEqualOp:
+				return []explainWhereCondition{{column: colName, isEquality: true}}
+			case sqlparser.InOp:
+				return []explainWhereCondition{{column: colName, isEquality: true, isRange: true}}
+			case sqlparser.GreaterThanOp, sqlparser.GreaterEqualOp,
+				sqlparser.LessThanOp, sqlparser.LessEqualOp:
+				return []explainWhereCondition{{column: colName, isRange: true}}
+			}
+		}
+	case *sqlparser.BetweenExpr:
+		colName := explainExtractColumnName(e.Left)
+		if colName != "" {
+			return []explainWhereCondition{{column: colName, isRange: true}}
+		}
+	case *sqlparser.IsExpr:
+		colName := explainExtractColumnName(e.Left)
+		if colName != "" {
+			return []explainWhereCondition{{column: colName, isEquality: true}}
+		}
+	}
+	return nil
+}
+
+// explainExtractColumnName extracts a simple column name from an expression.
+func explainExtractColumnName(expr sqlparser.Expr) string {
+	switch e := expr.(type) {
+	case *sqlparser.ColName:
+		return e.Name.String()
+	}
+	return ""
+}
+
+// findColumnDef finds a column definition by name in a table definition.
+func findColumnDef(td *catalog.TableDef, colName string) *catalog.ColumnDef {
+	lower := strings.ToLower(colName)
+	for i := range td.Columns {
+		if strings.ToLower(td.Columns[i].Name) == lower {
+			return &td.Columns[i]
+		}
+	}
+	return nil
 }
 
 // explainTableInfo extracts table name, row count, and extra info for a SELECT.
