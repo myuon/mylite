@@ -212,6 +212,9 @@ type Executor struct {
 	preparedStmts map[string]string
 	// tempTables stores temporary tables per session (table name -> true).
 	tempTables map[string]bool
+	// tempShadowsReal tracks temp tables that shadow a real table with the same name.
+	// When such a temp table is dropped, the real table is NOT removed from catalog/storage.
+	tempShadowsReal map[string]bool
 	// globalScopeVars stores SET GLOBAL variable overrides.
 	globalScopeVars map[string]string
 	// sessionScopeVars stores SET SESSION/LOCAL variable overrides.
@@ -221,6 +224,8 @@ type Executor struct {
 	startupVars map[string]string
 	// views stores view definitions (view name -> SELECT query string).
 	views map[string]string
+	// viewColumns stores optional column aliases for views (view name -> []string).
+	viewColumns map[string][]string
 	// queryTableDef holds the table definition for the current query context,
 	// used for column-level checks (e.g., IS NULL on NOT NULL columns).
 	queryTableDef *catalog.TableDef
@@ -277,6 +282,12 @@ type Executor struct {
 	// handlerReadKey counts the number of index-based reads (SELECT queries).
 	// Incremented per SELECT, reset on FLUSH STATUS.
 	handlerReadKey int64
+	// triggerNewRow holds the NEW row when executing a trigger body with control flow.
+	triggerNewRow storage.Row
+	// triggerOldRow holds the OLD row when executing a trigger body with control flow.
+	triggerOldRow storage.Row
+	// triggerTiming holds the trigger timing ("BEFORE"/"AFTER") during trigger execution.
+	triggerTiming string
 }
 
 // Warning represents a MySQL warning.
@@ -543,14 +554,6 @@ func (e *Executor) initSystemTables() {
 		},
 	})
 	ensure("performance_schema", &catalog.TableDef{
-		Name: "events_stages_history",
-		Columns: []catalog.ColumnDef{
-			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
-			{Name: "WORK_COMPLETED", Type: "BIGINT"},
-			{Name: "WORK_ESTIMATED", Type: "BIGINT"},
-		},
-	})
-	ensure("performance_schema", &catalog.TableDef{
 		Name: "global_variables",
 		Columns: []catalog.ColumnDef{
 			{Name: "VARIABLE_NAME", Type: "VARCHAR(64)"},
@@ -564,81 +567,213 @@ func (e *Executor) initSystemTables() {
 			{Name: "VARIABLE_VALUE", Type: "VARCHAR(1024)"},
 		},
 	})
+
+	// ── events_stages_* ──
+	psEventsStagesCols := []catalog.ColumnDef{
+		{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+		{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+		{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+		{Name: "SOURCE", Type: "VARCHAR(64)", Nullable: true},
+		{Name: "TIMER_START", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "TIMER_END", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "WORK_COMPLETED", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "WORK_ESTIMATED", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "NESTING_EVENT_TYPE", Type: "ENUM('TRANSACTION','STATEMENT','STAGE','WAIT')", Nullable: true},
+	}
+	for _, tbl := range []string{"events_stages_current", "events_stages_history", "events_stages_history_long"} {
+		cols := make([]catalog.ColumnDef, len(psEventsStagesCols))
+		copy(cols, psEventsStagesCols)
+		ensure("performance_schema", &catalog.TableDef{
+			Name: tbl, Engine: "PERFORMANCE_SCHEMA", Columns: cols,
+		})
+	}
+
+	// ── events_waits_* ──
+	psEventsWaitsCols := []catalog.ColumnDef{
+		{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+		{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+		{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+		{Name: "SOURCE", Type: "VARCHAR(64)", Nullable: true},
+		{Name: "TIMER_START", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "TIMER_END", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "SPINS", Type: "INT UNSIGNED", Nullable: true},
+		{Name: "OBJECT_SCHEMA", Type: "VARCHAR(64)", Nullable: true},
+		{Name: "OBJECT_NAME", Type: "VARCHAR(512)", Nullable: true},
+		{Name: "INDEX_NAME", Type: "VARCHAR(64)", Nullable: true},
+		{Name: "OBJECT_TYPE", Type: "VARCHAR(64)", Nullable: true},
+		{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
+		{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "NESTING_EVENT_TYPE", Type: "ENUM('TRANSACTION','STATEMENT','STAGE','WAIT')", Nullable: true},
+		{Name: "OPERATION", Type: "VARCHAR(32)"},
+		{Name: "NUMBER_OF_BYTES", Type: "BIGINT", Nullable: true},
+		{Name: "FLAGS", Type: "INT UNSIGNED", Nullable: true},
+	}
+	for _, tbl := range []string{"events_waits_current", "events_waits_history", "events_waits_history_long"} {
+		cols := make([]catalog.ColumnDef, len(psEventsWaitsCols))
+		copy(cols, psEventsWaitsCols)
+		ensure("performance_schema", &catalog.TableDef{
+			Name: tbl, Engine: "PERFORMANCE_SCHEMA", Columns: cols,
+		})
+	}
+
+	// ── events_statements_* ──
+	psEventsStmtsCols := []catalog.ColumnDef{
+		{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+		{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+		{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+		{Name: "SOURCE", Type: "VARCHAR(64)", Nullable: true},
+		{Name: "TIMER_START", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "TIMER_END", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "LOCK_TIME", Type: "BIGINT UNSIGNED"},
+		{Name: "SQL_TEXT", Type: "LONGTEXT", Nullable: true},
+		{Name: "DIGEST", Type: "VARCHAR(64)", Nullable: true},
+		{Name: "DIGEST_TEXT", Type: "LONGTEXT", Nullable: true},
+		{Name: "CURRENT_SCHEMA", Type: "VARCHAR(64)", Nullable: true},
+		{Name: "OBJECT_TYPE", Type: "VARCHAR(64)", Nullable: true},
+		{Name: "OBJECT_SCHEMA", Type: "VARCHAR(64)", Nullable: true},
+		{Name: "OBJECT_NAME", Type: "VARCHAR(64)", Nullable: true},
+		{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "MYSQL_ERRNO", Type: "INT", Nullable: true},
+		{Name: "RETURNED_SQLSTATE", Type: "VARCHAR(5)", Nullable: true},
+		{Name: "MESSAGE_TEXT", Type: "VARCHAR(128)", Nullable: true},
+		{Name: "ERRORS", Type: "BIGINT UNSIGNED"},
+		{Name: "WARNINGS", Type: "BIGINT UNSIGNED"},
+		{Name: "ROWS_AFFECTED", Type: "BIGINT UNSIGNED"},
+		{Name: "ROWS_SENT", Type: "BIGINT UNSIGNED"},
+		{Name: "ROWS_EXAMINED", Type: "BIGINT UNSIGNED"},
+		{Name: "CREATED_TMP_DISK_TABLES", Type: "BIGINT UNSIGNED"},
+		{Name: "CREATED_TMP_TABLES", Type: "BIGINT UNSIGNED"},
+		{Name: "SELECT_FULL_JOIN", Type: "BIGINT UNSIGNED"},
+		{Name: "SELECT_FULL_RANGE_JOIN", Type: "BIGINT UNSIGNED"},
+		{Name: "SELECT_RANGE", Type: "BIGINT UNSIGNED"},
+		{Name: "SELECT_RANGE_CHECK", Type: "BIGINT UNSIGNED"},
+		{Name: "SELECT_SCAN", Type: "BIGINT UNSIGNED"},
+		{Name: "SORT_MERGE_PASSES", Type: "BIGINT UNSIGNED"},
+		{Name: "SORT_RANGE", Type: "BIGINT UNSIGNED"},
+		{Name: "SORT_ROWS", Type: "BIGINT UNSIGNED"},
+		{Name: "SORT_SCAN", Type: "BIGINT UNSIGNED"},
+		{Name: "NO_INDEX_USED", Type: "BIGINT UNSIGNED"},
+		{Name: "NO_GOOD_INDEX_USED", Type: "BIGINT UNSIGNED"},
+		{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "NESTING_EVENT_TYPE", Type: "ENUM('TRANSACTION','STATEMENT','STAGE','WAIT')", Nullable: true},
+		{Name: "NESTING_EVENT_LEVEL", Type: "INT", Nullable: true},
+		{Name: "STATEMENT_ID", Type: "BIGINT UNSIGNED", Nullable: true},
+	}
+	for _, tbl := range []string{"events_statements_current", "events_statements_history", "events_statements_history_long"} {
+		cols := make([]catalog.ColumnDef, len(psEventsStmtsCols))
+		copy(cols, psEventsStmtsCols)
+		ensure("performance_schema", &catalog.TableDef{
+			Name: tbl, Engine: "PERFORMANCE_SCHEMA", Columns: cols,
+		})
+	}
+
+	// ── events_transactions_* ──
+	psEventsTxnCols := []catalog.ColumnDef{
+		{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+		{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+		{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+		{Name: "STATE", Type: "ENUM('ACTIVE','COMMITTED','ROLLED BACK')", Nullable: true},
+		{Name: "TRX_ID", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "GTID", Type: "VARCHAR(64)", Nullable: true},
+		{Name: "XID_FORMAT_ID", Type: "INT", Nullable: true},
+		{Name: "XID_GTRID", Type: "VARCHAR(130)", Nullable: true},
+		{Name: "XID_BQUAL", Type: "VARCHAR(130)", Nullable: true},
+		{Name: "XA_STATE", Type: "VARCHAR(64)", Nullable: true},
+		{Name: "SOURCE", Type: "VARCHAR(64)", Nullable: true},
+		{Name: "TIMER_START", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "TIMER_END", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "ACCESS_MODE", Type: "ENUM('READ ONLY','READ WRITE')", Nullable: true},
+		{Name: "ISOLATION_LEVEL", Type: "VARCHAR(64)", Nullable: true},
+		{Name: "AUTOCOMMIT", Type: "ENUM('YES','NO')"},
+		{Name: "NUMBER_OF_SAVEPOINTS", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "NUMBER_OF_ROLLBACK_TO_SAVEPOINT", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "NUMBER_OF_RELEASE_SAVEPOINT", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED", Nullable: true},
+		{Name: "NESTING_EVENT_TYPE", Type: "ENUM('TRANSACTION','STATEMENT','STAGE','WAIT')", Nullable: true},
+	}
+	for _, tbl := range []string{"events_transactions_current", "events_transactions_history", "events_transactions_history_long"} {
+		cols := make([]catalog.ColumnDef, len(psEventsTxnCols))
+		copy(cols, psEventsTxnCols)
+		ensure("performance_schema", &catalog.TableDef{
+			Name: tbl, Engine: "PERFORMANCE_SCHEMA", Columns: cols,
+		})
+	}
+
+	// ── keyring_keys ──
 	ensure("performance_schema", &catalog.TableDef{
-		Name: "events_waits_history_long",
+		Name: "keyring_keys", Engine: "PERFORMANCE_SCHEMA",
+		Collation: "utf8mb4_bin",
 		Columns: []catalog.ColumnDef{
-			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
-			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
-			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED"},
-			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
-			{Name: "SOURCE", Type: "VARCHAR(64)"},
-			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
-			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
-			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
-			{Name: "SPINS", Type: "INT UNSIGNED"},
-			{Name: "OBJECT_SCHEMA", Type: "VARCHAR(64)"},
-			{Name: "OBJECT_NAME", Type: "VARCHAR(512)"},
-			{Name: "INDEX_NAME", Type: "VARCHAR(64)"},
-			{Name: "OBJECT_TYPE", Type: "VARCHAR(64)"},
-			{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
-			{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED"},
-			{Name: "NESTING_EVENT_TYPE", Type: "VARCHAR(64)"},
-			{Name: "OPERATION", Type: "VARCHAR(32)"},
-			{Name: "NUMBER_OF_BYTES", Type: "BIGINT"},
-			{Name: "FLAGS", Type: "INT UNSIGNED"},
+			{Name: "KEY_ID", Type: "VARCHAR(255)", Collation: "utf8mb4_bin"},
+			{Name: "KEY_OWNER", Type: "VARCHAR(255)", Nullable: true, Collation: "utf8mb4_bin"},
+			{Name: "BACKEND_KEY_ID", Type: "VARCHAR(255)", Nullable: true, Collation: "utf8mb4_bin"},
 		},
 	})
+
+	// ── performance_timers ──
 	ensure("performance_schema", &catalog.TableDef{
-		Name: "events_waits_current",
+		Name: "performance_timers", Engine: "PERFORMANCE_SCHEMA",
 		Columns: []catalog.ColumnDef{
-			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
-			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
-			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED"},
-			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
-			{Name: "SOURCE", Type: "VARCHAR(64)"},
-			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
-			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
-			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
-			{Name: "SPINS", Type: "INT UNSIGNED"},
-			{Name: "OBJECT_SCHEMA", Type: "VARCHAR(64)"},
-			{Name: "OBJECT_NAME", Type: "VARCHAR(512)"},
-			{Name: "INDEX_NAME", Type: "VARCHAR(64)"},
-			{Name: "OBJECT_TYPE", Type: "VARCHAR(64)"},
-			{Name: "OBJECT_INSTANCE_BEGIN", Type: "BIGINT UNSIGNED"},
-			{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED"},
-			{Name: "NESTING_EVENT_TYPE", Type: "VARCHAR(64)"},
-			{Name: "OPERATION", Type: "VARCHAR(32)"},
-			{Name: "NUMBER_OF_BYTES", Type: "BIGINT"},
-			{Name: "FLAGS", Type: "INT UNSIGNED"},
+			{Name: "TIMER_NAME", Type: "ENUM('CYCLE','NANOSECOND','MICROSECOND','MILLISECOND')"},
+			{Name: "TIMER_FREQUENCY", Type: "BIGINT", Nullable: true},
+			{Name: "TIMER_RESOLUTION", Type: "BIGINT", Nullable: true},
+			{Name: "TIMER_OVERHEAD", Type: "BIGINT", Nullable: true},
 		},
 	})
+
+	// ── persisted_variables ──
 	ensure("performance_schema", &catalog.TableDef{
-		Name: "events_statements_history_long",
+		Name: "persisted_variables", Engine: "PERFORMANCE_SCHEMA",
 		Columns: []catalog.ColumnDef{
-			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
-			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
-			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED"},
-			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
-			{Name: "SOURCE", Type: "VARCHAR(64)"},
-			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
-			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
-			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
-			{Name: "SQL_TEXT", Type: "LONGTEXT"},
-			{Name: "DIGEST", Type: "VARCHAR(64)"},
-			{Name: "DIGEST_TEXT", Type: "LONGTEXT"},
+			{Name: "VARIABLE_NAME", Type: "VARCHAR(64)"},
+			{Name: "VARIABLE_VALUE", Type: "VARCHAR(1024)", Nullable: true},
+		},
+		PrimaryKey: []string{"VARIABLE_NAME"},
+	})
+
+	// ── replication_group_member_stats ──
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "replication_group_member_stats", Engine: "PERFORMANCE_SCHEMA",
+		Columns: []catalog.ColumnDef{
+			{Name: "CHANNEL_NAME", Type: "CHAR(64)"},
+			{Name: "VIEW_ID", Type: "CHAR(60)", Charset: "utf8mb4", Collation: "utf8mb4_bin"},
+			{Name: "MEMBER_ID", Type: "CHAR(36)", Charset: "utf8mb4", Collation: "utf8mb4_bin"},
+			{Name: "COUNT_TRANSACTIONS_IN_QUEUE", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_TRANSACTIONS_CHECKED", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_CONFLICTS_DETECTED", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_TRANSACTIONS_ROWS_VALIDATING", Type: "BIGINT UNSIGNED"},
+			{Name: "TRANSACTIONS_COMMITTED_ALL_MEMBERS", Type: "LONGTEXT"},
+			{Name: "LAST_CONFLICT_FREE_TRANSACTION", Type: "TEXT"},
+			{Name: "COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_TRANSACTIONS_REMOTE_APPLIED", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_TRANSACTIONS_LOCAL_PROPOSED", Type: "BIGINT UNSIGNED"},
+			{Name: "COUNT_TRANSACTIONS_LOCAL_ROLLBACK", Type: "BIGINT UNSIGNED"},
 		},
 	})
+
+	// ── variables_info ──
+	compiledDefault := "COMPILED"
 	ensure("performance_schema", &catalog.TableDef{
-		Name: "events_stages_history_long",
+		Name: "variables_info", Engine: "PERFORMANCE_SCHEMA",
 		Columns: []catalog.ColumnDef{
-			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
-			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
-			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED"},
-			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
-			{Name: "SOURCE", Type: "VARCHAR(64)"},
-			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
-			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
-			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "VARIABLE_NAME", Type: "VARCHAR(64)"},
+			{Name: "VARIABLE_SOURCE", Type: "ENUM('COMPILED','GLOBAL','SERVER','EXPLICIT','EXTRA','USER','LOGIN','COMMAND_LINE','PERSISTED','DYNAMIC')", Nullable: true, Default: &compiledDefault},
+			{Name: "VARIABLE_PATH", Type: "VARCHAR(1024)", Nullable: true},
+			{Name: "MIN_VALUE", Type: "VARCHAR(64)", Nullable: true},
+			{Name: "MAX_VALUE", Type: "VARCHAR(64)", Nullable: true},
+			{Name: "SET_TIME", Type: "TIMESTAMP(6)", Nullable: true},
+			{Name: "SET_USER", Type: "CHAR(32)", Nullable: true, Charset: "utf8mb4", Collation: "utf8mb4_bin"},
+			{Name: "SET_HOST", Type: "CHAR(255)", Nullable: true, Charset: "ascii", Collation: "ascii_general_ci"},
 		},
 	})
 
@@ -3737,14 +3872,51 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		if e.views == nil {
 			e.views = make(map[string]string)
 		}
+		if e.viewColumns == nil {
+			e.viewColumns = make(map[string][]string)
+		}
+		// Validate the view's SELECT statement (variables, temp tables)
+		if err := e.validateViewSelect(s.Select); err != nil {
+			return nil, err
+		}
+		// Check if view already exists (case-insensitive)
+		if canonName, _, ok := e.lookupView(viewName); ok {
+			if !s.IsReplace {
+				return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", canonName))
+			}
+			// OR REPLACE: remove old entry (may differ in case)
+			delete(e.views, canonName)
+			delete(e.viewColumns, canonName)
+		}
 		e.views[viewName] = selectSQL
+		// Store column aliases if provided
+		if len(s.Columns) > 0 {
+			cols := make([]string, len(s.Columns))
+			for i, c := range s.Columns {
+				cols[i] = c.String()
+			}
+			e.viewColumns[viewName] = cols
+		}
 		return &Result{}, nil
 	case *sqlparser.DropView:
 		// Remove view definitions
 		for _, name := range s.FromTables {
 			viewName := name.Name.String()
-			if e.views != nil {
-				delete(e.views, viewName)
+			if canonName, _, ok := e.lookupView(viewName); ok {
+				delete(e.views, canonName)
+				if e.viewColumns != nil {
+					delete(e.viewColumns, canonName)
+				}
+			} else if !s.IfExists {
+				// Check if it's actually a table (not a view) — ER_WRONG_OBJECT
+				lookupDB := e.CurrentDB
+				if !name.Qualifier.IsEmpty() {
+					lookupDB = name.Qualifier.String()
+				}
+				if _, err := e.Storage.GetTable(lookupDB, viewName); err == nil {
+					return nil, mysqlError(1347, "HY000", fmt.Sprintf("'%s.%s' is not VIEW", lookupDB, viewName))
+				}
+				return nil, mysqlError(1051, "42S02", fmt.Sprintf("Unknown table '%s.%s'", e.CurrentDB, viewName))
 			}
 		}
 		return &Result{}, nil
@@ -3780,7 +3952,24 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		if e.views == nil {
 			e.views = make(map[string]string)
 		}
+		if e.viewColumns == nil {
+			e.viewColumns = make(map[string][]string)
+		}
+		// ALTER VIEW on nonexistent view is an error
+		canonName, _, ok := e.lookupView(viewName)
+		if !ok {
+			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, viewName))
+		}
+		delete(e.views, canonName)
+		delete(e.viewColumns, canonName)
 		e.views[viewName] = selectSQL
+		if len(s.Columns) > 0 {
+			cols := make([]string, len(s.Columns))
+			for i, c := range s.Columns {
+				cols[i] = c.String()
+			}
+			e.viewColumns[viewName] = cols
+		}
 		return &Result{}, nil
 	case *sqlparser.CommentOnly:
 		return &Result{}, nil
@@ -4749,6 +4938,10 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		if sysVarGlobalOnly[cleanVarName] && scope != sqlparser.GlobalScope {
 			return nil, mysqlError(1228, "HY000", fmt.Sprintf("Variable '%s' is a GLOBAL variable and should be set with SET GLOBAL", cleanVarName))
 		}
+		// Check if SESSION-only variable is being set at GLOBAL scope
+		if sysVarSessionOnly[cleanVarName] && scope == sqlparser.GlobalScope {
+			return nil, mysqlError(1228, "HY000", fmt.Sprintf("Variable '%s' is a SESSION variable and can't be used with SET GLOBAL", cleanVarName))
+		}
 		val := sqlparser.String(expr.Expr)
 		val = strings.Trim(val, "'\"")
 		// Try evaluating the expression (handles @user_var, @@system_var references)
@@ -5329,7 +5522,16 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					}
 					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", n)
 				} else if cleanName == "innodb_tmpdir" {
-					// innodb_tmpdir must be a valid path
+					// innodb_tmpdir: string only, must be a valid path
+					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
+						litStr := strings.TrimSpace(sqlparser.String(lit))
+						isQuotedStr := strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"")
+						if !isQuotedStr {
+							return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+						}
+					} else if _, isUnary := expr.Expr.(*sqlparser.UnaryExpr); isUnary {
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+					}
 					evalVal, _ := e.evalExpr(expr.Expr)
 					tmpPath := toString(evalVal)
 					if tmpPath != "" {
@@ -5344,8 +5546,17 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					}
 					e.sessionScopeVars[cleanName] = tmpPath
 				} else if cleanName == "innodb_commit_concurrency" {
-					// innodb_commit_concurrency cannot transition between 0 and non-zero.
+					// innodb_commit_concurrency: integer only, cannot transition between 0 and non-zero.
+					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
+						litStr := strings.TrimSpace(sqlparser.String(lit))
+						if strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"") || strings.ContainsAny(litStr, ".eE") {
+							return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+						}
+					}
 					evalVal, _ := e.evalExpr(expr.Expr)
+					if evalVal == nil {
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+					}
 					newVal := toInt64(evalVal)
 					currentVal, _ := e.getSysVar(cleanName)
 					if currentVal == "" {
@@ -5398,6 +5609,25 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						}
 					} else {
 						e.sessionScopeVars[cleanName] = normalized
+					}
+				} else if sysVarStringType[cleanName] {
+					// String-type variable: reject numeric/float assignment
+					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
+						litStr := strings.TrimSpace(sqlparser.String(lit))
+						isQuotedStr := strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"")
+						if !isQuotedStr {
+							// Unquoted numeric literals are rejected
+							return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+						}
+					} else if _, isUnary := expr.Expr.(*sqlparser.UnaryExpr); isUnary {
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+					}
+					evalVal, _ := e.evalExpr(expr.Expr)
+					if evalVal != nil {
+						strVal := fmt.Sprintf("%v", evalVal)
+						e.sessionScopeVars[cleanName] = strVal
+					} else {
+						e.sessionScopeVars[cleanName] = ""
 					}
 				} else {
 					// Evaluate expression
@@ -5638,6 +5868,10 @@ func (e *Executor) handleRawSet(raw string) error {
 		if sysVarGlobalOnly[varName] && !isGlobalScope {
 			return mysqlError(1228, "HY000", fmt.Sprintf("Variable '%s' is a GLOBAL variable and should be set with SET GLOBAL", varName))
 		}
+		// Check SESSION-only
+		if sysVarSessionOnly[varName] && isGlobalScope {
+			return mysqlError(1228, "HY000", fmt.Sprintf("Variable '%s' is a SESSION variable and can't be used with SET GLOBAL", varName))
+		}
 		val := strings.TrimSpace(rest[eqIdx+1:])
 		val = strings.TrimSuffix(val, ";")
 		val = strings.TrimSpace(val)
@@ -5645,6 +5879,32 @@ func (e *Executor) handleRawSet(raw string) error {
 		// Propagate as syntax error, but only for non-enum variables (enum vars often use reserved words as values).
 		if !strings.HasPrefix(val, "'") && !strings.HasPrefix(val, "\"") && sqlReservedKeywords[strings.ToUpper(val)] && !sysVarEnumSet[varName] {
 			return mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", val))
+		}
+		rawVal := val // preserve original (possibly quoted) for validation
+		// Detect multi-variable SET (e.g., "SET a=1, b=2")
+		// In this case, skip type validation as the value parsing is incomplete.
+		// A comma followed by an identifier=value pattern indicates multiple vars.
+		isMultiVarSet := false
+		{
+			// Check if there's a comma that's not inside quotes, followed by more text
+			inQ := byte(0)
+			for i := 0; i < len(rawVal); i++ {
+				ch := rawVal[i]
+				if inQ != 0 {
+					if ch == inQ {
+						inQ = 0
+					}
+					continue
+				}
+				if ch == '\'' || ch == '"' {
+					inQ = ch
+					continue
+				}
+				if ch == ',' {
+					isMultiVarSet = true
+					break
+				}
+			}
 		}
 		val = strings.Trim(val, "'\"")
 		// Normalize engine names for storage engine variables
@@ -5654,10 +5914,67 @@ func (e *Executor) handleRawSet(raw string) error {
 			}
 			val = normalizeEngineName(val)
 		}
-		if strings.ToUpper(val) != "DEFAULT" {
-			e.setSysVar(varName, val, isGlobalScope)
-		} else {
+		isQuotedVal := strings.HasPrefix(rawVal, "'") || strings.HasPrefix(rawVal, "\"")
+		if strings.ToUpper(val) == "DEFAULT" && !isQuotedVal {
 			e.deleteSysVar(varName, isGlobalScope)
+		} else if !isMultiVarSet && isBooleanVariable(varName) {
+			// Validate boolean value in handleRawSet path
+			isQuoted := strings.HasPrefix(rawVal, "'") || strings.HasPrefix(rawVal, "\"")
+			if isQuoted {
+				upVal := strings.ToUpper(val)
+				switch upVal {
+				case "ON", "OFF", "0", "1":
+					// ok
+				default:
+					return mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", varName, val))
+				}
+			} else {
+				upVal := strings.ToUpper(val)
+				switch upVal {
+				case "ON", "OFF", "TRUE", "FALSE", "0", "1":
+					// ok
+				default:
+					// Check if integer
+					if _, err := strconv.ParseInt(val, 10, 64); err == nil {
+						if sysVarBoolAcceptNegative[varName] {
+							// Negative integers accepted as ON
+						} else {
+							return mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", varName, val))
+						}
+					} else if _, err := strconv.ParseFloat(val, 64); err == nil {
+						return mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", varName))
+					} else {
+						return mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", varName, val))
+					}
+				}
+			}
+			// Normalize to ON/OFF
+			upVal := strings.ToUpper(val)
+			switch upVal {
+			case "ON", "TRUE", "1":
+				e.setSysVar(varName, "ON", isGlobalScope)
+			case "OFF", "FALSE", "0":
+				e.setSysVar(varName, "OFF", isGlobalScope)
+			default:
+				if sysVarBoolAcceptNegative[varName] {
+					e.setSysVar(varName, "ON", isGlobalScope)
+				}
+			}
+		} else if !isMultiVarSet {
+			if _, isEnum := sysVarEnumValues[varName]; isEnum {
+				// Validate enum value
+				enumMap := sysVarEnumValues[varName]
+				upVal := strings.ToUpper(val)
+				if mapped, ok := enumMap[upVal]; ok {
+					e.setSysVar(varName, mapped, isGlobalScope)
+				} else {
+					return mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", varName, val))
+				}
+			} else {
+				e.setSysVar(varName, val, isGlobalScope)
+			}
+		} else {
+			e.setSysVar(varName, val, isGlobalScope)
 		}
 		// Trigger variables reset to OFF immediately after being set
 		if triggerSysVars[varName] {
@@ -8474,16 +8791,30 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	}
 
 	// Temporary tables are connection-scoped in MySQL, but this simplified engine
-	// uses a shared catalog. Recreate temporary tables idempotently to avoid
-	// cross-session name collisions in MTR multi-connection tests.
+	// uses a shared catalog. When a real table with the same name exists, keep
+	// the real table in the catalog/storage and just mark it as temp.
+	// When the temp table is dropped, the real table entry remains.
 	if stmt.Temp {
-		_ = db.DropTable(tableName)
-		e.Storage.DropTable(dbName, tableName)
-		delete(e.tempTables, tableName)
+		if e.tempTables[tableName] {
+			// Previous temp table: drop and recreate
+			_ = db.DropTable(tableName)
+			e.Storage.DropTable(dbName, tableName)
+		}
+		// Don't drop real tables — just mark as temp
 	}
 
 	err = db.CreateTable(def)
 	if err != nil {
+		if stmt.Temp {
+			// Temp table with same name as real table: just mark as temp
+			// without modifying catalog/storage. The temp table shadows the real one.
+			e.tempTables[tableName] = true
+			if e.tempShadowsReal == nil {
+				e.tempShadowsReal = make(map[string]bool)
+			}
+			e.tempShadowsReal[tableName] = true
+			return &Result{}, nil
+		}
 		if stmt.IfNotExists {
 			return &Result{}, nil
 		}
@@ -8624,6 +8955,12 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 			}
 			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
 		}
+		// If this is a temp table that shadows a real table, just unmark it
+		if e.tempTables[tableName] && e.tempShadowsReal[tableName] {
+			delete(e.tempTables, tableName)
+			delete(e.tempShadowsReal, tableName)
+			continue
+		}
 		err = db.DropTable(tableName)
 		if err != nil {
 			if stmt.IfExists {
@@ -8635,6 +8972,7 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 		e.removeInnoDBStatsRows(dbName, tableName)
 		// Clean up temp table tracking
 		delete(e.tempTables, tableName)
+		delete(e.tempShadowsReal, tableName)
 		// Drop triggers associated with this table (MySQL behavior)
 		e.dropTriggersForTable(db, tableName)
 	}
@@ -8995,11 +9333,16 @@ func (e *Executor) execMyliteCommand(query string) (*Result, error) {
 		db, err := e.Catalog.GetDatabase(e.CurrentDB)
 		if err == nil {
 			for name := range e.tempTables {
+				// Don't drop real tables that were shadowed by temp tables
+				if e.tempShadowsReal != nil && e.tempShadowsReal[name] {
+					continue
+				}
 				db.DropTable(name) //nolint:errcheck
 				e.Storage.DropTable(e.CurrentDB, name)
 			}
 		}
 		e.tempTables = make(map[string]bool)
+		e.tempShadowsReal = nil
 		return &Result{}, nil
 	}
 
@@ -9011,6 +9354,8 @@ func (e *Executor) execMyliteCommand(query string) (*Result, error) {
 		e.sqlMode = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
 		e.userVars = make(map[string]interface{})
 		e.preparedStmts = make(map[string]string)
+		e.views = nil
+		e.viewColumns = nil
 		return &Result{}, nil
 	}
 
@@ -10572,29 +10917,40 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 		tbl, err := e.Storage.GetTable(lookupDB, lookupTable)
 		if err != nil {
 			// Check if it's a view
-			if e.views != nil {
-				if viewSQL, ok := e.views[lookupTable]; ok {
-					viewResult, err := e.Execute(viewSQL)
-					if err != nil {
-						return nil, err
-					}
-					// Convert view result to storage.Rows
-					rows := make([]storage.Row, 0, len(viewResult.Rows))
-					// Store column order as a special metadata key for SELECT * resolution
-					colOrderStr := strings.Join(viewResult.Columns, "\x00")
-					for _, vrow := range viewResult.Rows {
-						row := make(storage.Row)
-						row["__column_order__"] = colOrderStr
-						for ci, col := range viewResult.Columns {
-							if ci < len(vrow) {
-								row[col] = vrow[ci]
-								row[alias+"."+col] = vrow[ci]
+			if canonName, viewSQL, ok := e.lookupView(lookupTable); ok {
+				viewResult, err := e.Execute(viewSQL)
+				if err != nil {
+					return nil, err
+				}
+				// Apply column aliases if defined
+				outCols := viewResult.Columns
+				if e.viewColumns != nil {
+					if aliases, ok := e.viewColumns[canonName]; ok && len(aliases) > 0 {
+						outCols = make([]string, len(viewResult.Columns))
+						copy(outCols, viewResult.Columns)
+						for i, a := range aliases {
+							if i < len(outCols) {
+								outCols[i] = a
 							}
 						}
-						rows = append(rows, row)
 					}
-					return rows, nil
 				}
+				// Convert view result to storage.Rows
+				rows := make([]storage.Row, 0, len(viewResult.Rows))
+				// Store column order as a special metadata key for SELECT * resolution
+				colOrderStr := strings.Join(outCols, "\x00")
+				for _, vrow := range viewResult.Rows {
+					row := make(storage.Row)
+					row["__column_order__"] = colOrderStr
+					for ci, col := range outCols {
+						if ci < len(vrow) {
+							row[col] = vrow[ci]
+							row[alias+"."+col] = vrow[ci]
+						}
+					}
+					rows = append(rows, row)
+				}
+				return rows, nil
 			}
 			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", lookupDB, lookupTable))
 		}
@@ -16066,20 +16422,8 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 	tblDef, resolvedTableName, err := findTableDefCaseInsensitive(db, tableName)
 	if err != nil {
 		// Check if it's a view — derive column info from executing the view's SELECT.
-		if e.views != nil {
-			viewLookup := tableName
-			if _, ok := e.views[viewLookup]; !ok {
-				// Try case-insensitive lookup
-				for vn := range e.views {
-					if strings.EqualFold(vn, viewLookup) {
-						viewLookup = vn
-						break
-					}
-				}
-			}
-			if viewSQL, ok := e.views[viewLookup]; ok {
-				return e.describeView(viewSQL)
-			}
+		if _, viewSQL, ok := e.lookupView(tableName); ok {
+			return e.describeView(viewSQL)
 		}
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", descDB, tableName))
 	}
@@ -16276,6 +16620,61 @@ func (e *Executor) describeTableFull(tableName string) (*Result, error) {
 	}, nil
 }
 
+// lookupView performs a case-insensitive view lookup, returning the canonical
+// view name and its SQL definition. ok is false when no view matches.
+func (e *Executor) lookupView(name string) (canonName string, viewSQL string, ok bool) {
+	if e.views == nil {
+		return "", "", false
+	}
+	if sql, found := e.views[name]; found {
+		return name, sql, true
+	}
+	for vn, sql := range e.views {
+		if strings.EqualFold(vn, name) {
+			return vn, sql, true
+		}
+	}
+	return "", "", false
+}
+
+// validateViewSelect checks a CREATE VIEW's SELECT for invalid references
+// (user/system variables, temporary tables).
+// Note: table existence is NOT checked here because temporary table handling
+// in the shared catalog can clobber real table entries.
+func (e *Executor) validateViewSelect(sel sqlparser.TableStatement) error {
+	var varErr error
+	var tableErr error
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
+		switch n := node.(type) {
+		case *sqlparser.Variable:
+			// @@global.var, @@session.var, @user_var
+			varErr = mysqlError(1351, "HY000", "View's SELECT contains a variable or parameter")
+			return false, nil
+		case *sqlparser.AliasedTableExpr:
+			if tn, ok := n.Expr.(sqlparser.TableName); ok {
+				tblName := tn.Name.String()
+				if strings.EqualFold(tblName, "dual") || tblName == "" {
+					return true, nil
+				}
+				// Check for temporary tables (ER_VIEW_SELECT_TMPTABLE)
+				if e.tempTables != nil && e.tempTables[tblName] {
+					tableErr = mysqlError(1352, "HY000", fmt.Sprintf("View's SELECT refers to a temporary table '%s'", tblName))
+					return false, nil
+				}
+			}
+			return true, nil
+		}
+		return true, nil
+	}, sel)
+	if varErr != nil {
+		return varErr
+	}
+	if tableErr != nil {
+		return tableErr
+	}
+	return nil
+}
+
 // describeView derives DESCRIBE-style column info by executing the view's SELECT
 // and inferring types from the result set.
 func (e *Executor) describeView(viewSQL string) (*Result, error) {
@@ -16372,7 +16771,42 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 				return nil, err
 			}
 			tables := db.ListTables()
+			// Merge view names into the list
+			if e.views != nil {
+				tableSet := make(map[string]bool, len(tables))
+				for _, t := range tables {
+					tableSet[strings.ToLower(t)] = true
+				}
+				for vn := range e.views {
+					if !tableSet[strings.ToLower(vn)] {
+						tables = append(tables, vn)
+					}
+				}
+			}
 			sort.Strings(tables)
+			colName := fmt.Sprintf("Tables_in_%s", e.CurrentDB)
+			if basic.Full {
+				// SHOW FULL TABLES
+				rows := make([][]interface{}, 0, len(tables))
+				for _, t := range tables {
+					if e.tempTables[t] {
+						continue
+					}
+					if likePattern != "" && !matchLike(t, likePattern) {
+						continue
+					}
+					tableType := "BASE TABLE"
+					if _, _, ok := e.lookupView(t); ok {
+						tableType = "VIEW"
+					}
+					rows = append(rows, []interface{}{t, tableType})
+				}
+				return &Result{
+					Columns:     []string{colName, "Table_type"},
+					Rows:        rows,
+					IsResultSet: true,
+				}, nil
+			}
 			rows := make([][]interface{}, 0, len(tables))
 			for _, t := range tables {
 				// Skip temporary tables in SHOW TABLES
@@ -16385,7 +16819,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 				rows = append(rows, []interface{}{t})
 			}
 			return &Result{
-				Columns:     []string{fmt.Sprintf("Tables_in_%s", e.CurrentDB)},
+				Columns:     []string{colName},
 				Rows:        rows,
 				IsResultSet: true,
 			}, nil
@@ -16394,13 +16828,45 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 
 	upper := strings.ToUpper(strings.TrimSpace(query))
 
-	if strings.HasPrefix(upper, "SHOW TABLES") {
+	if strings.HasPrefix(upper, "SHOW TABLES") || strings.HasPrefix(upper, "SHOW FULL TABLES") {
 		db, err := e.Catalog.GetDatabase(e.CurrentDB)
 		if err != nil {
 			return nil, err
 		}
 		tables := db.ListTables()
+		// Merge view names
+		if e.views != nil {
+			tableSet := make(map[string]bool, len(tables))
+			for _, t := range tables {
+				tableSet[strings.ToLower(t)] = true
+			}
+			for vn := range e.views {
+				if !tableSet[strings.ToLower(vn)] {
+					tables = append(tables, vn)
+				}
+			}
+		}
 		sort.Strings(tables)
+		isFull := strings.HasPrefix(upper, "SHOW FULL TABLES")
+		colName := fmt.Sprintf("Tables_in_%s", e.CurrentDB)
+		if isFull {
+			rows := make([][]interface{}, 0, len(tables))
+			for _, t := range tables {
+				if e.tempTables[t] {
+					continue
+				}
+				tableType := "BASE TABLE"
+				if _, _, ok := e.lookupView(t); ok {
+					tableType = "VIEW"
+				}
+				rows = append(rows, []interface{}{t, tableType})
+			}
+			return &Result{
+				Columns:     []string{colName, "Table_type"},
+				Rows:        rows,
+				IsResultSet: true,
+			}, nil
+		}
 		rows := make([][]interface{}, 0, len(tables))
 		for _, t := range tables {
 			if e.tempTables[t] {
@@ -16409,7 +16875,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			rows = append(rows, []interface{}{t})
 		}
 		return &Result{
-			Columns:     []string{fmt.Sprintf("Tables_in_%s", e.CurrentDB)},
+			Columns:     []string{colName},
 			Rows:        rows,
 			IsResultSet: true,
 		}, nil
@@ -16525,6 +16991,33 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 	}
 
 	// SHOW CREATE TABLE <table>
+	// SHOW CREATE VIEW <view>
+	if strings.HasPrefix(upper, "SHOW CREATE VIEW") {
+		parts := strings.Fields(query)
+		if len(parts) >= 4 {
+			viewName := strings.Join(parts[3:], " ")
+			viewName = strings.TrimRight(viewName, ";")
+			viewName = strings.ReplaceAll(viewName, "`", "")
+			if canonName, viewSQL, ok := e.lookupView(viewName); ok {
+				createView := fmt.Sprintf("CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `%s` AS %s", canonName, viewSQL)
+				return &Result{
+					Columns:     []string{"View", "Create View", "character_set_client", "collation_connection"},
+					Rows:        [][]interface{}{{canonName, createView, "utf8mb4", "utf8mb4_0900_ai_ci"}},
+					IsResultSet: true,
+				}, nil
+			}
+			// Not a view — check if it's a table (ER_WRONG_OBJECT)
+			lookupDB := e.CurrentDB
+			if strings.Contains(viewName, ".") {
+				lookupDB, viewName = resolveTableNameDB(viewName, e.CurrentDB)
+			}
+			if _, err := e.Storage.GetTable(lookupDB, viewName); err == nil {
+				return nil, mysqlError(1347, "HY000", fmt.Sprintf("'%s.%s' is not VIEW", lookupDB, viewName))
+			}
+			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", lookupDB, viewName))
+		}
+	}
+
 	if strings.HasPrefix(upper, "SHOW CREATE TABLE") {
 		parts := strings.Fields(query)
 		if len(parts) >= 4 {
@@ -16745,7 +17238,8 @@ var sysVarReadOnly = map[string]bool{
 	"server_uuid": true, "skip_networking": true, "socket": true,
 	"system_time_zone": true, "thread_stack": true, "tmpdir": true,
 	"version": true, "version_comment": true, "version_compile_machine": true,
-	"version_compile_os": true, "innodb_buffer_pool_chunk_size": true,
+	"version_compile_os": true,
+	"innodb_adaptive_hash_index_parts": true, "innodb_buffer_pool_chunk_size": true,
 	"innodb_buffer_pool_load_at_startup": true,
 	"innodb_data_file_path":              true, "innodb_data_home_dir": true,
 	"innodb_dedicated_server": true, "innodb_force_recovery": true,
@@ -16807,8 +17301,11 @@ var sysVarReadOnly = map[string]bool{
 	"disabled_storage_engines": true, "ft_max_word_len": true,
 	"ft_min_word_len": true, "ft_query_expansion_limit": true,
 	"ft_stopword_file": true, "innodb_autoinc_lock_mode": true,
+	"innodb_api_disable_rowlock":   true, "innodb_api_enable_binlog": true,
+	"innodb_api_enable_mdl":        true,
 	"innodb_buffer_pool_instances": true, "innodb_doublewrite_dir": true,
 	"innodb_doublewrite_files": true, "innodb_doublewrite_pages": true,
+	"innodb_flush_method":          true,
 	"innodb_force_load_corrupted": true, "innodb_ft_cache_size": true,
 	"innodb_ft_max_token_size": true, "innodb_ft_min_token_size": true,
 	"innodb_ft_sort_pll_degree": true, "innodb_ft_total_cache_size": true,
@@ -16830,6 +17327,7 @@ var sysVarReadOnly = map[string]bool{
 	"mysqlx_ssl_ca": true, "mysqlx_ssl_capath": true, "mysqlx_ssl_cert": true,
 	"mysqlx_ssl_cipher": true, "mysqlx_ssl_key": true,
 	"mysqlx_ssl_crl": true, "mysqlx_ssl_crlpath": true,
+	"mysqlx_port_open_timeout": true,
 	"mysqlx_socket": true, "mysqlx_bind_address": true,
 	"auto_generate_certs":                          true,
 	"sha256_password_auto_generate_rsa_keys":       true,
@@ -16888,6 +17386,7 @@ var sysVarGlobalOnly = map[string]bool{
 	"slow_query_log":                          true,
 	"slow_query_log_file":                     true,
 	"binlog_cache_size":                        true,
+	"binlog_encryption":                        true,
 	"binlog_error_action":                      true,
 	"binlog_expire_logs_seconds":               true,
 	"binlog_group_commit_sync_delay":           true,
@@ -16904,12 +17403,14 @@ var sysVarGlobalOnly = map[string]bool{
 	"default_authentication_plugin":            true,
 	"default_password_lifetime":                true,
 	"disconnect_on_expired_password":           true,
+	"event_scheduler":                          true,
 	"expire_logs_days":                         true,
 	"flush":                                    true,
 	"flush_time":                               true,
 	"general_log":                              true,
 	"general_log_file":                         true,
 	"gtid_executed_compression_period":         true,
+	"gtid_mode":                               true,
 	"innodb_adaptive_flushing":                 true,
 	"innodb_adaptive_flushing_lwm":             true,
 	"innodb_adaptive_hash_index":               true,
@@ -16941,6 +17442,7 @@ var sysVarGlobalOnly = map[string]bool{
 	"innodb_ft_enable_diag_print":              true,
 	"innodb_ft_num_word_optimize":              true,
 	"innodb_ft_result_cache_limit":             true,
+	"innodb_ft_server_stopword_table":          true,
 	"innodb_io_capacity":                       true,
 	"innodb_io_capacity_max":                   true,
 	"innodb_lru_scan_depth":                    true,
@@ -16982,6 +17484,7 @@ var sysVarGlobalOnly = map[string]bool{
 	"log_error_verbosity":                      true,
 	"log_error_suppression_list":               true,
 	"log_error_services":                       true,
+	"log_output":                               true,
 	"log_bin_trust_function_creators":          true,
 	"log_throttle_queries_not_using_indexes":   true,
 	"max_connections":                          true,
@@ -17067,6 +17570,9 @@ var sysVarGlobalOnly = map[string]bool{
 	"gtid_executed":                            true,
 	"init_file":                                true,
 	"innodb_api_bk_commit_interval":            true,
+	"innodb_api_disable_rowlock":               true,
+	"innodb_api_enable_binlog":                 true,
+	"innodb_api_enable_mdl":                    true,
 	"innodb_api_trx_level":                     true,
 	"innodb_autoextend_increment":              true,
 	"innodb_change_buffering":                  true,
@@ -17256,6 +17762,22 @@ var sysVarEnumValues = map[string]map[string]string{
 		"ON":   "ON",
 		"WARN": "WARN",
 	},
+	"event_scheduler": {
+		"0":        "OFF",
+		"1":        "ON",
+		"OFF":      "OFF",
+		"ON":       "ON",
+	},
+	"gtid_mode": {
+		"0":               "OFF",
+		"1":               "OFF_PERMISSIVE",
+		"2":               "ON_PERMISSIVE",
+		"3":               "ON",
+		"OFF":             "OFF",
+		"OFF_PERMISSIVE":  "OFF_PERMISSIVE",
+		"ON_PERMISSIVE":   "ON_PERMISSIVE",
+		"ON":              "ON",
+	},
 	"innodb_change_buffering": {
 		"0":       "none",
 		"1":       "inserts",
@@ -17299,6 +17821,50 @@ var sysVarEnumValues = map[string]map[string]string{
 		"NOSYNC":         "nosync",
 		"O_DIRECT":       "O_DIRECT",
 		"O_DIRECT_NO_FSYNC": "O_DIRECT_NO_FSYNC",
+	},
+	"slave_parallel_type": {
+		"DATABASE":     "DATABASE",
+		"LOGICAL_CLOCK": "LOGICAL_CLOCK",
+	},
+	"slave_type_conversions": {
+		"":                        "",
+		"ALL_LOSSY":               "ALL_LOSSY",
+		"ALL_NON_LOSSY":           "ALL_NON_LOSSY",
+		"ALL_LOSSY,ALL_NON_LOSSY": "ALL_LOSSY,ALL_NON_LOSSY",
+		"ALL_NON_LOSSY,ALL_LOSSY": "ALL_LOSSY,ALL_NON_LOSSY",
+	},
+	"slave_rows_search_algorithms": {
+		"TABLE_SCAN,INDEX_SCAN":            "TABLE_SCAN,INDEX_SCAN",
+		"INDEX_SCAN,HASH_SCAN":             "INDEX_SCAN,HASH_SCAN",
+		"TABLE_SCAN,HASH_SCAN":             "TABLE_SCAN,HASH_SCAN",
+		"TABLE_SCAN,INDEX_SCAN,HASH_SCAN":  "TABLE_SCAN,INDEX_SCAN,HASH_SCAN",
+		"INDEX_SCAN,TABLE_SCAN":            "TABLE_SCAN,INDEX_SCAN",
+		"HASH_SCAN,INDEX_SCAN":             "INDEX_SCAN,HASH_SCAN",
+		"HASH_SCAN,TABLE_SCAN":             "TABLE_SCAN,HASH_SCAN",
+		"INDEX_SCAN,TABLE_SCAN,HASH_SCAN":  "TABLE_SCAN,INDEX_SCAN,HASH_SCAN",
+		"HASH_SCAN,TABLE_SCAN,INDEX_SCAN":  "TABLE_SCAN,INDEX_SCAN,HASH_SCAN",
+		"HASH_SCAN,INDEX_SCAN,TABLE_SCAN":  "TABLE_SCAN,INDEX_SCAN,HASH_SCAN",
+		"INDEX_SCAN,HASH_SCAN,TABLE_SCAN":  "TABLE_SCAN,INDEX_SCAN,HASH_SCAN",
+		"TABLE_SCAN,HASH_SCAN,INDEX_SCAN":  "TABLE_SCAN,INDEX_SCAN,HASH_SCAN",
+	},
+	"updatable_views_with_limit": {
+		"0":   "NO",
+		"1":   "YES",
+		"NO":  "NO",
+		"YES": "YES",
+	},
+	"rbr_exec_mode": {
+		"0":       "STRICT",
+		"1":       "IDEMPOTENT",
+		"STRICT":  "STRICT",
+		"IDEMPOTENT": "IDEMPOTENT",
+	},
+	"log_output": {
+		"FILE":       "FILE",
+		"TABLE":      "TABLE",
+		"NONE":       "NONE",
+		"FILE,TABLE": "FILE,TABLE",
+		"TABLE,FILE": "FILE,TABLE",
 	},
 	"log_timestamps": {
 		"0":     "UTC",
@@ -17425,14 +17991,14 @@ var sysVarBoolean = map[string]bool{
 	"avoid_temporal_upgrade": true, "show_create_table_verbosity": true,
 	"show_old_temporals": true, "windowing_use_high_precision": true,
 	"session_track_schema": true, "session_track_state_change": true,
-	"select_into_disk_sync": true, "transaction_read_only": true,
+	"select_into_disk_sync": true, "transaction_read_only": true, "transaction_allow_batching": true,
 	"read_only": true, "super_read_only": true, "offline_mode": true,
 	"relay_log_purge": true, "relay_log_recovery": true,
 	"master_verify_checksum": true, "slave_allow_batching": true,
 	"slave_compressed_protocol": true, "slave_preserve_commit_order": true,
-	"slave_sql_verify_checksum": true, "print_identified_with_as_hex": true,
+	"slave_sql_verify_checksum": true, "pseudo_slave_mode": true, "print_identified_with_as_hex": true,
 	"default_table_encryption": true, "table_encryption_privilege_check": true,
-	"local_infile": true, "myisam_use_mmap": true,
+	"local_infile": true, "myisam_use_mmap": true, "mysqlx_enable_hello_notice": true,
 	"temptable_use_mmap": true, "sql_log_off": true,
 	"innodb_doublewrite": true,
 	"automatic_sp_privileges": true,
@@ -17512,6 +18078,22 @@ var triggerSysVars = map[string]bool{
 	"innodb_buffer_pool_dump_now":   true,
 	"innodb_undo_log_encrypt":       true,
 	"innodb_redo_log_encrypt":       true,
+}
+
+// sysVarStringType contains string-type variables that reject numeric/float assignment
+// with "Incorrect argument type" (error 1232).
+var sysVarStringType = map[string]bool{
+	"innodb_ft_aux_table":                true,
+	"innodb_ft_server_stopword_table":    true,
+	"innodb_ft_user_stopword_table":      true,
+	"innodb_tmpdir":                      true,
+	"general_log_file":                   true,
+	"slow_query_log_file":                true,
+	"innodb_buffer_pool_filename":        true,
+	"innodb_redo_log_archive_dirs":       true,
+	"log_error_suppression_list":         true,
+	"init_connect":                       true,
+	"init_slave":                         true,
 }
 
 type intVarRange struct {
@@ -17615,7 +18197,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"mysqlx_write_timeout":                     {Min: 1, Max: 2147483, IsUnsigned: true},
 	"mysqlx_read_timeout":                      {Min: 1, Max: 2147483, IsUnsigned: true},
 	"mysqlx_wait_timeout":                      {Min: 1, Max: 2147483647, IsUnsigned: true},
-	"mysqlx_interactive_timeout":               {Min: 1, Max: 2147483647, IsUnsigned: true},
+	"mysqlx_interactive_timeout":               {Min: 1, Max: 2147483, IsUnsigned: true},
 	"net_buffer_length":                        {Min: 1024, Max: 1048576, IsUnsigned: true},
 	"net_read_timeout":                         {Min: 1, Max: 31536000, IsUnsigned: true},
 	"net_retry_count":                          {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
@@ -17675,6 +18257,13 @@ var sysVarIntRange = map[string]intVarRange{
 	"max_allowed_packet":                       {Min: 1024, Max: 1073741824, IsUnsigned: true, BlockSize: 1024},
 	"performance_schema_max_digest_sample_age": {Min: 0, Max: 1048576, IsUnsigned: true},
 	"server_id":                                {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"identity":                                 {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"insert_id":                               {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"last_insert_id":                          {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"pseudo_thread_id":                        {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"immediate_server_version":                 {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"original_server_version":                 {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"original_commit_timestamp":               {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
 	"innodb_api_bk_commit_interval":            {Min: 1, Max: 1073741824, IsUnsigned: true},
 	"innodb_api_trx_level":                     {Min: 0, Max: 3, IsUnsigned: true},
 	"innodb_autoextend_increment":              {Min: 1, Max: 1000, IsUnsigned: true},
@@ -17993,19 +18582,33 @@ func normalizeBooleanSetValue(name string, expr sqlparser.Expr, evalVal interfac
 	case float32, float64:
 		return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
 	case string:
-		n, ok, typeErr := normalizeBooleanToken(v)
-		if typeErr {
-			return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+		// When a string value comes from evaluation (e.g., user variable @var),
+		// treat it like a quoted string: only accept ON/OFF/0/1, not TRUE/FALSE.
+		upStr := strings.ToUpper(strings.TrimSpace(v))
+		switch upStr {
+		case "ON":
+			return "1", nil
+		case "OFF":
+			return "0", nil
+		case "0":
+			return "0", nil
+		case "1":
+			return "1", nil
 		}
-		if !ok {
-			if acceptNeg && strings.HasPrefix(v, "-") {
-				if _, err := strconv.ParseInt(v, 10, 64); err == nil {
-					return "1", nil
-				}
+		// Check for float/scientific notation
+		if strings.ContainsAny(v, ".eE") {
+			if _, err := strconv.ParseFloat(v, 64); err == nil {
+				return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
 			}
-			return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", name, strings.Trim(v, "'\"")))
 		}
-		return strconv.FormatInt(n, 10), nil
+		// Check for negative integers
+		if acceptNeg && strings.HasPrefix(v, "-") {
+			if _, err := strconv.ParseInt(v, 10, 64); err == nil {
+				return "1", nil
+			}
+		}
+		return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", name, strings.Trim(v, "'\"")))
+
 	default:
 		valStr := "NULL"
 		if evalVal != nil {
@@ -18954,6 +19557,7 @@ func (e *Executor) showStatus(upper string) (*Result, error) {
 		{Name: "Connections", Value: "1"},
 		{Name: "Handler_read_first", Value: "0"},
 		{Name: "Handler_read_key", Value: fmt.Sprintf("%d", e.handlerReadKey)},
+		{Name: "Handler_read_last", Value: "0"},
 		{Name: "Handler_read_next", Value: "0"},
 		{Name: "Handler_read_prev", Value: "0"},
 		{Name: "Handler_read_rnd", Value: "0"},
@@ -19407,6 +20011,11 @@ func mysqlDisplayType(colType string) string {
 	base := upper
 	suffix := ""
 	if idx := strings.Index(upper, "("); idx >= 0 {
+		baseWord := strings.ToUpper(strings.TrimSpace(upper[:idx]))
+		// ENUM and SET preserve the case of their values
+		if baseWord == "ENUM" || baseWord == "SET" {
+			return strings.ToLower(baseWord) + stripped[idx:]
+		}
 		// Already has width specified, just lowercase it
 		// But also normalize REAL to DOUBLE, NUMERIC to DECIMAL, INTEGER to INT
 		result := strings.ToLower(stripped)
@@ -19526,24 +20135,13 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	def, resolvedTableName, err := findTableDefCaseInsensitive(db, tableName)
 	if err != nil {
 		// Check if it's a view — return SHOW CREATE VIEW style output.
-		if e.views != nil {
-			viewLookup := tableName
-			if _, ok := e.views[viewLookup]; !ok {
-				for vn := range e.views {
-					if strings.EqualFold(vn, viewLookup) {
-						viewLookup = vn
-						break
-					}
-				}
-			}
-			if viewSQL, ok := e.views[viewLookup]; ok {
-				createView := fmt.Sprintf("CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `%s` AS %s", viewLookup, viewSQL)
-				return &Result{
-					Columns:     []string{"View", "Create View", "character_set_client", "collation_connection"},
-					Rows:        [][]interface{}{{viewLookup, createView, "utf8mb4", "utf8mb4_0900_ai_ci"}},
-					IsResultSet: true,
-				}, nil
-			}
+		if canonName, viewSQL, ok := e.lookupView(tableName); ok {
+			createView := fmt.Sprintf("CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `%s` AS %s", canonName, viewSQL)
+			return &Result{
+				Columns:     []string{"View", "Create View", "character_set_client", "collation_connection"},
+				Rows:        [][]interface{}{{canonName, createView, "utf8mb4", "utf8mb4_0900_ai_ci"}},
+				IsResultSet: true,
+			}, nil
 		}
 		return nil, fmt.Errorf("ERROR 1146 (42S02): Table '%s.%s' doesn't exist", showDB, tableName)
 	}
@@ -19575,11 +20173,29 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 				tableCharset = "utf8mb4"
 			}
 			if !strings.EqualFold(col.Charset, tableCharset) {
+				// Different charset from table default - show both CHARACTER SET and COLLATE
 				collation := col.Collation
 				if collation == "" {
 					collation = catalog.DefaultCollationForCharset(col.Charset)
 				}
 				parts = append(parts, fmt.Sprintf("CHARACTER SET %s COLLATE %s", col.Charset, collation))
+			} else if col.Collation != "" {
+				// Same charset but different collation from charset's default
+				defaultColl := catalog.DefaultCollationForCharset(col.Charset)
+				if !strings.EqualFold(col.Collation, defaultColl) {
+					parts = append(parts, fmt.Sprintf("CHARACTER SET %s COLLATE %s", col.Charset, col.Collation))
+				}
+			}
+		} else if col.Collation != "" {
+			// Column has explicit collation without charset override.
+			// Show COLLATE when it differs from the charset's default collation.
+			colCharset := def.Charset
+			if colCharset == "" {
+				colCharset = "utf8mb4"
+			}
+			defaultColl := catalog.DefaultCollationForCharset(colCharset)
+			if !strings.EqualFold(col.Collation, defaultColl) {
+				parts = append(parts, fmt.Sprintf("COLLATE %s", col.Collation))
 			}
 		}
 		colTypeLower := strings.ToLower(col.Type)
@@ -21493,19 +22109,47 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			if arg == nil {
 				return nil, nil
 			}
-			n, _ := strconv.ParseFloat(fmt.Sprintf("%v", arg), 64)
-			switch {
-			case n >= 1099511627776: // 1 TiB
-				return fmt.Sprintf("%.2f TiB", n/1099511627776), nil
-			case n >= 1073741824: // 1 GiB
-				return fmt.Sprintf("%.2f GiB", n/1073741824), nil
-			case n >= 1048576: // 1 MiB
-				return fmt.Sprintf("%.2f MiB", n/1048576), nil
-			case n >= 1024: // 1 KiB
-				return fmt.Sprintf("%.2f KiB", n/1024), nil
-			default:
-				return fmt.Sprintf("%.0f bytes", n), nil
+			// Reject pure string inputs that are not numeric
+			argStr := fmt.Sprintf("%v", arg)
+			if _, ok := arg.(string); ok {
+				if _, parseErr := strconv.ParseFloat(argStr, 64); parseErr != nil {
+					return nil, mysqlError(1264, "22003", "Input value is out of range in 'format_bytes'")
+				}
 			}
+			n, _ := strconv.ParseFloat(argStr, 64)
+			neg := n < 0
+			if neg {
+				n = -n
+			}
+			prefix := ""
+			if neg {
+				prefix = "-"
+			}
+			var result string
+			switch {
+			case n >= 1152921504606846976: // 1 EiB
+				val := n / 1152921504606846976
+				if val >= 100000 || val <= -100000 {
+					result = fmt.Sprintf("%s%.2e EiB", prefix, val)
+				} else {
+					result = fmt.Sprintf("%s%.2f EiB", prefix, val)
+				}
+			case n >= 1125899906842624: // 1 PiB
+				result = fmt.Sprintf("%s%.2f PiB", prefix, n/1125899906842624)
+			case n >= 1099511627776: // 1 TiB
+				result = fmt.Sprintf("%s%.2f TiB", prefix, n/1099511627776)
+			case n >= 1073741824: // 1 GiB
+				result = fmt.Sprintf("%s%.2f GiB", prefix, n/1073741824)
+			case n >= 1048576: // 1 MiB
+				result = fmt.Sprintf("%s%.2f MiB", prefix, n/1048576)
+			case n >= 1024: // 1 KiB
+				result = fmt.Sprintf("%s%.2f KiB", prefix, n/1024)
+			default:
+				// Right-pad with spaces to 4 chars for bytes value
+				byteStr := fmt.Sprintf("%s%.0f", prefix, n)
+				result = fmt.Sprintf("%4s bytes", byteStr)
+			}
+			return result, nil
 		case sqlparser.FormatPicoTimeType:
 			// format_pico_time(time_val) formats a picosecond value into a human-readable string.
 			if v.Argument == nil {
@@ -21518,25 +22162,47 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			if arg == nil {
 				return nil, nil
 			}
-			ps, _ := strconv.ParseFloat(fmt.Sprintf("%v", arg), 64)
+			argStr := fmt.Sprintf("%v", arg)
+			if _, ok := arg.(string); ok {
+				if _, parseErr := strconv.ParseFloat(argStr, 64); parseErr != nil {
+					return nil, mysqlError(1264, "22003", "Input value is out of range in 'format_pico_time'")
+				}
+			}
+			ps, _ := strconv.ParseFloat(argStr, 64)
+			neg := ps < 0
+			if neg {
+				ps = -ps
+			}
+			prefix := ""
+			if neg {
+				prefix = "-"
+			}
+			var result string
 			switch {
 			case ps >= 86400e12: // days
-				return fmt.Sprintf("%.2f d", ps/86400e12), nil
+				val := ps / 86400e12
+				if val >= 100000 || val <= -100000 {
+					result = fmt.Sprintf("%s%.2e d", prefix, val)
+				} else {
+					result = fmt.Sprintf("%s%.2f d", prefix, val)
+				}
 			case ps >= 3600e12: // hours
-				return fmt.Sprintf("%.2f h", ps/3600e12), nil
+				result = fmt.Sprintf("%s%.2f h", prefix, ps/3600e12)
 			case ps >= 60e12: // minutes
-				return fmt.Sprintf("%.2f min", ps/60e12), nil
+				result = fmt.Sprintf("%s%.2f min", prefix, ps/60e12)
 			case ps >= 1e12: // seconds
-				return fmt.Sprintf("%.2f s", ps/1e12), nil
+				result = fmt.Sprintf("%s%.2f s", prefix, ps/1e12)
 			case ps >= 1e9: // milliseconds
-				return fmt.Sprintf("%.2f ms", ps/1e9), nil
+				result = fmt.Sprintf("%s%.2f ms", prefix, ps/1e9)
 			case ps >= 1e6: // microseconds
-				return fmt.Sprintf("%.2f us", ps/1e6), nil
+				result = fmt.Sprintf("%s%.2f us", prefix, ps/1e6)
 			case ps >= 1e3: // nanoseconds
-				return fmt.Sprintf("%.2f ns", ps/1e3), nil
+				result = fmt.Sprintf("%s%.2f ns", prefix, ps/1e3)
 			default:
-				return fmt.Sprintf("%.0f ps", ps), nil
+				psStr := fmt.Sprintf("%s%.0f", prefix, ps)
+				result = fmt.Sprintf("%3s ps", psStr)
 			}
+			return result, nil
 		}
 		return nil, fmt.Errorf("unsupported performance schema function type: %d", v.Type)
 	}
@@ -28823,18 +29489,54 @@ func (e *Executor) fireTriggers(tableName, timing, event string, newRow, oldRow 
 
 	triggers := db.GetTriggersForTable(tableName, timing, event)
 	for _, tr := range triggers {
+		// Check if body contains control flow (IF, WHILE, BEGIN, etc.)
+		hasControlFlow := false
 		for _, stmtStr := range tr.Body {
 			stmtUpper := strings.ToUpper(strings.TrimSpace(stmtStr))
-			// Handle SET NEW.col = value in BEFORE triggers
-			if strings.HasPrefix(stmtUpper, "SET NEW.") && timing == "BEFORE" && newRow != nil {
-				e.handleSetNew(stmtStr, newRow, oldRow)
-				continue
+			if strings.HasPrefix(stmtUpper, "IF ") || strings.HasPrefix(stmtUpper, "WHILE ") ||
+				strings.HasPrefix(stmtUpper, "LOOP") || strings.HasPrefix(stmtUpper, "REPEAT") ||
+				strings.HasPrefix(stmtUpper, "BEGIN") || strings.HasPrefix(stmtUpper, "DECLARE") ||
+				(strings.Contains(stmtUpper, ":") && strings.Contains(stmtUpper, "BEGIN")) {
+				hasControlFlow = true
+				break
 			}
-			// Substitute NEW.col and OLD.col references
-			resolved := e.resolveNewOldRefs(stmtStr, newRow, oldRow)
-			_, err := e.Execute(resolved)
+		}
+
+		if hasControlFlow {
+			// Use routine executor for complex trigger bodies with control flow.
+			// Don't pre-resolve NEW/OLD references; instead set trigger context
+			// so the routine executor can resolve them on the fly and handle
+			// SET NEW.col = val correctly.
+			ctx := &routineContext{
+				localVars:  make(map[string]interface{}),
+				cursors:    make(map[string]*cursorState),
+				cursorDefs: make(map[string]string),
+			}
+			e.triggerNewRow = newRow
+			e.triggerOldRow = oldRow
+			e.triggerTiming = timing
+			_, err := e.execRoutineBodyWithContext(tr.Body, ctx)
+			e.triggerNewRow = nil
+			e.triggerOldRow = nil
+			e.triggerTiming = ""
 			if err != nil {
 				return err
+			}
+		} else {
+			// Simple trigger body: execute statements directly
+			for _, stmtStr := range tr.Body {
+				stmtUpper := strings.ToUpper(strings.TrimSpace(stmtStr))
+				// Handle SET NEW.col = value in BEFORE triggers
+				if strings.HasPrefix(stmtUpper, "SET NEW.") && timing == "BEFORE" && newRow != nil {
+					e.handleSetNew(stmtStr, newRow, oldRow)
+					continue
+				}
+				// Substitute NEW.col and OLD.col references
+				resolved := e.resolveNewOldRefs(stmtStr, newRow, oldRow)
+				_, err := e.Execute(resolved)
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -28843,14 +29545,18 @@ func (e *Executor) fireTriggers(tableName, timing, event string, newRow, oldRow 
 
 // handleSetNew processes "SET NEW.col = expr" statements in BEFORE triggers.
 func (e *Executor) handleSetNew(stmtStr string, newRow, oldRow storage.Row) {
-	// Parse: SET NEW.col = expr
+	// Parse: SET NEW.col = expr (also handles := syntax)
 	rest := strings.TrimSpace(stmtStr[len("SET "):])
-	eqIdx := strings.Index(rest, "=")
-	if eqIdx < 0 {
+	var colRef, valExpr string
+	if colonEqIdx := strings.Index(rest, ":="); colonEqIdx >= 0 {
+		colRef = strings.TrimSpace(rest[:colonEqIdx])
+		valExpr = strings.TrimSpace(rest[colonEqIdx+2:])
+	} else if eqIdx := strings.Index(rest, "="); eqIdx >= 0 {
+		colRef = strings.TrimSpace(rest[:eqIdx])
+		valExpr = strings.TrimSpace(rest[eqIdx+1:])
+	} else {
 		return
 	}
-	colRef := strings.TrimSpace(rest[:eqIdx])
-	valExpr := strings.TrimSpace(rest[eqIdx+1:])
 	valExpr = strings.TrimRight(valExpr, ";")
 
 	// Extract column name from NEW.col
@@ -29266,8 +29972,7 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 
 	proc := db.GetProcedure(procName)
 	if proc == nil {
-		// Silently accept calls to non-existent procedures for compatibility
-		return &Result{}, nil
+		return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", e.CurrentDB, procName))
 	}
 
 	// Build parameter mapping: bind IN params, track OUT params
@@ -31038,11 +31743,26 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 
 		// Handle SET statements with local variable substitution
 		if strings.HasPrefix(stmtUpper, "SET ") {
+			// Handle SET NEW.col = val in trigger context
+			if e.triggerNewRow != nil && e.triggerTiming == "BEFORE" &&
+				strings.HasPrefix(stmtUpper, "SET NEW.") {
+				e.handleSetNew(stmtStr, e.triggerNewRow, e.triggerOldRow)
+				continue
+			}
 			setPart := strings.TrimSpace(stmtStr[4:])
-			eqIdx := strings.Index(setPart, "=")
+			// Handle both = and := assignment operators
+			var varName, valStr string
+			eqIdx := -1
+			if colonEqIdx := strings.Index(setPart, ":="); colonEqIdx >= 0 {
+				varName = strings.TrimSpace(setPart[:colonEqIdx])
+				valStr = strings.TrimSpace(setPart[colonEqIdx+2:])
+				eqIdx = colonEqIdx
+			} else if regularEqIdx := strings.Index(setPart, "="); regularEqIdx >= 0 {
+				varName = strings.TrimSpace(setPart[:regularEqIdx])
+				valStr = strings.TrimSpace(setPart[regularEqIdx+1:])
+				eqIdx = regularEqIdx
+			}
 			if eqIdx >= 0 {
-				varName := strings.TrimSpace(setPart[:eqIdx])
-				valStr := strings.TrimSpace(setPart[eqIdx+1:])
 				// Evaluate expression
 				val, err := e.evaluateExprWithVars(valStr, localVars)
 				if err != nil {
@@ -31262,6 +31982,57 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 			}
 		}
 
+		// Handle unlabeled BEGIN...END blocks
+		if strings.HasPrefix(stmtUpper, "BEGIN") && (len(stmtUpper) == 5 || !isAlphaNum(stmtStr[5])) {
+			// Collect the full BEGIN block if needed
+			beginBlock := stmtStr
+			beginDepth := 1
+			for beginDepth > 0 && i+1 < len(body) {
+				i++
+				line := body[i]
+				lineUpper := strings.ToUpper(strings.TrimSpace(line))
+				if strings.HasPrefix(lineUpper, "BEGIN") && (len(lineUpper) == 5 || !isAlphaNum(lineUpper[5])) {
+					beginDepth++
+				}
+				if lineUpper == "END" || strings.HasPrefix(lineUpper, "END ") || strings.HasPrefix(lineUpper, "END;") {
+					// Check if this END is not END IF, END WHILE, etc.
+					endRest := strings.TrimSpace(lineUpper[3:])
+					endRest = strings.TrimLeft(endRest, ";")
+					endRest = strings.TrimSpace(endRest)
+					if endRest == "" {
+						beginDepth--
+					}
+				}
+				beginBlock += ";\n" + line
+			}
+			// Strip BEGIN ... END wrapper
+			inner := strings.TrimSpace(beginBlock)
+			if strings.HasPrefix(strings.ToUpper(inner), "BEGIN") {
+				inner = strings.TrimSpace(inner[len("BEGIN"):])
+			}
+			innerUpper := strings.ToUpper(strings.TrimSpace(inner))
+			if strings.HasSuffix(innerUpper, "END") {
+				// Make sure it's a standalone END, not END IF/WHILE/etc.
+				prefix := strings.TrimSpace(inner[:len(inner)-3])
+				prefixUpper := strings.ToUpper(prefix)
+				_ = prefixUpper
+				inner = prefix
+			}
+			inner = strings.TrimRight(inner, ";")
+			inner = strings.TrimSpace(inner)
+			if inner != "" {
+				stmts := splitTriggerBody(inner)
+				retVal, err := e.execRoutineBodyWithContext(stmts, ctx)
+				if err != nil {
+					return nil, err
+				}
+				if retVal != nil {
+					return retVal, nil
+				}
+			}
+			continue
+		}
+
 		// Handle SELECT ... INTO
 		if strings.HasPrefix(stmtUpper, "SELECT") && strings.Contains(stmtUpper, " INTO ") {
 			err := e.execSelectIntoForRoutine(stmtStr, localVars)
@@ -31271,8 +32042,14 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 			continue
 		}
 
-		// General SQL statement - substitute local variables and execute
-		resolvedSQL := e.substituteLocalVars(stmtStr, localVars)
+		// General SQL statement - substitute local variables and execute.
+		// For DML statements, use smart substitution that avoids replacing
+		// variable names in column-name positions (INSERT column lists, etc.)
+		resolvedSQL := e.substituteLocalVarsSmart(stmtStr, localVars)
+		// Resolve NEW/OLD references if we're inside a trigger
+		if e.triggerNewRow != nil || e.triggerOldRow != nil {
+			resolvedSQL = e.resolveNewOldRefs(resolvedSQL, e.triggerNewRow, e.triggerOldRow)
+		}
 		_, err := e.Execute(resolvedSQL)
 		if err != nil {
 			return nil, err
@@ -31307,6 +32084,227 @@ func (e *Executor) substituteLocalVars(sql string, vars map[string]interface{}) 
 		result = replaceWordBoundary(result, pair.key, valStr)
 	}
 	return result
+}
+
+// substituteLocalVarsSmart replaces local variable references in a SQL string,
+// but avoids replacing them in column-name positions. In MySQL stored procedures,
+// column names take precedence over variable names in SQL contexts.
+// This function detects INSERT column lists, table-qualified references (t.col),
+// and other column-name positions to avoid incorrect substitution.
+func (e *Executor) substituteLocalVarsSmart(sql string, vars map[string]interface{}) string {
+	if len(vars) == 0 {
+		return sql
+	}
+
+	upper := strings.ToUpper(strings.TrimSpace(sql))
+
+	// For non-DML statements, use normal substitution
+	isDML := strings.HasPrefix(upper, "INSERT") || strings.HasPrefix(upper, "UPDATE") ||
+		strings.HasPrefix(upper, "DELETE") || strings.HasPrefix(upper, "REPLACE") ||
+		strings.HasPrefix(upper, "SELECT")
+	if !isDML {
+		return e.substituteLocalVars(sql, vars)
+	}
+
+	// Detect column names from the SQL to avoid substituting them.
+	// Strategy: find which variable names match table column names by
+	// looking up referenced tables. If a variable name matches a column
+	// in a referenced table, don't substitute it in SQL statement context.
+	// Instead, only substitute in WHERE clause RHS, VALUES(), etc.
+
+	// For INSERT: extract column names from the column list
+	colNames := make(map[string]bool)
+	if strings.HasPrefix(upper, "INSERT") || strings.HasPrefix(upper, "REPLACE") {
+		// Find column list: INSERT INTO table (col1, col2, ...)
+		parenStart := strings.Index(sql, "(")
+		if parenStart >= 0 {
+			// Check if this paren is before VALUES
+			valIdx := strings.Index(upper, "VALUES")
+			setIdx := strings.Index(upper, " SET ")
+			if valIdx > 0 && parenStart < valIdx {
+				// Extract column names from the column list
+				parenEnd := strings.Index(sql[parenStart:], ")")
+				if parenEnd >= 0 {
+					colList := sql[parenStart+1 : parenStart+parenEnd]
+					for _, col := range strings.Split(colList, ",") {
+						col = strings.TrimSpace(col)
+						col = strings.Trim(col, "`")
+						if col != "" {
+							colNames[strings.ToLower(col)] = true
+						}
+					}
+				}
+			}
+			_ = setIdx
+		}
+	}
+
+	// For UPDATE/REPLACE SET: column names appear before '='
+	if strings.HasPrefix(upper, "UPDATE") || (strings.HasPrefix(upper, "REPLACE") && strings.Contains(upper, " SET ")) {
+		setIdx := strings.Index(upper, " SET ")
+		if setIdx >= 0 {
+			afterSet := sql[setIdx+5:]
+			// Find WHERE clause to limit scope
+			whereIdx := strings.Index(strings.ToUpper(afterSet), " WHERE ")
+			setClause := afterSet
+			if whereIdx >= 0 {
+				setClause = afterSet[:whereIdx]
+			}
+			// Extract column names (before each '=')
+			for _, assign := range strings.Split(setClause, ",") {
+				eqIdx := strings.Index(assign, "=")
+				if eqIdx >= 0 {
+					col := strings.TrimSpace(assign[:eqIdx])
+					col = strings.Trim(col, "`")
+					// Handle table.column
+					if dotIdx := strings.LastIndex(col, "."); dotIdx >= 0 {
+						col = col[dotIdx+1:]
+					}
+					if col != "" {
+						colNames[strings.ToLower(col)] = true
+					}
+				}
+			}
+		}
+	}
+
+	// Now substitute, but skip variables whose names match detected column names
+	// when they appear in column-name positions
+	result := sql
+	type kv struct {
+		key string
+		val interface{}
+	}
+	var sorted []kv
+	for k, v := range vars {
+		sorted = append(sorted, kv{k, v})
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return len(sorted[i].key) > len(sorted[j].key)
+	})
+
+	for _, pair := range sorted {
+		valStr := "NULL"
+		if pair.val != nil {
+			switch v := pair.val.(type) {
+			case string:
+				valStr = "'" + strings.ReplaceAll(v, "'", "''") + "'"
+			default:
+				valStr = fmt.Sprintf("%v", pair.val)
+			}
+		}
+
+		if colNames[strings.ToLower(pair.key)] {
+			// This variable name conflicts with a column name.
+			// Use a context-aware replacement that only substitutes
+			// in value positions (after =, in VALUES(), in WHERE RHS)
+			result = replaceWordBoundarySkipColumnPositions(result, pair.key, valStr)
+		} else {
+			result = replaceWordBoundary(result, pair.key, valStr)
+		}
+	}
+	return result
+}
+
+// replaceWordBoundarySkipColumnPositions replaces a word at word boundaries,
+// but skips positions where the word appears as a column name:
+// - After '(' before VALUES (INSERT column list)
+// - Before '=' in SET clauses (UPDATE/REPLACE)
+// - After '.' (table-qualified column)
+func replaceWordBoundarySkipColumnPositions(s, word, replacement string) string {
+	var result strings.Builder
+	i := 0
+	wordLen := len(word)
+	for i < len(s) {
+		// Skip quoted strings
+		if s[i] == '\'' || s[i] == '"' || s[i] == '`' {
+			q := s[i]
+			result.WriteByte(q)
+			i++
+			for i < len(s) && s[i] != q {
+				result.WriteByte(s[i])
+				i++
+			}
+			if i < len(s) {
+				result.WriteByte(s[i])
+				i++
+			}
+			continue
+		}
+		if i+wordLen <= len(s) && strings.EqualFold(s[i:i+wordLen], word) {
+			// Check word boundary before
+			if i > 0 {
+				ch := s[i-1]
+				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (ch >= '0' && ch <= '9') || ch == '@' {
+					result.WriteByte(s[i])
+					i++
+					continue
+				}
+			}
+			// Check word boundary after
+			end := i + wordLen
+			if end < len(s) {
+				ch := s[end]
+				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (ch >= '0' && ch <= '9') {
+					result.WriteByte(s[i])
+					i++
+					continue
+				}
+			}
+
+			// Check if this is a column-name position:
+			// 1. After '.' (table-qualified: t1.data)
+			if i > 0 && s[i-1] == '.' {
+				result.WriteString(s[i : i+wordLen])
+				i += wordLen
+				continue
+			}
+			// 2. Inside a column list (between '(' and ')' before VALUES keyword)
+			// Look backwards for opening '(' or ','
+			{
+				j := i - 1
+				for j >= 0 && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n') {
+					j--
+				}
+				if j >= 0 && (s[j] == '(' || s[j] == ',') {
+					// Check if a ')' and then VALUES follows later
+					rest := s[end:]
+					trimRest := strings.TrimSpace(rest)
+					if len(trimRest) > 0 && (trimRest[0] == ',' || trimRest[0] == ')') {
+						// Looks like inside a list - check if VALUES follows after ')'
+						closeIdx := strings.Index(rest, ")")
+						if closeIdx >= 0 {
+							afterClose := strings.TrimSpace(strings.ToUpper(rest[closeIdx+1:]))
+							if strings.HasPrefix(afterClose, "VALUES") || strings.HasPrefix(afterClose, "VALUE") {
+								// Column list position - don't substitute
+								result.WriteString(s[i : i+wordLen])
+								i += wordLen
+								continue
+							}
+						}
+					}
+				}
+			}
+			// 3. Before '=' (SET data = ..., could be column assignment)
+			if end < len(s) {
+				afterWord := strings.TrimSpace(s[end:])
+				if len(afterWord) > 0 && afterWord[0] == '=' && (len(afterWord) < 2 || afterWord[1] != '=') {
+					// Looks like an assignment (not ==), this is a column position in SET clause
+					result.WriteString(s[i : i+wordLen])
+					i += wordLen
+					continue
+				}
+			}
+
+			// Not in a column-name position, do the replacement
+			result.WriteString(replacement)
+			i += wordLen
+		} else {
+			result.WriteByte(s[i])
+			i++
+		}
+	}
+	return result.String()
 }
 
 // replaceWordBoundary replaces occurrences of word in s only when they appear at word boundaries.
@@ -31510,6 +32508,10 @@ func (e *Executor) execIfBlock(block string, localVars map[string]interface{}, c
 
 	// Evaluate condition
 	condResolved := e.substituteLocalVars(condStr, localVars)
+	// Resolve NEW/OLD references if we're inside a trigger
+	if e.triggerNewRow != nil || e.triggerOldRow != nil {
+		condResolved = e.resolveNewOldRefs(condResolved, e.triggerNewRow, e.triggerOldRow)
+	}
 	condVal, err := e.evaluateExprWithVars(condResolved, map[string]interface{}{})
 	if err != nil {
 		return false, nil, err

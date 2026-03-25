@@ -609,8 +609,34 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.perfSchemaVariablesInfo()
 	case "variables_by_thread":
 		rawRows = []storage.Row{}
-	case "mutex_instances", "rwlock_instances", "cond_instances",
-		"file_instances", "file_summary_by_instance",
+	case "mutex_instances":
+		if e.startupVars["performance_schema_max_mutex_instances"] == "0" ||
+			e.startupVars["performance_schema_max_mutex_classes"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"NAME": "wait/synch/mutex/mysys/THR_LOCK_heap", "OBJECT_INSTANCE_BEGIN": int64(1), "LOCKED_BY_THREAD_ID": nil},
+			}
+		}
+	case "rwlock_instances":
+		if e.startupVars["performance_schema_max_rwlock_instances"] == "0" ||
+			e.startupVars["performance_schema_max_rwlock_classes"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"NAME": "wait/synch/rwlock/mysys/THR_LOCK_log", "OBJECT_INSTANCE_BEGIN": int64(1), "WRITE_LOCKED_BY_THREAD_ID": nil, "READ_LOCKED_BY_COUNT": int64(0)},
+			}
+		}
+	case "cond_instances":
+		if e.startupVars["performance_schema_max_cond_instances"] == "0" ||
+			e.startupVars["performance_schema_max_cond_classes"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"NAME": "wait/synch/cond/mysys/THR_COND_threads", "OBJECT_INSTANCE_BEGIN": int64(1)},
+			}
+		}
+	case "file_instances", "file_summary_by_instance",
 		"socket_instances", "socket_summary_by_event_name", "socket_summary_by_instance",
 		"table_handles",
 		"table_io_waits_summary_by_table", "table_io_waits_summary_by_index_usage",
@@ -1059,6 +1085,39 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 				"CHECKSUM":        nil,
 				"CREATE_OPTIONS":  createOptions,
 				"TABLE_COMMENT":   tblComment,
+			})
+		}
+	}
+	// Add views as TABLE_TYPE = 'VIEW'
+	if e.views != nil {
+		viewNames := make([]string, 0, len(e.views))
+		for vn := range e.views {
+			viewNames = append(viewNames, vn)
+		}
+		sort.Strings(viewNames)
+		for _, vName := range viewNames {
+			rows = append(rows, storage.Row{
+				"TABLE_CATALOG":   "def",
+				"TABLE_SCHEMA":    e.CurrentDB,
+				"TABLE_NAME":      vName,
+				"TABLE_TYPE":      "VIEW",
+				"ENGINE":          nil,
+				"VERSION":         nil,
+				"ROW_FORMAT":      nil,
+				"TABLE_ROWS":      nil,
+				"AVG_ROW_LENGTH":  nil,
+				"DATA_LENGTH":     nil,
+				"MAX_DATA_LENGTH": nil,
+				"INDEX_LENGTH":    nil,
+				"DATA_FREE":       nil,
+				"AUTO_INCREMENT":  nil,
+				"CREATE_TIME":     nil,
+				"UPDATE_TIME":     nil,
+				"CHECK_TIME":      nil,
+				"TABLE_COLLATION": nil,
+				"CHECKSUM":        nil,
+				"CREATE_OPTIONS":  nil,
+				"TABLE_COMMENT":   "VIEW",
 			})
 		}
 	}

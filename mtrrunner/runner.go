@@ -769,8 +769,18 @@ func (ctx *execContext) executeLines(lines []string) error {
 			l := lines[i]
 			t := strings.TrimSpace(l)
 
-			// Skip comments within statement (only if not inside a string literal)
+			// Skip comments within statement (only if not inside a string literal
+			// and not already collecting a multi-line statement with custom delimiter).
+			// When using a custom delimiter (e.g., |), # comments inside a multi-line
+			// statement must be preserved in the echo output because they're part of the
+			// statement body (e.g., comments inside CREATE PROCEDURE).
 			if !inStringLiteral && strings.HasPrefix(t, "#") {
+				if len(rawLines) == 0 {
+					i++
+					continue
+				}
+				// Inside multi-line statement: preserve comment in echo but not in SQL
+				rawLines = append(rawLines, t)
 				i++
 				continue
 			}
