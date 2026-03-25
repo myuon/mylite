@@ -1837,6 +1837,22 @@ func formatResultCell(v interface{}) string {
 		if !strings.ContainsAny(s, "eE") {
 			return s
 		}
+		// Skip hex strings (e.g., HEX() output like "000006E0") which contain
+		// only hex digits [0-9A-Fa-f] and could be misinterpreted as scientific notation.
+		isHexLike := true
+		for _, c := range s {
+			if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) {
+				isHexLike = false
+				break
+			}
+		}
+		if isHexLike && len(s) > 0 {
+			// Only treat as scientific notation if it contains a decimal point or
+			// explicit sign (e.g., "1.5e10", "-3e2"), not pure hex like "0006E0"
+			if !strings.ContainsAny(s, ".+-") {
+				return s
+			}
+		}
 		f, err := strconv.ParseFloat(s, 64)
 		if err != nil {
 			return s
