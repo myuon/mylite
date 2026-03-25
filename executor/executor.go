@@ -28,8 +28,39 @@ import (
 	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/transform"
 	"golang.org/x/text/unicode/norm"
+	"vitess.io/vitess/go/mysql/collations"
+	"vitess.io/vitess/go/mysql/collations/charset"
+	"vitess.io/vitess/go/mysql/collations/colldata"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
+
+// vitessCollEnv is a shared Vitess collation environment for MySQL 8.0.
+var vitessCollEnv = collations.NewEnvironment("8.0.40")
+
+// lookupVitessCollation returns a Vitess Collation for the given name, or nil if not found.
+func lookupVitessCollation(name string) colldata.Collation {
+	id := vitessCollEnv.LookupByName(strings.ToLower(name))
+	if id == collations.Unknown {
+		return nil
+	}
+	return colldata.Lookup(id)
+}
+
+// vitessWeightString returns the MySQL-compatible weight string for a Go string
+// under the given Vitess collation. It handles charset conversion from UTF-8
+// to the collation's charset before computing the weight string.
+func vitessWeightString(s string, coll colldata.Collation) []byte {
+	src := []byte(s)
+	cs := coll.Charset()
+	// Convert from UTF-8 to the collation's charset if needed
+	if cs.Name() != "utf8mb4" && cs.Name() != "utf8mb3" && cs.Name() != "binary" {
+		converted, err := charset.ConvertFromUTF8(nil, cs, src)
+		if err == nil {
+			src = converted
+		}
+	}
+	return coll.WeightString(nil, src, 0)
+}
 
 // mysqlCharLen returns the MySQL character count of a string.
 // For valid UTF-8, it returns the rune count.
@@ -12134,11 +12165,18 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	preSortedOrderBy := false
 	// If ORDER BY references base columns that are not projected, pre-sort source rows.
 	if stmt.OrderBy != nil && needsPreProjectionOrderBy(stmt.OrderBy, colNames) {
-		orderCollation := resolveOrderByCollation(selectTableDefs)
+		defaultCollation := resolveOrderByCollation(selectTableDefs)
 		sort.SliceStable(allRows, func(a, b int) bool {
 			for _, order := range stmt.OrderBy {
-				va := resolveOrderByExprValue(e, order.Expr, allRows[a])
-				vb := resolveOrderByExprValue(e, order.Expr, allRows[b])
+				expr := order.Expr
+				orderCollation := defaultCollation
+				// Extract collation from COLLATE expression
+				if collateExpr, ok := expr.(*sqlparser.CollateExpr); ok {
+					orderCollation = collateExpr.Collation
+					expr = collateExpr.Expr
+				}
+				va := resolveOrderByExprValue(e, expr, allRows[a])
+				vb := resolveOrderByExprValue(e, expr, allRows[b])
 				cmp := compareByCollation(va, vb, orderCollation)
 				if cmp == 0 {
 					continue
@@ -20421,17 +20459,67 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return int64(0), nil
 		}
 		// Allow comparison expressions to be used as boolean values (e.g. in IF args)
-		left, err := e.evalExpr(v.Left)
+		// Extract COLLATE clause from either side for collation-aware comparison
+		var collationName string
+		leftExpr, rightExpr := v.Left, v.Right
+		if ce, ok := leftExpr.(*sqlparser.CollateExpr); ok {
+			collationName = ce.Collation
+			leftExpr = ce.Expr
+		}
+		if ce, ok := rightExpr.(*sqlparser.CollateExpr); ok {
+			collationName = ce.Collation
+			rightExpr = ce.Expr
+		}
+		left, err := e.evalExpr(leftExpr)
 		if err != nil {
 			return nil, err
 		}
-		right, err := e.evalExpr(v.Right)
+		right, err := e.evalExpr(rightExpr)
 		if err != nil {
 			return nil, err
 		}
 		// NULL comparison returns NULL (except for NULL-safe equal <=>)
 		if (left == nil || right == nil) && v.Operator != sqlparser.NullSafeEqualOp {
 			return nil, nil
+		}
+		// If COLLATE was specified and both sides are strings, use collation-aware comparison
+		if collationName != "" {
+			if vc := lookupVitessCollation(collationName); vc != nil {
+				ls := toString(left)
+				rs := toString(right)
+				lBytes := []byte(ls)
+				rBytes := []byte(rs)
+				cs := vc.Charset()
+				if cs.Name() != "utf8mb4" && cs.Name() != "utf8mb3" && cs.Name() != "binary" {
+					if conv, convErr := charset.ConvertFromUTF8(nil, cs, lBytes); convErr == nil {
+						lBytes = conv
+					}
+					if conv, convErr := charset.ConvertFromUTF8(nil, cs, rBytes); convErr == nil {
+						rBytes = conv
+					}
+				}
+				cmp := vc.Collate(lBytes, rBytes, false)
+				switch v.Operator {
+				case sqlparser.EqualOp:
+					if cmp == 0 { return int64(1), nil }
+					return int64(0), nil
+				case sqlparser.NotEqualOp:
+					if cmp != 0 { return int64(1), nil }
+					return int64(0), nil
+				case sqlparser.LessThanOp:
+					if cmp < 0 { return int64(1), nil }
+					return int64(0), nil
+				case sqlparser.GreaterThanOp:
+					if cmp > 0 { return int64(1), nil }
+					return int64(0), nil
+				case sqlparser.LessEqualOp:
+					if cmp <= 0 { return int64(1), nil }
+					return int64(0), nil
+				case sqlparser.GreaterEqualOp:
+					if cmp >= 0 { return int64(1), nil }
+					return int64(0), nil
+				}
+			}
 		}
 		result, err := compareValues(left, right, v.Operator)
 		if err != nil {
@@ -20536,7 +20624,50 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			if err != nil {
 				return e.evalExpr(v.Expr)
 			}
-			return string(bs), nil
+			cs := strings.ToLower(strings.TrimPrefix(v.CharacterSet, "_"))
+			// Decode charset-encoded bytes to Go string (UTF-8)
+			switch cs {
+			case "utf32":
+				// UTF-32 big-endian: each 4 bytes is a codepoint
+				// MySQL left-pads short hex values to a multiple of 4 bytes
+				for len(bs)%4 != 0 {
+					bs = append([]byte{0}, bs...)
+				}
+				var runes []rune
+				for i := 0; i+3 < len(bs); i += 4 {
+					cp := rune(bs[i])<<24 | rune(bs[i+1])<<16 | rune(bs[i+2])<<8 | rune(bs[i+3])
+					runes = append(runes, cp)
+				}
+				return string(runes), nil
+			case "utf16":
+				// UTF-16 big-endian; pad to even length
+				if len(bs)%2 != 0 {
+					bs = append([]byte{0}, bs...)
+				}
+				var runes []rune
+				for i := 0; i+1 < len(bs); i += 2 {
+					u := uint16(bs[i])<<8 | uint16(bs[i+1])
+					if u >= 0xD800 && u <= 0xDBFF && i+3 < len(bs) {
+						// Surrogate pair
+						lo := uint16(bs[i+2])<<8 | uint16(bs[i+3])
+						if lo >= 0xDC00 && lo <= 0xDFFF {
+							cp := rune((uint32(u)-0xD800)*0x400+(uint32(lo)-0xDC00)) + 0x10000
+							runes = append(runes, cp)
+							i += 2
+							continue
+						}
+					}
+					runes = append(runes, rune(u))
+				}
+				return string(runes), nil
+			case "ucs2":
+				// Keep UCS-2 as raw bytes for compatibility with JP charset tests
+				return string(bs), nil
+			default:
+				// For other charsets (latin1, sjis, etc.), return raw bytes as-is.
+				// The existing JP charset conversion tests rely on this behavior.
+				return string(bs), nil
+			}
 		}
 		return e.evalExpr(v.Expr)
 	case *sqlparser.CastExpr:
@@ -21094,8 +21225,15 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		// A row constructor (tuple) used in a scalar context is an error in MySQL
 		return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain 1 column(s)"))
 	case *sqlparser.WeightStringFuncExpr:
-		// WEIGHT_STRING(str [AS CHAR(n)|BINARY(n)])
-		val, err := e.evalExpr(v.Expr)
+		// WEIGHT_STRING(str [AS CHAR(n)|BINARY(n)] [COLLATE collation])
+		// Check if inner expression is a CollateExpr to extract collation
+		innerExpr := v.Expr
+		var collationName string
+		if ce, ok := innerExpr.(*sqlparser.CollateExpr); ok {
+			collationName = ce.Collation
+			innerExpr = ce.Expr
+		}
+		val, err := e.evalExpr(innerExpr)
 		if err != nil {
 			return nil, err
 		}
@@ -21103,7 +21241,9 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return nil, nil
 		}
 		s := toString(val)
-		// If AS BINARY(n) is specified, pad/truncate to n bytes
+
+		// Determine number of codepoints for AS CHAR(n)/BINARY(n)
+		numCodepoints := 0
 		if v.As != nil {
 			typeName := strings.ToUpper(v.As.Type)
 			n := 0
@@ -21111,6 +21251,27 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 				n = *v.As.Length
 			}
 			if typeName == "BINARY" && n > 0 {
+				// For BINARY(n), pad/truncate to n bytes (charset-level)
+				if collationName != "" {
+					if vc := lookupVitessCollation(collationName); vc != nil {
+						src := []byte(s)
+						cs := vc.Charset()
+						if cs.Name() != "utf8mb4" && cs.Name() != "utf8mb3" && cs.Name() != "binary" {
+							if conv, convErr := charset.ConvertFromUTF8(nil, cs, src); convErr == nil {
+								src = conv
+							}
+						}
+						if len(src) > n {
+							src = src[:n]
+						} else {
+							for len(src) < n {
+								src = append(src, 0)
+							}
+						}
+						ws := vc.WeightString(nil, src, 0)
+						return string(ws), nil
+					}
+				}
 				bs := []byte(s)
 				if len(bs) > n {
 					bs = bs[:n]
@@ -21127,9 +21288,32 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 					runes = runes[:n]
 				}
 				s = string(runes)
+				numCodepoints = n
 			}
 		}
-		// Return raw bytes as the weight string
+
+		// Use Vitess weight string if collation is specified
+		if collationName != "" {
+			if vc := lookupVitessCollation(collationName); vc != nil {
+				src := []byte(s)
+				cs := vc.Charset()
+				if cs.Name() != "utf8mb4" && cs.Name() != "utf8mb3" && cs.Name() != "binary" {
+					if conv, convErr := charset.ConvertFromUTF8(nil, cs, src); convErr == nil {
+						src = conv
+					}
+				}
+				ws := vc.WeightString(nil, src, numCodepoints)
+				return string(ws), nil
+			}
+		}
+
+		// Default: use connection collation (utf8mb4_0900_ai_ci) for weight string
+		defaultColl := "utf8mb4_0900_ai_ci"
+		if vc := lookupVitessCollation(defaultColl); vc != nil {
+			ws := vc.WeightString(nil, []byte(s), numCodepoints)
+			return string(ws), nil
+		}
+		// Final fallback: raw bytes
 		return s, nil
 	case *sqlparser.AndExpr:
 		left, err := e.evalExpr(v.Left)
@@ -25758,13 +25942,62 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			return int64(0), nil
 		}
 		// Comparison in row context
-		left, err := e.evalRowExpr(v.Left, row)
+		// Extract COLLATE clause for collation-aware comparison
+		var collationName string
+		leftExpr2, rightExpr2 := v.Left, v.Right
+		if ce, ok := leftExpr2.(*sqlparser.CollateExpr); ok {
+			collationName = ce.Collation
+			leftExpr2 = ce.Expr
+		}
+		if ce, ok := rightExpr2.(*sqlparser.CollateExpr); ok {
+			collationName = ce.Collation
+			rightExpr2 = ce.Expr
+		}
+		left, err := e.evalRowExpr(leftExpr2, row)
 		if err != nil {
 			return nil, err
 		}
-		right, err := e.evalRowExpr(v.Right, row)
+		right, err := e.evalRowExpr(rightExpr2, row)
 		if err != nil {
 			return nil, err
+		}
+		if collationName != "" {
+			if vc := lookupVitessCollation(collationName); vc != nil {
+				ls := toString(left)
+				rs := toString(right)
+				lBytes := []byte(ls)
+				rBytes := []byte(rs)
+				cs := vc.Charset()
+				if cs.Name() != "utf8mb4" && cs.Name() != "utf8mb3" && cs.Name() != "binary" {
+					if conv, convErr := charset.ConvertFromUTF8(nil, cs, lBytes); convErr == nil {
+						lBytes = conv
+					}
+					if conv, convErr := charset.ConvertFromUTF8(nil, cs, rBytes); convErr == nil {
+						rBytes = conv
+					}
+				}
+				cmp := vc.Collate(lBytes, rBytes, false)
+				switch v.Operator {
+				case sqlparser.EqualOp:
+					if cmp == 0 { return int64(1), nil }
+					return int64(0), nil
+				case sqlparser.NotEqualOp:
+					if cmp != 0 { return int64(1), nil }
+					return int64(0), nil
+				case sqlparser.LessThanOp:
+					if cmp < 0 { return int64(1), nil }
+					return int64(0), nil
+				case sqlparser.GreaterThanOp:
+					if cmp > 0 { return int64(1), nil }
+					return int64(0), nil
+				case sqlparser.LessEqualOp:
+					if cmp <= 0 { return int64(1), nil }
+					return int64(0), nil
+				case sqlparser.GreaterEqualOp:
+					if cmp >= 0 { return int64(1), nil }
+					return int64(0), nil
+				}
+			}
 		}
 		result, err := compareValues(left, right, v.Operator)
 		if err != nil {
@@ -28115,6 +28348,40 @@ func compareByCollation(a, b interface{}, collation string) int {
 	if aIsStr || bIsStr {
 		aStr := toString(a)
 		bStr := toString(b)
+
+		// Try Vitess collation for UCA 0900 collations that need accurate comparison
+		collLower := strings.ToLower(collation)
+		if strings.Contains(collLower, "_0900_") || strings.HasSuffix(collLower, "_0900_bin") {
+			if vc := lookupVitessCollation(collation); vc != nil {
+				aSrc := []byte(aStr)
+				bSrc := []byte(bStr)
+				cs := vc.Charset()
+				if cs.Name() != "utf8mb4" && cs.Name() != "utf8mb3" && cs.Name() != "binary" {
+					if conv, err := charset.ConvertFromUTF8(nil, cs, aSrc); err == nil {
+						aSrc = conv
+					}
+					if conv, err := charset.ConvertFromUTF8(nil, cs, bSrc); err == nil {
+						bSrc = conv
+					}
+				}
+				cmp := vc.Collate(aSrc, bSrc, false)
+				if cmp != 0 {
+					return cmp
+				}
+				// Tie-break: for _ci collations, use codepoint order
+				if strings.HasSuffix(collLower, "_ci") {
+					if aStr < bStr {
+						return -1
+					}
+					if aStr > bStr {
+						return 1
+					}
+				}
+				return 0
+			}
+		}
+
+		// Fallback: use normalizeCollationKey for non-0900 collations
 		sa := normalizeCollationKey(aStr, collation)
 		sb := normalizeCollationKey(bStr, collation)
 		if sa < sb {
@@ -28123,9 +28390,7 @@ func compareByCollation(a, b interface{}, collation string) int {
 		if sa > sb {
 			return 1
 		}
-		// Tie-break: for case-insensitive collations (like utf8mb4_0900_ai_ci),
-		// uppercase letters sort before lowercase in MySQL.
-		// Use native charset encoding for tie-break to match MySQL byte ordering.
+		// Tie-break for _ci collations
 		coll := strings.ToLower(collation)
 		if strings.HasSuffix(coll, "_ci") {
 			var aTie, bTie string
@@ -28155,10 +28420,17 @@ func compareByCollation(a, b interface{}, collation string) int {
 func normalizeCollationKey(s string, collation string) string {
 	coll := strings.ToLower(collation)
 
+	// Use Vitess only for UCA 0900 collations which need accurate weight tables
+	if strings.Contains(coll, "_0900_") || strings.HasSuffix(coll, "_0900_bin") {
+		if vc := lookupVitessCollation(collation); vc != nil {
+			ws := vitessWeightString(s, vc)
+			return string(ws)
+		}
+	}
+
+	// Legacy behavior for non-0900 collations
 	switch coll {
 	case "utf8_general_ci", "utf8mb3_general_ci":
-		return normalizeUTF8GeneralCIKey(s)
-	case "utf8mb4_0900_ai_ci":
 		return normalizeUTF8GeneralCIKey(s)
 	case "sjis_japanese_ci", "cp932_japanese_ci":
 		return encodeStringForCollation(foldASCIICase(s), "sjis")
@@ -28535,7 +28807,12 @@ func applyOrderBy(orderBy sqlparser.OrderBy, colNames []string, rows [][]interfa
 
 func needsPreProjectionOrderBy(orderBy sqlparser.OrderBy, colNames []string) bool {
 	for _, order := range orderBy {
-		col, ok := order.Expr.(*sqlparser.ColName)
+		expr := order.Expr
+		// Unwrap COLLATE expression to get the inner column name
+		if ce, ok := expr.(*sqlparser.CollateExpr); ok {
+			expr = ce.Expr
+		}
+		col, ok := expr.(*sqlparser.ColName)
 		if !ok || col == nil {
 			continue
 		}
@@ -32635,6 +32912,32 @@ func convertThroughCharset(s, charset string) (string, error) {
 	switch cs {
 	case "utf8", "":
 		return s, nil
+	case "utf32":
+		// Encode each rune as 4-byte big-endian UTF-32
+		runes := []rune(s)
+		buf := make([]byte, len(runes)*4)
+		for i, r := range runes {
+			buf[i*4] = byte(r >> 24)
+			buf[i*4+1] = byte(r >> 16)
+			buf[i*4+2] = byte(r >> 8)
+			buf[i*4+3] = byte(r)
+		}
+		return string(buf), nil
+	case "utf16":
+		// Encode each rune as 2-byte or 4-byte UTF-16 big-endian
+		var buf []byte
+		for _, r := range s {
+			if r <= 0xFFFF {
+				buf = append(buf, byte(r>>8), byte(r))
+			} else {
+				// Surrogate pair
+				r -= 0x10000
+				hi := 0xD800 + (r>>10)&0x3FF
+				lo := 0xDC00 + r&0x3FF
+				buf = append(buf, byte(hi>>8), byte(hi), byte(lo>>8), byte(lo))
+			}
+		}
+		return string(buf), nil
 	case "ucs2":
 		// Keep UCS2 display semantics in higher-level query paths.
 		return s, nil

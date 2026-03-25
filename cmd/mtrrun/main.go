@@ -2395,31 +2395,14 @@ var skipTests = map[string]bool{
 	"binlog/binlog_truncate_myisam":                                    true,
 	"binlog/binlog_user_if_exists":                                     true,
 	"binlog/print_identified_with_as_hex":                              true,
-	// === collations suite === (requires UCA 0900 weight tables)
-	"collations/chinese":         true,
-	"collations/classic_latin":   true,
-	"collations/codepoint_order": true,
-	"collations/croatian":        true,
-	"collations/czech":           true,
-	"collations/danish":          true,
-	"collations/esperanto":       true,
-	"collations/estonian":        true,
-	"collations/german":          true,
-	"collations/hungarian":       true,
-	"collations/icelandic":       true,
-	"collations/japanese":        true,
-	"collations/latvian":         true,
-	"collations/lithuanian":      true,
-	"collations/polish":          true,
-	"collations/romanian":        true,
-	"collations/root":            true,
-	"collations/russian":         true,
-	"collations/slovak":          true,
-	"collations/slovenian":       true,
-	"collations/spanish":         true,
-	"collations/swedish":         true,
-	"collations/turkish":         true,
-	"collations/vietnamese":      true,
+	// collations suite: partially supported via Vitess UCA 0900 weight tables
+	// Remaining failures require multi-character contraction tie-breaking
+	"collations/croatian":   true, // DŽ/LJ/NJ contractions
+	"collations/danish":     true, // AA contraction
+	"collations/german":     true, // AE/OE/UE contractions
+	"collations/hungarian":  true, // Cs/Dz/Gy/Ly/Ny/Sz/Ty/Zs contractions
+	"collations/spanish":    true, // CH/LL contractions
+	"collations/vietnamese": true, // TH/NG/NH contractions
 	// === query_rewrite_plugins suite === (requires rewriter plugin)
 	"query_rewrite_plugins/basic":              true,
 	"query_rewrite_plugins/logging_general":    true,
