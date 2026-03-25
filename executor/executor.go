@@ -3063,11 +3063,49 @@ func (e *Executor) explainGetTableDef(tableName string) *catalog.TableDef {
 	return td
 }
 
+// charsetBytesPerChar returns the maximum bytes per character for a given charset.
+func charsetBytesPerChar(charset string) int {
+	switch strings.ToLower(charset) {
+	case "latin1", "binary", "ascii":
+		return 1
+	case "utf8", "utf8mb3":
+		return 3
+	case "utf8mb4", "":
+		return 4
+	default:
+		return 4 // default to utf8mb4
+	}
+}
+
+// decimalStorageBytes computes the storage size for DECIMAL(M,D) using MySQL's formula.
+// Each group of 9 digits uses 4 bytes; leftover digits use ceil-mapped sizes.
+func decimalStorageBytes(precision, scale int) int {
+	// Bytes needed for leftover digits (1-8 digits after groups of 9)
+	leftoverBytes := []int{0, 1, 1, 2, 2, 3, 3, 4, 4} // index 0..8
+
+	intgDigits := precision - scale
+	fracDigits := scale
+
+	intgFull := intgDigits / 9
+	intgLeft := intgDigits % 9
+	fracFull := fracDigits / 9
+	fracLeft := fracDigits % 9
+
+	return intgFull*4 + leftoverBytes[intgLeft] + fracFull*4 + leftoverBytes[fracLeft]
+}
+
 // explainKeyLen computes the MySQL key_len for a column used in an index lookup.
 // MySQL reports key_len in bytes. For nullable columns, add 1 byte.
-func explainKeyLen(col *catalog.ColumnDef) int {
+// The tableCharset parameter is the table-level charset; column-level charset overrides it.
+func explainKeyLen(col *catalog.ColumnDef, tableCharset string) int {
 	upper := strings.ToUpper(col.Type)
 	baseLen := 0
+
+	// Determine effective charset for this column
+	charset := col.Charset
+	if charset == "" {
+		charset = tableCharset
+	}
 
 	switch {
 	case strings.HasPrefix(upper, "BIGINT"):
@@ -3085,8 +3123,25 @@ func explainKeyLen(col *catalog.ColumnDef) int {
 	case strings.HasPrefix(upper, "DOUBLE") || strings.HasPrefix(upper, "REAL"):
 		baseLen = 8
 	case strings.HasPrefix(upper, "DECIMAL") || strings.HasPrefix(upper, "NUMERIC"):
-		// DECIMAL(M,D) uses a compact binary format; approximate
-		baseLen = 8
+		// DECIMAL(M,D): use MySQL's compact binary storage formula
+		precision := 10 // default M
+		scale := 0      // default D
+		start := strings.Index(upper, "(")
+		end := strings.Index(upper, ")")
+		if start >= 0 && end > start+1 {
+			parts := strings.Split(upper[start+1:end], ",")
+			if len(parts) >= 1 {
+				if p, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil {
+					precision = p
+				}
+			}
+			if len(parts) >= 2 {
+				if d, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil {
+					scale = d
+				}
+			}
+		}
+		baseLen = decimalStorageBytes(precision, scale)
 	case strings.HasPrefix(upper, "DATE"):
 		baseLen = 3
 	case strings.HasPrefix(upper, "DATETIME") || strings.HasPrefix(upper, "TIMESTAMP"):
@@ -3096,13 +3151,11 @@ func explainKeyLen(col *catalog.ColumnDef) int {
 	case strings.HasPrefix(upper, "YEAR"):
 		baseLen = 1
 	case strings.HasPrefix(upper, "CHAR"):
-		// CHAR(N) → N*4 for utf8mb4
 		n := extractTypeLength(upper, 1)
-		baseLen = n * 4
+		baseLen = n * charsetBytesPerChar(charset)
 	case strings.HasPrefix(upper, "VARCHAR"):
-		// VARCHAR(N) → N*4 + 2 for utf8mb4
 		n := extractTypeLength(upper, 255)
-		baseLen = n*4 + 2
+		baseLen = n*charsetBytesPerChar(charset) + 2
 	case strings.HasPrefix(upper, "BINARY"):
 		n := extractTypeLength(upper, 1)
 		baseLen = n
@@ -3197,7 +3250,7 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 			for _, pkCol := range td.PrimaryKey {
 				colDef := findColumnDef(td, pkCol)
 				if colDef != nil {
-					pkKeyLen += explainKeyLen(colDef)
+					pkKeyLen += explainKeyLen(colDef, td.Charset)
 				}
 			}
 			result.accessType = "const"
@@ -3206,11 +3259,6 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 			result.keyLen = strconv.Itoa(pkKeyLen)
 			result.ref = "const"
 			return result
-		}
-		// Check if the first PK column is used in a range condition
-		firstPK := strings.ToLower(td.PrimaryKey[0])
-		if rangeCols[firstPK] || eqCols[firstPK] {
-			// PK is a possible key even if not fully matched
 		}
 	}
 
@@ -3312,7 +3360,7 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 	for i := 0; i < matchCount && i < len(best.index.Columns); i++ {
 		colDef := findColumnDef(td, best.index.Columns[i])
 		if colDef != nil {
-			keyLen += explainKeyLen(colDef)
+			keyLen += explainKeyLen(colDef, td.Charset)
 		}
 	}
 
@@ -3320,10 +3368,20 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 	result.keyLen = strconv.Itoa(keyLen)
 
 	// Determine access type
+	// Check if query involves a join (eq_ref only applies in join context)
+	isJoin := false
+	for _, te := range sel.From {
+		if _, ok := te.(*sqlparser.JoinTableExpr); ok {
+			isJoin = true
+			break
+		}
+	}
 	if best.matchedAll && best.index.Unique {
-		if best.isPrimary {
+		if best.isPrimary || !isJoin {
+			// Use "const" for PK lookups or unique index lookups in standalone queries
 			result.accessType = "const"
 		} else {
+			// Use "eq_ref" only for unique index lookups driven by a join
 			result.accessType = "eq_ref"
 		}
 		// Build ref string
