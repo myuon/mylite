@@ -228,28 +228,9 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	}
 	expected := string(expectedBytes)
 
-	// Fast path: if lengths differ by more than 50%, skip expensive normalization
-	// of the expected output and compute diff with minimal normalization.
-	actualLen := len(actual)
-	expectedLen := len(expected)
-	if expectedLen > 0 && (actualLen < expectedLen/2 || actualLen > expectedLen*2) {
-		// Quick normalization for actual only
-		normalizedActual := normalizeOutput(actual)
-		// Light normalization of expected: just trim whitespace per line
-		expLines := strings.Split(expected, "\n")
-		for i, l := range expLines {
-			expLines[i] = strings.TrimRight(l, " \t\r")
-		}
-		normalizedExpected := strings.TrimRight(strings.Join(expLines, "\n"), "\n")
-		diff := computeDiff(normalizedExpected, normalizedActual)
-		return TestResult{
-			Name:     name,
-			Passed:   false,
-			Output:   actual,
-			Expected: expected,
-			Diff:     diff,
-		}
-	}
+	// Fast path: if lengths differ by more than 50% AFTER normalizing expected
+	// (strip Warnings blocks etc.), skip and compute diff with full normalization.
+	// We always apply normalizeExpected to properly handle Warning-block stripping.
 
 	// Compare: normalize expected side to strip Warnings blocks etc.
 	normalizedActual := normalizeOutput(actual)
@@ -2319,6 +2300,7 @@ func (ctx *execContext) executeExec(stmt string) error {
 		}
 		return fmt.Errorf("exec failed: %s: %v", stmt, err)
 	}
+	// Warning output after exec is handled by the caller or by SHOW WARNINGS queries in the test.
 	if ctx.infoEnabled && result != nil {
 		affected, _ := result.RowsAffected()
 		ctx.output.WriteString(fmt.Sprintf("affected rows: %d\n", affected))

@@ -4749,6 +4749,14 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		if sysVarGlobalOnly[cleanVarName] && scope != sqlparser.GlobalScope {
 			return nil, mysqlError(1228, "HY000", fmt.Sprintf("Variable '%s' is a GLOBAL variable and should be set with SET GLOBAL", cleanVarName))
 		}
+		// Check if session-read-only variable is being set at SESSION scope
+		if sysVarSessionReadOnly[cleanVarName] && scope != sqlparser.GlobalScope {
+			return nil, mysqlError(1238, "HY000", fmt.Sprintf("SESSION variable '%s' is read-only. Use SET GLOBAL to assign the value", cleanVarName))
+		}
+		// Emit deprecation warning for deprecated variables
+		if msg, ok := sysVarDeprecated[cleanVarName]; ok {
+			e.addWarning("Warning", 1287, msg)
+		}
 		val := sqlparser.String(expr.Expr)
 		val = strings.Trim(val, "'\"")
 		// Try evaluating the expression (handles @user_var, @@system_var references)
@@ -5637,6 +5645,14 @@ func (e *Executor) handleRawSet(raw string) error {
 		// Check GLOBAL-only
 		if sysVarGlobalOnly[varName] && !isGlobalScope {
 			return mysqlError(1228, "HY000", fmt.Sprintf("Variable '%s' is a GLOBAL variable and should be set with SET GLOBAL", varName))
+		}
+		// Check session-read-only
+		if sysVarSessionReadOnly[varName] && !isGlobalScope {
+			return mysqlError(1238, "HY000", fmt.Sprintf("SESSION variable '%s' is read-only. Use SET GLOBAL to assign the value", varName))
+		}
+		// Emit deprecation warning for deprecated variables
+		if msg, ok := sysVarDeprecated[varName]; ok {
+			e.addWarning("Warning", 1287, msg)
 		}
 		val := strings.TrimSpace(rest[eqIdx+1:])
 		val = strings.TrimSuffix(val, ";")
@@ -17407,6 +17423,51 @@ var sysVarSessionOnly = map[string]bool{
 	"rbr_exec_mode":              true,
 }
 
+// sysVarSessionReadOnly contains system variables that are read-only at SESSION scope.
+// SET SESSION var = val should return error 1238 with "SESSION variable 'var' is read-only. Use SET GLOBAL to assign the value".
+var sysVarSessionReadOnly = map[string]bool{
+	"net_buffer_length":  true,
+	"max_user_connections": true,
+}
+
+// sysVarDeprecated maps deprecated system variable names to their deprecation warning message.
+// When these variables are read (SELECT @@var), a deprecation warning (code 1287) is emitted.
+var sysVarDeprecated = map[string]string{
+	"expire_logs_days":                     "'@@expire_logs_days' is deprecated and will be removed in a future release. Please use binlog_expire_logs_seconds instead.",
+	"max_delayed_threads":                  "'@@max_delayed_threads' is deprecated and will be removed in a future release.",
+	"max_insert_delayed_threads":           "'@@max_insert_delayed_threads' is deprecated and will be removed in a future release.",
+	"binlog_max_flush_queue_time":          "'@@binlog_max_flush_queue_time' is deprecated and will be removed in a future release.",
+	"show_old_temporals":                   "'@@show_old_temporals' is deprecated and will be removed in a future release.",
+	"avoid_temporal_upgrade":               "'@@avoid_temporal_upgrade' is deprecated and will be removed in a future release.",
+	"log_bin_use_v1_row_events":            "'@@log_bin_use_v1_row_events' is deprecated and will be removed in a future release.",
+	"log_slow_slave_statements":            "'@@log_slow_slave_statements' is deprecated and will be removed in a future release. Please use log_slow_replica_statements instead.",
+	"relay_log_info_file":                  "'@@relay_log_info_file' is deprecated and will be removed in a future release.",
+	"master_info_repository":               "'@@master_info_repository' is deprecated and will be removed in a future release.",
+	"relay_log_info_repository":            "'@@relay_log_info_repository' is deprecated and will be removed in a future release.",
+	"master_verify_checksum":               "'@@master_verify_checksum' is deprecated and will be removed in a future release. Please use source_verify_checksum instead.",
+	"slave_compressed_protocol":            "'@@slave_compressed_protocol' is deprecated and will be removed in a future release.",
+	"log_statements_unsafe_for_binlog":     "'@@log_statements_unsafe_for_binlog' is deprecated and will be removed in a future release.",
+	"init_slave":                           "'@@init_slave' is deprecated and will be removed in a future release. Please use init_replica instead.",
+	"slave_rows_search_algorithms":         "'@@slave_rows_search_algorithms' is deprecated and will be removed in a future release.",
+	"slave_type_conversions":               "'@@slave_type_conversions' is deprecated and will be removed in a future release.",
+	"slave_allow_batching":                 "'@@slave_allow_batching' is deprecated and will be removed in a future release.",
+	"slave_checkpoint_group":               "'@@slave_checkpoint_group' is deprecated and will be removed in a future release.",
+	"slave_checkpoint_period":              "'@@slave_checkpoint_period' is deprecated and will be removed in a future release.",
+	"slave_max_allowed_packet":             "'@@slave_max_allowed_packet' is deprecated and will be removed in a future release.",
+	"slave_net_timeout":                    "'@@slave_net_timeout' is deprecated and will be removed in a future release.",
+	"slave_parallel_type":                  "'@@slave_parallel_type' is deprecated and will be removed in a future release.",
+	"slave_parallel_workers":               "'@@slave_parallel_workers' is deprecated and will be removed in a future release.",
+	"slave_pending_jobs_size_max":          "'@@slave_pending_jobs_size_max' is deprecated and will be removed in a future release.",
+	"slave_preserve_commit_order":          "'@@slave_preserve_commit_order' is deprecated and will be removed in a future release.",
+	"slave_sql_verify_checksum":            "'@@slave_sql_verify_checksum' is deprecated and will be removed in a future release.",
+	"slave_transaction_retries":            "'@@slave_transaction_retries' is deprecated and will be removed in a future release.",
+	"slave_skip_errors":                    "'@@slave_skip_errors' is deprecated and will be removed in a future release.",
+	"slave_exec_mode":                      "'@@slave_exec_mode' is deprecated and will be removed in a future release.",
+	"rpl_stop_slave_timeout":               "'@@rpl_stop_slave_timeout' is deprecated and will be removed in a future release. Please use rpl_stop_replica_timeout instead.",
+	"sync_master_info":                     "'@@sync_master_info' is deprecated and will be removed in a future release. Please use sync_source_info instead.",
+	"sql_slave_skip_counter":               "'@@sql_slave_skip_counter' is deprecated and will be removed in a future release. Please use sql_replica_skip_counter instead.",
+}
+
 // sysVarBoolean contains system variables that are boolean type (ON/OFF).
 // For these, float/scientific notation values are rejected with "Incorrect argument type".
 var sysVarBoolean = map[string]bool{
@@ -20001,6 +20062,11 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			if hasSessionScope {
 				return nil, mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a GLOBAL variable", name))
 			}
+		}
+
+		// Emit deprecation warning for deprecated variables
+		if msg, ok := sysVarDeprecated[name]; ok {
+			e.addWarning("Warning", 1287, msg)
 		}
 
 		// Check for @@global.session_only_var
