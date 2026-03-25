@@ -6,7 +6,6 @@
 //
 // If no suite is specified, runs all suites.
 package main
-
 import (
 	"context"
 	"database/sql"
@@ -20,7 +19,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/executor"
@@ -28,7 +26,6 @@ import (
 	"github.com/myuon/mylite/server"
 	"github.com/myuon/mylite/storage"
 )
-
 // skipTests lists tests known to be unfixable. Key: "suite/testname".
 var skipTests = map[string]bool{
 	// Regressions from merge - need investigation
@@ -39,7 +36,6 @@ var skipTests = map[string]bool{
 	"x/prep_stmt_performance_schema": true,
 	"x/session_connect_attributes": true,
 	"x/session_connect_attributes_with_session_reset": true,
-
 	// Requires full cp932_japanese_ci sort weight tables
 	"engine_funcs/jp_comment_older_compatibility1": true,
 	// Uses randomized data from data1.inc; expected output is MySQL-specific
@@ -92,7 +88,6 @@ var skipTests = map[string]bool{
 	// Foreign key constraint enforcement not implemented (InnoDB FK checks fail)
 	"gcol/gcol_ins_upd_innodb": true,
 	"gcol/gcol_ins_upd_myisam": true,
-
 	// === GIS suite ===
 	// Stored procedures using DO inside CALL + full WKB/SRID binary format required
 	"gis/all_geometry_types_instantiable": true,
@@ -162,7 +157,6 @@ var skipTests = map[string]bool{
 	"gis/geojson_functions": true,
 	// Requires geometry validation errors, proper centroid, and SRID-aware operations
 	"gis/gis_bugs_crashes": true,
-
 	// === innodb_fts suite ===
 	// Requires exact MySQL IDF/BM25 relevance scores and row ordering by relevance
 	"innodb_fts/basic":             true,
@@ -209,7 +203,6 @@ var skipTests = map[string]bool{
 	"innodb_fts/tablespace_location": true,
 	// Requires innodb_ft_server_stopword_table SET validation and FTS stopword configuration
 	"innodb_fts/stopword": true,
-
 	// === binlog_gtid suite ===
 	// Requires BINLOG statement (binary log event replay) - replication feature
 	"binlog_gtid/binlog_gtid_not_yet_determined_reacquire": true,
@@ -223,7 +216,6 @@ var skipTests = map[string]bool{
 	"binlog_gtid/binlog_gtid_utils": true,
 	// Requires mysql.gtid_executed system table
 	"binlog_gtid/binlog_shutdown_hang": true,
-
 	// === parts suite ===
 	// Partition-specific error: blocked SQL functions in partition expressions
 	"parts/part_blocked_sql_func_innodb": true,
@@ -306,7 +298,6 @@ var skipTests = map[string]bool{
 	"parts/partition_value_error": true,
 	// Replication with partitioned DML
 	"parts/rpl-partition-dml-1-1-innodb": true,
-
 	// === funcs_1 suite ===
 	// Charset/collation comparison differences
 	"funcs_1/charset_collation": true,
@@ -365,7 +356,6 @@ var skipTests = map[string]bool{
 	"funcs_1/processlist_val_no_prot":  true,
 	// Complex stored procedure features
 	"funcs_1/storedproc": true,
-
 	// === secondary_engine suite ===
 	// All tests require secondary engine plugin
 	"secondary_engine/cost_threshold":     true,
@@ -378,7 +368,6 @@ var skipTests = map[string]bool{
 	"secondary_engine/query_preparation":  true,
 	"secondary_engine/system_variables":   true,
 	"secondary_engine/uninstall":          true,
-
 	// === innodb suite ===
 	// Regression from global/session scope split
 	"innodb/innodb_stats":       true,
@@ -503,7 +492,6 @@ var skipTests = map[string]bool{
 	"innodb/virtual_basic": true,
 	// ERROR: ALTER TABLE ADD generated column
 	"innodb/virtual_index": true,
-
 	// === innodb suite FAIL tests ===
 	// "innodb/alter_page_size": true, // now passes
 	// ALTER TABLE RENAME with extra features
@@ -652,13 +640,11 @@ var skipTests = map[string]bool{
 	"innodb/zlob_import_export": true,
 	// ZLOB redundant partial update
 	"innodb/zlob_redundant_partial_update": true,
-
 	// === stress suite ===
 	// TIMEOUT: DDL stress tests that exceed timeout
 	"stress/ddl_csv":    true,
 	"stress/ddl_innodb": true,
 	"stress/ddl_memory": true,
-
 	// === perfschema suite (still-failing tests) ===
 	"perfschema/all_tests": true,
 	"perfschema/batch_table_io_func": true,
@@ -919,7 +905,6 @@ var skipTests = map[string]bool{
 	"perfschema/unary_digest": true,
 	"perfschema/user_var_func": true,
 	"perfschema/view_table_io": true,
-
 	// === sys_vars suite (remaining failures) ===
 	// Multi-connection tests requiring connect/disconnect commands
 	"sys_vars/auto_increment_increment_func": true,
@@ -1029,11 +1014,8 @@ var skipTests = map[string]bool{
 	// Requires PERSIST / RESET PERSIST
 	"sys_vars/binlog_row_event_max_size_basic": true,
 	// Requires deprecation warnings
-	"sys_vars/expire_logs_days_basic": true,
-	"sys_vars/show_old_temporals_basic": true,
 	"sys_vars/max_delayed_threads_basic": true,
 	"sys_vars/max_insert_delayed_threads_basic": true,
-	"sys_vars/binlog_max_flush_queue_time_basic": true,
 	// Requires SHOW STATUS
 	"sys_vars/delay_key_write_func": true,
 	// Requires LOAD DATA
@@ -1078,7 +1060,6 @@ var skipTests = map[string]bool{
 	"sys_vars/rand_seed1_basic": true,
 	"sys_vars/rand_seed2_basic": true,
 	"sys_vars/last_insert_id_basic": true,
-	"sys_vars/transaction_allow_batching_basic": true,
 	"sys_vars/slave_parallel_workers_basic": true,
 	"sys_vars/slave_pending_jobs_size_max_basic": true,
 	// Requires session_track_gtids / session_track_system_variables enum validation
@@ -1175,7 +1156,6 @@ var skipTests = map[string]bool{
 	// Error tests
 	"sys_vars/log_output_basic": true,
 	"sys_vars/slave_rows_search_algorithms_basic": true,
-
 	// === sysschema suite ===
 	// Requires sys schema views, functions, and procedures not implemented
 	"sysschema/all_sys_objects_exist":                         true,
@@ -1263,7 +1243,6 @@ var skipTests = map[string]bool{
 	"sysschema/v_waits_by_user_by_latency":                    true,
 	"sysschema/v_waits_global_by_latency":                     true,
 	"sysschema/version_functions":                             true,
-
 	// === x suite ===
 	// Requires X Protocol (mysqlx) plugin not implemented
 	"x/admin_bogus":                                  true,
@@ -1481,7 +1460,6 @@ var skipTests = map[string]bool{
 	"x/update_sql_o":                                 true,
 	"x/update_table":                                 true,
 	"x/wait_timeout":                                 true,
-
 	// === other suite ===
 	// Output mismatch
 	"other/1st":                                    true,
@@ -1722,7 +1700,6 @@ var skipTests = map[string]bool{
 	"other/wl6301_2_not_windows":                   true,
 	"other/wl6301_3":                               true,
 	"other/xa_prepared_binlog_off":                 true,
-
 	// Execution error (unsupported SQL or runtime failure)
 	"other/alter_table":                      true,
 	"other/binary":                           true,
@@ -1923,7 +1900,6 @@ var skipTests = map[string]bool{
 	"other/wl6219-memory":                    true,
 	"other/wl6219-merge":                     true,
 	"other/xml":                              true,
-
 	// Timeout (multi-connection, locking, or long-running)
 	"other/big_packets_boundary":                true,
 	"other/bug12368203":                         true,
@@ -1984,7 +1960,6 @@ var skipTests = map[string]bool{
 	"other/xa_applier_crash_mdl":                true,
 	// XA MDL backup requires multi-connection XA transactions
 	"other/xa_mdl_backup": true,
-
 	// === Newly un-skipped tests that fail (MyISAM/ARCHIVE engine tests now run but fail) ===
 	"binlog_gtid/binlog_gtid_mysqlbinlog_row_myisam": true,
 	// "funcs_1/is_cml_myisam": true, // now passes
@@ -2273,24 +2248,19 @@ var skipTests = map[string]bool{
 	"other/view_myisam": true,
 	"other/window_functions_myisam": true,
 	"other/wl6219-myisam": true,
-
 	// === encryption suite ===
 	"encryption/engine": true,
-
 	// === large_tests suite ===
 	"large_tests/innodb_innochecksum_3gb": true,
 	"large_tests/rpl_slave_net_timeout":   true,
-
 	// === binlog_nogtid suite ===
 	"binlog_nogtid/binlog_mysqlbinlog_row_myisam":            true,
 	"binlog_nogtid/binlog_mysqlbinlog_row_trans":              true,
 	"binlog_nogtid/binlog_nogtid_not_yet_determined_reacquire": true,
 	"binlog_nogtid/binlog_nogtid_select_taking_write_locks":   true,
 	"binlog_nogtid/binlog_row_insert_select":                  true,
-
 	// === innodb_undo suite ===
 	"innodb_undo/undo_ddl_vs_dml": true,
-
 	// === innodb_zip suite ===
 	"innodb_zip/bug52745":          true,
 	"innodb_zip/bug53591":          true,
@@ -2302,10 +2272,8 @@ var skipTests = map[string]bool{
 	"innodb_zip/restart":           true,
 	"innodb_zip/wl6915_1":          true,
 	"innodb_zip/zip":               true,
-
 	// === gcol_ndb suite ===
 	"gcol_ndb/gcol_column_def_options_ndb": true,
-
 	// === innodb_gis suite ===
 	"innodb_gis/alter_spatial_index":  true,
 	"innodb_gis/bug16236208":          true,
@@ -2320,7 +2288,6 @@ var skipTests = map[string]bool{
 	"innodb_gis/rtree_old":            true,
 	"innodb_gis/rtree_search":         true,
 	"innodb_gis/rtree_undo":           true,
-
 	// === innodb_stress suite ===
 	"innodb_stress/innodb_bigstress":                       true,
 	"innodb_stress/innodb_bigstress_blob":                  true,
@@ -2346,7 +2313,6 @@ var skipTests = map[string]bool{
 	"innodb_stress/innodb_stress_crash_blob_nocompress":    true,
 	"innodb_stress/innodb_stress_crash_nocompress":         true,
 	"innodb_stress/innodb_stress_nocompress":               true,
-
 	// === max_parts suite ===
 	"max_parts/partition_max_parts_hash_innodb":            true,
 	"max_parts/partition_max_parts_inv_innodb":             true,
@@ -2357,7 +2323,6 @@ var skipTests = map[string]bool{
 	"max_parts/partition_max_sub_parts_key_range_innodb":   true,
 	"max_parts/partition_max_sub_parts_list_innodb":        true,
 	"max_parts/partition_max_sub_parts_range_innodb":       true,
-
 	// === opt_trace suite ===
 	"opt_trace/bugs_no_prot_all":       true,
 	"opt_trace/bugs_no_prot_none":      true,
@@ -2382,7 +2347,6 @@ var skipTests = map[string]bool{
 	"opt_trace/subquery_no_prot":       true,
 	"opt_trace/subquery_ps_prot":       true,
 	"opt_trace/temp_table":             true,
-
 	// === auth_sec suite ===
 	"auth_sec/anonymous_grants":                true,
 	"auth_sec/install_keyring_file":            true,
@@ -2405,7 +2369,6 @@ var skipTests = map[string]bool{
 	"auth_sec/ssl_mode":                        true,
 	"auth_sec/system_user_kill_connection":      true,
 	"auth_sec/system_user_priv":                true,
-
 	// === binlog suite ===
 	"binlog/binlog_create_drop_temporary_table":                        true,
 	"binlog/binlog_database":                                           true,
@@ -2428,7 +2391,6 @@ var skipTests = map[string]bool{
 	"binlog/binlog_truncate_myisam":                                    true,
 	"binlog/binlog_user_if_exists":                                     true,
 	"binlog/print_identified_with_as_hex":                              true,
-
 	// === collations suite === (requires UCA 0900 weight tables)
 	"collations/chinese":         true,
 	"collations/classic_latin":   true,
@@ -2454,7 +2416,6 @@ var skipTests = map[string]bool{
 	"collations/swedish":         true,
 	"collations/turkish":         true,
 	"collations/vietnamese":      true,
-
 	// === query_rewrite_plugins suite === (requires rewriter plugin)
 	"query_rewrite_plugins/basic":              true,
 	"query_rewrite_plugins/logging_general":    true,
@@ -2463,14 +2424,12 @@ var skipTests = map[string]bool{
 	"query_rewrite_plugins/schema":             true,
 	"query_rewrite_plugins/warnings":           true,
 }
-
 func main() {
 	// MySQL MTR framework uses --timezone=GMT-3 (POSIX convention: GMT-3 = UTC+3).
 	os.Setenv("TZ", "Etc/GMT-3")
 	if loc, err := time.LoadLocation("Etc/GMT-3"); err == nil {
 		time.Local = loc
 	}
-
 	defaultTestdata := resolveTestdataRoot()
 	suiteRoot := flag.String("suite-root", filepath.Join(defaultTestdata, "suite"), "root directory for test suites")
 	includeRoot := flag.String("include-root", filepath.Join(defaultTestdata, "include"), "root directory for include files")
@@ -2479,46 +2438,36 @@ func main() {
 	jobs := flag.Int("j", 0, "number of parallel test workers (0=auto, 1=sequential)")
 	timeout := flag.Duration("timeout", 20*time.Second, "timeout per test (0=no timeout)")
 	flag.Parse()
-
 	args := flag.Args()
-
 	// No args: run all suites
 	if len(args) == 0 {
 		runAllSuites(*suiteRoot, *includeRoot, *verbose, *maxTests, *jobs, *timeout)
 		return
 	}
-
 	target := args[0]
-
 	// Check if it's a direct .test file path
 	if strings.HasSuffix(target, ".test") {
 		runSingleTest(target, *suiteRoot, *includeRoot, *verbose)
 		return
 	}
-
 	// Specific test within suite?
 	testFilter := ""
 	if len(args) > 1 {
 		testFilter = args[1]
 	}
-
 	results := runSuite(target, testFilter, *suiteRoot, *includeRoot, *verbose, *maxTests, *jobs, *timeout)
 	printSuiteSummary(target, results)
-
 	if hasFailures(results) {
 		os.Exit(1)
 	}
 }
-
 // runAllSuites discovers and runs all test suites sequentially.
 func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs int, timeout time.Duration) {
 	start := time.Now()
-
 	entries, err := os.ReadDir(suiteRoot)
 	if err != nil {
 		log.Fatalf("cannot read suite root: %v", err)
 	}
-
 	// Enabled suites whitelist. Add suites one at a time and fix until all pass.
 	enabledSuites := map[string]bool{
 		// Phase 1: Core engine (high pass rate)
@@ -2556,7 +2505,6 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		"collations":             true,
 		"query_rewrite_plugins": true,
 	}
-
 	var suiteNames []string
 	for _, e := range entries {
 		if !e.IsDir() {
@@ -2570,9 +2518,7 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 			suiteNames = append(suiteNames, e.Name())
 		}
 	}
-
 	var totalPassed, totalFailed, totalSkipped, totalErrors, totalTimeouts, totalTests int
-
 	for _, sn := range suiteNames {
 		fmt.Fprintf(os.Stderr, "[%s] starting suite %s...\n", time.Now().Format("15:04:05"), sn)
 		results := runSuite(sn, "", suiteRoot, includeRoot, verbose, maxTests, jobs, timeout)
@@ -2593,25 +2539,21 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		totalTimeouts += t
 		totalTests += len(results)
 	}
-
 	elapsed := time.Since(start)
 	fmt.Printf("\n=== Grand Total ===\n")
 	fmt.Printf("Suites: %d, Total: %d, Passed: %d, Failed: %d, Skipped: %d, Errors: %d, Timeouts: %d\n",
 		len(suiteNames), totalTests, totalPassed, totalFailed, totalSkipped, totalErrors, totalTimeouts)
 	fmt.Printf("Time: %.1fs\n", elapsed.Seconds())
-
 	if totalFailed+totalErrors > 0 {
 		os.Exit(1)
 	}
 }
-
 // runSuite runs all tests in a single suite and returns results.
 func runSuite(suiteName, testFilter, suiteRoot, includeRoot string, verbose bool, maxTests, jobs int, timeout time.Duration) []mtrrunner.TestResult {
 	suiteDir := filepath.Join(suiteRoot, suiteName)
 	if _, err := os.Stat(suiteDir); os.IsNotExist(err) {
 		log.Fatalf("suite directory not found: %s", suiteDir)
 	}
-
 	// Build include paths for this suite
 	includePaths := []string{includeRoot}
 	suiteInclude := filepath.Join(suiteDir, "include")
@@ -2623,17 +2565,14 @@ func runSuite(suiteName, testFilter, suiteRoot, includeRoot string, verbose bool
 		includePaths = append(includePaths, suiteTestDir)
 	}
 	includePaths = append(includePaths, suiteRoot)
-
 	searchPaths := []string{suiteRoot, includeRoot, filepath.Dir(suiteRoot)}
 	searchPaths = append(searchPaths, includePaths...)
-
 	// Discover tests
 	testDir := filepath.Join(suiteDir, "t")
 	entries, err := os.ReadDir(testDir)
 	if err != nil {
 		return nil
 	}
-
 	var testPaths []string
 	var skippedResults []mtrrunner.TestResult
 	for _, entry := range entries {
@@ -2656,11 +2595,9 @@ func runSuite(suiteName, testFilter, suiteRoot, includeRoot string, verbose bool
 			break
 		}
 	}
-
 	if len(testPaths) == 0 {
 		return skippedResults
 	}
-
 	// Determine parallelism
 	numJobs := jobs
 	if numJobs <= 0 {
@@ -2675,7 +2612,6 @@ func runSuite(suiteName, testFilter, suiteRoot, includeRoot string, verbose bool
 	if numJobs > len(testPaths) {
 		numJobs = len(testPaths)
 	}
-
 	var results []mtrrunner.TestResult
 	if numJobs <= 1 {
 		results = runSequential(testPaths, includePaths, searchPaths, verbose, timeout)
@@ -2684,7 +2620,6 @@ func runSuite(suiteName, testFilter, suiteRoot, includeRoot string, verbose bool
 	}
 	return append(skippedResults, results...)
 }
-
 // worker represents a dedicated mylite server instance for running tests.
 type worker struct {
 	srv         *server.Server
@@ -2696,7 +2631,6 @@ type worker struct {
 	searchPaths []string
 	db          *sql.DB // reusable DB connection pool for this worker
 }
-
 func newWorker(searchPaths []string) (*worker, error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -2704,7 +2638,6 @@ func newWorker(searchPaths []string) (*worker, error) {
 	}
 	addr := listener.Addr().String()
 	listener.Close()
-
 	tmpDir, err := os.MkdirTemp("", "mylite-mtr-*")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp dir: %v", err)
@@ -2712,7 +2645,6 @@ func newWorker(searchPaths []string) (*worker, error) {
 	os.MkdirAll(filepath.Join(tmpDir, "tmp"), 0755) //nolint:errcheck
 	dataDir := filepath.Join(tmpDir, "data", "inner")
 	os.MkdirAll(dataDir, 0755) //nolint:errcheck
-
 	// Symlink std_data into temp dir so LOAD DATA with $MYSQLTEST_VARDIR/std_data/... works
 	for _, sp := range searchPaths {
 		stdData := filepath.Join(sp, "std_data")
@@ -2724,18 +2656,15 @@ func newWorker(searchPaths []string) (*worker, error) {
 			break
 		}
 	}
-
 	cat := catalog.New()
 	store := storage.NewEngine()
 	exec := executor.New(cat, store)
 	exec.DataDir = dataDir
 	exec.SearchPaths = searchPaths
-
 	srv := server.New(exec, addr)
 	go func() {
 		srv.Start() //nolint:errcheck
 	}()
-
 	// Create a reusable DB connection pool for this worker
 	db, err := connectDB(addr)
 	if err != nil {
@@ -2745,7 +2674,6 @@ func newWorker(searchPaths []string) (*worker, error) {
 	}
 	db.SetMaxIdleConns(1)
 	db.SetMaxOpenConns(2)
-
 	return &worker{
 		srv:         srv,
 		exec:        exec,
@@ -2757,7 +2685,6 @@ func newWorker(searchPaths []string) (*worker, error) {
 		db:          db,
 	}, nil
 }
-
 func (w *worker) close() {
 	if w.db != nil {
 		w.db.Close()
@@ -2765,7 +2692,6 @@ func (w *worker) close() {
 	w.srv.Close()
 	os.RemoveAll(w.tmpDir)
 }
-
 // resetState creates a fresh catalog/storage/executor and swaps it into the server.
 // This ensures complete isolation between tests without restarting the TCP listener.
 func (w *worker) resetState() {
@@ -2776,20 +2702,16 @@ func (w *worker) resetState() {
 	w.exec.SearchPaths = w.searchPaths
 	w.srv.Executor = w.exec
 }
-
 func (w *worker) runTest(testPath string, includePaths []string, verbose bool, timeout time.Duration) mtrrunner.TestResult {
 	testName := strings.TrimSuffix(filepath.Base(testPath), ".test")
 	t0 := time.Now()
-
 	if timeout > 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-
 		ch := make(chan mtrrunner.TestResult, 1)
 		go func() {
 			ch <- w.runTestInner(testPath, includePaths, verbose)
 		}()
-
 		select {
 		case result := <-ch:
 			result.Elapsed = time.Since(t0)
@@ -2805,12 +2727,10 @@ func (w *worker) runTest(testPath string, includePaths []string, verbose bool, t
 			}
 		}
 	}
-
 	result := w.runTestInner(testPath, includePaths, verbose)
 	result.Elapsed = time.Since(t0)
 	return result
 }
-
 // rebuild tears down the current server and creates a fresh one.
 // The old server's goroutines are abandoned but will exit when their
 // connections are closed by the OS or when the process exits.
@@ -2828,12 +2748,10 @@ func (w *worker) rebuild() {
 	w.exec = nil
 	w.cat = nil
 	w.store = nil
-
 	// Create fresh server
 	listener, _ := net.Listen("tcp", "127.0.0.1:0")
 	w.addr = listener.Addr().String()
 	listener.Close()
-
 	w.cat = catalog.New()
 	w.store = storage.NewEngine()
 	w.exec = executor.New(w.cat, w.store)
@@ -2841,7 +2759,6 @@ func (w *worker) rebuild() {
 	w.exec.SearchPaths = w.searchPaths
 	w.srv = server.New(w.exec, w.addr)
 	go w.srv.Start()
-
 	// Reconnect DB
 	for i := 0; i < 50; i++ {
 		db, err := connectDB(w.addr)
@@ -2854,13 +2771,10 @@ func (w *worker) rebuild() {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
-
 func (w *worker) runTestInner(testPath string, includePaths []string, verbose bool) mtrrunner.TestResult {
 	// Reset executor state for full isolation between tests
 	w.resetState()
-
 	resetSessionState(w.db)
-
 	// Use a dedicated DB connection for this test so timeout can close it
 	testDB, err := connectDB(w.addr)
 	if err != nil {
@@ -2872,22 +2786,18 @@ func (w *worker) runTestInner(testPath string, includePaths []string, verbose bo
 	defer testDB.Close()
 	testDB.SetMaxIdleConns(4)
 	testDB.SetMaxOpenConns(16)
-
 	runner := &mtrrunner.Runner{
 		DB:           testDB,
 		IncludePaths: includePaths,
 		Verbose:      verbose,
 		TmpDir:       w.tmpDir,
 	}
-
 	return runner.RunFile(testPath)
 }
-
 type indexedResult struct {
 	index  int
 	result mtrrunner.TestResult
 }
-
 func runParallel(testPaths []string, includePaths, searchPaths []string, verbose bool, numJobs int, timeout time.Duration) []mtrrunner.TestResult {
 	// Create worker pool
 	workers := make([]*worker, numJobs)
@@ -2903,7 +2813,6 @@ func runParallel(testPaths []string, includePaths, searchPaths []string, verbose
 			w.close()
 		}
 	}()
-
 	// Wait for all workers to be ready
 	for _, w := range workers {
 		db, err := connectDB(w.addr)
@@ -2912,7 +2821,6 @@ func runParallel(testPaths []string, includePaths, searchPaths []string, verbose
 		}
 		db.Close()
 	}
-
 	// Distribute tests to workers via channel
 	testCh := make(chan struct {
 		index int
@@ -2925,9 +2833,7 @@ func runParallel(testPaths []string, includePaths, searchPaths []string, verbose
 		}{i, p}
 	}
 	close(testCh)
-
 	resultCh := make(chan indexedResult, len(testPaths))
-
 	var wg sync.WaitGroup
 	for i := 0; i < numJobs; i++ {
 		wg.Add(1)
@@ -2939,42 +2845,34 @@ func runParallel(testPaths []string, includePaths, searchPaths []string, verbose
 			}
 		}(workers[i])
 	}
-
 	go func() {
 		wg.Wait()
 		close(resultCh)
 	}()
-
 	results := make([]mtrrunner.TestResult, len(testPaths))
 	for ir := range resultCh {
 		results[ir.index] = ir.result
 	}
-
 	return results
 }
-
 func runSequential(testPaths []string, includePaths, searchPaths []string, verbose bool, timeout time.Duration) []mtrrunner.TestResult {
 	w, err := newWorker(searchPaths)
 	if err != nil {
 		log.Fatalf("failed to create worker: %v", err)
 	}
 	defer w.close()
-
 	db, err := connectDB(w.addr)
 	if err != nil {
 		log.Fatalf("failed to connect to mylite: %v", err)
 	}
 	db.Close()
-
 	var results []mtrrunner.TestResult
 	for _, testPath := range testPaths {
 		result := w.runTest(testPath, includePaths, verbose, timeout)
 		results = append(results, result)
 	}
-
 	return results
 }
-
 func countResults(results []mtrrunner.TestResult) (passed, failed, skipped, errors, timeouts int) {
 	for _, r := range results {
 		switch {
@@ -2992,7 +2890,6 @@ func countResults(results []mtrrunner.TestResult) (passed, failed, skipped, erro
 	}
 	return
 }
-
 func hasFailures(results []mtrrunner.TestResult) bool {
 	for _, r := range results {
 		if !r.Passed && !r.Skipped && !r.Timeout {
@@ -3001,7 +2898,6 @@ func hasFailures(results []mtrrunner.TestResult) bool {
 	}
 	return false
 }
-
 func printSuiteSummary(suiteName string, results []mtrrunner.TestResult) {
 	for _, r := range results {
 		printResult(r, false)
@@ -3011,7 +2907,6 @@ func printSuiteSummary(suiteName string, results []mtrrunner.TestResult) {
 	fmt.Printf("Total: %d, Passed: %d, Failed: %d, Skipped: %d, Errors: %d, Timeouts: %d\n",
 		len(results), p, f, s, e, t)
 }
-
 func printSuiteSummaryCompact(suiteName string, total, passed, failed, skipped, errors, timeouts int, elapsed time.Duration) {
 	status := "OK"
 	if failed+errors > 0 {
@@ -3020,11 +2915,9 @@ func printSuiteSummaryCompact(suiteName string, total, passed, failed, skipped, 
 	fmt.Printf("%-30s %4d tests: %4d passed, %4d failed, %4d skipped, %4d errors, %4d timeouts  [%s]  (%.1fs)\n",
 		suiteName, total, passed, failed, skipped, errors, timeouts, status, elapsed.Seconds())
 }
-
 func runSingleTest(target, suiteRoot, includeRoot string, verbose bool) {
 	searchPaths := []string{suiteRoot, includeRoot, filepath.Dir(suiteRoot)}
 	includePaths := []string{includeRoot}
-
 	suiteDir := filepath.Dir(filepath.Dir(target))
 	suiteInclude := filepath.Join(suiteDir, "include")
 	if _, err := os.Stat(suiteInclude); err == nil {
@@ -3036,26 +2929,22 @@ func runSingleTest(target, suiteRoot, includeRoot string, verbose bool) {
 	}
 	includePaths = append(includePaths, suiteRoot)
 	searchPaths = append(searchPaths, includePaths...)
-
 	w, err := newWorker(searchPaths)
 	if err != nil {
 		log.Fatalf("failed to create worker: %v", err)
 	}
 	defer w.close()
-
 	db, err := connectDB(w.addr)
 	if err != nil {
 		log.Fatalf("failed to connect to mylite: %v", err)
 	}
 	db.Close()
-
 	result := w.runTest(target, includePaths, verbose, 0)
 	printResult(result, verbose)
 	if !result.Passed && !result.Skipped {
 		os.Exit(1)
 	}
 }
-
 func connectDB(addr string) (*sql.DB, error) {
 	var db *sql.DB
 	var err error
@@ -3073,7 +2962,6 @@ func connectDB(addr string) (*sql.DB, error) {
 	}
 	return nil, err
 }
-
 func printResult(r mtrrunner.TestResult, verbose bool) {
 	timeStr := fmt.Sprintf("(%.1fs)", r.Elapsed.Seconds())
 	if r.Timeout {
@@ -3100,7 +2988,6 @@ func printResult(r mtrrunner.TestResult, verbose bool) {
 		fmt.Printf("%s\n", indent(r.Diff))
 	}
 }
-
 func indent(s string) string {
 	lines := strings.Split(s, "\n")
 	for i, l := range lines {
@@ -3108,13 +2995,11 @@ func indent(s string) string {
 	}
 	return strings.Join(lines, "\n")
 }
-
 func resolveTestdataRoot() string {
 	local := "testdata/dolt-mysql-tests/files"
 	if fi, err := os.Stat(filepath.Join(local, "suite")); err == nil && fi.IsDir() {
 		return local
 	}
-
 	gitPath := ".git"
 	data, err := os.ReadFile(gitPath)
 	if err == nil {
@@ -3129,10 +3014,8 @@ func resolveTestdataRoot() string {
 			}
 		}
 	}
-
 	return local
 }
-
 func resetSessionState(db *sql.DB) {
 	db.Exec("SET SQL_MODE='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'")          //nolint:errcheck
 	db.Exec("SET @@GLOBAL.SQL_MODE='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'") //nolint:errcheck
