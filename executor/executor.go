@@ -12335,7 +12335,11 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	preSortedOrderBy := false
 	// If ORDER BY references base columns that are not projected, pre-sort source rows.
 	if stmt.OrderBy != nil && needsPreProjectionOrderBy(stmt.OrderBy, colNames) {
-		defaultCollation := resolveOrderByCollation(selectTableDefs)
+		var fromExpr sqlparser.TableExpr
+		if len(stmt.From) > 0 {
+			fromExpr = stmt.From[0]
+		}
+		defaultCollation := resolveOrderByCollation(selectTableDefs, fromExpr)
 		sort.SliceStable(allRows, func(a, b int) bool {
 			for _, order := range stmt.OrderBy {
 				expr := order.Expr
@@ -12408,7 +12412,11 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 
 	// Apply ORDER BY
 	if stmt.OrderBy != nil && !preSortedOrderBy {
-		resultRows, err = applyOrderBy(stmt.OrderBy, colNames, resultRows, resolveOrderByCollation(selectTableDefs))
+		var fromExpr2 sqlparser.TableExpr
+		if len(stmt.From) > 0 {
+			fromExpr2 = stmt.From[0]
+		}
+		resultRows, err = applyOrderBy(stmt.OrderBy, colNames, resultRows, resolveOrderByCollation(selectTableDefs, fromExpr2))
 		if err != nil {
 			return nil, err
 		}
@@ -13184,7 +13192,7 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 	var err error
 	orderCollation := ""
 	if len(stmt.From) > 0 {
-		orderCollation = resolveOrderByCollation(e.collectTableDefs(stmt.From[0]))
+		orderCollation = resolveOrderByCollation(e.collectTableDefs(stmt.From[0]), stmt.From[0])
 	}
 	if stmt.OrderBy != nil {
 		resultRows, err = applyOrderBy(stmt.OrderBy, colNames, resultRows, orderCollation)
@@ -28491,8 +28499,19 @@ func effectiveTableCollation(def *catalog.TableDef) string {
 	return strings.ToLower(catalog.DefaultCollationForCharset(charset))
 }
 
-func resolveOrderByCollation(tableDefs []*catalog.TableDef) string {
+func resolveOrderByCollation(tableDefs []*catalog.TableDef, fromExprs ...sqlparser.TableExpr) string {
 	if len(tableDefs) == 0 {
+		// For virtual tables (information_schema, performance_schema) that don't have
+		// catalog entries, detect the schema from the FROM clause and use utf8_general_ci
+		// which is the default collation for these schemas in MySQL 8.0.
+		if len(fromExprs) > 0 {
+			if dbName := extractFromDatabase(fromExprs[0]); dbName != "" {
+				dbLower := strings.ToLower(dbName)
+				if dbLower == "information_schema" || dbLower == "performance_schema" {
+					return "utf8_general_ci"
+				}
+			}
+		}
 		return "utf8mb4_0900_ai_ci"
 	}
 	// Use single-table collation first; for joins fallback to the first table.
@@ -28500,6 +28519,19 @@ func resolveOrderByCollation(tableDefs []*catalog.TableDef) string {
 		return effectiveTableCollation(tableDefs[0])
 	}
 	return effectiveTableCollation(tableDefs[0])
+}
+
+// extractFromDatabase extracts the database/qualifier name from a FROM expression.
+func extractFromDatabase(expr sqlparser.TableExpr) string {
+	switch te := expr.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if tn, ok := te.Expr.(sqlparser.TableName); ok {
+			if !tn.Qualifier.IsEmpty() {
+				return tn.Qualifier.String()
+			}
+		}
+	}
+	return ""
 }
 
 func compareByCollation(a, b interface{}, collation string) int {
@@ -28519,39 +28551,6 @@ func compareByCollation(a, b interface{}, collation string) int {
 		aStr := toString(a)
 		bStr := toString(b)
 
-		// Try Vitess collation for UCA 0900 collations that need accurate comparison
-		collLower := strings.ToLower(collation)
-		if strings.Contains(collLower, "_0900_") || strings.HasSuffix(collLower, "_0900_bin") {
-			if vc := lookupVitessCollation(collation); vc != nil {
-				aSrc := []byte(aStr)
-				bSrc := []byte(bStr)
-				cs := vc.Charset()
-				if cs.Name() != "utf8mb4" && cs.Name() != "utf8mb3" && cs.Name() != "binary" {
-					if conv, err := charset.ConvertFromUTF8(nil, cs, aSrc); err == nil {
-						aSrc = conv
-					}
-					if conv, err := charset.ConvertFromUTF8(nil, cs, bSrc); err == nil {
-						bSrc = conv
-					}
-				}
-				cmp := vc.Collate(aSrc, bSrc, false)
-				if cmp != 0 {
-					return cmp
-				}
-				// Tie-break: for _ci collations, use codepoint order
-				if strings.HasSuffix(collLower, "_ci") {
-					if aStr < bStr {
-						return -1
-					}
-					if aStr > bStr {
-						return 1
-					}
-				}
-				return 0
-			}
-		}
-
-		// Fallback: use normalizeCollationKey for non-0900 collations
 		sa := normalizeCollationKey(aStr, collation)
 		sb := normalizeCollationKey(bStr, collation)
 		if sa < sb {
@@ -28598,7 +28597,7 @@ func normalizeCollationKey(s string, collation string) string {
 		}
 	}
 
-	// Legacy behavior for non-0900 collations
+	// Collation-specific key normalization
 	switch coll {
 	case "utf8_general_ci", "utf8mb3_general_ci":
 		return normalizeUTF8GeneralCIKey(s)
