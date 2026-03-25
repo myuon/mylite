@@ -351,7 +351,7 @@ var skipTests = map[string]bool{
 	"funcs_1/is_basics_mixed":                    true,
 	"funcs_1/is_character_sets":                  true,
 	"funcs_1/is_cml_innodb":                      true,
-	"funcs_1/is_cml_memory":                      true,
+	// "funcs_1/is_cml_memory": true, // now passes (eval variable expansion + COLUMNS fixes)
 	"funcs_1/is_coll_char_set_appl":              true,
 	"funcs_1/is_collations":                      true,
 	"funcs_1/is_column_privileges":               true,
@@ -366,7 +366,7 @@ var skipTests = map[string]bool{
 	"funcs_1/is_table_constraints_mysql":         true,
 	"funcs_1/is_table_privileges":                true,
 	"funcs_1/is_tables_innodb":                   true,
-	"funcs_1/is_tables_is":                       true,
+	// "funcs_1/is_tables_is": true, // now passes (IS SYSTEM VIEW entries + utf8_general_ci ordering)
 	"funcs_1/is_tables_memory":                   true,
 	"funcs_1/is_tables_mysql":                    true,
 	"funcs_1/is_user_privileges":                 true,

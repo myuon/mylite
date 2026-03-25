@@ -327,6 +327,7 @@ type execContext struct {
 	pendingSendByConn map[string]*pendingSend // keyed by connection name ("" for default)
 	pendingSendNext   bool                    // next SQL statement should be sent asynchronously
 	pendingSendEval   bool                    // pending send should use variable substitution
+	pendingEval       bool                    // next SQL statement should have variables expanded in echo
 }
 
 type tableSnapshot struct {
@@ -870,6 +871,9 @@ func (ctx *execContext) executeLines(lines []string) error {
 			stmts = splitStatements(stmt)
 		}
 
+		isEval := ctx.pendingEval
+		ctx.pendingEval = false
+
 		if len(stmts) <= 1 {
 			// Single statement: echo raw lines preserving original formatting
 			// Don't echo if this is a pending send (async dispatch)
@@ -877,6 +881,11 @@ func (ctx *execContext) executeLines(lines []string) error {
 				for _, rl := range rawLines {
 					if rl == "" {
 						continue // Skip blank lines in SQL echo (mysqltest doesn't output them)
+					}
+					// In eval mode, substitute variables in echoed lines
+					if isEval {
+						rl = ctx.substituteVars(rl)
+						rl = stripUndefinedVars(rl)
 					}
 					// Apply --replace_result and --replace_regex to echoed SQL too
 					if len(ctx.replaceResult) > 0 {
@@ -1094,6 +1103,10 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 			}
 			return true, false, err
 		}
+		// eval with no args: mark next SQL statement for variable expansion in echo
+		if name == "eval" {
+			ctx.pendingEval = true
+		}
 		return true, false, nil
 
 	case "shutdown_server":
@@ -1160,7 +1173,12 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		fields := strings.Fields(args)
 		for i := 0; i+1 < len(fields); i += 2 {
 			if colNum, err := strconv.Atoi(fields[i]); err == nil {
-				ctx.replaceColumns[colNum] = fields[i+1]
+				val := fields[i+1]
+				// Strip surrounding double quotes (mysqltest behavior)
+				if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
+					val = val[1 : len(val)-1]
+				}
+				ctx.replaceColumns[colNum] = val
 			}
 		}
 		return true, false, nil

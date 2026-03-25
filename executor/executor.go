@@ -14333,7 +14333,11 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 	if stmt.OrderBy != nil && len(stmt.OrderBy) > 0 {
 		sort.SliceStable(matchingIndices, func(a, b int) bool {
 			for _, order := range stmt.OrderBy {
-				colName := sqlparser.String(order.Expr)
+				orderExpr := order.Expr
+				if collateExpr, ok := orderExpr.(*sqlparser.CollateExpr); ok {
+					orderExpr = collateExpr.Expr
+				}
+				colName := sqlparser.String(orderExpr)
 				colName = strings.Trim(colName, "`")
 				va := rowValueByColumnName(tbl.Rows[matchingIndices[a]], colName)
 				vb := rowValueByColumnName(tbl.Rows[matchingIndices[b]], colName)
@@ -16367,7 +16371,11 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			}
 			return &Result{Columns: []string{"Collation", "Charset", "Id", "Default", "Compiled", "Sortlen", "Pad_attribute"}, Rows: rows, IsResultSet: true}, nil
 		case sqlparser.Table: // SHOW TABLES
-			db, err := e.Catalog.GetDatabase(e.CurrentDB)
+			targetDB := e.CurrentDB
+			if !basic.DbName.IsEmpty() {
+				targetDB = basic.DbName.String()
+			}
+			db, err := e.Catalog.GetDatabase(targetDB)
 			if err != nil {
 				return nil, err
 			}
@@ -16385,7 +16393,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 				rows = append(rows, []interface{}{t})
 			}
 			return &Result{
-				Columns:     []string{fmt.Sprintf("Tables_in_%s", e.CurrentDB)},
+				Columns:     []string{fmt.Sprintf("Tables_in_%s", targetDB)},
 				Rows:        rows,
 				IsResultSet: true,
 			}, nil
@@ -16395,7 +16403,20 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 	upper := strings.ToUpper(strings.TrimSpace(query))
 
 	if strings.HasPrefix(upper, "SHOW TABLES") {
-		db, err := e.Catalog.GetDatabase(e.CurrentDB)
+		targetDB := e.CurrentDB
+		// Parse SHOW TABLES FROM/IN <database>
+		if idx := strings.Index(upper, " FROM "); idx >= 0 {
+			rest := strings.TrimSpace(query[idx+6:])
+			dbName := strings.Fields(rest)[0]
+			dbName = strings.Trim(dbName, "`")
+			targetDB = dbName
+		} else if idx := strings.Index(upper, " IN "); idx >= 0 {
+			rest := strings.TrimSpace(query[idx+4:])
+			dbName := strings.Fields(rest)[0]
+			dbName = strings.Trim(dbName, "`")
+			targetDB = dbName
+		}
+		db, err := e.Catalog.GetDatabase(targetDB)
 		if err != nil {
 			return nil, err
 		}
@@ -16409,7 +16430,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			rows = append(rows, []interface{}{t})
 		}
 		return &Result{
-			Columns:     []string{fmt.Sprintf("Tables_in_%s", e.CurrentDB)},
+			Columns:     []string{fmt.Sprintf("Tables_in_%s", targetDB)},
 			Rows:        rows,
 			IsResultSet: true,
 		}, nil
@@ -28108,7 +28129,13 @@ func normalizeUTF8GeneralCIKey(s string) string {
 		if unicode.Is(unicode.Mn, r) {
 			continue
 		}
-		b.WriteRune(r)
+		// In MySQL's utf8_general_ci, non-letter ASCII symbols like '_' (0x5F)
+		// sort after letters. Remap them to high codepoints to match MySQL ordering.
+		if r == '_' {
+			b.WriteRune('\u007F') // DEL sorts after all ASCII letters
+		} else {
+			b.WriteRune(r)
+		}
 	}
 	return b.String()
 }
@@ -28369,12 +28396,21 @@ func applyOrderBy(orderBy sqlparser.OrderBy, colNames []string, rows [][]interfa
 	}
 
 	type orderSpec struct {
-		colIdx int
-		asc    bool
+		colIdx    int
+		asc       bool
+		collation string
 	}
 	var specs []orderSpec
 	for _, order := range orderBy {
-		colName := sqlparser.String(order.Expr)
+		// Handle COLLATE expressions by extracting the inner column name
+		// and using the specified collation for comparison
+		expr := order.Expr
+		orderCollation := collation
+		if collateExpr, ok := expr.(*sqlparser.CollateExpr); ok {
+			expr = collateExpr.Expr
+			orderCollation = collateExpr.Collation
+		}
+		colName := sqlparser.String(expr)
 		colName = strings.Trim(colName, "`")
 		colIdx := -1
 		for i, c := range colNames {
@@ -28387,7 +28423,7 @@ func applyOrderBy(orderBy sqlparser.OrderBy, colNames []string, rows [][]interfa
 			continue
 		}
 		asc := order.Direction == sqlparser.AscOrder || order.Direction == 0
-		specs = append(specs, orderSpec{colIdx: colIdx, asc: asc})
+		specs = append(specs, orderSpec{colIdx: colIdx, asc: asc, collation: orderCollation})
 	}
 	if len(specs) == 0 {
 		return rows, nil
@@ -28395,7 +28431,11 @@ func applyOrderBy(orderBy sqlparser.OrderBy, colNames []string, rows [][]interfa
 
 	sort.SliceStable(rows, func(i, j int) bool {
 		for _, spec := range specs {
-			cmp := compareByCollation(rows[i][spec.colIdx], rows[j][spec.colIdx], collation)
+			coll := spec.collation
+			if coll == "" {
+				coll = collation
+			}
+			cmp := compareByCollation(rows[i][spec.colIdx], rows[j][spec.colIdx], coll)
 			if cmp == 0 {
 				continue
 			}
@@ -28463,7 +28503,11 @@ func applyOrderByWithTypeHints(orderBy sqlparser.OrderBy, colNames []string, row
 	}
 	var specs []orderSpec
 	for _, order := range orderBy {
-		colName := strings.Trim(sqlparser.String(order.Expr), "`")
+		expr := order.Expr
+		if collateExpr, ok := expr.(*sqlparser.CollateExpr); ok {
+			expr = collateExpr.Expr
+		}
+		colName := strings.Trim(sqlparser.String(expr), "`")
 		colIdx := -1
 		for i, c := range colNames {
 			if strings.EqualFold(c, colName) {

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	catalogPkg "github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
 )
 
@@ -427,7 +428,7 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 			rawRows = []storage.Row{{"ID": int64(1), "USER": "root", "HOST": "localhost", "DB": e.CurrentDB, "COMMAND": "Query", "TIME": int64(0), "STATE": "executing", "INFO": nil}}
 		}
 	case "key_column_usage":
-		rawRows = []storage.Row{{"CONSTRAINT_CATALOG": "def", "CONSTRAINT_SCHEMA": "", "CONSTRAINT_NAME": "", "TABLE_CATALOG": "def", "TABLE_SCHEMA": "", "TABLE_NAME": "", "COLUMN_NAME": "", "ORDINAL_POSITION": int64(1), "POSITION_IN_UNIQUE_CONSTRAINT": nil, "REFERENCED_TABLE_SCHEMA": nil, "REFERENCED_TABLE_NAME": nil, "REFERENCED_COLUMN_NAME": nil}}
+		rawRows = e.infoSchemaKeyColumnUsage()
 	case "referential_constraints":
 		rawRows = []storage.Row{{"CONSTRAINT_CATALOG": "def", "CONSTRAINT_SCHEMA": "", "CONSTRAINT_NAME": "", "UNIQUE_CONSTRAINT_CATALOG": "def", "UNIQUE_CONSTRAINT_SCHEMA": "", "UNIQUE_CONSTRAINT_NAME": "", "MATCH_OPTION": "NONE", "UPDATE_RULE": "RESTRICT", "DELETE_RULE": "RESTRICT", "TABLE_NAME": "", "REFERENCED_TABLE_NAME": ""}}
 	case "innodb_temp_table_info":
@@ -512,7 +513,7 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 	case "table_constraints":
 		rawRows = e.infoSchemaTableConstraints()
 	case "check_constraints":
-		rawRows = []storage.Row{} // empty
+		rawRows = e.infoSchemaCheckConstraints()
 	case "character_sets":
 		rawRows = e.infoSchemaCharacterSets()
 	case "collations":
@@ -1003,6 +1004,11 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 
 	var rows []storage.Row
 	for _, dbName := range dbNames {
+		// Skip information_schema and performance_schema from the regular loop
+		// They have their own virtual table entries added below
+		if strings.EqualFold(dbName, "information_schema") || strings.EqualFold(dbName, "performance_schema") {
+			continue
+		}
 		db, err := e.Catalog.GetDatabase(dbName)
 		if err != nil {
 			continue
@@ -1037,31 +1043,130 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 					avgRowLength = dataLength / tableRows
 				}
 			}
+			// Determine ENGINE from table definition
+			engine := "InnoDB"
+			if tblDef != nil && tblDef.Engine != "" {
+				engine = canonicalEngineName(tblDef.Engine)
+			}
+
+			// Determine ROW_FORMAT from table definition
+			rowFormat := "Dynamic"
+			if tblDef != nil && tblDef.RowFormat != "" {
+				rowFormat = tblDef.RowFormat
+			} else if strings.EqualFold(engine, "MEMORY") {
+				rowFormat = "Fixed"
+			}
+
+			// Determine TABLE_COLLATION from table definition or database charset
+			tableCollation := "utf8mb4_0900_ai_ci"
+			if tblDef != nil && tblDef.Collation != "" {
+				tableCollation = tblDef.Collation
+			} else if tblDef != nil && tblDef.Charset != "" {
+				tableCollation = catalogPkg.DefaultCollationForCharset(tblDef.Charset)
+			} else if db != nil && db.CollationName != "" {
+				tableCollation = db.CollationName
+			}
+
+			// Try to get actual row count from storage engine
+			if tableRows == 0 {
+				if stbl, err := e.Storage.GetTable(dbName, tblName); err == nil {
+					stbl.Mu.RLock()
+					tableRows = int64(len(stbl.Rows))
+					stbl.Mu.RUnlock()
+				}
+			}
+
+			// Compute AUTO_INCREMENT: next value for auto-increment column
+			var autoIncrement interface{} = nil
+			if tblDef != nil {
+				for _, col := range tblDef.Columns {
+					if col.AutoIncrement {
+						if stbl, err := e.Storage.GetTable(dbName, tblName); err == nil {
+							cur := stbl.AutoIncrementValue()
+							autoIncrement = cur + 1
+						}
+						break
+					}
+				}
+			}
+
+			// DATA_FREE: use 0 for InnoDB tables (not nil)
+			var dataFree interface{} = int64(0)
+			if strings.EqualFold(engine, "MEMORY") {
+				dataFree = int64(0)
+			}
+
 			rows = append(rows, storage.Row{
 				"TABLE_CATALOG":   "def",
 				"TABLE_SCHEMA":    dbName,
 				"TABLE_NAME":      tblName,
 				"TABLE_TYPE":      "BASE TABLE",
-				"ENGINE":          "InnoDB",
+				"ENGINE":          engine,
 				"VERSION":         int64(10),
-				"ROW_FORMAT":      "Dynamic",
+				"ROW_FORMAT":      rowFormat,
 				"TABLE_ROWS":      tableRows,
 				"AVG_ROW_LENGTH":  avgRowLength,
 				"DATA_LENGTH":     dataLength,
 				"MAX_DATA_LENGTH": maxDataLength,
 				"INDEX_LENGTH":    indexLength,
-				"DATA_FREE":       nil,
-				"AUTO_INCREMENT":  nil,
+				"DATA_FREE":       dataFree,
+				"AUTO_INCREMENT":  autoIncrement,
 				"CREATE_TIME":     nil,
 				"UPDATE_TIME":     nil,
 				"CHECK_TIME":      nil,
-				"TABLE_COLLATION": "utf8mb4_general_ci",
+				"TABLE_COLLATION": tableCollation,
 				"CHECKSUM":        nil,
 				"CREATE_OPTIONS":  createOptions,
 				"TABLE_COMMENT":   tblComment,
 			})
 		}
 	}
+
+	// Add information_schema virtual tables as SYSTEM VIEW entries
+	// Order matches MySQL 8.0's utf8_general_ci collation ordering
+	isTableNames := []string{
+		"CHARACTER_SETS", "CHECK_CONSTRAINTS",
+		"COLLATIONS", "COLLATION_CHARACTER_SET_APPLICABILITY",
+		"COLUMNS", "COLUMN_PRIVILEGES", "COLUMN_STATISTICS",
+		"ENGINES", "EVENTS", "FILES",
+		"KEYWORDS", "KEY_COLUMN_USAGE",
+		"OPTIMIZER_TRACE",
+		"PARAMETERS", "PARTITIONS", "PLUGINS",
+		"PROCESSLIST",
+		"REFERENTIAL_CONSTRAINTS", "RESOURCE_GROUPS", "ROUTINES",
+		"SCHEMATA", "SCHEMA_PRIVILEGES", "STATISTICS",
+		"ST_GEOMETRY_COLUMNS", "ST_SPATIAL_REFERENCE_SYSTEMS", "ST_UNITS_OF_MEASURE",
+		"TABLES", "TABLESPACES", "TABLE_CONSTRAINTS", "TABLE_PRIVILEGES",
+		"TRIGGERS",
+		"USER_PRIVILEGES",
+		"VIEWS", "VIEW_ROUTINE_USAGE", "VIEW_TABLE_USAGE",
+	}
+	for _, tblName := range isTableNames {
+		rows = append(rows, storage.Row{
+			"TABLE_CATALOG":   "def",
+			"TABLE_SCHEMA":    "information_schema",
+			"TABLE_NAME":      tblName,
+			"TABLE_TYPE":      "SYSTEM VIEW",
+			"ENGINE":          nil,
+			"VERSION":         int64(10),
+			"ROW_FORMAT":      nil,
+			"TABLE_ROWS":      nil,
+			"AVG_ROW_LENGTH":  nil,
+			"DATA_LENGTH":     nil,
+			"MAX_DATA_LENGTH": nil,
+			"INDEX_LENGTH":    nil,
+			"DATA_FREE":       nil,
+			"AUTO_INCREMENT":  nil,
+			"CREATE_TIME":     nil,
+			"UPDATE_TIME":     nil,
+			"CHECK_TIME":      nil,
+			"TABLE_COLLATION": nil,
+			"CHECKSUM":        nil,
+			"CREATE_OPTIONS":  nil,
+			"TABLE_COMMENT":   "",
+		})
+	}
+
 	return rows
 }
 
@@ -1258,8 +1363,45 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 				} else if col.Unique {
 					columnKey = "UNI"
 				}
+				// Also mark as MUL if part of a non-unique index (first column)
+				if columnKey == "" {
+					for _, idx := range tbl.Indexes {
+						if len(idx.Columns) > 0 {
+							idxCol := normalizeIndexColumnName(idx.Columns[0])
+							if strings.EqualFold(idxCol, col.Name) {
+								columnKey = "MUL"
+								break
+							}
+						}
+					}
+				}
 				if col.AutoIncrement {
 					extra = "auto_increment"
+				} else if col.OnUpdateCurrentTimestamp {
+					if col.Default != nil && strings.ToUpper(*col.Default) == "CURRENT_TIMESTAMP" {
+						extra = "DEFAULT_GENERATED on update CURRENT_TIMESTAMP"
+					} else {
+						extra = "on update CURRENT_TIMESTAMP"
+					}
+				} else if col.Default != nil && strings.ToUpper(*col.Default) == "CURRENT_TIMESTAMP" {
+					// TIMESTAMP/DATETIME with DEFAULT CURRENT_TIMESTAMP (no ON UPDATE)
+					extra = "DEFAULT_GENERATED"
+				}
+
+				// Compute DATETIME_PRECISION for temporal types
+				var datetimePrecision interface{} = nil
+				switch baseType {
+				case "DATETIME", "TIMESTAMP", "TIME":
+					datetimePrecision = int64(0) // default fractional seconds precision
+					// Check for explicit precision like DATETIME(6)
+					if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
+						end := strings.Index(colTypeUpper[idx:], ")")
+						if end > 0 {
+							if n, err := strconv.ParseInt(colTypeUpper[idx+1:idx+end], 10, 64); err == nil {
+								datetimePrecision = n
+							}
+						}
+					}
 				}
 
 				rows = append(rows, storage.Row{
@@ -1275,7 +1417,7 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 					"CHARACTER_OCTET_LENGTH":   charOctetLen,
 					"NUMERIC_PRECISION":        numPrecision,
 					"NUMERIC_SCALE":            numScale,
-					"DATETIME_PRECISION":       nil,
+					"DATETIME_PRECISION":       datetimePrecision,
 					"CHARACTER_SET_NAME":       charSetName,
 					"COLLATION_NAME":           collationName,
 					"COLUMN_TYPE":              normalizeColumnType(col.Type),
@@ -2337,6 +2479,127 @@ func (e *Executor) psClassDisabled(class string) bool {
 	return false
 }
 
+// infoSchemaKeyColumnUsage returns rows for INFORMATION_SCHEMA.KEY_COLUMN_USAGE.
+func (e *Executor) infoSchemaKeyColumnUsage() []storage.Row {
+	dbNames := e.Catalog.ListDatabases()
+	sort.Strings(dbNames)
+
+	var rows []storage.Row
+	for _, dbName := range dbNames {
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		tableNames := db.ListTables()
+		sort.Strings(tableNames)
+		for _, tblName := range tableNames {
+			tbl, err := db.GetTable(tblName)
+			if err != nil || tbl == nil {
+				continue
+			}
+			// Primary key constraint
+			if len(tbl.PrimaryKey) > 0 {
+				for i, col := range tbl.PrimaryKey {
+					rows = append(rows, storage.Row{
+						"CONSTRAINT_CATALOG":            "def",
+						"CONSTRAINT_SCHEMA":             dbName,
+						"CONSTRAINT_NAME":               "PRIMARY",
+						"TABLE_CATALOG":                 "def",
+						"TABLE_SCHEMA":                  dbName,
+						"TABLE_NAME":                    tblName,
+						"COLUMN_NAME":                   col,
+						"ORDINAL_POSITION":              int64(i + 1),
+						"POSITION_IN_UNIQUE_CONSTRAINT": nil,
+						"REFERENCED_TABLE_SCHEMA":       nil,
+						"REFERENCED_TABLE_NAME":         nil,
+						"REFERENCED_COLUMN_NAME":        nil,
+					})
+				}
+			}
+			// Unique indexes
+			for _, idx := range tbl.Indexes {
+				if idx.Unique {
+					for i, col := range idx.Columns {
+						colName := normalizeIndexColumnName(col)
+						rows = append(rows, storage.Row{
+							"CONSTRAINT_CATALOG":            "def",
+							"CONSTRAINT_SCHEMA":             dbName,
+							"CONSTRAINT_NAME":               idx.Name,
+							"TABLE_CATALOG":                 "def",
+							"TABLE_SCHEMA":                  dbName,
+							"TABLE_NAME":                    tblName,
+							"COLUMN_NAME":                   colName,
+							"ORDINAL_POSITION":              int64(i + 1),
+							"POSITION_IN_UNIQUE_CONSTRAINT": nil,
+							"REFERENCED_TABLE_SCHEMA":       nil,
+							"REFERENCED_TABLE_NAME":         nil,
+							"REFERENCED_COLUMN_NAME":        nil,
+						})
+					}
+				}
+			}
+		}
+	}
+	return rows
+}
+
+// infoSchemaCheckConstraints returns rows for INFORMATION_SCHEMA.CHECK_CONSTRAINTS.
+func (e *Executor) infoSchemaCheckConstraints() []storage.Row {
+	dbNames := e.Catalog.ListDatabases()
+	sort.Strings(dbNames)
+
+	var rows []storage.Row
+	for _, dbName := range dbNames {
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		tableNames := db.ListTables()
+		sort.Strings(tableNames)
+		for _, tblName := range tableNames {
+			tbl, err := db.GetTable(tblName)
+			if err != nil || tbl == nil {
+				continue
+			}
+			for _, cc := range tbl.CheckConstraints {
+				rows = append(rows, storage.Row{
+					"CONSTRAINT_CATALOG": "def",
+					"CONSTRAINT_SCHEMA":  dbName,
+					"CONSTRAINT_NAME":    cc.Name,
+					"CHECK_CLAUSE":       cc.Expr,
+				})
+			}
+		}
+	}
+	return rows
+}
+
+// canonicalEngineName returns the MySQL-canonical engine name with proper casing.
+func canonicalEngineName(engine string) string {
+	switch strings.ToUpper(engine) {
+	case "INNODB":
+		return "InnoDB"
+	case "MYISAM":
+		return "MyISAM"
+	case "MEMORY":
+		return "MEMORY"
+	case "CSV":
+		return "CSV"
+	case "ARCHIVE":
+		return "ARCHIVE"
+	case "BLACKHOLE":
+		return "BLACKHOLE"
+	case "MERGE", "MRGSORT":
+		return "MRG_MYISAM"
+	case "FEDERATED":
+		return "FEDERATED"
+	case "NDB", "NDBCLUSTER":
+		return "ndbcluster"
+	default:
+		return engine
+	}
+}
+
 // normalizeColumnType returns the MySQL COLUMN_TYPE string for a given column type.
 // For integer types without explicit display width, it adds the default display width.
 func normalizeColumnType(colType string) string {
@@ -2384,6 +2647,11 @@ func normalizeColumnType(colType string) string {
 		return "int(11)"
 	case "bigint":
 		return "bigint(20)" + suffix
+	case "char":
+		// CHAR without length defaults to CHAR(1)
+		return "char(1)"
+	case "year":
+		return "year(4)"
 	}
 	return t
 }
