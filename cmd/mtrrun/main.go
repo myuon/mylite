@@ -1061,7 +1061,7 @@ var skipTests = map[string]bool{
 	"sys_vars/new_basic": true,
 	"sys_vars/foreign_key_checks_basic": true,
 	"sys_vars/unique_checks_basic": true,
-	"sys_vars/sql_log_bin_basic": true,
+	// "sys_vars/sql_log_bin_basic": true, // now passes (session-only enforcement)
 	"sys_vars/session_track_schema_basic": true,
 	"sys_vars/log_bin_trust_function_creators_basic": true,
 	"sys_vars/updatable_views_with_limit_basic": true,
@@ -1155,7 +1155,7 @@ var skipTests = map[string]bool{
 	"sys_vars/innodb_ft_aux_table_basic": true,
 	"sys_vars/innodb_ft_server_stopword_table_basic": true,
 	"sys_vars/innodb_ft_user_stopword_table_basic": true,
-	"sys_vars/innodb_lock_wait_timeout_basic": true,
+	// "sys_vars/innodb_lock_wait_timeout_basic": true, // now passes (float var + range fix)
 	"sys_vars/innodb_tmpdir_basic": true,
 	"sys_vars/log_statements_unsafe_for_binlog_basic": true,
 	"sys_vars/general_log_file_basic": true,
@@ -1714,7 +1714,7 @@ var skipTests = map[string]bool{
 	"other/type_time":                              true,
 	"other/type_varchar":                           true,
 	"other/type_year":                              true,
-	"other/upgrade":                                true,
+	// "other/upgrade":                                true, // now passes (USE information_schema fix)
 	"other/user_if_exists":                         true,
 	"other/variables_dynamic_privs":                true,
 	"other/with_explain":                           true,

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
 )
 
@@ -1064,6 +1065,9 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 			dataLength := int64(0)
 			maxDataLength := int64(0)
 			indexLength := int64(0)
+			tableCollation := "utf8mb4_general_ci"
+			tableEngine := "InnoDB"
+			tableRowFormat := "Dynamic"
 			if tblDef != nil {
 				tblComment = tblDef.Comment
 				opts := make([]string, 0, 2)
@@ -1074,6 +1078,38 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 					opts = append(opts, fmt.Sprintf("stats_auto_recalc=%d", *tblDef.StatsAutoRecalc))
 				}
 				createOptions = strings.Join(opts, " ")
+				// Use table-level collation if set, otherwise derive from charset
+				if tblDef.Collation != "" {
+					tableCollation = tblDef.Collation
+				} else if tblDef.Charset != "" {
+					tableCollation = catalog.DefaultCollationForCharset(tblDef.Charset)
+				}
+				if tblDef.Engine != "" {
+					// Normalize engine name to MySQL's display format
+					switch strings.ToUpper(tblDef.Engine) {
+					case "INNODB":
+						tableEngine = "InnoDB"
+					case "MYISAM":
+						tableEngine = "MyISAM"
+					case "MEMORY":
+						tableEngine = "MEMORY"
+					case "CSV":
+						tableEngine = "CSV"
+					case "ARCHIVE":
+						tableEngine = "ARCHIVE"
+					case "BLACKHOLE":
+						tableEngine = "BLACKHOLE"
+					case "MERGE", "MRG_MYISAM":
+						tableEngine = "MRG_MYISAM"
+					default:
+						tableEngine = tblDef.Engine
+					}
+				}
+				if tblDef.RowFormat != "" {
+					// Capitalize first letter for display (e.g., "DYNAMIC" -> "Dynamic")
+					rf := strings.ToLower(tblDef.RowFormat)
+					tableRowFormat = strings.ToUpper(rf[:1]) + rf[1:]
+				}
 			}
 			if stats, ok := tableStatsByKey[strings.ToLower(dbName+"."+tblName)]; ok {
 				tableRows = asInt64Or(stats["n_rows"], 0)
@@ -1088,9 +1124,9 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 				"TABLE_SCHEMA":    dbName,
 				"TABLE_NAME":      tblName,
 				"TABLE_TYPE":      "BASE TABLE",
-				"ENGINE":          "InnoDB",
+				"ENGINE":          tableEngine,
 				"VERSION":         int64(10),
-				"ROW_FORMAT":      "Dynamic",
+				"ROW_FORMAT":      tableRowFormat,
 				"TABLE_ROWS":      tableRows,
 				"AVG_ROW_LENGTH":  avgRowLength,
 				"DATA_LENGTH":     dataLength,
@@ -1101,7 +1137,7 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 				"CREATE_TIME":     nil,
 				"UPDATE_TIME":     nil,
 				"CHECK_TIME":      nil,
-				"TABLE_COLLATION": "utf8mb4_general_ci",
+				"TABLE_COLLATION": tableCollation,
 				"CHECKSUM":        nil,
 				"CREATE_OPTIONS":  createOptions,
 				"TABLE_COMMENT":   tblComment,
@@ -1431,7 +1467,7 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 					collation = nil
 				} else if idxType == "SPATIAL" {
 					indexTypeStr = "SPATIAL"
-					// MySQL shows collation=A for SPATIAL indexes
+					// SPATIAL indexes show Collation=A in MySQL
 				}
 				for i, col := range cols {
 					colName := normalizeIndexColumnName(col)

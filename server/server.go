@@ -80,13 +80,21 @@ func (h *Handler) HandleQuery(query string) (*mysql.Result, error) {
 		return nil, fmt.Errorf("ERROR 1064 (42000): %v", err)
 	}
 
+	warningCount := h.executor.GetWarningCount()
+
 	if result.IsResultSet {
-		return resultToMySQL(result)
+		r, err := resultToMySQL(result)
+		if err != nil {
+			return nil, err
+		}
+		r.Warnings = warningCount
+		return r, nil
 	}
 
 	return &mysql.Result{
 		AffectedRows: result.AffectedRows,
 		InsertId:     result.InsertID,
+		Warnings:     warningCount,
 	}, nil
 }
 
@@ -161,13 +169,21 @@ func (h *Handler) HandleStmtExecute(context interface{}, query string, args []in
 		return nil, fmt.Errorf("ERROR 1064 (42000): %v", err)
 	}
 
+	warningCount := h.executor.GetWarningCount()
+
 	if result.IsResultSet {
-		return resultToMySQLBinary(result)
+		r, err := resultToMySQLBinary(result)
+		if err != nil {
+			return nil, err
+		}
+		r.Warnings = warningCount
+		return r, nil
 	}
 
 	return &mysql.Result{
 		AffectedRows: result.AffectedRows,
 		InsertId:     result.InsertID,
+		Warnings:     warningCount,
 	}, nil
 }
 

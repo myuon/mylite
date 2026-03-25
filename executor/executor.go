@@ -302,6 +302,15 @@ func (e *Executor) addWarning(level string, code int, message string) {
 	e.warnings = append(e.warnings, Warning{Level: level, Code: code, Message: message})
 }
 
+// GetWarningCount returns the number of warnings from the last statement.
+func (e *Executor) GetWarningCount() uint16 {
+	n := len(e.warnings)
+	if n > 65535 {
+		return 65535
+	}
+	return uint16(n)
+}
+
 // getSysVar reads a system variable with proper scope resolution:
 // session -> global -> (not found). Used for reads that don't specify scope.
 func (e *Executor) getSysVar(name string) (string, bool) {
@@ -3804,11 +3813,13 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			}
 			return &Result{}, nil
 		}
-		if strings.HasPrefix(upper, "CREATE EVENT") ||
-			strings.HasPrefix(upper, "DROP EVENT") ||
-			strings.HasPrefix(upper, "CREATE USER") ||
-			strings.HasPrefix(upper, "DROP USER") ||
-			strings.HasPrefix(upper, "ALTER USER") ||
+		// Normalize multiple spaces for prefix matching (e.g., "DROP   USER" from test files)
+		upperNorm := regexp.MustCompile(`\s+`).ReplaceAllString(upper, " ")
+		if strings.HasPrefix(upperNorm, "CREATE EVENT") ||
+			strings.HasPrefix(upperNorm, "DROP EVENT") ||
+			strings.HasPrefix(upperNorm, "CREATE USER") ||
+			strings.HasPrefix(upperNorm, "DROP USER") ||
+			strings.HasPrefix(upperNorm, "ALTER USER") ||
 			strings.HasPrefix(upper, "GRANT ") ||
 			strings.HasPrefix(upper, "REVOKE ") ||
 			strings.HasPrefix(upper, "FLUSH ") ||
@@ -5246,6 +5257,47 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						return nil, err
 					}
 					e.sessionScopeVars[cleanName] = clamped
+				} else if frange, ok := sysVarFloatRange[cleanName]; ok {
+					// Float variables with range clamping
+					evalVal, err := e.evalExpr(expr.Expr)
+					if err != nil || evalVal == nil {
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+					}
+					var f float64
+					switch v := evalVal.(type) {
+					case int, int8, int16, int32, int64:
+						f = float64(toInt64(evalVal))
+					case uint, uint8, uint16, uint32, uint64:
+						f = float64(toInt64(evalVal))
+					case float32:
+						f = float64(v)
+					case float64:
+						f = v
+					case string:
+						parsed, pErr := strconv.ParseFloat(v, 64)
+						if pErr != nil {
+							return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+						}
+						f = parsed
+					default:
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+					}
+					if f < frange.Min {
+						e.warnings = append(e.warnings, Warning{
+							Level:   "Warning",
+							Code:    1292,
+							Message: fmt.Sprintf("Truncated incorrect %s value: '%s'", cleanName, fmt.Sprintf("%v", evalVal)),
+						})
+						f = frange.Min
+					} else if f > frange.Max {
+						e.warnings = append(e.warnings, Warning{
+							Level:   "Warning",
+							Code:    1292,
+							Message: fmt.Sprintf("Truncated incorrect %s value: '%s'", cleanName, fmt.Sprintf("%v", evalVal)),
+						})
+						f = frange.Max
+					}
+					e.sessionScopeVars[cleanName] = fmt.Sprintf("%g", f)
 				} else if cleanName == "innodb_io_capacity_max" {
 					// INTEGER only, minimum 100, and cannot be set lower than innodb_io_capacity.
 					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
@@ -6057,10 +6109,17 @@ func (e *Executor) handleRawSet(raw string) error {
 	} else if strings.HasPrefix(restUpper, "PERSIST ") {
 		rest = rest[len("PERSIST "):]
 	}
-	rest = strings.TrimPrefix(rest, "@@global.")
-	rest = strings.TrimPrefix(rest, "@@session.")
-	rest = strings.TrimPrefix(rest, "@@local.")
-	rest = strings.TrimPrefix(rest, "@@")
+	// Case-insensitive prefix stripping for @@ scope prefixes
+	restLowerForPrefix := strings.ToLower(rest)
+	if strings.HasPrefix(restLowerForPrefix, "@@global.") {
+		rest = rest[len("@@global."):]
+	} else if strings.HasPrefix(restLowerForPrefix, "@@session.") {
+		rest = rest[len("@@session."):]
+	} else if strings.HasPrefix(restLowerForPrefix, "@@local.") {
+		rest = rest[len("@@local."):]
+	} else if strings.HasPrefix(rest, "@@") {
+		rest = rest[len("@@"):]
+	}
 	_ = restUpper
 	if eqIdx := strings.Index(rest, "="); eqIdx > 0 {
 		varName := strings.TrimSpace(strings.ToLower(rest[:eqIdx]))
@@ -17059,7 +17118,11 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			}
 			return &Result{Columns: []string{"Collation", "Charset", "Id", "Default", "Compiled", "Sortlen", "Pad_attribute"}, Rows: rows, IsResultSet: true}, nil
 		case sqlparser.Table: // SHOW TABLES
-			db, err := e.Catalog.GetDatabase(e.CurrentDB)
+			targetDB := e.CurrentDB
+			if !basic.DbName.IsEmpty() {
+				targetDB = basic.DbName.String()
+			}
+			db, err := e.Catalog.GetDatabase(targetDB)
 			if err != nil {
 				return nil, err
 			}
@@ -17077,7 +17140,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 				}
 			}
 			sort.Strings(tables)
-			colName := fmt.Sprintf("Tables_in_%s", e.CurrentDB)
+			colName := fmt.Sprintf("Tables_in_%s", targetDB)
 			if basic.Full {
 				// SHOW FULL TABLES
 				rows := make([][]interface{}, 0, len(tables))
@@ -17122,7 +17185,21 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 	upper := strings.ToUpper(strings.TrimSpace(query))
 
 	if strings.HasPrefix(upper, "SHOW TABLES") || strings.HasPrefix(upper, "SHOW FULL TABLES") {
-		db, err := e.Catalog.GetDatabase(e.CurrentDB)
+		// Parse FROM/IN clause: SHOW TABLES [FROM|IN db_name] [LIKE pattern]
+		targetDB := e.CurrentDB
+		rest := strings.TrimSpace(query[len("SHOW TABLES"):])
+		if strings.HasPrefix(upper, "SHOW FULL TABLES") {
+			rest = strings.TrimSpace(query[len("SHOW FULL TABLES"):])
+		}
+		restUpper := strings.ToUpper(rest)
+		if strings.HasPrefix(restUpper, "FROM ") || strings.HasPrefix(restUpper, "IN ") {
+			// Extract database name
+			parts := strings.Fields(rest)
+			if len(parts) >= 2 {
+				targetDB = strings.Trim(parts[1], "`")
+			}
+		}
+		db, err := e.Catalog.GetDatabase(targetDB)
 		if err != nil {
 			return nil, err
 		}
@@ -17141,7 +17218,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		}
 		sort.Strings(tables)
 		isFull := strings.HasPrefix(upper, "SHOW FULL TABLES")
-		colName := fmt.Sprintf("Tables_in_%s", e.CurrentDB)
+		colName := fmt.Sprintf("Tables_in_%s", targetDB)
 		if isFull {
 			rows := make([][]interface{}, 0, len(tables))
 			for _, t := range tables {
@@ -17648,7 +17725,6 @@ var sysVarReadOnly = map[string]bool{
 	"default_authentication_plugin":                true,
 	"disconnect_on_expired_password":               true,
 	"gtid_executed":                                true,
-	"gtid_owned":                                   true,
 	"relay_log":                                    true,
 	"relay_log_info_file":                          true,
 	"relay_log_recovery":                           true,
@@ -18424,6 +18500,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"innodb_purge_rseg_truncate_frequency":     {Min: 1, Max: 128, IsUnsigned: true},
 	"innodb_sync_spin_loops":                   {Min: 0, Max: 4294967295, IsUnsigned: true},
 	"innodb_thread_concurrency":                {Min: 0, Max: 1000, IsUnsigned: true},
+	"innodb_lock_wait_timeout":                 {Min: 1, Max: 1073741824, IsUnsigned: true},
 	"lock_wait_timeout":                        {Min: 1, Max: 31536000, IsUnsigned: true},
 	"max_connections":                          {Min: 1, Max: 100000, IsUnsigned: true},
 	"mysqlx_connect_timeout":                   {Min: 1, Max: 31536000, IsUnsigned: true},
@@ -18460,7 +18537,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"innodb_concurrency_tickets":               {Min: 1, Max: 4294967295, IsUnsigned: true},
 	"innodb_fast_shutdown":                     {Min: 0, Max: 2, IsUnsigned: true},
 	"innodb_flush_neighbors":                   {Min: 0, Max: 2, IsUnsigned: true},
-	"innodb_max_dirty_pages_pct_lwm":           {Min: 0, Max: 99, IsUnsigned: true},
+	// innodb_max_dirty_pages_pct_lwm is actually a float variable - handled separately
 	"innodb_max_undo_log_size":                 {Min: 10485760, Max: 18446744073709551615, IsUnsigned: true},
 	"innodb_online_alter_log_max_size":         {Min: 65536, Max: 18446744073709551615, IsUnsigned: true},
 	"join_buffer_size":                         {Min: 128, Max: 18446744073709551615, IsUnsigned: true, BlockSize: 128},
@@ -18470,7 +18547,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"key_cache_division_limit":                 {Min: 1, Max: 100, IsUnsigned: true},
 	"log_error_verbosity":                      {Min: 1, Max: 3, IsUnsigned: true},
 	"log_throttle_queries_not_using_indexes":   {Min: 0, Max: 4294967295, IsUnsigned: true},
-	"long_query_time":                          {Min: 0, Max: 31536000, IsUnsigned: false},
+	// long_query_time is actually a float variable - handled separately
 	"max_binlog_cache_size":                    {Min: 4096, Max: 18446744073709547520, IsUnsigned: true, BlockSize: 4096},
 	"max_binlog_size":                          {Min: 4096, Max: 1073741824, IsUnsigned: true, BlockSize: 4096},
 	"max_binlog_stmt_cache_size":               {Min: 4096, Max: 18446744073709547520, IsUnsigned: true, BlockSize: 4096},
@@ -18574,12 +18651,25 @@ var sysVarIntRange = map[string]intVarRange{
 	"innodb_flush_log_at_trx_commit":           {Min: 0, Max: 2, IsUnsigned: true},
 	"innodb_log_write_ahead_size":              {Min: 512, Max: 16384, IsUnsigned: true},
 	"innodb_rollback_segments":                 {Min: 1, Max: 128, IsUnsigned: true},
-	"innodb_max_dirty_pages_pct":               {Min: 0, Max: 99, IsUnsigned: true},
+	// innodb_max_dirty_pages_pct is actually a float variable - handled separately
 	"myisam_data_pointer_size":                 {Min: 2, Max: 7, IsUnsigned: true},
 	"myisam_mmap_size":                         {Min: 7, Max: 18446744073709551615, IsUnsigned: true},
 	"relay_log_space_limit":                    {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
 	"innodb_undo_tablespaces":                 {Min: 2, Max: 127, IsUnsigned: true},
 	"sql_slave_skip_counter":                   {Min: 0, Max: 4294967295, IsUnsigned: true},
+}
+
+// floatVarRange defines the valid range for float system variables.
+type floatVarRange struct {
+	Min float64
+	Max float64
+}
+
+var sysVarFloatRange = map[string]floatVarRange{
+	"innodb_max_dirty_pages_pct":           {Min: 0, Max: 99.999},
+	"innodb_max_dirty_pages_pct_lwm":      {Min: 0, Max: 99.999},
+	"long_query_time":                     {Min: 0, Max: 31536000},
+	"secondary_engine_cost_threshold":     {Min: 0, Max: 1.7976931348623157e+308},
 }
 
 func parseStrictIntegerAssignment(expr sqlparser.Expr, evalVal interface{}) (int64, uint64, bool, string, error) {
@@ -19752,6 +19842,10 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 
 	// Override with SET SESSION values (skip for SHOW GLOBAL VARIABLES)
 	if globalOnly {
+		// Remove session-only variables from global scope
+		for name := range sysVarSessionOnly {
+			delete(vars, name)
+		}
 		return vars
 	}
 	for name, val := range e.sessionScopeVars {
@@ -23349,6 +23443,10 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 		if err != nil {
 			return nil, nil
 		}
+		// parseDateTimeValue returns time in UTC; re-interpret in session timezone
+		if e.timeZone != nil && e.timeZone != time.UTC {
+			t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), e.timeZone)
+		}
 		// MySQL returns decimal with microsecond precision when given a datetime argument
 		return fmt.Sprintf("%d.%06d", t.Unix(), t.Nanosecond()/1000), nil
 	case "from_unixtime":
@@ -26327,7 +26425,11 @@ func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator) (i
 		if rf == 0 {
 			return nil, nil // MySQL returns NULL for division by zero
 		}
-		return DivisionResult(lf / rf), nil
+		// Round to 4 decimal places (MySQL's div_precision_increment default)
+		// to ensure consistent sorting and comparison behavior.
+		raw := lf / rf
+		rounded := math.Round(raw*10000) / 10000
+		return DivisionResult(rounded), nil
 	case sqlparser.IntDivOp:
 		if rf == 0 {
 			return nil, nil
@@ -33675,8 +33777,8 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 	// Note: EXTENDED is only valid for CHECK TABLE, not OPTIMIZE TABLE
 	{
 		restUpper := strings.ToUpper(rest)
-		// For OPTIMIZE TABLE, reject unsupported options like EXTENDED
-		if op == "optimize" {
+		// EXTENDED is only valid for CHECK TABLE and REPAIR TABLE, not ANALYZE/OPTIMIZE
+		if op == "analyze" || op == "optimize" {
 			trimmed := strings.TrimSpace(strings.TrimRight(restUpper, ";"))
 			for _, badOpt := range []string{"EXTENDED", "CHANGED", "FOR UPGRADE", "USE_FRM"} {
 				if strings.HasSuffix(trimmed, badOpt) {

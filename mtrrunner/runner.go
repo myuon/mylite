@@ -1171,7 +1171,12 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		fields := strings.Fields(args)
 		for i := 0; i+1 < len(fields); i += 2 {
 			if colNum, err := strconv.Atoi(fields[i]); err == nil {
-				ctx.replaceColumns[colNum] = fields[i+1]
+				val := fields[i+1]
+				// Strip surrounding quotes from replacement values
+				if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
+					val = val[1 : len(val)-1]
+				}
+				ctx.replaceColumns[colNum] = val
 			}
 		}
 		return true, false, nil
@@ -3121,7 +3126,7 @@ func parseDirectiveNameArgs(directive string) (name, args string) {
 
 	// Support parenthesized forms like "connect(...)".
 	// If both '(' and whitespace exist, whichever appears first defines the split.
-	wsIdx := strings.IndexAny(d, " \t")
+	wsIdx := strings.IndexAny(d, " \t\n")
 	parIdx := strings.IndexByte(d, '(')
 	if parIdx >= 0 && (wsIdx < 0 || parIdx < wsIdx) {
 		name = strings.ToLower(strings.TrimSpace(d[:parIdx]))
