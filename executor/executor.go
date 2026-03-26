@@ -12413,7 +12413,30 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// The parser may synthesize a "dual" FROM table, and INSERT...SELECT inherits
 	// the outer query in currentQuery, so we check multiple conditions.
 	lowerCurrentQuery := strings.ToLower(strings.TrimSpace(e.currentQuery))
-	logicalNoFrom := !hasTopLevelFromClause(e.currentQuery) &&
+	// Check both the original query text AND the AST.  When executing a
+	// subquery, e.currentQuery still holds the outer query, but stmt.From
+	// belongs to the inner SELECT.  If the inner SELECT has a real FROM
+	// clause (anything other than synthesised "dual"), it is NOT a no-FROM
+	// query — column references in it are legitimate.
+	stmtHasRealFrom := false
+	for _, f := range stmt.From {
+		if ate, ok := f.(*sqlparser.AliasedTableExpr); ok {
+			if tn, ok2 := ate.Expr.(sqlparser.TableName); ok2 {
+				if strings.ToLower(tn.Name.String()) != "dual" {
+					stmtHasRealFrom = true
+					break
+				}
+			} else {
+				stmtHasRealFrom = true
+				break
+			}
+		} else {
+			stmtHasRealFrom = true
+			break
+		}
+	}
+	logicalNoFrom := !stmtHasRealFrom &&
+		!hasTopLevelFromClause(e.currentQuery) &&
 		!strings.HasPrefix(lowerCurrentQuery, "with ") &&
 		!strings.HasPrefix(lowerCurrentQuery, "insert ") &&
 		!strings.HasPrefix(lowerCurrentQuery, "update ") &&
@@ -12438,7 +12461,7 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// Vitess may synthesize stmt.From for SELECT local.var/session.var/global.var
 	// even when the query has no explicit FROM clause. In MySQL these are
 	// resolved as table-qualified columns and must return unknown-table errors.
-	if !hasTopLevelFromClause(e.currentQuery) && strings.HasPrefix(lowerCurrentQuery, "select ") {
+	if !stmtHasRealFrom && !hasTopLevelFromClause(e.currentQuery) && strings.HasPrefix(lowerCurrentQuery, "select ") {
 		if err := validateImplicitScopeQualifiedCols(stmt); err != nil {
 			return nil, err
 		}
@@ -15097,6 +15120,10 @@ func validateNoFromTopLevelColRefs(expr sqlparser.Expr) error {
 func validateNoFromExprRefs(expr sqlparser.Expr) error {
 	var walkErr error
 	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		// Don't descend into subqueries - they have their own scope
+		if _, ok := node.(*sqlparser.Subquery); ok {
+			return false, nil
+		}
 		col, ok := node.(*sqlparser.ColName)
 		if !ok {
 			return true, nil

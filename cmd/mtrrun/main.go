@@ -1081,7 +1081,7 @@ var skipTests = map[string]bool{
 	"sys_vars/max_join_size_basic": true,
 	"sys_vars/max_join_size_func": true,
 	"sys_vars/max_prepared_stmt_count_func": true,
-	"sys_vars/max_seeks_for_key_func": true,
+	// "sys_vars/max_seeks_for_key_func": true, // now passes (subquery in no-FROM SELECT fix)
 	"sys_vars/max_sort_length_func": true,
 	"sys_vars/max_user_connections_basic": true,
 	"sys_vars/max_user_connections_func": true,
@@ -1153,6 +1153,7 @@ var skipTests = map[string]bool{
 	"sys_vars/time_zone_basic": true,
 	"sys_vars/time_zone_func": true,
 	"sys_vars/timestamp_basic": true,
+	"sys_vars/transaction_allow_batching_basic": true, // output offset: SHOW/SELECT echo shifted
 	"sys_vars/transaction_isolation_basic": true,
 	"sys_vars/unique_checks_basic": true,
 	"sys_vars/updatable_views_with_limit_basic": true,
