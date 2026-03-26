@@ -434,3 +434,25 @@ func (tlm *TableLockManager) IsLocked(connID int64, dbTable string) (locked bool
 	return true, mode
 }
 
+// IsLockedByOther checks if a table is locked by any connection OTHER than connID.
+// Returns (true, mode) if locked by another connection, where mode is the strongest
+// lock mode held (WRITE > READ). Returns (false, "") if not locked by others.
+func (tlm *TableLockManager) IsLockedByOther(connID int64, dbTable string) (locked bool, mode string) {
+	tlm.mu.Lock()
+	defer tlm.mu.Unlock()
+	key := strings.ToLower(dbTable)
+	for otherID, m := range tlm.locks {
+		if otherID == connID {
+			continue
+		}
+		if lockMode, ok := m[key]; ok {
+			if lockMode == "WRITE" {
+				return true, "WRITE"
+			}
+			locked = true
+			mode = lockMode
+		}
+	}
+	return locked, mode
+}
+

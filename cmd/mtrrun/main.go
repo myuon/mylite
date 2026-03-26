@@ -1034,7 +1034,7 @@ var skipTests = map[string]bool{
 	"sys_vars/innodb_ft_aux_table_basic": true,
 	"sys_vars/innodb_ft_server_stopword_table_basic": true,
 	"sys_vars/innodb_ft_user_stopword_table_basic": true,
-	"sys_vars/innodb_lock_wait_timeout_basic": true,
+	// "sys_vars/innodb_lock_wait_timeout_basic": true, // unskipped: value clamping fixed
 	"sys_vars/innodb_log_buffer_size_basic": true,
 	"sys_vars/innodb_log_spin_cpu_abs_lwm": true,
 	"sys_vars/innodb_log_spin_cpu_pct_hwm": true,
@@ -1930,7 +1930,7 @@ var skipTests = map[string]bool{
 	"other/lock_multi_bug38691":                 true,
 	"other/locking_clause":                      true, // needs stored procedures
 	"other/locking_readonly_db":                 true,
-	"other/locking_with_out_key":                true,
+	// "other/locking_with_out_key": true, // unskipped: FOR SHARE OF clause fixed
 	"other/log_state":                           true,
 	"other/partition_innodb":                    true,
 	"other/partition_locking_4":                 true, // needs multi-connection lock wait timeout
