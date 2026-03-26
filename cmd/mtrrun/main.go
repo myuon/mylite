@@ -380,7 +380,7 @@ var skipTests = map[string]bool{
 	"secondary_engine/uninstall":          true,
 	// === innodb suite ===
 	// Regression from global/session scope split
-	"innodb/innodb_stats":       true,
+	// "innodb/innodb_stats":       true, // now passes (IN subquery fix)
 // "innodb/innodb_stats_fetch": true, // now passes
 	// ERROR: ALTER TABLE RENAME requires source table to exist
 	"innodb/alter_rename_existing": true,
@@ -1469,7 +1469,7 @@ var skipTests = map[string]bool{
 	// Output mismatch
 	"other/1st":                                    true,
 	// Regression from global/session scope split
-	"other/dd_string":                              true,
+	// "other/dd_string":                              true, // now passes (IN subquery fix)
 	"other/alias":                                  true,
 	"other/alter_table_partition":                  true,
 	"other/analyze":                                true,
@@ -1546,9 +1546,9 @@ var skipTests = map[string]bool{
 	"other/explain_tree":                           true,
 	"other/file_contents":                          true,
 	// "other/filesort": true, // unskipped: now passes
-	"other/filesort_json":                          true,
+	// "other/filesort_json":                          true, // now passes (IN subquery fix)
 	"other/filesort_pack":                          true,
-	"other/filter_single_col_idx_big":              true,
+	// "other/filter_single_col_idx_big":              true, // now passes (IN subquery fix)
 	"other/flush2":                                 true,
 	"other/func_aes_misc":                          true,
 	"other/func_compress":                          true,
@@ -1589,7 +1589,7 @@ var skipTests = map[string]bool{
 	"other/innodb_mrr_cost_icp":                    true,
 	"other/innodb_mrr_icp":                         true,
 	"other/innodb_mrr_none":                        true,
-	"other/join_outer_innodb":                      true,
+	// "other/join_outer_innodb":                      true, // now passes (IN subquery fix)
 	"other/key":                                    true,
 	"other/key_diff":                               true,
 	"other/lead_lag_explain":                       true,
@@ -1627,7 +1627,7 @@ var skipTests = map[string]bool{
 	"other/null_key_none_innodb":                   true,
 	"other/opt_costmodel":                          true,
 	"other/opt_costmodel_flush":                    true,
-	"other/opt_costmodel_pfs":                      true,
+	// "other/opt_costmodel_pfs":                      true, // now passes (IN subquery fix)
 	// "other/opt_hints_index_merge": true, // unskipped: now passes
 	"other/opt_hints_pfs":                          true,
 	"other/opt_hints_subquery":                     true,
@@ -2050,7 +2050,7 @@ var skipTests = map[string]bool{
 	"other/delete_myisam": true,
 	"other/derived": true,
 	"other/distinct": true,
-	"other/ds_mrr-big": true,
+// "other/ds_mrr-big": true, // now passes (IN subquery fix)
 	"other/explain": true,
 	"other/explain_json_all": true,
 	"other/explain_json_none": true,

@@ -15027,6 +15027,104 @@ func (e *Executor) execSubqueryScalar(sub *sqlparser.Subquery, outerRow storage.
 	return result.Rows[0][0], nil
 }
 
+// evalInSubquery handles "value IN (SELECT ...)" and "(a,b) IN (SELECT ...)"
+// leftVal is the already-evaluated scalar left side (may be nil for tuple case).
+// leftExpr is the original AST left side (used to detect tuple form).
+func (e *Executor) evalInSubquery(leftVal interface{}, leftExpr sqlparser.Expr, sub *sqlparser.Subquery, op sqlparser.ComparisonExprOperator) (interface{}, error) {
+	result, err := e.execSubquery(sub, e.correlatedRow)
+	if err != nil {
+		return nil, err
+	}
+	// Check if left is a tuple: (a,b) IN (SELECT x,y FROM ...)
+	if leftTuple, ok := leftExpr.(sqlparser.ValTuple); ok {
+		if len(result.Columns) != len(leftTuple) {
+			return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTuple)))
+		}
+		leftVals := make([]interface{}, len(leftTuple))
+		for i, lExpr := range leftTuple {
+			lv, err := e.evalExpr(lExpr)
+			if err != nil {
+				return nil, err
+			}
+			leftVals[i] = lv
+		}
+		hasNull := false
+		for _, lv := range leftVals {
+			if lv == nil {
+				hasNull = true
+				break
+			}
+		}
+		for _, row := range result.Rows {
+			if len(row) != len(leftVals) {
+				continue
+			}
+			allMatch := true
+			rowHasNull := false
+			for i := 0; i < len(leftVals); i++ {
+				if leftVals[i] == nil || row[i] == nil {
+					rowHasNull = true
+					allMatch = false
+					break
+				}
+				match, _ := compareValues(leftVals[i], row[i], sqlparser.EqualOp)
+				if !match {
+					allMatch = false
+					break
+				}
+			}
+			if allMatch {
+				if op == sqlparser.InOp {
+					return int64(1), nil
+				}
+				return int64(0), nil
+			}
+			if rowHasNull {
+				hasNull = true
+			}
+		}
+		if hasNull {
+			return nil, nil
+		}
+		if op == sqlparser.NotInOp {
+			return int64(1), nil
+		}
+		return int64(0), nil
+	}
+	// scalar IN (SELECT single_col FROM ...)
+	if len(result.Columns) > 1 {
+		return nil, mysqlError(1241, "21000", "Operand should contain 1 column(s)")
+	}
+	if leftVal == nil {
+		return nil, nil
+	}
+	hasNull := false
+	for _, row := range result.Rows {
+		if len(row) == 0 {
+			continue
+		}
+		val := row[0]
+		if val == nil {
+			hasNull = true
+			continue
+		}
+		match, _ := compareValues(leftVal, val, sqlparser.EqualOp)
+		if match {
+			if op == sqlparser.InOp {
+				return int64(1), nil
+			}
+			return int64(0), nil
+		}
+	}
+	if hasNull {
+		return nil, nil
+	}
+	if op == sqlparser.NotInOp {
+		return int64(1), nil
+	}
+	return int64(0), nil
+}
+
 func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 	// Check for bare column references FIRST (before scope errors),
 	// because MySQL returns "Unknown column" for bare names in no-FROM queries
@@ -21338,6 +21436,10 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 				}
 				return int64(0), nil
 			}
+			// Handle IN (SELECT ...) — subquery on right side
+			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+				return e.evalInSubquery(left, v.Left, sub, v.Operator)
+			}
 		}
 		// Handle ROW/tuple comparisons: ROW(a,b) = ROW(c,d) or (a,b) = (c,d)
 		leftTuple, leftIsTuple := v.Left.(sqlparser.ValTuple)
@@ -26810,6 +26912,10 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				}
 				return int64(0), nil
 			}
+			// Handle IN (SELECT ...) — subquery on right side
+			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+				return e.evalInSubquery(left, v.Left, sub, v.Operator)
+			}
 		}
 		// Handle ROW/tuple comparisons: ROW(a,b) = ROW(c,d) or (a,b) = (c,d)
 		leftTuple, leftIsTuple := v.Left.(sqlparser.ValTuple)
@@ -28304,12 +28410,67 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 	case *sqlparser.ComparisonExpr:
 		// Handle IN / NOT IN specially because the right side is a ValTuple or Subquery.
 		if v.Operator == sqlparser.InOp || v.Operator == sqlparser.NotInOp {
-			left, err := e.evalRowExpr(v.Left, row)
-			if err != nil {
-				return false, err
-			}
 			// Handle subquery on right side
 			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+				// Check if left side is a tuple: (a,b) IN (SELECT x,y FROM ...)
+				if leftTuple, ok := v.Left.(sqlparser.ValTuple); ok {
+					result, err := e.execSubquery(sub, row)
+					if err != nil {
+						return false, err
+					}
+					if len(result.Columns) != len(leftTuple) {
+						return false, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTuple)))
+					}
+					leftVals := make([]interface{}, len(leftTuple))
+					for i, lExpr := range leftTuple {
+						lv, err := e.evalRowExpr(lExpr, row)
+						if err != nil {
+							return false, err
+						}
+						leftVals[i] = lv
+					}
+					hasNull := false
+					for _, lv := range leftVals {
+						if lv == nil {
+							hasNull = true
+							break
+						}
+					}
+					for _, rrow := range result.Rows {
+						if len(rrow) != len(leftVals) {
+							continue
+						}
+						allMatch := true
+						rowHasNull := false
+						for i := 0; i < len(leftVals); i++ {
+							if leftVals[i] == nil || rrow[i] == nil {
+								rowHasNull = true
+								allMatch = false
+								break
+							}
+							match, _ := compareValues(leftVals[i], rrow[i], sqlparser.EqualOp)
+							if !match {
+								allMatch = false
+								break
+							}
+						}
+						if allMatch {
+							return v.Operator == sqlparser.InOp, nil
+						}
+						if rowHasNull {
+							hasNull = true
+						}
+					}
+					if v.Operator == sqlparser.NotInOp && !hasNull {
+						return true, nil
+					}
+					return false, nil
+				}
+				// Scalar IN (SELECT ...)
+				left, err := e.evalRowExpr(v.Left, row)
+				if err != nil {
+					return false, err
+				}
 				vals, err := e.execSubqueryValues(sub, row)
 				if err != nil {
 					return false, err
@@ -28337,6 +28498,10 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 					return false, nil
 				}
 				return v.Operator == sqlparser.NotInOp, nil
+			}
+			left, err := e.evalRowExpr(v.Left, row)
+			if err != nil {
+				return false, err
 			}
 			tuple, ok := v.Right.(sqlparser.ValTuple)
 			if !ok {
