@@ -84,7 +84,7 @@ var skipTests = map[string]bool{
 	// "gcol/gcol_partition_innodb": true, // now passes (partition ordering fixed)
 	// ALTER TABLE ADD STORED column type-range errors not implemented
 	"gcol/gcol_rejected_myisam": true,
-	"gcol/gcol_bugfixes_latin1": true, // re-skipped: latin1 byte display regression
+// "gcol/gcol_bugfixes_latin1": true, // now passes // re-skipped: latin1 byte display regression
 	// Stored procedure/function detection in gcol expressions not implemented; cascading diffs
 	"gcol/gcol_blocked_sql_funcs_innodb": true,
 	"gcol/gcol_blocked_sql_funcs_myisam": true,
@@ -291,7 +291,7 @@ var skipTests = map[string]bool{
 	// Requires InnoDB status file and lock wait timeout with partitions
 	"parts/partition_innodb_status_file": true,
 	// INT ordering differs across partitions
-	"parts/partition_int_innodb": true,
+// "parts/partition_int_innodb": true, // now passes
 	// Partition-specific error validation (duplicate list values, duplicate names)
 	"parts/partition_list_error": true,
 	// REORGANIZE PARTITION (divide) requires partition management
@@ -381,7 +381,7 @@ var skipTests = map[string]bool{
 	// === innodb suite ===
 	// Regression from global/session scope split
 	"innodb/innodb_stats":       true,
-	"innodb/innodb_stats_fetch": true,
+// "innodb/innodb_stats_fetch": true, // now passes
 	// ERROR: ALTER TABLE RENAME requires source table to exist
 	"innodb/alter_rename_existing": true,
 	// ERROR: Auto-increment duplicate entry on INSERT with 0
@@ -757,7 +757,7 @@ var skipTests = map[string]bool{
 	// "perfschema/idx_global_status": true, // now passes
 	// "perfschema/idx_global_variables": true, // now passes
 	// "perfschema/idx_hosts": true, // now passes
-	"perfschema/idx_joins": true,
+// "perfschema/idx_joins": true, // now passes
 	"perfschema/idx_keyring_keys": true,
 	// "perfschema/idx_mems_by_account_by_event_name": true, // now passes
 	// "perfschema/idx_mems_by_host_by_event_name": true, // now passes
