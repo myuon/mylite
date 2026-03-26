@@ -2704,7 +2704,7 @@ func (e *Executor) dummyExplainRow(query string) []interface{} {
 			}
 		}
 	}
-	if strings.Contains(upper, "GROUP BY") || strings.Contains(upper, "SQL_BIG_RESULT") {
+	if !strings.Contains(upper, "ORDER BY NULL") && (strings.Contains(upper, "GROUP BY") || strings.Contains(upper, "SQL_BIG_RESULT")) {
 		extra = "Using filesort"
 	}
 	if table == nil {
@@ -2825,7 +2825,12 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 	// Check for GROUP BY / SQL_BIG_RESULT
 	queryStr := sqlparser.String(sel)
 	upperQ := strings.ToUpper(queryStr)
-	if extra == nil && (strings.Contains(upperQ, "GROUP BY") || strings.Contains(upperQ, "SQL_BIG_RESULT")) {
+	// ORDER BY NULL suppresses the implicit sort from GROUP BY
+	orderByNull := len(sel.OrderBy) == 1 && func() bool {
+		_, ok := sel.OrderBy[0].Expr.(*sqlparser.NullVal)
+		return ok
+	}()
+	if extra == nil && !orderByNull && (strings.Contains(upperQ, "GROUP BY") || strings.Contains(upperQ, "SQL_BIG_RESULT")) {
 		extra = "Using filesort"
 	}
 
@@ -3447,6 +3452,11 @@ func explainExtractWhereConditions(expr sqlparser.Expr, tableName string) []expl
 		if colName != "" {
 			return []explainWhereCondition{{column: colName, isEquality: true}}
 		}
+	case *sqlparser.OrExpr:
+		// OR expressions can't be decomposed into individual column conditions,
+		// but we still need to indicate that a WHERE condition exists so that
+		// "Using where" is detected. Return a single condition with empty column.
+		return []explainWhereCondition{{column: "", isEquality: false}}
 	}
 	return nil
 }
