@@ -4159,23 +4159,36 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			}
 			return &Result{}, nil
 		}
-		// HANDLER ... OPEN: return error for performance_schema tables
+		// HANDLER ... OPEN/READ/CLOSE: return error for performance_schema tables
 		if strings.HasPrefix(upper, "HANDLER ") {
-			// Parse: HANDLER [db.]table OPEN
 			rest := strings.TrimSpace(trimmed[len("HANDLER "):])
 			parts := strings.Fields(rest)
-			if len(parts) >= 2 && strings.EqualFold(parts[len(parts)-1], "OPEN") {
-				tblRef := strings.Trim(parts[0], "`")
-				handlerDB := ""
-				handlerTbl := tblRef
-				if strings.Contains(tblRef, ".") {
-					dbTbl := strings.SplitN(tblRef, ".", 2)
-					handlerDB = strings.Trim(dbTbl[0], "`")
-					handlerTbl = strings.Trim(dbTbl[1], "`")
+			if len(parts) >= 2 {
+				lastWord := strings.ToUpper(parts[len(parts)-1])
+				isHandlerOp := lastWord == "OPEN" || lastWord == "READ" || lastWord == "CLOSE"
+				// READ can also have additional args like HANDLER t READ idx (>, =, etc.)
+				if !isHandlerOp {
+					for _, p := range parts[1:] {
+						pu := strings.ToUpper(p)
+						if pu == "READ" || pu == "CLOSE" {
+							isHandlerOp = true
+							break
+						}
+					}
 				}
-				if strings.EqualFold(handlerDB, "performance_schema") ||
-					(handlerDB == "" && strings.EqualFold(e.CurrentDB, "performance_schema")) {
-					return nil, mysqlError(1031, "HY000", fmt.Sprintf("Table storage engine for '%s' doesn't have this option", handlerTbl))
+				if isHandlerOp {
+					tblRef := strings.Trim(parts[0], "`")
+					handlerDB := ""
+					handlerTbl := tblRef
+					if strings.Contains(tblRef, ".") {
+						dbTbl := strings.SplitN(tblRef, ".", 2)
+						handlerDB = strings.Trim(dbTbl[0], "`")
+						handlerTbl = strings.Trim(dbTbl[1], "`")
+					}
+					if strings.EqualFold(handlerDB, "performance_schema") ||
+						(handlerDB == "" && strings.EqualFold(e.CurrentDB, "performance_schema")) {
+						return nil, mysqlError(1031, "HY000", fmt.Sprintf("Table storage engine for '%s' doesn't have this option", handlerTbl))
+					}
 				}
 			}
 			return &Result{}, nil

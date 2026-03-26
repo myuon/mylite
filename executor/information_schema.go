@@ -2245,15 +2245,61 @@ func (e *Executor) execPerfSchemaInsert(stmt *sqlparser.Insert, tableName string
 					newRow["TIMED"] = "YES"
 				}
 			}
+			// Validate ENABLED/HISTORY and OBJECT_TYPE
 			if tableName == "setup_actors" {
+				if enabled, ok := newRow["ENABLED"].(string); ok {
+					if !isPerfSchemaEnumValid(enabled) {
+						return nil, mysqlError(1265, "01000", "Data truncated for column 'ENABLED' at row 1")
+					}
+					newRow["ENABLED"] = strings.ToUpper(enabled)
+				}
+				if history, ok := newRow["HISTORY"].(string); ok {
+					if !isPerfSchemaEnumValid(history) {
+						return nil, mysqlError(1265, "01000", "Data truncated for column 'HISTORY' at row 1")
+					}
+					newRow["HISTORY"] = strings.ToUpper(history)
+				}
+			} else {
+				if objType, ok := newRow["OBJECT_TYPE"].(string); ok {
+					if !validSetupObjectTypes[strings.ToUpper(objType)] {
+						return nil, mysqlError(1452, "23000", "Cannot add or update a child row: a foreign key constraint fails ()")
+					}
+					newRow["OBJECT_TYPE"] = strings.ToUpper(objType)
+				}
+			}
+
+			// Check for duplicate key
+			if tableName == "setup_actors" {
+				currentRows := e.getSetupActorsRows()
+				host := fmt.Sprintf("%v", newRow["HOST"])
+				user := fmt.Sprintf("%v", newRow["USER"])
+				role := fmt.Sprintf("%v", newRow["ROLE"])
+				for _, existing := range currentRows {
+					if fmt.Sprintf("%v", existing["HOST"]) == host &&
+						fmt.Sprintf("%v", existing["USER"]) == user &&
+						fmt.Sprintf("%v", existing["ROLE"]) == role {
+						return nil, mysqlError(1022, "23000", "Can't write; duplicate key in table 'setup_actors'")
+					}
+				}
 				if !e.psSetupActorsInit {
-					e.psSetupActors = append([]storage.Row{}, e.perfSchemaSetupActors()...)
+					e.psSetupActors = append([]storage.Row{}, currentRows...)
 					e.psSetupActorsInit = true
 				}
 				e.psSetupActors = append(e.psSetupActors, newRow)
 			} else {
+				currentRows := e.getSetupObjectsRows()
+				objType := fmt.Sprintf("%v", newRow["OBJECT_TYPE"])
+				objSchema := fmt.Sprintf("%v", newRow["OBJECT_SCHEMA"])
+				objName := fmt.Sprintf("%v", newRow["OBJECT_NAME"])
+				for _, existing := range currentRows {
+					if fmt.Sprintf("%v", existing["OBJECT_TYPE"]) == objType &&
+						fmt.Sprintf("%v", existing["OBJECT_SCHEMA"]) == objSchema &&
+						fmt.Sprintf("%v", existing["OBJECT_NAME"]) == objName {
+						return nil, mysqlError(1022, "23000", "Can't write; duplicate key in table 'setup_objects'")
+					}
+				}
 				if !e.psSetupObjectsInit {
-					e.psSetupObjects = append([]storage.Row{}, e.perfSchemaSetupObjectsDefault()...)
+					e.psSetupObjects = append([]storage.Row{}, currentRows...)
 					e.psSetupObjectsInit = true
 				}
 				e.psSetupObjects = append(e.psSetupObjects, newRow)
