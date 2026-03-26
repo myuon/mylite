@@ -280,6 +280,19 @@ type Executor struct {
 	// psTruncated tracks performance_schema tables that have been TRUNCATED.
 	// These tables return empty result sets until data is re-inserted.
 	psTruncated map[string]bool
+	// psSetupActors holds the in-memory rows for performance_schema.setup_actors.
+	// nil means "use default rows"; non-nil means the rows have been modified.
+	psSetupActors []storage.Row
+	// psSetupActorsInit tracks whether psSetupActors has been explicitly set.
+	psSetupActorsInit bool
+	// psSetupObjects holds the in-memory rows for performance_schema.setup_objects.
+	psSetupObjects []storage.Row
+	// psSetupObjectsInit tracks whether psSetupObjects has been explicitly set.
+	psSetupObjectsInit bool
+	// psThreadInstrumented tracks per-connection INSTRUMENTED column for threads table.
+	psThreadInstrumented map[int64]string
+	// psThreadHistory tracks per-connection HISTORY column for threads table.
+	psThreadHistory map[int64]string
 	// processList is a shared registry of active connections and their states.
 	// It is shared across all executor instances (connections).
 	processList *ProcessList
@@ -4156,6 +4169,40 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			}
 			return &Result{}, nil
 		}
+		// HANDLER ... OPEN/READ/CLOSE: return error for performance_schema tables
+		if strings.HasPrefix(upper, "HANDLER ") {
+			rest := strings.TrimSpace(trimmed[len("HANDLER "):])
+			parts := strings.Fields(rest)
+			if len(parts) >= 2 {
+				lastWord := strings.ToUpper(parts[len(parts)-1])
+				isHandlerOp := lastWord == "OPEN" || lastWord == "READ" || lastWord == "CLOSE"
+				// READ can also have additional args like HANDLER t READ idx (>, =, etc.)
+				if !isHandlerOp {
+					for _, p := range parts[1:] {
+						pu := strings.ToUpper(p)
+						if pu == "READ" || pu == "CLOSE" {
+							isHandlerOp = true
+							break
+						}
+					}
+				}
+				if isHandlerOp {
+					tblRef := strings.Trim(parts[0], "`")
+					handlerDB := ""
+					handlerTbl := tblRef
+					if strings.Contains(tblRef, ".") {
+						dbTbl := strings.SplitN(tblRef, ".", 2)
+						handlerDB = strings.Trim(dbTbl[0], "`")
+						handlerTbl = strings.Trim(dbTbl[1], "`")
+					}
+					if strings.EqualFold(handlerDB, "performance_schema") ||
+						(handlerDB == "" && strings.EqualFold(e.CurrentDB, "performance_schema")) {
+						return nil, mysqlError(1031, "HY000", fmt.Sprintf("Table storage engine for '%s' doesn't have this option", handlerTbl))
+					}
+				}
+			}
+			return &Result{}, nil
+		}
 		if strings.HasPrefix(upper, "CREATE EVENT") ||
 			strings.HasPrefix(upper, "DROP EVENT") ||
 			strings.HasPrefix(upper, "CREATE USER") ||
@@ -4165,7 +4212,6 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			strings.HasPrefix(upper, "REVOKE ") ||
 			strings.HasPrefix(upper, "FLUSH ") ||
 			strings.HasPrefix(upper, "RESET ") ||
-			strings.HasPrefix(upper, "HANDLER ") ||
 			strings.HasPrefix(upper, "INSTALL ") ||
 			strings.HasPrefix(upper, "UNINSTALL ") ||
 			strings.HasPrefix(upper, "CHECKSUM ") ||
@@ -9728,11 +9774,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		if lowerTable != "setup_actors" && lowerTable != "setup_objects" {
 			return nil, mysqlError(1142, "42000", fmt.Sprintf("INSERT command denied to user 'root'@'localhost' for table '%s'", tableName))
 		}
-		// For setup_actors/setup_objects, silently succeed and clear truncated flag
-		if e.psTruncated != nil {
-			delete(e.psTruncated, lowerTable)
-		}
-		return &Result{AffectedRows: 1}, nil
+		return e.execPerfSchemaInsert(stmt, lowerTable)
 	}
 
 	// Gap lock simulation: in REPEATABLE READ (or stricter), if another
@@ -14286,16 +14328,22 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 				// key that matches case-insensitively, use that key's case
 				// (needed for information_schema columns which are UPPERCASE).
 				// Prefer exact case match to avoid non-deterministic map iteration.
+				// Only apply to information_schema rows (marked with __is_info_schema__),
+				// not performance_schema rows where MySQL preserves user's casing.
 				if len(rows) > 0 {
-					upperName := strings.ToUpper(name)
-					// First try exact match
-					if _, ok := rows[0][name]; ok {
-						// name already matches exactly, keep it
-					} else {
-						for k := range rows[0] {
-							if strings.ToUpper(k) == upperName && !strings.Contains(k, ".") {
-								name = k
-								break
+					_, isIS := rows[0]["__is_info_schema__"]
+					_, preserveCase := rows[0]["__ps_preserve_col_case__"]
+					if isIS && !preserveCase {
+						upperName := strings.ToUpper(name)
+						// First try exact match
+						if _, ok := rows[0][name]; ok {
+							// name already matches exactly, keep it
+						} else {
+							for k := range rows[0] {
+								if strings.ToUpper(k) == upperName && !strings.Contains(k, ".") {
+									name = k
+									break
+								}
 							}
 						}
 					}
@@ -14932,25 +14980,7 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		switch lowerTable {
 		case "setup_instruments", "setup_consumers", "setup_threads", "threads",
 			"setup_actors", "setup_objects":
-			// Writable performance_schema tables: check that only allowed columns are updated
-			allowedCols := map[string]map[string]bool{
-				"setup_consumers":   {"enabled": true},
-				"setup_instruments": {"enabled": true, "timed": true},
-				"setup_actors":      {"host": true, "user": true, "role": true, "enabled": true, "history": true},
-				"setup_objects":     {"object_type": true, "object_schema": true, "object_name": true, "enabled": true, "timed": true},
-				"setup_threads":     {"enabled": true, "instrumented": true, "history": true},
-				"threads":           {"instrumented": true, "history": true},
-			}
-			if allowed, ok := allowedCols[lowerTable]; ok {
-				for _, expr := range stmt.Exprs {
-					colName := strings.ToLower(expr.Name.Name.String())
-					if !allowed[colName] {
-						return nil, mysqlError(1683, "HY000", "Invalid performance_schema usage.")
-					}
-				}
-			}
-			// Silently succeed for valid updates
-			return &Result{AffectedRows: 0}, nil
+			return e.execPerfSchemaUpdate(stmt, lowerTable)
 		default:
 			return nil, mysqlError(1142, "42000", fmt.Sprintf("UPDATE command denied to user 'root'@'localhost' for table '%s'", tableName))
 		}
@@ -15480,8 +15510,7 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 	if strings.EqualFold(deleteDB, "performance_schema") {
 		lowerTable := strings.ToLower(tableName)
 		if lowerTable == "setup_actors" || lowerTable == "setup_objects" {
-			// Writable performance_schema tables: silently succeed
-			return &Result{AffectedRows: 0}, nil
+			return e.execPerfSchemaDelete(stmt, lowerTable)
 		}
 		return nil, mysqlError(1142, "42000", fmt.Sprintf("DELETE command denied to user 'root'@'localhost' for table '%s'", tableName))
 	}
@@ -29588,11 +29617,22 @@ func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, er
 		if perfSchemaTruncateDenied(tableName) {
 			return nil, mysqlError(1142, "42000", fmt.Sprintf("DROP command denied to user 'root'@'localhost' for table '%s'", tableName))
 		}
-		// Track truncated PS tables so they return empty result sets
-		if e.psTruncated == nil {
-			e.psTruncated = make(map[string]bool)
+		lowerTable := strings.ToLower(tableName)
+		// For writable tables with in-memory state, clear the rows
+		switch lowerTable {
+		case "setup_actors":
+			e.psSetupActors = []storage.Row{}
+			e.psSetupActorsInit = true
+		case "setup_objects":
+			e.psSetupObjects = []storage.Row{}
+			e.psSetupObjectsInit = true
+		default:
+			// Track truncated PS tables so they return empty result sets
+			if e.psTruncated == nil {
+				e.psTruncated = make(map[string]bool)
+			}
+			e.psTruncated[lowerTable] = true
 		}
-		e.psTruncated[strings.ToLower(tableName)] = true
 		return &Result{AffectedRows: 0, IsResultSet: false}, nil
 	}
 	tbl, err := e.Storage.GetTable(dbName, tableName)
