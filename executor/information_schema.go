@@ -9,6 +9,7 @@ import (
 
 	catalogPkg "github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 func asInt64Or(v interface{}, fallback int64) int64 {
@@ -560,50 +561,21 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 			}
 		}
 	case "setup_actors":
-		if e.psTruncated != nil && e.psTruncated["setup_actors"] {
-			rawRows = []storage.Row{}
+		if e.psSetupActorsInit {
+			rawRows = e.psSetupActors
 		} else {
 			rawRows = e.perfSchemaSetupActors()
 		}
 	case "setup_objects":
-		if e.psTruncated != nil && e.psTruncated["setup_objects"] {
-			rawRows = []storage.Row{}
-			break
-		}
-		// If performance_schema_setup_objects_size=0, return empty
-		if v, ok := e.startupVars["performance_schema_setup_objects_size"]; ok && v == "0" {
-			rawRows = []storage.Row{}
-			break
-		}
-		rawRows = []storage.Row{
-			{"OBJECT_TYPE": "EVENT", "OBJECT_SCHEMA": "mysql", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
-			{"OBJECT_TYPE": "EVENT", "OBJECT_SCHEMA": "performance_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
-			{"OBJECT_TYPE": "EVENT", "OBJECT_SCHEMA": "information_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
-			{"OBJECT_TYPE": "EVENT", "OBJECT_SCHEMA": "%", "OBJECT_NAME": "%", "ENABLED": "YES", "TIMED": "YES"},
-			{"OBJECT_TYPE": "FUNCTION", "OBJECT_SCHEMA": "mysql", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
-			{"OBJECT_TYPE": "FUNCTION", "OBJECT_SCHEMA": "performance_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
-			{"OBJECT_TYPE": "FUNCTION", "OBJECT_SCHEMA": "information_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
-			{"OBJECT_TYPE": "FUNCTION", "OBJECT_SCHEMA": "%", "OBJECT_NAME": "%", "ENABLED": "YES", "TIMED": "YES"},
-			{"OBJECT_TYPE": "PROCEDURE", "OBJECT_SCHEMA": "mysql", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
-			{"OBJECT_TYPE": "PROCEDURE", "OBJECT_SCHEMA": "performance_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
-			{"OBJECT_TYPE": "PROCEDURE", "OBJECT_SCHEMA": "information_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
-			{"OBJECT_TYPE": "PROCEDURE", "OBJECT_SCHEMA": "%", "OBJECT_NAME": "%", "ENABLED": "YES", "TIMED": "YES"},
-			{"OBJECT_TYPE": "TABLE", "OBJECT_SCHEMA": "mysql", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
-			{"OBJECT_TYPE": "TABLE", "OBJECT_SCHEMA": "performance_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
-			{"OBJECT_TYPE": "TABLE", "OBJECT_SCHEMA": "information_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
-			{"OBJECT_TYPE": "TABLE", "OBJECT_SCHEMA": "%", "OBJECT_NAME": "%", "ENABLED": "YES", "TIMED": "YES"},
-			{"OBJECT_TYPE": "TRIGGER", "OBJECT_SCHEMA": "mysql", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
-			{"OBJECT_TYPE": "TRIGGER", "OBJECT_SCHEMA": "performance_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
-			{"OBJECT_TYPE": "TRIGGER", "OBJECT_SCHEMA": "information_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
-			{"OBJECT_TYPE": "TRIGGER", "OBJECT_SCHEMA": "%", "OBJECT_NAME": "%", "ENABLED": "YES", "TIMED": "YES"},
+		if e.psSetupObjectsInit {
+			rawRows = e.psSetupObjects
+		} else {
+			rawRows = e.perfSchemaSetupObjectsDefault()
 		}
 	case "setup_instruments":
 		rawRows = e.perfSchemaSetupInstruments()
 	case "setup_threads":
-		rawRows = []storage.Row{
-			{"NAME": "thread/sql/main", "ENABLED": "YES", "HISTORY": "YES", "PROPERTIES": "singleton", "VOLATILITY": int64(0), "DOCUMENTATION": nil},
-			{"NAME": "thread/sql/one_connection", "ENABLED": "YES", "HISTORY": "YES", "PROPERTIES": "user", "VOLATILITY": int64(0), "DOCUMENTATION": nil},
-		}
+		rawRows = e.perfSchemaSetupThreads()
 	case "persisted_variables":
 		rawRows = []storage.Row{}
 	case "variables_info":
@@ -875,11 +847,18 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		}
 	}
 
+	// Determine if this is a performance_schema table (columns use user casing, not uppercase)
+	isPerfSchema := strings.Contains(strings.ToLower(alias), "performance_schema")
+
 	result := make([]storage.Row, len(rawRows))
 	for i, row := range rawRows {
 		newRow := make(storage.Row, len(row)*3+1)
 		// Mark row as INFORMATION_SCHEMA for case-insensitive WHERE comparison
 		newRow["__is_info_schema__"] = true
+		// Performance_schema tables preserve user-specified column casing in SELECT
+		if isPerfSchema {
+			newRow["__ps_preserve_col_case__"] = true
+		}
 		for k, v := range row {
 			newRow[k] = v
 			newRow[alias+"."+k] = v
@@ -2035,6 +2014,14 @@ func (e *Executor) perfSchemaThreads() []storage.Row {
 	// Add a row for the current user connection
 	connID := e.connectionID
 	if connID > 0 {
+		instrumented := "YES"
+		if v, ok := e.psThreadInstrumented[connID]; ok {
+			instrumented = v
+		}
+		history := "YES"
+		if v, ok := e.psThreadHistory[connID]; ok {
+			history = v
+		}
 		rows = append(rows, storage.Row{
 			"THREAD_ID":           connID + 1, // thread_id = connID + 1 by convention
 			"NAME":                "thread/sql/one_connection",
@@ -2049,8 +2036,8 @@ func (e *Executor) perfSchemaThreads() []storage.Row {
 			"PROCESSLIST_INFO":    nil,
 			"PARENT_THREAD_ID":    int64(1),
 			"ROLE":                nil,
-			"INSTRUMENTED":        "YES",
-			"HISTORY":             "YES",
+			"INSTRUMENTED":        instrumented,
+			"HISTORY":             history,
 			"CONNECTION_TYPE":     "TCP/IP",
 			"THREAD_OS_ID":        int64(0),
 			"RESOURCE_GROUP":      "USR_default",
@@ -2070,25 +2057,589 @@ func (e *Executor) perfSchemaSetupActors() []storage.Row {
 	}
 }
 
+// perfSchemaSetupThreads returns the rows for performance_schema.setup_threads matching MySQL 8.0.
+func (e *Executor) perfSchemaSetupThreads() []storage.Row {
+	type threadDef struct {
+		name, properties string
+	}
+	threads := []threadDef{
+		{"thread/innodb/buf_dump_thread", ""},
+		{"thread/innodb/buf_resize_thread", ""},
+		{"thread/innodb/clone_ddl_thread", ""},
+		{"thread/innodb/clone_gtid_thread", ""},
+		{"thread/innodb/dict_stats_thread", ""},
+		{"thread/innodb/fts_optimize_thread", ""},
+		{"thread/innodb/fts_parallel_merge_thread", ""},
+		{"thread/innodb/fts_parallel_tokenization_thread", ""},
+		{"thread/innodb/io_handler_thread", ""},
+		{"thread/innodb/io_ibuf_thread", ""},
+		{"thread/innodb/io_log_thread", ""},
+		{"thread/innodb/io_read_thread", ""},
+		{"thread/innodb/io_write_thread", ""},
+		{"thread/innodb/log_writer_thread", ""},
+		{"thread/innodb/page_flush_thread", ""},
+		{"thread/innodb/srv_error_monitor_thread", ""},
+		{"thread/innodb/srv_lock_timeout_thread", ""},
+		{"thread/innodb/srv_master_thread", ""},
+		{"thread/innodb/srv_monitor_thread", ""},
+		{"thread/innodb/srv_purge_thread", ""},
+		{"thread/innodb/srv_worker_thread", ""},
+		{"thread/innodb/trx_recovery_rollback_thread", ""},
+		{"thread/sql/compress_gtid_table", "singleton"},
+		{"thread/sql/event_scheduler", "singleton"},
+		{"thread/sql/event_worker", ""},
+		{"thread/sql/main", "singleton"},
+		{"thread/sql/one_connection", "user"},
+		{"thread/sql/signal_handler", "singleton"},
+	}
+
+	// Check if thread classes are disabled
+	if v, ok := e.startupVars["performance_schema_max_thread_classes"]; ok && v == "0" {
+		return []storage.Row{}
+	}
+
+	rows := make([]storage.Row, 0, len(threads))
+	for _, t := range threads {
+		rows = append(rows, storage.Row{
+			"NAME": t.name, "ENABLED": "YES", "HISTORY": "YES",
+			"PROPERTIES": t.properties, "VOLATILITY": int64(0), "DOCUMENTATION": nil,
+		})
+	}
+	return rows
+}
+
+// perfSchemaSetupObjectsDefault returns the default rows for performance_schema.setup_objects.
+func (e *Executor) perfSchemaSetupObjectsDefault() []storage.Row {
+	// If performance_schema_setup_objects_size=0, return empty
+	if v, ok := e.startupVars["performance_schema_setup_objects_size"]; ok && v == "0" {
+		return []storage.Row{}
+	}
+	return []storage.Row{
+		{"OBJECT_TYPE": "EVENT", "OBJECT_SCHEMA": "mysql", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+		{"OBJECT_TYPE": "EVENT", "OBJECT_SCHEMA": "performance_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+		{"OBJECT_TYPE": "EVENT", "OBJECT_SCHEMA": "information_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+		{"OBJECT_TYPE": "EVENT", "OBJECT_SCHEMA": "%", "OBJECT_NAME": "%", "ENABLED": "YES", "TIMED": "YES"},
+		{"OBJECT_TYPE": "FUNCTION", "OBJECT_SCHEMA": "mysql", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+		{"OBJECT_TYPE": "FUNCTION", "OBJECT_SCHEMA": "performance_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+		{"OBJECT_TYPE": "FUNCTION", "OBJECT_SCHEMA": "information_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+		{"OBJECT_TYPE": "FUNCTION", "OBJECT_SCHEMA": "%", "OBJECT_NAME": "%", "ENABLED": "YES", "TIMED": "YES"},
+		{"OBJECT_TYPE": "PROCEDURE", "OBJECT_SCHEMA": "mysql", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+		{"OBJECT_TYPE": "PROCEDURE", "OBJECT_SCHEMA": "performance_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+		{"OBJECT_TYPE": "PROCEDURE", "OBJECT_SCHEMA": "information_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+		{"OBJECT_TYPE": "PROCEDURE", "OBJECT_SCHEMA": "%", "OBJECT_NAME": "%", "ENABLED": "YES", "TIMED": "YES"},
+		{"OBJECT_TYPE": "TABLE", "OBJECT_SCHEMA": "mysql", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+		{"OBJECT_TYPE": "TABLE", "OBJECT_SCHEMA": "performance_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+		{"OBJECT_TYPE": "TABLE", "OBJECT_SCHEMA": "information_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+		{"OBJECT_TYPE": "TABLE", "OBJECT_SCHEMA": "%", "OBJECT_NAME": "%", "ENABLED": "YES", "TIMED": "YES"},
+		{"OBJECT_TYPE": "TRIGGER", "OBJECT_SCHEMA": "mysql", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+		{"OBJECT_TYPE": "TRIGGER", "OBJECT_SCHEMA": "performance_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+		{"OBJECT_TYPE": "TRIGGER", "OBJECT_SCHEMA": "information_schema", "OBJECT_NAME": "%", "ENABLED": "NO", "TIMED": "NO"},
+		{"OBJECT_TYPE": "TRIGGER", "OBJECT_SCHEMA": "%", "OBJECT_NAME": "%", "ENABLED": "YES", "TIMED": "YES"},
+	}
+}
+
+// getSetupActorsRows returns the current setup_actors rows, initializing from defaults if needed.
+func (e *Executor) getSetupActorsRows() []storage.Row {
+	if e.psSetupActorsInit {
+		return e.psSetupActors
+	}
+	return e.perfSchemaSetupActors()
+}
+
+// getSetupObjectsRows returns the current setup_objects rows, initializing from defaults if needed.
+func (e *Executor) getSetupObjectsRows() []storage.Row {
+	if e.psSetupObjectsInit {
+		return e.psSetupObjects
+	}
+	return e.perfSchemaSetupObjectsDefault()
+}
+
+// isPerfSchemaEnumValid checks if a value is valid for YES/NO enum columns.
+func isPerfSchemaEnumValid(val string) bool {
+	return strings.EqualFold(val, "YES") || strings.EqualFold(val, "NO")
+}
+
+// validSetupObjectTypes are the allowed OBJECT_TYPE values for setup_objects.
+var validSetupObjectTypes = map[string]bool{
+	"EVENT": true, "FUNCTION": true, "PROCEDURE": true, "TABLE": true, "TRIGGER": true,
+}
+
+// execPerfSchemaInsert handles INSERT into performance_schema.setup_actors or setup_objects.
+func (e *Executor) execPerfSchemaInsert(stmt *sqlparser.Insert, tableName string) (*Result, error) {
+	// Get column names from the INSERT statement
+	colNames := make([]string, len(stmt.Columns))
+	for i, col := range stmt.Columns {
+		colNames[i] = strings.ToUpper(col.String())
+	}
+
+	// Handle INSERT ... SELECT (for restoring from backup table)
+	if sel, ok := stmt.Rows.(*sqlparser.Select); ok {
+		selResult, err := e.execSelect(sel)
+		if err != nil {
+			return nil, err
+		}
+		if selResult == nil || !selResult.IsResultSet {
+			return &Result{AffectedRows: 0}, nil
+		}
+		affected := uint64(0)
+		for _, row := range selResult.Rows {
+			newRow := storage.Row{}
+			if len(colNames) > 0 {
+				for i, cn := range colNames {
+					if i < len(row) {
+						if row[i] != nil {
+							newRow[cn] = fmt.Sprintf("%v", row[i])
+						} else {
+							newRow[cn] = "%"
+						}
+					}
+				}
+			} else {
+				// No columns specified - map by result column order
+				if tableName == "setup_actors" {
+					actorCols := []string{"HOST", "USER", "ROLE", "ENABLED", "HISTORY"}
+					for i, cn := range actorCols {
+						if i < len(row) {
+							if row[i] != nil {
+								newRow[cn] = fmt.Sprintf("%v", row[i])
+							} else {
+								newRow[cn] = "%"
+							}
+						}
+					}
+				} else { // setup_objects
+					objCols := []string{"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "ENABLED", "TIMED"}
+					for i, cn := range objCols {
+						if i < len(row) {
+							if row[i] != nil {
+								newRow[cn] = fmt.Sprintf("%v", row[i])
+							} else {
+								newRow[cn] = "%"
+							}
+						}
+					}
+				}
+			}
+			// Set defaults for missing columns
+			if tableName == "setup_actors" {
+				if _, ok := newRow["HOST"]; !ok {
+					newRow["HOST"] = "%"
+				}
+				if _, ok := newRow["USER"]; !ok {
+					newRow["USER"] = "%"
+				}
+				if _, ok := newRow["ROLE"]; !ok {
+					newRow["ROLE"] = "%"
+				}
+				if _, ok := newRow["ENABLED"]; !ok {
+					newRow["ENABLED"] = "YES"
+				}
+				if _, ok := newRow["HISTORY"]; !ok {
+					newRow["HISTORY"] = "YES"
+				}
+			} else {
+				if _, ok := newRow["ENABLED"]; !ok {
+					newRow["ENABLED"] = "YES"
+				}
+				if _, ok := newRow["TIMED"]; !ok {
+					newRow["TIMED"] = "YES"
+				}
+			}
+			if tableName == "setup_actors" {
+				if !e.psSetupActorsInit {
+					e.psSetupActors = append([]storage.Row{}, e.perfSchemaSetupActors()...)
+					e.psSetupActorsInit = true
+				}
+				e.psSetupActors = append(e.psSetupActors, newRow)
+			} else {
+				if !e.psSetupObjectsInit {
+					e.psSetupObjects = append([]storage.Row{}, e.perfSchemaSetupObjectsDefault()...)
+					e.psSetupObjectsInit = true
+				}
+				e.psSetupObjects = append(e.psSetupObjects, newRow)
+			}
+			affected++
+		}
+		return &Result{AffectedRows: affected}, nil
+	}
+
+	// Handle INSERT ... VALUES or INSERT ... SET
+	rows, ok := stmt.Rows.(sqlparser.Values)
+	if !ok {
+		return &Result{AffectedRows: 1}, nil
+	}
+
+	affected := uint64(0)
+	for _, valTuple := range rows {
+		newRow := storage.Row{}
+		if len(colNames) > 0 {
+			for i, cn := range colNames {
+				if i < len(valTuple) {
+					val, err := e.evalExpr(valTuple[i])
+					if err != nil {
+						return nil, err
+					}
+					if val != nil {
+						newRow[cn] = fmt.Sprintf("%v", val)
+					} else {
+						newRow[cn] = "%"
+					}
+				}
+			}
+		} else {
+			// Positional values
+			if tableName == "setup_actors" {
+				actorCols := []string{"HOST", "USER", "ROLE", "ENABLED", "HISTORY"}
+				for i, cn := range actorCols {
+					if i < len(valTuple) {
+						val, err := e.evalExpr(valTuple[i])
+						if err != nil {
+							return nil, err
+						}
+						if val != nil {
+							newRow[cn] = fmt.Sprintf("%v", val)
+						} else {
+							newRow[cn] = "%"
+						}
+					}
+				}
+			} else {
+				objCols := []string{"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "ENABLED", "TIMED"}
+				for i, cn := range objCols {
+					if i < len(valTuple) {
+						val, err := e.evalExpr(valTuple[i])
+						if err != nil {
+							return nil, err
+						}
+						if val != nil {
+							newRow[cn] = fmt.Sprintf("%v", val)
+						} else {
+							newRow[cn] = "%"
+						}
+					}
+				}
+			}
+		}
+
+		// Set defaults for missing columns
+		if tableName == "setup_actors" {
+			if _, ok := newRow["HOST"]; !ok {
+				newRow["HOST"] = "%"
+			}
+			if _, ok := newRow["USER"]; !ok {
+				newRow["USER"] = "%"
+			}
+			if _, ok := newRow["ROLE"]; !ok {
+				newRow["ROLE"] = "%"
+			}
+			if _, ok := newRow["ENABLED"]; !ok {
+				newRow["ENABLED"] = "YES"
+			}
+			if _, ok := newRow["HISTORY"]; !ok {
+				newRow["HISTORY"] = "YES"
+			}
+			// Validate ENABLED/HISTORY columns
+			if enabled, ok := newRow["ENABLED"].(string); ok {
+				if !isPerfSchemaEnumValid(enabled) {
+					return nil, mysqlError(1265, "01000", "Data truncated for column 'ENABLED' at row 1")
+				}
+				newRow["ENABLED"] = strings.ToUpper(enabled)
+			}
+			if history, ok := newRow["HISTORY"].(string); ok {
+				if !isPerfSchemaEnumValid(history) {
+					return nil, mysqlError(1265, "01000", "Data truncated for column 'HISTORY' at row 1")
+				}
+				newRow["HISTORY"] = strings.ToUpper(history)
+			}
+		} else { // setup_objects
+			if _, ok := newRow["ENABLED"]; !ok {
+				newRow["ENABLED"] = "YES"
+			}
+			if _, ok := newRow["TIMED"]; !ok {
+				newRow["TIMED"] = "YES"
+			}
+			// Validate OBJECT_TYPE
+			if objType, ok := newRow["OBJECT_TYPE"].(string); ok {
+				if !validSetupObjectTypes[strings.ToUpper(objType)] {
+					return nil, mysqlError(1452, "23000", "Cannot add or update a child row: a foreign key constraint fails ()")
+				}
+				newRow["OBJECT_TYPE"] = strings.ToUpper(objType)
+			}
+		}
+
+		// Check for duplicate key
+		if tableName == "setup_actors" {
+			currentRows := e.getSetupActorsRows()
+			host := fmt.Sprintf("%v", newRow["HOST"])
+			user := fmt.Sprintf("%v", newRow["USER"])
+			role := fmt.Sprintf("%v", newRow["ROLE"])
+			for _, existing := range currentRows {
+				if fmt.Sprintf("%v", existing["HOST"]) == host &&
+					fmt.Sprintf("%v", existing["USER"]) == user &&
+					fmt.Sprintf("%v", existing["ROLE"]) == role {
+					return nil, mysqlError(1022, "23000", "Can't write; duplicate key in table 'setup_actors'")
+				}
+			}
+			if !e.psSetupActorsInit {
+				e.psSetupActors = append([]storage.Row{}, currentRows...)
+				e.psSetupActorsInit = true
+			}
+			e.psSetupActors = append(e.psSetupActors, newRow)
+		} else {
+			currentRows := e.getSetupObjectsRows()
+			objType := fmt.Sprintf("%v", newRow["OBJECT_TYPE"])
+			objSchema := fmt.Sprintf("%v", newRow["OBJECT_SCHEMA"])
+			objName := fmt.Sprintf("%v", newRow["OBJECT_NAME"])
+			for _, existing := range currentRows {
+				if fmt.Sprintf("%v", existing["OBJECT_TYPE"]) == objType &&
+					fmt.Sprintf("%v", existing["OBJECT_SCHEMA"]) == objSchema &&
+					fmt.Sprintf("%v", existing["OBJECT_NAME"]) == objName {
+					return nil, mysqlError(1022, "23000", "Can't write; duplicate key in table 'setup_objects'")
+				}
+			}
+			if !e.psSetupObjectsInit {
+				e.psSetupObjects = append([]storage.Row{}, currentRows...)
+				e.psSetupObjectsInit = true
+			}
+			e.psSetupObjects = append(e.psSetupObjects, newRow)
+		}
+		affected++
+	}
+	return &Result{AffectedRows: affected}, nil
+}
+
+// execPerfSchemaDelete handles DELETE from performance_schema.setup_actors or setup_objects.
+func (e *Executor) execPerfSchemaDelete(stmt *sqlparser.Delete, tableName string) (*Result, error) {
+	var currentRows []storage.Row
+	if tableName == "setup_actors" {
+		currentRows = e.getSetupActorsRows()
+	} else {
+		currentRows = e.getSetupObjectsRows()
+	}
+
+	// If no WHERE clause, delete all rows
+	if stmt.Where == nil {
+		affected := uint64(len(currentRows))
+		if tableName == "setup_actors" {
+			e.psSetupActors = []storage.Row{}
+			e.psSetupActorsInit = true
+		} else {
+			e.psSetupObjects = []storage.Row{}
+			e.psSetupObjectsInit = true
+		}
+		return &Result{AffectedRows: affected}, nil
+	}
+
+	// Filter rows based on WHERE clause
+	remaining := make([]storage.Row, 0, len(currentRows))
+	affected := uint64(0)
+	for _, row := range currentRows {
+		match, err := e.evalWhere(stmt.Where.Expr, row)
+		if err != nil {
+			return nil, err
+		}
+		if match {
+			affected++
+		} else {
+			remaining = append(remaining, row)
+		}
+	}
+	if tableName == "setup_actors" {
+		e.psSetupActors = remaining
+		e.psSetupActorsInit = true
+	} else {
+		e.psSetupObjects = remaining
+		e.psSetupObjectsInit = true
+	}
+	return &Result{AffectedRows: affected}, nil
+}
+
+// execPerfSchemaUpdate handles UPDATE on writable performance_schema tables.
+func (e *Executor) execPerfSchemaUpdate(stmt *sqlparser.Update, tableName string) (*Result, error) {
+	// Check allowed columns
+	allowedCols := map[string]map[string]bool{
+		"setup_consumers":   {"enabled": true},
+		"setup_instruments": {"enabled": true, "timed": true},
+		"setup_actors":      {"enabled": true, "history": true},
+		"setup_objects":     {"enabled": true, "timed": true},
+		"setup_threads":     {"enabled": true, "history": true},
+		"threads":           {"instrumented": true, "history": true},
+	}
+	if allowed, ok := allowedCols[tableName]; ok {
+		for _, expr := range stmt.Exprs {
+			colName := strings.ToLower(expr.Name.Name.String())
+			if !allowed[colName] {
+				return nil, mysqlError(1683, "HY000", "Invalid performance_schema usage.")
+			}
+		}
+	}
+
+	// Validate YES/NO enum values and NULL checks for each update expression
+	for _, expr := range stmt.Exprs {
+		colName := strings.ToUpper(expr.Name.Name.String())
+		val, err := e.evalExpr(expr.Expr)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", colName))
+		}
+		strVal := fmt.Sprintf("%v", val)
+		if !isPerfSchemaEnumValid(strVal) {
+			return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", colName))
+		}
+	}
+
+	// For setup_actors, update the in-memory rows
+	if tableName == "setup_actors" {
+		currentRows := e.getSetupActorsRows()
+		updated := make([]storage.Row, len(currentRows))
+		affected := uint64(0)
+		for i, row := range currentRows {
+			match := true
+			if stmt.Where != nil {
+				m, err := e.evalWhere(stmt.Where.Expr, row)
+				if err != nil {
+					return nil, err
+				}
+				match = m
+			}
+			newRow := make(storage.Row, len(row))
+			for k, v := range row {
+				newRow[k] = v
+			}
+			if match {
+				for _, expr := range stmt.Exprs {
+					colName := strings.ToUpper(expr.Name.Name.String())
+					val, _ := e.evalExpr(expr.Expr)
+					newRow[colName] = strings.ToUpper(fmt.Sprintf("%v", val))
+				}
+				affected++
+			}
+			updated[i] = newRow
+		}
+		e.psSetupActors = updated
+		e.psSetupActorsInit = true
+		return &Result{AffectedRows: affected}, nil
+	}
+
+	// For setup_objects, update the in-memory rows
+	if tableName == "setup_objects" {
+		currentRows := e.getSetupObjectsRows()
+		updated := make([]storage.Row, len(currentRows))
+		affected := uint64(0)
+		for i, row := range currentRows {
+			match := true
+			if stmt.Where != nil {
+				m, err := e.evalWhere(stmt.Where.Expr, row)
+				if err != nil {
+					return nil, err
+				}
+				match = m
+			}
+			newRow := make(storage.Row, len(row))
+			for k, v := range row {
+				newRow[k] = v
+			}
+			if match {
+				for _, expr := range stmt.Exprs {
+					colName := strings.ToUpper(expr.Name.Name.String())
+					val, _ := e.evalExpr(expr.Expr)
+					newRow[colName] = strings.ToUpper(fmt.Sprintf("%v", val))
+				}
+				affected++
+			}
+			updated[i] = newRow
+		}
+		e.psSetupObjects = updated
+		e.psSetupObjectsInit = true
+		return &Result{AffectedRows: affected}, nil
+	}
+
+	// For threads table, track INSTRUMENTED/HISTORY per-connection
+	if tableName == "threads" {
+		if e.psThreadInstrumented == nil {
+			e.psThreadInstrumented = make(map[int64]string)
+		}
+		if e.psThreadHistory == nil {
+			e.psThreadHistory = make(map[int64]string)
+		}
+		for _, expr := range stmt.Exprs {
+			colName := strings.ToLower(expr.Name.Name.String())
+			val, _ := e.evalExpr(expr.Expr)
+			strVal := strings.ToUpper(fmt.Sprintf("%v", val))
+			switch colName {
+			case "instrumented":
+				e.psThreadInstrumented[e.connectionID] = strVal
+			case "history":
+				e.psThreadHistory[e.connectionID] = strVal
+			}
+		}
+		return &Result{AffectedRows: 0}, nil
+	}
+
+	// For setup_instruments, setup_consumers, setup_threads - silently succeed
+	return &Result{AffectedRows: 0}, nil
+}
+
 // perfSchemaSetupInstruments returns stub rows for performance_schema.setup_instruments.
 func (e *Executor) perfSchemaSetupInstruments() []storage.Row {
-	// Return a representative set of instrument categories
-	instruments := []struct{ name, enabled, timed string }{
-		{"wait/synch/mutex/sql/THD_LOCK_INFO::mutex", "YES", "YES"},
-		{"wait/synch/rwlock/sql/LOCK_grant", "YES", "YES"},
-		{"wait/synch/cond/sql/COND_open", "YES", "YES"},
-		{"wait/io/file/sql/binlog", "YES", "YES"},
-		{"wait/io/table/sql/handler", "YES", "YES"},
-		{"wait/io/socket/sql/server_tcpip_socket", "YES", "YES"},
-		{"wait/lock/table/sql/handler", "YES", "YES"},
-		{"stage/sql/After create", "YES", "YES"},
-		{"statement/sql/select", "YES", "YES"},
-		{"statement/sql/insert", "YES", "YES"},
-		{"statement/sql/update", "YES", "YES"},
-		{"statement/sql/delete", "YES", "YES"},
-		{"transaction", "YES", "YES"},
-		{"memory/sql/THD::main_mem_root", "YES", "YES"},
-		{"idle", "YES", "YES"},
+	// Return a representative set of instrument categories matching MySQL 8.0
+	type instDef struct {
+		name, enabled, timed, properties string
+	}
+	instruments := []instDef{
+		// Mutex instruments (sorted by name for 'order by name')
+		{"wait/synch/mutex/sql/Commit_order_manager::m_mutex", "YES", "YES", ""},
+		{"wait/synch/mutex/sql/Cost_constant_cache::LOCK_cost_const", "YES", "YES", "singleton"},
+		{"wait/synch/mutex/sql/Event_scheduler::LOCK_scheduler_state", "YES", "YES", "singleton"},
+		{"wait/synch/mutex/sql/Gtid_set::gtid_executed::free_intervals_mutex", "YES", "YES", ""},
+		{"wait/synch/mutex/sql/Gtid_state", "YES", "YES", "singleton"},
+		{"wait/synch/mutex/sql/hash_filo::lock", "YES", "YES", ""},
+		{"wait/synch/mutex/sql/key_mts_gaq_LOCK", "YES", "YES", ""},
+		{"wait/synch/mutex/sql/key_mts_temp_table_LOCK", "YES", "YES", ""},
+		{"wait/synch/mutex/sql/LOCK_acl_cache_flush", "YES", "YES", "singleton"},
+		{"wait/synch/mutex/sql/LOCK_audit_mask", "YES", "YES", "singleton"},
+		{"wait/synch/mutex/sql/THD_LOCK_INFO::mutex", "YES", "YES", ""},
+		// Rwlock instruments
+		{"wait/synch/rwlock/sql/Binlog_relay_IO_delegate::lock", "YES", "YES", "singleton"},
+		{"wait/synch/rwlock/sql/Binlog_storage_delegate::lock", "YES", "YES", "singleton"},
+		{"wait/synch/rwlock/sql/Binlog_transmit_delegate::lock", "YES", "YES", "singleton"},
+		{"wait/synch/rwlock/sql/channel_lock", "YES", "YES", ""},
+		{"wait/synch/rwlock/sql/channel_map_lock", "YES", "YES", ""},
+		{"wait/synch/rwlock/sql/channel_to_filter_lock", "YES", "YES", ""},
+		{"wait/synch/rwlock/sql/gtid_commit_rollback", "YES", "YES", "singleton"},
+		{"wait/synch/rwlock/sql/gtid_mode_lock", "YES", "YES", "singleton"},
+		{"wait/synch/rwlock/sql/gtid_retrieved", "YES", "YES", "singleton"},
+		{"wait/synch/rwlock/sql/LOCK_sys_init_connect", "YES", "YES", "singleton"},
+		// Cond instruments
+		{"wait/synch/cond/sql/Commit_order_manager::m_workers.cond", "YES", "YES", ""},
+		{"wait/synch/cond/sql/COND_compress_gtid_table", "YES", "YES", "singleton"},
+		{"wait/synch/cond/sql/COND_connection_count", "YES", "YES", "singleton"},
+		{"wait/synch/cond/sql/COND_flush_thread_cache", "YES", "YES", "singleton"},
+		{"wait/synch/cond/sql/COND_manager", "YES", "YES", "singleton"},
+		{"wait/synch/cond/sql/COND_open", "YES", "YES", ""},
+		{"wait/synch/cond/sql/COND_queue_state", "YES", "YES", "singleton"},
+		{"wait/synch/cond/sql/COND_server_started", "YES", "YES", "singleton"},
+		{"wait/synch/cond/sql/COND_thd_list", "YES", "YES", ""},
+		{"wait/synch/cond/sql/COND_thr_lock", "YES", "YES", ""},
+		{"wait/synch/cond/sql/COND_thread_cache", "YES", "YES", "singleton"},
+		// IO instruments
+		{"wait/io/file/sql/binlog", "YES", "YES", ""},
+		{"wait/io/table/sql/handler", "YES", "YES", ""},
+		{"wait/io/socket/sql/server_tcpip_socket", "YES", "YES", ""},
+		{"wait/lock/table/sql/handler", "YES", "YES", ""},
+		// Stage instruments
+		{"stage/sql/After create", "YES", "YES", ""},
+		// Statement instruments
+		{"statement/sql/select", "YES", "YES", ""},
+		{"statement/sql/insert", "YES", "YES", ""},
+		{"statement/sql/update", "YES", "YES", ""},
+		{"statement/sql/delete", "YES", "YES", ""},
+		// Other instruments
+		{"transaction", "YES", "YES", ""},
+		{"memory/sql/THD::main_mem_root", "YES", "YES", ""},
+		{"idle", "YES", "YES", ""},
 	}
 
 	// Check startup variables that disable instrument categories.
@@ -2125,7 +2676,7 @@ func (e *Executor) perfSchemaSetupInstruments() []storage.Row {
 		}
 		rows = append(rows, storage.Row{
 			"NAME": inst.name, "ENABLED": inst.enabled, "TIMED": inst.timed,
-			"PROPERTIES": "", "VOLATILITY": int64(0), "DOCUMENTATION": nil,
+			"PROPERTIES": inst.properties, "VOLATILITY": int64(0), "DOCUMENTATION": nil,
 		})
 	}
 	return rows

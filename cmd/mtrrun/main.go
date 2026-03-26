@@ -677,13 +677,13 @@ var skipTests = map[string]bool{
 	// "perfschema/dml_ews_by_host_by_event_name": true, // now passes
 	// "perfschema/dml_ews_by_user_by_event_name": true, // now passes
 	"perfschema/dml_file_instances": true,
-	"perfschema/dml_handler": true,
+	"perfschema/dml_handler": true, // requires all 103 perfschema tables to match MySQL 8.0
 	"perfschema/dml_os_global_by_type": true,
-	"perfschema/dml_setup_actors": true,
-	"perfschema/dml_setup_instruments": true,
-	"perfschema/dml_setup_objects": true,
-	"perfschema/dml_setup_threads": true,
-	"perfschema/dml_threads": true,
+	// "perfschema/dml_setup_actors": true, // now passes
+	// "perfschema/dml_setup_instruments": true, // now passes
+	// "perfschema/dml_setup_objects": true, // now passes
+	// "perfschema/dml_setup_threads": true, // now passes
+	// "perfschema/dml_threads": true, // now passes
 	"perfschema/dml_tiws_by_index_usage": true,
 	"perfschema/error_stats_summary": true,
 	"perfschema/event_aggregate": true,
