@@ -8148,7 +8148,7 @@ func evalIntervalDateExpr(dateVal, intervalVal interface{}, unit sqlparser.Inter
 // parseMySQLTimeInterval parses MySQL time interval strings like "1 01:01:01" or "01:01:01".
 func parseMySQLTimeInterval(s string) (time.Duration, error) {
 	s = strings.TrimSpace(s)
-	var days, hours, mins, secs int
+	var days, hours, mins, secs, usecs int
 
 	// Format: "D HH:MM:SS" or "HH:MM:SS" or "D"
 	if idx := strings.Index(s, " "); idx >= 0 {
@@ -8165,8 +8165,23 @@ func parseMySQLTimeInterval(s string) (time.Duration, error) {
 	case 3:
 		h, _ := strconv.Atoi(parts[0])
 		m, _ := strconv.Atoi(parts[1])
-		sc, _ := strconv.Atoi(parts[2])
-		hours, mins, secs = h, m, sc
+		secPart := parts[2]
+		if dotIdx := strings.Index(secPart, "."); dotIdx >= 0 {
+			intPart := secPart[:dotIdx]
+			fracPart := secPart[dotIdx+1:]
+			sc, _ := strconv.Atoi(intPart)
+			secs = sc
+			// Pad or truncate to 6 digits (microseconds)
+			for len(fracPart) < 6 {
+				fracPart += "0"
+			}
+			fracPart = fracPart[:6]
+			usecs, _ = strconv.Atoi(fracPart)
+		} else {
+			sc, _ := strconv.Atoi(secPart)
+			secs = sc
+		}
+		hours, mins = h, m
 	case 2:
 		h, _ := strconv.Atoi(parts[0])
 		m, _ := strconv.Atoi(parts[1])
@@ -8181,7 +8196,8 @@ func parseMySQLTimeInterval(s string) (time.Duration, error) {
 	return time.Duration(days)*24*time.Hour +
 		time.Duration(hours)*time.Hour +
 		time.Duration(mins)*time.Minute +
-		time.Duration(secs)*time.Second, nil
+		time.Duration(secs)*time.Second +
+		time.Duration(usecs)*time.Microsecond, nil
 }
 
 // mysqlDateFormat converts a MySQL DATE_FORMAT format string (e.g. "%Y-%m-%d") to a Go time.Time string.

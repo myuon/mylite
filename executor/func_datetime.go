@@ -387,7 +387,8 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if err != nil {
 			return toString(base), true, nil
 		}
-		return t.Add(dur).Format("2006-01-02 15:04:05"), true, nil
+		result := t.Add(dur)
+		return formatDateTimeWithOptionalMicros(result), true, nil
 	case "subtime":
 		if len(v.Exprs) < 2 {
 			return nil, true, nil
@@ -408,7 +409,8 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if err != nil {
 			return toString(base), true, nil
 		}
-		return t.Add(-dur).Format("2006-01-02 15:04:05"), true, nil
+		result := t.Add(-dur)
+		return formatDateTimeWithOptionalMicros(result), true, nil
 	case "from_days":
 		val, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {
@@ -779,4 +781,15 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 	default:
 		return nil, false, nil
 	}
+}
+
+// formatDateTimeWithOptionalMicros formats a time.Time as "2006-01-02 15:04:05"
+// and appends ".NNNNNN" microsecond fraction only when non-zero.
+func formatDateTimeWithOptionalMicros(t time.Time) string {
+	base := t.Format("2006-01-02 15:04:05")
+	usec := t.Nanosecond() / 1000
+	if usec != 0 {
+		return fmt.Sprintf("%s.%06d", base, usec)
+	}
+	return base
 }
