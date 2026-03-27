@@ -175,6 +175,30 @@ func isAlphaNum(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
 }
 
+// isStandaloneEnd returns true if the upper-cased line represents a standalone
+// END (optionally followed by a label) but NOT "END IF", "END WHILE",
+// "END LOOP", "END CASE", or "END REPEAT".
+func isStandaloneEnd(lineUpper string) bool {
+	if lineUpper == "END" {
+		return true
+	}
+	if !strings.HasPrefix(lineUpper, "END ") {
+		return false
+	}
+	after := strings.TrimSpace(lineUpper[4:])
+	switch after {
+	case "IF", "WHILE", "LOOP", "CASE", "REPEAT":
+		return false
+	}
+	// Also reject if it starts with one of these keywords (e.g. "END IF label")
+	for _, kw := range []string{"IF ", "WHILE ", "LOOP ", "CASE ", "REPEAT "} {
+		if strings.HasPrefix(after, kw) {
+			return false
+		}
+	}
+	return true
+}
+
 // countOccurrences counts the number of non-overlapping occurrences of substr in s.
 // It only counts whole-word occurrences where "IF " means IF followed by space (not part of END IF).
 func countOccurrences(s, substr string) int {
@@ -1007,6 +1031,38 @@ type iterateError struct {
 
 func (e *iterateError) Error() string { return "ITERATE " + e.label }
 
+// signalError represents a SIGNAL/RESIGNAL raised inside a stored routine.
+type signalError struct {
+	sqlState    string
+	mysqlErrno  int
+	messageText string
+}
+
+func (e *signalError) Error() string {
+	code := e.mysqlErrno
+	if code == 0 {
+		code = 1644 // ER_SIGNAL_EXCEPTION
+	}
+	msg := e.messageText
+	if msg == "" {
+		msg = "Unhandled user-defined exception"
+	}
+	return fmt.Sprintf("ERROR %d (%s): %s", code, e.sqlState, msg)
+}
+
+// exitHandlerError wraps the exit-handler action: after running the handler body
+// the current BEGIN...END block must terminate.
+type exitHandlerError struct{}
+
+func (e *exitHandlerError) Error() string { return "EXIT HANDLER" }
+
+// handlerDef describes a DECLARE HANDLER definition.
+type handlerDef struct {
+	handlerType string   // "CONTINUE" or "EXIT"
+	conditions  []string // condition keys, e.g. "NOT FOUND", "SQLEXCEPTION", "SQLWARNING", "02000"
+	body        string   // handler body (SQL to execute)
+}
+
 // routineContext holds shared state for a stored routine execution.
 type routineContext struct {
 	localVars          map[string]interface{}
@@ -1014,6 +1070,8 @@ type routineContext struct {
 	cursorDefs         map[string]string
 	notFoundHandlerVar string
 	done               bool
+	handlers           []handlerDef
+	currentSignal      *signalError // the signal currently being handled (for bare RESIGNAL)
 }
 
 // execRoutineBody executes the body of a stored procedure or function, supporting
@@ -1053,20 +1111,86 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 			rest := strings.TrimSpace(stmtStr[len("DECLARE"):])
 			restUpper := strings.ToUpper(rest)
 
-			// DECLARE CONTINUE HANDLER FOR NOT FOUND SET var = val
-			// DECLARE CONTINUE HANDLER FOR SQLSTATE '02000' SET var = val
-			if strings.HasPrefix(restUpper, "CONTINUE HANDLER") {
-				afterHandler := strings.TrimSpace(rest[len("CONTINUE HANDLER"):])
-				afterHandlerUpper := strings.ToUpper(afterHandler)
-				// Extract SET variable
-				setIdx := strings.Index(afterHandlerUpper, "SET ")
-				if setIdx >= 0 {
-					setPart := strings.TrimSpace(afterHandler[setIdx+4:])
-					eqIdx := strings.Index(setPart, "=")
-					if eqIdx >= 0 {
-						varName := strings.TrimSpace(setPart[:eqIdx])
-						notFoundHandlerVar = varName
-						ctx.notFoundHandlerVar = varName
+			// DECLARE {CONTINUE|EXIT} HANDLER FOR {condition} {body}
+			if strings.HasPrefix(restUpper, "CONTINUE HANDLER") || strings.HasPrefix(restUpper, "EXIT HANDLER") {
+				handlerType := "CONTINUE"
+				afterType := rest[len("CONTINUE HANDLER"):]
+				if strings.HasPrefix(restUpper, "EXIT HANDLER") {
+					handlerType = "EXIT"
+					afterType = rest[len("EXIT HANDLER"):]
+				}
+				afterType = strings.TrimSpace(afterType)
+				afterTypeUpper := strings.ToUpper(afterType)
+
+				// Parse FOR clause
+				if strings.HasPrefix(afterTypeUpper, "FOR ") {
+					afterFor := strings.TrimSpace(afterType[4:])
+					afterForUpper := strings.ToUpper(afterFor)
+
+					// Parse conditions and body
+					var conditions []string
+					var handlerBody string
+
+					if strings.HasPrefix(afterForUpper, "NOT FOUND") {
+						conditions = append(conditions, "NOT FOUND")
+						handlerBody = strings.TrimSpace(afterFor[len("NOT FOUND"):])
+					} else if strings.HasPrefix(afterForUpper, "SQLEXCEPTION") {
+						conditions = append(conditions, "SQLEXCEPTION")
+						handlerBody = strings.TrimSpace(afterFor[len("SQLEXCEPTION"):])
+					} else if strings.HasPrefix(afterForUpper, "SQLWARNING") {
+						conditions = append(conditions, "SQLWARNING")
+						handlerBody = strings.TrimSpace(afterFor[len("SQLWARNING"):])
+					} else if strings.HasPrefix(afterForUpper, "SQLSTATE") {
+						// SQLSTATE 'value'
+						stateRest := strings.TrimSpace(afterFor[len("SQLSTATE"):])
+						stateRestUpper := strings.ToUpper(stateRest)
+						if strings.HasPrefix(stateRestUpper, "VALUE ") {
+							stateRest = strings.TrimSpace(stateRest[len("VALUE "):])
+						}
+						// Extract quoted state
+						if len(stateRest) > 0 && (stateRest[0] == '\'' || stateRest[0] == '"') {
+							q := stateRest[0]
+							end := strings.IndexByte(stateRest[1:], q)
+							if end >= 0 {
+								sqlState := stateRest[1 : end+1]
+								conditions = append(conditions, sqlState)
+								handlerBody = strings.TrimSpace(stateRest[end+2:])
+							}
+						}
+					} else {
+						// MySQL error number: DECLARE HANDLER FOR 1062 ...
+						parts := strings.Fields(afterFor)
+						if len(parts) > 0 {
+							conditions = append(conditions, parts[0])
+							handlerBody = strings.TrimSpace(afterFor[len(parts[0]):])
+						}
+					}
+
+					// For backward compat: if handler body is SET var = val and condition is NOT FOUND,
+					// also set notFoundHandlerVar for the old cursor path
+					if len(conditions) > 0 {
+						hDef := handlerDef{
+							handlerType: handlerType,
+							conditions:  conditions,
+							body:        handlerBody,
+						}
+						ctx.handlers = append(ctx.handlers, hDef)
+
+						// Legacy NOT FOUND handler variable tracking
+						for _, c := range conditions {
+							if c == "NOT FOUND" || c == "02000" {
+								setIdx := strings.Index(strings.ToUpper(handlerBody), "SET ")
+								if setIdx >= 0 {
+									setPart := strings.TrimSpace(handlerBody[setIdx+4:])
+									eqIdx := strings.Index(setPart, "=")
+									if eqIdx >= 0 {
+										varName := strings.TrimSpace(setPart[:eqIdx])
+										notFoundHandlerVar = varName
+										ctx.notFoundHandlerVar = varName
+									}
+								}
+							}
+						}
 					}
 				}
 				continue
@@ -1104,7 +1228,17 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 							nameUpper == "CHAR" || nameUpper == "VARCHAR" || nameUpper == "TEXT" ||
 							nameUpper == "DECIMAL" || nameUpper == "FLOAT" || nameUpper == "DOUBLE" ||
 							nameUpper == "DATE" || nameUpper == "DATETIME" || nameUpper == "TIMESTAMP" ||
-							strings.HasPrefix(nameUpper, "CHAR(") || strings.HasPrefix(nameUpper, "VARCHAR(") {
+							nameUpper == "BOOLEAN" || nameUpper == "BOOL" || nameUpper == "NUMERIC" ||
+							nameUpper == "BLOB" || nameUpper == "LONGTEXT" || nameUpper == "MEDIUMTEXT" ||
+							nameUpper == "TINYTEXT" || nameUpper == "LONGBLOB" || nameUpper == "MEDIUMBLOB" ||
+							nameUpper == "TINYBLOB" || nameUpper == "BINARY" || nameUpper == "VARBINARY" ||
+							nameUpper == "ENUM" || nameUpper == "JSON" || nameUpper == "BIT" ||
+							nameUpper == "YEAR" || nameUpper == "TIME" ||
+							nameUpper == "CONDITION" || // DECLARE x CONDITION FOR ...
+							strings.HasPrefix(nameUpper, "CHAR(") || strings.HasPrefix(nameUpper, "VARCHAR(") ||
+							strings.HasPrefix(nameUpper, "DECIMAL(") || strings.HasPrefix(nameUpper, "NUMERIC(") ||
+							strings.HasPrefix(nameUpper, "ENUM(") || strings.HasPrefix(nameUpper, "BIT(") ||
+							strings.HasPrefix(nameUpper, "BINARY(") || strings.HasPrefix(nameUpper, "VARBINARY(") {
 							isType = true
 							break
 						}
@@ -1120,14 +1254,49 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 						}
 					}
 				}
-				// Find DEFAULT value
+				// Check if this is a CONDITION declaration (DECLARE x CONDITION FOR ...)
+				if typeIdx < len(declParts) && strings.ToUpper(declParts[typeIdx]) == "CONDITION" {
+					// DECLARE condition_name CONDITION FOR SQLSTATE VALUE 'xxxxx'
+					// We just register it as a no-op for now
+					continue
+				}
+
+				// Determine default value based on type
 				var defaultVal interface{}
-				defaultVal = int64(0) // MySQL default for numeric types
+				typeName := ""
+				if typeIdx < len(declParts) {
+					typeName = strings.ToUpper(declParts[typeIdx])
+				}
+				// String types default to empty string, numeric to 0
+				switch {
+				case typeName == "CHAR" || typeName == "VARCHAR" || typeName == "TEXT" ||
+					typeName == "LONGTEXT" || typeName == "MEDIUMTEXT" || typeName == "TINYTEXT" ||
+					typeName == "BLOB" || typeName == "LONGBLOB" || typeName == "MEDIUMBLOB" ||
+					typeName == "TINYBLOB" || typeName == "JSON" || typeName == "ENUM" ||
+					strings.HasPrefix(typeName, "CHAR(") || strings.HasPrefix(typeName, "VARCHAR(") ||
+					strings.HasPrefix(typeName, "ENUM("):
+					defaultVal = ""
+				case typeName == "DATE" || typeName == "DATETIME" || typeName == "TIMESTAMP" ||
+					typeName == "TIME" || typeName == "YEAR":
+					defaultVal = nil
+				default:
+					defaultVal = int64(0)
+				}
+				// Find DEFAULT value override
 				for j := typeIdx; j < len(declParts); j++ {
 					if strings.ToUpper(declParts[j]) == "DEFAULT" && j+1 < len(declParts) {
-						defStr := declParts[j+1]
-						if n, err := strconv.ParseInt(defStr, 10, 64); err == nil {
+						defStr := strings.Join(declParts[j+1:], " ")
+						defStr = strings.TrimRight(defStr, ";")
+						if strings.ToUpper(defStr) == "NULL" {
+							defaultVal = nil
+						} else if n, err := strconv.ParseInt(defStr, 10, 64); err == nil {
 							defaultVal = n
+						} else if f, err := strconv.ParseFloat(defStr, 64); err == nil {
+							defaultVal = f
+						} else if strings.ToUpper(defStr) == "TRUE" {
+							defaultVal = int64(1)
+						} else if strings.ToUpper(defStr) == "FALSE" {
+							defaultVal = int64(0)
 						} else {
 							defaultVal = strings.Trim(defStr, "'\"")
 						}
@@ -1454,7 +1623,7 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 						if strings.HasPrefix(lineUpper, "BEGIN") {
 							beginDepth++
 						}
-						if strings.HasPrefix(lineUpper, "END") {
+						if isStandaloneEnd(lineUpper) {
 							beginDepth--
 						}
 						beginBlock += ";\n" + line
@@ -1489,6 +1658,127 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 			}
 		}
 
+		// Handle CASE statement (control flow, not expression)
+		if strings.HasPrefix(stmtUpper, "CASE") && !strings.HasPrefix(stmtUpper, "CASE ") ||
+			strings.HasPrefix(stmtUpper, "CASE ") {
+			// Collect the full CASE block
+			caseBlock := stmtStr
+			// Count CASE/END CASE nesting
+			caseDepth := countCaseStatements(strings.ToUpper(caseBlock))
+			for caseDepth > 0 && i+1 < len(body) {
+				i++
+				caseBlock += ";\n" + body[i]
+				caseDepth = countCaseStatements(strings.ToUpper(caseBlock))
+			}
+			retVal, err := e.execCaseBlockCtx(caseBlock, ctx)
+			if err != nil {
+				return nil, err
+			}
+			if retVal != nil {
+				return retVal, nil
+			}
+			continue
+		}
+
+		// Handle SIGNAL sqlstate
+		if strings.HasPrefix(stmtUpper, "SIGNAL ") {
+			sigErr := e.parseSignal(stmtStr, localVars)
+			// Check if there's a matching handler
+			handled, exitFlag := e.tryHandler(sigErr, ctx)
+			if handled {
+				if exitFlag {
+					return nil, nil // EXIT handler: stop block
+				}
+				continue // CONTINUE handler: proceed
+			}
+			return nil, sigErr
+		}
+
+		// Handle RESIGNAL
+		if strings.HasPrefix(stmtUpper, "RESIGNAL") {
+			resignalRest := strings.TrimSpace(stmtStr[len("RESIGNAL"):])
+			if resignalRest == "" {
+				// Bare RESIGNAL: re-raise the current condition being handled
+				if ctx != nil && ctx.currentSignal != nil {
+					return nil, ctx.currentSignal
+				}
+				// No current signal context; raise default
+				return nil, &signalError{sqlState: "45000"}
+			}
+			sigErr := e.parseSignal(stmtStr, localVars)
+			return nil, sigErr
+		}
+
+		// Handle GET DIAGNOSTICS (stub - set variables to empty/0)
+		if strings.HasPrefix(stmtUpper, "GET DIAGNOSTICS") || strings.HasPrefix(stmtUpper, "GET CURRENT DIAGNOSTICS") || strings.HasPrefix(stmtUpper, "GET STACKED DIAGNOSTICS") {
+			continue
+		}
+
+		// Handle unlabeled BEGIN...END block
+		if stmtUpper == "BEGIN" || strings.HasPrefix(stmtUpper, "BEGIN\n") || strings.HasPrefix(stmtUpper, "BEGIN;") {
+			beginBlock := stmtStr
+			beginDepth := 1
+			for beginDepth > 0 && i+1 < len(body) {
+				i++
+				line := body[i]
+				lineUpper := strings.ToUpper(strings.TrimSpace(line))
+				if lineUpper == "BEGIN" || strings.HasPrefix(lineUpper, "BEGIN\n") {
+					beginDepth++
+				}
+				if isStandaloneEnd(lineUpper) {
+					beginDepth--
+				}
+				beginBlock += ";\n" + line
+			}
+			inner := strings.TrimSpace(beginBlock)
+			if strings.HasPrefix(strings.ToUpper(inner), "BEGIN") {
+				inner = strings.TrimSpace(inner[len("BEGIN"):])
+			}
+			if strings.HasSuffix(strings.ToUpper(strings.TrimSpace(inner)), "END") {
+				inner = strings.TrimSpace(inner[:len(inner)-len("END")])
+			}
+			inner = strings.TrimRight(inner, ";")
+			stmts := splitTriggerBody(inner)
+			// Create a child context sharing state but with own handler scope
+			childCtx := &routineContext{
+				localVars:          localVars,
+				cursors:            cursors,
+				cursorDefs:         cursorDefs,
+				notFoundHandlerVar: notFoundHandlerVar,
+				done:               done,
+			}
+			retVal, err := e.execRoutineBodyWithContext(stmts, childCtx)
+			if err != nil {
+				var exitErr *exitHandlerError
+				if errors.As(err, &exitErr) {
+					continue
+				}
+				return nil, err
+			}
+			if retVal != nil {
+				return retVal, nil
+			}
+			continue
+		}
+
+		// Handle CALL inside routine body (nested SP call with local var substitution)
+		if strings.HasPrefix(stmtUpper, "CALL ") {
+			resolvedSQL := e.substituteLocalVars(stmtStr, localVars)
+			_, err := e.Execute(resolvedSQL)
+			if err != nil {
+				// Check if a handler can catch this error
+				handled, exitFlag := e.tryHandler(err, ctx)
+				if handled {
+					if exitFlag {
+						return nil, nil
+					}
+					continue
+				}
+				return nil, err
+			}
+			continue
+		}
+
 		// Handle SELECT ... INTO
 		if strings.HasPrefix(stmtUpper, "SELECT") && strings.Contains(stmtUpper, " INTO ") {
 			err := e.execSelectIntoForRoutine(stmtStr, localVars)
@@ -1502,12 +1792,322 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 		resolvedSQL := e.substituteLocalVars(stmtStr, localVars)
 		_, err := e.Execute(resolvedSQL)
 		if err != nil {
+			// Check if a handler can catch this error
+			handled, exitFlag := e.tryHandler(err, ctx)
+			if handled {
+				if exitFlag {
+					return nil, nil
+				}
+				continue
+			}
 			return nil, err
 		}
 	}
 
 	_ = done
 	return returnVal, nil
+}
+
+// countCaseStatements counts unmatched CASE statements (CASE - END CASE).
+func countCaseStatements(upper string) int {
+	caseCount := 0
+	endCaseCount := strings.Count(upper, "END CASE")
+	// Count CASE that starts a statement (at start or after whitespace/newline)
+	idx := 0
+	for {
+		pos := strings.Index(upper[idx:], "CASE")
+		if pos < 0 {
+			break
+		}
+		absPos := idx + pos
+		// Check it's a word boundary
+		before := true
+		if absPos > 0 {
+			ch := upper[absPos-1]
+			if (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' {
+				before = false
+			}
+		}
+		after := true
+		endPos := absPos + 4
+		if endPos < len(upper) {
+			ch := upper[endPos]
+			if (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' {
+				after = false
+			}
+		}
+		if before && after {
+			// Make sure it's not "END CASE"
+			if absPos >= 4 && upper[absPos-4:absPos] == "END " {
+				// skip, this is END CASE
+			} else {
+				caseCount++
+			}
+		}
+		idx = absPos + 4
+	}
+	return caseCount - endCaseCount
+}
+
+// execCaseBlockCtx executes a CASE statement block with routine context.
+func (e *Executor) execCaseBlockCtx(block string, ctx *routineContext) (interface{}, error) {
+	trimmed := strings.TrimSpace(block)
+	upper := strings.ToUpper(trimmed)
+
+	// Remove trailing END CASE
+	if strings.HasSuffix(upper, "END CASE") {
+		trimmed = strings.TrimSpace(trimmed[:len(trimmed)-len("END CASE")])
+		trimmed = strings.TrimRight(trimmed, ";")
+		trimmed = strings.TrimSpace(trimmed)
+	}
+
+	// Determine if this is a simple CASE (CASE expr WHEN ...) or searched CASE (CASE WHEN ...)
+	afterCase := strings.TrimSpace(trimmed[4:]) // skip "CASE"
+	afterCaseUpper := strings.ToUpper(afterCase)
+
+	var baseExprStr string
+	isSimple := false
+
+	if !strings.HasPrefix(afterCaseUpper, "WHEN ") {
+		// Simple CASE: extract the base expression up to the first WHEN
+		whenIdx := findTopLevelKeyword(afterCase, "WHEN ")
+		if whenIdx < 0 {
+			return nil, fmt.Errorf("CASE statement missing WHEN")
+		}
+		baseExprStr = strings.TrimSpace(afterCase[:whenIdx])
+		afterCase = strings.TrimSpace(afterCase[whenIdx:])
+		afterCaseUpper = strings.ToUpper(afterCase)
+		isSimple = true
+	}
+
+	// Evaluate base expression for simple CASE
+	var baseVal interface{}
+	if isSimple && baseExprStr != "" {
+		var err error
+		baseVal, err = e.evaluateExprWithVars(baseExprStr, ctx.localVars)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Parse WHEN...THEN...ELSE blocks
+	// We need to find top-level WHEN, THEN, ELSE boundaries
+	type whenClause struct {
+		cond string
+		body string
+	}
+	var whens []whenClause
+	var elseBody string
+
+	remaining := afterCase
+	for {
+		remainingUpper := strings.ToUpper(remaining)
+		if !strings.HasPrefix(remainingUpper, "WHEN ") {
+			break
+		}
+		remaining = strings.TrimSpace(remaining[5:]) // skip "WHEN "
+
+		// Find THEN at top level
+		thenIdx := findTopLevelKeyword(remaining, " THEN")
+		if thenIdx < 0 {
+			break
+		}
+		cond := strings.TrimSpace(remaining[:thenIdx])
+		remaining = strings.TrimSpace(remaining[thenIdx+5:]) // skip " THEN"
+
+		// Find next WHEN or ELSE or end
+		nextWhen := findTopLevelKeyword(remaining, "WHEN ")
+		nextElse := findTopLevelKeyword(remaining, "ELSE ")
+		// Pick the earliest
+		endIdx := len(remaining)
+		if nextWhen >= 0 && nextWhen < endIdx {
+			endIdx = nextWhen
+		}
+		if nextElse >= 0 && nextElse < endIdx {
+			endIdx = nextElse
+		}
+		bodyStr := strings.TrimSpace(remaining[:endIdx])
+		bodyStr = strings.TrimRight(bodyStr, ";")
+		whens = append(whens, whenClause{cond: cond, body: bodyStr})
+		remaining = strings.TrimSpace(remaining[endIdx:])
+	}
+
+	// Check for ELSE
+	remainingUpper := strings.ToUpper(remaining)
+	if strings.HasPrefix(remainingUpper, "ELSE ") || strings.HasPrefix(remainingUpper, "ELSE\n") {
+		elseBody = strings.TrimSpace(remaining[4:])
+		elseBody = strings.TrimRight(elseBody, ";")
+		elseBody = strings.TrimSpace(elseBody)
+	}
+
+	// Evaluate each WHEN clause
+	for _, wc := range whens {
+		matched := false
+		if isSimple {
+			// Compare base value to WHEN value
+			whenVal, err := e.evaluateExprWithVars(wc.cond, ctx.localVars)
+			if err != nil {
+				continue
+			}
+			matched = fmt.Sprintf("%v", baseVal) == fmt.Sprintf("%v", whenVal)
+		} else {
+			// Searched CASE: evaluate condition as boolean
+			condVal, err := e.evaluateExprWithVars(wc.cond, ctx.localVars)
+			if err != nil {
+				continue
+			}
+			matched = isTruthy(condVal)
+		}
+		if matched {
+			stmts := splitTriggerBody(wc.body)
+			return e.execRoutineBodyWithContext(stmts, ctx)
+		}
+	}
+
+	// Execute ELSE block if present
+	if elseBody != "" {
+		stmts := splitTriggerBody(elseBody)
+		return e.execRoutineBodyWithContext(stmts, ctx)
+	}
+
+	// No match and no ELSE - MySQL raises error 1339
+	if isSimple {
+		return nil, mysqlError(1339, "20000", "Case not found for CASE statement")
+	}
+
+	return nil, nil
+}
+
+// parseSignal parses a SIGNAL or RESIGNAL statement and returns a signalError.
+func (e *Executor) parseSignal(stmtStr string, localVars map[string]interface{}) *signalError {
+	upper := strings.ToUpper(strings.TrimSpace(stmtStr))
+	rest := stmtStr
+	if strings.HasPrefix(upper, "SIGNAL ") {
+		rest = strings.TrimSpace(stmtStr[len("SIGNAL "):])
+	} else if strings.HasPrefix(upper, "RESIGNAL") {
+		rest = strings.TrimSpace(stmtStr[len("RESIGNAL"):])
+	}
+
+	sigErr := &signalError{sqlState: "45000"}
+
+	restUpper := strings.ToUpper(rest)
+	// Parse SQLSTATE [VALUE] 'xxxxx'
+	if strings.HasPrefix(restUpper, "SQLSTATE") {
+		after := strings.TrimSpace(rest[len("SQLSTATE"):])
+		afterUpper := strings.ToUpper(after)
+		if strings.HasPrefix(afterUpper, "VALUE ") {
+			after = strings.TrimSpace(after[len("VALUE "):])
+		}
+		// Extract quoted state
+		if len(after) > 0 && (after[0] == '\'' || after[0] == '"') {
+			q := after[0]
+			end := strings.IndexByte(after[1:], q)
+			if end >= 0 {
+				sigErr.sqlState = after[1 : end+1]
+				after = strings.TrimSpace(after[end+2:])
+			}
+		}
+		// Parse SET clause
+		afterUpper = strings.ToUpper(after)
+		if strings.HasPrefix(afterUpper, "SET ") {
+			e.parseSignalSetClause(after[4:], sigErr, localVars)
+		}
+	}
+
+	return sigErr
+}
+
+// parseSignalSetClause parses SET MESSAGE_TEXT = '...', MYSQL_ERRNO = ... in SIGNAL.
+func (e *Executor) parseSignalSetClause(clause string, sigErr *signalError, localVars map[string]interface{}) {
+	// Split by comma (respecting quotes)
+	parts := splitByComma(clause)
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		eqIdx := strings.Index(part, "=")
+		if eqIdx < 0 {
+			continue
+		}
+		key := strings.ToUpper(strings.TrimSpace(part[:eqIdx]))
+		val := strings.TrimSpace(part[eqIdx+1:])
+		val = strings.Trim(val, "'\"")
+		switch key {
+		case "MESSAGE_TEXT":
+			// Substitute local variables
+			resolved := e.substituteLocalVars(val, localVars)
+			sigErr.messageText = resolved
+		case "MYSQL_ERRNO":
+			if n, err := strconv.Atoi(val); err == nil {
+				sigErr.mysqlErrno = n
+			}
+		}
+	}
+}
+
+// tryHandler checks if any declared handler matches the given error and executes it.
+// Returns (handled, exitFlag).
+func (e *Executor) tryHandler(err error, ctx *routineContext) (bool, bool) {
+	if ctx == nil || len(ctx.handlers) == 0 {
+		return false, false
+	}
+
+	var sigErr *signalError
+	isSignal := errors.As(err, &sigErr)
+
+	for _, h := range ctx.handlers {
+		matched := false
+		for _, cond := range h.conditions {
+			switch cond {
+			case "SQLEXCEPTION":
+				// Matches any error that is not NOT FOUND or SQLWARNING
+				if isSignal {
+					// Class '02' = NOT FOUND, class '01' = SQLWARNING, others = SQLEXCEPTION
+					if !strings.HasPrefix(sigErr.sqlState, "02") && !strings.HasPrefix(sigErr.sqlState, "01") {
+						matched = true
+					}
+				} else {
+					// Non-signal errors are generally SQLEXCEPTION
+					matched = true
+				}
+			case "NOT FOUND":
+				if isSignal && strings.HasPrefix(sigErr.sqlState, "02") {
+					matched = true
+				}
+			case "SQLWARNING":
+				if isSignal && strings.HasPrefix(sigErr.sqlState, "01") {
+					matched = true
+				}
+			default:
+				// Specific SQLSTATE or error number
+				if isSignal && sigErr.sqlState == cond {
+					matched = true
+				}
+			}
+		}
+		if matched {
+			// Store the current signal context for bare RESIGNAL
+			prevSignal := ctx.currentSignal
+			if isSignal {
+				ctx.currentSignal = sigErr
+			} else {
+				// Wrap non-signal errors as a generic SQLEXCEPTION signal
+				ctx.currentSignal = &signalError{
+					sqlState:    "45000",
+					messageText: err.Error(),
+				}
+			}
+			// Execute handler body
+			if h.body != "" {
+				stmts := splitTriggerBody(h.body)
+				if _, herr := e.execRoutineBodyWithContext(stmts, ctx); herr != nil {
+					ctx.currentSignal = prevSignal
+					return false, false
+				}
+			}
+			ctx.currentSignal = prevSignal
+			return true, h.handlerType == "EXIT"
+		}
+	}
+	return false, false
 }
 
 // substituteLocalVars replaces local variable references in a SQL string with their values.
