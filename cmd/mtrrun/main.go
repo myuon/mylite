@@ -101,9 +101,8 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 	//
 	// Out-of-scope suites (not enabled):
 	// - x: X Protocol (mysqlx) plugin required
-	// - binlog, binlog_gtid, binlog_nogtid: binary log / replication
+	// - binlog, binlog_gtid: binary log / replication
 	// - secondary_engine: secondary engine plugin required
-	// - encryption: TDE/keyring plugin required
 	enabledSuites := map[string]bool{
 		// Phase 1: Core engine (high pass rate)
 		"engine_funcs":  true,
@@ -133,6 +132,8 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		"auth_sec":      true,
 		"collations":             true,
 		"query_rewrite_plugins": true,
+		"encryption":            true,
+		"binlog_nogtid":         true,
 	}
 	var suiteNames []string
 	for _, e := range entries {
