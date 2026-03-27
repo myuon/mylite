@@ -4232,6 +4232,7 @@ type loadDataOptions struct {
 	setExprs          string   // raw SET clause
 	isReplace         bool
 	isIgnore          bool
+	charset           string // CHARACTER SET clause (e.g. "latin1", "utf8")
 }
 
 // reLoadData matches LOAD DATA [LOCAL] INFILE 'file' [REPLACE|IGNORE] INTO TABLE tablename ...
@@ -4440,6 +4441,21 @@ func parseLoadDataSQL(query string) (*loadDataOptions, error) {
 	opts.isReplace = reLoadReplace.MatchString(query)
 	opts.isIgnore = reLoadIgnore.MatchString(query)
 
+	// Parse CHARACTER SET clause
+	if csIdx := strings.Index(upper, "CHARACTER SET "); csIdx >= 0 {
+		afterCS := query[csIdx+len("CHARACTER SET "):]
+		fields := strings.Fields(afterCS)
+		if len(fields) > 0 {
+			opts.charset = strings.ToLower(strings.TrimRight(fields[0], ";"))
+		}
+	} else if csIdx := strings.Index(upper, "CHARSET "); csIdx >= 0 {
+		afterCS := query[csIdx+len("CHARSET "):]
+		fields := strings.Fields(afterCS)
+		if len(fields) > 0 {
+			opts.charset = strings.ToLower(strings.TrimRight(fields[0], ";"))
+		}
+	}
+
 	if idx := findColumnListStart(query); idx >= 0 {
 		end := strings.Index(query[idx:], ")")
 		if end >= 0 {
@@ -4541,20 +4557,35 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 		return nil, mysqlError(29, "HY000", fmt.Sprintf("File '%s' not found (OS errno 2 - No such file or directory)", opts.filePath))
 	}
 
-	// Convert encoding for non-UTF-8 data files (SJIS, EUC-JP, UCS2)
-	baseName := strings.ToLower(filepath.Base(filePath))
-	if strings.Contains(baseName, "ucs2") {
+	// Convert encoding for non-UTF-8 data files based on CHARACTER SET clause or filename heuristic
+	cs := opts.charset
+	if cs == "" {
+		// Fall back to filename-based heuristic
+		baseName := strings.ToLower(filepath.Base(filePath))
+		if strings.Contains(baseName, "ucs2") {
+			cs = "ucs2"
+		} else if strings.Contains(baseName, "sjis") || strings.Contains(baseName, "cp932") {
+			cs = "sjis"
+		} else if strings.Contains(baseName, "ujis") || strings.Contains(baseName, "eucjp") {
+			cs = "eucjp"
+		}
+	}
+	switch cs {
+	case "ucs2":
 		if decoded, err := decodeUCS2(data); err == nil {
 			data = decoded
 		}
-	} else if strings.Contains(baseName, "sjis") || strings.Contains(baseName, "cp932") {
+	case "sjis", "cp932":
 		if decoded, err := decodeSJIS(data); err == nil {
 			data = decoded
 		}
-	} else if strings.Contains(baseName, "ujis") || strings.Contains(baseName, "eucjp") {
+	case "ujis", "eucjp", "eucjpms":
 		if decoded, err := decodeEUCJP(data); err == nil {
 			data = decoded
 		}
+	case "latin1", "utf8", "utf8mb3", "utf8mb4", "binary", "ascii":
+		// latin1 is a superset of ASCII; Go strings handle bytes directly.
+		// utf8/utf8mb4 is Go's native encoding. No conversion needed.
 	}
 
 	content := string(data)

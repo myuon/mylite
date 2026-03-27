@@ -281,6 +281,12 @@ func newWorker(searchPaths []string) (*worker, error) {
 		if fi, err := os.Stat(stdData); err == nil && fi.IsDir() {
 			target := filepath.Join(tmpDir, "std_data")
 			if _, err := os.Lstat(target); os.IsNotExist(err) {
+				// Use absolute path for symlink target so it resolves correctly
+				// from the temp directory.
+				absStdData, absErr := filepath.Abs(stdData)
+				if absErr == nil {
+					stdData = absStdData
+				}
 				os.Symlink(stdData, target) //nolint:errcheck
 			}
 			break
@@ -628,6 +634,9 @@ func indent(s string) string {
 func resolveTestdataRoot() string {
 	local := "testdata/dolt-mysql-tests/files"
 	if fi, err := os.Stat(filepath.Join(local, "suite")); err == nil && fi.IsDir() {
+		if abs, err := filepath.Abs(local); err == nil {
+			return abs
+		}
 		return local
 	}
 	gitPath := ".git"
