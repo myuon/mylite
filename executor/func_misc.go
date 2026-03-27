@@ -71,16 +71,14 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		r, err := e.evalExpr(v.Exprs[2])
 		return r, true, err
 	case "isnull":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("ISNULL requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1(v.Exprs, "ISNULL")
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return int64(1), true, nil
 		}
+		_ = val
 		return int64(0), true, nil
 	case "nullif":
 		if len(v.Exprs) < 2 {
@@ -292,18 +290,11 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 	case "user", "session_user", "system_user":
 		return "root@localhost", true, nil
 	case "regexp_like":
-		if len(v.Exprs) < 2 {
-			return nil, true, fmt.Errorf("REGEXP_LIKE requires at least 2 arguments")
-		}
-		rlVal, err := e.evalExpr(v.Exprs[0])
+		rlVal, rlPat, hasNull, err := e.evalArgs2(v.Exprs, "REGEXP_LIKE")
 		if err != nil {
 			return nil, true, err
 		}
-		rlPat, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, true, err
-		}
-		if rlVal == nil || rlPat == nil {
+		if hasNull {
 			return nil, true, nil
 		}
 		rlFlags := ""
@@ -329,14 +320,11 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return int64(0), true, nil
 	case "is_ipv4":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("IS_IPV4 requires 1 argument")
-		}
-		ipVal, err := e.evalExpr(v.Exprs[0])
+		ipVal, isNull, err := e.evalArg1(v.Exprs, "IS_IPV4")
 		if err != nil {
 			return nil, true, err
 		}
-		if ipVal == nil {
+		if isNull {
 			return int64(0), true, nil
 		}
 		ipStr := toString(ipVal)
@@ -359,27 +347,21 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 	case "current_role":
 		return "NONE", true, nil
 	case "inet_ntoa":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("INET_NTOA requires 1 argument")
-		}
-		inVal, err := e.evalExpr(v.Exprs[0])
+		inVal, isNull, err := e.evalArg1(v.Exprs, "INET_NTOA")
 		if err != nil {
 			return nil, true, err
 		}
-		if inVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		inN := uint32(toInt64(inVal))
 		return fmt.Sprintf("%d.%d.%d.%d", (inN>>24)&0xFF, (inN>>16)&0xFF, (inN>>8)&0xFF, inN&0xFF), true, nil
 	case "inet_aton":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("INET_ATON requires 1 argument")
-		}
-		iaVal, err := e.evalExpr(v.Exprs[0])
+		iaVal, isNull, err := e.evalArg1(v.Exprs, "INET_ATON")
 		if err != nil {
 			return nil, true, err
 		}
-		if iaVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		iaParts := strings.Split(toString(iaVal), ".")
@@ -398,30 +380,20 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 	case "coercibility":
 		return int64(4), true, nil
 	case "st_astext", "st_aswkt":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		stVal, err := e.evalExpr(v.Exprs[0])
+		stVal, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if stVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return toString(stVal), true, nil
 	case "st_equals":
-		if len(v.Exprs) < 2 {
-			return nil, true, fmt.Errorf("ST_EQUALS requires 2 arguments")
-		}
-		steA, err := e.evalExpr(v.Exprs[0])
+		steA, steB, hasNull, err := e.evalArgs2(v.Exprs, "ST_EQUALS")
 		if err != nil {
 			return nil, true, err
 		}
-		steB, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, true, err
-		}
-		if steA == nil || steB == nil {
+		if hasNull {
 			return nil, true, nil
 		}
 		if toString(steA) == toString(steB) {
@@ -429,18 +401,11 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return int64(0), true, nil
 	case "mbrintersects", "st_intersects", "mbrwithin", "st_within", "mbrcontains", "st_contains":
-		if len(v.Exprs) < 2 {
-			return nil, true, fmt.Errorf("%s requires 2 arguments", strings.ToUpper(name))
-		}
-		g1Val, err := e.evalExpr(v.Exprs[0])
+		g1Val, g2Val, hasNull, err := e.evalArgs2(v.Exprs, strings.ToUpper(name))
 		if err != nil {
 			return nil, true, err
 		}
-		g2Val, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, true, err
-		}
-		if g1Val == nil || g2Val == nil {
+		if hasNull {
 			return nil, true, nil
 		}
 		g1Str := toString(g1Val)
@@ -480,14 +445,11 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 			uint16(uuidB[8])<<8|uint16(uuidB[9]),
 			uint64(uuidB[10])<<40|uint64(uuidB[11])<<32|uint64(uuidB[12])<<24|uint64(uuidB[13])<<16|uint64(uuidB[14])<<8|uint64(uuidB[15])), true, nil
 	case "is_ipv6":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("IS_IPV6 requires 1 argument")
-		}
-		ip6Val, err := e.evalExpr(v.Exprs[0])
+		ip6Val, isNull, err := e.evalArg1(v.Exprs, "IS_IPV6")
 		if err != nil {
 			return nil, true, err
 		}
-		if ip6Val == nil {
+		if isNull {
 			return int64(0), true, nil
 		}
 		ip6Str := toString(ip6Val)
@@ -496,14 +458,11 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return int64(0), true, nil
 	case "is_ipv4_mapped":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("IS_IPV4_MAPPED requires 1 argument")
-		}
-		imVal, err := e.evalExpr(v.Exprs[0])
+		imVal, isNull, err := e.evalArg1(v.Exprs, "IS_IPV4_MAPPED")
 		if err != nil {
 			return nil, true, err
 		}
-		if imVal == nil {
+		if isNull {
 			return int64(0), true, nil
 		}
 		imBytes := []byte(toString(imVal))
@@ -521,14 +480,11 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return int64(0), true, nil
 	case "is_ipv4_compat":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("IS_IPV4_COMPAT requires 1 argument")
-		}
-		icVal, err := e.evalExpr(v.Exprs[0])
+		icVal, isNull, err := e.evalArg1(v.Exprs, "IS_IPV4_COMPAT")
 		if err != nil {
 			return nil, true, err
 		}
-		if icVal == nil {
+		if isNull {
 			return int64(0), true, nil
 		}
 		icBytes := []byte(toString(icVal))
@@ -546,14 +502,11 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return int64(0), true, nil
 	case "sha", "sha1":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("SHA requires 1 argument")
-		}
-		shaVal, err := e.evalExpr(v.Exprs[0])
+		shaVal, isNull, err := e.evalArg1(v.Exprs, "SHA")
 		if err != nil {
 			return nil, true, err
 		}
-		if shaVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return fmt.Sprintf("%x", md5.Sum([]byte(toString(shaVal)))), true, nil
@@ -562,14 +515,11 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 	case "master_pos_wait":
 		return int64(0), true, nil
 	case "statement_digest":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		sdVal, err := e.evalExpr(v.Exprs[0])
+		sdVal, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if sdVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		sdHash := md5.Sum([]byte(toString(sdVal)))
@@ -583,38 +533,29 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 	case "aes_encrypt", "aes_decrypt":
 		return nil, true, nil
 	case "uuid_to_bin":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		utbVal, err := e.evalExpr(v.Exprs[0])
+		utbVal, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if utbVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return strings.ReplaceAll(toString(utbVal), "-", ""), true, nil
 	case "bin_to_uuid":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		btuVal, err := e.evalExpr(v.Exprs[0])
+		btuVal, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if btuVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return toString(btuVal), true, nil
 	case "to_base64":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		tb64Val, err := e.evalExpr(v.Exprs[0])
+		tb64Val, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if tb64Val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		tb64Src := []byte(toString(tb64Val))
@@ -644,26 +585,20 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return string(tb64Buf), true, nil
 	case "from_base64":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		fb64Val, err := e.evalExpr(v.Exprs[0])
+		fb64Val, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if fb64Val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return toString(fb64Val), true, nil // simplified stub
 	case "random_bytes":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		rbVal, err := e.evalExpr(v.Exprs[0])
+		rbVal, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if rbVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		rbN := int(toInt64(rbVal))
@@ -684,14 +619,11 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 	case "uuid_short":
 		return int64(rand.Int63()), true, nil
 	case "is_uuid":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		iuVal, err := e.evalExpr(v.Exprs[0])
+		iuVal, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if iuVal == nil {
+		if isNull {
 			return int64(0), true, nil
 		}
 		iuStr := toString(iuVal)

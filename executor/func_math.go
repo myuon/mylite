@@ -29,14 +29,11 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		r := rand.New(rand.NewSource(toInt64(seedVal)))
 		return r.Float64(), true, nil
 	case "abs":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("ABS requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1(v.Exprs, "ABS")
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		f := toFloat(val)
@@ -53,27 +50,21 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return math.Pi, true, nil
 	case "floor":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("FLOOR requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1(v.Exprs, "FLOOR")
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		f := toFloat(val)
 		return int64(f), true, nil
 	case "ceil", "ceiling":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("CEIL requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1(v.Exprs, "CEIL")
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		f := toFloat(val)
@@ -83,14 +74,11 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return n, true, nil
 	case "round":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("ROUND requires at least 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1(v.Exprs, "ROUND")
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		f := toFloat(val)
@@ -124,11 +112,11 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		if len(v.Exprs) < 2 {
 			return nil, true, fmt.Errorf("TRUNCATE requires 2 arguments")
 		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1(v.Exprs, "TRUNCATE")
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		dv, err := e.evalExpr(v.Exprs[1])
@@ -171,18 +159,11 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return int64(f/factor) * int64(factor), true, nil
 	case "mod":
-		if len(v.Exprs) < 2 {
-			return nil, true, fmt.Errorf("MOD requires 2 arguments")
-		}
-		v0, err := e.evalExpr(v.Exprs[0])
+		v0, v1, hasNull, err := e.evalArgs2(v.Exprs, "MOD")
 		if err != nil {
 			return nil, true, err
 		}
-		v1, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, true, err
-		}
-		if v0 == nil || v1 == nil {
+		if hasNull {
 			return nil, true, nil
 		}
 		d := toInt64(v1)
@@ -191,14 +172,11 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return toInt64(v0) % d, true, nil
 	case "sqrt":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("SQRT requires 1 argument")
-		}
-		sqrtVal, err := e.evalExpr(v.Exprs[0])
+		sqrtVal, isNull, err := e.evalArg1(v.Exprs, "SQRT")
 		if err != nil {
 			return nil, true, err
 		}
-		if sqrtVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		sqrtF := toFloat(sqrtVal)
@@ -207,14 +185,11 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return math.Sqrt(sqrtF), true, nil
 	case "sign":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("SIGN requires 1 argument")
-		}
-		signVal, err := e.evalExpr(v.Exprs[0])
+		signVal, isNull, err := e.evalArg1(v.Exprs, "SIGN")
 		if err != nil {
 			return nil, true, err
 		}
-		if signVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		signF := toFloat(signVal)
@@ -225,14 +200,11 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return int64(0), true, nil
 	case "ln":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("LN requires 1 argument")
-		}
-		lnVal, err := e.evalExpr(v.Exprs[0])
+		lnVal, isNull, err := e.evalArg1(v.Exprs, "LN")
 		if err != nil {
 			return nil, true, err
 		}
-		if lnVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		lnF := toFloat(lnVal)
@@ -275,14 +247,11 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return nil, true, fmt.Errorf("LOG requires 1 or 2 arguments")
 	case "log2":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("LOG2 requires 1 argument")
-		}
-		log2Val, err := e.evalExpr(v.Exprs[0])
+		log2Val, isNull, err := e.evalArg1(v.Exprs, "LOG2")
 		if err != nil {
 			return nil, true, err
 		}
-		if log2Val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		log2F := toFloat(log2Val)
@@ -291,14 +260,11 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return math.Log2(log2F), true, nil
 	case "log10":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("LOG10 requires 1 argument")
-		}
-		log10Val, err := e.evalExpr(v.Exprs[0])
+		log10Val, isNull, err := e.evalArg1(v.Exprs, "LOG10")
 		if err != nil {
 			return nil, true, err
 		}
-		if log10Val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		log10F := toFloat(log10Val)
@@ -307,42 +273,29 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return math.Log10(log10F), true, nil
 	case "exp":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("EXP requires 1 argument")
-		}
-		expVal, err := e.evalExpr(v.Exprs[0])
+		expVal, isNull, err := e.evalArg1(v.Exprs, "EXP")
 		if err != nil {
 			return nil, true, err
 		}
-		if expVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return math.Exp(toFloat(expVal)), true, nil
 	case "pow", "power":
-		if len(v.Exprs) < 2 {
-			return nil, true, fmt.Errorf("POW requires 2 arguments")
-		}
-		powBase, err := e.evalExpr(v.Exprs[0])
+		powBase, powExp, hasNull, err := e.evalArgs2(v.Exprs, "POW")
 		if err != nil {
 			return nil, true, err
 		}
-		powExp, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, true, err
-		}
-		if powBase == nil || powExp == nil {
+		if hasNull {
 			return nil, true, nil
 		}
 		return math.Pow(toFloat(powBase), toFloat(powExp)), true, nil
 	case "crc32":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("CRC32 requires 1 argument")
-		}
-		crcVal, err := e.evalExpr(v.Exprs[0])
+		crcVal, isNull, err := e.evalArg1(v.Exprs, "CRC32")
 		if err != nil {
 			return nil, true, err
 		}
-		if crcVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		crcS := toString(crcVal)
@@ -359,38 +312,29 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return int64(crcResult ^ 0xFFFFFFFF), true, nil
 	case "degrees":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		degVal, err := e.evalExpr(v.Exprs[0])
+		degVal, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if degVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return toFloat(degVal) * 180 / math.Pi, true, nil
 	case "radians":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		radVal, err := e.evalExpr(v.Exprs[0])
+		radVal, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if radVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return toFloat(radVal) * math.Pi / 180, true, nil
 	case "acos":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("ACOS requires 1 argument")
-		}
-		acosVal, err := e.evalExpr(v.Exprs[0])
+		acosVal, isNull, err := e.evalArg1(v.Exprs, "ACOS")
 		if err != nil {
 			return nil, true, err
 		}
-		if acosVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		acosF := toFloat(acosVal)
@@ -399,14 +343,11 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return math.Acos(acosF), true, nil
 	case "asin":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("ASIN requires 1 argument")
-		}
-		asinVal, err := e.evalExpr(v.Exprs[0])
+		asinVal, isNull, err := e.evalArg1(v.Exprs, "ASIN")
 		if err != nil {
 			return nil, true, err
 		}
-		if asinVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		asinF := toFloat(asinVal)
@@ -415,14 +356,11 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return math.Asin(asinF), true, nil
 	case "atan", "atan2":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		atanVal, err := e.evalExpr(v.Exprs[0])
+		atanVal, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if atanVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		if len(v.Exprs) >= 2 {
@@ -437,50 +375,38 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return math.Atan(toFloat(atanVal)), true, nil
 	case "sin":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		sinVal, err := e.evalExpr(v.Exprs[0])
+		sinVal, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if sinVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return math.Sin(toFloat(sinVal)), true, nil
 	case "cos":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		cosVal, err := e.evalExpr(v.Exprs[0])
+		cosVal, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if cosVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return math.Cos(toFloat(cosVal)), true, nil
 	case "tan":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		tanVal, err := e.evalExpr(v.Exprs[0])
+		tanVal, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if tanVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return math.Tan(toFloat(tanVal)), true, nil
 	case "cot":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		cotVal, err := e.evalExpr(v.Exprs[0])
+		cotVal, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if cotVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		cotF := toFloat(cotVal)
@@ -490,14 +416,11 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return math.Cos(cotF) / sinV, true, nil
 	case "bit_count":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("BIT_COUNT requires 1 argument")
-		}
-		bcVal, err := e.evalExpr(v.Exprs[0])
+		bcVal, isNull, err := e.evalArg1(v.Exprs, "BIT_COUNT")
 		if err != nil {
 			return nil, true, err
 		}
-		if bcVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		bcU := uint64(toInt64(bcVal))
@@ -535,14 +458,11 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{},
 		}
 		return strings.ToUpper(strconv.FormatInt(n, toBase)), true, nil
 	case "bin":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		n := toInt64(val)

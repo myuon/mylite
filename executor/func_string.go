@@ -33,14 +33,11 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 		}
 		return sb.String(), true, nil
 	case "md5":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("MD5 requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1(v.Exprs, "MD5")
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		sum := md5.Sum([]byte(toString(val)))
@@ -70,14 +67,11 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 		}
 		return strings.Join(parts, sep), true, nil
 	case "upper", "ucase":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("UPPER requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1(v.Exprs, "UPPER")
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		s := toString(val)
@@ -89,14 +83,11 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 		}
 		return strings.ToUpper(s), true, nil
 	case "lower", "lcase":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("LOWER requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1(v.Exprs, "LOWER")
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		if e.isBinaryExpr(v.Exprs[0]) {
@@ -104,14 +95,11 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 		}
 		return strings.ToLower(toString(val)), true, nil
 	case "length", "octet_length":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("LENGTH requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1(v.Exprs, "LENGTH")
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		s := toString(val)
@@ -123,26 +111,20 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 		}
 		return int64(len(s)), true, nil
 	case "char_length", "character_length":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("CHAR_LENGTH requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1(v.Exprs, "CHAR_LENGTH")
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return int64(mysqlCharLen(toString(val))), true, nil
 	case "ascii", "ord":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("ASCII requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1(v.Exprs, "ASCII")
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		s := toString(val)
@@ -151,14 +133,11 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 		}
 		return int64(s[0]), true, nil
 	case "load_file":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		filePath := toString(val)
@@ -240,38 +219,29 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 		}
 		return string(s[pos:]), true, nil
 	case "trim":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("TRIM requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1(v.Exprs, "TRIM")
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return strings.TrimSpace(toString(val)), true, nil
 	case "ltrim":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("LTRIM requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1(v.Exprs, "LTRIM")
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return strings.TrimLeft(toString(val), " \t\n\r"), true, nil
 	case "rtrim":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("RTRIM requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1(v.Exprs, "RTRIM")
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return strings.TrimRight(toString(val), " \t\n\r"), true, nil
@@ -352,14 +322,11 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 		}
 		return string(s[len(s)-n:]), true, nil
 	case "hex":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		switch tv := val.(type) {
@@ -376,14 +343,11 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 			return hexBuf.String(), true, nil
 		}
 	case "unhex":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		decoded, err := hex.DecodeString(toString(val))
@@ -392,18 +356,11 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 		}
 		return string(decoded), true, nil
 	case "strcmp":
-		if len(v.Exprs) < 2 {
-			return nil, true, fmt.Errorf("STRCMP requires 2 arguments")
-		}
-		v0, err := e.evalExpr(v.Exprs[0])
+		v0, v1, hasNull, err := e.evalArgs2(v.Exprs, "STRCMP")
 		if err != nil {
 			return nil, true, err
 		}
-		v1, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, true, err
-		}
-		if v0 == nil || v1 == nil {
+		if hasNull {
 			return nil, true, nil
 		}
 		s0 := strings.ToLower(toString(v0))
@@ -415,14 +372,11 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 		}
 		return int64(0), true, nil
 	case "reverse":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		runes := []rune(toString(val))
@@ -431,14 +385,11 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 		}
 		return string(runes), true, nil
 	case "oct":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		n := toInt64(val)
@@ -468,18 +419,11 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 		}
 		return strings.Repeat(str, count), true, nil
 	case "instr":
-		if len(v.Exprs) < 2 {
-			return nil, true, fmt.Errorf("INSTR requires 2 arguments")
-		}
-		strVal, err := e.evalExpr(v.Exprs[0])
+		strVal, subVal, hasNull, err := e.evalArgs2(v.Exprs, "INSTR")
 		if err != nil {
 			return nil, true, err
 		}
-		subVal, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, true, err
-		}
-		if strVal == nil || subVal == nil {
+		if hasNull {
 			return nil, true, nil
 		}
 		s := []rune(toString(strVal))
@@ -601,14 +545,11 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 		pad = pad[:needed]
 		return string(append(s, pad...)), true, nil
 	case "space":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("SPACE requires 1 argument")
-		}
-		spVal, err := e.evalExpr(v.Exprs[0])
+		spVal, isNull, err := e.evalArg1(v.Exprs, "SPACE")
 		if err != nil {
 			return nil, true, err
 		}
-		if spVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		spN := int(toInt64(spVal))
@@ -654,26 +595,20 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 		}
 		return strings.Join(siParts[len(siParts)-siN:], siD), true, nil
 	case "soundex":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("SOUNDEX requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1(v.Exprs, "SOUNDEX")
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return soundex(toString(val)), true, nil
 	case "bit_length":
-		if len(v.Exprs) < 1 {
-			return nil, true, fmt.Errorf("BIT_LENGTH requires 1 argument")
-		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, isNull, err := e.evalArg1(v.Exprs, "BIT_LENGTH")
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return int64(len(toString(val))) * 8, true, nil
@@ -700,18 +635,11 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 		}
 		return int64(0), true, nil
 	case "find_in_set":
-		if len(v.Exprs) < 2 {
-			return nil, true, fmt.Errorf("FIND_IN_SET requires 2 arguments")
-		}
-		fisNeedle, err := e.evalExpr(v.Exprs[0])
+		fisNeedle, fisHaystack, hasNull, err := e.evalArgs2(v.Exprs, "FIND_IN_SET")
 		if err != nil {
 			return nil, true, err
 		}
-		fisHaystack, err := e.evalExpr(v.Exprs[1])
-		if err != nil {
-			return nil, true, err
-		}
-		if fisNeedle == nil || fisHaystack == nil {
+		if hasNull {
 			return nil, true, nil
 		}
 		fisNS := toString(fisNeedle)
@@ -816,14 +744,11 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 		}
 		return strings.Join(esParts, esSep), true, nil
 	case "quote":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		qVal, err := e.evalExpr(v.Exprs[0])
+		qVal, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if qVal == nil {
+		if isNull {
 			return "NULL", true, nil
 		}
 		qStr := toString(qVal)
@@ -831,14 +756,11 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{
 		qStr = strings.ReplaceAll(qStr, "'", "\\'")
 		return "'" + qStr + "'", true, nil
 	case "weight_string":
-		if len(v.Exprs) < 1 {
-			return nil, true, nil
-		}
-		wsVal, err := e.evalExpr(v.Exprs[0])
+		wsVal, isNull, err := e.evalArg1Quiet(v.Exprs)
 		if err != nil {
 			return nil, true, err
 		}
-		if wsVal == nil {
+		if isNull {
 			return nil, true, nil
 		}
 		return toString(wsVal), true, nil
