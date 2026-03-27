@@ -226,6 +226,16 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 			}
 		}
 
+		// Enforce FOREIGN KEY constraints for rows being deleted
+		for idx := range deleteSet {
+			tbl.Unlock()
+			if fkErr := e.checkForeignKeyOnDelete(deleteDB, tableName, tbl.Rows[idx]); fkErr != nil {
+				tbl.Lock()
+				return nil, fkErr
+			}
+			tbl.Lock()
+		}
+
 		newRows := make([]storage.Row, 0, len(tbl.Rows)-len(deleteSet))
 		for i, row := range tbl.Rows {
 			if !deleteSet[i] {
@@ -278,6 +288,14 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 			// Fire BEFORE DELETE triggers
 			tbl.Unlock()
 			if err := e.fireTriggers(tableName, "BEFORE", "DELETE", nil, row); err != nil {
+				tbl.Lock()
+				return nil, err
+			}
+			tbl.Lock()
+
+			// Enforce FOREIGN KEY constraints: check child rows referencing this parent row
+			tbl.Unlock()
+			if err := e.checkForeignKeyOnDelete(deleteDB, tableName, row); err != nil {
 				tbl.Lock()
 				return nil, err
 			}
