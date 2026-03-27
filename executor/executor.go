@@ -2,14 +2,11 @@ package executor
 
 import (
 	"bytes"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"math/big"
-	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
