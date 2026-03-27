@@ -175,6 +175,30 @@ func isAlphaNum(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
 }
 
+// isStandaloneEnd returns true if the upper-cased line represents a standalone
+// END (optionally followed by a label) but NOT "END IF", "END WHILE",
+// "END LOOP", "END CASE", or "END REPEAT".
+func isStandaloneEnd(lineUpper string) bool {
+	if lineUpper == "END" {
+		return true
+	}
+	if !strings.HasPrefix(lineUpper, "END ") {
+		return false
+	}
+	after := strings.TrimSpace(lineUpper[4:])
+	switch after {
+	case "IF", "WHILE", "LOOP", "CASE", "REPEAT":
+		return false
+	}
+	// Also reject if it starts with one of these keywords (e.g. "END IF label")
+	for _, kw := range []string{"IF ", "WHILE ", "LOOP ", "CASE ", "REPEAT "} {
+		if strings.HasPrefix(after, kw) {
+			return false
+		}
+	}
+	return true
+}
+
 // countOccurrences counts the number of non-overlapping occurrences of substr in s.
 // It only counts whole-word occurrences where "IF " means IF followed by space (not part of END IF).
 func countOccurrences(s, substr string) int {
@@ -1047,6 +1071,7 @@ type routineContext struct {
 	notFoundHandlerVar string
 	done               bool
 	handlers           []handlerDef
+	currentSignal      *signalError // the signal currently being handled (for bare RESIGNAL)
 }
 
 // execRoutineBody executes the body of a stored procedure or function, supporting
@@ -1598,7 +1623,7 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 						if strings.HasPrefix(lineUpper, "BEGIN") {
 							beginDepth++
 						}
-						if strings.HasPrefix(lineUpper, "END") {
+						if isStandaloneEnd(lineUpper) {
 							beginDepth--
 						}
 						beginBlock += ";\n" + line
@@ -1671,7 +1696,15 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 
 		// Handle RESIGNAL
 		if strings.HasPrefix(stmtUpper, "RESIGNAL") {
-			// RESIGNAL re-raises the current condition; for now treat it like SIGNAL
+			resignalRest := strings.TrimSpace(stmtStr[len("RESIGNAL"):])
+			if resignalRest == "" {
+				// Bare RESIGNAL: re-raise the current condition being handled
+				if ctx != nil && ctx.currentSignal != nil {
+					return nil, ctx.currentSignal
+				}
+				// No current signal context; raise default
+				return nil, &signalError{sqlState: "45000"}
+			}
 			sigErr := e.parseSignal(stmtStr, localVars)
 			return nil, sigErr
 		}
@@ -1692,7 +1725,7 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 				if lineUpper == "BEGIN" || strings.HasPrefix(lineUpper, "BEGIN\n") {
 					beginDepth++
 				}
-				if lineUpper == "END" || strings.HasPrefix(lineUpper, "END ") {
+				if isStandaloneEnd(lineUpper) {
 					beginDepth--
 				}
 				beginBlock += ";\n" + line
@@ -1953,9 +1986,6 @@ func (e *Executor) parseSignal(stmtStr string, localVars map[string]interface{})
 		rest = strings.TrimSpace(stmtStr[len("SIGNAL "):])
 	} else if strings.HasPrefix(upper, "RESIGNAL") {
 		rest = strings.TrimSpace(stmtStr[len("RESIGNAL"):])
-		if rest == "" {
-			return &signalError{sqlState: "45000"}
-		}
 	}
 
 	sigErr := &signalError{sqlState: "45000"}
@@ -2054,11 +2084,26 @@ func (e *Executor) tryHandler(err error, ctx *routineContext) (bool, bool) {
 			}
 		}
 		if matched {
+			// Store the current signal context for bare RESIGNAL
+			prevSignal := ctx.currentSignal
+			if isSignal {
+				ctx.currentSignal = sigErr
+			} else {
+				// Wrap non-signal errors as a generic SQLEXCEPTION signal
+				ctx.currentSignal = &signalError{
+					sqlState:    "45000",
+					messageText: err.Error(),
+				}
+			}
 			// Execute handler body
 			if h.body != "" {
 				stmts := splitTriggerBody(h.body)
-				e.execRoutineBodyWithContext(stmts, ctx) //nolint:errcheck
+				if _, herr := e.execRoutineBodyWithContext(stmts, ctx); herr != nil {
+					ctx.currentSignal = prevSignal
+					return false, false
+				}
 			}
+			ctx.currentSignal = prevSignal
 			return true, h.handlerType == "EXIT"
 		}
 	}
