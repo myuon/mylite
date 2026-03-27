@@ -780,6 +780,8 @@ func (e *Executor) getTableRowsWithAliasDB(dbName, tableName, alias string) ([]s
 // matchRowToTable returns the index of the row in tbl.Rows that matches
 // matchedRow by comparing column values using qualified (alias.col, tableName.col)
 // or unqualified (col) key lookups. Returns -1 if no match is found.
+// This is the strict variant used by DELETE: every column in tbl.Def.Columns
+// must be found in matchedRow for a match.
 func matchRowToTable(matchedRow storage.Row, tbl *storage.Table, alias, tableName string) int {
 	for i, existingRow := range tbl.Rows {
 		allMatch := true
@@ -802,6 +804,37 @@ func matchRowToTable(matchedRow storage.Row, tbl *storage.Table, alias, tableNam
 			}
 		}
 		if allMatch {
+			return i
+		}
+	}
+	return -1
+}
+
+// matchRowToTableLenient returns the index of the row in tbl.Rows that matches
+// matchedRow using a lenient strategy: it iterates over the storage row's keys,
+// skips columns not found in matchedRow, and requires at least one column to match.
+// This preserves the original multi-table UPDATE matching behavior.
+func matchRowToTableLenient(matchedRow storage.Row, tbl *storage.Table, alias, tableName string) int {
+	for i, existingRow := range tbl.Rows {
+		isMatch := true
+		matchedCols := 0
+		for k, v := range existingRow {
+			qualKey := alias + "." + k
+			if mv, ok := matchedRow[qualKey]; ok {
+				if fmt.Sprintf("%v", mv) != fmt.Sprintf("%v", v) {
+					isMatch = false
+					break
+				}
+				matchedCols++
+			} else if mv, ok := matchedRow[tableName+"."+k]; ok {
+				if fmt.Sprintf("%v", mv) != fmt.Sprintf("%v", v) {
+					isMatch = false
+					break
+				}
+				matchedCols++
+			}
+		}
+		if isMatch && matchedCols > 0 {
 			return i
 		}
 	}
