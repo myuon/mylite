@@ -6555,6 +6555,23 @@ func decimalMaxString(m, d int) string {
 	return strings.Repeat("9", intDigits) + "." + strings.Repeat("9", d)
 }
 
+// coerceColumnValue applies the standard DML value coercion chain for a column:
+// binary padding, decimal formatting, enum/set validation, datetime coercion,
+// integer coercion, and bit coercion.
+func coerceColumnValue(colType string, val interface{}) interface{} {
+	if padLen := binaryPadLength(colType); padLen > 0 && val != nil {
+		val = padBinaryValue(val, padLen)
+	}
+	if val != nil {
+		val = formatDecimalValue(colType, val)
+		val = validateEnumSetValue(colType, val)
+		val = coerceDateTimeValue(colType, val)
+		val = coerceIntegerValue(colType, val)
+		val = coerceBitValue(colType, val)
+	}
+	return val
+}
+
 // formatDecimalValue formats a value for DECIMAL(M,D), DOUBLE(M,D), or FLOAT(M,D) columns.
 func formatDecimalValue(colType string, v interface{}) interface{} {
 	lower := strings.ToLower(colType)

@@ -286,17 +286,8 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					break
 				}
 				colName := colNames[i]
-				if v != nil {
-					if cm, ok := colMetaMap[colName]; ok {
-						if cm.padLen > 0 {
-							v = padBinaryValue(v, cm.padLen)
-						}
-						v = formatDecimalValue(cm.col.Type, v)
-						v = validateEnumSetValue(cm.col.Type, v)
-						v = coerceDateTimeValue(cm.col.Type, v)
-						v = coerceIntegerValue(cm.col.Type, v)
-						v = coerceBitValue(cm.col.Type, v)
-					}
+				if cm, ok := colMetaMap[colName]; ok {
+					v = coerceColumnValue(cm.col.Type, v)
 				}
 				row[colName] = v
 			}
@@ -650,9 +641,6 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			// Pad BINARY(N), format DECIMAL, validate ENUM/SET.
 			for _, col := range tbl.Def.Columns {
 				if col.Name == colNames[i] {
-					if padLen := binaryPadLength(col.Type); padLen > 0 && v != nil {
-						v = padBinaryValue(v, padLen)
-					}
 					if v != nil {
 						// In strict mode, check DECIMAL range and unsigned constraint before clipping
 						if e.isStrictMode() {
@@ -688,12 +676,8 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 								}
 							}
 						}
-						v = formatDecimalValue(col.Type, v)
-						v = validateEnumSetValue(col.Type, v)
-						v = coerceDateTimeValue(col.Type, v)
-						v = coerceIntegerValue(col.Type, v)
-						v = coerceBitValue(col.Type, v)
 					}
+					v = coerceColumnValue(col.Type, v)
 					break
 				}
 			}
@@ -820,16 +804,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					// Pad BINARY(N) values, coerce DATE/TIME.
 					for _, col := range tbl.Def.Columns {
 						if col.Name == colName {
-							if padLen := binaryPadLength(col.Type); padLen > 0 && val != nil {
-								val = padBinaryValue(val, padLen)
-							}
-							if val != nil {
-								val = formatDecimalValue(col.Type, val)
-								val = validateEnumSetValue(col.Type, val)
-								val = coerceDateTimeValue(col.Type, val)
-								val = coerceIntegerValue(col.Type, val)
-								val = coerceBitValue(col.Type, val)
-							}
+							val = coerceColumnValue(col.Type, val)
 							break
 						}
 					}

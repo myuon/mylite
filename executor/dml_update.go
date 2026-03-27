@@ -293,10 +293,7 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 			}
 			for _, col := range tbl.Def.Columns {
 				if col.Name == colName {
-					if padLen := binaryPadLength(col.Type); padLen > 0 && val != nil {
-						val = padBinaryValue(val, padLen)
-					}
-					if val != nil {
+						if val != nil {
 						colUpper := strings.ToUpper(col.Type)
 						// In non-strict mode, invalid numeric strings are coerced to 0 with warning.
 						isNumericType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "NUMERIC") ||
@@ -332,12 +329,8 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 								}
 							}
 						}
-						val = formatDecimalValue(col.Type, val)
-						val = validateEnumSetValue(col.Type, val)
-						val = coerceDateTimeValue(col.Type, val)
-						val = coerceIntegerValue(col.Type, val)
-						val = coerceBitValue(col.Type, val)
 					}
+					val = coerceColumnValue(col.Type, val)
 					break
 				}
 			}
@@ -814,19 +807,11 @@ func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error)
 					// Apply the same type coercions used by single-table UPDATE.
 					for _, col := range tbl.Def.Columns {
 						if col.Name == colName {
-							if padLen := binaryPadLength(col.Type); padLen > 0 && val != nil {
-								val = padBinaryValue(val, padLen)
-							}
-							if val != nil {
-								val = formatDecimalValue(col.Type, val)
-								val = validateEnumSetValue(col.Type, val)
-								val = coerceDateTimeValue(col.Type, val)
-								val = coerceIntegerValue(col.Type, val)
-								val = coerceBitValue(col.Type, val)
-							} else if !col.Nullable {
+							if val == nil && !col.Nullable {
 								tbl.Unlock()
 								return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", colName))
 							}
+							val = coerceColumnValue(col.Type, val)
 							break
 						}
 					}
