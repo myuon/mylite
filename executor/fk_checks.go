@@ -34,7 +34,7 @@ func (e *Executor) checkForeignKeyOnInsert(dbName, tableName string, row storage
 	}
 
 	for _, fk := range def.ForeignKeys {
-		if err := e.checkParentRowExists(dbName, fk, row); err != nil {
+		if err := e.checkParentRowExists(dbName, tableName, fk, row); err != nil {
 			return err
 		}
 	}
@@ -84,7 +84,7 @@ func (e *Executor) checkForeignKeyOnUpdate(dbName, tableName string, oldRow, new
 			}
 		}
 		if changed {
-			if err := e.checkParentRowExists(dbName, fk, newRow); err != nil {
+			if err := e.checkParentRowExists(dbName, tableName, fk, newRow); err != nil {
 				return err
 			}
 		}
@@ -95,7 +95,7 @@ func (e *Executor) checkForeignKeyOnUpdate(dbName, tableName string, oldRow, new
 }
 
 // checkParentRowExists verifies that the parent row referenced by the FK exists.
-func (e *Executor) checkParentRowExists(dbName string, fk catalog.ForeignKeyDef, row storage.Row) error {
+func (e *Executor) checkParentRowExists(dbName, childTableName string, fk catalog.ForeignKeyDef, row storage.Row) error {
 	// If any FK column is NULL, the constraint is satisfied (MySQL behavior)
 	for _, col := range fk.Columns {
 		if row[col] == nil {
@@ -115,18 +115,13 @@ func (e *Executor) checkParentRowExists(dbName string, fk catalog.ForeignKeyDef,
 		}
 	}
 
-	// Build the error message with the FK column values
-	vals := make([]string, len(fk.Columns))
-	for i, col := range fk.Columns {
-		vals[i] = fmt.Sprintf("%v", row[col])
-	}
-	childRef := fmt.Sprintf("`%s`.`%s`", dbName, fk.ReferencedTable)
+	parentRef := fmt.Sprintf("`%s`.`%s`", dbName, fk.ReferencedTable)
 	return mysqlError(1452, "23000",
 		fmt.Sprintf("Cannot add or update a child row: a foreign key constraint fails (`%s`.`%s`, CONSTRAINT `%s` FOREIGN KEY (%s) REFERENCES %s (%s))",
-			dbName, fk.ReferencedTable, // This should be the child table but MySQL uses parent in message
+			dbName, childTableName,
 			fk.Name,
 			formatColumnList(fk.Columns),
-			childRef,
+			parentRef,
 			formatColumnList(fk.ReferencedColumns)))
 }
 
@@ -138,7 +133,14 @@ func (e *Executor) handleParentRowRemoval(dbName, tableName string, parentRow st
 		return nil
 	}
 
-	for childTableName, childDef := range db.Tables {
+	// Use ListTables() which acquires the read lock, to avoid data race on db.Tables map
+	tableNames := db.ListTables()
+
+	for _, childTableName := range tableNames {
+		childDef, err := db.GetTable(childTableName)
+		if err != nil {
+			continue
+		}
 		for _, fk := range childDef.ForeignKeys {
 			if !strings.EqualFold(fk.ReferencedTable, tableName) {
 				continue
@@ -156,7 +158,7 @@ func (e *Executor) handleParentRowRemoval(dbName, tableName string, parentRow st
 
 			hasChildren := false
 			for _, childRow := range childTbl.Rows {
-				if fkRowMatchesParent(fk.Columns, fk.ReferencedColumns, childRow, parentRow) {
+				if fkRowMatches(fk.Columns, fk.ReferencedColumns, childRow, parentRow) {
 					hasChildren = true
 					break
 				}
@@ -169,33 +171,61 @@ func (e *Executor) handleParentRowRemoval(dbName, tableName string, parentRow st
 			switch strings.ToUpper(action) {
 			case "CASCADE":
 				if isDelete {
+					// Collect removed child rows for recursive cascade
 					childTbl.Lock()
 					newRows := make([]storage.Row, 0, len(childTbl.Rows))
+					var removedRows []storage.Row
 					for _, childRow := range childTbl.Rows {
-						if !fkRowMatchesParent(fk.Columns, fk.ReferencedColumns, childRow, parentRow) {
+						if fkRowMatches(fk.Columns, fk.ReferencedColumns, childRow, parentRow) {
+							removedRows = append(removedRows, childRow)
+						} else {
 							newRows = append(newRows, childRow)
 						}
 					}
 					childTbl.Rows = newRows
 					childTbl.InvalidateIndexes()
 					childTbl.Unlock()
+
+					// Recursively cascade to grandchild tables
+					for _, removedRow := range removedRows {
+						if err := e.handleParentRowRemoval(dbName, childTableName, removedRow, true); err != nil {
+							return err
+						}
+					}
 				}
 			case "SET NULL":
 				childTbl.Lock()
+				var modifiedRows []storage.Row
 				for _, childRow := range childTbl.Rows {
-					if fkRowMatchesParent(fk.Columns, fk.ReferencedColumns, childRow, parentRow) {
+					if fkRowMatches(fk.Columns, fk.ReferencedColumns, childRow, parentRow) {
+						// Save a copy of the old row for recursive update propagation
+						oldChild := make(storage.Row)
+						for k, v := range childRow {
+							oldChild[k] = v
+						}
 						for _, col := range fk.Columns {
 							childRow[col] = nil
 						}
+						modifiedRows = append(modifiedRows, oldChild)
 					}
 				}
 				childTbl.InvalidateIndexes()
 				childTbl.Unlock()
-			default: // RESTRICT, NO ACTION, or empty (default = RESTRICT)
-				vals := make([]string, len(fk.ReferencedColumns))
-				for i, col := range fk.ReferencedColumns {
-					vals[i] = fmt.Sprintf("%v", parentRow[col])
+
+				// Recursively propagate SET NULL changes to grandchild tables
+				for _, oldChild := range modifiedRows {
+					newChild := make(storage.Row)
+					for k, v := range oldChild {
+						newChild[k] = v
+					}
+					for _, col := range fk.Columns {
+						newChild[col] = nil
+					}
+					if err := e.handleParentRowUpdate(dbName, childTableName, oldChild, newChild); err != nil {
+						return err
+					}
 				}
+			default: // RESTRICT, NO ACTION, or empty (default = RESTRICT)
 				return mysqlError(1451, "23000",
 					fmt.Sprintf("Cannot delete or update a parent row: a foreign key constraint fails (`%s`.`%s`, CONSTRAINT `%s` FOREIGN KEY (%s) REFERENCES `%s` (%s))",
 						dbName, childTableName,
@@ -216,7 +246,14 @@ func (e *Executor) handleParentRowUpdate(dbName, tableName string, oldRow, newRo
 		return nil
 	}
 
-	for childTableName, childDef := range db.Tables {
+	// Use ListTables() which acquires the read lock, to avoid data race on db.Tables map
+	tableNames := db.ListTables()
+
+	for _, childTableName := range tableNames {
+		childDef, err := db.GetTable(childTableName)
+		if err != nil {
+			continue
+		}
 		for _, fk := range childDef.ForeignKeys {
 			if !strings.EqualFold(fk.ReferencedTable, tableName) {
 				continue
@@ -242,7 +279,7 @@ func (e *Executor) handleParentRowUpdate(dbName, tableName string, oldRow, newRo
 
 			hasChildren := false
 			for _, childRow := range childTbl.Rows {
-				if fkRowMatchesParent(fk.Columns, fk.ReferencedColumns, childRow, oldRow) {
+				if fkRowMatches(fk.Columns, fk.ReferencedColumns, childRow, oldRow) {
 					hasChildren = true
 					break
 				}
@@ -256,26 +293,66 @@ func (e *Executor) handleParentRowUpdate(dbName, tableName string, oldRow, newRo
 			switch strings.ToUpper(action) {
 			case "CASCADE":
 				childTbl.Lock()
+				type oldNewPair struct {
+					old, new storage.Row
+				}
+				var cascadedPairs []oldNewPair
 				for _, childRow := range childTbl.Rows {
-					if fkRowMatchesParent(fk.Columns, fk.ReferencedColumns, childRow, oldRow) {
+					if fkRowMatches(fk.Columns, fk.ReferencedColumns, childRow, oldRow) {
+						oldChild := make(storage.Row)
+						for k, v := range childRow {
+							oldChild[k] = v
+						}
 						for i, col := range fk.Columns {
 							childRow[col] = newRow[fk.ReferencedColumns[i]]
 						}
+						newChild := make(storage.Row)
+						for k, v := range childRow {
+							newChild[k] = v
+						}
+						cascadedPairs = append(cascadedPairs, oldNewPair{old: oldChild, new: newChild})
 					}
 				}
 				childTbl.InvalidateIndexes()
 				childTbl.Unlock()
+
+				// Recursively cascade to grandchild tables
+				for _, pair := range cascadedPairs {
+					if err := e.handleParentRowUpdate(dbName, childTableName, pair.old, pair.new); err != nil {
+						return err
+					}
+				}
 			case "SET NULL":
 				childTbl.Lock()
+				type oldNewPair struct {
+					old, new storage.Row
+				}
+				var cascadedPairs []oldNewPair
 				for _, childRow := range childTbl.Rows {
-					if fkRowMatchesParent(fk.Columns, fk.ReferencedColumns, childRow, oldRow) {
+					if fkRowMatches(fk.Columns, fk.ReferencedColumns, childRow, oldRow) {
+						oldChild := make(storage.Row)
+						for k, v := range childRow {
+							oldChild[k] = v
+						}
 						for _, col := range fk.Columns {
 							childRow[col] = nil
 						}
+						newChild := make(storage.Row)
+						for k, v := range childRow {
+							newChild[k] = v
+						}
+						cascadedPairs = append(cascadedPairs, oldNewPair{old: oldChild, new: newChild})
 					}
 				}
 				childTbl.InvalidateIndexes()
 				childTbl.Unlock()
+
+				// Recursively propagate to grandchild tables
+				for _, pair := range cascadedPairs {
+					if err := e.handleParentRowUpdate(dbName, childTableName, pair.old, pair.new); err != nil {
+						return err
+					}
+				}
 			default: // RESTRICT, NO ACTION, or empty (default = RESTRICT)
 				return mysqlError(1451, "23000",
 					fmt.Sprintf("Cannot delete or update a parent row: a foreign key constraint fails (`%s`.`%s`, CONSTRAINT `%s` FOREIGN KEY (%s) REFERENCES `%s` (%s))",
@@ -299,27 +376,6 @@ func fkRowMatches(childCols, parentCols []string, childRow, parentRow storage.Ro
 		cv := childRow[childCol]
 		pv := parentRow[parentCols[i]]
 		if cv == nil || pv == nil {
-			return false
-		}
-		if fmt.Sprintf("%v", cv) != fmt.Sprintf("%v", pv) {
-			return false
-		}
-	}
-	return true
-}
-
-// fkRowMatchesParent checks if a child row references a specific parent row.
-func fkRowMatchesParent(childCols, parentCols []string, childRow, parentRow storage.Row) bool {
-	if len(childCols) != len(parentCols) {
-		return false
-	}
-	for i, childCol := range childCols {
-		cv := childRow[childCol]
-		pv := parentRow[parentCols[i]]
-		if cv == nil {
-			return false // NULL child FK values don't reference any parent
-		}
-		if pv == nil {
 			return false
 		}
 		if fmt.Sprintf("%v", cv) != fmt.Sprintf("%v", pv) {
