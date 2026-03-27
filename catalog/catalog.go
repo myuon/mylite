@@ -270,6 +270,14 @@ func (c *Catalog) GetDatabase(name string) (*Database, error) {
 	defer c.mu.RUnlock()
 	db, ok := c.Databases[name]
 	if !ok {
+		// Case-insensitive fallback (MySQL treats database names
+		// case-insensitively on macOS/Windows and for built-in schemas)
+		lower := strings.ToLower(name)
+		for k, v := range c.Databases {
+			if strings.ToLower(k) == lower {
+				return v, nil
+			}
+		}
 		return nil, fmt.Errorf("unknown database '%s'", name)
 	}
 	return db, nil
@@ -279,7 +287,19 @@ func (c *Catalog) DropDatabase(name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, exists := c.Databases[name]; !exists {
-		return fmt.Errorf("database '%s' doesn't exist", name)
+		// Case-insensitive fallback
+		lower := strings.ToLower(name)
+		found := false
+		for k := range c.Databases {
+			if strings.ToLower(k) == lower {
+				name = k
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("database '%s' doesn't exist", name)
+		}
 	}
 	delete(c.Databases, name)
 	return nil

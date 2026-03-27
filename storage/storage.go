@@ -171,7 +171,8 @@ func NewEngine() *Engine {
 func (e *Engine) EnsureDatabase(name string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, ok := e.databases[name]; !ok {
+	_, _, ok := e.resolveDBName(name)
+	if !ok {
 		e.databases[name] = make(map[string]*Table)
 	}
 }
@@ -179,32 +180,55 @@ func (e *Engine) EnsureDatabase(name string) {
 func (e *Engine) DropDatabase(name string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	delete(e.databases, name)
+	actualName, _, ok := e.resolveDBName(name)
+	if ok {
+		delete(e.databases, actualName)
+	} else {
+		delete(e.databases, name)
+	}
 }
 
 func (e *Engine) CreateTable(dbName string, def *catalog.TableDef) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, ok := e.databases[dbName]; !ok {
-		e.databases[dbName] = make(map[string]*Table)
+	actualName, _, ok := e.resolveDBName(dbName)
+	if !ok {
+		actualName = dbName
+		e.databases[actualName] = make(map[string]*Table)
 	}
 	t := &Table{Def: def, Rows: make([]Row, 0)}
 	t.AutoIncrement.Store(0)
-	e.databases[dbName][def.Name] = t
+	e.databases[actualName][def.Name] = t
 }
 
 func (e *Engine) DropTable(dbName, tableName string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if db, ok := e.databases[dbName]; ok {
+	_, db, ok := e.resolveDBName(dbName)
+	if ok {
 		delete(db, tableName)
 	}
+}
+
+// resolveDBName returns the actual database key for a case-insensitive name.
+// Caller must hold at least e.mu.RLock().
+func (e *Engine) resolveDBName(dbName string) (string, map[string]*Table, bool) {
+	if db, ok := e.databases[dbName]; ok {
+		return dbName, db, true
+	}
+	lower := strings.ToLower(dbName)
+	for k, v := range e.databases {
+		if strings.ToLower(k) == lower {
+			return k, v, true
+		}
+	}
+	return dbName, nil, false
 }
 
 func (e *Engine) GetTable(dbName, tableName string) (*Table, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	db, ok := e.databases[dbName]
+	_, db, ok := e.resolveDBName(dbName)
 	if !ok {
 		return nil, fmt.Errorf("unknown database '%s'", dbName)
 	}
