@@ -34,6 +34,12 @@ func (e *Executor) checkForeignKeyOnInsert(dbName, tableName string, row storage
 	}
 
 	for _, fk := range def.ForeignKeys {
+		// Skip self-referencing FK checks during INSERT — MySQL checks these
+		// after the statement completes, allowing rows in the same INSERT batch
+		// to reference each other.
+		if strings.EqualFold(fk.ReferencedTable, tableName) {
+			continue
+		}
 		if err := e.checkParentRowExists(dbName, tableName, fk, row); err != nil {
 			return err
 		}
