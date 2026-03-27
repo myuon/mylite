@@ -50,6 +50,7 @@ type TableDef struct {
 	StatsAutoRecalc  *int
 	StatsSamplePages *int
 	CheckConstraints  []CheckConstraint // CHECK constraint definitions
+	ForeignKeys       []ForeignKeyDef    // FOREIGN KEY constraint definitions
 	PartitionType     string             // "RANGE", "LIST", "HASH", "KEY" or "" for non-partitioned
 	PartitionColumns  []string           // column names used in partition expression (for ordering)
 }
@@ -58,6 +59,16 @@ type TableDef struct {
 type CheckConstraint struct {
 	Name string // constraint name (auto-generated if not specified)
 	Expr string // SQL expression to evaluate
+}
+
+// ForeignKeyDef represents a foreign key constraint.
+type ForeignKeyDef struct {
+	Name              string   // constraint name
+	Columns           []string // columns in the child (referencing) table
+	ReferencedTable   string   // parent (referenced) table name
+	ReferencedColumns []string // columns in the parent table
+	OnDelete          string   // "RESTRICT", "CASCADE", "SET NULL", "NO ACTION", "" (default = RESTRICT)
+	OnUpdate          string   // "RESTRICT", "CASCADE", "SET NULL", "NO ACTION", "" (default = RESTRICT)
 }
 
 // TriggerDef represents a trigger definition.

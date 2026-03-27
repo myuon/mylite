@@ -380,6 +380,14 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 			}
 		}
 
+		// Enforce FOREIGN KEY constraints on UPDATE
+		tbl.Unlock()
+		if fkErr := e.checkForeignKeyOnUpdate(updateDB, tableName, oldRow, newRow); fkErr != nil {
+			tbl.Lock()
+			return nil, fkErr
+		}
+		tbl.Lock()
+
 		// Enforce PRIMARY KEY / UNIQUE constraints for the updated row.
 		dupErr := func() error {
 			// Resolve primary key columns (table-level or column-level declaration).

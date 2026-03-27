@@ -903,12 +903,43 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 	}
 
+	// Extract FOREIGN KEY constraints
+	var foreignKeys []catalog.ForeignKeyDef
+	fkAutoIdx := 0
+	for _, constraint := range stmt.TableSpec.Constraints {
+		if fkDef, ok := constraint.Details.(*sqlparser.ForeignKeyDefinition); ok {
+			name := constraint.Name.String()
+			if name == "" {
+				fkAutoIdx++
+				name = fmt.Sprintf("%s_ibfk_%d", tableName, fkAutoIdx)
+			}
+			var cols []string
+			for _, col := range fkDef.Source {
+				cols = append(cols, col.String())
+			}
+			fk := catalog.ForeignKeyDef{
+				Name:    name,
+				Columns: cols,
+			}
+			if fkDef.ReferenceDefinition != nil {
+				fk.ReferencedTable = fkDef.ReferenceDefinition.ReferencedTable.Name.String()
+				for _, col := range fkDef.ReferenceDefinition.ReferencedColumns {
+					fk.ReferencedColumns = append(fk.ReferencedColumns, col.String())
+				}
+				fk.OnDelete = referenceActionToString(fkDef.ReferenceDefinition.OnDelete)
+				fk.OnUpdate = referenceActionToString(fkDef.ReferenceDefinition.OnUpdate)
+			}
+			foreignKeys = append(foreignKeys, fk)
+		}
+	}
+
 	def := &catalog.TableDef{
 		Name:             tableName,
 		Columns:          columns,
 		PrimaryKey:       primaryKeys,
 		Indexes:          indexes,
 		CheckConstraints: checkConstraints,
+		ForeignKeys:      foreignKeys,
 	}
 	// Inherit database defaults unless overridden by explicit table options.
 	if db.CharacterSet != "" {
@@ -1820,13 +1851,45 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 						})
 					}
 				}
+				// Store the FK constraint in the table definition
+				fkName := op.ConstraintDefinition.Name.String()
+				if fkName == "" {
+					fkName = tableName + "_ibfk_1"
+				}
+				fk := catalog.ForeignKeyDef{
+					Name:    fkName,
+					Columns: fkCols,
+				}
+				if fkDef.ReferenceDefinition != nil {
+					fk.ReferencedTable = fkDef.ReferenceDefinition.ReferencedTable.Name.String()
+					for _, col := range fkDef.ReferenceDefinition.ReferencedColumns {
+						fk.ReferencedColumns = append(fk.ReferencedColumns, col.String())
+					}
+					fk.OnDelete = referenceActionToString(fkDef.ReferenceDefinition.OnDelete)
+					fk.OnUpdate = referenceActionToString(fkDef.ReferenceDefinition.OnUpdate)
+				}
+				if td, _ := db.GetTable(tableName); td != nil {
+					td.ForeignKeys = append(td.ForeignKeys, fk)
+				}
 			}
 
 		case *sqlparser.DropKey:
 			if op.Type == sqlparser.PrimaryKeyType {
 				db.DropPrimaryKey(tableName)
-			} else if op.Type == sqlparser.ForeignKeyType || op.Type == sqlparser.CheckKeyType {
-				// Foreign keys and CHECK constraints are not enforced; silently accept DROP.
+			} else if op.Type == sqlparser.ForeignKeyType {
+				// Remove FK constraint from table definition
+				fkName := op.Name.String()
+				if td, _ := db.GetTable(tableName); td != nil {
+					newFKs := make([]catalog.ForeignKeyDef, 0, len(td.ForeignKeys))
+					for _, fk := range td.ForeignKeys {
+						if !strings.EqualFold(fk.Name, fkName) {
+							newFKs = append(newFKs, fk)
+						}
+					}
+					td.ForeignKeys = newFKs
+				}
+			} else if op.Type == sqlparser.CheckKeyType {
+				// CHECK constraints: silently accept DROP.
 			} else {
 				idxName := op.Name.String()
 				if err := db.DropIndex(tableName, idxName); err != nil {
@@ -2056,6 +2119,24 @@ func buildColumnTypeString(ct *sqlparser.ColumnType) string {
 		s += " generated always as (" + sqlparser.String(ct.Options.As) + ")" + storage
 	}
 	return s
+}
+
+// referenceActionToString converts a sqlparser.ReferenceAction to a string.
+func referenceActionToString(action sqlparser.ReferenceAction) string {
+	switch action {
+	case sqlparser.Restrict:
+		return "RESTRICT"
+	case sqlparser.Cascade:
+		return "CASCADE"
+	case sqlparser.NoAction:
+		return "NO ACTION"
+	case sqlparser.SetNull:
+		return "SET NULL"
+	case sqlparser.SetDefault:
+		return "SET DEFAULT"
+	default:
+		return "" // DefaultAction = RESTRICT behavior
+	}
 }
 
 func tableOptionString(opt *sqlparser.TableOption) string {
