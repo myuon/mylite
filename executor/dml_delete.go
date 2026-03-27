@@ -511,32 +511,8 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 		}
 		deleteIndices := make(map[int]bool)
 		for _, matchedRow := range allRows {
-			for i, existingRow := range tbl.Rows {
-				if deleteIndices[i] {
-					continue
-				}
-				allMatch := true
-				for _, col := range tbl.Def.Columns {
-					mv, ok := matchedRow[targetAlias+"."+col.Name]
-					if !ok {
-						mv, ok = matchedRow[targetName+"."+col.Name]
-					}
-					if !ok {
-						mv, ok = matchedRow[col.Name]
-					}
-					if !ok {
-						allMatch = false
-						break
-					}
-					ev := existingRow[col.Name]
-					if fmt.Sprintf("%v", mv) != fmt.Sprintf("%v", ev) {
-						allMatch = false
-						break
-					}
-				}
-				if allMatch {
-					deleteIndices[i] = true
-				}
+			if idx := matchRowToTable(matchedRow, tbl, targetAlias, targetName); idx >= 0 && !deleteIndices[idx] {
+				deleteIndices[idx] = true
 			}
 		}
 		if len(deleteIndices) > 0 {
@@ -743,32 +719,8 @@ func (e *Executor) execMultiTableDelete(query string) (*Result, error) {
 		}
 		deleteIndices := make(map[int]bool)
 		for _, matchedRow := range allRows {
-			for i, existingRow := range tbl.Rows {
-				if deleteIndices[i] {
-					continue
-				}
-				allMatch := true
-				for _, col := range tbl.Def.Columns {
-					mv, ok := matchedRow[targetAlias+"."+col.Name]
-					if !ok {
-						mv, ok = matchedRow[target+"."+col.Name]
-					}
-					if !ok {
-						mv, ok = matchedRow[col.Name]
-					}
-					if !ok {
-						allMatch = false
-						break
-					}
-					ev := existingRow[col.Name]
-					if fmt.Sprintf("%v", mv) != fmt.Sprintf("%v", ev) {
-						allMatch = false
-						break
-					}
-				}
-				if allMatch {
-					deleteIndices[i] = true
-				}
+			if idx := matchRowToTable(matchedRow, tbl, targetAlias, target); idx >= 0 && !deleteIndices[idx] {
+				deleteIndices[idx] = true
 			}
 		}
 		if len(deleteIndices) > 0 {
@@ -823,6 +775,37 @@ func (e *Executor) getTableRowsWithAliasDB(dbName, tableName, alias string) ([]s
 		result[i] = newRow
 	}
 	return result, nil
+}
+
+// matchRowToTable returns the index of the row in tbl.Rows that matches
+// matchedRow by comparing column values using qualified (alias.col, tableName.col)
+// or unqualified (col) key lookups. Returns -1 if no match is found.
+func matchRowToTable(matchedRow storage.Row, tbl *storage.Table, alias, tableName string) int {
+	for i, existingRow := range tbl.Rows {
+		allMatch := true
+		for _, col := range tbl.Def.Columns {
+			mv, ok := matchedRow[alias+"."+col.Name]
+			if !ok {
+				mv, ok = matchedRow[tableName+"."+col.Name]
+			}
+			if !ok {
+				mv, ok = matchedRow[col.Name]
+			}
+			if !ok {
+				allMatch = false
+				break
+			}
+			ev := existingRow[col.Name]
+			if fmt.Sprintf("%v", mv) != fmt.Sprintf("%v", ev) {
+				allMatch = false
+				break
+			}
+		}
+		if allMatch {
+			return i
+		}
+	}
+	return -1
 }
 
 // maxCrossProductRows limits the result of a cross product to prevent
