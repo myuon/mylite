@@ -10,9 +10,10 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
-// evalDatetimeFunc dispatches date/time-related functions from evalFuncExpr.
+// evalDatetimeFunc dispatches date/time-related functions.
+// When row is non-nil, expressions are evaluated with row context.
 // Returns (result, handled, error).
-func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interface{}, bool, error) {
+func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.Row) (interface{}, bool, error) {
 	switch name {
 	case "now", "current_timestamp", "sysdate":
 		return e.nowTime().Format("2006-01-02 15:04:05"), true, nil
@@ -30,7 +31,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) == 0 {
 			return int64(e.nowTime().Unix()), true, nil
 		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -43,14 +44,14 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 1 {
 			return nil, true, fmt.Errorf("FROM_UNIXTIME requires 1 argument")
 		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
 		}
 		ts := toInt64(val)
 		t := time.Unix(ts, 0)
 		if len(v.Exprs) >= 2 {
-			fmtVal, err := e.evalExpr(v.Exprs[1])
+			fmtVal, err := e.evalExprMaybeRow(v.Exprs[1], row)
 			if err != nil {
 				return nil, true, err
 			}
@@ -61,9 +62,15 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 1 {
 			return nil, true, fmt.Errorf("YEAR requires 1 argument")
 		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
+		}
+		if isZeroDate(val) {
+			return int64(0), true, nil
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
@@ -74,9 +81,15 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 1 {
 			return nil, true, fmt.Errorf("MONTH requires 1 argument")
 		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
+		}
+		if isZeroDate(val) {
+			return int64(0), true, nil
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
@@ -87,9 +100,15 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 1 {
 			return nil, true, fmt.Errorf("DAY requires 1 argument")
 		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
+		}
+		if isZeroDate(val) {
+			return int64(0), true, nil
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
@@ -100,9 +119,12 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 1 {
 			return nil, true, fmt.Errorf("HOUR requires 1 argument")
 		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
@@ -113,9 +135,12 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 1 {
 			return nil, true, fmt.Errorf("MINUTE requires 1 argument")
 		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
@@ -126,9 +151,12 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 1 {
 			return nil, true, fmt.Errorf("SECOND requires 1 argument")
 		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
@@ -136,7 +164,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		}
 		return int64(t.Second()), true, nil
 	case "date":
-		val, isNull, err := e.evalArg1(v.Exprs, "DATE")
+		val, isNull, err := e.evalArg1(v.Exprs, "DATE", row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -155,9 +183,12 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 1 {
 			return nil, true, fmt.Errorf("TIME requires 1 argument")
 		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
@@ -165,7 +196,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		}
 		return t.Format("15:04:05"), true, nil
 	case "datediff":
-		v0, v1, hasNull, err := e.evalArgs2(v.Exprs, "DATEDIFF")
+		v0, v1, hasNull, err := e.evalArgs2(v.Exprs, "DATEDIFF", row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -188,11 +219,11 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 2 {
 			return nil, true, fmt.Errorf("DATE_FORMAT requires 2 arguments")
 		}
-		dateVal, err := e.evalExpr(v.Exprs[0])
+		dateVal, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
 		}
-		fmtVal, err := e.evalExpr(v.Exprs[1])
+		fmtVal, err := e.evalExprMaybeRow(v.Exprs[1], row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -205,11 +236,11 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 2 {
 			return nil, true, fmt.Errorf("STR_TO_DATE requires 2 arguments")
 		}
-		strVal, err := e.evalExpr(v.Exprs[0])
+		strVal, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
 		}
-		fmtVal2, err := e.evalExpr(v.Exprs[1])
+		fmtVal2, err := e.evalExprMaybeRow(v.Exprs[1], row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -225,11 +256,11 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 2 {
 			return nil, true, fmt.Errorf("GET_FORMAT requires 2 arguments")
 		}
-		typeVal, err := e.evalExpr(v.Exprs[0])
+		typeVal, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
 		}
-		localeVal, err := e.evalExpr(v.Exprs[1])
+		localeVal, err := e.evalExprMaybeRow(v.Exprs[1], row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -241,9 +272,12 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 1 {
 			return nil, true, nil
 		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
 		}
 		if isZeroDate(val) {
 			return nil, true, nil
@@ -257,9 +291,12 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 1 {
 			return nil, true, nil
 		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
 		}
 		if isZeroDate(val) {
 			return nil, true, nil
@@ -273,9 +310,12 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 1 {
 			return nil, true, nil
 		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
 		}
 		if isZeroDate(val) {
 			return nil, true, nil
@@ -293,9 +333,12 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 1 {
 			return nil, true, nil
 		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
 		}
 		if isZeroDate(val) {
 			return nil, true, nil
@@ -309,9 +352,15 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 1 {
 			return nil, true, nil
 		}
-		val, err := e.evalExpr(v.Exprs[0])
+		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
+		}
+		if isZeroDate(val) {
+			return nil, true, nil
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
@@ -322,11 +371,11 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 2 {
 			return nil, true, nil
 		}
-		base, err := e.evalExpr(v.Exprs[0])
+		base, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
 		}
-		interval, err := e.evalExpr(v.Exprs[1])
+		interval, err := e.evalExprMaybeRow(v.Exprs[1], row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -343,11 +392,11 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 2 {
 			return nil, true, nil
 		}
-		base, err := e.evalExpr(v.Exprs[0])
+		base, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
 		}
-		interval, err := e.evalExpr(v.Exprs[1])
+		interval, err := e.evalExprMaybeRow(v.Exprs[1], row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -361,7 +410,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		}
 		return t.Add(-dur).Format("2006-01-02 15:04:05"), true, nil
 	case "from_days":
-		val, isNull, err := e.evalArg1Quiet(v.Exprs)
+		val, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -375,7 +424,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		t := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, days-1)
 		return t.Format("2006-01-02"), true, nil
 	case "to_days":
-		val, isNull, err := e.evalArg1Quiet(v.Exprs)
+		val, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -391,11 +440,14 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		}
 		return mysqlToDays(t), true, nil
 	case "last_day":
-		val, isNull, err := e.evalArg1Quiet(v.Exprs)
+		val, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {
 			return nil, true, err
 		}
 		if isNull {
+			return nil, true, nil
+		}
+		if isZeroDate(val) {
 			return nil, true, nil
 		}
 		t, parseErr := parseDateTimeValue(val)
@@ -406,12 +458,15 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		lastDay := firstOfNextMonth.AddDate(0, 0, -1)
 		return lastDay.Format("2006-01-02"), true, nil
 	case "quarter":
-		val, isNull, err := e.evalArg1Quiet(v.Exprs)
+		val, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {
 			return nil, true, err
 		}
 		if isNull {
 			return nil, true, nil
+		}
+		if isZeroDate(val) {
+			return int64(0), true, nil
 		}
 		t, parseErr := parseDateTimeValue(val)
 		if parseErr != nil {
@@ -419,7 +474,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		}
 		return int64((t.Month()-1)/3 + 1), true, nil
 	case "week":
-		val, isNull, err := e.evalArg1Quiet(v.Exprs)
+		val, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -435,7 +490,8 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		}
 		mode := int64(0)
 		if len(v.Exprs) >= 2 {
-			if modeVal, modeErr := e.evalExpr(v.Exprs[1]); modeErr == nil && modeVal != nil {
+			modeVal, modeErr := e.evalExprMaybeRow(v.Exprs[1], row)
+			if modeErr == nil && modeVal != nil {
 				mode = toInt64(modeVal)
 			}
 		}
@@ -445,7 +501,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		_, wk := t.ISOWeek()
 		return int64(wk), true, nil
 	case "weekofyear":
-		val, isNull, err := e.evalArg1Quiet(v.Exprs)
+		val, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -462,11 +518,14 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		_, wk := t.ISOWeek()
 		return int64(wk), true, nil
 	case "yearweek":
-		val, isNull, err := e.evalArg1Quiet(v.Exprs)
+		val, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {
 			return nil, true, err
 		}
 		if isNull {
+			return nil, true, nil
+		}
+		if isZeroDate(val) {
 			return nil, true, nil
 		}
 		t, parseErr := parseDateTimeValue(val)
@@ -476,12 +535,15 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		yr, wk := mysqlYearWeek(t, 0)
 		return int64(yr*100 + wk), true, nil
 	case "timestamp":
-		val, isNull, err := e.evalArg1Quiet(v.Exprs)
+		val, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {
 			return nil, true, err
 		}
 		if isNull {
 			return nil, true, nil
+		}
+		if isZeroDate(val) {
+			return "0000-00-00 00:00:00", true, nil
 		}
 		t, parseErr := parseDateTimeValue(val)
 		if parseErr != nil {
@@ -489,7 +551,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		}
 		return t.Format("2006-01-02 15:04:05"), true, nil
 	case "sec_to_time":
-		arg, isNull, err := e.evalArg1Quiet(v.Exprs)
+		arg, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -498,7 +560,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		}
 		return secToTimeValue(arg), true, nil
 	case "time_to_sec":
-		ttsVal, isNull, err := e.evalArg1(v.Exprs, "TIME_TO_SEC")
+		ttsVal, isNull, err := e.evalArg1(v.Exprs, "TIME_TO_SEC", row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -532,7 +594,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		}
 		return ttsSecs, true, nil
 	case "period_add":
-		paP, paN, hasNull, err := e.evalArgs2(v.Exprs, "PERIOD_ADD")
+		paP, paN, hasNull, err := e.evalArgs2(v.Exprs, "PERIOD_ADD", row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -556,7 +618,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		paNewM := paTotalM%12 + 1
 		return paNewY*100 + paNewM, true, nil
 	case "period_diff":
-		pdP1, pdP2, hasNull, err := e.evalArgs2(v.Exprs, "PERIOD_DIFF")
+		pdP1, pdP2, hasNull, err := e.evalArgs2(v.Exprs, "PERIOD_DIFF", row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -575,7 +637,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		}
 		return pdToMonths(toInt64(pdP1)) - pdToMonths(toInt64(pdP2)), true, nil
 	case "maketime":
-		mtH, mtM, mtSec, hasNull, err := e.evalArgs3(v.Exprs, "MAKETIME")
+		mtH, mtM, mtSec, hasNull, err := e.evalArgs3(v.Exprs, "MAKETIME", row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -595,7 +657,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		}
 		return fmt.Sprintf("%s%02d:%02d:%02d", mtNeg, mtHi, mtMi, mtSi), true, nil
 	case "microsecond":
-		usVal, isNull, err := e.evalArg1(v.Exprs, "MICROSECOND")
+		usVal, isNull, err := e.evalArg1(v.Exprs, "MICROSECOND", row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -613,7 +675,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		}
 		return int64(0), true, nil
 	case "time_format":
-		tfTime, tfFmt, hasNull, err := e.evalArgs2(v.Exprs, "TIME_FORMAT")
+		tfTime, tfFmt, hasNull, err := e.evalArgs2(v.Exprs, "TIME_FORMAT", row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -654,7 +716,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		if len(v.Exprs) < 3 {
 			return nil, true, fmt.Errorf("CONVERT_TZ requires 3 arguments")
 		}
-		ctzVal, isNull, err := e.evalArg1Quiet(v.Exprs)
+		ctzVal, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -663,7 +725,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		}
 		return toString(ctzVal), true, nil
 	case "timediff":
-		tdA, tdB, hasNull, err := e.evalArgs2(v.Exprs, "TIMEDIFF")
+		tdA, tdB, hasNull, err := e.evalArgs2(v.Exprs, "TIMEDIFF", row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -686,7 +748,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		tdS := int(tdDiff.Seconds()) % 60
 		return fmt.Sprintf("%s%02d:%02d:%02d", tdNeg, tdH, tdM, tdS), true, nil
 	case "to_seconds":
-		tsVal, isNull, err := e.evalArg1Quiet(v.Exprs)
+		tsVal, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -700,7 +762,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		tsDays := int64(tsT.Year())*365 + int64(tsT.YearDay()) + int64(tsT.Year())/4 - int64(tsT.Year())/100 + int64(tsT.Year())/400
 		return tsDays*86400 + int64(tsT.Hour())*3600 + int64(tsT.Minute())*60 + int64(tsT.Second()), true, nil
 	case "makedate":
-		mdYear, mdDay, hasNull, err := e.evalArgs2(v.Exprs, "MAKEDATE")
+		mdYear, mdDay, hasNull, err := e.evalArgs2(v.Exprs, "MAKEDATE", row)
 		if err != nil {
 			return nil, true, err
 		}
@@ -714,361 +776,6 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr) (interfac
 		}
 		mdT := time.Date(mdY, 1, mdD, 0, 0, 0, 0, time.UTC)
 		return mdT.Format("2006-01-02"), true, nil
-	default:
-		return nil, false, nil
-	}
-}
-
-// evalDatetimeFuncWithRow dispatches date/time-related functions from evalFuncExprWithRow.
-func evalDatetimeFuncWithRow(e *Executor, name string, v *sqlparser.FuncExpr, row storage.Row, evalArgs func() ([]interface{}, error)) (interface{}, bool, error) {
-	switch name {
-	case "date":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		if isZeroDate(args[0]) {
-			return "0000-00-00", true, nil
-		}
-		t, err := parseDateTimeValue(args[0])
-		if err != nil {
-			return nil, true, nil
-		}
-		return t.Format("2006-01-02"), true, nil
-	case "year":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		if isZeroDate(args[0]) {
-			return int64(0), true, nil
-		}
-		t, err := parseDateTimeValue(args[0])
-		if err != nil {
-			return nil, true, nil
-		}
-		return int64(t.Year()), true, nil
-	case "month":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		if isZeroDate(args[0]) {
-			return int64(0), true, nil
-		}
-		t, err := parseDateTimeValue(args[0])
-		if err != nil {
-			return nil, true, nil
-		}
-		return int64(t.Month()), true, nil
-	case "day", "dayofmonth":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		if isZeroDate(args[0]) {
-			return int64(0), true, nil
-		}
-		t, err := parseDateTimeValue(args[0])
-		if err != nil {
-			return nil, true, nil
-		}
-		return int64(t.Day()), true, nil
-	case "hour":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		t, err := parseDateTimeValue(args[0])
-		if err != nil {
-			return nil, true, nil
-		}
-		return int64(t.Hour()), true, nil
-	case "minute":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		t, err := parseDateTimeValue(args[0])
-		if err != nil {
-			return nil, true, nil
-		}
-		return int64(t.Minute()), true, nil
-	case "second":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		t, err := parseDateTimeValue(args[0])
-		if err != nil {
-			return nil, true, nil
-		}
-		return int64(t.Second()), true, nil
-	case "dayname":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		if isZeroDate(args[0]) {
-			return nil, true, nil
-		}
-		t, err := parseDateTimeValue(args[0])
-		if err != nil {
-			return nil, true, nil
-		}
-		return t.Format("Monday"), true, nil
-	case "dayofweek":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		if isZeroDate(args[0]) {
-			return nil, true, nil
-		}
-		t, err := parseDateTimeValue(args[0])
-		if err != nil {
-			return nil, true, nil
-		}
-		return int64(t.Weekday()) + 1, true, nil
-	case "dayofyear":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		if isZeroDate(args[0]) {
-			return nil, true, nil
-		}
-		t, err := parseDateTimeValue(args[0])
-		if err != nil {
-			return nil, true, nil
-		}
-		return int64(t.YearDay()), true, nil
-	case "monthname":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		if isZeroDate(args[0]) {
-			return nil, true, nil
-		}
-		t, err := parseDateTimeValue(args[0])
-		if err != nil {
-			return nil, true, nil
-		}
-		return t.Format("January"), true, nil
-	case "weekday":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		if isZeroDate(args[0]) {
-			return nil, true, nil
-		}
-		t, err := parseDateTimeValue(args[0])
-		if err != nil {
-			return nil, true, nil
-		}
-		wd := int64(t.Weekday()) - 1
-		if wd < 0 {
-			wd = 6
-		}
-		return wd, true, nil
-	case "time":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		t, err := parseDateTimeValue(args[0])
-		if err != nil {
-			return nil, true, nil
-		}
-		return t.Format("15:04:05"), true, nil
-	case "from_days":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		days := int(toInt64(args[0]))
-		if days <= 0 {
-			return "0000-00-00", true, nil
-		}
-		t := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, days-1)
-		return t.Format("2006-01-02"), true, nil
-	case "to_days":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		if isZeroDate(args[0]) {
-			return nil, true, nil
-		}
-		t, parseErr := parseDateTimeValue(args[0])
-		if parseErr != nil {
-			return nil, true, nil
-		}
-		return mysqlToDays(t), true, nil
-	case "last_day":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		if isZeroDate(args[0]) {
-			return nil, true, nil
-		}
-		t, parseErr := parseDateTimeValue(args[0])
-		if parseErr != nil {
-			return nil, true, nil
-		}
-		firstOfNextMonth := time.Date(t.Year(), t.Month()+1, 1, 0, 0, 0, 0, time.UTC)
-		lastDay := firstOfNextMonth.AddDate(0, 0, -1)
-		return lastDay.Format("2006-01-02"), true, nil
-	case "quarter":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		if isZeroDate(args[0]) {
-			return int64(0), true, nil
-		}
-		t, parseErr := parseDateTimeValue(args[0])
-		if parseErr != nil {
-			return nil, true, nil
-		}
-		return int64((t.Month()-1)/3 + 1), true, nil
-	case "week":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		if isZeroDate(args[0]) {
-			return nil, true, nil
-		}
-		t, parseErr := parseDateTimeValue(args[0])
-		if parseErr != nil {
-			return nil, true, nil
-		}
-		mode := int64(0)
-		if len(args) >= 2 && args[1] != nil {
-			mode = toInt64(args[1])
-		}
-		if mode == 0 {
-			return mysqlWeekMode0(t), true, nil
-		}
-		_, wk := t.ISOWeek()
-		return int64(wk), true, nil
-	case "weekofyear":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		if isZeroDate(args[0]) {
-			return nil, true, nil
-		}
-		t, parseErr := parseDateTimeValue(args[0])
-		if parseErr != nil {
-			return nil, true, nil
-		}
-		_, wk := t.ISOWeek()
-		return int64(wk), true, nil
-	case "yearweek":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		if isZeroDate(args[0]) {
-			return nil, true, nil
-		}
-		t, parseErr := parseDateTimeValue(args[0])
-		if parseErr != nil {
-			return nil, true, nil
-		}
-		yr, wk := mysqlYearWeek(t, 0)
-		return int64(yr*100 + wk), true, nil
-	case "timestamp":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		if isZeroDate(args[0]) {
-			return "0000-00-00 00:00:00", true, nil
-		}
-		t, parseErr := parseDateTimeValue(args[0])
-		if parseErr != nil {
-			return nil, true, nil
-		}
-		return t.Format("2006-01-02 15:04:05"), true, nil
-	case "sec_to_time":
-		args, err := evalArgs()
-		if err != nil {
-			return nil, true, err
-		}
-		if len(args) < 1 || args[0] == nil {
-			return nil, true, nil
-		}
-		return secToTimeValue(args[0]), true, nil
 	default:
 		return nil, false, nil
 	}

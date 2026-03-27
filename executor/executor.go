@@ -7804,16 +7804,16 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 	name := strings.ToLower(v.Name.String())
 
 	// Dispatch to category-specific handlers
-	if result, handled, err := evalStringFunc(e, name, v); handled {
+	if result, handled, err := evalStringFunc(e, name, v, nil); handled {
 		return result, err
 	}
-	if result, handled, err := evalDatetimeFunc(e, name, v); handled {
+	if result, handled, err := evalDatetimeFunc(e, name, v, nil); handled {
 		return result, err
 	}
-	if result, handled, err := evalMathFunc(e, name, v); handled {
+	if result, handled, err := evalMathFunc(e, name, v, nil); handled {
 		return result, err
 	}
-	if result, handled, err := evalMiscFunc(e, name, v); handled {
+	if result, handled, err := evalMiscFunc(e, name, v, nil); handled {
 		return result, err
 	}
 
@@ -8623,6 +8623,14 @@ func isTruthy(v interface{}) bool {
 	return false
 }
 
+// evalExprMaybeRow evaluates an expression, using row context if row is non-nil.
+func (e *Executor) evalExprMaybeRow(expr sqlparser.Expr, row *storage.Row) (interface{}, error) {
+	if row != nil {
+		return e.evalRowExpr(expr, *row)
+	}
+	return e.evalExpr(expr)
+}
+
 // evalRowExpr evaluates an expression in the context of a table row.
 // It handles column lookups and delegates other expressions to e.evalExpr.
 func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{}, error) {
@@ -8993,30 +9001,19 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 	// Evaluate function arguments with row context to resolve column references
 	name := strings.ToLower(v.Name.String())
 
-	// Helper to evaluate args with row context
-	evalArgs := func() ([]interface{}, error) {
-		args := make([]interface{}, len(v.Exprs))
-		for i, argExpr := range v.Exprs {
-			val, err := e.evalRowExpr(argExpr, row)
-			if err != nil {
-				return nil, err
-			}
-			args[i] = val
-		}
-		return args, nil
-	}
+	rowPtr := &row
 
 	// Dispatch to category-specific handlers
-	if result, handled, err := evalStringFuncWithRow(e, name, v, row, evalArgs); handled {
+	if result, handled, err := evalStringFunc(e, name, v, rowPtr); handled {
 		return result, err
 	}
-	if result, handled, err := evalDatetimeFuncWithRow(e, name, v, row, evalArgs); handled {
+	if result, handled, err := evalDatetimeFunc(e, name, v, rowPtr); handled {
 		return result, err
 	}
-	if result, handled, err := evalMathFuncWithRow(e, name, v, row, evalArgs); handled {
+	if result, handled, err := evalMathFunc(e, name, v, rowPtr); handled {
 		return result, err
 	}
-	if result, handled, err := evalMiscFuncWithRow(e, name, v, row, evalArgs); handled {
+	if result, handled, err := evalMiscFunc(e, name, v, rowPtr); handled {
 		return result, err
 	}
 
