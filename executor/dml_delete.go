@@ -104,6 +104,13 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		return nil, fmt.Errorf("unsupported table expression: %T", te)
 	}
 
+	// Resolve views: if tableName is a view, replace with the underlying base table.
+	if baseTable, isView, err := e.resolveViewToBaseTable(tableName); err != nil {
+		return nil, err
+	} else if isView {
+		tableName = baseTable
+	}
+
 	// Handle performance_schema tables
 	if strings.EqualFold(deleteDB, "performance_schema") {
 		lowerTable := strings.ToLower(tableName)

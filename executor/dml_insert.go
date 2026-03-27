@@ -143,6 +143,13 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		insertDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
 	}
 
+	// Resolve views: if tableName is a view, replace with the underlying base table.
+	if baseTable, isView, err := e.resolveViewToBaseTable(tableName); err != nil {
+		return nil, err
+	} else if isView {
+		tableName = baseTable
+	}
+
 	// Reject INSERT on performance_schema tables (except writable setup tables)
 	if strings.EqualFold(insertDB, "performance_schema") {
 		lowerTable := strings.ToLower(tableName)

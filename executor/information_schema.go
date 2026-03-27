@@ -1021,6 +1021,40 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 		}
 	}
 
+	// Add user-defined views as VIEW entries
+	if e.views != nil {
+		viewNames := make([]string, 0, len(e.views))
+		for n := range e.views {
+			viewNames = append(viewNames, n)
+		}
+		sort.Strings(viewNames)
+		for _, vName := range viewNames {
+			rows = append(rows, storage.Row{
+				"TABLE_CATALOG":   "def",
+				"TABLE_SCHEMA":    e.CurrentDB,
+				"TABLE_NAME":      vName,
+				"TABLE_TYPE":      "VIEW",
+				"ENGINE":          nil,
+				"VERSION":         nil,
+				"ROW_FORMAT":      nil,
+				"TABLE_ROWS":      nil,
+				"AVG_ROW_LENGTH":  nil,
+				"DATA_LENGTH":     nil,
+				"MAX_DATA_LENGTH": nil,
+				"INDEX_LENGTH":    nil,
+				"DATA_FREE":       nil,
+				"AUTO_INCREMENT":  nil,
+				"CREATE_TIME":     nil,
+				"UPDATE_TIME":     nil,
+				"CHECK_TIME":      nil,
+				"TABLE_COLLATION": nil,
+				"CHECKSUM":        nil,
+				"CREATE_OPTIONS":  nil,
+				"TABLE_COMMENT":   "VIEW",
+			})
+		}
+	}
+
 	// Add information_schema virtual tables as SYSTEM VIEW entries
 	// Order matches MySQL 8.0's utf8_general_ci collation ordering
 	isTableNames := []string{

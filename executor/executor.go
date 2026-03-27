@@ -10582,6 +10582,72 @@ func resolveTableNameDB(name, currentDB string) (string, string) {
 	return currentDB, name
 }
 
+// lookupView looks up a view by name (case-insensitive) and returns the
+// view SQL and the canonical name. Returns ("", "", false) if not found.
+func (e *Executor) lookupView(name string) (viewSQL string, canonicalName string, ok bool) {
+	if e.views == nil {
+		return "", "", false
+	}
+	if sql, found := e.views[name]; found {
+		return sql, name, true
+	}
+	for vn, sql := range e.views {
+		if strings.EqualFold(vn, name) {
+			return sql, vn, true
+		}
+	}
+	return "", "", false
+}
+
+// resolveViewToBaseTable checks if the given table name is a view, and if so,
+// returns the underlying base table name. It also validates that the view is
+// updatable (simple SELECT from a single table, no JOINs, GROUP BY, DISTINCT,
+// aggregates, UNION, or subqueries in FROM).
+// Returns (baseTable, isView, error). If isView is false, the caller should
+// proceed with normal table handling.
+func (e *Executor) resolveViewToBaseTable(tableName string) (string, bool, error) {
+	viewSQL, _, ok := e.lookupView(tableName)
+	if !ok {
+		return "", false, nil
+	}
+	stmt, err := e.parser().Parse(viewSQL)
+	if err != nil {
+		return "", true, fmt.Errorf("cannot parse view definition: %v", err)
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		// UNION or other non-simple SELECT
+		return "", true, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
+	}
+	// Must have exactly one table in FROM (no JOINs)
+	if len(sel.From) != 1 {
+		return "", true, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
+	}
+	ate, ok := sel.From[0].(*sqlparser.AliasedTableExpr)
+	if !ok {
+		// JOIN expression
+		return "", true, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
+	}
+	tn, ok := ate.Expr.(sqlparser.TableName)
+	if !ok {
+		// Subquery in FROM
+		return "", true, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
+	}
+	// Check for GROUP BY, HAVING, DISTINCT, aggregates, window functions
+	if sel.GroupBy != nil || sel.Having != nil || sel.Distinct {
+		return "", true, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
+	}
+	// Check for aggregate functions in SELECT exprs
+	for _, expr := range sel.SelectExprs.Exprs {
+		if ae, ok := expr.(*sqlparser.AliasedExpr); ok {
+			if containsAggregate(ae.Expr) {
+				return "", true, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
+			}
+		}
+	}
+	return tn.Name.String(), true, nil
+}
+
 // isMultiTableUpdate checks if an UPDATE statement involves multiple tables (join or comma-separated).
 // resolveColumnTable resolves an unqualified column name to a table name
 // by searching through the table expressions in the FROM clause.

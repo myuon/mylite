@@ -377,6 +377,12 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 				return nil, err
 			}
 			tables := db.ListTables()
+			// Include views in SHOW TABLES
+			if e.views != nil {
+				for vn := range e.views {
+					tables = append(tables, vn)
+				}
+			}
 			sort.Strings(tables)
 			rows := make([][]interface{}, 0, len(tables))
 			for _, t := range tables {
@@ -418,6 +424,12 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			return nil, err
 		}
 		tables := db.ListTables()
+		// Include views in SHOW TABLES
+		if e.views != nil {
+			for vn := range e.views {
+				tables = append(tables, vn)
+			}
+		}
 		sort.Strings(tables)
 		rows := make([][]interface{}, 0, len(tables))
 		for _, t := range tables {
