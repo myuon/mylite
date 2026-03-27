@@ -5778,6 +5778,22 @@ func mysqlRoundToInt(f float64) int64 {
 	return int64(f - 0.5)
 }
 
+// intTypeRange holds the signed min/max and unsigned max for an integer column type.
+type intTypeRange struct {
+	Min, Max    int64
+	MaxUnsigned uint64
+}
+
+// intTypeRanges maps base integer type names to their value ranges.
+var intTypeRanges = map[string]intTypeRange{
+	"TINYINT":   {-128, 127, 255},
+	"SMALLINT":  {-32768, 32767, 65535},
+	"MEDIUMINT": {-8388608, 8388607, 16777215},
+	"INT":       {-2147483648, 2147483647, 4294967295},
+	"INTEGER":   {-2147483648, 2147483647, 4294967295},
+	"BIGINT":    {-9223372036854775808, 9223372036854775807, 18446744073709551615},
+}
+
 func coerceIntegerValue(colType string, v interface{}) interface{} {
 	upper := strings.ToUpper(strings.TrimSpace(colType))
 	// Remove display width like INT(11)
@@ -5790,34 +5806,11 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 	baseType = strings.TrimSpace(strings.Replace(strings.Replace(baseType, "UNSIGNED", "", 1), "ZEROFILL", "", 1))
 
 	// Check if this is an integer type
-	isIntType := false
-	var minVal, maxVal int64
-	var maxUnsigned uint64
-	switch baseType {
-	case "TINYINT":
-		isIntType = true
-		minVal, maxVal = -128, 127
-		maxUnsigned = 255
-	case "SMALLINT":
-		isIntType = true
-		minVal, maxVal = -32768, 32767
-		maxUnsigned = 65535
-	case "MEDIUMINT":
-		isIntType = true
-		minVal, maxVal = -8388608, 8388607
-		maxUnsigned = 16777215
-	case "INT", "INTEGER":
-		isIntType = true
-		minVal, maxVal = -2147483648, 2147483647
-		maxUnsigned = 4294967295
-	case "BIGINT":
-		isIntType = true
-		minVal, maxVal = -9223372036854775808, 9223372036854775807
-		maxUnsigned = 18446744073709551615
-	}
+	rng, isIntType := intTypeRanges[baseType]
 	if !isIntType {
 		return v
 	}
+	minVal, maxVal, maxUnsigned := rng.Min, rng.Max, rng.MaxUnsigned
 
 	// Convert value to int64
 	var intVal int64
@@ -6995,6 +6988,20 @@ func (e *Executor) execMyliteCommand(query string) (*Result, error) {
 	return nil, fmt.Errorf("unknown MYLITE command: %s", query)
 }
 
+// buildGeometryFromExprs evaluates a slice of expressions, applies extractFn
+// to each result, and wraps them in "WRAPNAME(...)".
+func (e *Executor) buildGeometryFromExprs(params []sqlparser.Expr, extractFn func(string) string, wrapperName string) (string, error) {
+	var parts []string
+	for _, p := range params {
+		pv, err := e.evalExpr(p)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, extractFn(toString(pv)))
+	}
+	return fmt.Sprintf("%s(%s)", wrapperName, strings.Join(parts, ",")), nil
+}
+
 // evalExpr evaluates a SQL expression that does not depend on a row context.
 // It is a method on *Executor so that functions like LAST_INSERT_ID() and
 // DATABASE() can access executor state.
@@ -7308,57 +7315,15 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 		return evalGeoHash(coords[0], coords[1], int(toInt64(maxLenVal)))
 	case *sqlparser.LineStringExpr:
-		// LINESTRING(pt, pt, ...)
-		var parts []string
-		for _, p := range v.PointParams {
-			pv, err := e.evalExpr(p)
-			if err != nil {
-				return nil, err
-			}
-			parts = append(parts, extractPointCoords(toString(pv)))
-		}
-		return fmt.Sprintf("LINESTRING(%s)", strings.Join(parts, ",")), nil
+		return e.buildGeometryFromExprs(v.PointParams, extractPointCoords, "LINESTRING")
 	case *sqlparser.PolygonExpr:
-		// POLYGON(ls, ...)
-		var rings []string
-		for _, ls := range v.LinestringParams {
-			lv, err := e.evalExpr(ls)
-			if err != nil {
-				return nil, err
-			}
-			rings = append(rings, extractRingCoords(toString(lv)))
-		}
-		return fmt.Sprintf("POLYGON(%s)", strings.Join(rings, ",")), nil
+		return e.buildGeometryFromExprs(v.LinestringParams, extractRingCoords, "POLYGON")
 	case *sqlparser.MultiPointExpr:
-		var parts []string
-		for _, p := range v.PointParams {
-			pv, err := e.evalExpr(p)
-			if err != nil {
-				return nil, err
-			}
-			parts = append(parts, extractPointCoords(toString(pv)))
-		}
-		return fmt.Sprintf("MULTIPOINT(%s)", strings.Join(parts, ",")), nil
+		return e.buildGeometryFromExprs(v.PointParams, extractPointCoords, "MULTIPOINT")
 	case *sqlparser.MultiLinestringExpr:
-		var parts []string
-		for _, ls := range v.LinestringParams {
-			lv, err := e.evalExpr(ls)
-			if err != nil {
-				return nil, err
-			}
-			parts = append(parts, extractRingCoords(toString(lv)))
-		}
-		return fmt.Sprintf("MULTILINESTRING(%s)", strings.Join(parts, ",")), nil
+		return e.buildGeometryFromExprs(v.LinestringParams, extractRingCoords, "MULTILINESTRING")
 	case *sqlparser.MultiPolygonExpr:
-		var parts []string
-		for _, p := range v.PolygonParams {
-			pv, err := e.evalExpr(p)
-			if err != nil {
-				return nil, err
-			}
-			parts = append(parts, extractPolygonCoords(toString(pv)))
-		}
-		return fmt.Sprintf("MULTIPOLYGON(%s)", strings.Join(parts, ",")), nil
+		return e.buildGeometryFromExprs(v.PolygonParams, extractPolygonCoords, "MULTIPOLYGON")
 	case *sqlparser.CharExpr:
 		// CHAR(N1, N2, ...) — convert integers to characters
 		var sb strings.Builder
@@ -9045,46 +9010,7 @@ func (e *Executor) evalBinaryExprWithRow(v *sqlparser.BinaryExpr, row storage.Ro
 	if err != nil {
 		return nil, err
 	}
-	// MySQL arithmetic/bit operations with NULL yield NULL.
-	if left == nil || right == nil {
-		return nil, nil
-	}
-	l := toFloat(left)
-	r := toFloat(right)
-	switch v.Operator {
-	case sqlparser.PlusOp:
-		return l + r, nil
-	case sqlparser.MinusOp:
-		return l - r, nil
-	case sqlparser.MultOp:
-		return l * r, nil
-	case sqlparser.DivOp:
-		if r == 0 {
-			return nil, nil
-		}
-		return l / r, nil
-	case sqlparser.IntDivOp:
-		if r == 0 {
-			return nil, nil
-		}
-		return int64(l) / int64(r), nil
-	case sqlparser.ModOp:
-		if r == 0 {
-			return nil, nil
-		}
-		return int64(l) % int64(r), nil
-	case sqlparser.ShiftLeftOp:
-		return uint64(int64(l)) << uint64(int64(r)), nil
-	case sqlparser.ShiftRightOp:
-		return uint64(int64(l)) >> uint64(int64(r)), nil
-	case sqlparser.BitAndOp:
-		return uint64(int64(l)) & uint64(int64(r)), nil
-	case sqlparser.BitOrOp:
-		return uint64(int64(l)) | uint64(int64(r)), nil
-	case sqlparser.BitXorOp:
-		return uint64(int64(l)) ^ uint64(int64(r)), nil
-	}
-	return e.evalExpr(v)
+	return evalBinaryExpr(left, right, v.Operator)
 }
 
 // evalCaseExprWithRow evaluates a CASE expression with row context.
