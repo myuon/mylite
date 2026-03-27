@@ -223,6 +223,116 @@ var infoSchemaColumnOrder = map[string][]string{
 	"data_lock_waits":                  {"ENGINE", "REQUESTING_ENGINE_LOCK_ID", "REQUESTING_ENGINE_TRANSACTION_ID", "REQUESTING_THREAD_ID", "REQUESTING_EVENT_ID", "REQUESTING_OBJECT_INSTANCE_BEGIN", "BLOCKING_ENGINE_LOCK_ID", "BLOCKING_ENGINE_TRANSACTION_ID", "BLOCKING_THREAD_ID", "BLOCKING_EVENT_ID", "BLOCKING_OBJECT_INSTANCE_BEGIN"},
 }
 
+// emptyStubTables lists virtual tables that always return an empty result set.
+var emptyStubTables = map[string]bool{
+	"innodb_ft_index_cache":  true,
+	"innodb_ft_index_table":  true,
+	"innodb_ft_config":       true,
+	"innodb_ft_being_deleted": true,
+	"innodb_ft_deleted":      true,
+	"schema_privileges":      true,
+	"table_privileges":       true,
+	"column_privileges":      true,
+	"persisted_variables":    true,
+	"variables_by_thread":    true,
+	"events_statements_summary_by_digest":     true,
+	"events_statements_summary_by_program":    true,
+	"events_statements_histogram_by_digest":   true,
+	"status_by_account":                       true,
+	"status_by_host":                          true,
+	"status_by_thread":                        true,
+	"status_by_user":                          true,
+	"replication_connection_configuration":     true,
+	"replication_connection_status":            true,
+	"replication_applier_configuration":        true,
+	"replication_applier_status":               true,
+	"replication_applier_status_by_coordinator": true,
+	"replication_applier_status_by_worker":     true,
+	"replication_applier_filters":              true,
+	"replication_applier_global_filters":       true,
+	"replication_group_members":                true,
+	"replication_group_member_stats":           true,
+	"keyring_keys":               true,
+	"host_cache":                 true,
+	"log_status":                 true,
+	"prepared_statements_instances": true,
+	"user_defined_functions":     true,
+	"user_variables_by_thread":   true,
+	"session_connect_attrs":      true,
+	"session_account_connect_attrs": true,
+	"metadata_locks":             true,
+	"data_locks":                 true,
+	"data_lock_waits":            true,
+	"mutex_instances":            true,
+	"rwlock_instances":           true,
+	"cond_instances":             true,
+	"file_instances":             true,
+	"file_summary_by_instance":   true,
+	"socket_instances":           true,
+	"socket_summary_by_event_name":  true,
+	"socket_summary_by_instance":    true,
+	"table_handles":              true,
+	"table_io_waits_summary_by_table":       true,
+	"table_io_waits_summary_by_index_usage": true,
+	"table_lock_waits_summary_by_table":     true,
+}
+
+// singleRowStubTables maps table names to their single stub row definition.
+// These are InnoDB metadata tables that return one row of zero/empty values.
+var singleRowStubTables = map[string]storage.Row{
+	"innodb_columns":        {"TABLE_ID": int64(0), "NAME": "", "POS": int64(0), "MTYPE": int64(0), "PRTYPE": int64(0), "LEN": int64(0)},
+	"innodb_virtual":        {"TABLE_ID": int64(0), "POS": int64(0), "BASE_POS": int64(0)},
+	"innodb_foreign":        {"ID": "", "FOR_NAME": "", "REF_NAME": "", "N_COLS": int64(0)},
+	"innodb_cached_indexes": {"INDEX_ID": int64(0), "N_FIELDS": int64(0), "SPACE": int64(0), "PAGE_NO": int64(0)},
+	"innodb_indexes":        {"INDEX_ID": int64(0), "NAME": "", "TABLE_ID": int64(0), "TYPE": int64(0)},
+	"innodb_buffer_page_lru": {"POOL_ID": int64(0), "LRU_POSITION": int64(0), "SPACE": int64(0), "PAGE_NUMBER": int64(0)},
+	"innodb_buffer_page":    {"SPACE": int64(0), "PAGE_NUMBER": int64(0), "PAGE_TYPE": "", "NUMBER_RECORDS": int64(0)},
+	"innodb_buffer_pool_stats": {"POOL_ID": int64(0), "POOL_SIZE": int64(0)},
+	"innodb_trx":            {"trx_id": "", "trx_state": "RUNNING", "trx_started": nil},
+	"innodb_foreign_cols":   {"ID": "", "FOR_COL_NAME": "", "REF_COL_NAME": "", "POS": int64(0)},
+	"innodb_fields":         {"INDEX_ID": int64(0), "NAME": "", "POS": int64(0)},
+	"optimizer_trace":       {"QUERY": "", "TRACE": ""},
+	"files":                 {"FILE_NAME": "", "FILE_TYPE": "", "TABLESPACE_NAME": ""},
+	"referential_constraints": {"CONSTRAINT_CATALOG": "def", "CONSTRAINT_SCHEMA": "", "CONSTRAINT_NAME": "", "UNIQUE_CONSTRAINT_CATALOG": "def", "UNIQUE_CONSTRAINT_SCHEMA": "", "UNIQUE_CONSTRAINT_NAME": "", "MATCH_OPTION": "NONE", "UPDATE_RULE": "RESTRICT", "DELETE_RULE": "RESTRICT", "TABLE_NAME": "", "REFERENCED_TABLE_NAME": ""},
+	"innodb_temp_table_info": {"TABLE_ID": int64(0), "NAME": "", "N_COLS": int64(0), "SPACE": int64(0)},
+}
+
+// psSummaryTables maps summary table names to their definitions.
+// Each entry follows the pattern: check psClassDisabled/startupVar, then call seed fn.
+type psSummaryDef struct {
+	disableClass string   // for psClassDisabled check ("wait", "transaction", "stage", "")
+	disableVar   string   // for startupVars check (empty means use disableClass instead)
+	seedFn       func(e *Executor) []storage.Row
+}
+
+var psSummaryTables = map[string]psSummaryDef{
+	// wait summaries
+	"events_waits_summary_by_account_by_event_name": {disableClass: "wait", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByAccountByEventName(psWaitEventNames) }},
+	"events_waits_summary_by_host_by_event_name":    {disableClass: "wait", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByHostByEventName(psWaitEventNames) }},
+	"events_waits_summary_by_instance":              {disableClass: "wait", seedFn: func(_ *Executor) []storage.Row { return []storage.Row{{"EVENT_NAME": "wait/lock/table/sql/handler", "OBJECT_INSTANCE_BEGIN": int64(1), "COUNT_STAR": int64(0), "SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0), "AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0)}} }},
+	"events_waits_summary_by_thread_by_event_name":  {disableClass: "wait", seedFn: func(e *Executor) []storage.Row { return e.perfSchemaSeedByThreadByEventName(psWaitEventNames) }},
+	"events_waits_summary_by_user_by_event_name":    {disableClass: "wait", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByUserByEventName(psWaitEventNames) }},
+	"events_waits_summary_global_by_event_name":     {disableClass: "wait", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedGlobalByEventName(psWaitEventNames) }},
+	// stage summaries
+	"events_stages_summary_by_account_by_event_name": {disableVar: "performance_schema_max_stage_classes", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByAccountByEventName(psStageEventNames) }},
+	"events_stages_summary_by_host_by_event_name":    {disableVar: "performance_schema_max_stage_classes", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByHostByEventName(psStageEventNames) }},
+	"events_stages_summary_by_thread_by_event_name":  {disableVar: "performance_schema_max_stage_classes", seedFn: func(e *Executor) []storage.Row { return e.perfSchemaSeedByThreadByEventName(psStageEventNames) }},
+	"events_stages_summary_by_user_by_event_name":    {disableVar: "performance_schema_max_stage_classes", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByUserByEventName(psStageEventNames) }},
+	"events_stages_summary_global_by_event_name":     {disableVar: "performance_schema_max_stage_classes", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedGlobalByEventName(psStageEventNames) }},
+	// statement summaries
+	"events_statements_summary_by_account_by_event_name": {disableVar: "performance_schema_max_statement_classes", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedStmtByAccountByEventName() }},
+	"events_statements_summary_by_host_by_event_name":    {disableVar: "performance_schema_max_statement_classes", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedStmtByHostByEventName() }},
+	"events_statements_summary_by_thread_by_event_name":  {disableVar: "performance_schema_max_statement_classes", seedFn: func(e *Executor) []storage.Row { return e.perfSchemaSeedStmtByThreadByEventName() }},
+	"events_statements_summary_by_user_by_event_name":    {disableVar: "performance_schema_max_statement_classes", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedStmtByUserByEventName() }},
+	"events_statements_summary_global_by_event_name":     {disableVar: "performance_schema_max_statement_classes", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedStmtGlobalByEventName() }},
+	// transaction summaries
+	"events_transactions_summary_by_account_by_event_name": {disableClass: "transaction", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByAccountByEventName(psTxnEventNames) }},
+	"events_transactions_summary_by_host_by_event_name":    {disableClass: "transaction", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByHostByEventName(psTxnEventNames) }},
+	"events_transactions_summary_by_thread_by_event_name":  {disableClass: "transaction", seedFn: func(e *Executor) []storage.Row { return e.perfSchemaSeedByThreadByEventName(psTxnEventNames) }},
+	"events_transactions_summary_by_user_by_event_name":    {disableClass: "transaction", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByUserByEventName(psTxnEventNames) }},
+	"events_transactions_summary_global_by_event_name":     {disableClass: "transaction", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedGlobalByEventName(psTxnEventNames) }},
+}
+
 // isInformationSchemaTable returns (dbName, tableName, true) when the provided
 // AliasedTableExpr refers to an INFORMATION_SCHEMA virtual table, either via an
 // explicit qualifier (information_schema.tables) or when the current database is
@@ -347,6 +457,34 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storage.Row, error) {
 	t := strings.ToLower(tableName)
 	var rawRows []storage.Row
+
+	// Check declarative stub tables first (empty results and single-row stubs).
+	if emptyStubTables[t] {
+		rawRows = []storage.Row{}
+		goto applyAlias
+	}
+	if stubRow, ok := singleRowStubTables[t]; ok {
+		rawRows = []storage.Row{stubRow}
+		goto applyAlias
+	}
+
+	// Check performance_schema summary tables with disable-check + seed pattern.
+	if def, ok := psSummaryTables[t]; ok {
+		disabled := false
+		if def.disableClass != "" {
+			disabled = e.psClassDisabled(def.disableClass)
+		}
+		if def.disableVar != "" {
+			disabled = e.startupVars[def.disableVar] == "0"
+		}
+		if disabled {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = def.seedFn(e)
+		}
+		goto applyAlias
+	}
+
 	switch t {
 	case "schemata":
 		rawRows = e.infoSchemaSchemata()
@@ -366,34 +504,8 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.infoSchemaInnoDBTablespaces()
 	case "innodb_datafiles":
 		rawRows = e.infoSchemaInnoDBDatafiles()
-	case "innodb_columns":
-		rawRows = []storage.Row{{"TABLE_ID": int64(0), "NAME": "", "POS": int64(0), "MTYPE": int64(0), "PRTYPE": int64(0), "LEN": int64(0)}}
-	case "innodb_virtual":
-		rawRows = []storage.Row{{"TABLE_ID": int64(0), "POS": int64(0), "BASE_POS": int64(0)}}
-	case "innodb_foreign":
-		rawRows = []storage.Row{{"ID": "", "FOR_NAME": "", "REF_NAME": "", "N_COLS": int64(0)}}
 	case "innodb_metrics":
 		rawRows = e.infoSchemaInnoDBMetrics()
-	case "innodb_cached_indexes":
-		rawRows = []storage.Row{{"INDEX_ID": int64(0), "N_FIELDS": int64(0), "SPACE": int64(0), "PAGE_NO": int64(0)}}
-	case "innodb_indexes":
-		rawRows = []storage.Row{{"INDEX_ID": int64(0), "NAME": "", "TABLE_ID": int64(0), "TYPE": int64(0)}}
-	case "innodb_buffer_page_lru":
-		rawRows = []storage.Row{{"POOL_ID": int64(0), "LRU_POSITION": int64(0), "SPACE": int64(0), "PAGE_NUMBER": int64(0)}}
-	case "innodb_buffer_page":
-		rawRows = []storage.Row{{"SPACE": int64(0), "PAGE_NUMBER": int64(0), "PAGE_TYPE": "", "NUMBER_RECORDS": int64(0)}}
-	case "innodb_buffer_pool_stats":
-		rawRows = []storage.Row{{"POOL_ID": int64(0), "POOL_SIZE": int64(0)}}
-	case "innodb_trx":
-		rawRows = []storage.Row{{"trx_id": "", "trx_state": "RUNNING", "trx_started": nil}}
-	case "innodb_foreign_cols":
-		rawRows = []storage.Row{{"ID": "", "FOR_COL_NAME": "", "REF_COL_NAME": "", "POS": int64(0)}}
-	case "innodb_fields":
-		rawRows = []storage.Row{{"INDEX_ID": int64(0), "NAME": "", "POS": int64(0)}}
-	case "optimizer_trace":
-		rawRows = []storage.Row{{"QUERY": "", "TRACE": ""}}
-	case "files":
-		rawRows = []storage.Row{{"FILE_NAME": "", "FILE_TYPE": "", "TABLESPACE_NAME": ""}}
 	case "processlist":
 		if e.processList != nil {
 			entries := e.processList.Snapshot()
@@ -430,10 +542,6 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		}
 	case "key_column_usage":
 		rawRows = e.infoSchemaKeyColumnUsage()
-	case "referential_constraints":
-		rawRows = []storage.Row{{"CONSTRAINT_CATALOG": "def", "CONSTRAINT_SCHEMA": "", "CONSTRAINT_NAME": "", "UNIQUE_CONSTRAINT_CATALOG": "def", "UNIQUE_CONSTRAINT_SCHEMA": "", "UNIQUE_CONSTRAINT_NAME": "", "MATCH_OPTION": "NONE", "UPDATE_RULE": "RESTRICT", "DELETE_RULE": "RESTRICT", "TABLE_NAME": "", "REFERENCED_TABLE_NAME": ""}}
-	case "innodb_temp_table_info":
-		rawRows = []storage.Row{{"TABLE_ID": int64(0), "NAME": "", "N_COLS": int64(0), "SPACE": int64(0)}}
 	case "innodb_ft_default_stopword":
 		// MySQL default fulltext stopword list
 		rawRows = []storage.Row{
@@ -447,16 +555,6 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 			{"value": "when"}, {"value": "where"}, {"value": "who"}, {"value": "will"},
 			{"value": "with"}, {"value": "und"}, {"value": "the"}, {"value": "www"},
 		}
-	case "innodb_ft_index_cache":
-		rawRows = []storage.Row{}
-	case "innodb_ft_index_table":
-		rawRows = []storage.Row{}
-	case "innodb_ft_config":
-		rawRows = []storage.Row{}
-	case "innodb_ft_being_deleted":
-		rawRows = []storage.Row{}
-	case "innodb_ft_deleted":
-		rawRows = []storage.Row{}
 	case "global_variables":
 		rawRows = e.perfSchemaVariablesScoped(true)
 	case "session_variables":
@@ -523,12 +621,6 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.infoSchemaCollCharSetAppl()
 	case "user_privileges":
 		rawRows = e.infoSchemaUserPrivileges()
-	case "schema_privileges":
-		rawRows = []storage.Row{} // empty – no grants tracked
-	case "table_privileges":
-		rawRows = []storage.Row{} // empty – no grants tracked
-	case "column_privileges":
-		rawRows = []storage.Row{} // empty – no grants tracked
 	case "routines":
 		rawRows = e.infoSchemaRoutines()
 	case "views":
@@ -576,19 +668,8 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.perfSchemaSetupInstruments()
 	case "setup_threads":
 		rawRows = e.perfSchemaSetupThreads()
-	case "persisted_variables":
-		rawRows = []storage.Row{}
 	case "variables_info":
 		rawRows = e.perfSchemaVariablesInfo()
-	case "variables_by_thread":
-		rawRows = []storage.Row{}
-	case "mutex_instances", "rwlock_instances", "cond_instances",
-		"file_instances", "file_summary_by_instance",
-		"socket_instances", "socket_summary_by_event_name", "socket_summary_by_instance",
-		"table_handles",
-		"table_io_waits_summary_by_table", "table_io_waits_summary_by_index_usage",
-		"table_lock_waits_summary_by_table":
-		rawRows = []storage.Row{}
 	case "file_summary_by_event_name":
 		rawRows = perfSchemaSeedFileSummaryByEventName()
 	case "events_stages_current":
@@ -639,142 +720,8 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 				{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "transaction", "STATE": "COMMITTED", "TRX_ID": nil, "GTID": "", "XID_FORMAT_ID": nil, "XID_GTRID": nil, "XID_BQUAL": nil, "XA_STATE": nil, "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "ACCESS_MODE": "READ WRITE", "ISOLATION_LEVEL": "REPEATABLE READ", "AUTOCOMMIT": "YES", "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil},
 			}
 		}
-	case "events_waits_summary_by_account_by_event_name":
-		if e.psClassDisabled("wait") {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = perfSchemaSeedByAccountByEventName(psWaitEventNames)
-		}
-	case "events_waits_summary_by_host_by_event_name":
-		if e.psClassDisabled("wait") {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = perfSchemaSeedByHostByEventName(psWaitEventNames)
-		}
-	case "events_waits_summary_by_instance":
-		if e.psClassDisabled("wait") {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = []storage.Row{
-				{"EVENT_NAME": "wait/lock/table/sql/handler", "OBJECT_INSTANCE_BEGIN": int64(1), "COUNT_STAR": int64(0), "SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0), "AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0)},
-			}
-		}
-	case "events_waits_summary_by_thread_by_event_name":
-		if e.psClassDisabled("wait") {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = e.perfSchemaSeedByThreadByEventName(psWaitEventNames)
-		}
-	case "events_waits_summary_by_user_by_event_name":
-		if e.psClassDisabled("wait") {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = perfSchemaSeedByUserByEventName(psWaitEventNames)
-		}
-	case "events_waits_summary_global_by_event_name":
-		if e.psClassDisabled("wait") {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = perfSchemaSeedGlobalByEventName(psWaitEventNames)
-		}
-	case "events_stages_summary_by_account_by_event_name":
-		if e.startupVars["performance_schema_max_stage_classes"] == "0" {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = perfSchemaSeedByAccountByEventName(psStageEventNames)
-		}
-	case "events_stages_summary_by_host_by_event_name":
-		if e.startupVars["performance_schema_max_stage_classes"] == "0" {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = perfSchemaSeedByHostByEventName(psStageEventNames)
-		}
-	case "events_stages_summary_by_thread_by_event_name":
-		if e.startupVars["performance_schema_max_stage_classes"] == "0" {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = e.perfSchemaSeedByThreadByEventName(psStageEventNames)
-		}
-	case "events_stages_summary_by_user_by_event_name":
-		if e.startupVars["performance_schema_max_stage_classes"] == "0" {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = perfSchemaSeedByUserByEventName(psStageEventNames)
-		}
-	case "events_stages_summary_global_by_event_name":
-		if e.startupVars["performance_schema_max_stage_classes"] == "0" {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = perfSchemaSeedGlobalByEventName(psStageEventNames)
-		}
-	case "events_statements_summary_by_account_by_event_name":
-		if e.startupVars["performance_schema_max_statement_classes"] == "0" {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = perfSchemaSeedStmtByAccountByEventName()
-		}
-	case "events_statements_summary_by_digest":
-		rawRows = []storage.Row{}
-	case "events_statements_summary_by_host_by_event_name":
-		if e.startupVars["performance_schema_max_statement_classes"] == "0" {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = perfSchemaSeedStmtByHostByEventName()
-		}
-	case "events_statements_summary_by_thread_by_event_name":
-		if e.startupVars["performance_schema_max_statement_classes"] == "0" {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = e.perfSchemaSeedStmtByThreadByEventName()
-		}
-	case "events_statements_summary_by_user_by_event_name":
-		if e.startupVars["performance_schema_max_statement_classes"] == "0" {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = perfSchemaSeedStmtByUserByEventName()
-		}
-	case "events_statements_summary_global_by_event_name":
-		if e.startupVars["performance_schema_max_statement_classes"] == "0" {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = perfSchemaSeedStmtGlobalByEventName()
-		}
-	case "events_statements_summary_by_program":
-		rawRows = []storage.Row{}
-	case "events_statements_histogram_by_digest":
-		rawRows = []storage.Row{}
 	case "events_statements_histogram_global":
 		rawRows = perfSchemaSeedHistogramGlobal()
-	case "events_transactions_summary_by_account_by_event_name":
-		if e.psClassDisabled("transaction") {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = perfSchemaSeedByAccountByEventName(psTxnEventNames)
-		}
-	case "events_transactions_summary_by_host_by_event_name":
-		if e.psClassDisabled("transaction") {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = perfSchemaSeedByHostByEventName(psTxnEventNames)
-		}
-	case "events_transactions_summary_by_thread_by_event_name":
-		if e.psClassDisabled("transaction") {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = e.perfSchemaSeedByThreadByEventName(psTxnEventNames)
-		}
-	case "events_transactions_summary_by_user_by_event_name":
-		if e.psClassDisabled("transaction") {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = perfSchemaSeedByUserByEventName(psTxnEventNames)
-		}
-	case "events_transactions_summary_global_by_event_name":
-		if e.psClassDisabled("transaction") {
-			rawRows = []storage.Row{}
-		} else {
-			rawRows = perfSchemaSeedGlobalByEventName(psTxnEventNames)
-		}
 	case "events_errors_summary_by_account_by_error":
 		rawRows = perfSchemaSeedErrorByAccount()
 	case "events_errors_summary_by_host_by_error":
@@ -795,38 +742,10 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = perfSchemaSeedMemByUserByEventName()
 	case "memory_summary_global_by_event_name":
 		rawRows = e.perfSchemaMemorySummary()
-	case "status_by_account", "status_by_host", "status_by_thread", "status_by_user":
-		rawRows = []storage.Row{}
-	case "replication_connection_configuration", "replication_connection_status",
-		"replication_applier_configuration", "replication_applier_status",
-		"replication_applier_status_by_coordinator", "replication_applier_status_by_worker",
-		"replication_applier_filters", "replication_applier_global_filters",
-		"replication_group_members", "replication_group_member_stats":
-		rawRows = []storage.Row{}
-	case "keyring_keys":
-		rawRows = []storage.Row{}
-	case "host_cache":
-		rawRows = []storage.Row{}
-	case "log_status":
-		rawRows = []storage.Row{}
 	case "objects_summary_global_by_type":
 		rawRows = []storage.Row{
 			{"OBJECT_TYPE": "TABLE", "OBJECT_SCHEMA": "test", "OBJECT_NAME": "t1", "COUNT_STAR": int64(0), "SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0), "AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0)},
 		}
-	case "prepared_statements_instances":
-		rawRows = []storage.Row{}
-	case "user_defined_functions":
-		rawRows = []storage.Row{}
-	case "user_variables_by_thread":
-		rawRows = []storage.Row{}
-	case "session_connect_attrs", "session_account_connect_attrs":
-		rawRows = []storage.Row{}
-	case "metadata_locks":
-		rawRows = []storage.Row{}
-	case "data_locks":
-		rawRows = []storage.Row{}
-	case "data_lock_waits":
-		rawRows = []storage.Row{}
 	case "setup_consumers":
 		consumers := []string{
 			"events_stages_current", "events_stages_history", "events_stages_history_long",
@@ -847,6 +766,7 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		}
 	}
 
+applyAlias:
 	// Determine if this is a performance_schema table (columns use user casing, not uppercase)
 	isPerfSchema := strings.Contains(strings.ToLower(alias), "performance_schema")
 
