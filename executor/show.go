@@ -1,0 +1,1387 @@
+package executor
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/myuon/mylite/catalog"
+	"github.com/myuon/mylite/storage"
+	"vitess.io/vitess/go/vt/sqlparser"
+)
+
+// execDescribe handles DESCRIBE <table> and DESC <table> (parsed as *sqlparser.ExplainTab).
+func (e *Executor) execDescribe(stmt *sqlparser.ExplainTab) (*Result, error) {
+	tableName := stmt.Table.Name.String()
+	if q := stmt.Table.Qualifier.String(); q != "" {
+		tableName = q + "." + tableName
+	}
+	return e.describeTable(tableName)
+}
+
+func findTableDefCaseInsensitive(db *catalog.Database, tableName string) (*catalog.TableDef, string, error) {
+	if def, err := db.GetTable(tableName); err == nil {
+		return def, tableName, nil
+	}
+	for _, name := range db.ListTables() {
+		if strings.EqualFold(name, tableName) {
+			def, err := db.GetTable(name)
+			if err == nil {
+				return def, name, nil
+			}
+		}
+	}
+	return nil, tableName, fmt.Errorf("table '%s' doesn't exist", tableName)
+}
+
+func findDatabaseCaseInsensitive(cat *catalog.Catalog, dbName string) (*catalog.Database, string, error) {
+	if db, err := cat.GetDatabase(dbName); err == nil {
+		return db, dbName, nil
+	}
+	for _, name := range cat.ListDatabases() {
+		if strings.EqualFold(name, dbName) {
+			db, err := cat.GetDatabase(name)
+			if err == nil {
+				return db, name, nil
+			}
+		}
+	}
+	return nil, dbName, fmt.Errorf("unknown database '%s'", dbName)
+}
+
+func isInfoSchemaTable(dbName string) bool {
+	return strings.EqualFold(dbName, "information_schema")
+}
+
+// describeTable returns column metadata for a table, matching MySQL DESCRIBE output.
+func (e *Executor) describeTable(tableName string) (*Result, error) {
+	descDB := e.CurrentDB
+	if strings.Contains(tableName, ".") {
+		descDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
+	}
+	db, resolvedDBName, err := findDatabaseCaseInsensitive(e.Catalog, descDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", descDB))
+	}
+	descDB = resolvedDBName
+	tblDef, resolvedTableName, err := findTableDefCaseInsensitive(db, tableName)
+	if err != nil {
+		// Check if it's a view — derive column info from executing the view's SELECT.
+		if e.views != nil {
+			viewLookup := tableName
+			if _, ok := e.views[viewLookup]; !ok {
+				// Try case-insensitive lookup
+				for vn := range e.views {
+					if strings.EqualFold(vn, viewLookup) {
+						viewLookup = vn
+						break
+					}
+				}
+			}
+			if viewSQL, ok := e.views[viewLookup]; ok {
+				return e.describeView(viewSQL)
+			}
+		}
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", descDB, tableName))
+	}
+	tableName = resolvedTableName
+
+	cols := []string{"Field", "Type", "Null", "Key", "Default", "Extra"}
+	rows := make([][]interface{}, 0, len(tblDef.Columns))
+	for _, col := range tblDef.Columns {
+		nullable := "YES"
+		if !col.Nullable {
+			nullable = "NO"
+		}
+		key := ""
+		isPK := col.PrimaryKey
+		if !isPK {
+			for _, pk := range tblDef.PrimaryKey {
+				if strings.EqualFold(stripPrefixLengthFromCol(pk), col.Name) {
+					isPK = true
+					break
+				}
+			}
+		}
+		if isPK {
+			key = "PRI"
+		} else if col.Unique {
+			key = "UNI"
+		} else {
+			// Check indexes for this column
+			for _, idx := range tblDef.Indexes {
+				if len(idx.Columns) > 0 {
+					// Strip length suffix from index column name (e.g. "col(10)" -> "col")
+					idxCol := idx.Columns[0]
+					if parenIdx := strings.Index(idxCol, "("); parenIdx >= 0 {
+						idxCol = idxCol[:parenIdx]
+					}
+					if strings.EqualFold(idxCol, col.Name) {
+						if idx.Unique && len(idx.Columns) == 1 {
+							key = "UNI"
+						} else {
+							key = "MUL"
+						}
+						break
+					}
+				}
+			}
+		}
+		var defVal interface{}
+		if col.Default != nil {
+			defVal = *col.Default
+		} else if isInfoSchemaTable(descDB) {
+			defVal = "" // empty for INFORMATION_SCHEMA columns
+		} else {
+			defVal = nil // NULL for columns without explicit default (user tables)
+		}
+		var extra interface{}
+		extra = ""
+		if col.AutoIncrement {
+			extra = "auto_increment"
+		} else if isGeneratedColumnType(col.Type) {
+			if strings.Contains(strings.ToUpper(col.Type), "STORED") {
+				extra = "STORED GENERATED"
+			} else {
+				extra = "VIRTUAL GENERATED"
+			}
+		}
+		// For TEMPORARY tables, MySQL returns NULL for the Extra column when empty
+		if e.tempTables[tableName] && extra == "" {
+			extra = nil
+		}
+		rows = append(rows, []interface{}{col.Name, mysqlDisplayType(col.Type), nullable, key, defVal, extra})
+	}
+
+	return &Result{
+		Columns:     cols,
+		Rows:        rows,
+		IsResultSet: true,
+	}, nil
+}
+
+// describeTableFull returns column metadata for SHOW FULL COLUMNS, including
+// Collation, Privileges, and Comment columns.
+func (e *Executor) describeTableFull(tableName string) (*Result, error) {
+	// Get the basic describe result first
+	basic, err := e.describeTable(tableName)
+	if err != nil {
+		return nil, err
+	}
+	// Extend columns: Field, Type, Collation, Null, Key, Default, Extra, Privileges, Comment
+	cols := []string{"Field", "Type", "Collation", "Null", "Key", "Default", "Extra", "Privileges", "Comment"}
+	rows := make([][]interface{}, 0, len(basic.Rows))
+	for _, row := range basic.Rows {
+		// row is [Field, Type, Null, Key, Default, Extra]
+		colType := ""
+		if len(row) > 1 && row[1] != nil {
+			colType = toString(row[1])
+		}
+		collation := interface{}(nil)
+		colTypeUpper := strings.ToUpper(colType)
+		// String types get a collation
+		if strings.Contains(colTypeUpper, "CHAR") || strings.Contains(colTypeUpper, "TEXT") ||
+			strings.Contains(colTypeUpper, "ENUM") || strings.Contains(colTypeUpper, "SET") {
+			collation = "utf8mb4_0900_ai_ci"
+			// Try to extract charset/collation from column definition
+			fieldName := ""
+			if row[0] != nil {
+				fieldName = toString(row[0])
+			}
+			descDB := e.CurrentDB
+			descTbl := tableName
+			if strings.Contains(descTbl, ".") {
+				descDB, descTbl = resolveTableNameDB(descTbl, e.CurrentDB)
+			}
+			if dbObj, err2 := e.Catalog.GetDatabase(descDB); err2 == nil {
+				if tblDef, err2 := dbObj.GetTable(descTbl); err2 == nil && tblDef != nil {
+					for _, cd := range tblDef.Columns {
+						if strings.EqualFold(cd.Name, fieldName) {
+							// Check for CHARACTER SET in column type
+							cdUpper := strings.ToUpper(cd.Type)
+							if idx := strings.Index(cdUpper, "CHARACTER SET "); idx >= 0 {
+								rest := cd.Type[idx+len("CHARACTER SET "):]
+								parts := strings.Fields(rest)
+								if len(parts) > 0 {
+									cs := strings.ToLower(parts[0])
+									// Map charset to default collation
+									switch cs {
+									case "latin1":
+										collation = "latin1_swedish_ci"
+									case "utf8", "utf8mb3":
+										collation = "utf8_general_ci"
+									case "binary":
+										collation = "binary"
+									case "gb2312":
+										collation = "gb2312_chinese_ci"
+									case "gbk":
+										collation = "gbk_chinese_ci"
+									case "gb18030":
+										collation = "gb18030_chinese_ci"
+									case "cp1250":
+										collation = "cp1250_general_ci"
+									case "ascii":
+										collation = "ascii_general_ci"
+									case "latin2":
+										collation = "latin2_general_ci"
+									case "cp932":
+										collation = "cp932_japanese_ci"
+									case "ujis":
+										collation = "ujis_japanese_ci"
+									case "ucs2":
+										collation = "ucs2_general_ci"
+									case "utf16":
+										collation = "utf16_general_ci"
+									case "utf32":
+										collation = "utf32_general_ci"
+									case "tis620":
+										collation = "tis620_thai_ci"
+									default:
+										collation = cs + "_general_ci"
+									}
+								}
+							}
+							// Check for COLLATE in column type
+							if idx := strings.Index(cdUpper, "COLLATE "); idx >= 0 {
+								rest := cd.Type[idx+len("COLLATE "):]
+								parts := strings.Fields(rest)
+								if len(parts) > 0 {
+									collation = strings.ToLower(parts[0])
+								}
+							}
+							break
+						}
+					}
+				}
+			}
+		}
+		privileges := "select,insert,update,references"
+		comment := ""
+		newRow := []interface{}{
+			row[0],     // Field
+			row[1],     // Type
+			collation,  // Collation
+			row[2],     // Null
+			row[3],     // Key
+			row[4],     // Default
+			row[5],     // Extra
+			privileges, // Privileges
+			comment,    // Comment
+		}
+		rows = append(rows, newRow)
+	}
+	return &Result{
+		Columns:     cols,
+		Rows:        rows,
+		IsResultSet: true,
+	}, nil
+}
+
+// describeView derives DESCRIBE-style column info by executing the view's SELECT
+// and inferring types from the result set.
+func (e *Executor) describeView(viewSQL string) (*Result, error) {
+	viewResult, err := e.Execute(viewSQL)
+	if err != nil {
+		return nil, err
+	}
+	cols := []string{"Field", "Type", "Null", "Key", "Default", "Extra"}
+	rows := make([][]interface{}, 0, len(viewResult.Columns))
+	for i, colName := range viewResult.Columns {
+		// Infer type from the first non-nil value in this column
+		colType := "varchar(255)" // default for unknown
+		if len(viewResult.Rows) > 0 {
+			for _, row := range viewResult.Rows {
+				if i < len(row) && row[i] != nil {
+					switch row[i].(type) {
+					case int64, uint64:
+						colType = "bigint"
+					case float64:
+						colType = "double"
+					default:
+						colType = "varchar(255)"
+					}
+					break
+				}
+			}
+		}
+		rows = append(rows, []interface{}{colName, colType, "YES", "", nil, ""})
+	}
+	return &Result{
+		Columns:     cols,
+		Rows:        rows,
+		IsResultSet: true,
+	}, nil
+}
+
+func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error) {
+	// Dispatch based on the structured ShowBasic command type when available.
+	if basic, ok := stmt.Internal.(*sqlparser.ShowBasic); ok {
+		likePattern := ""
+		if basic.Filter != nil {
+			likePattern = basic.Filter.Like
+		}
+		switch basic.Command {
+		case sqlparser.Column:
+			// SHOW COLUMNS FROM <table> / SHOW FULL COLUMNS FROM <table>
+			tblName := basic.Tbl.Name.String()
+			if !basic.Tbl.Qualifier.IsEmpty() {
+				tblName = basic.Tbl.Qualifier.String() + "." + tblName
+			}
+			if basic.Full {
+				return e.describeTableFull(tblName)
+			}
+			return e.describeTable(tblName)
+		case sqlparser.TableStatus:
+			// SHOW TABLE STATUS [FROM db] [LIKE ...]
+			return e.showTableStatus()
+		case sqlparser.Database: // SHOW DATABASES / SHOW SCHEMAS
+			dbs := e.Catalog.ListDatabases()
+			sort.Strings(dbs)
+			rows := make([][]interface{}, 0, len(dbs))
+			for _, d := range dbs {
+				if likePattern != "" && !matchLike(d, likePattern) {
+					continue
+				}
+				rows = append(rows, []interface{}{d})
+			}
+			colName := "Database"
+			if likePattern != "" {
+				colName = fmt.Sprintf("Database (%s)", likePattern)
+			}
+			return &Result{Columns: []string{colName}, Rows: rows, IsResultSet: true}, nil
+		case sqlparser.Charset: // SHOW CHARACTER SET
+			charsets := allCharsets()
+			rows := make([][]interface{}, 0)
+			for _, cs := range charsets {
+				if likePattern == "" || matchLike(cs[0].(string), likePattern) {
+					rows = append(rows, cs)
+				}
+			}
+			return &Result{Columns: []string{"Charset", "Description", "Default collation", "Maxlen"}, Rows: rows, IsResultSet: true}, nil
+		case sqlparser.Collation: // SHOW COLLATION
+			collations := allCollations()
+			rows := make([][]interface{}, 0)
+			for _, c := range collations {
+				if likePattern == "" || matchLike(c[0].(string), likePattern) {
+					rows = append(rows, c)
+				}
+			}
+			return &Result{Columns: []string{"Collation", "Charset", "Id", "Default", "Compiled", "Sortlen", "Pad_attribute"}, Rows: rows, IsResultSet: true}, nil
+		case sqlparser.Table: // SHOW TABLES
+			targetDB := e.CurrentDB
+			if !basic.DbName.IsEmpty() {
+				targetDB = basic.DbName.String()
+			}
+			db, err := e.Catalog.GetDatabase(targetDB)
+			if err != nil {
+				return nil, err
+			}
+			tables := db.ListTables()
+			sort.Strings(tables)
+			rows := make([][]interface{}, 0, len(tables))
+			for _, t := range tables {
+				// Skip temporary tables in SHOW TABLES
+				if e.tempTables[t] {
+					continue
+				}
+				if likePattern != "" && !matchLike(t, likePattern) {
+					continue
+				}
+				rows = append(rows, []interface{}{t})
+			}
+			return &Result{
+				Columns:     []string{fmt.Sprintf("Tables_in_%s", targetDB)},
+				Rows:        rows,
+				IsResultSet: true,
+			}, nil
+		}
+	}
+
+	upper := strings.ToUpper(strings.TrimSpace(query))
+
+	if strings.HasPrefix(upper, "SHOW TABLES") {
+		targetDB := e.CurrentDB
+		// Parse SHOW TABLES FROM/IN <database>
+		if idx := strings.Index(upper, " FROM "); idx >= 0 {
+			rest := strings.TrimSpace(query[idx+6:])
+			dbName := strings.Fields(rest)[0]
+			dbName = strings.Trim(dbName, "`")
+			targetDB = dbName
+		} else if idx := strings.Index(upper, " IN "); idx >= 0 {
+			rest := strings.TrimSpace(query[idx+4:])
+			dbName := strings.Fields(rest)[0]
+			dbName = strings.Trim(dbName, "`")
+			targetDB = dbName
+		}
+		db, err := e.Catalog.GetDatabase(targetDB)
+		if err != nil {
+			return nil, err
+		}
+		tables := db.ListTables()
+		sort.Strings(tables)
+		rows := make([][]interface{}, 0, len(tables))
+		for _, t := range tables {
+			if e.tempTables[t] {
+				continue
+			}
+			rows = append(rows, []interface{}{t})
+		}
+		return &Result{
+			Columns:     []string{fmt.Sprintf("Tables_in_%s", targetDB)},
+			Rows:        rows,
+			IsResultSet: true,
+		}, nil
+	}
+
+	if strings.HasPrefix(upper, "SHOW DATABASES") || strings.HasPrefix(upper, "SHOW SCHEMAS") {
+		dbs := e.Catalog.ListDatabases()
+		sort.Strings(dbs)
+		// Handle LIKE pattern
+		likePattern := ""
+		if idx := strings.Index(upper, "LIKE "); idx >= 0 {
+			rest := strings.TrimSpace(query[idx+5:])
+			likePattern = strings.Trim(rest, "'\"")
+		}
+		rows := make([][]interface{}, 0, len(dbs))
+		for _, d := range dbs {
+			if likePattern != "" && !matchLike(d, likePattern) {
+				continue
+			}
+			rows = append(rows, []interface{}{d})
+		}
+		colName := "Database"
+		if likePattern != "" {
+			colName = fmt.Sprintf("Database (%s)", likePattern)
+		}
+		return &Result{
+			Columns:     []string{colName},
+			Rows:        rows,
+			IsResultSet: true,
+		}, nil
+	}
+
+	// SHOW CHARACTER SET
+	if strings.HasPrefix(upper, "SHOW CHARACTER SET") || strings.HasPrefix(upper, "SHOW CHARSET") {
+		likePattern := ""
+		if idx := strings.Index(upper, "LIKE "); idx >= 0 {
+			rest := strings.TrimSpace(query[idx+5:])
+			likePattern = strings.Trim(rest, "'\"")
+		}
+		charsets := allCharsets()
+		rows := make([][]interface{}, 0)
+		for _, cs := range charsets {
+			if likePattern == "" || matchLike(cs[0].(string), likePattern) {
+				rows = append(rows, cs)
+			}
+		}
+		return &Result{
+			Columns:     []string{"Charset", "Description", "Default collation", "Maxlen"},
+			Rows:        rows,
+			IsResultSet: true,
+		}, nil
+	}
+
+	// SHOW COLLATION
+	if strings.HasPrefix(upper, "SHOW COLLATION") {
+		likePattern := ""
+		if idx := strings.Index(upper, "LIKE "); idx >= 0 {
+			rest := strings.TrimSpace(query[idx+5:])
+			likePattern = strings.Trim(rest, "'\"")
+		}
+		collations := [][]interface{}{
+			{"utf8mb4_0900_ai_ci", "utf8mb4", int64(255), "Yes", "Yes", int64(0), "NO PAD"},
+			{"utf8mb4_general_ci", "utf8mb4", int64(45), "", "Yes", int64(1), "PAD SPACE"},
+			{"utf8_general_ci", "utf8", int64(33), "Yes", "Yes", int64(1), "PAD SPACE"},
+			{"latin1_swedish_ci", "latin1", int64(8), "Yes", "Yes", int64(1), "PAD SPACE"},
+			{"ascii_general_ci", "ascii", int64(11), "Yes", "Yes", int64(1), "PAD SPACE"},
+			{"binary", "binary", int64(63), "Yes", "Yes", int64(1), "NO PAD"},
+		}
+		rows := make([][]interface{}, 0)
+		for _, c := range collations {
+			if likePattern == "" || matchLike(c[0].(string), likePattern) {
+				rows = append(rows, c)
+			}
+		}
+		return &Result{
+			Columns:     []string{"Collation", "Charset", "Id", "Default", "Compiled", "Sortlen", "Pad_attribute"},
+			Rows:        rows,
+			IsResultSet: true,
+		}, nil
+	}
+
+	// SHOW PROCEDURE CODE / SHOW FUNCTION CODE - feature disabled (requires debug build)
+	if strings.HasPrefix(upper, "SHOW PROCEDURE CODE") || strings.HasPrefix(upper, "SHOW FUNCTION CODE") {
+		return nil, mysqlError(1289, "HY000", "The 'SHOW PROCEDURE|FUNCTION CODE' feature is disabled; you need MySQL built with '--with-debug' to have it working")
+	}
+
+	// SHOW CREATE DATABASE <db>
+	if strings.HasPrefix(upper, "SHOW CREATE DATABASE") || strings.HasPrefix(upper, "SHOW CREATE SCHEMA") {
+		parts := strings.Fields(query)
+		if len(parts) >= 4 {
+			dbName := parts[3]
+			dbName = strings.TrimRight(dbName, ";")
+			dbName = strings.ReplaceAll(dbName, "`", "")
+			db, resolvedName, err := findDatabaseCaseInsensitive(e.Catalog, dbName)
+			if err != nil {
+				return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
+			}
+			charset := "utf8mb4"
+			collation := "utf8mb4_0900_ai_ci"
+			if db.CharacterSet != "" {
+				charset = db.CharacterSet
+			}
+			if db.CollationName != "" {
+				collation = db.CollationName
+			}
+			createSQL := fmt.Sprintf("CREATE DATABASE `%s` /*!40100 DEFAULT CHARACTER SET %s COLLATE %s */ /*!80016 DEFAULT ENCRYPTION='N' */", resolvedName, charset, collation)
+			return &Result{
+				Columns:     []string{"Database", "Create Database"},
+				Rows:        [][]interface{}{{resolvedName, createSQL}},
+				IsResultSet: true,
+			}, nil
+		}
+	}
+
+	// SHOW CREATE TABLE <table>
+	if strings.HasPrefix(upper, "SHOW CREATE TABLE") {
+		parts := strings.Fields(query)
+		if len(parts) >= 4 {
+			tableName := strings.Join(parts[3:], " ")
+			tableName = strings.TrimRight(tableName, ";")
+			tableName = strings.ReplaceAll(tableName, "`", "")
+			return e.showCreateTable(tableName)
+		}
+	}
+
+	// SHOW INDEX/INDEXES/KEYS FROM <table>
+	if strings.HasPrefix(upper, "SHOW INDEX ") || strings.HasPrefix(upper, "SHOW INDEXES ") || strings.HasPrefix(upper, "SHOW KEYS ") {
+		showDB, showTable, ok := parseShowIndexTarget(query, e.CurrentDB)
+		if ok {
+			return e.showIndexes(showDB, showTable)
+		}
+	}
+
+	// SHOW VARIABLES / SHOW GLOBAL VARIABLES / SHOW SESSION VARIABLES
+	if strings.HasPrefix(upper, "SHOW VARIABLES") || strings.HasPrefix(upper, "SHOW GLOBAL VARIABLES") ||
+		strings.HasPrefix(upper, "SHOW SESSION VARIABLES") || strings.HasPrefix(upper, "SHOW LOCAL VARIABLES") {
+		return e.showVariables(upper)
+	}
+
+	// SHOW STATUS / SHOW GLOBAL STATUS
+	if strings.HasPrefix(upper, "SHOW STATUS") || strings.HasPrefix(upper, "SHOW GLOBAL STATUS") ||
+		strings.HasPrefix(upper, "SHOW SESSION STATUS") {
+		return e.showStatus(upper)
+	}
+
+	// SHOW WARNINGS
+	if strings.HasPrefix(upper, "SHOW WARNINGS") || strings.HasPrefix(upper, "SHOW COUNT(*) WARNINGS") {
+		rows := make([][]interface{}, 0, len(e.warnings))
+		for _, w := range e.warnings {
+			rows = append(rows, []interface{}{w.Level, int64(w.Code), w.Message})
+		}
+		return &Result{
+			Columns:     []string{"Level", "Code", "Message"},
+			Rows:        rows,
+			IsResultSet: true,
+		}, nil
+	}
+
+	// SHOW ERRORS
+	if strings.HasPrefix(upper, "SHOW ERRORS") || strings.HasPrefix(upper, "SHOW COUNT(*) ERRORS") {
+		return &Result{
+			Columns:     []string{"Level", "Code", "Message"},
+			Rows:        [][]interface{}{},
+			IsResultSet: true,
+		}, nil
+	}
+
+	// Handle @@warning_count / @@error_count
+	if strings.Contains(upper, "WARNING_COUNT") || strings.Contains(upper, "ERROR_COUNT") {
+		return &Result{
+			Columns:     []string{"@@warning_count"},
+			Rows:        [][]interface{}{{int64(len(e.warnings))}},
+			IsResultSet: true,
+		}, nil
+	}
+
+	// SHOW ENGINE INNODB STATUS
+	if strings.HasPrefix(upper, "SHOW ENGINE") {
+		return &Result{
+			Columns:     []string{"Type", "Name", "Status"},
+			Rows:        [][]interface{}{{"InnoDB", "", ""}},
+			IsResultSet: true,
+		}, nil
+	}
+
+	// SHOW GRANTS [FOR user@host]
+	if strings.HasPrefix(upper, "SHOW GRANTS") {
+		grantUser := "root"
+		grantHost := "localhost"
+		if forIdx := strings.Index(upper, " FOR "); forIdx >= 0 {
+			forPart := strings.TrimSpace(query[forIdx+5:])
+			forPart = strings.TrimRight(forPart, ";")
+			if atIdx := strings.LastIndex(forPart, "@"); atIdx >= 0 {
+				grantUser = strings.Trim(strings.TrimSpace(forPart[:atIdx]), "'`\"")
+				grantHost = strings.Trim(strings.TrimSpace(forPart[atIdx+1:]), "'`\"")
+			} else {
+				grantUser = strings.Trim(strings.TrimSpace(forPart), "'`\"")
+			}
+		}
+		grantRows := [][]interface{}{
+			{fmt.Sprintf("GRANT USAGE ON *.* TO `%s`@`%s`", grantUser, grantHost)},
+		}
+		if grantUser == "root" {
+			grantRows = [][]interface{}{
+				{"GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' WITH GRANT OPTION"},
+			}
+		} else if e.Catalog != nil {
+			for _, dbName := range e.Catalog.ListDatabases() {
+				if !strings.EqualFold(dbName, "information_schema") && !strings.EqualFold(dbName, "performance_schema") &&
+					!strings.EqualFold(dbName, "mysql") && !strings.EqualFold(dbName, "sys") {
+					grantRows = append(grantRows, []interface{}{
+						fmt.Sprintf("GRANT ALL PRIVILEGES ON `%s`.* TO `%s`@`%s`", dbName, grantUser, grantHost),
+					})
+				}
+			}
+		}
+		return &Result{
+			Columns:     []string{fmt.Sprintf("Grants for %s@%s", grantUser, grantHost)},
+			Rows:        grantRows,
+			IsResultSet: true,
+		}, nil
+	}
+
+	// Accept other SHOW statements silently
+	return &Result{
+		Columns:     []string{"Value"},
+		Rows:        [][]interface{}{},
+		IsResultSet: true,
+	}, nil
+}
+
+func parseShowIndexTarget(query, currentDB string) (dbName, tableName string, ok bool) {
+	trimmed := strings.TrimSpace(strings.TrimRight(query, ";"))
+	fields := strings.Fields(trimmed)
+	if len(fields) < 4 {
+		return "", "", false
+	}
+	// SHOW INDEX|INDEXES|KEYS FROM|IN <table> ...
+	if !strings.EqualFold(fields[0], "show") {
+		return "", "", false
+	}
+	if !(strings.EqualFold(fields[1], "index") || strings.EqualFold(fields[1], "indexes") || strings.EqualFold(fields[1], "keys")) {
+		return "", "", false
+	}
+	if !(strings.EqualFold(fields[2], "from") || strings.EqualFold(fields[2], "in")) {
+		return "", "", false
+	}
+	target := strings.Trim(fields[3], "`")
+	target = strings.TrimRight(target, ",")
+	dbName = currentDB
+	tableName = target
+	if dot := strings.Index(target, "."); dot >= 0 {
+		dbName = strings.Trim(target[:dot], "`")
+		tableName = strings.Trim(target[dot+1:], "`")
+	}
+	if dbName == "" || tableName == "" {
+		return "", "", false
+	}
+	return dbName, tableName, true
+}
+
+func (e *Executor) showIndexes(dbName, tableName string) (*Result, error) {
+	db, resolvedDBName, err := findDatabaseCaseInsensitive(e.Catalog, dbName)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
+	}
+	dbName = resolvedDBName
+	if _, resolvedTableName, err := findTableDefCaseInsensitive(db, tableName); err == nil {
+		tableName = resolvedTableName
+	} else {
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", dbName, tableName))
+	}
+
+	rows := make([][]interface{}, 0)
+	for _, r := range e.infoSchemaStatistics() {
+		if !strings.EqualFold(toString(r["TABLE_SCHEMA"]), dbName) || !strings.EqualFold(toString(r["TABLE_NAME"]), tableName) {
+			continue
+		}
+		rows = append(rows, []interface{}{
+			r["TABLE_NAME"],    // Table
+			r["NON_UNIQUE"],    // Non_unique
+			r["INDEX_NAME"],    // Key_name
+			r["SEQ_IN_INDEX"],  // Seq_in_index
+			r["COLUMN_NAME"],   // Column_name
+			r["COLLATION"],     // Collation
+			r["CARDINALITY"],   // Cardinality
+			r["SUB_PART"],      // Sub_part
+			r["PACKED"],        // Packed
+			r["NULLABLE"],      // Null
+			r["INDEX_TYPE"],    // Index_type
+			r["COMMENT"],       // Comment
+			r["INDEX_COMMENT"], // Index_comment
+			r["IS_VISIBLE"],    // Visible
+			r["EXPRESSION"],    // Expression
+		})
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		ki := toString(rows[i][2])
+		kj := toString(rows[j][2])
+		if ki != kj {
+			return strings.ToLower(ki) < strings.ToLower(kj)
+		}
+		return toInt64(rows[i][3]) < toInt64(rows[j][3])
+	})
+	return &Result{
+		Columns: []string{
+			"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name",
+			"Collation", "Cardinality", "Sub_part", "Packed", "Null",
+			"Index_type", "Comment", "Index_comment", "Visible", "Expression",
+		},
+		Rows:        rows,
+		IsResultSet: true,
+	}, nil
+}
+
+// populatePerfSchemaTable dynamically populates certain performance_schema tables
+// with live data before they are scanned by SELECT.
+func (e *Executor) populatePerfSchemaTable(tbl *storage.Table, tableName string) {
+	lower := strings.ToLower(tableName)
+	switch lower {
+	case "global_status", "session_status":
+		// Populate with the same data as SHOW STATUS
+		statusResult, err := e.showStatus("")
+		if err != nil || statusResult == nil {
+			return
+		}
+		// Build a mapping of PS lost counters to their size variables.
+		// If a size is set to 0, the lost counter should be > 0 (since connections exist).
+		psLostToSize := map[string]string{
+			"Performance_schema_accounts_lost":              "performance_schema_accounts_size",
+			"Performance_schema_cond_classes_lost":          "performance_schema_max_cond_classes",
+			"Performance_schema_cond_instances_lost":        "performance_schema_max_cond_instances",
+			"Performance_schema_file_classes_lost":          "performance_schema_max_file_classes",
+			"Performance_schema_file_handles_lost":          "performance_schema_max_file_handles",
+			"Performance_schema_file_instances_lost":        "performance_schema_max_file_instances",
+			"Performance_schema_hosts_lost":                 "performance_schema_hosts_size",
+			"Performance_schema_index_stat_lost":            "performance_schema_max_index_stat",
+			"Performance_schema_memory_classes_lost":        "performance_schema_max_memory_classes",
+			"Performance_schema_metadata_lock_lost":         "performance_schema_max_metadata_locks",
+			"Performance_schema_mutex_classes_lost":         "performance_schema_max_mutex_classes",
+			"Performance_schema_mutex_instances_lost":       "performance_schema_max_mutex_instances",
+			"Performance_schema_prepared_statements_lost":   "performance_schema_max_prepared_statements_instances",
+			"Performance_schema_program_lost":               "performance_schema_max_program_instances",
+			"Performance_schema_rwlock_classes_lost":        "performance_schema_max_rwlock_classes",
+			"Performance_schema_rwlock_instances_lost":      "performance_schema_max_rwlock_instances",
+			"Performance_schema_session_connect_attrs_lost": "performance_schema_session_connect_attrs_size",
+			"Performance_schema_socket_classes_lost":        "performance_schema_max_socket_classes",
+			"Performance_schema_socket_instances_lost":      "performance_schema_max_socket_instances",
+			"Performance_schema_stage_classes_lost":         "performance_schema_max_stage_classes",
+			"Performance_schema_statement_classes_lost":     "performance_schema_max_statement_classes",
+			"Performance_schema_table_handles_lost":         "performance_schema_max_table_handles",
+			"Performance_schema_table_instances_lost":       "performance_schema_max_table_instances",
+			"Performance_schema_table_lock_stat_lost":       "performance_schema_max_table_lock_stat",
+			"Performance_schema_thread_classes_lost":        "performance_schema_max_thread_classes",
+			"Performance_schema_thread_instances_lost":      "performance_schema_max_thread_instances",
+			"Performance_schema_users_lost":                 "performance_schema_users_size",
+		}
+		tbl.Mu.Lock()
+		tbl.Rows = nil
+		for _, row := range statusResult.Rows {
+			if len(row) >= 2 {
+				r := make(storage.Row)
+				name := fmt.Sprintf("%v", row[0])
+				val := fmt.Sprintf("%v", row[1])
+				// If this is a PS lost counter and the corresponding size var is 0,
+				// report the lost counter as 1 (indicating data was lost).
+				if sizeVar, ok := psLostToSize[name]; ok {
+					if sizeVal, found := e.startupVars[sizeVar]; found && sizeVal == "0" {
+						val = "1"
+					}
+				}
+				// Store with both cases for column name lookups
+				upperName := strings.ToUpper(name)
+				r["VARIABLE_NAME"] = upperName
+				r["variable_name"] = upperName
+				r["VARIABLE_VALUE"] = val
+				r["variable_value"] = val
+				r["variable_value"] = val
+				tbl.Rows = append(tbl.Rows, r)
+			}
+		}
+		tbl.Mu.Unlock()
+	case "global_variables":
+		vars := e.buildVariablesMapScoped(true)
+		tbl.Mu.Lock()
+		tbl.Rows = nil
+		// Sort by name for deterministic output
+		names := make([]string, 0, len(vars))
+		for name := range vars {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			r := make(storage.Row)
+			r["VARIABLE_NAME"] = name
+			r["VARIABLE_VALUE"] = vars[name]
+			tbl.Rows = append(tbl.Rows, r)
+		}
+		tbl.Mu.Unlock()
+	case "session_variables":
+		vars := e.buildVariablesMapScoped(false)
+		tbl.Mu.Lock()
+		tbl.Rows = nil
+		names := make([]string, 0, len(vars))
+		for name := range vars {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			r := make(storage.Row)
+			r["VARIABLE_NAME"] = name
+			r["VARIABLE_VALUE"] = vars[name]
+			tbl.Rows = append(tbl.Rows, r)
+		}
+		tbl.Mu.Unlock()
+	}
+}
+
+// mysqlGeneratedClause formats a generated column clause for SHOW CREATE TABLE.
+// It takes the raw expression string and storage type (virtual/stored) and returns
+// something like: GENERATED ALWAYS AS ((`a` + LENGTH(`d`))) STORED
+func mysqlGeneratedClause(exprStr string, colType string, colCharset string) string {
+	upper := strings.ToUpper(colType)
+	storage := "VIRTUAL"
+	if strings.HasSuffix(upper, " STORED") {
+		storage = "STORED"
+	}
+
+	// Parse the expression and reformat it MySQL-style
+	formattedExpr := mysqlFormatGenExpr(exprStr, colCharset)
+
+	return fmt.Sprintf("GENERATED ALWAYS AS (%s) %s", formattedExpr, storage)
+}
+
+// mysqlFormatGenExpr formats a generated column expression in MySQL style:
+// backtick-quoted column refs, no spaces after commas in function args,
+// _utf8mb4 prefix for string literals, extra outer parens for non-function expressions.
+// colCharset is the column-level charset (e.g. "latin1"); empty means default (no prefix needed).
+func mysqlFormatGenExpr(exprStr string, colCharset string) string {
+	parser := sqlparser.NewTestParser()
+	stmt, err := parser.Parse("SELECT " + exprStr)
+	if err != nil {
+		// Fallback: return as-is
+		return exprStr
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok || len(sel.SelectExprs.Exprs) != 1 {
+		return exprStr
+	}
+	aliased, ok := sel.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr)
+	if !ok {
+		return exprStr
+	}
+	inner := mysqlGenExprNode(aliased.Expr, colCharset)
+	// MySQL wraps non-function/non-call expressions in extra parens
+	switch aliased.Expr.(type) {
+	case *sqlparser.FuncExpr, *sqlparser.SubstrExpr,
+		*sqlparser.JSONUnquoteExpr, *sqlparser.JSONExtractExpr,
+		*sqlparser.CastExpr:
+		// Function-like expressions: no extra parens
+		return inner
+	case *sqlparser.Literal:
+		// When column has explicit charset, the charset introducer makes the
+		// literal a complete expression (e.g. _latin1'...') — no extra parens.
+		if colCharset != "" {
+			return inner
+		}
+		return "(" + inner + ")"
+	default:
+		// Binary expressions, column refs, etc: wrap in parens
+		return "(" + inner + ")"
+	}
+}
+
+// mysqlGenExprNode recursively formats an expression node in MySQL SHOW CREATE TABLE style.
+// colCharset is the column-level charset; when non-empty, string literals get a charset introducer prefix.
+func mysqlGenExprNode(expr sqlparser.Expr, colCharset string) string {
+	switch e := expr.(type) {
+	case *sqlparser.ColName:
+		return "`" + e.Name.String() + "`"
+	case *sqlparser.BinaryExpr:
+		return fmt.Sprintf("%s %s %s", mysqlGenExprNode(e.Left, colCharset), e.Operator.ToString(), mysqlGenExprNode(e.Right, colCharset))
+	case *sqlparser.FuncExpr:
+		args := make([]string, len(e.Exprs))
+		for i, arg := range e.Exprs {
+			args[i] = mysqlGenExprNode(arg, colCharset)
+		}
+		name := e.Name.String()
+		// MySQL outputs function names in lowercase in SHOW CREATE TABLE
+		// for generated column expressions.
+		name = strings.ToLower(name)
+		return name + "(" + strings.Join(args, ",") + ")"
+	case *sqlparser.Literal:
+		if e.Type == sqlparser.StrVal {
+			if colCharset != "" {
+				return "_" + colCharset + "'" + e.Val + "'"
+			}
+			return "'" + e.Val + "'"
+		}
+		return e.Val
+	case *sqlparser.UnaryExpr:
+		return e.Operator.ToString() + mysqlGenExprNode(e.Expr, colCharset)
+	case *sqlparser.SubstrExpr:
+		parts := []string{mysqlGenExprNode(e.Name, colCharset)}
+		if e.From != nil {
+			parts = append(parts, mysqlGenExprNode(e.From, colCharset))
+		}
+		if e.To != nil {
+			parts = append(parts, mysqlGenExprNode(e.To, colCharset))
+		}
+		return "substr(" + strings.Join(parts, ",") + ")"
+	case *sqlparser.JSONUnquoteExpr:
+		return "json_unquote(" + mysqlGenExprNode(e.JSONValue, colCharset) + ")"
+	case *sqlparser.JSONExtractExpr:
+		parts := []string{mysqlGenExprNode(e.JSONDoc, colCharset)}
+		for _, p := range e.PathList {
+			parts = append(parts, mysqlGenExprNode(p, colCharset))
+		}
+		return "json_extract(" + strings.Join(parts, ",") + ")"
+	case *sqlparser.CastExpr:
+		return "cast(" + mysqlGenExprNode(e.Expr, colCharset) + " as " + strings.ToLower(e.Type.Type) + ")"
+	case *sqlparser.IntroducerExpr:
+		return e.CharacterSet + mysqlGenExprNode(e.Expr, colCharset)
+	case *sqlparser.IsExpr:
+		op := strings.ToLower(e.Right.ToString())
+		return mysqlGenExprNode(e.Left, colCharset) + " is " + op
+	case *sqlparser.CaseExpr:
+		var b strings.Builder
+		b.WriteString("case")
+		if e.Expr != nil {
+			b.WriteString(" ")
+			b.WriteString(mysqlGenExprNode(e.Expr, colCharset))
+		}
+		for _, w := range e.Whens {
+			b.WriteString(" when ")
+			b.WriteString(mysqlGenExprNode(w.Cond, colCharset))
+			b.WriteString(" then ")
+			b.WriteString(mysqlGenExprNode(w.Val, colCharset))
+		}
+		if e.Else != nil {
+			b.WriteString(" else ")
+			b.WriteString(mysqlGenExprNode(e.Else, colCharset))
+		}
+		b.WriteString(" end")
+		return b.String()
+	case *sqlparser.ComparisonExpr:
+		return mysqlGenExprNode(e.Left, colCharset) + " " + e.Operator.ToString() + " " + mysqlGenExprNode(e.Right, colCharset)
+	case *sqlparser.NullVal:
+		return "NULL"
+	case *sqlparser.NotExpr:
+		return "not(" + mysqlGenExprNode(e.Expr, colCharset) + ")"
+	default:
+		// Fallback to sqlparser.String for unhandled types
+		return sqlparser.String(expr)
+	}
+}
+
+// mysqlDisplayType returns the MySQL display type with width for SHOW CREATE TABLE.
+func mysqlDisplayType(colType string) string {
+	// Strip generated column clause before processing the base type
+	stripped := colType
+	upperCheck := strings.ToUpper(colType)
+	if idx := strings.Index(upperCheck, " GENERATED ALWAYS AS "); idx >= 0 {
+		stripped = strings.TrimSpace(colType[:idx])
+	}
+
+	upper := strings.ToUpper(strings.TrimSpace(stripped))
+	// Extract base type and any existing parameters
+	base := upper
+	suffix := ""
+	if idx := strings.Index(upper, "("); idx >= 0 {
+		// Already has width specified, just lowercase it
+		// But also normalize REAL to DOUBLE, NUMERIC to DECIMAL, INTEGER to INT
+		result := strings.ToLower(stripped)
+		if strings.HasPrefix(result, "real") {
+			result = "double" + result[4:]
+		}
+		if strings.HasPrefix(result, "numeric") {
+			result = "decimal" + result[7:]
+		}
+		if strings.HasPrefix(result, "integer") {
+			result = "int" + result[7:]
+		}
+		return result
+	}
+	// Check for ZEROFILL suffix (must check before UNSIGNED since ZEROFILL implies UNSIGNED)
+	if strings.HasSuffix(base, " ZEROFILL") {
+		base = strings.TrimSuffix(base, " ZEROFILL")
+		suffix = " zerofill"
+	}
+	// Check for UNSIGNED suffix
+	if strings.HasSuffix(base, " UNSIGNED") {
+		base = strings.TrimSuffix(base, " UNSIGNED")
+		suffix = " unsigned" + suffix
+	} else if strings.Contains(suffix, "zerofill") {
+		// ZEROFILL implies UNSIGNED in MySQL
+		suffix = " unsigned" + suffix
+	}
+
+	// Add default display widths (differ for signed vs unsigned in MySQL)
+	isUnsigned := suffix != ""
+	switch base {
+	case "TINYINT":
+		if isUnsigned {
+			return "tinyint(3)" + suffix
+		}
+		return "tinyint(4)" + suffix
+	case "SMALLINT":
+		if isUnsigned {
+			return "smallint(5)" + suffix
+		}
+		return "smallint(6)" + suffix
+	case "MEDIUMINT":
+		if isUnsigned {
+			return "mediumint(8)" + suffix
+		}
+		return "mediumint(9)" + suffix
+	case "INT", "INTEGER":
+		if isUnsigned {
+			return "int(10)" + suffix
+		}
+		return "int(11)" + suffix
+	case "BIGINT":
+		if isUnsigned {
+			return "bigint(20)" + suffix
+		}
+		return "bigint(20)" + suffix
+	case "FLOAT":
+		return "float" + suffix
+	case "DOUBLE", "REAL":
+		return "double" + suffix
+	case "DECIMAL", "NUMERIC":
+		return "decimal(10,0)" + suffix
+	case "CHAR":
+		return "char(1)"
+	case "BINARY":
+		return "binary(1)"
+	case "BIT":
+		return "bit(1)"
+	case "YEAR":
+		return "year(4)"
+	case "BOOL", "BOOLEAN":
+		return "tinyint(1)"
+	default:
+		return strings.ToLower(colType)
+	}
+}
+
+func isClusterPreferredUniqueIndex(idx catalog.IndexDef, cols []catalog.ColumnDef) bool {
+	if !idx.Unique || len(idx.Columns) == 0 {
+		return false
+	}
+	colByName := make(map[string]catalog.ColumnDef, len(cols))
+	for _, c := range cols {
+		colByName[strings.ToLower(c.Name)] = c
+	}
+	for _, raw := range idx.Columns {
+		c := strings.TrimSpace(raw)
+		if strings.HasPrefix(c, "(") && strings.HasSuffix(c, ")") {
+			return false
+		}
+		if lparen := strings.Index(c, "("); lparen >= 0 {
+			// Prefix-length index parts are not clustered-primary candidates.
+			return false
+		}
+		base := c
+		if fields := strings.Fields(c); len(fields) > 0 {
+			base = fields[0]
+		}
+		def, ok := colByName[strings.ToLower(base)]
+		if !ok || def.Nullable {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *Executor) showCreateTable(tableName string) (*Result, error) {
+	showDB := e.CurrentDB
+	if strings.Contains(tableName, ".") {
+		showDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
+	}
+	db, resolvedDBName, err := findDatabaseCaseInsensitive(e.Catalog, showDB)
+	if err != nil {
+		return nil, err
+	}
+	showDB = resolvedDBName
+	def, resolvedTableName, err := findTableDefCaseInsensitive(db, tableName)
+	if err != nil {
+		// Check if it's a view — return SHOW CREATE VIEW style output.
+		if e.views != nil {
+			viewLookup := tableName
+			if _, ok := e.views[viewLookup]; !ok {
+				for vn := range e.views {
+					if strings.EqualFold(vn, viewLookup) {
+						viewLookup = vn
+						break
+					}
+				}
+			}
+			if viewSQL, ok := e.views[viewLookup]; ok {
+				createView := fmt.Sprintf("CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `%s` AS %s", viewLookup, viewSQL)
+				return &Result{
+					Columns:     []string{"View", "Create View", "character_set_client", "collation_connection"},
+					Rows:        [][]interface{}{{viewLookup, createView, "utf8mb4", "utf8mb4_0900_ai_ci"}},
+					IsResultSet: true,
+				}, nil
+			}
+		}
+		return nil, fmt.Errorf("ERROR 1146 (42S02): Table '%s.%s' doesn't exist", showDB, tableName)
+	}
+	tableName = resolvedTableName
+
+	// Get AUTO_INCREMENT value
+	autoIncVal := int64(0)
+	if tbl, err := e.Storage.GetTable(showDB, tableName); err == nil {
+		autoIncVal = tbl.AutoIncrementValue()
+	}
+
+	var b strings.Builder
+	if e.tempTables[tableName] {
+		b.WriteString(fmt.Sprintf("CREATE TEMPORARY TABLE `%s` (\n", tableName))
+	} else {
+		b.WriteString(fmt.Sprintf("CREATE TABLE `%s` (\n", tableName))
+	}
+
+	var colDefs []string
+	var pkCols []string
+	for _, col := range def.Columns {
+		var parts []string
+		parts = append(parts, fmt.Sprintf("  `%s`", col.Name))
+		parts = append(parts, mysqlDisplayType(col.Type))
+		// Column-level CHARACTER SET / COLLATE (when different from table default)
+		if col.Charset != "" {
+			tableCharset := def.Charset
+			if tableCharset == "" {
+				tableCharset = "utf8mb4"
+			}
+			if !strings.EqualFold(col.Charset, tableCharset) {
+				collation := col.Collation
+				if collation == "" {
+					collation = catalog.DefaultCollationForCharset(col.Charset)
+				}
+				parts = append(parts, fmt.Sprintf("CHARACTER SET %s COLLATE %s", col.Charset, collation))
+			}
+		}
+		colTypeLower := strings.ToLower(col.Type)
+		isTimestamp := strings.HasPrefix(colTypeLower, "timestamp")
+		genExpr := generatedColumnExpr(col.Type)
+		isGenerated := genExpr != ""
+		if isGenerated {
+			// Append GENERATED ALWAYS AS (...) VIRTUAL/STORED
+			parts = append(parts, mysqlGeneratedClause(genExpr, col.Type, col.Charset))
+		}
+		if !col.Nullable {
+			parts = append(parts, "NOT NULL")
+		} else if isTimestamp {
+			// MySQL explicitly shows NULL for nullable timestamp columns
+			parts = append(parts, "NULL")
+		}
+		if col.AutoIncrement {
+			parts = append(parts, "AUTO_INCREMENT")
+		} else if !isGenerated && col.Default != nil {
+			defVal := *col.Default
+			// MySQL SHOW CREATE TABLE quotes default values
+			if defVal == "NULL" || defVal == "null" {
+				parts = append(parts, "DEFAULT NULL")
+			} else if strings.HasPrefix(defVal, "'") {
+				// Already quoted - pad BINARY default values.
+				if padLen := binaryPadLength(col.Type); padLen > 0 {
+					inner := defVal[1 : len(defVal)-1] // strip quotes
+					if len(inner) < padLen {
+						inner = inner + strings.Repeat("\\0", padLen-len(inner))
+					}
+					defVal = "'" + inner + "'"
+				}
+				parts = append(parts, fmt.Sprintf("DEFAULT %s", defVal))
+			} else {
+				// Pad BINARY default values.
+				if padLen := binaryPadLength(col.Type); padLen > 0 && len(defVal) < padLen {
+					defVal = defVal + strings.Repeat("\\0", padLen-len(defVal))
+				}
+				// Pad DECIMAL default values to the declared scale.
+				defVal = padDecimalDefault(col.Type, defVal)
+				parts = append(parts, fmt.Sprintf("DEFAULT '%s'", defVal))
+			}
+		} else if !isGenerated && col.Nullable && !col.DefaultDropped {
+			// MySQL doesn't show DEFAULT NULL for BLOB/TEXT types
+			isBlobOrText := strings.Contains(colTypeLower, "blob") || strings.Contains(colTypeLower, "text")
+			if !isBlobOrText {
+				parts = append(parts, "DEFAULT NULL")
+			}
+		}
+		if col.Comment != "" {
+			parts = append(parts, fmt.Sprintf("COMMENT '%s'", col.Comment))
+		}
+		colDefs = append(colDefs, strings.Join(parts, " "))
+	}
+	pkCols = append(pkCols, def.PrimaryKey...)
+	if len(pkCols) == 0 {
+		for _, col := range def.Columns {
+			if col.PrimaryKey {
+				pkCols = append(pkCols, col.Name)
+			}
+		}
+	}
+	if len(pkCols) == 0 {
+		pkCols = def.PrimaryKey
+	}
+
+	hasTrailingDefs := len(pkCols) > 0 || len(def.Indexes) > 0
+
+	for i, cd := range colDefs {
+		b.WriteString(cd)
+		if i < len(colDefs)-1 || hasTrailingDefs {
+			b.WriteString(",")
+		}
+		b.WriteString("\n")
+	}
+	if len(pkCols) > 0 {
+		quotedPK := make([]string, len(pkCols))
+		for i, pk := range pkCols {
+			trimmed := strings.TrimSpace(pk)
+			if strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")") {
+				quotedPK[i] = trimmed
+			} else if lparen := strings.Index(trimmed, "("); lparen >= 0 {
+				quotedPK[i] = fmt.Sprintf("`%s`%s", trimmed[:lparen], trimmed[lparen:])
+			} else {
+				quotedPK[i] = fmt.Sprintf("`%s`", trimmed)
+			}
+		}
+		hasMore := len(def.Indexes) > 0
+		b.WriteString(fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(quotedPK, ",")))
+		if hasMore {
+			b.WriteString(",")
+		}
+		b.WriteString("\n")
+	}
+	displayIndexes := make([]catalog.IndexDef, len(def.Indexes))
+	copy(displayIndexes, def.Indexes)
+	sort.SliceStable(displayIndexes, func(i, j int) bool {
+		// MySQL orders UNIQUE KEY before non-unique KEY in SHOW CREATE TABLE
+		return displayIndexes[i].Unique && !displayIndexes[j].Unique
+	})
+	for i, idx := range displayIndexes {
+		quotedCols := make([]string, len(idx.Columns))
+		for j, c := range idx.Columns {
+			direction := ""
+			if j < len(idx.Orders) && strings.EqualFold(idx.Orders[j], "DESC") {
+				direction = " DESC"
+			} else if j < len(idx.Orders) && strings.EqualFold(idx.Orders[j], "ASC") {
+				direction = " ASC"
+			}
+			trimmed := strings.TrimSpace(c)
+			if strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")") {
+				quotedCols[j] = trimmed + direction
+			} else if lparen := strings.Index(trimmed, "("); lparen >= 0 {
+				// Handle column with length prefix like "c1(10)"
+				quotedCols[j] = fmt.Sprintf("`%s`%s%s", trimmed[:lparen], trimmed[lparen:], direction)
+			} else {
+				quotedCols[j] = fmt.Sprintf("`%s`%s", trimmed, direction)
+			}
+		}
+		usingStr := ""
+		if strings.EqualFold(idx.Using, "BTREE") {
+			usingStr = " USING BTREE"
+		}
+		commentStr := ""
+		if idx.Comment != "" {
+			commentStr = fmt.Sprintf(" COMMENT '%s'", idx.Comment)
+		}
+		prefix := "KEY"
+		if idx.Type == "FULLTEXT" {
+			prefix = "FULLTEXT KEY"
+		} else if idx.Type == "SPATIAL" {
+			prefix = "SPATIAL KEY"
+		} else if idx.Unique {
+			prefix = "UNIQUE KEY"
+		}
+		if prefix == "UNIQUE KEY" {
+			b.WriteString(fmt.Sprintf("  UNIQUE KEY `%s` (%s)%s%s", idx.Name, strings.Join(quotedCols, ","), usingStr, commentStr))
+		} else {
+			b.WriteString(fmt.Sprintf("  %s `%s` (%s)%s%s", prefix, idx.Name, strings.Join(quotedCols, ","), usingStr, commentStr))
+		}
+		if i < len(displayIndexes)-1 {
+			b.WriteString(",")
+		}
+		b.WriteString("\n")
+	}
+
+	engineName := "InnoDB"
+	if def.Engine != "" {
+		// Normalize engine name casing to match MySQL conventions
+		switch strings.ToUpper(def.Engine) {
+		case "INNODB":
+			engineName = "InnoDB"
+		case "MYISAM":
+			engineName = "MyISAM"
+		case "MEMORY", "HEAP":
+			engineName = "MEMORY"
+		case "CSV":
+			engineName = "CSV"
+		case "ARCHIVE":
+			engineName = "ARCHIVE"
+		case "BLACKHOLE":
+			engineName = "BLACKHOLE"
+		case "MERGE", "MRGSORT", "MRG_MYISAM":
+			engineName = "MRG_MyISAM"
+		case "FEDERATED":
+			engineName = "FEDERATED"
+		default:
+			engineName = def.Engine
+		}
+	}
+	trailer := fmt.Sprintf(") ENGINE=%s", engineName)
+	if autoIncVal > 0 {
+		trailer += fmt.Sprintf(" AUTO_INCREMENT=%d", autoIncVal+1)
+	}
+	charset := "utf8mb4"
+	collation := "utf8mb4_0900_ai_ci"
+	if def.Charset != "" {
+		charset = def.Charset
+		collation = catalog.DefaultCollationForCharset(charset)
+	}
+	if def.Collation != "" {
+		collation = def.Collation
+	}
+	trailer += fmt.Sprintf(" DEFAULT CHARSET=%s", charset)
+	// Show COLLATE when charset is utf8mb4 (MySQL default behavior) or when
+	// an explicit non-default collation is specified.
+	defaultCollation := catalog.DefaultCollationForCharset(charset)
+	if charset == "utf8mb4" || collation != defaultCollation {
+		trailer += fmt.Sprintf(" COLLATE=%s", collation)
+	}
+	if def.Comment != "" {
+		trailer += fmt.Sprintf(" COMMENT='%s'", def.Comment)
+	}
+	if def.RowFormat != "" {
+		trailer += fmt.Sprintf(" ROW_FORMAT=%s", strings.ToUpper(def.RowFormat))
+	}
+	if def.KeyBlockSize != nil {
+		trailer += fmt.Sprintf(" KEY_BLOCK_SIZE=%d", *def.KeyBlockSize)
+	}
+	if def.StatsPersistent != nil {
+		trailer += fmt.Sprintf(" STATS_PERSISTENT=%d", *def.StatsPersistent)
+	}
+	if def.StatsAutoRecalc != nil {
+		trailer += fmt.Sprintf(" STATS_AUTO_RECALC=%d", *def.StatsAutoRecalc)
+	}
+	b.WriteString(trailer)
+
+	return &Result{
+		Columns:     []string{"Table", "Create Table"},
+		Rows:        [][]interface{}{{tableName, b.String()}},
+		IsResultSet: true,
+	}, nil
+}

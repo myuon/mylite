@@ -1,0 +1,2143 @@
+package executor
+
+import (
+	"errors"
+	"fmt"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/myuon/mylite/catalog"
+	"github.com/myuon/mylite/storage"
+	"vitess.io/vitess/go/vt/sqlparser"
+)
+
+// execCreateTrigger parses and stores a CREATE TRIGGER statement.
+// Format: CREATE TRIGGER name timing event ON table FOR EACH ROW BEGIN ... END
+func (e *Executor) execCreateTrigger(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
+	// Parse the CREATE TRIGGER statement manually
+	// CREATE TRIGGER <name> <BEFORE|AFTER> <INSERT|UPDATE|DELETE> ON <table> FOR EACH ROW [BEGIN] <body> [END]
+	upper := strings.ToUpper(query)
+	// Remove "CREATE TRIGGER " prefix
+	rest := strings.TrimSpace(query[len("CREATE TRIGGER "):])
+
+	// Extract trigger name
+	parts := strings.Fields(rest)
+	if len(parts) < 6 {
+		return nil, fmt.Errorf("invalid CREATE TRIGGER syntax")
+	}
+	triggerName := parts[0]
+	timing := strings.ToUpper(parts[1]) // BEFORE or AFTER
+	event := strings.ToUpper(parts[2])  // INSERT, UPDATE, or DELETE
+
+	// Find "ON" keyword
+	onIdx := -1
+	for i, p := range parts {
+		if strings.ToUpper(p) == "ON" && i > 2 {
+			onIdx = i
+			break
+		}
+	}
+	if onIdx < 0 {
+		return nil, fmt.Errorf("invalid CREATE TRIGGER syntax: missing ON")
+	}
+	tableName := parts[onIdx+1]
+	tableName = strings.Trim(tableName, "`")
+
+	// Check if table references performance_schema — deny CREATE TRIGGER on PS tables
+	if strings.Contains(tableName, ".") {
+		dbTbl := strings.SplitN(tableName, ".", 2)
+		trigDB := strings.Trim(dbTbl[0], "`")
+		if strings.EqualFold(trigDB, "performance_schema") {
+			return nil, mysqlError(1044, "42000", fmt.Sprintf("Access denied for user 'root'@'localhost' to database 'performance_schema'"))
+		}
+	}
+
+	// Extract body: everything after "FOR EACH ROW"
+	_ = upper // already have it
+	forEachIdx := strings.Index(upper, "FOR EACH ROW")
+	if forEachIdx < 0 {
+		return nil, fmt.Errorf("invalid CREATE TRIGGER syntax: missing FOR EACH ROW")
+	}
+	body := strings.TrimSpace(query[forEachIdx+len("FOR EACH ROW"):])
+
+	// Parse the body into individual SQL statements
+	var bodyStatements []string
+	bodyUpper := strings.ToUpper(strings.TrimSpace(body))
+	if strings.HasPrefix(bodyUpper, "BEGIN") {
+		// Strip BEGIN and END
+		inner := strings.TrimSpace(body[len("BEGIN"):])
+		if strings.HasSuffix(strings.ToUpper(strings.TrimSpace(inner)), "END") {
+			inner = strings.TrimSpace(inner[:len(inner)-len("END")])
+		}
+		// Split by semicolons (respecting quoted strings)
+		bodyStatements = splitTriggerBody(inner)
+	} else {
+		// Single statement trigger
+		body = strings.TrimRight(body, ";")
+		bodyStatements = []string{strings.TrimSpace(body)}
+	}
+
+	// Validate: AFTER triggers cannot modify NEW row
+	if timing == "AFTER" {
+		for _, stmt := range bodyStatements {
+			stmtUpper := strings.ToUpper(stmt)
+			if strings.Contains(stmtUpper, "SET NEW.") {
+				return nil, mysqlError(1362, "HY000", "Updating of NEW row is not allowed in after trigger")
+			}
+		}
+	}
+	// Validate: BEFORE/AFTER DELETE triggers cannot reference NEW
+	if event == "DELETE" {
+		for _, stmt := range bodyStatements {
+			stmtUpper := strings.ToUpper(stmt)
+			if strings.Contains(stmtUpper, "NEW.") {
+				return nil, mysqlError(1363, "HY000", "There is no NEW row in on DELETE trigger")
+			}
+		}
+	}
+	// Validate: BEFORE/AFTER INSERT triggers cannot reference OLD
+	if event == "INSERT" {
+		for _, stmt := range bodyStatements {
+			stmtUpper := strings.ToUpper(stmt)
+			if strings.Contains(stmtUpper, "OLD.") {
+				return nil, mysqlError(1363, "HY000", "There is no OLD row in on INSERT trigger")
+			}
+		}
+	}
+
+	trigDef := &catalog.TriggerDef{
+		Name:   triggerName,
+		Timing: timing,
+		Event:  event,
+		Table:  tableName,
+		Body:   bodyStatements,
+	}
+	db.CreateTrigger(trigDef)
+
+	return &Result{}, nil
+}
+
+// splitTriggerBody splits the body of a trigger/procedure into individual SQL statements.
+func splitTriggerBody(body string) []string {
+	var stmts []string
+	var current strings.Builder
+	inSingle := false
+	inDouble := false
+	depth := 0 // track nested BEGIN...END
+
+	words := body
+	i := 0
+	for i < len(words) {
+		ch := words[i]
+		switch {
+		case ch == '\'' && !inDouble:
+			inSingle = !inSingle
+			current.WriteByte(ch)
+		case ch == '"' && !inSingle:
+			inDouble = !inDouble
+			current.WriteByte(ch)
+		case ch == ';' && !inSingle && !inDouble && depth == 0:
+			stmt := strings.TrimSpace(current.String())
+			if stmt != "" {
+				stmts = append(stmts, stmt)
+			}
+			current.Reset()
+		default:
+			// Track nested BEGIN...END for IF/WHILE blocks
+			if !inSingle && !inDouble {
+				remaining := strings.ToUpper(words[i:])
+				if strings.HasPrefix(remaining, "BEGIN") && (i+5 >= len(words) || !isAlphaNum(words[i+5])) {
+					depth++
+				}
+				if strings.HasPrefix(remaining, "END") && (i+3 >= len(words) || !isAlphaNum(words[i+3])) && depth > 0 {
+					depth--
+				}
+			}
+			current.WriteByte(ch)
+		}
+		i++
+	}
+	rest := strings.TrimSpace(current.String())
+	if rest != "" {
+		stmts = append(stmts, rest)
+	}
+	return stmts
+}
+
+func isAlphaNum(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+// countOccurrences counts the number of non-overlapping occurrences of substr in s.
+// It only counts whole-word occurrences where "IF " means IF followed by space (not part of END IF).
+func countOccurrences(s, substr string) int {
+	if substr == "IF " {
+		// Count IF that aren't preceded by END
+		count := 0
+		idx := 0
+		for {
+			pos := strings.Index(s[idx:], "IF ")
+			if pos < 0 {
+				break
+			}
+			absPos := idx + pos
+			// Check it's not preceded by "END " or "ELSEIF"
+			if absPos >= 4 && s[absPos-4:absPos] == "END " {
+				idx = absPos + 3
+				continue
+			}
+			if absPos >= 6 && strings.HasSuffix(s[:absPos], "ELSEIF") {
+				idx = absPos + 3
+				continue
+			}
+			if absPos >= 4 && strings.HasSuffix(s[:absPos], "ELSE") {
+				idx = absPos + 3
+				continue
+			}
+			count++
+			idx = absPos + 3
+		}
+		return count
+	}
+	return strings.Count(s, substr)
+}
+
+// dropTriggersForTable removes all triggers associated with the given table.
+func (e *Executor) dropTriggersForTable(db *catalog.Database, tableName string) {
+	if db.Triggers == nil {
+		return
+	}
+	var toRemove []string
+	for name, tr := range db.Triggers {
+		if strings.EqualFold(tr.Table, tableName) {
+			toRemove = append(toRemove, name)
+		}
+	}
+	for _, name := range toRemove {
+		db.DropTrigger(name)
+	}
+}
+
+// execDropTrigger handles DROP TRIGGER [IF EXISTS] name
+func (e *Executor) execDropTrigger(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	rest := strings.TrimSpace(query[len("DROP TRIGGER"):])
+
+	ifExists := false
+	if strings.HasPrefix(strings.ToUpper(rest), "IF EXISTS") {
+		ifExists = true
+		rest = strings.TrimSpace(rest[len("IF EXISTS"):])
+	}
+	name := strings.TrimRight(strings.TrimSpace(rest), ";")
+	name = strings.Trim(name, "`")
+	_ = upper
+
+	if _, ok := db.Triggers[name]; !ok && !ifExists {
+		return nil, mysqlError(1360, "HY000", fmt.Sprintf("Trigger does not exist"))
+	}
+	db.DropTrigger(name)
+	return &Result{}, nil
+}
+
+// fireTriggers executes all triggers matching the given timing and event for the specified table.
+// The newRow and oldRow maps provide NEW and OLD pseudo-record values.
+// For BEFORE triggers, SET NEW.col = val modifies newRow in place.
+func (e *Executor) fireTriggers(tableName, timing, event string, newRow, oldRow storage.Row) error {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return err
+	}
+
+	triggers := db.GetTriggersForTable(tableName, timing, event)
+	for _, tr := range triggers {
+		for _, stmtStr := range tr.Body {
+			stmtUpper := strings.ToUpper(strings.TrimSpace(stmtStr))
+			// Handle SET NEW.col = value in BEFORE triggers
+			if strings.HasPrefix(stmtUpper, "SET NEW.") && timing == "BEFORE" && newRow != nil {
+				e.handleSetNew(stmtStr, newRow, oldRow)
+				continue
+			}
+			// Substitute NEW.col and OLD.col references
+			resolved := e.resolveNewOldRefs(stmtStr, newRow, oldRow)
+			_, err := e.Execute(resolved)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// handleSetNew processes "SET NEW.col = expr" statements in BEFORE triggers.
+func (e *Executor) handleSetNew(stmtStr string, newRow, oldRow storage.Row) {
+	// Parse: SET NEW.col = expr
+	rest := strings.TrimSpace(stmtStr[len("SET "):])
+	eqIdx := strings.Index(rest, "=")
+	if eqIdx < 0 {
+		return
+	}
+	colRef := strings.TrimSpace(rest[:eqIdx])
+	valExpr := strings.TrimSpace(rest[eqIdx+1:])
+	valExpr = strings.TrimRight(valExpr, ";")
+
+	// Extract column name from NEW.col
+	if !strings.HasPrefix(strings.ToUpper(colRef), "NEW.") {
+		return
+	}
+	colName := colRef[4:] // strip "NEW."
+
+	// Resolve OLD/NEW references in the value expression
+	resolved := e.resolveNewOldRefs(valExpr, newRow, oldRow)
+
+	// Try to parse and evaluate the value expression
+	val, err := e.evaluateSimpleExpr(resolved)
+	if err != nil {
+		return
+	}
+	newRow[colName] = val
+}
+
+// evaluateSimpleExpr evaluates a simple expression string (used for trigger SET NEW.col = expr).
+func (e *Executor) evaluateSimpleExpr(expr string) (interface{}, error) {
+	// Try to parse as a SELECT expression to use the full evaluator
+	selectSQL := "SELECT " + expr
+	stmt, err := e.parser().Parse(selectSQL)
+	if err != nil {
+		// Fallback: treat as literal
+		return expr, nil
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok || len(sel.SelectExprs.Exprs) == 0 {
+		return expr, nil
+	}
+	ae, ok := sel.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr)
+	if !ok {
+		return expr, nil
+	}
+	return e.evalExpr(ae.Expr)
+}
+
+// resolveNewOldRefs replaces NEW.col and OLD.col references in a SQL statement
+// with the actual values from the row.
+func (e *Executor) resolveNewOldRefs(stmtStr string, newRow, oldRow storage.Row) string {
+	// Replace NEW.col and OLD.col with actual values
+	result := stmtStr
+
+	// Process NEW.xxx references
+	if newRow != nil {
+		result = replaceRowRefs(result, "NEW", newRow)
+	}
+	// Process OLD.xxx references
+	if oldRow != nil {
+		result = replaceRowRefs(result, "OLD", oldRow)
+	}
+	return result
+}
+
+// replaceRowRefs replaces prefix.col references (e.g. NEW.c1) with actual values.
+func replaceRowRefs(stmt, prefix string, row storage.Row) string {
+	// Find all occurrences of PREFIX.identifier (case-insensitive prefix)
+	result := stmt
+	prefixUpper := strings.ToUpper(prefix)
+	i := 0
+	for i < len(result) {
+		// Look for prefix followed by dot
+		remaining := result[i:]
+		remainingUpper := strings.ToUpper(remaining)
+		if !strings.HasPrefix(remainingUpper, prefixUpper+".") {
+			i++
+			continue
+		}
+		// Check word boundary before prefix
+		if i > 0 && isAlphaNum(result[i-1]) {
+			i++
+			continue
+		}
+		// Extract column name after the dot
+		dotPos := i + len(prefix) + 1
+		end := dotPos
+		for end < len(result) && (isAlphaNum(result[end]) || result[end] == '_') {
+			end++
+		}
+		if end == dotPos {
+			i++
+			continue
+		}
+		colName := result[dotPos:end]
+
+		// Look up value in row (case-insensitive)
+		var val interface{}
+		found := false
+		for k, v := range row {
+			if strings.EqualFold(k, colName) {
+				val = v
+				found = true
+				break
+			}
+		}
+
+		var replacement string
+		if !found || val == nil {
+			replacement = "NULL"
+		} else {
+			switch v := val.(type) {
+			case string:
+				replacement = "'" + strings.ReplaceAll(v, "'", "''") + "'"
+			default:
+				replacement = fmt.Sprintf("%v", v)
+			}
+		}
+		result = result[:i] + replacement + result[end:]
+		i += len(replacement)
+	}
+	return result
+}
+
+// execCreateProcedure parses and stores a CREATE PROCEDURE statement with BEGIN...END body.
+func (e *Executor) execCreateProcedure(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
+	// Parse: CREATE PROCEDURE name (params) [characteristics] BEGIN ... END
+	upper := strings.ToUpper(query)
+	rest := strings.TrimSpace(query[len("CREATE PROCEDURE "):])
+
+	// Extract procedure name (up to first '(')
+	parenIdx := strings.Index(rest, "(")
+	if parenIdx < 0 {
+		return nil, fmt.Errorf("invalid CREATE PROCEDURE syntax: missing parameter list")
+	}
+	procName := strings.TrimSpace(rest[:parenIdx])
+	procName = strings.Trim(procName, "`")
+
+	// Extract params between first '(' and matching ')'
+	paramStart := parenIdx + 1
+	depth := 1
+	paramEnd := paramStart
+	for paramEnd < len(rest) && depth > 0 {
+		if rest[paramEnd] == '(' {
+			depth++
+		} else if rest[paramEnd] == ')' {
+			depth--
+		}
+		if depth > 0 {
+			paramEnd++
+		}
+	}
+	paramStr := strings.TrimSpace(rest[paramStart:paramEnd])
+	params := parseProcParams(paramStr)
+
+	// Extract body: find BEGIN...END or single-statement body
+	_ = upper
+	afterParams := rest[paramEnd+1:]
+	var bodyStmts []string
+	beginIdx := strings.Index(strings.ToUpper(afterParams), "BEGIN")
+	if beginIdx >= 0 {
+		bodyStr := strings.TrimSpace(afterParams[beginIdx+len("BEGIN"):])
+		if strings.HasSuffix(strings.ToUpper(strings.TrimSpace(bodyStr)), "END") {
+			bodyStr = strings.TrimSpace(bodyStr[:len(bodyStr)-len("END")])
+		}
+		bodyStmts = splitTriggerBody(bodyStr)
+	} else {
+		// Single-statement procedure (no BEGIN...END)
+		// Skip optional characteristics (LANGUAGE SQL, DETERMINISTIC, etc.)
+		bodyStr := strings.TrimSpace(afterParams)
+		upperBody := strings.ToUpper(bodyStr)
+		for {
+			trimmedBody := strings.TrimSpace(bodyStr)
+			upperBody = strings.ToUpper(trimmedBody)
+			if strings.HasPrefix(upperBody, "LANGUAGE ") {
+				if idx := strings.Index(trimmedBody[9:], " "); idx >= 0 {
+					bodyStr = trimmedBody[9+idx:]
+				} else {
+					break
+				}
+			} else if strings.HasPrefix(upperBody, "NOT DETERMINISTIC") {
+				bodyStr = trimmedBody[17:]
+			} else if strings.HasPrefix(upperBody, "DETERMINISTIC") {
+				bodyStr = trimmedBody[13:]
+			} else if strings.HasPrefix(upperBody, "CONTAINS SQL") {
+				bodyStr = trimmedBody[12:]
+			} else if strings.HasPrefix(upperBody, "NO SQL") {
+				bodyStr = trimmedBody[6:]
+			} else if strings.HasPrefix(upperBody, "READS SQL DATA") {
+				bodyStr = trimmedBody[14:]
+			} else if strings.HasPrefix(upperBody, "MODIFIES SQL DATA") {
+				bodyStr = trimmedBody[17:]
+			} else if strings.HasPrefix(upperBody, "SQL SECURITY DEFINER") {
+				bodyStr = trimmedBody[20:]
+			} else if strings.HasPrefix(upperBody, "SQL SECURITY INVOKER") {
+				bodyStr = trimmedBody[20:]
+			} else if strings.HasPrefix(upperBody, "COMMENT ") {
+				// Skip COMMENT 'string'
+				rest2 := trimmedBody[8:]
+				if len(rest2) > 0 && (rest2[0] == '\'' || rest2[0] == '"') {
+					q := rest2[0]
+					end := strings.IndexByte(rest2[1:], q)
+					if end >= 0 {
+						bodyStr = rest2[end+2:]
+					} else {
+						break
+					}
+				} else {
+					break
+				}
+			} else {
+				break
+			}
+		}
+		bodyStr = strings.TrimSpace(bodyStr)
+		bodyStr = strings.TrimSuffix(bodyStr, ";")
+		bodyStr = strings.TrimSpace(bodyStr)
+		if bodyStr == "" {
+			return nil, fmt.Errorf("invalid CREATE PROCEDURE syntax: missing body")
+		}
+		bodyStmts = []string{bodyStr}
+	}
+
+	procDef := &catalog.ProcedureDef{
+		Name:   procName,
+		Params: params,
+		Body:   bodyStmts,
+	}
+	db.CreateProcedure(procDef)
+
+	return &Result{}, nil
+}
+
+// parseProcParams parses a procedure parameter list string.
+func parseProcParams(paramStr string) []catalog.ProcParam {
+	if strings.TrimSpace(paramStr) == "" {
+		return nil
+	}
+	var params []catalog.ProcParam
+	// Split by commas (not inside parens)
+	parts := splitByComma(paramStr)
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		words := strings.Fields(p)
+		param := catalog.ProcParam{}
+		idx := 0
+		// Check for IN/OUT/INOUT prefix
+		if len(words) > 0 {
+			modeUpper := strings.ToUpper(words[0])
+			if modeUpper == "IN" || modeUpper == "OUT" || modeUpper == "INOUT" {
+				param.Mode = modeUpper
+				idx = 1
+			} else {
+				param.Mode = "IN" // default
+			}
+		}
+		if idx < len(words) {
+			param.Name = words[idx]
+			idx++
+		}
+		if idx < len(words) {
+			param.Type = strings.Join(words[idx:], " ")
+		}
+		params = append(params, param)
+	}
+	return params
+}
+
+// splitByComma splits a string by commas, respecting parentheses.
+func splitByComma(s string) []string {
+	var parts []string
+	var current strings.Builder
+	depth := 0
+	for _, ch := range s {
+		switch ch {
+		case '(':
+			depth++
+			current.WriteRune(ch)
+		case ')':
+			depth--
+			current.WriteRune(ch)
+		case ',':
+			if depth == 0 {
+				parts = append(parts, current.String())
+				current.Reset()
+			} else {
+				current.WriteRune(ch)
+			}
+		default:
+			current.WriteRune(ch)
+		}
+	}
+	rest := current.String()
+	if strings.TrimSpace(rest) != "" {
+		parts = append(parts, rest)
+	}
+	return parts
+}
+
+// execDropProcedureFallback handles DROP PROCEDURE [IF EXISTS] name
+func (e *Executor) execDropProcedureFallback(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
+	rest := strings.TrimSpace(query[len("DROP PROCEDURE"):])
+	ifExists := false
+	restUpper := strings.ToUpper(rest)
+	if strings.HasPrefix(restUpper, "IF EXISTS") {
+		ifExists = true
+		rest = strings.TrimSpace(rest[len("IF EXISTS"):])
+	}
+	name := strings.TrimRight(strings.TrimSpace(rest), ";")
+	name = strings.Trim(name, "`")
+
+	// Handle qualified name (schema.procedure)
+	targetDB := db
+	dbName := e.CurrentDB
+	if dotIdx := strings.Index(name, "."); dotIdx >= 0 {
+		dbName = strings.Trim(name[:dotIdx], "`")
+		name = strings.Trim(name[dotIdx+1:], "`")
+		targetDB2, err2 := e.Catalog.GetDatabase(dbName)
+		if err2 != nil {
+			if ifExists {
+				return &Result{}, nil
+			}
+			return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", dbName, name))
+		}
+		targetDB = targetDB2
+	}
+
+	if targetDB.GetProcedure(name) == nil && !ifExists {
+		return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", dbName, name))
+	}
+	targetDB.DropProcedure(name)
+	return &Result{}, nil
+}
+
+// execDropProcedureAST handles DROP PROCEDURE parsed by vitess.
+func (e *Executor) execDropProcedureAST(stmt *sqlparser.DropProcedure) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+	name := stmt.Name.Name.String()
+	name = strings.Trim(name, "`")
+	if db.GetProcedure(name) == nil && !stmt.IfExists {
+		return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", e.CurrentDB, name))
+	}
+	db.DropProcedure(name)
+	return &Result{}, nil
+}
+
+// execCallProcedure handles CALL procedure_name(args) from text.
+func (e *Executor) execCallProcedure(query string) (*Result, error) {
+	// Parse: CALL proc_name(arg1, arg2, ...)
+	rest := strings.TrimSpace(query[len("CALL "):])
+	rest = strings.TrimRight(rest, ";")
+
+	// Extract procedure name and args
+	parenIdx := strings.Index(rest, "(")
+	var procName string
+	var argStrs []string
+	if parenIdx < 0 {
+		procName = strings.TrimSpace(rest)
+	} else {
+		procName = strings.TrimSpace(rest[:parenIdx])
+		argPart := rest[parenIdx+1:]
+		if closeParen := strings.LastIndex(argPart, ")"); closeParen >= 0 {
+			argPart = argPart[:closeParen]
+		}
+		argStrs = splitByComma(argPart)
+	}
+	procName = strings.Trim(procName, "`")
+
+	// Handle well-known no-op procedures (e.g. mtr.add_suppression)
+	if strings.Contains(procName, ".") {
+		return &Result{}, nil
+	}
+
+	return e.callProcedureByName(procName, argStrs)
+}
+
+// execCallProcFromAST handles CALL parsed by vitess.
+func (e *Executor) execCallProcFromAST(stmt *sqlparser.CallProc) (*Result, error) {
+	procName := stmt.Name.Name.String()
+	procName = strings.Trim(procName, "`")
+
+	// Handle well-known no-op procedures
+	qualifier := stmt.Name.Qualifier.String()
+	if qualifier != "" {
+		return &Result{}, nil
+	}
+
+	var argStrs []string
+	for _, arg := range stmt.Params {
+		argStrs = append(argStrs, sqlparser.String(arg))
+	}
+
+	return e.callProcedureByName(procName, argStrs)
+}
+
+// callProcedureByName looks up and executes a stored procedure.
+func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
+	proc := db.GetProcedure(procName)
+	if proc == nil {
+		// Silently accept calls to non-existent procedures for compatibility
+		return &Result{}, nil
+	}
+
+	// Build parameter mapping: bind IN params, track OUT params
+	paramVars := make(map[string]interface{})
+	for i, param := range proc.Params {
+		if i < len(argStrs) {
+			argVal := strings.TrimSpace(argStrs[i])
+			if strings.HasPrefix(argVal, "@") {
+				// User variable reference
+				if param.Mode == "IN" || param.Mode == "INOUT" {
+					paramVars[param.Name] = argVal
+				}
+			} else {
+				// Literal value - try to parse as number
+				if n, err := strconv.ParseInt(argVal, 10, 64); err == nil {
+					paramVars[param.Name] = n
+				} else {
+					paramVars[param.Name] = strings.Trim(argVal, "'\"")
+				}
+			}
+		}
+	}
+
+	// Execute body using the routine executor with cursor support
+	_, err = e.execRoutineBody(proc.Body, paramVars)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Result{}, nil
+}
+
+// execSelectInto handles SELECT ... INTO variable inside a stored procedure.
+func (e *Executor) execSelectInto(stmtStr string, paramVars map[string]interface{}, outVarMap map[string]string) error {
+	// Parse: SELECT expr INTO varname FROM ...
+	// We need to extract the INTO clause and rewrite the SELECT without it
+	upper := strings.ToUpper(stmtStr)
+	intoIdx := strings.Index(upper, " INTO ")
+	if intoIdx < 0 {
+		return nil
+	}
+
+	// Find what comes after INTO: variable name, then FROM/WHERE/etc.
+	afterInto := stmtStr[intoIdx+len(" INTO "):]
+	// The variable name ends at the next keyword (FROM, WHERE, etc.) or end of string
+	var varName string
+	var restOfQuery string
+	for _, kw := range []string{" FROM ", " WHERE ", " GROUP ", " ORDER ", " LIMIT ", " HAVING "} {
+		kwIdx := strings.Index(strings.ToUpper(afterInto), kw)
+		if kwIdx >= 0 {
+			varName = strings.TrimSpace(afterInto[:kwIdx])
+			restOfQuery = afterInto[kwIdx:]
+			break
+		}
+	}
+	if varName == "" {
+		varName = strings.TrimSpace(afterInto)
+	}
+
+	// Build a SELECT without the INTO clause
+	selectPart := stmtStr[:intoIdx]
+	rewrittenSQL := selectPart + restOfQuery
+
+	result, err := e.Execute(rewrittenSQL)
+	if err != nil {
+		return err
+	}
+
+	// Assign result to the output variable
+	if result != nil && len(result.Rows) > 0 && len(result.Rows[0]) > 0 {
+		val := result.Rows[0][0]
+		// If varName is a parameter name, look up the OUT variable
+		if outVar, ok := outVarMap[varName]; ok {
+			_ = outVar
+			_ = val
+			// For now, we just store it (user variables @xxx are not fully implemented)
+		}
+		paramVars[varName] = val
+	}
+
+	return nil
+}
+
+// truncateNear truncates a SQL string for error messages (MySQL shows ~80 chars).
+func truncateNear(s string) string {
+	// MySQL parse errors around unquoted time-like tokens (e.g. 11:11:11)
+	// typically show the snippet starting from ':'.
+	if idx := strings.IndexByte(s, ':'); idx > 0 {
+		prev := s[idx-1]
+		if prev >= '0' && prev <= '9' {
+			s = s[idx:]
+		}
+	}
+	if len(s) > 80 {
+		return s[:80]
+	}
+	return s
+}
+
+// execCreateFunction handles CREATE FUNCTION name(params) RETURNS type BEGIN...END
+func (e *Executor) execCreateFunction(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
+	rest := strings.TrimSpace(query[len("CREATE FUNCTION "):])
+
+	// Extract function name (up to first '(')
+	parenIdx := strings.Index(rest, "(")
+	if parenIdx < 0 {
+		return nil, fmt.Errorf("invalid CREATE FUNCTION syntax: missing parameter list")
+	}
+	funcName := strings.TrimSpace(rest[:parenIdx])
+	funcName = strings.Trim(funcName, "`")
+
+	// Handle schema-qualified function names (e.g. test.f or `test`.`f`)
+	if dotIdx := strings.Index(funcName, "."); dotIdx >= 0 {
+		schemaName := strings.Trim(funcName[:dotIdx], "`")
+		funcName = strings.Trim(funcName[dotIdx+1:], "`")
+		db, err = e.Catalog.GetDatabase(schemaName)
+		if err != nil {
+			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", schemaName))
+		}
+	}
+
+	// Extract params between first '(' and matching ')'
+	paramStart := parenIdx + 1
+	depth := 1
+	paramEnd := paramStart
+	for paramEnd < len(rest) && depth > 0 {
+		if rest[paramEnd] == '(' {
+			depth++
+		} else if rest[paramEnd] == ')' {
+			depth--
+		}
+		if depth > 0 {
+			paramEnd++
+		}
+	}
+	paramStr := strings.TrimSpace(rest[paramStart:paramEnd])
+	params := parseProcParams(paramStr)
+
+	// Extract RETURNS type and body
+	afterParams := rest[paramEnd+1:]
+	upperAfter := strings.ToUpper(afterParams)
+
+	// Find RETURNS keyword
+	returnsIdx := strings.Index(upperAfter, "RETURNS ")
+	returnType := ""
+	if returnsIdx >= 0 {
+		afterReturns := strings.TrimSpace(afterParams[returnsIdx+len("RETURNS "):])
+		// Return type ends at BEGIN/RETURN or at a characteristic keyword
+		beginIdx := strings.Index(strings.ToUpper(afterReturns), "BEGIN")
+		returnIdx := strings.Index(strings.ToUpper(afterReturns), "RETURN ")
+		endIdx := beginIdx
+		if endIdx < 0 || (returnIdx >= 0 && returnIdx < endIdx) {
+			endIdx = returnIdx
+		}
+		if endIdx < 0 {
+			endIdx = len(afterReturns)
+		}
+		returnType = strings.TrimSpace(afterReturns[:endIdx])
+		// Strip optional characteristics like CONTAINS SQL, NO SQL, READS SQL DATA, etc.
+		for _, kw := range []string{"DETERMINISTIC", "NOT DETERMINISTIC", "CONTAINS SQL", "NO SQL", "READS SQL DATA", "MODIFIES SQL DATA", "SQL SECURITY DEFINER", "SQL SECURITY INVOKER"} {
+			returnType = strings.TrimSuffix(strings.TrimSpace(returnType), kw)
+		}
+		returnType = strings.TrimSpace(returnType)
+	}
+
+	// Extract body: BEGIN...END or single RETURN expression.
+	var bodyStmts []string
+	beginIdx := strings.Index(strings.ToUpper(afterParams), "BEGIN")
+	if beginIdx >= 0 {
+		bodyStr := strings.TrimSpace(afterParams[beginIdx+len("BEGIN"):])
+		if strings.HasSuffix(strings.ToUpper(strings.TrimSpace(bodyStr)), "END") {
+			bodyStr = strings.TrimSpace(bodyStr[:len(bodyStr)-len("END")])
+		}
+		bodyStmts = splitTriggerBody(bodyStr)
+	} else {
+		returnIdx := strings.Index(strings.ToUpper(afterParams), "RETURN ")
+		if returnIdx < 0 {
+			return nil, fmt.Errorf("invalid CREATE FUNCTION syntax: missing RETURN")
+		}
+		returnExpr := strings.TrimSpace(afterParams[returnIdx:])
+		returnExpr = strings.TrimSuffix(returnExpr, ";")
+		bodyStmts = []string{returnExpr}
+	}
+
+	funcDef := &catalog.FunctionDef{
+		Name:       funcName,
+		Params:     params,
+		ReturnType: returnType,
+		Body:       bodyStmts,
+	}
+	db.CreateFunction(funcDef)
+
+	return &Result{}, nil
+}
+
+// execDropFunction handles DROP FUNCTION [IF EXISTS] name
+func (e *Executor) execDropFunction(query string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
+	rest := strings.TrimSpace(query[len("DROP FUNCTION"):])
+	ifExists := false
+	restUpper := strings.ToUpper(strings.TrimSpace(rest))
+	if strings.HasPrefix(restUpper, "IF EXISTS") {
+		ifExists = true
+		rest = strings.TrimSpace(rest[len("IF EXISTS"):])
+		rest = strings.TrimSpace(rest)
+	}
+	name := strings.TrimRight(strings.TrimSpace(rest), ";")
+	name = strings.Trim(name, "`")
+
+	// Handle schema-qualified function names (e.g. test.f or `test`.`f`)
+	if dotIdx := strings.Index(name, "."); dotIdx >= 0 {
+		schemaName := strings.Trim(name[:dotIdx], "`")
+		name = strings.Trim(name[dotIdx+1:], "`")
+		db, err = e.Catalog.GetDatabase(schemaName)
+		if err != nil {
+			if ifExists {
+				return &Result{}, nil
+			}
+			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", schemaName))
+		}
+	}
+
+	if db.GetFunction(name) == nil && !ifExists {
+		return nil, mysqlError(1305, "42000", fmt.Sprintf("FUNCTION %s.%s does not exist", e.CurrentDB, name))
+	}
+	db.DropFunction(name)
+	return &Result{}, nil
+}
+
+// cursorState holds the state of an open cursor during procedure/function execution.
+type cursorState struct {
+	rows    [][]interface{}
+	columns []string
+	pos     int
+}
+
+// callUserDefinedFunction looks up a user-defined function in the catalog and executes it.
+// qualifier is the optional schema qualifier (e.g. "test" in "test.f()").
+func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Expr, row *storage.Row, qualifier ...string) (interface{}, error) {
+	if e.Catalog == nil {
+		return nil, fmt.Errorf("function not found: %s", name)
+	}
+	dbName := e.CurrentDB
+	if len(qualifier) > 0 && qualifier[0] != "" {
+		dbName = qualifier[0]
+	}
+	if dbName == "" {
+		dbName = "test"
+	}
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		return nil, fmt.Errorf("no database")
+	}
+
+	fn := db.GetFunction(name)
+	if fn == nil {
+		return nil, fmt.Errorf("function not found: %s", name)
+	}
+
+	// Evaluate arguments
+	paramVars := make(map[string]interface{})
+	for i, param := range fn.Params {
+		if i < len(argExprs) {
+			var val interface{}
+			var evalErr error
+			if row != nil {
+				val, evalErr = e.evalRowExpr(argExprs[i], *row)
+			} else {
+				val, evalErr = e.evalExpr(argExprs[i])
+			}
+			if evalErr != nil {
+				return nil, evalErr
+			}
+			paramVars[param.Name] = val
+		}
+	}
+
+	// Execute function body with local variables, cursors, and handlers
+	return e.execRoutineBody(fn.Body, paramVars)
+}
+
+// leaveError is a sentinel error used to implement LEAVE label in stored routines.
+type leaveError struct {
+	label string
+}
+
+func (e *leaveError) Error() string { return "LEAVE " + e.label }
+
+// iterateError is a sentinel error used to implement ITERATE label in stored routines.
+type iterateError struct {
+	label string
+}
+
+func (e *iterateError) Error() string { return "ITERATE " + e.label }
+
+// routineContext holds shared state for a stored routine execution.
+type routineContext struct {
+	localVars          map[string]interface{}
+	cursors            map[string]*cursorState
+	cursorDefs         map[string]string
+	notFoundHandlerVar string
+	done               bool
+}
+
+// execRoutineBody executes the body of a stored procedure or function, supporting
+// DECLARE, SET, IF, WHILE, REPEAT, CURSOR, HANDLER, RETURN, and general SQL statements.
+func (e *Executor) execRoutineBody(body []string, paramVars map[string]interface{}) (interface{}, error) {
+	ctx := &routineContext{
+		localVars:  make(map[string]interface{}),
+		cursors:    make(map[string]*cursorState),
+		cursorDefs: make(map[string]string),
+	}
+	for k, v := range paramVars {
+		ctx.localVars[k] = v
+	}
+	return e.execRoutineBodyWithContext(body, ctx)
+}
+
+// execRoutineBodyWithContext executes routine body statements with shared context.
+func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext) (interface{}, error) {
+	localVars := ctx.localVars
+	cursors := ctx.cursors
+	cursorDefs := ctx.cursorDefs
+	notFoundHandlerVar := ctx.notFoundHandlerVar
+	done := ctx.done
+
+	var returnVal interface{}
+
+	for i := 0; i < len(body); i++ {
+		stmtStr := strings.TrimSpace(body[i])
+		stmtUpper := strings.ToUpper(stmtStr)
+
+		if stmtStr == "" {
+			continue
+		}
+
+		// Handle DECLARE
+		if strings.HasPrefix(stmtUpper, "DECLARE") {
+			rest := strings.TrimSpace(stmtStr[len("DECLARE"):])
+			restUpper := strings.ToUpper(rest)
+
+			// DECLARE CONTINUE HANDLER FOR NOT FOUND SET var = val
+			// DECLARE CONTINUE HANDLER FOR SQLSTATE '02000' SET var = val
+			if strings.HasPrefix(restUpper, "CONTINUE HANDLER") {
+				afterHandler := strings.TrimSpace(rest[len("CONTINUE HANDLER"):])
+				afterHandlerUpper := strings.ToUpper(afterHandler)
+				// Extract SET variable
+				setIdx := strings.Index(afterHandlerUpper, "SET ")
+				if setIdx >= 0 {
+					setPart := strings.TrimSpace(afterHandler[setIdx+4:])
+					eqIdx := strings.Index(setPart, "=")
+					if eqIdx >= 0 {
+						varName := strings.TrimSpace(setPart[:eqIdx])
+						notFoundHandlerVar = varName
+						ctx.notFoundHandlerVar = varName
+					}
+				}
+				continue
+			}
+
+			// DECLARE cursor_name CURSOR FOR select_stmt
+			if strings.Contains(restUpper, " CURSOR FOR ") {
+				parts := strings.SplitN(rest, " ", 2)
+				cursorName := strings.TrimSpace(parts[0])
+				cursorForIdx := strings.Index(restUpper, "CURSOR FOR ")
+				selectSQL := strings.TrimSpace(rest[cursorForIdx+len("CURSOR FOR "):])
+				cursorDefs[strings.ToLower(cursorName)] = selectSQL
+				continue
+			}
+
+			// DECLARE var1[,var2,...] TYPE [DEFAULT val]
+			// Parse variable declarations
+			declParts := strings.Fields(rest)
+			if len(declParts) >= 2 {
+				// Collect variable names (comma-separated) before the type keyword
+				var varNames []string
+				typeIdx := 0
+				for j, p := range declParts {
+					// Handle comma-separated variable names (e.g., "b,c")
+					subNames := strings.Split(strings.TrimRight(p, ","), ",")
+					isType := false
+					for _, name := range subNames {
+						name = strings.TrimSpace(name)
+						if name == "" {
+							continue
+						}
+						nameUpper := strings.ToUpper(name)
+						if nameUpper == "INT" || nameUpper == "INTEGER" || nameUpper == "BIGINT" ||
+							nameUpper == "SMALLINT" || nameUpper == "TINYINT" || nameUpper == "MEDIUMINT" ||
+							nameUpper == "CHAR" || nameUpper == "VARCHAR" || nameUpper == "TEXT" ||
+							nameUpper == "DECIMAL" || nameUpper == "FLOAT" || nameUpper == "DOUBLE" ||
+							nameUpper == "DATE" || nameUpper == "DATETIME" || nameUpper == "TIMESTAMP" ||
+							strings.HasPrefix(nameUpper, "CHAR(") || strings.HasPrefix(nameUpper, "VARCHAR(") {
+							isType = true
+							break
+						}
+					}
+					if isType {
+						typeIdx = j
+						break
+					}
+					for _, name := range subNames {
+						name = strings.TrimSpace(name)
+						if name != "" {
+							varNames = append(varNames, name)
+						}
+					}
+				}
+				// Find DEFAULT value
+				var defaultVal interface{}
+				defaultVal = int64(0) // MySQL default for numeric types
+				for j := typeIdx; j < len(declParts); j++ {
+					if strings.ToUpper(declParts[j]) == "DEFAULT" && j+1 < len(declParts) {
+						defStr := declParts[j+1]
+						if n, err := strconv.ParseInt(defStr, 10, 64); err == nil {
+							defaultVal = n
+						} else {
+							defaultVal = strings.Trim(defStr, "'\"")
+						}
+						break
+					}
+				}
+				for _, vn := range varNames {
+					localVars[vn] = defaultVal
+				}
+			}
+			continue
+		}
+
+		// Handle OPEN cursor_name
+		if strings.HasPrefix(stmtUpper, "OPEN ") {
+			cursorName := strings.ToLower(strings.TrimSpace(stmtStr[len("OPEN "):]))
+			selectSQL, ok := cursorDefs[cursorName]
+			if !ok {
+				return nil, fmt.Errorf("cursor '%s' is not declared", cursorName)
+			}
+			// Substitute local variables in the SELECT query
+			resolvedSQL := e.substituteLocalVars(selectSQL, localVars)
+			result, err := e.Execute(resolvedSQL)
+			if err != nil {
+				return nil, err
+			}
+			cs := &cursorState{
+				columns: result.Columns,
+				pos:     0,
+			}
+			for _, r := range result.Rows {
+				cs.rows = append(cs.rows, r)
+			}
+			cursors[cursorName] = cs
+			continue
+		}
+
+		// Handle CLOSE cursor_name
+		if strings.HasPrefix(stmtUpper, "CLOSE ") {
+			cursorName := strings.ToLower(strings.TrimSpace(stmtStr[len("CLOSE "):]))
+			delete(cursors, cursorName)
+			continue
+		}
+
+		// Handle FETCH cursor_name INTO var1, var2, ...
+		if strings.HasPrefix(stmtUpper, "FETCH ") {
+			rest := strings.TrimSpace(stmtStr[len("FETCH "):])
+			restUpper := strings.ToUpper(rest)
+			// Skip optional NEXT FROM
+			if strings.HasPrefix(restUpper, "NEXT FROM ") {
+				rest = strings.TrimSpace(rest[len("NEXT FROM "):])
+			}
+			intoIdx := strings.Index(strings.ToUpper(rest), " INTO ")
+			if intoIdx < 0 {
+				continue
+			}
+			cursorName := strings.ToLower(strings.TrimSpace(rest[:intoIdx]))
+			varsPart := strings.TrimSpace(rest[intoIdx+len(" INTO "):])
+			varNames := strings.Split(varsPart, ",")
+			for j := range varNames {
+				varNames[j] = strings.TrimSpace(varNames[j])
+			}
+
+			cs, ok := cursors[cursorName]
+			if !ok {
+				// Cursor not open - trigger NOT FOUND
+				if notFoundHandlerVar != "" {
+					localVars[notFoundHandlerVar] = int64(1)
+					done = true
+				}
+				continue
+			}
+			if cs.pos >= len(cs.rows) {
+				// No more rows - trigger NOT FOUND
+				if notFoundHandlerVar != "" {
+					localVars[notFoundHandlerVar] = int64(1)
+					done = true
+				}
+				continue
+			}
+			row := cs.rows[cs.pos]
+			cs.pos++
+			for j, vn := range varNames {
+				if j < len(row) {
+					localVars[vn] = row[j]
+				}
+			}
+			continue
+		}
+
+		// Handle RETURN value
+		if strings.HasPrefix(stmtUpper, "RETURN ") {
+			exprStr := strings.TrimSpace(stmtStr[len("RETURN "):])
+			exprStr = strings.TrimRight(exprStr, ";")
+			// Try to evaluate as a local variable first
+			if val, ok := localVars[exprStr]; ok {
+				return val, nil
+			}
+			// Try to evaluate as an expression
+			val, err := e.evaluateExprWithVars(exprStr, localVars)
+			if err != nil {
+				// Fallback for RETURN (SELECT ...): evaluate the inner scalar query.
+				resolvedExpr := strings.TrimSpace(exprStr)
+				if strings.HasPrefix(resolvedExpr, "(") && strings.HasSuffix(resolvedExpr, ")") {
+					resolvedExpr = strings.TrimSpace(resolvedExpr[1 : len(resolvedExpr)-1])
+				}
+				toSQLLiteral := func(v interface{}) string {
+					if v == nil {
+						return "NULL"
+					}
+					switch x := v.(type) {
+					case string:
+						return "'" + strings.ReplaceAll(x, "'", "''") + "'"
+					case bool:
+						if x {
+							return "1"
+						}
+						return "0"
+					default:
+						return fmt.Sprintf("%v", x)
+					}
+				}
+				for varName, varVal := range localVars {
+					re := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(varName) + `\b`)
+					resolvedExpr = re.ReplaceAllString(resolvedExpr, toSQLLiteral(varVal))
+				}
+				res, qerr := e.Execute(resolvedExpr)
+				if qerr != nil || res == nil || len(res.Rows) == 0 || len(res.Rows[0]) == 0 {
+					return nil, err
+				}
+				return res.Rows[0][0], nil
+			}
+			return val, nil
+		}
+
+		// Handle SET statements with local variable substitution
+		if strings.HasPrefix(stmtUpper, "SET ") {
+			setPart := strings.TrimSpace(stmtStr[4:])
+			eqIdx := strings.Index(setPart, "=")
+			if eqIdx >= 0 {
+				varName := strings.TrimSpace(setPart[:eqIdx])
+				valStr := strings.TrimSpace(setPart[eqIdx+1:])
+				// Evaluate expression
+				val, err := e.evaluateExprWithVars(valStr, localVars)
+				if err != nil {
+					// Fall back to Execute
+					resolvedSQL := e.substituteLocalVars(stmtStr, localVars)
+					e.Execute(resolvedSQL) //nolint:errcheck
+				} else {
+					localVars[varName] = val
+				}
+			} else {
+				resolvedSQL := e.substituteLocalVars(stmtStr, localVars)
+				e.Execute(resolvedSQL) //nolint:errcheck
+			}
+			continue
+		}
+
+		// Handle IF...THEN...ELSEIF...ELSE...END IF (may span multiple body statements)
+		if strings.HasPrefix(stmtUpper, "IF ") {
+			// Collect the full IF block, tracking nesting
+			ifBlock := stmtStr
+			ifDepth := countOccurrences(strings.ToUpper(ifBlock), "IF ") - countOccurrences(strings.ToUpper(ifBlock), "END IF")
+			for ifDepth > 0 && i+1 < len(body) {
+				i++
+				ifBlock += ";\n" + body[i]
+				ifDepth += countOccurrences(strings.ToUpper(body[i]), "IF ") - countOccurrences(strings.ToUpper(body[i]), "END IF")
+			}
+			_, retVal, err := e.execIfBlockCtx(ifBlock, ctx)
+			if err != nil {
+				return nil, err
+			}
+			if retVal != nil {
+				return retVal, nil
+			}
+			continue
+		}
+
+		// Handle REPEAT...UNTIL...END REPEAT
+		if strings.HasPrefix(stmtUpper, "REPEAT") {
+			// Collect the full REPEAT block
+			repeatBlock := stmtStr
+			for !strings.HasSuffix(strings.ToUpper(strings.TrimSpace(repeatBlock)), "END REPEAT") && i+1 < len(body) {
+				i++
+				repeatBlock += ";\n" + body[i]
+			}
+			retVal, err := e.execRepeatBlockCtx(repeatBlock, ctx)
+			if err != nil {
+				return nil, err
+			}
+			if retVal != nil {
+				return retVal, nil
+			}
+			continue
+		}
+
+		// Handle WHILE...DO...END WHILE
+		if strings.HasPrefix(stmtUpper, "WHILE ") {
+			whileBlock := stmtStr
+			for !strings.HasSuffix(strings.ToUpper(strings.TrimSpace(whileBlock)), "END WHILE") && i+1 < len(body) {
+				i++
+				whileBlock += ";\n" + body[i]
+			}
+			retVal, err := e.execWhileBlockCtx(whileBlock, ctx)
+			if err != nil {
+				return nil, err
+			}
+			if retVal != nil {
+				return retVal, nil
+			}
+			continue
+		}
+
+		// Handle LEAVE label
+		if strings.HasPrefix(stmtUpper, "LEAVE ") {
+			label := strings.TrimSpace(stmtStr[len("LEAVE "):])
+			label = strings.TrimRight(label, ";")
+			return nil, &leaveError{label: label}
+		}
+
+		// Handle ITERATE label
+		if strings.HasPrefix(stmtUpper, "ITERATE ") {
+			label := strings.TrimSpace(stmtStr[len("ITERATE "):])
+			label = strings.TrimRight(label, ";")
+			return nil, &iterateError{label: label}
+		}
+
+		// Handle LOOP...END LOOP (with optional label)
+		if strings.HasPrefix(stmtUpper, "LOOP") || (strings.Contains(stmtUpper, ":") && strings.Contains(stmtUpper, "LOOP")) {
+			// Check for labeled loop: label: LOOP ... END LOOP [label]
+			loopBlock := stmtStr
+			loopLabel := ""
+			startUpper := stmtUpper
+			if colonIdx := strings.Index(startUpper, ":"); colonIdx >= 0 {
+				possibleLabel := strings.TrimSpace(stmtStr[:colonIdx])
+				afterColon := strings.TrimSpace(stmtStr[colonIdx+1:])
+				if strings.HasPrefix(strings.ToUpper(afterColon), "LOOP") {
+					loopLabel = possibleLabel
+					loopBlock = afterColon
+				}
+			}
+			// Collect the full LOOP block
+			for !strings.HasSuffix(strings.ToUpper(strings.TrimSpace(loopBlock)), "END LOOP") &&
+				!strings.HasSuffix(strings.ToUpper(strings.TrimSpace(loopBlock)), "END LOOP "+strings.ToUpper(loopLabel)) && i+1 < len(body) {
+				i++
+				loopBlock += ";\n" + body[i]
+			}
+			retVal, err := e.execLoopBlockCtx(loopBlock, loopLabel, ctx)
+			if err != nil {
+				return nil, err
+			}
+			if retVal != nil {
+				return retVal, nil
+			}
+			continue
+		}
+
+		// Handle labeled WHILE: label: WHILE ... END WHILE
+		if strings.Contains(stmtUpper, ":") && !strings.HasPrefix(stmtUpper, "WHILE ") {
+			colonIdx := strings.Index(stmtStr, ":")
+			if colonIdx >= 0 {
+				afterColon := strings.TrimSpace(stmtStr[colonIdx+1:])
+				afterColonUpper := strings.ToUpper(afterColon)
+				if strings.HasPrefix(afterColonUpper, "WHILE ") {
+					loopLabel := strings.TrimSpace(stmtStr[:colonIdx])
+					whileBlock := afterColon
+					for !strings.HasSuffix(strings.ToUpper(strings.TrimSpace(whileBlock)), "END WHILE") &&
+						!strings.HasSuffix(strings.ToUpper(strings.TrimSpace(whileBlock)), "END WHILE "+strings.ToUpper(loopLabel)) && i+1 < len(body) {
+						i++
+						whileBlock += ";\n" + body[i]
+					}
+					retVal, err := e.execWhileBlockWithLabel(whileBlock, loopLabel, ctx)
+					if err != nil {
+						return nil, err
+					}
+					if retVal != nil {
+						return retVal, nil
+					}
+					continue
+				}
+				if strings.HasPrefix(afterColonUpper, "REPEAT") {
+					loopLabel := strings.TrimSpace(stmtStr[:colonIdx])
+					repeatBlock := afterColon
+					for !strings.HasSuffix(strings.ToUpper(strings.TrimSpace(repeatBlock)), "END REPEAT") &&
+						!strings.HasSuffix(strings.ToUpper(strings.TrimSpace(repeatBlock)), "END REPEAT "+strings.ToUpper(loopLabel)) && i+1 < len(body) {
+						i++
+						repeatBlock += ";\n" + body[i]
+					}
+					retVal, err := e.execRepeatBlockWithLabel(repeatBlock, loopLabel, ctx)
+					if err != nil {
+						return nil, err
+					}
+					if retVal != nil {
+						return retVal, nil
+					}
+					continue
+				}
+				if strings.HasPrefix(afterColonUpper, "LOOP") {
+					loopLabel := strings.TrimSpace(stmtStr[:colonIdx])
+					loopBlock := afterColon
+					for !strings.HasSuffix(strings.ToUpper(strings.TrimSpace(loopBlock)), "END LOOP") &&
+						!strings.HasSuffix(strings.ToUpper(strings.TrimSpace(loopBlock)), "END LOOP "+strings.ToUpper(loopLabel)) && i+1 < len(body) {
+						i++
+						loopBlock += ";\n" + body[i]
+					}
+					retVal, err := e.execLoopBlockCtx(loopBlock, loopLabel, ctx)
+					if err != nil {
+						return nil, err
+					}
+					if retVal != nil {
+						return retVal, nil
+					}
+					continue
+				}
+				// Handle labeled BEGIN...END block
+				if strings.HasPrefix(afterColonUpper, "BEGIN") {
+					label := strings.TrimSpace(stmtStr[:colonIdx])
+					beginBlock := afterColon
+					beginDepth := 1
+					for beginDepth > 0 && i+1 < len(body) {
+						i++
+						line := body[i]
+						lineUpper := strings.ToUpper(strings.TrimSpace(line))
+						if strings.HasPrefix(lineUpper, "BEGIN") {
+							beginDepth++
+						}
+						if strings.HasPrefix(lineUpper, "END") {
+							beginDepth--
+						}
+						beginBlock += ";\n" + line
+					}
+					// Strip BEGIN ... END wrapper
+					inner := strings.TrimSpace(beginBlock)
+					if strings.HasPrefix(strings.ToUpper(inner), "BEGIN") {
+						inner = strings.TrimSpace(inner[len("BEGIN"):])
+					}
+					innerUpper := strings.ToUpper(strings.TrimSpace(inner))
+					if strings.HasSuffix(innerUpper, "END "+strings.ToUpper(label)) {
+						inner = strings.TrimSpace(inner[:len(inner)-len("END ")-len(label)])
+					} else if strings.HasSuffix(innerUpper, "END") {
+						inner = strings.TrimSpace(inner[:len(inner)-len("END")])
+					}
+					inner = strings.TrimRight(inner, ";")
+					stmts := splitTriggerBody(inner)
+					retVal, err := e.execRoutineBodyWithContext(stmts, ctx)
+					if err != nil {
+						// Handle LEAVE for this labeled block
+						var le *leaveError
+						if errors.As(err, &le) && strings.EqualFold(le.label, label) {
+							continue
+						}
+						return nil, err
+					}
+					if retVal != nil {
+						return retVal, nil
+					}
+					continue
+				}
+			}
+		}
+
+		// Handle SELECT ... INTO
+		if strings.HasPrefix(stmtUpper, "SELECT") && strings.Contains(stmtUpper, " INTO ") {
+			err := e.execSelectIntoForRoutine(stmtStr, localVars)
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		// General SQL statement - substitute local variables and execute
+		resolvedSQL := e.substituteLocalVars(stmtStr, localVars)
+		_, err := e.Execute(resolvedSQL)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	_ = done
+	return returnVal, nil
+}
+
+// substituteLocalVars replaces local variable references in a SQL string with their values.
+func (e *Executor) substituteLocalVars(sql string, vars map[string]interface{}) string {
+	result := sql
+	// Sort variable names by length descending to avoid partial replacements
+	type kv struct {
+		key string
+		val interface{}
+	}
+	var sorted []kv
+	for k, v := range vars {
+		sorted = append(sorted, kv{k, v})
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return len(sorted[i].key) > len(sorted[j].key)
+	})
+	for _, pair := range sorted {
+		valStr := "NULL"
+		if pair.val != nil {
+			valStr = fmt.Sprintf("%v", pair.val)
+		}
+		// Replace variable references that appear as standalone words
+		result = replaceWordBoundary(result, pair.key, valStr)
+	}
+	return result
+}
+
+// replaceWordBoundary replaces occurrences of word in s only when they appear at word boundaries.
+func replaceWordBoundary(s, word, replacement string) string {
+	var result strings.Builder
+	i := 0
+	wordLen := len(word)
+	for i < len(s) {
+		// Skip quoted strings
+		if s[i] == '\'' || s[i] == '"' || s[i] == '`' {
+			q := s[i]
+			result.WriteByte(q)
+			i++
+			for i < len(s) && s[i] != q {
+				result.WriteByte(s[i])
+				i++
+			}
+			if i < len(s) {
+				result.WriteByte(s[i])
+				i++
+			}
+			continue
+		}
+		if i+wordLen <= len(s) && strings.EqualFold(s[i:i+wordLen], word) {
+			// Check word boundary before
+			if i > 0 {
+				ch := s[i-1]
+				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (ch >= '0' && ch <= '9') || ch == '@' {
+					result.WriteByte(s[i])
+					i++
+					continue
+				}
+			}
+			// Check word boundary after
+			end := i + wordLen
+			if end < len(s) {
+				ch := s[end]
+				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (ch >= '0' && ch <= '9') {
+					result.WriteByte(s[i])
+					i++
+					continue
+				}
+			}
+			result.WriteString(replacement)
+			i += wordLen
+		} else {
+			result.WriteByte(s[i])
+			i++
+		}
+	}
+	return result.String()
+}
+
+// evaluateExprWithVars evaluates a simple expression string, substituting local variables.
+func (e *Executor) evaluateExprWithVars(exprStr string, vars map[string]interface{}) (interface{}, error) {
+	resolved := e.substituteLocalVars(exprStr, vars)
+	// Try to parse and evaluate as a SQL expression
+	selectSQL := "SELECT " + resolved
+	result, err := e.Execute(selectSQL)
+	if err != nil {
+		return nil, err
+	}
+	if result != nil && len(result.Rows) > 0 && len(result.Rows[0]) > 0 {
+		return result.Rows[0][0], nil
+	}
+	return nil, nil
+}
+
+// execSelectIntoForRoutine handles SELECT ... INTO inside a stored routine,
+// properly extracting INTO variable names before substituting local vars.
+func (e *Executor) execSelectIntoForRoutine(stmtStr string, localVars map[string]interface{}) error {
+	upper := strings.ToUpper(stmtStr)
+	intoIdx := strings.Index(upper, " INTO ")
+	if intoIdx < 0 {
+		return nil
+	}
+
+	afterInto := stmtStr[intoIdx+len(" INTO "):]
+	// Extract variable names (they end at a keyword)
+	var varNames []string
+	var restOfQuery string
+	for _, kw := range []string{" FROM ", " WHERE ", " GROUP ", " ORDER ", " LIMIT ", " HAVING "} {
+		kwIdx := strings.Index(strings.ToUpper(afterInto), kw)
+		if kwIdx >= 0 {
+			varPart := strings.TrimSpace(afterInto[:kwIdx])
+			varNames = strings.Split(varPart, ",")
+			restOfQuery = afterInto[kwIdx:]
+			break
+		}
+	}
+	if len(varNames) == 0 {
+		varPart := strings.TrimSpace(afterInto)
+		varNames = strings.Split(varPart, ",")
+	}
+	for j := range varNames {
+		varNames[j] = strings.TrimSpace(varNames[j])
+	}
+
+	// Build SELECT without INTO, then substitute vars only in that part
+	selectPart := stmtStr[:intoIdx]
+	rewrittenSQL := selectPart + restOfQuery
+	// Substitute local vars in the rewritten SQL
+	resolvedSQL := e.substituteLocalVars(rewrittenSQL, localVars)
+
+	result, err := e.Execute(resolvedSQL)
+	if err != nil {
+		return err
+	}
+
+	if result != nil && len(result.Rows) > 0 {
+		row := result.Rows[0]
+		for j, vn := range varNames {
+			if j < len(row) {
+				localVars[vn] = row[j]
+			}
+		}
+	}
+
+	return nil
+}
+
+// execSelectIntoLocal handles SELECT ... INTO local_var inside a routine body.
+func (e *Executor) execSelectIntoLocal(stmtStr string, localVars map[string]interface{}) error {
+	upper := strings.ToUpper(stmtStr)
+	intoIdx := strings.Index(upper, " INTO ")
+	if intoIdx < 0 {
+		return nil
+	}
+
+	afterInto := stmtStr[intoIdx+len(" INTO "):]
+	// The variable names end at the next keyword
+	var varNames []string
+	var restOfQuery string
+	for _, kw := range []string{" FROM ", " WHERE ", " GROUP ", " ORDER ", " LIMIT ", " HAVING "} {
+		kwIdx := strings.Index(strings.ToUpper(afterInto), kw)
+		if kwIdx >= 0 {
+			varPart := strings.TrimSpace(afterInto[:kwIdx])
+			varNames = strings.Split(varPart, ",")
+			restOfQuery = afterInto[kwIdx:]
+			break
+		}
+	}
+	if len(varNames) == 0 {
+		varPart := strings.TrimSpace(afterInto)
+		varNames = strings.Split(varPart, ",")
+	}
+
+	for j := range varNames {
+		varNames[j] = strings.TrimSpace(varNames[j])
+	}
+
+	// Build SELECT without INTO
+	selectPart := stmtStr[:intoIdx]
+	rewrittenSQL := selectPart + restOfQuery
+
+	result, err := e.Execute(rewrittenSQL)
+	if err != nil {
+		return err
+	}
+
+	if result != nil && len(result.Rows) > 0 {
+		row := result.Rows[0]
+		for j, vn := range varNames {
+			if j < len(row) {
+				localVars[vn] = row[j]
+			}
+		}
+	}
+
+	return nil
+}
+
+// execIfBlockCtx executes an IF block with shared routine context.
+func (e *Executor) execIfBlockCtx(block string, ctx *routineContext) (bool, interface{}, error) {
+	return e.execIfBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done)
+}
+
+// execIfBlock executes an IF...THEN...ELSEIF...ELSE...END IF block.
+func (e *Executor) execIfBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool) (bool, interface{}, error) {
+	trimmed := strings.TrimSpace(block)
+	upper := strings.ToUpper(trimmed)
+
+	// Remove trailing END IF (only the outermost)
+	if strings.HasSuffix(upper, "END IF") {
+		trimmed = strings.TrimSpace(trimmed[:len(trimmed)-len("END IF")])
+		// Also remove trailing semicolon if present
+		trimmed = strings.TrimSpace(strings.TrimRight(trimmed, ";"))
+	}
+
+	// Find the first THEN keyword (at the top level, not inside a nested IF)
+	thenIdx := findTopLevelKeyword(trimmed, " THEN")
+	if thenIdx < 0 {
+		return false, nil, nil
+	}
+
+	condStr := strings.TrimSpace(trimmed[3:thenIdx]) // skip "IF "
+	bodyAfterThen := strings.TrimSpace(trimmed[thenIdx+len(" THEN"):])
+
+	// Find top-level ELSE (not inside nested IF/END IF)
+	thenBody, elseBody, hasElse := splitAtTopLevelElse(bodyAfterThen)
+
+	// Evaluate condition
+	condResolved := e.substituteLocalVars(condStr, localVars)
+	condVal, err := e.evaluateExprWithVars(condResolved, map[string]interface{}{})
+	if err != nil {
+		return false, nil, err
+	}
+
+	// Build a temporary context for the block execution that shares the same state
+	blockCtx := &routineContext{
+		localVars:          localVars,
+		cursors:            cursors,
+		cursorDefs:         cursorDefs,
+		notFoundHandlerVar: notFoundHandlerVar,
+		done:               *done,
+	}
+
+	if isTruthy(condVal) {
+		stmts := splitTriggerBody(thenBody)
+		retVal, err := e.execRoutineBodyWithContext(stmts, blockCtx)
+		if err != nil {
+			return false, nil, err
+		}
+		return true, retVal, nil
+	} else if hasElse {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(elseBody)), "IF ") {
+			// ELSEIF case: wrap in IF...END IF and recurse
+			ifBlock := strings.TrimSpace(elseBody)
+			if !strings.HasSuffix(strings.ToUpper(strings.TrimSpace(ifBlock)), "END IF") {
+				ifBlock += "\nEND IF"
+			}
+			return e.execIfBlock(ifBlock, localVars, cursors, cursorDefs, notFoundHandlerVar, done)
+		}
+		stmts := splitTriggerBody(elseBody)
+		retVal, err := e.execRoutineBodyWithContext(stmts, blockCtx)
+		if err != nil {
+			return false, nil, err
+		}
+		return true, retVal, nil
+	}
+
+	return false, nil, nil
+}
+
+// findTopLevelKeyword finds a keyword at the top level (not inside nested IF/END IF blocks).
+func findTopLevelKeyword(s, keyword string) int {
+	upper := strings.ToUpper(s)
+	return strings.Index(upper, keyword)
+}
+
+// splitAtTopLevelElse splits body at the top-level ELSE keyword, respecting nested IF blocks.
+func splitAtTopLevelElse(body string) (thenBody, elseBody string, hasElse bool) {
+	upper := strings.ToUpper(body)
+	depth := 0
+
+	for i := 0; i < len(upper); i++ {
+		// Track IF nesting
+		if i+3 <= len(upper) && upper[i:i+3] == "IF " {
+			if i == 0 || !isAlphaNum(body[i-1]) {
+				// Make sure it's not ELSEIF or END IF
+				if i < 4 || upper[i-4:i] != "END " {
+					if i < 4 || !strings.HasSuffix(upper[:i], "ELSE") {
+						depth++
+					}
+				}
+			}
+		}
+		if i+6 <= len(upper) && upper[i:i+6] == "END IF" {
+			if i == 0 || !isAlphaNum(body[i-1]) {
+				depth--
+			}
+		}
+
+		// Look for ELSE at depth 0
+		if depth == 0 && i+4 <= len(upper) && upper[i:i+4] == "ELSE" {
+			if (i == 0 || !isAlphaNum(body[i-1])) && (i+4 >= len(upper) || !isAlphaNum(body[i+4])) {
+				// Make sure it's not ELSEIF
+				if i+6 <= len(upper) && upper[i:i+6] == "ELSEIF" {
+					// It's ELSEIF - treat as ELSE + IF
+					thenBody = strings.TrimSpace(body[:i])
+					elseBody = strings.TrimSpace(body[i+4:]) // skip ELSE, leave IF
+					return thenBody, elseBody, true
+				}
+				thenBody = strings.TrimSpace(body[:i])
+				elseBody = strings.TrimSpace(body[i+4:]) // skip "ELSE"
+				return thenBody, elseBody, true
+			}
+		}
+	}
+
+	return body, "", false
+}
+
+// execRepeatBlockCtx executes a REPEAT block with shared routine context.
+func (e *Executor) execRepeatBlockCtx(block string, ctx *routineContext) (interface{}, error) {
+	return e.execRepeatBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done)
+}
+
+// execRepeatBlock executes a REPEAT...UNTIL...END REPEAT block.
+func (e *Executor) execRepeatBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool) (interface{}, error) {
+	upper := strings.ToUpper(strings.TrimSpace(block))
+
+	// Remove REPEAT prefix and END REPEAT suffix
+	bodyStr := strings.TrimSpace(block)
+	if strings.HasPrefix(upper, "REPEAT") {
+		bodyStr = strings.TrimSpace(bodyStr[len("REPEAT"):])
+	}
+
+	// Find UNTIL ... END REPEAT
+	bodyUpper := strings.ToUpper(bodyStr)
+	untilIdx := strings.LastIndex(bodyUpper, "UNTIL ")
+	if untilIdx < 0 {
+		return nil, fmt.Errorf("REPEAT without UNTIL")
+	}
+
+	loopBody := strings.TrimSpace(bodyStr[:untilIdx])
+	afterUntil := strings.TrimSpace(bodyStr[untilIdx+len("UNTIL "):])
+	// Remove trailing END REPEAT
+	endRepeatIdx := strings.LastIndex(strings.ToUpper(afterUntil), "END REPEAT")
+	condStr := afterUntil
+	if endRepeatIdx >= 0 {
+		condStr = strings.TrimSpace(afterUntil[:endRepeatIdx])
+	}
+
+	blockCtx := &routineContext{
+		localVars:          localVars,
+		cursors:            cursors,
+		cursorDefs:         cursorDefs,
+		notFoundHandlerVar: notFoundHandlerVar,
+		done:               *done,
+	}
+	for iterations := 0; iterations < 10000; iterations++ {
+		// Execute loop body
+		stmts := splitTriggerBody(loopBody)
+		retVal, err := e.execRoutineBodyWithContext(stmts, blockCtx)
+		if err != nil {
+			// LEAVE/ITERATE propagate up to the caller
+			return nil, err
+		}
+		if retVal != nil {
+			return retVal, nil
+		}
+
+		// Evaluate UNTIL condition
+		condResolved := e.substituteLocalVars(condStr, localVars)
+		condVal, err := e.evaluateExprWithVars(condResolved, map[string]interface{}{})
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(condVal) {
+			break
+		}
+	}
+
+	return nil, nil
+}
+
+// execWhileBlockCtx executes a WHILE block with shared routine context.
+func (e *Executor) execWhileBlockCtx(block string, ctx *routineContext) (interface{}, error) {
+	return e.execWhileBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done)
+}
+
+// execWhileBlock executes a WHILE...DO...END WHILE block.
+func (e *Executor) execWhileBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool) (interface{}, error) {
+	upper := strings.ToUpper(strings.TrimSpace(block))
+
+	bodyStr := strings.TrimSpace(block)
+	if strings.HasPrefix(upper, "WHILE ") {
+		bodyStr = strings.TrimSpace(bodyStr[len("WHILE "):])
+	}
+
+	// Find DO keyword
+	doIdx := strings.Index(strings.ToUpper(bodyStr), " DO")
+	if doIdx < 0 {
+		return nil, fmt.Errorf("WHILE without DO")
+	}
+	condStr := strings.TrimSpace(bodyStr[:doIdx])
+	afterDo := strings.TrimSpace(bodyStr[doIdx+len(" DO"):])
+
+	// Remove trailing END WHILE
+	bodyUpper := strings.ToUpper(afterDo)
+	endWhileIdx := strings.LastIndex(bodyUpper, "END WHILE")
+	loopBody := afterDo
+	if endWhileIdx >= 0 {
+		loopBody = strings.TrimSpace(afterDo[:endWhileIdx])
+	}
+
+	blockCtx := &routineContext{
+		localVars:          localVars,
+		cursors:            cursors,
+		cursorDefs:         cursorDefs,
+		notFoundHandlerVar: notFoundHandlerVar,
+		done:               *done,
+	}
+	for iterations := 0; iterations < 10000; iterations++ {
+		// Evaluate condition
+		condResolved := e.substituteLocalVars(condStr, localVars)
+		condVal, err := e.evaluateExprWithVars(condResolved, map[string]interface{}{})
+		if err != nil {
+			return nil, err
+		}
+		if !isTruthy(condVal) {
+			break
+		}
+
+		// Execute loop body
+		stmts := splitTriggerBody(loopBody)
+		retVal, err := e.execRoutineBodyWithContext(stmts, blockCtx)
+		if err != nil {
+			return nil, err
+		}
+		if retVal != nil {
+			return retVal, nil
+		}
+	}
+
+	return nil, nil
+}
+
+// execLoopBlockCtx executes a LOOP...END LOOP block with optional LEAVE label.
+func (e *Executor) execLoopBlockCtx(block string, label string, ctx *routineContext) (interface{}, error) {
+	upper := strings.ToUpper(strings.TrimSpace(block))
+	bodyStr := strings.TrimSpace(block)
+
+	// Remove LOOP prefix
+	if strings.HasPrefix(upper, "LOOP") {
+		bodyStr = strings.TrimSpace(bodyStr[len("LOOP"):])
+	}
+
+	// Remove trailing END LOOP [label]
+	bodyUpper := strings.ToUpper(bodyStr)
+	endSuffix := "END LOOP"
+	if label != "" {
+		endWithLabel := "END LOOP " + strings.ToUpper(label)
+		if idx := strings.LastIndex(bodyUpper, endWithLabel); idx >= 0 {
+			bodyStr = strings.TrimSpace(bodyStr[:idx])
+		} else if idx := strings.LastIndex(bodyUpper, endSuffix); idx >= 0 {
+			bodyStr = strings.TrimSpace(bodyStr[:idx])
+		}
+	} else if idx := strings.LastIndex(bodyUpper, endSuffix); idx >= 0 {
+		bodyStr = strings.TrimSpace(bodyStr[:idx])
+	}
+	bodyStr = strings.TrimRight(bodyStr, ";")
+
+	blockCtx := &routineContext{
+		localVars:          ctx.localVars,
+		cursors:            ctx.cursors,
+		cursorDefs:         ctx.cursorDefs,
+		notFoundHandlerVar: ctx.notFoundHandlerVar,
+		done:               ctx.done,
+	}
+
+	for iterations := 0; iterations < 10000; iterations++ {
+		stmts := splitTriggerBody(bodyStr)
+		retVal, err := e.execRoutineBodyWithContext(stmts, blockCtx)
+		if err != nil {
+			// Handle LEAVE for this loop
+			var le *leaveError
+			if errors.As(err, &le) {
+				if label == "" || strings.EqualFold(le.label, label) {
+					return nil, nil // exit the loop
+				}
+				return nil, err // propagate to outer block
+			}
+			// Handle ITERATE for this loop
+			var ie *iterateError
+			if errors.As(err, &ie) {
+				if label == "" || strings.EqualFold(ie.label, label) {
+					continue // restart loop iteration
+				}
+				return nil, err // propagate to outer block
+			}
+			return nil, err
+		}
+		if retVal != nil {
+			return retVal, nil
+		}
+	}
+	return nil, nil
+}
+
+// execWhileBlockWithLabel executes a labeled WHILE block, supporting LEAVE/ITERATE.
+func (e *Executor) execWhileBlockWithLabel(block string, label string, ctx *routineContext) (interface{}, error) {
+	upper := strings.ToUpper(strings.TrimSpace(block))
+	bodyStr := strings.TrimSpace(block)
+	if strings.HasPrefix(upper, "WHILE ") {
+		bodyStr = strings.TrimSpace(bodyStr[len("WHILE "):])
+	}
+
+	doIdx := strings.Index(strings.ToUpper(bodyStr), " DO")
+	if doIdx < 0 {
+		return nil, fmt.Errorf("WHILE without DO")
+	}
+	condStr := strings.TrimSpace(bodyStr[:doIdx])
+	afterDo := strings.TrimSpace(bodyStr[doIdx+len(" DO"):])
+
+	// Remove trailing END WHILE [label]
+	bodyUpper := strings.ToUpper(afterDo)
+	endSuffix := "END WHILE"
+	if label != "" {
+		endWithLabel := "END WHILE " + strings.ToUpper(label)
+		if idx := strings.LastIndex(bodyUpper, endWithLabel); idx >= 0 {
+			afterDo = strings.TrimSpace(afterDo[:idx])
+		} else if idx := strings.LastIndex(bodyUpper, endSuffix); idx >= 0 {
+			afterDo = strings.TrimSpace(afterDo[:idx])
+		}
+	} else if idx := strings.LastIndex(bodyUpper, endSuffix); idx >= 0 {
+		afterDo = strings.TrimSpace(afterDo[:idx])
+	}
+
+	blockCtx := &routineContext{
+		localVars:          ctx.localVars,
+		cursors:            ctx.cursors,
+		cursorDefs:         ctx.cursorDefs,
+		notFoundHandlerVar: ctx.notFoundHandlerVar,
+		done:               ctx.done,
+	}
+
+	for iterations := 0; iterations < 10000; iterations++ {
+		condResolved := e.substituteLocalVars(condStr, ctx.localVars)
+		condVal, err := e.evaluateExprWithVars(condResolved, map[string]interface{}{})
+		if err != nil {
+			return nil, err
+		}
+		if !isTruthy(condVal) {
+			break
+		}
+
+		stmts := splitTriggerBody(afterDo)
+		retVal, err := e.execRoutineBodyWithContext(stmts, blockCtx)
+		if err != nil {
+			var le *leaveError
+			if errors.As(err, &le) && strings.EqualFold(le.label, label) {
+				return nil, nil
+			}
+			var ie *iterateError
+			if errors.As(err, &ie) && strings.EqualFold(ie.label, label) {
+				continue
+			}
+			return nil, err
+		}
+		if retVal != nil {
+			return retVal, nil
+		}
+	}
+	return nil, nil
+}
+
+// execRepeatBlockWithLabel executes a labeled REPEAT block, supporting LEAVE/ITERATE.
+func (e *Executor) execRepeatBlockWithLabel(block string, label string, ctx *routineContext) (interface{}, error) {
+	upper := strings.ToUpper(strings.TrimSpace(block))
+	bodyStr := strings.TrimSpace(block)
+	if strings.HasPrefix(upper, "REPEAT") {
+		bodyStr = strings.TrimSpace(bodyStr[len("REPEAT"):])
+	}
+
+	bodyUpper := strings.ToUpper(bodyStr)
+	untilIdx := strings.LastIndex(bodyUpper, "UNTIL ")
+	if untilIdx < 0 {
+		return nil, fmt.Errorf("REPEAT without UNTIL")
+	}
+
+	loopBody := strings.TrimSpace(bodyStr[:untilIdx])
+	afterUntil := strings.TrimSpace(bodyStr[untilIdx+len("UNTIL "):])
+	endRepeatIdx := strings.LastIndex(strings.ToUpper(afterUntil), "END REPEAT")
+	condStr := afterUntil
+	if endRepeatIdx >= 0 {
+		condStr = strings.TrimSpace(afterUntil[:endRepeatIdx])
+	}
+
+	blockCtx := &routineContext{
+		localVars:          ctx.localVars,
+		cursors:            ctx.cursors,
+		cursorDefs:         ctx.cursorDefs,
+		notFoundHandlerVar: ctx.notFoundHandlerVar,
+		done:               ctx.done,
+	}
+
+	for iterations := 0; iterations < 10000; iterations++ {
+		stmts := splitTriggerBody(loopBody)
+		retVal, err := e.execRoutineBodyWithContext(stmts, blockCtx)
+		if err != nil {
+			var le *leaveError
+			if errors.As(err, &le) && strings.EqualFold(le.label, label) {
+				return nil, nil
+			}
+			var ie *iterateError
+			if errors.As(err, &ie) && strings.EqualFold(ie.label, label) {
+				goto checkCond
+			}
+			return nil, err
+		}
+		if retVal != nil {
+			return retVal, nil
+		}
+	checkCond:
+		condResolved := e.substituteLocalVars(condStr, ctx.localVars)
+		condVal, err := e.evaluateExprWithVars(condResolved, map[string]interface{}{})
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(condVal) {
+			break
+		}
+	}
+	return nil, nil
+}
