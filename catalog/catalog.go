@@ -244,8 +244,12 @@ func (c *Catalog) CreateDatabase(name string) error {
 func (c *Catalog) CreateDatabaseWithCharset(name, charset, collation string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, exists := c.Databases[name]; exists {
-		return fmt.Errorf("database '%s' already exists", name)
+	// Case-insensitive duplicate check (MySQL treats DB names case-insensitively)
+	lower := strings.ToLower(name)
+	for k := range c.Databases {
+		if strings.ToLower(k) == lower {
+			return fmt.Errorf("database '%s' already exists", name)
+		}
 	}
 	if charset == "" {
 		charset = "utf8mb4"

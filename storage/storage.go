@@ -183,8 +183,6 @@ func (e *Engine) DropDatabase(name string) {
 	actualName, _, ok := e.resolveDBName(name)
 	if ok {
 		delete(e.databases, actualName)
-	} else {
-		delete(e.databases, name)
 	}
 }
 
@@ -900,7 +898,7 @@ type DatabaseSnapshot struct {
 // Returns nil if the database does not exist.
 func (e *Engine) SnapshotDatabase(dbName string) *DatabaseSnapshot {
 	e.mu.RLock()
-	db, ok := e.databases[dbName]
+	_, db, ok := e.resolveDBName(dbName)
 	e.mu.RUnlock()
 	if !ok {
 		return nil
@@ -977,6 +975,11 @@ func (e *Engine) RestoreDatabase(dbName string, snap *DatabaseSnapshot) {
 	}
 
 	e.mu.Lock()
+	// Resolve the actual database key (case-insensitive).
+	actualName, _, resolveOK := e.resolveDBName(dbName)
+	if !resolveOK {
+		actualName = dbName
+	}
 	// Replace the entire table map with restored tables.
 	restored := make(map[string]*Table, len(snap.Tables))
 	for name, ts := range snap.Tables {
@@ -991,6 +994,6 @@ func (e *Engine) RestoreDatabase(dbName string, snap *DatabaseSnapshot) {
 		t.AutoIncrement.Store(ts.AutoIncrement)
 		restored[name] = t
 	}
-	e.databases[dbName] = restored
+	e.databases[actualName] = restored
 	e.mu.Unlock()
 }
