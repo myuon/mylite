@@ -161,6 +161,14 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 			continue
 		}
 		p, f, s, e, t := countResults(results)
+		for _, r := range results {
+			if r.Error != "" {
+				fmt.Printf("  ERROR: %s: %s\n", r.Name, r.Error[:min(len(r.Error), 200)])
+			}
+			if !r.Passed && !r.Skipped && !r.Timeout && r.Error == "" {
+				fmt.Printf("  FAIL: %s\n", r.Name)
+			}
+		}
 		printSuiteSummaryCompact(sn, len(results), p, f, s, e, t, 0)
 		totalPassed += p
 		totalFailed += f
