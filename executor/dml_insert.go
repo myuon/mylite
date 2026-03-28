@@ -1092,10 +1092,21 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						}
 						allowedCount := len(splitEnumValues(enumInner))
 
-						if sv, ok := rv.(string); ok {
+						sv, isStr := rv.(string)
+						if !isStr {
+							if ev, isEnum := rv.(EnumValue); isEnum {
+								sv = string(ev)
+								isStr = true
+							}
+						}
+						if isStr {
 							origStr := ""
 							if ov, ok2 := origValues[col.Name]; ok2 {
-								origStr, _ = ov.(string)
+								if os, ok3 := ov.(string); ok3 {
+									origStr = os
+								} else if oev, ok3 := ov.(EnumValue); ok3 {
+									origStr = string(oev)
+								}
 							}
 							// ENUM: empty string is invalid (not in the allowed list)
 							if isEnumType && sv == "" {

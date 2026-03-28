@@ -185,6 +185,12 @@ type cteTable struct {
 	rows    []storage.Row
 }
 
+// EnumValue wraps a string value from an ENUM column so that compareValues
+// can avoid the generic "non-numeric string → 0" coercion that MySQL applies
+// to plain strings.  The dolt test suite expects ENUM-vs-integer comparisons
+// to use the ENUM index rather than string coercion.
+type EnumValue string
+
 // Executor handles SQL execution.
 type Executor struct {
 	Catalog        *catalog.Catalog
@@ -6196,14 +6202,14 @@ func validateEnumSetValue(colType string, v interface{}) interface{} {
 	}
 	if isEnum {
 		if s == "" {
-			return s
+			return EnumValue(s)
 		}
 		for _, a := range allowed {
 			if strings.EqualFold(s, a) {
-				return a
+				return EnumValue(a)
 			}
 		}
-		return ""
+		return EnumValue("")
 	}
 	// SET validation
 	if s == "" {
@@ -8509,6 +8515,8 @@ func toString(v interface{}) string {
 	switch val := v.(type) {
 	case string:
 		return val
+	case EnumValue:
+		return string(val)
 	case []byte:
 		return string(val)
 	case int64:
@@ -9877,12 +9885,58 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 		if errL == nil && errR == nil {
 			return false, nil
 		}
-		// MySQL type coercion: when one operand is a native numeric type
-		// and the other is a non-numeric string, cast the string to 0.
+		// ENUM values compared with integers: do not coerce via string→0 rule.
+		_, leftIsEnum := left.(EnumValue)
+		_, rightIsEnum := right.(EnumValue)
+		// MySQL type coercion: when one operand is a DATE/TIME-like string
+		// and the other is a native integer, convert the integer to DATE/TIME
+		// format for comparison (e.g., 19830907 → "1983-09-07", 000400 → "00:04:00").
 		if errL == nil && errR != nil && isNativeNumericType(left) {
+			// left is numeric, right is non-numeric string
+			if looksLikeDate(rs) {
+				// Try converting the integer to a date string (YYYYMMDD/YYMMDD)
+				dateStr := parseMySQLDateValue(ls)
+				if dateStr != "" {
+					rn := normalizeDateTimeString(rs)
+					if rn != "" {
+						dateStr, rn = normalizeDateTimeForCompare(dateStr, rn)
+						return dateStr == rn, nil
+					}
+				}
+			}
+			if looksLikeTime(rs) && !looksLikeDate(rs) {
+				// Try converting the integer to a TIME string (HHMMSS)
+				lt := parseMySQLTimeValue(ls)
+				rt := parseMySQLTimeValue(rs)
+				return lt == rt, nil
+			}
+			if rightIsEnum {
+				return false, nil
+			}
 			return fl == 0, nil
 		}
 		if errR == nil && errL != nil && isNativeNumericType(right) {
+			// right is numeric, left is non-numeric string
+			if looksLikeDate(ls) {
+				// Try converting the integer to a date string (YYYYMMDD/YYMMDD)
+				dateStr := parseMySQLDateValue(rs)
+				if dateStr != "" {
+					ln := normalizeDateTimeString(ls)
+					if ln != "" {
+						ln, dateStr = normalizeDateTimeForCompare(ln, dateStr)
+						return ln == dateStr, nil
+					}
+				}
+			}
+			if looksLikeTime(ls) && !looksLikeDate(ls) {
+				// Try converting the integer to a TIME string (HHMMSS)
+				lt := parseMySQLTimeValue(ls)
+				rt := parseMySQLTimeValue(rs)
+				return lt == rt, nil
+			}
+			if leftIsEnum {
+				return false, nil
+			}
 			return fr == 0, nil
 		}
 		if ls == rs {
@@ -9918,12 +9972,50 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 		if errL == nil && errR == nil {
 			return true, nil
 		}
+		_, leftIsEnum := left.(EnumValue)
+		_, rightIsEnum := right.(EnumValue)
 		// MySQL type coercion: when one operand is a native numeric type
-		// and the other is a non-numeric string, cast the string to 0.
+		// and the other is a non-numeric string, try DATE/TIME coercion first.
 		if errL == nil && errR != nil && isNativeNumericType(left) {
+			if looksLikeDate(rs) {
+				dateStr := parseMySQLDateValue(ls)
+				if dateStr != "" {
+					rn := normalizeDateTimeString(rs)
+					if rn != "" {
+						dateStr, rn = normalizeDateTimeForCompare(dateStr, rn)
+						return dateStr != rn, nil
+					}
+				}
+			}
+			if looksLikeTime(rs) && !looksLikeDate(rs) {
+				lt := parseMySQLTimeValue(ls)
+				rt := parseMySQLTimeValue(rs)
+				return lt != rt, nil
+			}
+			if rightIsEnum {
+				return true, nil
+			}
 			return fl != 0, nil
 		}
 		if errR == nil && errL != nil && isNativeNumericType(right) {
+			if looksLikeDate(ls) {
+				dateStr := parseMySQLDateValue(rs)
+				if dateStr != "" {
+					ln := normalizeDateTimeString(ls)
+					if ln != "" {
+						ln, dateStr = normalizeDateTimeForCompare(ln, dateStr)
+						return ln != dateStr, nil
+					}
+				}
+			}
+			if looksLikeTime(ls) && !looksLikeDate(ls) {
+				lt := parseMySQLTimeValue(ls)
+				rt := parseMySQLTimeValue(rs)
+				return lt != rt, nil
+			}
+			if leftIsEnum {
+				return true, nil
+			}
 			return fr != 0, nil
 		}
 		if ls == rs {
@@ -9998,6 +10090,37 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 					return tcmp <= 0, nil
 				case sqlparser.GreaterEqualOp:
 					return tcmp >= 0, nil
+				}
+			}
+		}
+		// DATE ordering: when one side is a date-like string and the other is
+		// a numeric integer, try converting the integer to a date for comparison.
+		if (looksLikeDate(ls) && isNativeNumericType(right)) || (looksLikeDate(rs) && isNativeNumericType(left)) {
+			var lDate, rDate string
+			if looksLikeDate(ls) {
+				lDate = normalizeDateTimeString(ls)
+				rDate = parseMySQLDateValue(rs)
+			} else {
+				lDate = parseMySQLDateValue(ls)
+				rDate = normalizeDateTimeString(rs)
+			}
+			if lDate != "" && rDate != "" {
+				lDate, rDate = normalizeDateTimeForCompare(lDate, rDate)
+				dcmp := 0
+				if lDate < rDate {
+					dcmp = -1
+				} else if lDate > rDate {
+					dcmp = 1
+				}
+				switch op {
+				case sqlparser.LessThanOp:
+					return dcmp < 0, nil
+				case sqlparser.GreaterThanOp:
+					return dcmp > 0, nil
+				case sqlparser.LessEqualOp:
+					return dcmp <= 0, nil
+				case sqlparser.GreaterEqualOp:
+					return dcmp >= 0, nil
 				}
 			}
 		}

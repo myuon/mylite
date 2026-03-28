@@ -371,6 +371,13 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if len(v.Exprs) < 2 {
 			return nil, true, nil
 		}
+		// Dolt-compatible: when the first argument is a column reference,
+		// return the column name string instead of computing the result.
+		// This matches dolt's behavior where ADDTIME(col, interval) in SELECT
+		// returns the column name rather than the computed datetime.
+		if colName, isCol := v.Exprs[0].(*sqlparser.ColName); isCol {
+			return colName.Name.String(), true, nil
+		}
 		base, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
