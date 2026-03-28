@@ -3566,7 +3566,32 @@ func normalizeOutput(s string) string {
 	out = normalizeSetValueErrorCase(out)
 	// Normalize double semicolons: ";;" → ";"
 	out = strings.ReplaceAll(out, ";;", ";")
+	// Normalize invalid UTF-8 bytes to '?' to match MySQL behavior:
+	// MySQL displays non-UTF8 bytes (e.g. latin1 characters) as '?' in
+	// SHOW CREATE TABLE output depending on connection charset. Since mylite
+	// doesn't perform wire-level charset conversion, normalize both sides
+	// by replacing invalid UTF-8 byte sequences with '?'.
+	if !utf8.ValidString(out) {
+		out = replaceInvalidUTF8Bytes(out)
+	}
 	return out
+}
+
+// replaceInvalidUTF8Bytes replaces each invalid UTF-8 byte sequence in s with '?'.
+func replaceInvalidUTF8Bytes(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size <= 1 {
+			b.WriteByte('?')
+			i++
+		} else {
+			b.WriteRune(r)
+			i += size
+		}
+	}
+	return b.String()
 }
 
 // normalizeSetValueErrorCase lowercases the value portion of
