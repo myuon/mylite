@@ -679,6 +679,8 @@ var sysVarReadOnly = map[string]bool{
 	"ft_stopword_file": true, "innodb_autoinc_lock_mode": true,
 	"innodb_buffer_pool_instances": true, "innodb_doublewrite_dir": true,
 	"innodb_doublewrite_files": true, "innodb_doublewrite_pages": true,
+	"innodb_adaptive_hash_index_parts": true,
+	"innodb_api_disable_rowlock": true, "innodb_api_enable_binlog": true, "innodb_api_enable_mdl": true,
 	"innodb_force_load_corrupted": true, "innodb_ft_cache_size": true,
 	"innodb_ft_max_token_size": true, "innodb_ft_min_token_size": true,
 	"innodb_ft_sort_pll_degree": true, "innodb_ft_total_cache_size": true,
@@ -700,7 +702,7 @@ var sysVarReadOnly = map[string]bool{
 	"mysqlx_ssl_ca": true, "mysqlx_ssl_capath": true, "mysqlx_ssl_cert": true,
 	"mysqlx_ssl_cipher": true, "mysqlx_ssl_key": true,
 	"mysqlx_ssl_crl": true, "mysqlx_ssl_crlpath": true,
-	"mysqlx_socket": true, "mysqlx_bind_address": true,
+	"mysqlx_socket": true, "mysqlx_bind_address": true, "mysqlx_port_open_timeout": true,
 	"auto_generate_certs":                          true,
 	"sha256_password_auto_generate_rsa_keys":       true,
 	"caching_sha2_password_auto_generate_rsa_keys": true,
@@ -1351,6 +1353,7 @@ var sysVarBoolean = map[string]bool{
 	"temptable_use_mmap": true, "sql_log_off": true,
 	"innodb_doublewrite":      true,
 	"automatic_sp_privileges": true,
+	"mysqlx_enable_hello_notice": true,
 }
 
 func isBooleanVariable(name string) bool {

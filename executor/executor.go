@@ -9689,6 +9689,17 @@ func normalizeYearComparisonTypedStringOnly(ls, rs string, origLeft, origRight i
 	return ls, rs
 }
 
+// isNativeNumericType returns true if the value is a Go numeric type (int64, uint64, float64).
+// Used for MySQL-compatible type coercion: when comparing a number with a non-numeric string,
+// the string is cast to 0.
+func isNativeNumericType(v interface{}) bool {
+	switch v.(type) {
+	case int64, uint64, float64, int, int32, float32:
+		return true
+	}
+	return false
+}
+
 func numericEqualForComparison(ls, rs string, origLeft, origRight interface{}) bool {
 	if li, okL := parseStrictBigInt(ls); okL {
 		if ri, okR := parseStrictBigInt(rs); okR {
@@ -9861,10 +9872,18 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 		if numericEqualForComparison(ls, rs, left, right) {
 			return true, nil
 		}
-		if _, errL := strconv.ParseFloat(ls, 64); errL == nil {
-			if _, errR := strconv.ParseFloat(rs, 64); errR == nil {
-				return false, nil
-			}
+		fl, errL := strconv.ParseFloat(ls, 64)
+		fr, errR := strconv.ParseFloat(rs, 64)
+		if errL == nil && errR == nil {
+			return false, nil
+		}
+		// MySQL type coercion: when one operand is a native numeric type
+		// and the other is a non-numeric string, cast the string to 0.
+		if errL == nil && errR != nil && isNativeNumericType(left) {
+			return fl == 0, nil
+		}
+		if errR == nil && errL != nil && isNativeNumericType(right) {
+			return fr == 0, nil
 		}
 		if ls == rs {
 			return true, nil
@@ -9894,10 +9913,18 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 		if numericEqualForComparison(ls, rs, left, right) {
 			return false, nil
 		}
-		if _, errL := strconv.ParseFloat(ls, 64); errL == nil {
-			if _, errR := strconv.ParseFloat(rs, 64); errR == nil {
-				return true, nil
-			}
+		fl, errL := strconv.ParseFloat(ls, 64)
+		fr, errR := strconv.ParseFloat(rs, 64)
+		if errL == nil && errR == nil {
+			return true, nil
+		}
+		// MySQL type coercion: when one operand is a native numeric type
+		// and the other is a non-numeric string, cast the string to 0.
+		if errL == nil && errR != nil && isNativeNumericType(left) {
+			return fl != 0, nil
+		}
+		if errR == nil && errL != nil && isNativeNumericType(right) {
+			return fr != 0, nil
 		}
 		if ls == rs {
 			return false, nil
