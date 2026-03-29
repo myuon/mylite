@@ -233,10 +233,6 @@ type Executor struct {
 	globalScopeVars map[string]string
 	// sessionScopeVars stores SET SESSION/LOCAL variable overrides.
 	sessionScopeVars map[string]string
-	// globalSetThisSession tracks variable names that were SET GLOBAL in
-	// this session. Used to prevent the current session from seeing its
-	// own SET GLOBAL changes through session-scope fallback resolution.
-	globalSetThisSession map[string]bool
 	// startupVars stores variable values set at server startup (e.g., from master.opt).
 	// These are used as default values when SET ... = DEFAULT is used.
 	startupVars map[string]string

@@ -177,24 +177,16 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 	}
 
 	// Check for user-set variables with proper scope resolution.
-	// MySQL resolves @@var (session scope) as: session → global → default.
-	// New sessions inherit global values. However, SET GLOBAL in the current
-	// session should not affect the current session's reads, so we skip the
-	// global fallback for variables that were SET GLOBAL in this session.
 	var gv string
 	var gvOK bool
 	if v.Scope == sqlparser.GlobalScope {
 		gv, gvOK = e.getSysVarGlobal(name)
 	} else {
 		gv, gvOK = e.getSysVarSession(name)
-		if !gvOK {
-			// Fall back to global scope if:
-			// 1. The variable is global-only (no session value exists), OR
-			// 2. The variable has a global override and was NOT SET GLOBAL
-			//    in this session (i.e., it was set before this session started).
-			if sysVarGlobalOnly[name] || !e.globalSetThisSession[name] {
-				gv, gvOK = e.getSysVarGlobal(name)
-			}
+		// For global-only variables accessed without explicit scope,
+		// fall back to global scope since they have no session value.
+		if !gvOK && sysVarGlobalOnly[name] {
+			gv, gvOK = e.getSysVarGlobal(name)
 		}
 	}
 	if gvOK {
