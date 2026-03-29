@@ -12090,15 +12090,47 @@ func (e *Executor) evalMatchExpr(v *sqlparser.MatchExpr) (interface{}, error) {
 		return nil, err
 	}
 
-	// 1. Collect text from the MATCH columns in the current row
+	// 1. Collect text from the FULLTEXT index columns (not the MATCH columns).
+	// MySQL uses all columns from the matching FULLTEXT index, regardless of
+	// what columns are specified in MATCH(). This handles cases like MATCH(c,c)
+	// which should use the (b,c) FULLTEXT index and search both columns.
+	ftCols := e.resolveFulltextIndexColumns(v)
 	var docParts []string
-	for _, col := range v.Columns {
-		val, err := e.evalExpr(col)
-		if err != nil {
-			return float64(0), nil
+	if len(ftCols) > 0 {
+		seen := make(map[string]bool)
+		for _, colName := range ftCols {
+			if seen[colName] {
+				continue
+			}
+			seen[colName] = true
+			col := &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(colName)}
+			if len(v.Columns) > 0 && !v.Columns[0].Qualifier.IsEmpty() {
+				col.Qualifier = v.Columns[0].Qualifier
+			}
+			val, err := e.evalExpr(col)
+			if err != nil {
+				continue
+			}
+			if val != nil {
+				docParts = append(docParts, toString(val))
+			}
 		}
-		if val != nil {
-			docParts = append(docParts, toString(val))
+	} else {
+		// Fallback: use MATCH columns directly (deduplicated)
+		seen := make(map[string]bool)
+		for _, col := range v.Columns {
+			colKey := strings.ToLower(col.Name.String())
+			if seen[colKey] {
+				continue
+			}
+			seen[colKey] = true
+			val, err := e.evalExpr(col)
+			if err != nil {
+				continue
+			}
+			if val != nil {
+				docParts = append(docParts, toString(val))
+			}
 		}
 	}
 	docText := strings.Join(docParts, " ")
@@ -12123,6 +12155,69 @@ func (e *Executor) evalMatchExpr(v *sqlparser.MatchExpr) (interface{}, error) {
 		// Natural language mode (also covers NoOption, QueryExpansionOpt, NaturalLanguageModeWithQueryExpansionOpt)
 		return ftsEvalNaturalLanguage(docText, searchStr, minTokenSize), nil
 	}
+}
+
+// resolveFulltextIndexColumns finds the FULLTEXT index that matches the MATCH
+// expression and returns its column names. Returns nil if no index is found.
+func (e *Executor) resolveFulltextIndexColumns(v *sqlparser.MatchExpr) []string {
+	if e.CurrentDB == "" || e.Catalog == nil || len(v.Columns) == 0 {
+		return nil
+	}
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil || db == nil {
+		return nil
+	}
+
+	matchSet := make(map[string]bool)
+	for _, col := range v.Columns {
+		matchSet[strings.ToLower(col.Name.String())] = true
+	}
+
+	tableName := ""
+	if !v.Columns[0].Qualifier.IsEmpty() {
+		tableName = v.Columns[0].Qualifier.Name.String()
+	}
+
+	checkTable := func(tblDef *catalog.TableDef) []string {
+		for _, idx := range tblDef.Indexes {
+			if idx.Type != "FULLTEXT" {
+				continue
+			}
+			idxCols := make(map[string]bool)
+			for _, c := range idx.Columns {
+				idxCols[strings.ToLower(stripPrefixLengthFromCol(c))] = true
+			}
+			allFound := true
+			for mc := range matchSet {
+				if !idxCols[mc] {
+					allFound = false
+					break
+				}
+			}
+			if allFound {
+				return idx.Columns
+			}
+		}
+		return nil
+	}
+
+	if tableName != "" {
+		tblDef, _, err := findTableDefCaseInsensitive(db, tableName)
+		if err != nil || tblDef == nil {
+			return nil
+		}
+		return checkTable(tblDef)
+	}
+	for _, name := range db.ListTables() {
+		tblDef, err := db.GetTable(name)
+		if err != nil {
+			continue
+		}
+		if cols := checkTable(tblDef); cols != nil {
+			return cols
+		}
+	}
+	return nil
 }
 
 // ftsEvalNaturalLanguage performs natural-language full-text search.
