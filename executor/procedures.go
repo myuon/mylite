@@ -924,7 +924,21 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 	}
 	db.CreateFunction(funcDef)
 
+	// Check if function name collides with a native function (Warning 1585)
+	lowerName := strings.ToLower(funcName)
+	if nativeFunctions[lowerName] {
+		e.addWarning("Note", 1585, fmt.Sprintf("This function '%s' has the same name as a native function", lowerName))
+	}
+
 	return &Result{}, nil
+}
+
+// nativeFunctions lists MySQL native function names for collision detection (Warning 1585).
+var nativeFunctions = map[string]bool{
+	"ps_current_thread_id": true,
+	"ps_thread_id":         true,
+	"format_bytes":         true,
+	"format_pico_time":     true,
 }
 
 // execDropFunction handles DROP FUNCTION [IF EXISTS] name

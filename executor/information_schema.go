@@ -1966,9 +1966,52 @@ func (e *Executor) perfSchemaThreads() []storage.Row {
 			"RESOURCE_GROUP":      "SYS_default",
 		},
 	}
-	// Add a row for the current user connection
+	// Add rows for all active connections from the process list
+	seenConnIDs := make(map[int64]bool)
+	if e.processList != nil {
+		for _, proc := range e.processList.Snapshot() {
+			cid := proc.ID
+			if cid <= 0 || seenConnIDs[cid] {
+				continue
+			}
+			seenConnIDs[cid] = true
+			instrumented := "YES"
+			if v, ok := e.psThreadInstrumented[cid]; ok {
+				instrumented = v
+			}
+			history := "YES"
+			if v, ok := e.psThreadHistory[cid]; ok {
+				history = v
+			}
+			db := proc.DB
+			if db == "" {
+				db = "test"
+			}
+			rows = append(rows, storage.Row{
+				"THREAD_ID":           cid + 1, // thread_id = connID + 1 by convention
+				"NAME":                "thread/sql/one_connection",
+				"TYPE":                "FOREGROUND",
+				"PROCESSLIST_ID":      cid,
+				"PROCESSLIST_USER":    proc.User,
+				"PROCESSLIST_HOST":    proc.Host,
+				"PROCESSLIST_DB":      db,
+				"PROCESSLIST_COMMAND": proc.Command,
+				"PROCESSLIST_TIME":    int64(0),
+				"PROCESSLIST_STATE":   nil,
+				"PROCESSLIST_INFO":    nil,
+				"PARENT_THREAD_ID":    int64(1),
+				"ROLE":                nil,
+				"INSTRUMENTED":        instrumented,
+				"HISTORY":             history,
+				"CONNECTION_TYPE":     "TCP/IP",
+				"THREAD_OS_ID":        int64(0),
+				"RESOURCE_GROUP":      "USR_default",
+			})
+		}
+	}
+	// Also add the current connection if not already included
 	connID := e.connectionID
-	if connID > 0 {
+	if connID > 0 && !seenConnIDs[connID] {
 		instrumented := "YES"
 		if v, ok := e.psThreadInstrumented[connID]; ok {
 			instrumented = v

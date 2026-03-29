@@ -26,6 +26,45 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	e.subqueryValCache = nil
 	upper := strings.ToUpper(trimmed)
 
+	// Check for PS function parameter count errors before parsing.
+	// Only match unqualified calls (no schema prefix like "test.ps_thread_id").
+	// Strip string literals first to avoid false matches inside strings.
+	if strings.HasPrefix(upper, "SELECT") {
+		stripped := stripStringLiterals(upper)
+		compact := strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "").Replace(stripped)
+		// ps_current_thread_id() takes no arguments
+		if strings.Contains(compact, "PS_CURRENT_THREAD_ID(") {
+			idx := strings.Index(compact, "PS_CURRENT_THREAD_ID(")
+			// Only match if not preceded by '.' (schema-qualified)
+			if idx >= 0 && (idx == 0 || compact[idx-1] != '.') {
+				inner := compact[idx+len("PS_CURRENT_THREAD_ID("):]
+				if closeIdx := strings.Index(inner, ")"); closeIdx > 0 {
+					args := strings.TrimSpace(inner[:closeIdx])
+					if args != "" {
+						return "", nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'ps_current_thread_id'")
+					}
+				}
+			}
+		}
+		// ps_thread_id() requires exactly 1 argument
+		if strings.Contains(compact, "PS_THREAD_ID(") && !strings.Contains(compact, "PS_CURRENT_THREAD_ID(") {
+			idx := strings.Index(compact, "PS_THREAD_ID(")
+			// Only match if not preceded by '.' (schema-qualified)
+			if idx >= 0 && (idx == 0 || compact[idx-1] != '.') {
+				inner := compact[idx+len("PS_THREAD_ID("):]
+				if closeIdx := strings.Index(inner, ")"); closeIdx >= 0 {
+					args := strings.TrimSpace(inner[:closeIdx])
+					if args == "" {
+						return "", nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'ps_thread_id'")
+					}
+					if n := countTopLevelSQLArgs(args); n != 1 {
+						return "", nil, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'ps_thread_id'")
+					}
+				}
+			}
+		}
+	}
+
 	// Only compute compact form for SELECT queries that might contain JSON function checks
 	if strings.HasPrefix(upper, "SELECT") && strings.Contains(upper, "JSON_") {
 		compact := strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "").Replace(upper)
@@ -413,4 +452,41 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	}
 
 	return query, nil, nil
+}
+
+// stripStringLiterals replaces string literal contents with 'X' placeholders
+// to avoid false matches on function names inside string content.
+// The quotes and a placeholder character are preserved so arg counting still works.
+func stripStringLiterals(s string) string {
+	var buf strings.Builder
+	buf.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		if s[i] == '\'' || s[i] == '"' {
+			quote := s[i]
+			buf.WriteByte(quote)
+			buf.WriteByte('X') // placeholder for content
+			i++                // skip opening quote
+			for i < len(s) {
+				if s[i] == '\\' {
+					i += 2 // skip escaped char
+					continue
+				}
+				if s[i] == quote {
+					if i+1 < len(s) && s[i+1] == quote {
+						i += 2 // skip doubled quote
+						continue
+					}
+					buf.WriteByte(quote)
+					i++ // skip closing quote
+					break
+				}
+				i++
+			}
+		} else {
+			buf.WriteByte(s[i])
+			i++
+		}
+	}
+	return buf.String()
 }

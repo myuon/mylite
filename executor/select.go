@@ -2858,24 +2858,43 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			}
 			avgRows = filtered
 		}
-		sum := float64(0)
+		sumRat := new(big.Rat)
 		count := int64(0)
 		maxScale := 0
+		allInt := true
 		for _, row := range avgRows {
 			val, err := evalRowExpr(e.Arg, row)
 			if err != nil {
 				return nil, err
 			}
 			if val != nil {
-				sum += toFloat(val)
 				count++
-				if s, ok := val.(string); ok {
-					if dot := strings.Index(s, "."); dot >= 0 {
-						scale := len(s) - dot - 1
+				switch n := val.(type) {
+				case int64:
+					sumRat.Add(sumRat, new(big.Rat).SetInt64(n))
+				case uint64:
+					sumRat.Add(sumRat, new(big.Rat).SetFrac(new(big.Int).SetUint64(n), big.NewInt(1)))
+				case float64:
+					allInt = false
+					sumRat.Add(sumRat, new(big.Rat).SetFloat64(n))
+				case string:
+					if dot := strings.Index(n, "."); dot >= 0 {
+						scale := len(n) - dot - 1
 						if scale > maxScale {
 							maxScale = scale
 						}
 					}
+					if r, ok := parseDecimalStringToRat(n); ok {
+						sumRat.Add(sumRat, r)
+					} else {
+						allInt = false
+						f := toFloat(val)
+						sumRat.Add(sumRat, new(big.Rat).SetFloat64(f))
+					}
+				default:
+					allInt = false
+					f := toFloat(val)
+					sumRat.Add(sumRat, new(big.Rat).SetFloat64(f))
 				}
 			}
 		}
@@ -2887,9 +2906,10 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		if avgScale < 4 {
 			avgScale = 4
 		}
-		avg := sum / float64(count)
-		formatted := fmt.Sprintf("%.*f", avgScale, avg)
-		// For non-DECIMAL values (maxScale == 0), strip trailing zeros
+		avgRat := new(big.Rat).Quo(sumRat, new(big.Rat).SetInt64(count))
+		formatted := formatRatFixed(avgRat, avgScale)
+		// For non-DECIMAL integer values (maxScale == 0), strip trailing zeros
+		_ = allInt
 		if maxScale == 0 {
 			if dot := strings.Index(formatted, "."); dot >= 0 {
 				minLen := dot + 5 // at least 4 decimal places
@@ -3059,6 +3079,24 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 				JSONDocList: resolvedDocList,
 			}
 			return tmpExec.evalJSONValueMerge(newMerge)
+		}
+	}
+	// Handle PerformanceSchemaFuncExpr wrapping aggregates (e.g., format_bytes(sum(bytes)))
+	if psExpr, ok := expr.(*sqlparser.PerformanceSchemaFuncExpr); ok && psExpr.Argument != nil {
+		if isAggregateExpr(psExpr.Argument) {
+			// Compute the inner aggregate first
+			innerVal, err := evalAggregateExpr(psExpr.Argument, groupRows, repRow)
+			if err != nil {
+				return nil, err
+			}
+			// Build a synthetic row with the aggregate display name as key
+			aggName := aggregateDisplayName(psExpr.Argument)
+			syntheticRow := storage.Row{aggName: innerVal}
+			// Merge with repRow for any other column references
+			for k, v := range repRow {
+				syntheticRow[k] = v
+			}
+			return evalRowExpr(expr, syntheticRow)
 		}
 	}
 	// Non-aggregate: return value from representative row
