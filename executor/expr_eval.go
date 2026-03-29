@@ -39,15 +39,11 @@ func (e *Executor) evalLiteralExpr(v *sqlparser.Literal) (interface{}, error) {
 	case sqlparser.StrVal:
 		return v.Val, nil
 	case sqlparser.HexVal:
-		// x'...' hex literal: decode hex digits to a byte string.
-		// MySQL treats x'...' as a binary string; numeric context conversion
-		// happens via toFloat/evalBinaryExpr.
-		hexStr := v.Val
-		b, err := hex.DecodeString(hexStr)
-		if err == nil {
-			return string(b), nil
-		}
-		return v.Val, nil
+		// x'...' hex literal: return as HexBytes so that string contexts
+		// (CONVERT USING, JSON functions) see the hex-digit string while
+		// numeric contexts (arithmetic, comparison) interpret it as a
+		// big-endian unsigned integer via toFloat/toInt64.
+		return HexBytes(v.Val), nil
 	case sqlparser.HexNum:
 		// 0x878A -> parse as integer
 		s := v.Val

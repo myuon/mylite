@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9261,6 +9262,12 @@ func (e *Executor) evalCaseExpr(v *sqlparser.CaseExpr) (interface{}, error) {
 	return nil, nil
 }
 
+// HexBytes represents a value originating from an x'...' hex literal.
+// In string context it behaves as the hex-digit string (e.g. "e68891"),
+// but toFloat/toInt64 interpret it as a big-endian unsigned integer so
+// arithmetic works correctly (e.g. x'1000000000000000' - 1).
+type HexBytes string
+
 // DivisionResult wraps a float64 that came from the / operator so the display
 // layer can format it with div_precision_increment (default 4) decimal places.
 type DivisionResult float64
@@ -9331,6 +9338,8 @@ func toString(v interface{}) string {
 	switch val := v.(type) {
 	case string:
 		return val
+	case HexBytes:
+		return string(val)
 	case EnumValue:
 		return string(val)
 	case []byte:
@@ -9390,6 +9399,16 @@ func toInt64(v interface{}) int64 {
 		return int64(n)
 	case DivisionResult:
 		return int64(float64(n))
+	case HexBytes:
+		decoded, err := hex.DecodeString(string(n))
+		if err != nil || len(decoded) == 0 {
+			return 0
+		}
+		var val uint64
+		for _, b := range decoded {
+			val = val<<8 | uint64(b)
+		}
+		return int64(val)
 	case string:
 		i, err := strconv.ParseInt(n, 10, 64)
 		if err != nil {
@@ -11488,6 +11507,17 @@ func toFloat(v interface{}) float64 {
 		return n
 	case DivisionResult:
 		return float64(n)
+	case HexBytes:
+		// Interpret hex digits as big-endian unsigned integer.
+		decoded, err := hex.DecodeString(string(n))
+		if err != nil || len(decoded) == 0 {
+			return 0
+		}
+		var val uint64
+		for _, b := range decoded {
+			val = val<<8 | uint64(b)
+		}
+		return float64(val)
 	case string:
 		s := strings.TrimSpace(n)
 		if f, err := strconv.ParseFloat(s, 64); err == nil {
