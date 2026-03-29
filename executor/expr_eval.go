@@ -223,10 +223,10 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 	case "collation_connection":
 		return "utf8mb4_0900_ai_ci", nil
 	case "sql_mode":
-		// For @@global.sql_mode, return the default (empty string), not
+		// For @@global.sql_mode, return the default, not
 		// the session-local e.sqlMode which may have been SET at session level.
 		if v.Scope == sqlparser.GlobalScope {
-			return "", nil
+			return defaultSQLMode, nil
 		}
 		return e.sqlMode, nil
 	case "autocommit":
@@ -270,7 +270,7 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 	case "innodb_redo_log_encrypt":
 		return int64(0), nil
 	case "innodb_flush_method":
-		return "O_DIRECT", nil
+		return "fsync", nil
 	case "innodb_tmpdir":
 		return nil, nil
 	case "innodb_data_file_path":
@@ -1434,26 +1434,37 @@ func (e *Executor) evalPerformanceSchemaFuncExpr(v *sqlparser.PerformanceSchemaF
 		if arg == nil {
 			return nil, nil
 		}
-		// Try to parse the connection ID
-		connIDStr := fmt.Sprintf("%v", arg)
-		connID, parseErr := strconv.ParseInt(connIDStr, 10, 64)
-		if parseErr != nil {
-			// Non-numeric input returns NULL
+		// Convert arg to connection ID
+		connID := int64(0)
+		switch a := arg.(type) {
+		case int64:
+			connID = a
+		case float64:
+			connID = int64(a)
+		case string:
+			n, parseErr := strconv.ParseFloat(a, 64)
+			if parseErr != nil {
+				return nil, nil
+			}
+			connID = int64(n)
+		default:
 			return nil, nil
 		}
-		if connID < 0 {
-			// Negative connection ID returns NULL
+		if connID <= 0 {
 			return nil, nil
 		}
-		// Check if the connection exists in the process list
+		// Check if connID is known: current connection or in process list
+		if connID == e.connectionID {
+			return connID + 1, nil
+		}
 		if e.processList != nil {
 			for _, proc := range e.processList.Snapshot() {
 				if proc.ID == connID {
-					return connID + 1, nil // thread_id = connID + 1
+					return connID + 1, nil
 				}
 			}
 		}
-		// Connection not found
+		// Unknown connection ID -> NULL
 		return nil, nil
 	case sqlparser.FormatBytesType:
 		// format_bytes(count) formats a byte count into a human-readable string.

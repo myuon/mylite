@@ -13,6 +13,8 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
+const defaultSQLMode = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+
 // execSet handles parsed SET statements.
 func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 	for _, expr := range stmt.Exprs {
@@ -62,10 +64,18 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			e.sessionScopeVars["character_set_connection"] = charset
 			e.sessionScopeVars["character_set_results"] = charset
 		case "sql_mode":
-			if strings.ToUpper(val) == "DEFAULT" {
-				e.sqlMode = ""
+			if _, isNull := expr.Expr.(*sqlparser.NullVal); isNull {
+				return nil, mysqlError(1231, "42000", "Variable 'sql_mode' can't be set to the value of 'NULL'")
+			}
+			upperVal := strings.ToUpper(val)
+			// Reject boolean-like values that are not valid SQL modes
+			if upperVal == "OFF" || upperVal == "ON" || upperVal == "TRUE" || upperVal == "FALSE" {
+				return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'sql_mode' can't be set to the value of '%s'", strings.ToLower(val)))
+			}
+			if upperVal == "DEFAULT" {
+				e.sqlMode = defaultSQLMode
 			} else {
-				e.sqlMode = expandSQLMode(strings.ToUpper(val))
+				e.sqlMode = expandSQLMode(upperVal)
 			}
 		case "sql_auto_is_null":
 			e.sqlAutoIsNull = val == "1" || strings.ToUpper(val) == "ON" || strings.ToUpper(val) == "TRUE"
@@ -89,7 +99,25 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				}
 			}
 		case "time_zone":
-			e.parseTimeZone(val)
+			if err := e.parseTimeZone(val); err != nil {
+				return nil, mysqlError(1298, "HY000", err.Error())
+			}
+			// Update session/global scope vars so @@time_zone reads back correctly
+			if e.timeZone != nil {
+				tzStr := e.timeZone.String()
+				// time.FixedZone preserves the original string we passed
+				if scope == sqlparser.GlobalScope {
+					e.globalScopeVars["time_zone"] = tzStr
+				} else {
+					e.sessionScopeVars["time_zone"] = tzStr
+				}
+			} else {
+				if scope == sqlparser.GlobalScope {
+					e.globalScopeVars["time_zone"] = "SYSTEM"
+				} else {
+					delete(e.sessionScopeVars, "time_zone")
+				}
+			}
 		case "insert_id":
 			if n, err := strconv.ParseInt(val, 10, 64); err == nil {
 				e.nextInsertID = n
@@ -443,7 +471,7 @@ func (e *Executor) handleRawSet(raw string) error {
 			// Resolve @user_var and @@system_var references
 			val = e.resolveSystemVarInValue(val)
 			if strings.ToUpper(val) == "DEFAULT" {
-				e.sqlMode = ""
+				e.sqlMode = defaultSQLMode
 			} else {
 				e.sqlMode = strings.ToUpper(val)
 			}
@@ -489,7 +517,7 @@ func (e *Executor) handleRawSet(raw string) error {
 			val = strings.Trim(val, "'\"")
 			val = strings.TrimSuffix(val, ";")
 			val = strings.TrimSpace(val)
-			e.parseTimeZone(val)
+			_ = e.parseTimeZone(val)
 		}
 	}
 	// Detect invalid SET local.X / SET global.X / SET session.X (without @@)
@@ -2024,7 +2052,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"innodb_change_buffer_max_size":            "25",
 		"innodb_flush_log_at_trx_commit":           "1",
 		"innodb_doublewrite":                       "ON",
-		"innodb_flush_method":                      "O_DIRECT",
+		"innodb_flush_method":                      "fsync",
 		"innodb_tmpdir":                            "",
 		"innodb_checksum_algorithm":                "crc32",
 		"innodb_ft_max_token_size":                 "84",

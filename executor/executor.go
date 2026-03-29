@@ -1596,7 +1596,7 @@ func expandSQLMode(mode string) string {
 	case "ANSI":
 		return "REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,ANSI"
 	case "TRADITIONAL":
-		return "STRICT_TRANS_TABLES,STRICT_ALL_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION,TRADITIONAL"
+		return "STRICT_TRANS_TABLES,STRICT_ALL_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,TRADITIONAL,NO_ENGINE_SUBSTITUTION"
 	default:
 		return mode
 	}
@@ -5631,29 +5631,61 @@ func (e *Executor) nowTime() time.Time {
 }
 
 // parseTimeZone parses a time zone string like "+03:00" or "SYSTEM" and sets e.timeZone.
-func (e *Executor) parseTimeZone(val string) {
+func (e *Executor) parseTimeZone(val string) error {
 	val = strings.Trim(val, "'\"")
 	val = strings.TrimSpace(val)
-	if strings.ToUpper(val) == "SYSTEM" || val == "" {
+	if strings.ToUpper(val) == "SYSTEM" || strings.ToUpper(val) == "DEFAULT" || val == "" {
 		e.timeZone = nil
-		return
+		return nil
 	}
-	// Parse offset like "+03:00" or "-05:00"
-	if (val[0] == '+' || val[0] == '-') && len(val) >= 6 {
+	// Parse offset like "+03:00", "-05:00", "+0:0"
+	if (val[0] == '+' || val[0] == '-') && strings.Contains(val, ":") {
 		var hours, mins int
 		if _, err := fmt.Sscanf(val, "%d:%d", &hours, &mins); err == nil {
+			// MySQL valid range: -12:59 to +13:00
+			absHours := hours
+			if absHours < 0 {
+				absHours = -absHours
+			}
+			if mins < 0 || mins >= 60 {
+				return fmt.Errorf("Unknown or incorrect time zone: '%s'", val)
+			}
+			totalMins := absHours*60 + mins
+			if hours >= 0 {
+				// Positive: max +13:00
+				if totalMins > 13*60 {
+					return fmt.Errorf("Unknown or incorrect time zone: '%s'", val)
+				}
+			} else {
+				// Negative: max -12:59
+				if totalMins > 12*60+59 {
+					return fmt.Errorf("Unknown or incorrect time zone: '%s'", val)
+				}
+			}
 			offset := hours*3600 + mins*60
 			if hours < 0 {
 				offset = hours*3600 - mins*60
 			}
-			e.timeZone = time.FixedZone(val, offset)
-			return
+			// Normalize the timezone name: zero-pad and handle -00:00 -> +00:00
+			sign := "+"
+			if offset < 0 {
+				sign = "-"
+			}
+			absOffset := offset
+			if absOffset < 0 {
+				absOffset = -absOffset
+			}
+			normalizedName := fmt.Sprintf("%s%02d:%02d", sign, absOffset/3600, (absOffset%3600)/60)
+			e.timeZone = time.FixedZone(normalizedName, offset)
+			return nil
 		}
 	}
 	// Try as named timezone
 	if loc, err := time.LoadLocation(val); err == nil {
 		e.timeZone = loc
+		return nil
 	}
+	return fmt.Errorf("Unknown or incorrect time zone: '%s'", val)
 }
 
 // isStrictMode returns true when sql_mode includes STRICT_TRANS_TABLES, STRICT_ALL_TABLES, or TRADITIONAL.
