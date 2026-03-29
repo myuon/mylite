@@ -3034,8 +3034,94 @@ func (e *Executor) explainFromExpr(te sqlparser.TableExpr, idCounter *int64, res
 	}
 }
 
+// extractTableNamesAndAliases collects all table names and aliases from a SELECT's FROM clause.
+// This is used to determine whether a subquery references outer tables (correlated).
+func (e *Executor) extractTableNamesAndAliases(sel *sqlparser.Select) map[string]bool {
+	names := make(map[string]bool)
+	for _, te := range sel.From {
+		e.collectTableNamesAndAliases(te, names)
+	}
+	return names
+}
+
+func (e *Executor) collectTableNamesAndAliases(te sqlparser.TableExpr, names map[string]bool) {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if tn, ok := t.Expr.(sqlparser.TableName); ok {
+			names[strings.ToLower(tn.Name.String())] = true
+		}
+		if !t.As.IsEmpty() {
+			names[strings.ToLower(t.As.String())] = true
+		}
+	case *sqlparser.JoinTableExpr:
+		e.collectTableNamesAndAliases(t.LeftExpr, names)
+		e.collectTableNamesAndAliases(t.RightExpr, names)
+	case *sqlparser.ParenTableExpr:
+		for _, expr := range t.Exprs {
+			e.collectTableNamesAndAliases(expr, names)
+		}
+	}
+}
+
+// isCorrelatedSubquery checks whether a subquery SELECT references any of the outer table names.
+func (e *Executor) isCorrelatedSubquery(subSelect sqlparser.TableStatement, outerTables map[string]bool) bool {
+	if len(outerTables) == 0 {
+		return false
+	}
+
+	// Collect the subquery's own table names/aliases
+	innerTables := make(map[string]bool)
+	switch s := subSelect.(type) {
+	case *sqlparser.Select:
+		innerTables = e.extractTableNamesAndAliases(s)
+	case *sqlparser.Union:
+		// For unions, collect from all selects
+		selects := e.flattenUnion(s)
+		for _, sel := range selects {
+			if inner, ok := sel.(*sqlparser.Select); ok {
+				for k, v := range e.extractTableNamesAndAliases(inner) {
+					innerTables[k] = v
+				}
+			}
+		}
+	}
+
+	correlated := false
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if cn, ok := node.(*sqlparser.ColName); ok {
+			qualifier := strings.ToLower(cn.Qualifier.Name.String())
+			if qualifier != "" && outerTables[qualifier] && !innerTables[qualifier] {
+				correlated = true
+				return false, nil
+			}
+		}
+		return true, nil
+	}, subSelect)
+	return correlated
+}
+
+// isSubqueryInINContext checks if a Subquery node is used in an IN or = ANY context (for MATERIALIZED detection).
+func isSubqueryInINContext(node sqlparser.SQLNode, sub *sqlparser.Subquery) bool {
+	found := false
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if cmp, ok := n.(*sqlparser.ComparisonExpr); ok {
+			if cmp.Operator == sqlparser.InOp || cmp.Operator == sqlparser.NotInOp {
+				if subR, ok := cmp.Right.(*sqlparser.Subquery); ok && subR == sub {
+					found = true
+					return false, nil
+				}
+			}
+		}
+		return true, nil
+	}, node)
+	return found
+}
+
 // explainSubqueries finds subqueries in SELECT expressions, WHERE, and HAVING clauses.
 func (e *Executor) explainSubqueries(sel *sqlparser.Select, idCounter *int64, result *[]explainSelectType) {
+	// Collect outer table names for correlated subquery detection
+	outerTables := e.extractTableNamesAndAliases(sel)
+
 	// Walk the SELECT expressions, WHERE, and HAVING to find subqueries
 	// We need to avoid descending into FROM clause (handled separately)
 	nodes := []sqlparser.SQLNode{}
@@ -3053,12 +3139,12 @@ func (e *Executor) explainSubqueries(sel *sqlparser.Select, idCounter *int64, re
 	}
 
 	for _, node := range nodes {
-		e.walkForSubqueries(node, idCounter, result)
+		e.walkForSubqueries(node, idCounter, result, outerTables)
 	}
 }
 
 // walkForSubqueries walks a node tree to find subqueries (not descending into FROM).
-func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, result *[]explainSelectType) {
+func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, result *[]explainSelectType, outerTables map[string]bool) {
 	if node == nil {
 		return
 	}
@@ -3066,16 +3152,34 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 		switch sub := n.(type) {
 		case *sqlparser.Subquery:
 			*idCounter++
+			correlated := e.isCorrelatedSubquery(sub.Select, outerTables)
+			inContext := isSubqueryInINContext(node, sub)
+
 			switch inner := sub.Select.(type) {
 			case *sqlparser.Union:
 				unionRows := e.explainUnion(inner, idCounter, false)
-				// The first part becomes SUBQUERY
 				if len(unionRows) > 0 {
-					unionRows[0].selectType = "SUBQUERY"
+					if correlated {
+						unionRows[0].selectType = "DEPENDENT SUBQUERY"
+						// Mark subsequent UNION rows as DEPENDENT UNION
+						for i := 1; i < len(unionRows); i++ {
+							if unionRows[i].selectType == "UNION" {
+								unionRows[i].selectType = "DEPENDENT UNION"
+							}
+						}
+					} else {
+						unionRows[0].selectType = "SUBQUERY"
+					}
 				}
 				*result = append(*result, unionRows...)
 			case *sqlparser.Select:
-				subRows := e.explainSelect(inner, idCounter, "SUBQUERY")
+				selectType := "SUBQUERY"
+				if correlated {
+					selectType = "DEPENDENT SUBQUERY"
+				} else if inContext {
+					selectType = "MATERIALIZED"
+				}
+				subRows := e.explainSelect(inner, idCounter, selectType)
 				if len(subRows) > 0 {
 					subRows[0].id = *idCounter
 				}

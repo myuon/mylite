@@ -59,6 +59,7 @@ func TestExplainSelectType_SimpleNoTable(t *testing.T) {
 
 func TestExplainSelectType_SubqueryInWhere(t *testing.T) {
 	e := newTestExecutor(t)
+	// Non-correlated IN subquery should be MATERIALIZED
 	res, err := e.Execute("EXPLAIN SELECT * FROM t1 WHERE id IN (SELECT t1_id FROM t2)")
 	if err != nil {
 		t.Fatalf("EXPLAIN failed: %v", err)
@@ -70,16 +71,16 @@ func TestExplainSelectType_SubqueryInWhere(t *testing.T) {
 	if res.Rows[0][1] != "PRIMARY" {
 		t.Errorf("expected first row select_type=PRIMARY, got %v", res.Rows[0][1])
 	}
-	// Second row should be SUBQUERY
+	// Second row should be MATERIALIZED (non-correlated IN subquery)
 	found := false
 	for _, row := range res.Rows[1:] {
-		if row[1] == "SUBQUERY" {
+		if row[1] == "MATERIALIZED" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("expected a SUBQUERY row, got types: %v", collectSelectTypes(res.Rows))
+		t.Errorf("expected a MATERIALIZED row, got types: %v", collectSelectTypes(res.Rows))
 	}
 }
 
@@ -184,6 +185,108 @@ func TestExplainSelectType_UnionAll(t *testing.T) {
 	}
 	if !foundUnion {
 		t.Errorf("expected a UNION row, got types: %v", types)
+	}
+}
+
+func TestExplainSelectType_DependentSubquery(t *testing.T) {
+	e := newTestExecutor(t)
+	// Add column 'b' to t2 for the correlated reference
+	if _, err := e.Execute("ALTER TABLE t2 ADD COLUMN b INT"); err != nil {
+		t.Fatalf("alter t2: %v", err)
+	}
+	// Correlated subquery: inner SELECT references t1.val from outer query
+	res, err := e.Execute("EXPLAIN SELECT * FROM t1 WHERE id IN (SELECT t1_id FROM t2 WHERE t2.b = t1.id)")
+	if err != nil {
+		t.Fatalf("EXPLAIN failed: %v", err)
+	}
+	if len(res.Rows) < 2 {
+		t.Fatalf("expected at least 2 rows, got %d", len(res.Rows))
+	}
+	types := collectSelectTypes(res.Rows)
+	if types[0] != "PRIMARY" {
+		t.Errorf("expected first row select_type=PRIMARY, got %v", types[0])
+	}
+	found := false
+	for _, st := range types[1:] {
+		if st == "DEPENDENT SUBQUERY" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected a DEPENDENT SUBQUERY row, got types: %v", types)
+	}
+}
+
+func TestExplainSelectType_DependentUnion(t *testing.T) {
+	e := newTestExecutor(t)
+	// Correlated subquery with UNION: references t1.id from outer query
+	res, err := e.Execute("EXPLAIN SELECT * FROM t1 WHERE id IN (SELECT t1_id FROM t2 WHERE t2.t1_id = t1.id UNION SELECT id FROM t2 WHERE t2.t1_id = t1.id)")
+	if err != nil {
+		t.Fatalf("EXPLAIN failed: %v", err)
+	}
+	types := collectSelectTypes(res.Rows)
+	if types[0] != "PRIMARY" {
+		t.Errorf("expected first row select_type=PRIMARY, got %v", types[0])
+	}
+	foundDepSub := false
+	foundDepUnion := false
+	for _, st := range types[1:] {
+		if st == "DEPENDENT SUBQUERY" {
+			foundDepSub = true
+		}
+		if st == "DEPENDENT UNION" {
+			foundDepUnion = true
+		}
+	}
+	if !foundDepSub {
+		t.Errorf("expected a DEPENDENT SUBQUERY row, got types: %v", types)
+	}
+	if !foundDepUnion {
+		t.Errorf("expected a DEPENDENT UNION row, got types: %v", types)
+	}
+}
+
+func TestExplainSelectType_Materialized(t *testing.T) {
+	e := newTestExecutor(t)
+	// Non-correlated IN subquery should be MATERIALIZED
+	res, err := e.Execute("EXPLAIN SELECT * FROM t1 WHERE id IN (SELECT t1_id FROM t2)")
+	if err != nil {
+		t.Fatalf("EXPLAIN failed: %v", err)
+	}
+	types := collectSelectTypes(res.Rows)
+	if types[0] != "PRIMARY" {
+		t.Errorf("expected first row select_type=PRIMARY, got %v", types[0])
+	}
+	found := false
+	for _, st := range types[1:] {
+		if st == "MATERIALIZED" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected a MATERIALIZED row, got types: %v", types)
+	}
+}
+
+func TestExplainSelectType_NonINSubqueryStaysSubquery(t *testing.T) {
+	e := newTestExecutor(t)
+	// Non-correlated subquery NOT in IN context should stay SUBQUERY
+	res, err := e.Execute("EXPLAIN SELECT (SELECT 1 FROM t2 LIMIT 1) FROM t1")
+	if err != nil {
+		t.Fatalf("EXPLAIN failed: %v", err)
+	}
+	types := collectSelectTypes(res.Rows)
+	found := false
+	for _, st := range types[1:] {
+		if st == "SUBQUERY" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected a SUBQUERY row (not MATERIALIZED), got types: %v", types)
 	}
 }
 
