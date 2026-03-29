@@ -579,9 +579,35 @@ func (e *Executor) initSystemTables() {
 	ensure("performance_schema", &catalog.TableDef{
 		Name: "events_stages_history",
 		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED"},
 			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
-			{Name: "WORK_COMPLETED", Type: "BIGINT"},
-			{Name: "WORK_ESTIMATED", Type: "BIGINT"},
+			{Name: "SOURCE", Type: "VARCHAR(64)"},
+			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "WORK_COMPLETED", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "WORK_ESTIMATED", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "NESTING_EVENT_TYPE", Type: "ENUM('TRANSACTION','STATEMENT','STAGE','WAIT')"},
+		},
+	})
+	ensure("performance_schema", &catalog.TableDef{
+		Name: "events_stages_current",
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "SOURCE", Type: "VARCHAR(64)"},
+			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
+			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "WORK_COMPLETED", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "WORK_ESTIMATED", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "NESTING_EVENT_TYPE", Type: "ENUM('TRANSACTION','STATEMENT','STAGE','WAIT')"},
 		},
 	})
 	ensure("performance_schema", &catalog.TableDef{
@@ -673,6 +699,10 @@ func (e *Executor) initSystemTables() {
 			{Name: "TIMER_START", Type: "BIGINT UNSIGNED"},
 			{Name: "TIMER_END", Type: "BIGINT UNSIGNED"},
 			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED"},
+			{Name: "WORK_COMPLETED", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "WORK_ESTIMATED", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "NESTING_EVENT_TYPE", Type: "ENUM('TRANSACTION','STATEMENT','STAGE','WAIT')"},
 		},
 	})
 

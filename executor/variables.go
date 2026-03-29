@@ -2802,6 +2802,7 @@ func (e *Executor) showStatus(upper string) (*Result, error) {
 		{Name: "Connections", Value: "1"},
 		{Name: "Handler_read_first", Value: "0"},
 		{Name: "Handler_read_key", Value: fmt.Sprintf("%d", e.handlerReadKey)},
+		{Name: "Handler_read_last", Value: "0"},
 		{Name: "Handler_read_next", Value: "0"},
 		{Name: "Handler_read_prev", Value: "0"},
 		{Name: "Handler_read_rnd", Value: "0"},
