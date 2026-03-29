@@ -158,9 +158,13 @@ func (lm *LockManager) IsUsedLock(name string) interface{} {
 //   - Multiple shared locks from different connections are compatible.
 //   - An exclusive lock is incompatible with any other lock from a different connection.
 type RowLockManager struct {
-	mu    sync.Mutex
-	locks map[string]*rowLockEntry // lockKey -> entry
+	mu         sync.Mutex
+	locks      map[string]*rowLockEntry  // lockKey -> entry
+	waitingFor map[int64]map[int64]bool  // waiter connID -> set of blocker connIDs
 }
+
+// errDeadlock is returned when a deadlock cycle is detected.
+var errDeadlock = fmt.Errorf("Deadlock found when trying to get lock; try restarting transaction")
 
 type rowLockEntry struct {
 	exclusive bool           // true = X lock, false = S lock
@@ -171,7 +175,8 @@ type rowLockEntry struct {
 // NewRowLockManager creates a new RowLockManager.
 func NewRowLockManager() *RowLockManager {
 	return &RowLockManager{
-		locks: make(map[string]*rowLockEntry),
+		locks:      make(map[string]*rowLockEntry),
+		waitingFor: make(map[int64]map[int64]bool),
 	}
 }
 
@@ -202,6 +207,7 @@ func (rlm *RowLockManager) acquireRowLockInner(connID int64, key string, exclusi
 				owners:    map[int64]bool{connID: true},
 				ch:        make(chan struct{}),
 			}
+			delete(rlm.waitingFor, connID)
 			rlm.mu.Unlock()
 			return nil
 		}
@@ -231,8 +237,25 @@ func (rlm *RowLockManager) acquireRowLockInner(connID int64, key string, exclusi
 		if !exclusive && !existing.exclusive {
 			// Shared + shared = compatible, add ourselves
 			existing.owners[connID] = true
+			delete(rlm.waitingFor, connID)
 			rlm.mu.Unlock()
 			return nil
+		}
+
+		// Record wait-for relationship and check for deadlock
+		blockers := make(map[int64]bool)
+		for ownerID := range existing.owners {
+			if ownerID != connID {
+				blockers[ownerID] = true
+			}
+		}
+		if len(blockers) > 0 {
+			rlm.waitingFor[connID] = blockers
+			if rlm.detectDeadlock(connID) {
+				delete(rlm.waitingFor, connID)
+				rlm.mu.Unlock()
+				return errDeadlock
+			}
 		}
 
 		// Incompatible: wait for lock state change
@@ -245,6 +268,9 @@ func (rlm *RowLockManager) acquireRowLockInner(connID int64, key string, exclusi
 			case <-waitCh:
 				continue
 			default:
+				rlm.mu.Lock()
+				delete(rlm.waitingFor, connID)
+				rlm.mu.Unlock()
 				return errLockWaitTimeout
 			}
 		}
@@ -259,10 +285,38 @@ func (rlm *RowLockManager) acquireRowLockInner(connID int64, key string, exclusi
 			case <-waitCh:
 				continue
 			default:
+				rlm.mu.Lock()
+				delete(rlm.waitingFor, connID)
+				rlm.mu.Unlock()
 				return errLockWaitTimeout
 			}
 		}
 	}
+}
+
+// detectDeadlock checks if connID is involved in a deadlock cycle using DFS.
+// Must be called with rlm.mu held.
+func (rlm *RowLockManager) detectDeadlock(startConn int64) bool {
+	visited := make(map[int64]bool)
+	return rlm.dfsDeadlock(startConn, startConn, visited)
+}
+
+// dfsDeadlock performs a DFS traversal of the wait-for graph.
+// Returns true if a cycle back to target is found.
+func (rlm *RowLockManager) dfsDeadlock(current, target int64, visited map[int64]bool) bool {
+	if visited[current] {
+		return false
+	}
+	visited[current] = true
+	for blocker := range rlm.waitingFor[current] {
+		if blocker == target {
+			return true
+		}
+		if rlm.dfsDeadlock(blocker, target, visited) {
+			return true
+		}
+	}
+	return false
 }
 
 // TryAcquireRowLock attempts to acquire an exclusive row lock without blocking.
@@ -309,6 +363,8 @@ func (rlm *RowLockManager) TryAcquireRowLock(connID int64, key string, exclusive
 func (rlm *RowLockManager) ReleaseRowLocks(connID int64) {
 	rlm.mu.Lock()
 	defer rlm.mu.Unlock()
+
+	delete(rlm.waitingFor, connID)
 
 	for key, entry := range rlm.locks {
 		if entry.owners[connID] {
