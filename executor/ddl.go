@@ -1366,6 +1366,9 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					if col.Type.Options != nil && col.Type.Options.Autoincrement {
 						autoIncrCols[strings.ToLower(col.Name.String())] = true
 					}
+					if col.Type.Options != nil && col.Type.Options.KeyOpt != sqlparser.ColKeyNone {
+						indexedCols[strings.ToLower(col.Name.String())] = true
+					}
 				}
 			case *sqlparser.AddIndexDefinition:
 				for _, idxCol := range op.IndexDefinition.Columns {
