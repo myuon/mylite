@@ -440,6 +440,14 @@ func (e *Executor) evalBinaryOp(v *sqlparser.BinaryExpr) (interface{}, error) {
 func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{}, error) {
 	// Handle IN / NOT IN specially: right side is a ValTuple
 	if v.Operator == sqlparser.InOp || v.Operator == sqlparser.NotInOp {
+		// When left is a tuple and right is a subquery, delegate directly to
+		// evalInSubquery which handles tuple evaluation internally. Evaluating
+		// v.Left via evalExpr would fail with "Operand should contain 1 column(s)".
+		if _, leftIsTuple := v.Left.(sqlparser.ValTuple); leftIsTuple {
+			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+				return e.evalInSubquery(nil, v.Left, sub, v.Operator)
+			}
+		}
 		left, err := e.evalExpr(v.Left)
 		if err != nil {
 			return nil, err
