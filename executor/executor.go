@@ -3971,9 +3971,12 @@ func (e *Executor) explainJSONTableBlock(row []interface{}, query string) []orde
 		}
 	}
 
-	// cost_info
+	// cost_info - MySQL's cost model:
+	// eval_cost = rows * 0.10 (per-row evaluation cost)
+	// read_cost = IO cost (roughly constant at 0.25 for table scans)
+	// prefix_cost = read_cost + eval_cost
 	evalCost := float64(rowCount) * 0.10
-	readCost := float64(rowCount) * 0.25
+	readCost := 0.25 // MySQL IO cost is roughly constant for small tables
 	prefixCost := evalCost + readCost
 
 	// Estimate data_read_per_join based on table definition if available
@@ -3997,7 +4000,7 @@ func (e *Executor) explainJSONTableBlock(row []interface{}, query string) []orde
 	kvs = append(kvs, orderedKV{"cost_info", costInfo})
 
 	// used_columns
-	usedCols := e.explainJSONUsedColumns(tableName, row)
+	usedCols := e.explainJSONUsedColumns(tableName, query)
 	if len(usedCols) > 0 {
 		arr := make([]interface{}, len(usedCols))
 		for i, c := range usedCols {
@@ -4074,18 +4077,16 @@ func (e *Executor) explainEstimateRowSize(td *catalog.TableDef) int {
 			nullableCount++
 		}
 	}
-	// MySQL adds overhead: null bitmap (1 byte per 8 nullable columns, min 1 if any nullable),
-	// plus 1 byte for the "delete mark", plus 1 for rec_buff_length = reclength + 1,
-	// plus 1 extra for row header alignment
-	if nullableCount > 0 {
-		size += (nullableCount + 7) / 8 // null bitmap
-	}
-	size += 3 // MySQL row overhead (delete mark + rec_buff padding + alignment)
+	// MySQL adds per-row overhead: 1 byte per nullable column for null flags,
+	// plus 3 bytes for row header (delete mark, rec_buff padding, alignment).
+	size += nullableCount
+	size += 3 // MySQL row overhead
 	return size
 }
 
 // explainJSONUsedColumns returns the list of column names used in the query for a given table.
-func (e *Executor) explainJSONUsedColumns(tableName string, row []interface{}) []string {
+// It analyzes the query AST to find only the columns actually referenced.
+func (e *Executor) explainJSONUsedColumns(tableName string, query string) []string {
 	if tableName == "" {
 		return nil
 	}
@@ -4093,12 +4094,56 @@ func (e *Executor) explainJSONUsedColumns(tableName string, row []interface{}) [
 	if td == nil {
 		return nil
 	}
-	// Return all columns from the table definition
-	cols := make([]string, len(td.Columns))
-	for i, c := range td.Columns {
-		cols[i] = c.Name
+
+	// Parse the query and extract referenced column names
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		// Fallback: return all columns
+		cols := make([]string, len(td.Columns))
+		for i, c := range td.Columns {
+			cols[i] = c.Name
+		}
+		return cols
 	}
-	return cols
+
+	// Collect all column names referenced in the query
+	referencedCols := map[string]bool{}
+	hasStar := false
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		switch n := node.(type) {
+		case *sqlparser.ColName:
+			referencedCols[strings.ToLower(n.Name.String())] = true
+		case *sqlparser.StarExpr:
+			hasStar = true
+		}
+		return true, nil
+	}, stmt)
+
+	// If SELECT *, return all columns
+	if hasStar {
+		cols := make([]string, len(td.Columns))
+		for i, c := range td.Columns {
+			cols[i] = c.Name
+		}
+		return cols
+	}
+
+	// Return columns that exist in the table definition, preserving table definition order
+	var result []string
+	for _, c := range td.Columns {
+		if referencedCols[strings.ToLower(c.Name)] {
+			result = append(result, c.Name)
+		}
+	}
+	if len(result) == 0 {
+		// Fallback if no columns matched (shouldn't happen normally)
+		cols := make([]string, len(td.Columns))
+		for i, c := range td.Columns {
+			cols[i] = c.Name
+		}
+		return cols
+	}
+	return result
 }
 
 // explainJSONBuildConditionFromQuery reconstructs the WHERE condition from the original query.
@@ -4197,7 +4242,7 @@ func (e *Executor) explainJSONQueryBlockForRow(row []interface{}, query string) 
 		}
 	}
 	rc := explainJSONRowCount(row)
-	cost := float64(rc)*0.10 + float64(rc)*0.25
+	cost := float64(rc)*0.10 + 0.25
 	qb = append(qb, orderedKV{"cost_info", []orderedKV{{"query_cost", fmt.Sprintf("%.2f", cost)}}})
 	if row[2] != nil {
 		qb = append(qb, orderedKV{"table", e.explainJSONTableBlock(row, query)})
@@ -4239,11 +4284,12 @@ func (e *Executor) explainJSONDocument(query string) string {
 	}
 
 	// Calculate total query cost from all primary/simple rows
+	// query_cost = sum(prefix_cost for each table) + sort_cost
 	totalCost := 0.0
 	for _, p := range parsed {
 		if p.selectType == "SIMPLE" || p.selectType == "PRIMARY" {
 			rc := explainJSONRowCount(p.row)
-			totalCost += float64(rc)*0.10 + float64(rc)*0.25
+			totalCost += float64(rc)*0.10 + 0.25 // eval_cost + read_cost
 		}
 	}
 
