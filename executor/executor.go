@@ -233,6 +233,10 @@ type Executor struct {
 	globalScopeVars map[string]string
 	// sessionScopeVars stores SET SESSION/LOCAL variable overrides.
 	sessionScopeVars map[string]string
+	// globalSetThisSession tracks variable names that were SET GLOBAL in
+	// this session. Used to prevent the current session from seeing its
+	// own SET GLOBAL changes through session-scope fallback resolution.
+	globalSetThisSession map[string]bool
 	// startupVars stores variable values set at server startup (e.g., from master.opt).
 	// These are used as default values when SET ... = DEFAULT is used.
 	startupVars map[string]string
@@ -9750,6 +9754,40 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		}
 		// Fallback: compute the aggregate (for single-row context)
 		return e.evalExpr(expr)
+	case *sqlparser.PerformanceSchemaFuncExpr:
+		// Evaluate the argument with row context so aggregate results are resolved
+		if v.Argument != nil {
+			argVal, err := e.evalRowExpr(v.Argument, row)
+			if err != nil {
+				return nil, err
+			}
+			// Apply the formatting function to the resolved argument
+			switch v.Type {
+			case sqlparser.FormatBytesType:
+				if argVal == nil {
+					return nil, nil
+				}
+				if s, ok := argVal.(string); ok {
+					if _, parseErr := strconv.ParseFloat(s, 64); parseErr != nil {
+						return nil, mysqlError(1264, "22003", "Input value is out of range in 'format_bytes'")
+					}
+				}
+				return formatBytesValue(argVal), nil
+			case sqlparser.FormatPicoTimeType:
+				if argVal == nil {
+					return nil, nil
+				}
+				if s, ok := argVal.(string); ok {
+					if _, parseErr := strconv.ParseFloat(s, 64); parseErr != nil {
+						return nil, mysqlError(1264, "22003", "Input value is out of range in 'format_pico_time'")
+					}
+				}
+				return formatPicoTimeValue(argVal), nil
+			default:
+				return e.evalPerformanceSchemaFuncExpr(v)
+			}
+		}
+		return e.evalPerformanceSchemaFuncExpr(v)
 	default:
 		// For JSON and other expressions, set row context via correlatedRow
 		// so that ColName lookups in evalExpr can find row values
@@ -11481,6 +11519,24 @@ func toFloat(v interface{}) float64 {
 		}
 		if f, ok := parseNumericPrefixMySQL(s); ok {
 			return f
+		}
+		// Binary string to integer (big-endian) for hex literal x'...' in numeric context.
+		// MySQL interprets binary strings as big-endian unsigned integers in arithmetic.
+		if len(n) > 0 && len(n) <= 8 {
+			isBinary := false
+			for i := 0; i < len(n); i++ {
+				if n[i] < 0x20 || n[i] > 0x7e {
+					isBinary = true
+					break
+				}
+			}
+			if isBinary {
+				var val uint64
+				for i := 0; i < len(n); i++ {
+					val = val<<8 | uint64(n[i])
+				}
+				return float64(val)
+			}
 		}
 		return 0
 	case bool:

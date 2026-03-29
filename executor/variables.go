@@ -55,27 +55,58 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		if evalVal, err := e.evalExpr(expr.Expr); err == nil && evalVal != nil {
 			val = fmt.Sprintf("%v", evalVal)
 		}
+		isGlobalScope := scope == sqlparser.GlobalScope
+		// Track SET GLOBAL for special-case variables so session-scope reads
+		// don't fall through to the new global value in the same session.
+		if isGlobalScope {
+			if e.globalSetThisSession == nil {
+				e.globalSetThisSession = make(map[string]bool)
+			}
+			switch name {
+			case "names":
+				e.globalSetThisSession["character_set_client"] = true
+				e.globalSetThisSession["character_set_connection"] = true
+				e.globalSetThisSession["character_set_results"] = true
+			case "sql_mode", "sql_auto_is_null", "character_set_client", "character_set_connection", "character_set_results":
+				e.globalSetThisSession[name] = true
+			}
+		}
 		switch name {
 		case "names":
 			charset := strings.ToLower(val)
-			e.sessionScopeVars["character_set_client"] = charset
-			e.sessionScopeVars["character_set_connection"] = charset
-			e.sessionScopeVars["character_set_results"] = charset
-		case "sql_mode":
-			if strings.ToUpper(val) == "DEFAULT" {
-				e.sqlMode = ""
+			if isGlobalScope {
+				e.globalScopeVars["character_set_client"] = charset
+				e.globalScopeVars["character_set_connection"] = charset
+				e.globalScopeVars["character_set_results"] = charset
 			} else {
-				e.sqlMode = expandSQLMode(strings.ToUpper(val))
+				e.sessionScopeVars["character_set_client"] = charset
+				e.sessionScopeVars["character_set_connection"] = charset
+				e.sessionScopeVars["character_set_results"] = charset
+			}
+		case "sql_mode":
+			expanded := ""
+			if strings.ToUpper(val) != "DEFAULT" {
+				expanded = expandSQLMode(strings.ToUpper(val))
+			}
+			if isGlobalScope {
+				e.globalScopeVars["sql_mode"] = expanded
+			} else {
+				e.sqlMode = expanded
 			}
 		case "sql_auto_is_null":
-			e.sqlAutoIsNull = val == "1" || strings.ToUpper(val) == "ON" || strings.ToUpper(val) == "TRUE"
-			// Also store in session scope so @@sql_auto_is_null reads it back.
-			if e.sqlAutoIsNull {
-				e.sessionScopeVars["sql_auto_is_null"] = "ON"
+			boolOn := val == "1" || strings.ToUpper(val) == "ON" || strings.ToUpper(val) == "TRUE"
+			boolStr := "OFF"
+			if boolOn {
+				boolStr = "ON"
+			}
+			if isGlobalScope {
+				e.globalScopeVars["sql_auto_is_null"] = boolStr
 			} else {
-				e.sessionScopeVars["sql_auto_is_null"] = "OFF"
+				e.sqlAutoIsNull = boolOn
+				e.sessionScopeVars["sql_auto_is_null"] = boolStr
 			}
 		case "timestamp":
+			// timestamp is session-only, but handle gracefully
 			n, err := strconv.ParseFloat(val, 64)
 			if err == nil {
 				if n == 0 {
@@ -95,7 +126,11 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				e.nextInsertID = n
 			}
 		case "character_set_client", "character_set_connection", "character_set_results":
-			e.sessionScopeVars[name] = strings.ToLower(val)
+			if isGlobalScope {
+				e.globalScopeVars[name] = strings.ToLower(val)
+			} else {
+				e.sessionScopeVars[name] = strings.ToLower(val)
+			}
 		default:
 			// Store any SET GLOBAL/SESSION variable for later retrieval
 			if name != "" {
@@ -113,6 +148,12 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				}
 				// Handle DEFAULT: restore to default value (or emulate known MySQL special defaults).
 				if _, isDefault := expr.Expr.(*sqlparser.Default); isDefault {
+					if isGlobal {
+						if e.globalSetThisSession == nil {
+							e.globalSetThisSession = make(map[string]bool)
+						}
+						e.globalSetThisSession[cleanName] = true
+					}
 					if cleanName == "connect_timeout" {
 						e.setSysVar(cleanName, "10", isGlobal)
 					} else if cleanName == "innodb_io_capacity_max" {
@@ -347,6 +388,12 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							delete(e.sessionScopeVars, cleanName)
 						}
 					}
+					// Track that this variable was SET GLOBAL in this session
+					// so session-scope reads don't fall through to the new global value.
+					if e.globalSetThisSession == nil {
+						e.globalSetThisSession = make(map[string]bool)
+					}
+					e.globalSetThisSession[cleanName] = true
 				}
 			}
 		}
@@ -577,6 +624,13 @@ func (e *Executor) handleRawSet(raw string) error {
 		// Trigger variables reset to OFF immediately after being set
 		if triggerSysVars[varName] {
 			e.setSysVar(varName, "OFF", isGlobalScope)
+		}
+		// Track SET GLOBAL so session reads don't fall through to the new global.
+		if isGlobalScope {
+			if e.globalSetThisSession == nil {
+				e.globalSetThisSession = make(map[string]bool)
+			}
+			e.globalSetThisSession[varName] = true
 		}
 	}
 	if strings.HasPrefix(upper, "SET NAMES ") {
@@ -2666,11 +2720,16 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 	}
 
 	// Override with SET GLOBAL values.
-	// For session scope (!globalOnly), only apply global overrides for global-only
-	// variables because SET @@global.var should not affect @@session.var.
+	// For global scope (globalOnly=true), always apply.
+	// For session scope (!globalOnly), apply global overrides when:
+	//   1. The variable is global-only, OR
+	//   2. There is no session override AND the variable was not SET GLOBAL
+	//      in this session (i.e., it was inherited from a previous session).
 	for name, val := range e.globalScopeVars {
 		if !globalOnly && !sysVarGlobalOnly[name] {
-			continue
+			if _, hasSession := e.sessionScopeVars[name]; hasSession || e.globalSetThisSession[name] {
+				continue
+			}
 		}
 		if name == "innodb_stats_transient_sample_pages" || name == "innodb_stats_persistent_sample_pages" {
 			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n < 1 {

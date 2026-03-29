@@ -39,24 +39,14 @@ func (e *Executor) evalLiteralExpr(v *sqlparser.Literal) (interface{}, error) {
 	case sqlparser.StrVal:
 		return v.Val, nil
 	case sqlparser.HexVal:
-		// x'AABB' syntax: decode hex to bytes, then interpret as big-endian unsigned integer
-		// for numeric context (MySQL treats x'...' as integer in arithmetic).
-		decoded, err := hex.DecodeString(v.Val)
-		if err != nil {
-			return v.Val, nil
+		// x'...' hex literal: decode hex digits to a byte string.
+		// MySQL treats x'...' as a binary string; numeric context conversion
+		// happens via toFloat/evalBinaryExpr.
+		hexStr := v.Val
+		b, err := hex.DecodeString(hexStr)
+		if err == nil {
+			return string(b), nil
 		}
-		// If it fits in uint64 (8 bytes or less), return as uint64
-		if len(decoded) <= 8 {
-			var n uint64
-			for _, b := range decoded {
-				n = n<<8 | uint64(b)
-			}
-			if n <= math.MaxInt64 {
-				return int64(n), nil
-			}
-			return n, nil
-		}
-		// For very large hex values, return as string
 		return v.Val, nil
 	case sqlparser.HexNum:
 		// 0x878A -> parse as integer
@@ -187,16 +177,24 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 	}
 
 	// Check for user-set variables with proper scope resolution.
+	// MySQL resolves @@var (session scope) as: session → global → default.
+	// New sessions inherit global values. However, SET GLOBAL in the current
+	// session should not affect the current session's reads, so we skip the
+	// global fallback for variables that were SET GLOBAL in this session.
 	var gv string
 	var gvOK bool
 	if v.Scope == sqlparser.GlobalScope {
 		gv, gvOK = e.getSysVarGlobal(name)
 	} else {
 		gv, gvOK = e.getSysVarSession(name)
-		// For global-only variables accessed without explicit scope,
-		// fall back to global scope since they have no session value.
-		if !gvOK && sysVarGlobalOnly[name] {
-			gv, gvOK = e.getSysVarGlobal(name)
+		if !gvOK {
+			// Fall back to global scope if:
+			// 1. The variable is global-only (no session value exists), OR
+			// 2. The variable has a global override and was NOT SET GLOBAL
+			//    in this session (i.e., it was set before this session started).
+			if sysVarGlobalOnly[name] || !e.globalSetThisSession[name] {
+				gv, gvOK = e.getSysVarGlobal(name)
+			}
 		}
 	}
 	if gvOK {
@@ -233,6 +231,11 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 	case "collation_connection":
 		return "utf8mb4_0900_ai_ci", nil
 	case "sql_mode":
+		// For @@global.sql_mode, return the default (empty string), not
+		// the session-local e.sqlMode which may have been SET at session level.
+		if v.Scope == sqlparser.GlobalScope {
+			return "", nil
+		}
 		return e.sqlMode, nil
 	case "autocommit":
 		return int64(1), nil
@@ -330,13 +333,6 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 func (e *Executor) evalUnaryExpr(v *sqlparser.UnaryExpr) (interface{}, error) {
 	val, err := e.evalExpr(v.Expr)
 	if err != nil {
-		// For unary minus with overflow, preserve the negation in the error
-		if v.Operator == sqlparser.UMinusOp {
-			var oe *intOverflowError
-			if errors.As(err, &oe) {
-				return nil, &intOverflowError{val: "-" + oe.val}
-			}
-		}
 		return nil, err
 	}
 	if v.Operator == sqlparser.UMinusOp {
@@ -432,14 +428,10 @@ func (e *Executor) evalConvertExpr(v *sqlparser.ConvertExpr) (interface{}, error
 func (e *Executor) evalBinaryOp(v *sqlparser.BinaryExpr) (interface{}, error) {
 	left, err := e.evalExpr(v.Left)
 	if err != nil {
-		// For INT_OVERFLOW in arithmetic context, try to use the actual value as float64
+		// For INT_OVERFLOW in arithmetic context, treat as max uint64
 		var oe *intOverflowError
 		if errors.As(err, &oe) {
-			if f, ferr := strconv.ParseFloat(oe.val, 64); ferr == nil {
-				left = f
-			} else {
-				left = uint64(math.MaxUint64)
-			}
+			left = uint64(math.MaxUint64)
 			err = nil
 		} else if strings.Contains(err.Error(), "INT_OVERFLOW") {
 			// Fallback: match by string if type assertion fails
@@ -453,11 +445,7 @@ func (e *Executor) evalBinaryOp(v *sqlparser.BinaryExpr) (interface{}, error) {
 	if err != nil {
 		var oe *intOverflowError
 		if errors.As(err, &oe) {
-			if f, ferr := strconv.ParseFloat(oe.val, 64); ferr == nil {
-				right = f
-			} else {
-				right = uint64(math.MaxUint64)
-			}
+			right = uint64(math.MaxUint64)
 			err = nil
 		} else if strings.Contains(err.Error(), "INT_OVERFLOW") {
 			right = uint64(math.MaxUint64)
@@ -1419,190 +1407,29 @@ func (e *Executor) evalExtractFuncExpr(v *sqlparser.ExtractFuncExpr) (interface{
 	}
 }
 
-// isPerformanceSchemaEnabled checks if performance_schema is enabled.
-func (e *Executor) isPerformanceSchemaEnabled() bool {
-	if v, ok := e.startupVars["performance_schema"]; ok {
-		return v != "0" && !strings.EqualFold(v, "OFF")
-	}
-	if v, ok := e.globalScopeVars["performance_schema"]; ok {
-		return !strings.EqualFold(v, "0") && !strings.EqualFold(v, "OFF")
-	}
-	return true // default ON
-}
-
-// isPSThreadInstrumentationDisabled checks if thread instrumentation is disabled
-// via performance_schema_max_thread_instances=0 or performance_schema_max_thread_classes=0.
-func (e *Executor) isPSThreadInstrumentationDisabled() bool {
-	if v, ok := e.startupVars["performance_schema_max_thread_instances"]; ok && v == "0" {
-		return true
-	}
-	if v, ok := e.startupVars["performance_schema_max_thread_classes"]; ok && v == "0" {
-		return true
-	}
-	return false
-}
-
-// parseNumericArg attempts to parse a value as a float64 for PS functions.
-// Returns the float64 value, whether it was valid, and error string for bad input.
-func parseNumericArg(arg interface{}) (float64, bool) {
-	s := fmt.Sprintf("%v", arg)
-	n, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		// Check if it looks like a non-numeric string
-		s = strings.TrimSpace(s)
-		if len(s) == 0 {
-			return 0, false
-		}
-		// Try to see if it starts with a digit
-		if s[0] >= '0' && s[0] <= '9' || s[0] == '-' || s[0] == '+' || s[0] == '.' {
-			return 0, false
-		}
-		return 0, false
-	}
-	return n, true
-}
-
-// formatBytesValue formats a byte count into human-readable form matching MySQL behavior.
-func formatBytesValue(n float64) string {
-	negative := n < 0
-	abs := n
-	if negative {
-		abs = -n
-	}
-	prefix := ""
-	if negative {
-		prefix = "-"
-	}
-
-	const (
-		kib = 1024.0
-		mib = 1024.0 * 1024
-		gib = 1024.0 * 1024 * 1024
-		tib = 1024.0 * 1024 * 1024 * 1024
-		pib = 1024.0 * 1024 * 1024 * 1024 * 1024
-		eib = 1024.0 * 1024 * 1024 * 1024 * 1024 * 1024
-	)
-
-	switch {
-	case abs >= eib:
-		val := n / eib
-		formatted := fmt.Sprintf("%.2f", val)
-		// Check if we need exponent format (value >= 100000 or <= -100000)
-		if abs/eib >= 99999.995 {
-			formatted = fmt.Sprintf("%.2e", val)
-		}
-		return formatted + " EiB"
-	case abs >= pib:
-		return fmt.Sprintf("%s%.2f PiB", prefix, abs/pib)
-	case abs >= tib:
-		return fmt.Sprintf("%s%.2f TiB", prefix, abs/tib)
-	case abs >= gib:
-		return fmt.Sprintf("%s%.2f GiB", prefix, abs/gib)
-	case abs >= mib:
-		return fmt.Sprintf("%s%.2f MiB", prefix, abs/mib)
-	case abs >= kib:
-		return fmt.Sprintf("%s%.2f KiB", prefix, abs/kib)
-	default:
-		// Right-align to 4 characters for "bytes" values
-		s := fmt.Sprintf("%s%.0f", prefix, abs)
-		if len(s) < 4 {
-			s = strings.Repeat(" ", 4-len(s)) + s
-		}
-		return s + " bytes"
-	}
-}
-
-// formatPicoTimeValue formats a picosecond value into human-readable form matching MySQL behavior.
-func formatPicoTimeValue(ps float64) string {
-	negative := ps < 0
-	abs := ps
-	if negative {
-		abs = -ps
-	}
-	prefix := ""
-	if negative {
-		prefix = "-"
-	}
-
-	const (
-		ns  = 1e3
-		us  = 1e6
-		ms  = 1e9
-		sec = 1e12
-		min = 60e12
-		hr  = 3600e12
-		day = 86400e12
-	)
-
-	switch {
-	case abs >= day:
-		val := ps / day
-		absVal := abs / day
-		// Check if we need exponent format
-		if absVal >= 99999.995 {
-			formatted := fmt.Sprintf("%.2e", val)
-			return formatted + " d"
-		}
-		return fmt.Sprintf("%s%.2f d", prefix, absVal)
-	case abs >= hr:
-		return fmt.Sprintf("%s%.2f h", prefix, abs/hr)
-	case abs >= min:
-		return fmt.Sprintf("%s%.2f min", prefix, abs/min)
-	case abs >= sec:
-		return fmt.Sprintf("%s%.2f s", prefix, abs/sec)
-	case abs >= ms:
-		return fmt.Sprintf("%s%.2f ms", prefix, abs/ms)
-	case abs >= us:
-		return fmt.Sprintf("%s%.2f us", prefix, abs/us)
-	case abs >= ns:
-		return fmt.Sprintf("%s%.2f ns", prefix, abs/ns)
-	default:
-		s := fmt.Sprintf("%s%.0f", prefix, abs)
-		if len(s) < 3 {
-			s = strings.Repeat(" ", 3-len(s)) + s
-		}
-		return s + " ps"
-	}
-}
-
-// evalPSFuncArg evaluates the argument of a performance schema function,
-// handling aggregate expressions by looking them up in correlatedRow.
-func (e *Executor) evalPSFuncArg(arg sqlparser.Expr) (interface{}, error) {
-	// If the argument is an aggregate and we have a correlated row, look it up.
-	switch arg.(type) {
-	case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg, *sqlparser.GroupConcatExpr:
-		if e.correlatedRow != nil {
-			displayName := aggregateDisplayName(arg)
-			if val, ok := e.correlatedRow[displayName]; ok {
-				return val, nil
-			}
-		}
-	}
-	return e.evalExpr(arg)
-}
-
 // evalPerformanceSchemaFuncExpr handles *sqlparser.PerformanceSchemaFuncExpr evaluation.
 func (e *Executor) evalPerformanceSchemaFuncExpr(v *sqlparser.PerformanceSchemaFuncExpr) (interface{}, error) {
 	switch v.Type {
 	case sqlparser.PsCurrentThreadIDType:
 		// ps_current_thread_id() returns the thread ID for the current connection.
-		if !e.isPerformanceSchemaEnabled() {
-			return nil, mysqlError(3019, "HY000", "'ps_current_thread_id': The Performance Schema is not enabled.")
+		// When performance_schema is disabled, return an error.
+		if e.startupVars["performance_schema"] == "0" || strings.EqualFold(e.startupVars["performance_schema"], "OFF") {
+			return nil, mysqlError(3182, "HY000", "'ps_current_thread_id': The Performance Schema is not enabled.")
 		}
-		// If thread instrumentation is disabled (max_thread_instances=0 or max_thread_classes=0),
-		// the thread is not instrumented and the function returns NULL.
-		if e.isPSThreadInstrumentationDisabled() {
+		// When thread instances are disabled, thread is not instrumented -> NULL
+		if e.startupVars["performance_schema_max_thread_instances"] == "0" {
 			return nil, nil
 		}
-		// thread_id = connectionID + 1 by convention (matching perfSchemaThreads)
+		// thread_id = connectionID + 1, matching performance_schema.threads convention
 		return e.connectionID + 1, nil
 	case sqlparser.PsThreadIDType:
 		// ps_thread_id(connection_id) returns the thread ID for a given connection.
-		if !e.isPerformanceSchemaEnabled() {
-			return nil, mysqlError(3019, "HY000", "'ps_thread_id': The Performance Schema is not enabled.")
+		// When performance_schema is disabled, return an error.
+		if e.startupVars["performance_schema"] == "0" || strings.EqualFold(e.startupVars["performance_schema"], "OFF") {
+			return nil, mysqlError(3182, "HY000", "'ps_thread_id': The Performance Schema is not enabled.")
 		}
-		// If thread instrumentation is disabled, return NULL.
-		if e.isPSThreadInstrumentationDisabled() {
+		// When thread instances are disabled, thread is not instrumented -> NULL
+		if e.startupVars["performance_schema_max_thread_instances"] == "0" {
 			return nil, nil
 		}
 		if v.Argument == nil {
@@ -1615,26 +1442,22 @@ func (e *Executor) evalPerformanceSchemaFuncExpr(v *sqlparser.PerformanceSchemaF
 		if arg == nil {
 			return nil, nil
 		}
-		// Try to parse as integer connection ID
-		s := fmt.Sprintf("%v", arg)
-		f, err := strconv.ParseFloat(s, 64)
-		if err != nil || f < 0 || f != math.Trunc(f) {
-			// Bad parameter (string, negative, or non-integer) returns NULL
+		// Try to parse the connection ID
+		connIDStr := fmt.Sprintf("%v", arg)
+		connID, parseErr := strconv.ParseInt(connIDStr, 10, 64)
+		if parseErr != nil {
+			// Non-numeric input returns NULL
 			return nil, nil
 		}
-		connID := int64(f)
-		if connID <= 0 {
+		if connID < 0 {
+			// Negative connection ID returns NULL
 			return nil, nil
 		}
-		// Check if this connection ID exists (only current connection is tracked)
-		if connID == e.connectionID {
-			return connID + 1, nil
-		}
-		// Check process list for other connections
+		// Check if the connection exists in the process list
 		if e.processList != nil {
 			for _, proc := range e.processList.Snapshot() {
 				if proc.ID == connID {
-					return connID + 1, nil
+					return connID + 1, nil // thread_id = connID + 1
 				}
 			}
 		}
@@ -1645,57 +1468,129 @@ func (e *Executor) evalPerformanceSchemaFuncExpr(v *sqlparser.PerformanceSchemaF
 		if v.Argument == nil {
 			return nil, nil
 		}
-		arg, err := e.evalPSFuncArg(v.Argument)
+		arg, err := e.evalExpr(v.Argument)
 		if err != nil {
-			// Handle int overflow: extract the string value and parse as float
-			var oe *intOverflowError
-			if errors.As(err, &oe) {
-				n, parseErr := strconv.ParseFloat(oe.val, 64)
-				if parseErr != nil {
-					return nil, mysqlError(1264, "22003", "Input value is out of range in 'format_bytes'")
-				}
-				return formatBytesValue(n), nil
-			}
 			return nil, err
 		}
 		if arg == nil {
 			return nil, nil
 		}
-		s := fmt.Sprintf("%v", arg)
-		n, parseErr := strconv.ParseFloat(s, 64)
-		if parseErr != nil {
-			// Non-numeric string -> ER_DATA_OUT_OF_RANGE
-			return nil, mysqlError(1264, "22003", "Input value is out of range in 'format_bytes'")
+		// String arguments that are not numeric should return an error
+		if s, ok := arg.(string); ok {
+			if _, parseErr := strconv.ParseFloat(s, 64); parseErr != nil {
+				return nil, mysqlError(1264, "22003", "Input value is out of range in 'format_bytes'")
+			}
 		}
-		return formatBytesValue(n), nil
+		return formatBytesValue(arg), nil
 	case sqlparser.FormatPicoTimeType:
 		// format_pico_time(time_val) formats a picosecond value into a human-readable string.
 		if v.Argument == nil {
 			return nil, nil
 		}
-		arg, err := e.evalPSFuncArg(v.Argument)
+		arg, err := e.evalExpr(v.Argument)
 		if err != nil {
-			// Handle int overflow: extract the string value and parse as float
-			var oe *intOverflowError
-			if errors.As(err, &oe) {
-				ps, parseErr := strconv.ParseFloat(oe.val, 64)
-				if parseErr != nil {
-					return nil, mysqlError(1264, "22003", "Input value is out of range in 'format_pico_time'")
-				}
-				return formatPicoTimeValue(ps), nil
-			}
 			return nil, err
 		}
 		if arg == nil {
 			return nil, nil
 		}
-		s := fmt.Sprintf("%v", arg)
-		ps, parseErr := strconv.ParseFloat(s, 64)
-		if parseErr != nil {
-			// Non-numeric string -> ER_DATA_OUT_OF_RANGE
-			return nil, mysqlError(1264, "22003", "Input value is out of range in 'format_pico_time'")
+		// String arguments that are not numeric should return an error
+		if s, ok := arg.(string); ok {
+			if _, parseErr := strconv.ParseFloat(s, 64); parseErr != nil {
+				return nil, mysqlError(1264, "22003", "Input value is out of range in 'format_pico_time'")
+			}
 		}
-		return formatPicoTimeValue(ps), nil
+		return formatPicoTimeValue(arg), nil
 	}
 	return nil, fmt.Errorf("unsupported performance schema function type: %d", v.Type)
+}
+
+// formatBytesValue formats a byte count into a human-readable string, matching MySQL's format_bytes().
+func formatBytesValue(arg interface{}) string {
+	n, _ := strconv.ParseFloat(fmt.Sprintf("%v", arg), 64)
+	negative := n < 0
+	abs := n
+	if negative {
+		abs = -n
+	}
+	sign := ""
+	if negative {
+		sign = "-"
+	}
+
+	const (
+		kib = 1024.0
+		mib = 1024.0 * 1024.0
+		gib = 1024.0 * 1024.0 * 1024.0
+		tib = 1024.0 * 1024.0 * 1024.0 * 1024.0
+		pib = 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0
+		eib = 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0
+	)
+
+	switch {
+	case abs >= eib:
+		val := n / eib
+		// Use exponent format for very large values (>= 100000 or very large magnitude)
+		absVal := val
+		if absVal < 0 {
+			absVal = -absVal
+		}
+		if absVal >= 100000 {
+			return fmt.Sprintf("%.2e EiB", val)
+		}
+		return fmt.Sprintf("%s%.2f EiB", sign, abs/eib)
+	case abs >= pib:
+		return fmt.Sprintf("%s%.2f PiB", sign, abs/pib)
+	case abs >= tib:
+		return fmt.Sprintf("%s%.2f TiB", sign, abs/tib)
+	case abs >= gib:
+		return fmt.Sprintf("%s%.2f GiB", sign, abs/gib)
+	case abs >= mib:
+		return fmt.Sprintf("%s%.2f MiB", sign, abs/mib)
+	case abs >= kib:
+		return fmt.Sprintf("%s%.2f KiB", sign, abs/kib)
+	default:
+		return fmt.Sprintf("%s%4.0f bytes", sign, abs)
+	}
+}
+
+// formatPicoTimeValue formats a picosecond value into a human-readable string, matching MySQL's format_pico_time().
+func formatPicoTimeValue(arg interface{}) string {
+	ps, _ := strconv.ParseFloat(fmt.Sprintf("%v", arg), 64)
+	negative := ps < 0
+	abs := ps
+	if negative {
+		abs = -ps
+	}
+	sign := ""
+	if negative {
+		sign = "-"
+	}
+
+	switch {
+	case abs >= 86400e12: // days
+		val := ps / 86400e12
+		absVal := val
+		if absVal < 0 {
+			absVal = -absVal
+		}
+		if absVal >= 100000 {
+			return fmt.Sprintf("%.2e d", val)
+		}
+		return fmt.Sprintf("%s%.2f d", sign, abs/86400e12)
+	case abs >= 3600e12: // hours
+		return fmt.Sprintf("%s%.2f h", sign, abs/3600e12)
+	case abs >= 60e12: // minutes
+		return fmt.Sprintf("%s%.2f min", sign, abs/60e12)
+	case abs >= 1e12: // seconds
+		return fmt.Sprintf("%s%.2f s", sign, abs/1e12)
+	case abs >= 1e9: // milliseconds
+		return fmt.Sprintf("%s%.2f ms", sign, abs/1e9)
+	case abs >= 1e6: // microseconds
+		return fmt.Sprintf("%s%.2f us", sign, abs/1e6)
+	case abs >= 1e3: // nanoseconds
+		return fmt.Sprintf("%s%.2f ns", sign, abs/1e3)
+	default:
+		return fmt.Sprintf("%s%.0f ps", sign, abs)
+	}
 }
