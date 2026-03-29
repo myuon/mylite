@@ -308,6 +308,9 @@ type Executor struct {
 	// tableLockManager manages LOCK TABLE READ/WRITE per connection.
 	// Shared across all executor instances.
 	tableLockManager *TableLockManager
+	// globalReadLock manages FLUSH TABLES WITH READ LOCK (FTWRL).
+	// Shared across all executor instances.
+	globalReadLock *GlobalReadLock
 	// handlerReadKey counts the number of index-based reads (SELECT queries).
 	// Incremented per SELECT, reset on FLUSH STATUS.
 	handlerReadKey int64
@@ -420,6 +423,7 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	e.rowLockManager = NewRowLockManager()
 	e.txnActiveSet = NewTxnActiveSet()
 	e.tableLockManager = NewTableLockManager()
+	e.globalReadLock = NewGlobalReadLock()
 	e.initSystemTables()
 	return e
 }
@@ -468,6 +472,7 @@ func (e *Executor) Clone() *Executor {
 		processList:      e.processList,
 		txnActiveSet:     e.txnActiveSet,
 		tableLockManager: e.tableLockManager,
+		globalReadLock:   e.globalReadLock,
 	}
 }
 
@@ -481,6 +486,9 @@ func (e *Executor) OnDisconnect() {
 	}
 	if e.tableLockManager != nil {
 		e.tableLockManager.UnlockAll(e.connectionID)
+	}
+	if e.globalReadLock != nil {
+		e.globalReadLock.Release(e.connectionID)
 	}
 }
 
@@ -4729,8 +4737,7 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			strings.HasPrefix(upper, "CREATE UNDO TABLESPACE") ||
 			strings.HasPrefix(upper, "DROP UNDO TABLESPACE") ||
 			strings.HasPrefix(upper, "CREATE SPATIAL REFERENCE SYSTEM") ||
-			strings.HasPrefix(upper, "DROP SPATIAL REFERENCE SYSTEM") ||
-			strings.HasPrefix(upper, "UNLOCK TABLE") {
+			strings.HasPrefix(upper, "DROP SPATIAL REFERENCE SYSTEM") {
 			return &Result{}, nil
 		}
 		// LOCK TABLES: check for performance_schema tables
@@ -4912,6 +4919,9 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		}
 		return &Result{}, nil
 	case *sqlparser.UnlockTables:
+		if e.globalReadLock != nil {
+			e.globalReadLock.Release(e.connectionID)
+		}
 		if e.tableLockManager != nil {
 			e.tableLockManager.UnlockAll(e.connectionID)
 		}
@@ -4969,6 +4979,26 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	case *sqlparser.RenameTable:
 		return e.execRenameTable(s)
 	case *sqlparser.Flush:
+		// FLUSH TABLES WITH READ LOCK: acquire global read lock
+		if s.WithLock && e.globalReadLock != nil {
+			// Implicitly commit any active transaction first (MySQL behavior)
+			if e.inTransaction {
+				e.execCommit()
+			}
+			if e.processList != nil {
+				e.processList.SetState(e.connectionID, "Waiting for global read lock")
+			}
+			if err := e.globalReadLock.Acquire(e.connectionID, 31536000, e.processList); err != nil {
+				if e.processList != nil {
+					e.processList.SetState(e.connectionID, "")
+				}
+				return nil, mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
+			}
+			if e.processList != nil {
+				e.processList.SetState(e.connectionID, "")
+			}
+			return &Result{}, nil
+		}
 		// FLUSH TABLE ... FOR EXPORT on non-InnoDB engines returns an error
 		if s.ForExport && len(s.TableNames) > 0 {
 			for _, tn := range s.TableNames {

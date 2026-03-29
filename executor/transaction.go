@@ -75,6 +75,21 @@ func (e *Executor) execCommit() (*Result, error) {
 	if !e.inTransaction {
 		return &Result{}, nil
 	}
+	// Block COMMIT if another connection holds FLUSH TABLES WITH READ LOCK
+	if e.globalReadLock != nil {
+		if e.processList != nil {
+			e.processList.SetState(e.connectionID, "Waiting for commit lock")
+		}
+		if err := e.globalReadLock.WaitIfHeldByOther(e.connectionID, 31536000); err != nil {
+			if e.processList != nil {
+				e.processList.SetState(e.connectionID, "")
+			}
+			return nil, fmt.Errorf("Lock wait timeout exceeded; try restarting transaction")
+		}
+		if e.processList != nil {
+			e.processList.SetState(e.connectionID, "")
+		}
+	}
 	// Remove transaction tags from rows inserted by this connection
 	e.clearTxnRowTags()
 	e.inTransaction = false

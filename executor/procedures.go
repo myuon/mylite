@@ -1783,6 +1783,14 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 		if strings.HasPrefix(stmtUpper, "SELECT") && strings.Contains(stmtUpper, " INTO ") {
 			err := e.execSelectIntoForRoutine(stmtStr, localVars)
 			if err != nil {
+				// Check if a handler can catch this error
+				handled, exitFlag := e.tryHandler(err, ctx)
+				if handled {
+					if exitFlag {
+						return nil, nil
+					}
+					continue
+				}
 				return nil, err
 			}
 			continue
@@ -2095,10 +2103,16 @@ func (e *Executor) tryHandler(err error, ctx *routineContext) (bool, bool) {
 					messageText: err.Error(),
 				}
 			}
-			// Execute handler body
+			// Execute handler body.
+			// Temporarily remove handlers to prevent re-entrant handler invocation
+			// (MySQL handlers are not recursive).
 			if h.body != "" {
+				savedHandlers := ctx.handlers
+				ctx.handlers = nil
 				stmts := splitTriggerBody(h.body)
-				if _, herr := e.execRoutineBodyWithContext(stmts, ctx); herr != nil {
+				_, herr := e.execRoutineBodyWithContext(stmts, ctx)
+				ctx.handlers = savedHandlers
+				if herr != nil {
 					ctx.currentSignal = prevSignal
 					return false, false
 				}
@@ -2308,11 +2322,11 @@ func (e *Executor) execSelectIntoLocal(stmtStr string, localVars map[string]inte
 
 // execIfBlockCtx executes an IF block with shared routine context.
 func (e *Executor) execIfBlockCtx(block string, ctx *routineContext) (bool, interface{}, error) {
-	return e.execIfBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done)
+	return e.execIfBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done, ctx.handlers)
 }
 
 // execIfBlock executes an IF...THEN...ELSEIF...ELSE...END IF block.
-func (e *Executor) execIfBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool) (bool, interface{}, error) {
+func (e *Executor) execIfBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool, handlers []handlerDef) (bool, interface{}, error) {
 	trimmed := strings.TrimSpace(block)
 	upper := strings.ToUpper(trimmed)
 
@@ -2349,6 +2363,7 @@ func (e *Executor) execIfBlock(block string, localVars map[string]interface{}, c
 		cursorDefs:         cursorDefs,
 		notFoundHandlerVar: notFoundHandlerVar,
 		done:               *done,
+		handlers:           handlers,
 	}
 
 	if isTruthy(condVal) {
@@ -2365,7 +2380,7 @@ func (e *Executor) execIfBlock(block string, localVars map[string]interface{}, c
 			if !strings.HasSuffix(strings.ToUpper(strings.TrimSpace(ifBlock)), "END IF") {
 				ifBlock += "\nEND IF"
 			}
-			return e.execIfBlock(ifBlock, localVars, cursors, cursorDefs, notFoundHandlerVar, done)
+			return e.execIfBlock(ifBlock, localVars, cursors, cursorDefs, notFoundHandlerVar, done, handlers)
 		}
 		stmts := splitTriggerBody(elseBody)
 		retVal, err := e.execRoutineBodyWithContext(stmts, blockCtx)
@@ -2429,11 +2444,11 @@ func splitAtTopLevelElse(body string) (thenBody, elseBody string, hasElse bool) 
 
 // execRepeatBlockCtx executes a REPEAT block with shared routine context.
 func (e *Executor) execRepeatBlockCtx(block string, ctx *routineContext) (interface{}, error) {
-	return e.execRepeatBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done)
+	return e.execRepeatBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done, ctx.handlers)
 }
 
 // execRepeatBlock executes a REPEAT...UNTIL...END REPEAT block.
-func (e *Executor) execRepeatBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool) (interface{}, error) {
+func (e *Executor) execRepeatBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool, handlers []handlerDef) (interface{}, error) {
 	upper := strings.ToUpper(strings.TrimSpace(block))
 
 	// Remove REPEAT prefix and END REPEAT suffix
@@ -2464,6 +2479,7 @@ func (e *Executor) execRepeatBlock(block string, localVars map[string]interface{
 		cursorDefs:         cursorDefs,
 		notFoundHandlerVar: notFoundHandlerVar,
 		done:               *done,
+		handlers:           handlers,
 	}
 	for iterations := 0; iterations < 10000; iterations++ {
 		// Execute loop body
@@ -2493,11 +2509,11 @@ func (e *Executor) execRepeatBlock(block string, localVars map[string]interface{
 
 // execWhileBlockCtx executes a WHILE block with shared routine context.
 func (e *Executor) execWhileBlockCtx(block string, ctx *routineContext) (interface{}, error) {
-	return e.execWhileBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done)
+	return e.execWhileBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done, ctx.handlers)
 }
 
 // execWhileBlock executes a WHILE...DO...END WHILE block.
-func (e *Executor) execWhileBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool) (interface{}, error) {
+func (e *Executor) execWhileBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool, handlers []handlerDef) (interface{}, error) {
 	upper := strings.ToUpper(strings.TrimSpace(block))
 
 	bodyStr := strings.TrimSpace(block)
@@ -2527,6 +2543,7 @@ func (e *Executor) execWhileBlock(block string, localVars map[string]interface{}
 		cursorDefs:         cursorDefs,
 		notFoundHandlerVar: notFoundHandlerVar,
 		done:               *done,
+		handlers:           handlers,
 	}
 	for iterations := 0; iterations < 10000; iterations++ {
 		// Evaluate condition
@@ -2584,6 +2601,7 @@ func (e *Executor) execLoopBlockCtx(block string, label string, ctx *routineCont
 		cursorDefs:         ctx.cursorDefs,
 		notFoundHandlerVar: ctx.notFoundHandlerVar,
 		done:               ctx.done,
+		handlers:           ctx.handlers,
 	}
 
 	for iterations := 0; iterations < 10000; iterations++ {
@@ -2650,6 +2668,7 @@ func (e *Executor) execWhileBlockWithLabel(block string, label string, ctx *rout
 		cursorDefs:         ctx.cursorDefs,
 		notFoundHandlerVar: ctx.notFoundHandlerVar,
 		done:               ctx.done,
+		handlers:           ctx.handlers,
 	}
 
 	for iterations := 0; iterations < 10000; iterations++ {
@@ -2710,6 +2729,7 @@ func (e *Executor) execRepeatBlockWithLabel(block string, label string, ctx *rou
 		cursorDefs:         ctx.cursorDefs,
 		notFoundHandlerVar: ctx.notFoundHandlerVar,
 		done:               ctx.done,
+		handlers:           ctx.handlers,
 	}
 
 	for iterations := 0; iterations < 10000; iterations++ {

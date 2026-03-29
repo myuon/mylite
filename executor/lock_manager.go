@@ -456,3 +456,159 @@ func (tlm *TableLockManager) IsLockedByOther(connID int64, dbTable string) (lock
 	return locked, mode
 }
 
+// GlobalReadLock implements FLUSH TABLES WITH READ LOCK (FTWRL).
+// When held, all DML/DDL and COMMIT from other connections are blocked.
+// Only one connection can hold the global read lock at a time.
+//
+// FTWRL has two phases:
+//  1. Acquire the exclusive FTWRL mutex (only one connection at a time)
+//  2. Wait for all other active transactions to commit
+//
+// Once fully acquired, COMMIT from other connections is blocked until UNLOCK TABLES.
+type GlobalReadLock struct {
+	mu     sync.Mutex
+	holder int64         // connectionID that holds FTWRL, 0 if none
+	held   bool          // true when FTWRL mutex is acquired (may still be in phase 2)
+	ready  bool          // true when FTWRL is fully acquired (phase 2 complete, blocking commits)
+	ch     chan struct{} // closed when FTWRL is released; recreated on next acquire
+}
+
+// NewGlobalReadLock creates a new GlobalReadLock.
+func NewGlobalReadLock() *GlobalReadLock {
+	return &GlobalReadLock{
+		ch: make(chan struct{}),
+	}
+}
+
+// Acquire tries to acquire the global read lock for the given connection.
+// If another connection holds it, blocks until released or timeout expires.
+// After acquiring the mutex, waits for all other active queries to complete.
+// Returns nil on success, error on timeout.
+func (grl *GlobalReadLock) Acquire(connID int64, timeoutSec float64, pl *ProcessList) error {
+	deadline := time.Now().Add(time.Duration(timeoutSec * float64(time.Second)))
+
+	// Phase 1: Acquire the FTWRL mutex
+	for {
+		grl.mu.Lock()
+		if !grl.held {
+			grl.held = true
+			grl.holder = connID
+			grl.ch = make(chan struct{})
+			grl.mu.Unlock()
+			break
+		}
+		if grl.holder == connID {
+			// Already hold it - re-entrant
+			grl.mu.Unlock()
+			return nil
+		}
+		waitCh := grl.ch
+		grl.mu.Unlock()
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return errLockWaitTimeout
+		}
+
+		timer := time.NewTimer(remaining)
+		select {
+		case <-waitCh:
+			timer.Stop()
+			continue
+		case <-timer.C:
+			return errLockWaitTimeout
+		}
+	}
+
+	// Phase 2: Wait for all other connections' active queries to complete.
+	// We hold the FTWRL mutex but haven't set ready=true yet,
+	// so existing transactions can still COMMIT during this phase.
+	if pl != nil {
+		for {
+			entries := pl.Snapshot()
+			hasActiveQuery := false
+			for _, entry := range entries {
+				if entry.ID != connID && entry.Command == "Query" {
+					hasActiveQuery = true
+					break
+				}
+			}
+
+			if !hasActiveQuery {
+				break
+			}
+
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				// Release the lock since we couldn't fully acquire
+				grl.mu.Lock()
+				grl.held = false
+				grl.holder = 0
+				close(grl.ch)
+				grl.mu.Unlock()
+				return errLockWaitTimeout
+			}
+
+			// Poll every 10ms
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Phase 2 complete: now block new COMMITs from other connections
+	grl.mu.Lock()
+	grl.ready = true
+	grl.mu.Unlock()
+
+	return nil
+}
+
+// Release releases the global read lock if held by the given connection.
+func (grl *GlobalReadLock) Release(connID int64) {
+	grl.mu.Lock()
+	defer grl.mu.Unlock()
+	if grl.held && grl.holder == connID {
+		grl.held = false
+		grl.ready = false
+		grl.holder = 0
+		close(grl.ch)
+	}
+}
+
+// IsHeld returns true if the global read lock is held.
+func (grl *GlobalReadLock) IsHeld() bool {
+	grl.mu.Lock()
+	defer grl.mu.Unlock()
+	return grl.held
+}
+
+// IsHeldByOther returns true if the global read lock is fully acquired (ready)
+// by a connection other than connID. If held, also returns the wait channel.
+func (grl *GlobalReadLock) IsHeldByOther(connID int64) (bool, chan struct{}) {
+	grl.mu.Lock()
+	defer grl.mu.Unlock()
+	if grl.held && grl.ready && grl.holder != connID {
+		return true, grl.ch
+	}
+	return false, nil
+}
+
+// WaitIfHeldByOther blocks until the global read lock is released by another
+// connection, or until the timeout expires. Returns nil if lock was released
+// (or not held), error on timeout.
+func (grl *GlobalReadLock) WaitIfHeldByOther(connID int64, timeoutSec float64) error {
+	held, waitCh := grl.IsHeldByOther(connID)
+	if !held {
+		return nil
+	}
+
+	timer := time.NewTimer(time.Duration(timeoutSec * float64(time.Second)))
+	defer timer.Stop()
+
+	select {
+	case <-waitCh:
+		return nil
+	case <-timer.C:
+		return errLockWaitTimeout
+	}
+}
+
