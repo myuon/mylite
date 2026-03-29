@@ -2968,8 +2968,21 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 			keyLen = accessInfo.keyLen
 			ref = accessInfo.ref
 
-			if accessInfo.accessType == "const" {
+			if accessInfo.accessType == "const" || accessInfo.accessType == "eq_ref" || accessInfo.accessType == "ref" {
 				rowCount = int64(1)
+			}
+
+			// Set "Using index condition" for ref access with IS NULL or range conditions on indexed columns
+			if extra == nil && (accessInfo.accessType == "ref" || accessInfo.accessType == "range") {
+				if sel.Where != nil {
+					wcs := explainExtractWhereConditions(sel.Where.Expr, tblName)
+					for _, wc := range wcs {
+						if wc.isNull {
+							extra = "Using index condition"
+							break
+						}
+					}
+				}
 			}
 
 			result = append(result, explainSelectType{
@@ -3450,12 +3463,16 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 	// Build a set of columns referenced in equality conditions
 	eqCols := map[string]bool{}
 	rangeCols := map[string]bool{}
+	nullCols := map[string]bool{}
 	for _, wc := range whereCols {
 		if wc.isEquality {
 			eqCols[strings.ToLower(wc.column)] = true
 		}
 		if wc.isRange {
 			rangeCols[strings.ToLower(wc.column)] = true
+		}
+		if wc.isNull {
+			nullCols[strings.ToLower(wc.column)] = true
 		}
 	}
 
@@ -3600,7 +3617,16 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 			break
 		}
 	}
-	if best.matchedAll && best.index.Unique {
+	// Check if any matched column uses IS NULL (UNIQUE indexes allow multiple NULLs)
+	hasNullCondition := false
+	for _, c := range best.index.Columns {
+		if nullCols[strings.ToLower(c)] {
+			hasNullCondition = true
+			break
+		}
+	}
+
+	if best.matchedAll && best.index.Unique && !hasNullCondition {
 		if best.isPrimary || !isJoin {
 			// Use "const" for PK lookups or unique index lookups in standalone queries
 			result.accessType = "const"
@@ -3633,6 +3659,7 @@ type explainWhereCondition struct {
 	column     string
 	isEquality bool // col = value, col IS NULL, col IN (...)
 	isRange    bool // col > value, col < value, col BETWEEN, col IN (...)
+	isNull     bool // col IS NULL (UNIQUE indexes allow multiple NULLs → "ref" not "const")
 }
 
 // explainExtractWhereConditions recursively extracts column conditions from a WHERE expression.
@@ -3669,7 +3696,7 @@ func explainExtractWhereConditions(expr sqlparser.Expr, tableName string) []expl
 	case *sqlparser.IsExpr:
 		colName := explainExtractColumnName(e.Left)
 		if colName != "" {
-			return []explainWhereCondition{{column: colName, isEquality: true}}
+			return []explainWhereCondition{{column: colName, isEquality: true, isNull: e.Right == sqlparser.IsNullOp}}
 		}
 	case *sqlparser.OrExpr:
 		// OR expressions can't be decomposed into individual column conditions,
@@ -3841,79 +3868,626 @@ func explainTableBlock(table string, rows int, cols []string, indent string) str
 %s}`, indent, table, indent, indent, rows, indent, rows, indent, indent, indent, readCost, indent, evalCost, indent, prefixCost, indent, dataRead, indent, usedCols, indent)
 }
 
-func (e *Executor) explainJSONDocument(query string) string {
-	table := explainTableNameFromQuery(query)
-	if table == "" {
-		table = "t1"
+// explainJSONTableBlock builds an ordered JSON structure for a single table entry
+// from an EXPLAIN row (as returned by explainMultiRows).
+// The query parameter is the original SQL query, used for condition reconstruction.
+func (e *Executor) explainJSONTableBlock(row []interface{}, query string) []orderedKV {
+	// row layout: id, selectType, table, partitions, accessType, possibleKeys, key, keyLen, ref, rows, filtered, extra
+	var kvs []orderedKV
+
+	if row[2] != nil {
+		kvs = append(kvs, orderedKV{"table_name", fmt.Sprintf("%v", row[2])})
 	}
-	rows := e.explainRowsFromQuery(query)
-	upper := strings.ToUpper(query)
-	cols := explainUsedColumns(query)
-	if strings.Contains(upper, "GROUP BY") {
-		if strings.Contains(upper, "SQL_BUFFER_RESULT") {
-			tableBlock := explainTableBlock(table, rows, cols, "          ")
-			return fmt.Sprintf(`{
-  "query_block": {
-    "select_id": 1,
-    "cost_info": {
-      "query_cost": "9.05"
-    },
-    "grouping_operation": {
-      "using_filesort": true,
-      "cost_info": {
-        "sort_cost": "8.00"
-      },
-      "buffer_result": {
-        "using_temporary_table": true,
-        "table": %s
-      }
-    }
-  }
-}`, tableBlock)
+	accessType := "ALL"
+	if row[4] != nil {
+		accessType = fmt.Sprintf("%v", row[4])
+	}
+	kvs = append(kvs, orderedKV{"access_type", accessType})
+
+	// possible_keys → array
+	if row[5] != nil {
+		pkStr := fmt.Sprintf("%v", row[5])
+		if pkStr != "" {
+			parts := strings.Split(pkStr, ",")
+			arr := make([]interface{}, len(parts))
+			for i, p := range parts {
+				arr[i] = strings.TrimSpace(p)
+			}
+			kvs = append(kvs, orderedKV{"possible_keys", arr})
 		}
-		tableBlock := explainTableBlock(table, rows, cols, "        ")
-		return fmt.Sprintf(`{
-  "query_block": {
-    "select_id": 1,
-    "cost_info": {
-      "query_cost": "9.05"
-    },
-    "grouping_operation": {
-      "using_filesort": true,
-      "cost_info": {
-        "sort_cost": "8.00"
-      },
-      "table": %s
-    }
-  }
-}`, tableBlock)
-	}
-	tableBlock := explainTableBlock(table, rows, cols, "      ")
-	if strings.Contains(upper, "SQL_BUFFER_RESULT") {
-		tableBlock = explainTableBlock(table, rows, cols, "        ")
-		return fmt.Sprintf(`{
-  "query_block": {
-    "select_id": 1,
-    "cost_info": {
-      "query_cost": "1.05"
-    },
-    "buffer_result": {
-      "using_temporary_table": true,
-      "table": %s
-    }
-  }
-}`, tableBlock)
 	}
 
-	return fmt.Sprintf(`{
-  "query_block": {
-    "select_id": 1,
-    "cost_info": {
-      "query_cost": "1.05"
-    },
-    "table": %s
-  }
-}`, tableBlock)
+	// key
+	if row[6] != nil {
+		keyStr := fmt.Sprintf("%v", row[6])
+		kvs = append(kvs, orderedKV{"key", keyStr})
+		// used_key_parts
+		parts := strings.Split(keyStr, ",")
+		arr := make([]interface{}, len(parts))
+		for i, p := range parts {
+			arr[i] = strings.TrimSpace(p)
+		}
+		kvs = append(kvs, orderedKV{"used_key_parts", arr})
+	}
+
+	// key_length
+	if row[7] != nil {
+		kvs = append(kvs, orderedKV{"key_length", fmt.Sprintf("%v", row[7])})
+	}
+
+	// ref → array
+	if row[8] != nil {
+		refStr := fmt.Sprintf("%v", row[8])
+		if refStr != "" {
+			parts := strings.Split(refStr, ",")
+			arr := make([]interface{}, len(parts))
+			for i, p := range parts {
+				arr[i] = strings.TrimSpace(p)
+			}
+			kvs = append(kvs, orderedKV{"ref", arr})
+		}
+	}
+
+	// rows
+	var rowCount int64 = 1
+	if row[9] != nil {
+		switch v := row[9].(type) {
+		case int64:
+			rowCount = v
+		case int:
+			rowCount = int64(v)
+		}
+	}
+	kvs = append(kvs, orderedKV{"rows_examined_per_scan", rowCount})
+	kvs = append(kvs, orderedKV{"rows_produced_per_join", rowCount})
+
+	// filtered
+	filtered := "100.00"
+	if row[10] != nil {
+		filtered = fmt.Sprintf("%v", row[10])
+	}
+	kvs = append(kvs, orderedKV{"filtered", filtered})
+
+	// Extract table name for condition reconstruction and row size estimation
+	tableName := ""
+	if row[2] != nil {
+		tableName = fmt.Sprintf("%v", row[2])
+	}
+
+	// Parse extra for special fields (index_condition, attached_condition, etc.)
+	if row[11] != nil {
+		extraStr := fmt.Sprintf("%v", row[11])
+		if strings.Contains(extraStr, "Using index condition") {
+			cond := e.explainJSONBuildConditionFromQuery(query, tableName)
+			if cond != "" {
+				kvs = append(kvs, orderedKV{"index_condition", cond})
+			}
+		}
+		if strings.Contains(extraStr, "Using where") {
+			cond := e.explainJSONBuildConditionFromQuery(query, tableName)
+			if cond != "" {
+				kvs = append(kvs, orderedKV{"attached_condition", cond})
+			}
+		}
+	}
+
+	// cost_info
+	evalCost := float64(rowCount) * 0.10
+	readCost := float64(rowCount) * 0.25
+	prefixCost := evalCost + readCost
+
+	// Estimate data_read_per_join based on table definition if available
+	dataRead := rowCount * 56 // default estimate
+	if tableName != "" {
+		td := e.explainGetTableDef(tableName)
+		if td != nil {
+			rowSize := e.explainEstimateRowSize(td)
+			if rowSize > 0 {
+				dataRead = rowCount * int64(rowSize)
+			}
+		}
+	}
+
+	costInfo := []orderedKV{
+		{"read_cost", fmt.Sprintf("%.2f", readCost)},
+		{"eval_cost", fmt.Sprintf("%.2f", evalCost)},
+		{"prefix_cost", fmt.Sprintf("%.2f", prefixCost)},
+		{"data_read_per_join", fmt.Sprintf("%d", dataRead)},
+	}
+	kvs = append(kvs, orderedKV{"cost_info", costInfo})
+
+	// used_columns
+	usedCols := e.explainJSONUsedColumns(tableName, row)
+	if len(usedCols) > 0 {
+		arr := make([]interface{}, len(usedCols))
+		for i, c := range usedCols {
+			arr[i] = c
+		}
+		kvs = append(kvs, orderedKV{"used_columns", arr})
+	}
+
+	return kvs
+}
+
+// explainEstimateRowSize estimates the average row size in bytes for a table.
+// This attempts to match MySQL's rec_buff_length calculation used for data_read_per_join.
+func (e *Executor) explainEstimateRowSize(td *catalog.TableDef) int {
+	size := 0
+	charset := td.Charset
+	if charset == "" {
+		charset = "utf8mb4"
+	}
+	nullableCount := 0
+	for _, col := range td.Columns {
+		colCharset := col.Charset
+		if colCharset == "" {
+			colCharset = charset
+		}
+		upper := strings.ToUpper(col.Type)
+		switch {
+		case strings.HasPrefix(upper, "BIGINT"):
+			size += 8
+		case strings.HasPrefix(upper, "INT") || strings.HasPrefix(upper, "INTEGER"):
+			size += 4
+		case strings.HasPrefix(upper, "MEDIUMINT"):
+			size += 3
+		case strings.HasPrefix(upper, "SMALLINT"):
+			size += 2
+		case strings.HasPrefix(upper, "TINYINT"):
+			size += 1
+		case strings.HasPrefix(upper, "FLOAT"):
+			size += 4
+		case strings.HasPrefix(upper, "DOUBLE") || strings.HasPrefix(upper, "REAL"):
+			size += 8
+		case strings.HasPrefix(upper, "DECIMAL") || strings.HasPrefix(upper, "NUMERIC"):
+			size += 8 // rough estimate
+		case strings.HasPrefix(upper, "DATE"):
+			size += 3
+		case strings.HasPrefix(upper, "DATETIME") || strings.HasPrefix(upper, "TIMESTAMP"):
+			size += 5
+		case strings.HasPrefix(upper, "TIME"):
+			size += 3
+		case strings.HasPrefix(upper, "YEAR"):
+			size += 1
+		case strings.HasPrefix(upper, "CHAR"):
+			n := extractTypeLength(upper, 1)
+			size += n * charsetBytesPerChar(colCharset)
+		case strings.HasPrefix(upper, "VARCHAR"):
+			n := extractTypeLength(upper, 255)
+			size += n*charsetBytesPerChar(colCharset) + 2
+		case strings.HasPrefix(upper, "BINARY"):
+			n := extractTypeLength(upper, 1)
+			size += n
+		case strings.HasPrefix(upper, "VARBINARY"):
+			n := extractTypeLength(upper, 255)
+			size += n + 2
+		case strings.HasPrefix(upper, "ENUM"):
+			size += 2
+		case strings.HasPrefix(upper, "SET"):
+			size += 8
+		case strings.HasPrefix(upper, "TEXT"), strings.HasPrefix(upper, "BLOB"):
+			size += 256 // rough estimate
+		default:
+			size += 8
+		}
+		if col.Nullable {
+			nullableCount++
+		}
+	}
+	// MySQL adds overhead: null bitmap (1 byte per 8 nullable columns, min 1 if any nullable),
+	// plus 1 byte for the "delete mark", plus 1 for rec_buff_length = reclength + 1,
+	// plus 1 extra for row header alignment
+	if nullableCount > 0 {
+		size += (nullableCount + 7) / 8 // null bitmap
+	}
+	size += 3 // MySQL row overhead (delete mark + rec_buff padding + alignment)
+	return size
+}
+
+// explainJSONUsedColumns returns the list of column names used in the query for a given table.
+func (e *Executor) explainJSONUsedColumns(tableName string, row []interface{}) []string {
+	if tableName == "" {
+		return nil
+	}
+	td := e.explainGetTableDef(tableName)
+	if td == nil {
+		return nil
+	}
+	// Return all columns from the table definition
+	cols := make([]string, len(td.Columns))
+	for i, c := range td.Columns {
+		cols[i] = c.Name
+	}
+	return cols
+}
+
+// explainJSONBuildConditionFromQuery reconstructs the WHERE condition from the original query.
+// This is stored in the explainJSONDocument via a separate pass since rows don't carry the query.
+// The caller must set this field separately.
+func (e *Executor) explainJSONBuildConditionFromQuery(query string, tableName string) string {
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		return ""
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return ""
+	}
+	if sel.Where == nil {
+		return ""
+	}
+	// Format the WHERE expression in MySQL canonical form with qualified column names
+	dbName := e.CurrentDB
+	if dbName == "" {
+		dbName = "test"
+	}
+	return e.explainFormatExpr(sel.Where.Expr, dbName, tableName)
+}
+
+// explainFormatExpr formats an expression in MySQL canonical form: (`db`.`table`.`col` op val)
+func (e *Executor) explainFormatExpr(expr sqlparser.Expr, dbName, tableName string) string {
+	switch ex := expr.(type) {
+	case *sqlparser.IsExpr:
+		colName := explainExtractColumnName(ex.Left)
+		if colName != "" {
+			qualifiedCol := fmt.Sprintf("`%s`.`%s`.`%s`", dbName, tableName, colName)
+			switch ex.Right {
+			case sqlparser.IsNullOp:
+				return fmt.Sprintf("(%s is null)", qualifiedCol)
+			case sqlparser.IsNotNullOp:
+				return fmt.Sprintf("(%s is not null)", qualifiedCol)
+			case sqlparser.IsTrueOp:
+				return fmt.Sprintf("(%s is true)", qualifiedCol)
+			case sqlparser.IsFalseOp:
+				return fmt.Sprintf("(%s is false)", qualifiedCol)
+			}
+		}
+	case *sqlparser.ComparisonExpr:
+		colName := explainExtractColumnName(ex.Left)
+		if colName != "" {
+			qualifiedCol := fmt.Sprintf("`%s`.`%s`.`%s`", dbName, tableName, colName)
+			rightStr := sqlparser.String(ex.Right)
+			switch ex.Operator {
+			case sqlparser.EqualOp:
+				return fmt.Sprintf("(%s = %s)", qualifiedCol, rightStr)
+			case sqlparser.NotEqualOp:
+				return fmt.Sprintf("(%s <> %s)", qualifiedCol, rightStr)
+			case sqlparser.LessThanOp:
+				return fmt.Sprintf("(%s < %s)", qualifiedCol, rightStr)
+			case sqlparser.LessEqualOp:
+				return fmt.Sprintf("(%s <= %s)", qualifiedCol, rightStr)
+			case sqlparser.GreaterThanOp:
+				return fmt.Sprintf("(%s > %s)", qualifiedCol, rightStr)
+			case sqlparser.GreaterEqualOp:
+				return fmt.Sprintf("(%s >= %s)", qualifiedCol, rightStr)
+			}
+		}
+	case *sqlparser.AndExpr:
+		left := e.explainFormatExpr(ex.Left, dbName, tableName)
+		right := e.explainFormatExpr(ex.Right, dbName, tableName)
+		return fmt.Sprintf("(%s and %s)", left, right)
+	case *sqlparser.OrExpr:
+		left := e.explainFormatExpr(ex.Left, dbName, tableName)
+		right := e.explainFormatExpr(ex.Right, dbName, tableName)
+		return fmt.Sprintf("(%s or %s)", left, right)
+	}
+	return sqlparser.String(expr)
+}
+
+// explainJSONRowCount extracts the row count from an EXPLAIN row.
+func explainJSONRowCount(row []interface{}) int64 {
+	if row[9] != nil {
+		switch v := row[9].(type) {
+		case int64:
+			return v
+		case int:
+			return int64(v)
+		}
+	}
+	return 1
+}
+
+// explainJSONQueryBlockForRow builds a query_block structure for a single EXPLAIN row.
+func (e *Executor) explainJSONQueryBlockForRow(row []interface{}, query string) []orderedKV {
+	var qb []orderedKV
+	if row[0] != nil {
+		switch v := row[0].(type) {
+		case int64:
+			qb = append(qb, orderedKV{"select_id", v})
+		}
+	}
+	rc := explainJSONRowCount(row)
+	cost := float64(rc)*0.10 + float64(rc)*0.25
+	qb = append(qb, orderedKV{"cost_info", []orderedKV{{"query_cost", fmt.Sprintf("%.2f", cost)}}})
+	if row[2] != nil {
+		qb = append(qb, orderedKV{"table", e.explainJSONTableBlock(row, query)})
+	} else {
+		extra := ""
+		if row[11] != nil {
+			extra = fmt.Sprintf("%v", row[11])
+		}
+		if extra != "" {
+			qb = append(qb, orderedKV{"message", extra})
+		}
+	}
+	return qb
+}
+
+func (e *Executor) explainJSONDocument(query string) string {
+	// Get analyzed EXPLAIN rows from the traditional EXPLAIN logic
+	explainRows := e.explainMultiRows(query)
+	if len(explainRows) == 0 {
+		return `{"query_block": {"select_id": 1}}`
+	}
+
+	upper := strings.ToUpper(query)
+
+	// Parse each row to extract selectType and build structured JSON
+	type parsedRow struct {
+		id         interface{} // int64 or nil
+		selectType string
+		row        []interface{}
+	}
+
+	var parsed []parsedRow
+	for _, r := range explainRows {
+		st := ""
+		if r[1] != nil {
+			st = fmt.Sprintf("%v", r[1])
+		}
+		parsed = append(parsed, parsedRow{id: r[0], selectType: st, row: r})
+	}
+
+	// Calculate total query cost from all primary/simple rows
+	totalCost := 0.0
+	for _, p := range parsed {
+		if p.selectType == "SIMPLE" || p.selectType == "PRIMARY" {
+			rc := explainJSONRowCount(p.row)
+			totalCost += float64(rc)*0.10 + float64(rc)*0.25
+		}
+	}
+
+	// Detect filesort and GROUP BY
+	sortCost := 0.0
+	hasGroupBy := strings.Contains(upper, "GROUP BY")
+	hasSQLBufferResult := strings.Contains(upper, "SQL_BUFFER_RESULT")
+	hasFilesort := false
+	for _, p := range parsed {
+		if p.row[11] != nil {
+			extraStr := fmt.Sprintf("%v", p.row[11])
+			if strings.Contains(extraStr, "Using filesort") {
+				hasFilesort = true
+				rc := explainJSONRowCount(p.row)
+				sortCost = float64(rc) * 1.0
+			}
+		}
+	}
+	if hasFilesort {
+		totalCost += sortCost
+	}
+
+	// Separate rows by select type
+	var primaryRows []parsedRow
+	var subqueryRows []parsedRow
+	var derivedRows []parsedRow
+	var unionRows []parsedRow
+	var unionResultRow *parsedRow
+
+	for i := range parsed {
+		switch parsed[i].selectType {
+		case "SIMPLE", "PRIMARY":
+			primaryRows = append(primaryRows, parsed[i])
+		case "SUBQUERY":
+			subqueryRows = append(subqueryRows, parsed[i])
+		case "DERIVED":
+			derivedRows = append(derivedRows, parsed[i])
+		case "UNION":
+			unionRows = append(unionRows, parsed[i])
+		case "UNION RESULT":
+			p := parsed[i]
+			unionResultRow = &p
+		default:
+			primaryRows = append(primaryRows, parsed[i])
+		}
+	}
+
+	// Build the query_block with ordered keys
+	var queryBlock []orderedKV
+
+	// select_id
+	if parsed[0].id != nil {
+		switch v := parsed[0].id.(type) {
+		case int64:
+			queryBlock = append(queryBlock, orderedKV{"select_id", v})
+		default:
+			queryBlock = append(queryBlock, orderedKV{"select_id", int64(1)})
+		}
+	} else {
+		queryBlock = append(queryBlock, orderedKV{"select_id", int64(1)})
+	}
+
+	// cost_info
+	queryBlock = append(queryBlock, orderedKV{"cost_info", []orderedKV{
+		{"query_cost", fmt.Sprintf("%.2f", totalCost)},
+	}})
+
+	// Build the main content based on structure
+	if len(primaryRows) == 1 && len(subqueryRows) == 0 && len(derivedRows) == 0 && len(unionRows) == 0 && unionResultRow == nil {
+		// Simple query with a single table
+		p := primaryRows[0]
+		if p.row[2] == nil {
+			// No table (e.g., SELECT 1)
+			extra := ""
+			if p.row[11] != nil {
+				extra = fmt.Sprintf("%v", p.row[11])
+			}
+			if extra != "" {
+				queryBlock = append(queryBlock, orderedKV{"message", extra})
+			}
+			return e.explainJSONMarshal([]orderedKV{{"query_block", queryBlock}})
+		}
+
+		tblBlock := e.explainJSONTableBlock(p.row, query)
+
+		if hasGroupBy && hasSQLBufferResult {
+			groupOp := []orderedKV{
+				{"using_filesort", true},
+				{"cost_info", []orderedKV{{"sort_cost", fmt.Sprintf("%.2f", sortCost)}}},
+				{"buffer_result", []orderedKV{
+					{"using_temporary_table", true},
+					{"table", tblBlock},
+				}},
+			}
+			queryBlock = append(queryBlock, orderedKV{"grouping_operation", groupOp})
+		} else if hasGroupBy && hasFilesort {
+			groupOp := []orderedKV{
+				{"using_filesort", true},
+				{"cost_info", []orderedKV{{"sort_cost", fmt.Sprintf("%.2f", sortCost)}}},
+				{"table", tblBlock},
+			}
+			queryBlock = append(queryBlock, orderedKV{"grouping_operation", groupOp})
+		} else if hasSQLBufferResult {
+			queryBlock = append(queryBlock, orderedKV{"buffer_result", []orderedKV{
+				{"using_temporary_table", true},
+				{"table", tblBlock},
+			}})
+		} else {
+			queryBlock = append(queryBlock, orderedKV{"table", tblBlock})
+		}
+	} else if unionResultRow != nil {
+		// UNION query
+		var querySpecs []interface{}
+
+		for _, p := range primaryRows {
+			querySpecs = append(querySpecs, e.explainJSONQueryBlockForRow(p.row, query))
+		}
+		for _, p := range unionRows {
+			querySpecs = append(querySpecs, e.explainJSONQueryBlockForRow(p.row, query))
+		}
+
+		unionResult := []orderedKV{
+			{"using_temporary_table", true},
+			{"table_name", fmt.Sprintf("%v", unionResultRow.row[2])},
+		}
+		accessType := "ALL"
+		if unionResultRow.row[4] != nil {
+			accessType = fmt.Sprintf("%v", unionResultRow.row[4])
+		}
+		unionResult = append(unionResult, orderedKV{"access_type", accessType})
+		unionResult = append(unionResult, orderedKV{"query_specifications", querySpecs})
+
+		queryBlock = append(queryBlock, orderedKV{"union_result", unionResult})
+	} else {
+		// Complex query with subqueries and/or derived tables
+		if len(primaryRows) > 0 {
+			p := primaryRows[0]
+			if p.row[2] != nil {
+				tblBlock := e.explainJSONTableBlock(p.row, query)
+
+				// Check if the primary table references a derived table
+				tableName := fmt.Sprintf("%v", p.row[2])
+				if strings.HasPrefix(tableName, "<derived") {
+					// Find the corresponding DERIVED row
+					for _, d := range derivedRows {
+						if d.row[2] != nil {
+							innerQB := e.explainJSONQueryBlockForRow(d.row, query)
+							derivedBlock := []orderedKV{
+								{"using_temporary_table", true},
+								{"query_block", innerQB},
+							}
+							tblBlock = append(tblBlock, orderedKV{"materialized_from_subquery", derivedBlock})
+						}
+					}
+				}
+
+				if hasGroupBy && hasFilesort {
+					groupOp := []orderedKV{
+						{"using_filesort", true},
+						{"cost_info", []orderedKV{{"sort_cost", fmt.Sprintf("%.2f", sortCost)}}},
+						{"table", tblBlock},
+					}
+					queryBlock = append(queryBlock, orderedKV{"grouping_operation", groupOp})
+				} else {
+					queryBlock = append(queryBlock, orderedKV{"table", tblBlock})
+				}
+			}
+		}
+
+		// Attached subqueries
+		if len(subqueryRows) > 0 {
+			var attachedSubs []interface{}
+			for _, s := range subqueryRows {
+				attachedSubs = append(attachedSubs, e.explainJSONQueryBlockForRow(s.row, query))
+			}
+			queryBlock = append(queryBlock, orderedKV{"attached_subqueries", attachedSubs})
+		}
+	}
+
+	return e.explainJSONMarshal([]orderedKV{{"query_block", queryBlock}})
+}
+
+// orderedKV represents an ordered key-value pair for JSON output.
+type orderedKV struct {
+	Key   string
+	Value interface{}
+}
+
+// explainJSONMarshal marshals an ordered structure to a pretty-printed JSON string.
+func (e *Executor) explainJSONMarshal(v interface{}) string {
+	var b strings.Builder
+	e.explainJSONWrite(&b, v, 0)
+	return b.String()
+}
+
+// explainJSONWrite writes a JSON value with proper indentation.
+func (e *Executor) explainJSONWrite(b *strings.Builder, v interface{}, indent int) {
+	prefix := strings.Repeat("  ", indent)
+	switch val := v.(type) {
+	case []orderedKV:
+		b.WriteString("{\n")
+		for i, kv := range val {
+			b.WriteString(prefix + "  ")
+			b.WriteString(fmt.Sprintf("%q", kv.Key))
+			b.WriteString(": ")
+			e.explainJSONWrite(b, kv.Value, indent+1)
+			if i < len(val)-1 {
+				b.WriteString(",")
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString(prefix + "}")
+	case []interface{}:
+		b.WriteString("[\n")
+		for i, item := range val {
+			b.WriteString(prefix + "  ")
+			e.explainJSONWrite(b, item, indent+1)
+			if i < len(val)-1 {
+				b.WriteString(",")
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString(prefix + "]")
+	case string:
+		b.WriteString(fmt.Sprintf("%q", val))
+	case int64:
+		b.WriteString(fmt.Sprintf("%d", val))
+	case int:
+		b.WriteString(fmt.Sprintf("%d", val))
+	case float64:
+		b.WriteString(fmt.Sprintf("%g", val))
+	case bool:
+		if val {
+			b.WriteString("true")
+		} else {
+			b.WriteString("false")
+		}
+	case nil:
+		b.WriteString("null")
+	default:
+		// Fallback to json.Marshal
+		data, _ := json.Marshal(val)
+		b.Write(data)
+	}
 }
 
 func (e *Executor) explainTreeText(query string) string {
