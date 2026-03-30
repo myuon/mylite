@@ -759,9 +759,12 @@ func (e *Executor) execCallProcedure(query string) (*Result, error) {
 	}
 	procName = strings.Trim(procName, "`")
 
-	// Handle well-known no-op procedures (e.g. mtr.add_suppression)
+	// Handle qualified procedure name (db.proc_name)
 	if strings.Contains(procName, ".") {
-		return &Result{}, nil
+		parts := strings.SplitN(procName, ".", 2)
+		dbName := strings.Trim(parts[0], "`")
+		procName = strings.Trim(parts[1], "`")
+		return e.callProcedureByNameInDB(dbName, procName, argStrs)
 	}
 
 	return e.callProcedureByName(procName, argStrs)
@@ -772,18 +775,59 @@ func (e *Executor) execCallProcFromAST(stmt *sqlparser.CallProc) (*Result, error
 	procName := stmt.Name.Name.String()
 	procName = strings.Trim(procName, "`")
 
-	// Handle well-known no-op procedures
-	qualifier := stmt.Name.Qualifier.String()
-	if qualifier != "" {
-		return &Result{}, nil
-	}
-
 	var argStrs []string
 	for _, arg := range stmt.Params {
 		argStrs = append(argStrs, sqlparser.String(arg))
 	}
 
+	// Handle qualified procedure name (db.proc_name)
+	qualifier := stmt.Name.Qualifier.String()
+	if qualifier != "" {
+		return e.callProcedureByNameInDB(qualifier, procName, argStrs)
+	}
+
 	return e.callProcedureByName(procName, argStrs)
+}
+
+// callProcedureByNameInDB looks up and executes a stored procedure in a specific database.
+func (e *Executor) callProcedureByNameInDB(dbName string, procName string, argStrs []string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		// Silently accept calls to procedures in unknown databases for compatibility
+		return &Result{}, nil
+	}
+
+	proc := db.GetProcedure(procName)
+	if proc == nil {
+		// Silently accept calls to non-existent procedures for compatibility
+		return &Result{}, nil
+	}
+
+	// Build parameter mapping: bind IN params, track OUT params
+	paramVars := make(map[string]interface{})
+	for i, param := range proc.Params {
+		if i < len(argStrs) {
+			argVal := strings.TrimSpace(argStrs[i])
+			if strings.HasPrefix(argVal, "@") {
+				if param.Mode == "IN" || param.Mode == "INOUT" {
+					paramVars[param.Name] = argVal
+				}
+			} else {
+				if n, err := strconv.ParseInt(argVal, 10, 64); err == nil {
+					paramVars[param.Name] = n
+				} else {
+					paramVars[param.Name] = strings.Trim(argVal, "'\"")
+				}
+			}
+		}
+	}
+
+	_, err = e.execRoutineBody(proc.Body, paramVars)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Result{}, nil
 }
 
 // callProcedureByName looks up and executes a stored procedure.
