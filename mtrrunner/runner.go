@@ -1773,6 +1773,13 @@ func (ctx *execContext) evaluateIfConditionInner(condStr string) bool {
 		if idx := strings.Index(condStr, op); idx >= 0 {
 			left := strings.TrimSpace(condStr[:idx])
 			right := strings.TrimSpace(condStr[idx+len(op):])
+			// Strip surrounding single quotes (mysqltest convention: 'value')
+			if len(left) >= 2 && left[0] == '\'' && left[len(left)-1] == '\'' {
+				left = left[1 : len(left)-1]
+			}
+			if len(right) >= 2 && right[0] == '\'' && right[len(right)-1] == '\'' {
+				right = right[1 : len(right)-1]
+			}
 			lNum, lErr := strconv.ParseFloat(left, 64)
 			rNum, rErr := strconv.ParseFloat(right, 64)
 			if lErr == nil && rErr == nil {
@@ -2549,6 +2556,13 @@ func (ctx *execContext) setVariable(expr string) error {
 			return nil
 		}
 		sqlStmt := strings.TrimSpace(rest[:secondLastComma])
+		// Strip surrounding quotes from the SQL statement (MTR uses "..." or '...')
+		if len(sqlStmt) >= 2 {
+			if (sqlStmt[0] == '"' && sqlStmt[len(sqlStmt)-1] == '"') ||
+				(sqlStmt[0] == '\'' && sqlStmt[len(sqlStmt)-1] == '\'') {
+				sqlStmt = sqlStmt[1 : len(sqlStmt)-1]
+			}
+		}
 		// rowNum is 1-based
 		rowNum, _ := strconv.Atoi(rowNumStr)
 		if rowNum < 1 {

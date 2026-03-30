@@ -825,8 +825,27 @@ func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 }
 
 func (e *Executor) infoSchemaInnoDBTablespaces() []storage.Row {
+	// Start with the two default undo tablespaces (innodb_undo_001, innodb_undo_002).
+	// MySQL always creates these at startup; MTR tests rely on their presence.
+	rows := []storage.Row{
+		{
+			"SPACE":         int64(0xFFFFFFFE),
+			"NAME":          "innodb_undo_001",
+			"ROW_FORMAT":    "Undo",
+			"PAGE_SIZE":     int64(16384),
+			"ZIP_PAGE_SIZE": int64(0),
+			"SPACE_TYPE":    "Undo",
+		},
+		{
+			"SPACE":         int64(0xFFFFFFFD),
+			"NAME":          "innodb_undo_002",
+			"ROW_FORMAT":    "Undo",
+			"PAGE_SIZE":     int64(16384),
+			"ZIP_PAGE_SIZE": int64(0),
+			"SPACE_TYPE":    "Undo",
+		},
+	}
 	tables := e.infoSchemaInnoDBTables()
-	rows := make([]storage.Row, 0, len(tables))
 	for _, t := range tables {
 		name := toString(t["NAME"])
 		rows = append(rows, storage.Row{
