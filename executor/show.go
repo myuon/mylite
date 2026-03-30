@@ -1319,6 +1319,9 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 					defVal = "'" + inner + "'"
 				}
 				parts = append(parts, fmt.Sprintf("DEFAULT %s", defVal))
+			} else if strings.HasPrefix(strings.ToUpper(defVal), "CURRENT_TIMESTAMP") {
+				// CURRENT_TIMESTAMP and CURRENT_TIMESTAMP(N) are shown unquoted
+				parts = append(parts, fmt.Sprintf("DEFAULT %s", defVal))
 			} else {
 				// Pad BINARY default values.
 				if padLen := binaryPadLength(col.Type); padLen > 0 && len(defVal) < padLen {
@@ -1334,6 +1337,17 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 			if !isBlobOrText {
 				parts = append(parts, "DEFAULT NULL")
 			}
+		}
+		if col.OnUpdateCurrentTimestamp {
+			// Show ON UPDATE CURRENT_TIMESTAMP with precision matching the column type
+			fsp := ""
+			if idx := strings.Index(colTypeLower, "("); idx >= 0 {
+				end := strings.Index(colTypeLower[idx:], ")")
+				if end >= 0 {
+					fsp = colTypeLower[idx : idx+end+1]
+				}
+			}
+			parts = append(parts, fmt.Sprintf("ON UPDATE CURRENT_TIMESTAMP%s", fsp))
 		}
 		if col.Comment != "" {
 			parts = append(parts, fmt.Sprintf("COMMENT '%s'", col.Comment))

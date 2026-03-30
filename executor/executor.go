@@ -1022,31 +1022,39 @@ func (e *Executor) initSystemTables() {
 			{Name: "Grant_priv", Type: "VARCHAR(1)"},
 		},
 	})
+	logDefaultTS := "CURRENT_TIMESTAMP(6)"
 	ensure("mysql", &catalog.TableDef{
-		Name: "general_log",
+		Name:    "general_log",
+		Engine:  "CSV",
+		Charset: "utf8",
+		Comment: "General log",
 		Columns: []catalog.ColumnDef{
-			{Name: "event_time", Type: "TIMESTAMP"},
-			{Name: "user_host", Type: "VARCHAR(255)"},
-			{Name: "thread_id", Type: "BIGINT"},
-			{Name: "server_id", Type: "BIGINT"},
+			{Name: "event_time", Type: "TIMESTAMP(6)", Default: &logDefaultTS, OnUpdateCurrentTimestamp: true},
+			{Name: "user_host", Type: "MEDIUMTEXT"},
+			{Name: "thread_id", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "server_id", Type: "INT(10) UNSIGNED"},
 			{Name: "command_type", Type: "VARCHAR(64)"},
-			{Name: "argument", Type: "TEXT"},
+			{Name: "argument", Type: "MEDIUMBLOB"},
 		},
 	})
 	ensure("mysql", &catalog.TableDef{
-		Name: "slow_log",
+		Name:    "slow_log",
+		Engine:  "CSV",
+		Charset: "utf8",
+		Comment: "Slow log",
 		Columns: []catalog.ColumnDef{
-			{Name: "start_time", Type: "TIMESTAMP"},
-			{Name: "user_host", Type: "VARCHAR(255)"},
-			{Name: "query_time", Type: "VARCHAR(20)"},
-			{Name: "lock_time", Type: "VARCHAR(20)"},
-			{Name: "rows_sent", Type: "BIGINT"},
-			{Name: "rows_examined", Type: "BIGINT"},
+			{Name: "start_time", Type: "TIMESTAMP(6)", Default: &logDefaultTS, OnUpdateCurrentTimestamp: true},
+			{Name: "user_host", Type: "MEDIUMTEXT"},
+			{Name: "query_time", Type: "TIME(6)"},
+			{Name: "lock_time", Type: "TIME(6)"},
+			{Name: "rows_sent", Type: "INT(11)"},
+			{Name: "rows_examined", Type: "INT(11)"},
 			{Name: "db", Type: "VARCHAR(512)"},
-			{Name: "last_insert_id", Type: "BIGINT"},
-			{Name: "insert_id", Type: "BIGINT"},
-			{Name: "server_id", Type: "BIGINT"},
-			{Name: "sql_text", Type: "TEXT"},
+			{Name: "last_insert_id", Type: "INT(11)"},
+			{Name: "insert_id", Type: "INT(11)"},
+			{Name: "server_id", Type: "INT(10) UNSIGNED"},
+			{Name: "sql_text", Type: "MEDIUMBLOB"},
+			{Name: "thread_id", Type: "BIGINT(21) UNSIGNED"},
 		},
 	})
 	ensure("mysql", &catalog.TableDef{
@@ -4993,6 +5001,49 @@ func (e *Executor) explainResultForType(explainType sqlparser.ExplainType, expla
 	}
 }
 
+// logToGeneralLog appends a row to mysql.general_log when the general_log
+// global variable is enabled and sql_log_off is not set.
+func (e *Executor) logToGeneralLog(query string) {
+	// Check if general_log is ON
+	if v, ok := e.globalScopeVars["general_log"]; ok {
+		if !strings.EqualFold(v, "ON") && v != "1" {
+			return
+		}
+	}
+	// Check if sql_log_off is set for this session
+	if v, ok := e.sessionScopeVars["sql_log_off"]; ok {
+		if strings.EqualFold(v, "ON") || v == "1" {
+			return
+		}
+	}
+	// Check if log_output includes TABLE
+	logOutput := "FILE"
+	if v, ok := e.globalScopeVars["log_output"]; ok {
+		logOutput = v
+	} else if v, ok := e.startupVars["log_output"]; ok {
+		logOutput = v
+	}
+	if !strings.Contains(strings.ToUpper(logOutput), "TABLE") {
+		return
+	}
+	tbl, err := e.Storage.GetTable("mysql", "general_log")
+	if err != nil {
+		return
+	}
+	now := time.Now().Format("2006-01-02 15:04:05.000000")
+	row := storage.Row{
+		"event_time":   now,
+		"user_host":    "root[root] @ localhost []",
+		"thread_id":    int64(1),
+		"server_id":    int64(1),
+		"command_type": "Query",
+		"argument":     strings.TrimRight(strings.TrimSpace(query), ";"),
+	}
+	tbl.Mu.Lock()
+	tbl.Rows = append(tbl.Rows, row)
+	tbl.Mu.Unlock()
+}
+
 // recordStatementDigest records a statement digest for performance_schema
 // events_statements_summary_by_digest and histogram tables.
 func (e *Executor) recordStatementDigest(query string) {
@@ -5040,6 +5091,9 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	if result != nil || err != nil {
 		return result, err
 	}
+
+	// Log query to mysql.general_log if general_log is enabled
+	e.logToGeneralLog(query)
 
 	// Record statement digest for performance_schema digest tables
 	e.recordStatementDigest(query)
@@ -5282,6 +5336,20 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	case *sqlparser.Set:
 		return e.execSet(s)
 	case *sqlparser.LockTables:
+		// ER_CANT_LOCK_LOG_TABLE: MySQL log tables cannot be locked
+		for _, tl := range s.Tables {
+			if ate, ok := tl.Table.(*sqlparser.AliasedTableExpr); ok {
+				if tn, ok := ate.Expr.(sqlparser.TableName); ok {
+					lockDB := e.CurrentDB
+					if !tn.Qualifier.IsEmpty() {
+						lockDB = tn.Qualifier.String()
+					}
+					if isMySQLLogTable(lockDB, tn.Name.String()) {
+						return nil, mysqlError(1532, "HY000", "You can't use locks with log tables.")
+					}
+				}
+			}
+		}
 		// Release any previously held table locks (MySQL behavior: LOCK TABLES implicitly unlocks)
 		if e.tableLockManager != nil {
 			e.tableLockManager.UnlockAll(e.connectionID)

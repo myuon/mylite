@@ -11,6 +11,36 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
+// isMySQLLogTable returns true if the given database and table name refer to
+// one of the MySQL log tables (general_log or slow_log).
+func isMySQLLogTable(dbName, tableName string) bool {
+	if !strings.EqualFold(dbName, "mysql") {
+		return false
+	}
+	lower := strings.ToLower(tableName)
+	return lower == "general_log" || lower == "slow_log"
+}
+
+// isLogTableLoggingEnabled checks whether logging is currently enabled for the
+// given MySQL log table. general_log is protected when general_log='ON',
+// slow_log is protected when slow_query_log='ON'.
+func (e *Executor) isLogTableLoggingEnabled(tableName string) bool {
+	lower := strings.ToLower(tableName)
+	switch lower {
+	case "general_log":
+		if v, ok := e.globalScopeVars["general_log"]; ok {
+			return strings.EqualFold(v, "ON") || v == "1"
+		}
+		return true // default is ON
+	case "slow_log":
+		if v, ok := e.globalScopeVars["slow_query_log"]; ok {
+			return strings.EqualFold(v, "ON") || v == "1"
+		}
+		return true // default is ON
+	}
+	return false
+}
+
 func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error) {
 	for _, pair := range stmt.TablePairs {
 		oldName := pair.FromTable.Name.String()
@@ -1187,6 +1217,10 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 		if !table.Qualifier.IsEmpty() {
 			dbName = table.Qualifier.String()
 		}
+		// Protect MySQL log tables from DROP when logging is enabled
+		if isMySQLLogTable(dbName, tableName) && e.isLogTableLoggingEnabled(tableName) {
+			return nil, mysqlError(1580, "HY000", "You cannot 'DROP' a log table if logging is enabled")
+		}
 		db, err := e.Catalog.GetDatabase(dbName)
 		if err != nil {
 			if stmt.IfExists {
@@ -1309,12 +1343,43 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		return nil, mysqlError(1044, "42000", "Access denied for user 'root'@'localhost' to database 'performance_schema'")
 	}
 
+	tableName := stmt.Table.Name.String()
+
+	// Protect MySQL log tables from ALTER when logging is enabled
+	if isMySQLLogTable(dbName, tableName) && e.isLogTableLoggingEnabled(tableName) {
+		return nil, mysqlError(1580, "HY000", "You cannot 'ALTER' a log table if logging is enabled")
+	}
+
+	// Check engine restrictions for log tables (even when logging is disabled)
+	if isMySQLLogTable(dbName, tableName) {
+		for _, opt := range stmt.AlterOptions {
+			if tblOpts, ok := opt.(sqlparser.TableOptions); ok {
+				for _, to := range tblOpts {
+					if strings.EqualFold(to.Name, "ENGINE") {
+						engineVal := strings.ToUpper(tableOptionString(to))
+						// Check if engine exists
+						switch engineVal {
+						case "INNODB", "MYISAM", "CSV", "ARCHIVE", "BLACKHOLE", "HEAP", "MEMORY",
+							"MERGE", "MRG_MYISAM", "FEDERATED", "NDB", "NDBCLUSTER", "EXAMPLE",
+							"PERFORMANCE_SCHEMA":
+							// Known engines - check if suitable for log tables
+						default:
+							return nil, mysqlError(1286, "42000", fmt.Sprintf("Unknown storage engine '%s'", tableOptionString(to)))
+						}
+						// MEMORY and similar engines cannot be used for log tables
+						if engineVal == "MEMORY" || engineVal == "HEAP" {
+							return nil, mysqlError(1579, "HY000", "This storage engine cannot be used for log tables")
+						}
+					}
+				}
+			}
+		}
+	}
+
 	db, err := e.Catalog.GetDatabase(dbName)
 	if err != nil {
 		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
 	}
-
-	tableName := stmt.Table.Name.String()
 
 	// Ensure the storage table exists.
 	tbl, err := e.Storage.GetTable(dbName, tableName)
@@ -1908,6 +1973,11 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		case sqlparser.TableOptions:
 			for _, to := range op {
 				switch strings.ToUpper(to.Name) {
+				case "ENGINE":
+					tableDef, _ := db.GetTable(tableName)
+					if tableDef != nil {
+						tableDef.Engine = tableOptionString(to)
+					}
 				case "AUTO_INCREMENT":
 					if val, err := strconv.ParseInt(to.Value.Val, 10, 64); err == nil {
 						tbl.AutoIncrement.Store(val - 1)
