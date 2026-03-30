@@ -155,6 +155,12 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		applyMasterOpt(string(optData), ectx)
 	}
 
+	// Read .cnf file to apply server options from [mysqld.1] section
+	cnfPath := filepath.Join(filepath.Dir(testPath), name+".cnf")
+	if cnfData, err := os.ReadFile(cnfPath); err == nil {
+		applyCnfFile(string(cnfData), ectx)
+	}
+
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -2776,6 +2782,54 @@ func applyMasterOpt(content string, ctx *execContext) {
 			ctx.variables["$"+varKey] = val
 			// Apply as startup variable (SET STARTUP is a special mylite command)
 			ctx.getActiveConn().ExecContext(context.Background(), fmt.Sprintf("SET STARTUP %s = %s", varKey, val)) //nolint:errcheck
+		}
+	}
+}
+
+// applyCnfFile parses a MySQL .cnf file and applies options from the [mysqld.1]
+// section to the exec context, similar to applyMasterOpt.
+func applyCnfFile(content string, ctx *execContext) {
+	inMysqld1 := false
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "!") {
+			continue
+		}
+		// Section headers
+		if strings.HasPrefix(line, "[") {
+			inMysqld1 = (line == "[mysqld.1]")
+			continue
+		}
+		if !inMysqld1 {
+			continue
+		}
+		// Parse key=value or standalone key (boolean flag)
+		if eqIdx := strings.Index(line, "="); eqIdx >= 0 {
+			key := strings.TrimSpace(line[:eqIdx])
+			val := strings.TrimSpace(line[eqIdx+1:])
+			varKey := strings.ReplaceAll(key, "-", "_")
+			// Special handling for log-error: MySQL appends .err if no extension
+			if varKey == "log_error" && !strings.Contains(val, ".") {
+				val = val + ".err"
+			}
+			ctx.variables["$"+key] = val
+			ctx.variables["$"+varKey] = val
+			ctx.getActiveConn().ExecContext(context.Background(), fmt.Sprintf("SET STARTUP %s = '%s'", varKey, val)) //nolint:errcheck
+		} else {
+			// Boolean flag without value
+			key := line
+			varKey := strings.ReplaceAll(key, "-", "_")
+			// Special handling for log-error without value: MySQL uses hostname.err
+			if varKey == "log_error" {
+				val := "mylite.err"
+				ctx.variables["$"+key] = val
+				ctx.variables["$"+varKey] = val
+				ctx.getActiveConn().ExecContext(context.Background(), fmt.Sprintf("SET STARTUP %s = '%s'", varKey, val)) //nolint:errcheck
+			} else {
+				ctx.variables["$"+key] = "1"
+				ctx.variables["$"+varKey] = "1"
+				ctx.getActiveConn().ExecContext(context.Background(), fmt.Sprintf("SET STARTUP %s = %s", varKey, "1")) //nolint:errcheck
+			}
 		}
 	}
 }

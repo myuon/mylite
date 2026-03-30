@@ -159,6 +159,14 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							delete(e.sessionScopeVars, cleanName)
 						}
 					}
+					// When max_join_size is reset to DEFAULT, sql_big_selects goes back to ON.
+					if cleanName == "max_join_size" {
+						if isGlobal {
+							e.globalScopeVars["sql_big_selects"] = "ON"
+						} else {
+							e.sessionScopeVars["sql_big_selects"] = "ON"
+						}
+					}
 					// Skip the isGlobal move-to-global block below since DEFAULT
 					// already handled the proper scope placement.
 					continue
@@ -174,6 +182,15 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						return nil, err
 					}
 					e.sessionScopeVars[cleanName] = clamped
+					// When max_join_size is set, update sql_big_selects accordingly.
+					// Non-default value -> sql_big_selects = OFF; default -> ON.
+					if cleanName == "max_join_size" && !isGlobal {
+						if clamped == "18446744073709551615" {
+							e.sessionScopeVars["sql_big_selects"] = "ON"
+						} else {
+							e.sessionScopeVars["sql_big_selects"] = "OFF"
+						}
+					}
 				} else if cleanName == "innodb_io_capacity_max" {
 					// INTEGER only, minimum 100, and cannot be set lower than innodb_io_capacity.
 					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
@@ -376,6 +393,14 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						// Trigger variables reset immediately after being set
 						if triggerSysVars[cleanName] {
 							e.globalScopeVars[cleanName] = "OFF"
+						}
+						// When max_join_size is set globally, update global sql_big_selects.
+						if cleanName == "max_join_size" {
+							if v == "18446744073709551615" {
+								e.globalScopeVars["sql_big_selects"] = "ON"
+							} else {
+								e.globalScopeVars["sql_big_selects"] = "OFF"
+							}
 						}
 						// Restore the previous session value or remove if there wasn't one.
 						if prevVal, had := savedSessionVal[cleanName]; had {

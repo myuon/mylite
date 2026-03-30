@@ -428,8 +428,9 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		preparedStmts: make(map[string]string),
 		tempTables:    make(map[string]bool),
 		globalScopeVars: map[string]string{
-			"general_log":    "ON",
-			"slow_query_log": "ON",
+			"general_log":                         "ON",
+			"slow_query_log":                      "ON",
+			"log_bin_trust_function_creators":      "ON",
 		},
 		sessionScopeVars: make(map[string]string),
 		startupVars: map[string]string{

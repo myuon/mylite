@@ -82,9 +82,10 @@ type TriggerDef struct {
 
 // ProcedureDef represents a stored procedure definition.
 type ProcedureDef struct {
-	Name   string
-	Params []ProcParam
-	Body   []string // SQL statements in the procedure body
+	Name        string
+	Params      []ProcParam
+	Body        []string // SQL statements in the procedure body
+	OriginalSQL string   // original CREATE PROCEDURE statement
 }
 
 // ProcParam represents a parameter in a stored procedure.
@@ -101,6 +102,7 @@ type FunctionDef struct {
 	ReturnType    string
 	Body          []string // SQL statements in the function body
 	Deterministic bool     // true if declared DETERMINISTIC
+	OriginalSQL   string   // original CREATE FUNCTION statement
 }
 
 // Database represents a database containing tables.

@@ -275,6 +275,21 @@ func (e *Executor) execDropTrigger(query string) (*Result, error) {
 	return &Result{}, nil
 }
 
+// triggerBodyNeedsRoutineInterpreter returns true if the trigger body contains
+// control flow statements (IF, WHILE, CASE, LOOP, REPEAT, DECLARE, BEGIN) that
+// require the full routine body interpreter.
+func triggerBodyNeedsRoutineInterpreter(body []string) bool {
+	for _, stmt := range body {
+		upper := strings.ToUpper(strings.TrimSpace(stmt))
+		for _, kw := range []string{"IF ", "WHILE ", "CASE ", "CASE\n", "LOOP", "REPEAT ", "DECLARE ", "BEGIN"} {
+			if strings.HasPrefix(upper, kw) || upper == strings.TrimSpace(kw) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // fireTriggers executes all triggers matching the given timing and event for the specified table.
 // The newRow and oldRow maps provide NEW and OLD pseudo-record values.
 // For BEFORE triggers, SET NEW.col = val modifies newRow in place.
@@ -286,6 +301,14 @@ func (e *Executor) fireTriggers(tableName, timing, event string, newRow, oldRow 
 
 	triggers := db.GetTriggersForTable(tableName, timing, event)
 	for _, tr := range triggers {
+		// If the trigger body contains control flow, use the routine interpreter
+		if triggerBodyNeedsRoutineInterpreter(tr.Body) {
+			if err := e.fireTriggerWithRoutineInterpreter(tr, timing, newRow, oldRow); err != nil {
+				return err
+			}
+			continue
+		}
+
 		for _, stmtStr := range tr.Body {
 			stmtUpper := strings.ToUpper(strings.TrimSpace(stmtStr))
 			// Handle SET NEW.col = value in BEFORE triggers
@@ -301,6 +324,52 @@ func (e *Executor) fireTriggers(tableName, timing, event string, newRow, oldRow 
 			}
 		}
 	}
+	return nil
+}
+
+// fireTriggerWithRoutineInterpreter executes a trigger body through the routine
+// body interpreter, enabling support for IF/THEN, WHILE, CASE, LOOP, REPEAT,
+// DECLARE, and other control flow statements.
+func (e *Executor) fireTriggerWithRoutineInterpreter(tr *catalog.TriggerDef, timing string, newRow, oldRow storage.Row) error {
+	ctx := &routineContext{
+		localVars:     make(map[string]interface{}),
+		cursors:       make(map[string]*cursorState),
+		cursorDefs:    make(map[string]string),
+		triggerNewRow: newRow,
+		triggerOldRow: oldRow,
+		triggerTiming: timing,
+	}
+
+	// Populate local variables for NEW.col and OLD.col so the routine
+	// interpreter can resolve them in SET statements and expressions.
+	// For SQL statements (INSERT, etc.), resolveNewOldRefs is used instead
+	// for proper SQL quoting of string values.
+	if newRow != nil {
+		for col, val := range newRow {
+			ctx.localVars["NEW."+col] = val
+		}
+	}
+	if oldRow != nil {
+		for col, val := range oldRow {
+			ctx.localVars["OLD."+col] = val
+		}
+	}
+
+	_, err := e.execRoutineBodyWithContext(tr.Body, ctx)
+	if err != nil {
+		return err
+	}
+
+	// For BEFORE triggers, copy any modified NEW.col values back to newRow
+	if timing == "BEFORE" && newRow != nil {
+		for k, v := range ctx.localVars {
+			if strings.HasPrefix(k, "NEW.") {
+				colName := k[4:]
+				newRow[colName] = v
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -534,9 +603,10 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 	}
 
 	procDef := &catalog.ProcedureDef{
-		Name:   procName,
-		Params: params,
-		Body:   bodyStmts,
+		Name:        procName,
+		Params:      params,
+		Body:        bodyStmts,
+		OriginalSQL: query,
 	}
 	db.CreateProcedure(procDef)
 
@@ -729,31 +799,67 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 		return &Result{}, nil
 	}
 
-	// Build parameter mapping: bind IN params, track OUT params
+	// Build parameter mapping: bind IN/INOUT params, track OUT param user-variable targets.
 	paramVars := make(map[string]interface{})
+	// outTargets maps parameter name -> caller's user variable name (without '@')
+	outTargets := make(map[string]string)
 	for i, param := range proc.Params {
 		if i < len(argStrs) {
 			argVal := strings.TrimSpace(argStrs[i])
 			if strings.HasPrefix(argVal, "@") {
-				// User variable reference
+				userVar := strings.TrimPrefix(argVal, "@")
+				// Track OUT/INOUT targets for writeback
+				if param.Mode == "OUT" || param.Mode == "INOUT" {
+					outTargets[param.Name] = userVar
+				}
+				// Resolve the user variable value for IN/INOUT params
 				if param.Mode == "IN" || param.Mode == "INOUT" {
-					paramVars[param.Name] = argVal
+					if val, ok := e.userVars[userVar]; ok {
+						paramVars[param.Name] = val
+					} else {
+						paramVars[param.Name] = nil
+					}
+				}
+				// For pure OUT params, initialize to nil
+				if param.Mode == "OUT" {
+					paramVars[param.Name] = nil
 				}
 			} else {
-				// Literal value - try to parse as number
-				if n, err := strconv.ParseInt(argVal, 10, 64); err == nil {
-					paramVars[param.Name] = n
-				} else {
-					paramVars[param.Name] = strings.Trim(argVal, "'\"")
+				// Literal value - only valid for IN params
+				if param.Mode == "IN" {
+					if n, err := strconv.ParseInt(argVal, 10, 64); err == nil {
+						paramVars[param.Name] = n
+					} else {
+						paramVars[param.Name] = strings.Trim(argVal, "'\"")
+					}
 				}
+				// Literals for OUT/INOUT are silently ignored (no writeback target)
 			}
 		}
 	}
 
-	// Execute body using the routine executor with cursor support
-	_, err = e.execRoutineBody(proc.Body, paramVars)
+	// Execute body using the routine executor with cursor support.
+	// We create the context directly so we can read back final variable values.
+	ctx := &routineContext{
+		localVars:  make(map[string]interface{}),
+		cursors:    make(map[string]*cursorState),
+		cursorDefs: make(map[string]string),
+	}
+	for k, v := range paramVars {
+		ctx.localVars[k] = v
+	}
+	_, err = e.execRoutineBodyWithContext(proc.Body, ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	// Write back OUT/INOUT parameter values to caller's user variables
+	for paramName, userVar := range outTargets {
+		val := ctx.localVars[paramName]
+		if e.userVars == nil {
+			e.userVars = make(map[string]interface{})
+		}
+		e.userVars[userVar] = val
 	}
 
 	return &Result{}, nil
@@ -917,10 +1023,11 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 	}
 
 	funcDef := &catalog.FunctionDef{
-		Name:       funcName,
-		Params:     params,
-		ReturnType: returnType,
-		Body:       bodyStmts,
+		Name:        funcName,
+		Params:      params,
+		ReturnType:  returnType,
+		Body:        bodyStmts,
+		OriginalSQL: query,
 	}
 	db.CreateFunction(funcDef)
 
@@ -1086,6 +1193,26 @@ type routineContext struct {
 	done               bool
 	handlers           []handlerDef
 	currentSignal      *signalError // the signal currently being handled (for bare RESIGNAL)
+	triggerNewRow      storage.Row  // non-nil when executing a trigger body (for NEW.col resolution)
+	triggerOldRow      storage.Row  // non-nil when executing a trigger body (for OLD.col resolution)
+	triggerTiming      string       // "BEFORE" or "AFTER" for trigger execution
+}
+
+// childContext creates a child routineContext that shares state with the parent
+// but can have its own handler scope. Trigger context is always propagated.
+func (ctx *routineContext) childContext() *routineContext {
+	child := &routineContext{
+		localVars:          ctx.localVars,
+		cursors:            ctx.cursors,
+		cursorDefs:         ctx.cursorDefs,
+		notFoundHandlerVar: ctx.notFoundHandlerVar,
+		done:               ctx.done,
+		handlers:           ctx.handlers,
+		triggerNewRow:       ctx.triggerNewRow,
+		triggerOldRow:       ctx.triggerOldRow,
+		triggerTiming:       ctx.triggerTiming,
+	}
+	return child
 }
 
 // execRoutineBody executes the body of a stored procedure or function, supporting
@@ -1754,13 +1881,7 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 			inner = strings.TrimRight(inner, ";")
 			stmts := splitTriggerBody(inner)
 			// Create a child context sharing state but with own handler scope
-			childCtx := &routineContext{
-				localVars:          localVars,
-				cursors:            cursors,
-				cursorDefs:         cursorDefs,
-				notFoundHandlerVar: notFoundHandlerVar,
-				done:               done,
-			}
+			childCtx := ctx.childContext()
 			retVal, err := e.execRoutineBodyWithContext(stmts, childCtx)
 			if err != nil {
 				var exitErr *exitHandlerError
@@ -1811,7 +1932,12 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 		}
 
 		// General SQL statement - substitute local variables and execute
-		resolvedSQL := e.substituteLocalVars(stmtStr, localVars)
+		resolvedSQL := stmtStr
+		// In trigger context, resolve NEW/OLD refs with proper SQL quoting first
+		if ctx.triggerNewRow != nil || ctx.triggerOldRow != nil {
+			resolvedSQL = e.resolveNewOldRefs(resolvedSQL, ctx.triggerNewRow, ctx.triggerOldRow)
+		}
+		resolvedSQL = e.substituteLocalVars(resolvedSQL, localVars)
 		_, err := e.Execute(resolvedSQL)
 		if err != nil {
 			// Check if a handler can catch this error
@@ -2336,11 +2462,11 @@ func (e *Executor) execSelectIntoLocal(stmtStr string, localVars map[string]inte
 
 // execIfBlockCtx executes an IF block with shared routine context.
 func (e *Executor) execIfBlockCtx(block string, ctx *routineContext) (bool, interface{}, error) {
-	return e.execIfBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done, ctx.handlers)
+	return e.execIfBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done, ctx.handlers, ctx)
 }
 
 // execIfBlock executes an IF...THEN...ELSEIF...ELSE...END IF block.
-func (e *Executor) execIfBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool, handlers []handlerDef) (bool, interface{}, error) {
+func (e *Executor) execIfBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool, handlers []handlerDef, parentCtx *routineContext) (bool, interface{}, error) {
 	trimmed := strings.TrimSpace(block)
 	upper := strings.ToUpper(trimmed)
 
@@ -2360,6 +2486,11 @@ func (e *Executor) execIfBlock(block string, localVars map[string]interface{}, c
 	condStr := strings.TrimSpace(trimmed[3:thenIdx]) // skip "IF "
 	bodyAfterThen := strings.TrimSpace(trimmed[thenIdx+len(" THEN"):])
 
+	// In trigger context, resolve NEW/OLD references in the condition
+	if parentCtx != nil && (parentCtx.triggerNewRow != nil || parentCtx.triggerOldRow != nil) {
+		condStr = e.resolveNewOldRefs(condStr, parentCtx.triggerNewRow, parentCtx.triggerOldRow)
+	}
+
 	// Find top-level ELSE (not inside nested IF/END IF)
 	thenBody, elseBody, hasElse := splitAtTopLevelElse(bodyAfterThen)
 
@@ -2371,13 +2502,18 @@ func (e *Executor) execIfBlock(block string, localVars map[string]interface{}, c
 	}
 
 	// Build a temporary context for the block execution that shares the same state
-	blockCtx := &routineContext{
-		localVars:          localVars,
-		cursors:            cursors,
-		cursorDefs:         cursorDefs,
-		notFoundHandlerVar: notFoundHandlerVar,
-		done:               *done,
-		handlers:           handlers,
+	var blockCtx *routineContext
+	if parentCtx != nil {
+		blockCtx = parentCtx.childContext()
+	} else {
+		blockCtx = &routineContext{
+			localVars:          localVars,
+			cursors:            cursors,
+			cursorDefs:         cursorDefs,
+			notFoundHandlerVar: notFoundHandlerVar,
+			done:               *done,
+			handlers:           handlers,
+		}
 	}
 
 	if isTruthy(condVal) {
@@ -2394,7 +2530,7 @@ func (e *Executor) execIfBlock(block string, localVars map[string]interface{}, c
 			if !strings.HasSuffix(strings.ToUpper(strings.TrimSpace(ifBlock)), "END IF") {
 				ifBlock += "\nEND IF"
 			}
-			return e.execIfBlock(ifBlock, localVars, cursors, cursorDefs, notFoundHandlerVar, done, handlers)
+			return e.execIfBlock(ifBlock, localVars, cursors, cursorDefs, notFoundHandlerVar, done, handlers, parentCtx)
 		}
 		stmts := splitTriggerBody(elseBody)
 		retVal, err := e.execRoutineBodyWithContext(stmts, blockCtx)
@@ -2458,11 +2594,11 @@ func splitAtTopLevelElse(body string) (thenBody, elseBody string, hasElse bool) 
 
 // execRepeatBlockCtx executes a REPEAT block with shared routine context.
 func (e *Executor) execRepeatBlockCtx(block string, ctx *routineContext) (interface{}, error) {
-	return e.execRepeatBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done, ctx.handlers)
+	return e.execRepeatBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done, ctx.handlers, ctx)
 }
 
 // execRepeatBlock executes a REPEAT...UNTIL...END REPEAT block.
-func (e *Executor) execRepeatBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool, handlers []handlerDef) (interface{}, error) {
+func (e *Executor) execRepeatBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool, handlers []handlerDef, parentCtx *routineContext) (interface{}, error) {
 	upper := strings.ToUpper(strings.TrimSpace(block))
 
 	// Remove REPEAT prefix and END REPEAT suffix
@@ -2487,13 +2623,18 @@ func (e *Executor) execRepeatBlock(block string, localVars map[string]interface{
 		condStr = strings.TrimSpace(afterUntil[:endRepeatIdx])
 	}
 
-	blockCtx := &routineContext{
-		localVars:          localVars,
-		cursors:            cursors,
-		cursorDefs:         cursorDefs,
-		notFoundHandlerVar: notFoundHandlerVar,
-		done:               *done,
-		handlers:           handlers,
+	var blockCtx *routineContext
+	if parentCtx != nil {
+		blockCtx = parentCtx.childContext()
+	} else {
+		blockCtx = &routineContext{
+			localVars:          localVars,
+			cursors:            cursors,
+			cursorDefs:         cursorDefs,
+			notFoundHandlerVar: notFoundHandlerVar,
+			done:               *done,
+			handlers:           handlers,
+		}
 	}
 	for iterations := 0; iterations < 10000; iterations++ {
 		// Execute loop body
@@ -2523,11 +2664,11 @@ func (e *Executor) execRepeatBlock(block string, localVars map[string]interface{
 
 // execWhileBlockCtx executes a WHILE block with shared routine context.
 func (e *Executor) execWhileBlockCtx(block string, ctx *routineContext) (interface{}, error) {
-	return e.execWhileBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done, ctx.handlers)
+	return e.execWhileBlock(block, ctx.localVars, ctx.cursors, ctx.cursorDefs, ctx.notFoundHandlerVar, &ctx.done, ctx.handlers, ctx)
 }
 
 // execWhileBlock executes a WHILE...DO...END WHILE block.
-func (e *Executor) execWhileBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool, handlers []handlerDef) (interface{}, error) {
+func (e *Executor) execWhileBlock(block string, localVars map[string]interface{}, cursors map[string]*cursorState, cursorDefs map[string]string, notFoundHandlerVar string, done *bool, handlers []handlerDef, parentCtx *routineContext) (interface{}, error) {
 	upper := strings.ToUpper(strings.TrimSpace(block))
 
 	bodyStr := strings.TrimSpace(block)
@@ -2551,13 +2692,18 @@ func (e *Executor) execWhileBlock(block string, localVars map[string]interface{}
 		loopBody = strings.TrimSpace(afterDo[:endWhileIdx])
 	}
 
-	blockCtx := &routineContext{
-		localVars:          localVars,
-		cursors:            cursors,
-		cursorDefs:         cursorDefs,
-		notFoundHandlerVar: notFoundHandlerVar,
-		done:               *done,
-		handlers:           handlers,
+	var blockCtx *routineContext
+	if parentCtx != nil {
+		blockCtx = parentCtx.childContext()
+	} else {
+		blockCtx = &routineContext{
+			localVars:          localVars,
+			cursors:            cursors,
+			cursorDefs:         cursorDefs,
+			notFoundHandlerVar: notFoundHandlerVar,
+			done:               *done,
+			handlers:           handlers,
+		}
 	}
 	for iterations := 0; iterations < 10000; iterations++ {
 		// Evaluate condition
@@ -2609,14 +2755,7 @@ func (e *Executor) execLoopBlockCtx(block string, label string, ctx *routineCont
 	}
 	bodyStr = strings.TrimRight(bodyStr, ";")
 
-	blockCtx := &routineContext{
-		localVars:          ctx.localVars,
-		cursors:            ctx.cursors,
-		cursorDefs:         ctx.cursorDefs,
-		notFoundHandlerVar: ctx.notFoundHandlerVar,
-		done:               ctx.done,
-		handlers:           ctx.handlers,
-	}
+	blockCtx := ctx.childContext()
 
 	for iterations := 0; iterations < 10000; iterations++ {
 		stmts := splitTriggerBody(bodyStr)
@@ -2676,14 +2815,7 @@ func (e *Executor) execWhileBlockWithLabel(block string, label string, ctx *rout
 		afterDo = strings.TrimSpace(afterDo[:idx])
 	}
 
-	blockCtx := &routineContext{
-		localVars:          ctx.localVars,
-		cursors:            ctx.cursors,
-		cursorDefs:         ctx.cursorDefs,
-		notFoundHandlerVar: ctx.notFoundHandlerVar,
-		done:               ctx.done,
-		handlers:           ctx.handlers,
-	}
+	blockCtx := ctx.childContext()
 
 	for iterations := 0; iterations < 10000; iterations++ {
 		condResolved := e.substituteLocalVars(condStr, ctx.localVars)
@@ -2737,14 +2869,7 @@ func (e *Executor) execRepeatBlockWithLabel(block string, label string, ctx *rou
 		condStr = strings.TrimSpace(afterUntil[:endRepeatIdx])
 	}
 
-	blockCtx := &routineContext{
-		localVars:          ctx.localVars,
-		cursors:            ctx.cursors,
-		cursorDefs:         ctx.cursorDefs,
-		notFoundHandlerVar: ctx.notFoundHandlerVar,
-		done:               ctx.done,
-		handlers:           ctx.handlers,
-	}
+	blockCtx := ctx.childContext()
 
 	for iterations := 0; iterations < 10000; iterations++ {
 		stmts := splitTriggerBody(loopBody)
