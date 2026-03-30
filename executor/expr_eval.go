@@ -496,39 +496,105 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 			return e.evalInSubquery(left, v.Left, sub, v.Operator)
 		}
 	}
-	// Handle ROW/tuple comparisons: ROW(a,b) = ROW(c,d) or (a,b) = (c,d)
+	// Handle ROW/tuple comparisons: ROW(a,b) op ROW(c,d) or (a,b) op (c,d)
+	// Supports =, !=, <, >, <=, >= with lexicographic comparison.
 	leftTuple, leftIsTuple := v.Left.(sqlparser.ValTuple)
 	rightTuple, rightIsTuple := v.Right.(sqlparser.ValTuple)
 	if leftIsTuple && rightIsTuple {
 		if len(leftTuple) != len(rightTuple) {
 			return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTuple)))
 		}
-		allMatch := true
-		for i := 0; i < len(leftTuple); i++ {
-			lv, err := e.evalExpr(leftTuple[i])
-			if err != nil {
-				return nil, err
+		switch v.Operator {
+		case sqlparser.EqualOp, sqlparser.NotEqualOp, sqlparser.NullSafeEqualOp:
+			// Equality / inequality: all elements must match (or differ for !=)
+			allMatch := true
+			for i := 0; i < len(leftTuple); i++ {
+				lv, err := e.evalExpr(leftTuple[i])
+				if err != nil {
+					return nil, err
+				}
+				rv, err := e.evalExpr(rightTuple[i])
+				if err != nil {
+					return nil, err
+				}
+				if lv == nil || rv == nil {
+					if v.Operator == sqlparser.NullSafeEqualOp {
+						if lv != nil || rv != nil {
+							allMatch = false
+							break
+						}
+						continue // both NULL — equal for <=>
+					}
+					return nil, nil // NULL comparison -> NULL
+				}
+				match, err := compareValues(lv, rv, sqlparser.EqualOp)
+				if err != nil {
+					return nil, err
+				}
+				if !match {
+					allMatch = false
+					break
+				}
 			}
-			rv, err := e.evalExpr(rightTuple[i])
-			if err != nil {
-				return nil, err
+			if v.Operator == sqlparser.NotEqualOp {
+				allMatch = !allMatch
 			}
-			if lv == nil || rv == nil {
-				return nil, nil // NULL comparison -> NULL
+			if allMatch {
+				return int64(1), nil
 			}
-			match, err := compareValues(lv, rv, v.Operator)
-			if err != nil {
-				return nil, err
+			return int64(0), nil
+		case sqlparser.LessThanOp, sqlparser.GreaterThanOp, sqlparser.LessEqualOp, sqlparser.GreaterEqualOp:
+			// Lexicographic comparison: compare element by element.
+			// The first pair that is not equal determines the result.
+			// If all elements are equal, the result depends on the operator
+			// (true for <= and >=, false for < and >).
+			// If any element is NULL, the result is NULL.
+			for i := 0; i < len(leftTuple); i++ {
+				lv, err := e.evalExpr(leftTuple[i])
+				if err != nil {
+					return nil, err
+				}
+				rv, err := e.evalExpr(rightTuple[i])
+				if err != nil {
+					return nil, err
+				}
+				if lv == nil || rv == nil {
+					return nil, nil // NULL -> NULL
+				}
+				// Check if elements are equal
+				eq, err := compareValues(lv, rv, sqlparser.EqualOp)
+				if err != nil {
+					return nil, err
+				}
+				if eq {
+					continue // elements equal, move to next
+				}
+				// Elements differ — the result is determined by this pair
+				lt, err := compareValues(lv, rv, sqlparser.LessThanOp)
+				if err != nil {
+					return nil, err
+				}
+				switch v.Operator {
+				case sqlparser.LessThanOp, sqlparser.LessEqualOp:
+					if lt {
+						return int64(1), nil
+					}
+					return int64(0), nil
+				case sqlparser.GreaterThanOp, sqlparser.GreaterEqualOp:
+					if !lt {
+						return int64(1), nil
+					}
+					return int64(0), nil
+				}
 			}
-			if !match {
-				allMatch = false
-				break
+			// All elements are equal
+			switch v.Operator {
+			case sqlparser.LessEqualOp, sqlparser.GreaterEqualOp:
+				return int64(1), nil
+			default:
+				return int64(0), nil
 			}
 		}
-		if allMatch {
-			return int64(1), nil
-		}
-		return int64(0), nil
 	}
 	// Allow comparison expressions to be used as boolean values (e.g. in IF args)
 	// Extract COLLATE clause from either side for collation-aware comparison

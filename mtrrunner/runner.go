@@ -883,6 +883,10 @@ func (ctx *execContext) executeLines(lines []string) error {
 				if s == "" {
 					continue
 				}
+				if isEval {
+					s = ctx.substituteVars(s)
+					s = stripUndefinedVars(s)
+				}
 				err := ctx.executeSQLNoEcho(s)
 				if err != nil {
 					return err
@@ -894,6 +898,10 @@ func (ctx *execContext) executeLines(lines []string) error {
 				s = strings.TrimSpace(s)
 				if s == "" {
 					continue
+				}
+				if isEval {
+					s = ctx.substituteVars(s)
+					s = stripUndefinedVars(s)
 				}
 				// Use executeSQL which does echo + execute
 				err := ctx.executeSQL(s)
