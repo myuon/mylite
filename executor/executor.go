@@ -428,9 +428,9 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		preparedStmts: make(map[string]string),
 		tempTables:    make(map[string]bool),
 		globalScopeVars: map[string]string{
-			"general_log":                         "ON",
-			"slow_query_log":                      "ON",
-			"log_bin_trust_function_creators":      "ON",
+			"general_log":                    "ON",
+			"slow_query_log":                 "ON",
+			"log_bin_trust_function_creators": "ON",
 		},
 		sessionScopeVars: make(map[string]string),
 		startupVars: map[string]string{
@@ -10062,6 +10062,10 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 					return int64(0), nil
 				}
 			}
+		}
+		// NULL comparison returns NULL (except for NULL-safe equal <=>)
+		if (left == nil || right == nil) && v.Operator != sqlparser.NullSafeEqualOp {
+			return nil, nil
 		}
 		result, err := compareValues(left, right, v.Operator)
 		if err != nil {
