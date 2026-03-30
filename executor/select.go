@@ -149,6 +149,12 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 			}
 			return e.buildInformationSchemaRows(bareTableName, isAlias)
 		}
+		// If the qualifier is information_schema but the table is not a known
+		// virtual table, return MySQL error 1109 (ER_UNKNOWN_TABLE) instead of
+		// falling through to regular table lookup.
+		if strings.EqualFold(qualifier, "information_schema") {
+			return nil, mysqlError(1109, "42S02", fmt.Sprintf("Unknown table '%s' in information_schema", strings.ToUpper(bareTableName)))
+		}
 		lookupDB := e.CurrentDB
 		lookupTable := bareTableName
 		if qualifier != "" && !strings.EqualFold(qualifier, "information_schema") {

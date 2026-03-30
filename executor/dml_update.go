@@ -752,126 +752,177 @@ func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error)
 
 	var affected uint64
 
-	for _, mrow := range matchedRows {
-		for _, upd := range stmt.Exprs {
-			// Use the AST ColName to resolve the target
-			colName := upd.Name.Name.String()
-			qualStr := sqlparser.String(upd.Name.Qualifier)
-			qualStr = strings.Trim(qualStr, "`")
+	// Pre-resolve each SET expression's target table so we can group by table.
+	type resolvedUpd struct {
+		colName     string
+		targetDB    string
+		targetTable string
+		upd         *sqlparser.UpdateExpr
+	}
+	resolvedUpds := make([]resolvedUpd, 0, len(stmt.Exprs))
+	for idx := range stmt.Exprs {
+		upd := stmt.Exprs[idx]
+		colName := upd.Name.Name.String()
+		qualStr := sqlparser.String(upd.Name.Qualifier)
+		qualStr = strings.Trim(qualStr, "`")
 
-			var targetDB, targetTable string
-			if strings.Contains(qualStr, ".") {
-				// db.table qualifier
-				parts := strings.SplitN(qualStr, ".", 2)
-				targetDB = parts[0]
-				targetTable = parts[1]
-			} else if qualStr != "" {
-				targetTable = qualStr
-				targetDB = e.CurrentDB
-			} else {
-				targetDB = e.CurrentDB
-				targetTable = ""
-				// Resolve unqualified column by scanning tables in FROM clause
-				for _, te := range stmt.TableExprs {
-					resolved := resolveColumnTable(te, colName, e)
-					if resolved != "" {
-						targetTable = resolved
-						break
-					}
+		var targetDB, targetTable string
+		if strings.Contains(qualStr, ".") {
+			parts := strings.SplitN(qualStr, ".", 2)
+			targetDB = parts[0]
+			targetTable = parts[1]
+		} else if qualStr != "" {
+			targetTable = qualStr
+			targetDB = e.CurrentDB
+		} else {
+			targetDB = e.CurrentDB
+			targetTable = ""
+			for _, te := range stmt.TableExprs {
+				resolved := resolveColumnTable(te, colName, e)
+				if resolved != "" {
+					targetTable = resolved
+					break
 				}
 			}
+		}
+		resolvedUpds = append(resolvedUpds, resolvedUpd{colName, targetDB, targetTable, upd})
+	}
 
-			// Evaluate new value
-			val, err := e.evalRowExpr(upd.Expr, mrow)
-			if err != nil {
-				return nil, err
+	for _, mrow := range matchedRows {
+		// Group SET expressions by target table key (db.table) and apply all
+		// columns for the same table together so that matchRowToTableLenient
+		// is called only once per table before any storage modifications.
+		type tableKey struct{ db, table string }
+		type pendingCol struct {
+			colName string
+			upd     *sqlparser.UpdateExpr
+		}
+		tableOrder := make([]tableKey, 0, 4)
+		tableGroups := make(map[tableKey][]pendingCol)
+		for _, ru := range resolvedUpds {
+			tk := tableKey{ru.targetDB, ru.targetTable}
+			if _, exists := tableGroups[tk]; !exists {
+				tableOrder = append(tableOrder, tk)
 			}
+			tableGroups[tk] = append(tableGroups[tk], pendingCol{ru.colName, ru.upd})
+		}
 
-			tbl, err := e.Storage.GetTable(targetDB, targetTable)
+		for _, tk := range tableOrder {
+			cols := tableGroups[tk]
+
+			tbl, err := e.Storage.GetTable(tk.db, tk.table)
 			if err != nil {
 				continue
 			}
 
-			// Build alias for row matching
-			targetAlias := targetTable
-			if targetDB != e.CurrentDB {
-				targetAlias = targetDB + "." + targetTable
+			targetAlias := tk.table
+			if tk.db != e.CurrentDB {
+				targetAlias = tk.db + "." + tk.table
 			}
 
 			tbl.Lock()
-			i := matchRowToTableLenient(mrow, tbl, targetAlias, targetTable)
-			if i >= 0 {
-				// Apply the same type coercions used by single-table UPDATE.
+			i := matchRowToTableLenient(mrow, tbl, targetAlias, tk.table)
+			if i < 0 {
+				tbl.Unlock()
+				continue
+			}
+
+			// Evaluate all SET values and coerce types.
+			colVals := make(map[string]interface{}, len(cols))
+			var unlockAndReturn error
+			for _, pc := range cols {
+				val, err := e.evalRowExpr(pc.upd.Expr, mrow)
+				if err != nil {
+					unlockAndReturn = err
+					break
+				}
 				for _, col := range tbl.Def.Columns {
-					if col.Name == colName {
+					if col.Name == pc.colName {
 						if val == nil && !col.Nullable {
-							tbl.Unlock()
-							return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", colName))
+							unlockAndReturn = mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", pc.colName))
+							break
 						}
 						val = coerceColumnValue(col.Type, val)
 						break
 					}
 				}
-
-				// Build candidate row and enforce PRIMARY KEY uniqueness.
-				candidate := make(storage.Row, len(tbl.Rows[i]))
-				for k, v := range tbl.Rows[i] {
-					candidate[k] = v
+				if unlockAndReturn != nil {
+					break
 				}
+				colVals[pc.colName] = val
+			}
+			if unlockAndReturn != nil {
+				tbl.Unlock()
+				return nil, unlockAndReturn
+			}
+
+			// Build candidate row with all column changes and enforce PK uniqueness.
+			candidate := make(storage.Row, len(tbl.Rows[i]))
+			for k, v := range tbl.Rows[i] {
+				candidate[k] = v
+			}
+			for colName, val := range colVals {
 				candidate[colName] = val
+			}
 
-				pkCols := make([]string, 0, len(tbl.Def.PrimaryKey))
-				if len(tbl.Def.PrimaryKey) > 0 {
-					pkCols = append(pkCols, tbl.Def.PrimaryKey...)
-				} else {
-					for _, col := range tbl.Def.Columns {
-						if col.PrimaryKey {
-							pkCols = append(pkCols, col.Name)
-						}
+			pkCols := make([]string, 0, len(tbl.Def.PrimaryKey))
+			if len(tbl.Def.PrimaryKey) > 0 {
+				pkCols = append(pkCols, tbl.Def.PrimaryKey...)
+			} else {
+				for _, col := range tbl.Def.Columns {
+					if col.PrimaryKey {
+						pkCols = append(pkCols, col.Name)
 					}
 				}
-				if len(pkCols) > 0 {
-					for j, other := range tbl.Rows {
-						if j == i {
-							continue
-						}
-						matchPK := true
-						for _, pk := range pkCols {
-							if fmt.Sprintf("%v", other[pk]) != fmt.Sprintf("%v", candidate[pk]) {
-								matchPK = false
-								break
-							}
-						}
-						if matchPK {
-							vals := make([]string, len(pkCols))
-							for k, pk := range pkCols {
-								vals[k] = fmt.Sprintf("%v", candidate[pk])
-							}
-							tbl.Unlock()
-							return nil, mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key 'PRIMARY'", strings.Join(vals, "-")))
+			}
+			if len(pkCols) > 0 {
+				for j, other := range tbl.Rows {
+					if j == i {
+						continue
+					}
+					matchPK := true
+					for _, pk := range pkCols {
+						if fmt.Sprintf("%v", other[pk]) != fmt.Sprintf("%v", candidate[pk]) {
+							matchPK = false
+							break
 						}
 					}
+					if matchPK {
+						vals := make([]string, len(pkCols))
+						for k, pk := range pkCols {
+							vals[k] = fmt.Sprintf("%v", candidate[pk])
+						}
+						tbl.Unlock()
+						return nil, mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key 'PRIMARY'", strings.Join(vals, "-")))
+					}
 				}
+			}
 
+			// Apply all column updates at once.
+			anyChanged := false
+			for colName, val := range colVals {
 				oldVal := tbl.Rows[i][colName]
 				tbl.Rows[i][colName] = val
-				// Apply ON UPDATE CURRENT_TIMESTAMP if the value actually changed
 				if !valuesEqual(oldVal, val) {
-					explicitCols := make(map[string]bool)
-					for _, u := range stmt.Exprs {
-						explicitCols[strings.ToLower(u.Name.Name.String())] = true
-					}
-					for _, col := range tbl.Def.Columns {
-						if col.OnUpdateCurrentTimestamp && !explicitCols[strings.ToLower(col.Name)] {
-							nowStr := e.nowTime().Format("2006-01-02 15:04:05")
-							colUpper := strings.ToUpper(col.Type)
-							if strings.Contains(colUpper, "TIMESTAMP(6)") || strings.Contains(colUpper, "DATETIME(6)") {
-								nowStr = e.nowTime().Format("2006-01-02 15:04:05.000000")
-							} else if strings.Contains(colUpper, "TIMESTAMP(3)") || strings.Contains(colUpper, "DATETIME(3)") {
-								nowStr = e.nowTime().Format("2006-01-02 15:04:05.000")
-							}
-							tbl.Rows[i][col.Name] = nowStr
+					anyChanged = true
+				}
+			}
+			// Apply ON UPDATE CURRENT_TIMESTAMP if any value actually changed
+			if anyChanged {
+				explicitCols := make(map[string]bool)
+				for _, u := range stmt.Exprs {
+					explicitCols[strings.ToLower(u.Name.Name.String())] = true
+				}
+				for _, col := range tbl.Def.Columns {
+					if col.OnUpdateCurrentTimestamp && !explicitCols[strings.ToLower(col.Name)] {
+						nowStr := e.nowTime().Format("2006-01-02 15:04:05")
+						colUpper := strings.ToUpper(col.Type)
+						if strings.Contains(colUpper, "TIMESTAMP(6)") || strings.Contains(colUpper, "DATETIME(6)") {
+							nowStr = e.nowTime().Format("2006-01-02 15:04:05.000000")
+						} else if strings.Contains(colUpper, "TIMESTAMP(3)") || strings.Contains(colUpper, "DATETIME(3)") {
+							nowStr = e.nowTime().Format("2006-01-02 15:04:05.000")
 						}
+						tbl.Rows[i][col.Name] = nowStr
 					}
 				}
 			}

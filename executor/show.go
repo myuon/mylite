@@ -630,10 +630,17 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 	}
 
 	// Handle @@warning_count / @@error_count
-	if strings.Contains(upper, "WARNING_COUNT") || strings.Contains(upper, "ERROR_COUNT") {
+	if strings.Contains(upper, "WARNING_COUNT") {
 		return &Result{
 			Columns:     []string{"@@warning_count"},
-			Rows:        [][]interface{}{{int64(len(e.warnings))}},
+			Rows:        [][]interface{}{{e.lastWarningCount}},
+			IsResultSet: true,
+		}, nil
+	}
+	if strings.Contains(upper, "ERROR_COUNT") {
+		return &Result{
+			Columns:     []string{"@@error_count"},
+			Rows:        [][]interface{}{{e.lastErrorCount}},
 			IsResultSet: true,
 		}, nil
 	}

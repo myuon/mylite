@@ -108,10 +108,20 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	}
 
 	// Clear warnings from previous statement, but preserve for SHOW WARNINGS/ERRORS.
+	// Snapshot the warning/error counts before clearing so that
+	// SELECT @@warning_count / @@error_count return the previous statement's counts.
 	if !strings.HasPrefix(upper, "SHOW WARNINGS") &&
 		!strings.HasPrefix(upper, "SHOW COUNT(*) WARNINGS") &&
 		!strings.HasPrefix(upper, "SHOW ERRORS") &&
 		!strings.HasPrefix(upper, "SHOW COUNT(*) ERRORS") {
+		e.lastWarningCount = int64(len(e.warnings))
+		var errCnt int64
+		for _, w := range e.warnings {
+			if strings.ToUpper(w.Level) == "ERROR" {
+				errCnt++
+			}
+		}
+		e.lastErrorCount = errCnt
 		e.warnings = nil
 	}
 

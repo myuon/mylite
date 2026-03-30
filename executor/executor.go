@@ -253,6 +253,11 @@ type Executor struct {
 	queryTableDef *catalog.TableDef
 	// warnings stores the warnings from the last executed statement.
 	warnings []Warning
+	// lastWarningCount / lastErrorCount hold the warning/error counts from the
+	// previous statement so that SELECT @@warning_count / @@error_count return
+	// the correct value (the counts are snapshotted before warnings are cleared).
+	lastWarningCount int64
+	lastErrorCount   int64
 	// currentQuery holds the current raw SQL text for display-name reconstruction.
 	currentQuery string
 	// onDupValuesRow holds the candidate INSERT row while evaluating
@@ -342,6 +347,16 @@ type Warning struct {
 // addWarning adds a warning to the current statement's warning list.
 func (e *Executor) addWarning(level string, code int, message string) {
 	e.warnings = append(e.warnings, Warning{Level: level, Code: code, Message: message})
+}
+
+// sqlNotesEnabled returns true if the sql_notes session variable is ON (default).
+// When sql_notes is OFF, Note-level diagnostics should be suppressed.
+func (e *Executor) sqlNotesEnabled() bool {
+	if v, ok := e.sessionScopeVars["sql_notes"]; ok {
+		upper := strings.ToUpper(v)
+		return upper == "ON" || upper == "1"
+	}
+	return true // default is ON
 }
 
 // getSysVar reads a system variable with proper scope resolution:

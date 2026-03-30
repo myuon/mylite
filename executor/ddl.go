@@ -1186,6 +1186,9 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 		db, err := e.Catalog.GetDatabase(dbName)
 		if err != nil {
 			if stmt.IfExists {
+				if e.sqlNotesEnabled() {
+					e.addWarning("Note", 1051, fmt.Sprintf("Unknown table '%s.%s'", dbName, tableName))
+				}
 				continue
 			}
 			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
@@ -1193,6 +1196,9 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 		err = db.DropTable(tableName)
 		if err != nil {
 			if stmt.IfExists {
+				if e.sqlNotesEnabled() {
+					e.addWarning("Note", 1051, fmt.Sprintf("Unknown table '%s.%s'", dbName, tableName))
+				}
 				continue
 			}
 			return nil, mysqlError(1051, "42S02", fmt.Sprintf("Unknown table '%s.%s'", dbName, tableName))

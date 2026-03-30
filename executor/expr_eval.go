@@ -129,6 +129,15 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 	name = strings.TrimPrefix(name, "session.")
 	name = strings.TrimPrefix(name, "local.")
 
+	// @@warning_count and @@error_count are diagnostic variables that return
+	// the counts from the *previous* statement (snapshotted in preprocessQuery).
+	if name == "warning_count" {
+		return e.lastWarningCount, nil
+	}
+	if name == "error_count" {
+		return e.lastErrorCount, nil
+	}
+
 	// Check if the user explicitly wrote @@session.var or @@local.var
 	// (as opposed to just @@var). We detect this from the raw query text
 	// because the AST doesn't distinguish @@var from @@session.var.
