@@ -361,8 +361,8 @@ func (e *Executor) getSysVarGlobal(name string) (string, bool) {
 
 // getSysVarSession reads a session-scoped system variable.
 // For global-only variables, falls back to globalScopeVars.
-// For session-capable variables, only checks sessionScopeVars so that
-// SET @@global.var = X does not affect the session value.
+// For other variables, also falls back to startupVars so that server
+// startup options (e.g. --parser-max-mem-size) are visible in session scope.
 func (e *Executor) getSysVarSession(name string) (string, bool) {
 	if v, ok := e.sessionScopeVars[name]; ok {
 		return v, true
@@ -372,6 +372,11 @@ func (e *Executor) getSysVarSession(name string) (string, bool) {
 		if v, ok := e.globalScopeVars[name]; ok {
 			return v, true
 		}
+	}
+	// Fall back to startupVars so that server startup options are visible
+	// in session scope (e.g. --parser-max-mem-size from master.opt).
+	if v, ok := e.startupVars[name]; ok {
+		return v, true
 	}
 	return "", false
 }
@@ -5242,15 +5247,23 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return &Result{}, nil
 	case *sqlparser.Analyze:
 		tableName := s.Table.Name.String()
+		msgText := "Table is already up to date"
 		if db, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
-			if def, err := db.GetTable(tableName); err == nil && def != nil && e.innodbStatsPersistentEnabled(def) {
-				e.upsertInnoDBStatsRows(e.CurrentDB, tableName, e.tableRowCount(e.CurrentDB, tableName))
+			if def, err := db.GetTable(tableName); err == nil && def != nil {
+				if e.innodbStatsPersistentEnabled(def) {
+					e.upsertInnoDBStatsRows(e.CurrentDB, tableName, e.tableRowCount(e.CurrentDB, tableName))
+				}
+				// InnoDB tables return "OK"; non-InnoDB return "Table is already up to date"
+				eng := strings.ToUpper(def.Engine)
+				if eng == "" || eng == "INNODB" {
+					msgText = "OK"
+				}
 			}
 		}
 		// Return a minimal ANALYZE TABLE result set for compatibility
 		return &Result{
 			Columns:     []string{"Table", "Op", "Msg_type", "Msg_text"},
-			Rows:        [][]interface{}{{fmt.Sprintf("%s.%s", e.CurrentDB, tableName), "analyze", "status", "OK"}},
+			Rows:        [][]interface{}{{fmt.Sprintf("%s.%s", e.CurrentDB, tableName), "analyze", "status", msgText}},
 			IsResultSet: true,
 		}, nil
 	case *sqlparser.CallProc:
@@ -5920,9 +5933,13 @@ func (e *Executor) execDeallocate(stmt *sqlparser.DeallocateStmt) (*Result, erro
 
 func (e *Executor) execUse(stmt *sqlparser.Use) (*Result, error) {
 	name := stmt.DBName.String()
-	_, err := e.Catalog.GetDatabase(name)
-	if err != nil {
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", name))
+	// Allow USE INFORMATION_SCHEMA / PERFORMANCE_SCHEMA as virtual databases.
+	lower := strings.ToLower(name)
+	if lower != "information_schema" && lower != "performance_schema" {
+		_, err := e.Catalog.GetDatabase(name)
+		if err != nil {
+			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", name))
+		}
 	}
 	e.CurrentDB = name
 	return &Result{}, nil
@@ -10176,9 +10193,21 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		return e.evalPerformanceSchemaFuncExpr(v)
 	default:
 		// For JSON and other expressions, set row context via correlatedRow
-		// so that ColName lookups in evalExpr can find row values
+		// so that ColName lookups in evalExpr can find row values.
+		// Merge the old correlatedRow into the new row so that outer
+		// correlated references (e.g., from an enclosing subquery) remain
+		// accessible.
 		oldCorrelated := e.correlatedRow
-		e.correlatedRow = row
+		merged := make(storage.Row, len(row))
+		if oldCorrelated != nil {
+			for k, v := range oldCorrelated {
+				merged[k] = v
+			}
+		}
+		for k, v := range row {
+			merged[k] = v
+		}
+		e.correlatedRow = merged
 		val, err := e.evalExpr(expr)
 		e.correlatedRow = oldCorrelated
 		if err != nil {
@@ -12229,23 +12258,26 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 				continue
 			}
 		}
-		if op == "optimize" {
-			// Check if the table's declared engine is InnoDB
-			isInnoDB := true
-			bareTable := t
-			if dbObj, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
-				if tblDef, err := dbObj.GetTable(bareTable); err == nil && tblDef != nil {
-					eng := strings.ToUpper(tblDef.Engine)
-					if eng == "MYISAM" || eng == "MEMORY" || eng == "CSV" || eng == "ARCHIVE" || eng == "HEAP" {
-						isInnoDB = false
-					}
+		// Determine the table's storage engine
+		isInnoDB := true
+		bareTable := t
+		if dbObj, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
+			if tblDef, err := dbObj.GetTable(bareTable); err == nil && tblDef != nil {
+				eng := strings.ToUpper(tblDef.Engine)
+				if eng == "MYISAM" || eng == "MEMORY" || eng == "CSV" || eng == "ARCHIVE" || eng == "HEAP" {
+					isInnoDB = false
 				}
 			}
+		}
+		if op == "optimize" {
 			if isInnoDB {
 				// InnoDB doesn't support optimize; MySQL outputs a note then status OK
 				rows = append(rows, []interface{}{tableName, op, "note", "Table does not support optimize, doing recreate + analyze instead"})
+				rows = append(rows, []interface{}{tableName, op, "status", "OK"})
+			} else {
+				// Non-InnoDB engines (MyISAM, etc.) return "Table is already up to date"
+				rows = append(rows, []interface{}{tableName, op, "status", "Table is already up to date"})
 			}
-			rows = append(rows, []interface{}{tableName, op, "status", "OK"})
 		} else {
 			rows = append(rows, []interface{}{tableName, op, "status", "OK"})
 		}
@@ -12270,7 +12302,17 @@ func (e *Executor) execAnalyzeMultiTable(query string) (*Result, error) {
 		if !strings.Contains(tableName, ".") {
 			tableName = e.CurrentDB + "." + tableName
 		}
-		rows = append(rows, []interface{}{tableName, "analyze", "status", "OK"})
+		msgText := "Table is already up to date"
+		bareTable := t
+		if dbObj, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
+			if tblDef, err := dbObj.GetTable(bareTable); err == nil && tblDef != nil {
+				eng := strings.ToUpper(tblDef.Engine)
+				if eng == "" || eng == "INNODB" {
+					msgText = "OK"
+				}
+			}
+		}
+		rows = append(rows, []interface{}{tableName, "analyze", "status", msgText})
 	}
 	return &Result{
 		Columns:     []string{"Table", "Op", "Msg_type", "Msg_text"},

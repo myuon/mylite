@@ -558,6 +558,35 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 	return &Result{AffectedRows: totalAffected}, nil
 }
 
+// findTopLevelWhereIndex returns the index of the top-level WHERE keyword
+// (not inside parentheses) in the given string, or -1 if not found.
+// It matches WHERE preceded by whitespace or start-of-string.
+func findTopLevelWhereIndex(s string) int {
+	upper := strings.ToUpper(s)
+	depth := 0
+	for i := 0; i < len(upper); i++ {
+		switch upper[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && i+6 <= len(upper) && upper[i:i+5] == "WHERE" {
+				// Check that WHERE is preceded by whitespace or is at start
+				if i == 0 || upper[i-1] == ' ' || upper[i-1] == '\n' || upper[i-1] == '\t' || upper[i-1] == '\r' {
+					// Check that WHERE is followed by whitespace
+					if i+5 < len(upper) && (upper[i+5] == ' ' || upper[i+5] == '\n' || upper[i+5] == '\t') {
+						return i
+					}
+				}
+			}
+		}
+	}
+	return -1
+}
+
 // execMultiTableDelete handles multi-table DELETE statements:
 // Syntax 1: DELETE t1,t2 FROM t1,t2,t3 WHERE ...
 // Syntax 2: DELETE FROM t1,t2 USING t1,t2,t3 WHERE ...
@@ -598,9 +627,8 @@ func (e *Executor) execMultiTableDelete(query string) (*Result, error) {
 				deleteTargets = append(deleteTargets, t)
 			}
 		}
-		whereUpper := strings.ToUpper(afterUsing)
-		if whereIdx := strings.Index(whereUpper, " WHERE "); whereIdx >= 0 {
-			whereClause = strings.TrimSpace(afterUsing[whereIdx+len(" WHERE "):])
+		if whereIdx := findTopLevelWhereIndex(afterUsing); whereIdx >= 0 {
+			whereClause = strings.TrimSpace(afterUsing[whereIdx+len("WHERE "):])
 			whereClause = strings.TrimSuffix(whereClause, ";")
 			fromTablesStr = strings.TrimSpace(afterUsing[:whereIdx])
 		} else {
@@ -623,9 +651,8 @@ func (e *Executor) execMultiTableDelete(query string) (*Result, error) {
 				deleteTargets = append(deleteTargets, t)
 			}
 		}
-		whereUpper := strings.ToUpper(afterFrom)
-		if whereIdx := strings.Index(whereUpper, " WHERE "); whereIdx >= 0 {
-			whereClause = strings.TrimSpace(afterFrom[whereIdx+len(" WHERE "):])
+		if whereIdx := findTopLevelWhereIndex(afterFrom); whereIdx >= 0 {
+			whereClause = strings.TrimSpace(afterFrom[whereIdx+len("WHERE "):])
 			whereClause = strings.TrimSuffix(whereClause, ";")
 			fromTablesStr = strings.TrimSpace(afterFrom[:whereIdx])
 		} else {
@@ -648,72 +675,74 @@ func (e *Executor) execMultiTableDelete(query string) (*Result, error) {
 	}
 	_ = deleteTargetDBs
 
-	// Parse table refs
-	type tableRef struct {
-		name  string
-		alias string
-		db    string
+	// Parse table refs and WHERE using vitess by constructing a SELECT statement.
+	// This handles JOINs, subqueries, and complex WHERE clauses correctly.
+	var tableRefs []deleteTableRef
+
+	selectSQL := "SELECT 1 FROM " + fromTablesStr
+	if whereClause != "" {
+		selectSQL += " WHERE " + whereClause
 	}
-	var tableRefs []tableRef
-	for _, t := range strings.Split(fromTablesStr, ",") {
-		t = strings.TrimSpace(t)
-		t = strings.Trim(t, ";")
-		parts := strings.Fields(t)
-		if len(parts) == 0 {
-			continue
+	parsedStmt, err := e.parser().Parse(selectSQL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse WHERE clause: %v", err)
+	}
+	sel, ok := parsedStmt.(*sqlparser.Select)
+	if !ok {
+		return nil, fmt.Errorf("failed to parse WHERE clause")
+	}
+
+	// Extract table refs from parsed FROM clause
+	var extractTableExprs func(te sqlparser.TableExpr)
+	extractTableExprs = func(te sqlparser.TableExpr) {
+		switch t := te.(type) {
+		case *sqlparser.AliasedTableExpr:
+			tn, ok := t.Expr.(sqlparser.TableName)
+			if !ok {
+				return
+			}
+			name := tn.Name.String()
+			alias := name
+			db := e.CurrentDB
+			if !tn.Qualifier.IsEmpty() {
+				db = tn.Qualifier.String()
+			}
+			if !t.As.IsEmpty() {
+				alias = t.As.String()
+			}
+			tableRefs = append(tableRefs, deleteTableRef{name: name, alias: alias, db: db})
+		case *sqlparser.JoinTableExpr:
+			extractTableExprs(t.LeftExpr)
+			extractTableExprs(t.RightExpr)
+		case *sqlparser.ParenTableExpr:
+			for _, expr := range t.Exprs {
+				extractTableExprs(expr)
+			}
 		}
-		name := strings.Trim(parts[0], "`")
-		alias := name
-		db := e.CurrentDB
-		// Handle db.table qualified names
-		if dotParts := strings.Split(name, "."); len(dotParts) == 2 {
-			db = dotParts[0]
-			name = dotParts[1]
-			alias = dotParts[0] + "." + name // keep d1.t1 as alias for qualified column refs
-		}
-		if len(parts) >= 3 && strings.ToUpper(parts[1]) == "AS" {
-			alias = strings.Trim(parts[2], "`")
-		} else if len(parts) >= 2 && strings.ToUpper(parts[1]) != "AS" {
-			alias = strings.Trim(parts[1], "`")
-		}
-		tableRefs = append(tableRefs, tableRef{name: name, alias: alias, db: db})
+	}
+	for _, te := range sel.From {
+		extractTableExprs(te)
 	}
 
 	if len(tableRefs) == 0 {
 		return &Result{}, nil
 	}
 
-	// Build cross-product of all table rows
-	allRows, err := e.getTableRowsWithAliasDB(tableRefs[0].db, tableRefs[0].name, tableRefs[0].alias)
-	if err != nil {
-		return nil, err
-	}
-	for i := 1; i < len(tableRefs); i++ {
-		tRows, err := e.getTableRowsWithAliasDB(tableRefs[i].db, tableRefs[i].name, tableRefs[i].alias)
-		if err != nil {
-			return nil, err
-		}
-		allRows = crossProduct(allRows, tRows)
+	// Build joined rows from the FROM clause, handling JOINs.
+	var allRows []storage.Row
+	var buildErr error
+	allRows, buildErr = e.buildDeleteFromRows(sel.From, tableRefs)
+	if buildErr != nil {
+		return nil, buildErr
 	}
 
 	// Apply WHERE filter
-	if whereClause != "" {
-		// Build a SELECT statement to parse the WHERE clause
-		// Use the first table as a dummy FROM to help vitess parse qualified column refs
-		selectSQL := "SELECT 1 FROM dual WHERE " + whereClause
-		parsedStmt, err := e.parser().Parse(selectSQL)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse WHERE clause: %v", err)
-		}
-		sel, ok := parsedStmt.(*sqlparser.Select)
-		if !ok || sel.Where == nil {
-			return nil, fmt.Errorf("failed to parse WHERE clause")
-		}
+	if sel.Where != nil {
 		filtered := make([]storage.Row, 0)
 		for _, row := range allRows {
-			match, err := e.evalWhere(sel.Where.Expr, row)
-			if err != nil {
-				return nil, err
+			match, mErr := e.evalWhere(sel.Where.Expr, row)
+			if mErr != nil {
+				return nil, mErr
 			}
 			if match {
 				filtered = append(filtered, row)
@@ -800,6 +829,111 @@ func (e *Executor) getTableRowsWithAliasDB(dbName, tableName, alias string) ([]s
 		result[i] = newRow
 	}
 	return result, nil
+}
+
+type deleteTableRef struct {
+	name  string
+	alias string
+	db    string
+}
+
+// buildDeleteFromRows resolves the FROM clause of a multi-table DELETE into
+// joined storage.Row slices, handling JOINs and cross products while preserving
+// per-table column identity (alias.col keys) needed for row deletion.
+func (e *Executor) buildDeleteFromRows(from sqlparser.TableExprs, tableRefs []deleteTableRef) ([]storage.Row, error) {
+	if len(from) == 0 {
+		return nil, nil
+	}
+	rows, err := e.buildDeleteTableExprRows(from[0], tableRefs)
+	if err != nil {
+		return nil, err
+	}
+	for i := 1; i < len(from); i++ {
+		right, err := e.buildDeleteTableExprRows(from[i], tableRefs)
+		if err != nil {
+			return nil, err
+		}
+		rows = crossProduct(rows, right)
+	}
+	return rows, nil
+}
+
+func (e *Executor) buildDeleteTableExprRows(te sqlparser.TableExpr, tableRefs []deleteTableRef) ([]storage.Row, error) {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		tn, ok := t.Expr.(sqlparser.TableName)
+		if !ok {
+			return nil, fmt.Errorf("unsupported table expression in multi-table DELETE")
+		}
+		name := tn.Name.String()
+		db := e.CurrentDB
+		alias := name
+		if !tn.Qualifier.IsEmpty() {
+			db = tn.Qualifier.String()
+		}
+		if !t.As.IsEmpty() {
+			alias = t.As.String()
+		}
+		return e.getTableRowsWithAliasDB(db, name, alias)
+	case *sqlparser.JoinTableExpr:
+		leftRows, err := e.buildDeleteTableExprRows(t.LeftExpr, tableRefs)
+		if err != nil {
+			return nil, err
+		}
+		rightRows, err := e.buildDeleteTableExprRows(t.RightExpr, tableRefs)
+		if err != nil {
+			return nil, err
+		}
+		isLeft := t.Join == sqlparser.LeftJoinType || t.Join == sqlparser.NaturalLeftJoinType
+		var result []storage.Row
+		for _, lRow := range leftRows {
+			matched := false
+			for _, rRow := range rightRows {
+				combined := mergeDeleteRows(lRow, rRow)
+				if t.Condition.On != nil {
+					ok, err := e.evalWhere(t.Condition.On, combined)
+					if err != nil {
+						return nil, err
+					}
+					if !ok {
+						continue
+					}
+				}
+				matched = true
+				result = append(result, combined)
+			}
+			if !matched && isLeft {
+				// LEFT JOIN with no match: combine left row with NULLs for right
+				nullRow := make(storage.Row)
+				for k := range lRow {
+					nullRow[k] = lRow[k]
+				}
+				// Add NULL entries for right table columns
+				if len(rightRows) > 0 {
+					for k := range rightRows[0] {
+						nullRow[k] = nil
+					}
+				}
+				result = append(result, nullRow)
+			}
+		}
+		return result, nil
+	case *sqlparser.ParenTableExpr:
+		return e.buildDeleteFromRows(t.Exprs, tableRefs)
+	default:
+		return nil, fmt.Errorf("unsupported table expression type in multi-table DELETE")
+	}
+}
+
+func mergeDeleteRows(left, right storage.Row) storage.Row {
+	merged := make(storage.Row, len(left)+len(right))
+	for k, v := range left {
+		merged[k] = v
+	}
+	for k, v := range right {
+		merged[k] = v
+	}
+	return merged
 }
 
 // matchRowToTable returns the index of the row in tbl.Rows that matches

@@ -291,7 +291,14 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					if curIsZero != newIsZero {
 						return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'innodb_commit_concurrency' can't be set to the value of '%v'", evalVal))
 					}
-					e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", newVal)
+					if isGlobal {
+						e.globalScopeVars[cleanName] = fmt.Sprintf("%d", newVal)
+						if prevVal, had := savedSessionVal[cleanName]; had {
+							e.sessionScopeVars[cleanName] = prevVal
+						}
+					} else {
+						e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", newVal)
+					}
 				} else if cleanName == "default_storage_engine" || cleanName == "default_tmp_storage_engine" || cleanName == "storage_engine" {
 					// Normalize engine names for storage engine variables
 					if _, isNull := expr.Expr.(*sqlparser.NullVal); isNull {
