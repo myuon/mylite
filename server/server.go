@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
@@ -414,6 +415,14 @@ func normalizeRows(rows [][]interface{}) [][]interface{} {
 				rows[i][j] = fmt.Sprintf("%.4f", float64(d))
 			} else if ev, ok := val.(executor.EnumValue); ok {
 				rows[i][j] = string(ev)
+			} else if hb, ok := val.(executor.HexBytes); ok {
+				// HexBytes stores hex-encoded data (e.g. "31" for x'31').
+				// Decode to raw bytes for the wire protocol.
+				if decoded, err := hex.DecodeString(string(hb)); err == nil {
+					rows[i][j] = decoded
+				} else {
+					rows[i][j] = string(hb)
+				}
 			}
 		}
 	}

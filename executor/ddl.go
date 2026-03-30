@@ -1719,11 +1719,12 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				seen := make(map[string]bool)
 				for _, row := range tbl.Rows {
 					keyParts := make([]string, len(baseCols))
-					allNull := true
+					hasNull := false
 					for ci, c := range baseCols {
 						v := rowValueByColumnName(row, c)
 						if v == nil {
 							keyParts[ci] = "NULL"
+							hasNull = true
 						} else {
 							s := fmt.Sprintf("%v", v)
 							// Apply prefix length and trim trailing nulls/spaces
@@ -1732,11 +1733,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 							}
 							s = strings.TrimRight(s, "\x00 ")
 							keyParts[ci] = s
-							allNull = false
 						}
 					}
-					if allNull {
-						continue // NULL values don't conflict
+					if hasNull {
+						continue // rows with any NULL in the key don't violate uniqueness
 					}
 					key := strings.Join(keyParts, "-")
 					if seen[key] {

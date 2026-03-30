@@ -2372,6 +2372,20 @@ func replaceTypeWord(query, old, replacement string) string {
 				idx = endPos
 				continue
 			}
+			// Skip if preceded by '=' (e.g. ROW_FORMAT=FIXED — not a column type)
+			if ch == '=' {
+				idx = endPos
+				continue
+			}
+		}
+		// Skip if the preceding non-space token is a table option keyword like ROW_FORMAT
+		// (e.g. "ROW_FORMAT FIXED" — value, not a column type)
+		{
+			pre := strings.TrimRight(upper[:absPos], " \t\n\r")
+			if strings.HasSuffix(pre, "ROW_FORMAT") {
+				idx = endPos
+				continue
+			}
 		}
 		if endPos < len(query) {
 			ch := query[endPos]
@@ -2385,6 +2399,231 @@ func replaceTypeWord(query, old, replacement string) string {
 		idx = absPos + len(replacement)
 	}
 	return query
+}
+
+// normalizeInlineCheckConstraints converts column-level CHECK constraints to
+// table-level constraints. The vitess parser produces a nil TableSpec when a
+// column definition contains an inline CHECK (expr), but handles table-level
+// CHECK constraints correctly.
+// Example: CREATE TABLE t1(f1 INT CHECK (f1 < 10))
+// becomes: CREATE TABLE t1(f1 INT, CHECK (f1 < 10))
+func normalizeInlineCheckConstraints(query string) string {
+	upper := strings.ToUpper(query)
+	if !strings.Contains(upper, "CREATE TABLE") && !strings.Contains(upper, "ALTER TABLE") {
+		return query
+	}
+	if !strings.Contains(upper, "CHECK") {
+		return query
+	}
+
+	// Find inline CHECK constraints in column definitions and move them
+	// to table-level constraints.
+	// We scan for patterns like: ... CHECK (...) ... within column definitions.
+	// An inline CHECK is preceded by a column type/options (not by a comma).
+	var result []byte
+	var extractedChecks []string
+	i := 0
+	for i < len(query) {
+		// Skip string literals
+		if query[i] == '\'' {
+			result = append(result, query[i])
+			i++
+			for i < len(query) {
+				result = append(result, query[i])
+				if query[i] == '\'' {
+					i++
+					break
+				}
+				if query[i] == '\\' && i+1 < len(query) {
+					i++
+					result = append(result, query[i])
+				}
+				i++
+			}
+			continue
+		}
+		if query[i] == '"' {
+			result = append(result, query[i])
+			i++
+			for i < len(query) {
+				result = append(result, query[i])
+				if query[i] == '"' {
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+		if query[i] == '`' {
+			result = append(result, query[i])
+			i++
+			for i < len(query) {
+				result = append(result, query[i])
+				if query[i] == '`' {
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+
+		// Look for CONSTRAINT name CHECK or CHECK keyword
+		remaining := query[i:]
+		upperRemaining := strings.ToUpper(remaining)
+
+		// Match optional "CONSTRAINT name" before CHECK
+		constraintPrefix := ""
+		checkStart := i
+		matched := false
+
+		if strings.HasPrefix(upperRemaining, "CONSTRAINT ") {
+			// Could be "CONSTRAINT name CHECK ..."
+			j := len("CONSTRAINT ")
+			// Skip whitespace
+			for j < len(remaining) && (remaining[j] == ' ' || remaining[j] == '\t' || remaining[j] == '\n' || remaining[j] == '\r') {
+				j++
+			}
+			// Read name (possibly backtick-quoted)
+			nameStart := j
+			_ = nameStart
+			if j < len(remaining) && remaining[j] == '`' {
+				j++
+				for j < len(remaining) && remaining[j] != '`' {
+					j++
+				}
+				if j < len(remaining) {
+					j++ // skip closing backtick
+				}
+			} else {
+				for j < len(remaining) && remaining[j] != ' ' && remaining[j] != '\t' && remaining[j] != '\n' {
+					j++
+				}
+			}
+			nameEnd := j
+			// Skip whitespace
+			for j < len(remaining) && (remaining[j] == ' ' || remaining[j] == '\t' || remaining[j] == '\n' || remaining[j] == '\r') {
+				j++
+			}
+			if j+5 <= len(remaining) && strings.EqualFold(remaining[j:j+5], "CHECK") &&
+				(j+5 == len(remaining) || remaining[j+5] == ' ' || remaining[j+5] == '(' || remaining[j+5] == '\t') {
+				constraintPrefix = remaining[:nameEnd]
+				checkStart = i + j
+				matched = true
+			}
+		}
+
+		if !matched && strings.HasPrefix(upperRemaining, "CHECK") &&
+			(len(upperRemaining) == 5 || upperRemaining[5] == ' ' || upperRemaining[5] == '(' || upperRemaining[5] == '\t') {
+			matched = true
+			checkStart = i
+		}
+
+		if matched {
+			// Determine if this CHECK is inline (part of column def) or already at table level.
+			// Table-level CHECK is preceded by a comma (possibly with whitespace).
+			// Inline CHECK is preceded by column type/options (letter, digit, paren).
+			prevNonSpace := 0
+			for p := checkStart - 1; p >= 0; p-- {
+				ch := query[p]
+				if ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' {
+					prevNonSpace = int(ch)
+					break
+				}
+			}
+			isTableLevel := prevNonSpace == ',' || prevNonSpace == '('
+			if !isTableLevel {
+				// This is an inline CHECK. Extract the full CHECK clause.
+				// Find the opening '(' after CHECK
+				j := checkStart + 5 // past "CHECK"
+				for j < len(query) && query[j] != '(' {
+					j++
+				}
+				if j < len(query) {
+					// Find matching closing ')'
+					depth := 0
+					start := j
+					for j < len(query) {
+						if query[j] == '(' {
+							depth++
+						} else if query[j] == ')' {
+							depth--
+							if depth == 0 {
+								j++
+								break
+							}
+						} else if query[j] == '\'' {
+							j++
+							for j < len(query) && query[j] != '\'' {
+								if query[j] == '\\' {
+									j++
+								}
+								j++
+							}
+						}
+						j++
+					}
+					checkExpr := query[start:j]
+					// Also consume optional NOT ENFORCED / ENFORCED after the check
+					rest := strings.TrimLeft(query[j:], " \t\n\r")
+					upperRest := strings.ToUpper(rest)
+					suffix := ""
+					consumed := j
+					if strings.HasPrefix(upperRest, "NOT ENFORCED") {
+						suffix = " NOT ENFORCED"
+						consumed = j + (len(query[j:]) - len(rest)) + len("NOT ENFORCED")
+					} else if strings.HasPrefix(upperRest, "ENFORCED") {
+						suffix = " ENFORCED"
+						consumed = j + (len(query[j:]) - len(rest)) + len("ENFORCED")
+					}
+					// Build the table-level constraint
+					checkClause := "CHECK " + checkExpr + suffix
+					if constraintPrefix != "" {
+						checkClause = constraintPrefix + " " + checkClause
+					}
+					extractedChecks = append(extractedChecks, checkClause)
+					// Remove from current position, trim trailing whitespace
+					// Also remove the CONSTRAINT prefix if present
+					removeFrom := i
+					if constraintPrefix != "" {
+						removeFrom = i
+					}
+					// Strip whitespace before the removed CHECK
+					for removeFrom > 0 && (query[removeFrom-1] == ' ' || query[removeFrom-1] == '\t') {
+						removeFrom--
+					}
+					result = result[:len(result)-(i-removeFrom)]
+					i = consumed
+					continue
+				}
+			}
+		}
+
+		result = append(result, query[i])
+		i++
+	}
+
+	if len(extractedChecks) == 0 {
+		return query
+	}
+
+	// Insert extracted checks before the closing ')' of the column definition list.
+	// Find the last ')' that closes the column definitions.
+	out := string(result)
+	// Find the position of the closing paren of column list.
+	// It's the last ')' before table options or end of statement.
+	lastParen := strings.LastIndex(out, ")")
+	if lastParen >= 0 {
+		// Insert checks as table-level constraints
+		insert := ""
+		for _, c := range extractedChecks {
+			insert += ",\n" + c
+		}
+		out = out[:lastParen] + insert + out[lastParen:]
+	}
+
+	return out
 }
 
 // normalizeStorageClause strips "STORAGE DISK" and "STORAGE MEMORY" from

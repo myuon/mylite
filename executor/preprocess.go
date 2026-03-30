@@ -300,6 +300,7 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 
 	// Normalize SQL type aliases that vitess parser doesn't support
 	query = normalizeTypeAliases(query)
+	query = normalizeInlineCheckConstraints(query)
 	query = normalizeStorageClause(query)
 	// Strip STATS_SAMPLE_PAGES=default which vitess can't parse
 	query = normalizeStatsSamplePages(query)
