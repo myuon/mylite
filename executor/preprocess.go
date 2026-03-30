@@ -317,6 +317,8 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	// Fix vitess parser issue: "ADD KEY USING BTREE (col)" is not parsed correctly.
 	// Rewrite to "ADD KEY (col)" since BTREE is the default for InnoDB.
 	query = normalizeAddIndexUsing(query)
+	// Normalize "ENGINE value" to "ENGINE=value" (MySQL allows omitting "=")
+	query = normalizeEngineWithoutEquals(query)
 	// Fix CREATE TABLE with "KEY/INDEX/PRIMARY KEY USING BTREE/HASH (cols)" syntax
 	query = normalizeCreateTableIndexUsing(query)
 	// Detect SKIP LOCKED / NOWAIT and per-table locking clauses before
@@ -452,10 +454,6 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		return "", result, err
 	}
 
-	// Quote identifiers starting with 0b that aren't valid binary literals
-	// (e.g. 0b02, 0b2 used as column names in CREATE TABLE).
-	query = quote0bPrefixedIdentifiers(query)
-
 	// Quote non-ASCII bare identifiers so vitess can parse them.
 	query = quoteNonASCIIIdentifiers(query)
 	trimmed = strings.TrimSpace(query)
@@ -504,30 +502,4 @@ func stripStringLiterals(s string) string {
 		}
 	}
 	return buf.String()
-}
-
-// quote0bPrefixedIdentifiers wraps bare identifiers that start with "0b"
-// followed by digits containing non-binary digits (2-9) in backticks so the
-// vitess SQL parser does not misinterpret them as binary literals.
-// For example, column name "0b02" becomes "`0b02`".
-// Genuine binary literals like 0b0101 (only 0s and 1s) are left untouched.
-var re0bIdent = regexp.MustCompile(`\b(0[bB])([0-9]+)\b`)
-
-func quote0bPrefixedIdentifiers(query string) string {
-	// Quick check: if "0b" or "0B" is not present, skip.
-	if !strings.Contains(query, "0b") && !strings.Contains(query, "0B") {
-		return query
-	}
-	return re0bIdent.ReplaceAllStringFunc(query, func(match string) string {
-		// Extract the digits after "0b"/"0B"
-		digits := match[2:]
-		// If all digits are 0 or 1, this is a valid binary literal -- leave it.
-		for _, c := range digits {
-			if c != '0' && c != '1' {
-				// Contains non-binary digit; this is an identifier, quote it.
-				return "`" + match + "`"
-			}
-		}
-		return match
-	})
 }

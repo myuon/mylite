@@ -2705,6 +2705,24 @@ func isIdentChar(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b == '$'
 }
 
+// normalizeEngineWithoutEquals rewrites "ENGINE <value>" to "ENGINE=<value>"
+// in CREATE TABLE / ALTER TABLE statements. MySQL allows both forms but the
+// vitess parser requires the equals sign.
+func normalizeEngineWithoutEquals(query string) string {
+	upper := strings.ToUpper(query)
+	if !strings.Contains(upper, "ENGINE") {
+		return query
+	}
+	if !strings.HasPrefix(upper, "CREATE ") && !strings.HasPrefix(upper, "ALTER ") {
+		return query
+	}
+	// Match ENGINE followed by whitespace and a known engine name (without "=").
+	// Only rewrite for known engine names to avoid false positives like
+	// "ENGINE FROM" in SELECT queries.
+	re := regexp.MustCompile(`(?i)\bENGINE\s+(InnoDB|MyISAM|MEMORY|HEAP|ARCHIVE|CSV|BLACKHOLE|NDB|MERGE|FEDERATED|EXAMPLE)\b`)
+	return re.ReplaceAllString(query, "ENGINE=$1")
+}
+
 // normalizeCreateTableEngineSelect strips table options (ENGINE=, CHARSET=, etc.)
 // between the table name and SELECT clause in CREATE TABLE statements so the
 // vitess parser can handle them. The engine is ignored since mylite uses its
@@ -2776,24 +2794,27 @@ func normalizeCreateTableIndexUsing(query string) string {
 	if !strings.Contains(upper, "CREATE TABLE") && !strings.Contains(upper, "CREATE TEMPORARY TABLE") {
 		return query
 	}
+	// Use a parenthesized-column-list pattern that handles one level of nesting,
+	// e.g. (c(1), d(2)) where prefix lengths create inner parentheses.
+	const colList = `(\([^()]*(?:\([^()]*\)[^()]*)*\))`
 	// PRIMARY KEY USING BTREE/HASH (cols) -> PRIMARY KEY (cols)
-	re1 := regexp.MustCompile(`(?i)(PRIMARY\s+KEY)\s+USING\s+(\w+)\s*(\([^)]*\))`)
+	re1 := regexp.MustCompile(`(?i)(PRIMARY\s+KEY)\s+USING\s+(\w+)\s*` + colList)
 	query = re1.ReplaceAllString(query, "${1} ${3} USING ${2}")
 	// UNIQUE KEY [name] USING BTREE (cols) -> UNIQUE KEY [name] (cols) USING BTREE
-	re2 := regexp.MustCompile("(?i)(UNIQUE\\s+(?:KEY|INDEX))\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
+	re2 := regexp.MustCompile(`(?i)(UNIQUE\s+(?:KEY|INDEX))\s+USING\s+(\w+)\s*` + colList)
 	query = re2.ReplaceAllString(query, "${1} ${3} USING ${2}")
-	re3 := regexp.MustCompile("(?i)(UNIQUE\\s+(?:KEY|INDEX)\\s+`?\\w+`?)\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
+	re3 := regexp.MustCompile("(?i)(UNIQUE\\s+(?:KEY|INDEX)\\s+`?\\w+`?)\\s+USING\\s+(\\w+)\\s*" + colList)
 	query = re3.ReplaceAllString(query, "${1} ${3} USING ${2}")
 	// KEY/INDEX [name] USING BTREE (cols) -> KEY [name] (cols) USING BTREE
-	re4 := regexp.MustCompile("(?i)((?:KEY|INDEX))\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
+	re4 := regexp.MustCompile("(?i)((?:KEY|INDEX))\\s+USING\\s+(\\w+)\\s*" + colList)
 	query = re4.ReplaceAllString(query, "${1} ${3} USING ${2}")
-	re5 := regexp.MustCompile("(?i)((?:KEY|INDEX)\\s+`?\\w+`?)\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
+	re5 := regexp.MustCompile("(?i)((?:KEY|INDEX)\\s+`?\\w+`?)\\s+USING\\s+(\\w+)\\s*" + colList)
 	query = re5.ReplaceAllString(query, "${1} ${3} USING ${2}")
 	// UNIQUE name USING BTREE (cols) -> UNIQUE KEY name (cols) USING BTREE
-	re6 := regexp.MustCompile("(?i)(UNIQUE)\\s+(`?\\w+`?)\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
+	re6 := regexp.MustCompile("(?i)(UNIQUE)\\s+(`?\\w+`?)\\s+USING\\s+(\\w+)\\s*" + colList)
 	query = re6.ReplaceAllString(query, "${1} KEY ${2} ${4} USING ${3}")
 	// UNIQUE USING BTREE (cols) -> UNIQUE KEY (cols) USING BTREE (no name)
-	re7 := regexp.MustCompile("(?i)(UNIQUE)\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
+	re7 := regexp.MustCompile("(?i)(UNIQUE)\\s+USING\\s+(\\w+)\\s*" + colList)
 	query = re7.ReplaceAllString(query, "${1} KEY ${3} USING ${2}")
 	return query
 }

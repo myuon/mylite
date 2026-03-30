@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
@@ -533,8 +535,12 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		}
 		r, err := e.evalExprMaybeRow(v.Exprs[1], row)
 		return r, true, err
-	case "aes_encrypt", "aes_decrypt":
-		return nil, true, nil
+	case "aes_encrypt":
+		result, err := e.evalAESEncrypt(v, row)
+		return result, true, err
+	case "aes_decrypt":
+		result, err := e.evalAESDecrypt(v, row)
+		return result, true, err
 	case "uuid_to_bin":
 		utbVal, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {
@@ -642,4 +648,362 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 	default:
 		return nil, false, nil
 	}
+}
+
+// parseBlockEncryptionMode parses the block_encryption_mode system variable.
+// Returns (algorithm, keyLen, mode) e.g. ("aes", 128, "ecb").
+func parseBlockEncryptionMode(modeStr string) (int, string) {
+	// Format: "aes-<keylen>-<mode>" e.g. "aes-128-ecb"
+	parts := strings.Split(strings.ToLower(modeStr), "-")
+	if len(parts) != 3 {
+		return 128, "ecb"
+	}
+	keyLen := 128
+	switch parts[1] {
+	case "192":
+		keyLen = 192
+	case "256":
+		keyLen = 256
+	}
+	return keyLen, parts[2]
+}
+
+// aesBlockModeRequiresIV returns true if the block cipher mode requires an IV.
+func aesBlockModeRequiresIV(mode string) bool {
+	switch mode {
+	case "cbc", "cfb1", "cfb8", "cfb128", "ofb":
+		return true
+	}
+	return false
+}
+
+// aesKeySchedule derives the AES key from the user-provided key string,
+// matching MySQL's key schedule algorithm (repeated XOR folding).
+func aesKeySchedule(key []byte, keyLen int) []byte {
+	keyBytes := keyLen / 8
+	result := make([]byte, keyBytes)
+	for i, b := range key {
+		result[i%keyBytes] ^= b
+	}
+	return result
+}
+
+// pkcs7Pad pads data to blockSize using PKCS#7.
+func pkcs7Pad(data []byte, blockSize int) []byte {
+	padding := blockSize - len(data)%blockSize
+	pad := make([]byte, padding)
+	for i := range pad {
+		pad[i] = byte(padding)
+	}
+	return append(data, pad...)
+}
+
+// pkcs7Unpad removes PKCS#7 padding.
+func pkcs7Unpad(data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty data")
+	}
+	padding := int(data[len(data)-1])
+	if padding == 0 || padding > len(data) || padding > aes.BlockSize {
+		return nil, fmt.Errorf("invalid padding")
+	}
+	for i := len(data) - padding; i < len(data); i++ {
+		if data[i] != byte(padding) {
+			return nil, fmt.Errorf("invalid padding")
+		}
+	}
+	return data[:len(data)-padding], nil
+}
+
+func (e *Executor) evalAESEncrypt(v *sqlparser.FuncExpr, row *storage.Row) (interface{}, error) {
+	modeStr, _ := e.getSysVar("block_encryption_mode")
+	if modeStr == "" {
+		modeStr = "aes-128-ecb"
+	}
+	keyLen, mode := parseBlockEncryptionMode(modeStr)
+
+	// CFB/OFB modes require exactly 3 args (plaintext, key, iv)
+	if aesBlockModeRequiresIV(mode) && len(v.Exprs) < 3 {
+		return nil, mysqlError(1582, "42000",
+			"Incorrect parameter count in the call to native function 'aes_encrypt'")
+	}
+	if len(v.Exprs) < 2 {
+		return nil, mysqlError(1582, "42000",
+			"Incorrect parameter count in the call to native function 'aes_encrypt'")
+	}
+
+	plainVal, err := e.evalExprMaybeRow(v.Exprs[0], row)
+	if err != nil {
+		return nil, err
+	}
+	keyVal, err := e.evalExprMaybeRow(v.Exprs[1], row)
+	if err != nil {
+		return nil, err
+	}
+	if plainVal == nil || keyVal == nil {
+		return nil, nil
+	}
+
+	var iv []byte
+	if len(v.Exprs) >= 3 {
+		ivVal, err := e.evalExprMaybeRow(v.Exprs[2], row)
+		if err != nil {
+			return nil, err
+		}
+		if ivVal != nil {
+			iv = []byte(toString(ivVal))
+		}
+	}
+
+	plaintext := []byte(toString(plainVal))
+	key := aesKeySchedule([]byte(toString(keyVal)), keyLen)
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, nil
+	}
+
+	var result string
+	switch mode {
+	case "ecb":
+		padded := pkcs7Pad(plaintext, aes.BlockSize)
+		ciphertext := make([]byte, len(padded))
+		for i := 0; i < len(padded); i += aes.BlockSize {
+			block.Encrypt(ciphertext[i:i+aes.BlockSize], padded[i:i+aes.BlockSize])
+		}
+		result = string(ciphertext)
+	case "cbc":
+		if len(iv) < aes.BlockSize {
+			return nil, nil
+		}
+		padded := pkcs7Pad(plaintext, aes.BlockSize)
+		ciphertext := make([]byte, len(padded))
+		cbc := cipher.NewCBCEncrypter(block, iv[:aes.BlockSize])
+		cbc.CryptBlocks(ciphertext, padded)
+		result = string(ciphertext)
+	case "cfb1":
+		if len(iv) < aes.BlockSize {
+			return nil, nil
+		}
+		ciphertext := aesCFB1Encrypt(block, iv[:aes.BlockSize], plaintext)
+		result = string(ciphertext)
+	case "cfb8":
+		if len(iv) < aes.BlockSize {
+			return nil, nil
+		}
+		ciphertext := aesCFB8Encrypt(block, iv[:aes.BlockSize], plaintext)
+		result = string(ciphertext)
+	case "cfb128":
+		if len(iv) < aes.BlockSize {
+			return nil, nil
+		}
+		ciphertext := make([]byte, len(plaintext))
+		stream := cipher.NewCFBEncrypter(block, iv[:aes.BlockSize])
+		stream.XORKeyStream(ciphertext, plaintext)
+		result = string(ciphertext)
+	case "ofb":
+		if len(iv) < aes.BlockSize {
+			return nil, nil
+		}
+		ciphertext := make([]byte, len(plaintext))
+		stream := cipher.NewOFB(block, iv[:aes.BlockSize])
+		stream.XORKeyStream(ciphertext, plaintext)
+		result = string(ciphertext)
+	default:
+		return nil, nil
+	}
+	return result, nil
+}
+
+func (e *Executor) evalAESDecrypt(v *sqlparser.FuncExpr, row *storage.Row) (interface{}, error) {
+	modeStr, _ := e.getSysVar("block_encryption_mode")
+	if modeStr == "" {
+		modeStr = "aes-128-ecb"
+	}
+	keyLen, mode := parseBlockEncryptionMode(modeStr)
+
+	if aesBlockModeRequiresIV(mode) && len(v.Exprs) < 3 {
+		return nil, mysqlError(1582, "42000",
+			"Incorrect parameter count in the call to native function 'aes_decrypt'")
+	}
+	if len(v.Exprs) < 2 {
+		return nil, mysqlError(1582, "42000",
+			"Incorrect parameter count in the call to native function 'aes_decrypt'")
+	}
+
+	cipherVal, err := e.evalExprMaybeRow(v.Exprs[0], row)
+	if err != nil {
+		return nil, err
+	}
+	keyVal, err := e.evalExprMaybeRow(v.Exprs[1], row)
+	if err != nil {
+		return nil, err
+	}
+	if cipherVal == nil || keyVal == nil {
+		return nil, nil
+	}
+
+	var iv []byte
+	if len(v.Exprs) >= 3 {
+		ivVal, err := e.evalExprMaybeRow(v.Exprs[2], row)
+		if err != nil {
+			return nil, err
+		}
+		if ivVal != nil {
+			iv = []byte(toString(ivVal))
+		}
+	}
+
+	ciphertext := []byte(toString(cipherVal))
+	key := aesKeySchedule([]byte(toString(keyVal)), keyLen)
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, nil
+	}
+
+	switch mode {
+	case "ecb":
+		if len(ciphertext) == 0 || len(ciphertext)%aes.BlockSize != 0 {
+			return nil, nil
+		}
+		plaintext := make([]byte, len(ciphertext))
+		for i := 0; i < len(ciphertext); i += aes.BlockSize {
+			block.Decrypt(plaintext[i:i+aes.BlockSize], ciphertext[i:i+aes.BlockSize])
+		}
+		unpadded, err := pkcs7Unpad(plaintext)
+		if err != nil {
+			return nil, nil
+		}
+		return string(unpadded), nil
+	case "cbc":
+		if len(iv) < aes.BlockSize {
+			return nil, nil
+		}
+		if len(ciphertext) == 0 || len(ciphertext)%aes.BlockSize != 0 {
+			return nil, nil
+		}
+		plaintext := make([]byte, len(ciphertext))
+		cbc := cipher.NewCBCDecrypter(block, iv[:aes.BlockSize])
+		cbc.CryptBlocks(plaintext, ciphertext)
+		unpadded, err := pkcs7Unpad(plaintext)
+		if err != nil {
+			return nil, nil
+		}
+		return string(unpadded), nil
+	case "cfb1":
+		if len(iv) < aes.BlockSize {
+			return nil, nil
+		}
+		plaintext := aesCFB1Decrypt(block, iv[:aes.BlockSize], ciphertext)
+		return string(plaintext), nil
+	case "cfb8":
+		if len(iv) < aes.BlockSize {
+			return nil, nil
+		}
+		plaintext := aesCFB8Decrypt(block, iv[:aes.BlockSize], ciphertext)
+		return string(plaintext), nil
+	case "cfb128":
+		if len(iv) < aes.BlockSize {
+			return nil, nil
+		}
+		plaintext := make([]byte, len(ciphertext))
+		stream := cipher.NewCFBDecrypter(block, iv[:aes.BlockSize])
+		stream.XORKeyStream(plaintext, ciphertext)
+		return string(plaintext), nil
+	case "ofb":
+		if len(iv) < aes.BlockSize {
+			return nil, nil
+		}
+		plaintext := make([]byte, len(ciphertext))
+		stream := cipher.NewOFB(block, iv[:aes.BlockSize])
+		stream.XORKeyStream(plaintext, ciphertext)
+		return string(plaintext), nil
+	default:
+		return nil, nil
+	}
+}
+
+// aesCFB1Encrypt implements CFB-1 mode encryption (1 bit at a time).
+func aesCFB1Encrypt(block cipher.Block, iv, plaintext []byte) []byte {
+	shift := make([]byte, aes.BlockSize)
+	copy(shift, iv)
+	ciphertext := make([]byte, len(plaintext))
+	encrypted := make([]byte, aes.BlockSize)
+
+	for i := 0; i < len(plaintext); i++ {
+		var outByte byte
+		for bit := 7; bit >= 0; bit-- {
+			block.Encrypt(encrypted, shift)
+			plaintextBit := (plaintext[i] >> uint(bit)) & 1
+			cipherBit := plaintextBit ^ (encrypted[0] >> 7)
+			outByte |= cipherBit << uint(bit)
+			// Shift left by 1 bit, insert cipherBit at the end
+			for j := 0; j < aes.BlockSize-1; j++ {
+				shift[j] = (shift[j] << 1) | (shift[j+1] >> 7)
+			}
+			shift[aes.BlockSize-1] = (shift[aes.BlockSize-1] << 1) | cipherBit
+		}
+		ciphertext[i] = outByte
+	}
+	return ciphertext
+}
+
+// aesCFB1Decrypt implements CFB-1 mode decryption (1 bit at a time).
+func aesCFB1Decrypt(block cipher.Block, iv, ciphertext []byte) []byte {
+	shift := make([]byte, aes.BlockSize)
+	copy(shift, iv)
+	plaintext := make([]byte, len(ciphertext))
+	encrypted := make([]byte, aes.BlockSize)
+
+	for i := 0; i < len(ciphertext); i++ {
+		var outByte byte
+		for bit := 7; bit >= 0; bit-- {
+			block.Encrypt(encrypted, shift)
+			cipherBit := (ciphertext[i] >> uint(bit)) & 1
+			plaintextBit := cipherBit ^ (encrypted[0] >> 7)
+			outByte |= plaintextBit << uint(bit)
+			// Shift left by 1 bit, insert cipherBit at the end
+			for j := 0; j < aes.BlockSize-1; j++ {
+				shift[j] = (shift[j] << 1) | (shift[j+1] >> 7)
+			}
+			shift[aes.BlockSize-1] = (shift[aes.BlockSize-1] << 1) | cipherBit
+		}
+		plaintext[i] = outByte
+	}
+	return plaintext
+}
+
+// aesCFB8Encrypt implements CFB-8 mode encryption (1 byte at a time).
+func aesCFB8Encrypt(block cipher.Block, iv, plaintext []byte) []byte {
+	shift := make([]byte, aes.BlockSize)
+	copy(shift, iv)
+	ciphertext := make([]byte, len(plaintext))
+	encrypted := make([]byte, aes.BlockSize)
+
+	for i := 0; i < len(plaintext); i++ {
+		block.Encrypt(encrypted, shift)
+		ciphertext[i] = plaintext[i] ^ encrypted[0]
+		// Shift left by 1 byte, append ciphertext byte
+		copy(shift, shift[1:])
+		shift[aes.BlockSize-1] = ciphertext[i]
+	}
+	return ciphertext
+}
+
+// aesCFB8Decrypt implements CFB-8 mode decryption (1 byte at a time).
+func aesCFB8Decrypt(block cipher.Block, iv, ciphertext []byte) []byte {
+	shift := make([]byte, aes.BlockSize)
+	copy(shift, iv)
+	plaintext := make([]byte, len(ciphertext))
+	encrypted := make([]byte, aes.BlockSize)
+
+	for i := 0; i < len(ciphertext); i++ {
+		block.Encrypt(encrypted, shift)
+		plaintext[i] = ciphertext[i] ^ encrypted[0]
+		// Shift left by 1 byte, append ciphertext byte
+		copy(shift, shift[1:])
+		shift[aes.BlockSize-1] = ciphertext[i]
+	}
+	return plaintext
 }
