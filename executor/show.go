@@ -565,6 +565,28 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		}
 	}
 
+	// SHOW CREATE PROCEDURE <name>
+	if strings.HasPrefix(upper, "SHOW CREATE PROCEDURE") {
+		parts := strings.Fields(query)
+		if len(parts) >= 4 {
+			procName := strings.Join(parts[3:], " ")
+			procName = strings.TrimRight(procName, ";")
+			procName = strings.ReplaceAll(procName, "`", "")
+			return e.showCreateProcedure(procName)
+		}
+	}
+
+	// SHOW CREATE FUNCTION <name>
+	if strings.HasPrefix(upper, "SHOW CREATE FUNCTION") {
+		parts := strings.Fields(query)
+		if len(parts) >= 4 {
+			funcName := strings.Join(parts[3:], " ")
+			funcName = strings.TrimRight(funcName, ";")
+			funcName = strings.ReplaceAll(funcName, "`", "")
+			return e.showCreateFunction(funcName)
+		}
+	}
+
 	// SHOW INDEX/INDEXES/KEYS FROM <table>
 	if strings.HasPrefix(upper, "SHOW INDEX ") || strings.HasPrefix(upper, "SHOW INDEXES ") || strings.HasPrefix(upper, "SHOW KEYS ") {
 		showDB, showTable, ok := parseShowIndexTarget(query, e.CurrentDB)
@@ -736,8 +758,9 @@ func (e *Executor) showIndexes(dbName, tableName string) (*Result, error) {
 			r["EXPRESSION"],    // Expression
 		})
 	}
-	// MySQL's SHOW INDEX preserves index creation order, with PRIMARY always first.
-	// Use a stable sort that only moves PRIMARY to the front.
+	// MySQL's SHOW INDEX preserves index definition order, with PRIMARY always first.
+	// Use a stable sort that only moves PRIMARY to the front and orders by
+	// Seq_in_index within the same index name.
 	sort.SliceStable(rows, func(i, j int) bool {
 		ki := toString(rows[i][2])
 		kj := toString(rows[j][2])
@@ -1123,6 +1146,70 @@ func isClusterPreferredUniqueIndex(idx catalog.IndexDef, cols []catalog.ColumnDe
 		}
 	}
 	return true
+}
+
+func (e *Executor) showCreateProcedure(procName string) (*Result, error) {
+	dbName := e.CurrentDB
+	if strings.Contains(procName, ".") {
+		parts := strings.SplitN(procName, ".", 2)
+		dbName = parts[0]
+		procName = parts[1]
+	}
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
+	}
+	procDef := db.GetProcedure(procName)
+	if procDef == nil {
+		return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", dbName, procName))
+	}
+	createSQL := procDef.OriginalSQL
+	if createSQL == "" {
+		// Reconstruct from stored definition
+		var paramParts []string
+		for _, p := range procDef.Params {
+			paramParts = append(paramParts, fmt.Sprintf("%s %s %s", p.Mode, p.Name, p.Type))
+		}
+		body := strings.Join(procDef.Body, ";\n")
+		createSQL = fmt.Sprintf("CREATE DEFINER=`root`@`localhost` PROCEDURE `%s`(%s)\nBEGIN\n%s;\nEND", procDef.Name, strings.Join(paramParts, ", "), body)
+	}
+	return &Result{
+		Columns:     []string{"Procedure", "sql_mode", "Create Procedure", "character_set_client", "collation_connection", "Database Collation"},
+		Rows:        [][]interface{}{{procDef.Name, "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION", createSQL, "utf8mb4", "utf8mb4_0900_ai_ci", "utf8mb4_0900_ai_ci"}},
+		IsResultSet: true,
+	}, nil
+}
+
+func (e *Executor) showCreateFunction(funcName string) (*Result, error) {
+	dbName := e.CurrentDB
+	if strings.Contains(funcName, ".") {
+		parts := strings.SplitN(funcName, ".", 2)
+		dbName = parts[0]
+		funcName = parts[1]
+	}
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
+	}
+	funcDef := db.GetFunction(funcName)
+	if funcDef == nil {
+		return nil, mysqlError(1305, "42000", fmt.Sprintf("FUNCTION %s.%s does not exist", dbName, funcName))
+	}
+	createSQL := funcDef.OriginalSQL
+	if createSQL == "" {
+		// Reconstruct from stored definition
+		var paramParts []string
+		for _, p := range funcDef.Params {
+			paramParts = append(paramParts, fmt.Sprintf("%s %s", p.Name, p.Type))
+		}
+		body := strings.Join(funcDef.Body, ";\n")
+		createSQL = fmt.Sprintf("CREATE DEFINER=`root`@`localhost` FUNCTION `%s`(%s) RETURNS %s\nBEGIN\n%s;\nEND", funcDef.Name, strings.Join(paramParts, ", "), funcDef.ReturnType, body)
+	}
+	return &Result{
+		Columns:     []string{"Function", "sql_mode", "Create Function", "character_set_client", "collation_connection", "Database Collation"},
+		Rows:        [][]interface{}{{funcDef.Name, "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION", createSQL, "utf8mb4", "utf8mb4_0900_ai_ci", "utf8mb4_0900_ai_ci"}},
+		IsResultSet: true,
+	}, nil
 }
 
 func (e *Executor) showCreateTable(tableName string) (*Result, error) {
