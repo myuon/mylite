@@ -1280,9 +1280,32 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	}
 	displayIndexes := make([]catalog.IndexDef, len(def.Indexes))
 	copy(displayIndexes, def.Indexes)
+	// hasColumnPrefix returns true if any column in the index uses a prefix (e.g. col(31)).
+	hasColumnPrefix := func(idx catalog.IndexDef) bool {
+		for _, c := range idx.Columns {
+			if strings.Contains(c, "(") {
+				return true
+			}
+		}
+		return false
+	}
 	sort.SliceStable(displayIndexes, func(i, j int) bool {
 		// MySQL orders UNIQUE KEY before non-unique KEY in SHOW CREATE TABLE
-		return displayIndexes[i].Unique && !displayIndexes[j].Unique
+		iUnique := displayIndexes[i].Unique
+		jUnique := displayIndexes[j].Unique
+		if iUnique != jUnique {
+			return iUnique && !jUnique
+		}
+		// Among UNIQUE keys, MySQL/InnoDB puts full-column (no prefix) indexes
+		// before prefix-based indexes (InnoDB clustered index promotion logic).
+		if iUnique && jUnique {
+			iPrefix := hasColumnPrefix(displayIndexes[i])
+			jPrefix := hasColumnPrefix(displayIndexes[j])
+			if iPrefix != jPrefix {
+				return !iPrefix && jPrefix
+			}
+		}
+		return false
 	})
 	for i, idx := range displayIndexes {
 		quotedCols := make([]string, len(idx.Columns))

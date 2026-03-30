@@ -3133,6 +3133,29 @@ func (e *Executor) infoSchemaKeyColumnUsage() []storage.Row {
 					}
 				}
 			}
+			// Foreign key constraints
+			for _, fk := range tbl.ForeignKeys {
+				for i, col := range fk.Columns {
+					var refCol interface{}
+					if i < len(fk.ReferencedColumns) {
+						refCol = fk.ReferencedColumns[i]
+					}
+					rows = append(rows, storage.Row{
+						"CONSTRAINT_CATALOG":            "def",
+						"CONSTRAINT_SCHEMA":             dbName,
+						"CONSTRAINT_NAME":               fk.Name,
+						"TABLE_CATALOG":                 "def",
+						"TABLE_SCHEMA":                  dbName,
+						"TABLE_NAME":                    tblName,
+						"COLUMN_NAME":                   col,
+						"ORDINAL_POSITION":              int64(i + 1),
+						"POSITION_IN_UNIQUE_CONSTRAINT": int64(i + 1),
+						"REFERENCED_TABLE_SCHEMA":       dbName,
+						"REFERENCED_TABLE_NAME":         fk.ReferencedTable,
+						"REFERENCED_COLUMN_NAME":        refCol,
+					})
+				}
+			}
 		}
 	}
 	return rows
