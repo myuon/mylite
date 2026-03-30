@@ -146,9 +146,28 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					} else if cleanName == "innodb_io_capacity_max" {
 						e.setSysVar(cleanName, "4294967295", isGlobal)
 					} else if isGlobal {
-						// For SET GLOBAL var = DEFAULT, delete the global override
-						// so the value falls back to the compiled default.
-						e.deleteSysVar(cleanName, true)
+						// For SET GLOBAL var = DEFAULT, reset to compiled default.
+						// If startupVars has an override for this variable, we must
+						// explicitly set globalScopeVars to the compiled default so
+						// it takes precedence over the startup value.
+						// Exception: innodb_commit_concurrency uses startup value as
+						// its DEFAULT because the zero<->non-zero transition rule
+						// would block resetting to the compiled default (0).
+						if cleanName == "innodb_commit_concurrency" {
+							if sv, hasSV := e.startupVars[cleanName]; hasSV {
+								e.globalScopeVars[cleanName] = sv
+							} else {
+								e.deleteSysVar(cleanName, true)
+							}
+						} else if _, hasStartup := e.startupVars[cleanName]; hasStartup {
+							if compiled, ok := e.getCompiledDefault(cleanName); ok {
+								e.globalScopeVars[cleanName] = compiled
+							} else {
+								e.deleteSysVar(cleanName, true)
+							}
+						} else {
+							e.deleteSysVar(cleanName, true)
+						}
 					} else {
 						// For SET SESSION var = DEFAULT, set session to current global value.
 						// In MySQL, DEFAULT for session means "current global value".
@@ -361,24 +380,6 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						e.sessionScopeVars[cleanName] = normalized
 					}
 				} else {
-					// For most system variables, NULL means reset to default (empty string)
-					// Only reject NULL for specific variable types that require it
-					if _, isNull := expr.Expr.(*sqlparser.NullVal); isNull {
-						if !isBooleanVariable(cleanName) {
-							if _, isEnum := sysVarEnumValues[cleanName]; isEnum {
-								// enum variables handle NULL in their own path
-							} else if sysVarRejectsNull(cleanName) {
-								return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of 'NULL'", cleanName))
-							}
-						}
-					}
-					// Warn when setting log_error_services to empty string
-					if cleanName == "log_error_services" {
-						testVal := strings.Trim(val, "'\"")
-						if testVal == "" {
-							e.addWarning("Warning", 3702, "Setting an empty log_error_services pipeline disables error logging!")
-						}
-					}
 					// Evaluate expression
 					evalVal, err := e.evalExpr(expr.Expr)
 					if enumVals, isEnum := sysVarEnumValues[cleanName]; isEnum && len(enumVals) > 0 {
@@ -652,7 +653,28 @@ func (e *Executor) handleRawSet(raw string) error {
 		if strings.ToUpper(val) != "DEFAULT" {
 			e.setSysVar(varName, val, isGlobalScope)
 		} else {
-			e.deleteSysVar(varName, isGlobalScope)
+			// For SET GLOBAL var = DEFAULT, use the compiled default when
+			// startupVars would otherwise shadow it.
+			// Exception: innodb_commit_concurrency uses startup value as DEFAULT.
+			if isGlobalScope {
+				if varName == "innodb_commit_concurrency" {
+					if sv, hasSV := e.startupVars[varName]; hasSV {
+						e.globalScopeVars[varName] = sv
+					} else {
+						e.deleteSysVar(varName, true)
+					}
+				} else if _, hasStartup := e.startupVars[varName]; hasStartup {
+					if compiled, ok := e.getCompiledDefault(varName); ok {
+						e.globalScopeVars[varName] = compiled
+					} else {
+						e.deleteSysVar(varName, true)
+					}
+				} else {
+					e.deleteSysVar(varName, true)
+				}
+			} else {
+				e.deleteSysVar(varName, false)
+			}
 		}
 		// Trigger variables reset to OFF immediately after being set
 		if triggerSysVars[varName] {
@@ -1451,19 +1473,6 @@ var sysVarBoolean = map[string]bool{
 
 func isBooleanVariable(name string) bool {
 	return sysVarBoolean[name]
-}
-
-// sysVarRejectsNull returns true for system variables that reject NULL assignment
-// Most string variables accept NULL (treated as empty string or default), but some reject it.
-func sysVarRejectsNull(name string) bool {
-	switch name {
-	case "character_set_client", "character_set_connection", "character_set_database",
-		"character_set_filesystem", "character_set_results", "character_set_server",
-		"collation_connection", "collation_database", "collation_server",
-		"default_collation_for_utf8mb4":
-		return true
-	}
-	return false
 }
 
 // sysVarBoolAcceptNegative contains boolean variables that accept negative integers

@@ -21,6 +21,32 @@ import (
 // buildFromExpr builds rows from any TableExpr (AliasedTableExpr or JoinTableExpr).
 // Each row has both un-prefixed keys (for backwards compat with single-table queries)
 // and "alias.col" prefixed keys (for JOIN disambiguation).
+// collectJoinTableAliases extracts the alias (or table name if no alias) for each table
+// in a FROM expression (including JOINs), in the same order as collectTableDefs.
+func collectJoinTableAliases(expr sqlparser.TableExpr) []string {
+	switch te := expr.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if !te.As.IsEmpty() {
+			return []string{te.As.String()}
+		}
+		if tn, ok := te.Expr.(sqlparser.TableName); ok {
+			return []string{tn.Name.String()}
+		}
+		return nil
+	case *sqlparser.JoinTableExpr:
+		left := collectJoinTableAliases(te.LeftExpr)
+		right := collectJoinTableAliases(te.RightExpr)
+		return append(left, right...)
+	case *sqlparser.ParenTableExpr:
+		var result []string
+		for _, inner := range te.Exprs {
+			result = append(result, collectJoinTableAliases(inner)...)
+		}
+		return result
+	}
+	return nil
+}
+
 // collectTableDefs extracts table definitions from a FROM expression, handling both
 // simple table references and JOINs.
 func (e *Executor) collectTableDefs(expr sqlparser.TableExpr) []*catalog.TableDef {
@@ -1557,6 +1583,9 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	var selectTableDefs []*catalog.TableDef
 	if len(stmt.From) > 0 {
 		selectTableDefs = e.collectTableDefs(stmt.From[0])
+		e.selectTableAliases = collectJoinTableAliases(stmt.From[0])
+	} else {
+		e.selectTableAliases = nil
 	}
 
 	// Implicit FTS relevance ordering: when WHERE contains MATCH AGAINST
@@ -2390,12 +2419,28 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 			}
 			rawExprIdx++
 		case *sqlparser.StarExpr:
-			// SELECT * with GROUP BY: expand to all columns from the first row
-			if len(groups) > 0 && len(groups[0].rows) > 0 {
+			// SELECT * with GROUP BY: expand to all columns from the first row.
+			// Use table definition column order if available; fallback to row keys
+			// (filtering out alias-prefixed keys like "t1.col").
+			var starExpanded bool
+			if len(stmt.From) > 0 {
+				tds := e.collectTableDefs(stmt.From[0])
+				if len(tds) > 0 {
+					for _, td := range tds {
+						for _, col := range td.Columns {
+							colNames = append(colNames, col.Name)
+						}
+					}
+					starExpanded = true
+				}
+			}
+			if !starExpanded && len(groups) > 0 && len(groups[0].rows) > 0 {
 				repRow := groups[0].rows[0]
 				keys := make([]string, 0, len(repRow))
 				for k := range repRow {
-					keys = append(keys, k)
+					if !strings.Contains(k, ".") && k != "__column_order__" {
+						keys = append(keys, k)
+					}
 				}
 				sort.Strings(keys)
 				colNames = append(colNames, keys...)
@@ -2416,13 +2461,26 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 		for _, expr := range stmt.SelectExprs.Exprs {
 			switch se := expr.(type) {
 			case *sqlparser.StarExpr:
-				// Expand * to all column values from representative row
-				keys := make([]string, 0, len(repRow))
-				for k := range repRow {
-					keys = append(keys, k)
+				// Expand * to all column values from representative row.
+				// Use table definition column order if available.
+				var starKeys []string
+				if len(stmt.From) > 0 {
+					tds := e.collectTableDefs(stmt.From[0])
+					for _, td := range tds {
+						for _, col := range td.Columns {
+							starKeys = append(starKeys, col.Name)
+						}
+					}
 				}
-				sort.Strings(keys)
-				for _, k := range keys {
+				if len(starKeys) == 0 {
+					for k := range repRow {
+						if !strings.Contains(k, ".") && k != "__column_order__" {
+							starKeys = append(starKeys, k)
+						}
+					}
+					sort.Strings(starKeys)
+				}
+				for _, k := range starKeys {
 					resultRow = append(resultRow, repRow[k])
 				}
 				_ = se
@@ -2626,6 +2684,20 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	// Apply SELECT DISTINCT (GROUP BY path)
+	if stmt.Distinct {
+		seen := make(map[string]bool)
+		unique := make([][]interface{}, 0)
+		for _, row := range resultRows {
+			key := fmt.Sprintf("%v", row)
+			if !seen[key] {
+				seen[key] = true
+				unique = append(unique, row)
+			}
+		}
+		resultRows = unique
 	}
 
 	// Track row count before LIMIT for FOUND_ROWS()
@@ -3181,20 +3253,24 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 						})
 					}
 					// Then: add remaining columns from each table, skipping USING cols
-					for _, td := range tableDefs {
+					for tdIdx, td := range tableDefs {
 						for _, col := range td.Columns {
 							if usingColSet[strings.ToLower(col.Name)] {
 								continue
 							}
 							cols = append(cols, col.Name)
+							qualifierName := td.Name
+							if tdIdx < len(e.selectTableAliases) {
+								qualifierName = e.selectTableAliases[tdIdx]
+							}
 							colExprs = append(colExprs, &sqlparser.ColName{
 								Name:      sqlparser.NewIdentifierCI(col.Name),
-								Qualifier: sqlparser.TableName{Name: sqlparser.NewIdentifierCS(td.Name)},
+								Qualifier: sqlparser.TableName{Name: sqlparser.NewIdentifierCS(qualifierName)},
 							})
 						}
 					}
 				} else {
-					for _, td := range tableDefs {
+					for tdIdx, td := range tableDefs {
 						// For IS/PS tables, prefer canonical column order (more complete)
 						lowerName := strings.ToLower(td.Name)
 						if order, ok := infoSchemaColumnOrder[lowerName]; ok && len(order) > len(td.Columns) {
@@ -3206,9 +3282,14 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 							for _, col := range td.Columns {
 								cols = append(cols, col.Name)
 								if len(tableDefs) > 1 {
+									// Use alias instead of table name for proper self-join support
+									qualifierName := td.Name
+									if tdIdx < len(e.selectTableAliases) {
+										qualifierName = e.selectTableAliases[tdIdx]
+									}
 									colExprs = append(colExprs, &sqlparser.ColName{
 										Name:      sqlparser.NewIdentifierCI(col.Name),
-										Qualifier: sqlparser.TableName{Name: sqlparser.NewIdentifierCS(td.Name)},
+										Qualifier: sqlparser.TableName{Name: sqlparser.NewIdentifierCS(qualifierName)},
 									})
 								} else {
 									colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(col.Name)})
@@ -3881,6 +3962,15 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 				if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' {
 					raw = raw[1 : len(raw)-1]
 				}
+				// If raw expression got polluted by UNION text (e.g., when
+				// executing a sub-SELECT of a UNION with currentQuery set to
+				// the full UNION), fall back to AST-based display name.
+				if _, isLit := se.Expr.(*sqlparser.Literal); isLit {
+					upperRaw := strings.ToUpper(raw)
+					if strings.Contains(upperRaw, " UNION ") {
+						raw = normalizeSQLDisplayName(sqlparser.String(se.Expr))
+					}
+				}
 				name = raw
 			} else {
 				name = normalizeSQLDisplayName(sqlparser.String(se.Expr))
@@ -4130,6 +4220,20 @@ func needsPreProjectionOrderBy(orderBy sqlparser.OrderBy, colNames []string) boo
 		}
 		col, ok := expr.(*sqlparser.ColName)
 		if !ok || col == nil {
+			// Non-column expression (e.g., a+2, FIELD(...)) in ORDER BY
+			// needs pre-projection sorting since applyOrderBy can only
+			// match column names.
+			exprStr := strings.Trim(sqlparser.String(expr), "`")
+			found := false
+			for _, c := range colNames {
+				if strings.EqualFold(c, exprStr) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return true
+			}
 			continue
 		}
 		name := strings.Trim(col.Name.String(), "`")

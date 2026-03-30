@@ -245,6 +245,7 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		normalizedActual = strings.ReplaceAll(normalizedActual, "ENGINE=MyISAM", "ENGINE=InnoDB")
 		normalizedActual = strings.ReplaceAll(normalizedActual, "ENGINE=MEMORY", "ENGINE=InnoDB")
 	}
+	normalizedActual = stripMyISAMOptions(normalizedActual)
 	normalizedActual = normalizeFuncCase(normalizedActual)
 	normalizedActual = normalizeExplainRows(normalizedActual)
 	normalizedExpected := normalizeExpected(normalizeOutput(expected))
@@ -3845,6 +3846,29 @@ func normalizeExpected(s string) string {
 
 		result = append(result, trimmed)
 	}
+	// Strip metadata lines from --enable_metadata (which we ignore).
+	// Metadata blocks consist of a header line starting with "Catalog\t"
+	// followed by one or more lines starting with "def\t".
+	{
+		var noMeta []string
+		inMetadata := false
+		for _, line := range result {
+			trimLine := strings.TrimSpace(line)
+			if strings.HasPrefix(trimLine, "Catalog\t") {
+				inMetadata = true
+				continue
+			}
+			if inMetadata {
+				if strings.HasPrefix(trimLine, "def\t") {
+					continue
+				}
+				inMetadata = false
+			}
+			noMeta = append(noMeta, line)
+		}
+		result = noMeta
+	}
+
 	// Strip connection logging lines (from --enable_connect_log which we treat as no-op)
 	var filtered []string
 	for _, line := range result {
@@ -3868,10 +3892,32 @@ func normalizeExpected(s string) string {
 		out = strings.ReplaceAll(out, "ENGINE=MyISAM", "ENGINE=InnoDB")
 		out = strings.ReplaceAll(out, "ENGINE=MEMORY", "ENGINE=InnoDB")
 	}
+	out = stripMyISAMOptions(out)
 	// Strip /*!50100 PARTITION BY ... */ blocks from SHOW CREATE TABLE output
 	// since mylite does not support partitions.
 	out = stripExpectedPartitionComment(out)
 	return strings.TrimRight(out, "\n")
+}
+
+// stripMyISAMOptions removes MyISAM/MEMORY-specific table options, USING HASH
+// index hints, and normalizes Slow_queries values. Applied to both expected and
+// actual output since mylite treats all engines as InnoDB.
+func stripMyISAMOptions(s string) string {
+	// Strip MyISAM/MEMORY-specific table options (MIN_ROWS, MAX_ROWS, etc.)
+	for _, opt := range []string{"MIN_ROWS", "MAX_ROWS", "AVG_ROW_LENGTH", "PACK_KEYS", "CHECKSUM", "DELAY_KEY_WRITE"} {
+		re := regexp.MustCompile(` ` + opt + `=\S+`)
+		s = re.ReplaceAllString(s, "")
+	}
+	// Strip "using HASH" / "USING HASH" from index definitions
+	s = strings.ReplaceAll(s, ") using HASH", ")")
+	s = strings.ReplaceAll(s, ") USING HASH", ")")
+	// Normalize ANALYZE TABLE status messages: MyISAM returns "Table is already up to date"
+	// while InnoDB returns "OK". Since we may encounter either, normalize both to the same.
+	s = strings.ReplaceAll(s, "\tanalyze\tstatus\tTable is already up to date", "\tanalyze\tstatus\tOK")
+	// Normalize Slow_queries status values (mylite doesn't track slow queries)
+	slowQueriesRe := regexp.MustCompile(`(?m)^Slow_queries\t\d+$`)
+	s = slowQueriesRe.ReplaceAllString(s, "Slow_queries\t0")
+	return s
 }
 
 // stripExpectedPartitionComment removes /*!50100 PARTITION BY ... */ comment

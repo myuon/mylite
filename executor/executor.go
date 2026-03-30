@@ -246,6 +246,8 @@ type Executor struct {
 	// startupVars stores variable values set at server startup (e.g., from master.opt).
 	// These are used as default values when SET ... = DEFAULT is used.
 	startupVars map[string]string
+	// compiledDefaults caches the hardcoded MySQL defaults (without startup overrides).
+	compiledDefaults map[string]string
 	// views stores view definitions (view name -> SELECT query string).
 	views map[string]string
 	// queryTableDef holds the table definition for the current query context,
@@ -271,6 +273,10 @@ type Executor struct {
 	// When true, sub-SELECTs implicitly acquire shared (exclusive) row locks
 	// to emulate InnoDB's INSERT ... SELECT locking behaviour.
 	insideDML bool
+	// selectTableAliases holds aliases (or table names) for each table in the current
+	// SELECT's FROM clause, in the same order as selectTableDefs. Used for proper
+	// column qualification in SELECT * expansion (e.g., self-joins).
+	selectTableAliases []string
 	// executeDepth tracks the recursion depth of EXECUTE/CALL to prevent stack overflow.
 	executeDepth int
 	// sqlParser is a cached SQL parser instance to avoid allocation on every query.
@@ -419,6 +425,22 @@ func (e *Executor) deleteSysVar(name string, isGlobal bool) {
 	} else {
 		delete(e.sessionScopeVars, name)
 	}
+}
+
+// getCompiledDefault returns the compiled (hardcoded) MySQL default for a
+// system variable, ignoring startupVars and any SET GLOBAL/SESSION overrides.
+// The result is cached after the first call.
+func (e *Executor) getCompiledDefault(name string) (string, bool) {
+	if e.compiledDefaults == nil {
+		tmp := &Executor{
+			startupVars:      map[string]string{},
+			globalScopeVars:  map[string]string{},
+			sessionScopeVars: map[string]string{},
+		}
+		e.compiledDefaults = tmp.buildVariablesMapScoped(true)
+	}
+	v, ok := e.compiledDefaults[name]
+	return v, ok
 }
 
 // parser returns the cached SQL parser, creating it lazily.
@@ -2705,24 +2727,6 @@ func isIdentChar(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b == '$'
 }
 
-// normalizeEngineWithoutEquals rewrites "ENGINE <value>" to "ENGINE=<value>"
-// in CREATE TABLE / ALTER TABLE statements. MySQL allows both forms but the
-// vitess parser requires the equals sign.
-func normalizeEngineWithoutEquals(query string) string {
-	upper := strings.ToUpper(query)
-	if !strings.Contains(upper, "ENGINE") {
-		return query
-	}
-	if !strings.HasPrefix(upper, "CREATE ") && !strings.HasPrefix(upper, "ALTER ") {
-		return query
-	}
-	// Match ENGINE followed by whitespace and a known engine name (without "=").
-	// Only rewrite for known engine names to avoid false positives like
-	// "ENGINE FROM" in SELECT queries.
-	re := regexp.MustCompile(`(?i)\bENGINE\s+(InnoDB|MyISAM|MEMORY|HEAP|ARCHIVE|CSV|BLACKHOLE|NDB|MERGE|FEDERATED|EXAMPLE)\b`)
-	return re.ReplaceAllString(query, "ENGINE=$1")
-}
-
 // normalizeCreateTableEngineSelect strips table options (ENGINE=, CHARSET=, etc.)
 // between the table name and SELECT clause in CREATE TABLE statements so the
 // vitess parser can handle them. The engine is ignored since mylite uses its
@@ -2783,6 +2787,21 @@ func normalizeCreateTableEngineSelect(query string) string {
 	return strings.TrimSpace(cleaned) + " " + query[selectIdx:]
 }
 
+// normalizeEngineWithoutEquals rewrites "ENGINE <value>" to "ENGINE=<value>"
+// in CREATE TABLE / ALTER TABLE statements. MySQL allows both forms but the
+// vitess parser requires the equals sign.
+func normalizeEngineWithoutEquals(query string) string {
+	upper := strings.ToUpper(query)
+	if !strings.Contains(upper, "ENGINE") {
+		return query
+	}
+	if !strings.HasPrefix(upper, "CREATE ") && !strings.HasPrefix(upper, "ALTER ") {
+		return query
+	}
+	re := regexp.MustCompile(`(?i)\bENGINE\s+(InnoDB|MyISAM|MEMORY|HEAP|ARCHIVE|CSV|BLACKHOLE|NDB|MERGE|FEDERATED|EXAMPLE)\b`)
+	return re.ReplaceAllString(query, "ENGINE=$1")
+}
+
 // normalizeCreateTableIndexUsing rewrites "PRIMARY KEY USING BTREE (cols)" and
 // "KEY name USING BTREE (cols)" in CREATE TABLE to move USING after the column list
 // so the vitess parser can handle it.
@@ -2794,27 +2813,24 @@ func normalizeCreateTableIndexUsing(query string) string {
 	if !strings.Contains(upper, "CREATE TABLE") && !strings.Contains(upper, "CREATE TEMPORARY TABLE") {
 		return query
 	}
-	// Use a parenthesized-column-list pattern that handles one level of nesting,
-	// e.g. (c(1), d(2)) where prefix lengths create inner parentheses.
-	const colList = `(\([^()]*(?:\([^()]*\)[^()]*)*\))`
 	// PRIMARY KEY USING BTREE/HASH (cols) -> PRIMARY KEY (cols)
-	re1 := regexp.MustCompile(`(?i)(PRIMARY\s+KEY)\s+USING\s+(\w+)\s*` + colList)
+	re1 := regexp.MustCompile(`(?i)(PRIMARY\s+KEY)\s+USING\s+(\w+)\s*(\([^)]*\))`)
 	query = re1.ReplaceAllString(query, "${1} ${3} USING ${2}")
 	// UNIQUE KEY [name] USING BTREE (cols) -> UNIQUE KEY [name] (cols) USING BTREE
-	re2 := regexp.MustCompile(`(?i)(UNIQUE\s+(?:KEY|INDEX))\s+USING\s+(\w+)\s*` + colList)
+	re2 := regexp.MustCompile("(?i)(UNIQUE\\s+(?:KEY|INDEX))\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
 	query = re2.ReplaceAllString(query, "${1} ${3} USING ${2}")
-	re3 := regexp.MustCompile("(?i)(UNIQUE\\s+(?:KEY|INDEX)\\s+`?\\w+`?)\\s+USING\\s+(\\w+)\\s*" + colList)
+	re3 := regexp.MustCompile("(?i)(UNIQUE\\s+(?:KEY|INDEX)\\s+`?\\w+`?)\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
 	query = re3.ReplaceAllString(query, "${1} ${3} USING ${2}")
 	// KEY/INDEX [name] USING BTREE (cols) -> KEY [name] (cols) USING BTREE
-	re4 := regexp.MustCompile("(?i)((?:KEY|INDEX))\\s+USING\\s+(\\w+)\\s*" + colList)
+	re4 := regexp.MustCompile("(?i)((?:KEY|INDEX))\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
 	query = re4.ReplaceAllString(query, "${1} ${3} USING ${2}")
-	re5 := regexp.MustCompile("(?i)((?:KEY|INDEX)\\s+`?\\w+`?)\\s+USING\\s+(\\w+)\\s*" + colList)
+	re5 := regexp.MustCompile("(?i)((?:KEY|INDEX)\\s+`?\\w+`?)\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
 	query = re5.ReplaceAllString(query, "${1} ${3} USING ${2}")
 	// UNIQUE name USING BTREE (cols) -> UNIQUE KEY name (cols) USING BTREE
-	re6 := regexp.MustCompile("(?i)(UNIQUE)\\s+(`?\\w+`?)\\s+USING\\s+(\\w+)\\s*" + colList)
+	re6 := regexp.MustCompile("(?i)(UNIQUE)\\s+(`?\\w+`?)\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
 	query = re6.ReplaceAllString(query, "${1} KEY ${2} ${4} USING ${3}")
 	// UNIQUE USING BTREE (cols) -> UNIQUE KEY (cols) USING BTREE (no name)
-	re7 := regexp.MustCompile("(?i)(UNIQUE)\\s+USING\\s+(\\w+)\\s*" + colList)
+	re7 := regexp.MustCompile("(?i)(UNIQUE)\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
 	query = re7.ReplaceAllString(query, "${1} KEY ${3} USING ${2}")
 	return query
 }
@@ -5482,11 +5498,22 @@ func extractRawSelectExprs(query string) []string {
 			parenDepth--
 			continue
 		}
-		if parenDepth == 0 && i+4 <= len(q) && strings.EqualFold(q[i:i+4], "from") {
-			prevOK := i == 0 || q[i-1] == ' ' || q[i-1] == '\n' || q[i-1] == '\t' || q[i-1] == '\r'
-			nextOK := i+4 == len(q) || q[i+4] == ' ' || q[i+4] == '\n' || q[i+4] == '\t' || q[i+4] == '\r' || q[i+4] == '('
-			if prevOK && nextOK {
-				end = i
+		if parenDepth == 0 {
+			// Check for keywords that terminate the SELECT list.
+			// Note: UNION is intentionally not included because for UNION queries,
+			// MySQL uses the full expression (including UNION) as the column name.
+			for _, kw := range []string{"from", "limit", "order", "group", "having", "where", "into", "for", "window"} {
+				kwLen := len(kw)
+				if i+kwLen <= len(q) && strings.EqualFold(q[i:i+kwLen], kw) {
+					prevOK := i == 0 || q[i-1] == ' ' || q[i-1] == '\n' || q[i-1] == '\t' || q[i-1] == '\r'
+					nextOK := i+kwLen == len(q) || q[i+kwLen] == ' ' || q[i+kwLen] == '\n' || q[i+kwLen] == '\t' || q[i+kwLen] == '\r' || q[i+kwLen] == '('
+					if prevOK && nextOK {
+						end = i
+						break
+					}
+				}
+			}
+			if end != len(q) {
 				break
 			}
 		}
