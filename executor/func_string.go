@@ -408,6 +408,39 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 		if count <= 0 || sVal == nil {
 			return "", true, nil
 		}
+		// For HexBytes (from x'...' literals), decode to raw bytes
+		// so that REPEAT operates on the actual byte sequence.
+		if hb, ok := sVal.(HexBytes); ok {
+			decoded, err := hex.DecodeString(string(hb))
+			if err != nil {
+				return nil, true, nil
+			}
+			str := string(decoded)
+			if int64(count)*int64(len(str)) > 67108864 {
+				return nil, true, nil
+			}
+			return strings.Repeat(str, count), true, nil
+		}
+		// For 0x... hex number literals, the value is int64/uint64 but in
+		// string context MySQL treats them as binary byte sequences.
+		if lit, ok := v.Exprs[0].(*sqlparser.Literal); ok && lit.Type == sqlparser.HexNum {
+			s := lit.Val
+			if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+				s = s[2:]
+			}
+			if len(s)%2 != 0 {
+				s = "0" + s
+			}
+			decoded, err := hex.DecodeString(s)
+			if err != nil {
+				return nil, true, nil
+			}
+			str := string(decoded)
+			if int64(count)*int64(len(str)) > 67108864 {
+				return nil, true, nil
+			}
+			return strings.Repeat(str, count), true, nil
+		}
 		str := toString(sVal)
 		if int64(count)*int64(len(str)) > 67108864 {
 			return nil, true, nil
