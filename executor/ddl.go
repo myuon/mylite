@@ -2189,6 +2189,13 @@ func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, er
 		case "setup_objects":
 			e.psSetupObjects = []storage.Row{}
 			e.psSetupObjectsInit = true
+		case "events_statements_summary_by_digest", "events_statements_histogram_by_digest":
+			// Clear digests and mark as truncated so new statements are recorded
+			e.psDigests = nil
+			if e.psTruncated == nil {
+				e.psTruncated = make(map[string]bool)
+			}
+			e.psTruncated[lowerTable] = true
 		default:
 			// Track truncated PS tables so they return empty result sets
 			if e.psTruncated == nil {

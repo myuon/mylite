@@ -234,13 +234,17 @@ var emptyStubTables = map[string]bool{
 	"table_privileges":       true,
 	"column_privileges":      true,
 	"persisted_variables":    true,
-	"variables_by_thread":    true,
-	"events_statements_summary_by_digest":     true,
+	// "variables_by_thread" is handled dynamically
+	// "status_by_thread" is handled dynamically
+	// "user_variables_by_thread" is handled dynamically
+	// "session_connect_attrs" is handled dynamically
+	// "session_account_connect_attrs" is handled dynamically
+	// "socket_summary_by_event_name" is handled dynamically
+	// "events_statements_summary_by_digest" is handled dynamically
+	// "events_statements_histogram_by_digest" is handled dynamically
 	"events_statements_summary_by_program":    true,
-	"events_statements_histogram_by_digest":   true,
 	"status_by_account":                       true,
 	"status_by_host":                          true,
-	"status_by_thread":                        true,
 	"status_by_user":                          true,
 	"replication_connection_configuration":     true,
 	"replication_connection_status":            true,
@@ -257,9 +261,6 @@ var emptyStubTables = map[string]bool{
 	"log_status":                 true,
 	"prepared_statements_instances": true,
 	"user_defined_functions":     true,
-	"user_variables_by_thread":   true,
-	"session_connect_attrs":      true,
-	"session_account_connect_attrs": true,
 	"metadata_locks":             true,
 	"data_locks":                 true,
 	"data_lock_waits":            true,
@@ -269,7 +270,6 @@ var emptyStubTables = map[string]bool{
 	"file_instances":             true,
 	"file_summary_by_instance":   true,
 	"socket_instances":           true,
-	"socket_summary_by_event_name":  true,
 	"socket_summary_by_instance":    true,
 	"table_handles":              true,
 	"table_io_waits_summary_by_table":       true,
@@ -765,6 +765,20 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 			}
 			rawRows = append(rawRows, storage.Row{"NAME": c, "ENABLED": enabled})
 		}
+	case "session_connect_attrs", "session_account_connect_attrs":
+		rawRows = e.perfSchemaSessionConnectAttrs()
+	case "socket_summary_by_event_name":
+		rawRows = perfSchemaSocketSummaryByEventName()
+	case "status_by_thread":
+		rawRows = e.perfSchemaStatusByThread()
+	case "user_variables_by_thread":
+		rawRows = e.perfSchemaUserVariablesByThread()
+	case "variables_by_thread":
+		rawRows = e.perfSchemaVariablesByThread()
+	case "events_statements_summary_by_digest":
+		rawRows = e.perfSchemaESMSByDigest()
+	case "events_statements_histogram_by_digest":
+		rawRows = e.perfSchemaESMHByDigest()
 	}
 
 applyAlias:
@@ -3654,6 +3668,183 @@ func perfSchemaSeedHistogramGlobal() []storage.Row {
 			"COUNT_BUCKET": int64(0),
 			"COUNT_BUCKET_AND_LOWER": int64(0),
 			"BUCKET_QUANTILE": 0.0,
+		})
+	}
+	return rows
+}
+
+// perfSchemaSessionConnectAttrs returns rows for session_connect_attrs / session_account_connect_attrs.
+// These tables expose connection attributes (like _os, _platform, _client_name, etc.) for the current session.
+func (e *Executor) perfSchemaSessionConnectAttrs() []storage.Row {
+	attrs := []struct {
+		Name  string
+		Value string
+	}{
+		{"_os", "Linux"},
+		{"_client_name", "libmysql"},
+		{"_pid", "1"},
+		{"_client_version", "8.0.0"},
+		{"_platform", "x86_64"},
+		{"program_name", "mysql"},
+	}
+	rows := make([]storage.Row, 0, len(attrs))
+	for i, a := range attrs {
+		rows = append(rows, storage.Row{
+			"PROCESSLIST_ID":   e.connectionID,
+			"ATTR_NAME":        a.Name,
+			"ATTR_VALUE":       a.Value,
+			"ORDINAL_POSITION": int64(i),
+		})
+	}
+	return rows
+}
+
+// perfSchemaSocketSummaryByEventName returns rows for socket_summary_by_event_name.
+func perfSchemaSocketSummaryByEventName() []storage.Row {
+	events := []string{
+		"wait/io/socket/sql/server_tcpip_socket",
+		"wait/io/socket/sql/server_unix_socket",
+		"wait/io/socket/sql/client_connection",
+	}
+	rows := make([]storage.Row, 0, len(events))
+	for _, ev := range events {
+		rows = append(rows, storage.Row{
+			"EVENT_NAME":     ev,
+			"COUNT_STAR":     int64(0),
+			"SUM_TIMER_WAIT": int64(0),
+			"MIN_TIMER_WAIT": int64(0),
+			"AVG_TIMER_WAIT": int64(0),
+			"MAX_TIMER_WAIT": int64(0),
+		})
+	}
+	return rows
+}
+
+// perfSchemaStatusByThread returns rows for status_by_thread.
+func (e *Executor) perfSchemaStatusByThread() []storage.Row {
+	threadID := e.connectionID + 1
+	// Return a subset of important status variables per thread
+	statusVars := []struct {
+		Name  string
+		Value string
+	}{
+		{"Bytes_received", "0"},
+		{"Bytes_sent", "0"},
+		{"Handler_read_key", fmt.Sprintf("%d", e.handlerReadKey)},
+		{"Max_execution_time_exceeded", "0"},
+		{"Max_execution_time_set", "0"},
+		{"Max_execution_time_set_failed", "0"},
+		{"Sort_rows", "0"},
+		{"Sort_scan", "0"},
+	}
+	rows := make([]storage.Row, 0, len(statusVars))
+	for _, sv := range statusVars {
+		rows = append(rows, storage.Row{
+			"THREAD_ID":      threadID,
+			"VARIABLE_NAME":  sv.Name,
+			"VARIABLE_VALUE": sv.Value,
+		})
+	}
+	return rows
+}
+
+// perfSchemaUserVariablesByThread returns rows for user_variables_by_thread.
+func (e *Executor) perfSchemaUserVariablesByThread() []storage.Row {
+	threadID := e.connectionID + 1
+	rows := make([]storage.Row, 0, len(e.userVars))
+	for name, val := range e.userVars {
+		valStr := "NULL"
+		if val != nil {
+			valStr = fmt.Sprintf("%v", val)
+		}
+		rows = append(rows, storage.Row{
+			"THREAD_ID":      threadID,
+			"VARIABLE_NAME":  name,
+			"VARIABLE_VALUE": valStr,
+		})
+	}
+	return rows
+}
+
+// perfSchemaVariablesByThread returns rows for variables_by_thread.
+func (e *Executor) perfSchemaVariablesByThread() []storage.Row {
+	threadID := e.connectionID + 1
+	vars := e.buildVariablesMapScoped(false) // session scope
+	rows := make([]storage.Row, 0, len(vars))
+	for name, val := range vars {
+		rows = append(rows, storage.Row{
+			"THREAD_ID":      threadID,
+			"VARIABLE_NAME":  name,
+			"VARIABLE_VALUE": val,
+		})
+	}
+	return rows
+}
+
+// perfSchemaESMSByDigest returns rows for events_statements_summary_by_digest.
+func (e *Executor) perfSchemaESMSByDigest() []storage.Row {
+	if e.psTruncated["events_statements_summary_by_digest"] && len(e.psDigests) == 0 {
+		return []storage.Row{}
+	}
+	rows := make([]storage.Row, 0, len(e.psDigests))
+	for _, d := range e.psDigests {
+		rows = append(rows, storage.Row{
+			"SCHEMA_NAME":                  d.SchemaName,
+			"DIGEST":                       d.Digest,
+			"DIGEST_TEXT":                   d.DigestText,
+			"COUNT_STAR":                    d.CountStar,
+			"SUM_TIMER_WAIT":               int64(0),
+			"MIN_TIMER_WAIT":               int64(0),
+			"AVG_TIMER_WAIT":               int64(0),
+			"MAX_TIMER_WAIT":               int64(0),
+			"SUM_LOCK_TIME":                int64(0),
+			"SUM_ERRORS":                   int64(0),
+			"SUM_WARNINGS":                 int64(0),
+			"SUM_ROWS_AFFECTED":            int64(0),
+			"SUM_ROWS_SENT":                int64(0),
+			"SUM_ROWS_EXAMINED":            int64(0),
+			"SUM_CREATED_TMP_DISK_TABLES":  int64(0),
+			"SUM_CREATED_TMP_TABLES":       int64(0),
+			"SUM_SELECT_FULL_JOIN":         int64(0),
+			"SUM_SELECT_FULL_RANGE_JOIN":   int64(0),
+			"SUM_SELECT_RANGE":             int64(0),
+			"SUM_SELECT_RANGE_CHECK":       int64(0),
+			"SUM_SELECT_SCAN":              int64(0),
+			"SUM_SORT_MERGE_PASSES":        int64(0),
+			"SUM_SORT_RANGE":               int64(0),
+			"SUM_SORT_ROWS":                int64(0),
+			"SUM_SORT_SCAN":                int64(0),
+			"SUM_NO_INDEX_USED":            int64(0),
+			"SUM_NO_GOOD_INDEX_USED":       int64(0),
+			"FIRST_SEEN":                   "2024-01-01 00:00:00.000000",
+			"LAST_SEEN":                    "2024-01-01 00:00:00.000000",
+			"QUANTILE_95":                  int64(0),
+			"QUANTILE_99":                  int64(0),
+			"QUANTILE_999":                 int64(0),
+			"QUERY_SAMPLE_TEXT":            d.DigestText,
+			"QUERY_SAMPLE_SEEN":            "2024-01-01 00:00:00.000000",
+			"QUERY_SAMPLE_TIMER_WAIT":      int64(0),
+		})
+	}
+	return rows
+}
+
+// perfSchemaESMHByDigest returns rows for events_statements_histogram_by_digest.
+func (e *Executor) perfSchemaESMHByDigest() []storage.Row {
+	if e.psTruncated["events_statements_histogram_by_digest"] && len(e.psDigests) == 0 {
+		return []storage.Row{}
+	}
+	rows := make([]storage.Row, 0, len(e.psDigests))
+	for _, d := range e.psDigests {
+		rows = append(rows, storage.Row{
+			"SCHEMA_NAME":            d.SchemaName,
+			"DIGEST":                 d.Digest,
+			"BUCKET_NUMBER":          int64(0),
+			"BUCKET_TIMER_LOW":       int64(0),
+			"BUCKET_TIMER_HIGH":      int64(1000000),
+			"COUNT_BUCKET":           d.CountStar,
+			"COUNT_BUCKET_AND_LOWER": d.CountStar,
+			"BUCKET_QUANTILE":        1.0,
 		})
 	}
 	return rows

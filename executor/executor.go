@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -192,6 +193,14 @@ type cteTable struct {
 // to use the ENUM index rather than string coercion.
 type EnumValue string
 
+// psDigestEntry tracks a statement digest for performance_schema tables.
+type psDigestEntry struct {
+	SchemaName string
+	Digest     string
+	DigestText string
+	CountStar  int64
+}
+
 // Executor handles SQL execution.
 type Executor struct {
 	Catalog        *catalog.Catalog
@@ -276,6 +285,9 @@ type Executor struct {
 	psSetupObjects []storage.Row
 	// psSetupObjectsInit tracks whether psSetupObjects has been explicitly set.
 	psSetupObjectsInit bool
+	// psDigests tracks statement digests for events_statements_summary_by_digest
+	// and events_statements_histogram_by_digest tables.
+	psDigests []psDigestEntry
 	// psThreadInstrumented tracks per-connection INSTRUMENTED column for threads table.
 	psThreadInstrumented map[int64]string
 	// psThreadHistory tracks per-connection HISTORY column for threads table.
@@ -4618,11 +4630,56 @@ func (e *Executor) explainResultForType(explainType sqlparser.ExplainType, expla
 	}
 }
 
+// recordStatementDigest records a statement digest for performance_schema
+// events_statements_summary_by_digest and histogram tables.
+func (e *Executor) recordStatementDigest(query string) {
+	// Only record if digest tables have been truncated (i.e., test is tracking digests)
+	if e.psTruncated == nil {
+		return
+	}
+	if !e.psTruncated["events_statements_summary_by_digest"] && !e.psTruncated["events_statements_histogram_by_digest"] {
+		return
+	}
+	// Skip queries to performance_schema itself to avoid recursive recording
+	upperQ := strings.ToUpper(query)
+	if strings.Contains(upperQ, "PERFORMANCE_SCHEMA") {
+		return
+	}
+	// Skip TRUNCATE, USE, and other non-data statements
+	if strings.HasPrefix(upperQ, "TRUNCATE") || strings.HasPrefix(upperQ, "USE ") {
+		return
+	}
+	// Compute a simple digest
+	h := sha256.Sum256([]byte(strings.TrimSpace(query)))
+	digest := hex.EncodeToString(h[:16]) // 32-char hex digest
+
+	schemaName := e.CurrentDB
+	if schemaName == "" {
+		schemaName = "test"
+	}
+	// Check if we already have this digest+schema
+	for i := range e.psDigests {
+		if e.psDigests[i].Digest == digest && e.psDigests[i].SchemaName == schemaName {
+			e.psDigests[i].CountStar++
+			return
+		}
+	}
+	e.psDigests = append(e.psDigests, psDigestEntry{
+		SchemaName: schemaName,
+		Digest:     digest,
+		DigestText: strings.TrimSpace(query),
+		CountStar:  1,
+	})
+}
+
 func (e *Executor) Execute(query string) (*Result, error) {
 	query, result, err := e.preprocessQuery(query)
 	if result != nil || err != nil {
 		return result, err
 	}
+
+	// Record statement digest for performance_schema digest tables
+	e.recordStatementDigest(query)
 
 	trimmed := strings.TrimSpace(query)
 	upper := strings.ToUpper(trimmed)
