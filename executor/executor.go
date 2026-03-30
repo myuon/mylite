@@ -2230,6 +2230,7 @@ func isKnownSQLFunction(name string) bool {
 		"YEAR": true, "MONTH": true, "DAY": true, "HOUR": true, "MINUTE": true, "SECOND": true,
 		"DATE_FORMAT": true, "DATE_ADD": true, "DATE_SUB": true, "DATEDIFF": true,
 		"COUNT": true, "SUM": true, "AVG": true, "MIN": true, "MAX": true,
+		"BIT_AND": true, "BIT_OR": true, "BIT_XOR": true,
 		"GROUP_CONCAT": true, "JSON_ARRAYAGG": true, "JSON_OBJECTAGG": true,
 		"JSON_EXTRACT": true, "JSON_VALID": true, "JSON_TYPE": true,
 		"JSON_DEPTH": true, "JSON_LENGTH": true, "JSON_KEYS": true,
@@ -9971,6 +9972,53 @@ func toInt64(v interface{}) int64 {
 			}
 		}
 		return i
+	case bool:
+		if n {
+			return 1
+		}
+		return 0
+	}
+	return 0
+}
+
+// toUint64 converts a value to uint64 for bitwise aggregate operations.
+func toUint64(v interface{}) uint64 {
+	switch n := v.(type) {
+	case int64:
+		return uint64(n)
+	case uint64:
+		return n
+	case float64:
+		return uint64(int64(n))
+	case DivisionResult:
+		return uint64(int64(float64(n)))
+	case HexBytes:
+		decoded, err := hex.DecodeString(string(n))
+		if err != nil || len(decoded) == 0 {
+			return 0
+		}
+		var val uint64
+		for _, b := range decoded {
+			val = val<<8 | uint64(b)
+		}
+		return val
+	case []byte:
+		var val uint64
+		for _, b := range n {
+			val = val<<8 | uint64(b)
+		}
+		return val
+	case string:
+		if u, err := strconv.ParseUint(n, 10, 64); err == nil {
+			return u
+		}
+		if i, err := strconv.ParseInt(n, 10, 64); err == nil {
+			return uint64(i)
+		}
+		if f, err := strconv.ParseFloat(n, 64); err == nil {
+			return uint64(int64(f))
+		}
+		return 0
 	case bool:
 		if n {
 			return 1

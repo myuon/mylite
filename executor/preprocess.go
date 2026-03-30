@@ -167,6 +167,13 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		upper = strings.ToUpper(trimmed)
 	}
 
+	// Rewrite MID( -> SUBSTRING( since vitess parser doesn't recognize MID as a function
+	if strings.Contains(upper, "MID(") {
+		query = rewriteMidToSubstring(query)
+		trimmed = strings.TrimSpace(query)
+		upper = strings.ToUpper(trimmed)
+	}
+
 	// Rewrite weight_string(str, n1, n2, n3) -> weight_string(str) since vitess can't parse extra args
 	if strings.Contains(upper, "WEIGHT_STRING") {
 		query = normalizeWeightString(query)
@@ -317,8 +324,6 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	// Fix vitess parser issue: "ADD KEY USING BTREE (col)" is not parsed correctly.
 	// Rewrite to "ADD KEY (col)" since BTREE is the default for InnoDB.
 	query = normalizeAddIndexUsing(query)
-	// Normalize "ENGINE value" to "ENGINE=value" (MySQL allows omitting "=")
-	query = normalizeEngineWithoutEquals(query)
 	// Fix CREATE TABLE with "KEY/INDEX/PRIMARY KEY USING BTREE/HASH (cols)" syntax
 	query = normalizeCreateTableIndexUsing(query)
 	// Detect SKIP LOCKED / NOWAIT and per-table locking clauses before
@@ -332,8 +337,6 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	query = normalizeForShareOf(query)
 	query = normalizeMemberOperator(query)
 	query = normalizeJSONTableDefaultOrder(query)
-	// Rewrite CREATE TABLE t (SELECT ...) ORDER BY ... to CREATE TABLE t SELECT ...
-	query = normalizeCreateTableParenSelect(query)
 	// Fix CREATE TABLE name ENGINE=xxx SELECT ... (vitess fails to parse engine+select combo)
 	query = normalizeCreateTableEngineSelect(query)
 	trimmed = strings.TrimSpace(query)
@@ -504,4 +507,16 @@ func stripStringLiterals(s string) string {
 		}
 	}
 	return buf.String()
+}
+
+// rewriteMidToSubstring rewrites MID( function calls to SUBSTRING( since
+// the vitess SQL parser does not recognize MID as a built-in function.
+// MID(str, pos, len) is a MySQL synonym for SUBSTRING(str, pos, len).
+func rewriteMidToSubstring(query string) string {
+	re := regexp.MustCompile(`(?i)\bMID\s*\(`)
+	return re.ReplaceAllStringFunc(query, func(match string) string {
+		// Preserve the opening paren and any whitespace
+		idx := strings.Index(strings.ToUpper(match), "MID")
+		return "SUBSTRING" + match[idx+3:]
+	})
 }

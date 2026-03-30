@@ -84,6 +84,12 @@ func isWindowAggregateExpr(expr sqlparser.Expr) bool {
 		return v.OverClause != nil
 	case *sqlparser.Max:
 		return v.OverClause != nil
+	case *sqlparser.BitAnd:
+		return v.OverClause != nil
+	case *sqlparser.BitOr:
+		return v.OverClause != nil
+	case *sqlparser.BitXor:
+		return v.OverClause != nil
 	}
 	return false
 }

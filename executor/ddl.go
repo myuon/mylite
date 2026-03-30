@@ -490,6 +490,12 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 		// CREATE TABLE ... SELECT
 		if stmt.Select != nil {
+			// CREATE TABLE IF NOT EXISTS ... SELECT: skip if table already exists
+			if stmt.IfNotExists {
+				if _, err := e.Storage.GetTable(dbName, tableName); err == nil {
+					return &Result{}, nil
+				}
+			}
 			selectSQL := sqlparser.String(stmt.Select)
 			result, err := e.execCreateTableSelect(tableName, selectSQL)
 			if err == nil && stmt.Temp {
