@@ -5754,6 +5754,32 @@ func (e *Executor) parseTimeZone(val string) error {
 	return fmt.Errorf("Unknown or incorrect time zone: '%s'", val)
 }
 
+// parseTZName parses a timezone name string (e.g. "UTC", "+03:00", "US/Eastern")
+// and returns the corresponding *time.Location, or nil if the timezone is unknown.
+func parseTZName(val string) *time.Location {
+	val = strings.Trim(val, "'\"")
+	val = strings.TrimSpace(val)
+	if strings.EqualFold(val, "SYSTEM") || val == "" {
+		return time.Local
+	}
+	// Parse offset like "+03:00", "-05:00"
+	if (val[0] == '+' || val[0] == '-') && strings.Contains(val, ":") {
+		var hours, mins int
+		if _, err := fmt.Sscanf(val, "%d:%d", &hours, &mins); err == nil {
+			offset := hours*3600 + mins*60
+			if hours < 0 {
+				offset = hours*3600 - mins*60
+			}
+			return time.FixedZone(val, offset)
+		}
+	}
+	// Try as named timezone
+	if loc, err := time.LoadLocation(val); err == nil {
+		return loc
+	}
+	return nil
+}
+
 // isStrictMode returns true when sql_mode includes STRICT_TRANS_TABLES, STRICT_ALL_TABLES, or TRADITIONAL.
 func (e *Executor) isStrictMode() bool {
 	return strings.Contains(e.sqlMode, "TRADITIONAL") ||
@@ -11895,7 +11921,7 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 			if dbObj, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
 				if tblDef, err := dbObj.GetTable(bareTable); err == nil && tblDef != nil {
 					eng := strings.ToUpper(tblDef.Engine)
-					if eng == "MYISAM" || eng == "MEMORY" || eng == "CSV" || eng == "ARCHIVE" {
+					if eng == "MYISAM" || eng == "MEMORY" || eng == "CSV" || eng == "ARCHIVE" || eng == "HEAP" {
 						isInnoDB = false
 					}
 				}

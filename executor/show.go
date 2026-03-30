@@ -740,6 +740,13 @@ func (e *Executor) showIndexes(dbName, tableName string) (*Result, error) {
 		ki := toString(rows[i][2])
 		kj := toString(rows[j][2])
 		if ki != kj {
+			// PRIMARY key always comes first in MySQL's SHOW INDEX output
+			if strings.EqualFold(ki, "PRIMARY") {
+				return true
+			}
+			if strings.EqualFold(kj, "PRIMARY") {
+				return false
+			}
 			return strings.ToLower(ki) < strings.ToLower(kj)
 		}
 		return toInt64(rows[i][3]) < toInt64(rows[j][3])

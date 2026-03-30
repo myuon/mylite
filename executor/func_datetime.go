@@ -732,7 +732,32 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if isNull {
 			return nil, true, nil
 		}
-		return toString(ctzVal), true, nil
+		ctzFromVal, ctzFromErr := e.evalExprMaybeRow(v.Exprs[1], row)
+		if ctzFromErr != nil || ctzFromVal == nil {
+			return nil, true, nil
+		}
+		ctzToVal, ctzToErr := e.evalExprMaybeRow(v.Exprs[2], row)
+		if ctzToErr != nil || ctzToVal == nil {
+			return nil, true, nil
+		}
+		ctzFromStr := toString(ctzFromVal)
+		ctzToStr := toString(ctzToVal)
+		ctzFromLoc := parseTZName(ctzFromStr)
+		if ctzFromLoc == nil {
+			return nil, true, nil
+		}
+		ctzToLoc := parseTZName(ctzToStr)
+		if ctzToLoc == nil {
+			return nil, true, nil
+		}
+		ctzT, ctzParseErr := parseDateTimeValue(toString(ctzVal))
+		if ctzParseErr != nil {
+			return nil, true, nil
+		}
+		// Interpret the datetime in the source timezone, then convert to target
+		ctzInSrc := time.Date(ctzT.Year(), ctzT.Month(), ctzT.Day(), ctzT.Hour(), ctzT.Minute(), ctzT.Second(), ctzT.Nanosecond(), ctzFromLoc)
+		ctzInDst := ctzInSrc.In(ctzToLoc)
+		return ctzInDst.Format("2006-01-02 15:04:05"), true, nil
 	case "timediff":
 		tdA, tdB, hasNull, err := e.evalArgs2(v.Exprs, "TIMEDIFF", row)
 		if err != nil {
