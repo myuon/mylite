@@ -1463,7 +1463,7 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 					collation = nil
 				} else if idxType == "SPATIAL" {
 					indexTypeStr = "SPATIAL"
-					collation = nil
+					// SPATIAL indexes show Collation=A in SHOW INDEX (both InnoDB and MyISAM)
 				}
 				for i, col := range cols {
 					colName := normalizeIndexColumnName(col)
@@ -1478,6 +1478,11 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 					} else if i < len(dynamic) {
 						cardinality = dynamic[i]
 					}
+					// SPATIAL indexes use a 32-byte MBR key prefix
+					var subPart interface{}
+					if idxType == "SPATIAL" {
+						subPart = int64(32)
+					}
 					rows = append(rows, storage.Row{
 						"TABLE_CATALOG": "def",
 						"TABLE_SCHEMA":  dbName,
@@ -1489,7 +1494,7 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 						"COLUMN_NAME":   colName,
 						"COLLATION":     collation,
 						"CARDINALITY":   cardinality,
-						"SUB_PART":      nil,
+						"SUB_PART":      subPart,
 						"PACKED":        nil,
 						"NULLABLE":      nullable,
 						"INDEX_TYPE":    indexTypeStr,

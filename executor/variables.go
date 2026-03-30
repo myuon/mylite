@@ -296,6 +296,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						if prevVal, had := savedSessionVal[cleanName]; had {
 							e.sessionScopeVars[cleanName] = prevVal
 						}
+						continue
 					} else {
 						e.sessionScopeVars[cleanName] = fmt.Sprintf("%d", newVal)
 					}
@@ -338,6 +339,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						if prevVal, had := savedSessionVal[cleanName]; had {
 							e.sessionScopeVars[cleanName] = prevVal
 						}
+						continue
 					} else {
 						e.sessionScopeVars[cleanName] = normalized
 					}

@@ -327,6 +327,9 @@ type Executor struct {
 	// handlerReadKey counts the number of index-based reads (SELECT queries).
 	// Incremented per SELECT, reset on FLUSH STATUS.
 	handlerReadKey int64
+	// checkedForUpgrade tracks tables that have been CHECK TABLE ... FOR UPGRADE'd.
+	// Subsequent FOR UPGRADE checks return "Table is already up to date".
+	checkedForUpgrade map[string]bool
 }
 
 // Warning represents a MySQL warning.
@@ -5254,8 +5257,16 @@ func (e *Executor) Execute(query string) (*Result, error) {
 					e.upsertInnoDBStatsRows(e.CurrentDB, tableName, e.tableRowCount(e.CurrentDB, tableName))
 				}
 				// InnoDB tables return "OK"; non-InnoDB return "Table is already up to date"
+				// Exception: tables with SPATIAL indexes always return "OK" (reanalysis needed)
 				eng := strings.ToUpper(def.Engine)
-				if eng == "" || eng == "INNODB" {
+				hasSpatial := false
+				for _, idx := range def.Indexes {
+					if strings.EqualFold(idx.Type, "SPATIAL") {
+						hasSpatial = true
+						break
+					}
+				}
+				if eng == "" || eng == "INNODB" || hasSpatial {
 					msgText = "OK"
 				}
 			}
@@ -12226,6 +12237,14 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 		return &Result{AffectedRows: 0}, nil
 	}
 
+	// Detect FOR UPGRADE option before stripping
+	forUpgrade := false
+	{
+		restUpper := strings.ToUpper(strings.TrimSpace(strings.TrimRight(rest, ";")))
+		if strings.HasSuffix(restUpper, "FOR UPGRADE") {
+			forUpgrade = true
+		}
+	}
 	// Strip trailing options (QUICK, FAST, MEDIUM, EXTENDED, CHANGED, FOR UPGRADE, etc.)
 	{
 		restUpper := strings.ToUpper(rest)
@@ -12277,6 +12296,18 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 			} else {
 				// Non-InnoDB engines (MyISAM, etc.) return "Table is already up to date"
 				rows = append(rows, []interface{}{tableName, op, "status", "Table is already up to date"})
+			}
+		} else if op == "check" && forUpgrade {
+			// CHECK TABLE ... FOR UPGRADE: first check returns OK, subsequent checks
+			// return "Table is already up to date"
+			if e.checkedForUpgrade == nil {
+				e.checkedForUpgrade = map[string]bool{}
+			}
+			if e.checkedForUpgrade[tableName] {
+				rows = append(rows, []interface{}{tableName, op, "status", "Table is already up to date"})
+			} else {
+				e.checkedForUpgrade[tableName] = true
+				rows = append(rows, []interface{}{tableName, op, "status", "OK"})
 			}
 		} else {
 			rows = append(rows, []interface{}{tableName, op, "status", "OK"})
