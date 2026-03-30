@@ -1071,6 +1071,10 @@ func (e *Executor) preFilterRows(rows []storage.Row, preds []sqlparser.Expr) ([]
 }
 
 func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
+	// Validate index hints (USE KEY / IGNORE KEY / FORCE KEY) on FROM tables.
+	if err := e.validateIndexHints(stmt.From); err != nil {
+		return nil, err
+	}
 	// Increment handler_read_key for SELECT queries (used by SHOW SESSION STATUS).
 	e.handlerReadKey++
 	// For no-FROM queries (without CTEs), check for bare column references FIRST.

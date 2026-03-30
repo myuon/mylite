@@ -498,6 +498,8 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.infoSchemaColumnStatistics()
 	case "engines":
 		rawRows = e.infoSchemaEngines()
+	case "plugins":
+		rawRows = e.infoSchemaPlugins()
 	case "innodb_tables":
 		rawRows = e.infoSchemaInnoDBTables()
 	case "innodb_tablespaces":
@@ -1701,6 +1703,55 @@ func (e *Executor) infoSchemaEngines() []storage.Row {
 			"SAVEPOINTS":   "NO",
 		},
 	}
+}
+
+// infoSchemaPlugins returns rows for INFORMATION_SCHEMA.PLUGINS.
+// Reports the same set of storage-engine plugins that MySQL 8.0 ships by default.
+func (e *Executor) infoSchemaPlugins() []storage.Row {
+	type pluginInfo struct {
+		name, status, ptype, author, description string
+	}
+	plugins := []pluginInfo{
+		{"binlog", "ACTIVE", "STORAGE ENGINE", "MySQL AB", "This is a pseudo storage engine to represent the binlog in a transaction"},
+		{"sha256_password", "ACTIVE", "AUTHENTICATION", "Oracle", "SHA256 password authentication"},
+		{"caching_sha2_password", "ACTIVE", "AUTHENTICATION", "Oracle", "Caching SHA2 password authentication"},
+		{"sha2_cache_cleaner", "ACTIVE", "AUDIT", "Oracle", "SHA2 cache  cleaner"},
+		{"daemon_keyring_proxy_plugin", "ACTIVE", "DAEMON", "Oracle", "A plugin that can be used as a proxy to other keyring plugins"},
+		{"CSV", "ACTIVE", "STORAGE ENGINE", "Brian Aker, MySQL AB", "CSV storage engine"},
+		{"MEMORY", "ACTIVE", "STORAGE ENGINE", "MySQL AB", "Hash based, stored in memory, useful for temporary tables"},
+		{"InnoDB", "ACTIVE", "STORAGE ENGINE", "Oracle Corporation", "Supports transactions, row-level locking, and foreign keys"},
+		{"FEDERATED", "DISABLED", "STORAGE ENGINE", "Patrick Galbraith and Brian Aker, MySQL AB", "Federated MySQL storage engine"},
+		{"MyISAM", "ACTIVE", "STORAGE ENGINE", "MySQL AB", "MyISAM storage engine"},
+		{"MRG_MYISAM", "ACTIVE", "STORAGE ENGINE", "MySQL AB", "Collection of identical MyISAM tables"},
+		{"PERFORMANCE_SCHEMA", "ACTIVE", "STORAGE ENGINE", "Marc Alff, Oracle", "Performance Schema"},
+		{"ARCHIVE", "ACTIVE", "STORAGE ENGINE", "Brian Aker, MySQL AB", "Archive storage engine"},
+		{"BLACKHOLE", "ACTIVE", "STORAGE ENGINE", "MySQL AB", "/dev/null storage engine (anything you write to it disappears)"},
+		{"mysqlx_cache_cleaner", "ACTIVE", "AUDIT", "Oracle Corp", "Cache cleaner for sha2 authentication in X plugin"},
+		{"mysqlx", "ACTIVE", "DAEMON", "Oracle Corp", "X Plugin for MySQL"},
+		{"mysql_native_password", "ACTIVE", "AUTHENTICATION", "R.J.Silk, Sergei Golubchik", "Native MySQL authentication"},
+	}
+
+	rows := make([]storage.Row, 0, len(plugins))
+	for _, p := range plugins {
+		loadOption := "ON"
+		if p.status == "DISABLED" {
+			loadOption = "OFF"
+		}
+		rows = append(rows, storage.Row{
+			"PLUGIN_NAME":            p.name,
+			"PLUGIN_VERSION":         "1.0",
+			"PLUGIN_STATUS":          p.status,
+			"PLUGIN_TYPE":            p.ptype,
+			"PLUGIN_TYPE_VERSION":    "80200.0",
+			"PLUGIN_LIBRARY":         nil,
+			"PLUGIN_LIBRARY_VERSION": nil,
+			"PLUGIN_AUTHOR":          p.author,
+			"PLUGIN_DESCRIPTION":     p.description,
+			"PLUGIN_LICENSE":         "GPL",
+			"LOAD_OPTION":            loadOption,
+		})
+	}
+	return rows
 }
 
 // perfSchemaMemorySummary returns rows for performance_schema.memory_summary_global_by_event_name.

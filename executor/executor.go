@@ -462,6 +462,15 @@ func (e *Executor) GetConnectionID() int64 {
 func (e *Executor) Clone() *Executor {
 	defaultTZ := time.FixedZone("GMT-3", 3*60*60)
 	connID := e.nextConnID.Add(1)
+	// Inherit global variable values into the new session's sessionScopeVars
+	// for variables that have both GLOBAL and SESSION scope. This mirrors
+	// MySQL behaviour where new connections inherit the current global values.
+	sessVars := make(map[string]string)
+	for name, val := range e.globalScopeVars {
+		if !sysVarGlobalOnly[name] && !sysVarSessionOnly[name] {
+			sessVars[name] = val
+		}
+	}
 	return &Executor{
 		Catalog:          e.Catalog,
 		Storage:          e.Storage,
@@ -472,7 +481,7 @@ func (e *Executor) Clone() *Executor {
 		preparedStmts:    make(map[string]string),
 		tempTables:       make(map[string]bool),
 		globalScopeVars:  e.globalScopeVars,
-		sessionScopeVars: make(map[string]string),
+		sessionScopeVars: sessVars,
 		startupVars:      e.startupVars,
 		timeZone:         defaultTZ,
 		DataDir:          e.DataDir,
@@ -12057,12 +12066,79 @@ func resolveColumnTable(te sqlparser.TableExpr, colName string, e *Executor) str
 // execExplainStmt handles EXPLAIN SELECT ... statements.
 // Returns a simplified explain result set for compatibility.
 func (e *Executor) execExplainStmt(s *sqlparser.ExplainStmt, query string) (*Result, error) {
+	// Validate index hints (USE KEY / IGNORE KEY / FORCE KEY) before producing explain output.
+	if sel, ok := s.Statement.(*sqlparser.Select); ok {
+		if err := e.validateIndexHints(sel.From); err != nil {
+			return nil, err
+		}
+	}
 	// Use explainResultForType which delegates to explainMultiRows for proper select_type detection
 	explainedQuery := query
 	if s.Statement != nil {
 		explainedQuery = sqlparser.String(s.Statement)
 	}
 	return e.explainResultForType(s.Type, explainedQuery), nil
+}
+
+// validateIndexHints checks that all index names referenced in USE KEY / IGNORE KEY / FORCE KEY
+// hints actually exist in the target table. Returns error 1176 (ER_KEY_DOES_NOT_EXITS) on mismatch.
+func (e *Executor) validateIndexHints(from []sqlparser.TableExpr) error {
+	for _, te := range from {
+		switch t := te.(type) {
+		case *sqlparser.AliasedTableExpr:
+			if len(t.Hints) == 0 {
+				continue
+			}
+			tn, ok := t.Expr.(sqlparser.TableName)
+			if !ok {
+				continue
+			}
+			tableName := tn.Name.String()
+			lookupDB := e.CurrentDB
+			if !tn.Qualifier.IsEmpty() {
+				lookupDB = tn.Qualifier.String()
+			}
+			if e.Catalog == nil {
+				continue
+			}
+			db, err := e.Catalog.GetDatabase(lookupDB)
+			if err != nil {
+				continue
+			}
+			def, err := db.GetTable(tableName)
+			if err != nil {
+				continue
+			}
+			// Build set of valid key names for this table.
+			validKeys := make(map[string]bool)
+			if len(def.PrimaryKey) > 0 {
+				validKeys["primary"] = true
+			}
+			for _, idx := range def.Indexes {
+				validKeys[strings.ToLower(idx.Name)] = true
+			}
+			for _, hint := range t.Hints {
+				for _, idx := range hint.Indexes {
+					keyName := idx.String()
+					if !validKeys[strings.ToLower(keyName)] {
+						return mysqlError(1176, "42000", fmt.Sprintf("Key '%s' doesn't exist in table '%s'", keyName, tableName))
+					}
+				}
+			}
+		case *sqlparser.JoinTableExpr:
+			if err := e.validateIndexHints([]sqlparser.TableExpr{t.LeftExpr}); err != nil {
+				return err
+			}
+			if err := e.validateIndexHints([]sqlparser.TableExpr{t.RightExpr}); err != nil {
+				return err
+			}
+		case *sqlparser.ParenTableExpr:
+			if err := e.validateIndexHints(t.Exprs); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // execOtherAdmin handles OPTIMIZE TABLE, REPAIR TABLE, CHECK TABLE, etc.
