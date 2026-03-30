@@ -1671,7 +1671,15 @@ func matchLike(s, pattern string) bool {
 
 func matchLikeHelper(s, p []rune, si, pi int) bool {
 	for pi < len(p) {
-		if p[pi] == '%' {
+		if p[pi] == '\\' && pi+1 < len(p) {
+			// Backslash escape: next character is treated as literal
+			pi++
+			if si >= len(s) || s[si] != p[pi] {
+				return false
+			}
+			si++
+			pi++
+		} else if p[pi] == '%' {
 			pi++
 			for si <= len(s) {
 				if matchLikeHelper(s, p, si, pi) {
