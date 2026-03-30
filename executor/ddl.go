@@ -1322,7 +1322,6 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 	{
 		isInplace := false
 		hasStoredGcolAdd := false
-		hasAlterDefault := false
 		for _, opt := range stmt.AlterOptions {
 			switch av := opt.(type) {
 			case sqlparser.AlgorithmValue:
@@ -1338,13 +1337,9 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 						}
 					}
 				}
-			case *sqlparser.AlterColumn:
-				if av.DefaultVal != nil {
-					hasAlterDefault = true
-				}
 			}
 		}
-		if isInplace && (hasStoredGcolAdd || hasAlterDefault) {
+		if isInplace && hasStoredGcolAdd {
 			return nil, mysqlError(1845, "0A000", "ALGORITHM=INPLACE is not supported. Reason: Cannot change column type INPLACE. Try ALGORITHM=COPY.")
 		}
 	}

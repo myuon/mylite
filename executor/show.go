@@ -1352,7 +1352,7 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		pkCols = def.PrimaryKey
 	}
 
-	hasTrailingDefs := len(pkCols) > 0 || len(def.Indexes) > 0
+	hasTrailingDefs := len(pkCols) > 0 || len(def.Indexes) > 0 || len(def.CheckConstraints) > 0
 
 	for i, cd := range colDefs {
 		b.WriteString(cd)
@@ -1373,7 +1373,7 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 				quotedPK[i] = fmt.Sprintf("`%s`", trimmed)
 			}
 		}
-		hasMore := len(def.Indexes) > 0
+		hasMore := len(def.Indexes) > 0 || len(def.CheckConstraints) > 0
 		b.WriteString(fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(quotedPK, ",")))
 		if hasMore {
 			b.WriteString(",")
@@ -1449,7 +1449,22 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		} else {
 			b.WriteString(fmt.Sprintf("  %s `%s` (%s)%s%s", prefix, idx.Name, strings.Join(quotedCols, ","), usingStr, commentStr))
 		}
-		if i < len(displayIndexes)-1 {
+		if i < len(displayIndexes)-1 || len(def.CheckConstraints) > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("\n")
+	}
+
+	// CHECK constraints
+	for i, cc := range def.CheckConstraints {
+		// MySQL wraps CHECK expressions in extra parentheses and backtick-quotes
+		// column names. Re-parse the stored expression to produce canonical output.
+		checkExpr := cc.Expr
+		if parsed, err := sqlparser.NewTestParser().ParseExpr(cc.Expr); err == nil {
+			checkExpr = sqlparser.CanonicalString(parsed)
+		}
+		b.WriteString(fmt.Sprintf("  CONSTRAINT `%s` CHECK ((%s))", cc.Name, checkExpr))
+		if i < len(def.CheckConstraints)-1 {
 			b.WriteString(",")
 		}
 		b.WriteString("\n")

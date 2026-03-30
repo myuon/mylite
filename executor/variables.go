@@ -361,6 +361,24 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						e.sessionScopeVars[cleanName] = normalized
 					}
 				} else {
+					// For most system variables, NULL means reset to default (empty string)
+					// Only reject NULL for specific variable types that require it
+					if _, isNull := expr.Expr.(*sqlparser.NullVal); isNull {
+						if !isBooleanVariable(cleanName) {
+							if _, isEnum := sysVarEnumValues[cleanName]; isEnum {
+								// enum variables handle NULL in their own path
+							} else if sysVarRejectsNull(cleanName) {
+								return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of 'NULL'", cleanName))
+							}
+						}
+					}
+					// Warn when setting log_error_services to empty string
+					if cleanName == "log_error_services" {
+						testVal := strings.Trim(val, "'\"")
+						if testVal == "" {
+							e.addWarning("Warning", 3702, "Setting an empty log_error_services pipeline disables error logging!")
+						}
+					}
 					// Evaluate expression
 					evalVal, err := e.evalExpr(expr.Expr)
 					if enumVals, isEnum := sysVarEnumValues[cleanName]; isEnum && len(enumVals) > 0 {
@@ -1433,6 +1451,19 @@ var sysVarBoolean = map[string]bool{
 
 func isBooleanVariable(name string) bool {
 	return sysVarBoolean[name]
+}
+
+// sysVarRejectsNull returns true for system variables that reject NULL assignment
+// Most string variables accept NULL (treated as empty string or default), but some reject it.
+func sysVarRejectsNull(name string) bool {
+	switch name {
+	case "character_set_client", "character_set_connection", "character_set_database",
+		"character_set_filesystem", "character_set_results", "character_set_server",
+		"collation_connection", "collation_database", "collation_server",
+		"default_collation_for_utf8mb4":
+		return true
+	}
+	return false
 }
 
 // sysVarBoolAcceptNegative contains boolean variables that accept negative integers
