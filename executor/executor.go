@@ -2729,6 +2729,60 @@ func isIdentChar(b byte) bool {
 
 // normalizeCreateTableEngineSelect strips table options (ENGINE=, CHARSET=, etc.)
 // between the table name and SELECT clause in CREATE TABLE statements so the
+// normalizeCreateTableParenSelect rewrites CREATE TABLE t (SELECT ...) ORDER BY ...
+// into CREATE TABLE t SELECT ... so the vitess parser can handle it.
+func normalizeCreateTableParenSelect(query string) string {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	if !strings.HasPrefix(upper, "CREATE TABLE") && !strings.HasPrefix(upper, "CREATE TEMPORARY TABLE") {
+		return query
+	}
+	trimmed := strings.TrimSpace(query)
+	for i := 0; i < len(trimmed); i++ {
+		if trimmed[i] == '\'' {
+			for i++; i < len(trimmed) && trimmed[i] != '\''; i++ {
+				if trimmed[i] == '\\' {
+					i++
+				}
+			}
+			continue
+		}
+		if trimmed[i] != '(' {
+			continue
+		}
+		j := i + 1
+		for j < len(trimmed) && (trimmed[j] == ' ' || trimmed[j] == '\t' || trimmed[j] == '\n') {
+			j++
+		}
+		if j+6 >= len(trimmed) || !strings.EqualFold(trimmed[j:j+7], "SELECT ") {
+			break
+		}
+		depth := 1
+		k := i + 1
+		for k < len(trimmed) && depth > 0 {
+			switch trimmed[k] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+			case '\'':
+				for k++; k < len(trimmed) && trimmed[k] != '\''; k++ {
+					if trimmed[k] == '\\' {
+						k++
+					}
+				}
+			}
+			k++
+		}
+		if depth != 0 {
+			return query
+		}
+		innerSelect := strings.TrimSpace(trimmed[i+1 : k-1])
+		prefix := trimmed[:i]
+		return strings.TrimSpace(prefix) + " " + innerSelect
+	}
+	return query
+}
+
 // vitess parser can handle them. The engine is ignored since mylite uses its
 // own storage engine for all tables.
 func normalizeCreateTableEngineSelect(query string) string {

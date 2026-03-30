@@ -452,7 +452,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		// CREATE TABLE ... LIKE
 		if stmt.OptLike != nil {
 			srcName := stmt.OptLike.LikeTable.Name.String()
-			return e.execCreateTableLike(tableName, srcName)
+			srcDB := dbName
+			if !stmt.OptLike.LikeTable.Qualifier.IsEmpty() {
+				srcDB = stmt.OptLike.LikeTable.Qualifier.String()
+			}
+			return e.execCreateTableLike(dbName, tableName, srcDB, srcName)
 		}
 		// CREATE TABLE ... SELECT
 		if stmt.Select != nil {
@@ -2256,14 +2260,18 @@ func (e *Executor) inferColumnType(selectSQL, colName string) string {
 }
 
 // execCreateTableLike handles CREATE TABLE t2 LIKE t1.
-func (e *Executor) execCreateTableLike(newTableName, srcTableName string) (*Result, error) {
-	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+func (e *Executor) execCreateTableLike(targetDBName, newTableName, srcDBName, srcTableName string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(targetDBName)
 	if err != nil {
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", targetDBName))
 	}
-	srcDef, err := db.GetTable(srcTableName)
+	srcDB, err := e.Catalog.GetDatabase(srcDBName)
 	if err != nil {
-		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, srcTableName))
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", srcDBName))
+	}
+	srcDef, err := srcDB.GetTable(srcTableName)
+	if err != nil {
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", srcDBName, srcTableName))
 	}
 	newCols := make([]catalog.ColumnDef, len(srcDef.Columns))
 	copy(newCols, srcDef.Columns)
@@ -2283,8 +2291,8 @@ func (e *Executor) execCreateTableLike(newTableName, srcTableName string) (*Resu
 	if err := db.CreateTable(newDef); err != nil {
 		return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newTableName))
 	}
-	e.Storage.CreateTable(e.CurrentDB, newDef)
-	e.upsertInnoDBStatsRows(e.CurrentDB, newTableName, 0)
+	e.Storage.CreateTable(targetDBName, newDef)
+	e.upsertInnoDBStatsRows(targetDBName, newTableName, 0)
 	return &Result{}, nil
 }
 

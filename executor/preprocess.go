@@ -332,6 +332,8 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	query = normalizeForShareOf(query)
 	query = normalizeMemberOperator(query)
 	query = normalizeJSONTableDefaultOrder(query)
+	// Rewrite CREATE TABLE t (SELECT ...) ORDER BY ... to CREATE TABLE t SELECT ...
+	query = normalizeCreateTableParenSelect(query)
 	// Fix CREATE TABLE name ENGINE=xxx SELECT ... (vitess fails to parse engine+select combo)
 	query = normalizeCreateTableEngineSelect(query)
 	trimmed = strings.TrimSpace(query)
