@@ -2793,6 +2793,8 @@ func applyMasterOpt(content string, ctx *execContext) {
 			if strings.HasPrefix(key, "enable-") {
 				key = strings.TrimPrefix(key, "enable-")
 			}
+			// Strip MySQL loose- prefix (accepts unknown options without error)
+			key = strings.TrimPrefix(key, "loose-")
 			varKey := strings.ReplaceAll(key, "-", "_")
 			ctx.variables["$"+key] = val
 			ctx.variables["$"+varKey] = val
@@ -2822,6 +2824,8 @@ func applyMasterOpt(content string, ctx *execContext) {
 					val = "1"
 				}
 			}
+			// Strip MySQL loose- prefix
+			key = strings.TrimPrefix(key, "loose-")
 			// Normalize hyphens to underscores for MySQL variable names
 			varKey := strings.ReplaceAll(key, "-", "_")
 			// Set as variable (keep original key for $variable compatibility)
@@ -2949,6 +2953,16 @@ func (ctx *execContext) sourceFile(filename string) error {
 	// Apply variable substitution in filename
 	filename = ctx.substituteVars(filename)
 	baseName := strings.ToLower(filepath.Base(filename))
+	// force_myisam_default.inc tells MTR to start the server with
+	// default_storage_engine=MyISAM.  Our runner doesn't restart the
+	// server, so we emulate it by executing the corresponding SETs.
+	if baseName == "force_myisam_default.inc" {
+		_ = ctx.executeSQLNoEcho("SET @@GLOBAL.default_storage_engine = MyISAM")
+		_ = ctx.executeSQLNoEcho("SET @@SESSION.default_storage_engine = MyISAM")
+		_ = ctx.executeSQLNoEcho("SET @@GLOBAL.default_tmp_storage_engine = MyISAM")
+		_ = ctx.executeSQLNoEcho("SET @@SESSION.default_tmp_storage_engine = MyISAM")
+		return nil
+	}
 	// Treat proc-control include as no-op in this single-node runner.
 	if baseName == "restart_mysqld.inc" {
 		// MySQL MTR result files include "# $restart_parameters" when server is restarted.

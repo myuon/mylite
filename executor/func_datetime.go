@@ -39,7 +39,13 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if err != nil {
 			return nil, true, nil
 		}
-		return int64(t.Unix()), true, nil
+		// MySQL interprets the datetime argument in the session timezone,
+		// but parseDateTimeValue returns times in UTC. Adjust to local TZ.
+		if t.Location() == time.UTC {
+			t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.Local)
+		}
+		// Return with .000000 decimal places for datetime arguments (MySQL behavior)
+		return fmt.Sprintf("%d.%06d", t.Unix(), t.Nanosecond()/1000), true, nil
 	case "from_unixtime":
 		if len(v.Exprs) < 1 {
 			return nil, true, fmt.Errorf("FROM_UNIXTIME requires 1 argument")

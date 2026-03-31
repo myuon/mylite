@@ -545,7 +545,11 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			if db.CollationName != "" {
 				collation = db.CollationName
 			}
-			createSQL := fmt.Sprintf("CREATE DATABASE `%s` /*!40100 DEFAULT CHARACTER SET %s COLLATE %s */ /*!80016 DEFAULT ENCRYPTION='N' */", resolvedName, charset, collation)
+			quotedName := "`" + resolvedName + "`"
+			if v, ok := e.getSysVar("sql_quote_show_create"); ok && (v == "OFF" || v == "0") {
+				quotedName = resolvedName
+			}
+			createSQL := fmt.Sprintf("CREATE DATABASE %s /*!40100 DEFAULT CHARACTER SET %s COLLATE %s */ /*!80016 DEFAULT ENCRYPTION='N' */", quotedName, charset, collation)
 			return &Result{
 				Columns:     []string{"Database", "Create Database"},
 				Rows:        [][]interface{}{{resolvedName, createSQL}},
@@ -1255,6 +1259,18 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	}
 	tableName = resolvedTableName
 
+	// Check sql_quote_show_create setting
+	quoteIdent := true
+	if v, ok := e.getSysVar("sql_quote_show_create"); ok && (v == "OFF" || v == "0") {
+		quoteIdent = false
+	}
+	quoteFunc := func(name string) string {
+		if quoteIdent {
+			return "`" + name + "`"
+		}
+		return name
+	}
+
 	// Get AUTO_INCREMENT value
 	autoIncVal := int64(0)
 	if tbl, err := e.Storage.GetTable(showDB, tableName); err == nil {
@@ -1263,16 +1279,16 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 
 	var b strings.Builder
 	if e.tempTables[tableName] {
-		b.WriteString(fmt.Sprintf("CREATE TEMPORARY TABLE `%s` (\n", tableName))
+		b.WriteString(fmt.Sprintf("CREATE TEMPORARY TABLE %s (\n", quoteFunc(tableName)))
 	} else {
-		b.WriteString(fmt.Sprintf("CREATE TABLE `%s` (\n", tableName))
+		b.WriteString(fmt.Sprintf("CREATE TABLE %s (\n", quoteFunc(tableName)))
 	}
 
 	var colDefs []string
 	var pkCols []string
 	for _, col := range def.Columns {
 		var parts []string
-		parts = append(parts, fmt.Sprintf("  `%s`", col.Name))
+		parts = append(parts, fmt.Sprintf("  %s", quoteFunc(col.Name)))
 		parts = append(parts, mysqlDisplayType(col.Type))
 		// Column-level CHARACTER SET / COLLATE (when different from table default)
 		if col.Charset != "" {
@@ -1382,9 +1398,9 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 			if strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")") {
 				quotedPK[i] = trimmed
 			} else if lparen := strings.Index(trimmed, "("); lparen >= 0 {
-				quotedPK[i] = fmt.Sprintf("`%s`%s", trimmed[:lparen], trimmed[lparen:])
+				quotedPK[i] = fmt.Sprintf("%s%s", quoteFunc(trimmed[:lparen]), trimmed[lparen:])
 			} else {
-				quotedPK[i] = fmt.Sprintf("`%s`", trimmed)
+				quotedPK[i] = quoteFunc(trimmed)
 			}
 		}
 		hasMore := len(def.Indexes) > 0 || len(def.CheckConstraints) > 0
@@ -1437,9 +1453,9 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 				quotedCols[j] = trimmed + direction
 			} else if lparen := strings.Index(trimmed, "("); lparen >= 0 {
 				// Handle column with length prefix like "c1(10)"
-				quotedCols[j] = fmt.Sprintf("`%s`%s%s", trimmed[:lparen], trimmed[lparen:], direction)
+				quotedCols[j] = fmt.Sprintf("%s%s%s", quoteFunc(trimmed[:lparen]), trimmed[lparen:], direction)
 			} else {
-				quotedCols[j] = fmt.Sprintf("`%s`%s", trimmed, direction)
+				quotedCols[j] = fmt.Sprintf("%s%s", quoteFunc(trimmed), direction)
 			}
 		}
 		usingStr := ""
@@ -1459,9 +1475,9 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 			prefix = "UNIQUE KEY"
 		}
 		if prefix == "UNIQUE KEY" {
-			b.WriteString(fmt.Sprintf("  UNIQUE KEY `%s` (%s)%s%s", idx.Name, strings.Join(quotedCols, ","), usingStr, commentStr))
+			b.WriteString(fmt.Sprintf("  UNIQUE KEY %s (%s)%s%s", quoteFunc(idx.Name), strings.Join(quotedCols, ","), usingStr, commentStr))
 		} else {
-			b.WriteString(fmt.Sprintf("  %s `%s` (%s)%s%s", prefix, idx.Name, strings.Join(quotedCols, ","), usingStr, commentStr))
+			b.WriteString(fmt.Sprintf("  %s %s (%s)%s%s", prefix, quoteFunc(idx.Name), strings.Join(quotedCols, ","), usingStr, commentStr))
 		}
 		if i < len(displayIndexes)-1 || len(def.CheckConstraints) > 0 {
 			b.WriteString(",")

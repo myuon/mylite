@@ -584,7 +584,7 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 			}
 		}
 	case "events_statements_history_long":
-		if e.startupVars["performance_schema_events_statements_history_long_size"] == "0" {
+		if e.psClassDisabled("statement") || e.startupVars["performance_schema_events_statements_history_long_size"] == "0" {
 			rawRows = []storage.Row{}
 		} else {
 			rawRows = []storage.Row{
@@ -691,11 +691,15 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 			}
 		}
 	case "events_statements_current":
-		rawRows = []storage.Row{
-			{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "statement/sql/select", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "SQL_TEXT": nil, "DIGEST": nil, "DIGEST_TEXT": nil, "CURRENT_SCHEMA": nil, "ROWS_AFFECTED": int64(0), "ROWS_SENT": int64(0), "ROWS_EXAMINED": int64(0), "CREATED_TMP_DISK_TABLES": int64(0), "CREATED_TMP_TABLES": int64(0), "ERRORS": int64(0), "WARNINGS": int64(0), "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil},
+		if e.psClassDisabled("statement") {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "statement/sql/select", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "SQL_TEXT": nil, "DIGEST": nil, "DIGEST_TEXT": nil, "CURRENT_SCHEMA": nil, "ROWS_AFFECTED": int64(0), "ROWS_SENT": int64(0), "ROWS_EXAMINED": int64(0), "CREATED_TMP_DISK_TABLES": int64(0), "CREATED_TMP_TABLES": int64(0), "ERRORS": int64(0), "WARNINGS": int64(0), "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil},
+			}
 		}
 	case "events_statements_history":
-		if e.startupVars["performance_schema_events_statements_history_size"] == "0" {
+		if e.psClassDisabled("statement") || e.startupVars["performance_schema_events_statements_history_size"] == "0" {
 			rawRows = []storage.Row{}
 		} else {
 			rawRows = []storage.Row{
