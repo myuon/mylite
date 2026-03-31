@@ -5566,21 +5566,33 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		msgText := "Table is already up to date"
 		if db, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
 			if def, err := db.GetTable(tableName); err == nil && def != nil {
-				if e.innodbStatsPersistentEnabled(def) {
-					e.upsertInnoDBStatsRows(e.CurrentDB, tableName, e.tableRowCount(e.CurrentDB, tableName))
-				}
-				// InnoDB tables return "OK"; non-InnoDB return "Table is already up to date"
-				// Exception: tables with SPATIAL indexes always return "OK" (reanalysis needed)
-				eng := strings.ToUpper(def.Engine)
-				hasSpatial := false
-				for _, idx := range def.Indexes {
-					if strings.EqualFold(idx.Type, "SPATIAL") {
-						hasSpatial = true
-						break
+				// Check if another connection holds row locks on innodb stats tables.
+				// If so, ANALYZE TABLE fails with "Operation failed" (lock wait timeout).
+				statsLocked := false
+				if e.innodbStatsPersistentEnabled(def) && e.rowLockManager != nil {
+					if e.rowLockManager.HasOtherLocksWithPrefix(e.connectionID, "mysql:innodb_table_stats:") {
+						statsLocked = true
 					}
 				}
-				if eng == "" || eng == "INNODB" || hasSpatial {
-					msgText = "OK"
+				if statsLocked {
+					msgText = "Operation failed"
+				} else {
+					if e.innodbStatsPersistentEnabled(def) {
+						e.upsertInnoDBStatsRows(e.CurrentDB, tableName, e.tableRowCount(e.CurrentDB, tableName))
+					}
+					// InnoDB tables return "OK"; non-InnoDB return "Table is already up to date"
+					// Exception: tables with SPATIAL indexes always return "OK" (reanalysis needed)
+					eng := strings.ToUpper(def.Engine)
+					hasSpatial := false
+					for _, idx := range def.Indexes {
+						if strings.EqualFold(idx.Type, "SPATIAL") {
+							hasSpatial = true
+							break
+						}
+					}
+					if eng == "" || eng == "INNODB" || hasSpatial {
+						msgText = "OK"
+					}
 				}
 			}
 		}

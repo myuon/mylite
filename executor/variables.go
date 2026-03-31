@@ -309,6 +309,27 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							}
 						}
 					}
+					// For parser_max_mem_size, the global value caps session values
+					// for non-superuser connections. Root/superuser can exceed the
+					// global value.
+					if !isGlobal && cleanName == "parser_max_mem_size" {
+						isSuper := true
+						if cu, ok := e.userVars["__current_user"]; ok {
+							if cuStr, ok := cu.(string); ok && cuStr != "" && !strings.EqualFold(cuStr, "root") {
+								isSuper = false
+							}
+						}
+						if !isSuper {
+							if gv, ok := e.globalScopeVars[cleanName]; ok {
+								if gMax, err := strconv.ParseUint(gv, 10, 64); err == nil {
+									if cv, err := strconv.ParseUint(clamped, 10, 64); err == nil && cv > gMax {
+										e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect %s value: '%s'", cleanName, clamped))
+										clamped = strconv.FormatUint(gMax, 10)
+									}
+								}
+							}
+						}
+					}
 					e.sessionScopeVars[cleanName] = clamped
 					// When max_join_size is set, update sql_big_selects accordingly.
 					// Non-default value -> sql_big_selects = OFF; default -> ON.

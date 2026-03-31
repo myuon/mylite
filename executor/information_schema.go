@@ -87,17 +87,17 @@ var infoSchemaColumnOrder = map[string][]string{
 	"statistics":               {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "NON_UNIQUE", "INDEX_SCHEMA", "INDEX_NAME", "SEQ_IN_INDEX", "COLUMN_NAME", "COLLATION", "CARDINALITY", "SUB_PART", "PACKED", "NULLABLE", "INDEX_TYPE", "COMMENT", "INDEX_COMMENT", "IS_VISIBLE", "EXPRESSION"},
 	"column_statistics":        {"SCHEMA_NAME", "TABLE_NAME", "COLUMN_NAME", "HISTOGRAM"},
 	"engines":                  {"ENGINE", "SUPPORT", "COMMENT", "TRANSACTIONS", "XA", "SAVEPOINTS"},
-	"innodb_tables":            {"NAME", "SPACE", "FLAG", "N_COLS", "ROW_FORMAT", "ZIP_PAGE_SIZE", "SPACE_TYPE"},
+	"innodb_tables":            {"TABLE_ID", "NAME", "SPACE", "FLAG", "N_COLS", "ROW_FORMAT", "ZIP_PAGE_SIZE", "SPACE_TYPE"},
 	"innodb_tablespaces":       {"SPACE", "NAME", "ROW_FORMAT", "PAGE_SIZE", "ZIP_PAGE_SIZE", "SPACE_TYPE"},
 	"innodb_datafiles":         {"SPACE", "PATH"},
 	"innodb_columns":           {"TABLE_ID", "NAME", "POS", "MTYPE", "PRTYPE", "LEN"},
 	"innodb_virtual":           {"TABLE_ID", "POS", "BASE_POS"},
 	"innodb_foreign":           {"ID", "FOR_NAME", "REF_NAME", "N_COLS"},
 	"innodb_metrics":           {"NAME", "COUNT", "TYPE", "STATUS", "SUBSYSTEM", "COMMENT"},
-	"innodb_cached_indexes":    {"INDEX_ID", "N_FIELDS", "SPACE", "PAGE_NO"},
-	"innodb_indexes":           {"INDEX_ID", "NAME", "TABLE_ID", "TYPE"},
+	"innodb_cached_indexes":    {"SPACE_ID", "INDEX_ID", "N_CACHED_PAGES"},
+	"innodb_indexes":           {"INDEX_ID", "NAME", "TABLE_ID", "TYPE", "SPACE"},
 	"innodb_buffer_page_lru":   {"POOL_ID", "LRU_POSITION", "SPACE", "PAGE_NUMBER"},
-	"innodb_buffer_page":       {"SPACE", "PAGE_NUMBER", "PAGE_TYPE", "NUMBER_RECORDS"},
+	"innodb_buffer_page":       {"SPACE", "PAGE_NUMBER", "PAGE_TYPE", "NUMBER_RECORDS", "TABLE_NAME"},
 	"innodb_buffer_pool_stats": {"POOL_ID", "POOL_SIZE"},
 	"innodb_trx":               {"trx_id", "trx_state", "trx_started"},
 	"innodb_foreign_cols":      {"ID", "FOR_COL_NAME", "REF_COL_NAME", "POS"},
@@ -283,10 +283,7 @@ var singleRowStubTables = map[string]storage.Row{
 	"innodb_columns":        {"TABLE_ID": int64(0), "NAME": "", "POS": int64(0), "MTYPE": int64(0), "PRTYPE": int64(0), "LEN": int64(0)},
 	"innodb_virtual":        {"TABLE_ID": int64(0), "POS": int64(0), "BASE_POS": int64(0)},
 	"innodb_foreign":        {"ID": "", "FOR_NAME": "", "REF_NAME": "", "N_COLS": int64(0)},
-	"innodb_cached_indexes": {"INDEX_ID": int64(0), "N_FIELDS": int64(0), "SPACE": int64(0), "PAGE_NO": int64(0)},
-	"innodb_indexes":        {"INDEX_ID": int64(0), "NAME": "", "TABLE_ID": int64(0), "TYPE": int64(0)},
 	"innodb_buffer_page_lru": {"POOL_ID": int64(0), "LRU_POSITION": int64(0), "SPACE": int64(0), "PAGE_NUMBER": int64(0)},
-	"innodb_buffer_page":    {"SPACE": int64(0), "PAGE_NUMBER": int64(0), "PAGE_TYPE": "", "NUMBER_RECORDS": int64(0)},
 	"innodb_buffer_pool_stats": {"POOL_ID": int64(0), "POOL_SIZE": int64(0)},
 	"innodb_trx":            {"trx_id": "", "trx_state": "RUNNING", "trx_started": nil},
 	"innodb_foreign_cols":   {"ID": "", "FOR_COL_NAME": "", "REF_COL_NAME": "", "POS": int64(0)},
@@ -508,6 +505,12 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.infoSchemaInnoDBDatafiles()
 	case "innodb_metrics":
 		rawRows = e.infoSchemaInnoDBMetrics()
+	case "innodb_indexes":
+		rawRows = e.infoSchemaInnoDBIndexes()
+	case "innodb_cached_indexes":
+		rawRows = e.infoSchemaInnoDBCachedIndexes()
+	case "innodb_buffer_page":
+		rawRows = []storage.Row{} // empty stub - no buffer pool tracking
 	case "processlist":
 		if e.processList != nil {
 			entries := e.processList.Snapshot()
@@ -813,6 +816,7 @@ func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 	rows := make([]storage.Row, 0)
 	dbNames := e.Catalog.ListDatabases()
 	sort.Strings(dbNames)
+	tableID := int64(1)
 	space := int64(1)
 	for _, dbName := range dbNames {
 		switch strings.ToLower(dbName) {
@@ -827,6 +831,7 @@ func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 		sort.Strings(tableNames)
 		for _, tblName := range tableNames {
 			rows = append(rows, storage.Row{
+				"TABLE_ID":      tableID,
 				"NAME":          strings.ToLower(dbName + "/" + tblName),
 				"SPACE":         space,
 				"FLAG":          int64(33),
@@ -835,11 +840,125 @@ func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 				"ZIP_PAGE_SIZE": int64(0),
 				"SPACE_TYPE":    "Single",
 			})
+			tableID++
 			space++
 		}
 	}
 	if len(rows) == 0 {
-		return []storage.Row{{"NAME": "", "SPACE": int64(0), "FLAG": int64(33), "N_COLS": int64(0), "ROW_FORMAT": "Dynamic", "ZIP_PAGE_SIZE": int64(0), "SPACE_TYPE": "Single"}}
+		return []storage.Row{{"TABLE_ID": int64(0), "NAME": "", "SPACE": int64(0), "FLAG": int64(33), "N_COLS": int64(0), "ROW_FORMAT": "Dynamic", "ZIP_PAGE_SIZE": int64(0), "SPACE_TYPE": "Single"}}
+	}
+	return rows
+}
+
+// infoSchemaInnoDBIndexes returns rows for information_schema.INNODB_INDEXES.
+// Columns: INDEX_ID, NAME, TABLE_ID, TYPE, SPACE
+func (e *Executor) infoSchemaInnoDBIndexes() []storage.Row {
+	rows := make([]storage.Row, 0)
+	dbNames := e.Catalog.ListDatabases()
+	sort.Strings(dbNames)
+	tableID := int64(1)
+	indexID := int64(1)
+	space := int64(1)
+	for _, dbName := range dbNames {
+		switch strings.ToLower(dbName) {
+		case "information_schema", "mysql", "performance_schema", "sys":
+			continue
+		}
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		tableNames := db.ListTables()
+		sort.Strings(tableNames)
+		for _, tblName := range tableNames {
+			def, err := db.GetTable(tblName)
+			if err != nil || def == nil {
+				tableID++
+				space++
+				continue
+			}
+			// Primary index (GEN_CLUST_INDEX if no explicit primary key)
+			pkName := "GEN_CLUST_INDEX"
+			if len(def.PrimaryKey) > 0 {
+				pkName = "PRIMARY"
+			}
+			rows = append(rows, storage.Row{
+				"INDEX_ID": indexID,
+				"NAME":     pkName,
+				"TABLE_ID": tableID,
+				"TYPE":     int64(3), // clustered
+				"SPACE":    space,
+			})
+			indexID++
+			// Secondary indexes
+			for _, idx := range def.Indexes {
+				if strings.EqualFold(idx.Name, "PRIMARY") {
+					continue
+				}
+				rows = append(rows, storage.Row{
+					"INDEX_ID": indexID,
+					"NAME":     idx.Name,
+					"TABLE_ID": tableID,
+					"TYPE":     int64(0),
+					"SPACE":    space,
+				})
+				indexID++
+			}
+			tableID++
+			space++
+		}
+	}
+	return rows
+}
+
+// infoSchemaInnoDBCachedIndexes returns rows for information_schema.INNODB_CACHED_INDEXES.
+// Since mylite doesn't track buffer pool pages, all N_CACHED_PAGES are 0.
+// Columns: SPACE_ID, INDEX_ID, N_CACHED_PAGES
+func (e *Executor) infoSchemaInnoDBCachedIndexes() []storage.Row {
+	rows := make([]storage.Row, 0)
+	dbNames := e.Catalog.ListDatabases()
+	sort.Strings(dbNames)
+	indexID := int64(1)
+	space := int64(1)
+	for _, dbName := range dbNames {
+		switch strings.ToLower(dbName) {
+		case "information_schema", "mysql", "performance_schema", "sys":
+			continue
+		}
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		tableNames := db.ListTables()
+		sort.Strings(tableNames)
+		for _, tblName := range tableNames {
+			def, err := db.GetTable(tblName)
+			if err != nil || def == nil {
+				space++
+				indexID++
+				continue
+			}
+			// Primary/clustered index
+			rows = append(rows, storage.Row{
+				"SPACE_ID":       space,
+				"INDEX_ID":       indexID,
+				"N_CACHED_PAGES": int64(0),
+			})
+			indexID++
+			// Secondary indexes
+			for _, idx := range def.Indexes {
+				if strings.EqualFold(idx.Name, "PRIMARY") {
+					continue
+				}
+				rows = append(rows, storage.Row{
+					"SPACE_ID":       space,
+					"INDEX_ID":       indexID,
+					"N_CACHED_PAGES": int64(0),
+				})
+				indexID++
+			}
+			space++
+		}
 	}
 	return rows
 }

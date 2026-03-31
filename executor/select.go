@@ -2884,9 +2884,11 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			avgRows = filtered
 		}
 		sumRat := new(big.Rat)
+		sumFloat := float64(0)
 		count := int64(0)
 		maxScale := 0
 		allInt := true
+		hasFloat := false // true when any value is float64 (FLOAT/DOUBLE column)
 		for _, row := range avgRows {
 			val, err := evalRowExpr(e.Arg, row)
 			if err != nil {
@@ -2897,29 +2899,39 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 				switch n := val.(type) {
 				case int64:
 					sumRat.Add(sumRat, new(big.Rat).SetInt64(n))
+					sumFloat += float64(n)
 				case uint64:
 					sumRat.Add(sumRat, new(big.Rat).SetFrac(new(big.Int).SetUint64(n), big.NewInt(1)))
+					sumFloat += float64(n)
 				case float64:
 					allInt = false
+					hasFloat = true
 					sumRat.Add(sumRat, new(big.Rat).SetFloat64(n))
+					sumFloat += n
 				case string:
 					if dot := strings.Index(n, "."); dot >= 0 {
-						scale := len(n) - dot - 1
-						if scale > maxScale {
-							maxScale = scale
+						// Ignore decimal points in scientific notation (e.g. "3.40282e38")
+						if !strings.ContainsAny(n, "eE") {
+							scale := len(n) - dot - 1
+							if scale > maxScale {
+								maxScale = scale
+							}
 						}
 					}
 					if r, ok := parseDecimalStringToRat(n); ok {
 						sumRat.Add(sumRat, r)
+						sumFloat += toFloat(val)
 					} else {
 						allInt = false
 						f := toFloat(val)
 						sumRat.Add(sumRat, new(big.Rat).SetFloat64(f))
+						sumFloat += f
 					}
 				default:
 					allInt = false
 					f := toFloat(val)
 					sumRat.Add(sumRat, new(big.Rat).SetFloat64(f))
+					sumFloat += f
 				}
 			}
 		}
@@ -2930,6 +2942,12 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		avgScale := maxScale + 4
 		if avgScale < 4 {
 			avgScale = 4
+		}
+		// For FLOAT/DOUBLE columns (hasFloat && maxScale == 0), use float64
+		// arithmetic to match MySQL's native floating-point AVG behavior.
+		if hasFloat && maxScale == 0 {
+			avg := sumFloat / float64(count)
+			return fmt.Sprintf("%.*f", avgScale, avg), nil
 		}
 		avgRat := new(big.Rat).Quo(sumRat, new(big.Rat).SetInt64(count))
 		formatted := formatRatFixed(avgRat, avgScale)

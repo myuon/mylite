@@ -1031,7 +1031,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		return true, false, err
 
 	case "connect":
-		connName, dbName := parseConnectDirectiveArgs(args)
+		connName, dbName, userName := parseConnectDirectiveArgs(args)
 		if connName == "" {
 			return true, false, nil
 		}
@@ -1049,6 +1049,11 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 				conn.Close() //nolint:errcheck
 				return true, false, err
 			}
+		}
+		// Tell the server the connecting username so privilege-dependent
+		// variable capping (e.g. parser_max_mem_size) works correctly.
+		if userName != "" && !strings.EqualFold(userName, "root") {
+			conn.ExecContext(context.Background(), fmt.Sprintf("SET @__current_user = '%s'", userName)) //nolint:errcheck
 		}
 		ctx.connByName[key] = conn
 		ctx.currentConn = key
@@ -3286,7 +3291,7 @@ func parseDirectiveNameArgs(directive string) (name, args string) {
 	return strings.ToLower(strings.TrimRight(d, ";")), ""
 }
 
-func parseConnectDirectiveArgs(args string) (connName string, dbName string) {
+func parseConnectDirectiveArgs(args string) (connName string, dbName string, userName string) {
 	trimmed := strings.TrimSpace(args)
 	trimmed = strings.TrimSuffix(trimmed, ";")
 	trimmed = strings.TrimSpace(trimmed)
@@ -3294,7 +3299,7 @@ func parseConnectDirectiveArgs(args string) (connName string, dbName string) {
 		trimmed = strings.TrimSpace(trimmed[1 : len(trimmed)-1])
 	}
 	if trimmed == "" {
-		return "", ""
+		return "", "", ""
 	}
 
 	parts := strings.Split(trimmed, ",")
@@ -3303,6 +3308,9 @@ func parseConnectDirectiveArgs(args string) (connName string, dbName string) {
 		parts[i] = strings.Trim(parts[i], "`\"'")
 	}
 	connName = parts[0]
+	if len(parts) >= 3 {
+		userName = parts[2]
+	}
 	if len(parts) >= 5 {
 		dbName = parts[4]
 		// *NO-ONE* is a MySQL test convention meaning "connect without a default database"
@@ -3310,7 +3318,7 @@ func parseConnectDirectiveArgs(args string) (connName string, dbName string) {
 			dbName = ""
 		}
 	}
-	return connName, dbName
+	return connName, dbName, userName
 }
 
 // formatMySQLError formats an error into mysqltest expected format.
