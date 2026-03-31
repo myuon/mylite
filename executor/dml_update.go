@@ -337,6 +337,34 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 							}
 						}
 					}
+					// String length check for CHAR/VARCHAR/BINARY/VARBINARY columns
+					if val != nil {
+						colUp := strings.ToUpper(col.Type)
+						isCharType := strings.Contains(colUp, "CHAR") || strings.Contains(colUp, "BINARY")
+						if isCharType {
+							if sv, ok := val.(string); ok {
+								maxLen := extractCharLength(col.Type)
+								if maxLen > 0 && len([]rune(sv)) > maxLen {
+									excess := string([]rune(sv)[maxLen:])
+									onlySpaces := strings.TrimRight(excess, " ") == ""
+									if onlySpaces {
+										val = string([]rune(sv)[:maxLen])
+										e.addWarning("Note", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", col.Name, i+1))
+									} else if e.isStrictMode() {
+										if bool(stmt.Ignore) {
+											val = string([]rune(sv)[:maxLen])
+											e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", col.Name, i+1))
+										} else {
+											return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row %d", col.Name, i+1))
+										}
+									} else {
+										val = string([]rune(sv)[:maxLen])
+										e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", col.Name, i+1))
+									}
+								}
+							}
+						}
+					}
 					val = coerceColumnValue(col.Type, val)
 					break
 				}

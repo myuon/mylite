@@ -1069,10 +1069,20 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						if sv, ok := checkVal.(string); ok {
 							maxLen := extractCharLength(col.Type)
 							if maxLen > 0 && len([]rune(sv)) > maxLen {
-								if bool(stmt.Ignore) {
+								// Check if the excess characters are only spaces.
+								// MySQL allows truncation of trailing spaces with just a warning/note,
+								// even in strict mode.
+								excess := string([]rune(sv)[maxLen:])
+								onlySpaces := strings.TrimRight(excess, " ") == ""
+								if onlySpaces {
+									row[col.Name] = string([]rune(sv)[:maxLen])
+									rv = row[col.Name]
+									e.addWarning("Note", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+								} else if bool(stmt.Ignore) {
 									// INSERT IGNORE: truncate the value instead of error
 									row[col.Name] = string([]rune(sv)[:maxLen])
 									rv = row[col.Name]
+									e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 								} else {
 									return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row 1", col.Name))
 								}
@@ -1108,12 +1118,22 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 									origStr = string(oev)
 								}
 							}
-							// ENUM: empty string is invalid (not in the allowed list)
+							// ENUM: empty string is invalid unless '' is explicitly in the allowed list
 							if isEnumType && sv == "" {
-								if bool(stmt.Ignore) || !e.isStrictMode() {
-									e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
-								} else {
-									return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+								emptyAllowed := false
+								for _, ev := range splitEnumValues(enumInner) {
+									trimmed := strings.Trim(strings.TrimSpace(ev), "'")
+									if trimmed == "" {
+										emptyAllowed = true
+										break
+									}
+								}
+								if !emptyAllowed {
+									if bool(stmt.Ignore) || !e.isStrictMode() {
+										e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+									} else {
+										return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+									}
 								}
 							}
 							// SET: if the validated value differs from original,
@@ -1146,6 +1166,30 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							}
 						}
 					}
+				}
+			}
+		}
+
+		// Non-strict mode: truncate strings that exceed column length with a warning
+		if !e.isStrictMode() {
+			for _, col := range tbl.Def.Columns {
+				rv, exists := row[col.Name]
+				if !exists || rv == nil {
+					continue
+				}
+				colUpper := strings.ToUpper(col.Type)
+				isCharType := strings.Contains(colUpper, "CHAR") || strings.Contains(colUpper, "BINARY")
+				if !isCharType {
+					continue
+				}
+				sv, ok := rv.(string)
+				if !ok {
+					continue
+				}
+				maxLen := extractCharLength(col.Type)
+				if maxLen > 0 && len([]rune(sv)) > maxLen {
+					row[col.Name] = string([]rune(sv)[:maxLen])
+					e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 				}
 			}
 		}
