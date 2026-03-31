@@ -1126,7 +1126,10 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	isNoFromQuery := logicalNoFrom &&
 		(stmt.With == nil || len(stmt.With.CTEs) == 0) &&
 		e.cteMap == nil
-	if isNoFromQuery {
+	// Only validate bare column references in no-FROM queries when we're NOT inside
+	// a correlated subquery (correlatedRow would be set for correlated subqueries,
+	// and bare column references there are valid outer scope references).
+	if isNoFromQuery && e.correlatedRow == nil {
 		for _, expr := range stmt.SelectExprs.Exprs {
 			if se, ok := expr.(*sqlparser.AliasedExpr); ok {
 				if err := validateNoFromTopLevelColRefs(se.Expr); err != nil {
@@ -2433,7 +2436,7 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 			if !ok {
 				return nil, fmt.Errorf("unsupported select expression in GROUP BY: %T", expr)
 			}
-			val, err := evalAggregateExpr(ae.Expr, g.rows, repRow)
+			val, err := evalAggregateExpr(ae.Expr, g.rows, repRow, e)
 			if err != nil {
 				return nil, err
 			}
@@ -2489,7 +2492,7 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 				if isRolledUpExpr(ae, level) {
 					rollupRow = append(rollupRow, nil)
 				} else {
-					val, err := evalAggregateExpr(ae.Expr, sourceRows, repRow)
+					val, err := evalAggregateExpr(ae.Expr, sourceRows, repRow, e)
 					if err != nil {
 						return nil, err
 					}
@@ -2668,7 +2671,11 @@ func computeGroupKey(groupByExprs []sqlparser.Expr, row storage.Row) string {
 }
 
 // evalAggregateExpr evaluates an expression that may be an aggregate function over a group.
-func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow storage.Row) (interface{}, error) {
+func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow storage.Row, execCtx ...*Executor) (interface{}, error) {
+	var exec *Executor
+	if len(execCtx) > 0 {
+		exec = execCtx[0]
+	}
 	switch e := expr.(type) {
 	case *sqlparser.CountStar:
 		return int64(len(groupRows)), nil
@@ -3040,12 +3047,150 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		}
 		return result, nil
 	case *sqlparser.ComparisonExpr:
+		// Handle IN / NOT IN with right side ValTuple (including row-IN-tuple-of-tuples)
+		if e.Operator == sqlparser.InOp || e.Operator == sqlparser.NotInOp {
+			// Handle ROW(a, AGG(b)) IN (SELECT ...) in aggregate context
+			if leftTupleIN, leftIsTupleIN := e.Left.(sqlparser.ValTuple); leftIsTupleIN && exec != nil {
+				if sub, ok := e.Right.(*sqlparser.Subquery); ok {
+					// Evaluate left tuple elements with aggregate context
+					result, err := exec.execSubquery(sub, exec.correlatedRow)
+					if err != nil {
+						return nil, err
+					}
+					if len(result.Columns) != len(leftTupleIN) {
+						return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTupleIN)))
+					}
+					leftValsAggIN := make([]interface{}, len(leftTupleIN))
+					for i, lExpr := range leftTupleIN {
+						lv, err := evalAggregateExpr(lExpr, groupRows, repRow, exec)
+						if err != nil {
+							return nil, err
+						}
+						leftValsAggIN[i] = lv
+					}
+					hasNullAggIN := false
+					for _, lv := range leftValsAggIN {
+						if lv == nil {
+							hasNullAggIN = true
+							break
+						}
+					}
+					for _, subRow := range result.Rows {
+						if len(subRow) != len(leftValsAggIN) {
+							continue
+						}
+						allMatch := true
+						rowHasNull := false
+						for i := 0; i < len(leftValsAggIN); i++ {
+							if leftValsAggIN[i] == nil || subRow[i] == nil {
+								rowHasNull = true
+								allMatch = false
+								break
+							}
+							match, _ := compareValues(leftValsAggIN[i], subRow[i], sqlparser.EqualOp)
+							if !match {
+								allMatch = false
+								break
+							}
+						}
+						if allMatch {
+							if e.Operator == sqlparser.InOp {
+								return int64(1), nil
+							}
+							return int64(0), nil
+						}
+						if rowHasNull {
+							hasNullAggIN = true
+						}
+					}
+					if hasNullAggIN {
+						return nil, nil
+					}
+					if e.Operator == sqlparser.NotInOp {
+						return int64(1), nil
+					}
+					return int64(0), nil
+				}
+			}
+			if rightTupleAgg, ok := e.Right.(sqlparser.ValTuple); ok {
+				leftVal, err := evalAggregateExpr(e.Left, groupRows, repRow, exec)
+				if err != nil {
+					return nil, err
+				}
+				// Check if left is a tuple value (we evaluated a ValTuple left side)
+				// For scalar IN (v1,v2,...):
+				if leftVal == nil {
+					return nil, nil
+				}
+				hasNull := false
+				for _, item := range rightTupleAgg {
+					val, err := evalAggregateExpr(item, groupRows, repRow, exec)
+					if err != nil {
+						return nil, err
+					}
+					if val == nil {
+						hasNull = true
+						continue
+					}
+					match, _ := compareValues(leftVal, val, sqlparser.EqualOp)
+					if match {
+						if e.Operator == sqlparser.InOp {
+							return int64(1), nil
+						}
+						return int64(0), nil
+					}
+				}
+				if hasNull {
+					return nil, nil
+				}
+				if e.Operator == sqlparser.NotInOp {
+					return int64(1), nil
+				}
+				return int64(0), nil
+			}
+		}
+		// Handle row/tuple comparisons: (a, MAX(b)) = (1, 4), etc.
+		leftTupleAgg, leftIsTupleAgg := e.Left.(sqlparser.ValTuple)
+		rightTupleAgg2, rightIsTupleAgg := e.Right.(sqlparser.ValTuple)
+		if leftIsTupleAgg && rightIsTupleAgg {
+			if len(leftTupleAgg) != len(rightTupleAgg2) {
+				return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTupleAgg)))
+			}
+			leftValsAgg := make([]interface{}, len(leftTupleAgg))
+			rightValsAgg := make([]interface{}, len(rightTupleAgg2))
+			for i := 0; i < len(leftTupleAgg); i++ {
+				lv, err := evalAggregateExpr(leftTupleAgg[i], groupRows, repRow, exec)
+				if err != nil {
+					return nil, err
+				}
+				leftValsAgg[i] = lv
+				rv, err := evalAggregateExpr(rightTupleAgg2[i], groupRows, repRow, exec)
+				if err != nil {
+					return nil, err
+				}
+				rightValsAgg[i] = rv
+			}
+			equal, hasNull, err := rowTuplesEqual(interface{}(leftValsAgg), interface{}(rightValsAgg))
+			if err != nil {
+				return nil, err
+			}
+			if hasNull {
+				return nil, nil
+			}
+			if e.Operator == sqlparser.NotEqualOp {
+				equal = !equal
+			}
+			if equal {
+				return int64(1), nil
+			}
+			return int64(0), nil
+		}
 		// Handle expressions like COUNT(*) = 0
-		left, err := evalAggregateExpr(e.Left, groupRows, repRow)
+		left, err := evalAggregateExpr(e.Left, groupRows, repRow, exec)
 		if err != nil {
 			return nil, err
 		}
-		right, err := evalAggregateExpr(e.Right, groupRows, repRow)
+		right, err := evalAggregateExpr(e.Right, groupRows, repRow, exec)
 		if err != nil {
 			return nil, err
 		}
@@ -3058,21 +3203,21 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		}
 		return int64(0), nil
 	case *sqlparser.BinaryExpr:
-		left, err := evalAggregateExpr(e.Left, groupRows, repRow)
+		left, err := evalAggregateExpr(e.Left, groupRows, repRow, exec)
 		if err != nil {
 			return nil, err
 		}
-		right, err := evalAggregateExpr(e.Right, groupRows, repRow)
+		right, err := evalAggregateExpr(e.Right, groupRows, repRow, exec)
 		if err != nil {
 			return nil, err
 		}
 		return evalBinaryExpr(left, right, e.Operator)
 	case *sqlparser.IntervalDateExpr:
-		dateVal, err := evalAggregateExpr(e.Date, groupRows, repRow)
+		dateVal, err := evalAggregateExpr(e.Date, groupRows, repRow, exec)
 		if err != nil {
 			return nil, err
 		}
-		intervalVal, err := evalAggregateExpr(e.Interval, groupRows, repRow)
+		intervalVal, err := evalAggregateExpr(e.Interval, groupRows, repRow, exec)
 		if err != nil {
 			return nil, err
 		}
@@ -3083,7 +3228,7 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			tmpExec := &Executor{}
 			resolvedExprs := make([]sqlparser.Expr, len(e.Exprs))
 			for i, arg := range e.Exprs {
-				val, err := evalAggregateExpr(arg, groupRows, repRow)
+				val, err := evalAggregateExpr(arg, groupRows, repRow, exec)
 				if err != nil {
 					return nil, err
 				}
@@ -3101,13 +3246,13 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		// Handle JSON_MERGE_PRESERVE(JSON_ARRAYAGG(b), ...)
 		if containsAggregate(expr) {
 			tmpExec := &Executor{}
-			docVal, err := evalAggregateExpr(e.JSONDoc, groupRows, repRow)
+			docVal, err := evalAggregateExpr(e.JSONDoc, groupRows, repRow, exec)
 			if err != nil {
 				return nil, err
 			}
 			resolvedDocList := make([]sqlparser.Expr, len(e.JSONDocList))
 			for i, d := range e.JSONDocList {
-				val, err := evalAggregateExpr(d, groupRows, repRow)
+				val, err := evalAggregateExpr(d, groupRows, repRow, exec)
 				if err != nil {
 					return nil, err
 				}
@@ -3135,7 +3280,7 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 	if psExpr, ok := expr.(*sqlparser.PerformanceSchemaFuncExpr); ok && psExpr.Argument != nil {
 		if isAggregateExpr(psExpr.Argument) {
 			// Compute the inner aggregate first
-			innerVal, err := evalAggregateExpr(psExpr.Argument, groupRows, repRow)
+			innerVal, err := evalAggregateExpr(psExpr.Argument, groupRows, repRow, exec)
 			if err != nil {
 				return nil, err
 			}
@@ -3148,6 +3293,18 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			}
 			return evalRowExpr(expr, syntheticRow)
 		}
+	}
+	// Handle ValTuple (nested ROW) in aggregate context: evaluate each element recursively
+	if tup, ok := expr.(sqlparser.ValTuple); ok {
+		vals := make([]interface{}, len(tup))
+		for i, item := range tup {
+			v, err := evalAggregateExpr(item, groupRows, repRow, exec)
+			if err != nil {
+				return nil, err
+			}
+			vals[i] = v
+		}
+		return vals, nil
 	}
 	// Non-aggregate: return value from representative row
 	return evalRowExpr(expr, repRow)
@@ -3970,8 +4127,24 @@ func validateNoFromTopLevelColRefs(expr sqlparser.Expr) error {
 		return validateNoFromTopLevelColRefs(e.Left)
 	case *sqlparser.UnaryExpr:
 		return validateNoFromTopLevelColRefs(e.Expr)
+	case *sqlparser.FuncExpr:
+		// Validate column references inside function arguments for no-FROM queries.
+		// MySQL returns ER_BAD_FIELD_ERROR for bare column names inside function calls
+		// when there's no FROM clause (e.g. SELECT COUNT(col = @@GLOBAL.var)).
+		for _, arg := range e.Exprs {
+			if err := validateNoFromTopLevelColRefs(arg); err != nil {
+				return err
+			}
+		}
+	case *sqlparser.Count:
+		// COUNT(expr) - validate the argument expression
+		for _, arg := range e.Args {
+			if err := validateNoFromTopLevelColRefs(arg); err != nil {
+				return err
+			}
+		}
 	}
-	// For function calls, subqueries, etc., don't check - let them through
+	// For subqueries, etc., don't check - let them through
 	return nil
 }
 

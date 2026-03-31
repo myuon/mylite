@@ -159,6 +159,17 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		return "", &Result{}, nil
 	}
 
+	// Rewrite "SET @var:=expr" to "SET @var=expr" since vitess parser doesn't support
+	// := in SET statements (it is allowed in SELECT/expression context via AssignmentExpr).
+	if strings.HasPrefix(upper, "SET ") && strings.Contains(trimmed, ":=") {
+		setAssignRe := regexp.MustCompile(`(?i)(^SET\s+@\w+)\s*:=`)
+		if setAssignRe.MatchString(trimmed) {
+			query = setAssignRe.ReplaceAllString(trimmed, "$1 =")
+			trimmed = strings.TrimSpace(query)
+			upper = strings.ToUpper(trimmed)
+		}
+	}
+
 	// Rewrite "SOUNDS LIKE" to SOUNDEX comparison so vitess can parse it
 	if strings.Contains(upper, "SOUNDS LIKE") {
 		slRe := regexp.MustCompile(`(?i)('(?:[^'\\]|\\.)*'|\w+)\s+SOUNDS\s+LIKE\s+('(?:[^'\\]|\\.)*'|\w+)`)

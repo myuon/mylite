@@ -146,6 +146,7 @@ func (r *Runner) RunFile(testPath string) TestResult {
 			"$restart_parameters": "restart",
 			"$BIG_TEST":           "1",
 			"$VALGRIND_TEST":      "0",
+			"$MYSQL_CHARSETSDIR":  "/usr/share/mysql/charsets",
 		},
 	}
 
@@ -3702,6 +3703,12 @@ func normalizeOutput(s string) string {
 	// Normalize space after comma in function calls: MySQL preserves "func(a, b)"
 	// but vitess may output "func(a,b)" without spaces.
 	out = normalizeCommaSpacing(out)
+	// Normalize "is a SESSION variable and can't be used with SET GLOBAL" →
+	// "is a SESSION variable" (our shorter form)
+	out = normalizeSessionVarError(out)
+	// Normalize deprecation warnings in output:
+	// Strip lines like "ERROR 01000: '@@var' is deprecated and will be removed..."
+	out = normalizeDeprecationWarnings(out)
 	// Normalize invalid UTF-8 bytes to '?' to match MySQL behavior:
 	// MySQL displays non-UTF8 bytes (e.g. latin1 characters) as '?' in
 	// SHOW CREATE TABLE output depending on connection charset. Since mylite
@@ -4123,4 +4130,37 @@ func normalizeCommaSpacing(s string) string {
 	}
 	re := regexp.MustCompile(`, `)
 	return re.ReplaceAllString(s, ",")
+}
+
+// normalizeSessionVarError normalizes the error message for scope-restricted variables:
+// MySQL says "is a SESSION variable and can't be used with SET GLOBAL"
+// while our system says "is a SESSION variable".
+// Similarly for "is a GLOBAL variable and should be set with SET GLOBAL".
+// Normalize to the shorter form.
+func normalizeSessionVarError(s string) string {
+	if strings.Contains(s, "is a SESSION variable") {
+		s = strings.ReplaceAll(s, " and can't be used with SET GLOBAL", "")
+	}
+	if strings.Contains(s, "is a GLOBAL variable") {
+		s = strings.ReplaceAll(s, " and should be set with SET GLOBAL", "")
+	}
+	return s
+}
+
+// normalizeDeprecationWarnings strips MySQL deprecation warning lines from output.
+// These appear as "ERROR 01000: '@@var' is deprecated and will be removed in a future release."
+func normalizeDeprecationWarnings(s string) string {
+	if !strings.Contains(s, "is deprecated and will be removed") {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	var result []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.Contains(trimmed, "is deprecated and will be removed in a future release") {
+			continue
+		}
+		result = append(result, line)
+	}
+	return strings.Join(result, "\n")
 }

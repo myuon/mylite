@@ -1541,6 +1541,15 @@ func mysqlError(code int, state, message string) error {
 	return fmt.Errorf("ERROR %d (%s): %s", code, state, message)
 }
 
+// isMySQLError checks if err is a MySQL error with the given error code.
+func isMySQLError(err error, code int) bool {
+	if err == nil {
+		return false
+	}
+	prefix := fmt.Sprintf("ERROR %d (", code)
+	return strings.HasPrefix(err.Error(), prefix)
+}
+
 // perfSchemaTruncateDenied returns true if TRUNCATE is denied on the given
 // performance_schema table. Most PS tables allow TRUNCATE (resets statistics),
 // but certain tables with live/config data deny it.
@@ -9215,6 +9224,112 @@ func mysqlWeekMode0(t time.Time) int64 {
 	return int64((yday-firstSunday-1)/7 + 1)
 }
 
+// mysqlWeekFull calculates MySQL's WEEK(date, mode) for all 8 modes.
+// MySQL WEEK() mode semantics:
+//
+//	Mode 0: first=Sun, range 0-53, week1=starts at first Sunday
+//	Mode 1: first=Mon, range 0-53, week1=4+ days in year
+//	Mode 2: first=Sun, range 1-53, week1=starts at first Sunday (or prev year last week)
+//	Mode 3: first=Mon, range 1-53, ISO week
+//	Mode 4: first=Sun, range 0-53, week1=4+ days in year
+//	Mode 5: first=Mon, range 0-53, week1=starts at first Monday
+//	Mode 6: first=Sun, range 1-53, week1=4+ days in year
+//	Mode 7: first=Mon, range 1-53, week1=starts at first Monday (or prev year last week)
+func mysqlWeekFull(t time.Time, mode int64) int64 {
+	mode = mode & 7 // clamp to 0-7
+	mondayFirst := (mode & 1) != 0
+	weekRange1to53 := (mode & 2) != 0
+	useWeek4Rule := (mode & 4) != 0
+
+	year := t.Year()
+
+	if mondayFirst {
+		// Monday-first modes
+		if useWeek4Rule {
+			// Modes 5, 7: week 1 starts at first Monday (no 4-day rule)
+			jan1 := time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC)
+			wdJan1 := int(jan1.Weekday()) // 0=Sun, 1=Mon, ..., 6=Sat
+			// firstMonday: days from Jan 1 to first Monday (0-based offset)
+			firstMonday := (8 - wdJan1) % 7 // 0 if Jan 1 is Monday
+			yday := t.YearDay() - 1          // 0-based
+			if yday < firstMonday {
+				if weekRange1to53 {
+					// Return last week of previous year
+					prevDec31 := time.Date(year-1, 12, 31, 0, 0, 0, 0, time.UTC)
+					return mysqlWeekFull(prevDec31, mode)
+				}
+				return 0
+			}
+			return int64((yday-firstMonday)/7 + 1)
+		}
+		// Modes 1, 3: week 1 has 4+ days in year (ISO-like for Monday-first)
+		// ISO week (mode 3) is exactly this
+		_, isoWeek := t.ISOWeek()
+		if weekRange1to53 {
+			// Mode 3: straight ISO week
+			return int64(isoWeek)
+		}
+		// Mode 1: range 0-53; ISO week 0 means it belongs to prev year's last week
+		// If ISO week is 52 or 53 and we're in January, it's week 0
+		isoYear, isoW := t.ISOWeek()
+		if isoYear < year {
+			return 0
+		}
+		_ = isoW
+		return int64(isoWeek)
+	}
+
+	// Sunday-first modes (modes 0, 2, 4, 6)
+	jan1 := time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC)
+	wdJan1 := int(jan1.Weekday()) // 0=Sun
+
+	if useWeek4Rule {
+		// Modes 4, 6: week 1 has 4+ days in year (Sun-first variant)
+		// First Sunday of the week that contains Jan 1 with 4+ days
+		// The week containing Jan 1 starts on the Sunday on or before Jan 1.
+		// Jan 1 is day wdJan1 of its week (0=Sun). The week starts at Jan 1 - wdJan1.
+		// If this week has >= 4 days in the year (i.e. wdJan1 <= 3), it's week 1.
+		// Otherwise week 1 starts next Sunday.
+		yday := t.YearDay() - 1 // 0-based
+		// Days before Jan 1 in the partial week containing Jan 1
+		daysInFirstWeek := 7 - wdJan1
+		if wdJan1 <= 3 {
+			// Jan 1's week has >= 4 days -> it's week 1 starting at offset -wdJan1
+			weekStart := -wdJan1 // can be negative (days in Dec of prev year)
+			week := (yday - weekStart) / 7
+			if week == 0 && weekRange1to53 {
+				// Shouldn't happen with useWeek4Rule when wdJan1<=3
+				return 1
+			}
+			return int64(week + 1)
+		}
+		// First partial week has < 4 days, so week 1 starts at daysInFirstWeek
+		if yday < daysInFirstWeek {
+			if weekRange1to53 {
+				// Return last week of previous year
+				prevDec31 := time.Date(year-1, 12, 31, 0, 0, 0, 0, time.UTC)
+				return mysqlWeekFull(prevDec31, mode)
+			}
+			return 0
+		}
+		return int64((yday-daysInFirstWeek)/7 + 1)
+	}
+
+	// Modes 0, 2: week 1 starts at first Sunday
+	// firstSunday: 0-based offset of first Sunday
+	firstSunday := (7 - wdJan1) % 7
+	yday := t.YearDay() - 1 // 0-based
+	if yday < firstSunday {
+		if weekRange1to53 {
+			// Return last week of previous year
+			prevDec31 := time.Date(year-1, 12, 31, 0, 0, 0, 0, time.UTC)
+			return mysqlWeekFull(prevDec31, mode)
+		}
+		return 0
+	}
+	return int64((yday-firstSunday)/7 + 1)
+}
+
 // isBinaryExpr checks whether an expression references a BINARY or VARBINARY column.
 // This is used to make UPPER/LOWER no-ops on binary data, matching MySQL behavior.
 func (e *Executor) isBinaryExpr(expr sqlparser.Expr) bool {
@@ -10058,6 +10173,23 @@ func (e *Executor) evalExprMaybeRow(expr sqlparser.Expr, row *storage.Row) (inte
 
 // evalRowExpr evaluates an expression in the context of a table row.
 // It handles column lookups and delegates other expressions to e.evalExpr.
+// evalRowExprTupleAware evaluates an expression in row context, returning []interface{}
+// for ValTuple (to support nested row/tuple comparisons) or a scalar value otherwise.
+func (e *Executor) evalRowExprTupleAware(expr sqlparser.Expr, row storage.Row) (interface{}, error) {
+	if tup, ok := expr.(sqlparser.ValTuple); ok {
+		vals := make([]interface{}, len(tup))
+		for i, item := range tup {
+			v, err := e.evalRowExprTupleAware(item, row)
+			if err != nil {
+				return nil, err
+			}
+			vals[i] = v
+		}
+		return vals, nil
+	}
+	return e.evalRowExpr(expr, row)
+}
+
 func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{}, error) {
 	switch v := expr.(type) {
 	case *sqlparser.ColName:
@@ -10142,6 +10274,63 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 	case *sqlparser.ComparisonExpr:
 		// Handle IN / NOT IN specially: right side is a ValTuple
 		if v.Operator == sqlparser.InOp || v.Operator == sqlparser.NotInOp {
+			// When left is a tuple: (a,b) IN ((1,2),(3,4)) or (a,b) IN (SELECT ...)
+			if leftTupleIN, leftIsTupleIN := v.Left.(sqlparser.ValTuple); leftIsTupleIN {
+				if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+					return e.evalInSubquery(nil, v.Left, sub, v.Operator)
+				}
+				// Row IN tuple-of-tuples: (a,b) IN ((1,2),(3,4)) or nested (a,(b,c)) IN ((1,(2,3)),...)
+				if rightTupleIN, ok := v.Right.(sqlparser.ValTuple); ok {
+					// Evaluate left tuple values with row context (supports nested tuples)
+					leftValsIN := make([]interface{}, len(leftTupleIN))
+					for i, lExpr := range leftTupleIN {
+						lv, err := e.evalRowExprTupleAware(lExpr, row)
+						if err != nil {
+							return nil, err
+						}
+						leftValsIN[i] = lv
+					}
+					hasNullIN := false
+					leftRowIN := interface{}(leftValsIN)
+					for _, item := range rightTupleIN {
+						rowTupleIN, isRowTuple := item.(sqlparser.ValTuple)
+						if !isRowTuple {
+							break // fall through to scalar handling
+						}
+						if len(rowTupleIN) != len(leftTupleIN) {
+							return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTupleIN)))
+						}
+						rValsIN := make([]interface{}, len(rowTupleIN))
+						for i, rv := range rowTupleIN {
+							rVal, err := e.evalRowExprTupleAware(rv, row)
+							if err != nil {
+								return nil, err
+							}
+							rValsIN[i] = rVal
+						}
+						equal, rowHasNull, err := rowTuplesEqual(leftRowIN, interface{}(rValsIN))
+						if err != nil {
+							return nil, err
+						}
+						if equal {
+							if v.Operator == sqlparser.InOp {
+								return int64(1), nil
+							}
+							return int64(0), nil
+						}
+						if rowHasNull {
+							hasNullIN = true
+						}
+					}
+					if hasNullIN {
+						return nil, nil
+					}
+					if v.Operator == sqlparser.NotInOp {
+						return int64(1), nil
+					}
+					return int64(0), nil
+				}
+			}
 			left, err := e.evalRowExpr(v.Left, row)
 			if err != nil {
 				return nil, err
@@ -10181,39 +10370,128 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				return e.evalInSubquery(left, v.Left, sub, v.Operator)
 			}
 		}
+		// Handle (SELECT c1,c2,...) op ROW(v1,v2,...) and ROW(...) op (SELECT ...)
+		// in row context. Delegate to evalComparisonExpr which has the full implementation.
+		{
+			_, leftIsSub := v.Left.(*sqlparser.Subquery)
+			_, rightIsSub := v.Right.(*sqlparser.Subquery)
+			_, leftIsValTuple := v.Left.(sqlparser.ValTuple)
+			_, rightIsValTuple := v.Right.(sqlparser.ValTuple)
+			if (leftIsSub && rightIsValTuple) || (leftIsValTuple && rightIsSub) {
+				return e.evalComparisonExpr(v)
+			}
+		}
 		// Handle ROW/tuple comparisons: ROW(a,b) = ROW(c,d) or (a,b) = (c,d)
+		// Supports nested tuples via evalRowExprTupleAware returning []interface{} for ValTuple.
 		leftTuple, leftIsTuple := v.Left.(sqlparser.ValTuple)
 		rightTuple, rightIsTuple := v.Right.(sqlparser.ValTuple)
 		if leftIsTuple && rightIsTuple {
 			if len(leftTuple) != len(rightTuple) {
 				return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTuple)))
 			}
-			allMatch := true
+			// Evaluate as full tuple values (nested tuples return []interface{})
+			leftValsRT := make([]interface{}, len(leftTuple))
+			rightValsRT := make([]interface{}, len(rightTuple))
 			for i := 0; i < len(leftTuple); i++ {
-				lv, err := e.evalRowExpr(leftTuple[i], row)
+				lv, err := e.evalRowExprTupleAware(leftTuple[i], row)
 				if err != nil {
 					return nil, err
 				}
-				rv, err := e.evalRowExpr(rightTuple[i], row)
+				leftValsRT[i] = lv
+				rv, err := e.evalRowExprTupleAware(rightTuple[i], row)
 				if err != nil {
 					return nil, err
 				}
-				if lv == nil || rv == nil {
+				rightValsRT[i] = rv
+			}
+			switch v.Operator {
+			case sqlparser.EqualOp, sqlparser.NotEqualOp, sqlparser.NullSafeEqualOp:
+				equal, hasNull, err := rowTuplesEqual(interface{}(leftValsRT), interface{}(rightValsRT))
+				if err != nil {
+					return nil, err
+				}
+				if v.Operator == sqlparser.NullSafeEqualOp {
+					if hasNull {
+						// For <=>, NULL == NULL = true, NULL != non-NULL = false
+						// rowTuplesEqual doesn't handle this correctly for NullSafe
+						// Fall through to element-wise comparison
+						allNullMatch := true
+						for i := 0; i < len(leftValsRT); i++ {
+							lv, rv := leftValsRT[i], rightValsRT[i]
+							if lv == nil && rv == nil {
+								continue
+							}
+							if lv == nil || rv == nil {
+								allNullMatch = false
+								break
+							}
+							eq, _, err := rowTuplesEqual(lv, rv)
+							if err != nil {
+								return nil, err
+							}
+							if !eq {
+								allNullMatch = false
+								break
+							}
+						}
+						if allNullMatch {
+							return int64(1), nil
+						}
+						return int64(0), nil
+					}
+					if equal {
+						return int64(1), nil
+					}
+					return int64(0), nil
+				}
+				if hasNull {
 					return nil, nil
 				}
-				match, err := compareValues(lv, rv, v.Operator)
-				if err != nil {
-					return nil, err
+				if v.Operator == sqlparser.NotEqualOp {
+					equal = !equal
 				}
-				if !match {
-					allMatch = false
-					break
+				if equal {
+					return int64(1), nil
+				}
+				return int64(0), nil
+			default:
+				// Lexicographic comparison for <, >, <=, >=
+				for i := 0; i < len(leftValsRT); i++ {
+					lv, rv := leftValsRT[i], rightValsRT[i]
+					if lv == nil || rv == nil {
+						return nil, nil
+					}
+					eq, err := compareValues(lv, rv, sqlparser.EqualOp)
+					if err != nil {
+						return nil, err
+					}
+					if eq {
+						continue
+					}
+					lt, err := compareValues(lv, rv, sqlparser.LessThanOp)
+					if err != nil {
+						return nil, err
+					}
+					switch v.Operator {
+					case sqlparser.LessThanOp, sqlparser.LessEqualOp:
+						if lt {
+							return int64(1), nil
+						}
+						return int64(0), nil
+					default:
+						if !lt {
+							return int64(1), nil
+						}
+						return int64(0), nil
+					}
+				}
+				switch v.Operator {
+				case sqlparser.LessEqualOp, sqlparser.GreaterEqualOp:
+					return int64(1), nil
+				default:
+					return int64(0), nil
 				}
 			}
-			if allMatch {
-				return int64(1), nil
-			}
-			return int64(0), nil
 		}
 		if leftIsTuple {
 			// Left is tuple, right is subquery or something else - delegate to evalWhere
@@ -10237,6 +10515,26 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		if ce, ok := rightExpr2.(*sqlparser.CollateExpr); ok {
 			collationName = ce.Collation
 			rightExpr2 = ce.Expr
+		}
+		// If left side is a bare column reference not found in the row, MySQL returns
+		// ER_BAD_FIELD_ERROR before evaluating the right side. This prevents a right-side
+		// error (e.g. @@GLOBAL on a session-only var) from masking the column error.
+		if colExpr, ok := leftExpr2.(*sqlparser.ColName); ok && colExpr.Qualifier.IsEmpty() {
+			colName := colExpr.Name.String()
+			if _, found := row[colName]; !found {
+				// Also check case-insensitive
+				upperName := strings.ToUpper(colName)
+				foundCI := false
+				for k := range row {
+					if strings.ToUpper(k) == upperName {
+						foundCI = true
+						break
+					}
+				}
+				if !foundCI {
+					return nil, mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'field list'", colName))
+				}
+			}
 		}
 		left, err := e.evalRowExpr(leftExpr2, row)
 		if err != nil {
@@ -10736,6 +11034,54 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 				}
 				return v.Operator == sqlparser.NotInOp, nil
 			}
+			// Row/tuple IN (tuple of tuples): (a,b,c) IN ((1,2,3),(4,5,6))
+			if leftTupleW, leftIsTupleW := v.Left.(sqlparser.ValTuple); leftIsTupleW {
+				rightTupleW, ok := v.Right.(sqlparser.ValTuple)
+				if !ok {
+					return false, fmt.Errorf("IN/NOT IN right side must be a value tuple, got %T", v.Right)
+				}
+				leftValsW := make([]interface{}, len(leftTupleW))
+				for i, lExpr := range leftTupleW {
+					lv, err := e.evalRowExprTupleAware(lExpr, row)
+					if err != nil {
+						return false, err
+					}
+					leftValsW[i] = lv
+				}
+				hasNullW := false
+				leftRowW := interface{}(leftValsW)
+				for _, item := range rightTupleW {
+					rowTupleW, isRowTuple := item.(sqlparser.ValTuple)
+					if !isRowTuple {
+						break
+					}
+					if len(rowTupleW) != len(leftTupleW) {
+						return false, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTupleW)))
+					}
+					rValsW := make([]interface{}, len(rowTupleW))
+					for i, rv := range rowTupleW {
+						rVal, err := e.evalRowExprTupleAware(rv, row)
+						if err != nil {
+							return false, err
+						}
+						rValsW[i] = rVal
+					}
+					equal, rowHasNull, err := rowTuplesEqual(leftRowW, interface{}(rValsW))
+					if err != nil {
+						return false, err
+					}
+					if equal {
+						return v.Operator == sqlparser.InOp, nil
+					}
+					if rowHasNull {
+						hasNullW = true
+					}
+				}
+				if v.Operator == sqlparser.NotInOp && !hasNullW {
+					return true, nil
+				}
+				return false, nil
+			}
 			left, err := e.evalRowExpr(v.Left, row)
 			if err != nil {
 				return false, err
@@ -10853,10 +11199,10 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 
 		// Handle ValTuple (row constructor) comparison: (c1,c2) = (SELECT c1, c2 FROM ...) or (c1,c2) = (2,'abc')
 		if tuple, ok := v.Left.(sqlparser.ValTuple); ok {
-			// Evaluate left tuple values
+			// Evaluate left tuple values (with tuple-aware support for nested tuples)
 			leftVals := make([]interface{}, len(tuple))
 			for i, texpr := range tuple {
-				val, err := e.evalRowExpr(texpr, row)
+				val, err := e.evalRowExprTupleAware(texpr, row)
 				if err != nil {
 					return false, err
 				}
@@ -10892,27 +11238,86 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 				}
 				return allMatch, nil
 			}
-			// Right side: ValTuple literal (c1,c2) = (2, "abc")
+			// Right side: ValTuple literal (c1,c2) op (2, "abc") — row constructor comparison.
 			if rightTuple, ok := v.Right.(sqlparser.ValTuple); ok {
 				if len(leftVals) != len(rightTuple) {
-					return false, fmt.Errorf("Operand should contain %d column(s)", len(leftVals))
+					return false, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftVals)))
 				}
-				allMatch := true
-				for i, lv := range leftVals {
-					rv, err := e.evalRowExpr(rightTuple[i], row)
+				// Build right vals (with tuple-aware support for nested tuples)
+				rightValsW := make([]interface{}, len(rightTuple))
+				for i := range rightTuple {
+					rv, err := e.evalRowExprTupleAware(rightTuple[i], row)
 					if err != nil {
 						return false, err
 					}
-					match, err := compareValues(lv, rv, v.Operator)
+					rightValsW[i] = rv
+				}
+				switch v.Operator {
+				case sqlparser.EqualOp, sqlparser.NotEqualOp, sqlparser.NullSafeEqualOp:
+					equal, hasNull, err := rowTuplesEqual(interface{}(leftVals), interface{}(rightValsW))
 					if err != nil {
 						return false, err
 					}
-					if !match {
-						allMatch = false
-						break
+					if v.Operator == sqlparser.NullSafeEqualOp {
+						if hasNull {
+							// Element-wise null-safe comparison
+							for i := 0; i < len(leftVals); i++ {
+								lv, rv := leftVals[i], rightValsW[i]
+								if lv == nil && rv == nil {
+									continue
+								}
+								if lv == nil || rv == nil {
+									return false, nil
+								}
+								eq, _, _ := rowTuplesEqual(lv, rv)
+								if !eq {
+									return false, nil
+								}
+							}
+							return true, nil
+						}
+						return equal, nil
+					}
+					if hasNull {
+						return false, nil
+					}
+					if v.Operator == sqlparser.NotEqualOp {
+						return !equal, nil
+					}
+					return equal, nil
+				default:
+					// Lexicographic comparison for <, >, <=, >=
+					for i := 0; i < len(leftVals); i++ {
+						lv, rv := leftVals[i], rightValsW[i]
+						if lv == nil || rv == nil {
+							return false, nil // NULL → UNKNOWN → false in WHERE
+						}
+						eq, err := compareValues(lv, rv, sqlparser.EqualOp)
+						if err != nil {
+							return false, err
+						}
+						if eq {
+							continue
+						}
+						lt, err := compareValues(lv, rv, sqlparser.LessThanOp)
+						if err != nil {
+							return false, err
+						}
+						switch v.Operator {
+						case sqlparser.LessThanOp, sqlparser.LessEqualOp:
+							return lt, nil
+						default: // GreaterThanOp, GreaterEqualOp
+							return !lt, nil
+						}
+					}
+					// All elements equal
+					switch v.Operator {
+					case sqlparser.LessEqualOp, sqlparser.GreaterEqualOp:
+						return true, nil
+					default:
+						return false, nil
 					}
 				}
-				return allMatch, nil
 			}
 		}
 

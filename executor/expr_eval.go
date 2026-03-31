@@ -13,6 +13,68 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
+// evalTupleAware evaluates an expression, returning []interface{} for ValTuple
+// (to support nested row comparisons) or a scalar value otherwise.
+func (e *Executor) evalTupleAware(expr sqlparser.Expr) (interface{}, error) {
+	if tup, ok := expr.(sqlparser.ValTuple); ok {
+		vals := make([]interface{}, len(tup))
+		for i, item := range tup {
+			v, err := e.evalTupleAware(item)
+			if err != nil {
+				return nil, err
+			}
+			vals[i] = v
+		}
+		return vals, nil
+	}
+	return e.evalExpr(expr)
+}
+
+// rowTuplesEqual compares two values that may be scalars or []interface{} (nested tuples).
+// Returns (equal, hasNull, error). hasNull is true if either side is NULL.
+func rowTuplesEqual(a, b interface{}) (equal bool, hasNull bool, err error) {
+	aSlice, aIsTuple := a.([]interface{})
+	bSlice, bIsTuple := b.([]interface{})
+	if aIsTuple && bIsTuple {
+		if len(aSlice) != len(bSlice) {
+			return false, false, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(aSlice)))
+		}
+		sawNull := false
+		for i := range aSlice {
+			eq, null, err := rowTuplesEqual(aSlice[i], bSlice[i])
+			if err != nil {
+				return false, false, err
+			}
+			if null {
+				// Don't stop: a later definitive mismatch overrides NULL
+				sawNull = true
+				continue
+			}
+			if !eq {
+				// Definitive mismatch: result is 0 regardless of any NULLs seen
+				return false, false, nil
+			}
+		}
+		if sawNull {
+			return false, true, nil
+		}
+		return true, false, nil
+	}
+	if aIsTuple || bIsTuple {
+		// One is a tuple, the other is scalar - type mismatch
+		// The error message should reflect the number of columns expected by the tuple side.
+		if aIsTuple {
+			return false, false, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(aSlice)))
+		}
+		return false, false, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(bSlice)))
+	}
+	if a == nil || b == nil {
+		return false, true, nil
+	}
+	match, err := compareValues(a, b, sqlparser.EqualOp)
+	return match, false, err
+}
+
 // evalLiteralExpr handles *sqlparser.Literal evaluation.
 func (e *Executor) evalLiteralExpr(v *sqlparser.Literal) (interface{}, error) {
 	switch v.Type {
@@ -306,6 +368,8 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 		return "utf8mb4_0900_ai_ci", nil
 	case "identity", "last_insert_id":
 		return e.lastInsertID, nil
+	case "insert_id":
+		return e.nextInsertID, nil
 	// Variables that return NULL by default
 	case "external_user", "proxy_user",
 		"ssl_crl", "ssl_crlpath",
@@ -465,7 +529,63 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
 				return e.evalInSubquery(nil, v.Left, sub, v.Operator)
 			}
+			// Row/tuple IN (tuple of tuples): (a,b) IN ((1,2),(3,4))
+			// Right side must be a ValTuple where each element is itself a ValTuple.
+			if rightTuple, ok := v.Right.(sqlparser.ValTuple); ok {
+				leftTuple := v.Left.(sqlparser.ValTuple)
+				// Evaluate left tuple values once (recursively, to support nested tuples)
+				leftVals := make([]interface{}, len(leftTuple))
+				for i, lExpr := range leftTuple {
+					lv, err := e.evalTupleAware(lExpr)
+					if err != nil {
+						return nil, err
+					}
+					leftVals[i] = lv
+				}
+				hasNull := false
+				// Wrap leftVals as a []interface{} row for recursive comparison
+				leftRow := interface{}(leftVals)
+				for _, item := range rightTuple {
+					rowTuple, isRowTuple := item.(sqlparser.ValTuple)
+					if !isRowTuple {
+						// Degenerate: right contains non-tuple items; fall through to scalar path
+						goto scalarIN
+					}
+					if len(rowTuple) != len(leftTuple) {
+						return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTuple)))
+					}
+					rVals := make([]interface{}, len(rowTuple))
+					for i, rv := range rowTuple {
+						rVal, err := e.evalTupleAware(rv)
+						if err != nil {
+							return nil, err
+						}
+						rVals[i] = rVal
+					}
+					equal, rowHasNull, err := rowTuplesEqual(leftRow, interface{}(rVals))
+					if err != nil {
+						return nil, err
+					}
+					if equal {
+						if v.Operator == sqlparser.InOp {
+							return int64(1), nil
+						}
+						return int64(0), nil
+					}
+					if rowHasNull {
+						hasNull = true
+					}
+				}
+				if hasNull {
+					return nil, nil
+				}
+				if v.Operator == sqlparser.NotInOp {
+					return int64(1), nil
+				}
+				return int64(0), nil
+			}
 		}
+	scalarIN:
 		left, err := e.evalExpr(v.Left)
 		if err != nil {
 			return nil, err
@@ -505,8 +625,137 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 			return e.evalInSubquery(left, v.Left, sub, v.Operator)
 		}
 	}
+	// Handle (SELECT c1,c2,...) op ROW(v1,v2,...) — multi-column subquery vs tuple.
+	// MySQL allows comparing a row subquery to a row constructor.
+	{
+		leftSub, leftIsSub := v.Left.(*sqlparser.Subquery)
+		rightTupleExpr, rightIsTupleExpr := v.Right.(sqlparser.ValTuple)
+		if leftIsSub && rightIsTupleExpr {
+			subResult, err := e.execSubquery(leftSub, e.correlatedRow)
+			if err != nil {
+				return nil, err
+			}
+			if len(subResult.Rows) == 0 {
+				return nil, nil
+			}
+			if len(subResult.Rows) > 1 {
+				return nil, mysqlError(1242, "21000", "Subquery returns more than 1 row")
+			}
+			subRow := subResult.Rows[0]
+			if len(subRow) != len(rightTupleExpr) {
+				return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(subRow)))
+			}
+			// Build left values from subquery result row
+			leftVals := make([]interface{}, len(subRow))
+			for i, v := range subRow {
+				leftVals[i] = v
+			}
+			// Build right values from tuple
+			rightVals := make([]interface{}, len(rightTupleExpr))
+			for i, rExpr := range rightTupleExpr {
+				rv, err := e.evalExpr(rExpr)
+				if err != nil {
+					return nil, err
+				}
+				rightVals[i] = rv
+			}
+			// Compare as tuples
+			fakeCmp := &sqlparser.ComparisonExpr{Operator: v.Operator}
+			_ = fakeCmp
+			switch v.Operator {
+			case sqlparser.EqualOp, sqlparser.NotEqualOp, sqlparser.NullSafeEqualOp:
+				allMatch := true
+				for i := 0; i < len(leftVals); i++ {
+					lv, rv := leftVals[i], rightVals[i]
+					if lv == nil || rv == nil {
+						if v.Operator == sqlparser.NullSafeEqualOp {
+							if lv != nil || rv != nil {
+								allMatch = false
+								break
+							}
+							continue
+						}
+						return nil, nil
+					}
+					match, err := compareValues(lv, rv, sqlparser.EqualOp)
+					if err != nil {
+						return nil, err
+					}
+					if !match {
+						allMatch = false
+						break
+					}
+				}
+				if v.Operator == sqlparser.NotEqualOp {
+					allMatch = !allMatch
+				}
+				if allMatch {
+					return int64(1), nil
+				}
+				return int64(0), nil
+			case sqlparser.LessThanOp, sqlparser.GreaterThanOp, sqlparser.LessEqualOp, sqlparser.GreaterEqualOp:
+				for i := 0; i < len(leftVals); i++ {
+					lv, rv := leftVals[i], rightVals[i]
+					if lv == nil || rv == nil {
+						return nil, nil
+					}
+					eq, err := compareValues(lv, rv, sqlparser.EqualOp)
+					if err != nil {
+						return nil, err
+					}
+					if eq {
+						continue
+					}
+					lt, err := compareValues(lv, rv, sqlparser.LessThanOp)
+					if err != nil {
+						return nil, err
+					}
+					switch v.Operator {
+					case sqlparser.LessThanOp, sqlparser.LessEqualOp:
+						if lt {
+							return int64(1), nil
+						}
+						return int64(0), nil
+					default:
+						if !lt {
+							return int64(1), nil
+						}
+						return int64(0), nil
+					}
+				}
+				switch v.Operator {
+				case sqlparser.LessEqualOp, sqlparser.GreaterEqualOp:
+					return int64(1), nil
+				default:
+					return int64(0), nil
+				}
+			}
+		}
+		// Also handle ROW(v1,v2,...) op (SELECT c1,c2,...) (right is subquery)
+		leftTupleExpr2, leftIsTupleExpr2 := v.Left.(sqlparser.ValTuple)
+		rightSub2, rightIsSub2 := v.Right.(*sqlparser.Subquery)
+		if leftIsTupleExpr2 && rightIsSub2 {
+			// Reuse logic by swapping and flipping the operator
+			flipped := &sqlparser.ComparisonExpr{Left: v.Right, Right: v.Left, Operator: v.Operator}
+			switch v.Operator {
+			case sqlparser.LessThanOp:
+				flipped.Operator = sqlparser.GreaterThanOp
+			case sqlparser.GreaterThanOp:
+				flipped.Operator = sqlparser.LessThanOp
+			case sqlparser.LessEqualOp:
+				flipped.Operator = sqlparser.GreaterEqualOp
+			case sqlparser.GreaterEqualOp:
+				flipped.Operator = sqlparser.LessEqualOp
+			}
+			_ = leftTupleExpr2
+			_ = rightSub2
+			return e.evalComparisonExpr(flipped)
+		}
+	}
+
 	// Handle ROW/tuple comparisons: ROW(a,b) op ROW(c,d) or (a,b) op (c,d)
 	// Supports =, !=, <, >, <=, >= with lexicographic comparison.
+	// Uses evalTupleAware to support nested tuples like ROW(1,2,ROW(3,4)).
 	leftTuple, leftIsTuple := v.Left.(sqlparser.ValTuple)
 	rightTuple, rightIsTuple := v.Right.(sqlparser.ValTuple)
 	if leftIsTuple && rightIsTuple {
@@ -518,11 +767,11 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 			// Equality / inequality: all elements must match (or differ for !=)
 			allMatch := true
 			for i := 0; i < len(leftTuple); i++ {
-				lv, err := e.evalExpr(leftTuple[i])
+				lv, err := e.evalTupleAware(leftTuple[i])
 				if err != nil {
 					return nil, err
 				}
-				rv, err := e.evalExpr(rightTuple[i])
+				rv, err := e.evalTupleAware(rightTuple[i])
 				if err != nil {
 					return nil, err
 				}
@@ -536,11 +785,15 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 					}
 					return nil, nil // NULL comparison -> NULL
 				}
-				match, err := compareValues(lv, rv, sqlparser.EqualOp)
+				// Use rowTuplesEqual to support nested tuple comparison
+				eq, hasNull, err := rowTuplesEqual(lv, rv)
 				if err != nil {
 					return nil, err
 				}
-				if !match {
+				if hasNull {
+					return nil, nil
+				}
+				if !eq {
 					allMatch = false
 					break
 				}
@@ -616,6 +869,13 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 	if ce, ok := rightExpr.(*sqlparser.CollateExpr); ok {
 		collationName = ce.Collation
 		rightExpr = ce.Expr
+	}
+	// If left side is a bare column reference (no table context), MySQL returns
+	// ER_BAD_FIELD_ERROR before evaluating the right side. This matters when the
+	// right side would produce a different error (e.g. @@GLOBAL on a session-only var).
+	if colExpr, ok := leftExpr.(*sqlparser.ColName); ok && colExpr.Qualifier.IsEmpty() && e.correlatedRow == nil {
+		colName := colExpr.Name.String()
+		return nil, mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'field list'", colName))
 	}
 	left, err := e.evalExpr(leftExpr)
 	if err != nil {

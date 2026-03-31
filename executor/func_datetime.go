@@ -503,12 +503,15 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 			if modeErr == nil && modeVal != nil {
 				mode = toInt64(modeVal)
 			}
+		} else {
+			// No explicit mode: use @@default_week_format session variable
+			if sv, ok := e.getSysVar("default_week_format"); ok {
+				if n, err2 := strconv.ParseInt(sv, 10, 64); err2 == nil {
+					mode = n
+				}
+			}
 		}
-		if mode == 0 {
-			return mysqlWeekMode0(t), true, nil
-		}
-		_, wk := t.ISOWeek()
-		return int64(wk), true, nil
+		return mysqlWeekFull(t, mode), true, nil
 	case "weekofyear":
 		val, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {

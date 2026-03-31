@@ -43,6 +43,10 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		if sysVarGlobalOnly[cleanVarName] && scope != sqlparser.GlobalScope {
 			return nil, mysqlError(1228, "HY000", fmt.Sprintf("Variable '%s' is a GLOBAL variable and should be set with SET GLOBAL", cleanVarName))
 		}
+		// Check if SESSION-only variable is being set at GLOBAL scope
+		if sysVarSessionOnly[cleanVarName] && scope == sqlparser.GlobalScope {
+			return nil, mysqlError(1228, "HY000", fmt.Sprintf("Variable '%s' is a SESSION variable and can't be used with SET GLOBAL", cleanVarName))
+		}
 		// Check if session-read-only variable is being set at SESSION scope
 		if sysVarSessionReadOnly[cleanVarName] && scope != sqlparser.GlobalScope {
 			return nil, mysqlError(1238, "HY000", fmt.Sprintf("SESSION variable '%s' is read-only. Use SET GLOBAL to assign the value", cleanVarName))
@@ -59,8 +63,24 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		}
 		val := sqlparser.String(expr.Expr)
 		val = strings.Trim(val, "'\"")
+		// Detect bare-identifier arithmetic expressions like SET @@var = name1 + name2.
+		// MySQL treats bare identifiers in SET values as column references; if they appear
+		// in an arithmetic expression (BinaryExpr with ColName operands) and there's no
+		// table context, MySQL returns ER_BAD_FIELD_ERROR.
+		if binExpr, ok := expr.Expr.(*sqlparser.BinaryExpr); ok {
+			if setExprContainsColName(binExpr) {
+				// Extract the first ColName for the error message
+				colName := setExprFirstColName(binExpr)
+				return nil, mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'field list'", colName))
+			}
+		}
 		// Try evaluating the expression (handles @user_var, @@system_var references)
-		if evalVal, err := e.evalExpr(expr.Expr); err == nil && evalVal != nil {
+		if evalVal, evalErr := e.evalExpr(expr.Expr); evalErr != nil {
+			// If the expression itself fails, propagate ER_BAD_FIELD_ERROR
+			if isMySQLError(evalErr, 1054) { // ER_BAD_FIELD_ERROR
+				return nil, evalErr
+			}
+		} else if evalVal != nil {
 			val = fmt.Sprintf("%v", evalVal)
 		}
 		switch name {
@@ -125,11 +145,53 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				}
 			}
 		case "insert_id":
-			if n, err := strconv.ParseInt(val, 10, 64); err == nil {
-				e.nextInsertID = n
+			// insert_id only accepts integers (not floats or strings)
+			if strings.ContainsAny(val, ".eE") {
+				return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable 'insert_id'"))
 			}
-		case "character_set_client", "character_set_connection", "character_set_results":
-			e.sessionScopeVars[name] = strings.ToLower(val)
+			if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+				if n < 0 {
+					// Negative values are truncated to 0 (insert_id is unsigned)
+					e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect insert_id value: '%s'", val))
+					n = 0
+				}
+				e.nextInsertID = n
+			} else {
+				return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable 'insert_id'"))
+			}
+		case "identity", "last_insert_id":
+			// identity/last_insert_id only accepts integers (not floats or strings)
+			if strings.ContainsAny(val, ".eE") {
+				return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+			}
+			if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+				if n < 0 {
+					// Negative values are truncated to 0 (unsigned)
+					e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect %s value: '%s'", name, val))
+					n = 0
+				}
+				e.lastInsertID = n
+			} else {
+				return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+			}
+		case "character_set_client", "character_set_connection", "character_set_results",
+			"character_set_filesystem", "character_set_server", "character_set_database",
+			"collation_connection", "collation_server", "collation_database":
+			isGlobal := scope == sqlparser.GlobalScope
+			if strings.ToUpper(val) == "DEFAULT" {
+				// DEFAULT for session means current global value, or compiled default if no global override.
+				if isGlobal {
+					e.deleteSysVar(name, true)
+				} else {
+					if gv, ok := e.globalScopeVars[name]; ok {
+						e.sessionScopeVars[name] = gv
+					} else {
+						delete(e.sessionScopeVars, name)
+					}
+				}
+			} else {
+				e.setSysVar(name, strings.ToLower(val), isGlobal)
+			}
 		default:
 			// Store any SET GLOBAL/SESSION variable for later retrieval
 			if name != "" {
@@ -632,6 +694,10 @@ func (e *Executor) handleRawSet(raw string) error {
 		if sysVarGlobalOnly[varName] && !isGlobalScope {
 			return mysqlError(1228, "HY000", fmt.Sprintf("Variable '%s' is a GLOBAL variable and should be set with SET GLOBAL", varName))
 		}
+		// Check SESSION-only
+		if sysVarSessionOnly[varName] && isGlobalScope {
+			return mysqlError(1228, "HY000", fmt.Sprintf("Variable '%s' is a SESSION variable and can't be used with SET GLOBAL", varName))
+		}
 		// Check session-read-only
 		if sysVarSessionReadOnly[varName] && !isGlobalScope {
 			return mysqlError(1238, "HY000", fmt.Sprintf("SESSION variable '%s' is read-only. Use SET GLOBAL to assign the value", varName))
@@ -653,6 +719,38 @@ func (e *Executor) handleRawSet(raw string) error {
 			return mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", val))
 		}
 		val = strings.Trim(val, "'\"")
+		// Handle identity/last_insert_id special cases (type checking + update e.lastInsertID)
+		if varName == "identity" || varName == "last_insert_id" {
+			if strings.ContainsAny(val, ".eE") {
+				return mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", varName))
+			}
+			if n, nerr := strconv.ParseInt(val, 10, 64); nerr == nil {
+				if n < 0 {
+					e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect %s value: '%s'", varName, val))
+					n = 0
+				}
+				e.lastInsertID = n
+			} else {
+				return mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", varName))
+			}
+			return nil
+		}
+		// Handle insert_id special cases (type checking + update e.nextInsertID)
+		if varName == "insert_id" {
+			if strings.ContainsAny(val, ".eE") {
+				return mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable 'insert_id'"))
+			}
+			if n, nerr := strconv.ParseInt(val, 10, 64); nerr == nil {
+				if n < 0 {
+					e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect insert_id value: '%s'", val))
+					n = 0
+				}
+				e.nextInsertID = n
+			} else {
+				return mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable 'insert_id'"))
+			}
+			return nil
+		}
 		// Normalize engine names for storage engine variables
 		if varName == "default_storage_engine" || varName == "default_tmp_storage_engine" || varName == "storage_engine" {
 			if _, err := strconv.ParseFloat(val, 64); err == nil {
@@ -2859,6 +2957,10 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		}
 		vars[name] = val
 	}
+	// Override dynamic runtime values
+	vars["insert_id"] = strconv.FormatInt(e.nextInsertID, 10)
+	vars["identity"] = strconv.FormatInt(e.lastInsertID, 10)
+	vars["last_insert_id"] = strconv.FormatInt(e.lastInsertID, 10)
 	return vars
 }
 
@@ -3032,4 +3134,30 @@ func (e *Executor) showStatus(upper string) (*Result, error) {
 		Rows:        rows,
 		IsResultSet: true,
 	}, nil
+}
+
+// setExprContainsColName reports whether a BinaryExpr has at least one ColName operand.
+// Used to detect bare-identifier arithmetic in SET variable expressions.
+func setExprContainsColName(e sqlparser.Expr) bool {
+	switch v := e.(type) {
+	case *sqlparser.ColName:
+		return true
+	case *sqlparser.BinaryExpr:
+		return setExprContainsColName(v.Left) || setExprContainsColName(v.Right)
+	}
+	return false
+}
+
+// setExprFirstColName returns the name of the first ColName found in the expression tree.
+func setExprFirstColName(e sqlparser.Expr) string {
+	switch v := e.(type) {
+	case *sqlparser.ColName:
+		return v.Name.String()
+	case *sqlparser.BinaryExpr:
+		if name := setExprFirstColName(v.Left); name != "" {
+			return name
+		}
+		return setExprFirstColName(v.Right)
+	}
+	return ""
 }
