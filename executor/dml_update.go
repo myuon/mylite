@@ -371,7 +371,13 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 				continue
 			}
 			if val, ok := newRow[col.Name]; ok && val == nil {
-				if !e.isStrictMode() || bool(stmt.Ignore) {
+				// For DATE/DATETIME/TIMESTAMP NOT NULL columns, MySQL always converts
+				// NULL to the implicit zero value ('0000-00-00') even in strict mode.
+				colUpper := strings.ToUpper(col.Type)
+				isDateLike := strings.HasPrefix(colUpper, "DATE") ||
+					strings.HasPrefix(colUpper, "DATETIME") ||
+					strings.HasPrefix(colUpper, "TIMESTAMP")
+				if !e.isStrictMode() || bool(stmt.Ignore) || isDateLike {
 					e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", col.Name))
 					newRow[col.Name] = implicitZeroValue(col.Type)
 					continue

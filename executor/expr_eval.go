@@ -327,7 +327,7 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 	case "innodb_commit_concurrency":
 		return int64(0), nil
 	case "innodb_log_buffer_size":
-		return int64(1048576), nil
+		return int64(16777216), nil
 	case "innodb_buffer_pool_size":
 		return int64(134217728), nil
 	case "innodb_buffer_pool_in_core_file":

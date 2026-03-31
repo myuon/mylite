@@ -115,6 +115,14 @@ func (e *Executor) execCreateDatabase(stmt *sqlparser.CreateDatabase) (*Result, 
 			collation = opt.Value
 		}
 	}
+	// Validate collation is compatible with charset (ER_COLLATION_CHARSET_MISMATCH = 1253)
+	if charset != "" && collation != "" {
+		if collCharset, ok := catalog.CharsetForCollation(collation); ok {
+			if !strings.EqualFold(collCharset, charset) {
+				return nil, mysqlError(1253, "42000", fmt.Sprintf("COLLATION '%s' is not valid for CHARACTER SET '%s'", collation, charset))
+			}
+		}
+	}
 	err := e.Catalog.CreateDatabaseWithCharset(name, charset, collation)
 	if err != nil {
 		if stmt.IfNotExists {
@@ -231,6 +239,14 @@ func (e *Executor) execCreateDatabaseRaw(query string) (*Result, error) {
 	// Validate collation name
 	if collation != "" && !isKnownCollation(collation) {
 		return nil, mysqlError(1273, "HY000", fmt.Sprintf("Unknown collation: '%s'", collation))
+	}
+	// Validate collation is compatible with charset (ER_COLLATION_CHARSET_MISMATCH = 1253)
+	if charset != "" && collation != "" {
+		if collCharset, ok := catalog.CharsetForCollation(collation); ok {
+			if !strings.EqualFold(collCharset, charset) {
+				return nil, mysqlError(1253, "42000", fmt.Sprintf("COLLATION '%s' is not valid for CHARACTER SET '%s'", collation, charset))
+			}
+		}
 	}
 
 	err := e.Catalog.CreateDatabaseWithCharset(dbName, charset, collation)
@@ -736,6 +752,10 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				seen[base] = true
 			}
 		}
+		// Check max key parts per index (ER_TOO_MANY_KEY_PARTS = 1070)
+		if len(idxCols) > 16 {
+			return nil, mysqlError(1070, "42000", "Too many key parts specified; max 16 parts allowed")
+		}
 		// Check key prefix length limits (ER_TOO_LONG_KEY = 1071)
 		// COMPACT/REDUNDANT row format: max 767 bytes per key part
 		// DYNAMIC/COMPRESSED: max 3072 bytes per key part
@@ -982,6 +1002,18 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 	}
 
+	// Check max indexes per table (ER_TOO_MANY_KEYS = 1069)
+	// MySQL counts: primary key (if any) + all secondary indexes
+	{
+		totalKeys := len(indexes)
+		if len(primaryKeys) > 0 {
+			totalKeys++
+		}
+		if totalKeys > 64 {
+			return nil, mysqlError(1069, "42000", "Too many keys specified; max 64 keys allowed")
+		}
+	}
+
 	def := &catalog.TableDef{
 		Name:             tableName,
 		Columns:          columns,
@@ -1054,6 +1086,14 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			hasKeyBlockSize := def.KeyBlockSize != nil && *def.KeyBlockSize > 0
 			if isCompressed || hasKeyBlockSize {
 				return nil, mysqlError(1031, "HY000", fmt.Sprintf("Table storage engine for '%s' doesn't have this option", tableName))
+			}
+		}
+	}
+	// Validate collation is compatible with charset (ER_COLLATION_CHARSET_MISMATCH = 1253)
+	if charsetSpecified && collationSpecified && def.Charset != "" && def.Collation != "" {
+		if collCharset, ok := catalog.CharsetForCollation(def.Collation); ok {
+			if !strings.EqualFold(collCharset, def.Charset) {
+				return nil, mysqlError(1253, "42000", fmt.Sprintf("COLLATION '%s' is not valid for CHARACTER SET '%s'", def.Collation, def.Charset))
 			}
 		}
 	}
@@ -1728,6 +1768,41 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 						return nil, mysqlError(1060, "42S21", fmt.Sprintf("Duplicate column name '%s'", stripPrefixLengthFromCol(c)))
 					}
 					seen[base] = true
+				}
+			}
+			// Check max key parts per index (ER_TOO_MANY_KEY_PARTS = 1070)
+			if len(idxCols) > 16 {
+				return nil, mysqlError(1070, "42000", "Too many key parts specified; max 16 parts allowed")
+			}
+			// Check max indexes per table (ER_TOO_MANY_KEYS = 1069)
+			if tdErr == nil {
+				totalKeys := len(tableDef.Indexes)
+				if len(tableDef.PrimaryKey) > 0 {
+					totalKeys++
+				}
+				// Adding one more index
+				totalKeys++
+				if totalKeys > 64 {
+					return nil, mysqlError(1069, "42000", "Too many keys specified; max 64 keys allowed")
+				}
+			}
+			// Check key prefix length limits (ER_TOO_LONG_KEY = 1071)
+			{
+				tableRowFormat := ""
+				if tableDef, tdErr2 := db.GetTable(tableName); tdErr2 == nil {
+					tableRowFormat = strings.ToUpper(tableDef.RowFormat)
+				}
+				for _, idxCol := range op.IndexDefinition.Columns {
+					if idxCol.Length != nil {
+						prefixLen := *idxCol.Length
+						maxPrefixLen := 3072 // DYNAMIC default
+						if tableRowFormat == "COMPACT" || tableRowFormat == "REDUNDANT" {
+							maxPrefixLen = 767
+						}
+						if prefixLen > maxPrefixLen {
+							return nil, mysqlError(1071, "42000", fmt.Sprintf("Specified key was too long; max key length is %d bytes", maxPrefixLen))
+						}
+					}
 				}
 			}
 			isUnique := op.IndexDefinition.Info.Type == sqlparser.IndexTypeUnique

@@ -239,6 +239,47 @@ func DefaultCollationForCharset(charset string) string {
 	}
 }
 
+// CharsetForCollation returns the charset that a collation belongs to.
+// It returns the charset name and true if found, or "" and false if the collation is unknown.
+func CharsetForCollation(collation string) (string, bool) {
+	collation = strings.ToLower(collation)
+	// Special case: "binary" collation belongs to "binary" charset
+	if collation == "binary" {
+		return "binary", true
+	}
+	// Special case: utf8mb3_ collations belong to "utf8" charset
+	if strings.HasPrefix(collation, "utf8mb3_") {
+		return "utf8", true
+	}
+	// The charset is the prefix before the first underscore
+	idx := strings.Index(collation, "_")
+	if idx < 0 {
+		return "", false
+	}
+	charset := collation[:idx]
+	// Verify the charset is known by checking if DefaultCollationForCharset returns something meaningful
+	defColl := DefaultCollationForCharset(charset)
+	if defColl == charset+"_general_ci" {
+		// This is the fallback; check if it's a real charset
+		// by checking a known list
+		knownCharsets := map[string]bool{
+			"utf8mb4": true, "utf8": true, "latin1": true, "ascii": true, "binary": true,
+			"cp1251": true, "swe7": true, "armscii8": true, "big5": true, "cp1250": true,
+			"cp1256": true, "cp1257": true, "cp850": true, "cp852": true, "cp866": true,
+			"cp932": true, "dec8": true, "eucjpms": true, "euckr": true, "gb18030": true,
+			"gb2312": true, "gbk": true, "geostd8": true, "greek": true, "hebrew": true,
+			"hp8": true, "keybcs2": true, "koi8r": true, "koi8u": true, "latin2": true,
+			"latin5": true, "latin7": true, "macce": true, "macroman": true, "sjis": true,
+			"tis620": true, "ucs2": true, "ujis": true, "utf16": true, "utf16le": true,
+			"utf32": true,
+		}
+		if !knownCharsets[charset] {
+			return "", false
+		}
+	}
+	return charset, true
+}
+
 func (c *Catalog) CreateDatabase(name string) error {
 	return c.CreateDatabaseWithCharset(name, "", "")
 }

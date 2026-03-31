@@ -332,6 +332,12 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	query = normalizeStorageClause(query)
 	// Strip STATS_SAMPLE_PAGES=default which vitess can't parse
 	query = normalizeStatsSamplePages(query)
+	// Strip START TRANSACTION from CREATE TABLE (atomic DDL option, vitess can't parse)
+	query = normalizeStartTransaction(query)
+	// Normalize AUTOEXTEND_SIZE with size suffixes (e.g., 64M -> 67108864)
+	query = normalizeAutoextendSize(query)
+	// Strip SECONDARY_ENGINE=value (vitess can't parse, mylite doesn't support)
+	query = normalizeSecondaryEngine(query)
 	// Fix vitess parser issue: "ADD KEY USING BTREE (col)" is not parsed correctly.
 	// Rewrite to "ADD KEY (col)" since BTREE is the default for InnoDB.
 	query = normalizeAddIndexUsing(query)

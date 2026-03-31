@@ -2452,10 +2452,10 @@ func replaceTypeWord(query, old, replacement string) string {
 			}
 		}
 		// Skip if the preceding non-space token is a table option keyword like ROW_FORMAT
-		// (e.g. "ROW_FORMAT FIXED" — value, not a column type)
+		// or COLUMN_FORMAT (e.g. "ROW_FORMAT FIXED", "COLUMN_FORMAT FIXED" — value, not a column type)
 		{
 			pre := strings.TrimRight(upper[:absPos], " \t\n\r")
-			if strings.HasSuffix(pre, "ROW_FORMAT") {
+			if strings.HasSuffix(pre, "ROW_FORMAT") || strings.HasSuffix(pre, "COLUMN_FORMAT") {
 				idx = endPos
 				continue
 			}
@@ -2597,8 +2597,14 @@ func normalizeInlineCheckConstraints(query string) string {
 			// Determine if this CHECK is inline (part of column def) or already at table level.
 			// Table-level CHECK is preceded by a comma (possibly with whitespace).
 			// Inline CHECK is preceded by column type/options (letter, digit, paren).
+			// When a CONSTRAINT prefix is present, we must check the character before
+			// CONSTRAINT (not before CHECK), since CHECK follows the constraint name.
+			scanFrom := checkStart
+			if constraintPrefix != "" {
+				scanFrom = i // i points to the start of CONSTRAINT keyword
+			}
 			prevNonSpace := 0
-			for p := checkStart - 1; p >= 0; p-- {
+			for p := scanFrom - 1; p >= 0; p-- {
 				ch := query[p]
 				if ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' {
 					prevNonSpace = int(ch)
@@ -2606,7 +2612,50 @@ func normalizeInlineCheckConstraints(query string) string {
 				}
 			}
 			isTableLevel := prevNonSpace == ',' || prevNonSpace == '('
-			if !isTableLevel {
+			if isTableLevel {
+				// This is a table-level CHECK constraint. Skip past the entire
+				// CHECK (...) clause (and optional ENFORCED/NOT ENFORCED) so we
+				// don't re-encounter the CHECK keyword on subsequent iterations.
+				j := checkStart + 5 // past "CHECK"
+				for j < len(query) && query[j] != '(' {
+					j++
+				}
+				if j < len(query) {
+					depth := 0
+					for j < len(query) {
+						if query[j] == '(' {
+							depth++
+						} else if query[j] == ')' {
+							depth--
+							if depth == 0 {
+								j++
+								break
+							}
+						} else if query[j] == '\'' {
+							j++
+							for j < len(query) && query[j] != '\'' {
+								if query[j] == '\\' {
+									j++
+								}
+								j++
+							}
+						}
+						j++
+					}
+					// Also skip optional NOT ENFORCED / ENFORCED
+					rest := strings.TrimLeft(query[j:], " \t\n\r")
+					upperRest := strings.ToUpper(rest)
+					if strings.HasPrefix(upperRest, "NOT ENFORCED") {
+						j += (len(query[j:]) - len(rest)) + len("NOT ENFORCED")
+					} else if strings.HasPrefix(upperRest, "ENFORCED") {
+						j += (len(query[j:]) - len(rest)) + len("ENFORCED")
+					}
+					// Copy the entire table-level CHECK clause as-is
+					result = append(result, query[i:j]...)
+					i = j
+					continue
+				}
+			} else {
 				// This is an inline CHECK. Extract the full CHECK clause.
 				// Find the opening '(' after CHECK
 				j := checkStart + 5 // past "CHECK"
@@ -2719,6 +2768,64 @@ func normalizeStorageClause(query string) string {
 // still trigger parse errors.
 func normalizeStatsSamplePages(query string) string {
 	re := regexp.MustCompile(`(?i)\bSTATS_SAMPLE_PAGES\s*=\s*default\b`)
+	return re.ReplaceAllString(query, "")
+}
+
+// normalizeStartTransaction strips "START TRANSACTION" from CREATE TABLE
+// statements. This is an atomic DDL option in MySQL 8.0 that the vitess
+// parser cannot handle. It's safe to ignore since mylite doesn't support
+// crash recovery.
+func normalizeStartTransaction(query string) string {
+	upper := strings.ToUpper(query)
+	if !strings.Contains(upper, "CREATE TABLE") || !strings.Contains(upper, "START TRANSACTION") {
+		return query
+	}
+	re := regexp.MustCompile(`(?i)\bSTART\s+TRANSACTION\b`)
+	return re.ReplaceAllString(query, "")
+}
+
+// normalizeAutoextendSize converts AUTOEXTEND_SIZE values with size suffixes
+// (K, M, G, T) to their byte equivalents, since the vitess parser cannot
+// handle the suffix notation. E.g., AUTOEXTEND_SIZE=64M -> AUTOEXTEND_SIZE=67108864.
+func normalizeAutoextendSize(query string) string {
+	upper := strings.ToUpper(query)
+	if !strings.Contains(upper, "AUTOEXTEND_SIZE") {
+		return query
+	}
+	re := regexp.MustCompile(`(?i)\bAUTOEXTEND_SIZE\s*=\s*(\d+)([KMGT])\b`)
+	return re.ReplaceAllStringFunc(query, func(match string) string {
+		m := re.FindStringSubmatch(match)
+		if len(m) < 3 {
+			return match
+		}
+		val, err := strconv.ParseInt(m[1], 10, 64)
+		if err != nil {
+			return match
+		}
+		switch strings.ToUpper(m[2]) {
+		case "K":
+			val *= 1024
+		case "M":
+			val *= 1024 * 1024
+		case "G":
+			val *= 1024 * 1024 * 1024
+		case "T":
+			val *= 1024 * 1024 * 1024 * 1024
+		}
+		return fmt.Sprintf("AUTOEXTEND_SIZE=%d", val)
+	})
+}
+
+// normalizeSecondaryEngine strips SECONDARY_ENGINE=value from CREATE/ALTER TABLE
+// statements. The vitess parser produces a nil TableSpec when this option is present.
+// Since mylite doesn't support secondary engines, we simply ignore it.
+func normalizeSecondaryEngine(query string) string {
+	upper := strings.ToUpper(query)
+	if !strings.Contains(upper, "SECONDARY_ENGINE") {
+		return query
+	}
+	// Strip SECONDARY_ENGINE=value (value may be quoted or unquoted)
+	re := regexp.MustCompile(`(?i)\bSECONDARY_ENGINE\s*=\s*(?:'[^']*'|"[^"]*"|` + "`[^`]*`" + `|\S+)`)
 	return re.ReplaceAllString(query, "")
 }
 
@@ -5190,6 +5297,13 @@ func (e *Executor) Execute(query string) (*Result, error) {
 				}
 			}
 			return &Result{}, nil
+		}
+		// Reject CREATE EVENT with MICROSECOND intervals (MySQL error 1235)
+		if strings.HasPrefix(upper, "CREATE EVENT") &&
+			(strings.Contains(upper, "MICROSECOND") || strings.Contains(upper, "DAY_MICROSECOND") ||
+				strings.Contains(upper, "HOUR_MICROSECOND") || strings.Contains(upper, "MINUTE_MICROSECOND") ||
+				strings.Contains(upper, "SECOND_MICROSECOND")) {
+			return nil, mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'MICROSECOND'")
 		}
 		if strings.HasPrefix(upper, "CREATE EVENT") ||
 			strings.HasPrefix(upper, "DROP EVENT") ||
