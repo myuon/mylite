@@ -4209,7 +4209,7 @@ func (e *Executor) checkSelectScopeErrors(stmt *sqlparser.Select) error {
 		case *sqlparser.Variable:
 			if v.Scope == sqlparser.SessionScope {
 				name := strings.ToLower(v.Name.String())
-				if !sysVarSessionOnly[name] && (sysVarReadOnly[name] || (sysVarGlobalOnly[name] && !sysVarBothScope[name])) {
+				if !sysVarSessionOnly[name] && !sysVarBothScope[name] && (sysVarReadOnly[name] || sysVarGlobalOnly[name]) {
 					// Check if the raw query has @@session. or @@local. prefix
 					for _, prefix := range []string{"@@session.", "@@local."} {
 						pattern := prefix + name
@@ -4221,7 +4221,7 @@ func (e *Executor) checkSelectScopeErrors(stmt *sqlparser.Select) error {
 			}
 			if v.Scope == sqlparser.GlobalScope {
 				name := strings.ToLower(v.Name.String())
-				if sysVarSessionOnly[name] {
+				if sysVarSessionOnly[name] && !sysVarBothScope[name] {
 					return mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a SESSION variable", name))
 				}
 			}

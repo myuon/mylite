@@ -26,6 +26,11 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				// Fallback: use the string representation
 				val = strings.Trim(sqlparser.String(expr.Expr), "'\"")
 			}
+			// Unwrap SysVarDouble to plain float64 so user variables
+			// display as normal numbers (e.g. 90, not 90.000000).
+			if sd, ok := val.(SysVarDouble); ok {
+				val = sd.Value
+			}
 			e.userVars[varName] = val
 			continue
 		}
@@ -77,7 +82,8 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		// Try evaluating the expression (handles @user_var, @@system_var references)
 		if evalVal, evalErr := e.evalExpr(expr.Expr); evalErr != nil {
 			// If the expression itself fails, propagate ER_BAD_FIELD_ERROR
-			if isMySQLError(evalErr, 1054) { // ER_BAD_FIELD_ERROR
+			// unless this variable accepts unquoted identifiers (e.g., innodb_monitor_*)
+			if isMySQLError(evalErr, 1054) && !sysVarAcceptIdentifier[cleanVarName] { // ER_BAD_FIELD_ERROR
 				return nil, evalErr
 			}
 		} else if evalVal != nil {
@@ -279,6 +285,28 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					// Skip the isGlobal move-to-global block below since DEFAULT
 					// already handled the proper scope placement.
 					continue
+				} else if fltRng, isFlt := sysVarFloatRange[cleanName]; isFlt {
+					clamped, err := e.clampFloatVar(cleanName, expr.Expr, fltRng.Min, fltRng.Max)
+					if err != nil {
+						return nil, err
+					}
+					// Cross-variable constraint: lwm cannot exceed innodb_max_dirty_pages_pct
+					if cleanName == "innodb_max_dirty_pages_pct_lwm" {
+						if f, parseErr := strconv.ParseFloat(clamped, 64); parseErr == nil {
+							maxPct := 90.0 // default
+							if v, ok := e.getSysVar("innodb_max_dirty_pages_pct"); ok && v != "" {
+								if parsed, err := strconv.ParseFloat(v, 64); err == nil {
+									maxPct = parsed
+								}
+							}
+							if f > maxPct {
+								e.addWarning("Warning", 1210, "innodb_max_dirty_pages_pct_lwm cannot be set higher than innodb_max_dirty_pages_pct.")
+								e.addWarning("Warning", 1210, fmt.Sprintf("Setting innodb_max_dirty_page_pct_lwm to %s", strconv.FormatFloat(maxPct, 'f', 6, 64)))
+								clamped = strconv.FormatFloat(maxPct, 'f', 6, 64)
+							}
+						}
+					}
+					e.sessionScopeVars[cleanName] = clamped
 				} else if rng, ok := sysVarIntRange[cleanName]; ok {
 					var clamped string
 					var err error
@@ -799,7 +827,7 @@ func (e *Executor) handleRawSet(raw string) error {
 		}
 		// If the value is an unquoted SQL reserved keyword, vitess rejected it for good reason.
 		// Propagate as syntax error, but only for non-enum variables (enum vars often use reserved words as values).
-		if !strings.HasPrefix(val, "'") && !strings.HasPrefix(val, "\"") && sqlReservedKeywords[strings.ToUpper(val)] && !sysVarEnumSet[varName] {
+		if !strings.HasPrefix(val, "'") && !strings.HasPrefix(val, "\"") && sqlReservedKeywords[strings.ToUpper(val)] && !sysVarEnumSet[varName] && !sysVarAcceptIdentifier[varName] {
 			return mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", val))
 		}
 		val = strings.Trim(val, "'\"")
@@ -1156,6 +1184,7 @@ var sysVarGlobalOnly = map[string]bool{
 	"log_error_verbosity":                      true,
 	"log_error_suppression_list":               true,
 	"log_error_services":                       true,
+	"log_output":                               true,
 	"log_bin_trust_function_creators":          true,
 	"log_throttle_queries_not_using_indexes":   true,
 	"max_connections":                          true,
@@ -1357,6 +1386,26 @@ var sysVarEnumSet = map[string]bool{
 	"relay_log_info_repository":       true,
 }
 
+// sysVarCommaSeparatedEnum contains enum variables that accept comma-separated values (SET type).
+var sysVarCommaSeparatedEnum = map[string]bool{
+	"log_output":            true,
+	"optimizer_switch":      true,
+	"optimizer_trace":       true,
+	"sql_mode":              true,
+	"tls_version":           true,
+	"slave_rows_search_algorithms": true,
+	"slave_type_conversions":       true,
+}
+
+// sysVarAcceptIdentifier contains variables that accept unquoted identifiers as string values.
+// These are typically innodb_monitor_* variables that accept counter names like "All", "module_cpu", etc.
+var sysVarAcceptIdentifier = map[string]bool{
+	"innodb_monitor_disable":   true,
+	"innodb_monitor_enable":    true,
+	"innodb_monitor_reset":     true,
+	"innodb_monitor_reset_all": true,
+}
+
 // sysVarStringType contains system variables that are string types and reject NULL values.
 var sysVarStringType = map[string]bool{
 	"log_error_services":             true,
@@ -1365,7 +1414,6 @@ var sysVarStringType = map[string]bool{
 	"optimizer_switch":               true,
 	"optimizer_trace":                true,
 	"optimizer_trace_features":       true,
-	"session_track_system_variables": true,
 	"log_output":                     true,
 	"log_timestamps":                 true,
 	"tls_version":                    true,
@@ -1530,6 +1578,10 @@ var sysVarEnumValues = map[string]map[string]string{
 		"CHARACTERISTICS": "CHARACTERISTICS",
 	},
 	"transaction_isolation": {
+		"0":                "READ-UNCOMMITTED",
+		"1":                "READ-COMMITTED",
+		"2":                "REPEATABLE-READ",
+		"3":                "SERIALIZABLE",
 		"READ-UNCOMMITTED": "READ-UNCOMMITTED",
 		"READ-COMMITTED":   "READ-COMMITTED",
 		"REPEATABLE-READ":  "REPEATABLE-READ",
@@ -1562,10 +1614,21 @@ var sysVarEnumValues = map[string]map[string]string{
 		"ON":  "ON",
 		"OFF": "OFF",
 	},
+	"rbr_exec_mode": {
+		"STRICT":     "STRICT",
+		"IDEMPOTENT": "IDEMPOTENT",
+	},
 	"log_output": {
 		"TABLE": "TABLE",
 		"FILE":  "FILE",
 		"NONE":  "NONE",
+		"1":     "NONE",
+		"2":     "FILE",
+		"3":     "NONE,FILE",
+		"4":     "TABLE",
+		"5":     "NONE,TABLE",
+		"6":     "FILE,TABLE",
+		"7":     "NONE,FILE,TABLE",
 	},
 	"updatable_views_with_limit": {
 		"0":   "NO",
@@ -1619,8 +1682,8 @@ var sysVarSessionOnly = map[string]bool{
 	"original_commit_timestamp":  true,
 	"original_server_version":    true,
 	"immediate_server_version":   true,
-	"rbr_exec_mode":              true,
 	"timestamp":                  true,
+	"rbr_exec_mode":              true,
 }
 
 // sysVarBothScope contains system variables that exist at both SESSION and GLOBAL scope.
@@ -1628,6 +1691,7 @@ var sysVarSessionOnly = map[string]bool{
 var sysVarBothScope = map[string]bool{
 	"gtid_owned":         true,
 	"max_allowed_packet": true,
+	"rbr_exec_mode":      true,
 }
 
 // sysVarSessionReadOnly contains system variables that are read-only at SESSION scope.
@@ -1864,7 +1928,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"innodb_concurrency_tickets":                 {Min: 1, Max: 4294967295, IsUnsigned: true},
 	"innodb_fast_shutdown":                       {Min: 0, Max: 2, IsUnsigned: true},
 	"innodb_flush_neighbors":                     {Min: 0, Max: 2, IsUnsigned: true},
-	"innodb_max_dirty_pages_pct_lwm":             {Min: 0, Max: 99, IsUnsigned: true},
+	// innodb_max_dirty_pages_pct_lwm is a DOUBLE variable; handled in sysVarFloatRange.
 	"innodb_max_undo_log_size":                   {Min: 10485760, Max: 18446744073709551615, IsUnsigned: true},
 	"innodb_online_alter_log_max_size":           {Min: 65536, Max: 18446744073709551615, IsUnsigned: true},
 	"join_buffer_size":                           {Min: 128, Max: 18446744073709551615, IsUnsigned: true, BlockSize: 128},
@@ -1972,7 +2036,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"innodb_flush_log_at_trx_commit":             {Min: 0, Max: 2, IsUnsigned: true},
 	"innodb_log_write_ahead_size":                {Min: 512, Max: 16384, IsUnsigned: true},
 	"innodb_rollback_segments":                   {Min: 1, Max: 128, IsUnsigned: true},
-	"innodb_max_dirty_pages_pct":                 {Min: 0, Max: 99, IsUnsigned: true},
+	// innodb_max_dirty_pages_pct is a DOUBLE variable; handled in sysVarFloatRange.
 	"myisam_data_pointer_size":                   {Min: 2, Max: 7, IsUnsigned: true},
 	"myisam_mmap_size":                           {Min: 7, Max: 18446744073709551615, IsUnsigned: true},
 	"relay_log_space_limit":                      {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
@@ -2143,6 +2207,95 @@ func (e *Executor) clampIntVar(name string, expr sqlparser.Expr, min int64, max 
 	return strconv.FormatInt(out, 10), nil
 }
 
+// floatVarRange describes the valid range for a DOUBLE system variable.
+type floatVarRange struct {
+	Min float64
+	Max float64
+}
+
+// sysVarFloatRange contains system variables that are DOUBLE type with min/max bounds.
+var sysVarFloatRange = map[string]floatVarRange{
+	"innodb_max_dirty_pages_pct":     {Min: 0, Max: 99.999},
+	"innodb_max_dirty_pages_pct_lwm": {Min: 0, Max: 99.999},
+	"long_query_time":                {Min: 0, Max: 31536000},
+}
+
+// clampFloatVar validates and clamps a DOUBLE system variable assignment.
+func (e *Executor) clampFloatVar(name string, expr sqlparser.Expr, min, max float64) (string, error) {
+	evalVal, err := e.evalExpr(expr)
+	if err != nil {
+		evalVal = nil
+	}
+	var f float64
+	var raw string
+	if lit, isLit := expr.(*sqlparser.Literal); isLit {
+		litStr := strings.TrimSpace(sqlparser.String(lit))
+		unquoted := strings.Trim(litStr, "'\"")
+		// Quoted non-numeric strings are type errors
+		isQuoted := strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"")
+		if isQuoted {
+			if _, parseErr := strconv.ParseFloat(unquoted, 64); parseErr != nil {
+				return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+			}
+		}
+		parsed, parseErr := strconv.ParseFloat(unquoted, 64)
+		if parseErr != nil {
+			return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+		}
+		f = parsed
+		raw = unquoted
+	} else if evalVal != nil {
+		switch v := evalVal.(type) {
+		case float64:
+			f = v
+			raw = strconv.FormatFloat(v, 'f', -1, 64)
+		case float32:
+			f = float64(v)
+			raw = strconv.FormatFloat(f, 'f', -1, 64)
+		case int64:
+			f = float64(v)
+			raw = strconv.FormatInt(v, 10)
+		case int:
+			f = float64(v)
+			raw = strconv.Itoa(v)
+		case uint64:
+			f = float64(v)
+			raw = strconv.FormatUint(v, 10)
+		case SysVarDouble:
+			f = v.Value
+			raw = strconv.FormatFloat(v.Value, 'f', -1, 64)
+		case ScaledValue:
+			f = v.Value
+			raw = strconv.FormatFloat(v.Value, 'f', -1, 64)
+		case bool:
+			if v {
+				f = 1
+			}
+			raw = fmt.Sprintf("%v", v)
+		case string:
+			parsed, parseErr := strconv.ParseFloat(v, 64)
+			if parseErr != nil {
+				return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+			}
+			f = parsed
+			raw = v
+		default:
+			return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+		}
+	} else {
+		return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+	}
+	if f < min {
+		e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect %s value: '%s'", name, raw))
+		f = min
+	}
+	if f > max {
+		e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect %s value: '%s'", name, raw))
+		f = max
+	}
+	return strconv.FormatFloat(f, 'f', 6, 64), nil
+}
+
 func normalizeBooleanToken(raw string) (int64, bool, bool) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
@@ -2209,10 +2362,63 @@ func normalizeEnumSetValue(name string, expr sqlparser.Expr, evalVal interface{}
 	if !ok {
 		return "", fmt.Errorf("unknown enum variable")
 	}
+	// badPart captures the specific invalid part in comma-separated values
+	var badPart string
 	normalize := func(s string) (string, bool) {
 		up := strings.ToUpper(strings.TrimSpace(strings.Trim(s, "'\"")))
 		v, ok := enumMap[up]
-		return v, ok
+		if ok {
+			return v, true
+		}
+		// Support comma-separated values for SET-type enum variables (e.g., log_output = 'FILE,TABLE')
+		// Use the unquoted (but not trimmed) version for comma splitting to preserve spaces
+		rawUnquoted := strings.Trim(s, "'\"")
+		upRaw := strings.ToUpper(rawUnquoted)
+		if sysVarCommaSeparatedEnum[name] && strings.Contains(upRaw, ",") {
+			rawParts := strings.Split(rawUnquoted, ",")
+			upParts := strings.Split(upRaw, ",")
+			seen := map[string]bool{}
+			normalized := make([]string, 0, len(upParts))
+			for i, p := range upParts {
+				// For log_output, spaces within parts are NOT trimmed.
+				// MySQL rejects " FILE" as invalid.
+				if name == "log_output" {
+					if p == "" {
+						continue
+					}
+				} else {
+					p = strings.TrimSpace(p)
+					if p == "" {
+						continue
+					}
+				}
+				if mv, mok := enumMap[p]; mok {
+					if !seen[mv] {
+						seen[mv] = true
+						normalized = append(normalized, mv)
+					}
+				} else {
+					// Store the original-case bad part for error messages
+					if i < len(rawParts) {
+						badPart = rawParts[i]
+					} else {
+						badPart = p
+					}
+					return "", false
+				}
+			}
+			if len(normalized) > 0 {
+				// Sort in canonical order for log_output: NONE, FILE, TABLE
+				if name == "log_output" {
+					sort.Slice(normalized, func(i, j int) bool {
+						order := map[string]int{"NONE": 0, "FILE": 1, "TABLE": 2}
+						return order[normalized[i]] < order[normalized[j]]
+					})
+				}
+				return strings.Join(normalized, ","), true
+			}
+		}
+		return "", false
 	}
 	if lit, isLit := expr.(*sqlparser.Literal); isLit {
 		litStr := strings.TrimSpace(sqlparser.String(lit))
@@ -2226,6 +2432,10 @@ func normalizeEnumSetValue(name string, expr sqlparser.Expr, evalVal interface{}
 			return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
 		}
 		displayVal := strings.Trim(litStr, "'\"")
+		// If we have a specific bad part from comma-separated validation, use it
+		if badPart != "" {
+			return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", name, badPart))
+		}
 		// The parser lowercases unquoted keywords like OFF/ON to 'off'/'on'.
 		// MySQL shows them uppercase in error messages, so restore the case
 		// for well-known SQL keywords.
@@ -2349,6 +2559,14 @@ func sysVarStringToSelectValueForVar(val string, varName string) interface{} {
 			return int64(0)
 		}
 	}
+	// For DOUBLE system variables, return SysVarDouble so the display
+	// layer formats with 6 fixed decimal places (e.g. "90.000000"),
+	// while arithmetic still works (toFloat extracts the float64).
+	if _, isFlt := sysVarFloatRange[varName]; isFlt {
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			return SysVarDouble{Value: f}
+		}
+	}
 	if n, err := strconv.ParseInt(val, 10, 64); err == nil {
 		return n
 	}
@@ -2389,8 +2607,8 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"innodb_sort_buffer_size":                  "1048576",
 		"innodb_online_alter_log_max_size":         "134217728",
 		"innodb_optimize_fulltext_only":            "OFF",
-		"innodb_max_dirty_pages_pct":               "75.000000",
-		"innodb_max_dirty_pages_pct_lwm":           "0.000000",
+		"innodb_max_dirty_pages_pct":               "90.000000",
+		"innodb_max_dirty_pages_pct_lwm":           "10.000000",
 		"innodb_change_buffering":                  "all",
 		"innodb_change_buffer_max_size":            "25",
 		"innodb_flush_log_at_trx_commit":           "1",

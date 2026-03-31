@@ -203,7 +203,7 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 	// Check if the user explicitly wrote @@session.var or @@local.var
 	// (as opposed to just @@var). We detect this from the raw query text
 	// because the AST doesn't distinguish @@var from @@session.var.
-	if v.Scope == sqlparser.SessionScope && !sysVarSessionOnly[name] && (sysVarReadOnly[name] || (sysVarGlobalOnly[name] && !sysVarBothScope[name])) {
+	if v.Scope == sqlparser.SessionScope && !sysVarSessionOnly[name] && !sysVarBothScope[name] && (sysVarReadOnly[name] || sysVarGlobalOnly[name]) {
 		q := strings.ToLower(e.currentQuery)
 		// Check for explicit @@session.name or @@local.name anywhere in the query
 		// Use word boundary: the name must be followed by non-word char or end
@@ -239,7 +239,7 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 	}
 
 	// Check for @@global.session_only_var
-	if v.Scope == sqlparser.GlobalScope && sysVarSessionOnly[name] {
+	if v.Scope == sqlparser.GlobalScope && sysVarSessionOnly[name] && !sysVarBothScope[name] {
 		return nil, mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a SESSION variable", name))
 	}
 
@@ -370,6 +370,14 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 		return e.lastInsertID, nil
 	case "insert_id":
 		return e.nextInsertID, nil
+	case "gtid_owned":
+		// At session scope, gtid_owned reflects gtid_next when it's set to ANONYMOUS.
+		if v.Scope != sqlparser.GlobalScope {
+			if gn, ok := e.sessionScopeVars["gtid_next"]; ok && strings.EqualFold(gn, "ANONYMOUS") {
+				return "ANONYMOUS", nil
+			}
+		}
+		return "", nil
 	// Variables that return NULL by default
 	case "external_user", "proxy_user",
 		"ssl_crl", "ssl_crlpath",

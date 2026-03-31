@@ -10117,6 +10117,18 @@ func (e *Executor) evalCaseExpr(v *sqlparser.CaseExpr) (interface{}, error) {
 // arithmetic works correctly (e.g. x'1000000000000000' - 1).
 type HexBytes string
 
+// SysVarDouble wraps a float64 value from a DOUBLE system variable so
+// it is displayed with 6 fixed decimal places (e.g. "90.000000") in
+// SELECT @@var, while still being usable as a float64 in arithmetic
+// (e.g. SET @v = @@var - 1).
+type SysVarDouble struct {
+	Value float64
+}
+
+func (d SysVarDouble) String() string {
+	return strconv.FormatFloat(d.Value, 'f', 6, 64)
+}
+
 // ScaledValue wraps a float64 from multiplication/addition/subtraction
 // to preserve the decimal scale through the arithmetic chain.
 type ScaledValue struct {
@@ -10139,6 +10151,12 @@ func (d DivisionResult) String() string {
 // Used to compute division result precision per MySQL rules.
 func valueScale(v interface{}) int {
 	switch val := v.(type) {
+	case SysVarDouble:
+		s := strconv.FormatFloat(val.Value, 'f', -1, 64)
+		if idx := strings.Index(s, "."); idx >= 0 {
+			return len(s) - idx - 1
+		}
+		return 0
 	case ScaledValue:
 		return val.Scale
 	case DivisionResult:
@@ -10329,6 +10347,8 @@ func toInt64(v interface{}) int64 {
 		return int64(n)
 	case float64:
 		return int64(n)
+	case SysVarDouble:
+		return int64(n.Value)
 	case ScaledValue:
 		return int64(n.Value)
 	case DivisionResult:
@@ -11994,6 +12014,13 @@ func valuesEqual(a, b interface{}) bool {
 }
 
 func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator) (bool, error) {
+	// Unwrap SysVarDouble to plain float64 for comparison purposes.
+	if sd, ok := left.(SysVarDouble); ok {
+		left = sd.Value
+	}
+	if sd, ok := right.(SysVarDouble); ok {
+		right = sd.Value
+	}
 	// NULL-safe equal (<=>): true if both NULL, false if one is NULL, otherwise normal equality.
 	if op == sqlparser.NullSafeEqualOp {
 		if left == nil && right == nil {
@@ -12798,6 +12825,8 @@ func toFloat(v interface{}) float64 {
 		return float64(n)
 	case float64:
 		return n
+	case SysVarDouble:
+		return n.Value
 	case ScaledValue:
 		return n.Value
 	case DivisionResult:

@@ -411,6 +411,8 @@ func normalizeRows(rows [][]interface{}) [][]interface{} {
 				} else {
 					rows[i][j] = int64(0)
 				}
+			} else if sd, ok := val.(executor.SysVarDouble); ok {
+				rows[i][j] = strconv.FormatFloat(sd.Value, 'f', 6, 64)
 			} else if sv, ok := val.(executor.ScaledValue); ok {
 				rows[i][j] = sv.Value
 			} else if d, ok := val.(executor.DivisionResult); ok {
