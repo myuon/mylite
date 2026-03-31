@@ -351,9 +351,13 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		e.selectNowait = strings.Contains(uq, "NOWAIT")
 		e.selectLockClauses = parseSelectLockClauses(query)
 	}
+	// Strip ODBC outer join escape syntax: { oj ... } → ...
+	query = normalizeODBCOuterJoin(query)
 	query = normalizeForShareOf(query)
 	query = normalizeMemberOperator(query)
 	query = normalizeJSONTableDefaultOrder(query)
+	// Fix CREATE TABLE name (SELECT ...) ORDER BY ... (vitess fails to parse parenthesized SELECT)
+	query = normalizeCreateTableParenSelect(query)
 	// Fix CREATE TABLE name ENGINE=xxx SELECT ... (vitess fails to parse engine+select combo)
 	query = normalizeCreateTableEngineSelect(query)
 	trimmed = strings.TrimSpace(query)
@@ -524,6 +528,65 @@ func stripStringLiterals(s string) string {
 		}
 	}
 	return buf.String()
+}
+
+// normalizeODBCOuterJoin strips ODBC outer join escape syntax.
+// MySQL supports `{ oj table1 LEFT OUTER JOIN table2 ON ... }` as a
+// compatibility feature.  The vitess parser does not understand this
+// syntax so we strip the `{ oj` prefix and the matching closing `}`.
+func normalizeODBCOuterJoin(query string) string {
+	upper := strings.ToUpper(query)
+	if !strings.Contains(upper, "{ OJ ") && !strings.Contains(upper, "{OJ ") {
+		return query
+	}
+	result := make([]byte, 0, len(query))
+	i := 0
+	braceDepth := 0 // tracks how many ODBC braces we are inside
+	inQuote := byte(0)
+	for i < len(query) {
+		ch := query[i]
+		// Handle quoted strings – pass through unchanged.
+		if inQuote != 0 {
+			result = append(result, ch)
+			if ch == inQuote {
+				inQuote = 0
+			}
+			i++
+			continue
+		}
+		if ch == '\'' || ch == '"' || ch == '`' {
+			inQuote = ch
+			result = append(result, ch)
+			i++
+			continue
+		}
+		// Detect "{ oj " or "{oj " (case-insensitive).
+		if ch == '{' {
+			rest := query[i:]
+			restUpper := strings.ToUpper(rest)
+			if strings.HasPrefix(restUpper, "{ OJ ") {
+				// Skip "{ oj " (5 chars)
+				i += 5
+				braceDepth++
+				continue
+			}
+			if strings.HasPrefix(restUpper, "{OJ ") {
+				// Skip "{oj " (4 chars)
+				i += 4
+				braceDepth++
+				continue
+			}
+		}
+		// Skip closing brace that matches an ODBC open.
+		if ch == '}' && braceDepth > 0 {
+			braceDepth--
+			i++
+			continue
+		}
+		result = append(result, ch)
+		i++
+	}
+	return string(result)
 }
 
 // rewriteMidToSubstring rewrites MID( function calls to SUBSTRING( since

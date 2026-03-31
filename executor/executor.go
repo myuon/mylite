@@ -1740,20 +1740,56 @@ func isKnownCharset(name string) bool {
 }
 
 // isKnownCollation returns true if the collation name is a valid MySQL collation.
-// This is a simplified check that accepts any collation name that starts with a known charset prefix.
 func isKnownCollation(name string) bool {
 	name = strings.ToLower(name)
-	for _, cs := range allCharsets() {
-		csName := strings.ToLower(cs[0].(string))
-		if strings.HasPrefix(name, csName+"_") || name == csName {
+	for _, coll := range allCollations() {
+		if strings.ToLower(coll[0].(string)) == name {
 			return true
 		}
 	}
-	// Also check utf8mb3_ prefix
+	// Also accept utf8mb3_ prefix mapped to utf8_
 	if strings.HasPrefix(name, "utf8mb3_") {
-		return true
+		mapped := "utf8_" + strings.TrimPrefix(name, "utf8mb3_")
+		for _, coll := range allCollations() {
+			if strings.ToLower(coll[0].(string)) == mapped {
+				return true
+			}
+		}
 	}
 	return false
+}
+
+// resolveCollationID resolves a numeric collation ID to the collation name.
+func resolveCollationID(id int64) (string, bool) {
+	for _, row := range allCollations() {
+		if row[2].(int64) == id {
+			return row[0].(string), true
+		}
+	}
+	return "", false
+}
+
+// resolveCharsetID resolves a numeric charset ID to the charset name.
+// MySQL resolves charset numeric IDs by finding the collation with that ID
+// and returning its associated charset.
+func resolveCharsetID(id int64) (string, bool) {
+	for _, row := range allCollations() {
+		if row[2].(int64) == id {
+			return row[1].(string), true
+		}
+	}
+	return "", false
+}
+
+// charsetForCollation returns the charset associated with a collation name.
+func charsetForCollation(collation string) string {
+	collation = strings.ToLower(collation)
+	for _, row := range allCollations() {
+		if strings.ToLower(row[0].(string)) == collation {
+			return row[1].(string)
+		}
+	}
+	return ""
 }
 
 func matchLike(s, pattern string) bool {
@@ -2869,7 +2905,9 @@ func isIdentChar(b byte) bool {
 // normalizeCreateTableEngineSelect strips table options (ENGINE=, CHARSET=, etc.)
 // between the table name and SELECT clause in CREATE TABLE statements so the
 // normalizeCreateTableParenSelect rewrites CREATE TABLE t (SELECT ...) ORDER BY ...
-// into CREATE TABLE t SELECT ... so the vitess parser can handle it.
+// into CREATE TABLE t SELECT ... ORDER BY ... so the vitess parser can handle it.
+// When an outer ORDER BY is present, the inner ORDER BY is dropped since the
+// outer one takes precedence in MySQL.
 func normalizeCreateTableParenSelect(query string) string {
 	upper := strings.ToUpper(strings.TrimSpace(query))
 	if !strings.HasPrefix(upper, "CREATE TABLE") && !strings.HasPrefix(upper, "CREATE TEMPORARY TABLE") {
@@ -2917,7 +2955,40 @@ func normalizeCreateTableParenSelect(query string) string {
 		}
 		innerSelect := strings.TrimSpace(trimmed[i+1 : k-1])
 		prefix := trimmed[:i]
-		return strings.TrimSpace(prefix) + " " + innerSelect
+		suffix := strings.TrimSpace(trimmed[k:])
+
+		// If there is an outer ORDER BY, strip the inner ORDER BY
+		if len(suffix) > 0 && strings.HasPrefix(strings.ToUpper(suffix), "ORDER BY") {
+			upperInner := strings.ToUpper(innerSelect)
+			lastOB := -1
+			d := 0
+			for m := 0; m < len(innerSelect)-7; m++ {
+				switch innerSelect[m] {
+				case '(':
+					d++
+				case ')':
+					d--
+				case '\'':
+					for m++; m < len(innerSelect) && innerSelect[m] != '\''; m++ {
+						if innerSelect[m] == '\\' {
+							m++
+						}
+					}
+				}
+				if d == 0 && strings.HasPrefix(upperInner[m:], "ORDER BY") {
+					lastOB = m
+				}
+			}
+			if lastOB > 0 {
+				innerSelect = strings.TrimSpace(innerSelect[:lastOB])
+			}
+		}
+
+		result := strings.TrimSpace(prefix) + " " + innerSelect
+		if len(suffix) > 0 {
+			result += " " + suffix
+		}
+		return result
 	}
 	return query
 }

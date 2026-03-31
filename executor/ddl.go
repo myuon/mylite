@@ -115,6 +115,13 @@ func (e *Executor) execCreateDatabase(stmt *sqlparser.CreateDatabase) (*Result, 
 			collation = opt.Value
 		}
 	}
+	// If no explicit charset, use the session-level character_set_server
+	if charset == "" {
+		if csVal, ok := e.getSysVarSession("character_set_server"); ok {
+			charset = csVal
+		}
+		// Fall through to catalog default (utf8mb4) if session value not set
+	}
 	// Validate collation is compatible with charset (ER_COLLATION_CHARSET_MISMATCH = 1253)
 	if charset != "" && collation != "" {
 		if collCharset, ok := catalog.CharsetForCollation(collation); ok {
@@ -1100,6 +1107,16 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			def.StatsPersistent = parseTableOptionInt(opt)
 		case "STATS_AUTO_RECALC":
 			def.StatsAutoRecalc = parseTableOptionInt(opt)
+		case "STATS_SAMPLE_PAGES":
+			def.StatsSamplePages = parseTableOptionInt(opt)
+		case "INSERT_METHOD":
+			def.InsertMethod = strings.ToUpper(tableOptionString(opt))
+		case "UNION":
+			if opt.Tables != nil {
+				for _, tn := range opt.Tables {
+					def.UnionTables = append(def.UnionTables, tn.Name.String())
+				}
+			}
 		case "TABLESPACE":
 			tablespaceName = strings.ToLower(strings.Trim(strings.TrimSpace(optVal), "`'\""))
 		case "DATA DIRECTORY":
@@ -2149,6 +2166,16 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					tableDef, _ := db.GetTable(tableName)
 					if tableDef != nil {
 						tableDef.StatsAutoRecalc = parseTableOptionInt(to)
+					}
+				case "STATS_SAMPLE_PAGES":
+					tableDef, _ := db.GetTable(tableName)
+					if tableDef != nil {
+						tableDef.StatsSamplePages = parseTableOptionInt(to)
+					}
+				case "INSERT_METHOD":
+					tableDef, _ := db.GetTable(tableName)
+					if tableDef != nil {
+						tableDef.InsertMethod = strings.ToUpper(tableOptionString(to))
 					}
 				}
 			}

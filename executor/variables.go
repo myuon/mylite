@@ -200,11 +200,9 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
 			}
 		case "character_set_client", "character_set_connection", "character_set_results",
-			"character_set_filesystem", "character_set_server", "character_set_database",
-			"collation_connection", "collation_server", "collation_database":
+			"character_set_filesystem", "character_set_server", "character_set_database":
 			isGlobal := scope == sqlparser.GlobalScope
 			if strings.ToUpper(val) == "DEFAULT" {
-				// DEFAULT for session means current global value, or compiled default if no global override.
 				if isGlobal {
 					e.deleteSysVar(name, true)
 				} else {
@@ -215,7 +213,72 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					}
 				}
 			} else {
-				e.setSysVar(name, strings.ToLower(val), isGlobal)
+				csVal := strings.ToLower(val)
+				// Float values are an incorrect argument type
+				if strings.ContainsAny(csVal, ".eE") {
+					if _, fErr := strconv.ParseFloat(csVal, 64); fErr == nil {
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+					}
+				}
+				// Resolve numeric charset ID to name
+				if id, err := strconv.ParseInt(csVal, 10, 64); err == nil {
+					if csName, ok := resolveCharsetID(id); ok {
+						csVal = csName
+					} else {
+						return nil, mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", truncateErrVal(val)))
+					}
+				}
+				// Normalize utf8mb3 alias
+				if csVal == "utf8mb3" {
+					csVal = "utf8"
+				}
+				// Validate charset name
+				if !isKnownCharset(csVal) {
+					return nil, mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", truncateErrVal(val)))
+				}
+				// Reject non-client-safe charsets for character_set_client and character_set_connection
+				if (name == "character_set_client" || name == "character_set_connection") && isNonClientCharset(csVal) {
+					return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", name, csVal))
+				}
+				e.setSysVar(name, csVal, isGlobal)
+			}
+		case "collation_connection", "collation_server", "collation_database":
+			isGlobal := scope == sqlparser.GlobalScope
+			if strings.ToUpper(val) == "DEFAULT" {
+				if isGlobal {
+					e.deleteSysVar(name, true)
+				} else {
+					if gv, ok := e.globalScopeVars[name]; ok {
+						e.sessionScopeVars[name] = gv
+					} else {
+						delete(e.sessionScopeVars, name)
+					}
+				}
+			} else {
+				collVal := strings.ToLower(val)
+				// Float values are an incorrect argument type
+				if strings.ContainsAny(collVal, ".eE") {
+					if _, fErr := strconv.ParseFloat(collVal, 64); fErr == nil {
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+					}
+				}
+				// Resolve numeric collation ID to name
+				if id, err := strconv.ParseInt(collVal, 10, 64); err == nil {
+					if collName, ok := resolveCollationID(id); ok {
+						collVal = collName
+					} else {
+						return nil, mysqlError(1273, "HY000", fmt.Sprintf("Unknown collation: '%s'", truncateErrVal(val)))
+					}
+				}
+				// Normalize utf8mb3_ prefix
+				if strings.HasPrefix(collVal, "utf8mb3_") {
+					collVal = "utf8_" + strings.TrimPrefix(collVal, "utf8mb3_")
+				}
+				// Validate collation name
+				if !isKnownCollation(collVal) {
+					return nil, mysqlError(1273, "HY000", fmt.Sprintf("Unknown collation: '%s'", truncateErrVal(val)))
+				}
+				e.setSysVar(name, collVal, isGlobal)
 			}
 		default:
 			// Store any SET GLOBAL/SESSION variable for later retrieval
@@ -870,6 +933,51 @@ func (e *Executor) handleRawSet(raw string) error {
 			}
 			val = normalizeEngineName(val)
 		}
+		// Resolve numeric IDs and validate charset/collation variables
+		if isCharsetVar(varName) {
+			csVal := strings.ToLower(val)
+			if strings.ContainsAny(csVal, ".eE") {
+				if _, fErr := strconv.ParseFloat(csVal, 64); fErr == nil {
+					return mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", varName))
+				}
+			}
+			if id, parseErr := strconv.ParseInt(csVal, 10, 64); parseErr == nil {
+				if csName, ok := resolveCharsetID(id); ok {
+					val = csName
+				} else {
+					return mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", truncateErrVal(val)))
+				}
+			} else {
+				if csVal == "utf8mb3" {
+					val = "utf8"
+				}
+				if csVal != "default" && !isKnownCharset(csVal) {
+					return mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", truncateErrVal(val)))
+				}
+			}
+		}
+		if isCollationVar(varName) {
+			collVal := strings.ToLower(val)
+			if strings.ContainsAny(collVal, ".eE") {
+				if _, fErr := strconv.ParseFloat(collVal, 64); fErr == nil {
+					return mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", varName))
+				}
+			}
+			if id, parseErr := strconv.ParseInt(collVal, 10, 64); parseErr == nil {
+				if collName, ok := resolveCollationID(id); ok {
+					val = collName
+				} else {
+					return mysqlError(1273, "HY000", fmt.Sprintf("Unknown collation: '%s'", truncateErrVal(val)))
+				}
+			} else {
+				if strings.HasPrefix(collVal, "utf8mb3_") {
+					val = "utf8_" + strings.TrimPrefix(collVal, "utf8mb3_")
+				}
+				if collVal != "default" && !isKnownCollation(collVal) {
+					return mysqlError(1273, "HY000", fmt.Sprintf("Unknown collation: '%s'", truncateErrVal(val)))
+				}
+			}
+		}
 		if strings.ToUpper(val) != "DEFAULT" {
 			e.setSysVar(varName, val, isGlobalScope)
 		} else {
@@ -1420,6 +1528,53 @@ var sysVarStringType = map[string]bool{
 	"block_encryption_mode":          true,
 	"lc_messages":                    true,
 	"lc_time_names":                  true,
+	"character_set_client":           true,
+	"character_set_connection":       true,
+	// Note: character_set_results is NOT here because MySQL allows NULL
+	// (NULL means "don't convert results")
+	"character_set_filesystem":       true,
+	"character_set_server":           true,
+	"character_set_database":         true,
+	"collation_connection":           true,
+	"collation_server":               true,
+	"collation_database":             true,
+}
+
+// truncateErrVal truncates a value to 64 characters for MySQL error messages.
+func truncateErrVal(val string) string {
+	if len(val) > 64 {
+		return val[:64]
+	}
+	return val
+}
+
+// isNonClientCharset returns true for charsets that cannot be used as client charsets.
+// These are multi-byte-only charsets that can't represent ASCII in a single byte.
+func isNonClientCharset(name string) bool {
+	switch strings.ToLower(name) {
+	case "ucs2", "utf16", "utf16le", "utf32":
+		return true
+	}
+	return false
+}
+
+// isCharsetVar returns true if the variable name is a character_set_* variable.
+func isCharsetVar(name string) bool {
+	switch name {
+	case "character_set_client", "character_set_connection", "character_set_results",
+		"character_set_filesystem", "character_set_server", "character_set_database":
+		return true
+	}
+	return false
+}
+
+// isCollationVar returns true if the variable name is a collation_* variable.
+func isCollationVar(name string) bool {
+	switch name {
+	case "collation_connection", "collation_server", "collation_database":
+		return true
+	}
+	return false
 }
 
 // sysVarEnumValues maps numeric/string assignments to canonical enum names.

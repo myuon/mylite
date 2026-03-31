@@ -3515,7 +3515,8 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 				// (needed for information_schema columns which are UPPERCASE).
 				// Prefer exact case match to avoid non-deterministic map iteration.
 				// Only apply to information_schema rows (marked with __is_info_schema__),
-				// not performance_schema rows where MySQL preserves user's casing.
+				// not performance_schema rows or InnoDB IS tables where MySQL
+				// preserves user's casing.
 				if len(rows) > 0 {
 					_, isIS := rows[0]["__is_info_schema__"]
 					_, preserveCase := rows[0]["__ps_preserve_col_case__"]
@@ -3534,31 +3535,41 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 						}
 					}
 				} else {
-					// Even with no rows, resolve column name from table definition first
-					resolved := false
-					upperName := strings.ToUpper(name)
+					// Even with no rows, resolve column name from table definition first.
+					// Skip for InnoDB IS tables which preserve user's column casing.
+					isInnoDBISTable := false
 					for _, td := range tableDefs {
-						if td == nil {
-							continue
-						}
-						for _, col := range td.Columns {
-							if strings.ToUpper(col.Name) == upperName {
-								name = col.Name
-								resolved = true
-								break
-							}
-						}
-						if resolved {
+						if td != nil && strings.HasPrefix(strings.ToLower(td.Name), "innodb_") {
+							isInnoDBISTable = true
 							break
 						}
 					}
-					// Fall back to information_schema column names only if not resolved
-					if !resolved {
-						for _, order := range infoSchemaColumnOrder {
-							for _, col := range order {
-								if col == upperName {
-									name = col
+					if !isInnoDBISTable {
+						resolved := false
+						upperName := strings.ToUpper(name)
+						for _, td := range tableDefs {
+							if td == nil {
+								continue
+							}
+							for _, col := range td.Columns {
+								if strings.ToUpper(col.Name) == upperName {
+									name = col.Name
+									resolved = true
 									break
+								}
+							}
+							if resolved {
+								break
+							}
+						}
+						// Fall back to information_schema column names only if not resolved
+						if !resolved {
+							for _, order := range infoSchemaColumnOrder {
+								for _, col := range order {
+									if col == upperName {
+										name = col
+										break
+									}
 								}
 							}
 						}

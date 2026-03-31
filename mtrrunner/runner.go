@@ -3735,6 +3735,9 @@ func normalizeOutput(s string) string {
 	// Normalize deprecation warnings in output:
 	// Strip lines like "ERROR 01000: '@@var' is deprecated and will be removed..."
 	out = normalizeDeprecationWarnings(out)
+	// Normalize charset/collation error messages: truncate long names to 64 chars
+	// and lowercase charset/collation names in error messages for consistent comparison.
+	out = normalizeCharsetErrors(out)
 	// Normalize invalid UTF-8 bytes to '?' to match MySQL behavior:
 	// MySQL displays non-UTF8 bytes (e.g. latin1 characters) as '?' in
 	// SHOW CREATE TABLE output depending on connection charset. Since mylite
@@ -3808,6 +3811,38 @@ func normalizeFunctionNameCase(s string) string {
 		"LTRIM", "RTRIM", "RIGHT", "RPAD", "LPAD",
 		"TRIM", "LEFT",
 		"HEX", "IF",
+		// Spatial functions (normalize case for comparison)
+		"ST_ASTEXT", "ST_ASWKT", "ST_ASBINARY", "ST_ASWKB",
+		"ST_GEOMFROMTEXT", "ST_GEOMFROMWKB",
+		"ST_POINTFROMTEXT", "ST_LINEFROMTEXT", "ST_POLYFROMTEXT",
+		"ST_MULTIPOINTFROMTEXT", "ST_MULTILINESTRINGFROMTEXT", "ST_MULTIPOLYGONFROMTEXT",
+		"ST_GEOMCOLLFROMTEXT", "ST_GEOMETRYFROMTEXT",
+		"ST_POINTFROMWKB", "ST_LINEFROMWKB", "ST_POLYFROMWKB",
+		"ST_MULTIPOINTFROMWKB", "ST_MULTILINESTRINGFROMWKB", "ST_MULTIPOLYGONFROMWKB",
+		"ST_GEOMCOLLFROMWKB", "ST_GEOMETRYFROMWKB",
+		"ST_SRID", "ST_ISVALID", "ST_VALIDATE",
+		"ST_DISTANCE", "ST_DISTANCE_SPHERE",
+		"ST_CONTAINS", "ST_WITHIN", "ST_INTERSECTS",
+		"ST_DISJOINT", "ST_TOUCHES", "ST_OVERLAPS", "ST_CROSSES",
+		"ST_EQUALS",
+		"ST_UNION", "ST_INTERSECTION", "ST_DIFFERENCE", "ST_SYMDIFFERENCE",
+		"ST_BUFFER", "ST_BUFFER_STRATEGY", "ST_CONVEXHULL",
+		"ST_SIMPLIFY", "ST_TRANSFORM", "ST_SWAPXY",
+		"ST_MAKEENVELOPE", "ST_GEOMCOLLECTION",
+		"ST_X", "ST_Y", "ST_LATITUDE", "ST_LONGITUDE",
+		"ST_DIMENSION", "ST_ENVELOPE", "ST_GEOMETRYTYPE",
+		"ST_NUMGEOMETRIES", "ST_GEOMETRYN",
+		"ST_NUMPOINTS", "ST_POINTN",
+		"ST_STARTPOINT", "ST_ENDPOINT",
+		"ST_EXTERIORRING", "ST_INTERIORRINGN", "ST_NUMINTERIORRINGS",
+		"ST_AREA", "ST_LENGTH", "ST_CENTROID",
+		"ST_ISCLOSED", "ST_ISEMPTY", "ST_ISSIMPLE",
+		"MBRCONTAINS", "MBRWITHIN", "MBRINTERSECTS",
+		"MBRDISJOINT", "MBRTOUCHES", "MBROVERLAPS",
+		"MBREQUALS", "MBRCOVERS", "MBRCOVEREDBY",
+		"GEOMETRYCOLLECTION",
+		"POINT", "LINESTRING", "POLYGON",
+		"MULTIPOINT", "MULTILINESTRING", "MULTIPOLYGON",
 	}
 	for _, fn := range funcNames {
 		target := fn + "("
@@ -4189,4 +4224,30 @@ func normalizeDeprecationWarnings(s string) string {
 		result = append(result, line)
 	}
 	return strings.Join(result, "\n")
+}
+
+// normalizeCharsetErrors normalizes charset/collation error messages:
+// 1. Truncates long charset/collation names in error messages to 64 chars
+// 2. Lowercases charset/collation names in "Unknown character set/collation" errors
+var charsetErrRe = regexp.MustCompile(`(Unknown character set: ')([^']+)(')`)
+var collationErrRe = regexp.MustCompile(`(Unknown collation: ')([^']+)(')`)
+
+func normalizeCharsetErrors(s string) string {
+	s = charsetErrRe.ReplaceAllStringFunc(s, func(m string) string {
+		parts := charsetErrRe.FindStringSubmatch(m)
+		val := strings.ToLower(parts[2])
+		if len(val) > 64 {
+			val = val[:64]
+		}
+		return parts[1] + val + parts[3]
+	})
+	s = collationErrRe.ReplaceAllStringFunc(s, func(m string) string {
+		parts := collationErrRe.FindStringSubmatch(m)
+		val := strings.ToLower(parts[2])
+		if len(val) > 64 {
+			val = val[:64]
+		}
+		return parts[1] + val + parts[3]
+	})
+	return s
 }

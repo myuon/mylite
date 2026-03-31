@@ -549,7 +549,18 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			if v, ok := e.getSysVar("sql_quote_show_create"); ok && (v == "OFF" || v == "0") {
 				quotedName = resolvedName
 			}
-			createSQL := fmt.Sprintf("CREATE DATABASE %s /*!40100 DEFAULT CHARACTER SET %s COLLATE %s */ /*!80016 DEFAULT ENCRYPTION='N' */", quotedName, charset, collation)
+			// Show COLLATE when charset is utf8mb4 (MySQL always shows it) or
+			// when collation differs from the charset's default collation.
+			var createSQL string
+			defaultCollation := catalog.DefaultCollationForCharset(charset)
+			if charset == "utf8mb4" || (collation != "" && collation != defaultCollation) {
+				if collation == "" {
+					collation = defaultCollation
+				}
+				createSQL = fmt.Sprintf("CREATE DATABASE %s /*!40100 DEFAULT CHARACTER SET %s COLLATE %s */ /*!80016 DEFAULT ENCRYPTION='N' */", quotedName, charset, collation)
+			} else {
+				createSQL = fmt.Sprintf("CREATE DATABASE %s /*!40100 DEFAULT CHARACTER SET %s */ /*!80016 DEFAULT ENCRYPTION='N' */", quotedName, charset)
+			}
 			return &Result{
 				Columns:     []string{"Database", "Create Database"},
 				Rows:        [][]interface{}{{resolvedName, createSQL}},
@@ -1558,6 +1569,19 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	}
 	if def.StatsAutoRecalc != nil {
 		trailer += fmt.Sprintf(" STATS_AUTO_RECALC=%d", *def.StatsAutoRecalc)
+	}
+	if def.StatsSamplePages != nil {
+		trailer += fmt.Sprintf(" STATS_SAMPLE_PAGES=%d", *def.StatsSamplePages)
+	}
+	if def.InsertMethod != "" {
+		trailer += fmt.Sprintf(" INSERT_METHOD=%s", def.InsertMethod)
+	}
+	if len(def.UnionTables) > 0 {
+		quotedTables := make([]string, len(def.UnionTables))
+		for i, t := range def.UnionTables {
+			quotedTables[i] = "`" + t + "`"
+		}
+		trailer += fmt.Sprintf(" UNION=(%s)", strings.Join(quotedTables, ","))
 	}
 	b.WriteString(trailer)
 

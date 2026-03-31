@@ -794,13 +794,18 @@ applyAlias:
 	// Determine if this is a performance_schema table (columns use user casing, not uppercase)
 	isPerfSchema := strings.Contains(strings.ToLower(alias), "performance_schema")
 
+	// InnoDB INFORMATION_SCHEMA tables (innodb_*) also preserve user-specified
+	// column casing in SELECT headers, matching MySQL 8.0 behavior where these
+	// are data dictionary tables rather than system views.
+	isInnoDBTable := strings.HasPrefix(strings.ToLower(tableName), "innodb_")
+
 	result := make([]storage.Row, len(rawRows))
 	for i, row := range rawRows {
 		newRow := make(storage.Row, len(row)*3+1)
 		// Mark row as INFORMATION_SCHEMA for case-insensitive WHERE comparison
 		newRow["__is_info_schema__"] = true
-		// Performance_schema tables preserve user-specified column casing in SELECT
-		if isPerfSchema {
+		// Performance_schema and InnoDB IS tables preserve user-specified column casing in SELECT
+		if isPerfSchema || isInnoDBTable {
 			newRow["__ps_preserve_col_case__"] = true
 		}
 		for k, v := range row {

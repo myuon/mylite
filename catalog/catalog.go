@@ -50,6 +50,8 @@ type TableDef struct {
 	StatsPersistent  *int
 	StatsAutoRecalc  *int
 	StatsSamplePages *int
+	InsertMethod     string   // INSERT_METHOD for MERGE tables: "NO", "FIRST", "LAST"
+	UnionTables      []string // UNION=(t1,t2,...) for MERGE tables
 	CheckConstraints  []CheckConstraint // CHECK constraint definitions
 	ForeignKeys       []ForeignKeyDef    // FOREIGN KEY constraint definitions
 	PartitionType     string             // "RANGE", "LIST", "HASH", "KEY" or "" for non-partitioned
