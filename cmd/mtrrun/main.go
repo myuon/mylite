@@ -4,7 +4,13 @@
 //	mtrrun [flags] [suite] [testname]
 //	mtrrun [flags] <path/to/test.test>
 //
-// If no suite is specified, runs all suites.
+// Flags:
+//
+//	-suite  Run only specified suite(s), comma-separated (e.g. -suite sys_vars,innodb)
+//	-test   Run only specified test(s) in suite/testname format, comma-separated
+//	        (e.g. -test sys_vars/gtid_owned_basic,other/bool)
+//
+// If no suite is specified, runs all enabled suites.
 package main
 import (
 	"context"
@@ -66,11 +72,13 @@ func main() {
 	maxTests := flag.Int("max", 0, "maximum number of tests to run per suite (0=all)")
 	jobs := flag.Int("j", 0, "number of parallel test workers (0=auto, 1=sequential)")
 	timeout := flag.Duration("timeout", 20*time.Second, "timeout per test (0=no timeout)")
+	suiteFilter := flag.String("suite", "", "run only specified suite(s), comma-separated (e.g. sys_vars,innodb)")
+	testFilter := flag.String("test", "", "run only specified test(s), comma-separated in suite/testname format (e.g. sys_vars/gtid_owned_basic,other/bool)")
 	flag.Parse()
 	args := flag.Args()
-	// No args: run all suites
+	// No args: run all suites (with optional -suite/-test filtering)
 	if len(args) == 0 {
-		runAllSuites(*suiteRoot, *includeRoot, *verbose, *maxTests, *jobs, *timeout)
+		runAllSuites(*suiteRoot, *includeRoot, *verbose, *maxTests, *jobs, *timeout, *suiteFilter, *testFilter)
 		return
 	}
 	target := args[0]
@@ -80,19 +88,57 @@ func main() {
 		return
 	}
 	// Specific test within suite?
-	testFilter := ""
+	var argTestFilter map[string]bool
 	if len(args) > 1 {
-		testFilter = args[1]
+		argTestFilter = map[string]bool{args[1]: true}
 	}
-	results := runSuite(target, testFilter, *suiteRoot, *includeRoot, *verbose, *maxTests, *jobs, *timeout)
+	results := runSuite(target, argTestFilter, *suiteRoot, *includeRoot, *verbose, *maxTests, *jobs, *timeout)
 	printSuiteSummary(target, results)
 	if hasFailures(results) {
 		os.Exit(1)
 	}
 }
 // runAllSuites discovers and runs all test suites sequentially.
-func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs int, timeout time.Duration) {
+// suiteFilter: comma-separated suite names to run (empty=all enabled).
+// testFilterStr: comma-separated "suite/testname" pairs to run (empty=all).
+func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs int, timeout time.Duration, suiteFilter, testFilterStr string) {
 	start := time.Now()
+
+	// Parse -test flag into per-suite test name sets, and collect implied suites.
+	testsBySuite := map[string]map[string]bool{}
+	if testFilterStr != "" {
+		for _, t := range strings.Split(testFilterStr, ",") {
+			t = strings.TrimSpace(t)
+			if t == "" {
+				continue
+			}
+			parts := strings.SplitN(t, "/", 2)
+			if len(parts) != 2 {
+				log.Fatalf("-test value %q must be in suite/testname format", t)
+			}
+			suite, name := parts[0], parts[1]
+			if testsBySuite[suite] == nil {
+				testsBySuite[suite] = map[string]bool{}
+			}
+			testsBySuite[suite][name] = true
+		}
+	}
+
+	// Parse -suite flag into a set.
+	suiteFilterSet := map[string]bool{}
+	if suiteFilter != "" {
+		for _, s := range strings.Split(suiteFilter, ",") {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				suiteFilterSet[s] = true
+			}
+		}
+	}
+	// -test implies the suites of those tests.
+	for s := range testsBySuite {
+		suiteFilterSet[s] = true
+	}
+
 	entries, err := os.ReadDir(suiteRoot)
 	if err != nil {
 		log.Fatalf("cannot read suite root: %v", err)
@@ -140,7 +186,12 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 		if !e.IsDir() {
 			continue
 		}
-		if len(enabledSuites) > 0 && !enabledSuites[e.Name()] {
+		// When -suite or -test is specified, only run matching suites (skip enabledSuites whitelist).
+		if len(suiteFilterSet) > 0 {
+			if !suiteFilterSet[e.Name()] {
+				continue
+			}
+		} else if len(enabledSuites) > 0 && !enabledSuites[e.Name()] {
 			continue
 		}
 		testDir := filepath.Join(suiteRoot, e.Name(), "t")
@@ -151,7 +202,7 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 	var totalPassed, totalFailed, totalSkipped, totalErrors, totalTimeouts, totalTests int
 	for _, sn := range suiteNames {
 		fmt.Fprintf(os.Stderr, "[%s] starting suite %s...\n", time.Now().Format("15:04:05"), sn)
-		results := runSuite(sn, "", suiteRoot, includeRoot, verbose, maxTests, jobs, timeout)
+		results := runSuite(sn, testsBySuite[sn], suiteRoot, includeRoot, verbose, maxTests, jobs, timeout)
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
 		fmt.Fprintf(os.Stderr, "[%s] finished suite %s (%d tests) goroutines=%d heap=%.0fMB\n",
@@ -187,7 +238,8 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 	}
 }
 // runSuite runs all tests in a single suite and returns results.
-func runSuite(suiteName, testFilter, suiteRoot, includeRoot string, verbose bool, maxTests, jobs int, timeout time.Duration) []mtrrunner.TestResult {
+// testFilter: if non-nil, only run tests whose names are in this set.
+func runSuite(suiteName string, testFilter map[string]bool, suiteRoot, includeRoot string, verbose bool, maxTests, jobs int, timeout time.Duration) []mtrrunner.TestResult {
 	suiteDir := filepath.Join(suiteRoot, suiteName)
 	if _, err := os.Stat(suiteDir); os.IsNotExist(err) {
 		log.Fatalf("suite directory not found: %s", suiteDir)
@@ -218,7 +270,7 @@ func runSuite(suiteName, testFilter, suiteRoot, includeRoot string, verbose bool
 			continue
 		}
 		testName := strings.TrimSuffix(entry.Name(), ".test")
-		if testFilter != "" && testName != testFilter {
+		if testFilter != nil && !testFilter[testName] {
 			continue
 		}
 		if skipTests[suiteName+"/"+testName] {
