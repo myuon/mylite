@@ -1135,6 +1135,13 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				if err := validateNoFromTopLevelColRefs(se.Expr); err != nil {
 					return nil, err
 				}
+				// Also check for bare column references inside aggregate function args.
+				// MySQL returns "Unknown column" for bare names in no-FROM queries
+				// even inside COUNT(), SUM() etc., and this must take priority over
+				// scope errors (e.g., @@GLOBAL.session_only_var).
+				if err := validateNoFromExprRefs(se.Expr); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}

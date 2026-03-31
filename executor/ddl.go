@@ -218,6 +218,10 @@ func (e *Executor) execCreateDatabaseRaw(query string) (*Result, error) {
 	csIdx := strings.Index(fullUpper, "CHARACTER SET ")
 	if csIdx >= 0 {
 		afterCS := strings.TrimSpace(fullUpper[csIdx+len("CHARACTER SET "):])
+		// Skip optional '=' after CHARACTER SET
+		afterCS = strings.TrimPrefix(afterCS, "= ")
+		afterCS = strings.TrimPrefix(afterCS, "=")
+		afterCS = strings.TrimSpace(afterCS)
 		csFields := strings.Fields(afterCS)
 		if len(csFields) > 0 {
 			charset = strings.ToLower(csFields[0])
@@ -226,6 +230,10 @@ func (e *Executor) execCreateDatabaseRaw(query string) (*Result, error) {
 	collIdx := strings.Index(fullUpper, "COLLATE ")
 	if collIdx >= 0 {
 		afterColl := strings.TrimSpace(fullUpper[collIdx+len("COLLATE "):])
+		// Skip optional '=' after COLLATE
+		afterColl = strings.TrimPrefix(afterColl, "= ")
+		afterColl = strings.TrimPrefix(afterColl, "=")
+		afterColl = strings.TrimSpace(afterColl)
 		collFields := strings.Fields(afterColl)
 		if len(collFields) > 0 {
 			collation = strings.ToLower(collFields[0])
@@ -292,6 +300,9 @@ func (e *Executor) execAlterDatabaseRaw(query string) (*Result, error) {
 	csIdx := strings.Index(restUpper, "CHARACTER SET ")
 	if csIdx >= 0 {
 		afterCS := strings.TrimSpace(restUpper[csIdx+len("CHARACTER SET "):])
+		afterCS = strings.TrimPrefix(afterCS, "= ")
+		afterCS = strings.TrimPrefix(afterCS, "=")
+		afterCS = strings.TrimSpace(afterCS)
 		csFields := strings.Fields(afterCS)
 		if len(csFields) > 0 {
 			charset := strings.ToLower(csFields[0])
@@ -303,6 +314,9 @@ func (e *Executor) execAlterDatabaseRaw(query string) (*Result, error) {
 	collIdx := strings.Index(restUpper, "COLLATE ")
 	if collIdx >= 0 {
 		afterColl := strings.TrimSpace(restUpper[collIdx+len("COLLATE "):])
+		afterColl = strings.TrimPrefix(afterColl, "= ")
+		afterColl = strings.TrimPrefix(afterColl, "=")
+		afterColl = strings.TrimSpace(afterColl)
 		collFields := strings.Fields(afterColl)
 		if len(collFields) > 0 {
 			collation := strings.ToLower(collFields[0])
@@ -544,7 +558,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			}
 		}
 		engineUpper := strings.ToUpper(engine)
-		if engineUpper == "MEMORY" || engineUpper == "MERGE" || engineUpper == "MRG_MYISAM" {
+		// FEDERATED is compiled in but disabled
+		if engineUpper == "FEDERATED" {
+			return nil, mysqlError(1286, "42000", fmt.Sprintf("Unknown storage engine '%s'", engine))
+		}
+		if engineUpper == "MEMORY" || engineUpper == "MERGE" || engineUpper == "MRG_MYISAM" || engineUpper == "BLACKHOLE" {
 			for _, col := range stmt.TableSpec.Columns {
 				if col.Type.Options != nil && col.Type.Options.As != nil {
 					return nil, mysqlError(3106, "HY000", "'Specified storage engine' is not supported for generated columns.")
@@ -1405,23 +1423,26 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		return nil, mysqlError(1580, "HY000", "You cannot 'ALTER' a log table if logging is enabled")
 	}
 
-	// Check engine restrictions for log tables (even when logging is disabled)
-	if isMySQLLogTable(dbName, tableName) {
-		for _, opt := range stmt.AlterOptions {
-			if tblOpts, ok := opt.(sqlparser.TableOptions); ok {
-				for _, to := range tblOpts {
-					if strings.EqualFold(to.Name, "ENGINE") {
-						engineVal := strings.ToUpper(tableOptionString(to))
-						// Check if engine exists
-						switch engineVal {
-						case "INNODB", "MYISAM", "CSV", "ARCHIVE", "BLACKHOLE", "HEAP", "MEMORY",
-							"MERGE", "MRG_MYISAM", "FEDERATED", "NDB", "NDBCLUSTER", "EXAMPLE",
-							"PERFORMANCE_SCHEMA":
-							// Known engines - check if suitable for log tables
-						default:
-							return nil, mysqlError(1286, "42000", fmt.Sprintf("Unknown storage engine '%s'", tableOptionString(to)))
-						}
-						// MEMORY and similar engines cannot be used for log tables
+	// Check engine restrictions (disabled engines, unknown engines, log table constraints)
+	for _, opt := range stmt.AlterOptions {
+		if tblOpts, ok := opt.(sqlparser.TableOptions); ok {
+			for _, to := range tblOpts {
+				if strings.EqualFold(to.Name, "ENGINE") {
+					engineVal := strings.ToUpper(tableOptionString(to))
+					// Check if engine exists
+					switch engineVal {
+					case "INNODB", "MYISAM", "CSV", "ARCHIVE", "BLACKHOLE", "HEAP", "MEMORY",
+						"MERGE", "MRG_MYISAM", "NDB", "NDBCLUSTER", "EXAMPLE",
+						"PERFORMANCE_SCHEMA":
+						// Known engines
+					case "FEDERATED":
+						// FEDERATED is compiled in but disabled
+						return nil, mysqlError(1286, "42000", fmt.Sprintf("Unknown storage engine '%s'", tableOptionString(to)))
+					default:
+						return nil, mysqlError(1286, "42000", fmt.Sprintf("Unknown storage engine '%s'", tableOptionString(to)))
+					}
+					// MEMORY and similar engines cannot be used for log tables
+					if isMySQLLogTable(dbName, tableName) {
 						if engineVal == "MEMORY" || engineVal == "HEAP" {
 							return nil, mysqlError(1579, "HY000", "This storage engine cannot be used for log tables")
 						}
@@ -1556,7 +1577,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 							}
 						}
 					}
-					if tableEngine == "MEMORY" || tableEngine == "MERGE" || tableEngine == "MRG_MYISAM" {
+					if tableEngine == "MEMORY" || tableEngine == "MERGE" || tableEngine == "MRG_MYISAM" || tableEngine == "BLACKHOLE" {
 						return nil, mysqlError(3106, "HY000", "'Specified storage engine' is not supported for generated columns.")
 					}
 				}

@@ -290,6 +290,25 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					if err != nil {
 						return nil, err
 					}
+					// innodb_log_write_ahead_size must be a power of 2
+					if cleanName == "innodb_log_write_ahead_size" {
+						if n, parseErr := strconv.ParseUint(clamped, 10, 64); parseErr == nil && n > 0 {
+							// Check if n is a power of 2
+							if n&(n-1) != 0 {
+								// Round up to nearest power of 2
+								rounded := uint64(1)
+								for rounded < n {
+									rounded <<= 1
+								}
+								if rounded > 16384 {
+									rounded = 16384
+								}
+								e.addWarning("Warning", 1210, fmt.Sprintf("innodb_log_write_ahead_size should be set to power of 2, in range [512,16384]"))
+								e.addWarning("Warning", 1210, fmt.Sprintf("Setting innodb_log_write_ahead_size to %d", rounded))
+								clamped = strconv.FormatUint(rounded, 10)
+							}
+						}
+					}
 					e.sessionScopeVars[cleanName] = clamped
 					// When max_join_size is set, update sql_big_selects accordingly.
 					// Non-default value -> sql_big_selects = OFF; default -> ON.
@@ -1834,7 +1853,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"key_cache_division_limit":                   {Min: 1, Max: 100, IsUnsigned: true},
 	"log_error_verbosity":                        {Min: 1, Max: 3, IsUnsigned: true},
 	"log_throttle_queries_not_using_indexes":     {Min: 0, Max: 4294967295, IsUnsigned: true},
-	"long_query_time":                            {Min: 0, Max: 31536000, IsUnsigned: false},
+	// Note: long_query_time is a DOUBLE variable; handled separately (not in int range map).
 	"max_binlog_cache_size":                      {Min: 4096, Max: 18446744073709547520, IsUnsigned: true, BlockSize: 4096},
 	"max_binlog_size":                            {Min: 4096, Max: 1073741824, IsUnsigned: true, BlockSize: 4096},
 	"max_binlog_stmt_cache_size":                 {Min: 4096, Max: 18446744073709547520, IsUnsigned: true, BlockSize: 4096},
@@ -2262,7 +2281,13 @@ func normalizeBooleanSetValue(name string, expr sqlparser.Expr, evalVal interfac
 	case float32, float64:
 		return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
 	case string:
-		n, ok, typeErr := normalizeBooleanToken(v)
+		// When the value comes from a user variable, treat it as a quoted string
+		// (only "ON", "OFF", "0", "1" are valid, not "TRUE"/"FALSE").
+		checkVal := v
+		if _, isVar := expr.(*sqlparser.Variable); isVar {
+			checkVal = "'" + v + "'"
+		}
+		n, ok, typeErr := normalizeBooleanToken(checkVal)
 		if typeErr {
 			return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
 		}

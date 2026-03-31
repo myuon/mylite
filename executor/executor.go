@@ -405,6 +405,16 @@ func (e *Executor) getSysVarSession(name string) (string, bool) {
 	return "", false
 }
 
+// getDivPrecisionIncrement returns the current div_precision_increment value.
+func (e *Executor) getDivPrecisionIncrement() int {
+	if v, ok := e.getSysVar("div_precision_increment"); ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return 4 // default
+}
+
 // setSysVar stores a system variable in the appropriate scope map.
 func (e *Executor) setSysVar(name string, value string, isGlobal bool) {
 	// Trigger variables reset immediately after being set
@@ -7348,8 +7358,17 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 	switch val := v.(type) {
 	case int64:
 		intVal = val
+	case ScaledValue:
+		f := val.Value
+		if f > float64(maxVal) {
+			intVal = maxVal
+		} else if f < float64(minVal) {
+			intVal = minVal
+		} else {
+			intVal = int64(f)
+		}
 	case DivisionResult:
-		f := float64(val)
+		f := val.Value
 		if f > float64(maxVal) {
 			intVal = maxVal
 		} else if f < float64(minVal) {
@@ -9317,6 +9336,10 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 	if result, handled, err := evalSpatialFunc(e, name, v.Exprs); handled {
 		return result, err
 	}
+	// Try built-in sys schema functions
+	if result, handled, err := e.evalSysSchemaFunc(name, v.Exprs); handled {
+		return result, err
+	}
 	// Try user-defined function from catalog
 	qualifier := v.Qualifier.String()
 	if result, err := e.callUserDefinedFunction(name, v.Exprs, nil, qualifier); err == nil {
@@ -10082,16 +10105,56 @@ func (e *Executor) evalCaseExpr(v *sqlparser.CaseExpr) (interface{}, error) {
 // arithmetic works correctly (e.g. x'1000000000000000' - 1).
 type HexBytes string
 
+// ScaledValue wraps a float64 from multiplication/addition/subtraction
+// to preserve the decimal scale through the arithmetic chain.
+type ScaledValue struct {
+	Value float64
+	Scale int
+}
+
 // DivisionResult wraps a float64 that came from the / operator so the display
-// layer can format it with div_precision_increment (default 4) decimal places.
-type DivisionResult float64
+// layer can format it with div_precision_increment decimal places.
+type DivisionResult struct {
+	Value     float64
+	Precision int
+}
 
 func (d DivisionResult) String() string {
-	return fmt.Sprintf("%.4f", float64(d))
+	return fmt.Sprintf("%.*f", d.Precision, d.Value)
+}
+
+// valueScale returns the number of decimal digits in a value.
+// Used to compute division result precision per MySQL rules.
+func valueScale(v interface{}) int {
+	switch val := v.(type) {
+	case ScaledValue:
+		return val.Scale
+	case DivisionResult:
+		return val.Precision
+	case float64:
+		s := strconv.FormatFloat(val, 'f', -1, 64)
+		if idx := strings.Index(s, "."); idx >= 0 {
+			return len(s) - idx - 1
+		}
+		return 0
+	case float32:
+		s := strconv.FormatFloat(float64(val), 'f', -1, 32)
+		if idx := strings.Index(s, "."); idx >= 0 {
+			return len(s) - idx - 1
+		}
+		return 0
+	case string:
+		if idx := strings.Index(val, "."); idx >= 0 {
+			return len(val) - idx - 1
+		}
+		return 0
+	default:
+		return 0
+	}
 }
 
 // evalBinaryExpr evaluates arithmetic binary expressions.
-func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator) (interface{}, error) {
+func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator, divPrecision ...int) (interface{}, error) {
 	// MySQL arithmetic/bit operations with NULL yield NULL.
 	if left == nil || right == nil {
 		return nil, nil
@@ -10102,15 +10165,56 @@ func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator) (i
 	switch op {
 	case sqlparser.PlusOp:
 		result = lf + rf
+		// Preserve scale through addition for div_precision_increment
+		ls := valueScale(left)
+		rs := valueScale(right)
+		maxS := ls
+		if rs > maxS {
+			maxS = rs
+		}
+		if maxS > 0 {
+			return ScaledValue{Value: result, Scale: maxS}, nil
+		}
 	case sqlparser.MinusOp:
 		result = lf - rf
+		ls := valueScale(left)
+		rs := valueScale(right)
+		maxS := ls
+		if rs > maxS {
+			maxS = rs
+		}
+		if maxS > 0 {
+			return ScaledValue{Value: result, Scale: maxS}, nil
+		}
 	case sqlparser.MultOp:
 		result = lf * rf
+		// Preserve scale through multiplication for div_precision_increment
+		ls := valueScale(left)
+		rs := valueScale(right)
+		maxS := ls
+		if rs > maxS {
+			maxS = rs
+		}
+		if maxS > 0 {
+			return ScaledValue{Value: result, Scale: ls + rs}, nil
+		}
 	case sqlparser.DivOp:
 		if rf == 0 {
 			return nil, nil // MySQL returns NULL for division by zero
 		}
-		return DivisionResult(lf / rf), nil
+		divIncr := 4
+		if len(divPrecision) > 0 {
+			divIncr = divPrecision[0]
+		}
+		// MySQL computes result scale = max(left_scale, right_scale) + div_precision_increment
+		leftScale := valueScale(left)
+		rightScale := valueScale(right)
+		maxScale := leftScale
+		if rightScale > maxScale {
+			maxScale = rightScale
+		}
+		prec := maxScale + divIncr
+		return DivisionResult{Value: lf / rf, Precision: prec}, nil
 	case sqlparser.IntDivOp:
 		if rf == 0 {
 			return nil, nil
@@ -10162,8 +10266,10 @@ func toString(v interface{}) string {
 		return strconv.FormatInt(val, 10)
 	case float64:
 		return formatMySQLFloatString(val)
+	case ScaledValue:
+		return formatMySQLFloatString(val.Value)
 	case DivisionResult:
-		return fmt.Sprintf("%.4f", float64(val))
+		return fmt.Sprintf("%.*f", val.Precision, val.Value)
 	case bool:
 		if val {
 			return "1"
@@ -10211,8 +10317,10 @@ func toInt64(v interface{}) int64 {
 		return int64(n)
 	case float64:
 		return int64(n)
+	case ScaledValue:
+		return int64(n.Value)
 	case DivisionResult:
-		return int64(float64(n))
+		return int64(n.Value)
 	case HexBytes:
 		decoded, err := hex.DecodeString(string(n))
 		if err != nil || len(decoded) == 0 {
@@ -10251,7 +10359,7 @@ func toUint64(v interface{}) uint64 {
 	case float64:
 		return uint64(int64(n))
 	case DivisionResult:
-		return uint64(int64(float64(n)))
+		return uint64(int64(n.Value))
 	case HexBytes:
 		decoded, err := hex.DecodeString(string(n))
 		if err != nil || len(decoded) == 0 {
@@ -10300,8 +10408,10 @@ func isTruthy(v interface{}) bool {
 		return val != 0
 	case float64:
 		return val != 0
+	case ScaledValue:
+		return val.Value != 0
 	case DivisionResult:
-		return float64(val) != 0
+		return val.Value != 0
 	case string:
 		return val != "" && val != "0"
 	}
@@ -10415,7 +10525,7 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				return nil, err
 			}
 		}
-		return evalBinaryExpr(left, right, v.Operator)
+		return evalBinaryExpr(left, right, v.Operator, e.getDivPrecisionIncrement())
 	case *sqlparser.ComparisonExpr:
 		// Handle IN / NOT IN specially: right side is a ValTuple
 		if v.Operator == sqlparser.InOp || v.Operator == sqlparser.NotInOp {
@@ -10977,7 +11087,7 @@ func (e *Executor) evalBinaryExprWithRow(v *sqlparser.BinaryExpr, row storage.Ro
 	if err != nil {
 		return nil, err
 	}
-	return evalBinaryExpr(left, right, v.Operator)
+	return evalBinaryExpr(left, right, v.Operator, e.getDivPrecisionIncrement())
 }
 
 // evalCaseExprWithRow evaluates a CASE expression with row context.
@@ -11615,6 +11725,10 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 		return x != 0, nil
 	case float64:
 		return x != 0, nil
+	case ScaledValue:
+		return x.Value != 0, nil
+	case DivisionResult:
+		return x.Value != 0, nil
 	case string:
 		return strings.TrimSpace(x) != "" && x != "0", nil
 	default:
@@ -11780,11 +11894,11 @@ func shouldUseFloat32Equality(ls, rs string, origLeft, origRight interface{}) bo
 		return false
 	}
 	switch origLeft.(type) {
-	case float32, float64, DivisionResult:
+	case float32, float64, ScaledValue, DivisionResult:
 		return true
 	}
 	switch origRight.(type) {
-	case float32, float64, DivisionResult:
+	case float32, float64, ScaledValue, DivisionResult:
 		return true
 	}
 	_, leftIsString := origLeft.(string)
@@ -12672,8 +12786,10 @@ func toFloat(v interface{}) float64 {
 		return float64(n)
 	case float64:
 		return n
+	case ScaledValue:
+		return n.Value
 	case DivisionResult:
-		return float64(n)
+		return n.Value
 	case HexBytes:
 		// Interpret hex digits as big-endian unsigned integer.
 		decoded, err := hex.DecodeString(string(n))

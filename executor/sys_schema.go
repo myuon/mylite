@@ -1,6 +1,12 @@
 package executor
 
-import "github.com/myuon/mylite/catalog"
+import (
+	"fmt"
+	"strings"
+
+	"github.com/myuon/mylite/catalog"
+	"vitess.io/vitess/go/vt/sqlparser"
+)
 
 // initSysSchema populates the sys database with stub table/view definitions
 // so that DESC sys.<table> works and INFORMATION_SCHEMA.TABLES lists them.
@@ -1596,5 +1602,175 @@ func initSysSchema(db *catalog.Database) {
 
 func sysStrPtr(s string) *string {
 	return &s
+}
+
+// evalSysSchemaFunc evaluates built-in sys schema functions.
+// Returns (result, handled, error). If handled is false, the caller should try other dispatch paths.
+func (e *Executor) evalSysSchemaFunc(name string, args []sqlparser.Expr) (interface{}, bool, error) {
+	switch strings.ToLower(name) {
+	case "quote_identifier":
+		if len(args) < 1 {
+			return nil, true, nil
+		}
+		val, err := e.evalExpr(args[0])
+		if err != nil {
+			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
+		}
+		s := toString(val)
+		escaped := strings.ReplaceAll(s, "`", "``")
+		return "`" + escaped + "`", true, nil
+
+	case "format_bytes":
+		if len(args) < 1 {
+			return nil, true, nil
+		}
+		val, err := e.evalExpr(args[0])
+		if err != nil {
+			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
+		}
+		bytes := toFloat(val)
+		return sysFormatBytes(bytes), true, nil
+
+	case "format_time":
+		if len(args) < 1 {
+			return nil, true, nil
+		}
+		val, err := e.evalExpr(args[0])
+		if err != nil {
+			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
+		}
+		picos := toFloat(val)
+		return sysFormatTime(picos), true, nil
+
+	case "extract_schema_from_file_name":
+		if len(args) < 1 {
+			return nil, true, nil
+		}
+		val, err := e.evalExpr(args[0])
+		if err != nil {
+			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
+		}
+		s := toString(val)
+		parts := strings.Split(strings.ReplaceAll(s, "\\", "/"), "/")
+		if len(parts) >= 2 {
+			return parts[len(parts)-2], true, nil
+		}
+		return nil, true, nil
+
+	case "extract_table_from_file_name":
+		if len(args) < 1 {
+			return nil, true, nil
+		}
+		val, err := e.evalExpr(args[0])
+		if err != nil {
+			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
+		}
+		s := toString(val)
+		parts := strings.Split(strings.ReplaceAll(s, "\\", "/"), "/")
+		if len(parts) >= 1 {
+			tablePart := parts[len(parts)-1]
+			if idx := strings.LastIndex(tablePart, "."); idx >= 0 {
+				tablePart = tablePart[:idx]
+			}
+			return tablePart, true, nil
+		}
+		return nil, true, nil
+
+	case "version_major":
+		major, _, _ := e.parseMySQLVersion()
+		return int64(major), true, nil
+	case "version_minor":
+		_, minor, _ := e.parseMySQLVersion()
+		return int64(minor), true, nil
+	case "version_patch":
+		_, _, patch := e.parseMySQLVersion()
+		return int64(patch), true, nil
+
+	default:
+		return nil, false, nil
+	}
+}
+
+func (e *Executor) parseMySQLVersion() (int, int, int) {
+	ver, _ := e.getSysVar("version")
+	if ver == "" {
+		return 8, 4, 0
+	}
+	if idx := strings.IndexByte(ver, '-'); idx >= 0 {
+		ver = ver[:idx]
+	}
+	parts := strings.SplitN(ver, ".", 3)
+	var major, minor, patch int
+	if len(parts) >= 1 {
+		fmt.Sscanf(parts[0], "%d", &major)
+	}
+	if len(parts) >= 2 {
+		fmt.Sscanf(parts[1], "%d", &minor)
+	}
+	if len(parts) >= 3 {
+		fmt.Sscanf(parts[2], "%d", &patch)
+	}
+	return major, minor, patch
+}
+
+func sysFormatBytes(bytes float64) string {
+	if bytes < 0 {
+		return fmt.Sprintf("%.0f bytes", bytes)
+	}
+	units := []struct {
+		threshold float64
+		unit      string
+	}{
+		{1125899906842624, "PiB"},
+		{1099511627776, "TiB"},
+		{1073741824, "GiB"},
+		{1048576, "MiB"},
+		{1024, "KiB"},
+	}
+	for _, u := range units {
+		if bytes >= u.threshold {
+			return fmt.Sprintf("%.2f %s", bytes/u.threshold, u.unit)
+		}
+	}
+	return fmt.Sprintf("%.0f bytes", bytes)
+}
+
+func sysFormatTime(picos float64) string {
+	if picos < 0 {
+		return fmt.Sprintf("%.0f ps", picos)
+	}
+	units := []struct {
+		threshold float64
+		unit      string
+	}{
+		{86400000000000000, "d"},
+		{3600000000000000, "h"},
+		{60000000000000, "m"},
+		{1000000000000, "s"},
+		{1000000000, "ms"},
+		{1000000, "us"},
+		{1000, "ns"},
+	}
+	for _, u := range units {
+		if picos >= u.threshold {
+			return fmt.Sprintf("%.2f %s", picos/u.threshold, u.unit)
+		}
+	}
+	return fmt.Sprintf("%.0f ps", picos)
 }
 

@@ -515,7 +515,7 @@ func (e *Executor) evalBinaryOp(v *sqlparser.BinaryExpr) (interface{}, error) {
 			return nil, err
 		}
 	}
-	return evalBinaryExpr(left, right, v.Operator)
+	return evalBinaryExpr(left, right, v.Operator, e.getDivPrecisionIncrement())
 }
 
 // evalComparisonExpr handles *sqlparser.ComparisonExpr evaluation.

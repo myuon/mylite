@@ -411,8 +411,10 @@ func normalizeRows(rows [][]interface{}) [][]interface{} {
 				} else {
 					rows[i][j] = int64(0)
 				}
+			} else if sv, ok := val.(executor.ScaledValue); ok {
+				rows[i][j] = sv.Value
 			} else if d, ok := val.(executor.DivisionResult); ok {
-				rows[i][j] = fmt.Sprintf("%.4f", float64(d))
+				rows[i][j] = fmt.Sprintf("%.*f", d.Precision, d.Value)
 			} else if ev, ok := val.(executor.EnumValue); ok {
 				rows[i][j] = string(ev)
 			} else if hb, ok := val.(executor.HexBytes); ok {

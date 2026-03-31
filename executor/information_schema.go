@@ -353,7 +353,7 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 			"triggers", "table_constraints", "character_sets", "collations",
 			"collation_character_set_applicability", "user_privileges", "schema_privileges",
 			"table_privileges", "column_privileges", "routines", "views", "check_constraints",
-			"events", "partitions", "resource_groups", "view_table_usage":
+			"events", "partitions", "plugins", "resource_groups", "view_table_usage":
 			return true
 		}
 		return false
