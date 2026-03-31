@@ -1926,6 +1926,10 @@ func (e *Executor) perfSchemaVariablesScoped(globalOnly bool) []storage.Row {
 	vars := e.buildVariablesMapScoped(globalOnly)
 	names := make([]string, 0, len(vars))
 	for n := range vars {
+		// For global_variables, exclude session-only variables
+		if globalOnly && sysVarSessionOnly[n] {
+			continue
+		}
 		names = append(names, n)
 	}
 	sort.Strings(names)

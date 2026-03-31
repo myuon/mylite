@@ -1384,7 +1384,13 @@ var sysVarGlobalOnly = map[string]bool{
 	"innodb_file_per_table":                    true,
 	"innodb_flush_log_at_trx_commit":           true,
 	"innodb_ft_aux_table":                      true,
+	"innodb_ft_server_stopword_table":          true,
+	"innodb_log_buffer_size":                   true,
 	"innodb_log_checksums":                     true,
+	"innodb_log_spin_cpu_abs_lwm":             true,
+	"innodb_log_spin_cpu_pct_hwm":             true,
+	"innodb_log_wait_for_flush_spin_hwm":      true,
+	"innodb_log_writer_threads":               true,
 	"innodb_log_compressed_pages":              true,
 	"innodb_log_write_ahead_size":              true,
 	"innodb_rollback_segments":                 true,
@@ -1418,7 +1424,6 @@ var sysVarGlobalOnly = map[string]bool{
 	"delay_key_write":                          true,
 	"ft_boolean_syntax":                        true,
 	"init_connect":                             true,
-	"innodb_log_buffer_size":                   true,
 	"innodb_log_file_size":                     true,
 	"innodb_log_files_in_group":                true,
 	"key_buffer_size":                          true,
@@ -1854,6 +1859,7 @@ var sysVarBothScope = map[string]bool{
 var sysVarSessionReadOnly = map[string]bool{
 	"net_buffer_length":    true,
 	"max_user_connections": true,
+	"max_allowed_packet":   true,
 }
 
 // sysVarDeprecated maps deprecated system variable names to their deprecation warning message.
@@ -2088,8 +2094,8 @@ var sysVarIntRange = map[string]intVarRange{
 	"innodb_online_alter_log_max_size":           {Min: 65536, Max: 18446744073709551615, IsUnsigned: true},
 	"join_buffer_size":                           {Min: 128, Max: 18446744073709551615, IsUnsigned: true, BlockSize: 128},
 	"key_buffer_size":                            {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
-	"key_cache_age_threshold":                    {Min: 100, Max: 18446744073709551615, IsUnsigned: true},
-	"key_cache_block_size":                       {Min: 512, Max: 16384, IsUnsigned: true},
+	"key_cache_age_threshold":                    {Min: 100, Max: 18446744073709551615, IsUnsigned: true, BlockSize: 100},
+	"key_cache_block_size":                       {Min: 512, Max: 16384, IsUnsigned: true, BlockSize: 512},
 	"key_cache_division_limit":                   {Min: 1, Max: 100, IsUnsigned: true},
 	"log_error_verbosity":                        {Min: 1, Max: 3, IsUnsigned: true},
 	"log_throttle_queries_not_using_indexes":     {Min: 0, Max: 4294967295, IsUnsigned: true},
@@ -2123,9 +2129,9 @@ var sysVarIntRange = map[string]intVarRange{
 	"mysqlx_min_worker_threads":                  {Min: 1, Max: 100, IsUnsigned: true},
 	"mysqlx_write_timeout":                       {Min: 1, Max: 2147483, IsUnsigned: true},
 	"mysqlx_read_timeout":                        {Min: 1, Max: 2147483, IsUnsigned: true},
-	"mysqlx_wait_timeout":                        {Min: 1, Max: 2147483647, IsUnsigned: true},
-	"mysqlx_interactive_timeout":                 {Min: 1, Max: 2147483647, IsUnsigned: true},
-	"net_buffer_length":                          {Min: 1024, Max: 1048576, IsUnsigned: true},
+	"mysqlx_wait_timeout":                        {Min: 1, Max: 2147483, IsUnsigned: true},
+	"mysqlx_interactive_timeout":                 {Min: 1, Max: 2147483, IsUnsigned: true},
+	"net_buffer_length":                          {Min: 1024, Max: 1048576, IsUnsigned: true, BlockSize: 1024},
 	"net_read_timeout":                           {Min: 1, Max: 31536000, IsUnsigned: true},
 	"net_retry_count":                            {Min: 1, Max: 18446744073709551615, IsUnsigned: true},
 	"net_write_timeout":                          {Min: 1, Max: 31536000, IsUnsigned: true},
@@ -2209,6 +2215,15 @@ var sysVarIntRange = map[string]intVarRange{
 	"innodb_ft_result_cache_limit":               {Min: 1000000, Max: 4294967295, IsUnsigned: true},
 	"innodb_fill_factor":                         {Min: 10, Max: 100, IsUnsigned: true},
 	"innodb_replication_delay":                   {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"innodb_log_buffer_size":                     {Min: 262144, Max: 4294967295, IsUnsigned: true},
+	"innodb_log_spin_cpu_abs_lwm":                {Min: 0, Max: 4294967295, IsUnsigned: true},
+	"innodb_log_spin_cpu_pct_hwm":                {Min: 0, Max: 100, IsUnsigned: true},
+	"innodb_log_wait_for_flush_spin_hwm":         {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"innodb_parallel_read_threads":               {Min: 1, Max: 256, IsUnsigned: true},
+	"innodb_sort_buffer_size":                    {Min: 65536, Max: 67108864, IsUnsigned: true},
+	// innodb_commit_concurrency: special behavior in MySQL (cannot change from 0 to non-zero)
+	// Not adding to generic range check to avoid regression with innodb_bug42101
+	"server_id_bits":                             {Min: 0, Max: 32, IsUnsigned: true},
 }
 
 func parseStrictIntegerAssignment(expr sqlparser.Expr, evalVal interface{}) (int64, uint64, bool, string, error) {
@@ -2372,7 +2387,8 @@ type floatVarRange struct {
 var sysVarFloatRange = map[string]floatVarRange{
 	"innodb_max_dirty_pages_pct":     {Min: 0, Max: 99.999},
 	"innodb_max_dirty_pages_pct_lwm": {Min: 0, Max: 99.999},
-	"long_query_time":                {Min: 0, Max: 31536000},
+	"long_query_time":                    {Min: 0, Max: 31536000},
+	"secondary_engine_cost_threshold":    {Min: 0, Max: math.MaxFloat64},
 }
 
 // clampFloatVar validates and clamps a DOUBLE system variable assignment.
@@ -3046,7 +3062,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"local_infile":                      "OFF",
 
 		// Optimizer
-		"optimizer_switch":             "index_merge=on,index_merge_union=on,index_merge_sort_union=on,index_merge_intersection=on,engine_condition_pushdown=on,index_condition_pushdown=on,mrr=on,mrr_cost_based=on,block_nested_loop=on,batched_key_access=off,materialization=on,semijoin=on,loosescan=on,firstmatch=on,duplicateweedout=on,subquery_materialization_cost_based=on,use_index_extensions=on,condition_fanout_filter=on,derived_merge=on,use_invisible_indexes=off,skip_scan=on,hash_join=on,subquery_to_derived=off,prefer_ordering_index=on,hypergraph_optimizer=off,derived_condition_pushdown=on",
+		"optimizer_switch":             "index_merge=on,index_merge_union=on,index_merge_sort_union=on,index_merge_intersection=on,engine_condition_pushdown=on,index_condition_pushdown=on,mrr=on,mrr_cost_based=on,block_nested_loop=on,batched_key_access=off,materialization=on,semijoin=on,loosescan=on,firstmatch=on,duplicateweedout=on,subquery_materialization_cost_based=on,use_index_extensions=on,condition_fanout_filter=on,derived_merge=on,use_invisible_indexes=off,skip_scan=on",
 		"optimizer_trace":              "enabled=off,one_line=off",
 		"optimizer_trace_features":     "greedy_search=on,range_optimizer=on,dynamic_range=on,repeated_subselect=on",
 		"optimizer_trace_limit":        "1",
@@ -3517,6 +3533,10 @@ func (e *Executor) showVariables(upper string) (*Result, error) {
 
 	var rows [][]interface{}
 	for name, val := range vars {
+		// For SHOW GLOBAL VARIABLES, exclude session-only variables
+		if isGlobalShow && sysVarSessionOnly[name] {
+			continue
+		}
 		if likePattern != "" && !matchLike(name, likePattern) {
 			continue
 		}
