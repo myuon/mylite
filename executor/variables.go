@@ -51,6 +51,12 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		if msg, ok := sysVarDeprecated[cleanVarName]; ok {
 			e.addWarning("Warning", 1287, msg)
 		}
+		// Reject NULL for string-type system variables (MySQL error 1231)
+		if _, isNull := expr.Expr.(*sqlparser.NullVal); isNull {
+			if sysVarStringType[cleanVarName] {
+				return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of 'NULL'", cleanVarName))
+			}
+		}
 		val := sqlparser.String(expr.Expr)
 		val = strings.Trim(val, "'\"")
 		// Try evaluating the expression (handles @user_var, @@system_var references)
@@ -637,6 +643,10 @@ func (e *Executor) handleRawSet(raw string) error {
 		val := strings.TrimSpace(rest[eqIdx+1:])
 		val = strings.TrimSuffix(val, ";")
 		val = strings.TrimSpace(val)
+		// Reject NULL for string-type system variables
+		if strings.ToUpper(val) == "NULL" && sysVarStringType[varName] {
+			return mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of 'NULL'", varName))
+		}
 		// If the value is an unquoted SQL reserved keyword, vitess rejected it for good reason.
 		// Propagate as syntax error, but only for non-enum variables (enum vars often use reserved words as values).
 		if !strings.HasPrefix(val, "'") && !strings.HasPrefix(val, "\"") && sqlReservedKeywords[strings.ToUpper(val)] && !sysVarEnumSet[varName] {
@@ -1156,6 +1166,23 @@ var sysVarEnumSet = map[string]bool{
 	"thread_handling":                 true,
 	"master_info_repository":          true,
 	"relay_log_info_repository":       true,
+}
+
+// sysVarStringType contains system variables that are string types and reject NULL values.
+var sysVarStringType = map[string]bool{
+	"log_error_services":             true,
+	"log_error_suppression_list":     true,
+	"sql_mode":                       true,
+	"optimizer_switch":               true,
+	"optimizer_trace":                true,
+	"optimizer_trace_features":       true,
+	"session_track_system_variables": true,
+	"log_output":                     true,
+	"log_timestamps":                 true,
+	"tls_version":                    true,
+	"block_encryption_mode":          true,
+	"lc_messages":                    true,
+	"lc_time_names":                  true,
 }
 
 // sysVarEnumValues maps numeric/string assignments to canonical enum names.

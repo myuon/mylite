@@ -1110,7 +1110,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							}
 							// ENUM: empty string is invalid (not in the allowed list)
 							if isEnumType && sv == "" {
-								if bool(stmt.Ignore) {
+								if bool(stmt.Ignore) || !e.isStrictMode() {
 									e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 								} else {
 									return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
@@ -1119,7 +1119,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							// SET: if the validated value differs from original,
 							// it means some members were invalid
 							if isSetType && origStr != "" && sv != origStr {
-								if bool(stmt.Ignore) {
+								if bool(stmt.Ignore) || !e.isStrictMode() {
 									e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 								} else {
 									return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
@@ -1128,7 +1128,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						} else if nv, ok := rv.(int64); ok {
 							// Numeric values: validate range for ENUM/SET
 							if isEnumType && (nv < 0 || nv > int64(allowedCount)) {
-								if bool(stmt.Ignore) {
+								if bool(stmt.Ignore) || !e.isStrictMode() {
 									e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 								} else {
 									return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
@@ -1137,7 +1137,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							if isSetType {
 								maxVal := int64((1 << allowedCount) - 1)
 								if nv < 0 || nv > maxVal {
-									if bool(stmt.Ignore) {
+									if bool(stmt.Ignore) || !e.isStrictMode() {
 										e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 									} else {
 										return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))

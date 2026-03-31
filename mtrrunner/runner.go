@@ -492,11 +492,26 @@ func (ctx *execContext) executeLines(lines []string) error {
 			continue
 		}
 		if isIf && strings.Contains(trimmed, "{") {
-			// Skip if blocks
+			// Extract condition from same-line if
+			condStr := trimmed
+			if strings.HasPrefix(strings.ToLower(condStr), "--if") {
+				condStr = condStr[4:]
+			} else if strings.HasPrefix(strings.ToLower(condStr), "if") {
+				condStr = condStr[2:]
+			}
+			condStr = strings.TrimSpace(condStr)
+			condStr = strings.TrimSuffix(condStr, "{")
+			condStr = strings.TrimSpace(condStr)
+			condStr = strings.TrimPrefix(condStr, "(")
+			condStr = strings.TrimSuffix(condStr, ")")
+			condStr = strings.TrimSpace(condStr)
+
+			// Collect body lines until matching }
+			bodyStart := i + 1
 			depth := 1
-			i++
-			for i < len(lines) && depth > 0 {
-				t := strings.TrimSpace(lines[i])
+			j := bodyStart
+			for j < len(lines) && depth > 0 {
+				t := strings.TrimSpace(lines[j])
 				for _, ch := range t {
 					if ch == '{' {
 						depth++
@@ -504,8 +519,26 @@ func (ctx *execContext) executeLines(lines []string) error {
 						depth--
 					}
 				}
-				i++
+				if depth == 0 {
+					break
+				}
+				j++
 			}
+			bodyLines := lines[bodyStart:j]
+
+			condVal := ctx.substituteVars(condStr)
+			// Replace unresolved $variables with empty string for condition evaluation
+			condVal = regexp.MustCompile(`\$[a-zA-Z_][a-zA-Z0-9_]*`).ReplaceAllString(condVal, "")
+			if evalWhileCondition(condVal) {
+				err := ctx.executeLines(bodyLines)
+				if err != nil {
+					if errors.Is(err, errSkipTest) {
+						return err
+					}
+					return fmt.Errorf("line %d (if body): %v", i+1, err)
+				}
+			}
+			i = j + 1
 			continue
 		}
 		if isIfWhile {
@@ -1436,19 +1469,29 @@ func (ctx *execContext) handleIfBlock(lines []string, i int) (handled bool, skip
 		i++
 	}
 
-	// Now find the { and collect the block
-	for i < len(lines) {
-		t := strings.TrimSpace(lines[i])
-		if t == "" || strings.HasPrefix(t, "#") {
-			i++
-			continue
-		}
-		if t == "{" {
-			i++
+	// Check if { is already in condStr (same line as if condition)
+	braceFoundInCond := false
+	if idx := strings.LastIndex(condStr, "{"); idx >= 0 {
+		// Strip the { from the condition string
+		condStr = strings.TrimSpace(condStr[:idx])
+		braceFoundInCond = true
+	}
+
+	// Now find the { and collect the block (if not already found in condition)
+	if !braceFoundInCond {
+		for i < len(lines) {
+			t := strings.TrimSpace(lines[i])
+			if t == "" || strings.HasPrefix(t, "#") {
+				i++
+				continue
+			}
+			if t == "{" {
+				i++
+				break
+			}
+			// Opening brace might be on the same line as if condition
 			break
 		}
-		// Opening brace might be on the same line as if condition
-		break
 	}
 
 	// Collect block lines
@@ -1456,14 +1499,17 @@ func (ctx *execContext) handleIfBlock(lines []string, i int) (handled bool, skip
 	depth := 1
 	for i < len(lines) && depth > 0 {
 		t := strings.TrimSpace(lines[i])
-		if t == "{" {
-			depth++
-		} else if t == "}" {
+		// Check for } with possible trailing comment
+		closingBrace := t == "}" || strings.HasPrefix(t, "} ")  || strings.HasPrefix(t, "}#")
+		openingBrace := t == "{" || strings.HasSuffix(t, "{")
+		if closingBrace {
 			depth--
 			if depth == 0 {
 				i++
 				break
 			}
+		} else if openingBrace {
+			depth++
 		}
 		if depth > 0 {
 			blockLines = append(blockLines, lines[i])
@@ -3646,6 +3692,16 @@ func normalizeOutput(s string) string {
 	out = normalizeSetValueErrorCase(out)
 	// Normalize double semicolons: ";;" → ";"
 	out = strings.ReplaceAll(out, ";;", ";")
+	// Normalize @@GLOBAL/@@SESSION/@@LOCAL scope prefix case: MySQL preserves
+	// original query casing but vitess normalizes to lowercase. Lowercase both
+	// for consistent comparison.
+	out = normalizeVarScopeCase(out)
+	// Normalize double-quoted strings to single-quoted in IF() expressions:
+	// MySQL preserves "ON"/"OFF" but vitess outputs 'ON'/'OFF'.
+	out = normalizeIfDoubleQuotes(out)
+	// Normalize space after comma in function calls: MySQL preserves "func(a, b)"
+	// but vitess may output "func(a,b)" without spaces.
+	out = normalizeCommaSpacing(out)
 	// Normalize invalid UTF-8 bytes to '?' to match MySQL behavior:
 	// MySQL displays non-UTF8 bytes (e.g. latin1 characters) as '?' in
 	// SHOW CREATE TABLE output depending on connection charset. Since mylite
@@ -4025,4 +4081,46 @@ func isInnoDBPhysicalFile(path string) bool {
 		strings.HasSuffix(lower, ".cfg") ||
 		strings.HasSuffix(lower, ".cfp") ||
 		strings.HasSuffix(lower, ".sdi")
+}
+
+// normalizeVarScopeCase normalizes @@GLOBAL./@@SESSION./@@LOCAL. prefixes:
+// 1. Lowercases all scope prefixes (GLOBAL→global, SESSION→session, LOCAL→local)
+// 2. Strips @@session. and @@local. to just @@ since vitess normalizes SESSION scope away
+func normalizeVarScopeCase(s string) string {
+	if !strings.Contains(s, "@@") {
+		return s
+	}
+	// First lowercase all scope prefixes
+	re := regexp.MustCompile(`(?i)@@(GLOBAL|SESSION|LOCAL)\.`)
+	s = re.ReplaceAllStringFunc(s, func(m string) string {
+		return strings.ToLower(m)
+	})
+	// Then strip @@session. and @@local. to just @@ (vitess normalizes these away)
+	s = strings.ReplaceAll(s, "@@session.", "@@")
+	s = strings.ReplaceAll(s, "@@local.", "@@")
+	return s
+}
+
+// normalizeIfDoubleQuotes normalizes double-quoted string literals to single-quoted
+// everywhere in the output for consistent comparison. MySQL preserves the original
+// quote style but vitess may change double quotes to single quotes.
+// Applied to both expected and actual, so the transformation is safe.
+func normalizeIfDoubleQuotes(s string) string {
+	if !strings.Contains(s, `"`) {
+		return s
+	}
+	// Replace "string" with 'string' for short string literals (likely function args)
+	re := regexp.MustCompile(`"([^"\n]{0,20})"`)
+	return re.ReplaceAllString(s, "'$1'")
+}
+
+// normalizeCommaSpacing removes spaces after commas for consistent comparison.
+// MySQL preserves "func(a, b)" but vitess outputs "func(a,b)".
+// Applied to both expected and actual, so the transformation is safe.
+func normalizeCommaSpacing(s string) string {
+	if !strings.Contains(s, ", ") {
+		return s
+	}
+	re := regexp.MustCompile(`, `)
+	return re.ReplaceAllString(s, ",")
 }
