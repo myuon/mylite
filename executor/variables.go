@@ -232,6 +232,9 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						e.setSysVar(cleanName, "10", isGlobal)
 					} else if cleanName == "innodb_io_capacity_max" {
 						e.setSysVar(cleanName, "4294967295", isGlobal)
+					} else if cleanName == "foreign_key_checks" || cleanName == "unique_checks" {
+						// DEFAULT for these boolean session variables is OFF (0)
+						e.setSysVar(cleanName, "0", isGlobal)
 					} else if isGlobal {
 						// For SET GLOBAL var = DEFAULT, reset to compiled default.
 						// If startupVars has an override for this variable, we must
@@ -508,6 +511,11 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						// Trigger variables reset immediately after being set
 						if triggerSysVars[cleanName] {
 							e.globalScopeVars[cleanName] = "OFF"
+						}
+						// When super_read_only is set to ON, also set read_only to ON.
+						// (Setting super_read_only OFF does NOT reset read_only.)
+						if cleanName == "super_read_only" && (v == "1" || strings.ToUpper(v) == "ON") {
+							e.globalScopeVars["read_only"] = "1"
 						}
 						// When max_join_size is set globally, update global sql_big_selects.
 						if cleanName == "max_join_size" {
@@ -2038,6 +2046,12 @@ func (e *Executor) clampIntVar(name string, expr sqlparser.Expr, min int64, max 
 	n, u, isNegative, raw, parseErr := parseStrictIntegerAssignment(expr, evalVal)
 	if parseErr != nil {
 		return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+	}
+	// Check for --maximum-<varname> startup option that caps the max value
+	if maxStr, ok := e.startupVars["maximum_"+name]; ok {
+		if maxVal, err := strconv.ParseUint(maxStr, 10, 64); err == nil && maxVal < max {
+			max = maxVal
+		}
 	}
 	warn := func() {
 		e.warnings = append(e.warnings, Warning{

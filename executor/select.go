@@ -4143,6 +4143,10 @@ func validateNoFromTopLevelColRefs(expr sqlparser.Expr) error {
 				return err
 			}
 		}
+	case *sqlparser.Sum:
+		if err := validateNoFromTopLevelColRefs(e.Arg); err != nil {
+			return err
+		}
 	}
 	// For subqueries, etc., don't check - let them through
 	return nil
