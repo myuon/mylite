@@ -640,10 +640,16 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			Type:     buildColumnTypeString(col.Type),
 			Nullable: nullable,
 		}
-		// Capture column-level charset if explicitly specified
+		// Capture column-level charset if explicitly specified.
+		// When charset is "binary", the type has already been converted to its binary
+		// equivalent (e.g. char->binary, varchar->varbinary, text->blob) in
+		// buildColumnTypeString, so we don't need to store the charset separately.
 		if col.Type.Charset.Name != "" {
-			colDef.Charset = strings.ToLower(col.Type.Charset.Name)
-			colDef.Collation = catalog.DefaultCollationForCharset(colDef.Charset)
+			csLower := strings.ToLower(col.Type.Charset.Name)
+			if csLower != "binary" {
+				colDef.Charset = csLower
+				colDef.Collation = catalog.DefaultCollationForCharset(colDef.Charset)
+			}
 		}
 		if tUpper := strings.ToUpper(strings.TrimSpace(colDef.Type)); strings.HasPrefix(tUpper, "BIT(") {
 			var width int
@@ -2281,6 +2287,27 @@ func padBinaryValue(val interface{}, padLen int) interface{} {
 
 func buildColumnTypeString(ct *sqlparser.ColumnType) string {
 	s := strings.ToLower(ct.Type)
+
+	// When CHARACTER SET binary or BINARY modifier is used on text types,
+	// MySQL normalizes them to their binary equivalents.
+	isBinaryCharset := ct.Charset.Binary || strings.EqualFold(ct.Charset.Name, "binary")
+	if isBinaryCharset {
+		switch strings.ToUpper(ct.Type) {
+		case "CHAR":
+			s = "binary"
+		case "VARCHAR":
+			s = "varbinary"
+		case "TEXT":
+			s = "blob"
+		case "TINYTEXT":
+			s = "tinyblob"
+		case "MEDIUMTEXT":
+			s = "mediumblob"
+		case "LONGTEXT":
+			s = "longblob"
+		}
+	}
+
 	if ct.Length != nil && ct.Scale != nil {
 		s += fmt.Sprintf("(%d,%d)", *ct.Length, *ct.Scale)
 	} else if ct.Length != nil {

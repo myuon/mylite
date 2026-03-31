@@ -1937,6 +1937,10 @@ func formatResultCell(v interface{}) string {
 		return "NULL"
 	case []byte:
 		return normalizeScientific(string(val))
+	case int64:
+		return strconv.FormatInt(val, 10)
+	case uint64:
+		return strconv.FormatUint(val, 10)
 	case float64:
 		return formatMySQLFloat(val, 64)
 	case float32:

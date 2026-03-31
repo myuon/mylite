@@ -10294,6 +10294,8 @@ func toString(v interface{}) string {
 		return string(val)
 	case int64:
 		return strconv.FormatInt(val, 10)
+	case uint64:
+		return strconv.FormatUint(val, 10)
 	case float64:
 		return formatMySQLFloatString(val)
 	case ScaledValue:

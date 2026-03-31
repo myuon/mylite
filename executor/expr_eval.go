@@ -470,7 +470,11 @@ func (e *Executor) evalConvertExpr(v *sqlparser.ConvertExpr) (interface{}, error
 	case "SIGNED", "INT", "INTEGER", "BIGINT":
 		return toInt64(val), nil
 	case "UNSIGNED":
-		return toInt64(val), nil
+		n := toInt64(val)
+		if n < 0 {
+			return uint64(n), nil
+		}
+		return uint64(n), nil
 	case "CHAR", "VARCHAR", "TEXT", "NCHAR", "NVARCHAR":
 		if val == nil {
 			return nil, nil
