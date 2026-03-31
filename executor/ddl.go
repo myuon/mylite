@@ -582,6 +582,15 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 	}
 
+	// Extract table-level charset before processing columns so that
+	// buildColumnTypeString can propagate binary charset to columns.
+	var tableCharset string
+	for _, opt := range stmt.TableSpec.Options {
+		if strings.EqualFold(opt.Name, "CHARACTER SET") || strings.EqualFold(opt.Name, "CHARSET") {
+			tableCharset = opt.String
+		}
+	}
+
 	for _, col := range stmt.TableSpec.Columns {
 		// Validate ENUM/SET value lengths (MySQL max is 255 characters).
 		colTypeLower := strings.ToLower(col.Type.Type)
@@ -637,7 +646,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 
 		colDef := catalog.ColumnDef{
 			Name:     col.Name.String(),
-			Type:     buildColumnTypeString(col.Type),
+			Type:     buildColumnTypeString(col.Type, tableCharset),
 			Nullable: nullable,
 		}
 		// Capture column-level charset if explicitly specified.
@@ -650,6 +659,8 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				colDef.Charset = csLower
 				colDef.Collation = catalog.DefaultCollationForCharset(colDef.Charset)
 			}
+		} else if strings.EqualFold(tableCharset, "binary") {
+			// Table-level CHARACTER SET binary propagates to columns without explicit charset.
 		}
 		if tUpper := strings.ToUpper(strings.TrimSpace(colDef.Type)); strings.HasPrefix(tUpper, "BIT(") {
 			var width int
@@ -1375,7 +1386,7 @@ func implicitDefaultForType(colType string) interface{} {
 func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 	colDef := catalog.ColumnDef{
 		Name:     col.Name.String(),
-		Type:     buildColumnTypeString(col.Type),
+		Type:     buildColumnTypeString(col.Type, ""),
 		Nullable: true, // default nullable unless NOT NULL specified
 	}
 	if col.Type.Options != nil {
@@ -2285,12 +2296,13 @@ func padBinaryValue(val interface{}, padLen int) interface{} {
 	return s
 }
 
-func buildColumnTypeString(ct *sqlparser.ColumnType) string {
+func buildColumnTypeString(ct *sqlparser.ColumnType, tableCharset string) string {
 	s := strings.ToLower(ct.Type)
 
 	// When CHARACTER SET binary or BINARY modifier is used on text types,
 	// MySQL normalizes them to their binary equivalents.
-	isBinaryCharset := ct.Charset.Binary || strings.EqualFold(ct.Charset.Name, "binary")
+	// This also applies when the table-level charset is binary.
+	isBinaryCharset := ct.Charset.Binary || strings.EqualFold(ct.Charset.Name, "binary") || (ct.Charset.Name == "" && strings.EqualFold(tableCharset, "binary"))
 	if isBinaryCharset {
 		switch strings.ToUpper(ct.Type) {
 		case "CHAR":

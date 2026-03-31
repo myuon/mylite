@@ -1,7 +1,9 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/myuon/mylite/catalog"
@@ -1629,6 +1631,12 @@ func (e *Executor) evalSysSchemaFunc(name string, args []sqlparser.Expr) (interf
 		}
 		val, err := e.evalExpr(args[0])
 		if err != nil {
+			var intOvErr *intOverflowError
+			if errors.As(err, &intOvErr) {
+				// Large integer overflow: parse the string value as float
+				f, _ := strconv.ParseFloat(intOvErr.val, 64)
+				return sysFormatBytes(f), true, nil
+			}
 			return nil, true, err
 		}
 		if val == nil {
@@ -1643,6 +1651,12 @@ func (e *Executor) evalSysSchemaFunc(name string, args []sqlparser.Expr) (interf
 		}
 		val, err := e.evalExpr(args[0])
 		if err != nil {
+			var intOvErr *intOverflowError
+			if errors.As(err, &intOvErr) {
+				// Large integer overflow: parse the string value as float
+				f, _ := strconv.ParseFloat(intOvErr.val, 64)
+				return sysFormatTime(f), true, nil
+			}
 			return nil, true, err
 		}
 		if val == nil {

@@ -1816,6 +1816,11 @@ func (e *Executor) evalPerformanceSchemaFuncExpr(v *sqlparser.PerformanceSchemaF
 		}
 		arg, err := e.evalExpr(v.Argument)
 		if err != nil {
+			var intOvErr *intOverflowError
+			if errors.As(err, &intOvErr) {
+				f, _ := strconv.ParseFloat(intOvErr.val, 64)
+				return formatBytesValue(f), nil
+			}
 			return nil, err
 		}
 		if arg == nil {
@@ -1835,6 +1840,11 @@ func (e *Executor) evalPerformanceSchemaFuncExpr(v *sqlparser.PerformanceSchemaF
 		}
 		arg, err := e.evalExpr(v.Argument)
 		if err != nil {
+			var intOvErr *intOverflowError
+			if errors.As(err, &intOvErr) {
+				f, _ := strconv.ParseFloat(intOvErr.val, 64)
+				return formatPicoTimeValue(f), nil
+			}
 			return nil, err
 		}
 		if arg == nil {
