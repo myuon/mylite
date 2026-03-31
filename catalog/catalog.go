@@ -24,13 +24,14 @@ type ColumnDef struct {
 
 // IndexDef represents an index definition.
 type IndexDef struct {
-	Name    string
-	Columns []string
-	Orders  []string // per-column order: "", "ASC", "DESC"
-	Unique  bool
-	Type    string // "", "FULLTEXT", "SPATIAL"
-	Using   string // Index method: BTREE, HASH, etc.
-	Comment string // COMMENT clause on index
+	Name      string
+	Columns   []string
+	Orders    []string // per-column order: "", "ASC", "DESC"
+	Unique    bool
+	Type      string // "", "FULLTEXT", "SPATIAL"
+	Using     string // Index method: BTREE, HASH, etc.
+	Comment   string // COMMENT clause on index
+	Invisible bool   // true when ALTER TABLE ... ADD INDEX ... INVISIBLE
 }
 
 // TableDef represents a table definition.

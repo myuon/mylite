@@ -4180,7 +4180,7 @@ func (e *Executor) checkSelectScopeErrors(stmt *sqlparser.Select) error {
 		case *sqlparser.Variable:
 			if v.Scope == sqlparser.SessionScope {
 				name := strings.ToLower(v.Name.String())
-				if !sysVarSessionOnly[name] && (sysVarReadOnly[name] || sysVarGlobalOnly[name]) {
+				if !sysVarSessionOnly[name] && (sysVarReadOnly[name] || (sysVarGlobalOnly[name] && !sysVarBothScope[name])) {
 					// Check if the raw query has @@session. or @@local. prefix
 					for _, prefix := range []string{"@@session.", "@@local."} {
 						pattern := prefix + name

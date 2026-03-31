@@ -203,7 +203,7 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 	// Check if the user explicitly wrote @@session.var or @@local.var
 	// (as opposed to just @@var). We detect this from the raw query text
 	// because the AST doesn't distinguish @@var from @@session.var.
-	if v.Scope == sqlparser.SessionScope && !sysVarSessionOnly[name] && (sysVarReadOnly[name] || sysVarGlobalOnly[name]) {
+	if v.Scope == sqlparser.SessionScope && !sysVarSessionOnly[name] && (sysVarReadOnly[name] || (sysVarGlobalOnly[name] && !sysVarBothScope[name])) {
 		q := strings.ToLower(e.currentQuery)
 		// Check for explicit @@session.name or @@local.name anywhere in the query
 		// Use word boundary: the name must be followed by non-word char or end
@@ -252,7 +252,7 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 		gv, gvOK = e.getSysVarSession(name)
 		// For global-only variables accessed without explicit scope,
 		// fall back to global scope since they have no session value.
-		if !gvOK && sysVarGlobalOnly[name] {
+		if !gvOK && (sysVarGlobalOnly[name] && !sysVarBothScope[name]) {
 			gv, gvOK = e.getSysVarGlobal(name)
 		}
 	}

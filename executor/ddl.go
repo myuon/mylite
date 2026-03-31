@@ -813,6 +813,14 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 					usingMethod = strings.ToUpper(opt.String)
 				}
 			}
+			idxInvisible := false
+			for _, opt := range idx.Options {
+				if strings.EqualFold(opt.Name, "VISIBLE") {
+					idxInvisible = false
+				} else if strings.EqualFold(opt.Name, "INVISIBLE") {
+					idxInvisible = true
+				}
+			}
 			// MySQL returns error for index comments > 1024 in strict/TRADITIONAL mode;
 			// in non-strict mode it truncates silently.
 			if mysqlCharLen(idxComment) > 1024 {
@@ -822,13 +830,14 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				idxComment = mysqlTruncateChars(idxComment, 1024)
 			}
 			indexes = append(indexes, catalog.IndexDef{
-				Name:    idxName,
-				Columns: idxCols,
-				Orders:  idxOrders,
-				Unique:  isUnique,
-				Type:    idxType,
-				Using:   usingMethod,
-				Comment: idxComment,
+				Name:      idxName,
+				Columns:   idxCols,
+				Orders:    idxOrders,
+				Unique:    isUnique,
+				Type:      idxType,
+				Using:     usingMethod,
+				Comment:   idxComment,
+				Invisible: idxInvisible,
 			})
 		}
 	}
@@ -1763,6 +1772,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			// Check for USING method and COMMENT
 			usingMethod := ""
 			idxComment := ""
+			idxInvisible := false
 			for _, opt := range op.IndexDefinition.Options {
 				if opt.Name == "USING" {
 					usingMethod = strings.ToUpper(opt.String)
@@ -1773,6 +1783,11 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					} else {
 						idxComment = opt.String
 					}
+				}
+				if strings.EqualFold(opt.Name, "VISIBLE") {
+					idxInvisible = false
+				} else if strings.EqualFold(opt.Name, "INVISIBLE") {
+					idxInvisible = true
 				}
 			}
 			// Check for duplicate values in existing data when adding UNIQUE/PRIMARY index
@@ -1850,13 +1865,14 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					idxComment = mysqlTruncateChars(idxComment, 1024)
 				}
 				db.AddIndex(tableName, catalog.IndexDef{
-					Name:    idxName,
-					Columns: idxCols,
-					Orders:  idxOrders,
-					Unique:  isUnique,
-					Type:    idxType,
-					Using:   usingMethod,
-					Comment: idxComment,
+					Name:      idxName,
+					Columns:   idxCols,
+					Orders:    idxOrders,
+					Unique:    isUnique,
+					Type:      idxType,
+					Using:     usingMethod,
+					Comment:   idxComment,
+					Invisible: idxInvisible,
 				})
 			}
 

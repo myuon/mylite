@@ -40,12 +40,12 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		}
 		// Check if GLOBAL-only variable is being set at SESSION scope
 		scope := expr.Var.Scope
-		if sysVarGlobalOnly[cleanVarName] && scope != sqlparser.GlobalScope {
+		if sysVarGlobalOnly[cleanVarName] && !sysVarBothScope[cleanVarName] && scope != sqlparser.GlobalScope {
 			return nil, mysqlError(1228, "HY000", fmt.Sprintf("Variable '%s' is a GLOBAL variable and should be set with SET GLOBAL", cleanVarName))
 		}
 		// Check if SESSION-only variable is being set at GLOBAL scope
 		if sysVarSessionOnly[cleanVarName] && scope == sqlparser.GlobalScope {
-			return nil, mysqlError(1228, "HY000", fmt.Sprintf("Variable '%s' is a SESSION variable and can't be used with SET GLOBAL", cleanVarName))
+			return nil, mysqlError(1229, "HY000", fmt.Sprintf("Variable '%s' is a SESSION variable and can't be used with SET GLOBAL", cleanVarName))
 		}
 		// Check if session-read-only variable is being set at SESSION scope
 		if sysVarSessionReadOnly[cleanVarName] && scope != sqlparser.GlobalScope {
@@ -86,9 +86,16 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		switch name {
 		case "names":
 			charset := strings.ToLower(val)
-			e.sessionScopeVars["character_set_client"] = charset
-			e.sessionScopeVars["character_set_connection"] = charset
-			e.sessionScopeVars["character_set_results"] = charset
+			if charset == "default" {
+				delete(e.sessionScopeVars, "character_set_client")
+				delete(e.sessionScopeVars, "character_set_connection")
+				delete(e.sessionScopeVars, "character_set_results")
+				delete(e.sessionScopeVars, "collation_connection")
+			} else {
+				e.sessionScopeVars["character_set_client"] = charset
+				e.sessionScopeVars["character_set_connection"] = charset
+				e.sessionScopeVars["character_set_results"] = charset
+			}
 		case "sql_mode":
 			if _, isNull := expr.Expr.(*sqlparser.NullVal); isNull {
 				return nil, mysqlError(1231, "42000", "Variable 'sql_mode' can't be set to the value of 'NULL'")
@@ -463,7 +470,16 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						}
 						e.sessionScopeVars[cleanName] = boolVal
 					} else if err == nil && evalVal != nil {
-						e.sessionScopeVars[cleanName] = fmt.Sprintf("%v", evalVal)
+						sv := fmt.Sprintf("%v", evalVal)
+						if sysVarEnumSet[cleanName] {
+							switch strings.ToUpper(sv) {
+							case "TRUE":
+								sv = "ON"
+							case "FALSE":
+								sv = "OFF"
+							}
+						}
+						e.sessionScopeVars[cleanName] = sv
 					} else if err == nil && evalVal == nil {
 						// nil means NULL - store empty or delete
 						delete(e.sessionScopeVars, cleanName)
@@ -691,12 +707,12 @@ func (e *Executor) handleRawSet(raw string) error {
 			return mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a read only variable", varName))
 		}
 		// Check GLOBAL-only
-		if sysVarGlobalOnly[varName] && !isGlobalScope {
+		if sysVarGlobalOnly[varName] && !sysVarBothScope[varName] && !isGlobalScope {
 			return mysqlError(1228, "HY000", fmt.Sprintf("Variable '%s' is a GLOBAL variable and should be set with SET GLOBAL", varName))
 		}
 		// Check SESSION-only
 		if sysVarSessionOnly[varName] && isGlobalScope {
-			return mysqlError(1228, "HY000", fmt.Sprintf("Variable '%s' is a SESSION variable and can't be used with SET GLOBAL", varName))
+			return mysqlError(1229, "HY000", fmt.Sprintf("Variable '%s' is a SESSION variable and can't be used with SET GLOBAL", varName))
 		}
 		// Check session-read-only
 		if sysVarSessionReadOnly[varName] && !isGlobalScope {
@@ -797,9 +813,16 @@ func (e *Executor) handleRawSet(raw string) error {
 			if charset != "default" && charset != "binary" && !isKnownCharset(charset) {
 				return mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", charset))
 			}
-			e.sessionScopeVars["character_set_client"] = charset
-			e.sessionScopeVars["character_set_connection"] = charset
-			e.sessionScopeVars["character_set_results"] = charset
+			if charset == "default" {
+				delete(e.sessionScopeVars, "character_set_client")
+				delete(e.sessionScopeVars, "character_set_connection")
+				delete(e.sessionScopeVars, "character_set_results")
+				delete(e.sessionScopeVars, "collation_connection")
+			} else {
+				e.sessionScopeVars["character_set_client"] = charset
+				e.sessionScopeVars["character_set_connection"] = charset
+				e.sessionScopeVars["character_set_results"] = charset
+			}
 		}
 	}
 	return nil
@@ -982,7 +1005,7 @@ var sysVarGlobalOnly = map[string]bool{
 	"concurrent_insert":                        true,
 	"connect_timeout":                          true,
 	"innodb_undo_tablespaces":                  true,
-	"max_allowed_packet":                       true,
+	// "max_allowed_packet":                    true, // both scope (session + global)
 	"max_prepared_stmt_count":                  true,
 	"default_authentication_plugin":            true,
 	"default_password_lifetime":                true,
@@ -1448,6 +1471,40 @@ var sysVarEnumValues = map[string]map[string]string{
 		"TEMPTABLE": "TempTable",
 		"MEMORY":    "MEMORY",
 	},
+	"event_scheduler": {
+		"0":        "OFF",
+		"1":        "ON",
+		"ON":       "ON",
+		"OFF":      "OFF",
+		"DISABLED": "DISABLED",
+	},
+	"gtid_mode": {
+		"0":              "OFF",
+		"1":              "OFF_PERMISSIVE",
+		"2":              "ON_PERMISSIVE",
+		"3":              "ON",
+		"OFF":            "OFF",
+		"OFF_PERMISSIVE": "OFF_PERMISSIVE",
+		"ON_PERMISSIVE":  "ON_PERMISSIVE",
+		"ON":             "ON",
+	},
+	"innodb_doublewrite": {
+		"0":   "OFF",
+		"1":   "ON",
+		"ON":  "ON",
+		"OFF": "OFF",
+	},
+	"log_output": {
+		"TABLE": "TABLE",
+		"FILE":  "FILE",
+		"NONE":  "NONE",
+	},
+	"updatable_views_with_limit": {
+		"0":   "NO",
+		"1":   "YES",
+		"YES": "YES",
+		"NO":  "NO",
+	},
 	"block_encryption_mode": {
 		"0":              "aes-128-ecb",
 		"1":              "aes-192-ecb",
@@ -1496,6 +1553,13 @@ var sysVarSessionOnly = map[string]bool{
 	"immediate_server_version":   true,
 	"rbr_exec_mode":              true,
 	"timestamp":                  true,
+}
+
+// sysVarBothScope contains system variables that exist at both SESSION and GLOBAL scope.
+// These should not be blocked by sysVarGlobalOnly even if they appear there.
+var sysVarBothScope = map[string]bool{
+	"gtid_owned":         true,
+	"max_allowed_packet": true,
 }
 
 // sysVarSessionReadOnly contains system variables that are read-only at SESSION scope.
@@ -2909,7 +2973,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 	// For session scope (!globalOnly), only apply global overrides for global-only
 	// variables because SET @@global.var should not affect @@session.var.
 	for name, val := range e.globalScopeVars {
-		if !globalOnly && !sysVarGlobalOnly[name] {
+		if !globalOnly && !sysVarGlobalOnly[name] && !sysVarBothScope[name] {
 			continue
 		}
 		if name == "innodb_stats_transient_sample_pages" || name == "innodb_stats_persistent_sample_pages" {

@@ -1451,7 +1451,7 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 			for _, c := range tbl.Columns {
 				colNullable[strings.ToLower(c.Name)] = c.Nullable
 			}
-			appendIndexRows := func(indexName string, cols []string, nonUnique int64, idxComment string, idxType string) {
+			appendIndexRows := func(indexName string, cols []string, nonUnique int64, idxComment string, idxType string, invisible bool) {
 				var dynamic []int64
 				if !readPersistent {
 					dynamic = distinctPrefixCounts(dataRows, cols)
@@ -1472,7 +1472,7 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 						nullable = "YES"
 					}
 					statKey := strings.ToLower(dbName + "." + tblName + "." + indexName + "." + fmt.Sprintf("n_diff_pfx%02d", i+1))
-					cardinality := int64(0)
+					var cardinality interface{}
 					if readPersistent {
 						cardinality = cardinalityByKey[statKey]
 					} else if i < len(dynamic) {
@@ -1500,7 +1500,7 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 						"INDEX_TYPE":    indexTypeStr,
 						"COMMENT":       "",
 						"INDEX_COMMENT": idxComment,
-						"IS_VISIBLE":    "YES",
+						"IS_VISIBLE":    func() string { if invisible { return "NO" }; return "YES" }(),
 						"EXPRESSION":    nil,
 					})
 				}
@@ -1512,10 +1512,10 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 				if idx.Unique {
 					nonUnique = 0
 				}
-				appendIndexRows(idx.Name, idx.Columns, nonUnique, idx.Comment, idx.Type)
+				appendIndexRows(idx.Name, idx.Columns, nonUnique, idx.Comment, idx.Type, idx.Invisible)
 			}
 			if len(tbl.PrimaryKey) > 0 {
-				appendIndexRows("PRIMARY", tbl.PrimaryKey, 0, "", "")
+				appendIndexRows("PRIMARY", tbl.PrimaryKey, 0, "", "", false)
 			}
 		}
 	}
