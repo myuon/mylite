@@ -105,18 +105,29 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			if upperVal == "OFF" || upperVal == "ON" || upperVal == "TRUE" || upperVal == "FALSE" {
 				return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'sql_mode' can't be set to the value of '%s'", strings.ToLower(val)))
 			}
+			var modeVal string
 			if upperVal == "DEFAULT" {
-				e.sqlMode = defaultSQLMode
+				modeVal = defaultSQLMode
 			} else {
-				e.sqlMode = expandSQLMode(upperVal)
+				modeVal = expandSQLMode(upperVal)
+			}
+			if scope == sqlparser.GlobalScope {
+				e.globalScopeVars["sql_mode"] = modeVal
+			} else {
+				e.sqlMode = modeVal
+				e.sessionScopeVars["sql_mode"] = modeVal
 			}
 		case "sql_auto_is_null":
-			e.sqlAutoIsNull = val == "1" || strings.ToUpper(val) == "ON" || strings.ToUpper(val) == "TRUE"
-			// Also store in session scope so @@sql_auto_is_null reads it back.
-			if e.sqlAutoIsNull {
-				e.sessionScopeVars["sql_auto_is_null"] = "ON"
+			isOn := val == "1" || strings.ToUpper(val) == "ON" || strings.ToUpper(val) == "TRUE"
+			boolStr := "OFF"
+			if isOn {
+				boolStr = "ON"
+			}
+			if scope == sqlparser.GlobalScope {
+				e.globalScopeVars["sql_auto_is_null"] = boolStr
 			} else {
-				e.sessionScopeVars["sql_auto_is_null"] = "OFF"
+				e.sqlAutoIsNull = isOn
+				e.sessionScopeVars["sql_auto_is_null"] = boolStr
 			}
 		case "timestamp":
 			n, err := strconv.ParseFloat(val, 64)
@@ -163,6 +174,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					n = 0
 				}
 				e.nextInsertID = n
+				e.sessionScopeVars["insert_id"] = fmt.Sprintf("%d", n)
 			} else {
 				return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable 'insert_id'"))
 			}
@@ -607,10 +619,18 @@ func (e *Executor) handleRawSet(raw string) error {
 			val = strings.TrimSpace(val)
 			// Resolve @user_var and @@system_var references
 			val = e.resolveSystemVarInValue(val)
+			var modeVal string
 			if strings.ToUpper(val) == "DEFAULT" {
-				e.sqlMode = defaultSQLMode
+				modeVal = defaultSQLMode
 			} else {
-				e.sqlMode = strings.ToUpper(val)
+				modeVal = strings.ToUpper(val)
+			}
+			isGlobal := strings.Contains(upper, "GLOBAL")
+			if isGlobal {
+				e.globalScopeVars["sql_mode"] = modeVal
+			} else {
+				e.sqlMode = modeVal
+				e.sessionScopeVars["sql_mode"] = modeVal
 			}
 		}
 	}

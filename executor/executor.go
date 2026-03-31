@@ -2403,6 +2403,10 @@ func normalizeTypeAliases(query string) string {
 	result = replaceTypeWord(result, "FLOAT8", "DOUBLE")
 	result = replaceTypeWord(result, "LONG VARBINARY", "MEDIUMBLOB")
 	result = replaceTypeWord(result, "LONG VARCHAR", "MEDIUMTEXT")
+	// NCHAR VARYING must come before NCHAR to avoid partial replacement
+	result = replaceTypeWord(result, "NCHAR VARYING", "VARCHAR")
+	result = replaceTypeWord(result, "NVARCHAR", "VARCHAR")
+	result = replaceTypeWord(result, "NCHAR", "CHAR")
 	return result
 }
 
@@ -5679,6 +5683,33 @@ func stripLeadingCStyleComments(s string) string {
 		trimmed := strings.TrimSpace(s)
 		if !strings.HasPrefix(trimmed, "/*") {
 			return trimmed
+		}
+		// Preserve MySQL versioned comments that should be executed (version <= 80040).
+		// Format: /*!NNNNN content */ where NNNNN is the minimum MySQL version.
+		// If version <= our server version (8.0.40 = 80040), the content should be
+		// executed, so let vitess handle it. High version comments (e.g. /*!99999 ... */)
+		// are effectively no-ops and can be stripped.
+		if strings.HasPrefix(trimmed, "/*!") {
+			// Extract version number
+			verStr := ""
+			for i := 3; i < len(trimmed) && i < 8; i++ {
+				if trimmed[i] >= '0' && trimmed[i] <= '9' {
+					verStr += string(trimmed[i])
+				} else {
+					break
+				}
+			}
+			if len(verStr) == 5 {
+				ver := 0
+				for _, ch := range verStr {
+					ver = ver*10 + int(ch-'0')
+				}
+				if ver <= 80040 {
+					// This versioned comment should be executed - let vitess handle it
+					return trimmed
+				}
+			}
+			// High version or malformed - strip like a regular comment
 		}
 		end := strings.Index(trimmed, "*/")
 		if end < 0 {

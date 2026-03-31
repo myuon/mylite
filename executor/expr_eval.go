@@ -440,7 +440,7 @@ func (e *Executor) evalConvertExpr(v *sqlparser.ConvertExpr) (interface{}, error
 					return int64(math.MaxInt64), nil
 				case "UNSIGNED":
 					return uint64(math.MaxUint64), nil
-				case "DECIMAL", "FLOAT", "DOUBLE":
+				case "DECIMAL", "FLOAT", "DOUBLE", "REAL":
 					// Try to parse as float for decimal casts
 					f, parseErr := strconv.ParseFloat(oe.val, 64)
 					if parseErr == nil {
@@ -463,12 +463,12 @@ func (e *Executor) evalConvertExpr(v *sqlparser.ConvertExpr) (interface{}, error
 		return toInt64(val), nil
 	case "UNSIGNED":
 		return toInt64(val), nil
-	case "CHAR", "VARCHAR", "TEXT":
+	case "CHAR", "VARCHAR", "TEXT", "NCHAR", "NVARCHAR":
 		if val == nil {
 			return nil, nil
 		}
 		return toString(val), nil
-	case "DECIMAL", "FLOAT", "DOUBLE":
+	case "DECIMAL", "FLOAT", "DOUBLE", "REAL":
 		return toFloat(val), nil
 	case "DATETIME", "DATE", "TIME", "TIMESTAMP":
 		if val == nil {
@@ -1108,7 +1108,7 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 				return int64(math.MaxInt64), nil
 			case "UNSIGNED":
 				return uint64(math.MaxUint64), nil
-			case "DECIMAL", "FLOAT", "DOUBLE":
+			case "DECIMAL", "FLOAT", "DOUBLE", "REAL":
 				f, parseErr := strconv.ParseFloat(oe.val, 64)
 				if parseErr == nil {
 					return f, nil
@@ -1128,12 +1128,12 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 				return uint64(n), nil
 			}
 			return uint64(n), nil
-		case "CHAR", "VARCHAR", "TEXT":
+		case "CHAR", "VARCHAR", "TEXT", "NCHAR", "NVARCHAR":
 			if val == nil {
 				return nil, nil
 			}
 			return toString(val), nil
-		case "DECIMAL", "FLOAT", "DOUBLE":
+		case "DECIMAL", "FLOAT", "DOUBLE", "REAL":
 			return toFloat(val), nil
 		case "DATETIME", "DATE", "TIME", "TIMESTAMP":
 			if val == nil {
