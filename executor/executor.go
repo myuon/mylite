@@ -3079,7 +3079,7 @@ func normalizeCreateTableEngineSelect(query string) string {
 	// Find SELECT keyword (not inside parentheses)
 	depth := 0
 	selectIdx := -1
-	for i := 0; i < len(query)-7; i++ {
+	for i := 0; i < len(query)-6; i++ {
 		switch query[i] {
 		case '(':
 			depth++
@@ -3094,7 +3094,9 @@ func normalizeCreateTableEngineSelect(query string) string {
 			}
 		}
 		if depth == 0 && (query[i] == 's' || query[i] == 'S') {
-			if i+7 <= len(query) && strings.EqualFold(query[i:i+7], "SELECT ") {
+			// SELECT can be followed by space, newline, or tab as whitespace separator.
+			if i+6 <= len(query) && strings.EqualFold(query[i:i+6], "SELECT") &&
+				(i+6 == len(query) || query[i+6] == ' ' || query[i+6] == '\n' || query[i+6] == '\t' || query[i+6] == '\r') {
 				// Ensure SELECT is a standalone keyword (preceded by space/newline, not part of identifier)
 				if i == 0 || !isIdentChar(query[i-1]) {
 					selectIdx = i
