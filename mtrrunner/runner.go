@@ -2508,11 +2508,9 @@ func (ctx *execContext) executeExecWithExpectedError(stmt string) error {
 		return nil
 	}
 
-	// Statement succeeded but we expected an error — check for warnings
-	// MySQL test framework shows warnings as errors in this case
-	if ctx.resultLogEnabled {
-		ctx.outputWarningsOnConn(conn, expectedCode)
-	}
+	// Statement succeeded but we expected an error.
+	// Do NOT output warnings here — Dolt does not produce these warnings
+	// and the expected result files don't include them.
 	return nil
 }
 

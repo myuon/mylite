@@ -6497,6 +6497,14 @@ func (e *Executor) isStrictMode() bool {
 		strings.Contains(e.sqlMode, "STRICT_ALL_TABLES")
 }
 
+// isTraditionalMode returns true when sql_mode includes TRADITIONAL or STRICT_ALL_TABLES.
+// TRADITIONAL mode enforces stricter validation (e.g., ENUM value validation) than
+// STRICT_TRANS_TABLES alone.
+func (e *Executor) isTraditionalMode() bool {
+	return strings.Contains(e.sqlMode, "TRADITIONAL") ||
+		strings.Contains(e.sqlMode, "STRICT_ALL_TABLES")
+}
+
 // isInnoDBStrictMode returns true when innodb_strict_mode is ON.
 func (e *Executor) isInnoDBStrictMode() bool {
 	if v, ok := e.getSysVar("innodb_strict_mode"); ok {

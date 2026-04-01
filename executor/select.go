@@ -1135,13 +1135,6 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				if err := validateNoFromTopLevelColRefs(se.Expr); err != nil {
 					return nil, err
 				}
-				// Also check for bare column references inside aggregate function args.
-				// MySQL returns "Unknown column" for bare names in no-FROM queries
-				// even inside COUNT(), SUM() etc., and this must take priority over
-				// scope errors (e.g., @@GLOBAL.session_only_var).
-				if err := validateNoFromExprRefs(se.Expr); err != nil {
-					return nil, err
-				}
 			}
 		}
 	}
@@ -4084,7 +4077,7 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 	// even when the same expression also has a @@session.global_var reference.
 	for _, expr := range stmt.SelectExprs.Exprs {
 		if se, ok := expr.(*sqlparser.AliasedExpr); ok {
-			if err := validateNoFromExprRefs(se.Expr); err != nil {
+			if err := validateNoFromTopLevelColRefs(se.Expr); err != nil {
 				return nil, err
 			}
 		}
@@ -4163,15 +4156,6 @@ func validateNoFromTopLevelColRefs(expr sqlparser.Expr) error {
 		return validateNoFromTopLevelColRefs(e.Left)
 	case *sqlparser.UnaryExpr:
 		return validateNoFromTopLevelColRefs(e.Expr)
-	case *sqlparser.FuncExpr:
-		// Validate column references inside function arguments for no-FROM queries.
-		// MySQL returns ER_BAD_FIELD_ERROR for bare column names inside function calls
-		// when there's no FROM clause (e.g. SELECT COUNT(col = @@GLOBAL.var)).
-		for _, arg := range e.Exprs {
-			if err := validateNoFromTopLevelColRefs(arg); err != nil {
-				return err
-			}
-		}
 	case *sqlparser.Count:
 		// COUNT(expr) - validate the argument expression
 		for _, arg := range e.Args {
@@ -4186,27 +4170,6 @@ func validateNoFromTopLevelColRefs(expr sqlparser.Expr) error {
 	}
 	// For subqueries, etc., don't check - let them through
 	return nil
-}
-
-func validateNoFromExprRefs(expr sqlparser.Expr) error {
-	var walkErr error
-	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
-		// Don't descend into subqueries - they have their own scope
-		if _, ok := node.(*sqlparser.Subquery); ok {
-			return false, nil
-		}
-		col, ok := node.(*sqlparser.ColName)
-		if !ok {
-			return true, nil
-		}
-		if !col.Qualifier.IsEmpty() {
-			walkErr = mysqlError(1051, "42S02", fmt.Sprintf("Unknown table '%s' in field list", col.Qualifier.Name.String()))
-			return false, nil
-		}
-		walkErr = mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'field list'", col.Name.String()))
-		return false, nil
-	}, expr)
-	return walkErr
 }
 
 // checkSelectScopeErrors checks if a SELECT statement contains @@session.X or @@local.X

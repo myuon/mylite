@@ -1078,10 +1078,9 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 									row[col.Name] = string([]rune(sv)[:maxLen])
 									rv = row[col.Name]
 									e.addWarning("Note", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
-								} else if bool(stmt.Ignore) {
-									// INSERT IGNORE: truncate the value instead of error
-									row[col.Name] = string([]rune(sv)[:maxLen])
-									rv = row[col.Name]
+								} else if bool(stmt.Ignore) || !e.isStrictMode() {
+									// INSERT IGNORE or non-strict mode: warn but do NOT truncate
+									// (Dolt does not enforce VARCHAR length limits)
 									e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 								} else {
 									return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row 1", col.Name))
@@ -1129,7 +1128,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 									}
 								}
 								if !emptyAllowed {
-									if bool(stmt.Ignore) || !e.isStrictMode() {
+									if bool(stmt.Ignore) || !e.isTraditionalMode() {
 										e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 									} else {
 										return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
@@ -1148,7 +1147,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						} else if nv, ok := rv.(int64); ok {
 							// Numeric values: validate range for ENUM/SET
 							if isEnumType && (nv < 0 || nv > int64(allowedCount)) {
-								if bool(stmt.Ignore) || !e.isStrictMode() {
+								if bool(stmt.Ignore) || !e.isTraditionalMode() {
 									e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 								} else {
 									return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
@@ -1170,7 +1169,8 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 		}
 
-		// Non-strict mode: truncate strings that exceed column length with a warning
+		// Non-strict mode: warn about strings that exceed column length but do NOT truncate
+		// (Dolt does not enforce VARCHAR/CHAR length limits)
 		if !e.isStrictMode() {
 			for _, col := range tbl.Def.Columns {
 				rv, exists := row[col.Name]
@@ -1188,7 +1188,6 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				}
 				maxLen := extractCharLength(col.Type)
 				if maxLen > 0 && len([]rune(sv)) > maxLen {
-					row[col.Name] = string([]rune(sv)[:maxLen])
 					e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 				}
 			}

@@ -537,7 +537,24 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					e.sessionScopeVars[cleanName] = tmpPath
 				} else if cleanName == "innodb_commit_concurrency" {
 					// innodb_commit_concurrency cannot transition between 0 and non-zero.
+					// Type validation: reject non-integer literals (strings, floats)
+					if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
+						litStr := strings.TrimSpace(sqlparser.String(lit))
+						if strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"") || strings.ContainsAny(litStr, ".eE") {
+							return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+						}
+					}
 					evalVal, _ := e.evalExpr(expr.Expr)
+					// Reject string and float values from evaluated expressions
+					switch evalVal.(type) {
+					case string:
+						s := evalVal.(string)
+						if _, err := strconv.ParseInt(s, 10, 64); err != nil {
+							return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+						}
+					case float32, float64:
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanName))
+					}
 					newVal := toInt64(evalVal)
 					currentVal, _ := e.getSysVar(cleanName)
 					if currentVal == "" {
@@ -2224,6 +2241,12 @@ var sysVarIntRange = map[string]intVarRange{
 	// innodb_commit_concurrency: special behavior in MySQL (cannot change from 0 to non-zero)
 	// Not adding to generic range check to avoid regression with innodb_bug42101
 	"server_id_bits":                             {Min: 0, Max: 32, IsUnsigned: true},
+	"pseudo_thread_id":                           {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"rand_seed1":                                 {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"rand_seed2":                                 {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"original_commit_timestamp":                  {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"original_server_version":                    {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"immediate_server_version":                   {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
 }
 
 func parseStrictIntegerAssignment(expr sqlparser.Expr, evalVal interface{}) (int64, uint64, bool, string, error) {

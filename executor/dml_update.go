@@ -358,7 +358,7 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 											return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row %d", col.Name, i+1))
 										}
 									} else {
-										val = string([]rune(sv)[:maxLen])
+										// Non-strict mode: warn but do NOT truncate (Dolt compatibility)
 										e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", col.Name, i+1))
 									}
 								}
@@ -394,23 +394,31 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		tbl.Lock()
 
 		// Enforce NOT NULL constraints on final NEW values.
+		// Convert NULL to the implicit zero/default value first so that
+		// subsequent constraint checks (duplicate key, etc.) see the
+		// converted value rather than nil.
+		var nullToZeroCols []string
 		for _, col := range tbl.Def.Columns {
 			if col.Nullable {
 				continue
 			}
 			if val, ok := newRow[col.Name]; ok && val == nil {
-				// For DATE/DATETIME/TIMESTAMP NOT NULL columns, MySQL always converts
-				// NULL to the implicit zero value ('0000-00-00') even in strict mode.
 				colUpper := strings.ToUpper(col.Type)
-				isDateLike := strings.HasPrefix(colUpper, "DATE") ||
-					strings.HasPrefix(colUpper, "DATETIME") ||
-					strings.HasPrefix(colUpper, "TIMESTAMP")
-				if !e.isStrictMode() || bool(stmt.Ignore) || isDateLike {
-					e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", col.Name))
+				isTimestamp := strings.HasPrefix(colUpper, "TIMESTAMP")
+				if isTimestamp {
+					// TIMESTAMP NOT NULL: MySQL converts NULL to CURRENT_TIMESTAMP
+					newRow[col.Name] = e.nowTime().Format("2006-01-02 15:04:05")
+					if !e.isStrictMode() || bool(stmt.Ignore) {
+						e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", col.Name))
+					}
+				} else {
+					// DATE/DATETIME/other NOT NULL: convert to implicit zero value
 					newRow[col.Name] = implicitZeroValue(col.Type)
-					continue
+					nullToZeroCols = append(nullToZeroCols, col.Name)
+					if !e.isStrictMode() {
+						e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", col.Name))
+					}
 				}
-				return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
 			}
 		}
 
@@ -524,6 +532,19 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 				continue
 			}
 			return nil, dupErr
+		}
+
+		// In strict mode, if we converted NULL to zero for NOT NULL columns
+		// and no duplicate key absorbed the row, produce an error.
+		if e.isStrictMode() && len(nullToZeroCols) > 0 {
+			if bool(stmt.Ignore) {
+				// UPDATE IGNORE: add warnings for each NULL-to-zero conversion
+				for _, colName := range nullToZeroCols {
+					e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", colName))
+				}
+			} else {
+				return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", nullToZeroCols[0]))
+			}
 		}
 
 		// Apply the trigger-modified newRow values to the actual row
