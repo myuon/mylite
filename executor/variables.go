@@ -52,6 +52,17 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		if sysVarSessionOnly[cleanVarName] && scope == sqlparser.GlobalScope {
 			return nil, mysqlError(1229, "HY000", fmt.Sprintf("Variable '%s' is a SESSION variable and can't be used with SET GLOBAL", cleanVarName))
 		}
+		// Type validation for int-range and float-range variables must happen BEFORE
+		// scope checks (MySQL checks type before scope for these variables).
+		if _, isIntRange := sysVarIntRange[cleanVarName]; isIntRange {
+			if typeErr := checkIntVarType(cleanVarName, expr.Expr); typeErr != nil {
+				return nil, typeErr
+			}
+		} else if _, isFltRange := sysVarFloatRange[cleanVarName]; isFltRange {
+			if typeErr := checkFloatVarType(cleanVarName, expr.Expr); typeErr != nil {
+				return nil, typeErr
+			}
+		}
 		// Check if session-read-only variable is being set at SESSION scope
 		if sysVarSessionReadOnly[cleanVarName] && scope != sqlparser.GlobalScope {
 			return nil, mysqlError(1238, "HY000", fmt.Sprintf("SESSION variable '%s' is read-only. Use SET GLOBAL to assign the value", cleanVarName))
@@ -65,6 +76,10 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			if sysVarStringType[cleanVarName] {
 				return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of 'NULL'", cleanVarName))
 			}
+		}
+		// Reject numeric literals or bare identifiers for pure-string system variables (MySQL error 1232)
+		if sysVarPureStringType[cleanVarName] && isInvalidStringVarExpr(cleanVarName, expr.Expr) {
+			return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanVarName))
 		}
 		val := sqlparser.String(expr.Expr)
 		val = strings.Trim(val, "'\"")
@@ -616,6 +631,27 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						continue
 					} else {
 						e.sessionScopeVars[cleanName] = normalized
+					}
+				} else if cleanName == "innodb_ft_aux_table" || cleanName == "innodb_ft_server_stopword_table" || cleanName == "innodb_ft_user_stopword_table" {
+					// These variables require either empty string or "schema/table" format.
+					evalVal, _ := e.evalExpr(expr.Expr)
+					ftVal := strings.TrimSpace(toString(evalVal))
+					if ftVal == "" {
+						// NULL or empty string clears the variable
+						delete(e.sessionScopeVars, cleanName)
+					} else {
+						// Validate schema/table format: must be "schema/table" with exactly one '/'
+						// and non-empty parts on each side.
+						slashIdx := strings.Index(ftVal, "/")
+						if slashIdx < 0 || slashIdx == 0 || slashIdx == len(ftVal)-1 || strings.Contains(ftVal[slashIdx+1:], "/") {
+							// MySQL truncates the value to 200 chars in this error message
+							displayVal := ftVal
+							if len(displayVal) > 200 {
+								displayVal = displayVal[:200]
+							}
+							return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", cleanName, displayVal))
+						}
+						e.sessionScopeVars[cleanName] = strings.ToLower(ftVal)
 					}
 				} else {
 					// Evaluate expression
@@ -1558,9 +1594,105 @@ var sysVarStringType = map[string]bool{
 	"character_set_filesystem":       true,
 	"character_set_server":           true,
 	"character_set_database":         true,
-	"collation_connection":           true,
-	"collation_server":               true,
-	"collation_database":             true,
+	"collation_connection":                  true,
+	"collation_server":                      true,
+	"collation_database":                    true,
+	// Filename/path string variables that reject numeric literals
+	"innodb_ft_aux_table":                   true,
+	"innodb_ft_server_stopword_table":       true,
+	"innodb_ft_user_stopword_table":         true,
+	"general_log_file":                      true,
+	"slow_query_log_file":                   true,
+}
+
+// isNumericLiteralExpr returns true if the expression is a numeric literal
+// (integer or float), including negative numbers via UnaryExpr.
+func isNumericLiteralExpr(expr sqlparser.Expr) bool {
+	switch e := expr.(type) {
+	case *sqlparser.Literal:
+		switch e.Type {
+		case sqlparser.IntVal, sqlparser.FloatVal, sqlparser.DecimalVal, sqlparser.HexNum:
+			return true
+		}
+	case *sqlparser.UnaryExpr:
+		if e.Operator == sqlparser.UMinusOp || e.Operator == sqlparser.UPlusOp {
+			return isNumericLiteralExpr(e.Expr)
+		}
+	}
+	return false
+}
+
+// isInvalidStringVarExpr returns true if the expression is invalid for a
+// string-type system variable. MySQL rejects numeric literals with ER_WRONG_TYPE_FOR_VAR.
+// For filename-type variables, bare identifiers (ColName) are also rejected.
+func isInvalidStringVarExpr(varName string, expr sqlparser.Expr) bool {
+	if isNumericLiteralExpr(expr) {
+		return true
+	}
+	// Bare identifier like `mytest.log` parses as ColName; only reject for
+	// filename-type variables (not for enum-like vars that accept bare identifiers).
+	if sysVarFilenameType[varName] {
+		if _, isCol := expr.(*sqlparser.ColName); isCol {
+			return true
+		}
+	}
+	return false
+}
+
+// sysVarFilenameType contains string-type system variables that are file paths/names
+// and should reject bare identifiers (ColName) as ER_WRONG_TYPE_FOR_VAR.
+var sysVarFilenameType = map[string]bool{
+	"general_log_file":    true,
+	"slow_query_log_file": true,
+}
+
+// sysVarPureStringType contains system variables that are purely string-typed
+// (file paths, table names) and reject ALL numeric literals AND bare identifiers
+// with ER_WRONG_TYPE_FOR_VAR (error 1232). Unlike enum/charset string vars,
+// these do not accept numeric values as indices.
+var sysVarPureStringType = map[string]bool{
+	"innodb_ft_aux_table":             true,
+	"innodb_ft_server_stopword_table": true,
+	"innodb_ft_user_stopword_table":   true,
+	"general_log_file":                true,
+	"slow_query_log_file":             true,
+}
+
+// checkIntVarType checks if the expression is a valid integer type for integer-range
+// system variables. Returns ER_WRONG_TYPE_FOR_VAR if invalid.
+func checkIntVarType(name string, expr sqlparser.Expr) error {
+	switch e := expr.(type) {
+	case *sqlparser.Literal:
+		litStr := strings.TrimSpace(sqlparser.String(e))
+		// String literals and float literals are wrong type
+		if strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"") || strings.ContainsAny(litStr, ".eE") {
+			return mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+		}
+	case *sqlparser.UnaryExpr:
+		return checkIntVarType(name, e.Expr)
+	case *sqlparser.ColName:
+		// Bare identifier (e.g., SET var = test) is wrong type
+		return mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+	}
+	return nil
+}
+
+// checkFloatVarType checks if the expression is a valid type for float-range
+// system variables. Returns ER_WRONG_TYPE_FOR_VAR if invalid.
+func checkFloatVarType(name string, expr sqlparser.Expr) error {
+	switch e := expr.(type) {
+	case *sqlparser.Literal:
+		litStr := strings.TrimSpace(sqlparser.String(e))
+		// String literals are wrong type
+		if strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"") {
+			return mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+		}
+	case *sqlparser.UnaryExpr:
+		return checkFloatVarType(name, e.Expr)
+	case *sqlparser.ColName:
+		return mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+	}
+	return nil
 }
 
 // truncateErrVal truncates a value to 64 characters for MySQL error messages.
