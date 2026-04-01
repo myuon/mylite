@@ -157,9 +157,16 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 			if stmt.Where != nil {
 				m, wErr := e.evalWhere(stmt.Where.Expr, row)
 				if wErr != nil {
-					return nil, wErr
+					if bool(stmt.Ignore) {
+						// DELETE IGNORE: suppress WHERE eval errors (e.g. subquery > 1 row), skip row
+						e.addWarning("Warning", 1242, strings.TrimPrefix(wErr.Error(), "ERROR 1242 (21000): "))
+						match = false
+					} else {
+						return nil, wErr
+					}
+				} else {
+					match = m
 				}
-				match = m
 			}
 			if match {
 				candidates = append(candidates, indexedRow{idx: i, row: row})
@@ -280,9 +287,16 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		if stmt.Where != nil {
 			m, err := e.evalWhere(stmt.Where.Expr, row)
 			if err != nil {
-				return nil, err
+				if bool(stmt.Ignore) {
+					// DELETE IGNORE: suppress WHERE eval errors (e.g. subquery > 1 row), skip row
+					e.addWarning("Warning", 1242, strings.TrimPrefix(err.Error(), "ERROR 1242 (21000): "))
+					match = false
+				} else {
+					return nil, err
+				}
+			} else {
+				match = m
 			}
-			match = m
 		}
 		if match {
 			// Fire BEFORE DELETE triggers
@@ -508,6 +522,11 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 		for _, row := range allRows {
 			match, err := e.evalWhere(crossPred, row)
 			if err != nil {
+				if bool(stmt.Ignore) {
+					// DELETE IGNORE: suppress WHERE eval errors (e.g. subquery > 1 row), skip row
+					e.addWarning("Warning", 1242, strings.TrimPrefix(err.Error(), "ERROR 1242 (21000): "))
+					continue
+				}
 				return nil, err
 			}
 			if match {

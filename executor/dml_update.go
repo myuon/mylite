@@ -161,9 +161,13 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 				if remainExpr != nil {
 					m, err := e.evalWhere(remainExpr, tbl.Rows[rowIdx])
 					if err != nil {
-						return nil, err
-					}
-					if m {
+						if bool(stmt.Ignore) {
+							// UPDATE IGNORE: suppress WHERE eval errors (e.g. subquery > 1 row), skip row
+							e.addWarning("Warning", 1242, strings.TrimPrefix(err.Error(), "ERROR 1242 (21000): "))
+						} else {
+							return nil, err
+						}
+					} else if m {
 						matchingIndices = append(matchingIndices, rowIdx)
 					}
 				} else {
@@ -180,9 +184,16 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 			if stmt.Where != nil {
 				m, err := e.evalWhere(stmt.Where.Expr, row)
 				if err != nil {
-					return nil, err
+					if bool(stmt.Ignore) {
+						// UPDATE IGNORE: suppress WHERE eval errors (e.g. subquery > 1 row), skip row
+						e.addWarning("Warning", 1242, strings.TrimPrefix(err.Error(), "ERROR 1242 (21000): "))
+						match = false
+					} else {
+						return nil, err
+					}
+				} else {
+					match = m
 				}
-				match = m
 			}
 			if match {
 				matchingIndices = append(matchingIndices, i)
@@ -843,6 +854,7 @@ func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error)
 		resolvedUpds = append(resolvedUpds, resolvedUpd{colName, targetDB, targetTable, upd})
 	}
 
+nextRow:
 	for _, mrow := range matchedRows {
 		// Group SET expressions by target table key (db.table) and apply all
 		// columns for the same table together so that matchRowToTableLenient
@@ -947,8 +959,14 @@ func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error)
 						for k, pk := range pkCols {
 							vals[k] = fmt.Sprintf("%v", candidate[pk])
 						}
+						dupErr := mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key 'PRIMARY'", strings.Join(vals, "-")))
+						if bool(stmt.Ignore) {
+							e.addWarning("Warning", 1062, strings.TrimPrefix(dupErr.Error(), "ERROR 1062 (23000): "))
+							tbl.Unlock()
+							continue nextRow
+						}
 						tbl.Unlock()
-						return nil, mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key 'PRIMARY'", strings.Join(vals, "-")))
+						return nil, dupErr
 					}
 				}
 			}

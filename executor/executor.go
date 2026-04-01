@@ -3108,11 +3108,56 @@ func normalizeCreateTableEngineSelect(query string) string {
 	}
 	// Check if there are table options between the table name and SELECT
 	// CREATE [TEMPORARY] TABLE name [options] SELECT ...
+	// or CREATE [TEMPORARY] TABLE name (col defs) [options] SELECT ...
 	prefix := query[:selectIdx]
-	upperPrefix := strings.ToUpper(prefix)
-	// Strip known table options: ENGINE=x, DEFAULT CHARSET=x, COLLATE=x, ROW_FORMAT=x, etc.
+	// Find the position after the column definitions closing paren (depth 0).
+	// Table-level options only appear after the closing ')' of the column list.
+	// We must not strip CHARACTER SET / CHARSET inside the column definitions.
+	colDefsEnd := -1
+	{
+		d := 0
+		inStr := false
+		for i := 0; i < len(prefix); i++ {
+			if inStr {
+				if prefix[i] == '\'' {
+					if i+1 < len(prefix) && prefix[i+1] == '\'' {
+						i++ // skip escaped quote
+					} else {
+						inStr = false
+					}
+				} else if prefix[i] == '\\' {
+					i++
+				}
+				continue
+			}
+			switch prefix[i] {
+			case '\'':
+				inStr = true
+			case '(':
+				d++
+			case ')':
+				d--
+				if d == 0 {
+					colDefsEnd = i
+				}
+			}
+		}
+	}
+	// Only strip table-level options from the part after the closing paren.
+	// If there's no paren (rare: CREATE TABLE name ENGINE=x SELECT ...), strip from whole prefix.
+	colDefsPart := prefix
+	tableOptsPart := ""
+	if colDefsEnd >= 0 && colDefsEnd < len(prefix)-1 {
+		colDefsPart = prefix[:colDefsEnd+1]
+		tableOptsPart = prefix[colDefsEnd+1:]
+	} else if colDefsEnd < 0 {
+		// No parentheses - all of prefix is table options (CREATE TABLE name ENGINE=x SELECT)
+		colDefsPart = ""
+		tableOptsPart = prefix
+	}
+	// Strip known table options from the table-options portion only.
 	reOpts := regexp.MustCompile(`(?i)\b(?:ENGINE|TYPE|ROW_FORMAT|KEY_BLOCK_SIZE|AVG_ROW_LENGTH|MIN_ROWS|MAX_ROWS|PACK_KEYS|CHECKSUM|DELAY_KEY_WRITE|DATA\s+DIRECTORY|INDEX\s+DIRECTORY|AUTO_INCREMENT|INSERT_METHOD|STATS_AUTO_RECALC|STATS_PERSISTENT|STATS_SAMPLE_PAGES)\s*=\s*\S+`)
-	cleaned := reOpts.ReplaceAllString(prefix, " ")
+	cleaned := reOpts.ReplaceAllString(tableOptsPart, " ")
 	reCharset := regexp.MustCompile(`(?i)\bDEFAULT\s+(?:CHARSET|CHARACTER\s+SET)\s*=?\s*\S+`)
 	cleaned = reCharset.ReplaceAllString(cleaned, " ")
 	reCharset2 := regexp.MustCompile(`(?i)\b(?:CHARSET|CHARACTER\s+SET)\s*=?\s*\S+`)
@@ -3121,10 +3166,11 @@ func normalizeCreateTableEngineSelect(query string) string {
 	cleaned = reCollate.ReplaceAllString(cleaned, " ")
 	reComment := regexp.MustCompile(`(?i)\bCOMMENT\s*=?\s*'[^']*'`)
 	cleaned = reComment.ReplaceAllString(cleaned, " ")
-	_ = upperPrefix
-	// Collapse multiple spaces
+	// Collapse multiple spaces in table opts part
 	cleaned = regexp.MustCompile(`\s+`).ReplaceAllString(cleaned, " ")
-	return strings.TrimSpace(cleaned) + " " + query[selectIdx:]
+	fullPrefix := colDefsPart + cleaned
+	fullPrefix = regexp.MustCompile(`\s+`).ReplaceAllString(fullPrefix, " ")
+	return strings.TrimSpace(fullPrefix) + " " + query[selectIdx:]
 }
 
 // normalizeEngineWithoutEquals rewrites "ENGINE <value>" to "ENGINE=<value>"

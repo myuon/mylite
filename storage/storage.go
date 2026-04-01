@@ -216,9 +216,12 @@ func (e *Engine) GetTable(dbName, tableName string) (*Table, error) {
 }
 
 // Insert adds a row to the table. Handles AUTO_INCREMENT.
-func (t *Table) Insert(row Row) (int64, error) {
+// noAutoValueOnZero: when true (NO_AUTO_VALUE_ON_ZERO sql_mode), explicit 0 is stored as-is instead of generating next auto-increment.
+func (t *Table) Insert(row Row, noAutoValueOnZero ...bool) (int64, error) {
 	t.Mu.Lock()
 	defer t.Mu.Unlock()
+
+	noAutoZero := len(noAutoValueOnZero) > 0 && noAutoValueOnZero[0]
 
 	// Handle AUTO_INCREMENT
 	var lastInsertID int64
@@ -233,7 +236,7 @@ func (t *Table) Insert(row Row) (int64, error) {
 					isZero = true
 				}
 			}
-			if !exists || v == nil || isZero {
+			if !exists || v == nil || (isZero && !noAutoZero) {
 				// For nullable AI columns with explicitly-set AUTO_INCREMENT,
 				// inserting NULL stores NULL.
 				// Otherwise (NOT NULL or default AI), generate the next value.
