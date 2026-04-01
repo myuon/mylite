@@ -118,7 +118,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				modeVal = expandSQLMode(upperVal)
 			}
 			if scope == sqlparser.GlobalScope {
-				e.globalScopeVars["sql_mode"] = modeVal
+				e.setGlobalVar("sql_mode", modeVal)
 			} else {
 				e.sqlMode = modeVal
 				e.sessionScopeVars["sql_mode"] = modeVal
@@ -130,7 +130,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				boolStr = "ON"
 			}
 			if scope == sqlparser.GlobalScope {
-				e.globalScopeVars["sql_auto_is_null"] = boolStr
+				e.setGlobalVar("sql_auto_is_null", boolStr)
 			} else {
 				e.sqlAutoIsNull = isOn
 				e.sessionScopeVars["sql_auto_is_null"] = boolStr
@@ -157,13 +157,13 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				tzStr := e.timeZone.String()
 				// time.FixedZone preserves the original string we passed
 				if scope == sqlparser.GlobalScope {
-					e.globalScopeVars["time_zone"] = tzStr
+					e.setGlobalVar("time_zone", tzStr)
 				} else {
 					e.sessionScopeVars["time_zone"] = tzStr
 				}
 			} else {
 				if scope == sqlparser.GlobalScope {
-					e.globalScopeVars["time_zone"] = "SYSTEM"
+					e.setGlobalVar("time_zone", "SYSTEM")
 				} else {
 					delete(e.sessionScopeVars, "time_zone")
 				}
@@ -206,7 +206,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				if isGlobal {
 					e.deleteSysVar(name, true)
 				} else {
-					if gv, ok := e.globalScopeVars[name]; ok {
+					if gv, ok := e.getGlobalVar(name); ok {
 						e.sessionScopeVars[name] = gv
 					} else {
 						delete(e.sessionScopeVars, name)
@@ -248,7 +248,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				if isGlobal {
 					e.deleteSysVar(name, true)
 				} else {
-					if gv, ok := e.globalScopeVars[name]; ok {
+					if gv, ok := e.getGlobalVar(name); ok {
 						e.sessionScopeVars[name] = gv
 					} else {
 						delete(e.sessionScopeVars, name)
@@ -314,13 +314,13 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						// would block resetting to the compiled default (0).
 						if cleanName == "innodb_commit_concurrency" {
 							if sv, hasSV := e.startupVars[cleanName]; hasSV {
-								e.globalScopeVars[cleanName] = sv
+								e.setGlobalVar(cleanName, sv)
 							} else {
 								e.deleteSysVar(cleanName, true)
 							}
 						} else if _, hasStartup := e.startupVars[cleanName]; hasStartup {
 							if compiled, ok := e.getCompiledDefault(cleanName); ok {
-								e.globalScopeVars[cleanName] = compiled
+								e.setGlobalVar(cleanName, compiled)
 							} else {
 								e.deleteSysVar(cleanName, true)
 							}
@@ -330,7 +330,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					} else {
 						// For SET SESSION var = DEFAULT, set session to current global value.
 						// In MySQL, DEFAULT for session means "current global value".
-						if gv, ok := e.globalScopeVars[cleanName]; ok {
+						if gv, ok := e.getGlobalVar(cleanName); ok {
 							e.sessionScopeVars[cleanName] = gv
 						} else {
 							// No global override, fall back to compiled default
@@ -340,7 +340,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					// When max_join_size is reset to DEFAULT, sql_big_selects goes back to ON.
 					if cleanName == "max_join_size" {
 						if isGlobal {
-							e.globalScopeVars["sql_big_selects"] = "ON"
+							e.setGlobalVar("sql_big_selects", "ON")
 						} else {
 							e.sessionScopeVars["sql_big_selects"] = "ON"
 						}
@@ -411,7 +411,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							}
 						}
 						if !isSuper {
-							if gv, ok := e.globalScopeVars[cleanName]; ok {
+							if gv, ok := e.getGlobalVar(cleanName); ok {
 								if gMax, err := strconv.ParseUint(gv, 10, 64); err == nil {
 									if cv, err := strconv.ParseUint(clamped, 10, 64); err == nil && cv > gMax {
 										e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect %s value: '%s'", cleanName, clamped))
@@ -566,7 +566,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'innodb_commit_concurrency' can't be set to the value of '%v'", evalVal))
 					}
 					if isGlobal {
-						e.globalScopeVars[cleanName] = fmt.Sprintf("%d", newVal)
+						e.setGlobalVar(cleanName, fmt.Sprintf("%d", newVal))
 						if prevVal, had := savedSessionVal[cleanName]; had {
 							e.sessionScopeVars[cleanName] = prevVal
 						}
@@ -609,7 +609,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						return nil, mysqlError(1286, "42000", fmt.Sprintf("Unknown storage engine '%s'", val))
 					}
 					if isGlobal {
-						e.globalScopeVars[cleanName] = normalized
+						e.setGlobalVar(cleanName, normalized)
 						if prevVal, had := savedSessionVal[cleanName]; had {
 							e.sessionScopeVars[cleanName] = prevVal
 						}
@@ -655,22 +655,23 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				// affect the current session's variable value).
 				if isGlobal {
 					if v, ok := e.sessionScopeVars[cleanName]; ok {
-						e.globalScopeVars[cleanName] = v
+						globalVal := v
 						// Trigger variables reset immediately after being set
 						if triggerSysVars[cleanName] {
-							e.globalScopeVars[cleanName] = "OFF"
+							globalVal = "OFF"
 						}
+						e.setGlobalVar(cleanName, globalVal)
 						// When super_read_only is set to ON, also set read_only to ON.
 						// (Setting super_read_only OFF does NOT reset read_only.)
 						if cleanName == "super_read_only" && (v == "1" || strings.ToUpper(v) == "ON") {
-							e.globalScopeVars["read_only"] = "1"
+							e.setGlobalVar("read_only", "1")
 						}
 						// When max_join_size is set globally, update global sql_big_selects.
 						if cleanName == "max_join_size" {
 							if v == "18446744073709551615" {
-								e.globalScopeVars["sql_big_selects"] = "ON"
+								e.setGlobalVar("sql_big_selects", "ON")
 							} else {
-								e.globalScopeVars["sql_big_selects"] = "OFF"
+								e.setGlobalVar("sql_big_selects", "OFF")
 							}
 						}
 						// Restore the previous session value or remove if there wasn't one.
@@ -731,7 +732,7 @@ func (e *Executor) handleRawSet(raw string) error {
 			val = strings.Trim(val, "'\"")
 			// SET STARTUP bypasses read-only and scope checks.
 			// Store directly in both globalScopeVars and startupVars.
-			e.globalScopeVars[varName] = val
+			e.setGlobalVar(varName, val)
 			e.startupVars[varName] = val
 			return nil
 		}
@@ -783,7 +784,7 @@ func (e *Executor) handleRawSet(raw string) error {
 			}
 			isGlobal := strings.Contains(upper, "GLOBAL")
 			if isGlobal {
-				e.globalScopeVars["sql_mode"] = modeVal
+				e.setGlobalVar("sql_mode", modeVal)
 			} else {
 				e.sqlMode = modeVal
 				e.sessionScopeVars["sql_mode"] = modeVal
@@ -1004,13 +1005,13 @@ func (e *Executor) handleRawSet(raw string) error {
 			if isGlobalScope {
 				if varName == "innodb_commit_concurrency" {
 					if sv, hasSV := e.startupVars[varName]; hasSV {
-						e.globalScopeVars[varName] = sv
+						e.setGlobalVar(varName, sv)
 					} else {
 						e.deleteSysVar(varName, true)
 					}
 				} else if _, hasStartup := e.startupVars[varName]; hasStartup {
 					if compiled, ok := e.getCompiledDefault(varName); ok {
-						e.globalScopeVars[varName] = compiled
+						e.setGlobalVar(varName, compiled)
 					} else {
 						e.deleteSysVar(varName, true)
 					}
@@ -3464,7 +3465,17 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 	// Override with SET GLOBAL values.
 	// For session scope (!globalOnly), only apply global overrides for global-only
 	// variables because SET @@global.var should not affect @@session.var.
-	for name, val := range e.globalScopeVars {
+	globalVarsCopy := make(map[string]string, len(e.globalScopeVars))
+	if e.globalVarsMu != nil {
+		e.globalVarsMu.RLock()
+	}
+	for k, v := range e.globalScopeVars {
+		globalVarsCopy[k] = v
+	}
+	if e.globalVarsMu != nil {
+		e.globalVarsMu.RUnlock()
+	}
+	for name, val := range globalVarsCopy {
 		if !globalOnly && !sysVarGlobalOnly[name] && !sysVarBothScope[name] {
 			continue
 		}

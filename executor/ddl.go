@@ -28,12 +28,12 @@ func (e *Executor) isLogTableLoggingEnabled(tableName string) bool {
 	lower := strings.ToLower(tableName)
 	switch lower {
 	case "general_log":
-		if v, ok := e.globalScopeVars["general_log"]; ok {
+		if v, ok := e.getGlobalVar("general_log"); ok {
 			return strings.EqualFold(v, "ON") || v == "1"
 		}
 		return true // default is ON
 	case "slow_log":
-		if v, ok := e.globalScopeVars["slow_query_log"]; ok {
+		if v, ok := e.getGlobalVar("slow_query_log"); ok {
 			return strings.EqualFold(v, "ON") || v == "1"
 		}
 		return true // default is ON

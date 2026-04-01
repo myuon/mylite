@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"runtime"
 	"net"
 	"strconv"
 	"strings"
@@ -20,17 +21,32 @@ import (
 
 // Server is the MySQL-compatible server.
 type Server struct {
-	Executor *executor.Executor
-	Addr     string
-	listener net.Listener
-	mu       sync.Mutex
-	closed   bool
-	conns    map[net.Conn]struct{}
+	executor    *executor.Executor
+	executorMu  sync.RWMutex
+	Addr        string
+	listener    net.Listener
+	mu          sync.Mutex
+	closed      bool
+	conns       map[net.Conn]struct{}
+}
+
+// SetExecutor safely replaces the server's executor under a write lock.
+func (s *Server) SetExecutor(exec *executor.Executor) {
+	s.executorMu.Lock()
+	s.executor = exec
+	s.executorMu.Unlock()
+}
+
+// getExecutor returns the server's executor under a read lock.
+func (s *Server) getExecutor() *executor.Executor {
+	s.executorMu.RLock()
+	defer s.executorMu.RUnlock()
+	return s.executor
 }
 
 func New(exec *executor.Executor, addr string) *Server {
 	return &Server{
-		Executor: exec,
+		executor: exec,
 		Addr:     addr,
 		conns:    make(map[net.Conn]struct{}),
 	}
@@ -306,10 +322,12 @@ func (s *Server) Close() error {
 func (s *Server) handleConnection(conn net.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("panic in connection handler: %v", r)
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			log.Printf("panic in connection handler: %v\n%s", r, buf[:n])
 		}
 	}()
-	connExec := s.Executor.Clone()
+	connExec := s.getExecutor().Clone()
 	handler := &Handler{srv: s, executor: connExec}
 	connID := connExec.GetConnectionID()
 

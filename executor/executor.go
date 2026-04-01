@@ -240,7 +240,11 @@ type Executor struct {
 	// tempTables stores temporary tables per session (table name -> true).
 	tempTables map[string]bool
 	// globalScopeVars stores SET GLOBAL variable overrides.
+	// Access must be protected by globalVarsMu.
 	globalScopeVars map[string]string
+	// globalVarsMu protects concurrent access to globalScopeVars.
+	// It is a pointer so it is shared across all Clone()d executors.
+	globalVarsMu *sync.RWMutex
 	// sessionScopeVars stores SET SESSION/LOCAL variable overrides.
 	sessionScopeVars map[string]string
 	// startupVars stores variable values set at server startup (e.g., from master.opt).
@@ -365,13 +369,63 @@ func (e *Executor) sqlNotesEnabled() bool {
 	return true // default is ON
 }
 
+// getGlobalVar reads a value from globalScopeVars under RLock.
+func (e *Executor) getGlobalVar(name string) (string, bool) {
+	if e.globalVarsMu == nil {
+		v, ok := e.globalScopeVars[name]
+		return v, ok
+	}
+	e.globalVarsMu.RLock()
+	v, ok := e.globalScopeVars[name]
+	e.globalVarsMu.RUnlock()
+	return v, ok
+}
+
+// setGlobalVar writes a value to globalScopeVars under Lock.
+func (e *Executor) setGlobalVar(name, value string) {
+	if e.globalVarsMu == nil {
+		e.globalScopeVars[name] = value
+		return
+	}
+	e.globalVarsMu.Lock()
+	e.globalScopeVars[name] = value
+	e.globalVarsMu.Unlock()
+}
+
+// deleteGlobalVar deletes a key from globalScopeVars under Lock.
+func (e *Executor) deleteGlobalVar(name string) {
+	if e.globalVarsMu == nil {
+		delete(e.globalScopeVars, name)
+		return
+	}
+	e.globalVarsMu.Lock()
+	delete(e.globalScopeVars, name)
+	e.globalVarsMu.Unlock()
+}
+
+// rangeGlobalVars calls f for each (name, value) pair in globalScopeVars
+// under RLock. f must not call any globalVarsMu methods to avoid deadlock.
+func (e *Executor) rangeGlobalVars(f func(name, val string)) {
+	if e.globalVarsMu == nil {
+		for k, v := range e.globalScopeVars {
+			f(k, v)
+		}
+		return
+	}
+	e.globalVarsMu.RLock()
+	for k, v := range e.globalScopeVars {
+		f(k, v)
+	}
+	e.globalVarsMu.RUnlock()
+}
+
 // getSysVar reads a system variable with proper scope resolution:
 // session -> global -> (not found). Used for reads that don't specify scope.
 func (e *Executor) getSysVar(name string) (string, bool) {
 	if v, ok := e.sessionScopeVars[name]; ok {
 		return v, true
 	}
-	if v, ok := e.globalScopeVars[name]; ok {
+	if v, ok := e.getGlobalVar(name); ok {
 		return v, true
 	}
 	return "", false
@@ -379,8 +433,7 @@ func (e *Executor) getSysVar(name string) (string, bool) {
 
 // getSysVarGlobal reads a global-scoped system variable.
 func (e *Executor) getSysVarGlobal(name string) (string, bool) {
-	v, ok := e.globalScopeVars[name]
-	return v, ok
+	return e.getGlobalVar(name)
 }
 
 // getSysVarSession reads a session-scoped system variable.
@@ -393,7 +446,7 @@ func (e *Executor) getSysVarSession(name string) (string, bool) {
 	}
 	// For global-only variables, fall back to global scope
 	if sysVarGlobalOnly[name] {
-		if v, ok := e.globalScopeVars[name]; ok {
+		if v, ok := e.getGlobalVar(name); ok {
 			return v, true
 		}
 	}
@@ -422,7 +475,7 @@ func (e *Executor) setSysVar(name string, value string, isGlobal bool) {
 		value = "OFF"
 	}
 	if isGlobal {
-		e.globalScopeVars[name] = value
+		e.setGlobalVar(name, value)
 	} else {
 		e.sessionScopeVars[name] = value
 	}
@@ -431,7 +484,7 @@ func (e *Executor) setSysVar(name string, value string, isGlobal bool) {
 // deleteSysVar deletes a system variable from the appropriate scope map (for DEFAULT).
 func (e *Executor) deleteSysVar(name string, isGlobal bool) {
 	if isGlobal {
-		delete(e.globalScopeVars, name)
+		e.deleteGlobalVar(name)
 	} else {
 		delete(e.sessionScopeVars, name)
 	}
@@ -446,6 +499,7 @@ func (e *Executor) getCompiledDefault(name string) (string, bool) {
 			startupVars:      map[string]string{},
 			globalScopeVars:  map[string]string{},
 			sessionScopeVars: map[string]string{},
+			globalVarsMu:     &sync.RWMutex{},
 		}
 		e.compiledDefaults = tmp.buildVariablesMapScoped(true)
 	}
@@ -479,6 +533,7 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 			"slow_query_log":                 "ON",
 			"log_bin_trust_function_creators": "ON",
 		},
+		globalVarsMu:     &sync.RWMutex{},
 		sessionScopeVars: make(map[string]string),
 		startupVars: map[string]string{
 			"innodb_commit_concurrency": "0",
@@ -522,10 +577,16 @@ func (e *Executor) Clone() *Executor {
 	// for variables that have both GLOBAL and SESSION scope. This mirrors
 	// MySQL behaviour where new connections inherit the current global values.
 	sessVars := make(map[string]string)
+	if e.globalVarsMu != nil {
+		e.globalVarsMu.RLock()
+	}
 	for name, val := range e.globalScopeVars {
 		if !sysVarGlobalOnly[name] && !sysVarSessionOnly[name] {
 			sessVars[name] = val
 		}
+	}
+	if e.globalVarsMu != nil {
+		e.globalVarsMu.RUnlock()
 	}
 	return &Executor{
 		Catalog:          e.Catalog,
@@ -537,6 +598,7 @@ func (e *Executor) Clone() *Executor {
 		preparedStmts:    make(map[string]string),
 		tempTables:       make(map[string]bool),
 		globalScopeVars:  e.globalScopeVars,
+		globalVarsMu:     e.globalVarsMu,
 		sessionScopeVars: sessVars,
 		startupVars:      e.startupVars,
 		timeZone:         defaultTZ,
@@ -2460,11 +2522,19 @@ func normalizeTypeAliases(query string) string {
 // only when it appears as a whole word (not part of a larger identifier)
 // and not inside a quoted string.
 func replaceTypeWord(query, old, replacement string) string {
-	upper := strings.ToUpper(query)
+	// Use byte-level case folding to ensure upper and query have the same length.
+	// strings.ToUpper can change length for multi-byte characters (e.g. ß → SS).
+	upper := []byte(query)
+	for i, b := range upper {
+		if b >= 'a' && b <= 'z' {
+			upper[i] = b - 32
+		}
+	}
+	upperStr := string(upper)
 	oldUpper := strings.ToUpper(old)
 	idx := 0
 	for {
-		pos := strings.Index(upper[idx:], oldUpper)
+		pos := strings.Index(upperStr[idx:], oldUpper)
 		if pos == -1 {
 			break
 		}
@@ -2504,7 +2574,7 @@ func replaceTypeWord(query, old, replacement string) string {
 		// Skip if the preceding non-space token is a table option keyword like ROW_FORMAT
 		// or COLUMN_FORMAT (e.g. "ROW_FORMAT FIXED", "COLUMN_FORMAT FIXED" — value, not a column type)
 		{
-			pre := strings.TrimRight(upper[:absPos], " \t\n\r")
+			pre := strings.TrimRight(upperStr[:absPos], " \t\n\r")
 			if strings.HasSuffix(pre, "ROW_FORMAT") || strings.HasSuffix(pre, "COLUMN_FORMAT") {
 				idx = endPos
 				continue
@@ -2518,7 +2588,13 @@ func replaceTypeWord(query, old, replacement string) string {
 			}
 		}
 		query = query[:absPos] + replacement + query[endPos:]
-		upper = strings.ToUpper(query)
+		upper2 := []byte(query)
+		for i, b := range upper2 {
+			if b >= 'a' && b <= 'z' {
+				upper2[i] = b - 32
+			}
+		}
+		upperStr = string(upper2)
 		idx = absPos + len(replacement)
 	}
 	return query
@@ -5207,7 +5283,7 @@ func (e *Executor) explainResultForType(explainType sqlparser.ExplainType, expla
 // global variable is enabled and sql_log_off is not set.
 func (e *Executor) logToGeneralLog(query string) {
 	// Check if general_log is ON
-	if v, ok := e.globalScopeVars["general_log"]; ok {
+	if v, ok := e.getGlobalVar("general_log"); ok {
 		if !strings.EqualFold(v, "ON") && v != "1" {
 			return
 		}
@@ -5220,7 +5296,7 @@ func (e *Executor) logToGeneralLog(query string) {
 	}
 	// Check if log_output includes TABLE
 	logOutput := "FILE"
-	if v, ok := e.globalScopeVars["log_output"]; ok {
+	if v, ok := e.getGlobalVar("log_output"); ok {
 		logOutput = v
 	} else if v, ok := e.startupVars["log_output"]; ok {
 		logOutput = v

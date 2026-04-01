@@ -96,13 +96,6 @@ func main() {
 		time.Local = loc
 	}
 
-	unlock, err := acquireLock()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
-	}
-	defer unlock()
-
 	defaultTestdata := resolveTestdataRoot()
 	suiteRoot := flag.String("suite-root", filepath.Join(defaultTestdata, "suite"), "root directory for test suites")
 	includeRoot := flag.String("include-root", filepath.Join(defaultTestdata, "include"), "root directory for include files")
@@ -112,7 +105,28 @@ func main() {
 	timeout := flag.Duration("timeout", 20*time.Second, "timeout per test (0=no timeout)")
 	suiteFilter := flag.String("suite", "", "run only specified suite(s), comma-separated (e.g. sys_vars,innodb)")
 	testFilter := flag.String("test", "", "run only specified test(s), comma-separated in suite/testname format (e.g. sys_vars/gtid_owned_basic,other/bool)")
+	force := flag.Bool("force", false, "kill existing mtrrun process and remove lock before starting")
 	flag.Parse()
+
+	if *force {
+		if data, err := os.ReadFile(mtrrunLockFile); err == nil {
+			var pid int
+			if n, _ := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid); n == 1 {
+				if proc, err := os.FindProcess(pid); err == nil {
+					proc.Signal(syscall.SIGTERM) //nolint:errcheck
+				}
+			}
+			os.Remove(mtrrunLockFile) //nolint:errcheck
+			fmt.Fprintf(os.Stderr, "force: removed lock file %s\n", mtrrunLockFile)
+		}
+	}
+
+	unlock, err := acquireLock()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	defer unlock()
 	args := flag.Args()
 	// No args: run all suites (with optional -suite/-test filtering)
 	if len(args) == 0 {
@@ -441,7 +455,7 @@ func (w *worker) resetState() {
 	w.exec = executor.New(w.cat, w.store)
 	w.exec.DataDir = filepath.Join(w.tmpDir, "data", "inner")
 	w.exec.SearchPaths = w.searchPaths
-	w.srv.Executor = w.exec
+	w.srv.SetExecutor(w.exec)
 }
 func (w *worker) runTest(testPath string, includePaths []string, verbose bool, timeout time.Duration) mtrrunner.TestResult {
 	testName := strings.TrimSuffix(filepath.Base(testPath), ".test")
@@ -539,6 +553,35 @@ type indexedResult struct {
 	index  int
 	result mtrrunner.TestResult
 }
+
+// printVerboseResult prints a single test result line for -verbose mode.
+// mu may be nil when called from sequential execution.
+func printVerboseResult(r mtrrunner.TestResult, mu *sync.Mutex) {
+	var line string
+	timeStr := fmt.Sprintf("(%.1fs)", r.Elapsed.Seconds())
+	switch {
+	case r.Timeout:
+		line = fmt.Sprintf("  TIMEOUT: %s %s", r.Name, timeStr)
+	case r.Skipped:
+		line = fmt.Sprintf("  SKIP: %s", r.Name)
+	case r.Passed:
+		line = fmt.Sprintf("  PASS: %s %s", r.Name, timeStr)
+	case r.Error != "":
+		line = fmt.Sprintf("  ERROR: %s: %s %s", r.Name, r.Error, timeStr)
+	default:
+		diffLines := 0
+		if r.Diff != "" {
+			diffLines = len(strings.Split(r.Diff, "\n"))
+		}
+		line = fmt.Sprintf("  FAIL: %s (diff_lines=%d) %s", r.Name, diffLines, timeStr)
+	}
+	if mu != nil {
+		mu.Lock()
+		defer mu.Unlock()
+	}
+	fmt.Println(line)
+}
+
 func runParallel(testPaths []string, includePaths, searchPaths []string, verbose bool, numJobs int, timeout time.Duration) []mtrrunner.TestResult {
 	// Create worker pool
 	workers := make([]*worker, numJobs)
@@ -576,12 +619,16 @@ func runParallel(testPaths []string, includePaths, searchPaths []string, verbose
 	close(testCh)
 	resultCh := make(chan indexedResult, len(testPaths))
 	var wg sync.WaitGroup
+	var printMu sync.Mutex
 	for i := 0; i < numJobs; i++ {
 		wg.Add(1)
 		go func(w *worker) {
 			defer wg.Done()
 			for t := range testCh {
 				result := w.runTest(t.path, includePaths, verbose, timeout)
+				if verbose {
+					printVerboseResult(result, &printMu)
+				}
 				resultCh <- indexedResult{index: t.index, result: result}
 			}
 		}(workers[i])
@@ -610,6 +657,9 @@ func runSequential(testPaths []string, includePaths, searchPaths []string, verbo
 	var results []mtrrunner.TestResult
 	for _, testPath := range testPaths {
 		result := w.runTest(testPath, includePaths, verbose, timeout)
+		if verbose {
+			printVerboseResult(result, nil)
+		}
 		results = append(results, result)
 	}
 	return results
