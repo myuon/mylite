@@ -26,6 +26,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/myuon/mylite/catalog"
@@ -59,12 +60,49 @@ func init() {
 		skipTests[e.Test] = true
 	}
 }
+const mtrrunLockFile = "/tmp/mtrrun.lock"
+
+// acquireLock creates a PID lock file to prevent concurrent mtrrun executions.
+// Returns a cleanup function that removes the lock, or an error if already running.
+func acquireLock() (func(), error) {
+	// Check for existing lock and whether the owner is still alive.
+	if data, err := os.ReadFile(mtrrunLockFile); err == nil {
+		var pid int
+		if n, _ := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid); n == 1 {
+			if proc, err := os.FindProcess(pid); err == nil {
+				if proc.Signal(syscall.Signal(0)) == nil {
+					return nil, fmt.Errorf("mtrrun is already running (PID %d), lock: %s", pid, mtrrunLockFile)
+				}
+			}
+		}
+		// Stale lock — remove it.
+		os.Remove(mtrrunLockFile)
+	}
+
+	f, err := os.OpenFile(mtrrunLockFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("mtrrun is already running, lock: %s", mtrrunLockFile)
+	}
+	fmt.Fprintf(f, "%d", os.Getpid())
+	f.Close()
+
+	return func() { os.Remove(mtrrunLockFile) }, nil
+}
+
 func main() {
 	// MySQL MTR framework uses --timezone=GMT-3 (POSIX convention: GMT-3 = UTC+3).
 	os.Setenv("TZ", "Etc/GMT-3")
 	if loc, err := time.LoadLocation("Etc/GMT-3"); err == nil {
 		time.Local = loc
 	}
+
+	unlock, err := acquireLock()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	defer unlock()
+
 	defaultTestdata := resolveTestdataRoot()
 	suiteRoot := flag.String("suite-root", filepath.Join(defaultTestdata, "suite"), "root directory for test suites")
 	includeRoot := flag.String("include-root", filepath.Join(defaultTestdata, "include"), "root directory for include files")
@@ -217,7 +255,14 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 				fmt.Printf("  ERROR: %s: %s\n", r.Name, r.Error[:min(len(r.Error), 200)])
 			}
 			if !r.Passed && !r.Skipped && !r.Timeout && r.Error == "" {
-				fmt.Printf("  FAIL: %s\n", r.Name)
+				diffLines := 0
+				if r.Diff != "" {
+					diffLines = len(strings.Split(r.Diff, "\n"))
+				}
+				fmt.Printf("  FAIL: %s (diff_lines=%d)\n", r.Name, diffLines)
+				if r.Diff != "" && diffLines <= 20 {
+					fmt.Printf("  DIFF:\n%s\n", r.Diff)
+				}
 			}
 		}
 		printSuiteSummaryCompact(sn, len(results), p, f, s, e, t, 0)
