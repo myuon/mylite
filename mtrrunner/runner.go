@@ -787,8 +787,9 @@ func (ctx *execContext) executeLines(lines []string) error {
 		// Collect raw lines for echoing and build SQL statement
 		var rawLines []string
 		stmt := ""
-		inSingleQuote := false // track if we're inside a single-quoted string literal
-		inDoubleQuote := false // track if we're inside a double-quoted string literal
+		inSingleQuote := false  // track if we're inside a single-quoted string literal
+		inDoubleQuote := false  // track if we're inside a double-quoted string literal
+		inBlockComment := false // track if we're inside a /* ... */ block comment
 		inStringLiteral := false // combined: true when inside either quote type
 		for i < len(lines) {
 			l := lines[i]
@@ -819,9 +820,17 @@ func (ctx *execContext) executeLines(lines []string) error {
 				rawEcho = stripCommentAfterDelimiter(t, delim)
 			}
 
-			// Track string literal state: handle single and double quoted strings
+			// Track string literal state: handle single/double quoted strings and /* */ block comments
 			for ci := 0; ci < len(t); ci++ {
 				ch := t[ci]
+				if inBlockComment {
+					// Look for end of block comment */
+					if ch == '*' && ci+1 < len(t) && t[ci+1] == '/' {
+						inBlockComment = false
+						ci++ // skip the '/'
+					}
+					continue
+				}
 				if inSingleQuote {
 					if ch == '\\' && ci+1 < len(t) {
 						ci++ // skip escaped character
@@ -849,6 +858,12 @@ func (ctx *execContext) executeLines(lines []string) error {
 						inDoubleQuote = false
 					}
 				} else {
+					// Check for start of block comment /*
+					if ch == '/' && ci+1 < len(t) && t[ci+1] == '*' {
+						inBlockComment = true
+						ci++ // skip the '*'
+						continue
+					}
 					if ch == '\'' {
 						inSingleQuote = true
 					} else if ch == '"' {
