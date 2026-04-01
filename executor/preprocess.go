@@ -417,6 +417,19 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 			e.preparedStmts[stmtName] = queryStr
 			return "", &Result{}, nil
 		}
+		// Handle PREPARE stmt FROM 'string' or PREPARE stmt FROM "string" where the
+		// string may contain embedded newlines. Vitess parser cannot handle literal
+		// newlines inside string literals, so we extract the content manually.
+		if queryStr, stmtName, ok := extractPrepareFromStringLiteral(trimmed); ok {
+			// Unescape escape sequences
+			queryStr = strings.ReplaceAll(queryStr, "\\n", "\n")
+			queryStr = strings.ReplaceAll(queryStr, "\\t", "\t")
+			queryStr = strings.ReplaceAll(queryStr, "\\'", "'")
+			queryStr = strings.ReplaceAll(queryStr, "\\\"", "\"")
+			queryStr = strings.ReplaceAll(queryStr, "\\\\", "\\")
+			e.preparedStmts[stmtName] = queryStr
+			return "", &Result{}, nil
+		}
 	}
 
 	// Handle CREATE TRIGGER before vitess parser (it cannot parse triggers)
@@ -654,6 +667,60 @@ func normalizeODBCDateTimeLiterals(query string) string {
 }
 
 // rewriteMidToSubstring rewrites MID( function calls to SUBSTRING( since
+// extractPrepareFromStringLiteral parses a PREPARE stmt FROM 'string' or
+// PREPARE stmt FROM "string" statement where the string may contain embedded
+// newlines. Returns (queryStr, stmtName, true) on success, ("", "", false) otherwise.
+// This is needed because the vitess parser cannot handle literal newlines inside
+// string literals.
+func extractPrepareFromStringLiteral(trimmed string) (string, string, bool) {
+	// Match: PREPARE <name> FROM followed by a single or double quoted string
+	re := regexp.MustCompile(`(?is)^PREPARE\s+(\S+)\s+FROM\s*(['"])`)
+	m := re.FindStringSubmatchIndex(trimmed)
+	if m == nil {
+		return "", "", false
+	}
+	stmtName := trimmed[m[2]:m[3]]
+	quoteChar := trimmed[m[4]:m[5]]
+	quote := quoteChar[0]
+	// Find the content after the opening quote
+	contentStart := m[5]
+	content := trimmed[contentStart:]
+	// Find the matching closing quote (handling escaped quotes)
+	var queryStr strings.Builder
+	i := 0
+	for i < len(content) {
+		ch := content[i]
+		if ch == '\\' && i+1 < len(content) {
+			// Escaped character - pass through as-is for later unescaping
+			queryStr.WriteByte(ch)
+			queryStr.WriteByte(content[i+1])
+			i += 2
+			continue
+		}
+		if ch == quote {
+			// Check for doubled quote ('' or "")
+			if i+1 < len(content) && content[i+1] == quote {
+				queryStr.WriteByte(ch)
+				i += 2
+				continue
+			}
+			// End of string literal
+			// Check that only whitespace and optional semicolon follow
+			rest := strings.TrimSpace(content[i+1:])
+			rest = strings.TrimSuffix(rest, ";")
+			rest = strings.TrimSpace(rest)
+			if rest != "" {
+				return "", "", false
+			}
+			return queryStr.String(), stmtName, true
+		}
+		queryStr.WriteByte(ch)
+		i++
+	}
+	// Unterminated string
+	return "", "", false
+}
+
 // the vitess SQL parser does not recognize MID as a built-in function.
 // MID(str, pos, len) is a MySQL synonym for SUBSTRING(str, pos, len).
 func rewriteMidToSubstring(query string) string {

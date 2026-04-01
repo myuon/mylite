@@ -5516,6 +5516,12 @@ func (e *Executor) Execute(query string) (*Result, error) {
 				strings.Contains(upper, "SECOND_MICROSECOND")) {
 			return nil, mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'MICROSECOND'")
 		}
+		// OPTIMIZE TABLE ... EXTENDED and ANALYZE TABLE ... EXTENDED are syntax errors in MySQL
+		if (strings.HasPrefix(upper, "OPTIMIZE TABLE") || strings.HasPrefix(upper, "ANALYZE TABLE")) &&
+			strings.HasSuffix(strings.TrimRight(upper, ";"), "EXTENDED") {
+			// Return MySQL syntax error 1064
+			return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'extended' at line 1"))
+		}
 		if strings.HasPrefix(upper, "CREATE EVENT") ||
 			strings.HasPrefix(upper, "DROP EVENT") ||
 			strings.HasPrefix(upper, "CREATE USER") ||
@@ -5777,8 +5783,8 @@ func (e *Executor) Execute(query string) (*Result, error) {
 					if e.innodbStatsPersistentEnabled(def) {
 						e.upsertInnoDBStatsRows(e.CurrentDB, tableName, e.tableRowCount(e.CurrentDB, tableName))
 					}
-					// InnoDB tables return "OK"; non-InnoDB return "Table is already up to date"
-					// Exception: tables with SPATIAL indexes always return "OK" (reanalysis needed)
+					// InnoDB tables and tables with SPATIAL indexes return "OK"
+					// Non-InnoDB without SPATIAL return "Table is already up to date"
 					eng := strings.ToUpper(def.Engine)
 					hasSpatial := false
 					for _, idx := range def.Indexes {
@@ -13439,6 +13445,13 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 		return &Result{AffectedRows: 0}, nil
 	}
 
+	// OPTIMIZE TABLE and ANALYZE TABLE do not support EXTENDED keyword — return syntax error
+	{
+		restUpper := strings.ToUpper(strings.TrimSpace(strings.TrimRight(rest, ";")))
+		if (op == "optimize" || op == "analyze") && strings.HasSuffix(restUpper, " EXTENDED") {
+			return nil, mysqlError(1064, "42000", "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'extended' at line 1")
+		}
+	}
 	// Detect FOR UPGRADE option before stripping
 	forUpgrade := false
 	{

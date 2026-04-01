@@ -787,7 +787,9 @@ func (ctx *execContext) executeLines(lines []string) error {
 		// Collect raw lines for echoing and build SQL statement
 		var rawLines []string
 		stmt := ""
-		inStringLiteral := false // track if we're inside a multi-line string literal
+		inSingleQuote := false // track if we're inside a single-quoted string literal
+		inDoubleQuote := false // track if we're inside a double-quoted string literal
+		inStringLiteral := false // combined: true when inside either quote type
 		for i < len(lines) {
 			l := lines[i]
 			t := strings.TrimSpace(l)
@@ -817,21 +819,44 @@ func (ctx *execContext) executeLines(lines []string) error {
 				rawEcho = stripCommentAfterDelimiter(t, delim)
 			}
 
-			// Track string literal state: count unescaped single quotes on this line
+			// Track string literal state: handle single and double quoted strings
 			for ci := 0; ci < len(t); ci++ {
-				if t[ci] == '\'' {
-					// Check if escaped
-					if ci > 0 && t[ci-1] == '\\' {
+				ch := t[ci]
+				if inSingleQuote {
+					if ch == '\\' && ci+1 < len(t) {
+						ci++ // skip escaped character
 						continue
 					}
-					// Check for '' escape (two consecutive quotes)
-					if ci+1 < len(t) && t[ci+1] == '\'' {
-						ci++ // skip the next quote
+					if ch == '\'' {
+						// Check for '' escape (two consecutive single quotes)
+						if ci+1 < len(t) && t[ci+1] == '\'' {
+							ci++ // skip the next quote
+							continue
+						}
+						inSingleQuote = false
+					}
+				} else if inDoubleQuote {
+					if ch == '\\' && ci+1 < len(t) {
+						ci++ // skip escaped character
 						continue
 					}
-					inStringLiteral = !inStringLiteral
+					if ch == '"' {
+						// Check for "" escape (two consecutive double quotes)
+						if ci+1 < len(t) && t[ci+1] == '"' {
+							ci++ // skip the next quote
+							continue
+						}
+						inDoubleQuote = false
+					}
+				} else {
+					if ch == '\'' {
+						inSingleQuote = true
+					} else if ch == '"' {
+						inDoubleQuote = true
+					}
 				}
 			}
+			inStringLiteral = inSingleQuote || inDoubleQuote
 			// Strip inline comments (# outside quotes) for SQL processing
 			if !inStringLiteral {
 				t = stripInlineComment(t)
@@ -867,9 +892,10 @@ func (ctx *execContext) executeLines(lines []string) error {
 			rawLines = append(rawLines, rawEcho)
 
 			// Check delimiter on stripped line, but also on original trimmed line
-			// (in case inline comment stripping removed the trailing delimiter)
+			// (in case inline comment stripping removed the trailing delimiter).
+			// Do not treat a delimiter inside a string literal as a statement terminator.
 			originalTrimmed := strings.TrimSpace(l)
-			hasDelim := strings.HasSuffix(t, delim) || strings.HasSuffix(originalTrimmed, delim)
+			hasDelim := !inStringLiteral && (strings.HasSuffix(t, delim) || strings.HasSuffix(originalTrimmed, delim))
 			if hasDelim {
 				stmt += strings.TrimSuffix(stmtLine, delim)
 				i++

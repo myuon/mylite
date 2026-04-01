@@ -765,7 +765,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			if hasArrayCastExpr(idxCol.Expression) {
 				hasArrayMVIIndex = true
 			}
-			colStr := idxCol.Column.String()
+			colStr := strings.ToLower(idxCol.Column.String())
 			if idxCol.Expression != nil {
 				colStr = fmt.Sprintf("(%s)", strings.TrimSpace(sqlparser.String(idxCol.Expression)))
 			} else if idxCol.Length != nil {
@@ -1798,7 +1798,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			var idxCols []string
 			var idxOrders []string
 			for _, idxCol := range op.IndexDefinition.Columns {
-				colStr := idxCol.Column.String()
+				colStr := strings.ToLower(idxCol.Column.String())
 				if idxCol.Expression != nil {
 					colStr = fmt.Sprintf("(%s)", strings.TrimSpace(sqlparser.String(idxCol.Expression)))
 				} else if idxCol.Length != nil {
