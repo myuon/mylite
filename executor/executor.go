@@ -11052,6 +11052,46 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		if (left == nil || right == nil) && v.Operator != sqlparser.NullSafeEqualOp {
 			return nil, nil
 		}
+		// For system variable ENUM comparisons, apply case-insensitive string comparison
+		// to match MySQL's default collation (utf8mb4_0900_ai_ci) behavior.
+		if v.Operator == sqlparser.EqualOp || v.Operator == sqlparser.NotEqualOp {
+			isSysVarEnumRow := false
+			if varExpr, ok := leftExpr2.(*sqlparser.Variable); ok {
+				varName := strings.ToLower(varExpr.Name.String())
+				varName = strings.TrimPrefix(varName, "global.")
+				varName = strings.TrimPrefix(varName, "session.")
+				varName = strings.TrimPrefix(varName, "local.")
+				if sysVarEnumSet[varName] {
+					isSysVarEnumRow = true
+				}
+			}
+			if varExpr, ok := rightExpr2.(*sqlparser.Variable); ok {
+				varName := strings.ToLower(varExpr.Name.String())
+				varName = strings.TrimPrefix(varName, "global.")
+				varName = strings.TrimPrefix(varName, "session.")
+				varName = strings.TrimPrefix(varName, "local.")
+				if sysVarEnumSet[varName] {
+					isSysVarEnumRow = true
+				}
+			}
+			if isSysVarEnumRow {
+				if ls, lok := left.(string); lok {
+					if rs, rok := right.(string); rok {
+						equal := strings.EqualFold(ls, rs)
+						if v.Operator == sqlparser.EqualOp {
+							if equal {
+								return int64(1), nil
+							}
+							return int64(0), nil
+						}
+						if !equal {
+							return int64(1), nil
+						}
+						return int64(0), nil
+					}
+				}
+			}
+		}
 		result, err := compareValues(left, right, v.Operator)
 		if err != nil {
 			return nil, err

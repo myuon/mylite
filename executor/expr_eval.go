@@ -243,6 +243,22 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 		return nil, mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a SESSION variable", name))
 	}
 
+	// rand_seed1 and rand_seed2 are write-only: they can be SET to seed the RNG
+	// but SELECT @@rand_seed1 / @@rand_seed2 always returns 0 (MySQL behavior).
+	if name == "rand_seed1" || name == "rand_seed2" {
+		return int64(0), nil
+	}
+
+	// pseudo_thread_id defaults to the connection ID but can be overridden by SET.
+	if name == "pseudo_thread_id" && v.Scope != sqlparser.GlobalScope {
+		if sv, ok := e.sessionScopeVars["pseudo_thread_id"]; ok {
+			if n, err := strconv.ParseInt(sv, 10, 64); err == nil {
+				return n, nil
+			}
+		}
+		return e.connectionID, nil
+	}
+
 	// Check for user-set variables with proper scope resolution.
 	var gv string
 	var gvOK bool
@@ -937,6 +953,49 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 			case sqlparser.GreaterEqualOp:
 				if cmp >= 0 { return int64(1), nil }
 				return int64(0), nil
+			}
+		}
+	}
+	// For system variable ENUM comparisons (e.g. @@updatable_views_with_limit = 'Yes'),
+	// apply case-insensitive string comparison to match MySQL's default collation behavior.
+	// This is only done when one side is a system variable in sysVarEnumSet and both
+	// operands are non-numeric strings.
+	if v.Operator == sqlparser.EqualOp || v.Operator == sqlparser.NotEqualOp {
+		isSysVarEnum := false
+		if varExpr, ok := leftExpr.(*sqlparser.Variable); ok {
+			varName := strings.ToLower(varExpr.Name.String())
+			varName = strings.TrimPrefix(varName, "global.")
+			varName = strings.TrimPrefix(varName, "session.")
+			varName = strings.TrimPrefix(varName, "local.")
+			if sysVarEnumSet[varName] {
+				isSysVarEnum = true
+			}
+		}
+		if varExpr, ok := rightExpr.(*sqlparser.Variable); ok {
+			varName := strings.ToLower(varExpr.Name.String())
+			varName = strings.TrimPrefix(varName, "global.")
+			varName = strings.TrimPrefix(varName, "session.")
+			varName = strings.TrimPrefix(varName, "local.")
+			if sysVarEnumSet[varName] {
+				isSysVarEnum = true
+			}
+		}
+		if isSysVarEnum {
+			if ls, lok := left.(string); lok {
+				if rs, rok := right.(string); rok {
+					equal := strings.EqualFold(ls, rs)
+					if v.Operator == sqlparser.EqualOp {
+						if equal {
+							return int64(1), nil
+						}
+						return int64(0), nil
+					}
+					// NotEqualOp
+					if !equal {
+						return int64(1), nil
+					}
+					return int64(0), nil
+				}
 			}
 		}
 	}

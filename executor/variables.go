@@ -1867,9 +1867,11 @@ var sysVarSessionOnly = map[string]bool{
 // sysVarBothScope contains system variables that exist at both SESSION and GLOBAL scope.
 // These should not be blocked by sysVarGlobalOnly even if they appear there.
 var sysVarBothScope = map[string]bool{
-	"gtid_owned":         true,
-	"max_allowed_packet": true,
-	"rbr_exec_mode":      true,
+	"gtid_owned":           true,
+	"max_allowed_packet":   true,
+	"rbr_exec_mode":        true,
+	"max_user_connections": true,
+	"net_buffer_length":    true,
 }
 
 // sysVarSessionReadOnly contains system variables that are read-only at SESSION scope.
@@ -2345,10 +2347,18 @@ func (e *Executor) clampIntVar(name string, expr sqlparser.Expr, min int64, max 
 	if parseErr != nil {
 		return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
 	}
-	// Check for --maximum-<varname> startup option that caps the max value
+	// Check for --maximum-<varname> startup option that caps the max value.
+	// For signed variables, the maximum also sets a symmetric negative minimum
+	// (e.g., --maximum-optimizer-trace-offset=50 means range is [-50, 50]).
+	var maximumCapMin int64
+	var hasMaximumCap bool
 	if maxStr, ok := e.startupVars["maximum_"+name]; ok {
 		if maxVal, err := strconv.ParseUint(maxStr, 10, 64); err == nil && maxVal < max {
 			max = maxVal
+			if !isUnsigned {
+				maximumCapMin = -int64(maxVal)
+				hasMaximumCap = true
+			}
 		}
 	}
 	warn := func() {
@@ -2390,8 +2400,13 @@ func (e *Executor) clampIntVar(name string, expr sqlparser.Expr, min int64, max 
 			out = int64(u)
 		}
 	}
-	if out < min {
-		out = min
+	// Apply symmetric negative minimum from --maximum-<varname> startup option
+	effectiveMin := min
+	if hasMaximumCap && maximumCapMin > min {
+		effectiveMin = maximumCapMin
+	}
+	if out < effectiveMin {
+		out = effectiveMin
 		warn()
 	}
 	if out > maxI {
@@ -3528,6 +3543,13 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 	vars["insert_id"] = strconv.FormatInt(e.nextInsertID, 10)
 	vars["identity"] = strconv.FormatInt(e.lastInsertID, 10)
 	vars["last_insert_id"] = strconv.FormatInt(e.lastInsertID, 10)
+	// pseudo_thread_id defaults to the connection ID (if not explicitly SET)
+	if _, hasExplicit := e.sessionScopeVars["pseudo_thread_id"]; !hasExplicit {
+		vars["pseudo_thread_id"] = strconv.FormatInt(e.connectionID, 10)
+	}
+	// rand_seed1 and rand_seed2 always read as 0 (write-only variables)
+	vars["rand_seed1"] = "0"
+	vars["rand_seed2"] = "0"
 	return vars
 }
 
