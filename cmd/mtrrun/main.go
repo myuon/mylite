@@ -60,7 +60,7 @@ func init() {
 		skipTests[e.Test] = true
 	}
 }
-const mtrrunLockFile = "/tmp/mtrrun.lock"
+var mtrrunLockFile = filepath.Join(os.TempDir(), "mtrrun.lock")
 
 // acquireLock creates a PID lock file to prevent concurrent mtrrun executions.
 // Returns a cleanup function that removes the lock, or an error if already running.
