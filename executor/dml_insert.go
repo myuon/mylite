@@ -430,7 +430,10 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		if firstAutoInsertID > 0 {
 			lastInsertID = firstAutoInsertID
 		}
-		e.lastInsertID = lastInsertID
+		// Only overwrite e.lastInsertID if an auto-increment insert occurred.
+		if lastInsertID > 0 {
+			e.lastInsertID = lastInsertID
+		}
 
 		if lastInsertID > 0 {
 			for _, col := range tbl.Def.Columns {
@@ -463,6 +466,36 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			return result, nil
 		}
 		// Fall through to slow path
+		// Check for ambiguous column references in ON DUPLICATE KEY UPDATE expressions.
+		// MySQL error 1052: if an unqualified column name in the ODKU clause exists in
+		// both the SELECT source result columns AND the target table columns.
+		if len(stmt.OnDup) > 0 {
+			sourceColSet := make(map[string]bool, len(selResult.Columns))
+			for _, sc := range selResult.Columns {
+				sourceColSet[strings.ToLower(sc)] = true
+			}
+			targetColSet := make(map[string]bool, len(tbl.Def.Columns))
+			for _, tc := range tbl.Def.Columns {
+				targetColSet[strings.ToLower(tc.Name)] = true
+			}
+			for _, upd := range stmt.OnDup {
+				// Collect all unqualified column references in the update expression
+				if walkErr := sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+					if colName, ok := node.(*sqlparser.ColName); ok {
+						if colName.Qualifier.IsEmpty() {
+							cn := strings.ToLower(colName.Name.String())
+							if sourceColSet[cn] && targetColSet[cn] {
+								return false, mysqlError(1052, "23000",
+									fmt.Sprintf("Column '%s' in field list is ambiguous", colName.Name.String()))
+							}
+						}
+					}
+					return true, nil
+				}, upd.Expr); walkErr != nil {
+					return nil, walkErr
+				}
+			}
+		}
 		var valRows sqlparser.Values
 		for _, selRow := range selResult.Rows {
 			var tuple sqlparser.ValTuple
@@ -532,6 +565,8 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	var lastInsertID int64
 	var firstAutoInsertID int64
 	var affected uint64
+	var odkuCount uint64  // number of rows that triggered ON DUPLICATE KEY UPDATE
+	var totalRows uint64  // total rows processed from VALUES/SELECT
 	autoColName := ""
 	for _, col := range tbl.Def.Columns {
 		if col.AutoIncrement {
@@ -541,6 +576,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	}
 
 	for _, valTuple := range rows {
+		totalRows++
 		row := make(storage.Row)
 		origValues := make(storage.Row) // original values before formatting (for strict mode checks)
 		for i, val := range valTuple {
@@ -878,10 +914,91 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						}
 					}
 				}
+				// Check NOT NULL constraints on the updated row.
+				updatedRow := tbl.Rows[dupIdx]
+				var notNullColName string
+				for _, col := range tbl.Def.Columns {
+					if !col.Nullable && !col.AutoIncrement && !isGeneratedColumnType(col.Type) {
+						if updatedRow[col.Name] == nil {
+							notNullColName = col.Name
+							break
+						}
+					}
+				}
+				if notNullColName != "" {
+					// Rollback the update
+					tbl.Rows[dupIdx] = odduSnap
+					tbl.InvalidateIndexes()
+					tbl.Unlock()
+					if bool(stmt.Ignore) {
+						e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", notNullColName))
+						continue
+					}
+					return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", notNullColName))
+				}
+				// Check that the updated row does not violate any other unique constraints.
+				// E.g. ON DUPLICATE KEY UPDATE b=4 might create a duplicate on another UNIQUE key.
+				var uniqueViolationErr error
+				// Check unique indexes
+				for _, idx := range tbl.Def.Indexes {
+					if !idx.Unique {
+						continue
+					}
+					// Check if any unique index column was actually modified.
+					idxModified := false
+					for _, c := range idx.Columns {
+						baseC := stripPrefixLengthFromCol(c)
+						ov := fmt.Sprintf("%v", odduSnap[baseC])
+						nv := fmt.Sprintf("%v", updatedRow[baseC])
+						if ov != nv {
+							idxModified = true
+							break
+						}
+					}
+					if !idxModified {
+						continue
+					}
+					for j, other := range tbl.Rows {
+						if j == dupIdx {
+							continue
+						}
+						match := true
+						vals := make([]string, 0, len(idx.Columns))
+						for _, c := range idx.Columns {
+							baseC := stripPrefixLengthFromCol(c)
+							nv := updatedRow[baseC]
+							ov := other[baseC]
+							if nv == nil || ov == nil {
+								match = false
+								break
+							}
+							if fmt.Sprintf("%v", nv) != fmt.Sprintf("%v", ov) {
+								match = false
+								break
+							}
+							vals = append(vals, fmt.Sprintf("%v", nv))
+						}
+						if match {
+							uniqueViolationErr = mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key '%s'", strings.Join(vals, "-"), idx.Name))
+							break
+						}
+					}
+					if uniqueViolationErr != nil {
+						break
+					}
+				}
+				if uniqueViolationErr != nil {
+					// Rollback the update by restoring the snapshot
+					tbl.Rows[dupIdx] = odduSnap
+					tbl.InvalidateIndexes()
+					tbl.Unlock()
+					return nil, uniqueViolationErr
+				}
 				tbl.InvalidateIndexes()
 				tbl.Unlock()
 				// MySQL counts ON DUPLICATE KEY UPDATE as 2 affected rows when a row is updated.
 				affected += 2
+				odkuCount++
 				continue
 			}
 		}
@@ -937,6 +1054,9 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		}
 
 		// REPLACE: delete existing duplicate row (after BEFORE INSERT, before actual insert)
+		// We track the position of the deleted row so we can reinsert at the same slot,
+		// preserving MySQL's physical row ordering behavior.
+		replaceAtIdx := -1
 		if stmt.Action == sqlparser.ReplaceAct {
 			dupIdx := e.findDuplicateRow(tbl, row, pkCols, uniqueCols)
 			if dupIdx >= 0 {
@@ -957,6 +1077,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				tbl.InvalidateIndexes()
 				tbl.Unlock()
 				affected++ // REPLACE counts deleted row + inserted row = 2
+				replaceAtIdx = dupIdx // remember position for reinsertion
 
 				// Fire AFTER DELETE trigger
 				if err := e.fireTriggers(tableName, "AFTER", "DELETE", nil, oldRow); err != nil {
@@ -1317,6 +1438,22 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		}
 		affected++
 
+		// For REPLACE: move the newly inserted row to the position of the deleted row
+		// to preserve MySQL's physical row ordering (new row occupies the same slot).
+		if replaceAtIdx >= 0 {
+			tbl.Lock()
+			newIdx := len(tbl.Rows) - 1
+			if replaceAtIdx < newIdx {
+				// Move the row from the end to replaceAtIdx by shifting rows
+				moved := tbl.Rows[newIdx]
+				copy(tbl.Rows[replaceAtIdx+1:newIdx+1], tbl.Rows[replaceAtIdx:newIdx])
+				tbl.Rows[replaceAtIdx] = moved
+				tbl.InvalidateIndexes()
+			}
+			tbl.Unlock()
+			replaceAtIdx = -1 // reset for next iteration
+		}
+
 		// Fire AFTER INSERT triggers
 		if err := e.fireTriggers(tableName, "AFTER", "INSERT", fullRow, nil); err != nil {
 			return nil, err
@@ -1326,7 +1463,12 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	if firstAutoInsertID > 0 {
 		lastInsertID = firstAutoInsertID
 	}
-	e.lastInsertID = lastInsertID
+	// Only overwrite e.lastInsertID if an auto-increment insert occurred.
+	// When only ON DUPLICATE KEY UPDATE fired (no new rows), preserve any
+	// value that LAST_INSERT_ID(expr) set during the UPDATE clause evaluation.
+	if lastInsertID > 0 {
+		e.lastInsertID = lastInsertID
+	}
 
 	// evaluateCheckConstraint is defined below.
 
@@ -1353,9 +1495,26 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		}
 	}
 
+	// Build info message for INSERT/REPLACE with Records/Duplicates counts.
+	// This is used by the mtrrunner to emit the "info: Records: N  Duplicates: M  Warnings: 0" line.
+	var infoMsg string
+	if stmt.Action == sqlparser.InsertAct || stmt.Action == sqlparser.ReplaceAct {
+		duplicates := odkuCount
+		if stmt.Action == sqlparser.ReplaceAct {
+			// For REPLACE, duplicates = number of deleted+reinserted rows
+			duplicates = affected - totalRows
+			if totalRows > affected {
+				duplicates = 0
+			}
+		}
+		infoMsg = fmt.Sprintf("Records: %d  Duplicates: %d  Warnings: 0", totalRows, duplicates)
+	}
+	e.lastInsertInfo = infoMsg
+
 	return &Result{
 		AffectedRows: affected,
 		InsertID:     uint64(lastInsertID),
+		InfoMessage:  infoMsg,
 	}, nil
 }
 

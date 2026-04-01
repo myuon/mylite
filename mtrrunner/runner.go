@@ -2441,9 +2441,26 @@ func (ctx *execContext) executeExec(stmt string) error {
 		ctx.output.WriteString(fmt.Sprintf("affected rows: %d\n", affected))
 		upper := strings.ToUpper(strings.TrimSpace(stmt))
 		if strings.HasPrefix(upper, "ALTER TABLE") || strings.HasPrefix(upper, "LOAD DATA") ||
-			strings.HasPrefix(upper, "CREATE INDEX") || strings.HasPrefix(upper, "DROP INDEX") ||
-			strings.HasPrefix(upper, "INSERT") || strings.HasPrefix(upper, "REPLACE") {
+			strings.HasPrefix(upper, "CREATE INDEX") || strings.HasPrefix(upper, "DROP INDEX") {
 			ctx.output.WriteString(fmt.Sprintf("info: Records: %d  Duplicates: 0  Warnings: 0\n", affected))
+		} else if strings.HasPrefix(upper, "INSERT") || strings.HasPrefix(upper, "REPLACE") {
+			// Query the server for INSERT/REPLACE info (Records/Duplicates/Warnings)
+			var info string
+			if activeConn != nil {
+				row := activeConn.QueryRowContext(context.Background(), "MYLITE LAST_INSERT_INFO")
+				if err := row.Scan(&info); err == nil && info != "" {
+					ctx.output.WriteString(fmt.Sprintf("info: %s\n", info))
+				} else {
+					ctx.output.WriteString(fmt.Sprintf("info: Records: %d  Duplicates: 0  Warnings: 0\n", affected))
+				}
+			} else {
+				row := ctx.db.QueryRow("MYLITE LAST_INSERT_INFO")
+				if err := row.Scan(&info); err == nil && info != "" {
+					ctx.output.WriteString(fmt.Sprintf("info: %s\n", info))
+				} else {
+					ctx.output.WriteString(fmt.Sprintf("info: Records: %d  Duplicates: 0  Warnings: 0\n", affected))
+				}
+			}
 		} else if strings.HasPrefix(upper, "UPDATE") {
 			// Query the server for the update info message (Rows matched/Changed)
 			var info string

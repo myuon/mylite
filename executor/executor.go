@@ -211,6 +211,7 @@ type Executor struct {
 	snapshots      map[string]*fullSnapshot
 	lastInsertID   int64
 	lastUpdateInfo string // stores info message from last UPDATE (e.g. "Rows matched: 2  Changed: 1  Warnings: 0")
+	lastInsertInfo string // stores info message from last INSERT/REPLACE (e.g. "Records: 5  Duplicates: 2  Warnings: 0")
 	// cteMap holds CTE virtual tables for the currently executing query.
 	cteMap map[string]*cteTable
 	// sqlMode stores the current SQL mode (e.g. "TRADITIONAL", "STRICT_TRANS_TABLES").
@@ -8754,6 +8755,15 @@ func (e *Executor) execMyliteCommand(query string) (*Result, error) {
 		if info == "" {
 			info = ""
 		}
+		return &Result{
+			Columns:     []string{"info"},
+			Rows:        [][]interface{}{{info}},
+			IsResultSet: true,
+		}, nil
+	}
+
+	if restUpper == "LAST_INSERT_INFO" {
+		info := e.lastInsertInfo
 		return &Result{
 			Columns:     []string{"info"},
 			Rows:        [][]interface{}{{info}},
