@@ -7787,6 +7787,16 @@ func checkIntegerStrict(colType string, colName string, v interface{}) error {
 		if hasDot {
 			f, _ := strconv.ParseFloat(numStr, 64)
 			intVal = int64(f)
+		} else if isUnsigned && !strings.HasPrefix(numStr, "-") {
+			// For unsigned columns, try ParseUint first to handle values > MaxInt64
+			u, err := strconv.ParseUint(numStr, 10, 64)
+			if err != nil {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+			}
+			if u > maxUnsigned {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+			}
+			return nil
 		} else {
 			n, err := strconv.ParseInt(numStr, 10, 64)
 			if err != nil {

@@ -657,8 +657,9 @@ func (ctx *execContext) executeLines(lines []string) error {
 		if strings.HasPrefix(trimmed, "--") {
 			directive := strings.TrimPrefix(trimmed, "--")
 			directive = strings.TrimSpace(directive)
-			name, _ := parseDirectiveNameArgs(directive)
+			name, inlineArgs := parseDirectiveNameArgs(directive)
 			if (name == "query" || name == "query_vertical") &&
+				inlineArgs == "" &&
 				!strings.HasSuffix(strings.TrimSpace(trimmed), ";") {
 				fullDirective := directive
 				i++

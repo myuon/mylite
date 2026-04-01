@@ -353,6 +353,8 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	}
 	// Strip ODBC outer join escape syntax: { oj ... } → ...
 	query = normalizeODBCOuterJoin(query)
+	// Convert ODBC date/time/timestamp literals: {d '...'} → '...', {ts '...'} → '...', {t '...'} → '...'
+	query = normalizeODBCDateTimeLiterals(query)
 	query = normalizeForShareOf(query)
 	query = normalizeMemberOperator(query)
 	query = normalizeJSONTableDefaultOrder(query)
@@ -582,6 +584,68 @@ func normalizeODBCOuterJoin(query string) string {
 			braceDepth--
 			i++
 			continue
+		}
+		result = append(result, ch)
+		i++
+	}
+	return string(result)
+}
+
+// normalizeODBCDateTimeLiterals rewrites ODBC escape date/time/timestamp
+// literals to plain string literals that the vitess parser can handle.
+// Examples:
+//   {d '2006-01-02'}        →  '2006-01-02'
+//   {t '15:04:05'}          →  '15:04:05'
+//   {ts '2006-01-02 15:04:05'} →  '2006-01-02 15:04:05'
+func normalizeODBCDateTimeLiterals(query string) string {
+	upper := strings.ToUpper(query)
+	// Quick bail-out: these patterns must contain '{' followed by d/t/ts
+	if !strings.ContainsAny(upper, "{") {
+		return query
+	}
+	result := make([]byte, 0, len(query))
+	i := 0
+	inQuote := byte(0)
+	for i < len(query) {
+		ch := query[i]
+		if inQuote != 0 {
+			result = append(result, ch)
+			if ch == inQuote {
+				inQuote = 0
+			}
+			i++
+			continue
+		}
+		if ch == '\'' || ch == '"' || ch == '`' {
+			inQuote = ch
+			result = append(result, ch)
+			i++
+			continue
+		}
+		if ch == '{' {
+			rest := query[i:]
+			restUpper := strings.ToUpper(rest)
+			// Try {ts '...'}, {d '...'}, {t '...'} in order (longest first)
+			prefixes := []string{"{TS ", "{D ", "{T "}
+			matched := false
+			for _, prefix := range prefixes {
+				if strings.HasPrefix(restUpper, prefix) {
+					// Find the closing '}'
+					closeIdx := strings.Index(rest, "}")
+					if closeIdx < 0 {
+						break
+					}
+					inner := strings.TrimSpace(rest[len(prefix):closeIdx])
+					// inner should be a quoted string like '2006-01-02'
+					result = append(result, []byte(inner)...)
+					i += closeIdx + 1
+					matched = true
+					break
+				}
+			}
+			if matched {
+				continue
+			}
 		}
 		result = append(result, ch)
 		i++

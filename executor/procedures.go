@@ -60,12 +60,14 @@ func (e *Executor) execCreateTrigger(query string) (*Result, error) {
 	}
 
 	// Extract body: everything after "FOR EACH ROW"
+	// Use a regex to handle variable whitespace (e.g. "FOR  EACH ROW" with two spaces).
 	_ = upper // already have it
-	forEachIdx := strings.Index(upper, "FOR EACH ROW")
-	if forEachIdx < 0 {
+	forEachRe := regexp.MustCompile(`(?i)FOR\s+EACH\s+ROW`)
+	forEachLoc := forEachRe.FindStringIndex(query)
+	if forEachLoc == nil {
 		return nil, fmt.Errorf("invalid CREATE TRIGGER syntax: missing FOR EACH ROW")
 	}
-	body := strings.TrimSpace(query[forEachIdx+len("FOR EACH ROW"):])
+	body := strings.TrimSpace(query[forEachLoc[1]:])
 
 	// Parse the body into individual SQL statements
 	var bodyStatements []string
@@ -2326,7 +2328,12 @@ func (e *Executor) substituteLocalVars(sql string, vars map[string]interface{}) 
 	for _, pair := range sorted {
 		valStr := "NULL"
 		if pair.val != nil {
-			valStr = fmt.Sprintf("%v", pair.val)
+			switch v := pair.val.(type) {
+			case string:
+				valStr = "'" + strings.ReplaceAll(v, "'", "''") + "'"
+			default:
+				valStr = fmt.Sprintf("%v", v)
+			}
 		}
 		// Replace variable references that appear as standalone words
 		result = replaceWordBoundary(result, pair.key, valStr)
@@ -2359,7 +2366,7 @@ func replaceWordBoundary(s, word, replacement string) string {
 			// Check word boundary before
 			if i > 0 {
 				ch := s[i-1]
-				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (ch >= '0' && ch <= '9') || ch == '@' {
+				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (ch >= '0' && ch <= '9') || ch == '@' || ch == '.' {
 					result.WriteByte(s[i])
 					i++
 					continue
@@ -2369,7 +2376,7 @@ func replaceWordBoundary(s, word, replacement string) string {
 			end := i + wordLen
 			if end < len(s) {
 				ch := s[end]
-				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (ch >= '0' && ch <= '9') {
+				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (ch >= '0' && ch <= '9') || ch == '.' {
 					result.WriteByte(s[i])
 					i++
 					continue

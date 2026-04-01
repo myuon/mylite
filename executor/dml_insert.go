@@ -576,6 +576,16 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							v = e.nowTime().Format("2006-01-02 15:04:05")
 						} else if col.AutoIncrement {
 							v = nil // AUTO_INCREMENT will be handled later
+						} else if !col.Nullable && !isGeneratedColumnType(col.Type) {
+							// DEFAULT keyword used on NOT NULL column with no actual default
+							// In strict mode: error 1364; in non-strict: warning + zero value
+							if e.isStrictMode() && !bool(stmt.Ignore) {
+								return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
+							}
+							e.addWarning("Warning", 1364, fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
+							v = implicitZeroValue(col.Type)
+						} else {
+							v = implicitZeroValue(col.Type)
 						}
 						break
 					}
@@ -803,13 +813,22 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			if dupIdx >= 0 {
 				// Apply the ON DUPLICATE KEY UPDATE expressions to the existing row.
 				tbl.Lock()
+				// Snapshot the existing row so that ODKU expressions (e.g. a = a + 1)
+				// read the pre-update values of columns, matching MySQL semantics.
+				odduSnap := make(storage.Row, len(tbl.Rows[dupIdx]))
+				for k, v := range tbl.Rows[dupIdx] {
+					odduSnap[k] = v
+				}
 				prevOnDupValuesRow := e.onDupValuesRow
 				e.onDupValuesRow = row
+				prevCorrelatedRow := e.correlatedRow
+				e.correlatedRow = odduSnap
 				for _, upd := range stmt.OnDup {
 					colName := upd.Name.Name.String()
 					val, err := e.evalExpr(upd.Expr)
 					if err != nil {
 						e.onDupValuesRow = prevOnDupValuesRow
+						e.correlatedRow = prevCorrelatedRow
 						tbl.Unlock()
 						return nil, err
 					}
@@ -823,6 +842,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					tbl.Rows[dupIdx][colName] = val
 				}
 				e.onDupValuesRow = prevOnDupValuesRow
+				e.correlatedRow = prevCorrelatedRow
 				// Recompute generated columns after ON DUPLICATE KEY UPDATE
 				for _, col := range tbl.Def.Columns {
 					if isGeneratedColumnType(col.Type) {
