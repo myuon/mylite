@@ -1142,6 +1142,11 @@ type cursorState struct {
 // callUserDefinedFunction looks up a user-defined function in the catalog and executes it.
 // qualifier is the optional schema qualifier (e.g. "test" in "test.f()").
 func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Expr, row *storage.Row, qualifier ...string) (interface{}, error) {
+	e.routineDepth++
+	defer func() { e.routineDepth-- }()
+	if e.routineDepth > 256 {
+		return nil, fmt.Errorf("Error 1456 (HY000): Recursive stored functions and triggers are not allowed")
+	}
 	if e.Catalog == nil {
 		return nil, fmt.Errorf("function not found: %s", name)
 	}

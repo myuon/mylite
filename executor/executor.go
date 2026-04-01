@@ -288,6 +288,8 @@ type Executor struct {
 	// lastFoundRows stores the row count from the last SELECT before LIMIT was applied.
 	// Used by the FOUND_ROWS() function.
 	lastFoundRows int64
+	// routineDepth tracks the current stored routine call depth to prevent infinite recursion.
+	routineDepth int
 	// psTruncated tracks performance_schema tables that have been TRUNCATED.
 	// These tables return empty result sets until data is re-inserted.
 	psTruncated map[string]bool
