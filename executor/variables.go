@@ -791,6 +791,33 @@ func (e *Executor) handleRawSet(raw string) error {
 			// Store directly in both globalScopeVars and startupVars.
 			e.setGlobalVar(varName, val)
 			e.startupVars[varName] = val
+			// Special handling: --timezone= master.opt option sets the server timezone.
+			// POSIX TZ convention (GMT+N = UTC-N) is used, so we store it for Clone()
+			// to pick up as the default session timezone.
+			if varName == "timezone" || varName == "time_zone" {
+				// Parse as POSIX TZ offset (e.g. "GMT+10" = UTC-10, "GMT-3" = UTC+3)
+				posixVal := val
+				// Convert POSIX "GMT+N" to MySQL "+N:00" format (sign is inverted)
+				if strings.HasPrefix(strings.ToUpper(posixVal), "GMT") {
+					offsetStr := posixVal[3:] // e.g. "+10" or "-3"
+					if len(offsetStr) > 0 && (offsetStr[0] == '+' || offsetStr[0] == '-') {
+						// Invert the sign for MySQL convention
+						sign := offsetStr[0]
+						absStr := offsetStr[1:]
+						hours, parseErr := strconv.Atoi(absStr)
+						if parseErr == nil {
+							mysqlSign := byte('+')
+							if sign == '+' {
+								mysqlSign = '-'
+							}
+							posixVal = fmt.Sprintf("%c%02d:00", mysqlSign, hours)
+						}
+					}
+				}
+				if tzErr := e.parseTimeZone(posixVal); tzErr == nil {
+					e.startupVars["timezone_parsed"] = posixVal
+				}
+			}
 			return nil
 		}
 	}

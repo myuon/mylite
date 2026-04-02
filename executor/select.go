@@ -24,6 +24,14 @@ import (
 // collectTableDefs extracts table definitions from a FROM expression, handling both
 // simple table references and JOINs.
 func (e *Executor) collectTableDefs(expr sqlparser.TableExpr) []*catalog.TableDef {
+	defs, _ := e.collectTableDefsWithAliases(expr)
+	return defs
+}
+
+// collectTableDefsWithAliases collects table definitions and their aliases
+// (the name to use for qualifying columns in SELECT * expansion). The alias
+// is the AS alias if present, otherwise the table name.
+func (e *Executor) collectTableDefsWithAliases(expr sqlparser.TableExpr) ([]*catalog.TableDef, []string) {
 	switch te := expr.(type) {
 	case *sqlparser.AliasedTableExpr:
 		if tn, ok := te.Expr.(sqlparser.TableName); ok {
@@ -32,26 +40,33 @@ func (e *Executor) collectTableDefs(expr sqlparser.TableExpr) []*catalog.TableDe
 			if !tn.Qualifier.IsEmpty() {
 				lookupDB = tn.Qualifier.String()
 			}
+			alias := tblName
+			if !te.As.IsEmpty() {
+				alias = te.As.String()
+			}
 			if e.Catalog != nil {
 				if db, err := e.Catalog.GetDatabase(lookupDB); err == nil {
 					if td, err := db.GetTable(tblName); err == nil {
-						return []*catalog.TableDef{td}
+						return []*catalog.TableDef{td}, []string{alias}
 					}
 				}
 			}
 		}
 	case *sqlparser.JoinTableExpr:
-		left := e.collectTableDefs(te.LeftExpr)
-		right := e.collectTableDefs(te.RightExpr)
-		return append(left, right...)
+		leftDefs, leftAliases := e.collectTableDefsWithAliases(te.LeftExpr)
+		rightDefs, rightAliases := e.collectTableDefsWithAliases(te.RightExpr)
+		return append(leftDefs, rightDefs...), append(leftAliases, rightAliases...)
 	case *sqlparser.ParenTableExpr:
-		var result []*catalog.TableDef
+		var defs []*catalog.TableDef
+		var aliases []string
 		for _, inner := range te.Exprs {
-			result = append(result, e.collectTableDefs(inner)...)
+			d, a := e.collectTableDefsWithAliases(inner)
+			defs = append(defs, d...)
+			aliases = append(aliases, a...)
 		}
-		return result
+		return defs, aliases
 	}
-	return nil
+	return nil, nil
 }
 
 // extractJoinUsingCols extracts column names from JOIN ... USING(...) clauses.
@@ -1466,8 +1481,11 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				return nil, err
 			}
 			var crossed []storage.Row
-			for _, leftRow := range allRows {
-				for _, rightRow := range rightRows {
+			// MySQL cross-join ordering: the rightmost table is the outer loop
+			// and the accumulated left rows are the inner loop. This matches
+			// MySQL behaviour for "FROM t1, t2" (t2 is outer, t1 is inner).
+			for _, rightRow := range rightRows {
+				for _, leftRow := range allRows {
 					if len(crossed) >= maxCrossProductRows {
 						break
 					}
@@ -1559,7 +1577,22 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// Collect table definitions for proper column ordering in SELECT *
 	var selectTableDefs []*catalog.TableDef
 	if len(stmt.From) > 0 {
-		selectTableDefs = e.collectTableDefs(stmt.From[0])
+		if len(stmt.From) == 1 {
+			defs, aliases := e.collectTableDefsWithAliases(stmt.From[0])
+			selectTableDefs = defs
+			e.selectTableAliases = aliases
+		} else {
+			// Implicit cross join: collect defs from all FROM tables so
+			// SELECT * expands correctly (e.g. "SELECT * FROM t1, t1 AS t2"
+			// should produce columns a b a b, not just a b).
+			var allAliases []string
+			for _, fromExpr := range stmt.From {
+				defs, aliases := e.collectTableDefsWithAliases(fromExpr)
+				selectTableDefs = append(selectTableDefs, defs...)
+				allAliases = append(allAliases, aliases...)
+			}
+			e.selectTableAliases = allAliases
+		}
 	}
 
 	// Implicit FTS relevance ordering: when WHERE contains MATCH AGAINST
@@ -1714,6 +1747,13 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				if collateExpr, ok := expr.(*sqlparser.CollateExpr); ok {
 					orderCollation = collateExpr.Collation
 					expr = collateExpr.Expr
+				}
+				// BINARY expr → use binary (case-sensitive) collation for ORDER BY
+				if convExpr, ok := expr.(*sqlparser.ConvertExpr); ok {
+					if convExpr.Type != nil && strings.EqualFold(convExpr.Type.Type, "binary") {
+						orderCollation = "binary"
+						expr = convExpr.Expr
+					}
 				}
 				va := resolveOrderByExprValue(e, expr, allRows[a])
 				vb := resolveOrderByExprValue(e, expr, allRows[b])
@@ -3434,10 +3474,15 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 		switch se := expr.(type) {
 		case *sqlparser.StarExpr:
 			// Expand star using table definition column order if available
+			// Check if this is a qualified star (e.g. t1.* or t2.*)
+			starQualifier := ""
+			if !se.TableName.IsEmpty() {
+				starQualifier = se.TableName.Name.String()
+			}
 			if len(tableDefs) > 0 {
 				// For JOIN ... USING, USING columns appear first (from left table only),
 				// then remaining columns from left table, then remaining from right tables.
-				if len(tableDefs) > 1 && len(joinUsingCols) > 0 {
+				if len(tableDefs) > 1 && len(joinUsingCols) > 0 && starQualifier == "" {
 					// First: add USING columns (unqualified, resolves to COALESCE of both tables)
 					for _, uc := range joinUsingCols {
 						cols = append(cols, uc)
@@ -3459,10 +3504,20 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 						}
 					}
 				} else {
-					for _, td := range tableDefs {
+					for tdIdx, td := range tableDefs {
+						// Determine the qualifier to use for this table's columns.
+						// Use the alias (AS name) if available, otherwise the table name.
+						qualifier := td.Name
+						if e.selectTableAliases != nil && tdIdx < len(e.selectTableAliases) && e.selectTableAliases[tdIdx] != "" {
+							qualifier = e.selectTableAliases[tdIdx]
+						}
+						// For qualified star (e.g. t1.*), only expand the matching table.
+						if starQualifier != "" && !strings.EqualFold(qualifier, starQualifier) {
+							continue
+						}
 						// For IS/PS tables, prefer canonical column order (more complete)
 						lowerName := strings.ToLower(td.Name)
-						if order, ok := infoSchemaColumnOrder[lowerName]; ok && len(order) > len(td.Columns) {
+						if order, ok := infoSchemaColumnOrder[lowerName]; ok && len(order) > len(td.Columns) && starQualifier == "" {
 							for _, colName := range order {
 								cols = append(cols, colName)
 								colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(colName)})
@@ -3470,10 +3525,10 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 						} else {
 							for _, col := range td.Columns {
 								cols = append(cols, col.Name)
-								if len(tableDefs) > 1 {
+								if len(tableDefs) > 1 || starQualifier != "" {
 									colExprs = append(colExprs, &sqlparser.ColName{
 										Name:      sqlparser.NewIdentifierCI(col.Name),
-										Qualifier: sqlparser.TableName{Name: sqlparser.NewIdentifierCS(td.Name)},
+										Qualifier: sqlparser.TableName{Name: sqlparser.NewIdentifierCS(qualifier)},
 									})
 								} else {
 									colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(col.Name)})
@@ -4350,6 +4405,13 @@ func applyOrderBy(orderBy sqlparser.OrderBy, colNames []string, rows [][]interfa
 			expr = collateExpr.Expr
 			orderCollation = collateExpr.Collation
 		}
+		// BINARY expr → use binary (case-sensitive) collation for ORDER BY
+		if convExpr, ok := expr.(*sqlparser.ConvertExpr); ok {
+			if convExpr.Type != nil && strings.EqualFold(convExpr.Type.Type, "binary") {
+				orderCollation = "binary"
+				expr = convExpr.Expr
+			}
+		}
 		colName := sqlparser.String(expr)
 		colName = strings.Trim(colName, "`")
 		colIdx := -1
@@ -4398,6 +4460,19 @@ func needsPreProjectionOrderBy(orderBy sqlparser.OrderBy, colNames []string) boo
 		}
 		col, ok := expr.(*sqlparser.ColName)
 		if !ok || col == nil {
+			// Non-column expression (function, etc.) - check if it matches a column alias exactly.
+			// If it doesn't match any alias, we need pre-projection sort.
+			exprStr := sqlparser.String(expr)
+			found := false
+			for _, c := range colNames {
+				if strings.EqualFold(c, exprStr) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return true
+			}
 			continue
 		}
 		name := strings.Trim(col.Name.String(), "`")
@@ -4417,6 +4492,12 @@ func needsPreProjectionOrderBy(orderBy sqlparser.OrderBy, colNames []string) boo
 
 func resolveOrderByExprValue(e *Executor, expr sqlparser.Expr, row storage.Row) interface{} {
 	if col, ok := expr.(*sqlparser.ColName); ok && col != nil {
+		// For qualified column names (e.g. t1.a), use evalRowExpr which correctly
+		// handles case-insensitive qualified lookup in cross-join rows.
+		if !col.Qualifier.IsEmpty() {
+			val, _ := e.evalRowExpr(col, row)
+			return val
+		}
 		name := strings.Trim(col.Name.String(), "`")
 		if v, ok := row[name]; ok {
 			return v

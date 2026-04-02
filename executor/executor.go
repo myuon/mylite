@@ -599,7 +599,14 @@ func (e *Executor) GetConnectionID() int64 {
 // startupVars, lockManager, processList, and psTruncated, but has its own
 // fresh per-session state. Used to give each connection its own executor.
 func (e *Executor) Clone() *Executor {
+	// Default to GMT-3 (= UTC+3), which matches the MySQL MTR test framework default.
+	// If the server was started with --timezone=<tz> (e.g. from master.opt), use that instead.
 	defaultTZ := time.FixedZone("GMT-3", 3*60*60)
+	if e.timeZone != nil {
+		// Parent executor has a timezone set (e.g. from SET STARTUP timezone=GMT+10),
+		// use it as the default for the new session.
+		defaultTZ = e.timeZone
+	}
 	connID := e.nextConnID.Add(1)
 	// Inherit global variable values into the new session's sessionScopeVars
 	// for variables that have both GLOBAL and SESSION scope. This mirrors
@@ -2829,10 +2836,19 @@ func normalizeInlineCheckConstraints(query string) string {
 				}
 			} else {
 				// This is an inline CHECK. Extract the full CHECK clause.
-				// Find the opening '(' after CHECK
+				// Find the opening '(' after CHECK — must be only whitespace between
+				// CHECK and '('. If other characters appear first, this is invalid
+				// CHECK syntax (e.g. "CHECK something (...)") that MySQL rejects;
+				// skip normalization so the executor can return a parse error.
 				j := checkStart + 5 // past "CHECK"
-				for j < len(query) && query[j] != '(' {
+				for j < len(query) && (query[j] == ' ' || query[j] == '\t' || query[j] == '\n' || query[j] == '\r') {
 					j++
+				}
+				if j >= len(query) || query[j] != '(' {
+					// Not a valid inline CHECK — pass through without normalizing
+					result = append(result, query[i])
+					i++
+					continue
 				}
 				if j < len(query) {
 					// Find matching closing ')'
@@ -7093,8 +7109,19 @@ func parseMySQLTimeValue(s string) string {
 		return "00:00:00"
 	}
 
-	// If the value looks like a datetime (YYYY-MM-DD HH:MM:SS), extract the time part
+	// If the value looks like a datetime (YYYY-MM-DD HH:MM:SS), extract the time part.
+	// Special case: 0000-00-DD represents a day offset for TIME values (e.g. from str_to_date %d %H).
+	// In that case, convert days to hours and add to the time component.
 	if len(s) >= 19 && s[4] == '-' && s[7] == '-' && s[10] == ' ' {
+		year, _ := strconv.Atoi(s[:4])
+		month, _ := strconv.Atoi(s[5:7])
+		if year == 0 && month == 0 {
+			day, _ := strconv.Atoi(s[8:10])
+			if day > 0 {
+				// Convert to D HH:MM:SS.ffffff form and let the colon-based parser handle it
+				return parseMySQLTimeValue(fmt.Sprintf("%d %s", day, s[11:]))
+			}
+		}
 		return s[11:]
 	}
 	// If the value looks like a date (YYYY-MM-DD), return 00:00:00
@@ -7279,11 +7306,7 @@ func applyTimePrecision(timeStr string, fsp int) string {
 			}
 		}
 	}
-	// Remove trailing zeros
-	fracPart = strings.TrimRight(fracPart, "0")
-	if fracPart == "" {
-		return basePart
-	}
+	// Keep exactly fsp digits (do not trim trailing zeros for fixed-precision TIME columns)
 	return basePart + "." + fracPart
 }
 
@@ -10158,6 +10181,121 @@ func evalIntervalDateExpr(dateVal, intervalVal interface{}, unit sqlparser.Inter
 }
 
 // parseMySQLTimeInterval parses MySQL time interval strings like "1 01:01:01" or "01:01:01".
+// addTimeStrings adds (or subtracts if subtract=true) two TIME strings using microsecond arithmetic.
+// Handles garbage at end of base string (truncates to valid time part).
+// Returns the result as a TIME string with microseconds (e.g. "-25:01:00.110000").
+func addTimeStrings(base, interval string, subtract bool) interface{} {
+	// Parse base time - truncate at first non-time character after a valid time
+	baseTime := parseTimeStringToMicros(base)
+	if baseTime == nil {
+		return base // unparseable
+	}
+	// Parse interval
+	intervalTime := parseTimeStringToMicros(interval)
+	if intervalTime == nil {
+		return base
+	}
+	baseMicros := *baseTime
+	intervalMicros := *intervalTime
+	var resultMicros int64
+	if subtract {
+		resultMicros = baseMicros - intervalMicros
+	} else {
+		resultMicros = baseMicros + intervalMicros
+	}
+	return formatMicrosAsTimeString(resultMicros)
+}
+
+// parseTimeStringToMicros parses a MySQL TIME string to total microseconds.
+// Handles negative signs, D HH:MM:SS, HH:MM:SS.ffffff, and garbage at end.
+// Returns nil if completely unparseable.
+func parseTimeStringToMicros(s string) *int64 {
+	s = strings.TrimSpace(s)
+	negative := false
+	if strings.HasPrefix(s, "-") {
+		negative = true
+		s = s[1:]
+	}
+	// Extract valid time chars: digits, colon, dot, space
+	end := 0
+	for end < len(s) {
+		c := s[end]
+		if (c >= '0' && c <= '9') || c == ':' || c == '.' || c == ' ' {
+			end++
+		} else {
+			break
+		}
+	}
+	if end == 0 {
+		return nil
+	}
+	s = strings.TrimSpace(s[:end])
+	// Parse D HH:MM:SS.ffffff
+	days := 0
+	if idx := strings.Index(s, " "); idx >= 0 {
+		d, err := strconv.Atoi(s[:idx])
+		if err == nil {
+			days = d
+			s = s[idx+1:]
+		}
+	}
+	var h, m, sec, usecs int
+	parts := strings.SplitN(s, ":", 3)
+	switch len(parts) {
+	case 3:
+		h, _ = strconv.Atoi(parts[0])
+		m, _ = strconv.Atoi(parts[1])
+		secStr := parts[2]
+		if dotIdx := strings.Index(secStr, "."); dotIdx >= 0 {
+			sec, _ = strconv.Atoi(secStr[:dotIdx])
+			frac := secStr[dotIdx+1:]
+			for len(frac) < 6 {
+				frac += "0"
+			}
+			if len(frac) > 6 {
+				frac = frac[:6]
+			}
+			usecs, _ = strconv.Atoi(frac)
+		} else {
+			sec, _ = strconv.Atoi(secStr)
+		}
+	case 2:
+		h, _ = strconv.Atoi(parts[0])
+		m, _ = strconv.Atoi(parts[1])
+	case 1:
+		h, _ = strconv.Atoi(parts[0])
+	default:
+		return nil
+	}
+	total := int64(days)*24*int64(time.Hour/time.Microsecond) +
+		int64(h)*int64(time.Hour/time.Microsecond) +
+		int64(m)*int64(time.Minute/time.Microsecond) +
+		int64(sec)*int64(time.Second/time.Microsecond) +
+		int64(usecs)
+	if negative {
+		total = -total
+	}
+	return &total
+}
+
+// formatMicrosAsTimeString formats total microseconds as a MySQL TIME string with 6 decimal places.
+func formatMicrosAsTimeString(micros int64) string {
+	negative := micros < 0
+	if negative {
+		micros = -micros
+	}
+	us := micros % int64(time.Second/time.Microsecond)
+	micros /= int64(time.Second/time.Microsecond)
+	sec := int(micros % 60)
+	micros /= 60
+	mins := int(micros % 60)
+	hours := int(micros / 60)
+	if negative {
+		return fmt.Sprintf("-%02d:%02d:%02d.%06d", hours, mins, sec, us)
+	}
+	return fmt.Sprintf("%02d:%02d:%02d.%06d", hours, mins, sec, us)
+}
+
 func parseMySQLTimeInterval(s string) (time.Duration, error) {
 	s = strings.TrimSpace(s)
 	var days, hours, mins, secs, usecs int
@@ -10212,8 +10350,68 @@ func parseMySQLTimeInterval(s string) (time.Duration, error) {
 		time.Duration(usecs)*time.Microsecond, nil
 }
 
+// mysqlWeekdayNames maps Go weekday to MySQL weekday name.
+var mysqlWeekdayNamesDF = [7]string{"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"}
+var mysqlWeekdayAbbrDF = [7]string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
+
+// Locale-specific month/weekday name tables for date_format.
+var mysqlLocaleMonthNames = map[string][12]string{
+	"de_DE": {"Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"},
+}
+var mysqlLocaleMonthAbbr = map[string][12]string{
+	"de_DE": {"Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"},
+}
+var mysqlLocaleWeekdayNames = map[string][7]string{
+	"de_DE": {"Sonntag", "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag"},
+}
+var mysqlLocaleWeekdayAbbr = map[string][7]string{
+	"de_DE": {"So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"},
+}
+
+// mysqlAdjustedWeekday returns the weekday adjusted for MySQL's calendar (handles year 0 offset).
+func mysqlAdjustedWeekday(t time.Time) time.Weekday {
+	wd := t.Weekday()
+	// For year 0 dates, Go's proleptic Gregorian calendar is off by 1 from MySQL.
+	// MySQL considers year 0 weekdays shifted by +1.
+	if t.Year() == 0 {
+		wd = (wd + 1) % 7
+	}
+	return wd
+}
+
 // mysqlDateFormat converts a MySQL DATE_FORMAT format string (e.g. "%Y-%m-%d") to a Go time.Time string.
-func mysqlDateFormat(t time.Time, format string) string {
+// The locale parameter (e.g. "de_DE", "en_US") controls month/weekday name language.
+func mysqlDateFormat(t time.Time, format string, locale ...string) string {
+	lcLocale := "en_US"
+	if len(locale) > 0 && locale[0] != "" {
+		lcLocale = locale[0]
+	}
+	// Helper to get weekday name
+	getWeekdayName := func(wd time.Weekday) string {
+		if names, ok := mysqlLocaleWeekdayNames[lcLocale]; ok {
+			return names[wd]
+		}
+		return mysqlWeekdayNamesDF[wd]
+	}
+	getWeekdayAbbr := func(wd time.Weekday) string {
+		if abbr, ok := mysqlLocaleWeekdayAbbr[lcLocale]; ok {
+			return abbr[wd]
+		}
+		return mysqlWeekdayAbbrDF[wd]
+	}
+	getMonthName := func(m time.Month) string {
+		if names, ok := mysqlLocaleMonthNames[lcLocale]; ok {
+			return names[m-1]
+		}
+		return t.Format("January")
+	}
+	getMonthAbbr := func(m time.Month) string {
+		if abbr, ok := mysqlLocaleMonthAbbr[lcLocale]; ok {
+			return abbr[m-1]
+		}
+		return t.Format("Jan")
+	}
+
 	var sb strings.Builder
 	i := 0
 	for i < len(format) {
@@ -10242,16 +10440,18 @@ func mysqlDateFormat(t time.Time, format string) string {
 				sb.WriteString(t.Format("05"))
 			case 'p':
 				sb.WriteString(t.Format("PM"))
+			case 'a':
+				sb.WriteString(getWeekdayAbbr(mysqlAdjustedWeekday(t)))
 			case 'W':
-				sb.WriteString(t.Format("Monday"))
+				sb.WriteString(getWeekdayName(mysqlAdjustedWeekday(t)))
 			case 'w':
-				sb.WriteString(fmt.Sprintf("%d", t.Weekday()))
+				sb.WriteString(fmt.Sprintf("%d", mysqlAdjustedWeekday(t)))
 			case 'j':
 				sb.WriteString(fmt.Sprintf("%d", t.YearDay()))
 			case 'M':
-				sb.WriteString(t.Format("January"))
+				sb.WriteString(getMonthName(t.Month()))
 			case 'b':
-				sb.WriteString(t.Format("Jan"))
+				sb.WriteString(getMonthAbbr(t.Month()))
 			case 'T':
 				sb.WriteString(t.Format("15:04:05"))
 			case 'r':
@@ -10318,37 +10518,800 @@ func timestampDiff(unit sqlparser.IntervalType, t1, t2 time.Time) int64 {
 
 // mysqlStrToDate parses a date string using a MySQL format string (like STR_TO_DATE).
 // Returns nil if the string cannot be parsed.
-func mysqlStrToDate(dateStr, format string) *string {
-	// Convert MySQL format specifiers to Go time layout
-	goLayout := mysqlFormatToGoLayout(format)
-	t, err := time.Parse(goLayout, dateStr)
-	if err != nil {
+// When literalFormat is true, returns a smart type-aware format (date, time, or datetime).
+// When literalFormat is false, always returns the full datetime(6) format.
+func mysqlStrToDate(dateStr, format string, literalFormat bool) *string {
+	// Use a custom MySQL-compatible parser rather than Go's time.Parse,
+	// because MySQL supports specifiers that Go doesn't (e.g. %D, %#, %j, %U, %W).
+	p := &mysqlDateParser{s: dateStr, f: format, literalMode: literalFormat}
+	if !p.parse() {
 		return nil
 	}
-	// Determine output format based on what format specifiers were present
-	hasDate := strings.Contains(format, "%Y") || strings.Contains(format, "%y") ||
-		strings.Contains(format, "%m") || strings.Contains(format, "%d") ||
-		strings.Contains(format, "%c") || strings.Contains(format, "%e")
-	hasTime := strings.Contains(format, "%H") || strings.Contains(format, "%h") ||
-		strings.Contains(format, "%i") || strings.Contains(format, "%s") ||
-		strings.Contains(format, "%S") || strings.Contains(format, "%T") ||
-		strings.Contains(format, "%r")
-	hasMicro := strings.Contains(format, "%f")
-	var result string
-	if hasDate && hasTime {
-		if hasMicro {
-			result = t.Format("2006-01-02 15:04:05.000000")
-		} else {
-			result = t.Format("2006-01-02 15:04:05")
-		}
-	} else if hasDate {
-		result = t.Format("2006-01-02")
-	} else if hasTime {
-		result = t.Format("15:04:05")
-	} else {
-		result = t.Format("2006-01-02 15:04:05")
+	if !p.validate() {
+		return nil
 	}
+	result := p.format()
 	return &result
+}
+
+// mysqlDateParser is a custom parser for MySQL's STR_TO_DATE format.
+type mysqlDateParser struct {
+	s           string // input string
+	f           string // format string
+	si          int    // position in s
+	fi          int    // position in f
+	literalMode bool   // when true, use smart type-aware output format
+	// parsed components
+	year, month, day           int
+	hour, minute, second       int
+	microsecond                int
+	ampm                       int // 0=unset, 1=AM, 2=PM
+	weekday                    int // 0=Sunday..6=Saturday, -1=unset
+	yearday                    int // day of year 1..366, 0=unset
+	weekU, weeku               int // week number for %U/%u, -1=unset
+	weekV, weekv               int // week number for %V/%v, -1=unset
+	yearX, yearx               int // year for %X/%x
+	hasDate, hasTime, hasMicro bool
+	hasYear, hasMonth           bool // true if %Y/%y or %m/%c/%M/%b present
+	hasAMPM                    bool
+	has24hHour                 bool // true if %H or %k was used (24-hour format)
+	hasWeekday                 bool // true if %W or %w was used
+	hasWeekV                   bool // true if %V was used
+	hasWeekv                   bool // true if %v was used
+	hasWeekU                   bool // true if %U was used
+	hasWeeku                   bool // true if %u was used
+	hasYearX                   bool // true if %X was used
+	hasYearx                   bool // true if %x was used
+}
+
+var mysqlMonthNames = []string{
+	"", "January", "February", "March", "April", "May", "June",
+	"July", "August", "September", "October", "November", "December",
+}
+var mysqlMonthAbbr = []string{
+	"", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+	"Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+}
+var mysqlWeekdayNames = []string{
+	"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+}
+var mysqlWeekdayAbbr = []string{
+	"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
+}
+
+func (p *mysqlDateParser) readInt(maxDigits int) (int, bool) {
+	start := p.si
+	count := 0
+	for p.si < len(p.s) && p.s[p.si] >= '0' && p.s[p.si] <= '9' && count < maxDigits {
+		p.si++
+		count++
+	}
+	if count == 0 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(p.s[start:p.si])
+	return n, err == nil
+}
+
+func (p *mysqlDateParser) readFrac() (int, bool) {
+	// Read up to 6 digits, pad to 6
+	start := p.si
+	count := 0
+	for p.si < len(p.s) && p.s[p.si] >= '0' && p.s[p.si] <= '9' && count < 6 {
+		p.si++
+		count++
+	}
+	// skip extra digits
+	for p.si < len(p.s) && p.s[p.si] >= '0' && p.s[p.si] <= '9' {
+		p.si++
+	}
+	if count == 0 {
+		return 0, false
+	}
+	frac := p.s[start : start+count]
+	for len(frac) < 6 {
+		frac += "0"
+	}
+	n, err := strconv.Atoi(frac)
+	return n, err == nil
+}
+
+func (p *mysqlDateParser) matchLiteral(lit string) bool {
+	if p.si+len(lit) > len(p.s) {
+		return false
+	}
+	if strings.EqualFold(p.s[p.si:p.si+len(lit)], lit) {
+		p.si += len(lit)
+		return true
+	}
+	return false
+}
+
+func (p *mysqlDateParser) skipNonDigits() {
+	for p.si < len(p.s) && (p.s[p.si] < '0' || p.s[p.si] > '9') {
+		p.si++
+	}
+}
+
+func (p *mysqlDateParser) parse() bool {
+	p.year, p.month, p.day = 0, 0, 0
+	p.hour, p.minute, p.second, p.microsecond = 0, 0, 0, 0
+	p.ampm = 0
+	p.weekday = -1
+	p.yearday = 0
+	p.weekU, p.weeku, p.weekV, p.weekv = -1, -1, -1, -1
+	p.yearX, p.yearx = 0, 0
+
+	for p.fi < len(p.f) {
+		if p.f[p.fi] == '%' && p.fi+1 < len(p.f) {
+			p.fi++
+			spec := p.f[p.fi]
+			p.fi++
+			switch spec {
+			case 'Y': // 4-digit year (MySQL also handles 2-digit with century expansion)
+				startSI := p.si
+				n, ok := p.readInt(4)
+				if !ok {
+					return false
+				}
+				// If only 2 digits were read, apply MySQL 2-digit year rule
+				if p.si-startSI <= 2 && n < 100 {
+					if n < 70 {
+						p.year = 2000 + n
+					} else {
+						p.year = 1900 + n
+					}
+				} else {
+					p.year = n
+				}
+				p.hasDate = true
+				p.hasYear = true
+			case 'y': // 2-digit year
+				n, ok := p.readInt(2)
+				if !ok {
+					return false
+				}
+				if n < 70 {
+					p.year = 2000 + n
+				} else {
+					p.year = 1900 + n
+				}
+				p.hasDate = true
+				p.hasYear = true
+			case 'm': // month 01-12
+				n, ok := p.readInt(2)
+				if !ok {
+					return false
+				}
+				p.month = n
+				p.hasDate = true
+				p.hasMonth = true
+			case 'c': // month 1-12 (no leading zero)
+				n, ok := p.readInt(2)
+				if !ok {
+					return false
+				}
+				p.month = n
+				p.hasDate = true
+				p.hasMonth = true
+			case 'd': // day 01-31
+				n, ok := p.readInt(2)
+				if !ok {
+					return false
+				}
+				p.day = n
+				p.hasDate = true
+			case 'e': // day 1-31 (no leading zero)
+				n, ok := p.readInt(2)
+				if !ok {
+					return false
+				}
+				p.day = n
+				p.hasDate = true
+			case 'D': // day with ordinal suffix (1st, 2nd, 3rd...)
+				n, ok := p.readInt(2)
+				if !ok {
+					return false
+				}
+				p.day = n
+				p.hasDate = true
+				// Skip ordinal suffix (st, nd, rd, th)
+				for p.si < len(p.s) && p.s[p.si] >= 'a' && p.s[p.si] <= 'z' {
+					p.si++
+				}
+			case 'H': // hour 00-23 (optional at end of input, 24-hour)
+				p.has24hHour = true
+				if p.si >= len(p.s) {
+					p.hasTime = true
+					break
+				}
+				n, ok := p.readInt(2)
+				if !ok {
+					return false
+				}
+				p.hour = n
+				p.hasTime = true
+			case 'h', 'I': // hour 01-12 (optional at end of input)
+				if p.si >= len(p.s) {
+					p.hasTime = true
+					break
+				}
+				n, ok := p.readInt(2)
+				if !ok {
+					return false
+				}
+				p.hour = n
+				p.hasTime = true
+			case 'k': // hour 0-23 (no leading zero, 24-hour)
+				p.has24hHour = true
+				if p.si >= len(p.s) {
+					p.hasTime = true
+					break
+				}
+				n, ok := p.readInt(2)
+				if !ok {
+					return false
+				}
+				p.hour = n
+				p.hasTime = true
+			case 'l': // hour 1-12 (no leading zero)
+				if p.si >= len(p.s) {
+					p.hasTime = true
+					break
+				}
+				n, ok := p.readInt(2)
+				if !ok {
+					return false
+				}
+				p.hour = n
+				p.hasTime = true
+			case 'i': // minutes (optional at end of input)
+				if p.si >= len(p.s) {
+					break
+				}
+				n, ok := p.readInt(2)
+				if !ok {
+					return false
+				}
+				p.minute = n
+				p.hasTime = true
+			case 's', 'S': // seconds (optional at end of input)
+				if p.si >= len(p.s) {
+					break
+				}
+				n, ok := p.readInt(2)
+				if !ok {
+					return false
+				}
+				p.second = n
+				p.hasTime = true
+			case 'f': // microseconds (optional - if not present, default to 0)
+				p.hasMicro = true // %f in format always indicates microsecond output
+				if p.si < len(p.s) && p.s[p.si] >= '0' && p.s[p.si] <= '9' {
+					n, ok := p.readFrac()
+					if ok {
+						p.microsecond = n
+					}
+				}
+				p.hasTime = true
+			case 'p': // AM/PM
+				// skip optional whitespace
+				for p.si < len(p.s) && p.s[p.si] == ' ' {
+					p.si++
+				}
+				if p.si+2 <= len(p.s) {
+					am := strings.ToUpper(p.s[p.si : p.si+2])
+					if am == "AM" {
+						p.ampm = 1
+						p.si += 2
+						p.hasAMPM = true
+					} else if am == "PM" {
+						p.ampm = 2
+						p.si += 2
+						p.hasAMPM = true
+					} else {
+						return false
+					}
+				} else {
+					return false
+				}
+			case 'T': // HH:MM:SS
+				h, ok1 := p.readInt(2)
+				if !ok1 || p.si >= len(p.s) || p.s[p.si] != ':' {
+					return false
+				}
+				p.si++
+				m, ok2 := p.readInt(2)
+				if !ok2 || p.si >= len(p.s) || p.s[p.si] != ':' {
+					return false
+				}
+				p.si++
+				s, ok3 := p.readInt(2)
+				if !ok3 {
+					return false
+				}
+				p.hour, p.minute, p.second = h, m, s
+				p.hasTime = true
+			case 'r': // HH:MM:SS AM/PM
+				h, ok1 := p.readInt(2)
+				if !ok1 || p.si >= len(p.s) || p.s[p.si] != ':' {
+					return false
+				}
+				p.si++
+				m, ok2 := p.readInt(2)
+				if !ok2 || p.si >= len(p.s) || p.s[p.si] != ':' {
+					return false
+				}
+				p.si++
+				s, ok3 := p.readInt(2)
+				if !ok3 {
+					return false
+				}
+				p.hour, p.minute, p.second = h, m, s
+				p.hasTime = true
+				// read space and AM/PM
+				for p.si < len(p.s) && p.s[p.si] == ' ' {
+					p.si++
+				}
+				if p.si+2 <= len(p.s) {
+					am := strings.ToUpper(p.s[p.si : p.si+2])
+					if am == "AM" {
+						p.ampm = 1
+						p.si += 2
+						p.hasAMPM = true
+					} else if am == "PM" {
+						p.ampm = 2
+						p.si += 2
+						p.hasAMPM = true
+					}
+				}
+			case 'M': // full month name
+				matched := false
+				for i := 1; i <= 12; i++ {
+					if p.matchLiteral(mysqlMonthNames[i]) {
+						p.month = i
+						matched = true
+						p.hasDate = true
+						p.hasMonth = true
+						break
+					}
+					// also try 3-letter prefix match for abbreviated
+				}
+				if !matched {
+					// try abbreviated match (first 3-4 chars)
+					for i := 1; i <= 12; i++ {
+						for l := 3; l <= len(mysqlMonthNames[i]); l++ {
+							if p.si+l <= len(p.s) && strings.EqualFold(p.s[p.si:p.si+l], mysqlMonthNames[i][:l]) {
+								if l == len(mysqlMonthNames[i]) || (p.si+l < len(p.s) && (p.s[p.si+l] < 'a' || p.s[p.si+l] > 'z') && (p.s[p.si+l] < 'A' || p.s[p.si+l] > 'Z')) {
+									p.month = i
+									p.si += l
+									matched = true
+									p.hasDate = true
+									p.hasMonth = true
+									break
+								}
+							}
+						}
+						if matched {
+							break
+						}
+					}
+				}
+				if !matched {
+					return false
+				}
+			case 'b': // abbreviated month name
+				matched := false
+				for i := 1; i <= 12; i++ {
+					if p.matchLiteral(mysqlMonthAbbr[i]) {
+						p.month = i
+						matched = true
+						p.hasDate = true
+						p.hasMonth = true
+						break
+					}
+				}
+				if !matched {
+					// try case-insensitive match of full month up to 3 chars
+					for i := 1; i <= 12; i++ {
+						for l := 3; l <= len(mysqlMonthNames[i]); l++ {
+							if p.si+l <= len(p.s) && strings.EqualFold(p.s[p.si:p.si+l], mysqlMonthNames[i][:l]) {
+								if l == len(mysqlMonthNames[i]) || (p.si+l < len(p.s) && !((p.s[p.si+l] >= 'a' && p.s[p.si+l] <= 'z') || (p.s[p.si+l] >= 'A' && p.s[p.si+l] <= 'Z'))) {
+									p.month = i
+									p.si += l
+									matched = true
+									p.hasDate = true
+									p.hasMonth = true
+									break
+								}
+							}
+						}
+						if matched {
+							break
+						}
+					}
+				}
+				if !matched {
+					return false
+				}
+			case 'W': // full weekday name
+				p.hasWeekday = true
+				matched := false
+				for i, name := range mysqlWeekdayNames {
+					// try full match first
+					if p.matchLiteral(name) {
+						p.weekday = i
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					// try abbreviated (3 char min)
+					for i, name := range mysqlWeekdayNames {
+						for l := 3; l <= len(name); l++ {
+							if p.si+l <= len(p.s) && strings.EqualFold(p.s[p.si:p.si+l], name[:l]) {
+								if l == len(name) || (p.si+l < len(p.s) && !((p.s[p.si+l] >= 'a' && p.s[p.si+l] <= 'z') || (p.s[p.si+l] >= 'A' && p.s[p.si+l] <= 'Z'))) {
+									p.weekday = i
+									p.si += l
+									matched = true
+									break
+								}
+							}
+						}
+						if matched {
+							break
+						}
+					}
+				}
+				if !matched {
+					// MySQL silently ignores unrecognized weekday names
+				}
+			case 'a': // abbreviated weekday name
+				for _, name := range mysqlWeekdayAbbr {
+					if p.matchLiteral(name) {
+						break
+					}
+				}
+			case 'j': // day of year 001-366
+				n, ok := p.readInt(3)
+				if !ok {
+					return false
+				}
+				p.yearday = n
+				p.hasDate = true
+			case 'U': // week 00-53 (first day=Sunday)
+				p.hasWeekU = true
+				n, ok := p.readInt(2)
+				if !ok {
+					return false
+				}
+				p.weekU = n
+			case 'u': // week 00-53 (first day=Monday, ISO)
+				p.hasWeeku = true
+				n, ok := p.readInt(2)
+				if !ok {
+					return false
+				}
+				p.weeku = n
+			case 'V': // week 01-53 (first day=Sunday, used with %X)
+				p.hasWeekV = true
+				n, ok := p.readInt(2)
+				if !ok {
+					return false
+				}
+				p.weekV = n
+			case 'v': // week 01-53 (first day=Monday, used with %x)
+				p.hasWeekv = true
+				n, ok := p.readInt(2)
+				if !ok {
+					return false
+				}
+				p.weekv = n
+			case 'X': // year for %V (4 digits, Sunday-based)
+				p.hasYearX = true
+				n, ok := p.readInt(4)
+				if !ok {
+					return false
+				}
+				p.yearX = n
+				p.hasDate = true
+				p.hasYear = true
+			case 'x': // year for %v (4 digits, Monday-based ISO)
+				p.hasYearx = true
+				n, ok := p.readInt(4)
+				if !ok {
+					return false
+				}
+				p.yearx = n
+				p.hasDate = true
+				p.hasYear = true
+			case 'w': // weekday 0=Sunday..6=Saturday
+				p.hasWeekday = true
+				n, ok := p.readInt(1)
+				if !ok {
+					return false
+				}
+				if n > 6 { // MySQL: 0=Sunday..6=Saturday, 7 is invalid
+					return false
+				}
+				p.weekday = n
+			case '#', '@', '.': // skip non-numeric chars (%#, %@, and %. all skip non-digits)
+				p.skipNonDigits()
+			case '%': // literal %
+				if p.si >= len(p.s) || p.s[p.si] != '%' {
+					return false
+				}
+				p.si++
+			default:
+				// unknown specifier, skip char in input
+				if p.si < len(p.s) {
+					p.si++
+				}
+			}
+		} else {
+			// literal char in format must match char in input.
+			// MySQL is lenient: if a non-alphanumeric separator doesn't match,
+			// parsing stops but returns what was parsed so far (not a failure).
+			fc := p.f[p.fi]
+			p.fi++
+			if p.si >= len(p.s) {
+				// MySQL is lenient with trailing format chars
+				continue
+			}
+			if p.s[p.si] != fc {
+				isAlpha := func(c byte) bool {
+					return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+				}
+				isNonAlnum := func(c byte) bool {
+					return (c < '0' || c > '9') && (c < 'a' || c > 'z') && (c < 'A' || c > 'Z')
+				}
+				if isNonAlnum(fc) {
+					// Format expects a separator but input has something different.
+					// Check what comes NEXT in the format (after this separator).
+					restFormat := p.f[p.fi:]
+					// If the next format item is %f (microseconds), and the input at the
+					// current position is alpha (like 'A' for AM), that means the fractional
+					// part is completely absent. The separator before %f is required when
+					// %p follows %f (because otherwise AM/PM can't be parsed correctly).
+					if len(restFormat) >= 2 && restFormat[0] == '%' && restFormat[1] == 'f' {
+						// Check if there's a %p after %f
+						afterF := restFormat[2:]
+						// strip the optional space between %f and %p
+						afterFtrimmed := strings.TrimLeft(afterF, " \t")
+						if len(afterFtrimmed) >= 2 && afterFtrimmed[0] == '%' && (afterFtrimmed[1] == 'p' || afterFtrimmed[1] == 'P') {
+							// If input is alphabetic (like A of AM), the `.` separator before %f
+							// didn't match and %f+%p combination would be ambiguous -> return false
+							if isAlpha(p.s[p.si]) {
+								return false
+							}
+						}
+					}
+					// Try to skip the format separator and continue (MySQL leniency).
+					// Don't advance input - the next format specifier will try to match.
+					continue
+				}
+				// Alphanumeric literal mismatch - MySQL stops parsing here
+				// and returns what was parsed so far (not NULL).
+				// We break out of the loop and return true.
+				p.fi = len(p.f) // stop processing format
+				continue
+			}
+			p.si++
+		}
+	}
+	return true
+}
+
+// validate checks for invalid format specifier combinations that MySQL rejects.
+func (p *mysqlDateParser) validate() bool {
+	// %H or %k (24-hour) combined with %p (AM/PM) is invalid in MySQL
+	if p.has24hHour && p.hasAMPM {
+		return false
+	}
+	// %V (Sunday-based week) requires %X (Sunday-based year), not %x or plain %Y
+	if p.hasWeekV && !p.hasYearX {
+		return false
+	}
+	// %v (ISO/Monday-based week) requires %x (ISO year), not %X or plain %Y
+	if p.hasWeekv && !p.hasYearx {
+		return false
+	}
+	// %X (Sunday-based year) should be used with %V, not %v
+	if p.hasYearX && p.hasWeekv && !p.hasWeekV {
+		return false
+	}
+	// %x (ISO year) should be used with %v, not %V
+	if p.hasYearx && p.hasWeekV && !p.hasWeekv {
+		return false
+	}
+	// %u (Monday-based week) should use %Y (not %x which is for %v/ISO)
+	// Mixing %u with %x is invalid
+	if p.hasWeeku && p.hasYearx {
+		return false
+	}
+	return true
+}
+
+func (p *mysqlDateParser) resolveDate() (yr, mo, dy int) {
+	yr, mo, dy = p.year, p.month, p.day
+
+	// If we have week+year info, compute date from that
+	if p.weekU >= 0 && yr > 0 {
+		// %U + %Y: week number (Sunday-based)
+		// Find Jan 1 of year, then compute week
+		jan1 := time.Date(yr, 1, 1, 0, 0, 0, 0, time.UTC)
+		// First Sunday on or before Jan 1
+		offset := int(jan1.Weekday()) // 0=Sunday
+		firstSunday := jan1.AddDate(0, 0, -offset)
+		// Week 0 starts on firstSunday (if Jan 1 is not Sunday, week 0 = last week of prev year)
+		// Week 1 starts on first Sunday >= Jan 1
+		if offset == 0 {
+			// Jan 1 is Sunday, week 0 = that week
+			firstSunday = jan1
+		}
+		target := firstSunday.AddDate(0, 0, p.weekU*7)
+		if p.weekday >= 0 {
+			// adjust to the correct weekday
+			diff := p.weekday - int(target.Weekday())
+			target = target.AddDate(0, 0, diff)
+		}
+		yr, mo, dy = target.Year(), int(target.Month()), target.Day()
+		return
+	}
+	if p.weeku >= 0 && yr > 0 {
+		// %u + %Y: ISO-like week number (Monday-based)
+		jan1 := time.Date(yr, 1, 1, 0, 0, 0, 0, time.UTC)
+		offset := int(jan1.Weekday()) // 0=Sunday
+		// Week 1 starts on first Monday
+		// Adjust: Monday=0 for ISO
+		mondayOffset := (offset + 6) % 7 // days from last Monday to Jan 1
+		firstMonday := jan1.AddDate(0, 0, -mondayOffset)
+		if mondayOffset == 0 {
+			firstMonday = jan1
+		}
+		// Week 0 = the week before the first Monday
+		target := firstMonday.AddDate(0, 0, (p.weeku-1)*7)
+		if p.weeku == 0 {
+			target = firstMonday.AddDate(0, 0, -7)
+		} else {
+			target = firstMonday.AddDate(0, 0, (p.weeku-1)*7)
+		}
+		if p.weekday >= 0 {
+			diff := p.weekday - int(target.Weekday())
+			if diff < 0 {
+				diff += 7
+			}
+			target = target.AddDate(0, 0, diff)
+		}
+		yr, mo, dy = target.Year(), int(target.Month()), target.Day()
+		return
+	}
+	if p.weekV >= 0 && p.yearX > 0 {
+		// %V + %X: Sunday-based week, year from %X
+		jan1 := time.Date(p.yearX, 1, 1, 0, 0, 0, 0, time.UTC)
+		offset := int(jan1.Weekday())
+		var firstSunday time.Time
+		if offset == 0 {
+			firstSunday = jan1
+		} else {
+			firstSunday = jan1.AddDate(0, 0, 7-offset)
+		}
+		target := firstSunday.AddDate(0, 0, (p.weekV-1)*7)
+		if p.weekday >= 0 {
+			diff := p.weekday - int(target.Weekday())
+			target = target.AddDate(0, 0, diff)
+		}
+		yr, mo, dy = target.Year(), int(target.Month()), target.Day()
+		return
+	}
+	if p.weekv >= 0 && p.yearx > 0 {
+		// %v + %x: ISO week, year from %x
+		// Find the first Monday of the first ISO week of yearx
+		jan1 := time.Date(p.yearx, 1, 1, 0, 0, 0, 0, time.UTC)
+		_, isoWeek1 := jan1.ISOWeek()
+		var isoFirstMonday time.Time
+		if isoWeek1 == 1 {
+			// Jan 1 is in ISO week 1, find the Monday of that week
+			wd := int(jan1.Weekday())
+			if wd == 0 {
+				wd = 7
+			}
+			isoFirstMonday = jan1.AddDate(0, 0, 1-wd)
+		} else {
+			// Jan 1 is in last week of previous year, find first ISO week 1 Monday
+			isoFirstMonday = jan1.AddDate(0, 0, 8-int(jan1.Weekday()))
+			if jan1.Weekday() == 0 {
+				isoFirstMonday = jan1.AddDate(0, 0, 1)
+			}
+		}
+		target := isoFirstMonday.AddDate(0, 0, (p.weekv-1)*7)
+		if p.weekday >= 0 {
+			diff := p.weekday - int(target.Weekday())
+			if diff < 0 {
+				diff += 7
+			}
+			target = target.AddDate(0, 0, diff)
+		}
+		yr, mo, dy = target.Year(), int(target.Month()), target.Day()
+		return
+	}
+	if p.yearday > 0 && yr > 0 {
+		// %j + %Y: day of year
+		t := time.Date(yr, 1, p.yearday, 0, 0, 0, 0, time.UTC)
+		yr, mo, dy = t.Year(), int(t.Month()), t.Day()
+	}
+	return
+}
+
+func (p *mysqlDateParser) format() string {
+	// Apply AM/PM adjustment
+	h := p.hour
+	if p.hasAMPM {
+		if p.ampm == 1 { // AM
+			if h == 12 {
+				h = 0
+			}
+		} else if p.ampm == 2 { // PM
+			if h != 12 {
+				h += 12
+			}
+		}
+	}
+
+	yr, mo, dy := p.resolveDate()
+
+	// Determine the result format based on which specifiers were used.
+	hasFullDate := p.hasYear || p.hasMonth // has year or month info → calendar date context
+	hasDayOffset := p.hasDate && !hasFullDate // %d/%j but no year/month → day-offset for time
+
+	if p.literalMode {
+		// Smart type-aware output: use the minimal format suggested by the format string.
+		if hasFullDate && p.hasTime {
+			// Full datetime
+			if p.hasMicro {
+				return fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d.%06d",
+					yr, mo, dy, h, p.minute, p.second, p.microsecond)
+			}
+			return fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d",
+				yr, mo, dy, h, p.minute, p.second)
+		}
+		if hasFullDate {
+			// Date only
+			return fmt.Sprintf("%04d-%02d-%02d", yr, mo, dy)
+		}
+		if p.hasTime {
+			// Time only or day-offset + time → return as time string
+			dayOffset := 0
+			if hasDayOffset {
+				dayOffset = dy
+			}
+			totalH := h + dayOffset*24
+			frac := ""
+			if p.hasMicro {
+				frac = fmt.Sprintf(".%06d", p.microsecond)
+			}
+			if totalH < 0 {
+				return fmt.Sprintf("-%02d:%02d:%02d%s", -totalH, p.minute, p.second, frac)
+			}
+			return fmt.Sprintf("%02d:%02d:%02d%s", totalH, p.minute, p.second, frac)
+		}
+		if hasDayOffset {
+			// Day only (no time specifiers) → return as date with 0000-00-DD
+			return fmt.Sprintf("0000-00-%02d", dy)
+		}
+	}
+
+	// Default mode (or fallback for literal mode): return full datetime(6) format.
+	// When time-only (no date): use 0000-00-00 prefix.
+	if !p.hasDate && p.hasTime {
+		// Time-only with no date: use 0000-00-00 as date prefix
+		return fmt.Sprintf("0000-00-00 %02d:%02d:%02d.%06d",
+			h, p.minute, p.second, p.microsecond)
+	}
+	// Day+time with no full date: keep day in date position (non-literal mode)
+	// Full datetime or date-only: return YYYY-MM-DD HH:MM:SS.ffffff
+	return fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d.%06d",
+		yr, mo, dy, h, p.minute, p.second, p.microsecond)
 }
 
 // mysqlFormatToGoLayout converts a MySQL date format string to a Go time layout.
@@ -10980,6 +11943,13 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			fullQualified = strings.Trim(fullQualified, "`")
 			if val, ok := row[fullQualified]; ok {
 				return val, nil
+			}
+			// Try case-insensitive qualified lookup (handles t1.A when key is t1.a)
+			upperQualified := strings.ToUpper(qualified)
+			for k, kv := range row {
+				if strings.ToUpper(k) == upperQualified {
+					return kv, nil
+				}
 			}
 			// Fall back to correlatedRow for correlated subquery references
 			if e.correlatedRow != nil {
@@ -12369,11 +13339,18 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 		}
 		return len(result.Rows) > 0, nil
 	case *sqlparser.NotExpr:
-		inner, err := e.evalWhere(v.Expr, row)
+		// Evaluate the inner expression using evalRowExpr to preserve NULL (tristate) semantics.
+		// NOT(NULL) = NULL → exclude from WHERE (return false).
+		// NOT(TRUE) = FALSE → exclude from WHERE (return false).
+		// NOT(FALSE) = TRUE → include in WHERE (return true).
+		innerVal, err := e.evalRowExpr(v.Expr, row)
 		if err != nil {
 			return false, err
 		}
-		return !inner, nil
+		if innerVal == nil {
+			return false, nil // NOT(NULL) = NULL → treat as false in WHERE
+		}
+		return !isTruthy(innerVal), nil
 	case *sqlparser.MemberOfExpr:
 		val, err := e.evalRowExpr(v, row)
 		if err != nil {
@@ -12763,6 +13740,14 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 			if looksLikeDate(ls) {
 				// Try converting the integer to a date string (YYYYMMDD/YYMMDD)
 				dateStr := parseMySQLDateValue(rs)
+				if dateStr == "" && fr == 0 {
+					// Integer 0 compared to a date = 0000-00-00 comparison
+					ln := normalizeDateTimeString(ls)
+					if ln != "" {
+						ln, _ = normalizeDateTimeForCompare(ln, "0000-00-00")
+						return ln == "0000-00-00", nil
+					}
+				}
 				if dateStr != "" {
 					ln := normalizeDateTimeString(ls)
 					if ln != "" {
@@ -12792,6 +13777,17 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 		}
 		if ls == rs {
 			return true, nil
+		}
+		// MySQL default collation (utf8mb4_0900_ai_ci) is case-insensitive.
+		// When both operands are native Go strings (i.e. VARCHAR/CHAR columns or string literals),
+		// use case-insensitive comparison unless the value looks like a date/time/number (already
+		// handled above) or binary data.
+		_, leftIsString := left.(string)
+		_, rightIsString := right.(string)
+		if leftIsString && rightIsString && !looksLikeBinaryData(ls) && !looksLikeBinaryData(rs) {
+			if strings.EqualFold(ls, rs) {
+				return true, nil
+			}
 		}
 		// Try datetime normalization if strings look like dates
 		if looksLikeDate(ls) || looksLikeDate(rs) {

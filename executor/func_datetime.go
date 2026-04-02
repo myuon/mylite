@@ -29,6 +29,7 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		return e.nowTime().UTC().Format("2006-01-02 15:04:05"), true, nil
 	case "unix_timestamp":
 		if len(v.Exprs) == 0 {
+			// Return as integer when called with no arguments
 			return int64(e.nowTime().Unix()), true, nil
 		}
 		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
@@ -39,7 +40,30 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if err != nil {
 			return nil, true, nil
 		}
-		return int64(t.Unix()), true, nil
+		// Re-interpret the parsed wall-clock time in the session timezone so that
+		// UNIX_TIMESTAMP('1998-09-16 09:26:00') with time_zone='+03:00' correctly
+		// treats the datetime as being in +03:00, not UTC.
+		loc := e.timeZone
+		if loc == nil {
+			loc = time.Local
+		}
+		tInZone := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), loc)
+		// Detect whether argument has fractional seconds to determine return type.
+		// MySQL returns an integer when a string literal without fractional seconds is given,
+		// and DECIMAL(16,6) when the argument is an expression (CONCAT, column, function).
+		micros := float64(tInZone.Nanosecond()) / 1e3
+		result := float64(tInZone.Unix()) + micros/1e6
+		// Check if arg is a plain string literal with no fractional seconds
+		isPlainLiteral := false
+		if lit, ok := v.Exprs[0].(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
+			if !strings.Contains(lit.Val, ".") {
+				isPlainLiteral = true
+			}
+		}
+		if isPlainLiteral && tInZone.Nanosecond() == 0 {
+			return int64(tInZone.Unix()), true, nil
+		}
+		return DivisionResult{Value: result, Precision: 6}, true, nil
 	case "from_unixtime":
 		if len(v.Exprs) < 1 {
 			return nil, true, fmt.Errorf("FROM_UNIXTIME requires 1 argument")
@@ -50,6 +74,10 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		}
 		ts := toInt64(val)
 		t := time.Unix(ts, 0)
+		// Apply session timezone so FROM_UNIXTIME(0) respects SET time_zone
+		if e.timeZone != nil {
+			t = t.In(e.timeZone)
+		}
 		if len(v.Exprs) >= 2 {
 			fmtVal, err := e.evalExprMaybeRow(v.Exprs[1], row)
 			if err != nil {
@@ -190,11 +218,40 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if val == nil {
 			return nil, true, nil
 		}
-		t, err := parseDateTimeValue(val)
-		if err != nil {
-			return nil, true, nil
+		valStr := toString(val)
+		// Handle "0000-00-00 HH:MM:SS..." format directly (str_to_date time-only result)
+		var timeStr string
+		var fracStr string
+		if strings.HasPrefix(valStr, "0000-00-00 ") {
+			rest := valStr[len("0000-00-00 "):]
+			if dotIdx := strings.LastIndex(rest, "."); dotIdx >= 0 {
+				fracStr = rest[dotIdx+1:]
+				timeStr = rest[:dotIdx]
+			} else {
+				timeStr = rest
+			}
+		} else {
+			t, terr := parseDateTimeValue(val)
+			if terr != nil {
+				return nil, true, nil
+			}
+			timeStr = t.Format("15:04:05")
+			// Extract fractional part from input string
+			if dotIdx := strings.LastIndex(valStr, "."); dotIdx >= 0 {
+				fracStr = valStr[dotIdx+1:]
+			}
 		}
-		return t.Format("15:04:05"), true, nil
+		// Include fractional seconds if present in input
+		if fracStr != "" {
+			for len(fracStr) < 6 {
+				fracStr += "0"
+			}
+			if len(fracStr) > 6 {
+				fracStr = fracStr[:6]
+			}
+			return fmt.Sprintf("%s.%s", timeStr, fracStr), true, nil
+		}
+		return timeStr, true, nil
 	case "datediff":
 		v0, v1, hasNull, err := e.evalArgs2(v.Exprs, "DATEDIFF", row)
 		if err != nil {
@@ -231,7 +288,8 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if err != nil {
 			return nil, true, nil
 		}
-		return mysqlDateFormat(t, toString(fmtVal)), true, nil
+		lcLocale, _ := e.getSysVar("lc_time_names")
+		return mysqlDateFormat(t, toString(fmtVal), lcLocale), true, nil
 	case "str_to_date":
 		if len(v.Exprs) < 2 {
 			return nil, true, fmt.Errorf("STR_TO_DATE requires 2 arguments")
@@ -247,7 +305,10 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if strVal == nil || fmtVal2 == nil {
 			return nil, true, nil
 		}
-		parsed := mysqlStrToDate(toString(strVal), toString(fmtVal2))
+		// Use smart (type-aware) output format only when both arguments are string literals.
+		// When either arg is a column reference or expression, MySQL returns datetime(6) format.
+		_, fmtIsLit := v.Exprs[1].(*sqlparser.Literal)
+		parsed := mysqlStrToDate(toString(strVal), toString(fmtVal2), fmtIsLit)
 		if parsed == nil {
 			return nil, true, nil
 		}
@@ -256,18 +317,33 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if len(v.Exprs) < 2 {
 			return nil, true, fmt.Errorf("GET_FORMAT requires 2 arguments")
 		}
-		typeVal, err := e.evalExprMaybeRow(v.Exprs[0], row)
-		if err != nil {
-			return nil, true, err
+		// The first argument is a type keyword (DATE, TIME, DATETIME, TIMESTAMP).
+		// It may be parsed as a ColName. Extract it directly from AST if possible.
+		var typeStr string
+		if col, ok := v.Exprs[0].(*sqlparser.ColName); ok {
+			typeStr = strings.ToUpper(col.Name.String())
+		} else {
+			typeVal, err := e.evalExprMaybeRow(v.Exprs[0], row)
+			if err != nil {
+				return nil, true, err
+			}
+			if typeVal == nil {
+				return nil, true, nil
+			}
+			typeStr = strings.ToUpper(toString(typeVal))
 		}
 		localeVal, err := e.evalExprMaybeRow(v.Exprs[1], row)
 		if err != nil {
 			return nil, true, err
 		}
-		if typeVal == nil || localeVal == nil {
+		if localeVal == nil {
 			return nil, true, nil
 		}
-		return mysqlGetFormat(strings.ToUpper(toString(typeVal)), strings.ToUpper(toString(localeVal))), true, nil
+		result := mysqlGetFormat(typeStr, strings.ToUpper(toString(localeVal)))
+		if result == "" {
+			return nil, true, nil
+		}
+		return result, true, nil
 	case "dayname":
 		if len(v.Exprs) < 1 {
 			return nil, true, nil
@@ -386,16 +462,19 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if err != nil {
 			return nil, true, err
 		}
-		t, err := parseDateTimeValue(base)
-		if err != nil {
-			return toString(base), true, nil
+		baseStr := toString(base)
+		// Try datetime first, then fall back to time-string arithmetic
+		t, dtErr := parseDateTimeValue(base)
+		if dtErr == nil {
+			dur, err := parseMySQLTimeInterval(toString(interval))
+			if err != nil {
+				return baseStr, true, nil
+			}
+			result := t.Add(dur)
+			return formatDateTimeWithOptionalMicros(result), true, nil
 		}
-		dur, err := parseMySQLTimeInterval(toString(interval))
-		if err != nil {
-			return toString(base), true, nil
-		}
-		result := t.Add(dur)
-		return formatDateTimeWithOptionalMicros(result), true, nil
+		// Base is a TIME string (possibly with garbage at end) - use time arithmetic
+		return addTimeStrings(baseStr, toString(interval), false), true, nil
 	case "subtime":
 		if len(v.Exprs) < 2 {
 			return nil, true, nil
@@ -408,16 +487,18 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if err != nil {
 			return nil, true, err
 		}
-		t, err := parseDateTimeValue(base)
-		if err != nil {
-			return toString(base), true, nil
+		baseStr := toString(base)
+		t, dtErr := parseDateTimeValue(base)
+		if dtErr == nil {
+			dur, err := parseMySQLTimeInterval(toString(interval))
+			if err != nil {
+				return baseStr, true, nil
+			}
+			result := t.Add(-dur)
+			return formatDateTimeWithOptionalMicros(result), true, nil
 		}
-		dur, err := parseMySQLTimeInterval(toString(interval))
-		if err != nil {
-			return toString(base), true, nil
-		}
-		result := t.Add(-dur)
-		return formatDateTimeWithOptionalMicros(result), true, nil
+		// Base is a TIME string - use time arithmetic
+		return addTimeStrings(baseStr, toString(interval), true), true, nil
 	case "from_days":
 		val, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {
@@ -679,10 +760,19 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		usStr := toString(usVal)
 		if usDot := strings.LastIndex(usStr, "."); usDot >= 0 {
 			usFrac := usStr[usDot+1:]
+			// Truncate at first non-digit (MySQL ignores trailing garbage)
+			digitEnd := 0
+			for digitEnd < len(usFrac) && usFrac[digitEnd] >= '0' && usFrac[digitEnd] <= '9' {
+				digitEnd++
+			}
+			usFrac = usFrac[:digitEnd]
 			for len(usFrac) < 6 {
 				usFrac += "0"
 			}
-			usN, _ := strconv.ParseInt(usFrac[:6], 10, 64)
+			if len(usFrac) > 6 {
+				usFrac = usFrac[:6]
+			}
+			usN, _ := strconv.ParseInt(usFrac, 10, 64)
 			return usN, true, nil
 		}
 		return int64(0), true, nil
@@ -706,24 +796,54 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if len(tfParts) >= 3 {
 			tfSec, _ = strconv.Atoi(tfParts[2])
 		}
-		tfResult := toString(tfFmt)
-		tfResult = strings.ReplaceAll(tfResult, "%H", fmt.Sprintf("%02d", tfH))
-		tfResult = strings.ReplaceAll(tfResult, "%k", fmt.Sprintf("%d", tfH))
-		tfResult = strings.ReplaceAll(tfResult, "%i", fmt.Sprintf("%02d", tfM))
-		tfResult = strings.ReplaceAll(tfResult, "%S", fmt.Sprintf("%02d", tfSec))
-		tfResult = strings.ReplaceAll(tfResult, "%s", fmt.Sprintf("%02d", tfSec))
-		tfH12 := tfH % 12
+		// For AM/PM and 12-hour clock, normalize using h mod 24
+		tfH24 := tfH % 24  // hour within a day (0-23)
+		if tfH24 < 0 {
+			tfH24 += 24
+		}
+		tfAmPm := "AM"
+		if tfH24 >= 12 {
+			tfAmPm = "PM"
+		}
+		tfH12 := tfH24 % 12
 		if tfH12 == 0 {
 			tfH12 = 12
 		}
-		tfResult = strings.ReplaceAll(tfResult, "%h", fmt.Sprintf("%02d", tfH12))
-		tfResult = strings.ReplaceAll(tfResult, "%l", fmt.Sprintf("%d", tfH12))
-		if tfH < 12 {
-			tfResult = strings.ReplaceAll(tfResult, "%p", "AM")
-		} else {
-			tfResult = strings.ReplaceAll(tfResult, "%p", "PM")
+
+		tfFmtStr := toString(tfFmt)
+		var tfSb strings.Builder
+		for i := 0; i < len(tfFmtStr); i++ {
+			if tfFmtStr[i] == '%' && i+1 < len(tfFmtStr) {
+				i++
+				switch tfFmtStr[i] {
+				case 'H':
+					tfSb.WriteString(fmt.Sprintf("%02d", tfH))
+				case 'k':
+					tfSb.WriteString(fmt.Sprintf("%d", tfH))
+				case 'h', 'I':
+					tfSb.WriteString(fmt.Sprintf("%02d", tfH12))
+				case 'l':
+					tfSb.WriteString(fmt.Sprintf("%d", tfH12))
+				case 'i':
+					tfSb.WriteString(fmt.Sprintf("%02d", tfM))
+				case 's', 'S':
+					tfSb.WriteString(fmt.Sprintf("%02d", tfSec))
+				case 'p':
+					tfSb.WriteString(tfAmPm)
+				case 'r':
+					// 12-hour clock with AM/PM
+					tfSb.WriteString(fmt.Sprintf("%02d:%02d:%02d %s", tfH12, tfM, tfSec, tfAmPm))
+				case '%':
+					tfSb.WriteByte('%')
+				default:
+					tfSb.WriteByte('%')
+					tfSb.WriteByte(tfFmtStr[i])
+				}
+			} else {
+				tfSb.WriteByte(tfFmtStr[i])
+			}
 		}
-		return tfResult, true, nil
+		return tfSb.String(), true, nil
 	case "convert_tz":
 		if len(v.Exprs) < 3 {
 			return nil, true, fmt.Errorf("CONVERT_TZ requires 3 arguments")

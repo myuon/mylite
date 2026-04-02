@@ -260,7 +260,7 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 		if err != nil {
 			return nil, true, err
 		}
-		if strVal == nil {
+		if strVal == nil || fromVal == nil || toVal == nil {
 			return nil, true, nil
 		}
 		return strings.ReplaceAll(toString(strVal), toString(fromVal), toString(toVal)), true, nil

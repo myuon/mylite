@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -540,7 +541,12 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			}
 			return result, err
 		}
-		return &Result{}, nil
+		// TableSpec is nil but it's not a CREATE TABLE ... LIKE or ... SELECT.
+		// This happens when vitess accepts invalid syntax that MySQL rejects
+		// (e.g. CHECK without parentheses, bare CONSTRAINT without key type).
+		// Return a parse error to match MySQL behaviour.
+		return nil, mysqlError(1064, "42000",
+			"You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '' at line 1")
 	}
 
 	columns := make([]catalog.ColumnDef, 0)
@@ -1109,6 +1115,10 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			def.StatsAutoRecalc = parseTableOptionInt(opt)
 		case "STATS_SAMPLE_PAGES":
 			def.StatsSamplePages = parseTableOptionInt(opt)
+		case "MAX_ROWS":
+			def.MaxRows = parseTableOptionUint64Clamped(opt)
+		case "MIN_ROWS", "AVG_ROW_LENGTH":
+			// Accepted but not stored/displayed
 		case "INSERT_METHOD":
 			def.InsertMethod = strings.ToUpper(tableOptionString(opt))
 		case "UNION":
@@ -2172,6 +2182,13 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					if tableDef != nil {
 						tableDef.StatsSamplePages = parseTableOptionInt(to)
 					}
+				case "MAX_ROWS":
+					tableDef, _ := db.GetTable(tableName)
+					if tableDef != nil {
+						tableDef.MaxRows = parseTableOptionUint64Clamped(to)
+					}
+				case "MIN_ROWS", "AVG_ROW_LENGTH":
+					// Accepted but not stored/displayed
 				case "INSERT_METHOD":
 					tableDef, _ := db.GetTable(tableName)
 					if tableDef != nil {
@@ -2496,6 +2513,25 @@ func parseTableOptionInt(opt *sqlparser.TableOption) *int {
 	return &v
 }
 
+// parseTableOptionUint64Clamped parses a table option as uint64,
+// clamping values exceeding uint32 max to math.MaxUint32 (MySQL MyISAM behaviour).
+func parseTableOptionUint64Clamped(opt *sqlparser.TableOption) *uint64 {
+	raw := strings.TrimSpace(tableOptionString(opt))
+	if raw == "" {
+		return nil
+	}
+	n, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		// Try parsing as a signed int in case negative or overflow
+		n = math.MaxUint32
+	}
+	if n > math.MaxUint32 {
+		n = math.MaxUint32
+	}
+	v := n
+	return &v
+}
+
 // execTruncateTable handles TRUNCATE TABLE statements.
 func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, error) {
 	tableName := stmt.Table.Name.String()
@@ -2737,11 +2773,74 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 					return fmt.Sprintf("varchar(%d)", strLen*cnt)
 				}
 			}
+		case "str_to_date":
+			// str_to_date always returns datetime(6) type; MySQL infers the actual subtype
+			// from the format string used at CREATE TABLE time.
+			if len(v.Exprs) >= 2 {
+				fmtLit, ok := v.Exprs[1].(*sqlparser.Literal)
+				if ok && fmtLit.Type == sqlparser.StrVal {
+					return inferStrToDateType(fmtLit.Val)
+				}
+			}
+			return "datetime(6)"
 		}
 	case *sqlparser.NullVal:
 		return ""
 	}
 	return ""
+}
+
+// inferStrToDateType infers the column type from a str_to_date format string.
+// MySQL uses the format to determine if the result is datetime, date, time, etc.
+// A "full date" requires at least a year OR month specifier (not just %d/%j alone).
+func inferStrToDateType(format string) string {
+	hasFullDate := false // year or month specifier present
+	hasDay := false      // only day specifier present
+	hasTime := false
+	hasMicro := false
+	for i := 0; i < len(format); i++ {
+		if format[i] == '%' && i+1 < len(format) {
+			i++
+			switch format[i] {
+			case 'Y', 'y', 'm', 'c', 'M', 'b', 'U', 'u', 'V', 'v', 'X', 'x', 'W', 'w':
+				hasFullDate = true
+			case 'd', 'e', 'D', 'j':
+				hasDay = true
+			case 'H', 'h', 'I', 'k', 'l', 'i', 's', 'S', 'T', 'r', 'p':
+				hasTime = true
+			case 'f':
+				hasMicro = true
+				hasTime = true
+			}
+		}
+	}
+	// MySQL type inference rules for str_to_date:
+	// - date+time (year/month present + time) → datetime[(6)]
+	// - date only (year or month, no time) → date
+	// - day+time (no year/month, has time) → time[(6)]
+	// - day only (no year/month, no time) → date (e.g. %d alone)
+	// - time only → time[(6)]
+	if hasFullDate && hasTime {
+		if hasMicro {
+			return "datetime(6)"
+		}
+		return "datetime"
+	}
+	if hasFullDate {
+		return "date"
+	}
+	if hasTime {
+		// time-only or day+time
+		if hasMicro {
+			return "time(6)"
+		}
+		return "time"
+	}
+	if hasDay {
+		// day-only (no year/month, no time) → date
+		return "date"
+	}
+	return "datetime(6)"
 }
 
 // mergeColumnTypes merges a list of column types from UNION branches,
@@ -2892,11 +2991,20 @@ func (e *Executor) execCreateTableSelect(newTableName, selectSQL string) (*Resul
 	}
 	e.Storage.CreateTable(e.CurrentDB, newDef)
 	tbl, _ := e.Storage.GetTable(e.CurrentDB, newTableName)
+	// Build a column type map for coercion
+	colTypeMap := make(map[string]string, len(cols))
+	for _, col := range cols {
+		colTypeMap[col.Name] = col.Type
+	}
 	for _, row := range result.Rows {
 		sRow := make(storage.Row)
 		for i, colName := range result.Columns {
 			if i < len(row) {
-				sRow[colName] = row[i]
+				val := row[i]
+				if colType, ok := colTypeMap[colName]; ok && val != nil {
+					val = coerceColumnValue(colType, val)
+				}
+				sRow[colName] = val
 			}
 		}
 		tbl.Insert(sRow) //nolint:errcheck

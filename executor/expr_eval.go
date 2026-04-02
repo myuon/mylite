@@ -488,6 +488,10 @@ func (e *Executor) evalConvertExpr(v *sqlparser.ConvertExpr) (interface{}, error
 		return val, nil
 	}
 	typeName := strings.ToUpper(v.Type.Type)
+	// NULL cast always returns NULL regardless of target type.
+	if val == nil {
+		return nil, nil
+	}
 	switch typeName {
 	case "SIGNED", "INT", "INTEGER", "BIGINT":
 		return toInt64(val), nil
@@ -1281,6 +1285,10 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 	}
 	if v.Type != nil {
 		typeName := strings.ToUpper(v.Type.Type)
+		// NULL cast always returns NULL regardless of target type.
+		if val == nil {
+			return nil, nil
+		}
 		switch typeName {
 		case "SIGNED", "INT", "INTEGER", "BIGINT":
 			return toInt64(val), nil
@@ -1309,11 +1317,40 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 			return toString(val), nil
 		case "DECIMAL", "FLOAT", "DOUBLE", "REAL":
 			return toFloat(val), nil
-		case "DATETIME", "DATE", "TIME", "TIMESTAMP":
+		case "DATETIME", "TIMESTAMP":
 			if val == nil {
 				return nil, nil
 			}
-			return toString(val), nil
+			s := toString(val)
+			// CAST AS DATETIME strips microseconds (returns YYYY-MM-DD HH:MM:SS)
+			if len(s) > 19 && s[19] == '.' {
+				s = s[:19]
+			}
+			return s, nil
+		case "DATE":
+			if val == nil {
+				return nil, nil
+			}
+			s := toString(val)
+			// CAST AS DATE strips time component and returns YYYY-MM-DD
+			if len(s) >= 10 {
+				s = s[:10]
+			}
+			return s, nil
+		case "TIME":
+			if val == nil {
+				return nil, nil
+			}
+			s := toString(val)
+			// CAST AS TIME: extract time component
+			if len(s) > 11 && s[10] == ' ' {
+				s = s[11:]
+			}
+			// Strip microseconds from TIME cast too
+			if len(s) > 8 && s[8] == '.' {
+				s = s[:8]
+			}
+			return s, nil
 		case "JSON":
 			// Preserve boolean type for CAST(TRUE/FALSE AS JSON)
 			if bv, ok := v.Expr.(sqlparser.BoolVal); ok {
@@ -1597,12 +1634,45 @@ func (e *Executor) evalBetweenExpr(v *sqlparser.BetweenExpr) (interface{}, error
 	if err != nil {
 		return nil, err
 	}
-	if val == nil || from == nil || to == nil {
+	// MySQL NULL semantics for BETWEEN: val BETWEEN from AND to = (val >= from) AND (val <= to)
+	// If any operand is NULL, the corresponding comparison is NULL.
+	// NULL AND FALSE = FALSE (short-circuits), NULL AND TRUE = NULL.
+	// We compute each comparison independently:
+	var geFrom, leTo bool
+	var geFromNull, leToNull bool
+	if val == nil || from == nil {
+		geFromNull = true
+	} else {
+		geFrom, _ = compareValues(val, from, sqlparser.GreaterEqualOp)
+	}
+	if val == nil || to == nil {
+		leToNull = true
+	} else {
+		leTo, _ = compareValues(val, to, sqlparser.LessEqualOp)
+	}
+	// Compute: geFrom AND leTo with NULL propagation
+	// FALSE AND anything = FALSE, TRUE AND NULL = NULL, NULL AND NULL = NULL
+	var result bool
+	var resultNull bool
+	if geFromNull {
+		if !leToNull && !leTo {
+			// NULL AND FALSE = FALSE
+			result = false
+		} else {
+			resultNull = true
+		}
+	} else if !geFrom {
+		// FALSE AND anything = FALSE
+		result = false
+	} else if leToNull {
+		// TRUE AND NULL = NULL
+		resultNull = true
+	} else {
+		result = leTo
+	}
+	if resultNull {
 		return nil, nil
 	}
-	geFrom, _ := compareValues(val, from, sqlparser.GreaterEqualOp)
-	leTo, _ := compareValues(val, to, sqlparser.LessEqualOp)
-	result := geFrom && leTo
 	if v.IsBetween {
 		if result {
 			return int64(1), nil

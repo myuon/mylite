@@ -170,6 +170,16 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		}
 	}
 
+	// When HIGH_NOT_PRECEDENCE SQL mode is active, rewrite "NOT col BETWEEN lo AND hi"
+	// to "(NOT col) BETWEEN lo AND hi" since the vitess parser does not support this mode.
+	// In MySQL with HIGH_NOT_PRECEDENCE, NOT has higher precedence than BETWEEN.
+	if strings.Contains(e.sqlMode, "HIGH_NOT_PRECEDENCE") && strings.Contains(upper, "BETWEEN") && strings.Contains(upper, "NOT") {
+		highNotRe := regexp.MustCompile(`(?i)\bNOT\s+(\w+)\s+BETWEEN\b`)
+		query = highNotRe.ReplaceAllString(query, "(NOT $1) BETWEEN")
+		trimmed = strings.TrimSpace(query)
+		upper = strings.ToUpper(trimmed)
+	}
+
 	// Rewrite "SOUNDS LIKE" to SOUNDEX comparison so vitess can parse it
 	if strings.Contains(upper, "SOUNDS LIKE") {
 		slRe := regexp.MustCompile(`(?i)('(?:[^'\\]|\\.)*'|\w+)\s+SOUNDS\s+LIKE\s+('(?:[^'\\]|\\.)*'|\w+)`)

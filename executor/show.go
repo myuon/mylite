@@ -1625,6 +1625,9 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	if def.StatsSamplePages != nil {
 		trailer += fmt.Sprintf(" STATS_SAMPLE_PAGES=%d", *def.StatsSamplePages)
 	}
+	if def.MaxRows != nil {
+		trailer += fmt.Sprintf(" MAX_ROWS=%d", *def.MaxRows)
+	}
 	if def.InsertMethod != "" {
 		trailer += fmt.Sprintf(" INSERT_METHOD=%s", def.InsertMethod)
 	}

@@ -52,6 +52,7 @@ type TableDef struct {
 	StatsSamplePages *int
 	InsertMethod     string   // INSERT_METHOD for MERGE tables: "NO", "FIRST", "LAST"
 	UnionTables      []string // UNION=(t1,t2,...) for MERGE tables
+	MaxRows          *uint64  // MAX_ROWS table option (clamped to uint32 max for non-64-bit engines)
 	CheckConstraints  []CheckConstraint // CHECK constraint definitions
 	ForeignKeys       []ForeignKeyDef    // FOREIGN KEY constraint definitions
 	PartitionType     string             // "RANGE", "LIST", "HASH", "KEY" or "" for non-partitioned
