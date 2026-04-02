@@ -926,9 +926,12 @@ func (ctx *execContext) executeLines(lines []string) error {
 		}
 
 		// Handle multiple statements on one line (e.g. "DROP TABLE t1; SHOW TABLES")
-		// When using a custom delimiter, don't split by semicolon
+		// When using a custom delimiter (e.g. "//"), the block may contain multiple
+		// semicolon-separated statements (e.g. in --enable_info tests). Split by ";"
+		// unless the block looks like a compound statement body (CREATE PROCEDURE etc.)
+		// that must be sent as a single unit.
 		var stmts []string
-		if ctx.delimiter != "" {
+		if ctx.delimiter != "" && isCompoundStatement(stmt) {
 			stmts = []string{stmt}
 		} else {
 			stmts = splitStatements(stmt)
@@ -3563,6 +3566,24 @@ func applyReplaceRegex(line string, pairs []regexReplace) string {
 
 // splitStatements splits a string that may contain multiple SQL statements
 // separated by semicolons, respecting quoted strings.
+// isCompoundStatement returns true if the statement is a compound DDL (CREATE PROCEDURE,
+// CREATE FUNCTION, CREATE TRIGGER, CREATE EVENT) that contains a BEGIN...END body and
+// must be sent as a single unit rather than split by semicolons.
+func isCompoundStatement(s string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(s))
+	compoundPrefixes := []string{
+		"CREATE PROCEDURE", "CREATE FUNCTION", "CREATE TRIGGER", "CREATE EVENT",
+		"ALTER PROCEDURE", "ALTER FUNCTION",
+		"CREATE DEFINER", // handles DEFINER=... prefix for routines
+	}
+	for _, prefix := range compoundPrefixes {
+		if strings.HasPrefix(upper, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func splitStatements(s string) []string {
 	var stmts []string
 	var current strings.Builder

@@ -542,6 +542,9 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		result, err := e.evalAESDecrypt(v, row)
 		return result, true, err
 	case "uuid_to_bin":
+		if len(v.Exprs) == 0 {
+			return nil, true, nil
+		}
 		utbVal, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {
 			return nil, true, err
@@ -549,8 +552,42 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if isNull {
 			return nil, true, nil
 		}
-		return strings.ReplaceAll(toString(utbVal), "-", ""), true, nil
+		uuidStr := toString(utbVal)
+		// Strip surrounding braces if present
+		uuidStr = strings.TrimLeft(uuidStr, "{")
+		uuidStr = strings.TrimRight(uuidStr, "}")
+		// Remove dashes
+		hexStr := strings.ReplaceAll(uuidStr, "-", "")
+		// Check for swap_flag (second argument)
+		swapFlag := false
+		if len(v.Exprs) >= 2 {
+			swapVal, swapErr := e.evalExprMaybeRow(v.Exprs[1], row)
+			if swapErr == nil && swapVal != nil {
+				swapFlag = toInt64(swapVal) != 0
+			}
+		}
+		// Decode hex to 16 binary bytes
+		decoded, decErr := hex.DecodeString(hexStr)
+		if decErr != nil || len(decoded) != 16 {
+			return nil, true, fmt.Errorf("incorrect string value for uuid_to_bin")
+		}
+		// If swap_flag is set, swap time-low and time-high fields (MySQL time-ordered UUID)
+		if swapFlag {
+			// Swap: [0-3] (time_low) ↔ [6-7] (time_hi_and_version)
+			// Original: time_low(4) time_mid(2) time_hi(2) ...
+			// Swapped:  time_hi(2) time_mid(2) time_low(4) ...
+			swapped := make([]byte, 16)
+			copy(swapped[0:2], decoded[6:8])  // time_hi
+			copy(swapped[2:4], decoded[4:6])  // time_mid
+			copy(swapped[4:8], decoded[0:4])  // time_low
+			copy(swapped[8:16], decoded[8:16]) // rest
+			decoded = swapped
+		}
+		return string(decoded), true, nil
 	case "bin_to_uuid":
+		if len(v.Exprs) == 0 {
+			return nil, true, nil
+		}
 		btuVal, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {
 			return nil, true, err
@@ -558,7 +595,43 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if isNull {
 			return nil, true, nil
 		}
-		return toString(btuVal), true, nil
+		// Decode binary input: HexBytes (x'...' literals) need to be decoded to raw bytes
+		var btuBytes []byte
+		if hb, ok := btuVal.(HexBytes); ok {
+			decoded, decErr := hex.DecodeString(string(hb))
+			if decErr != nil {
+				return nil, true, fmt.Errorf("incorrect string value for bin_to_uuid")
+			}
+			btuBytes = decoded
+		} else {
+			btuBytes = []byte(toString(btuVal))
+		}
+		// Expect exactly 16 bytes
+		if len(btuBytes) != 16 {
+			return nil, true, fmt.Errorf("incorrect string value for bin_to_uuid")
+		}
+		btuStr := string(btuBytes)
+		// Check for swap_flag (second argument)
+		btuSwapFlag := false
+		if len(v.Exprs) >= 2 {
+			btuSwapVal, btuSwapErr := e.evalExprMaybeRow(v.Exprs[1], row)
+			if btuSwapErr == nil && btuSwapVal != nil {
+				btuSwapFlag = toInt64(btuSwapVal) != 0
+			}
+		}
+		b := []byte(btuStr)
+		if btuSwapFlag {
+			// Reverse the time-ordered swap: time_hi(2) time_mid(2) time_low(4) → time_low(4) time_mid(2) time_hi(2)
+			unswapped := make([]byte, 16)
+			copy(unswapped[0:4], b[4:8])  // time_low
+			copy(unswapped[4:6], b[2:4])  // time_mid
+			copy(unswapped[6:8], b[0:2])  // time_hi
+			copy(unswapped[8:16], b[8:16]) // rest
+			b = unswapped
+		}
+		uuidStr := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+			b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+		return uuidStr, true, nil
 	case "to_base64":
 		tb64Val, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {

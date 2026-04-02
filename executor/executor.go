@@ -6842,6 +6842,22 @@ func extractCharLength(colType string) int {
 	return 0
 }
 
+// isSingleByteCharset returns true if the charset is a known single-byte charset
+// where CHAR(N) = N bytes (so Go's rune count is accurate for length checking).
+func isSingleByteCharset(charset string) bool {
+	switch strings.ToLower(charset) {
+	case "latin1", "latin2", "latin5", "latin7", "latin9",
+		"cp1250", "cp1251", "cp1256", "cp1257",
+		"cp850", "cp852", "cp866",
+		"armscii8", "dec8", "geostd8", "greek", "hebrew", "hp8",
+		"keybcs2", "koi8r", "koi8u",
+		"macce", "macroman",
+		"swe7", "tis620":
+		return true
+	}
+	return false
+}
+
 // checkDecimalRange checks if a value fits within a DECIMAL(M,D) column's range.
 func checkDecimalRange(colType string, v interface{}) error {
 	lower := strings.ToLower(colType)
@@ -11959,6 +11975,22 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				if val, ok := e.correlatedRow[fullQualified]; ok {
 					return val, nil
 				}
+				// Try unqualified lookup in correlatedRow: handles the case where
+				// the outer row's keys are unqualified (e.g. {a:0, b:10}) but the
+				// subquery WHERE references them as t1.a.  We must look here BEFORE
+				// falling through to row[colName], otherwise we'd incorrectly return
+				// the inner table's value (e.g. t2.a) instead of the outer t1.a.
+				upperName := strings.ToUpper(colName)
+				for k, kv := range e.correlatedRow {
+					if strings.ToUpper(k) == upperName {
+						return kv, nil
+					}
+				}
+				// Qualifier was present but not resolved from correlatedRow either.
+				// Do NOT fall through to bare row[colName]: that would incorrectly
+				// match a same-named column in the inner table (e.g., t2.a when
+				// looking for t1.a in a correlated subquery).
+				return nil, nil
 			}
 		}
 		// Fall back to un-prefixed lookup

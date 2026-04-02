@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
@@ -355,7 +356,26 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 						if isCharType {
 							if sv, ok := val.(string); ok {
 								maxLen := extractCharLength(col.Type)
-								if maxLen > 0 && len([]rune(sv)) > maxLen {
+								// Determine effective charset for accurate character counting.
+								// For multi-byte non-UTF8 charsets (ucs2, utf16, utf32, big5, gbk, etc.)
+								// or when the string contains non-UTF-8 bytes, we cannot accurately
+								// count characters. Skip the length check in those cases.
+								effectiveCs := col.Charset
+								if effectiveCs == "" && tbl.Def != nil {
+									effectiveCs = tbl.Def.Charset
+								}
+								if effectiveCs == "" {
+									effectiveCs = "utf8mb4"
+								}
+								effectiveCs = strings.ToLower(effectiveCs)
+								isUtf8Cs := effectiveCs == "utf8" || effectiveCs == "utf8mb4" ||
+									effectiveCs == "utf8mb3" || effectiveCs == "ascii" ||
+									effectiveCs == "" || isSingleByteCharset(effectiveCs)
+								svLen := 0
+								if isUtf8Cs && utf8.ValidString(sv) {
+									svLen = len([]rune(sv))
+								}
+								if maxLen > 0 && svLen > maxLen {
 									excess := string([]rune(sv)[maxLen:])
 									onlySpaces := strings.TrimRight(excess, " ") == ""
 									if onlySpaces {

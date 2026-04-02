@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
@@ -1224,7 +1225,26 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							if isBinaryColType {
 								svLen = len(sv)
 							} else {
-								svLen = len([]rune(sv))
+								// For non-binary CHAR/VARCHAR, determine effective charset.
+								// For multi-byte non-UTF8 charsets (ucs2, utf16, utf32, big5, gbk, etc.)
+								// or when the string contains non-UTF-8 bytes, we cannot accurately
+								// count characters. Skip the length check in those cases.
+								effectiveCharset := col.Charset
+								if effectiveCharset == "" && tbl.Def != nil {
+									effectiveCharset = tbl.Def.Charset
+								}
+								if effectiveCharset == "" {
+									effectiveCharset = "utf8mb4"
+								}
+								effectiveCharset = strings.ToLower(effectiveCharset)
+								isUtf8Compatible := effectiveCharset == "utf8" || effectiveCharset == "utf8mb4" ||
+									effectiveCharset == "utf8mb3" || effectiveCharset == "ascii" ||
+									effectiveCharset == "" || isSingleByteCharset(effectiveCharset)
+								if !isUtf8Compatible || !utf8.ValidString(sv) {
+									svLen = 0 // skip check for multi-byte charsets
+								} else {
+									svLen = len([]rune(sv))
+								}
 							}
 							if maxLen > 0 && svLen > maxLen {
 								// For BINARY/VARBINARY columns, any excess bytes cause a strict mode
@@ -1356,7 +1376,22 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					continue
 				}
 				maxLen := extractCharLength(col.Type)
-				if maxLen > 0 && len([]rune(sv)) > maxLen {
+				runeLen := 0
+				effectiveCs := col.Charset
+				if effectiveCs == "" && tbl.Def != nil {
+					effectiveCs = tbl.Def.Charset
+				}
+				if effectiveCs == "" {
+					effectiveCs = "utf8mb4"
+				}
+				effectiveCs = strings.ToLower(effectiveCs)
+				isUtf8Cs := effectiveCs == "utf8" || effectiveCs == "utf8mb4" ||
+					effectiveCs == "utf8mb3" || effectiveCs == "ascii" ||
+					effectiveCs == "" || isSingleByteCharset(effectiveCs)
+				if isUtf8Cs && utf8.ValidString(sv) {
+					runeLen = len([]rune(sv))
+				}
+				if maxLen > 0 && runeLen > maxLen {
 					e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 				}
 			}

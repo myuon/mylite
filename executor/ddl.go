@@ -43,10 +43,39 @@ func (e *Executor) isLogTableLoggingEnabled(tableName string) bool {
 }
 
 func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error) {
+	// RENAME TABLE is atomic: validate all pairs before executing any rename.
+	// We simulate the rename chain to validate that each source exists and each
+	// target doesn't conflict, accounting for intermediate renames.
+	// "effective" tracks which (db, name) keys exist after simulated renames so far.
+	type tableKey struct{ db, name string }
+	// Start with "unknown" — we'll query the catalog on demand and track additions/removals.
+	removed := make(map[tableKey]bool)
+	added := make(map[tableKey]bool)
+
+	tableExists := func(db, name string) bool {
+		k := tableKey{db, name}
+		if removed[k] {
+			return false
+		}
+		if added[k] {
+			return true
+		}
+		catDB, err := e.Catalog.GetDatabase(db)
+		if err != nil {
+			return false
+		}
+		_, err = catDB.GetTable(name)
+		return err == nil
+	}
+
+	type renamePair struct {
+		srcDB, oldName, targetDB, newName string
+	}
+	pairs := make([]renamePair, 0, len(stmt.TablePairs))
+
 	for _, pair := range stmt.TablePairs {
 		oldName := pair.FromTable.Name.String()
 		newName := pair.ToTable.Name.String()
-		// Determine source and target databases
 		srcDB := e.CurrentDB
 		if !pair.FromTable.Qualifier.IsEmpty() {
 			srcDB = pair.FromTable.Qualifier.String()
@@ -55,43 +84,61 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 		if !pair.ToTable.Qualifier.IsEmpty() {
 			targetDB = pair.ToTable.Qualifier.String()
 		}
+
+		// Validate databases exist
 		if _, err := e.Catalog.GetDatabase(targetDB); err != nil {
 			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", targetDB))
 		}
-		srcCatDB, err := e.Catalog.GetDatabase(srcDB)
-		if err != nil {
+		if _, err := e.Catalog.GetDatabase(srcDB); err != nil {
 			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", srcDB))
 		}
-		targetCatDB, err := e.Catalog.GetDatabase(targetDB)
-		if err != nil {
-			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", targetDB))
-		}
-		// Check if new name already exists in target db
-		if _, err := targetCatDB.GetTable(newName); err == nil {
-			return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newName))
-		}
-		// Get old table def
-		def, err := srcCatDB.GetTable(oldName)
-		if err != nil {
+
+		// Validate source exists (considering prior simulated renames)
+		if !tableExists(srcDB, oldName) {
 			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", srcDB, oldName))
 		}
+		// Validate target doesn't exist (considering prior simulated renames)
+		if tableExists(targetDB, newName) {
+			return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newName))
+		}
+
+		// Simulate this rename for subsequent validations
+		removed[tableKey{srcDB, oldName}] = true
+		added[tableKey{targetDB, newName}] = true
+		// If we had previously "added" the source, remove it from added too
+		if added[tableKey{srcDB, oldName}] {
+			delete(added, tableKey{srcDB, oldName})
+		}
+
+		pairs = append(pairs, renamePair{srcDB, oldName, targetDB, newName})
+	}
+
+	// All validations passed; execute all renames.
+	for _, p := range pairs {
+		srcCatDB, _ := e.Catalog.GetDatabase(p.srcDB)
+		targetCatDB, _ := e.Catalog.GetDatabase(p.targetDB)
+
+		def, err := srcCatDB.GetTable(p.oldName)
+		if err != nil {
+			continue // shouldn't happen after validation
+		}
 		// Rename in catalog
-		def.Name = newName
-		srcCatDB.DropTable(oldName)  //nolint:errcheck
-		targetCatDB.CreateTable(def) //nolint:errcheck
+		def.Name = p.newName
+		srcCatDB.DropTable(p.oldName)    //nolint:errcheck
+		targetCatDB.CreateTable(def)      //nolint:errcheck
 		// Rename in storage
-		if tbl, err := e.Storage.GetTable(srcDB, oldName); err == nil {
+		if tbl, err := e.Storage.GetTable(p.srcDB, p.oldName); err == nil {
 			tbl.Def = def
-			e.Storage.CreateTable(targetDB, def)
+			e.Storage.CreateTable(p.targetDB, def)
 			// Copy rows
-			if newTbl, err := e.Storage.GetTable(targetDB, newName); err == nil {
+			if newTbl, err := e.Storage.GetTable(p.targetDB, p.newName); err == nil {
 				newTbl.Rows = tbl.Rows
 				newTbl.AutoIncrement.Store(tbl.AutoIncrementValue())
 			}
-			e.Storage.DropTable(srcDB, oldName)
+			e.Storage.DropTable(p.srcDB, p.oldName)
 		}
-		e.removeInnoDBStatsRows(srcDB, oldName)
-		e.upsertInnoDBStatsRows(targetDB, newName, e.tableRowCount(targetDB, newName))
+		e.removeInnoDBStatsRows(p.srcDB, p.oldName)
+		e.upsertInnoDBStatsRows(p.targetDB, p.newName, e.tableRowCount(p.targetDB, p.newName))
 	}
 	return &Result{}, nil
 }
