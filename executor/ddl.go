@@ -2281,6 +2281,71 @@ func binaryPadLength(colType string) int {
 	return 0
 }
 
+// isVarbinaryType returns true if the column type is VARBINARY(N) or BINARY without a length.
+func isVarbinaryType(colType string) bool {
+	lower := strings.ToLower(strings.TrimSpace(colType))
+	return strings.HasPrefix(lower, "varbinary(")
+}
+
+// looksLikeBinaryData returns true if s contains bytes that are unlikely to appear
+// in a normal text string (null bytes or bytes < 0x09), indicating it's binary data
+// from a BINARY/VARBINARY column.
+func looksLikeBinaryData(s string) bool {
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b == 0x00 || b < 0x09 {
+			return true
+		}
+	}
+	return false
+}
+
+// hexIntToBytes converts an int64 or uint64 (from a 0xNN hex literal) to its
+// big-endian byte string representation, stripping leading zero bytes.
+// Returns the original value unchanged if it is not an integer type.
+func hexIntToBytes(val interface{}) interface{} {
+	switch tv := val.(type) {
+	case int64:
+		if tv == 0 {
+			return "\x00"
+		}
+		var buf [8]byte
+		buf[0] = byte(tv >> 56)
+		buf[1] = byte(tv >> 48)
+		buf[2] = byte(tv >> 40)
+		buf[3] = byte(tv >> 32)
+		buf[4] = byte(tv >> 24)
+		buf[5] = byte(tv >> 16)
+		buf[6] = byte(tv >> 8)
+		buf[7] = byte(tv)
+		start := 0
+		for start < 7 && buf[start] == 0 {
+			start++
+		}
+		return string(buf[start:])
+	case uint64:
+		if tv == 0 {
+			return "\x00"
+		}
+		var buf [8]byte
+		buf[0] = byte(tv >> 56)
+		buf[1] = byte(tv >> 48)
+		buf[2] = byte(tv >> 40)
+		buf[3] = byte(tv >> 32)
+		buf[4] = byte(tv >> 24)
+		buf[5] = byte(tv >> 16)
+		buf[6] = byte(tv >> 8)
+		buf[7] = byte(tv)
+		start := 0
+		for start < 7 && buf[start] == 0 {
+			start++
+		}
+		return string(buf[start:])
+	default:
+		return val
+	}
+}
+
 // padDecimalDefault pads a decimal default value to the declared scale.
 // e.g. DECIMAL(10,8) with default "3.141592" -> "3.14159200"
 func padDecimalDefault(colType, defVal string) string {
@@ -2306,12 +2371,16 @@ func padDecimalDefault(colType, defVal string) string {
 	return defVal
 }
 
-// padBinaryValue pads a string value to the given length with null bytes.
+// padBinaryValue pads a value to the given fixed length with null bytes.
+// Integer values (from 0xNN hex literals) are first converted to their
+// big-endian byte representation before padding.
 func padBinaryValue(val interface{}, padLen int) interface{} {
 	if val == nil || padLen <= 0 {
 		return val
 	}
-	s, ok := val.(string)
+	// Convert integer hex literals to byte strings first
+	converted := hexIntToBytes(val)
+	s, ok := converted.(string)
 	if !ok {
 		return val
 	}

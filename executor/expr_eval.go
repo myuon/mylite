@@ -504,7 +504,25 @@ func (e *Executor) evalConvertExpr(v *sqlparser.ConvertExpr) (interface{}, error
 		}
 		return toString(val), nil
 	case "BINARY", "VARBINARY":
-		return toString(val), nil
+		if val == nil {
+			return nil, nil
+		}
+		// Convert integer hex literals to big-endian bytes first
+		byteVal := hexIntToBytes(val)
+		var s string
+		if sv, ok := byteVal.(string); ok {
+			s = sv
+		} else {
+			s = toString(val)
+		}
+		// For BINARY(N), pad to length N
+		if typeName == "BINARY" && v.Type != nil && v.Type.Length != nil {
+			n := *v.Type.Length
+			if n > 0 {
+				return padBinaryValue(s, n), nil
+			}
+		}
+		return s, nil
 	case "YEAR":
 		return toInt64(val), nil
 	case "JSON":
@@ -1217,6 +1235,29 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 				return castToJSONValue(bool(bv), isStrictJSONStringCastSource(v.Expr))
 			}
 			return castToJSONValue(val, isStrictJSONStringCastSource(v.Expr))
+		case "BINARY":
+			// CAST(expr AS BINARY(N)) or CAST(expr AS BINARY):
+			// Convert the value to a byte string, then right-pad with \x00 to length N.
+			if val == nil {
+				return nil, nil
+			}
+			// Convert integer (e.g., from 0xNN hex literals) to big-endian bytes first
+			byteVal := hexIntToBytes(val)
+			var s string
+			switch bv := byteVal.(type) {
+			case string:
+				s = bv
+			default:
+				s = toString(val)
+			}
+			// Pad to declared length if specified
+			if v.Type != nil && v.Type.Length != nil {
+				n := *v.Type.Length
+				if n > 0 {
+					return padBinaryValue(s, n), nil
+				}
+			}
+			return s, nil
 		}
 	}
 	return val, nil

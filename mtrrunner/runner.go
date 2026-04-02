@@ -4081,6 +4081,12 @@ func normalizeExpected(s string) string {
 				strings.HasPrefix(trimmed, "Message\t") {
 				continue
 			}
+			// Also handle --replace_column substituted warning lines (e.g. "X\tX\tX").
+			// SHOW WARNINGS rows always have exactly 3 tab-separated columns (Level, Code, Message),
+			// so any line inside a Warnings block with exactly 2 tabs is a warning row.
+			if strings.Count(trimmed, "\t") == 2 {
+				continue
+			}
 			inWarnings = false
 		}
 

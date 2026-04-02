@@ -1210,24 +1210,49 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						if ov, ok := origValues[col.Name]; ok && ov != nil {
 							checkVal = ov
 						}
+						// For BINARY/VARBINARY columns, convert integer hex literals to bytes
+						isBinaryColType := strings.Contains(colUpper, "BINARY")
+						if isBinaryColType {
+							if converted := hexIntToBytes(checkVal); converted != checkVal {
+								checkVal = converted
+							}
+						}
 						if sv, ok := checkVal.(string); ok {
 							maxLen := extractCharLength(col.Type)
-							if maxLen > 0 && len([]rune(sv)) > maxLen {
-								// Check if the excess characters are only spaces.
-								// MySQL allows truncation of trailing spaces with just a warning/note,
-								// even in strict mode.
-								excess := string([]rune(sv)[maxLen:])
-								onlySpaces := strings.TrimRight(excess, " ") == ""
-								if onlySpaces {
-									row[col.Name] = string([]rune(sv)[:maxLen])
-									rv = row[col.Name]
-									e.addWarning("Note", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
-								} else if bool(stmt.Ignore) || !e.isStrictMode() {
-									// INSERT IGNORE or non-strict mode: warn but do NOT truncate
-									// (Dolt does not enforce VARCHAR length limits)
-									e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+							// For binary columns, use byte length (not rune length)
+							var svLen int
+							if isBinaryColType {
+								svLen = len(sv)
+							} else {
+								svLen = len([]rune(sv))
+							}
+							if maxLen > 0 && svLen > maxLen {
+								// For BINARY/VARBINARY columns, any excess bytes cause a strict mode
+								// error (unlike CHAR/VARCHAR where trailing spaces are allowed).
+								if isBinaryColType {
+									if bool(stmt.Ignore) || !e.isStrictMode() {
+										// IGNORE or non-strict: truncate with warning
+										row[col.Name] = sv[:maxLen]
+										rv = row[col.Name]
+										e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+									} else {
+										return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row 1", col.Name))
+									}
 								} else {
-									return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row 1", col.Name))
+									// For CHAR/VARCHAR: trailing spaces can be truncated with just a warning
+									excess := string([]rune(sv)[maxLen:])
+									onlySpaces := strings.TrimRight(excess, " ") == ""
+									if onlySpaces {
+										row[col.Name] = string([]rune(sv)[:maxLen])
+										rv = row[col.Name]
+										e.addWarning("Note", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+									} else if bool(stmt.Ignore) || !e.isStrictMode() {
+										// INSERT IGNORE or non-strict mode: warn but do NOT truncate
+										// (Dolt does not enforce VARCHAR length limits)
+										e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+									} else {
+										return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row 1", col.Name))
+									}
 								}
 							}
 						}

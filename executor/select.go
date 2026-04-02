@@ -2320,6 +2320,56 @@ func isAggregateExpr(expr sqlparser.Expr) bool {
 
 // execSelectGroupBy handles SELECT with GROUP BY or aggregate functions.
 func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.Row) (*Result, error) {
+	// ONLY_FULL_GROUP_BY: validate that non-aggregate SELECT expressions appear in GROUP BY.
+	if stmt.GroupBy != nil && len(stmt.GroupBy.Exprs) > 0 &&
+		strings.Contains(e.sqlMode, "ONLY_FULL_GROUP_BY") {
+		// Build set of GROUP BY column names (lowercase)
+		groupByColSet := make(map[string]bool)
+		for _, gbExpr := range stmt.GroupBy.Exprs {
+			if col, ok := gbExpr.(*sqlparser.ColName); ok {
+				groupByColSet[strings.ToLower(col.Name.String())] = true
+			}
+		}
+		// Determine table name from FROM clause for error messages
+		tableName := ""
+		if len(stmt.From) > 0 {
+			if tbl, ok := stmt.From[0].(*sqlparser.AliasedTableExpr); ok {
+				if tblName, ok := tbl.Expr.(sqlparser.TableName); ok {
+					tableName = tblName.Name.String()
+				}
+			}
+		}
+		// Check each SELECT expression
+		for i, selectExpr := range stmt.SelectExprs.Exprs {
+			ae, ok := selectExpr.(*sqlparser.AliasedExpr)
+			if !ok {
+				continue
+			}
+			// Skip aggregate expressions
+			if isAggregateExpr(ae.Expr) {
+				continue
+			}
+			// Skip literals and NULL
+			switch ae.Expr.(type) {
+			case *sqlparser.Literal, *sqlparser.NullVal:
+				continue
+			}
+			// Check if it's a column reference
+			col, isCol := ae.Expr.(*sqlparser.ColName)
+			if !isCol {
+				continue
+			}
+			colNameLower := strings.ToLower(col.Name.String())
+			if !groupByColSet[colNameLower] {
+				// Not in GROUP BY — error
+				dbTable := e.CurrentDB + "." + tableName + "." + col.Name.String()
+				return nil, mysqlError(1055, "42000",
+					fmt.Sprintf("Expression #%d of SELECT list is not in GROUP BY clause and contains nonaggregated column '%s' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by",
+						i+1, dbTable))
+			}
+		}
+	}
+
 	type group struct {
 		key  string
 		rows []storage.Row
@@ -3561,7 +3611,8 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					// spacing after commas in function calls).
 					// MySQL displays string literal column headers without quotes:
 					// SELECT 'hello' -> column name is "hello" not "'hello'"
-					if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' {
+					// But only strip if it's a simple string literal (no operators like ||).
+					if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' && isSimpleStringLiteral(raw) {
 						raw = raw[1 : len(raw)-1]
 					}
 					// MySQL displays j->'$.key' as JSON_EXTRACT(j,'$.key') in column headers

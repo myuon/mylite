@@ -26,10 +26,33 @@ func stripPrefixLength(col string) string {
 type Row map[string]interface{}
 
 // displayValue formats a value for error messages, stripping trailing null bytes
-// from strings (for BINARY column display).
+// from strings (for BINARY column display) and escaping non-printable bytes.
 func displayValue(v interface{}) string {
 	s := fmt.Sprintf("%v", v)
-	return strings.TrimRight(s, "\x00")
+	// Strip trailing null bytes (BINARY column padding)
+	s = strings.TrimRight(s, "\x00")
+	// Escape non-printable bytes as \xNN (MySQL error message format)
+	var out strings.Builder
+	hasBinary := false
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b < 0x20 || b > 0x7e {
+			hasBinary = true
+			break
+		}
+	}
+	if hasBinary {
+		for i := 0; i < len(s); i++ {
+			b := s[i]
+			if b < 0x20 || b > 0x7e {
+				fmt.Fprintf(&out, "\\x%02x", b)
+			} else {
+				out.WriteByte(b)
+			}
+		}
+		return out.String()
+	}
+	return s
 }
 
 // Table is the in-memory storage for a single table.

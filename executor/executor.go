@@ -1926,10 +1926,28 @@ func normalizeSQLDisplayName(s string) string {
 	s = normalizeSelectedFunctionArgDisplaySpacing(s)
 	// MySQL displays string literal column headers without quotes:
 	// SELECT 'hello' -> column name is "hello" not "'hello'"
-	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
+	// But only strip if it's a simple string literal (no operators like ||).
+	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' && isSimpleStringLiteral(s) {
 		s = s[1 : len(s)-1]
 	}
 	return s
+}
+
+// isSimpleStringLiteral returns true if s is a simple quoted string literal
+// (starts and ends with ' and contains no unescaped ' in the middle and no operators outside quotes).
+// Used to distinguish SELECT 'hello' (simple literal) from SELECT 'A' || 'B' (expression).
+func isSimpleStringLiteral(s string) bool {
+	if len(s) < 2 || s[0] != '\'' || s[len(s)-1] != '\'' {
+		return false
+	}
+	// Check that there is no unescaped ' between position 1 and len-1
+	inner := s[1 : len(s)-1]
+	for i := 0; i < len(inner); i++ {
+		if inner[i] == '\'' && (i == 0 || inner[i-1] != '\\') {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeSelectedFunctionArgDisplaySpacing(s string) string {
@@ -3702,6 +3720,26 @@ func (e *Executor) extractAllTableNames(te sqlparser.TableExpr) []string {
 	return nil
 }
 
+// countDerivedTablesInExpr counts how many direct derived tables (subqueries in FROM) exist
+// in a table expression.
+func countDerivedTablesInExpr(te sqlparser.TableExpr) int {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if _, ok := t.Expr.(*sqlparser.DerivedTable); ok {
+			return 1
+		}
+	case *sqlparser.JoinTableExpr:
+		return countDerivedTablesInExpr(t.LeftExpr) + countDerivedTablesInExpr(t.RightExpr)
+	case *sqlparser.ParenTableExpr:
+		n := 0
+		for _, expr := range t.Exprs {
+			n += countDerivedTablesInExpr(expr)
+		}
+		return n
+	}
+	return 0
+}
+
 // explainSelect produces EXPLAIN rows for a SELECT statement.
 func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, selectType string) []explainSelectType {
 	myID := *idCounter
@@ -3713,6 +3751,12 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 		allTableNames = append(allTableNames, e.extractAllTableNames(te)...)
 	}
 
+	// Count direct derived tables in FROM clause
+	numDerived := 0
+	for _, te := range sel.From {
+		numDerived += countDerivedTablesInExpr(te)
+	}
+
 	// Check for GROUP BY / SQL_BIG_RESULT
 	queryStr := sqlparser.String(sel)
 	upperQ := strings.ToUpper(queryStr)
@@ -3721,8 +3765,8 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 		return ok
 	}()
 
-	if len(allTableNames) == 0 {
-		// No tables
+	if len(allTableNames) == 0 && numDerived == 0 {
+		// No tables at all
 		result = append(result, explainSelectType{
 			id:         myID,
 			selectType: selectType,
@@ -3732,6 +3776,27 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 			filtered:   nil,
 			accessType: nil,
 		})
+	} else if len(allTableNames) == 0 && numDerived > 0 {
+		// Only derived tables in FROM - add a row for each derived table reference.
+		// Derived tables will get ids starting at *idCounter+1 (assigned in explainFromExpr).
+		nextID := *idCounter + 1
+		for i := 0; i < numDerived; i++ {
+			derivedRef := fmt.Sprintf("<derived%d>", nextID)
+			result = append(result, explainSelectType{
+				id:           myID,
+				selectType:   selectType,
+				table:        derivedRef,
+				extra:        nil,
+				rows:         int64(1),
+				filtered:     "100.00",
+				accessType:   "ALL",
+				possibleKeys: nil,
+				key:          nil,
+				keyLen:       nil,
+				ref:          nil,
+			})
+			nextID++
+		}
 	} else {
 		for idx, tblName := range allTableNames {
 			var rowCount int64 = 1
@@ -5693,11 +5758,7 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	case *sqlparser.ExplainTab:
 		return e.execDescribe(s)
 	case *sqlparser.ExplainStmt:
-		explainedQuery := trimmed
-		if s.Statement != nil {
-			explainedQuery = sqlparser.String(s.Statement)
-		}
-		return e.explainResultForType(s.Type, explainedQuery), nil
+		return e.execExplainStmt(s, trimmed)
 	case *sqlparser.Begin:
 		return e.execBegin()
 	case *sqlparser.Commit:
@@ -7258,6 +7319,10 @@ func implicitZeroValue(colType string) interface{} {
 		strings.Contains(upper, "FLOAT") || strings.Contains(upper, "DOUBLE") {
 		return int64(0)
 	}
+	// BINARY(N): zero value is N null bytes
+	if padLen := binaryPadLength(colType); padLen > 0 {
+		return strings.Repeat("\x00", padLen)
+	}
 	// Default for string types
 	return ""
 }
@@ -8378,6 +8443,10 @@ func decimalMaxString(m, d int) string {
 func coerceColumnValue(colType string, val interface{}) interface{} {
 	if padLen := binaryPadLength(colType); padLen > 0 && val != nil {
 		val = padBinaryValue(val, padLen)
+	} else if isVarbinaryType(colType) && val != nil {
+		// For VARBINARY, convert integer hex literals (int64/uint64) to their
+		// big-endian byte string representation without fixed-length padding.
+		val = hexIntToBytes(val)
 	}
 	if val != nil {
 		val = formatDecimalValue(colType, val)
@@ -8706,6 +8775,8 @@ func coerceValueForColumnType(col catalog.ColumnDef, val interface{}) interface{
 	}
 	if padLen := binaryPadLength(col.Type); padLen > 0 {
 		val = padBinaryValue(val, padLen)
+	} else if isVarbinaryType(col.Type) {
+		val = hexIntToBytes(val)
 	}
 	val = formatDecimalValue(col.Type, val)
 	val = validateEnumSetValue(col.Type, val)
@@ -9259,6 +9330,14 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		right, err := e.evalExpr(v.Right)
 		if err != nil {
 			return nil, err
+		}
+		// When PIPES_AS_CONCAT is active, || acts as string concatenation (same as CONCAT()).
+		// The SQL parser converts || to OrExpr, so we intercept it here.
+		if strings.Contains(e.sqlMode, "PIPES_AS_CONCAT") {
+			if left == nil || right == nil {
+				return nil, nil
+			}
+			return toString(left) + toString(right), nil
 		}
 		lb := isTruthy(left)
 		rb := isTruthy(right)
@@ -12415,6 +12494,14 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 			if rightIsEnum {
 				return false, nil
 			}
+			// Binary string vs integer: if right contains non-printable bytes (binary data),
+			// treat the integer as a big-endian byte string for comparison.
+			if looksLikeBinaryData(rs) {
+				leftAsBytes, ok := hexIntToBytes(left).(string)
+				if ok {
+					return leftAsBytes == rs, nil
+				}
+			}
 			return fl == 0, nil
 		}
 		if errR == nil && errL != nil && isNativeNumericType(right) {
@@ -12438,6 +12525,14 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 			}
 			if leftIsEnum {
 				return false, nil
+			}
+			// Binary string vs integer: if left contains non-printable bytes (binary data),
+			// treat the integer as a big-endian byte string for comparison.
+			if looksLikeBinaryData(ls) {
+				rightAsBytes, ok := hexIntToBytes(right).(string)
+				if ok {
+					return ls == rightAsBytes, nil
+				}
 			}
 			return fr == 0, nil
 		}
