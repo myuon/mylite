@@ -744,6 +744,26 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 				break
 			}
 		}
+		// Add event_scheduler daemon row (MySQL always shows it)
+		hasEventScheduler := false
+		for _, row := range rows {
+			if u, ok := row[1].(string); ok && strings.EqualFold(u, "event_scheduler") {
+				hasEventScheduler = true
+				break
+			}
+		}
+		if !hasEventScheduler {
+			rows = append([][]interface{}{{
+				int64(1),
+				"event_scheduler",
+				"localhost",
+				nil,
+				"Daemon",
+				int64(0),
+				"Waiting for next activation",
+				nil,
+			}}, rows...)
+		}
 		if !connInList {
 			rows = append(rows, []interface{}{
 				e.connectionID,
@@ -752,8 +772,8 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 				e.CurrentDB,
 				"Query",
 				int64(0),
-				"executing",
-				nil,
+				"starting",
+				"show processlist",
 			})
 		}
 		return &Result{Columns: cols, Rows: rows, IsResultSet: true}, nil

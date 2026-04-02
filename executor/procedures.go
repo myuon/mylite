@@ -824,9 +824,15 @@ func (e *Executor) callProcedureByNameInDB(dbName string, procName string, argSt
 		}
 	}
 
-	_, err = e.execRoutineBody(proc.Body, paramVars)
+	bodyResult, err := e.execRoutineBody(proc.Body, paramVars)
 	if err != nil {
 		return nil, err
+	}
+	// If the routine body produced a result set (e.g. from EXIT HANDLER), return it.
+	if bodyResult != nil {
+		if r, ok := bodyResult.(*Result); ok && r != nil && r.IsResultSet {
+			return r, nil
+		}
 	}
 
 	return &Result{}, nil
@@ -894,7 +900,7 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 	for k, v := range paramVars {
 		ctx.localVars[k] = v
 	}
-	_, err = e.execRoutineBodyWithContext(proc.Body, ctx)
+	bodyResult, err := e.execRoutineBodyWithContext(proc.Body, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -906,6 +912,13 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 			e.userVars = make(map[string]interface{})
 		}
 		e.userVars[userVar] = val
+	}
+
+	// If the routine body produced a result set (e.g. from EXIT HANDLER or SELECT), return it.
+	if bodyResult != nil {
+		if r, ok := bodyResult.(*Result); ok && r != nil && r.IsResultSet {
+			return r, nil
+		}
 	}
 
 	return &Result{}, nil
@@ -1247,6 +1260,7 @@ type routineContext struct {
 	triggerNewRow      storage.Row  // non-nil when executing a trigger body (for NEW.col resolution)
 	triggerOldRow      storage.Row  // non-nil when executing a trigger body (for OLD.col resolution)
 	triggerTiming      string       // "BEFORE" or "AFTER" for trigger execution
+	handlerResult      *Result      // result set produced by EXIT HANDLER body (to return from CALL)
 }
 
 // childContext creates a child routineContext that shares state with the parent
@@ -1989,17 +2003,23 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 			resolvedSQL = e.resolveNewOldRefs(resolvedSQL, ctx.triggerNewRow, ctx.triggerOldRow)
 		}
 		resolvedSQL = e.substituteLocalVars(resolvedSQL, localVars)
-		_, err := e.Execute(resolvedSQL)
+		stmtResult, err := e.Execute(resolvedSQL)
 		if err != nil {
 			// Check if a handler can catch this error
 			handled, exitFlag := e.tryHandler(err, ctx)
 			if handled {
 				if exitFlag {
-					return nil, nil
+					// Return the result set from the EXIT HANDLER body (if any)
+					return ctx.handlerResult, nil
 				}
 				continue
 			}
 			return nil, err
+		}
+		// Store result sets produced by SELECT statements inside the routine body.
+		// They will be returned if an EXIT HANDLER fires, or from the routine call itself.
+		if stmtResult != nil && stmtResult.IsResultSet {
+			ctx.handlerResult = stmtResult
 		}
 	}
 
@@ -2300,12 +2320,21 @@ func (e *Executor) tryHandler(err error, ctx *routineContext) (bool, bool) {
 			if h.body != "" {
 				savedHandlers := ctx.handlers
 				ctx.handlers = nil
+				// Clear any previous handler result before running the handler body
+				ctx.handlerResult = nil
 				stmts := splitTriggerBody(h.body)
-				_, herr := e.execRoutineBodyWithContext(stmts, ctx)
+				handlerBodyResult, herr := e.execRoutineBodyWithContext(stmts, ctx)
 				ctx.handlers = savedHandlers
 				if herr != nil {
 					ctx.currentSignal = prevSignal
 					return false, false
+				}
+				// Store the result set from the handler body (for EXIT handlers,
+				// this will be returned as the CALL result).
+				if handlerBodyResult != nil {
+					if r, ok := handlerBodyResult.(*Result); ok && r != nil && r.IsResultSet {
+						ctx.handlerResult = r
+					}
 				}
 			}
 			ctx.currentSignal = prevSignal

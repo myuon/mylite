@@ -79,7 +79,7 @@ func (h *Handler) HandleQuery(query string) (*mysql.Result, error) {
 	pl := h.executor.GetProcessList()
 	connID := h.executor.GetConnectionID()
 	if pl != nil {
-		pl.SetQuery(connID, query, "executing")
+		pl.SetQuery(connID, query, "starting")
 		defer pl.ClearQuery(connID)
 	}
 
@@ -162,7 +162,7 @@ func (h *Handler) HandleStmtExecute(context interface{}, query string, args []in
 	pl := h.executor.GetProcessList()
 	connID := h.executor.GetConnectionID()
 	if pl != nil {
-		pl.SetQuery(connID, finalQuery, "executing")
+		pl.SetQuery(connID, finalQuery, "starting")
 		defer pl.ClearQuery(connID)
 	}
 

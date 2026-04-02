@@ -14982,8 +14982,8 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 				rows = append(rows, []interface{}{tableName, op, "note", "Table does not support optimize, doing recreate + analyze instead"})
 				rows = append(rows, []interface{}{tableName, op, "status", "OK"})
 			} else {
-				// Non-InnoDB engines (MyISAM, etc.) return "Table is already up to date"
-				rows = append(rows, []interface{}{tableName, op, "status", "Table is already up to date"})
+				// Non-InnoDB engines (MyISAM, etc.) return "OK" after optimization
+				rows = append(rows, []interface{}{tableName, op, "status", "OK"})
 			}
 		} else if op == "check" && forUpgrade {
 			// CHECK TABLE ... FOR UPGRADE: first check returns OK, subsequent checks

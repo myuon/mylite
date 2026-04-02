@@ -3,6 +3,7 @@ package executor
 import (
 	"fmt"
 	"math"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -588,6 +589,15 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			}
 			return result, err
 		}
+		// Special case: CREATE TABLE t (PRIMARY KEY (a)) SELECT ...
+		// Vitess parses this with TableSpec=nil and Select=nil when the parens
+		// contain only index definitions (no column definitions). Detect this
+		// by checking if the current query text contains SELECT, and if the
+		// paren block only has index definitions.
+		if result, err := e.tryExecCreateTableIndexOnlySelect(stmt, dbName, tableName); result != nil || err != nil {
+			return result, err
+		}
+
 		// TableSpec is nil but it's not a CREATE TABLE ... LIKE or ... SELECT.
 		// This happens when vitess accepts invalid syntax that MySQL rejects
 		// (e.g. CHECK without parentheses, bare CONSTRAINT without key type).
@@ -1308,6 +1318,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 					}
 				}
 				// Insert select results
+				var insertErr error
 				for _, selRow := range selResult.Rows {
 					row := make(storage.Row)
 					for j, selCol := range selResult.Columns {
@@ -1315,7 +1326,17 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 							row[selCol] = selRow[j]
 						}
 					}
-					tbl.Insert(row) //nolint:errcheck
+					if _, err := tbl.Insert(row); err != nil {
+						insertErr = err
+						break
+					}
+				}
+				if insertErr != nil {
+					// On insert failure (e.g. duplicate key), drop the newly created table
+					// to match MySQL's behavior of rolling back the CREATE TABLE ... SELECT.
+					db.DropTable(tableName)       //nolint:errcheck
+					e.Storage.DropTable(dbName, tableName)
+					return nil, insertErr
 				}
 			}
 		}
@@ -2977,6 +2998,132 @@ func (e *Executor) execCreateTableLike(targetDBName, newTableName, srcDBName, sr
 	}
 	e.Storage.CreateTable(targetDBName, newDef)
 	e.upsertInnoDBStatsRows(targetDBName, newTableName, 0)
+	return &Result{}, nil
+}
+
+// tryExecCreateTableIndexOnlySelect handles the case where vitess parses
+// CREATE TABLE t (PRIMARY KEY (a)) SELECT ... with TableSpec=nil and Select=nil
+// because the paren block contains only index definitions (no column defs).
+// Returns (nil, nil) if the current query doesn't match this pattern.
+func (e *Executor) tryExecCreateTableIndexOnlySelect(stmt *sqlparser.CreateTable, dbName, tableName string) (*Result, error) {
+	// Check if the current query text has SELECT in it
+	currentQuery := e.currentQuery
+	upperQuery := strings.ToUpper(currentQuery)
+	if !strings.Contains(upperQuery, "SELECT") {
+		return nil, nil
+	}
+	// Find SELECT outside parentheses
+	depth := 0
+	selectIdx := -1
+	for i := 0; i < len(currentQuery)-5; i++ {
+		switch currentQuery[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case '\'':
+			for i++; i < len(currentQuery) && currentQuery[i] != '\''; i++ {
+				if currentQuery[i] == '\\' {
+					i++
+				}
+			}
+		}
+		if depth == 0 && (currentQuery[i] == 's' || currentQuery[i] == 'S') {
+			if i+6 <= len(currentQuery) && strings.EqualFold(currentQuery[i:i+6], "SELECT") {
+				if i == 0 || !isIdentChar(currentQuery[i-1]) {
+					selectIdx = i
+					break
+				}
+			}
+		}
+	}
+	if selectIdx < 0 {
+		return nil, nil
+	}
+	// Extract the index/constraint block: the part between CREATE TABLE name and SELECT
+	// Find the index block: everything between the first '(' at depth=0 and the matching ')'
+	// Parse PRIMARY KEY columns from the block
+	prefix := strings.TrimSpace(currentQuery[:selectIdx])
+	selectSQL := strings.TrimSpace(currentQuery[selectIdx:])
+
+	// Extract PRIMARY KEY columns from prefix like "CREATE TABLE t2 ( PRIMARY KEY (a) )"
+	re := regexp.MustCompile(`(?i)\bPRIMARY\s+KEY\s*\(([^)]+)\)`)
+	pkMatch := re.FindStringSubmatch(prefix)
+	var primaryKeyCols []string
+	if pkMatch != nil {
+		for _, col := range strings.Split(pkMatch[1], ",") {
+			primaryKeyCols = append(primaryKeyCols, strings.TrimSpace(col))
+		}
+	}
+
+	// Run the SELECT to determine columns
+	result, err := e.Execute(selectSQL)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil || !result.IsResultSet {
+		return &Result{}, nil
+	}
+
+	// Build column defs from SELECT result
+	cols := make([]catalog.ColumnDef, 0, len(result.Columns))
+	for _, colName := range result.Columns {
+		colType := "text"
+		if inferredType := e.inferColumnType(selectSQL, colName); inferredType != "" {
+			colType = inferredType
+		}
+		isPK := false
+		for _, pk := range primaryKeyCols {
+			if strings.EqualFold(pk, colName) {
+				isPK = true
+				break
+			}
+		}
+		colDef := catalog.ColumnDef{
+			Name:       colName,
+			Type:       colType,
+			Nullable:   !isPK,
+			PrimaryKey: isPK,
+		}
+		cols = append(cols, colDef)
+	}
+
+	newDef := &catalog.TableDef{
+		Name:       tableName,
+		Columns:    cols,
+		PrimaryKey: primaryKeyCols,
+	}
+
+	db, dbErr := e.Catalog.GetDatabase(dbName)
+	if dbErr != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
+	}
+	if err := db.CreateTable(newDef); err != nil {
+		return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", tableName))
+	}
+	e.Storage.CreateTable(dbName, newDef)
+	tbl, _ := e.Storage.GetTable(dbName, tableName)
+
+	// Insert rows with constraint checking
+	for _, selRow := range result.Rows {
+		row := make(storage.Row)
+		for j, colName := range result.Columns {
+			if j < len(selRow) {
+				row[colName] = selRow[j]
+			}
+		}
+		if _, insertErr := tbl.Insert(row); insertErr != nil {
+			// On failure, roll back by dropping the table
+			db.DropTable(tableName)       //nolint:errcheck
+			e.Storage.DropTable(dbName, tableName)
+			return nil, insertErr
+		}
+	}
+
+	if stmt.Temp {
+		e.tempTables[tableName] = true
+	}
+	e.upsertInnoDBStatsRows(dbName, tableName, e.tableRowCount(dbName, tableName))
 	return &Result{}, nil
 }
 

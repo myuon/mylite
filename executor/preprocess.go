@@ -32,6 +32,26 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	if strings.HasPrefix(upper, "SELECT") {
 		stripped := stripStringLiterals(upper)
 		compact := strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "").Replace(stripped)
+		// ST_X() and ST_Y() are native spatial functions requiring exactly 1 argument.
+		// When called with 0 arguments, MySQL returns a parameter count error even if
+		// a user-defined function with the same name exists (native functions take precedence).
+		for _, nativeFn := range []string{"ST_X", "ST_Y"} {
+			fnUpper := strings.ToUpper(nativeFn)
+			if strings.Contains(compact, fnUpper+"(") {
+				idx := strings.Index(compact, fnUpper+"(")
+				// Only match if not preceded by '.' (schema-qualified)
+				if idx >= 0 && (idx == 0 || compact[idx-1] != '.') {
+					inner := compact[idx+len(fnUpper)+1:]
+					if closeIdx := strings.Index(inner, ")"); closeIdx >= 0 {
+						args := strings.TrimSpace(inner[:closeIdx])
+						if args == "" {
+							// Use lowercase name to match MySQL's error message format
+							return "", nil, mysqlError(1582, "42000", fmt.Sprintf("Incorrect parameter count in the call to native function '%s'", strings.ToLower(nativeFn)))
+						}
+					}
+				}
+			}
+		}
 		// ps_current_thread_id() takes no arguments
 		if strings.Contains(compact, "PS_CURRENT_THREAD_ID(") {
 			idx := strings.Index(compact, "PS_CURRENT_THREAD_ID(")

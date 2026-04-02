@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/myuon/mylite/catalog"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
@@ -787,10 +788,29 @@ func (e *Executor) handleRawSet(raw string) error {
 			val = strings.TrimSuffix(val, ";")
 			val = strings.TrimSpace(val)
 			val = strings.Trim(val, "'\"")
+			// For charset/collation options, MySQL accepts comma-separated values
+			// but only uses the first value (e.g. --character-set-server=utf16,latin1 -> utf16).
+			if varName == "character_set_server" || varName == "collation_server" {
+				if commaIdx := strings.Index(val, ","); commaIdx >= 0 {
+					val = strings.TrimSpace(val[:commaIdx])
+				}
+			}
 			// SET STARTUP bypasses read-only and scope checks.
 			// Store directly in both globalScopeVars and startupVars.
 			e.setGlobalVar(varName, val)
 			e.startupVars[varName] = val
+			// When character_set_server is set and collation_server was not explicitly
+			// set in startup options, update collation_server to the default collation
+			// for that charset (MySQL behavior).
+			if varName == "character_set_server" {
+				if _, collationAlreadySet := e.startupVars["collation_server"]; !collationAlreadySet {
+					defaultCollation := catalog.DefaultCollationForCharset(val)
+					if defaultCollation != "" {
+						e.setGlobalVar("collation_server", defaultCollation)
+						e.startupVars["collation_server"] = defaultCollation
+					}
+				}
+			}
 			// Special handling: --timezone= master.opt option sets the server timezone.
 			// POSIX TZ convention (GMT+N = UTC-N) is used, so we store it for Clone()
 			// to pick up as the default session timezone.
