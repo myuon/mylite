@@ -120,12 +120,37 @@ type Result struct {
 }
 
 // intOverflowError is returned when an integer literal exceeds uint64 range.
+// kind is one of "DECIMAL" (from integer/decimal literal), "INTEGER" (from string→int),
+// or "BINARY" (from hex literal like 0x...).
 type intOverflowError struct {
-	val string
+	val  string
+	kind string // "DECIMAL", "INTEGER", "BINARY"
 }
 
 func (e *intOverflowError) Error() string {
 	return "INT_OVERFLOW:" + e.val
+}
+
+// formatOverflowWarningMsg returns the warning message for a BIGINT overflow.
+func formatOverflowWarningMsg(oe *intOverflowError) string {
+	switch oe.kind {
+	case "BINARY":
+		// Pad hex digits to even length, format as x'...'
+		hex := oe.val
+		if len(hex)%2 != 0 {
+			hex = "0" + hex
+		}
+		// Truncate to 128 chars in the displayed hex string (MySQL truncates long values)
+		const maxHexLen = 128
+		if len(hex) > maxHexLen {
+			hex = hex[:maxHexLen]
+		}
+		return fmt.Sprintf("Truncated incorrect BINARY value: 'x'%s''", hex)
+	case "INTEGER":
+		return fmt.Sprintf("Truncated incorrect INTEGER value: '%s'", oe.val)
+	default: // "DECIMAL"
+		return fmt.Sprintf("Truncated incorrect DECIMAL value: '%s'", oe.val)
+	}
 }
 
 // selectLockClause describes a per-table locking clause parsed from
@@ -10539,6 +10564,42 @@ func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator, di
 	if left == nil || right == nil {
 		return nil, nil
 	}
+
+	// Handle uint64 arithmetic without float conversion to preserve precision.
+	// uint64 + int64 or int64 + uint64 where one side is uint64 should stay uint64.
+	if op == sqlparser.PlusOp || op == sqlparser.MinusOp {
+		// Only if neither side has decimal scale
+		if valueScale(left) == 0 && valueScale(right) == 0 {
+			lu, lIsU64 := left.(uint64)
+			ru, rIsU64 := right.(uint64)
+			li, lIsI64 := left.(int64)
+			ri, rIsI64 := right.(int64)
+			if lIsU64 || rIsU64 {
+				var lv, rv uint64
+				if lIsU64 {
+					lv = lu
+				} else if lIsI64 {
+					lv = uint64(li)
+				} else {
+					lv = 0
+				}
+				if rIsU64 {
+					rv = ru
+				} else if rIsI64 {
+					rv = uint64(ri)
+				} else {
+					rv = 0
+				}
+				if op == sqlparser.PlusOp {
+					return lv + rv, nil
+				}
+				return lv - rv, nil
+			}
+			_ = li
+			_ = ri
+		}
+	}
+
 	lf := toFloat(left)
 	rf := toFloat(right)
 	var result float64
@@ -10610,15 +10671,15 @@ func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator, di
 		}
 		return mod, nil
 	case sqlparser.ShiftLeftOp:
-		return uint64(int64(lf)) << uint64(int64(rf)), nil
+		return toUint64ForBitOp(left) << toUint64ForBitOp(right), nil
 	case sqlparser.ShiftRightOp:
-		return uint64(int64(lf)) >> uint64(int64(rf)), nil
+		return toUint64ForBitOp(left) >> toUint64ForBitOp(right), nil
 	case sqlparser.BitAndOp:
-		return uint64(int64(lf)) & uint64(int64(rf)), nil
+		return toUint64ForBitOp(left) & toUint64ForBitOp(right), nil
 	case sqlparser.BitOrOp:
-		return uint64(int64(lf)) | uint64(int64(rf)), nil
+		return toUint64ForBitOp(left) | toUint64ForBitOp(right), nil
 	case sqlparser.BitXorOp:
-		return uint64(int64(lf)) ^ uint64(int64(rf)), nil
+		return toUint64ForBitOp(left) ^ toUint64ForBitOp(right), nil
 	default:
 		return nil, fmt.Errorf("unsupported binary operator: %v", op)
 	}
@@ -10626,6 +10687,71 @@ func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator, di
 		return int64(result), nil
 	}
 	return result, nil
+}
+
+// isIntValLiteral returns true if the expression is an IntVal literal
+// (a decimal integer literal, not a hex or string literal).
+func isIntValLiteral(expr sqlparser.Expr) bool {
+	if lit, ok := expr.(*sqlparser.Literal); ok {
+		return lit.Type == sqlparser.IntVal
+	}
+	return false
+}
+
+// isHexNumLiteral returns true if the expression is a HexNum literal (0x...).
+func isHexNumLiteral(expr sqlparser.Expr) bool {
+	if lit, ok := expr.(*sqlparser.Literal); ok {
+		return lit.Type == sqlparser.HexNum
+	}
+	return false
+}
+
+// toUint64ForBitOp converts a value to uint64 for bitwise operations,
+// preserving the full uint64 range without float precision loss.
+func toUint64ForBitOp(v interface{}) uint64 {
+	switch n := v.(type) {
+	case int64:
+		return uint64(n)
+	case uint64:
+		return n
+	case HexBytes:
+		decoded, err := hex.DecodeString(string(n))
+		if err != nil || len(decoded) == 0 {
+			return 0
+		}
+		var val uint64
+		for _, b := range decoded {
+			val = val<<8 | uint64(b)
+		}
+		return val
+	case string:
+		// Try uint64 first, then int64, then float
+		if u, err := strconv.ParseUint(strings.TrimSpace(n), 10, 64); err == nil {
+			return u
+		}
+		if i, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64); err == nil {
+			return uint64(i)
+		}
+		if f, err := strconv.ParseFloat(strings.TrimSpace(n), 64); err == nil {
+			if f < 0 {
+				return uint64(int64(f))
+			}
+			if f >= float64(math.MaxUint64) {
+				return math.MaxUint64
+			}
+			return uint64(f)
+		}
+		return 0
+	default:
+		f := toFloat(v)
+		if f < 0 {
+			return uint64(int64(f))
+		}
+		if f >= float64(math.MaxUint64) {
+			return math.MaxUint64
+		}
+		return uint64(f)
+	}
 }
 
 // toString converts a value to string.
@@ -10893,20 +11019,148 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		// Scalar subquery in row context (correlated)
 		return e.execSubqueryScalar(v, row)
 	case *sqlparser.BinaryExpr:
+		isBitOpRow := v.Operator == sqlparser.BitOrOp || v.Operator == sqlparser.BitAndOp ||
+			v.Operator == sqlparser.BitXorOp || v.Operator == sqlparser.ShiftLeftOp ||
+			v.Operator == sqlparser.ShiftRightOp
+		isPlusMinusRow := v.Operator == sqlparser.PlusOp || v.Operator == sqlparser.MinusOp
+		// Determine if sub-expressions are integer literals that may overflow
+		leftIsIntLit := isIntValLiteral(v.Left)
+		rightIsIntLit := isIntValLiteral(v.Right)
+		leftIsHexLit := isHexNumLiteral(v.Left)
+		rightIsHexLit := isHexNumLiteral(v.Right)
 		left, err := e.evalRowExpr(v.Left, row)
+		var leftOvRow *intOverflowError
 		if err != nil {
-			if strings.Contains(err.Error(), "INT_OVERFLOW") {
+			var oe *intOverflowError
+			if errors.As(err, &oe) {
+				leftOvRow = oe
+				if isBitOpRow && oe.kind == "DECIMAL" {
+					left = int64(math.MaxInt64)
+				} else {
+					left = uint64(math.MaxUint64)
+				}
+			} else if strings.Contains(err.Error(), "INT_OVERFLOW") {
 				left = uint64(math.MaxUint64)
 			} else {
 				return nil, err
 			}
 		}
 		right, err := e.evalRowExpr(v.Right, row)
+		var rightOvRow *intOverflowError
 		if err != nil {
-			if strings.Contains(err.Error(), "INT_OVERFLOW") {
+			var oe *intOverflowError
+			if errors.As(err, &oe) {
+				rightOvRow = oe
+				if isBitOpRow && oe.kind == "DECIMAL" {
+					right = int64(math.MaxInt64)
+				} else {
+					right = uint64(math.MaxUint64)
+				}
+			} else if strings.Contains(err.Error(), "INT_OVERFLOW") {
 				right = uint64(math.MaxUint64)
 			} else {
 				return nil, err
+			}
+		}
+		if leftOvRow != nil {
+			e.addWarning("Warning", 1292, formatOverflowWarningMsg(leftOvRow))
+		}
+		if rightOvRow != nil {
+			e.addWarning("Warning", 1292, formatOverflowWarningMsg(rightOvRow))
+		}
+		// For bit operations, check if a string result from evalRowExpr represents an
+		// overflowed value. Adjust the clamped value based on the original expression type:
+		// - IntVal literal overflow → DECIMAL kind → clamp to MaxInt64
+		// - string literals / other → INTEGER kind → clamp to MaxUint64
+		if isBitOpRow && leftOvRow == nil {
+			if s, ok := left.(string); ok {
+				if _, err2 := strconv.ParseUint(strings.TrimSpace(s), 10, 64); err2 != nil && errors.Is(err2, strconv.ErrRange) {
+					kind := "INTEGER"
+					if leftIsIntLit {
+						kind = "DECIMAL"
+					}
+					e.addWarning("Warning", 1292, formatOverflowWarningMsg(&intOverflowError{val: strings.TrimSpace(s), kind: kind}))
+					if kind == "DECIMAL" {
+						left = int64(math.MaxInt64)
+					}
+					// For INTEGER, toUint64ForBitOp will handle the string properly
+				}
+			}
+		}
+		if isBitOpRow && rightOvRow == nil {
+			if s, ok := right.(string); ok {
+				if _, err2 := strconv.ParseUint(strings.TrimSpace(s), 10, 64); err2 != nil && errors.Is(err2, strconv.ErrRange) {
+					kind := "INTEGER"
+					if rightIsIntLit {
+						kind = "DECIMAL"
+					}
+					e.addWarning("Warning", 1292, formatOverflowWarningMsg(&intOverflowError{val: strings.TrimSpace(s), kind: kind}))
+					if kind == "DECIMAL" {
+						right = int64(math.MaxInt64)
+					}
+				}
+			}
+		}
+		// For plus/minus operations, handle big decimal literal overflow:
+		// When a big IntVal literal overflows uint64, evalRowExpr default case returns the
+		// decimal string (oe.val). MySQL preserves the exact decimal value for addition/subtraction.
+		// Use math/big to compute the exact result.
+		if isPlusMinusRow && leftOvRow == nil && leftIsIntLit {
+			if leftStr, ok := left.(string); ok {
+				// Parse as big.Int
+				var bigL, bigR big.Int
+				if _, ok2 := bigL.SetString(strings.TrimSpace(leftStr), 10); ok2 {
+					// Parse right as big.Int if it's a string or int64
+					rightStr := ""
+					switch rv := right.(type) {
+					case string:
+						rightStr = strings.TrimSpace(rv)
+					case int64:
+						rightStr = strconv.FormatInt(rv, 10)
+					case uint64:
+						rightStr = strconv.FormatUint(rv, 10)
+					}
+					if rightStr != "" {
+						if _, ok3 := bigR.SetString(rightStr, 10); ok3 {
+							var bigResult big.Int
+							if v.Operator == sqlparser.PlusOp {
+								bigResult.Add(&bigL, &bigR)
+							} else {
+								bigResult.Sub(&bigL, &bigR)
+							}
+							// If result fits in int64, return int64
+							if bigResult.IsInt64() {
+								return bigResult.Int64(), nil
+							}
+							// Otherwise return as string (exact decimal)
+							return bigResult.String(), nil
+						}
+					}
+				}
+			}
+		}
+		// For plus/minus operations, handle hex literal overflow:
+		// When a HexNum literal overflowed uint64, evalRowExpr default case returns the hex
+		// string (oe.val) instead of an error. Detect this and clamp to MaxUint64 + warning.
+		if isPlusMinusRow && leftOvRow == nil && leftIsHexLit {
+			if s, ok := left.(string); ok {
+				// Try to parse as hex: strip leading zeros and check if it overflows uint64.
+				hexStr := strings.TrimLeft(s, "0")
+				if len(hexStr) > 16 { // More than 16 hex chars = > 8 bytes = overflows uint64
+					oe := &intOverflowError{val: s, kind: "BINARY"}
+					e.addWarning("Warning", 1292, formatOverflowWarningMsg(oe))
+					left = uint64(math.MaxUint64)
+				}
+			}
+		}
+		if isPlusMinusRow && rightOvRow == nil && rightIsHexLit {
+			if s, ok := right.(string); ok {
+				hexStr := strings.TrimLeft(s, "0")
+				if len(hexStr) > 16 {
+					oe := &intOverflowError{val: s, kind: "BINARY"}
+					e.addWarning("Warning", 1292, formatOverflowWarningMsg(oe))
+					right = uint64(math.MaxUint64)
+				}
 			}
 		}
 		return evalBinaryExpr(left, right, v.Operator, e.getDivPrecisionIncrement())

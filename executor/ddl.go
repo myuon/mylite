@@ -2863,7 +2863,11 @@ func (e *Executor) execCreateTableSelect(newTableName, selectSQL string) (*Resul
 			}
 		}
 	}
+	// Mark as DML context so that overflow in strict mode raises errors (not warnings).
+	prevInsideDML := e.insideDML
+	e.insideDML = true
 	result, err := e.Execute(selectSQL)
+	e.insideDML = prevInsideDML
 	if err != nil {
 		return nil, err
 	}

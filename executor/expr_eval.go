@@ -84,7 +84,7 @@ func (e *Executor) evalLiteralExpr(v *sqlparser.Literal) (interface{}, error) {
 			// Try unsigned 64-bit
 			u, err2 := strconv.ParseUint(v.Val, 10, 64)
 			if err2 != nil {
-				return nil, &intOverflowError{val: v.Val}
+				return nil, &intOverflowError{val: v.Val, kind: "DECIMAL"}
 			}
 			return u, nil
 		}
@@ -117,7 +117,8 @@ func (e *Executor) evalLiteralExpr(v *sqlparser.Literal) (interface{}, error) {
 			// Try unsigned for large values like 0xfffffffffffffff1
 			u, err2 := strconv.ParseUint(s, 16, 64)
 			if err2 != nil {
-				return v.Val, nil
+				// Value exceeds uint64; return overflow error so callers can clamp to MaxUint64 + warn
+				return nil, &intOverflowError{val: s, kind: "BINARY"}
 			}
 			return u, nil
 		}
@@ -463,6 +464,11 @@ func (e *Executor) evalConvertExpr(v *sqlparser.ConvertExpr) (interface{}, error
 					}
 					return int64(math.MaxInt64), nil
 				case "UNSIGNED":
+					// In strict DML mode, overflow is an error.
+					if e.isStrictMode() && e.insideDML {
+						return nil, mysqlError(1292, "22007", formatOverflowWarningMsg(oe))
+					}
+					e.addWarning("Warning", 1292, formatOverflowWarningMsg(oe))
 					return uint64(math.MaxUint64), nil
 				case "DECIMAL", "FLOAT", "DOUBLE", "REAL":
 					// Try to parse as float for decimal casts
@@ -486,6 +492,27 @@ func (e *Executor) evalConvertExpr(v *sqlparser.ConvertExpr) (interface{}, error
 	case "SIGNED", "INT", "INTEGER", "BIGINT":
 		return toInt64(val), nil
 	case "UNSIGNED":
+		// String → UNSIGNED: if string is too large for int64 (float overflow), clamp to MaxUint64.
+		if s, ok := val.(string); ok {
+			u, err2 := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
+			if err2 != nil {
+				if errors.Is(err2, strconv.ErrRange) {
+					oe := &intOverflowError{val: s, kind: "INTEGER"}
+					if e.isStrictMode() && e.insideDML {
+						return nil, mysqlError(1292, "22007", formatOverflowWarningMsg(oe))
+					}
+					e.addWarning("Warning", 1292, formatOverflowWarningMsg(oe))
+					return uint64(math.MaxUint64), nil
+				}
+				// Try float parse for cases like "3.14"
+				n := toInt64(val)
+				if n < 0 {
+					return uint64(n), nil
+				}
+				return uint64(n), nil
+			}
+			return u, nil
+		}
 		n := toInt64(val)
 		if n < 0 {
 			return uint64(n), nil
@@ -533,12 +560,25 @@ func (e *Executor) evalConvertExpr(v *sqlparser.ConvertExpr) (interface{}, error
 
 // evalBinaryOp handles *sqlparser.BinaryExpr evaluation.
 func (e *Executor) evalBinaryOp(v *sqlparser.BinaryExpr) (interface{}, error) {
+	// Determine if this is a bitwise operation, which affects how overflow is handled.
+	isBitOp := v.Operator == sqlparser.BitOrOp || v.Operator == sqlparser.BitAndOp ||
+		v.Operator == sqlparser.BitXorOp || v.Operator == sqlparser.ShiftLeftOp ||
+		v.Operator == sqlparser.ShiftRightOp
+
 	left, err := e.evalExpr(v.Left)
+	var leftOverflow *intOverflowError
 	if err != nil {
 		// For INT_OVERFLOW in arithmetic context, treat as max uint64
 		var oe *intOverflowError
 		if errors.As(err, &oe) {
-			left = uint64(math.MaxUint64)
+			leftOverflow = oe
+			// DECIMAL overflow in bitwise ops clamps to MaxInt64 (MySQL uses signed context for DECIMAL).
+			// BINARY/INTEGER overflow in bitwise ops clamps to MaxUint64.
+			if isBitOp && oe.kind == "DECIMAL" {
+				left = int64(math.MaxInt64)
+			} else {
+				left = uint64(math.MaxUint64)
+			}
 			err = nil
 		} else if strings.Contains(err.Error(), "INT_OVERFLOW") {
 			// Fallback: match by string if type assertion fails
@@ -549,16 +589,45 @@ func (e *Executor) evalBinaryOp(v *sqlparser.BinaryExpr) (interface{}, error) {
 		}
 	}
 	right, err := e.evalExpr(v.Right)
+	var rightOverflow *intOverflowError
 	if err != nil {
 		var oe *intOverflowError
 		if errors.As(err, &oe) {
-			right = uint64(math.MaxUint64)
+			rightOverflow = oe
+			if isBitOp && oe.kind == "DECIMAL" {
+				right = int64(math.MaxInt64)
+			} else {
+				right = uint64(math.MaxUint64)
+			}
 			err = nil
 		} else if strings.Contains(err.Error(), "INT_OVERFLOW") {
 			right = uint64(math.MaxUint64)
 			err = nil
 		} else {
 			return nil, err
+		}
+	}
+	// Add overflow warnings before computing the result
+	if leftOverflow != nil {
+		e.addWarning("Warning", 1292, formatOverflowWarningMsg(leftOverflow))
+	}
+	if rightOverflow != nil {
+		e.addWarning("Warning", 1292, formatOverflowWarningMsg(rightOverflow))
+	}
+	// For bit operations, detect string overflow that wasn't caught as intOverflowError.
+	// Strings in bitwise context are treated as UNSIGNED integers; overflow → MaxUint64 + warning.
+	if isBitOp && leftOverflow == nil {
+		if s, ok := left.(string); ok {
+			if _, err2 := strconv.ParseUint(strings.TrimSpace(s), 10, 64); err2 != nil && errors.Is(err2, strconv.ErrRange) {
+				e.addWarning("Warning", 1292, formatOverflowWarningMsg(&intOverflowError{val: strings.TrimSpace(s), kind: "INTEGER"}))
+			}
+		}
+	}
+	if isBitOp && rightOverflow == nil {
+		if s, ok := right.(string); ok {
+			if _, err2 := strconv.ParseUint(strings.TrimSpace(s), 10, 64); err2 != nil && errors.Is(err2, strconv.ErrRange) {
+				e.addWarning("Warning", 1292, formatOverflowWarningMsg(&intOverflowError{val: strings.TrimSpace(s), kind: "INTEGER"}))
+			}
 		}
 	}
 	return evalBinaryExpr(left, right, v.Operator, e.getDivPrecisionIncrement())
@@ -1196,6 +1265,10 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 				}
 				return int64(math.MaxInt64), nil
 			case "UNSIGNED":
+				if e.isStrictMode() && e.insideDML {
+					return nil, mysqlError(1292, "22007", formatOverflowWarningMsg(oe))
+				}
+				e.addWarning("Warning", 1292, formatOverflowWarningMsg(oe))
 				return uint64(math.MaxUint64), nil
 			case "DECIMAL", "FLOAT", "DOUBLE", "REAL":
 				f, parseErr := strconv.ParseFloat(oe.val, 64)
@@ -1212,6 +1285,18 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 		case "SIGNED", "INT", "INTEGER", "BIGINT":
 			return toInt64(val), nil
 		case "UNSIGNED":
+			// String → UNSIGNED: if string is too large, clamp to MaxUint64.
+			if s, ok2 := val.(string); ok2 {
+				_, err2 := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
+				if err2 != nil && errors.Is(err2, strconv.ErrRange) {
+					oe := &intOverflowError{val: s, kind: "INTEGER"}
+					if e.isStrictMode() && e.insideDML {
+						return nil, mysqlError(1292, "22007", formatOverflowWarningMsg(oe))
+					}
+					e.addWarning("Warning", 1292, formatOverflowWarningMsg(oe))
+					return uint64(math.MaxUint64), nil
+				}
+			}
 			n := toInt64(val)
 			if n < 0 {
 				return uint64(n), nil
