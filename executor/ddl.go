@@ -93,13 +93,13 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", srcDB))
 		}
 
+		// Validate target doesn't exist first (MySQL checks destination conflicts before source existence)
+		if tableExists(targetDB, newName) {
+			return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newName))
+		}
 		// Validate source exists (considering prior simulated renames)
 		if !tableExists(srcDB, oldName) {
 			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", srcDB, oldName))
-		}
-		// Validate target doesn't exist (considering prior simulated renames)
-		if tableExists(targetDB, newName) {
-			return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newName))
 		}
 
 		// Simulate this rename for subsequent validations
