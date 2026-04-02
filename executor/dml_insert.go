@@ -145,9 +145,13 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	}
 
 	// Resolve views: if tableName is a view, replace with the underlying base table.
+	// Also capture any WITH CHECK OPTION condition for enforcement.
+	originalViewName := tableName
+	var viewCheckExpr sqlparser.Expr
 	if baseTable, isView, err := e.resolveViewToBaseTable(tableName); err != nil {
 		return nil, err
 	} else if isView {
+		viewCheckExpr = e.getViewCheckCondition(originalViewName)
 		tableName = baseTable
 	}
 
@@ -1407,6 +1411,15 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				if !checkResult {
 					return nil, mysqlError(3819, "HY000", fmt.Sprintf("Check constraint '%s' is violated.", cc.Name))
 				}
+			}
+		}
+
+		// Enforce view WITH CHECK OPTION: the inserted/replaced row must satisfy
+		// the view's WHERE condition.
+		if viewCheckExpr != nil {
+			match, err := e.evalWhere(viewCheckExpr, row)
+			if err != nil || !match {
+				return nil, mysqlError(1369, "HY000", fmt.Sprintf("CHECK OPTION failed '%s.%s'", e.CurrentDB, originalViewName))
 			}
 		}
 

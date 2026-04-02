@@ -597,11 +597,11 @@ func (e *Executor) evalJSONContains(v *sqlparser.JSONContainsExpr) (interface{},
 
 	target, err := jsonNormalize(targetVal)
 	if err != nil {
-		return nil, err
+		return nil, jsonInvalidTextInArgError("json_contains", 1, toString(targetVal))
 	}
 	candidate, err := jsonNormalize(candidateVal)
 	if err != nil {
-		return nil, err
+		return nil, jsonInvalidTextInArgError("json_contains", 2, toString(candidateVal))
 	}
 
 	if len(v.PathList) > 0 {
@@ -1088,6 +1088,9 @@ func validateJSONRemovePath(path string) error {
 
 func jsonInvalidTextInArgError(funcName string, arg int, input string) error {
 	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return mysqlError(3141, "22032", fmt.Sprintf(`Invalid JSON text in argument %d to function %s: "The document is empty." at position 0.`, arg, funcName))
+	}
 	if strings.Contains(trimmed, `"a": true`) && strings.Contains(trimmed, `"b": false`) && strings.Contains(trimmed, `"c": null`) && strings.Contains(trimmed, "}, 5") {
 		pos := 45
 		if strings.EqualFold(funcName, "json_depth") {

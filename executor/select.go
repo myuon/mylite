@@ -2476,6 +2476,13 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 						raw = raw[1 : len(raw)-1]
 					}
 					colNames = append(colNames, raw)
+				} else if raw != "" {
+					// Strip quotes from simple string literals (MySQL displays 'a' as a)
+					if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' && isSimpleStringLiteral(raw) {
+						raw = raw[1 : len(raw)-1]
+					}
+					// Preserve original query text for column name (MySQL behavior)
+					colNames = append(colNames, raw)
 				} else {
 					colNames = append(colNames, normalizeSQLDisplayName(sqlparser.String(se.Expr)))
 				}

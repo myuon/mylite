@@ -280,6 +280,8 @@ type Executor struct {
 	compiledDefaults map[string]string
 	// views stores view definitions (view name -> SELECT query string).
 	views map[string]string
+	// viewCheckOptions stores WITH CHECK OPTION for views (view name -> check option string: "cascaded", "local", or "").
+	viewCheckOptions map[string]string
 	// queryTableDef holds the table definition for the current query context,
 	// used for column-level checks (e.g., IS NULL on NOT NULL columns).
 	queryTableDef *catalog.TableDef
@@ -5974,6 +5976,10 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			e.views = make(map[string]string)
 		}
 		e.views[viewName] = selectSQL
+		if e.viewCheckOptions == nil {
+			e.viewCheckOptions = make(map[string]string)
+		}
+		e.viewCheckOptions[viewName] = s.CheckOption
 		return &Result{}, nil
 	case *sqlparser.DropView:
 		// Remove view definitions
@@ -6037,6 +6043,10 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			e.views = make(map[string]string)
 		}
 		e.views[viewName] = selectSQL
+		if e.viewCheckOptions == nil {
+			e.viewCheckOptions = make(map[string]string)
+		}
+		e.viewCheckOptions[viewName] = s.CheckOption
 		return &Result{}, nil
 	case *sqlparser.CommentOnly:
 		return &Result{}, nil
@@ -14709,6 +14719,41 @@ func (e *Executor) resolveViewToBaseTable(tableName string) (string, bool, error
 		}
 	}
 	return tn.Name.String(), true, nil
+}
+
+// getViewCheckCondition returns the WHERE expression from a view definition if it has WITH CHECK OPTION.
+// Returns nil if no check option or no WHERE condition.
+func (e *Executor) getViewCheckCondition(viewName string) sqlparser.Expr {
+	if e.viewCheckOptions == nil {
+		return nil
+	}
+	checkOpt, ok := e.viewCheckOptions[viewName]
+	if !ok {
+		// Try case-insensitive lookup
+		for vn, opt := range e.viewCheckOptions {
+			if strings.EqualFold(vn, viewName) {
+				checkOpt = opt
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok || checkOpt == "" {
+		return nil
+	}
+	viewSQL, _, found := e.lookupView(viewName)
+	if !found {
+		return nil
+	}
+	stmt, err := e.parser().Parse(viewSQL)
+	if err != nil {
+		return nil
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok || sel.Where == nil {
+		return nil
+	}
+	return sel.Where.Expr
 }
 
 // isMultiTableUpdate checks if an UPDATE statement involves multiple tables (join or comma-separated).
