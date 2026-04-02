@@ -343,6 +343,9 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	query = normalizeAddIndexUsing(query)
 	// Fix CREATE TABLE with "KEY/INDEX/PRIMARY KEY USING BTREE/HASH (cols)" syntax
 	query = normalizeCreateTableIndexUsing(query)
+	// Convert hex literals in ENUM/SET column type values to quoted strings so vitess can parse them.
+	// e.g. ENUM(0x9353,0x9373) -> ENUM('0x9353','0x9373')
+	query = normalizeEnumHexValues(query)
 	// Detect SKIP LOCKED / NOWAIT and per-table locking clauses before
 	// normalizeForShareOf strips them.
 	{

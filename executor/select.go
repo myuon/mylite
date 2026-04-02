@@ -3503,31 +3503,10 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 				name = se.As.String()
 			} else if colName, ok := se.Expr.(*sqlparser.ColName); ok {
 				name = colName.Name.String()
-				// Case-insensitive column name resolution: if the row has a
-				// key that matches case-insensitively, use that key's case
-				// (needed for information_schema columns which are UPPERCASE).
-				// Prefer exact case match to avoid non-deterministic map iteration.
-				// Only apply to information_schema rows (marked with __is_info_schema__),
-				// not performance_schema rows or InnoDB IS tables where MySQL
-				// preserves user's casing.
-				if len(rows) > 0 {
-					_, isIS := rows[0]["__is_info_schema__"]
-					_, preserveCase := rows[0]["__ps_preserve_col_case__"]
-					if isIS && !preserveCase {
-						upperName := strings.ToUpper(name)
-						// First try exact match
-						if _, ok := rows[0][name]; ok {
-							// name already matches exactly, keep it
-						} else {
-							for k := range rows[0] {
-								if strings.ToUpper(k) == upperName && !strings.Contains(k, ".") {
-									name = k
-									break
-								}
-							}
-						}
-					}
-				} else {
+				// MySQL preserves the user's typed column name as the column header.
+				// Value lookup uses case-insensitive matching in evalRowExpr, so we
+				// don't need to override the user's casing here.
+				if len(rows) == 0 {
 					// Even with no rows, resolve column name from table definition first.
 					// Skip for InnoDB IS tables which preserve user's column casing.
 					isInnoDBISTable := false

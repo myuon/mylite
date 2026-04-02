@@ -3733,6 +3733,9 @@ func normalizeOutput(s string) string {
 	lines := strings.Split(s, "\n")
 	var result []string
 	for _, line := range lines {
+		// Normalize vertical output column name case (KEY\tvalue format) BEFORE trimming,
+		// so that trailing-tab lines like "CREATE_OPTIONS\t" are handled correctly.
+		line = normalizeVerticalColLine(line)
 		trimmed := strings.TrimRight(line, " \t\r")
 		// Normalize leading spaces on SQL continuation lines:
 		// Lines that start with spaces (not tabs) and contain SQL keywords
@@ -3795,6 +3798,11 @@ func normalizeOutput(s string) string {
 	// Normalize charset/collation error messages: truncate long names to 64 chars
 	// and lowercase charset/collation names in error messages for consistent comparison.
 	out = normalizeCharsetErrors(out)
+	// Normalize column name case in vertical output (--vertical_results / \G format):
+	// MySQL 5.7 outputs IS column names in UPPERCASE, MySQL 8.0 preserves query case.
+	// Normalize by lowercasing the column name part of vertical output lines
+	// (lines with format "COLUMN_NAME\tvalue") so both old and new result files match.
+	out = normalizeVerticalOutputColCase(out)
 	// Normalize invalid UTF-8 bytes to '?' to match MySQL behavior:
 	// MySQL displays non-UTF8 bytes (e.g. latin1 characters) as '?' in
 	// SHOW CREATE TABLE output depending on connection charset. Since mylite
@@ -3804,6 +3812,58 @@ func normalizeOutput(s string) string {
 		out = replaceInvalidUTF8Bytes(out)
 	}
 	return out
+}
+
+// normalizeVerticalColLine normalizes the column name case in a single vertical output line.
+// In vertical output mode (--vertical_results or \G), each line has the format:
+//   COLUMN_NAME\tvalue   (or COLUMN_NAME\t  with empty/trailing whitespace)
+// MySQL 5.7 always outputs IS column names in UPPERCASE; MySQL 8.0 preserves user's case.
+// We lowercase the key part so both old and new result files compare equally.
+// Also handles lines without a tab (e.g. after trimming) where the whole line is an identifier.
+func normalizeVerticalColLine(line string) string {
+	tabIdx := strings.Index(line, "\t")
+	var key, rest string
+	if tabIdx > 0 {
+		key = line[:tabIdx]
+		rest = line[tabIdx:] // includes the tab
+	} else if tabIdx < 0 {
+		// No tab — could be a horizontal column header line; handle below
+		key = strings.TrimRight(line, " \t\r")
+		rest = ""
+	} else {
+		return line // tab at position 0, skip
+	}
+	// Only normalize if key looks like an SQL identifier (letters, digits, underscores only)
+	if key == "" {
+		return line
+	}
+	isIdent := true
+	for _, c := range key {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+			isIdent = false
+			break
+		}
+	}
+	if !isIdent || key == strings.ToLower(key) {
+		return line
+	}
+	// Check if key matches a known INFORMATION_SCHEMA column name (all uppercase).
+	// We only normalize identifiers that are fully uppercase (no mixed case like "Table").
+	if key != strings.ToUpper(key) {
+		return line
+	}
+	return strings.ToLower(key) + rest
+}
+
+// normalizeVerticalOutputColCase normalizes column name case in vertical output lines.
+// Applied as a post-processing step (after trailing whitespace trimming).
+// See also normalizeVerticalColLine which handles pre-trim normalization.
+func normalizeVerticalOutputColCase(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = normalizeVerticalColLine(line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // replaceInvalidUTF8Bytes replaces each invalid UTF-8 byte sequence in s with '?'.

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
@@ -705,6 +706,57 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			Rows:        grantRows,
 			IsResultSet: true,
 		}, nil
+	}
+
+	// SHOW [FULL] PROCESSLIST
+	if strings.HasPrefix(upper, "SHOW PROCESSLIST") || strings.HasPrefix(upper, "SHOW FULL PROCESSLIST") {
+		cols := []string{"Id", "User", "Host", "db", "Command", "Time", "State", "Info"}
+		rows := make([][]interface{}, 0)
+		if e.processList != nil {
+			now := time.Now()
+			for _, entry := range e.processList.Snapshot() {
+				elapsed := int64(now.Sub(entry.StartTime).Seconds())
+				db := entry.DB
+				if db == "" {
+					db = e.CurrentDB
+				}
+				var info interface{}
+				if entry.Info != "" {
+					info = entry.Info
+				}
+				rows = append(rows, []interface{}{
+					entry.ID,
+					entry.User,
+					entry.Host,
+					db,
+					entry.Command,
+					elapsed,
+					entry.State,
+					info,
+				})
+			}
+		}
+		// Include current connection if not already in the list
+		connInList := false
+		for _, row := range rows {
+			if row[0] == e.connectionID {
+				connInList = true
+				break
+			}
+		}
+		if !connInList {
+			rows = append(rows, []interface{}{
+				e.connectionID,
+				"root",
+				"localhost",
+				e.CurrentDB,
+				"Query",
+				int64(0),
+				"executing",
+				nil,
+			})
+		}
+		return &Result{Columns: cols, Rows: rows, IsResultSet: true}, nil
 	}
 
 	// Accept other SHOW statements silently

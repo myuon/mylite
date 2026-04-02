@@ -217,6 +217,27 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		case "character_set_client", "character_set_connection", "character_set_results",
 			"character_set_filesystem", "character_set_server", "character_set_database":
 			isGlobal := scope == sqlparser.GlobalScope
+			// MySQL allows SET @@character_set_results = NULL to disable result conversion.
+			if _, isNull := expr.Expr.(*sqlparser.NullVal); isNull {
+				if name == "character_set_results" {
+					if isGlobal {
+						e.deleteSysVar(name, true)
+					} else {
+						delete(e.sessionScopeVars, name)
+					}
+				}
+				break
+			}
+			if strings.ToUpper(val) == "NULL" {
+				if name == "character_set_results" {
+					if isGlobal {
+						e.deleteSysVar(name, true)
+					} else {
+						delete(e.sessionScopeVars, name)
+					}
+				}
+				break
+			}
 			if strings.ToUpper(val) == "DEFAULT" {
 				if isGlobal {
 					e.deleteSysVar(name, true)
@@ -3768,7 +3789,12 @@ func (e *Executor) showStatus(upper string) (*Result, error) {
 		{Name: "Bytes_received", Value: "0"},
 		{Name: "Bytes_sent", Value: "0"},
 		{Name: "Com_select", Value: "1"},
-		{Name: "Connections", Value: "1"},
+		{Name: "Connections", Value: func() string {
+			if e.nextConnID != nil {
+				return fmt.Sprintf("%d", e.nextConnID.Load())
+			}
+			return "1"
+		}()},
 		{Name: "Handler_commit", Value: "0"},
 		{Name: "Handler_delete", Value: "0"},
 		{Name: "Handler_discover", Value: "0"},

@@ -453,14 +453,34 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		s := toString(val)
 		fromBase := int(toInt64(fromBaseVal))
 		toBase := int(toInt64(toBaseVal))
-		if fromBase < 2 || fromBase > 36 || toBase < 2 || toBase > 36 {
+		// MySQL allows negative to_base (means signed output); normalize for validation
+		absFromBase := fromBase
+		if absFromBase < 0 {
+			absFromBase = -absFromBase
+		}
+		absToBase := toBase
+		if absToBase < 0 {
+			absToBase = -absToBase
+		}
+		if absFromBase < 2 || absFromBase > 36 || absToBase < 2 || absToBase > 36 {
 			return nil, true, nil
 		}
-		n, parseErr := strconv.ParseInt(s, fromBase, 64)
+		// MySQL CONV() treats values as unsigned 64-bit integers.
+		// Try unsigned parse first to handle large hex values like e251273eb74a8ee3.
+		un, parseErr := strconv.ParseUint(s, absFromBase, 64)
 		if parseErr != nil {
-			return nil, true, nil
+			// Fall back to signed parse (for negative values)
+			n, signedErr := strconv.ParseInt(s, absFromBase, 64)
+			if signedErr != nil {
+				return nil, true, nil
+			}
+			un = uint64(n)
 		}
-		return strings.ToUpper(strconv.FormatInt(n, toBase)), true, nil
+		if toBase < 0 {
+			// Negative toBase means interpret as signed and output signed
+			return strings.ToUpper(strconv.FormatInt(int64(un), absToBase)), true, nil
+		}
+		return strings.ToUpper(strconv.FormatUint(un, toBase)), true, nil
 	case "bin":
 		val, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {

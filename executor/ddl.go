@@ -2473,15 +2473,23 @@ func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, er
 }
 
 // inferColumnType tries to determine the column type from the source table of a SELECT statement.
+// For UNION queries, it merges types from all branches (taking the widest varchar).
 func (e *Executor) inferColumnType(selectSQL, colName string) string {
 	stmt, err := e.parser().Parse(selectSQL)
 	if err != nil {
 		return ""
 	}
-	sel, ok := stmt.(*sqlparser.Select)
-	if !ok {
-		return ""
+	switch s := stmt.(type) {
+	case *sqlparser.Select:
+		return e.inferColumnTypeFromSelect(s, colName)
+	case *sqlparser.Union:
+		return e.inferColumnTypeFromUnion(s, colName)
 	}
+	return ""
+}
+
+// inferColumnTypeFromSelect infers the column type from a single SELECT statement.
+func (e *Executor) inferColumnTypeFromSelect(sel *sqlparser.Select, colName string) string {
 	// Get the source table from the FROM clause
 	for _, from := range sel.From {
 		ate, ok := from.(*sqlparser.AliasedTableExpr)
@@ -2510,7 +2518,214 @@ func (e *Executor) inferColumnType(selectSQL, colName string) string {
 			}
 		}
 	}
+	// No FROM clause (e.g. SELECT 'literal') — infer type from expressions
+	// Find the expression corresponding to this column name by alias or position
+	for _, expr := range sel.SelectExprs.Exprs {
+		ae, ok := expr.(*sqlparser.AliasedExpr)
+		if !ok {
+			continue
+		}
+		alias := ""
+		if !ae.As.IsEmpty() {
+			alias = ae.As.String()
+		}
+		if alias != "" && !strings.EqualFold(alias, colName) {
+			continue
+		}
+		if alias == "" {
+			if col, ok2 := ae.Expr.(*sqlparser.ColName); ok2 {
+				if !strings.EqualFold(col.Name.String(), colName) {
+					continue
+				}
+			}
+		}
+		return e.inferExprType(ae.Expr)
+	}
 	return ""
+}
+
+// inferColumnTypeFromUnion infers the column type from a UNION by merging all branches.
+// The colName parameter is used for the first SELECT branch; subsequent branches
+// use positional matching.
+func (e *Executor) inferColumnTypeFromUnion(u *sqlparser.Union, colName string) string {
+	selects := e.flattenUnionStatements(u)
+	types := make([]string, 0, len(selects))
+	for i, s := range selects {
+		sel, ok := s.(*sqlparser.Select)
+		if !ok {
+			continue
+		}
+		var t string
+		if i == 0 {
+			t = e.inferColumnTypeFromSelect(sel, colName)
+		} else {
+			// For non-first branches, find the column by position matching colName
+			t = e.inferColumnTypeFromSelectByPosition(sel, colName, selects[0])
+		}
+		if t != "" {
+			types = append(types, t)
+		}
+	}
+	return mergeColumnTypes(types)
+}
+
+// flattenUnionStatements flattens a Union AST into a slice of TableStatement (each is a *Select).
+func (e *Executor) flattenUnionStatements(u *sqlparser.Union) []sqlparser.TableStatement {
+	var result []sqlparser.TableStatement
+	switch left := u.Left.(type) {
+	case *sqlparser.Union:
+		result = append(result, e.flattenUnionStatements(left)...)
+	default:
+		result = append(result, left)
+	}
+	switch right := u.Right.(type) {
+	case *sqlparser.Union:
+		result = append(result, e.flattenUnionStatements(right)...)
+	default:
+		result = append(result, right)
+	}
+	return result
+}
+
+// inferColumnTypeFromSelectByPosition finds the column type in a SELECT by matching
+// the position of colName in the first SELECT branch.
+func (e *Executor) inferColumnTypeFromSelectByPosition(sel *sqlparser.Select, colName string, firstBranch sqlparser.TableStatement) string {
+	// Find the position of colName in the first branch
+	pos := -1
+	if firstSel, ok := firstBranch.(*sqlparser.Select); ok {
+		for i, expr := range firstSel.SelectExprs.Exprs {
+			ae, ok := expr.(*sqlparser.AliasedExpr)
+			if !ok {
+				if _, ok2 := expr.(*sqlparser.StarExpr); ok2 {
+					// Star expansion — can't easily determine position, skip
+					pos = 0
+					break
+				}
+				continue
+			}
+			alias := ""
+			if !ae.As.IsEmpty() {
+				alias = ae.As.String()
+			}
+			if alias != "" && strings.EqualFold(alias, colName) {
+				pos = i
+				break
+			}
+			if col, ok2 := ae.Expr.(*sqlparser.ColName); ok2 {
+				if strings.EqualFold(col.Name.String(), colName) {
+					pos = i
+					break
+				}
+			}
+		}
+	}
+	if pos < 0 {
+		return ""
+	}
+	// Get the expression at position pos in the current SELECT
+	if pos < len(sel.SelectExprs.Exprs) {
+		expr := sel.SelectExprs.Exprs[pos]
+		if ae, ok := expr.(*sqlparser.AliasedExpr); ok {
+			// First try table column lookup
+			t := e.inferColumnTypeFromSelect(sel, colName)
+			if t != "" {
+				return t
+			}
+			return e.inferExprType(ae.Expr)
+		}
+	}
+	return ""
+}
+
+// inferExprType infers the SQL column type from a literal or function expression.
+func (e *Executor) inferExprType(expr sqlparser.Expr) string {
+	switch v := expr.(type) {
+	case *sqlparser.Literal:
+		switch v.Type {
+		case sqlparser.StrVal:
+			n := len(v.Val)
+			return fmt.Sprintf("varchar(%d)", n)
+		case sqlparser.IntVal:
+			return "int"
+		case sqlparser.FloatVal:
+			return "double"
+		}
+	case *sqlparser.FuncExpr:
+		name := strings.ToLower(v.Name.String())
+		switch name {
+		case "repeat":
+			// REPEAT(str, count) — type is varchar(len(str)*count)
+			if len(v.Exprs) == 2 {
+				strLen := 0
+				if lit, ok := v.Exprs[0].(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
+					strLen = len(lit.Val)
+				}
+				cnt := 0
+				if lit, ok := v.Exprs[1].(*sqlparser.Literal); ok && lit.Type == sqlparser.IntVal {
+					cnt, _ = strconv.Atoi(lit.Val)
+				}
+				if strLen > 0 && cnt > 0 {
+					return fmt.Sprintf("varchar(%d)", strLen*cnt)
+				}
+			}
+		}
+	case *sqlparser.NullVal:
+		return ""
+	}
+	return ""
+}
+
+// mergeColumnTypes merges a list of column types from UNION branches,
+// returning the widest compatible type. varchar(N) types are merged by taking max(N).
+// If any branch has text/blob/longtext, the result is that type.
+func mergeColumnTypes(types []string) string {
+	if len(types) == 0 {
+		return ""
+	}
+	if len(types) == 1 {
+		return types[0]
+	}
+	maxVarcharLen := 0
+	hasText := false
+	hasBlob := false
+	hasInt := false
+	hasDouble := false
+	for _, t := range types {
+		lower := strings.ToLower(strings.TrimSpace(t))
+		if lower == "text" || lower == "mediumtext" || lower == "longtext" {
+			hasText = true
+		} else if lower == "blob" || lower == "mediumblob" || lower == "longblob" {
+			hasBlob = true
+		} else if lower == "int" || lower == "bigint" || lower == "tinyint" || lower == "smallint" {
+			hasInt = true
+		} else if lower == "double" || lower == "float" || lower == "decimal" {
+			hasDouble = true
+		} else if strings.HasPrefix(lower, "varchar(") {
+			var n int
+			if _, err := fmt.Sscanf(lower, "varchar(%d)", &n); err == nil {
+				if n > maxVarcharLen {
+					maxVarcharLen = n
+				}
+			}
+		}
+	}
+	if hasBlob {
+		return "blob"
+	}
+	if hasText {
+		return "text"
+	}
+	if maxVarcharLen > 0 {
+		return fmt.Sprintf("varchar(%d)", maxVarcharLen)
+	}
+	if hasInt {
+		return "int"
+	}
+	if hasDouble {
+		return "double"
+	}
+	// Fall back to first non-empty type
+	return types[0]
 }
 
 // execCreateTableLike handles CREATE TABLE t2 LIKE t1.

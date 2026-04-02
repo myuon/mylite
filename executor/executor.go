@@ -3204,7 +3204,20 @@ func normalizeCreateTableIndexUsing(query string) string {
 	if !strings.Contains(upper, "CREATE TABLE") && !strings.Contains(upper, "CREATE TEMPORARY TABLE") {
 		return query
 	}
-	// PRIMARY KEY USING BTREE/HASH (cols) -> PRIMARY KEY (cols)
+	// Strip "USING BTREE/HASH" that appears immediately before a column list "(".
+	// This handles cases like "UNIQUE KEY name USING HASH (col(N))" where the
+	// column list contains nested parentheses that confuse the [^)]* approach.
+	// Vitess can parse the index type when it appears after the column list, but
+	// since mylite ignores index types entirely, we simply strip them when they
+	// appear before the column list.
+	reUsingBeforeParen := regexp.MustCompile(`(?i)\bUSING\s+(?:BTREE|HASH)\s+\(`)
+	if reUsingBeforeParen.MatchString(query) {
+		query = reUsingBeforeParen.ReplaceAllStringFunc(query, func(_ string) string {
+			return "("
+		})
+		return query
+	}
+	// PRIMARY KEY USING BTREE/HASH (cols) -> PRIMARY KEY (cols) USING BTREE/HASH
 	re1 := regexp.MustCompile(`(?i)(PRIMARY\s+KEY)\s+USING\s+(\w+)\s*(\([^)]*\))`)
 	query = re1.ReplaceAllString(query, "${1} ${3} USING ${2}")
 	// UNIQUE KEY [name] USING BTREE (cols) -> UNIQUE KEY [name] (cols) USING BTREE
@@ -3224,6 +3237,33 @@ func normalizeCreateTableIndexUsing(query string) string {
 	re7 := regexp.MustCompile("(?i)(UNIQUE)\\s+USING\\s+(\\w+)\\s*(\\([^)]*\\))")
 	query = re7.ReplaceAllString(query, "${1} KEY ${3} USING ${2}")
 	return query
+}
+
+// normalizeEnumHexValues converts hex literals in ENUM and SET column type values
+// to quoted string literals so the vitess parser can handle them.
+// e.g. ENUM(0x9353,0x9373) -> ENUM('0x9353','0x9373')
+func normalizeEnumHexValues(query string) string {
+	upper := strings.ToUpper(query)
+	if !strings.Contains(upper, "ENUM") && !strings.Contains(upper, " SET") {
+		return query
+	}
+	reHex := regexp.MustCompile(`(?i)\b(ENUM|SET)\s*\(((?:[^()]*0x[0-9a-fA-F]+[^()]*)+)\)`)
+	return reHex.ReplaceAllStringFunc(query, func(match string) string {
+		parenIdx := strings.IndexByte(match, '(')
+		keyword := match[:parenIdx]
+		valPart := match[parenIdx+1 : len(match)-1]
+		parts := strings.Split(valPart, ",")
+		newParts := make([]string, 0, len(parts))
+		for _, p := range parts {
+			trimmed := strings.TrimSpace(p)
+			if strings.HasPrefix(strings.ToLower(trimmed), "0x") {
+				newParts = append(newParts, "'"+trimmed+"'")
+			} else {
+				newParts = append(newParts, p)
+			}
+		}
+		return keyword + "(" + strings.Join(newParts, ", ") + ")"
+	})
 }
 
 // normalizeWeightString strips extra numeric args from weight_string() calls
