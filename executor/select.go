@@ -1770,6 +1770,7 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 			return false
 		})
 		preSortedOrderBy = true
+		// Track sort stats for pre-projection sort too (count will be updated after LIMIT)
 	}
 
 	resultRows := make([][]interface{}, 0, len(allRows))
@@ -1817,7 +1818,8 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	}
 
 	// Apply ORDER BY
-	if stmt.OrderBy != nil && !preSortedOrderBy {
+	needsSortStats := stmt.OrderBy != nil && !preSortedOrderBy
+	if needsSortStats {
 		var fromExpr2 sqlparser.TableExpr
 		if len(stmt.From) > 0 {
 			fromExpr2 = stmt.From[0]
@@ -1836,6 +1838,20 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		resultRows, err = applyLimit(stmt.Limit, resultRows)
 		if err != nil {
 			return nil, err
+		}
+	}
+
+	// Track sort statistics AFTER LIMIT (Sort_rows counts rows actually sorted/returned)
+	if needsSortStats || preSortedOrderBy {
+		e.sortRows += int64(len(resultRows))
+		// Sort_range: sort done on a range scan (WHERE with index range condition).
+		// Sort_scan: sort done on a full table scan.
+		// Heuristic: if the WHERE clause specifically uses a BETWEEN condition, classify as range.
+		// Otherwise classify as scan.
+		if stmt.Where != nil && containsBetweenExpr(stmt.Where.Expr) {
+			e.sortRange++
+		} else {
+			e.sortScan++
 		}
 	}
 
@@ -2722,7 +2738,8 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 	if len(stmt.From) > 0 {
 		orderCollation = resolveOrderByCollation(e.collectTableDefs(stmt.From[0]), stmt.From[0])
 	}
-	if stmt.OrderBy != nil {
+	needsSortStats2 := stmt.OrderBy != nil
+	if needsSortStats2 {
 		resultRows, err = applyOrderBy(stmt.OrderBy, colNames, resultRows, orderCollation)
 		if err != nil {
 			return nil, err
@@ -2737,6 +2754,16 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 		resultRows, err = applyLimit(stmt.Limit, resultRows)
 		if err != nil {
 			return nil, err
+		}
+	}
+
+	// Track sort statistics AFTER LIMIT
+	if needsSortStats2 {
+		e.sortRows += int64(len(resultRows))
+		if stmt.Where != nil && containsBetweenExpr(stmt.Where.Expr) {
+			e.sortRange++
+		} else {
+			e.sortScan++
 		}
 	}
 
@@ -5419,4 +5446,23 @@ func (e *Executor) execSelectIntoUserVars(into *sqlparser.SelectInto, colNames [
 		}
 	}
 	return &Result{}, nil
+}
+
+// containsBetweenExpr returns true if the WHERE expression contains a BETWEEN expression,
+// which typically indicates a range scan for sort statistics classification.
+func containsBetweenExpr(expr sqlparser.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	switch e := expr.(type) {
+	case *sqlparser.BetweenExpr:
+		return true
+	case *sqlparser.AndExpr:
+		return containsBetweenExpr(e.Left) || containsBetweenExpr(e.Right)
+	case *sqlparser.OrExpr:
+		return containsBetweenExpr(e.Left) || containsBetweenExpr(e.Right)
+	case *sqlparser.NotExpr:
+		return containsBetweenExpr(e.Expr)
+	}
+	return false
 }

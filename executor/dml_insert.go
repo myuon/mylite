@@ -1281,6 +1281,27 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							}
 						}
 					}
+					// UTF8 charset validation for string columns (TEXT, CHAR, VARCHAR, etc.)
+					// If a string contains invalid UTF8 bytes and the column uses a UTF8 charset,
+					// emit Warning 1366 and replace value with empty string.
+					colTypeLower := strings.ToLower(col.Type)
+					isTextOrCharType := strings.Contains(colTypeLower, "text") ||
+						strings.Contains(colTypeLower, "char") ||
+						strings.Contains(colTypeLower, "blob")
+					if isTextOrCharType && !strings.Contains(colTypeLower, "binary") {
+						if sv, ok := rv.(string); ok {
+							colCharset := col.Charset
+							if colCharset == "" && tbl.Def != nil {
+								colCharset = tbl.Def.Charset
+							}
+							colCharset = strings.ToLower(colCharset)
+							isUtf8Charset := colCharset == "utf8" || colCharset == "utf8mb3" || colCharset == "utf8mb4"
+							if isUtf8Charset && !utf8.ValidString(sv) {
+								e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect string value: '%s' for column '%s' at row %d", formatBytesForWarning(sv), col.Name, 1))
+								row[col.Name] = ""
+							}
+						}
+					}
 					// ENUM/SET validity check in strict mode
 					isEnumType := strings.HasPrefix(strings.ToLower(col.Type), "enum(")
 					isSetType := strings.HasPrefix(strings.ToLower(col.Type), "set(")
@@ -1789,10 +1810,27 @@ func (e *Executor) findDuplicateRow(tbl *storage.Table, candidate storage.Row, p
 		if !cok || cv == nil {
 			continue
 		}
+		cvStr := fmt.Sprintf("%v", cv)
+		// Get column type to determine if PAD SPACE comparison applies
+		colType := ""
+		for _, c := range tbl.Def.Columns {
+			if strings.EqualFold(c.Name, baseCol) {
+				colType = strings.ToUpper(c.Type)
+				break
+			}
+		}
+		isPadSpace := strings.Contains(colType, "CHAR") && !strings.Contains(colType, "BINARY")
 		for i, existing := range tbl.Rows {
 			ev, eok := existing[baseCol]
-			if eok && ev != nil && fmt.Sprintf("%v", cv) == fmt.Sprintf("%v", ev) {
-				return i
+			if eok && ev != nil {
+				evStr := fmt.Sprintf("%v", ev)
+				if isPadSpace {
+					if strings.TrimRight(cvStr, " ") == strings.TrimRight(evStr, " ") {
+						return i
+					}
+				} else if cvStr == evStr {
+					return i
+				}
 			}
 		}
 	}
@@ -1812,7 +1850,24 @@ func (e *Executor) findDuplicateRow(tbl *storage.Table, candidate storage.Row, p
 					match = false
 					break
 				}
-				if fmt.Sprintf("%v", cv) != fmt.Sprintf("%v", ev) {
+				cvStr := fmt.Sprintf("%v", cv)
+				evStr := fmt.Sprintf("%v", ev)
+				// For string columns, use PAD SPACE comparison (trim trailing spaces)
+				colType := ""
+				for _, c := range tbl.Def.Columns {
+					if strings.EqualFold(c.Name, baseCol) {
+						colType = strings.ToUpper(c.Type)
+						break
+					}
+				}
+				isPadSpace := strings.Contains(colType, "CHAR") && !strings.Contains(colType, "BINARY")
+				var valuesMatch bool
+				if isPadSpace {
+					valuesMatch = strings.TrimRight(cvStr, " ") == strings.TrimRight(evStr, " ")
+				} else {
+					valuesMatch = cvStr == evStr
+				}
+				if !valuesMatch {
 					match = false
 					break
 				}
@@ -1851,4 +1906,37 @@ func (e *Executor) evaluateCheckConstraint(exprStr string, row storage.Row) (boo
 		return true, nil // NULL result means constraint is satisfied (MySQL behavior)
 	}
 	return isTruthy(val), nil
+}
+
+// formatBytesForWarning formats the invalid bytes in a string as MySQL does in Warning 1366:
+// e.g. '\xFF' or '\xEF\xBF' showing the first few invalid bytes.
+func formatBytesForWarning(s string) string {
+	// Find the first invalid UTF8 sequence and show it
+	var result strings.Builder
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size <= 1 {
+			// Invalid byte - show it as \xNN
+			fmt.Fprintf(&result, "\\x%02X", s[i])
+			i++
+			// Show a few more invalid bytes if present
+			count := 1
+			for i < len(s) && count < 4 {
+				r2, size2 := utf8.DecodeRuneInString(s[i:])
+				if r2 == utf8.RuneError && size2 <= 1 {
+					fmt.Fprintf(&result, "\\x%02X", s[i])
+					i++
+					count++
+				} else {
+					break
+				}
+			}
+			break
+		}
+		i += size
+	}
+	if result.Len() == 0 {
+		return s
+	}
+	return result.String()
 }

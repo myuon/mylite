@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // preprocessQuery performs pre-parse processing on the query string before
@@ -171,10 +174,49 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		return "", &Result{}, nil
 	}
 
-	// Handle CREATE/ALTER/DROP RESOURCE GROUP as no-ops
-	if strings.HasPrefix(upper, "CREATE RESOURCE GROUP") ||
-		strings.HasPrefix(upper, "ALTER RESOURCE GROUP") ||
-		strings.HasPrefix(upper, "DROP RESOURCE GROUP") ||
+	// Handle CREATE/ALTER/DROP/SET RESOURCE GROUP
+	if strings.HasPrefix(upper, "CREATE RESOURCE GROUP") {
+		// Extract group name (first word after "CREATE RESOURCE GROUP")
+		rest := strings.TrimSpace(query[len("CREATE RESOURCE GROUP"):])
+		name := extractFirstIdentifier(rest)
+		if name != "" {
+			normalized := normalizeResourceGroupName(name)
+			if e.resourceGroupsMu != nil {
+				e.resourceGroupsMu.Lock()
+			}
+			if e.resourceGroups == nil {
+				e.resourceGroups = make(map[string]string)
+			}
+			if _, exists := e.resourceGroups[normalized]; exists {
+				if e.resourceGroupsMu != nil {
+					e.resourceGroupsMu.Unlock()
+				}
+				return "", nil, mysqlError(3654, "HY000", fmt.Sprintf("Resource Group '%s' exists", name))
+			}
+			e.resourceGroups[normalized] = name
+			if e.resourceGroupsMu != nil {
+				e.resourceGroupsMu.Unlock()
+			}
+		}
+		return "", &Result{}, nil
+	}
+	if strings.HasPrefix(upper, "DROP RESOURCE GROUP") {
+		// Extract group name
+		rest := strings.TrimSpace(query[len("DROP RESOURCE GROUP"):])
+		name := extractFirstIdentifier(rest)
+		if name != "" {
+			normalized := normalizeResourceGroupName(name)
+			if e.resourceGroupsMu != nil {
+				e.resourceGroupsMu.Lock()
+			}
+			delete(e.resourceGroups, normalized)
+			if e.resourceGroupsMu != nil {
+				e.resourceGroupsMu.Unlock()
+			}
+		}
+		return "", &Result{}, nil
+	}
+	if strings.HasPrefix(upper, "ALTER RESOURCE GROUP") ||
 		strings.HasPrefix(upper, "SET RESOURCE GROUP") {
 		return "", &Result{}, nil
 	}
@@ -763,4 +805,45 @@ func rewriteMidToSubstring(query string) string {
 		idx := strings.Index(strings.ToUpper(match), "MID")
 		return "SUBSTRING" + match[idx+3:]
 	})
+}
+
+// normalizeResourceGroupName normalizes a resource group name for case and accent-insensitive comparison.
+// MySQL resource group names are compared in a case and accent-insensitive manner.
+func normalizeResourceGroupName(name string) string {
+	// Remove backtick quoting if present
+	name = strings.Trim(name, "`")
+	// Decompose to NFD (separates base chars from combining marks), strip combining marks, then lowercase.
+	nfd := norm.NFD.String(strings.ToLower(name))
+	result := make([]rune, 0, len(nfd))
+	for _, r := range nfd {
+		if unicode.Is(unicode.Mn, r) {
+			// Skip combining marks (accents, diacritics)
+			continue
+		}
+		result = append(result, r)
+	}
+	return string(result)
+}
+
+// extractFirstIdentifier extracts the first identifier (possibly backtick-quoted) from a SQL fragment.
+func extractFirstIdentifier(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if s[0] == '`' {
+		// Backtick-quoted identifier
+		end := strings.Index(s[1:], "`")
+		if end < 0 {
+			return s[1:]
+		}
+		return s[1 : end+1]
+	}
+	// Unquoted identifier: read until whitespace or special char
+	end := 0
+	for end < len(s) && s[end] != ' ' && s[end] != '\t' && s[end] != '\n' &&
+		s[end] != '(' && s[end] != ')' && s[end] != ';' {
+		end++
+	}
+	return s[:end]
 }

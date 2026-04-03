@@ -166,7 +166,7 @@ func (t *Table) ensureIndexes() {
 			if idx.Unique {
 				s := make(map[string]bool, len(t.Rows))
 				for _, existing := range t.Rows {
-					key := bulkUniqueKey(existing, idx.Columns)
+					key := bulkUniqueKeyPadSpace(existing, idx.Columns, t.Def)
 					if key != "" {
 						s[key] = true
 					}
@@ -371,7 +371,7 @@ func (t *Table) Insert(row Row, noAutoValueOnZero ...bool) (int64, error) {
 	if t.uniqueIndex != nil {
 		for _, idx := range t.Def.Indexes {
 			if idx.Unique {
-				key := bulkUniqueKey(row, idx.Columns)
+				key := bulkUniqueKeyPadSpace(row, idx.Columns, t.Def)
 				if key != "" && t.uniqueIndex[idx.Name][key] {
 					vals := make([]string, len(idx.Columns))
 					for i, c := range idx.Columns {
@@ -403,7 +403,7 @@ func (t *Table) Insert(row Row, noAutoValueOnZero ...bool) (int64, error) {
 	if t.uniqueIndex != nil {
 		for _, idx := range t.Def.Indexes {
 			if idx.Unique {
-				key := bulkUniqueKey(row, idx.Columns)
+				key := bulkUniqueKeyPadSpace(row, idx.Columns, t.Def)
 				if key != "" {
 					if t.uniqueIndex[idx.Name] == nil {
 						t.uniqueIndex[idx.Name] = make(map[string]bool)
@@ -490,7 +490,7 @@ func (t *Table) BulkInsert(rows []Row) ([]int64, error) {
 				if idx.Unique {
 					s := make(map[string]bool, len(t.Rows))
 					for _, existing := range t.Rows {
-						key := bulkUniqueKey(existing, idx.Columns)
+						key := bulkUniqueKeyPadSpace(existing, idx.Columns, t.Def)
 						if key != "" { // empty means has NULL, skip
 							s[key] = true
 						}
@@ -608,7 +608,7 @@ func (t *Table) BulkInsert(rows []Row) ([]int64, error) {
 			if hasUnique {
 				for _, idx := range t.Def.Indexes {
 					if idx.Unique {
-						key := bulkUniqueKey(row, idx.Columns)
+						key := bulkUniqueKeyPadSpace(row, idx.Columns, t.Def)
 						if key != "" && uniqueSets[idx.Name][key] {
 							vals := make([]string, len(idx.Columns))
 							for i, c := range idx.Columns {
@@ -664,6 +664,64 @@ func bulkUniqueKey(row Row, cols []string) string {
 			return ""
 		}
 		parts[i] = fmt.Sprintf("%v", v)
+	}
+	return strings.Join(parts, "\x00")
+}
+
+// isPadSpaceCol returns true if the column uses PAD SPACE collation
+// (default for non-binary CHAR/VARCHAR columns).
+func isPadSpaceCol(colType string) bool {
+	upper := strings.ToUpper(colType)
+	// CHAR and VARCHAR use PAD SPACE by default
+	isCharOrVarchar := (strings.HasPrefix(upper, "CHAR(") || upper == "CHAR" ||
+		strings.HasPrefix(upper, "VARCHAR("))
+	if !isCharOrVarchar {
+		return false
+	}
+	// BINARY character set disables PAD SPACE
+	if strings.Contains(upper, "BINARY") {
+		return false
+	}
+	return true
+}
+
+// padSpaceValue trims trailing spaces from a value if the column uses PAD SPACE collation.
+func padSpaceValue(v string, colType string) string {
+	if isPadSpaceCol(colType) {
+		return strings.TrimRight(v, " ")
+	}
+	return v
+}
+
+// bulkUniqueKeyPadSpace builds a hash key with PAD SPACE normalization for CHAR/VARCHAR columns.
+// Returns "" if any column is NULL (NULL doesn't violate UNIQUE).
+func bulkUniqueKeyPadSpace(row Row, cols []string, def *catalog.TableDef) string {
+	// Build a column type map for quick lookup
+	colTypeMap := make(map[string]string, len(def.Columns))
+	for _, c := range def.Columns {
+		colTypeMap[strings.ToLower(c.Name)] = c.Type
+	}
+
+	normalizeVal := func(colName string, v interface{}) string {
+		s := fmt.Sprintf("%v", v)
+		colType := colTypeMap[strings.ToLower(colName)]
+		return padSpaceValue(s, colType)
+	}
+
+	if len(cols) == 1 {
+		v := row[cols[0]]
+		if v == nil {
+			return ""
+		}
+		return normalizeVal(cols[0], v)
+	}
+	parts := make([]string, len(cols))
+	for i, c := range cols {
+		v := row[c]
+		if v == nil {
+			return ""
+		}
+		parts[i] = normalizeVal(c, v)
 	}
 	return strings.Join(parts, "\x00")
 }

@@ -318,6 +318,11 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		}
 		rlRe, err := regexp.Compile(rlPattern)
 		if err != nil {
+			// If the pattern has large repetition counts (e.g. {120}, {80}), MySQL's ICU
+			// engine compiles it but then times out during matching. Map to timeout error.
+			if strings.Contains(err.Error(), "invalid repeat count") {
+				return nil, true, mysqlError(3699, "HY000", "Timeout exceeded in regular expression match.")
+			}
 			return nil, true, mysqlError(3692, "HY000", "Illegal argument to a regular expression.")
 		}
 		if rlRe.MatchString(toString(rlVal)) {

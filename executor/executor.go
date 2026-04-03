@@ -375,6 +375,15 @@ type Executor struct {
 	// checkedForUpgrade tracks tables that have been CHECK TABLE ... FOR UPGRADE'd.
 	// Subsequent FOR UPGRADE checks return "Table is already up to date".
 	checkedForUpgrade map[string]bool
+	// Sort statistics: incremented when ORDER BY operations are performed.
+	sortRows  int64 // total rows sorted
+	sortRange int64 // sort operations using range scan
+	sortScan  int64 // sort operations using full table scan
+	// resourceGroups stores resource group names (lowercase-normalized for case+accent-insensitive comparison).
+	// Shared across all connections. Maps normalized name → original name.
+	resourceGroups map[string]string
+	// resourceGroupsMu protects resourceGroups.
+	resourceGroupsMu *sync.RWMutex
 }
 
 // Warning represents a MySQL warning.
@@ -578,6 +587,8 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	e.txnActiveSet = NewTxnActiveSet()
 	e.tableLockManager = NewTableLockManager()
 	e.globalReadLock = NewGlobalReadLock()
+	e.resourceGroups = make(map[string]string)
+	e.resourceGroupsMu = &sync.RWMutex{}
 	e.initSystemTables()
 	return e
 }
@@ -650,6 +661,8 @@ func (e *Executor) Clone() *Executor {
 		txnActiveSet:     e.txnActiveSet,
 		tableLockManager: e.tableLockManager,
 		globalReadLock:   e.globalReadLock,
+		resourceGroups:   e.resourceGroups,
+		resourceGroupsMu: e.resourceGroupsMu,
 	}
 }
 
@@ -6031,6 +6044,9 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		for _, opt := range s.FlushOptions {
 			if strings.ToUpper(opt) == "STATUS" {
 				e.handlerReadKey = 0
+				e.sortRows = 0
+				e.sortRange = 0
+				e.sortScan = 0
 			}
 		}
 		return &Result{}, nil
@@ -13832,22 +13848,24 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 				return true, nil
 			}
 		}
-		// Try datetime normalization if strings look like dates
-		if looksLikeDate(ls) || looksLikeDate(rs) {
-			ln := normalizeDateTimeString(ls)
-			rn := normalizeDateTimeString(rs)
-			if ln != "" && rn != "" {
-				// Use the two-arg normalizer to align date vs datetime granularity
-				ln, rn = normalizeDateTimeForCompare(ln, rn)
-				return ln == rn, nil
+		// Try datetime normalization if strings look like dates (but not binary data)
+		if !looksLikeBinaryData(ls) && !looksLikeBinaryData(rs) {
+			if looksLikeDate(ls) || looksLikeDate(rs) {
+				ln := normalizeDateTimeString(ls)
+				rn := normalizeDateTimeString(rs)
+				if ln != "" && rn != "" {
+					// Use the two-arg normalizer to align date vs datetime granularity
+					ln, rn = normalizeDateTimeForCompare(ln, rn)
+					return ln == rn, nil
+				}
 			}
-		}
-		// Try TIME normalization if either looks like a time
-		if looksLikeTime(ls) || looksLikeTime(rs) {
-			lt := parseMySQLTimeValue(ls)
-			rt := parseMySQLTimeValue(rs)
-			if lt == rt {
-				return true, nil
+			// Try TIME normalization if either looks like a time
+			if looksLikeTime(ls) || looksLikeTime(rs) {
+				lt := parseMySQLTimeValue(ls)
+				rt := parseMySQLTimeValue(rs)
+				if lt == rt {
+					return true, nil
+				}
 			}
 		}
 		return false, nil
@@ -14982,8 +15000,20 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 				rows = append(rows, []interface{}{tableName, op, "note", "Table does not support optimize, doing recreate + analyze instead"})
 				rows = append(rows, []interface{}{tableName, op, "status", "OK"})
 			} else {
-				// Non-InnoDB engines (MyISAM, etc.) return "OK" after optimization
-				rows = append(rows, []interface{}{tableName, op, "status", "OK"})
+				// Non-InnoDB engines (MyISAM, etc.) check if the table has data:
+				// empty tables → "Table is already up to date"
+				// tables with data → "OK"
+				dbName := e.CurrentDB
+				if strings.Contains(tableName, ".") {
+					parts := strings.SplitN(tableName, ".", 2)
+					dbName = parts[0]
+				}
+				rowCount := e.tableRowCount(dbName, bareTable)
+				if rowCount == 0 {
+					rows = append(rows, []interface{}{tableName, op, "status", "Table is already up to date"})
+				} else {
+					rows = append(rows, []interface{}{tableName, op, "status", "OK"})
+				}
 			}
 		} else if op == "check" && forUpgrade {
 			// CHECK TABLE ... FOR UPGRADE: first check returns OK, subsequent checks

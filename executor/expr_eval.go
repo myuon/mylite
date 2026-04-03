@@ -1920,12 +1920,23 @@ func (e *Executor) evalRegexpLikeExpr(v *sqlparser.RegexpLikeExpr) (interface{},
 	}
 	rlCompiled, err := regexp.Compile(rlPat)
 	if err != nil {
-		return nil, mysqlError(3692, "HY000", "Illegal argument to a regular expression.")
+		return nil, regexpCompileError(err)
 	}
 	if rlCompiled.MatchString(toString(rlExprVal)) {
 		return int64(1), nil
 	}
 	return int64(0), nil
+}
+
+// regexpCompileError converts a regexp compile error to the appropriate MySQL error.
+// Patterns with large repetition counts (e.g. {120}) fail in Go's RE2 engine but would
+// compile in MySQL's ICU engine, potentially causing a timeout. We map those to the
+// MySQL timeout error instead of the illegal argument error.
+func regexpCompileError(err error) error {
+	if strings.Contains(err.Error(), "invalid repeat count") || strings.Contains(err.Error(), "repetition") {
+		return mysqlError(3699, "HY000", "Timeout exceeded in regular expression match.")
+	}
+	return mysqlError(3692, "HY000", "Illegal argument to a regular expression.")
 }
 
 // evalRegexpInstrExpr handles *sqlparser.RegexpInstrExpr evaluation.
