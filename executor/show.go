@@ -1734,7 +1734,7 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		pkCols = def.PrimaryKey
 	}
 
-	hasTrailingDefs := len(pkCols) > 0 || len(def.Indexes) > 0 || len(def.CheckConstraints) > 0
+	hasTrailingDefs := len(pkCols) > 0 || len(def.Indexes) > 0 || len(def.CheckConstraints) > 0 || len(def.ForeignKeys) > 0
 
 	for i, cd := range colDefs {
 		b.WriteString(cd)
@@ -1755,7 +1755,7 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 				quotedPK[i] = quoteFunc(trimmed)
 			}
 		}
-		hasMore := len(def.Indexes) > 0 || len(def.CheckConstraints) > 0
+		hasMore := len(def.Indexes) > 0 || len(def.CheckConstraints) > 0 || len(def.ForeignKeys) > 0
 		b.WriteString(fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(quotedPK, ",")))
 		if hasMore {
 			b.WriteString(",")
@@ -1835,7 +1835,7 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		} else {
 			b.WriteString(fmt.Sprintf("  %s %s (%s)%s%s%s", prefix, quoteFunc(idx.Name), strings.Join(quotedCols, ","), usingStr, commentStr, invisibleStr))
 		}
-		if i < len(displayIndexes)-1 || len(def.CheckConstraints) > 0 {
+		if i < len(displayIndexes)-1 || len(def.CheckConstraints) > 0 || len(def.ForeignKeys) > 0 {
 			b.WriteString(",")
 		}
 		b.WriteString("\n")
@@ -1850,7 +1850,47 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 			checkExpr = sqlparser.CanonicalString(parsed)
 		}
 		b.WriteString(fmt.Sprintf("  CONSTRAINT `%s` CHECK ((%s))", cc.Name, checkExpr))
-		if i < len(def.CheckConstraints)-1 {
+		if i < len(def.CheckConstraints)-1 || len(def.ForeignKeys) > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("\n")
+	}
+
+	// FOREIGN KEY constraints
+	for i, fk := range def.ForeignKeys {
+		quotedChildCols := make([]string, len(fk.Columns))
+		for j, c := range fk.Columns {
+			quotedChildCols[j] = quoteFunc(c)
+		}
+		quotedParentCols := make([]string, len(fk.ReferencedColumns))
+		for j, c := range fk.ReferencedColumns {
+			quotedParentCols[j] = quoteFunc(c)
+		}
+		fkStr := fmt.Sprintf("  CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)",
+			quoteFunc(fk.Name),
+			strings.Join(quotedChildCols, ","),
+			quoteFunc(fk.ReferencedTable),
+			strings.Join(quotedParentCols, ","))
+		if strings.ToUpper(fk.OnDelete) == "CASCADE" {
+			fkStr += " ON DELETE CASCADE"
+		} else if strings.ToUpper(fk.OnDelete) == "SET NULL" {
+			fkStr += " ON DELETE SET NULL"
+		} else if strings.ToUpper(fk.OnDelete) == "NO ACTION" {
+			fkStr += " ON DELETE NO ACTION"
+		} else if strings.ToUpper(fk.OnDelete) == "SET DEFAULT" {
+			fkStr += " ON DELETE SET DEFAULT"
+		}
+		if strings.ToUpper(fk.OnUpdate) == "CASCADE" {
+			fkStr += " ON UPDATE CASCADE"
+		} else if strings.ToUpper(fk.OnUpdate) == "SET NULL" {
+			fkStr += " ON UPDATE SET NULL"
+		} else if strings.ToUpper(fk.OnUpdate) == "NO ACTION" {
+			fkStr += " ON UPDATE NO ACTION"
+		} else if strings.ToUpper(fk.OnUpdate) == "SET DEFAULT" {
+			fkStr += " ON UPDATE SET DEFAULT"
+		}
+		b.WriteString(fkStr)
+		if i < len(def.ForeignKeys)-1 {
 			b.WriteString(",")
 		}
 		b.WriteString("\n")

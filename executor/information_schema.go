@@ -92,7 +92,7 @@ var infoSchemaColumnOrder = map[string][]string{
 	"innodb_datafiles":         {"SPACE", "PATH"},
 	"innodb_columns":           {"TABLE_ID", "NAME", "POS", "MTYPE", "PRTYPE", "LEN"},
 	"innodb_virtual":           {"TABLE_ID", "POS", "BASE_POS"},
-	"innodb_foreign":           {"ID", "FOR_NAME", "REF_NAME", "N_COLS"},
+	"innodb_foreign":           {"ID", "FOR_NAME", "REF_NAME", "N_COLS", "TYPE"},
 	"innodb_metrics":           {"NAME", "COUNT", "TYPE", "STATUS", "SUBSYSTEM", "COMMENT"},
 	"innodb_cached_indexes":    {"SPACE_ID", "INDEX_ID", "N_CACHED_PAGES"},
 	"innodb_indexes":           {"INDEX_ID", "NAME", "TABLE_ID", "TYPE", "SPACE"},
@@ -350,7 +350,6 @@ var emptyStubTables = map[string]bool{
 var singleRowStubTables = map[string]storage.Row{
 	"innodb_columns":        {"TABLE_ID": int64(0), "NAME": "", "POS": int64(0), "MTYPE": int64(0), "PRTYPE": int64(0), "LEN": int64(0)},
 	"innodb_virtual":        {"TABLE_ID": int64(0), "POS": int64(0), "BASE_POS": int64(0)},
-	"innodb_foreign":        {"ID": "", "FOR_NAME": "", "REF_NAME": "", "N_COLS": int64(0)},
 	"innodb_buffer_page_lru": {"POOL_ID": int64(0), "LRU_POSITION": int64(0), "SPACE": int64(0), "PAGE_NUMBER": int64(0)},
 	"innodb_buffer_pool_stats": {"POOL_ID": int64(0), "POOL_SIZE": int64(0)},
 	"innodb_cmp":          {"page_size": int64(4096), "compress_ops": int64(0), "compress_ops_ok": int64(0), "compress_time": int64(0), "uncompress_ops": int64(0), "uncompress_time": int64(0)},
@@ -358,7 +357,6 @@ var singleRowStubTables = map[string]storage.Row{
 	"innodb_cmpmem":       {"page_size": int64(4096), "buffer_pool_instance": int64(0), "pages_used": int64(0), "pages_free": int64(0), "relocation_ops": int64(0), "relocation_time": int64(0)},
 	"innodb_cmpmem_reset": {"page_size": int64(4096), "buffer_pool_instance": int64(0), "pages_used": int64(0), "pages_free": int64(0), "relocation_ops": int64(0), "relocation_time": int64(0)},
 	"innodb_trx":            {"trx_id": "", "trx_state": "RUNNING", "trx_started": nil},
-	"innodb_foreign_cols":   {"ID": "", "FOR_COL_NAME": "", "REF_COL_NAME": "", "POS": int64(0)},
 	"innodb_fields":         {"INDEX_ID": int64(0), "NAME": "", "POS": int64(0)},
 	"optimizer_trace":       {"QUERY": "", "TRACE": ""},
 	"files":                 {"FILE_NAME": "", "FILE_TYPE": "", "TABLESPACE_NAME": ""},
@@ -582,6 +580,10 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.infoSchemaInnoDBIndexes()
 	case "innodb_cached_indexes":
 		rawRows = e.infoSchemaInnoDBCachedIndexes()
+	case "innodb_foreign":
+		rawRows = []storage.Row{} // stub — FK metadata not yet tracked
+	case "innodb_foreign_cols":
+		rawRows = []storage.Row{} // stub — FK metadata not yet tracked
 	case "innodb_buffer_page":
 		rawRows = []storage.Row{} // empty stub - no buffer pool tracking
 	case "processlist":
@@ -1086,6 +1088,100 @@ func (e *Executor) infoSchemaInnoDBDatafiles() []storage.Row {
 			"SPACE": t["SPACE"],
 			"PATH":  "./" + name + ".ibd",
 		})
+	}
+	return rows
+}
+
+// innodbFKType computes the InnoDB INNODB_FOREIGN.TYPE bitmask for a foreign key.
+// Bit encoding:
+//
+//	DELETE: CASCADE=1, SET NULL=2, NO_ACTION=16, RESTRICT=0
+//	UPDATE: CASCADE=4, SET NULL=8, NO_ACTION=32, RESTRICT=0
+//	Default (no clause specified) = NO_ACTION on both sides = 48
+func innodbFKType(onDelete, onUpdate string) int64 {
+	var t int64
+	switch strings.ToUpper(onDelete) {
+	case "CASCADE":
+		t |= 1
+	case "SET NULL":
+		t |= 2
+	case "NO ACTION", "":
+		t |= 16
+	// RESTRICT = 0 (no bits set)
+	}
+	switch strings.ToUpper(onUpdate) {
+	case "CASCADE":
+		t |= 4
+	case "SET NULL":
+		t |= 8
+	case "NO ACTION", "":
+		t |= 32
+	// RESTRICT = 0 (no bits set)
+	}
+	return t
+}
+
+// infoSchemaInnoDBForeign returns rows for INFORMATION_SCHEMA.INNODB_FOREIGN.
+func (e *Executor) infoSchemaInnoDBForeign() []storage.Row {
+	dbNames := e.Catalog.ListDatabases()
+	var rows []storage.Row
+	for _, dbName := range dbNames {
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		for _, tableName := range db.ListTables() {
+			def, err := db.GetTable(tableName)
+			if err != nil || def == nil {
+				continue
+			}
+			for _, fk := range def.ForeignKeys {
+				fkID := dbName + "/" + fk.Name
+				forName := dbName + "/" + tableName
+				refName := dbName + "/" + fk.ReferencedTable
+				rows = append(rows, storage.Row{
+					"ID":       fkID,
+					"FOR_NAME": forName,
+					"REF_NAME": refName,
+					"N_COLS":   int64(len(fk.Columns)),
+					"TYPE":     innodbFKType(fk.OnDelete, fk.OnUpdate),
+				})
+			}
+		}
+	}
+	return rows
+}
+
+// infoSchemaInnoDBForeignCols returns rows for INFORMATION_SCHEMA.INNODB_FOREIGN_COLS.
+func (e *Executor) infoSchemaInnoDBForeignCols() []storage.Row {
+	dbNames := e.Catalog.ListDatabases()
+	var rows []storage.Row
+	for _, dbName := range dbNames {
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		for _, tableName := range db.ListTables() {
+			def, err := db.GetTable(tableName)
+			if err != nil || def == nil {
+				continue
+			}
+			for _, fk := range def.ForeignKeys {
+				fkID := dbName + "/" + fk.Name
+				for i, col := range fk.Columns {
+					refCol := ""
+					if i < len(fk.ReferencedColumns) {
+						refCol = fk.ReferencedColumns[i]
+					}
+					rows = append(rows, storage.Row{
+						"ID":           fkID,
+						"FOR_COL_NAME": col,
+						"REF_COL_NAME": refCol,
+						"POS":          int64(i + 1),
+					})
+				}
+			}
+		}
 	}
 	return rows
 }
@@ -2331,6 +2427,16 @@ func (e *Executor) perfSchemaThreads() []storage.Row {
 			if db == "" {
 				db = "test"
 			}
+			var procInfo interface{}
+			if proc.Info != "" {
+				procInfo = proc.Info
+			}
+			var procState interface{}
+			if proc.State != "" && proc.State != "starting" {
+				procState = proc.State
+			} else if proc.Command == "Query" {
+				procState = "executing"
+			}
 			rows = append(rows, storage.Row{
 				"THREAD_ID":           cid + 1, // thread_id = connID + 1 by convention
 				"NAME":                "thread/sql/one_connection",
@@ -2341,14 +2447,14 @@ func (e *Executor) perfSchemaThreads() []storage.Row {
 				"PROCESSLIST_DB":      db,
 				"PROCESSLIST_COMMAND": proc.Command,
 				"PROCESSLIST_TIME":    int64(0),
-				"PROCESSLIST_STATE":   nil,
-				"PROCESSLIST_INFO":    nil,
+				"PROCESSLIST_STATE":   procState,
+				"PROCESSLIST_INFO":    procInfo,
 				"PARENT_THREAD_ID":    int64(1),
 				"ROLE":                nil,
 				"INSTRUMENTED":        instrumented,
 				"HISTORY":             history,
 				"CONNECTION_TYPE":     "TCP/IP",
-				"THREAD_OS_ID":        int64(0),
+				"THREAD_OS_ID":        10000 + cid, // unique fake OS thread ID per connection
 				"RESOURCE_GROUP":      "USR_default",
 			})
 		}
@@ -2375,13 +2481,13 @@ func (e *Executor) perfSchemaThreads() []storage.Row {
 			"PROCESSLIST_COMMAND": "Query",
 			"PROCESSLIST_TIME":    int64(0),
 			"PROCESSLIST_STATE":   nil,
-			"PROCESSLIST_INFO":    nil,
+			"PROCESSLIST_INFO":    e.currentQuery,
 			"PARENT_THREAD_ID":    int64(1),
 			"ROLE":                nil,
 			"INSTRUMENTED":        instrumented,
 			"HISTORY":             history,
 			"CONNECTION_TYPE":     "TCP/IP",
-			"THREAD_OS_ID":        int64(0),
+			"THREAD_OS_ID":        10000 + connID, // unique fake OS thread ID per connection
 			"RESOURCE_GROUP":      "USR_default",
 		})
 	}

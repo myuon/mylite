@@ -3688,6 +3688,13 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 
 	// Override with any SET GLOBAL/SESSION values
 	for name, val := range e.startupVars {
+		// performance_schema_consumer_* and performance_schema_instrument are
+		// startup-only options that configure performance_schema.setup_consumers
+		// and setup_instruments tables. They are NOT exposed as system variables.
+		if strings.HasPrefix(name, "performance_schema_consumer_") ||
+			name == "performance_schema_instrument" {
+			continue
+		}
 		// Apply minimum/maximum constraints for known variables
 		if name == "innodb_stats_transient_sample_pages" || name == "innodb_stats_persistent_sample_pages" {
 			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n < 1 {
@@ -3722,6 +3729,11 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		e.globalVarsMu.RUnlock()
 	}
 	for name, val := range globalVarsCopy {
+		// performance_schema_consumer_* are startup-only, not system variables
+		if strings.HasPrefix(name, "performance_schema_consumer_") ||
+			name == "performance_schema_instrument" {
+			continue
+		}
 		if !globalOnly && !sysVarGlobalOnly[name] && !sysVarBothScope[name] {
 			continue
 		}

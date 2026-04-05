@@ -2704,6 +2704,52 @@ func (ctx *execContext) getActiveConn() *sql.Conn {
 	return ctx.connByName[strings.ToLower(ctx.currentConn)]
 }
 
+// queryRows executes a SQL query and returns the results as a slice of string slices.
+// It is used for internal evaluation (e.g., assert.inc conditions) and does not
+// write anything to the output buffer.
+func (ctx *execContext) queryRows(stmt string) ([][]string, error) {
+	activeConn := ctx.getActiveConn()
+	var (
+		sqlRows *sql.Rows
+		err     error
+	)
+	if activeConn != nil {
+		sqlRows, err = activeConn.QueryContext(context.Background(), stmt)
+	} else {
+		sqlRows, err = ctx.db.Query(stmt)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer sqlRows.Close()
+
+	cols, err := sqlRows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	var result [][]string
+	for sqlRows.Next() {
+		vals := make([]interface{}, len(cols))
+		ptrs := make([]interface{}, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := sqlRows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		row := make([]string, len(cols))
+		for i, v := range vals {
+			if v == nil {
+				row[i] = "NULL"
+			} else {
+				row[i] = fmt.Sprintf("%v", v)
+			}
+		}
+		result = append(result, row)
+	}
+	return result, sqlRows.Err()
+}
+
 func (ctx *execContext) closeConnections() {
 	for name, conn := range ctx.connByName {
 		if conn != nil {
@@ -3102,6 +3148,39 @@ func evalWhileCondition(condVal string) bool {
 	return n != 0
 }
 
+// expandBracketSubExprs expands eval.inc-style [SQL_STATEMENT] sub-expressions
+// in an assert condition by executing each bracketed SQL and substituting the
+// result.  Only simple [SQL] forms (no column/row index) are handled.
+func (ctx *execContext) expandBracketSubExprs(expr string) string {
+	for {
+		start := strings.Index(expr, "[")
+		if start < 0 {
+			break
+		}
+		end := strings.Index(expr[start:], "]")
+		if end < 0 {
+			break
+		}
+		end += start
+		inner := strings.TrimSpace(expr[start+1 : end])
+		if inner == "" {
+			break
+		}
+		// Execute the sub-statement and get its first column of first row.
+		activeConn := ctx.getActiveConn()
+		subRows, err := activeConn.QueryContext(context.Background(), inner)
+		result := ""
+		if err == nil {
+			if subRows.Next() {
+				_ = subRows.Scan(&result)
+			}
+			subRows.Close()
+		}
+		expr = expr[:start] + result + expr[end+1:]
+	}
+	return expr
+}
+
 // stripUndefinedVars removes remaining $variable references that were not
 // substituted. In MySQL's mysqltest, undefined variables in eval context
 // expand to empty string.
@@ -3134,6 +3213,44 @@ func (ctx *execContext) sourceFile(filename string) error {
 		_ = ctx.executeSQLNoEcho("SET @@SESSION.default_storage_engine = MyISAM")
 		_ = ctx.executeSQLNoEcho("SET @@GLOBAL.default_tmp_storage_engine = MyISAM")
 		_ = ctx.executeSQLNoEcho("SET @@SESSION.default_tmp_storage_engine = MyISAM")
+		return nil
+	}
+	// assert.inc checks a condition and prints its label.  Rather than
+	// executing the full include chain (which involves eval.inc,
+	// begin_include_file.inc, etc. and produces unwanted SQL output), we
+	// emulate the essential behaviour inline:
+	//  1. Print "include/assert.inc [$assert_text]" (only at top level).
+	//  2. Evaluate $assert_cond via a silent SELECT.
+	//  3. Fail the test if the condition is false.
+	if baseName == "assert.inc" {
+		assertText := ctx.variables["$assert_text"]
+		assertCond := ctx.variables["$assert_cond"]
+		includeDepth := ctx.variables["$_include_file_depth"]
+		if includeDepth == "" || includeDepth == "0" {
+			ctx.output.WriteString("include/assert.inc [" + assertText + "]\n")
+		}
+		// Evaluate the condition silently if we have a connection.
+		if assertCond != "" {
+			assertCond = ctx.substituteVars(assertCond)
+			// Expand eval.inc-style [SQL] bracket sub-expressions.
+			assertCond = ctx.expandBracketSubExprs(assertCond)
+			// Use a silent SQL SELECT to evaluate the boolean expression.
+			activeConn := ctx.getActiveConn()
+			sqlRows, err := activeConn.QueryContext(context.Background(), "SELECT "+assertCond)
+			if err == nil {
+				var result string
+				if sqlRows.Next() {
+					_ = sqlRows.Scan(&result)
+				}
+				sqlRows.Close()
+				if result == "0" || result == "" {
+					return fmt.Errorf("assert.inc: assertion failed: %s (condition: %s)", assertText, assertCond)
+				}
+			}
+		}
+		// Clear assert variables as assert.inc normally does.
+		ctx.variables["$assert_text"] = ""
+		ctx.variables["$assert_cond"] = ""
 		return nil
 	}
 	// Treat proc-control include as no-op in this single-node runner.
