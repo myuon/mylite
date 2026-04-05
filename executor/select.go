@@ -186,7 +186,11 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 			// Check if it's a view
 			if e.views != nil {
 				if viewSQL, ok := e.views[lookupTable]; ok {
+					// Save and restore currentQuery so that view execution doesn't
+					// overwrite the outer query's text (used for column name extraction).
+					savedCurrentQuery := e.currentQuery
 					viewResult, err := e.Execute(viewSQL)
+					e.currentQuery = savedCurrentQuery
 					if err != nil {
 						return nil, err
 					}
@@ -2605,13 +2609,6 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 				// MySQL displays function args without space after comma: JSON_OBJECTAGG(k,b)
 				if rawExprIdx < len(rawExprs) {
 					raw := strings.TrimSpace(rawExprs[rawExprIdx])
-					// Uppercase known aggregate function names
-					for _, fn := range []string{"count", "sum", "avg", "min", "max", "json_arrayagg", "json_objectagg", "group_concat"} {
-						if strings.HasPrefix(strings.ToLower(raw), fn+"(") {
-							raw = strings.ToUpper(fn) + raw[len(fn):]
-							break
-						}
-					}
 					// MySQL displays function args without space after comma
 					raw = normalizeFuncArgSpaces(raw)
 					// MySQL displays NULL uppercase and SQL keywords uppercase in column headers
@@ -4487,6 +4484,22 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 				// String literal: use the value directly (unquoted), even if the raw expression
 				// includes "UNION ..." suffix (which happens when called from a UNION context).
 				name = lit.Val
+			} else if isAggregateExpr(se.Expr) && rawExprIdx < len(rawExprs) {
+				// Aggregate function in no-FROM context: normalize like execSelectGroupBy
+				raw := strings.TrimSpace(rawExprs[rawExprIdx])
+				raw = normalizeFuncArgSpaces(raw)
+				raw = normalizeAggColNameNulls(raw)
+				// Uppercase outer aggregate function name if lowercase
+				for _, fn := range []string{"json_arrayagg(", "json_objectagg(", "count(", "sum(", "avg(", "min(", "max(", "group_concat("} {
+					if strings.HasPrefix(raw, fn) {
+						raw = strings.ToUpper(fn) + raw[len(fn):]
+						break
+					}
+				}
+				raw = uppercaseAggInnerKeywords(raw)
+				raw = normalizeAggColNameFunctions(raw)
+				raw = normalizeAggColNameSubselect(raw)
+				name = raw
 			} else if rawExprIdx < len(rawExprs) {
 				raw := strings.TrimSpace(rawExprs[rawExprIdx])
 				// MySQL displays string literal column headers without quotes
