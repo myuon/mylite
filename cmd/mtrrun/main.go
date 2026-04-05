@@ -38,6 +38,9 @@ import (
 // skipTests lists tests known to be unfixable. Key: "suite/testname".
 var skipTests map[string]bool
 
+// runSkippedOnly when true, inverts the skip logic: only run tests IN the skiplist.
+var runSkippedOnly bool
+
 //go:embed skiplist.json
 var skipListData []byte
 
@@ -106,7 +109,9 @@ func main() {
 	suiteFilter := flag.String("suite", "", "run only specified suite(s), comma-separated (e.g. sys_vars,innodb)")
 	testFilter := flag.String("test", "", "run only specified test(s), comma-separated in suite/testname format (e.g. sys_vars/gtid_owned_basic,other/bool)")
 	force := flag.Bool("force", false, "kill existing mtrrun process and remove lock before starting")
+	skippedOnly := flag.Bool("skipped-only", false, "run only tests that are in the skiplist (inverse of normal behavior)")
 	flag.Parse()
+	runSkippedOnly = *skippedOnly
 
 	if *force {
 		if data, err := os.ReadFile(mtrrunLockFile); err == nil {
@@ -332,12 +337,19 @@ func runSuite(suiteName string, testFilter map[string]bool, suiteRoot, includeRo
 		if testFilter != nil && !testFilter[testName] {
 			continue
 		}
-		if skipTests[suiteName+"/"+testName] {
-			skippedResults = append(skippedResults, mtrrunner.TestResult{
-				Name:    testName,
-				Skipped: true,
-			})
-			continue
+		isSkipped := skipTests[suiteName+"/"+testName]
+		if runSkippedOnly {
+			if !isSkipped {
+				continue
+			}
+		} else {
+			if isSkipped {
+				skippedResults = append(skippedResults, mtrrunner.TestResult{
+					Name:    testName,
+					Skipped: true,
+				})
+				continue
+			}
 		}
 		testPaths = append(testPaths, filepath.Join(testDir, entry.Name()))
 		if maxTests > 0 && len(testPaths) >= maxTests {
