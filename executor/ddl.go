@@ -1385,6 +1385,29 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	// Handle CREATE TABLE (cols...) SELECT ... : insert rows from the SELECT
 	if stmt.Select != nil {
 		selectSQL := sqlparser.String(stmt.Select)
+		// MySQL raises ER_CANT_UPDATE_TABLE_IN_CREATE_TABLE_SELECT when CREATE TABLE
+		// with a SELECT ... FOR UPDATE cannot acquire locks (another connection holds them).
+		if isSELECTForUpdate(selectSQL) && e.rowLockManager != nil {
+			srcTable := explainTableNameFromQuery(selectSQL)
+			if srcTable != "" {
+				if tbl, tblErr := e.Storage.GetTable(e.CurrentDB, srcTable); tblErr == nil {
+					if srcDB2, dbErr2 := e.Catalog.GetDatabase(dbName); dbErr2 == nil {
+						if def2, defErr2 := srcDB2.GetTable(srcTable); defErr2 == nil && len(tbl.Rows) > 0 {
+							allIndices := make([]int, len(tbl.Rows))
+							for i := range tbl.Rows {
+								allIndices[i] = i
+							}
+							if lockErr := e.acquireRowLocksForRows(e.CurrentDB, srcTable, def2, tbl.Rows, allIndices); lockErr != nil {
+								e.handleRollbackOnTimeout()
+								return nil, mysqlError(1615, "HY000", fmt.Sprintf("Can't update table '%s' while '%s' is being created.", srcTable, tableName))
+							}
+							// Release the locks immediately; we just needed to verify availability
+							e.rowLockManager.ReleaseRowLocks(e.connectionID)
+						}
+					}
+				}
+			}
+		}
 		selResult, selErr := e.Execute(selectSQL)
 		if selErr != nil {
 			return nil, selErr
@@ -2530,6 +2553,87 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			tableName = newName
 			tbl, _ = e.Storage.GetTable(dbName, newName)
 
+		case *sqlparser.AlterCharset:
+			// ALTER TABLE ... CONVERT TO CHARACTER SET <newCharset>
+			// Re-encode all string column values from the table's current charset to UTF-8.
+			newCharset := strings.ToLower(op.CharacterSet)
+			canonNew := canonicalCharset(newCharset)
+			tableDef, _ := db.GetTable(tableName)
+			oldCharset := ""
+			if tableDef != nil {
+				oldCharset = strings.ToLower(tableDef.Charset)
+			}
+			canonOld := canonicalCharset(oldCharset)
+			// Only re-encode if converting from a non-UTF8 charset to utf8
+			if canonOld != "" && canonOld != "utf8" && canonOld != "utf8mb4" &&
+				(canonNew == "utf8" || canonNew == "utf8mb4") {
+				dec := charsetDecoder(canonOld)
+				if dec != nil && tbl != nil {
+					isStringCol := func(colType string) bool {
+						upper := strings.ToUpper(strings.TrimSpace(colType))
+						return strings.HasPrefix(upper, "CHAR") ||
+							strings.HasPrefix(upper, "VARCHAR") ||
+							strings.HasPrefix(upper, "TEXT") ||
+							strings.HasPrefix(upper, "TINYTEXT") ||
+							strings.HasPrefix(upper, "MEDIUMTEXT") ||
+							strings.HasPrefix(upper, "LONGTEXT") ||
+							strings.HasPrefix(upper, "ENUM") ||
+							strings.HasPrefix(upper, "SET")
+					}
+					stringCols := make(map[string]bool)
+					if tableDef != nil {
+						for _, col := range tableDef.Columns {
+							if isStringCol(col.Type) {
+								stringCols[col.Name] = true
+							}
+						}
+					}
+					if len(stringCols) > 0 {
+						tbl.Mu.Lock()
+						for i := range tbl.Rows {
+							row := tbl.Rows[i]
+							for colName := range stringCols {
+								if val, ok := row[colName]; ok && val != nil {
+									var rawBytes []byte
+									switch v := val.(type) {
+									case string:
+										rawBytes = []byte(v)
+									case []byte:
+										rawBytes = v
+									}
+									if rawBytes == nil {
+										// Handle int64/uint64: treat as raw byte value
+										switch iv := val.(type) {
+										case int64:
+											if iv >= 0 && iv <= 255 {
+												rawBytes = []byte{byte(iv)}
+											}
+										case uint64:
+											if iv <= 255 {
+												rawBytes = []byte{byte(iv)}
+											}
+										}
+									}
+									if rawBytes != nil {
+										if converted, err := dec.Bytes(rawBytes); err == nil {
+											row[colName] = string(converted)
+										}
+									}
+								}
+							}
+						}
+						tbl.Mu.Unlock()
+					}
+				}
+			}
+			// Update the table's charset in the catalog
+			if tableDef != nil {
+				tableDef.Charset = newCharset
+				if op.Collate != "" {
+					tableDef.Collation = op.Collate
+				}
+			}
+
 		default:
 			// Unsupported ALTER option — ignore silently to stay compatible.
 		}
@@ -3490,6 +3594,12 @@ func (e *Executor) tryExecCreateTableIndexOnlySelect(stmt *sqlparser.CreateTable
 	return &Result{}, nil
 }
 
+// isSELECTForUpdate returns true if the SELECT query contains a FOR UPDATE clause.
+func isSELECTForUpdate(selectSQL string) bool {
+	upper := strings.ToUpper(selectSQL)
+	return strings.Contains(upper, " FOR UPDATE")
+}
+
 // execCreateTableSelect handles CREATE TABLE t2 [AS] SELECT ...
 // targetDB specifies the database to create the table in (may differ from e.CurrentDB for cross-db CREATE TABLE).
 func (e *Executor) execCreateTableSelect(targetDB, newTableName, selectSQL string) (*Result, error) {
@@ -3515,6 +3625,11 @@ func (e *Executor) execCreateTableSelect(targetDB, newTableName, selectSQL strin
 					}
 					if lockErr := e.acquireRowLocksForRows(srcDB, srcTable, def, tbl.Rows, allIndices); lockErr != nil {
 						e.handleRollbackOnTimeout()
+						// MySQL raises a specific error when CREATE TABLE ... SELECT ... FOR UPDATE
+						// cannot acquire locks on the source table
+						if isSELECTForUpdate(selectSQL) {
+							return nil, mysqlError(1615, "HY000", fmt.Sprintf("Can't update table '%s' while '%s' is being created.", srcTable, newTableName))
+						}
 						return nil, lockErr
 					}
 					// Release the locks immediately; we just needed to verify availability

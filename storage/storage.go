@@ -55,6 +55,20 @@ func displayValue(v interface{}) string {
 	return s
 }
 
+func decimalZeroValueByType(colType string) interface{} {
+	lower := strings.ToLower(strings.TrimSpace(colType))
+	if strings.Contains(lower, "decimal") || strings.Contains(lower, "numeric") {
+		var m, d int
+		if n, err := fmt.Sscanf(lower, "decimal(%d,%d)", &m, &d); err == nil && n == 2 && d > 0 {
+			return "0." + strings.Repeat("0", d)
+		}
+		if n, err := fmt.Sscanf(lower, "numeric(%d,%d)", &m, &d); err == nil && n == 2 && d > 0 {
+			return "0." + strings.Repeat("0", d)
+		}
+	}
+	return int64(0)
+}
+
 // Table is the in-memory storage for a single table.
 type Table struct {
 	Def             *catalog.TableDef
@@ -311,7 +325,7 @@ func (t *Table) Insert(row Row, noAutoValueOnZero ...bool) (int64, error) {
 					row[col.Name] = id
 					lastInsertID = id
 				}
-				} else {
+			} else {
 				// If explicit value provided, update auto_increment counter if needed
 				// Store the value itself (not value+1) because Add(1) will return value+1
 				if uv, ok := v.(uint64); ok {
@@ -350,7 +364,7 @@ func (t *Table) Insert(row Row, noAutoValueOnZero ...bool) (int64, error) {
 				switch {
 				case strings.Contains(upper, "INT") || strings.Contains(upper, "DECIMAL") ||
 					strings.Contains(upper, "FLOAT") || strings.Contains(upper, "DOUBLE"):
-					row[col.Name] = int64(0)
+					row[col.Name] = decimalZeroValueByType(col.Type)
 				case strings.Contains(upper, "CHAR") || strings.Contains(upper, "TEXT") ||
 					strings.Contains(upper, "BLOB") || strings.Contains(upper, "ENUM"):
 					row[col.Name] = ""
@@ -591,7 +605,7 @@ func (t *Table) BulkInsert(rows []Row) ([]int64, error) {
 					switch {
 					case strings.Contains(upper, "INT") || strings.Contains(upper, "DECIMAL") ||
 						strings.Contains(upper, "FLOAT") || strings.Contains(upper, "DOUBLE"):
-						row[col.Name] = int64(0)
+						row[col.Name] = decimalZeroValueByType(col.Type)
 					case strings.Contains(upper, "CHAR") || strings.Contains(upper, "TEXT") ||
 						strings.Contains(upper, "BLOB") || strings.Contains(upper, "ENUM"):
 						row[col.Name] = ""

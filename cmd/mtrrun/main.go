@@ -546,6 +546,7 @@ func (w *worker) runTestInner(testPath string, includePaths []string, verbose bo
 		IncludePaths: includePaths,
 		Verbose:      verbose,
 		TmpDir:       w.tmpDir,
+		ServerAddr:   w.addr,
 	}
 	return runner.RunFile(testPath)
 }

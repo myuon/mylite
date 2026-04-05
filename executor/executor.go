@@ -22,6 +22,7 @@ import (
 	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
 	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/charmap"
 	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/transform"
 	"golang.org/x/text/unicode/norm"
@@ -392,6 +393,13 @@ type Executor struct {
 	// handlerReadKey counts the number of index-based reads (SELECT queries).
 	// Incremented per SELECT, reset on FLUSH STATUS.
 	handlerReadKey int64
+	// Additional handler counters surfaced by SHOW STATUS LIKE 'handler_read%'.
+	handlerReadFirst   int64
+	handlerReadLast    int64
+	handlerReadNext    int64
+	handlerReadPrev    int64
+	handlerReadRnd     int64
+	handlerReadRndNext int64
 	// checkedForUpgrade tracks tables that have been CHECK TABLE ... FOR UPGRADE'd.
 	// Subsequent FOR UPGRADE checks return "Table is already up to date".
 	checkedForUpgrade map[string]bool
@@ -579,18 +587,18 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	// We mirror this so SET TIMESTAMP + CURRENT_TIME() match expected results.
 	defaultTZ := time.FixedZone("GMT-3", 3*60*60)
 	e := &Executor{
-		Catalog:       cat,
-		Storage:       store,
-		CurrentDB:     "test",
-		sqlMode:       "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
-		snapshots:     make(map[string]*fullSnapshot),
-		userVars:      make(map[string]interface{}),
-		preparedStmts: make(map[string]string),
+		Catalog:                 cat,
+		Storage:                 store,
+		CurrentDB:               "test",
+		sqlMode:                 "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+		snapshots:               make(map[string]*fullSnapshot),
+		userVars:                make(map[string]interface{}),
+		preparedStmts:           make(map[string]string),
 		tempTables:              make(map[string]bool),
 		tempTableSavedPermanent: make(map[string]*savedPermTable),
 		globalScopeVars: map[string]string{
-			"general_log":                    "ON",
-			"slow_query_log":                 "ON",
+			"general_log":                     "ON",
+			"slow_query_log":                  "ON",
 			"log_bin_trust_function_creators": "ON",
 		},
 		globalVarsMu:     &sync.RWMutex{},
@@ -658,33 +666,33 @@ func (e *Executor) Clone() *Executor {
 		e.globalVarsMu.RUnlock()
 	}
 	return &Executor{
-		Catalog:          e.Catalog,
-		Storage:          e.Storage,
-		CurrentDB:        "test",
-		sqlMode:          "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
-		snapshots:        make(map[string]*fullSnapshot),
-		userVars:         make(map[string]interface{}),
-		preparedStmts:    make(map[string]string),
+		Catalog:                 e.Catalog,
+		Storage:                 e.Storage,
+		CurrentDB:               "test",
+		sqlMode:                 "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+		snapshots:               make(map[string]*fullSnapshot),
+		userVars:                make(map[string]interface{}),
+		preparedStmts:           make(map[string]string),
 		tempTables:              make(map[string]bool),
 		tempTableSavedPermanent: make(map[string]*savedPermTable),
 		globalScopeVars:         e.globalScopeVars,
-		globalVarsMu:     e.globalVarsMu,
-		sessionScopeVars: sessVars,
-		startupVars:      e.startupVars,
-		timeZone:         defaultTZ,
-		DataDir:          e.DataDir,
-		SearchPaths:      e.SearchPaths,
-		psTruncated:      e.psTruncated,
-		nextConnID:       e.nextConnID,
-		connectionID:     connID,
-		lockManager:      e.lockManager,
-		rowLockManager:   e.rowLockManager,
-		processList:      e.processList,
-		txnActiveSet:     e.txnActiveSet,
-		tableLockManager: e.tableLockManager,
-		globalReadLock:   e.globalReadLock,
-		resourceGroups:   e.resourceGroups,
-		resourceGroupsMu: e.resourceGroupsMu,
+		globalVarsMu:            e.globalVarsMu,
+		sessionScopeVars:        sessVars,
+		startupVars:             e.startupVars,
+		timeZone:                defaultTZ,
+		DataDir:                 e.DataDir,
+		SearchPaths:             e.SearchPaths,
+		psTruncated:             e.psTruncated,
+		nextConnID:              e.nextConnID,
+		connectionID:            connID,
+		lockManager:             e.lockManager,
+		rowLockManager:          e.rowLockManager,
+		processList:             e.processList,
+		txnActiveSet:            e.txnActiveSet,
+		tableLockManager:        e.tableLockManager,
+		globalReadLock:          e.globalReadLock,
+		resourceGroups:          e.resourceGroups,
+		resourceGroupsMu:        e.resourceGroupsMu,
 	}
 }
 
@@ -4910,7 +4918,14 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 		}
 	}
 
-	if best.matchedAll && best.index.Unique && !hasNullCondition {
+	if best.matchedEq > 0 && hasNullCondition {
+		result.accessType = "ref_or_null"
+		refs := make([]string, best.matchedEq)
+		for i := range refs {
+			refs[i] = "const"
+		}
+		result.ref = strings.Join(refs, ",")
+	} else if best.matchedAll && best.index.Unique && !hasNullCondition {
 		if best.isPrimary || !isJoin {
 			// Use "const" for PK lookups or unique index lookups in standalone queries
 			result.accessType = "const"
@@ -4962,9 +4977,18 @@ func explainExtractWhereConditions(expr sqlparser.Expr, tableName string) []expl
 			colName = explainExtractColumnName(e.Right)
 		}
 		if colName != "" {
+			hasNullLiteral := func(x sqlparser.Expr) bool {
+				if x == nil {
+					return false
+				}
+				if nv, ok := x.(*sqlparser.NullVal); ok && nv != nil {
+					return true
+				}
+				return false
+			}
 			switch e.Operator {
 			case sqlparser.EqualOp, sqlparser.NullSafeEqualOp:
-				return []explainWhereCondition{{column: colName, isEquality: true}}
+				return []explainWhereCondition{{column: colName, isEquality: true, isNull: hasNullLiteral(e.Left) || hasNullLiteral(e.Right)}}
 			case sqlparser.InOp:
 				return []explainWhereCondition{{column: colName, isEquality: true, isRange: true}}
 			case sqlparser.GreaterThanOp, sqlparser.GreaterEqualOp,
@@ -4983,9 +5007,36 @@ func explainExtractWhereConditions(expr sqlparser.Expr, tableName string) []expl
 			return []explainWhereCondition{{column: colName, isEquality: true, isNull: e.Right == sqlparser.IsNullOp}}
 		}
 	case *sqlparser.OrExpr:
-		// OR expressions can't be decomposed into individual column conditions,
-		// but we still need to indicate that a WHERE condition exists so that
-		// "Using where" is detected. Return a single condition with empty column.
+		// Handle OR predicates on the same indexed column, e.g.
+		// "a IN (42) OR a IS NULL" / "a=42 OR a=NULL" as ref_or_null.
+		left := explainExtractWhereConditions(e.Left, tableName)
+		right := explainExtractWhereConditions(e.Right, tableName)
+		all := append(append([]explainWhereCondition{}, left...), right...)
+		if len(all) > 0 {
+			firstCol := ""
+			merged := explainWhereCondition{}
+			sameCol := true
+			for _, wc := range all {
+				if wc.column == "" {
+					sameCol = false
+					break
+				}
+				if firstCol == "" {
+					firstCol = wc.column
+					merged.column = wc.column
+				} else if !strings.EqualFold(firstCol, wc.column) {
+					sameCol = false
+					break
+				}
+				merged.isEquality = merged.isEquality || wc.isEquality
+				merged.isRange = merged.isRange || wc.isRange
+				merged.isNull = merged.isNull || wc.isNull
+			}
+			if sameCol && merged.column != "" {
+				return []explainWhereCondition{merged}
+			}
+		}
+		// Fallback: mark as generic WHERE for "Using where" only.
 		return []explainWhereCondition{{column: "", isEquality: false}}
 	}
 	return nil
@@ -6061,6 +6112,20 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			}
 			return &Result{}, nil
 		}
+		// FLUSH STATUS (parser fallback path) must reset session status counters.
+		if strings.HasPrefix(upper, "FLUSH STATUS") {
+			e.handlerReadKey = 0
+			e.handlerReadFirst = 0
+			e.handlerReadLast = 0
+			e.handlerReadNext = 0
+			e.handlerReadPrev = 0
+			e.handlerReadRnd = 0
+			e.handlerReadRndNext = 0
+			e.sortRows = 0
+			e.sortRange = 0
+			e.sortScan = 0
+			return &Result{}, nil
+		}
 		// HANDLER ... OPEN/READ/CLOSE: return error for performance_schema tables
 		if strings.HasPrefix(upper, "HANDLER ") {
 			rest := strings.TrimSpace(trimmed[len("HANDLER "):])
@@ -6506,8 +6571,14 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		}
 		// FLUSH STATUS resets session status counters.
 		for _, opt := range s.FlushOptions {
-			if strings.ToUpper(opt) == "STATUS" {
+			if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(opt)), "STATUS") {
 				e.handlerReadKey = 0
+				e.handlerReadFirst = 0
+				e.handlerReadLast = 0
+				e.handlerReadNext = 0
+				e.handlerReadPrev = 0
+				e.handlerReadRnd = 0
+				e.handlerReadRndNext = 0
 				e.sortRows = 0
 				e.sortRange = 0
 				e.sortScan = 0
@@ -7339,7 +7410,7 @@ func extractCharLength(colType string) int {
 		return 65535
 	case "mediumblob", "mediumtext":
 		return 16777215
-	// LONGBLOB/LONGTEXT max is 4GB — too large to enforce in memory; skip
+		// LONGBLOB/LONGTEXT max is 4GB — too large to enforce in memory; skip
 	}
 	return 0
 }
@@ -10444,7 +10515,6 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 	return nil, mysqlError(1305, "42000", fmt.Sprintf("FUNCTION %s.%s does not exist", db, name))
 }
 
-
 // parseDateTimeValue parses a date/time interface value into a time.Time.
 // Supports string formats: "2006-01-02", "2006-01-02 15:04:05", "15:04:05", "2006-01-02T15:04:05".
 // isZeroDate checks if a value represents MySQL's zero date (0000-00-00 ...)
@@ -10512,7 +10582,7 @@ func mysqlWeekFull(t time.Time, mode int64) int64 {
 			wdJan1 := int(jan1.Weekday()) // 0=Sun, 1=Mon, ..., 6=Sat
 			// firstMonday: days from Jan 1 to first Monday (0-based offset)
 			firstMonday := (8 - wdJan1) % 7 // 0 if Jan 1 is Monday
-			yday := t.YearDay() - 1          // 0-based
+			yday := t.YearDay() - 1         // 0-based
 			if yday < firstMonday {
 				if weekRange1to53 {
 					// Return last week of previous year
@@ -10968,7 +11038,7 @@ func formatMicrosAsTimeString(micros int64) string {
 		micros = -micros
 	}
 	us := micros % int64(time.Second/time.Microsecond)
-	micros /= int64(time.Second/time.Microsecond)
+	micros /= int64(time.Second / time.Microsecond)
 	sec := int(micros % 60)
 	micros /= 60
 	mins := int(micros % 60)
@@ -11040,15 +11110,19 @@ var mysqlWeekdayAbbrDF = [7]string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sa
 // Locale-specific month/weekday name tables for date_format.
 var mysqlLocaleMonthNames = map[string][12]string{
 	"de_DE": {"Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"},
+	"ru_RU": {"Января", "Февраля", "Марта", "Апреля", "Мая", "Июня", "Июля", "Августа", "Сентября", "Октября", "Ноября", "Декабря"},
 }
 var mysqlLocaleMonthAbbr = map[string][12]string{
 	"de_DE": {"Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"},
+	"ru_RU": {"Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"},
 }
 var mysqlLocaleWeekdayNames = map[string][7]string{
 	"de_DE": {"Sonntag", "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag"},
+	"ru_RU": {"Воскресенье", "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"},
 }
 var mysqlLocaleWeekdayAbbr = map[string][7]string{
 	"de_DE": {"So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"},
+	"ru_RU": {"Вск", "Пнд", "Втр", "Срд", "Чтв", "Птн", "Сбт"},
 }
 
 // mysqlAdjustedWeekday returns the weekday adjusted for MySQL's calendar (handles year 0 offset).
@@ -11235,7 +11309,7 @@ type mysqlDateParser struct {
 	weekV, weekv               int // week number for %V/%v, -1=unset
 	yearX, yearx               int // year for %X/%x
 	hasDate, hasTime, hasMicro bool
-	hasYear, hasMonth           bool // true if %Y/%y or %m/%c/%M/%b present
+	hasYear, hasMonth          bool // true if %Y/%y or %m/%c/%M/%b present
 	hasAMPM                    bool
 	has24hHour                 bool // true if %H or %k was used (24-hour format)
 	hasWeekday                 bool // true if %W or %w was used
@@ -11944,7 +12018,7 @@ func (p *mysqlDateParser) format() string {
 	yr, mo, dy := p.resolveDate()
 
 	// Determine the result format based on which specifiers were used.
-	hasFullDate := p.hasYear || p.hasMonth // has year or month info → calendar date context
+	hasFullDate := p.hasYear || p.hasMonth    // has year or month info → calendar date context
 	hasDayOffset := p.hasDate && !hasFullDate // %d/%j but no year/month → day-offset for time
 
 	if p.literalMode {
@@ -13419,6 +13493,7 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		return e.evalFuncExpr(v)
 	}
 }
+
 // evalComparisonWithRow evaluates a comparison expression with row context.
 func (e *Executor) evalComparisonWithRow(v *sqlparser.ComparisonExpr, row storage.Row) (interface{}, error) {
 	// Delegate to evalWhere for the actual comparison logic (it handles tuples, subqueries, etc.)
@@ -15879,6 +15954,14 @@ func charsetDecoder(charset string) *encoding.Decoder {
 		return japanese.ShiftJIS.NewDecoder()
 	case "ujis":
 		return japanese.EUCJP.NewDecoder()
+	case "hebrew":
+		return charmap.ISO8859_8.NewDecoder()
+	case "latin1":
+		return charmap.ISO8859_1.NewDecoder()
+	case "greek":
+		return charmap.ISO8859_7.NewDecoder()
+	case "latin2":
+		return charmap.ISO8859_2.NewDecoder()
 	default:
 		return nil
 	}

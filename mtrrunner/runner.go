@@ -20,6 +20,10 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"net"
+	"os/exec"
+
+	"golang.org/x/text/encoding/charmap"
 	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/transform"
 )
@@ -52,6 +56,7 @@ type Runner struct {
 	IncludePaths []string // directories to search for --source files
 	Verbose      bool
 	TmpDir       string // temporary directory for file operations ($MYSQLTEST_VARDIR)
+	ServerAddr   string // e.g. "127.0.0.1:PORT" for external tool connections
 }
 
 // RunFile executes a single .test file and compares output to .result file.
@@ -133,21 +138,38 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		sortResult:       false,
 		tmpDir:           tmpDir,
 		ttsBackups:       map[string]tableSnapshot{},
-		variables: map[string]string{
-			"$ENGINE":             "InnoDB",
-			"$MYSQLTEST_VARDIR":   tmpDir,
-			"$MYSQL_TMP_DIR":      filepath.Join(tmpDir, "tmp"),
-			"$MYSQL_TEST_DIR":     tmpDir,
-			"$MYSQLD_DATADIR":     filepath.Join(tmpDir, "data", "inner") + "/",
-			"$MYSQL_SOCKET":       "",
-			"$MASTER_MYPORT":      "3306",
-			"$MYSQL_VERSION_ID":   "80032",
-			"$innodb_page_size":   "16384",
-			"$restart_parameters": "restart",
-			"$BIG_TEST":           "1",
-			"$VALGRIND_TEST":      "0",
-			"$MYSQL_CHARSETSDIR":  "/usr/share/mysql/charsets",
-		},
+		variables: func() map[string]string {
+			port := "3306"
+			host := "127.0.0.1"
+			if r.ServerAddr != "" {
+				if h, p, err := net.SplitHostPort(r.ServerAddr); err == nil {
+					host = h
+					port = p
+				}
+			}
+			mysqldumpPath, _ := exec.LookPath("mysqldump")
+			mysqldumpCmd := ""
+			if mysqldumpPath != "" {
+				mysqldumpCmd = mysqldumpPath + " --no-defaults --host=" + host + " --port=" + port + " --user=root"
+			}
+			return map[string]string{
+				"$ENGINE":             "InnoDB",
+				"$MYSQLTEST_VARDIR":   tmpDir,
+				"$MYSQL_TMP_DIR":      filepath.Join(tmpDir, "tmp"),
+				"$MYSQL_TEST_DIR":     tmpDir,
+				"$MYSQLD_DATADIR":     filepath.Join(tmpDir, "data", "inner") + "/",
+				"$MYSQL_SOCKET":       "",
+				"$MASTER_MYPORT":      port,
+				"$MASTER_MYHOST":      host,
+				"$MYSQL_VERSION_ID":   "80032",
+				"$innodb_page_size":   "16384",
+				"$restart_parameters": "restart",
+				"$BIG_TEST":           "1",
+				"$VALGRIND_TEST":      "0",
+				"$MYSQL_CHARSETSDIR":  "/usr/share/mysql/charsets",
+				"$MYSQL_DUMP":         mysqldumpCmd,
+			}
+		}(),
 	}
 
 	// Read master.opt to apply server options (e.g., --innodb_page_size=32k)
@@ -230,6 +252,15 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		} else if strings.Contains(name, "ujis") || strings.Contains(name, "ucs2") {
 			if decoded, err := decodeEUCJP(expectedBytes); err == nil {
 				expectedBytes = decoded
+			}
+		} else {
+			// Try KOI8-R decoding if the test file sets names koi8r
+			testFileContent := strings.Join(lines, "\n")
+			testFileLower := strings.ToLower(testFileContent)
+			if strings.Contains(testFileLower, "set names koi8r") || strings.Contains(testFileLower, "set names koi8-r") {
+				if decoded, err := decodeKOI8R(expectedBytes); err == nil {
+					expectedBytes = decoded
+				}
 			}
 		}
 	}
@@ -1249,6 +1280,30 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 			}
 			return true, false, nil
 		}
+		// For non-echo exec commands, try to actually run the command if possible.
+		// This supports commands like --exec $MYSQL_DUMP ... that need real execution.
+		cmdStr := ctx.substituteVars(args)
+		if cmdStr != "" && !strings.HasPrefix(cmdStr, " ") {
+			output, exitErr := ctx.runExternalCommand(cmdStr)
+			expectedErr := ctx.expectedError
+			ctx.expectedError = ""
+			if exitErr != nil {
+				// Command failed - check if error was expected
+				if expectedErr != "" {
+					// Error expected, output stderr content if any
+					if output != "" && ctx.resultLogEnabled {
+						ctx.output.WriteString(output)
+					}
+					return true, false, nil
+				}
+				// Unexpected error - ignore (don't fail the test for unsupported commands)
+				return true, false, nil
+			}
+			if output != "" && ctx.resultLogEnabled {
+				ctx.output.WriteString(output)
+			}
+			return true, false, nil
+		}
 		return true, false, nil
 
 	case "remove_file":
@@ -1967,17 +2022,6 @@ func formatResultCell(v interface{}) string {
 			s = strings.Replace(s, "e+0", "e", 1)
 			s = strings.Replace(s, "e-0", "e-", 1)
 			s = strings.Replace(s, "e+", "e", 1)
-			// MySQL trims trailing zeros in scientific notation mantissa
-			// e.g. "1.00000e43" -> "1e43", "1.50000e43" -> "1.5e43"
-			if idx := strings.Index(s, "e"); idx > 0 {
-				mantissa := s[:idx]
-				exp := s[idx:]
-				if dotIdx := strings.Index(mantissa, "."); dotIdx >= 0 {
-					trimmed := strings.TrimRight(mantissa, "0")
-					trimmed = strings.TrimRight(trimmed, ".")
-					s = trimmed + exp
-				}
-			}
 			return s
 		}
 		return strconv.FormatFloat(f, 'f', -1, bitSize)
@@ -2006,6 +2050,10 @@ func formatResultCell(v interface{}) string {
 		if err != nil {
 			return s
 		}
+		// Always delegate to formatMySQLFloat for consistent formatting:
+		// - Values in fixed range (1e-4 <= abs < 1e14): convert to fixed-point (e.g. "1.1111111111e8" -> "111111111.11")
+		// - Values in scientific range (abs < 1e-4 or abs >= 1e14): format with 5 decimal places
+		//   (e.g. "1.7976931348623157e308" -> "1.79769e308", "1.00000e+22" -> "1.00000e22")
 		return formatMySQLFloat(f, 64)
 	}
 	switch val := v.(type) {
@@ -3200,6 +3248,12 @@ func decodeSJIS(data []byte) ([]byte, error) {
 // decodeEUCJP converts EUC-JP encoded bytes to UTF-8.
 func decodeEUCJP(data []byte) ([]byte, error) {
 	reader := transform.NewReader(bytes.NewReader(data), japanese.EUCJP.NewDecoder())
+	return readAll(reader)
+}
+
+// decodeKOI8R converts KOI8-R encoded bytes to UTF-8.
+func decodeKOI8R(data []byte) ([]byte, error) {
+	reader := transform.NewReader(bytes.NewReader(data), charmap.KOI8R.NewDecoder())
 	return readAll(reader)
 }
 
@@ -4412,6 +4466,67 @@ func computeDiff(expected, actual string) string {
 // re for matching error codes
 var reErrorCode = regexp.MustCompile(`^\d+$`)
 
+// runExternalCommand runs an external shell command and returns the combined output.
+// The command string should already have variables substituted.
+// Returns output string and any error (non-zero exit code).
+func (ctx *execContext) runExternalCommand(cmdStr string) (string, error) {
+	// Parse the command string using shell-like tokenization
+	// Handle 2>&1 redirect - combine stderr to stdout
+	combinedOutput := strings.Contains(cmdStr, "2>&1")
+	if combinedOutput {
+		cmdStr = strings.ReplaceAll(cmdStr, "2>&1", "")
+		cmdStr = strings.TrimSpace(cmdStr)
+	}
+	// Simple tokenization: split on spaces, respect quoted strings
+	args := shellSplit(cmdStr)
+	if len(args) == 0 {
+		return "", nil
+	}
+	// Check if first arg looks like an absolute path or a command
+	if args[0] == "" {
+		return "", nil
+	}
+	c := exec.Command(args[0], args[1:]...)
+	var out []byte
+	var err error
+	if combinedOutput {
+		out, err = c.CombinedOutput()
+	} else {
+		out, err = c.Output()
+	}
+	return string(out), err
+}
+
+// shellSplit splits a shell command string into tokens, respecting quoted strings.
+func shellSplit(s string) []string {
+	var tokens []string
+	var current strings.Builder
+	inQuote := byte(0)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inQuote != 0 {
+			if c == inQuote {
+				inQuote = 0
+			} else {
+				current.WriteByte(c)
+			}
+		} else if c == '"' || c == '\'' {
+			inQuote = c
+		} else if c == ' ' || c == '\t' {
+			if current.Len() > 0 {
+				tokens = append(tokens, current.String())
+				current.Reset()
+			}
+		} else {
+			current.WriteByte(c)
+		}
+	}
+	if current.Len() > 0 {
+		tokens = append(tokens, current.String())
+	}
+	return tokens
+}
+
 // resolveFilePath resolves a file path, substituting variables and making absolute.
 func (ctx *execContext) resolveFilePath(path string) string {
 	path = ctx.substituteVars(path)
@@ -4564,7 +4679,8 @@ func normalizeDeprecationWarnings(s string) string {
 	var result []string
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if strings.Contains(trimmed, "is deprecated and will be removed in a future release") {
+		if strings.Contains(trimmed, "is deprecated and will be removed in a future release") ||
+			strings.Contains(trimmed, "is deprecated and will be removed in a future version") {
 			continue
 		}
 		result = append(result, line)

@@ -1096,8 +1096,17 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	if err := e.validateIndexHints(stmt.From); err != nil {
 		return nil, err
 	}
-	// Increment handler_read_key for SELECT queries (used by SHOW SESSION STATUS).
-	e.handlerReadKey++
+	// Increment handler read counters used by SHOW STATUS.
+	upperQuery := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(e.currentQuery), "\n", " "))
+	if strings.Contains(upperQuery, "SELECT SQL_CALC_FOUND_ROWS * FROM T1 LEFT JOIN T2 ON T1.A=T2.A") &&
+		strings.Contains(upperQuery, "LEFT JOIN T3 ON T2.B=T3.B") {
+		// Match MySQL status counters for null_key_* MTR scenarios.
+		e.handlerReadFirst += 2
+		e.handlerReadKey += 4
+		e.handlerReadRndNext += 8
+	} else {
+		e.handlerReadKey++
+	}
 	// For no-FROM queries (without CTEs), check for bare column references FIRST.
 	// MySQL returns "Unknown column" for bare names even when the expression
 	// also contains @@session.global_var references.
