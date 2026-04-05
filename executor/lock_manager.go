@@ -637,6 +637,13 @@ func (grl *GlobalReadLock) IsHeld() bool {
 	return grl.held
 }
 
+// IsHeldByConn returns true if the global read lock is held by the given connID.
+func (grl *GlobalReadLock) IsHeldByConn(connID int64) bool {
+	grl.mu.Lock()
+	defer grl.mu.Unlock()
+	return grl.held && grl.holder == connID
+}
+
 // IsHeldByOther returns true if the global read lock is fully acquired (ready)
 // by a connection other than connID. If held, also returns the wait channel.
 func (grl *GlobalReadLock) IsHeldByOther(connID int64) (bool, chan struct{}) {

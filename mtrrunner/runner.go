@@ -690,15 +690,30 @@ func (ctx *execContext) executeLines(lines []string) error {
 
 		// Handle bare directives (without -- prefix): eval, let, echo, source, skip,
 		// enable_warnings, disable_warnings, etc.
-		if bareDirective, ok := extractBareDirective(trimmed); ok {
+		// When using a custom delimiter (e.g. "//"), strip it from the end of the
+		// line before trying to recognize it as a bare directive.
+		trimmedForDirective := trimmed
+		if ctx.delimiter != "" && strings.HasSuffix(trimmedForDirective, ctx.delimiter) {
+			trimmedForDirective = strings.TrimSpace(trimmedForDirective[:len(trimmedForDirective)-len(ctx.delimiter)])
+		}
+		if bareDirective, ok := extractBareDirective(trimmedForDirective); ok {
 			advancedLine := false
 			// For 'let' directives, collect multiline values until ';'
 			// but only if the value doesn't end with a backtick (single-line query)
 			bdLower := strings.ToLower(bareDirective)
 			if strings.HasPrefix(bdLower, "let ") {
 				letVal := strings.TrimSpace(bareDirective)
-				// Check if the original line already ended with ';' (complete single-line let)
-				originalEndsWithSemicolon := strings.HasSuffix(strings.TrimSpace(trimmed), ";")
+				// Check if the original line already ended with ';' (complete single-line let).
+				// Strip inline # comments before checking (e.g. "let $x=FLOAT(5,2); # comment").
+				trimmedForSemicolon := strings.TrimSpace(trimmed)
+				if hashIdx := strings.Index(trimmedForSemicolon, " #"); hashIdx >= 0 {
+					trimmedForSemicolon = strings.TrimSpace(trimmedForSemicolon[:hashIdx])
+				}
+				originalEndsWithSemicolon := strings.HasSuffix(trimmedForSemicolon, ";")
+				// Also treat custom delimiter as statement terminator for let
+				if ctx.delimiter != "" && strings.HasSuffix(trimmedForSemicolon, ctx.delimiter) {
+					originalEndsWithSemicolon = true
+				}
 				// Check if value is incomplete (doesn't end with ';' and not a backtick expression)
 				isBacktickExpr := false
 				if eqIdx := strings.Index(letVal, "="); eqIdx >= 0 {
@@ -863,6 +878,11 @@ func (ctx *execContext) executeLines(lines []string) error {
 						inBlockComment = true
 						ci++ // skip the '*'
 						continue
+					}
+					// Check for inline comment # (stops quote tracking for the rest of this line)
+					if ch == '#' {
+						// Everything after # is a comment; don't let it affect quote state
+						break
 					}
 					if ch == '\'' {
 						inSingleQuote = true
@@ -1947,6 +1967,17 @@ func formatResultCell(v interface{}) string {
 			s = strings.Replace(s, "e+0", "e", 1)
 			s = strings.Replace(s, "e-0", "e-", 1)
 			s = strings.Replace(s, "e+", "e", 1)
+			// MySQL trims trailing zeros in scientific notation mantissa
+			// e.g. "1.00000e43" -> "1e43", "1.50000e43" -> "1.5e43"
+			if idx := strings.Index(s, "e"); idx > 0 {
+				mantissa := s[:idx]
+				exp := s[idx:]
+				if dotIdx := strings.Index(mantissa, "."); dotIdx >= 0 {
+					trimmed := strings.TrimRight(mantissa, "0")
+					trimmed = strings.TrimRight(trimmed, ".")
+					s = trimmed + exp
+				}
+			}
 			return s
 		}
 		return strconv.FormatFloat(f, 'f', -1, bitSize)
@@ -2099,6 +2130,10 @@ func (ctx *execContext) executeSQLInner(stmt string) error {
 
 	// EXECUTE might be either a query or exec depending on the prepared statement
 	if strings.HasPrefix(upper, "EXECUTE ") {
+		return ctx.executeQueryOrExec(stmt)
+	}
+	// CALL might return result sets from procedures (e.g. via SELECT inside procedure)
+	if strings.HasPrefix(upper, "CALL ") {
 		return ctx.executeQueryOrExec(stmt)
 	}
 	// Parenthesized SELECT/UNION statements (e.g. "(SELECT ...) UNION ...")
@@ -2550,6 +2585,17 @@ func (ctx *execContext) executeExecWithExpectedError(stmt string) error {
 
 	_, execErr := conn.ExecContext(context.Background(), stmt)
 	if execErr != nil {
+		// Set $mysql_errno and $mysql_errname for use by test scripts.
+		errCode := extractMySQLErrorCode(execErr)
+		if ctx.variables == nil {
+			ctx.variables = make(map[string]string)
+		}
+		ctx.variables["$mysql_errno"] = strconv.Itoa(errCode)
+		if name, ok := mysqlErrorCodeToName[errCode]; ok {
+			ctx.variables["$mysql_errname"] = name
+		} else {
+			ctx.variables["$mysql_errname"] = strconv.Itoa(errCode)
+		}
 		if ctx.resultLogEnabled {
 			if strings.Contains(expectedCode, ",") {
 				codes := strings.Split(expectedCode, ",")
@@ -2570,7 +2616,13 @@ func (ctx *execContext) executeExecWithExpectedError(stmt string) error {
 		return nil
 	}
 
-	// Statement succeeded but we expected an error.
+	// Statement succeeded.
+	// Reset $mysql_errno to 0 on success.
+	if ctx.variables == nil {
+		ctx.variables = make(map[string]string)
+	}
+	ctx.variables["$mysql_errno"] = "0"
+	ctx.variables["$mysql_errname"] = ""
 	// Do NOT output warnings here — Dolt does not produce these warnings
 	// and the expected result files don't include them.
 	return nil
@@ -2635,6 +2687,10 @@ func (ctx *execContext) setVariable(expr string) error {
 	// Strip trailing semicolons from simple values (mysqltest convention).
 	// Don't strip if value is a backtick query or contains embedded semicolons in strings.
 	if !strings.HasPrefix(value, "`") {
+		// Strip inline # comment first (e.g. "FLOAT(5,2); # nnn.nn" -> "FLOAT(5,2)")
+		if hashIdx := strings.Index(value, " #"); hashIdx >= 0 {
+			value = strings.TrimSpace(value[:hashIdx])
+		}
 		value = strings.TrimRight(value, ";")
 		value = strings.TrimSpace(value)
 	}
@@ -3357,6 +3413,13 @@ func parseDirectiveNameArgs(directive string) (name, args string) {
 
 func parseConnectDirectiveArgs(args string) (connName string, dbName string, userName string) {
 	trimmed := strings.TrimSpace(args)
+	// Strip inline # comment (e.g. "connect (con2,...);  # comment here")
+	if hashIdx := strings.Index(trimmed, ";"); hashIdx >= 0 {
+		afterSemi := strings.TrimSpace(trimmed[hashIdx+1:])
+		if strings.HasPrefix(afterSemi, "#") {
+			trimmed = trimmed[:hashIdx]
+		}
+	}
 	trimmed = strings.TrimSuffix(trimmed, ";")
 	trimmed = strings.TrimSpace(trimmed)
 	if strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")") {
@@ -3407,6 +3470,145 @@ func formatMySQLError(err error) string {
 		return fmt.Sprintf("ERROR %s: %s", m[2], m[3])
 	}
 	return "ERROR HY000: " + msg
+}
+
+// extractMySQLErrorCode extracts the MySQL error code (integer) from an error string.
+// Returns 0 if no code found.
+func extractMySQLErrorCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	msg := err.Error()
+	re := regexp.MustCompile(`Error (\d+) \(`)
+	if m := re.FindStringSubmatch(msg); m != nil {
+		if code, e := strconv.Atoi(m[1]); e == nil {
+			return code
+		}
+	}
+	return 0
+}
+
+// mysqlErrorCodeToName maps MySQL error codes to their symbolic names.
+var mysqlErrorCodeToName = map[int]string{
+	1022: "ER_DUP_KEY",
+	1036: "ER_OPEN_AS_READONLY",
+	1040: "ER_CON_COUNT_ERROR",
+	1045: "ER_ACCESS_DENIED_ERROR",
+	1046: "ER_NO_DB_ERROR",
+	1048: "ER_BAD_NULL_ERROR",
+	1049: "ER_BAD_DB_ERROR",
+	1050: "ER_TABLE_EXISTS_ERROR",
+	1051: "ER_BAD_TABLE_ERROR",
+	1054: "ER_BAD_FIELD_ERROR",
+	1062: "ER_DUP_ENTRY",
+	1064: "ER_PARSE_ERROR",
+	1065: "ER_EMPTY_QUERY",
+	1067: "ER_INVALID_DEFAULT",
+	1075: "ER_WRONG_AUTO_KEY",
+	1086: "ER_FILE_EXISTS_ERROR",
+	1100: "ER_TABLE_NOT_LOCKED",
+	1102: "ER_WRONG_DB_NAME",
+	1103: "ER_WRONG_TABLE_NAME",
+	1105: "ER_UNKNOWN_ERROR",
+	1106: "ER_UNKNOWN_PROCEDURE",
+	1109: "ER_UNKNOWN_TABLE",
+	1115: "ER_UNKNOWN_CHARACTER_SET",
+	1130: "ER_HOST_NOT_PRIVILEGED",
+	1131: "ER_PASSWORD_ANONYMOUS_USER",
+	1132: "ER_PASSWORD_NOT_ALLOWED",
+	1133: "ER_PASSWORD_NO_MATCH",
+	1136: "ER_WRONG_VALUE_COUNT_ON_ROW",
+	1139: "ER_REGEXP_ERROR",
+	1143: "ER_COLUMNACCESS_DENIED_ERROR",
+	1146: "ER_NO_SUCH_TABLE",
+	1147: "ER_NOT_ALLOWED_COMMAND",
+	1149: "ER_SYNTAX_ERROR",
+	1165: "ER_DELAYED_NOT_SUPPORTED",
+	1166: "ER_ILLEGAL_HA_CREATE_OPTION",
+	1172: "ER_TOO_MANY_ROWS",
+	1175: "ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE",
+	1176: "ER_KEY_DOES_NOT_EXITS",
+	1192: "ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION",
+	1193: "ER_UNKNOWN_SYSTEM_VARIABLE",
+	1201: "ER_SLAVE_MUST_STOP",
+	1203: "ER_TOO_MANY_USER_CONNECTIONS",
+	1205: "ER_LOCK_WAIT_TIMEOUT",
+	1213: "ER_LOCK_DEADLOCK",
+	1214: "ER_TABLE_CANT_HANDLE_FT",
+	1215: "ER_CANNOT_ADD_FOREIGN",
+	1216: "ER_NO_REFERENCED_ROW",
+	1217: "ER_ROW_IS_REFERENCED",
+	1227: "ER_SPECIFIC_ACCESS_DENIED_ERROR",
+	1231: "ER_WRONG_VALUE_FOR_VAR",
+	1232: "ER_WRONG_TYPE_FOR_VAR",
+	1235: "ER_NOT_SUPPORTED_YET",
+	1242: "ER_SUBQUERY_NO_1_ROW",
+	1243: "ER_UNKNOWN_STMT_HANDLER",
+	1249: "ER_VIEW_SELECT_DERIVED",
+	1250: "ER_VIEW_SELECT_CLAUSE",
+	1251: "ER_VIEW_SELECT_VARIABLE",
+	1252: "ER_VIEW_SELECT_TMPTABLE",
+	1253: "ER_VIEW_WRONG_LIST",
+	1264: "ER_WARN_DATA_OUT_OF_RANGE",
+	1265: "ER_WARN_DATA_TRUNCATED",
+	1267: "ER_INCOMPATIBLE_FRM",
+	1273: "ER_UNKNOWN_COLLATION",
+	1280: "ER_KEY_COLUMN_DOES_NOT_EXITS",
+	1286: "ER_UNKNOWN_STORAGE_ENGINE",
+	1288: "ER_NON_UPDATABLE_TABLE",
+	1290: "ER_OPTION_PREVENTS_STATEMENT",
+	1292: "ER_TRUNCATED_WRONG_VALUE",
+	1293: "ER_INVALID_DEFAULT",
+	1296: "ER_GET_ERRNO",
+	1300: "ER_INVALID_CHARACTER_STRING",
+	1303: "ER_SP_NO_RECURSIVE_CREATE",
+	1304: "ER_SP_ALREADY_EXISTS",
+	1305: "ER_SP_DOES_NOT_EXIST",
+	1317: "ER_QUERY_INTERRUPTED",
+	1318: "ER_SP_WRONG_NO_OF_ARGS",
+	1320: "ER_SP_FETCH_NO_DATA",
+	1321: "ER_SP_UNINITIALIZED_VAR",
+	1322: "ER_SP_VARCOND_AFTER_CURSORDEF",
+	1323: "ER_SP_CURSOR_AFTER_HANDLER",
+	1324: "ER_SP_CURSOR_MISMATCH",
+	1325: "ER_SP_CURSOR_ALREADY_OPEN",
+	1326: "ER_SP_CURSOR_NOT_OPEN",
+	1327: "ER_SP_UNDECLARED_VAR",
+	1329: "ER_SP_FETCH_NO_DATA",
+	1331: "ER_USER_LIMIT_REACHED",
+	1336: "ER_SP_NO_USE",
+	1337: "ER_SP_COND_MISMATCH",
+	1338: "ER_SP_NORETURN",
+	1339: "ER_SP_NORETURNEND",
+	1340: "ER_SP_BAD_CURSOR_QUERY",
+	1341: "ER_SP_BAD_CURSOR_SELECT",
+	1342: "ER_SP_CURSOR_MISMATCH",
+	1343: "ER_SP_CURSOR_ALREADY_OPEN",
+	1344: "ER_SP_CURSOR_NOT_OPEN",
+	1345: "ER_SP_UNDECLARED_VAR",
+	1346: "ER_SP_WRONG_NO_OF_FETCH_ARGS",
+	1347: "ER_SP_FETCH_NO_DATA",
+	1348: "ER_SP_SELECT_CHANGED",
+	1350: "ER_SP_BAD_EXCEPTION_MODE",
+	1351: "ER_SP_NO_RECURSIVE_CREATE",
+	1363: "ER_ROW_IS_REFERENCED_2",
+	1364: "ER_NO_DEFAULT_FOR_FIELD",
+	1365: "ER_DIVISION_BY_ZERO",
+	1366: "ER_TRUNCATED_WRONG_VALUE_FOR_FIELD",
+	1390: "ER_PS_MANY_PARAM",
+	1406: "ER_DATA_TOO_LONG",
+	1407: "ER_WRONG_VALUE_FOR_TYPE",
+	1408: "ER_TABLE_CANT_HANDLE_SPKEYS",
+	1414: "ER_TOO_MANY_CONCURRENT_TRXS",
+	1418: "ER_BINLOG_UNSAFE_ROUTINE",
+	1436: "ER_STACK_OVERRUN_NEED_MORE",
+	1438: "ER_XAER_OUTSIDE",
+	1451: "ER_ROW_IS_REFERENCED_2",
+	1452: "ER_NO_REFERENCED_ROW_2",
+	1461: "ER_MAX_PREPARED_STMT_COUNT_REACHED",
+	1463: "ER_FIELD_IN_ORDER_NOT_SELECT",
+	1465: "ER_DUP_LIST_ENTRY",
+	1467: "ER_AUTOINC_READ_FAILED",
 }
 
 // mysqlCodeToSQLState maps a MySQL error code to its SQLSTATE.

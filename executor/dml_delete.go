@@ -105,10 +105,21 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 	}
 
 	// Resolve views: if tableName is a view, replace with the underlying base table.
-	if baseTable, isView, err := e.resolveViewToBaseTable(tableName); err != nil {
+	// Also collect the view's WHERE condition to merge with the DELETE's WHERE.
+	var viewWhereExpr sqlparser.Expr
+	if baseTable, isView, viewWhere, err := e.resolveViewToBaseTable(tableName); err != nil {
 		return nil, err
 	} else if isView {
 		tableName = baseTable
+		viewWhereExpr = viewWhere
+	}
+	// Merge view's WHERE condition into the DELETE's WHERE clause.
+	if viewWhereExpr != nil {
+		if stmt.Where == nil {
+			stmt.Where = &sqlparser.Where{Type: sqlparser.WhereClause, Expr: viewWhereExpr}
+		} else {
+			stmt.Where.Expr = &sqlparser.AndExpr{Left: viewWhereExpr, Right: stmt.Where.Expr}
+		}
 	}
 
 	// Handle performance_schema tables
@@ -234,13 +245,24 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		}
 
 		// Enforce FOREIGN KEY constraints for rows being deleted
+		fkViolated := map[int]bool{}
 		for idx := range deleteSet {
 			tbl.Unlock()
 			if fkErr := e.checkForeignKeyOnDelete(deleteDB, tableName, tbl.Rows[idx]); fkErr != nil {
 				tbl.Lock()
-				return nil, fkErr
+				if bool(stmt.Ignore) {
+					// DELETE IGNORE: add warning, skip this row
+					errCode := 1451
+					msg := strings.TrimPrefix(fkErr.Error(), "ERROR 1451 (23000): ")
+					e.addWarning("Warning", errCode, msg)
+					delete(deleteSet, idx)
+					fkViolated[idx] = true
+				} else {
+					return nil, fkErr
+				}
+			} else {
+				tbl.Lock()
 			}
-			tbl.Lock()
 		}
 
 		newRows := make([]storage.Row, 0, len(tbl.Rows)-len(deleteSet))
@@ -311,6 +333,14 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 			tbl.Unlock()
 			if err := e.checkForeignKeyOnDelete(deleteDB, tableName, row); err != nil {
 				tbl.Lock()
+				if bool(stmt.Ignore) {
+					// DELETE IGNORE: add warning, skip this row (don't delete it)
+					errCode := 1451
+					msg := strings.TrimPrefix(err.Error(), "ERROR 1451 (23000): ")
+					e.addWarning("Warning", errCode, msg)
+					newRows = append(newRows, row)
+					continue
+				}
 				return nil, err
 			}
 			tbl.Lock()

@@ -42,6 +42,26 @@ func containsWindowFunc(expr sqlparser.Expr) bool {
 		return v.OverClause != nil
 	case *sqlparser.Max:
 		return v.OverClause != nil
+	case *sqlparser.Variance:
+		return v.OverClause != nil
+	case *sqlparser.VarPop:
+		return v.OverClause != nil
+	case *sqlparser.VarSamp:
+		return v.OverClause != nil
+	case *sqlparser.Std:
+		return v.OverClause != nil
+	case *sqlparser.StdDev:
+		return v.OverClause != nil
+	case *sqlparser.StdPop:
+		return v.OverClause != nil
+	case *sqlparser.StdSamp:
+		return v.OverClause != nil
+	case *sqlparser.BitAnd:
+		return v.OverClause != nil
+	case *sqlparser.BitOr:
+		return v.OverClause != nil
+	case *sqlparser.BitXor:
+		return v.OverClause != nil
 	case *sqlparser.BinaryExpr:
 		return containsWindowFunc(v.Left) || containsWindowFunc(v.Right)
 	case *sqlparser.UnaryExpr:
@@ -90,6 +110,20 @@ func isWindowAggregateExpr(expr sqlparser.Expr) bool {
 		return v.OverClause != nil
 	case *sqlparser.BitXor:
 		return v.OverClause != nil
+	case *sqlparser.Variance:
+		return v.OverClause != nil
+	case *sqlparser.VarPop:
+		return v.OverClause != nil
+	case *sqlparser.VarSamp:
+		return v.OverClause != nil
+	case *sqlparser.Std:
+		return v.OverClause != nil
+	case *sqlparser.StdDev:
+		return v.OverClause != nil
+	case *sqlparser.StdPop:
+		return v.OverClause != nil
+	case *sqlparser.StdSamp:
+		return v.OverClause != nil
 	}
 	return false
 }
@@ -132,6 +166,26 @@ func getOverClause(expr sqlparser.Expr) *sqlparser.OverClause {
 	case *sqlparser.Min:
 		return v.OverClause
 	case *sqlparser.Max:
+		return v.OverClause
+	case *sqlparser.Variance:
+		return v.OverClause
+	case *sqlparser.VarPop:
+		return v.OverClause
+	case *sqlparser.VarSamp:
+		return v.OverClause
+	case *sqlparser.Std:
+		return v.OverClause
+	case *sqlparser.StdDev:
+		return v.OverClause
+	case *sqlparser.StdPop:
+		return v.OverClause
+	case *sqlparser.StdSamp:
+		return v.OverClause
+	case *sqlparser.BitAnd:
+		return v.OverClause
+	case *sqlparser.BitOr:
+		return v.OverClause
+	case *sqlparser.BitXor:
 		return v.OverClause
 	}
 	return nil
@@ -316,6 +370,39 @@ func evalFrameOffset(expr sqlparser.Expr, e *Executor) int {
 	return int(toInt64(val))
 }
 
+// resolveNamedWindows resolves named window references (OVER w) by looking up the named window
+// definitions from the WINDOW clause and replacing the OverClause.WindowName with the full spec.
+// This handles both single and multiple named windows.
+func resolveNamedWindows(winFuncs []windowFuncInfo, namedWindows sqlparser.NamedWindows) []windowFuncInfo {
+	if len(namedWindows) == 0 {
+		return winFuncs
+	}
+	// Build map of name -> WindowSpecification
+	windowMap := make(map[string]*sqlparser.WindowSpecification)
+	for _, nw := range namedWindows {
+		for _, wdef := range nw.Windows {
+			windowMap[wdef.Name.Lowered()] = wdef.WindowSpec
+		}
+	}
+	if len(windowMap) == 0 {
+		return winFuncs
+	}
+	resolved := make([]windowFuncInfo, len(winFuncs))
+	for i, wf := range winFuncs {
+		resolved[i] = wf
+		if wf.overClause != nil && !wf.overClause.WindowName.IsEmpty() && wf.overClause.WindowSpec == nil {
+			name := wf.overClause.WindowName.Lowered()
+			if spec, ok := windowMap[name]; ok {
+				// Create a new OverClause with the resolved WindowSpec
+				resolved[i].overClause = &sqlparser.OverClause{
+					WindowSpec: spec,
+				}
+			}
+		}
+	}
+	return resolved
+}
+
 // processWindowFunctions computes window function values for all rows.
 // It modifies resultRows in-place, replacing stub values with correct window function results.
 func (e *Executor) processWindowFunctions(
@@ -323,10 +410,23 @@ func (e *Executor) processWindowFunctions(
 	allRows []storage.Row,
 	resultRows [][]interface{},
 ) error {
+	return e.processWindowFunctionsWithNamedWindows(colExprs, allRows, resultRows, nil)
+}
+
+// processWindowFunctionsWithNamedWindows computes window function values with named window support.
+func (e *Executor) processWindowFunctionsWithNamedWindows(
+	colExprs []sqlparser.Expr,
+	allRows []storage.Row,
+	resultRows [][]interface{},
+	namedWindows sqlparser.NamedWindows,
+) error {
 	winFuncs := findWindowFuncs(colExprs)
 	if len(winFuncs) == 0 {
 		return nil
 	}
+
+	// Resolve named window references (OVER w) to their full window specifications
+	winFuncs = resolveNamedWindows(winFuncs, namedWindows)
 
 	for _, wf := range winFuncs {
 		if err := e.computeWindowFunc(wf, allRows, resultRows); err != nil {
@@ -476,6 +576,9 @@ func (e *Executor) evalWindowFuncForRow(
 		if err != nil {
 			return nil, err
 		}
+		if nVal == nil {
+			return nil, nil
+		}
 		buckets := toInt64(nVal)
 		if buckets <= 0 {
 			return nil, fmt.Errorf("NTILE argument must be positive")
@@ -555,6 +658,9 @@ func (e *Executor) evalWindowFuncForRow(
 		nVal, err := e.evalExpr(v.N)
 		if err != nil {
 			return nil, err
+		}
+		if nVal == nil {
+			return nil, nil
 		}
 		nth := int(toInt64(nVal))
 		if nth <= 0 {
@@ -686,6 +792,206 @@ func (e *Executor) evalWindowFuncForRow(
 			}
 		}
 		return maxVal, nil
+
+	case *sqlparser.Variance, *sqlparser.VarPop:
+		// VAR_POP / VARIANCE: population variance = sum((x-mean)^2) / n
+		var arg sqlparser.Expr
+		switch vv := v.(type) {
+		case *sqlparser.Variance:
+			arg = vv.Arg
+		case *sqlparser.VarPop:
+			arg = vv.Arg
+		}
+		start, end := e.computeFrameBounds(ws.FrameClause, ws.OrderClause, partRows, localIdx, orderByVals)
+		if start < 0 {
+			start = 0
+		}
+		if end >= n {
+			end = n - 1
+		}
+		var vals []float64
+		for i := start; i <= end; i++ {
+			val, _ := e.evalRowExpr(arg, partRows[i])
+			if val != nil {
+				vals = append(vals, windowToFloat64(val))
+			}
+		}
+		if len(vals) == 0 {
+			return nil, nil
+		}
+		mean := 0.0
+		for _, x := range vals {
+			mean += x
+		}
+		mean /= float64(len(vals))
+		variance := 0.0
+		for _, x := range vals {
+			d := x - mean
+			variance += d * d
+		}
+		variance /= float64(len(vals))
+		return variance, nil
+
+	case *sqlparser.VarSamp:
+		// VAR_SAMP: sample variance = sum((x-mean)^2) / (n-1)
+		start, end := e.computeFrameBounds(ws.FrameClause, ws.OrderClause, partRows, localIdx, orderByVals)
+		if start < 0 {
+			start = 0
+		}
+		if end >= n {
+			end = n - 1
+		}
+		var vals []float64
+		for i := start; i <= end; i++ {
+			val, _ := e.evalRowExpr(v.Arg, partRows[i])
+			if val != nil {
+				vals = append(vals, windowToFloat64(val))
+			}
+		}
+		if len(vals) < 2 {
+			return nil, nil
+		}
+		mean := 0.0
+		for _, x := range vals {
+			mean += x
+		}
+		mean /= float64(len(vals))
+		variance := 0.0
+		for _, x := range vals {
+			d := x - mean
+			variance += d * d
+		}
+		variance /= float64(len(vals) - 1)
+		return variance, nil
+
+	case *sqlparser.Std, *sqlparser.StdDev, *sqlparser.StdPop:
+		// STDDEV_POP / STD / STDDEV: sqrt(VAR_POP)
+		var arg sqlparser.Expr
+		switch vv := v.(type) {
+		case *sqlparser.Std:
+			arg = vv.Arg
+		case *sqlparser.StdDev:
+			arg = vv.Arg
+		case *sqlparser.StdPop:
+			arg = vv.Arg
+		}
+		start, end := e.computeFrameBounds(ws.FrameClause, ws.OrderClause, partRows, localIdx, orderByVals)
+		if start < 0 {
+			start = 0
+		}
+		if end >= n {
+			end = n - 1
+		}
+		var vals []float64
+		for i := start; i <= end; i++ {
+			val, _ := e.evalRowExpr(arg, partRows[i])
+			if val != nil {
+				vals = append(vals, windowToFloat64(val))
+			}
+		}
+		if len(vals) == 0 {
+			return nil, nil
+		}
+		mean := 0.0
+		for _, x := range vals {
+			mean += x
+		}
+		mean /= float64(len(vals))
+		variance := 0.0
+		for _, x := range vals {
+			d := x - mean
+			variance += d * d
+		}
+		variance /= float64(len(vals))
+		return math.Sqrt(variance), nil
+
+	case *sqlparser.StdSamp:
+		// STDDEV_SAMP: sqrt(VAR_SAMP)
+		start, end := e.computeFrameBounds(ws.FrameClause, ws.OrderClause, partRows, localIdx, orderByVals)
+		if start < 0 {
+			start = 0
+		}
+		if end >= n {
+			end = n - 1
+		}
+		var vals []float64
+		for i := start; i <= end; i++ {
+			val, _ := e.evalRowExpr(v.Arg, partRows[i])
+			if val != nil {
+				vals = append(vals, windowToFloat64(val))
+			}
+		}
+		if len(vals) < 2 {
+			return nil, nil
+		}
+		mean := 0.0
+		for _, x := range vals {
+			mean += x
+		}
+		mean /= float64(len(vals))
+		variance := 0.0
+		for _, x := range vals {
+			d := x - mean
+			variance += d * d
+		}
+		variance /= float64(len(vals) - 1)
+		return math.Sqrt(variance), nil
+
+	case *sqlparser.BitAnd:
+		start, end := e.computeFrameBounds(ws.FrameClause, ws.OrderClause, partRows, localIdx, orderByVals)
+		if start < 0 {
+			start = 0
+		}
+		if end >= n {
+			end = n - 1
+		}
+		result := ^uint64(0) // 18446744073709551615 (all bits set)
+		hasValue := false
+		for i := start; i <= end; i++ {
+			val, _ := e.evalRowExpr(v.Arg, partRows[i])
+			if val != nil {
+				result &= toUint64ForBitOp(val)
+				hasValue = true
+			}
+		}
+		if !hasValue {
+			return uint64(^uint64(0)), nil
+		}
+		return result, nil
+
+	case *sqlparser.BitOr:
+		start, end := e.computeFrameBounds(ws.FrameClause, ws.OrderClause, partRows, localIdx, orderByVals)
+		if start < 0 {
+			start = 0
+		}
+		if end >= n {
+			end = n - 1
+		}
+		result := uint64(0)
+		for i := start; i <= end; i++ {
+			val, _ := e.evalRowExpr(v.Arg, partRows[i])
+			if val != nil {
+				result |= toUint64ForBitOp(val)
+			}
+		}
+		return result, nil
+
+	case *sqlparser.BitXor:
+		start, end := e.computeFrameBounds(ws.FrameClause, ws.OrderClause, partRows, localIdx, orderByVals)
+		if start < 0 {
+			start = 0
+		}
+		if end >= n {
+			end = n - 1
+		}
+		result := uint64(0)
+		for i := start; i <= end; i++ {
+			val, _ := e.evalRowExpr(v.Arg, partRows[i])
+			if val != nil {
+				result ^= toUint64ForBitOp(val)
+			}
+		}
+		return result, nil
 	}
 
 	return nil, nil

@@ -148,7 +148,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	// Also capture any WITH CHECK OPTION condition for enforcement.
 	originalViewName := tableName
 	var viewCheckExpr sqlparser.Expr
-	if baseTable, isView, err := e.resolveViewToBaseTable(tableName); err != nil {
+	if baseTable, isView, _, err := e.resolveViewToBaseTable(tableName); err != nil {
 		return nil, err
 	} else if isView {
 		viewCheckExpr = e.getViewCheckCondition(originalViewName)
@@ -210,10 +210,23 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		e.nextInsertID = 0
 	}
 
-	// Get column names
+	// Get column names and normalize them to match the table def's column names
+	// (SQL column names may differ in case from the table definition, e.g. SET A=NULL vs col.Name="a")
 	colNames := make([]string, len(stmt.Columns))
 	for i, col := range stmt.Columns {
 		colNames[i] = col.String()
+	}
+	// Normalize column names to match actual table column names (case-insensitive lookup)
+	if len(colNames) > 0 {
+		colNameByLower := make(map[string]string, len(tbl.Def.Columns))
+		for _, col := range tbl.Def.Columns {
+			colNameByLower[strings.ToLower(col.Name)] = col.Name
+		}
+		for i, cn := range colNames {
+			if actual, ok := colNameByLower[strings.ToLower(cn)]; ok {
+				colNames[i] = actual
+			}
+		}
 	}
 
 	// If no columns specified, use all columns from table def
@@ -471,9 +484,45 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			return result, nil
 		}
 		// Fall through to slow path
+		// Build defaults map from source SELECT tables for DEFAULT(col) support in ON DUPLICATE KEY UPDATE.
+		if len(stmt.OnDup) > 0 {
+			sourceDefaults := make(map[string]interface{})
+			// Walk the FROM clause to find source table names
+			for _, tableExpr := range sel.From {
+				var srcTableName string
+				switch te := tableExpr.(type) {
+				case *sqlparser.AliasedTableExpr:
+					if tname, ok := te.Expr.(sqlparser.TableName); ok {
+						srcTableName = tname.Name.String()
+					}
+				}
+				if srcTableName == "" {
+					continue
+				}
+				if srcDB, dbErr := e.Catalog.GetDatabase(e.CurrentDB); dbErr == nil {
+					if srcDef, tblErr := srcDB.GetTable(srcTableName); tblErr == nil {
+						for _, col := range srcDef.Columns {
+							colKey := strings.ToLower(col.Name)
+							if col.Default != nil {
+								sourceDefaults[colKey] = *col.Default
+							} else {
+								sourceDefaults[colKey] = nil
+							}
+						}
+					}
+				}
+			}
+			if len(sourceDefaults) > 0 {
+				prevDefaultsByColName := e.defaultsByColName
+				e.defaultsByColName = sourceDefaults
+				defer func() { e.defaultsByColName = prevDefaultsByColName }()
+			}
+		}
 		// Check for ambiguous column references in ON DUPLICATE KEY UPDATE expressions.
 		// MySQL error 1052: if an unqualified column name in the ODKU clause exists in
-		// both the SELECT source result columns AND the target table columns.
+		// both the SELECT source result columns AND the target table columns, AND the
+		// expression also contains a table-qualified reference to the source table.
+		// If the ODKU expression only has unqualified references, they refer to the target table.
 		if len(stmt.OnDup) > 0 {
 			sourceColSet := make(map[string]bool, len(selResult.Columns))
 			for _, sc := range selResult.Columns {
@@ -484,6 +533,21 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				targetColSet[strings.ToLower(tc.Name)] = true
 			}
 			for _, upd := range stmt.OnDup {
+				// Check if the expression contains ANY table-qualified column reference.
+				// If it does, then unqualified columns that exist in both source and target are ambiguous.
+				hasQualifiedSourceRef := false
+				_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+					if colName, ok := node.(*sqlparser.ColName); ok {
+						if !colName.Qualifier.IsEmpty() && !strings.EqualFold(colName.Qualifier.Name.String(), tableName) {
+							hasQualifiedSourceRef = true
+							return false, nil
+						}
+					}
+					return true, nil
+				}, upd.Expr)
+				if !hasQualifiedSourceRef {
+					continue
+				}
 				// Collect all unqualified column references in the update expression
 				if walkErr := sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
 					if colName, ok := node.(*sqlparser.ColName); ok {
@@ -867,12 +931,15 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				e.onDupValuesRow = row
 				prevCorrelatedRow := e.correlatedRow
 				e.correlatedRow = odduSnap
+				prevDefaultsTableDef := e.defaultsTableDef
+				e.defaultsTableDef = tbl.Def
 				for _, upd := range stmt.OnDup {
 					colName := upd.Name.Name.String()
 					val, err := e.evalExpr(upd.Expr)
 					if err != nil {
 						e.onDupValuesRow = prevOnDupValuesRow
 						e.correlatedRow = prevCorrelatedRow
+						e.defaultsTableDef = prevDefaultsTableDef
 						tbl.Unlock()
 						return nil, err
 					}
@@ -887,6 +954,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				}
 				e.onDupValuesRow = prevOnDupValuesRow
 				e.correlatedRow = prevCorrelatedRow
+				e.defaultsTableDef = prevDefaultsTableDef
 				// Recompute generated columns after ON DUPLICATE KEY UPDATE
 				for _, col := range tbl.Def.Columns {
 					if isGeneratedColumnType(col.Type) {
@@ -1058,13 +1126,18 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 		}
 
-		// REPLACE: delete existing duplicate row (after BEFORE INSERT, before actual insert)
-		// We track the position of the deleted row so we can reinsert at the same slot,
+		// REPLACE: delete ALL existing duplicate rows (after BEFORE INSERT, before actual insert)
+		// MySQL REPLACE deletes every row that conflicts on any unique/primary key with the
+		// new row, then inserts the new row. We loop until no more duplicates remain.
+		// We track the position of the first deleted row so we can reinsert at the same slot,
 		// preserving MySQL's physical row ordering behavior.
 		replaceAtIdx := -1
 		if stmt.Action == sqlparser.ReplaceAct {
-			dupIdx := e.findDuplicateRow(tbl, row, pkCols, uniqueCols)
-			if dupIdx >= 0 {
+			for {
+				dupIdx := e.findDuplicateRow(tbl, row, pkCols, uniqueCols)
+				if dupIdx < 0 {
+					break
+				}
 				tbl.Mu.RLock()
 				oldRow := make(storage.Row, len(tbl.Rows[dupIdx]))
 				for k, v := range tbl.Rows[dupIdx] {
@@ -1081,8 +1154,12 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				tbl.Rows = append(tbl.Rows[:dupIdx], tbl.Rows[dupIdx+1:]...)
 				tbl.InvalidateIndexes()
 				tbl.Unlock()
-				affected++ // REPLACE counts deleted row + inserted row = 2
-				replaceAtIdx = dupIdx // remember position for reinsertion
+				affected++ // REPLACE counts each deleted row
+				if replaceAtIdx < 0 {
+					replaceAtIdx = dupIdx // remember position of first deleted row for reinsertion
+				} else if dupIdx < replaceAtIdx {
+					replaceAtIdx = dupIdx // track earliest position
+				}
 
 				// Fire AFTER DELETE trigger
 				if err := e.fireTriggers(tableName, "AFTER", "DELETE", nil, oldRow); err != nil {
@@ -1210,21 +1287,23 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					}
 					// String length check (use original value before padding/formatting)
 					isCharType := strings.Contains(colUpper, "CHAR") || strings.Contains(colUpper, "BINARY")
-					if isCharType {
+					isBlobType := colUpper == "BLOB" || colUpper == "TINYBLOB" || colUpper == "MEDIUMBLOB" || colUpper == "LONGBLOB"
+					isTextType := colUpper == "TEXT" || colUpper == "TINYTEXT" || colUpper == "MEDIUMTEXT" || colUpper == "LONGTEXT"
+					if isCharType || isBlobType || isTextType {
 						checkVal := rv
 						if ov, ok := origValues[col.Name]; ok && ov != nil {
 							checkVal = ov
 						}
 						// For BINARY/VARBINARY columns, convert integer hex literals to bytes
-						isBinaryColType := strings.Contains(colUpper, "BINARY")
-						if isBinaryColType {
+						isBinaryColType := strings.Contains(colUpper, "BINARY") || isBlobType
+						if strings.Contains(colUpper, "BINARY") {
 							if converted := hexIntToBytes(checkVal); converted != checkVal {
 								checkVal = converted
 							}
 						}
 						if sv, ok := checkVal.(string); ok {
 							maxLen := extractCharLength(col.Type)
-							// For binary columns, use byte length (not rune length)
+							// For binary/blob columns, use byte length (not rune length)
 							var svLen int
 							if isBinaryColType {
 								svLen = len(sv)
@@ -1424,14 +1503,24 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 
 		// Enforce CHECK constraints
 		if tbl.Def != nil && len(tbl.Def.CheckConstraints) > 0 {
+			checkViolated := false
 			for _, cc := range tbl.Def.CheckConstraints {
 				checkResult, err := e.evaluateCheckConstraint(cc.Expr, row)
 				if err != nil {
 					continue // if we can't evaluate, skip
 				}
 				if !checkResult {
+					if bool(stmt.Ignore) {
+						// INSERT IGNORE: add warning and skip this row
+						e.addWarning("Warning", 3819, fmt.Sprintf("Check constraint '%s' is violated.", cc.Name))
+						checkViolated = true
+						break
+					}
 					return nil, mysqlError(3819, "HY000", fmt.Sprintf("Check constraint '%s' is violated.", cc.Name))
 				}
+			}
+			if checkViolated {
+				continue
 			}
 		}
 
@@ -1753,12 +1842,9 @@ func (e *Executor) populateGeneratedColumns(row storage.Row, cols []catalog.Colu
 		if expr == "" {
 			continue
 		}
-		// Always evaluate the generated column expression, even if the key
-		// already exists with a nil value (e.g., DEFAULT was specified).
-		// Only skip if a non-nil value was explicitly provided.
-		if val, exists := row[col.Name]; exists && val != nil {
-			continue
-		}
+		// Always re-evaluate generated column expressions (virtual or stored).
+		// The expression result must override any implicit zero value that was
+		// set when processing the DEFAULT keyword for this column.
 		v, err := e.evalGeneratedColumnExpr(expr, row)
 		if err != nil {
 			return err

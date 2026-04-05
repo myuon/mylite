@@ -1798,7 +1798,7 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 
 	// Apply window functions (ROW_NUMBER, RANK, LAG, SUM OVER, etc.)
 	if selectExprsHaveWindowFuncs(stmt.SelectExprs.Exprs) {
-		if err := e.processWindowFunctions(colExprs, allRows, resultRows); err != nil {
+		if err := e.processWindowFunctionsWithNamedWindows(colExprs, allRows, resultRows, stmt.Windows); err != nil {
 			return nil, err
 		}
 	}
@@ -2306,6 +2306,20 @@ func containsAggregate(expr sqlparser.Expr) bool {
 		return true
 	}
 	switch v := expr.(type) {
+	case *sqlparser.AssignmentExpr:
+		return containsAggregate(v.Right)
+	case *sqlparser.SubstrExpr:
+		return containsAggregate(v.Name) || containsAggregate(v.From) || containsAggregate(v.To)
+	case *sqlparser.ConvertExpr:
+		return containsAggregate(v.Expr)
+	case *sqlparser.ConvertUsingExpr:
+		return containsAggregate(v.Expr)
+	case *sqlparser.IsExpr:
+		return containsAggregate(v.Left)
+	case *sqlparser.UnaryExpr:
+		return containsAggregate(v.Expr)
+	case *sqlparser.IntervalDateExpr:
+		return containsAggregate(v.Date) || containsAggregate(v.Interval)
 	case *sqlparser.ComparisonExpr:
 		return containsAggregate(v.Left) || containsAggregate(v.Right)
 	case *sqlparser.BinaryExpr:
@@ -2348,7 +2362,7 @@ func containsAggregate(expr sqlparser.Expr) bool {
 func aggregateDisplayName(expr sqlparser.Expr) string {
 	s := sqlparser.String(expr)
 	// Replace lowercase function names with uppercase
-	for _, fn := range []string{"count", "sum", "avg", "min", "max", "json_arrayagg", "json_objectagg", "bit_and", "bit_or", "bit_xor"} {
+	for _, fn := range []string{"count", "sum", "avg", "min", "max", "json_arrayagg", "json_objectagg", "bit_and", "bit_or", "bit_xor", "group_concat"} {
 		if strings.HasPrefix(s, fn+"(") {
 			s = strings.ToUpper(fn) + s[len(fn):]
 			break
@@ -2374,6 +2388,57 @@ func isAggregateExpr(expr sqlparser.Expr) bool {
 	return false
 }
 
+// collectWhereEqualityConstants finds columns constrained by equality to a constant in a WHERE expression.
+// For example, WHERE col = 1 AND col2 = 'foo' adds "col" and "col2" to the result map.
+func collectWhereEqualityConstants(expr sqlparser.Expr, result map[string]bool) {
+	if expr == nil {
+		return
+	}
+	switch e := expr.(type) {
+	case *sqlparser.AndExpr:
+		collectWhereEqualityConstants(e.Left, result)
+		collectWhereEqualityConstants(e.Right, result)
+	case *sqlparser.ComparisonExpr:
+		if e.Operator == sqlparser.EqualOp {
+			if col, ok := e.Left.(*sqlparser.ColName); ok {
+				if _, isLit := e.Right.(*sqlparser.Literal); isLit {
+					result[strings.ToLower(col.Name.String())] = true
+				}
+			}
+			if col, ok := e.Right.(*sqlparser.ColName); ok {
+				if _, isLit := e.Left.(*sqlparser.Literal); isLit {
+					result[strings.ToLower(col.Name.String())] = true
+				}
+			}
+		}
+	}
+}
+
+// collectColumnEqualities collects pairs of column names that are equated in an expression.
+// For example, "WHERE c1 = c2 AND a = b" adds pairs (c1,c2) and (a,b).
+// Used to detect functional dependency: if col1 is in GROUP BY and col1=col2, then col2 is also dependent.
+func collectColumnEqualities(expr sqlparser.Expr, pairs *[][2]string) {
+	if expr == nil {
+		return
+	}
+	switch e := expr.(type) {
+	case *sqlparser.AndExpr:
+		collectColumnEqualities(e.Left, pairs)
+		collectColumnEqualities(e.Right, pairs)
+	case *sqlparser.ComparisonExpr:
+		if e.Operator == sqlparser.EqualOp {
+			col1, ok1 := e.Left.(*sqlparser.ColName)
+			col2, ok2 := e.Right.(*sqlparser.ColName)
+			if ok1 && ok2 {
+				*pairs = append(*pairs, [2]string{
+					strings.ToLower(col1.Name.String()),
+					strings.ToLower(col2.Name.String()),
+				})
+			}
+		}
+	}
+}
+
 // execSelectGroupBy handles SELECT with GROUP BY or aggregate functions.
 func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.Row) (*Result, error) {
 	// ONLY_FULL_GROUP_BY: validate that non-aggregate SELECT expressions appear in GROUP BY.
@@ -2384,6 +2449,70 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 		for _, gbExpr := range stmt.GroupBy.Exprs {
 			if col, ok := gbExpr.(*sqlparser.ColName); ok {
 				groupByColSet[strings.ToLower(col.Name.String())] = true
+			}
+		}
+		// Build set of SELECT aliases (lowercase) that appear in GROUP BY
+		selectAliasSet := make(map[string]bool)
+		for _, selectExpr := range stmt.SelectExprs.Exprs {
+			if ae, ok := selectExpr.(*sqlparser.AliasedExpr); ok && !ae.As.IsEmpty() {
+				aliasLower := strings.ToLower(ae.As.String())
+				if groupByColSet[aliasLower] {
+					// Alias used in GROUP BY: add the underlying column to the set
+					if col, ok := ae.Expr.(*sqlparser.ColName); ok {
+						selectAliasSet[strings.ToLower(col.Name.String())] = true
+					}
+				}
+			}
+		}
+		for k, v := range selectAliasSet {
+			groupByColSet[k] = v
+		}
+		// Also handle GROUP BY with numeric positions (e.g., GROUP BY 1)
+		for _, gbExpr := range stmt.GroupBy.Exprs {
+			if lit, ok := gbExpr.(*sqlparser.Literal); ok && lit.Type == sqlparser.IntVal {
+				pos := int(toInt64(lit.Val))
+				if pos >= 1 && pos <= len(stmt.SelectExprs.Exprs) {
+					if ae, ok := stmt.SelectExprs.Exprs[pos-1].(*sqlparser.AliasedExpr); ok {
+						if col, ok := ae.Expr.(*sqlparser.ColName); ok {
+							groupByColSet[strings.ToLower(col.Name.String())] = true
+						}
+					}
+				}
+			}
+		}
+		// Build set of columns constrained by equality in WHERE clause (functionally dependent on constants)
+		whereConstantCols := make(map[string]bool)
+		if stmt.Where != nil {
+			collectWhereEqualityConstants(stmt.Where.Expr, whereConstantCols)
+		}
+		// Also collect column-to-column equalities from WHERE and JOIN ON conditions.
+		// If col1 is in GROUP BY and col1 = col2, then col2 is functionally dependent.
+		// Similarly, collect from JOIN ON conditions.
+		var colEqPairs [][2]string
+		if stmt.Where != nil {
+			collectColumnEqualities(stmt.Where.Expr, &colEqPairs)
+		}
+		// Collect JOIN ON equalities
+		for _, tableExpr := range stmt.From {
+			if joinExpr, ok := tableExpr.(*sqlparser.JoinTableExpr); ok {
+				if joinExpr.Condition != nil && joinExpr.Condition.On != nil {
+					collectColumnEqualities(joinExpr.Condition.On, &colEqPairs)
+				}
+			}
+		}
+		// Expand groupByColSet: if col1 is in groupByColSet and col1=col2, add col2
+		changed := true
+		for changed {
+			changed = false
+			for _, pair := range colEqPairs {
+				if groupByColSet[pair[0]] && !groupByColSet[pair[1]] {
+					groupByColSet[pair[1]] = true
+					changed = true
+				}
+				if groupByColSet[pair[1]] && !groupByColSet[pair[0]] {
+					groupByColSet[pair[0]] = true
+					changed = true
+				}
 			}
 		}
 		// Determine table name from FROM clause for error messages
@@ -2416,13 +2545,17 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 				continue
 			}
 			colNameLower := strings.ToLower(col.Name.String())
-			if !groupByColSet[colNameLower] {
-				// Not in GROUP BY — error
-				dbTable := e.CurrentDB + "." + tableName + "." + col.Name.String()
-				return nil, mysqlError(1055, "42000",
-					fmt.Sprintf("Expression #%d of SELECT list is not in GROUP BY clause and contains nonaggregated column '%s' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by",
-						i+1, dbTable))
+			if groupByColSet[colNameLower] {
+				continue // In GROUP BY — OK
 			}
+			if whereConstantCols[colNameLower] {
+				continue // Constrained by WHERE equality — functionally dependent
+			}
+			// Not in GROUP BY — error
+			dbTable := e.CurrentDB + "." + tableName + "." + col.Name.String()
+			return nil, mysqlError(1055, "42000",
+				fmt.Sprintf("Expression #%d of SELECT list is not in GROUP BY clause and contains nonaggregated column '%s' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by",
+					i+1, dbTable))
 		}
 	}
 
@@ -2485,6 +2618,21 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 				}
 			} else if colName, ok := se.Expr.(*sqlparser.ColName); ok {
 				colNames = append(colNames, colName.Name.String())
+			} else if lit, ok := se.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
+				// String literal in UNION context: MySQL uses the literal value (unquoted) as column name.
+				// We use the AST directly to avoid picking up the "UNION ..." suffix from rawExprs.
+				colNames = append(colNames, lit.Val)
+				rawExprIdx++
+				continue
+			} else if _, ok := se.Expr.(*sqlparser.IntervalDateExpr); ok {
+				// DATE_ADD/DATE_SUB with INTERVAL: MySQL normalizes to lowercase via Vitess String()
+				// e.g. DATE_ADD(JSON_ARRAYAGG(a), INTERVAL 31 DAY) -> date_add(JSON_ARRAYAGG(a),interval 31 day)
+				colName := sqlparser.String(se.Expr)
+				// But restore uppercase for known aggregate function names within the expression
+				for _, fn := range []string{"json_arrayagg", "json_objectagg", "count", "sum", "avg", "min", "max", "group_concat"} {
+					colName = strings.ReplaceAll(colName, fn+"(", strings.ToUpper(fn)+"(")
+				}
+				colNames = append(colNames, colName)
 			} else if rawExprIdx < len(rawExprs) {
 				raw := strings.TrimSpace(rawExprs[rawExprIdx])
 				if strings.Contains(strings.ToLower(raw), "@@") {
@@ -2497,6 +2645,13 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 					if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' && isSimpleStringLiteral(raw) {
 						raw = raw[1 : len(raw)-1]
 					}
+					// MySQL strips leading '+' from numeric literals in column headers
+					// e.g. SELECT +4294967296 has column name "4294967296" not "+4294967296"
+					if len(raw) > 1 && raw[0] == '+' && raw[1] >= '0' && raw[1] <= '9' {
+						raw = raw[1:]
+					}
+					// Normalize charset introducers (e.g. _utf8mb3 'x' → _utf8'x')
+					raw = normalizeCharsetIntroducers(raw)
 					// Preserve original query text for column name (MySQL behavior)
 					colNames = append(colNames, raw)
 				} else {
@@ -2808,15 +2963,25 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			return int64(len(groupRows)), nil
 		}
 		if e.Distinct {
-			// COUNT(DISTINCT expr) - count unique non-NULL values
+			// COUNT(DISTINCT expr[, expr...]) - count unique non-NULL combinations
+			// A row is skipped if ANY argument is NULL
 			seen := make(map[string]bool)
 			for _, row := range groupRows {
-				val, err := evalRowExpr(e.Args[0], row)
-				if err != nil {
-					return nil, err
+				var keyParts []string
+				anyNull := false
+				for _, arg := range e.Args {
+					val, err := evalRowExpr(arg, row)
+					if err != nil {
+						return nil, err
+					}
+					if val == nil {
+						anyNull = true
+						break
+					}
+					keyParts = append(keyParts, fmt.Sprintf("%v", val))
 				}
-				if val != nil {
-					key := fmt.Sprintf("%v", val)
+				if !anyNull {
+					key := strings.Join(keyParts, "\x00")
 					seen[key] = true
 				}
 			}
@@ -3436,6 +3601,43 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			return evalRowExpr(expr, syntheticRow)
 		}
 	}
+	// Handle @var:=agg(...) - variable assignment wrapping an aggregate
+	if assignExpr, ok := expr.(*sqlparser.AssignmentExpr); ok {
+		if containsAggregate(assignExpr.Right) {
+			aggVal, err := evalAggregateExpr(assignExpr.Right, groupRows, repRow, execCtx...)
+			if err != nil {
+				return nil, err
+			}
+			// Store in user variable if executor is available
+			if exec != nil {
+				varName := strings.TrimPrefix(sqlparser.String(assignExpr.Left), "@")
+				varName = strings.Trim(varName, "`")
+				if exec.userVars == nil {
+					exec.userVars = make(map[string]interface{})
+				}
+				exec.userVars[varName] = aggVal
+			}
+			return aggVal, nil
+		}
+	}
+	// Handle SubstrExpr (SUBSTRING) wrapping an aggregate
+	if substrExpr, ok := expr.(*sqlparser.SubstrExpr); ok && containsAggregate(expr) && exec != nil {
+		// Compute the Name (first argument) via evalAggregateExpr if it's an aggregate
+		nameVal, err := evalAggregateExpr(substrExpr.Name, groupRows, repRow, execCtx...)
+		if err != nil {
+			return nil, err
+		}
+		// Build a temporary SubstrExpr with the computed Name as a literal
+		var nameLit sqlparser.Expr
+		if nameVal == nil {
+			nameLit = &sqlparser.NullVal{}
+		} else {
+			nameLit = &sqlparser.Literal{Type: sqlparser.StrVal, Val: toString(nameVal)}
+		}
+		newSubstr := *substrExpr
+		newSubstr.Name = nameLit
+		return exec.evalSubstrExpr(&newSubstr)
+	}
 	// Handle ValTuple (nested ROW) in aggregate context: evaluate each element recursively
 	if tup, ok := expr.(sqlparser.ValTuple); ok {
 		vals := make([]interface{}, len(tup))
@@ -3448,7 +3650,17 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		}
 		return vals, nil
 	}
-	// Non-aggregate: return value from representative row
+	// Non-aggregate: return value from representative row.
+	// For user-defined functions (FuncExpr), use exec context if available so UDFs can be resolved.
+	if exec != nil {
+		if fe, ok := expr.(*sqlparser.FuncExpr); ok {
+			// Only use exec context for potential UDFs (not built-in functions)
+			qualifier := fe.Qualifier.String()
+			if result, err := exec.callUserDefinedFunction(strings.ToLower(fe.Name.String()), fe.Exprs, nil, qualifier); err == nil {
+				return result, nil
+			}
+		}
+	}
 	return evalRowExpr(expr, repRow)
 }
 
@@ -3640,6 +3852,10 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 			name := ""
 			if !se.As.IsEmpty() {
 				name = se.As.String()
+			} else if lit, ok := se.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
+				// String literal: use the value directly (unquoted), even if the raw expression
+				// includes "UNION ..." suffix (which happens when called from a UNION context).
+				name = lit.Val
 			} else if colName, ok := se.Expr.(*sqlparser.ColName); ok {
 				name = colName.Name.String()
 				// Case-insensitive column name resolution: if the row has a
@@ -3669,15 +3885,21 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 				}
 				if len(rows) == 0 {
 					// Even with no rows, resolve column name from table definition first.
-					// Skip for InnoDB IS tables which preserve user's column casing.
+					// Skip for InnoDB IS tables and performance_schema tables which preserve user's column casing.
 					isInnoDBISTable := false
+					isPSTable := false
 					for _, td := range tableDefs {
 						if td != nil && strings.HasPrefix(strings.ToLower(td.Name), "innodb_") {
 							isInnoDBISTable = true
 							break
 						}
+						if td != nil {
+							if _, ok := perfSchemaColumnOrder[strings.ToLower(td.Name)]; ok {
+								isPSTable = true
+							}
+						}
 					}
-					if !isInnoDBISTable {
+					if !isInnoDBISTable && !isPSTable {
 						resolved := false
 						upperName := strings.ToUpper(name)
 						for _, td := range tableDefs {
@@ -3695,9 +3917,13 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 								break
 							}
 						}
-						// Fall back to information_schema column names only if not resolved
+						// Fall back to information_schema column names only if not resolved.
+						// Skip performance_schema tables since they preserve user-specified casing.
 						if !resolved {
-							for _, order := range infoSchemaColumnOrder {
+							for tblKey, order := range infoSchemaColumnOrder {
+								if perfSchemaColumnOrder[tblKey] {
+									continue
+								}
 								for _, col := range order {
 									if col == upperName {
 										name = col
@@ -3726,6 +3952,10 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' && isSimpleStringLiteral(raw) {
 						raw = raw[1 : len(raw)-1]
 					}
+					// MySQL strips leading '+' from numeric literals in column headers
+					if len(raw) > 1 && raw[0] == '+' && raw[1] >= '0' && raw[1] <= '9' {
+						raw = raw[1:]
+					}
 					// MySQL displays j->'$.key' as JSON_EXTRACT(j,'$.key') in column headers
 					if arrowIdx := strings.Index(raw, "->>'"); arrowIdx >= 0 {
 						raw = "JSON_UNQUOTE(JSON_EXTRACT(" + raw[:arrowIdx] + "," + raw[arrowIdx+3:] + "))"
@@ -3744,6 +3974,8 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					case "null", "true", "false":
 						raw = strings.ToUpper(raw)
 					}
+					// Normalize charset introducers (e.g. _utf8mb3 'x' → _utf8'x')
+					raw = normalizeCharsetIntroducers(raw)
 					name = raw
 				}
 				if name == "" {
@@ -4242,12 +4474,22 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 			name := ""
 			if !se.As.IsEmpty() {
 				name = se.As.String()
+			} else if lit, ok := se.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
+				// String literal: use the value directly (unquoted), even if the raw expression
+				// includes "UNION ..." suffix (which happens when called from a UNION context).
+				name = lit.Val
 			} else if rawExprIdx < len(rawExprs) {
 				raw := strings.TrimSpace(rawExprs[rawExprIdx])
 				// MySQL displays string literal column headers without quotes
 				if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' {
 					raw = raw[1 : len(raw)-1]
 				}
+				// MySQL strips leading '+' from numeric literals in column headers
+				if len(raw) > 1 && raw[0] == '+' && raw[1] >= '0' && raw[1] <= '9' {
+					raw = raw[1:]
+				}
+				// Normalize charset introducers (e.g. _utf8mb3 'x' → _utf8'x')
+				raw = normalizeCharsetIntroducers(raw)
 				name = raw
 			} else {
 				name = normalizeSQLDisplayName(sqlparser.String(se.Expr))

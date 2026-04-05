@@ -159,9 +159,9 @@ func (e *Executor) execCreateDatabase(stmt *sqlparser.CreateDatabase) (*Result, 
 	for _, opt := range stmt.CreateOptions {
 		switch opt.Type {
 		case sqlparser.CharacterSetType:
-			charset = opt.Value
+			charset = strings.ToLower(strings.Trim(opt.Value, "'\""))
 		case sqlparser.CollateType:
-			collation = opt.Value
+			collation = strings.ToLower(strings.Trim(opt.Value, "'\""))
 		}
 	}
 	// If no explicit charset, use the session-level character_set_server
@@ -170,6 +170,14 @@ func (e *Executor) execCreateDatabase(stmt *sqlparser.CreateDatabase) (*Result, 
 			charset = csVal
 		}
 		// Fall through to catalog default (utf8mb4) if session value not set
+	}
+	// Validate charset name
+	if charset != "" && !isKnownCharset(charset) {
+		return nil, mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", charset))
+	}
+	// Validate collation name
+	if collation != "" && !isKnownCollation(collation) {
+		return nil, mysqlError(1273, "HY000", fmt.Sprintf("Unknown collation: '%s'", collation))
 	}
 	// Validate collation is compatible with charset (ER_COLLATION_CHARSET_MISMATCH = 1253)
 	if charset != "" && collation != "" {
@@ -219,13 +227,21 @@ func (e *Executor) execAlterDatabase(stmt *sqlparser.AlterDatabase) (*Result, er
 	for _, opt := range stmt.AlterOptions {
 		switch opt.Type {
 		case sqlparser.CharacterSetType:
-			db.CharacterSet = opt.Value
+			csVal := strings.ToLower(strings.Trim(opt.Value, "'\""))
+			if !isKnownCharset(csVal) {
+				return nil, mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", csVal))
+			}
+			db.CharacterSet = csVal
 			// Update collation to default for the new charset
-			db.CollationName = catalog.DefaultCollationForCharset(opt.Value)
+			db.CollationName = catalog.DefaultCollationForCharset(csVal)
 		case sqlparser.CollateType:
-			db.CollationName = opt.Value
+			collVal := strings.ToLower(strings.Trim(opt.Value, "'\""))
+			if !isKnownCollation(collVal) {
+				return nil, mysqlError(1273, "HY000", fmt.Sprintf("Unknown collation: '%s'", collVal))
+			}
+			db.CollationName = collVal
 			// Derive charset from collation name (e.g. "utf8_general_ci" -> "utf8")
-			parts := strings.SplitN(opt.Value, "_", 2)
+			parts := strings.SplitN(collVal, "_", 2)
 			if len(parts) > 0 {
 				db.CharacterSet = parts[0]
 			}
@@ -280,9 +296,11 @@ func (e *Executor) execCreateDatabaseRaw(query string) (*Result, error) {
 		afterCS = strings.TrimSpace(afterCS)
 		csFields := strings.Fields(afterCS)
 		if len(csFields) > 0 {
-			charset = strings.ToLower(csFields[0])
+			charset = strings.ToLower(strings.Trim(csFields[0], "'\""))
 		}
 	}
+	// Also check in original (non-uppercased) for COLLATE value quoting
+	fullOrig := strings.Join(fields[1:], " ")
 	collIdx := strings.Index(fullUpper, "COLLATE ")
 	if collIdx >= 0 {
 		afterColl := strings.TrimSpace(fullUpper[collIdx+len("COLLATE "):])
@@ -292,7 +310,26 @@ func (e *Executor) execCreateDatabaseRaw(query string) (*Result, error) {
 		afterColl = strings.TrimSpace(afterColl)
 		collFields := strings.Fields(afterColl)
 		if len(collFields) > 0 {
-			collation = strings.ToLower(collFields[0])
+			collVal := collFields[0]
+			// Check if the collation value is unquoted in the original query.
+			// In MySQL, certain reserved keywords (like 'binary') must be quoted when used as collation names.
+			origAfterColl := strings.TrimSpace(fullOrig[collIdx+len("COLLATE "):])
+			origAfterColl = strings.TrimPrefix(origAfterColl, "= ")
+			origAfterColl = strings.TrimPrefix(origAfterColl, "=")
+			origAfterColl = strings.TrimSpace(origAfterColl)
+			if len(origAfterColl) > 0 {
+				firstChar := origAfterColl[0]
+				if firstChar != '\'' && firstChar != '"' && firstChar != '`' {
+					// Unquoted collation name — check if it's a reserved keyword
+					reservedKeywords := map[string]bool{
+						"binary": true,
+					}
+					if reservedKeywords[strings.ToLower(strings.Fields(origAfterColl)[0])] {
+						return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'binary' at line 1"))
+					}
+				}
+			}
+			collation = strings.ToLower(strings.Trim(collVal, "'\""))
 		}
 	}
 
@@ -583,7 +620,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				}
 			}
 			selectSQL := sqlparser.String(stmt.Select)
-			result, err := e.execCreateTableSelect(tableName, selectSQL)
+			result, err := e.execCreateTableSelect(dbName, tableName, selectSQL)
 			if err == nil && stmt.Temp {
 				e.tempTables[tableName] = true
 			}
@@ -729,6 +766,16 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				colDef.Charset = csLower
 				colDef.Collation = catalog.DefaultCollationForCharset(colDef.Charset)
 			}
+		} else if col.Type.Charset.Binary {
+			// BINARY modifier without explicit CHARACTER SET means binary collation of the current charset.
+			// e.g. VARCHAR(30) BINARY with table charset latin1 -> collation latin1_bin.
+			// We store the charset explicitly so SHOW CREATE TABLE can display the collation.
+			cs := tableCharset
+			if cs == "" {
+				cs = "utf8mb4"
+			}
+			colDef.Charset = cs
+			colDef.Collation = catalog.BinaryCollationForCharset(cs)
 		} else if strings.EqualFold(tableCharset, "binary") {
 			// Table-level CHARACTER SET binary propagates to columns without explicit charset.
 		}
@@ -772,11 +819,33 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 					colDef.Default = &defStr
 				}
 			}
+			// Validate zero date/datetime/timestamp defaults in strict mode
+			if colDef.Default != nil && e.isStrictMode() {
+				colTypeUpper := strings.ToUpper(strings.TrimSpace(col.Type.Type))
+				hasNoZeroDate := strings.Contains(e.sqlMode, "NO_ZERO_DATE") || strings.Contains(e.sqlMode, "TRADITIONAL")
+				hasNoZeroInDate := strings.Contains(e.sqlMode, "NO_ZERO_IN_DATE") || strings.Contains(e.sqlMode, "TRADITIONAL")
+				switch colTypeUpper {
+				case "TIMESTAMP", "DATETIME":
+					// NO_ZERO_DATE catches zero dates (0000-00-00) and zero-in-date (2012-02-00)
+					// NO_ZERO_IN_DATE also catches zero-in-date values
+					if (hasNoZeroDate || hasNoZeroInDate) && isZeroInDateValue(*colDef.Default) {
+						return nil, mysqlError(1067, "42000", fmt.Sprintf("Invalid default value for '%s'", colDef.Name))
+					}
+				case "DATE":
+					if (hasNoZeroDate || hasNoZeroInDate) && isZeroInDateValue(*colDef.Default) {
+						return nil, mysqlError(1067, "42000", fmt.Sprintf("Invalid default value for '%s'", colDef.Name))
+					}
+				}
+			}
 			if col.Type.Options.OnUpdate != nil {
 				onUpdateStr := strings.ToUpper(sqlparser.String(col.Type.Options.OnUpdate))
 				if strings.Contains(onUpdateStr, "CURRENT_TIMESTAMP") || strings.Contains(onUpdateStr, "NOW") {
 					colDef.OnUpdateCurrentTimestamp = true
 				}
+			}
+			// Validate that PRIMARY KEY/KEY cannot be INVISIBLE at column level
+			if col.Type.Options.Invisible != nil && (col.Type.Options.KeyOpt == sqlparser.ColKeyPrimary || col.Type.Options.KeyOpt == sqlparser.ColKey) {
+				return nil, mysqlError(3522, "HY000", "A primary key index cannot be invisible")
 			}
 			switch col.Type.Options.KeyOpt {
 			case sqlparser.ColKeyPrimary, sqlparser.ColKey: // PRIMARY KEY or KEY
@@ -878,11 +947,25 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 		if idx.Info.Type == sqlparser.IndexTypePrimary {
 			primaryKeys = nil
-			primaryKeys = append(primaryKeys, idxCols...)
+			// Use the actual column names from the columns slice (preserving case)
+			// to ensure row lookups work correctly.
+			for _, idxCol := range idxCols {
+				matched := false
+				for _, col := range columns {
+					if strings.EqualFold(col.Name, idxCol) {
+						primaryKeys = append(primaryKeys, col.Name)
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					primaryKeys = append(primaryKeys, idxCol)
+				}
+			}
 			// Mark PK columns as NOT NULL (PRIMARY KEY implies NOT NULL)
 			for i, col := range columns {
 				for _, pk := range idxCols {
-					if col.Name == pk {
+					if strings.EqualFold(col.Name, pk) {
 						columns[i].Nullable = false
 					}
 				}
@@ -945,6 +1028,10 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				} else if strings.EqualFold(opt.Name, "INVISIBLE") {
 					idxInvisible = true
 				}
+			}
+			// Validate that PRIMARY KEY cannot be INVISIBLE
+			if idxInvisible && idx.Info.Type == sqlparser.IndexTypePrimary {
+				return nil, mysqlError(3522, "HY000", "A primary key index cannot be invisible")
 			}
 			// MySQL returns error for index comments > 1024 in strict/TRADITIONAL mode;
 			// in non-strict mode it truncates silently.
@@ -1251,6 +1338,19 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	// uses a shared catalog. Recreate temporary tables idempotently to avoid
 	// cross-session name collisions in MTR multi-connection tests.
 	if stmt.Temp {
+		// Check if there's an existing permanent table we need to save.
+		// If this session already has a temp table with this name (re-creating it),
+		// we already saved the permanent one, so don't overwrite the saved state.
+		if _, alreadyTemp := e.tempTables[tableName]; !alreadyTemp {
+			// Save the permanent table state before shadowing it.
+			if existingDef, err2 := db.GetTable(tableName); err2 == nil {
+				savedTable := e.Storage.SaveTable(dbName, tableName)
+				e.tempTableSavedPermanent[tableName] = &savedPermTable{
+					def:   existingDef,
+					table: savedTable,
+				}
+			}
+		}
 		_ = db.DropTable(tableName)
 		e.Storage.DropTable(dbName, tableName)
 		delete(e.tempTables, tableName)
@@ -1292,31 +1392,50 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		if selResult != nil && selResult.IsResultSet {
 			tbl, tblErr := e.Storage.GetTable(dbName, tableName)
 			if tblErr == nil {
-				// Add any new columns from SELECT that aren't in the table def
+				// Build the final column list following SELECT column order (MySQL behavior).
+				// Columns from the SELECT are placed first (in SELECT order), then any
+				// explicitly-defined columns that don't appear in the SELECT.
+				// When a SELECT column matches an explicit column def, the explicit def is used.
+				explicitColsByName := make(map[string]catalog.ColumnDef, len(def.Columns))
+				for _, c := range def.Columns {
+					explicitColsByName[strings.ToLower(c.Name)] = c
+				}
+				var reorderedCols []catalog.ColumnDef
+				seenInSelect := make(map[string]bool)
 				for _, selCol := range selResult.Columns {
-					found := false
-					for _, defCol := range def.Columns {
-						if strings.EqualFold(defCol.Name, selCol) {
-							found = true
-							break
-						}
-					}
-					if !found {
-						// Try to infer column type from source table
-						colType := "text"
-						colNullable := true
-						if inferredType := e.inferColumnType(selectSQL, selCol); inferredType != "" {
-							colType = inferredType
+					key := strings.ToLower(selCol)
+					seenInSelect[key] = true
+					if defCol, ok := explicitColsByName[key]; ok {
+						// Use the explicit column definition
+						reorderedCols = append(reorderedCols, defCol)
+					} else {
+						// New column from SELECT — infer type and attributes
+						attrs := e.inferColumnAttrs(selectSQL, selCol)
+						colType := attrs.colType
+						if colType == "" {
+							colType = "text"
 						}
 						newCol := catalog.ColumnDef{
 							Name:     selCol,
 							Type:     colType,
-							Nullable: colNullable,
+							Nullable: attrs.nullable,
+							Charset:  attrs.charset,
 						}
-						def.Columns = append(def.Columns, newCol)
+						if attrs.hasDefault {
+							newCol.Default = &attrs.defaultVal
+						}
+						reorderedCols = append(reorderedCols, newCol)
 						tbl.AddColumn(selCol, nil)
 					}
 				}
+				// Append any explicit columns not present in the SELECT
+				for _, c := range def.Columns {
+					if !seenInSelect[strings.ToLower(c.Name)] {
+						reorderedCols = append(reorderedCols, c)
+						tbl.AddColumn(c.Name, nil)
+					}
+				}
+				def.Columns = reorderedCols
 				// Insert select results
 				var insertErr error
 				for _, selRow := range selResult.Rows {
@@ -1342,7 +1461,9 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 	}
 
-	e.upsertInnoDBStatsRows(dbName, tableName, e.tableRowCount(dbName, tableName))
+	// Use FromCreate variant so that SHOW INDEX cardinality returns NULL
+	// for freshly created tables (no ANALYZE run yet). MySQL behavior.
+	e.upsertInnoDBStatsRowsFromCreate(dbName, tableName, e.tableRowCount(dbName, tableName))
 
 	return &Result{}, nil
 }
@@ -1428,6 +1549,17 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 		}
 		e.Storage.DropTable(dbName, tableName)
 		e.removeInnoDBStatsRows(dbName, tableName)
+		// If this was a temporary table, restore any permanent table it was shadowing.
+		if _, wasTemp := e.tempTables[tableName]; wasTemp {
+			if saved, ok := e.tempTableSavedPermanent[tableName]; ok {
+				// Restore the permanent table catalog entry and storage.
+				if db2, err2 := e.Catalog.GetDatabase(dbName); err2 == nil {
+					_ = db2.CreateTable(saved.def)
+				}
+				e.Storage.RestoreTable(dbName, tableName, saved.table)
+				delete(e.tempTableSavedPermanent, tableName)
+			}
+		}
 		// Clean up temp table tracking
 		delete(e.tempTables, tableName)
 		// Drop triggers associated with this table (MySQL behavior)
@@ -1694,6 +1826,19 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					}
 				}
 				colDef := columnDefFromAST(col)
+				// Check for invalid zero date/datetime/timestamp defaults in strict mode
+				if colDef.Default != nil && e.isStrictMode() {
+					colTypeUpper := strings.ToUpper(strings.TrimSpace(col.Type.Type))
+					hasNoZeroDate := strings.Contains(e.sqlMode, "NO_ZERO_DATE") || strings.Contains(e.sqlMode, "TRADITIONAL")
+					hasNoZeroInDate := strings.Contains(e.sqlMode, "NO_ZERO_IN_DATE") || strings.Contains(e.sqlMode, "TRADITIONAL")
+					switch colTypeUpper {
+					case "TIMESTAMP", "DATETIME", "DATE":
+						// NO_ZERO_DATE and NO_ZERO_IN_DATE both reject zero-component date defaults
+						if (hasNoZeroDate || hasNoZeroInDate) && isZeroInDateValue(*colDef.Default) {
+							return nil, mysqlError(1067, "42000", fmt.Sprintf("Invalid default value for '%s'", colDef.Name))
+						}
+					}
+				}
 				// Check column comment length in strict/traditional mode (MySQL max is 1024 characters)
 				if mysqlCharLen(colDef.Comment) > 1024 && e.isStrictMode() {
 					return nil, mysqlError(1629, "HY000", fmt.Sprintf("Comment for field '%s' is too long (max = 1024)", colDef.Name))
@@ -1734,6 +1879,15 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 						tbl.Rows[i][colDef.Name] = v
 					}
 					tbl.Mu.Unlock()
+				} else if colDef.AutoIncrement {
+					// For AUTO_INCREMENT columns, fill existing rows with sequential values
+					tbl.AddColumn(colDef.Name, nil)
+					tbl.Mu.Lock()
+					for i := range tbl.Rows {
+						autoVal := tbl.AutoIncrement.Add(1)
+						tbl.Rows[i][colDef.Name] = autoVal
+					}
+					tbl.Mu.Unlock()
 				} else {
 					var defVal interface{}
 					if colDef.Default != nil {
@@ -1749,10 +1903,22 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 		case *sqlparser.DropColumn:
 			colName := op.Name.Name.String()
-			// Check if this would leave the table with no columns
+			// Check if this would leave the table with no columns.
+			// Count net effect of all DROP/ADD COLUMN ops in this ALTER TABLE.
 			tableDef, _ := db.GetTable(tableName)
-			if tableDef != nil && len(tableDef.Columns) <= 1 {
-				return nil, mysqlError(1090, "42000", "You can't delete all columns with ALTER TABLE; use DROP TABLE instead")
+			if tableDef != nil {
+				netCols := len(tableDef.Columns)
+				for _, altOpt := range stmt.AlterOptions {
+					switch altOp := altOpt.(type) {
+					case *sqlparser.DropColumn:
+						netCols--
+					case *sqlparser.AddColumns:
+						netCols += len(altOp.Columns)
+					}
+				}
+				if netCols <= 0 {
+					return nil, mysqlError(1090, "42000", "You can't delete all columns with ALTER TABLE; use DROP TABLE instead")
+				}
 			}
 			if dropErr := db.DropColumn(tableName, colName); dropErr != nil {
 				return nil, dropErr
@@ -1998,6 +2164,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					idxInvisible = true
 				}
 			}
+			// Validate that PRIMARY KEY cannot be INVISIBLE
+			if idxInvisible && isPrimary {
+				return nil, mysqlError(3522, "HY000", "A primary key index cannot be invisible")
+			}
 			// Check for duplicate values in existing data when adding UNIQUE/PRIMARY index
 			if isUnique || isPrimary {
 				// Extract prefix lengths from idxCols (e.g., "f1(4)" -> 4)
@@ -2045,7 +2215,20 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				}
 			}
 			if isPrimary {
-				db.SetPrimaryKey(tableName, idxCols)
+				// Map lowercase idxCols to actual column names (preserving case)
+				actualPKCols := make([]string, len(idxCols))
+				for i, idxCol := range idxCols {
+					actualPKCols[i] = idxCol // default to lowercase
+					if tableDef, tdErr2 := db.GetTable(tableName); tdErr2 == nil {
+						for _, col := range tableDef.Columns {
+							if strings.EqualFold(col.Name, idxCol) {
+								actualPKCols[i] = col.Name
+								break
+							}
+						}
+					}
+				}
+				db.SetPrimaryKey(tableName, actualPKCols)
 				tableDef, tdErr := db.GetTable(tableName)
 				if tdErr == nil && strings.EqualFold(tableDef.Engine, "InnoDB") {
 					orderCollation := effectiveTableCollation(tableDef)
@@ -2285,6 +2468,42 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				}
 			}
 
+		case *sqlparser.AlterIndex:
+			// ALTER TABLE ... ALTER INDEX <name> VISIBLE/INVISIBLE
+			idxName := op.Name.String()
+			// PRIMARY KEY cannot be made invisible
+			if op.Invisible && strings.EqualFold(idxName, "PRIMARY") {
+				return nil, mysqlError(3522, "HY000", "A primary key index cannot be invisible")
+			}
+			tableDef, _ := db.GetTable(tableName)
+			if tableDef != nil {
+				for i, idx := range tableDef.Indexes {
+					if strings.EqualFold(idx.Name, idxName) {
+						// If making invisible: check if this is an implicit primary key
+						// (first NOT NULL UNIQUE when table has no explicit primary key)
+						if op.Invisible && !hasPrimaryKey(tableDef) && isFirstNotNullUnique(tableDef, idx) {
+							return nil, mysqlError(3522, "HY000", "A primary key index cannot be invisible")
+						}
+						tableDef.Indexes[i].Invisible = op.Invisible
+						break
+					}
+				}
+			}
+
+		case *sqlparser.RenameIndex:
+			// ALTER TABLE ... RENAME INDEX <old> TO <new>
+			oldName := op.OldName.String()
+			newName := op.NewName.String()
+			tableDef, _ := db.GetTable(tableName)
+			if tableDef != nil {
+				for i, idx := range tableDef.Indexes {
+					if strings.EqualFold(idx.Name, oldName) {
+						tableDef.Indexes[i].Name = newName
+						break
+					}
+				}
+			}
+
 		case *sqlparser.RenameTableName:
 			newName := op.Table.Name.String()
 			// Get the current table def
@@ -2480,11 +2699,14 @@ func padBinaryValue(val interface{}, padLen int) interface{} {
 func buildColumnTypeString(ct *sqlparser.ColumnType, tableCharset string) string {
 	s := strings.ToLower(ct.Type)
 
-	// When CHARACTER SET binary or BINARY modifier is used on text types,
-	// MySQL normalizes them to their binary equivalents.
+	// When CHARACTER SET binary is explicitly specified, MySQL normalizes text types
+	// to their binary equivalents (char->binary, varchar->varbinary, text->blob, etc.).
 	// This also applies when the table-level charset is binary.
-	isBinaryCharset := ct.Charset.Binary || strings.EqualFold(ct.Charset.Name, "binary") || (ct.Charset.Name == "" && strings.EqualFold(tableCharset, "binary"))
-	if isBinaryCharset {
+	// NOTE: When just the BINARY modifier is used (ct.Charset.Binary=true, ct.Charset.Name=""),
+	// this is the deprecated "BINARY as attribute of a type" syntax which means binary collation
+	// of the current charset, NOT a type conversion to VARBINARY/BINARY.
+	isBinaryCharsetExplicit := strings.EqualFold(ct.Charset.Name, "binary") || (ct.Charset.Name == "" && !ct.Charset.Binary && strings.EqualFold(tableCharset, "binary"))
+	if isBinaryCharsetExplicit {
 		switch strings.ToUpper(ct.Type) {
 		case "CHAR":
 			s = "binary"
@@ -2661,6 +2883,58 @@ func (e *Executor) inferColumnType(selectSQL, colName string) string {
 	return ""
 }
 
+// inferColumnAttrs infers full column attributes (type, charset, nullable, default) for a column
+// from a SELECT SQL string. Falls back to type-only inference when full attrs aren't available.
+func (e *Executor) inferColumnAttrs(selectSQL, colName string) columnAttrs {
+	attrs := columnAttrs{nullable: true}
+	stmt, err := e.parser().Parse(selectSQL)
+	if err != nil {
+		return attrs
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		attrs.colType = e.inferColumnType(selectSQL, colName)
+		return attrs
+	}
+	// Find the expression for colName
+	for _, expr := range sel.SelectExprs.Exprs {
+		ae, ok := expr.(*sqlparser.AliasedExpr)
+		if !ok {
+			continue
+		}
+		alias := ""
+		if !ae.As.IsEmpty() {
+			alias = ae.As.String()
+		}
+		if alias != "" {
+			if !strings.EqualFold(alias, colName) {
+				continue
+			}
+		} else {
+			if col, ok2 := ae.Expr.(*sqlparser.ColName); ok2 {
+				if !strings.EqualFold(col.Name.String(), colName) {
+					continue
+				}
+			} else {
+				exprStr := normalizeCharsetIntroducersForMatch(sqlparser.String(ae.Expr))
+				normalizedColName := normalizeCharsetIntroducersForMatch(colName)
+				if !strings.EqualFold(exprStr, normalizedColName) {
+					continue
+				}
+			}
+		}
+		// Found the expression — get full attrs
+		a := e.inferExprAttrs(ae.Expr)
+		if a.colType == "" {
+			a.colType = e.inferColumnTypeFromSelect(sel, colName)
+		}
+		return a
+	}
+	// Fall back to type inference
+	attrs.colType = e.inferColumnTypeFromSelect(sel, colName)
+	return attrs
+}
+
 // inferColumnTypeFromSelect infers the column type from a single SELECT statement.
 func (e *Executor) inferColumnTypeFromSelect(sel *sqlparser.Select, colName string) string {
 	// Get the source table from the FROM clause
@@ -2710,11 +2984,28 @@ func (e *Executor) inferColumnTypeFromSelect(sel *sqlparser.Select, colName stri
 				if !strings.EqualFold(col.Name.String(), colName) {
 					continue
 				}
+			} else {
+				// For non-column expressions (FuncExpr, etc.), compare the string representation.
+				// Normalize charset introducers before comparing (sqlparser uses _utf8mb3 'x'
+				// but MySQL column names show _utf8'x').
+				exprStr := normalizeCharsetIntroducersForMatch(sqlparser.String(ae.Expr))
+				normalizedColName := normalizeCharsetIntroducersForMatch(colName)
+				if !strings.EqualFold(exprStr, normalizedColName) {
+					continue
+				}
 			}
 		}
 		return e.inferExprType(ae.Expr)
 	}
 	return ""
+}
+
+// normalizeCharsetIntroducersForMatch normalizes charset introducer syntax for string matching.
+// Converts _utf8mb3 (with or without space) to _utf8 to allow matching.
+func normalizeCharsetIntroducersForMatch(s string) string {
+	s = strings.ReplaceAll(s, "_utf8mb3 '", "_utf8'")
+	s = strings.ReplaceAll(s, "_utf8mb3'", "_utf8'")
+	return s
 }
 
 // inferColumnTypeFromUnion infers the column type from a UNION by merging all branches.
@@ -2851,11 +3142,83 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 				}
 			}
 			return "datetime(6)"
+		case "database", "schema":
+			// MySQL: database() returns varchar(34) CHARACTER SET utf8
+			return "varchar(34)"
+		case "user", "current_user", "session_user", "system_user":
+			// MySQL: user() returns varchar(288) CHARACTER SET utf8
+			return "varchar(288)"
+		case "version":
+			// MySQL: version() returns char(60)
+			return "char(60)"
+		case "charset", "collation":
+			// MySQL: charset()/collation() return varchar(64) CHARACTER SET utf8
+			return "varchar(64)"
+		case "connection_id":
+			return "bigint unsigned"
+		case "last_insert_id", "row_count", "found_rows":
+			return "bigint"
+		}
+	case *sqlparser.IntroducerExpr:
+		// _charset'string' — type is varchar(len) with the given charset
+		if lit, ok := v.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
+			return fmt.Sprintf("varchar(%d)", len(lit.Val))
 		}
 	case *sqlparser.NullVal:
 		return ""
 	}
 	return ""
+}
+
+// columnAttrs holds inferred column attributes beyond just type.
+type columnAttrs struct {
+	colType  string
+	charset  string
+	nullable bool
+	hasDefault bool
+	defaultVal string
+}
+
+// inferExprAttrs infers type, charset, nullable, and default from a function/expr.
+// Used by CREATE TABLE ... SELECT to set correct column attributes.
+func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
+	attrs := columnAttrs{nullable: true}
+	switch v := expr.(type) {
+	case *sqlparser.FuncExpr:
+		name := strings.ToLower(v.Name.String())
+		switch name {
+		case "database", "schema":
+			attrs.colType = "varchar(34)"
+			attrs.charset = "utf8"
+			attrs.nullable = true
+		case "user", "current_user", "session_user", "system_user":
+			attrs.colType = "varchar(288)"
+			attrs.charset = "utf8"
+			attrs.nullable = false
+			attrs.hasDefault = true
+			attrs.defaultVal = ""
+		case "charset", "collation":
+			attrs.colType = "varchar(64)"
+			attrs.charset = "utf8"
+			attrs.nullable = false
+			attrs.hasDefault = true
+			attrs.defaultVal = ""
+		}
+	case *sqlparser.IntroducerExpr:
+		// _charset'string' — charset comes from the introducer
+		cs := strings.ToLower(strings.TrimPrefix(v.CharacterSet, "_"))
+		if cs == "utf8mb3" {
+			cs = "utf8"
+		}
+		attrs.charset = cs
+		if lit, ok := v.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
+			attrs.colType = fmt.Sprintf("varchar(%d)", len(lit.Val))
+		}
+	}
+	if attrs.colType == "" {
+		attrs.colType = e.inferExprType(expr)
+	}
+	return attrs
 }
 
 // inferStrToDateType infers the column type from a str_to_date format string.
@@ -3128,10 +3491,14 @@ func (e *Executor) tryExecCreateTableIndexOnlySelect(stmt *sqlparser.CreateTable
 }
 
 // execCreateTableSelect handles CREATE TABLE t2 [AS] SELECT ...
-func (e *Executor) execCreateTableSelect(newTableName, selectSQL string) (*Result, error) {
-	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+// targetDB specifies the database to create the table in (may differ from e.CurrentDB for cross-db CREATE TABLE).
+func (e *Executor) execCreateTableSelect(targetDB, newTableName, selectSQL string) (*Result, error) {
+	if targetDB == "" {
+		targetDB = e.CurrentDB
+	}
+	db, err := e.Catalog.GetDatabase(targetDB)
 	if err != nil {
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", targetDB))
 	}
 	// CREATE TABLE ... AS SELECT needs to acquire locks on source table rows.
 	// If another connection holds FOR UPDATE locks, this should time out.
@@ -3166,15 +3533,21 @@ func (e *Executor) execCreateTableSelect(newTableName, selectSQL string) (*Resul
 	}
 	var cols []catalog.ColumnDef
 	for _, colName := range result.Columns {
-		colType := "text"
-		if inferredType := e.inferColumnType(selectSQL, colName); inferredType != "" {
-			colType = inferredType
+		attrs := e.inferColumnAttrs(selectSQL, colName)
+		colType := attrs.colType
+		if colType == "" {
+			colType = "text"
 		}
-		cols = append(cols, catalog.ColumnDef{
+		col := catalog.ColumnDef{
 			Name:     colName,
 			Type:     colType,
-			Nullable: true,
-		})
+			Nullable: attrs.nullable,
+			Charset:  attrs.charset,
+		}
+		if attrs.hasDefault {
+			col.Default = &attrs.defaultVal
+		}
+		cols = append(cols, col)
 	}
 	newDef := &catalog.TableDef{
 		Name:    newTableName,
@@ -3183,8 +3556,8 @@ func (e *Executor) execCreateTableSelect(newTableName, selectSQL string) (*Resul
 	if err := db.CreateTable(newDef); err != nil {
 		return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newTableName))
 	}
-	e.Storage.CreateTable(e.CurrentDB, newDef)
-	tbl, _ := e.Storage.GetTable(e.CurrentDB, newTableName)
+	e.Storage.CreateTable(targetDB, newDef)
+	tbl, _ := e.Storage.GetTable(targetDB, newTableName)
 	// Build a column type map for coercion
 	colTypeMap := make(map[string]string, len(cols))
 	for _, col := range cols {
@@ -3203,6 +3576,99 @@ func (e *Executor) execCreateTableSelect(newTableName, selectSQL string) (*Resul
 		}
 		tbl.Insert(sRow) //nolint:errcheck
 	}
-	e.upsertInnoDBStatsRows(e.CurrentDB, newTableName, e.tableRowCount(e.CurrentDB, newTableName))
+	e.upsertInnoDBStatsRows(targetDB, newTableName, e.tableRowCount(targetDB, newTableName))
 	return &Result{}, nil
+}
+
+// hasPrimaryKey returns true if the table has an explicit primary key defined.
+// isZeroDateValue returns true if val represents a zero date/datetime/timestamp value.
+// MySQL considers "0", "0000-00-00", "0000-00-00 00:00:00" as zero dates.
+func isZeroDateValue(val string) bool {
+	v := strings.TrimSpace(val)
+	return v == "0" || v == "0000-00-00" || v == "0000-00-00 00:00:00" || v == "0000-00-00 00:00:00.000000"
+}
+
+// isZeroInDateValue returns true if val represents a date with a zero component (year/month/day).
+// This is used for NO_ZERO_IN_DATE checks (e.g., '2012-02-00' has zero day).
+func isZeroInDateValue(val string) bool {
+	v := strings.TrimSpace(val)
+	// First check for fully zero date
+	if isZeroDateValue(v) {
+		return true
+	}
+	// Strip time component if present
+	datepart := v
+	if idx := strings.Index(v, " "); idx >= 0 {
+		datepart = v[:idx]
+	}
+	// Check YYYY-MM-DD format for zero components
+	parts := strings.Split(datepart, "-")
+	if len(parts) == 3 {
+		for _, p := range parts {
+			if p == "0" || p == "00" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasPrimaryKey(tbl *catalog.TableDef) bool {
+	if len(tbl.PrimaryKey) > 0 {
+		return true
+	}
+	for _, col := range tbl.Columns {
+		if col.PrimaryKey {
+			return true
+		}
+	}
+	return false
+}
+
+// isFirstNotNullUnique returns true if the given index is the first NOT NULL UNIQUE index
+// that would be implicitly promoted as the primary key.
+func isFirstNotNullUnique(tbl *catalog.TableDef, idx catalog.IndexDef) bool {
+	if !idx.Unique {
+		return false
+	}
+	// Check if all columns in the index are NOT NULL
+	for _, col := range idx.Columns {
+		baseCol := strings.TrimSpace(col)
+		for _, c := range tbl.Columns {
+			if strings.EqualFold(c.Name, baseCol) {
+				if c.Nullable {
+					return false
+				}
+				break
+			}
+		}
+	}
+	// Check if this is the first NOT NULL UNIQUE index
+	for _, other := range tbl.Indexes {
+		if !other.Unique {
+			continue
+		}
+		if strings.EqualFold(other.Name, idx.Name) {
+			// This is the first NOT NULL UNIQUE index we've checked
+			return true
+		}
+		// Check if this other index is also all NOT NULL
+		allNotNull := true
+		for _, col := range other.Columns {
+			baseCol := strings.TrimSpace(col)
+			for _, c := range tbl.Columns {
+				if strings.EqualFold(c.Name, baseCol) {
+					if c.Nullable {
+						allNotNull = false
+					}
+					break
+				}
+			}
+		}
+		if allNotNull {
+			// Found an earlier NOT NULL UNIQUE index
+			return false
+		}
+	}
+	return false
 }

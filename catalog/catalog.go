@@ -242,6 +242,21 @@ func DefaultCollationForCharset(charset string) string {
 	}
 }
 
+// BinaryCollationForCharset returns the binary collation for a charset.
+// For example, "latin1" -> "latin1_bin", "utf8mb4" -> "utf8mb4_bin".
+func BinaryCollationForCharset(charset string) string {
+	switch strings.ToLower(charset) {
+	case "binary":
+		return "binary"
+	case "utf8mb4":
+		return "utf8mb4_bin"
+	case "utf8", "utf8mb3":
+		return "utf8_bin"
+	default:
+		return strings.ToLower(charset) + "_bin"
+	}
+}
+
 // CharsetForCollation returns the charset that a collation belongs to.
 // It returns the charset name and true if found, or "" and false if the collation is unknown.
 func CharsetForCollation(collation string) (string, bool) {
@@ -700,21 +715,22 @@ func (db *Database) CreateProcedure(def *ProcedureDef) {
 	if db.Procedures == nil {
 		db.Procedures = make(map[string]*ProcedureDef)
 	}
-	db.Procedures[def.Name] = def
+	// Store with lowercase key for case-insensitive lookup
+	db.Procedures[strings.ToLower(def.Name)] = def
 }
 
 // DropProcedure removes a stored procedure by name.
 func (db *Database) DropProcedure(name string) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	delete(db.Procedures, name)
+	delete(db.Procedures, strings.ToLower(name))
 }
 
-// GetProcedure returns a stored procedure by name.
+// GetProcedure returns a stored procedure by name (case-insensitive).
 func (db *Database) GetProcedure(name string) *ProcedureDef {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	return db.Procedures[name]
+	return db.Procedures[strings.ToLower(name)]
 }
 
 // CreateFunction adds a stored function definition.
@@ -742,4 +758,26 @@ func (db *Database) GetFunction(name string) *FunctionDef {
 		return nil
 	}
 	return db.Functions[strings.ToLower(name)]
+}
+
+// ListFunctions returns all stored function definitions in the database.
+func (db *Database) ListFunctions() []*FunctionDef {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	var result []*FunctionDef
+	for _, f := range db.Functions {
+		result = append(result, f)
+	}
+	return result
+}
+
+// ListProcedures returns all stored procedure definitions in the database.
+func (db *Database) ListProcedures() []*ProcedureDef {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	var result []*ProcedureDef
+	for _, p := range db.Procedures {
+		result = append(result, p)
+	}
+	return result
 }

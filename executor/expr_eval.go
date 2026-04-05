@@ -412,7 +412,8 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 	if val, ok := allVars[name]; ok {
 		return sysVarStringToSelectValueForVar(val, name), nil
 	}
-	return "", nil
+	// Unknown system variable — return MySQL error 1193
+	return nil, mysqlError(1193, "HY000", fmt.Sprintf("Unknown system variable '%s'", name))
 }
 
 // evalUnaryExpr handles *sqlparser.UnaryExpr evaluation.
@@ -705,6 +706,61 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 			}
 		}
 	scalarIN:
+		// Handle (SELECT c1,c2,...) IN (SELECT c1,c2,...) — subquery IN subquery.
+		// The left subquery returns multi-column rows; treat each row as a tuple to
+		// match against rows from the right subquery.
+		if leftSub, leftIsSub := v.Left.(*sqlparser.Subquery); leftIsSub {
+			if rightSub, rightIsSub := v.Right.(*sqlparser.Subquery); rightIsSub {
+				leftResult, err := e.execSubquery(leftSub, e.correlatedRow)
+				if err != nil {
+					return nil, err
+				}
+				rightResult, err := e.execSubquery(rightSub, e.correlatedRow)
+				if err != nil {
+					return nil, err
+				}
+				if len(leftResult.Columns) != len(rightResult.Columns) {
+					return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftResult.Columns)))
+				}
+				ncols := len(leftResult.Columns)
+				for _, lrow := range leftResult.Rows {
+					hasNull := false
+					for _, rrow := range rightResult.Rows {
+						allMatch := true
+						rowHasNull := false
+						for i := 0; i < ncols; i++ {
+							lv, rv := lrow[i], rrow[i]
+							if lv == nil || rv == nil {
+								rowHasNull = true
+								allMatch = false
+								break
+							}
+							match, _ := compareValues(lv, rv, sqlparser.EqualOp)
+							if !match {
+								allMatch = false
+								break
+							}
+						}
+						if allMatch {
+							if v.Operator == sqlparser.InOp {
+								return int64(1), nil
+							}
+							return int64(0), nil
+						}
+						if rowHasNull {
+							hasNull = true
+						}
+					}
+					if hasNull {
+						return nil, nil
+					}
+				}
+				if v.Operator == sqlparser.NotInOp {
+					return int64(1), nil
+				}
+				return int64(0), nil
+			}
+		}
 		left, err := e.evalExpr(v.Left)
 		if err != nil {
 			return nil, err
@@ -854,6 +910,19 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 		leftTupleExpr2, leftIsTupleExpr2 := v.Left.(sqlparser.ValTuple)
 		rightSub2, rightIsSub2 := v.Right.(*sqlparser.Subquery)
 		if leftIsTupleExpr2 && rightIsSub2 {
+			// (a,b) = ANY (SELECT ...) is parsed as EqualOp with ValTuple left and Subquery right.
+			// MySQL's = ANY semantics are equivalent to IN: true if any row in the subquery matches.
+			// Similarly, != ALL is equivalent to NOT IN.
+			// For EqualOp and NotEqualOp, use evalInSubquery which iterates all rows.
+			if v.Operator == sqlparser.EqualOp {
+				return e.evalInSubquery(nil, v.Left, rightSub2, sqlparser.InOp)
+			}
+			if v.Operator == sqlparser.NotEqualOp {
+				// <> ANY is NOT equivalent to NOT IN; it means "at least one row differs".
+				// But for NOT IN semantics (used in <> ALL = NOT IN), use NotInOp.
+				// For now, treat (a,b) <> subquery as scalar single-row comparison (preserve old behavior).
+				// Fall through to flip-and-reuse for other operators.
+			}
 			// Reuse logic by swapping and flipping the operator
 			flipped := &sqlparser.ComparisonExpr{Left: v.Right, Right: v.Left, Operator: v.Operator}
 			switch v.Operator {
@@ -1314,6 +1383,13 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 			if val == nil {
 				return nil, nil
 			}
+			// Validate CHARACTER SET name in CAST(expr AS CHAR CHARACTER SET name)
+			if v.Type != nil && v.Type.Charset.Name != "" && !v.Type.Charset.Binary {
+				csName := strings.ToLower(strings.Trim(v.Type.Charset.Name, "'\""))
+				if csName != "binary" && !isKnownCharset(csName) {
+					return nil, mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", csName))
+				}
+			}
 			return toString(val), nil
 		case "DECIMAL", "FLOAT", "DOUBLE", "REAL":
 			return toFloat(val), nil
@@ -1419,13 +1495,17 @@ func (e *Executor) evalIsExpr(v *sqlparser.IsExpr) (interface{}, error) {
 // evalConvertUsingExpr handles *sqlparser.ConvertUsingExpr evaluation.
 func (e *Executor) evalConvertUsingExpr(v *sqlparser.ConvertUsingExpr) (interface{}, error) {
 	// CONVERT(expr USING charset)
+	target := strings.ToLower(v.Type)
+	// Validate charset name
+	if target != "binary" && !isKnownCharset(target) {
+		return nil, mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", target))
+	}
 	val, err := e.evalExpr(v.Expr)
 	if err != nil {
 		return nil, err
 	}
 	out := toString(val)
 	orig := out
-	target := strings.ToLower(v.Type)
 	connCharsetVal, _ := e.getSysVar("character_set_connection")
 	connCharset := canonicalCharset(strings.ToLower(connCharsetVal))
 	sourceCharset := ""

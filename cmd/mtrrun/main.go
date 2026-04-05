@@ -274,7 +274,7 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 					diffLines = len(strings.Split(r.Diff, "\n"))
 				}
 				fmt.Printf("  FAIL: %s (diff_lines=%d)\n", r.Name, diffLines)
-				if r.Diff != "" && diffLines <= 20 {
+				if r.Diff != "" && diffLines <= 30 {
 					fmt.Printf("  DIFF:\n%s\n", r.Diff)
 				}
 			}

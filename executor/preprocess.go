@@ -15,6 +15,17 @@ import (
 //   - Direct result (no parsing needed): returns ("", result, nil)
 //   - Error: returns ("", nil, err)
 func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
+	// Handle nested comments inside MySQL versioned conditional comments (/*!NNNNN...*/):
+	// MySQL allows but deprecates nesting /* */ inside /*! ... */. Preprocess to strip
+	// the inner nested comments so the vitess parser can handle the query.
+	if strings.Contains(query, "/*!") && strings.Contains(query, "/*") {
+		query = stripNestedConditionalComments(query, e)
+	}
+	// Vitess parser does not support multiple window definitions in a WINDOW clause
+	// (e.g., "WINDOW w AS (...), w1 AS (...)"). Inline named windows into OVER clauses.
+	if rewritten := inlineNamedWindows(query); rewritten != "" {
+		query = rewritten
+	}
 	trimmed := stripLeadingCStyleComments(strings.TrimSpace(query))
 	query = trimmed
 	e.currentQuery = trimmed
@@ -22,6 +33,36 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	// Empty query (e.g. comment-only) is a no-op.
 	if trimmed == "" {
 		return "", &Result{}, nil
+	}
+
+	// Handle ODBC escape syntax: {fn func(args)}, { date "value" }, {d 'value'}, {ts '...'}, {t '...'}.
+	// MySQL supports ODBC escape sequences for compatibility. We preprocess them to standard MySQL syntax.
+	// e.currentQuery is already set to the original for rawExprs column name extraction.
+	if rewritten, hasODBC := rewriteODBCEscapes(trimmed); hasODBC {
+		query = rewritten
+	}
+
+	// Vitess parser doesn't support SUM(ALL expr), COUNT(ALL expr), etc.
+	// ALL is the default and redundant; transform FUNC(ALL ...) → FUNC(...).
+	if strings.Contains(strings.ToUpper(trimmed), "(ALL ") {
+		query = rewriteAggregateAll(query)
+	}
+
+	// Vitess parser doesn't handle LONG, LONG VARCHAR, LONG VARBINARY type aliases.
+	// MySQL treats them as: LONG/LONG VARCHAR -> MEDIUMTEXT, LONG VARBINARY -> MEDIUMBLOB.
+	// Only apply to DDL statements (CREATE TABLE / ALTER TABLE) to avoid mangling string literals.
+	{
+		upperContains := strings.ToUpper(trimmed)
+		isCreateOrAlterTable := (strings.HasPrefix(upperContains, "CREATE") || strings.HasPrefix(upperContains, "ALTER")) && strings.Contains(upperContains, "TABLE")
+		if isCreateOrAlterTable && (strings.Contains(upperContains, " LONG ") || strings.Contains(upperContains, " LONG,") || strings.Contains(upperContains, " LONG)")) {
+			query = rewriteLongTypes(query)
+		}
+		// Vitess parser doesn't support deprecated `BINARY CHARACTER SET X` order in column definitions.
+		// MySQL supports both orders; rewrite `BINARY CHARACTER SET X` -> `CHARACTER SET X BINARY`.
+		// Also handle BYTE keyword (deprecated synonym for BINARY in column types).
+		if isCreateOrAlterTable && (strings.Contains(upperContains, "BINARY CHARACTER SET") || strings.Contains(upperContains, " BYTE")) {
+			query = rewriteBinaryCharacterSet(query)
+		}
 	}
 
 	// Clear per-query subquery cache so non-correlated IN subqueries
@@ -264,6 +305,18 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		upper = strings.ToUpper(trimmed)
 	}
 
+	// Rewrite LONG type alias: MySQL allows LONG as a synonym for MEDIUMTEXT.
+	// Vitess parser doesn't support LONG, so rewrite it to MEDIUMTEXT.
+	// Pattern: word boundary + LONG + word boundary (as a column type).
+	if strings.Contains(upper, " LONG ") || strings.Contains(upper, " LONG\n") ||
+		strings.Contains(upper, "\tLONG ") || strings.Contains(upper, "\tLONG\n") {
+		if (strings.HasPrefix(upper, "CREATE") || strings.HasPrefix(upper, "ALTER")) && strings.Contains(upper, "TABLE") {
+			query = rewriteLongType(query)
+			trimmed = strings.TrimSpace(query)
+			upper = strings.ToUpper(trimmed)
+		}
+	}
+
 	// Handle MYLITE control commands before passing to the SQL parser.
 	if strings.HasPrefix(upper, "MYLITE ") {
 		result, err := e.execMyliteCommand(trimmed)
@@ -374,6 +427,14 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	if strings.Contains(upper, "NATIONAL CHAR") {
 		query = regexp.MustCompile(`(?i)\bNATIONAL\s+CHAR\b`).ReplaceAllString(query, "CHAR")
 	}
+	// NCHAR VARYING, NVARCHAR, NCHAR are MySQL type aliases for VARCHAR/CHAR that
+	// vitess parser doesn't support in all contexts (e.g., JSON_TABLE COLUMNS).
+	// Apply these globally (not just in DDL) to handle SELECT ... JSON_TABLE cases.
+	if strings.Contains(upper, "NCHAR") || strings.Contains(upper, "NVARCHAR") {
+		query = replaceTypeWord(query, "NCHAR VARYING", "VARCHAR")
+		query = replaceTypeWord(query, "NVARCHAR", "VARCHAR")
+		query = replaceTypeWord(query, "NCHAR", "CHAR")
+	}
 	trimmed = strings.TrimSpace(query)
 	upper = strings.ToUpper(trimmed)
 
@@ -446,6 +507,15 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		return "", nil, mysqlError(1221, "HY000", "Incorrect usage of ASC and key part")
 	}
 
+	// Detect wildcard alias with string literal (e.g. t1.* AS 'alias') in CREATE TABLE ... SELECT.
+	// MySQL rejects this as a syntax error, but the vitess parser silently drops the string alias,
+	// causing CREATE TABLE to succeed where it should fail.
+	if strings.HasPrefix(upper, "CREATE TABLE") || strings.HasPrefix(upper, "CREATE TEMPORARY TABLE") {
+		if nearStr := wildcardStringAliasNear(trimmed); nearStr != "" {
+			return "", nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", nearStr))
+		}
+	}
+
 	// Handle ALTER DATABASE/SCHEMA ... CHARACTER SET (vitess parser doesn't parse CHARACTER SET)
 	if (strings.HasPrefix(upper, "ALTER DATABASE") || strings.HasPrefix(upper, "ALTER SCHEMA")) &&
 		(strings.Contains(upper, "CHARACTER SET") || strings.Contains(upper, "COLLATE")) {
@@ -453,9 +523,9 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		return "", result, err
 	}
 
-	// Handle CREATE DATABASE/SCHEMA ... CHARACTER SET when parser doesn't extract charset
+	// Handle CREATE DATABASE/SCHEMA ... CHARACTER SET or COLLATE when parser doesn't handle these
 	if (strings.HasPrefix(upper, "CREATE DATABASE") || strings.HasPrefix(upper, "CREATE SCHEMA")) &&
-		strings.Contains(upper, "CHARACTER SET") {
+		(strings.Contains(upper, "CHARACTER SET") || strings.Contains(upper, " COLLATE ")) {
 		result, err := e.execCreateDatabaseRaw(trimmed)
 		return "", result, err
 	}
@@ -846,4 +916,491 @@ func extractFirstIdentifier(s string) string {
 		end++
 	}
 	return s[:end]
+}
+
+// inlineNamedWindows handles the case where a WINDOW clause defines multiple named windows
+// (e.g., "WINDOW w AS (...), w1 AS (...)"). Vitess only supports a single named window per
+// WINDOW clause. This function inlines named window definitions into the OVER clauses.
+// Returns the rewritten query or "" if no rewriting was needed.
+func inlineNamedWindows(query string) string {
+	// Find all occurrences of "\bWINDOW\s+" using case-insensitive search
+	windowRe := regexp.MustCompile(`(?i)\bWINDOW\s+`)
+	allLocs := windowRe.FindAllStringIndex(query, -1)
+	if len(allLocs) == 0 {
+		return ""
+	}
+	// Use the last WINDOW keyword location
+	lastLoc := allLocs[len(allLocs)-1]
+	windowIdx := lastLoc[0]
+	// Extract window definitions part (everything after "WINDOW ")
+	defsStr := strings.TrimSpace(query[lastLoc[1]:])
+	// Remove trailing semicolon
+	defsStr = strings.TrimRight(defsStr, " \t\n\r;")
+
+	// Parse window definitions: name AS (spec) [, name2 AS (spec2)] ...
+	windowMap := make(map[string]string)
+	rest := defsStr
+	for {
+		rest = strings.TrimSpace(rest)
+		if rest == "" {
+			break
+		}
+		// Find window name
+		spaceIdx := strings.IndexAny(rest, " \t\n\r")
+		if spaceIdx < 0 {
+			break
+		}
+		name := strings.ToLower(rest[:spaceIdx])
+		rest = strings.TrimSpace(rest[spaceIdx:])
+		// Expect AS
+		if len(rest) < 2 || strings.ToUpper(rest[:2]) != "AS" {
+			break
+		}
+		rest = strings.TrimSpace(rest[2:])
+		// Expect (
+		if !strings.HasPrefix(rest, "(") {
+			break
+		}
+		// Find matching closing paren
+		depth := 0
+		end := -1
+		for i, ch := range rest {
+			if ch == '(' {
+				depth++
+			} else if ch == ')' {
+				depth--
+				if depth == 0 {
+					end = i
+					break
+				}
+			}
+		}
+		if end < 0 {
+			break
+		}
+		spec := rest[:end+1] // includes parens
+		windowMap[name] = spec
+		rest = strings.TrimSpace(rest[end+1:])
+		// Skip comma
+		if strings.HasPrefix(rest, ",") {
+			rest = strings.TrimSpace(rest[1:])
+		} else {
+			break
+		}
+	}
+	if len(windowMap) <= 1 {
+		return "" // single window handled by vitess parser
+	}
+	// Calculate how much of the query was consumed by the WINDOW clause
+	// defsStr was the full text after "WINDOW "; rest is what's left after window defs
+	// We need to find where rest starts in the original query to include any trailing text
+	consumedLen := len(query) - len(defsStr) // length up to and including "WINDOW "
+	// Find how much of defsStr was consumed
+	parsedLen := len(defsStr) - len(rest)
+	trailingText := ""
+	if rest != "" {
+		trailingText = rest
+	}
+	_ = consumedLen
+	_ = parsedLen
+
+	// Remove the WINDOW clause from the query and append any trailing text
+	selectPart := strings.TrimRight(query[:windowIdx], " \t\n\r")
+	// Replace all "OVER wname" with "OVER (spec)"
+	result := selectPart
+	for name, spec := range windowMap {
+		re := regexp.MustCompile(`(?i)\bOVER\s+` + regexp.QuoteMeta(name) + `\b`)
+		result = re.ReplaceAllString(result, "OVER "+spec)
+	}
+	if trailingText != "" {
+		result += "\n" + trailingText
+	}
+	return result
+}
+
+// stripNestedConditionalComments handles nested /* */ inside /*!NNNNN */ comment blocks.
+// MySQL allows (but deprecates) this syntax. We preprocess to strip the nesting so the
+// vitess parser can handle the remaining query correctly.
+// For version > server (e.g., /*!99999 ... */), the entire block is removed.
+// For version <= server or no version (/*!...*/), the inner content is kept but nested
+// comment markers are stripped.
+// A warning 1681 is added for any nested comment found.
+func stripNestedConditionalComments(query string, e *Executor) string {
+	const serverVersion = 80040
+	var result strings.Builder
+	i := 0
+	hasNestedComment := false
+	for i < len(query) {
+		// Look for /*!
+		if i+2 < len(query) && query[i] == '/' && query[i+1] == '*' && query[i+2] == '!' {
+			// Find the matching */ accounting for nested /* */
+			start := i
+			i += 3 // skip /*!
+			// Extract version number (up to 5 digits)
+			verStr := ""
+			for i < len(query) && len(verStr) < 5 && query[i] >= '0' && query[i] <= '9' {
+				verStr += string(query[i])
+				i++
+			}
+			ver := 0
+			if len(verStr) == 5 {
+				for _, ch := range verStr {
+					ver = ver*10 + int(ch-'0')
+				}
+			}
+			// Collect inner content, tracking nested /* */ depth
+			var inner strings.Builder
+			depth := 1 // we're inside the outer /*!...
+			for i < len(query) && depth > 0 {
+				if i+1 < len(query) && query[i] == '/' && query[i+1] == '*' {
+					// Nested comment start
+					hasNestedComment = true
+					depth++
+					i += 2
+					// Don't add /* to inner
+					continue
+				}
+				if i+1 < len(query) && query[i] == '*' && query[i+1] == '/' {
+					depth--
+					i += 2
+					if depth > 0 {
+						// Closing a nested comment, don't add */
+						continue
+					}
+					// Closing the outer /*! comment
+					break
+				}
+				inner.WriteByte(query[i])
+				i++
+			}
+			_ = start
+			if ver > serverVersion {
+				// High-version comment: skip entire block (don't emit anything)
+			} else {
+				// Execute content: emit the inner content
+				result.WriteString(inner.String())
+			}
+			continue
+		}
+		// Handle string literals (don't process comments inside strings)
+		if query[i] == '\'' || query[i] == '"' {
+			q := query[i]
+			result.WriteByte(query[i])
+			i++
+			for i < len(query) {
+				result.WriteByte(query[i])
+				if query[i] == '\\' {
+					i++
+					if i < len(query) {
+						result.WriteByte(query[i])
+						i++
+					}
+					continue
+				}
+				if query[i] == q {
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+		result.WriteByte(query[i])
+		i++
+	}
+	if hasNestedComment && e != nil {
+		e.addWarning("Warning", 1681, "Nested comment syntax is deprecated and will be removed in a future release.")
+	}
+	return result.String()
+}
+
+// rewriteODBCEscapes rewrites ODBC escape sequences to standard MySQL syntax.
+// Returns the rewritten query and true if any ODBC sequences were found.
+//
+// Supported patterns:
+//   - {fn func_name(args)} → func_name(args)
+//   - { date "value" } or {d 'value'} → DATE 'value'
+//   - { time "value" } or {t 'value'} → TIME 'value'
+//   - { ts "value" } or {timestamp 'value'} → TIMESTAMP 'value'
+//
+// e.currentQuery should already be set to the original query before calling this
+// so that rawExprs column name extraction uses the original ODBC syntax.
+func rewriteODBCEscapes(query string) (string, bool) {
+	if !strings.Contains(query, "{") {
+		return "", false
+	}
+
+	var result strings.Builder
+	i := 0
+	found := false
+
+	for i < len(query) {
+		if query[i] == '\'' || query[i] == '"' || query[i] == '`' {
+			// Skip string literals
+			quote := query[i]
+			result.WriteByte(query[i])
+			i++
+			for i < len(query) {
+				if query[i] == quote && (i == 0 || query[i-1] != '\\') {
+					result.WriteByte(query[i])
+					i++
+					break
+				}
+				result.WriteByte(query[i])
+				i++
+			}
+			continue
+		}
+
+		if query[i] != '{' {
+			result.WriteByte(query[i])
+			i++
+			continue
+		}
+
+		// Found '{'
+		// Try to parse ODBC escape sequence
+		j := i + 1
+		// Skip whitespace
+		for j < len(query) && (query[j] == ' ' || query[j] == '\t') {
+			j++
+		}
+
+		// Extract keyword
+		kStart := j
+		for j < len(query) && (query[j] >= 'a' && query[j] <= 'z' || query[j] >= 'A' && query[j] <= 'Z' || query[j] == '_') {
+			j++
+		}
+		keyword := strings.ToLower(query[kStart:j])
+
+		// Find matching '}'
+		depth := 1
+		k := j
+		for k < len(query) && depth > 0 {
+			if query[k] == '{' {
+				depth++
+			} else if query[k] == '}' {
+				depth--
+			} else if query[k] == '\'' || query[k] == '"' || query[k] == '`' {
+				// Skip string literals inside
+				qt := query[k]
+				k++
+				for k < len(query) {
+					if query[k] == qt && (k == 0 || query[k-1] != '\\') {
+						break
+					}
+					k++
+				}
+			}
+			if depth > 0 {
+				k++
+			}
+		}
+		if depth != 0 {
+			// Unmatched { - output as-is
+			result.WriteByte(query[i])
+			i++
+			continue
+		}
+		// query[k] == '}'
+		inner := strings.TrimSpace(query[j:k])
+		found = true
+
+		switch keyword {
+		case "fn":
+			// {fn func_name(args)} → func_name(args)
+			result.WriteString(inner)
+		case "d", "date":
+			// {d 'value'} or { date "value" } → DATE 'value' → just output the value
+			// The inner is the date string (possibly quoted)
+			if inner == "" {
+				result.WriteString("NULL")
+			} else {
+				// inner might be "1997-10-20" or '1997-10-20'
+				result.WriteString(inner)
+			}
+		case "t", "time":
+			// {t 'value'} → TIME 'value'
+			result.WriteString("TIME ")
+			result.WriteString(inner)
+		case "ts", "timestamp":
+			// {ts 'value'} → TIMESTAMP 'value'
+			result.WriteString("TIMESTAMP ")
+			result.WriteString(inner)
+		default:
+			// Unknown ODBC escape - output as-is
+			result.WriteString(query[i : k+1])
+			found = false
+		}
+		i = k + 1
+	}
+
+	if !found {
+		return "", false
+	}
+	return result.String(), true
+}
+
+// rewriteLongType rewrites the LONG data type alias to MEDIUMTEXT in CREATE/ALTER TABLE
+// statements. MySQL historically supports LONG as a synonym for MEDIUMTEXT.
+// Vitess parser doesn't support LONG as a type, so we rewrite it to MEDIUMTEXT.
+func rewriteLongType(query string) string {
+	// Walk the query, replacing LONG when used as a type (after a column name or comma,
+	// and followed by whitespace/comma/closing paren/NOT/NULL/DEFAULT etc.).
+	// We use a simple state machine to avoid replacing inside string literals.
+	var result strings.Builder
+	i := 0
+	for i < len(query) {
+		ch := query[i]
+		// Handle string literals
+		if ch == '\'' || ch == '"' || ch == '`' {
+			q := ch
+			result.WriteByte(ch)
+			i++
+			for i < len(query) {
+				c := query[i]
+				result.WriteByte(c)
+				i++
+				if c == q {
+					break
+				}
+				if c == '\\' && i < len(query) {
+					result.WriteByte(query[i])
+					i++
+				}
+			}
+			continue
+		}
+		// Check for LONG keyword
+		if i+4 <= len(query) && strings.EqualFold(query[i:i+4], "long") {
+			// Verify it's a whole word (not part of longer word like LONGTEXT, LONGBLOB, etc.)
+			afterEnd := i + 4
+			isWordEnd := afterEnd >= len(query) || !isLongWordChar(rune(query[afterEnd]))
+			isWordStart := i == 0 || !isLongWordChar(rune(query[i-1]))
+			if isWordStart && isWordEnd {
+				result.WriteString("MEDIUMTEXT")
+				i += 4
+				continue
+			}
+		}
+		result.WriteByte(ch)
+		i++
+	}
+	return result.String()
+}
+
+func isLongWordChar(r rune) bool {
+	return r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+}
+
+// rewriteAggregateAll rewrites FUNC(ALL expr) → FUNC(expr) for aggregate functions.
+// In MySQL, ALL is the default quantifier (opposite of DISTINCT) and is syntactically
+// valid but redundant. Vitess parser doesn't support this syntax.
+func rewriteAggregateAll(query string) string {
+	// Known aggregate functions that support ALL quantifier
+	aggFuncs := []string{"SUM", "COUNT", "AVG", "STD", "STDDEV", "STDDEV_POP", "STDDEV_SAMP",
+		"VARIANCE", "VAR_POP", "VAR_SAMP", "BIT_OR", "BIT_AND", "BIT_XOR",
+		"MIN", "MAX", "GROUP_CONCAT"}
+	upper := strings.ToUpper(query)
+	for _, fn := range aggFuncs {
+		pattern := fn + "(ALL "
+		if !strings.Contains(upper, pattern) {
+			continue
+		}
+		// Case-insensitive replacement of FUNC(ALL  with FUNC(
+		var buf strings.Builder
+		src := query
+		for {
+			idx := strings.Index(strings.ToUpper(src), pattern)
+			if idx < 0 {
+				buf.WriteString(src)
+				break
+			}
+			// Write everything up to and including "FUNC(" (but not "ALL ")
+			buf.WriteString(src[:idx+len(fn)+1]) // includes the '('
+			src = src[idx+len(fn)+1+len("ALL "):]
+		}
+		query = buf.String()
+		upper = strings.ToUpper(query)
+	}
+	return query
+}
+
+// rewriteLongTypes replaces MySQL's LONG, LONG VARCHAR, LONG VARBINARY type aliases
+// with their canonical equivalents that Vitess can parse.
+// LONG / LONG VARCHAR → MEDIUMTEXT
+// LONG VARBINARY → MEDIUMBLOB
+// rewriteBinaryCharacterSet rewrites `BINARY CHARACTER SET X` to `CHARACTER SET X BINARY`
+// in column type definitions, since vitess parser only supports the latter order.
+// Also rewrites `BYTE` keyword (deprecated MySQL alias for BINARY in column types) to `BINARY`.
+func rewriteBinaryCharacterSet(query string) string {
+	// Rewrite BINARY CHARACTER SET X -> CHARACTER SET X BINARY
+	re := regexp.MustCompile(`(?i)\bBINARY\s+CHARACTER\s+SET\s+([A-Za-z0-9_]+)`)
+	query = re.ReplaceAllString(query, "CHARACTER SET $1 BINARY")
+	// Rewrite BYTE (as column type attribute) -> BINARY
+	// BYTE is a deprecated synonym for BINARY in MySQL column definitions.
+	// Pattern: word boundary, BYTE, followed by end/comma/closing-paren/whitespace
+	reB := regexp.MustCompile(`(?i)\bBYTE\b`)
+	query = reB.ReplaceAllString(query, "BINARY")
+	return query
+}
+
+func rewriteLongTypes(query string) string {
+	// Replace LONG VARBINARY first (before LONG to avoid partial match)
+	reLongVarbinary := regexp.MustCompile(`(?i)\bLONG\s+VARBINARY\b`)
+	query = reLongVarbinary.ReplaceAllString(query, "MEDIUMBLOB")
+
+	// Replace LONG VARCHAR
+	reLongVarchar := regexp.MustCompile(`(?i)\bLONG\s+VARCHAR\b`)
+	query = reLongVarchar.ReplaceAllString(query, "MEDIUMTEXT")
+
+	// Replace LONG BLOB → LONGBLOB, LONG TEXT → LONGTEXT, standalone LONG → MEDIUMTEXT
+	// Match LONG optionally followed by BLOB or TEXT (with whitespace)
+	reLong := regexp.MustCompile(`(?i)\bLONG(\s+(?:BLOB|TEXT))?\b`)
+	query = reLong.ReplaceAllStringFunc(query, func(match string) string {
+		upper := strings.ToUpper(strings.TrimSpace(match))
+		switch upper {
+		case "LONG":
+			return "MEDIUMTEXT"
+		case "LONG BLOB":
+			return "LONGBLOB"
+		case "LONG TEXT":
+			return "LONGTEXT"
+		default:
+			return match
+		}
+	})
+
+	return query
+}
+
+// wildcardStringAliasNear checks if query contains a wildcard alias with string literal
+// (e.g. `t1.* AS 'alias'`) and returns the near-clause for MySQL error messages.
+// MySQL syntax error: `.*` followed by `AS 'string'` is invalid.
+var wildcardStringAliasRe = regexp.MustCompile(`(?i)\.\*\s+AS\s+'[^']*'`)
+
+func wildcardStringAliasNear(query string) string {
+	loc := wildcardStringAliasRe.FindStringIndex(query)
+	if loc == nil {
+		return ""
+	}
+	// Find the position of 'AS' after '.*'
+	segment := query[loc[0]:]
+	upperSeg := strings.ToUpper(segment)
+	asIdx := strings.Index(upperSeg, " AS ")
+	if asIdx < 0 {
+		return ""
+	}
+	// near clause starts from 'as ' (lowercase)
+	nearStart := loc[0] + asIdx + 1 // skip the space before 'AS'
+	if nearStart >= len(query) {
+		return ""
+	}
+	near := query[nearStart:]
+	// Remove trailing whitespace/semicolon
+	near = strings.TrimRight(near, " \t\n\r;")
+	if len(near) > 64 {
+		near = near[:64]
+	}
+	return near
 }

@@ -224,6 +224,31 @@ func (e *Engine) DropTable(dbName, tableName string) {
 	}
 }
 
+// SaveTable returns the current Table pointer (if any) for the given table,
+// without removing it from storage. Used to save state before overwriting with a temp table.
+func (e *Engine) SaveTable(dbName, tableName string) *Table {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if db, ok := e.databases[dbName]; ok {
+		return db[tableName]
+	}
+	return nil
+}
+
+// RestoreTable puts a previously saved Table pointer back into storage under the given name.
+// Used to restore a permanent table after a shadowing temporary table is dropped.
+func (e *Engine) RestoreTable(dbName, tableName string, t *Table) {
+	if t == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, ok := e.databases[dbName]; !ok {
+		e.databases[dbName] = make(map[string]*Table)
+	}
+	e.databases[dbName][tableName] = t
+}
+
 func (e *Engine) GetTable(dbName, tableName string) (*Table, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -286,7 +311,7 @@ func (t *Table) Insert(row Row, noAutoValueOnZero ...bool) (int64, error) {
 					row[col.Name] = id
 					lastInsertID = id
 				}
-			} else {
+				} else {
 				// If explicit value provided, update auto_increment counter if needed
 				// Store the value itself (not value+1) because Add(1) will return value+1
 				if uv, ok := v.(uint64); ok {
@@ -347,7 +372,7 @@ func (t *Table) Insert(row Row, noAutoValueOnZero ...bool) (int64, error) {
 		if t.pkIndex[key] {
 			pkVal := make([]string, len(t.Def.PrimaryKey))
 			for i, pk := range t.Def.PrimaryKey {
-				pkVal[i] = displayValue(row[stripPrefixLength(pk)])
+				pkVal[i] = displayValue(rowGetCI(row, stripPrefixLength(pk)))
 			}
 			return 0, fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key 'PRIMARY'",
 				strings.Join(pkVal, "-"))
@@ -586,7 +611,7 @@ func (t *Table) BulkInsert(rows []Row) ([]int64, error) {
 				if pkSet[key] {
 					pkVal := make([]string, len(t.Def.PrimaryKey))
 					for i, pk := range t.Def.PrimaryKey {
-						pkVal[i] = displayValue(row[stripPrefixLength(pk)])
+						pkVal[i] = displayValue(rowGetCI(row, stripPrefixLength(pk)))
 					}
 					return ids[:ri], fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key 'PRIMARY'",
 						strings.Join(pkVal, "-"))
@@ -596,10 +621,11 @@ func (t *Table) BulkInsert(rows []Row) ([]int64, error) {
 			if hasPKCol {
 				for _, col := range t.Def.Columns {
 					if col.PrimaryKey {
-						key := fmt.Sprintf("%v", row[col.Name])
+						v := rowGetCI(row, col.Name)
+						key := fmt.Sprintf("%v", v)
 						if colPKSets[col.Name][key] {
 							return ids[:ri], fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key 'PRIMARY'",
-								displayValue(row[col.Name]))
+								displayValue(v))
 						}
 						colPKSets[col.Name][key] = true
 					}
@@ -635,14 +661,29 @@ func (t *Table) BulkInsert(rows []Row) ([]int64, error) {
 	return ids, nil
 }
 
+// rowGetCI returns the value for a column name using case-insensitive lookup.
+// It first tries exact match (fast path), then falls back to case-insensitive scan.
+func rowGetCI(row Row, col string) interface{} {
+	if v, ok := row[col]; ok {
+		return v
+	}
+	colLower := strings.ToLower(col)
+	for k, v := range row {
+		if strings.ToLower(k) == colLower {
+			return v
+		}
+	}
+	return nil
+}
+
 // bulkPKKey builds a hash key for composite primary key lookup.
 func bulkPKKey(row Row, pkCols []string) string {
 	if len(pkCols) == 1 {
-		return fmt.Sprintf("%v", row[stripPrefixLength(pkCols[0])])
+		return fmt.Sprintf("%v", rowGetCI(row, stripPrefixLength(pkCols[0])))
 	}
 	parts := make([]string, len(pkCols))
 	for i, pk := range pkCols {
-		parts[i] = fmt.Sprintf("%v", row[stripPrefixLength(pk)])
+		parts[i] = fmt.Sprintf("%v", rowGetCI(row, stripPrefixLength(pk)))
 	}
 	return strings.Join(parts, "\x00")
 }
@@ -828,6 +869,47 @@ func compareRowValue(a, b interface{}) int {
 	}
 	if b == nil {
 		return 1
+	}
+	// Handle uint64 comparisons directly to avoid float64 precision loss for large values
+	au64, aIsU64 := a.(uint64)
+	bu64, bIsU64 := b.(uint64)
+	if aIsU64 && bIsU64 {
+		if au64 < bu64 {
+			return -1
+		}
+		if au64 > bu64 {
+			return 1
+		}
+		return 0
+	}
+	// Mixed uint64/int64 comparisons
+	if aIsU64 {
+		if bi64, ok := b.(int64); ok {
+			if bi64 < 0 {
+				return 1 // uint64 is always >= 0 > negative int64
+			}
+			if au64 > uint64(bi64) {
+				return 1
+			}
+			if au64 < uint64(bi64) {
+				return -1
+			}
+			return 0
+		}
+	}
+	if bIsU64 {
+		if ai64, ok := a.(int64); ok {
+			if ai64 < 0 {
+				return -1 // negative int64 < uint64
+			}
+			if uint64(ai64) < bu64 {
+				return -1
+			}
+			if uint64(ai64) > bu64 {
+				return 1
+			}
+			return 0
+		}
 	}
 	af, aok := toComparableFloat(a)
 	bf, bok := toComparableFloat(b)

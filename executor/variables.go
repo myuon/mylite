@@ -113,6 +113,8 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				delete(e.sessionScopeVars, "character_set_connection")
 				delete(e.sessionScopeVars, "character_set_results")
 				delete(e.sessionScopeVars, "collation_connection")
+			} else if charset != "binary" && !isKnownCharset(charset) {
+				return nil, mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", charset))
 			} else {
 				e.sessionScopeVars["character_set_client"] = charset
 				e.sessionScopeVars["character_set_connection"] = charset
@@ -138,6 +140,17 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			} else {
 				e.sqlMode = modeVal
 				e.sessionScopeVars["sql_mode"] = modeVal
+			}
+			// Emit warning 3135 when NO_ZERO_DATE/NO_ZERO_IN_DATE/ERROR_FOR_DIVISION_BY_ZERO
+			// are explicitly set (MySQL deprecation warning — these will merge into strict mode).
+			// Warning is emitted unless TRADITIONAL mode is used (which already includes these).
+			if modeVal != defaultSQLMode && !strings.Contains(modeVal, "TRADITIONAL") {
+				hasSensitiveMode := strings.Contains(modeVal, "NO_ZERO_DATE") ||
+					strings.Contains(modeVal, "NO_ZERO_IN_DATE") ||
+					strings.Contains(modeVal, "ERROR_FOR_DIVISION_BY_ZERO")
+				if hasSensitiveMode {
+					e.addWarning("Warning", 3135, "'NO_ZERO_DATE', 'NO_ZERO_IN_DATE' and 'ERROR_FOR_DIVISION_BY_ZERO' sql modes should be used with strict mode. They will be merged with strict mode in a future release.")
+				}
 			}
 		case "sql_auto_is_null":
 			isOn := val == "1" || strings.ToUpper(val) == "ON" || strings.ToUpper(val) == "TRUE"
@@ -796,6 +809,15 @@ func (e *Executor) handleRawSet(raw string) error {
 				}
 			}
 			// SET STARTUP bypasses read-only and scope checks.
+			// Normalize boolean variables to ON/OFF.
+			if isBooleanVariable(varName) {
+				upperVal := strings.ToUpper(val)
+				if upperVal == "1" || upperVal == "ON" || upperVal == "TRUE" || upperVal == "YES" {
+					val = "ON"
+				} else if upperVal == "0" || upperVal == "OFF" || upperVal == "FALSE" || upperVal == "NO" {
+					val = "OFF"
+				}
+			}
 			// Store directly in both globalScopeVars and startupVars.
 			e.setGlobalVar(varName, val)
 			e.startupVars[varName] = val
@@ -892,6 +914,15 @@ func (e *Executor) handleRawSet(raw string) error {
 			} else {
 				e.sqlMode = modeVal
 				e.sessionScopeVars["sql_mode"] = modeVal
+			}
+			// Emit warning 3135 for deprecated sensitive modes (same as execSet path)
+			if modeVal != defaultSQLMode && !strings.Contains(modeVal, "TRADITIONAL") {
+				hasSensitiveMode := strings.Contains(modeVal, "NO_ZERO_DATE") ||
+					strings.Contains(modeVal, "NO_ZERO_IN_DATE") ||
+					strings.Contains(modeVal, "ERROR_FOR_DIVISION_BY_ZERO")
+				if hasSensitiveMode {
+					e.addWarning("Warning", 3135, "'NO_ZERO_DATE', 'NO_ZERO_IN_DATE' and 'ERROR_FOR_DIVISION_BY_ZERO' sql modes should be used with strict mode. They will be merged with strict mode in a future release.")
+				}
 			}
 		}
 	}
@@ -3225,7 +3256,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"log_error_verbosity":             "2",
 		"log_error_suppression_list":      "",
 		"log_error_services":              "log_filter_internal; log_sink_internal",
-		"log_bin":                         "ON",
+		"log_bin":                         "OFF",
 		"log_bin_basename":                "",
 		"log_bin_index":                   "",
 		"log_bin_trust_function_creators": "OFF",
@@ -3264,9 +3295,9 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"gtid_next":                        "AUTOMATIC",
 
 		// Replication
-		"relay_log":                "",
-		"relay_log_basename":       "",
-		"relay_log_index":          "",
+		"relay_log":                "localhost-relay-bin",
+		"relay_log_basename":       "/var/lib/mysql/localhost-relay-bin",
+		"relay_log_index":          "/var/lib/mysql/localhost-relay-bin.index",
 		"relay_log_info_file":      "relay-log.info",
 		"relay_log_purge":          "ON",
 		"relay_log_recovery":       "OFF",

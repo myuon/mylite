@@ -127,12 +127,13 @@ func (e *Executor) execCreateTrigger(query string) (*Result, error) {
 }
 
 // splitTriggerBody splits the body of a trigger/procedure into individual SQL statements.
+// It keeps compound statements (IF/CASE/WHILE/LOOP/REPEAT/BEGIN blocks) together.
 func splitTriggerBody(body string) []string {
 	var stmts []string
 	var current strings.Builder
 	inSingle := false
 	inDouble := false
-	depth := 0 // track nested BEGIN...END
+	depth := 0 // track nested compound block depth
 
 	words := body
 	i := 0
@@ -152,14 +153,52 @@ func splitTriggerBody(body string) []string {
 			}
 			current.Reset()
 		default:
-			// Track nested BEGIN...END for IF/WHILE blocks
+			// Track nested compound blocks (BEGIN/END, IF/END IF, CASE/END CASE,
+			// WHILE/END WHILE, LOOP/END LOOP, REPEAT/END REPEAT)
 			if !inSingle && !inDouble {
 				remaining := strings.ToUpper(words[i:])
-				if strings.HasPrefix(remaining, "BEGIN") && (i+5 >= len(words) || !isAlphaNum(words[i+5])) {
-					depth++
+				prevIsAlpha := i > 0 && isAlphaNum(words[i-1])
+				// A keyword is at "statement start" if the preceding non-whitespace char
+				// is ';', a newline (start of line), or the beginning of the body.
+				// This prevents matching SQL function calls like repeat('x', 10) or if(cond, a, b).
+				isStmtStart := i == 0
+				if !isStmtStart && i > 0 {
+					// Check if preceded only by whitespace since last ';' or start
+					j := i - 1
+					for j >= 0 && (words[j] == ' ' || words[j] == '\t') {
+						j--
+					}
+					if j < 0 || words[j] == ';' || words[j] == '\n' {
+						isStmtStart = true
+					}
 				}
-				if strings.HasPrefix(remaining, "END") && (i+3 >= len(words) || !isAlphaNum(words[i+3])) && depth > 0 {
+				// Check for block closers first: END IF, END CASE, END WHILE, etc.
+				// END can appear at statement start or inside UNTIL condition (e.g. UNTIL done END REPEAT)
+				if !prevIsAlpha && strings.HasPrefix(remaining, "END") && (i+3 >= len(words) || !isAlphaNum(words[i+3])) && depth > 0 {
 					depth--
+				} else if isStmtStart {
+					// Check for block openers (only if not part of an END xxx pattern)
+					// Helper: check if preceded by "END " or "END\n" or "END\t" (this keyword follows END)
+					isAfterEnd := i >= 4 && strings.ToUpper(words[i-4:i-1]) == "END" && (words[i-1] == ' ' || words[i-1] == '\n' || words[i-1] == '\t')
+					if !isAfterEnd {
+						if strings.HasPrefix(remaining, "BEGIN") && (i+5 >= len(words) || !isAlphaNum(words[i+5])) {
+							depth++
+						} else if strings.HasPrefix(remaining, "IF") && (i+2 >= len(words) || words[i+2] == ' ' || words[i+2] == '\t' || words[i+2] == '\n') {
+							// Skip ELSEIF (preceded by ELSE)
+							isElseIf := i >= 4 && strings.ToUpper(words[i-4:i]) == "ELSE"
+							if !isElseIf {
+								depth++
+							}
+						} else if strings.HasPrefix(remaining, "CASE") && (i+4 >= len(words) || !isAlphaNum(words[i+4])) {
+							depth++
+						} else if strings.HasPrefix(remaining, "WHILE") && (i+5 >= len(words) || !isAlphaNum(words[i+5])) {
+							depth++
+						} else if strings.HasPrefix(remaining, "LOOP") && (i+4 >= len(words) || !isAlphaNum(words[i+4])) {
+							depth++
+						} else if strings.HasPrefix(remaining, "REPEAT") && (i+6 >= len(words) || !isAlphaNum(words[i+6])) {
+							depth++
+						}
+					}
 				}
 			}
 			current.WriteByte(ch)
@@ -519,6 +558,17 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 	procName := strings.TrimSpace(rest[:parenIdx])
 	procName = strings.Trim(procName, "`")
 
+	// Handle qualified name (schema.procedure) - use the specified database
+	if dotIdx := strings.Index(procName, "."); dotIdx >= 0 {
+		qualDBName := strings.Trim(procName[:dotIdx], "`")
+		procName = strings.Trim(procName[dotIdx+1:], "`")
+		targetDB, dbErr := e.Catalog.GetDatabase(qualDBName)
+		if dbErr != nil {
+			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", qualDBName))
+		}
+		db = targetDB
+	}
+
 	// Extract params between first '(' and matching ')'
 	paramStart := parenIdx + 1
 	depth := 1
@@ -542,11 +592,20 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 	var bodyStmts []string
 	beginIdx := strings.Index(strings.ToUpper(afterParams), "BEGIN")
 	if beginIdx >= 0 {
-		bodyStr := strings.TrimSpace(afterParams[beginIdx+len("BEGIN"):])
-		if strings.HasSuffix(strings.ToUpper(strings.TrimSpace(bodyStr)), "END") {
-			bodyStr = strings.TrimSpace(bodyStr[:len(bodyStr)-len("END")])
+		// Check if there's a label before BEGIN (e.g. "foo: begin ... end foo")
+		beforeBegin := strings.TrimSpace(afterParams[:beginIdx])
+		hasLabel := len(beforeBegin) > 0 && beforeBegin[len(beforeBegin)-1] == ':'
+		if hasLabel {
+			// Store as single labeled block statement; execRoutineBodyWithContext handles it
+			bodyStr := strings.TrimSpace(afterParams)
+			bodyStmts = []string{bodyStr}
+		} else {
+			bodyStr := strings.TrimSpace(afterParams[beginIdx+len("BEGIN"):])
+			if strings.HasSuffix(strings.ToUpper(strings.TrimSpace(bodyStr)), "END") {
+				bodyStr = strings.TrimSpace(bodyStr[:len(bodyStr)-len("END")])
+			}
+			bodyStmts = splitTriggerBody(bodyStr)
 		}
-		bodyStmts = splitTriggerBody(bodyStr)
 	} else {
 		// Single-statement procedure (no BEGIN...END)
 		// Skip optional characteristics (LANGUAGE SQL, DETERMINISTIC, etc.)
@@ -556,8 +615,12 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 			trimmedBody := strings.TrimSpace(bodyStr)
 			upperBody = strings.ToUpper(trimmedBody)
 			if strings.HasPrefix(upperBody, "LANGUAGE ") {
-				if idx := strings.Index(trimmedBody[9:], " "); idx >= 0 {
-					bodyStr = trimmedBody[9+idx:]
+				// Skip the language name (single word after LANGUAGE)
+				// Find the end of the word (space, newline, or tab)
+				rest := trimmedBody[9:] // skip "LANGUAGE "
+				wordEnd := strings.IndexAny(rest, " \t\n\r")
+				if wordEnd >= 0 {
+					bodyStr = rest[wordEnd:]
 				} else {
 					break
 				}
@@ -796,12 +859,13 @@ func (e *Executor) callProcedureByNameInDB(dbName string, procName string, argSt
 	db, err := e.Catalog.GetDatabase(dbName)
 	if err != nil {
 		// Silently accept calls to procedures in unknown databases for compatibility
+		// (e.g., mtr.add_suppression is called by tests but mtr database doesn't exist)
 		return &Result{}, nil
 	}
 
 	proc := db.GetProcedure(procName)
 	if proc == nil {
-		// Silently accept calls to non-existent procedures for compatibility
+		// Silently accept calls to non-existent procedures in other databases for compatibility
 		return &Result{}, nil
 	}
 
@@ -847,8 +911,7 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 
 	proc := db.GetProcedure(procName)
 	if proc == nil {
-		// Silently accept calls to non-existent procedures for compatibility
-		return &Result{}, nil
+		return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", e.CurrentDB, procName))
 	}
 
 	// Build parameter mapping: bind IN/INOUT params, track OUT param user-variable targets.
@@ -893,9 +956,10 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 	// Execute body using the routine executor with cursor support.
 	// We create the context directly so we can read back final variable values.
 	ctx := &routineContext{
-		localVars:  make(map[string]interface{}),
-		cursors:    make(map[string]*cursorState),
-		cursorDefs: make(map[string]string),
+		localVars:     make(map[string]interface{}),
+		localVarTypes: make(map[string]string),
+		cursors:       make(map[string]*cursorState),
+		cursorDefs:    make(map[string]string),
 	}
 	for k, v := range paramVars {
 		ctx.localVars[k] = v
@@ -919,6 +983,10 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 		if r, ok := bodyResult.(*Result); ok && r != nil && r.IsResultSet {
 			return r, nil
 		}
+	}
+	// Also check the handlerResult which holds the last SELECT result set from normal body execution.
+	if ctx.handlerResult != nil && ctx.handlerResult.IsResultSet {
+		return ctx.handlerResult, nil
 	}
 
 	return &Result{}, nil
@@ -989,6 +1057,57 @@ func truncateNear(s string) string {
 		return s[:80]
 	}
 	return s
+}
+
+var vitessPositionRe = regexp.MustCompile(`syntax error at position (\d+)`)
+var vitessNearRe = regexp.MustCompile(`\bnear '([^']*)'`)
+
+// extractNearFromParseError extracts a MySQL-compatible "near" text from a vitess parse error.
+// Vitess reports "syntax error at position N near 'TOKEN'" where N is 0-indexed position
+// pointing after the bad token. We find the start of that token in the original query
+// and return the rest of the query from that point (up to 80 chars).
+func extractNearFromParseError(query string, parseErr error) string {
+	if parseErr == nil {
+		return truncateNear(query)
+	}
+	errMsg := parseErr.Error()
+
+	// Try to use both position and near-token from vitess error
+	pm := vitessPositionRe.FindStringSubmatch(errMsg)
+	nm := vitessNearRe.FindStringSubmatch(errMsg)
+
+	if pm != nil && nm != nil {
+		pos, err := strconv.Atoi(pm[1])
+		if err == nil && pos > 0 && pos <= len(query) {
+			tokenStr := nm[1]
+			// Search backwards from pos for the token
+			searchFrom := pos - len(tokenStr) - 1
+			if searchFrom < 0 {
+				searchFrom = 0
+			}
+			for i := searchFrom; i >= 0; i-- {
+				if i+len(tokenStr) <= len(query) && query[i:i+len(tokenStr)] == tokenStr {
+					near := query[i:]
+					if len(near) > 80 {
+						near = near[:80]
+					}
+					return near
+				}
+			}
+			// Fallback: use position directly
+			start := pos - 1
+			if start < 0 {
+				start = 0
+			}
+			near := query[start:]
+			if len(near) > 80 {
+				near = near[:80]
+			}
+			return near
+		}
+	}
+
+	return truncateNear(query)
 }
 
 // execCreateFunction handles CREATE FUNCTION name(params) RETURNS type BEGIN...END
@@ -1251,6 +1370,7 @@ type handlerDef struct {
 // routineContext holds shared state for a stored routine execution.
 type routineContext struct {
 	localVars          map[string]interface{}
+	localVarTypes      map[string]string // declared SQL type for each local variable (e.g. "DOUBLE(10,3)")
 	cursors            map[string]*cursorState
 	cursorDefs         map[string]string
 	notFoundHandlerVar string
@@ -1268,14 +1388,15 @@ type routineContext struct {
 func (ctx *routineContext) childContext() *routineContext {
 	child := &routineContext{
 		localVars:          ctx.localVars,
+		localVarTypes:      ctx.localVarTypes,
 		cursors:            ctx.cursors,
 		cursorDefs:         ctx.cursorDefs,
 		notFoundHandlerVar: ctx.notFoundHandlerVar,
 		done:               ctx.done,
 		handlers:           ctx.handlers,
-		triggerNewRow:       ctx.triggerNewRow,
-		triggerOldRow:       ctx.triggerOldRow,
-		triggerTiming:       ctx.triggerTiming,
+		triggerNewRow:      ctx.triggerNewRow,
+		triggerOldRow:      ctx.triggerOldRow,
+		triggerTiming:      ctx.triggerTiming,
 	}
 	return child
 }
@@ -1284,9 +1405,10 @@ func (ctx *routineContext) childContext() *routineContext {
 // DECLARE, SET, IF, WHILE, REPEAT, CURSOR, HANDLER, RETURN, and general SQL statements.
 func (e *Executor) execRoutineBody(body []string, paramVars map[string]interface{}) (interface{}, error) {
 	ctx := &routineContext{
-		localVars:  make(map[string]interface{}),
-		cursors:    make(map[string]*cursorState),
-		cursorDefs: make(map[string]string),
+		localVars:     make(map[string]interface{}),
+		localVarTypes: make(map[string]string),
+		cursors:       make(map[string]*cursorState),
+		cursorDefs:    make(map[string]string),
 	}
 	for k, v := range paramVars {
 		ctx.localVars[k] = v
@@ -1444,7 +1566,11 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 							strings.HasPrefix(nameUpper, "CHAR(") || strings.HasPrefix(nameUpper, "VARCHAR(") ||
 							strings.HasPrefix(nameUpper, "DECIMAL(") || strings.HasPrefix(nameUpper, "NUMERIC(") ||
 							strings.HasPrefix(nameUpper, "ENUM(") || strings.HasPrefix(nameUpper, "BIT(") ||
-							strings.HasPrefix(nameUpper, "BINARY(") || strings.HasPrefix(nameUpper, "VARBINARY(") {
+							strings.HasPrefix(nameUpper, "BINARY(") || strings.HasPrefix(nameUpper, "VARBINARY(") ||
+							strings.HasPrefix(nameUpper, "DOUBLE(") || strings.HasPrefix(nameUpper, "FLOAT(") ||
+							strings.HasPrefix(nameUpper, "INT(") || strings.HasPrefix(nameUpper, "BIGINT(") ||
+							strings.HasPrefix(nameUpper, "TINYINT(") || strings.HasPrefix(nameUpper, "SMALLINT(") ||
+							strings.HasPrefix(nameUpper, "MEDIUMINT(") {
 							isType = true
 							break
 						}
@@ -1509,8 +1635,25 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 						break
 					}
 				}
+				// Build full type string for type tracking (e.g. "DOUBLE(10,3)")
+				fullTypeName := ""
+				if typeIdx < len(declParts) {
+					// Collect type tokens up to DEFAULT or end
+					typeParts := []string{}
+					for j := typeIdx; j < len(declParts); j++ {
+						u := strings.ToUpper(declParts[j])
+						if u == "DEFAULT" || u == "NOT" || u == "NULL" || u == "UNSIGNED" || u == "ZEROFILL" {
+							break
+						}
+						typeParts = append(typeParts, declParts[j])
+					}
+					fullTypeName = strings.Join(typeParts, " ")
+				}
 				for _, vn := range varNames {
 					localVars[vn] = defaultVal
+					if ctx.localVarTypes != nil && fullTypeName != "" {
+						ctx.localVarTypes[strings.ToLower(vn)] = fullTypeName
+					}
 				}
 			}
 			continue
@@ -1604,6 +1747,14 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 			// Try to evaluate as an expression
 			val, err := e.evaluateExprWithVars(exprStr, localVars)
 			if err != nil {
+				// Check if a handler can catch this error before trying fallback
+				handled, exitFlag := e.tryHandler(err, ctx)
+				if handled {
+					if exitFlag {
+						return nil, nil // EXIT handler: stop block
+					}
+					continue // CONTINUE handler: skip this RETURN, keep executing
+				}
 				// Fallback for RETURN (SELECT ...): evaluate the inner scalar query.
 				resolvedExpr := strings.TrimSpace(exprStr)
 				if strings.HasPrefix(resolvedExpr, "(") && strings.HasSuffix(resolvedExpr, ")") {
@@ -1631,6 +1782,14 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 				}
 				res, qerr := e.Execute(resolvedExpr)
 				if qerr != nil || res == nil || len(res.Rows) == 0 || len(res.Rows[0]) == 0 {
+					// Also try handlers for this fallback error
+					handled2, exitFlag2 := e.tryHandler(err, ctx)
+					if handled2 {
+						if exitFlag2 {
+							return nil, nil
+						}
+						continue
+					}
 					return nil, err
 				}
 				return res.Rows[0][0], nil
@@ -1652,7 +1811,21 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 					resolvedSQL := e.substituteLocalVars(stmtStr, localVars)
 					e.Execute(resolvedSQL) //nolint:errcheck
 				} else {
-					localVars[varName] = val
+					// User variables (@var) are session-scoped and must persist outside the routine.
+					if strings.HasPrefix(varName, "@") {
+						if e.userVars == nil {
+							e.userVars = make(map[string]interface{})
+						}
+						e.userVars[strings.TrimPrefix(varName, "@")] = val
+					} else {
+						// Apply declared-type formatting (e.g. DOUBLE(10,3) -> "100.000")
+						if ctx.localVarTypes != nil {
+							if declaredType, ok := ctx.localVarTypes[strings.ToLower(varName)]; ok {
+								val = formatDecimalValue(declaredType, val)
+							}
+						}
+						localVars[varName] = val
+					}
 				}
 			} else {
 				resolvedSQL := e.substituteLocalVars(stmtStr, localVars)
@@ -2024,6 +2197,10 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 	}
 
 	_ = done
+	// Return the last SELECT result set if any, otherwise the return value.
+	if ctx.handlerResult != nil && ctx.handlerResult.IsResultSet {
+		return ctx.handlerResult, nil
+	}
 	return returnVal, nil
 }
 
@@ -2134,9 +2311,17 @@ func (e *Executor) execCaseBlockCtx(block string, ctx *routineContext) (interfac
 		cond := strings.TrimSpace(remaining[:thenIdx])
 		remaining = strings.TrimSpace(remaining[thenIdx+5:]) // skip " THEN"
 
-		// Find next WHEN or ELSE or end
-		nextWhen := findTopLevelKeyword(remaining, "WHEN ")
-		nextElse := findTopLevelKeyword(remaining, "ELSE ")
+		// Find next WHEN or ELSE or end (using depth-aware search to skip nested blocks)
+		nextWhen := findKeywordAtDepth0(remaining, "WHEN ")
+		nextElseSpace := findKeywordAtDepth0(remaining, "ELSE ")
+		nextElseNewline := findKeywordAtDepth0(remaining, "ELSE\n")
+		nextElse := -1
+		if nextElseSpace >= 0 && (nextElse < 0 || nextElseSpace < nextElse) {
+			nextElse = nextElseSpace
+		}
+		if nextElseNewline >= 0 && (nextElse < 0 || nextElseNewline < nextElse) {
+			nextElse = nextElseNewline
+		}
 		// Pick the earliest
 		endIdx := len(remaining)
 		if nextWhen >= 0 && nextWhen < endIdx {
@@ -2272,6 +2457,9 @@ func (e *Executor) tryHandler(err error, ctx *routineContext) (bool, bool) {
 	var sigErr *signalError
 	isSignal := errors.As(err, &sigErr)
 
+	// Also extract SQLSTATE from regular mysqlError strings (e.g. "ERROR 1305 (42000): ...")
+	mysqlSQLState := extractMySQLSQLState(err)
+
 	for _, h := range ctx.handlers {
 		matched := false
 		for _, cond := range h.conditions {
@@ -2283,6 +2471,11 @@ func (e *Executor) tryHandler(err error, ctx *routineContext) (bool, bool) {
 					if !strings.HasPrefix(sigErr.sqlState, "02") && !strings.HasPrefix(sigErr.sqlState, "01") {
 						matched = true
 					}
+				} else if mysqlSQLState != "" {
+					// MySQL error: check SQLSTATE class
+					if !strings.HasPrefix(mysqlSQLState, "02") && !strings.HasPrefix(mysqlSQLState, "01") {
+						matched = true
+					}
 				} else {
 					// Non-signal errors are generally SQLEXCEPTION
 					matched = true
@@ -2290,15 +2483,29 @@ func (e *Executor) tryHandler(err error, ctx *routineContext) (bool, bool) {
 			case "NOT FOUND":
 				if isSignal && strings.HasPrefix(sigErr.sqlState, "02") {
 					matched = true
+				} else if mysqlSQLState != "" && strings.HasPrefix(mysqlSQLState, "02") {
+					matched = true
 				}
 			case "SQLWARNING":
 				if isSignal && strings.HasPrefix(sigErr.sqlState, "01") {
+					matched = true
+				} else if mysqlSQLState != "" && strings.HasPrefix(mysqlSQLState, "01") {
 					matched = true
 				}
 			default:
 				// Specific SQLSTATE or error number
 				if isSignal && sigErr.sqlState == cond {
 					matched = true
+				} else if mysqlSQLState != "" && mysqlSQLState == cond {
+					matched = true
+				} else if !isSignal && mysqlSQLState == "" {
+					// Check if condition is a numeric error code
+					// e.g., cond = "1305" matches isMySQLError(err, 1305)
+					if code, parseErr := strconv.Atoi(cond); parseErr == nil {
+						if isMySQLError(err, code) {
+							matched = true
+						}
+					}
 				}
 			}
 		}
@@ -2375,6 +2582,58 @@ func (e *Executor) substituteLocalVars(sql string, vars map[string]interface{}) 
 	return result
 }
 
+// isColumnNameContext checks if position i in string s is inside an INSERT column list.
+// This detects patterns like "INSERT INTO t1 (col1, col2)" where we shouldn't substitute.
+// It does NOT match VALUES lists like "INSERT INTO t1 VALUES (x, y)".
+func isColumnNameContext(s string, i int) bool {
+	// Look backwards to check if we're inside "INSERT INTO table (" column list
+	depth := 0
+	for j := i - 1; j >= 0; j-- {
+		ch := s[j]
+		if ch == ')' {
+			depth++
+		} else if ch == '(' {
+			if depth == 0 {
+				// We found the enclosing '('
+				// Look at what's immediately before this paren (trimmed)
+				before := strings.TrimSpace(s[:j])
+				beforeUpper := strings.ToUpper(before)
+				// Check for VALUES before the paren - that means it's a VALUES list, not column list
+				if strings.HasSuffix(beforeUpper, "VALUES") || strings.HasSuffix(beforeUpper, "VALUE") {
+					return false
+				}
+				if strings.HasSuffix(before, ")") {
+					// Could be VALUES (...) or nested, not a column list
+					return false
+				}
+				// Check if this looks like a column list (after INSERT INTO tbl or REPLACE INTO tbl)
+				// The word right before ( should be a table name, and before that INTO/table
+				words := strings.Fields(before)
+				if len(words) == 0 {
+					return false
+				}
+				// Walk backwards looking for INSERT/REPLACE keyword
+				// Allow skipping table name and INTO
+				for k := len(words) - 1; k >= 0; k-- {
+					wu := strings.ToUpper(words[k])
+					if wu == "INSERT" || wu == "REPLACE" {
+						// Found INSERT/REPLACE - this is a column list
+						return true
+					}
+					// If we hit VALUES, a semicolon, or other DML keywords, stop
+					if wu == "VALUES" || wu == ";" || wu == "SET" || wu == "WHERE" || wu == "SELECT" || wu == "FROM" {
+						break
+					}
+					// INTO/table name/db.table: keep walking backwards
+				}
+				return false
+			}
+			depth--
+		}
+	}
+	return false
+}
+
 // replaceWordBoundary replaces occurrences of word in s only when they appear at word boundaries.
 func replaceWordBoundary(s, word, replacement string) string {
 	var result strings.Builder
@@ -2413,6 +2672,30 @@ func replaceWordBoundary(s, word, replacement string) string {
 				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (ch >= '0' && ch <= '9') || ch == '.' {
 					result.WriteByte(s[i])
 					i++
+					continue
+				}
+			}
+			// Don't substitute if this is in a column name context (e.g. INSERT INTO t (col, var_name))
+			if isColumnNameContext(s, i) {
+				result.WriteString(s[i : i+wordLen])
+				i += wordLen
+				continue
+			}
+			// Don't substitute if this word is immediately followed by '=' (SET col = val context)
+			// This handles REPLACE t SET col = val and UPDATE t SET col = val
+			endPos := i + wordLen
+			tempPos := endPos
+			for tempPos < len(s) && (s[tempPos] == ' ' || s[tempPos] == '\t') {
+				tempPos++
+			}
+			if tempPos < len(s) && s[tempPos] == '=' && (tempPos+1 >= len(s) || s[tempPos+1] != '=') {
+				// This word is followed by = (not ==), likely a column name in SET
+				// But only skip if we're actually in a SET context
+				// Check if there's SET somewhere before, skipping other assignments
+				beforePos := strings.ToUpper(s[:i])
+				if strings.Contains(beforePos, " SET ") || strings.HasSuffix(strings.TrimSpace(beforePos), "SET") {
+					result.WriteString(s[i : i+wordLen])
+					i += wordLen
 					continue
 				}
 			}
@@ -2563,13 +2846,16 @@ func (e *Executor) execIfBlock(block string, localVars map[string]interface{}, c
 	}
 
 	// Find the first THEN keyword (at the top level, not inside a nested IF)
-	thenIdx := findTopLevelKeyword(trimmed, " THEN")
+	// Use whitespace-aware finder to handle multiline IF...THEN
+	thenIdx := findThenKeyword(trimmed)
 	if thenIdx < 0 {
 		return false, nil, nil
 	}
 
 	condStr := strings.TrimSpace(trimmed[3:thenIdx]) // skip "IF "
-	bodyAfterThen := strings.TrimSpace(trimmed[thenIdx+len(" THEN"):])
+	// thenIdx points at whitespace before THEN; skip whitespace + "THEN"
+	afterWhitespace := strings.TrimLeft(trimmed[thenIdx:], " \t\n\r")
+	bodyAfterThen := strings.TrimSpace(afterWhitespace[len("THEN"):])
 
 	// In trigger context, resolve NEW/OLD references in the condition
 	if parentCtx != nil && (parentCtx.triggerNewRow != nil || parentCtx.triggerOldRow != nil) {
@@ -2628,48 +2914,198 @@ func (e *Executor) execIfBlock(block string, localVars map[string]interface{}, c
 	return false, nil, nil
 }
 
-// findTopLevelKeyword finds a keyword at the top level (not inside nested IF/END IF blocks).
+// findTopLevelKeyword finds a keyword at the top level (not inside nested compound blocks).
+// For simple cases like finding " THEN" in "IF cond THEN body", use strings.Index directly.
 func findTopLevelKeyword(s, keyword string) int {
 	upper := strings.ToUpper(s)
 	return strings.Index(upper, keyword)
 }
 
-// splitAtTopLevelElse splits body at the top-level ELSE keyword, respecting nested IF blocks.
+// findWhileDoKeyword finds the DO keyword in a WHILE condition string.
+// DO must be preceded by whitespace (space, tab, or newline) and followed by
+// whitespace or end-of-string to avoid matching partial words.
+// Returns (position of whitespace before DO, total length of whitespace+DO).
+func findWhileDoKeyword(s string) (int, int) {
+	upper := strings.ToUpper(s)
+	for i := 0; i < len(upper); i++ {
+		if (upper[i] == ' ' || upper[i] == '\t' || upper[i] == '\n' || upper[i] == '\r') &&
+			i+1 < len(upper) && upper[i+1] == 'D' &&
+			i+2 < len(upper) && upper[i+2] == 'O' &&
+			(i+3 >= len(upper) || upper[i+3] == ' ' || upper[i+3] == '\t' || upper[i+3] == '\n' || upper[i+3] == '\r') {
+			return i, 3 // position of whitespace, length = 1 (whitespace) + 2 (DO)
+		}
+	}
+	return -1, 0
+}
+
+// findThenKeyword finds the THEN keyword in an IF condition string.
+// THEN must be preceded by whitespace (space, tab, or newline).
+// Returns the index of the whitespace character before THEN (so condStr = s[:idx]).
+func findThenKeyword(s string) int {
+	upper := strings.ToUpper(s)
+	for i := 0; i < len(upper); i++ {
+		if (upper[i] == ' ' || upper[i] == '\t' || upper[i] == '\n' || upper[i] == '\r') &&
+			i+4 < len(upper) && upper[i+1] == 'T' && upper[i+2] == 'H' && upper[i+3] == 'E' && upper[i+4] == 'N' &&
+			(i+5 >= len(upper) || upper[i+5] == ' ' || upper[i+5] == '\t' || upper[i+5] == '\n' || upper[i+5] == '\r') {
+			return i // position of the whitespace before THEN
+		}
+	}
+	return -1
+}
+
+// findKeywordAtDepth0 finds a keyword at depth 0, skipping nested compound blocks.
+// Compound blocks tracked: BEGIN/END, IF/END IF, CASE/END CASE, WHILE/END WHILE,
+// LOOP/END LOOP, REPEAT/END REPEAT. The initial depth is assumed to be 0.
+func findKeywordAtDepth0(s, keyword string) int {
+	upper := strings.ToUpper(s)
+	depth := 0
+	i := 0
+	kLen := len(keyword)
+	kupper := strings.ToUpper(keyword)
+
+	for i < len(upper) {
+		// Skip string literals (single or double quoted)
+		if s[i] == '\'' || s[i] == '"' {
+			quote := s[i]
+			i++
+			for i < len(s) {
+				if s[i] == '\\' {
+					i += 2
+					continue
+				}
+				if s[i] == quote {
+					break
+				}
+				i++
+			}
+			i++
+			continue
+		}
+
+		prevIsAlpha := i > 0 && isAlphaNum(upper[i-1])
+
+		// Check for the target keyword at depth 0
+		if depth == 0 && !prevIsAlpha && i+kLen <= len(upper) && upper[i:i+kLen] == kupper {
+			return i
+		}
+
+		// Track nesting depth - check for block closers first
+		if !prevIsAlpha && i+3 <= len(upper) && upper[i:i+3] == "END" && (i+3 >= len(upper) || !isAlphaNum(upper[i+3])) {
+			if depth > 0 {
+				depth--
+			}
+			i++
+			continue
+		}
+
+		// Check for block openers
+		isAfterEnd := i >= 4 && upper[i-4:i-1] == "END" && (upper[i-1] == ' ' || upper[i-1] == '\t' || upper[i-1] == '\n')
+		if !prevIsAlpha && !isAfterEnd {
+			if i+5 <= len(upper) && upper[i:i+5] == "BEGIN" && (i+5 >= len(upper) || !isAlphaNum(upper[i+5])) {
+				depth++
+			} else if i+2 <= len(upper) && upper[i:i+2] == "IF" && i+2 < len(upper) && (upper[i+2] == ' ' || upper[i+2] == '\t' || upper[i+2] == '\n') {
+				isElseIf := i >= 4 && upper[i-4:i] == "ELSE"
+				if !isElseIf {
+					depth++
+				}
+			} else if i+4 <= len(upper) && upper[i:i+4] == "CASE" && (i+4 >= len(upper) || !isAlphaNum(upper[i+4])) {
+				depth++
+			} else if i+5 <= len(upper) && upper[i:i+5] == "WHILE" && (i+5 >= len(upper) || !isAlphaNum(upper[i+5])) {
+				depth++
+			} else if i+4 <= len(upper) && upper[i:i+4] == "LOOP" && (i+4 >= len(upper) || !isAlphaNum(upper[i+4])) {
+				depth++
+			} else if i+6 <= len(upper) && upper[i:i+6] == "REPEAT" && (i+6 >= len(upper) || !isAlphaNum(upper[i+6])) {
+				depth++
+			}
+		}
+
+		i++
+	}
+	return -1
+}
+
+// splitAtTopLevelElse splits body at the top-level ELSE keyword, respecting nested compound blocks.
+// Tracks depth for: BEGIN/END, IF/END IF, CASE/END CASE, WHILE/END WHILE, LOOP/END LOOP, REPEAT/END REPEAT.
 func splitAtTopLevelElse(body string) (thenBody, elseBody string, hasElse bool) {
 	upper := strings.ToUpper(body)
 	depth := 0
 
 	for i := 0; i < len(upper); i++ {
-		// Track IF nesting
-		if i+3 <= len(upper) && upper[i:i+3] == "IF " {
-			if i == 0 || !isAlphaNum(body[i-1]) {
-				// Make sure it's not ELSEIF or END IF
-				if i < 4 || upper[i-4:i] != "END " {
-					if i < 4 || !strings.HasSuffix(upper[:i], "ELSE") {
-						depth++
-					}
+		// Skip string literals (single or double quoted)
+		if body[i] == '\'' || body[i] == '"' {
+			quote := body[i]
+			i++
+			for i < len(body) {
+				if body[i] == '\\' {
+					i += 2
+					continue
+				}
+				if body[i] == quote {
+					break
+				}
+				i++
+			}
+			continue
+		}
+
+		prevIsAlpha := i > 0 && isAlphaNum(body[i-1])
+
+		// Track block closers: END (any suffix)
+		if !prevIsAlpha && i+3 <= len(upper) && upper[i:i+3] == "END" && (i+3 >= len(upper) || !isAlphaNum(upper[i+3])) {
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+
+		// Track block openers (not after END)
+		isAfterEnd := i >= 4 && upper[i-4:i-1] == "END" && (body[i-1] == ' ' || body[i-1] == '\t' || body[i-1] == '\n')
+		if !prevIsAlpha && !isAfterEnd {
+			if i+5 <= len(upper) && upper[i:i+5] == "BEGIN" && (i+5 >= len(upper) || !isAlphaNum(upper[i+5])) {
+				depth++
+				continue
+			}
+			if i+2 <= len(upper) && upper[i:i+2] == "IF" && i+2 < len(upper) && (upper[i+2] == ' ' || upper[i+2] == '\t' || upper[i+2] == '\n') {
+				isElseIf := i >= 4 && upper[i-4:i] == "ELSE"
+				if !isElseIf {
+					depth++
+					continue
 				}
 			}
-		}
-		if i+6 <= len(upper) && upper[i:i+6] == "END IF" {
-			if i == 0 || !isAlphaNum(body[i-1]) {
-				depth--
+			if i+4 <= len(upper) && upper[i:i+4] == "CASE" && (i+4 >= len(upper) || !isAlphaNum(upper[i+4])) {
+				depth++
+				continue
+			}
+			if i+5 <= len(upper) && upper[i:i+5] == "WHILE" && (i+5 >= len(upper) || !isAlphaNum(upper[i+5])) {
+				depth++
+				continue
+			}
+			if i+4 <= len(upper) && upper[i:i+4] == "LOOP" && (i+4 >= len(upper) || !isAlphaNum(upper[i+4])) {
+				depth++
+				continue
+			}
+			if i+6 <= len(upper) && upper[i:i+6] == "REPEAT" && (i+6 >= len(upper) || !isAlphaNum(upper[i+6])) {
+				depth++
+				continue
 			}
 		}
 
 		// Look for ELSE at depth 0
 		if depth == 0 && i+4 <= len(upper) && upper[i:i+4] == "ELSE" {
-			if (i == 0 || !isAlphaNum(body[i-1])) && (i+4 >= len(upper) || !isAlphaNum(body[i+4])) {
-				// Make sure it's not ELSEIF
-				if i+6 <= len(upper) && upper[i:i+6] == "ELSEIF" {
+			if i == 0 || !isAlphaNum(body[i-1]) {
+				// Check for ELSEIF first (before the word-boundary check on body[i+4])
+				if i+6 <= len(upper) && upper[i:i+6] == "ELSEIF" && (i+6 >= len(upper) || !isAlphaNum(body[i+6])) {
 					// It's ELSEIF - treat as ELSE + IF
 					thenBody = strings.TrimSpace(body[:i])
 					elseBody = strings.TrimSpace(body[i+4:]) // skip ELSE, leave IF
 					return thenBody, elseBody, true
 				}
-				thenBody = strings.TrimSpace(body[:i])
-				elseBody = strings.TrimSpace(body[i+4:]) // skip "ELSE"
-				return thenBody, elseBody, true
+				// Plain ELSE: check word boundary after
+				if i+4 >= len(upper) || !isAlphaNum(body[i+4]) {
+					thenBody = strings.TrimSpace(body[:i])
+					elseBody = strings.TrimSpace(body[i+4:]) // skip "ELSE"
+					return thenBody, elseBody, true
+				}
 			}
 		}
 	}
@@ -2761,13 +3197,13 @@ func (e *Executor) execWhileBlock(block string, localVars map[string]interface{}
 		bodyStr = strings.TrimSpace(bodyStr[len("WHILE "):])
 	}
 
-	// Find DO keyword
-	doIdx := strings.Index(strings.ToUpper(bodyStr), " DO")
+	// Find DO keyword (may be preceded by space, tab, or newline)
+	doIdx, doLen := findWhileDoKeyword(bodyStr)
 	if doIdx < 0 {
 		return nil, fmt.Errorf("WHILE without DO")
 	}
 	condStr := strings.TrimSpace(bodyStr[:doIdx])
-	afterDo := strings.TrimSpace(bodyStr[doIdx+len(" DO"):])
+	afterDo := strings.TrimSpace(bodyStr[doIdx+doLen:])
 
 	// Remove trailing END WHILE
 	bodyUpper := strings.ToUpper(afterDo)
@@ -2879,12 +3315,12 @@ func (e *Executor) execWhileBlockWithLabel(block string, label string, ctx *rout
 		bodyStr = strings.TrimSpace(bodyStr[len("WHILE "):])
 	}
 
-	doIdx := strings.Index(strings.ToUpper(bodyStr), " DO")
+	doIdx, doLen := findWhileDoKeyword(bodyStr)
 	if doIdx < 0 {
 		return nil, fmt.Errorf("WHILE without DO")
 	}
 	condStr := strings.TrimSpace(bodyStr[:doIdx])
-	afterDo := strings.TrimSpace(bodyStr[doIdx+len(" DO"):])
+	afterDo := strings.TrimSpace(bodyStr[doIdx+doLen:])
 
 	// Remove trailing END WHILE [label]
 	bodyUpper := strings.ToUpper(afterDo)

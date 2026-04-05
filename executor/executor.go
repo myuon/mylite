@@ -226,6 +226,12 @@ type psDigestEntry struct {
 	CountStar  int64
 }
 
+// savedPermTable holds the state of a permanent table that was shadowed by a temporary table.
+type savedPermTable struct {
+	def   *catalog.TableDef
+	table *storage.Table
+}
+
 // Executor handles SQL execution.
 type Executor struct {
 	Catalog        *catalog.Catalog
@@ -265,6 +271,10 @@ type Executor struct {
 	preparedStmts map[string]string
 	// tempTables stores temporary tables per session (table name -> true).
 	tempTables map[string]bool
+	// tempTableSavedPermanent stores the saved permanent table state (catalog def + storage table)
+	// for tables that were shadowed by a temporary table. When the temp table is dropped,
+	// the permanent state is restored. Key is tableName.
+	tempTableSavedPermanent map[string]*savedPermTable
 	// globalScopeVars stores SET GLOBAL variable overrides.
 	// Access must be protected by globalVarsMu.
 	globalScopeVars map[string]string
@@ -297,6 +307,12 @@ type Executor struct {
 	// onDupValuesRow holds the candidate INSERT row while evaluating
 	// ON DUPLICATE KEY UPDATE expressions (for VALUES(col) support).
 	onDupValuesRow storage.Row
+	// defaultsTableDef holds the table definition for evaluating DEFAULT(col) expressions.
+	// Set during INSERT/UPDATE operations so that DEFAULT(colname) can look up the column default.
+	defaultsTableDef *catalog.TableDef
+	// defaultsByColName is an auxiliary map for DEFAULT(col) lookups that supplements defaultsTableDef.
+	// It can contain columns from source tables in INSERT ... SELECT ... ON DUPLICATE KEY UPDATE.
+	defaultsByColName map[string]interface{}
 	// subqueryValCache caches results of non-correlated IN subqueries
 	// within the same top-level query execution.  Keyed by the SQL
 	// string of the subquery.
@@ -318,6 +334,10 @@ type Executor struct {
 	lastFoundRows int64
 	// routineDepth tracks the current stored routine call depth to prevent infinite recursion.
 	routineDepth int
+	// exprDepth tracks the current expression evaluation depth to prevent Go stack overflow
+	// on deeply nested expressions. MySQL returns ER_STACK_OVERRUN_NEED_MORE (1436) when
+	// the expression stack exceeds its limit.
+	exprDepth int
 	// psTruncated tracks performance_schema tables that have been TRUNCATED.
 	// These tables return empty result sets until data is re-inserted.
 	psTruncated map[string]bool
@@ -566,7 +586,8 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		snapshots:     make(map[string]*fullSnapshot),
 		userVars:      make(map[string]interface{}),
 		preparedStmts: make(map[string]string),
-		tempTables:    make(map[string]bool),
+		tempTables:              make(map[string]bool),
+		tempTableSavedPermanent: make(map[string]*savedPermTable),
 		globalScopeVars: map[string]string{
 			"general_log":                    "ON",
 			"slow_query_log":                 "ON",
@@ -644,8 +665,9 @@ func (e *Executor) Clone() *Executor {
 		snapshots:        make(map[string]*fullSnapshot),
 		userVars:         make(map[string]interface{}),
 		preparedStmts:    make(map[string]string),
-		tempTables:       make(map[string]bool),
-		globalScopeVars:  e.globalScopeVars,
+		tempTables:              make(map[string]bool),
+		tempTableSavedPermanent: make(map[string]*savedPermTable),
+		globalScopeVars:         e.globalScopeVars,
 		globalVarsMu:     e.globalVarsMu,
 		sessionScopeVars: sessVars,
 		startupVars:      e.startupVars,
@@ -1183,10 +1205,10 @@ func (e *Executor) initSystemTables() {
 		Name: "server_cost",
 		Columns: []catalog.ColumnDef{
 			{Name: "cost_name", Type: "VARCHAR(64)"},
-			{Name: "cost_value", Type: "FLOAT"},
+			{Name: "cost_value", Type: "FLOAT", Nullable: true},
 			{Name: "last_update", Type: "TIMESTAMP"},
-			{Name: "comment", Type: "VARCHAR(1024)"},
-			{Name: "default_value", Type: "FLOAT"},
+			{Name: "comment", Type: "VARCHAR(1024)", Nullable: true},
+			{Name: "default_value", Type: "FLOAT", Nullable: true},
 		},
 	})
 	ensure("mysql", &catalog.TableDef{
@@ -1195,10 +1217,10 @@ func (e *Executor) initSystemTables() {
 			{Name: "engine_name", Type: "VARCHAR(64)"},
 			{Name: "device_type", Type: "INT"},
 			{Name: "cost_name", Type: "VARCHAR(64)"},
-			{Name: "cost_value", Type: "FLOAT"},
+			{Name: "cost_value", Type: "FLOAT", Nullable: true},
 			{Name: "last_update", Type: "TIMESTAMP"},
-			{Name: "comment", Type: "VARCHAR(1024)"},
-			{Name: "default_value", Type: "FLOAT"},
+			{Name: "comment", Type: "VARCHAR(1024)", Nullable: true},
+			{Name: "default_value", Type: "FLOAT", Nullable: true},
 		},
 	})
 	ensure("mysql", &catalog.TableDef{
@@ -1265,6 +1287,222 @@ func (e *Executor) initSystemTables() {
 			{Name: "Grantor", Type: "VARCHAR(288)"},
 			{Name: "Proc_priv", Type: "VARCHAR(200)"},
 			{Name: "Timestamp", Type: "TIMESTAMP"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "component",
+		Columns: []catalog.ColumnDef{
+			{Name: "component_id", Type: "INT UNSIGNED"},
+			{Name: "component_group_id", Type: "INT UNSIGNED"},
+			{Name: "component_urn", Type: "TEXT"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "global_grants",
+		Columns: []catalog.ColumnDef{
+			{Name: "USER", Type: "VARCHAR(32)"},
+			{Name: "HOST", Type: "VARCHAR(255)"},
+			{Name: "PRIV", Type: "VARCHAR(32)"},
+			{Name: "WITH_GRANT_OPTION", Type: "VARCHAR(1)"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "gtid_executed",
+		Columns: []catalog.ColumnDef{
+			{Name: "source_uuid", Type: "CHAR(36)"},
+			{Name: "interval_start", Type: "BIGINT"},
+			{Name: "interval_end", Type: "BIGINT"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "help_category",
+		Columns: []catalog.ColumnDef{
+			{Name: "help_category_id", Type: "SMALLINT UNSIGNED"},
+			{Name: "name", Type: "VARCHAR(64)"},
+			{Name: "parent_category_id", Type: "SMALLINT UNSIGNED"},
+			{Name: "url", Type: "TEXT"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "help_keyword",
+		Columns: []catalog.ColumnDef{
+			{Name: "help_keyword_id", Type: "INT UNSIGNED"},
+			{Name: "name", Type: "VARCHAR(64)"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "help_relation",
+		Columns: []catalog.ColumnDef{
+			{Name: "help_topic_id", Type: "INT UNSIGNED"},
+			{Name: "help_keyword_id", Type: "INT UNSIGNED"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "help_topic",
+		Columns: []catalog.ColumnDef{
+			{Name: "help_topic_id", Type: "INT UNSIGNED"},
+			{Name: "name", Type: "VARCHAR(64)"},
+			{Name: "help_category_id", Type: "SMALLINT UNSIGNED"},
+			{Name: "description", Type: "TEXT"},
+			{Name: "example", Type: "TEXT"},
+			{Name: "url", Type: "TEXT"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "password_history",
+		Columns: []catalog.ColumnDef{
+			{Name: "Host", Type: "VARCHAR(255)"},
+			{Name: "User", Type: "VARCHAR(32)"},
+			{Name: "Password_timestamp", Type: "TIMESTAMP(6)"},
+			{Name: "Password", Type: "TEXT"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "plugin",
+		Columns: []catalog.ColumnDef{
+			{Name: "name", Type: "VARCHAR(64)"},
+			{Name: "dl", Type: "VARCHAR(128)"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "proxies_priv",
+		Columns: []catalog.ColumnDef{
+			{Name: "Host", Type: "VARCHAR(255)"},
+			{Name: "User", Type: "VARCHAR(32)"},
+			{Name: "Proxied_host", Type: "VARCHAR(255)"},
+			{Name: "Proxied_user", Type: "VARCHAR(32)"},
+			{Name: "With_grant", Type: "TINYINT"},
+			{Name: "Grantor", Type: "VARCHAR(288)"},
+			{Name: "Timestamp", Type: "TIMESTAMP"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "servers",
+		Columns: []catalog.ColumnDef{
+			{Name: "Server_name", Type: "VARCHAR(64)"},
+			{Name: "Host", Type: "VARCHAR(255)"},
+			{Name: "Db", Type: "VARCHAR(64)"},
+			{Name: "Username", Type: "VARCHAR(64)"},
+			{Name: "Password", Type: "VARCHAR(64)"},
+			{Name: "Port", Type: "INT"},
+			{Name: "Socket", Type: "VARCHAR(64)"},
+			{Name: "Wrapper", Type: "VARCHAR(64)"},
+			{Name: "Owner", Type: "VARCHAR(64)"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "slave_master_info",
+		Columns: []catalog.ColumnDef{
+			{Name: "Number_of_lines", Type: "INT UNSIGNED"},
+			{Name: "Master_log_name", Type: "TEXT"},
+			{Name: "Master_log_pos", Type: "BIGINT UNSIGNED"},
+			{Name: "Host", Type: "VARCHAR(255)"},
+			{Name: "User_name", Type: "TEXT"},
+			{Name: "User_password", Type: "TEXT"},
+			{Name: "Port", Type: "INT UNSIGNED"},
+			{Name: "Connect_retry", Type: "INT UNSIGNED"},
+			{Name: "Enabled_ssl", Type: "TINYINT UNSIGNED"},
+			{Name: "Ssl_ca", Type: "TEXT"},
+			{Name: "Ssl_capath", Type: "TEXT"},
+			{Name: "Ssl_cert", Type: "TEXT"},
+			{Name: "Ssl_cipher", Type: "TEXT"},
+			{Name: "Ssl_key", Type: "TEXT"},
+			{Name: "Ssl_verify_server_cert", Type: "TINYINT UNSIGNED"},
+			{Name: "Heartbeat", Type: "FLOAT"},
+			{Name: "Bind", Type: "TEXT"},
+			{Name: "Ignored_server_ids", Type: "TEXT"},
+			{Name: "Uuid", Type: "TEXT"},
+			{Name: "Retry_count", Type: "BIGINT UNSIGNED"},
+			{Name: "Ssl_crl", Type: "TEXT"},
+			{Name: "Ssl_crlpath", Type: "TEXT"},
+			{Name: "Enabled_auto_position", Type: "TINYINT UNSIGNED"},
+			{Name: "Channel_name", Type: "VARCHAR(64)"},
+			{Name: "Tls_version", Type: "TEXT"},
+			{Name: "Public_key_path", Type: "TEXT"},
+			{Name: "Get_public_key", Type: "TINYINT UNSIGNED"},
+			{Name: "Network_namespace", Type: "TEXT"},
+			{Name: "Master_compression_algorithm", Type: "VARCHAR(64)"},
+			{Name: "Master_zstd_compression_level", Type: "INT UNSIGNED"},
+			{Name: "Tls_ciphersuites", Type: "TEXT"},
+			{Name: "Source_connection_auto_failover", Type: "TINYINT UNSIGNED"},
+			{Name: "Gtid_only", Type: "TINYINT UNSIGNED"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "slave_relay_log_info",
+		Columns: []catalog.ColumnDef{
+			{Name: "Number_of_lines", Type: "INT UNSIGNED"},
+			{Name: "Relay_log_name", Type: "TEXT"},
+			{Name: "Relay_log_pos", Type: "BIGINT UNSIGNED"},
+			{Name: "Master_log_name", Type: "TEXT"},
+			{Name: "Master_log_pos", Type: "BIGINT UNSIGNED"},
+			{Name: "Sql_delay", Type: "INT"},
+			{Name: "Number_of_workers", Type: "INT UNSIGNED"},
+			{Name: "Id", Type: "INT UNSIGNED"},
+			{Name: "Channel_name", Type: "VARCHAR(64)"},
+			{Name: "Privilege_checks_username", Type: "TEXT"},
+			{Name: "Privilege_checks_hostname", Type: "TEXT"},
+			{Name: "Require_row_format", Type: "TINYINT UNSIGNED"},
+			{Name: "Require_table_primary_key_check", Type: "ENUM('STREAM','ON','OFF','GENERATE')"},
+			{Name: "Assign_gtids_to_anonymous_transactions_type", Type: "ENUM('OFF','LOCAL','UUID')"},
+			{Name: "Assign_gtids_to_anonymous_transactions_value", Type: "TEXT"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "slave_worker_info",
+		Columns: []catalog.ColumnDef{
+			{Name: "Id", Type: "INT UNSIGNED"},
+			{Name: "Relay_log_name", Type: "TEXT"},
+			{Name: "Relay_log_pos", Type: "BIGINT UNSIGNED"},
+			{Name: "Master_log_name", Type: "TEXT"},
+			{Name: "Master_log_pos", Type: "BIGINT UNSIGNED"},
+			{Name: "Checkpoint_relay_log_name", Type: "TEXT"},
+			{Name: "Checkpoint_relay_log_pos", Type: "BIGINT UNSIGNED"},
+			{Name: "Checkpoint_master_log_name", Type: "TEXT"},
+			{Name: "Checkpoint_master_log_pos", Type: "BIGINT UNSIGNED"},
+			{Name: "Checkpoint_seqno", Type: "INT UNSIGNED"},
+			{Name: "Checkpoint_group_size", Type: "INT UNSIGNED"},
+			{Name: "Checkpoint_group_bitmap", Type: "BLOB"},
+			{Name: "Channel_name", Type: "VARCHAR(64)"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "time_zone",
+		Columns: []catalog.ColumnDef{
+			{Name: "Time_zone_id", Type: "INT UNSIGNED"},
+			{Name: "Use_leap_seconds", Type: "VARCHAR(1)"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "time_zone_leap_second",
+		Columns: []catalog.ColumnDef{
+			{Name: "Transition_time", Type: "BIGINT"},
+			{Name: "Correction", Type: "INT"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "time_zone_name",
+		Columns: []catalog.ColumnDef{
+			{Name: "Name", Type: "VARCHAR(64)"},
+			{Name: "Time_zone_id", Type: "INT UNSIGNED"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "time_zone_transition",
+		Columns: []catalog.ColumnDef{
+			{Name: "Time_zone_id", Type: "INT UNSIGNED"},
+			{Name: "Transition_time", Type: "BIGINT"},
+			{Name: "Transition_type_id", Type: "INT UNSIGNED"},
+		},
+	})
+	ensure("mysql", &catalog.TableDef{
+		Name: "time_zone_transition_type",
+		Columns: []catalog.ColumnDef{
+			{Name: "Time_zone_id", Type: "INT UNSIGNED"},
+			{Name: "Transition_type_id", Type: "INT UNSIGNED"},
+			{Name: "Offset", Type: "INT"},
+			{Name: "Is_DST", Type: "TINYINT UNSIGNED"},
+			{Name: "Abbreviation", Type: "VARCHAR(8)"},
 		},
 	})
 }
@@ -1402,7 +1640,60 @@ func (e *Executor) maybeRecalcStats(dbName, tableName string, changes int64) {
 	tbl.Mu.Unlock()
 }
 
+// upsertInnoDBTableStatsOnly inserts only into innodb_table_stats (not innodb_index_stats).
+// Used by CREATE TABLE so that SHOW INDEX cardinality returns NULL for freshly created tables
+// (no ANALYZE has been run yet). ANALYZE TABLE will call upsertInnoDBStatsRows which also
+// inserts index stats, making cardinality show computed values.
+func (e *Executor) upsertInnoDBTableStatsOnly(dbName, tableName string, rowCount int64) {
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		return
+	}
+	def, err := db.GetTable(tableName)
+	if err != nil || def == nil {
+		return
+	}
+	if def.Engine != "" && !strings.EqualFold(def.Engine, "InnoDB") {
+		return
+	}
+	if !e.innodbStatsPersistentEnabled(def) {
+		e.removeInnoDBStatsRows(dbName, tableName)
+		return
+	}
+
+	e.removeInnoDBStatsRows(dbName, tableName)
+	lastUpdate := time.Now().UTC().Format("2006-01-02 15:04:05")
+
+	statsTbl, err := e.Storage.GetTable("mysql", "innodb_table_stats")
+	if err == nil {
+		statsTbl.Mu.Lock()
+		statsTbl.Rows = append(statsTbl.Rows, storage.Row{
+			"database_name":            dbName,
+			"table_name":               tableName,
+			"last_update":              lastUpdate,
+			"n_rows":                   rowCount,
+			"clustered_index_size":     int64(1),
+			"sum_of_other_index_sizes": int64(len(def.Indexes)),
+		})
+		statsTbl.Mu.Unlock()
+	}
+	// Note: intentionally does NOT insert into innodb_index_stats.
+	// Cardinality will show as NULL in SHOW INDEX until ANALYZE TABLE is run.
+}
+
+func (e *Executor) upsertInnoDBStatsRowsFromCreate(dbName, tableName string, rowCount int64) {
+	e.upsertInnoDBStatsRowsInternal(dbName, tableName, rowCount, true)
+}
+
 func (e *Executor) upsertInnoDBStatsRows(dbName, tableName string, rowCount int64) {
+	e.upsertInnoDBStatsRowsInternal(dbName, tableName, rowCount, false)
+}
+
+func (e *Executor) upsertInnoDBStatsRowsInternal(dbName, tableName string, rowCount int64, notAnalyzed bool) {
+	// Skip stats for temporary tables - they don't have persistent stats.
+	if e.tempTables != nil && (e.tempTables[tableName] || e.tempTables[strings.ToLower(tableName)]) {
+		return
+	}
 	db, err := e.Catalog.GetDatabase(dbName)
 	if err != nil {
 		return
@@ -1474,6 +1765,13 @@ func (e *Executor) upsertInnoDBStatsRows(dbName, tableName string, rowCount int6
 				descCols = append(descCols, statsIndexColName(statCols[j]))
 			}
 			statValue := computeDistinctCount(tableRows, statCols[:i+1])
+			// When notAnalyzed=true (CREATE TABLE), use sample_size=0 as a sentinel
+			// meaning "stats not yet computed by ANALYZE". This makes SHOW INDEX
+			// display NULL for cardinality (matching MySQL behavior for fresh tables).
+			ndiffSampleSize := interface{}(int64(1))
+			if notAnalyzed {
+				ndiffSampleSize = int64(0)
+			}
 			idxTbl.Rows = append(idxTbl.Rows, storage.Row{
 				"database_name":    dbName,
 				"table_name":       tableName,
@@ -1481,7 +1779,7 @@ func (e *Executor) upsertInnoDBStatsRows(dbName, tableName string, rowCount int6
 				"last_update":      lastUpdate,
 				"stat_name":        statName,
 				"stat_value":       statValue,
-				"sample_size":      int64(1),
+				"sample_size":      ndiffSampleSize,
 				"stat_description": strings.Join(descCols, ","),
 			})
 		}
@@ -1670,6 +1968,25 @@ func isMySQLError(err error, code int) bool {
 	}
 	prefix := fmt.Sprintf("ERROR %d (", code)
 	return strings.HasPrefix(err.Error(), prefix)
+}
+
+// extractMySQLSQLState extracts the SQLSTATE from a mysqlError formatted as
+// "ERROR <code> (<state>): <message>". Returns "" if it can't parse.
+func extractMySQLSQLState(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	// Format: "ERROR 1234 (ABCDE): message"
+	open := strings.Index(s, " (")
+	if open < 0 {
+		return ""
+	}
+	close := strings.Index(s[open:], ")")
+	if close < 0 {
+		return ""
+	}
+	return s[open+2 : open+close]
 }
 
 // perfSchemaTruncateDenied returns true if TRUNCATE is denied on the given
@@ -1977,6 +2294,21 @@ func normalizeSQLDisplayName(s string) string {
 	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' && isSimpleStringLiteral(s) {
 		s = s[1 : len(s)-1]
 	}
+	// Normalize _utf8mb3 charset introducer to _utf8 (MySQL displays _utf8, not _utf8mb3)
+	// Also remove the space that sqlparser inserts between introducer and literal
+	s = normalizeCharsetIntroducers(s)
+	return s
+}
+
+// normalizeCharsetIntroducers normalizes charset introducers in column display names.
+// The sqlparser converts _utf8 to _utf8mb3 and adds a space before the literal.
+// MySQL displays these as _utf8'...' without space.
+func normalizeCharsetIntroducers(s string) string {
+	// Replace _utf8mb3 ' with _utf8'
+	s = strings.ReplaceAll(s, "_utf8mb3 '", "_utf8'")
+	s = strings.ReplaceAll(s, "_utf8mb3'", "_utf8'")
+	// Also handle other common alias pairs
+	s = strings.ReplaceAll(s, "_utf8mb4 '", "_utf8mb4'")
 	return s
 }
 
@@ -2676,7 +3008,9 @@ func replaceTypeWord(query, old, replacement string) string {
 // becomes: CREATE TABLE t1(f1 INT, CHECK (f1 < 10))
 func normalizeInlineCheckConstraints(query string) string {
 	upper := strings.ToUpper(query)
-	if !strings.Contains(upper, "CREATE TABLE") && !strings.Contains(upper, "ALTER TABLE") {
+	// Only normalize inline CHECK constraints for CREATE TABLE.
+	// ALTER TABLE with ADD CONSTRAINT ... CHECK is valid Vitess syntax as-is.
+	if !strings.Contains(upper, "CREATE TABLE") {
 		return query
 	}
 	if !strings.Contains(upper, "CHECK") {
@@ -2798,11 +3132,40 @@ func normalizeInlineCheckConstraints(query string) string {
 				scanFrom = i // i points to the start of CONSTRAINT keyword
 			}
 			prevNonSpace := 0
+			prevNonSpacePos := -1
 			for p := scanFrom - 1; p >= 0; p-- {
 				ch := query[p]
 				if ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' {
 					prevNonSpace = int(ch)
+					prevNonSpacePos = p
 					break
+				}
+			}
+			// If the prevNonSpace is a letter, it might be the end of the word
+			// "CONSTRAINT". In that case we should look before CONSTRAINT to determine
+			// if the check is at table level (preceded by ',' or '(').
+			if prevNonSpace > 0 && ((prevNonSpace >= 'a' && prevNonSpace <= 'z') || (prevNonSpace >= 'A' && prevNonSpace <= 'Z')) && prevNonSpacePos >= 0 {
+				// Find the start of this word
+				wordEnd := prevNonSpacePos
+				wordStart := wordEnd
+				for wordStart > 0 {
+					ch := query[wordStart-1]
+					if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' {
+						wordStart--
+					} else {
+						break
+					}
+				}
+				word := strings.ToUpper(query[wordStart : wordEnd+1])
+				if word == "CONSTRAINT" {
+					// Look before CONSTRAINT
+					for p := wordStart - 1; p >= 0; p-- {
+						ch := query[p]
+						if ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' {
+							prevNonSpace = int(ch)
+							break
+						}
+					}
 				}
 			}
 			isTableLevel := prevNonSpace == ',' || prevNonSpace == '('
@@ -5592,6 +5955,18 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	trimmed := strings.TrimSpace(query)
 	upper := strings.ToUpper(trimmed)
 
+	// MySQL has a stack depth limit for deeply nested expressions.
+	// Count nested IF/CASE occurrences in the query string as a proxy for expression depth.
+	// If it exceeds our threshold, return ER_STACK_OVERRUN_NEED_MORE instead of a parse error.
+	{
+		ifCount := strings.Count(upper, "IF(")
+		caseCount := strings.Count(upper, " WHEN ") + strings.Count(upper, "\nWHEN ")
+		if ifCount+caseCount > 5 {
+			return nil, mysqlError(1436, "HY000", "Thread stack overrun: "+
+				"Need more than available stack. Use 'mysqld --thread_stack=#' to specify a bigger stack.")
+		}
+	}
+
 	stmt, err := e.parser().Parse(query)
 	if err != nil {
 		// Accept statements that Vitess parser doesn't support
@@ -5622,6 +5997,54 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			nearText := strings.TrimPrefix(trimmed, "USE ")
 			nearText = strings.TrimPrefix(nearText, "use ")
 			return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", nearText))
+		}
+		// FLUSH TABLE <tblname> (without FOR EXPORT): re-open table and refresh stats.
+		// When stats have been deleted from innodb_index_stats and FLUSH TABLE is called,
+		// MySQL recomputes transient stats. But if stats exist (e.g., manually updated),
+		// FLUSH TABLE just re-reads them without overwriting.
+		if (strings.HasPrefix(upper, "FLUSH TABLE ") || strings.HasPrefix(upper, "FLUSH TABLES ")) &&
+			!strings.Contains(upper, "FOR EXPORT") && !strings.Contains(upper, "WITH READ LOCK") {
+			// Extract table names from FLUSH TABLE t1, t2, ...
+			rest := ""
+			if strings.HasPrefix(upper, "FLUSH TABLE ") {
+				rest = strings.TrimSpace(trimmed[len("FLUSH TABLE "):])
+			} else {
+				rest = strings.TrimSpace(trimmed[len("FLUSH TABLES "):])
+			}
+			if rest != "" && !strings.EqualFold(rest, ";") && !strings.EqualFold(strings.TrimSuffix(strings.TrimSpace(rest), ";"), "") {
+				tableNames := strings.Split(strings.TrimSuffix(strings.TrimSpace(rest), ";"), ",")
+				for _, tn := range tableNames {
+					tn = strings.TrimSpace(strings.Trim(tn, "`"))
+					if tn == "" {
+						continue
+					}
+					// Parse db.table notation
+					flushDB := e.CurrentDB
+					flushTable := tn
+					if dotIdx := strings.Index(tn, "."); dotIdx >= 0 {
+						flushDB = strings.Trim(tn[:dotIdx], "`")
+						flushTable = strings.Trim(tn[dotIdx+1:], "`")
+					}
+					// Only recompute stats if no entries exist in innodb_index_stats.
+					// If stats exist (manually updated or from ANALYZE), keep them as-is.
+					hasIndexStats := false
+					if idxTbl, err := e.Storage.GetTable("mysql", "innodb_index_stats"); err == nil {
+						idxTbl.Mu.RLock()
+						for _, r := range idxTbl.Rows {
+							if strings.EqualFold(toString(r["database_name"]), flushDB) &&
+								strings.EqualFold(toString(r["table_name"]), flushTable) {
+								hasIndexStats = true
+								break
+							}
+						}
+						idxTbl.Mu.RUnlock()
+					}
+					if !hasIndexStats {
+						// No index stats exist: recompute (simulates InnoDB re-reading stats after FLUSH)
+						e.upsertInnoDBStatsRows(flushDB, flushTable, e.tableRowCount(flushDB, flushTable))
+					}
+				}
+			}
 		}
 		// FLUSH TABLE(S) ... FOR EXPORT on non-InnoDB engines returns an error
 		if strings.HasPrefix(upper, "FLUSH TABLE") && strings.Contains(upper, "FOR EXPORT") {
@@ -5721,8 +6144,6 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			strings.HasPrefix(upper, "BINLOG ") ||
 			strings.HasPrefix(upper, "END") ||
 			strings.HasPrefix(upper, "ALTER INSTANCE") ||
-			strings.HasPrefix(upper, "CREATE UNDO TABLESPACE") ||
-			strings.HasPrefix(upper, "DROP UNDO TABLESPACE") ||
 			strings.HasPrefix(upper, "CREATE SPATIAL REFERENCE SYSTEM") ||
 			strings.HasPrefix(upper, "DROP SPATIAL REFERENCE SYSTEM") {
 			return &Result{}, nil
@@ -5731,6 +6152,26 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		if strings.HasPrefix(upper, "LOCK TABLE ") || strings.HasPrefix(upper, "LOCK TABLES ") {
 			if tblName := extractPerfSchemaLockTable(trimmed); tblName != "" {
 				return nil, mysqlError(1142, "42000", fmt.Sprintf("SELECT, LOCK TABLES command denied to user 'root'@'localhost' for table '%s'", tblName))
+			}
+			return &Result{}, nil
+		}
+		// Undo tablespace DDL: only supported for InnoDB. When ENGINE=MyISAM is specified,
+		// MySQL returns ER_ILLEGAL_HA_CREATE_OPTION (1031).
+		if strings.HasPrefix(upper, "CREATE UNDO TABLESPACE") {
+			if strings.Contains(upper, "ENGINE MYISAM") || strings.Contains(upper, "ENGINE=MYISAM") {
+				return nil, mysqlError(1031, "HY000", "Table storage engine 'MyISAM' does not support the create option 'CREATE UNDO TABLESPACE'")
+			}
+			return &Result{}, nil
+		}
+		if strings.HasPrefix(upper, "ALTER UNDO TABLESPACE") {
+			if strings.Contains(upper, "ENGINE MYISAM") || strings.Contains(upper, "ENGINE=MYISAM") {
+				return nil, mysqlError(1031, "HY000", "Table storage engine 'MyISAM' does not support the create option 'ALTER UNDO TABLESPACE'")
+			}
+			return &Result{}, nil
+		}
+		if strings.HasPrefix(upper, "DROP UNDO TABLESPACE") {
+			if strings.Contains(upper, "ENGINE MYISAM") || strings.Contains(upper, "ENGINE=MYISAM") {
+				return nil, mysqlError(1031, "HY000", "Table storage engine 'MyISAM' does not support the create option 'DROP UNDO TABLESPACE'")
 			}
 			return &Result{}, nil
 		}
@@ -5779,13 +6220,36 @@ func (e *Executor) Execute(query string) (*Result, error) {
 				IsResultSet: true,
 			}, nil
 		}
-		return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", truncateNear(trimmed)))
+		return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", extractNearFromParseError(trimmed, err)))
 	}
 
 	// Enforce LOCK TABLES restrictions before dispatching
 	if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
 		if lockErr := e.checkTableLockRestrictions(stmt); lockErr != nil {
 			return nil, lockErr
+		}
+	}
+
+	// Enforce read_only: when read_only=ON, block write statements from non-SUPER users.
+	// SUPER users (root) can bypass read_only but not super_read_only.
+	if readOnlyVal, ok := e.getGlobalVar("read_only"); ok {
+		readOnlyOn := readOnlyVal == "1" || strings.EqualFold(readOnlyVal, "ON")
+		if readOnlyOn {
+			// Check if current user is root/SUPER
+			isSuper := true
+			if cu, ok2 := e.userVars["__current_user"]; ok2 {
+				if cuStr, ok3 := cu.(string); ok3 && cuStr != "" && !strings.EqualFold(cuStr, "root") {
+					isSuper = false
+				}
+			}
+			if !isSuper {
+				switch stmt.(type) {
+				case *sqlparser.Insert, *sqlparser.Update, *sqlparser.Delete,
+					*sqlparser.CreateTable, *sqlparser.DropTable, *sqlparser.AlterTable,
+					*sqlparser.CreateDatabase, *sqlparser.DropDatabase, *sqlparser.TruncateTable:
+					return nil, mysqlError(1290, "HY000", "The MySQL server is running with the --read-only option so it cannot execute this statement")
+				}
+			}
 		}
 	}
 
@@ -6855,7 +7319,8 @@ func (e *Executor) findRowIDColumn(row storage.Row) string {
 	return ""
 }
 
-// extractCharLength returns the max character length from a CHAR(N) or VARCHAR(N) type string.
+// extractCharLength returns the max character/byte length from a column type string.
+// Returns 0 if the type has no enforced length limit (e.g., LONGBLOB/LONGTEXT).
 func extractCharLength(colType string) int {
 	lower := strings.ToLower(strings.TrimSpace(colType))
 	var n int
@@ -6865,6 +7330,16 @@ func extractCharLength(colType string) int {
 				return n
 			}
 		}
+	}
+	// BLOB/TEXT family max sizes (in bytes/chars)
+	switch lower {
+	case "tinyblob", "tinytext":
+		return 255
+	case "blob", "text":
+		return 65535
+	case "mediumblob", "mediumtext":
+		return 16777215
+	// LONGBLOB/LONGTEXT max is 4GB — too large to enforce in memory; skip
 	}
 	return 0
 }
@@ -7414,7 +7889,17 @@ func implicitZeroValue(colType string) interface{} {
 	if padLen := binaryPadLength(colType); padLen > 0 {
 		return strings.Repeat("\x00", padLen)
 	}
-	// Default for string types
+	// ENUM: implicit default is the first enum value
+	lower := strings.ToLower(strings.TrimSpace(colType))
+	if strings.HasPrefix(lower, "enum(") {
+		inner := colType[5 : len(colType)-1]
+		vals := splitEnumValues(inner)
+		if len(vals) > 0 {
+			return EnumValue(strings.Trim(vals[0], "'"))
+		}
+		return EnumValue("")
+	}
+	// Default for string types (including SET which defaults to empty)
 	return ""
 }
 
@@ -8158,10 +8643,6 @@ func validateEnumSetValue(colType string, v interface{}) interface{} {
 	if !strings.HasPrefix(lower, "enum(") && !strings.HasPrefix(lower, "set(") {
 		return v
 	}
-	s, ok := v.(string)
-	if !ok {
-		return v
-	}
 	isEnum := strings.HasPrefix(lower, "enum(")
 	inner := ""
 	if isEnum {
@@ -8174,9 +8655,61 @@ func validateEnumSetValue(colType string, v interface{}) interface{} {
 		part = strings.Trim(part, "'")
 		allowed = append(allowed, part)
 	}
+
+	// Handle integer values: convert valid indices/bitmasks to string labels.
+	// Out-of-range integers are left as-is so the INSERT validation code can raise errors.
+	switch iv := v.(type) {
+	case int64:
+		if isEnum {
+			// ENUM: index 1..N maps to the Nth element; index 0 = empty string (valid).
+			// Out-of-range indices are left as int64 for the INSERT path to reject.
+			if iv == 0 {
+				return EnumValue("")
+			}
+			if iv >= 1 && int(iv) <= len(allowed) {
+				return EnumValue(allowed[iv-1])
+			}
+			// Out of range: leave as int64 for strict mode to handle
+			return v
+		}
+		// SET bitmask: only convert if within valid range (0..2^N-1)
+		maxMask := int64((1 << uint(len(allowed))) - 1)
+		if iv >= 0 && iv <= maxMask {
+			if iv == 0 {
+				return ""
+			}
+			var valid []string
+			for i, a := range allowed {
+				if iv&(1<<uint(i)) != 0 {
+					valid = append(valid, a)
+				}
+			}
+			return strings.Join(valid, ",")
+		}
+		// Out of range: leave as int64 for strict mode to handle
+		return v
+	case uint64:
+		return validateEnumSetValue(colType, int64(iv))
+	}
+
+	s, ok := v.(string)
+	if !ok {
+		// Other non-string values are left as-is.
+		return v
+	}
 	if isEnum {
 		if s == "" {
 			return EnumValue(s)
+		}
+		// Check if the string is a numeric index (stored as string representation of int)
+		if idx, err := strconv.ParseInt(s, 10, 64); err == nil {
+			if idx == 0 {
+				return EnumValue("")
+			}
+			if idx >= 1 && int(idx) <= len(allowed) {
+				return EnumValue(allowed[idx-1])
+			}
+			return EnumValue("")
 		}
 		for _, a := range allowed {
 			if strings.EqualFold(s, a) {
@@ -8188,6 +8721,19 @@ func validateEnumSetValue(colType string, v interface{}) interface{} {
 	// SET validation
 	if s == "" {
 		return s
+	}
+	// Check if the string is a numeric bitmask (stored as string representation of int)
+	if bitmask, err := strconv.ParseInt(s, 10, 64); err == nil {
+		if bitmask == 0 {
+			return ""
+		}
+		var valid []string
+		for i, a := range allowed {
+			if bitmask&(1<<uint(i)) != 0 {
+				valid = append(valid, a)
+			}
+		}
+		return strings.Join(valid, ",")
 	}
 	members := strings.Split(s, ",")
 	var valid []string
@@ -8874,6 +9420,27 @@ func coerceValueForColumnType(col catalog.ColumnDef, val interface{}) interface{
 	val = coerceDateTimeValue(col.Type, val)
 	val = coerceIntegerValue(col.Type, val)
 	val = coerceBitValue(col.Type, val)
+	// Truncate BLOB/TEXT values when column type changes (e.g., LONGBLOB→BLOB)
+	// MySQL behavior: data exceeding the new max length is set to empty string
+	colUp := strings.ToUpper(col.Type)
+	isBlobTy := colUp == "BLOB" || colUp == "TINYBLOB" || colUp == "MEDIUMBLOB"
+	isTextTy := colUp == "TEXT" || colUp == "TINYTEXT" || colUp == "MEDIUMTEXT"
+	if isBlobTy || isTextTy {
+		if sv, ok := val.(string); ok {
+			maxLen := extractCharLength(col.Type)
+			if maxLen > 0 {
+				if isBlobTy {
+					if len(sv) > maxLen {
+						val = "" // MySQL sets to empty string when BLOB data exceeds new column max
+					}
+				} else {
+					if len([]rune(sv)) > maxLen {
+						val = "" // MySQL sets to empty string when TEXT data exceeds new column max
+					}
+				}
+			}
+		}
+	}
 	return val
 }
 
@@ -8982,7 +9549,15 @@ func (e *Executor) execMyliteCommand(query string) (*Result, error) {
 				e.Storage.DropTable(e.CurrentDB, name)
 			}
 		}
+		// Restore any permanent tables that were shadowed by temporary tables
+		for name, saved := range e.tempTableSavedPermanent {
+			if db2, err2 := e.Catalog.GetDatabase(e.CurrentDB); err2 == nil {
+				_ = db2.CreateTable(saved.def)
+			}
+			e.Storage.RestoreTable(e.CurrentDB, name, saved.table)
+		}
 		e.tempTables = make(map[string]bool)
+		e.tempTableSavedPermanent = make(map[string]*savedPermTable)
 		return &Result{}, nil
 	}
 
@@ -9048,6 +9623,51 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.Variable:
 		return e.evalVariableExpr(v)
 	case *sqlparser.Default:
+		// DEFAULT(col) returns the default value for the named column.
+		if v.ColName != "" {
+			// First check the primary table def (target table)
+			if e.defaultsTableDef != nil {
+				for _, col := range e.defaultsTableDef.Columns {
+					if strings.EqualFold(col.Name, v.ColName) {
+						if col.Default != nil {
+							return *col.Default, nil
+						}
+						// No explicit default: return NULL for nullable, implicit zero for NOT NULL
+						if col.Nullable {
+							return nil, nil
+						}
+						return implicitZeroValue(col.Type), nil
+					}
+				}
+			}
+			// Then check the auxiliary defaults map (for source tables in INSERT ... SELECT)
+			if e.defaultsByColName != nil {
+				if def, ok := e.defaultsByColName[strings.ToLower(v.ColName)]; ok {
+					return def, nil
+				}
+			}
+			// Fall back: search all tables in the current DB for the column.
+			// This supports DEFAULT(col) in SELECT statements.
+			if e.Catalog != nil {
+				if db, _ := e.Catalog.GetDatabase(e.CurrentDB); db != nil {
+					for _, tbl := range db.Tables {
+						for _, col := range tbl.Columns {
+							if strings.EqualFold(col.Name, v.ColName) {
+								if col.Default != nil {
+									return *col.Default, nil
+								}
+								if col.Nullable {
+									return nil, nil
+								}
+								return implicitZeroValue(col.Type), nil
+							}
+						}
+					}
+				}
+			}
+			// Column not found in any table: no default value
+			return nil, mysqlError(1364, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", v.ColName))
+		}
 		return nil, nil
 	case *sqlparser.UnaryExpr:
 		return e.evalUnaryExpr(v)
@@ -9499,6 +10119,21 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		return nil, nil
 	case *sqlparser.VarPop:
 		return nil, nil
+	case *sqlparser.StdDev:
+		return nil, nil
+	case *sqlparser.StdPop:
+		return nil, nil
+	case *sqlparser.StdSamp:
+		return nil, nil
+	case *sqlparser.BitAnd:
+		// BIT_AND aggregate/window function - stub; actual values computed by processWindowFunctions
+		return uint64(^uint64(0)), nil
+	case *sqlparser.BitOr:
+		// BIT_OR aggregate/window function - stub; actual values computed by processWindowFunctions
+		return uint64(0), nil
+	case *sqlparser.BitXor:
+		// BIT_XOR aggregate/window function - stub; actual values computed by processWindowFunctions
+		return uint64(0), nil
 	case *sqlparser.RegexpSubstrExpr:
 		return e.evalRegexpSubstrExpr(v)
 	case *sqlparser.IntervalFuncExpr:
@@ -9800,8 +10435,13 @@ func (e *Executor) evalFuncExpr(v *sqlparser.FuncExpr) (interface{}, error) {
 	} else if !strings.Contains(strings.ToLower(err.Error()), "function not found") {
 		return nil, err
 	}
-	// Unknown function: return nil rather than error to be lenient
-	return nil, fmt.Errorf("unsupported function: %s", name)
+	// Unknown function: return ER_SP_DOES_NOT_EXIST (1305, SQLSTATE 42000) so that
+	// CONTINUE HANDLERs for SQLSTATE '42000' inside stored functions can catch it.
+	db := e.CurrentDB
+	if db == "" {
+		db = "test"
+	}
+	return nil, mysqlError(1305, "42000", fmt.Sprintf("FUNCTION %s.%s does not exist", db, name))
 }
 
 
@@ -11461,6 +12101,14 @@ func mysqlGetFormat(dateType, locale string) string {
 
 // evalCaseExpr handles CASE expressions.
 func (e *Executor) evalCaseExpr(v *sqlparser.CaseExpr) (interface{}, error) {
+	// Track expression depth to detect stack overflow for deeply nested expressions.
+	// MySQL returns ER_STACK_OVERRUN_NEED_MORE (1436) when the expression stack is exhausted.
+	e.exprDepth++
+	defer func() { e.exprDepth-- }()
+	if e.exprDepth > 8192 {
+		return nil, mysqlError(1436, "HY000", "Thread stack overrun: "+
+			"Need more than available stack. Use 'mysqld --thread_stack=#' to specify a bigger stack.")
+	}
 	var baseVal interface{}
 	if v.Expr != nil {
 		var err error
@@ -12963,6 +13611,52 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 					}
 					return false, nil
 				}
+				// Handle (SELECT c1,c2,...) IN (SELECT c1,c2,...) — subquery on both sides.
+				// Execute left subquery and compare its rows against right subquery rows.
+				if leftSub, leftIsSub := v.Left.(*sqlparser.Subquery); leftIsSub {
+					leftResult, err := e.execSubquery(leftSub, row)
+					if err != nil {
+						return false, err
+					}
+					rightResult, err := e.execSubquery(sub, row)
+					if err != nil {
+						return false, err
+					}
+					if len(leftResult.Columns) != len(rightResult.Columns) {
+						return false, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftResult.Columns)))
+					}
+					ncols := len(leftResult.Columns)
+					for _, lrow := range leftResult.Rows {
+						hasNull := false
+						for _, rrow := range rightResult.Rows {
+							allMatch := true
+							rowHasNull := false
+							for i := 0; i < ncols; i++ {
+								lv, rv := lrow[i], rrow[i]
+								if lv == nil || rv == nil {
+									rowHasNull = true
+									allMatch = false
+									break
+								}
+								match, _ := compareValues(lv, rv, sqlparser.EqualOp)
+								if !match {
+									allMatch = false
+									break
+								}
+							}
+							if allMatch {
+								return v.Operator == sqlparser.InOp, nil
+							}
+							if rowHasNull {
+								hasNull = true
+							}
+						}
+						if hasNull {
+							return false, nil
+						}
+					}
+					return v.Operator == sqlparser.NotInOp, nil
+				}
 				// Scalar IN (SELECT ...)
 				left, err := e.evalRowExpr(v.Left, row)
 				if err != nil {
@@ -13113,6 +13807,59 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 		// Handle ANY/SOME (Modifier=1) and ALL (Modifier=2) with subquery
 		if v.Modifier != 0 {
 			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+				isAny := v.Modifier == 1 // ANY/SOME
+				// Handle tuple (row constructor) left side: (a,b) = ANY (SELECT x,y FROM ...)
+				if leftTupleAny, leftIsTupleAny := v.Left.(sqlparser.ValTuple); leftIsTupleAny && v.Operator == sqlparser.EqualOp {
+					result, err := e.execSubquery(sub, row)
+					if err != nil {
+						return false, err
+					}
+					if len(result.Columns) != len(leftTupleAny) {
+						return false, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTupleAny)))
+					}
+					leftVals := make([]interface{}, len(leftTupleAny))
+					for i, lExpr := range leftTupleAny {
+						lv, err := e.evalRowExpr(lExpr, row)
+						if err != nil {
+							return false, err
+						}
+						leftVals[i] = lv
+					}
+					if isAny {
+						// ANY: true if any row matches
+						for _, rrow := range result.Rows {
+							allMatch := true
+							for i := 0; i < len(leftVals); i++ {
+								if leftVals[i] == nil || rrow[i] == nil {
+									allMatch = false
+									break
+								}
+								match, _ := compareValues(leftVals[i], rrow[i], sqlparser.EqualOp)
+								if !match {
+									allMatch = false
+									break
+								}
+							}
+							if allMatch {
+								return true, nil
+							}
+						}
+						return false, nil
+					}
+					// ALL: true if every row matches
+					for _, rrow := range result.Rows {
+						for i := 0; i < len(leftVals); i++ {
+							if leftVals[i] == nil || rrow[i] == nil {
+								return false, nil
+							}
+							match, _ := compareValues(leftVals[i], rrow[i], sqlparser.EqualOp)
+							if !match {
+								return false, nil
+							}
+						}
+					}
+					return true, nil
+				}
 				left, err := e.evalRowExpr(v.Left, row)
 				if err != nil {
 					return false, err
@@ -13124,7 +13871,6 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 				if err != nil {
 					return false, err
 				}
-				isAny := v.Modifier == 1 // ANY/SOME
 				if isAny {
 					// ANY/SOME: true if comparison holds for at least one non-NULL value
 					for _, val := range vals {
@@ -13845,6 +14591,13 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 		_, rightIsString := right.(string)
 		if leftIsString && rightIsString && !looksLikeBinaryData(ls) && !looksLikeBinaryData(rs) {
 			if strings.EqualFold(ls, rs) {
+				return true, nil
+			}
+			// MySQL PAD SPACE semantics: trailing spaces are ignored in non-binary comparisons.
+			// 'a' = 'a ' is TRUE, 'a\0' < 'a' is TRUE (NUL is less than space)
+			lsTrimmed := strings.TrimRight(ls, " ")
+			rsTrimmed := strings.TrimRight(rs, " ")
+			if strings.EqualFold(lsTrimmed, rsTrimmed) {
 				return true, nil
 			}
 		}
@@ -14694,49 +15447,53 @@ func (e *Executor) lookupView(name string) (viewSQL string, canonicalName string
 // returns the underlying base table name. It also validates that the view is
 // updatable (simple SELECT from a single table, no JOINs, GROUP BY, DISTINCT,
 // aggregates, UNION, or subqueries in FROM).
-// Returns (baseTable, isView, error). If isView is false, the caller should
-// proceed with normal table handling.
-func (e *Executor) resolveViewToBaseTable(tableName string) (string, bool, error) {
+// Returns (baseTable, isView, viewWhere, error). If isView is false, the caller should
+// proceed with normal table handling. viewWhere is the WHERE clause from the view definition.
+func (e *Executor) resolveViewToBaseTable(tableName string) (string, bool, sqlparser.Expr, error) {
 	viewSQL, _, ok := e.lookupView(tableName)
 	if !ok {
-		return "", false, nil
+		return "", false, nil, nil
 	}
 	stmt, err := e.parser().Parse(viewSQL)
 	if err != nil {
-		return "", true, fmt.Errorf("cannot parse view definition: %v", err)
+		return "", true, nil, fmt.Errorf("cannot parse view definition: %v", err)
 	}
 	sel, ok := stmt.(*sqlparser.Select)
 	if !ok {
 		// UNION or other non-simple SELECT
-		return "", true, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
+		return "", true, nil, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
 	}
 	// Must have exactly one table in FROM (no JOINs)
 	if len(sel.From) != 1 {
-		return "", true, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
+		return "", true, nil, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
 	}
 	ate, ok := sel.From[0].(*sqlparser.AliasedTableExpr)
 	if !ok {
 		// JOIN expression
-		return "", true, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
+		return "", true, nil, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
 	}
 	tn, ok := ate.Expr.(sqlparser.TableName)
 	if !ok {
 		// Subquery in FROM
-		return "", true, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
+		return "", true, nil, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
 	}
 	// Check for GROUP BY, HAVING, DISTINCT, aggregates, window functions
 	if sel.GroupBy != nil || sel.Having != nil || sel.Distinct {
-		return "", true, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
+		return "", true, nil, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
 	}
 	// Check for aggregate functions in SELECT exprs
 	for _, expr := range sel.SelectExprs.Exprs {
 		if ae, ok := expr.(*sqlparser.AliasedExpr); ok {
 			if containsAggregate(ae.Expr) {
-				return "", true, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
+				return "", true, nil, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
 			}
 		}
 	}
-	return tn.Name.String(), true, nil
+	var viewWhere sqlparser.Expr
+	if sel.Where != nil {
+		viewWhere = sel.Where.Expr
+	}
+	return tn.Name.String(), true, viewWhere, nil
 }
 
 // getViewCheckCondition returns the WHERE expression from a view definition if it has WITH CHECK OPTION.
@@ -15364,7 +16121,7 @@ func ftsTokenize(text string, minLen int) []string {
 	var tokens []string
 	word := strings.Builder{}
 	for _, r := range text {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r >= 0x80 {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || (r >= 0x80 && unicode.IsLetter(r)) {
 			word.WriteRune(unicode.ToLower(r))
 		} else {
 			if word.Len() >= minLen {
@@ -15759,6 +16516,14 @@ func parseBoolTerms(s string, minTokenSize int) ([]boolTerm, string) {
 				wildcard = true
 				word = word[:len(word)-1]
 			}
+			// Strip non-word characters (punctuation like curly quotes) from the word.
+			// Only keep letters, digits, and underscores (same logic as ftsTokenize).
+			word = strings.Map(func(r rune) rune {
+				if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || (r >= 0x80 && unicode.IsLetter(r)) {
+					return r
+				}
+				return -1
+			}, word)
 			word = strings.ToLower(word)
 			if word == "" || word == "&" {
 				continue

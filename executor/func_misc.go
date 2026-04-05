@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/rand"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -112,6 +113,17 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if cue, ok := v.Exprs[0].(*sqlparser.ConvertUsingExpr); ok {
 			return strings.ToLower(cue.Type), true, nil
 		}
+		// Handle charset introducer: _utf8'a' → charset is "utf8"
+		if intro, ok := v.Exprs[0].(*sqlparser.IntroducerExpr); ok {
+			cs := strings.ToLower(intro.CharacterSet)
+			// Normalize utf8mb3 → utf8 for display
+			if cs == "_utf8mb3" || cs == "utf8mb3" {
+				cs = "utf8"
+			} else {
+				cs = strings.TrimPrefix(cs, "_")
+			}
+			return cs, true, nil
+		}
 		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
@@ -165,6 +177,22 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 				return cs + "_general_ci", true, nil
 			}
 		}
+		// Handle charset introducer: _utf8'a' → collation is "utf8_general_ci"
+		if intro, ok := v.Exprs[0].(*sqlparser.IntroducerExpr); ok {
+			cs := strings.ToLower(strings.TrimPrefix(intro.CharacterSet, "_"))
+			switch cs {
+			case "utf8", "utf8mb3":
+				return "utf8_general_ci", true, nil
+			case "utf8mb4":
+				return "utf8mb4_0900_ai_ci", true, nil
+			case "latin1":
+				return "latin1_swedish_ci", true, nil
+			case "binary":
+				return "binary", true, nil
+			default:
+				return cs + "_general_ci", true, nil
+			}
+		}
 		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err
@@ -187,6 +215,15 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 				default:
 					return cs + "_general_ci", true, nil
 				}
+			}
+		}
+		// Functions that return utf8 strings: charset(), collation(), user(), database(), version(), etc.
+		if innerFunc, ok := v.Exprs[0].(*sqlparser.FuncExpr); ok {
+			funcName := strings.ToLower(innerFunc.Name.String())
+			switch funcName {
+			case "charset", "collation", "user", "current_user", "session_user",
+				"system_user", "database", "schema", "version":
+				return "utf8_general_ci", true, nil
 			}
 		}
 		return "utf8mb4_0900_ai_ci", true, nil
@@ -247,6 +284,15 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		}
 		return result, true, nil
 	case "current_user":
+		if cu, ok := e.userVars["__current_user"]; ok {
+			if cuStr, ok := cu.(string); ok && cuStr != "" {
+				// If the username doesn't include @host, append @localhost
+				if !strings.Contains(cuStr, "@") {
+					return cuStr + "@localhost", true, nil
+				}
+				return cuStr, true, nil
+			}
+		}
 		return "root@localhost", true, nil
 	case "connection_id":
 		return e.connectionID, true, nil
@@ -293,6 +339,14 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		}
 		return int64(0), true, nil
 	case "user", "session_user", "system_user":
+		if cu, ok := e.userVars["__current_user"]; ok {
+			if cuStr, ok := cu.(string); ok && cuStr != "" {
+				if !strings.Contains(cuStr, "@") {
+					return cuStr + "@localhost", true, nil
+				}
+				return cuStr, true, nil
+			}
+		}
 		return "root@localhost", true, nil
 	case "regexp_like":
 		rlVal, rlPat, hasNull, err := e.evalArgs2(v.Exprs, "REGEXP_LIKE", row)
@@ -720,8 +774,43 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		}
 		return int64(0), true, nil
 	case "inet6_aton":
-		return nil, true, nil
+		i6aVal, i6aIsNull, i6aErr := e.evalArg1Quiet(v.Exprs, row)
+		if i6aErr != nil {
+			return nil, true, i6aErr
+		}
+		if i6aIsNull || i6aVal == nil {
+			return nil, true, nil
+		}
+		i6aStr := toString(i6aVal)
+		// Try parsing as IPv4-in-IPv6 (::ffff:x.x.x.x) or pure IPv6 or IPv4
+		i6aIP := net.ParseIP(i6aStr)
+		if i6aIP == nil {
+			return nil, true, nil
+		}
+		// Convert to 16-byte binary string (always IPv6 format)
+		i6aIP = i6aIP.To16()
+		if i6aIP == nil {
+			return nil, true, nil
+		}
+		return string(i6aIP), true, nil
 	case "inet6_ntoa":
+		i6nVal, i6nIsNull, i6nErr := e.evalArg1Quiet(v.Exprs, row)
+		if i6nErr != nil {
+			return nil, true, i6nErr
+		}
+		if i6nIsNull || i6nVal == nil {
+			return nil, true, nil
+		}
+		i6nStr := toString(i6nVal)
+		b := []byte(i6nStr)
+		if len(b) == 4 {
+			// IPv4
+			return fmt.Sprintf("%d.%d.%d.%d", b[0], b[1], b[2], b[3]), true, nil
+		} else if len(b) == 16 {
+			// IPv6
+			ip := net.IP(b)
+			return ip.String(), true, nil
+		}
 		return nil, true, nil
 	default:
 		return nil, false, nil

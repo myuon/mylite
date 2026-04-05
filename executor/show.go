@@ -603,6 +603,16 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		}
 	}
 
+	// SHOW FUNCTION STATUS [LIKE 'pattern' | WHERE expr]
+	if strings.HasPrefix(upper, "SHOW FUNCTION STATUS") {
+		return e.showRoutineStatus("FUNCTION", query[len("SHOW FUNCTION STATUS"):])
+	}
+
+	// SHOW PROCEDURE STATUS [LIKE 'pattern' | WHERE expr]
+	if strings.HasPrefix(upper, "SHOW PROCEDURE STATUS") {
+		return e.showRoutineStatus("PROCEDURE", query[len("SHOW PROCEDURE STATUS"):])
+	}
+
 	// SHOW INDEX/INDEXES/KEYS FROM <table>
 	if strings.HasPrefix(upper, "SHOW INDEX ") || strings.HasPrefix(upper, "SHOW INDEXES ") || strings.HasPrefix(upper, "SHOW KEYS ") {
 		showDB, showTable, ok := parseShowIndexTarget(query, e.CurrentDB)
@@ -1266,10 +1276,12 @@ func (e *Executor) showCreateProcedure(procName string) (*Result, error) {
 		}
 		body := strings.Join(procDef.Body, ";\n")
 		createSQL = fmt.Sprintf("CREATE DEFINER=`root`@`localhost` PROCEDURE `%s`(%s)\nBEGIN\n%s;\nEND", procDef.Name, strings.Join(paramParts, ", "), body)
+	} else {
+		createSQL = normalizeCreateRoutine(createSQL, "PROCEDURE", procDef.Name)
 	}
 	return &Result{
 		Columns:     []string{"Procedure", "sql_mode", "Create Procedure", "character_set_client", "collation_connection", "Database Collation"},
-		Rows:        [][]interface{}{{procDef.Name, "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION", createSQL, "utf8mb4", "utf8mb4_0900_ai_ci", "utf8mb4_0900_ai_ci"}},
+		Rows:        [][]interface{}{{procDef.Name, e.sqlMode, createSQL, "utf8mb4", "utf8mb4_0900_ai_ci", "utf8mb4_0900_ai_ci"}},
 		IsResultSet: true,
 	}, nil
 }
@@ -1298,10 +1310,256 @@ func (e *Executor) showCreateFunction(funcName string) (*Result, error) {
 		}
 		body := strings.Join(funcDef.Body, ";\n")
 		createSQL = fmt.Sprintf("CREATE DEFINER=`root`@`localhost` FUNCTION `%s`(%s) RETURNS %s\nBEGIN\n%s;\nEND", funcDef.Name, strings.Join(paramParts, ", "), funcDef.ReturnType, body)
+	} else {
+		createSQL = normalizeCreateRoutine(createSQL, "FUNCTION", funcDef.Name)
 	}
 	return &Result{
 		Columns:     []string{"Function", "sql_mode", "Create Function", "character_set_client", "collation_connection", "Database Collation"},
-		Rows:        [][]interface{}{{funcDef.Name, "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION", createSQL, "utf8mb4", "utf8mb4_0900_ai_ci", "utf8mb4_0900_ai_ci"}},
+		Rows:        [][]interface{}{{funcDef.Name, e.sqlMode, createSQL, "utf8mb4", "utf8mb4_0900_ai_ci", "utf8mb4_0900_ai_ci"}},
+		IsResultSet: true,
+	}, nil
+}
+
+// normalizeReturnType converts SQL type names to MySQL canonical form.
+func normalizeReturnType(t string) string {
+	switch strings.ToUpper(strings.TrimSpace(t)) {
+	case "INT", "INTEGER":
+		return "int(11)"
+	case "TINYINT":
+		return "tinyint(4)"
+	case "SMALLINT":
+		return "smallint(6)"
+	case "MEDIUMINT":
+		return "mediumint(9)"
+	case "BIGINT":
+		return "bigint(20)"
+	case "FLOAT":
+		return "float"
+	case "DOUBLE", "REAL":
+		return "double"
+	case "DECIMAL", "NUMERIC":
+		return "decimal(10,0)"
+	case "VARCHAR":
+		return "varchar(255)"
+	case "CHAR":
+		return "char(1)"
+	case "TEXT":
+		return "text"
+	case "BLOB":
+		return "blob"
+	case "LONGTEXT":
+		return "longtext"
+	case "LONGBLOB":
+		return "longblob"
+	case "TINYTEXT":
+		return "tinytext"
+	case "TINYBLOB":
+		return "tinyblob"
+	case "MEDIUMTEXT":
+		return "mediumtext"
+	case "MEDIUMBLOB":
+		return "mediumblob"
+	case "DATE":
+		return "date"
+	case "DATETIME":
+		return "datetime"
+	case "TIMESTAMP":
+		return "timestamp"
+	case "TIME":
+		return "time"
+	case "YEAR":
+		return "year(4)"
+	case "BOOL", "BOOLEAN":
+		return "tinyint(1)"
+	case "JSON":
+		return "json"
+	}
+	return strings.ToLower(t)
+}
+
+// normalizeCreateRoutine transforms a user-provided CREATE FUNCTION/PROCEDURE SQL
+// into MySQL's canonical SHOW CREATE output format.
+func normalizeCreateRoutine(originalSQL string, routineType string, routineName string) string {
+	// Remove leading/trailing whitespace
+	sql := strings.TrimSpace(originalSQL)
+
+	// Parse whether it already has DEFINER
+	upper := strings.ToUpper(sql)
+	hasDefiner := strings.Contains(upper, "DEFINER")
+
+	// Find and replace the "CREATE [DEFINER=...] FUNCTION/PROCEDURE name" header
+	routineTypeUpper := strings.ToUpper(routineType)
+	idx := strings.Index(upper, routineTypeUpper+" ")
+	if idx < 0 {
+		return sql
+	}
+
+	// Build the canonical prefix
+	prefix := fmt.Sprintf("CREATE DEFINER=`root`@`localhost` %s `%s`", routineType, routineName)
+
+	// Find what comes after the routine name in the original
+	// Skip past "FUNCTION name" or "PROCEDURE name" in the original
+	rest := sql[idx+len(routineType)+1:]
+	// Skip the routine name
+	rest = strings.TrimSpace(rest)
+	// Skip quoted or unquoted name
+	if strings.HasPrefix(rest, "`") {
+		end := strings.Index(rest[1:], "`")
+		if end >= 0 {
+			rest = rest[end+2:]
+		}
+	} else {
+		// Unquoted name: skip until whitespace, (, or end
+		i := 0
+		for i < len(rest) && rest[i] != ' ' && rest[i] != '\t' && rest[i] != '\n' && rest[i] != '(' {
+			i++
+		}
+		rest = rest[i:]
+	}
+
+	// If this is a FUNCTION, normalize the RETURNS type
+	if routineTypeUpper == "FUNCTION" {
+		// Find "RETURNS type" in the rest (before BEGIN)
+		restUpper := strings.ToUpper(rest)
+		returnsIdx := strings.Index(restUpper, "RETURNS ")
+		if returnsIdx >= 0 {
+			beforeReturns := rest[:returnsIdx]
+			afterKeyword := rest[returnsIdx+8:] // after "RETURNS "
+			// Find where type ends (before BEGIN or whitespace+BEGIN)
+			afterKeywordUpper := strings.ToUpper(afterKeyword)
+			beginIdx := strings.Index(afterKeywordUpper, "\nBEGIN")
+			if beginIdx < 0 {
+				beginIdx = strings.Index(afterKeywordUpper, " BEGIN")
+			}
+			var returnType string
+			var afterType string
+			if beginIdx >= 0 {
+				returnType = strings.TrimSpace(afterKeyword[:beginIdx])
+				afterType = afterKeyword[beginIdx:]
+			} else {
+				// Single-statement function (RETURN ...)
+				// Type ends at newline or specific keyword
+				newlineIdx := strings.Index(afterKeyword, "\n")
+				if newlineIdx >= 0 {
+					returnType = strings.TrimSpace(afterKeyword[:newlineIdx])
+					afterType = afterKeyword[newlineIdx:]
+				} else {
+					returnType = strings.TrimSpace(afterKeyword)
+					afterType = ""
+				}
+			}
+			// Normalize type
+			returnType = normalizeReturnType(returnType)
+			rest = beforeReturns + "RETURNS " + returnType + afterType
+		}
+	}
+
+	// Normalize body: strip leading whitespace from each line
+	lines := strings.Split(rest, "\n")
+	var normalizedLines []string
+	for _, line := range lines {
+		normalizedLines = append(normalizedLines, strings.TrimLeft(line, " \t"))
+	}
+	rest = strings.Join(normalizedLines, "\n")
+	rest = strings.TrimSpace(rest)
+
+	_ = hasDefiner
+	return prefix + rest
+}
+
+// showRoutineStatus implements SHOW FUNCTION STATUS and SHOW PROCEDURE STATUS.
+// routineType is "FUNCTION" or "PROCEDURE".
+// rest is the remaining part of the query after "SHOW FUNCTION STATUS" or "SHOW PROCEDURE STATUS".
+func (e *Executor) showRoutineStatus(routineType string, rest string) (*Result, error) {
+	rest = strings.TrimSpace(rest)
+	restUpper := strings.ToUpper(rest)
+
+	// Parse optional LIKE or WHERE clause
+	var likePattern string
+	var whereField string
+	var whereValue string
+
+	if strings.HasPrefix(restUpper, "LIKE ") {
+		// Extract the pattern
+		likeRest := strings.TrimSpace(rest[5:])
+		likeRest = strings.TrimRight(likeRest, ";")
+		likePattern = strings.Trim(likeRest, "'\"")
+	} else if strings.HasPrefix(restUpper, "WHERE ") {
+		// Simple WHERE NAME='value' or WHERE NAME LIKE 'pattern'
+		whereRest := strings.TrimSpace(rest[6:])
+		whereRest = strings.TrimRight(whereRest, ";")
+		whereRestUpper := strings.ToUpper(whereRest)
+		if strings.HasPrefix(whereRestUpper, "NAME") {
+			afterName := strings.TrimSpace(whereRest[4:])
+			afterNameUpper := strings.ToUpper(afterName)
+			if strings.HasPrefix(afterNameUpper, "LIKE ") {
+				pat := strings.TrimSpace(afterName[5:])
+				likePattern = strings.Trim(pat, "'\"")
+			} else if strings.HasPrefix(afterName, "=") || strings.HasPrefix(afterName, " =") {
+				eqIdx := strings.Index(afterName, "=")
+				val := strings.TrimSpace(afterName[eqIdx+1:])
+				whereField = "NAME"
+				whereValue = strings.Trim(val, "'\"")
+			}
+		}
+	}
+
+	cols := []string{"Db", "Name", "Type", "Definer", "Modified", "Created", "Security_type", "Comment", "character_set_client", "collation_connection", "Database Collation"}
+	var rows [][]interface{}
+
+	now := "2000-01-01 00:00:00" // placeholder timestamp
+
+	// Iterate over all databases
+	for _, dbName := range e.Catalog.ListDatabases() {
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+
+		if routineType == "FUNCTION" {
+			for _, funcDef := range db.ListFunctions() {
+				name := funcDef.Name
+				// Apply filter
+				if likePattern != "" {
+					if !matchLike(strings.ToLower(name), strings.ToLower(likePattern)) {
+						continue
+					}
+				} else if whereField == "NAME" && whereValue != "" {
+					if !strings.EqualFold(name, whereValue) {
+						continue
+					}
+				}
+				rows = append(rows, []interface{}{
+					dbName, name, "FUNCTION", "root@localhost",
+					now, now, "DEFINER", "",
+					"utf8mb4", "utf8mb4_0900_ai_ci", "utf8mb4_0900_ai_ci",
+				})
+			}
+		} else {
+			for _, procDef := range db.ListProcedures() {
+				name := procDef.Name
+				// Apply filter
+				if likePattern != "" {
+					if !matchLike(strings.ToLower(name), strings.ToLower(likePattern)) {
+						continue
+					}
+				} else if whereField == "NAME" && whereValue != "" {
+					if !strings.EqualFold(name, whereValue) {
+						continue
+					}
+				}
+				rows = append(rows, []interface{}{
+					dbName, name, "PROCEDURE", "root@localhost",
+					now, now, "DEFINER", "",
+					"utf8mb4", "utf8mb4_0900_ai_ci", "utf8mb4_0900_ai_ci",
+				})
+			}
+		}
+	}
+
+	return &Result{
+		Columns:     cols,
+		Rows:        rows,
 		IsResultSet: true,
 	}, nil
 }
@@ -1379,12 +1637,23 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 			if tableCharset == "" {
 				tableCharset = "utf8mb4"
 			}
-			if !strings.EqualFold(col.Charset, tableCharset) {
+			charsetDiffers := !strings.EqualFold(col.Charset, tableCharset)
+			// Show COLLATE when the column collation differs from the default collation for the column's charset.
+			// This handles cases like VARCHAR BINARY which gets latin1_bin vs latin1's default latin1_swedish_ci.
+			defaultCollForColCharset := catalog.DefaultCollationForCharset(col.Charset)
+			collationDiffers := col.Collation != "" && !strings.EqualFold(col.Collation, defaultCollForColCharset)
+			if charsetDiffers {
 				collation := col.Collation
 				if collation == "" {
-					collation = catalog.DefaultCollationForCharset(col.Charset)
+					// No explicit collation: show only CHARACTER SET (MySQL behavior for
+					// columns whose collation was not explicitly set, e.g. from SELECT result)
+					parts = append(parts, fmt.Sprintf("CHARACTER SET %s", col.Charset))
+				} else {
+					parts = append(parts, fmt.Sprintf("CHARACTER SET %s COLLATE %s", col.Charset, collation))
 				}
-				parts = append(parts, fmt.Sprintf("CHARACTER SET %s COLLATE %s", col.Charset, collation))
+			} else if collationDiffers {
+				// Same charset as table but different collation: show only COLLATE
+				parts = append(parts, fmt.Sprintf("COLLATE %s", col.Collation))
 			}
 		}
 		colTypeLower := strings.ToLower(col.Type)
@@ -1557,10 +1826,14 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		} else if idx.Unique {
 			prefix = "UNIQUE KEY"
 		}
+		invisibleStr := ""
+		if idx.Invisible {
+			invisibleStr = " /*!80000 INVISIBLE */"
+		}
 		if prefix == "UNIQUE KEY" {
-			b.WriteString(fmt.Sprintf("  UNIQUE KEY %s (%s)%s%s", quoteFunc(idx.Name), strings.Join(quotedCols, ","), usingStr, commentStr))
+			b.WriteString(fmt.Sprintf("  UNIQUE KEY %s (%s)%s%s%s", quoteFunc(idx.Name), strings.Join(quotedCols, ","), usingStr, commentStr, invisibleStr))
 		} else {
-			b.WriteString(fmt.Sprintf("  %s %s (%s)%s%s", prefix, quoteFunc(idx.Name), strings.Join(quotedCols, ","), usingStr, commentStr))
+			b.WriteString(fmt.Sprintf("  %s %s (%s)%s%s%s", prefix, quoteFunc(idx.Name), strings.Join(quotedCols, ","), usingStr, commentStr, invisibleStr))
 		}
 		if i < len(displayIndexes)-1 || len(def.CheckConstraints) > 0 {
 			b.WriteString(",")

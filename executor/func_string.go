@@ -330,9 +330,10 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 		}
 		switch tv := val.(type) {
 		case int64:
-			return strings.ToUpper(fmt.Sprintf("%X", tv)), true, nil
+			// Use unsigned format to avoid negative hex output for large values
+			return strings.ToUpper(fmt.Sprintf("%X", uint64(tv))), true, nil
 		case float64:
-			return strings.ToUpper(fmt.Sprintf("%X", int64(tv))), true, nil
+			return strings.ToUpper(fmt.Sprintf("%X", uint64(int64(tv)))), true, nil
 		default:
 			s := toString(val)
 			return strings.ToUpper(hex.EncodeToString([]byte(s))), true, nil
@@ -358,8 +359,9 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 		if hasNull {
 			return nil, true, nil
 		}
-		s0 := strings.ToLower(toString(v0))
-		s1 := strings.ToLower(toString(v1))
+		// PAD SPACE: strip trailing spaces for non-binary comparison
+		s0 := strings.TrimRight(strings.ToLower(toString(v0)), " ")
+		s1 := strings.TrimRight(strings.ToLower(toString(v1)), " ")
 		if s0 < s1 {
 			return int64(-1), true, nil
 		} else if s0 > s1 {

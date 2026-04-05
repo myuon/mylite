@@ -98,10 +98,22 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 	}
 
 	// Resolve views: if tableName is a view, replace with the underlying base table.
-	if baseTable, isView, err := e.resolveViewToBaseTable(tableName); err != nil {
+	// Also collect the view's WHERE condition to merge with the UPDATE's WHERE.
+	var viewWhereExpr sqlparser.Expr
+	if baseTable, isView, viewWhere, err := e.resolveViewToBaseTable(tableName); err != nil {
 		return nil, err
 	} else if isView {
 		tableName = baseTable
+		viewWhereExpr = viewWhere
+	}
+	// Merge view's WHERE condition into the UPDATE's WHERE clause.
+	// If the view has a WHERE clause, AND it with the UPDATE's WHERE clause.
+	if viewWhereExpr != nil {
+		if stmt.Where == nil {
+			stmt.Where = &sqlparser.Where{Type: sqlparser.WhereClause, Expr: viewWhereExpr}
+		} else {
+			stmt.Where.Expr = &sqlparser.AndExpr{Left: viewWhereExpr, Right: stmt.Where.Expr}
+		}
 	}
 
 	// Handle performance_schema tables
@@ -349,48 +361,63 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 							}
 						}
 					}
-					// String length check for CHAR/VARCHAR/BINARY/VARBINARY columns
+					// String length check for CHAR/VARCHAR/BINARY/VARBINARY/BLOB/TEXT columns
 					if val != nil {
 						colUp := strings.ToUpper(col.Type)
 						isCharType := strings.Contains(colUp, "CHAR") || strings.Contains(colUp, "BINARY")
-						if isCharType {
+						isBlobType := colUp == "BLOB" || colUp == "TINYBLOB" || colUp == "MEDIUMBLOB" || colUp == "LONGBLOB"
+						isTextType := colUp == "TEXT" || colUp == "TINYTEXT" || colUp == "MEDIUMTEXT" || colUp == "LONGTEXT"
+						if isCharType || isBlobType || isTextType {
 							if sv, ok := val.(string); ok {
 								maxLen := extractCharLength(col.Type)
-								// Determine effective charset for accurate character counting.
-								// For multi-byte non-UTF8 charsets (ucs2, utf16, utf32, big5, gbk, etc.)
-								// or when the string contains non-UTF-8 bytes, we cannot accurately
-								// count characters. Skip the length check in those cases.
-								effectiveCs := col.Charset
-								if effectiveCs == "" && tbl.Def != nil {
-									effectiveCs = tbl.Def.Charset
-								}
-								if effectiveCs == "" {
-									effectiveCs = "utf8mb4"
-								}
-								effectiveCs = strings.ToLower(effectiveCs)
-								isUtf8Cs := effectiveCs == "utf8" || effectiveCs == "utf8mb4" ||
-									effectiveCs == "utf8mb3" || effectiveCs == "ascii" ||
-									effectiveCs == "" || isSingleByteCharset(effectiveCs)
-								svLen := 0
-								if isUtf8Cs && utf8.ValidString(sv) {
-									svLen = len([]rune(sv))
+								isBinaryCol := strings.Contains(colUp, "BINARY") || isBlobType
+								var svLen int
+								if isBinaryCol {
+									svLen = len(sv)
+								} else {
+									// For CHAR/VARCHAR/TEXT, determine effective charset for char counting.
+									effectiveCs := col.Charset
+									if effectiveCs == "" && tbl.Def != nil {
+										effectiveCs = tbl.Def.Charset
+									}
+									if effectiveCs == "" {
+										effectiveCs = "utf8mb4"
+									}
+									effectiveCs = strings.ToLower(effectiveCs)
+									isUtf8Cs := effectiveCs == "utf8" || effectiveCs == "utf8mb4" ||
+										effectiveCs == "utf8mb3" || effectiveCs == "ascii" ||
+										effectiveCs == "" || isSingleByteCharset(effectiveCs)
+									svLen = 0
+									if isUtf8Cs && utf8.ValidString(sv) {
+										svLen = len([]rune(sv))
+									}
 								}
 								if maxLen > 0 && svLen > maxLen {
-									excess := string([]rune(sv)[maxLen:])
-									onlySpaces := strings.TrimRight(excess, " ") == ""
-									if onlySpaces {
-										val = string([]rune(sv)[:maxLen])
-										e.addWarning("Note", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", col.Name, i+1))
-									} else if e.isStrictMode() {
-										if bool(stmt.Ignore) {
-											val = string([]rune(sv)[:maxLen])
+									if isBinaryCol {
+										// BLOB/BINARY: truncate at byte boundary
+										if bool(stmt.Ignore) || !e.isStrictMode() {
+											val = sv[:maxLen]
 											e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", col.Name, i+1))
 										} else {
 											return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row %d", col.Name, i+1))
 										}
 									} else {
-										// Non-strict mode: warn but do NOT truncate (Dolt compatibility)
-										e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", col.Name, i+1))
+										excess := string([]rune(sv)[maxLen:])
+										onlySpaces := strings.TrimRight(excess, " ") == ""
+										if onlySpaces {
+											val = string([]rune(sv)[:maxLen])
+											e.addWarning("Note", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", col.Name, i+1))
+										} else if e.isStrictMode() {
+											if bool(stmt.Ignore) {
+												val = string([]rune(sv)[:maxLen])
+												e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", col.Name, i+1))
+											} else {
+												return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row %d", col.Name, i+1))
+											}
+										} else {
+											// Non-strict mode: warn but do NOT truncate (Dolt compatibility)
+											e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", col.Name, i+1))
+										}
 									}
 								}
 							}

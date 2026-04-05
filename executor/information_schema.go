@@ -99,6 +99,10 @@ var infoSchemaColumnOrder = map[string][]string{
 	"innodb_buffer_page_lru":   {"POOL_ID", "LRU_POSITION", "SPACE", "PAGE_NUMBER"},
 	"innodb_buffer_page":       {"SPACE", "PAGE_NUMBER", "PAGE_TYPE", "NUMBER_RECORDS", "TABLE_NAME"},
 	"innodb_buffer_pool_stats": {"POOL_ID", "POOL_SIZE"},
+	"innodb_cmp":               {"page_size", "compress_ops", "compress_ops_ok", "compress_time", "uncompress_ops", "uncompress_time"},
+	"innodb_cmp_reset":         {"page_size", "compress_ops", "compress_ops_ok", "compress_time", "uncompress_ops", "uncompress_time"},
+	"innodb_cmpmem":            {"page_size", "buffer_pool_instance", "pages_used", "pages_free", "relocation_ops", "relocation_time"},
+	"innodb_cmpmem_reset":      {"page_size", "buffer_pool_instance", "pages_used", "pages_free", "relocation_ops", "relocation_time"},
 	"innodb_trx":               {"trx_id", "trx_state", "trx_started"},
 	"innodb_foreign_cols":      {"ID", "FOR_COL_NAME", "REF_COL_NAME", "POS"},
 	"innodb_fields":            {"INDEX_ID", "NAME", "POS"},
@@ -223,6 +227,70 @@ var infoSchemaColumnOrder = map[string][]string{
 	"data_lock_waits":                  {"ENGINE", "REQUESTING_ENGINE_LOCK_ID", "REQUESTING_ENGINE_TRANSACTION_ID", "REQUESTING_THREAD_ID", "REQUESTING_EVENT_ID", "REQUESTING_OBJECT_INSTANCE_BEGIN", "BLOCKING_ENGINE_LOCK_ID", "BLOCKING_ENGINE_TRANSACTION_ID", "BLOCKING_THREAD_ID", "BLOCKING_EVENT_ID", "BLOCKING_OBJECT_INSTANCE_BEGIN"},
 }
 
+// perfSchemaColumnOrder lists performance_schema table names (lowercase).
+// Used to detect PS tables which preserve user-specified column casing.
+var perfSchemaColumnOrder = map[string]bool{
+	"accounts": true, "users": true, "hosts": true,
+	"setup_objects": true, "setup_instruments": true, "setup_threads": true,
+	"persisted_variables": true, "variables_info": true, "variables_by_thread": true,
+	"mutex_instances": true, "rwlock_instances": true, "cond_instances": true,
+	"file_instances": true, "file_summary_by_instance": true, "file_summary_by_event_name": true,
+	"socket_instances": true, "socket_summary_by_event_name": true, "socket_summary_by_instance": true,
+	"table_handles": true, "table_io_waits_summary_by_table": true,
+	"table_io_waits_summary_by_index_usage": true, "table_lock_waits_summary_by_table": true,
+	"events_waits_history": true, "events_waits_history_long": true, "events_waits_current": true,
+	"events_stages_current": true, "events_stages_history": true, "events_stages_history_long": true,
+	"events_statements_current": true, "events_statements_history": true, "events_statements_history_long": true,
+	"events_transactions_current": true, "events_transactions_history": true, "events_transactions_history_long": true,
+	"events_waits_summary_by_account_by_event_name": true,
+	"events_waits_summary_by_host_by_event_name": true,
+	"events_waits_summary_by_instance": true,
+	"events_waits_summary_by_thread_by_event_name": true,
+	"events_waits_summary_by_user_by_event_name": true,
+	"events_waits_summary_global_by_event_name": true,
+	"events_stages_summary_by_account_by_event_name": true,
+	"events_stages_summary_by_host_by_event_name": true,
+	"events_stages_summary_by_thread_by_event_name": true,
+	"events_stages_summary_by_user_by_event_name": true,
+	"events_stages_summary_global_by_event_name": true,
+	"events_statements_summary_by_account_by_event_name": true,
+	"events_statements_summary_by_digest": true,
+	"events_statements_summary_by_host_by_event_name": true,
+	"events_statements_summary_by_thread_by_event_name": true,
+	"events_statements_summary_by_user_by_event_name": true,
+	"events_statements_summary_global_by_event_name": true,
+	"events_statements_summary_by_program": true,
+	"events_statements_histogram_by_digest": true,
+	"events_statements_histogram_global": true,
+	"events_transactions_summary_by_account_by_event_name": true,
+	"events_transactions_summary_by_host_by_event_name": true,
+	"events_transactions_summary_by_thread_by_event_name": true,
+	"events_transactions_summary_by_user_by_event_name": true,
+	"events_transactions_summary_global_by_event_name": true,
+	"events_errors_summary_by_account_by_error": true,
+	"events_errors_summary_by_host_by_error": true,
+	"events_errors_summary_by_thread_by_error": true,
+	"events_errors_summary_by_user_by_error": true,
+	"events_errors_summary_global_by_error": true,
+	"memory_summary_by_account_by_event_name": true,
+	"memory_summary_by_host_by_event_name": true,
+	"memory_summary_by_thread_by_event_name": true,
+	"memory_summary_by_user_by_event_name": true,
+	"status_by_account": true, "status_by_host": true, "status_by_thread": true, "status_by_user": true,
+	"replication_connection_configuration": true, "replication_connection_status": true,
+	"replication_applier_configuration": true, "replication_applier_status": true,
+	"replication_applier_status_by_coordinator": true, "replication_applier_status_by_worker": true,
+	"replication_applier_filters": true, "replication_applier_global_filters": true,
+	"replication_group_members": true, "replication_group_member_stats": true,
+	"keyring_keys": true, "host_cache": true, "log_status": true,
+	"objects_summary_global_by_type": true, "prepared_statements_instances": true,
+	"user_defined_functions": true, "user_variables_by_thread": true,
+	"session_connect_attrs": true, "session_account_connect_attrs": true,
+	"metadata_locks": true, "data_locks": true, "data_lock_waits": true,
+	"setup_consumers": true, "setup_actors": true, "performance_timers": true,
+	"threads": true,
+}
+
 // emptyStubTables lists virtual tables that always return an empty result set.
 var emptyStubTables = map[string]bool{
 	"innodb_ft_index_cache":  true,
@@ -285,6 +353,10 @@ var singleRowStubTables = map[string]storage.Row{
 	"innodb_foreign":        {"ID": "", "FOR_NAME": "", "REF_NAME": "", "N_COLS": int64(0)},
 	"innodb_buffer_page_lru": {"POOL_ID": int64(0), "LRU_POSITION": int64(0), "SPACE": int64(0), "PAGE_NUMBER": int64(0)},
 	"innodb_buffer_pool_stats": {"POOL_ID": int64(0), "POOL_SIZE": int64(0)},
+	"innodb_cmp":          {"page_size": int64(4096), "compress_ops": int64(0), "compress_ops_ok": int64(0), "compress_time": int64(0), "uncompress_ops": int64(0), "uncompress_time": int64(0)},
+	"innodb_cmp_reset":    {"page_size": int64(4096), "compress_ops": int64(0), "compress_ops_ok": int64(0), "compress_time": int64(0), "uncompress_ops": int64(0), "uncompress_time": int64(0)},
+	"innodb_cmpmem":       {"page_size": int64(4096), "buffer_pool_instance": int64(0), "pages_used": int64(0), "pages_free": int64(0), "relocation_ops": int64(0), "relocation_time": int64(0)},
+	"innodb_cmpmem_reset": {"page_size": int64(4096), "buffer_pool_instance": int64(0), "pages_used": int64(0), "pages_free": int64(0), "relocation_ops": int64(0), "relocation_time": int64(0)},
 	"innodb_trx":            {"trx_id": "", "trx_state": "RUNNING", "trx_started": nil},
 	"innodb_foreign_cols":   {"ID": "", "FOR_COL_NAME": "", "REF_COL_NAME": "", "POS": int64(0)},
 	"innodb_fields":         {"INDEX_ID": int64(0), "NAME": "", "POS": int64(0)},
@@ -343,6 +415,7 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 			"innodb_tables", "innodb_tablespaces", "innodb_datafiles", "innodb_columns",
 			"innodb_virtual", "innodb_foreign", "innodb_metrics", "innodb_cached_indexes",
 			"innodb_indexes", "innodb_buffer_page_lru", "innodb_buffer_page", "innodb_buffer_pool_stats",
+			"innodb_cmp", "innodb_cmp_reset", "innodb_cmpmem", "innodb_cmpmem_reset",
 			"innodb_trx", "innodb_foreign_cols", "innodb_fields", "optimizer_trace", "files", "processlist",
 			"key_column_usage", "referential_constraints", "innodb_temp_table_info",
 			"innodb_ft_default_stopword", "innodb_ft_index_cache", "innodb_ft_index_table",
@@ -1534,22 +1607,33 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 // infoSchemaStatistics returns rows for INFORMATION_SCHEMA.STATISTICS.
 func (e *Executor) infoSchemaStatistics() []storage.Row {
 	readPersistent := e.informationSchemaStatsExpiryZero()
+	// Always load persistent stats from innodb_index_stats (if available).
+	// These are used when readPersistent=true, or as a presence indicator
+	// to decide whether to return NULL vs 0 for cardinality.
 	cardinalityByKey := map[string]int64{}
-	if readPersistent {
-		if tbl, err := e.Storage.GetTable("mysql", "innodb_index_stats"); err == nil {
-			tbl.Mu.RLock()
-			for _, r := range tbl.Rows {
-				dbName := strings.ToLower(toString(r["database_name"]))
-				tableName := strings.ToLower(toString(r["table_name"]))
-				indexName := strings.ToLower(toString(r["index_name"]))
-				statName := strings.ToLower(toString(r["stat_name"]))
-				if dbName == "" || tableName == "" || indexName == "" || !strings.HasPrefix(statName, "n_diff_pfx") {
-					continue
-				}
-				cardinalityByKey[dbName+"."+tableName+"."+indexName+"."+statName] = asInt64Or(r["stat_value"], 0)
+	cardinalityKeyExists := map[string]bool{}
+	// cardinalityNotAnalyzed tracks entries with sample_size=0 (sentinel for CREATE TABLE).
+	// These show as NULL in SHOW INDEX until ANALYZE is run.
+	cardinalityNotAnalyzed := map[string]bool{}
+	if tbl, err := e.Storage.GetTable("mysql", "innodb_index_stats"); err == nil {
+		tbl.Mu.RLock()
+		for _, r := range tbl.Rows {
+			dbName := strings.ToLower(toString(r["database_name"]))
+			tableName := strings.ToLower(toString(r["table_name"]))
+			indexName := strings.ToLower(toString(r["index_name"]))
+			statName := strings.ToLower(toString(r["stat_name"]))
+			if dbName == "" || tableName == "" || indexName == "" || !strings.HasPrefix(statName, "n_diff_pfx") {
+				continue
 			}
-			tbl.Mu.RUnlock()
+			key := dbName + "." + tableName + "." + indexName + "." + statName
+			cardinalityByKey[key] = asInt64Or(r["stat_value"], 0)
+			cardinalityKeyExists[key] = true
+			// Check if this is the "not yet analyzed" sentinel (sample_size=0)
+			if asInt64Or(r["sample_size"], -1) == 0 {
+				cardinalityNotAnalyzed[key] = true
+			}
 		}
+		tbl.Mu.RUnlock()
 	}
 
 	dbNames := e.Catalog.ListDatabases()
@@ -1579,9 +1663,23 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 			for _, c := range tbl.Columns {
 				colNullable[strings.ToLower(c.Name)] = c.Nullable
 			}
+			// Determine table engine for cardinality mode selection.
+			tblEngine := ""
+			if tbl != nil {
+				tblEngine = strings.ToUpper(tbl.Engine)
+			}
+			// InnoDB with STATS_PERSISTENT=0: use transient/dynamic stats (always compute dynamic)
+			tblUsesTransientStats := (tblEngine == "" || tblEngine == "INNODB") &&
+				!e.innodbStatsPersistentEnabled(tbl)
+			// Temporary tables always use dynamic stats (no persistent stats stored)
+			tblIsTemp := e.tempTables != nil && (e.tempTables[tblName] || e.tempTables[strings.ToLower(tblName)])
 			appendIndexRows := func(indexName string, cols []string, nonUnique int64, idxComment string, idxType string, invisible bool) {
 				var dynamic []int64
-				if !readPersistent {
+				if !readPersistent && (tblUsesTransientStats || tblIsTemp || len(dataRows) > 0) {
+					// Compute dynamic stats when:
+					// - Transient InnoDB (STATS_PERSISTENT=0): always compute
+					// - Temporary tables: always compute
+					// - Any table with rows: compute for fallback
 					dynamic = distinctPrefixCounts(dataRows, cols)
 				}
 				indexTypeStr := "BTREE"
@@ -1602,10 +1700,35 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 					statKey := strings.ToLower(dbName + "." + tblName + "." + indexName + "." + fmt.Sprintf("n_diff_pfx%02d", i+1))
 					var cardinality interface{}
 					if readPersistent {
-						cardinality = cardinalityByKey[statKey]
+						// When stats_expiry=0, always read from persistent storage.
+						// If key not found or not-analyzed sentinel, return NULL.
+						if cardinalityKeyExists[statKey] && !cardinalityNotAnalyzed[statKey] {
+							cardinality = cardinalityByKey[statKey]
+						}
+					} else if cardinalityKeyExists[statKey] {
+						if cardinalityNotAnalyzed[statKey] {
+							// Not-analyzed sentinel (CREATE TABLE, no ANALYZE): show NULL.
+							// Only InnoDB persistent-stats tables reach here (non-InnoDB tables
+							// don't have entries in innodb_index_stats).
+							cardinality = nil
+						} else {
+							cardinality = cardinalityByKey[statKey]
+						}
+					} else if tblUsesTransientStats || tblIsTemp {
+						// Transient InnoDB (STATS_PERSISTENT=0) or temp table: use dynamic.
+						if i < len(dynamic) {
+							cardinality = dynamic[i]
+						} else {
+							cardinality = int64(0)
+						}
 					} else if i < len(dynamic) {
+						// No persistent stats entry and not transient InnoDB.
+						// For non-InnoDB (MyISAM etc.) or temp tables: use dynamic if available.
+						// dynamic[i] is only computed when len(dataRows) > 0 (see guard above).
 						cardinality = dynamic[i]
 					}
+					// For InnoDB with STATS_PERSISTENT=1 and no entry: NULL (unexpected, but handled)
+					// For empty MyISAM (len(dataRows)==0) with no entry: NULL (dynamic not computed)
 					// SPATIAL indexes use a 32-byte MBR key prefix
 					var subPart interface{}
 					if idxType == "SPATIAL" {
