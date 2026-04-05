@@ -64,6 +64,9 @@ go run ./cmd/mtrrun -suite sys_vars,innodb
 # 特定テストのみ実行
 go run ./cmd/mtrrun -test sys_vars/gtid_owned_basic
 go run ./cmd/mtrrun -test sys_vars/gtid_owned_basic,other/bool
+
+# skipされたテストのみ実行（skiplistを変更せずに確認）
+go run ./cmd/mtrrun -suite sys_vars -skipped-only -force
 ```
 
 ## skiplist操作
