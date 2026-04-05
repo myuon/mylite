@@ -8287,6 +8287,60 @@ func looksLikeTime(s string) bool {
 	return strings.Contains(s, ":")
 }
 
+// looksLikeActualTime returns true if the string is a plausible MySQL TIME value.
+// A valid TIME looks like: [+-][D ]HH:MM[:SS[.frac]] where all components are numeric.
+// This is stricter than looksLikeTime and excludes strings like instrument names
+// that happen to contain ':' (e.g. 'wait/synch/mutex/sql/hash_filo::lock').
+func looksLikeActualTime(s string) bool {
+	if s == "" {
+		return false
+	}
+	// Strip optional sign
+	if s[0] == '-' || s[0] == '+' {
+		s = s[1:]
+	}
+	// Strip optional day prefix (e.g. "1 " in "1 12:00:00")
+	if idx := strings.Index(s, " "); idx >= 0 {
+		dayPart := s[:idx]
+		rest := s[idx+1:]
+		allDigits := true
+		for _, c := range dayPart {
+			if c < '0' || c > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits && len(dayPart) > 0 {
+			s = rest
+		}
+	}
+	// Now s should be HH:MM[:SS[.frac]]
+	// The first character must be a digit
+	if len(s) == 0 || s[0] < '0' || s[0] > '9' {
+		return false
+	}
+	// Must contain ':' and all colon-separated segments must start with a digit
+	colonIdx := strings.Index(s, ":")
+	if colonIdx < 0 {
+		return false
+	}
+	// Validate each colon-separated part starts with a digit
+	parts := strings.Split(s, ":")
+	for _, p := range parts {
+		// Each part may have fractional seconds: strip after '.'
+		p = strings.SplitN(p, ".", 2)[0]
+		if len(p) == 0 {
+			continue // empty part (e.g. "12::34") - not valid time but also not an instrument
+		}
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // normalizeDateTimeString normalizes a date or datetime string into canonical form.
 // For date-only values: returns "YYYY-MM-DD".
 // For datetime values: returns "YYYY-MM-DD HH:MM:SS".
@@ -14721,8 +14775,10 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 					return ln == rn, nil
 				}
 			}
-			// Try TIME normalization if either looks like a time
-			if looksLikeTime(ls) || looksLikeTime(rs) {
+			// Try TIME normalization if either looks like a time.
+			// Use strict check to avoid false positives from strings that contain ':'
+			// but are not actually time values (e.g. instrument names like 'hash_filo::lock').
+			if looksLikeActualTime(ls) || looksLikeActualTime(rs) {
 				lt := parseMySQLTimeValue(ls)
 				rt := parseMySQLTimeValue(rs)
 				if lt == rt {
