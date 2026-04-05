@@ -54,13 +54,3 @@ python3 scripts/skiplist.py validate
 ```
 
 ⚠️ エージェントにskiplist.jsonを直接編集させない。必ずスクリプト経由で操作すること。
-
-## worktreeマージの注意点
-
-- worktreeは古いbaseから分岐するため、mainの最新コードを消すリスクがある
-- 変更が小さい場合（1-2ファイル、数箇所）はworktreeを使わず直接Editが安全
-- worktreeを使った場合、マージは以下の手順:
-  1. mainのファイルをReadで読む
-  2. worktreeのファイルをReadで読む
-  3. 差分を理解し、Editで追加部分のみ適用
-  4. `go build ./...` && `go test ./... -count=1 -timeout 60s` で検証
