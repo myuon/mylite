@@ -283,7 +283,11 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 		return sysVarStringToSelectValueForVar(gv, name), nil
 	}
 	// Fall back to startup variables if present.
-	if sv, ok := e.startupVars[name]; ok {
+	// performance_schema_consumer_* and performance_schema_instrument are
+	// startup-only options that must not be exposed as system variables.
+	if sv, ok := e.startupVars[name]; ok &&
+		!strings.HasPrefix(name, "performance_schema_consumer_") &&
+		name != "performance_schema_instrument" {
 		if name == "innodb_stats_transient_sample_pages" || name == "innodb_stats_persistent_sample_pages" {
 			if n, err := strconv.ParseInt(sv, 10, 64); err == nil && n < 1 {
 				sv = "1"

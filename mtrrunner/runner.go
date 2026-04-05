@@ -2998,62 +2998,79 @@ func (ctx *execContext) substituteVars(s string) string {
 // applyMasterOpt parses a master.opt file and applies relevant options to the
 // exec context variables (e.g., --innodb_page_size=32k sets $innodb_page_size).
 func applyMasterOpt(content string, ctx *execContext) {
-	for _, token := range strings.Fields(content) {
-		token = strings.TrimPrefix(token, "--")
-		// Handle boolean flags without = (e.g., --loose-enable-performance-schema, --innodb_rollback_on_timeout)
-		if !strings.Contains(token, "=") {
-			key := token
-			key = strings.TrimPrefix(key, "loose-")
-			val := "1"
-			if strings.HasPrefix(key, "disable-") {
-				key = strings.TrimPrefix(key, "disable-")
-				val = "0"
-			}
-			if strings.HasPrefix(key, "enable-") {
-				key = strings.TrimPrefix(key, "enable-")
-			}
-			// Strip MySQL loose- prefix (accepts unknown options without error)
-			key = strings.TrimPrefix(key, "loose-")
-			varKey := strings.ReplaceAll(key, "-", "_")
-			ctx.variables["$"+key] = val
-			ctx.variables["$"+varKey] = val
-			ctx.getActiveConn().ExecContext(context.Background(), fmt.Sprintf("SET STARTUP %s = %s", varKey, val)) //nolint:errcheck
+	// Parse line by line so that quoted values with spaces (e.g.
+	// --loose-performance-schema-instrument='wait/synch/mutex/sql/% = OFF ')
+	// are handled correctly.
+	for _, rawLine := range strings.Split(content, "\n") {
+		rawLine = strings.TrimSpace(rawLine)
+		if rawLine == "" || strings.HasPrefix(rawLine, "#") {
 			continue
 		}
-		if strings.Contains(token, "=") {
-			parts := strings.SplitN(token, "=", 2)
-			key := strings.TrimSpace(parts[0])
-			val := strings.TrimSpace(parts[1])
-			// Convert size suffixes (k, m, g)
-			if strings.HasSuffix(strings.ToLower(val), "k") {
-				if n, err := strconv.Atoi(val[:len(val)-1]); err == nil {
-					val = strconv.Itoa(n * 1024)
-				}
-			} else if strings.HasSuffix(strings.ToLower(val), "m") {
-				if n, err := strconv.Atoi(val[:len(val)-1]); err == nil {
-					val = strconv.Itoa(n * 1024 * 1024)
-				}
-			}
-			// Strip MySQL --loose- prefix (accepts unknown options without error)
-			key = strings.TrimPrefix(key, "loose-")
-			// Strip --enable- prefix (boolean true)
-			if strings.HasPrefix(key, "enable-") {
-				key = strings.TrimPrefix(key, "enable-")
-				if val == "" {
-					val = "1"
-				}
-			}
-			// Strip MySQL loose- prefix
-			key = strings.TrimPrefix(key, "loose-")
-			// Normalize hyphens to underscores for MySQL variable names
-			varKey := strings.ReplaceAll(key, "-", "_")
-			// Set as variable (keep original key for $variable compatibility)
-			ctx.variables["$"+key] = val
-			ctx.variables["$"+varKey] = val
-			// Apply as startup variable (SET STARTUP is a special mylite command)
-			ctx.getActiveConn().ExecContext(context.Background(), fmt.Sprintf("SET STARTUP %s = %s", varKey, val)) //nolint:errcheck
+		// Each line may contain multiple space-separated tokens when there are no
+		// quoted values with spaces. Split into tokens, but re-join lines that
+		// contain --key='value with spaces' patterns.
+		applyMasterOptToken(rawLine, ctx)
+	}
+}
+
+// applyMasterOptToken processes a single master.opt option line.
+func applyMasterOptToken(token string, ctx *execContext) {
+	token = strings.TrimPrefix(token, "--")
+	// Handle boolean flags without = (e.g., --loose-enable-performance-schema, --innodb_rollback_on_timeout)
+	if !strings.Contains(token, "=") {
+		key := token
+		key = strings.TrimPrefix(key, "loose-")
+		val := "1"
+		if strings.HasPrefix(key, "disable-") {
+			key = strings.TrimPrefix(key, "disable-")
+			val = "0"
+		}
+		if strings.HasPrefix(key, "enable-") {
+			key = strings.TrimPrefix(key, "enable-")
+		}
+		// Strip MySQL loose- prefix (accepts unknown options without error)
+		key = strings.TrimPrefix(key, "loose-")
+		varKey := strings.ReplaceAll(key, "-", "_")
+		ctx.variables["$"+key] = val
+		ctx.variables["$"+varKey] = val
+		ctx.getActiveConn().ExecContext(context.Background(), fmt.Sprintf("SET STARTUP %s = %s", varKey, val)) //nolint:errcheck
+		return
+	}
+	eqIdx := strings.Index(token, "=")
+	key := strings.TrimSpace(token[:eqIdx])
+	val := strings.TrimSpace(token[eqIdx+1:])
+	// Strip enclosing single quotes (preserving the inner content including spaces)
+	if strings.HasPrefix(val, "'") && strings.HasSuffix(val, "'") {
+		val = val[1 : len(val)-1]
+	}
+	// Convert size suffixes (k, m, g)
+	if strings.HasSuffix(strings.ToLower(val), "k") {
+		if n, err := strconv.Atoi(val[:len(val)-1]); err == nil {
+			val = strconv.Itoa(n * 1024)
+		}
+	} else if strings.HasSuffix(strings.ToLower(val), "m") {
+		if n, err := strconv.Atoi(val[:len(val)-1]); err == nil {
+			val = strconv.Itoa(n * 1024 * 1024)
 		}
 	}
+	// Strip MySQL --loose- prefix (accepts unknown options without error)
+	key = strings.TrimPrefix(key, "loose-")
+	// Strip --enable- prefix (boolean true)
+	if strings.HasPrefix(key, "enable-") {
+		key = strings.TrimPrefix(key, "enable-")
+		if val == "" {
+			val = "1"
+		}
+	}
+	// Strip MySQL loose- prefix
+	key = strings.TrimPrefix(key, "loose-")
+	// Normalize hyphens to underscores for MySQL variable names
+	varKey := strings.ReplaceAll(key, "-", "_")
+	// Set as variable (keep original key for $variable compatibility)
+	ctx.variables["$"+key] = val
+	ctx.variables["$"+varKey] = val
+	// Apply as startup variable (SET STARTUP is a special mylite command)
+	ctx.getActiveConn().ExecContext(context.Background(), fmt.Sprintf("SET STARTUP %s = '%s'", varKey, val)) //nolint:errcheck
 }
 
 // applyCnfFile parses a MySQL .cnf file and applies options from the [mysqld.1]

@@ -1133,8 +1133,25 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				if !covered {
 					idxName := name
 					if idxName == "" {
-						fkIdx++
-						idxName = fmt.Sprintf("%s_ibfk_%d", tableName, fkIdx)
+						// MySQL auto-names FK indexes after the first FK column.
+						// If that name is taken, append _2, _3, etc.
+						baseIdxName := fkCols[0]
+						idxName = baseIdxName
+						suffix := 2
+						for {
+							taken := false
+							for _, idx := range indexes {
+								if strings.EqualFold(idx.Name, idxName) {
+									taken = true
+									break
+								}
+							}
+							if !taken {
+								break
+							}
+							idxName = fmt.Sprintf("%s_%d", baseIdxName, suffix)
+							suffix++
+						}
 					}
 					idxOrders := make([]string, len(fkCols))
 					indexes = append(indexes, catalog.IndexDef{

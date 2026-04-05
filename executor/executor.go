@@ -505,6 +505,11 @@ func (e *Executor) getSysVar(name string) (string, bool) {
 
 // getSysVarGlobal reads a global-scoped system variable.
 func (e *Executor) getSysVarGlobal(name string) (string, bool) {
+	// performance_schema_consumer_* are startup-only options, not system variables.
+	if strings.HasPrefix(name, "performance_schema_consumer_") ||
+		name == "performance_schema_instrument" {
+		return "", false
+	}
 	return e.getGlobalVar(name)
 }
 
@@ -513,6 +518,13 @@ func (e *Executor) getSysVarGlobal(name string) (string, bool) {
 // For other variables, also falls back to startupVars so that server
 // startup options (e.g. --parser-max-mem-size) are visible in session scope.
 func (e *Executor) getSysVarSession(name string) (string, bool) {
+	// performance_schema_consumer_* are startup-only options for
+	// configuring performance_schema.setup_consumers. They must not be
+	// exposed as system variables (SELECT @@var / SHOW VARIABLES).
+	if strings.HasPrefix(name, "performance_schema_consumer_") ||
+		name == "performance_schema_instrument" {
+		return "", false
+	}
 	if v, ok := e.sessionScopeVars[name]; ok {
 		return v, true
 	}

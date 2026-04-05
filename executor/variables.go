@@ -40,6 +40,11 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		cleanVarName := strings.TrimPrefix(name, "global.")
 		cleanVarName = strings.TrimPrefix(cleanVarName, "session.")
 		cleanVarName = strings.TrimPrefix(cleanVarName, "local.")
+		// performance_schema_consumer_* are startup-only options, not settable variables.
+		if strings.HasPrefix(cleanVarName, "performance_schema_consumer_") ||
+			cleanVarName == "performance_schema_instrument" {
+			return nil, mysqlError(1193, "HY000", fmt.Sprintf("Unknown system variable '%s'", cleanVarName))
+		}
 		// Check if variable is read-only
 		if sysVarReadOnly[cleanVarName] {
 			return nil, mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a read only variable", cleanVarName))
@@ -817,6 +822,18 @@ func (e *Executor) handleRawSet(raw string) error {
 				} else if upperVal == "0" || upperVal == "OFF" || upperVal == "FALSE" || upperVal == "NO" {
 					val = "OFF"
 				}
+			}
+			// performance_schema_instrument patterns are accumulated, not overwritten.
+			// Each call to SET STARTUP performance_schema_instrument='pattern=value'
+			// appends to the list stored in __ps_instrument_patterns__.
+			if varName == "performance_schema_instrument" {
+				existing := e.startupVars["__ps_instrument_patterns__"]
+				if existing == "" {
+					e.startupVars["__ps_instrument_patterns__"] = val
+				} else {
+					e.startupVars["__ps_instrument_patterns__"] = existing + "\n" + val
+				}
+				return nil
 			}
 			// Store directly in both globalScopeVars and startupVars.
 			e.setGlobalVar(varName, val)

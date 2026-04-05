@@ -581,9 +581,9 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 	case "innodb_cached_indexes":
 		rawRows = e.infoSchemaInnoDBCachedIndexes()
 	case "innodb_foreign":
-		rawRows = []storage.Row{} // stub — FK metadata not yet tracked
+		rawRows = e.infoSchemaInnoDBForeign()
 	case "innodb_foreign_cols":
-		rawRows = []storage.Row{} // stub — FK metadata not yet tracked
+		rawRows = e.infoSchemaInnoDBForeignCols()
 	case "innodb_buffer_page":
 		rawRows = []storage.Row{} // empty stub - no buffer pool tracking
 	case "processlist":
@@ -2382,6 +2382,32 @@ func (e *Executor) perfSchemaPerformanceTimers() []storage.Row {
 	}
 }
 
+// innoDBBackgroundThreadNames lists the InnoDB background thread names returned
+// in performance_schema.threads. These are static thread names from MySQL 8.0.
+var innoDBBackgroundThreadNames = []string{
+	"thread/innodb/buf_dump_thread",
+	"thread/innodb/buf_resize_thread",
+	"thread/innodb/dict_stats_thread",
+	"thread/innodb/fts_optimize_thread",
+	"thread/innodb/io_ibuf_thread",
+	"thread/innodb/io_log_thread",
+	"thread/innodb/io_read_thread",
+	"thread/innodb/io_write_thread",
+	"thread/innodb/log_checkpointer_thread",
+	"thread/innodb/log_closer_thread",
+	"thread/innodb/log_flush_notifier_thread",
+	"thread/innodb/log_flusher_thread",
+	"thread/innodb/log_write_notifier_thread",
+	"thread/innodb/log_writer_thread",
+	"thread/innodb/page_flush_coordinator_thread",
+	"thread/innodb/srv_error_monitor_thread",
+	"thread/innodb/srv_lock_timeout_thread",
+	"thread/innodb/srv_master_thread",
+	"thread/innodb/srv_monitor_thread",
+	"thread/innodb/srv_purge_thread",
+	"thread/innodb/srv_worker_thread",
+}
+
 // perfSchemaThreads returns a stub row for performance_schema.threads.
 func (e *Executor) perfSchemaThreads() []storage.Row {
 	rows := []storage.Row{
@@ -2402,9 +2428,32 @@ func (e *Executor) perfSchemaThreads() []storage.Row {
 			"INSTRUMENTED":        "YES",
 			"HISTORY":             "YES",
 			"CONNECTION_TYPE":     nil,
-			"THREAD_OS_ID":        int64(0),
+			"THREAD_OS_ID":        int64(1),
 			"RESOURCE_GROUP":      "SYS_default",
 		},
+	}
+	// Add InnoDB background threads
+	for i, name := range innoDBBackgroundThreadNames {
+		rows = append(rows, storage.Row{
+			"THREAD_ID":           int64(100 + i),
+			"NAME":                name,
+			"TYPE":                "BACKGROUND",
+			"PROCESSLIST_ID":      nil,
+			"PROCESSLIST_USER":    nil,
+			"PROCESSLIST_HOST":    nil,
+			"PROCESSLIST_DB":      nil,
+			"PROCESSLIST_COMMAND": nil,
+			"PROCESSLIST_TIME":    nil,
+			"PROCESSLIST_STATE":   nil,
+			"PROCESSLIST_INFO":    nil,
+			"PARENT_THREAD_ID":    nil,
+			"ROLE":                nil,
+			"INSTRUMENTED":        "YES",
+			"HISTORY":             "YES",
+			"CONNECTION_TYPE":     nil,
+			"THREAD_OS_ID":        int64(100 + i),
+			"RESOURCE_GROUP":      "SYS_default",
+		})
 	}
 	// Add rows for all active connections from the process list
 	seenConnIDs := make(map[int64]bool)
@@ -3076,6 +3125,90 @@ func (e *Executor) execPerfSchemaUpdate(stmt *sqlparser.Update, tableName string
 	return &Result{AffectedRows: 0}, nil
 }
 
+// psInstrumentPatternValue parses a performance-schema-instrument value string.
+// Returns (enabled, timed, valid). Invalid values return false.
+// ON/TRUE/1 → YES/YES, OFF/FALSE/0/NO → NO/NO, COUNTED → YES/NO
+func psInstrumentPatternValue(v string) (enabled, timed string, valid bool) {
+	upper := strings.ToUpper(strings.TrimSpace(v))
+	switch upper {
+	case "ON", "TRUE", "1", "YES":
+		return "YES", "YES", true
+	case "OFF", "FALSE", "0", "NO":
+		return "NO", "NO", true
+	case "COUNTED":
+		return "YES", "NO", true
+	}
+	return "", "", false
+}
+
+// psLikeMatch performs SQL LIKE matching where % matches any sequence of chars.
+// Matching is case-insensitive.
+func psLikeMatch(pattern, str string) bool {
+	if pattern == "" {
+		return str == ""
+	}
+	if pattern[0] == '%' {
+		// Skip consecutive %
+		for len(pattern) > 0 && pattern[0] == '%' {
+			pattern = pattern[1:]
+		}
+		if pattern == "" {
+			return true
+		}
+		for i := 0; i <= len(str); i++ {
+			if psLikeMatch(pattern, str[i:]) {
+				return true
+			}
+		}
+		return false
+	}
+	if len(str) == 0 {
+		return false
+	}
+	if pattern[0] != str[0] {
+		return false
+	}
+	return psLikeMatch(pattern[1:], str[1:])
+}
+
+// applyPsInstrumentPatterns applies performance-schema-instrument startup patterns
+// to determine the ENABLED and TIMED values for a given instrument name.
+// Patterns are applied in order; the last matching pattern wins.
+// Memory instruments always have TIMED=NO regardless of patterns.
+func applyPsInstrumentPatterns(patterns string, name, defaultEnabled, defaultTimed string) (enabled, timed string) {
+	enabled, timed = defaultEnabled, defaultTimed
+	nameLower := strings.ToLower(name)
+	for _, line := range strings.Split(patterns, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		eqIdx := strings.Index(line, "=")
+		if eqIdx < 0 {
+			continue
+		}
+		pat := strings.TrimSpace(line[:eqIdx])
+		val := strings.TrimSpace(line[eqIdx+1:])
+		if pat == "" {
+			continue
+		}
+		// Strip trailing slashes from pattern (MySQL trims them)
+		pat = strings.TrimRight(pat, "/")
+		en, ti, ok := psInstrumentPatternValue(val)
+		if !ok {
+			continue
+		}
+		if psLikeMatch(strings.ToLower(pat), nameLower) {
+			enabled, timed = en, ti
+		}
+	}
+	// Memory instruments are never timed
+	if strings.HasPrefix(nameLower, "memory/") {
+		timed = "NO"
+	}
+	return enabled, timed
+}
+
 // perfSchemaSetupInstruments returns stub rows for performance_schema.setup_instruments.
 func (e *Executor) perfSchemaSetupInstruments() []storage.Row {
 	// Return a representative set of instrument categories matching MySQL 8.0
@@ -3083,7 +3216,7 @@ func (e *Executor) perfSchemaSetupInstruments() []storage.Row {
 		name, enabled, timed, properties string
 	}
 	instruments := []instDef{
-		// Mutex instruments (sorted by name for 'order by name')
+		// Mutex instruments
 		{"wait/synch/mutex/sql/Commit_order_manager::m_mutex", "YES", "YES", ""},
 		{"wait/synch/mutex/sql/Cost_constant_cache::LOCK_cost_const", "YES", "YES", "singleton"},
 		{"wait/synch/mutex/sql/Event_scheduler::LOCK_scheduler_state", "YES", "YES", "singleton"},
@@ -3094,6 +3227,9 @@ func (e *Executor) perfSchemaSetupInstruments() []storage.Row {
 		{"wait/synch/mutex/sql/key_mts_temp_table_LOCK", "YES", "YES", ""},
 		{"wait/synch/mutex/sql/LOCK_acl_cache_flush", "YES", "YES", "singleton"},
 		{"wait/synch/mutex/sql/LOCK_audit_mask", "YES", "YES", "singleton"},
+		{"wait/synch/mutex/sql/LOCK_transaction_cache", "YES", "YES", "singleton"},
+		{"wait/synch/mutex/sql/LOCK_user_conn", "YES", "YES", "singleton"},
+		{"wait/synch/mutex/sql/LOCK_uuid_generator", "YES", "YES", "singleton"},
 		{"wait/synch/mutex/sql/THD_LOCK_INFO::mutex", "YES", "YES", ""},
 		// Rwlock instruments
 		{"wait/synch/rwlock/sql/Binlog_relay_IO_delegate::lock", "YES", "YES", "singleton"},
@@ -3125,14 +3261,16 @@ func (e *Executor) perfSchemaSetupInstruments() []storage.Row {
 		{"wait/lock/table/sql/handler", "YES", "YES", ""},
 		// Stage instruments
 		{"stage/sql/After create", "YES", "YES", ""},
+		{"stage/sql/creating table", "YES", "YES", ""},
 		// Statement instruments
 		{"statement/sql/select", "YES", "YES", ""},
 		{"statement/sql/insert", "YES", "YES", ""},
 		{"statement/sql/update", "YES", "YES", ""},
 		{"statement/sql/delete", "YES", "YES", ""},
+		// Memory instruments (TIMED is always NO for memory instruments)
+		{"memory/sql/THD::main_mem_root", "YES", "NO", ""},
 		// Other instruments
 		{"transaction", "YES", "YES", ""},
-		{"memory/sql/THD::main_mem_root", "YES", "YES", ""},
 		{"idle", "YES", "YES", ""},
 	}
 
@@ -3156,6 +3294,9 @@ func (e *Executor) perfSchemaSetupInstruments() []storage.Row {
 		}
 	}
 
+	// Load performance-schema-instrument patterns accumulated from master.opt
+	patterns := e.startupVars["__ps_instrument_patterns__"]
+
 	rows := make([]storage.Row, 0, len(instruments))
 	for _, inst := range instruments {
 		excluded := false
@@ -3168,8 +3309,12 @@ func (e *Executor) perfSchemaSetupInstruments() []storage.Row {
 		if excluded {
 			continue
 		}
+		enabled, timed := inst.enabled, inst.timed
+		if patterns != "" {
+			enabled, timed = applyPsInstrumentPatterns(patterns, inst.name, enabled, timed)
+		}
 		rows = append(rows, storage.Row{
-			"NAME": inst.name, "ENABLED": inst.enabled, "TIMED": inst.timed,
+			"NAME": inst.name, "ENABLED": enabled, "TIMED": timed,
 			"PROPERTIES": inst.properties, "VOLATILITY": int64(0), "DOCUMENTATION": nil,
 		})
 	}
