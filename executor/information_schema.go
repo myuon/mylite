@@ -414,9 +414,8 @@ var emptyStubTables = map[string]bool{
 	"socket_instances":           true,
 	"socket_summary_by_instance":    true,
 	"table_handles":              true,
-	"table_io_waits_summary_by_table":       true,
-	"table_io_waits_summary_by_index_usage": true,
-	"table_lock_waits_summary_by_table":     true,
+	// table_io_waits_summary_by_table, table_io_waits_summary_by_index_usage,
+	// table_lock_waits_summary_by_table are handled dynamically (see buildInformationSchemaRows).
 }
 
 // singleRowStubTables maps table names to their single stub row definition.
@@ -715,6 +714,12 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.perfSchemaVariablesScoped(false)
 	case "global_status", "session_status":
 		rawRows = e.perfSchemaStatus()
+	case "table_io_waits_summary_by_table":
+		rawRows = e.perfSchemaTableIOWaitsByTable()
+	case "table_io_waits_summary_by_index_usage":
+		rawRows = e.perfSchemaTableIOWaitsByIndexUsage()
+	case "table_lock_waits_summary_by_table":
+		rawRows = e.perfSchemaTableLockWaitsByTable()
 	case "events_waits_current":
 		rawRows = []storage.Row{
 			{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "wait/lock/table/sql/handler", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "SPINS": nil, "OBJECT_SCHEMA": nil, "OBJECT_NAME": nil, "INDEX_NAME": nil, "OBJECT_TYPE": nil, "OBJECT_INSTANCE_BEGIN": int64(0), "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil, "OPERATION": "lock", "NUMBER_OF_BYTES": nil, "FLAGS": nil},
@@ -2614,6 +2619,300 @@ func (e *Executor) perfSchemaThreads() []storage.Row {
 			"RESOURCE_GROUP":      "USR_default",
 		})
 	}
+	return rows
+}
+
+// perfSchemaUserTableRows iterates all non-system user tables and calls fn for each.
+func (e *Executor) perfSchemaUserTableRows(fn func(dbName, tblName string, tbl *catalogPkg.TableDef)) {
+	dbNames := e.Catalog.ListDatabases()
+	sort.Strings(dbNames)
+	for _, dbName := range dbNames {
+		switch strings.ToLower(dbName) {
+		case "information_schema", "mysql", "performance_schema", "sys":
+			continue
+		}
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		tblNames := db.ListTables()
+		sort.Strings(tblNames)
+		for _, tblName := range tblNames {
+			def, err := db.GetTable(tblName)
+			if err != nil || def == nil {
+				continue
+			}
+			fn(dbName, tblName, def)
+		}
+	}
+}
+
+// perfSchemaTableIOWaitsByTable returns one zero-count row per user table.
+func (e *Executor) perfSchemaTableIOWaitsByTable() []storage.Row {
+	var rows []storage.Row
+	e.perfSchemaUserTableRows(func(dbName, tblName string, _ *catalogPkg.TableDef) {
+		rows = append(rows, storage.Row{
+			"OBJECT_TYPE":      "TABLE",
+			"OBJECT_SCHEMA":    dbName,
+			"OBJECT_NAME":      tblName,
+			"COUNT_STAR":       int64(0),
+			"SUM_TIMER_WAIT":   int64(0),
+			"MIN_TIMER_WAIT":   int64(0),
+			"AVG_TIMER_WAIT":   int64(0),
+			"MAX_TIMER_WAIT":   int64(0),
+			"COUNT_READ":       int64(0),
+			"SUM_TIMER_READ":   int64(0),
+			"MIN_TIMER_READ":   int64(0),
+			"AVG_TIMER_READ":   int64(0),
+			"MAX_TIMER_READ":   int64(0),
+			"COUNT_WRITE":      int64(0),
+			"SUM_TIMER_WRITE":  int64(0),
+			"MIN_TIMER_WRITE":  int64(0),
+			"AVG_TIMER_WRITE":  int64(0),
+			"MAX_TIMER_WRITE":  int64(0),
+			"COUNT_FETCH":      int64(0),
+			"SUM_TIMER_FETCH":  int64(0),
+			"MIN_TIMER_FETCH":  int64(0),
+			"AVG_TIMER_FETCH":  int64(0),
+			"MAX_TIMER_FETCH":  int64(0),
+			"COUNT_INSERT":     int64(0),
+			"SUM_TIMER_INSERT": int64(0),
+			"MIN_TIMER_INSERT": int64(0),
+			"AVG_TIMER_INSERT": int64(0),
+			"MAX_TIMER_INSERT": int64(0),
+			"COUNT_UPDATE":     int64(0),
+			"SUM_TIMER_UPDATE": int64(0),
+			"MIN_TIMER_UPDATE": int64(0),
+			"AVG_TIMER_UPDATE": int64(0),
+			"MAX_TIMER_UPDATE": int64(0),
+			"COUNT_DELETE":     int64(0),
+			"SUM_TIMER_DELETE": int64(0),
+			"MIN_TIMER_DELETE": int64(0),
+			"AVG_TIMER_DELETE": int64(0),
+			"MAX_TIMER_DELETE": int64(0),
+		})
+	})
+	return rows
+}
+
+// perfSchemaTableIOWaitsByIndexUsage returns one zero-count row per (table, index) combo.
+func (e *Executor) perfSchemaTableIOWaitsByIndexUsage() []storage.Row {
+	var rows []storage.Row
+	e.perfSchemaUserTableRows(func(dbName, tblName string, def *catalogPkg.TableDef) {
+		// NULL index row (full-table scans)
+		rows = append(rows, storage.Row{
+			"OBJECT_TYPE":      "TABLE",
+			"OBJECT_SCHEMA":    dbName,
+			"OBJECT_NAME":      tblName,
+			"INDEX_NAME":       nil,
+			"COUNT_STAR":       int64(0),
+			"SUM_TIMER_WAIT":   int64(0),
+			"MIN_TIMER_WAIT":   int64(0),
+			"AVG_TIMER_WAIT":   int64(0),
+			"MAX_TIMER_WAIT":   int64(0),
+			"COUNT_READ":       int64(0),
+			"SUM_TIMER_READ":   int64(0),
+			"MIN_TIMER_READ":   int64(0),
+			"AVG_TIMER_READ":   int64(0),
+			"MAX_TIMER_READ":   int64(0),
+			"COUNT_WRITE":      int64(0),
+			"SUM_TIMER_WRITE":  int64(0),
+			"MIN_TIMER_WRITE":  int64(0),
+			"AVG_TIMER_WRITE":  int64(0),
+			"MAX_TIMER_WRITE":  int64(0),
+			"COUNT_FETCH":      int64(0),
+			"SUM_TIMER_FETCH":  int64(0),
+			"MIN_TIMER_FETCH":  int64(0),
+			"AVG_TIMER_FETCH":  int64(0),
+			"MAX_TIMER_FETCH":  int64(0),
+			"COUNT_INSERT":     int64(0),
+			"SUM_TIMER_INSERT": int64(0),
+			"MIN_TIMER_INSERT": int64(0),
+			"AVG_TIMER_INSERT": int64(0),
+			"MAX_TIMER_INSERT": int64(0),
+			"COUNT_UPDATE":     int64(0),
+			"SUM_TIMER_UPDATE": int64(0),
+			"MIN_TIMER_UPDATE": int64(0),
+			"AVG_TIMER_UPDATE": int64(0),
+			"MAX_TIMER_UPDATE": int64(0),
+			"COUNT_DELETE":     int64(0),
+			"SUM_TIMER_DELETE": int64(0),
+			"MIN_TIMER_DELETE": int64(0),
+			"AVG_TIMER_DELETE": int64(0),
+			"MAX_TIMER_DELETE": int64(0),
+		})
+		// PRIMARY index row
+		pkName := "PRIMARY"
+		if len(def.PrimaryKey) == 0 {
+			pkName = "GEN_CLUST_INDEX"
+		}
+		rows = append(rows, storage.Row{
+			"OBJECT_TYPE":      "TABLE",
+			"OBJECT_SCHEMA":    dbName,
+			"OBJECT_NAME":      tblName,
+			"INDEX_NAME":       pkName,
+			"COUNT_STAR":       int64(0),
+			"SUM_TIMER_WAIT":   int64(0),
+			"MIN_TIMER_WAIT":   int64(0),
+			"AVG_TIMER_WAIT":   int64(0),
+			"MAX_TIMER_WAIT":   int64(0),
+			"COUNT_READ":       int64(0),
+			"SUM_TIMER_READ":   int64(0),
+			"MIN_TIMER_READ":   int64(0),
+			"AVG_TIMER_READ":   int64(0),
+			"MAX_TIMER_READ":   int64(0),
+			"COUNT_WRITE":      int64(0),
+			"SUM_TIMER_WRITE":  int64(0),
+			"MIN_TIMER_WRITE":  int64(0),
+			"AVG_TIMER_WRITE":  int64(0),
+			"MAX_TIMER_WRITE":  int64(0),
+			"COUNT_FETCH":      int64(0),
+			"SUM_TIMER_FETCH":  int64(0),
+			"MIN_TIMER_FETCH":  int64(0),
+			"AVG_TIMER_FETCH":  int64(0),
+			"MAX_TIMER_FETCH":  int64(0),
+			"COUNT_INSERT":     int64(0),
+			"SUM_TIMER_INSERT": int64(0),
+			"MIN_TIMER_INSERT": int64(0),
+			"AVG_TIMER_INSERT": int64(0),
+			"MAX_TIMER_INSERT": int64(0),
+			"COUNT_UPDATE":     int64(0),
+			"SUM_TIMER_UPDATE": int64(0),
+			"MIN_TIMER_UPDATE": int64(0),
+			"AVG_TIMER_UPDATE": int64(0),
+			"MAX_TIMER_UPDATE": int64(0),
+			"COUNT_DELETE":     int64(0),
+			"SUM_TIMER_DELETE": int64(0),
+			"MIN_TIMER_DELETE": int64(0),
+			"AVG_TIMER_DELETE": int64(0),
+			"MAX_TIMER_DELETE": int64(0),
+		})
+		// Secondary index rows
+		for _, idx := range def.Indexes {
+			if strings.EqualFold(idx.Name, "PRIMARY") {
+				continue
+			}
+			rows = append(rows, storage.Row{
+				"OBJECT_TYPE":      "TABLE",
+				"OBJECT_SCHEMA":    dbName,
+				"OBJECT_NAME":      tblName,
+				"INDEX_NAME":       idx.Name,
+				"COUNT_STAR":       int64(0),
+				"SUM_TIMER_WAIT":   int64(0),
+				"MIN_TIMER_WAIT":   int64(0),
+				"AVG_TIMER_WAIT":   int64(0),
+				"MAX_TIMER_WAIT":   int64(0),
+				"COUNT_READ":       int64(0),
+				"SUM_TIMER_READ":   int64(0),
+				"MIN_TIMER_READ":   int64(0),
+				"AVG_TIMER_READ":   int64(0),
+				"MAX_TIMER_READ":   int64(0),
+				"COUNT_WRITE":      int64(0),
+				"SUM_TIMER_WRITE":  int64(0),
+				"MIN_TIMER_WRITE":  int64(0),
+				"AVG_TIMER_WRITE":  int64(0),
+				"MAX_TIMER_WRITE":  int64(0),
+				"COUNT_FETCH":      int64(0),
+				"SUM_TIMER_FETCH":  int64(0),
+				"MIN_TIMER_FETCH":  int64(0),
+				"AVG_TIMER_FETCH":  int64(0),
+				"MAX_TIMER_FETCH":  int64(0),
+				"COUNT_INSERT":     int64(0),
+				"SUM_TIMER_INSERT": int64(0),
+				"MIN_TIMER_INSERT": int64(0),
+				"AVG_TIMER_INSERT": int64(0),
+				"MAX_TIMER_INSERT": int64(0),
+				"COUNT_UPDATE":     int64(0),
+				"SUM_TIMER_UPDATE": int64(0),
+				"MIN_TIMER_UPDATE": int64(0),
+				"AVG_TIMER_UPDATE": int64(0),
+				"MAX_TIMER_UPDATE": int64(0),
+				"COUNT_DELETE":     int64(0),
+				"SUM_TIMER_DELETE": int64(0),
+				"MIN_TIMER_DELETE": int64(0),
+				"AVG_TIMER_DELETE": int64(0),
+				"MAX_TIMER_DELETE": int64(0),
+			})
+		}
+	})
+	return rows
+}
+
+// perfSchemaTableLockWaitsByTable returns one zero-count row per user table.
+func (e *Executor) perfSchemaTableLockWaitsByTable() []storage.Row {
+	var rows []storage.Row
+	e.perfSchemaUserTableRows(func(dbName, tblName string, _ *catalogPkg.TableDef) {
+		rows = append(rows, storage.Row{
+			"OBJECT_TYPE":                       "TABLE",
+			"OBJECT_SCHEMA":                     dbName,
+			"OBJECT_NAME":                       tblName,
+			"COUNT_STAR":                        int64(0),
+			"SUM_TIMER_WAIT":                    int64(0),
+			"MIN_TIMER_WAIT":                    int64(0),
+			"AVG_TIMER_WAIT":                    int64(0),
+			"MAX_TIMER_WAIT":                    int64(0),
+			"COUNT_READ":                        int64(0),
+			"SUM_TIMER_READ":                    int64(0),
+			"MIN_TIMER_READ":                    int64(0),
+			"AVG_TIMER_READ":                    int64(0),
+			"MAX_TIMER_READ":                    int64(0),
+			"COUNT_WRITE":                       int64(0),
+			"SUM_TIMER_WRITE":                   int64(0),
+			"MIN_TIMER_WRITE":                   int64(0),
+			"AVG_TIMER_WRITE":                   int64(0),
+			"MAX_TIMER_WRITE":                   int64(0),
+			"COUNT_READ_NORMAL":                 int64(0),
+			"SUM_TIMER_READ_NORMAL":             int64(0),
+			"MIN_TIMER_READ_NORMAL":             int64(0),
+			"AVG_TIMER_READ_NORMAL":             int64(0),
+			"MAX_TIMER_READ_NORMAL":             int64(0),
+			"COUNT_READ_WITH_SHARED_LOCKS":      int64(0),
+			"SUM_TIMER_READ_WITH_SHARED_LOCKS":  int64(0),
+			"MIN_TIMER_READ_WITH_SHARED_LOCKS":  int64(0),
+			"AVG_TIMER_READ_WITH_SHARED_LOCKS":  int64(0),
+			"MAX_TIMER_READ_WITH_SHARED_LOCKS":  int64(0),
+			"COUNT_READ_HIGH_PRIORITY":          int64(0),
+			"SUM_TIMER_READ_HIGH_PRIORITY":      int64(0),
+			"MIN_TIMER_READ_HIGH_PRIORITY":      int64(0),
+			"AVG_TIMER_READ_HIGH_PRIORITY":      int64(0),
+			"MAX_TIMER_READ_HIGH_PRIORITY":      int64(0),
+			"COUNT_READ_NO_INSERT":              int64(0),
+			"SUM_TIMER_READ_NO_INSERT":          int64(0),
+			"MIN_TIMER_READ_NO_INSERT":          int64(0),
+			"AVG_TIMER_READ_NO_INSERT":          int64(0),
+			"MAX_TIMER_READ_NO_INSERT":          int64(0),
+			"COUNT_READ_EXTERNAL":               int64(0),
+			"SUM_TIMER_READ_EXTERNAL":           int64(0),
+			"MIN_TIMER_READ_EXTERNAL":           int64(0),
+			"AVG_TIMER_READ_EXTERNAL":           int64(0),
+			"MAX_TIMER_READ_EXTERNAL":           int64(0),
+			"COUNT_WRITE_ALLOW_WRITE":           int64(0),
+			"SUM_TIMER_WRITE_ALLOW_WRITE":       int64(0),
+			"MIN_TIMER_WRITE_ALLOW_WRITE":       int64(0),
+			"AVG_TIMER_WRITE_ALLOW_WRITE":       int64(0),
+			"MAX_TIMER_WRITE_ALLOW_WRITE":       int64(0),
+			"COUNT_WRITE_CONCURRENT_INSERT":     int64(0),
+			"SUM_TIMER_WRITE_CONCURRENT_INSERT": int64(0),
+			"MIN_TIMER_WRITE_CONCURRENT_INSERT": int64(0),
+			"AVG_TIMER_WRITE_CONCURRENT_INSERT": int64(0),
+			"MAX_TIMER_WRITE_CONCURRENT_INSERT": int64(0),
+			"COUNT_WRITE_LOW_PRIORITY":          int64(0),
+			"SUM_TIMER_WRITE_LOW_PRIORITY":      int64(0),
+			"MIN_TIMER_WRITE_LOW_PRIORITY":      int64(0),
+			"AVG_TIMER_WRITE_LOW_PRIORITY":      int64(0),
+			"MAX_TIMER_WRITE_LOW_PRIORITY":      int64(0),
+			"COUNT_WRITE_NORMAL":                int64(0),
+			"SUM_TIMER_WRITE_NORMAL":            int64(0),
+			"MIN_TIMER_WRITE_NORMAL":            int64(0),
+			"AVG_TIMER_WRITE_NORMAL":            int64(0),
+			"MAX_TIMER_WRITE_NORMAL":            int64(0),
+			"COUNT_WRITE_EXTERNAL":              int64(0),
+			"SUM_TIMER_WRITE_EXTERNAL":          int64(0),
+			"MIN_TIMER_WRITE_EXTERNAL":          int64(0),
+			"AVG_TIMER_WRITE_EXTERNAL":          int64(0),
+			"MAX_TIMER_WRITE_EXTERNAL":          int64(0),
+		})
+	})
 	return rows
 }
 

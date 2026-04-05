@@ -417,6 +417,11 @@ type Executor struct {
 	resourceGroups map[string]string
 	// resourceGroupsMu protects resourceGroups.
 	resourceGroupsMu *sync.RWMutex
+	// superUsers tracks users that have been granted SUPER privilege via GRANT SUPER ON *.* TO user.
+	// Shared across all connections (like globalScopeVars). Key is lowercase username.
+	superUsers map[string]bool
+	// superUsersMu protects superUsers.
+	superUsersMu *sync.RWMutex
 }
 
 // Warning represents a MySQL warning.
@@ -635,6 +640,8 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	e.globalReadLock = NewGlobalReadLock()
 	e.resourceGroups = make(map[string]string)
 	e.resourceGroupsMu = &sync.RWMutex{}
+	e.superUsers = make(map[string]bool)
+	e.superUsersMu = &sync.RWMutex{}
 	e.initSystemTables()
 	return e
 }
@@ -710,6 +717,8 @@ func (e *Executor) Clone() *Executor {
 		globalReadLock:          e.globalReadLock,
 		resourceGroups:          e.resourceGroups,
 		resourceGroupsMu:        e.resourceGroupsMu,
+		superUsers:              e.superUsers,
+		superUsersMu:            e.superUsersMu,
 	}
 }
 
@@ -967,23 +976,23 @@ func (e *Executor) initSystemTables() {
 			{Name: "trx_started", Type: "DATETIME"},
 			{Name: "trx_requested_lock_id", Type: "VARCHAR(105)", Nullable: true},
 			{Name: "trx_wait_started", Type: "DATETIME", Nullable: true},
-			{Name: "trx_weight", Type: "BIGINT UNSIGNED"},
-			{Name: "trx_mysql_thread_id", Type: "BIGINT UNSIGNED"},
+			{Name: "trx_weight", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "trx_mysql_thread_id", Type: "BIGINT(21) UNSIGNED"},
 			{Name: "trx_query", Type: "VARCHAR(1024)", Nullable: true},
 			{Name: "trx_operation_state", Type: "VARCHAR(64)", Nullable: true},
-			{Name: "trx_tables_in_use", Type: "BIGINT UNSIGNED"},
-			{Name: "trx_tables_locked", Type: "BIGINT UNSIGNED"},
-			{Name: "trx_lock_structs", Type: "BIGINT UNSIGNED"},
-			{Name: "trx_lock_memory_bytes", Type: "BIGINT UNSIGNED"},
-			{Name: "trx_rows_locked", Type: "BIGINT UNSIGNED"},
-			{Name: "trx_rows_modified", Type: "BIGINT UNSIGNED"},
-			{Name: "trx_concurrency_tickets", Type: "BIGINT UNSIGNED"},
+			{Name: "trx_tables_in_use", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "trx_tables_locked", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "trx_lock_structs", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "trx_lock_memory_bytes", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "trx_rows_locked", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "trx_rows_modified", Type: "BIGINT(21) UNSIGNED"},
+			{Name: "trx_concurrency_tickets", Type: "BIGINT(21) UNSIGNED"},
 			{Name: "trx_isolation_level", Type: "VARCHAR(16)"},
 			{Name: "trx_unique_checks", Type: "INT(1)"},
 			{Name: "trx_foreign_key_checks", Type: "INT(1)"},
 			{Name: "trx_last_foreign_key_error", Type: "VARCHAR(256)", Nullable: true},
 			{Name: "trx_adaptive_hash_latched", Type: "INT(1)"},
-			{Name: "trx_adaptive_hash_timeout", Type: "BIGINT UNSIGNED"},
+			{Name: "trx_adaptive_hash_timeout", Type: "BIGINT(21) UNSIGNED"},
 			{Name: "trx_is_read_only", Type: "INT(1)"},
 			{Name: "trx_autocommit_non_locking", Type: "INT(1)"},
 		},
@@ -1061,7 +1070,7 @@ func (e *Executor) initSystemTables() {
 	ensure("information_schema", &catalog.TableDef{
 		Name: "INNODB_TEMP_TABLE_INFO",
 		Columns: []catalog.ColumnDef{
-			{Name: "TABLE_ID", Type: "BIGINT"},
+			{Name: "TABLE_ID", Type: "BIGINT(21) UNSIGNED"},
 			{Name: "NAME", Type: "VARCHAR(255)"},
 			{Name: "N_COLS", Type: "BIGINT"},
 			{Name: "SPACE", Type: "BIGINT"},
@@ -6190,12 +6199,37 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			// Return MySQL syntax error 1064
 			return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'extended' at line 1"))
 		}
+		if strings.HasPrefix(upper, "GRANT ") {
+			// Track GRANT SUPER ON *.* TO user for privilege checking
+			if strings.Contains(upper, "SUPER") {
+				// Parse: GRANT SUPER ON *.* TO 'username'@'host' or GRANT SUPER ON *.* TO username
+				if idx := strings.Index(upper, " TO "); idx >= 0 {
+					userPart := strings.TrimSpace(trimmed[idx+4:])
+					// Strip WITH GRANT OPTION suffix
+					if wi := strings.Index(strings.ToUpper(userPart), " WITH "); wi >= 0 {
+						userPart = strings.TrimSpace(userPart[:wi])
+					}
+					// Extract bare username (strip quotes and @host)
+					userPart = strings.Trim(userPart, "'`\"")
+					if at := strings.Index(userPart, "@"); at >= 0 {
+						userPart = userPart[:at]
+					}
+					userPart = strings.Trim(userPart, "'`\"")
+					username := strings.ToLower(strings.TrimSpace(userPart))
+					if username != "" && e.superUsersMu != nil {
+						e.superUsersMu.Lock()
+						e.superUsers[username] = true
+						e.superUsersMu.Unlock()
+					}
+				}
+			}
+			return &Result{}, nil
+		}
 		if strings.HasPrefix(upper, "CREATE EVENT") ||
 			strings.HasPrefix(upper, "DROP EVENT") ||
 			strings.HasPrefix(upper, "CREATE USER") ||
 			strings.HasPrefix(upper, "DROP USER") ||
 			strings.HasPrefix(upper, "ALTER USER") ||
-			strings.HasPrefix(upper, "GRANT ") ||
 			strings.HasPrefix(upper, "REVOKE ") ||
 			strings.HasPrefix(upper, "FLUSH ") ||
 			strings.HasPrefix(upper, "RESET ") ||
@@ -6312,6 +6346,23 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		}
 	}
 
+	// Enforce super_read_only: blocks ALL users including SUPER (only TEMP tables exempt).
+	if superROVal, ok := e.getGlobalVar("super_read_only"); ok {
+		superROOn := superROVal == "1" || strings.EqualFold(superROVal, "ON")
+		if superROOn {
+			switch s := stmt.(type) {
+			case *sqlparser.Insert, *sqlparser.Update, *sqlparser.Delete,
+				*sqlparser.DropTable, *sqlparser.AlterTable,
+				*sqlparser.CreateDatabase, *sqlparser.DropDatabase, *sqlparser.TruncateTable:
+				return nil, mysqlError(1290, "HY000", "The MySQL server is running with the --super-read-only option so it cannot execute this statement")
+			case *sqlparser.CreateTable:
+				if !s.Temp {
+					return nil, mysqlError(1290, "HY000", "The MySQL server is running with the --super-read-only option so it cannot execute this statement")
+				}
+			}
+		}
+	}
+
 	// Enforce read_only: when read_only=ON, block write statements from non-SUPER users.
 	// SUPER users (root) can bypass read_only but not super_read_only.
 	if readOnlyVal, ok := e.getGlobalVar("read_only"); ok {
@@ -6322,6 +6373,14 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			if cu, ok2 := e.userVars["__current_user"]; ok2 {
 				if cuStr, ok3 := cu.(string); ok3 && cuStr != "" && !strings.EqualFold(cuStr, "root") {
 					isSuper = false
+					// Check if user has been granted SUPER privilege
+					if e.superUsersMu != nil {
+						e.superUsersMu.RLock()
+						if e.superUsers[strings.ToLower(cuStr)] {
+							isSuper = true
+						}
+						e.superUsersMu.RUnlock()
+					}
 				}
 			}
 			if !isSuper {

@@ -343,6 +343,19 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				cleanName = strings.TrimPrefix(cleanName, "session.")
 				cleanName = strings.TrimPrefix(cleanName, "local.")
 				isGlobal := scope == sqlparser.GlobalScope
+				// Enforce SUPER privilege for setting security-sensitive global variables.
+				// Non-root (non-SUPER) users get ER_SPECIFIC_ACCESS_DENIED_ERROR (1227).
+				if isGlobal && superOnlyGlobalVars[cleanName] {
+					isNonRoot := false
+					if cu, ok := e.userVars["__current_user"]; ok {
+						if cuStr, ok2 := cu.(string); ok2 && cuStr != "" && !strings.EqualFold(cuStr, "root") {
+							isNonRoot = true
+						}
+					}
+					if isNonRoot {
+						return nil, mysqlError(1227, "42000", "Access denied; you need (at least one of) the SUPER or SYSTEM_VARIABLES_ADMIN privilege(s) for this operation")
+					}
+				}
 				// Save previous session value before SET GLOBAL overwrites it.
 				savedSessionVal := map[string]string{}
 				if isGlobal {
@@ -740,7 +753,12 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						// When super_read_only is set to ON, also set read_only to ON.
 						// (Setting super_read_only OFF does NOT reset read_only.)
 						if cleanName == "super_read_only" && (v == "1" || strings.ToUpper(v) == "ON") {
+							// Setting super_read_only ON also sets read_only ON.
 							e.setGlobalVar("read_only", "1")
+						}
+						// Setting read_only OFF also sets super_read_only OFF (MySQL behavior).
+						if cleanName == "read_only" && (v == "0" || strings.ToUpper(v) == "OFF") {
+							e.setGlobalVar("super_read_only", "0")
 						}
 						// When max_join_size is set globally, update global sql_big_selects.
 						if cleanName == "max_join_size" {
@@ -1360,6 +1378,14 @@ var sysVarReadOnly = map[string]bool{
 
 // sysVarGlobalOnly contains system variables that can only be SET at GLOBAL scope.
 // Only includes variables where we are 100% certain they are GLOBAL-only in MySQL 8.0.
+// superOnlyGlobalVars lists global system variables that require SUPER (or
+// SYSTEM_VARIABLES_ADMIN) privilege to set. Non-root connections attempting
+// to set these receive ER_SPECIFIC_ACCESS_DENIED_ERROR (1227).
+var superOnlyGlobalVars = map[string]bool{
+	"read_only":       true,
+	"super_read_only": true,
+}
+
 var sysVarGlobalOnly = map[string]bool{
 	"automatic_sp_privileges":                 true,
 	"avoid_temporal_upgrade":                  true,
