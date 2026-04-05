@@ -1569,6 +1569,20 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	if strings.Contains(tableName, ".") {
 		showDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
 	}
+
+	// Handle SHOW CREATE TABLE for performance_schema tables.
+	if strings.ToLower(showDB) == "performance_schema" {
+		lowerName := strings.ToLower(tableName)
+		if stmt, ok := perfSchemaCreateTable[lowerName]; ok {
+			return &Result{
+				Columns:     []string{"Table", "Create Table"},
+				Rows:        [][]interface{}{{tableName, stmt}},
+				IsResultSet: true,
+			}, nil
+		}
+		return nil, fmt.Errorf("ERROR 1146 (42S02): Table 'performance_schema.%s' doesn't exist", tableName)
+	}
+
 	db, resolvedDBName, err := findDatabaseCaseInsensitive(e.Catalog, showDB)
 	if err != nil {
 		return nil, err

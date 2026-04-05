@@ -777,7 +777,7 @@ func (e *Executor) initSystemTables() {
 			{Name: "last_update", Type: "TIMESTAMP"},
 			{Name: "stat_name", Type: "VARCHAR(64)"},
 			{Name: "stat_value", Type: "BIGINT"},
-			{Name: "sample_size", Type: "BIGINT"},
+			{Name: "sample_size", Type: "BIGINT", Nullable: true},
 			{Name: "stat_description", Type: "VARCHAR(1024)"},
 		},
 	})
@@ -6325,11 +6325,16 @@ func (e *Executor) Execute(query string) (*Result, error) {
 				}
 			}
 			if !isSuper {
-				switch stmt.(type) {
+				switch s := stmt.(type) {
 				case *sqlparser.Insert, *sqlparser.Update, *sqlparser.Delete,
-					*sqlparser.CreateTable, *sqlparser.DropTable, *sqlparser.AlterTable,
+					*sqlparser.DropTable, *sqlparser.AlterTable,
 					*sqlparser.CreateDatabase, *sqlparser.DropDatabase, *sqlparser.TruncateTable:
 					return nil, mysqlError(1290, "HY000", "The MySQL server is running with the --read-only option so it cannot execute this statement")
+				case *sqlparser.CreateTable:
+					// CREATE TEMPORARY TABLE is allowed even when read_only=ON (MySQL behavior).
+					if !s.Temp {
+						return nil, mysqlError(1290, "HY000", "The MySQL server is running with the --read-only option so it cannot execute this statement")
+					}
 				}
 			}
 		}
