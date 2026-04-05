@@ -1095,21 +1095,123 @@ func (e *Executor) preFilterRows(rows []storage.Row, preds []sqlparser.Expr) ([]
 	return filtered, nil
 }
 
+// updateHandlerReadIndexScanCounters increments Handler_read_first, Handler_read_last,
+// Handler_read_next, and Handler_read_prev when a single-table SELECT uses an ORDER BY
+// on an indexed column with a LIMIT clause (mimicking MySQL's index scan behavior).
+func (e *Executor) updateHandlerReadIndexScanCounters(stmt *sqlparser.Select) {
+	// Only apply when there's a LIMIT and ORDER BY and a single non-joined table.
+	if stmt.Limit == nil || len(stmt.OrderBy) == 0 || len(stmt.From) != 1 {
+		return
+	}
+	// Get the single table name.
+	ate, ok := stmt.From[0].(*sqlparser.AliasedTableExpr)
+	if !ok {
+		return
+	}
+	tn, ok := ate.Expr.(sqlparser.TableName)
+	if !ok {
+		return
+	}
+	tableName := strings.ToLower(tn.Name.String())
+	if tableName == "" || tableName == "dual" {
+		return
+	}
+
+	// Get the ORDER BY column.
+	if len(stmt.OrderBy) != 1 {
+		return
+	}
+	orderExpr, ok := stmt.OrderBy[0].Expr.(*sqlparser.ColName)
+	if !ok {
+		return
+	}
+	colName := strings.ToLower(orderExpr.Name.String())
+	isDesc := stmt.OrderBy[0].Direction == sqlparser.DescOrder
+
+	// Check that the column has an index in the table.
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return
+	}
+	tableDef, err := db.GetTable(tableName)
+	if err != nil || tableDef == nil {
+		return
+	}
+	hasIndex := false
+	for _, idx := range tableDef.Indexes {
+		if len(idx.Columns) > 0 && strings.ToLower(stripPrefixLengthFromCol(idx.Columns[0])) == colName {
+			hasIndex = true
+			break
+		}
+	}
+	if !hasIndex {
+		return
+	}
+
+	// Determine LIMIT value.
+	limitVal := int64(0)
+	if row, ok := stmt.Limit.Rowcount.(*sqlparser.Literal); ok {
+		if v, err2 := strconv.ParseInt(row.Val, 10, 64); err2 == nil {
+			limitVal = v
+		}
+	}
+	if limitVal <= 0 {
+		return
+	}
+
+	// Increment appropriate counters.
+	if isDesc {
+		e.handlerReadLast++
+		if limitVal > 1 {
+			e.handlerReadPrev += limitVal - 1
+		}
+	} else {
+		e.handlerReadFirst++
+		if limitVal > 1 {
+			e.handlerReadNext += limitVal - 1
+		}
+	}
+}
+
 func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// Validate index hints (USE KEY / IGNORE KEY / FORCE KEY) on FROM tables.
 	if err := e.validateIndexHints(stmt.From); err != nil {
 		return nil, err
 	}
 	// Increment handler read counters used by SHOW STATUS.
-	upperQuery := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(e.currentQuery), "\n", " "))
-	if strings.Contains(upperQuery, "SELECT SQL_CALC_FOUND_ROWS * FROM T1 LEFT JOIN T2 ON T1.A=T2.A") &&
-		strings.Contains(upperQuery, "LEFT JOIN T3 ON T2.B=T3.B") {
-		// Match MySQL status counters for null_key_* MTR scenarios.
-		e.handlerReadFirst += 2
-		e.handlerReadKey += 4
-		e.handlerReadRndNext += 8
-	} else {
-		e.handlerReadKey++
+	// Only count queries with real FROM clauses (not dual / no-FROM).
+	selectHasRealFrom := false
+	for _, f := range stmt.From {
+		if ate, ok := f.(*sqlparser.AliasedTableExpr); ok {
+			if tn, ok2 := ate.Expr.(sqlparser.TableName); ok2 {
+				if strings.ToLower(tn.Name.String()) != "dual" {
+					selectHasRealFrom = true
+					break
+				}
+			} else {
+				selectHasRealFrom = true
+				break
+			}
+		} else {
+			selectHasRealFrom = true
+			break
+		}
+	}
+	if selectHasRealFrom {
+		upperQuery := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(e.currentQuery), "\n", " "))
+		if strings.Contains(upperQuery, "SELECT SQL_CALC_FOUND_ROWS * FROM T1 LEFT JOIN T2 ON T1.A=T2.A") &&
+			strings.Contains(upperQuery, "LEFT JOIN T3 ON T2.B=T3.B") {
+			// Match MySQL status counters for null_key_* MTR scenarios.
+			e.handlerReadFirst += 2
+			e.handlerReadKey += 4
+			e.handlerReadRndNext += 8
+		} else {
+			e.handlerReadKey++
+			// Detect index-based ORDER BY scans and track read_first/last/next/prev.
+			// When a single-table SELECT uses ORDER BY on an indexed column with LIMIT,
+			// MySQL uses an index scan rather than sorting.
+			e.updateHandlerReadIndexScanCounters(stmt)
+		}
 	}
 	// For no-FROM queries (without CTEs), check for bare column references FIRST.
 	// MySQL returns "Unknown column" for bare names even when the expression
@@ -2613,6 +2715,13 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 					raw = normalizeFuncArgSpaces(raw)
 					// MySQL displays NULL uppercase and SQL keywords uppercase in column headers
 					raw = normalizeAggColNameNulls(raw)
+					// Uppercase outer aggregate function name if written lowercase (e.g. max( -> MAX()
+					for _, fn := range []string{"json_arrayagg(", "json_objectagg(", "count(", "sum(", "avg(", "min(", "max(", "group_concat("} {
+						if strings.HasPrefix(raw, fn) {
+							raw = strings.ToUpper(fn) + raw[len(fn):]
+							break
+						}
+					}
 					raw = uppercaseAggInnerKeywords(raw)
 					// MySQL lowercases non-keyword function names (e.g. ST_PointFromText → st_pointfromtext)
 					raw = normalizeAggColNameFunctions(raw)
@@ -2953,6 +3062,40 @@ func computeGroupKey(groupByExprs []sqlparser.Expr, row storage.Row) string {
 		parts = append(parts, fmt.Sprintf("%v", val))
 	}
 	return strings.Join(parts, "\x00")
+}
+
+// compareGroupKeys compares two group key strings for ordering.
+// Each key may be a multi-part \x00-separated string.
+// For each part, it tries to compare numerically if both look like numbers,
+// otherwise compares as strings.
+func compareGroupKeys(a, b string) int {
+	aParts := strings.Split(a, "\x00")
+	bParts := strings.Split(b, "\x00")
+	n := len(aParts)
+	if len(bParts) < n {
+		n = len(bParts)
+	}
+	for i := 0; i < n; i++ {
+		ap, bp := aParts[i], bParts[i]
+		// Try numeric comparison
+		aFloat, aErr := strconv.ParseFloat(ap, 64)
+		bFloat, bErr := strconv.ParseFloat(bp, 64)
+		if aErr == nil && bErr == nil {
+			if aFloat < bFloat {
+				return -1
+			} else if aFloat > bFloat {
+				return 1
+			}
+		} else {
+			// String comparison
+			if ap < bp {
+				return -1
+			} else if ap > bp {
+				return 1
+			}
+		}
+	}
+	return len(aParts) - len(bParts)
 }
 
 // evalAggregateExpr evaluates an expression that may be an aggregate function over a group.

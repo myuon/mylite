@@ -202,6 +202,25 @@ func (e *Executor) execRollback() (*Result, error) {
 	// If we have an undo log, use it for precise per-connection rollback
 	// instead of the snapshot-based approach which can clobber other connections' data.
 	if len(undoLog) > 0 {
+		// Check if any tables involved in the transaction are non-transactional (MyISAM/MEMORY).
+		// If so, emit Warning 1196 and skip rollback for those tables.
+		hasNonTransactional := false
+		for _, entry := range undoLog {
+			if db, ok := e.Catalog.Databases[entry.db]; ok {
+				if tblDef, ok2 := db.Tables[entry.table]; ok2 {
+					eng := strings.ToUpper(tblDef.Engine)
+					if eng == "MYISAM" || eng == "MEMORY" || eng == "HEAP" {
+						hasNonTransactional = true
+						break
+					}
+				}
+			}
+		}
+		if hasNonTransactional {
+			// Non-transactional tables cannot be rolled back; emit warning and skip undo.
+			e.addWarning("Warning", 1196, "Some non-transactional changed tables couldn't be rolled back")
+			return &Result{}, nil
+		}
 		e.replayUndoLog(undoLog)
 		return &Result{}, nil
 	}

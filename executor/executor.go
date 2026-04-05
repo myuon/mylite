@@ -403,6 +403,11 @@ type Executor struct {
 	// checkedForUpgrade tracks tables that have been CHECK TABLE ... FOR UPGRADE'd.
 	// Subsequent FOR UPGRADE checks return "Table is already up to date".
 	checkedForUpgrade map[string]bool
+	// tableNeedsAnalyze tracks non-InnoDB tables without SPATIAL indexes that need
+	// ANALYZE. A table is added when ALTER TABLE is run, and removed when ANALYZE
+	// TABLE or REPAIR TABLE is run. ANALYZE TABLE returns "OK" when in this set,
+	// "Table is already up to date" for non-SPATIAL non-InnoDB otherwise.
+	tableNeedsAnalyze map[string]bool
 	// Sort statistics: incremented when ORDER BY operations are performed.
 	sortRows  int64 // total rows sorted
 	sortRange int64 // sort operations using range scan
@@ -6338,7 +6343,20 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	case *sqlparser.Delete:
 		return e.execDelete(s)
 	case *sqlparser.AlterTable:
-		return e.execAlterTable(s)
+		res, err := e.execAlterTable(s)
+		if err == nil {
+			// Mark the table as needing analysis after structural changes.
+			dbName := e.CurrentDB
+			if !s.Table.Qualifier.IsEmpty() {
+				dbName = s.Table.Qualifier.String()
+			}
+			fullName := dbName + "." + s.Table.Name.String()
+			if e.tableNeedsAnalyze == nil {
+				e.tableNeedsAnalyze = map[string]bool{}
+			}
+			e.tableNeedsAnalyze[fullName] = true
+		}
+		return res, err
 	case *sqlparser.Show:
 		return e.execShow(s, query)
 	case *sqlparser.ExplainTab:
@@ -6471,8 +6489,7 @@ func (e *Executor) Execute(query string) (*Result, error) {
 					if e.innodbStatsPersistentEnabled(def) {
 						e.upsertInnoDBStatsRows(e.CurrentDB, tableName, e.tableRowCount(e.CurrentDB, tableName))
 					}
-					// InnoDB tables and tables with SPATIAL indexes return "OK"
-					// Non-InnoDB without SPATIAL return "Table is already up to date"
+					// InnoDB, SPATIAL-indexed tables, or tables needing re-analysis return "OK"
 					eng := strings.ToUpper(def.Engine)
 					hasSpatial := false
 					for _, idx := range def.Indexes {
@@ -6481,13 +6498,18 @@ func (e *Executor) Execute(query string) (*Result, error) {
 							break
 						}
 					}
-					if eng == "" || eng == "INNODB" || hasSpatial {
+					fullName := e.CurrentDB + "." + tableName
+					needsAnalyze := e.tableNeedsAnalyze != nil && e.tableNeedsAnalyze[fullName]
+					if eng == "" || eng == "INNODB" || hasSpatial || needsAnalyze {
 						msgText = "OK"
+						// Clear the needs-analyze flag
+						if e.tableNeedsAnalyze != nil {
+							delete(e.tableNeedsAnalyze, fullName)
+						}
 					}
 				}
 			}
 		}
-		// Return a minimal ANALYZE TABLE result set for compatibility
 		return &Result{
 			Columns:     []string{"Table", "Op", "Msg_type", "Msg_text"},
 			Rows:        [][]interface{}{{fmt.Sprintf("%s.%s", e.CurrentDB, tableName), "analyze", "status", msgText}},
@@ -15879,17 +15901,28 @@ func (e *Executor) execAnalyzeMultiTable(query string) (*Result, error) {
 		t = strings.TrimSpace(t)
 		t = strings.TrimRight(t, ";")
 		t = strings.Trim(t, "`")
+		bareTable := t
 		tableName := t
 		if !strings.Contains(tableName, ".") {
 			tableName = e.CurrentDB + "." + tableName
 		}
 		msgText := "Table is already up to date"
-		bareTable := t
 		if dbObj, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
 			if tblDef, err := dbObj.GetTable(bareTable); err == nil && tblDef != nil {
 				eng := strings.ToUpper(tblDef.Engine)
-				if eng == "" || eng == "INNODB" {
+				hasSpatial := false
+				for _, idx := range tblDef.Indexes {
+					if strings.EqualFold(idx.Type, "SPATIAL") {
+						hasSpatial = true
+						break
+					}
+				}
+				needsAnalyze := e.tableNeedsAnalyze != nil && e.tableNeedsAnalyze[tableName]
+				if eng == "" || eng == "INNODB" || hasSpatial || needsAnalyze {
 					msgText = "OK"
+					if e.tableNeedsAnalyze != nil {
+						delete(e.tableNeedsAnalyze, tableName)
+					}
 				}
 			}
 		}

@@ -1572,6 +1572,10 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 		}
 		e.Storage.DropTable(dbName, tableName)
 		e.removeInnoDBStatsRows(dbName, tableName)
+		// Clear analysis state for the dropped table.
+		if e.tableNeedsAnalyze != nil {
+			delete(e.tableNeedsAnalyze, dbName+"."+tableName)
+		}
 		// If this was a temporary table, restore any permanent table it was shadowing.
 		if _, wasTemp := e.tempTables[tableName]; wasTemp {
 			if saved, ok := e.tempTableSavedPermanent[tableName]; ok {
@@ -2235,6 +2239,55 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 						return nil, mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key '%s'", strings.Join(keyParts, "-"), idxName))
 					}
 					seen[key] = true
+				}
+			}
+			// In strict mode with NO_ZERO_DATE or TRADITIONAL, validate existing rows
+			// for zero date values in indexed DATETIME/DATE/TIMESTAMP columns.
+			if e.isStrictMode() && (strings.Contains(e.sqlMode, "NO_ZERO_DATE") || strings.Contains(e.sqlMode, "TRADITIONAL")) {
+				if tdErr == nil {
+					// Build a map of indexed column names to their types
+					type idxColInfo struct {
+						name    string
+						colType string
+					}
+					var dtCols []idxColInfo
+					for _, ic := range idxCols {
+						baseName := stripPrefixLengthFromCol(ic)
+						for _, col := range tableDef.Columns {
+							if strings.EqualFold(col.Name, baseName) {
+								colUpper := strings.ToUpper(col.Type)
+								if strings.Contains(colUpper, "DATETIME") || strings.Contains(colUpper, "DATE") || strings.Contains(colUpper, "TIMESTAMP") {
+									dtCols = append(dtCols, idxColInfo{name: baseName, colType: col.Type})
+								}
+								break
+							}
+						}
+					}
+					if len(dtCols) > 0 {
+						tbl.Mu.RLock()
+						for rowIdx, row := range tbl.Rows {
+							for _, dtCol := range dtCols {
+								v := rowValueByColumnName(row, dtCol.name)
+								if v == nil {
+									continue
+								}
+								vs := fmt.Sprintf("%v", v)
+								// Zero date values: "0000-00-00", "0000-00-00 00:00:00"
+								if vs == "0000-00-00" || vs == "0000-00-00 00:00:00" {
+									tbl.Mu.RUnlock()
+									colType := strings.ToUpper(dtCol.colType)
+									var displayVal string
+									if strings.Contains(colType, "DATE") && !strings.Contains(colType, "DATETIME") {
+										displayVal = "0000-00-00"
+									} else {
+										displayVal = "0000-00-00 00:00:00"
+									}
+									return nil, mysqlError(1292, "22007", fmt.Sprintf("Incorrect datetime value: '%s' for column '%s' at row %d", displayVal, dtCol.name, rowIdx+1))
+								}
+							}
+						}
+						tbl.Mu.RUnlock()
+					}
 				}
 			}
 			if isPrimary {
