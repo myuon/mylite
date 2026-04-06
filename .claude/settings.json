@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "jq -r '.tool_input.file_path // .tool_input.filePath // \"\"' | grep -q 'skiplist.json' && echo '{\"decision\":\"block\",\"reason\":\"skiplist.jsonを直接編集しないでください。python3 scripts/skiplist.py を使用してください。\"}' || echo '{}'"
+            "command": "jq -r '.tool_input.file_path // .tool_input.filePath // \"\"' | { read -r f; if echo \"$f\" | grep -q 'skiplist.json'; then echo '{\"decision\":\"block\",\"reason\":\"skiplist.jsonを直接編集しないでください。python3 scripts/skiplist.py を使用してください。\"}'; elif echo \"$f\" | grep -q 'testdata/dolt-mysql-tests'; then echo '{\"decision\":\"block\",\"reason\":\"testdata/dolt-mysql-tests はサブモジュールです。直接編集しないでください。\"}'; else echo '{}'; fi; }"
           }
         ]
       }
