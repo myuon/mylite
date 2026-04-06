@@ -37,6 +37,9 @@ go run ./cmd/mtrrun -test sys_vars/gtid_owned_basic,other/bool
 go run ./cmd/mtrrun -suite sys_vars -skipped-only -force
 ```
 
+実行結果は `.mtrrun-logs/result-YYYYMMDD-HHMMSS.json` に自動保存される。
+エージェントは全スイート再実行せず、このログを参照して分析すること。
+
 ## skiplist操作
 
 ```bash

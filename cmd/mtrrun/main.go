@@ -38,6 +38,16 @@ import (
 // skipTests lists tests known to be unfixable. Key: "suite/testname".
 var skipTests map[string]bool
 
+// testResultJSON is the per-test entry in the JSON result log.
+type testResultJSON struct {
+	Suite   string `json:"suite"`
+	Name    string `json:"name"`
+	Status  string `json:"status"` // "pass", "fail", "error", "timeout", "skip"
+	Elapsed string `json:"elapsed,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Diff    string `json:"diff,omitempty"`
+}
+
 // runSkippedOnly when true, inverts the skip logic: only run tests IN the skiplist.
 var runSkippedOnly bool
 
@@ -256,6 +266,7 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 			suiteNames = append(suiteNames, e.Name())
 		}
 	}
+	var allResultsJSON []testResultJSON
 	var totalPassed, totalFailed, totalSkipped, totalErrors, totalTimeouts, totalTests int
 	for _, sn := range suiteNames {
 		fmt.Fprintf(os.Stderr, "[%s] starting suite %s...\n", time.Now().Format("15:04:05"), sn)
@@ -269,6 +280,24 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 			continue
 		}
 		p, f, s, e, t := countResults(results)
+		for _, r := range results {
+			jr := testResultJSON{Suite: sn, Name: r.Name, Elapsed: r.Elapsed.Round(time.Millisecond).String()}
+			switch {
+			case r.Passed:
+				jr.Status = "pass"
+			case r.Skipped:
+				jr.Status = "skip"
+			case r.Timeout:
+				jr.Status = "timeout"
+			case r.Error != "":
+				jr.Status = "error"
+				jr.Error = r.Error
+			default:
+				jr.Status = "fail"
+				jr.Diff = r.Diff
+			}
+			allResultsJSON = append(allResultsJSON, jr)
+		}
 		for _, r := range results {
 			if r.Error != "" {
 				fmt.Printf("  ERROR: %s: %s\n", r.Name, r.Error[:min(len(r.Error), 200)])
@@ -297,10 +326,45 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 	fmt.Printf("Suites: %d, Total: %d, Passed: %d, Failed: %d, Skipped: %d, Errors: %d, Timeouts: %d\n",
 		len(suiteNames), totalTests, totalPassed, totalFailed, totalSkipped, totalErrors, totalTimeouts)
 	fmt.Printf("Time: %.1fs\n", elapsed.Seconds())
+
+	// Save results to JSON log
+	saveResultLog(allResultsJSON, totalPassed, totalFailed, totalSkipped, totalErrors, totalTimeouts, elapsed)
+
 	if totalFailed+totalErrors > 0 {
 		os.Exit(1)
 	}
 }
+// saveResultLog writes test results to a timestamped JSON file in .mtrrun-logs/.
+func saveResultLog(results []testResultJSON, passed, failed, skipped, errors, timeouts int, elapsed time.Duration) {
+	logDir := ".mtrrun-logs"
+	os.MkdirAll(logDir, 0755)
+	ts := time.Now().Format("20060102-150405")
+	filename := filepath.Join(logDir, fmt.Sprintf("result-%s.json", ts))
+
+	type logFile struct {
+		Timestamp string      `json:"timestamp"`
+		Elapsed   string      `json:"elapsed"`
+		Summary   interface{} `json:"summary"`
+		Tests     interface{} `json:"tests"`
+	}
+
+	data, _ := json.MarshalIndent(logFile{
+		Timestamp: time.Now().Format(time.RFC3339),
+		Elapsed:   elapsed.Round(time.Millisecond).String(),
+		Summary: map[string]int{
+			"passed":   passed,
+			"failed":   failed,
+			"skipped":  skipped,
+			"errors":   errors,
+			"timeouts": timeouts,
+			"total":    passed + failed + skipped + errors + timeouts,
+		},
+		Tests: results,
+	}, "", "  ")
+	os.WriteFile(filename, data, 0644)
+	fmt.Printf("Results saved to: %s\n", filename)
+}
+
 // runSuite runs all tests in a single suite and returns results.
 // testFilter: if non-nil, only run tests whose names are in this set.
 func runSuite(suiteName string, testFilter map[string]bool, suiteRoot, includeRoot string, verbose bool, maxTests, jobs int, timeout time.Duration) []mtrrunner.TestResult {
