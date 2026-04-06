@@ -1302,15 +1302,22 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		// Execute the rest as SQL. query_vertical uses vertical key/value result formatting.
 		if args != "" {
 			args = stripInlineHashComments(args)
-			args = strings.TrimSpace(args)
-			args = strings.TrimSuffix(args, ";")
 			if name == "eval" {
+				// For eval: trim leading whitespace, remove trailing semicolon preserving any
+				// trailing space before it (e.g. "ENGINE=INNODB ;" echoes as "ENGINE=INNODB ;").
+				args = strings.TrimLeft(args, " \t\r\n")
+				// Strip trailing newlines but not trailing spaces (preserve "word ;"-style spacing)
+				args = strings.TrimRight(args, "\r\n")
+				// Strip only semicolons at the end (any trailing space before ';' was preserved)
+				args = strings.TrimSuffix(args, ";")
 				// In eval context, undefined variables expand to empty string
 				args = ctx.substituteVars(args)
 				args = stripUndefinedVars(args)
-				// Don't TrimSpace here: preserve trailing space before semicolon
-				// so that "LIMIT 2 $for_share;" echoes as "LIMIT 2 ;" when $for_share is empty
-				args = strings.TrimRight(args, "\t\r\n")
+				// Trim only trailing newlines (not spaces) to preserve trailing " " before ";"
+				args = strings.TrimRight(args, "\r\n")
+			} else {
+				args = strings.TrimSpace(args)
+				args = strings.TrimSuffix(args, ";")
 			}
 			if name == "query_vertical" {
 				ctx.verticalResult = true
@@ -2922,7 +2929,9 @@ func (ctx *execContext) setVariable(expr string) error {
 	if !strings.HasPrefix(name, "$") && !strings.HasPrefix(name, "@") {
 		name = "$" + name
 	}
-	value := strings.TrimSpace(parts[1])
+	// Only trim leading whitespace; preserve trailing spaces so that variable values
+	// like "UPDATE t1 SET x=1 ;" keep the trailing space for faithful echo output.
+	value := strings.TrimLeft(parts[1], " \t\r\n")
 	// Strip trailing semicolons from simple values (mysqltest convention).
 	// Don't strip if value is a backtick query or contains embedded semicolons in strings.
 	if !strings.HasPrefix(value, "`") {
@@ -2943,7 +2952,9 @@ func (ctx *execContext) setVariable(expr string) error {
 			}
 		}
 		value = strings.TrimRight(value, ";")
-		value = strings.TrimSpace(value)
+		// Only trim leading whitespace; preserve trailing spaces so that
+		// "$query = UPDATE t1 SET x=1 ;" stores the trailing space for echo.
+		value = strings.TrimLeft(value, " \t\r\n")
 	}
 
 	// If value is wrapped in backticks, execute as SQL and use first column of first row
@@ -3265,6 +3276,14 @@ func applyMasterOptToken(token string, ctx *execContext) {
 	key = strings.TrimPrefix(key, "loose-")
 	// Normalize hyphens to underscores for MySQL variable names
 	varKey := strings.ReplaceAll(key, "-", "_")
+	// For open_files_limit, cap at our default (1048576) since we can't actually
+	// change OS file limits. Tests that set open_files_limit to unreachable values
+	// (e.g. 10000000) expect the server to use a lower actual value.
+	if varKey == "open_files_limit" {
+		if n, err := strconv.ParseInt(val, 10, 64); err == nil && n > 1048576 {
+			val = "1048576"
+		}
+	}
 	// Set as variable (keep original key for $variable compatibility)
 	ctx.variables["$"+key] = val
 	ctx.variables["$"+varKey] = val
@@ -3480,7 +3499,24 @@ func (ctx *execContext) sourceFile(filename string) error {
 		if restartParams == "" {
 			restartParams = "restart"
 		}
+		// Strip surrounding double quotes if present (e.g. "restart:--foo=bar" -> restart:--foo=bar)
+		if len(restartParams) >= 2 && restartParams[0] == '"' && restartParams[len(restartParams)-1] == '"' {
+			restartParams = restartParams[1 : len(restartParams)-1]
+		}
 		ctx.output.WriteString("# " + restartParams + "\n")
+		// Apply any startup parameters to the session (e.g. --sort_buffer_size=9999999)
+		if strings.HasPrefix(restartParams, "restart:--") {
+			paramStr := strings.TrimPrefix(restartParams, "restart:")
+			for _, param := range strings.Split(paramStr, " ") {
+				param = strings.TrimPrefix(param, "--")
+				if eqIdx := strings.Index(param, "="); eqIdx != -1 {
+					varName := param[:eqIdx]
+					varVal := param[eqIdx+1:]
+					_ = ctx.executeSQLNoEcho(fmt.Sprintf("SET @@GLOBAL.%s = %s", varName, varVal))
+					_ = ctx.executeSQLNoEcho(fmt.Sprintf("SET @@SESSION.%s = %s", varName, varVal))
+				}
+			}
+		}
 		// Reset $restart_parameters to default after use.
 		ctx.variables["$restart_parameters"] = "restart"
 		return nil
@@ -3776,8 +3812,9 @@ func extractBareDirective(trimmed string) (string, bool) {
 }
 
 func parseDirectiveNameArgs(directive string) (name, args string) {
-	d := strings.TrimSpace(directive)
-	if d == "" {
+	// Only trim leading whitespace; preserve trailing spaces (e.g. for "ENGINE=INNODB ;" in eval).
+	d := strings.TrimLeft(directive, " \t\r\n")
+	if strings.TrimSpace(d) == "" {
 		return "", ""
 	}
 
@@ -3794,7 +3831,9 @@ func parseDirectiveNameArgs(directive string) (name, args string) {
 	// Otherwise prefer the first whitespace separator when present.
 	if wsIdx >= 0 {
 		name = strings.ToLower(strings.TrimSpace(d[:wsIdx]))
-		args = strings.TrimSpace(d[wsIdx+1:])
+		// Only trim leading whitespace from args; preserve trailing spaces so that
+		// multi-line eval statements like "ENGINE=INNODB ;" preserve the space before ";".
+		args = strings.TrimLeft(d[wsIdx+1:], " \t")
 		return strings.TrimRight(name, ";"), args
 	}
 
@@ -4544,7 +4583,9 @@ func normalizeSyntaxErrorNear(s string) string {
 	if !strings.Contains(s, "near '") {
 		return s
 	}
-	re := regexp.MustCompile(`(?m)(ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use) near '[^']*'( at line \d+)`)
+	// Match "near '...' at line N" where ... can contain any characters including quotes.
+	// Use a non-greedy match from near ' to the last ' before " at line \d+".
+	re := regexp.MustCompile(`(?m)(ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use) near '.*'( at line \d+)`)
 	return re.ReplaceAllString(s, "${1} near '<normalized>'${2}")
 }
 

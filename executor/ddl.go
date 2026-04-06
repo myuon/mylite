@@ -1915,6 +1915,13 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					}
 				}
 				colDef := columnDefFromAST(col)
+				// YEAR column only supports YEAR or YEAR(4).
+				if strings.EqualFold(col.Type.Type, "year") && col.Type.Length != nil {
+					yearLen := int(*col.Type.Length)
+					if yearLen != 4 {
+						return nil, mysqlError(1818, "HY000", "Supports only YEAR or YEAR(4) column.")
+					}
+				}
 				// Check for invalid zero date/datetime/timestamp defaults in strict mode
 				if colDef.Default != nil && e.isStrictMode() {
 					colTypeUpper := strings.ToUpper(strings.TrimSpace(col.Type.Type))
@@ -2016,6 +2023,13 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 		case *sqlparser.ModifyColumn:
 			colDef := columnDefFromAST(op.NewColDefinition)
+			// YEAR column only supports YEAR or YEAR(4).
+			if strings.EqualFold(op.NewColDefinition.Type.Type, "year") && op.NewColDefinition.Type.Length != nil {
+				yearLen := int(*op.NewColDefinition.Type.Length)
+				if yearLen != 4 {
+					return nil, mysqlError(1818, "HY000", "Supports only YEAR or YEAR(4) column.")
+				}
+			}
 			if mysqlCharLen(colDef.Comment) > 1024 {
 				if e.isStrictMode() {
 					return nil, mysqlError(1629, "HY000", fmt.Sprintf("Comment for field '%s' is too long (max = 1024)", colDef.Name))
