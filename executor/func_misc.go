@@ -787,7 +787,11 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if i6aIP == nil {
 			return nil, true, nil
 		}
-		// Convert to 16-byte binary string (always IPv6 format)
+		// MySQL INET6_ATON returns 4-byte binary for IPv4 addresses,
+		// 16-byte binary for IPv6 addresses.
+		if i6aIP4 := i6aIP.To4(); i6aIP4 != nil {
+			return string(i6aIP4), true, nil
+		}
 		i6aIP = i6aIP.To16()
 		if i6aIP == nil {
 			return nil, true, nil

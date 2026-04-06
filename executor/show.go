@@ -489,11 +489,14 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			if !basic.DbName.IsEmpty() {
 				targetDB = basic.DbName.String()
 			}
-			db, err := e.Catalog.GetDatabase(targetDB)
-			if err != nil {
-				return nil, err
+			var tables []string
+			if !strings.EqualFold(targetDB, "information_schema") {
+				db, err := e.Catalog.GetDatabase(targetDB)
+				if err != nil {
+					return nil, err
+				}
+				tables = db.ListTables()
 			}
-			tables := db.ListTables()
 			// Include views in SHOW TABLES
 			if e.views != nil {
 				for vn := range e.views {

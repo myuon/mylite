@@ -1370,6 +1370,33 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 
 		for _, cte := range stmt.With.CTEs {
 			cteName := cte.ID.String()
+			// For recursive CTEs, use the iterative recursive executor.
+			if stmt.With.Recursive {
+				subResult, err := e.execRecursiveCTE(cteName, cte.Subquery, cte.Columns, newCTEMap)
+				if err != nil {
+					return nil, fmt.Errorf("CTE '%s': %w", cteName, err)
+				}
+				// newCTEMap[cteName] is already set by execRecursiveCTE (with all rows).
+				// Re-register with the full result so subsequent CTEs or the outer query see all rows.
+				columns := subResult.Columns
+				colOrder := strings.Join(columns, "\x00")
+				cteRows := make([]storage.Row, len(subResult.Rows))
+				for i, row := range subResult.Rows {
+					r := make(storage.Row, len(columns)+1)
+					for j, col := range columns {
+						if j < len(row) {
+							r[col] = row[j]
+						}
+					}
+					r["__column_order__"] = colOrder
+					cteRows[i] = r
+				}
+				newCTEMap[cteName] = &cteTable{
+					columns: columns,
+					rows:    cteRows,
+				}
+				continue
+			}
 			// Execute the CTE subquery (supports both SELECT and UNION).
 			var subResult *Result
 			switch sub := cte.Subquery.(type) {
@@ -3455,10 +3482,36 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		sep := e.Separator
 		if sep == "" {
 			sep = ","
+		} else if len(sep) >= 2 && sep[0] == '\'' && sep[len(sep)-1] == '\'' {
+			// Vitess parser keeps separator as a quoted string literal (e.g. "','") – strip quotes
+			sep = sep[1 : len(sep)-1]
+		} else if len(sep) >= 2 && sep[0] == '"' && sep[len(sep)-1] == '"' {
+			sep = sep[1 : len(sep)-1]
+		}
+		// Apply ORDER BY if present
+		sortedRows := make([]storage.Row, len(groupRows))
+		copy(sortedRows, groupRows)
+		if len(e.OrderBy) > 0 {
+			sort.SliceStable(sortedRows, func(i, j int) bool {
+				for _, ord := range e.OrderBy {
+					vi, _ := evalRowExpr(ord.Expr, sortedRows[i])
+					vj, _ := evalRowExpr(ord.Expr, sortedRows[j])
+					lt, _ := compareValues(vi, vj, sqlparser.LessThanOp)
+					eq, _ := compareValues(vi, vj, sqlparser.EqualOp)
+					if eq {
+						continue
+					}
+					if ord.Direction == sqlparser.DescOrder {
+						return !lt
+					}
+					return lt
+				}
+				return false
+			})
 		}
 		distinct := make(map[string]struct{})
-		out := make([]string, 0, len(groupRows))
-		for _, row := range groupRows {
+		out := make([]string, 0, len(sortedRows))
+		for _, row := range sortedRows {
 			var part strings.Builder
 			hasNull := false
 			for _, arg := range e.Exprs {
@@ -4178,6 +4231,31 @@ func (e *Executor) execUnion(stmt *sqlparser.Union) (*Result, error) {
 
 		for _, cte := range stmt.With.CTEs {
 			cteName := cte.ID.String()
+			// For recursive CTEs, use the iterative recursive executor.
+			if stmt.With.Recursive {
+				subResult, err := e.execRecursiveCTE(cteName, cte.Subquery, cte.Columns, newCTEMap)
+				if err != nil {
+					return nil, fmt.Errorf("CTE '%s': %w", cteName, err)
+				}
+				columns := subResult.Columns
+				colOrder := strings.Join(columns, "\x00")
+				cteRows := make([]storage.Row, len(subResult.Rows))
+				for i, row := range subResult.Rows {
+					r := make(storage.Row, len(columns)+1)
+					for j, col := range columns {
+						if j < len(row) {
+							r[col] = row[j]
+						}
+					}
+					r["__column_order__"] = colOrder
+					cteRows[i] = r
+				}
+				newCTEMap[cteName] = &cteTable{
+					columns: columns,
+					rows:    cteRows,
+				}
+				continue
+			}
 			subResult, err := e.execTableStmtForUnion(cte.Subquery)
 			if err != nil {
 				return nil, fmt.Errorf("CTE '%s': %w", cteName, err)
@@ -4312,6 +4390,218 @@ func (e *Executor) execTableStmtForUnion(stmt sqlparser.TableStatement) (*Result
 	default:
 		return e.Execute(sqlparser.String(stmt))
 	}
+}
+
+// execRecursiveCTE executes a WITH RECURSIVE CTE by iterating anchor then recursive parts.
+// cteName is the CTE name, subquery is the CTE body (must be a *sqlparser.Union),
+// colAliases are the column aliases from WITH qn(a,b) AS (...), and cteMap is the
+// current (already-extended) CTE map into which we register the result.
+// Returns the accumulated result of all iterations.
+// cteRefersToName checks if a TableStatement (SELECT or UNION) directly references
+// the given CTE name in its FROM clause (non-recursive check - looks only at table names).
+func cteRefersToName(stmt sqlparser.TableStatement, cteName string) bool {
+	lower := strings.ToLower(cteName)
+	found := false
+	sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if found {
+			return false, nil
+		}
+		switch n := node.(type) {
+		case sqlparser.TableName:
+			if strings.ToLower(n.Name.String()) == lower {
+				found = true
+				return false, nil
+			}
+		}
+		return true, nil
+	}, stmt)
+	return found
+}
+
+// flattenUnionParts flattens a potentially nested UNION chain into individual parts,
+// preserving the distinct flag of the outermost union.
+// Returns the SELECT parts and whether UNION DISTINCT (vs UNION ALL) is used at the top level.
+func flattenUnionParts(stmt sqlparser.TableStatement) ([]sqlparser.TableStatement, bool) {
+	union, ok := stmt.(*sqlparser.Union)
+	if !ok {
+		return []sqlparser.TableStatement{stmt}, false
+	}
+	leftParts, _ := flattenUnionParts(union.Left)
+	rightParts, _ := flattenUnionParts(union.Right)
+	parts := append(leftParts, rightParts...)
+	return parts, union.Distinct
+}
+
+// execRecursiveCTE executes a WITH RECURSIVE CTE by iterating anchor then recursive parts.
+// cteName is the CTE name, subquery is the CTE body (must be a *sqlparser.Union),
+// colAliases are the column aliases from WITH qn(a,b) AS (...), and cteMap is the
+// current (already-extended) CTE map into which we register the result.
+// Returns the accumulated result of all iterations.
+func (e *Executor) execRecursiveCTE(cteName string, subquery sqlparser.TableStatement, colAliases sqlparser.Columns, cteMap map[string]*cteTable) (*Result, error) {
+	// Get recursion depth limit.
+	maxDepth := int64(1000)
+	if v, ok := e.getSysVar("cte_max_recursion_depth"); ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			maxDepth = n
+		}
+	}
+
+	// Helper to convert result rows into storage.Row maps.
+	rowsToStorageRows := func(columns []string, rows [][]interface{}) []storage.Row {
+		colOrder := strings.Join(columns, "\x00")
+		storageRows := make([]storage.Row, len(rows))
+		for i, row := range rows {
+			r := make(storage.Row, len(columns)+1)
+			for j, col := range columns {
+				if j < len(row) {
+					r[col] = row[j]
+				}
+			}
+			r["__column_order__"] = colOrder
+			storageRows[i] = r
+		}
+		return storageRows
+	}
+
+	// For a recursive CTE, the subquery must be a UNION (anchor UNION ALL recursive).
+	// If it's not a union, just execute non-recursively.
+	topUnion, isUnion := subquery.(*sqlparser.Union)
+	if !isUnion {
+		result, err := e.execTableStmtForUnion(subquery)
+		if err != nil {
+			return nil, err
+		}
+		return result, nil
+	}
+
+	// Check if the outer union has a LIMIT (e.g. "union all select 1 from qn limit 10").
+	// In MySQL this is an error for recursive CTEs, but we support it as a row limit.
+	var bodyLimit int64 = -1 // -1 means no limit
+	if topUnion.Limit != nil {
+		if rowCount, ok := topUnion.Limit.Rowcount.(*sqlparser.Literal); ok {
+			if n, err := strconv.ParseInt(rowCount.Val, 10, 64); err == nil {
+				bodyLimit = n
+			}
+		}
+	}
+
+	// Flatten the union chain and split into anchor and recursive parts.
+	// Anchor parts do NOT reference the CTE name; recursive parts DO.
+	allParts, topDistinct := flattenUnionParts(subquery)
+	var anchorParts, recursiveParts []sqlparser.TableStatement
+	for _, part := range allParts {
+		if cteRefersToName(part, cteName) {
+			recursiveParts = append(recursiveParts, part)
+		} else {
+			anchorParts = append(anchorParts, part)
+		}
+	}
+
+	// If no anchor parts found, fall back to executing Left as anchor.
+	if len(anchorParts) == 0 {
+		anchorParts = []sqlparser.TableStatement{topUnion.Left}
+		recursiveParts = []sqlparser.TableStatement{topUnion.Right}
+	}
+
+	// Execute all anchor parts and combine their results.
+	var anchorResult *Result
+	for i, part := range anchorParts {
+		r, err := e.execTableStmtForUnion(part)
+		if err != nil {
+			return nil, err
+		}
+		if i == 0 {
+			anchorResult = r
+		} else {
+			anchorResult.Rows = append(anchorResult.Rows, r.Rows...)
+		}
+	}
+	if anchorResult == nil {
+		anchorResult = &Result{IsResultSet: true}
+	}
+
+	// Apply column aliases from WITH qn(a,b) AS (...) if provided.
+	columns := make([]string, len(anchorResult.Columns))
+	copy(columns, anchorResult.Columns)
+	if len(colAliases) > 0 {
+		for ci, ca := range colAliases {
+			if ci < len(columns) {
+				columns[ci] = ca.String()
+			}
+		}
+	}
+
+	// Accumulate all rows (anchor + all recursive iterations).
+	allRows := make([][]interface{}, len(anchorResult.Rows))
+	copy(allRows, anchorResult.Rows)
+
+	// For UNION DISTINCT: track seen rows globally.
+	var seenRows map[string]bool
+	if topDistinct {
+		seenRows = make(map[string]bool)
+		for _, r := range allRows {
+			seenRows[unionRowKey(r)] = true
+		}
+	}
+
+	// Register the anchor rows as the "working table" for the first recursive step.
+	cteMap[cteName] = &cteTable{
+		columns: columns,
+		rows:    rowsToStorageRows(columns, anchorResult.Rows),
+	}
+
+	// Iteratively execute all recursive parts.
+	for depth := int64(0); depth < maxDepth; depth++ {
+		var newRows [][]interface{}
+		for _, recursivePart := range recursiveParts {
+			recursiveResult, err := e.execTableStmtForUnion(recursivePart)
+			if err != nil {
+				return nil, err
+			}
+			newRows = append(newRows, recursiveResult.Rows...)
+		}
+		if len(newRows) == 0 {
+			break
+		}
+
+		// For UNION DISTINCT, filter out rows already seen.
+		if topDistinct {
+			filtered := make([][]interface{}, 0, len(newRows))
+			for _, r := range newRows {
+				key := unionRowKey(r)
+				if !seenRows[key] {
+					seenRows[key] = true
+					filtered = append(filtered, r)
+				}
+			}
+			newRows = filtered
+			if len(newRows) == 0 {
+				break
+			}
+		}
+
+		allRows = append(allRows, newRows...)
+
+		// If body LIMIT is set, stop once we have enough rows.
+		if bodyLimit >= 0 && int64(len(allRows)) >= bodyLimit {
+			if int64(len(allRows)) > bodyLimit {
+				allRows = allRows[:bodyLimit]
+			}
+			break
+		}
+
+		// Update cteMap with only the new rows (working table for next iteration).
+		cteMap[cteName] = &cteTable{
+			columns: columns,
+			rows:    rowsToStorageRows(columns, newRows),
+		}
+	}
+
+	return &Result{
+		Columns:     columns,
+		Rows:        allRows,
+		IsResultSet: true,
+	}, nil
 }
 
 func unionRowKey(row []interface{}) string {

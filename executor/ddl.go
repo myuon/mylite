@@ -619,8 +619,20 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 					return &Result{}, nil
 				}
 			}
-			// Prefer extracting SELECT from original query text to preserve case/spacing
-			selectSQL := e.extractSelectFromQuery(e.currentQuery)
+			// When the SELECT has a WITH clause (CTE), always use the parsed AST string
+			// to preserve the WITH clause. Otherwise prefer extracting from the original
+			// query text to preserve case and spacing.
+			selectSQL := ""
+			hasWith := false
+			switch sel := stmt.Select.(type) {
+			case *sqlparser.Select:
+				hasWith = sel.With != nil && len(sel.With.CTEs) > 0
+			case *sqlparser.Union:
+				hasWith = sel.With != nil && len(sel.With.CTEs) > 0
+			}
+			if !hasWith {
+				selectSQL = e.extractSelectFromQuery(e.currentQuery)
+			}
 			if selectSQL == "" {
 				selectSQL = sqlparser.String(stmt.Select)
 			}
@@ -1354,6 +1366,16 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			if col, ok := po.Expr.(*sqlparser.ColName); ok {
 				def.PartitionColumns = []string{col.Name.String()}
 			}
+		}
+	}
+
+	// If no explicit ENGINE was specified, resolve from session default_storage_engine.
+	// This ensures table.Engine is always set so ANALYZE TABLE can determine the correct response.
+	if def.Engine == "" {
+		if eng, ok := e.getSysVar("default_storage_engine"); ok && eng != "" {
+			def.Engine = strings.ToUpper(eng)
+		} else {
+			def.Engine = "INNODB"
 		}
 	}
 

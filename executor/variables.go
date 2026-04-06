@@ -343,17 +343,33 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				cleanName = strings.TrimPrefix(cleanName, "session.")
 				cleanName = strings.TrimPrefix(cleanName, "local.")
 				isGlobal := scope == sqlparser.GlobalScope
-				// Enforce SUPER privilege for setting security-sensitive global variables.
-				// Non-root (non-SUPER) users get ER_SPECIFIC_ACCESS_DENIED_ERROR (1227).
-				if isGlobal && superOnlyGlobalVars[cleanName] {
-					isNonRoot := false
+				// Enforce SUPER or SYSTEM_VARIABLES_ADMIN privilege for setting global variables.
+				// Non-privileged users get ER_SPECIFIC_ACCESS_DENIED_ERROR (1227).
+				if isGlobal {
+					cuStr := ""
 					if cu, ok := e.userVars["__current_user"]; ok {
-						if cuStr, ok2 := cu.(string); ok2 && cuStr != "" && !strings.EqualFold(cuStr, "root") {
-							isNonRoot = true
+						if s, ok2 := cu.(string); ok2 {
+							cuStr = s
 						}
 					}
+					isNonRoot := cuStr != "" && !strings.EqualFold(cuStr, "root")
 					if isNonRoot {
-						return nil, mysqlError(1227, "42000", "Access denied; you need (at least one of) the SUPER or SYSTEM_VARIABLES_ADMIN privilege(s) for this operation")
+						// Check if user has SUPER privilege
+						hasPriv := false
+						if e.superUsersMu != nil {
+							e.superUsersMu.RLock()
+							hasPriv = e.superUsers[strings.ToLower(cuStr)]
+							e.superUsersMu.RUnlock()
+						}
+						// Check if user has SYSTEM_VARIABLES_ADMIN privilege
+						if !hasPriv && e.sysVarsAdminUsersMu != nil {
+							e.sysVarsAdminUsersMu.RLock()
+							hasPriv = e.sysVarsAdminUsers[strings.ToLower(cuStr)]
+							e.sysVarsAdminUsersMu.RUnlock()
+						}
+						if !hasPriv {
+							return nil, mysqlError(1227, "42000", "Access denied; you need (at least one of) the SUPER or SYSTEM_VARIABLES_ADMIN privilege(s) for this operation")
+						}
 					}
 				}
 				// Save previous session value before SET GLOBAL overwrites it.

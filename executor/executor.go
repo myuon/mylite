@@ -426,6 +426,11 @@ type Executor struct {
 	superUsers map[string]bool
 	// superUsersMu protects superUsers.
 	superUsersMu *sync.RWMutex
+	// sysVarsAdminUsers tracks users that have been granted SYSTEM_VARIABLES_ADMIN privilege.
+	// Shared across all connections. Key is lowercase username.
+	sysVarsAdminUsers map[string]bool
+	// sysVarsAdminUsersMu protects sysVarsAdminUsers.
+	sysVarsAdminUsersMu *sync.RWMutex
 }
 
 // Warning represents a MySQL warning.
@@ -646,6 +651,8 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	e.resourceGroupsMu = &sync.RWMutex{}
 	e.superUsers = make(map[string]bool)
 	e.superUsersMu = &sync.RWMutex{}
+	e.sysVarsAdminUsers = make(map[string]bool)
+	e.sysVarsAdminUsersMu = &sync.RWMutex{}
 	e.initSystemTables()
 	return e
 }
@@ -723,6 +730,8 @@ func (e *Executor) Clone() *Executor {
 		resourceGroupsMu:        e.resourceGroupsMu,
 		superUsers:              e.superUsers,
 		superUsersMu:            e.superUsersMu,
+		sysVarsAdminUsers:       e.sysVarsAdminUsers,
+		sysVarsAdminUsersMu:     e.sysVarsAdminUsersMu,
 	}
 }
 
@@ -2641,7 +2650,9 @@ func normalizeAggColNameNulls(s string) string {
 // uppercaseAggInnerKeywords applies uppercaseSQLKeywords to the inner arguments
 // of an aggregate function, preserving the outer function name.
 func uppercaseAggInnerKeywords(s string) string {
-	knownUpper := []string{"JSON_ARRAYAGG(", "JSON_OBJECTAGG(", "COUNT(", "SUM(", "AVG(", "MIN(", "MAX(", "GROUP_CONCAT("}
+	// GROUP_CONCAT is intentionally excluded: MySQL preserves lowercase keywords
+	// (order by, separator, etc.) in GROUP_CONCAT column display names.
+	knownUpper := []string{"JSON_ARRAYAGG(", "JSON_OBJECTAGG(", "COUNT(", "SUM(", "AVG(", "MIN(", "MAX("}
 	prefixEnd := 0
 	for _, p := range knownUpper {
 		if strings.HasPrefix(s, p) {
@@ -3468,6 +3479,11 @@ func normalizeCreateTableParenSelect(query string) string {
 	if !strings.HasPrefix(upper, "CREATE TABLE") && !strings.HasPrefix(upper, "CREATE TEMPORARY TABLE") {
 		return query
 	}
+	// Skip normalization if WITH clause (CTE) is present to avoid mistaking CTE subqueries
+	// for the parenthesized SELECT pattern. A CTE WITH clause has the form "WITH name AS (".
+	if regexp.MustCompile(`(?i)\bWITH\s+\w+\s+AS\s*\(`).MatchString(query) {
+		return query
+	}
 	trimmed := strings.TrimSpace(query)
 	for i := 0; i < len(trimmed); i++ {
 		if trimmed[i] == '\'' {
@@ -4108,6 +4124,153 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 		}
 	}
 	return rows
+}
+
+// explainSemijoin checks whether MySQL's semijoin optimization applies to this SELECT.
+// When a non-correlated EXISTS or IN subquery appears in the WHERE clause (not SELECT/HAVING),
+// MySQL's semijoin optimizer merges the subquery into the outer query and shows all
+// participating tables with SELECT_TYPE=SIMPLE and the same query id=1.
+// Returns (rows, true) if semijoin applies, otherwise (nil, false).
+func (e *Executor) explainSemijoin(sel *sqlparser.Select, baseID int64) ([]explainSelectType, bool) {
+	// No FROM clause → not applicable
+	if len(sel.From) == 0 {
+		return nil, false
+	}
+	// Derived tables in FROM → not semijoin
+	for _, te := range sel.From {
+		if e.tableExprHasSubquery(te) {
+			return nil, false
+		}
+	}
+	// No WHERE clause → no subquery to semijoin
+	if sel.Where == nil {
+		return nil, false
+	}
+	// Collect outer real table names; if none (e.g. FROM dual), semijoin doesn't apply
+	outerTables := map[string]bool{}
+	for _, te := range sel.From {
+		for _, tn := range e.extractAllTableNames(te) {
+			if !strings.EqualFold(tn, "dual") {
+				outerTables[strings.ToLower(tn)] = true
+			}
+		}
+	}
+	if len(outerTables) == 0 {
+		return nil, false
+	}
+	var semiTables []string // tables from EXISTS/IN inner selects
+	hasSemijoins := false
+	hasOtherSubqueries := false
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		switch n := node.(type) {
+		case *sqlparser.Subquery:
+			inner, ok := n.Select.(*sqlparser.Select)
+			if !ok {
+				hasOtherSubqueries = true
+				return false, nil
+			}
+			// Check if correlated
+			if e.isCorrelatedSubquery(n.Select, outerTables) {
+				hasOtherSubqueries = true
+				return false, nil
+			}
+			// Collect inner real table names (exclude pseudo-table "dual")
+			innerTables := e.extractAllTableNamesFromSelect(inner)
+			var realInnerTables []string
+			for _, t := range innerTables {
+				if !strings.EqualFold(t, "dual") {
+					realInnerTables = append(realInnerTables, t)
+				}
+			}
+			if len(realInnerTables) == 0 {
+				// No real tables in EXISTS → not semijoin candidate
+				hasOtherSubqueries = true
+				return false, nil
+			}
+			semiTables = append(semiTables, realInnerTables...)
+			hasSemijoins = true
+			return false, nil
+		}
+		return true, nil
+	}, sel.Where)
+
+	if !hasSemijoins || hasOtherSubqueries || len(semiTables) == 0 {
+		return nil, false
+	}
+	// Build SIMPLE rows: inner (semi-join) tables first, then outer tables
+	// Use the single query id=baseID for all rows
+	var rows []explainSelectType
+	// Add inner semi-join tables (from EXISTS subqueries)
+	for _, tbl := range semiTables {
+		ai := e.explainDetectAccessType(sel, tbl)
+		var rowCount int64 = 1
+		if e.Storage != nil {
+			if t, err := e.Storage.GetTable(e.CurrentDB, tbl); err == nil && len(t.Rows) > 0 {
+				rowCount = int64(len(t.Rows))
+			}
+		}
+		rows = append(rows, explainSelectType{
+			id:           baseID,
+			selectType:   "SIMPLE",
+			table:        tbl,
+			accessType:   ai.accessType,
+			possibleKeys: nilIfEmpty(ai.possibleKeys),
+			key:          nilIfEmpty(ai.key),
+			keyLen:       nilIfEmpty(ai.keyLen),
+			ref:          nilIfEmpty(ai.ref),
+			rows:         rowCount,
+			filtered:     "100.00",
+			extra:        nil,
+		})
+	}
+	// Add outer real tables (exclude dual)
+	outerTableNames := e.extractAllTableNamesFromSelect(sel)
+	for _, tbl := range outerTableNames {
+		if strings.EqualFold(tbl, "dual") {
+			continue
+		}
+		ai := e.explainDetectAccessType(sel, tbl)
+		var rowCount int64 = 1
+		if e.Storage != nil {
+			if t, err := e.Storage.GetTable(e.CurrentDB, tbl); err == nil && len(t.Rows) > 0 {
+				rowCount = int64(len(t.Rows))
+			}
+		}
+		rows = append(rows, explainSelectType{
+			id:           baseID,
+			selectType:   "SIMPLE",
+			table:        tbl,
+			accessType:   ai.accessType,
+			possibleKeys: nilIfEmpty(ai.possibleKeys),
+			key:          nilIfEmpty(ai.key),
+			keyLen:       nilIfEmpty(ai.keyLen),
+			ref:          nilIfEmpty(ai.ref),
+			rows:         rowCount,
+			filtered:     "100.00",
+			extra:        nil,
+		})
+	}
+	return rows, true
+}
+
+// extractAllTableNamesFromSelect extracts real table names from a SELECT's FROM clause.
+func (e *Executor) extractAllTableNamesFromSelect(sel *sqlparser.Select) []string {
+	var names []string
+	for _, te := range sel.From {
+		names = append(names, e.extractAllTableNames(te)...)
+	}
+	return names
+}
+
+// nilIfEmpty returns nil if v is nil or an empty string, otherwise returns v.
+func nilIfEmpty(v interface{}) interface{} {
+	if v == nil {
+		return nil
+	}
+	if s, ok := v.(string); ok && s == "" {
+		return nil
+	}
+	return v
 }
 
 // queryHasComplexParts returns true if the SELECT contains subqueries or derived tables.
@@ -5903,14 +6066,101 @@ func (e *Executor) explainJSONWrite(b *strings.Builder, v interface{}, indent in
 }
 
 func (e *Executor) explainTreeText(query string) string {
-	if strings.Contains(strings.ToUpper(query), "JSON_TABLE(") {
+	upper := strings.ToUpper(query)
+	if strings.Contains(upper, "JSON_TABLE(") {
 		return "-> Materialize table function"
 	}
 	tbl := explainTableNameFromQuery(query)
 	if tbl == "" {
 		tbl = "dual"
 	}
-	return "-> Table scan on " + tbl
+
+	// Parse the query to detect structural features
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		return "-> Table scan on " + tbl
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return "-> Table scan on " + tbl
+	}
+
+	// Detect LIMIT/OFFSET
+	var limitOffset string
+	if sel.Limit != nil {
+		rowCount := int64(0)
+		offset := int64(0)
+		if sel.Limit.Rowcount != nil {
+			if lit, ok := sel.Limit.Rowcount.(*sqlparser.Literal); ok {
+				rowCount, _ = strconv.ParseInt(lit.Val, 10, 64)
+			}
+		}
+		if sel.Limit.Offset != nil {
+			if lit, ok := sel.Limit.Offset.(*sqlparser.Literal); ok {
+				offset, _ = strconv.ParseInt(lit.Val, 10, 64)
+			}
+		}
+		if offset > 0 {
+			limitOffset = fmt.Sprintf("-> Limit/Offset: %d/%d row(s)\n    ", rowCount, offset)
+		} else if rowCount > 0 {
+			limitOffset = fmt.Sprintf("-> Limit: %d row(s)\n    ", rowCount)
+		}
+	}
+
+	// Determine inner scan node based on access type
+	var scanNode string
+	hasWhere := sel.Where != nil
+	if hasWhere {
+		// Try to detect index usage for the scan node
+		ai := e.explainDetectAccessType(sel, tbl)
+		if ai.accessType == "range" {
+			idxName := ""
+			if ai.key != nil {
+				idxName = fmt.Sprintf("%v", ai.key)
+			}
+			if idxName != "" {
+				scanNode = "-> Index range scan on " + tbl + " using " + idxName
+			} else {
+				scanNode = "-> Table scan on " + tbl
+			}
+		} else if ai.accessType == "ref" || ai.accessType == "ref_or_null" || ai.accessType == "eq_ref" || ai.accessType == "const" {
+			idxName := ""
+			if ai.key != nil {
+				idxName = fmt.Sprintf("%v", ai.key)
+			}
+			if idxName != "" {
+				scanNode = "-> Index lookup on " + tbl + " using " + idxName
+			} else {
+				scanNode = "-> Table scan on " + tbl
+			}
+		} else if ai.accessType == "index" {
+			idxName := ""
+			if ai.key != nil {
+				idxName = fmt.Sprintf("%v", ai.key)
+			}
+			if idxName != "" {
+				scanNode = "-> Index scan on " + tbl + " using " + idxName
+			} else {
+				scanNode = "-> Table scan on " + tbl
+			}
+		} else {
+			scanNode = "-> Table scan on " + tbl
+		}
+	} else {
+		scanNode = "-> Table scan on " + tbl
+	}
+
+	// Build the tree: [LimitOffset ->] [Filter ->] scan
+	if hasWhere {
+		// Generate a placeholder filter condition text
+		whereStr := sqlparser.String(sel.Where.Expr)
+		filterLine := "-> Filter: (" + whereStr + ")\n    " + scanNode
+		if limitOffset != "" {
+			return limitOffset + filterLine
+		}
+		return filterLine
+	}
+	return limitOffset + scanNode
 }
 
 func (e *Executor) explainResultForType(explainType sqlparser.ExplainType, explainedQuery string) *Result {
@@ -6205,9 +6455,8 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'extended' at line 1"))
 		}
 		if strings.HasPrefix(upper, "GRANT ") {
-			// Track GRANT SUPER ON *.* TO user for privilege checking
-			if strings.Contains(upper, "SUPER") {
-				// Parse: GRANT SUPER ON *.* TO 'username'@'host' or GRANT SUPER ON *.* TO username
+			// Helper to extract username from "GRANT ... TO 'user'@'host'"
+			extractGrantUser := func() string {
 				if idx := strings.Index(upper, " TO "); idx >= 0 {
 					userPart := strings.TrimSpace(trimmed[idx+4:])
 					// Strip WITH GRANT OPTION suffix
@@ -6220,12 +6469,24 @@ func (e *Executor) Execute(query string) (*Result, error) {
 						userPart = userPart[:at]
 					}
 					userPart = strings.Trim(userPart, "'`\"")
-					username := strings.ToLower(strings.TrimSpace(userPart))
-					if username != "" && e.superUsersMu != nil {
-						e.superUsersMu.Lock()
-						e.superUsers[username] = true
-						e.superUsersMu.Unlock()
-					}
+					return strings.ToLower(strings.TrimSpace(userPart))
+				}
+				return ""
+			}
+			// Track GRANT SUPER ON *.* TO user for privilege checking
+			if strings.Contains(upper, "SUPER") {
+				if username := extractGrantUser(); username != "" && e.superUsersMu != nil {
+					e.superUsersMu.Lock()
+					e.superUsers[username] = true
+					e.superUsersMu.Unlock()
+				}
+			}
+			// Track GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO user for SET GLOBAL privilege checking
+			if strings.Contains(upper, "SYSTEM_VARIABLES_ADMIN") {
+				if username := extractGrantUser(); username != "" && e.sysVarsAdminUsersMu != nil {
+					e.sysVarsAdminUsersMu.Lock()
+					e.sysVarsAdminUsers[username] = true
+					e.sysVarsAdminUsersMu.Unlock()
 				}
 			}
 			return &Result{}, nil
@@ -6417,26 +6678,28 @@ func (e *Executor) Execute(query string) (*Result, error) {
 		return e.execDropTable(s)
 	case *sqlparser.Insert:
 		res, err := e.execInsert(s)
-		// For VALUES-based inserts (not SELECT), track for OPTIMIZE/ANALYZE status.
-		// INSERT ... SELECT doesn't mark the table as modified (stats stay current).
+		// Track OPTIMIZE/ANALYZE status based on insert type.
 		if err == nil {
-			if _, isSelect := s.Rows.(*sqlparser.Select); !isSelect {
-				if _, isUnion := s.Rows.(*sqlparser.Union); !isUnion {
-					tblName := s.Table.TableNameString()
-					dbName := e.CurrentDB
-					if tn, ok := s.Table.Expr.(sqlparser.TableName); ok && !tn.Qualifier.IsEmpty() {
-						dbName = tn.Qualifier.String()
-					}
-					if dbObj, dbErr := e.Catalog.GetDatabase(dbName); dbErr == nil {
-						if tblDef, tblErr := dbObj.GetTable(tblName); tblErr == nil && tblDef != nil {
-							eng := strings.ToUpper(tblDef.Engine)
-							if eng == "MYISAM" || eng == "MEMORY" || eng == "CSV" || eng == "ARCHIVE" || eng == "HEAP" {
-								fullName := dbName + "." + tblName
-								if e.tableNeedsOptimize == nil {
-									e.tableNeedsOptimize = map[string]bool{}
-								}
-								e.tableNeedsOptimize[fullName] = true
+			tblName := s.Table.TableNameString()
+			dbName := e.CurrentDB
+			if tn, ok := s.Table.Expr.(sqlparser.TableName); ok && !tn.Qualifier.IsEmpty() {
+				dbName = tn.Qualifier.String()
+			}
+			fullName := dbName + "." + tblName
+			_, isSelect := s.Rows.(*sqlparser.Select)
+			_, isUnion := s.Rows.(*sqlparser.Union)
+			if !(isSelect || isUnion) {
+				// VALUES-based insert: mark non-InnoDB table as needing analyze.
+				if dbObj, dbErr := e.Catalog.GetDatabase(dbName); dbErr == nil {
+					if tblDef, tblErr := dbObj.GetTable(tblName); tblErr == nil && tblDef != nil {
+						eng := strings.ToUpper(tblDef.Engine)
+						// Only track for non-InnoDB, non-MEMORY engines.
+						// InnoDB always returns "OK" from ANALYZE TABLE regardless.
+						if eng != "" && eng != "INNODB" && eng != "MEMORY" && eng != "HEAP" {
+							if e.tableNeedsOptimize == nil {
+								e.tableNeedsOptimize = map[string]bool{}
 							}
+							e.tableNeedsOptimize[fullName] = true
 						}
 					}
 				}
@@ -6602,6 +6865,14 @@ func (e *Executor) Execute(query string) (*Result, error) {
 					}
 					fullName := e.CurrentDB + "." + tableName
 					eng := strings.ToUpper(def.Engine)
+					// MEMORY/HEAP engine doesn't support ANALYZE TABLE
+					if eng == "MEMORY" || eng == "HEAP" {
+						return &Result{
+							Columns:     []string{"Table", "Op", "Msg_type", "Msg_text"},
+							Rows:        [][]interface{}{{fmt.Sprintf("%s.%s", e.CurrentDB, tableName), "analyze", "note", "The storage engine for the table doesn't support analyze"}},
+							IsResultSet: true,
+						}, nil
+					}
 					hasSpatial := false
 					for _, idx := range def.Indexes {
 						if strings.EqualFold(idx.Type, "SPATIAL") {
@@ -6611,8 +6882,8 @@ func (e *Executor) Execute(query string) (*Result, error) {
 					}
 					needsAnalyze := e.tableNeedsAnalyze != nil && e.tableNeedsAnalyze[fullName]
 					needsOptimize := e.tableNeedsOptimize != nil && e.tableNeedsOptimize[fullName]
-					// ANALYZE TABLE returns "OK" for InnoDB, SPATIAL-indexed tables,
-					// or non-InnoDB tables with pending analysis/optimization (ALTER or INSERT).
+					// ANALYZE TABLE returns "OK" for InnoDB (always), SPATIAL-indexed tables,
+					// or when there are pending stats updates (ALTER TABLE, INSERT, DELETE).
 					if eng == "" || eng == "INNODB" || hasSpatial || needsAnalyze || needsOptimize {
 						msgText = "OK"
 					}
@@ -16164,33 +16435,40 @@ func (e *Executor) execAnalyzeMultiTable(query string) (*Result, error) {
 			tableName = e.CurrentDB + "." + tableName
 		}
 		msgText := "Table is already up to date"
+		msgType := "status"
 		if dbObj, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
 			if tblDef, err := dbObj.GetTable(bareTable); err == nil && tblDef != nil {
 				eng := strings.ToUpper(tblDef.Engine)
-				hasSpatial := false
-				for _, idx := range tblDef.Indexes {
-					if strings.EqualFold(idx.Type, "SPATIAL") {
-						hasSpatial = true
-						break
+				// MEMORY/HEAP engine doesn't support ANALYZE TABLE
+				if eng == "MEMORY" || eng == "HEAP" {
+					msgType = "note"
+					msgText = "The storage engine for the table doesn't support analyze"
+				} else {
+					hasSpatial := false
+					for _, idx := range tblDef.Indexes {
+						if strings.EqualFold(idx.Type, "SPATIAL") {
+							hasSpatial = true
+							break
+						}
 					}
-				}
-				needsAnalyze := e.tableNeedsAnalyze != nil && e.tableNeedsAnalyze[tableName]
-				needsOptimize := e.tableNeedsOptimize != nil && e.tableNeedsOptimize[tableName]
-				// ANALYZE TABLE returns "OK" for InnoDB, SPATIAL-indexed tables,
-				// or non-InnoDB tables with pending analysis/optimization.
-				if eng == "" || eng == "INNODB" || hasSpatial || needsAnalyze || needsOptimize {
-					msgText = "OK"
-				}
-				// Clear flags after analyze
-				if e.tableNeedsAnalyze != nil {
-					delete(e.tableNeedsAnalyze, tableName)
-				}
-				if e.tableNeedsOptimize != nil {
-					delete(e.tableNeedsOptimize, tableName)
+					needsAnalyze := e.tableNeedsAnalyze != nil && e.tableNeedsAnalyze[tableName]
+					needsOptimize := e.tableNeedsOptimize != nil && e.tableNeedsOptimize[tableName]
+					// ANALYZE TABLE returns "OK" for InnoDB (always), SPATIAL-indexed tables,
+					// or when there are pending stats updates.
+					if eng == "" || eng == "INNODB" || hasSpatial || needsAnalyze || needsOptimize {
+						msgText = "OK"
+					}
+					// Clear flags after analyze
+					if e.tableNeedsAnalyze != nil {
+						delete(e.tableNeedsAnalyze, tableName)
+					}
+					if e.tableNeedsOptimize != nil {
+						delete(e.tableNeedsOptimize, tableName)
+					}
 				}
 			}
 		}
-		rows = append(rows, []interface{}{tableName, "analyze", "status", msgText})
+		rows = append(rows, []interface{}{tableName, "analyze", msgType, msgText})
 	}
 	return &Result{
 		Columns:     []string{"Table", "Op", "Msg_type", "Msg_text"},

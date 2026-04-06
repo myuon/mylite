@@ -58,6 +58,61 @@ func classifyDeletePredsForTables(where sqlparser.Expr, tableAliases []string) (
 }
 
 func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
+	// Handle WITH clause (CTEs) on DELETE statements.
+	if stmt.With != nil && len(stmt.With.CTEs) > 0 {
+		outerCTEMap := e.cteMap
+		newCTEMap := make(map[string]*cteTable)
+		if outerCTEMap != nil {
+			for k, v := range outerCTEMap {
+				newCTEMap[k] = v
+			}
+		}
+		e.cteMap = newCTEMap
+		defer func() { e.cteMap = outerCTEMap }()
+
+		for _, cte := range stmt.With.CTEs {
+			cteName := cte.ID.String()
+			var subResult *Result
+			if stmt.With.Recursive {
+				var err error
+				subResult, err = e.execRecursiveCTE(cteName, cte.Subquery, cte.Columns, newCTEMap)
+				if err != nil {
+					return nil, fmt.Errorf("CTE '%s': %w", cteName, err)
+				}
+			} else {
+				var err error
+				subResult, err = e.execTableStmtForUnion(cte.Subquery)
+				if err != nil {
+					return nil, fmt.Errorf("CTE '%s': %w", cteName, err)
+				}
+			}
+			columns := subResult.Columns
+			if len(cte.Columns) > 0 {
+				for ci, ca := range cte.Columns {
+					if ci < len(columns) {
+						columns[ci] = ca.String()
+					}
+				}
+			}
+			colOrder := strings.Join(columns, "\x00")
+			cteRows := make([]storage.Row, len(subResult.Rows))
+			for i, row := range subResult.Rows {
+				r := make(storage.Row, len(columns)+1)
+				for j, col := range columns {
+					if j < len(row) {
+						r[col] = row[j]
+					}
+				}
+				r["__column_order__"] = colOrder
+				cteRows[i] = r
+			}
+			newCTEMap[cteName] = &cteTable{
+				columns: columns,
+				rows:    cteRows,
+			}
+		}
+	}
+
 	// Set insideDML so that sub-SELECTs in WHERE clause acquire row locks
 	// (InnoDB acquires shared locks on rows read by subqueries within DML).
 	prevInsideDML := e.insideDML

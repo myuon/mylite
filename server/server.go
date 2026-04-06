@@ -271,6 +271,11 @@ func argToSQL(v interface{}) string {
 }
 
 func (h *Handler) HandleOtherCommand(cmd byte, data []byte) error {
+	// Handle COM_SHUTDOWN gracefully: return an error to the client (don't kill the server).
+	// COM_SHUTDOWN = 8; we acknowledge it with an error so the client exits cleanly.
+	if cmd == mysql.COM_SHUTDOWN {
+		return mysql.NewError(mysql.ER_SPECIFIC_ACCESS_DENIED_ERROR, "Access denied; you need (at least one of) the SUPER privilege(s) for this operation")
+	}
 	return fmt.Errorf("unsupported command: %d", cmd)
 }
 
