@@ -48,6 +48,12 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		query = rewriteAggregateAll(query)
 	}
 
+	// Vitess parser cannot handle AS aliases that start with a digit (e.g. AS 1Eq).
+	// MySQL allows these; quote them: AS 1Eq -> AS `1Eq`.
+	if rewritten := rewriteNumericAliases(query); rewritten != query {
+		query = rewritten
+	}
+
 	// Vitess parser doesn't handle LONG, LONG VARCHAR, LONG VARBINARY type aliases.
 	// MySQL treats them as: LONG/LONG VARCHAR -> MEDIUMTEXT, LONG VARBINARY -> MEDIUMBLOB.
 	// Only apply to DDL statements (CREATE TABLE / ALTER TABLE) to avoid mangling string literals.
@@ -552,7 +558,7 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	if strings.HasPrefix(upper, "PREPARE ") {
 		if re := regexp.MustCompile(`(?i)^PREPARE\s+(\S+)\s+FROM\s+@(\S+)\s*;?\s*$`); re.MatchString(trimmed) {
 			m := re.FindStringSubmatch(trimmed)
-			stmtName := m[1]
+			stmtName := strings.ToLower(m[1])
 			varName := m[2]
 			val, ok := e.userVars[varName]
 			if !ok || val == nil {
@@ -572,7 +578,7 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 			queryStr = strings.ReplaceAll(queryStr, "\\'", "'")
 			queryStr = strings.ReplaceAll(queryStr, "\\\"", "\"")
 			queryStr = strings.ReplaceAll(queryStr, "\\\\", "\\")
-			e.preparedStmts[stmtName] = queryStr
+			e.preparedStmts[strings.ToLower(stmtName)] = queryStr
 			return "", &Result{}, nil
 		}
 	}
@@ -1403,4 +1409,87 @@ func wildcardStringAliasNear(query string) string {
 		near = near[:64]
 	}
 	return near
+}
+
+// numericAliasRe matches AS clauses with unquoted identifiers starting with a digit.
+var numericAliasRe = regexp.MustCompile(`(?i)\bAS\s+([0-9][a-zA-Z0-9_]*)`)
+
+// rewriteNumericAliases quotes AS aliases that start with a digit.
+// MySQL allows identifiers like 1Eq, 2NEq1, but the vitess parser does not.
+// This transforms: AS 1Eq -> AS `1Eq`
+func rewriteNumericAliases(query string) string {
+	if !numericAliasRe.MatchString(query) {
+		return query
+	}
+	// Process outside string literals only
+	var result strings.Builder
+	inSingle := false
+	inDouble := false
+	i := 0
+	for i < len(query) {
+		ch := query[i]
+		if inSingle {
+			result.WriteByte(ch)
+			if ch == '\'' && i+1 < len(query) && query[i+1] == '\'' {
+				i++
+				result.WriteByte(query[i])
+			} else if ch == '\\' && i+1 < len(query) {
+				i++
+				result.WriteByte(query[i])
+			} else if ch == '\'' {
+				inSingle = false
+			}
+			i++
+			continue
+		}
+		if inDouble {
+			result.WriteByte(ch)
+			if ch == '"' && i+1 < len(query) && query[i+1] == '"' {
+				i++
+				result.WriteByte(query[i])
+			} else if ch == '"' {
+				inDouble = false
+			}
+			i++
+			continue
+		}
+		if ch == '\'' {
+			inSingle = true
+			result.WriteByte(ch)
+			i++
+			continue
+		}
+		if ch == '"' {
+			inDouble = true
+			result.WriteByte(ch)
+			i++
+			continue
+		}
+		// Check for "AS " followed by digit-starting identifier
+		upper := strings.ToUpper(query[i:])
+		if strings.HasPrefix(upper, "AS ") || strings.HasPrefix(upper, "AS\t") {
+			asLen := 2
+			j := i + asLen
+			for j < len(query) && (query[j] == ' ' || query[j] == '\t') {
+				j++
+			}
+			if j < len(query) && query[j] >= '0' && query[j] <= '9' {
+				// Find the identifier end
+				k := j
+				for k < len(query) && (query[k] == '_' || (query[k] >= '0' && query[k] <= '9') || (query[k] >= 'a' && query[k] <= 'z') || (query[k] >= 'A' && query[k] <= 'Z')) {
+					k++
+				}
+				// Write: AS `ident`
+				result.WriteString(query[i : j])
+				result.WriteByte('`')
+				result.WriteString(query[j:k])
+				result.WriteByte('`')
+				i = k
+				continue
+			}
+		}
+		result.WriteByte(ch)
+		i++
+	}
+	return result.String()
 }

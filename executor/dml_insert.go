@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -707,19 +708,39 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			if err != nil {
 				var intOvErr *intOverflowError
 				if errors.As(err, &intOvErr) {
-					// For DECIMAL/FLOAT/DOUBLE columns, parse overflow as float
-					isDecCol := false
+					// For BINARY/VARBINARY columns, convert large hex literals to binary strings.
 					overflowStr := intOvErr.val
+					if intOvErr.kind == "BINARY" {
+						isBinCol := false
+						for _, col := range tbl.Def.Columns {
+							if col.Name == colNames[i] {
+								colUpper := strings.ToUpper(col.Type)
+								if strings.HasPrefix(colUpper, "BINARY") || strings.HasPrefix(colUpper, "VARBINARY") {
+									isBinCol = true
+								}
+								break
+							}
+						}
+						if isBinCol {
+							// Decode hex string to binary bytes
+							if bs, herr := hex.DecodeString(overflowStr); herr == nil {
+								v = string(bs)
+								err = nil
+							}
+						}
+					}
+					// For DECIMAL/FLOAT/DOUBLE/REAL columns, parse overflow as float
+					isDecCol := false
 					for _, col := range tbl.Def.Columns {
 						if col.Name == colNames[i] {
 							colUpper := strings.ToUpper(col.Type)
-							if strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") {
+							if strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || colUpper == "REAL" || strings.HasPrefix(colUpper, "REAL ") {
 								isDecCol = true
 							}
 							break
 						}
 					}
-					if isDecCol {
+					if err != nil && isDecCol {
 						if f, ferr := strconv.ParseFloat(overflowStr, 64); ferr == nil {
 							v = f
 							err = nil
@@ -780,7 +801,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						// In strict mode, check DECIMAL range and unsigned constraint before clipping
 						if e.isStrictMode() {
 							colUpper := strings.ToUpper(col.Type)
-							isDecType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE")
+							isDecType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || colUpper == "REAL" || strings.HasPrefix(colUpper, "REAL ")
 							if isDecType {
 								if strings.Contains(colUpper, "UNSIGNED") {
 									f := toFloat(v)
@@ -1210,7 +1231,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					colUpper := strings.ToUpper(col.Type)
 					isSpatialType := strings.Contains(colUpper, "POINT") || strings.Contains(colUpper, "LINESTRING") || strings.Contains(colUpper, "POLYGON") || strings.Contains(colUpper, "GEOMETRY") || strings.Contains(colUpper, "GEOMCOLLECTION")
 					isIntType := !isSpatialType && (strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER"))
-					isDecimalType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE")
+					isDecimalType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || colUpper == "REAL" || strings.HasPrefix(colUpper, "REAL ")
 					isNumericType := isIntType || isDecimalType
 					isUnsigned := strings.Contains(colUpper, "UNSIGNED")
 					if isNumericType {

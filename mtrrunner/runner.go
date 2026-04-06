@@ -1217,7 +1217,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		return true, false, err
 
 	case "connect":
-		connName, dbName, userName := parseConnectDirectiveArgs(args)
+		connName, dbName, userName, _ := parseConnectDirectiveArgsWithPassword(args)
 		if connName == "" {
 			return true, false, nil
 		}
@@ -3842,6 +3842,11 @@ func parseDirectiveNameArgs(directive string) (name, args string) {
 }
 
 func parseConnectDirectiveArgs(args string) (connName string, dbName string, userName string) {
+	connName, dbName, userName, _ = parseConnectDirectiveArgsWithPassword(args)
+	return
+}
+
+func parseConnectDirectiveArgsWithPassword(args string) (connName string, dbName string, userName string, password string) {
 	trimmed := strings.TrimSpace(args)
 	// Strip inline # comment (e.g. "connect (con2,...);  # comment here")
 	if hashIdx := strings.Index(trimmed, ";"); hashIdx >= 0 {
@@ -3856,7 +3861,7 @@ func parseConnectDirectiveArgs(args string) (connName string, dbName string, use
 		trimmed = strings.TrimSpace(trimmed[1 : len(trimmed)-1])
 	}
 	if trimmed == "" {
-		return "", "", ""
+		return "", "", "", ""
 	}
 
 	parts := strings.Split(trimmed, ",")
@@ -3868,6 +3873,9 @@ func parseConnectDirectiveArgs(args string) (connName string, dbName string, use
 	if len(parts) >= 3 {
 		userName = parts[2]
 	}
+	if len(parts) >= 4 {
+		password = parts[3]
+	}
 	if len(parts) >= 5 {
 		dbName = parts[4]
 		// *NO-ONE* is a MySQL test convention meaning "connect without a default database"
@@ -3875,7 +3883,7 @@ func parseConnectDirectiveArgs(args string) (connName string, dbName string, use
 			dbName = ""
 		}
 	}
-	return connName, dbName, userName
+	return connName, dbName, userName, password
 }
 
 // formatMySQLError formats an error into mysqltest expected format.

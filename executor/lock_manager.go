@@ -456,6 +456,21 @@ func (tlm *TableLockManager) UnlockAll(connID int64) {
 	delete(tlm.locks, connID)
 }
 
+// UnlockTable releases the lock for a specific table for a connection.
+// If no locks remain for the connection after this, the connection entry is removed.
+func (tlm *TableLockManager) UnlockTable(connID int64, dbTable string) {
+	tlm.mu.Lock()
+	defer tlm.mu.Unlock()
+	m, ok := tlm.locks[connID]
+	if !ok {
+		return
+	}
+	delete(m, strings.ToLower(dbTable))
+	if len(m) == 0 {
+		delete(tlm.locks, connID)
+	}
+}
+
 // HasLocks returns true if the connection currently holds any LOCK TABLE locks.
 func (tlm *TableLockManager) HasLocks(connID int64) bool {
 	tlm.mu.Lock()

@@ -613,19 +613,25 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 		}
 		siS := toString(siStr)
 		siD := toString(siDelim)
-		siN := int(toInt64(siCnt))
+		siN64 := toInt64(siCnt)
 		siParts := strings.Split(siS, siD)
-		if siN >= 0 {
-			if siN >= len(siParts) {
+		siPartsLen := int64(len(siParts))
+		if siN64 >= 0 {
+			if siN64 >= siPartsLen {
 				return siS, true, nil
 			}
-			return strings.Join(siParts[:siN], siD), true, nil
+			return strings.Join(siParts[:siN64], siD), true, nil
 		}
-		siN = -siN
-		if siN >= len(siParts) {
+		// Negative count: take from the end
+		siAbs := -siN64
+		// Guard against overflow (e.g. INT64_MIN)
+		if siAbs < 0 {
+			siAbs = siPartsLen
+		}
+		if siAbs >= siPartsLen {
 			return siS, true, nil
 		}
-		return strings.Join(siParts[len(siParts)-siN:], siD), true, nil
+		return strings.Join(siParts[siPartsLen-siAbs:], siD), true, nil
 	case "soundex":
 		val, isNull, err := e.evalArg1(v.Exprs, "SOUNDEX", row)
 		if err != nil {

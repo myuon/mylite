@@ -350,6 +350,8 @@ func (e *Executor) fireTriggers(tableName, timing, event string, newRow, oldRow 
 			continue
 		}
 
+		// Enter trigger — internal Execute calls should not count as client Questions.
+		e.routineDepth++
 		for _, stmtStr := range tr.Body {
 			stmtUpper := strings.ToUpper(strings.TrimSpace(stmtStr))
 			// Handle SET NEW.col = value in BEFORE triggers
@@ -361,9 +363,11 @@ func (e *Executor) fireTriggers(tableName, timing, event string, newRow, oldRow 
 			resolved := e.resolveNewOldRefs(stmtStr, newRow, oldRow)
 			_, err := e.Execute(resolved)
 			if err != nil {
+				e.routineDepth--
 				return err
 			}
 		}
+		e.routineDepth--
 	}
 	return nil
 }
@@ -396,7 +400,10 @@ func (e *Executor) fireTriggerWithRoutineInterpreter(tr *catalog.TriggerDef, tim
 		}
 	}
 
+	// Enter trigger routine — internal Execute calls should not count as client Questions.
+	e.routineDepth++
 	_, err := e.execRoutineBodyWithContext(tr.Body, ctx)
+	e.routineDepth--
 	if err != nil {
 		return err
 	}
@@ -888,7 +895,10 @@ func (e *Executor) callProcedureByNameInDB(dbName string, procName string, argSt
 		}
 	}
 
+	// Enter stored routine — internal Execute calls should not count as client Questions.
+	e.routineDepth++
 	bodyResult, err := e.execRoutineBody(proc.Body, paramVars)
+	e.routineDepth--
 	if err != nil {
 		return nil, err
 	}
@@ -964,7 +974,10 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 	for k, v := range paramVars {
 		ctx.localVars[k] = v
 	}
+	// Enter stored routine — internal Execute calls should not count as client Questions.
+	e.routineDepth++
 	bodyResult, err := e.execRoutineBodyWithContext(proc.Body, ctx)
+	e.routineDepth--
 	if err != nil {
 		return nil, err
 	}
@@ -1275,7 +1288,13 @@ type cursorState struct {
 // qualifier is the optional schema qualifier (e.g. "test" in "test.f()").
 func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Expr, row *storage.Row, qualifier ...string) (interface{}, error) {
 	e.routineDepth++
-	defer func() { e.routineDepth-- }()
+	// Save and restore currentQuery so that UDF execution doesn't overwrite
+	// the outer query's text (used for column name extraction).
+	savedQuery := e.currentQuery
+	defer func() {
+		e.routineDepth--
+		e.currentQuery = savedQuery
+	}()
 	if e.routineDepth > 256 {
 		return nil, fmt.Errorf("Error 1456 (HY000): Recursive stored functions and triggers are not allowed")
 	}
@@ -2714,7 +2733,11 @@ func (e *Executor) evaluateExprWithVars(exprStr string, vars map[string]interfac
 	resolved := e.substituteLocalVars(exprStr, vars)
 	// Try to parse and evaluate as a SQL expression
 	selectSQL := "SELECT " + resolved
+	// Save and restore currentQuery so that UDF execution doesn't overwrite
+	// the outer query's text (used for column name extraction).
+	savedQuery := e.currentQuery
 	result, err := e.Execute(selectSQL)
+	e.currentQuery = savedQuery
 	if err != nil {
 		return nil, err
 	}

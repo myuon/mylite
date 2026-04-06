@@ -717,15 +717,29 @@ func (e *Executor) evalWindowFuncForRow(
 		}
 		hasValue := false
 		sum := float64(0)
+		// Track uint64 accumulation separately to avoid float64 precision loss for large uints.
+		var sumU64 uint64
+		allUint64 := true
 		for i := start; i <= end; i++ {
 			val, _ := e.evalRowExpr(v.Arg, partRows[i])
 			if val != nil {
+				if u, ok := val.(uint64); ok {
+					sumU64 += u
+				} else {
+					allUint64 = false
+				}
 				sum += windowToFloat64(val)
 				hasValue = true
+			} else {
+				allUint64 = false
 			}
 		}
 		if !hasValue {
 			return nil, nil
+		}
+		// If all values were uint64, return uint64 to preserve precision (e.g. BIT_AND result).
+		if allUint64 {
+			return sumU64, nil
 		}
 		// MySQL returns DECIMAL for SUM of integers
 		return fmt.Sprintf("%.1f", sum), nil

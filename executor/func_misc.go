@@ -4,6 +4,8 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
+	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"math/rand"
@@ -573,7 +575,39 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if isNull {
 			return nil, true, nil
 		}
-		return fmt.Sprintf("%x", md5.Sum([]byte(toString(shaVal)))), true, nil
+		return fmt.Sprintf("%x", sha1.Sum([]byte(toString(shaVal)))), true, nil
+	case "sha2":
+		// SHA2(str, hash_length) — hash_length can be 224, 256, 384, 512, or 0 (defaults to 256)
+		if len(v.Exprs) < 2 {
+			return nil, true, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'sha2'")
+		}
+		sha2Str, sha2Null, sha2Err := e.evalArg1(v.Exprs[:1], "SHA2", row)
+		if sha2Err != nil {
+			return nil, true, sha2Err
+		}
+		if sha2Null {
+			return nil, true, nil
+		}
+		sha2LenRaw, sha2LenErr := e.evalExprMaybeRow(v.Exprs[1], row)
+		if sha2LenErr != nil {
+			return nil, true, sha2LenErr
+		}
+		if sha2LenRaw == nil {
+			return nil, true, nil
+		}
+		sha2LenInt, _ := strconv.ParseInt(fmt.Sprintf("%v", sha2LenRaw), 10, 64)
+		sha2Input := []byte(toString(sha2Str))
+		switch sha2LenInt {
+		case 0, 256:
+			sum := sha256.Sum256(sha2Input)
+			return fmt.Sprintf("%x", sum[:]), true, nil
+		case 224:
+			sum := sha256.Sum224(sha2Input)
+			return fmt.Sprintf("%x", sum[:]), true, nil
+		default:
+			// SHA-384 and SHA-512 require crypto/sha512; return null for unsupported lengths
+			return nil, true, nil
+		}
 	case "benchmark":
 		return int64(0), true, nil
 	case "master_pos_wait":

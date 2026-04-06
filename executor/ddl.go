@@ -897,11 +897,15 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		columns = append(columns, colDef)
 	}
 
-	// Pre-scan table options for ROW_FORMAT (needed for key length validation)
+	// Pre-scan table options for ROW_FORMAT and ENGINE (needed for key length validation)
 	tableRowFormat := ""
+	tableEngine := "INNODB" // default
 	for _, opt := range stmt.TableSpec.Options {
-		if strings.EqualFold(strings.TrimSpace(opt.Name), "ROW_FORMAT") {
+		name := strings.ToUpper(strings.TrimSpace(opt.Name))
+		if name == "ROW_FORMAT" {
 			tableRowFormat = strings.ToUpper(tableOptionString(opt))
+		} else if name == "ENGINE" {
+			tableEngine = strings.ToUpper(tableOptionString(opt))
 		}
 	}
 
@@ -956,17 +960,28 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			return nil, mysqlError(1070, "42000", "Too many key parts specified; max 16 parts allowed")
 		}
 		// Check key prefix length limits (ER_TOO_LONG_KEY = 1071)
-		// COMPACT/REDUNDANT row format: max 767 bytes per key part
-		// DYNAMIC/COMPRESSED: max 3072 bytes per key part
-		for _, idxCol := range idx.Columns {
+		// MyISAM: max 1000 bytes; InnoDB COMPACT/REDUNDANT: 767; InnoDB DYNAMIC: 3072
+		// For PRIMARY KEY or UNIQUE: error; for regular INDEX: warning (key silently used as-is)
+		isUniqueOrPrimary := idx.Info.Type == sqlparser.IndexTypeUnique || idx.Info.Type == sqlparser.IndexTypePrimary
+		for ci, idxCol := range idx.Columns {
 			if idxCol.Length != nil {
 				prefixLen := *idxCol.Length
-				maxPrefixLen := 3072 // DYNAMIC default
-				if tableRowFormat == "COMPACT" || tableRowFormat == "REDUNDANT" {
-					maxPrefixLen = 767
+				var maxPrefixLen int
+				if tableEngine == "MYISAM" || tableEngine == "ARCHIVE" || tableEngine == "HEAP" || tableEngine == "MEMORY" {
+					maxPrefixLen = 1000
+				} else {
+					maxPrefixLen = 3072 // InnoDB DYNAMIC default
+					if tableRowFormat == "COMPACT" || tableRowFormat == "REDUNDANT" {
+						maxPrefixLen = 767
+					}
 				}
 				if prefixLen > maxPrefixLen {
-					return nil, mysqlError(1071, "42000", fmt.Sprintf("Specified key was too long; max key length is %d bytes", maxPrefixLen))
+					if isUniqueOrPrimary {
+						return nil, mysqlError(1071, "42000", fmt.Sprintf("Specified key was too long; max key length is %d bytes", maxPrefixLen))
+					}
+					// For regular index: add warning and allow creation
+					_ = ci
+					e.addWarning("Warning", 1071, fmt.Sprintf("Specified key was too long; max key length is %d bytes", maxPrefixLen))
 				}
 			}
 		}
@@ -2191,18 +2206,29 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			// Check key prefix length limits (ER_TOO_LONG_KEY = 1071)
 			{
 				tableRowFormat := ""
+				altTableEngine := "INNODB"
 				if tableDef, tdErr2 := db.GetTable(tableName); tdErr2 == nil {
 					tableRowFormat = strings.ToUpper(tableDef.RowFormat)
+					altTableEngine = strings.ToUpper(tableDef.Engine)
 				}
+				isUniqueOrPrimaryIdx := op.IndexDefinition.Info.Type == sqlparser.IndexTypeUnique || op.IndexDefinition.Info.Type == sqlparser.IndexTypePrimary
 				for _, idxCol := range op.IndexDefinition.Columns {
 					if idxCol.Length != nil {
 						prefixLen := *idxCol.Length
-						maxPrefixLen := 3072 // DYNAMIC default
-						if tableRowFormat == "COMPACT" || tableRowFormat == "REDUNDANT" {
-							maxPrefixLen = 767
+						var maxPrefixLen int
+						if altTableEngine == "MYISAM" || altTableEngine == "ARCHIVE" || altTableEngine == "HEAP" || altTableEngine == "MEMORY" {
+							maxPrefixLen = 1000
+						} else {
+							maxPrefixLen = 3072 // InnoDB DYNAMIC default
+							if tableRowFormat == "COMPACT" || tableRowFormat == "REDUNDANT" {
+								maxPrefixLen = 767
+							}
 						}
 						if prefixLen > maxPrefixLen {
-							return nil, mysqlError(1071, "42000", fmt.Sprintf("Specified key was too long; max key length is %d bytes", maxPrefixLen))
+							if isUniqueOrPrimaryIdx {
+								return nil, mysqlError(1071, "42000", fmt.Sprintf("Specified key was too long; max key length is %d bytes", maxPrefixLen))
+							}
+							e.addWarning("Warning", 1071, fmt.Sprintf("Specified key was too long; max key length is %d bytes", maxPrefixLen))
 						}
 					}
 				}

@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -2525,7 +2526,7 @@ func containsAggregate(expr sqlparser.Expr) bool {
 func aggregateDisplayName(expr sqlparser.Expr) string {
 	s := sqlparser.String(expr)
 	// Replace lowercase function names with uppercase
-	for _, fn := range []string{"count", "sum", "avg", "min", "max", "json_arrayagg", "json_objectagg", "bit_and", "bit_or", "bit_xor", "group_concat"} {
+	for _, fn := range []string{"count", "sum", "avg", "min", "max", "json_arrayagg", "json_objectagg", "bit_and", "bit_or", "bit_xor", "group_concat", "std", "stddev", "stddev_pop", "stddev_samp", "variance", "var_pop", "var_samp"} {
 		if strings.HasPrefix(s, fn+"(") {
 			s = strings.ToUpper(fn) + s[len(fn):]
 			break
@@ -2546,7 +2547,9 @@ func isAggregateExpr(expr sqlparser.Expr) bool {
 	case *sqlparser.CountStar, *sqlparser.Count,
 		*sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg,
 		*sqlparser.JSONArrayAgg, *sqlparser.JSONObjectAgg, *sqlparser.GroupConcatExpr,
-		*sqlparser.BitAnd, *sqlparser.BitOr, *sqlparser.BitXor:
+		*sqlparser.BitAnd, *sqlparser.BitOr, *sqlparser.BitXor,
+		*sqlparser.Std, *sqlparser.StdDev, *sqlparser.StdPop, *sqlparser.StdSamp,
+		*sqlparser.Variance, *sqlparser.VarPop, *sqlparser.VarSamp:
 		return true
 	}
 	return false
@@ -3026,6 +3029,33 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 		resultRows = newResult
 	}
 
+	// Apply window functions over aggregated rows (e.g. SUM(BIT_AND(i)) OVER (...)).
+	// We build synthetic storage.Row objects from the aggregate result rows using colNames
+	// as keys, so that window function arguments can look up pre-computed aggregate values.
+	if selectExprsHaveWindowFuncs(stmt.SelectExprs.Exprs) {
+		// Build synthetic rows from aggregate results.
+		syntheticRows := make([]storage.Row, len(resultRows))
+		for ri, row := range resultRows {
+			sr := make(storage.Row, len(colNames))
+			for ci, cn := range colNames {
+				if ci < len(row) {
+					sr[cn] = row[ci]
+				}
+			}
+			syntheticRows[ri] = sr
+		}
+		// Extract column expressions.
+		colExprs := make([]sqlparser.Expr, 0, len(stmt.SelectExprs.Exprs))
+		for _, se := range stmt.SelectExprs.Exprs {
+			if ae, ok := se.(*sqlparser.AliasedExpr); ok {
+				colExprs = append(colExprs, ae.Expr)
+			}
+		}
+		if err := e.processWindowFunctionsWithNamedWindows(colExprs, syntheticRows, resultRows, stmt.Windows); err != nil {
+			return nil, err
+		}
+	}
+
 	// Apply HAVING
 	if stmt.Having != nil {
 		filtered := make([][]interface{}, 0)
@@ -3145,6 +3175,43 @@ func compareGroupKeys(a, b string) int {
 		}
 	}
 	return len(aParts) - len(bParts)
+}
+
+// getAggArg extracts the argument expression from variance/std aggregate types.
+func getAggArg(e sqlparser.Expr) sqlparser.Expr {
+	switch v := e.(type) {
+	case *sqlparser.Variance:
+		return v.Arg
+	case *sqlparser.VarPop:
+		return v.Arg
+	case *sqlparser.VarSamp:
+		return v.Arg
+	case *sqlparser.Std:
+		return v.Arg
+	case *sqlparser.StdDev:
+		return v.Arg
+	case *sqlparser.StdPop:
+		return v.Arg
+	case *sqlparser.StdSamp:
+		return v.Arg
+	}
+	return nil
+}
+
+// collectNumericVals collects non-NULL float64 values for an expression over a group of rows.
+func collectNumericVals(arg sqlparser.Expr, groupRows []storage.Row) ([]float64, int) {
+	if arg == nil {
+		return nil, 0
+	}
+	var vals []float64
+	for _, row := range groupRows {
+		val, err := evalRowExpr(arg, row)
+		if err != nil || val == nil {
+			continue
+		}
+		vals = append(vals, toFloat(val))
+	}
+	return vals, len(vals)
 }
 
 // evalAggregateExpr evaluates an expression that may be an aggregate function over a group.
@@ -3577,6 +3644,82 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			result ^= toUint64(val)
 		}
 		return result, nil
+	case *sqlparser.Variance, *sqlparser.VarPop:
+		// VAR_POP / VARIANCE: population variance = sum((x - mean)^2) / N
+		arg := getAggArg(e)
+		vals, count := collectNumericVals(arg, groupRows)
+		if count == 0 {
+			return nil, nil
+		}
+		mean := 0.0
+		for _, v := range vals {
+			mean += v
+		}
+		mean /= float64(count)
+		variance := 0.0
+		for _, v := range vals {
+			d := v - mean
+			variance += d * d
+		}
+		variance /= float64(count)
+		return fmt.Sprintf("%.10f", variance), nil
+	case *sqlparser.VarSamp:
+		// VAR_SAMP: sample variance = sum((x - mean)^2) / (N-1)
+		arg := getAggArg(e)
+		vals, count := collectNumericVals(arg, groupRows)
+		if count < 2 {
+			return nil, nil
+		}
+		mean := 0.0
+		for _, v := range vals {
+			mean += v
+		}
+		mean /= float64(count)
+		variance := 0.0
+		for _, v := range vals {
+			d := v - mean
+			variance += d * d
+		}
+		variance /= float64(count - 1)
+		return fmt.Sprintf("%.10f", variance), nil
+	case *sqlparser.Std, *sqlparser.StdDev, *sqlparser.StdPop:
+		// STD / STDDEV / STDDEV_POP: population std = sqrt(VAR_POP)
+		arg := getAggArg(e)
+		vals, count := collectNumericVals(arg, groupRows)
+		if count == 0 {
+			return nil, nil
+		}
+		mean := 0.0
+		for _, v := range vals {
+			mean += v
+		}
+		mean /= float64(count)
+		variance := 0.0
+		for _, v := range vals {
+			d := v - mean
+			variance += d * d
+		}
+		variance /= float64(count)
+		return fmt.Sprintf("%.10f", math.Sqrt(variance)), nil
+	case *sqlparser.StdSamp:
+		// STDDEV_SAMP: sample std = sqrt(VAR_SAMP)
+		arg := getAggArg(e)
+		vals, count := collectNumericVals(arg, groupRows)
+		if count < 2 {
+			return nil, nil
+		}
+		mean := 0.0
+		for _, v := range vals {
+			mean += v
+		}
+		mean /= float64(count)
+		variance := 0.0
+		for _, v := range vals {
+			d := v - mean
+			variance += d * d
+		}
+		variance /= float64(count - 1)
+		return fmt.Sprintf("%.10f", math.Sqrt(variance)), nil
 	case *sqlparser.ComparisonExpr:
 		// Handle IN / NOT IN with right side ValTuple (including row-IN-tuple-of-tuples)
 		if e.Operator == sqlparser.InOp || e.Operator == sqlparser.NotInOp {

@@ -333,7 +333,8 @@ type Executor struct {
 	// lastFoundRows stores the row count from the last SELECT before LIMIT was applied.
 	// Used by the FOUND_ROWS() function.
 	lastFoundRows int64
-	// routineDepth tracks the current stored routine call depth to prevent infinite recursion.
+	// routineDepth tracks the current stored routine call depth to prevent infinite recursion
+	// and to avoid counting internal routine Execute calls in the Questions status counter.
 	routineDepth int
 	// exprDepth tracks the current expression evaluation depth to prevent Go stack overflow
 	// on deeply nested expressions. MySQL returns ER_STACK_OVERRUN_NEED_MORE (1436) when
@@ -416,6 +417,8 @@ type Executor struct {
 	sortRows  int64 // total rows sorted
 	sortRange int64 // sort operations using range scan
 	sortScan  int64 // sort operations using full table scan
+	// questions counts the number of client statements received, reset on FLUSH STATUS.
+	questions int64
 	// resourceGroups stores resource group names (lowercase-normalized for case+accent-insensitive comparison).
 	// Shared across all connections. Maps normalized name → original name.
 	resourceGroups map[string]string
@@ -6273,6 +6276,14 @@ func (e *Executor) recordStatementDigest(query string) {
 }
 
 func (e *Executor) Execute(query string) (*Result, error) {
+	// Increment the Questions counter for every statement received from the client,
+	// including statements that preprocessQuery short-circuits (e.g. SHOW COUNT(*) WARNINGS).
+	// Skip incrementing for empty queries and for internal routine statements.
+	trimmedForCount := strings.TrimSpace(query)
+	if trimmedForCount != "" && e.routineDepth == 0 {
+		e.questions++
+	}
+
 	query, result, err := e.preprocessQuery(query)
 	if result != nil || err != nil {
 		return result, err
@@ -6405,6 +6416,7 @@ func (e *Executor) Execute(query string) (*Result, error) {
 			e.sortRows = 0
 			e.sortRange = 0
 			e.sortScan = 0
+			e.questions = 0
 			return &Result{}, nil
 		}
 		// HANDLER ... OPEN/READ/CLOSE: return error for performance_schema tables
@@ -6490,6 +6502,10 @@ func (e *Executor) Execute(query string) (*Result, error) {
 				}
 			}
 			return &Result{}, nil
+		}
+		// INSTALL PLUGIN with a path (contains '/') should fail with ER_UDF_NO_PATHS
+		if strings.HasPrefix(upper, "INSTALL PLUGIN ") && strings.Contains(query, "/") {
+			return nil, mysqlError(1210, "HY000", "No paths allowed for shared library")
 		}
 		if strings.HasPrefix(upper, "CREATE EVENT") ||
 			strings.HasPrefix(upper, "DROP EVENT") ||
@@ -6991,6 +7007,7 @@ func (e *Executor) Execute(query string) (*Result, error) {
 				e.sortRows = 0
 				e.sortRange = 0
 				e.sortScan = 0
+				e.questions = 0
 			}
 		}
 		return &Result{}, nil
@@ -7484,7 +7501,7 @@ func (e *Executor) checkTableLockRestrictions(stmt sqlparser.Statement) error {
 
 // execPrepare handles PREPARE stmt_name FROM 'query'.
 func (e *Executor) execPrepare(stmt *sqlparser.PrepareStmt) (*Result, error) {
-	name := stmt.Name.String()
+	name := strings.ToLower(stmt.Name.String())
 	// The statement text is in stmt.Statement
 	query := sqlparser.String(stmt.Statement)
 	if len(query) >= 2 {
@@ -7511,7 +7528,7 @@ func (e *Executor) execExecute(stmt *sqlparser.ExecuteStmt) (*Result, error) {
 	e.executeDepth++
 	defer func() { e.executeDepth-- }()
 
-	name := stmt.Name.String()
+	name := strings.ToLower(stmt.Name.String())
 	query, ok := e.preparedStmts[name]
 	if !ok {
 		return nil, mysqlError(1243, "HY000", fmt.Sprintf("Unknown prepared statement handler (%s) given to EXECUTE", name))
@@ -7617,7 +7634,7 @@ func (e *Executor) execExecute(stmt *sqlparser.ExecuteStmt) (*Result, error) {
 
 // execDeallocate handles DEALLOCATE PREPARE stmt_name.
 func (e *Executor) execDeallocate(stmt *sqlparser.DeallocateStmt) (*Result, error) {
-	name := stmt.Name.String()
+	name := strings.ToLower(stmt.Name.String())
 	delete(e.preparedStmts, name)
 	return &Result{}, nil
 }
@@ -8435,14 +8452,30 @@ func coerceYearValue(v interface{}) interface{} {
 		return "0000"
 	}
 
-	// String value
+	// String value — MySQL extracts leading numeric portion (e.g., "2012qwer" → 2012)
 	n, err := strconv.Atoi(s)
 	if err != nil {
 		f, err2 := strconv.ParseFloat(s, 64)
 		if err2 != nil {
-			return "0000"
+			// Try extracting leading digits (e.g., "2012qwer" -> 2012)
+			leadingDigits := ""
+			for _, ch := range s {
+				if ch >= '0' && ch <= '9' {
+					leadingDigits += string(ch)
+				} else {
+					break
+				}
+			}
+			if leadingDigits == "" {
+				return "0000"
+			}
+			n, err = strconv.Atoi(leadingDigits)
+			if err != nil {
+				return "0000"
+			}
+		} else {
+			n = int(f)
 		}
-		n = int(f)
 	}
 
 	// String '0' or '00' or '000' -> 2000 (but '0000' -> 0000)
@@ -10634,8 +10667,18 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.LagLeadExpr:
 		return nil, nil
 	case *sqlparser.VarSamp:
+		if e.correlatedRow != nil {
+			if val, ok := e.correlatedRow[aggregateDisplayName(expr)]; ok {
+				return val, nil
+			}
+		}
 		return nil, nil
 	case *sqlparser.Std:
+		if e.correlatedRow != nil {
+			if val, ok := e.correlatedRow[aggregateDisplayName(expr)]; ok {
+				return val, nil
+			}
+		}
 		return nil, nil
 	case *sqlparser.FirstOrLastValueExpr:
 		// FIRST_VALUE/LAST_VALUE - evaluate expression as stub
@@ -10652,14 +10695,39 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		// UPDATEXML(target, xpath, new) - stub
 		return nil, nil
 	case *sqlparser.Variance:
+		if e.correlatedRow != nil {
+			if val, ok := e.correlatedRow[aggregateDisplayName(expr)]; ok {
+				return val, nil
+			}
+		}
 		return nil, nil
 	case *sqlparser.VarPop:
+		if e.correlatedRow != nil {
+			if val, ok := e.correlatedRow[aggregateDisplayName(expr)]; ok {
+				return val, nil
+			}
+		}
 		return nil, nil
 	case *sqlparser.StdDev:
+		if e.correlatedRow != nil {
+			if val, ok := e.correlatedRow[aggregateDisplayName(expr)]; ok {
+				return val, nil
+			}
+		}
 		return nil, nil
 	case *sqlparser.StdPop:
+		if e.correlatedRow != nil {
+			if val, ok := e.correlatedRow[aggregateDisplayName(expr)]; ok {
+				return val, nil
+			}
+		}
 		return nil, nil
 	case *sqlparser.StdSamp:
+		if e.correlatedRow != nil {
+			if val, ok := e.correlatedRow[aggregateDisplayName(expr)]; ok {
+				return val, nil
+			}
+		}
 		return nil, nil
 	case *sqlparser.BitAnd:
 		// BIT_AND aggregate/window function - stub; actual values computed by processWindowFunctions
@@ -10695,13 +10763,37 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.ExistsExpr:
 		return e.evalExistsExpr(v)
 	case *sqlparser.Avg:
-		// Aggregate used in unexpected context (e.g., HAVING) - return NULL
+		// Aggregate used in HAVING context — look up pre-computed value from correlatedRow.
+		if e.correlatedRow != nil {
+			displayName := aggregateDisplayName(expr)
+			if val, ok := e.correlatedRow[displayName]; ok {
+				return val, nil
+			}
+		}
 		return nil, nil
 	case *sqlparser.Max:
+		if e.correlatedRow != nil {
+			displayName := aggregateDisplayName(expr)
+			if val, ok := e.correlatedRow[displayName]; ok {
+				return val, nil
+			}
+		}
 		return nil, nil
 	case *sqlparser.Min:
+		if e.correlatedRow != nil {
+			displayName := aggregateDisplayName(expr)
+			if val, ok := e.correlatedRow[displayName]; ok {
+				return val, nil
+			}
+		}
 		return nil, nil
 	case *sqlparser.Sum:
+		if e.correlatedRow != nil {
+			displayName := aggregateDisplayName(expr)
+			if val, ok := e.correlatedRow[displayName]; ok {
+				return val, nil
+			}
+		}
 		return nil, nil
 	case *sqlparser.Count:
 		// In no-FROM context (e.g., SELECT COUNT(@@var)), evaluate the argument
@@ -10779,6 +10871,9 @@ func (e *Executor) evalInsertExpr(v *sqlparser.InsertExpr) (interface{}, error) 
 	end := idx + length
 	if end > len(str) {
 		end = len(str)
+	}
+	if end < idx {
+		end = idx
 	}
 
 	// Build result: str[:idx] + newStr + str[end:]
@@ -12870,8 +12965,27 @@ func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator, di
 				}
 				return lv - rv, nil
 			}
-			_ = li
-			_ = ri
+			// Both int64: use integer arithmetic to avoid float precision loss.
+			// Only do this when the result fits in int64 (no overflow).
+			if lIsI64 && rIsI64 {
+				if op == sqlparser.PlusOp {
+					sum := li + ri
+					// Overflow detection: if signs were different from expected, use float
+					if (ri > 0 && sum < li) || (ri < 0 && sum > li) {
+						// Overflow — fall through to float arithmetic
+					} else {
+						return sum, nil
+					}
+				} else { // MinusOp
+					diff := li - ri
+					// Overflow detection
+					if (ri < 0 && diff < li) || (ri > 0 && diff > li) {
+						// Overflow — fall through to float arithmetic
+					} else {
+						return diff, nil
+					}
+				}
+			}
 		}
 	}
 
@@ -13081,6 +13195,12 @@ func formatMySQLFloatString(v float64) string {
 		return s
 	}
 	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
+// FormatMySQLFloat formats a float64 value using MySQL's scientific notation style
+// (trailing zeros stripped, exponent normalized).
+func FormatMySQLFloat(v float64) string {
+	return formatMySQLFloatString(v)
 }
 
 func isStringValue(v interface{}) bool {
@@ -14156,7 +14276,9 @@ func (e *Executor) addAggregatesToRow(expr sqlparser.Expr, row storage.Row, grou
 		e.addAggregatesToRow(v.Left, row, groupRows)
 		e.addAggregatesToRow(v.Right, row, groupRows)
 	case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Max, *sqlparser.Min, *sqlparser.Avg, *sqlparser.GroupConcatExpr,
-		*sqlparser.JSONArrayAgg, *sqlparser.JSONObjectAgg:
+		*sqlparser.JSONArrayAgg, *sqlparser.JSONObjectAgg,
+		*sqlparser.Variance, *sqlparser.VarPop, *sqlparser.VarSamp,
+		*sqlparser.Std, *sqlparser.StdDev, *sqlparser.StdPop, *sqlparser.StdSamp:
 		displayName := aggregateDisplayName(expr)
 		if _, ok := row[displayName]; !ok {
 			repRow := storage.Row{}
@@ -14168,6 +14290,9 @@ func (e *Executor) addAggregatesToRow(expr sqlparser.Expr, row storage.Row, grou
 				row[displayName] = val
 			}
 		}
+	case *sqlparser.IsExpr:
+		// Walk into IS expressions to find aggregates (e.g., avg(x) IS NOT NULL)
+		e.addAggregatesToRow(v.Left, row, groupRows)
 	}
 }
 
