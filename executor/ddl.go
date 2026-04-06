@@ -808,6 +808,13 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		if err := validateNumericTypeSpec(colDef.Type, colDef.Name); err != nil {
 			return nil, mysqlError(1426, "42000", err.Error())
 		}
+		// YEAR column only supports YEAR or YEAR(4).
+		if strings.EqualFold(col.Type.Type, "year") && col.Type.Length != nil {
+			yearLen := int(*col.Type.Length)
+			if yearLen != 4 {
+				return nil, mysqlError(1818, "HY000", "Supports only YEAR or YEAR(4) column.")
+			}
+		}
 
 		if col.Type.Options != nil {
 			if col.Type.Options.As != nil && hasArrayCastExpr(col.Type.Options.As) {
@@ -1576,6 +1583,7 @@ func validateNumericTypeSpec(colType, colName string) error {
 		if m < d {
 			return fmt.Errorf("For float(M,D), double(M,D) or decimal(M,D), M must be >= D (column '%s').", colName)
 		}
+	// YEAR validation is handled separately (different error code)
 	}
 	return nil
 }
