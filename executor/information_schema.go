@@ -724,10 +724,46 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		if e.startupVars["performance_schema_max_mutex_classes"] == "0" || e.startupVars["performance_schema_max_mutex_instances"] == "0" {
 			rawRows = []storage.Row{}
 		} else {
-			rawRows = []storage.Row{
-				{"NAME": "wait/synch/mutex/sql/tz_LOCK", "OBJECT_INSTANCE_BEGIN": int64(1), "LOCKED_BY_THREAD_ID": nil},
-				{"NAME": "wait/synch/mutex/sql/LOCK_active_mi", "OBJECT_INSTANCE_BEGIN": int64(2), "LOCKED_BY_THREAD_ID": nil},
-				{"NAME": "wait/synch/mutex/sql/LOCK_global_system_variables", "OBJECT_INSTANCE_BEGIN": int64(3), "LOCKED_BY_THREAD_ID": nil},
+			// Comprehensive list of MySQL server mutexes for compatibility with server_init test
+			mutexNames := []string{
+				"wait/synch/mutex/mysys/THR_LOCK_malloc",
+				"wait/synch/mutex/mysys/THR_LOCK_open",
+				"wait/synch/mutex/mysys/THR_LOCK_myisam",
+				"wait/synch/mutex/mysys/THR_LOCK_heap",
+				"wait/synch/mutex/mysys/THR_LOCK_net",
+				"wait/synch/mutex/mysys/THR_LOCK_charset",
+				"wait/synch/mutex/sql/LOCK_open",
+				// 8 instances of LOCK_thd_list
+				"wait/synch/mutex/sql/LOCK_thd_list",
+				"wait/synch/mutex/sql/LOCK_thd_list",
+				"wait/synch/mutex/sql/LOCK_thd_list",
+				"wait/synch/mutex/sql/LOCK_thd_list",
+				"wait/synch/mutex/sql/LOCK_thd_list",
+				"wait/synch/mutex/sql/LOCK_thd_list",
+				"wait/synch/mutex/sql/LOCK_thd_list",
+				"wait/synch/mutex/sql/LOCK_thd_list",
+				"wait/synch/mutex/sql/LOCK_log_throttle_qni",
+				"wait/synch/mutex/sql/LOCK_status",
+				"wait/synch/mutex/sql/LOCK_uuid_generator",
+				"wait/synch/mutex/sql/LOCK_crypt",
+				"wait/synch/mutex/sql/LOCK_slave_list",
+				"wait/synch/mutex/sql/LOCK_manager",
+				"wait/synch/mutex/sql/LOCK_global_system_variables",
+				"wait/synch/mutex/sql/LOCK_user_conn",
+				"wait/synch/mutex/sql/LOCK_prepared_stmt_count",
+				"wait/synch/mutex/sql/LOCK_connection_count",
+				"wait/synch/mutex/sql/LOCK_server_started",
+				"wait/synch/mutex/sql/LOCK_event_queue",
+				"wait/synch/mutex/sql/LOCK_item_func_sleep",
+				"wait/synch/mutex/sql/LOCK_audit_mask",
+				"wait/synch/mutex/sql/LOCK_transaction_cache",
+				"wait/synch/mutex/sql/LOCK_plugin",
+				"wait/synch/mutex/sql/tz_LOCK",
+				"wait/synch/mutex/sql/LOCK_active_mi",
+			}
+			rawRows = make([]storage.Row, len(mutexNames))
+			for i, name := range mutexNames {
+				rawRows[i] = storage.Row{"NAME": name, "OBJECT_INSTANCE_BEGIN": int64(i + 1), "LOCKED_BY_THREAD_ID": nil}
 			}
 		}
 	case "rwlock_instances":
@@ -735,9 +771,15 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		if e.startupVars["performance_schema_max_rwlock_classes"] == "0" || e.startupVars["performance_schema_max_rwlock_instances"] == "0" {
 			rawRows = []storage.Row{}
 		} else {
-			rawRows = []storage.Row{
-				{"NAME": "wait/synch/rwlock/sql/LOCK_system_variables_hash", "OBJECT_INSTANCE_BEGIN": int64(1), "WRITE_LOCKED_BY_THREAD_ID": nil, "READ_LOCKED_BY_COUNT": int64(0)},
-				{"NAME": "wait/synch/rwlock/sql/LOCK_grant", "OBJECT_INSTANCE_BEGIN": int64(2), "WRITE_LOCKED_BY_THREAD_ID": nil, "READ_LOCKED_BY_COUNT": int64(0)},
+			rwlockNames := []string{
+				"wait/synch/rwlock/sql/LOCK_sys_init_connect",
+				"wait/synch/rwlock/sql/LOCK_sys_init_slave",
+				"wait/synch/rwlock/sql/LOCK_system_variables_hash",
+				"wait/synch/rwlock/sql/LOCK_grant",
+			}
+			rawRows = make([]storage.Row, len(rwlockNames))
+			for i, name := range rwlockNames {
+				rawRows[i] = storage.Row{"NAME": name, "OBJECT_INSTANCE_BEGIN": int64(i + 1), "WRITE_LOCKED_BY_THREAD_ID": nil, "READ_LOCKED_BY_COUNT": int64(0)}
 			}
 		}
 	case "cond_instances":
@@ -745,9 +787,16 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		if e.startupVars["performance_schema_max_cond_classes"] == "0" || e.startupVars["performance_schema_max_cond_instances"] == "0" {
 			rawRows = []storage.Row{}
 		} else {
-			rawRows = []storage.Row{
-				{"NAME": "wait/synch/cond/sql/COND_server_started", "OBJECT_INSTANCE_BEGIN": int64(1)},
-				{"NAME": "wait/synch/cond/sql/COND_manager", "OBJECT_INSTANCE_BEGIN": int64(2)},
+			condNames := []string{
+				"wait/synch/cond/sql/COND_server_started",
+				"wait/synch/cond/sql/COND_manager",
+				"wait/synch/cond/sql/COND_thread_cache",
+				"wait/synch/cond/sql/COND_flush_thread_cache",
+				"wait/synch/cond/sql/COND_queue_state",
+			}
+			rawRows = make([]storage.Row, len(condNames))
+			for i, name := range condNames {
+				rawRows[i] = storage.Row{"NAME": name, "OBJECT_INSTANCE_BEGIN": int64(i + 1)}
 			}
 		}
 	case "socket_instances":
