@@ -175,20 +175,20 @@ var infoSchemaColumnOrder = map[string][]string{
 	"events_stages_summary_by_thread_by_event_name":  {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
 	"events_stages_summary_by_user_by_event_name":    {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
 	"events_stages_summary_global_by_event_name":     {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"events_statements_summary_by_account_by_event_name": {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED"},
+	"events_statements_summary_by_account_by_event_name": {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
 	"events_statements_summary_by_digest":           {"SCHEMA_NAME", "DIGEST", "DIGEST_TEXT", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED", "FIRST_SEEN", "LAST_SEEN", "QUANTILE_95", "QUANTILE_99", "QUANTILE_999", "QUERY_SAMPLE_TEXT", "QUERY_SAMPLE_SEEN", "QUERY_SAMPLE_TIMER_WAIT"},
-	"events_statements_summary_by_host_by_event_name":   {"HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED"},
-	"events_statements_summary_by_thread_by_event_name": {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED"},
-	"events_statements_summary_by_user_by_event_name":   {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED"},
-	"events_statements_summary_global_by_event_name":    {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED"},
+	"events_statements_summary_by_host_by_event_name":   {"HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
+	"events_statements_summary_by_thread_by_event_name": {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
+	"events_statements_summary_by_user_by_event_name":   {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
+	"events_statements_summary_global_by_event_name":    {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
 	"events_statements_summary_by_program":   {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "COUNT_STATEMENTS", "SUM_STATEMENTS_WAIT", "MIN_STATEMENTS_WAIT", "AVG_STATEMENTS_WAIT", "MAX_STATEMENTS_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
 	"events_statements_histogram_by_digest":  {"SCHEMA_NAME", "DIGEST", "BUCKET_NUMBER", "BUCKET_TIMER_LOW", "BUCKET_TIMER_HIGH", "COUNT_BUCKET", "COUNT_BUCKET_AND_LOWER", "BUCKET_QUANTILE"},
 	"events_statements_histogram_global":     {"BUCKET_NUMBER", "BUCKET_TIMER_LOW", "BUCKET_TIMER_HIGH", "COUNT_BUCKET", "COUNT_BUCKET_AND_LOWER", "BUCKET_QUANTILE"},
-	"events_transactions_summary_by_account_by_event_name": {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"events_transactions_summary_by_host_by_event_name":    {"HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"events_transactions_summary_by_thread_by_event_name":  {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"events_transactions_summary_by_user_by_event_name":    {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"events_transactions_summary_global_by_event_name":     {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_transactions_summary_by_account_by_event_name": {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "COUNT_READ_WRITE", "SUM_TIMER_READ_WRITE", "MIN_TIMER_READ_WRITE", "AVG_TIMER_READ_WRITE", "MAX_TIMER_READ_WRITE", "COUNT_READ_ONLY", "SUM_TIMER_READ_ONLY", "MIN_TIMER_READ_ONLY", "AVG_TIMER_READ_ONLY", "MAX_TIMER_READ_ONLY"},
+	"events_transactions_summary_by_host_by_event_name":    {"HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "COUNT_READ_WRITE", "SUM_TIMER_READ_WRITE", "MIN_TIMER_READ_WRITE", "AVG_TIMER_READ_WRITE", "MAX_TIMER_READ_WRITE", "COUNT_READ_ONLY", "SUM_TIMER_READ_ONLY", "MIN_TIMER_READ_ONLY", "AVG_TIMER_READ_ONLY", "MAX_TIMER_READ_ONLY"},
+	"events_transactions_summary_by_thread_by_event_name":  {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "COUNT_READ_WRITE", "SUM_TIMER_READ_WRITE", "MIN_TIMER_READ_WRITE", "AVG_TIMER_READ_WRITE", "MAX_TIMER_READ_WRITE", "COUNT_READ_ONLY", "SUM_TIMER_READ_ONLY", "MIN_TIMER_READ_ONLY", "AVG_TIMER_READ_ONLY", "MAX_TIMER_READ_ONLY"},
+	"events_transactions_summary_by_user_by_event_name":    {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "COUNT_READ_WRITE", "SUM_TIMER_READ_WRITE", "MIN_TIMER_READ_WRITE", "AVG_TIMER_READ_WRITE", "MAX_TIMER_READ_WRITE", "COUNT_READ_ONLY", "SUM_TIMER_READ_ONLY", "MIN_TIMER_READ_ONLY", "AVG_TIMER_READ_ONLY", "MAX_TIMER_READ_ONLY"},
+	"events_transactions_summary_global_by_event_name":     {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "COUNT_READ_WRITE", "SUM_TIMER_READ_WRITE", "MIN_TIMER_READ_WRITE", "AVG_TIMER_READ_WRITE", "MAX_TIMER_READ_WRITE", "COUNT_READ_ONLY", "SUM_TIMER_READ_ONLY", "MIN_TIMER_READ_ONLY", "AVG_TIMER_READ_ONLY", "MAX_TIMER_READ_ONLY"},
 	"events_errors_summary_by_account_by_error": {"USER", "HOST", "ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
 	"events_errors_summary_by_host_by_error":    {"HOST", "ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
 	"events_errors_summary_by_thread_by_error":  {"THREAD_ID", "ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
@@ -283,12 +283,13 @@ var perfSchemaColumnOrder = map[string]bool{
 	"replication_applier_filters": true, "replication_applier_global_filters": true,
 	"replication_group_members": true, "replication_group_member_stats": true,
 	"keyring_keys": true, "host_cache": true, "log_status": true,
-	"objects_summary_global_by_type": true, "prepared_statements_instances": true,
+	"prepared_statements_instances": true,
 	"user_defined_functions": true, "user_variables_by_thread": true,
 	"session_connect_attrs": true, "session_account_connect_attrs": true,
 	"metadata_locks": true, "data_locks": true, "data_lock_waits": true,
 	"setup_consumers": true, "setup_actors": true, "performance_timers": true,
 	"threads": true,
+	"objects_summary_global_by_type": true,
 }
 // perfSchemaCreateTable maps performance_schema table names to their CREATE TABLE statements.
 // These are fixed MySQL system table definitions.
@@ -406,12 +407,8 @@ var emptyStubTables = map[string]bool{
 	"metadata_locks":             true,
 	"data_locks":                 true,
 	"data_lock_waits":            true,
-	"mutex_instances":            true,
-	"rwlock_instances":           true,
-	"cond_instances":             true,
 	"file_instances":             true,
 	"file_summary_by_instance":   true,
-	"socket_instances":           true,
 	"socket_summary_by_instance":    true,
 	"table_handles":              true,
 	// table_io_waits_summary_by_table, table_io_waits_summary_by_index_usage,
@@ -465,12 +462,12 @@ var psSummaryTables = map[string]psSummaryDef{
 	"events_statements_summary_by_thread_by_event_name":  {disableVar: "performance_schema_max_statement_classes", seedFn: func(e *Executor) []storage.Row { return e.perfSchemaSeedStmtByThreadByEventName() }},
 	"events_statements_summary_by_user_by_event_name":    {disableVar: "performance_schema_max_statement_classes", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedStmtByUserByEventName() }},
 	"events_statements_summary_global_by_event_name":     {disableVar: "performance_schema_max_statement_classes", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedStmtGlobalByEventName() }},
-	// transaction summaries
-	"events_transactions_summary_by_account_by_event_name": {disableClass: "transaction", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByAccountByEventName(psTxnEventNames) }},
-	"events_transactions_summary_by_host_by_event_name":    {disableClass: "transaction", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByHostByEventName(psTxnEventNames) }},
-	"events_transactions_summary_by_thread_by_event_name":  {disableClass: "transaction", seedFn: func(e *Executor) []storage.Row { return e.perfSchemaSeedByThreadByEventName(psTxnEventNames) }},
-	"events_transactions_summary_by_user_by_event_name":    {disableClass: "transaction", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByUserByEventName(psTxnEventNames) }},
-	"events_transactions_summary_global_by_event_name":     {disableClass: "transaction", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedGlobalByEventName(psTxnEventNames) }},
+	// transaction summaries (include COUNT_READ_WRITE, COUNT_READ_ONLY, etc.)
+	"events_transactions_summary_by_account_by_event_name": {disableClass: "transaction", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedTxnByAccountByEventName() }},
+	"events_transactions_summary_by_host_by_event_name":    {disableClass: "transaction", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedTxnByHostByEventName() }},
+	"events_transactions_summary_by_thread_by_event_name":  {disableClass: "transaction", seedFn: func(e *Executor) []storage.Row { return e.perfSchemaSeedTxnByThreadByEventName() }},
+	"events_transactions_summary_by_user_by_event_name":    {disableClass: "transaction", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedTxnByUserByEventName() }},
+	"events_transactions_summary_global_by_event_name":     {disableClass: "transaction", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedTxnGlobalByEventName() }},
 }
 
 // isInformationSchemaTable returns (dbName, tableName, true) when the provided
@@ -720,6 +717,48 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.perfSchemaTableIOWaitsByIndexUsage()
 	case "table_lock_waits_summary_by_table":
 		rawRows = e.perfSchemaTableLockWaitsByTable()
+	case "objects_summary_global_by_type":
+		rawRows = e.perfSchemaObjectsSummaryGlobalByType()
+	case "mutex_instances":
+		// Empty when max_mutex_classes=0 or max_mutex_instances=0
+		if e.startupVars["performance_schema_max_mutex_classes"] == "0" || e.startupVars["performance_schema_max_mutex_instances"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"NAME": "wait/synch/mutex/sql/tz_LOCK", "OBJECT_INSTANCE_BEGIN": int64(1), "LOCKED_BY_THREAD_ID": nil},
+				{"NAME": "wait/synch/mutex/sql/LOCK_active_mi", "OBJECT_INSTANCE_BEGIN": int64(2), "LOCKED_BY_THREAD_ID": nil},
+				{"NAME": "wait/synch/mutex/sql/LOCK_global_system_variables", "OBJECT_INSTANCE_BEGIN": int64(3), "LOCKED_BY_THREAD_ID": nil},
+			}
+		}
+	case "rwlock_instances":
+		// Empty when max_rwlock_classes=0 or max_rwlock_instances=0
+		if e.startupVars["performance_schema_max_rwlock_classes"] == "0" || e.startupVars["performance_schema_max_rwlock_instances"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"NAME": "wait/synch/rwlock/sql/LOCK_system_variables_hash", "OBJECT_INSTANCE_BEGIN": int64(1), "WRITE_LOCKED_BY_THREAD_ID": nil, "READ_LOCKED_BY_COUNT": int64(0)},
+				{"NAME": "wait/synch/rwlock/sql/LOCK_grant", "OBJECT_INSTANCE_BEGIN": int64(2), "WRITE_LOCKED_BY_THREAD_ID": nil, "READ_LOCKED_BY_COUNT": int64(0)},
+			}
+		}
+	case "cond_instances":
+		// Empty when max_cond_classes=0 or max_cond_instances=0
+		if e.startupVars["performance_schema_max_cond_classes"] == "0" || e.startupVars["performance_schema_max_cond_instances"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"NAME": "wait/synch/cond/sql/COND_server_started", "OBJECT_INSTANCE_BEGIN": int64(1)},
+				{"NAME": "wait/synch/cond/sql/COND_manager", "OBJECT_INSTANCE_BEGIN": int64(2)},
+			}
+		}
+	case "socket_instances":
+		// Empty when max_socket_classes=0 or max_socket_instances=0
+		if e.startupVars["performance_schema_max_socket_classes"] == "0" || e.startupVars["performance_schema_max_socket_instances"] == "0" {
+			rawRows = []storage.Row{}
+		} else {
+			rawRows = []storage.Row{
+				{"EVENT_NAME": "wait/io/socket/sql/client_connection", "OBJECT_INSTANCE_BEGIN": int64(1), "THREAD_ID": e.connectionID + 1, "SOCKET_ID": int64(1), "IP": "127.0.0.1", "PORT": int64(3306), "STATE": "ACTIVE"},
+			}
+		}
 	case "events_waits_current":
 		rawRows = []storage.Row{
 			{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "wait/lock/table/sql/handler", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "SPINS": nil, "OBJECT_SCHEMA": nil, "OBJECT_NAME": nil, "INDEX_NAME": nil, "OBJECT_TYPE": nil, "OBJECT_INSTANCE_BEGIN": int64(0), "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil, "OPERATION": "lock", "NUMBER_OF_BYTES": nil, "FLAGS": nil},
@@ -905,11 +944,6 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = perfSchemaSeedMemByUserByEventName()
 	case "memory_summary_global_by_event_name":
 		rawRows = e.perfSchemaMemorySummary()
-	case "objects_summary_global_by_type":
-		rawRows = []storage.Row{
-			{"OBJECT_TYPE": "TABLE", "OBJECT_SCHEMA": "test", "OBJECT_NAME": "t1", "COUNT_STAR": int64(0), "SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0), "AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0)},
-			{"OBJECT_TYPE": "TABLE", "OBJECT_SCHEMA": "performance_schema", "OBJECT_NAME": "accounts", "COUNT_STAR": int64(0), "SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0), "AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0)},
-		}
 	case "setup_consumers":
 		consumers := []string{
 			"events_stages_current", "events_stages_history", "events_stages_history_long",
@@ -2674,6 +2708,39 @@ func (e *Executor) perfSchemaUserTableRows(fn func(dbName, tblName string, tbl *
 	}
 }
 
+// perfSchemaObjectsSummaryGlobalByType returns rows for objects_summary_global_by_type.
+// It returns one row per table across all databases (user tables + key system tables).
+func (e *Executor) perfSchemaObjectsSummaryGlobalByType() []storage.Row {
+	var rows []storage.Row
+	dbNames := e.Catalog.ListDatabases()
+	sort.Strings(dbNames)
+	for _, dbName := range dbNames {
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		tblNames := db.ListTables()
+		sort.Strings(tblNames)
+		for _, tblName := range tblNames {
+			// Skip temporary tables — they are not tracked in performance_schema.
+			if e.tempTables != nil && (e.tempTables[tblName] || e.tempTables[strings.ToLower(tblName)]) {
+				continue
+			}
+			rows = append(rows, storage.Row{
+				"OBJECT_TYPE":      "TABLE",
+				"OBJECT_SCHEMA":    dbName,
+				"OBJECT_NAME":      tblName,
+				"COUNT_STAR":       int64(0),
+				"SUM_TIMER_WAIT":   int64(0),
+				"MIN_TIMER_WAIT":   int64(0),
+				"AVG_TIMER_WAIT":   int64(0),
+				"MAX_TIMER_WAIT":   int64(0),
+			})
+		}
+	}
+	return rows
+}
+
 // perfSchemaTableIOWaitsByTable returns one zero-count row per user table.
 func (e *Executor) perfSchemaTableIOWaitsByTable() []storage.Row {
 	var rows []storage.Row
@@ -3853,29 +3920,47 @@ func (e *Executor) infoSchemaTableConstraints() []storage.Row {
 
 // infoSchemaCharacterSets returns rows for INFORMATION_SCHEMA.CHARACTER_SETS.
 func (e *Executor) infoSchemaCharacterSets() []storage.Row {
-	return []storage.Row{
-		{"CHARACTER_SET_NAME": "utf8mb4", "DEFAULT_COLLATE_NAME": "utf8mb4_general_ci", "DESCRIPTION": "UTF-8 Unicode", "MAXLEN": int64(4)},
-		{"CHARACTER_SET_NAME": "utf8mb3", "DEFAULT_COLLATE_NAME": "utf8mb3_general_ci", "DESCRIPTION": "UTF-8 Unicode", "MAXLEN": int64(3)},
-		{"CHARACTER_SET_NAME": "utf8", "DEFAULT_COLLATE_NAME": "utf8_general_ci", "DESCRIPTION": "UTF-8 Unicode", "MAXLEN": int64(3)},
-		{"CHARACTER_SET_NAME": "latin1", "DEFAULT_COLLATE_NAME": "latin1_swedish_ci", "DESCRIPTION": "cp1252 West European", "MAXLEN": int64(1)},
-		{"CHARACTER_SET_NAME": "binary", "DEFAULT_COLLATE_NAME": "binary", "DESCRIPTION": "Binary pseudo charset", "MAXLEN": int64(1)},
-		{"CHARACTER_SET_NAME": "ascii", "DEFAULT_COLLATE_NAME": "ascii_general_ci", "DESCRIPTION": "US ASCII", "MAXLEN": int64(1)},
+	// Build from allCharsets() which has all 41 MySQL 8.0 charsets.
+	// allCharsets() columns: [name, description, default_collation, maxlen]
+	charsets := allCharsets()
+	rows := make([]storage.Row, 0, len(charsets))
+	for _, cs := range charsets {
+		name := cs[0].(string)
+		desc := cs[1].(string)
+		defaultColl := cs[2].(string)
+		maxlen := cs[3].(int64)
+		rows = append(rows, storage.Row{
+			"CHARACTER_SET_NAME":  name,
+			"DEFAULT_COLLATE_NAME": defaultColl,
+			"DESCRIPTION":         desc,
+			"MAXLEN":              maxlen,
+		})
 	}
+	return rows
 }
 
 // infoSchemaCollations returns rows for INFORMATION_SCHEMA.COLLATIONS.
 func (e *Executor) infoSchemaCollations() []storage.Row {
-	return []storage.Row{
-		{"COLLATION_NAME": "utf8mb4_general_ci", "CHARACTER_SET_NAME": "utf8mb4", "ID": int64(45), "IS_DEFAULT": "Yes", "IS_COMPILED": "Yes", "SORTLEN": int64(1), "PAD_ATTRIBUTE": "PAD SPACE"},
-		{"COLLATION_NAME": "utf8mb4_bin", "CHARACTER_SET_NAME": "utf8mb4", "ID": int64(46), "IS_DEFAULT": "", "IS_COMPILED": "Yes", "SORTLEN": int64(1), "PAD_ATTRIBUTE": "PAD SPACE"},
-		{"COLLATION_NAME": "utf8mb4_0900_ai_ci", "CHARACTER_SET_NAME": "utf8mb4", "ID": int64(255), "IS_DEFAULT": "", "IS_COMPILED": "Yes", "SORTLEN": int64(0), "PAD_ATTRIBUTE": "NO PAD"},
-		{"COLLATION_NAME": "utf8_general_ci", "CHARACTER_SET_NAME": "utf8", "ID": int64(33), "IS_DEFAULT": "Yes", "IS_COMPILED": "Yes", "SORTLEN": int64(1), "PAD_ATTRIBUTE": "PAD SPACE"},
-		{"COLLATION_NAME": "utf8_bin", "CHARACTER_SET_NAME": "utf8", "ID": int64(83), "IS_DEFAULT": "", "IS_COMPILED": "Yes", "SORTLEN": int64(1), "PAD_ATTRIBUTE": "PAD SPACE"},
-		{"COLLATION_NAME": "latin1_swedish_ci", "CHARACTER_SET_NAME": "latin1", "ID": int64(8), "IS_DEFAULT": "Yes", "IS_COMPILED": "Yes", "SORTLEN": int64(1), "PAD_ATTRIBUTE": "PAD SPACE"},
-		{"COLLATION_NAME": "latin1_bin", "CHARACTER_SET_NAME": "latin1", "ID": int64(47), "IS_DEFAULT": "", "IS_COMPILED": "Yes", "SORTLEN": int64(1), "PAD_ATTRIBUTE": "PAD SPACE"},
-		{"COLLATION_NAME": "binary", "CHARACTER_SET_NAME": "binary", "ID": int64(63), "IS_DEFAULT": "Yes", "IS_COMPILED": "Yes", "SORTLEN": int64(1), "PAD_ATTRIBUTE": "NO PAD"},
-		{"COLLATION_NAME": "ascii_general_ci", "CHARACTER_SET_NAME": "ascii", "ID": int64(11), "IS_DEFAULT": "Yes", "IS_COMPILED": "Yes", "SORTLEN": int64(1), "PAD_ATTRIBUTE": "PAD SPACE"},
+	// Build from allCollations() which has all MySQL collations.
+	// allCollations() columns: [Collation, Charset, Id, Default, Compiled, Sortlen, Pad_attribute]
+	colls := allCollations()
+	rows := make([]storage.Row, 0, len(colls))
+	for _, c := range colls {
+		isDefault := ""
+		if c[3].(string) == "Yes" {
+			isDefault = "Yes"
+		}
+		rows = append(rows, storage.Row{
+			"COLLATION_NAME":     c[0].(string),
+			"CHARACTER_SET_NAME": c[1].(string),
+			"ID":                 c[2].(int64),
+			"IS_DEFAULT":         isDefault,
+			"IS_COMPILED":        c[4].(string),
+			"SORTLEN":            c[5].(int64),
+			"PAD_ATTRIBUTE":      c[6].(string),
+		})
 	}
+	return rows
 }
 
 // infoSchemaCollCharSetAppl returns rows for INFORMATION_SCHEMA.COLLATION_CHARACTER_SET_APPLICABILITY.
@@ -4389,6 +4474,103 @@ func perfSchemaSeedByUserByEventName(names []string) []storage.Row {
 	return rows
 }
 
+// txnExtraColumns returns the extra columns for transaction summary rows.
+func txnExtraColumns() storage.Row {
+	return storage.Row{
+		"COUNT_READ_WRITE": int64(0), "SUM_TIMER_READ_WRITE": int64(0),
+		"MIN_TIMER_READ_WRITE": int64(0), "AVG_TIMER_READ_WRITE": int64(0), "MAX_TIMER_READ_WRITE": int64(0),
+		"COUNT_READ_ONLY": int64(0), "SUM_TIMER_READ_ONLY": int64(0),
+		"MIN_TIMER_READ_ONLY": int64(0), "AVG_TIMER_READ_ONLY": int64(0), "MAX_TIMER_READ_ONLY": int64(0),
+	}
+}
+
+func perfSchemaSeedTxnGlobalByEventName() []storage.Row {
+	rows := make([]storage.Row, 0, len(psTxnEventNames))
+	for _, n := range psTxnEventNames {
+		row := storage.Row{
+			"EVENT_NAME": n, "COUNT_STAR": int64(0),
+			"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
+			"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+		}
+		for k, v := range txnExtraColumns() {
+			row[k] = v
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func (e *Executor) perfSchemaSeedTxnByThreadByEventName() []storage.Row {
+	tid := e.connectionID + 1
+	rows := make([]storage.Row, 0, len(psTxnEventNames))
+	for _, n := range psTxnEventNames {
+		row := storage.Row{
+			"THREAD_ID": tid, "EVENT_NAME": n, "COUNT_STAR": int64(0),
+			"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
+			"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+		}
+		for k, v := range txnExtraColumns() {
+			row[k] = v
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func perfSchemaSeedTxnByAccountByEventName() []storage.Row {
+	users := []string{"root", "foo"}
+	rows := make([]storage.Row, 0, len(psTxnEventNames)*len(users))
+	for _, u := range users {
+		for _, n := range psTxnEventNames {
+			row := storage.Row{
+				"USER": u, "HOST": "localhost", "EVENT_NAME": n, "COUNT_STAR": int64(0),
+				"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
+				"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+			}
+			for k, v := range txnExtraColumns() {
+				row[k] = v
+			}
+			rows = append(rows, row)
+		}
+	}
+	return rows
+}
+
+func perfSchemaSeedTxnByHostByEventName() []storage.Row {
+	rows := make([]storage.Row, 0, len(psTxnEventNames))
+	for _, n := range psTxnEventNames {
+		row := storage.Row{
+			"HOST": "localhost", "EVENT_NAME": n, "COUNT_STAR": int64(0),
+			"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
+			"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+		}
+		for k, v := range txnExtraColumns() {
+			row[k] = v
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func perfSchemaSeedTxnByUserByEventName() []storage.Row {
+	users := []string{"root", "foo"}
+	rows := make([]storage.Row, 0, len(psTxnEventNames)*len(users))
+	for _, u := range users {
+		for _, n := range psTxnEventNames {
+			row := storage.Row{
+				"USER": u, "EVENT_NAME": n, "COUNT_STAR": int64(0),
+				"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
+				"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+			}
+			for k, v := range txnExtraColumns() {
+				row[k] = v
+			}
+			rows = append(rows, row)
+		}
+	}
+	return rows
+}
+
 // -- Statement summary helpers (extra columns vs waits/stages/txn) --
 
 func perfSchemaSeedStmtGlobalByEventName() []storage.Row {
@@ -4398,9 +4580,17 @@ func perfSchemaSeedStmtGlobalByEventName() []storage.Row {
 			"EVENT_NAME": n, "COUNT_STAR": int64(0),
 			"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
 			"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+			"SUM_LOCK_TIME": int64(0),
 			"SUM_ERRORS": int64(0), "SUM_WARNINGS": int64(0),
 			"SUM_ROWS_AFFECTED": int64(0), "SUM_ROWS_SENT": int64(0),
 			"SUM_ROWS_EXAMINED": int64(0),
+			"SUM_CREATED_TMP_DISK_TABLES": int64(0), "SUM_CREATED_TMP_TABLES": int64(0),
+			"SUM_SELECT_FULL_JOIN": int64(0), "SUM_SELECT_FULL_RANGE_JOIN": int64(0),
+			"SUM_SELECT_RANGE": int64(0), "SUM_SELECT_RANGE_CHECK": int64(0),
+			"SUM_SELECT_SCAN": int64(0),
+			"SUM_SORT_MERGE_PASSES": int64(0), "SUM_SORT_RANGE": int64(0),
+			"SUM_SORT_ROWS": int64(0), "SUM_SORT_SCAN": int64(0),
+			"SUM_NO_INDEX_USED": int64(0), "SUM_NO_GOOD_INDEX_USED": int64(0),
 		})
 	}
 	return rows
@@ -4414,9 +4604,17 @@ func (e *Executor) perfSchemaSeedStmtByThreadByEventName() []storage.Row {
 			"THREAD_ID": tid, "EVENT_NAME": n, "COUNT_STAR": int64(0),
 			"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
 			"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+			"SUM_LOCK_TIME": int64(0),
 			"SUM_ERRORS": int64(0), "SUM_WARNINGS": int64(0),
 			"SUM_ROWS_AFFECTED": int64(0), "SUM_ROWS_SENT": int64(0),
 			"SUM_ROWS_EXAMINED": int64(0),
+			"SUM_CREATED_TMP_DISK_TABLES": int64(0), "SUM_CREATED_TMP_TABLES": int64(0),
+			"SUM_SELECT_FULL_JOIN": int64(0), "SUM_SELECT_FULL_RANGE_JOIN": int64(0),
+			"SUM_SELECT_RANGE": int64(0), "SUM_SELECT_RANGE_CHECK": int64(0),
+			"SUM_SELECT_SCAN": int64(0),
+			"SUM_SORT_MERGE_PASSES": int64(0), "SUM_SORT_RANGE": int64(0),
+			"SUM_SORT_ROWS": int64(0), "SUM_SORT_SCAN": int64(0),
+			"SUM_NO_INDEX_USED": int64(0), "SUM_NO_GOOD_INDEX_USED": int64(0),
 		})
 	}
 	return rows
@@ -4431,9 +4629,17 @@ func perfSchemaSeedStmtByAccountByEventName() []storage.Row {
 				"USER": u, "HOST": "localhost", "EVENT_NAME": n, "COUNT_STAR": int64(0),
 				"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
 				"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+				"SUM_LOCK_TIME": int64(0),
 				"SUM_ERRORS": int64(0), "SUM_WARNINGS": int64(0),
 				"SUM_ROWS_AFFECTED": int64(0), "SUM_ROWS_SENT": int64(0),
 				"SUM_ROWS_EXAMINED": int64(0),
+				"SUM_CREATED_TMP_DISK_TABLES": int64(0), "SUM_CREATED_TMP_TABLES": int64(0),
+				"SUM_SELECT_FULL_JOIN": int64(0), "SUM_SELECT_FULL_RANGE_JOIN": int64(0),
+				"SUM_SELECT_RANGE": int64(0), "SUM_SELECT_RANGE_CHECK": int64(0),
+				"SUM_SELECT_SCAN": int64(0),
+				"SUM_SORT_MERGE_PASSES": int64(0), "SUM_SORT_RANGE": int64(0),
+				"SUM_SORT_ROWS": int64(0), "SUM_SORT_SCAN": int64(0),
+				"SUM_NO_INDEX_USED": int64(0), "SUM_NO_GOOD_INDEX_USED": int64(0),
 			})
 		}
 	}
@@ -4447,9 +4653,17 @@ func perfSchemaSeedStmtByHostByEventName() []storage.Row {
 			"HOST": "localhost", "EVENT_NAME": n, "COUNT_STAR": int64(0),
 			"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
 			"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+			"SUM_LOCK_TIME": int64(0),
 			"SUM_ERRORS": int64(0), "SUM_WARNINGS": int64(0),
 			"SUM_ROWS_AFFECTED": int64(0), "SUM_ROWS_SENT": int64(0),
 			"SUM_ROWS_EXAMINED": int64(0),
+			"SUM_CREATED_TMP_DISK_TABLES": int64(0), "SUM_CREATED_TMP_TABLES": int64(0),
+			"SUM_SELECT_FULL_JOIN": int64(0), "SUM_SELECT_FULL_RANGE_JOIN": int64(0),
+			"SUM_SELECT_RANGE": int64(0), "SUM_SELECT_RANGE_CHECK": int64(0),
+			"SUM_SELECT_SCAN": int64(0),
+			"SUM_SORT_MERGE_PASSES": int64(0), "SUM_SORT_RANGE": int64(0),
+			"SUM_SORT_ROWS": int64(0), "SUM_SORT_SCAN": int64(0),
+			"SUM_NO_INDEX_USED": int64(0), "SUM_NO_GOOD_INDEX_USED": int64(0),
 		})
 	}
 	return rows
@@ -4464,9 +4678,17 @@ func perfSchemaSeedStmtByUserByEventName() []storage.Row {
 				"USER": u, "EVENT_NAME": n, "COUNT_STAR": int64(0),
 				"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
 				"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
+				"SUM_LOCK_TIME": int64(0),
 				"SUM_ERRORS": int64(0), "SUM_WARNINGS": int64(0),
 				"SUM_ROWS_AFFECTED": int64(0), "SUM_ROWS_SENT": int64(0),
 				"SUM_ROWS_EXAMINED": int64(0),
+				"SUM_CREATED_TMP_DISK_TABLES": int64(0), "SUM_CREATED_TMP_TABLES": int64(0),
+				"SUM_SELECT_FULL_JOIN": int64(0), "SUM_SELECT_FULL_RANGE_JOIN": int64(0),
+				"SUM_SELECT_RANGE": int64(0), "SUM_SELECT_RANGE_CHECK": int64(0),
+				"SUM_SELECT_SCAN": int64(0),
+				"SUM_SORT_MERGE_PASSES": int64(0), "SUM_SORT_RANGE": int64(0),
+				"SUM_SORT_ROWS": int64(0), "SUM_SORT_SCAN": int64(0),
+				"SUM_NO_INDEX_USED": int64(0), "SUM_NO_GOOD_INDEX_USED": int64(0),
 			})
 		}
 	}
@@ -4750,6 +4972,54 @@ func (e *Executor) perfSchemaVariablesByThread() []storage.Row {
 func (e *Executor) perfSchemaESMSByDigest() []storage.Row {
 	if e.psTruncated["events_statements_summary_by_digest"] && len(e.psDigests) == 0 {
 		return []storage.Row{}
+	}
+	// When digests_size=0, the table is disabled — return empty.
+	if v, ok := e.startupVars["performance_schema_digests_size"]; ok && v == "0" {
+		return []storage.Row{}
+	}
+	// When digests_size=N and N is very small (e.g. 1), the table fills up
+	// immediately. Show a NULL overflow row to indicate the table is full.
+	if v, ok := e.startupVars["performance_schema_digests_size"]; ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 && n <= 1 {
+			// Table has a capacity of 1 and is already full (overflow indicator).
+			return []storage.Row{{
+				"SCHEMA_NAME":                 nil,
+				"DIGEST":                      nil,
+				"DIGEST_TEXT":                  nil,
+				"COUNT_STAR":                   int64(0),
+				"SUM_TIMER_WAIT":              int64(0),
+				"MIN_TIMER_WAIT":              int64(0),
+				"AVG_TIMER_WAIT":              int64(0),
+				"MAX_TIMER_WAIT":              int64(0),
+				"SUM_LOCK_TIME":               int64(0),
+				"SUM_ERRORS":                  int64(0),
+				"SUM_WARNINGS":                int64(0),
+				"SUM_ROWS_AFFECTED":           int64(0),
+				"SUM_ROWS_SENT":               int64(0),
+				"SUM_ROWS_EXAMINED":           int64(0),
+				"SUM_CREATED_TMP_DISK_TABLES": int64(0),
+				"SUM_CREATED_TMP_TABLES":      int64(0),
+				"SUM_SELECT_FULL_JOIN":        int64(0),
+				"SUM_SELECT_FULL_RANGE_JOIN":  int64(0),
+				"SUM_SELECT_RANGE":            int64(0),
+				"SUM_SELECT_RANGE_CHECK":      int64(0),
+				"SUM_SELECT_SCAN":             int64(0),
+				"SUM_SORT_MERGE_PASSES":       int64(0),
+				"SUM_SORT_RANGE":              int64(0),
+				"SUM_SORT_ROWS":               int64(0),
+				"SUM_SORT_SCAN":               int64(0),
+				"SUM_NO_INDEX_USED":           int64(0),
+				"SUM_NO_GOOD_INDEX_USED":      int64(0),
+				"FIRST_SEEN":                  "2024-01-01 00:00:00.000000",
+				"LAST_SEEN":                   "2024-01-01 00:00:00.000000",
+				"QUANTILE_95":                 int64(0),
+				"QUANTILE_99":                 int64(0),
+				"QUANTILE_999":                int64(0),
+				"QUERY_SAMPLE_TEXT":           nil,
+				"QUERY_SAMPLE_SEEN":           "2024-01-01 00:00:00.000000",
+				"QUERY_SAMPLE_TIMER_WAIT":     int64(0),
+			}}
+		}
 	}
 	rows := make([]storage.Row, 0, len(e.psDigests))
 	for _, d := range e.psDigests {

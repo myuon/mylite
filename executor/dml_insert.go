@@ -155,6 +155,11 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		tableName = baseTable
 	}
 
+	// Reject INSERT on information_schema tables.
+	if strings.EqualFold(insertDB, "information_schema") {
+		return nil, mysqlError(1044, "42000", fmt.Sprintf("Access denied for user 'root'@'localhost' to database 'information_schema'"))
+	}
+
 	// Reject INSERT on performance_schema tables (except writable setup tables)
 	if strings.EqualFold(insertDB, "performance_schema") {
 		lowerTable := strings.ToLower(tableName)

@@ -1569,6 +1569,10 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 		if !table.Qualifier.IsEmpty() {
 			dbName = table.Qualifier.String()
 		}
+		// Reject DROP TABLE on information_schema tables.
+		if strings.EqualFold(dbName, "information_schema") {
+			return nil, mysqlError(1044, "42000", "Access denied for user 'root'@'localhost' to database 'information_schema'")
+		}
 		// Protect MySQL log tables from DROP when logging is enabled
 		if isMySQLLogTable(dbName, tableName) && e.isLogTableLoggingEnabled(tableName) {
 			return nil, mysqlError(1580, "HY000", "You cannot 'DROP' a log table if logging is enabled")
@@ -1705,6 +1709,11 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 	if !stmt.Table.Qualifier.IsEmpty() {
 		dbName = stmt.Table.Qualifier.String()
 	}
+	// Reject DDL on information_schema tables.
+	if strings.EqualFold(dbName, "information_schema") {
+		return nil, mysqlError(1044, "42000", "Access denied for user 'root'@'localhost' to database 'information_schema'")
+	}
+
 	// Reject DDL on performance_schema tables
 	if strings.EqualFold(dbName, "performance_schema") {
 		return nil, mysqlError(1044, "42000", "Access denied for user 'root'@'localhost' to database 'performance_schema'")
@@ -3009,6 +3018,11 @@ func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, er
 	if q := stmt.Table.Qualifier.String(); q != "" {
 		dbName = q
 	}
+	// Reject TRUNCATE on information_schema tables.
+	if strings.EqualFold(dbName, "information_schema") {
+		return nil, mysqlError(1044, "42000", "Access denied for user 'root'@'localhost' to database 'information_schema'")
+	}
+
 	// Handle performance_schema tables
 	if strings.EqualFold(dbName, "performance_schema") {
 		if perfSchemaTruncateDenied(tableName) {

@@ -1042,8 +1042,10 @@ func (ctx *execContext) executeLines(lines []string) error {
 					if rl == "" {
 						continue
 					}
+					// Always apply variable substitution in echoed lines (not just in eval mode).
+					// mysqltest substitutes variables in compound statement bodies when echoing.
+					rl = ctx.substituteVars(rl)
 					if isEval {
-						rl = ctx.substituteVars(rl)
 						rl = stripUndefinedVars(rl)
 					}
 					if len(ctx.replaceResult) > 0 {
@@ -2249,7 +2251,8 @@ func (ctx *execContext) executeSQLInner(stmt string) error {
 		strings.HasPrefix(upper, "CHECK ") ||
 		strings.HasPrefix(upper, "CHECKSUM ") ||
 		strings.HasPrefix(upper, "OPTIMIZE ") ||
-		strings.HasPrefix(upper, "REPAIR ")
+		strings.HasPrefix(upper, "REPAIR ") ||
+		strings.HasPrefix(upper, "WITH ")
 	// ALTER TABLE ... ANALYZE/CHECK/OPTIMIZE/REPAIR PARTITION returns a result set
 	if strings.HasPrefix(upper, "ALTER ") {
 		for _, op := range []string{"ANALYZE PARTITION", "CHECK PARTITION", "OPTIMIZE PARTITION", "REPAIR PARTITION"} {
@@ -3220,6 +3223,8 @@ func applyCnfFile(content string, ctx *execContext) {
 		if eqIdx := strings.Index(line, "="); eqIdx >= 0 {
 			key := strings.TrimSpace(line[:eqIdx])
 			val := strings.TrimSpace(line[eqIdx+1:])
+			// Strip MySQL loose- prefix (accepts unknown options without error)
+			key = strings.TrimPrefix(key, "loose-")
 			varKey := strings.ReplaceAll(key, "-", "_")
 			// Special handling for log-error: MySQL appends .err if no extension
 			if varKey == "log_error" && !strings.Contains(val, ".") {
@@ -3231,6 +3236,8 @@ func applyCnfFile(content string, ctx *execContext) {
 		} else {
 			// Boolean flag without value
 			key := line
+			// Strip MySQL loose- prefix
+			key = strings.TrimPrefix(key, "loose-")
 			varKey := strings.ReplaceAll(key, "-", "_")
 			// Special handling for log-error without value: MySQL uses hostname.err
 			if varKey == "log_error" {

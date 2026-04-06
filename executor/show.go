@@ -54,6 +54,115 @@ func isInfoSchemaTable(dbName string) bool {
 	return strings.EqualFold(dbName, "information_schema")
 }
 
+// isColMeta holds column metadata for DESCRIBE output of IS tables.
+type isColMeta struct {
+	colType  string
+	nullable string // "YES" or "NO"
+	defVal   interface{}
+}
+
+// infoSchemaColumnMeta maps IS table+column to metadata for DESCRIBE.
+var infoSchemaColumnMeta = map[string]map[string]isColMeta{
+	"character_sets": {
+		"CHARACTER_SET_NAME":   {colType: "varchar(64)", nullable: "NO", defVal: nil},
+		"DEFAULT_COLLATE_NAME": {colType: "varchar(64)", nullable: "NO", defVal: nil},
+		"DESCRIPTION":          {colType: "varchar(2048)", nullable: "NO", defVal: nil},
+		"MAXLEN":               {colType: "int(10) unsigned", nullable: "NO", defVal: nil},
+	},
+	"collations": {
+		"COLLATION_NAME":     {colType: "varchar(64)", nullable: "NO", defVal: nil},
+		"CHARACTER_SET_NAME": {colType: "varchar(64)", nullable: "NO", defVal: nil},
+		"ID":                 {colType: "bigint(20) unsigned", nullable: "NO", defVal: "0"},
+		"IS_DEFAULT":         {colType: "varchar(3)", nullable: "NO", defVal: ""},
+		"IS_COMPILED":        {colType: "varchar(3)", nullable: "NO", defVal: ""},
+		"SORTLEN":            {colType: "int(10) unsigned", nullable: "NO", defVal: nil},
+		"PAD_ATTRIBUTE":      {colType: "enum('PAD SPACE','NO PAD')", nullable: "NO", defVal: nil},
+	},
+	"collation_character_set_applicability": {
+		"COLLATION_NAME":     {colType: "varchar(64)", nullable: "NO", defVal: nil},
+		"CHARACTER_SET_NAME": {colType: "varchar(64)", nullable: "NO", defVal: nil},
+	},
+	"engines": {
+		"ENGINE":       {colType: "varchar(64)", nullable: "NO", defVal: ""},
+		"SUPPORT":      {colType: "varchar(8)", nullable: "NO", defVal: ""},
+		"COMMENT":      {colType: "varchar(80)", nullable: "NO", defVal: ""},
+		"TRANSACTIONS": {colType: "varchar(3)", nullable: "YES", defVal: ""},
+		"XA":           {colType: "varchar(3)", nullable: "YES", defVal: ""},
+		"SAVEPOINTS":   {colType: "varchar(3)", nullable: "YES", defVal: ""},
+	},
+	"user_privileges": {
+		"GRANTEE":        {colType: "varchar(292)", nullable: "NO", defVal: ""},
+		"TABLE_CATALOG":  {colType: "varchar(512)", nullable: "NO", defVal: ""},
+		"PRIVILEGE_TYPE": {colType: "varchar(64)", nullable: "NO", defVal: ""},
+		"IS_GRANTABLE":   {colType: "varchar(3)", nullable: "NO", defVal: ""},
+	},
+	"schema_privileges": {
+		"GRANTEE":        {colType: "varchar(292)", nullable: "NO", defVal: ""},
+		"TABLE_CATALOG":  {colType: "varchar(512)", nullable: "NO", defVal: ""},
+		"TABLE_SCHEMA":   {colType: "varchar(64)", nullable: "NO", defVal: ""},
+		"PRIVILEGE_TYPE": {colType: "varchar(64)", nullable: "NO", defVal: ""},
+		"IS_GRANTABLE":   {colType: "varchar(3)", nullable: "NO", defVal: ""},
+	},
+	"table_privileges": {
+		"GRANTEE":        {colType: "varchar(292)", nullable: "NO", defVal: ""},
+		"TABLE_CATALOG":  {colType: "varchar(512)", nullable: "NO", defVal: ""},
+		"TABLE_SCHEMA":   {colType: "varchar(64)", nullable: "NO", defVal: ""},
+		"TABLE_NAME":     {colType: "varchar(64)", nullable: "NO", defVal: ""},
+		"PRIVILEGE_TYPE": {colType: "varchar(64)", nullable: "NO", defVal: ""},
+		"IS_GRANTABLE":   {colType: "varchar(3)", nullable: "NO", defVal: ""},
+	},
+	"column_privileges": {
+		"GRANTEE":        {colType: "varchar(292)", nullable: "NO", defVal: ""},
+		"TABLE_CATALOG":  {colType: "varchar(512)", nullable: "NO", defVal: ""},
+		"TABLE_SCHEMA":   {colType: "varchar(64)", nullable: "NO", defVal: ""},
+		"TABLE_NAME":     {colType: "varchar(64)", nullable: "NO", defVal: ""},
+		"COLUMN_NAME":    {colType: "varchar(64)", nullable: "NO", defVal: ""},
+		"PRIVILEGE_TYPE": {colType: "varchar(64)", nullable: "NO", defVal: ""},
+		"IS_GRANTABLE":   {colType: "varchar(3)", nullable: "NO", defVal: ""},
+	},
+}
+
+// infoSchemaCreateView maps IS table names to their MySQL view definitions (returned as VIEW).
+var infoSchemaCreateView = map[string]string{
+	"character_sets": "CREATE ALGORITHM=UNDEFINED DEFINER=`mysql.infoschema`@`localhost` SQL SECURITY DEFINER VIEW `information_schema`.`CHARACTER_SETS` AS select `cs`.`name` AS `CHARACTER_SET_NAME`,`col`.`name` AS `DEFAULT_COLLATE_NAME`,`cs`.`comment` AS `DESCRIPTION`,`cs`.`mb_max_length` AS `MAXLEN` from (`mysql`.`character_sets` `cs` join `mysql`.`collations` `col` on((`cs`.`default_collation_id` = `col`.`id`)))",
+	"collations": "CREATE ALGORITHM=UNDEFINED DEFINER=`mysql.infoschema`@`localhost` SQL SECURITY DEFINER VIEW `information_schema`.`COLLATIONS` AS select `col`.`name` AS `COLLATION_NAME`,`cs`.`name` AS `CHARACTER_SET_NAME`,`col`.`id` AS `ID`,if(exists(select 1 from `mysql`.`character_sets` where (`mysql`.`character_sets`.`default_collation_id` = `col`.`id`)),'Yes','') AS `IS_DEFAULT`,if(`col`.`is_compiled`,'Yes','') AS `IS_COMPILED`,`col`.`sort_length` AS `SORTLEN`,`col`.`pad_attribute` AS `PAD_ATTRIBUTE` from (`mysql`.`collations` `col` join `mysql`.`character_sets` `cs` on((`col`.`character_set_id` = `cs`.`id`)))",
+	"collation_character_set_applicability": "CREATE ALGORITHM=UNDEFINED DEFINER=`mysql.infoschema`@`localhost` SQL SECURITY DEFINER VIEW `information_schema`.`COLLATION_CHARACTER_SET_APPLICABILITY` AS select `col`.`name` AS `COLLATION_NAME`,`cs`.`name` AS `CHARACTER_SET_NAME` from (`mysql`.`character_sets` `cs` join `mysql`.`collations` `col` on((`cs`.`id` = `col`.`character_set_id`)))",
+}
+
+// infoSchemaCreateTable maps IS table names to CREATE TEMPORARY TABLE statements (for older IS tables).
+var infoSchemaCreateTable = map[string]string{
+	"engines":           "CREATE TEMPORARY TABLE `ENGINES` (\n  `ENGINE` varchar(64) NOT NULL DEFAULT '',\n  `SUPPORT` varchar(8) NOT NULL DEFAULT '',\n  `COMMENT` varchar(80) NOT NULL DEFAULT '',\n  `TRANSACTIONS` varchar(3) DEFAULT NULL,\n  `XA` varchar(3) DEFAULT NULL,\n  `SAVEPOINTS` varchar(3) DEFAULT NULL\n) ENGINE=MEMORY DEFAULT CHARSET=utf8",
+	"user_privileges":   "CREATE TEMPORARY TABLE `USER_PRIVILEGES` (\n  `GRANTEE` varchar(292) NOT NULL DEFAULT '',\n  `TABLE_CATALOG` varchar(512) NOT NULL DEFAULT '',\n  `PRIVILEGE_TYPE` varchar(64) NOT NULL DEFAULT '',\n  `IS_GRANTABLE` varchar(3) NOT NULL DEFAULT ''\n) ENGINE=MEMORY DEFAULT CHARSET=utf8",
+	"schema_privileges": "CREATE TEMPORARY TABLE `SCHEMA_PRIVILEGES` (\n  `GRANTEE` varchar(292) NOT NULL DEFAULT '',\n  `TABLE_CATALOG` varchar(512) NOT NULL DEFAULT '',\n  `TABLE_SCHEMA` varchar(64) NOT NULL DEFAULT '',\n  `PRIVILEGE_TYPE` varchar(64) NOT NULL DEFAULT '',\n  `IS_GRANTABLE` varchar(3) NOT NULL DEFAULT ''\n) ENGINE=MEMORY DEFAULT CHARSET=utf8",
+	"table_privileges":  "CREATE TEMPORARY TABLE `TABLE_PRIVILEGES` (\n  `GRANTEE` varchar(292) NOT NULL DEFAULT '',\n  `TABLE_CATALOG` varchar(512) NOT NULL DEFAULT '',\n  `TABLE_SCHEMA` varchar(64) NOT NULL DEFAULT '',\n  `TABLE_NAME` varchar(64) NOT NULL DEFAULT '',\n  `PRIVILEGE_TYPE` varchar(64) NOT NULL DEFAULT '',\n  `IS_GRANTABLE` varchar(3) NOT NULL DEFAULT ''\n) ENGINE=MEMORY DEFAULT CHARSET=utf8",
+	"column_privileges": "CREATE TEMPORARY TABLE `COLUMN_PRIVILEGES` (\n  `GRANTEE` varchar(292) NOT NULL DEFAULT '',\n  `TABLE_CATALOG` varchar(512) NOT NULL DEFAULT '',\n  `TABLE_SCHEMA` varchar(64) NOT NULL DEFAULT '',\n  `TABLE_NAME` varchar(64) NOT NULL DEFAULT '',\n  `COLUMN_NAME` varchar(64) NOT NULL DEFAULT '',\n  `PRIVILEGE_TYPE` varchar(64) NOT NULL DEFAULT '',\n  `IS_GRANTABLE` varchar(3) NOT NULL DEFAULT ''\n) ENGINE=MEMORY DEFAULT CHARSET=utf8",
+}
+
+// describeInfoSchemaTable returns DESCRIBE output for an information_schema virtual table.
+func describeInfoSchemaTable(tableName string, cols []string) *Result {
+	lowerName := strings.ToLower(tableName)
+	metaMap := infoSchemaColumnMeta[lowerName]
+	rows := make([][]interface{}, 0, len(cols))
+	for _, col := range cols {
+		colType := "varchar(64)"
+		nullable := "NO"
+		var defVal interface{} = nil
+		if metaMap != nil {
+			if m, ok := metaMap[col]; ok {
+				colType = m.colType
+				nullable = m.nullable
+				defVal = m.defVal
+			}
+		}
+		rows = append(rows, []interface{}{col, colType, nullable, "", defVal, ""})
+	}
+	return &Result{
+		Columns:     []string{"Field", "Type", "Null", "Key", "Default", "Extra"},
+		Rows:        rows,
+		IsResultSet: true,
+	}
+}
+
 // describeTable returns column metadata for a table, matching MySQL DESCRIBE output.
 func (e *Executor) describeTable(tableName string) (*Result, error) {
 	descDB := e.CurrentDB
@@ -81,6 +190,13 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 			}
 			if viewSQL, ok := e.views[viewLookup]; ok {
 				return e.describeView(viewSQL)
+			}
+		}
+		// For information_schema virtual tables, use infoSchemaColumnOrder to build DESCRIBE output.
+		if isInfoSchemaTable(descDB) {
+			lowerName := strings.ToLower(tableName)
+			if cols, ok := infoSchemaColumnOrder[lowerName]; ok {
+				return describeInfoSchemaTable(tableName, cols), nil
 			}
 		}
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", descDB, tableName))
@@ -384,6 +500,35 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 					tables = append(tables, vn)
 				}
 			}
+			// For information_schema, include virtual IS tables
+			if strings.EqualFold(targetDB, "information_schema") {
+				isTableNames := []string{
+					"CHARACTER_SETS", "CHECK_CONSTRAINTS",
+					"COLLATIONS", "COLLATION_CHARACTER_SET_APPLICABILITY",
+					"COLUMNS", "COLUMN_PRIVILEGES", "COLUMN_STATISTICS",
+					"ENGINES", "EVENTS", "FILES",
+					"KEYWORDS", "KEY_COLUMN_USAGE",
+					"OPTIMIZER_TRACE",
+					"PARAMETERS", "PARTITIONS", "PLUGINS",
+					"PROCESSLIST",
+					"REFERENTIAL_CONSTRAINTS", "RESOURCE_GROUPS", "ROUTINES",
+					"SCHEMATA", "SCHEMA_PRIVILEGES", "STATISTICS",
+					"ST_GEOMETRY_COLUMNS", "ST_SPATIAL_REFERENCE_SYSTEMS", "ST_UNITS_OF_MEASURE",
+					"TABLES", "TABLESPACES", "TABLE_CONSTRAINTS", "TABLE_PRIVILEGES",
+					"TRIGGERS",
+					"USER_PRIVILEGES",
+					"VIEWS", "VIEW_ROUTINE_USAGE", "VIEW_TABLE_USAGE",
+				}
+				seen := make(map[string]bool)
+				for _, t := range tables {
+					seen[strings.ToUpper(t)] = true
+				}
+				for _, t := range isTableNames {
+					if !seen[t] {
+						tables = append(tables, t)
+					}
+				}
+			}
 			sort.Strings(tables)
 			rows := make([][]interface{}, 0, len(tables))
 			for _, t := range tables {
@@ -396,8 +541,12 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 				}
 				rows = append(rows, []interface{}{t})
 			}
+			colName := fmt.Sprintf("Tables_in_%s", targetDB)
+			if likePattern != "" {
+				colName = fmt.Sprintf("Tables_in_%s (%s)", targetDB, likePattern)
+			}
 			return &Result{
-				Columns:     []string{fmt.Sprintf("Tables_in_%s", targetDB)},
+				Columns:     []string{colName},
 				Rows:        rows,
 				IsResultSet: true,
 			}, nil
@@ -420,6 +569,12 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			dbName = strings.Trim(dbName, "`")
 			targetDB = dbName
 		}
+		// Parse optional LIKE pattern
+		likePattern := ""
+		if idx := strings.Index(upper, " LIKE "); idx >= 0 {
+			rest := strings.TrimSpace(query[idx+6:])
+			likePattern = strings.Trim(strings.TrimRight(rest, ";"), "'\"")
+		}
 		db, err := e.Catalog.GetDatabase(targetDB)
 		if err != nil {
 			return nil, err
@@ -431,16 +586,52 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 				tables = append(tables, vn)
 			}
 		}
+		// For information_schema, include virtual IS tables
+		if strings.EqualFold(targetDB, "information_schema") {
+			isTableNames := []string{
+				"CHARACTER_SETS", "CHECK_CONSTRAINTS",
+				"COLLATIONS", "COLLATION_CHARACTER_SET_APPLICABILITY",
+				"COLUMNS", "COLUMN_PRIVILEGES", "COLUMN_STATISTICS",
+				"ENGINES", "EVENTS", "FILES",
+				"KEYWORDS", "KEY_COLUMN_USAGE",
+				"OPTIMIZER_TRACE",
+				"PARAMETERS", "PARTITIONS", "PLUGINS",
+				"PROCESSLIST",
+				"REFERENTIAL_CONSTRAINTS", "RESOURCE_GROUPS", "ROUTINES",
+				"SCHEMATA", "SCHEMA_PRIVILEGES", "STATISTICS",
+				"ST_GEOMETRY_COLUMNS", "ST_SPATIAL_REFERENCE_SYSTEMS", "ST_UNITS_OF_MEASURE",
+				"TABLES", "TABLESPACES", "TABLE_CONSTRAINTS", "TABLE_PRIVILEGES",
+				"TRIGGERS",
+				"USER_PRIVILEGES",
+				"VIEWS", "VIEW_ROUTINE_USAGE", "VIEW_TABLE_USAGE",
+			}
+			seen := make(map[string]bool)
+			for _, t := range tables {
+				seen[strings.ToUpper(t)] = true
+			}
+			for _, t := range isTableNames {
+				if !seen[t] {
+					tables = append(tables, t)
+				}
+			}
+		}
 		sort.Strings(tables)
 		rows := make([][]interface{}, 0, len(tables))
 		for _, t := range tables {
 			if e.tempTables[t] {
 				continue
 			}
+			if likePattern != "" && !matchLike(t, likePattern) {
+				continue
+			}
 			rows = append(rows, []interface{}{t})
 		}
+		colName := fmt.Sprintf("Tables_in_%s", targetDB)
+		if likePattern != "" {
+			colName = fmt.Sprintf("Tables_in_%s (%s)", targetDB, likePattern)
+		}
 		return &Result{
-			Columns:     []string{fmt.Sprintf("Tables_in_%s", targetDB)},
+			Columns:     []string{colName},
 			Rows:        rows,
 			IsResultSet: true,
 		}, nil
@@ -1568,6 +1759,26 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	showDB := e.CurrentDB
 	if strings.Contains(tableName, ".") {
 		showDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
+	}
+
+	// Handle SHOW CREATE TABLE for information_schema virtual tables.
+	if strings.ToLower(showDB) == "information_schema" {
+		lowerName := strings.ToLower(tableName)
+		upperName := strings.ToUpper(tableName)
+		if viewDef, ok := infoSchemaCreateView[lowerName]; ok {
+			return &Result{
+				Columns:     []string{"View", "Create View", "character_set_client", "collation_connection"},
+				Rows:        [][]interface{}{{upperName, viewDef, "utf8", "utf8_general_ci"}},
+				IsResultSet: true,
+			}, nil
+		}
+		if tblDef, ok := infoSchemaCreateTable[lowerName]; ok {
+			return &Result{
+				Columns:     []string{"Table", "Create Table"},
+				Rows:        [][]interface{}{{upperName, tblDef}},
+				IsResultSet: true,
+			}, nil
+		}
 	}
 
 	// Handle SHOW CREATE TABLE for performance_schema tables.

@@ -122,6 +122,11 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		}
 	}
 
+	// Reject DELETE on information_schema tables.
+	if strings.EqualFold(deleteDB, "information_schema") {
+		return nil, mysqlError(1044, "42000", "Access denied for user 'root'@'localhost' to database 'information_schema'")
+	}
+
 	// Handle performance_schema tables
 	if strings.EqualFold(deleteDB, "performance_schema") {
 		lowerTable := strings.ToLower(tableName)

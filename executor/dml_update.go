@@ -116,6 +116,11 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		}
 	}
 
+	// Reject UPDATE on information_schema tables.
+	if strings.EqualFold(updateDB, "information_schema") {
+		return nil, mysqlError(1044, "42000", "Access denied for user 'root'@'localhost' to database 'information_schema'")
+	}
+
 	// Handle performance_schema tables
 	if strings.EqualFold(updateDB, "performance_schema") {
 		lowerTable := strings.ToLower(tableName)

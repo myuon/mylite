@@ -98,15 +98,28 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 			if err != nil {
 				return nil, err
 			}
+			// Apply derived table column aliases if present: AS dt (x,y,z)
+			colNames := make([]string, len(result.Columns))
+			copy(colNames, result.Columns)
+			if len(te.Columns) > 0 {
+				for ci, ca := range te.Columns {
+					if ci < len(colNames) {
+						colNames[ci] = ca.String()
+					}
+				}
+			}
 			rows := make([]storage.Row, len(result.Rows))
 			for i, resultRow := range result.Rows {
-				row := make(storage.Row, len(result.Columns)*2)
-				for j, col := range result.Columns {
+				row := make(storage.Row, len(colNames)*2+1)
+				for j, col := range colNames {
 					row[col] = resultRow[j]
 					if alias != "" {
 						row[alias+"."+col] = resultRow[j]
 					}
 				}
+				// Store column order for * expansion
+				order := strings.Join(colNames, "\x00")
+				row["__column_order__"] = order
 				rows[i] = row
 			}
 			return rows, nil
@@ -135,8 +148,14 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 				for i, row := range cteTbl.rows {
 					newRow := make(storage.Row, len(row)*2)
 					for k, v := range row {
+						if k == "__column_order__" {
+							newRow[k] = v
+							continue
+						}
 						newRow[k] = v
-						newRow[alias+"."+k] = v
+						if alias != "" {
+							newRow[alias+"."+k] = v
+						}
 					}
 					result[i] = newRow
 				}
@@ -1380,14 +1399,16 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				}
 			}
 			// Convert result rows into storage.Row maps.
+			colOrder := strings.Join(columns, "\x00")
 			cteRows := make([]storage.Row, len(subResult.Rows))
 			for i, row := range subResult.Rows {
-				r := make(storage.Row, len(columns))
+				r := make(storage.Row, len(columns)+1)
 				for j, col := range columns {
 					if j < len(row) {
 						r[col] = row[j]
 					}
 				}
+				r["__column_order__"] = colOrder
 				cteRows[i] = r
 			}
 			newCTEMap[cteName] = &cteTable{
