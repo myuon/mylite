@@ -3,6 +3,7 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"math/big"
 	"strconv"
 	"strings"
 
@@ -1653,8 +1654,10 @@ func (e *Executor) evalSysSchemaFunc(name string, args []sqlparser.Expr) (interf
 		if err != nil {
 			var intOvErr *intOverflowError
 			if errors.As(err, &intOvErr) {
-				// Large integer overflow: parse the string value as float
-				f, _ := strconv.ParseFloat(intOvErr.val, 64)
+				// Large integer overflow: convert to float64 to match MySQL's float arithmetic
+				bf := new(big.Float).SetPrec(256)
+				bf.SetString(intOvErr.val)
+				f, _ := bf.Float64()
 				return sysFormatTime(f), true, nil
 			}
 			return nil, true, err
@@ -1715,6 +1718,44 @@ func (e *Executor) evalSysSchemaFunc(name string, args []sqlparser.Expr) (interf
 		_, _, patch := e.parseMySQLVersion()
 		return int64(patch), true, nil
 
+	case "sys_get_config":
+		// sys_get_config(variable_name, default_value): look up sys.sys_config table.
+		// Return the configured value if found, otherwise return the default.
+		if len(args) < 1 {
+			return nil, true, nil
+		}
+		nameVal, err := e.evalExpr(args[0])
+		if err != nil {
+			return nil, true, err
+		}
+		var defaultVal interface{}
+		if len(args) >= 2 {
+			defaultVal, err = e.evalExpr(args[1])
+			if err != nil {
+				return nil, true, err
+			}
+		}
+		paramName := toString(nameVal)
+		// Hardcoded defaults matching MySQL's sys_config table defaults
+		sysConfigDefaults := map[string]interface{}{
+			"diagnostics.allow_i_s_tables":               "OFF",
+			"diagnostics.include_raw":                    "OFF",
+			"ps_thread_trx_info.max_length":              int64(65535),
+			"statement_performance_analyzer.limit":       int64(100),
+			"statement_performance_analyzer.view":        nil,
+			"statement_truncate_len":                     int64(64),
+			"sys.diagnostics.allow_i_s_tables":           "OFF",
+			"sys.diagnostics.include_raw":                "OFF",
+			"sys.ps_thread_trx_info.max_length":          int64(65535),
+			"sys.statement_performance_analyzer.limit":   int64(100),
+			"sys.statement_performance_analyzer.view":    nil,
+			"sys.statement_truncate_len":                 int64(64),
+		}
+		if val, ok := sysConfigDefaults[paramName]; ok {
+			return val, true, nil
+		}
+		return defaultVal, true, nil
+
 	default:
 		return nil, false, nil
 	}
@@ -1764,6 +1805,90 @@ func sysFormatBytes(bytes float64) string {
 	return fmt.Sprintf("%.0f bytes", bytes)
 }
 
+// formatFloat2 formats a float64 value with 2 decimal places using MySQL-compatible
+// precision (17 significant digits), which matches how MySQL's libc formats large floats.
+func formatFloat2(f float64) string {
+	if f == 0 {
+		return "0.00"
+	}
+	negative := f < 0
+	if negative {
+		f = -f
+	}
+	// Use 17 significant digits (prec=16 in 'e' format) to match MySQL's double formatting
+	s := strconv.FormatFloat(f, 'e', 16, 64)
+	parts := strings.SplitN(s, "e", 2)
+	if len(parts) != 2 {
+		result := fmt.Sprintf("%.2f", f)
+		if negative {
+			return "-" + result
+		}
+		return result
+	}
+	mantStr := parts[0]
+	exp, err := strconv.Atoi(parts[1])
+	if err != nil {
+		result := fmt.Sprintf("%.2f", f)
+		if negative {
+			return "-" + result
+		}
+		return result
+	}
+	// Remove decimal point from mantissa to get all digits
+	mantDigits := strings.Replace(mantStr, ".", "", 1)
+	// intDigits = number of digits before the decimal point
+	intDigits := exp + 1
+	var intStr, fracStr string
+	if intDigits >= len(mantDigits) {
+		intStr = mantDigits + strings.Repeat("0", intDigits-len(mantDigits))
+		fracStr = "00"
+	} else if intDigits > 0 {
+		intStr = mantDigits[:intDigits]
+		remaining := mantDigits[intDigits:]
+		if len(remaining) >= 2 {
+			d1 := remaining[0] - '0'
+			d2 := remaining[1] - '0'
+			carry := byte(0)
+			if len(remaining) > 2 && remaining[2]-'0' >= 5 {
+				carry = 1
+			}
+			d2 += carry
+			if d2 >= 10 {
+				d2 -= 10
+				d1++
+			}
+			if d1 >= 10 {
+				// Carry overflows into integer part, fall back to standard formatting
+				result := fmt.Sprintf("%.2f", f)
+				if negative {
+					return "-" + result
+				}
+				return result
+			}
+			fracStr = fmt.Sprintf("%d%d", d1, d2)
+		} else if len(remaining) == 1 {
+			fracStr = string(remaining[0]) + "0"
+		} else {
+			fracStr = "00"
+		}
+	} else {
+		// |f| < 1
+		zeros := -intDigits
+		allFrac := strings.Repeat("0", zeros) + mantDigits
+		if len(allFrac) >= 2 {
+			fracStr = allFrac[:2]
+		} else {
+			fracStr = allFrac + strings.Repeat("0", 2-len(allFrac))
+		}
+		intStr = "0"
+	}
+	result := intStr + "." + fracStr
+	if negative {
+		return "-" + result
+	}
+	return result
+}
+
 func sysFormatTime(picos float64) string {
 	if picos < 0 {
 		return fmt.Sprintf("%.0f ps", picos)
@@ -1772,6 +1897,7 @@ func sysFormatTime(picos float64) string {
 		threshold float64
 		unit      string
 	}{
+		{604800000000000000, "w"},
 		{86400000000000000, "d"},
 		{3600000000000000, "h"},
 		{60000000000000, "m"},
@@ -1782,9 +1908,44 @@ func sysFormatTime(picos float64) string {
 	}
 	for _, u := range units {
 		if picos >= u.threshold {
-			return fmt.Sprintf("%.2f %s", picos/u.threshold, u.unit)
+			return formatFloat2(picos/u.threshold) + " " + u.unit
 		}
 	}
 	return fmt.Sprintf("%.0f ps", picos)
+}
+
+func sysFormatTimeBig(picos *big.Float) string {
+	units := []struct {
+		threshold string
+		unit      string
+	}{
+		{"604800000000000000", "w"},
+		{"86400000000000000", "d"},
+		{"3600000000000000", "h"},
+		{"60000000000000", "m"},
+		{"1000000000000", "s"},
+		{"1000000000", "ms"},
+		{"1000000", "us"},
+		{"1000", "ns"},
+	}
+	for _, u := range units {
+		thresh := new(big.Float).SetPrec(256)
+		thresh.SetString(u.threshold)
+		if picos.Cmp(thresh) >= 0 {
+			result := new(big.Float).SetPrec(256).Quo(picos, thresh)
+			// Format with 2 decimal places using big.Float precision
+			// Split into integer and fractional parts
+			intPart, _ := result.Int(nil)
+			intBig := new(big.Float).SetPrec(256).SetInt(intPart)
+			frac := new(big.Float).SetPrec(256).Sub(result, intBig)
+			fracF, _ := frac.Float64()
+			// Format: integer part + 2 decimal places
+			fracStr := fmt.Sprintf("%.2f", fracF)
+			decStr := fracStr[1:] // ".xx"
+			return fmt.Sprintf("%s%s %s", intPart.String(), decStr, u.unit)
+		}
+	}
+	f, _ := picos.Float64()
+	return fmt.Sprintf("%.0f ps", f)
 }
 

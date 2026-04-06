@@ -1203,13 +1203,16 @@ func innodbFKType(onDelete, onUpdate string) int64 {
 // infoSchemaInnoDBForeign returns rows for INFORMATION_SCHEMA.INNODB_FOREIGN.
 func (e *Executor) infoSchemaInnoDBForeign() []storage.Row {
 	dbNames := e.Catalog.ListDatabases()
+	sort.Strings(dbNames)
 	var rows []storage.Row
 	for _, dbName := range dbNames {
 		db, err := e.Catalog.GetDatabase(dbName)
 		if err != nil {
 			continue
 		}
-		for _, tableName := range db.ListTables() {
+		tableNames := db.ListTables()
+		sort.Strings(tableNames)
+		for _, tableName := range tableNames {
 			def, err := db.GetTable(tableName)
 			if err != nil || def == nil {
 				continue
@@ -1228,23 +1231,36 @@ func (e *Executor) infoSchemaInnoDBForeign() []storage.Row {
 			}
 		}
 	}
+	// Sort by FOR_NAME descending to match MySQL's INNODB_FOREIGN ordering
+	sort.Slice(rows, func(i, j int) bool {
+		fi, fj := rows[i]["FOR_NAME"].(string), rows[j]["FOR_NAME"].(string)
+		return fi > fj
+	})
 	return rows
 }
 
 // infoSchemaInnoDBForeignCols returns rows for INFORMATION_SCHEMA.INNODB_FOREIGN_COLS.
 func (e *Executor) infoSchemaInnoDBForeignCols() []storage.Row {
 	dbNames := e.Catalog.ListDatabases()
-	var rows []storage.Row
+	sort.Strings(dbNames)
+	type colRow struct {
+		forName string
+		row     storage.Row
+	}
+	var colRows []colRow
 	for _, dbName := range dbNames {
 		db, err := e.Catalog.GetDatabase(dbName)
 		if err != nil {
 			continue
 		}
-		for _, tableName := range db.ListTables() {
+		tableNames := db.ListTables()
+		sort.Strings(tableNames)
+		for _, tableName := range tableNames {
 			def, err := db.GetTable(tableName)
 			if err != nil || def == nil {
 				continue
 			}
+			forName := dbName + "/" + tableName
 			for _, fk := range def.ForeignKeys {
 				fkID := dbName + "/" + fk.Name
 				for i, col := range fk.Columns {
@@ -1252,15 +1268,26 @@ func (e *Executor) infoSchemaInnoDBForeignCols() []storage.Row {
 					if i < len(fk.ReferencedColumns) {
 						refCol = fk.ReferencedColumns[i]
 					}
-					rows = append(rows, storage.Row{
-						"ID":           fkID,
-						"FOR_COL_NAME": col,
-						"REF_COL_NAME": refCol,
-						"POS":          int64(i + 1),
+					colRows = append(colRows, colRow{
+						forName: forName,
+						row: storage.Row{
+							"ID":           fkID,
+							"FOR_COL_NAME": col,
+							"REF_COL_NAME": refCol,
+							"POS":          int64(i + 1),
+						},
 					})
 				}
 			}
 		}
+	}
+	// Sort by FOR_NAME descending to match MySQL's INNODB_FOREIGN_COLS ordering
+	sort.SliceStable(colRows, func(i, j int) bool {
+		return colRows[i].forName > colRows[j].forName
+	})
+	rows := make([]storage.Row, len(colRows))
+	for i, cr := range colRows {
+		rows[i] = cr.row
 	}
 	return rows
 }
@@ -4233,7 +4260,7 @@ func normalizeColumnType(colType string) string {
 		return "int(11)"
 	case "bigint":
 		if isUnsigned {
-			return "bigint(21) unsigned"
+			return "bigint(20) unsigned"
 		}
 		return "bigint(20)"
 	case "char":

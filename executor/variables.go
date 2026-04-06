@@ -3712,7 +3712,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"performance_schema_max_program_instances":                 "-1",
 		"performance_schema_max_rwlock_classes":                    "60",
 		"performance_schema_max_rwlock_instances":                  "-1",
-		"performance_schema_max_socket_classes":                    "123",
+		"performance_schema_max_socket_classes":                    "10",
 		"performance_schema_max_socket_instances":                  "123",
 		"performance_schema_max_sql_text_length":                   "1024",
 		"performance_schema_max_stage_classes":                     "175",

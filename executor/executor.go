@@ -408,6 +408,10 @@ type Executor struct {
 	// TABLE or REPAIR TABLE is run. ANALYZE TABLE returns "OK" when in this set,
 	// "Table is already up to date" for non-SPATIAL non-InnoDB otherwise.
 	tableNeedsAnalyze map[string]bool
+	// tableNeedsOptimize tracks non-InnoDB tables that were modified (INSERT/UPDATE/DELETE/ALTER)
+	// since last OPTIMIZE TABLE. OPTIMIZE TABLE returns "OK" when in this set,
+	// "Table is already up to date" otherwise.
+	tableNeedsOptimize map[string]bool
 	// Sort statistics: incremented when ORDER BY operations are performed.
 	sortRows  int64 // total rows sorted
 	sortRange int64 // sort operations using range scan
@@ -2770,6 +2774,7 @@ func normalizeAggColNameFunctions(s string) string {
 // should remain uppercase in column headers.
 func isKnownSQLFunction(name string) bool {
 	known := map[string]bool{
+		"DISTINCT": true,
 		"CAST": true, "CONVERT": true, "COALESCE": true, "IF": true, "IFNULL": true,
 		"NULLIF": true, "CONCAT": true, "CONCAT_WS": true, "LENGTH": true, "CHAR_LENGTH": true,
 		"UPPER": true, "LOWER": true, "TRIM": true, "LTRIM": true, "RTRIM": true,
@@ -6411,7 +6416,33 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	case *sqlparser.DropTable:
 		return e.execDropTable(s)
 	case *sqlparser.Insert:
-		return e.execInsert(s)
+		res, err := e.execInsert(s)
+		// For VALUES-based inserts (not SELECT), track for OPTIMIZE/ANALYZE status.
+		// INSERT ... SELECT doesn't mark the table as modified (stats stay current).
+		if err == nil {
+			if _, isSelect := s.Rows.(*sqlparser.Select); !isSelect {
+				if _, isUnion := s.Rows.(*sqlparser.Union); !isUnion {
+					tblName := s.Table.TableNameString()
+					dbName := e.CurrentDB
+					if tn, ok := s.Table.Expr.(sqlparser.TableName); ok && !tn.Qualifier.IsEmpty() {
+						dbName = tn.Qualifier.String()
+					}
+					if dbObj, dbErr := e.Catalog.GetDatabase(dbName); dbErr == nil {
+						if tblDef, tblErr := dbObj.GetTable(tblName); tblErr == nil && tblDef != nil {
+							eng := strings.ToUpper(tblDef.Engine)
+							if eng == "MYISAM" || eng == "MEMORY" || eng == "CSV" || eng == "ARCHIVE" || eng == "HEAP" {
+								fullName := dbName + "." + tblName
+								if e.tableNeedsOptimize == nil {
+									e.tableNeedsOptimize = map[string]bool{}
+								}
+								e.tableNeedsOptimize[fullName] = true
+							}
+						}
+					}
+				}
+			}
+		}
+		return res, err
 	case *sqlparser.Select:
 		return e.execSelect(s)
 	case *sqlparser.Update:
@@ -6421,7 +6452,7 @@ func (e *Executor) Execute(query string) (*Result, error) {
 	case *sqlparser.AlterTable:
 		res, err := e.execAlterTable(s)
 		if err == nil {
-			// Mark the table as needing analysis after structural changes.
+			// Mark the table as needing analysis/optimize after structural changes.
 			dbName := e.CurrentDB
 			if !s.Table.Qualifier.IsEmpty() {
 				dbName = s.Table.Qualifier.String()
@@ -6431,6 +6462,10 @@ func (e *Executor) Execute(query string) (*Result, error) {
 				e.tableNeedsAnalyze = map[string]bool{}
 			}
 			e.tableNeedsAnalyze[fullName] = true
+			if e.tableNeedsOptimize == nil {
+				e.tableNeedsOptimize = map[string]bool{}
+			}
+			e.tableNeedsOptimize[fullName] = true
 		}
 		return res, err
 	case *sqlparser.Show:
@@ -6565,7 +6600,7 @@ func (e *Executor) Execute(query string) (*Result, error) {
 					if e.innodbStatsPersistentEnabled(def) {
 						e.upsertInnoDBStatsRows(e.CurrentDB, tableName, e.tableRowCount(e.CurrentDB, tableName))
 					}
-					// InnoDB, SPATIAL-indexed tables, or tables needing re-analysis return "OK"
+					fullName := e.CurrentDB + "." + tableName
 					eng := strings.ToUpper(def.Engine)
 					hasSpatial := false
 					for _, idx := range def.Indexes {
@@ -6574,14 +6609,19 @@ func (e *Executor) Execute(query string) (*Result, error) {
 							break
 						}
 					}
-					fullName := e.CurrentDB + "." + tableName
 					needsAnalyze := e.tableNeedsAnalyze != nil && e.tableNeedsAnalyze[fullName]
-					if eng == "" || eng == "INNODB" || hasSpatial || needsAnalyze {
+					needsOptimize := e.tableNeedsOptimize != nil && e.tableNeedsOptimize[fullName]
+					// ANALYZE TABLE returns "OK" for InnoDB, SPATIAL-indexed tables,
+					// or non-InnoDB tables with pending analysis/optimization (ALTER or INSERT).
+					if eng == "" || eng == "INNODB" || hasSpatial || needsAnalyze || needsOptimize {
 						msgText = "OK"
-						// Clear the needs-analyze flag
-						if e.tableNeedsAnalyze != nil {
-							delete(e.tableNeedsAnalyze, fullName)
-						}
+					}
+					// Clear both flags after analyze
+					if e.tableNeedsAnalyze != nil {
+						delete(e.tableNeedsAnalyze, fullName)
+					}
+					if e.tableNeedsOptimize != nil {
+						delete(e.tableNeedsOptimize, fullName)
 					}
 				}
 			}
@@ -9483,10 +9523,12 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 					}
 				}
 				if m > 18 || math.Abs(f) > float64(math.MaxInt64)-1 {
+					// Use round-half-up for DECIMAL, not Go's round-half-to-even
+					// math.Floor(f+0.5) implements round-half-up
 					if f >= 0 {
-						return fmt.Sprintf("%.0f", f+0.5)
+						return fmt.Sprintf("%.0f", math.Floor(f+0.5))
 					}
-					return fmt.Sprintf("%.0f", f-0.5)
+					return fmt.Sprintf("%.0f", math.Ceil(f-0.5))
 				}
 			}
 			if prefix == "float" {
@@ -10212,7 +10254,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		if err != nil {
 			return nil, err
 		}
-		return evalIntervalDateExpr(dateVal, intervalVal, v.Unit, v.Syntax)
+		return evalIntervalDateExprStrict(dateVal, intervalVal, v.Unit, v.Syntax, e.isTraditionalMode())
 	case *sqlparser.AssignmentExpr:
 		// @var := expr — evaluate the right side, assign to user variable, return value
 		val, err := e.evalExpr(v.Right)
@@ -11005,6 +11047,14 @@ func extractLeadingInt(s string) string {
 
 // evalIntervalDateExpr evaluates DATE_ADD/DATE_SUB expressions.
 func evalIntervalDateExpr(dateVal, intervalVal interface{}, unit sqlparser.IntervalType, syntax sqlparser.IntervalExprSyntax) (interface{}, error) {
+	return evalIntervalDateExprStrict(dateVal, intervalVal, unit, syntax, false)
+}
+
+func evalIntervalDateExprStrict(dateVal, intervalVal interface{}, unit sqlparser.IntervalType, syntax sqlparser.IntervalExprSyntax, strict bool) (interface{}, error) {
+	// If interval value is NULL, result is NULL
+	if intervalVal == nil {
+		return nil, nil
+	}
 	t, err := parseDateTimeValue(dateVal)
 	if err != nil {
 		return toString(dateVal), nil
@@ -11012,46 +11062,106 @@ func evalIntervalDateExpr(dateVal, intervalVal interface{}, unit sqlparser.Inter
 	iStr := toString(intervalVal)
 	isSubtract := syntax == sqlparser.IntervalDateExprDateSub || syntax == sqlparser.IntervalDateExprSubdate
 
+	// parseIntervalInt parses an interval integer safely, returning (value, overflow).
+	// If the string is too large for int, overflow=true and the date would overflow.
+	parseIntervalInt := func(s string) (int, bool) {
+		s = extractLeadingInt(s)
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			// overflow or invalid - treat as overflow
+			return 0, true
+		}
+		return n, false
+	}
+
 	switch unit {
 	case sqlparser.IntervalDay:
-		n, _ := strconv.Atoi(extractLeadingInt(iStr))
+		n, ov := parseIntervalInt(iStr)
+		if ov {
+			if strict {
+				return nil, mysqlError(1441, "22008", "Datetime function: datetime field overflow")
+			}
+			return nil, nil
+		}
 		if isSubtract {
 			n = -n
 		}
 		t = t.AddDate(0, 0, n)
 	case sqlparser.IntervalMonth:
-		n, _ := strconv.Atoi(extractLeadingInt(iStr))
+		n, ov := parseIntervalInt(iStr)
+		if ov {
+			if strict {
+				return nil, mysqlError(1441, "22008", "Datetime function: datetime field overflow")
+			}
+			return nil, nil
+		}
 		if isSubtract {
 			n = -n
 		}
 		t = t.AddDate(0, n, 0)
 	case sqlparser.IntervalYear:
-		n, _ := strconv.Atoi(extractLeadingInt(iStr))
+		n, ov := parseIntervalInt(iStr)
+		if ov {
+			if strict {
+				return nil, mysqlError(1441, "22008", "Datetime function: datetime field overflow")
+			}
+			return nil, nil
+		}
 		if isSubtract {
 			n = -n
 		}
 		t = t.AddDate(n, 0, 0)
 	case sqlparser.IntervalHour:
-		n, _ := strconv.Atoi(extractLeadingInt(iStr))
+		n, ov := parseIntervalInt(iStr)
+		if ov {
+			if strict {
+				return nil, mysqlError(1441, "22008", "Datetime function: datetime field overflow")
+			}
+			return nil, nil
+		}
 		d := time.Duration(n) * time.Hour
 		if isSubtract {
 			d = -d
 		}
 		t = t.Add(d)
 	case sqlparser.IntervalMinute:
-		n, _ := strconv.Atoi(extractLeadingInt(iStr))
+		n, ov := parseIntervalInt(iStr)
+		if ov {
+			if strict {
+				return nil, mysqlError(1441, "22008", "Datetime function: datetime field overflow")
+			}
+			return nil, nil
+		}
 		d := time.Duration(n) * time.Minute
 		if isSubtract {
 			d = -d
 		}
 		t = t.Add(d)
 	case sqlparser.IntervalSecond:
-		n, _ := strconv.Atoi(extractLeadingInt(iStr))
+		n, ov := parseIntervalInt(iStr)
+		if ov {
+			if strict {
+				return nil, mysqlError(1441, "22008", "Datetime function: datetime field overflow")
+			}
+			return nil, nil
+		}
 		d := time.Duration(n) * time.Second
 		if isSubtract {
 			d = -d
 		}
 		t = t.Add(d)
+	case sqlparser.IntervalWeek:
+		n, ov := parseIntervalInt(iStr)
+		if ov {
+			if strict {
+				return nil, mysqlError(1441, "22008", "Datetime function: datetime field overflow")
+			}
+			return nil, nil
+		}
+		if isSubtract {
+			n = -n
+		}
+		t = t.AddDate(0, 0, n*7)
 	case sqlparser.IntervalDaySecond:
 		// Format: 'D HH:MM:SS' or 'D H:M:S'
 		dur, _ := parseMySQLTimeInterval(iStr)
@@ -11062,7 +11172,13 @@ func evalIntervalDateExpr(dateVal, intervalVal interface{}, unit sqlparser.Inter
 	default:
 		// For ADDDATE/SUBDATE shorthand (IntervalNone), the interval is in days
 		if unit == sqlparser.IntervalNone && (syntax == sqlparser.IntervalDateExprAdddate || syntax == sqlparser.IntervalDateExprSubdate) {
-			n, _ := strconv.Atoi(extractLeadingInt(iStr))
+			n, ov := parseIntervalInt(iStr)
+			if ov {
+				if strict {
+					return nil, mysqlError(1441, "22008", "Datetime function: datetime field overflow")
+				}
+				return nil, nil
+			}
 			if isSubtract {
 				n = -n
 			}
@@ -11075,6 +11191,14 @@ func evalIntervalDateExpr(dateVal, intervalVal interface{}, unit sqlparser.Inter
 			}
 			t = t.Add(dur)
 		}
+	}
+
+	// Check for datetime overflow (year out of MySQL's valid range 1000-9999)
+	if t.Year() < 1000 || t.Year() > 9999 {
+		if strict {
+			return nil, mysqlError(1441, "22008", "Datetime function: datetime field overflow")
+		}
+		return nil, nil
 	}
 
 	// Format output based on whether the original had time component
@@ -13518,7 +13642,7 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		if err != nil {
 			return nil, err
 		}
-		return evalIntervalDateExpr(dateVal, intervalVal, v.Unit, v.Syntax)
+		return evalIntervalDateExprStrict(dateVal, intervalVal, v.Unit, v.Syntax, e.isTraditionalMode())
 	case *sqlparser.AssignmentExpr:
 		// @var := expr with row context
 		val, err := e.evalRowExpr(v.Right, row)
@@ -15986,19 +16110,20 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 				rows = append(rows, []interface{}{tableName, op, "note", "Table does not support optimize, doing recreate + analyze instead"})
 				rows = append(rows, []interface{}{tableName, op, "status", "OK"})
 			} else {
-				// Non-InnoDB engines (MyISAM, etc.) check if the table has data:
-				// empty tables → "Table is already up to date"
-				// tables with data → "OK"
-				dbName := e.CurrentDB
+				// Non-InnoDB engines (MyISAM, etc.): return "OK" if the table was modified
+				// (INSERT/UPDATE/DELETE/ALTER) since last OPTIMIZE TABLE; otherwise "Table is already up to date".
+				fullName2 := e.CurrentDB + "." + bareTable
 				if strings.Contains(tableName, ".") {
-					parts := strings.SplitN(tableName, ".", 2)
-					dbName = parts[0]
+					fullName2 = tableName
 				}
-				rowCount := e.tableRowCount(dbName, bareTable)
-				if rowCount == 0 {
-					rows = append(rows, []interface{}{tableName, op, "status", "Table is already up to date"})
-				} else {
+				needsOptimize := e.tableNeedsOptimize != nil && e.tableNeedsOptimize[fullName2]
+				if needsOptimize {
+					if e.tableNeedsOptimize != nil {
+						delete(e.tableNeedsOptimize, fullName2)
+					}
 					rows = append(rows, []interface{}{tableName, op, "status", "OK"})
+				} else {
+					rows = append(rows, []interface{}{tableName, op, "status", "Table is already up to date"})
 				}
 			}
 		} else if op == "check" && forUpgrade {
@@ -16050,11 +16175,18 @@ func (e *Executor) execAnalyzeMultiTable(query string) (*Result, error) {
 					}
 				}
 				needsAnalyze := e.tableNeedsAnalyze != nil && e.tableNeedsAnalyze[tableName]
-				if eng == "" || eng == "INNODB" || hasSpatial || needsAnalyze {
+				needsOptimize := e.tableNeedsOptimize != nil && e.tableNeedsOptimize[tableName]
+				// ANALYZE TABLE returns "OK" for InnoDB, SPATIAL-indexed tables,
+				// or non-InnoDB tables with pending analysis/optimization.
+				if eng == "" || eng == "INNODB" || hasSpatial || needsAnalyze || needsOptimize {
 					msgText = "OK"
-					if e.tableNeedsAnalyze != nil {
-						delete(e.tableNeedsAnalyze, tableName)
-					}
+				}
+				// Clear flags after analyze
+				if e.tableNeedsAnalyze != nil {
+					delete(e.tableNeedsAnalyze, tableName)
+				}
+				if e.tableNeedsOptimize != nil {
+					delete(e.tableNeedsOptimize, tableName)
 				}
 			}
 		}

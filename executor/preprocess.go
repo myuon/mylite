@@ -265,7 +265,7 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	// Rewrite "SET @var:=expr" to "SET @var=expr" since vitess parser doesn't support
 	// := in SET statements (it is allowed in SELECT/expression context via AssignmentExpr).
 	if strings.HasPrefix(upper, "SET ") && strings.Contains(trimmed, ":=") {
-		setAssignRe := regexp.MustCompile(`(?i)(^SET\s+@\w+)\s*:=`)
+		setAssignRe := regexp.MustCompile(`(?i)(^SET\s+@[\w.]+)\s*:=`)
 		if setAssignRe.MatchString(trimmed) {
 			query = setAssignRe.ReplaceAllString(trimmed, "$1 =")
 			trimmed = strings.TrimSpace(query)

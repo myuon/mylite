@@ -2485,6 +2485,7 @@ func aggregateDisplayName(expr sqlparser.Expr) string {
 	}
 	// Uppercase DISTINCT within aggregate
 	s = strings.ReplaceAll(s, "(distinct ", "(DISTINCT ")
+	s = strings.ReplaceAll(s, "(distinct(", "(DISTINCT(")
 	return normalizeSQLDisplayName(s)
 }
 

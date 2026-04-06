@@ -337,10 +337,14 @@ type execContext struct {
 	replaceRegex     []regexReplace // regex pairs for --replace_regex
 	verticalResult   bool           // format next query result as vertical key/value pairs
 	verticalResults  bool           // persistent vertical output mode (--vertical_results)
-	infoEnabled      bool           // --enable_info: show affected rows and info after DML
-	skipped          bool           // set to true when --skip directive is encountered
-	testcaseDisabled bool           // set by --disable_testcase, cleared by --enable_testcase
-	sourceDepth      int            // current --source recursion depth
+	infoEnabled        bool           // --enable_info: show affected rows and info after DML
+	skipped            bool           // set to true when --skip directive is encountered
+	testcaseDisabled   bool           // set by --disable_testcase, cleared by --enable_testcase
+	sourceDepth        int            // current --source recursion depth
+	queryLogOnce       bool           // if true, restore queryLogEnabled after next statement
+	queryLogOnceRestore bool          // value to restore queryLogEnabled to after once
+	resultLogOnce      bool           // if true, restore resultLogEnabled after next statement
+	resultLogOnceRestore bool         // value to restore resultLogEnabled to after once
 	ttsBackups       map[string]tableSnapshot
 	errorConn        *sql.Conn // cached connection for --error expected error handling
 	pendingSendByConn map[string]*pendingSend // keyed by connection name ("" for default)
@@ -1029,20 +1033,56 @@ func (ctx *execContext) executeLines(lines []string) error {
 				}
 			}
 		} else {
-			// Multiple statements: echo and execute each individually
-			for _, s := range stmts {
-				s = strings.TrimSpace(s)
-				if s == "" {
-					continue
+			// Multiple statements: echo and execute each individually.
+			// If using a custom delimiter, the rawLines capture the original formatting
+			// (e.g. "ADD CONSTRAINT...|" vs individual statements ending with ";").
+			// Echo rawLines first, then execute each statement without re-echoing.
+			if ctx.delimiter != "" && ctx.queryLogEnabled && !ctx.pendingSendNext && len(rawLines) > 0 {
+				for _, rl := range rawLines {
+					if rl == "" {
+						continue
+					}
+					if isEval {
+						rl = ctx.substituteVars(rl)
+						rl = stripUndefinedVars(rl)
+					}
+					if len(ctx.replaceResult) > 0 {
+						rl = applyReplaceResult(rl, ctx.replaceResult)
+					}
+					if len(ctx.replaceRegex) > 0 {
+						rl = applyReplaceRegex(rl, ctx.replaceRegex)
+					}
+					ctx.output.WriteString(rl + "\n")
 				}
-				if isEval {
-					s = ctx.substituteVars(s)
-					s = stripUndefinedVars(s)
+				for _, s := range stmts {
+					s = strings.TrimSpace(s)
+					if s == "" {
+						continue
+					}
+					if isEval {
+						s = ctx.substituteVars(s)
+						s = stripUndefinedVars(s)
+					}
+					err := ctx.executeSQLNoEcho(s)
+					if err != nil {
+						return err
+					}
 				}
-				// Use executeSQL which does echo + execute
-				err := ctx.executeSQL(s)
-				if err != nil {
-					return err
+			} else {
+				for _, s := range stmts {
+					s = strings.TrimSpace(s)
+					if s == "" {
+						continue
+					}
+					if isEval {
+						s = ctx.substituteVars(s)
+						s = stripUndefinedVars(s)
+					}
+					// Use executeSQL which does echo + execute
+					err := ctx.executeSQL(s)
+					if err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -1082,17 +1122,41 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		return true, false, nil
 
 	case "disable_query_log":
-		ctx.queryLogEnabled = false
+		if strings.TrimSpace(strings.ToUpper(args)) == "ONCE" {
+			ctx.queryLogOnce = true
+			ctx.queryLogOnceRestore = ctx.queryLogEnabled
+			ctx.queryLogEnabled = false
+		} else {
+			ctx.queryLogEnabled = false
+		}
 		return true, false, nil
 	case "enable_query_log":
-		ctx.queryLogEnabled = true
+		if strings.TrimSpace(strings.ToUpper(args)) == "ONCE" {
+			ctx.queryLogOnce = true
+			ctx.queryLogOnceRestore = ctx.queryLogEnabled
+			ctx.queryLogEnabled = true
+		} else {
+			ctx.queryLogEnabled = true
+		}
 		return true, false, nil
 
 	case "disable_result_log":
-		ctx.resultLogEnabled = false
+		if strings.TrimSpace(strings.ToUpper(args)) == "ONCE" {
+			ctx.resultLogOnce = true
+			ctx.resultLogOnceRestore = ctx.resultLogEnabled
+			ctx.resultLogEnabled = false
+		} else {
+			ctx.resultLogEnabled = false
+		}
 		return true, false, nil
 	case "enable_result_log":
-		ctx.resultLogEnabled = true
+		if strings.TrimSpace(strings.ToUpper(args)) == "ONCE" {
+			ctx.resultLogOnce = true
+			ctx.resultLogOnceRestore = ctx.resultLogEnabled
+			ctx.resultLogEnabled = true
+		} else {
+			ctx.resultLogEnabled = true
+		}
 		return true, false, nil
 	case "vertical_results":
 		ctx.verticalResults = true
@@ -2101,7 +2165,17 @@ func (ctx *execContext) executeSQL(stmt string) error {
 		ctx.output.WriteString(echoLine + "\n")
 	}
 
-	return ctx.executeSQLInner(stmt)
+	err := ctx.executeSQLInner(stmt)
+	// Restore ONCE flags after statement execution
+	if ctx.queryLogOnce {
+		ctx.queryLogEnabled = ctx.queryLogOnceRestore
+		ctx.queryLogOnce = false
+	}
+	if ctx.resultLogOnce {
+		ctx.resultLogEnabled = ctx.resultLogOnceRestore
+		ctx.resultLogOnce = false
+	}
+	return err
 }
 
 func (ctx *execContext) executeSQLNoEcho(stmt string) error {
@@ -2116,7 +2190,17 @@ func (ctx *execContext) executeSQLNoEcho(stmt string) error {
 		return err
 	}
 
-	return ctx.executeSQLInner(stmt)
+	err := ctx.executeSQLInner(stmt)
+	// Restore ONCE flags after statement execution
+	if ctx.queryLogOnce {
+		ctx.queryLogEnabled = ctx.queryLogOnceRestore
+		ctx.queryLogOnce = false
+	}
+	if ctx.resultLogOnce {
+		ctx.resultLogEnabled = ctx.resultLogOnceRestore
+		ctx.resultLogOnce = false
+	}
+	return err
 }
 
 func (ctx *execContext) executeSQLInner(stmt string) error {
@@ -3006,11 +3090,53 @@ func applyMasterOpt(content string, ctx *execContext) {
 		if rawLine == "" || strings.HasPrefix(rawLine, "#") {
 			continue
 		}
-		// Each line may contain multiple space-separated tokens when there are no
-		// quoted values with spaces. Split into tokens, but re-join lines that
-		// contain --key='value with spaces' patterns.
-		applyMasterOptToken(rawLine, ctx)
+		// Split the line into individual --key[=value] tokens.
+		// We need to handle quoted values (e.g. --key='value with spaces').
+		tokens := splitMasterOptLine(rawLine)
+		for _, tok := range tokens {
+			applyMasterOptToken(tok, ctx)
+		}
 	}
+}
+
+// splitMasterOptLine splits a master.opt line into individual --key[=value] tokens,
+// respecting single-quoted values that may contain spaces.
+func splitMasterOptLine(line string) []string {
+	var tokens []string
+	i := 0
+	for i < len(line) {
+		// Skip whitespace between tokens
+		for i < len(line) && line[i] == ' ' {
+			i++
+		}
+		if i >= len(line) {
+			break
+		}
+		// Skip tokens that don't start with - (e.g. shell variables like $KEYRING_PLUGIN_OPT)
+		if line[i] != '-' {
+			// skip until next space
+			for i < len(line) && line[i] != ' ' {
+				i++
+			}
+			continue
+		}
+		// Collect token until next space or end, respecting single quotes
+		start := i
+		inQuote := false
+		for i < len(line) {
+			if line[i] == '\'' {
+				inQuote = !inQuote
+			} else if line[i] == ' ' && !inQuote {
+				break
+			}
+			i++
+		}
+		tok := strings.TrimSpace(line[start:i])
+		if tok != "" {
+			tokens = append(tokens, tok)
+		}
+	}
+	return tokens
 }
 
 // applyMasterOptToken processes a single master.opt option line.

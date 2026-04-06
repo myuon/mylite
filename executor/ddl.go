@@ -619,7 +619,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 					return &Result{}, nil
 				}
 			}
-			selectSQL := sqlparser.String(stmt.Select)
+			// Prefer extracting SELECT from original query text to preserve case/spacing
+			selectSQL := e.extractSelectFromQuery(e.currentQuery)
+			if selectSQL == "" {
+				selectSQL = sqlparser.String(stmt.Select)
+			}
 			result, err := e.execCreateTableSelect(dbName, tableName, selectSQL)
 			if err == nil && stmt.Temp {
 				e.tempTables[tableName] = true
@@ -669,7 +673,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		if engineUpper == "FEDERATED" {
 			return nil, mysqlError(1286, "42000", fmt.Sprintf("Unknown storage engine '%s'", engine))
 		}
-		if engineUpper == "MEMORY" || engineUpper == "MERGE" || engineUpper == "MRG_MYISAM" || engineUpper == "BLACKHOLE" {
+		if engineUpper == "MEMORY" || engineUpper == "MERGE" || engineUpper == "MRG_MYISAM" || engineUpper == "BLACKHOLE" || engineUpper == "ARCHIVE" {
 			for _, col := range stmt.TableSpec.Columns {
 				if col.Type.Options != nil && col.Type.Options.As != nil {
 					return nil, mysqlError(3106, "HY000", "'Specified storage engine' is not supported for generated columns.")
@@ -782,7 +786,9 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		if tUpper := strings.ToUpper(strings.TrimSpace(colDef.Type)); strings.HasPrefix(tUpper, "BIT(") {
 			var width int
 			if n, err := fmt.Sscanf(tUpper, "BIT(%d)", &width); err == nil && n == 1 {
-				if width < 1 || width > 64 {
+				if width < 1 {
+					return nil, mysqlError(1441, "HY000", fmt.Sprintf("Invalid size for column '%s'.", colDef.Name))
+				} else if width > 64 {
 					return nil, mysqlError(1439, "42000", fmt.Sprintf("Display width out of range for column '%s' (max = 64)", colDef.Name))
 				}
 			}
@@ -1865,7 +1871,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 							}
 						}
 					}
-					if tableEngine == "MEMORY" || tableEngine == "MERGE" || tableEngine == "MRG_MYISAM" || tableEngine == "BLACKHOLE" {
+					if tableEngine == "MEMORY" || tableEngine == "MERGE" || tableEngine == "MRG_MYISAM" || tableEngine == "BLACKHOLE" || tableEngine == "ARCHIVE" {
 						return nil, mysqlError(3106, "HY000", "'Specified storage engine' is not supported for generated columns.")
 					}
 				}
@@ -3092,7 +3098,11 @@ func (e *Executor) inferColumnAttrs(selectSQL, colName string) columnAttrs {
 			} else {
 				exprStr := normalizeCharsetIntroducersForMatch(sqlparser.String(ae.Expr))
 				normalizedColName := normalizeCharsetIntroducersForMatch(colName)
-				if !strings.EqualFold(exprStr, normalizedColName) {
+				// Normalize whitespace for comparison: sqlparser.String() may collapse or
+				// add spaces differently (e.g., "a, b" vs "a,b"). Strip all whitespace.
+				exprStrNorm := strings.ReplaceAll(strings.ToLower(exprStr), " ", "")
+				colNameNorm := strings.ReplaceAll(strings.ToLower(normalizedColName), " ", "")
+				if exprStrNorm != colNameNorm {
 					continue
 				}
 			}
@@ -3287,7 +3297,25 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			return "int"
 		case sqlparser.FloatVal:
 			return "double"
+		case sqlparser.HexVal:
+			// MySQL: hex literals act as BIGINT UNSIGNED in arithmetic context
+			return "bigint unsigned"
 		}
+	case *sqlparser.BinaryExpr:
+		// Arithmetic expressions (+,-,*,/) return numeric types.
+		// If either operand is hex, result is bigint unsigned.
+		leftType := e.inferExprType(v.Left)
+		rightType := e.inferExprType(v.Right)
+		if leftType == "bigint unsigned" || rightType == "bigint unsigned" {
+			return "bigint unsigned"
+		}
+		if leftType == "double" || rightType == "double" {
+			return "double"
+		}
+		if leftType == "int" || rightType == "int" {
+			return "bigint"
+		}
+		return "bigint"
 	case *sqlparser.FuncExpr:
 		name := strings.ToLower(v.Name.String())
 		switch name {
@@ -3332,6 +3360,27 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			return "bigint unsigned"
 		case "last_insert_id", "row_count", "found_rows":
 			return "bigint"
+		case "if", "ifnull", "nullif", "coalesce", "greatest", "least":
+			// For functions where all arguments resolve to NULL, MySQL returns binary(0).
+			// For IF(cond, then, else), check the then/else args (indices 1 and 2).
+			// For COALESCE/GREATEST/LEAST, check all args.
+			argsToCheck := v.Exprs
+			if name == "if" && len(v.Exprs) == 3 {
+				argsToCheck = v.Exprs[1:] // skip condition
+			} else if name == "ifnull" && len(v.Exprs) == 2 {
+				argsToCheck = v.Exprs // check both
+			}
+			allNull := len(argsToCheck) > 0
+			for _, arg := range argsToCheck {
+				t := e.inferExprType(arg)
+				if t != "binary(0)" && t != "" {
+					allNull = false
+					break
+				}
+			}
+			if allNull {
+				return "binary(0)"
+			}
 		}
 	case *sqlparser.IntroducerExpr:
 		// _charset'string' — type is varchar(len) with the given charset
@@ -3339,7 +3388,73 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			return fmt.Sprintf("varchar(%d)", len(lit.Val))
 		}
 	case *sqlparser.NullVal:
+		// MySQL uses binary(0) for NULL literal columns in CREATE TABLE AS SELECT
+		return "binary(0)"
+	case *sqlparser.ConvertExpr:
+		// CAST(x AS type) / CONVERT(x, type) — use the target type
+		return convertTypeToSQLType(v.Type)
+	case *sqlparser.CastExpr:
+		// CAST(x AS type) — use the target type
+		return convertTypeToSQLType(v.Type)
+	}
+	return ""
+}
+
+// convertTypeToSQLType converts a vitess ConvertType to a MySQL column type string.
+func convertTypeToSQLType(ct *sqlparser.ConvertType) string {
+	if ct == nil {
 		return ""
+	}
+	typeName := strings.ToLower(ct.Type)
+	switch typeName {
+	case "signed", "signed integer":
+		return "bigint"
+	case "unsigned", "unsigned integer":
+		return "bigint unsigned"
+	case "decimal":
+		if ct.Length != nil && ct.Scale != nil {
+			return fmt.Sprintf("decimal(%d,%d)", *ct.Length, *ct.Scale)
+		} else if ct.Length != nil {
+			return fmt.Sprintf("decimal(%d)", *ct.Length)
+		}
+		return "decimal(10,0)"
+	case "char":
+		if ct.Length != nil {
+			return fmt.Sprintf("char(%d)", *ct.Length)
+		}
+		return "char(0)"
+	case "nchar":
+		if ct.Length != nil {
+			return fmt.Sprintf("char(%d)", *ct.Length)
+		}
+		return "char(0)"
+	case "binary":
+		if ct.Length != nil {
+			return fmt.Sprintf("binary(%d)", *ct.Length)
+		}
+		return "binary(0)"
+	case "date":
+		return "date"
+	case "datetime":
+		if ct.Length != nil {
+			return fmt.Sprintf("datetime(%d)", *ct.Length)
+		}
+		return "datetime"
+	case "time":
+		if ct.Length != nil {
+			return fmt.Sprintf("time(%d)", *ct.Length)
+		}
+		return "time"
+	case "year":
+		return "year(4)"
+	case "json":
+		return "json"
+	case "float":
+		return "double"
+	case "double":
+		return "double"
+	case "real":
+		return "double"
 	}
 	return ""
 }
@@ -3536,6 +3651,40 @@ func (e *Executor) execCreateTableLike(targetDBName, newTableName, srcDBName, sr
 	e.Storage.CreateTable(targetDBName, newDef)
 	e.upsertInnoDBStatsRows(targetDBName, newTableName, 0)
 	return &Result{}, nil
+}
+
+// extractSelectFromQuery extracts the SELECT portion from a CREATE TABLE ... SELECT query,
+// preserving the original case and spacing from the raw query text.
+// Returns "" if the SELECT portion cannot be found.
+func (e *Executor) extractSelectFromQuery(query string) string {
+	depth := 0
+	selectIdx := -1
+	for i := 0; i < len(query)-5; i++ {
+		switch query[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case '\'':
+			for i++; i < len(query) && query[i] != '\''; i++ {
+				if query[i] == '\\' {
+					i++
+				}
+			}
+		}
+		if depth == 0 && (query[i] == 's' || query[i] == 'S') {
+			if i+6 <= len(query) && strings.EqualFold(query[i:i+6], "SELECT") {
+				if i == 0 || !isIdentChar(query[i-1]) {
+					selectIdx = i
+					break
+				}
+			}
+		}
+	}
+	if selectIdx < 0 {
+		return ""
+	}
+	return strings.TrimSpace(query[selectIdx:])
 }
 
 // tryExecCreateTableIndexOnlySelect handles the case where vitess parses
