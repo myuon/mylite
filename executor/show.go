@@ -1698,7 +1698,7 @@ func (e *Executor) showRoutineStatus(routineType string, rest string) (*Result, 
 		likeRest = strings.TrimRight(likeRest, ";")
 		likePattern = strings.Trim(likeRest, "'\"")
 	} else if strings.HasPrefix(restUpper, "WHERE ") {
-		// Simple WHERE NAME='value' or WHERE NAME LIKE 'pattern'
+		// Simple WHERE NAME='value' or WHERE NAME LIKE 'pattern' or WHERE Db = 'value'
 		whereRest := strings.TrimSpace(rest[6:])
 		whereRest = strings.TrimRight(whereRest, ";")
 		whereRestUpper := strings.ToUpper(whereRest)
@@ -1714,6 +1714,14 @@ func (e *Executor) showRoutineStatus(routineType string, rest string) (*Result, 
 				whereField = "NAME"
 				whereValue = strings.Trim(val, "'\"")
 			}
+		} else if strings.HasPrefix(whereRestUpper, "DB") {
+			afterDb := strings.TrimSpace(whereRest[2:])
+			if strings.HasPrefix(afterDb, "=") || strings.HasPrefix(afterDb, " =") {
+				eqIdx := strings.Index(afterDb, "=")
+				val := strings.TrimSpace(afterDb[eqIdx+1:])
+				whereField = "DB"
+				whereValue = strings.Trim(val, "'\"")
+			}
 		}
 	}
 
@@ -1724,6 +1732,13 @@ func (e *Executor) showRoutineStatus(routineType string, rest string) (*Result, 
 
 	// Iterate over all databases
 	for _, dbName := range e.Catalog.ListDatabases() {
+		// Apply DB filter
+		if whereField == "DB" && whereValue != "" {
+			if !strings.EqualFold(dbName, whereValue) {
+				continue
+			}
+		}
+
 		db, err := e.Catalog.GetDatabase(dbName)
 		if err != nil {
 			continue

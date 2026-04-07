@@ -106,6 +106,37 @@ func (r *Runner) RunFile(testPath string) TestResult {
 			defaultConn.ExecContext(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS `%s`", t)) //nolint:errcheck
 		}
 	}
+	// Drop stored procedures and functions from previous test
+	if rows, err2 := defaultConn.QueryContext(context.Background(), "SHOW PROCEDURE STATUS WHERE Db = 'test'"); err2 == nil {
+		var procs []string
+		for rows.Next() {
+			var db, name string
+			var rest [14]interface{}
+			ptrs := []interface{}{&db, &name}
+			for i := range rest { ptrs = append(ptrs, &rest[i]) }
+			rows.Scan(ptrs...) //nolint:errcheck
+			procs = append(procs, name)
+		}
+		rows.Close()
+		for _, p := range procs {
+			defaultConn.ExecContext(context.Background(), fmt.Sprintf("DROP PROCEDURE IF EXISTS `%s`", p)) //nolint:errcheck
+		}
+	}
+	if rows, err2 := defaultConn.QueryContext(context.Background(), "SHOW FUNCTION STATUS WHERE Db = 'test'"); err2 == nil {
+		var funcs []string
+		for rows.Next() {
+			var db, name string
+			var rest [14]interface{}
+			ptrs := []interface{}{&db, &name}
+			for i := range rest { ptrs = append(ptrs, &rest[i]) }
+			rows.Scan(ptrs...) //nolint:errcheck
+			funcs = append(funcs, name)
+		}
+		rows.Close()
+		for _, f := range funcs {
+			defaultConn.ExecContext(context.Background(), fmt.Sprintf("DROP FUNCTION IF EXISTS `%s`", f)) //nolint:errcheck
+		}
+	}
 	// Drop user-created databases from previous test (keep system databases)
 	systemDBs := map[string]bool{
 		"information_schema": true, "mysql": true, "performance_schema": true,
