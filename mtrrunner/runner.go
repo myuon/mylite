@@ -729,6 +729,15 @@ func (ctx *execContext) executeLines(lines []string) error {
 
 			handled, skip, err := ctx.handleDirective(directive)
 			if err != nil && !errors.Is(err, errSkipTest) {
+				// Check if the error was expected (e.g., --error before --connect)
+				if ctx.expectedError != "" && handled {
+					if ctx.resultLogEnabled {
+						ctx.output.WriteString(formatMySQLError(err) + "\n")
+					}
+					ctx.expectedError = ""
+					i++
+					continue
+				}
 				return fmt.Errorf("line %d: %v", i+1, err)
 			}
 			if skip {
@@ -817,6 +826,17 @@ func (ctx *execContext) executeLines(lines []string) error {
 			}
 			handled, skip, err := ctx.handleDirective(bareDirective)
 			if err != nil && !errors.Is(err, errSkipTest) {
+				// Check if the error was expected (e.g., --error before connect)
+				if ctx.expectedError != "" && handled {
+					if ctx.resultLogEnabled {
+						ctx.output.WriteString(formatMySQLError(err) + "\n")
+					}
+					ctx.expectedError = ""
+					if !advancedLine {
+						i++
+					}
+					continue
+				}
 				return fmt.Errorf("line %d: %v", i+1, err)
 			}
 			if skip {

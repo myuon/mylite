@@ -702,7 +702,9 @@ func findTopLevelWhereIndex(s string) int {
 // Supports: QUICK/LOW_PRIORITY/IGNORE modifiers, t1.* syntax, db.table syntax
 func (e *Executor) execMultiTableDelete(query string) (*Result, error) {
 	upper := strings.ToUpper(strings.TrimSpace(query))
-	rest := strings.TrimSpace(query[len("DELETE "):])
+	// Normalize whitespace (replace tabs/newlines with spaces) for easier parsing
+	normalizedQuery := strings.Join(strings.Fields(strings.TrimSpace(query)), " ")
+	rest := strings.TrimSpace(normalizedQuery[len("DELETE "):])
 	restUpper := strings.ToUpper(rest)
 
 	// Strip modifiers: LOW_PRIORITY, QUICK, IGNORE
