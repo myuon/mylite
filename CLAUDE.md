@@ -38,7 +38,21 @@ go run ./cmd/mtrrun -suite sys_vars -skipped-only -force
 ```
 
 実行結果は `.mtrrun-logs/result-YYYYMMDD-HHMMSS.json` に自動保存される。
-エージェントは全スイート再実行せず、このログを参照して分析すること。
+
+⚠️ **重要:** テスト結果の分析にはログJSONを使うこと。`mtrrun | grep` のようなパイプは禁止。
+```bash
+# 最新のログを確認
+ls -t .mtrrun-logs/ | head -1
+
+# FAILテストの一覧
+jq -r '.tests[] | select(.status=="fail") | .name' .mtrrun-logs/<latest>.json
+
+# ERRORパターンの集計
+jq -r '.tests[] | select(.status=="error") | .error' .mtrrun-logs/<latest>.json | sort | uniq -c | sort -rn
+
+# 特定スイートのFAIL
+jq -r '.tests[] | select(.suite=="other" and .status=="fail") | .name' .mtrrun-logs/<latest>.json
+```
 
 ## skiplist操作
 
