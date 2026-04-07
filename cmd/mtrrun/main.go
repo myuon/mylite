@@ -112,7 +112,6 @@ func main() {
 	defaultTestdata := resolveTestdataRoot()
 	suiteRoot := flag.String("suite-root", filepath.Join(defaultTestdata, "suite"), "root directory for test suites")
 	includeRoot := flag.String("include-root", filepath.Join(defaultTestdata, "include"), "root directory for include files")
-	verbose := flag.Bool("verbose", false, "verbose output")
 	maxTests := flag.Int("max", 0, "maximum number of tests to run per suite (0=all)")
 	jobs := flag.Int("j", 0, "number of parallel test workers (0=auto, 1=sequential)")
 	timeout := flag.Duration("timeout", 20*time.Second, "timeout per test (0=no timeout)")
@@ -145,13 +144,13 @@ func main() {
 	args := flag.Args()
 	// No args: run all suites (with optional -suite/-test filtering)
 	if len(args) == 0 {
-		runAllSuites(*suiteRoot, *includeRoot, *verbose, *maxTests, *jobs, *timeout, *suiteFilter, *testFilter)
+		runAllSuites(*suiteRoot, *includeRoot, *maxTests, *jobs, *timeout, *suiteFilter, *testFilter)
 		return
 	}
 	target := args[0]
 	// Check if it's a direct .test file path
 	if strings.HasSuffix(target, ".test") {
-		runSingleTest(target, *suiteRoot, *includeRoot, *verbose)
+		runSingleTest(target, *suiteRoot, *includeRoot)
 		return
 	}
 	// Specific test within suite?
@@ -159,7 +158,7 @@ func main() {
 	if len(args) > 1 {
 		argTestFilter = map[string]bool{args[1]: true}
 	}
-	results := runSuite(target, argTestFilter, *suiteRoot, *includeRoot, *verbose, *maxTests, *jobs, *timeout)
+	results := runSuite(target, argTestFilter, *suiteRoot, *includeRoot, *maxTests, *jobs, *timeout)
 	printSuiteSummary(target, results)
 	if hasFailures(results) {
 		os.Exit(1)
@@ -168,7 +167,7 @@ func main() {
 // runAllSuites discovers and runs all test suites sequentially.
 // suiteFilter: comma-separated suite names to run (empty=all enabled).
 // testFilterStr: comma-separated "suite/testname" pairs to run (empty=all).
-func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs int, timeout time.Duration, suiteFilter, testFilterStr string) {
+func runAllSuites(suiteRoot, includeRoot string, maxTests, jobs int, timeout time.Duration, suiteFilter, testFilterStr string) {
 	start := time.Now()
 
 	// Parse -test flag into per-suite test name sets, and collect implied suites.
@@ -270,7 +269,7 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 	var totalPassed, totalFailed, totalSkipped, totalErrors, totalTimeouts, totalTests int
 	for _, sn := range suiteNames {
 		fmt.Fprintf(os.Stderr, "[%s] starting suite %s...\n", time.Now().Format("15:04:05"), sn)
-		results := runSuite(sn, testsBySuite[sn], suiteRoot, includeRoot, verbose, maxTests, jobs, timeout)
+		results := runSuite(sn, testsBySuite[sn], suiteRoot, includeRoot, maxTests, jobs, timeout)
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
 		fmt.Fprintf(os.Stderr, "[%s] finished suite %s (%d tests) goroutines=%d heap=%.0fMB\n",
@@ -351,7 +350,7 @@ func saveResultLog(results []testResultJSON, passed, failed, skipped, errors, ti
 
 // runSuite runs all tests in a single suite and returns results.
 // testFilter: if non-nil, only run tests whose names are in this set.
-func runSuite(suiteName string, testFilter map[string]bool, suiteRoot, includeRoot string, verbose bool, maxTests, jobs int, timeout time.Duration) []mtrrunner.TestResult {
+func runSuite(suiteName string, testFilter map[string]bool, suiteRoot, includeRoot string, maxTests, jobs int, timeout time.Duration) []mtrrunner.TestResult {
 	suiteDir := filepath.Join(suiteRoot, suiteName)
 	if _, err := os.Stat(suiteDir); os.IsNotExist(err) {
 		log.Fatalf("suite directory not found: %s", suiteDir)
@@ -423,9 +422,9 @@ func runSuite(suiteName string, testFilter map[string]bool, suiteRoot, includeRo
 	}
 	var results []mtrrunner.TestResult
 	if numJobs <= 1 {
-		results = runSequential(testPaths, includePaths, searchPaths, verbose, timeout)
+		results = runSequential(testPaths, includePaths, searchPaths, timeout)
 	} else {
-		results = runParallel(testPaths, includePaths, searchPaths, verbose, numJobs, timeout)
+		results = runParallel(testPaths, includePaths, searchPaths, numJobs, timeout)
 	}
 	return append(skippedResults, results...)
 }
@@ -517,7 +516,7 @@ func (w *worker) resetState() {
 	w.exec.SearchPaths = w.searchPaths
 	w.srv.SetExecutor(w.exec)
 }
-func (w *worker) runTest(testPath string, includePaths []string, verbose bool, timeout time.Duration) mtrrunner.TestResult {
+func (w *worker) runTest(testPath string, includePaths []string, timeout time.Duration) mtrrunner.TestResult {
 	testName := strings.TrimSuffix(filepath.Base(testPath), ".test")
 	t0 := time.Now()
 	if timeout > 0 {
@@ -525,7 +524,7 @@ func (w *worker) runTest(testPath string, includePaths []string, verbose bool, t
 		defer cancel()
 		ch := make(chan mtrrunner.TestResult, 1)
 		go func() {
-			ch <- w.runTestInner(testPath, includePaths, verbose)
+			ch <- w.runTestInner(testPath, includePaths)
 		}()
 		select {
 		case result := <-ch:
@@ -542,7 +541,7 @@ func (w *worker) runTest(testPath string, includePaths []string, verbose bool, t
 			}
 		}
 	}
-	result := w.runTestInner(testPath, includePaths, verbose)
+	result := w.runTestInner(testPath, includePaths)
 	result.Elapsed = time.Since(t0)
 	return result
 }
@@ -586,7 +585,7 @@ func (w *worker) rebuild() {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
-func (w *worker) runTestInner(testPath string, includePaths []string, verbose bool) mtrrunner.TestResult {
+func (w *worker) runTestInner(testPath string, includePaths []string) mtrrunner.TestResult {
 	// Reset executor state for full isolation between tests
 	w.resetState()
 	resetSessionState(w.db)
@@ -604,7 +603,6 @@ func (w *worker) runTestInner(testPath string, includePaths []string, verbose bo
 	runner := &mtrrunner.Runner{
 		DB:           testDB,
 		IncludePaths: includePaths,
-		Verbose:      verbose,
 		TmpDir:       w.tmpDir,
 		ServerAddr:   w.addr,
 	}
@@ -615,35 +613,7 @@ type indexedResult struct {
 	result mtrrunner.TestResult
 }
 
-// printVerboseResult prints a single test result line for -verbose mode.
-// mu may be nil when called from sequential execution.
-func printVerboseResult(r mtrrunner.TestResult, mu *sync.Mutex) {
-	var line string
-	timeStr := fmt.Sprintf("(%.1fs)", r.Elapsed.Seconds())
-	switch {
-	case r.Timeout:
-		line = fmt.Sprintf("  TIMEOUT: %s %s", r.Name, timeStr)
-	case r.Skipped:
-		line = fmt.Sprintf("  SKIP: %s", r.Name)
-	case r.Passed:
-		line = fmt.Sprintf("  PASS: %s %s", r.Name, timeStr)
-	case r.Error != "":
-		line = fmt.Sprintf("  ERROR: %s: %s %s", r.Name, r.Error, timeStr)
-	default:
-		diffLines := 0
-		if r.Diff != "" {
-			diffLines = len(strings.Split(r.Diff, "\n"))
-		}
-		line = fmt.Sprintf("  FAIL: %s (diff_lines=%d) %s", r.Name, diffLines, timeStr)
-	}
-	if mu != nil {
-		mu.Lock()
-		defer mu.Unlock()
-	}
-	fmt.Println(line)
-}
-
-func runParallel(testPaths []string, includePaths, searchPaths []string, verbose bool, numJobs int, timeout time.Duration) []mtrrunner.TestResult {
+func runParallel(testPaths []string, includePaths, searchPaths []string, numJobs int, timeout time.Duration) []mtrrunner.TestResult {
 	// Create worker pool
 	workers := make([]*worker, numJobs)
 	for i := 0; i < numJobs; i++ {
@@ -685,7 +655,7 @@ func runParallel(testPaths []string, includePaths, searchPaths []string, verbose
 		go func(w *worker) {
 			defer wg.Done()
 			for t := range testCh {
-				result := w.runTest(t.path, includePaths, verbose, timeout)
+				result := w.runTest(t.path, includePaths, timeout)
 				resultCh <- indexedResult{index: t.index, result: result}
 			}
 		}(workers[i])
@@ -700,7 +670,7 @@ func runParallel(testPaths []string, includePaths, searchPaths []string, verbose
 	}
 	return results
 }
-func runSequential(testPaths []string, includePaths, searchPaths []string, verbose bool, timeout time.Duration) []mtrrunner.TestResult {
+func runSequential(testPaths []string, includePaths, searchPaths []string, timeout time.Duration) []mtrrunner.TestResult {
 	w, err := newWorker(searchPaths)
 	if err != nil {
 		log.Fatalf("failed to create worker: %v", err)
@@ -713,7 +683,7 @@ func runSequential(testPaths []string, includePaths, searchPaths []string, verbo
 	db.Close()
 	var results []mtrrunner.TestResult
 	for _, testPath := range testPaths {
-		result := w.runTest(testPath, includePaths, verbose, timeout)
+		result := w.runTest(testPath, includePaths, timeout)
 		results = append(results, result)
 	}
 	return results
@@ -745,7 +715,7 @@ func hasFailures(results []mtrrunner.TestResult) bool {
 }
 func printSuiteSummary(suiteName string, results []mtrrunner.TestResult) {
 	for _, r := range results {
-		printResult(r, false)
+		printResult(r)
 	}
 	p, f, s, e, t := countResults(results)
 	fmt.Printf("\n=== Summary ===\n")
@@ -760,7 +730,7 @@ func printSuiteSummaryCompact(suiteName string, total, passed, failed, skipped, 
 	fmt.Printf("%-30s %4d tests: %4d passed, %4d failed, %4d skipped, %4d errors, %4d timeouts  [%s]  (%.1fs)\n",
 		suiteName, total, passed, failed, skipped, errors, timeouts, status, elapsed.Seconds())
 }
-func runSingleTest(target, suiteRoot, includeRoot string, verbose bool) {
+func runSingleTest(target, suiteRoot, includeRoot string) {
 	searchPaths := []string{suiteRoot, includeRoot, filepath.Dir(suiteRoot)}
 	includePaths := []string{includeRoot}
 	suiteDir := filepath.Dir(filepath.Dir(target))
@@ -784,8 +754,8 @@ func runSingleTest(target, suiteRoot, includeRoot string, verbose bool) {
 		log.Fatalf("failed to connect to mylite: %v", err)
 	}
 	db.Close()
-	result := w.runTest(target, includePaths, verbose, 0)
-	printResult(result, verbose)
+	result := w.runTest(target, includePaths, 0)
+	printResult(result)
 	if !result.Passed && !result.Skipped {
 		os.Exit(1)
 	}
@@ -807,7 +777,7 @@ func connectDB(addr string) (*sql.DB, error) {
 	}
 	return nil, err
 }
-func printResult(r mtrrunner.TestResult, verbose bool) {
+func printResult(r mtrrunner.TestResult) {
 	timeStr := fmt.Sprintf("(%.1fs)", r.Elapsed.Seconds())
 	if r.Timeout {
 		fmt.Printf("TIMEOUT %-38s %s\n", r.Name, timeStr)
@@ -823,9 +793,6 @@ func printResult(r mtrrunner.TestResult, verbose bool) {
 	}
 	if r.Error != "" {
 		fmt.Printf("ERROR %-40s %s: %s\n", r.Name, timeStr, r.Error)
-		if verbose && r.Output != "" {
-			fmt.Printf("  Output:\n%s\n", indent(r.Output))
-		}
 		return
 	}
 	fmt.Printf("FAIL  %-40s %s\n", r.Name, timeStr)

@@ -13,17 +13,7 @@ go test ./... -count=1
 
 ```bash
 # 全スイート実行
-go run ./cmd/mtrrun -verbose
-
-# テスト結果のサマリのみ
 go run ./cmd/mtrrun
-```
-
-## mtrrunの使い方（追加オプション）
-
-```bash
-# 全スイート実行
-go run ./cmd/mtrrun -verbose
 
 # 特定スイートのみ実行
 go run ./cmd/mtrrun -suite sys_vars
@@ -37,9 +27,15 @@ go run ./cmd/mtrrun -test sys_vars/gtid_owned_basic,other/bool
 go run ./cmd/mtrrun -suite sys_vars -skipped-only -force
 ```
 
-実行結果は `.mtrrun-logs/result-YYYYMMDD-HHMMSS.json` に自動保存される。
+stdoutにはサマリとログパスのみ出力される:
+```
+=== Grand Total ===
+Suites: 29, Total: 3345, Passed: 1553, Failed: 367, Skipped: 1227, Errors: 191, Timeouts: 2
+Time: 143.6s
+Results saved to: .mtrrun-logs/result-20260406-162232.json
+```
 
-mtrrunはstdoutにGrand TotalとJSONログパスのみ出力する。テスト結果の詳細はJSONログを参照すること。
+テスト結果の詳細は `.mtrrun-logs/` のJSONログを参照すること。
 ```bash
 # 最新のログを確認
 ls -t .mtrrun-logs/ | head -1

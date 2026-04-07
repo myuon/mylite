@@ -54,9 +54,8 @@ type TestResult struct {
 type Runner struct {
 	DB           *sql.DB
 	IncludePaths []string // directories to search for --source files
-	Verbose      bool
-	TmpDir       string // temporary directory for file operations ($MYSQLTEST_VARDIR)
-	ServerAddr   string // e.g. "127.0.0.1:PORT" for external tool connections
+	TmpDir       string   // temporary directory for file operations ($MYSQLTEST_VARDIR)
+	ServerAddr   string   // e.g. "127.0.0.1:PORT" for external tool connections
 }
 
 // RunFile executes a single .test file and compares output to .result file.
