@@ -298,22 +298,6 @@ func runAllSuites(suiteRoot, includeRoot string, verbose bool, maxTests, jobs in
 			}
 			allResultsJSON = append(allResultsJSON, jr)
 		}
-		for _, r := range results {
-			if r.Error != "" {
-				fmt.Printf("  ERROR: %s: %s\n", r.Name, r.Error[:min(len(r.Error), 200)])
-			}
-			if !r.Passed && !r.Skipped && !r.Timeout && r.Error == "" {
-				diffLines := 0
-				if r.Diff != "" {
-					diffLines = len(strings.Split(r.Diff, "\n"))
-				}
-				fmt.Printf("  FAIL: %s (diff_lines=%d)\n", r.Name, diffLines)
-				if r.Diff != "" && diffLines <= 200 {
-					fmt.Printf("  DIFF:\n%s\n", r.Diff)
-				}
-			}
-		}
-		printSuiteSummaryCompact(sn, len(results), p, f, s, e, t, 0)
 		totalPassed += p
 		totalFailed += f
 		totalSkipped += s
@@ -696,16 +680,12 @@ func runParallel(testPaths []string, includePaths, searchPaths []string, verbose
 	close(testCh)
 	resultCh := make(chan indexedResult, len(testPaths))
 	var wg sync.WaitGroup
-	var printMu sync.Mutex
 	for i := 0; i < numJobs; i++ {
 		wg.Add(1)
 		go func(w *worker) {
 			defer wg.Done()
 			for t := range testCh {
 				result := w.runTest(t.path, includePaths, verbose, timeout)
-				if verbose {
-					printVerboseResult(result, &printMu)
-				}
 				resultCh <- indexedResult{index: t.index, result: result}
 			}
 		}(workers[i])
@@ -734,9 +714,6 @@ func runSequential(testPaths []string, includePaths, searchPaths []string, verbo
 	var results []mtrrunner.TestResult
 	for _, testPath := range testPaths {
 		result := w.runTest(testPath, includePaths, verbose, timeout)
-		if verbose {
-			printVerboseResult(result, nil)
-		}
 		results = append(results, result)
 	}
 	return results

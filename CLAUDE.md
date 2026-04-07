@@ -39,7 +39,7 @@ go run ./cmd/mtrrun -suite sys_vars -skipped-only -force
 
 実行結果は `.mtrrun-logs/result-YYYYMMDD-HHMMSS.json` に自動保存される。
 
-⚠️ **重要:** テスト結果の分析にはログJSONを使うこと。`mtrrun | grep` のようなパイプは禁止。
+mtrrunはstdoutにGrand TotalとJSONログパスのみ出力する。テスト結果の詳細はJSONログを参照すること。
 ```bash
 # 最新のログを確認
 ls -t .mtrrun-logs/ | head -1
