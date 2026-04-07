@@ -756,11 +756,6 @@ func splitByComma(s string) []string {
 
 // execDropProcedureFallback handles DROP PROCEDURE [IF EXISTS] name
 func (e *Executor) execDropProcedureFallback(query string) (*Result, error) {
-	db, err := e.Catalog.GetDatabase(e.CurrentDB)
-	if err != nil {
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
-	}
-
 	rest := strings.TrimSpace(query[len("DROP PROCEDURE"):])
 	ifExists := false
 	restUpper := strings.ToUpper(rest)
@@ -771,21 +766,21 @@ func (e *Executor) execDropProcedureFallback(query string) (*Result, error) {
 	name := strings.TrimRight(strings.TrimSpace(rest), ";")
 	name = strings.Trim(name, "`")
 
-	// Handle qualified name (schema.procedure)
-	targetDB := db
+	// Handle qualified name (schema.procedure) first to avoid looking up CurrentDB
 	dbName := e.CurrentDB
 	if dotIdx := strings.Index(name, "."); dotIdx >= 0 {
 		dbName = strings.Trim(name[:dotIdx], "`")
 		name = strings.Trim(name[dotIdx+1:], "`")
-		targetDB2, err2 := e.Catalog.GetDatabase(dbName)
-		if err2 != nil {
-			if ifExists {
-				return &Result{}, nil
-			}
-			return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", dbName, name))
-		}
-		targetDB = targetDB2
 	}
+
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		if ifExists {
+			return &Result{}, nil
+		}
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
+	}
+	targetDB := db
 
 	if targetDB.GetProcedure(name) == nil && !ifExists {
 		return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", dbName, name))
@@ -796,14 +791,30 @@ func (e *Executor) execDropProcedureFallback(query string) (*Result, error) {
 
 // execDropProcedureAST handles DROP PROCEDURE parsed by vitess.
 func (e *Executor) execDropProcedureAST(stmt *sqlparser.DropProcedure) (*Result, error) {
-	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	// Determine database: use qualifier if present, otherwise use CurrentDB
+	dbName := e.CurrentDB
+	if !stmt.Name.Qualifier.IsEmpty() {
+		dbName = stmt.Name.Qualifier.String()
+	}
+	db, err := e.Catalog.GetDatabase(dbName)
 	if err != nil {
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+		if stmt.IfExists {
+			return &Result{}, nil
+		}
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
 	}
 	name := stmt.Name.Name.String()
 	name = strings.Trim(name, "`")
 	if db.GetProcedure(name) == nil && !stmt.IfExists {
-		return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", e.CurrentDB, name))
+		return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", dbName, name))
+	}
+	// MySQL tries to revoke privileges from mysql.procs_priv when dropping a routine.
+	// If the table doesn't exist, return an error and a warning.
+	if mysqlDB, err2 := e.Catalog.GetDatabase("mysql"); err2 == nil {
+		if _, tblErr := mysqlDB.GetTable("procs_priv"); tblErr != nil {
+			e.warnings = append(e.warnings, Warning{Level: "Warning", Code: 1405, Message: "Failed to revoke all privileges to dropped routine"})
+			return nil, mysqlError(1146, "42S02", "Table 'mysql.procs_priv' doesn't exist")
+		}
 	}
 	db.DropProcedure(name)
 	return &Result{}, nil
@@ -900,6 +911,20 @@ func (e *Executor) callProcedureByNameInDB(dbName string, procName string, argSt
 	bodyResult, err := e.execRoutineBody(proc.Body, paramVars)
 	e.routineDepth--
 	if err != nil {
+		// SIGNAL with SQLSTATE class '01' (warning) should produce a warning, not an error.
+		var sigErr *signalError
+		if errors.As(err, &sigErr) && strings.HasPrefix(sigErr.sqlState, "01") {
+			code := sigErr.mysqlErrno
+			if code == 0 {
+				code = 1642 // ER_SIGNAL_WARN
+			}
+			msg := sigErr.messageText
+			if msg == "" {
+				msg = "Unhandled user-defined warning condition"
+			}
+			e.addWarning("Warning", code, msg)
+			return &Result{}, nil
+		}
 		return nil, err
 	}
 	// If the routine body produced a result set (e.g. from EXIT HANDLER), return it.
@@ -950,15 +975,22 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 					paramVars[param.Name] = nil
 				}
 			} else {
-				// Literal value - only valid for IN params
-				if param.Mode == "IN" {
-					if n, err := strconv.ParseInt(argVal, 10, 64); err == nil {
-						paramVars[param.Name] = n
-					} else {
-						paramVars[param.Name] = strings.Trim(argVal, "'\"")
-					}
+				// Literal value or NULL passed as argument
+				var literalVal interface{}
+				upperArgVal := strings.ToUpper(argVal)
+				if upperArgVal == "NULL" {
+					literalVal = nil
+				} else if n, err := strconv.ParseInt(argVal, 10, 64); err == nil {
+					literalVal = n
+				} else {
+					literalVal = strings.Trim(argVal, "'\"")
 				}
-				// Literals for OUT/INOUT are silently ignored (no writeback target)
+				if param.Mode == "IN" || param.Mode == "INOUT" {
+					paramVars[param.Name] = literalVal
+				} else if param.Mode == "OUT" {
+					paramVars[param.Name] = nil
+				}
+				// Note: INOUT and OUT with literal args have no writeback target
 			}
 		}
 	}
@@ -970,6 +1002,7 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 		localVarTypes: make(map[string]string),
 		cursors:       make(map[string]*cursorState),
 		cursorDefs:    make(map[string]string),
+		conditionDefs: make(map[string]string),
 	}
 	for k, v := range paramVars {
 		ctx.localVars[k] = v
@@ -979,6 +1012,28 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 	bodyResult, err := e.execRoutineBodyWithContext(proc.Body, ctx)
 	e.routineDepth--
 	if err != nil {
+		// SIGNAL with SQLSTATE class '01' (warning) should produce a warning, not an error.
+		var sigErr *signalError
+		if errors.As(err, &sigErr) && strings.HasPrefix(sigErr.sqlState, "01") {
+			code := sigErr.mysqlErrno
+			if code == 0 {
+				code = 1642 // ER_SIGNAL_WARN
+			}
+			msg := sigErr.messageText
+			if msg == "" {
+				msg = "Unhandled user-defined warning condition"
+			}
+			e.addWarning("Warning", code, msg)
+			// Still write back OUT/INOUT parameters before returning
+			for paramName, userVar := range outTargets {
+				val := ctx.localVars[paramName]
+				if e.userVars == nil {
+					e.userVars = make(map[string]interface{})
+				}
+				e.userVars[userVar] = val
+			}
+			return &Result{}, nil
+		}
 		return nil, err
 	}
 
@@ -1273,6 +1328,14 @@ func (e *Executor) execDropFunction(query string) (*Result, error) {
 	if db.GetFunction(name) == nil && !ifExists {
 		return nil, mysqlError(1305, "42000", fmt.Sprintf("FUNCTION %s.%s does not exist", e.CurrentDB, name))
 	}
+	// MySQL tries to revoke privileges from mysql.procs_priv when dropping a routine.
+	// If the table doesn't exist, return an error and a warning.
+	if mysqlDB, err2 := e.Catalog.GetDatabase("mysql"); err2 == nil {
+		if _, tblErr := mysqlDB.GetTable("procs_priv"); tblErr != nil {
+			e.warnings = append(e.warnings, Warning{Level: "Warning", Code: 1405, Message: "Failed to revoke all privileges to dropped routine"})
+			return nil, mysqlError(1146, "42S02", "Table 'mysql.procs_priv' doesn't exist")
+		}
+	}
 	db.DropFunction(name)
 	return &Result{}, nil
 }
@@ -1392,6 +1455,7 @@ type routineContext struct {
 	localVarTypes      map[string]string // declared SQL type for each local variable (e.g. "DOUBLE(10,3)")
 	cursors            map[string]*cursorState
 	cursorDefs         map[string]string
+	conditionDefs      map[string]string // condition name -> SQLSTATE (from DECLARE x CONDITION FOR SQLSTATE ...)
 	notFoundHandlerVar string
 	done               bool
 	handlers           []handlerDef
@@ -1410,6 +1474,7 @@ func (ctx *routineContext) childContext() *routineContext {
 		localVarTypes:      ctx.localVarTypes,
 		cursors:            ctx.cursors,
 		cursorDefs:         ctx.cursorDefs,
+		conditionDefs:      ctx.conditionDefs,
 		notFoundHandlerVar: ctx.notFoundHandlerVar,
 		done:               ctx.done,
 		handlers:           ctx.handlers,
@@ -1428,6 +1493,7 @@ func (e *Executor) execRoutineBody(body []string, paramVars map[string]interface
 		localVarTypes: make(map[string]string),
 		cursors:       make(map[string]*cursorState),
 		cursorDefs:    make(map[string]string),
+		conditionDefs: make(map[string]string),
 	}
 	for k, v := range paramVars {
 		ctx.localVars[k] = v
@@ -1607,8 +1673,37 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 				}
 				// Check if this is a CONDITION declaration (DECLARE x CONDITION FOR ...)
 				if typeIdx < len(declParts) && strings.ToUpper(declParts[typeIdx]) == "CONDITION" {
-					// DECLARE condition_name CONDITION FOR SQLSTATE VALUE 'xxxxx'
-					// We just register it as a no-op for now
+					// DECLARE condition_name CONDITION FOR SQLSTATE [VALUE] 'xxxxx'
+					// Parse and store the SQLSTATE mapping for use in SIGNAL
+					if ctx != nil && ctx.conditionDefs != nil && len(varNames) > 0 {
+						condRestUpper := strings.ToUpper(rest)
+						// Find "FOR" keyword
+						forIdx := strings.Index(condRestUpper, " FOR ")
+						if forIdx >= 0 {
+							forRest := strings.TrimSpace(rest[forIdx+5:])
+							forRestUpper := strings.ToUpper(forRest)
+							// Skip optional SQLSTATE keyword
+							if strings.HasPrefix(forRestUpper, "SQLSTATE") {
+								forRest = strings.TrimSpace(forRest[len("SQLSTATE"):])
+								forRestUpper = strings.ToUpper(forRest)
+							}
+							// Skip optional VALUE keyword
+							if strings.HasPrefix(forRestUpper, "VALUE ") {
+								forRest = strings.TrimSpace(forRest[len("VALUE "):])
+							}
+							// Extract the quoted SQLSTATE string
+							if len(forRest) > 0 && (forRest[0] == '\'' || forRest[0] == '"') {
+								q := forRest[0]
+								end := strings.IndexByte(forRest[1:], q)
+								if end >= 0 {
+									sqlState := forRest[1 : end+1]
+									for _, condName := range varNames {
+										ctx.conditionDefs[strings.ToLower(condName)] = sqlState
+									}
+								}
+							}
+						}
+					}
 					continue
 				}
 
@@ -1669,9 +1764,11 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 					fullTypeName = strings.Join(typeParts, " ")
 				}
 				for _, vn := range varNames {
-					localVars[vn] = defaultVal
+					// Strip backtick quotes from variable name
+					cleanVn := strings.Trim(vn, "`")
+					localVars[cleanVn] = defaultVal
 					if ctx.localVarTypes != nil && fullTypeName != "" {
-						ctx.localVarTypes[strings.ToLower(vn)] = fullTypeName
+						ctx.localVarTypes[strings.ToLower(cleanVn)] = fullTypeName
 					}
 				}
 			}
@@ -2080,7 +2177,11 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 
 		// Handle SIGNAL sqlstate
 		if strings.HasPrefix(stmtUpper, "SIGNAL ") {
-			sigErr := e.parseSignal(stmtStr, localVars)
+			var condDefs map[string]string
+			if ctx != nil {
+				condDefs = ctx.conditionDefs
+			}
+			sigErr := e.parseSignalWithConditions(stmtStr, localVars, condDefs)
 			// Check if there's a matching handler
 			handled, exitFlag := e.tryHandler(sigErr, ctx)
 			if handled {
@@ -2103,7 +2204,11 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 				// No current signal context; raise default
 				return nil, &signalError{sqlState: "45000"}
 			}
-			sigErr := e.parseSignal(stmtStr, localVars)
+			var condDefs map[string]string
+			if ctx != nil {
+				condDefs = ctx.conditionDefs
+			}
+			sigErr := e.parseSignalWithConditions(stmtStr, localVars, condDefs)
 			return nil, sigErr
 		}
 
@@ -2403,6 +2508,12 @@ func (e *Executor) execCaseBlockCtx(block string, ctx *routineContext) (interfac
 
 // parseSignal parses a SIGNAL or RESIGNAL statement and returns a signalError.
 func (e *Executor) parseSignal(stmtStr string, localVars map[string]interface{}) *signalError {
+	return e.parseSignalWithConditions(stmtStr, localVars, nil)
+}
+
+// parseSignalWithConditions parses a SIGNAL or RESIGNAL statement, resolving
+// condition names from the provided conditionDefs map (name -> SQLSTATE).
+func (e *Executor) parseSignalWithConditions(stmtStr string, localVars map[string]interface{}, conditionDefs map[string]string) *signalError {
 	upper := strings.ToUpper(strings.TrimSpace(stmtStr))
 	rest := stmtStr
 	if strings.HasPrefix(upper, "SIGNAL ") {
@@ -2434,6 +2545,35 @@ func (e *Executor) parseSignal(stmtStr string, localVars map[string]interface{})
 		afterUpper = strings.ToUpper(after)
 		if strings.HasPrefix(afterUpper, "SET ") {
 			e.parseSignalSetClause(after[4:], sigErr, localVars)
+		}
+	} else {
+		// May be a condition name reference: SIGNAL condition_name [SET ...]
+		// Extract the first token as potential condition name
+		setIdx := -1
+		restForSet := rest
+		restUpperForSet := restUpper
+		// Find SET keyword (at word boundary)
+		if idx := strings.Index(restUpperForSet, " SET "); idx >= 0 {
+			setIdx = idx
+		}
+		var condName string
+		if setIdx >= 0 {
+			condName = strings.TrimSpace(rest[:setIdx])
+			restForSet = strings.TrimSpace(rest[setIdx+1:]) // "SET ..."
+		} else {
+			condName = strings.TrimSpace(strings.TrimRight(rest, ";"))
+		}
+		// Strip backtick quotes from condition name
+		condName = strings.Trim(condName, "`")
+		// Look up condition name in conditionDefs
+		if conditionDefs != nil {
+			if sqlState, ok := conditionDefs[strings.ToLower(condName)]; ok {
+				sigErr.sqlState = sqlState
+			}
+		}
+		// Parse SET clause if present
+		if setIdx >= 0 && strings.HasPrefix(strings.ToUpper(restForSet), "SET ") {
+			e.parseSignalSetClause(restForSet[4:], sigErr, localVars)
 		}
 	}
 
@@ -2597,6 +2737,12 @@ func (e *Executor) substituteLocalVars(sql string, vars map[string]interface{}) 
 		}
 		// Replace variable references that appear as standalone words
 		result = replaceWordBoundary(result, pair.key, valStr)
+		// Also replace backtick-quoted references: `varname` -> value
+		// This handles cases like SELECT `get` where `get` is a local variable
+		backtickForm := "`" + pair.key + "`"
+		if strings.Contains(result, backtickForm) {
+			result = strings.ReplaceAll(result, backtickForm, valStr)
+		}
 	}
 	return result
 }
@@ -2904,6 +3050,7 @@ func (e *Executor) execIfBlock(block string, localVars map[string]interface{}, c
 			localVars:          localVars,
 			cursors:            cursors,
 			cursorDefs:         cursorDefs,
+			conditionDefs:      make(map[string]string),
 			notFoundHandlerVar: notFoundHandlerVar,
 			done:               *done,
 			handlers:           handlers,
@@ -3175,6 +3322,7 @@ func (e *Executor) execRepeatBlock(block string, localVars map[string]interface{
 			localVars:          localVars,
 			cursors:            cursors,
 			cursorDefs:         cursorDefs,
+			conditionDefs:      make(map[string]string),
 			notFoundHandlerVar: notFoundHandlerVar,
 			done:               *done,
 			handlers:           handlers,
@@ -3244,6 +3392,7 @@ func (e *Executor) execWhileBlock(block string, localVars map[string]interface{}
 			localVars:          localVars,
 			cursors:            cursors,
 			cursorDefs:         cursorDefs,
+			conditionDefs:      make(map[string]string),
 			notFoundHandlerVar: notFoundHandlerVar,
 			done:               *done,
 			handlers:           handlers,

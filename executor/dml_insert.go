@@ -712,16 +712,20 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					overflowStr := intOvErr.val
 					if intOvErr.kind == "BINARY" {
 						isBinCol := false
+						isCharCol := false
 						for _, col := range tbl.Def.Columns {
 							if col.Name == colNames[i] {
 								colUpper := strings.ToUpper(col.Type)
-								if strings.HasPrefix(colUpper, "BINARY") || strings.HasPrefix(colUpper, "VARBINARY") {
+								if strings.HasPrefix(colUpper, "BINARY") || strings.HasPrefix(colUpper, "VARBINARY") || colUpper == "BLOB" || colUpper == "TINYBLOB" || colUpper == "MEDIUMBLOB" || colUpper == "LONGBLOB" {
 									isBinCol = true
+								}
+								if strings.Contains(colUpper, "CHAR") || strings.Contains(colUpper, "TEXT") {
+									isCharCol = true
 								}
 								break
 							}
 						}
-						if isBinCol {
+						if isBinCol || isCharCol {
 							// Decode hex string to binary bytes
 							if bs, herr := hex.DecodeString(overflowStr); herr == nil {
 								v = string(bs)
@@ -1237,19 +1241,40 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					if isNumericType {
 						switch val := rv.(type) {
 						case int64:
+							outOfRange := false
 							if isUnsigned && val < 0 {
+								outOfRange = true
+							} else if isIntType {
+								// Check signed/unsigned range by integer type
+								min, max := insertIntTypeRange(colUpper)
+								if val < min || val > max {
+									outOfRange = true
+								}
+							}
+							if outOfRange {
 								if bool(stmt.Ignore) {
 									e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
-									row[col.Name] = int64(0)
+									row[col.Name] = insertClampToIntTypeRange(val, colUpper)
 								} else {
 									return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
 								}
 							}
 						case float64:
+							outOfRangeF := false
 							if isUnsigned && val < 0 {
+								outOfRangeF = true
+							} else if isIntType {
+								minF, maxF := float64(math.MinInt64), float64(math.MaxInt64)
+								rMin, rMax := insertIntTypeRange(colUpper)
+								minF, maxF = float64(rMin), float64(rMax)
+								if val < minF || val > maxF {
+									outOfRangeF = true
+								}
+							}
+							if outOfRangeF {
 								if bool(stmt.Ignore) {
 									e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
-									row[col.Name] = int64(0)
+									row[col.Name] = insertClampToIntTypeRangeFloat(val, colUpper)
 								} else {
 									return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
 								}
@@ -1269,7 +1294,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 									row[col.Name] = int64(0)
 									break
 								}
-								if _, perr := strconv.ParseInt(numText, 10, 64); perr != nil {
+								if parsedInt, perr := strconv.ParseInt(numText, 10, 64); perr != nil {
 									if _, perr := strconv.ParseFloat(numText, 64); perr != nil {
 										if bool(stmt.Ignore) {
 											e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect integer value: '%s' for column '%s' at row 1", val, col.Name))
@@ -1277,6 +1302,17 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 											break
 										}
 										return nil, mysqlError(1366, "HY000", fmt.Sprintf("Incorrect integer value: '%s' for column '%s' at row 1", val, col.Name))
+									}
+								} else {
+									// Check range for the specific integer type
+									rMin, rMax := insertIntTypeRange(colUpper)
+									if parsedInt < rMin || parsedInt > rMax {
+										if bool(stmt.Ignore) {
+											e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+											row[col.Name] = insertClampToIntTypeRange(parsedInt, colUpper)
+											break
+										}
+										return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
 									}
 								}
 							} else if isDecimalType {
@@ -1555,12 +1591,22 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		if viewCheckExpr != nil {
 			match, err := e.evalWhere(viewCheckExpr, row)
 			if err != nil || !match {
+				if bool(stmt.Ignore) {
+					// INSERT IGNORE: skip row and add warning
+					e.addWarning("Warning", 1369, fmt.Sprintf("CHECK OPTION failed '%s.%s'", e.CurrentDB, originalViewName))
+					continue
+				}
 				return nil, mysqlError(1369, "HY000", fmt.Sprintf("CHECK OPTION failed '%s.%s'", e.CurrentDB, originalViewName))
 			}
 		}
 
 		// Enforce FOREIGN KEY constraints: verify parent row exists
 		if err := e.checkForeignKeyOnInsert(insertDB, tableName, row); err != nil {
+			if bool(stmt.Ignore) {
+				// INSERT IGNORE: skip row and add warning
+				e.addWarning("Warning", 1452, err.Error())
+				continue
+			}
 			return nil, err
 		}
 
@@ -1617,6 +1663,59 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		if e.inTransaction && e.txnActiveSet != nil {
 			row["__txn_conn_id__"] = e.connectionID
 		}
+
+		// In strict mode, pre-validate auto_increment value range.
+		// MySQL computes the next AI value using auto_increment_increment and
+		// auto_increment_offset. If the resulting value exceeds the column type's
+		// range, strict mode must reject the insert.
+		if autoGeneratedThisRow && e.isStrictMode() && autoColName != "" {
+			// Compute the next AI value respecting auto_increment_increment/offset
+			cur := tbl.AutoIncrementValue()
+			aiIncrement := int64(1)
+			aiOffset := int64(1)
+			if v, ok := e.getSysVar("auto_increment_increment"); ok {
+				if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+					aiIncrement = n
+				}
+			}
+			if v, ok := e.getSysVar("auto_increment_offset"); ok {
+				if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+					aiOffset = n
+				}
+			}
+			// Compute next value: smallest value >= cur+1 such that (value - offset) % increment == 0
+			nextAI := cur + 1
+			if aiIncrement > 1 || aiOffset != 1 {
+				// Align nextAI to the sequence offset + k*increment
+				base := aiOffset
+				if nextAI > base {
+					rem := (nextAI - base) % aiIncrement
+					if rem != 0 {
+						nextAI = nextAI + (aiIncrement - rem)
+					}
+				} else {
+					nextAI = base
+				}
+			}
+			// Find the auto_increment column def and check range
+			for _, col := range tbl.Def.Columns {
+				if col.AutoIncrement && strings.EqualFold(col.Name, autoColName) {
+					if checkErr := checkIntegerStrict(col.Type, col.Name, nextAI); checkErr != nil {
+						if bool(stmt.Ignore) {
+							e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+							// Clamp to max
+							_, maxVal := insertIntTypeRange(strings.ToUpper(col.Type))
+							row[col.Name] = maxVal
+							autoGeneratedThisRow = false // value is now explicit
+						} else {
+							return nil, checkErr
+						}
+					}
+					break
+				}
+			}
+		}
+
 		id, err := tbl.Insert(row, noAutoValueOnZero)
 		if err != nil {
 			if lockMode0_2 {
@@ -2051,4 +2150,68 @@ func formatBytesForWarning(s string) string {
 		return s
 	}
 	return result.String()
+}
+
+// insertIntTypeRange returns (min, max) int64 valid range for the given integer column type.
+func insertIntTypeRange(colUpper string) (int64, int64) {
+	isUnsigned := strings.Contains(colUpper, "UNSIGNED")
+	base := colUpper
+	if i := strings.IndexByte(base, '('); i >= 0 {
+		base = base[:i]
+	}
+	base = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(base, "UNSIGNED", ""), "ZEROFILL", ""))
+	base = strings.TrimSpace(base)
+	switch base {
+	case "TINYINT":
+		if isUnsigned {
+			return 0, 255
+		}
+		return -128, 127
+	case "SMALLINT":
+		if isUnsigned {
+			return 0, 65535
+		}
+		return -32768, 32767
+	case "MEDIUMINT":
+		if isUnsigned {
+			return 0, 16777215
+		}
+		return -8388608, 8388607
+	case "INT", "INTEGER":
+		if isUnsigned {
+			return 0, 4294967295
+		}
+		return -2147483648, 2147483647
+	case "BIGINT":
+		if isUnsigned {
+			return 0, math.MaxInt64 // can't represent MaxUint64 in int64
+		}
+		return math.MinInt64, math.MaxInt64
+	}
+	return math.MinInt64, math.MaxInt64
+}
+
+// insertClampToIntTypeRange clamps val to the valid range for colUpper.
+func insertClampToIntTypeRange(val int64, colUpper string) int64 {
+	min, max := insertIntTypeRange(colUpper)
+	if val < min {
+		return min
+	}
+	if val > max {
+		return max
+	}
+	return val
+}
+
+// insertClampToIntTypeRangeFloat clamps float64 val to integer type range.
+func insertClampToIntTypeRangeFloat(val float64, colUpper string) int64 {
+	min, max := insertIntTypeRange(colUpper)
+	minF, maxF := float64(min), float64(max)
+	if val < minF {
+		return min
+	}
+	if val > maxF {
+		return max
+	}
+	return int64(val)
 }

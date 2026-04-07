@@ -86,6 +86,13 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 			targetDB = pair.ToTable.Qualifier.String()
 		}
 
+		// Validate identifier lengths (MySQL max is 64 characters)
+		if len(newName) > 64 {
+			return nil, mysqlError(1059, "42000", fmt.Sprintf("Identifier name '%s' is too long", newName))
+		}
+		if len(oldName) > 64 {
+			return nil, mysqlError(1059, "42000", fmt.Sprintf("Identifier name '%s' is too long", oldName))
+		}
 		// Validate databases exist
 		if _, err := e.Catalog.GetDatabase(targetDB); err != nil {
 			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", targetDB))
@@ -94,13 +101,20 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", srcDB))
 		}
 
+		// Skip validation for no-op renames (same table, same db) - MySQL allows this
+		isSameTable := strings.EqualFold(srcDB, targetDB) && strings.EqualFold(oldName, newName)
 		// Validate target doesn't exist first (MySQL checks destination conflicts before source existence)
-		if tableExists(targetDB, newName) {
+		if !isSameTable && tableExists(targetDB, newName) {
 			return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newName))
 		}
 		// Validate source exists (considering prior simulated renames)
 		if !tableExists(srcDB, oldName) {
 			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", srcDB, oldName))
+		}
+
+		// Skip no-op renames (same table, same db) - MySQL allows this silently
+		if isSameTable {
+			continue
 		}
 
 		// Simulate this rename for subsequent validations
@@ -140,6 +154,27 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 		}
 		e.removeInnoDBStatsRows(p.srcDB, p.oldName)
 		e.upsertInnoDBStatsRows(p.targetDB, p.newName, e.tableRowCount(p.targetDB, p.newName))
+		// Handle temporary table tracking: if the renamed table was a temp table,
+		// update the tempTables map and restore any saved permanent table.
+		if e.tempTables != nil && e.tempTables[p.oldName] {
+			delete(e.tempTables, p.oldName)
+			e.tempTables[p.newName] = true
+			// Restore the saved permanent table for the old name (if any).
+			if saved, ok := e.tempTableSavedPermanent[p.oldName]; ok {
+				delete(e.tempTableSavedPermanent, p.oldName)
+				// Restore permanent table definition in catalog
+				if restoreDef := saved.def; restoreDef != nil {
+					catDB, _ := e.Catalog.GetDatabase(p.srcDB)
+					if catDB != nil {
+						_ = catDB.CreateTable(restoreDef)
+					}
+				}
+				// Restore permanent table data in storage
+				if saved.table != nil {
+					e.Storage.RestoreTable(p.srcDB, p.oldName, saved.table)
+				}
+			}
+		}
 	}
 	return &Result{}, nil
 }
@@ -471,13 +506,21 @@ func (e *Executor) execAlterTableOrderBy(query string) (*Result, error) {
 	}
 	orderByStr := strings.TrimSpace(query[obIdx+len(" ORDER BY "):])
 
-	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
+	// Handle qualified table names like `mysql.db` (db=mysql, table=db)
+	tableDBName := e.CurrentDB
+	actualTableName := tableName
+	if dotIdx := strings.Index(tableName, "."); dotIdx >= 0 {
+		tableDBName = tableName[:dotIdx]
+		actualTableName = tableName[dotIdx+1:]
+	}
+
+	tbl, err := e.Storage.GetTable(tableDBName, actualTableName)
 	if err != nil {
-		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, tableName))
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", tableDBName, actualTableName))
 	}
 	orderCollation := ""
-	if db, dbErr := e.Catalog.GetDatabase(e.CurrentDB); dbErr == nil {
-		if def, defErr := db.GetTable(tableName); defErr == nil {
+	if db, dbErr := e.Catalog.GetDatabase(tableDBName); dbErr == nil {
+		if def, defErr := db.GetTable(actualTableName); defErr == nil {
 			orderCollation = effectiveTableCollation(def)
 		}
 	}
@@ -615,6 +658,9 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		if stmt.Select != nil {
 			// CREATE TABLE IF NOT EXISTS ... SELECT: skip if table already exists
 			if stmt.IfNotExists {
+				if _, alreadyTemp := e.tempTables[tableName]; alreadyTemp {
+					return &Result{}, nil
+				}
 				if _, err := e.Storage.GetTable(dbName, tableName); err == nil {
 					return &Result{}, nil
 				}
@@ -635,6 +681,78 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			}
 			if selectSQL == "" {
 				selectSQL = sqlparser.String(stmt.Select)
+			}
+			// For TEMPORARY tables, save any existing permanent table before shadowing it.
+			// We do this AFTER building selectSQL but BEFORE calling execCreateTableSelect
+			// so that if the table shadows itself (e.g. CREATE TEMP t1 SELECT * FROM t1),
+			// the SELECT still sees the original permanent table.
+			// Strategy: execute the SELECT first, then swap tables.
+			if stmt.Temp {
+				if _, alreadyTemp := e.tempTables[tableName]; !alreadyTemp {
+					// Execute SELECT while permanent table is still visible
+					prevInsideDML := e.insideDML
+					e.insideDML = true
+					selResult, selErr := e.Execute(selectSQL)
+					e.insideDML = prevInsideDML
+					if selErr != nil {
+						return nil, selErr
+					}
+					// Now save and drop the permanent table
+					if existingDef, err2 := db.GetTable(tableName); err2 == nil {
+						savedTable := e.Storage.SaveTable(dbName, tableName)
+						e.tempTableSavedPermanent[tableName] = &savedPermTable{
+							def:   existingDef,
+							table: savedTable,
+						}
+						_ = db.DropTable(tableName)
+						e.Storage.DropTable(dbName, tableName)
+					}
+					// Build column defs from SELECT result
+					var cols []catalog.ColumnDef
+					for _, colName := range selResult.Columns {
+						attrs := e.inferColumnAttrs(selectSQL, colName)
+						colType := attrs.colType
+						if colType == "" {
+							colType = "text"
+						}
+						col := catalog.ColumnDef{
+							Name:     colName,
+							Type:     colType,
+							Nullable: attrs.nullable,
+							Charset:  attrs.charset,
+						}
+						if attrs.hasDefault {
+							col.Default = &attrs.defaultVal
+						}
+						cols = append(cols, col)
+					}
+					newDef := &catalog.TableDef{Name: tableName, Columns: cols}
+					if err2 := db.CreateTable(newDef); err2 != nil {
+						return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", tableName))
+					}
+					e.Storage.CreateTable(dbName, newDef)
+					tbl, _ := e.Storage.GetTable(dbName, tableName)
+					colTypeMap := make(map[string]string, len(cols))
+					for _, col := range cols {
+						colTypeMap[col.Name] = col.Type
+					}
+					for _, row := range selResult.Rows {
+						sRow := make(storage.Row)
+						for i, colName := range selResult.Columns {
+							if i < len(row) {
+								val := row[i]
+								if colType, ok := colTypeMap[colName]; ok && val != nil {
+									val = coerceColumnValue(colType, val)
+								}
+								sRow[colName] = val
+							}
+						}
+						tbl.Insert(sRow) //nolint:errcheck
+					}
+					e.upsertInnoDBStatsRows(dbName, tableName, e.tableRowCount(dbName, tableName))
+					e.tempTables[tableName] = true
+					return &Result{}, nil
+				}
 			}
 			result, err := e.execCreateTableSelect(dbName, tableName, selectSQL)
 			if err == nil && stmt.Temp {
@@ -960,11 +1078,31 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			return nil, mysqlError(1070, "42000", "Too many key parts specified; max 16 parts allowed")
 		}
 		// Check key prefix length limits (ER_TOO_LONG_KEY = 1071)
+		// Also check ER_WRONG_SUB_KEY (1089): prefix key on non-string column
 		// MyISAM: max 1000 bytes; InnoDB COMPACT/REDUNDANT: 767; InnoDB DYNAMIC: 3072
 		// For PRIMARY KEY or UNIQUE: error; for regular INDEX: warning (key silently used as-is)
 		isUniqueOrPrimary := idx.Info.Type == sqlparser.IndexTypeUnique || idx.Info.Type == sqlparser.IndexTypePrimary
 		for ci, idxCol := range idx.Columns {
 			if idxCol.Length != nil {
+				// ER_WRONG_SUB_KEY (1089): prefix lengths are only valid for string/blob columns
+				colNameLower := strings.ToLower(idxCol.Column.String())
+				for _, col := range columns {
+					if strings.ToLower(col.Name) == colNameLower {
+						colTypeUpper := strings.ToUpper(strings.TrimSpace(col.Type))
+						if i := strings.IndexByte(colTypeUpper, '('); i >= 0 {
+							colTypeUpper = colTypeUpper[:i]
+						}
+						colTypeUpper = strings.TrimSpace(colTypeUpper)
+						isStringType := colTypeUpper == "CHAR" || colTypeUpper == "VARCHAR" ||
+							colTypeUpper == "BINARY" || colTypeUpper == "VARBINARY" ||
+							colTypeUpper == "TEXT" || colTypeUpper == "TINYTEXT" || colTypeUpper == "MEDIUMTEXT" || colTypeUpper == "LONGTEXT" ||
+							colTypeUpper == "BLOB" || colTypeUpper == "TINYBLOB" || colTypeUpper == "MEDIUMBLOB" || colTypeUpper == "LONGBLOB"
+						if !isStringType {
+							return nil, mysqlError(1089, "HY000", "Incorrect prefix key; the used key part isn't a string, the used length is longer than the key part, or the storage engine doesn't support unique prefix keys")
+						}
+						break
+					}
+				}
 				prefixLen := *idxCol.Length
 				var maxPrefixLen int
 				if tableEngine == "MYISAM" || tableEngine == "ARCHIVE" || tableEngine == "HEAP" || tableEngine == "MEMORY" {
@@ -976,12 +1114,41 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 					}
 				}
 				if prefixLen > maxPrefixLen {
-					if isUniqueOrPrimary {
+					isMyISAM := tableEngine == "MYISAM" || tableEngine == "ARCHIVE" || tableEngine == "HEAP" || tableEngine == "MEMORY"
+					if isUniqueOrPrimary || !isMyISAM {
+						// InnoDB: always error for too-long key prefix
+						// MyISAM: error only for UNIQUE/PRIMARY
 						return nil, mysqlError(1071, "42000", fmt.Sprintf("Specified key was too long; max key length is %d bytes", maxPrefixLen))
 					}
-					// For regular index: add warning and allow creation
-					_ = ci
+					// MyISAM regular index: add warning and truncate the stored prefix length
 					e.addWarning("Warning", 1071, fmt.Sprintf("Specified key was too long; max key length is %d bytes", maxPrefixLen))
+					// Determine bytes per character for this column's charset to compute truncated length
+					colName := strings.ToLower(idxCol.Column.String())
+					bytesPerChar := 1
+					for _, col := range columns {
+						if strings.ToLower(col.Name) == colName {
+							cs := strings.ToLower(col.Charset)
+							if cs == "" {
+								cs = strings.ToLower(tableCharset)
+							}
+							if cs == "" {
+								cs = "utf8mb4"
+							}
+							if cs == "utf8mb4" {
+								bytesPerChar = 4
+							} else if cs == "utf8" || cs == "utf8mb3" {
+								bytesPerChar = 3
+							} else if cs == "ucs2" || cs == "utf16" || cs == "utf16le" || cs == "utf32" {
+								bytesPerChar = 4
+							} else {
+								bytesPerChar = 1
+							}
+							break
+						}
+					}
+					truncatedLen := maxPrefixLen / bytesPerChar
+					colStr := colName + fmt.Sprintf("(%d)", truncatedLen)
+					idxCols[ci] = colStr
 				}
 			}
 		}
@@ -1417,6 +1584,15 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 					table: savedTable,
 				}
 			}
+		} else {
+			// This session already has a temp table with this name.
+			// Without IF NOT EXISTS, MySQL returns error 1050.
+			if !stmt.IfNotExists {
+				return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", tableName))
+			}
+			// IF NOT EXISTS: emit Note warning and skip.
+			e.warnings = append(e.warnings, Warning{Level: "Note", Code: 1050, Message: fmt.Sprintf("Table '%s' already exists", tableName)})
+			return &Result{}, nil
 		}
 		_ = db.DropTable(tableName)
 		e.Storage.DropTable(dbName, tableName)
@@ -1426,6 +1602,16 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	err = db.CreateTable(def)
 	if err != nil {
 		if stmt.IfNotExists {
+			return &Result{}, nil
+		}
+		// If a TEMP table exists with this name and we're creating a PERMANENT table,
+		// save the permanent def as "pending" - it will become visible when the temp is dropped.
+		if !stmt.Temp && e.tempTables != nil && e.tempTables[tableName] {
+			if e.pendingPermanentWhileTemp == nil {
+				e.pendingPermanentWhileTemp = make(map[string]*savedPermTable)
+			}
+			// Save just the definition (no rows yet - new table)
+			e.pendingPermanentWhileTemp[tableName] = &savedPermTable{def: def, table: nil}
 			return &Result{}, nil
 		}
 		return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", tableName))
@@ -1608,6 +1794,25 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 	if e.inTransaction {
 		e.execCommit()
 	}
+	// DDL also releases all table-level locks (MySQL behavior).
+	// Only do this for non-TEMP tables since TEMP drops don't affect lock state.
+	if !stmt.Temp && e.tableLockManager != nil {
+		e.tableLockManager.UnlockAll(e.connectionID)
+	}
+	// For DROP TEMPORARY TABLE, validate all tables first (atomically).
+	// If any table is not a temporary table, fail without dropping anything.
+	if stmt.Temp && !stmt.IfExists {
+		for _, table := range stmt.FromTables {
+			tableName := table.Name.String()
+			dbName := e.CurrentDB
+			if !table.Qualifier.IsEmpty() {
+				dbName = table.Qualifier.String()
+			}
+			if _, isTemp := e.tempTables[tableName]; !isTemp {
+				return nil, mysqlError(1051, "42S02", fmt.Sprintf("Unknown table '%s.%s'", dbName, tableName))
+			}
+		}
+	}
 	for _, table := range stmt.FromTables {
 		tableName := table.Name.String()
 		dbName := e.CurrentDB
@@ -1622,8 +1827,27 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 		if isMySQLLogTable(dbName, tableName) && e.isLogTableLoggingEnabled(tableName) {
 			return nil, mysqlError(1580, "HY000", "You cannot 'DROP' a log table if logging is enabled")
 		}
+		// For DROP TEMPORARY TABLE with IF EXISTS, skip non-temp tables with a warning.
+		if stmt.Temp && stmt.IfExists {
+			if _, isTemp := e.tempTables[tableName]; !isTemp {
+				if e.sqlNotesEnabled() {
+					e.addWarning("Note", 1051, fmt.Sprintf("Unknown table '%s.%s'", dbName, tableName))
+				}
+				continue
+			}
+		}
 		db, err := e.Catalog.GetDatabase(dbName)
 		if err != nil {
+			// For TEMPORARY tables, even if the database was dropped, clean up temp tracking.
+			if _, isTemp := e.tempTables[tableName]; isTemp {
+				e.Storage.DropTable(dbName, tableName)
+				delete(e.tempTables, tableName)
+				delete(e.tempTableSavedPermanent, tableName)
+				if e.pendingPermanentWhileTemp != nil {
+					delete(e.pendingPermanentWhileTemp, tableName)
+				}
+				continue
+			}
 			if stmt.IfExists {
 				if e.sqlNotesEnabled() {
 					e.addWarning("Note", 1051, fmt.Sprintf("Unknown table '%s.%s'", dbName, tableName))
@@ -1657,6 +1881,18 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 				}
 				e.Storage.RestoreTable(dbName, tableName, saved.table)
 				delete(e.tempTableSavedPermanent, tableName)
+			}
+			// If a permanent table was created while this temp existed, now add it to catalog.
+			if e.pendingPermanentWhileTemp != nil {
+				if pending, ok := e.pendingPermanentWhileTemp[tableName]; ok {
+					if db2, err2 := e.Catalog.GetDatabase(dbName); err2 == nil {
+						_ = db2.CreateTable(pending.def)
+					}
+					if pending.def != nil {
+						e.Storage.CreateTable(dbName, pending.def)
+					}
+					delete(e.pendingPermanentWhileTemp, tableName)
+				}
 			}
 		}
 		// Clean up temp table tracking
@@ -1877,6 +2113,65 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		}
 	}
 
+	// Pre-validate all ADD COLUMN operations: in strict mode with NO_ZERO_DATE, adding a NOT NULL
+	// date/datetime/timestamp column without a default to a non-empty table fails. We must check
+	// ALL AddColumns opcodes before processing any, so partial application doesn't occur.
+	if e.isStrictMode() {
+		hasNoZeroDate := strings.Contains(e.sqlMode, "NO_ZERO_DATE") || strings.Contains(e.sqlMode, "TRADITIONAL")
+		if hasNoZeroDate {
+			tbl.Mu.RLock()
+			hasRows := len(tbl.Rows) > 0
+			tbl.Mu.RUnlock()
+			if hasRows {
+				for _, opt := range stmt.AlterOptions {
+					if ac, ok := opt.(*sqlparser.AddColumns); ok {
+						for _, col := range ac.Columns {
+							if col.Type.Options == nil || col.Type.Options.Default == nil {
+								isNotNull := col.Type.Options != nil && col.Type.Options.Null != nil && !*col.Type.Options.Null
+								if isNotNull {
+									colTypeBase := strings.ToUpper(strings.TrimSpace(col.Type.Type))
+									if idx := strings.IndexByte(colTypeBase, '('); idx >= 0 {
+										colTypeBase = colTypeBase[:idx]
+									}
+									colTypeBase = strings.TrimSpace(colTypeBase)
+									if colTypeBase == "DATE" || colTypeBase == "DATETIME" || colTypeBase == "TIMESTAMP" {
+										return nil, mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '0000-00-00' for column '%s' at row 1", col.Name.String()))
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Pre-validate: check if DROP COLUMN operations would remove all columns.
+	{
+		tableDef, _ := db.GetTable(tableName)
+		if tableDef != nil {
+			netCols := len(tableDef.Columns)
+			for _, altOpt := range stmt.AlterOptions {
+				switch altOp := altOpt.(type) {
+				case *sqlparser.DropColumn:
+					// Only count existing columns in the drop
+					dropName := strings.ToLower(altOp.Name.Name.String())
+					for _, col := range tableDef.Columns {
+						if strings.ToLower(col.Name) == dropName {
+							netCols--
+							break
+						}
+					}
+				case *sqlparser.AddColumns:
+					netCols += len(altOp.Columns)
+				}
+			}
+			if netCols <= 0 {
+				return nil, mysqlError(1090, "42000", "You can't delete all columns with ALTER TABLE; use DROP TABLE instead")
+			}
+		}
+	}
+
 	for _, opt := range stmt.AlterOptions {
 		switch op := opt.(type) {
 
@@ -2014,23 +2309,6 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 		case *sqlparser.DropColumn:
 			colName := op.Name.Name.String()
-			// Check if this would leave the table with no columns.
-			// Count net effect of all DROP/ADD COLUMN ops in this ALTER TABLE.
-			tableDef, _ := db.GetTable(tableName)
-			if tableDef != nil {
-				netCols := len(tableDef.Columns)
-				for _, altOpt := range stmt.AlterOptions {
-					switch altOp := altOpt.(type) {
-					case *sqlparser.DropColumn:
-						netCols--
-					case *sqlparser.AddColumns:
-						netCols += len(altOp.Columns)
-					}
-				}
-				if netCols <= 0 {
-					return nil, mysqlError(1090, "42000", "You can't delete all columns with ALTER TABLE; use DROP TABLE instead")
-				}
-			}
 			if dropErr := db.DropColumn(tableName, colName); dropErr != nil {
 				return nil, dropErr
 			}
@@ -2225,7 +2503,8 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 							}
 						}
 						if prefixLen > maxPrefixLen {
-							if isUniqueOrPrimaryIdx {
+							isMyISAMAlt := altTableEngine == "MYISAM" || altTableEngine == "ARCHIVE" || altTableEngine == "HEAP" || altTableEngine == "MEMORY"
+							if isUniqueOrPrimaryIdx || !isMyISAMAlt {
 								return nil, mysqlError(1071, "42000", fmt.Sprintf("Specified key was too long; max key length is %d bytes", maxPrefixLen))
 							}
 							e.addWarning("Warning", 1071, fmt.Sprintf("Specified key was too long; max key length is %d bytes", maxPrefixLen))
@@ -2270,6 +2549,26 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					idxName = cn
 				} else if len(idxCols) > 0 {
 					idxName = stripPrefixLengthFromCol(idxCols[0])
+				}
+			}
+			// Auto-deduplicate index name: if a key with this name already exists,
+			// append _2, _3, etc. (MySQL behavior for ADD KEY without explicit name)
+			if idxName != "" && op.IndexDefinition.Info.Name.String() == "" && tdErr == nil {
+				baseIdxName := idxName
+				suffix := 2
+				for {
+					taken := false
+					for _, existing := range tableDef.Indexes {
+						if strings.EqualFold(existing.Name, idxName) {
+							taken = true
+							break
+						}
+					}
+					if !taken {
+						break
+					}
+					idxName = fmt.Sprintf("%s_%d", baseIdxName, suffix)
+					suffix++
 				}
 			}
 			// Check for USING method and COMMENT
@@ -2684,29 +2983,93 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 		case *sqlparser.RenameTableName:
 			newName := op.Table.Name.String()
+			// Determine target database: use qualifier if given, else current db
+			targetDBName := e.CurrentDB
+			if !op.Table.Qualifier.IsEmpty() {
+				targetDBName = op.Table.Qualifier.String()
+			}
+			targetDB, targetDBErr := e.Catalog.GetDatabase(targetDBName)
+			if targetDBErr != nil {
+				return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", targetDBName))
+			}
 			// Get the current table def
 			def, getErr := db.GetTable(tableName)
 			if getErr != nil {
 				return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", dbName, tableName))
 			}
-			// Check new name doesn't already exist
-			if _, getErr := db.GetTable(newName); getErr == nil {
-				return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newName))
+			// Determine if the table being renamed is a temporary table
+			isRenamingTemp := e.tempTables != nil && e.tempTables[tableName]
+			// Check new name doesn't already exist (skip for temp tables - they can shadow permanent ones)
+			// Also skip if renaming to the same name (no-op, MySQL allows this)
+			isSameName := strings.EqualFold(dbName, targetDBName) && strings.EqualFold(tableName, newName)
+			if !isSameName {
+				if isRenamingTemp {
+					// If renaming a temp table to a name that already has a temp table, fail with 1050.
+					if e.tempTables != nil && e.tempTables[newName] {
+						return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newName))
+					}
+				} else if _, getErr := targetDB.GetTable(newName); getErr == nil {
+					return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newName))
+				}
 			}
-			// Rename in catalog
-			def.Name = newName
-			db.DropTable(tableName) //nolint:errcheck
-			db.CreateTable(def)     //nolint:errcheck
-			// Rename in storage
-			e.Storage.CreateTable(dbName, def)
-			if newTbl, getErr := e.Storage.GetTable(dbName, newName); getErr == nil {
-				newTbl.Rows = tbl.Rows
-				newTbl.AutoIncrement.Store(tbl.AutoIncrementValue())
+			// If renaming a temp table, save any permanent table at newName BEFORE the rename
+			if isRenamingTemp {
+				if _, alreadySaved := e.tempTableSavedPermanent[newName]; !alreadySaved {
+					if existingPermDef, err2 := targetDB.GetTable(newName); err2 == nil {
+						savedTable := e.Storage.SaveTable(targetDBName, newName)
+						e.tempTableSavedPermanent[newName] = &savedPermTable{
+							def:   existingPermDef,
+							table: savedTable,
+						}
+						_ = targetDB.DropTable(newName)
+						e.Storage.DropTable(targetDBName, newName)
+					}
+				}
 			}
-			e.Storage.DropTable(dbName, tableName)
-			// Update tableName for any subsequent ALTER operations
+			// Rename in catalog (skip for no-op same-name renames)
+			if !isSameName {
+				def.Name = newName
+				db.DropTable(tableName) //nolint:errcheck
+				targetDB.CreateTable(def) //nolint:errcheck
+				// Rename in storage
+				e.Storage.CreateTable(targetDBName, def)
+				if newTbl, getErr := e.Storage.GetTable(targetDBName, newName); getErr == nil {
+					newTbl.Rows = tbl.Rows
+					newTbl.AutoIncrement.Store(tbl.AutoIncrementValue())
+				}
+				e.Storage.DropTable(dbName, tableName)
+			}
+			// Handle temporary table tracking: if the renamed table was a temp table,
+			// update the tempTables map and restore any saved permanent table for old name.
+			if isRenamingTemp {
+				delete(e.tempTables, tableName)
+				e.tempTables[newName] = true
+				// Restore the saved permanent table for the old name (if any).
+				if saved, ok := e.tempTableSavedPermanent[tableName]; ok {
+					delete(e.tempTableSavedPermanent, tableName)
+					if saved.def != nil {
+						_ = db.CreateTable(saved.def)
+					}
+					if saved.table != nil {
+						e.Storage.RestoreTable(dbName, tableName, saved.table)
+					}
+				}
+				// If a permanent table was created while this temp existed, now add it to catalog.
+				if e.pendingPermanentWhileTemp != nil {
+					if pending, ok := e.pendingPermanentWhileTemp[tableName]; ok {
+						if pending.def != nil {
+							_ = db.CreateTable(pending.def)
+							e.Storage.CreateTable(dbName, pending.def)
+						}
+						delete(e.pendingPermanentWhileTemp, tableName)
+					}
+				}
+			}
+			// Update tableName/dbName for any subsequent ALTER operations
 			tableName = newName
-			tbl, _ = e.Storage.GetTable(dbName, newName)
+			dbName = targetDBName
+			db = targetDB
+			tbl, _ = e.Storage.GetTable(targetDBName, newName)
 
 		case *sqlparser.AlterCharset:
 			// ALTER TABLE ... CONVERT TO CHARACTER SET <newCharset>

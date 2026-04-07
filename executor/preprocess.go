@@ -350,6 +350,17 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		result, err := e.execCommit()
 		return "", result, err
 	}
+	// Handle COMMIT [AND [NO] CHAIN] [NO RELEASE] / COMMIT AND CHAIN
+	if upper == "COMMIT AND CHAIN" || upper == "COMMIT AND NO CHAIN" ||
+		upper == "COMMIT NO RELEASE" || upper == "COMMIT RELEASE" {
+		result, err := e.execCommit()
+		return "", result, err
+	}
+	// Handle ROLLBACK AND CHAIN
+	if upper == "ROLLBACK AND CHAIN" || upper == "ROLLBACK AND NO CHAIN" {
+		result, err := e.execRollback()
+		return "", result, err
+	}
 
 	// Handle ANALYZE TABLE ... UPDATE/DROP HISTOGRAM (vitess can't parse)
 	if strings.HasPrefix(upper, "ANALYZE TABLE") && (strings.Contains(upper, "HISTOGRAM") || strings.Contains(upper, "UPDATE HISTOGRAM") || strings.Contains(upper, "DROP HISTOGRAM")) {
@@ -430,16 +441,62 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	if strings.Contains(upper, "UNSIGNED INT") {
 		query = regexp.MustCompile(`(?i)\bUNSIGNED\s+INT(EGER)?\b`).ReplaceAllString(query, "UNSIGNED")
 	}
-	if strings.Contains(upper, "NATIONAL CHAR") {
-		query = regexp.MustCompile(`(?i)\bNATIONAL\s+CHAR\b`).ReplaceAllString(query, "CHAR")
+	if strings.Contains(upper, "NATIONAL") {
+		// NATIONAL CHARACTER VARYING -> VARCHAR, NATIONAL VARCHAR -> VARCHAR, NATIONAL CHAR -> CHAR
+		// In DDL contexts, also add CHARACTER SET utf8 AFTER the size specifier e.g. CHAR(10) CHARACTER SET utf8.
+		isDDL := strings.HasPrefix(upper, "CREATE TABLE") || strings.HasPrefix(upper, "ALTER TABLE") ||
+			strings.HasPrefix(upper, "CREATE TEMPORARY TABLE")
+		if isDDL {
+			// Replace NATIONAL CHAR(n) -> CHAR(n) CHARACTER SET utf8
+			query = regexp.MustCompile(`(?i)\bNATIONAL\s+CHARACTER\s+VARYING(\s*\([^)]*\))?`).ReplaceAllStringFunc(query, func(m string) string {
+				re := regexp.MustCompile(`(?i)\bNATIONAL\s+CHARACTER\s+VARYING`)
+				return re.ReplaceAllString(m, "VARCHAR") + " CHARACTER SET utf8"
+			})
+			query = regexp.MustCompile(`(?i)\bNATIONAL\s+VARCHAR(\s*\([^)]*\))?`).ReplaceAllStringFunc(query, func(m string) string {
+				re := regexp.MustCompile(`(?i)\bNATIONAL\s+VARCHAR`)
+				return re.ReplaceAllString(m, "VARCHAR") + " CHARACTER SET utf8"
+			})
+			query = regexp.MustCompile(`(?i)\bNATIONAL\s+CHAR(\s*\([^)]*\))?`).ReplaceAllStringFunc(query, func(m string) string {
+				re := regexp.MustCompile(`(?i)\bNATIONAL\s+CHAR`)
+				return re.ReplaceAllString(m, "CHAR") + " CHARACTER SET utf8"
+			})
+		} else {
+			query = regexp.MustCompile(`(?i)\bNATIONAL\s+CHARACTER\s+VARYING\b`).ReplaceAllString(query, "VARCHAR")
+			query = regexp.MustCompile(`(?i)\bNATIONAL\s+VARCHAR\b`).ReplaceAllString(query, "VARCHAR")
+			query = regexp.MustCompile(`(?i)\bNATIONAL\s+CHAR\b`).ReplaceAllString(query, "CHAR")
+		}
 	}
-	// NCHAR VARYING, NVARCHAR, NCHAR are MySQL type aliases for VARCHAR/CHAR that
+	// NCHAR VARYING, NCHAR VARCHAR, NVARCHAR, NCHAR are MySQL type aliases for VARCHAR/CHAR that
 	// vitess parser doesn't support in all contexts (e.g., JSON_TABLE COLUMNS).
 	// Apply these globally (not just in DDL) to handle SELECT ... JSON_TABLE cases.
+	// NCHAR VARYING and NCHAR VARCHAR must come before NCHAR to avoid partial replacement.
 	if strings.Contains(upper, "NCHAR") || strings.Contains(upper, "NVARCHAR") {
-		query = replaceTypeWord(query, "NCHAR VARYING", "VARCHAR")
-		query = replaceTypeWord(query, "NVARCHAR", "VARCHAR")
-		query = replaceTypeWord(query, "NCHAR", "CHAR")
+		isDDL := strings.HasPrefix(upper, "CREATE TABLE") || strings.HasPrefix(upper, "ALTER TABLE") ||
+			strings.HasPrefix(upper, "CREATE TEMPORARY TABLE")
+		if isDDL {
+			// For DDL: replace NCHAR/NVARCHAR and add CHARACTER SET utf8 AFTER the size
+			query = regexp.MustCompile(`(?i)\bNCHAR\s+VARYING(\s*\([^)]*\))?`).ReplaceAllStringFunc(query, func(m string) string {
+				re := regexp.MustCompile(`(?i)\bNCHAR\s+VARYING`)
+				return re.ReplaceAllString(m, "VARCHAR") + " CHARACTER SET utf8"
+			})
+			query = regexp.MustCompile(`(?i)\bNCHAR\s+VARCHAR(\s*\([^)]*\))?`).ReplaceAllStringFunc(query, func(m string) string {
+				re := regexp.MustCompile(`(?i)\bNCHAR\s+VARCHAR`)
+				return re.ReplaceAllString(m, "VARCHAR") + " CHARACTER SET utf8"
+			})
+			query = regexp.MustCompile(`(?i)\bNVARCHAR(\s*\([^)]*\))?`).ReplaceAllStringFunc(query, func(m string) string {
+				re := regexp.MustCompile(`(?i)\bNVARCHAR`)
+				return re.ReplaceAllString(m, "VARCHAR") + " CHARACTER SET utf8"
+			})
+			query = regexp.MustCompile(`(?i)\bNCHAR(\s*\([^)]*\))?`).ReplaceAllStringFunc(query, func(m string) string {
+				re := regexp.MustCompile(`(?i)\bNCHAR`)
+				return re.ReplaceAllString(m, "CHAR") + " CHARACTER SET utf8"
+			})
+		} else {
+			query = replaceTypeWord(query, "NCHAR VARYING", "VARCHAR")
+			query = replaceTypeWord(query, "NCHAR VARCHAR", "VARCHAR")
+			query = replaceTypeWord(query, "NVARCHAR", "VARCHAR")
+			query = replaceTypeWord(query, "NCHAR", "CHAR")
+		}
 	}
 	trimmed = strings.TrimSpace(query)
 	upper = strings.ToUpper(trimmed)

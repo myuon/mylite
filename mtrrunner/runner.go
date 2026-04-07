@@ -1134,10 +1134,9 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		return true, false, nil
 
 	case "echo":
-		if ctx.resultLogEnabled {
-			echoText := ctx.substituteVars(args)
-			ctx.output.WriteString(echoText + "\n")
-		}
+		// --echo always outputs, regardless of --disable_result_log
+		echoText := ctx.substituteVars(args)
+		ctx.output.WriteString(echoText + "\n")
 		return true, false, nil
 
 	case "disable_warnings":
@@ -3789,6 +3788,12 @@ func extractBareDirective(trimmed string) (string, bool) {
 				if strings.HasSuffix(rest, ";") {
 					rest = rest[:len(rest)-1]
 				}
+			}
+			// For "let" commands, preserve trailing spaces in the variable value
+			// (e.g. "let $type= 'MYISAM' ;" should store 'MYISAM' with trailing space)
+			// For other commands, trim all surrounding whitespace.
+			if kw == "let" {
+				return kw + " " + strings.TrimLeft(rest, " \t"), true
 			}
 			return kw + " " + strings.TrimSpace(rest), true
 		}

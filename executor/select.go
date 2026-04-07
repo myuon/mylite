@@ -3069,6 +3069,35 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 			if gi < len(groups) {
 				groupRows = groups[gi].rows
 			}
+			// Include the raw group row values for GROUP BY columns so that GROUP BY columns
+			// not in SELECT are accessible in HAVING (e.g. HAVING col1 = 10 when col1
+			// is grouped by but not in the SELECT list).
+			if len(groupRows) > 0 && stmt.GroupBy != nil {
+				for _, gbExpr := range stmt.GroupBy.Exprs {
+					gbColName := strings.ToLower(sqlparser.String(gbExpr))
+					// Try stripping table qualifier for lookup
+					if _, exists := havingRow[gbColName]; !exists {
+						// Check with and without table prefix
+						for k, v := range groupRows[0] {
+							kLower := strings.ToLower(k)
+							if kLower == gbColName || strings.HasSuffix(kLower, "."+gbColName) || strings.TrimPrefix(kLower, strings.Split(kLower, ".")[0]+".") == gbColName {
+								if _, exists2 := havingRow[k]; !exists2 {
+									havingRow[k] = v
+								}
+								// Also add just the bare column name
+								bareName := gbColName
+								if idx := strings.LastIndex(gbColName, "."); idx >= 0 {
+									bareName = gbColName[idx+1:]
+								}
+								if _, exists3 := havingRow[bareName]; !exists3 {
+									havingRow[bareName] = v
+								}
+								break
+							}
+						}
+					}
+				}
+			}
 			// Evaluate HAVING with aggregate support
 			match, err := e.evalHaving(stmt.Having.Expr, havingRow, groupRows)
 			if err != nil {
@@ -3146,7 +3175,7 @@ func computeGroupKey(groupByExprs []sqlparser.Expr, row storage.Row) string {
 // compareGroupKeys compares two group key strings for ordering.
 // Each key may be a multi-part \x00-separated string.
 // For each part, it tries to compare numerically if both look like numbers,
-// otherwise compares as strings.
+// otherwise compares as strings. NULL (represented as "<nil>") sorts first.
 func compareGroupKeys(a, b string) int {
 	aParts := strings.Split(a, "\x00")
 	bParts := strings.Split(b, "\x00")
@@ -3156,6 +3185,18 @@ func compareGroupKeys(a, b string) int {
 	}
 	for i := 0; i < n; i++ {
 		ap, bp := aParts[i], bParts[i]
+		// NULL ("<nil>") sorts first (before any other value)
+		aIsNull := ap == "<nil>"
+		bIsNull := bp == "<nil>"
+		if aIsNull && bIsNull {
+			continue
+		}
+		if aIsNull {
+			return -1
+		}
+		if bIsNull {
+			return 1
+		}
 		// Try numeric comparison
 		aFloat, aErr := strconv.ParseFloat(ap, 64)
 		bFloat, bErr := strconv.ParseFloat(bp, 64)

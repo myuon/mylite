@@ -488,6 +488,12 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		// Enforce FOREIGN KEY constraints on UPDATE
 		tbl.Unlock()
 		if fkErr := e.checkForeignKeyOnUpdate(updateDB, tableName, oldRow, newRow); fkErr != nil {
+			if bool(stmt.Ignore) {
+				// UPDATE IGNORE: skip row and add warning
+				tbl.Lock()
+				e.addWarning("Warning", 1452, fkErr.Error())
+				continue
+			}
 			tbl.Lock()
 			return nil, fkErr
 		}
@@ -958,8 +964,14 @@ nextRow:
 				for _, col := range tbl.Def.Columns {
 					if col.Name == pc.colName {
 						if val == nil && !col.Nullable {
-							unlockAndReturn = mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", pc.colName))
-							break
+							if bool(stmt.Ignore) {
+								// UPDATE IGNORE: convert NULL to zero value and add warning
+								e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", pc.colName))
+								val = implicitZeroValue(col.Type)
+							} else {
+								unlockAndReturn = mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", pc.colName))
+								break
+							}
 						}
 						val = coerceColumnValue(col.Type, val)
 						break

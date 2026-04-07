@@ -276,6 +276,10 @@ type Executor struct {
 	// for tables that were shadowed by a temporary table. When the temp table is dropped,
 	// the permanent state is restored. Key is tableName.
 	tempTableSavedPermanent map[string]*savedPermTable
+	// pendingPermanentWhileTemp stores permanent table defs created while a temp table
+	// with the same name exists. When the temp table is dropped, this pending permanent
+	// is added to the catalog. Key is tableName.
+	pendingPermanentWhileTemp map[string]*savedPermTable
 	// globalScopeVars stores SET GLOBAL variable overrides.
 	// Access must be protected by globalVarsMu.
 	globalScopeVars map[string]string
@@ -1203,18 +1207,22 @@ func (e *Executor) initSystemTables() {
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "db",
-		Columns: []catalog.ColumnDef{
-			{Name: "Host", Type: "VARCHAR(255)"},
-			{Name: "Db", Type: "VARCHAR(64)"},
-			{Name: "User", Type: "VARCHAR(32)"},
-			{Name: "Select_priv", Type: "VARCHAR(1)"},
-			{Name: "Insert_priv", Type: "VARCHAR(1)"},
-			{Name: "Update_priv", Type: "VARCHAR(1)"},
-			{Name: "Delete_priv", Type: "VARCHAR(1)"},
-			{Name: "Create_priv", Type: "VARCHAR(1)"},
-			{Name: "Drop_priv", Type: "VARCHAR(1)"},
-			{Name: "Grant_priv", Type: "VARCHAR(1)"},
-		},
+		Columns: func() []catalog.ColumnDef {
+			defEmpty := ""
+			defN := "N"
+			return []catalog.ColumnDef{
+				{Name: "Host", Type: "VARCHAR(255)", Default: &defEmpty},
+				{Name: "Db", Type: "VARCHAR(64)", Default: &defEmpty},
+				{Name: "User", Type: "VARCHAR(32)", Default: &defEmpty},
+				{Name: "Select_priv", Type: "VARCHAR(1)", Default: &defN},
+				{Name: "Insert_priv", Type: "VARCHAR(1)", Default: &defN},
+				{Name: "Update_priv", Type: "VARCHAR(1)", Default: &defN},
+				{Name: "Delete_priv", Type: "VARCHAR(1)", Default: &defN},
+				{Name: "Create_priv", Type: "VARCHAR(1)", Default: &defN},
+				{Name: "Drop_priv", Type: "VARCHAR(1)", Default: &defN},
+				{Name: "Grant_priv", Type: "VARCHAR(1)", Default: &defN},
+			}
+		}(),
 	})
 	logDefaultTS := "CURRENT_TIMESTAMP(6)"
 	ensure("mysql", &catalog.TableDef{
@@ -2964,10 +2972,25 @@ func normalizeTypeAliases(query string) string {
 	result = replaceTypeWord(result, "FLOAT8", "DOUBLE")
 	result = replaceTypeWord(result, "LONG VARBINARY", "MEDIUMBLOB")
 	result = replaceTypeWord(result, "LONG VARCHAR", "MEDIUMTEXT")
-	// NCHAR VARYING must come before NCHAR to avoid partial replacement
-	result = replaceTypeWord(result, "NCHAR VARYING", "VARCHAR")
-	result = replaceTypeWord(result, "NVARCHAR", "VARCHAR")
-	result = replaceTypeWord(result, "NCHAR", "CHAR")
+	// NCHAR VARYING and NCHAR VARCHAR must come before NCHAR to avoid partial replacement.
+	// These are DDL-only normalizations. We add CHARACTER SET utf8 AFTER the size specifier
+	// to preserve the charset in SHOW CREATE TABLE output (NATIONAL/NCHAR types imply UTF8).
+	result = regexp.MustCompile(`(?i)\bNCHAR\s+VARYING(\s*\([^)]*\))?`).ReplaceAllStringFunc(result, func(m string) string {
+		re := regexp.MustCompile(`(?i)\bNCHAR\s+VARYING`)
+		return re.ReplaceAllString(m, "VARCHAR") + " CHARACTER SET utf8"
+	})
+	result = regexp.MustCompile(`(?i)\bNCHAR\s+VARCHAR(\s*\([^)]*\))?`).ReplaceAllStringFunc(result, func(m string) string {
+		re := regexp.MustCompile(`(?i)\bNCHAR\s+VARCHAR`)
+		return re.ReplaceAllString(m, "VARCHAR") + " CHARACTER SET utf8"
+	})
+	result = regexp.MustCompile(`(?i)\bNVARCHAR(\s*\([^)]*\))?`).ReplaceAllStringFunc(result, func(m string) string {
+		re := regexp.MustCompile(`(?i)\bNVARCHAR`)
+		return re.ReplaceAllString(m, "VARCHAR") + " CHARACTER SET utf8"
+	})
+	result = regexp.MustCompile(`(?i)\bNCHAR(\s*\([^)]*\))?`).ReplaceAllStringFunc(result, func(m string) string {
+		re := regexp.MustCompile(`(?i)\bNCHAR`)
+		return re.ReplaceAllString(m, "CHAR") + " CHARACTER SET utf8"
+	})
 	return result
 }
 
@@ -6275,13 +6298,35 @@ func (e *Executor) recordStatementDigest(query string) {
 	})
 }
 
-func (e *Executor) Execute(query string) (*Result, error) {
+func (e *Executor) Execute(query string) (res *Result, retErr error) {
 	// Increment the Questions counter for every statement received from the client,
 	// including statements that preprocessQuery short-circuits (e.g. SHOW COUNT(*) WARNINGS).
 	// Skip incrementing for empty queries and for internal routine statements.
 	trimmedForCount := strings.TrimSpace(query)
 	if trimmedForCount != "" && e.routineDepth == 0 {
 		e.questions++
+	}
+	// Track execution errors in the diagnostics area (for SHOW ERRORS / SHOW WARNINGS).
+	// Only track for client-level statements (not internal routine calls).
+	if e.routineDepth == 0 {
+		defer func() {
+			if retErr != nil {
+				// Extract MySQL error code and message from the error.
+				// Format: "ERROR <code> (<state>): <message>"
+				code := 1064
+				msg := retErr.Error()
+				if strings.HasPrefix(msg, "ERROR ") {
+					var codeVal int
+					if _, scanErr := fmt.Sscanf(msg, "ERROR %d", &codeVal); scanErr == nil && codeVal > 0 {
+						code = codeVal
+						if parenIdx := strings.Index(msg, "): "); parenIdx >= 0 {
+							msg = msg[parenIdx+3:]
+						}
+					}
+				}
+				e.warnings = append(e.warnings, Warning{Level: "Error", Code: code, Message: msg})
+			}
+		}()
 	}
 
 	query, result, err := e.preprocessQuery(query)
@@ -9306,10 +9351,22 @@ func validateEnumSetValue(colType string, v interface{}) interface{} {
 	var valid []string
 	for _, m := range members {
 		m = strings.TrimSpace(m)
+		matched := false
+		// Prefer exact (case-sensitive) match first
 		for _, a := range allowed {
-			if strings.EqualFold(m, a) {
+			if m == a {
 				valid = append(valid, a)
+				matched = true
 				break
+			}
+		}
+		// Fall back to case-insensitive match
+		if !matched {
+			for _, a := range allowed {
+				if strings.EqualFold(m, a) {
+					valid = append(valid, a)
+					break
+				}
 			}
 		}
 	}
@@ -10127,6 +10184,7 @@ func (e *Executor) execMyliteCommand(query string) (*Result, error) {
 		}
 		e.tempTables = make(map[string]bool)
 		e.tempTableSavedPermanent = make(map[string]*savedPermTable)
+		e.pendingPermanentWhileTemp = make(map[string]*savedPermTable)
 		return &Result{}, nil
 	}
 
@@ -10138,6 +10196,12 @@ func (e *Executor) execMyliteCommand(query string) (*Result, error) {
 		e.sqlMode = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
 		e.userVars = make(map[string]interface{})
 		e.preparedStmts = make(map[string]string)
+		// Clear shared resource groups to avoid cross-test contamination
+		if e.resourceGroupsMu != nil {
+			e.resourceGroupsMu.Lock()
+			e.resourceGroups = make(map[string]string)
+			e.resourceGroupsMu.Unlock()
+		}
 		return &Result{}, nil
 	}
 
@@ -13201,6 +13265,32 @@ func formatMySQLFloatString(v float64) string {
 // (trailing zeros stripped, exponent normalized).
 func FormatMySQLFloat(v float64) string {
 	return formatMySQLFloatString(v)
+}
+
+// FormatMySQLFloat32 formats a float32 value using MySQL's FLOAT column display style
+// (6 significant digits with trailing zeros preserved for single-precision columns).
+func FormatMySQLFloat32(v float32) string {
+	f := float64(v)
+	if math.IsNaN(f) {
+		return "NaN"
+	}
+	if math.IsInf(f, 1) {
+		return "inf"
+	}
+	if math.IsInf(f, -1) {
+		return "-inf"
+	}
+	abs := math.Abs(f)
+	if abs != 0 && (abs >= 1e14 || abs < 1e-4) {
+		// Use bitSize=32 for float32 precision, keeping 5 decimal places (6 sig figs)
+		s := strconv.FormatFloat(f, 'e', 5, 32)
+		s = strings.Replace(s, "e+0", "e", 1)
+		s = strings.Replace(s, "e-0", "e-", 1)
+		s = strings.Replace(s, "e+", "e", 1)
+		// For FLOAT, MySQL keeps trailing zeros (6 significant digits)
+		return s
+	}
+	return strconv.FormatFloat(f, 'f', -1, 32)
 }
 
 func isStringValue(v interface{}) bool {
