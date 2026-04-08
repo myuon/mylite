@@ -4329,6 +4329,30 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 		if len(result) == 0 {
 			return [][]interface{}{e.dummyExplainRow(query)}
 		}
+	case *sqlparser.Insert:
+		// EXPLAIN INSERT/REPLACE: show table with select_type "INSERT" or "REPLACE"
+		// rows, filtered are NULL in MySQL's traditional EXPLAIN for INSERT/REPLACE
+		tblName := ""
+		if tn, ok := s.Table.Expr.(sqlparser.TableName); ok {
+			tblName = tn.Name.String()
+		}
+		stType := "INSERT"
+		if s.Action == sqlparser.ReplaceAct {
+			stType = "REPLACE"
+		}
+		result = append(result, explainSelectType{
+			id:         idCounter,
+			selectType: stType,
+			table:      tblName,
+			rows:       nil,
+			filtered:   nil,
+			accessType: "ALL",
+		})
+		// For INSERT/REPLACE ... SELECT, also include the SELECT subquery (same id as INSERT/REPLACE)
+		if rows, ok := s.Rows.(*sqlparser.Select); ok {
+			innerRows := e.explainSelect(rows, &idCounter, "SIMPLE")
+			result = append(result, innerRows...)
+		}
 	default:
 		return [][]interface{}{e.dummyExplainRow(query)}
 	}
@@ -4585,10 +4609,14 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 	myID := *idCounter
 	var result []explainSelectType
 
-	// Collect all real table names from FROM clause
+	// Collect all real table names from FROM clause (skip synthesized "dual").
 	var allTableNames []string
 	for _, te := range sel.From {
-		allTableNames = append(allTableNames, e.extractAllTableNames(te)...)
+		for _, tn := range e.extractAllTableNames(te) {
+			if strings.ToLower(tn) != "dual" {
+				allTableNames = append(allTableNames, tn)
+			}
+		}
 	}
 
 	// Count direct derived tables in FROM clause
@@ -4640,16 +4668,32 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 	} else {
 		for idx, tblName := range allTableNames {
 			var rowCount int64 = 1
+			tableIsEmpty := false
 			if e.Storage != nil {
 				if tbl, err := e.Storage.GetTable(e.CurrentDB, tblName); err == nil {
 					if n := len(tbl.Rows); n > 0 {
 						rowCount = int64(n)
+					} else {
+						tableIsEmpty = true
 					}
 				}
 			}
 
 			var extra interface{} = nil
-			if idx == 0 && !orderByNull && (strings.Contains(upperQ, "GROUP BY") || strings.Contains(upperQ, "SQL_BIG_RESULT")) {
+			// Single-table scan on empty table: MySQL shows "no matching row in const table"
+			// with table=NULL in the traditional EXPLAIN output
+			if tableIsEmpty && len(allTableNames) == 1 && idx == 0 {
+				result = append(result, explainSelectType{
+					id:         myID,
+					selectType: selectType,
+					table:      nil,
+					extra:      "no matching row in const table",
+					rows:       nil,
+					filtered:   nil,
+					accessType: nil,
+				})
+				continue
+			} else if idx == 0 && !orderByNull && (strings.Contains(upperQ, "GROUP BY") || strings.Contains(upperQ, "SQL_BIG_RESULT")) {
 				extra = "Using filesort"
 			}
 			// For secondary tables in a cross-join, MySQL shows "Using join buffer"
@@ -5653,6 +5697,19 @@ func (e *Executor) explainJSONTableBlock(row []interface{}, query string) []orde
 	// row layout: id, selectType, table, partitions, accessType, possibleKeys, key, keyLen, ref, rows, filtered, extra
 	var kvs []orderedKV
 
+	// For INSERT/REPLACE statements: simple output with just insert/table_name/access_type
+	if row[1] != nil && (fmt.Sprintf("%v", row[1]) == "INSERT" || fmt.Sprintf("%v", row[1]) == "REPLACE") {
+		kvs = append(kvs, orderedKV{"insert", true})
+		if row[2] != nil {
+			kvs = append(kvs, orderedKV{"table_name", fmt.Sprintf("%v", row[2])})
+		}
+		accessType := "ALL"
+		if row[4] != nil {
+			accessType = fmt.Sprintf("%v", row[4])
+		}
+		kvs = append(kvs, orderedKV{"access_type", accessType})
+		return kvs
+	}
 	if row[2] != nil {
 		kvs = append(kvs, orderedKV{"table_name", fmt.Sprintf("%v", row[2])})
 	}
@@ -6021,10 +6078,11 @@ func (e *Executor) explainJSONQueryBlockForRow(row []interface{}, query string) 
 	}
 	rc := explainJSONRowCount(row)
 	cost := float64(rc)*0.10 + 0.25
-	qb = append(qb, orderedKV{"cost_info", []orderedKV{{"query_cost", fmt.Sprintf("%.2f", cost)}}})
 	if row[2] != nil {
+		qb = append(qb, orderedKV{"cost_info", []orderedKV{{"query_cost", fmt.Sprintf("%.2f", cost)}}})
 		qb = append(qb, orderedKV{"table", e.explainJSONTableBlock(row, query)})
 	} else {
+		// No table: emit a message if Extra column has content (e.g. "No tables used")
 		extra := ""
 		if row[11] != nil {
 			extra = fmt.Sprintf("%v", row[11])
@@ -6130,25 +6188,34 @@ func (e *Executor) explainJSONDocument(query string) string {
 		queryBlock = append(queryBlock, orderedKV{"select_id", int64(1)})
 	}
 
-	// cost_info
-	queryBlock = append(queryBlock, orderedKV{"cost_info", []orderedKV{
-		{"query_cost", fmt.Sprintf("%.2f", totalCost)},
-	}})
-
 	// Build the main content based on structure
 	if len(primaryRows) == 1 && len(subqueryRows) == 0 && len(derivedRows) == 0 && len(unionRows) == 0 && unionResultRow == nil {
 		// Simple query with a single table
 		p := primaryRows[0]
-		if p.row[2] == nil {
-			// No table (e.g., SELECT 1)
-			extra := ""
-			if p.row[11] != nil {
-				extra = fmt.Sprintf("%v", p.row[11])
-			}
+		// Check for "message-only" cases: no table, or empty table with special Extra
+		extra := ""
+		if p.row[11] != nil {
+			extra = fmt.Sprintf("%v", p.row[11])
+		}
+		isMessageOnly := p.row[2] == nil ||
+			strings.Contains(extra, "no matching row in const table") ||
+			strings.Contains(extra, "No tables used")
+		if isMessageOnly {
+			// No table or empty table - no cost_info in output, just message
 			if extra != "" {
 				queryBlock = append(queryBlock, orderedKV{"message", extra})
 			}
 			return e.explainJSONMarshal([]orderedKV{{"query_block", queryBlock}})
+		}
+
+		// For INSERT/REPLACE/UPDATE/DELETE: no cost_info at query_block level
+		isInsertLike := p.selectType == "INSERT" || p.selectType == "REPLACE" || p.selectType == "UPDATE" || p.selectType == "DELETE"
+
+		// Has a table with data: include cost_info (except for INSERT/UPDATE/DELETE)
+		if !isInsertLike {
+			queryBlock = append(queryBlock, orderedKV{"cost_info", []orderedKV{
+				{"query_cost", fmt.Sprintf("%.2f", totalCost)},
+			}})
 		}
 
 		tblBlock := e.explainJSONTableBlock(p.row, query)
@@ -6180,6 +6247,9 @@ func (e *Executor) explainJSONDocument(query string) string {
 		}
 	} else if unionResultRow != nil {
 		// UNION query
+		queryBlock = append(queryBlock, orderedKV{"cost_info", []orderedKV{
+			{"query_cost", fmt.Sprintf("%.2f", totalCost)},
+		}})
 		var querySpecs []interface{}
 
 		for _, p := range primaryRows {
@@ -6203,6 +6273,9 @@ func (e *Executor) explainJSONDocument(query string) string {
 		queryBlock = append(queryBlock, orderedKV{"union_result", unionResult})
 	} else {
 		// Complex query with subqueries and/or derived tables
+		queryBlock = append(queryBlock, orderedKV{"cost_info", []orderedKV{
+			{"query_cost", fmt.Sprintf("%.2f", totalCost)},
+		}})
 		if len(primaryRows) > 0 {
 			p := primaryRows[0]
 			if p.row[2] != nil {
@@ -6259,12 +6332,22 @@ type orderedKV struct {
 // explainJSONMarshal marshals an ordered structure to a pretty-printed JSON string.
 func (e *Executor) explainJSONMarshal(v interface{}) string {
 	var b strings.Builder
-	e.explainJSONWrite(&b, v, 0)
+	// Check end_markers_in_json session variable
+	endMarkers := false
+	if v, ok := e.sessionScopeVars["end_markers_in_json"]; ok {
+		endMarkers = strings.EqualFold(v, "ON") || v == "1"
+	}
+	e.explainJSONWriteWithMarkers(&b, v, 0, "", endMarkers)
 	return b.String()
 }
 
 // explainJSONWrite writes a JSON value with proper indentation.
 func (e *Executor) explainJSONWrite(b *strings.Builder, v interface{}, indent int) {
+	e.explainJSONWriteWithMarkers(b, v, indent, "", false)
+}
+
+// explainJSONWriteWithMarkers writes JSON with optional end markers (/* key_name */).
+func (e *Executor) explainJSONWriteWithMarkers(b *strings.Builder, v interface{}, indent int, keyName string, endMarkers bool) {
 	prefix := strings.Repeat("  ", indent)
 	switch val := v.(type) {
 	case []orderedKV:
@@ -6273,18 +6356,21 @@ func (e *Executor) explainJSONWrite(b *strings.Builder, v interface{}, indent in
 			b.WriteString(prefix + "  ")
 			b.WriteString(fmt.Sprintf("%q", kv.Key))
 			b.WriteString(": ")
-			e.explainJSONWrite(b, kv.Value, indent+1)
+			e.explainJSONWriteWithMarkers(b, kv.Value, indent+1, kv.Key, endMarkers)
 			if i < len(val)-1 {
 				b.WriteString(",")
 			}
 			b.WriteString("\n")
 		}
 		b.WriteString(prefix + "}")
+		if endMarkers && keyName != "" {
+			b.WriteString(fmt.Sprintf(" /* %s */", keyName))
+		}
 	case []interface{}:
 		b.WriteString("[\n")
 		for i, item := range val {
 			b.WriteString(prefix + "  ")
-			e.explainJSONWrite(b, item, indent+1)
+			e.explainJSONWriteWithMarkers(b, item, indent+1, "", endMarkers)
 			if i < len(val)-1 {
 				b.WriteString(",")
 			}
@@ -6585,10 +6671,29 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		// Accept statements that Vitess parser doesn't support
 		if strings.HasPrefix(upper, "EXPLAIN ") || strings.HasPrefix(upper, "DESC ") || strings.HasPrefix(upper, "DESCRIBE ") {
 			explainType := sqlparser.TraditionalType
-			if strings.Contains(upper, "FORMAT=JSON") {
-				explainType = sqlparser.JSONType
-			} else if strings.Contains(upper, "FORMAT=TREE") {
-				explainType = sqlparser.TreeType
+			// Check for FORMAT= specifier
+			if formatIdx := strings.Index(upper, "FORMAT="); formatIdx >= 0 {
+				formatStr := upper[formatIdx+7:]
+				// Strip quotes if present
+				if len(formatStr) > 0 && (formatStr[0] == '\'' || formatStr[0] == '"') {
+					formatStr = strings.Trim(formatStr, "'\"")
+				}
+				// Get the format name (up to first space)
+				if spIdx := strings.IndexAny(formatStr, " \t"); spIdx >= 0 {
+					formatStr = formatStr[:spIdx]
+				}
+				formatStr = strings.Trim(formatStr, "'\"")
+				switch formatStr {
+				case "JSON":
+					explainType = sqlparser.JSONType
+				case "TREE":
+					explainType = sqlparser.TreeType
+				case "TRADITIONAL":
+					explainType = sqlparser.TraditionalType
+				default:
+					// Unknown format name
+					return nil, mysqlError(1235, "HY000", fmt.Sprintf("Unknown EXPLAIN format name: '%s'", strings.ToLower(formatStr)))
+				}
 			}
 			explainedQuery := trimmed
 			if idx := strings.Index(strings.ToUpper(trimmed), "SELECT "); idx >= 0 {
