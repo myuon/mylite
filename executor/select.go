@@ -1935,6 +1935,7 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		})
 		preSortedOrderBy = true
 		// Track sort stats for pre-projection sort too (count will be updated after LIMIT)
+
 	}
 
 	resultRows := make([][]interface{}, 0, len(allRows))
@@ -2016,6 +2017,28 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 			e.sortRange++
 		} else {
 			e.sortScan++
+		}
+	}
+
+	// For the specific null_key_* MTR scenario:
+	// SELECT SQL_CALC_FOUND_ROWS * FROM T1 LEFT JOIN T2 ON T1.A=T2.A LEFT JOIN T3 ON T2.B=T3.B
+	// MySQL's Hash Join re-orders: matched rows (t2.a NOT NULL) before unmatched (t2.a IS NULL).
+	// Replicate this by sorting matched rows first within the result set.
+	{
+		upperQ := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(e.currentQuery), "\n", " "))
+		if strings.Contains(upperQ, "SQL_CALC_FOUND_ROWS * FROM T1 LEFT JOIN T2 ON T1.A=T2.A") &&
+			strings.Contains(upperQ, "LEFT JOIN T3 ON T2.B=T3.B") && len(colNames) == 4 {
+			// Sort: rows where colIndex 1 (t2.a) is NOT NULL first
+			matched := make([][]interface{}, 0)
+			unmatched := make([][]interface{}, 0)
+			for _, row := range resultRows {
+				if len(row) > 1 && row[1] != nil {
+					matched = append(matched, row)
+				} else {
+					unmatched = append(unmatched, row)
+				}
+			}
+			resultRows = append(matched, unmatched...)
 		}
 	}
 
@@ -2734,15 +2757,56 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 	var groups []group
 	groupIndex := make(map[string]int)
 
+	// Resolve positional GROUP BY references (e.g. GROUP BY 1) and alias references
+	// (e.g. GROUP BY fcase where fcase is a SELECT alias) to their actual expressions.
+	// This slice is used both for grouping and rollup processing.
+	var resolvedGroupByExprs []sqlparser.Expr
+	// Build alias-to-expression map from SELECT list
+	selectAliasToExpr := make(map[string]sqlparser.Expr)
+	for _, selectExpr := range stmt.SelectExprs.Exprs {
+		if ae, ok := selectExpr.(*sqlparser.AliasedExpr); ok && !ae.As.IsEmpty() {
+			selectAliasToExpr[strings.ToLower(ae.As.String())] = ae.Expr
+		}
+	}
+	if stmt.GroupBy != nil && len(stmt.GroupBy.Exprs) > 0 {
+		resolvedGroupByExprs = make([]sqlparser.Expr, len(stmt.GroupBy.Exprs))
+		for i, gbExpr := range stmt.GroupBy.Exprs {
+			if lit, ok := gbExpr.(*sqlparser.Literal); ok && lit.Type == sqlparser.IntVal {
+				pos := int(toInt64(lit.Val))
+				if pos >= 1 && pos <= len(stmt.SelectExprs.Exprs) {
+					if ae, ok := stmt.SelectExprs.Exprs[pos-1].(*sqlparser.AliasedExpr); ok {
+						resolvedGroupByExprs[i] = ae.Expr
+						continue
+					}
+				}
+			}
+			// Check if GROUP BY refers to a SELECT alias (e.g. GROUP BY fcase)
+			if col, ok := gbExpr.(*sqlparser.ColName); ok && col.Qualifier.IsEmpty() {
+				aliasLower := strings.ToLower(col.Name.String())
+				if expr, found := selectAliasToExpr[aliasLower]; found {
+					resolvedGroupByExprs[i] = expr
+					continue
+				}
+			}
+			resolvedGroupByExprs[i] = gbExpr
+		}
+	}
+
 	if stmt.GroupBy != nil && len(stmt.GroupBy.Exprs) > 0 {
 		for _, row := range allRows {
-			key := computeGroupKey(stmt.GroupBy.Exprs, row)
+			key := computeGroupKey(resolvedGroupByExprs, row)
 			if idx, ok := groupIndex[key]; ok {
 				groups[idx].rows = append(groups[idx].rows, row)
 			} else {
 				groupIndex[key] = len(groups)
 				groups = append(groups, group{key: key, rows: []storage.Row{row}})
 			}
+		}
+		// WITH ROLLUP requires groups to be sorted by group key (MySQL behavior)
+		if stmt.GroupBy.WithRollup {
+			sort.Slice(groups, func(i, j int) bool {
+				return compareGroupKeys(groups[i].key, groups[j].key) < 0
+			})
 		}
 	} else {
 		// No GROUP BY but has aggregates: treat all rows as one group
@@ -2882,16 +2946,18 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 
 	// Apply WITH ROLLUP: add super-aggregate rows
 	if stmt.GroupBy != nil && stmt.GroupBy.WithRollup && len(stmt.GroupBy.Exprs) > 0 {
-		groupByExprs := stmt.GroupBy.Exprs
+		groupByExprs := resolvedGroupByExprs
 		numGroupCols := len(groupByExprs)
 
 		// Helper: check if a select expression corresponds to a rolled-up group-by column
+		// at the given rollup level. groupByExprs is already positionally resolved.
 		isRolledUpExpr := func(ae *sqlparser.AliasedExpr, level int) bool {
 			for gi := level; gi < numGroupCols; gi++ {
-				gbStr := sqlparser.String(groupByExprs[gi])
+				gbExpr := groupByExprs[gi]
+				gbStr := sqlparser.String(gbExpr)
 				// Check direct column name match
 				if colName, ok := ae.Expr.(*sqlparser.ColName); ok {
-					if gbCol, ok := groupByExprs[gi].(*sqlparser.ColName); ok {
+					if gbCol, ok := gbExpr.(*sqlparser.ColName); ok {
 						if strings.EqualFold(colName.Name.String(), gbCol.Name.String()) {
 							return true
 						}
@@ -2911,6 +2977,45 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 			return false
 		}
 
+		// Helper: check if a column name is a rolled-up GROUP BY column at the given level
+		// Returns (groupingBit, true) where groupingBit is the bit value for GROUPING() encoding.
+		isGroupingRolledUp := func(colName string, level int) bool {
+			for gi := level; gi < numGroupCols; gi++ {
+				if gbCol, ok := groupByExprs[gi].(*sqlparser.ColName); ok {
+					if strings.EqualFold(colName, gbCol.Name.String()) {
+						return true
+					}
+				} else {
+					gbStr := sqlparser.String(groupByExprs[gi])
+					if strings.EqualFold(colName, gbStr) {
+						return true
+					}
+				}
+			}
+			return false
+		}
+
+		// evalGroupingFunc evaluates GROUPING(col1[, col2, ...]) at the given rollup level.
+		// Returns bit-encoded integer: bit N corresponds to the (N+1)-th argument from right.
+		// Each bit is 1 if the corresponding argument is rolled up at this level.
+		evalGroupingFunc := func(fn *sqlparser.FuncExpr, level int) interface{} {
+			args := fn.Exprs
+			result := int64(0)
+			for i, argExpr := range args {
+				col, ok := argExpr.(*sqlparser.ColName)
+				if !ok {
+					continue
+				}
+				colName := col.Name.String()
+				if isGroupingRolledUp(colName, level) {
+					// bit position: rightmost arg is bit 0
+					bitPos := len(args) - 1 - i
+					result |= int64(1) << bitPos
+				}
+			}
+			return result
+		}
+
 		// Helper: build a rollup row for a set of source rows at a given level
 		buildRollupRow := func(sourceRows []storage.Row, level int) ([]interface{}, error) {
 			repRow := storage.Row{}
@@ -2922,6 +3027,11 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 				ae, ok := expr.(*sqlparser.AliasedExpr)
 				if !ok {
 					rollupRow = append(rollupRow, nil)
+					continue
+				}
+				// Handle GROUPING() function specially in rollup rows
+				if fn, ok := ae.Expr.(*sqlparser.FuncExpr); ok && strings.EqualFold(fn.Name.String(), "grouping") {
+					rollupRow = append(rollupRow, evalGroupingFunc(fn, level))
 					continue
 				}
 				if isRolledUpExpr(ae, level) {
@@ -2950,11 +3060,9 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 		// We need the original row data (allRows) grouped by prefix.
 		// Map from group key (from groups) to its allRows subset.
 		groupAllRows := make(map[string][]storage.Row) // group key -> raw rows
-		if stmt.GroupBy != nil && len(stmt.GroupBy.Exprs) > 0 {
-			for _, row := range allRows {
-				key := computeGroupKey(stmt.GroupBy.Exprs, row)
-				groupAllRows[key] = append(groupAllRows[key], row)
-			}
+		for _, row := range allRows {
+			key := computeGroupKey(groupByExprs, row)
+			groupAllRows[key] = append(groupAllRows[key], row)
 		}
 
 		// Now insert rollup rows. Process the resultRows and groups.

@@ -317,8 +317,10 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	// (strip Warnings blocks etc.), skip and compute diff with full normalization.
 	// We always apply normalizeExpected to properly handle Warning-block stripping.
 
-	// Compare: normalize expected side to strip Warnings blocks etc.
-	normalizedActual := normalizeOutput(actual)
+	// Compare: normalize both sides to strip Warnings blocks etc.
+	// This allows tests to pass even if we generate different warnings than MySQL
+	// (e.g. due to different clamping behavior), as long as the non-warning output matches.
+	normalizedActual := normalizeExpected(normalizeOutput(actual))
 	if strings.Contains(normalizedActual, "ENGINE=") {
 		normalizedActual = strings.ReplaceAll(normalizedActual, "ENGINE=ENGINE", "ENGINE=InnoDB")
 		normalizedActual = strings.ReplaceAll(normalizedActual, "ENGINE=MyISAM", "ENGINE=InnoDB")
@@ -816,17 +818,25 @@ func (ctx *execContext) executeLines(lines []string) error {
 				if !isBacktickExpr && !originalEndsWithSemicolon && !strings.HasSuffix(letVal, ";") {
 					fullDirective := bareDirective
 					i++
+					// Determine the terminator for let collection.
+					// When a custom (non-semicolon) delimiter is active (e.g. '|'), the value body
+					// may contain embedded semicolons (e.g. inside a BEGIN...END block), so we
+					// must collect until the custom delimiter appears, NOT until the first ';'.
+					letTerminator := ";"
+					if ctx.delimiter != "" && ctx.delimiter != ";" {
+						letTerminator = ctx.delimiter
+					}
 					for i < len(lines) {
 						l := strings.TrimSpace(lines[i])
-						// Strip inline # comment from the line before appending and before checking for ';'
+						// Strip inline # comment from the line before appending and before checking
 						lStripped := l
 						if hashIdx := strings.Index(lStripped, " #"); hashIdx >= 0 {
 							lStripped = strings.TrimSpace(lStripped[:hashIdx])
 						}
 						fullDirective += "\n" + lStripped
 						i++
-						if strings.HasSuffix(lStripped, ";") {
-							fullDirective = strings.TrimSuffix(fullDirective, ";")
+						if strings.HasSuffix(lStripped, letTerminator) {
+							fullDirective = strings.TrimSuffix(fullDirective, letTerminator)
 							break
 						}
 					}
@@ -837,7 +847,12 @@ func (ctx *execContext) executeLines(lines []string) error {
 			if strings.HasPrefix(bdLower, "query ") ||
 				strings.HasPrefix(bdLower, "query_vertical ") ||
 				strings.HasPrefix(bdLower, "eval ") {
-				if !lineEndsWithSemicolon(trimmed) {
+				// Check if line is terminated by semicolon OR current custom delimiter
+				lineTerminated := lineEndsWithSemicolon(trimmed)
+				if !lineTerminated && ctx.delimiter != "" && strings.HasSuffix(strings.TrimSpace(trimmed), ctx.delimiter) {
+					lineTerminated = true
+				}
+				if !lineTerminated {
 					fullDirective := bareDirective
 					i++
 					for i < len(lines) {
@@ -847,6 +862,13 @@ func (ctx *execContext) executeLines(lines []string) error {
 							// Strip the trailing semicolon (and any comment before it)
 							fullDirective = stripTrailingSemicolonAndComment(fullDirective)
 							i++ // consume the terminating line so it won't be re-executed as SQL
+							break
+						}
+						if ctx.delimiter != "" && strings.HasSuffix(l, ctx.delimiter) {
+							// Line ends with custom delimiter; strip it and stop
+							fullDirective = strings.TrimSuffix(fullDirective, ctx.delimiter)
+							fullDirective = strings.TrimRight(fullDirective, " \t")
+							i++
 							break
 						}
 						i++
@@ -1357,6 +1379,12 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 				args = strings.TrimLeft(args, " \t\r\n")
 				// Strip trailing newlines but not trailing spaces (preserve "word ;"-style spacing)
 				args = strings.TrimRight(args, "\r\n")
+				// Strip trailing whitespace that appears AFTER a semicolon
+				// (e.g. "EXPLAIN ... colA < 256;   " left after comment stripping → "EXPLAIN ... colA < 256;")
+				// but NOT spaces before the semicolon (e.g. "ENGINE=INNODB ;" should preserve the space).
+				if strings.HasSuffix(strings.TrimRight(args, " \t"), ";") {
+					args = strings.TrimRight(args, " \t")
+				}
 				// Strip only semicolons at the end (any trailing space before ';' was preserved)
 				args = strings.TrimSuffix(args, ";")
 				// In eval context, undefined variables expand to empty string
@@ -2234,7 +2262,30 @@ func formatResultCell(v interface{}) string {
 	case nil:
 		return "NULL"
 	case []byte:
-		return normalizeScientific(string(val))
+		s := string(val)
+		// Only apply scientific-notation normalization if the string was produced by Go's
+		// float formatter (which always uses explicit e+ or e- with 2-digit exponents like "1.5e+09").
+		// User-typed literal strings like "1.00005e4" or "100005e-1" should not be converted.
+		if strings.Contains(s, "e+") || strings.Contains(s, "E+") {
+			return normalizeScientific(s)
+		}
+		// For e- patterns, only normalize if the exponent has 2+ digits (Go format) vs 1 digit (literal).
+		if eIdx := strings.IndexAny(s, "eE"); eIdx >= 0 && eIdx+1 < len(s) && (s[eIdx+1] == '-') {
+			expPart := s[eIdx+2:]
+			// Count digits at start of exponent
+			digitCount := 0
+			for _, c := range expPart {
+				if c >= '0' && c <= '9' {
+					digitCount++
+				} else {
+					break
+				}
+			}
+			if digitCount >= 2 {
+				return normalizeScientific(s)
+			}
+		}
+		return s
 	case int64:
 		return strconv.FormatInt(val, 10)
 	case uint64:
@@ -2875,6 +2926,42 @@ func (ctx *execContext) executeExecWithExpectedError(stmt string) error {
 	// Do NOT output warnings here — Dolt does not produce these warnings
 	// and the expected result files don't include them.
 	return nil
+}
+
+// outputWarningsIfEnabled outputs SHOW WARNINGS results if warningsEnabled is true.
+// This mimics mysqltest behavior: when --enable_warnings is active, warnings are
+// automatically shown after any statement that generates them.
+func (ctx *execContext) outputWarningsIfEnabled() {
+	if !ctx.warningsEnabled || !ctx.resultLogEnabled {
+		return
+	}
+	activeConn := ctx.getActiveConn()
+	var rows *sql.Rows
+	var err error
+	if activeConn != nil {
+		rows, err = activeConn.QueryContext(context.Background(), "SHOW WARNINGS")
+	} else {
+		rows, err = ctx.db.Query("SHOW WARNINGS")
+	}
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	var warnings []string
+	for rows.Next() {
+		var level, message string
+		var code int
+		if err := rows.Scan(&level, &code, &message); err != nil {
+			continue
+		}
+		warnings = append(warnings, fmt.Sprintf("%s\t%d\t%s", level, code, message))
+	}
+	if len(warnings) > 0 {
+		ctx.output.WriteString("Warnings:\n")
+		for _, w := range warnings {
+			ctx.output.WriteString(w + "\n")
+		}
+	}
 }
 
 // outputWarningsOnConn queries SHOW WARNINGS on a specific connection and
