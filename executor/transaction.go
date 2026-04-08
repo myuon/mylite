@@ -49,6 +49,14 @@ func (e *Executor) captureSnapshot() *txSavepoint {
 	return sp
 }
 
+// ddlImplicitCommit simulates the implicit commit that MySQL performs before DDL statements.
+// This clears named savepoints so that subsequent ROLLBACK TO SAVEPOINT fails.
+func (e *Executor) ddlImplicitCommit() {
+	if e.namedSavepoints != nil {
+		e.namedSavepoints = make(map[string]bool)
+	}
+}
+
 func (e *Executor) execBegin() (*Result, error) {
 	if e.inTransaction {
 		// Implicit commit of previous transaction before starting a new one.
@@ -60,6 +68,7 @@ func (e *Executor) execBegin() (*Result, error) {
 	}
 	e.savepoint = e.captureSnapshot()
 	e.txnUndoLog = nil
+	e.namedSavepoints = make(map[string]bool)
 	e.inTransaction = true
 	if e.txnActiveSet != nil {
 		e.txnActiveSet.Begin(e.connectionID)

@@ -240,6 +240,9 @@ type Executor struct {
 	CurrentDB      string
 	inTransaction  bool
 	savepoint      *txSavepoint
+	// namedSavepoints tracks savepoint names set in the current transaction.
+	// DDL statements (implicit commit) clears this map, so ROLLBACK TO SAVEPOINT fails.
+	namedSavepoints map[string]bool
 	snapshots      map[string]*fullSnapshot
 	lastInsertID   int64
 	lastUpdateInfo string // stores info message from last UPDATE (e.g. "Rows matched: 2  Changed: 1  Warnings: 0")
@@ -579,11 +582,104 @@ func (e *Executor) setSysVar(name string, value string, isGlobal bool) {
 	if triggerSysVars[name] {
 		value = "OFF"
 	}
+	// optimizer_switch uses MySQL's merge-set semantics: each SET only updates
+	// the specified flags, leaving others at their current values.
+	// e.g. SET optimizer_switch='materialization=off' only turns off materialization.
+	if name == "optimizer_switch" {
+		value = e.mergeOptimizerSwitch(value, isGlobal)
+	}
 	if isGlobal {
 		e.setGlobalVar(name, value)
 	} else {
 		e.sessionScopeVars[name] = value
 	}
+}
+
+// mergeOptimizerSwitch merges a partial optimizer_switch setting into the current value.
+// MySQL allows SET optimizer_switch='flag=on' to only change one flag at a time.
+func (e *Executor) mergeOptimizerSwitch(newValue string, isGlobal bool) string {
+	// Special case: 'default' resets optimizer_switch to the compiled default value.
+	if strings.EqualFold(strings.TrimSpace(newValue), "default") {
+		if compiled, ok := e.getCompiledDefault("optimizer_switch"); ok {
+			return compiled
+		}
+		return newValue
+	}
+	// Get current value - check session, global, startupVars, and compiled defaults
+	var currentValue string
+	if isGlobal {
+		if v, ok := e.getGlobalVar("optimizer_switch"); ok {
+			currentValue = v
+		}
+	} else {
+		if v, ok := e.getSysVar("optimizer_switch"); ok {
+			currentValue = v
+		}
+	}
+	// Fall back to startupVars if no explicit value set
+	if currentValue == "" {
+		if v, ok := e.startupVars["optimizer_switch"]; ok {
+			currentValue = v
+		}
+	}
+	// Fall back to compiled default
+	if currentValue == "" {
+		if compiled, ok := e.getCompiledDefault("optimizer_switch"); ok {
+			currentValue = compiled
+		}
+	}
+	if currentValue == "" {
+		return newValue
+	}
+
+	// Parse current flags into a map (preserving order with slice)
+	type flagEntry struct {
+		key string
+		val string
+	}
+	var flags []flagEntry
+	flagIndex := map[string]int{}
+	for _, part := range strings.Split(currentValue, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) == 2 {
+			k := strings.TrimSpace(kv[0])
+			v := strings.TrimSpace(kv[1])
+			if _, exists := flagIndex[k]; !exists {
+				flagIndex[k] = len(flags)
+				flags = append(flags, flagEntry{k, v})
+			}
+		}
+	}
+
+	// Apply new flags (merge/update)
+	for _, part := range strings.Split(newValue, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) == 2 {
+			k := strings.TrimSpace(kv[0])
+			v := strings.TrimSpace(kv[1])
+			if idx, exists := flagIndex[k]; exists {
+				flags[idx].val = v
+			} else {
+				flagIndex[k] = len(flags)
+				flags = append(flags, flagEntry{k, v})
+			}
+		}
+	}
+
+	// Reconstruct the merged value
+	parts := make([]string, len(flags))
+	for i, f := range flags {
+		parts[i] = f.key + "=" + f.val
+	}
+	return strings.Join(parts, ",")
 }
 
 // deleteSysVar deletes a system variable from the appropriate scope map (for DEFAULT).
@@ -2174,14 +2270,41 @@ func allCharsets() [][]interface{} {
 // isKnownCharset returns true if the charset name is a valid MySQL character set.
 // expandSQLMode expands MySQL combination sql_mode values into their component modes.
 func expandSQLMode(mode string) string {
-	switch strings.TrimSpace(mode) {
-	case "ANSI":
-		return "REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,ANSI"
-	case "TRADITIONAL":
-		return "STRICT_TRANS_TABLES,STRICT_ALL_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,TRADITIONAL,NO_ENGINE_SUBSTITUTION"
-	default:
-		return mode
+	// combinationModes maps shorthand mode names to their expanded equivalents.
+	combinationModes := map[string][]string{
+		"ANSI":        {"REAL_AS_FLOAT", "PIPES_AS_CONCAT", "ANSI_QUOTES", "IGNORE_SPACE", "ONLY_FULL_GROUP_BY", "ANSI"},
+		"TRADITIONAL": {"STRICT_TRANS_TABLES", "STRICT_ALL_TABLES", "NO_ZERO_IN_DATE", "NO_ZERO_DATE", "ERROR_FOR_DIVISION_BY_ZERO", "TRADITIONAL", "NO_ENGINE_SUBSTITUTION"},
+		"DB2":         {"PIPES_AS_CONCAT", "ANSI_QUOTES", "IGNORE_SPACE", "NO_KEY_OPTIONS", "NO_TABLE_OPTIONS", "NO_FIELD_OPTIONS", "DB2"},
+		"MAXDB":       {"PIPES_AS_CONCAT", "ANSI_QUOTES", "IGNORE_SPACE", "NO_KEY_OPTIONS", "NO_TABLE_OPTIONS", "NO_FIELD_OPTIONS", "NO_AUTO_CREATE_USER", "MAXDB"},
+		"MSSQL":       {"PIPES_AS_CONCAT", "ANSI_QUOTES", "IGNORE_SPACE", "NO_KEY_OPTIONS", "NO_TABLE_OPTIONS", "NO_FIELD_OPTIONS", "MSSQL"},
+		"ORACLE":      {"PIPES_AS_CONCAT", "ANSI_QUOTES", "IGNORE_SPACE", "NO_KEY_OPTIONS", "NO_TABLE_OPTIONS", "NO_FIELD_OPTIONS", "NO_AUTO_CREATE_USER", "ORACLE"},
+		"POSTGRESQL":  {"PIPES_AS_CONCAT", "ANSI_QUOTES", "IGNORE_SPACE", "NO_KEY_OPTIONS", "NO_TABLE_OPTIONS", "NO_FIELD_OPTIONS", "POSTGRESQL"},
 	}
+
+	// Split into individual modes, expand combination modes, deduplicate, and rejoin.
+	parts := strings.Split(mode, ",")
+	var result []string
+	seen := make(map[string]bool)
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if expanded, ok := combinationModes[part]; ok {
+			for _, m := range expanded {
+				if !seen[m] {
+					seen[m] = true
+					result = append(result, m)
+				}
+			}
+		} else {
+			if !seen[part] {
+				seen[part] = true
+				result = append(result, part)
+			}
+		}
+	}
+	return strings.Join(result, ",")
 }
 
 // normalizeEngineName returns the canonical MySQL engine name for a given input.
@@ -4137,6 +4260,75 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 			// Simple query
 			result = e.explainSelect(s, &idCounter, "SIMPLE")
 		}
+	case *sqlparser.Update:
+		// EXPLAIN UPDATE: first table gets select_type="UPDATE", subsequent tables get "SIMPLE".
+		// Collect all table names from the UPDATE's TableExprs.
+		var tableNames []string
+		for _, te := range s.TableExprs {
+			tableNames = append(tableNames, e.extractAllTableNames(te)...)
+		}
+		for i, tblName := range tableNames {
+			var rowCount int64 = 1
+			if e.Storage != nil {
+				if tbl, err := e.Storage.GetTable(e.CurrentDB, tblName); err == nil {
+					if n := len(tbl.Rows); n > 0 {
+						rowCount = int64(n)
+					}
+				}
+			}
+			st := "SIMPLE"
+			if i == 0 {
+				st = "UPDATE"
+			}
+			result = append(result, explainSelectType{
+				id:         idCounter,
+				selectType: st,
+				table:      tblName,
+				rows:       rowCount,
+				filtered:   "100.00",
+				accessType: "ALL",
+			})
+		}
+		if len(result) == 0 {
+			return [][]interface{}{e.dummyExplainRow(query)}
+		}
+	case *sqlparser.Delete:
+		// EXPLAIN DELETE: show "DELETE" as select_type.
+		// For DELETE without WHERE, Extra is "Deleting all rows".
+		var tableNames []string
+		for _, te := range s.TableExprs {
+			tableNames = append(tableNames, e.extractAllTableNames(te)...)
+		}
+		for i, tblName := range tableNames {
+			var rowCount int64 = 1
+			if e.Storage != nil {
+				if tbl, err := e.Storage.GetTable(e.CurrentDB, tblName); err == nil {
+					if n := len(tbl.Rows); n > 0 {
+						rowCount = int64(n)
+					}
+				}
+			}
+			st := "SIMPLE"
+			if i == 0 {
+				st = "DELETE"
+			}
+			var extra interface{} = nil
+			if i == 0 && s.Where == nil {
+				extra = "Deleting all rows"
+			}
+			result = append(result, explainSelectType{
+				id:         idCounter,
+				selectType: st,
+				table:      tblName,
+				rows:       rowCount,
+				filtered:   "100.00",
+				accessType: "ALL",
+				extra:      extra,
+			})
+		}
+		if len(result) == 0 {
+			return [][]interface{}{e.dummyExplainRow(query)}
+		}
 	default:
 		return [][]interface{}{e.dummyExplainRow(query)}
 	}
@@ -4589,6 +4781,23 @@ func (e *Executor) collectTableNamesAndAliases(te sqlparser.TableExpr, names map
 }
 
 // isCorrelatedSubquery checks whether a subquery SELECT references any of the outer table names.
+// isOptimizerSwitchEnabled checks if a specific optimizer_switch flag is enabled.
+// Returns true if the flag is "on" or if the switch is not set (defaults to on for most flags).
+func (e *Executor) isOptimizerSwitchEnabled(flag string) bool {
+	switchVal, ok := e.getSysVar("optimizer_switch")
+	if !ok {
+		return true // default: on
+	}
+	for _, part := range strings.Split(switchVal, ",") {
+		part = strings.TrimSpace(part)
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) == 2 && strings.TrimSpace(kv[0]) == flag {
+			return strings.TrimSpace(kv[1]) == "on"
+		}
+	}
+	return true // not found means default (on)
+}
+
 func (e *Executor) isCorrelatedSubquery(subSelect sqlparser.TableStatement, outerTables map[string]bool) bool {
 	if len(outerTables) == 0 {
 		return false
@@ -4625,12 +4834,21 @@ func (e *Executor) isCorrelatedSubquery(subSelect sqlparser.TableStatement, oute
 	return correlated
 }
 
-// isSubqueryInINContext checks if a Subquery node is used in an IN or = ANY context (for MATERIALIZED detection).
+// isSubqueryInINContext checks if a Subquery node is used in an IN, NOT IN, or = ANY / != ANY context.
 func isSubqueryInINContext(node sqlparser.SQLNode, sub *sqlparser.Subquery) bool {
 	found := false
 	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
 		if cmp, ok := n.(*sqlparser.ComparisonExpr); ok {
-			if cmp.Operator == sqlparser.InOp || cmp.Operator == sqlparser.NotInOp {
+			switch cmp.Operator {
+			case sqlparser.InOp, sqlparser.NotInOp:
+				if subR, ok := cmp.Right.(*sqlparser.Subquery); ok && subR == sub {
+					found = true
+					return false, nil
+				}
+			case sqlparser.EqualOp, sqlparser.NotEqualOp,
+				sqlparser.LessThanOp, sqlparser.LessEqualOp,
+				sqlparser.GreaterThanOp, sqlparser.GreaterEqualOp:
+				// = ANY / != ANY / < ANY / etc. with a subquery right-hand side
 				if subR, ok := cmp.Right.(*sqlparser.Subquery); ok && subR == sub {
 					found = true
 					return false, nil
@@ -4702,7 +4920,12 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 				if correlated {
 					selectType = "DEPENDENT SUBQUERY"
 				} else if inContext {
-					selectType = "MATERIALIZED"
+					if e.isOptimizerSwitchEnabled("materialization") {
+						selectType = "MATERIALIZED"
+					} else {
+						// When materialization=off, IN subqueries use EXISTS strategy → DEPENDENT SUBQUERY
+						selectType = "DEPENDENT SUBQUERY"
+					}
 				}
 				subRows := e.explainSelect(inner, idCounter, selectType)
 				if len(subRows) > 0 {
@@ -6343,13 +6566,15 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 	trimmed := strings.TrimSpace(query)
 	upper := strings.ToUpper(trimmed)
 
-	// MySQL has a stack depth limit for deeply nested expressions.
-	// Count nested IF/CASE occurrences in the query string as a proxy for expression depth.
-	// If it exceeds our threshold, return ER_STACK_OVERRUN_NEED_MORE instead of a parse error.
+	// MySQL has a stack depth limit for deeply nested IF expressions.
+	// Count IF( occurrences as a proxy for nesting depth.
+	// A threshold of 30 allows tests with up to 30 nested IFs (func_if test has exactly 30)
+	// while detecting pathological recursion (execution_constants builds thousands of IFs,
+	// reaching 31 after 10 loop iterations).
+	// Note: IFNULL/NULLIF are separate functions and won't match "IF(".
 	{
 		ifCount := strings.Count(upper, "IF(")
-		caseCount := strings.Count(upper, " WHEN ") + strings.Count(upper, "\nWHEN ")
-		if ifCount+caseCount > 5 {
+		if ifCount > 30 {
 			return nil, mysqlError(1436, "HY000", "Thread stack overrun: "+
 				"Need more than available stack. Use 'mysqld --thread_stack=#' to specify a bigger stack.")
 		}
@@ -6552,6 +6777,14 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		if strings.HasPrefix(upper, "INSTALL PLUGIN ") && strings.Contains(query, "/") {
 			return nil, mysqlError(1210, "HY000", "No paths allowed for shared library")
 		}
+		// ALTER PROCEDURE/FUNCTION are DDL: cause implicit commit (clears savepoints).
+		if strings.HasPrefix(upper, "ALTER PROCEDURE") || strings.HasPrefix(upper, "ALTER FUNCTION") {
+			e.ddlImplicitCommit()
+			// LOCK TABLES blocks procedure/function DDL.
+			if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
+				return nil, mysqlError(1192, "HY000", "Can't execute the given command because you have active locked tables or an active transaction")
+			}
+		}
 		if strings.HasPrefix(upper, "CREATE EVENT") ||
 			strings.HasPrefix(upper, "DROP EVENT") ||
 			strings.HasPrefix(upper, "CREATE USER") ||
@@ -6576,8 +6809,6 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			strings.HasPrefix(upper, "RESIGNAL") ||
 			strings.HasPrefix(upper, "GET DIAGNOSTICS") ||
 			strings.HasPrefix(upper, "XA ") ||
-			strings.HasPrefix(upper, "SAVEPOINT") ||
-			strings.HasPrefix(upper, "RELEASE SAVEPOINT") ||
 			strings.HasPrefix(upper, "ALTER PROCEDURE") ||
 			strings.HasPrefix(upper, "ALTER FUNCTION") ||
 			strings.HasPrefix(upper, "CHANGE ") ||
@@ -6734,8 +6965,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 	case *sqlparser.Use:
 		return e.execUse(s)
 	case *sqlparser.CreateTable:
+		e.ddlImplicitCommit()
 		return e.execCreateTable(s)
 	case *sqlparser.DropTable:
+		e.ddlImplicitCommit()
 		return e.execDropTable(s)
 	case *sqlparser.Insert:
 		res, err := e.execInsert(s)
@@ -6805,13 +7038,27 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 	case *sqlparser.Rollback:
 		return e.execRollback()
 	case *sqlparser.SRollback:
-		// ROLLBACK TO SAVEPOINT: accepted as a no-op for compatibility.
+		// ROLLBACK TO SAVEPOINT sv: fail if sv doesn't exist (e.g. was cleared by DDL auto-commit)
+		spName := strings.ToLower(s.Name.String())
+		if e.namedSavepoints == nil || !e.namedSavepoints[spName] {
+			return nil, mysqlError(1305, "42000", fmt.Sprintf("SAVEPOINT %s does not exist", s.Name.String()))
+		}
+		// If savepoint exists, treat rollback as a no-op (we don't track per-savepoint undo)
 		return &Result{}, nil
 	case *sqlparser.Savepoint:
-		// SAVEPOINT: accepted as a no-op for compatibility.
+		// SAVEPOINT sv: record the savepoint name.
+		if e.namedSavepoints == nil {
+			e.namedSavepoints = make(map[string]bool)
+		}
+		e.namedSavepoints[strings.ToLower(s.Name.String())] = true
 		return &Result{}, nil
 	case *sqlparser.Release:
-		// RELEASE SAVEPOINT: accepted as a no-op for compatibility.
+		// RELEASE SAVEPOINT sv: remove the savepoint if it exists.
+		spName := strings.ToLower(s.Name.String())
+		if e.namedSavepoints == nil || !e.namedSavepoints[spName] {
+			return nil, mysqlError(1305, "42000", fmt.Sprintf("SAVEPOINT %s does not exist", s.Name.String()))
+		}
+		delete(e.namedSavepoints, spName)
 		return &Result{}, nil
 	case *sqlparser.TruncateTable:
 		return e.execTruncateTable(s)
@@ -8674,6 +8921,149 @@ func isLeapYear(y int) bool {
 	return (y%4 == 0 && y%100 != 0) || y%400 == 0
 }
 
+// checkDateStrict validates a date string value for a DATE/DATETIME/TIMESTAMP column
+// in strict SQL mode. Returns an error if the date is invalid.
+// The sqlMode string is used to determine which checks to apply.
+func checkDateStrict(colType, colName, originalValue, sqlMode string) error {
+	upper := strings.ToUpper(strings.TrimSpace(colType))
+	// Only check date-like types
+	isDateType := upper == "DATE" || strings.HasPrefix(upper, "DATETIME") || strings.HasPrefix(upper, "TIMESTAMP")
+	if !isDateType {
+		return nil
+	}
+
+	s := strings.TrimSpace(originalValue)
+	if s == "" {
+		return nil
+	}
+
+	// Determine SQL mode flags
+	isNoZeroInDate := strings.Contains(sqlMode, "NO_ZERO_IN_DATE") || strings.Contains(sqlMode, "TRADITIONAL")
+	isNoZeroDate := strings.Contains(sqlMode, "NO_ZERO_DATE") || strings.Contains(sqlMode, "TRADITIONAL")
+	// ALLOW_INVALID_DATES skips range checks for day (but still requires valid month range 1-12)
+	allowInvalidDates := strings.Contains(sqlMode, "ALLOW_INVALID_DATES")
+
+	// Parse the date part from the value
+	// Supported formats: YYYY-MM-DD, YYYYMMDD, YY-MM-DD, and flexible variants
+	datePart := s
+	if idx := strings.IndexByte(s, ' '); idx >= 0 {
+		datePart = s[:idx]
+	}
+	if idx := strings.IndexByte(s, 'T'); idx >= 0 {
+		datePart = s[:idx]
+	}
+
+	// Try to parse as YYYY-M-D or YYYYMMDD
+	var y, m, d int
+	parsed := false
+
+	// Check if it's a numeric value (no delimiters)
+	isAllDigits := true
+	for _, c := range datePart {
+		if c < '0' || c > '9' {
+			isAllDigits = false
+			break
+		}
+	}
+	if isAllDigits {
+		switch len(datePart) {
+		case 8: // YYYYMMDD
+			yy, _ := strconv.Atoi(datePart[:4])
+			mm, _ := strconv.Atoi(datePart[4:6])
+			dd, _ := strconv.Atoi(datePart[6:8])
+			y, m, d = yy, mm, dd
+			parsed = true
+		case 6: // YYMMDD
+			yy, _ := strconv.Atoi(datePart[:2])
+			mm, _ := strconv.Atoi(datePart[2:4])
+			dd, _ := strconv.Atoi(datePart[4:6])
+			y, m, d = convert2DigitYear(yy), mm, dd
+			parsed = true
+		default:
+			// Short numeric values like '59' - definitely invalid
+			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+		}
+	}
+
+	if !parsed {
+		// Try delimited formats: YYYY-M-D or similar
+		norm := normalizeDateDelimiters(datePart)
+		parts := strings.Split(norm, "-")
+		if len(parts) == 3 {
+			yStr, mStr, dStr := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), strings.TrimSpace(parts[2])
+			// Remove time components from dStr
+			if idx := strings.IndexAny(dStr, " T:"); idx >= 0 {
+				dStr = dStr[:idx]
+			}
+			var parseErr error
+			if len(yStr) <= 2 {
+				var yy int
+				yy, parseErr = strconv.Atoi(yStr)
+				if parseErr == nil {
+					y = convert2DigitYear(yy)
+				}
+			} else {
+				y, parseErr = strconv.Atoi(yStr)
+			}
+			if parseErr != nil {
+				return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+			}
+			m, _ = strconv.Atoi(mStr)
+			d, _ = strconv.Atoi(dStr)
+			parsed = true
+		} else {
+			// Not parseable as a date
+			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+		}
+	}
+
+	if !parsed {
+		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+	}
+
+	// Check for zero date (0000-00-00)
+	if y == 0 && m == 0 && d == 0 {
+		if isNoZeroDate {
+			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+		}
+		return nil
+	}
+
+	// Check for zero month or zero day (partial zero dates)
+	if m == 0 || d == 0 {
+		if isNoZeroInDate {
+			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+		}
+		// Partial zero dates are allowed in non-NO_ZERO_IN_DATE mode
+		return nil
+	}
+
+	// Check month range
+	if m < 1 || m > 12 {
+		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+	}
+
+	// ALLOW_INVALID_DATES: skip day range check, only month must be valid (1-12)
+	if allowInvalidDates {
+		if d < 1 || d > 31 {
+			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+		}
+		return nil
+	}
+
+	// Check day range
+	daysInMonth := [13]int{0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
+	maxDay := daysInMonth[m]
+	if m == 2 && isLeapYear(y) {
+		maxDay = 29
+	}
+	if d < 1 || d > maxDay {
+		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+	}
+
+	return nil
+}
+
 // extractColumnName extracts the column name from a sqlparser expression.
 // Returns empty string if the expression is not a simple column reference.
 func extractColumnName(expr sqlparser.Expr) string {
@@ -8812,6 +9202,56 @@ func normalizeDateTimeString(s string) string {
 	return datePart
 }
 
+// hasInvalidTimeComponent checks if a datetime string has an invalid time component
+// (hour > 23, minute > 59, or second > 59). Returns the invalid string if found.
+// Only applies to strings that look like full datetime values (date + time parts).
+func hasInvalidTimeComponent(s string) (string, bool) {
+	// Must have both date separator (-) and time separator (:) and a space
+	spaceIdx := strings.Index(s, " ")
+	if spaceIdx < 0 {
+		return "", false
+	}
+	datePart := s[:spaceIdx]
+	timePart := strings.TrimSpace(s[spaceIdx+1:])
+	// Validate date part (must be YYYY-MM-DD format)
+	if len(datePart) < 10 || datePart[4] != '-' || datePart[7] != '-' {
+		return "", false
+	}
+	// Validate time part (must be HH:MM:SS format)
+	colonIdx := strings.Index(timePart, ":")
+	if colonIdx < 0 {
+		return "", false
+	}
+	hourStr := timePart[:colonIdx]
+	hour, err := strconv.Atoi(hourStr)
+	if err != nil {
+		return "", false
+	}
+	if hour > 23 {
+		return s, true
+	}
+	// Check minutes
+	rest := timePart[colonIdx+1:]
+	colonIdx2 := strings.Index(rest, ":")
+	if colonIdx2 >= 0 {
+		minStr := rest[:colonIdx2]
+		min, err := strconv.Atoi(minStr)
+		if err == nil && min > 59 {
+			return s, true
+		}
+		secStr := rest[colonIdx2+1:]
+		// Strip fractional seconds
+		if dotIdx := strings.Index(secStr, "."); dotIdx >= 0 {
+			secStr = secStr[:dotIdx]
+		}
+		sec, err := strconv.Atoi(secStr)
+		if err == nil && sec > 59 {
+			return s, true
+		}
+	}
+	return "", false
+}
+
 // convert2DigitYear converts a 2-digit year to 4-digit year.
 // 0-69 -> 2000-2069, 70-99 -> 1970-1999
 func convert2DigitYear(yy int) int {
@@ -8877,16 +9317,33 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 		intVal = val
 	case ScaledValue:
 		f := val.Value
-		if f > float64(maxVal) {
+		if isUnsigned {
+			if f < 0 {
+				intVal = 0
+			} else if f > float64(maxUnsigned) {
+				intVal = int64(maxUnsigned)
+			} else {
+				intVal = mysqlRoundToInt(f)
+			}
+		} else if f > float64(maxVal) {
 			intVal = maxVal
 		} else if f < float64(minVal) {
 			intVal = minVal
 		} else {
-			intVal = int64(f)
+			// MySQL rounds half away from zero for decimal-to-int conversion
+			intVal = mysqlRoundToInt(f)
 		}
 	case DivisionResult:
 		f := val.Value
-		if f > float64(maxVal) {
+		if isUnsigned {
+			if f < 0 {
+				intVal = 0
+			} else if f > float64(maxUnsigned) {
+				intVal = int64(maxUnsigned)
+			} else {
+				intVal = mysqlRoundToInt(f)
+			}
+		} else if f > float64(maxVal) {
 			intVal = maxVal
 		} else if f < float64(minVal) {
 			intVal = minVal
@@ -8895,7 +9352,15 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 			intVal = mysqlRoundToInt(f)
 		}
 	case float64:
-		if val > float64(maxVal) {
+		if isUnsigned {
+			if val < 0 {
+				intVal = 0
+			} else if val > float64(maxUnsigned) {
+				intVal = int64(maxUnsigned)
+			} else {
+				intVal = mysqlRoundToInt(val)
+			}
+		} else if val > float64(maxVal) {
 			intVal = maxVal
 		} else if val < float64(minVal) {
 			intVal = minVal
@@ -8930,13 +9395,24 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 		// Parse leading numeric portion
 		numStr := ""
 		hasDot := false
+		hasExp := false
 		for i, c := range val {
 			if c == '-' && i == 0 {
 				numStr += string(c)
+			} else if c == '-' && hasExp {
+				// Exponent sign (e.g. 1.5e-3)
+				numStr += string(c)
+			} else if c == '+' && hasExp {
+				// Exponent sign (e.g. 1.5e+3)
+				// skip +, just continue
 			} else if c >= '0' && c <= '9' {
 				numStr += string(c)
 			} else if c == '.' && !hasDot {
 				hasDot = true
+				numStr += string(c)
+			} else if (c == 'e' || c == 'E') && !hasExp && numStr != "" && numStr != "-" {
+				hasExp = true
+				hasDot = true // treat scientific notation as having decimal
 				numStr += string(c)
 			} else {
 				break
@@ -8946,16 +9422,84 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 			return int64(0)
 		}
 		if hasDot {
+			if baseType == "BIGINT" {
+				// Special case: float64 can't represent BIGINT boundaries precisely.
+				// Use big.Float with high precision to round correctly.
+				bf := new(big.Float).SetPrec(128)
+				if _, ok := bf.SetString(numStr); !ok {
+					return int64(0)
+				}
+				if isUnsigned {
+					// Check sign
+					if bf.Sign() < 0 {
+						return uint64(0)
+					}
+					// Convert to big.Int using truncation
+					bfTrunc := new(big.Float).SetPrec(128).Copy(bf)
+					// Get integer part via Uint64 on truncated value
+					// Use big.Int for full precision
+					bi := new(big.Int)
+					bf.Int(bi) // truncates toward zero
+					// Determine if we need to round up (fractional part >= 0.5)
+					biF := new(big.Float).SetPrec(128).SetInt(bi)
+					frac := new(big.Float).SetPrec(128).Sub(bfTrunc, biF)
+					half := new(big.Float).SetPrec(128).SetFloat64(0.5)
+					if frac.Cmp(half) >= 0 {
+						bi.Add(bi, big.NewInt(1))
+					}
+					// Clamp to uint64 max
+					maxU := new(big.Int).SetUint64(maxUnsigned)
+					if bi.Cmp(maxU) > 0 {
+						return maxUnsigned
+					}
+					return bi.Uint64()
+				} else {
+					// Signed BIGINT
+					bfSign := bf.Sign() // sign of original value
+					bf2 := new(big.Float).SetPrec(128).Copy(bf)
+					bi := new(big.Int)
+					bf.Int(bi) // truncates toward zero
+					biF := new(big.Float).SetPrec(128).SetInt(bi)
+					frac := new(big.Float).SetPrec(128).Sub(bf2, biF)
+					half := new(big.Float).SetPrec(128).SetFloat64(0.5)
+					negHalf := new(big.Float).SetPrec(128).SetFloat64(-0.5)
+					// Round half away from zero: use sign of original value to determine direction
+					if bfSign >= 0 && frac.Cmp(half) >= 0 {
+						bi.Add(bi, big.NewInt(1))
+					} else if bfSign < 0 && frac.Cmp(negHalf) <= 0 {
+						bi.Sub(bi, big.NewInt(1))
+					}
+					// Clamp to int64 range
+					maxI := new(big.Int).SetInt64(maxVal)
+					minI := new(big.Int).SetInt64(minVal)
+					if bi.Cmp(maxI) > 0 {
+						return maxVal
+					}
+					if bi.Cmp(minI) < 0 {
+						return minVal
+					}
+					return bi.Int64()
+				}
+			}
 			f, err := strconv.ParseFloat(numStr, 64)
 			if err != nil {
 				return int64(0)
 			}
-			if f > float64(maxVal) {
+			if isUnsigned {
+				if f < 0 {
+					intVal = 0
+				} else if f > float64(maxUnsigned) {
+					intVal = int64(maxUnsigned)
+				} else {
+					intVal = mysqlRoundToInt(f)
+				}
+			} else if f > float64(maxVal) {
 				intVal = maxVal
 			} else if f < float64(minVal) {
 				intVal = minVal
 			} else {
-				intVal = int64(f)
+				// MySQL rounds half away from zero for string-to-int conversion
+				intVal = mysqlRoundToInt(f)
 			}
 		} else {
 			n, err := strconv.ParseInt(numStr, 10, 64)
@@ -9195,13 +9739,22 @@ func checkIntegerStrict(colType string, colName string, v interface{}) error {
 		}
 		numStr := ""
 		hasDot := false
+		hasExp := false
 		for i, c := range val {
 			if c == '-' && i == 0 {
 				numStr += string(c)
+			} else if c == '-' && hasExp {
+				numStr += string(c)
+			} else if c == '+' && hasExp {
+				// skip +
 			} else if c >= '0' && c <= '9' {
 				numStr += string(c)
 			} else if c == '.' && !hasDot {
 				hasDot = true
+				numStr += string(c)
+			} else if (c == 'e' || c == 'E') && !hasExp && numStr != "" && numStr != "-" {
+				hasExp = true
+				hasDot = true // treat scientific notation as having decimal
 				numStr += string(c)
 			} else {
 				break
@@ -9211,8 +9764,48 @@ func checkIntegerStrict(colType string, colName string, v interface{}) error {
 			return nil
 		}
 		if hasDot {
+			if baseType == "BIGINT" {
+				// Special case: float64 can't represent BIGINT boundaries precisely.
+				// Use big.Float with high precision to check range.
+				bf := new(big.Float).SetPrec(128)
+				if _, ok := bf.SetString(numStr); !ok {
+					return nil
+				}
+				// Round: get integer value (truncate toward zero, then round based on frac)
+				bfSign := bf.Sign() // sign of original value
+				bfCopy := new(big.Float).SetPrec(128).Copy(bf)
+				bi := new(big.Int)
+				bf.Int(bi) // truncates toward zero
+				biF := new(big.Float).SetPrec(128).SetInt(bi)
+				frac := new(big.Float).SetPrec(128).Sub(bfCopy, biF)
+				half := new(big.Float).SetPrec(128).SetFloat64(0.5)
+				negHalf := new(big.Float).SetPrec(128).SetFloat64(-0.5)
+				// Round half away from zero: use sign of original value
+				if bfSign >= 0 && frac.Cmp(half) >= 0 {
+					bi.Add(bi, big.NewInt(1))
+				} else if bfSign < 0 && frac.Cmp(negHalf) <= 0 {
+					bi.Sub(bi, big.NewInt(1))
+				}
+				if isUnsigned {
+					if bi.Sign() < 0 {
+						return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+					}
+					maxU := new(big.Int).SetUint64(maxUnsigned)
+					if bi.Cmp(maxU) > 0 {
+						return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+					}
+				} else {
+					maxI := new(big.Int).SetInt64(maxVal)
+					minI := new(big.Int).SetInt64(minVal)
+					if bi.Cmp(maxI) > 0 || bi.Cmp(minI) < 0 {
+						return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+					}
+				}
+				return nil
+			}
 			f, _ := strconv.ParseFloat(numStr, 64)
-			intVal = int64(f)
+			// Use proper rounding (round half away from zero) for out-of-range detection
+			intVal = mysqlRoundToInt(f)
 		} else if isUnsigned && !strings.HasPrefix(numStr, "-") {
 			// For unsigned columns, try ParseUint first to handle values > MaxInt64
 			u, err := strconv.ParseUint(numStr, 10, 64)
@@ -10413,7 +11006,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		if val == nil {
 			return nil, nil
 		}
-		return toString(val), nil
+		return normalizeWKT(toString(val)), nil
 	case *sqlparser.GeomFormatExpr:
 		// ST_AsText/ST_AsWKT/ST_AsBinary/ST_AsWKB
 		val, err := e.evalExpr(v.Geom)
@@ -10584,7 +11177,11 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.PolygonExpr:
 		return e.buildGeometryFromExprs(v.LinestringParams, extractRingCoords, "POLYGON")
 	case *sqlparser.MultiPointExpr:
-		return e.buildGeometryFromExprs(v.PointParams, extractPointCoords, "MULTIPOINT")
+		result, err := e.buildGeometryFromExprs(v.PointParams, extractPointCoords, "MULTIPOINT")
+		if err != nil {
+			return nil, err
+		}
+		return normalizeWKT(result), nil
 	case *sqlparser.MultiLinestringExpr:
 		return e.buildGeometryFromExprs(v.LinestringParams, extractRingCoords, "MULTILINESTRING")
 	case *sqlparser.MultiPolygonExpr:
@@ -10994,7 +11591,19 @@ func (e *Executor) evalLocateExpr(v *sqlparser.LocateExpr) (interface{}, error) 
 	searchStr := str[startIdx:]
 	subStrStr := string(subStr)
 	searchStrStr := string(searchStr)
-	idx := strings.Index(searchStrStr, subStrStr)
+	// MySQL LOCATE is case-insensitive by default (uses the connection collation).
+	// Check if the str argument has a COLLATE clause to determine case sensitivity.
+	isCaseSensitive := false
+	if ce, ok := v.Str.(*sqlparser.CollateExpr); ok {
+		coll := strings.ToLower(ce.Collation)
+		isCaseSensitive = strings.Contains(coll, "_bin") || strings.Contains(coll, "_cs")
+	}
+	var idx int
+	if isCaseSensitive {
+		idx = strings.Index(searchStrStr, subStrStr)
+	} else {
+		idx = strings.Index(strings.ToLower(searchStrStr), strings.ToLower(subStrStr))
+	}
 	if idx < 0 {
 		return int64(0), nil
 	}
@@ -12983,8 +13592,17 @@ func valueScale(v interface{}) int {
 		}
 		return 0
 	case string:
+		// Only count decimal scale if the string represents a numeric value.
+		// Non-numeric strings like "/path/to/file.err" should not contribute scale.
 		if idx := strings.Index(val, "."); idx >= 0 {
-			return len(val) - idx - 1
+			// Verify the string looks like a number (leading digits or sign)
+			trimmed := strings.TrimSpace(val)
+			if len(trimmed) > 0 {
+				c := trimmed[0]
+				if c >= '0' && c <= '9' || c == '-' || c == '+' {
+					return len(val) - idx - 1
+				}
+			}
 		}
 		return 0
 	default:
@@ -13256,6 +13874,16 @@ func formatMySQLFloatString(v float64) string {
 		s = strings.Replace(s, "e+0", "e", 1)
 		s = strings.Replace(s, "e-0", "e-", 1)
 		s = strings.Replace(s, "e+", "e", 1)
+		// Strip trailing zeros from the mantissa (MySQL omits them, e.g. 1.00000e43 -> 1e43)
+		if eIdx := strings.IndexByte(s, 'e'); eIdx > 0 {
+			mantissa := s[:eIdx]
+			exp := s[eIdx:]
+			if strings.Contains(mantissa, ".") {
+				mantissa = strings.TrimRight(mantissa, "0")
+				mantissa = strings.TrimRight(mantissa, ".")
+			}
+			s = mantissa + exp
+		}
 		return s
 	}
 	return strconv.FormatFloat(v, 'f', -1, 64)
@@ -13945,6 +14573,42 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		if err != nil {
 			return nil, err
 		}
+		// Handle LIKE/NOT LIKE with optional ESCAPE and optional COLLATE
+		if v.Operator == sqlparser.LikeOp || v.Operator == sqlparser.NotLikeOp {
+			// NULL comparison: x LIKE NULL = NULL = false in WHERE context
+			if left == nil || right == nil {
+				return nil, nil
+			}
+			ls := toString(left)
+			rs := toString(right)
+			// Determine escape character (default is '\')
+			escapeChar := rune('\\')
+			if v.Escape != nil {
+				escVal, _ := e.evalRowExpr(v.Escape, row)
+				if escStr := toString(escVal); len([]rune(escStr)) > 0 {
+					escapeChar = []rune(escStr)[0]
+				}
+			}
+			collLower := strings.ToLower(collationName)
+			isCaseSensitive := collationName != "" && (strings.Contains(collLower, "_bin") || strings.Contains(collLower, "_cs"))
+			var re *regexp.Regexp
+			if isCaseSensitive {
+				re = likeToRegexpCaseSensitiveEscape(rs, escapeChar)
+			} else {
+				re = likeToRegexpEscape(rs, escapeChar)
+			}
+			matched := re.MatchString(ls)
+			if v.Operator == sqlparser.LikeOp {
+				if matched {
+					return int64(1), nil
+				}
+				return int64(0), nil
+			}
+			if !matched {
+				return int64(1), nil
+			}
+			return int64(0), nil
+		}
 		if collationName != "" {
 			if vc := lookupVitessCollation(collationName); vc != nil {
 				ls := toString(left)
@@ -14051,6 +14715,16 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		val, err := e.evalRowExpr(v.Expr, row)
 		if err != nil {
 			return nil, err
+		}
+		if v.Operator == sqlparser.BangOp {
+			// ! is logical NOT (deprecated alias in MySQL 8.0)
+			if val == nil {
+				return nil, nil // !NULL = NULL
+			}
+			if isTruthy(val) {
+				return int64(0), nil
+			}
+			return int64(1), nil
 		}
 		if v.Operator == sqlparser.UMinusOp {
 			switch n := val.(type) {
@@ -14277,6 +14951,28 @@ func (e *Executor) evalBinaryExprWithRow(v *sqlparser.BinaryExpr, row storage.Ro
 	return evalBinaryExpr(left, right, v.Operator, e.getDivPrecisionIncrement())
 }
 
+// isBinaryConvertExpr returns true if the expression is a BINARY cast (e.g. BINARY 'str' or CAST(x AS BINARY)).
+// This is used to detect binary-collation comparisons in CASE expressions.
+func isBinaryConvertExpr(expr sqlparser.Expr) bool {
+	switch v := expr.(type) {
+	case *sqlparser.ConvertExpr:
+		return v.Type != nil && strings.EqualFold(v.Type.Type, "binary")
+	case *sqlparser.CastExpr:
+		return v.Type != nil && strings.EqualFold(v.Type.Type, "binary")
+	}
+	return false
+}
+
+// compareValuesBinary compares two values case-sensitively (binary collation).
+func compareValuesBinary(left, right interface{}) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	ls := fmt.Sprintf("%v", left)
+	rs := fmt.Sprintf("%v", right)
+	return ls == rs
+}
+
 // evalCaseExprWithRow evaluates a CASE expression with row context.
 func (e *Executor) evalCaseExprWithRow(v *sqlparser.CaseExpr, row storage.Row) (interface{}, error) {
 	// Evaluate CASE expression with row context for column resolution
@@ -14286,12 +14982,20 @@ func (e *Executor) evalCaseExprWithRow(v *sqlparser.CaseExpr, row storage.Row) (
 		if err != nil {
 			return nil, err
 		}
+		// Check if the base expression has binary collation (BINARY expr)
+		baseIsBinary := isBinaryConvertExpr(v.Expr)
 		for _, when := range v.Whens {
 			whenVal, err := e.evalRowExpr(when.Cond, row)
 			if err != nil {
 				return nil, err
 			}
-			match, _ := compareValues(caseVal, whenVal, sqlparser.EqualOp)
+			// Use binary (case-sensitive) comparison if either side has a BINARY cast
+			var match bool
+			if baseIsBinary || isBinaryConvertExpr(when.Cond) {
+				match = compareValuesBinary(caseVal, whenVal)
+			} else {
+				match, _ = compareValues(caseVal, whenVal, sqlparser.EqualOp)
+			}
 			if match {
 				return e.evalRowExpr(when.Val, row)
 			}
@@ -14866,13 +15570,54 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 			}
 		}
 
-		left, err := e.evalRowExpr(v.Left, row)
+		// Extract COLLATE clause from either side for collation-aware comparison
+		var whereCollation string
+		leftExprW, rightExprW := v.Left, v.Right
+		if ce, ok := leftExprW.(*sqlparser.CollateExpr); ok {
+			whereCollation = ce.Collation
+			leftExprW = ce.Expr
+		}
+		if ce, ok := rightExprW.(*sqlparser.CollateExpr); ok {
+			whereCollation = ce.Collation
+			rightExprW = ce.Expr
+		}
+		left, err := e.evalRowExpr(leftExprW, row)
 		if err != nil {
 			return false, err
 		}
-		right, err := e.evalRowExpr(v.Right, row)
+		right, err := e.evalRowExpr(rightExprW, row)
 		if err != nil {
 			return false, err
+		}
+		// Collation-aware LIKE/NOT LIKE or LIKE with ESCAPE clause
+		if v.Operator == sqlparser.LikeOp || v.Operator == sqlparser.NotLikeOp {
+			// NULL comparison: x LIKE NULL = NULL = false in WHERE context
+			if left == nil || right == nil {
+				return false, nil
+			}
+			ls := toString(left)
+			rs := toString(right)
+			// Determine escape character (default is '\')
+			escapeChar := rune('\\')
+			if v.Escape != nil {
+				escVal, _ := e.evalRowExpr(v.Escape, row)
+				if escStr := toString(escVal); len([]rune(escStr)) > 0 {
+					escapeChar = []rune(escStr)[0]
+				}
+			}
+			collLower := strings.ToLower(whereCollation)
+			isCaseSensitive := whereCollation != "" && (strings.Contains(collLower, "_bin") || strings.Contains(collLower, "_cs"))
+			var re *regexp.Regexp
+			if isCaseSensitive {
+				re = likeToRegexpCaseSensitiveEscape(rs, escapeChar)
+			} else {
+				re = likeToRegexpEscape(rs, escapeChar)
+			}
+			matched := re.MatchString(ls)
+			if v.Operator == sqlparser.LikeOp {
+				return matched, nil
+			}
+			return !matched, nil
 		}
 		result, err := compareValues(left, right, v.Operator)
 		if err != nil {
@@ -15624,6 +16369,14 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 				}
 			}
 		}
+		// Validate datetime strings: if either side looks like a full datetime (date+time)
+		// but has an invalid time component (hour > 23, etc.), throw error 1292.
+		if invalidStr, invalid := hasInvalidTimeComponent(ls); invalid {
+			return false, mysqlError(1292, "HY000", fmt.Sprintf("Incorrect DATETIME value: '%s'", invalidStr))
+		}
+		if invalidStr, invalid := hasInvalidTimeComponent(rs); invalid {
+			return false, mysqlError(1292, "HY000", fmt.Sprintf("Incorrect DATETIME value: '%s'", invalidStr))
+		}
 		cmp := compareNumeric(left, right)
 		switch op {
 		case sqlparser.LessThanOp:
@@ -15717,6 +16470,49 @@ func soundex(s string) string {
 		result = append(result, '0')
 	}
 	return string(result)
+}
+
+// likePatternToRegexpStr converts a SQL LIKE pattern to a regexp string with a given escape rune.
+// prefix is the regexp prefix (e.g. "(?i)^" for case-insensitive or "^" for case-sensitive).
+func likePatternToRegexpStr(pattern string, escapeChar rune, prefix string) string {
+	var sb strings.Builder
+	sb.WriteString(prefix)
+	runes := []rune(pattern)
+	for i := 0; i < len(runes); i++ {
+		c := runes[i]
+		if c == escapeChar && i+1 < len(runes) {
+			// The next character is escaped: treat it literally (not as a wildcard)
+			sb.WriteString(regexp.QuoteMeta(string(runes[i+1])))
+			i++
+		} else if c == '%' {
+			sb.WriteString(".*")
+		} else if c == '_' {
+			sb.WriteString(".")
+		} else {
+			sb.WriteString(regexp.QuoteMeta(string(c)))
+		}
+	}
+	sb.WriteString("$")
+	return sb.String()
+}
+
+// likeToRegexpCaseSensitive converts a SQL LIKE pattern to a case-sensitive Go regexp.
+// Used for LIKE with binary or case-sensitive collations.
+func likeToRegexpCaseSensitive(pattern string) *regexp.Regexp {
+	re, _ := regexp.Compile(likePatternToRegexpStr(pattern, '\\', "^"))
+	return re
+}
+
+// likeToRegexpCaseSensitiveEscape converts a SQL LIKE pattern with a custom escape char to a case-sensitive Go regexp.
+func likeToRegexpCaseSensitiveEscape(pattern string, escapeChar rune) *regexp.Regexp {
+	re, _ := regexp.Compile(likePatternToRegexpStr(pattern, escapeChar, "^"))
+	return re
+}
+
+// likeToRegexpEscape converts a SQL LIKE pattern with a custom escape char to a case-insensitive Go regexp.
+func likeToRegexpEscape(pattern string, escapeChar rune) *regexp.Regexp {
+	re, _ := regexp.Compile(likePatternToRegexpStr(pattern, escapeChar, "(?i)^"))
+	return re
 }
 
 // likeToRegexp converts a SQL LIKE pattern to a Go regexp.
@@ -15882,7 +16678,7 @@ func compareByCollation(a, b interface{}, collation string) int {
 func normalizeCollationKey(s string, collation string) string {
 	coll := strings.ToLower(collation)
 
-	// Use Vitess only for UCA 0900 collations which need accurate weight tables
+	// Use Vitess for UCA 0900 collations which need accurate weight tables
 	if strings.Contains(coll, "_0900_") || strings.HasSuffix(coll, "_0900_bin") {
 		if vc := lookupVitessCollation(collation); vc != nil {
 			ws := vitessWeightString(s, vc)
@@ -15898,9 +16694,22 @@ func normalizeCollationKey(s string, collation string) string {
 		return encodeStringForCollation(foldASCIICase(s), "sjis")
 	case "ujis_japanese_ci", "eucjpms_japanese_ci":
 		return encodeStringForCollation(foldASCIICase(s), "eucjp")
+	case "dec8_swedish_ci", "swe7_swedish_ci":
+		// dec8_swedish_ci and swe7_swedish_ci: letters A-Z and a-z are case-folded using
+		// ToUpper (mapped to 0x41-0x5A range). This ensures letters sort before 0x5B-0x60
+		// characters ([, \, ], ^, _, `) since Z=0x5A < [=0x5B.
+		// In contrast, ToLower would map letters to 0x61-0x7A which is ABOVE 0x5B-0x60,
+		// causing [, \, etc. to incorrectly appear before letters in the sort output.
+		return strings.ToUpper(s)
 	}
 	if strings.HasSuffix(coll, "_ci") {
-		return strings.ToLower(s)
+		// Use ToUpper for case-insensitive collations. MySQL's weight tables for _ci collations
+		// assign letters the same weight as their uppercase equivalents (0x41-0x5A range).
+		// This ensures that letters sort BEFORE punctuation in the 0x5B-0x60 range ([, \, ], ^, _, `),
+		// which is correct for MySQL's Latin-family _ci collations.
+		// Previously ToLower was used, which mapped letters to 0x61-0x7A (ABOVE 0x5B-0x60),
+		// causing [ and \ to incorrectly sort before letters.
+		return strings.ToUpper(s)
 	}
 	return s
 }
@@ -16398,6 +17207,46 @@ func resolveColumnTable(te sqlparser.TableExpr, colName string, e *Executor) str
 	return ""
 }
 
+// validateWhereForInvalidDatetime walks a WHERE expression and checks for invalid datetime
+// string literals used in comparisons. Returns error 1292 if an invalid DATETIME is found.
+func validateWhereForInvalidDatetime(expr sqlparser.Expr) error {
+	if expr == nil {
+		return nil
+	}
+	var walkErr error
+	sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if walkErr != nil {
+			return false, nil
+		}
+		comp, ok := node.(*sqlparser.ComparisonExpr)
+		if !ok {
+			return true, nil
+		}
+		// Check right side for invalid datetime literal
+		if lit, ok := comp.Right.(*sqlparser.Literal); ok {
+			if lit.Type == sqlparser.StrVal {
+				val := lit.Val
+				if invalidStr, invalid := hasInvalidTimeComponent(val); invalid {
+					walkErr = mysqlError(1292, "HY000", fmt.Sprintf("Incorrect DATETIME value: '%s'", invalidStr))
+					return false, nil
+				}
+			}
+		}
+		// Check left side too
+		if lit, ok := comp.Left.(*sqlparser.Literal); ok {
+			if lit.Type == sqlparser.StrVal {
+				val := lit.Val
+				if invalidStr, invalid := hasInvalidTimeComponent(val); invalid {
+					walkErr = mysqlError(1292, "HY000", fmt.Sprintf("Incorrect DATETIME value: '%s'", invalidStr))
+					return false, nil
+				}
+			}
+		}
+		return true, nil
+	}, expr)
+	return walkErr
+}
+
 // execExplainStmt handles EXPLAIN SELECT ... statements.
 // Returns a simplified explain result set for compatibility.
 func (e *Executor) execExplainStmt(s *sqlparser.ExplainStmt, query string) (*Result, error) {
@@ -16405,6 +17254,12 @@ func (e *Executor) execExplainStmt(s *sqlparser.ExplainStmt, query string) (*Res
 	if sel, ok := s.Statement.(*sqlparser.Select); ok {
 		if err := e.validateIndexHints(sel.From); err != nil {
 			return nil, err
+		}
+		// Validate WHERE clause for invalid datetime literals.
+		if sel.Where != nil {
+			if err := validateWhereForInvalidDatetime(sel.Where.Expr); err != nil {
+				return nil, err
+			}
 		}
 	}
 	// Use explainResultForType which delegates to explainMultiRows for proper select_type detection

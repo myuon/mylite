@@ -69,6 +69,22 @@ func (e *Executor) execCreateTrigger(query string) (*Result, error) {
 	}
 	body := strings.TrimSpace(query[forEachLoc[1]:])
 
+	// Strip optional FOLLOWS <trigger_name> or PRECEDES <trigger_name> clause.
+	// These are ordering hints; we ignore the ordering and just store the body.
+	bodyUpp := strings.ToUpper(body)
+	if strings.HasPrefix(bodyUpp, "FOLLOWS ") || strings.HasPrefix(bodyUpp, "PRECEDES ") {
+		// Skip past the clause: FOLLOWS/PRECEDES + whitespace + trigger_name
+		spaceIdx := strings.Index(body, " ")
+		if spaceIdx >= 0 {
+			afterKeyword := strings.TrimSpace(body[spaceIdx+1:])
+			// The trigger name ends at the next whitespace
+			nameEnd := strings.IndexAny(afterKeyword, " \t\n\r")
+			if nameEnd >= 0 {
+				body = strings.TrimSpace(afterKeyword[nameEnd+1:])
+			}
+		}
+	}
+
 	// Parse the body into individual SQL statements
 	var bodyStatements []string
 	bodyUpper := strings.ToUpper(strings.TrimSpace(body))
@@ -133,12 +149,36 @@ func splitTriggerBody(body string) []string {
 	var current strings.Builder
 	inSingle := false
 	inDouble := false
-	depth := 0 // track nested compound block depth
+	inBlock := false // inside /* ... */ block comment
+	depth := 0       // track nested compound block depth
 
 	words := body
 	i := 0
 	for i < len(words) {
 		ch := words[i]
+
+		// Handle /* ... */ block comments: pass through to current but skip all parsing.
+		if inBlock {
+			current.WriteByte(ch)
+			if ch == '*' && i+1 < len(words) && words[i+1] == '/' {
+				current.WriteByte(words[i+1])
+				i += 2
+				inBlock = false
+			} else {
+				i++
+			}
+			continue
+		}
+
+		// Detect start of block comment (only outside of string literals)
+		if !inSingle && !inDouble && ch == '/' && i+1 < len(words) && words[i+1] == '*' {
+			current.WriteByte(ch)
+			current.WriteByte(words[i+1])
+			i += 2
+			inBlock = true
+			continue
+		}
+
 		switch {
 		case ch == '\'' && !inDouble:
 			inSingle = !inSingle
@@ -548,6 +588,12 @@ func replaceRowRefs(stmt, prefix string, row storage.Row) string {
 
 // execCreateProcedure parses and stores a CREATE PROCEDURE statement with BEGIN...END body.
 func (e *Executor) execCreateProcedure(query string) (*Result, error) {
+	// DDL causes an implicit commit, clearing named savepoints.
+	e.ddlImplicitCommit()
+	// LOCK TABLES blocks procedure DDL.
+	if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
+		return nil, mysqlError(1192, "HY000", "Can't execute the given command because you have active locked tables or an active transaction")
+	}
 	db, err := e.Catalog.GetDatabase(e.CurrentDB)
 	if err != nil {
 		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
@@ -597,6 +643,7 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 	_ = upper
 	afterParams := rest[paramEnd+1:]
 	var bodyStmts []string
+	var bodyText string
 	beginIdx := strings.Index(strings.ToUpper(afterParams), "BEGIN")
 	if beginIdx >= 0 {
 		// Check if there's a label before BEGIN (e.g. "foo: begin ... end foo")
@@ -606,7 +653,15 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 			// Store as single labeled block statement; execRoutineBodyWithContext handles it
 			bodyStr := strings.TrimSpace(afterParams)
 			bodyStmts = []string{bodyStr}
+			bodyText = bodyStr
 		} else {
+			// bodyText = everything from BEGIN onwards (for information_schema)
+			bodyText = strings.TrimSpace(afterParams[beginIdx:])
+			// Strip trailing semicolons that appear after END
+			if strings.HasSuffix(strings.TrimSpace(bodyText), ";") {
+				bodyText = strings.TrimRight(strings.TrimSpace(bodyText), ";")
+				bodyText = strings.TrimSpace(bodyText)
+			}
 			bodyStr := strings.TrimSpace(afterParams[beginIdx+len("BEGIN"):])
 			if strings.HasSuffix(strings.ToUpper(strings.TrimSpace(bodyStr)), "END") {
 				bodyStr = strings.TrimSpace(bodyStr[:len(bodyStr)-len("END")])
@@ -672,12 +727,14 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 			return nil, fmt.Errorf("invalid CREATE PROCEDURE syntax: missing body")
 		}
 		bodyStmts = []string{bodyStr}
+		bodyText = bodyStr
 	}
 
 	procDef := &catalog.ProcedureDef{
 		Name:        procName,
 		Params:      params,
 		Body:        bodyStmts,
+		BodyText:    bodyText,
 		OriginalSQL: query,
 	}
 	db.CreateProcedure(procDef)
@@ -756,6 +813,12 @@ func splitByComma(s string) []string {
 
 // execDropProcedureFallback handles DROP PROCEDURE [IF EXISTS] name
 func (e *Executor) execDropProcedureFallback(query string) (*Result, error) {
+	// DDL causes an implicit commit, clearing named savepoints.
+	e.ddlImplicitCommit()
+	// LOCK TABLES blocks procedure DDL.
+	if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
+		return nil, mysqlError(1192, "HY000", "Can't execute the given command because you have active locked tables or an active transaction")
+	}
 	rest := strings.TrimSpace(query[len("DROP PROCEDURE"):])
 	ifExists := false
 	restUpper := strings.ToUpper(rest)
@@ -791,6 +854,12 @@ func (e *Executor) execDropProcedureFallback(query string) (*Result, error) {
 
 // execDropProcedureAST handles DROP PROCEDURE parsed by vitess.
 func (e *Executor) execDropProcedureAST(stmt *sqlparser.DropProcedure) (*Result, error) {
+	// DDL causes an implicit commit, clearing named savepoints.
+	e.ddlImplicitCommit()
+	// LOCK TABLES blocks procedure DDL.
+	if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
+		return nil, mysqlError(1192, "HY000", "Can't execute the given command because you have active locked tables or an active transaction")
+	}
 	// Determine database: use qualifier if present, otherwise use CurrentDB
 	dbName := e.CurrentDB
 	if !stmt.Name.Qualifier.IsEmpty() {
@@ -887,28 +956,60 @@ func (e *Executor) callProcedureByNameInDB(dbName string, procName string, argSt
 		return &Result{}, nil
 	}
 
-	// Build parameter mapping: bind IN params, track OUT params
+	// Use same logic as callProcedureByName: properly bind IN/INOUT params and track OUT targets.
 	paramVars := make(map[string]interface{})
+	outTargets := make(map[string]string)
 	for i, param := range proc.Params {
 		if i < len(argStrs) {
 			argVal := strings.TrimSpace(argStrs[i])
 			if strings.HasPrefix(argVal, "@") {
+				userVar := strings.TrimPrefix(argVal, "@")
+				if param.Mode == "OUT" || param.Mode == "INOUT" {
+					outTargets[param.Name] = userVar
+				}
 				if param.Mode == "IN" || param.Mode == "INOUT" {
-					paramVars[param.Name] = argVal
+					if val, ok := e.userVars[userVar]; ok {
+						paramVars[param.Name] = val
+					} else {
+						paramVars[param.Name] = nil
+					}
+				}
+				if param.Mode == "OUT" {
+					paramVars[param.Name] = nil
 				}
 			} else {
-				if n, err := strconv.ParseInt(argVal, 10, 64); err == nil {
-					paramVars[param.Name] = n
+				upperArgVal := strings.ToUpper(argVal)
+				var literalVal interface{}
+				if upperArgVal == "NULL" {
+					literalVal = nil
+				} else if n, err2 := strconv.ParseInt(argVal, 10, 64); err2 == nil {
+					literalVal = n
 				} else {
-					paramVars[param.Name] = strings.Trim(argVal, "'\"")
+					literalVal = strings.Trim(argVal, "'\"")
+				}
+				if param.Mode == "IN" || param.Mode == "INOUT" {
+					paramVars[param.Name] = literalVal
+				} else if param.Mode == "OUT" {
+					paramVars[param.Name] = nil
 				}
 			}
 		}
 	}
 
+	ctx := &routineContext{
+		localVars:     make(map[string]interface{}),
+		localVarTypes: make(map[string]string),
+		cursors:       make(map[string]*cursorState),
+		cursorDefs:    make(map[string]string),
+		conditionDefs: make(map[string]string),
+	}
+	for k, v := range paramVars {
+		ctx.localVars[k] = v
+	}
+
 	// Enter stored routine — internal Execute calls should not count as client Questions.
 	e.routineDepth++
-	bodyResult, err := e.execRoutineBody(proc.Body, paramVars)
+	bodyResult, err := e.execRoutineBodyWithContext(proc.Body, ctx)
 	e.routineDepth--
 	if err != nil {
 		// SIGNAL with SQLSTATE class '01' (warning) should produce a warning, not an error.
@@ -923,15 +1024,36 @@ func (e *Executor) callProcedureByNameInDB(dbName string, procName string, argSt
 				msg = "Unhandled user-defined warning condition"
 			}
 			e.addWarning("Warning", code, msg)
+			// Still write back OUT/INOUT parameters before returning
+			for paramName, userVar := range outTargets {
+				val := ctx.localVars[paramName]
+				if e.userVars == nil {
+					e.userVars = make(map[string]interface{})
+				}
+				e.userVars[userVar] = val
+			}
 			return &Result{}, nil
 		}
 		return nil, err
 	}
-	// If the routine body produced a result set (e.g. from EXIT HANDLER), return it.
+
+	// Write back OUT/INOUT parameter values to caller's user variables
+	for paramName, userVar := range outTargets {
+		val := ctx.localVars[paramName]
+		if e.userVars == nil {
+			e.userVars = make(map[string]interface{})
+		}
+		e.userVars[userVar] = val
+	}
+
+	// If the routine body produced a result set (e.g. from EXIT HANDLER or SELECT), return it.
 	if bodyResult != nil {
 		if r, ok := bodyResult.(*Result); ok && r != nil && r.IsResultSet {
 			return r, nil
 		}
+	}
+	if ctx.handlerResult != nil && ctx.handlerResult.IsResultSet {
+		return ctx.handlerResult, nil
 	}
 
 	return &Result{}, nil
@@ -1180,6 +1302,10 @@ func extractNearFromParseError(query string, parseErr error) string {
 
 // execCreateFunction handles CREATE FUNCTION name(params) RETURNS type BEGIN...END
 func (e *Executor) execCreateFunction(query string) (*Result, error) {
+	// LOCK TABLES blocks function DDL.
+	if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
+		return nil, mysqlError(1192, "HY000", "Can't execute the given command because you have active locked tables or an active transaction")
+	}
 	db, err := e.Catalog.GetDatabase(e.CurrentDB)
 	if err != nil {
 		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
@@ -1296,6 +1422,10 @@ var nativeFunctions = map[string]bool{
 
 // execDropFunction handles DROP FUNCTION [IF EXISTS] name
 func (e *Executor) execDropFunction(query string) (*Result, error) {
+	// LOCK TABLES blocks function DDL.
+	if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
+		return nil, mysqlError(1192, "HY000", "Can't execute the given command because you have active locked tables or an active transaction")
+	}
 	db, err := e.Catalog.GetDatabase(e.CurrentDB)
 	if err != nil {
 		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
@@ -1519,6 +1649,22 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 			continue
 		}
 
+		// Strip leading /* ... */ block comments so control-flow keyword checks work correctly.
+		// A statement may start with a block comment (e.g. "/* remark */ CASE ...") when the
+		// comment precedes the first keyword and there is no semicolon separating them.
+		for strings.HasPrefix(stmtStr, "/*") {
+			endComment := strings.Index(stmtStr, "*/")
+			if endComment < 0 {
+				break // unterminated comment - leave stmtStr as-is
+			}
+			stmtStr = strings.TrimSpace(stmtStr[endComment+2:])
+			stmtUpper = strings.ToUpper(stmtStr)
+		}
+
+		if stmtStr == "" {
+			continue
+		}
+
 		// Handle DECLARE
 		if strings.HasPrefix(stmtUpper, "DECLARE") {
 			rest := strings.TrimSpace(stmtStr[len("DECLARE"):])
@@ -1610,11 +1756,17 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 			}
 
 			// DECLARE cursor_name CURSOR FOR select_stmt
-			if strings.Contains(restUpper, " CURSOR FOR ") {
+			// CURSOR FOR may be followed by a space or newline (multi-line declaration)
+			if strings.Contains(restUpper, " CURSOR FOR ") || strings.Contains(restUpper, " CURSOR FOR\n") {
 				parts := strings.SplitN(rest, " ", 2)
 				cursorName := strings.TrimSpace(parts[0])
 				cursorForIdx := strings.Index(restUpper, "CURSOR FOR ")
-				selectSQL := strings.TrimSpace(rest[cursorForIdx+len("CURSOR FOR "):])
+				cursorForSkip := len("CURSOR FOR ")
+				if idx2 := strings.Index(restUpper, "CURSOR FOR\n"); idx2 >= 0 && (cursorForIdx < 0 || idx2 < cursorForIdx) {
+					cursorForIdx = idx2
+					cursorForSkip = len("CURSOR FOR\n")
+				}
+				selectSQL := strings.TrimSpace(rest[cursorForIdx+cursorForSkip:])
 				cursorDefs[strings.ToLower(cursorName)] = selectSQL
 				continue
 			}
@@ -2217,8 +2369,8 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 			continue
 		}
 
-		// Handle unlabeled BEGIN...END block
-		if stmtUpper == "BEGIN" || strings.HasPrefix(stmtUpper, "BEGIN\n") || strings.HasPrefix(stmtUpper, "BEGIN;") {
+		// Handle unlabeled BEGIN...END block (BEGIN may be followed by \n, space, ; or another keyword)
+		if stmtUpper == "BEGIN" || strings.HasPrefix(stmtUpper, "BEGIN\n") || strings.HasPrefix(stmtUpper, "BEGIN;") || strings.HasPrefix(stmtUpper, "BEGIN ") {
 			beginBlock := stmtStr
 			beginDepth := 1
 			for beginDepth > 0 && i+1 < len(body) {
@@ -2276,8 +2428,8 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 			continue
 		}
 
-		// Handle SELECT ... INTO
-		if strings.HasPrefix(stmtUpper, "SELECT") && strings.Contains(stmtUpper, " INTO ") {
+		// Handle SELECT ... INTO (INTO may be preceded by space or newline)
+		if strings.HasPrefix(stmtUpper, "SELECT") && (strings.Contains(stmtUpper, " INTO ") || strings.Contains(stmtUpper, "\nINTO ")) {
 			err := e.execSelectIntoForRoutine(stmtStr, localVars)
 			if err != nil {
 				// Check if a handler can catch this error
@@ -2541,10 +2693,10 @@ func (e *Executor) parseSignalWithConditions(stmtStr string, localVars map[strin
 				after = strings.TrimSpace(after[end+2:])
 			}
 		}
-		// Parse SET clause
+		// Parse SET clause (SET may be followed by a space or newline)
 		afterUpper = strings.ToUpper(after)
-		if strings.HasPrefix(afterUpper, "SET ") {
-			e.parseSignalSetClause(after[4:], sigErr, localVars)
+		if strings.HasPrefix(afterUpper, "SET ") || strings.HasPrefix(afterUpper, "SET\n") || strings.HasPrefix(afterUpper, "SET\t") {
+			e.parseSignalSetClause(strings.TrimSpace(after[3:]), sigErr, localVars)
 		}
 	} else {
 		// May be a condition name reference: SIGNAL condition_name [SET ...]
@@ -2595,9 +2747,22 @@ func (e *Executor) parseSignalSetClause(clause string, sigErr *signalError, loca
 		val = strings.Trim(val, "'\"")
 		switch key {
 		case "MESSAGE_TEXT":
-			// Substitute local variables
-			resolved := e.substituteLocalVars(val, localVars)
-			sigErr.messageText = resolved
+			// If val is a bare identifier (local variable), look it up directly to avoid SQL quoting.
+			// Otherwise, perform normal local-var substitution and strip any resulting SQL quotes.
+			if trimmedVal := strings.TrimSpace(val); len(trimmedVal) > 0 && trimmedVal[0] != '\'' && trimmedVal[0] != '"' {
+				// Bare identifier or expression: try direct variable lookup first
+				if v, ok := localVars[strings.ToLower(trimmedVal)]; ok && v != nil {
+					sigErr.messageText = fmt.Sprintf("%v", v)
+				} else {
+					// Fall back to substituteLocalVars and strip any resulting quotes
+					resolved := e.substituteLocalVars(trimmedVal, localVars)
+					resolved = strings.Trim(resolved, "'\"")
+					sigErr.messageText = resolved
+				}
+			} else {
+				// String literal: strip quotes to get the raw message
+				sigErr.messageText = strings.Trim(val, "'\"")
+			}
 		case "MYSQL_ERRNO":
 			if n, err := strconv.Atoi(val); err == nil {
 				sigErr.mysqlErrno = n
@@ -2897,12 +3062,18 @@ func (e *Executor) evaluateExprWithVars(exprStr string, vars map[string]interfac
 // properly extracting INTO variable names before substituting local vars.
 func (e *Executor) execSelectIntoForRoutine(stmtStr string, localVars map[string]interface{}) error {
 	upper := strings.ToUpper(stmtStr)
+	// INTO may be preceded by a space or a newline (e.g. multi-line SELECT ... INTO var)
 	intoIdx := strings.Index(upper, " INTO ")
+	intoSkip := len(" INTO ")
+	if idx2 := strings.Index(upper, "\nINTO "); idx2 >= 0 && (intoIdx < 0 || idx2 < intoIdx) {
+		intoIdx = idx2
+		intoSkip = len("\nINTO ")
+	}
 	if intoIdx < 0 {
 		return nil
 	}
 
-	afterInto := stmtStr[intoIdx+len(" INTO "):]
+	afterInto := stmtStr[intoIdx+intoSkip:]
 	// Extract variable names (they end at a keyword)
 	var varNames []string
 	var restOfQuery string

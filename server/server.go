@@ -437,7 +437,8 @@ func normalizeRows(rows [][]interface{}) [][]interface{} {
 			} else if sd, ok := val.(executor.SysVarDouble); ok {
 				rows[i][j] = strconv.FormatFloat(sd.Value, 'f', 6, 64)
 			} else if sv, ok := val.(executor.ScaledValue); ok {
-				rows[i][j] = sv.Value
+				// Format with the correct number of decimal places to preserve scale.
+				rows[i][j] = fmt.Sprintf("%.*f", sv.Scale, sv.Value)
 			} else if d, ok := val.(executor.DivisionResult); ok {
 				rows[i][j] = fmt.Sprintf("%.*f", d.Precision, d.Value)
 			} else if ev, ok := val.(executor.EnumValue); ok {

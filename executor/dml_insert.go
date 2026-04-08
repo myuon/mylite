@@ -835,6 +835,11 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 									return nil, err
 								}
 							}
+						} else {
+							// Non-strict mode: check for out-of-range integer values and generate warnings
+							if err := checkIntegerStrict(col.Type, col.Name, v); err != nil {
+								e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+							}
 						}
 					}
 					v = coerceColumnValue(col.Type, v)
@@ -1095,6 +1100,11 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					tbl.Rows[dupIdx] = odduSnap
 					tbl.InvalidateIndexes()
 					tbl.Unlock()
+					// INSERT IGNORE suppresses duplicate key errors from ODKU too
+					if bool(stmt.Ignore) && strings.Contains(uniqueViolationErr.Error(), "1062") {
+						e.addWarning("Warning", 1062, uniqueViolationErr.Error())
+						continue
+					}
 					return nil, uniqueViolationErr
 				}
 				tbl.InvalidateIndexes()
