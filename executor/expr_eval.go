@@ -448,6 +448,16 @@ func (e *Executor) evalUnaryExpr(v *sqlparser.UnaryExpr) (interface{}, error) {
 			return "-" + n, nil
 		}
 	}
+	if v.Operator == sqlparser.BangOp {
+		// ! is logical NOT (deprecated alias in MySQL 8.0)
+		if val == nil {
+			return nil, nil // !NULL = NULL
+		}
+		if isTruthy(val) {
+			return int64(0), nil
+		}
+		return int64(1), nil
+	}
 	return val, nil
 }
 
@@ -1080,6 +1090,38 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 	// NULL comparison returns NULL (except for NULL-safe equal <=>)
 	if (left == nil || right == nil) && v.Operator != sqlparser.NullSafeEqualOp {
 		return nil, nil
+	}
+	// Handle LIKE/NOT LIKE with optional ESCAPE and optional COLLATE
+	if v.Operator == sqlparser.LikeOp || v.Operator == sqlparser.NotLikeOp {
+		// NULL comparison: x LIKE NULL = NULL
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		ls := toString(left)
+		rs := toString(right)
+		// Determine escape character (default is '\')
+		escapeChar := rune('\\')
+		if v.Escape != nil {
+			escVal, _ := e.evalExpr(v.Escape)
+			if escStr := toString(escVal); len([]rune(escStr)) > 0 {
+				escapeChar = []rune(escStr)[0]
+			}
+		}
+		collLower := strings.ToLower(collationName)
+		isCaseSensitive := collationName != "" && (strings.Contains(collLower, "_bin") || strings.Contains(collLower, "_cs"))
+		var re *regexp.Regexp
+		if isCaseSensitive {
+			re = likeToRegexpCaseSensitiveEscape(rs, escapeChar)
+		} else {
+			re = likeToRegexpEscape(rs, escapeChar)
+		}
+		if v.Operator == sqlparser.LikeOp {
+			if re.MatchString(ls) { return int64(1), nil }
+			return int64(0), nil
+		}
+		// NotLikeOp
+		if !re.MatchString(ls) { return int64(1), nil }
+		return int64(0), nil
 	}
 	// If COLLATE was specified and both sides are strings, use collation-aware comparison
 	if collationName != "" {
@@ -1968,6 +2010,8 @@ func (e *Executor) evalIntervalFuncExpr(v *sqlparser.IntervalFuncExpr) (interfac
 			return nil, err
 		}
 		if ivArgVal == nil {
+			// MySQL treats NULL list elements as -infinity: x >= NULL is always true
+			ivRes = int64(ivi + 1)
 			continue
 		}
 		if ivNF >= toFloat(ivArgVal) {

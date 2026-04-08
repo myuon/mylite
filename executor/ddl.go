@@ -2551,6 +2551,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					idxName = stripPrefixLengthFromCol(idxCols[0])
 				}
 			}
+			// Validate index name length (MySQL max is 64 characters)
+			if len(idxName) > 64 {
+				return nil, mysqlError(1059, "42000", fmt.Sprintf("Identifier name '%s' is too long", idxName))
+			}
 			// Auto-deduplicate index name: if a key with this name already exists,
 			// append _2, _3, etc. (MySQL behavior for ADD KEY without explicit name)
 			if idxName != "" && op.IndexDefinition.Info.Name.String() == "" && tdErr == nil {

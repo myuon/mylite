@@ -26,6 +26,12 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	if rewritten := inlineNamedWindows(query); rewritten != "" {
 		query = rewritten
 	}
+	// Vitess grammar for LEAD/LAG requires a non-negative integer offset.
+	// MySQL supports negative offsets: LEAD(expr, -N) is equivalent to LAG(expr, N).
+	// Preprocess to swap LEAD/LAG and negate when a negative integer offset is used.
+	if containsLeadLagWithNegativeOffset(query) {
+		query = rewriteLeadLagNegativeOffset(query)
+	}
 	trimmed := stripLeadingCStyleComments(strings.TrimSpace(query))
 	query = trimmed
 	e.currentQuery = trimmed
@@ -68,6 +74,11 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		// Also handle BYTE keyword (deprecated synonym for BINARY in column types).
 		if isCreateOrAlterTable && (strings.Contains(upperContains, "BINARY CHARACTER SET") || strings.Contains(upperContains, " BYTE")) {
 			query = rewriteBinaryCharacterSet(query)
+		}
+		// Vitess parser doesn't handle SQL standard type aliases:
+		// CHARACTER VARYING(n) -> VARCHAR(n), CHARACTER(n) -> CHAR(n)
+		if isCreateOrAlterTable && strings.Contains(upperContains, "CHARACTER VARYING") {
+			query = rewriteCharacterVarying(query)
 		}
 	}
 
@@ -1408,6 +1419,16 @@ func rewriteBinaryCharacterSet(query string) string {
 	return query
 }
 
+// rewriteCharacterVarying rewrites SQL standard type aliases to MySQL types:
+// CHARACTER VARYING(n) -> VARCHAR(n)
+// CHARACTER(n) -> CHAR(n)
+func rewriteCharacterVarying(query string) string {
+	// CHARACTER VARYING(n) -> VARCHAR(n) — must be done before CHARACTER(n)
+	reCV := regexp.MustCompile(`(?i)\bCHARACTER\s+VARYING\b`)
+	query = reCV.ReplaceAllString(query, "VARCHAR")
+	return query
+}
+
 func rewriteLongTypes(query string) string {
 	// Replace LONG VARBINARY first (before LONG to avoid partial match)
 	reLongVarbinary := regexp.MustCompile(`(?i)\bLONG\s+VARBINARY\b`)
@@ -1549,4 +1570,41 @@ func rewriteNumericAliases(query string) string {
 		i++
 	}
 	return result.String()
+}
+
+// containsLeadLagWithNegativeOffset checks if a query contains LEAD or LAG
+// with a negative integer offset (e.g. LEAD(col, -3)).
+func containsLeadLagWithNegativeOffset(query string) bool {
+	upper := strings.ToUpper(query)
+	hasLeadLag := strings.Contains(upper, "LEAD(") || strings.Contains(upper, "LAG(")
+	hasNeg := strings.Contains(query, ", -") || strings.Contains(query, ",-")
+	return hasLeadLag && hasNeg
+}
+
+var reLeadLagNeg = regexp.MustCompile(`(?i)\b(LEAD|LAG)\s*\(([^,)]+),\s*-(\d+)`)
+
+// rewriteLeadLagNegativeOffset rewrites LEAD(expr, -N) → LAG(expr, N)
+// and LAG(expr, -N) → LEAD(expr, N) to work around vitess grammar limitation.
+func rewriteLeadLagNegativeOffset(query string) string {
+	return reLeadLagNeg.ReplaceAllStringFunc(query, func(match string) string {
+		sub := reLeadLagNeg.FindStringSubmatch(match)
+		if len(sub) < 4 {
+			return match
+		}
+		fnName := sub[1]
+		expr := sub[2]
+		n := sub[3]
+		// Swap LEAD <-> LAG
+		var newFn string
+		if strings.ToUpper(fnName) == "LEAD" {
+			newFn = "LAG"
+		} else {
+			newFn = "LEAD"
+		}
+		// Preserve original case formatting style
+		if fnName[0] >= 'a' && fnName[0] <= 'z' {
+			newFn = strings.ToLower(newFn)
+		}
+		return newFn + "(" + expr + ", " + n
+	})
 }

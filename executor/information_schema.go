@@ -4047,6 +4047,16 @@ func (e *Executor) infoSchemaUserPrivileges() []storage.Row {
 	return rows
 }
 
+// routineDefinitionText returns the ROUTINE_DEFINITION value for a stored procedure or function.
+// When bodyText is available (preserves original BEGIN...END), it is used directly.
+// Otherwise falls back to joining statements with ";\n".
+func (e *Executor) routineDefinitionText(stmts []string, bodyText string) string {
+	if bodyText != "" {
+		return bodyText
+	}
+	return strings.Join(stmts, ";\n")
+}
+
 // infoSchemaRoutines returns rows for INFORMATION_SCHEMA.ROUTINES.
 func (e *Executor) infoSchemaRoutines() []storage.Row {
 	var rows []storage.Row
@@ -4085,7 +4095,7 @@ func (e *Executor) infoSchemaRoutines() []storage.Row {
 					"COLLATION_NAME":            nil,
 					"DTD_IDENTIFIER":            nil,
 					"ROUTINE_BODY":              "SQL",
-					"ROUTINE_DEFINITION":        strings.Join(p.Body, ";\n"),
+					"ROUTINE_DEFINITION":        e.routineDefinitionText(p.Body, p.BodyText),
 					"EXTERNAL_NAME":             nil,
 					"EXTERNAL_LANGUAGE":         "SQL",
 					"PARAMETER_STYLE":           "SQL",
@@ -4133,7 +4143,7 @@ func (e *Executor) infoSchemaRoutines() []storage.Row {
 					"COLLATION_NAME":            nil,
 					"DTD_IDENTIFIER":            f.ReturnType,
 					"ROUTINE_BODY":              "SQL",
-					"ROUTINE_DEFINITION":        strings.Join(f.Body, ";\n"),
+					"ROUTINE_DEFINITION":        e.routineDefinitionText(f.Body, f.BodyText),
 					"EXTERNAL_NAME":             nil,
 					"EXTERNAL_LANGUAGE":         "SQL",
 					"PARAMETER_STYLE":           "SQL",

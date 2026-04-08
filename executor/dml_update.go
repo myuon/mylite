@@ -151,6 +151,23 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 
 	tbl.Lock()
 	defer tbl.Unlock()
+
+	// SQL_SAFE_UPDATES: reject UPDATE without WHERE using a KEY column (unless LIMIT present).
+	if err := e.checkSafeUpdate(tbl.Def, func() sqlparser.Expr {
+		if stmt.Where != nil {
+			return stmt.Where.Expr
+		}
+		return nil
+	}(), stmt.Limit); err != nil {
+		return nil, err
+	}
+
+	// Set queryTableDef so IS NULL checks on NOT NULL date/datetime columns
+	// correctly treat '0000-00-00' as NULL (MySQL zero-date behavior).
+	oldQueryTableDef := e.queryTableDef
+	e.queryTableDef = tbl.Def
+	defer func() { e.queryTableDef = oldQueryTableDef }()
+
 	colTypeByName := make(map[string]string, len(tbl.Def.Columns))
 	for _, col := range tbl.Def.Columns {
 		colTypeByName[strings.ToLower(col.Name)] = col.Type

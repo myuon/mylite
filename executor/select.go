@@ -2893,12 +2893,23 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 			}
 			rawExprIdx++
 		case *sqlparser.StarExpr:
-			// SELECT * with GROUP BY: expand to all columns from the first row
+			// SELECT * with GROUP BY: expand to all columns from the representative row,
+			// preferring __column_order__ metadata to maintain schema order.
 			if len(groups) > 0 && len(groups[0].rows) > 0 {
 				repRow := groups[0].rows[0]
+				// Use __column_order__ if available (set when fetching from real tables)
+				if orderStr, ok := repRow["__column_order__"]; ok {
+					if s, ok2 := orderStr.(string); ok2 && s != "" {
+						colNames = append(colNames, strings.Split(s, "\x00")...)
+						break
+					}
+				}
+				// Fallback: use unqualified, non-internal keys
 				keys := make([]string, 0, len(repRow))
 				for k := range repRow {
-					keys = append(keys, k)
+					if !strings.Contains(k, ".") && k != "__column_order__" {
+						keys = append(keys, k)
+					}
 				}
 				sort.Strings(keys)
 				colNames = append(colNames, keys...)
@@ -2919,16 +2930,27 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 		for _, expr := range stmt.SelectExprs.Exprs {
 			switch se := expr.(type) {
 			case *sqlparser.StarExpr:
-				// Expand * to all column values from representative row
-				keys := make([]string, 0, len(repRow))
-				for k := range repRow {
-					keys = append(keys, k)
+				// Expand * to all column values from representative row,
+				// matching the same key set used for colNames above.
+				_ = se
+				var starKeys []string
+				if orderStr, ok := repRow["__column_order__"]; ok {
+					if s, ok2 := orderStr.(string); ok2 && s != "" {
+						starKeys = strings.Split(s, "\x00")
+					}
 				}
-				sort.Strings(keys)
-				for _, k := range keys {
+				if starKeys == nil {
+					starKeys = make([]string, 0, len(repRow))
+					for k := range repRow {
+						if !strings.Contains(k, ".") && k != "__column_order__" {
+							starKeys = append(starKeys, k)
+						}
+					}
+					sort.Strings(starKeys)
+				}
+				for _, k := range starKeys {
 					resultRow = append(resultRow, repRow[k])
 				}
-				_ = se
 				continue
 			}
 			ae, ok := expr.(*sqlparser.AliasedExpr)

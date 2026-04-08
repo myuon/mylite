@@ -90,6 +90,14 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 			}
 			decimals = toInt64(dv)
 		}
+		// Clamp decimals to a safe range to avoid overflow in formatting.
+		// MySQL returns 0 for very large negative decimals, and caps precision at 30 for positive.
+		if decimals < -30 {
+			return int64(0), true, nil
+		}
+		if decimals > 30 {
+			decimals = 30
+		}
 		// For exact integer types (int64, uint64) with 0 decimals, return as-is to avoid precision loss
 		if decimals == 0 {
 			switch tv := val.(type) {
@@ -103,12 +111,25 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if decimals == 0 {
 			return int64(f + 0.5), true, nil
 		}
-		factor := 1.0
-		for i := int64(0); i < decimals; i++ {
-			factor *= 10
+		var rounded float64
+		if decimals > 0 {
+			factor := 1.0
+			for i := int64(0); i < decimals; i++ {
+				factor *= 10
+			}
+			rounded = float64(int64(f*factor+0.5)) / factor
+		} else {
+			// Negative decimals: round to nearest 10^|decimals|
+			factor := 1.0
+			for i := decimals; i < 0; i++ {
+				factor *= 10
+			}
+			rounded = float64(int64(f/factor+0.5)) * factor
 		}
-		rounded := float64(int64(f*factor+0.5)) / factor
 		outScale := int(decimals)
+		if outScale < 0 {
+			outScale = 0
+		}
 		if s, ok := val.(string); ok {
 			if dot := strings.IndexByte(s, '.'); dot >= 0 {
 				inScale := len(s) - dot - 1

@@ -4864,13 +4864,45 @@ func (e *Executor) isCorrelatedSubquery(subSelect sqlparser.TableStatement, oute
 		}
 	}
 
+	// Check if the subquery has any real inner tables (not DUAL)
+	hasRealInnerTables := false
+	for t := range innerTables {
+		if !strings.EqualFold(t, "dual") {
+			hasRealInnerTables = true
+			break
+		}
+	}
+
 	correlated := false
 	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
 		if cn, ok := node.(*sqlparser.ColName); ok {
 			qualifier := strings.ToLower(cn.Qualifier.Name.String())
 			if qualifier != "" && outerTables[qualifier] && !innerTables[qualifier] {
+				// Qualified reference to outer table: clearly correlated
 				correlated = true
 				return false, nil
+			}
+			if qualifier == "" && !hasRealInnerTables {
+				// Unqualified column reference with no real inner tables (e.g. FROM DUAL):
+				// the column must come from the outer scope → correlated
+				colName := strings.ToLower(cn.Name.String())
+				// Check if this column name exists in any outer table
+				for outerTbl := range outerTables {
+					if strings.EqualFold(outerTbl, "dual") {
+						continue
+					}
+					// Look up the table schema to check column existence
+					if e.Storage != nil {
+						if tbl, err := e.Storage.GetTable(e.CurrentDB, outerTbl); err == nil && tbl.Def != nil {
+							for _, col := range tbl.Def.Columns {
+								if strings.EqualFold(col.Name, colName) {
+									correlated = true
+									return false, nil
+								}
+							}
+						}
+					}
+				}
 			}
 		}
 		return true, nil
@@ -4926,7 +4958,26 @@ func (e *Executor) explainSubqueries(sel *sqlparser.Select, idCounter *int64, re
 	}
 
 	for _, node := range nodes {
+		startIdx := len(*result)
 		e.walkForSubqueries(node, idCounter, result, outerTables)
+		// MySQL displays DEPENDENT SUBQUERY rows from the WHERE clause in reverse order
+		// (higher ids first) because it processes them in reverse during optimization.
+		// Reverse the newly-added rows if they are all DEPENDENT SUBQUERY.
+		newRows := (*result)[startIdx:]
+		if len(newRows) > 1 {
+			allDependent := true
+			for _, r := range newRows {
+				if r.selectType != "DEPENDENT SUBQUERY" {
+					allDependent = false
+					break
+				}
+			}
+			if allDependent {
+				for i, j := 0, len(newRows)-1; i < j; i, j = i+1, j-1 {
+					newRows[i], newRows[j] = newRows[j], newRows[i]
+				}
+			}
+		}
 	}
 }
 
@@ -7106,7 +7157,21 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 		return res, err
 	case *sqlparser.Select:
-		return e.execSelect(s)
+		res, err := e.execSelect(s)
+		// Apply SQL_SELECT_LIMIT when no explicit LIMIT clause is present.
+		// MySQL uses sql_select_limit+1 rows internally (the +1 allows detection
+		// of truncation by the protocol layer / client).
+		if err == nil && res != nil && s.Limit == nil {
+			if limitStr, ok := e.sessionScopeVars["sql_select_limit"]; ok {
+				if limit, convErr := strconv.ParseInt(limitStr, 10, 64); convErr == nil && limit >= 0 {
+					maxRows := limit + 1
+					if int64(len(res.Rows)) > maxRows {
+						res.Rows = res.Rows[:maxRows]
+					}
+				}
+			}
+		}
+		return res, err
 	case *sqlparser.Update:
 		return e.execUpdate(s)
 	case *sqlparser.Delete:
@@ -17822,6 +17887,86 @@ func decodeUCS2(data []byte) ([]byte, error) {
 		runes = append(runes, r)
 	}
 	return []byte(string(runes)), nil
+}
+
+// isSafeUpdateEnabled returns true if SQL_SAFE_UPDATES is enabled for the current session.
+func (e *Executor) isSafeUpdateEnabled() bool {
+	checkVal := func(val string) bool {
+		upper := strings.ToUpper(val)
+		return upper == "ON" || upper == "1"
+	}
+	// Check session override first
+	if val, ok := e.sessionScopeVars["sql_safe_updates"]; ok {
+		return checkVal(val)
+	}
+	// Check global override
+	if val, ok := e.getGlobalVar("sql_safe_updates"); ok {
+		return checkVal(val)
+	}
+	return false
+}
+
+// whereUsesKeyColumnDirectly returns true if the WHERE expression contains a direct
+// equality comparison (col = value or value = col) where col is a primary key or index column.
+// This is used for SQL_SAFE_UPDATES enforcement.
+func whereUsesKeyColumnDirectly(where sqlparser.Expr, keyColumns map[string]bool) bool {
+	if where == nil {
+		return false
+	}
+	switch e := where.(type) {
+	case *sqlparser.ComparisonExpr:
+		if e.Operator != sqlparser.EqualOp {
+			return false
+		}
+		// Check col = value
+		if cn, ok := e.Left.(*sqlparser.ColName); ok {
+			if keyColumns[strings.ToLower(cn.Name.String())] {
+				return true
+			}
+		}
+		// Check value = col
+		if cn, ok := e.Right.(*sqlparser.ColName); ok {
+			if keyColumns[strings.ToLower(cn.Name.String())] {
+				return true
+			}
+		}
+		return false
+	case *sqlparser.AndExpr:
+		return whereUsesKeyColumnDirectly(e.Left, keyColumns) || whereUsesKeyColumnDirectly(e.Right, keyColumns)
+	case *sqlparser.OrExpr:
+		// Both sides must use key for OR (conservative: we require at least one side)
+		return whereUsesKeyColumnDirectly(e.Left, keyColumns) && whereUsesKeyColumnDirectly(e.Right, keyColumns)
+	default:
+		return false
+	}
+}
+
+// checkSafeUpdate returns an error if SQL_SAFE_UPDATES is enabled and the
+// UPDATE/DELETE would violate safe update mode rules. Must be called after
+// the table def is loaded. limitClause should be nil if no LIMIT clause present.
+func (e *Executor) checkSafeUpdate(def *catalog.TableDef, where sqlparser.Expr, limitClause *sqlparser.Limit) error {
+	if !e.isSafeUpdateEnabled() {
+		return nil
+	}
+	// LIMIT present → always allowed
+	if limitClause != nil {
+		return nil
+	}
+	// Build set of key columns (primary key + all index columns)
+	keyColumns := make(map[string]bool)
+	for _, col := range def.PrimaryKey {
+		keyColumns[strings.ToLower(stripPrefixLengthFromCol(col))] = true
+	}
+	for _, idx := range def.Indexes {
+		for _, col := range idx.Columns {
+			keyColumns[strings.ToLower(stripPrefixLengthFromCol(col))] = true
+		}
+	}
+	// No WHERE or WHERE doesn't use a key column directly → error
+	if where == nil || !whereUsesKeyColumnDirectly(where, keyColumns) {
+		return mysqlError(1175, "HY000", "You are using safe update mode and you tried to update a table without a WHERE that uses a KEY column.")
+	}
+	return nil
 }
 
 // extractPKEquality checks if expr contains an equality on pkCol.

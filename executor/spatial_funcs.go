@@ -118,8 +118,9 @@ func detectGeometryType(upper string) string {
 		return "MULTILINESTRING"
 	case strings.HasPrefix(upper, "MULTIPOINT"):
 		return "MULTIPOINT"
-	case strings.HasPrefix(upper, "GEOMETRYCOLLECTION"):
-		return "GEOMETRYCOLLECTION"
+	case strings.HasPrefix(upper, "GEOMETRYCOLLECTION"), strings.HasPrefix(upper, "GEOMCOLLECTION"):
+		// MySQL 8.0 uses "GEOMCOLLECTION" as the canonical type name
+		return "GEOMCOLLECTION"
 	case strings.HasPrefix(upper, "POLYGON"):
 		return "POLYGON"
 	case strings.HasPrefix(upper, "LINESTRING"):
@@ -553,7 +554,8 @@ func geoJSONToWkt(jsonStr string) (interface{}, error) {
 			if !ok || len(pt) < 2 {
 				continue
 			}
-			parts = append(parts, fmt.Sprintf("%s %s", formatSpatialFloat(toFloat(pt[0])), formatSpatialFloat(toFloat(pt[1]))))
+			// MySQL wraps each point in parentheses: MULTIPOINT((x1 y1),(x2 y2),...)
+			parts = append(parts, fmt.Sprintf("(%s %s)", formatSpatialFloat(toFloat(pt[0])), formatSpatialFloat(toFloat(pt[1]))))
 		}
 		return fmt.Sprintf("MULTIPOINT(%s)", strings.Join(parts, ",")), nil
 	case "GEOMETRYCOLLECTION":
@@ -706,6 +708,40 @@ func extractPolygonCoords(wkt string) string {
 		}
 	}
 	return "(" + strings.TrimSpace(wkt) + ")"
+}
+
+// normalizeWKT normalizes a WKT geometry string to MySQL's canonical display format.
+// Currently handles MULTIPOINT(x y, ...) -> MULTIPOINT((x y), ...) normalization.
+func normalizeWKT(wkt string) string {
+	upper := strings.ToUpper(strings.TrimSpace(wkt))
+	if !strings.HasPrefix(upper, "MULTIPOINT") {
+		return wkt
+	}
+	// Find the content inside outermost parentheses
+	idx := strings.Index(wkt, "(")
+	if idx < 0 {
+		return wkt
+	}
+	end := strings.LastIndex(wkt, ")")
+	if end <= idx {
+		return wkt
+	}
+	inner := strings.TrimSpace(wkt[idx+1 : end])
+	// Check if already has nested parens (e.g., "(0 0),(10 10)") - already normalized
+	if strings.HasPrefix(inner, "(") {
+		return wkt
+	}
+	// Parse as flat coordinate list: "x1 y1, x2 y2, ..."
+	parts := strings.Split(inner, ",")
+	var normalized []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			normalized = append(normalized, "("+p+")")
+		}
+	}
+	prefix := wkt[:idx+1]
+	return prefix + strings.Join(normalized, ",") + ")"
 }
 
 // Spatial function helpers for evalFuncExpr — these handle functions called by name

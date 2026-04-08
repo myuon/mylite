@@ -730,6 +730,9 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						if enumErr != nil {
 							return nil, enumErr
 						}
+						if cleanName == "optimizer_switch" {
+							enumVal = e.mergeOptimizerSwitch(enumVal, isGlobal)
+						}
 						e.sessionScopeVars[cleanName] = enumVal
 					} else if isBooleanVariable(cleanName) {
 						boolVal, bErr := normalizeBooleanSetValue(cleanName, expr.Expr, evalVal)
@@ -747,12 +750,19 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 								sv = "OFF"
 							}
 						}
+						if cleanName == "optimizer_switch" {
+							sv = e.mergeOptimizerSwitch(sv, isGlobal)
+						}
 						e.sessionScopeVars[cleanName] = sv
 					} else if err == nil && evalVal == nil {
 						// nil means NULL - store empty or delete
 						delete(e.sessionScopeVars, cleanName)
 					} else {
-						e.sessionScopeVars[cleanName] = val
+						sv := val
+						if cleanName == "optimizer_switch" {
+							sv = e.mergeOptimizerSwitch(sv, isGlobal)
+						}
+						e.sessionScopeVars[cleanName] = sv
 					}
 				}
 				// If SET GLOBAL was used, move the newly-stored value to global scope

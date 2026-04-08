@@ -89,6 +89,7 @@ type ProcedureDef struct {
 	Name        string
 	Params      []ProcParam
 	Body        []string // SQL statements in the procedure body
+	BodyText    string   // original body text (begin...end or full body) for information_schema
 	OriginalSQL string   // original CREATE PROCEDURE statement
 }
 
@@ -105,6 +106,7 @@ type FunctionDef struct {
 	Params        []ProcParam
 	ReturnType    string
 	Body          []string // SQL statements in the function body
+	BodyText      string   // original body text for information_schema
 	Deterministic bool     // true if declared DETERMINISTIC
 	OriginalSQL   string   // original CREATE FUNCTION statement
 }

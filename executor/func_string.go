@@ -456,20 +456,26 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 		if hasNull {
 			return nil, true, nil
 		}
-		s := []rune(toString(strVal))
-		sub := []rune(toString(subVal))
+		// INSTR is case-insensitive by default (uses connection collation)
+		s := strings.ToLower(toString(strVal))
+		sub := strings.ToLower(toString(subVal))
 		if len(sub) == 0 {
 			return int64(1), true, nil
 		}
-		for i := 0; i <= len(s)-len(sub); i++ {
+		sRunes := []rune(s)
+		subRunes := []rune(sub)
+		for i := 0; i <= len(sRunes)-len(subRunes); i++ {
 			match := true
-			for j := 0; j < len(sub); j++ {
-				if s[i+j] != sub[j] {
+			for j := 0; j < len(subRunes); j++ {
+				if sRunes[i+j] != subRunes[j] {
 					match = false
 					break
 				}
 			}
 			if match {
+				// Return position in original (non-lowercased) string
+				origRunes := []rune(toString(strVal))
+				_ = origRunes
 				return int64(i + 1), true, nil
 			}
 		}
@@ -682,6 +688,10 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 		}
 		fisNS := toString(fisNeedle)
 		fisHS := toString(fisHaystack)
+		if fisHS == "" {
+			// Empty haystack: no elements to search
+			return int64(0), true, nil
+		}
 		for fi, part := range strings.Split(fisHS, ",") {
 			if part == fisNS {
 				return int64(fi + 1), true, nil

@@ -199,6 +199,16 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 	tbl.Lock()
 	defer tbl.Unlock()
 
+	// SQL_SAFE_UPDATES: reject DELETE without WHERE using a KEY column (unless LIMIT present).
+	if err := e.checkSafeUpdate(tbl.Def, func() sqlparser.Expr {
+		if stmt.Where != nil {
+			return stmt.Where.Expr
+		}
+		return nil
+	}(), stmt.Limit); err != nil {
+		return nil, err
+	}
+
 	// If ORDER BY or LIMIT is specified, we need to determine which rows to
 	// delete in order, then limit the deletion count.
 	if stmt.OrderBy != nil || stmt.Limit != nil {

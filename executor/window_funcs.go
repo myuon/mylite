@@ -717,31 +717,41 @@ func (e *Executor) evalWindowFuncForRow(
 		}
 		hasValue := false
 		sum := float64(0)
-		// Track uint64 accumulation separately to avoid float64 precision loss for large uints.
+		// Track accumulation by type for correct return type.
 		var sumU64 uint64
+		var sumI64 int64
 		allUint64 := true
+		allInt64 := true
 		for i := start; i <= end; i++ {
 			val, _ := e.evalRowExpr(v.Arg, partRows[i])
 			if val != nil {
 				if u, ok := val.(uint64); ok {
 					sumU64 += u
+					allInt64 = false
+				} else if iv, ok := val.(int64); ok {
+					sumI64 += iv
+					allUint64 = false
 				} else {
 					allUint64 = false
+					allInt64 = false
 				}
 				sum += windowToFloat64(val)
 				hasValue = true
-			} else {
-				allUint64 = false
 			}
+			// NULL values are ignored in SUM and don't affect the type determination
 		}
 		if !hasValue {
 			return nil, nil
 		}
-		// If all values were uint64, return uint64 to preserve precision (e.g. BIT_AND result).
+		// If all values were uint64, return uint64 to preserve precision.
 		if allUint64 {
 			return sumU64, nil
 		}
-		// MySQL returns DECIMAL for SUM of integers
+		// If all values were int64 (integer column), return int64 (MySQL returns BIGINT for SUM of integers).
+		if allInt64 {
+			return sumI64, nil
+		}
+		// Otherwise return float/decimal
 		return fmt.Sprintf("%.1f", sum), nil
 
 	case *sqlparser.Avg:

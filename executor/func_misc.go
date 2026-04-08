@@ -24,6 +24,10 @@ import (
 // Returns (result, handled, error).
 func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.Row) (interface{}, bool, error) {
 	switch name {
+	case "grouping":
+		// Outside of GROUP BY WITH ROLLUP context, GROUPING() always returns 0.
+		// In rollup context, GROUPING() is handled before reaching evalMiscFunc.
+		return int64(0), true, nil
 	case "last_insert_id":
 		if len(v.Exprs) > 0 {
 			val, err := e.evalExprMaybeRow(v.Exprs[0], row)
@@ -65,6 +69,12 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 	case "if":
 		if len(v.Exprs) < 3 {
 			return nil, true, fmt.Errorf("IF requires 3 arguments")
+		}
+		// Track expression depth to detect stack overflow for deeply nested IF expressions.
+		e.exprDepth++
+		defer func() { e.exprDepth-- }()
+		if e.exprDepth > 8192 {
+			return nil, true, mysqlError(1436, "HY000", "Thread stack overrun: Need more than available stack. Use 'mysqld --thread_stack=#' to specify a bigger stack.")
 		}
 		cond, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
@@ -319,6 +329,8 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 				return nil, true, err
 			}
 			if ivVal == nil {
+				// MySQL treats NULL list elements as -infinity: x >= NULL is always true
+				ivResult = int64(ivi)
 				continue
 			}
 			if ivNF >= toFloat(ivVal) {

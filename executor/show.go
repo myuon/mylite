@@ -1431,6 +1431,12 @@ func mysqlDisplayType(colType string) string {
 		return "year(4)"
 	case "BOOL", "BOOLEAN":
 		return "tinyint(1)"
+	case "GEOMETRYCOLLECTION", "GEOMCOLLECTION":
+		// MySQL 8.0 uses "geomcollection" as the canonical display name
+		return "geomcollection"
+	case "GEOMETRY", "POINT", "LINESTRING", "POLYGON",
+		"MULTIPOINT", "MULTILINESTRING", "MULTIPOLYGON":
+		return strings.ToLower(base)
 	default:
 		return strings.ToLower(colType)
 	}
