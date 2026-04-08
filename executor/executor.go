@@ -7157,16 +7157,18 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 		return res, err
 	case *sqlparser.Select:
+		// Check MAX_JOIN_SIZE before executing the SELECT.
+		if err := e.checkMaxJoinSize(s); err != nil {
+			return nil, err
+		}
 		res, err := e.execSelect(s)
 		// Apply SQL_SELECT_LIMIT when no explicit LIMIT clause is present.
-		// MySQL uses sql_select_limit+1 rows internally (the +1 allows detection
-		// of truncation by the protocol layer / client).
+		// MySQL applies sql_select_limit as the maximum rows returned to the client.
 		if err == nil && res != nil && s.Limit == nil {
 			if limitStr, ok := e.sessionScopeVars["sql_select_limit"]; ok {
 				if limit, convErr := strconv.ParseInt(limitStr, 10, 64); convErr == nil && limit >= 0 {
-					maxRows := limit + 1
-					if int64(len(res.Rows)) > maxRows {
-						res.Rows = res.Rows[:maxRows]
+					if int64(len(res.Rows)) > limit {
+						res.Rows = res.Rows[:limit]
 					}
 				}
 			}
@@ -17887,6 +17889,102 @@ func decodeUCS2(data []byte) ([]byte, error) {
 		runes = append(runes, r)
 	}
 	return []byte(string(runes)), nil
+}
+
+// checkMaxJoinSize checks if a SELECT would exceed max_join_size and raises error 1104 if so.
+// max_join_size is only enforced when sql_big_selects is OFF.
+func (e *Executor) checkMaxJoinSize(stmt *sqlparser.Select) error {
+	// Check if sql_big_selects is ON (overrides max_join_size).
+	bigSelects := e.sessionScopeVars["sql_big_selects"]
+	if bigSelects == "" {
+		if gv, ok := e.getGlobalVar("sql_big_selects"); ok {
+			bigSelects = gv
+		}
+	}
+	upperBS := strings.ToUpper(bigSelects)
+	if upperBS == "ON" || upperBS == "1" {
+		return nil
+	}
+
+	// Get max_join_size value.
+	maxJoinSizeStr := e.sessionScopeVars["max_join_size"]
+	if maxJoinSizeStr == "" {
+		if gv, ok := e.getGlobalVar("max_join_size"); ok {
+			maxJoinSizeStr = gv
+		}
+	}
+	if maxJoinSizeStr == "" {
+		return nil // no limit
+	}
+	maxJoinSize, parseErr := strconv.ParseUint(maxJoinSizeStr, 10, 64)
+	if parseErr != nil {
+		return nil
+	}
+	// 18446744073709551615 is the default (unlimited).
+	if maxJoinSize >= 18446744073709551615 {
+		return nil
+	}
+
+	// Estimate join size as the product of FROM table row counts.
+	var estimate uint64 = 1
+	for _, tableExpr := range stmt.From {
+		rowCount := e.estimateTableExprRows(tableExpr)
+		if rowCount <= 0 {
+			rowCount = 1
+		}
+		// Overflow-safe multiplication
+		if estimate > 18446744073709551615/uint64(rowCount) {
+			estimate = 18446744073709551615
+		} else {
+			estimate *= uint64(rowCount)
+		}
+	}
+
+	if estimate > maxJoinSize {
+		return mysqlError(1104, "42000", "The SELECT would examine more than MAX_JOIN_SIZE rows; check your WHERE and use SET SQL_BIG_SELECTS=1 or SET MAX_JOIN_SIZE=# if the SELECT is okay")
+	}
+	return nil
+}
+
+// estimateTableExprRows returns an estimate of the row count for a table expression.
+func (e *Executor) estimateTableExprRows(tableExpr sqlparser.TableExpr) int {
+	switch t := tableExpr.(type) {
+	case *sqlparser.AliasedTableExpr:
+		switch inner := t.Expr.(type) {
+		case sqlparser.TableName:
+			tableName := inner.Name.String()
+			dbName := e.CurrentDB
+			if !inner.Qualifier.IsEmpty() {
+				dbName = inner.Qualifier.String()
+			}
+			if strings.EqualFold(tableName, "dual") {
+				return 1
+			}
+			if e.Storage != nil {
+				if tbl, err := e.Storage.GetTable(dbName, tableName); err == nil {
+					tbl.Mu.RLock()
+					n := len(tbl.Rows)
+					tbl.Mu.RUnlock()
+					return n
+				}
+			}
+			return 1
+		default:
+			return 1
+		}
+	case *sqlparser.JoinTableExpr:
+		left := e.estimateTableExprRows(t.LeftExpr)
+		right := e.estimateTableExprRows(t.RightExpr)
+		return left * right
+	case *sqlparser.ParenTableExpr:
+		total := 1
+		for _, te := range t.Exprs {
+			total *= e.estimateTableExprRows(te)
+		}
+		return total
+	default:
+		return 1
+	}
 }
 
 // isSafeUpdateEnabled returns true if SQL_SAFE_UPDATES is enabled for the current session.
