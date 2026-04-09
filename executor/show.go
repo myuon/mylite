@@ -2247,3 +2247,91 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		IsResultSet: true,
 	}, nil
 }
+
+// buildCreateViewSQLFromQuery reconstructs the CREATE VIEW SQL statement from a parsed CreateView node,
+// using the original query text to preserve literal formatting (hex, binary) as written.
+func (e *Executor) buildCreateViewSQLFromQuery(s *sqlparser.CreateView, originalQuery string) string {
+	var b strings.Builder
+	b.WriteString("CREATE ")
+
+	algo := s.Algorithm
+	if algo == "" {
+		algo = "UNDEFINED"
+	}
+	b.WriteString(fmt.Sprintf("ALGORITHM=%s ", strings.ToUpper(algo)))
+
+	// DEFINER clause
+	if s.Definer != nil {
+		b.WriteString(fmt.Sprintf("DEFINER=`%s`@`%s` ", s.Definer.Name, s.Definer.Address))
+	} else {
+		b.WriteString("DEFINER=`root`@`localhost` ")
+	}
+
+	// SQL SECURITY clause
+	sec := s.Security
+	if sec == "" {
+		sec = "DEFINER"
+	}
+	b.WriteString(fmt.Sprintf("SQL SECURITY %s ", strings.ToUpper(sec)))
+
+	b.WriteString(fmt.Sprintf("VIEW `%s` AS ", s.ViewName.Name.String()))
+
+	// Try to extract the SELECT portion from the original query to preserve literal formatting.
+	selectPart := extractSelectFromCreateView(originalQuery)
+	if selectPart != "" {
+		b.WriteString(selectPart)
+	} else {
+		b.WriteString(sqlparser.String(s.Select))
+	}
+
+	return b.String()
+}
+
+// extractSelectFromCreateView extracts the SELECT (or subquery) part from a CREATE VIEW statement.
+// This preserves the original literal formatting (e.g., 0x... hex notation).
+func extractSelectFromCreateView(query string) string {
+	upper := strings.ToUpper(query)
+	// Find "AS" after "VIEW `name`" or "VIEW name"
+	// Search for " AS " after the last VIEW keyword
+	asIdx := -1
+	viewIdx := strings.Index(upper, " VIEW ")
+	if viewIdx >= 0 {
+		// Search for " AS " after the view name
+		rest := upper[viewIdx+6:]
+		restAsIdx := strings.Index(rest, " AS ")
+		if restAsIdx >= 0 {
+			asIdx = viewIdx + 6 + restAsIdx + 4
+		}
+	}
+	if asIdx < 0 {
+		return ""
+	}
+	return strings.TrimSpace(query[asIdx:])
+}
+
+// showCreateView handles SHOW CREATE VIEW <viewName>.
+func (e *Executor) showCreateView(viewName string) (*Result, error) {
+	// Look up stored CREATE VIEW SQL
+	createSQL := ""
+	if e.viewCreateStatements != nil {
+		if sql, ok := e.viewCreateStatements[viewName]; ok {
+			createSQL = sql
+		}
+	}
+	// Fall back to reconstructing from the stored select SQL
+	if createSQL == "" {
+		if e.views != nil {
+			if selectSQL, ok := e.views[viewName]; ok {
+				createSQL = fmt.Sprintf("CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `%s` AS %s", viewName, selectSQL)
+			}
+		}
+	}
+	if createSQL == "" {
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s' doesn't exist", viewName))
+	}
+	return &Result{
+		Columns:     []string{"View", "Create View", "character_set_client", "collation_connection"},
+		Rows:        [][]interface{}{{viewName, createSQL, "utf8mb4", "utf8mb4_0900_ai_ci"}},
+		IsResultSet: true,
+	}, nil
+}

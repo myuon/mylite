@@ -300,6 +300,8 @@ type Executor struct {
 	views map[string]string
 	// viewCheckOptions stores WITH CHECK OPTION for views (view name -> check option string: "cascaded", "local", or "").
 	viewCheckOptions map[string]string
+	// viewCreateStatements stores the full CREATE VIEW SQL for SHOW CREATE VIEW (view name -> full SQL).
+	viewCreateStatements map[string]string
 	// queryTableDef holds the table definition for the current query context,
 	// used for column-level checks (e.g., IS NULL on NOT NULL columns).
 	queryTableDef *catalog.TableDef
@@ -7175,9 +7177,61 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 		return res, err
 	case *sqlparser.Update:
-		return e.execUpdate(s)
+		res, err := e.execUpdate(s)
+		// Track analyze status for non-InnoDB tables after UPDATE.
+		if err == nil {
+			tableName := s.TableExprs[0]
+			if aliased, ok := tableName.(*sqlparser.AliasedTableExpr); ok {
+				if tn, ok := aliased.Expr.(sqlparser.TableName); ok {
+					tblName := tn.Name.String()
+					dbName := e.CurrentDB
+					if !tn.Qualifier.IsEmpty() {
+						dbName = tn.Qualifier.String()
+					}
+					fullName := dbName + "." + tblName
+					if dbObj, dbErr := e.Catalog.GetDatabase(dbName); dbErr == nil {
+						if tblDef, tblErr := dbObj.GetTable(tblName); tblErr == nil && tblDef != nil {
+							eng := strings.ToUpper(tblDef.Engine)
+							if eng != "" && eng != "INNODB" && eng != "MEMORY" && eng != "HEAP" {
+								if e.tableNeedsAnalyze == nil {
+									e.tableNeedsAnalyze = map[string]bool{}
+								}
+								e.tableNeedsAnalyze[fullName] = true
+							}
+						}
+					}
+				}
+			}
+		}
+		return res, err
 	case *sqlparser.Delete:
-		return e.execDelete(s)
+		res, err := e.execDelete(s)
+		// Track analyze status for non-InnoDB tables after DELETE.
+		if err == nil && s.TableExprs != nil && len(s.TableExprs) > 0 {
+			tableName := s.TableExprs[0]
+			if aliased, ok := tableName.(*sqlparser.AliasedTableExpr); ok {
+				if tn, ok := aliased.Expr.(sqlparser.TableName); ok {
+					tblName := tn.Name.String()
+					dbName := e.CurrentDB
+					if !tn.Qualifier.IsEmpty() {
+						dbName = tn.Qualifier.String()
+					}
+					fullName := dbName + "." + tblName
+					if dbObj, dbErr := e.Catalog.GetDatabase(dbName); dbErr == nil {
+						if tblDef, tblErr := dbObj.GetTable(tblName); tblErr == nil && tblDef != nil {
+							eng := strings.ToUpper(tblDef.Engine)
+							if eng != "" && eng != "INNODB" && eng != "MEMORY" && eng != "HEAP" {
+								if e.tableNeedsAnalyze == nil {
+									e.tableNeedsAnalyze = map[string]bool{}
+								}
+								e.tableNeedsAnalyze[fullName] = true
+							}
+						}
+					}
+				}
+			}
+		}
+		return res, err
 	case *sqlparser.AlterTable:
 		res, err := e.execAlterTable(s)
 		if err == nil {
@@ -7411,6 +7465,11 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			e.viewCheckOptions = make(map[string]string)
 		}
 		e.viewCheckOptions[viewName] = s.CheckOption
+		// Store full CREATE VIEW statement for SHOW CREATE VIEW
+		if e.viewCreateStatements == nil {
+			e.viewCreateStatements = make(map[string]string)
+		}
+		e.viewCreateStatements[viewName] = e.buildCreateViewSQLFromQuery(s, query)
 		return &Result{}, nil
 	case *sqlparser.DropView:
 		// Remove view definitions
@@ -7418,6 +7477,9 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			viewName := name.Name.String()
 			if e.views != nil {
 				delete(e.views, viewName)
+			}
+			if e.viewCreateStatements != nil {
+				delete(e.viewCreateStatements, viewName)
 			}
 		}
 		return &Result{}, nil
@@ -7488,6 +7550,20 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			e.viewCheckOptions = make(map[string]string)
 		}
 		e.viewCheckOptions[viewName] = s.CheckOption
+		// Store full CREATE VIEW statement for SHOW CREATE VIEW
+		if e.viewCreateStatements == nil {
+			e.viewCreateStatements = make(map[string]string)
+		}
+		// AlterView uses same structure as CreateView - convert to CreateView for building SQL
+		cv := &sqlparser.CreateView{
+			ViewName:    s.ViewName,
+			Algorithm:   s.Algorithm,
+			Definer:     s.Definer,
+			Security:    s.Security,
+			Select:      s.Select,
+			CheckOption: s.CheckOption,
+		}
+		e.viewCreateStatements[viewName] = e.buildCreateViewSQLFromQuery(cv, query)
 		return &Result{}, nil
 	case *sqlparser.CommentOnly:
 		return &Result{}, nil
@@ -17969,6 +18045,16 @@ func (e *Executor) estimateTableExprRows(tableExpr sqlparser.TableExpr) int {
 				}
 			}
 			return 1
+		case *sqlparser.DerivedTable:
+			// For derived tables (subqueries), estimate from the inner SELECT or Union.
+			switch subStmt := inner.Select.(type) {
+			case *sqlparser.Select:
+				return e.estimateSelectRows(subStmt)
+			case *sqlparser.Union:
+				// For UNION, estimate as the sum of all parts.
+				return e.estimateUnionRows(subStmt)
+			}
+			return 1
 		default:
 			return 1
 		}
@@ -17985,6 +18071,43 @@ func (e *Executor) estimateTableExprRows(tableExpr sqlparser.TableExpr) int {
 	default:
 		return 1
 	}
+}
+
+// estimateSelectRows estimates the number of rows a SELECT would produce by taking
+// the product of all FROM table row counts.
+func (e *Executor) estimateSelectRows(sel *sqlparser.Select) int {
+	total := 1
+	for _, tableExpr := range sel.From {
+		n := e.estimateTableExprRows(tableExpr)
+		if n <= 0 {
+			n = 1
+		}
+		total *= n
+	}
+	return total
+}
+
+// estimateUnionRows estimates the number of rows a UNION would produce as the sum of all parts.
+func (e *Executor) estimateUnionRows(u *sqlparser.Union) int {
+	left := 0
+	switch l := u.Left.(type) {
+	case *sqlparser.Select:
+		left = e.estimateSelectRows(l)
+	case *sqlparser.Union:
+		left = e.estimateUnionRows(l)
+	default:
+		left = 1
+	}
+	right := 0
+	switch r := u.Right.(type) {
+	case *sqlparser.Select:
+		right = e.estimateSelectRows(r)
+	case *sqlparser.Union:
+		right = e.estimateUnionRows(r)
+	default:
+		right = 1
+	}
+	return left + right
 }
 
 // isSafeUpdateEnabled returns true if SQL_SAFE_UPDATES is enabled for the current session.

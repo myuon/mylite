@@ -2632,8 +2632,10 @@ func collectColumnEqualities(expr sqlparser.Expr, pairs *[][2]string) {
 // execSelectGroupBy handles SELECT with GROUP BY or aggregate functions.
 func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.Row) (*Result, error) {
 	// ONLY_FULL_GROUP_BY: validate that non-aggregate SELECT expressions appear in GROUP BY.
+	// With SELECT DISTINCT, all selected columns are implicitly grouped, so skip the check.
 	if stmt.GroupBy != nil && len(stmt.GroupBy.Exprs) > 0 &&
-		strings.Contains(e.sqlMode, "ONLY_FULL_GROUP_BY") {
+		strings.Contains(e.sqlMode, "ONLY_FULL_GROUP_BY") &&
+		!stmt.Distinct {
 		// Build set of GROUP BY column names (lowercase)
 		groupByColSet := make(map[string]bool)
 		for _, gbExpr := range stmt.GroupBy.Exprs {
@@ -2714,6 +2716,106 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 				}
 			}
 		}
+		// Build a set of table names/aliases in the FROM clause of this SELECT.
+		// Used to detect correlated column references (outer query columns), which are always allowed.
+		localTableAliases := make(map[string]bool)
+		for _, alias := range collectTableAliases(stmt.From) {
+			if alias != "" {
+				localTableAliases[strings.ToLower(alias)] = true
+			}
+		}
+		// Also add actual table names (not just aliases)
+		for _, te := range stmt.From {
+			if ate, ok := te.(*sqlparser.AliasedTableExpr); ok {
+				if tn, ok := ate.Expr.(sqlparser.TableName); ok {
+					localTableAliases[strings.ToLower(tn.Name.String())] = true
+				}
+			}
+		}
+		// Build a set of table qualifiers that have at least one column in the groupByColSet.
+		// This is used to implement the MySQL rule: if a table's unique/primary key column
+		// is in GROUP BY, all columns from that table are functionally dependent.
+		// We use a simplified heuristic: if any column from a table qualifier appears in
+		// groupByColSet (or is functionally determined), that table's columns are all allowed.
+		tablesWithGroupedCols := make(map[string]bool)
+		for _, gbExpr := range stmt.GroupBy.Exprs {
+			if col, ok := gbExpr.(*sqlparser.ColName); ok {
+				if !col.Qualifier.IsEmpty() {
+					tablesWithGroupedCols[strings.ToLower(col.Qualifier.Name.String())] = true
+				}
+			}
+		}
+		// Also add tables from equality-expanded columns (tracked via SELECT expressions below)
+		for _, selectExpr := range stmt.SelectExprs.Exprs {
+			if ae2, ok := selectExpr.(*sqlparser.AliasedExpr); ok {
+				if col2, ok := ae2.Expr.(*sqlparser.ColName); ok {
+					colLower := strings.ToLower(col2.Name.String())
+					if groupByColSet[colLower] || whereConstantCols[colLower] {
+						if !col2.Qualifier.IsEmpty() {
+							tablesWithGroupedCols[strings.ToLower(col2.Qualifier.Name.String())] = true
+						}
+					}
+				}
+			}
+		}
+		// Check each table in FROM to see if GROUP BY columns cover a UNIQUE or PRIMARY key.
+		// If so, all columns from that table are functionally dependent on GROUP BY.
+		tablesFullyDetermined := make(map[string]bool)
+		for _, te := range stmt.From {
+			if ate, ok := te.(*sqlparser.AliasedTableExpr); ok {
+				if tn, ok := ate.Expr.(sqlparser.TableName); ok {
+					tblName := strings.ToLower(tn.Name.String())
+					dbName := e.CurrentDB
+					if !tn.Qualifier.IsEmpty() {
+						dbName = tn.Qualifier.String()
+					}
+					// Get the alias
+					tblAlias := tblName
+					if !ate.As.IsEmpty() {
+						tblAlias = strings.ToLower(ate.As.String())
+					}
+					// Get table definition to find unique/primary keys
+					if db, err := e.Catalog.GetDatabase(dbName); err == nil {
+						if def, err := db.GetTable(tn.Name.String()); err == nil && def != nil {
+							// Check if GROUP BY columns cover the PRIMARY KEY
+							if len(def.PrimaryKey) > 0 {
+								allInGroup := true
+								for _, pkCol := range def.PrimaryKey {
+									if !groupByColSet[strings.ToLower(pkCol)] {
+										allInGroup = false
+										break
+									}
+								}
+								if allInGroup {
+									tablesFullyDetermined[tblName] = true
+									tablesFullyDetermined[tblAlias] = true
+								}
+							}
+							// Check if GROUP BY columns cover any UNIQUE key
+							if !tablesFullyDetermined[tblName] {
+								for _, idx := range def.Indexes {
+									if !idx.Unique {
+										continue
+									}
+									allInGroup := true
+									for _, idxCol := range idx.Columns {
+										if !groupByColSet[strings.ToLower(idxCol)] {
+											allInGroup = false
+											break
+										}
+									}
+									if allInGroup && len(idx.Columns) > 0 {
+										tablesFullyDetermined[tblName] = true
+										tablesFullyDetermined[tblAlias] = true
+										break
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
 		// Check each SELECT expression
 		for i, selectExpr := range stmt.SelectExprs.Exprs {
 			ae, ok := selectExpr.(*sqlparser.AliasedExpr)
@@ -2740,6 +2842,46 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 			}
 			if whereConstantCols[colNameLower] {
 				continue // Constrained by WHERE equality — functionally dependent
+			}
+			// If the column has a table qualifier that doesn't appear in the local FROM clause,
+			// it's a correlated reference from an outer query and should always be allowed.
+			if !col.Qualifier.IsEmpty() {
+				tableQualLower := strings.ToLower(col.Qualifier.Name.String())
+				if !localTableAliases[tableQualLower] {
+					continue // Correlated reference from outer query — always allowed
+				}
+				// If GROUP BY covers a unique key of this table, all columns are functionally dependent.
+				if tablesFullyDetermined[tableQualLower] {
+					continue // Table's unique key is in GROUP BY — all columns are determined
+				}
+				// If the table is local and has a grouped column, it's considered functionally dependent.
+				if tablesWithGroupedCols[tableQualLower] {
+					continue // Table has a grouped column - considered functionally dependent
+				}
+			} else {
+				// No qualifier — check all tables in the FROM clause for unique key coverage
+				if len(tablesFullyDetermined) > 0 {
+					// If only one table and it's fully determined, allow
+					if len(localTableAliases) == 1 {
+						for tbl := range tablesFullyDetermined {
+							if localTableAliases[tbl] {
+								continue
+							}
+							_ = tbl
+						}
+						// Allow if the single table is fully determined
+						allDetermined := true
+						for tbl := range localTableAliases {
+							if !tablesFullyDetermined[tbl] {
+								allDetermined = false
+								break
+							}
+						}
+						if allDetermined {
+							continue
+						}
+					}
+				}
 			}
 			// Not in GROUP BY — error
 			dbTable := e.CurrentDB + "." + tableName + "." + col.Name.String()
@@ -3046,6 +3188,28 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 			}
 			rollupRow := make([]interface{}, 0, len(stmt.SelectExprs.Exprs))
 			for _, expr := range stmt.SelectExprs.Exprs {
+				// Handle SELECT * in ROLLUP: expand star to all columns (all NULL in rollup rows)
+				if _, isStar := expr.(*sqlparser.StarExpr); isStar {
+					var starKeys []string
+					if orderStr, ok := repRow["__column_order__"]; ok {
+						if s, ok2 := orderStr.(string); ok2 && s != "" {
+							starKeys = strings.Split(s, "\x00")
+						}
+					}
+					if starKeys == nil {
+						starKeys = make([]string, 0, len(repRow))
+						for k := range repRow {
+							if !strings.Contains(k, ".") && k != "__column_order__" {
+								starKeys = append(starKeys, k)
+							}
+						}
+						sort.Strings(starKeys)
+					}
+					for range starKeys {
+						rollupRow = append(rollupRow, nil)
+					}
+					continue
+				}
 				ae, ok := expr.(*sqlparser.AliasedExpr)
 				if !ok {
 					rollupRow = append(rollupRow, nil)
@@ -3133,7 +3297,7 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 				newResult = append(newResult, row)
 			}
 			// Insert final rollup row for the last prefix (or grand total at level 0)
-			if level == 0 {
+			if level == 0 && len(allRows) > 0 {
 				rollupRow, err := buildRollupRow(allRows, 0)
 				if err != nil {
 					return nil, err
@@ -3150,11 +3314,13 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 		if numGroupCols == 1 {
 			// For single group-by column, just append the grand total
 			newResult = resultRows
-			rollupRow, err := buildRollupRow(allRows, 0)
-			if err != nil {
-				return nil, err
+			if len(allRows) > 0 {
+				rollupRow, err := buildRollupRow(allRows, 0)
+				if err != nil {
+					return nil, err
+				}
+				newResult = append(newResult, rollupRow)
 			}
-			newResult = append(newResult, rollupRow)
 		}
 		resultRows = newResult
 	}

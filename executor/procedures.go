@@ -2090,6 +2090,21 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 						if ctx.localVarTypes != nil {
 							if declaredType, ok := ctx.localVarTypes[strings.ToLower(varName)]; ok {
 								val = formatDecimalValue(declaredType, val)
+								// Apply VARCHAR/CHAR length truncation with warning
+								declaredLower := strings.ToLower(declaredType)
+								for _, pfx := range []string{"varchar(", "char(", "nvarchar("} {
+									if strings.HasPrefix(declaredLower, pfx) {
+										endParen := strings.Index(declaredType[len(pfx):], ")")
+										if endParen >= 0 {
+											maxLen := int(toInt64(declaredType[len(pfx) : len(pfx)+endParen]))
+											if strVal, ok2 := val.(string); ok2 && len([]rune(strVal)) > maxLen {
+												val = string([]rune(strVal)[:maxLen])
+												e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", varName))
+											}
+										}
+										break
+									}
+								}
 							}
 						}
 						localVars[varName] = val
