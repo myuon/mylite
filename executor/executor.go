@@ -12071,15 +12071,33 @@ func isZeroDate(val interface{}) bool {
 }
 
 func secToTimeValue(v interface{}) string {
-	sec := int64(toFloat(v))
-	sign := ""
-	if sec < 0 {
-		sign = "-"
-		sec = -sec
+	// Determine the precision for fractional seconds.
+	// DivisionResult carries a Precision that limits decimal places.
+	fracPrec := 6
+	if dr, ok := v.(DivisionResult); ok {
+		if dr.Precision < fracPrec {
+			fracPrec = dr.Precision
+		}
 	}
-	h := sec / 3600
-	m := (sec % 3600) / 60
-	s := sec % 60
+	f := toFloat(v)
+	sign := ""
+	if f < 0 {
+		sign = "-"
+		f = -f
+	}
+	totalSec := int64(f)
+	frac := f - float64(totalSec)
+	h := totalSec / 3600
+	m := (totalSec % 3600) / 60
+	s := totalSec % 60
+	if frac > 1e-9 && fracPrec > 0 {
+		// Format fractional seconds with the appropriate precision, stripping trailing zeros
+		fracStr := fmt.Sprintf("%."+strconv.Itoa(fracPrec)+"f", frac)[1:] // e.g., ".4235"
+		fracStr = strings.TrimRight(fracStr, "0")
+		if fracStr != "." {
+			return fmt.Sprintf("%s%02d:%02d:%02d%s", sign, h, m, s, fracStr)
+		}
+	}
 	return fmt.Sprintf("%s%02d:%02d:%02d", sign, h, m, s)
 }
 
@@ -12137,21 +12155,34 @@ func mysqlWeekFull(t time.Time, mode int64) int64 {
 			}
 			return int64((yday-firstMonday)/7 + 1)
 		}
-		// Modes 1, 3: week 1 has 4+ days in year (ISO-like for Monday-first)
-		// ISO week (mode 3) is exactly this
-		_, isoWeek := t.ISOWeek()
+		// Mode 3: straight ISO week (1-53)
 		if weekRange1to53 {
-			// Mode 3: straight ISO week
+			_, isoWeek := t.ISOWeek()
 			return int64(isoWeek)
 		}
-		// Mode 1: range 0-53; ISO week 0 means it belongs to prev year's last week
-		// If ISO week is 52 or 53 and we're in January, it's week 0
-		isoYear, isoW := t.ISOWeek()
-		if isoYear < year {
+		// Mode 1: Monday-first, range 0-53, week 1 has 4+ days in year.
+		// Week 1 starts: the Monday on or before Jan 4 (the week containing Jan 4 is week 1).
+		// wdJan1 in Mon=1..Sun=7 system:
+		jan1 := time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC)
+		wdJan1Mon := int(jan1.Weekday()) // 0=Sun, 1=Mon..6=Sat
+		if wdJan1Mon == 0 {
+			wdJan1Mon = 7 // Sunday = 7 in Mon-first system
+		}
+		// Offset from Jan 1 to Monday of week 1:
+		// If wdJan1Mon <= 4 (Mon=1,Tue=2,Wed=3,Thu=4): week 1 starts at -(wdJan1Mon-1)
+		// If wdJan1Mon >= 5 (Fri=5,Sat=6,Sun=7): week 1 starts at 8-wdJan1Mon
+		var week1StartOffset int
+		if wdJan1Mon <= 4 {
+			week1StartOffset = -(wdJan1Mon - 1) // negative: in Dec of prev year
+		} else {
+			week1StartOffset = 8 - wdJan1Mon // positive: in Jan
+		}
+		yday := t.YearDay() - 1 // 0-based day of year
+		if yday < week1StartOffset {
+			// Date is before week 1 of current year: return 0
 			return 0
 		}
-		_ = isoW
-		return int64(isoWeek)
+		return int64((yday-week1StartOffset)/7 + 1)
 	}
 
 	// Sunday-first modes (modes 0, 2, 4, 6)
@@ -12206,7 +12237,7 @@ func mysqlWeekFull(t time.Time, mode int64) int64 {
 }
 
 // mysqlWeekYearFull returns (year, week) for a given mode.
-// This is used by DATE_FORMAT %x/%X to get the year the week belongs to.
+// This is used by DATE_FORMAT %x/%X and YEARWEEK() to get the year the week belongs to.
 func mysqlWeekYearFull(t time.Time, mode int64) (int, int64) {
 	week := mysqlWeekFull(t, mode)
 	year := t.Year()
@@ -12217,16 +12248,40 @@ func mysqlWeekYearFull(t time.Time, mode int64) (int, int64) {
 		week = mysqlWeekFull(prevDec31, mode)
 		return year, week
 	}
-	// For ISO-like modes (3, 7 with Monday-first), use Go's ISOWeek for the year
-	// since it correctly handles the year boundary
+	// Mode 3 (ISO): use Go's ISOWeek for accurate year boundary
 	if mode == 3 {
 		isoYear, _ := t.ISOWeek()
 		return isoYear, week
 	}
-	// For other modes, check if the week belongs to the next calendar year
-	// (e.g., Dec 31 could be week 1 of next year)
-	if week == 1 && int(t.Month()) == 12 && t.Day() >= 29 {
-		year++
+	// For dates in late December, check if the week actually belongs to next year's week 1.
+	// This happens with 4-day rule modes (1, 4, 6) and first-day rule modes (2, 5, 7).
+	// If Jan 1 of next year falls in week 1, and our date is in the same week as Jan 1,
+	// then our date belongs to next year's week 1.
+	if int(t.Month()) == 12 && t.Day() >= 29 {
+		nextYear := year + 1
+		jan1Next := time.Date(nextYear, 1, 1, 0, 0, 0, 0, time.UTC)
+		week1OfNextYear := mysqlWeekFull(jan1Next, mode)
+		if week1OfNextYear == 1 {
+			// Jan 1 of next year is in week 1. Check if our date t is in the same week.
+			// Two dates are in the same week if their day-of-week difference (Mon or Sun first) <= 6
+			// and the earlier is the week start.
+			mondayFirst := (mode & 1) != 0
+			var weekdayT, weekdayJ int
+			if mondayFirst {
+				weekdayT = (int(t.Weekday()) + 6) % 7 // 0=Mon..6=Sun
+				weekdayJ = (int(jan1Next.Weekday()) + 6) % 7
+			} else {
+				weekdayT = int(t.Weekday()) // 0=Sun..6=Sat
+				weekdayJ = int(jan1Next.Weekday())
+			}
+			// Check if t and jan1Next are in the same week:
+			// They are in the same week if their week-start date is the same.
+			weekStartT := t.AddDate(0, 0, -weekdayT)
+			weekStartJ := jan1Next.AddDate(0, 0, -weekdayJ)
+			if weekStartT.Equal(weekStartJ) {
+				return nextYear, 1
+			}
+		}
 	}
 	return year, week
 }
@@ -12429,7 +12484,70 @@ func parseDateTimeValue(val interface{}) (time.Time, error) {
 			return t, nil
 		}
 	}
+	// Handle "YYYY:MM:DD HH:MM:SS[.ffffff]" format (MySQL allows colons as date separators)
+	if len(s) >= 10 && s[4] == ':' && s[7] == ':' {
+		// Replace first two colons with dashes to get YYYY-MM-DD format
+		normalized := s[:4] + "-" + s[5:7] + "-" + s[8:]
+		t, err := parseDateTimeValue(normalized)
+		if err == nil {
+			return t, nil
+		}
+	}
 	return time.Time{}, fmt.Errorf("cannot parse date/time value: %q", s)
+}
+
+// addDateMonths adds years and months to a date using MySQL semantics:
+// if the resulting day exceeds the last day of the target month, it is clamped
+// to the last day (e.g., Jan 31 + 1 month = Feb 28, not Mar 3).
+func addDateMonths(t time.Time, years, months int) time.Time {
+	// Calculate target year/month
+	y := t.Year() + years
+	m := int(t.Month()) + months
+	// Normalize months
+	for m > 12 {
+		m -= 12
+		y++
+	}
+	for m < 1 {
+		m += 12
+		y--
+	}
+	// Clamp day to last day of target month
+	d := t.Day()
+	lastDay := daysInMonth(y, time.Month(m))
+	if d > lastDay {
+		d = lastDay
+	}
+	return time.Date(y, time.Month(m), d, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location())
+}
+
+// daysInMonth returns the number of days in the given month/year.
+func daysInMonth(year int, month time.Month) int {
+	return time.Date(year, month+1, 0, 0, 0, 0, 0, time.UTC).Day()
+}
+
+// parseTimeExtractionValue parses a value for HOUR/MINUTE/SECOND extraction.
+// It first tries HHMMSS interpretation for 6-digit integers, then falls
+// back to parseDateTimeValue for datetime/time strings.
+func parseTimeExtractionValue(val interface{}) (time.Time, error) {
+	s := toString(val)
+	// For all-digit strings, try HHMMSS first for 6 digits (e.g., 230322 = 23:03:22)
+	isAllDigits := true
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			isAllDigits = false
+			break
+		}
+	}
+	if isAllDigits && len(s) == 6 {
+		h, _ := strconv.Atoi(s[:2])
+		mi, _ := strconv.Atoi(s[2:4])
+		sec, _ := strconv.Atoi(s[4:6])
+		if h <= 23 && mi <= 59 && sec <= 59 {
+			return time.Date(0, 1, 1, h, mi, sec, 0, time.UTC), nil
+		}
+	}
+	return parseDateTimeValue(val)
 }
 
 // extractLeadingInt extracts the leading integer portion of a string.
@@ -12460,8 +12578,15 @@ func evalIntervalDateExpr(dateVal, intervalVal interface{}, unit sqlparser.Inter
 }
 
 func evalIntervalDateExprStrict(dateVal, intervalVal interface{}, unit sqlparser.IntervalType, syntax sqlparser.IntervalExprSyntax, strict bool) (interface{}, error) {
-	// If interval value is NULL, result is NULL
-	if intervalVal == nil {
+	// If date or interval value is NULL, result is NULL
+	if dateVal == nil || intervalVal == nil {
+		return nil, nil
+	}
+	// Zero dates produce NULL (with a warning in strict mode)
+	if isZeroDate(dateVal) {
+		if strict {
+			return nil, mysqlError(1292, "22007", "Incorrect datetime value: '"+toString(dateVal)+"'")
+		}
 		return nil, nil
 	}
 	t, err := parseDateTimeValue(dateVal)
@@ -12469,7 +12594,7 @@ func evalIntervalDateExprStrict(dateVal, intervalVal interface{}, unit sqlparser
 		return toString(dateVal), nil
 	}
 	iStr := toString(intervalVal)
-	isSubtract := syntax == sqlparser.IntervalDateExprDateSub || syntax == sqlparser.IntervalDateExprSubdate
+	isSubtract := syntax == sqlparser.IntervalDateExprDateSub || syntax == sqlparser.IntervalDateExprSubdate || syntax == sqlparser.IntervalDateExprBinarySub
 
 	// parseIntervalInt parses an interval integer safely, returning (value, overflow).
 	// If the string is too large for int, overflow=true and the date would overflow.
@@ -12507,7 +12632,7 @@ func evalIntervalDateExprStrict(dateVal, intervalVal interface{}, unit sqlparser
 		if isSubtract {
 			n = -n
 		}
-		t = t.AddDate(0, n, 0)
+		t = addDateMonths(t, 0, n)
 	case sqlparser.IntervalYear:
 		n, ov := parseIntervalInt(iStr)
 		if ov {
@@ -12519,7 +12644,7 @@ func evalIntervalDateExprStrict(dateVal, intervalVal interface{}, unit sqlparser
 		if isSubtract {
 			n = -n
 		}
-		t = t.AddDate(n, 0, 0)
+		t = addDateMonths(t, n, 0)
 	case sqlparser.IntervalHour:
 		n, ov := parseIntervalInt(iStr)
 		if ov {
@@ -12528,11 +12653,10 @@ func evalIntervalDateExprStrict(dateVal, intervalVal interface{}, unit sqlparser
 			}
 			return nil, nil
 		}
-		d := time.Duration(n) * time.Hour
 		if isSubtract {
-			d = -d
+			n = -n
 		}
-		t = t.Add(d)
+		t = addSecondsToTime(t, int64(n)*3600)
 	case sqlparser.IntervalMinute:
 		n, ov := parseIntervalInt(iStr)
 		if ov {
@@ -12541,11 +12665,10 @@ func evalIntervalDateExprStrict(dateVal, intervalVal interface{}, unit sqlparser
 			}
 			return nil, nil
 		}
-		d := time.Duration(n) * time.Minute
 		if isSubtract {
-			d = -d
+			n = -n
 		}
-		t = t.Add(d)
+		t = addSecondsToTime(t, int64(n)*60)
 	case sqlparser.IntervalSecond:
 		n, ov := parseIntervalInt(iStr)
 		if ov {
@@ -12554,11 +12677,13 @@ func evalIntervalDateExprStrict(dateVal, intervalVal interface{}, unit sqlparser
 			}
 			return nil, nil
 		}
-		d := time.Duration(n) * time.Second
 		if isSubtract {
-			d = -d
+			n = -n
 		}
-		t = t.Add(d)
+		// Use Unix epoch arithmetic to avoid time.Duration int64 overflow for large values.
+		days := n / 86400
+		rem := n % 86400
+		t = t.AddDate(0, 0, int(days)).Add(time.Duration(rem) * time.Second)
 	case sqlparser.IntervalWeek:
 		n, ov := parseIntervalInt(iStr)
 		if ov {
@@ -12571,9 +12696,106 @@ func evalIntervalDateExprStrict(dateVal, intervalVal interface{}, unit sqlparser
 			n = -n
 		}
 		t = t.AddDate(0, 0, n*7)
+	case sqlparser.IntervalYearMonth:
+		// Format: 'Y M' or 'Y:M' or 'Y-M'
+		s := strings.TrimSpace(iStr)
+		neg := false
+		if strings.HasPrefix(s, "-") {
+			neg = true
+			s = strings.TrimSpace(s[1:])
+		}
+		// Split on any separator: space, colon, or dash
+		sep := strings.IndexAny(s, " :-")
+		var years, months int
+		if sep >= 0 {
+			years, _ = strconv.Atoi(s[:sep])
+			months, _ = strconv.Atoi(strings.TrimSpace(s[sep+1:]))
+		} else {
+			years, _ = strconv.Atoi(s)
+		}
+		if neg {
+			years = -years
+			months = -months
+		}
+		if isSubtract {
+			years = -years
+			months = -months
+		}
+		t = addDateMonths(t, years, months)
+	case sqlparser.IntervalHourMinute:
+		// Format: 'HH:MM'
+		totalSec := parseCompoundInterval(iStr, "hh:mm")
+		if isSubtract {
+			totalSec = -totalSec
+		}
+		t = addSecondsToTime(t, totalSec)
+	case sqlparser.IntervalHourSecond:
+		// Format: 'HH:MM:SS'
+		totalSec := parseCompoundInterval(iStr, "hh:mm:ss")
+		if isSubtract {
+			totalSec = -totalSec
+		}
+		t = addSecondsToTime(t, totalSec)
+	case sqlparser.IntervalMinuteSecond:
+		// Format: 'MM:SS'
+		totalSec := parseCompoundInterval(iStr, "mm:ss")
+		if isSubtract {
+			totalSec = -totalSec
+		}
+		t = addSecondsToTime(t, totalSec)
+	case sqlparser.IntervalDayHour:
+		// Format: 'D HH'
+		totalSec := parseCompoundInterval(iStr, "d hh")
+		if isSubtract {
+			totalSec = -totalSec
+		}
+		t = addSecondsToTime(t, totalSec)
+	case sqlparser.IntervalDayMinute:
+		// Format: 'D HH:MM'
+		totalSec := parseCompoundInterval(iStr, "d hh:mm")
+		if isSubtract {
+			totalSec = -totalSec
+		}
+		t = addSecondsToTime(t, totalSec)
 	case sqlparser.IntervalDaySecond:
-		// Format: 'D HH:MM:SS' or 'D H:M:S'
-		dur, _ := parseMySQLTimeInterval(iStr)
+		// Format: 'D HH:MM:SS' or 'D H:M:S' - use totalSec to avoid overflow
+		totalSec := parseCompoundInterval(iStr, "d hh:mm:ss")
+		if isSubtract {
+			totalSec = -totalSec
+		}
+		t = addSecondsToTime(t, totalSec)
+	case sqlparser.IntervalMicrosecond:
+		// Format: just a number (microseconds)
+		n, _ := strconv.ParseInt(strings.TrimSpace(iStr), 10, 64)
+		dur := time.Duration(n) * time.Microsecond
+		if isSubtract {
+			dur = -dur
+		}
+		t = t.Add(dur)
+	case sqlparser.IntervalSecondMicrosecond:
+		// Format: 'SS.ffffff'
+		dur := parseMicrosecondInterval(iStr, "ss.ffffff")
+		if isSubtract {
+			dur = -dur
+		}
+		t = t.Add(dur)
+	case sqlparser.IntervalMinuteMicrosecond:
+		// Format: 'MM:SS.ffffff'
+		dur := parseMicrosecondInterval(iStr, "mm:ss.ffffff")
+		if isSubtract {
+			dur = -dur
+		}
+		t = t.Add(dur)
+	case sqlparser.IntervalHourMicrosecond:
+		// Format: 'HH:MM:SS.ffffff'
+		dur := parseMicrosecondInterval(iStr, "hh:mm:ss.ffffff")
+		if isSubtract {
+			dur = -dur
+		}
+		t = t.Add(dur)
+	case sqlparser.IntervalDayMicrosecond:
+		// Format: 'D HH:MM:SS.ffffff'
+		dur := parseMicrosecondInterval(iStr, "d hh:mm:ss.ffffff")
 		if isSubtract {
 			dur = -dur
 		}
@@ -12612,8 +12834,13 @@ func evalIntervalDateExprStrict(dateVal, intervalVal interface{}, unit sqlparser
 
 	// Format output based on whether the original had time component
 	ds := toString(dateVal)
-	if strings.Contains(ds, " ") || strings.Contains(ds, ":") || t.Hour() != 0 || t.Minute() != 0 || t.Second() != 0 {
-		return t.Format("2006-01-02 15:04:05"), nil
+	usec := t.Nanosecond() / 1000
+	if strings.Contains(ds, " ") || strings.Contains(ds, ":") || t.Hour() != 0 || t.Minute() != 0 || t.Second() != 0 || usec != 0 {
+		base := t.Format("2006-01-02 15:04:05")
+		if usec != 0 {
+			base = fmt.Sprintf("%s.%06d", base, usec)
+		}
+		return base, nil
 	}
 	return t.Format("2006-01-02"), nil
 }
@@ -12728,14 +12955,228 @@ func formatMicrosAsTimeString(micros int64) string {
 	micros /= 60
 	mins := int(micros % 60)
 	hours := int(micros / 60)
+	sign := ""
 	if negative {
-		return fmt.Sprintf("-%02d:%02d:%02d.%06d", hours, mins, sec, us)
+		sign = "-"
 	}
-	return fmt.Sprintf("%02d:%02d:%02d.%06d", hours, mins, sec, us)
+	if us != 0 {
+		return fmt.Sprintf("%s%02d:%02d:%02d.%06d", sign, hours, mins, sec, us)
+	}
+	return fmt.Sprintf("%s%02d:%02d:%02d", sign, hours, mins, sec)
+}
+
+// addDurationToTime adds a duration in seconds (possibly large) to a time,
+// avoiding int64 overflow in time.Duration by splitting into days and remainder.
+func addSecondsToTime(t time.Time, totalSec int64) time.Time {
+	days := totalSec / 86400
+	rem := totalSec % 86400
+	return t.AddDate(0, 0, int(days)).Add(time.Duration(rem) * time.Second)
+}
+
+// parseCompoundInterval parses MySQL compound (non-microsecond) interval formats.
+// Handles leading negative sign: applies to all components.
+// format: "hh:mm", "hh:mm:ss", "mm:ss", "d hh", "d hh:mm"
+// Returns total seconds as int64 to avoid overflow for large values.
+func parseCompoundInterval(s, format string) int64 {
+	s = strings.TrimSpace(s)
+	neg := false
+	if strings.HasPrefix(s, "-") {
+		neg = true
+		s = strings.TrimSpace(s[1:])
+	}
+
+	var days, hours, mins, secs int64
+
+	switch format {
+	case "d hh:mm:ss":
+		// D HH:MM:SS - space then colons
+		sep := strings.IndexAny(s, " :")
+		if sep >= 0 {
+			d, _ := strconv.ParseInt(s[:sep], 10, 64)
+			days = d
+			rest := s[sep+1:]
+			parts := strings.SplitN(rest, ":", 3)
+			if len(parts) == 3 {
+				h, _ := strconv.ParseInt(parts[0], 10, 64)
+				m, _ := strconv.ParseInt(parts[1], 10, 64)
+				sc, _ := strconv.ParseInt(parts[2], 10, 64)
+				hours, mins, secs = h, m, sc
+			} else if len(parts) == 2 {
+				h, _ := strconv.ParseInt(parts[0], 10, 64)
+				m, _ := strconv.ParseInt(parts[1], 10, 64)
+				hours, mins = h, m
+			} else {
+				h, _ := strconv.ParseInt(rest, 10, 64)
+				hours = h
+			}
+		}
+	case "d hh:mm":
+		// D HH:MM - separator can be space or colon
+		sep := strings.IndexAny(s, " :")
+		if sep >= 0 {
+			d, _ := strconv.ParseInt(s[:sep], 10, 64)
+			days = d
+			rest := s[sep+1:]
+			parts := strings.SplitN(rest, ":", 2)
+			if len(parts) == 2 {
+				h, _ := strconv.ParseInt(parts[0], 10, 64)
+				m, _ := strconv.ParseInt(parts[1], 10, 64)
+				hours, mins = h, m
+			} else {
+				h, _ := strconv.ParseInt(rest, 10, 64)
+				hours = h
+			}
+		}
+	case "d hh":
+		// D HH - separator can be space or colon
+		sep := strings.IndexAny(s, " :")
+		if sep >= 0 {
+			d, _ := strconv.ParseInt(s[:sep], 10, 64)
+			h, _ := strconv.ParseInt(strings.TrimSpace(s[sep+1:]), 10, 64)
+			days, hours = d, h
+		} else {
+			h, _ := strconv.ParseInt(s, 10, 64)
+			hours = h
+		}
+	case "hh:mm:ss":
+		// HH:MM:SS
+		parts := strings.SplitN(s, ":", 3)
+		if len(parts) == 3 {
+			h, _ := strconv.ParseInt(parts[0], 10, 64)
+			m, _ := strconv.ParseInt(parts[1], 10, 64)
+			sc, _ := strconv.ParseInt(parts[2], 10, 64)
+			hours, mins, secs = h, m, sc
+		}
+	case "hh:mm":
+		// HH:MM
+		parts := strings.SplitN(s, ":", 2)
+		if len(parts) == 2 {
+			h, _ := strconv.ParseInt(parts[0], 10, 64)
+			m, _ := strconv.ParseInt(parts[1], 10, 64)
+			hours, mins = h, m
+		}
+	case "mm:ss":
+		// MM:SS (colon separates minutes and seconds)
+		parts := strings.SplitN(s, ":", 2)
+		if len(parts) == 2 {
+			m, _ := strconv.ParseInt(parts[0], 10, 64)
+			sc, _ := strconv.ParseInt(parts[1], 10, 64)
+			mins, secs = m, sc
+		} else {
+			m, _ := strconv.ParseInt(s, 10, 64)
+			mins = m
+		}
+	}
+
+	totalSec := days*86400 + hours*3600 + mins*60 + secs
+	if neg {
+		totalSec = -totalSec
+	}
+	return totalSec
+}
+
+// parseMicrosecondInterval parses MySQL compound microsecond interval formats.
+// format parameter indicates the expected format type:
+//   - "ss.ffffff": SECOND_MICROSECOND like "10000.999999"
+//   - "mm:ss.ffffff": MINUTE_MICROSECOND like "10000:99.999999"
+//   - "hh:mm:ss.ffffff": HOUR_MICROSECOND like "10000:99:99.999999"
+//   - "d hh:mm:ss.ffffff": DAY_MICROSECOND like "10000 99:99:99.999999"
+func parseMicrosecondInterval(s, format string) time.Duration {
+	s = strings.TrimSpace(s)
+	var days, hours, mins, secs, usecs int64
+
+	switch format {
+	case "d hh:mm:ss.ffffff":
+		// D HH:MM:SS.ffffff
+		if idx := strings.Index(s, " "); idx >= 0 {
+			d, _ := strconv.ParseInt(s[:idx], 10, 64)
+			days = d
+			s = s[idx+1:]
+		}
+		fallthrough
+	case "hh:mm:ss.ffffff":
+		// HH:MM:SS.ffffff
+		parts := strings.SplitN(s, ":", 3)
+		if len(parts) == 3 {
+			h, _ := strconv.ParseInt(parts[0], 10, 64)
+			m, _ := strconv.ParseInt(parts[1], 10, 64)
+			secStr := parts[2]
+			hours, mins = h, m
+			if dotIdx := strings.Index(secStr, "."); dotIdx >= 0 {
+				sec, _ := strconv.ParseInt(secStr[:dotIdx], 10, 64)
+				secs = sec
+				frac := secStr[dotIdx+1:]
+				for len(frac) < 6 {
+					frac += "0"
+				}
+				usecs, _ = strconv.ParseInt(frac[:6], 10, 64)
+			} else {
+				sc, _ := strconv.ParseInt(secStr, 10, 64)
+				secs = sc
+			}
+		}
+	case "mm:ss.ffffff":
+		// MM:SS.ffffff (colon separates minutes and seconds)
+		parts := strings.SplitN(s, ":", 2)
+		if len(parts) == 2 {
+			m, _ := strconv.ParseInt(parts[0], 10, 64)
+			secStr := parts[1]
+			mins = m
+			if dotIdx := strings.Index(secStr, "."); dotIdx >= 0 {
+				sec, _ := strconv.ParseInt(secStr[:dotIdx], 10, 64)
+				secs = sec
+				frac := secStr[dotIdx+1:]
+				for len(frac) < 6 {
+					frac += "0"
+				}
+				usecs, _ = strconv.ParseInt(frac[:6], 10, 64)
+			} else {
+				sc, _ := strconv.ParseInt(secStr, 10, 64)
+				secs = sc
+			}
+		} else if len(parts) == 1 {
+			// Just seconds.microseconds
+			if dotIdx := strings.Index(s, "."); dotIdx >= 0 {
+				sec, _ := strconv.ParseInt(s[:dotIdx], 10, 64)
+				secs = sec
+				frac := s[dotIdx+1:]
+				for len(frac) < 6 {
+					frac += "0"
+				}
+				usecs, _ = strconv.ParseInt(frac[:6], 10, 64)
+			}
+		}
+	case "ss.ffffff":
+		// SS.ffffff (dot separates seconds and microseconds)
+		if dotIdx := strings.Index(s, "."); dotIdx >= 0 {
+			sec, _ := strconv.ParseInt(s[:dotIdx], 10, 64)
+			secs = sec
+			frac := s[dotIdx+1:]
+			for len(frac) < 6 {
+				frac += "0"
+			}
+			usecs, _ = strconv.ParseInt(frac[:6], 10, 64)
+		} else {
+			sec, _ := strconv.ParseInt(s, 10, 64)
+			secs = sec
+		}
+	}
+
+	return time.Duration(days)*24*time.Hour +
+		time.Duration(hours)*time.Hour +
+		time.Duration(mins)*time.Minute +
+		time.Duration(secs)*time.Second +
+		time.Duration(usecs)*time.Microsecond
 }
 
 func parseMySQLTimeInterval(s string) (time.Duration, error) {
 	s = strings.TrimSpace(s)
+	// Handle negative sign: "-01:01:01" means -1h-1m-1s
+	negative := false
+	if strings.HasPrefix(s, "-") {
+		negative = true
+		s = s[1:]
+	}
 	var days, hours, mins, secs, usecs int
 
 	// Format: "D HH:MM:SS" or "HH:MM:SS" or "D"
@@ -12781,11 +13222,15 @@ func parseMySQLTimeInterval(s string) (time.Duration, error) {
 		}
 	}
 
-	return time.Duration(days)*24*time.Hour +
+	dur := time.Duration(days)*24*time.Hour +
 		time.Duration(hours)*time.Hour +
 		time.Duration(mins)*time.Minute +
 		time.Duration(secs)*time.Second +
-		time.Duration(usecs)*time.Microsecond, nil
+		time.Duration(usecs)*time.Microsecond
+	if negative {
+		dur = -dur
+	}
+	return dur, nil
 }
 
 // mysqlWeekdayNames maps Go weekday to MySQL weekday name.
@@ -17417,6 +17862,62 @@ func isDatetimeString(s string) bool {
 	return len(s) == 19 && s[4] == '-' && s[7] == '-' && s[10] == ' ' && s[13] == ':' && s[16] == ':'
 }
 
+// isDateLikeButInvalid returns true if s looks like a date/datetime string (YYYY-MM-DD...)
+// but has an invalid month/day combination (e.g. "1997-11-31").
+func isDateLikeButInvalid(s string) bool {
+	if len(s) < 10 || s[4] != '-' || s[7] != '-' {
+		return false
+	}
+	// It looks like a date - check validity
+	y, ey := strconv.Atoi(s[:4])
+	m, em := strconv.Atoi(s[5:7])
+	d, ed := strconv.Atoi(s[8:10])
+	if ey != nil || em != nil || ed != nil {
+		return false
+	}
+	return !isValidDate(y, m, d)
+}
+
+// isStringBuildingExpr returns true when the SQL expression is a CONCAT or similar operation
+// that produces a string value. Used to detect when UNIX_TIMESTAMP should return DECIMAL.
+// MySQL returns DECIMAL(16,6) for UNIX_TIMESTAMP(CONCAT(...)) but INTEGER for datetime expressions.
+func isStringBuildingExpr(expr sqlparser.Expr) bool {
+	switch e := expr.(type) {
+	case *sqlparser.FuncExpr:
+		name := strings.ToLower(e.Name.Lowered())
+		switch name {
+		case "concat", "concat_ws", "format", "substring", "substr", "trim", "ltrim", "rtrim",
+			"replace", "insert", "lpad", "rpad", "repeat", "reverse", "space",
+			"left", "right", "mid":
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// isDatetimeLikeString returns true if s looks like a full datetime (has a date part with '-' or ':').
+// Used to detect when addtime/subtime/timediff receives a datetime instead of a time.
+func isDatetimeLikeString(s string) bool {
+	// A datetime string has format YYYY-MM-DD HH:MM:SS[.ffffff] or YYYY:MM:DD HH:MM:SS
+	// The key indicator: 4 digits followed by '-' or ':' at position 4, and another '-' or ':' at position 7.
+	// The first 4 characters must all be digits (year).
+	if len(s) >= 10 {
+		// Check first 4 chars are digits (year part)
+		for i := 0; i < 4; i++ {
+			if s[i] < '0' || s[i] > '9' {
+				return false
+			}
+		}
+		sep := s[4]
+		if (sep == '-' || sep == ':') && s[7] == sep {
+			return true
+		}
+	}
+	return false
+}
+
 func toFloat(v interface{}) float64 {
 	switch n := v.(type) {
 	case int64:
@@ -17500,6 +18001,23 @@ func toFloat(v interface{}) float64 {
 				}
 				return base
 			}
+		}
+		// MySQL numeric context for day names: Monday=0, Tuesday=1, ..., Sunday=6
+		switch s {
+		case "Monday":
+			return 0
+		case "Tuesday":
+			return 1
+		case "Wednesday":
+			return 2
+		case "Thursday":
+			return 3
+		case "Friday":
+			return 4
+		case "Saturday":
+			return 5
+		case "Sunday":
+			return 6
 		}
 		if f, ok := parseNumericPrefixMySQL(s); ok {
 			return f

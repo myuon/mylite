@@ -1491,10 +1491,7 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 			if len(s) > 11 && s[10] == ' ' {
 				s = s[11:]
 			}
-			// Strip microseconds from TIME cast too
-			if len(s) > 8 && s[8] == '.' {
-				s = s[:8]
-			}
+			// Preserve microseconds in CAST AS TIME (MySQL keeps them)
 			return s, nil
 		case "JSON":
 			// Preserve boolean type for CAST(TRUE/FALSE AS JSON)
@@ -2124,51 +2121,152 @@ func (e *Executor) evalExtractFuncExpr(v *sqlparser.ExtractFuncExpr) (interface{
 		return nil, nil
 	}
 	efStr := toString(efVal)
+	intervalType := strings.ToUpper(v.IntervalType.ToString())
 	efT, efErr := parseDateTimeValue(efStr)
+	// For compound time-based extractions, also try parsing as a time duration (D HH:MM:SS)
+	// when parseDateTimeValue fails (e.g., "02 10:11:12" is a time duration, not a date).
+	var totalSecFromDuration int64
+	var durationParsed bool
 	if efErr != nil {
-		return nil, nil
+		// Try to parse as MySQL time duration (e.g., "02 10:11:12" = 2 days 10h 11m 12s)
+		dur, durErr := parseMySQLTimeInterval(efStr)
+		if durErr == nil {
+			absNs := int64(dur)
+			if absNs < 0 {
+				absNs = -absNs
+			}
+			totalSecFromDuration = absNs / int64(1e9) // nanoseconds to seconds
+			if dur < 0 {
+				totalSecFromDuration = -totalSecFromDuration
+			}
+			durationParsed = true
+		}
 	}
-	switch strings.ToUpper(v.IntervalType.ToString()) {
+	switch intervalType {
 	case "YEAR":
+		if efErr != nil {
+			return nil, nil
+		}
 		return int64(efT.Year()), nil
 	case "MONTH":
+		if efErr != nil {
+			return nil, nil
+		}
 		return int64(efT.Month()), nil
 	case "DAY":
+		if efErr != nil {
+			return nil, nil
+		}
 		return int64(efT.Day()), nil
 	case "HOUR":
+		if efErr != nil {
+			return nil, nil
+		}
 		return int64(efT.Hour()), nil
 	case "MINUTE":
+		if efErr != nil {
+			return nil, nil
+		}
 		return int64(efT.Minute()), nil
 	case "SECOND":
+		if efErr != nil {
+			return nil, nil
+		}
 		return int64(efT.Second()), nil
 	case "QUARTER":
+		if efErr != nil {
+			return nil, nil
+		}
 		return int64((efT.Month()-1)/3 + 1), nil
 	case "WEEK":
+		if efErr != nil {
+			return nil, nil
+		}
 		_, efW := efT.ISOWeek()
 		return int64(efW), nil
 	case "MICROSECOND":
+		if efErr != nil {
+			return nil, nil
+		}
 		return int64(efT.Nanosecond() / 1000), nil
 	case "DAY_MICROSECOND":
+		if efErr != nil {
+			return nil, nil
+		}
 		return int64(efT.Day())*1000000000000 + int64(efT.Hour())*10000000000 + int64(efT.Minute())*100000000 + int64(efT.Second())*1000000 + int64(efT.Nanosecond()/1000), nil
 	case "HOUR_MICROSECOND":
+		if efErr != nil {
+			return nil, nil
+		}
 		return int64(efT.Hour())*10000000000 + int64(efT.Minute())*100000000 + int64(efT.Second())*1000000 + int64(efT.Nanosecond()/1000), nil
 	case "MINUTE_MICROSECOND":
+		if efErr != nil {
+			return nil, nil
+		}
 		return int64(efT.Minute())*100000000 + int64(efT.Second())*1000000 + int64(efT.Nanosecond()/1000), nil
 	case "SECOND_MICROSECOND":
+		if efErr != nil {
+			return nil, nil
+		}
 		return int64(efT.Second())*1000000 + int64(efT.Nanosecond()/1000), nil
 	case "YEAR_MONTH":
+		if efErr != nil {
+			return nil, nil
+		}
 		return int64(efT.Year())*100 + int64(efT.Month()), nil
 	case "DAY_HOUR":
+		if efErr != nil {
+			if !durationParsed {
+				return nil, nil
+			}
+			// totalHours:minutes format
+			totalHours := totalSecFromDuration / 3600
+			mins := (totalSecFromDuration % 3600) / 60
+			return totalHours*100 + mins, nil
+		}
 		return int64(efT.Day())*100 + int64(efT.Hour()), nil
 	case "DAY_MINUTE":
+		if efErr != nil {
+			if !durationParsed {
+				return nil, nil
+			}
+			// totalHours * 100 + minutes
+			totalHours := totalSecFromDuration / 3600
+			mins := (totalSecFromDuration % 3600) / 60
+			return totalHours*100 + mins, nil
+		}
 		return int64(efT.Day())*10000 + int64(efT.Hour())*100 + int64(efT.Minute()), nil
 	case "DAY_SECOND":
+		if efErr != nil {
+			if !durationParsed {
+				return nil, nil
+			}
+			// MySQL max time is 838:59:59 = 3020399 seconds
+			const maxTimeSec = int64(838*3600 + 59*60 + 59)
+			ts := totalSecFromDuration
+			if ts > maxTimeSec {
+				ts = maxTimeSec
+			}
+			h := ts / 3600
+			m := (ts % 3600) / 60
+			s := ts % 60
+			return h*10000 + m*100 + s, nil
+		}
 		return int64(efT.Day())*1000000 + int64(efT.Hour())*10000 + int64(efT.Minute())*100 + int64(efT.Second()), nil
 	case "HOUR_MINUTE":
+		if efErr != nil {
+			return nil, nil
+		}
 		return int64(efT.Hour())*100 + int64(efT.Minute()), nil
 	case "HOUR_SECOND":
+		if efErr != nil {
+			return nil, nil
+		}
 		return int64(efT.Hour())*10000 + int64(efT.Minute())*100 + int64(efT.Second()), nil
 	case "MINUTE_SECOND":
+		if efErr != nil {
+			return nil, nil
+		}
 		return int64(efT.Minute())*100 + int64(efT.Second()), nil
 	default:
 		return nil, nil
