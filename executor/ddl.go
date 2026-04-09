@@ -7,11 +7,36 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
+
+// validateUTF8StringForDDL checks if a string contains valid UTF-8 when character_set_client=binary.
+// MySQL raises ER_INVALID_CHARACTER_STRING (1300) when binary strings contain invalid UTF-8 in DDL contexts.
+// Returns an error with the invalid bytes (up to 6) shown in hex if the string is invalid.
+func validateUTF8StringForDDL(s string) error {
+	if utf8.ValidString(s) {
+		return nil
+	}
+	// Find the first invalid byte sequence
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size <= 1 {
+			// Found invalid bytes: collect up to 6 bytes starting from i
+			end := i + 6
+			if end > len(s) {
+				end = len(s)
+			}
+			hexBytes := fmt.Sprintf("%X", s[i:end])
+			return mysqlError(1300, "HY000", fmt.Sprintf("Invalid utf8 character string: '%s'", hexBytes))
+		}
+		i += size
+	}
+	return nil
+}
 
 // isMySQLLogTable returns true if the given database and table name refer to
 // one of the MySQL log tables (general_log or slow_log).
@@ -1003,6 +1028,12 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		// Save comment (MySQL truncates column comments > 1024 chars, errors in strict/traditional mode)
 		if col.Type.Options != nil && col.Type.Options.Comment != nil {
 			comment := col.Type.Options.Comment.Val
+			// When character_set_client=binary, validate the comment as UTF-8
+			if cs, _ := e.getSysVar("character_set_client"); strings.ToLower(cs) == "binary" {
+				if err := validateUTF8StringForDDL(comment); err != nil {
+					return nil, err
+				}
+			}
 			if mysqlCharLen(comment) > 1024 {
 				if e.isStrictMode() {
 					return nil, mysqlError(1629, "HY000", fmt.Sprintf("Comment for field '%s' is too long (max = 1024)", colDef.Name))
@@ -2242,6 +2273,14 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 						// NO_ZERO_DATE and NO_ZERO_IN_DATE both reject zero-component date defaults
 						if (hasNoZeroDate || hasNoZeroInDate) && isZeroInDateValue(*colDef.Default) {
 							return nil, mysqlError(1067, "42000", fmt.Sprintf("Invalid default value for '%s'", colDef.Name))
+						}
+					}
+				}
+				// When character_set_client=binary, validate the comment as UTF-8
+				if cs, _ := e.getSysVar("character_set_client"); strings.ToLower(cs) == "binary" {
+					if col.Type.Options != nil && col.Type.Options.Comment != nil {
+						if err := validateUTF8StringForDDL(colDef.Comment); err != nil {
+							return nil, err
 						}
 					}
 				}

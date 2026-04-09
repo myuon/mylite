@@ -2,6 +2,8 @@ package executor
 
 import (
 	"fmt"
+	"math/big"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -772,6 +774,17 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			tableName = strings.TrimRight(tableName, ";")
 			tableName = strings.ReplaceAll(tableName, "`", "")
 			return e.showCreateTable(tableName)
+		}
+	}
+
+	// SHOW CREATE VIEW <view>
+	if strings.HasPrefix(upper, "SHOW CREATE VIEW") {
+		parts := strings.Fields(query)
+		if len(parts) >= 4 {
+			viewName := strings.Join(parts[3:], " ")
+			viewName = strings.TrimRight(viewName, ";")
+			viewName = strings.ReplaceAll(viewName, "`", "")
+			return e.showCreateView(viewName)
 		}
 	}
 
@@ -2276,13 +2289,10 @@ func (e *Executor) buildCreateViewSQLFromQuery(s *sqlparser.CreateView, original
 
 	b.WriteString(fmt.Sprintf("VIEW `%s` AS ", s.ViewName.Name.String()))
 
-	// Try to extract the SELECT portion from the original query to preserve literal formatting.
-	selectPart := extractSelectFromCreateView(originalQuery)
-	if selectPart != "" {
-		b.WriteString(selectPart)
-	} else {
-		b.WriteString(sqlparser.String(s.Select))
-	}
+	// Build the SELECT SQL for the view definition in MySQL's canonical format.
+	// MySQL wraps each expression in () and backtick-quotes aliases.
+	selectPart := buildViewSelectSQL(s, originalQuery)
+	b.WriteString(selectPart)
 
 	return b.String()
 }
@@ -2307,6 +2317,124 @@ func extractSelectFromCreateView(query string) string {
 		return ""
 	}
 	return strings.TrimSpace(query[asIdx:])
+}
+
+// normalizeViewSQL normalizes the whitespace in a SQL string for SHOW CREATE VIEW output.
+// MySQL stores view definitions on a single line, collapsing multiple whitespace/newlines.
+func normalizeViewSQL(sql string) string {
+	var b strings.Builder
+	prevSpace := false
+	for _, r := range sql {
+		if r == '\n' || r == '\r' || r == '\t' || r == ' ' {
+			if !prevSpace {
+				b.WriteRune(' ')
+			}
+			prevSpace = true
+		} else {
+			b.WriteRune(r)
+			prevSpace = false
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// buildViewSelectSQL builds the SELECT SQL for a view definition in MySQL's canonical format.
+// MySQL's format: lowercase "select", each expression wrapped in (), aliases backtick-quoted,
+// and hex/binary literals in 0x... format.
+func buildViewSelectSQL(s *sqlparser.CreateView, originalQuery string) string {
+	// Get the base SELECT SQL from the AST
+	sel, ok := s.Select.(*sqlparser.Select)
+	if !ok {
+		// For UNION or other complex selects, fall back to normalizing the original query
+		selectPart := extractSelectFromCreateView(originalQuery)
+		if selectPart == "" {
+			selectPart = sqlparser.String(s.Select)
+		}
+		selectPart = normalizeViewLiterals(selectPart)
+		return normalizeViewSQL(selectPart)
+	}
+
+	// Build each SELECT expression as "(expr) AS `alias`"
+	var parts []string
+	for _, expr := range sel.SelectExprs.Exprs {
+		ae, ok := expr.(*sqlparser.AliasedExpr)
+		if !ok {
+			parts = append(parts, sqlparser.String(expr))
+			continue
+		}
+		// Get the expression string
+		exprStr := sqlparser.String(ae.Expr)
+		// Convert hex/binary literals
+		exprStr = normalizeViewLiterals(exprStr)
+		// Wrap in parentheses
+		exprStr = "(" + exprStr + ")"
+		// Get alias (required for SHOW CREATE VIEW)
+		alias := ""
+		if !ae.As.IsEmpty() {
+			alias = ae.As.String()
+		}
+		if alias != "" {
+			parts = append(parts, exprStr+" AS `"+alias+"`")
+		} else {
+			parts = append(parts, exprStr)
+		}
+	}
+
+	return "select " + strings.Join(parts, ",")
+}
+
+// normalizeViewLiterals converts hex and binary literals in a SELECT SQL to MySQL's canonical 0x... format.
+// It converts:
+//   - X'hexdigits' or x'hexdigits' → 0xhexdigits (lowercase hex)
+//   - b'01digits' or B'01digits' → 0x... hex representation
+//   - 0b... binary literal → 0x... hex representation
+func normalizeViewLiterals(sql string) string {
+	// Convert X'...' or x'...' to 0x... (lowercase hex)
+	reHex := regexp.MustCompile(`(?i)[xX]'([0-9a-fA-F]+)'`)
+	sql = reHex.ReplaceAllStringFunc(sql, func(m string) string {
+		inner := reHex.FindStringSubmatch(m)
+		if len(inner) < 2 {
+			return m
+		}
+		return "0x" + strings.ToLower(inner[1])
+	})
+	// Convert b'...' or B'...' binary literal to 0x... hex
+	reBinQuote := regexp.MustCompile(`(?i)[bB]'([01]+)'`)
+	sql = reBinQuote.ReplaceAllStringFunc(sql, func(m string) string {
+		inner := reBinQuote.FindStringSubmatch(m)
+		if len(inner) < 2 {
+			return m
+		}
+		binStr := inner[1]
+		n := new(big.Int)
+		n.SetString(binStr, 2)
+		// Format with byte-boundary padding: MySQL pads to full bytes
+		byteLen := (len(binStr) + 7) / 8
+		hexStr := fmt.Sprintf("%x", n)
+		// Pad to byteLen*2 hex chars
+		for len(hexStr) < byteLen*2 {
+			hexStr = "0" + hexStr
+		}
+		return "0x" + hexStr
+	})
+	// Convert 0b... binary literal to 0x... hex
+	reBin := regexp.MustCompile(`0b([01]+)`)
+	sql = reBin.ReplaceAllStringFunc(sql, func(m string) string {
+		inner := reBin.FindStringSubmatch(m)
+		if len(inner) < 2 {
+			return m
+		}
+		binStr := inner[1]
+		n := new(big.Int)
+		n.SetString(binStr, 2)
+		byteLen := (len(binStr) + 7) / 8
+		hexStr := fmt.Sprintf("%x", n)
+		for len(hexStr) < byteLen*2 {
+			hexStr = "0" + hexStr
+		}
+		return "0x" + hexStr
+	})
+	return sql
 }
 
 // showCreateView handles SHOW CREATE VIEW <viewName>.

@@ -1324,6 +1324,12 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 			}
 		}
 	}
+	// Validate WHERE clause for invalid DATE string literals against DATE columns.
+	if stmt.Where != nil && e.queryTableDef != nil {
+		if err := validateWhereForInvalidDateColumns(stmt.Where.Expr, e.queryTableDef, e.sqlMode); err != nil {
+			return nil, err
+		}
+	}
 	// If persistent stats are enabled and stats rows are missing, reading the table
 	// can regenerate stats (models InnoDB auto recalc on table open).
 	for _, fromExpr := range stmt.From {
@@ -4352,15 +4358,10 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		return vals, nil
 	}
 	// Non-aggregate: return value from representative row.
-	// For user-defined functions (FuncExpr), use exec context if available so UDFs can be resolved.
+	// Use exec context when available so that user variable assignments (@var:=expr)
+	// and UDFs are handled correctly.
 	if exec != nil {
-		if fe, ok := expr.(*sqlparser.FuncExpr); ok {
-			// Only use exec context for potential UDFs (not built-in functions)
-			qualifier := fe.Qualifier.String()
-			if result, err := exec.callUserDefinedFunction(strings.ToLower(fe.Name.String()), fe.Exprs, nil, qualifier); err == nil {
-				return result, nil
-			}
-		}
+		return exec.evalRowExpr(expr, repRow)
 	}
 	return evalRowExpr(expr, repRow)
 }

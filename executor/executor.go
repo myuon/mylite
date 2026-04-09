@@ -18253,6 +18253,210 @@ func validateWhereForInvalidDatetime(expr sqlparser.Expr) error {
 	return walkErr
 }
 
+// hasInvalidDateString checks if a string that looks like a date (YYYY-MM-DD format)
+// is actually an invalid date. Returns the invalid string and true if invalid.
+// The sqlMode parameter controls which dates are considered invalid:
+// - Without ALLOW_INVALID_DATES: rejects out-of-range months/days and zero dates (with NO_ZERO_DATE)
+// - With ALLOW_INVALID_DATES: allows day values up to 31 for any month, but rejects impossible day > 31
+// - Always rejects non-date strings that don't match date format
+func hasInvalidDateString(s string, sqlMode string) (string, bool) {
+	// Only check strings that look like dates (YYYY-MM-DD or similar)
+	// Must contain a hyphen and enough characters
+	if len(s) < 8 || !strings.ContainsRune(s, '-') {
+		// Check if it's trying to be a date but fails (e.g., "wrong-date")
+		// A string with '-' but not parseable as date
+		if strings.ContainsRune(s, '-') {
+			return s, true
+		}
+		return "", false
+	}
+
+	allowInvalidDates := strings.Contains(sqlMode, "ALLOW_INVALID_DATES")
+	isNoZeroDate := strings.Contains(sqlMode, "NO_ZERO_DATE") || strings.Contains(sqlMode, "TRADITIONAL")
+
+	// Strip time part if present
+	datePart := s
+	if idx := strings.IndexByte(s, ' '); idx >= 0 {
+		datePart = s[:idx]
+	}
+	if idx := strings.IndexByte(s, 'T'); idx >= 0 {
+		datePart = s[:idx]
+	}
+
+	// Parse YYYY-MM-DD
+	parts := strings.Split(datePart, "-")
+	if len(parts) != 3 {
+		// Not a recognizable date format - it's invalid
+		return s, true
+	}
+
+	yStr := strings.TrimSpace(parts[0])
+	mStr := strings.TrimSpace(parts[1])
+	dStr := strings.TrimSpace(parts[2])
+
+	// Validate all parts are numeric
+	for _, c := range yStr {
+		if c < '0' || c > '9' {
+			return s, true
+		}
+	}
+	for _, c := range mStr {
+		if c < '0' || c > '9' {
+			return s, true
+		}
+	}
+	for _, c := range dStr {
+		if c < '0' || c > '9' {
+			return s, true
+		}
+	}
+
+	y, _ := strconv.Atoi(yStr)
+	m, _ := strconv.Atoi(mStr)
+	d, _ := strconv.Atoi(dStr)
+
+	// Check for zero date (0000-00-00)
+	if y == 0 && m == 0 && d == 0 {
+		if isNoZeroDate {
+			return s, true
+		}
+		return "", false
+	}
+
+	if allowInvalidDates {
+		// In ALLOW_INVALID_DATES: allow zero month/day and any day 0-31
+		// Only reject impossible values like month > 12 or day > 31
+		if m > 12 {
+			return s, true
+		}
+		if d > 31 {
+			return s, true
+		}
+		return "", false
+	}
+
+	// Check month range (strict mode)
+	if m < 1 || m > 12 {
+		return s, true
+	}
+
+	// Check for partial zero dates (zero month or day) in strict modes
+	isNoZeroInDate := strings.Contains(sqlMode, "NO_ZERO_IN_DATE") || strings.Contains(sqlMode, "TRADITIONAL")
+	if m == 0 || d == 0 {
+		if isNoZeroInDate {
+			return s, true
+		}
+		return "", false
+	}
+
+	// Standard mode: check exact day range per month
+	if d < 1 {
+		return s, true
+	}
+	daysInMonth := [13]int{0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
+	maxDay := daysInMonth[m]
+	if m == 2 && isLeapYear(y) {
+		maxDay = 29
+	}
+	if d > maxDay {
+		return s, true
+	}
+
+	return "", false
+}
+
+// validateWhereForInvalidDateColumns walks a WHERE expression and checks for invalid date
+// string literals used in comparisons against DATE/DATETIME columns.
+// Returns error 1292 if an invalid DATE is found.
+func validateWhereForInvalidDateColumns(expr sqlparser.Expr, tableDef *catalog.TableDef, sqlMode string) error {
+	if expr == nil {
+		return nil
+	}
+	if tableDef == nil {
+		return nil
+	}
+
+	// Build a map of column name -> type for quick lookup
+	colTypes := make(map[string]string, len(tableDef.Columns))
+	for _, col := range tableDef.Columns {
+		colTypes[strings.ToLower(col.Name)] = strings.ToUpper(col.Type)
+	}
+
+	var walkErr error
+	sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if walkErr != nil {
+			return false, nil
+		}
+		comp, ok := node.(*sqlparser.ComparisonExpr)
+		if !ok {
+			return true, nil
+		}
+		// Only check ordered comparisons (< > <= >=) and equality
+		switch comp.Operator {
+		case sqlparser.LessThanOp, sqlparser.GreaterThanOp, sqlparser.LessEqualOp,
+			sqlparser.GreaterEqualOp, sqlparser.EqualOp, sqlparser.NotEqualOp:
+		default:
+			return true, nil
+		}
+
+		// Helper to check if an expression is a DATE/DATETIME column
+		isDateCol := func(e sqlparser.Expr) bool {
+			col, ok := e.(*sqlparser.ColName)
+			if !ok {
+				return false
+			}
+			colName := strings.ToLower(col.Name.String())
+			colType, exists := colTypes[colName]
+			if !exists {
+				return false
+			}
+			return colType == "DATE" || strings.HasPrefix(colType, "DATETIME") || strings.HasPrefix(colType, "TIMESTAMP")
+		}
+
+		// Check: date_col op string_literal
+		var strLit string
+		var hasStrLit bool
+		var isDateColumn bool
+
+		if lit, ok := comp.Right.(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
+			if isDateCol(comp.Left) {
+				strLit = lit.Val
+				hasStrLit = true
+				isDateColumn = true
+			}
+		}
+		if !hasStrLit {
+			if lit, ok := comp.Left.(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
+				if isDateCol(comp.Right) {
+					strLit = lit.Val
+					hasStrLit = true
+					isDateColumn = true
+				}
+			}
+		}
+
+		if hasStrLit && isDateColumn {
+			// Check if this string looks like a date but is invalid
+			// First check: does it look like a datetime (has both date and time components)?
+			if strings.ContainsRune(strLit, ' ') && strings.ContainsRune(strLit, ':') {
+				// Let the existing DATETIME validator handle this
+				if invalidStr, invalid := hasInvalidTimeComponent(strLit); invalid {
+					walkErr = mysqlError(1292, "HY000", fmt.Sprintf("Incorrect DATETIME value: '%s'", invalidStr))
+					return false, nil
+				}
+			}
+			// Check as a DATE string
+			if invalidStr, invalid := hasInvalidDateString(strLit, sqlMode); invalid {
+				walkErr = mysqlError(1292, "HY000", fmt.Sprintf("Incorrect DATE value: '%s'", invalidStr))
+				return false, nil
+			}
+		}
+
+		return true, nil
+	}, expr)
+	return walkErr
+}
+
 // execExplainStmt handles EXPLAIN SELECT ... statements.
 // Returns a simplified explain result set for compatibility.
 func (e *Executor) execExplainStmt(s *sqlparser.ExplainStmt, query string) (*Result, error) {
@@ -18265,6 +18469,23 @@ func (e *Executor) execExplainStmt(s *sqlparser.ExplainStmt, query string) (*Res
 		if sel.Where != nil {
 			if err := validateWhereForInvalidDatetime(sel.Where.Expr); err != nil {
 				return nil, err
+			}
+		}
+		// Validate WHERE clause for invalid DATE string literals against DATE columns.
+		if sel.Where != nil && len(sel.From) > 0 {
+			if tbl, ok := sel.From[0].(*sqlparser.AliasedTableExpr); ok {
+				if tn, ok := tbl.Expr.(sqlparser.TableName); ok {
+					tableName := tn.Name.String()
+					if e.Catalog != nil {
+						if db, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
+							if td, ok := db.Tables[tableName]; ok {
+								if err := validateWhereForInvalidDateColumns(sel.Where.Expr, td, e.sqlMode); err != nil {
+									return nil, err
+								}
+							}
+						}
+					}
+				}
 			}
 		}
 	}
