@@ -476,6 +476,7 @@ func newWorker(searchPaths []string) (*worker, error) {
 	exec.DataDir = dataDir
 	exec.SearchPaths = searchPaths
 	srv := server.New(exec, addr)
+	srv.SetLogger(server.DiscardLogger())
 	go func() {
 		srv.Start() //nolint:errcheck
 	}()
@@ -572,6 +573,7 @@ func (w *worker) rebuild() {
 	w.exec.DataDir = filepath.Join(w.tmpDir, "data", "inner")
 	w.exec.SearchPaths = w.searchPaths
 	w.srv = server.New(w.exec, w.addr)
+	w.srv.SetLogger(server.DiscardLogger())
 	go w.srv.Start()
 	// Reconnect DB
 	for i := 0; i < 50; i++ {

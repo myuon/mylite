@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"runtime"
 	"net"
@@ -28,6 +29,7 @@ type Server struct {
 	mu          sync.Mutex
 	closed      bool
 	conns       map[net.Conn]struct{}
+	logger      *log.Logger
 }
 
 // SetExecutor safely replaces the server's executor under a write lock.
@@ -49,7 +51,19 @@ func New(exec *executor.Executor, addr string) *Server {
 		executor: exec,
 		Addr:     addr,
 		conns:    make(map[net.Conn]struct{}),
+		logger:   log.Default(),
 	}
+}
+
+// SetLogger replaces the server's logger. Pass a logger writing to io.Discard
+// to silence all server log output.
+func (s *Server) SetLogger(l *log.Logger) {
+	s.logger = l
+}
+
+// DiscardLogger returns a logger that discards all output.
+func DiscardLogger() *log.Logger {
+	return log.New(io.Discard, "", 0)
 }
 
 // stmtCounter is a global monotonically increasing ID for prepared statements.
@@ -287,7 +301,7 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to listen on %s: %v", s.Addr, err)
 	}
 
-	log.Printf("mylite server listening on %s", s.Addr)
+	s.logger.Printf("mylite server listening on %s", s.Addr)
 
 	for {
 		conn, err := s.listener.Accept()
@@ -299,7 +313,7 @@ func (s *Server) Start() error {
 			if closed {
 				return nil
 			}
-			log.Printf("accept error: %v", err)
+			s.logger.Printf("accept error: %v", err)
 			continue
 		}
 		s.mu.Lock()
@@ -329,7 +343,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		if r := recover(); r != nil {
 			buf := make([]byte, 4096)
 			n := runtime.Stack(buf, false)
-			log.Printf("panic in connection handler: %v\n%s", r, buf[:n])
+			s.logger.Printf("panic in connection handler: %v\n%s", r, buf[:n])
 		}
 	}()
 	connExec := s.getExecutor().Clone()
@@ -357,7 +371,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// Create a MySQL connection with no auth
 	mysqlConn, err := gomysql.NewConn(conn, "root", "", handler)
 	if err != nil {
-		log.Printf("handshake error: %v", err)
+		s.logger.Printf("handshake error: %v", err)
 		return
 	}
 	for {
