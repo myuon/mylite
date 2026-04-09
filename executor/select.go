@@ -3822,30 +3822,20 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		if count == 0 {
 			return nil, nil
 		}
-		// MySQL AVG() returns DECIMAL with max(scale+4, 4) decimal places.
-		avgScale := maxScale + 4
-		if avgScale < 4 {
-			avgScale = 4
-		}
-		// For FLOAT/DOUBLE columns (hasFloat && maxScale == 0), use float64
-		// arithmetic to match MySQL's native floating-point AVG behavior.
-		if hasFloat && maxScale == 0 {
-			avg := sumFloat / float64(count)
-			return fmt.Sprintf("%.*f", avgScale, avg), nil
-		}
-		avgRat := new(big.Rat).Quo(sumRat, new(big.Rat).SetInt64(count))
-		formatted := formatRatFixed(avgRat, avgScale)
-		// For non-DECIMAL integer values (maxScale == 0), strip trailing zeros
+		// MySQL AVG() result format depends on input type:
+		// - Plain FLOAT/DOUBLE inputs (hasFloat && maxScale==0): return float64
+		//   so it formats with shortest representation (e.g. "3" not "3.00000")
+		// - Integer inputs (maxScale==0): 5 decimal places (scale+5 with scale=0)
+		// - DECIMAL/FLOAT(M,D) inputs with scale D: D+5 decimal places
 		_ = allInt
-		if maxScale == 0 {
-			if dot := strings.Index(formatted, "."); dot >= 0 {
-				minLen := dot + 5 // at least 4 decimal places
-				for len(formatted) > minLen && formatted[len(formatted)-1] == '0' {
-					formatted = formatted[:len(formatted)-1]
-				}
-			}
+		if hasFloat && maxScale == 0 {
+			// Plain double/float arithmetic result: use shortest representation
+			return sumFloat / float64(count), nil
 		}
-		return formatted, nil
+		avgScale := maxScale + 5
+		avgRat := new(big.Rat).Quo(sumRat, new(big.Rat).SetInt64(count))
+		avgFloat, _ := avgRat.Float64()
+		return AvgResult{Value: avgFloat, Scale: avgScale}, nil
 	case *sqlparser.JSONArrayAgg:
 		arr := make([]interface{}, 0)
 		for _, row := range groupRows {
@@ -3999,7 +3989,7 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			variance += d * d
 		}
 		variance /= float64(count)
-		return fmt.Sprintf("%.10f", variance), nil
+		return variance, nil
 	case *sqlparser.VarSamp:
 		// VAR_SAMP: sample variance = sum((x - mean)^2) / (N-1)
 		arg := getAggArg(e)
@@ -4018,7 +4008,7 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			variance += d * d
 		}
 		variance /= float64(count - 1)
-		return fmt.Sprintf("%.10f", variance), nil
+		return variance, nil
 	case *sqlparser.Std, *sqlparser.StdDev, *sqlparser.StdPop:
 		// STD / STDDEV / STDDEV_POP: population std = sqrt(VAR_POP)
 		arg := getAggArg(e)
@@ -4037,7 +4027,7 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			variance += d * d
 		}
 		variance /= float64(count)
-		return fmt.Sprintf("%.10f", math.Sqrt(variance)), nil
+		return math.Sqrt(variance), nil
 	case *sqlparser.StdSamp:
 		// STDDEV_SAMP: sample std = sqrt(VAR_SAMP)
 		arg := getAggArg(e)
@@ -4056,7 +4046,7 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			variance += d * d
 		}
 		variance /= float64(count - 1)
-		return fmt.Sprintf("%.10f", math.Sqrt(variance)), nil
+		return math.Sqrt(variance), nil
 	case *sqlparser.ComparisonExpr:
 		// Handle IN / NOT IN with right side ValTuple (including row-IN-tuple-of-tuples)
 		if e.Operator == sqlparser.InOp || e.Operator == sqlparser.NotInOp {

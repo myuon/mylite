@@ -1233,7 +1233,7 @@ func (e *Executor) evalTrimFuncExpr(v *sqlparser.TrimFuncExpr) (interface{}, err
 		return strings.TrimRight(s, " \t\n\r"), nil
 	default: // NormalTrimType
 		if v.TrimArg != nil {
-			// TRIM(trimChar FROM str) - trim specific char
+			// TRIM(trimStr FROM str) - trim specific substring (not character set)
 			trimVal, err := e.evalExpr(v.TrimArg)
 			if err != nil {
 				return nil, err
@@ -1241,14 +1241,37 @@ func (e *Executor) evalTrimFuncExpr(v *sqlparser.TrimFuncExpr) (interface{}, err
 			trimStr := toString(trimVal)
 			switch v.Type {
 			case sqlparser.LeadingTrimType:
-				return strings.TrimLeft(s, trimStr), nil
+				// Remove trimStr prefix repeatedly
+				for trimStr != "" && strings.HasPrefix(s, trimStr) {
+					s = s[len(trimStr):]
+				}
+				return s, nil
 			case sqlparser.TrailingTrimType:
-				return strings.TrimRight(s, trimStr), nil
+				// Remove trimStr suffix repeatedly
+				for trimStr != "" && strings.HasSuffix(s, trimStr) {
+					s = s[:len(s)-len(trimStr)]
+				}
+				return s, nil
 			default: // Both
-				return strings.Trim(s, trimStr), nil
+				// Remove trimStr prefix and suffix repeatedly
+				for trimStr != "" && strings.HasPrefix(s, trimStr) {
+					s = s[len(trimStr):]
+				}
+				for trimStr != "" && strings.HasSuffix(s, trimStr) {
+					s = s[:len(s)-len(trimStr)]
+				}
+				return s, nil
 			}
 		}
-		return strings.TrimSpace(s), nil
+		// No trimStr: trim spaces based on type
+		switch v.Type {
+		case sqlparser.LeadingTrimType:
+			return strings.TrimLeft(s, " "), nil
+		case sqlparser.TrailingTrimType:
+			return strings.TrimRight(s, " "), nil
+		default: // Both or unspecified
+			return strings.TrimSpace(s), nil
+		}
 	}
 }
 

@@ -422,6 +422,10 @@ type Executor struct {
 	// since last OPTIMIZE TABLE. OPTIMIZE TABLE returns "OK" when in this set,
 	// "Table is already up to date" otherwise.
 	tableNeedsOptimize map[string]bool
+	// tableAnalyzed tracks non-InnoDB tables whose statistics are known to be current
+	// (ANALYZE TABLE was run, or CREATE INDEX which computes stats automatically).
+	// When set and no pending changes exist, ANALYZE TABLE returns "Table is already up to date".
+	tableAnalyzed map[string]bool
 	// Sort statistics: incremented when ORDER BY operations are performed.
 	sortRows  int64 // total rows sorted
 	sortRange int64 // sort operations using range scan
@@ -5296,9 +5300,14 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 	eqCols := map[string]bool{}
 	rangeCols := map[string]bool{}
 	nullCols := map[string]bool{}
+	// nonNullEqCols tracks columns with non-null equality conditions (col = value, not IS NULL)
+	nonNullEqCols := map[string]bool{}
 	for _, wc := range whereCols {
 		if wc.isEquality {
 			eqCols[strings.ToLower(wc.column)] = true
+			if !wc.isNull {
+				nonNullEqCols[strings.ToLower(wc.column)] = true
+			}
 		}
 		if wc.isRange {
 			rangeCols[strings.ToLower(wc.column)] = true
@@ -5458,7 +5467,16 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 		}
 	}
 
-	if best.matchedEq > 0 && hasNullCondition {
+	// Check if there's a non-null equality condition on the best index column
+	// ref_or_null requires BOTH a non-null equality AND a null condition (col = val OR col IS NULL)
+	hasNonNullEqOnIndex := false
+	for _, c := range best.index.Columns {
+		if nonNullEqCols[strings.ToLower(c)] {
+			hasNonNullEqOnIndex = true
+			break
+		}
+	}
+	if best.matchedEq > 0 && hasNullCondition && hasNonNullEqOnIndex {
 		result.accessType = "ref_or_null"
 		refs := make([]string, best.matchedEq)
 		for i := range refs {
@@ -7140,18 +7158,23 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			fullName := dbName + "." + tblName
 			_, isSelect := s.Rows.(*sqlparser.Select)
 			_, isUnion := s.Rows.(*sqlparser.Union)
-			if !(isSelect || isUnion) {
-				// VALUES-based insert: mark non-InnoDB table as needing analyze.
-				if dbObj, dbErr := e.Catalog.GetDatabase(dbName); dbErr == nil {
-					if tblDef, tblErr := dbObj.GetTable(tblName); tblErr == nil && tblDef != nil {
-						eng := strings.ToUpper(tblDef.Engine)
-						// Only track for non-InnoDB, non-MEMORY engines.
-						// InnoDB always returns "OK" from ANALYZE TABLE regardless.
-						if eng != "" && eng != "INNODB" && eng != "MEMORY" && eng != "HEAP" {
+			if dbObj, dbErr := e.Catalog.GetDatabase(dbName); dbErr == nil {
+				if tblDef, tblErr := dbObj.GetTable(tblName); tblErr == nil && tblDef != nil {
+					eng := strings.ToUpper(tblDef.Engine)
+					// Only track for non-InnoDB, non-MEMORY engines.
+					// InnoDB always returns "OK" from ANALYZE TABLE regardless.
+					if eng != "" && eng != "INNODB" && eng != "MEMORY" && eng != "HEAP" {
+						if !(isSelect || isUnion) {
+							// VALUES-based insert: mark table as needing optimize.
 							if e.tableNeedsOptimize == nil {
 								e.tableNeedsOptimize = map[string]bool{}
 							}
 							e.tableNeedsOptimize[fullName] = true
+						}
+						// All inserts (including INSERT SELECT) clear the analyzed flag
+						// since data has changed and stats may be stale.
+						if e.tableAnalyzed != nil {
+							delete(e.tableAnalyzed, fullName)
 						}
 					}
 				}
@@ -7197,6 +7220,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 									e.tableNeedsAnalyze = map[string]bool{}
 								}
 								e.tableNeedsAnalyze[fullName] = true
+								// Clear analyzed flag since data changed.
+								if e.tableAnalyzed != nil {
+									delete(e.tableAnalyzed, fullName)
+								}
 							}
 						}
 					}
@@ -7225,6 +7252,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 									e.tableNeedsAnalyze = map[string]bool{}
 								}
 								e.tableNeedsAnalyze[fullName] = true
+								// Clear analyzed flag since data changed.
+								if e.tableAnalyzed != nil {
+									delete(e.tableAnalyzed, fullName)
+								}
 							}
 						}
 					}
@@ -7241,14 +7272,54 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 				dbName = s.Table.Qualifier.String()
 			}
 			fullName := dbName + "." + s.Table.Name.String()
-			if e.tableNeedsAnalyze == nil {
-				e.tableNeedsAnalyze = map[string]bool{}
+			tblName := s.Table.Name.String()
+
+			// Check if the ALTER TABLE only adds indexes (ADD INDEX / CREATE INDEX).
+			// For non-InnoDB tables: ADD INDEX already computes stats, so subsequent
+			// ANALYZE TABLE should return "Table is already up to date".
+			onlyAddsIndexes := len(s.AlterOptions) > 0
+			for _, opt := range s.AlterOptions {
+				switch opt.(type) {
+				case *sqlparser.AddIndexDefinition, *sqlparser.AddConstraintDefinition:
+					// These are index additions: stats computed during creation
+				default:
+					onlyAddsIndexes = false
+				}
 			}
-			e.tableNeedsAnalyze[fullName] = true
-			if e.tableNeedsOptimize == nil {
-				e.tableNeedsOptimize = map[string]bool{}
+
+			// Determine engine of the affected table.
+			alterEng := ""
+			if dbObj, dbErr := e.Catalog.GetDatabase(dbName); dbErr == nil {
+				if tblDef, tblErr := dbObj.GetTable(tblName); tblErr == nil && tblDef != nil {
+					alterEng = strings.ToUpper(tblDef.Engine)
+				}
 			}
-			e.tableNeedsOptimize[fullName] = true
+			isNonInnoDB := alterEng != "" && alterEng != "INNODB" && alterEng != "MEMORY" && alterEng != "HEAP"
+
+			if onlyAddsIndexes && isNonInnoDB {
+				// ADD INDEX on non-InnoDB (e.g., MyISAM) computes stats during creation.
+				// Clear the optimize flag so ANALYZE TABLE returns "Table is already up to date".
+				if e.tableNeedsOptimize != nil {
+					delete(e.tableNeedsOptimize, fullName)
+				}
+				if e.tableNeedsAnalyze != nil {
+					delete(e.tableNeedsAnalyze, fullName)
+				}
+				// Mark as analyzed since CREATE INDEX computes stats.
+				if e.tableAnalyzed == nil {
+					e.tableAnalyzed = map[string]bool{}
+				}
+				e.tableAnalyzed[fullName] = true
+			} else {
+				if e.tableNeedsAnalyze == nil {
+					e.tableNeedsAnalyze = map[string]bool{}
+				}
+				e.tableNeedsAnalyze[fullName] = true
+				if e.tableNeedsOptimize == nil {
+					e.tableNeedsOptimize = map[string]bool{}
+				}
+				e.tableNeedsOptimize[fullName] = true
+			}
 		}
 		return res, err
 	case *sqlparser.Show:
@@ -7416,17 +7487,28 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 					}
 					needsAnalyze := e.tableNeedsAnalyze != nil && e.tableNeedsAnalyze[fullName]
 					needsOptimize := e.tableNeedsOptimize != nil && e.tableNeedsOptimize[fullName]
+					alreadyAnalyzed := e.tableAnalyzed != nil && e.tableAnalyzed[fullName]
 					// ANALYZE TABLE returns "OK" for InnoDB (always), SPATIAL-indexed tables,
-					// or when there are pending stats updates (ALTER TABLE, INSERT, DELETE).
-					if eng == "" || eng == "INNODB" || hasSpatial || needsAnalyze || needsOptimize {
+					// or when there are pending stats updates (ALTER TABLE, INSERT, DELETE),
+					// or when the table has never been analyzed (stats unknown).
+					// For non-InnoDB: returns "Table is already up to date" only if stats are
+					// known to be current (tableAnalyzed flag set) and no pending changes.
+					isInnoDB := eng == "" || eng == "INNODB"
+					if isInnoDB || hasSpatial || needsAnalyze || needsOptimize || !alreadyAnalyzed {
 						msgText = "OK"
 					}
-					// Clear both flags after analyze
+					// Clear both flags after analyze and mark as analyzed
 					if e.tableNeedsAnalyze != nil {
 						delete(e.tableNeedsAnalyze, fullName)
 					}
 					if e.tableNeedsOptimize != nil {
 						delete(e.tableNeedsOptimize, fullName)
+					}
+					if !isInnoDB {
+						if e.tableAnalyzed == nil {
+							e.tableAnalyzed = map[string]bool{}
+						}
+						e.tableAnalyzed[fullName] = true
 					}
 				}
 			}
@@ -11436,7 +11518,8 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		return e.buildGeometryFromExprs(v.PolygonParams, extractPolygonCoords, "MULTIPOLYGON")
 	case *sqlparser.CharExpr:
 		// CHAR(N1, N2, ...) — convert integers to characters
-		var sb strings.Builder
+		// MySQL outputs the minimum number of bytes needed for each value.
+		var result []byte
 		for _, argExpr := range v.Exprs {
 			val, err := e.evalExpr(argExpr)
 			if err != nil {
@@ -11445,12 +11528,20 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			if val == nil {
 				continue
 			}
-			n := toInt64(val)
-			if n >= 0 && n <= 255 {
-				sb.WriteByte(byte(n))
+			n := uint64(toInt64(val))
+			if n == 0 {
+				result = append(result, 0)
+			} else if n <= 0xFF {
+				result = append(result, byte(n))
+			} else if n <= 0xFFFF {
+				result = append(result, byte(n>>8), byte(n))
+			} else if n <= 0xFFFFFF {
+				result = append(result, byte(n>>16), byte(n>>8), byte(n))
+			} else {
+				result = append(result, byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
 			}
 		}
-		return sb.String(), nil
+		return string(result), nil
 	case *sqlparser.CollateExpr:
 		// Ignore COLLATE clause and evaluate inner expression
 		return e.evalExpr(v.Expr)
@@ -11768,8 +11859,8 @@ func (e *Executor) evalInsertExpr(v *sqlparser.InsertExpr) (interface{}, error) 
 	newStr := toString(newStrVal)
 
 	// MySQL INSERT() uses 1-based positions
-	// If pos < 1 or pos > len(str)+1, return original string
-	if pos < 1 || pos > len(str)+1 {
+	// If pos < 1 or pos > len(str), return original string
+	if pos < 1 || pos > len(str) {
 		return string(str), nil
 	}
 
@@ -12142,6 +12233,32 @@ func mysqlWeekFull(t time.Time, mode int64) int64 {
 	return int64((yday-firstSunday)/7 + 1)
 }
 
+// mysqlWeekYearFull returns (year, week) for a given mode.
+// This is used by DATE_FORMAT %x/%X to get the year the week belongs to.
+func mysqlWeekYearFull(t time.Time, mode int64) (int, int64) {
+	week := mysqlWeekFull(t, mode)
+	year := t.Year()
+	if week == 0 {
+		// Week 0 means date belongs to last week of previous year
+		year--
+		prevDec31 := time.Date(year, 12, 31, 0, 0, 0, 0, time.UTC)
+		week = mysqlWeekFull(prevDec31, mode)
+		return year, week
+	}
+	// For ISO-like modes (3, 7 with Monday-first), use Go's ISOWeek for the year
+	// since it correctly handles the year boundary
+	if mode == 3 {
+		isoYear, _ := t.ISOWeek()
+		return isoYear, week
+	}
+	// For other modes, check if the week belongs to the next calendar year
+	// (e.g., Dec 31 could be week 1 of next year)
+	if week == 1 && int(t.Month()) == 12 && t.Day() >= 29 {
+		year++
+	}
+	return year, week
+}
+
 // isBinaryExpr checks whether an expression references a BINARY or VARBINARY column.
 // This is used to make UPPER/LOWER no-ops on binary data, matching MySQL behavior.
 func (e *Executor) isBinaryExpr(expr sqlparser.Expr) bool {
@@ -12254,6 +12371,39 @@ func parseDateTimeValue(val interface{}) (time.Time, error) {
 	for _, f := range formats {
 		if t, err := time.Parse(f, s); err == nil {
 			return t, nil
+		}
+	}
+	// Try to parse YYYYMMDDHHMMSS or YYMMDDHHMMSS format (all-digit, no separators)
+	isAllDigits := true
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			isAllDigits = false
+			break
+		}
+	}
+	if isAllDigits {
+		switch len(s) {
+		case 14: // YYYYMMDDHHMMSS
+			y, _ := strconv.Atoi(s[:4])
+			mo, _ := strconv.Atoi(s[4:6])
+			d, _ := strconv.Atoi(s[6:8])
+			h, _ := strconv.Atoi(s[8:10])
+			mi, _ := strconv.Atoi(s[10:12])
+			sec, _ := strconv.Atoi(s[12:14])
+			if mo >= 1 && mo <= 12 && d >= 1 && d <= 31 {
+				return time.Date(y, time.Month(mo), d, h, mi, sec, 0, time.UTC), nil
+			}
+		case 12: // YYMMDDHHMMSS
+			yy, _ := strconv.Atoi(s[:2])
+			mo, _ := strconv.Atoi(s[2:4])
+			d, _ := strconv.Atoi(s[4:6])
+			h, _ := strconv.Atoi(s[6:8])
+			mi, _ := strconv.Atoi(s[8:10])
+			sec, _ := strconv.Atoi(s[10:12])
+			y := convert2DigitYear(yy)
+			if mo >= 1 && mo <= 12 && d >= 1 && d <= 31 {
+				return time.Date(y, time.Month(mo), d, h, mi, sec, 0, time.UTC), nil
+			}
 		}
 	}
 	// Try to parse using parseMySQLDateValue for various formats (2-digit year, delimiters, etc.)
@@ -12766,8 +12916,41 @@ func mysqlDateFormat(t time.Time, format string, locale ...string) string {
 				sb.WriteString(getWeekdayName(mysqlAdjustedWeekday(t)))
 			case 'w':
 				sb.WriteString(fmt.Sprintf("%d", mysqlAdjustedWeekday(t)))
+			case 'D':
+				// Day of month with ordinal suffix (1st, 2nd, 3rd, 4th, ...)
+				day := t.Day()
+				var suffix string
+				switch day {
+				case 11, 12, 13:
+					suffix = "th"
+				default:
+					switch day % 10 {
+					case 1:
+						suffix = "st"
+					case 2:
+						suffix = "nd"
+					case 3:
+						suffix = "rd"
+					default:
+						suffix = "th"
+					}
+				}
+				sb.WriteString(fmt.Sprintf("%d%s", day, suffix))
+			case 'f':
+				// Microseconds (000000-999999)
+				sb.WriteString(fmt.Sprintf("%06d", t.Nanosecond()/1000))
 			case 'j':
-				sb.WriteString(fmt.Sprintf("%d", t.YearDay()))
+				sb.WriteString(fmt.Sprintf("%03d", t.YearDay()))
+			case 'k':
+				// Hour in 24h format without leading zero (0-23)
+				sb.WriteString(fmt.Sprintf("%d", t.Hour()))
+			case 'l':
+				// Hour in 12h format without leading zero (1-12)
+				h := t.Hour() % 12
+				if h == 0 {
+					h = 12
+				}
+				sb.WriteString(fmt.Sprintf("%d", h))
 			case 'M':
 				sb.WriteString(getMonthName(t.Month()))
 			case 'b':
@@ -12776,6 +12959,26 @@ func mysqlDateFormat(t time.Time, format string, locale ...string) string {
 				sb.WriteString(t.Format("15:04:05"))
 			case 'r':
 				sb.WriteString(t.Format("03:04:05 PM"))
+			case 'U':
+				// Week number (00-53), Sunday is first day of week (mode 0)
+				sb.WriteString(fmt.Sprintf("%02d", mysqlWeekFull(t, 0)))
+			case 'u':
+				// Week number (00-53), Monday is first day of week (mode 1)
+				sb.WriteString(fmt.Sprintf("%02d", mysqlWeekFull(t, 1)))
+			case 'V':
+				// Week number (01-53), Sunday is first day of week (mode 2)
+				sb.WriteString(fmt.Sprintf("%02d", mysqlWeekFull(t, 2)))
+			case 'v':
+				// Week number (01-53), Monday is first day of week (mode 3, ISO)
+				sb.WriteString(fmt.Sprintf("%02d", mysqlWeekFull(t, 3)))
+			case 'X':
+				// Year for the week where Sunday is first day (mode 2)
+				isoY, _ := mysqlWeekYearFull(t, 2)
+				sb.WriteString(fmt.Sprintf("%04d", isoY))
+			case 'x':
+				// Year for the week where Monday is first day (mode 3, ISO)
+				isoY, _ := mysqlWeekYearFull(t, 3)
+				sb.WriteString(fmt.Sprintf("%04d", isoY))
 			case '%':
 				sb.WriteByte('%')
 			default:
@@ -13813,6 +14016,19 @@ func (d DivisionResult) String() string {
 	return fmt.Sprintf("%.*f", d.Precision, d.Value)
 }
 
+// AvgResult wraps the float64 result of AVG() with its display scale.
+// It carries a Scale for formatted display, but contributes scale=0 to
+// arithmetic expressions (so that e.g. avg(a)+count(a) does not force
+// decimal-padded output on the sum).
+type AvgResult struct {
+	Value float64
+	Scale int
+}
+
+func (a AvgResult) String() string {
+	return fmt.Sprintf("%.*f", a.Scale, a.Value)
+}
+
 // valueScale returns the number of decimal digits in a value.
 // Used to compute division result precision per MySQL rules.
 func valueScale(v interface{}) int {
@@ -13827,11 +14043,14 @@ func valueScale(v interface{}) int {
 		return val.Scale
 	case DivisionResult:
 		return val.Precision
+	case AvgResult:
+		// AvgResult contributes scale=0 to arithmetic to avoid forcing
+		// decimal-padded output on expressions involving AVG.
+		return 0
 	case float64:
-		s := strconv.FormatFloat(val, 'f', -1, 64)
-		if idx := strings.Index(s, "."); idx >= 0 {
-			return len(s) - idx - 1
-		}
+		// Float64 values (from DOUBLE/FLOAT columns or function results) contribute
+		// scale=0 to arithmetic so that DOUBLE arithmetic yields DOUBLE (not fixed
+		// decimal) results. This matches MySQL behavior where DOUBLE+DOUBLE=DOUBLE.
 		return 0
 	case float32:
 		s := strconv.FormatFloat(float64(val), 'f', -1, 32)
@@ -13875,25 +14094,29 @@ func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator, di
 			li, lIsI64 := left.(int64)
 			ri, rIsI64 := right.(int64)
 			if lIsU64 || rIsU64 {
-				var lv, rv uint64
-				if lIsU64 {
-					lv = lu
-				} else if lIsI64 {
-					lv = uint64(li)
-				} else {
-					lv = 0
+				// Only use integer arithmetic when both sides are int64 or uint64.
+				// If either side is float64, AvgResult, or other numeric type,
+				// fall through to float arithmetic to avoid precision loss.
+				lKnown := lIsU64 || lIsI64
+				rKnown := rIsU64 || rIsI64
+				if lKnown && rKnown {
+					var lv, rv uint64
+					if lIsU64 {
+						lv = lu
+					} else {
+						lv = uint64(li)
+					}
+					if rIsU64 {
+						rv = ru
+					} else {
+						rv = uint64(ri)
+					}
+					if op == sqlparser.PlusOp {
+						return lv + rv, nil
+					}
+					return lv - rv, nil
 				}
-				if rIsU64 {
-					rv = ru
-				} else if rIsI64 {
-					rv = uint64(ri)
-				} else {
-					rv = 0
-				}
-				if op == sqlparser.PlusOp {
-					return lv + rv, nil
-				}
-				return lv - rv, nil
+				// Fall through to float arithmetic if either side is non-integer
 			}
 			// Both int64: use integer arithmetic to avoid float precision loss.
 			// Only do this when the result fits in int64 (no overflow).
@@ -14097,6 +14320,8 @@ func toString(v interface{}) string {
 		return formatMySQLFloatString(val.Value)
 	case DivisionResult:
 		return fmt.Sprintf("%.*f", val.Precision, val.Value)
+	case AvgResult:
+		return fmt.Sprintf("%.*f", val.Scale, val.Value)
 	case bool:
 		if val {
 			return "1"
@@ -14192,6 +14417,8 @@ func toInt64(v interface{}) int64 {
 		return int64(n.Value)
 	case DivisionResult:
 		return int64(n.Value)
+	case AvgResult:
+		return int64(n.Value)
 	case HexBytes:
 		decoded, err := hex.DecodeString(string(n))
 		if err != nil || len(decoded) == 0 {
@@ -14230,6 +14457,8 @@ func toUint64(v interface{}) uint64 {
 	case float64:
 		return uint64(int64(n))
 	case DivisionResult:
+		return uint64(int64(n.Value))
+	case AvgResult:
 		return uint64(int64(n.Value))
 	case HexBytes:
 		decoded, err := hex.DecodeString(string(n))
@@ -14282,6 +14511,8 @@ func isTruthy(v interface{}) bool {
 	case ScaledValue:
 		return val.Value != 0
 	case DivisionResult:
+		return val.Value != 0
+	case AvgResult:
 		return val.Value != 0
 	case string:
 		return val != "" && val != "0"
@@ -15018,7 +15249,8 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		return val, err
 	case *sqlparser.CharExpr:
 		// CHAR(N1, N2, ...) with row context
-		var sb strings.Builder
+		// MySQL outputs the minimum number of bytes needed for each value.
+		var result []byte
 		for _, argExpr := range v.Exprs {
 			val, err := e.evalRowExpr(argExpr, row)
 			if err != nil {
@@ -15027,12 +15259,20 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			if val == nil {
 				continue
 			}
-			n := toInt64(val)
-			if n >= 0 && n <= 255 {
-				sb.WriteByte(byte(n))
+			n := uint64(toInt64(val))
+			if n == 0 {
+				result = append(result, 0)
+			} else if n <= 0xFF {
+				result = append(result, byte(n))
+			} else if n <= 0xFFFF {
+				result = append(result, byte(n>>8), byte(n))
+			} else if n <= 0xFFFFFF {
+				result = append(result, byte(n>>16), byte(n>>8), byte(n))
+			} else {
+				result = append(result, byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
 			}
 		}
-		return sb.String(), nil
+		return string(result), nil
 	case *sqlparser.CollateExpr:
 		// Ignore COLLATE and evaluate inner expression with row context
 		return e.evalRowExpr(v.Expr, row)
@@ -16279,6 +16519,13 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 	if sd, ok := right.(SysVarDouble); ok {
 		right = sd.Value
 	}
+	// Unwrap AvgResult to plain float64 for comparison purposes.
+	if ar, ok := left.(AvgResult); ok {
+		left = ar.Value
+	}
+	if ar, ok := right.(AvgResult); ok {
+		right = ar.Value
+	}
 	// NULL-safe equal (<=>): true if both NULL, false if one is NULL, otherwise normal equality.
 	if op == sqlparser.NullSafeEqualOp {
 		if left == nil && right == nil {
@@ -16698,10 +16945,14 @@ func soundex(s string) string {
 	}
 	result = append(result, upper[firstIdx])
 	lastCode := code[upper[firstIdx]]
-	for i := firstIdx + 1; i < len(upper) && len(result) < 4; i++ {
+	// MySQL SOUNDEX: non-alpha chars (spaces, numbers, punctuation) do NOT reset adjacency.
+	// Only vowels/H/W/Y (letters without a soundex code) are skipped without resetting.
+	// All consonants with the same soundex code as the previous are skipped.
+	// MySQL does not limit the result to 4 characters.
+	for i := firstIdx + 1; i < len(upper); i++ {
 		c := upper[i]
 		if c < 'A' || c > 'Z' {
-			lastCode = 0
+			// Non-letter: skip without resetting lastCode
 			continue
 		}
 		if d, ok := code[c]; ok {
@@ -16710,8 +16961,7 @@ func soundex(s string) string {
 				lastCode = d
 			}
 		} else {
-			// A, E, I, O, U, H, W, Y — not coded but reset adjacency
-			lastCode = 0
+			// A, E, I, O, U, H, W, Y — not coded, skip but do NOT reset adjacency
 		}
 	}
 	for len(result) < 4 {
@@ -17198,6 +17448,8 @@ func toFloat(v interface{}) float64 {
 	case ScaledValue:
 		return n.Value
 	case DivisionResult:
+		return n.Value
+	case AvgResult:
 		return n.Value
 	case HexBytes:
 		// Interpret hex digits as big-endian unsigned integer.

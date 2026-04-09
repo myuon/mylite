@@ -155,7 +155,7 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 		}
 		return string(data), true, nil
 	case "char":
-		var sb strings.Builder
+		var result []byte
 		for _, argExpr := range v.Exprs {
 			val, err := e.evalExprMaybeRow(argExpr, row)
 			if err != nil {
@@ -164,12 +164,21 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 			if val == nil {
 				continue
 			}
-			n := toInt64(val)
-			if n >= 0 && n <= 255 {
-				sb.WriteByte(byte(n))
+			n := uint64(toInt64(val))
+			// MySQL CHAR() outputs the minimum number of bytes needed for the value
+			if n == 0 {
+				result = append(result, 0)
+			} else if n <= 0xFF {
+				result = append(result, byte(n))
+			} else if n <= 0xFFFF {
+				result = append(result, byte(n>>8), byte(n))
+			} else if n <= 0xFFFFFF {
+				result = append(result, byte(n>>16), byte(n>>8), byte(n))
+			} else {
+				result = append(result, byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
 			}
 		}
-		return sb.String(), true, nil
+		return string(result), true, nil
 	case "substring", "substr", "mid":
 		if len(v.Exprs) < 2 {
 			return nil, true, fmt.Errorf("SUBSTRING requires at least 2 arguments")
@@ -263,7 +272,12 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 		if strVal == nil || fromVal == nil || toVal == nil {
 			return nil, true, nil
 		}
-		return strings.ReplaceAll(toString(strVal), toString(fromVal), toString(toVal)), true, nil
+		fromStr := toString(fromVal)
+		if fromStr == "" {
+			// MySQL REPLACE returns original string when search string is empty
+			return toString(strVal), true, nil
+		}
+		return strings.ReplaceAll(toString(strVal), fromStr, toString(toVal)), true, nil
 	case "left":
 		if len(v.Exprs) < 2 {
 			return nil, true, fmt.Errorf("LEFT requires 2 arguments")
@@ -282,6 +296,9 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 				return nil, true, nil
 			}
 			return nil, true, err
+		}
+		if lenVal == nil {
+			return nil, true, nil
 		}
 		s := []rune(toString(strVal))
 		n := int(toInt64(lenVal))
@@ -310,6 +327,9 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 				return nil, true, nil
 			}
 			return nil, true, err
+		}
+		if lenVal == nil {
+			return nil, true, nil
 		}
 		s := []rune(toString(strVal))
 		n := int(toInt64(lenVal))
@@ -346,7 +366,12 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 		if isNull {
 			return nil, true, nil
 		}
-		decoded, err := hex.DecodeString(toString(val))
+		hexStr := toString(val)
+		// MySQL pads odd-length hex strings with a leading zero
+		if len(hexStr)%2 != 0 {
+			hexStr = "0" + hexStr
+		}
+		decoded, err := hex.DecodeString(hexStr)
 		if err != nil {
 			return nil, true, nil
 		}
@@ -620,24 +645,44 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 		siS := toString(siStr)
 		siD := toString(siDelim)
 		siN64 := toInt64(siCnt)
-		siParts := strings.Split(siS, siD)
-		siPartsLen := int64(len(siParts))
+		if siD == "" {
+			// MySQL returns empty string when delimiter is empty
+			return "", true, nil
+		}
 		if siN64 >= 0 {
-			if siN64 >= siPartsLen {
+			// Positive count: find N-th occurrence of delimiter from left
+			count := int(siN64)
+			if count == 0 {
+				return "", true, nil
+			}
+			pos := 0
+			for i := 0; i < count; i++ {
+				idx := strings.Index(siS[pos:], siD)
+				if idx < 0 {
+					// Fewer than count occurrences: return the whole string
+					return siS, true, nil
+				}
+				pos += idx + len(siD)
+			}
+			// Return everything before the N-th delimiter
+			return siS[:pos-len(siD)], true, nil
+		}
+		// Negative count: scan from the right
+		// Find the |N|-th occurrence from the right by reverse scanning
+		siAbs := -int(siN64)
+		if siN64 == -1<<63 {
+			siAbs = len(siS) // overflow guard
+		}
+		pos := len(siS)
+		for i := 0; i < siAbs; i++ {
+			// Search for delimiter ending at pos
+			idx := strings.LastIndex(siS[:pos], siD)
+			if idx < 0 {
 				return siS, true, nil
 			}
-			return strings.Join(siParts[:siN64], siD), true, nil
+			pos = idx
 		}
-		// Negative count: take from the end
-		siAbs := -siN64
-		// Guard against overflow (e.g. INT64_MIN)
-		if siAbs < 0 {
-			siAbs = siPartsLen
-		}
-		if siAbs >= siPartsLen {
-			return siS, true, nil
-		}
-		return strings.Join(siParts[siPartsLen-siAbs:], siD), true, nil
+		return siS[pos+len(siD):], true, nil
 	case "soundex":
 		val, isNull, err := e.evalArg1(v.Exprs, "SOUNDEX", row)
 		if err != nil {
@@ -799,10 +844,29 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 		if isNull {
 			return "NULL", true, nil
 		}
-		qStr := toString(qVal)
-		qStr = strings.ReplaceAll(qStr, "\\", "\\\\")
-		qStr = strings.ReplaceAll(qStr, "'", "\\'")
-		return "'" + qStr + "'", true, nil
+		qSrc := []byte(toString(qVal))
+		var qBuf strings.Builder
+		qBuf.WriteByte('\'')
+		for _, b := range qSrc {
+			switch b {
+			case '\\':
+				qBuf.WriteString("\\\\")
+			case '\'':
+				qBuf.WriteString("\\'")
+			case 0x00:
+				qBuf.WriteString("\\0")
+			case 0x1A: // ctrl-Z
+				qBuf.WriteString("\\Z")
+			case '\n':
+				qBuf.WriteString("\\n")
+			case '\r':
+				qBuf.WriteString("\\r")
+			default:
+				qBuf.WriteByte(b)
+			}
+		}
+		qBuf.WriteByte('\'')
+		return qBuf.String(), true, nil
 	case "weight_string":
 		wsVal, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {

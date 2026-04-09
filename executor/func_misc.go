@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"compress/zlib"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
@@ -8,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"regexp"
@@ -657,7 +659,8 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if isNull {
 			return nil, true, nil
 		}
-		uuidStr := toString(utbVal)
+		utbOrigStr := toString(utbVal)
+		uuidStr := utbOrigStr
 		// Strip surrounding braces if present
 		uuidStr = strings.TrimLeft(uuidStr, "{")
 		uuidStr = strings.TrimRight(uuidStr, "}")
@@ -674,7 +677,7 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		// Decode hex to 16 binary bytes
 		decoded, decErr := hex.DecodeString(hexStr)
 		if decErr != nil || len(decoded) != 16 {
-			return nil, true, fmt.Errorf("incorrect string value for uuid_to_bin")
+			return nil, true, mysqlError(3712, "HY000", fmt.Sprintf("Incorrect string value: '%s' for function uuid_to_bin", utbOrigStr))
 		}
 		// If swap_flag is set, swap time-low and time-high fields (MySQL time-ordered UUID)
 		if swapFlag {
@@ -702,10 +705,11 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		}
 		// Decode binary input: HexBytes (x'...' literals) need to be decoded to raw bytes
 		var btuBytes []byte
+		var btuOrigVal interface{} = btuVal
 		if hb, ok := btuVal.(HexBytes); ok {
 			decoded, decErr := hex.DecodeString(string(hb))
 			if decErr != nil {
-				return nil, true, fmt.Errorf("incorrect string value for bin_to_uuid")
+				return nil, true, mysqlError(3712, "HY000", fmt.Sprintf("Incorrect string value: '%s' for function bin_to_uuid", btuOrigVal))
 			}
 			btuBytes = decoded
 		} else {
@@ -713,7 +717,7 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		}
 		// Expect exactly 16 bytes
 		if len(btuBytes) != 16 {
-			return nil, true, fmt.Errorf("incorrect string value for bin_to_uuid")
+			return nil, true, mysqlError(3712, "HY000", fmt.Sprintf("Incorrect string value: '%s' for function bin_to_uuid", btuOrigVal))
 		}
 		btuStr := string(btuBytes)
 		// Check for swap_flag (second argument)
@@ -790,17 +794,80 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		}
 		rbN := int(toInt64(rbVal))
 		if rbN <= 0 || rbN > 1024 {
-			return nil, true, nil
+			return nil, true, mysqlError(1690, "22003", fmt.Sprintf("length value is out of range in 'random_bytes'"))
 		}
 		rbBytes := make([]byte, rbN)
 		rand.Read(rbBytes)
 		return string(rbBytes), true, nil
-	case "uncompress":
-		return nil, true, nil
 	case "compress":
-		return nil, true, nil
+		cmpVal, cmpIsNull, cmpErr := e.evalArg1Quiet(v.Exprs, row)
+		if cmpErr != nil {
+			return nil, true, cmpErr
+		}
+		if cmpIsNull {
+			return nil, true, nil
+		}
+		cmpSrc := []byte(toString(cmpVal))
+		if len(cmpSrc) == 0 {
+			return "", true, nil
+		}
+		var cmpBuf strings.Builder
+		// 4-byte little-endian uncompressed length prefix
+		ulen := uint32(len(cmpSrc))
+		cmpBuf.WriteByte(byte(ulen))
+		cmpBuf.WriteByte(byte(ulen >> 8))
+		cmpBuf.WriteByte(byte(ulen >> 16))
+		cmpBuf.WriteByte(byte(ulen >> 24))
+		// zlib-compress the data
+		var zlibBuf strings.Builder
+		zw, _ := zlib.NewWriterLevel(&zlibBuf, zlib.DefaultCompression)
+		zw.Write(cmpSrc)
+		zw.Close()
+		cmpBuf.WriteString(zlibBuf.String())
+		return cmpBuf.String(), true, nil
+	case "uncompress":
+		ucmpVal, ucmpIsNull, ucmpErr := e.evalArg1Quiet(v.Exprs, row)
+		if ucmpErr != nil {
+			return nil, true, ucmpErr
+		}
+		if ucmpIsNull {
+			return nil, true, nil
+		}
+		ucmpSrc := []byte(toString(ucmpVal))
+		if len(ucmpSrc) == 0 {
+			return "", true, nil
+		}
+		if len(ucmpSrc) < 5 {
+			// Not a valid compressed string
+			return nil, true, nil
+		}
+		// Skip the 4-byte length prefix and decompress
+		ucmpData := ucmpSrc[4:]
+		ucmpReader, ucmpRErr := zlib.NewReader(strings.NewReader(string(ucmpData)))
+		if ucmpRErr != nil {
+			return nil, true, nil
+		}
+		defer ucmpReader.Close()
+		var ucmpOut strings.Builder
+		if _, ucmpReadErr := io.Copy(&ucmpOut, ucmpReader); ucmpReadErr != nil {
+			return nil, true, nil
+		}
+		return ucmpOut.String(), true, nil
 	case "uncompressed_length":
-		return int64(0), true, nil
+		ulVal, ulIsNull, ulErr := e.evalArg1Quiet(v.Exprs, row)
+		if ulErr != nil {
+			return nil, true, ulErr
+		}
+		if ulIsNull {
+			return int64(0), true, nil
+		}
+		ulSrc := []byte(toString(ulVal))
+		if len(ulSrc) < 4 {
+			return int64(0), true, nil
+		}
+		// Read 4-byte little-endian uncompressed length
+		ulLen := uint32(ulSrc[0]) | uint32(ulSrc[1])<<8 | uint32(ulSrc[2])<<16 | uint32(ulSrc[3])<<24
+		return int64(ulLen), true, nil
 	case "row_count":
 		return int64(-1), true, nil
 	case "uuid_short":

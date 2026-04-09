@@ -764,18 +764,30 @@ func (e *Executor) evalWindowFuncForRow(
 		}
 		sum := float64(0)
 		count := 0
+		maxScale := 0
 		for i := start; i <= end; i++ {
 			val, _ := e.evalRowExpr(v.Arg, partRows[i])
 			if val != nil {
 				sum += windowToFloat64(val)
 				count++
+				// Track decimal scale from string values (e.g. "1.00" from FLOAT(10,2))
+				if s, ok := val.(string); ok {
+					if dot := strings.Index(s, "."); dot >= 0 {
+						scale := len(s) - dot - 1
+						if scale > maxScale {
+							maxScale = scale
+						}
+					}
+				}
 			}
 		}
 		if count == 0 {
 			return nil, nil
 		}
 		avg := sum / float64(count)
-		return fmt.Sprintf("%.4f", avg), nil
+		// MySQL AVG: (scale+5) decimal places (minimum 5 for integer columns)
+		avgScale := maxScale + 5
+		return AvgResult{Value: avg, Scale: avgScale}, nil
 
 	case *sqlparser.Min:
 		start, end := e.computeFrameBounds(ws.FrameClause, ws.OrderClause, partRows, localIdx, orderByVals)

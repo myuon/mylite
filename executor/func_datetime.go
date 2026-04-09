@@ -784,20 +784,29 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if hasNull {
 			return nil, true, nil
 		}
-		tfStr := toString(tfTime)
-		tfParts := strings.Split(tfStr, ":")
+		// Parse the time value - handle numeric datetime format (YYYYMMDDHHMMSS etc.)
 		tfH, tfM, tfSec := 0, 0, 0
-		if len(tfParts) >= 1 {
-			tfH, _ = strconv.Atoi(tfParts[0])
-		}
-		if len(tfParts) >= 2 {
-			tfM, _ = strconv.Atoi(tfParts[1])
-		}
-		if len(tfParts) >= 3 {
-			tfSec, _ = strconv.Atoi(tfParts[2])
+		// First try to parse as a datetime to extract time components
+		if t, parseErr := parseDateTimeValue(tfTime); parseErr == nil {
+			tfH = t.Hour()
+			tfM = t.Minute()
+			tfSec = t.Second()
+		} else {
+			// Fallback: split by ':' for HH:MM:SS format
+			tfStr := toString(tfTime)
+			tfParts := strings.Split(tfStr, ":")
+			if len(tfParts) >= 1 {
+				tfH, _ = strconv.Atoi(tfParts[0])
+			}
+			if len(tfParts) >= 2 {
+				tfM, _ = strconv.Atoi(tfParts[1])
+			}
+			if len(tfParts) >= 3 {
+				tfSec, _ = strconv.Atoi(tfParts[2])
+			}
 		}
 		// For AM/PM and 12-hour clock, normalize using h mod 24
-		tfH24 := tfH % 24  // hour within a day (0-23)
+		tfH24 := tfH % 24 // hour within a day (0-23)
 		if tfH24 < 0 {
 			tfH24 += 24
 		}
@@ -817,9 +826,9 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 				i++
 				switch tfFmtStr[i] {
 				case 'H':
-					tfSb.WriteString(fmt.Sprintf("%02d", tfH))
+					tfSb.WriteString(fmt.Sprintf("%02d", tfH24))
 				case 'k':
-					tfSb.WriteString(fmt.Sprintf("%d", tfH))
+					tfSb.WriteString(fmt.Sprintf("%d", tfH24))
 				case 'h', 'I':
 					tfSb.WriteString(fmt.Sprintf("%02d", tfH12))
 				case 'l':
@@ -833,6 +842,8 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 				case 'r':
 					// 12-hour clock with AM/PM
 					tfSb.WriteString(fmt.Sprintf("%02d:%02d:%02d %s", tfH12, tfM, tfSec, tfAmPm))
+				case 'T':
+					tfSb.WriteString(fmt.Sprintf("%02d:%02d:%02d", tfH24, tfM, tfSec))
 				case '%':
 					tfSb.WriteByte('%')
 				default:
