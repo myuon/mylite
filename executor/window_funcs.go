@@ -785,8 +785,9 @@ func (e *Executor) evalWindowFuncForRow(
 			return nil, nil
 		}
 		avg := sum / float64(count)
-		// MySQL AVG: (scale+5) decimal places (minimum 5 for integer columns)
-		avgScale := maxScale + 5
+		// MySQL AVG: (scale + div_precision_increment) decimal places
+		dpi := e.getDivPrecisionIncrement()
+		avgScale := maxScale + dpi
 		return AvgResult{Value: avg, Scale: avgScale}, nil
 
 	case *sqlparser.Min:

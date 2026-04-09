@@ -705,11 +705,10 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		}
 		// Decode binary input: HexBytes (x'...' literals) need to be decoded to raw bytes
 		var btuBytes []byte
-		var btuOrigVal interface{} = btuVal
 		if hb, ok := btuVal.(HexBytes); ok {
 			decoded, decErr := hex.DecodeString(string(hb))
 			if decErr != nil {
-				return nil, true, mysqlError(3712, "HY000", fmt.Sprintf("Incorrect string value: '%s' for function bin_to_uuid", btuOrigVal))
+				return nil, true, mysqlError(3712, "HY000", fmt.Sprintf("Incorrect string value: '%s' for function bin_to_uuid", btuBinaryEscapeStr([]byte(string(hb)))))
 			}
 			btuBytes = decoded
 		} else {
@@ -717,7 +716,7 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		}
 		// Expect exactly 16 bytes
 		if len(btuBytes) != 16 {
-			return nil, true, mysqlError(3712, "HY000", fmt.Sprintf("Incorrect string value: '%s' for function bin_to_uuid", btuOrigVal))
+			return nil, true, mysqlError(3712, "HY000", fmt.Sprintf("Incorrect string value: '%s' for function bin_to_uuid", btuBinaryEscapeStr(btuBytes)))
 		}
 		btuStr := string(btuBytes)
 		// Check for swap_flag (second argument)
@@ -859,7 +858,7 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 			return nil, true, ulErr
 		}
 		if ulIsNull {
-			return int64(0), true, nil
+			return nil, true, nil
 		}
 		ulSrc := []byte(toString(ulVal))
 		if len(ulSrc) < 4 {
@@ -1290,4 +1289,18 @@ func aesCFB8Decrypt(block cipher.Block, iv, ciphertext []byte) []byte {
 		shift[aes.BlockSize-1] = ciphertext[i]
 	}
 	return plaintext
+}
+
+// btuBinaryEscapeStr formats a byte slice for MySQL error messages,
+// escaping non-printable or non-ASCII bytes as \xNN (uppercase hex).
+func btuBinaryEscapeStr(b []byte) string {
+	var sb strings.Builder
+	for _, c := range b {
+		if c >= 0x20 && c < 0x7F {
+			sb.WriteByte(c)
+		} else {
+			fmt.Fprintf(&sb, "\\x%02X", c)
+		}
+	}
+	return sb.String()
 }

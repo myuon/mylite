@@ -939,10 +939,18 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		}
 		mdY := int(toInt64(mdYear))
 		mdD := int(toInt64(mdDay))
+		// MySQL converts 2-digit years: 0-69 → 2000-2069, 70-99 → 1970-1999
+		if mdY >= 0 && mdY <= 99 {
+			mdY = convert2DigitYear(mdY)
+		}
 		if mdD <= 0 || mdY < 0 || mdY > 9999 {
 			return nil, true, nil
 		}
 		mdT := time.Date(mdY, 1, mdD, 0, 0, 0, 0, time.UTC)
+		// MySQL returns NULL if the resulting date is out of range (year > 9999)
+		if mdT.Year() > 9999 || mdT.Year() < 0 {
+			return nil, true, nil
+		}
 		return mdT.Format("2006-01-02"), true, nil
 	default:
 		return nil, false, nil

@@ -2152,8 +2152,24 @@ func (e *Executor) evalExtractFuncExpr(v *sqlparser.ExtractFuncExpr) (interface{
 		return int64(efT.Day())*1000000000000 + int64(efT.Hour())*10000000000 + int64(efT.Minute())*100000000 + int64(efT.Second())*1000000 + int64(efT.Nanosecond()/1000), nil
 	case "HOUR_MICROSECOND":
 		return int64(efT.Hour())*10000000000 + int64(efT.Minute())*100000000 + int64(efT.Second())*1000000 + int64(efT.Nanosecond()/1000), nil
+	case "MINUTE_MICROSECOND":
+		return int64(efT.Minute())*100000000 + int64(efT.Second())*1000000 + int64(efT.Nanosecond()/1000), nil
+	case "SECOND_MICROSECOND":
+		return int64(efT.Second())*1000000 + int64(efT.Nanosecond()/1000), nil
 	case "YEAR_MONTH":
 		return int64(efT.Year())*100 + int64(efT.Month()), nil
+	case "DAY_HOUR":
+		return int64(efT.Day())*100 + int64(efT.Hour()), nil
+	case "DAY_MINUTE":
+		return int64(efT.Day())*10000 + int64(efT.Hour())*100 + int64(efT.Minute()), nil
+	case "DAY_SECOND":
+		return int64(efT.Day())*1000000 + int64(efT.Hour())*10000 + int64(efT.Minute())*100 + int64(efT.Second()), nil
+	case "HOUR_MINUTE":
+		return int64(efT.Hour())*100 + int64(efT.Minute()), nil
+	case "HOUR_SECOND":
+		return int64(efT.Hour())*10000 + int64(efT.Minute())*100 + int64(efT.Second()), nil
+	case "MINUTE_SECOND":
+		return int64(efT.Minute())*100 + int64(efT.Second()), nil
 	default:
 		return nil, nil
 	}

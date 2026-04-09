@@ -3825,14 +3825,17 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		// MySQL AVG() result format depends on input type:
 		// - Plain FLOAT/DOUBLE inputs (hasFloat && maxScale==0): return float64
 		//   so it formats with shortest representation (e.g. "3" not "3.00000")
-		// - Integer inputs (maxScale==0): 5 decimal places (scale+5 with scale=0)
-		// - DECIMAL/FLOAT(M,D) inputs with scale D: D+5 decimal places
+		// - Integer/DECIMAL/FLOAT(M,D) inputs: use (scale + div_precision_increment) places
 		_ = allInt
 		if hasFloat && maxScale == 0 {
 			// Plain double/float arithmetic result: use shortest representation
 			return sumFloat / float64(count), nil
 		}
-		avgScale := maxScale + 5
+		dpi := 4 // default div_precision_increment
+		if exec != nil {
+			dpi = exec.getDivPrecisionIncrement()
+		}
+		avgScale := maxScale + dpi
 		avgRat := new(big.Rat).Quo(sumRat, new(big.Rat).SetInt64(count))
 		avgFloat, _ := avgRat.Float64()
 		return AvgResult{Value: avgFloat, Scale: avgScale}, nil
