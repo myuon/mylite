@@ -3823,22 +3823,26 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			return nil, nil
 		}
 		// MySQL AVG() result format depends on input type:
-		// - Plain FLOAT/DOUBLE inputs (hasFloat && maxScale==0): return float64
-		//   so it formats with shortest representation (e.g. "3" not "3.00000")
-		// - Integer/DECIMAL/FLOAT(M,D) inputs: use (scale + div_precision_increment) places
+		// - All inputs use (scale + div_precision_increment) decimal places.
+		// - FLOAT/DOUBLE inputs (hasFloat && maxScale==0): compute via float64
+		//   but still format with dpi decimal places (e.g. "18535183.4917").
+		// - For large or high-precision values, use exact big.Rat formatting
+		//   to avoid float64 precision loss.
 		_ = allInt
-		if hasFloat && maxScale == 0 {
-			// Plain double/float arithmetic result: use shortest representation
-			return sumFloat / float64(count), nil
-		}
 		dpi := 4 // default div_precision_increment
 		if exec != nil {
 			dpi = exec.getDivPrecisionIncrement()
 		}
 		avgScale := maxScale + dpi
+		if hasFloat && maxScale == 0 {
+			// FLOAT/DOUBLE column: use float64 arithmetic but format with dpi places.
+			avg := sumFloat / float64(count)
+			avgFloat := avg
+			return AvgResult{Value: avgFloat, Scale: avgScale}, nil
+		}
 		avgRat := new(big.Rat).Quo(sumRat, new(big.Rat).SetInt64(count))
 		avgFloat, _ := avgRat.Float64()
-		return AvgResult{Value: avgFloat, Scale: avgScale}, nil
+		return AvgResult{Value: avgFloat, Scale: avgScale, Rat: avgRat}, nil
 	case *sqlparser.JSONArrayAgg:
 		arr := make([]interface{}, 0)
 		for _, row := range groupRows {

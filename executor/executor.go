@@ -14437,12 +14437,18 @@ func (d DivisionResult) String() string {
 // It carries a Scale for formatted display, but contributes scale=0 to
 // arithmetic expressions (so that e.g. avg(a)+count(a) does not force
 // decimal-padded output on the sum).
+// When Rat is non-nil, String() uses exact big.Rat formatting to avoid
+// float64 precision loss for large or high-precision values.
 type AvgResult struct {
 	Value float64
 	Scale int
+	Rat   *big.Rat // exact value; used by String() when set
 }
 
 func (a AvgResult) String() string {
+	if a.Rat != nil {
+		return formatRatFixed(a.Rat, a.Scale)
+	}
 	return fmt.Sprintf("%.*f", a.Scale, a.Value)
 }
 

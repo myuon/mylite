@@ -456,7 +456,7 @@ func normalizeRows(rows [][]interface{}) [][]interface{} {
 			} else if d, ok := val.(executor.DivisionResult); ok {
 				rows[i][j] = fmt.Sprintf("%.*f", d.Precision, d.Value)
 			} else if ar, ok := val.(executor.AvgResult); ok {
-				rows[i][j] = fmt.Sprintf("%.*f", ar.Scale, ar.Value)
+				rows[i][j] = ar.String()
 			} else if ev, ok := val.(executor.EnumValue); ok {
 				rows[i][j] = string(ev)
 			} else if hb, ok := val.(executor.HexBytes); ok {
