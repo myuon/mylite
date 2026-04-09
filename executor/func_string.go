@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/myuon/mylite/storage"
@@ -32,7 +33,24 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 			}
 			sb.WriteString(toString(val))
 		}
-		return sb.String(), true, nil
+		result := sb.String()
+		// Check if result exceeds max_allowed_packet (MySQL: error 1301)
+		maxPkt := int64(67108864)
+		if sv, ok := e.getSysVar("max_allowed_packet"); ok {
+			if n, err2 := strconv.ParseInt(sv, 10, 64); err2 == nil {
+				maxPkt = n
+			}
+		}
+		if int64(len(result)) > maxPkt {
+			msg := fmt.Sprintf("Result of concat() was larger than max_allowed_packet (%d) - truncated", maxPkt)
+			if e.inUpdateSetContext {
+				return nil, true, mysqlError(1301, "HY000", msg)
+			}
+			// SELECT/INSERT context: return NULL with warning
+			e.addWarning("Warning", 1301, msg)
+			return nil, true, nil
+		}
+		return result, true, nil
 	case "md5":
 		val, isNull, err := e.evalArg1(v.Exprs, "MD5", row)
 		if err != nil {

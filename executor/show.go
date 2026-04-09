@@ -2354,7 +2354,7 @@ func buildViewSelectSQL(s *sqlparser.CreateView, originalQuery string) string {
 		return normalizeViewSQL(selectPart)
 	}
 
-	// Build each SELECT expression as "(expr) AS `alias`"
+	// Build each SELECT expression in MySQL's canonical format
 	var parts []string
 	for _, expr := range sel.SelectExprs.Exprs {
 		ae, ok := expr.(*sqlparser.AliasedExpr)
@@ -2366,8 +2366,11 @@ func buildViewSelectSQL(s *sqlparser.CreateView, originalQuery string) string {
 		exprStr := sqlparser.String(ae.Expr)
 		// Convert hex/binary literals
 		exprStr = normalizeViewLiterals(exprStr)
-		// Wrap in parentheses
-		exprStr = "(" + exprStr + ")"
+		// MySQL wraps binary expressions (comparisons, arithmetic) in parentheses,
+		// but NOT simple literals, column refs, or function calls.
+		if viewExprNeedsParens(ae.Expr) {
+			exprStr = "(" + exprStr + ")"
+		}
 		// Get alias (required for SHOW CREATE VIEW)
 		alias := ""
 		if !ae.As.IsEmpty() {
@@ -2381,6 +2384,17 @@ func buildViewSelectSQL(s *sqlparser.CreateView, originalQuery string) string {
 	}
 
 	return "select " + strings.Join(parts, ",")
+}
+
+// viewExprNeedsParens returns true if MySQL wraps this expression in parentheses in SHOW CREATE VIEW output.
+// MySQL wraps binary expressions (comparisons, arithmetic) but not literals, column refs, function calls, etc.
+func viewExprNeedsParens(expr sqlparser.Expr) bool {
+	switch expr.(type) {
+	case *sqlparser.ComparisonExpr, *sqlparser.BinaryExpr, *sqlparser.AndExpr, *sqlparser.OrExpr,
+		*sqlparser.NotExpr, *sqlparser.BetweenExpr, *sqlparser.IsExpr:
+		return true
+	}
+	return false
 }
 
 // normalizeViewLiterals converts hex and binary literals in a SELECT SQL to MySQL's canonical 0x... format.

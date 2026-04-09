@@ -297,7 +297,13 @@ type Executor struct {
 	// compiledDefaults caches the hardcoded MySQL defaults (without startup overrides).
 	compiledDefaults map[string]string
 	// views stores view definitions (view name -> SELECT query string).
+	// The stored SQL is from sqlparser.String() which may include "from dual" for literal-only SELECTs.
+	// This is used for VIEW EXECUTION only.
 	views map[string]string
+	// viewDisplaySQL stores the canonical SELECT SQL for each view (view name -> SELECT string).
+	// This is the normalized version used for INFORMATION_SCHEMA.VIEWS.VIEW_DEFINITION display.
+	// It uses buildViewSelectSQL() format (no "from dual", proper alias quoting, etc.).
+	viewDisplaySQL map[string]string
 	// viewCheckOptions stores WITH CHECK OPTION for views (view name -> check option string: "cascaded", "local", or "").
 	viewCheckOptions map[string]string
 	// viewCreateStatements stores the full CREATE VIEW SQL for SHOW CREATE VIEW (view name -> full SQL).
@@ -443,6 +449,10 @@ type Executor struct {
 	sysVarsAdminUsers map[string]bool
 	// sysVarsAdminUsersMu protects sysVarsAdminUsers.
 	sysVarsAdminUsersMu *sync.RWMutex
+	// inUpdateSetContext is set to true while evaluating SET expressions in an UPDATE statement.
+	// When true, CONCAT (and similar) should return an error if the result exceeds max_allowed_packet,
+	// rather than returning NULL with a warning (which is correct for SELECT/INSERT context).
+	inUpdateSetContext bool
 }
 
 // Warning represents a MySQL warning.
@@ -450,6 +460,21 @@ type Warning struct {
 	Level   string // "Warning", "Note", "Error"
 	Code    int
 	Message string
+}
+
+// viewDefinitionForDisplay returns the canonical SELECT SQL for a view, suitable for
+// INFORMATION_SCHEMA.VIEWS.VIEW_DEFINITION display. Uses viewDisplaySQL if available
+// (no "from dual", proper formatting), otherwise falls back to the raw view SQL.
+func (e *Executor) viewDefinitionForDisplay(viewName string) string {
+	if e.viewDisplaySQL != nil {
+		if sql, ok := e.viewDisplaySQL[viewName]; ok {
+			return sql
+		}
+	}
+	if e.views != nil {
+		return e.views[viewName]
+	}
+	return ""
 }
 
 // addWarning adds a warning to the current statement's warning list.
@@ -7510,11 +7535,18 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 	case *sqlparser.CreateView:
 		// Store view definition
 		viewName := s.ViewName.Name.String()
+		// Use sqlparser.String(s.Select) to preserve the full SELECT including FROM clause.
+		// For literal-only SELECT (no FROM), sqlparser adds "from dual" which is handled fine by the executor.
 		selectSQL := sqlparser.String(s.Select)
 		if e.views == nil {
 			e.views = make(map[string]string)
 		}
 		e.views[viewName] = selectSQL
+		// Store canonical display SQL (no "from dual", proper formatting) for IS.VIEWS.VIEW_DEFINITION
+		if e.viewDisplaySQL == nil {
+			e.viewDisplaySQL = make(map[string]string)
+		}
+		e.viewDisplaySQL[viewName] = buildViewSelectSQL(s, query)
 		if e.viewCheckOptions == nil {
 			e.viewCheckOptions = make(map[string]string)
 		}

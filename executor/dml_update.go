@@ -321,6 +321,11 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 
 	var affected uint64
 	var matchedRows uint64
+	// Set inUpdateSetContext so that functions like CONCAT can distinguish
+	// UPDATE SET expressions from SELECT/INSERT contexts (different behavior
+	// when result exceeds max_allowed_packet).
+	e.inUpdateSetContext = true
+	defer func() { e.inUpdateSetContext = false }()
 	for _, i := range matchingIndices {
 		row := tbl.Rows[i]
 		_ = row

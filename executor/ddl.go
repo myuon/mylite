@@ -7,33 +7,75 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode/utf8"
-
 	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
-// validateUTF8StringForDDL checks if a string contains valid UTF-8 when character_set_client=binary.
-// MySQL raises ER_INVALID_CHARACTER_STRING (1300) when binary strings contain invalid UTF-8 in DDL contexts.
-// Returns an error with the invalid bytes (up to 6) shown in hex if the string is invalid.
+// validateUTF8StringForDDL checks if a string contains valid utf8mb3 (3-byte UTF-8) when character_set_client=binary.
+// MySQL raises ER_INVALID_CHARACTER_STRING (1300) when binary strings contain invalid utf8/utf8mb3 sequences in DDL contexts.
+// Returns an error with the invalid bytes shown in hex if the string is invalid.
 func validateUTF8StringForDDL(s string) error {
-	if utf8.ValidString(s) {
-		return nil
-	}
-	// Find the first invalid byte sequence
+	// Validate as utf8mb3: bytes must form valid UTF-8 sequences, and no codepoint may exceed U+FFFF (3-byte max)
 	for i := 0; i < len(s); {
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if r == utf8.RuneError && size <= 1 {
-			// Found invalid bytes: collect up to 6 bytes starting from i
-			end := i + 6
+		b := s[i]
+		var seqLen int
+		switch {
+		case b < 0x80:
+			// ASCII (1 byte)
+			i++
+			continue
+		case b < 0xC0:
+			// Continuation byte without start byte - invalid
+			seqLen = 1
+		case b < 0xE0:
+			// 2-byte sequence
+			seqLen = 2
+		case b < 0xF0:
+			// 3-byte sequence
+			seqLen = 3
+		default:
+			// 4+ byte sequence: invalid for utf8mb3 (and also invalid for most cases)
+			seqLen = 4
+			if i+seqLen > len(s) {
+				seqLen = len(s) - i
+			}
+			end := i + 3 // show 3 bytes in error (like MySQL does)
 			if end > len(s) {
 				end = len(s)
 			}
 			hexBytes := fmt.Sprintf("%X", s[i:end])
 			return mysqlError(1300, "HY000", fmt.Sprintf("Invalid utf8 character string: '%s'", hexBytes))
 		}
-		i += size
+		// Validate continuation bytes
+		if i+seqLen > len(s) {
+			// Truncated sequence
+			end := len(s)
+			if end-i > 3 {
+				end = i + 3
+			}
+			hexBytes := fmt.Sprintf("%X", s[i:end])
+			return mysqlError(1300, "HY000", fmt.Sprintf("Invalid utf8 character string: '%s'", hexBytes))
+		}
+		valid := true
+		for j := 1; j < seqLen; j++ {
+			if s[i+j]&0xC0 != 0x80 {
+				valid = false
+				break
+			}
+		}
+		if !valid {
+			// Show start byte plus continuation bytes (MySQL shows 3 bytes in error message)
+			end := i + 3
+			if end > len(s) {
+				end = len(s)
+			}
+			hexBytes := fmt.Sprintf("%X", s[i:end])
+			return mysqlError(1300, "HY000", fmt.Sprintf("Invalid utf8 character string: '%s'", hexBytes))
+		}
+		// For 3-byte sequences, also validate the codepoint is in range (U+0000-U+FFFF)
+		// (utf8mb3 max is U+FFFF, 4-byte sequences already rejected above)
+		i += seqLen
 	}
 	return nil
 }
@@ -3788,16 +3830,30 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 		case sqlparser.FloatVal:
 			return "double"
 		case sqlparser.HexVal:
-			// MySQL: hex literals act as BIGINT UNSIGNED in arithmetic context
+			// MySQL: x'...' hex literals
+			// For small hex literals (≤ 4 bytes = fits in INT), MySQL uses "int(3) unsigned".
+			if len(v.Val) <= 8 { // 8 hex chars = 4 bytes
+				return "int(3) unsigned"
+			}
+			return "bigint unsigned"
+		case sqlparser.HexNum:
+			// MySQL: 0x... hex literals
+			// For small hex literals (≤ 4 bytes = fits in INT), MySQL uses "int(3) unsigned".
+			if len(v.Val) <= 8 { // 8 hex chars = 4 bytes (the val includes "0x" prefix)
+				return "int(3) unsigned"
+			}
 			return "bigint unsigned"
 		}
 	case *sqlparser.BinaryExpr:
 		// Arithmetic expressions (+,-,*,/) return numeric types.
-		// If either operand is hex, result is bigint unsigned.
+		// If either operand is hex, result is int(3) unsigned (for small hex) or bigint unsigned (for large hex).
 		leftType := e.inferExprType(v.Left)
 		rightType := e.inferExprType(v.Right)
 		if leftType == "bigint unsigned" || rightType == "bigint unsigned" {
 			return "bigint unsigned"
+		}
+		if leftType == "int(3) unsigned" || rightType == "int(3) unsigned" {
+			return "int(3) unsigned"
 		}
 		if leftType == "double" || rightType == "double" {
 			return "double"
@@ -3996,6 +4052,15 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 	}
 	if attrs.colType == "" {
 		attrs.colType = e.inferExprType(expr)
+	}
+	// For arithmetic expressions involving hex/integer literals, MySQL uses NOT NULL with DEFAULT 0
+	if _, isBin := expr.(*sqlparser.BinaryExpr); isBin {
+		colType := strings.ToLower(attrs.colType)
+		if strings.Contains(colType, "int") || colType == "double" || colType == "decimal" {
+			attrs.nullable = false
+			attrs.hasDefault = true
+			attrs.defaultVal = "0"
+		}
 	}
 	return attrs
 }

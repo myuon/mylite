@@ -4180,7 +4180,7 @@ func (e *Executor) infoSchemaViews() []storage.Row {
 				"TABLE_CATALOG":        "def",
 				"TABLE_SCHEMA":         e.CurrentDB,
 				"TABLE_NAME":           vName,
-				"VIEW_DEFINITION":      e.views[vName],
+				"VIEW_DEFINITION":      e.viewDefinitionForDisplay(vName),
 				"CHECK_OPTION":         "NONE",
 				"IS_UPDATABLE":         "YES",
 				"DEFINER":              "root@localhost",
