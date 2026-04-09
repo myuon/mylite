@@ -422,10 +422,6 @@ type Executor struct {
 	// since last OPTIMIZE TABLE. OPTIMIZE TABLE returns "OK" when in this set,
 	// "Table is already up to date" otherwise.
 	tableNeedsOptimize map[string]bool
-	// tableAnalyzed tracks non-InnoDB tables whose statistics are known to be current
-	// (ANALYZE TABLE was run, or CREATE INDEX which computes stats automatically).
-	// When set and no pending changes exist, ANALYZE TABLE returns "Table is already up to date".
-	tableAnalyzed map[string]bool
 	// Sort statistics: incremented when ORDER BY operations are performed.
 	sortRows  int64 // total rows sorted
 	sortRange int64 // sort operations using range scan
@@ -7173,9 +7169,6 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 						}
 						// All inserts (including INSERT SELECT) clear the analyzed flag
 						// since data has changed and stats may be stale.
-						if e.tableAnalyzed != nil {
-							delete(e.tableAnalyzed, fullName)
-						}
 					}
 				}
 			}
@@ -7220,10 +7213,6 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 									e.tableNeedsAnalyze = map[string]bool{}
 								}
 								e.tableNeedsAnalyze[fullName] = true
-								// Clear analyzed flag since data changed.
-								if e.tableAnalyzed != nil {
-									delete(e.tableAnalyzed, fullName)
-								}
 							}
 						}
 					}
@@ -7252,10 +7241,6 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 									e.tableNeedsAnalyze = map[string]bool{}
 								}
 								e.tableNeedsAnalyze[fullName] = true
-								// Clear analyzed flag since data changed.
-								if e.tableAnalyzed != nil {
-									delete(e.tableAnalyzed, fullName)
-								}
 							}
 						}
 					}
@@ -7305,11 +7290,7 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 				if e.tableNeedsAnalyze != nil {
 					delete(e.tableNeedsAnalyze, fullName)
 				}
-				// Mark as analyzed since CREATE INDEX computes stats.
-				if e.tableAnalyzed == nil {
-					e.tableAnalyzed = map[string]bool{}
-				}
-				e.tableAnalyzed[fullName] = true
+
 			} else {
 				if e.tableNeedsAnalyze == nil {
 					e.tableNeedsAnalyze = map[string]bool{}
@@ -7487,14 +7468,11 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 					}
 					needsAnalyze := e.tableNeedsAnalyze != nil && e.tableNeedsAnalyze[fullName]
 					needsOptimize := e.tableNeedsOptimize != nil && e.tableNeedsOptimize[fullName]
-					alreadyAnalyzed := e.tableAnalyzed != nil && e.tableAnalyzed[fullName]
 					// ANALYZE TABLE returns "OK" for InnoDB (always), SPATIAL-indexed tables,
-					// or when there are pending stats updates (ALTER TABLE, INSERT, DELETE),
-					// or when the table has never been analyzed (stats unknown).
-					// For non-InnoDB: returns "Table is already up to date" only if stats are
-					// known to be current (tableAnalyzed flag set) and no pending changes.
+					// or when there are pending stats updates (ALTER TABLE, INSERT, DELETE).
+					// For non-InnoDB: returns "Table is already up to date" unless flagged.
 					isInnoDB := eng == "" || eng == "INNODB"
-					if isInnoDB || hasSpatial || needsAnalyze || needsOptimize || !alreadyAnalyzed {
+					if isInnoDB || hasSpatial || needsAnalyze || needsOptimize {
 						msgText = "OK"
 					}
 					// Clear both flags after analyze and mark as analyzed
@@ -7503,12 +7481,6 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 					}
 					if e.tableNeedsOptimize != nil {
 						delete(e.tableNeedsOptimize, fullName)
-					}
-					if !isInnoDB {
-						if e.tableAnalyzed == nil {
-							e.tableAnalyzed = map[string]bool{}
-						}
-						e.tableAnalyzed[fullName] = true
 					}
 				}
 			}
@@ -14144,6 +14116,14 @@ func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator, di
 
 	lf := toFloat(left)
 	rf := toFloat(right)
+	// Track whether either operand is a float type (not integer).
+	// If so, the result should remain float64 even when it's a whole number,
+	// to match MySQL DOUBLE arithmetic behavior.
+	_, lIsFloat := left.(float64)
+	_, rIsFloat := right.(float64)
+	_, lIsFloat32 := left.(float32)
+	_, rIsFloat32 := right.(float32)
+	hasFloatOperand := lIsFloat || rIsFloat || lIsFloat32 || rIsFloat32
 	var result float64
 	switch op {
 	case sqlparser.PlusOp:
@@ -14225,7 +14205,9 @@ func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator, di
 	default:
 		return nil, fmt.Errorf("unsupported binary operator: %v", op)
 	}
-	if result == float64(int64(result)) {
+	// Don't convert to int64 if either operand was float, to preserve
+	// DOUBLE type semantics (MySQL: INT + DOUBLE = DOUBLE, not INT).
+	if !hasFloatOperand && result == float64(int64(result)) {
 		return int64(result), nil
 	}
 	return result, nil
