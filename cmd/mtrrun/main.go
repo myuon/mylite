@@ -50,6 +50,7 @@ type testResultJSON struct {
 
 // runSkippedOnly when true, inverts the skip logic: only run tests IN the skiplist.
 var runSkippedOnly bool
+var verboseMode bool
 
 //go:embed skiplist.json
 var skipListData []byte
@@ -119,8 +120,10 @@ func main() {
 	testFilter := flag.String("test", "", "run only specified test(s), comma-separated in suite/testname format (e.g. sys_vars/gtid_owned_basic,other/bool)")
 	force := flag.Bool("force", false, "kill existing mtrrun process and remove lock before starting")
 	skippedOnly := flag.Bool("skipped-only", false, "run only tests that are in the skiplist (inverse of normal behavior)")
+	verbose := flag.Bool("verbose", false, "show server logs and other verbose output")
 	flag.Parse()
 	runSkippedOnly = *skippedOnly
+	verboseMode = *verbose
 
 	if *force {
 		if data, err := os.ReadFile(mtrrunLockFile); err == nil {
@@ -476,7 +479,9 @@ func newWorker(searchPaths []string) (*worker, error) {
 	exec.DataDir = dataDir
 	exec.SearchPaths = searchPaths
 	srv := server.New(exec, addr)
-	srv.SetLogger(server.DiscardLogger())
+	if !verboseMode {
+		srv.SetLogger(server.DiscardLogger())
+	}
 	go func() {
 		srv.Start() //nolint:errcheck
 	}()
@@ -573,7 +578,9 @@ func (w *worker) rebuild() {
 	w.exec.DataDir = filepath.Join(w.tmpDir, "data", "inner")
 	w.exec.SearchPaths = w.searchPaths
 	w.srv = server.New(w.exec, w.addr)
-	w.srv.SetLogger(server.DiscardLogger())
+	if !verboseMode {
+		w.srv.SetLogger(server.DiscardLogger())
+	}
 	go w.srv.Start()
 	// Reconnect DB
 	for i := 0; i < 50; i++ {
