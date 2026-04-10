@@ -807,7 +807,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							colUpper := strings.ToUpper(col.Type)
 							isDecType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || colUpper == "REAL" || strings.HasPrefix(colUpper, "REAL ")
 							if isDecType {
-								if strings.Contains(colUpper, "UNSIGNED") {
+								if strings.Contains(colUpper, "UNSIGNED") || strings.Contains(colUpper, "ZEROFILL") {
 									f := toFloat(v)
 									if f < 0 {
 										if bool(stmt.Ignore) {
@@ -835,10 +835,47 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 									return nil, err
 								}
 							}
+							// Strict mode: validate DATE/DATETIME/TIMESTAMP values
+							if sv, ok := v.(string); ok {
+								if err := checkDateStrict(col.Type, col.Name, sv, e.sqlMode); err != nil {
+									// For non-transactional tables (MyISAM) under STRICT_TRANS_TABLES only
+									// (not STRICT_ALL_TABLES), treat as warning not error (like IGNORE).
+									tblEngine := strings.ToUpper(tbl.Def.Engine)
+									if tblEngine == "" {
+										// No engine specified; use session default_storage_engine.
+										if eng, ok := e.getSysVar("default_storage_engine"); ok && eng != "" {
+											tblEngine = strings.ToUpper(eng)
+										}
+									}
+									isNonTransactional := tblEngine == "MYISAM" || tblEngine == "MRG_MYISAM" || tblEngine == "MEMORY" || tblEngine == "ARCHIVE" || tblEngine == "CSV"
+									strictAllTables := strings.Contains(e.sqlMode, "STRICT_ALL_TABLES") || strings.Contains(e.sqlMode, "TRADITIONAL")
+									if bool(stmt.Ignore) || (isNonTransactional && !strictAllTables) {
+										e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+									} else {
+										return nil, err
+									}
+								}
+							}
 						} else {
 							// Non-strict mode: check for out-of-range integer values and generate warnings
 							if err := checkIntegerStrict(col.Type, col.Name, v); err != nil {
 								e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+							}
+						}
+					}
+					// For DECIMAL columns: if a string value has an invalid numeric suffix that
+					// can be truncated (e.g. "123.4e" -> "123.4"), emit Note 1265 proactively.
+					// formatDecimalValue will silently handle the truncation; we need to warn here.
+					if v != nil {
+						colUpper2 := strings.ToUpper(col.Type)
+						if strings.Contains(colUpper2, "DECIMAL") {
+							if sv, isStr := v.(string); isStr {
+								svTrimmed := strings.TrimSpace(sv)
+								if _, perr2 := strconv.ParseFloat(svTrimmed, 64); perr2 != nil {
+									if prefix2, ok2 := extractNumericPrefix(svTrimmed); ok2 && prefix2 != svTrimmed {
+										e.addWarning("Note", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+									}
+								}
 							}
 						}
 					}
@@ -1247,7 +1284,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					isIntType := !isSpatialType && (strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER"))
 					isDecimalType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || colUpper == "REAL" || strings.HasPrefix(colUpper, "REAL ")
 					isNumericType := isIntType || isDecimalType
-					isUnsigned := strings.Contains(colUpper, "UNSIGNED")
+					isUnsigned := strings.Contains(colUpper, "UNSIGNED") || strings.Contains(colUpper, "ZEROFILL") // ZEROFILL implies UNSIGNED
 					if isNumericType {
 						switch val := rv.(type) {
 						case int64:
@@ -1327,12 +1364,20 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 								}
 							} else if isDecimalType {
 								if _, perr := strconv.ParseFloat(numText, 64); perr != nil {
-									if bool(stmt.Ignore) {
-										e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row 1", val, col.Name))
-										row[col.Name] = float64(0)
-										break
+									// Try to extract a valid numeric prefix (e.g. "123.4e" -> "123.4")
+									// MySQL behavior: truncate invalid suffix and emit Note 1265.
+									if prefix, ok := extractNumericPrefix(numText); ok && prefix != numText {
+										e.addWarning("Note", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+										numText = prefix
+										// fall through to use the truncated prefix
+									} else {
+										if bool(stmt.Ignore) {
+											e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row 1", val, col.Name))
+											row[col.Name] = float64(0)
+											break
+										}
+										return nil, mysqlError(1366, "HY000", fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row 1", val, col.Name))
 									}
-									return nil, mysqlError(1366, "HY000", fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row 1", val, col.Name))
 								}
 							}
 							// Check unsigned constraint for string-typed decimal values
@@ -1435,10 +1480,12 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					// UTF8 charset validation for string columns (TEXT, CHAR, VARCHAR, etc.)
 					// If a string contains invalid UTF8 bytes and the column uses a UTF8 charset,
 					// emit Warning 1366 and replace value with empty string.
+					// Note: BLOB types store binary data and must NOT be UTF-8 validated.
 					colTypeLower := strings.ToLower(col.Type)
-					isTextOrCharType := strings.Contains(colTypeLower, "text") ||
+					isBlobColType := colTypeLower == "blob" || colTypeLower == "tinyblob" || colTypeLower == "mediumblob" || colTypeLower == "longblob"
+					isTextOrCharType := !isBlobColType && (strings.Contains(colTypeLower, "text") ||
 						strings.Contains(colTypeLower, "char") ||
-						strings.Contains(colTypeLower, "blob")
+						strings.Contains(colTypeLower, "blob"))
 					if isTextOrCharType && !strings.Contains(colTypeLower, "binary") {
 						if sv, ok := rv.(string); ok {
 							colCharset := col.Charset
