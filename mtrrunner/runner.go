@@ -3662,13 +3662,17 @@ func (ctx *execContext) sourceFile(filename string) error {
 		}
 		ctx.output.WriteString("# " + restartParams + "\n")
 		// Apply any startup parameters to the session (e.g. --sort_buffer_size=9999999)
-		if strings.HasPrefix(restartParams, "restart:--") {
-			paramStr := strings.TrimPrefix(restartParams, "restart:")
+		// Support both "restart:--foo=bar" and "restart: --foo=bar" (with optional space)
+		restartParamsNorm := strings.Replace(restartParams, "restart: --", "restart:--", 1)
+		if strings.HasPrefix(restartParamsNorm, "restart:--") {
+			paramStr := strings.TrimPrefix(restartParamsNorm, "restart:")
 			for _, param := range strings.Split(paramStr, " ") {
 				param = strings.TrimPrefix(param, "--")
 				if eqIdx := strings.Index(param, "="); eqIdx != -1 {
 					varName := param[:eqIdx]
 					varVal := param[eqIdx+1:]
+					// MySQL converts hyphens to underscores in variable names
+					varName = strings.ReplaceAll(varName, "-", "_")
 					_ = ctx.executeSQLNoEcho(fmt.Sprintf("SET @@GLOBAL.%s = %s", varName, varVal))
 					_ = ctx.executeSQLNoEcho(fmt.Sprintf("SET @@SESSION.%s = %s", varName, varVal))
 				}

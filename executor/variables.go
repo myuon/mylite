@@ -1129,10 +1129,16 @@ func (e *Executor) handleRawSet(raw string) error {
 	} else if strings.HasPrefix(restUpper, "PERSIST ") {
 		rest = rest[len("PERSIST "):]
 	}
-	rest = strings.TrimPrefix(rest, "@@global.")
-	rest = strings.TrimPrefix(rest, "@@session.")
-	rest = strings.TrimPrefix(rest, "@@local.")
-	rest = strings.TrimPrefix(rest, "@@")
+	// Strip @@ scope prefix case-insensitively
+	if strings.HasPrefix(restUpper, "@@GLOBAL.") {
+		rest = rest[len("@@GLOBAL."):]
+	} else if strings.HasPrefix(restUpper, "@@SESSION.") {
+		rest = rest[len("@@SESSION."):]
+	} else if strings.HasPrefix(restUpper, "@@LOCAL.") {
+		rest = rest[len("@@LOCAL."):]
+	} else if strings.HasPrefix(rest, "@@") {
+		rest = rest[2:]
+	}
 	_ = restUpper
 	if eqIdx := strings.Index(rest, "="); eqIdx > 0 {
 		varName := strings.TrimSpace(strings.ToLower(rest[:eqIdx]))
@@ -1257,6 +1263,13 @@ func (e *Executor) handleRawSet(raw string) error {
 			}
 		}
 		if strings.ToUpper(val) != "DEFAULT" {
+			// Normalize enum values for enum-type variables (e.g. "5" → "O_DIRECT_NO_FSYNC")
+			if enumMap, isEnum := sysVarEnumValues[varName]; isEnum {
+				upVal := strings.ToUpper(strings.Trim(val, "'\""))
+				if enumVal, ok := enumMap[upVal]; ok {
+					val = enumVal
+				}
+			}
 			e.setSysVar(varName, val, isGlobalScope)
 		} else {
 			// For SET GLOBAL var = DEFAULT, use the compiled default when
@@ -1462,8 +1475,7 @@ var sysVarReadOnly = map[string]bool{
 	"lock_order_trace_missing_arc":                 true,
 	"lock_order_trace_missing_key":                 true,
 	"lock_order_trace_missing_unlock":              true,
-	"log_error":                                    true,
-	"innodb_flush_method":                          true,
+	"log_error": true,
 }
 
 // sysVarGlobalOnly contains system variables that can only be SET at GLOBAL scope.

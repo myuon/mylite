@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -5283,6 +5284,51 @@ func (e *Executor) shouldMaterializeSubquery(inner *sqlparser.Select) bool {
 		return false
 	}
 
+	// Find the join column (first SELECT expression of the inner query).
+	var joinColName string
+	if inner.SelectExprs != nil && len(inner.SelectExprs.Exprs) > 0 {
+		if ae, ok := inner.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok {
+			if col, ok := ae.Expr.(*sqlparser.ColName); ok {
+				joinColName = strings.ToLower(col.Name.String())
+			}
+		}
+	}
+
+	// For single-table subqueries, check for index coverage on the join column.
+	// MySQL's strategy depends on the index type and optimizer flags:
+	// - PRIMARY KEY or UNIQUE on join col → always eq_ref (inline), regardless of firstmatch setting
+	// - Secondary (non-unique) index + firstmatch=on → FirstMatch (inline)
+	// - Secondary (non-unique) index + firstmatch=off → MATERIALIZED (for large tables)
+	// - No index → MATERIALIZED (if large table) or inline (if small)
+	firstMatchOn := e.isOptimizerSwitchEnabled("firstmatch")
+	if len(realInnerTables) == 1 && joinColName != "" {
+		innerTableName := realInnerTables[0]
+		if tbl, err := e.Storage.GetTable(e.CurrentDB, innerTableName); err == nil && tbl.Def != nil {
+			// Primary key always produces eq_ref → no materialization needed
+			if len(tbl.Def.PrimaryKey) > 0 && strings.EqualFold(tbl.Def.PrimaryKey[0], joinColName) {
+				return false // eq_ref via primary key → always inline
+			}
+			// Check secondary indexes
+			for _, idx := range tbl.Def.Indexes {
+				if len(idx.Columns) > 0 && strings.EqualFold(idx.Columns[0], joinColName) {
+					// Secondary index on join column:
+					// - firstmatch=on → FirstMatch (inline, no materialization)
+					// - firstmatch=off → may materialize if table is large
+					if f, ferr := os.OpenFile("/tmp/explain_debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); ferr == nil {
+						fmt.Fprintf(f, "DEBUG shouldMaterialize: table=%s joinCol=%s idxCol=%s firstMatchOn=%v pk=%v\n",
+							innerTableName, joinColName, idx.Columns[0], firstMatchOn, tbl.Def.PrimaryKey)
+						f.Close()
+					}
+					if firstMatchOn {
+						return false // FirstMatch strategy → inline
+					}
+					// firstmatch=off: fall through to row count check for this secondary index
+					break
+				}
+			}
+		}
+	}
+
 	// Compute total row count across all inner tables
 	totalRows := 0
 	for _, tblName := range realInnerTables {
@@ -5293,56 +5339,18 @@ func (e *Executor) shouldMaterializeSubquery(inner *sqlparser.Select) bool {
 		totalRows += len(tbl.Rows)
 	}
 
-	// Large subquery → always materialize
-	if totalRows > materializationRowThreshold {
-		return true
-	}
-
 	// Empty table → use inline semijoin (FirstMatch), not materialization.
-	// MySQL doesn't materialize empty tables; it uses the FirstMatch strategy.
 	if totalRows == 0 {
 		return false
 	}
 
-	// For small non-empty subqueries: check if the join column has a usable index.
-	// If no index on the join column → materialize (hash lookup is cheaper than full scan).
-	// If has index → inline semijoin (eq_ref/ref access is cheap).
+	// Large subquery with no primary key → materialize.
+	if totalRows > materializationRowThreshold {
+		return true
+	}
+
+	// Small non-empty single-table subquery with no primary key (and no FirstMatch) → materialize.
 	if len(realInnerTables) == 1 {
-		innerTableName := realInnerTables[0]
-		tbl, err := e.Storage.GetTable(e.CurrentDB, innerTableName)
-		if err != nil {
-			return false
-		}
-
-		// Find the join column: the first SELECT expression of the inner query
-		if inner.SelectExprs == nil || len(inner.SelectExprs.Exprs) == 0 {
-			return false
-		}
-		var joinColName string
-		if ae, ok := inner.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok {
-			if col, ok := ae.Expr.(*sqlparser.ColName); ok {
-				joinColName = strings.ToLower(col.Name.String())
-			}
-		}
-		if joinColName == "" {
-			return false
-		}
-
-		// Check if inner table has an index starting with the join column
-		if tbl.Def != nil {
-			// Check primary key first
-			if len(tbl.Def.PrimaryKey) > 0 && strings.EqualFold(tbl.Def.PrimaryKey[0], joinColName) {
-				return false // Primary key covers the join column → inline semijoin
-			}
-			// Check secondary indexes
-			for _, idx := range tbl.Def.Indexes {
-				if len(idx.Columns) > 0 && strings.EqualFold(idx.Columns[0], joinColName) {
-					return false // Has a usable index → inline semijoin
-				}
-			}
-		}
-
-		// No usable index → materialize
 		return true
 	}
 
