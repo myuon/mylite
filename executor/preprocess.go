@@ -32,6 +32,11 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	if containsLeadLagWithNegativeOffset(query) {
 		query = rewriteLeadLagNegativeOffset(query)
 	}
+	// Vitess parser loses the inner LIMIT in queries like "(SELECT ... LIMIT N) ORDER BY ...".
+	// Rewrite such queries to use a derived table: SELECT * FROM (SELECT ... LIMIT N) AS _paren_subq ORDER BY ...
+	if rewritten := rewriteParenSelectWithOuterOrderBy(query); rewritten != "" {
+		query = rewritten
+	}
 	trimmed := stripLeadingCStyleComments(strings.TrimSpace(query))
 	query = trimmed
 	e.currentQuery = trimmed
@@ -1607,4 +1612,95 @@ func rewriteLeadLagNegativeOffset(query string) string {
 		}
 		return newFn + "(" + expr + ", " + n
 	})
+}
+
+// rewriteParenSelectWithOuterOrderBy rewrites a query of the form:
+//
+//	(SELECT ... LIMIT N) ORDER BY col [LIMIT M] [OFFSET P]
+//
+// into:
+//
+//	SELECT * FROM (SELECT ... LIMIT N) AS _paren_subq ORDER BY col [LIMIT M] [OFFSET P]
+//
+// This is needed because the vitess parser calls SetLimit on the inner SELECT,
+// which overwrites the inner LIMIT N with the outer LIMIT M. MySQL's semantics
+// require the inner LIMIT to be evaluated first (as a derived table), then the
+// outer ORDER BY/LIMIT applied to those results.
+//
+// Returns empty string if the query does not match this pattern.
+func rewriteParenSelectWithOuterOrderBy(query string) string {
+	trimmed := strings.TrimSpace(query)
+	if len(trimmed) == 0 || trimmed[0] != '(' {
+		return ""
+	}
+	// Find matching close paren at top level
+	depth := 0
+	closeIdx := -1
+	inSingleQuote := false
+	inDoubleQuote := false
+	inBacktick := false
+	for i, ch := range trimmed {
+		if inSingleQuote {
+			if ch == '\'' {
+				inSingleQuote = false
+			}
+			continue
+		}
+		if inDoubleQuote {
+			if ch == '"' {
+				inDoubleQuote = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'':
+			inSingleQuote = true
+		case '"':
+			inDoubleQuote = true
+		case '`':
+			inBacktick = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				closeIdx = i
+				goto foundClose
+			}
+		}
+	}
+foundClose:
+	if closeIdx < 0 {
+		return ""
+	}
+	// The inner content is trimmed[1:closeIdx]
+	innerSQL := trimmed[1:closeIdx]
+	// Check if inner SQL contains LIMIT (indicating it has a limit we want to preserve)
+	innerUpper := strings.ToUpper(innerSQL)
+	if !strings.Contains(innerUpper, "LIMIT") {
+		return ""
+	}
+	// Check that inner starts with SELECT
+	innerTrimmed := strings.TrimSpace(innerSQL)
+	if !strings.HasPrefix(strings.ToUpper(innerTrimmed), "SELECT") {
+		return ""
+	}
+	// What follows the close paren?
+	after := strings.TrimSpace(trimmed[closeIdx+1:])
+	if after == "" {
+		return ""
+	}
+	afterUpper := strings.ToUpper(after)
+	// Must start with ORDER BY or LIMIT
+	if !strings.HasPrefix(afterUpper, "ORDER BY") && !strings.HasPrefix(afterUpper, "LIMIT") {
+		return ""
+	}
+	// Rewrite: SELECT * FROM (inner) AS _paren_subq <after>
+	return "SELECT * FROM (" + innerSQL + ") AS _paren_subq " + after
 }

@@ -743,6 +743,17 @@ func (e *Executor) buildJoinedRowsFromJoinPrefiltered(join *sqlparser.JoinTableE
 					combined[rightAlias+"."+col] = nil
 				}
 			}
+			// Also null all qualified keys from the right rows to ensure
+			// evalRowExpr("ot2.a", combined) returns nil not a fallback value.
+			if len(rightRows) > 0 {
+				for k := range rightRows[0] {
+					if strings.Contains(k, ".") && k != "__column_order__" {
+						if _, alreadySet := combined[k]; !alreadySet {
+							combined[k] = nil
+						}
+					}
+				}
+			}
 			result = append(result, combined)
 		}
 	}
@@ -805,6 +816,11 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 		}
 	}
 
+	// nullPaddingExpr is the TableExpr from which to derive column names for null-padding
+	// when rightRows is empty. For RIGHT JOIN (swapped to LEFT JOIN), the null-padded
+	// side is the original left side (join.LeftExpr). For regular LEFT JOIN, it's join.RightExpr.
+	nullPaddingExpr := sqlparser.TableExpr(join.RightExpr)
+
 	joinType := join.Join
 
 	// Handle RIGHT JOIN by swapping left and right and treating as LEFT JOIN
@@ -812,6 +828,7 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 		leftRows, rightRows = rightRows, leftRows
 		leftAlias, rightAlias = rightAlias, leftAlias
 		leftColNames, rightColNames = rightColNames, leftColNames
+		nullPaddingExpr = join.LeftExpr
 		if joinType == sqlparser.RightJoinType {
 			joinType = sqlparser.LeftJoinType
 		} else {
@@ -948,6 +965,40 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 				combined[col] = nil
 				if rightAlias != "" {
 					combined[rightAlias+"."+col] = nil
+				}
+			}
+			// Also null all qualified keys from the right rows (e.g. "ot2.a", "ot3.a").
+			// This ensures that evalRowExpr("ot2.a", combined) correctly returns nil
+			// rather than falling back to the unqualified "a" key. Without this,
+			// a cascaded LEFT JOIN's ON condition like "ot2.a=ot4.a" would incorrectly
+			// match against another table's "a" value.
+			if len(rightRows) > 0 {
+				for k := range rightRows[0] {
+					if strings.Contains(k, ".") && k != "__column_order__" {
+						if _, alreadySet := combined[k]; !alreadySet {
+							combined[k] = nil
+						}
+					}
+				}
+			} else {
+				// rightRows is empty (e.g. inner join with no matches): derive right-side
+				// column names from the schema to ensure qualified keys are set to nil.
+				rightDefs, rightAliases := e.collectTableDefsWithAliases(nullPaddingExpr)
+				for di, def := range rightDefs {
+					if def == nil {
+						continue
+					}
+					tableAlias := ""
+					if di < len(rightAliases) {
+						tableAlias = rightAliases[di]
+					}
+					for _, col := range def.Columns {
+						colName := col.Name
+						combined[colName] = nil
+						if tableAlias != "" {
+							combined[tableAlias+"."+colName] = nil
+						}
+					}
 				}
 			}
 			result = append(result, combined)
@@ -2010,6 +2061,20 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		resultRows = unique
 	}
 
+	// Validate ORDER BY positions: numeric literals out of range → error 1054.
+	// Also validate ORDER BY column references exist.
+	if stmt.OrderBy != nil {
+		for _, order := range stmt.OrderBy {
+			expr := order.Expr
+			if lit, ok := expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.IntVal {
+				pos := int(toInt64(lit.Val))
+				if pos < 1 || pos > len(colNames) {
+					return nil, mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%d' in 'order clause'", pos))
+				}
+			}
+		}
+	}
+
 	// Apply ORDER BY
 	needsSortStats := stmt.OrderBy != nil && !preSortedOrderBy
 	if needsSortStats {
@@ -2700,6 +2765,33 @@ func collectColumnEqualities(expr sqlparser.Expr, pairs *[][2]string) {
 
 // execSelectGroupBy handles SELECT with GROUP BY or aggregate functions.
 func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.Row) (*Result, error) {
+	// Validate: aggregate functions are not allowed in GROUP BY expressions (error 1111).
+	// Also validate that GROUP BY numeric positions are within range (error 1054).
+	if stmt.GroupBy != nil {
+		numSelectExprs := len(stmt.SelectExprs.Exprs)
+		// Check for star expression - when SELECT *, position validation is skipped
+		hasStar := false
+		for _, se := range stmt.SelectExprs.Exprs {
+			if _, ok := se.(*sqlparser.StarExpr); ok {
+				hasStar = true
+				break
+			}
+		}
+		for _, gbExpr := range stmt.GroupBy.Exprs {
+			if containsAggregate(gbExpr) {
+				return nil, mysqlError(1111, "HY000", "Invalid use of group function")
+			}
+			if !hasStar {
+				if lit, ok := gbExpr.(*sqlparser.Literal); ok && lit.Type == sqlparser.IntVal {
+					pos := int(toInt64(lit.Val))
+					if pos < 1 || pos > numSelectExprs {
+						return nil, mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%d' in 'group statement'", pos))
+					}
+				}
+			}
+		}
+	}
+
 	// ONLY_FULL_GROUP_BY: validate that non-aggregate SELECT expressions appear in GROUP BY.
 	// With SELECT DISTINCT, all selected columns are implicitly grouped, so skip the check.
 	if stmt.GroupBy != nil && len(stmt.GroupBy.Exprs) > 0 &&
@@ -3013,12 +3105,10 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 				groups = append(groups, group{key: key, rows: []storage.Row{row}})
 			}
 		}
-		// WITH ROLLUP requires groups to be sorted by group key (MySQL behavior)
-		if stmt.GroupBy.WithRollup {
-			sort.Slice(groups, func(i, j int) bool {
-				return compareGroupKeys(groups[i].key, groups[j].key) < 0
-			})
-		}
+		// MySQL sorts GROUP BY groups by key (ascending, NULLs first)
+		sort.SliceStable(groups, func(i, j int) bool {
+			return compareGroupKeys(groups[i].key, groups[j].key) < 0
+		})
 	} else {
 		// No GROUP BY but has aggregates: treat all rows as one group
 		groups = []group{{key: "", rows: allRows}}
@@ -4018,7 +4108,34 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			}
 			out = append(out, s)
 		}
-		return strings.Join(out, sep), nil
+		result := strings.Join(out, sep)
+		// Apply group_concat_max_len limit.
+		// MySQL limits GROUP_CONCAT output based on group_concat_max_len.
+		// For BLOB/binary columns with multibyte session charset (e.g. utf8mb4, mbmaxlen=4),
+		// MySQL uses group_concat_max_len / mbmaxlen as the effective byte limit.
+		// The default session charset in MySQL 8.0 is utf8mb4 (mbmaxlen=4).
+		if len(execCtx) > 0 && execCtx[0] != nil {
+			exec := execCtx[0]
+			maxLen := int64(1024) // MySQL default group_concat_max_len
+			if v, ok := exec.getSysVar("group_concat_max_len"); ok {
+				if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+					maxLen = n
+				}
+			}
+			// Effective byte limit: group_concat_max_len / mbmaxlen_of_session_charset.
+			// For utf8mb4 (default), mbmaxlen=4; for latin1/binary, mbmaxlen=1.
+			// We use mbmaxlen=4 as the default (MySQL 8.0 default charset is utf8mb4).
+			const mbmaxlen = 4
+			effectiveMaxBytes := int(maxLen) / mbmaxlen
+			if len(result) > effectiveMaxBytes {
+				// Truncate to effectiveMaxBytes and emit Warning 1260 for each source row.
+				result = result[:effectiveMaxBytes]
+				for i := range sortedRows {
+					exec.addWarning("Warning", 1260, "Row "+strconv.Itoa(i+1)+" was cut by GROUP_CONCAT()")
+				}
+			}
+		}
+		return result, nil
 	case *sqlparser.BitAnd:
 		result := uint64(0xFFFFFFFFFFFFFFFF) // default: all bits set
 		for _, row := range groupRows {
@@ -5215,38 +5332,51 @@ func subqueryHasLimit(sub *sqlparser.Subquery) bool {
 // isNonCorrelatedSubquery returns true when the subquery only references
 // tables declared in its own FROM clause.  This is a conservative check:
 // if we can't determine the answer, we return false (correlated).
-func isNonCorrelatedSubquery(sub *sqlparser.Subquery) bool {
+func (e *Executor) isNonCorrelatedSubquery(sub *sqlparser.Subquery) bool {
 	sel, ok := sub.Select.(*sqlparser.Select)
 	if !ok {
 		return false
 	}
 	// Collect table names / aliases from the subquery's FROM clause.
 	fromTables := map[string]bool{}
+	// Also collect actual column names for each table (for unqualified column checks).
+	tableColumns := map[string]map[string]bool{} // table/alias -> column set
+	collectFromTable := func(te *sqlparser.AliasedTableExpr) {
+		if tn, ok2 := te.Expr.(sqlparser.TableName); ok2 {
+			tableName := strings.ToLower(tn.Name.String())
+			fromTables[tableName] = true
+			alias := tableName
+			if !te.As.IsEmpty() {
+				alias = strings.ToLower(te.As.String())
+				fromTables[alias] = true
+			}
+			// Collect column names for this table
+			if e.Storage != nil {
+				db := e.CurrentDB
+				if !tn.Qualifier.IsEmpty() {
+					db = tn.Qualifier.String()
+				}
+				if tbl, err := e.Storage.GetTable(db, tableName); err == nil && tbl.Def != nil {
+					cols := map[string]bool{}
+					for _, col := range tbl.Def.Columns {
+						cols[strings.ToLower(col.Name)] = true
+					}
+					tableColumns[tableName] = cols
+					tableColumns[alias] = cols
+				}
+			}
+		}
+	}
 	for _, te := range sel.From {
 		switch t := te.(type) {
 		case *sqlparser.AliasedTableExpr:
-			if tn, ok2 := t.Expr.(sqlparser.TableName); ok2 {
-				fromTables[strings.ToLower(tn.Name.String())] = true
-			}
-			if !t.As.IsEmpty() {
-				fromTables[strings.ToLower(t.As.String())] = true
-			}
+			collectFromTable(t)
 		case *sqlparser.JoinTableExpr:
 			if ate, ok2 := t.LeftExpr.(*sqlparser.AliasedTableExpr); ok2 {
-				if tn, ok3 := ate.Expr.(sqlparser.TableName); ok3 {
-					fromTables[strings.ToLower(tn.Name.String())] = true
-				}
-				if !ate.As.IsEmpty() {
-					fromTables[strings.ToLower(ate.As.String())] = true
-				}
+				collectFromTable(ate)
 			}
 			if ate, ok2 := t.RightExpr.(*sqlparser.AliasedTableExpr); ok2 {
-				if tn, ok3 := ate.Expr.(sqlparser.TableName); ok3 {
-					fromTables[strings.ToLower(tn.Name.String())] = true
-				}
-				if !ate.As.IsEmpty() {
-					fromTables[strings.ToLower(ate.As.String())] = true
-				}
+				collectFromTable(ate)
 			}
 		default:
 			return false // unknown FROM structure, assume correlated
@@ -5254,6 +5384,13 @@ func isNonCorrelatedSubquery(sub *sqlparser.Subquery) bool {
 	}
 	if len(fromTables) == 0 {
 		return false
+	}
+	// Build a merged set of all columns from all FROM tables (for unqualified column checks).
+	allFromColumns := map[string]bool{}
+	for _, cols := range tableColumns {
+		for col := range cols {
+			allFromColumns[col] = true
+		}
 	}
 	// Walk all ColName nodes in WHERE and SELECT and check qualifiers.
 	correlated := false
@@ -5270,6 +5407,15 @@ func isNonCorrelatedSubquery(sub *sqlparser.Subquery) bool {
 			if !n.Qualifier.Name.IsEmpty() {
 				q := strings.ToLower(n.Qualifier.Name.String())
 				if !fromTables[q] {
+					correlated = true
+				}
+			} else {
+				// Unqualified column: check if it exists in any FROM table.
+				// If the column is NOT in any FROM table's schema, it might be a
+				// correlated reference to an outer query's column.
+				colLower := strings.ToLower(n.Name.String())
+				if len(tableColumns) > 0 && !allFromColumns[colLower] {
+					// Column not found in any FROM table - might be correlated.
 					correlated = true
 				}
 			}
@@ -5315,7 +5461,7 @@ func (e *Executor) execSubqueryValues(sub *sqlparser.Subquery, outerRow storage.
 
 	// For non-correlated subqueries, return cached values if available.
 	cacheKey := ""
-	if isNonCorrelatedSubquery(sub) {
+	if e.isNonCorrelatedSubquery(sub) {
 		cacheKey = sqlparser.String(sub)
 		if cached, ok := e.subqueryValCache[cacheKey]; ok {
 			return cached, nil

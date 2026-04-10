@@ -144,10 +144,95 @@ func (e *Executor) evalLiteralExpr(v *sqlparser.Literal) (interface{}, error) {
 			return int64(u), nil
 		}
 		return u, nil
+	case sqlparser.DateVal:
+		// Validate DATE literal: must have exactly 3 components (year, month, day)
+		// separated by -, ., /, or :. No trailing time components allowed.
+		s := v.Val
+		normalized, err := normalizeDateLiteral(s, e.sqlMode)
+		if err != nil {
+			return nil, err
+		}
+		return normalized, nil
 	default:
 		// Handle timestamp/date/time typed literals as plain string values.
 		return v.Val, nil
 	}
+}
+
+// normalizeDateLiteral validates and normalizes a DATE literal string.
+// Returns the normalized "YYYY-MM-DD" string, or an error if invalid.
+// Supports MySQL's flexible date parsing:
+//   - Separators: -, ., /, :
+//   - 2-digit years: 00-69 → 2000-2069, 70-99 → 1970-1999
+//   - Output always "YYYY-MM-DD"
+//
+// Invalid cases (error): fewer than 3 components, trailing time part (space), non-digit chars.
+func normalizeDateLiteral(s, sqlMode string) (string, error) {
+	// No spaces allowed in DATE literals (space indicates trailing time part)
+	if strings.ContainsAny(s, " \t") {
+		return "", mysqlError(1292, "HY000", fmt.Sprintf("Incorrect DATE value: '%s'", s))
+	}
+
+	// Count separator characters - find the separator used
+	var sep byte
+	sepCount := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '-' || c == '.' || c == '/' || c == ':' {
+			if sepCount == 0 {
+				sep = c
+			} else if c != sep {
+				// Mixed separators not allowed
+				return "", mysqlError(1292, "HY000", fmt.Sprintf("Incorrect DATE value: '%s'", s))
+			}
+			sepCount++
+		}
+	}
+
+	// Must have exactly 2 separators (3 components)
+	if sepCount != 2 {
+		return "", mysqlError(1292, "HY000", fmt.Sprintf("Incorrect DATE value: '%s'", s))
+	}
+
+	// Check that each component is a non-empty sequence of digits
+	parts := strings.Split(s, string([]byte{sep}))
+	if len(parts) != 3 {
+		return "", mysqlError(1292, "HY000", fmt.Sprintf("Incorrect DATE value: '%s'", s))
+	}
+	for _, p := range parts {
+		if p == "" {
+			return "", mysqlError(1292, "HY000", fmt.Sprintf("Incorrect DATE value: '%s'", s))
+		}
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return "", mysqlError(1292, "HY000", fmt.Sprintf("Incorrect DATE value: '%s'", s))
+			}
+		}
+	}
+
+	// Parse year/month/day as integers
+	year, _ := strconv.Atoi(parts[0])
+	month, _ := strconv.Atoi(parts[1])
+	day, _ := strconv.Atoi(parts[2])
+
+	// Normalize 2-digit years: 00-69 → 2000-2069, 70-99 → 1970-1999
+	if len(parts[0]) <= 2 {
+		if year <= 69 {
+			year += 2000
+		} else {
+			year += 1900
+		}
+	}
+
+	// Check sql_mode restrictions
+	if strings.Contains(sqlMode, "NO_ZERO_IN_DATE") || strings.Contains(sqlMode, "TRADITIONAL") {
+		if month == 0 || day == 0 {
+			return "", mysqlError(1292, "HY000", fmt.Sprintf("Incorrect DATE value: '%s'", s))
+		}
+	}
+
+	// Return normalized YYYY-MM-DD
+	return fmt.Sprintf("%04d-%02d-%02d", year, month, day), nil
 }
 
 // evalColNameExpr handles *sqlparser.ColName evaluation.

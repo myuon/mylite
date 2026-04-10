@@ -1833,12 +1833,12 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 				if col.AutoIncrement {
 					extra = "auto_increment"
 				} else if col.OnUpdateCurrentTimestamp {
-					if col.Default != nil && strings.ToUpper(*col.Default) == "CURRENT_TIMESTAMP" {
+					if col.Default != nil && strings.HasPrefix(strings.ToUpper(*col.Default), "CURRENT_TIMESTAMP") {
 						extra = "DEFAULT_GENERATED on update CURRENT_TIMESTAMP"
 					} else {
 						extra = "on update CURRENT_TIMESTAMP"
 					}
-				} else if col.Default != nil && strings.ToUpper(*col.Default) == "CURRENT_TIMESTAMP" {
+				} else if col.Default != nil && strings.HasPrefix(strings.ToUpper(*col.Default), "CURRENT_TIMESTAMP") {
 					// TIMESTAMP/DATETIME with DEFAULT CURRENT_TIMESTAMP (no ON UPDATE)
 					extra = "DEFAULT_GENERATED"
 				}
@@ -1960,11 +1960,14 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 			tblIsTemp := e.tempTables != nil && (e.tempTables[tblName] || e.tempTables[strings.ToLower(tblName)])
 			appendIndexRows := func(indexName string, cols []string, nonUnique int64, idxComment string, idxType string, invisible bool) {
 				var dynamic []int64
-				if !readPersistent && (tblUsesTransientStats || tblIsTemp || len(dataRows) > 0) {
+				tblIsNonInnoDB := tblEngine != "" && tblEngine != "INNODB"
+				if (!readPersistent && (tblUsesTransientStats || tblIsTemp || len(dataRows) > 0)) ||
+					(tblIsNonInnoDB && len(dataRows) > 0) {
 					// Compute dynamic stats when:
 					// - Transient InnoDB (STATS_PERSISTENT=0): always compute
 					// - Temporary tables: always compute
 					// - Any table with rows: compute for fallback
+					// - Non-InnoDB tables (MyISAM etc.): always compute from live data
 					dynamic = distinctPrefixCounts(dataRows, cols)
 				}
 				indexTypeStr := "BTREE"
@@ -1984,11 +1987,19 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 					}
 					statKey := strings.ToLower(dbName + "." + tblName + "." + indexName + "." + fmt.Sprintf("n_diff_pfx%02d", i+1))
 					var cardinality interface{}
-					if readPersistent {
+					// readPersistent only applies to InnoDB tables (which have innodb_index_stats entries).
+					// Non-InnoDB tables (MyISAM, etc.) don't have persistent stats, so use dynamic.
+					tblIsInnoDB := tblEngine == "" || tblEngine == "INNODB"
+					if readPersistent && tblIsInnoDB {
 						// When stats_expiry=0, always read from persistent storage.
-						// If key not found or not-analyzed sentinel, return NULL.
-						if cardinalityKeyExists[statKey] && !cardinalityNotAnalyzed[statKey] {
+						// MySQL returns the stored stat_value even for unanalyzed tables (shows 0 for empty tables).
+						// If no persistent entry exists (e.g., new index added via CREATE INDEX), use dynamic stats.
+						if cardinalityKeyExists[statKey] {
 							cardinality = cardinalityByKey[statKey]
+						} else if i < len(dynamic) {
+							cardinality = dynamic[i]
+						} else {
+							cardinality = int64(0)
 						}
 					} else if cardinalityKeyExists[statKey] {
 						if cardinalityNotAnalyzed[statKey] {
@@ -2424,9 +2435,9 @@ type innoDBMetricDef struct {
 
 // innoDBMetrics is a list of known InnoDB metrics, mirroring the MySQL 8.0 set.
 var innoDBMetrics = []innoDBMetricDef{
-	{"metadata_table_reference_count", "metadata", "counter"},
 	{"metadata_table_handles_opened", "metadata", "counter"},
 	{"metadata_table_handles_closed", "metadata", "counter"},
+	{"metadata_table_reference_count", "metadata", "counter"},
 	{"lock_deadlocks", "lock", "counter"},
 	{"lock_deadlock_false_positives", "lock", "counter"},
 	{"lock_deadlock_rounds", "counter", "counter"},

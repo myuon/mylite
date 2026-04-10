@@ -402,9 +402,21 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 		if hasNull {
 			return nil, true, nil
 		}
-		// PAD SPACE: strip trailing spaces for non-binary comparison
-		s0 := strings.TrimRight(strings.ToLower(toString(v0)), " ")
-		s1 := strings.TrimRight(strings.ToLower(toString(v1)), " ")
+		// PAD SPACE: compare with space-padding semantics (MySQL non-binary collation).
+		// When one string is shorter, it is virtually padded with spaces for comparison.
+		// This means 'a\0' < 'a' because 'a' pads to 'a ' and '\0' (0x00) < ' ' (0x20).
+		s0 := strings.ToLower(toString(v0))
+		s1 := strings.ToLower(toString(v1))
+		cmpLen := len(s0)
+		if len(s1) > cmpLen {
+			cmpLen = len(s1)
+		}
+		for len(s0) < cmpLen {
+			s0 += " "
+		}
+		for len(s1) < cmpLen {
+			s1 += " "
+		}
 		if s0 < s1 {
 			return int64(-1), true, nil
 		} else if s0 > s1 {

@@ -138,6 +138,14 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 			}
 			return cs, true, nil
 		}
+		// Functions that return binary: aes_encrypt, sha1, sha2, sha, md5, random_bytes, etc.
+		if innerFunc, ok := v.Exprs[0].(*sqlparser.FuncExpr); ok {
+			funcName := strings.ToLower(innerFunc.Name.String())
+			switch funcName {
+			case "aes_encrypt", "aes_decrypt", "random_bytes", "compress":
+				return "binary", true, nil
+			}
+		}
 		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {
 			return nil, true, err

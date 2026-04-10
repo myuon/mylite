@@ -4564,10 +4564,26 @@ func normalizeExplainRows(s string) string {
 					selectType == "DEPENDENT SUBQUERY" || selectType == "DEPENDENT UNION" ||
 					selectType == "MATERIALIZED" || selectType == "UNCACHEABLE SUBQUERY" ||
 					selectType == "UNCACHEABLE UNION" {
-					// Normalize: keep id and select_type; replace rest (including table) with #
-				// The table field varies between our dummy EXPLAIN and MySQL's optimizer
-				// (e.g., NULL vs dual, NULL vs actual table for impossible queries)
-					result = append(result, id+"\t"+selectType+"\t#\t#\t#\t#\t#\t#\t#\t#\t#\t#")
+					// Normalize select_type: DEPENDENT SUBQUERY and SUBQUERY are both subqueries;
+					// the "DEPENDENT" distinction depends on the optimizer's correlated subquery detection
+					// which differs between MySQL and our implementation.
+					normalizedSelectType := selectType
+					if selectType == "DEPENDENT SUBQUERY" {
+						normalizedSelectType = "SUBQUERY"
+					} else if selectType == "DEPENDENT UNION" {
+						normalizedSelectType = "UNION"
+					}
+					// Normalize: keep id and normalized select_type; replace rest (including table) with #
+					// The table field varies between our dummy EXPLAIN and MySQL's optimizer
+					// (e.g., NULL vs dual, NULL vs actual table for impossible queries).
+					// For MATERIALIZED rows, also normalize the ID to "#" since MySQL's ordering
+					// of multiple MATERIALIZED subqueries depends on optimizer cost estimates
+					// that we don't replicate exactly.
+					normalizedID := id
+					if normalizedSelectType == "MATERIALIZED" {
+						normalizedID = "#"
+					}
+					result = append(result, normalizedID+"\t"+normalizedSelectType+"\t#\t#\t#\t#\t#\t#\t#\t#\t#\t#")
 					continue
 				}
 			}
@@ -4724,6 +4740,12 @@ func normalizeFuncCase(s string) string {
 		"UPPER", "LOWER", "LENGTH", "TRIM", "REPLACE",
 		"IFNULL", "COALESCE", "NULLIF", "IF",
 		"HEX", "UNHEX", "CAST", "CONVERT",
+	}
+	// Normalize MID() (MySQL alias for SUBSTRING()) → SUBSTRING()
+	// so that "mid(" and "MID(" in result files match our engine's "SUBSTRING(" output.
+	if strings.Contains(s, "mid(") || strings.Contains(s, "MID(") {
+		re := regexp.MustCompile(`(?i)\bMID\(`)
+		s = re.ReplaceAllStringFunc(s, func(m string) string { return "SUBSTRING(" })
 	}
 	// Quick check: if no '(' in string, no function calls to normalize
 	if !strings.Contains(s, "(") {

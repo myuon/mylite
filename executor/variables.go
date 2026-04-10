@@ -45,6 +45,12 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			cleanVarName == "performance_schema_instrument" {
 			return nil, mysqlError(1193, "HY000", fmt.Sprintf("Unknown system variable '%s'", cleanVarName))
 		}
+		// Type check for pure-string system variables must happen BEFORE read-only check
+		// (MySQL returns ER_WRONG_TYPE_FOR_VAR when you pass a numeric to a string-only var,
+		// even if that var is also read-only).
+		if sysVarPureStringType[cleanVarName] && isInvalidStringVarExpr(cleanVarName, expr.Expr) {
+			return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanVarName))
+		}
 		// Check if variable is read-only
 		if sysVarReadOnly[cleanVarName] {
 			return nil, mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a read only variable", cleanVarName))
@@ -82,10 +88,6 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			if sysVarStringType[cleanVarName] {
 				return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of 'NULL'", cleanVarName))
 			}
-		}
-		// Reject numeric literals or bare identifiers for pure-string system variables (MySQL error 1232)
-		if sysVarPureStringType[cleanVarName] && isInvalidStringVarExpr(cleanVarName, expr.Expr) {
-			return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", cleanVarName))
 		}
 		val := sqlparser.String(expr.Expr)
 		val = strings.Trim(val, "'\"")
@@ -1220,7 +1222,13 @@ func (e *Executor) handleRawSet(raw string) error {
 		// Check read-only
 		if sysVarReadOnly[varName] {
 			if isPersistOnly {
-				return mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a non persistent read only variable", varName))
+				// "Non persistent read only" variables cannot be configured even via PERSIST_ONLY.
+				if sysVarNonPersistReadOnly[varName] {
+					return mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a non persistent read only variable", varName))
+				}
+				// Regular read-only variables: SET PERSIST_ONLY is allowed (writes to mysqld-auto.cnf for next restart)
+				// without affecting the current running value. Return success silently.
+				return nil
 			}
 			return mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a read only variable", varName))
 		}
@@ -1551,6 +1559,13 @@ var sysVarReadOnly = map[string]bool{
 	"lock_order_trace_missing_key":                 true,
 	"lock_order_trace_missing_unlock":              true,
 	"log_error": true,
+}
+
+// sysVarNonPersistReadOnly contains system variables that cannot be SET even via PERSIST_ONLY.
+// These are "non persistent read only" variables in MySQL terminology - they differ from
+// regular read-only variables which can still be written to mysqld-auto.cnf via PERSIST_ONLY.
+var sysVarNonPersistReadOnly = map[string]bool{
+	"innodb_temp_tablespaces_dir": true,
 }
 
 // sysVarGlobalOnly contains system variables that can only be SET at GLOBAL scope.
@@ -1975,6 +1990,9 @@ var sysVarPureStringType = map[string]bool{
 	"innodb_ft_user_stopword_table":   true,
 	"general_log_file":                true,
 	"slow_query_log_file":             true,
+	// SSL path variables: reject numeric literals with ER_WRONG_TYPE_FOR_VAR
+	"ssl_ca": true, "ssl_capath": true, "ssl_cert": true, "ssl_cipher": true,
+	"ssl_key": true, "ssl_crl": true, "ssl_crlpath": true,
 }
 
 // checkIntVarType checks if the expression is a valid integer type for integer-range
@@ -3212,9 +3230,24 @@ func sysVarStringToSelectValue(val string) interface{} {
 	return sysVarStringToSelectValueForVar(val, "")
 }
 
+// sysVarNullableEmpty lists system variables that should return NULL (not empty string) when unset.
+// In MySQL these file-path variables are NULL when not configured.
+var sysVarNullableEmpty = map[string]bool{
+	"ssl_ca": true, "ssl_capath": true, "ssl_cert": true, "ssl_cipher": true,
+	"ssl_key": true, "ssl_crl": true, "ssl_crlpath": true,
+	"mysqlx_ssl_capath": true, "mysqlx_ssl_cipher": true,
+	"mysqlx_ssl_crl": true, "mysqlx_ssl_crlpath": true,
+	// Note: mysqlx_ssl_ca, mysqlx_ssl_cert, mysqlx_ssl_key are auto-generated in MySQL
+	// and have non-empty defaults, so they are NOT in this list.
+}
+
 // sysVarStringToSelectValueForVar converts with variable name awareness.
 // For enum-type variables, ON/OFF strings are preserved; for booleans they become 0/1.
 func sysVarStringToSelectValueForVar(val string, varName string) interface{} {
+	// Nullable-empty variables return NULL when their value is empty string.
+	if val == "" && sysVarNullableEmpty[varName] {
+		return nil
+	}
 	upper := strings.ToUpper(val)
 	// For enum variables, don't convert ON/OFF to 0/1
 	if !sysVarEnumSet[varName] {
@@ -3749,13 +3782,13 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"mysqlx_port_open_timeout":                    "0",
 		"mysqlx_read_timeout":                         "30",
 		"mysqlx_socket":                               "/var/run/mysqld/mysqlx.sock",
-		"mysqlx_ssl_ca":                               "",
+		"mysqlx_ssl_ca":                               "/var/lib/mysql/ca.pem",
 		"mysqlx_ssl_capath":                           "",
-		"mysqlx_ssl_cert":                             "",
+		"mysqlx_ssl_cert":                             "/var/lib/mysql/server-cert.pem",
 		"mysqlx_ssl_cipher":                           "",
 		"mysqlx_ssl_crl":                              "",
 		"mysqlx_ssl_crlpath":                          "",
-		"mysqlx_ssl_key":                              "",
+		"mysqlx_ssl_key":                              "/var/lib/mysql/server-key.pem",
 		"mysqlx_wait_timeout":                         "28800",
 		"mysqlx_write_timeout":                        "60",
 		"mysqlx_compression_algorithms":               "deflate_stream,lz4_message,zstd_stream",
@@ -4114,6 +4147,9 @@ func (e *Executor) showStatus(upper string) (*Result, error) {
 	}{
 		{Name: "Aborted_clients", Value: "0"},
 		{Name: "Aborted_connects", Value: "0"},
+		{Name: "Created_tmp_disk_tables", Value: "0"},
+		{Name: "Created_tmp_files", Value: "0"},
+		{Name: "Created_tmp_tables", Value: "0"},
 		{Name: "Bytes_received", Value: "0"},
 		{Name: "Bytes_sent", Value: "0"},
 		{Name: "Com_select", Value: "1"},

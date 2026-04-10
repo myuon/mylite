@@ -647,6 +647,10 @@ func (e *Executor) evalWindowFuncForRow(
 		return e.evalRowExpr(v.Expr, partRows[end])
 
 	case *sqlparser.NTHValueExpr:
+		// FROM LAST is not supported (MySQL limitation)
+		if v.FromFirstLastClause != nil && v.FromFirstLastClause.Type == sqlparser.FromLastType {
+			return nil, mysqlError(1235, "42000", "This version of MySQL doesn't yet support ' FROM LAST'")
+		}
 		start, end := e.computeFrameBounds(ws.FrameClause, ws.OrderClause, partRows, localIdx, orderByVals)
 		if start < 0 {
 			start = 0

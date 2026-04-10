@@ -889,6 +889,25 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 	}
 
+	// CSV engine requires all columns to be explicitly NOT NULL (ER_CHECK_NOT_IMPLEMENTED = 1178)
+	{
+		engine := ""
+		for _, opt := range stmt.TableSpec.Options {
+			if strings.EqualFold(opt.Name, "ENGINE") {
+				engine = strings.ToUpper(tableOptionString(opt))
+				break
+			}
+		}
+		if engine == "CSV" {
+			for _, col := range stmt.TableSpec.Columns {
+				isNotNull := col.Type.Options != nil && col.Type.Options.Null != nil && !*col.Type.Options.Null
+				if !isNotNull {
+					return nil, mysqlError(1178, "42000", "The storage engine for the table doesn't support nullable columns")
+				}
+			}
+		}
+	}
+
 	// Check for reserved InnoDB internal column names
 	reservedInnoDBCols := map[string]bool{
 		"db_row_id": true, "db_trx_id": true, "db_roll_ptr": true,
@@ -910,8 +929,31 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	}
 
 	for _, col := range stmt.TableSpec.Columns {
-		// Validate ENUM/SET value lengths (MySQL max is 255 characters).
+		// Validate CHAR/BINARY/VARCHAR/VARBINARY length limits
 		colTypeLower := strings.ToLower(col.Type.Type)
+		if col.Type.Length != nil {
+			length := int64(*col.Type.Length)
+			switch colTypeLower {
+			case "char", "binary":
+				if length > 255 {
+					return nil, mysqlError(1074, "42000", fmt.Sprintf("Column length too big for column '%s' (max = 255); use BLOB or TEXT instead", col.Name.String()))
+				}
+			case "varchar", "varbinary":
+				// For varchar(N) with N > 65535: MySQL promotes to text type silently,
+				// UNLESS the column has a non-NULL default (which can't be stored in a text type).
+				// In that case, error 1074 is returned.
+				// We check this here before default processing; the promotion happens in buildColumnTypeString.
+				if length > 65535 {
+					hasNonNullDefault := col.Type.Options != nil && col.Type.Options.Default != nil &&
+						!strings.EqualFold(sqlparser.String(col.Type.Options.Default), "null")
+					if hasNonNullDefault {
+						return nil, mysqlError(1074, "42000", fmt.Sprintf("Column length too big for column '%s' (max = 65535); use BLOB or TEXT instead", col.Name.String()))
+					}
+				}
+			}
+		}
+
+		// Validate ENUM/SET value lengths (MySQL max is 255 characters).
 		if colTypeLower == "enum" || colTypeLower == "set" {
 			for _, ev := range col.Type.EnumValues {
 				v := strings.Trim(ev, "'")
@@ -981,12 +1023,19 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			// BINARY modifier without explicit CHARACTER SET means binary collation of the current charset.
 			// e.g. VARCHAR(30) BINARY with table charset latin1 -> collation latin1_bin.
 			// We store the charset explicitly so SHOW CREATE TABLE can display the collation.
-			cs := tableCharset
-			if cs == "" {
-				cs = "utf8mb4"
+			// However, if the resulting type is already a native binary/blob type (e.g. "long byte" → mediumblob),
+			// don't add a charset since blob types don't have a charset.
+			colTypeLowerCheck := strings.ToLower(strings.TrimSpace(colDef.Type))
+			isBlobType := strings.HasSuffix(colTypeLowerCheck, "blob") || colTypeLowerCheck == "binary" ||
+				strings.HasPrefix(colTypeLowerCheck, "binary(") || strings.HasPrefix(colTypeLowerCheck, "varbinary")
+			if !isBlobType {
+				cs := tableCharset
+				if cs == "" {
+					cs = "utf8mb4"
+				}
+				colDef.Charset = cs
+				colDef.Collation = catalog.BinaryCollationForCharset(cs)
 			}
-			colDef.Charset = cs
-			colDef.Collation = catalog.BinaryCollationForCharset(cs)
 		} else if strings.EqualFold(tableCharset, "binary") {
 			// Table-level CHARACTER SET binary propagates to columns without explicit charset.
 		}
@@ -1027,16 +1076,40 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				if strings.EqualFold(defStr, "null") {
 					// Keep colDef.Default as nil to represent NULL default
 				} else {
-					// Strip surrounding quotes from default values (vitess adds them)
-					if len(defStr) >= 2 && defStr[0] == '\'' && defStr[len(defStr)-1] == '\'' {
-						defStr = defStr[1 : len(defStr)-1]
+					// Blob/Text/Geometry/JSON columns cannot have a non-empty non-NULL default value.
+					// MySQL errors on non-empty defaults (e.g. default 'hello') and warns on empty defaults (default '').
+					colTypeForDefault := strings.ToLower(colDef.Type)
+					isBlobTextDefault := strings.Contains(colTypeForDefault, "blob") || strings.Contains(colTypeForDefault, "text") ||
+						colTypeForDefault == "json" || colTypeForDefault == "geometry" ||
+						colTypeForDefault == "point" || colTypeForDefault == "linestring" || colTypeForDefault == "polygon" ||
+						colTypeForDefault == "multipoint" || colTypeForDefault == "multilinestring" || colTypeForDefault == "multipolygon" ||
+						colTypeForDefault == "geometrycollection" || colTypeForDefault == "geomcollection"
+					if isBlobTextDefault {
+						// Get the raw default value to check if it's empty
+						rawDefault := sqlparser.String(col.Type.Options.Default)
+						// Strip quotes if present
+						if len(rawDefault) >= 2 && rawDefault[0] == '\'' && rawDefault[len(rawDefault)-1] == '\'' {
+							rawDefault = rawDefault[1 : len(rawDefault)-1]
+						}
+						if rawDefault != "" {
+							return nil, mysqlError(1101, "42000", fmt.Sprintf("BLOB, TEXT, GEOMETRY or JSON column '%s' can't have a default value", col.Name.String()))
+						}
+						// Empty default '' on blob type: MySQL emits warning but allows it.
+						// Skip default processing for this column (leave colDef.Default as nil).
+					} else {
+						// Strip surrounding quotes from default values (vitess adds them)
+						if len(defStr) >= 2 && defStr[0] == '\'' && defStr[len(defStr)-1] == '\'' {
+							defStr = defStr[1 : len(defStr)-1]
+						}
+						// MySQL strips trailing spaces from SET/ENUM default values
+						colTypeLower := strings.ToLower(col.Type.Type)
+						if colTypeLower == "set" || colTypeLower == "enum" {
+							defStr = strings.TrimRight(defStr, " ")
+						}
+						// Normalize now() / current_timestamp() to CURRENT_TIMESTAMP
+						defStr = normalizeCurrentTimestampDefault(defStr)
+						colDef.Default = &defStr
 					}
-					// MySQL strips trailing spaces from SET/ENUM default values
-					colTypeLower := strings.ToLower(col.Type.Type)
-					if colTypeLower == "set" || colTypeLower == "enum" {
-						defStr = strings.TrimRight(defStr, " ")
-					}
-					colDef.Default = &defStr
 				}
 			}
 			// Validate zero date/datetime/timestamp defaults in strict mode
@@ -1449,6 +1522,33 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 						Columns: fkCols,
 						Orders:  idxOrders,
 					})
+				}
+			}
+		}
+	}
+
+	// Resolve duplicate index names: MySQL auto-renames duplicates by appending _2, _3, etc.
+	// (but skip PRIMARY KEY and UNIQUE constraints that have explicit names).
+	{
+		usedNames := make(map[string]bool)
+		for i := range indexes {
+			baseName := indexes[i].Name
+			if baseName == "" {
+				continue
+			}
+			nameLower := strings.ToLower(baseName)
+			if !usedNames[nameLower] {
+				usedNames[nameLower] = true
+			} else {
+				// Collision: find a unique suffix
+				for suffix := 2; ; suffix++ {
+					candidate := fmt.Sprintf("%s_%d", baseName, suffix)
+					candidateLower := strings.ToLower(candidate)
+					if !usedNames[candidateLower] {
+						indexes[i].Name = candidate
+						usedNames[candidateLower] = true
+						break
+					}
 				}
 			}
 		}
@@ -2047,6 +2147,8 @@ func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 			if len(defStr) >= 2 && defStr[0] == '\'' && defStr[len(defStr)-1] == '\'' {
 				defStr = defStr[1 : len(defStr)-1]
 			}
+			// Normalize now() / current_timestamp() to CURRENT_TIMESTAMP
+			defStr = normalizeCurrentTimestampDefault(defStr)
 			colDef.Default = &defStr
 		}
 		if col.Type.Options.OnUpdate != nil {
@@ -2153,6 +2255,50 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		}
 		if isInplace && hasStoredGcolAdd {
 			return nil, mysqlError(1845, "0A000", "ALGORITHM=INPLACE is not supported. Reason: Cannot change column type INPLACE. Try ALGORITHM=COPY.")
+		}
+	}
+
+	// Pre-check: CSV engine requires all columns to be NOT NULL (ER_CHECK_NOT_IMPLEMENTED = 1178)
+	// This applies to ADD COLUMN, MODIFY COLUMN, and CHANGE COLUMN on CSV tables.
+	{
+		tableEngine := ""
+		if tableDef, tdErr := db.GetTable(tableName); tdErr == nil && tableDef != nil {
+			tableEngine = strings.ToUpper(tableDef.Engine)
+		}
+		// Also check if ALTER TABLE itself changes the engine to CSV
+		for _, opt := range stmt.AlterOptions {
+			if tblOpts, ok := opt.(sqlparser.TableOptions); ok {
+				for _, to := range tblOpts {
+					if strings.EqualFold(to.Name, "ENGINE") {
+						tableEngine = strings.ToUpper(tableOptionString(to))
+					}
+				}
+			}
+		}
+		if tableEngine == "CSV" {
+			for _, opt := range stmt.AlterOptions {
+				switch op := opt.(type) {
+				case *sqlparser.AddColumns:
+					for _, col := range op.Columns {
+						isNotNull := col.Type.Options != nil && col.Type.Options.Null != nil && !*col.Type.Options.Null
+						if !isNotNull {
+							return nil, mysqlError(1178, "42000", "The storage engine for the table doesn't support nullable columns")
+						}
+					}
+				case *sqlparser.ModifyColumn:
+					col := op.NewColDefinition
+					isNotNull := col.Type.Options != nil && col.Type.Options.Null != nil && !*col.Type.Options.Null
+					if !isNotNull {
+						return nil, mysqlError(1178, "42000", "The storage engine for the table doesn't support nullable columns")
+					}
+				case *sqlparser.ChangeColumn:
+					col := op.NewColDefinition
+					isNotNull := col.Type.Options != nil && col.Type.Options.Null != nil && !*col.Type.Options.Null
+					if !isNotNull {
+						return nil, mysqlError(1178, "42000", "The storage engine for the table doesn't support nullable columns")
+					}
+				}
+			}
 		}
 	}
 
@@ -3430,6 +3576,37 @@ func padBinaryValue(val interface{}, padLen int) interface{} {
 func buildColumnTypeString(ct *sqlparser.ColumnType, tableCharset string) string {
 	s := strings.ToLower(ct.Type)
 
+	// Normalize MySQL type aliases
+	// "long" and "long text" → mediumtext; "long binary"/"long byte" → mediumblob
+	// Also: "long" with BINARY modifier (ct.Charset.Binary=true) means "long byte" → mediumblob
+	// Note: vitess pre-normalizes "long" → MEDIUMTEXT internally, so we check both.
+	switch strings.ToUpper(s) {
+	case "LONG":
+		if ct.Charset.Binary {
+			s = "mediumblob"
+		} else {
+			s = "mediumtext"
+		}
+	case "LONG VARBINARY", "LONG BINARY", "LONG BYTE":
+		s = "mediumblob"
+	}
+
+	// When the BINARY modifier is set on a LOB text type, convert to the binary equivalent.
+	// e.g. "long byte" → vitess parses as MEDIUMTEXT + Charset.Binary=true → mediumblob
+	// Note: BINARY modifier on non-LOB types (varchar, char) means binary collation, NOT type conversion.
+	if ct.Charset.Binary && ct.Charset.Name == "" {
+		switch strings.ToUpper(s) {
+		case "TINYTEXT":
+			s = "tinyblob"
+		case "TEXT":
+			s = "blob"
+		case "MEDIUMTEXT":
+			s = "mediumblob"
+		case "LONGTEXT":
+			s = "longblob"
+		}
+	}
+
 	// When CHARACTER SET binary is explicitly specified, MySQL normalizes text types
 	// to their binary equivalents (char->binary, varchar->varbinary, text->blob, etc.).
 	// This also applies when the table-level charset is binary.
@@ -3486,6 +3663,80 @@ func buildColumnTypeString(ct *sqlparser.ColumnType, tableCharset string) string
 			storage = " stored"
 		}
 		s += " generated always as (" + sqlparser.String(ct.Options.As) + ")" + storage
+	}
+	// Promote blob/text/varbinary/varchar types based on declared length
+	if ct.Length != nil {
+		// Determine effective charset for byte-length calculation
+		effectiveCharset := ct.Charset.Name
+		if effectiveCharset == "" {
+			effectiveCharset = tableCharset
+		}
+		s = promoteBlobTextType(s, ct.Type, int64(*ct.Length), effectiveCharset)
+	}
+	return s
+}
+
+// promoteBlobTextType promotes blob/text/varbinary/varchar types based on declared length.
+// MySQL auto-selects the smallest type that can hold the declared length.
+// For VARCHAR, the effective length in bytes is length * bytesPerChar(charset).
+func promoteBlobTextType(s string, originalType string, length int64, charset string) string {
+	base := strings.ToUpper(originalType)
+	// For BLOB types: blob(N) → tinyblob/blob/mediumblob/longblob based on N
+	switch base {
+	case "BLOB":
+		if length <= 255 {
+			return "tinyblob"
+		} else if length <= 65535 {
+			return "blob"
+		} else if length <= 16777215 {
+			return "mediumblob"
+		}
+		return "longblob"
+	case "TEXT":
+		if length <= 255 {
+			return "tinytext"
+		} else if length <= 65535 {
+			return "text"
+		} else if length <= 16777215 {
+			return "mediumtext"
+		}
+		return "longtext"
+	case "TINYBLOB":
+		return "tinyblob"
+	case "MEDIUMBLOB":
+		return "mediumblob"
+	case "LONGBLOB":
+		return "longblob"
+	case "TINYTEXT":
+		return "tinytext"
+	case "MEDIUMTEXT":
+		return "mediumtext"
+	case "LONGTEXT":
+		return "longtext"
+	case "VARBINARY":
+		if length > 65535 {
+			if length <= 16777215 {
+				return "mediumblob"
+			}
+			return "longblob"
+		}
+	case "VARCHAR":
+		// MySQL uses byte length for promotion thresholds.
+		// For multibyte charsets (utf8=3 bytes/char, utf8mb4=4 bytes/char), the byte length
+		// may exceed 65535 even if the char count doesn't.
+		byteLen := length * int64(charsetBytesPerChar(charset))
+		if byteLen > 65535 {
+			if byteLen <= 16777215 {
+				return "mediumtext"
+			}
+			return "longtext"
+		} else if length > 65535 {
+			// char count alone exceeds 65535 (e.g. latin1 with 70000 chars)
+			if length <= 16777215 {
+				return "mediumtext"
+			}
+			return "longtext"
+		}
 	}
 	return s
 }
@@ -4524,6 +4775,24 @@ func isZeroInDateValue(val string) bool {
 		}
 	}
 	return false
+}
+
+// normalizeCurrentTimestampDefault normalizes CURRENT_TIMESTAMP synonyms (now(), current_timestamp())
+// to canonical CURRENT_TIMESTAMP form for storage.
+func normalizeCurrentTimestampDefault(s string) string {
+	upper := strings.ToUpper(strings.TrimSpace(s))
+	if upper == "NOW()" || upper == "CURRENT_TIMESTAMP()" {
+		return "CURRENT_TIMESTAMP"
+	}
+	// now(N) or current_timestamp(N) with precision
+	if strings.HasPrefix(upper, "NOW(") && strings.HasSuffix(upper, ")") {
+		n := upper[4 : len(upper)-1]
+		return "CURRENT_TIMESTAMP(" + n + ")"
+	}
+	if strings.HasPrefix(upper, "CURRENT_TIMESTAMP(") {
+		return upper // already canonical
+	}
+	return s
 }
 
 func hasPrimaryKey(tbl *catalog.TableDef) bool {

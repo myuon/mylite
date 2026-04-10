@@ -2,35 +2,21 @@ package executor
 
 import (
 	"testing"
-
-	"github.com/myuon/mylite/catalog"
-	"github.com/myuon/mylite/storage"
+	"fmt"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
 
-func TestShowIndexCardinality(t *testing.T) {
-	cat := catalog.New()
-	store := storage.NewEngine()
-	e := New(cat, store)
-	if _, err := e.Execute("CREATE DATABASE IF NOT EXISTS test"); err != nil {
-		t.Fatalf("create db: %v", err)
-	}
-	e.CurrentDB = "test"
-
-	_, err := e.Execute(`CREATE TABLE t1 (a INT, KEY (a))`)
+func TestParseISUnknown(t *testing.T) {
+	p := sqlparser.NewTestParser()
+	stmt, err := p.Parse("SELECT * FROM x1 WHERE (d1,d2) IN (SELECT d1, d2 FROM x2) IS UNKNOWN")
 	if err != nil {
-		t.Fatalf("create table: %v", err)
+		t.Logf("parse error: %v", err)
+		return
 	}
-
-	result, err := e.Execute("SHOW INDEX FROM t1")
-	if err != nil {
-		t.Fatalf("show index: %v", err)
-	}
-	if len(result.Rows) > 0 {
-		// Column 6 is Cardinality (0-indexed)
-		t.Logf("Columns: %v", result.Columns)
-		t.Logf("Row: %v (types)", result.Rows[0])
-		for i, v := range result.Rows[0] {
-			t.Logf("  col[%d] %s = %v (%T)", i, result.Columns[i], v, v)
-		}
+	sel := stmt.(*sqlparser.Select)
+	where := sel.Where.Expr
+	fmt.Printf("where type: %T\n", where)
+	if isExpr, ok := where.(*sqlparser.IsExpr); ok {
+		fmt.Printf("is expr right: %v\n", isExpr.Right)
 	}
 }

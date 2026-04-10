@@ -248,7 +248,15 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 		}
 		var defVal interface{}
 		if col.Default != nil {
-			defVal = *col.Default
+			// MySQL does not show defaults for BLOB/TEXT/JSON/GEOMETRY columns in SHOW COLUMNS.
+			colTypeLower := strings.ToLower(col.Type)
+			isBlobTextType := strings.Contains(colTypeLower, "blob") || strings.Contains(colTypeLower, "text") ||
+				colTypeLower == "json" || colTypeLower == "geometry"
+			if isBlobTextType {
+				defVal = nil
+			} else {
+				defVal = *col.Default
+			}
 		} else if isInfoSchemaTable(descDB) {
 			defVal = "" // empty for INFORMATION_SCHEMA columns
 		} else {
@@ -264,6 +272,15 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 			} else {
 				extra = "VIRTUAL GENERATED"
 			}
+		} else if col.Default != nil && strings.HasPrefix(strings.ToUpper(*col.Default), "CURRENT_TIMESTAMP") {
+			// TIMESTAMP/DATETIME columns with DEFAULT CURRENT_TIMESTAMP show DEFAULT_GENERATED
+			extraStr := "DEFAULT_GENERATED"
+			if col.OnUpdateCurrentTimestamp {
+				extraStr += " on update CURRENT_TIMESTAMP"
+			}
+			extra = extraStr
+		} else if col.OnUpdateCurrentTimestamp {
+			extra = "on update CURRENT_TIMESTAMP"
 		}
 		// For TEMPORARY tables, MySQL returns NULL for the Extra column when empty
 		if e.tempTables[tableName] && extra == "" {
@@ -1383,6 +1400,18 @@ func mysqlDisplayType(colType string) string {
 		}
 		if strings.HasPrefix(result, "integer") {
 			result = "int" + result[7:]
+		}
+		// Normalize DECIMAL(M) to DECIMAL(M,0) - MySQL always shows scale explicitly
+		if strings.HasPrefix(result, "decimal(") {
+			parenStart := strings.Index(result, "(")
+			// Find matching close paren (before any suffix like " unsigned")
+			parenEnd := strings.Index(result, ")")
+			if parenStart >= 0 && parenEnd > parenStart {
+				inner := result[parenStart+1 : parenEnd]
+				if !strings.Contains(inner, ",") {
+					result = result[:parenEnd] + ",0" + result[parenEnd:]
+				}
+			}
 		}
 		return result
 	}
