@@ -14890,6 +14890,16 @@ func isHexNumLiteral(expr sqlparser.Expr) bool {
 	return false
 }
 
+// hexDecodeString decodes a hex string (e.g. "123ABC") to raw bytes (e.g. "\x12\x3a\xbc").
+// Returns error if the input is not valid hex.
+func hexDecodeString(s string) (string, error) {
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
 // toUint64ForBitOp converts a value to uint64 for bitwise operations,
 // preserving the full uint64 range without float precision loss.
 func toUint64ForBitOp(v interface{}) uint64 {
@@ -17300,6 +17310,27 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 	}
 	if ar, ok := right.(AvgResult); ok {
 		right = ar.Value
+	}
+	// When comparing HexBytes (x'...' literal) against an integer (0x... literal),
+	// decode both to raw byte strings for comparison. In MySQL, x'123ABC' = 0x123ABC
+	// is true because both represent the same binary string "\x12\x3a\xbc".
+	if hb, ok := left.(HexBytes); ok {
+		if isNativeNumericType(right) {
+			// Decode HexBytes to raw bytes, convert integer to raw bytes too
+			decoded, err := hexDecodeString(string(hb))
+			if err == nil {
+				left = decoded
+				right = hexIntToBytes(right)
+			}
+		}
+	} else if hb, ok := right.(HexBytes); ok {
+		if isNativeNumericType(left) {
+			decoded, err := hexDecodeString(string(hb))
+			if err == nil {
+				right = decoded
+				left = hexIntToBytes(left)
+			}
+		}
 	}
 	// NULL-safe equal (<=>): true if both NULL, false if one is NULL, otherwise normal equality.
 	if op == sqlparser.NullSafeEqualOp {
