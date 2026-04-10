@@ -493,6 +493,15 @@ func (e *Executor) sqlNotesEnabled() bool {
 	return true // default is ON
 }
 
+// isSemijoinEnabled returns true if semijoin=on is present in optimizer_switch.
+// When semijoin is disabled, IN-subqueries use SUBQUERY select_type instead of MATERIALIZED.
+func (e *Executor) isSemijoinEnabled() bool {
+	if v, ok := e.getSysVar("optimizer_switch"); ok {
+		return strings.Contains(v, "semijoin=on")
+	}
+	return true // default optimizer_switch has semijoin=on
+}
+
 // getGlobalVar reads a value from globalScopeVars under RLock.
 func (e *Executor) getGlobalVar(name string) (string, bool) {
 	if e.globalVarsMu == nil {
@@ -5215,14 +5224,19 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 				if correlated || innerHasNoSemijoin {
 					selectType = "DEPENDENT SUBQUERY"
 				} else if inContext {
-					bigTables := false
-					if v, ok := e.getSysVar("big_tables"); ok && strings.EqualFold(v, "on") {
-						bigTables = true
-					}
-					if e.isOptimizerSwitchEnabled("materialization") && !bigTables {
-						selectType = "MATERIALIZED"
+					if e.isSemijoinEnabled() {
+						bigTables := false
+						if v, ok := e.getSysVar("big_tables"); ok && strings.EqualFold(v, "on") {
+							bigTables = true
+						}
+						if e.isOptimizerSwitchEnabled("materialization") && !bigTables {
+							selectType = "MATERIALIZED"
+						} else {
+							// When materialization=off or big_tables=ON, IN subqueries use EXISTS strategy → DEPENDENT SUBQUERY
+							selectType = "DEPENDENT SUBQUERY"
+						}
 					} else {
-						// When materialization=off or big_tables=ON, IN subqueries use EXISTS strategy → DEPENDENT SUBQUERY
+						// semijoin=off: IN subqueries use EXISTS strategy → DEPENDENT SUBQUERY
 						selectType = "DEPENDENT SUBQUERY"
 					}
 				}

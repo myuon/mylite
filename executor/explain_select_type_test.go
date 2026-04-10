@@ -254,15 +254,16 @@ func TestExplainSelectType_Materialized(t *testing.T) {
 	if types[0] != "PRIMARY" {
 		t.Errorf("expected first row select_type=PRIMARY (semijoin=off), got %v", types[0])
 	}
+	// When semijoin=off, MySQL uses DEPENDENT SUBQUERY (EXISTS strategy) for IN-subqueries
 	found := false
 	for _, st := range types[1:] {
-		if st == "MATERIALIZED" {
+		if st == "DEPENDENT SUBQUERY" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("expected a MATERIALIZED row (semijoin=off), got types: %v", types)
+		t.Errorf("expected a DEPENDENT SUBQUERY row (semijoin=off), got types: %v", types)
 	}
 }
 
