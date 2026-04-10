@@ -1488,8 +1488,9 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 					totalCount *= int64(len(rows))
 				}
 				return &Result{
-					Columns: []string{colName},
-					Rows:    [][]interface{}{{totalCount}},
+					Columns:     []string{colName},
+					Rows:        [][]interface{}{{totalCount}},
+					IsResultSet: true,
 				}, nil
 			}
 			// WITH WHERE: pre-filter each table's rows using single-table
@@ -1546,8 +1547,9 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				e.lastAutoIncID = 0
 			}
 			return &Result{
-				Columns: []string{colName},
-				Rows:    [][]interface{}{{totalCount}},
+				Columns:     []string{colName},
+				Rows:        [][]interface{}{{totalCount}},
+				IsResultSet: true,
 			}, nil
 		}
 	}
@@ -1909,6 +1911,19 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 			fromExpr = stmt.From[0]
 		}
 		defaultCollation := resolveOrderByCollation(selectTableDefs, fromExpr)
+		// Build binary column set for pre-projection sort
+		preSortBinaryCols := make(map[string]bool)
+		for _, td := range selectTableDefs {
+			if td == nil {
+				continue
+			}
+			for _, col := range td.Columns {
+				ct := strings.ToUpper(strings.TrimSpace(col.Type))
+				if strings.HasPrefix(ct, "BINARY") || strings.HasPrefix(ct, "VARBINARY") || strings.HasPrefix(ct, "BLOB") {
+					preSortBinaryCols[strings.ToLower(col.Name)] = true
+				}
+			}
+		}
 		sort.SliceStable(allRows, func(a, b int) bool {
 			for _, order := range stmt.OrderBy {
 				expr := order.Expr
@@ -1923,6 +1938,13 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 					if convExpr.Type != nil && strings.EqualFold(convExpr.Type.Type, "binary") {
 						orderCollation = "binary"
 						expr = convExpr.Expr
+					}
+				}
+				// Check if ORDER BY column is a BINARY/VARBINARY column type
+				if col, ok := expr.(*sqlparser.ColName); ok {
+					colLower := strings.ToLower(strings.Trim(col.Name.String(), "`"))
+					if preSortBinaryCols[colLower] {
+						orderCollation = "binary"
 					}
 				}
 				va := resolveOrderByExprValue(e, expr, allRows[a])
@@ -1995,7 +2017,20 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		if len(stmt.From) > 0 {
 			fromExpr2 = stmt.From[0]
 		}
-		resultRows, err = applyOrderBy(stmt.OrderBy, colNames, resultRows, resolveOrderByCollation(selectTableDefs, fromExpr2))
+		// Build a set of column names that have BINARY/VARBINARY type (require binary collation for sort)
+		binaryColNames := make(map[string]bool)
+		for _, td := range selectTableDefs {
+			if td == nil {
+				continue
+			}
+			for _, col := range td.Columns {
+				ct := strings.ToUpper(strings.TrimSpace(col.Type))
+				if strings.HasPrefix(ct, "BINARY") || strings.HasPrefix(ct, "VARBINARY") || strings.HasPrefix(ct, "BLOB") {
+					binaryColNames[strings.ToLower(col.Name)] = true
+				}
+			}
+		}
+		resultRows, err = applyOrderByWithBinaryCols(stmt.OrderBy, colNames, resultRows, resolveOrderByCollation(selectTableDefs, fromExpr2), binaryColNames)
 		if err != nil {
 			return nil, err
 		}
@@ -3057,6 +3092,8 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 					}
 					colNames = append(colNames, raw)
 				} else if raw != "" {
+					// Strip charset introducers for column names: _utf8'abc' -> 'abc', n'abc' -> 'abc'
+					raw = stripCharsetIntroducerForColName(raw)
 					// Strip quotes from simple string literals (MySQL displays 'a' as a)
 					if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' && isSimpleStringLiteral(raw) {
 						raw = raw[1 : len(raw)-1]
@@ -4689,6 +4726,8 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					// Use raw expression text from the original query to preserve
 					// MySQL's behavior of keeping the original formatting (e.g.
 					// spacing after commas in function calls).
+					// Strip charset introducers for column names: _utf8'abc' -> 'abc', n'abc' -> 'abc'
+					raw = stripCharsetIntroducerForColName(raw)
 					// MySQL displays string literal column headers without quotes:
 					// SELECT 'hello' -> column name is "hello" not "'hello'"
 					// But only strip if it's a simple string literal (no operators like ||).
@@ -5480,6 +5519,8 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 				if strings.Contains(raw, "/*") {
 					raw = stripBlockComments(raw)
 				}
+				// Strip charset introducers for column names: _utf8'abc' -> 'abc', n'abc' -> 'abc'
+				raw = stripCharsetIntroducerForColName(raw)
 				// MySQL displays string literal column headers without quotes
 				if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' {
 					raw = raw[1 : len(raw)-1]
@@ -5699,6 +5740,77 @@ func applyOrderBy(orderBy sqlparser.OrderBy, colNames []string, rows [][]interfa
 		}
 		if colIdx == -1 {
 			continue
+		}
+		asc := order.Direction == sqlparser.AscOrder || order.Direction == 0
+		specs = append(specs, orderSpec{colIdx: colIdx, asc: asc, collation: orderCollation})
+	}
+	if len(specs) == 0 {
+		return rows, nil
+	}
+
+	sort.SliceStable(rows, func(i, j int) bool {
+		for _, spec := range specs {
+			coll := spec.collation
+			if coll == "" {
+				coll = collation
+			}
+			cmp := compareByCollation(rows[i][spec.colIdx], rows[j][spec.colIdx], coll)
+			if cmp == 0 {
+				continue
+			}
+			if spec.asc {
+				return cmp < 0
+			}
+			return cmp > 0
+		}
+		return false
+	})
+	return rows, nil
+}
+
+// applyOrderByWithBinaryCols is like applyOrderBy but overrides collation to "binary"
+// for ORDER BY columns that are BINARY/VARBINARY/BLOB type (byte-by-byte comparison).
+func applyOrderByWithBinaryCols(orderBy sqlparser.OrderBy, colNames []string, rows [][]interface{}, collation string, binaryColNames map[string]bool) ([][]interface{}, error) {
+	if len(orderBy) == 0 {
+		return rows, nil
+	}
+	if len(binaryColNames) == 0 {
+		return applyOrderBy(orderBy, colNames, rows, collation)
+	}
+
+	type orderSpec struct {
+		colIdx    int
+		asc       bool
+		collation string
+	}
+	var specs []orderSpec
+	for _, order := range orderBy {
+		expr := order.Expr
+		orderCollation := collation
+		if collateExpr, ok := expr.(*sqlparser.CollateExpr); ok {
+			expr = collateExpr.Expr
+			orderCollation = collateExpr.Collation
+		}
+		if convExpr, ok := expr.(*sqlparser.ConvertExpr); ok {
+			if convExpr.Type != nil && strings.EqualFold(convExpr.Type.Type, "binary") {
+				orderCollation = "binary"
+				expr = convExpr.Expr
+			}
+		}
+		colName := strings.Trim(sqlparser.String(expr), "`")
+		colIdx := -1
+		for i, c := range colNames {
+			if strings.EqualFold(c, colName) {
+				colIdx = i
+				break
+			}
+		}
+		if colIdx == -1 {
+			continue
+		}
+		// If the column is a binary type, force binary collation
+		if binaryColNames[strings.ToLower(colName)] {
+			orderCollation = "binary"
 		}
 		asc := order.Direction == sqlparser.AscOrder || order.Direction == 0
 		specs = append(specs, orderSpec{colIdx: colIdx, asc: asc, collation: orderCollation})

@@ -2765,6 +2765,31 @@ func normalizeCharsetIntroducers(s string) string {
 	return s
 }
 
+// stripCharsetIntroducerForColName strips charset introducers from an expression
+// when used as a column name. In MySQL, _utf8'abc' and n'abc' display as 'abc' (then
+// the outer quote-strip will produce 'abc'). So we strip the _charset prefix,
+// leaving just the quoted string. National charset introducer n'' is also stripped.
+// Examples: _utf8'abc' -> 'abc', n'abc' -> 'abc', _utf8mb4'abc' -> 'abc'
+func stripCharsetIntroducerForColName(s string) string {
+	// Handle national charset: n'...' or N'...'
+	if len(s) >= 3 && (s[0] == 'n' || s[0] == 'N') && s[1] == '\'' && s[len(s)-1] == '\'' {
+		return s[1:]
+	}
+	// Handle _charset'...' pattern
+	if len(s) >= 3 && s[0] == '_' {
+		// Find the quote
+		for i := 1; i < len(s); i++ {
+			if s[i] == '\'' {
+				if i < len(s)-1 && s[len(s)-1] == '\'' {
+					return s[i:]
+				}
+				break
+			}
+		}
+	}
+	return s
+}
+
 // isSimpleStringLiteral returns true if s is a simple quoted string literal
 // (starts and ends with ' and contains no unescaped ' in the middle and no operators outside quotes).
 // Used to distinguish SELECT 'hello' (simple literal) from SELECT 'A' || 'B' (expression).
@@ -2953,12 +2978,24 @@ func unescapeStringLiterals(s string) string {
 			if ch == '\\' && i+1 < len(s) {
 				next := s[i+1]
 				switch next {
+				case '0':
+					result.WriteByte(0x00) // \0 = null byte (ASCII 0)
+					i++
+					continue
 				case 'n':
 					result.WriteByte('\n')
 					i++
 					continue
 				case 't':
 					result.WriteByte('\t')
+					i++
+					continue
+				case 'r':
+					result.WriteByte('\r')
+					i++
+					continue
+				case 'b':
+					result.WriteByte('\b')
 					i++
 					continue
 				case '\\':
@@ -4554,43 +4591,234 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 				}
 				// Post-process rows to handle materialization correctly.
 				if e.isOptimizerSwitchEnabled("materialization") {
-					// Insert <subqueryN> placeholder rows before MATERIALIZED rows and keep them.
-					// Only one placeholder per unique subquery id (multi-table subqueries share one id).
-					var processed []explainSelectType
+					// Build final row order:
+					// 1. <subqueryN> placeholders (one per unique MATERIALIZED subquery id)
+					// 2. SIMPLE outer table rows
+					// 3. MATERIALIZED inner rows
+					// This matches MySQL's EXPLAIN output order where the materialized temp table
+					// is shown first (as the driving side), then the outer table (eq_ref probe).
+					var placeholders []explainSelectType
+					var simpleRows []explainSelectType
+					var materializedRows []explainSelectType
+					var derivedRows []explainSelectType
+					// Track which unique MATERIALIZED subquery IDs we've seen, to create placeholders later
 					insertedPlaceholder := map[interface{}]bool{}
+					var materializedIDs []interface{} // track insertion order of IDs
 					for _, r := range result {
 						if r.selectType == "MATERIALIZED" {
-							// Insert <subqueryN> placeholder at id=1, SIMPLE before MATERIALIZED rows
-							// but only once per subquery id.
 							if !insertedPlaceholder[r.id] {
 								insertedPlaceholder[r.id] = true
-								subqueryRef := fmt.Sprintf("<subquery%d>", r.id)
-								processed = append(processed, explainSelectType{
+								materializedIDs = append(materializedIDs, r.id)
+							}
+							materializedRows = append(materializedRows, r)
+						} else if r.selectType == "DERIVED" {
+							// DERIVED rows (from FROM-clause derived tables) are preserved as-is
+							derivedRows = append(derivedRows, r)
+						} else if r.selectType != "SIMPLE" {
+							// Non-SIMPLE, non-MATERIALIZED, non-DERIVED rows (e.g. DEPENDENT SUBQUERY for EXISTS)
+							// become id=1, SIMPLE (anti-join / FirstMatch strategy)
+							r.id = int64(1)
+							r.selectType = "SIMPLE"
+							simpleRows = append(simpleRows, r)
+						} else {
+							simpleRows = append(simpleRows, r)
+						}
+					}
+					// Now create the <subqueryN> placeholder rows.
+					// Determine access type based on outer tables:
+					// - If the outer IN expression uses a constant literal (e.g. "11 IN (subquery)"),
+					//   MySQL uses const access on the materialized hash table.
+					// - If any outer SIMPLE row has non-ALL access (eq_ref, ref, const),
+					//   the outer table is a probe → <subqueryN> is the driver (ALL access)
+					// - If all outer SIMPLE rows have ALL access (scan), they drive the join
+					//   → <subqueryN> is the probe (eq_ref with <auto_key>)
+					outerINIsConst := inSubqueryOuterIsConst(s)
+					outerHasNonAll := false
+					outerHasAllScan := false // any ALL-scan outer table (potential driver of <subquery> via BNL)
+					outerJoinColForRef := extractINSubqueryOuterCol(s)
+					outerTableNameForRef := ""
+					for _, sr := range simpleRows {
+						if sr.table != nil && !strings.HasPrefix(fmt.Sprintf("%v", sr.table), "<subquery") {
+							at := fmt.Sprintf("%v", sr.accessType)
+							if at == "eq_ref" || at == "ref" || at == "const" {
+								outerHasNonAll = true
+							} else {
+								// ALL or index_scan outer table
+								outerHasAllScan = true
+							}
+							if outerTableNameForRef == "" {
+								outerTableNameForRef = fmt.Sprintf("%v", sr.table)
+							}
+						}
+					}
+					// Create placeholder rows with appropriate access type
+					for _, rawID := range materializedIDs {
+						if id, ok := rawID.(int64); ok {
+							subqueryRef := fmt.Sprintf("<subquery%d>", id)
+							var ph explainSelectType
+							if outerINIsConst {
+								// Constant IN expression (e.g. "11 IN (subquery)"): MySQL does a
+								// const lookup on the materialized hash table.
+								ph = explainSelectType{
+									id:           int64(1),
+									selectType:   "SIMPLE",
+									table:        subqueryRef,
+									accessType:   "const",
+									possibleKeys: "<auto_key>",
+									key:          "<auto_key>",
+									keyLen:       "5",
+									ref:          "const",
+									rows:         int64(1),
+									filtered:     "100.00",
+									extra:        nil,
+								}
+							} else if outerHasNonAll && outerHasAllScan {
+								// Mixed case: some outer tables are ALL-scan (drivers) and some use
+								// ref/eq_ref access (they probe <subqueryN> by its join key).
+								// In MySQL's plan: ALL-scan tables drive, <subqueryN> is scanned via BNL
+								// (it's the inner of the BNL join), then ref-access tables probe <subqueryN>.
+								bnlExtra := "Using join buffer (Block Nested Loop)"
+								// If there are range conditions on the IN column (beyond the IN itself),
+								// MySQL adds "Using where" to indicate the filter applied to <subqueryN>.
+								if outerJoinColForRef != "" && s.Where != nil &&
+									hasNonINRangeConditionOnCol(s.Where.Expr, outerJoinColForRef) {
+									bnlExtra = "Using where; Using join buffer (Block Nested Loop)"
+								}
+								ph = explainSelectType{
+									id:           int64(1),
+									selectType:   "SIMPLE",
+									table:        subqueryRef,
+									accessType:   "ALL",
+									possibleKeys: nil,
+									key:          nil,
+									keyLen:       nil,
+									ref:          nil,
+									rows:         nil,
+									filtered:     "100.00",
+									extra:        bnlExtra,
+								}
+							} else if outerHasNonAll && !outerHasAllScan {
+								// All outer tables use ref/eq_ref access (they probe <subqueryN>).
+								// <subqueryN> drives (ALL scan), outer tables are probes.
+								// This is the "materialized probe" pattern:
+								// <subquery> scans, outer table does eq_ref lookup.
+								ph = explainSelectType{
+									id:           int64(1),
+									selectType:   "SIMPLE",
+									table:        subqueryRef,
+									accessType:   "ALL",
+									possibleKeys: nil,
+									key:          nil,
+									keyLen:       nil,
+									ref:          nil,
+									rows:         nil,
+									filtered:     "100.00",
+									extra:        nil,
+								}
+							} else {
+								// Outer table scans (ALL) → <subqueryN> is probed via hash (eq_ref <auto_key>)
+								var refStr interface{} = nil
+								if outerTableNameForRef != "" && outerJoinColForRef != "" {
+									// If the outer table is a derived/subquery placeholder, MySQL shows "func"
+									// as the ref (the join key is computed as a function expression).
+									if strings.HasPrefix(outerTableNameForRef, "<derived") || strings.HasPrefix(outerTableNameForRef, "<subquery") {
+										refStr = "func"
+									} else {
+										refStr = outerTableNameForRef + "." + outerJoinColForRef
+									}
+								}
+								// When outer is a derived table, MySQL adds "Using where" to indicate
+								// the semi-join condition is applied as a filter.
+								var placeholderExtra interface{} = nil
+								if strings.HasPrefix(outerTableNameForRef, "<derived") {
+									placeholderExtra = "Using where"
+								}
+								ph = explainSelectType{
 									id:           int64(1),
 									selectType:   "SIMPLE",
 									table:        subqueryRef,
 									accessType:   "eq_ref",
 									possibleKeys: "<auto_key>",
 									key:          "<auto_key>",
-									keyLen:       nil,
-									ref:          nil,
+									keyLen:       "5", // typical INT hash key length
+									ref:          refStr,
 									rows:         int64(1),
 									filtered:     "100.00",
-									extra:        nil,
-								})
+									extra:        placeholderExtra,
+								}
 							}
-							// Keep the MATERIALIZED row unchanged
-							processed = append(processed, r)
-						} else if r.selectType != "SIMPLE" {
-							// Non-SIMPLE, non-MATERIALIZED rows (e.g. DEPENDENT SUBQUERY for EXISTS)
-							// become id=1, SIMPLE (anti-join / FirstMatch strategy)
-							r.id = int64(1)
-							r.selectType = "SIMPLE"
-							processed = append(processed, r)
-						} else {
-							processed = append(processed, r)
+							placeholders = append(placeholders, ph)
 						}
 					}
+					// Update outer SIMPLE rows: when the outer table is accessed via a
+					// MATERIALIZED subquery join, change 'const' access to 'eq_ref' and
+					// update the ref to "<subqueryN>.join_col".
+					if len(materializedRows) > 0 && len(placeholders) > 0 {
+						// Find the join column from the IN condition in the WHERE clause.
+						outerJoinCol := extractINSubqueryOuterCol(s)
+						for i, sr := range simpleRows {
+							at := fmt.Sprintf("%v", sr.accessType)
+							if at == "const" && sr.possibleKeys == "PRIMARY" && outerJoinCol != "" {
+								// Change to eq_ref access via the materialized subquery
+								simpleRows[i].accessType = "eq_ref"
+								// Use the first placeholder's subquery reference
+								subqueryRef := fmt.Sprintf("%v", placeholders[0].table)
+								simpleRows[i].ref = subqueryRef + "." + outerJoinCol
+								// used_key_parts: use the actual join column name, not "PRIMARY"
+								// (This is used in the JSON key field "used_key_parts")
+							}
+						}
+					}
+					// Apply derived table merging for the SIMPLE <derivedN> rows:
+					// When a SIMPLE row has table "<derivedN>" and there's a corresponding DERIVED row,
+					// replace <derivedN> with the DERIVED row's base table and drop the DERIVED row.
+					// This matches MySQL's behavior of merging simple derived tables into the outer query.
+					derivedByID := make(map[int64]explainSelectType)
+					for _, dr := range derivedRows {
+						if id, ok := dr.id.(int64); ok {
+							derivedByID[id] = dr
+						}
+					}
+					mergedDerived := make(map[int64]bool)
+					for i, sr := range simpleRows {
+						if sr.table == nil {
+							continue
+						}
+						tblStr := fmt.Sprintf("%v", sr.table)
+						if !strings.HasPrefix(tblStr, "<derived") {
+							continue
+						}
+						// Extract the derived ID from "<derivedN>"
+						var derivedID int64
+						if _, err := fmt.Sscanf(tblStr, "<derived%d>", &derivedID); err == nil {
+							if dr, ok := derivedByID[derivedID]; ok {
+								// Replace the <derivedN> row with the DERIVED row's properties
+								simpleRows[i].table = dr.table
+								simpleRows[i].accessType = dr.accessType
+								simpleRows[i].rows = dr.rows
+								simpleRows[i].filtered = dr.filtered
+								simpleRows[i].extra = dr.extra
+								mergedDerived[derivedID] = true
+							}
+						}
+					}
+					// Keep unmerged DERIVED rows
+					var unmergedDerived []explainSelectType
+					for _, dr := range derivedRows {
+						if id, ok := dr.id.(int64); ok {
+							if !mergedDerived[id] {
+								unmergedDerived = append(unmergedDerived, dr)
+							}
+						}
+					}
+
+					// Final order: placeholders first, then outer SIMPLE rows, then MATERIALIZED rows,
+					// then unmerged DERIVED rows
+					var processed []explainSelectType
+					processed = append(processed, placeholders...)
+					processed = append(processed, simpleRows...)
+					processed = append(processed, materializedRows...)
+					processed = append(processed, unmergedDerived...)
 					result = processed
 				} else {
 					// materialization=off: all non-SIMPLE rows become id=1, SIMPLE
@@ -4918,21 +5146,22 @@ func (e *Executor) queryHasComplexParts(sel *sqlparser.Select) bool {
 //   - No UNION subqueries inside IN (unions cannot be semijoin-flattened).
 //   - semijoin optimizer flag is ON (default).
 func (e *Executor) queryCanBeSemijoinFlattened(sel *sqlparser.Select) bool {
-	// Derived tables in FROM prevent flattening.
-	for _, te := range sel.From {
-		if e.tableExprHasSubquery(te) {
-			return false
-		}
-	}
+	// Note: derived tables in FROM do NOT prevent IN-subquery flattening.
+	// MySQL can semijoin-flatten IN subqueries even when the outer FROM has derived tables.
+	// (The old check was too restrictive.)
 
-	// The outer query must have at least one real table (not just DUAL).
-	// If there are no real tables, MySQL cannot form an anti-join and keeps
+	// The outer query must have at least one real table or derived table (not just DUAL).
+	// If there are no real tables or derived tables, MySQL cannot form an anti-join and keeps
 	// the subquery as a separate PRIMARY+SUBQUERY pair.
 	var outerTables []string
 	for _, te := range sel.From {
 		outerTables = append(outerTables, e.extractAllTableNames(te)...)
 	}
-	hasRealTable := false
+	numDerivedOuter := 0
+	for _, te := range sel.From {
+		numDerivedOuter += countDerivedTablesInExpr(te)
+	}
+	hasRealTable := numDerivedOuter > 0 // derived tables also count as "real" outer tables
 	for _, tn := range outerTables {
 		if strings.ToLower(tn) != "dual" {
 			hasRealTable = true
@@ -5318,6 +5547,23 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 				}
 			}
 
+			// Add "Using where" for ALL-access tables that have WHERE conditions filtering them.
+			// MySQL adds "Using where" when the engine applies a WHERE filter during a full scan.
+			if accessInfo.accessType == "ALL" && sel.Where != nil {
+				dbName := e.CurrentDB
+				if dbName == "" {
+					dbName = "test"
+				}
+				cond := e.extractTableCondition(sel.Where.Expr, tblName, dbName)
+				if cond != "" {
+					if extra == nil {
+						extra = "Using where"
+					} else {
+						extra = fmt.Sprintf("Using where; %v", extra)
+					}
+				}
+			}
+
 			result = append(result, explainSelectType{
 				id:           myID,
 				selectType:   selectType,
@@ -5348,7 +5594,7 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 
 	// Process subqueries in SELECT expressions, WHERE, HAVING.
 	// MySQL outputs WHERE-clause subqueries BEFORE FROM-clause derived tables.
-	e.explainSubqueries(sel, idCounter, &result)
+	e.explainSubqueries(sel, idCounter, &result, selectType)
 
 	// Append derived rows after WHERE-clause subquery rows.
 	result = append(result, derivedRows...)
@@ -5613,6 +5859,28 @@ func hasRightJoin(te sqlparser.TableExpr) bool {
 // allInnerTablesTwoOrMoreRows returns true if the inner SELECT uses STRAIGHT_JOIN and ALL inner
 // tables have >= 2 rows. In this case, MySQL forces MATERIALIZED even for constant outer expressions
 // (e.g., "11 IN (SELECT ...)"), because materializing is cheaper than scanning large fixed-order tables.
+// outerQueryHasOnlyDerivedTables returns true if the outer query's FROM clause contains
+// only derived tables (subqueries) and no real base tables. This is used to determine
+// whether MySQL will prefer MATERIALIZED strategy for IN subqueries (since FirstMatch
+// can't be applied efficiently when there's no base table to probe against).
+func (e *Executor) outerQueryHasOnlyDerivedTables(sel *sqlparser.Select) bool {
+	if sel == nil || len(sel.From) == 0 {
+		return false
+	}
+	numDerived := 0
+	numBase := 0
+	for _, te := range sel.From {
+		numDerived += countDerivedTablesInExpr(te)
+		baseNames := e.extractAllTableNames(te)
+		for _, name := range baseNames {
+			if !strings.EqualFold(name, "dual") {
+				numBase++
+			}
+		}
+	}
+	return numDerived > 0 && numBase == 0
+}
+
 func (e *Executor) allInnerTablesTwoOrMoreRows(inner *sqlparser.Select) bool {
 	if e.Storage == nil {
 		return false
@@ -5644,6 +5912,276 @@ func (e *Executor) allInnerTablesTwoOrMoreRows(inner *sqlparser.Select) bool {
 
 // shouldMaterializeSubquery returns true if an IN subquery should use the MATERIALIZED strategy.
 // MySQL uses a cost-based approach, but we approximate with a row count heuristic:
+// extractINSubqueryOuterCol extracts the outer column name from the first
+// IN (subquery) condition in a SELECT's WHERE clause.
+// For "WHERE col IN (SELECT ...)", returns "col".
+// inSubqueryOuterIsConst returns true if the WHERE clause has "const IN (subquery)"
+// where the left side of IN is a literal constant (e.g. "11 IN (SELECT ...)").
+// In this case MySQL uses const access on the materialized hash table.
+func inSubqueryOuterIsConst(sel *sqlparser.Select) bool {
+	if sel == nil || sel.Where == nil {
+		return false
+	}
+	result := false
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if cmp, ok := n.(*sqlparser.ComparisonExpr); ok {
+			if cmp.Operator == sqlparser.InOp {
+				if _, ok := cmp.Right.(*sqlparser.Subquery); ok {
+					switch cmp.Left.(type) {
+					case *sqlparser.Literal, *sqlparser.NullVal:
+						result = true
+						return false, nil
+					}
+				}
+			}
+		}
+		return true, nil
+	}, sel.Where.Expr)
+	return result
+}
+
+// For "WHERE tbl.col IN (SELECT ...)", returns "col".
+// Returns "" if no IN subquery condition is found.
+func extractINSubqueryOuterCol(sel *sqlparser.Select) string {
+	if sel == nil || sel.Where == nil {
+		return ""
+	}
+	return extractINColFromExpr(sel.Where.Expr)
+}
+
+// extractINColFromNode finds the outer column name for a specific IN subquery `sub`
+// within a WHERE expression node. For "WHERE a IN (sub1) AND b IN (sub2)", calling
+// with sub2 returns "b".
+func extractINColFromNode(node sqlparser.SQLNode, sub *sqlparser.Subquery) string {
+	var result string
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if cmp, ok := n.(*sqlparser.ComparisonExpr); ok {
+			if cmp.Operator == sqlparser.InOp {
+				if rSub, ok := cmp.Right.(*sqlparser.Subquery); ok {
+					if rSub == sub {
+						if col, ok := cmp.Left.(*sqlparser.ColName); ok {
+							result = col.Name.String()
+							return false, nil
+						}
+					}
+				}
+			}
+		}
+		return true, nil
+	}, node)
+	return result
+}
+
+func extractINColFromExpr(expr sqlparser.Expr) string {
+	if expr == nil {
+		return ""
+	}
+	switch e := expr.(type) {
+	case *sqlparser.ComparisonExpr:
+		if e.Operator == sqlparser.InOp {
+			// col IN (subquery)
+			if col, ok := e.Left.(*sqlparser.ColName); ok {
+				return col.Name.String()
+			}
+		}
+	case *sqlparser.AndExpr:
+		if col := extractINColFromExpr(e.Left); col != "" {
+			return col
+		}
+		return extractINColFromExpr(e.Right)
+	}
+	return ""
+}
+
+// matTypeClass returns the "materialization type class" for a MySQL column type.
+// MySQL only uses materialization when the outer column and inner column have
+// compatible type classes (same class). Cross-class comparisons (e.g., INT vs DATE,
+// INT vs CHAR) fall back to DuplicateWeedout/non-materialized strategies.
+// Classes: "numeric", "string", "temporal", "other"
+func matTypeClass(colType string) string {
+	upper := strings.ToUpper(strings.TrimSpace(colType))
+	// Strip type parameters e.g. VARCHAR(255) → VARCHAR
+	if idx := strings.IndexByte(upper, '('); idx >= 0 {
+		upper = strings.TrimSpace(upper[:idx])
+	}
+	switch upper {
+	case "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT",
+		"FLOAT", "DOUBLE", "REAL", "DECIMAL", "NUMERIC",
+		"UNSIGNED", "BIT":
+		return "numeric"
+	case "CHAR", "VARCHAR", "TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT",
+		"BINARY", "VARBINARY", "TINYBLOB", "BLOB", "MEDIUMBLOB", "LONGBLOB",
+		"ENUM", "SET":
+		return "string"
+	case "DATE", "DATETIME", "TIMESTAMP", "TIME", "YEAR":
+		return "temporal"
+	}
+	return "other"
+}
+
+// hasNonINRangeConditionOnCol checks whether the WHERE expression contains any
+// range conditions (less-than, greater-than, between, OR of comparisons) on the
+// given column name (ignoring table qualifiers), other than an IN-subquery condition.
+// This is used to determine if "Using where" should be shown on a <subqueryN> placeholder.
+func hasNonINRangeConditionOnCol(expr sqlparser.Expr, colName string) bool {
+	if expr == nil {
+		return false
+	}
+	switch e := expr.(type) {
+	case *sqlparser.AndExpr:
+		return hasNonINRangeConditionOnCol(e.Left, colName) || hasNonINRangeConditionOnCol(e.Right, colName)
+	case *sqlparser.OrExpr:
+		// OR involving the same column implies a range/multi-range filter
+		leftHas := hasNonINRangeConditionOnCol(e.Left, colName)
+		rightHas := hasNonINRangeConditionOnCol(e.Right, colName)
+		return leftHas || rightHas
+	case *sqlparser.ComparisonExpr:
+		if e.Operator == sqlparser.InOp {
+			return false // skip IN expressions
+		}
+		var lCol, rCol string
+		if col, ok := e.Left.(*sqlparser.ColName); ok {
+			lCol = col.Name.String()
+		}
+		if col, ok := e.Right.(*sqlparser.ColName); ok {
+			rCol = col.Name.String()
+		}
+		if strings.EqualFold(lCol, colName) || strings.EqualFold(rCol, colName) {
+			return true
+		}
+	case *sqlparser.BetweenExpr:
+		if col, ok := e.Left.(*sqlparser.ColName); ok {
+			if strings.EqualFold(col.Name.String(), colName) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// inSubqueryTypesCompatibleForMat returns true if the outer join column type
+// and inner select column type are compatible for materialization (same type class).
+// When types are incompatible (e.g., INT vs DATE), MySQL falls back to DuplicateWeedout.
+func (e *Executor) inSubqueryTypesCompatibleForMat(outerSel *sqlparser.Select, inner *sqlparser.Select, subNode *sqlparser.Subquery) bool {
+	if e.Storage == nil || e.Catalog == nil {
+		return true // assume compatible if we can't check
+	}
+
+	// Find the outer join column name from the WHERE clause
+	var outerColName, outerTableName string
+	if outerSel != nil && outerSel.Where != nil {
+		_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+			if cmp, ok := n.(*sqlparser.ComparisonExpr); ok {
+				if cmp.Operator == sqlparser.InOp {
+					var rSub *sqlparser.Subquery
+					if subNode != nil {
+						rSub, _ = cmp.Right.(*sqlparser.Subquery)
+						if rSub != subNode {
+							return true, nil
+						}
+					} else {
+						rSub, _ = cmp.Right.(*sqlparser.Subquery)
+						if rSub == nil {
+							return true, nil
+						}
+					}
+					if col, ok := cmp.Left.(*sqlparser.ColName); ok {
+						outerColName = strings.ToLower(col.Name.String())
+						if !col.Qualifier.Name.IsEmpty() {
+							outerTableName = strings.ToLower(col.Qualifier.Name.String())
+						}
+						return false, nil
+					}
+				}
+			}
+			return true, nil
+		}, outerSel.Where.Expr)
+	}
+	if outerColName == "" {
+		return true // no column to check
+	}
+
+	// Find the outer column type from the FROM tables
+	outerColType := ""
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return true
+	}
+	for _, te := range outerSel.From {
+		var tblName, alias string
+		if ate, ok := te.(*sqlparser.AliasedTableExpr); ok {
+			if tn, ok := ate.Expr.(sqlparser.TableName); ok {
+				tblName = strings.ToLower(tn.Name.String())
+			}
+			if !ate.As.IsEmpty() {
+				alias = strings.ToLower(ate.As.String())
+			}
+		}
+		if tblName == "" {
+			continue
+		}
+		// Check if this table matches the outer column qualifier
+		if outerTableName != "" && outerTableName != tblName && outerTableName != alias {
+			continue
+		}
+		if tblDef, err := db.GetTable(tblName); err == nil && tblDef != nil {
+			for _, col := range tblDef.Columns {
+				if strings.EqualFold(col.Name, outerColName) {
+					outerColType = col.Type
+					break
+				}
+			}
+		}
+		if outerColType != "" {
+			break
+		}
+	}
+	if outerColType == "" {
+		return true // can't determine type, assume compatible
+	}
+
+	// Find the inner column type from the inner SELECT first expression
+	innerColType := ""
+	if inner != nil && inner.SelectExprs != nil && len(inner.SelectExprs.Exprs) > 0 {
+		if ae, ok := inner.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok {
+			if col, ok := ae.Expr.(*sqlparser.ColName); ok {
+				innerColName := strings.ToLower(col.Name.String())
+				// Look up in inner tables
+				for _, te := range inner.From {
+					var tblName string
+					if ate, ok := te.(*sqlparser.AliasedTableExpr); ok {
+						if tn, ok := ate.Expr.(sqlparser.TableName); ok {
+							tblName = strings.ToLower(tn.Name.String())
+						}
+					}
+					if tblName == "" {
+						continue
+					}
+					if tblDef, err := db.GetTable(tblName); err == nil && tblDef != nil {
+						for _, c := range tblDef.Columns {
+							if strings.EqualFold(c.Name, innerColName) {
+								innerColType = c.Type
+								break
+							}
+						}
+					}
+					if innerColType != "" {
+						break
+					}
+				}
+			}
+		}
+	}
+	if innerColType == "" {
+		return true // can't determine type, assume compatible
+	}
+
+	// Check if type classes are the same
+	outerClass := matTypeClass(outerColType)
+	innerClass := matTypeClass(innerColType)
+	return outerClass == innerClass || outerClass == "other" || innerClass == "other"
+}
+
 // - If total inner table rows > materializationThreshold → MATERIALIZED
 // - If the join column has no usable index AND total rows > 0 → MATERIALIZED
 // - If the inner table is empty (0 rows) → MATERIALIZED (MySQL still materializes for large outer tables)
@@ -5710,11 +6248,23 @@ func (e *Executor) shouldMaterializeSubquery(inner *sqlparser.Select, outerIsSys
 					if len(idx.Columns) > 0 && strings.EqualFold(idx.Columns[0], joinColName) {
 						// Secondary index on join column:
 						// - firstmatch=on → FirstMatch (inline, no materialization)
+						//   UNLESS the inner WHERE has a range condition on the join column,
+						//   in which case MySQL uses materialization (range scan materializes
+						//   a subset and probes via hash).
 						// - firstmatch=off → may materialize if table is large
 						if firstMatchOn {
-							return false // FirstMatch strategy → inline
+							// Check if the inner WHERE has a range condition on the join column.
+							// E.g., "kp1 < 20" would cause MySQL to use materialization.
+							innerHasRangeOnJoinCol := false
+							if inner.Where != nil {
+								innerHasRangeOnJoinCol = whereHasRangeOnCol(inner.Where.Expr, joinColName)
+							}
+							if !innerHasRangeOnJoinCol {
+								return false // FirstMatch strategy → inline (equality/no-range)
+							}
+							// Range condition → fall through to materialization
 						}
-						// firstmatch=off: fall through to row count check for this secondary index
+						// firstmatch=off or range on join col: fall through to row count check
 						break
 					}
 				}
@@ -5762,17 +6312,24 @@ func (e *Executor) shouldMaterializeSubquery(inner *sqlparser.Select, outerIsSys
 				// BUT ONLY when the outer table is NOT a system table (1 row).
 				// When outer is system (1 row), MySQL always uses FirstMatch even for STRAIGHT_JOIN.
 				// For all other join types (INNER, LEFT, RIGHT), MySQL can reorder tables and
-				// LooseScan is viable when total inner rows >= 2.
+				// LooseScan is viable when total inner rows >= 2, BUT ONLY when loosescan=on.
+				// When loosescan=off, MySQL uses MATERIALIZED instead.
+				looseScanOn := e.isOptimizerSwitchEnabled("loosescan")
 				if !outerIsSystem && e.innerSubqueryUsesOnlyStraightJoin(inner) && len(realInnerTables) >= 2 {
 					firstTbl := realInnerTables[0]
 					if tbl, err := e.Storage.GetTable(e.CurrentDB, firstTbl); err == nil && len(tbl.Rows) > 0 {
 						return true // STRAIGHT_JOIN with non-empty first table → MATERIALIZED
 					}
 				}
-				return false // total >= 2 inner rows → LooseScan strategy (not MATERIALIZED)
+				if looseScanOn {
+					return false // total >= 2 inner rows → LooseScan strategy (not MATERIALIZED)
+				}
+				return true // loosescan=off → MATERIALIZED
 			}
-			// total == 1: check if RIGHT JOIN with right table being the non-empty one
-			if totalInnerRows == 1 && e.innerSubqueryUsesRightJoin(inner) && len(realInnerTables) >= 2 {
+			// total == 1: check if RIGHT JOIN with right table being the non-empty one.
+			// When firstmatch=on, MySQL can use LooseScan for this case.
+			// When firstmatch=off, MySQL uses MATERIALIZED instead.
+			if firstMatchOn && totalInnerRows == 1 && e.innerSubqueryUsesRightJoin(inner) && len(realInnerTables) >= 2 {
 				lastTbl := realInnerTables[len(realInnerTables)-1]
 				if tbl, err := e.Storage.GetTable(e.CurrentDB, lastTbl); err == nil && len(tbl.Rows) > 0 {
 					return false // RIGHT JOIN with right table having the 1 row → LooseScan
@@ -5783,9 +6340,12 @@ func (e *Executor) shouldMaterializeSubquery(inner *sqlparser.Select, outerIsSys
 		// All inner tables have data:
 		// - STRAIGHT_JOIN with first table having >= 2 rows → MATERIALIZED (fixed join order, large probe set)
 		//   BUT ONLY when the outer is NOT a system table (outer=system always uses FirstMatch).
-		// - firstmatch=on: inline semijoin (SIMPLE, all rows at id=1)
+		// - firstmatch=on + any inner table has PK on join col → FirstMatch (eq_ref inline, cheap even with data)
+		// - firstmatch=on + no PK on join col + total inner rows above threshold → MATERIALIZED
+		// - firstmatch=on + no PK on join col + small tables → inline semijoin (SIMPLE)
 		// - firstmatch=off + any inner table has PK on join column: inline (eq_ref → no cost benefit from MATERIALIZED)
 		// - firstmatch=off + no PK on join column + large tables: MATERIALIZED
+		const multiTableMatThreshold = 5
 		if !outerIsSystem && e.innerSubqueryUsesOnlyStraightJoin(inner) && len(realInnerTables) >= 2 {
 			firstTbl := realInnerTables[0]
 			if tbl, err := e.Storage.GetTable(e.CurrentDB, firstTbl); err == nil && len(tbl.Rows) >= 2 {
@@ -5793,7 +6353,45 @@ func (e *Executor) shouldMaterializeSubquery(inner *sqlparser.Select, outerIsSys
 			}
 		}
 		if firstMatchOn {
-			return false // FirstMatch strategy → inline for multi-table with data
+			// When any inner table has a PRIMARY KEY or SECONDARY INDEX on the join column,
+			// MySQL can use ref/eq_ref access → FirstMatch is cheap and preferred regardless of table size.
+			if joinColName != "" {
+				for _, tblName := range realInnerTables {
+					if tbl, err := e.Storage.GetTable(e.CurrentDB, tblName); err == nil && tbl.Def != nil {
+						// Check PRIMARY KEY
+						if len(tbl.Def.PrimaryKey) > 0 && strings.EqualFold(tbl.Def.PrimaryKey[0], joinColName) {
+							return false // eq_ref via primary key → FirstMatch is cheap
+						}
+						// Check secondary indexes
+						for _, idx := range tbl.Def.Indexes {
+							if len(idx.Columns) > 0 && strings.EqualFold(idx.Columns[0], joinColName) {
+								// If inner subquery has a range condition on the join col,
+								// MySQL uses MATERIALIZED even with firstmatch=on.
+								innerHasRangeOnJC := false
+								if inner.Where != nil {
+									innerHasRangeOnJC = whereHasRangeOnCol(inner.Where.Expr, joinColName)
+								}
+								if !innerHasRangeOnJC {
+									return false // ref via secondary index → FirstMatch is cheap
+								}
+								// Range condition → fall through to MATERIALIZED
+							}
+						}
+					}
+				}
+			}
+			// No index on join column in any inner table: use total row count to decide.
+			// When total inner rows exceeds the threshold, MySQL's cost model prefers MATERIALIZED.
+			totalInnerRowsForMat := 0
+			for _, tblName := range realInnerTables {
+				if tbl, err := e.Storage.GetTable(e.CurrentDB, tblName); err == nil {
+					totalInnerRowsForMat += len(tbl.Rows)
+				}
+			}
+			if totalInnerRowsForMat > multiTableMatThreshold {
+				return true // Large multi-table subquery with no usable index → MATERIALIZED
+			}
+			return false // Small multi-table subquery → FirstMatch strategy (inline)
 		}
 		// firstmatch=off: check if the first inner table has a PK on the join column.
 		// If so, MySQL uses inline eq_ref access instead of MATERIALIZED.
@@ -5848,6 +6446,45 @@ func (e *Executor) shouldMaterializeSubquery(inner *sqlparser.Select, outerIsSys
 // hasConstPKEquality checks if the WHERE expression has a constant equality condition on the given column.
 // For example, `pk = 12` or `12 = pk` (with a literal, not a column reference) returns true.
 // This is used to detect "const table" access patterns where MySQL accesses a single row via primary key.
+// whereHasRangeOnCol returns true if the WHERE expression contains a range condition
+// (non-equality comparison) directly on the given column name. Examples:
+//   col < 20, col > 5, col <= 100, col BETWEEN a AND b
+// This is used to detect when MySQL switches from FirstMatch to materialization
+// for single-table IN subqueries with range access on the join column.
+func whereHasRangeOnCol(expr sqlparser.Expr, col string) bool {
+	switch e := expr.(type) {
+	case *sqlparser.ComparisonExpr:
+		var colName string
+		var otherSide sqlparser.Expr
+		if c, ok := e.Left.(*sqlparser.ColName); ok {
+			colName = strings.ToLower(c.Name.String())
+			otherSide = e.Right
+		} else if c, ok := e.Right.(*sqlparser.ColName); ok {
+			colName = strings.ToLower(c.Name.String())
+			otherSide = e.Left
+		}
+		if strings.EqualFold(colName, col) {
+			// Only treat as a range condition when compared to a literal value,
+			// not another column reference (correlation doesn't restrict range).
+			if _, isLiteral := otherSide.(*sqlparser.Literal); !isLiteral {
+				break
+			}
+			switch e.Operator {
+			case sqlparser.LessThanOp, sqlparser.LessEqualOp,
+				sqlparser.GreaterThanOp, sqlparser.GreaterEqualOp,
+				sqlparser.NotEqualOp:
+				return true
+			}
+		}
+
+	case *sqlparser.AndExpr:
+		return whereHasRangeOnCol(e.Left, col) || whereHasRangeOnCol(e.Right, col)
+	case *sqlparser.OrExpr:
+		return whereHasRangeOnCol(e.Left, col) || whereHasRangeOnCol(e.Right, col)
+	}
+	return false
+}
+
 func hasConstPKEquality(expr sqlparser.Expr, pkCol string) bool {
 	switch e := expr.(type) {
 	case *sqlparser.ComparisonExpr:
@@ -6092,7 +6729,7 @@ func outerINExprIsConstant(node sqlparser.SQLNode, sub *sqlparser.Subquery) bool
 }
 
 // explainSubqueries finds subqueries in SELECT expressions, WHERE, and HAVING clauses.
-func (e *Executor) explainSubqueries(sel *sqlparser.Select, idCounter *int64, result *[]explainSelectType) {
+func (e *Executor) explainSubqueries(sel *sqlparser.Select, idCounter *int64, result *[]explainSelectType, outerSelectType ...string) {
 	// Collect outer table names for correlated subquery detection
 	outerTables := e.extractTableNamesAndAliases(sel)
 
@@ -6121,9 +6758,14 @@ func (e *Executor) explainSubqueries(sel *sqlparser.Select, idCounter *int64, re
 		e.collectJoinOnConditions(te, &nodes)
 	}
 
+	outerHasOnlyDerived := e.outerQueryHasOnlyDerivedTables(sel)
+	outerST := ""
+	if len(outerSelectType) > 0 {
+		outerST = outerSelectType[0]
+	}
 	for _, node := range nodes {
 		startIdx := len(*result)
-		e.walkForSubqueries(node, idCounter, result, outerTables, outerCanSemijoin)
+		e.walkForSubqueries(node, idCounter, result, outerTables, outerCanSemijoin, outerHasOnlyDerived, sel, outerST)
 		// MySQL displays DEPENDENT SUBQUERY rows from the WHERE clause in reverse order
 		// (higher ids first) because it processes them in reverse during optimization.
 		// Reverse the newly-added rows if they are all DEPENDENT SUBQUERY.
@@ -6166,13 +6808,20 @@ func (e *Executor) collectJoinOnConditions(te sqlparser.TableExpr, nodes *[]sqlp
 // outerCanSemijoin indicates whether the outer SELECT can use semijoin flattening.
 // When false, IN subqueries become SUBQUERY (not MATERIALIZED) since MATERIALIZED
 // is only used in the context of semijoin-flattened outer queries.
-func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, result *[]explainSelectType, outerTables map[string]bool, outerCanSemijoin bool) {
+func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, result *[]explainSelectType, outerTables map[string]bool, outerCanSemijoin bool, outerHasOnlyDerivedTables bool, outerSel *sqlparser.Select, outerSelectTypeCtx ...string) {
+	// Extract optional outer select type context
+	outerSelectTypeOuter := ""
+	if len(outerSelectTypeCtx) > 0 {
+		outerSelectTypeOuter = outerSelectTypeCtx[0]
+	}
+	_ = outerSelectTypeOuter
 	if node == nil {
 		return
 	}
 	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
 		switch sub := n.(type) {
 		case *sqlparser.Subquery:
+			outerIDBeforeIncrement := *idCounter
 			*idCounter++
 			correlated := e.isCorrelatedSubquery(sub.Select, outerTables)
 			inContext := isSubqueryInINContext(node, sub)
@@ -6237,14 +6886,67 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 							// tables are empty. The const/system outer table makes FirstMatch optimal.
 							outerINIsConst := outerINExprIsConstant(node, sub)
 							outerIsSystem := e.outerTablesAreSystem(outerTables)
+							firstMatchOn := e.isOptimizerSwitchEnabled("firstmatch")
+							// Check if outer query has only derived tables (no real base tables).
+							// When outer FROM has only derived tables, MySQL prefers MATERIALIZED strategy
+							// for the IN subquery (FirstMatch can't be applied efficiently without base table).
+							outerHasOnlyDerivedTables := outerHasOnlyDerivedTables
 							// Special case: STRAIGHT_JOIN with ALL inner tables having >= 2 rows forces
 							// MATERIALIZED even when the outer IN expression is a constant.
 							// MySQL's cost-based optimizer decides that materializing is cheaper
 							// than FirstMatch when all inner tables are large.
 							if !outerIsSystem && e.allInnerTablesTwoOrMoreRows(inner) {
 								selectType = "MATERIALIZED"
-							} else if !outerINIsConst && e.shouldMaterializeSubquery(inner, outerIsSystem) {
+							} else if outerHasOnlyDerivedTables && !outerINIsConst {
+								// Outer has only derived tables: MySQL cannot do efficient FirstMatch,
+								// so it uses MATERIALIZED strategy for non-constant IN expressions.
 								selectType = "MATERIALIZED"
+							} else if e.inSubqueryTypesCompatibleForMat(outerSel, inner, sub) && e.shouldMaterializeSubquery(inner, outerIsSystem) {
+								// When firstmatch=on and outer IN is a constant literal, MySQL uses
+								// "no matching row in const table" (FirstMatch with const lookup).
+								// When firstmatch=off, MySQL always uses MATERIALIZED strategy.
+								// Note: type incompatibility (e.g., INT vs DATE) skips materialization.
+								//
+								// Exception: when the inner subquery's range on the join column is
+								// "bounded" by an equal range condition in the outer WHERE, MySQL
+								// can use ref access (FirstMatch) instead of materialization.
+								// E.g., "WHERE a IN (SELECT kp1 FROM t1 WHERE kp1<20) AND a<20"
+								// → MySQL uses ref on kp1=t3.a (FirstMatch), not MATERIALIZED.
+								outerAlsoHasRange := false
+								if node != nil {
+									// Extract the outer join column (left side of IN expr)
+									outerJoinCol := extractINColFromNode(node, sub)
+									if outerJoinCol != "" {
+										// Get the expression from the node (could be *sqlparser.Where or Expr)
+										var outerExpr sqlparser.Expr
+										if w, ok := node.(*sqlparser.Where); ok {
+											outerExpr = w.Expr
+										} else if e, ok := node.(sqlparser.Expr); ok {
+											outerExpr = e
+										}
+										if outerExpr != nil {
+											outerAlsoHasRange = whereHasRangeOnCol(outerExpr, outerJoinCol)
+										}
+									}
+								}
+								// Determine whether to use MATERIALIZED strategy:
+								// - For constant IN (e.g. "11 IN (subquery)"): always MATERIALIZED
+								//   when no outer range on the lookup col (which is always true for const).
+								// - For column IN (e.g. "col IN (subquery)"):
+								//   - firstmatch=off: always MATERIALIZED (no FirstMatch available)
+								//   - firstmatch=on: only MATERIALIZED when outer doesn't have a
+								//     bounded range on the same col (if outer also has same range,
+								//     FirstMatch via ref access is cheaper than materialization)
+								if outerINIsConst {
+									// Constant IN: materialize (outerAlsoHasRange is always false for const)
+									selectType = "MATERIALIZED"
+								} else if !firstMatchOn {
+									// firstmatch=off + column IN: always MATERIALIZED
+									selectType = "MATERIALIZED"
+								} else if !outerAlsoHasRange {
+									// firstmatch=on + column IN + no outer range: MATERIALIZED
+									selectType = "MATERIALIZED"
+								}
 							}
 							// If not materialized, selectType stays "SUBQUERY" but will be
 							// changed to "SIMPLE" by the semijoin flattening in explainMultiRows.
@@ -6282,9 +6984,43 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 						extra:      "no matching row in const table",
 					})
 				} else {
+					// When we're in a DEPENDENT SUBQUERY context and the inner query is
+					// MATERIALIZED, MySQL creates a <subqueryN> placeholder at the outer
+					// (DEPENDENT SUBQUERY) id. This placeholder represents the materialized
+					// temp table being probed by the DEPENDENT SUBQUERY's tables.
+					if selectType == "MATERIALIZED" && outerSelectTypeOuter == "DEPENDENT SUBQUERY" && inContext {
+						subqueryRef := fmt.Sprintf("<subquery%d>", *idCounter)
+						phRef := extractINColFromNode(node, sub)
+						var refStr interface{} = nil
+						// Find the outer table name for the ref field
+						for _, r := range *result {
+							if r.selectType == "DEPENDENT SUBQUERY" && r.id == outerIDBeforeIncrement &&
+								r.table != nil && !strings.HasPrefix(fmt.Sprintf("%v", r.table), "<subquery") {
+								if phRef != "" {
+									refStr = fmt.Sprintf("%v", r.table) + "." + phRef
+								}
+								break
+							}
+						}
+						ph := explainSelectType{
+							id:           outerIDBeforeIncrement,
+							selectType:   "DEPENDENT SUBQUERY",
+							table:        subqueryRef,
+							accessType:   "eq_ref",
+							possibleKeys: "<auto_key>",
+							key:          "<auto_key>",
+							keyLen:       "5",
+							ref:          refStr,
+							rows:         int64(1),
+							filtered:     "100.00",
+							extra:        nil,
+						}
+						*result = append(*result, ph)
+					}
+					subQueryID := *idCounter
 					subRows := e.explainSelect(inner, idCounter, selectType)
 					if len(subRows) > 0 {
-						subRows[0].id = *idCounter
+						subRows[0].id = subQueryID
 					}
 					*result = append(*result, subRows...)
 				}
@@ -6785,9 +7521,31 @@ func explainExtractWhereConditions(expr sqlparser.Expr, tableName string) []expl
 		right := explainExtractWhereConditions(e.Right, tableName)
 		return append(left, right...)
 	case *sqlparser.ComparisonExpr:
-		colName := explainExtractColumnName(e.Left)
+		// Extract column with qualifier-aware filtering:
+		// Only include conditions where the column qualifier matches tableName (or is unqualified).
+		colName := ""
+		leftIsColName := false
+		if col, ok := e.Left.(*sqlparser.ColName); ok {
+			leftIsColName = true
+			qual := col.Qualifier.Name.String()
+			// Only include if qualifier matches tableName or is unqualified
+			if qual == "" || strings.EqualFold(qual, tableName) {
+				colName = col.Name.String()
+			}
+		}
 		if colName == "" {
-			colName = explainExtractColumnName(e.Right)
+			if col, ok := e.Right.(*sqlparser.ColName); ok {
+				qual := col.Qualifier.Name.String()
+				if qual == "" || strings.EqualFold(qual, tableName) {
+					colName = col.Name.String()
+				}
+			} else if !leftIsColName {
+				// Neither left nor right is a ColName: try unqualified extraction as fallback
+				colName = explainExtractColumnName(e.Left)
+				if colName == "" {
+					colName = explainExtractColumnName(e.Right)
+				}
+			}
 		}
 		if colName != "" {
 			hasNullLiteral := func(x sqlparser.Expr) bool {
@@ -6803,6 +7561,11 @@ func explainExtractWhereConditions(expr sqlparser.Expr, tableName string) []expl
 			case sqlparser.EqualOp, sqlparser.NullSafeEqualOp:
 				return []explainWhereCondition{{column: colName, isEquality: true, isNull: hasNullLiteral(e.Left) || hasNullLiteral(e.Right)}}
 			case sqlparser.InOp:
+				// For IN (subquery), don't treat as equality for access type purposes.
+				// Subquery INs are handled via semijoin/materialization, not direct index lookups.
+				if _, isSubquery := e.Right.(*sqlparser.Subquery); isSubquery {
+					return nil
+				}
 				return []explainWhereCondition{{column: colName, isEquality: true, isRange: true}}
 			case sqlparser.GreaterThanOp, sqlparser.GreaterEqualOp,
 				sqlparser.LessThanOp, sqlparser.LessEqualOp:
@@ -6810,12 +7573,30 @@ func explainExtractWhereConditions(expr sqlparser.Expr, tableName string) []expl
 			}
 		}
 	case *sqlparser.BetweenExpr:
-		colName := explainExtractColumnName(e.Left)
+		colName := ""
+		if col, ok := e.Left.(*sqlparser.ColName); ok {
+			qual := col.Qualifier.Name.String()
+			if qual == "" || strings.EqualFold(qual, tableName) {
+				colName = col.Name.String()
+			}
+		}
+		if colName == "" {
+			colName = explainExtractColumnName(e.Left)
+		}
 		if colName != "" {
 			return []explainWhereCondition{{column: colName, isRange: true}}
 		}
 	case *sqlparser.IsExpr:
-		colName := explainExtractColumnName(e.Left)
+		colName := ""
+		if col, ok := e.Left.(*sqlparser.ColName); ok {
+			qual := col.Qualifier.Name.String()
+			if qual == "" || strings.EqualFold(qual, tableName) {
+				colName = col.Name.String()
+			}
+		}
+		if colName == "" {
+			colName = explainExtractColumnName(e.Left)
+		}
 		if colName != "" {
 			return []explainWhereCondition{{column: colName, isEquality: true, isNull: e.Right == sqlparser.IsNullOp}}
 		}
@@ -7062,13 +7843,26 @@ func (e *Executor) explainJSONTableBlock(row []interface{}, query string) []orde
 	if row[6] != nil {
 		keyStr := fmt.Sprintf("%v", row[6])
 		kvs = append(kvs, orderedKV{"key", keyStr})
-		// used_key_parts
-		parts := strings.Split(keyStr, ",")
-		arr := make([]interface{}, len(parts))
-		for i, p := range parts {
-			arr[i] = strings.TrimSpace(p)
+		// used_key_parts: resolve "PRIMARY" to actual PK column names
+		var usedKeyParts []interface{}
+		if strings.EqualFold(keyStr, "PRIMARY") && row[2] != nil {
+			// Look up the actual primary key columns for this table
+			tblName := fmt.Sprintf("%v", row[2])
+			if td := e.explainGetTableDef(tblName); td != nil && len(td.PrimaryKey) > 0 {
+				for _, pk := range td.PrimaryKey {
+					usedKeyParts = append(usedKeyParts, pk)
+				}
+			}
 		}
-		kvs = append(kvs, orderedKV{"used_key_parts", arr})
+		if len(usedKeyParts) == 0 {
+			// Fallback: split the key string by comma
+			parts := strings.Split(keyStr, ",")
+			usedKeyParts = make([]interface{}, len(parts))
+			for i, p := range parts {
+				usedKeyParts[i] = strings.TrimSpace(p)
+			}
+		}
+		kvs = append(kvs, orderedKV{"used_key_parts", usedKeyParts})
 	}
 
 	// key_length
@@ -7115,19 +7909,13 @@ func (e *Executor) explainJSONTableBlock(row []interface{}, query string) []orde
 		tableName = fmt.Sprintf("%v", row[2])
 	}
 
-	// Parse extra for special fields (index_condition, attached_condition, etc.)
+	// Parse extra for special fields (index_condition only; attached_condition goes after used_columns)
 	if row[11] != nil {
 		extraStr := fmt.Sprintf("%v", row[11])
 		if strings.Contains(extraStr, "Using index condition") {
 			cond := e.explainJSONBuildConditionFromQuery(query, tableName)
 			if cond != "" {
 				kvs = append(kvs, orderedKV{"index_condition", cond})
-			}
-		}
-		if strings.Contains(extraStr, "Using where") {
-			cond := e.explainJSONBuildConditionFromQuery(query, tableName)
-			if cond != "" {
-				kvs = append(kvs, orderedKV{"attached_condition", cond})
 			}
 		}
 	}
@@ -7168,6 +7956,22 @@ func (e *Executor) explainJSONTableBlock(row []interface{}, query string) []orde
 			arr[i] = c
 		}
 		kvs = append(kvs, orderedKV{"used_columns", arr})
+	}
+
+	// attached_condition goes AFTER used_columns (MySQL JSON EXPLAIN ordering)
+	if row[11] != nil {
+		extraStr := fmt.Sprintf("%v", row[11])
+		if strings.Contains(extraStr, "Using where") {
+			// Use table-specific condition extraction to only include conditions for this table.
+			cond := e.explainJSONBuildTableFilterCondition(query, tableName)
+			if cond == "" {
+				// Fallback to full WHERE condition if table-specific extraction fails.
+				cond = e.explainJSONBuildConditionFromQuery(query, tableName)
+			}
+			if cond != "" {
+				kvs = append(kvs, orderedKV{"attached_condition", cond})
+			}
+		}
 	}
 
 	return kvs
@@ -7310,6 +8114,87 @@ func (e *Executor) explainJSONUsedColumns(tableName string, query string) []stri
 // explainJSONBuildConditionFromQuery reconstructs the WHERE condition from the original query.
 // This is stored in the explainJSONDocument via a separate pass since rows don't carry the query.
 // The caller must set this field separately.
+// explainJSONBuildMaterializedCondition builds the attached_condition for a
+// materialized subquery placeholder like <subqueryN>. For example:
+//   (`<subquery3>`.`a` = `test`.`t0`.`a`)
+// It extracts the IN subquery column from the outer WHERE clause.
+func (e *Executor) explainJSONBuildMaterializedCondition(query string, subqueryName string) string {
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		return ""
+	}
+	// The query may be the outer query (possibly with derived table as FROM)
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return ""
+	}
+	// Unwrap derived table: if FROM is a subquery, use the subquery as the inner, but
+	// the WHERE condition is on the outer sel
+	if sel.Where == nil {
+		return ""
+	}
+
+	dbName := e.CurrentDB
+	if dbName == "" {
+		dbName = "test"
+	}
+
+	// Find the outer table name (first non-derived FROM table, or first derived table's alias)
+	outerTableName := ""
+	outerTableQualified := ""
+	for _, expr := range sel.From {
+		switch te := expr.(type) {
+		case *sqlparser.AliasedTableExpr:
+			switch t := te.Expr.(type) {
+			case sqlparser.TableName:
+				outerTableName = t.Name.String()
+				outerTableQualified = fmt.Sprintf("`%s`.`%s`", dbName, outerTableName)
+			case *sqlparser.DerivedTable:
+				// Derived table: MySQL resolves to the underlying base table name, not the alias.
+				// E.g., for `(select a from t0) x`, use `t0`, not `x`.
+				baseName := ""
+				if innerSel, ok2 := t.Select.(*sqlparser.Select); ok2 {
+					for _, fromExpr := range innerSel.From {
+						if innerATE, ok3 := fromExpr.(*sqlparser.AliasedTableExpr); ok3 {
+							if tn, ok4 := innerATE.Expr.(sqlparser.TableName); ok4 {
+								baseName = tn.Name.String()
+								break
+							}
+						}
+					}
+				}
+				if baseName != "" {
+					outerTableName = baseName
+					outerTableQualified = fmt.Sprintf("`%s`.`%s`", dbName, outerTableName)
+				} else {
+					// Fall back to alias
+					alias := te.As.String()
+					if alias != "" {
+						outerTableName = alias
+						outerTableQualified = fmt.Sprintf("`%s`.`%s`", dbName, outerTableName)
+					}
+				}
+			}
+		}
+		if outerTableName != "" {
+			break
+		}
+	}
+
+	// Find the IN subquery condition to extract column name
+	col := extractINColFromExpr(sel.Where.Expr)
+	if col == "" {
+		return ""
+	}
+
+	// Build: (`<subqueryN>`.`col` = `db`.`outerTable`.`col`)
+	subqueryCol := fmt.Sprintf("(`%s`.`%s`", subqueryName, col)
+	if outerTableQualified != "" {
+		return fmt.Sprintf("%s = %s.`%s`)", subqueryCol, outerTableQualified, col)
+	}
+	return fmt.Sprintf("%s = `%s`.`%s`)", subqueryCol, dbName, col)
+}
+
 func (e *Executor) explainJSONBuildConditionFromQuery(query string, tableName string) string {
 	stmt, err := e.parser().Parse(query)
 	if err != nil {
@@ -7328,6 +8213,233 @@ func (e *Executor) explainJSONBuildConditionFromQuery(query string, tableName st
 		dbName = "test"
 	}
 	return e.explainFormatExpr(sel.Where.Expr, dbName, tableName)
+}
+
+// explainJSONBuildTableFilterCondition extracts and formats the WHERE conditions
+// that belong to a specific table (by table qualifier). This is used to generate
+// the attached_condition for tables in EXPLAIN FORMAT=JSON.
+// Returns the formatted condition string, or "" if no conditions found for this table.
+func (e *Executor) explainJSONBuildTableFilterCondition(query string, tableName string) string {
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		return ""
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return ""
+	}
+	if sel.Where == nil {
+		return ""
+	}
+	dbName := e.CurrentDB
+	if dbName == "" {
+		dbName = "test"
+	}
+	// Extract conditions that reference this table
+	cond := e.extractTableCondition(sel.Where.Expr, tableName, dbName)
+	return cond
+}
+
+// explainJSONBuildSubqueryRangeCondition builds the attached_condition for a
+// <subqueryN> placeholder in a BNL join where range conditions exist on the join column.
+// The condition is formatted using <subqueryN>.col references (e.g. `<subquery2>`.`a`).
+// Returns "" if no range conditions are found.
+func (e *Executor) explainJSONBuildSubqueryRangeCondition(query string, subqueryName string) string {
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		return ""
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return ""
+	}
+	if sel.Where == nil {
+		return ""
+	}
+	// Find the IN column name
+	inCol := extractINColFromExpr(sel.Where.Expr)
+	if inCol == "" {
+		return ""
+	}
+	// Build the range condition referencing <subqueryN>.col
+	cond := e.buildSubqueryRangeCondFromExpr(sel.Where.Expr, inCol, subqueryName)
+	if cond == "" {
+		return ""
+	}
+	// MySQL appends "and (`<subqueryN>`.`col` is not null)" to IN conditions
+	notNull := fmt.Sprintf("(`%s`.`%s` is not null)", subqueryName, inCol)
+	return fmt.Sprintf("(%s and %s)", cond, notNull)
+}
+
+// buildSubqueryRangeCondFromExpr extracts and formats non-IN range conditions
+// on the given column, replacing the table-qualified reference with <subqueryN>.col.
+func (e *Executor) buildSubqueryRangeCondFromExpr(expr sqlparser.Expr, colName string, subqueryName string) string {
+	if expr == nil {
+		return ""
+	}
+	subRef := fmt.Sprintf("`%s`.`%s`", subqueryName, colName)
+	switch ex := expr.(type) {
+	case *sqlparser.AndExpr:
+		left := e.buildSubqueryRangeCondFromExpr(ex.Left, colName, subqueryName)
+		right := e.buildSubqueryRangeCondFromExpr(ex.Right, colName, subqueryName)
+		if left != "" && right != "" {
+			return fmt.Sprintf("(%s and %s)", left, right)
+		}
+		if left != "" {
+			return left
+		}
+		return right
+	case *sqlparser.OrExpr:
+		left := e.buildSubqueryRangeCondFromExpr(ex.Left, colName, subqueryName)
+		right := e.buildSubqueryRangeCondFromExpr(ex.Right, colName, subqueryName)
+		if left != "" && right != "" {
+			return fmt.Sprintf("(%s or %s)", left, right)
+		}
+		if left != "" {
+			return left
+		}
+		return right
+	case *sqlparser.ComparisonExpr:
+		if ex.Operator == sqlparser.InOp {
+			return "" // skip IN expressions
+		}
+		var col *sqlparser.ColName
+		useLeft := false
+		if c, ok := ex.Left.(*sqlparser.ColName); ok && strings.EqualFold(c.Name.String(), colName) {
+			col = c
+			useLeft = true
+		} else if c, ok := ex.Right.(*sqlparser.ColName); ok && strings.EqualFold(c.Name.String(), colName) {
+			col = c
+		}
+		if col == nil {
+			return ""
+		}
+		if useLeft {
+			rightStr := sqlparser.String(ex.Right)
+			switch ex.Operator {
+			case sqlparser.LessThanOp:
+				return fmt.Sprintf("(%s < %s)", subRef, rightStr)
+			case sqlparser.LessEqualOp:
+				return fmt.Sprintf("(%s <= %s)", subRef, rightStr)
+			case sqlparser.GreaterThanOp:
+				return fmt.Sprintf("(%s > %s)", subRef, rightStr)
+			case sqlparser.GreaterEqualOp:
+				return fmt.Sprintf("(%s >= %s)", subRef, rightStr)
+			case sqlparser.EqualOp:
+				return fmt.Sprintf("(%s = %s)", subRef, rightStr)
+			}
+		}
+		return ""
+	}
+	return ""
+}
+
+// extractTableCondition recursively walks an expression tree and returns
+// only the sub-expressions that reference columns from the given table.
+// Returns "" if no conditions for this table are found.
+func (e *Executor) extractTableCondition(expr sqlparser.Expr, tableName string, dbName string) string {
+	if expr == nil {
+		return ""
+	}
+	switch ex := expr.(type) {
+	case *sqlparser.AndExpr:
+		left := e.extractTableCondition(ex.Left, tableName, dbName)
+		right := e.extractTableCondition(ex.Right, tableName, dbName)
+		if left != "" && right != "" {
+			return fmt.Sprintf("(%s and %s)", left, right)
+		}
+		if left != "" {
+			return left
+		}
+		return right
+	case *sqlparser.OrExpr:
+		left := e.extractTableCondition(ex.Left, tableName, dbName)
+		right := e.extractTableCondition(ex.Right, tableName, dbName)
+		if left != "" && right != "" {
+			return fmt.Sprintf("(%s or %s)", left, right)
+		}
+		if left != "" {
+			return left
+		}
+		return right
+	case *sqlparser.ComparisonExpr:
+		colName := ""
+		qual := ""
+		if col, ok := ex.Left.(*sqlparser.ColName); ok {
+			colName = col.Name.String()
+			qual = col.Qualifier.Name.String()
+		} else if col, ok := ex.Right.(*sqlparser.ColName); ok {
+			colName = col.Name.String()
+			qual = col.Qualifier.Name.String()
+		}
+		// Only include if the column's qualifier matches tableName, or if there's
+		// no qualifier and the column exists in this table.
+		if colName == "" {
+			return ""
+		}
+		if qual != "" && !strings.EqualFold(qual, tableName) {
+			return ""
+		}
+		if qual == "" {
+			// Unqualified: check if this table has this column
+			if td := e.explainGetTableDef(tableName); td != nil {
+				found := false
+				for _, c := range td.Columns {
+					if strings.EqualFold(c.Name, colName) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return ""
+				}
+			}
+		}
+		qualifiedCol := fmt.Sprintf("`%s`.`%s`.`%s`", dbName, tableName, colName)
+		switch ex.Operator {
+		case sqlparser.EqualOp:
+			rightStr := sqlparser.String(ex.Right)
+			return fmt.Sprintf("(%s = %s)", qualifiedCol, rightStr)
+		case sqlparser.NotEqualOp:
+			rightStr := sqlparser.String(ex.Right)
+			return fmt.Sprintf("(%s <> %s)", qualifiedCol, rightStr)
+		case sqlparser.LessThanOp:
+			rightStr := sqlparser.String(ex.Right)
+			return fmt.Sprintf("(%s < %s)", qualifiedCol, rightStr)
+		case sqlparser.LessEqualOp:
+			rightStr := sqlparser.String(ex.Right)
+			return fmt.Sprintf("(%s <= %s)", qualifiedCol, rightStr)
+		case sqlparser.GreaterThanOp:
+			rightStr := sqlparser.String(ex.Right)
+			return fmt.Sprintf("(%s > %s)", qualifiedCol, rightStr)
+		case sqlparser.GreaterEqualOp:
+			rightStr := sqlparser.String(ex.Right)
+			return fmt.Sprintf("(%s >= %s)", qualifiedCol, rightStr)
+		}
+		return ""
+	case *sqlparser.IsExpr:
+		colName := ""
+		qual := ""
+		if col, ok := ex.Left.(*sqlparser.ColName); ok {
+			colName = col.Name.String()
+			qual = col.Qualifier.Name.String()
+		}
+		if colName == "" {
+			return ""
+		}
+		if qual != "" && !strings.EqualFold(qual, tableName) {
+			return ""
+		}
+		qualifiedCol := fmt.Sprintf("`%s`.`%s`.`%s`", dbName, tableName, colName)
+		switch ex.Right {
+		case sqlparser.IsNullOp:
+			return fmt.Sprintf("(%s is null)", qualifiedCol)
+		case sqlparser.IsNotNullOp:
+			return fmt.Sprintf("(%s is not null)", qualifiedCol)
+		}
+		return ""
+	}
+	return ""
 }
 
 // explainFormatExpr formats an expression in MySQL canonical form: (`db`.`table`.`col` op val)
@@ -7420,6 +8532,51 @@ func (e *Executor) explainJSONQueryBlockForRow(row []interface{}, query string) 
 	return qb
 }
 
+// extractFirstINSubquerySQL extracts the first IN (SELECT ...) subquery from a SQL query string.
+// Returns the SELECT part (e.g., "SELECT a FROM t11") for use in analyzing which columns
+// are referenced in the subquery (for used_columns in EXPLAIN FORMAT=JSON).
+// Returns empty string if no IN subquery is found.
+func (e *Executor) extractFirstINSubquerySQL(query string) string {
+	upper := strings.ToUpper(query)
+	// Find " IN (" or " IN(" followed by SELECT
+	patterns := []string{" IN (SELECT", " IN(SELECT", "\nIN (SELECT", "\nIN(SELECT"}
+	for _, pat := range patterns {
+		idx := strings.Index(upper, pat)
+		if idx < 0 {
+			continue
+		}
+		// Find start of SELECT inside the IN(...)
+		selectStart := idx + strings.Index(upper[idx:], "SELECT")
+		if selectStart < idx {
+			continue
+		}
+		// Find the matching closing parenthesis
+		depth := 0
+		// We're already past IN(, need to find the opening paren
+		parenIdx := strings.Index(upper[idx:], "(")
+		if parenIdx < 0 {
+			continue
+		}
+		start := idx + parenIdx
+		end := -1
+		for i := start; i < len(query); i++ {
+			if query[i] == '(' {
+				depth++
+			} else if query[i] == ')' {
+				depth--
+				if depth == 0 {
+					end = i
+					break
+				}
+			}
+		}
+		if end > selectStart {
+			return query[selectStart:end]
+		}
+	}
+	return ""
+}
+
 func (e *Executor) explainJSONDocument(query string) string {
 	// Get analyzed EXPLAIN rows from the traditional EXPLAIN logic
 	explainRows := e.explainMultiRows(query)
@@ -7480,6 +8637,9 @@ func (e *Executor) explainJSONDocument(query string) string {
 	var derivedRows []parsedRow
 	var unionRows []parsedRow
 	var unionResultRow *parsedRow
+	// materializedRowsByID groups MATERIALIZED rows by their subquery id.
+	// Key: subquery id (int64), Value: list of MATERIALIZED rows for that id.
+	materializedRowsByID := make(map[int64][]parsedRow)
 
 	for i := range parsed {
 		switch parsed[i].selectType {
@@ -7494,6 +8654,10 @@ func (e *Executor) explainJSONDocument(query string) string {
 		case "UNION RESULT":
 			p := parsed[i]
 			unionResultRow = &p
+		case "MATERIALIZED":
+			if id, ok := parsed[i].id.(int64); ok {
+				materializedRowsByID[id] = append(materializedRowsByID[id], parsed[i])
+			}
 		default:
 			primaryRows = append(primaryRows, parsed[i])
 		}
@@ -7515,7 +8679,328 @@ func (e *Executor) explainJSONDocument(query string) string {
 	}
 
 	// Build the main content based on structure
-	if len(primaryRows) == 1 && len(subqueryRows) == 0 && len(derivedRows) == 0 && len(unionRows) == 0 && unionResultRow == nil {
+	if len(primaryRows) >= 1 && len(materializedRowsByID) > 0 && len(unionRows) == 0 && unionResultRow == nil {
+		// Query with MATERIALIZED subqueries: produce nested_loop structure
+		// Recalculate total cost including materialized inner rows
+		totalCost = 0.0
+		for _, p := range primaryRows {
+			rc := explainJSONRowCount(p.row)
+			totalCost += float64(rc)*0.10 + 0.25
+		}
+		for _, matRows := range materializedRowsByID {
+			for _, m := range matRows {
+				rc := explainJSONRowCount(m.row)
+				totalCost += float64(rc)*0.10 + 0.25
+			}
+		}
+		queryBlock = append(queryBlock, orderedKV{"cost_info", []orderedKV{
+			{"query_cost", fmt.Sprintf("%.2f", totalCost)},
+		}})
+
+		// Build nested_loop array: follow the primaryRows order exactly, replacing
+		// <subqueryN> placeholder rows with their materialized subquery blocks in-place.
+		// This preserves MySQL's join order (as shown in the tabular EXPLAIN).
+
+		// Extract the IN-subquery SQL for used_columns analysis (so we only show
+		// the columns referenced in the subquery, not all columns from outer SELECT *).
+		inSubquerySQL := e.extractFirstINSubquerySQL(query)
+
+		// First, build a map from subquery name -> materialized block ([]orderedKV)
+		matBlockByName := make(map[string][]orderedKV)
+		for matID, matRows := range materializedRowsByID {
+			if len(matRows) == 0 {
+				continue
+			}
+			// Use the subquery SQL (if available) for used_columns analysis in inner tables.
+			innerQuery := query
+			if inSubquerySQL != "" {
+				innerQuery = inSubquerySQL
+			}
+			// Build the inner query_block for the materialized subquery
+			var innerQB []orderedKV
+			if len(matRows) == 1 {
+				// Single table in subquery: simple table block
+				m := matRows[0]
+				innerTblBlock := e.explainJSONTableBlock(m.row, innerQuery)
+				innerQB = append(innerQB, orderedKV{"table", innerTblBlock})
+			} else {
+				// Multiple tables: nested_loop in inner query_block
+				var innerLoop []interface{}
+				for _, m := range matRows {
+					innerTblBlock := e.explainJSONTableBlock(m.row, innerQuery)
+					innerLoop = append(innerLoop, []orderedKV{{"table", innerTblBlock}})
+				}
+				innerQB = append(innerQB, orderedKV{"nested_loop", innerLoop})
+			}
+			matFromSub := []orderedKV{
+				{"using_temporary_table", true},
+				{"query_block", innerQB},
+			}
+			subqueryName := fmt.Sprintf("<subquery%d>", matID)
+			matBlockByName[subqueryName] = matFromSub
+		}
+
+		// Build subquery placeholder blocks.
+		// For each <subqueryN> placeholder, build its full block (table_name, access_type,
+		// key, ref, materialized_from_subquery, etc.) from the placeholder's tabular row.
+		// Build a helper function to produce the subquery placeholder block.
+		buildSubqueryBlock := func(p parsedRow, tblName string, matFromSub []orderedKV) []orderedKV {
+			var subqueryTblBlock []orderedKV
+			subqueryTblBlock = append(subqueryTblBlock, orderedKV{"table_name", tblName})
+			accessType := "ALL"
+			if p.row[4] != nil {
+				accessType = fmt.Sprintf("%v", p.row[4])
+			}
+			subqueryTblBlock = append(subqueryTblBlock, orderedKV{"access_type", accessType})
+
+			extraStr := ""
+			if p.row[11] != nil {
+				extraStr = fmt.Sprintf("%v", p.row[11])
+			}
+
+			if accessType != "ALL" {
+				// Probe case (eq_ref/ref): show key, key_length, ref, rows, attached_condition
+				if p.row[5] != nil {
+					pkStr := fmt.Sprintf("%v", p.row[5])
+					if pkStr != "" && !strings.HasPrefix(pkStr, "<auto_key") {
+						arr := []interface{}{pkStr}
+						subqueryTblBlock = append(subqueryTblBlock, orderedKV{"possible_keys", arr})
+					}
+				}
+				if p.row[6] != nil {
+					keyStr := fmt.Sprintf("%v", p.row[6])
+					subqueryTblBlock = append(subqueryTblBlock, orderedKV{"key", keyStr})
+				}
+				if p.row[7] != nil {
+					subqueryTblBlock = append(subqueryTblBlock, orderedKV{"key_length", fmt.Sprintf("%v", p.row[7])})
+				}
+				if p.row[8] != nil {
+					refStr := fmt.Sprintf("%v", p.row[8])
+					if refStr != "" {
+						parts := strings.Split(refStr, ",")
+						arr := make([]interface{}, len(parts))
+						for i, pp := range parts {
+							arr[i] = strings.TrimSpace(pp)
+						}
+						subqueryTblBlock = append(subqueryTblBlock, orderedKV{"ref", arr})
+					}
+				}
+				var rowCount int64 = 1
+				if p.row[9] != nil {
+					switch v := p.row[9].(type) {
+					case int64:
+						rowCount = v
+					case int:
+						rowCount = int64(v)
+					}
+				}
+				subqueryTblBlock = append(subqueryTblBlock, orderedKV{"rows_examined_per_scan", rowCount})
+				if strings.Contains(extraStr, "Using where") {
+					cond := e.explainJSONBuildMaterializedCondition(query, tblName)
+					if cond != "" {
+						subqueryTblBlock = append(subqueryTblBlock, orderedKV{"attached_condition", cond})
+					}
+				}
+			} else {
+				// ALL access: emit using_join_buffer and/or attached_condition if present
+				if strings.Contains(extraStr, "Block Nested Loop") {
+					subqueryTblBlock = append(subqueryTblBlock, orderedKV{"using_join_buffer", "Block Nested Loop"})
+				}
+				if strings.Contains(extraStr, "Using where") {
+					// For BNL placeholder with "Using where", the condition reflects
+					// the range filter on the join column applied when scanning <subqueryN>.
+					// Build from the WHERE clause range conditions on the IN column.
+					cond := e.explainJSONBuildSubqueryRangeCondition(query, tblName)
+					if cond == "" {
+						// Fallback to the equality join condition
+						cond = e.explainJSONBuildMaterializedCondition(query, tblName)
+					}
+					if cond != "" {
+						subqueryTblBlock = append(subqueryTblBlock, orderedKV{"attached_condition", cond})
+					}
+				}
+			}
+			// materialized_from_subquery comes last
+			subqueryTblBlock = append(subqueryTblBlock, orderedKV{"materialized_from_subquery", matFromSub})
+			return subqueryTblBlock
+		}
+
+		// Find all <subquery> placeholder rows from primaryRows.
+		// Build a map by name so we can look them up quickly.
+		subqueryPlaceholderByName := make(map[string]parsedRow)
+		for _, p := range primaryRows {
+			if p.row[2] == nil {
+				continue
+			}
+			tblName := fmt.Sprintf("%v", p.row[2])
+			if strings.HasPrefix(tblName, "<subquery") {
+				subqueryPlaceholderByName[tblName] = p
+			}
+		}
+
+		// Determine if each <subquery> placeholder is a driver (goes first) or driven (goes after some tables).
+		// Rule:
+		//   - ALL access + no "Using join buffer" in Extra: placeholder DRIVES (put it first)
+		//   - ALL access + "Using join buffer": placeholder is INNER (driven by outer tables, put it after)
+		//   - eq_ref/ref/const access: placeholder is a PROBE (put it after driver tables)
+		subqueryIsDriving := make(map[string]bool)
+		for name, p := range subqueryPlaceholderByName {
+			accessType := "ALL"
+			if p.row[4] != nil {
+				accessType = fmt.Sprintf("%v", p.row[4])
+			}
+			extraStr := ""
+			if p.row[11] != nil {
+				extraStr = fmt.Sprintf("%v", p.row[11])
+			}
+			isDriver := (accessType == "ALL") && !strings.Contains(extraStr, "Using join buffer")
+			subqueryIsDriving[name] = isDriver
+		}
+
+		// Collect non-subquery primary table blocks.
+		var outerTableBlocks []interface{}
+		for _, p := range primaryRows {
+			if p.row[2] == nil {
+				continue
+			}
+			tblName := fmt.Sprintf("%v", p.row[2])
+			if strings.HasPrefix(tblName, "<subquery") {
+				continue
+			}
+			tblBlock := e.explainJSONTableBlock(p.row, query)
+			outerTableBlocks = append(outerTableBlocks, []orderedKV{{"table", tblBlock}})
+		}
+
+		// Build the nested_loop in the correct MySQL order:
+		// For single-subquery cases:
+		//   - Subquery drives (isDriver=true): [<subquery>, outer_tables...]
+		//   - Subquery is driven (isDriver=false): [outer_driver_tables..., <subquery>, outer_dependent_tables...]
+		// For simplicity with multiple outer tables, if the subquery is driven:
+		//   - tables that are ALL-scan and don't reference <subquery> come first
+		//   - then <subquery>
+		//   - then tables that ref <subquery> (ref/eq_ref access types)
+		var nestedLoop []interface{}
+
+		// Check if any subquery is driving
+		anySubqueryDriving := false
+		for _, driving := range subqueryIsDriving {
+			if driving {
+				anySubqueryDriving = true
+				break
+			}
+		}
+
+		if anySubqueryDriving {
+			// Driving subqueries go first
+			for name, matFromSub := range matBlockByName {
+				if ph, ok := subqueryPlaceholderByName[name]; ok && subqueryIsDriving[name] {
+					subqueryTblBlock := buildSubqueryBlock(ph, name, matFromSub)
+					nestedLoop = append(nestedLoop, []orderedKV{{"table", subqueryTblBlock}})
+				}
+			}
+			// Then outer tables
+			nestedLoop = append(nestedLoop, outerTableBlocks...)
+			// Then non-driving subqueries (shouldn't normally happen)
+			for name, matFromSub := range matBlockByName {
+				if ph, ok := subqueryPlaceholderByName[name]; ok && !subqueryIsDriving[name] {
+					subqueryTblBlock := buildSubqueryBlock(ph, name, matFromSub)
+					nestedLoop = append(nestedLoop, []orderedKV{{"table", subqueryTblBlock}})
+				}
+			}
+		} else {
+			// All subqueries are driven (ALL+BNL or eq_ref probe).
+			// Separate outer tables into: "driver tables" (ALL-scan, before <subquery>)
+			// and "dependent tables" (ref/eq_ref/const, after <subquery>).
+			//
+			// When the placeholder has BNL (driven by ALL-scan outer tables):
+			//   - ALL-scan outer tables → go before <subquery> (they drive)
+			//   - ref/eq_ref/const outer tables → go after <subquery> (they probe via subquery key)
+			//
+			// When the placeholder has eq_ref access (probe, no BNL):
+			//   - All outer ALL-scan tables → go before <subquery>
+			//   - <subquery> is the probe (eq_ref) at the end
+			//
+			// Determine if any subquery has BNL
+			anySubqueryBNL := false
+			for _, ph := range subqueryPlaceholderByName {
+				if ph.row[11] != nil {
+					extraStr := fmt.Sprintf("%v", ph.row[11])
+					if strings.Contains(extraStr, "Block Nested Loop") {
+						anySubqueryBNL = true
+						break
+					}
+				}
+			}
+			var driverTables []interface{}
+			var dependentTables []interface{}
+			for _, p := range primaryRows {
+				if p.row[2] == nil {
+					continue
+				}
+				tblName := fmt.Sprintf("%v", p.row[2])
+				if strings.HasPrefix(tblName, "<subquery") {
+					continue
+				}
+				accessType := "ALL"
+				if p.row[4] != nil {
+					accessType = fmt.Sprintf("%v", p.row[4])
+				}
+				// In the BNL case: non-ALL tables come AFTER the subquery (they probe via subquery key)
+				// In the non-BNL (eq_ref probe) case: all outer tables come BEFORE the subquery
+				isDependent := anySubqueryBNL && (accessType == "ref" || accessType == "eq_ref" || accessType == "const")
+				tblBlock := e.explainJSONTableBlock(p.row, query)
+				if isDependent {
+					dependentTables = append(dependentTables, []orderedKV{{"table", tblBlock}})
+				} else {
+					driverTables = append(driverTables, []orderedKV{{"table", tblBlock}})
+				}
+			}
+			// Build: driver tables, then subqueries (sorted by ID), then dependent tables
+			nestedLoop = append(nestedLoop, driverTables...)
+			var matIDs []int64
+			for matID := range materializedRowsByID {
+				matIDs = append(matIDs, matID)
+			}
+			for i := 0; i < len(matIDs); i++ {
+				for j := i + 1; j < len(matIDs); j++ {
+					if matIDs[i] > matIDs[j] {
+						matIDs[i], matIDs[j] = matIDs[j], matIDs[i]
+					}
+				}
+			}
+			for _, matID := range matIDs {
+				name := fmt.Sprintf("<subquery%d>", matID)
+				matFromSub, ok := matBlockByName[name]
+				if !ok {
+					continue
+				}
+				if ph, ok := subqueryPlaceholderByName[name]; ok {
+					subqueryTblBlock := buildSubqueryBlock(ph, name, matFromSub)
+					nestedLoop = append(nestedLoop, []orderedKV{{"table", subqueryTblBlock}})
+				} else {
+					// No placeholder row found; use fallback
+					subqueryTblBlock := []orderedKV{
+						{"table_name", name},
+						{"access_type", "ALL"},
+						{"materialized_from_subquery", matFromSub},
+					}
+					nestedLoop = append(nestedLoop, []orderedKV{{"table", subqueryTblBlock}})
+				}
+			}
+			nestedLoop = append(nestedLoop, dependentTables...)
+		}
+
+		queryBlock = append(queryBlock, orderedKV{"nested_loop", nestedLoop})
+
+		// Attached subqueries
+		if len(subqueryRows) > 0 {
+			var attachedSubs []interface{}
+			for _, s := range subqueryRows {
+				attachedSubs = append(attachedSubs, e.explainJSONQueryBlockForRow(s.row, query))
+			}
+			queryBlock = append(queryBlock, orderedKV{"attached_subqueries", attachedSubs})
+		}
+	} else if len(primaryRows) == 1 && len(subqueryRows) == 0 && len(derivedRows) == 0 && len(unionRows) == 0 && unionResultRow == nil {
 		// Simple query with a single table
 		p := primaryRows[0]
 		// Check for "message-only" cases: no table, or empty table with special Extra
@@ -7726,11 +9211,259 @@ func (e *Executor) explainJSONWriteWithMarkers(b *strings.Builder, v interface{}
 	}
 }
 
+// explainTreeIndent returns a string of spaces for the given indent level (4 spaces per level).
+func explainTreeIndent(level int) string {
+	return strings.Repeat("    ", level)
+}
+
+// explainTreeRowInfo extracts fields from an EXPLAIN row []interface{}.
+// EXPLAIN row format: {id, select_type, table, partitions, type, possible_keys, key, key_len, ref, rows, filtered, Extra}
+func explainTreeRowInfo(row []interface{}) (tblName, accessType, keyName, ref, extra, selectType string, id int64) {
+	if row[0] != nil {
+		id, _ = row[0].(int64)
+	}
+	if row[1] != nil {
+		selectType = fmt.Sprintf("%v", row[1])
+	}
+	if row[2] != nil {
+		tblName = fmt.Sprintf("%v", row[2])
+	}
+	if row[4] != nil {
+		accessType = fmt.Sprintf("%v", row[4])
+	}
+	if row[6] != nil {
+		keyName = fmt.Sprintf("%v", row[6])
+	}
+	if row[8] != nil {
+		ref = fmt.Sprintf("%v", row[8])
+	}
+	if row[11] != nil {
+		extra = fmt.Sprintf("%v", row[11])
+	}
+	return
+}
+
+// explainTreeBuildGroup builds tree lines for a group of EXPLAIN rows at the same id.
+// indent is the indentation level. allRows is the full EXPLAIN rows for MATERIALIZED lookup.
+// joinType is "inner" or "left".
+func (e *Executor) explainTreeBuildGroup(groupRows [][]interface{}, allRows [][]interface{}, indent int, joinType string) []string {
+	if len(groupRows) == 0 {
+		return nil
+	}
+	if joinType == "" {
+		joinType = "inner"
+	}
+
+	if len(groupRows) == 1 {
+		row := groupRows[0]
+		tbl, at, kn, ref, extra, _, _ := explainTreeRowInfo(row)
+		return e.explainTreeTableNode(tbl, at, kn, ref, extra, allRows, indent)
+	}
+
+	// Multiple tables: sort so driving tables (ALL scan) come before probe tables (subquery lookups).
+	// In MySQL's TREE format, the left child is the driver and right child is the probe.
+	sortedRows := make([][]interface{}, len(groupRows))
+	copy(sortedRows, groupRows)
+	// Move ALL-scan tables to the front
+	stableSort := func(rows [][]interface{}) [][]interface{} {
+		var drivers, probes [][]interface{}
+		for _, row := range rows {
+			_, at, _, _, _, _, _ := explainTreeRowInfo(row)
+			tbl := ""
+			if row[2] != nil {
+				tbl = fmt.Sprintf("%v", row[2])
+			}
+			if at == "ALL" && !strings.HasPrefix(tbl, "<subquery") {
+				drivers = append(drivers, row)
+			} else {
+				probes = append(probes, row)
+			}
+		}
+		return append(drivers, probes...)
+	}
+	sortedRows = stableSort(sortedRows)
+
+	// Wrap in nested loop join
+	var lines []string
+	lines = append(lines, explainTreeIndent(indent)+"-> Nested loop "+joinType+" join")
+	for _, row := range sortedRows {
+		tbl, at, kn, ref, extra, _, _ := explainTreeRowInfo(row)
+		subLines := e.explainTreeTableNode(tbl, at, kn, ref, extra, allRows, indent+1)
+		lines = append(lines, subLines...)
+	}
+	return lines
+}
+
+// explainTreeTableNode generates tree lines for a single EXPLAIN table entry.
+func (e *Executor) explainTreeTableNode(tblName, accessType, keyName, ref, extra string, allRows [][]interface{}, indent int) []string {
+	pfx := explainTreeIndent(indent)
+	var lines []string
+
+	if strings.HasPrefix(tblName, "<subquery") {
+		// Materialized subquery placeholder
+		subNum := strings.TrimPrefix(tblName, "<subquery")
+		subNum = strings.TrimSuffix(subNum, ">")
+		var innerID int64
+		fmt.Sscanf(subNum, "%d", &innerID)
+
+		// Emit single-row index lookup for the placeholder
+		lines = append(lines, pfx+"-> Single-row index lookup on "+tblName+" using "+keyName+" (placeholder)")
+
+		// Find MATERIALIZED rows for this subquery id
+		var innerRows [][]interface{}
+		for _, r := range allRows {
+			_, _, _, _, _, st, rid := explainTreeRowInfo(r)
+			if st == "MATERIALIZED" && rid == innerID {
+				innerRows = append(innerRows, r)
+			}
+		}
+		if len(innerRows) > 0 {
+			lines = append(lines, pfx+"    -> Materialize with deduplication")
+			innerLines := e.explainTreeMaterializedContent(innerRows, allRows, indent+2)
+			lines = append(lines, innerLines...)
+		}
+		return lines
+	}
+
+	switch accessType {
+	case "ALL":
+		lines = append(lines, pfx+"-> Filter: ("+tblName+" not null)")
+		lines = append(lines, pfx+"    -> Table scan on "+tblName)
+	case "range":
+		lines = append(lines, pfx+"-> Filter: ("+tblName+" not null)")
+		lines = append(lines, pfx+"    -> Index range scan on "+tblName+" using "+keyName+", with index condition: (cond)")
+	case "eq_ref", "ref", "const":
+		lines = append(lines, pfx+"-> Single-row index lookup on "+tblName+" using "+keyName+" (placeholder)")
+	default:
+		lines = append(lines, pfx+"-> Table scan on "+tblName)
+	}
+	return lines
+}
+
+// explainTreeMaterializedContent builds lines for the content under "Materialize with deduplication".
+func (e *Executor) explainTreeMaterializedContent(innerRows [][]interface{}, allRows [][]interface{}, indent int) []string {
+	if len(innerRows) == 0 {
+		return nil
+	}
+	pfx := explainTreeIndent(indent)
+
+	if len(innerRows) == 1 {
+		row := innerRows[0]
+		tbl, at, kn, _, _, _, _ := explainTreeRowInfo(row)
+		var lines []string
+		switch at {
+		case "ALL":
+			lines = append(lines, pfx+"-> Filter: ("+tbl+" not null)")
+			lines = append(lines, pfx+"    -> Table scan on "+tbl)
+		case "range":
+			lines = append(lines, pfx+"-> Filter: ("+tbl+" not null)")
+			// Range scan inside a Filter: the condition is in the Filter node, not in the range scan.
+			lines = append(lines, pfx+"    -> Index range scan on "+tbl+" using "+kn)
+		case "eq_ref", "ref", "const":
+			lines = append(lines, pfx+"-> Single-row index lookup on "+tbl+" using "+kn+" (placeholder)")
+		default:
+			lines = append(lines, pfx+"-> Table scan on "+tbl)
+		}
+		return lines
+	}
+
+	// Multiple inner tables: filter + nested loop inner join
+	var lines []string
+	lines = append(lines, pfx+"-> Filter: (inner not null)")
+	lines = append(lines, pfx+"    -> Nested loop inner join")
+	for i, row := range innerRows {
+		tbl, at, kn, _, _, _, _ := explainTreeRowInfo(row)
+		subpfx := explainTreeIndent(indent + 2)
+		if i == 0 {
+			// First (driving) table gets a filter wrapper
+			lines = append(lines, subpfx+"-> Filter: ("+tbl+" not null)")
+			switch at {
+			case "range":
+				// Range scan inside a Filter: the condition is in the Filter node, not in the range scan.
+				lines = append(lines, subpfx+"    -> Index range scan on "+tbl+" using "+kn)
+			case "eq_ref", "ref", "const":
+				lines = append(lines, subpfx+"    -> Single-row index lookup on "+tbl+" using "+kn+" (placeholder)")
+			default:
+				lines = append(lines, subpfx+"    -> Table scan on "+tbl)
+			}
+		} else {
+			switch at {
+			case "eq_ref", "ref", "const":
+				lines = append(lines, subpfx+"-> Single-row index lookup on "+tbl+" using "+kn+" (placeholder)")
+			case "range":
+				lines = append(lines, subpfx+"-> Index range scan on "+tbl+" using "+kn+", with index condition: (cond)")
+			default:
+				lines = append(lines, subpfx+"-> Table scan on "+tbl)
+			}
+		}
+	}
+	return lines
+}
+
 func (e *Executor) explainTreeText(query string) string {
 	upper := strings.ToUpper(query)
 	if strings.Contains(upper, "JSON_TABLE(") {
 		return "-> Materialize table function"
 	}
+
+	// Try to build a proper tree from EXPLAIN rows
+	rows := e.explainMultiRows(query)
+
+	// Check if we have any complex structure (materialized subqueries, multi-table joins)
+	hasSubquery := false
+	hasMaterialized := false
+	for _, row := range rows {
+		_, _, _, _, _, st, _ := explainTreeRowInfo(row)
+		tbl := ""
+		if row[2] != nil {
+			tbl = fmt.Sprintf("%v", row[2])
+		}
+		if strings.HasPrefix(tbl, "<subquery") {
+			hasSubquery = true
+		}
+		if st == "MATERIALIZED" {
+			hasMaterialized = true
+		}
+	}
+
+	// For complex queries with materialized subqueries, build full tree
+	if hasSubquery || hasMaterialized {
+		// Group rows by id (skip nil-id rows like UNION RESULT)
+		idOrder := []int64{}
+		idGroups := map[int64][][]interface{}{}
+		for _, row := range rows {
+			if id, ok := row[0].(int64); ok {
+				if _, seen := idGroups[id]; !seen {
+					idOrder = append(idOrder, id)
+				}
+				idGroups[id] = append(idGroups[id], row)
+			}
+		}
+
+		if len(idOrder) > 0 {
+			outerID := idOrder[0]
+			outerRows := idGroups[outerID]
+
+			// Filter out MATERIALIZED rows (they belong to inner subqueries and are accessed via the placeholder)
+			var primaryRows [][]interface{}
+			for _, row := range outerRows {
+				_, _, _, _, _, st, _ := explainTreeRowInfo(row)
+				if st != "MATERIALIZED" {
+					primaryRows = append(primaryRows, row)
+				}
+			}
+			if len(primaryRows) == 0 {
+				primaryRows = outerRows
+			}
+
+			treeLines := e.explainTreeBuildGroup(primaryRows, rows, 0, "inner")
+			if len(treeLines) > 0 {
+				return strings.Join(treeLines, "\n")
+			}
+		}
+	}
+
+	// Fallback: simple single-table tree
 	tbl := explainTableNameFromQuery(query)
 	if tbl == "" {
 		tbl = "dual"
@@ -11102,20 +12835,36 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 	}
 
 	// Apply range constraints
+	isZerofill := strings.Contains(upper, "ZEROFILL")
 	if isUnsigned {
 		if intVal < 0 {
 			if baseType == "BIGINT" {
+				if isZerofill {
+					return applyIntZerofill(uint64(0), upper)
+				}
 				return uint64(0)
+			}
+			if isZerofill {
+				return applyIntZerofill(int64(0), upper)
 			}
 			return int64(0)
 		}
 		if uint64(intVal) > maxUnsigned {
 			if baseType == "BIGINT" {
+				if isZerofill {
+					return applyIntZerofill(maxUnsigned, upper)
+				}
 				return maxUnsigned
+			}
+			if isZerofill {
+				return applyIntZerofill(int64(maxUnsigned), upper)
 			}
 			return int64(maxUnsigned)
 		}
 		if baseType == "BIGINT" {
+			if isZerofill {
+				return applyIntZerofill(uint64(intVal), upper)
+			}
 			return uint64(intVal)
 		}
 	} else {
@@ -11126,7 +12875,42 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 			return maxVal
 		}
 	}
+	if isZerofill {
+		return applyIntZerofill(intVal, upper)
+	}
 	return intVal
+}
+
+// applyIntZerofill applies ZEROFILL zero-padding to an integer value for display.
+// The display width is extracted from the column type (e.g., "INT(2) ZEROFILL" -> width 2).
+// Returns a zero-padded string if a display width is specified, otherwise returns val unchanged.
+func applyIntZerofill(val interface{}, upperColType string) interface{} {
+	// Extract display width from INT(N), TINYINT(N), etc.
+	var width int
+	if idx := strings.Index(upperColType, "("); idx >= 0 {
+		if n, err := fmt.Sscanf(upperColType[idx:], "(%d)", &width); err != nil || n == 0 {
+			width = 0
+		}
+	}
+	if width <= 0 {
+		return val
+	}
+	var s string
+	switch v := val.(type) {
+	case int64:
+		if v < 0 {
+			return val // negative values not zero-padded in MySQL ZEROFILL (unsigned context)
+		}
+		s = fmt.Sprintf("%d", v)
+	case uint64:
+		s = fmt.Sprintf("%d", v)
+	default:
+		return val
+	}
+	for len(s) < width {
+		s = "0" + s
+	}
+	return s
 }
 
 func coerceBitValue(colType string, v interface{}) interface{} {
@@ -11566,6 +13350,62 @@ func splitEnumValues(s string) []string {
 	return result
 }
 
+// extractNumericPrefix tries to find the longest valid numeric prefix in a string s.
+// For example, "123.4e" -> "123.4" (truncate trailing 'e' with no exponent digits).
+// "123abc" -> "123", "-456.78e+2abc" -> "-456.78e+2".
+// Returns ("", false) if no valid numeric prefix found.
+func extractNumericPrefix(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	i := 0
+	// optional sign
+	if i < len(s) && (s[i] == '+' || s[i] == '-') {
+		i++
+	}
+	// digits before decimal
+	digitsBeforeDecimal := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+		digitsBeforeDecimal++
+	}
+	// optional decimal point and fractional digits
+	if i < len(s) && s[i] == '.' {
+		i++
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
+			digitsBeforeDecimal++ // count overall
+		}
+	}
+	if digitsBeforeDecimal == 0 {
+		return "", false
+	}
+	// optional exponent (only if followed by digits)
+	ePos := i
+	if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
+		j := i + 1
+		if j < len(s) && (s[j] == '+' || s[j] == '-') {
+			j++
+		}
+		if j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			// Valid exponent: advance i past exponent digits
+			i = j
+			for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+				i++
+			}
+		} else {
+			// 'e' not followed by digits: truncate here (don't include the 'e')
+			i = ePos
+		}
+	}
+	prefix := s[:i]
+	if prefix == "" || prefix == "+" || prefix == "-" {
+		return "", false
+	}
+	return prefix, true
+}
+
 // parseDecimalString attempts to parse a string that may contain scientific notation
 // or other numeric formats that strconv.ParseFloat cannot handle (e.g., extreme exponents).
 // Returns the float64 value and a classification:
@@ -11596,6 +13436,19 @@ func parseDecimalString(s string) (float64, string) {
 		}
 		// Check if the exponent value itself overflows uint64
 		// MySQL treats these as "incorrect decimal value" -> 0
+		// Special case: empty expStr means "123.4e" with trailing 'e' -> truncate to mantissa
+		if expStr == "" {
+			// Trailing 'e'/'E' with no exponent: truncate to the mantissa before 'e'
+			mantissa := cleanS[:idx]
+			if negative {
+				mantissa = "-" + mantissa
+			}
+			f, perr := strconv.ParseFloat(mantissa, 64)
+			if perr != nil {
+				return 0, "truncated"
+			}
+			return f, "truncated"
+		}
 		expVal, err := strconv.ParseUint(expStr, 10, 64)
 		if err != nil {
 			// Exponent value overflows -> incorrect decimal value -> 0
@@ -11892,8 +13745,18 @@ func coerceColumnValue(colType string, val interface{}) interface{} {
 // formatDecimalValue formats a value for DECIMAL(M,D), DOUBLE(M,D), or FLOAT(M,D) columns.
 func formatDecimalValue(colType string, v interface{}) interface{} {
 	lower := strings.ToLower(colType)
-	cleanLower := strings.TrimSuffix(strings.TrimSpace(lower), " unsigned")
-	cleanLower = strings.TrimSpace(cleanLower)
+	// Strip all trailing modifiers (unsigned, zerofill) in any order to get the base type
+	cleanLower := strings.TrimSpace(lower)
+	for {
+		prev := cleanLower
+		cleanLower = strings.TrimSuffix(cleanLower, " unsigned")
+		cleanLower = strings.TrimSpace(cleanLower)
+		cleanLower = strings.TrimSuffix(cleanLower, " zerofill")
+		cleanLower = strings.TrimSpace(cleanLower)
+		if cleanLower == prev {
+			break
+		}
+	}
 	var prefix string
 	for _, p := range []string{"decimal", "double", "float", "real"} {
 		if strings.HasPrefix(cleanLower, p+"(") {
@@ -11902,7 +13765,7 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 		}
 	}
 
-	isUnsigned := strings.Contains(lower, "unsigned")
+	isUnsigned := strings.Contains(lower, "unsigned") || strings.Contains(lower, "zerofill") // ZEROFILL implies UNSIGNED
 
 	// Handle bare DECIMAL/DOUBLE/FLOAT/REAL without (M,D)
 	if prefix == "" {
@@ -11963,10 +13826,33 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 					f = -maxVal
 				}
 			}
-			if f >= 0 {
-				return int64(f + 0.5)
+			// Helper to zero-pad integer for bare DECIMAL ZEROFILL (default M=10)
+			zerofillInt := func(i int64) interface{} {
+				if !strings.Contains(lower, "zerofill") {
+					return i
+				}
+				const bareDecimalM = 10
+				if i < 0 && isUnsigned {
+					return strings.Repeat("0", bareDecimalM)
+				}
+				s := fmt.Sprintf("%d", i)
+				neg := i < 0
+				abs := s
+				if neg {
+					abs = s[1:]
+				}
+				for len(abs) < bareDecimalM {
+					abs = "0" + abs
+				}
+				if neg {
+					return "-" + abs
+				}
+				return abs
 			}
-			return -int64(-f + 0.5)
+			if f >= 0 {
+				return zerofillInt(int64(f + 0.5))
+			}
+			return zerofillInt(-int64(-f + 0.5))
 		}
 		return v
 	}
@@ -11977,6 +13863,8 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 			return v
 		}
 	}
+	isZerofill := strings.Contains(lower, "zerofill")
+
 	var m, d int
 	// Try DECIMAL(M,D) first, then DECIMAL(M) which defaults to D=0
 	if n, err := fmt.Sscanf(cleanLower, prefix+"(%d,%d)", &m, &d); (err == nil && n == 2) || func() bool {
@@ -11986,6 +13874,89 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 		}
 		return false
 	}() {
+		// applyZerofillStr zero-pads a decimal string for ZEROFILL DECIMAL(M,D).
+		// For DECIMAL(M,D), the integer part is M-D digits wide.
+		// e.g. DECIMAL(10,2) -> "1.23" -> "00000001.23"
+		// For DECIMAL(M,0) ZEROFILL: "1" -> "0000000001"
+		applyZerofillStr := func(s string) string {
+			if !isZerofill || prefix != "decimal" {
+				return s
+			}
+			// Strip leading + sign (not used in MySQL output normally)
+			if strings.HasPrefix(s, "+") {
+				s = s[1:]
+			}
+			negative := strings.HasPrefix(s, "-")
+			abs := s
+			if negative {
+				abs = s[1:]
+			}
+			// ZEROFILL + UNSIGNED: negative values are clipped to 0
+			if negative && isUnsigned {
+				if d == 0 {
+					return strings.Repeat("0", m)
+				}
+				intWidth2 := m - d
+				if intWidth2 <= 0 {
+					intWidth2 = 1
+				}
+				return strings.Repeat("0", intWidth2) + "." + strings.Repeat("0", d)
+			}
+			if d == 0 {
+				// Integer DECIMAL(M,0) ZEROFILL: pad to M digits
+				for len(abs) < m {
+					abs = "0" + abs
+				}
+				if negative {
+					return "-" + abs
+				}
+				return abs
+			}
+			dotIdx := strings.Index(abs, ".")
+			var intPart, fracPart string
+			if dotIdx >= 0 {
+				intPart = abs[:dotIdx]
+				fracPart = abs[dotIdx+1:]
+			} else {
+				intPart = abs
+				fracPart = strings.Repeat("0", d)
+			}
+			intWidth := m - d
+			if intWidth <= 0 {
+				intWidth = 1
+			}
+			for len(intPart) < intWidth {
+				intPart = "0" + intPart
+			}
+			padded := intPart + "." + fracPart
+			if negative {
+				return "-" + padded
+			}
+			return padded
+		}
+		// applyZerofillFromInt applies zerofill to an int64 value for DECIMAL(M,0) ZEROFILL.
+		applyZerofillFromInt := func(i int64) interface{} {
+			if !isZerofill || prefix != "decimal" || d != 0 {
+				return i
+			}
+			if i < 0 && isUnsigned {
+				return strings.Repeat("0", m)
+			}
+			s := fmt.Sprintf("%d", i)
+			neg := i < 0
+			abs2 := s
+			if neg {
+				abs2 = s[1:]
+			}
+			for len(abs2) < m {
+				abs2 = "0" + abs2
+			}
+			if neg {
+				return "-" + abs2
+			}
+			return abs2
+		}
+
 		f, cls := decimalParseValue(v)
 		if prefix == "float" || prefix == "double" || prefix == "real" {
 			f, cls = floatParseValue(v)
@@ -12033,33 +14004,36 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 				if s, ok := v.(string); ok {
 					_, sCls := parseDecimalString(s)
 					if sCls == "overflow_pos" {
+						if isZerofill {
+							return strings.Repeat("9", m)
+						}
 						return strings.Repeat("9", m)
 					}
 					if sCls == "overflow_neg" {
 						if isUnsigned {
-							return "0"
+							return applyZerofillStr("0")
 						}
 						return "-" + strings.Repeat("9", m)
 					}
 					if sCls == "zero" {
-						return "0"
+						return applyZerofillStr("0")
 					}
 					if rounded, ok := roundNumericStringHalfUp(s, 0); ok {
-						return clipDecimalIntegerString(rounded, m, isUnsigned)
+						return applyZerofillStr(clipDecimalIntegerString(rounded, m, isUnsigned))
 					}
 				}
 				if s, ok := v.(string); ok && !clipped {
 					if rounded, ok := roundNumericStringHalfUp(s, 0); ok {
-						return rounded
+						return applyZerofillStr(rounded)
 					}
 				}
 				if m > 18 || math.Abs(f) > float64(math.MaxInt64)-1 {
 					// Use round-half-up for DECIMAL, not Go's round-half-to-even
 					// math.Floor(f+0.5) implements round-half-up
 					if f >= 0 {
-						return fmt.Sprintf("%.0f", math.Floor(f+0.5))
+						return applyZerofillStr(fmt.Sprintf("%.0f", math.Floor(f+0.5)))
 					}
-					return fmt.Sprintf("%.0f", math.Ceil(f-0.5))
+					return applyZerofillStr(fmt.Sprintf("%.0f", math.Ceil(f-0.5)))
 				}
 			}
 			if prefix == "float" {
@@ -12067,28 +14041,28 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 			}
 			// Round to nearest integer (MySQL DECIMAL rounds, not truncates)
 			if f >= 0 {
-				return int64(f + 0.5)
+				return applyZerofillFromInt(int64(f + 0.5))
 			}
-			return -int64(-f + 0.5)
+			return applyZerofillFromInt(-int64(-f + 0.5))
 		}
 		if prefix == "decimal" {
 			if clipped {
 				maxStr := decimalMaxString(m, d)
 				if isUnsigned && f == 0 {
-					return "0." + strings.Repeat("0", d)
+					return applyZerofillStr("0." + strings.Repeat("0", d))
 				}
 				if f < 0 {
 					return "-" + maxStr
 				}
-				return maxStr
+				return applyZerofillStr(maxStr)
 			}
 			// DECIMAL: round to d decimal places.
 			if s, ok := v.(string); ok && !clipped {
 				if rounded, ok := roundNumericStringHalfUp(s, d); ok {
-					return rounded
+					return applyZerofillStr(rounded)
 				}
 			}
-			return fmt.Sprintf("%.*f", d, f)
+			return applyZerofillStr(fmt.Sprintf("%.*f", d, f))
 		}
 		// FLOAT/DOUBLE/REAL(M,D): round to d decimal places (banker's rounding).
 		f = roundToEvenScale(f, d)
@@ -18028,6 +20002,33 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 			}
 			return !matched, nil
 		}
+		// For binary/varbinary column comparisons, use NO PAD (byte-for-byte) semantics.
+		// Check if either side references a binary column.
+		if (e.isBinaryExpr(leftExprW) || e.isBinaryExpr(rightExprW)) &&
+			(v.Operator == sqlparser.LessThanOp || v.Operator == sqlparser.GreaterThanOp ||
+				v.Operator == sqlparser.LessEqualOp || v.Operator == sqlparser.GreaterEqualOp) {
+			if left == nil || right == nil {
+				return false, nil
+			}
+			ls := toString(left)
+			rs := toString(right)
+			cmp := 0
+			if ls < rs {
+				cmp = -1
+			} else if ls > rs {
+				cmp = 1
+			}
+			switch v.Operator {
+			case sqlparser.LessThanOp:
+				return cmp < 0, nil
+			case sqlparser.GreaterThanOp:
+				return cmp > 0, nil
+			case sqlparser.LessEqualOp:
+				return cmp <= 0, nil
+			case sqlparser.GreaterEqualOp:
+				return cmp >= 0, nil
+			}
+		}
 		result, err := compareValues(left, right, v.Operator)
 		if err != nil {
 			return false, err
@@ -18549,14 +20550,8 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 			if rightIsEnum {
 				return false, nil
 			}
-			// Binary string vs integer: if right contains non-printable bytes (binary data),
-			// treat the integer as a big-endian byte string for comparison.
-			if looksLikeBinaryData(rs) {
-				leftAsBytes, ok := hexIntToBytes(left).(string)
-				if ok {
-					return leftAsBytes == rs, nil
-				}
-			}
+			// For a native numeric column value vs a binary string with non-printable bytes:
+			// MySQL converts the binary string to DOUBLE (which fails -> 0), so compare fl == 0.
 			return fl == 0, nil
 		}
 		if errR == nil && errL != nil && isNativeNumericType(right) {
@@ -19244,6 +21239,22 @@ func compareNumeric(a, b interface{}) int {
 		// Normalize date/time comparisons: when one is TIME-like and
 		// the other is DATETIME-like, extract the matching part.
 		sa, sb = normalizeDateTimeForCompare(sa, sb)
+
+		// Apply PAD SPACE semantics for non-binary string comparisons.
+		// MySQL's default collations (latin1_swedish_ci, utf8mb4_0900_ai_ci, etc.)
+		// use PAD SPACE: the shorter string is virtually padded with spaces before comparison.
+		// This means 'a\0' < 'a' because 'a' pads to 'a ' and NUL (0x00) < space (0x20).
+		padLen := len(sa)
+		if len(sb) > padLen {
+			padLen = len(sb)
+		}
+		for len(sa) < padLen {
+			sa += " "
+		}
+		for len(sb) < padLen {
+			sb += " "
+		}
+
 		if sa < sb {
 			return -1
 		}
