@@ -2060,9 +2060,37 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 
 	return &Result{
 		Columns:     colNames,
+		ColumnTypes: buildColumnTypes(colNames, selectTableDefs),
 		Rows:        resultRows,
 		IsResultSet: true,
 	}, nil
+}
+
+// buildColumnTypes returns a slice of MySQL column type strings (one per column name)
+// based on the provided table definitions. For columns not found in any table definition,
+// an empty string is returned.
+func buildColumnTypes(colNames []string, tableDefs []*catalog.TableDef) []string {
+	if len(tableDefs) == 0 {
+		return nil
+	}
+	// Build a flat map: lowercase column name -> upper-cased MySQL type
+	typeMap := make(map[string]string)
+	for _, td := range tableDefs {
+		if td == nil {
+			continue
+		}
+		for _, col := range td.Columns {
+			key := strings.ToLower(col.Name)
+			if _, exists := typeMap[key]; !exists {
+				typeMap[key] = strings.ToUpper(strings.TrimSpace(col.Type))
+			}
+		}
+	}
+	colTypes := make([]string, len(colNames))
+	for i, name := range colNames {
+		colTypes[i] = typeMap[strings.ToLower(name)]
+	}
+	return colTypes
 }
 
 // acquireRowLocksForSelect acquires row-level locks for SELECT ... FOR UPDATE / LOCK IN SHARE MODE.

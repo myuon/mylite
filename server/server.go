@@ -394,6 +394,7 @@ func resultToMySQLBinary(result *executor.Result) (*mysql.Result, error) {
 		if err != nil {
 			return nil, err
 		}
+		applyBinaryColumnFlags(r, result.ColumnTypes)
 		return &mysql.Result{Resultset: r}, nil
 	}
 
@@ -405,14 +406,16 @@ func resultToMySQLBinary(result *executor.Result) (*mysql.Result, error) {
 			}
 		}
 	}
+	rows := convertBinaryColumnValues(result.Rows, result.ColumnTypes)
 	r, err := mysql.BuildSimpleResultset(
 		makeFields(result.Columns),
-		result.Rows,
+		rows,
 		true,
 	)
 	if err != nil {
 		return nil, err
 	}
+	applyBinaryColumnFlags(r, result.ColumnTypes)
 	return &mysql.Result{Resultset: r}, nil
 }
 
@@ -561,22 +564,142 @@ func resultToMySQL(result *executor.Result) (*mysql.Result, error) {
 		if err != nil {
 			return nil, err
 		}
+		applyBinaryColumnFlags(r, result.ColumnTypes)
 		return &mysql.Result{
 			Resultset: r,
 		}, nil
 	}
 
+	rows := convertBinaryColumnValues(result.Rows, result.ColumnTypes)
 	r, err := mysql.BuildSimpleResultset(
 		makeFields(result.Columns),
-		fixEmptyStrings(normalizeRows(result.Rows)),
+		fixEmptyStrings(normalizeRows(rows)),
 		false,
 	)
 	if err != nil {
 		return nil, err
 	}
+	applyBinaryColumnFlags(r, result.ColumnTypes)
 	return &mysql.Result{
 		Resultset: r,
 	}, nil
+}
+
+// isBinaryColumnType returns true if the MySQL column type should be treated as binary
+// (i.e., charset=63, hex-encoded by clients using --binary-as-hex).
+func isBinaryColumnType(colType string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(colType))
+	if idx := strings.IndexByte(upper, '('); idx >= 0 {
+		upper = strings.TrimSpace(upper[:idx])
+	}
+	switch upper {
+	case "BINARY", "VARBINARY", "TINYBLOB", "BLOB", "MEDIUMBLOB", "LONGBLOB", "GEOMETRY", "BIT":
+		return true
+	}
+	return false
+}
+
+// applyBinaryColumnFlags sets the correct MySQL wire protocol field metadata for binary columns
+// so that clients using --binary-as-hex will hex-encode the output.
+func applyBinaryColumnFlags(r *mysql.Resultset, columnTypes []string) {
+	if r == nil || len(columnTypes) == 0 {
+		return
+	}
+	for i, colType := range columnTypes {
+		if i >= len(r.Fields) || r.Fields[i] == nil {
+			break
+		}
+		if !isBinaryColumnType(colType) {
+			continue
+		}
+		r.Fields[i].Charset = 63 // binary charset
+		upperType := strings.ToUpper(strings.TrimSpace(colType))
+		if idx := strings.IndexByte(upperType, '('); idx >= 0 {
+			upperType = strings.TrimSpace(upperType[:idx])
+		}
+		switch upperType {
+		case "TINYBLOB":
+			r.Fields[i].Flag |= mysql.BINARY_FLAG | mysql.BLOB_FLAG
+			r.Fields[i].Type = mysql.MYSQL_TYPE_TINY_BLOB
+		case "MEDIUMBLOB":
+			r.Fields[i].Flag |= mysql.BINARY_FLAG | mysql.BLOB_FLAG
+			r.Fields[i].Type = mysql.MYSQL_TYPE_MEDIUM_BLOB
+		case "LONGBLOB":
+			r.Fields[i].Flag |= mysql.BINARY_FLAG | mysql.BLOB_FLAG
+			r.Fields[i].Type = mysql.MYSQL_TYPE_LONG_BLOB
+		case "BLOB":
+			r.Fields[i].Flag |= mysql.BINARY_FLAG | mysql.BLOB_FLAG
+			r.Fields[i].Type = mysql.MYSQL_TYPE_BLOB
+		case "BINARY":
+			r.Fields[i].Flag |= mysql.BINARY_FLAG
+			r.Fields[i].Type = mysql.MYSQL_TYPE_STRING
+		case "VARBINARY":
+			r.Fields[i].Flag |= mysql.BINARY_FLAG
+			r.Fields[i].Type = mysql.MYSQL_TYPE_VAR_STRING
+		case "GEOMETRY":
+			r.Fields[i].Flag |= mysql.BINARY_FLAG | mysql.BLOB_FLAG
+			r.Fields[i].Type = mysql.MYSQL_TYPE_GEOMETRY
+		case "BIT":
+			r.Fields[i].Flag |= mysql.BINARY_FLAG | mysql.UNSIGNED_FLAG
+			r.Fields[i].Type = mysql.MYSQL_TYPE_BIT
+		}
+	}
+}
+
+// convertBinaryColumnValues converts Go values in rows for binary column types
+// to the format expected by the MySQL wire protocol:
+//   - BIT columns: int64 -> big-endian []byte
+//   - GEOMETRY columns: WKT string -> WKB []byte
+func convertBinaryColumnValues(rows [][]interface{}, columnTypes []string) [][]interface{} {
+	if len(columnTypes) == 0 {
+		return rows
+	}
+	result := make([][]interface{}, len(rows))
+	for ri, row := range rows {
+		newRow := make([]interface{}, len(row))
+		copy(newRow, row)
+		for ci, colType := range columnTypes {
+			if ci >= len(newRow) {
+				break
+			}
+			upper := strings.ToUpper(strings.TrimSpace(colType))
+			if idx := strings.IndexByte(upper, '('); idx >= 0 {
+				upper = strings.TrimSpace(upper[:idx])
+			}
+			switch upper {
+			case "BIT":
+				if v, ok := newRow[ci].(int64); ok {
+					// Convert int64 to minimal big-endian byte representation
+					if v == 0 {
+						newRow[ci] = []byte{0x00}
+					} else {
+						// Determine byte length needed
+						n := v
+						byteLen := 0
+						for n > 0 {
+							byteLen++
+							n >>= 8
+						}
+						b := make([]byte, byteLen)
+						for i := byteLen - 1; i >= 0; i-- {
+							b[i] = byte(v & 0xff)
+							v >>= 8
+						}
+						newRow[ci] = b
+					}
+				}
+			case "GEOMETRY":
+				if s, ok := newRow[ci].(string); ok && s != "" {
+					wkb := executor.WktToWKB(s)
+					if wkb != nil {
+						newRow[ci] = wkb
+					}
+				}
+			}
+		}
+		result[ri] = newRow
+	}
+	return result
 }
 
 func makeFields(columns []string) []string {

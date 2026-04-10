@@ -111,6 +111,7 @@ func mysqlTruncateChars(s string, maxChars int) string {
 // Result represents the result of a query execution.
 type Result struct {
 	Columns      []string
+	ColumnTypes  []string // MySQL column types (e.g. "BLOB", "BINARY", "VARBINARY") for wire protocol
 	Rows         [][]interface{}
 	AffectedRows uint64
 	InsertID     uint64
@@ -4282,7 +4283,22 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 	case *sqlparser.Select:
 		// Check if this SELECT has subqueries, derived tables, etc.
 		if e.queryHasComplexParts(s) {
-			result = e.explainSelect(s, &idCounter, "PRIMARY")
+			if e.queryCanBeSemijoinFlattened(s) {
+				// MySQL flattens IN/NOT EXISTS subqueries into semi-join / anti-join.
+				// All rows appear as id=1, SIMPLE (the sub-tables are inlined).
+				result = e.explainSelect(s, &idCounter, "SIMPLE")
+				// Post-process: rows added by explainSubqueries have id>1 and
+				// select_type like MATERIALIZED/SUBQUERY/DEPENDENT SUBQUERY.
+				// Change them to id=1, SIMPLE so they look like anti-join rows.
+				for i := range result {
+					if result[i].selectType != "SIMPLE" {
+						result[i].id = int64(1)
+						result[i].selectType = "SIMPLE"
+					}
+				}
+			} else {
+				result = e.explainSelect(s, &idCounter, "PRIMARY")
+			}
 		} else {
 			// Simple query
 			result = e.explainSelect(s, &idCounter, "SIMPLE")
@@ -4568,6 +4584,142 @@ func (e *Executor) queryHasComplexParts(sel *sqlparser.Select) bool {
 	return hasComplex
 }
 
+// queryCanBeSemijoinFlattened returns true if the SELECT's WHERE-clause subqueries
+// can all be flattened into a single SIMPLE query block (MySQL anti-join / semi-join
+// optimization). The rules:
+//
+//   - No derived tables in FROM (those need DERIVED rows).
+//   - The outer query must have at least one real table (not just DUAL).
+//   - No subqueries in the SELECT list (scalar subqueries must stay as SUBQUERY).
+//   - Every subquery in WHERE is either: IN (SELECT …), NOT IN (SELECT …),
+//     EXISTS (SELECT …), or NOT EXISTS wrapped in ExistsExpr.
+//   - No UNION subqueries inside IN (unions cannot be semijoin-flattened).
+//   - semijoin optimizer flag is ON (default).
+func (e *Executor) queryCanBeSemijoinFlattened(sel *sqlparser.Select) bool {
+	// Derived tables in FROM prevent flattening.
+	for _, te := range sel.From {
+		if e.tableExprHasSubquery(te) {
+			return false
+		}
+	}
+
+	// The outer query must have at least one real table (not just DUAL).
+	// If there are no real tables, MySQL cannot form an anti-join and keeps
+	// the subquery as a separate PRIMARY+SUBQUERY pair.
+	var outerTables []string
+	for _, te := range sel.From {
+		outerTables = append(outerTables, e.extractAllTableNames(te)...)
+	}
+	hasRealTable := false
+	for _, tn := range outerTables {
+		if strings.ToLower(tn) != "dual" {
+			hasRealTable = true
+			break
+		}
+	}
+	if !hasRealTable {
+		return false
+	}
+
+	// Subqueries in the SELECT list (scalar) prevent flattening.
+	hasSelectSubquery := false
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if _, ok := n.(*sqlparser.Subquery); ok {
+			hasSelectSubquery = true
+			return false, nil
+		}
+		return true, nil
+	}, sel.SelectExprs)
+	if hasSelectSubquery {
+		return false
+	}
+
+	// Count and classify WHERE-clause subqueries.
+	if sel.Where == nil {
+		return false // no subqueries at all → already SIMPLE
+	}
+	hasAny := false
+	allFlattenable := true
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		switch expr := n.(type) {
+		case *sqlparser.ExistsExpr:
+			// EXISTS / NOT EXISTS can be flattened only when the subquery has real tables.
+			// If the subquery is `EXISTS (SELECT 1 FROM dual)`, MySQL keeps it as SUBQUERY.
+			if inner, ok := expr.Subquery.Select.(*sqlparser.Select); ok {
+				var innerTables []string
+				for _, te := range inner.From {
+					innerTables = append(innerTables, e.extractAllTableNames(te)...)
+				}
+				hasRealInner := false
+				for _, tn := range innerTables {
+					if strings.ToLower(tn) != "dual" {
+						hasRealInner = true
+						break
+					}
+				}
+				if !hasRealInner {
+					// No real inner tables: EXISTS is a constant check, can't be flattened.
+					allFlattenable = false
+					return false, nil
+				}
+				hasAny = true
+			}
+			return false, nil
+		case *sqlparser.ComparisonExpr:
+			if expr.Operator == sqlparser.InOp || expr.Operator == sqlparser.NotInOp {
+				if sub, ok := expr.Right.(*sqlparser.Subquery); ok {
+					// UNION subqueries inside IN cannot be semijoin-flattened.
+					if _, isUnion := sub.Select.(*sqlparser.Union); isUnion {
+						allFlattenable = false
+						return false, nil
+					}
+					// IN subqueries with no real inner tables are constant checks.
+					if inner, ok := sub.Select.(*sqlparser.Select); ok {
+						var innerTables []string
+						for _, te := range inner.From {
+							innerTables = append(innerTables, e.extractAllTableNames(te)...)
+						}
+						hasRealInner := false
+						for _, tn := range innerTables {
+							if strings.ToLower(tn) != "dual" {
+								hasRealInner = true
+								break
+							}
+						}
+						if !hasRealInner {
+							allFlattenable = false
+							return false, nil
+						}
+						// Check for NO_SEMIJOIN optimizer hint in the inner SELECT.
+						// e.g. SELECT /*+ NO_SEMIJOIN() */ a FROM t1 prevents flattening.
+						for _, c := range inner.Comments.GetComments() {
+							if strings.Contains(strings.ToUpper(c), "NO_SEMIJOIN") {
+								allFlattenable = false
+								return false, nil
+							}
+						}
+					}
+					hasAny = true
+					return false, nil
+				}
+			}
+			return true, nil
+		case *sqlparser.Subquery:
+			// A bare subquery in WHERE not wrapped in EXISTS/IN/NOT IN.
+			allFlattenable = false
+			return false, nil
+		}
+		return true, nil
+	}, sel.Where)
+
+	if !hasAny || !allFlattenable {
+		return false
+	}
+
+	// semijoin must be enabled (it is on by default).
+	return e.isOptimizerSwitchEnabled("semijoin")
+}
+
 // tableExprHasSubquery checks if a table expression contains a derived table (subquery in FROM).
 func (e *Executor) tableExprHasSubquery(te sqlparser.TableExpr) bool {
 	switch t := te.(type) {
@@ -4776,13 +4928,24 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 		}
 	}
 
-	// Process FROM clause for derived tables
+	// Process FROM clause for derived tables.
+	// We collect them separately first so that WHERE-clause subqueries
+	// (DEPENDENT SUBQUERY / SUBQUERY) can be inserted before DERIVED rows,
+	// matching MySQL's EXPLAIN output order.
+	derivedStart := len(result)
 	for _, te := range sel.From {
 		e.explainFromExpr(te, idCounter, &result)
 	}
+	derivedRows := make([]explainSelectType, len(result)-derivedStart)
+	copy(derivedRows, result[derivedStart:])
+	result = result[:derivedStart]
 
-	// Process subqueries in SELECT expressions, WHERE, HAVING
+	// Process subqueries in SELECT expressions, WHERE, HAVING.
+	// MySQL outputs WHERE-clause subqueries BEFORE FROM-clause derived tables.
 	e.explainSubqueries(sel, idCounter, &result)
+
+	// Append derived rows after WHERE-clause subquery rows.
+	result = append(result, derivedRows...)
 
 	return result
 }
@@ -5039,13 +5202,27 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 				*result = append(*result, unionRows...)
 			case *sqlparser.Select:
 				selectType := "SUBQUERY"
-				if correlated {
+				// Check if the inner SELECT has a NO_SEMIJOIN optimizer hint.
+				// When NO_SEMIJOIN is present, MySQL uses the EXISTS strategy (DEPENDENT SUBQUERY),
+				// not MATERIALIZED, even if materialization=on.
+				innerHasNoSemijoin := false
+				for _, c := range inner.Comments.GetComments() {
+					if strings.Contains(strings.ToUpper(c), "NO_SEMIJOIN") {
+						innerHasNoSemijoin = true
+						break
+					}
+				}
+				if correlated || innerHasNoSemijoin {
 					selectType = "DEPENDENT SUBQUERY"
 				} else if inContext {
-					if e.isOptimizerSwitchEnabled("materialization") {
+					bigTables := false
+					if v, ok := e.getSysVar("big_tables"); ok && strings.EqualFold(v, "on") {
+						bigTables = true
+					}
+					if e.isOptimizerSwitchEnabled("materialization") && !bigTables {
 						selectType = "MATERIALIZED"
 					} else {
-						// When materialization=off, IN subqueries use EXISTS strategy → DEPENDENT SUBQUERY
+						// When materialization=off or big_tables=ON, IN subqueries use EXISTS strategy → DEPENDENT SUBQUERY
 						selectType = "DEPENDENT SUBQUERY"
 					}
 				}
@@ -15304,6 +15481,60 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 					return int64(0), nil
 				}
 			}
+			// Handle (SELECT c1,c2,...) IN (SELECT c1,c2,...) — subquery IN subquery.
+			// The left subquery may return multi-column rows.
+			if leftSub, leftIsSub := v.Left.(*sqlparser.Subquery); leftIsSub {
+				if rightSub, rightIsSub := v.Right.(*sqlparser.Subquery); rightIsSub {
+					leftResult, err := e.execSubquery(leftSub, row)
+					if err != nil {
+						return nil, err
+					}
+					rightResult, err := e.execSubquery(rightSub, row)
+					if err != nil {
+						return nil, err
+					}
+					if len(leftResult.Columns) != len(rightResult.Columns) {
+						return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftResult.Columns)))
+					}
+					ncols := len(leftResult.Columns)
+					for _, lrow := range leftResult.Rows {
+						hasNull := false
+						for _, rrow := range rightResult.Rows {
+							allMatch := true
+							rowHasNull := false
+							for i := 0; i < ncols; i++ {
+								lv, rv := lrow[i], rrow[i]
+								if lv == nil || rv == nil {
+									rowHasNull = true
+									allMatch = false
+									break
+								}
+								match, _ := compareValues(lv, rv, sqlparser.EqualOp)
+								if !match {
+									allMatch = false
+									break
+								}
+							}
+							if allMatch {
+								if v.Operator == sqlparser.InOp {
+									return int64(1), nil
+								}
+								return int64(0), nil
+							}
+							if rowHasNull {
+								hasNull = true
+							}
+						}
+						if hasNull {
+							return nil, nil
+						}
+					}
+					if v.Operator == sqlparser.NotInOp {
+						return int64(1), nil
+					}
+					return int64(0), nil
+				}
+			}
 			left, err := e.evalRowExpr(v.Left, row)
 			if err != nil {
 				return nil, err
@@ -15476,6 +15707,85 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				return int64(1), nil
 			}
 			return int64(0), nil
+		}
+		// Handle ANY/SOME/ALL modifier with subquery on right side.
+		// e.g. expr = ANY(SELECT ...) or expr <> ALL(SELECT ...) in SELECT list context.
+		// The right subquery can return multiple rows (ANY/ALL semantics).
+		if v.Modifier != 0 {
+			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+				isAny := v.Modifier == 1 // ANY/SOME; Modifier=2 means ALL
+
+				// Evaluate left side. If left is itself a subquery that returns >1 row,
+				// MySQL returns NULL rather than raising error 1242 in ANY/ALL context.
+				var left interface{}
+				if leftSub, leftIsSub := v.Left.(*sqlparser.Subquery); leftIsSub {
+					subResult, subErr := e.execSubquery(leftSub, row)
+					if subErr != nil {
+						return nil, subErr
+					}
+					if len(subResult.Rows) == 0 {
+						return nil, nil // NULL
+					}
+					if len(subResult.Rows) > 1 {
+						return nil, nil // >1 row in ANY/ALL context → NULL (not error 1242)
+					}
+					if len(subResult.Rows[0]) == 0 {
+						return nil, nil
+					}
+					left = subResult.Rows[0][0]
+				} else {
+					var err error
+					left, err = e.evalRowExpr(v.Left, row)
+					if err != nil {
+						return nil, err
+					}
+				}
+
+				if left == nil {
+					return nil, nil
+				}
+
+				vals, err := e.execSubqueryValues(sub, row)
+				if err != nil {
+					return nil, err
+				}
+
+				if isAny {
+					// ANY/SOME: true if comparison holds for at least one non-NULL value
+					hasNull := false
+					for _, val := range vals {
+						if val == nil {
+							hasNull = true
+							continue
+						}
+						match, err := compareValues(left, val, v.Operator)
+						if err != nil {
+							return nil, err
+						}
+						if match {
+							return int64(1), nil
+						}
+					}
+					if hasNull {
+						return nil, nil // unknown (NULL) if no match but there were NULLs
+					}
+					return int64(0), nil
+				}
+				// ALL: true if comparison holds for every value; NULL if any value is NULL
+				for _, val := range vals {
+					if val == nil {
+						return nil, nil
+					}
+					match, err := compareValues(left, val, v.Operator)
+					if err != nil {
+						return nil, err
+					}
+					if !match {
+						return int64(0), nil
+					}
+				}
+				return int64(1), nil
+			}
 		}
 		// Comparison in row context
 		// Extract COLLATE clause for collation-aware comparison

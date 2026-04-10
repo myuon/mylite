@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -1171,4 +1172,36 @@ func wktBoundingBox(wkt string) []float64 {
 		}
 	}
 	return []float64{minX, minY, maxX, maxY}
+}
+
+// WktToWKB is the exported form of wktToWKB for use from other packages (e.g. server).
+func WktToWKB(wkt string) []byte {
+	return wktToWKB(wkt)
+}
+
+// wktToWKB converts a WKT geometry string (e.g. "POINT(1 2)") to MySQL's internal
+// binary geometry format: 4-byte SRID (big-endian) + WKB (ISO).
+// Returns nil if parsing fails.
+func wktToWKB(wkt string) []byte {
+	wkt = strings.TrimSpace(wkt)
+	upper := strings.ToUpper(wkt)
+	if strings.HasPrefix(upper, "POINT") {
+		coords := parseSpatialPointCoords(wkt)
+		if len(coords) < 2 {
+			return nil
+		}
+		buf := make([]byte, 4+1+4+8+8) // SRID + byteOrder + type + X + Y
+		// SRID = 0 (big-endian)
+		binary.BigEndian.PutUint32(buf[0:4], 0)
+		// Byte order = 1 (little-endian)
+		buf[4] = 1
+		// Geometry type = 1 (POINT), little-endian
+		binary.LittleEndian.PutUint32(buf[5:9], 1)
+		// X coordinate
+		binary.LittleEndian.PutUint64(buf[9:17], math.Float64bits(coords[0]))
+		// Y coordinate
+		binary.LittleEndian.PutUint64(buf[17:25], math.Float64bits(coords[1]))
+		return buf
+	}
+	return nil
 }

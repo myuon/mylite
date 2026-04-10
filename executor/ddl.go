@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/hex"
 	"fmt"
 	"math"
 	"regexp"
@@ -3388,6 +3389,20 @@ func padDecimalDefault(colType, defVal string) string {
 func padBinaryValue(val interface{}, padLen int) interface{} {
 	if val == nil || padLen <= 0 {
 		return val
+	}
+	// Handle HexBytes (x'...' literal): decode hex string to raw bytes, then pad
+	if hb, ok := val.(HexBytes); ok {
+		decoded, err := hex.DecodeString(string(hb))
+		if err != nil {
+			decoded = []byte{}
+		}
+		s := string(decoded)
+		if len(s) < padLen {
+			s = s + strings.Repeat("\x00", padLen-len(s))
+		} else if len(s) > padLen {
+			s = s[:padLen]
+		}
+		return s
 	}
 	// Convert integer hex literals to byte strings first
 	converted := hexIntToBytes(val)
