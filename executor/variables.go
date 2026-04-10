@@ -110,6 +110,36 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		} else if evalVal != nil {
 			val = fmt.Sprintf("%v", evalVal)
 		}
+		// Special validation for time_zone: unquoted numeric literals give ER_WRONG_TYPE_FOR_VAR.
+		// Bare identifiers like OFF/ON need to be uppercased in error messages.
+		// This must be checked for both SESSION and GLOBAL scope before the switch.
+		if cleanVarName == "time_zone" {
+			// Unquoted numeric literals (integers, floats) → ER_WRONG_TYPE_FOR_VAR
+			if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
+				litStr := sqlparser.String(lit)
+				isQuoted := strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"")
+				if !isQuoted {
+					return nil, mysqlError(1232, "42000", "Incorrect argument type to variable 'time_zone'")
+				}
+			}
+			// TRUE/FALSE (sqlparser.BoolVal) → ER_WRONG_TYPE_FOR_VAR
+			if _, isBool := expr.Expr.(sqlparser.BoolVal); isBool {
+				return nil, mysqlError(1232, "42000", "Incorrect argument type to variable 'time_zone'")
+			}
+			// UnaryExpr like +0200 (= +200) → ER_WRONG_TYPE_FOR_VAR
+			if _, isUnary := expr.Expr.(*sqlparser.UnaryExpr); isUnary {
+				return nil, mysqlError(1232, "42000", "Incorrect argument type to variable 'time_zone'")
+			}
+			// Preserve original case for bare identifiers like OFF/ON in error messages.
+			if colName, isCol := expr.Expr.(*sqlparser.ColName); isCol {
+				val = strings.ToUpper(colName.Name.String())
+			} else if !strings.HasPrefix(val, "'") && !strings.HasPrefix(val, "\"") {
+				upper := strings.ToUpper(val)
+				if upper == "ON" || upper == "OFF" {
+					val = upper
+				}
+			}
+		}
 		switch name {
 		case "names":
 			charset := strings.ToLower(val)
@@ -170,8 +200,29 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				e.sessionScopeVars["sql_auto_is_null"] = boolStr
 			}
 		case "timestamp":
+			// String literals like "100" or " " are invalid — timestamp requires a numeric value.
+			if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
+				litStr := sqlparser.String(lit)
+				if strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"") {
+					return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable 'timestamp'"))
+				}
+			}
+			// Boolean identifiers (ON, OFF) are not valid for timestamp.
+			if colName, isCol := expr.Expr.(*sqlparser.ColName); isCol {
+				upper := strings.ToUpper(colName.Name.String())
+				if upper == "ON" || upper == "OFF" {
+					return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable 'timestamp'"))
+				}
+			}
 			n, err := strconv.ParseFloat(val, 64)
 			if err == nil {
+				// Very large values that overflow int64 are invalid.
+				if n > float64(math.MaxInt64) || n < float64(math.MinInt64) {
+					// Format like MySQL: 1e22 not 1e+22
+					fmtVal := fmt.Sprintf("%g", n)
+					fmtVal = strings.ReplaceAll(fmtVal, "e+", "e")
+					return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'timestamp' can't be set to the value of '%s'", fmtVal))
+				}
 				if n == 0 {
 					e.fixedTimestamp = nil
 				} else {
@@ -183,6 +234,8 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				}
 			}
 		case "time_zone":
+			// Validation is already done before the switch (numeric literal check + case preservation).
+			// Just call parseTimeZone with the already-processed val.
 			if err := e.parseTimeZone(val); err != nil {
 				return nil, mysqlError(1298, "HY000", err.Error())
 			}
@@ -734,6 +787,17 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							enumVal = e.mergeOptimizerSwitch(enumVal, isGlobal)
 						}
 						e.sessionScopeVars[cleanName] = enumVal
+					} else if cleanName == "optimizer_trace" {
+						// optimizer_trace uses key=value format; handle specially.
+						sv := val
+						if evalVal != nil {
+							sv = fmt.Sprintf("%v", evalVal)
+						}
+						traceVal, traceErr := e.normalizeOptimizerTrace(sv, expr.Expr, evalVal)
+						if traceErr != nil {
+							return nil, traceErr
+						}
+						e.sessionScopeVars[cleanName] = traceVal
 					} else if isBooleanVariable(cleanName) {
 						boolVal, bErr := normalizeBooleanSetValue(cleanName, expr.Expr, evalVal)
 						if bErr != nil {
@@ -2070,11 +2134,10 @@ var sysVarEnumValues = map[string]map[string]string{
 		"MEMORY":    "MEMORY",
 	},
 	"event_scheduler": {
-		"0":        "OFF",
-		"1":        "ON",
-		"ON":       "ON",
-		"OFF":      "OFF",
-		"DISABLED": "DISABLED",
+		"0":   "OFF",
+		"1":   "ON",
+		"ON":  "ON",
+		"OFF": "OFF",
 	},
 	"gtid_mode": {
 		"0":              "OFF",
@@ -2461,7 +2524,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"optimizer_trace_limit":                    {Min: 0, Max: 2147483647, IsUnsigned: false},
 	"optimizer_trace_max_mem_size":             {Min: 0, Max: 4294967295, IsUnsigned: true},
 	"optimizer_trace_offset":                   {Min: -2147483648, Max: 2147483647, IsUnsigned: false},
-	"parser_max_mem_size":                      {Min: 10000000, Max: 18446744073709551615, IsUnsigned: true},
+	"parser_max_mem_size":                      {Min: 10000000, Max: 50000000, IsUnsigned: true},
 	"password_history":                         {Min: 0, Max: 4294967295, IsUnsigned: true},
 	"password_reuse_interval":                  {Min: 0, Max: 4294967295, IsUnsigned: true},
 	"preload_buffer_size":                      {Min: 1024, Max: 1073741824, IsUnsigned: true},
@@ -3650,7 +3713,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"max_relay_log_size":                     "0",
 		"myisam_mmap_size":                       "18446744073709551615",
 		"offline_mode":                           "OFF",
-		"parser_max_mem_size":                    "18446744073709551615",
+		"parser_max_mem_size":                    "50000000",
 		"persisted_globals_load":                 "ON",
 		"print_identified_with_as_hex":           "OFF",
 		"pseudo_slave_mode":                      "OFF",

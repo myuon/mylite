@@ -1498,8 +1498,10 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		for i := 0; i+1 < len(fields); i += 2 {
 			if colNum, err := strconv.Atoi(fields[i]); err == nil {
 				val := fields[i+1]
-				// Strip surrounding double quotes (mysqltest behavior)
+				// Strip surrounding quotes (mysqltest behavior)
 				if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
+					val = val[1 : len(val)-1]
+				} else if len(val) >= 2 && val[0] == '\'' && val[len(val)-1] == '\'' {
 					val = val[1 : len(val)-1]
 				}
 				ctx.replaceColumns[colNum] = val

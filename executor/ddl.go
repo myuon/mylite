@@ -313,6 +313,15 @@ func (e *Executor) execDropDatabase(stmt *sqlparser.DropDatabase) (*Result, erro
 	e.Storage.DropDatabase(name)
 	if e.CurrentDB == name {
 		e.CurrentDB = ""
+		// Revert character_set_database/collation_database to the session-level
+		// character_set_server/collation_server. New connections inherit the global
+		// value as their session value, so this properly reflects per-connection state.
+		if cs, ok := e.getSysVarSession("character_set_server"); ok && cs != "" {
+			e.setSysVar("character_set_database", cs, false)
+		}
+		if coll, ok := e.getSysVarSession("collation_server"); ok && coll != "" {
+			e.setSysVar("collation_database", coll, false)
+		}
 	}
 	return &Result{}, nil
 }

@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"vitess.io/vitess/go/mysql/collations/charset"
 	"vitess.io/vitess/go/vt/sqlparser"
@@ -248,6 +249,23 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 	// but SELECT @@rand_seed1 / @@rand_seed2 always returns 0 (MySQL behavior).
 	if name == "rand_seed1" || name == "rand_seed2" {
 		return int64(0), nil
+	}
+
+	// @@timestamp is a session-only variable. When set to a non-zero value, it
+	// returns that fixed timestamp as a float. When unset or set to 0 (the default),
+	// it returns the current UNIX timestamp as a float64.
+	// MySQL formats @@timestamp with 6 decimal places (DOUBLE type), and it is
+	// a DOUBLE in arithmetic context (so timestamp - timestamp = 0, not 0.000000).
+	if name == "timestamp" && v.Scope != sqlparser.GlobalScope {
+		var ts float64
+		if e.fixedTimestamp != nil {
+			ts = float64(e.fixedTimestamp.Unix())
+		} else {
+			ts = float64(time.Now().Unix())
+		}
+		// SysVarDouble displays with 6 decimal places but has valueScale=0 so
+		// arithmetic operations produce integer results (not ScaledValue).
+		return SysVarDouble{Value: ts}, nil
 	}
 
 	// pseudo_thread_id defaults to the connection ID but can be overridden by SET.

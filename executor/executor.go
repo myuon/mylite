@@ -719,6 +719,101 @@ func (e *Executor) mergeOptimizerSwitch(newValue string, isGlobal bool) string {
 	return strings.Join(parts, ",")
 }
 
+// mergeOptimizerTrace handles SET optimizer_trace = value.
+// The optimizer_trace variable is stored as "enabled=on,one_line=off" format.
+// When set to 1/ON/TRUE → "enabled=on,one_line=off"
+// When set to 0/OFF/FALSE → "enabled=off,one_line=off"
+// When set to a key=value string like "enabled=on,one_line=off", it merges with current.
+// Float/scientific notation values are rejected as ER_WRONG_TYPE_FOR_VAR.
+// Unknown key=value strings are rejected as ER_WRONG_VALUE_FOR_VAR.
+func (e *Executor) normalizeOptimizerTrace(newValue string, expr sqlparser.Expr, evalVal interface{}) (string, error) {
+	const defaultTrace = "enabled=off,one_line=off"
+	validKeys := map[string]bool{"enabled": true, "one_line": true}
+
+	// Reject float/scientific notation
+	if lit, isLit := expr.(*sqlparser.Literal); isLit {
+		litStr := sqlparser.String(lit)
+		isQuoted := strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"")
+		if !isQuoted && strings.ContainsAny(litStr, ".eE") {
+			return "", mysqlError(1232, "42000", "Incorrect argument type to variable 'optimizer_trace'")
+		}
+	}
+
+	upper := strings.ToUpper(strings.TrimSpace(newValue))
+	// Handle DEFAULT
+	if upper == "DEFAULT" {
+		return defaultTrace, nil
+	}
+	// Handle numeric/boolean: 0/FALSE/OFF → disabled, 1/TRUE/ON → enabled
+	switch upper {
+	case "0", "OFF", "FALSE":
+		return "enabled=off,one_line=off", nil
+	case "1", "ON", "TRUE":
+		return "enabled=on,one_line=off", nil
+	}
+	// If numeric but not 0 or 1, try to parse
+	if n, err := strconv.ParseInt(upper, 10, 64); err == nil {
+		if n == 0 {
+			return "enabled=off,one_line=off", nil
+		}
+		return "enabled=on,one_line=off", nil
+	}
+
+	// Handle key=value format — parse and validate keys
+	if strings.Contains(newValue, "=") {
+		// Get current value to merge with
+		currentValue := defaultTrace
+		if cv, ok := e.getSysVar("optimizer_trace"); ok {
+			currentValue = cv
+		}
+		// Parse current state
+		type flagEntry struct{ key, val string }
+		var flags []flagEntry
+		flagIndex := map[string]int{}
+		for _, part := range strings.Split(currentValue, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			kv := strings.SplitN(part, "=", 2)
+			if len(kv) == 2 {
+				k, v := strings.TrimSpace(kv[0]), strings.TrimSpace(kv[1])
+				flagIndex[k] = len(flags)
+				flags = append(flags, flagEntry{k, v})
+			}
+		}
+		// Merge new values
+		for _, part := range strings.Split(newValue, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			kv := strings.SplitN(part, "=", 2)
+			if len(kv) != 2 {
+				return "", mysqlError(1231, "42000", fmt.Sprintf("Variable 'optimizer_trace' can't be set to the value of '%s'", newValue))
+			}
+			k, v := strings.ToLower(strings.TrimSpace(kv[0])), strings.ToLower(strings.TrimSpace(kv[1]))
+			if !validKeys[k] {
+				return "", mysqlError(1231, "42000", fmt.Sprintf("Variable 'optimizer_trace' can't be set to the value of '%s'", newValue))
+			}
+			if v != "on" && v != "off" {
+				return "", mysqlError(1231, "42000", fmt.Sprintf("Variable 'optimizer_trace' can't be set to the value of '%s'", newValue))
+			}
+			if idx, exists := flagIndex[k]; exists {
+				flags[idx].val = v
+			}
+		}
+		parts := make([]string, len(flags))
+		for i, f := range flags {
+			parts[i] = f.key + "=" + f.val
+		}
+		return strings.Join(parts, ","), nil
+	}
+
+	// Unknown string value
+	return "", mysqlError(1231, "42000", fmt.Sprintf("Variable 'optimizer_trace' can't be set to the value of '%s'", newValue))
+}
+
 // deleteSysVar deletes a system variable from the appropriate scope map (for DEFAULT).
 func (e *Executor) deleteSysVar(name string, isGlobal bool) {
 	if isGlobal {
@@ -4294,15 +4389,53 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 		if e.queryHasComplexParts(s) {
 			if e.queryCanBeSemijoinFlattened(s) {
 				// MySQL flattens IN/NOT EXISTS subqueries into semi-join / anti-join.
-				// All rows appear as id=1, SIMPLE (the sub-tables are inlined).
+				// With materialization=on, IN subqueries appear as:
+				//   id=1 SIMPLE outer_table
+				//   id=1 SIMPLE <subqueryN>  (materialized lookup table)
+				//   id=N MATERIALIZED inner_table
+				// With materialization=off or for EXISTS/anti-join, all rows are id=1, SIMPLE.
 				result = e.explainSelect(s, &idCounter, "SIMPLE")
-				// Post-process: rows added by explainSubqueries have id>1 and
-				// select_type like MATERIALIZED/SUBQUERY/DEPENDENT SUBQUERY.
-				// Change them to id=1, SIMPLE so they look like anti-join rows.
-				for i := range result {
-					if result[i].selectType != "SIMPLE" {
-						result[i].id = int64(1)
-						result[i].selectType = "SIMPLE"
+				// Post-process rows to handle materialization correctly.
+				if e.isOptimizerSwitchEnabled("materialization") {
+					// Insert <subqueryN> placeholder rows before MATERIALIZED rows and keep them.
+					var processed []explainSelectType
+					for _, r := range result {
+						if r.selectType == "MATERIALIZED" {
+							// Insert <subqueryN> placeholder at id=1, SIMPLE before MATERIALIZED row
+							subqueryRef := fmt.Sprintf("<subquery%d>", r.id)
+							processed = append(processed, explainSelectType{
+								id:           int64(1),
+								selectType:   "SIMPLE",
+								table:        subqueryRef,
+								accessType:   "eq_ref",
+								possibleKeys: "<auto_key>",
+								key:          "<auto_key>",
+								keyLen:       nil,
+								ref:          nil,
+								rows:         int64(1),
+								filtered:     "100.00",
+								extra:        nil,
+							})
+							// Keep the MATERIALIZED row unchanged
+							processed = append(processed, r)
+						} else if r.selectType != "SIMPLE" {
+							// Non-SIMPLE, non-MATERIALIZED rows (e.g. DEPENDENT SUBQUERY for EXISTS)
+							// become id=1, SIMPLE (anti-join / FirstMatch strategy)
+							r.id = int64(1)
+							r.selectType = "SIMPLE"
+							processed = append(processed, r)
+						} else {
+							processed = append(processed, r)
+						}
+					}
+					result = processed
+				} else {
+					// materialization=off: all non-SIMPLE rows become id=1, SIMPLE
+					for i := range result {
+						if result[i].selectType != "SIMPLE" {
+							result[i].id = int64(1)
+							result[i].selectType = "SIMPLE"
+						}
 					}
 				}
 			} else {
@@ -4675,14 +4808,26 @@ func (e *Executor) queryCanBeSemijoinFlattened(sel *sqlparser.Select) bool {
 			}
 			return false, nil
 		case *sqlparser.ComparisonExpr:
+			// Check if the right-hand side is a subquery (IN, NOT IN, = ANY, etc.)
+			isSubqueryComparison := false
 			if expr.Operator == sqlparser.InOp || expr.Operator == sqlparser.NotInOp {
+				isSubqueryComparison = true
+			} else if expr.Modifier == sqlparser.Any || expr.Modifier == sqlparser.All {
+				// = ANY / != ANY / < ANY / etc. with a subquery right-hand side
+				// These are semijoin-flattenable (equivalent to IN-subquery semantics).
+				// Plain scalar comparisons without ANY/ALL modifier are NOT flattenable.
+				if _, ok := expr.Right.(*sqlparser.Subquery); ok {
+					isSubqueryComparison = true
+				}
+			}
+			if isSubqueryComparison {
 				if sub, ok := expr.Right.(*sqlparser.Subquery); ok {
-					// UNION subqueries inside IN cannot be semijoin-flattened.
+					// UNION subqueries inside IN/ANY cannot be semijoin-flattened.
 					if _, isUnion := sub.Select.(*sqlparser.Union); isUnion {
 						allFlattenable = false
 						return false, nil
 					}
-					// IN subqueries with no real inner tables are constant checks.
+					// IN/ANY subqueries with no real inner tables are constant checks.
 					if inner, ok := sub.Select.(*sqlparser.Select); ok {
 						var innerTables []string
 						for _, te := range inner.From {
@@ -4714,7 +4859,7 @@ func (e *Executor) queryCanBeSemijoinFlattened(sel *sqlparser.Select) bool {
 			}
 			return true, nil
 		case *sqlparser.Subquery:
-			// A bare subquery in WHERE not wrapped in EXISTS/IN/NOT IN.
+			// A bare subquery in WHERE not wrapped in EXISTS/IN/NOT IN/= ANY.
 			allFlattenable = false
 			return false, nil
 		}
@@ -5109,7 +5254,105 @@ func (e *Executor) isCorrelatedSubquery(subSelect sqlparser.TableStatement, oute
 	return correlated
 }
 
+// shouldMaterializeSubquery returns true if an IN subquery should use the MATERIALIZED strategy.
+// MySQL uses a cost-based approach, but we approximate with a row count heuristic:
+// - If total inner table rows > materializationThreshold → MATERIALIZED
+// - If the join column has no usable index AND total rows > 0 → MATERIALIZED
+// - If the inner table is empty (0 rows) → MATERIALIZED (MySQL still materializes for large outer tables)
+// Otherwise → inline semijoin (SIMPLE, all rows at id=1).
+const materializationRowThreshold = 100
+
+func (e *Executor) shouldMaterializeSubquery(inner *sqlparser.Select) bool {
+	if e.Storage == nil {
+		return false
+	}
+
+	// Collect inner table names
+	var innerTables []string
+	for _, te := range inner.From {
+		innerTables = append(innerTables, e.extractAllTableNames(te)...)
+	}
+	// Filter out DUAL
+	var realInnerTables []string
+	for _, t := range innerTables {
+		if !strings.EqualFold(t, "dual") {
+			realInnerTables = append(realInnerTables, t)
+		}
+	}
+	if len(realInnerTables) == 0 {
+		return false
+	}
+
+	// Compute total row count across all inner tables
+	totalRows := 0
+	for _, tblName := range realInnerTables {
+		tbl, err := e.Storage.GetTable(e.CurrentDB, tblName)
+		if err != nil {
+			continue
+		}
+		totalRows += len(tbl.Rows)
+	}
+
+	// Large subquery → always materialize
+	if totalRows > materializationRowThreshold {
+		return true
+	}
+
+	// Empty table → use inline semijoin (FirstMatch), not materialization.
+	// MySQL doesn't materialize empty tables; it uses the FirstMatch strategy.
+	if totalRows == 0 {
+		return false
+	}
+
+	// For small non-empty subqueries: check if the join column has a usable index.
+	// If no index on the join column → materialize (hash lookup is cheaper than full scan).
+	// If has index → inline semijoin (eq_ref/ref access is cheap).
+	if len(realInnerTables) == 1 {
+		innerTableName := realInnerTables[0]
+		tbl, err := e.Storage.GetTable(e.CurrentDB, innerTableName)
+		if err != nil {
+			return false
+		}
+
+		// Find the join column: the first SELECT expression of the inner query
+		if inner.SelectExprs == nil || len(inner.SelectExprs.Exprs) == 0 {
+			return false
+		}
+		var joinColName string
+		if ae, ok := inner.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok {
+			if col, ok := ae.Expr.(*sqlparser.ColName); ok {
+				joinColName = strings.ToLower(col.Name.String())
+			}
+		}
+		if joinColName == "" {
+			return false
+		}
+
+		// Check if inner table has an index starting with the join column
+		if tbl.Def != nil {
+			// Check primary key first
+			if len(tbl.Def.PrimaryKey) > 0 && strings.EqualFold(tbl.Def.PrimaryKey[0], joinColName) {
+				return false // Primary key covers the join column → inline semijoin
+			}
+			// Check secondary indexes
+			for _, idx := range tbl.Def.Indexes {
+				if len(idx.Columns) > 0 && strings.EqualFold(idx.Columns[0], joinColName) {
+					return false // Has a usable index → inline semijoin
+				}
+			}
+		}
+
+		// No usable index → materialize
+		return true
+	}
+
+	// Multi-table inner subquery with small data → use inline semijoin
+	return false
+}
+
 // isSubqueryInINContext checks if a Subquery node is used in an IN, NOT IN, or = ANY / != ANY context.
+// Note: plain scalar equality like "col = (SELECT 1 FROM t2)" (without ANY/ALL) is NOT IN context;
+// those are SUBQUERY not semijoin-flattenable.
 func isSubqueryInINContext(node sqlparser.SQLNode, sub *sqlparser.Subquery) bool {
 	found := false
 	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
@@ -5123,10 +5366,13 @@ func isSubqueryInINContext(node sqlparser.SQLNode, sub *sqlparser.Subquery) bool
 			case sqlparser.EqualOp, sqlparser.NotEqualOp,
 				sqlparser.LessThanOp, sqlparser.LessEqualOp,
 				sqlparser.GreaterThanOp, sqlparser.GreaterEqualOp:
-				// = ANY / != ANY / < ANY / etc. with a subquery right-hand side
-				if subR, ok := cmp.Right.(*sqlparser.Subquery); ok && subR == sub {
-					found = true
-					return false, nil
+				// = ANY / != ANY / < ANY / etc. — only with ANY or ALL modifier.
+				// Plain scalar comparisons like col = (SELECT 1) have Modifier=Missing and are NOT IN context.
+				if (cmp.Modifier == sqlparser.Any || cmp.Modifier == sqlparser.All) {
+					if subR, ok := cmp.Right.(*sqlparser.Subquery); ok && subR == sub {
+						found = true
+						return false, nil
+					}
 				}
 			}
 		}
@@ -5230,7 +5476,13 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 							bigTables = true
 						}
 						if e.isOptimizerSwitchEnabled("materialization") && !bigTables {
-							selectType = "MATERIALIZED"
+							// Use MATERIALIZED only when the inner subquery would benefit from
+							// materialization (no usable index, or multiple tables, or empty table).
+							if e.shouldMaterializeSubquery(inner) {
+								selectType = "MATERIALIZED"
+							}
+							// If not materialized, selectType stays "SUBQUERY" but will be
+							// changed to "SIMPLE" by the semijoin flattening in explainMultiRows.
 						} else {
 							// When materialization=off or big_tables=ON, IN subqueries use EXISTS strategy → DEPENDENT SUBQUERY
 							selectType = "DEPENDENT SUBQUERY"
@@ -8467,6 +8719,15 @@ func (e *Executor) execUse(stmt *sqlparser.Use) (*Result, error) {
 		}
 	}
 	e.CurrentDB = name
+	// Update character_set_database and collation_database to match the new database's charset/collation.
+	if db, err := e.Catalog.GetDatabase(name); err == nil {
+		if db.CharacterSet != "" {
+			e.setSysVar("character_set_database", db.CharacterSet, false)
+		}
+		if db.CollationName != "" {
+			e.setSysVar("collation_database", db.CollationName, false)
+		}
+	}
 	return &Result{}, nil
 }
 
