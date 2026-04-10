@@ -5555,12 +5555,28 @@ func (e *Executor) shouldMaterializeSubquery(inner *sqlparser.Select) bool {
 	}
 
 	// Multi-table inner subqueries:
-	// - firstmatch=on: inline semijoin (SIMPLE, all rows at id=1)
-	// - firstmatch=off + any inner table has PK on join column: inline (eq_ref → no cost benefit from MATERIALIZED)
-	// - firstmatch=off + no PK on join column + large tables: MATERIALIZED
+	// Check if any inner table is empty — even one empty table in an INNER JOIN causes MySQL
+	// to prefer MATERIALIZED strategy (empty table makes the join result empty, cost analysis
+	// prefers materialization over inline FirstMatch for degenerate cases).
 	if len(realInnerTables) > 1 {
+		anyEmpty := false
+		for _, tblName := range realInnerTables {
+			tbl, err := e.Storage.GetTable(e.CurrentDB, tblName)
+			if err != nil || len(tbl.Rows) == 0 {
+				anyEmpty = true
+				break
+			}
+		}
+		if anyEmpty {
+			// Any inner table empty → use MATERIALIZED strategy
+			return true
+		}
+		// All inner tables have data:
+		// - firstmatch=on: inline semijoin (SIMPLE, all rows at id=1)
+		// - firstmatch=off + any inner table has PK on join column: inline (eq_ref → no cost benefit from MATERIALIZED)
+		// - firstmatch=off + no PK on join column + large tables: MATERIALIZED
 		if firstMatchOn {
-			return false // FirstMatch strategy → inline for multi-table too
+			return false // FirstMatch strategy → inline for multi-table with data
 		}
 		// firstmatch=off: check if the first inner table has a PK on the join column.
 		// If so, MySQL uses inline eq_ref access instead of MATERIALIZED.
@@ -5687,25 +5703,7 @@ func (e *Executor) isImpossibleConstPKWhere(inner *sqlparser.Select) bool {
 		innerTableNames = append(innerTableNames, e.extractAllTableNames(te)...)
 	}
 
-	// Case 1: Multi-table inner subquery where ALL tables are empty.
-	// MySQL treats this as "no matching row in const table" since every inner table
-	// is a const table (accessed via full scan) with 0 rows.
-	if len(innerTableNames) > 1 {
-		allEmpty := true
-		for _, tblName := range innerTableNames {
-			if strings.EqualFold(tblName, "dual") {
-				continue
-			}
-			tbl, err := e.Storage.GetTable(e.CurrentDB, tblName)
-			if err != nil || len(tbl.Rows) > 0 {
-				allEmpty = false
-				break
-			}
-		}
-		return allEmpty
-	}
-
-	// Case 2: Single-table inner subquery with a constant PK equality that matches no row.
+	// Single-table inner subquery with a constant PK equality that matches no row.
 	if inner.Where == nil || len(innerTableNames) != 1 {
 		return false
 	}

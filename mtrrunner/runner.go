@@ -3679,8 +3679,9 @@ func (ctx *execContext) sourceFile(filename string) error {
 					varVal := param[eqIdx+1:]
 					// MySQL converts hyphens to underscores in variable names
 					varName = strings.ReplaceAll(varName, "-", "_")
-					_ = ctx.executeSQLNoEcho(fmt.Sprintf("SET @@GLOBAL.%s = %s", varName, varVal))
-					_ = ctx.executeSQLNoEcho(fmt.Sprintf("SET @@SESSION.%s = %s", varName, varVal))
+					// Use SET STARTUP for restart simulation: bypasses read-only checks
+					// (server restart can change read-only startup-only vars like innodb_flush_method).
+					_ = ctx.executeSQLNoEcho(fmt.Sprintf("SET STARTUP %s = '%s'", varName, varVal))
 				}
 			}
 		}

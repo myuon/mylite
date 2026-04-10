@@ -980,6 +980,15 @@ func (e *Executor) handleRawSet(raw string) error {
 				}
 				return nil
 			}
+			// Apply enum mapping if the variable has canonical enum values (e.g. innodb_flush_method).
+			// This normalizes numeric assignments like "5" → "O_DIRECT_NO_FSYNC".
+			if enumMap, isEnum := sysVarEnumValues[varName]; isEnum {
+				if mapped, ok := enumMap[strings.ToUpper(val)]; ok {
+					val = mapped
+				} else if mapped, ok := enumMap[val]; ok {
+					val = mapped
+				}
+			}
 			// Store directly in both globalScopeVars and startupVars.
 			e.setGlobalVar(varName, val)
 			e.startupVars[varName] = val
@@ -1399,7 +1408,7 @@ var sysVarReadOnly = map[string]bool{
 	"have_geometry": true, "have_openssl": true, "have_profiling": true,
 	"have_query_cache": true, "have_rtree_keys": true, "have_ssl": true,
 	"have_symlink": true, "have_statement_timeout": true,
-	"hostname": true, "innodb_page_size": true, "innodb_read_only": true,
+	"hostname": true, "innodb_flush_method": true, "innodb_page_size": true, "innodb_read_only": true,
 	"innodb_version": true, "large_files_support": true, "large_page_size": true,
 	"lc_messages_dir": true, "license": true, "locked_in_memory": true,
 	"log_bin": true, "log_bin_basename": true, "log_bin_index": true,
@@ -3797,7 +3806,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"max_relay_log_size":                     "0",
 		"myisam_mmap_size":                       "18446744073709551615",
 		"offline_mode":                           "OFF",
-		"parser_max_mem_size":                    "50000000",
+		"parser_max_mem_size":                    "18446744073709551615",
 		"persisted_globals_load":                 "ON",
 		"print_identified_with_as_hex":           "OFF",
 		"pseudo_slave_mode":                      "OFF",
@@ -3929,6 +3938,19 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 			}
 		}
 		vars[name] = val
+	}
+
+	// parser_max_mem_size is special: --maximum-parser-max-mem-size=N also initializes
+	// the global value to N (because the compiled default is ULLONG_MAX which exceeds
+	// any maximum cap). Apply the cap to the initial display value when no explicit
+	// --parser-max-mem-size startup option was provided and no explicit SET GLOBAL was done.
+	if maxPMMS, hasParserMax := e.startupVars["maximum_parser_max_mem_size"]; hasParserMax {
+		if _, hasExplicit := e.startupVars["parser_max_mem_size"]; !hasExplicit {
+			// Check if a SET GLOBAL was done (use getGlobalVar for thread safety)
+			if _, hasGlobal := e.getGlobalVar("parser_max_mem_size"); !hasGlobal {
+				vars["parser_max_mem_size"] = maxPMMS
+			}
+		}
 	}
 
 	// Override with SET GLOBAL values.
