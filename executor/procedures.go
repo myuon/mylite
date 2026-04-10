@@ -2075,16 +2075,29 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 				// Evaluate expression
 				val, err := e.evaluateExprWithVars(valStr, localVars)
 				if err != nil {
-					// Fall back to Execute
+					// Fall back to Execute; propagate errors for system variable assignments.
 					resolvedSQL := e.substituteLocalVars(stmtStr, localVars)
-					e.Execute(resolvedSQL) //nolint:errcheck
+					if _, execErr := e.Execute(resolvedSQL); execErr != nil {
+						if strings.HasPrefix(varName, "@@") {
+							return nil, execErr
+						}
+						// For local variables, silently ignore execute errors (best-effort fallback)
+					}
 				} else {
 					// User variables (@var) are session-scoped and must persist outside the routine.
-					if strings.HasPrefix(varName, "@") {
+					// System variables (@@var) must go through Execute to trigger proper validation.
+					if strings.HasPrefix(varName, "@") && !strings.HasPrefix(varName, "@@") {
 						if e.userVars == nil {
 							e.userVars = make(map[string]interface{})
 						}
 						e.userVars[strings.TrimPrefix(varName, "@")] = val
+					} else if strings.HasPrefix(varName, "@@") {
+						// System variable assignment: must go through Execute for proper validation
+						// (e.g., sql_mode bitmask validation, pseudo_slave_mode checks, etc.)
+						resolvedSQL := e.substituteLocalVars(stmtStr, localVars)
+						if _, execErr := e.Execute(resolvedSQL); execErr != nil {
+							return nil, execErr
+						}
 					} else {
 						// Apply declared-type formatting (e.g. DOUBLE(10,3) -> "100.000")
 						if ctx.localVarTypes != nil {

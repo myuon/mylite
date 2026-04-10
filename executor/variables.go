@@ -167,7 +167,40 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			var modeVal string
 			if upperVal == "DEFAULT" {
 				modeVal = defaultSQLMode
+			} else if n, numErr := strconv.ParseUint(upperVal, 10, 64); numErr == nil {
+				// Numeric bitmask: convert to mode string.
+				// MySQL rejects values > 8589934591 (2^33-1).
+				if n > uint64(8589934591) {
+					return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'sql_mode' can't be set to the value of '%s'", upperVal))
+				}
+				// MySQL 8.0 rejects deprecated combination modes (bits 8-17, 28).
+				// These generate ER_UNSUPPORTED_SQL_MODE (3507).
+				// Exception: when pseudo_slave_mode is TRUE (replication slave mode),
+				// these unsupported bits are silently stripped with a warning instead of an error.
+				const unsupportedBits = uint64((1<<8)|(1<<9)|(1<<10)|(1<<11)|(1<<12)|(1<<13)|(1<<14)|(1<<15)|(1<<16)|(1<<17)|(1<<28))
+				if n&unsupportedBits != 0 {
+					// pseudo_slave_mode bypass only applies to direct (non-routine) SET statements.
+					pseudoSlaveMode := e.sessionScopeVars["pseudo_slave_mode"]
+					if (pseudoSlaveMode != "ON" && pseudoSlaveMode != "1") || e.routineDepth > 0 {
+						return nil, mysqlError(3507, "HY000", fmt.Sprintf("sql_mode=0x%08X is not supported.", n&unsupportedBits))
+					}
+					// pseudo_slave_mode=ON (direct SET, not inside routine): strip unsupported bits, emit warning 13249
+					badBits := n & unsupportedBits
+					e.addWarning("Warning", 13249, fmt.Sprintf("sql_mode=0x%08X has been removed and will be ignored", badBits))
+					n = n &^ unsupportedBits
+				}
+				modeVal = sqlModeBitmaskToString(n)
+			} else if _, negErr := strconv.ParseInt(upperVal, 10, 64); negErr == nil {
+				// Negative integers are rejected
+				return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'sql_mode' can't be set to the value of '%s'", upperVal))
+			} else if _, floatErr := strconv.ParseFloat(upperVal, 64); floatErr == nil && strings.ContainsAny(upperVal, ".") {
+				// Float values (containing decimal point) rejected with "Incorrect argument type"
+				return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable 'sql_mode'"))
 			} else {
+				// Validate: check each comma-separated part is a known SQL mode
+				if badPart := validateSQLModeValue(upperVal); badPart != "" {
+					return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'sql_mode' can't be set to the value of '%s'", badPart))
+				}
 				modeVal = expandSQLMode(upperVal)
 			}
 			if scope == sqlparser.GlobalScope {
@@ -175,6 +208,10 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			} else {
 				e.sqlMode = modeVal
 				e.sessionScopeVars["sql_mode"] = modeVal
+			}
+			// Emit warning 3090 when PAD_CHAR_TO_FULL_LENGTH is set (deprecated since 8.0.13).
+			if strings.Contains(modeVal, "PAD_CHAR_TO_FULL_LENGTH") {
+				e.addWarning("Warning", 3090, "Changing sql mode 'PAD_CHAR_TO_FULL_LENGTH' is deprecated. It will be removed in a future release.")
 			}
 			// Emit warning 3135 when NO_ZERO_DATE/NO_ZERO_IN_DATE/ERROR_FOR_DIVISION_BY_ZERO
 			// are explicitly set (MySQL deprecation warning — these will merge into strict mode).
@@ -1019,6 +1056,17 @@ func (e *Executor) handleRawSet(raw string) error {
 		}
 	}
 	upper := strings.ToUpper(raw)
+	// Detect invalid SET local.X / SET global.X / SET session.X (without @@) before any specific handling.
+	// This must come before the SQL_MODE block to avoid treating "SET session.sql_mode = X" as valid.
+	{
+		restCheck := strings.TrimSpace(trimmed[4:])
+		restCheckLower := strings.ToLower(restCheck)
+		for _, prefix := range []string{"local.", "global.", "session."} {
+			if strings.HasPrefix(restCheckLower, prefix) && !strings.HasPrefix(restCheckLower, "@@") {
+				return mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", restCheck))
+			}
+		}
+	}
 	if strings.Contains(upper, "SQL_MODE") {
 		if idx := strings.Index(upper, "="); idx >= 0 {
 			val := strings.TrimSpace(raw[idx+1:])
@@ -1028,10 +1076,30 @@ func (e *Executor) handleRawSet(raw string) error {
 			// Resolve @user_var and @@system_var references
 			val = e.resolveSystemVarInValue(val)
 			var modeVal string
-			if strings.ToUpper(val) == "DEFAULT" {
+			upperVal2 := strings.ToUpper(val)
+			if upperVal2 == "DEFAULT" {
 				modeVal = defaultSQLMode
+			} else if n, numErr := strconv.ParseUint(upperVal2, 10, 64); numErr == nil {
+				if n > uint64(8589934591) {
+					return mysqlError(1231, "42000", fmt.Sprintf("Variable 'sql_mode' can't be set to the value of '%s'", upperVal2))
+				}
+				const unsupportedBits = uint64((1 << 8) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16) | (1 << 17) | (1 << 28))
+				if n&unsupportedBits != 0 {
+					// pseudo_slave_mode bypass only applies to direct (non-routine) SET statements.
+					pseudoSlaveMode := e.sessionScopeVars["pseudo_slave_mode"]
+					if (pseudoSlaveMode != "ON" && pseudoSlaveMode != "1") || e.routineDepth > 0 {
+						return mysqlError(3507, "HY000", fmt.Sprintf("sql_mode=0x%08X is not supported.", n&unsupportedBits))
+					}
+					badBits := n & unsupportedBits
+					e.addWarning("Warning", 13249, fmt.Sprintf("sql_mode=0x%08X has been removed and will be ignored", badBits))
+					n = n &^ unsupportedBits
+				}
+				modeVal = sqlModeBitmaskToString(n)
 			} else {
-				modeVal = strings.ToUpper(val)
+				if badPart := validateSQLModeValue(upperVal2); badPart != "" {
+					return mysqlError(1231, "42000", fmt.Sprintf("Variable 'sql_mode' can't be set to the value of '%s'", badPart))
+				}
+				modeVal = expandSQLMode(upperVal2)
 			}
 			isGlobal := strings.Contains(upper, "GLOBAL")
 			if isGlobal {
@@ -1039,6 +1107,10 @@ func (e *Executor) handleRawSet(raw string) error {
 			} else {
 				e.sqlMode = modeVal
 				e.sessionScopeVars["sql_mode"] = modeVal
+			}
+			// Emit warning 3090 when PAD_CHAR_TO_FULL_LENGTH is set (deprecated since 8.0.13).
+			if strings.Contains(modeVal, "PAD_CHAR_TO_FULL_LENGTH") {
+				e.addWarning("Warning", 3090, "Changing sql mode 'PAD_CHAR_TO_FULL_LENGTH' is deprecated. It will be removed in a future release.")
 			}
 			// Emit warning 3135 for deprecated sensitive modes (same as execSet path)
 			if modeVal != defaultSQLMode && !strings.Contains(modeVal, "TRADITIONAL") {
@@ -1049,6 +1121,7 @@ func (e *Executor) handleRawSet(raw string) error {
 					e.addWarning("Warning", 3135, "'NO_ZERO_DATE', 'NO_ZERO_IN_DATE' and 'ERROR_FOR_DIVISION_BY_ZERO' sql modes should be used with strict mode. They will be merged with strict mode in a future release.")
 				}
 			}
+			return nil
 		}
 	}
 	if strings.Contains(upper, "SQL_AUTO_IS_NULL") {
@@ -1094,17 +1167,10 @@ func (e *Executor) handleRawSet(raw string) error {
 			_ = e.parseTimeZone(val)
 		}
 	}
-	// Detect invalid SET local.X / SET global.X / SET session.X (without @@)
+	// Detect SET @@SESSION varname / SET @@GLOBAL varname (space instead of dot)
 	{
 		restCheck := strings.TrimSpace(trimmed[4:])
 		restCheckLower := strings.ToLower(restCheck)
-		for _, prefix := range []string{"local.", "global.", "session."} {
-			if strings.HasPrefix(restCheckLower, prefix) && !strings.HasPrefix(restCheckLower, "@@") {
-				// This is SET local.X = Y which is a syntax error in MySQL
-				return mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", restCheck))
-			}
-		}
-		// Detect SET @@SESSION varname / SET @@GLOBAL varname (space instead of dot)
 		for _, prefix := range []string{"@@global ", "@@session ", "@@local "} {
 			if strings.HasPrefix(restCheckLower, prefix) {
 				nearText := restCheck[len(prefix):]

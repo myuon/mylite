@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"math"
 	"math/big"
-	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -2400,6 +2399,97 @@ func allCharsets() [][]interface{} {
 	}
 }
 
+// validSQLModes lists all valid individual SQL mode names (including combination modes).
+var validSQLModes = map[string]bool{
+	"ALLOW_INVALID_DATES": true, "ANSI_QUOTES": true,
+	"ERROR_FOR_DIVISION_BY_ZERO": true, "HIGH_NOT_PRECEDENCE": true,
+	"IGNORE_SPACE": true, "NO_AUTO_CREATE_USER": true, "NO_AUTO_VALUE_ON_ZERO": true,
+	"NO_BACKSLASH_ESCAPES": true, "NO_DIR_IN_CREATE": true, "NO_ENGINE_SUBSTITUTION": true,
+	"NO_FIELD_OPTIONS": true, "NO_KEY_OPTIONS": true, "NO_TABLE_OPTIONS": true,
+	"NO_UNSIGNED_SUBTRACTION": true, "NO_ZERO_DATE": true, "NO_ZERO_IN_DATE": true,
+	"ONLY_FULL_GROUP_BY": true, "PAD_CHAR_TO_FULL_LENGTH": true, "PIPES_AS_CONCAT": true,
+	"REAL_AS_FLOAT": true, "STRICT_ALL_TABLES": true, "STRICT_TRANS_TABLES": true,
+	"TIME_TRUNCATE_FRACTIONAL": true,
+	// Combination modes
+	"ANSI": true, "DB2": true, "MAXDB": true, "MSSQL": true, "MYSQL323": true,
+	"MYSQL40": true, "ORACLE": true, "POSTGRESQL": true, "TRADITIONAL": true,
+}
+
+// validateSQLModeValue returns the first invalid mode part, or "" if all parts are valid.
+func validateSQLModeValue(mode string) string {
+	for _, part := range strings.Split(mode, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" && !validSQLModes[strings.ToUpper(part)] {
+			return part
+		}
+	}
+	return ""
+}
+
+// sqlModeBits maps bit positions to SQL mode names (MySQL 8.0 bitmask).
+// Lowercase names indicate deprecated/reserved bits that MySQL still emits.
+var sqlModeBits = []string{
+	"REAL_AS_FLOAT",              // bit 0 = 1
+	"PIPES_AS_CONCAT",            // bit 1 = 2
+	"ANSI_QUOTES",                // bit 2 = 4
+	"IGNORE_SPACE",               // bit 3 = 8
+	"not_used",                   // bit 4 = 16 (reserved, emitted as lowercase)
+	"ONLY_FULL_GROUP_BY",         // bit 5 = 32
+	"NO_UNSIGNED_SUBTRACTION",    // bit 6 = 64
+	"NO_DIR_IN_CREATE",           // bit 7 = 128
+	"POSTGRESQL",                 // bit 8 = 256
+	"ORACLE",                     // bit 9 = 512
+	"MSSQL",                      // bit 10 = 1024
+	"DB2",                        // bit 11 = 2048
+	"MAXDB",                      // bit 12 = 4096
+	"NO_KEY_OPTIONS",             // bit 13 = 8192
+	"NO_TABLE_OPTIONS",           // bit 14 = 16384
+	"NO_FIELD_OPTIONS",           // bit 15 = 32768
+	"MYSQL323",                   // bit 16 = 65536
+	"MYSQL40",                    // bit 17 = 131072
+	"ANSI",                       // bit 18 = 262144
+	"NO_AUTO_VALUE_ON_ZERO",      // bit 19 = 524288
+	"NO_BACKSLASH_ESCAPES",       // bit 20 = 1048576
+	"STRICT_TRANS_TABLES",        // bit 21 = 2097152
+	"STRICT_ALL_TABLES",          // bit 22 = 4194304
+	"NO_ZERO_IN_DATE",            // bit 23 = 8388608
+	"NO_ZERO_DATE",               // bit 24 = 16777216
+	"ALLOW_INVALID_DATES",        // bit 25 = 33554432
+	"ERROR_FOR_DIVISION_BY_ZERO", // bit 26 = 67108864
+	"TRADITIONAL",                // bit 27 = 134217728
+	"NO_AUTO_CREATE_USER",        // bit 28 = 268435456
+	"HIGH_NOT_PRECEDENCE",        // bit 29 = 536870912
+	"NO_ENGINE_SUBSTITUTION",     // bit 30 = 1073741824
+	"PAD_CHAR_TO_FULL_LENGTH",    // bit 31 = 2147483648
+	"TIME_TRUNCATE_FRACTIONAL",   // bit 32 = 4294967296
+}
+
+// sqlModeBitmaskToString converts a numeric sql_mode bitmask to a comma-separated mode string.
+// Combination mode bits (ANSI=bit18, TRADITIONAL=bit27) are expanded to include their component bits.
+func sqlModeBitmaskToString(n uint64) string {
+	if n == 0 {
+		return ""
+	}
+	// Expand combination mode bits into their component bits.
+	// ANSI (bit 18) expands to include REAL_AS_FLOAT(0),PIPES_AS_CONCAT(1),ANSI_QUOTES(2),IGNORE_SPACE(3),ONLY_FULL_GROUP_BY(5)
+	const ansiBit = uint64(1 << 18)
+	// TRADITIONAL (bit 27) expands to include STRICT_TRANS_TABLES(21),STRICT_ALL_TABLES(22),NO_ZERO_IN_DATE(23),NO_ZERO_DATE(24),ERROR_FOR_DIVISION_BY_ZERO(26),NO_ENGINE_SUBSTITUTION(30)
+	const traditionalBit = uint64(1 << 27)
+	if n&ansiBit != 0 {
+		n |= (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5) // REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY
+	}
+	if n&traditionalBit != 0 {
+		n |= (1 << 21) | (1 << 22) | (1 << 23) | (1 << 24) | (1 << 26) | (1 << 30) // STRICT_TRANS_TABLES,STRICT_ALL_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+	}
+	var modes []string
+	for i, name := range sqlModeBits {
+		if n&(1<<uint(i)) != 0 {
+			modes = append(modes, name)
+		}
+	}
+	return strings.Join(modes, ",")
+}
+
 // isKnownCharset returns true if the charset name is a valid MySQL character set.
 // expandSQLMode expands MySQL combination sql_mode values into their component modes.
 func expandSQLMode(mode string) string {
@@ -2414,6 +2504,18 @@ func expandSQLMode(mode string) string {
 		"POSTGRESQL":  {"PIPES_AS_CONCAT", "ANSI_QUOTES", "IGNORE_SPACE", "NO_KEY_OPTIONS", "NO_TABLE_OPTIONS", "NO_FIELD_OPTIONS", "POSTGRESQL"},
 	}
 
+	// Build bit-position map for canonical ordering
+	bitPosMap := make(map[string]int, len(sqlModeBits))
+	for i, name := range sqlModeBits {
+		bitPosMap[strings.ToUpper(name)] = i
+	}
+	getBitPos := func(name string) int {
+		if p, ok := bitPosMap[strings.ToUpper(name)]; ok {
+			return p
+		}
+		return 1000
+	}
+
 	// Split into individual modes, expand combination modes, deduplicate, and rejoin.
 	parts := strings.Split(mode, ",")
 	var result []string
@@ -2425,18 +2527,24 @@ func expandSQLMode(mode string) string {
 		}
 		if expanded, ok := combinationModes[part]; ok {
 			for _, m := range expanded {
-				if !seen[m] {
-					seen[m] = true
+				up := strings.ToUpper(m)
+				if !seen[up] {
+					seen[up] = true
 					result = append(result, m)
 				}
 			}
 		} else {
-			if !seen[part] {
-				seen[part] = true
+			up := strings.ToUpper(part)
+			if !seen[up] {
+				seen[up] = true
 				result = append(result, part)
 			}
 		}
 	}
+	// Sort by bit position for canonical MySQL output order
+	sort.Slice(result, func(i, j int) bool {
+		return getBitPos(result[i]) < getBitPos(result[j])
+	})
 	return strings.Join(result, ",")
 }
 
@@ -4396,27 +4504,49 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 				//   id=N MATERIALIZED inner_table
 				// With materialization=off or for EXISTS/anti-join, all rows are id=1, SIMPLE.
 				result = e.explainSelect(s, &idCounter, "SIMPLE")
+				// Check if any subquery resulted in an impossible WHERE (no matching row in const table).
+				// If so, collapse the entire result to a single NULL row.
+				for _, r := range result {
+					if r.selectType == "__IMPOSSIBLE__" {
+						result = []explainSelectType{{
+							id:         int64(1),
+							selectType: "SIMPLE",
+							table:      nil,
+							extra:      "no matching row in const table",
+							rows:       nil,
+							filtered:   nil,
+							accessType: nil,
+						}}
+						break
+					}
+				}
 				// Post-process rows to handle materialization correctly.
 				if e.isOptimizerSwitchEnabled("materialization") {
 					// Insert <subqueryN> placeholder rows before MATERIALIZED rows and keep them.
+					// Only one placeholder per unique subquery id (multi-table subqueries share one id).
 					var processed []explainSelectType
+					insertedPlaceholder := map[interface{}]bool{}
 					for _, r := range result {
 						if r.selectType == "MATERIALIZED" {
-							// Insert <subqueryN> placeholder at id=1, SIMPLE before MATERIALIZED row
-							subqueryRef := fmt.Sprintf("<subquery%d>", r.id)
-							processed = append(processed, explainSelectType{
-								id:           int64(1),
-								selectType:   "SIMPLE",
-								table:        subqueryRef,
-								accessType:   "eq_ref",
-								possibleKeys: "<auto_key>",
-								key:          "<auto_key>",
-								keyLen:       nil,
-								ref:          nil,
-								rows:         int64(1),
-								filtered:     "100.00",
-								extra:        nil,
-							})
+							// Insert <subqueryN> placeholder at id=1, SIMPLE before MATERIALIZED rows
+							// but only once per subquery id.
+							if !insertedPlaceholder[r.id] {
+								insertedPlaceholder[r.id] = true
+								subqueryRef := fmt.Sprintf("<subquery%d>", r.id)
+								processed = append(processed, explainSelectType{
+									id:           int64(1),
+									selectType:   "SIMPLE",
+									table:        subqueryRef,
+									accessType:   "eq_ref",
+									possibleKeys: "<auto_key>",
+									key:          "<auto_key>",
+									keyLen:       nil,
+									ref:          nil,
+									rows:         int64(1),
+									filtered:     "100.00",
+									extra:        nil,
+								})
+							}
 							// Keep the MATERIALIZED row unchanged
 							processed = append(processed, r)
 						} else if r.selectType != "SIMPLE" {
@@ -4724,6 +4854,23 @@ func (e *Executor) queryHasComplexParts(sel *sqlparser.Select) bool {
 		}
 		return true, nil
 	}, sel.SelectExprs, sel.Where, sel.Having)
+	if hasComplex {
+		return true
+	}
+	// Check for subqueries in JOIN ON conditions
+	for _, te := range sel.From {
+		var onNodes []sqlparser.SQLNode
+		e.collectJoinOnConditions(te, &onNodes)
+		for _, onNode := range onNodes {
+			_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+				if _, ok := node.(*sqlparser.Subquery); ok {
+					hasComplex = true
+					return false, nil
+				}
+				return true, nil
+			}, onNode)
+		}
+	}
 	return hasComplex
 }
 
@@ -4777,13 +4924,36 @@ func (e *Executor) queryCanBeSemijoinFlattened(sel *sqlparser.Select) bool {
 		return false
 	}
 
-	// Count and classify WHERE-clause subqueries.
-	if sel.Where == nil {
+	// Collect ON conditions from JOIN expressions.
+	var onConditions []sqlparser.SQLNode
+	for _, te := range sel.From {
+		e.collectJoinOnConditions(te, &onConditions)
+	}
+
+	// Check if there are any subqueries to flatten in WHERE or ON conditions.
+	// If WHERE is nil AND no ON conditions have subqueries, this is a simple query.
+	hasSubqueryInWhere := sel.Where != nil
+	hasSubqueryInON := false
+	for _, onCond := range onConditions {
+		_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+			if _, ok := n.(*sqlparser.Subquery); ok {
+				hasSubqueryInON = true
+				return false, nil
+			}
+			return true, nil
+		}, onCond)
+		if hasSubqueryInON {
+			break
+		}
+	}
+	if !hasSubqueryInWhere && !hasSubqueryInON {
 		return false // no subqueries at all → already SIMPLE
 	}
+
+	// Walk both WHERE and ON conditions for flattenability analysis.
 	hasAny := false
 	allFlattenable := true
-	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+	walkFn := func(n sqlparser.SQLNode) (bool, error) {
 		switch expr := n.(type) {
 		case *sqlparser.ExistsExpr:
 			// EXISTS / NOT EXISTS can be flattened only when the subquery has real tables.
@@ -4865,10 +5035,48 @@ func (e *Executor) queryCanBeSemijoinFlattened(sel *sqlparser.Select) bool {
 			return false, nil
 		}
 		return true, nil
-	}, sel.Where)
+	}
+	// Walk WHERE clause
+	if sel.Where != nil {
+		_ = sqlparser.Walk(walkFn, sel.Where)
+	}
+	// Walk JOIN ON conditions
+	for _, onCond := range onConditions {
+		_ = sqlparser.Walk(walkFn, onCond)
+	}
 
 	if !hasAny || !allFlattenable {
 		return false
+	}
+
+	// MySQL cannot semijoin-flatten if the total number of tables (outer + inner) exceeds MAX_TABLES (61).
+	// When there are too many tables, MySQL keeps the subquery as a separate SUBQUERY block.
+	const mysqlMaxTables = 61
+	outerTableCount := len(outerTables)
+	// Count inner tables from all IN/ANY subqueries in WHERE and ON conditions
+	innerTableCount := 0
+	countInnerTables := func(n sqlparser.SQLNode) (bool, error) {
+		if comp, ok := n.(*sqlparser.ComparisonExpr); ok {
+			if comp.Operator == sqlparser.InOp || comp.Operator == sqlparser.NotInOp {
+				if sub, ok := comp.Right.(*sqlparser.Subquery); ok {
+					if inner, ok := sub.Select.(*sqlparser.Select); ok {
+						for _, te := range inner.From {
+							innerTableCount += len(e.extractAllTableNames(te))
+						}
+					}
+				}
+			}
+		}
+		return true, nil
+	}
+	if sel.Where != nil {
+		_ = sqlparser.Walk(countInnerTables, sel.Where)
+	}
+	for _, onCond := range onConditions {
+		_ = sqlparser.Walk(countInnerTables, onCond)
+	}
+	if outerTableCount+innerTableCount > mysqlMaxTables {
+		return false // Too many tables → MySQL keeps subquery as SUBQUERY, not SIMPLE
 	}
 
 	// semijoin must be enabled (it is on by default).
@@ -5009,14 +5217,16 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 						rowCount = int64(n)
 					} else {
 						tableIsEmpty = true
+						rowCount = 0
 					}
 				}
 			}
 
 			var extra interface{} = nil
 			// Single-table scan on empty table: MySQL shows "no matching row in const table"
-			// with table=NULL in the traditional EXPLAIN output
-			if tableIsEmpty && len(allTableNames) == 1 && idx == 0 {
+			// with table=NULL in the traditional EXPLAIN output.
+			// Exception: MATERIALIZED subqueries always show the real table name with 0 rows.
+			if tableIsEmpty && len(allTableNames) == 1 && idx == 0 && selectType != "MATERIALIZED" {
 				result = append(result, explainSelectType{
 					id:         myID,
 					selectType: selectType,
@@ -5026,6 +5236,12 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 					filtered:   nil,
 					accessType: nil,
 				})
+				// When the outer table is empty in a semijoin-flattened context (SIMPLE),
+				// return immediately without processing subqueries. MySQL collapses the
+				// entire result to 1 NULL row in this case.
+				if selectType == "SIMPLE" {
+					return result
+				}
 				continue
 			} else if idx == 0 && !orderByNull && (strings.Contains(upperQ, "GROUP BY") || strings.Contains(upperQ, "SQL_BIG_RESULT")) {
 				extra = "Using filesort"
@@ -5037,6 +5253,9 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 
 			var accessType interface{} = "ALL"
 			var filtered interface{} = "100.00"
+			if tableIsEmpty {
+				filtered = "0.00"
+			}
 			var possibleKeys interface{} = nil
 			var key interface{} = nil
 			var keyLen interface{} = nil
@@ -5297,39 +5516,66 @@ func (e *Executor) shouldMaterializeSubquery(inner *sqlparser.Select) bool {
 	// For single-table subqueries, check for index coverage on the join column.
 	// MySQL's strategy depends on the index type and optimizer flags:
 	// - PRIMARY KEY or UNIQUE on join col → always eq_ref (inline), regardless of firstmatch setting
+	// - Constant primary key equality in WHERE (pk=N) → const/eq_ref access, never materialize
 	// - Secondary (non-unique) index + firstmatch=on → FirstMatch (inline)
 	// - Secondary (non-unique) index + firstmatch=off → MATERIALIZED (for large tables)
 	// - No index → MATERIALIZED (if large table) or inline (if small)
 	firstMatchOn := e.isOptimizerSwitchEnabled("firstmatch")
-	if len(realInnerTables) == 1 && joinColName != "" {
+	if len(realInnerTables) == 1 {
 		innerTableName := realInnerTables[0]
 		if tbl, err := e.Storage.GetTable(e.CurrentDB, innerTableName); err == nil && tbl.Def != nil {
-			// Primary key always produces eq_ref → no materialization needed
-			if len(tbl.Def.PrimaryKey) > 0 && strings.EqualFold(tbl.Def.PrimaryKey[0], joinColName) {
-				return false // eq_ref via primary key → always inline
+			// Check if the inner WHERE has a constant equality on the primary key column(s).
+			// When pk = constant, MySQL uses const/eq_ref access → no materialization.
+			if len(tbl.Def.PrimaryKey) > 0 && inner.Where != nil {
+				if hasConstPKEquality(inner.Where.Expr, tbl.Def.PrimaryKey[0]) {
+					return false // const table access via primary key → always inline
+				}
 			}
-			// Check secondary indexes
-			for _, idx := range tbl.Def.Indexes {
-				if len(idx.Columns) > 0 && strings.EqualFold(idx.Columns[0], joinColName) {
-					// Secondary index on join column:
-					// - firstmatch=on → FirstMatch (inline, no materialization)
-					// - firstmatch=off → may materialize if table is large
-					if f, ferr := os.OpenFile("/tmp/explain_debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); ferr == nil {
-						fmt.Fprintf(f, "DEBUG shouldMaterialize: table=%s joinCol=%s idxCol=%s firstMatchOn=%v pk=%v\n",
-							innerTableName, joinColName, idx.Columns[0], firstMatchOn, tbl.Def.PrimaryKey)
-						f.Close()
+
+			if joinColName != "" {
+				// Primary key on join col → eq_ref (inline)
+				if len(tbl.Def.PrimaryKey) > 0 && strings.EqualFold(tbl.Def.PrimaryKey[0], joinColName) {
+					return false // eq_ref via primary key → always inline
+				}
+				// Check secondary indexes
+				for _, idx := range tbl.Def.Indexes {
+					if len(idx.Columns) > 0 && strings.EqualFold(idx.Columns[0], joinColName) {
+						// Secondary index on join column:
+						// - firstmatch=on → FirstMatch (inline, no materialization)
+						// - firstmatch=off → may materialize if table is large
+						if firstMatchOn {
+							return false // FirstMatch strategy → inline
+						}
+						// firstmatch=off: fall through to row count check for this secondary index
+						break
 					}
-					if firstMatchOn {
-						return false // FirstMatch strategy → inline
-					}
-					// firstmatch=off: fall through to row count check for this secondary index
-					break
 				}
 			}
 		}
 	}
 
-	// Compute total row count across all inner tables
+	// Multi-table inner subqueries:
+	// - firstmatch=on: inline semijoin (SIMPLE, all rows at id=1)
+	// - firstmatch=off + any inner table has PK on join column: inline (eq_ref → no cost benefit from MATERIALIZED)
+	// - firstmatch=off + no PK on join column + large tables: MATERIALIZED
+	if len(realInnerTables) > 1 {
+		if firstMatchOn {
+			return false // FirstMatch strategy → inline for multi-table too
+		}
+		// firstmatch=off: check if the first inner table has a PK on the join column.
+		// If so, MySQL uses inline eq_ref access instead of MATERIALIZED.
+		if joinColName != "" && e.Storage != nil {
+			firstTbl := realInnerTables[0]
+			if tbl, err := e.Storage.GetTable(e.CurrentDB, firstTbl); err == nil && tbl.Def != nil {
+				if len(tbl.Def.PrimaryKey) > 0 && strings.EqualFold(tbl.Def.PrimaryKey[0], joinColName) {
+					return false // eq_ref via primary key → inline even for multi-table
+				}
+			}
+		}
+		return true // firstmatch=off, no PK on join col → MATERIALIZED
+	}
+
+	// Compute total row count across all inner tables (single-table case)
 	totalRows := 0
 	for _, tblName := range realInnerTables {
 		tbl, err := e.Storage.GetTable(e.CurrentDB, tblName)
@@ -5339,23 +5585,154 @@ func (e *Executor) shouldMaterializeSubquery(inner *sqlparser.Select) bool {
 		totalRows += len(tbl.Rows)
 	}
 
-	// Empty table → use inline semijoin (FirstMatch), not materialization.
+	// Empty table handling:
+	// - subquery_materialization_cost_based=off → always materialize (even empty, even firstmatch=on)
+	// - subquery_materialization_cost_based=on + firstmatch=on → use FirstMatch (SIMPLE), not MATERIALIZED
+	// - subquery_materialization_cost_based=on + firstmatch=off → materialize
 	if totalRows == 0 {
+		costBased := e.isOptimizerSwitchEnabled("subquery_materialization_cost_based")
+		if !costBased {
+			// Cost-based disabled → always materialize
+			return true
+		}
+		if !firstMatchOn {
+			// firstmatch=off → materialize empty tables too
+			return true
+		}
+		// firstmatch=on + cost_based=on → use FirstMatch (inline/SIMPLE)
 		return false
 	}
 
-	// Large subquery with no primary key → materialize.
+	// Large single-table subquery with no primary key and no usable index → materialize.
 	if totalRows > materializationRowThreshold {
 		return true
 	}
 
 	// Small non-empty single-table subquery with no primary key (and no FirstMatch) → materialize.
-	if len(realInnerTables) == 1 {
-		return true
+	return true
+}
+
+// hasConstPKEquality checks if the WHERE expression has a constant equality condition on the given column.
+// For example, `pk = 12` or `12 = pk` (with a literal, not a column reference) returns true.
+// This is used to detect "const table" access patterns where MySQL accesses a single row via primary key.
+func hasConstPKEquality(expr sqlparser.Expr, pkCol string) bool {
+	switch e := expr.(type) {
+	case *sqlparser.ComparisonExpr:
+		if e.Operator == sqlparser.EqualOp {
+			// Check col = literal
+			if col, ok := e.Left.(*sqlparser.ColName); ok {
+				if strings.EqualFold(col.Name.String(), pkCol) {
+					// Right side must be a literal (not a column ref)
+					if _, isLit := e.Right.(*sqlparser.Literal); isLit {
+						return true
+					}
+				}
+			}
+			// Check literal = col
+			if col, ok := e.Right.(*sqlparser.ColName); ok {
+				if strings.EqualFold(col.Name.String(), pkCol) {
+					if _, isLit := e.Left.(*sqlparser.Literal); isLit {
+						return true
+					}
+				}
+			}
+		}
+	case *sqlparser.AndExpr:
+		return hasConstPKEquality(e.Left, pkCol) || hasConstPKEquality(e.Right, pkCol)
+	}
+	return false
+}
+
+// extractConstPKValue extracts the literal value from a constant PK equality condition.
+// For example, `pk = 12` returns ("12", true); otherwise returns ("", false).
+func extractConstPKValue(expr sqlparser.Expr, pkCol string) (string, bool) {
+	switch e := expr.(type) {
+	case *sqlparser.ComparisonExpr:
+		if e.Operator == sqlparser.EqualOp {
+			if col, ok := e.Left.(*sqlparser.ColName); ok {
+				if strings.EqualFold(col.Name.String(), pkCol) {
+					if lit, isLit := e.Right.(*sqlparser.Literal); isLit {
+						return lit.Val, true
+					}
+				}
+			}
+			if col, ok := e.Right.(*sqlparser.ColName); ok {
+				if strings.EqualFold(col.Name.String(), pkCol) {
+					if lit, isLit := e.Left.(*sqlparser.Literal); isLit {
+						return lit.Val, true
+					}
+				}
+			}
+		}
+	case *sqlparser.AndExpr:
+		if v, ok := extractConstPKValue(e.Left, pkCol); ok {
+			return v, true
+		}
+		return extractConstPKValue(e.Right, pkCol)
+	}
+	return "", false
+}
+
+// isImpossibleConstPKWhere checks if the inner SELECT's WHERE clause is a constant PK equality
+// that doesn't match any existing row, OR if ALL inner tables are empty (making the result empty).
+// Used for MySQL's "no matching row in const table" EXPLAIN optimization.
+func (e *Executor) isImpossibleConstPKWhere(inner *sqlparser.Select) bool {
+	if e.Storage == nil {
+		return false
 	}
 
-	// Multi-table inner subquery with small data → use inline semijoin
-	return false
+	// Collect all inner table names
+	var innerTableNames []string
+	for _, te := range inner.From {
+		innerTableNames = append(innerTableNames, e.extractAllTableNames(te)...)
+	}
+
+	// Case 1: Multi-table inner subquery where ALL tables are empty.
+	// MySQL treats this as "no matching row in const table" since every inner table
+	// is a const table (accessed via full scan) with 0 rows.
+	if len(innerTableNames) > 1 {
+		allEmpty := true
+		for _, tblName := range innerTableNames {
+			if strings.EqualFold(tblName, "dual") {
+				continue
+			}
+			tbl, err := e.Storage.GetTable(e.CurrentDB, tblName)
+			if err != nil || len(tbl.Rows) > 0 {
+				allEmpty = false
+				break
+			}
+		}
+		return allEmpty
+	}
+
+	// Case 2: Single-table inner subquery with a constant PK equality that matches no row.
+	if inner.Where == nil || len(innerTableNames) != 1 {
+		return false
+	}
+	tableName := innerTableNames[0]
+	if strings.EqualFold(tableName, "dual") {
+		return false
+	}
+	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
+	if err != nil || tbl.Def == nil || len(tbl.Def.PrimaryKey) == 0 {
+		return false
+	}
+	pkCol := tbl.Def.PrimaryKey[0]
+	pkVal, ok := extractConstPKValue(inner.Where.Expr, pkCol)
+	if !ok {
+		return false
+	}
+	// Check if any row has this PK value
+	// Row is a map[string]interface{}, keyed by column name.
+	for _, row := range tbl.Rows {
+		if val, ok := row[pkCol]; ok {
+			rowVal := fmt.Sprintf("%v", val)
+			if rowVal == pkVal {
+				return false // Row exists → not impossible
+			}
+		}
+	}
+	return true // No matching row found → impossible WHERE
 }
 
 // isSubqueryInINContext checks if a Subquery node is used in an IN, NOT IN, or = ANY / != ANY context.
@@ -5394,8 +5771,13 @@ func (e *Executor) explainSubqueries(sel *sqlparser.Select, idCounter *int64, re
 	// Collect outer table names for correlated subquery detection
 	outerTables := e.extractTableNamesAndAliases(sel)
 
-	// Walk the SELECT expressions, WHERE, and HAVING to find subqueries
-	// We need to avoid descending into FROM clause (handled separately)
+	// Determine whether the outer query can use semijoin flattening.
+	// MATERIALIZED is only valid when the outer query is semijoin-flattened.
+	outerCanSemijoin := e.queryCanBeSemijoinFlattened(sel)
+
+	// Walk the SELECT expressions, WHERE, HAVING, and JOIN ON conditions to find subqueries.
+	// We need to avoid descending into FROM clause derived tables (handled separately)
+	// but we DO need to walk JOIN ON conditions (which may contain IN subqueries).
 	nodes := []sqlparser.SQLNode{}
 	if sel.SelectExprs != nil {
 		nodes = append(nodes, sel.SelectExprs)
@@ -5409,10 +5791,14 @@ func (e *Executor) explainSubqueries(sel *sqlparser.Select, idCounter *int64, re
 	if sel.OrderBy != nil {
 		nodes = append(nodes, sel.OrderBy)
 	}
+	// Walk ON conditions from JOIN expressions in the FROM clause.
+	for _, te := range sel.From {
+		e.collectJoinOnConditions(te, &nodes)
+	}
 
 	for _, node := range nodes {
 		startIdx := len(*result)
-		e.walkForSubqueries(node, idCounter, result, outerTables)
+		e.walkForSubqueries(node, idCounter, result, outerTables, outerCanSemijoin)
 		// MySQL displays DEPENDENT SUBQUERY rows from the WHERE clause in reverse order
 		// (higher ids first) because it processes them in reverse during optimization.
 		// Reverse the newly-added rows if they are all DEPENDENT SUBQUERY.
@@ -5434,8 +5820,28 @@ func (e *Executor) explainSubqueries(sel *sqlparser.Select, idCounter *int64, re
 	}
 }
 
+// collectJoinOnConditions recursively collects ON condition expressions from JOIN table expressions.
+// These conditions may contain subqueries that need to be walked for EXPLAIN.
+func (e *Executor) collectJoinOnConditions(te sqlparser.TableExpr, nodes *[]sqlparser.SQLNode) {
+	switch t := te.(type) {
+	case *sqlparser.JoinTableExpr:
+		if t.Condition != nil && t.Condition.On != nil {
+			*nodes = append(*nodes, t.Condition.On)
+		}
+		e.collectJoinOnConditions(t.LeftExpr, nodes)
+		e.collectJoinOnConditions(t.RightExpr, nodes)
+	case *sqlparser.ParenTableExpr:
+		for _, expr := range t.Exprs {
+			e.collectJoinOnConditions(expr, nodes)
+		}
+	}
+}
+
 // walkForSubqueries walks a node tree to find subqueries (not descending into FROM).
-func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, result *[]explainSelectType, outerTables map[string]bool) {
+// outerCanSemijoin indicates whether the outer SELECT can use semijoin flattening.
+// When false, IN subqueries become SUBQUERY (not MATERIALIZED) since MATERIALIZED
+// is only used in the context of semijoin-flattened outer queries.
+func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, result *[]explainSelectType, outerTables map[string]bool, outerCanSemijoin bool) {
 	if node == nil {
 		return
 	}
@@ -5475,10 +5881,16 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 						break
 					}
 				}
-				if correlated || innerHasNoSemijoin {
+				// Check for "impossible WHERE" first (before considering correlation):
+				// When all inner tables are empty OR const PK lookup fails, MySQL uses
+				// "no matching row in const table" for the entire outer query.
+				// This applies to both IN and EXISTS/correlated subqueries when semijoin=on.
+				if e.isSemijoinEnabled() && e.isImpossibleConstPKWhere(inner) {
+					selectType = "__IMPOSSIBLE__"
+				} else if correlated || innerHasNoSemijoin {
 					selectType = "DEPENDENT SUBQUERY"
 				} else if inContext {
-					if e.isSemijoinEnabled() {
+					if e.isSemijoinEnabled() && outerCanSemijoin {
 						bigTables := false
 						if v, ok := e.getSysVar("big_tables"); ok && strings.EqualFold(v, "on") {
 							bigTables = true
@@ -5495,16 +5907,31 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 							// When materialization=off or big_tables=ON, IN subqueries use EXISTS strategy → DEPENDENT SUBQUERY
 							selectType = "DEPENDENT SUBQUERY"
 						}
+					} else if e.isSemijoinEnabled() && !outerCanSemijoin {
+						// semijoin=on but outer query can't use semijoin (e.g. too many tables):
+						// IN subqueries become plain SUBQUERY (not MATERIALIZED, not DEPENDENT).
+						selectType = "SUBQUERY"
 					} else {
 						// semijoin=off: IN subqueries use EXISTS strategy → DEPENDENT SUBQUERY
 						selectType = "DEPENDENT SUBQUERY"
 					}
 				}
-				subRows := e.explainSelect(inner, idCounter, selectType)
-				if len(subRows) > 0 {
-					subRows[0].id = *idCounter
+				if selectType == "__IMPOSSIBLE__" {
+					// Impossible WHERE: the entire outer query has no matching rows.
+					// Emit a marker row; explainMultiRows will collapse the result to 1 NULL row.
+					*result = append(*result, explainSelectType{
+						id:         int64(1),
+						selectType: "__IMPOSSIBLE__",
+						table:      nil,
+						extra:      "no matching row in const table",
+					})
+				} else {
+					subRows := e.explainSelect(inner, idCounter, selectType)
+					if len(subRows) > 0 {
+						subRows[0].id = *idCounter
+					}
+					*result = append(*result, subRows...)
 				}
-				*result = append(*result, subRows...)
 			}
 			return false, nil // Don't descend further into this subquery
 		}

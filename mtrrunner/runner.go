@@ -2624,17 +2624,23 @@ func (ctx *execContext) executeQuery(stmt string) error {
 	// Clear replace_columns after use
 	ctx.replaceColumns = nil
 
-	// Apply --replace_result to output
+	// Apply --replace_result to output (including column headers)
 	if len(ctx.replaceResult) > 0 {
 		for i, line := range resultLines {
 			resultLines[i] = applyReplaceResult(line, ctx.replaceResult)
 		}
+		for i, col := range columns {
+			columns[i] = applyReplaceResult(col, ctx.replaceResult)
+		}
 		ctx.replaceResult = nil
 	}
-	// Apply --replace_regex to output
+	// Apply --replace_regex to output (including column headers)
 	if len(ctx.replaceRegex) > 0 {
 		for i, line := range resultLines {
 			resultLines[i] = applyReplaceRegex(line, ctx.replaceRegex)
+		}
+		for i, col := range columns {
+			columns[i] = applyReplaceRegex(col, ctx.replaceRegex)
 		}
 		ctx.replaceRegex = nil
 	}
@@ -4214,6 +4220,8 @@ var mysqlErrorCodeToName = map[int]string{
 	1463: "ER_FIELD_IN_ORDER_NOT_SELECT",
 	1465: "ER_DUP_LIST_ENTRY",
 	1467: "ER_AUTOINC_READ_FAILED",
+	3507: "ER_UNSUPPORTED_SQL_MODE",
+	3566: "ER_VARIABLE_NOT_SETTABLE_IN_SP",
 }
 
 // mysqlCodeToSQLState maps a MySQL error code to its SQLSTATE.
