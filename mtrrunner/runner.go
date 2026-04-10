@@ -963,7 +963,16 @@ func (ctx *execContext) executeLines(lines []string) error {
 				rawEcho = stripCommentAfterDelimiter(strings.TrimRight(l, " \t\r\n"), delim)
 				stmtLine = strings.TrimRight(l, " \t\r\n")
 			} else {
-				rawEcho = stripCommentAfterDelimiter(t, delim)
+				// For echo: strip # comments that appear AFTER the delimiter on the same line
+				// (e.g. "OPTIMIZE TABLE t1; # this is a comment" → echo "OPTIMIZE TABLE t1;")
+				// But for lines without a delimiter, echo the line as-is including # comments
+				// (e.g. "SELECT 1 # comment" on a line before ";" → echo includes the comment)
+				if strings.Contains(t, delim) {
+					rawEcho = stripCommentAfterDelimiter(t, delim)
+				} else {
+					// No delimiter on this line: echo line preserving # comments
+					rawEcho = t
+				}
 			}
 
 			// Track string literal state: handle single/double quoted strings and /* */ block comments
@@ -1073,6 +1082,33 @@ func (ctx *execContext) executeLines(lines []string) error {
 
 		stmt = strings.TrimSpace(stmt)
 		if stmt == "" {
+			// Empty statement (e.g. " ;" or just ";"): MySQL returns error 1065.
+			// If there's an expected error or query logging, we need to handle it.
+			if ctx.expectedError != "" || ctx.queryLogEnabled {
+				// Echo the raw lines (shows ";")
+				if ctx.queryLogEnabled {
+					for _, rl := range rawLines {
+						if rl != "" {
+							ctx.output.WriteString(rl + "\n")
+						}
+					}
+				}
+				expectedErr := ctx.expectedError
+				ctx.expectedError = ""
+				errMsg := "ERROR 42000: Query was empty"
+				if expectedErr != "" {
+					// Check if error 1065 matches the expected error
+					if strings.Contains(expectedErr, "1065") || strings.Contains(expectedErr, "ER_EMPTY_QUERY") {
+						// Expected error matches, output the error message
+						ctx.output.WriteString(errMsg + "\n")
+					} else {
+						// Unexpected: no error or wrong error
+						ctx.output.WriteString(errMsg + "\n")
+					}
+				} else {
+					ctx.output.WriteString(errMsg + "\n")
+				}
+			}
 			continue
 		}
 

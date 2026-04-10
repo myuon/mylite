@@ -2686,6 +2686,37 @@ func matchLikeHelper(s, p []rune, si, pi int) bool {
 	return si == len(s)
 }
 
+// stripBlockComments removes /* ... */ block comments from a string,
+// but only when they appear at the end of the expression (trailing comments).
+// Embedded comments like 1+2/*hello*/+3 are preserved.
+// Used to clean up column names where MySQL strips trailing block comments.
+func stripBlockComments(s string) string {
+	// Only strip if the expression ends with */
+	trimmed := strings.TrimSpace(s)
+	if !strings.HasSuffix(trimmed, "*/") {
+		return s
+	}
+	// Find the start of the last trailing block comment
+	// We want to find the rightmost /* such that everything after */ is whitespace
+	result := trimmed
+	for strings.HasSuffix(result, "*/") {
+		// Find the matching /*
+		end := strings.LastIndex(result, "*/")
+		start := strings.LastIndex(result[:end], "/*")
+		if start < 0 {
+			break
+		}
+		// Check that what's after the */ is only whitespace (already trimmed, so end is at len-2)
+		// and that what's before /* is meaningful
+		candidate := strings.TrimSpace(result[:start])
+		if candidate == "" {
+			break
+		}
+		result = candidate
+	}
+	return result
+}
+
 // normalizeSQLDisplayName converts SQL keywords in a string to uppercase and
 // normalizes operator spacing to match MySQL's column display name behavior.
 func normalizeSQLDisplayName(s string) string {
@@ -4496,7 +4527,8 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 	case *sqlparser.Select:
 		// Check if this SELECT has subqueries, derived tables, etc.
 		if e.queryHasComplexParts(s) {
-			if e.queryCanBeSemijoinFlattened(s) {
+			canFlatten := e.queryCanBeSemijoinFlattened(s)
+			if canFlatten {
 				// MySQL flattens IN/NOT EXISTS subqueries into semi-join / anti-join.
 				// With materialization=on, IN subqueries appear as:
 				//   id=1 SIMPLE outer_table
@@ -5474,6 +5506,142 @@ func (e *Executor) isCorrelatedSubquery(subSelect sqlparser.TableStatement, oute
 	return correlated
 }
 
+// outerTablesAreSystem returns true if all outer tables together have exactly 1 row,
+// making the outer query a "system" table access. In this case, MySQL prefers inline
+// FirstMatch over MATERIALIZED because the const/system access is cheap.
+func (e *Executor) outerTablesAreSystem(outerTables map[string]bool) bool {
+	if e.Storage == nil || len(outerTables) == 0 {
+		return false
+	}
+	totalRows := 0
+	for tblName := range outerTables {
+		tbl, err := e.Storage.GetTable(e.CurrentDB, tblName)
+		if err != nil {
+			return false
+		}
+		totalRows += len(tbl.Rows)
+	}
+	return totalRows == 1
+}
+
+// innerSubqueryUsesOnlyStraightJoin returns true if the SELECT's FROM clause uses ONLY STRAIGHT_JOIN
+// (no INNER JOIN, no LEFT JOIN, no comma-join). STRAIGHT_JOIN forces join order, preventing table reordering.
+// Note: FROM t1, t2 (comma join) has len(sel.From)==2 with separate AliasedTableExprs, NOT STRAIGHT_JOIN.
+// STRAIGHT_JOIN syntax (t1 STRAIGHT_JOIN t2) produces a single JoinTableExpr with StraightJoinType.
+func (e *Executor) innerSubqueryUsesOnlyStraightJoin(sel *sqlparser.Select) bool {
+	if len(sel.From) == 0 {
+		return false
+	}
+	// Comma join (FROM t1, t2) means multiple top-level table expressions — not STRAIGHT_JOIN
+	if len(sel.From) > 1 {
+		return false
+	}
+	for _, te := range sel.From {
+		if !allJoinsAreStraight(te) {
+			return false
+		}
+	}
+	// Must have at least one actual JoinTableExpr with StraightJoinType
+	return hasStraightJoin(sel.From[0])
+}
+
+// hasStraightJoin returns true if the table expression contains at least one STRAIGHT_JOIN.
+func hasStraightJoin(te sqlparser.TableExpr) bool {
+	switch t := te.(type) {
+	case *sqlparser.JoinTableExpr:
+		if t.Join == sqlparser.StraightJoinType {
+			return true
+		}
+		return hasStraightJoin(t.LeftExpr) || hasStraightJoin(t.RightExpr)
+	case *sqlparser.ParenTableExpr:
+		for _, expr := range t.Exprs {
+			if hasStraightJoin(expr) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func allJoinsAreStraight(te sqlparser.TableExpr) bool {
+	switch t := te.(type) {
+	case *sqlparser.JoinTableExpr:
+		if t.Join != sqlparser.StraightJoinType {
+			return false
+		}
+		return allJoinsAreStraight(t.LeftExpr) && allJoinsAreStraight(t.RightExpr)
+	case *sqlparser.AliasedTableExpr:
+		return true // base table - no join
+	case *sqlparser.ParenTableExpr:
+		for _, expr := range t.Exprs {
+			if !allJoinsAreStraight(expr) {
+				return false
+			}
+		}
+		return true
+	}
+	return true
+}
+
+// innerSubqueryUsesRightJoin returns true if the SELECT's FROM clause contains a RIGHT JOIN.
+func (e *Executor) innerSubqueryUsesRightJoin(sel *sqlparser.Select) bool {
+	for _, te := range sel.From {
+		if hasRightJoin(te) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasRightJoin(te sqlparser.TableExpr) bool {
+	switch t := te.(type) {
+	case *sqlparser.JoinTableExpr:
+		if t.Join == sqlparser.RightJoinType || t.Join == sqlparser.NaturalRightJoinType {
+			return true
+		}
+		return hasRightJoin(t.LeftExpr) || hasRightJoin(t.RightExpr)
+	case *sqlparser.ParenTableExpr:
+		for _, expr := range t.Exprs {
+			if hasRightJoin(expr) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// allInnerTablesTwoOrMoreRows returns true if the inner SELECT uses STRAIGHT_JOIN and ALL inner
+// tables have >= 2 rows. In this case, MySQL forces MATERIALIZED even for constant outer expressions
+// (e.g., "11 IN (SELECT ...)"), because materializing is cheaper than scanning large fixed-order tables.
+func (e *Executor) allInnerTablesTwoOrMoreRows(inner *sqlparser.Select) bool {
+	if e.Storage == nil {
+		return false
+	}
+	if !e.innerSubqueryUsesOnlyStraightJoin(inner) {
+		return false
+	}
+	var innerTables []string
+	for _, te := range inner.From {
+		innerTables = append(innerTables, e.extractAllTableNames(te)...)
+	}
+	var realInner []string
+	for _, t := range innerTables {
+		if !strings.EqualFold(t, "dual") {
+			realInner = append(realInner, t)
+		}
+	}
+	if len(realInner) < 2 {
+		return false
+	}
+	for _, tblName := range realInner {
+		tbl, err := e.Storage.GetTable(e.CurrentDB, tblName)
+		if err != nil || len(tbl.Rows) < 2 {
+			return false
+		}
+	}
+	return true
+}
+
 // shouldMaterializeSubquery returns true if an IN subquery should use the MATERIALIZED strategy.
 // MySQL uses a cost-based approach, but we approximate with a row count heuristic:
 // - If total inner table rows > materializationThreshold → MATERIALIZED
@@ -5482,7 +5650,7 @@ func (e *Executor) isCorrelatedSubquery(subSelect sqlparser.TableStatement, oute
 // Otherwise → inline semijoin (SIMPLE, all rows at id=1).
 const materializationRowThreshold = 100
 
-func (e *Executor) shouldMaterializeSubquery(inner *sqlparser.Select) bool {
+func (e *Executor) shouldMaterializeSubquery(inner *sqlparser.Select, outerIsSystem bool) bool {
 	if e.Storage == nil {
 		return false
 	}
@@ -5555,9 +5723,11 @@ func (e *Executor) shouldMaterializeSubquery(inner *sqlparser.Select) bool {
 	}
 
 	// Multi-table inner subqueries:
-	// Check if any inner table is empty — even one empty table in an INNER JOIN causes MySQL
-	// to prefer MATERIALIZED strategy (empty table makes the join result empty, cost analysis
-	// prefers materialization over inline FirstMatch for degenerate cases).
+	// When the outer table is a "system" table (exactly 1 row) and firstmatch=on,
+	// MySQL always uses the inline FirstMatch/semijoin strategy regardless of inner table sizes.
+	// This is because the const/system outer table makes FirstMatch optimal.
+	// When the outer table requires a scan (2+ rows), check if any inner table is empty —
+	// even one empty table in an INNER JOIN causes MySQL to prefer MATERIALIZED strategy.
 	if len(realInnerTables) > 1 {
 		anyEmpty := false
 		for _, tblName := range realInnerTables {
@@ -5568,13 +5738,60 @@ func (e *Executor) shouldMaterializeSubquery(inner *sqlparser.Select) bool {
 			}
 		}
 		if anyEmpty {
-			// Any inner table empty → use MATERIALIZED strategy
-			return true
+			// Any inner table empty:
+			// - If outer is a "system" table (1 row) and firstmatch=on, MySQL uses inline
+			//   FirstMatch because the const/system outer makes it optimal.
+			// - If total inner rows >= 2: MySQL uses LooseScan (Start/End temporary) regardless
+			//   of join type — at least one non-empty inner table makes LooseScan viable.
+			// - If total inner rows == 1 and RIGHT JOIN with the right table having that 1 row:
+			//   LooseScan applies since the right (preserved) table drives.
+			// - Otherwise (total <= 1 with no LooseScan-viable configuration): MATERIALIZED.
+			if outerIsSystem && firstMatchOn {
+				return false // outer is system + firstmatch=on → inline FirstMatch
+			}
+			// Compute total inner rows to determine LooseScan viability
+			totalInnerRows := 0
+			for _, tblName := range realInnerTables {
+				if tbl, err := e.Storage.GetTable(e.CurrentDB, tblName); err == nil {
+					totalInnerRows += len(tbl.Rows)
+				}
+			}
+			if totalInnerRows >= 2 {
+				// For STRAIGHT_JOIN, the join order is fixed (t2 STRAIGHT_JOIN t3 → t2 first).
+				// When the FIRST (leftmost) inner table is non-empty, MySQL uses MATERIALIZED —
+				// BUT ONLY when the outer table is NOT a system table (1 row).
+				// When outer is system (1 row), MySQL always uses FirstMatch even for STRAIGHT_JOIN.
+				// For all other join types (INNER, LEFT, RIGHT), MySQL can reorder tables and
+				// LooseScan is viable when total inner rows >= 2.
+				if !outerIsSystem && e.innerSubqueryUsesOnlyStraightJoin(inner) && len(realInnerTables) >= 2 {
+					firstTbl := realInnerTables[0]
+					if tbl, err := e.Storage.GetTable(e.CurrentDB, firstTbl); err == nil && len(tbl.Rows) > 0 {
+						return true // STRAIGHT_JOIN with non-empty first table → MATERIALIZED
+					}
+				}
+				return false // total >= 2 inner rows → LooseScan strategy (not MATERIALIZED)
+			}
+			// total == 1: check if RIGHT JOIN with right table being the non-empty one
+			if totalInnerRows == 1 && e.innerSubqueryUsesRightJoin(inner) && len(realInnerTables) >= 2 {
+				lastTbl := realInnerTables[len(realInnerTables)-1]
+				if tbl, err := e.Storage.GetTable(e.CurrentDB, lastTbl); err == nil && len(tbl.Rows) > 0 {
+					return false // RIGHT JOIN with right table having the 1 row → LooseScan
+				}
+			}
+			return true // use MATERIALIZED strategy
 		}
 		// All inner tables have data:
+		// - STRAIGHT_JOIN with first table having >= 2 rows → MATERIALIZED (fixed join order, large probe set)
+		//   BUT ONLY when the outer is NOT a system table (outer=system always uses FirstMatch).
 		// - firstmatch=on: inline semijoin (SIMPLE, all rows at id=1)
 		// - firstmatch=off + any inner table has PK on join column: inline (eq_ref → no cost benefit from MATERIALIZED)
 		// - firstmatch=off + no PK on join column + large tables: MATERIALIZED
+		if !outerIsSystem && e.innerSubqueryUsesOnlyStraightJoin(inner) && len(realInnerTables) >= 2 {
+			firstTbl := realInnerTables[0]
+			if tbl, err := e.Storage.GetTable(e.CurrentDB, firstTbl); err == nil && len(tbl.Rows) >= 2 {
+				return true // STRAIGHT_JOIN with large first table → MATERIALIZED even when firstmatch=on
+			}
+		}
 		if firstMatchOn {
 			return false // FirstMatch strategy → inline for multi-table with data
 		}
@@ -5764,6 +5981,116 @@ func isSubqueryInINContext(node sqlparser.SQLNode, sub *sqlparser.Subquery) bool
 	return found
 }
 
+// isSubqueryInExistsContext checks if a Subquery node is inside an ExistsExpr.
+func isSubqueryInExistsContext(node sqlparser.SQLNode, sub *sqlparser.Subquery) bool {
+	found := false
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if exists, ok := n.(*sqlparser.ExistsExpr); ok {
+			if exists.Subquery == sub {
+				found = true
+				return false, nil
+			}
+		}
+		return true, nil
+	}, node)
+	return found
+}
+
+// isSemiJoinDecorrelatable checks if a correlated subquery can be converted to a semijoin.
+// This is true when the correlation consists only of simple equality conditions
+// between outer and inner table columns (e.g., WHERE outer.col = inner.col).
+// Such conditions can be "hoisted" into the semijoin join condition, making
+// the inner subquery effectively non-correlated.
+func (e *Executor) isSemiJoinDecorrelatable(inner *sqlparser.Select, outerTables map[string]bool) bool {
+	if inner.Where == nil {
+		return false // no WHERE → no correlation to decorrelate
+	}
+	// Collect inner table names
+	innerTables := e.extractTableNamesAndAliases(inner)
+
+	// Check if ALL references to outer tables in WHERE are simple equality conditions
+	allCorrelationsAreEqualities := true
+	hasAnyCorrelation := false
+
+	var checkExpr func(expr sqlparser.Expr) bool
+	checkExpr = func(expr sqlparser.Expr) bool {
+		switch e := expr.(type) {
+		case *sqlparser.AndExpr:
+			return checkExpr(e.Left) && checkExpr(e.Right)
+		case *sqlparser.ComparisonExpr:
+			if e.Operator != sqlparser.EqualOp {
+				// Non-equality condition: check if it references outer tables
+				// If not correlated, it's fine. If correlated, not decorrelatable.
+				leftRefOuter := exprReferencesOuterTable(e.Left, outerTables, innerTables)
+				rightRefOuter := exprReferencesOuterTable(e.Right, outerTables, innerTables)
+				if leftRefOuter || rightRefOuter {
+					return false // non-equality correlation → not decorrelatable
+				}
+				return true
+			}
+			// Equality: check if it's an outer-inner equality
+			leftRefOuter := exprReferencesOuterTable(e.Left, outerTables, innerTables)
+			rightRefOuter := exprReferencesOuterTable(e.Right, outerTables, innerTables)
+			if leftRefOuter || rightRefOuter {
+				hasAnyCorrelation = true
+				// This is an equality with outer reference → decorrelatable
+				return true
+			}
+			return true // non-correlated equality → fine
+		default:
+			return true
+		}
+	}
+
+	if !checkExpr(inner.Where.Expr) {
+		allCorrelationsAreEqualities = false
+	}
+
+	return allCorrelationsAreEqualities && hasAnyCorrelation
+}
+
+// exprReferencesOuterTable returns true if the expression references an outer table column.
+func exprReferencesOuterTable(expr sqlparser.Expr, outerTables map[string]bool, innerTables map[string]bool) bool {
+	if col, ok := expr.(*sqlparser.ColName); ok {
+		qualifier := strings.ToLower(col.Qualifier.Name.String())
+		if qualifier != "" {
+			return outerTables[qualifier] && !innerTables[qualifier]
+		}
+		// Unqualified: check if it's NOT an inner table column (could be outer)
+		// For safety, return false for unqualified names
+	}
+	return false
+}
+
+// outerINExprIsConstant checks if the IN condition that contains the given subquery
+// has a constant (non-column) expression on the left-hand side.
+// When the IN outer expression is a constant (e.g., "11 IN (subquery)"), MySQL uses
+// FirstMatch instead of MATERIALIZED because the constant can be checked without
+// materializing the inner result for each outer row.
+func outerINExprIsConstant(node sqlparser.SQLNode, sub *sqlparser.Subquery) bool {
+	isConst := false
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if cmp, ok := n.(*sqlparser.ComparisonExpr); ok {
+			if cmp.Operator == sqlparser.InOp || cmp.Operator == sqlparser.NotInOp {
+				if subR, ok := cmp.Right.(*sqlparser.Subquery); ok && subR == sub {
+					// Check if the left side is a constant (not a column reference)
+					switch cmp.Left.(type) {
+					case *sqlparser.Literal, *sqlparser.NullVal:
+						isConst = true
+					case *sqlparser.ColName:
+						isConst = false
+					default:
+						isConst = false
+					}
+					return false, nil
+				}
+			}
+		}
+		return true, nil
+	}, node)
+	return isConst
+}
+
 // explainSubqueries finds subqueries in SELECT expressions, WHERE, and HAVING clauses.
 func (e *Executor) explainSubqueries(sel *sqlparser.Select, idCounter *int64, result *[]explainSelectType) {
 	// Collect outer table names for correlated subquery detection
@@ -5883,11 +6210,18 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 				// When all inner tables are empty OR const PK lookup fails, MySQL uses
 				// "no matching row in const table" for the entire outer query.
 				// This applies to both IN and EXISTS/correlated subqueries when semijoin=on.
+				// Check if subquery is in EXISTS context (MySQL can semijoin-flatten correlated EXISTS)
+				inExistsContext := isSubqueryInExistsContext(node, sub)
+				// MySQL decorrelates simple correlated EXISTS subqueries:
+				// EXISTS (SELECT * FROM t2 LEFT JOIN t3 WHERE outer.col = inner.col)
+				// → treated as semijoin with decorrelated inner subquery
+				existsCanDecorrelate := inExistsContext && e.isSemijoinEnabled() && outerCanSemijoin && !innerHasNoSemijoin && e.isSemiJoinDecorrelatable(inner, outerTables)
+
 				if e.isSemijoinEnabled() && e.isImpossibleConstPKWhere(inner) {
 					selectType = "__IMPOSSIBLE__"
-				} else if correlated || innerHasNoSemijoin {
+				} else if (correlated || innerHasNoSemijoin) && !existsCanDecorrelate {
 					selectType = "DEPENDENT SUBQUERY"
-				} else if inContext {
+				} else if inContext || existsCanDecorrelate {
 					if e.isSemijoinEnabled() && outerCanSemijoin {
 						bigTables := false
 						if v, ok := e.getSysVar("big_tables"); ok && strings.EqualFold(v, "on") {
@@ -5896,7 +6230,20 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 						if e.isOptimizerSwitchEnabled("materialization") && !bigTables {
 							// Use MATERIALIZED only when the inner subquery would benefit from
 							// materialization (no usable index, or multiple tables, or empty table).
-							if e.shouldMaterializeSubquery(inner) {
+							// Exception 1: when the outer IN expression is a constant (e.g., "11 IN (subquery)"),
+							// MySQL uses FirstMatch instead — no need to materialize for a constant lookup.
+							// Exception 2: when the outer table is a "system" table (exactly 1 row)
+							// and firstmatch=on, MySQL always uses inline FirstMatch even if inner
+							// tables are empty. The const/system outer table makes FirstMatch optimal.
+							outerINIsConst := outerINExprIsConstant(node, sub)
+							outerIsSystem := e.outerTablesAreSystem(outerTables)
+							// Special case: STRAIGHT_JOIN with ALL inner tables having >= 2 rows forces
+							// MATERIALIZED even when the outer IN expression is a constant.
+							// MySQL's cost-based optimizer decides that materializing is cheaper
+							// than FirstMatch when all inner tables are large.
+							if !outerIsSystem && e.allInnerTablesTwoOrMoreRows(inner) {
+								selectType = "MATERIALIZED"
+							} else if !outerINIsConst && e.shouldMaterializeSubquery(inner, outerIsSystem) {
 								selectType = "MATERIALIZED"
 							}
 							// If not materialized, selectType stays "SUBQUERY" but will be
@@ -5910,8 +6257,19 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 						// IN subqueries become plain SUBQUERY (not MATERIALIZED, not DEPENDENT).
 						selectType = "SUBQUERY"
 					} else {
-						// semijoin=off: IN subqueries use EXISTS strategy → DEPENDENT SUBQUERY
-						selectType = "DEPENDENT SUBQUERY"
+						// semijoin=off: MySQL still uses materialization if materialization=on.
+						// Only when materialization=off (or big_tables=ON) does it fall back
+						// to the EXISTS strategy (DEPENDENT SUBQUERY).
+						bigTables := false
+						if v, ok := e.getSysVar("big_tables"); ok && strings.EqualFold(v, "on") {
+							bigTables = true
+						}
+						if e.isOptimizerSwitchEnabled("materialization") && !bigTables {
+							selectType = "SUBQUERY"
+						} else {
+							// semijoin=off AND (materialization=off OR big_tables=ON): EXISTS strategy
+							selectType = "DEPENDENT SUBQUERY"
+						}
 					}
 				}
 				if selectType == "__IMPOSSIBLE__" {
@@ -16145,7 +16503,67 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			// When left is a tuple: (a,b) IN ((1,2),(3,4)) or (a,b) IN (SELECT ...)
 			if leftTupleIN, leftIsTupleIN := v.Left.(sqlparser.ValTuple); leftIsTupleIN {
 				if sub, ok := v.Right.(*sqlparser.Subquery); ok {
-					return e.evalInSubquery(nil, v.Left, sub, v.Operator)
+					// Evaluate tuple elements WITH row context (needed when in IS TRUE/FALSE wrapper)
+					result, err := e.execSubquery(sub, row)
+					if err != nil {
+						return nil, err
+					}
+					if len(result.Columns) != len(leftTupleIN) {
+						return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTupleIN)))
+					}
+					leftValsRow := make([]interface{}, len(leftTupleIN))
+					for i, lExpr := range leftTupleIN {
+						lv, err := e.evalRowExpr(lExpr, row) // Use row context!
+						if err != nil {
+							return nil, err
+						}
+						leftValsRow[i] = lv
+					}
+					hasNullRow := false
+					for _, lv := range leftValsRow {
+						if lv == nil {
+							hasNullRow = true
+							break
+						}
+					}
+					for _, rrow := range result.Rows {
+						if len(rrow) != len(leftValsRow) {
+							continue
+						}
+						allMatch := true
+						rowHasNull := false
+						hasDefiniteNonMatch := false
+						for i := 0; i < len(leftValsRow); i++ {
+							if leftValsRow[i] == nil || rrow[i] == nil {
+								rowHasNull = true
+								allMatch = false
+								// Don't break - continue to check remaining non-null pairs
+								continue
+							}
+							match, _ := compareValues(leftValsRow[i], rrow[i], sqlparser.EqualOp)
+							if !match {
+								allMatch = false
+								hasDefiniteNonMatch = true
+								break
+							}
+						}
+						if allMatch {
+							if v.Operator == sqlparser.InOp {
+								return int64(1), nil
+							}
+							return int64(0), nil
+						}
+						if rowHasNull && !hasDefiniteNonMatch {
+							hasNullRow = true
+						}
+					}
+					if hasNullRow {
+						return nil, nil
+					}
+					if v.Operator == sqlparser.NotInOp {
+						return int64(1), nil
+					}
+					return int64(0), nil
 				}
 				// Row IN tuple-of-tuples: (a,b) IN ((1,2),(3,4)) or nested (a,(b,c)) IN ((1,(2,3)),...)
 				if rightTupleIN, ok := v.Right.(sqlparser.ValTuple); ok {
@@ -16289,7 +16707,14 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			}
 			// Handle IN (SELECT ...) — subquery on right side
 			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
-				return e.evalInSubquery(left, v.Left, sub, v.Operator)
+				// Set correlatedRow so correlated subqueries can reference the outer row.
+				oldCorrelatedIN := e.correlatedRow
+				if row != nil {
+					e.correlatedRow = row
+				}
+				result, err := e.evalInSubquery(left, v.Left, sub, v.Operator)
+				e.correlatedRow = oldCorrelatedIN
+				return result, err
 			}
 		}
 		// Handle (SELECT c1,c2,...) op ROW(v1,v2,...) and ROW(...) op (SELECT ...)
@@ -17109,22 +17534,25 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 						}
 						allMatch := true
 						rowHasNull := false
+						hasDefiniteNonMatch := false
 						for i := 0; i < len(leftVals); i++ {
 							if leftVals[i] == nil || rrow[i] == nil {
 								rowHasNull = true
 								allMatch = false
-								break
+								// Don't break - continue to check remaining non-null pairs
+								continue
 							}
 							match, _ := compareValues(leftVals[i], rrow[i], sqlparser.EqualOp)
 							if !match {
 								allMatch = false
+								hasDefiniteNonMatch = true
 								break
 							}
 						}
 						if allMatch {
 							return v.Operator == sqlparser.InOp, nil
 						}
-						if rowHasNull {
+						if rowHasNull && !hasDefiniteNonMatch {
 							hasNull = true
 						}
 					}
@@ -19416,11 +19844,6 @@ func hasInvalidDateString(s string, sqlMode string) (string, bool) {
 		return "", false
 	}
 
-	// Check month range (strict mode)
-	if m < 1 || m > 12 {
-		return s, true
-	}
-
 	// Check for partial zero dates (zero month or day) in strict modes
 	isNoZeroInDate := strings.Contains(sqlMode, "NO_ZERO_IN_DATE") || strings.Contains(sqlMode, "TRADITIONAL")
 	if m == 0 || d == 0 {
@@ -19428,6 +19851,11 @@ func hasInvalidDateString(s string, sqlMode string) (string, bool) {
 			return s, true
 		}
 		return "", false
+	}
+
+	// Check month range (strict mode) - only for non-zero months
+	if m < 1 || m > 12 {
+		return s, true
 	}
 
 	// Standard mode: check exact day range per month

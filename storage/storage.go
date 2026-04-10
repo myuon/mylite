@@ -45,7 +45,7 @@ func displayValue(v interface{}) string {
 		for i := 0; i < len(s); i++ {
 			b := s[i]
 			if b < 0x20 || b > 0x7e {
-				fmt.Fprintf(&out, "\\x%02x", b)
+				fmt.Fprintf(&out, "\\x%02X", b)
 			} else {
 				out.WriteByte(b)
 			}

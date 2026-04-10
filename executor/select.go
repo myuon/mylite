@@ -3003,6 +3003,10 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 				// MySQL displays function args without space after comma: JSON_OBJECTAGG(k,b)
 				if rawExprIdx < len(rawExprs) {
 					raw := strings.TrimSpace(rawExprs[rawExprIdx])
+					// MySQL strips block comments from column names
+					if strings.Contains(raw, "/*") {
+						raw = stripBlockComments(raw)
+					}
 					// MySQL displays function args without space after comma
 					raw = normalizeFuncArgSpaces(raw)
 					// MySQL displays NULL uppercase and SQL keywords uppercase in column headers
@@ -3042,6 +3046,11 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 				colNames = append(colNames, colName)
 			} else if rawExprIdx < len(rawExprs) {
 				raw := strings.TrimSpace(rawExprs[rawExprIdx])
+				// MySQL strips block comments (/* ... */) from column names.
+				// e.g. SELECT 1 /* comment */ has column name "1" not "1 /* comment */"
+				if strings.Contains(raw, "/*") {
+					raw = stripBlockComments(raw)
+				}
 				if strings.Contains(strings.ToLower(raw), "@@") {
 					if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' {
 						raw = raw[1 : len(raw)-1]
@@ -4667,6 +4676,10 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 			} else {
 				if rawExprIdx < len(rawExprs) {
 					raw := strings.TrimSpace(rawExprs[rawExprIdx])
+					// MySQL strips block comments from column names
+					if strings.Contains(raw, "/*") {
+						raw = stripBlockComments(raw)
+					}
 					lowerRaw := strings.ToLower(raw)
 					if strings.Contains(lowerRaw, "json_schema_validation_report(") {
 						if idx := strings.Index(raw, `"longitude": -90,`); idx >= 0 {
@@ -5463,6 +5476,10 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 				name = raw
 			} else if rawExprIdx < len(rawExprs) {
 				raw := strings.TrimSpace(rawExprs[rawExprIdx])
+				// MySQL strips block comments from column names
+				if strings.Contains(raw, "/*") {
+					raw = stripBlockComments(raw)
+				}
 				// MySQL displays string literal column headers without quotes
 				if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' {
 					raw = raw[1 : len(raw)-1]

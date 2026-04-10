@@ -249,7 +249,7 @@ func TestExplainSelectType_Materialized(t *testing.T) {
 	e := newTestExecutor(t)
 	// Non-correlated IN subquery: with semijoin=on (default), MySQL uses semi-join
 	// flattening, showing all rows as SIMPLE. MATERIALIZED strategy is shown when
-	// semijoin=off or big_tables=ON (forces disk-based execution).
+	// semijoin=off (MySQL still uses materialization even without semijoin).
 	// Test the semijoin=off case explicitly.
 	if _, err := e.Execute("SET optimizer_switch='semijoin=off'"); err != nil {
 		t.Fatalf("set optimizer_switch: %v", err)
@@ -262,16 +262,17 @@ func TestExplainSelectType_Materialized(t *testing.T) {
 	if types[0] != "PRIMARY" {
 		t.Errorf("expected first row select_type=PRIMARY (semijoin=off), got %v", types[0])
 	}
-	// When semijoin=off, MySQL uses DEPENDENT SUBQUERY (EXISTS strategy) for IN-subqueries
+	// When semijoin=off but materialization=on (default), MySQL uses SUBQUERY (materialization).
+	// MySQL only uses DEPENDENT SUBQUERY (EXISTS strategy) when both semijoin=off AND materialization=off.
 	found := false
 	for _, st := range types[1:] {
-		if st == "DEPENDENT SUBQUERY" {
+		if st == "SUBQUERY" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("expected a DEPENDENT SUBQUERY row (semijoin=off), got types: %v", types)
+		t.Errorf("expected a SUBQUERY row (semijoin=off, materialization=on), got types: %v", types)
 	}
 }
 

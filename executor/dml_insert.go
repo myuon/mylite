@@ -1084,7 +1084,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 								match = false
 								break
 							}
-							vals = append(vals, fmt.Sprintf("%v", nv))
+							vals = append(vals, formatValForDupKey(nv))
 						}
 						if match {
 							uniqueViolationErr = mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key '%s'", strings.Join(vals, "-"), idx.Name))
@@ -2127,6 +2127,36 @@ func (e *Executor) evaluateCheckConstraint(exprStr string, row storage.Row) (boo
 		return true, nil // NULL result means constraint is satisfied (MySQL behavior)
 	}
 	return isTruthy(val), nil
+}
+
+// formatValForDupKey formats a value for use in a Duplicate Entry error message.
+// Binary values have non-printable/non-ASCII bytes escaped as \xNN (uppercase hex).
+func formatValForDupKey(v interface{}) string {
+	if v == nil {
+		return "NULL"
+	}
+	s := fmt.Sprintf("%v", v)
+	hasNonPrintable := false
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b < 0x20 || b >= 0x7F {
+			hasNonPrintable = true
+			break
+		}
+	}
+	if !hasNonPrintable {
+		return s
+	}
+	var result strings.Builder
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b < 0x20 || b >= 0x7F {
+			fmt.Fprintf(&result, "\\x%02X", b)
+		} else {
+			result.WriteByte(b)
+		}
+	}
+	return result.String()
 }
 
 // formatBytesForWarning formats the invalid bytes in a string as MySQL does in Warning 1366:
