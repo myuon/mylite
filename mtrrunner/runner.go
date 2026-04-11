@@ -5111,6 +5111,13 @@ func normalizeExpected(s string) string {
 	for _, line := range lines {
 		trimmed := strings.TrimRight(line, " \t\r")
 
+		// Skip standalone # comment lines from .result files
+		// These are mysqltest harness comments echoed to output.
+		// Distinguish from EXPLAIN output where # appears as a tab-separated placeholder.
+		if strings.HasPrefix(trimmed, "#") && !strings.Contains(trimmed, "\t") {
+			continue
+		}
+
 		// Detect start of Warnings block
 		if trimmed == "Warnings:" {
 			inWarnings = true
