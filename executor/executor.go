@@ -8558,6 +8558,10 @@ func (e *Executor) explainJSONTableBlock(row []interface{}, query string) []orde
 
 // explainEstimateRowSize estimates the average row size in bytes for a table.
 // This attempts to match MySQL's rec_buff_length calculation used for data_read_per_join.
+// Formula (InnoDB COMPACT format):
+//
+//	size = sum(field_pack_length) + null_bytes + variable_length_headers + 2_overhead
+//	rounded up to nearest 4 bytes.
 func (e *Executor) explainEstimateRowSize(td *catalog.TableDef) int {
 	size := 0
 	charset := td.Charset
@@ -8565,6 +8569,7 @@ func (e *Executor) explainEstimateRowSize(td *catalog.TableDef) int {
 		charset = "utf8mb4"
 	}
 	nullableCount := 0
+	varLenCount := 0 // count of variable-length fields (InnoDB needs 1 byte per field in header)
 	for _, col := range td.Columns {
 		colCharset := col.Charset
 		if colCharset == "" {
@@ -8587,45 +8592,127 @@ func (e *Executor) explainEstimateRowSize(td *catalog.TableDef) int {
 		case strings.HasPrefix(upper, "DOUBLE") || strings.HasPrefix(upper, "REAL"):
 			size += 8
 		case strings.HasPrefix(upper, "DECIMAL") || strings.HasPrefix(upper, "NUMERIC"):
-			size += 8 // rough estimate
-		case strings.HasPrefix(upper, "DATE"):
-			size += 3
+			// MySQL DECIMAL pack_length: ceil(intDigits/9)*4 + ceil(fracDigits/9)*4
+			// but we use a rough estimate matching MySQL binary format
+			p, s := extractDecimalPrecisionScale(upper)
+			size += decimalPackLength(p, s)
 		case strings.HasPrefix(upper, "DATETIME") || strings.HasPrefix(upper, "TIMESTAMP"):
 			size += 5
+		case strings.HasPrefix(upper, "DATE"):
+			size += 3
 		case strings.HasPrefix(upper, "TIME"):
 			size += 3
 		case strings.HasPrefix(upper, "YEAR"):
 			size += 1
 		case strings.HasPrefix(upper, "CHAR"):
 			n := extractTypeLength(upper, 1)
-			size += n * charsetBytesPerChar(colCharset)
+			bpc := charsetBytesPerChar(colCharset)
+			size += n * bpc
+			// Multi-byte CHAR is variable-length in InnoDB (needs length header)
+			if bpc > 1 {
+				varLenCount++
+			}
 		case strings.HasPrefix(upper, "VARCHAR"):
 			n := extractTypeLength(upper, 255)
-			size += n*charsetBytesPerChar(colCharset) + 2
+			maxBytes := n * charsetBytesPerChar(colCharset)
+			// 1-byte length prefix if max bytes ≤ 255, else 2 bytes
+			if maxBytes <= 255 {
+				size += maxBytes + 1
+			} else {
+				size += maxBytes + 2
+			}
+			varLenCount++
 		case strings.HasPrefix(upper, "BINARY"):
 			n := extractTypeLength(upper, 1)
 			size += n
 		case strings.HasPrefix(upper, "VARBINARY"):
 			n := extractTypeLength(upper, 255)
-			size += n + 2
+			// 1-byte length prefix if max ≤ 255, else 2 bytes
+			if n <= 255 {
+				size += n + 1
+			} else {
+				size += n + 2
+			}
+			varLenCount++
 		case strings.HasPrefix(upper, "ENUM"):
 			size += 2
 		case strings.HasPrefix(upper, "SET"):
 			size += 8
-		case strings.HasPrefix(upper, "TEXT"), strings.HasPrefix(upper, "BLOB"):
-			size += 256 // rough estimate
+		case strings.HasPrefix(upper, "TINYBLOB"), strings.HasPrefix(upper, "TINYTEXT"):
+			size += 9 // 1 byte length + 8 byte pointer
+			varLenCount++
+		case strings.HasPrefix(upper, "MEDIUMBLOB"), strings.HasPrefix(upper, "MEDIUMTEXT"):
+			size += 11 // 3 byte length + 8 byte pointer
+			varLenCount++
+		case strings.HasPrefix(upper, "LONGBLOB"), strings.HasPrefix(upper, "LONGTEXT"):
+			size += 12 // 4 byte length + 8 byte pointer
+			varLenCount++
+		case strings.HasPrefix(upper, "BLOB"), strings.HasPrefix(upper, "TEXT"):
+			size += 10 // 2 byte length + 8 byte pointer
+			varLenCount++
+		case strings.HasPrefix(upper, "JSON"):
+			size += 9 // stored as longblob, but small inline: 1-byte length + 8 pointer
+			varLenCount++
 		default:
-			size += 8
+			// POINT, GEOMETRY, etc. — stored off-page like BLOB
+			size += 9
+			varLenCount++
 		}
 		if col.Nullable {
 			nullableCount++
 		}
 	}
-	// MySQL adds per-row overhead: 1 byte per nullable column for null flags,
-	// plus 3 bytes for row header (delete mark, rec_buff padding, alignment).
-	size += nullableCount
-	size += 3 // MySQL row overhead
+	// InnoDB COMPACT format overhead:
+	//   null_bytes: ceil(nullable_count/8) bytes for null flag bitmap
+	//   varlen_headers: 1 byte per variable-length field for offset table
+	//   row_header: 2 bytes (delete mark + record type)
+	nullBytes := (nullableCount + 7) / 8
+	size += nullBytes
+	size += varLenCount // 1 byte per variable-length field in InnoDB header
+	size += 2          // row header overhead
+	// Round up to nearest 8 bytes (MySQL alignment for rec_buff)
+	size = (size + 7) &^ 7
 	return size
+}
+
+// extractDecimalPrecisionScale extracts precision and scale from DECIMAL(p,s) type string.
+func extractDecimalPrecisionScale(upper string) (int, int) {
+	// e.g. "DECIMAL(5,4)" → (5,4)
+	start := strings.Index(upper, "(")
+	end := strings.Index(upper, ")")
+	if start < 0 || end < 0 {
+		return 10, 0 // default: DECIMAL(10,0)
+	}
+	inner := upper[start+1 : end]
+	parts := strings.SplitN(inner, ",", 2)
+	p := 10
+	s := 0
+	if len(parts) >= 1 {
+		if n, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil {
+			p = n
+		}
+	}
+	if len(parts) >= 2 {
+		if n, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil {
+			s = n
+		}
+	}
+	return p, s
+}
+
+// decimalPackLength returns MySQL binary DECIMAL pack_length for given precision and scale.
+func decimalPackLength(precision, scale int) int {
+	// MySQL stores DECIMAL in binary format:
+	// integer digits = precision - scale
+	// Each group of 9 digits = 4 bytes; remainder digits: 1-2=1, 3-4=2, 5-6=3, 7-8=4, 9=4
+	digitsPerGroup := 9
+	bytesPerGroup := 4
+	intDigits := precision - scale
+	fracDigits := scale
+	bytesPerDigit := []int{0, 1, 1, 2, 2, 3, 3, 3, 4, 4}
+	intBytes := (intDigits/digitsPerGroup)*bytesPerGroup + bytesPerDigit[intDigits%digitsPerGroup]
+	fracBytes := (fracDigits/digitsPerGroup)*bytesPerGroup + bytesPerDigit[fracDigits%digitsPerGroup]
+	return intBytes + fracBytes
 }
 
 // explainJSONUsedColumns returns the list of column names used in the query for a given table.
@@ -8670,6 +8757,21 @@ func (e *Executor) explainJSONUsedColumns(tableName string, query string) []stri
 			cols[i] = c.Name
 		}
 		return cols
+	}
+
+	// If query has window functions, also include primary key columns (MySQL needs them for row ordering)
+	hasWindowFuncsInQuery := false
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		name, oc, _ := explainJSONGetWindowFuncName(node)
+		if name != "" && oc != nil {
+			hasWindowFuncsInQuery = true
+		}
+		return !hasWindowFuncsInQuery, nil
+	}, stmt)
+	if hasWindowFuncsInQuery {
+		for _, pkCol := range td.PrimaryKey {
+			referencedCols[strings.ToLower(pkCol)] = true
+		}
 	}
 
 	// Return columns that exist in the table definition, preserving table definition order
@@ -9071,6 +9173,303 @@ func (e *Executor) explainFormatExpr(expr sqlparser.Expr, dbName, tableName stri
 	return sqlparser.String(expr)
 }
 
+// explainWindowInfo holds metadata about a window for EXPLAIN JSON output.
+type explainWindowInfo struct {
+	funcName           string   // first function name (used as fallback)
+	windowName         string   // "<unnamed window>" or name from WINDOW clause
+	hasFrame           bool     // whether to emit frame_buffer block
+	hasOptimizedFrame  bool     // whether frame_buffer includes optimized_frame_evaluation
+	hasNonExactAggreg  bool     // true if any function uses non-exact numeric type (disables optimized_frame)
+	orderBy            []string // ORDER BY keys for filesort (e.g. ["`j`", "`id` desc"])
+}
+
+// explainJSONGetWindowFuncName returns the lowercase function name for a window function node.
+func explainJSONGetWindowFuncName(node sqlparser.SQLNode) (string, *sqlparser.OverClause, bool) {
+	switch n := node.(type) {
+	case *sqlparser.Sum:
+		if n.OverClause != nil { return "sum", n.OverClause, false }
+	case *sqlparser.Avg:
+		if n.OverClause != nil { return "avg", n.OverClause, false }
+	case *sqlparser.Count:
+		if n.OverClause != nil { return "count", n.OverClause, false }
+	case *sqlparser.CountStar:
+		if n.OverClause != nil { return "count", n.OverClause, false }
+	case *sqlparser.Max:
+		if n.OverClause != nil { return "max", n.OverClause, false }
+	case *sqlparser.Min:
+		if n.OverClause != nil { return "min", n.OverClause, false }
+	case *sqlparser.BitAnd:
+		if n.OverClause != nil { return "bit_and", n.OverClause, false }
+	case *sqlparser.BitOr:
+		if n.OverClause != nil { return "bit_or", n.OverClause, false }
+	case *sqlparser.BitXor:
+		if n.OverClause != nil { return "bit_xor", n.OverClause, false }
+	case *sqlparser.Std:
+		if n.OverClause != nil { return "std", n.OverClause, false }
+	case *sqlparser.StdDev:
+		if n.OverClause != nil { return "stddev", n.OverClause, false }
+	case *sqlparser.StdPop:
+		if n.OverClause != nil { return "stddev_pop", n.OverClause, false }
+	case *sqlparser.StdSamp:
+		if n.OverClause != nil { return "stddev_samp", n.OverClause, false }
+	case *sqlparser.VarPop:
+		if n.OverClause != nil { return "var_pop", n.OverClause, false }
+	case *sqlparser.VarSamp:
+		if n.OverClause != nil { return "var_samp", n.OverClause, false }
+	case *sqlparser.Variance:
+		if n.OverClause != nil { return "variance", n.OverClause, false }
+	case *sqlparser.LagLeadExpr:
+		if n.OverClause != nil { return n.Type.ToString(), n.OverClause, true }
+	case *sqlparser.NTHValueExpr:
+		// NTH_VALUE: needs frame_buffer except for ROWS UNBOUNDED PRECEDING frame (handled in caller)
+		if n.OverClause != nil { return "nth_value", n.OverClause, false }
+	case *sqlparser.FirstOrLastValueExpr:
+		// FIRST/LAST_VALUE: same as NTH_VALUE - needs frame_buffer except for ROWS UNBOUNDED PRECEDING
+		if n.OverClause != nil { return n.Type.ToString(), n.OverClause, false }
+	case *sqlparser.NtileExpr:
+		// ntile is a two-pass function that always needs frame_buffer
+		if n.OverClause != nil { return "ntile", n.OverClause, true }
+	case *sqlparser.ArgumentLessWindowExpr:
+		// percent_rank, cume_dist, dense_rank, rank, row_number
+		// percent_rank and ntile are two-pass functions that always need frame_buffer
+		if n.OverClause != nil {
+			switch n.Type {
+			case sqlparser.PercentRankExprType, sqlparser.CumeDistExprType:
+				return n.Type.ToString(), n.OverClause, true
+			default:
+				return n.Type.ToString(), n.OverClause, false
+			}
+		}
+	}
+	return "", nil, false
+}
+
+// explainJSONExtractWindowFuncs parses the query and extracts window function info per window.
+// Returns (hasWindowFuncs, []explainWindowInfo grouped per window).
+func (e *Executor) explainJSONExtractWindowFuncs(query string) (bool, []explainWindowInfo) {
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		return false, nil
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return false, nil
+	}
+
+	// Collect named window definitions
+	namedWindows := map[string]*sqlparser.WindowSpecification{}
+	for _, nw := range sel.Windows {
+		for _, wd := range nw.Windows {
+			if wd.WindowSpec != nil {
+				namedWindows[strings.ToLower(wd.Name.String())] = wd.WindowSpec
+			}
+		}
+	}
+
+	// Get table name and definition for column type lookups
+	var mainTableDef *catalog.TableDef
+	if len(sel.From) == 1 {
+		if tbl, ok2 := sel.From[0].(*sqlparser.AliasedTableExpr); ok2 {
+			if tblName, ok3 := tbl.Expr.(sqlparser.TableName); ok3 {
+				mainTableDef = e.explainGetTableDef(tblName.Name.String())
+			}
+		}
+	}
+
+	// isNonExactNumericCol returns true if a column is FLOAT/DOUBLE/REAL type
+	isNonExactNumericCol := func(colName string) bool {
+		if mainTableDef == nil {
+			return false
+		}
+		for _, col := range mainTableDef.Columns {
+			if strings.ToLower(col.Name) == strings.ToLower(colName) {
+				upper := strings.ToUpper(col.Type)
+				return strings.HasPrefix(upper, "DOUBLE") || strings.HasPrefix(upper, "FLOAT") || strings.HasPrefix(upper, "REAL")
+			}
+		}
+		return false
+	}
+
+	// isNonExactExpr returns true if an expression references a non-exact numeric column
+	isNonExactExpr := func(expr sqlparser.Expr) bool {
+		if expr == nil {
+			return false
+		}
+		switch ex := expr.(type) {
+		case *sqlparser.ColName:
+			return isNonExactNumericCol(ex.Name.String())
+		}
+		return false
+	}
+
+	var infos []explainWindowInfo
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		funcName, overClause, alwaysFrame := explainJSONGetWindowFuncName(node)
+		if funcName == "" || overClause == nil {
+			return true, nil
+		}
+
+		// Determine window name and spec
+		winName := "<unnamed window>"
+		var winSpec *sqlparser.WindowSpecification
+		if !overClause.WindowName.IsEmpty() {
+			wn := strings.ToLower(overClause.WindowName.String())
+			winName = wn
+			winSpec = namedWindows[wn]
+		} else if overClause.WindowSpec != nil {
+			winSpec = overClause.WindowSpec
+		}
+
+		// Extract PARTITION BY and ORDER BY from window spec for filesort_key.
+		// MySQL includes PARTITION BY columns first, then ORDER BY columns.
+		var orderByKeys []string
+		if winSpec != nil {
+			// PARTITION BY columns (no direction)
+			for _, pc := range winSpec.PartitionClause {
+				colStr := sqlparser.String(pc)
+				colStr = strings.ToLower(strings.Trim(colStr, "`"))
+				orderByKeys = append(orderByKeys, "`"+colStr+"`")
+			}
+			// ORDER BY columns (with direction)
+			for _, ob := range winSpec.OrderClause {
+				colStr := sqlparser.String(ob.Expr)
+				colStr = strings.ToLower(strings.Trim(colStr, "`"))
+				if ob.Direction == sqlparser.DescOrder {
+					orderByKeys = append(orderByKeys, "`"+colStr+"` desc")
+				} else {
+					orderByKeys = append(orderByKeys, "`"+colStr+"`")
+				}
+			}
+		}
+
+		// isRowsUnboundedPreceding returns true if the frame is ROWS UNBOUNDED PRECEDING
+		// (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), which does NOT need frame_buffer
+		// for NTH_VALUE/FIRST_VALUE/LAST_VALUE functions.
+		isRowsUnboundedPreceding := func() bool {
+			if winSpec == nil || winSpec.FrameClause == nil {
+				return false
+			}
+			fc := winSpec.FrameClause
+			if fc.Unit != sqlparser.FrameRowsType {
+				return false
+			}
+			if fc.Start == nil || fc.Start.Type != sqlparser.UnboundedPrecedingType {
+				return false
+			}
+			// End must be nil (defaults to current row) or explicitly CurrentRowType
+			if fc.End != nil && fc.End.Type != sqlparser.CurrentRowType {
+				return false
+			}
+			return true
+		}
+
+		// isNthOrFirstLastValue returns true for NTH_VALUE, FIRST_VALUE, LAST_VALUE nodes
+		isNthOrFirstLastValue := func() bool {
+			switch node.(type) {
+			case *sqlparser.NTHValueExpr, *sqlparser.FirstOrLastValueExpr:
+				return true
+			}
+			return false
+		}
+
+		// Determine whether frame_buffer is needed
+		hasFrame := alwaysFrame
+		hasOptimized := false
+		if alwaysFrame {
+			// LAG/LEAD always need frame_buffer with optimized_frame_evaluation
+			hasOptimized = true
+		} else if isNthOrFirstLastValue() {
+			// NTH_VALUE/FIRST_VALUE/LAST_VALUE: need frame_buffer unless ROWS UNBOUNDED PRECEDING
+			if !isRowsUnboundedPreceding() {
+				hasFrame = true
+				hasOptimized = true
+			}
+		} else if winSpec != nil && winSpec.FrameClause != nil {
+			// Aggregate functions need frame_buffer when explicit frame is present
+			hasFrame = true
+			// optimized_frame_evaluation is true for ROWS frame type, but only
+			// for exact numeric types (not FLOAT/DOUBLE/REAL)
+			if winSpec.FrameClause.Unit == sqlparser.FrameRowsType {
+				hasOptimized = true
+			}
+		}
+
+		// Check if this aggregate uses a non-exact numeric type (disables optimized_frame)
+		isNonExactAgg := false
+		if !alwaysFrame && winSpec != nil && winSpec.FrameClause != nil {
+			switch n := node.(type) {
+			case *sqlparser.Sum:
+				isNonExactAgg = isNonExactExpr(n.Arg)
+			case *sqlparser.Avg:
+				isNonExactAgg = isNonExactExpr(n.Arg)
+			}
+		}
+
+		// Find or create entry for this window name
+		found := false
+		for i, info := range infos {
+			if info.windowName == winName {
+				infos[i].hasFrame = infos[i].hasFrame || hasFrame
+				infos[i].hasOptimizedFrame = infos[i].hasOptimizedFrame || hasOptimized
+				if isNonExactAgg {
+					infos[i].hasNonExactAggreg = true
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			infos = append(infos, explainWindowInfo{
+				funcName:          funcName,
+				windowName:        winName,
+				hasFrame:          hasFrame,
+				hasOptimizedFrame: hasOptimized,
+				hasNonExactAggreg: isNonExactAgg,
+				orderBy:           orderByKeys,
+			})
+		}
+		return true, nil
+	}, sel.SelectExprs)
+
+	if len(infos) == 0 {
+		return false, nil
+	}
+	return true, infos
+}
+
+// explainJSONWindowFuncNamesForWindow returns all window function names for a given window.
+func (e *Executor) explainJSONWindowFuncNamesForWindow(query string, winName string) []string {
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		return nil
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return nil
+	}
+
+	var funcNames []string
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		funcName, overClause, _ := explainJSONGetWindowFuncName(node)
+		if funcName == "" || overClause == nil {
+			return true, nil
+		}
+
+		// Get window name for this function
+		fnWinName := "<unnamed window>"
+		if !overClause.WindowName.IsEmpty() {
+			fnWinName = strings.ToLower(overClause.WindowName.String())
+		}
+
+		if fnWinName == winName {
+			// MySQL includes each function occurrence (no deduplication)
+			funcNames = append(funcNames, funcName)
+		}
+		return true, nil
+	}, sel.SelectExprs)
+	return funcNames
+}
+
 // explainJSONRowCount extracts the row count from an EXPLAIN row.
 func explainJSONRowCount(row []interface{}) int64 {
 	if row[9] != nil {
@@ -9181,6 +9580,9 @@ func (e *Executor) explainJSONDocument(query string) string {
 		parsed = append(parsed, parsedRow{id: r[0], selectType: st, row: r})
 	}
 
+	// Detect window functions early (needed for cost calculation)
+	hasWindowFuncsEarly, windowInfosEarly := e.explainJSONExtractWindowFuncs(query)
+
 	// Calculate total query cost from all primary/simple rows
 	// query_cost = sum(prefix_cost for each table) + sort_cost
 	totalCost := 0.0
@@ -9208,6 +9610,30 @@ func (e *Executor) explainJSONDocument(query string) string {
 	}
 	if hasFilesort {
 		totalCost += sortCost
+	}
+
+	// Window sort cost: if any window has ORDER BY or PARTITION BY, add sort cost
+	// based on row count. This is separate from external filesort.
+	windowSortCost := 0.0
+	if hasWindowFuncsEarly {
+		hasSortInWindowEarly := false
+		for _, info := range windowInfosEarly {
+			if len(info.orderBy) > 0 {
+				hasSortInWindowEarly = true
+				break
+			}
+		}
+		if hasSortInWindowEarly {
+			// Find row count from primary rows
+			for _, p := range parsed {
+				if p.selectType == "SIMPLE" || p.selectType == "PRIMARY" {
+					rc := explainJSONRowCount(p.row)
+					windowSortCost = float64(rc) * 1.0
+					break
+				}
+			}
+			totalCost += windowSortCost
+		}
 	}
 
 	// Separate rows by select type
@@ -9240,6 +9666,136 @@ func (e *Executor) explainJSONDocument(query string) string {
 		default:
 			primaryRows = append(primaryRows, parsed[i])
 		}
+	}
+
+	// Reuse window function info from early detection
+	hasWindowFuncs, windowInfos := hasWindowFuncsEarly, windowInfosEarly
+
+	// Detect if query has an external ORDER BY (outside window specs)
+	hasExternalOrderBy := false
+	if stmt, err := e.parser().Parse(query); err == nil {
+		if sel, ok := stmt.(*sqlparser.Select); ok {
+			if len(sel.OrderBy) > 0 && !hasWindowFuncs {
+				// ORDER BY without window funcs is handled by filesort
+			} else if len(sel.OrderBy) > 0 && hasWindowFuncs {
+				hasExternalOrderBy = true
+			}
+		}
+	}
+
+	// Read optimizer_switch to detect semijoin strategies
+	optimizerSwitch, _ := e.getSysVarSession("optimizer_switch")
+	if optimizerSwitch == "" {
+		optimizerSwitch, _ = e.getSysVar("optimizer_switch")
+	}
+	isDupsweedEnabled := strings.Contains(optimizerSwitch, "duplicateweedout=on")
+	isFirstmatchEnabled := strings.Contains(optimizerSwitch, "firstmatch=on")
+
+	// Helper: build a windowing block for a single table
+	buildWindowingBlock := func(tblBlock []orderedKV) []orderedKV {
+		// Build windows array
+		var windowsArr []interface{}
+		for _, info := range windowInfos {
+			winBlock := []orderedKV{{"name", info.windowName}}
+			// Get all function names for this window
+			allFuncs := e.explainJSONWindowFuncNamesForWindow(query, info.windowName)
+			if len(allFuncs) == 0 {
+				allFuncs = []string{info.funcName}
+			}
+			// Add filesort info if window has ORDER BY
+			if len(info.orderBy) > 0 {
+				winBlock = append(winBlock, orderedKV{"using_filesort", true})
+				orderArr := make([]interface{}, len(info.orderBy))
+				for i, k := range info.orderBy {
+					orderArr[i] = k
+				}
+				winBlock = append(winBlock, orderedKV{"filesort_key", orderArr})
+			}
+			// Add using_temporary_table at window level if external ORDER BY
+			if hasExternalOrderBy {
+				winBlock = append(winBlock, orderedKV{"using_temporary_table", true})
+			}
+			// Add frame_buffer if needed
+			if info.hasFrame {
+				frameBlock := []orderedKV{{"using_temporary_table", true}}
+				// optimized_frame_evaluation is present unless a non-exact numeric aggregate disables it
+				if info.hasOptimizedFrame && !info.hasNonExactAggreg {
+					frameBlock = append(frameBlock, orderedKV{"optimized_frame_evaluation", true})
+				}
+				winBlock = append(winBlock, orderedKV{"frame_buffer", frameBlock})
+			}
+			// Add functions array
+			funcsArr := make([]interface{}, len(allFuncs))
+			for i, fn := range allFuncs {
+				funcsArr[i] = fn
+			}
+			winBlock = append(winBlock, orderedKV{"functions", funcsArr})
+			windowsArr = append(windowsArr, winBlock)
+		}
+
+		windowing := []orderedKV{{"windows", windowsArr}}
+		// If any window has filesort, add cost_info for windowing
+		hasSortInWindow := false
+		for _, info := range windowInfos {
+			if len(info.orderBy) > 0 {
+				hasSortInWindow = true
+				break
+			}
+		}
+		if hasSortInWindow {
+			windowing = append(windowing, orderedKV{"cost_info", []orderedKV{
+				{"sort_cost", fmt.Sprintf("%.2f", windowSortCost)},
+			}})
+		}
+		windowing = append(windowing, orderedKV{"table", tblBlock})
+		return windowing
+	}
+
+	// Helper: build nested_loop from primary rows
+	buildNestedLoop := func(rows []parsedRow) []interface{} {
+		var nl []interface{}
+		for _, pr := range rows {
+			tblBlock := e.explainJSONTableBlock(pr.row, query)
+			nl = append(nl, []orderedKV{{"table", tblBlock}})
+		}
+		return nl
+	}
+
+	// Helper: build nested_loop with first_match annotation
+	// The first_match field is added to non-first tables when firstmatch strategy is used
+	buildFirstMatchNestedLoop := func(rows []parsedRow) []interface{} {
+		var nl []interface{}
+		if len(rows) == 0 {
+			return nl
+		}
+		// First table has no first_match annotation
+		firstTbl := e.explainJSONTableBlock(rows[0].row, query)
+		nl = append(nl, []orderedKV{{"table", firstTbl}})
+		// Subsequent tables get first_match pointing to the first table's name
+		if len(rows) > 1 {
+			firstTableName := ""
+			if rows[0].row[2] != nil {
+				firstTableName = fmt.Sprintf("%v", rows[0].row[2])
+			}
+			for _, pr := range rows[1:] {
+				tblBlock := e.explainJSONTableBlock(pr.row, query)
+				// Insert first_match after "filtered" field (before cost_info and used_columns)
+				insertPos := len(tblBlock) // default: append at end
+				for i, kv := range tblBlock {
+					if kv.Key == "filtered" {
+						insertPos = i + 1
+						break
+					}
+				}
+				// Insert first_match at insertPos
+				newBlock := make([]orderedKV, 0, len(tblBlock)+1)
+				newBlock = append(newBlock, tblBlock[:insertPos]...)
+				newBlock = append(newBlock, orderedKV{"first_match", firstTableName})
+				newBlock = append(newBlock, tblBlock[insertPos:]...)
+				nl = append(nl, []orderedKV{{"table", newBlock}})
+			}
+		}
+		return nl
 	}
 
 	// Build the query_block with ordered keys
@@ -9610,7 +10166,25 @@ func (e *Executor) explainJSONDocument(query string) string {
 
 		tblBlock := e.explainJSONTableBlock(p.row, query)
 
-		if hasGroupBy && hasSQLBufferResult {
+		if hasWindowFuncs {
+			// Windowing query: wrap table in windowing block
+			windowing := buildWindowingBlock(tblBlock)
+			if hasExternalOrderBy {
+				// Wrap in ordering_operation
+				orderingOp := []orderedKV{
+					{"using_filesort", true},
+				}
+				if sortCost > 0 {
+					orderingOp = append(orderingOp, orderedKV{"cost_info", []orderedKV{
+						{"sort_cost", fmt.Sprintf("%.2f", sortCost)},
+					}})
+				}
+				orderingOp = append(orderingOp, orderedKV{"windowing", windowing})
+				queryBlock = append(queryBlock, orderedKV{"ordering_operation", orderingOp})
+			} else {
+				queryBlock = append(queryBlock, orderedKV{"windowing", windowing})
+			}
+		} else if hasGroupBy && hasSQLBufferResult {
 			groupOp := []orderedKV{
 				{"using_filesort", true},
 				{"cost_info", []orderedKV{{"sort_cost", fmt.Sprintf("%.2f", sortCost)}}},
@@ -9634,6 +10208,29 @@ func (e *Executor) explainJSONDocument(query string) string {
 			}})
 		} else {
 			queryBlock = append(queryBlock, orderedKV{"table", tblBlock})
+		}
+	} else if len(primaryRows) > 1 && len(subqueryRows) == 0 && len(derivedRows) == 0 && len(unionRows) == 0 && unionResultRow == nil {
+		// Multi-table query: JOIN or semijoin
+		queryBlock = append(queryBlock, orderedKV{"cost_info", []orderedKV{
+			{"query_cost", fmt.Sprintf("%.2f", totalCost)},
+		}})
+		// Determine strategy from optimizer_switch
+		if isDupsweedEnabled && !isFirstmatchEnabled {
+			// DuplicateWeedout strategy: wrap nested_loop in duplicates_removal
+			nl := buildNestedLoop(primaryRows)
+			dupRemoval := []orderedKV{
+				{"using_temporary_table", true},
+				{"nested_loop", nl},
+			}
+			queryBlock = append(queryBlock, orderedKV{"duplicates_removal", dupRemoval})
+		} else if isFirstmatchEnabled {
+			// FirstMatch strategy: nested_loop with first_match annotation on later tables
+			nl := buildFirstMatchNestedLoop(primaryRows)
+			queryBlock = append(queryBlock, orderedKV{"nested_loop", nl})
+		} else {
+			// Plain nested loop (e.g., plain JOIN)
+			nl := buildNestedLoop(primaryRows)
+			queryBlock = append(queryBlock, orderedKV{"nested_loop", nl})
 		}
 	} else if unionResultRow != nil {
 		// UNION query

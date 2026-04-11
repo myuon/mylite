@@ -3928,7 +3928,8 @@ func (e *Executor) inferColumnAttrs(selectSQL, colName string) columnAttrs {
 
 // inferColumnTypeFromSelect infers the column type from a single SELECT statement.
 func (e *Executor) inferColumnTypeFromSelect(sel *sqlparser.Select, colName string) string {
-	// Get the source table from the FROM clause
+	// Get source table definitions for column type lookups
+	var srcTableDefs []*catalog.TableDef
 	for _, from := range sel.From {
 		ate, ok := from.(*sqlparser.AliasedTableExpr)
 		if !ok {
@@ -3950,12 +3951,80 @@ func (e *Executor) inferColumnTypeFromSelect(sel *sqlparser.Select, colName stri
 		if err != nil {
 			continue
 		}
-		for _, col := range tblDef.Columns {
-			if strings.EqualFold(col.Name, colName) {
-				return col.Type
+		srcTableDefs = append(srcTableDefs, tblDef)
+	}
+
+	// Helper: find column type in all source table defs
+	findColType := func(cn string) string {
+		for _, tblDef := range srcTableDefs {
+			for _, col := range tblDef.Columns {
+				if strings.EqualFold(col.Name, cn) {
+					return col.Type
+				}
+			}
+		}
+		return ""
+	}
+
+	// Check if the column is a direct reference or an aliased expression
+	for _, selExpr := range sel.SelectExprs.Exprs {
+		ae, ok := selExpr.(*sqlparser.AliasedExpr)
+		if !ok {
+			continue
+		}
+		// Get the alias or auto-generated name
+		exprColName := ""
+		if !ae.As.IsEmpty() {
+			exprColName = ae.As.String()
+		} else if colRef, ok2 := ae.Expr.(*sqlparser.ColName); ok2 {
+			exprColName = colRef.Name.String()
+		}
+		if !strings.EqualFold(exprColName, colName) {
+			continue
+		}
+
+		// Found the expression - determine its type
+		switch ex := ae.Expr.(type) {
+		case *sqlparser.ColName:
+			// Direct column reference
+			if t := findColType(ex.Name.String()); t != "" {
+				return t
+			}
+		case *sqlparser.LagLeadExpr:
+			// LEAD/LAG: result type is determined by type promotion of value arg and default arg
+			if ex.OverClause != nil {
+				// Get primary column type (first arg)
+				var primaryCol string
+				if colRef, ok2 := ex.Expr.(*sqlparser.ColName); ok2 {
+					primaryCol = colRef.Name.String()
+				}
+				var defaultCol string
+				if ex.Default != nil {
+					if colRef, ok2 := ex.Default.(*sqlparser.ColName); ok2 {
+						defaultCol = colRef.Name.String()
+					}
+				}
+				primaryType := findColType(primaryCol)
+				defaultType := ""
+				if defaultCol != "" {
+					defaultType = findColType(defaultCol)
+				}
+				if primaryType != "" {
+					return promoteStringColumnType(primaryType, defaultType)
+				}
+			}
+		case *sqlparser.NTHValueExpr:
+			// NTH_VALUE: result type is the value arg type
+			if ex.OverClause != nil {
+				if colRef, ok2 := ex.Expr.(*sqlparser.ColName); ok2 {
+					if t := findColType(colRef.Name.String()); t != "" {
+						return t
+					}
+				}
 			}
 		}
 	}
+
 	// No FROM clause (e.g. SELECT 'literal') — infer type from expressions
 	// Find the expression corresponding to this column name by alias or position
 	for _, expr := range sel.SelectExprs.Exprs {
@@ -3997,6 +4066,32 @@ func normalizeCharsetIntroducersForMatch(s string) string {
 	s = strings.ReplaceAll(s, "_utf8mb3 '", "_utf8'")
 	s = strings.ReplaceAll(s, "_utf8mb3'", "_utf8'")
 	return s
+}
+
+// promoteStringColumnType returns the promoted type when combining two column types.
+// This mirrors MySQL's type promotion rules for LEAD/LAG and IFNULL.
+func promoteStringColumnType(primaryType, defaultType string) string {
+	if defaultType == "" {
+		return primaryType
+	}
+	// If both are CHAR/VARCHAR, promote to VARCHAR with max length and utf8mb4
+	primaryUpper := strings.ToUpper(primaryType)
+	defaultUpper := strings.ToUpper(defaultType)
+	isCharOrVarchar := func(t string) bool {
+		return strings.HasPrefix(t, "CHAR") || strings.HasPrefix(t, "VARCHAR")
+	}
+	if isCharOrVarchar(primaryUpper) && isCharOrVarchar(defaultUpper) {
+		// Extract lengths
+		n1 := extractTypeLength(primaryUpper, 1)
+		n2 := extractTypeLength(defaultUpper, 1)
+		maxN := n1
+		if n2 > n1 {
+			maxN = n2
+		}
+		// Use VARCHAR with max length and utf8mb4 charset
+		return fmt.Sprintf("varchar(%d)", maxN)
+	}
+	return primaryType
 }
 
 // inferColumnTypeFromUnion infers the column type from a UNION by merging all branches.
