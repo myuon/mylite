@@ -1,14 +1,18 @@
 package executor
 
 import (
+	"bytes"
+	"compress/flate"
 	"compress/zlib"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"hash/adler32"
 	"io"
 	"math/rand"
 	"net"
@@ -807,73 +811,102 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		rand.Read(rbBytes)
 		return string(rbBytes), true, nil
 	case "compress":
-		cmpVal, cmpIsNull, cmpErr := e.evalArg1Quiet(v.Exprs, row)
-		if cmpErr != nil {
-			return nil, true, cmpErr
+		cmpVal, isNull, err := e.evalArg1Quiet(v.Exprs, row)
+		if err != nil {
+			return nil, true, err
 		}
-		if cmpIsNull {
+		if isNull {
 			return nil, true, nil
 		}
-		cmpSrc := []byte(toString(cmpVal))
-		if len(cmpSrc) == 0 {
+		cmpStr := toString(cmpVal)
+		if cmpStr == "" {
 			return "", true, nil
 		}
-		var cmpBuf strings.Builder
-		// 4-byte little-endian uncompressed length prefix
-		ulen := uint32(len(cmpSrc))
-		cmpBuf.WriteByte(byte(ulen))
-		cmpBuf.WriteByte(byte(ulen >> 8))
-		cmpBuf.WriteByte(byte(ulen >> 16))
-		cmpBuf.WriteByte(byte(ulen >> 24))
-		// zlib-compress the data
-		var zlibBuf strings.Builder
-		zw, _ := zlib.NewWriterLevel(&zlibBuf, zlib.DefaultCompression)
-		zw.Write(cmpSrc)
-		zw.Close()
-		cmpBuf.WriteString(zlibBuf.String())
-		return cmpBuf.String(), true, nil
+		// MySQL COMPRESS: 4-byte LE uncompressed length + zlib-compressed data.
+		// MySQL's C zlib produces a BFINAL=1 data block with no trailing null stored block.
+		// Go's compress/flate writes a BFINAL=0 data block + null stored block (00 00 ff ff).
+		// Fix: set BFINAL=1 on the data block and remove the 4-byte null stored block suffix.
+		var deflateBuf bytes.Buffer
+		flateW, _ := flate.NewWriter(&deflateBuf, 6)
+		flateW.Write([]byte(cmpStr))
+		flateW.Close()
+		deflateData := deflateBuf.Bytes()
+		// Remove trailing null stored block (00 00 ff ff) and set BFINAL=1 on first block.
+		if len(deflateData) >= 4 &&
+			deflateData[len(deflateData)-4] == 0x00 &&
+			deflateData[len(deflateData)-3] == 0x00 &&
+			deflateData[len(deflateData)-2] == 0xff &&
+			deflateData[len(deflateData)-1] == 0xff {
+			deflateData = deflateData[:len(deflateData)-4]
+			deflateData[0] |= 0x01 // Set BFINAL=1 on the first block
+		}
+		// Build zlib stream: 2-byte header (0x78 0x9c = level 6) + deflate + 4-byte adler32 (BE)
+		checksum := adler32.Checksum([]byte(cmpStr))
+		cmpResult := make([]byte, 0, 4+2+len(deflateData)+4)
+		prefix := make([]byte, 4)
+		binary.LittleEndian.PutUint32(prefix, uint32(len(cmpStr)))
+		cmpResult = append(cmpResult, prefix...)
+		cmpResult = append(cmpResult, 0x78, 0x9c) // zlib header for default compression (level 6)
+		cmpResult = append(cmpResult, deflateData...)
+		cmpResult = append(cmpResult, byte(checksum>>24), byte(checksum>>16), byte(checksum>>8), byte(checksum))
+		return string(cmpResult), true, nil
+
 	case "uncompress":
-		ucmpVal, ucmpIsNull, ucmpErr := e.evalArg1Quiet(v.Exprs, row)
-		if ucmpErr != nil {
-			return nil, true, ucmpErr
+		ucmpVal, isNull, err := e.evalArg1Quiet(v.Exprs, row)
+		if err != nil {
+			return nil, true, err
 		}
-		if ucmpIsNull {
+		if isNull {
 			return nil, true, nil
 		}
-		ucmpSrc := []byte(toString(ucmpVal))
-		if len(ucmpSrc) == 0 {
+		ucmpStr := toString(ucmpVal)
+		if ucmpStr == "" {
 			return "", true, nil
 		}
-		if len(ucmpSrc) < 5 {
-			// Not a valid compressed string
+		ucmpBytes := []byte(ucmpStr)
+		// Must have at least 5 bytes: 4-byte header + at least 1 byte of zlib data
+		if len(ucmpBytes) < 5 {
+			e.addWarning("Warning", 1259, "ZLIB: Input data corrupted")
 			return nil, true, nil
 		}
-		// Skip the 4-byte length prefix and decompress
-		ucmpData := ucmpSrc[4:]
-		ucmpReader, ucmpRErr := zlib.NewReader(strings.NewReader(string(ucmpData)))
-		if ucmpRErr != nil {
+		// Read 4-byte LE uncompressed length
+		uncompLen := binary.LittleEndian.Uint32(ucmpBytes[:4])
+		const maxUncompressedSize = 67108864 // 64 MB
+		if uncompLen > maxUncompressedSize {
+			e.addWarning("Warning", 1256, fmt.Sprintf("Uncompressed data size too large; the maximum size is %d (probably, length of uncompressed data was corrupted)", maxUncompressedSize))
 			return nil, true, nil
 		}
-		defer ucmpReader.Close()
-		var ucmpOut strings.Builder
-		if _, ucmpReadErr := io.Copy(&ucmpOut, ucmpReader); ucmpReadErr != nil {
+		// Decompress the zlib data (after the 4-byte header)
+		zlibR, zlibErr := zlib.NewReader(bytes.NewReader(ucmpBytes[4:]))
+		if zlibErr != nil {
+			e.addWarning("Warning", 1259, "ZLIB: Input data corrupted")
 			return nil, true, nil
 		}
-		return ucmpOut.String(), true, nil
+		decompressed, readErr := io.ReadAll(zlibR)
+		zlibR.Close()
+		if readErr != nil {
+			e.addWarning("Warning", 1259, "ZLIB: Input data corrupted")
+			return nil, true, nil
+		}
+		return string(decompressed), true, nil
+
 	case "uncompressed_length":
-		ulVal, ulIsNull, ulErr := e.evalArg1Quiet(v.Exprs, row)
-		if ulErr != nil {
-			return nil, true, ulErr
+		ulVal, isNull, err := e.evalArg1Quiet(v.Exprs, row)
+		if err != nil {
+			return nil, true, err
 		}
-		if ulIsNull {
+		if isNull {
 			return nil, true, nil
 		}
-		ulSrc := []byte(toString(ulVal))
-		if len(ulSrc) < 4 {
+		ulStr := toString(ulVal)
+		ulBytes := []byte(ulStr)
+		// MySQL requires at least 5 bytes (4-byte header + at least 1 byte of compressed data).
+		// Strings with exactly 4 bytes have no compressed payload and return 0.
+		if len(ulBytes) < 5 {
 			return int64(0), true, nil
 		}
-		// Read 4-byte little-endian uncompressed length
-		ulLen := uint32(ulSrc[0]) | uint32(ulSrc[1])<<8 | uint32(ulSrc[2])<<16 | uint32(ulSrc[3])<<24
+		// Read 4-byte LE uncompressed length (raw, no further validation)
+		ulLen := binary.LittleEndian.Uint32(ulBytes[:4])
 		return int64(ulLen), true, nil
 	case "row_count":
 		return int64(-1), true, nil

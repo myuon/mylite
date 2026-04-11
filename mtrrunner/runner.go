@@ -2795,15 +2795,21 @@ func (ctx *execContext) executeQueryOrExec(stmt string) error {
 	// Clear replace_columns after use
 	ctx.replaceColumns = nil
 
-	// Apply --replace_result to output
+	// Apply --replace_result to output (including column headers)
 	if len(ctx.replaceResult) > 0 {
+		for i, col := range columns {
+			columns[i] = applyReplaceResult(col, ctx.replaceResult)
+		}
 		for i, line := range resultLines {
 			resultLines[i] = applyReplaceResult(line, ctx.replaceResult)
 		}
 		ctx.replaceResult = nil
 	}
-	// Apply --replace_regex to output
+	// Apply --replace_regex to output (including column headers)
 	if len(ctx.replaceRegex) > 0 {
+		for i, col := range columns {
+			columns[i] = applyReplaceRegex(col, ctx.replaceRegex)
+		}
 		for i, line := range resultLines {
 			resultLines[i] = applyReplaceRegex(line, ctx.replaceRegex)
 		}

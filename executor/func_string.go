@@ -499,7 +499,13 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 			return strings.Repeat(str, count), true, nil
 		}
 		str := toString(sVal)
-		if int64(count)*int64(len(str)) > 67108864 {
+		maxAllowed := int64(67108864) // default 64 MB
+		if mapStr, ok := e.getSysVar("max_allowed_packet"); ok && mapStr != "" {
+			if parsed, err := strconv.ParseInt(mapStr, 10, 64); err == nil && parsed > maxAllowed {
+				maxAllowed = parsed
+			}
+		}
+		if int64(count)*int64(len(str)) > maxAllowed {
 			return nil, true, nil
 		}
 		return strings.Repeat(str, count), true, nil
