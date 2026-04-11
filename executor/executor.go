@@ -64,22 +64,54 @@ func vitessWeightString(s string, coll colldata.Collation) []byte {
 // For valid UTF-8, it returns the rune count.
 // For non-UTF-8 (e.g., cp932, sjis), it heuristically counts multi-byte characters.
 func mysqlCharLen(s string) int {
+	return mysqlCharLenCharset(s, "")
+}
+
+// mysqlCharLenCharset returns the MySQL character count of a string for a given charset.
+func mysqlCharLenCharset(s string, charset string) int {
 	if utf8.ValidString(s) {
 		return utf8.RuneCountInString(s)
 	}
-	// Heuristic for non-UTF-8 multi-byte charsets (cp932, sjis, etc.):
-	// Count bytes that look like double-byte lead bytes as starting a 2-byte character.
 	count := 0
 	i := 0
-	for i < len(s) {
-		b := s[i]
-		// cp932/sjis lead byte ranges
-		if (b >= 0x81 && b <= 0x9F) || (b >= 0xE0 && b <= 0xFC) {
-			i += 2
-		} else {
-			i++
+	switch strings.ToLower(charset) {
+	case "big5":
+		for i < len(s) {
+			if s[i] >= 0xA1 && s[i] <= 0xFE {
+				i += 2
+			} else {
+				i++
+			}
+			count++
 		}
-		count++
+	case "gb2312":
+		for i < len(s) {
+			if s[i] >= 0xA1 && s[i] <= 0xF7 {
+				i += 2
+			} else {
+				i++
+			}
+			count++
+		}
+	case "gbk", "gb18030":
+		for i < len(s) {
+			if s[i] >= 0x81 && s[i] <= 0xFE {
+				i += 2
+			} else {
+				i++
+			}
+			count++
+		}
+	default:
+		for i < len(s) {
+			b := s[i]
+			if (b >= 0x81 && b <= 0x9F) || (b >= 0xE0 && b <= 0xFC) {
+				i += 2
+			} else {
+				i++
+			}
+			count++
+		}
 	}
 	return count
 }

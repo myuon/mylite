@@ -135,7 +135,12 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 		if isNull {
 			return nil, true, nil
 		}
-		return int64(mysqlCharLen(toString(val))), true, nil
+		s := toString(val)
+		cs := ""
+		if colName, ok := v.Exprs[0].(*sqlparser.ColName); ok {
+			cs = e.getColumnCharset(colName)
+		}
+		return int64(mysqlCharLenCharset(s, cs)), true, nil
 	case "ascii", "ord":
 		val, isNull, err := e.evalArg1(v.Exprs, "ASCII", row)
 		if err != nil {
