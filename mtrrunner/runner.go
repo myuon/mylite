@@ -454,8 +454,11 @@ func (ctx *execContext) executeLines(lines []string) error {
 			continue
 		}
 
-		// Comments starting with # are NOT echoed to output (mysqltest behavior)
+		// Comments starting with # are echoed to output (mysqltest behavior)
 		if strings.HasPrefix(trimmed, "#") {
+			if ctx.resultLogEnabled {
+				ctx.output.WriteString(trimmed + "\n")
+			}
 			i++
 			continue
 		}
