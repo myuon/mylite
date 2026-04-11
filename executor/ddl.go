@@ -3966,6 +3966,16 @@ func (e *Executor) inferColumnTypeFromSelect(sel *sqlparser.Select, colName stri
 		return ""
 	}
 
+	// If SELECT *, all source table columns are implicitly included.
+	// In that case, look up colName directly in the source tables.
+	for _, selExpr := range sel.SelectExprs.Exprs {
+		if _, ok := selExpr.(*sqlparser.StarExpr); ok {
+			if t := findColType(colName); t != "" {
+				return t
+			}
+		}
+	}
+
 	// Check if the column is a direct reference or an aliased expression
 	for _, selExpr := range sel.SelectExprs.Exprs {
 		ae, ok := selExpr.(*sqlparser.AliasedExpr)
