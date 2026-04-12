@@ -107,9 +107,27 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 				return tv, true, nil
 			}
 		}
-		// For decimal strings (from DECIMAL literals), use exact decimal rounding to avoid float64 precision loss.
+		// For decimal strings (from DECIMAL columns), use exact decimal rounding to avoid float64 precision loss.
+		// Preserve the original scale (trailing zeros) to match MySQL's DECIMAL output format.
 		if s, ok := val.(string); ok {
 			if out, ok2 := roundDecimalStringHalfUp(s, int(decimals)); ok2 {
+				// Preserve original scale: if input had more decimal places, pad with zeros
+				origScale := 0
+				if dotIdx := strings.IndexByte(s, '.'); dotIdx >= 0 {
+					origScale = len(s) - dotIdx - 1
+				}
+				if int(decimals) < origScale {
+					// Pad result to original scale
+					outDotIdx := strings.IndexByte(out, '.')
+					if outDotIdx < 0 {
+						out += "." + strings.Repeat("0", origScale)
+					} else {
+						curScale := len(out) - outDotIdx - 1
+						if curScale < origScale {
+							out += strings.Repeat("0", origScale-curScale)
+						}
+					}
+				}
 				return out, true, nil
 			}
 		}
