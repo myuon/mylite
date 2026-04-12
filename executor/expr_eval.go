@@ -1580,12 +1580,11 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 				return nil, nil
 			}
 			s := toString(val)
-			// Use parseMySQLDateValue which handles YYYYMMDD, YYMMDD, compact integers, etc.
-			parsed := parseMySQLDateValue(s)
-			if parsed == "" {
-				return nil, nil
+			// CAST AS DATE strips time component and returns YYYY-MM-DD
+			if len(s) >= 10 {
+				s = s[:10]
 			}
-			return parsed, nil
+			return s, nil
 		case "TIME":
 			if val == nil {
 				return nil, nil
