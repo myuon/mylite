@@ -446,7 +446,12 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if isNull {
 			return nil, true, nil
 		}
-		inN := uint32(toInt64(inVal))
+		inRaw := toInt64(inVal)
+		// Values > 0xFFFFFFFF (or negative) return NULL
+		if inRaw < 0 || inRaw > 0xFFFFFFFF {
+			return nil, true, nil
+		}
+		inN := uint32(inRaw)
 		return fmt.Sprintf("%d.%d.%d.%d", (inN>>24)&0xFF, (inN>>16)&0xFF, (inN>>8)&0xFF, inN&0xFF), true, nil
 	case "inet_aton":
 		iaVal, isNull, err := e.evalArg1(v.Exprs, "INET_ATON", row)
@@ -457,16 +462,40 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 			return nil, true, nil
 		}
 		iaParts := strings.Split(toString(iaVal), ".")
-		if len(iaParts) != 4 {
+		if len(iaParts) < 1 || len(iaParts) > 4 {
 			return nil, true, nil
 		}
-		var iaResult uint32
-		for _, iaP := range iaParts {
-			iaN, err := strconv.Atoi(iaP)
-			if err != nil || iaN < 0 || iaN > 255 {
+		// MySQL short notation rules:
+		// 1 part:  a       -> last part fills 4 octets (0-4294967295)
+		// 2 parts: a.b     -> a fills 1 octet; b fills 3 octets (0-16777215)
+		// 3 parts: a.b.c   -> a,b fill 1 octet each; c fills 2 octets (0-65535)
+		// 4 parts: a.b.c.d -> each fills 1 octet (0-255)
+		var iaResult uint64
+		n := len(iaParts)
+		// Number of octets the last part fills: 5-n (e.g. n=1 -> 4, n=2 -> 3, n=3 -> 2, n=4 -> 1)
+		lastOctets := uint(5 - n)
+		for i, iaP := range iaParts {
+			iaN, err := strconv.ParseUint(iaP, 10, 64)
+			if err != nil {
 				return nil, true, nil
 			}
-			iaResult = iaResult*256 + uint32(iaN)
+			if i < n-1 {
+				// Non-last parts must be 0-255
+				if iaN > 255 {
+					return nil, true, nil
+				}
+				iaResult = (iaResult << 8) | iaN
+			} else {
+				// Last part fills lastOctets octets
+				maxVal := uint64(1)<<(lastOctets*8) - 1
+				if iaN > maxVal {
+					return nil, true, nil
+				}
+				iaResult = (iaResult << (lastOctets * 8)) | iaN
+			}
+		}
+		if iaResult > 0xFFFFFFFF {
+			return nil, true, nil
 		}
 		return int64(iaResult), true, nil
 	case "coercibility":
