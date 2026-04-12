@@ -597,7 +597,6 @@ func (w *worker) rebuild() {
 func (w *worker) runTestInner(testPath string, includePaths []string) mtrrunner.TestResult {
 	// Reset executor state for full isolation between tests
 	w.resetState()
-	resetSessionState(w.db)
 	// Use a dedicated DB connection for this test so timeout can close it
 	testDB, err := connectDB(w.addr)
 	if err != nil {
@@ -609,6 +608,8 @@ func (w *worker) runTestInner(testPath string, includePaths []string) mtrrunner.
 	defer testDB.Close()
 	testDB.SetMaxIdleConns(4)
 	testDB.SetMaxOpenConns(16)
+	// Reset session state on the actual test connection to prevent state leaking between tests
+	resetSessionState(testDB)
 	runner := &mtrrunner.Runner{
 		DB:           testDB,
 		IncludePaths: includePaths,
@@ -844,4 +845,11 @@ func resetSessionState(db *sql.DB) {
 	db.Exec("SET SQL_MODE='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'")          //nolint:errcheck
 	db.Exec("SET @@GLOBAL.SQL_MODE='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'") //nolint:errcheck
 	db.Exec("SET TIMESTAMP=DEFAULT")                                                                                                                         //nolint:errcheck
+	db.Exec("SET SESSION autocommit = 1")                                                                                                                    //nolint:errcheck
+	db.Exec("SET SESSION foreign_key_checks = 1")                                                                                                            //nolint:errcheck
+	db.Exec("SET SESSION unique_checks = 1")                                                                                                                 //nolint:errcheck
+	db.Exec("SET SESSION character_set_client = 'utf8mb4'")                                                                                                  //nolint:errcheck
+	db.Exec("SET SESSION character_set_results = 'utf8mb4'")                                                                                                 //nolint:errcheck
+	db.Exec("SET SESSION character_set_connection = 'utf8mb4'")                                                                                              //nolint:errcheck
+	db.Exec("SET SESSION collation_connection = 'utf8mb4_general_ci'")                                                                                       //nolint:errcheck
 }
