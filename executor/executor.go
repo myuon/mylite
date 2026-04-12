@@ -1462,6 +1462,11 @@ func (e *Executor) initSystemTables() {
 				{Name: "ssl_cipher", Type: "BLOB", Default: &defEmpty},
 				{Name: "x509_issuer", Type: "BLOB", Default: &defEmpty},
 				{Name: "x509_subject", Type: "BLOB", Default: &defEmpty},
+				{Name: "password_last_changed", Type: "TIMESTAMP", Nullable: true},
+				{Name: "Password_reuse_history", Type: "SMALLINT UNSIGNED", Nullable: true},
+				{Name: "Password_reuse_time", Type: "SMALLINT UNSIGNED", Nullable: true},
+				{Name: "create_role_priv", Type: "ENUM('N','Y')", Default: &defN},
+				{Name: "drop_role_priv", Type: "ENUM('N','Y')", Default: &defN},
 			}
 		}(),
 	})
