@@ -13818,6 +13818,17 @@ func parseMySQLDateValue(s string) string {
 			if isValidDate(y, m, d) {
 				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
 			}
+		case 1, 2, 3, 4, 5: // Short integers: left-pad to 6 digits and parse as YYMMDD
+			// MySQL compact date: e.g. 1111 -> 001111 -> 2000-11-11, 11111 -> 011111 -> 2001-11-11
+			padded := fmt.Sprintf("%06s", datePart)
+			yy, _ := strconv.Atoi(padded[:2])
+			m, _ := strconv.Atoi(padded[2:4])
+			d, _ := strconv.Atoi(padded[4:6])
+			y := convert2DigitYear(yy)
+			if isValidDate(y, m, d) {
+				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
+			}
+		// case 7: 7-digit numbers are invalid in MySQL (Data truncated warning, result 0000-00-00)
 		}
 		return ""
 	}
