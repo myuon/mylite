@@ -670,6 +670,24 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				}
 			}
 			v, err := e.evalExpr(val)
+			// For INSERT ... SET col1=val1, col2=col1 — if the expression is a bare
+			// column name reference and that column was already assigned in this same
+			// INSERT SET clause, use the previously-assigned value (left-to-right
+			// evaluation, matching MySQL behaviour).
+			if colRef, isColRef := val.(*sqlparser.ColName); isColRef && colRef.Qualifier.IsEmpty() && err == nil {
+				refName := colRef.Name.String()
+				for j, prevCol := range colNames {
+					if j >= i {
+						break
+					}
+					if strings.EqualFold(prevCol, refName) {
+						if prevVal, found := row[prevCol]; found {
+							v = prevVal
+						}
+						break
+					}
+				}
+			}
 			// If the expression is DEFAULT keyword, resolve the column's actual default
 			if _, isDefault := val.(*sqlparser.Default); isDefault {
 				for _, col := range tbl.Def.Columns {
