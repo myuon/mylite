@@ -4217,6 +4217,36 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			return "int"
 		case sqlparser.FloatVal:
 			return "double"
+		case sqlparser.DecimalVal:
+			// DECIMAL literal: infer decimal(M,D) from the string representation.
+			s := v.Val
+			if dot := strings.IndexByte(s, '.'); dot >= 0 {
+				intDigits := dot
+				if strings.HasPrefix(s, "-") {
+					intDigits--
+				}
+				fracDigits := len(s) - dot - 1
+				m := intDigits + fracDigits
+				if m < 1 {
+					m = 1
+				}
+				return fmt.Sprintf("decimal(%d,%d)", m, fracDigits)
+			}
+			// No decimal point: decimal(N,0)
+			n := len(s)
+			if strings.HasPrefix(s, "-") {
+				n--
+			}
+			if n < 1 {
+				n = 1
+			}
+			return fmt.Sprintf("decimal(%d,0)", n)
+		case sqlparser.DateVal:
+			return "date"
+		case sqlparser.TimeVal:
+			return "time"
+		case sqlparser.TimestampVal:
+			return "datetime"
 		case sqlparser.HexVal:
 			// MySQL: x'...' hex literals
 			// For small hex literals (≤ 4 bytes = fits in INT), MySQL uses "int(3) unsigned".
@@ -4240,6 +4270,11 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 				if err == nil && n > 2147483647 { // > INT32_MAX: needs bigint (signed)
 					return "bigint"
 				}
+			}
+			// Unary minus on a decimal preserves the decimal type.
+			inner := e.inferExprType(v.Expr)
+			if strings.HasPrefix(inner, "decimal(") {
+				return inner
 			}
 		}
 		return e.inferExprType(v.Expr)
@@ -4305,7 +4340,80 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			return "bigint unsigned"
 		case "last_insert_id", "row_count", "found_rows":
 			return "bigint"
-		case "if", "ifnull", "nullif", "coalesce", "greatest", "least":
+		case "round", "truncate":
+			// ROUND(x, d) / TRUNCATE(x, d): if x is a decimal literal, infer decimal(M,D)
+			// where D is the number of decimal places requested (or 0 for negative d).
+			if len(v.Exprs) >= 1 {
+				argType := e.inferExprType(v.Exprs[0])
+				if strings.HasPrefix(argType, "decimal(") {
+					var argM, argD int
+					if n, _ := fmt.Sscanf(argType, "decimal(%d,%d)", &argM, &argD); n == 2 {
+						outD := argD // default: same scale
+						scaleVal := argD
+						if len(v.Exprs) >= 2 {
+							scaleArg := v.Exprs[1]
+							scaleOK := false
+							// Handle both plain literal (-1 as Literal{IntVal,"-1"}) and unary minus
+							if lit, ok := scaleArg.(*sqlparser.Literal); ok && lit.Type == sqlparser.IntVal {
+								if d, err := strconv.Atoi(lit.Val); err == nil {
+									scaleVal, scaleOK = d, true
+								}
+							} else if ue, ok := scaleArg.(*sqlparser.UnaryExpr); ok && ue.Operator == sqlparser.UMinusOp {
+								if lit2, ok2 := ue.Expr.(*sqlparser.Literal); ok2 && lit2.Type == sqlparser.IntVal {
+									if d, err := strconv.Atoi(lit2.Val); err == nil {
+										scaleVal, scaleOK = -d, true
+									}
+								}
+							}
+							if scaleOK {
+								if scaleVal < 0 {
+									outD = 0
+								} else if scaleVal < argD {
+									outD = scaleVal
+								} else {
+									outD = argD
+								}
+							}
+						}
+						// M = integer digits of arg + output scale.
+						// For ROUND: add 1 for potential carry (e.g. 9.9 rounds to 10).
+						intDigits := argM - argD
+						if intDigits < 1 {
+							intDigits = 1
+						}
+						outM := intDigits + outD
+						if name == "round" {
+							outM++ // extra digit for rounding carry
+						}
+						if outM < 1 {
+							outM = 1
+						}
+						return fmt.Sprintf("decimal(%d,%d)", outM, outD)
+					}
+				}
+			}
+		case "abs":
+			// ABS(x): preserve decimal type of x, but +1 to M to accommodate sign.
+			if len(v.Exprs) >= 1 {
+				argType := e.inferExprType(v.Exprs[0])
+				if strings.HasPrefix(argType, "decimal(") {
+					var m, d int
+					if n, _ := fmt.Sscanf(argType, "decimal(%d,%d)", &m, &d); n == 2 {
+						return fmt.Sprintf("decimal(%d,%d)", m+1, d)
+					}
+					return argType
+				}
+			}
+		case "nullif":
+			// NULLIF(x, y) uses the type of the first argument.
+			if len(v.Exprs) >= 1 {
+				t := e.inferExprType(v.Exprs[0])
+				if t != "" && t != "binary(0)" {
+					return t
+				}
+			}
+			return "binary(0)"
+		case "if", "ifnull", "coalesce", "greatest", "least":
 			// For functions where all arguments resolve to NULL, MySQL returns binary(0).
 			// For IF(cond, then, else), check the then/else args (indices 1 and 2).
 			// For COALESCE/GREATEST/LEAST, check all args.
@@ -4316,15 +4424,36 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 				argsToCheck = v.Exprs // check both
 			}
 			allNull := len(argsToCheck) > 0
+			var decimalType string
+			hasDouble := false
+			hasNullArg := false
 			for _, arg := range argsToCheck {
 				t := e.inferExprType(arg)
-				if t != "binary(0)" && t != "" {
-					allNull = false
-					break
+				if t == "binary(0)" || t == "" {
+					if t == "binary(0)" {
+						hasNullArg = true
+					}
+					continue
+				}
+				allNull = false
+				if strings.HasPrefix(t, "decimal(") {
+					decimalType = t
+				} else if t == "double" {
+					hasDouble = true
 				}
 			}
 			if allNull {
 				return "binary(0)"
+			}
+			// If any arg is double, return double (double beats decimal).
+			if hasDouble {
+				return "double"
+			}
+			// If any arg is a decimal, return the decimal type.
+			// (int literals mixed with decimal still yield decimal in MySQL)
+			if decimalType != "" {
+				_ = hasNullArg // nullable handled in inferExprAttrs
+				return decimalType
 			}
 		}
 	case *sqlparser.IntroducerExpr:
@@ -4438,6 +4567,25 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 			attrs.hasDefault = true
 			attrs.defaultVal = ""
 		}
+	case *sqlparser.Literal:
+		// Temporal literals: DATE'...', TIME'...', TIMESTAMP'...' — MySQL uses NOT NULL with zero default
+		switch v.Type {
+		case sqlparser.DateVal:
+			attrs.colType = "date"
+			attrs.nullable = false
+			attrs.hasDefault = true
+			attrs.defaultVal = "0000-00-00"
+		case sqlparser.TimeVal:
+			attrs.colType = "time"
+			attrs.nullable = false
+			attrs.hasDefault = true
+			attrs.defaultVal = "00:00:00"
+		case sqlparser.TimestampVal:
+			attrs.colType = "datetime"
+			attrs.nullable = false
+			attrs.hasDefault = true
+			attrs.defaultVal = "0000-00-00 00:00:00"
+		}
 	case *sqlparser.IntroducerExpr:
 		// _charset'string' — charset comes from the introducer
 		cs := strings.ToLower(strings.TrimPrefix(v.CharacterSet, "_"))
@@ -4459,6 +4607,80 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 			attrs.nullable = false
 			attrs.hasDefault = true
 			attrs.defaultVal = "0"
+		}
+	}
+	// For numeric functions that return decimal, MySQL uses NOT NULL with appropriate DEFAULT.
+	// ROUND, TRUNCATE, ABS, and unary minus on a decimal literal arg → NOT NULL + DEFAULT.
+	if fn, ok := expr.(*sqlparser.FuncExpr); ok {
+		fname := strings.ToLower(fn.Name.String())
+		switch fname {
+		case "round", "truncate", "abs":
+			if strings.HasPrefix(strings.ToLower(attrs.colType), "decimal(") {
+				attrs.nullable = false
+				attrs.hasDefault = true
+				var m, d int
+				if n, _ := fmt.Sscanf(attrs.colType, "decimal(%d,%d)", &m, &d); n == 2 && d > 0 {
+					attrs.defaultVal = "0." + strings.Repeat("0", d)
+				} else {
+					attrs.defaultVal = "0"
+				}
+			}
+		}
+	}
+	if _, isUnary := expr.(*sqlparser.UnaryExpr); isUnary {
+		if strings.HasPrefix(strings.ToLower(attrs.colType), "decimal(") {
+			attrs.nullable = false
+			attrs.hasDefault = true
+			var m, d int
+			if n, _ := fmt.Sscanf(attrs.colType, "decimal(%d,%d)", &m, &d); n == 2 && d > 0 {
+				attrs.defaultVal = "0." + strings.Repeat("0", d)
+			} else {
+				attrs.defaultVal = "0"
+			}
+		}
+	}
+	// For IF/COALESCE/IFNULL/NULLIF/GREATEST/LEAST with a decimal result type,
+	// MySQL uses NOT NULL with DEFAULT '0.0' (or '0.00' for scale=2, etc.),
+	// unless any value arg is NULL (then DEFAULT NULL is used).
+	if fn, ok := expr.(*sqlparser.FuncExpr); ok {
+		fname := strings.ToLower(fn.Name.String())
+		switch fname {
+		case "nullif":
+			// NULLIF always returns NULL when args are equal, so always nullable (DEFAULT NULL).
+			// Still set the type correctly (decimal if applicable), but leave nullable=true.
+		case "if", "ifnull", "coalesce", "greatest", "least":
+			colTypeLower := strings.ToLower(attrs.colType)
+			isNumericType := strings.HasPrefix(colTypeLower, "decimal(") || colTypeLower == "double"
+			if isNumericType {
+				// Check if any value arg is a NULL literal
+				argsToCheck := fn.Exprs
+				if fname == "if" && len(fn.Exprs) == 3 {
+					argsToCheck = fn.Exprs[1:] // skip condition
+				}
+				hasNullArg := false
+				for _, arg := range argsToCheck {
+					t := e.inferExprType(arg)
+					if t == "binary(0)" {
+						hasNullArg = true
+						break
+					}
+				}
+				if !hasNullArg {
+					attrs.nullable = false
+					attrs.hasDefault = true
+					if strings.HasPrefix(colTypeLower, "decimal(") {
+						// Extract scale from decimal(M,D) to form default like "0.0" or "0.00"
+						var m, d int
+						if n, _ := fmt.Sscanf(attrs.colType, "decimal(%d,%d)", &m, &d); n == 2 && d > 0 {
+							attrs.defaultVal = "0." + strings.Repeat("0", d)
+						} else {
+							attrs.defaultVal = "0"
+						}
+					} else {
+						attrs.defaultVal = "0"
+					}
+				}
+			}
 		}
 	}
 	return attrs

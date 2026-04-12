@@ -107,6 +107,12 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 				return tv, true, nil
 			}
 		}
+		// For decimal strings (from DECIMAL literals), use exact decimal rounding to avoid float64 precision loss.
+		if s, ok := val.(string); ok {
+			if out, ok2 := roundDecimalStringHalfUp(s, int(decimals)); ok2 {
+				return out, true, nil
+			}
+		}
 		f := toFloat(val)
 		if decimals == 0 {
 			return int64(f + 0.5), true, nil
