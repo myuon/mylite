@@ -13011,6 +13011,12 @@ func (e *Executor) isStrictMode() bool {
 		strings.Contains(e.sqlMode, "STRICT_ALL_TABLES")
 }
 
+// isTimeTruncateFractionalMode returns true when sql_mode includes TIME_TRUNCATE_FRACTIONAL.
+// In this mode, fractional seconds beyond the column's fsp are truncated (not rounded).
+func (e *Executor) isTimeTruncateFractionalMode() bool {
+	return strings.Contains(e.sqlMode, "TIME_TRUNCATE_FRACTIONAL")
+}
+
 // isTraditionalMode returns true when sql_mode includes TRADITIONAL or STRICT_ALL_TABLES.
 // TRADITIONAL mode enforces stricter validation (e.g., ENUM value validation) than
 // STRICT_TRANS_TABLES alone.
@@ -13144,7 +13150,9 @@ func checkDecimalRange(colType string, v interface{}) error {
 // For DATE columns, "2007-02-13 15:09:33" becomes "2007-02-13".
 // For TIME columns, "2007-02-13 15:09:33" becomes "15:09:33".
 // For YEAR columns, "2007-02-13 15:09:33" becomes "2007".
-func coerceDateTimeValue(colType string, v interface{}) interface{} {
+// truncateFractional mirrors the TIME_TRUNCATE_FRACTIONAL sql_mode: when true,
+// fractional seconds beyond fsp are truncated; when false they are rounded.
+func coerceDateTimeValue(colType string, v interface{}, truncateFractional bool) interface{} {
 	upper := strings.ToUpper(strings.TrimSpace(colType))
 	s := fmt.Sprintf("%v", v)
 	if len(s) == 0 {
@@ -13179,6 +13187,14 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 	if isTimeType {
 		upper = "TIME"
 	}
+	// Extract DATETIME/TIMESTAMP precision: DATETIME(N) -> N, plain DATETIME -> -1 (no fsp)
+	datetimeFsp := -1
+	if strings.HasPrefix(upper, "DATETIME(") {
+		fmt.Sscanf(upper, "DATETIME(%d)", &datetimeFsp)
+		upper = "DATETIME"
+	} else if strings.HasPrefix(upper, "TIMESTAMP(") {
+		upper = "TIMESTAMP"
+	}
 	switch upper {
 	case "DATE":
 		// If the value looks like a datetime, truncate to date-only
@@ -13205,8 +13221,8 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 		if strings.Count(result, ":") != 2 {
 			result = "00:00:00"
 		}
-		// Apply TIME precision: round fractional seconds to timeFsp digits
-		return applyTimePrecision(result, timeFsp)
+		// Apply TIME precision: round or truncate fractional seconds to timeFsp digits
+		return applyTimePrecision(result, timeFsp, truncateFractional)
 	case "YEAR":
 		return coerceYearValue(v)
 	case "TIMESTAMP":
@@ -13254,7 +13270,12 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 			if timePart != "" {
 				// Normalize time separator chars to ':'
 				timePart = normalizeDateTimeSeparators(timePart)
-				return parsed + " " + timePart
+				result := parsed + " " + timePart
+				// Apply DATETIME(N) fractional seconds precision if specified
+				if datetimeFsp >= 0 {
+					result = applyDatetimePrecision(result, datetimeFsp, truncateFractional)
+				}
+				return result
 			}
 			return parsed + " 00:00:00"
 		}
@@ -13262,6 +13283,21 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 		return "0000-00-00 00:00:00"
 	}
 	return v
+}
+
+// applyDatetimePrecision applies fractional seconds precision to a DATETIME string
+// like "2001-01-01 10:10:10.999999", rounding or truncating to fsp decimal places.
+func applyDatetimePrecision(datetimeStr string, fsp int, truncate bool) string {
+	// Find the space separating date and time
+	spaceIdx := strings.Index(datetimeStr, " ")
+	if spaceIdx < 0 {
+		return datetimeStr
+	}
+	datePart := datetimeStr[:spaceIdx]
+	timePart := datetimeStr[spaceIdx+1:]
+	// Apply precision to the time portion (reuse applyTimePrecision for the HH:MM:SS.fff part)
+	adjusted := applyTimePrecision(timePart, fsp, truncate)
+	return datePart + " " + adjusted
 }
 
 // extractTimePart extracts the time component from a datetime value.
@@ -13354,9 +13390,14 @@ func parseMySQLTimeValueRaw(v interface{}) string {
 		h := int(intPart / 10000)
 		frac := ""
 		if fracPart > 0 {
-			fracStr := fmt.Sprintf("%.6f", fracPart)
-			frac = strings.TrimPrefix(fracStr, "0.")
-			frac = strings.TrimRight(frac, "0")
+			// Use integer truncation to avoid floating-point rounding artifacts
+			// (e.g., 0.9999999 would round to "1.000000" with %.6f).
+			// applyTimePrecision handles rounding/truncation based on sql_mode.
+			micros := int64(fracPart * 1e6)
+			if micros > 0 {
+				frac = fmt.Sprintf("%06d", micros)
+				frac = strings.TrimRight(frac, "0")
+			}
 		}
 		return formatTimeValue(negative, h, m, sec, frac)
 	case uint64:
@@ -13502,6 +13543,27 @@ func formatTimeValue(negative bool, h, m, sec int, frac string) string {
 		// If hours > 838, clip to max
 		h, m, sec = 838, 59, 59
 		frac = ""
+	} else if totalSecs == maxSecs && len(frac) > 6 {
+		// At the maximum seconds, check if fractional part exceeds 999999 microseconds.
+		// frac has > 6 digits; if the first 6 are "999999" and there are more non-zero digits,
+		// the value exceeds the max TIME(6) representable value. MySQL clips to max and
+		// emits a warning.
+		first6 := frac
+		if len(first6) > 6 {
+			first6 = first6[:6]
+		}
+		hasExtraDigits := false
+		for _, c := range frac[6:] {
+			if c != '0' {
+				hasExtraDigits = true
+				break
+			}
+		}
+		if first6 == "999999" && hasExtraDigits {
+			// Value exceeds max TIME range; clip to max integer seconds (no fraction).
+			h, m, sec = 838, 59, 59
+			frac = ""
+		}
 	}
 
 	sign := ""
@@ -13526,18 +13588,27 @@ func formatTimeValue(negative bool, h, m, sec int, frac string) string {
 
 // applyTimePrecision rounds or truncates a TIME string's fractional seconds
 // to the given fsp (fractional seconds precision, 0-6).
-// For fsp=0 (default TIME), fractional seconds >= 0.5 round up the seconds.
-func applyTimePrecision(timeStr string, fsp int) string {
+// When truncate is false (default): fractional seconds are rounded (MySQL default).
+// When truncate is true (TIME_TRUNCATE_FRACTIONAL mode): fractional seconds are truncated.
+func applyTimePrecision(timeStr string, fsp int, truncate bool) string {
 	// Find the fractional part
 	dotIdx := strings.Index(timeStr, ".")
 	if dotIdx < 0 {
-		// No fractional part, nothing to do
+		if fsp > 0 {
+			// No fractional part but column has precision > 0: pad with zeros
+			return timeStr + "." + strings.Repeat("0", fsp)
+		}
+		// No fractional part and fsp=0: nothing to do
 		return timeStr
 	}
 	basePart := timeStr[:dotIdx]
 	fracPart := timeStr[dotIdx+1:]
 
 	if fsp == 0 {
+		if truncate {
+			// TIME_TRUNCATE_FRACTIONAL: discard fractional seconds entirely
+			return basePart
+		}
 		// Round: if first frac digit >= 5, increment seconds
 		if len(fracPart) > 0 && fracPart[0] >= '5' {
 			return incrementTimeSecond(basePart)
@@ -13550,25 +13621,30 @@ func applyTimePrecision(timeStr string, fsp int) string {
 		fracPart += "0"
 	}
 	if len(fracPart) > fsp {
-		// Check if we need to round
-		roundUp := fracPart[fsp] >= '5'
-		fracPart = fracPart[:fsp]
-		if roundUp {
-			// Increment the last fractional digit
-			digits := []byte(fracPart)
-			carry := true
-			for i := len(digits) - 1; i >= 0 && carry; i-- {
-				digits[i]++
-				if digits[i] > '9' {
-					digits[i] = '0'
-				} else {
-					carry = false
+		if truncate {
+			// TIME_TRUNCATE_FRACTIONAL: just drop excess digits
+			fracPart = fracPart[:fsp]
+		} else {
+			// Round: check if we need to round up
+			roundUp := fracPart[fsp] >= '5'
+			fracPart = fracPart[:fsp]
+			if roundUp {
+				// Increment the last fractional digit
+				digits := []byte(fracPart)
+				carry := true
+				for i := len(digits) - 1; i >= 0 && carry; i-- {
+					digits[i]++
+					if digits[i] > '9' {
+						digits[i] = '0'
+					} else {
+						carry = false
+					}
 				}
-			}
-			fracPart = string(digits)
-			if carry {
-				// Fractional part overflowed, increment seconds
-				return incrementTimeSecond(basePart) + "." + fracPart
+				fracPart = string(digits)
+				if carry {
+					// Fractional part overflowed, increment seconds
+					return incrementTimeSecond(basePart) + "." + fracPart
+				}
 			}
 		}
 	}
@@ -15418,7 +15494,8 @@ func decimalMaxString(m, d int) string {
 // coerceColumnValue applies the standard DML value coercion chain for a column:
 // binary padding, decimal formatting, enum/set validation, datetime coercion,
 // integer coercion, and bit coercion.
-func coerceColumnValue(colType string, val interface{}) interface{} {
+// truncateFractional mirrors the TIME_TRUNCATE_FRACTIONAL sql_mode for TIME/DATETIME columns.
+func coerceColumnValue(colType string, val interface{}, truncateFractional bool) interface{} {
 	if padLen := binaryPadLength(colType); padLen > 0 && val != nil {
 		val = padBinaryValue(val, padLen)
 	} else if isVarbinaryType(colType) && val != nil {
@@ -15429,7 +15506,7 @@ func coerceColumnValue(colType string, val interface{}) interface{} {
 	if val != nil {
 		val = formatDecimalValue(colType, val)
 		val = validateEnumSetValue(colType, val)
-		val = coerceDateTimeValue(colType, val)
+		val = coerceDateTimeValue(colType, val, truncateFractional)
 		val = coerceIntegerValue(colType, val)
 		val = coerceBitValue(colType, val)
 	}
@@ -15870,7 +15947,7 @@ func floatParseValue(v interface{}) (float64, string) {
 	return f, "normal"
 }
 
-func coerceValueForColumnType(col catalog.ColumnDef, val interface{}) interface{} {
+func coerceValueForColumnType(col catalog.ColumnDef, val interface{}, truncateFractional bool) interface{} {
 	if val == nil {
 		return nil
 	}
@@ -15881,7 +15958,7 @@ func coerceValueForColumnType(col catalog.ColumnDef, val interface{}) interface{
 	}
 	val = formatDecimalValue(col.Type, val)
 	val = validateEnumSetValue(col.Type, val)
-	val = coerceDateTimeValue(col.Type, val)
+	val = coerceDateTimeValue(col.Type, val, truncateFractional)
 	val = coerceIntegerValue(col.Type, val)
 	val = coerceBitValue(col.Type, val)
 	// Truncate BLOB/TEXT values when column type changes (e.g., LONGBLOB→BLOB)

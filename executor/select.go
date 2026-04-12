@@ -6617,7 +6617,7 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 				if padLen := binaryPadLength(colDef.Type); padLen > 0 {
 					v = padBinaryValue(v, padLen)
 				}
-				row[colDef.Name] = coerceDateTimeValue(colDef.Type, v)
+				row[colDef.Name] = coerceDateTimeValue(colDef.Type, v, e.isTimeTruncateFractionalMode())
 			}
 		}
 
