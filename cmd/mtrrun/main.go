@@ -841,15 +841,13 @@ func resolveTestdataRoot() string {
 	}
 	return local
 }
+// resetSessionState resets session state that resetState() doesn't cover.
+// Since testDB is created AFTER resetState() swaps in a fresh executor,
+// most session variables are already at defaults. These SET statements
+// handle the few variables that MySQL wire protocol connections inherit
+// from the server rather than from the executor.
 func resetSessionState(db *sql.DB) {
 	db.Exec("SET SQL_MODE='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'")          //nolint:errcheck
 	db.Exec("SET @@GLOBAL.SQL_MODE='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'") //nolint:errcheck
 	db.Exec("SET TIMESTAMP=DEFAULT")                                                                                                                         //nolint:errcheck
-	db.Exec("SET SESSION autocommit = 1")                                                                                                                    //nolint:errcheck
-	db.Exec("SET SESSION foreign_key_checks = 1")                                                                                                            //nolint:errcheck
-	db.Exec("SET SESSION unique_checks = 1")                                                                                                                 //nolint:errcheck
-	db.Exec("SET SESSION character_set_client = 'utf8mb4'")                                                                                                  //nolint:errcheck
-	db.Exec("SET SESSION character_set_results = 'utf8mb4'")                                                                                                 //nolint:errcheck
-	db.Exec("SET SESSION character_set_connection = 'utf8mb4'")                                                                                              //nolint:errcheck
-	db.Exec("SET SESSION collation_connection = 'utf8mb4_general_ci'")                                                                                       //nolint:errcheck
 }
