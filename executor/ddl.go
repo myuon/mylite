@@ -4206,6 +4206,14 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			n := len(v.Val)
 			return fmt.Sprintf("varchar(%d)", n)
 		case sqlparser.IntVal:
+			n, err := strconv.ParseUint(v.Val, 10, 64)
+			if err == nil {
+				if n > 4294967295 { // > UINT32_MAX: needs bigint
+					return "bigint unsigned"
+				} else if n > 2147483647 { // > INT32_MAX: needs int unsigned
+					return "int unsigned"
+				}
+			}
 			return "int"
 		case sqlparser.FloatVal:
 			return "double"
@@ -4224,6 +4232,17 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			}
 			return "bigint unsigned"
 		}
+	case *sqlparser.UnaryExpr:
+		// Handle negative integer literals: -9223372036854775808 etc.
+		if v.Operator == sqlparser.UMinusOp {
+			if lit, ok := v.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.IntVal {
+				n, err := strconv.ParseUint(lit.Val, 10, 64)
+				if err == nil && n > 2147483647 { // > INT32_MAX: needs bigint (signed)
+					return "bigint"
+				}
+			}
+		}
+		return e.inferExprType(v.Expr)
 	case *sqlparser.BinaryExpr:
 		// Arithmetic expressions (+,-,*,/) return numeric types.
 		// If either operand is hex, result is int(3) unsigned (for small hex) or bigint unsigned (for large hex).
