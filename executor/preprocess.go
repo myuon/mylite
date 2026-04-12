@@ -862,23 +862,71 @@ func normalizeODBCDateTimeLiterals(query string) string {
 		if ch == '{' {
 			rest := query[i:]
 			restUpper := strings.ToUpper(rest)
-			// Try {ts '...'}, {d '...'}, {t '...'} in order (longest first)
-			prefixes := []string{"{TS ", "{D ", "{T "}
+			// Try {ts '...'}, {d '...'}, {t '...'} in order (longest first).
+			// Accept both space-separated ({t '...'}) and no-space ({t'...'}) variants.
+			// Convert to typed temporal literals (DATE/TIME/TIMESTAMP) when the value
+			// is valid for the type; otherwise keep as plain string literal.
+			type odbcEntry struct {
+				prefixes []string
+				keyword  string
+			}
+			odbcEntries := []odbcEntry{
+				{[]string{"{TS ", "{TS'"}, "TIMESTAMP"},
+				{[]string{"{D ", "{D'"}, "DATE"},
+				{[]string{"{T ", "{T'"}, "TIME"},
+			}
 			matched := false
-			for _, prefix := range prefixes {
-				if strings.HasPrefix(restUpper, prefix) {
-					// Find the closing '}'
-					closeIdx := strings.Index(rest, "}")
-					if closeIdx < 0 {
+			for _, entry := range odbcEntries {
+				found := ""
+				for _, prefix := range entry.prefixes {
+					if strings.HasPrefix(restUpper, prefix) {
+						found = prefix
 						break
 					}
-					inner := strings.TrimSpace(rest[len(prefix):closeIdx])
-					// inner should be a quoted string like '2006-01-02'
-					result = append(result, []byte(inner)...)
-					i += closeIdx + 1
-					matched = true
+				}
+				if found == "" {
+					continue
+				}
+				// Find the closing '}'
+				closeIdx := strings.Index(rest, "}")
+				if closeIdx < 0 {
 					break
 				}
+				// Compute inner content. If the prefix ends with "'" (no-space variant like {T'),
+				// the quote is part of the prefix so we must re-include it.
+				innerStart := len(found)
+				if strings.HasSuffix(found, "'") {
+					innerStart-- // step back to include the opening quote
+				}
+				inner := strings.TrimSpace(rest[innerStart:closeIdx])
+				// inner should be a quoted string like '2006-01-02'
+				// Determine whether to use typed literal or plain string.
+				// For DATE: value must not contain spaces (no datetime values).
+				// For TIME: value must contain ':' or be purely numeric (no date format).
+				// For TIMESTAMP: always use typed literal.
+				useTyped := false
+				if len(inner) >= 2 && inner[0] == '\'' && inner[len(inner)-1] == '\'' {
+					val := inner[1 : len(inner)-1]
+					switch entry.keyword {
+					case "TIMESTAMP":
+						useTyped = true
+					case "DATE":
+						// Valid date: no spaces, has at least 2 separators
+						useTyped = !strings.ContainsAny(val, " \t")
+					case "TIME":
+						// Valid time: contains ':' or is purely numeric (no dashes indicating a date)
+						useTyped = strings.Contains(val, ":") || (!strings.Contains(val, "-") && !strings.ContainsAny(val, " \t"))
+					}
+				}
+				if useTyped {
+					result = append(result, []byte(entry.keyword)...)
+					result = append(result, []byte(inner)...)
+				} else {
+					result = append(result, []byte(inner)...)
+				}
+				i += closeIdx + 1
+				matched = true
+				break
 			}
 			if matched {
 				continue
@@ -1290,8 +1338,8 @@ func rewriteODBCEscapes(query string) (string, bool) {
 			// {fn func_name(args)} → func_name(args)
 			result.WriteString(inner)
 		case "d", "date":
-			// {d 'value'} or { date "value" } → DATE 'value' → just output the value
-			// The inner is the date string (possibly quoted)
+			// {d 'value'} or { date "value" } → just output the value as a string.
+			// The inner is the date string (possibly quoted).
 			if inner == "" {
 				result.WriteString("NULL")
 			} else {
@@ -1299,13 +1347,40 @@ func rewriteODBCEscapes(query string) (string, bool) {
 				result.WriteString(inner)
 			}
 		case "t", "time":
-			// {t 'value'} → TIME 'value'
-			result.WriteString("TIME ")
-			result.WriteString(inner)
+			// {t 'value'} → TIME 'value' if valid time, else plain string.
+			// A valid time value contains ':' or is purely numeric (not a date with dashes).
+			if inner == "" {
+				result.WriteString("NULL")
+			} else {
+				val := inner
+				if len(val) >= 2 && (val[0] == '\'' || val[0] == '"') && val[len(val)-1] == val[0] {
+					val = val[1 : len(val)-1]
+				}
+				isValidTime := strings.Contains(val, ":") || (!strings.Contains(val, "-") && !strings.ContainsAny(val, " \t"))
+				if isValidTime {
+					result.WriteString("TIME ")
+					result.WriteString(inner)
+				} else {
+					result.WriteString(inner)
+				}
+			}
 		case "ts", "timestamp":
-			// {ts 'value'} → TIMESTAMP 'value'
-			result.WriteString("TIMESTAMP ")
-			result.WriteString(inner)
+			// {ts 'value'} → TIMESTAMP 'value' if valid datetime (has space), else plain string.
+			if inner == "" {
+				result.WriteString("NULL")
+			} else {
+				val := inner
+				if len(val) >= 2 && (val[0] == '\'' || val[0] == '"') && val[len(val)-1] == val[0] {
+					val = val[1 : len(val)-1]
+				}
+				// Valid timestamp: has a space separating date and time parts
+				if strings.Contains(val, " ") {
+					result.WriteString("TIMESTAMP ")
+					result.WriteString(inner)
+				} else {
+					result.WriteString(inner)
+				}
+			}
 		default:
 			// Unknown ODBC escape - output as-is
 			result.WriteString(query[i : k+1])

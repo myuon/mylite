@@ -153,8 +153,24 @@ func (e *Executor) evalLiteralExpr(v *sqlparser.Literal) (interface{}, error) {
 			return nil, err
 		}
 		return normalized, nil
+	case sqlparser.TimeVal:
+		// Validate TIME literal: must be in valid TIME format and within -838:59:59..838:59:59.
+		s := v.Val
+		normalized, err := normalizeTimeLiteral(s)
+		if err != nil {
+			return nil, err
+		}
+		return normalized, nil
+	case sqlparser.TimestampVal:
+		// Validate TIMESTAMP literal: must have at least date + hour (YYYY-MM-DD HH).
+		s := v.Val
+		normalized, err := normalizeTimestampLiteral(s)
+		if err != nil {
+			return nil, err
+		}
+		return normalized, nil
 	default:
-		// Handle timestamp/date/time typed literals as plain string values.
+		// Handle other typed literals as plain string values.
 		return v.Val, nil
 	}
 }
@@ -233,6 +249,179 @@ func normalizeDateLiteral(s, sqlMode string) (string, error) {
 
 	// Return normalized YYYY-MM-DD
 	return fmt.Sprintf("%04d-%02d-%02d", year, month, day), nil
+}
+
+// normalizeTimeLiteral validates a TIME literal string and returns the normalized HH:MM:SS value.
+// Returns error if the value is not a valid TIME literal or exceeds -838:59:59..838:59:59.
+func normalizeTimeLiteral(s string) (string, error) {
+	invalidErr := mysqlError(1292, "HY000", fmt.Sprintf("Incorrect TIME value: '%s'", s))
+
+	// DATE-like formats (YYYY-MM-DD ...) are not valid TIME literals.
+	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
+		return "", invalidErr
+	}
+
+	const maxTotalSecs = 838*3600 + 59*60 + 59
+
+	if strings.Contains(s, ":") {
+		negative := false
+		work := s
+		if strings.HasPrefix(work, "-") {
+			negative = true
+			work = work[1:]
+		}
+		days := 0
+		if idx := strings.Index(work, " "); idx >= 0 {
+			d, err := strconv.Atoi(strings.TrimSpace(work[:idx]))
+			if err != nil {
+				return "", invalidErr
+			}
+			days = d
+			work = strings.TrimSpace(work[idx+1:])
+		}
+		parts := strings.Split(work, ":")
+		if len(parts) < 2 || len(parts) > 3 {
+			return "", invalidErr
+		}
+		h, errH := strconv.Atoi(parts[0])
+		if errH != nil {
+			return "", invalidErr
+		}
+		sec := 0
+		frac := ""
+		// Parse MM part, which may carry fractional seconds (e.g. "10:11.12" → MM=11, frac="12")
+		mPart := parts[1]
+		if mFrac := strings.SplitN(mPart, ".", 2); len(mFrac) == 2 {
+			mPart = mFrac[0]
+			frac = mFrac[1]
+		}
+		m, errM := strconv.Atoi(mPart)
+		if errM != nil || m > 59 || m < 0 {
+			return "", invalidErr
+		}
+		if len(parts) == 3 {
+			secParts := strings.SplitN(parts[2], ".", 2)
+			var errS error
+			sec, errS = strconv.Atoi(secParts[0])
+			if errS != nil || sec > 59 || sec < 0 {
+				return "", invalidErr
+			}
+			if len(secParts) > 1 {
+				frac = secParts[1]
+			}
+		}
+		totalH := h + days*24
+		totalSecs := totalH*3600 + m*60 + sec
+		if totalSecs > maxTotalSecs {
+			return "", invalidErr
+		}
+		return formatTimeValue(negative, totalH, m, sec, frac), nil
+	}
+
+	// Numeric format: SS, MMSS, HHMMSS
+	negative := false
+	work := s
+	if strings.HasPrefix(work, "-") {
+		negative = true
+		work = work[1:]
+	}
+	// Must be purely numeric (with optional fractional part)
+	frac := ""
+	if dotIdx := strings.Index(work, "."); dotIdx >= 0 {
+		frac = work[dotIdx+1:]
+		work = work[:dotIdx]
+		// frac must be digits
+		for _, c := range frac {
+			if c < '0' || c > '9' {
+				return "", invalidErr
+			}
+		}
+	}
+	if work == "" {
+		return "", invalidErr
+	}
+	for _, c := range work {
+		if c < '0' || c > '9' {
+			return "", invalidErr
+		}
+	}
+	n, err := strconv.ParseInt(work, 10, 64)
+	if err != nil {
+		return "", invalidErr
+	}
+	var h, m, sec int
+	if n < 100 {
+		sec = int(n)
+	} else if n < 10000 {
+		sec = int(n % 100)
+		m = int(n / 100)
+	} else {
+		sec = int(n % 100)
+		m = int((n / 100) % 100)
+		h = int(n / 10000)
+	}
+	if m > 59 || sec > 59 {
+		return "", invalidErr
+	}
+	totalSecs := h*3600 + m*60 + sec
+	if totalSecs > maxTotalSecs {
+		return "", invalidErr
+	}
+	return formatTimeValue(negative, h, m, sec, frac), nil
+}
+
+// normalizeTimestampLiteral validates a TIMESTAMP literal and returns its normalized form.
+// TIMESTAMP literals must have at least a date and hour component (YYYY-MM-DD HH...).
+// Returns error for invalid formats (no date part, or only date without time).
+func normalizeTimestampLiteral(s string) (string, error) {
+	invalidErr := mysqlError(1292, "HY000", fmt.Sprintf("Incorrect DATETIME value: '%s'", s))
+
+	// Must have a space separating date and time.
+	spaceIdx := strings.Index(s, " ")
+	if spaceIdx < 0 {
+		// No space: just a date or invalid → error
+		return "", invalidErr
+	}
+	datePart := s[:spaceIdx]
+	// Date part must have exactly 2 dashes (YYYY-MM-DD format)
+	if strings.Count(datePart, "-") != 2 {
+		return "", invalidErr
+	}
+	// Time part must have at least one digit (the hour)
+	timePart := strings.TrimSpace(s[spaceIdx+1:])
+	if timePart == "" {
+		return "", invalidErr
+	}
+
+	// Normalize the time part to HH:MM:SS[.frac] format
+	// Parse what's provided and fill in missing components with zeros
+	timeParts := strings.SplitN(timePart, ":", 3)
+	h := timeParts[0]
+	m := "00"
+	sec := "00"
+	frac := ""
+	if len(timeParts) >= 2 {
+		m = timeParts[1]
+	}
+	if len(timeParts) >= 3 {
+		secFrac := strings.SplitN(timeParts[2], ".", 2)
+		sec = secFrac[0]
+		if len(secFrac) > 1 {
+			frac = secFrac[1]
+		}
+	}
+
+	// Fractional seconds with more than 6 digits (nanoseconds) are an error in MySQL.
+	if len(frac) > 6 {
+		return "", invalidErr
+	}
+
+	// Build normalized time string
+	normalizedTime := fmt.Sprintf("%02s:%02s:%02s", h, m, sec)
+	if frac != "" {
+		normalizedTime += "." + frac
+	}
+	return datePart + " " + normalizedTime, nil
 }
 
 // evalColNameExpr handles *sqlparser.ColName evaluation.
