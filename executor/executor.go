@@ -12315,10 +12315,10 @@ func stripLeadingCStyleComments(s string) string {
 func extractRawSelectExprs(query string) []string {
 	q := strings.TrimSpace(query)
 	lq := strings.ToLower(q)
-	if !strings.HasPrefix(lq, "select") || (len(lq) > 6 && lq[6] != ' ' && lq[6] != '\t' && lq[6] != '\n' && lq[6] != '\r') {
+	if !strings.HasPrefix(lq, "select ") {
 		return nil
 	}
-	start := len("select")
+	start := len("select ")
 	// Skip DISTINCT keyword and SQL hints so they don't appear in column headers
 	rest := strings.TrimSpace(q[start:])
 	for {

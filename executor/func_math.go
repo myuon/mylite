@@ -107,42 +107,6 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 				return tv, true, nil
 			}
 		}
-		// For string decimal values (e.g. from DECIMAL columns), use exact string-based
-		// rounding to avoid float64 precision loss (e.g. -51.395 stored as -51.39499...).
-		if s, ok := val.(string); ok && decimals >= 0 {
-			if dot := strings.IndexByte(s, '.'); dot >= 0 && !strings.ContainsAny(s, "eE") {
-				if rounded, ok2 := roundDecimalStringHalfUp(s, int(decimals)); ok2 {
-					// When the second argument is a literal integer, return exactly that many
-					// decimal places. When it comes from a column/expression, MySQL preserves
-					// the original column scale (max of requested and input scale).
-					decimalsIsLiteral := len(v.Exprs) >= 2
-					if decimalsIsLiteral {
-						if lit, ok3 := v.Exprs[1].(*sqlparser.Literal); !ok3 || lit.Type != sqlparser.IntVal {
-							decimalsIsLiteral = false
-						}
-					}
-					if decimalsIsLiteral {
-						return rounded, true, nil
-					}
-					// Non-literal second arg: preserve original input scale if larger
-					inScale := len(s) - dot - 1
-					outScale := int(decimals)
-					if inScale > outScale {
-						outScale = inScale
-					}
-					// Pad trailing zeros to reach outScale decimal places
-					if outScale > int(decimals) {
-						if rdot := strings.IndexByte(rounded, '.'); rdot >= 0 {
-							curFrac := len(rounded) - rdot - 1
-							rounded += strings.Repeat("0", outScale-curFrac)
-						} else {
-							rounded += "." + strings.Repeat("0", outScale)
-						}
-					}
-					return rounded, true, nil
-				}
-			}
-		}
 		f := toFloat(val)
 		if decimals == 0 {
 			return int64(f + 0.5), true, nil
@@ -165,6 +129,14 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		outScale := int(decimals)
 		if outScale < 0 {
 			outScale = 0
+		}
+		if s, ok := val.(string); ok {
+			if dot := strings.IndexByte(s, '.'); dot >= 0 {
+				inScale := len(s) - dot - 1
+				if inScale > outScale {
+					outScale = inScale
+				}
+			}
 		}
 		return fmt.Sprintf("%.*f", outScale, rounded), true, nil
 	case "truncate":

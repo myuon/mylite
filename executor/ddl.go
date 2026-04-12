@@ -4217,22 +4217,6 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			return "int"
 		case sqlparser.FloatVal:
 			return "double"
-		case sqlparser.DecimalVal:
-			// Plain decimal literal like 1.1 — infer decimal(M,D) type
-			s := v.Val
-			if dot := strings.IndexByte(s, '.'); dot >= 0 {
-				intDigits := dot
-				if strings.HasPrefix(s, "-") {
-					intDigits--
-				}
-				fracDigits := len(s) - dot - 1
-				prec := intDigits + fracDigits
-				if prec < 1 {
-					prec = 1
-				}
-				return fmt.Sprintf("decimal(%d,%d)", prec, fracDigits)
-			}
-			return "double"
 		case sqlparser.HexVal:
 			// MySQL: x'...' hex literals
 			// For small hex literals (≤ 4 bytes = fits in INT), MySQL uses "int(3) unsigned".
@@ -4247,12 +4231,6 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 				return "int(3) unsigned"
 			}
 			return "bigint unsigned"
-		case sqlparser.DateVal:
-			return "date"
-		case sqlparser.TimeVal:
-			return "time"
-		case sqlparser.TimestampVal:
-			return "datetime"
 		}
 	case *sqlparser.UnaryExpr:
 		// Handle negative integer literals: -9223372036854775808 etc.
@@ -4328,13 +4306,6 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 		case "last_insert_id", "row_count", "found_rows":
 			return "bigint"
 		case "if", "ifnull", "nullif", "coalesce", "greatest", "least":
-			// NULLIF(expr1, expr2) returns the type of expr1 (result is either expr1 or NULL)
-			if name == "nullif" && len(v.Exprs) == 2 {
-				if t := e.inferExprType(v.Exprs[0]); t != "" {
-					return t
-				}
-				return "binary(0)"
-			}
 			// For functions where all arguments resolve to NULL, MySQL returns binary(0).
 			// For IF(cond, then, else), check the then/else args (indices 1 and 2).
 			// For COALESCE/GREATEST/LEAST, check all args.
@@ -4345,73 +4316,15 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 				argsToCheck = v.Exprs // check both
 			}
 			allNull := len(argsToCheck) > 0
-			// Track whether all non-null args are plain decimal literals (DecimalVal),
-			// or a mix of decimal + integer literals (no scientific notation), and the
-			// maximum precision/scale seen so we can return an appropriate decimal type.
-			allDecimalOrInt := len(argsToCheck) > 0
-			hasDecimal := false
-			maxPrec, maxScale := 0, 0
-			maxIntDigits := 0
 			for _, arg := range argsToCheck {
 				t := e.inferExprType(arg)
 				if t != "binary(0)" && t != "" {
 					allNull = false
-				}
-				// Check if this arg is a plain decimal literal (no e/E notation)
-				if lit, ok := arg.(*sqlparser.Literal); ok {
-					switch lit.Type {
-					case sqlparser.DecimalVal:
-						// Plain decimal literal like 1.1, -51.395
-						allNull = false // DecimalVal is non-null
-						s := lit.Val
-						if dot := strings.IndexByte(s, '.'); dot >= 0 {
-							intDigits := dot
-							if strings.HasPrefix(s, "-") {
-								intDigits--
-							}
-							fracDigits := len(s) - dot - 1
-							prec := intDigits + fracDigits
-							if prec > maxPrec {
-								maxPrec = prec
-							}
-							if fracDigits > maxScale {
-								maxScale = fracDigits
-							}
-							if intDigits > maxIntDigits {
-								maxIntDigits = intDigits
-							}
-							hasDecimal = true
-						} else {
-							allDecimalOrInt = false
-						}
-					case sqlparser.IntVal:
-						// Integer literal — allowed as part of decimal mix
-						digits := len(lit.Val)
-						if digits > maxIntDigits {
-							maxIntDigits = digits
-						}
-						if digits > maxPrec {
-							maxPrec = digits
-						}
-					default:
-						allDecimalOrInt = false
-					}
-				} else if _, ok2 := arg.(*sqlparser.NullVal); !ok2 {
-					allDecimalOrInt = false
+					break
 				}
 			}
 			if allNull {
 				return "binary(0)"
-			}
-			// When all value args are decimal/int literals (no scientific notation),
-			// return an appropriate decimal type so that CREATE TABLE AS SELECT produces
-			// decimal(M,D) instead of binary(0).
-			if allDecimalOrInt && hasDecimal && maxPrec > 0 {
-				totalPrec := maxIntDigits + maxScale
-				if totalPrec < maxPrec {
-					totalPrec = maxPrec
-				}
-				return fmt.Sprintf("decimal(%d,%d)", totalPrec, maxScale)
 			}
 		}
 	case *sqlparser.IntroducerExpr:
@@ -4538,42 +4451,6 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 	}
 	if attrs.colType == "" {
 		attrs.colType = e.inferExprType(expr)
-	}
-	// For temporal literals (DATE/TIME/TIMESTAMP), MySQL uses NOT NULL with zero default.
-	if lit, ok := expr.(*sqlparser.Literal); ok {
-		switch lit.Type {
-		case sqlparser.DateVal:
-			attrs.nullable = false
-			attrs.hasDefault = true
-			attrs.defaultVal = "0000-00-00"
-		case sqlparser.TimeVal:
-			// Determine fractional precision from the literal value.
-			attrs.nullable = false
-			attrs.hasDefault = true
-			if dotIdx := strings.LastIndex(lit.Val, "."); dotIdx >= 0 {
-				frac := strings.TrimRight(lit.Val[dotIdx+1:], "")
-				prec := len(frac)
-				if prec > 0 {
-					attrs.colType = fmt.Sprintf("time(%d)", prec)
-					attrs.defaultVal = fmt.Sprintf("00:00:00.%s", strings.Repeat("0", prec))
-				} else {
-					attrs.defaultVal = "00:00:00"
-				}
-			} else {
-				attrs.defaultVal = "00:00:00"
-			}
-		case sqlparser.TimestampVal:
-			// TIMESTAMP literals in CREATE TABLE AS SELECT: NOT NULL, no default.
-			// Also handle fractional precision.
-			attrs.nullable = false
-			if dotIdx := strings.LastIndex(lit.Val, "."); dotIdx >= 0 {
-				frac := strings.TrimRight(lit.Val[dotIdx+1:], "")
-				prec := len(frac)
-				if prec > 0 {
-					attrs.colType = fmt.Sprintf("datetime(%d)", prec)
-				}
-			}
-		}
 	}
 	// For arithmetic expressions involving hex/integer literals, MySQL uses NOT NULL with DEFAULT 0
 	if _, isBin := expr.(*sqlparser.BinaryExpr); isBin {
