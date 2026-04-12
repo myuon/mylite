@@ -1949,7 +1949,14 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	if len(stmt.From) > 0 {
 		joinUsingCols = extractJoinUsingCols(stmt.From[0])
 	}
-	colNames, colExprs, err := e.resolveSelectExprs(stmt.SelectExprs.Exprs, allRows, joinUsingCols, selectTableDefs...)
+	// For column name resolution in SELECT *, use preWhereRows when allRows is empty
+	// and no tableDefs are available (e.g. derived tables like FROM (SELECT ...) AS d1).
+	// This ensures column headers are emitted even for empty result sets.
+	rowsForColResolution := allRows
+	if len(allRows) == 0 && len(preWhereRows) > 0 && (len(selectTableDefs) == 0 || selectTableDefs[0] == nil) {
+		rowsForColResolution = preWhereRows
+	}
+	colNames, colExprs, err := e.resolveSelectExprs(stmt.SelectExprs.Exprs, rowsForColResolution, joinUsingCols, selectTableDefs...)
 	if err != nil {
 		return nil, err
 	}

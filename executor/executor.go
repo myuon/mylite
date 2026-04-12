@@ -4631,7 +4631,37 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 		// Check if this SELECT has subqueries, derived tables, etc.
 		if e.queryHasComplexParts(s) {
 			canFlatten := e.queryCanBeSemijoinFlattened(s)
-			if canFlatten {
+			if canFlatten && e.outerQueryHasOnlyDerivedTables(s) && e.isOptimizerSwitchEnabled("firstmatch") {
+				// FirstMatch semijoin strategy: when the outer FROM has only derived tables
+				// and firstmatch=on, MySQL uses PRIMARY selectType with inline FirstMatch()
+				// rather than the MATERIALIZED/SIMPLE pattern.
+				// e.g. SELECT * FROM (SELECT * FROM t1) AS d1 WHERE d1.c1 IN (SELECT c1 FROM t2)
+				// → id=1 PRIMARY <derived2>, id=1 PRIMARY t2 (FirstMatch(<derived2>)), id=2 DERIVED t1
+				result = e.explainSelect(s, &idCounter, "PRIMARY")
+				// Find the DERIVED row id for the FirstMatch() reference string.
+				var derivedFirstMatchID int64
+				for _, r := range result {
+					if r.selectType == "DERIVED" {
+						if id, ok := r.id.(int64); ok {
+							derivedFirstMatchID = id
+						}
+						break
+					}
+				}
+				// Convert MATERIALIZED rows to PRIMARY with FirstMatch() in Extra.
+				for i := range result {
+					if result[i].selectType == "MATERIALIZED" {
+						result[i].selectType = "PRIMARY"
+						result[i].id = int64(1)
+						firstMatchStr := fmt.Sprintf("FirstMatch(<derived%d>)", derivedFirstMatchID)
+						if result[i].extra == nil {
+							result[i].extra = firstMatchStr
+						} else {
+							result[i].extra = fmt.Sprintf("%v; %v", result[i].extra, firstMatchStr)
+						}
+					}
+				}
+			} else if canFlatten {
 				// MySQL flattens IN/NOT EXISTS subqueries into semi-join / anti-join.
 				// With materialization=on, IN subqueries appear as:
 				//   id=1 SIMPLE outer_table
@@ -5155,6 +5185,37 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 		} else {
 			// Simple query
 			result = e.explainSelect(s, &idCounter, "SIMPLE")
+			// Detect "Impossible WHERE noticed after reading const tables":
+			// When all tables in the result have const/system access type AND
+			// there are multiple tables (JOIN) AND the actual SELECT returns 0 rows,
+			// MySQL collapses to a single "Impossible WHERE noticed after reading const tables" row.
+			// This occurs when constant folding after const-table resolution reveals
+			// that the WHERE condition is always false (e.g., LEFT JOIN with IS NULL + non-null check).
+			if len(result) > 1 && s.Where != nil {
+				allConst := true
+				for _, r := range result {
+					at := fmt.Sprintf("%v", r.accessType)
+					if at != "const" && at != "system" {
+						allConst = false
+						break
+					}
+				}
+				if allConst {
+					// Execute the SELECT to check if it returns 0 rows
+					actualResult, execErr := e.execSelect(s)
+					if execErr == nil && actualResult != nil && len(actualResult.Rows) == 0 {
+						result = []explainSelectType{{
+							id:         int64(1),
+							selectType: "SIMPLE",
+							table:      nil,
+							extra:      "Impossible WHERE noticed after reading const tables",
+							rows:       nil,
+							filtered:   nil,
+							accessType: nil,
+						}}
+					}
+				}
+			}
 		}
 	case *sqlparser.Update:
 		// EXPLAIN UPDATE: first table gets select_type="UPDATE", subsequent tables get "SIMPLE".
@@ -7398,7 +7459,13 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 				} else if (correlated || innerHasNoSemijoin) && !existsCanDecorrelate {
 					selectType = "DEPENDENT SUBQUERY"
 				} else if inContext || existsCanDecorrelate {
-					if e.isSemijoinEnabled() && outerCanSemijoin {
+					if inContext && outerSelectTypeOuter == "DEPENDENT SUBQUERY" && e.isSemijoinEnabled() {
+						// IN subquery inside a DEPENDENT SUBQUERY context: MySQL uses FirstMatch
+						// within the dependent context (the inner table is transitively dependent).
+						// Don't use MATERIALIZED here — produce a DEPENDENT SUBQUERY row merged
+						// at the outer id level instead of a new MATERIALIZED subquery.
+						selectType = "DEPENDENT SUBQUERY"
+					} else if e.isSemijoinEnabled() && outerCanSemijoin {
 						bigTables := false
 						if v, ok := e.getSysVar("big_tables"); ok && strings.EqualFold(v, "on") {
 							bigTables = true
@@ -7457,16 +7524,16 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 									}
 								}
 								// Determine whether to use MATERIALIZED strategy:
-								// - For constant IN (e.g. "11 IN (subquery)"): always MATERIALIZED
-								//   when no outer range on the lookup col (which is always true for const).
+								// - For constant IN (e.g. "11 IN (subquery)"): MySQL uses FirstMatch
+								//   strategy (const lookup on semijoin result), so selectType stays SIMPLE.
 								// - For column IN (e.g. "col IN (subquery)"):
 								//   - firstmatch=off: always MATERIALIZED (no FirstMatch available)
 								//   - firstmatch=on: only MATERIALIZED when outer doesn't have a
 								//     bounded range on the same col (if outer also has same range,
 								//     FirstMatch via ref access is cheaper than materialization)
 								if outerINIsConst {
-									// Constant IN: materialize (outerAlsoHasRange is always false for const)
-									selectType = "MATERIALIZED"
+									// Constant IN: MySQL uses FirstMatch, not MATERIALIZED.
+									// selectType stays as semijoin-flattened SIMPLE.
 								} else if !firstMatchOn {
 									// firstmatch=off + column IN: always MATERIALIZED
 									selectType = "MATERIALIZED"
@@ -7597,9 +7664,18 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 						*result = append(*result, ph)
 					}
 					subQueryID := *idCounter
+					// When the IN subquery is inside a DEPENDENT SUBQUERY context and treated as
+					// transitively dependent (selectType = "DEPENDENT SUBQUERY" from the merged-level
+					// path above), MySQL merges its tables into the outer subquery's id level rather
+					// than creating a new subquery id. Use outerIDBeforeIncrement instead.
+					mergedDependent := selectType == "DEPENDENT SUBQUERY" && outerSelectTypeOuter == "DEPENDENT SUBQUERY" && inContext
 					subRows := e.explainSelect(inner, idCounter, selectType)
 					if len(subRows) > 0 {
-						subRows[0].id = subQueryID
+						if mergedDependent {
+							subRows[0].id = outerIDBeforeIncrement
+						} else {
+							subRows[0].id = subQueryID
+						}
 					}
 					*result = append(*result, subRows...)
 				}
