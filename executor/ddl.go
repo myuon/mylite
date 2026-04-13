@@ -3883,6 +3883,31 @@ func (e *Executor) inferColumnAttrs(selectSQL, colName string) columnAttrs {
 		attrs.colType = e.inferColumnType(selectSQL, colName)
 		return attrs
 	}
+	// Build source table definitions for column type lookups (same as inferColumnTypeFromSelect)
+	var srcTableDefs []*catalog.TableDef
+	for _, from := range sel.From {
+		ate, ok2 := from.(*sqlparser.AliasedTableExpr)
+		if !ok2 {
+			continue
+		}
+		tn, ok2 := ate.Expr.(sqlparser.TableName)
+		if !ok2 {
+			continue
+		}
+		srcDB := e.CurrentDB
+		if !tn.Qualifier.IsEmpty() {
+			srcDB = tn.Qualifier.String()
+		}
+		db, dbErr := e.Catalog.GetDatabase(srcDB)
+		if dbErr != nil {
+			continue
+		}
+		tblDef, tblErr := db.GetTable(tn.Name.String())
+		if tblErr != nil {
+			continue
+		}
+		srcTableDefs = append(srcTableDefs, tblDef)
+	}
 	// Find the expression for colName
 	for _, expr := range sel.SelectExprs.Exprs {
 		ae, ok := expr.(*sqlparser.AliasedExpr)
@@ -3914,7 +3939,52 @@ func (e *Executor) inferColumnAttrs(selectSQL, colName string) columnAttrs {
 				}
 			}
 		}
-		// Found the expression — get full attrs
+		// Found the expression — check for bitwise op on BINARY/VARBINARY columns first
+		if binExpr, ok2 := ae.Expr.(*sqlparser.BinaryExpr); ok2 {
+			isBitOp := binExpr.Operator == sqlparser.BitAndOp ||
+				binExpr.Operator == sqlparser.BitOrOp ||
+				binExpr.Operator == sqlparser.BitXorOp ||
+				binExpr.Operator == sqlparser.ShiftLeftOp ||
+				binExpr.Operator == sqlparser.ShiftRightOp
+			if isBitOp {
+				getBinaryWidth := func(expr sqlparser.Expr) (bool, int) {
+					if colRef, ok3 := expr.(*sqlparser.ColName); ok3 {
+						t := ""
+						for _, tblDef := range srcTableDefs {
+							for _, col := range tblDef.Columns {
+								if strings.EqualFold(col.Name, colRef.Name.String()) {
+									t = col.Type
+									break
+								}
+							}
+						}
+						lower := strings.ToLower(t)
+						if strings.Contains(lower, "binary") {
+							width := 0
+							if n, err := fmt.Sscanf(lower, "varbinary(%d)", &width); n == 1 && err == nil {
+								return true, width
+							}
+							if n, err := fmt.Sscanf(lower, "binary(%d)", &width); n == 1 && err == nil {
+								return true, width
+							}
+							return true, 0
+						}
+					}
+					return false, 0
+				}
+				leftIsBin, leftW := getBinaryWidth(binExpr.Left)
+				rightIsBin, rightW := getBinaryWidth(binExpr.Right)
+				if leftIsBin || rightIsBin {
+					w := leftW
+					if rightW > w {
+						w = rightW
+					}
+					colType := fmt.Sprintf("varbinary(%d)", w)
+					return columnAttrs{colType: colType, nullable: true}
+				}
+			}
+		}
+		// Get full attrs
 		a := e.inferExprAttrs(ae.Expr)
 		if a.colType == "" {
 			a.colType = e.inferColumnTypeFromSelect(sel, colName)
@@ -4032,6 +4102,47 @@ func (e *Executor) inferColumnTypeFromSelect(sel *sqlparser.Select, colName stri
 					}
 				}
 			}
+		case *sqlparser.BinaryExpr:
+			// For bitwise ops (&, |, ^, <<, >>), if either operand is BINARY/VARBINARY,
+			// the result type in MySQL is VARBINARY with the operand's width.
+			isBitOp := ex.Operator == sqlparser.BitAndOp ||
+				ex.Operator == sqlparser.BitOrOp ||
+				ex.Operator == sqlparser.BitXorOp ||
+				ex.Operator == sqlparser.ShiftLeftOp ||
+				ex.Operator == sqlparser.ShiftRightOp
+			if isBitOp {
+				getBinaryWidth := func(expr sqlparser.Expr) (string, int) {
+					if colRef, ok2 := expr.(*sqlparser.ColName); ok2 {
+						t := findColType(colRef.Name.String())
+						lower := strings.ToLower(t)
+						if strings.Contains(lower, "binary") {
+							// Extract width: varbinary(N) or binary(N)
+							width := 0
+							if n, err := fmt.Sscanf(lower, "varbinary(%d)", &width); n == 1 && err == nil {
+								return "varbinary", width
+							}
+							if n, err := fmt.Sscanf(lower, "binary(%d)", &width); n == 1 && err == nil {
+								return "binary", width
+							}
+							return "binary", 0
+						}
+					}
+					return "", 0
+				}
+				leftKind, leftWidth := getBinaryWidth(ex.Left)
+				rightKind, rightWidth := getBinaryWidth(ex.Right)
+				if leftKind != "" || rightKind != "" {
+					// At least one operand is BINARY/VARBINARY → result is VARBINARY
+					width := leftWidth
+					if rightWidth > width {
+						width = rightWidth
+					}
+					if width > 0 {
+						return fmt.Sprintf("varbinary(%d)", width)
+					}
+					return "varbinary(16)"
+				}
+			}
 		}
 	}
 
@@ -4062,6 +4173,41 @@ func (e *Executor) inferColumnTypeFromSelect(sel *sqlparser.Select, colName stri
 				normalizedColName := normalizeCharsetIntroducersForMatch(colName)
 				if !strings.EqualFold(exprStr, normalizedColName) {
 					continue
+				}
+			}
+		}
+		// For bitwise ops (&, |, ^, <<, >>) on BINARY/VARBINARY columns, MySQL returns VARBINARY.
+		if binExpr, ok2 := ae.Expr.(*sqlparser.BinaryExpr); ok2 {
+			isBitOp := binExpr.Operator == sqlparser.BitAndOp ||
+				binExpr.Operator == sqlparser.BitOrOp ||
+				binExpr.Operator == sqlparser.BitXorOp ||
+				binExpr.Operator == sqlparser.ShiftLeftOp ||
+				binExpr.Operator == sqlparser.ShiftRightOp
+			if isBitOp {
+				getBinaryWidth := func(expr sqlparser.Expr) int {
+					if colRef, ok3 := expr.(*sqlparser.ColName); ok3 {
+						t := findColType(colRef.Name.String())
+						lower := strings.ToLower(t)
+						if strings.Contains(lower, "binary") {
+							width := 0
+							if n, err := fmt.Sscanf(lower, "varbinary(%d)", &width); n == 1 && err == nil {
+								return width
+							}
+							if n, err := fmt.Sscanf(lower, "binary(%d)", &width); n == 1 && err == nil {
+								return width
+							}
+						}
+					}
+					return 0
+				}
+				leftW := getBinaryWidth(binExpr.Left)
+				rightW := getBinaryWidth(binExpr.Right)
+				if leftW > 0 || rightW > 0 {
+					w := leftW
+					if rightW > w {
+						w = rightW
+					}
+					return fmt.Sprintf("varbinary(%d)", w)
 				}
 			}
 		}

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/hex"
 	"fmt"
 	"math"
 	"math/rand"
@@ -477,6 +478,24 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		}
 		if isNull {
 			return nil, true, nil
+		}
+		// For HexBytes (BINARY/VARBINARY), count bits across all bytes
+		if hb, ok := bcVal.(HexBytes); ok {
+			hexStr := string(hb)
+			if len(hexStr)%2 != 0 {
+				hexStr = "0" + hexStr
+			}
+			decoded, decErr := hex.DecodeString(hexStr)
+			if decErr == nil {
+				bcCount := int64(0)
+				for _, b := range decoded {
+					for b != 0 {
+						bcCount += int64(b & 1)
+						b >>= 1
+					}
+				}
+				return bcCount, true, nil
+			}
 		}
 		bcU := uint64(toInt64(bcVal))
 		bcCount := int64(0)

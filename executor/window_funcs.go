@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/hex"
 	"fmt"
 	"math"
 	"sort"
@@ -203,9 +204,44 @@ func findWindowFuncs(colExprs []sqlparser.Expr) []windowFuncInfo {
 				expr:       expr,
 				overClause: oc,
 			})
+		} else if containsWindowFunc(expr) {
+			// Expression wraps a window function (e.g., HEX(BIT_OR(b) OVER w))
+			// Find the inner OVER clause for window specification
+			innerOC := findInnerOverClause(expr)
+			if innerOC != nil {
+				result = append(result, windowFuncInfo{
+					colIdx:     i,
+					expr:       expr,
+					overClause: innerOC,
+				})
+			}
 		}
 	}
 	return result
+}
+
+// findInnerOverClause finds the first OVER clause in a nested expression tree.
+func findInnerOverClause(expr sqlparser.Expr) *sqlparser.OverClause {
+	if oc := getOverClause(expr); oc != nil {
+		return oc
+	}
+	switch v := expr.(type) {
+	case *sqlparser.FuncExpr:
+		for _, arg := range v.Exprs {
+			// FuncExpr.Exprs is []Expr (not SelectExprs)
+			if oc := findInnerOverClause(arg); oc != nil {
+				return oc
+			}
+		}
+	case *sqlparser.BinaryExpr:
+		if oc := findInnerOverClause(v.Left); oc != nil {
+			return oc
+		}
+		return findInnerOverClause(v.Right)
+	case *sqlparser.UnaryExpr:
+		return findInnerOverClause(v.Expr)
+	}
+	return nil
 }
 
 // partitionKey computes a partition key string for a row given PARTITION BY expressions.
@@ -433,6 +469,12 @@ func (e *Executor) processWindowFunctionsWithNamedWindows(
 			return err
 		}
 	}
+
+	// MySQL outputs rows in PARTITION BY + ORDER BY order of the window function.
+	// Apply the global sort to resultRows to match MySQL's output order.
+	// Use the first window function's spec that has an ORDER BY (and optionally PARTITION BY).
+	e.applyWindowOutputSort(winFuncs, allRows, resultRows)
+
 	return nil
 }
 
@@ -473,6 +515,87 @@ func (e *Executor) computeWindowFunc(wf windowFuncInfo, allRows []storage.Row, r
 	}
 
 	return nil
+}
+
+// applyWindowOutputSort sorts resultRows (and allRows) by the PARTITION BY + ORDER BY
+// of the first window function that has an ORDER BY clause. This matches MySQL's behavior
+// of outputting rows in window ORDER BY order when no outer ORDER BY is present.
+func (e *Executor) applyWindowOutputSort(winFuncs []windowFuncInfo, allRows []storage.Row, resultRows [][]interface{}) {
+	if len(allRows) == 0 {
+		return
+	}
+	// Find first window spec with ORDER BY
+	var ws *sqlparser.WindowSpecification
+	for _, wf := range winFuncs {
+		if wf.overClause != nil && wf.overClause.WindowSpec != nil {
+			spec := wf.overClause.WindowSpec
+			if len(spec.OrderClause) > 0 {
+				ws = spec
+				break
+			}
+		}
+	}
+	if ws == nil {
+		return
+	}
+
+	n := len(allRows)
+	indices := make([]int, n)
+	for i := range indices {
+		indices[i] = i
+	}
+
+	// Sort by PARTITION BY keys first, then ORDER BY
+	sort.SliceStable(indices, func(a, b int) bool {
+		rowA := allRows[indices[a]]
+		rowB := allRows[indices[b]]
+		// Compare PARTITION BY columns first
+		for _, p := range ws.PartitionClause {
+			va, _ := e.evalRowExpr(p, rowA)
+			vb, _ := e.evalRowExpr(p, rowB)
+			cmp := windowCompareValues(va, vb)
+			if cmp != 0 {
+				return cmp < 0
+			}
+		}
+		// Then ORDER BY
+		for _, o := range ws.OrderClause {
+			va, _ := e.evalRowExpr(o.Expr, rowA)
+			vb, _ := e.evalRowExpr(o.Expr, rowB)
+			cmp := windowCompareValues(va, vb)
+			if cmp == 0 {
+				continue
+			}
+			asc := o.Direction == sqlparser.AscOrder || o.Direction == 0
+			if asc {
+				return cmp < 0
+			}
+			return cmp > 0
+		}
+		return false
+	})
+
+	// Check if already sorted (no-op if in order)
+	sorted := true
+	for i, idx := range indices {
+		if idx != i {
+			sorted = false
+			break
+		}
+	}
+	if sorted {
+		return
+	}
+
+	// Apply permutation to allRows and resultRows in-place
+	newAllRows := make([]storage.Row, n)
+	newResultRows := make([][]interface{}, n)
+	for i, idx := range indices {
+		newAllRows[i] = allRows[idx]
+		newResultRows[i] = resultRows[idx]
+	}
+	copy(allRows, newAllRows)
+	copy(resultRows, newResultRows)
 }
 
 type partition struct {
@@ -756,7 +879,8 @@ func (e *Executor) evalWindowFuncForRow(
 			return sumI64, nil
 		}
 		// Otherwise return float/decimal
-		return fmt.Sprintf("%.1f", sum), nil
+		// For DOUBLE, MySQL displays whole-number results as integers (e.g. 0, 1, 2, not 0.0, 1.0, 2.0)
+		return formatWindowSumFloat(sum), nil
 
 	case *sqlparser.Avg:
 		start, end := e.computeFrameBounds(ws.FrameClause, ws.OrderClause, partRows, localIdx, orderByVals)
@@ -986,6 +1110,50 @@ func (e *Executor) evalWindowFuncForRow(
 		if end >= n {
 			end = n - 1
 		}
+		// Use binary mode if the argument is a BINARY/VARBINARY column
+		if e.isBinaryExpr(v.Arg) {
+			binaryWidthAnd := 0
+			for i := 0; i < n; i++ {
+				val, _ := e.evalRowExpr(v.Arg, partRows[i])
+				if b, ok := toBinaryBytesForBitOp(val); ok {
+					binaryWidthAnd = len(b)
+					break
+				}
+			}
+			if binaryWidthAnd == 0 {
+				binaryWidthAnd = e.getBinaryColumnWidth(v.Arg)
+			}
+			if binaryWidthAnd > 0 {
+				resultBytes := make([]byte, binaryWidthAnd)
+				// Initialize all bits to 1 for AND operation
+				for j := range resultBytes {
+					resultBytes[j] = 0xFF
+				}
+				hasValue := false
+				for i := start; i <= end; i++ {
+					val, _ := e.evalRowExpr(v.Arg, partRows[i])
+					if val == nil {
+						continue
+					}
+					b, ok := toBinaryBytesForBitOp(val)
+					if !ok || len(b) != binaryWidthAnd {
+						continue
+					}
+					for j := range resultBytes {
+						resultBytes[j] &= b[j]
+					}
+					hasValue = true
+				}
+				if !hasValue {
+					// All NULL frame: return zero bytes for BIT_AND (MySQL returns 0xFF... for empty BIT_AND)
+					// Wait - for all-NULL frame, BIT_AND returns the init value (all FF)?
+					// Actually MySQL returns 18446744073709551615 (all FF) for BIT_AND over empty set.
+					// For VARBINARY, it should be all FF bytes.
+					return HexBytes(strings.Repeat("FF", binaryWidthAnd)), nil
+				}
+				return HexBytes(strings.ToUpper(hex.EncodeToString(resultBytes))), nil
+			}
+		}
 		result := ^uint64(0) // 18446744073709551615 (all bits set)
 		hasValue := false
 		for i := start; i <= end; i++ {
@@ -1008,6 +1176,38 @@ func (e *Executor) evalWindowFuncForRow(
 		if end >= n {
 			end = n - 1
 		}
+		// Use binary mode if the argument is a BINARY/VARBINARY column
+		if e.isBinaryExpr(v.Arg) {
+			// Determine width from first non-NULL value in partition, or from schema
+			binaryWidth := 0
+			for i := 0; i < n; i++ {
+				val, _ := e.evalRowExpr(v.Arg, partRows[i])
+				if b, ok := toBinaryBytesForBitOp(val); ok {
+					binaryWidth = len(b)
+					break
+				}
+			}
+			if binaryWidth == 0 {
+				binaryWidth = e.getBinaryColumnWidth(v.Arg)
+			}
+			if binaryWidth > 0 {
+				resultBytes := make([]byte, binaryWidth)
+				for i := start; i <= end; i++ {
+					val, _ := e.evalRowExpr(v.Arg, partRows[i])
+					if val == nil {
+						continue
+					}
+					b, ok := toBinaryBytesForBitOp(val)
+					if !ok || len(b) != binaryWidth {
+						continue
+					}
+					for j := range resultBytes {
+						resultBytes[j] |= b[j]
+					}
+				}
+				return HexBytes(strings.ToUpper(hex.EncodeToString(resultBytes))), nil
+			}
+		}
 		result := uint64(0)
 		for i := start; i <= end; i++ {
 			val, _ := e.evalRowExpr(v.Arg, partRows[i])
@@ -1025,6 +1225,37 @@ func (e *Executor) evalWindowFuncForRow(
 		if end >= n {
 			end = n - 1
 		}
+		// Use binary mode if the argument is a BINARY/VARBINARY column
+		if e.isBinaryExpr(v.Arg) {
+			binaryWidthXor := 0
+			for i := 0; i < n; i++ {
+				val, _ := e.evalRowExpr(v.Arg, partRows[i])
+				if b, ok := toBinaryBytesForBitOp(val); ok {
+					binaryWidthXor = len(b)
+					break
+				}
+			}
+			if binaryWidthXor == 0 {
+				binaryWidthXor = e.getBinaryColumnWidth(v.Arg)
+			}
+			if binaryWidthXor > 0 {
+				resultBytes := make([]byte, binaryWidthXor)
+				for i := start; i <= end; i++ {
+					val, _ := e.evalRowExpr(v.Arg, partRows[i])
+					if val == nil {
+						continue
+					}
+					b, ok := toBinaryBytesForBitOp(val)
+					if !ok || len(b) != binaryWidthXor {
+						continue
+					}
+					for j := range resultBytes {
+						resultBytes[j] ^= b[j]
+					}
+				}
+				return HexBytes(strings.ToUpper(hex.EncodeToString(resultBytes))), nil
+			}
+		}
 		result := uint64(0)
 		for i := start; i <= end; i++ {
 			val, _ := e.evalRowExpr(v.Arg, partRows[i])
@@ -1035,7 +1266,80 @@ func (e *Executor) evalWindowFuncForRow(
 		return result, nil
 	}
 
+	// Handle FuncExpr (or BinaryExpr etc.) that wraps a window function
+	// e.g., HEX(BIT_OR(b) OVER w), ~(BIT_XOR(c) OVER w), etc.
+	// Strategy: build a synthetic row with the inner window function values
+	// substituted by pre-computing them, then evalRowExpr on the outer expression.
+	if containsWindowFunc(expr) {
+		// Evaluate the expression with inner window functions substituted
+		val, err := e.evalWindowFuncExprSubstitute(expr, ws, partRows, localIdx, orderByVals)
+		if err != nil {
+			return nil, err
+		}
+		return val, nil
+	}
+
 	return nil, nil
+}
+
+// evalWindowFuncExprSubstitute evaluates an expression that contains window functions
+// by substituting inner window function values computed for the current row/frame.
+func (e *Executor) evalWindowFuncExprSubstitute(
+	expr sqlparser.Expr,
+	ws *sqlparser.WindowSpecification,
+	partRows []storage.Row,
+	localIdx int,
+	orderByVals [][]interface{},
+) (interface{}, error) {
+	switch v := expr.(type) {
+	case *sqlparser.FuncExpr:
+		// Handle single-argument functions wrapping a window func (e.g., HEX(BIT_OR(b) OVER w))
+		if len(v.Exprs) == 1 && containsWindowFunc(v.Exprs[0]) {
+			innerVal, err := e.evalWindowFuncForRow(v.Exprs[0], ws, partRows, localIdx, orderByVals)
+			if err != nil {
+				return nil, err
+			}
+			return e.applyFuncToVal(v.Name.Lowered(), innerVal, partRows[localIdx])
+		}
+	}
+	return e.evalRowExpr(expr, partRows[localIdx])
+}
+
+// applyFuncToVal applies a single-argument function to a pre-computed value.
+func (e *Executor) applyFuncToVal(funcName string, val interface{}, row storage.Row) (interface{}, error) {
+	switch funcName {
+	case "hex":
+		switch tv := val.(type) {
+		case int64:
+			return strings.ToUpper(fmt.Sprintf("%X", uint64(tv))), nil
+		case uint64:
+			return strings.ToUpper(fmt.Sprintf("%X", tv)), nil
+		case float64:
+			return strings.ToUpper(fmt.Sprintf("%X", uint64(int64(tv)))), nil
+		case HexBytes:
+			return strings.ToUpper(string(tv)), nil
+		default:
+			s := fmt.Sprintf("%v", val)
+			var hexResult strings.Builder
+			for _, b := range []byte(s) {
+				hexResult.WriteString(fmt.Sprintf("%02X", b))
+			}
+			return hexResult.String(), nil
+		}
+	}
+	// For other functions, fall back to evalRowExpr
+	return e.evalRowExpr(&sqlparser.FuncExpr{}, row)
+}
+
+// formatWindowSumFloat formats a float64 SUM result for display.
+// MySQL displays whole-number DOUBLE results as integers (0, not 0.0).
+func formatWindowSumFloat(v float64) interface{} {
+	if v == math.Trunc(v) && !math.IsInf(v, 0) && !math.IsNaN(v) {
+		if v >= 0 && v <= float64(^uint64(0)) {
+			return int64(v)
+		}
+	}
+	return fmt.Sprintf("%.1f", v)
 }
 
 // windowCompareOrderByVals compares two sets of ORDER BY values taking direction into account.
@@ -1084,6 +1388,12 @@ func windowToFloat64(val interface{}) float64 {
 		return f
 	case uint64:
 		return float64(v)
+	case ScaledValue:
+		return v.Value
+	case DivisionResult:
+		return v.Value
+	case AvgResult:
+		return v.Value
 	}
 	return 0
 }
@@ -1170,6 +1480,12 @@ func windowToFloat64Force(val interface{}) float64 {
 		var f float64
 		fmt.Sscanf(string(v), "%f", &f)
 		return f
+	case ScaledValue:
+		return v.Value
+	case DivisionResult:
+		return v.Value
+	case AvgResult:
+		return v.Value
 	}
 	return math.NaN()
 }

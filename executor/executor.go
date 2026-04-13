@@ -14319,6 +14319,24 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 	switch val := v.(type) {
 	case int64:
 		intVal = val
+	case HexBytes:
+		// x'...' hex literal inserted into integer column: convert big-endian bytes to integer
+		decoded, err := hex.DecodeString(string(val))
+		if err != nil || len(decoded) == 0 {
+			intVal = 0
+		} else {
+			var uval uint64
+			for _, b := range decoded {
+				uval = uval<<8 | uint64(b)
+			}
+			if isUnsigned {
+				if uval > maxUnsigned {
+					return int64(maxUnsigned)
+				}
+				return int64(uval)
+			}
+			intVal = int64(uval)
+		}
 	case ScaledValue:
 		f := val.Value
 		if isUnsigned {
@@ -17253,8 +17271,25 @@ func (e *Executor) isBinaryExpr(expr sqlparser.Expr) bool {
 			}
 		}
 	case *sqlparser.FuncExpr:
-		// Functions like UPPER/LOWER inherit the binary-ness of their argument
-		// but we don't recurse here to avoid infinite loops
+		// Functions that always return VARBINARY data (raw bytes)
+		name := strings.ToLower(ex.Name.String())
+		switch name {
+		case "inet6_aton", "inet_aton", "uuid_to_bin", "st_aswkb", "st_asgeowkb",
+			"st_asbinary", "from_base64", "weight_string", "to_binary":
+			return true
+		}
+		// Functions that inherit binary-ness from their argument (e.g. UNHEX returns VARBINARY)
+		switch name {
+		case "unhex":
+			return true
+		case "substr", "substring", "left", "right", "mid", "concat", "concat_ws":
+			// Return binary if any argument is binary
+			for _, se := range ex.Exprs {
+				if e.isBinaryExpr(se) {
+					return true
+				}
+			}
+		}
 	}
 	return false
 }
@@ -17289,6 +17324,109 @@ func (e *Executor) isColumnBinary(tableName, colName string) bool {
 		}
 	}
 	return false
+}
+
+// isSpatialExpr checks if an expression references a spatial/geometry column (POINT, GEOMETRY, etc.)
+// Spatial types are not valid in bitwise operations and raise error 1210.
+func (e *Executor) isSpatialExpr(expr sqlparser.Expr) bool {
+	colName, ok := expr.(*sqlparser.ColName)
+	if !ok {
+		return false
+	}
+	name := colName.Name.String()
+	tableName := ""
+	if !colName.Qualifier.Name.IsEmpty() {
+		tableName = colName.Qualifier.Name.String()
+	}
+	if e.CurrentDB == "" {
+		return false
+	}
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return false
+	}
+	var tables []string
+	if tableName != "" {
+		tables = []string{tableName}
+	} else {
+		tables = db.ListTables()
+	}
+	spatialTypes := map[string]bool{
+		"point": true, "linestring": true, "polygon": true, "geometry": true,
+		"multipoint": true, "multilinestring": true, "multipolygon": true, "geometrycollection": true,
+		"geomcollection": true,
+	}
+	for _, tbl := range tables {
+		tDef, _ := db.GetTable(tbl)
+		if tDef == nil {
+			continue
+		}
+		for _, col := range tDef.Columns {
+			if strings.EqualFold(col.Name, name) {
+				lower := strings.ToLower(strings.Fields(col.Type)[0]) // get base type
+				if spatialTypes[lower] {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// getBinaryColumnWidth returns the byte width of a BINARY/VARBINARY column from schema.
+// Returns 0 if the column type cannot be determined.
+func (e *Executor) getBinaryColumnWidth(expr sqlparser.Expr) int {
+	colName, ok := expr.(*sqlparser.ColName)
+	if !ok {
+		return 0
+	}
+	name := colName.Name.String()
+	tableName := ""
+	if !colName.Qualifier.Name.IsEmpty() {
+		tableName = colName.Qualifier.Name.String()
+	}
+	if e.CurrentDB == "" {
+		return 0
+	}
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return 0
+	}
+	var tables []string
+	if tableName != "" {
+		tables = []string{tableName}
+	} else {
+		tables = db.ListTables()
+	}
+	for _, tbl := range tables {
+		tDef, _ := db.GetTable(tbl)
+		if tDef == nil {
+			continue
+		}
+		for _, col := range tDef.Columns {
+			if strings.EqualFold(col.Name, name) {
+				return extractBinaryColumnWidth(col.Type)
+			}
+		}
+	}
+	return 0
+}
+
+// extractBinaryColumnWidth extracts the byte width from a BINARY/VARBINARY column type string.
+func extractBinaryColumnWidth(colType string) int {
+	lower := strings.ToLower(strings.TrimSpace(colType))
+	if strings.HasPrefix(lower, "binary(") || strings.HasPrefix(lower, "varbinary(") {
+		// Extract number from e.g. "varbinary(8)" or "binary(6)"
+		start := strings.Index(lower, "(")
+		end := strings.Index(lower, ")")
+		if start >= 0 && end > start {
+			n, err := strconv.Atoi(strings.TrimSpace(lower[start+1 : end]))
+			if err == nil {
+				return n
+			}
+		}
+	}
+	return 0
 }
 
 // mysqlYearWeek implements MySQL's YEARWEEK(date, mode) function.
@@ -19591,15 +19729,43 @@ func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator, di
 		}
 		return mod, nil
 	case sqlparser.ShiftLeftOp:
+		leftBytes, leftIsBinary := toBinaryBytesForBitOp(left)
+		if leftIsBinary {
+			n := toUint64ForBitOp(right)
+			return binaryShiftLeft(leftBytes, n), nil
+		}
 		return toUint64ForBitOp(left) << toUint64ForBitOp(right), nil
 	case sqlparser.ShiftRightOp:
+		leftBytes, leftIsBinary := toBinaryBytesForBitOp(left)
+		if leftIsBinary {
+			n := toUint64ForBitOp(right)
+			return binaryShiftRight(leftBytes, n), nil
+		}
 		return toUint64ForBitOp(left) >> toUint64ForBitOp(right), nil
 	case sqlparser.BitAndOp:
-		return toUint64ForBitOp(left) & toUint64ForBitOp(right), nil
+		leftBytes, leftIsBinary := toBinaryBytesForBitOp(left)
+		rightBytes, rightIsBinary := toBinaryBytesForBitOp(right)
+		if leftIsBinary && rightIsBinary {
+			// Both sides are binary: byte-wise operation
+			return binaryBitwiseAnd(leftBytes, rightBytes)
+		}
+		// When only one side is binary (mixed mode), MySQL uses integer arithmetic
+		// where the binary side is converted as a string → integer (truncated to 0 for non-numeric binary data).
+		return toUint64ForBitOpAsBinaryString(left, leftBytes, leftIsBinary) & toUint64ForBitOpAsBinaryString(right, rightBytes, rightIsBinary), nil
 	case sqlparser.BitOrOp:
-		return toUint64ForBitOp(left) | toUint64ForBitOp(right), nil
+		leftBytes, leftIsBinary := toBinaryBytesForBitOp(left)
+		rightBytes, rightIsBinary := toBinaryBytesForBitOp(right)
+		if leftIsBinary && rightIsBinary {
+			return binaryBitwiseOr(leftBytes, rightBytes)
+		}
+		return toUint64ForBitOpAsBinaryString(left, leftBytes, leftIsBinary) | toUint64ForBitOpAsBinaryString(right, rightBytes, rightIsBinary), nil
 	case sqlparser.BitXorOp:
-		return toUint64ForBitOp(left) ^ toUint64ForBitOp(right), nil
+		leftBytes, leftIsBinary := toBinaryBytesForBitOp(left)
+		rightBytes, rightIsBinary := toBinaryBytesForBitOp(right)
+		if leftIsBinary && rightIsBinary {
+			return binaryBitwiseXor(leftBytes, rightBytes)
+		}
+		return toUint64ForBitOpAsBinaryString(left, leftBytes, leftIsBinary) ^ toUint64ForBitOpAsBinaryString(right, rightBytes, rightIsBinary), nil
 	default:
 		return nil, fmt.Errorf("unsupported binary operator: %v", op)
 	}
@@ -19636,6 +19802,141 @@ func hexDecodeString(s string) (string, error) {
 		return "", err
 	}
 	return string(b), nil
+}
+
+// toBinaryBytesForBitOp extracts raw bytes from a value if it should be treated as
+// a binary string for bitwise operations. Returns (bytes, true) if binary, or (nil, false) if not.
+// A value is "binary" if it is:
+//   - HexBytes (from x'...' hex literal or stored in BINARY/VARBINARY column)
+//   - string with non-printable/null bytes (raw binary data from _binary introducer or stored binary)
+//
+// Pure integer/float values are NOT binary.
+func toBinaryBytesForBitOp(v interface{}) ([]byte, bool) {
+	switch n := v.(type) {
+	case HexBytes:
+		// x'...' literal or BINARY/VARBINARY column value: hex digits string, decode to raw bytes
+		hexStr := string(n)
+		if len(hexStr)%2 != 0 {
+			hexStr = "0" + hexStr
+		}
+		decoded, err := hex.DecodeString(hexStr)
+		if err != nil {
+			return nil, false
+		}
+		return decoded, true
+	}
+	return nil, false
+}
+
+// binaryBitwiseAnd performs byte-wise AND on two binary byte slices of equal length.
+// Returns error if lengths differ.
+func binaryBitwiseAnd(left, right []byte) (string, error) {
+	if len(left) != len(right) {
+		return "", mysqlError(3513, "HY000", "Binary operands of bitwise operators must be of equal length")
+	}
+	result := make([]byte, len(left))
+	for i := range left {
+		result[i] = left[i] & right[i]
+	}
+	return string(result), nil
+}
+
+// binaryBitwiseOr performs byte-wise OR on two binary byte slices of equal length.
+func binaryBitwiseOr(left, right []byte) (string, error) {
+	if len(left) != len(right) {
+		return "", mysqlError(3513, "HY000", "Binary operands of bitwise operators must be of equal length")
+	}
+	result := make([]byte, len(left))
+	for i := range left {
+		result[i] = left[i] | right[i]
+	}
+	return string(result), nil
+}
+
+// binaryBitwiseXor performs byte-wise XOR on two binary byte slices of equal length.
+func binaryBitwiseXor(left, right []byte) (string, error) {
+	if len(left) != len(right) {
+		return "", mysqlError(3513, "HY000", "Binary operands of bitwise operators must be of equal length")
+	}
+	result := make([]byte, len(left))
+	for i := range left {
+		result[i] = left[i] ^ right[i]
+	}
+	return string(result), nil
+}
+
+// binaryBitwiseNot performs byte-wise NOT (flip all bits) on a binary byte slice.
+func binaryBitwiseNot(b []byte) string {
+	result := make([]byte, len(b))
+	for i := range b {
+		result[i] = ^b[i]
+	}
+	return string(result)
+}
+
+// binaryShiftLeft shifts a binary byte slice left by n bits, returning the same-length result.
+func binaryShiftLeft(b []byte, n uint64) string {
+	if len(b) == 0 {
+		return ""
+	}
+	byteShift := int(n / 8)
+	bitShift := uint(n % 8)
+	result := make([]byte, len(b))
+	if byteShift >= len(b) {
+		return string(result) // all zeros
+	}
+	for i := 0; i < len(b)-byteShift; i++ {
+		result[i] = b[i+byteShift] << bitShift
+		if bitShift > 0 && i+byteShift+1 < len(b) {
+			result[i] |= b[i+byteShift+1] >> (8 - bitShift)
+		}
+	}
+	return string(result)
+}
+
+// toBinaryBytesFromInt converts a uint64 integer to a big-endian byte slice of the given length.
+// Used when one operand is binary and the other is an integer in a binary bitwise op.
+func toBinaryBytesFromInt(v uint64, length int) []byte {
+	if length <= 0 {
+		length = 8
+	}
+	buf := make([]byte, 8)
+	buf[0] = byte(v >> 56)
+	buf[1] = byte(v >> 48)
+	buf[2] = byte(v >> 40)
+	buf[3] = byte(v >> 32)
+	buf[4] = byte(v >> 24)
+	buf[5] = byte(v >> 16)
+	buf[6] = byte(v >> 8)
+	buf[7] = byte(v)
+	if length >= 8 {
+		// Right-align 8 bytes within longer buffer
+		result := make([]byte, length)
+		copy(result[length-8:], buf)
+		return result
+	}
+	// Take rightmost 'length' bytes
+	return buf[8-length:]
+}
+
+// binaryShiftRight shifts a binary byte slice right by n bits, returning the same-length result.
+func binaryShiftRight(b []byte, n uint64) string {
+	if len(b) == 0 {
+		return ""
+	}
+	byteShift := int(n / 8)
+	bitShift := uint(n % 8)
+	result := make([]byte, len(b))
+	if byteShift >= len(b) {
+		return string(result) // all zeros
+	}
+	for i := len(b) - 1; i >= byteShift; i-- {
+		result[i] = b[i-byteShift] >> bitShift
+		if bitShift > 0 && i-byteShift-1 >= 0 {
+			result[i] |= b[i-byteShift-1] << (8 - bitShift)
+		}
+	}
+	return string(result)
 }
 
 // toUint64ForBitOp converts a value to uint64 for bitwise operations,
@@ -20028,6 +20329,25 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			v.Operator == sqlparser.BitXorOp || v.Operator == sqlparser.ShiftLeftOp ||
 			v.Operator == sqlparser.ShiftRightOp
 		isPlusMinusRow := v.Operator == sqlparser.PlusOp || v.Operator == sqlparser.MinusOp
+		// Check for spatial type columns in bit operations - MySQL raises 1210 (Incorrect arguments)
+		if isBitOpRow {
+			opName := ""
+			switch v.Operator {
+			case sqlparser.BitOrOp:
+				opName = "|"
+			case sqlparser.BitAndOp:
+				opName = "&"
+			case sqlparser.BitXorOp:
+				opName = "^"
+			case sqlparser.ShiftLeftOp:
+				opName = "<<"
+			case sqlparser.ShiftRightOp:
+				opName = ">>"
+			}
+			if e.isSpatialExpr(v.Left) || e.isSpatialExpr(v.Right) {
+				return nil, mysqlError(1210, "HY000", fmt.Sprintf("Incorrect arguments to %s", opName))
+			}
+		}
 		// Determine if sub-expressions are integer literals that may overflow
 		leftIsIntLit := isIntValLiteral(v.Left)
 		rightIsIntLit := isIntValLiteral(v.Right)
@@ -20041,6 +20361,14 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				leftOvRow = oe
 				if isBitOpRow && oe.kind == "DECIMAL" {
 					left = int64(math.MaxInt64)
+				} else if isBitOpRow && oe.kind == "BINARY" {
+					// Large hex literal (0x...) overflow in a bit op: treat as binary bytes
+					hexStr := oe.val
+					if len(hexStr)%2 != 0 {
+						hexStr = "0" + hexStr
+					}
+					left = HexBytes(hexStr)
+					leftOvRow = nil // Don't emit overflow warning for binary case
 				} else {
 					left = uint64(math.MaxUint64)
 				}
@@ -20048,6 +20376,27 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				left = uint64(math.MaxUint64)
 			} else {
 				return nil, err
+			}
+		}
+		// When a HexNum literal overflows uint64, the default: case in evalRowExpr returns
+		// the hex digit string (oe.val) without error. Detect this and convert to HexBytes
+		// for correct binary byte-wise operations.
+		if isBitOpRow && leftIsHexLit && err == nil {
+			if s, ok := left.(string); ok {
+				hexStr := s
+				if len(hexStr)%2 != 0 {
+					hexStr = "0" + hexStr
+				}
+				if _, decErr := hex.DecodeString(hexStr); decErr == nil {
+					left = HexBytes(hexStr)
+				}
+			}
+		}
+		// If left is from a VARBINARY/BINARY column, the storage returns raw bytes as a string.
+		// Convert to HexBytes so bitwise ops treat it as binary, not an integer.
+		if isBitOpRow && err == nil && e.isBinaryExpr(v.Left) {
+			if s, ok := left.(string); ok {
+				left = HexBytes(strings.ToUpper(hex.EncodeToString([]byte(s))))
 			}
 		}
 		right, err := e.evalRowExpr(v.Right, row)
@@ -20058,6 +20407,14 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				rightOvRow = oe
 				if isBitOpRow && oe.kind == "DECIMAL" {
 					right = int64(math.MaxInt64)
+				} else if isBitOpRow && oe.kind == "BINARY" {
+					// Large hex literal (0x...) overflow in a bit op: treat as binary bytes
+					hexStr := oe.val
+					if len(hexStr)%2 != 0 {
+						hexStr = "0" + hexStr
+					}
+					right = HexBytes(hexStr)
+					rightOvRow = nil // Don't emit overflow warning for binary case
 				} else {
 					right = uint64(math.MaxUint64)
 				}
@@ -20065,6 +20422,27 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				right = uint64(math.MaxUint64)
 			} else {
 				return nil, err
+			}
+		}
+		// When a HexNum literal overflows uint64, the default: case in evalRowExpr returns
+		// the hex digit string (oe.val) without error. Detect this and convert to HexBytes
+		// for correct binary byte-wise operations.
+		if isBitOpRow && rightIsHexLit && err == nil {
+			if s, ok := right.(string); ok {
+				hexStr := s
+				if len(hexStr)%2 != 0 {
+					hexStr = "0" + hexStr
+				}
+				if _, decErr := hex.DecodeString(hexStr); decErr == nil {
+					right = HexBytes(hexStr)
+				}
+			}
+		}
+		// If right is from a VARBINARY/BINARY column, the storage returns raw bytes as a string.
+		// Convert to HexBytes so bitwise ops treat it as binary, not an integer.
+		if isBitOpRow && err == nil && e.isBinaryExpr(v.Right) {
+			if s, ok := right.(string); ok {
+				right = HexBytes(strings.ToUpper(hex.EncodeToString([]byte(s))))
 			}
 		}
 		if leftOvRow != nil {
@@ -20785,6 +21163,23 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		if err != nil {
 			return nil, err
 		}
+		if v.Operator == sqlparser.TildaOp {
+			// ~ is bitwise NOT
+			if val == nil {
+				return nil, nil // ~NULL = NULL
+			}
+			// If value is from a VARBINARY/BINARY column, convert raw bytes to HexBytes first
+			if e.isBinaryExpr(v.Expr) {
+				if s, ok := val.(string); ok {
+					val = HexBytes(strings.ToUpper(hex.EncodeToString([]byte(s))))
+				}
+			}
+			// If value is a binary string (HexBytes or raw binary), do byte-wise NOT
+			if binaryBytes, isBinary := toBinaryBytesForBitOp(val); isBinary {
+				return binaryBitwiseNot(binaryBytes), nil
+			}
+			return ^toUint64ForBitOp(val), nil
+		}
 		if v.Operator == sqlparser.BangOp {
 			// ! is logical NOT (deprecated alias in MySQL 8.0)
 			if val == nil {
@@ -20953,6 +21348,16 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		if err != nil {
 			var oe *intOverflowError
 			if errors.As(err, &oe) {
+				if oe.kind == "BINARY" {
+					// Large hex literal (0x...) overflow: return as HexBytes so that
+					// comparisons with HexBytes results (e.g. from VARBINARY bitwise ops)
+					// and other binary-aware code paths work correctly.
+					hexStr := oe.val
+					if len(hexStr)%2 != 0 {
+						hexStr = "0" + hexStr
+					}
+					return HexBytes(strings.ToUpper(hexStr)), nil
+				}
 				// Preserve the original integer literal text so comparisons can
 				// use exact bigint semantics instead of float64-rounded max uint.
 				return oe.val, nil
@@ -22008,6 +22413,29 @@ func isNativeNumericType(v interface{}) bool {
 	return false
 }
 
+// isNumericString returns true if s is parseable as a decimal or floating-point number.
+// Used to distinguish numeric strings (e.g. DECIMAL column "123.45") from raw binary byte strings.
+func isNumericString(s string) bool {
+	if s == "" {
+		return false
+	}
+	_, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	return err == nil
+}
+
+// toUint64ForBitOpAsBinaryString converts a value to uint64 for integer-mode bitwise operations.
+// When the value is binary (HexBytes from BINARY/VARBINARY column), MySQL converts the raw bytes
+// as a string to integer (i.e., treats the bytes as text, resulting in 0 for non-numeric binary data).
+// This mirrors MySQL's mixed-mode behavior: BINARY_col | INTEGER → integer arithmetic.
+func toUint64ForBitOpAsBinaryString(v interface{}, bytes []byte, isBinary bool) uint64 {
+	if isBinary {
+		// Binary side in mixed mode: treat raw bytes as string for integer conversion
+		rawStr := string(bytes)
+		return toUint64ForBitOp(rawStr)
+	}
+	return toUint64ForBitOp(v)
+}
+
 func numericEqualForComparison(ls, rs string, origLeft, origRight interface{}) bool {
 	if li, okL := parseStrictBigInt(ls); okL {
 		if ri, okR := parseStrictBigInt(rs); okR {
@@ -22157,6 +22585,13 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 				left = decoded
 				right = hexIntToBytes(right)
 			}
+		} else if _, ok2 := right.(string); ok2 {
+			// HexBytes vs string (e.g. raw binary from VARBINARY bitwise op result vs HexBytes from 0x overflow)
+			// Decode HexBytes to raw bytes for comparison with the raw byte string
+			decoded, err := hexDecodeString(string(hb))
+			if err == nil {
+				left = decoded
+			}
 		}
 	} else if hb, ok := right.(HexBytes); ok {
 		if isNativeNumericType(left) {
@@ -22164,6 +22599,12 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 			if err == nil {
 				right = decoded
 				left = hexIntToBytes(left)
+			}
+		} else if _, ok2 := left.(string); ok2 {
+			// HexBytes vs string (e.g. raw binary from VARBINARY bitwise op result vs HexBytes from 0x overflow)
+			decoded, err := hexDecodeString(string(hb))
+			if err == nil {
+				right = decoded
 			}
 		}
 	}

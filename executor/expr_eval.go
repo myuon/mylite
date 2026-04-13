@@ -551,6 +551,17 @@ func (e *Executor) evalUnaryExpr(v *sqlparser.UnaryExpr) (interface{}, error) {
 			return "-" + n, nil
 		}
 	}
+	if v.Operator == sqlparser.TildaOp {
+		// ~ is bitwise NOT
+		if val == nil {
+			return nil, nil // ~NULL = NULL
+		}
+		// If value is a binary string (HexBytes or raw binary), do byte-wise NOT
+		if binaryBytes, isBinary := toBinaryBytesForBitOp(val); isBinary {
+			return binaryBitwiseNot(binaryBytes), nil
+		}
+		return ^toUint64ForBitOp(val), nil
+	}
 	if v.Operator == sqlparser.BangOp {
 		// ! is logical NOT (deprecated alias in MySQL 8.0)
 		if val == nil {
@@ -695,9 +706,18 @@ func (e *Executor) evalBinaryOp(v *sqlparser.BinaryExpr) (interface{}, error) {
 		if errors.As(err, &oe) {
 			leftOverflow = oe
 			// DECIMAL overflow in bitwise ops clamps to MaxInt64 (MySQL uses signed context for DECIMAL).
-			// BINARY/INTEGER overflow in bitwise ops clamps to MaxUint64.
+			// BINARY overflow (large hex literal 0x...) in bitwise ops: treat as binary byte string.
+			// INTEGER overflow in bitwise ops clamps to MaxUint64.
 			if isBitOp && oe.kind == "DECIMAL" {
 				left = int64(math.MaxInt64)
+			} else if isBitOp && oe.kind == "BINARY" {
+				// Large hex literal overflow in bit op: treat as binary bytes
+				hexStr := oe.val
+				if len(hexStr)%2 != 0 {
+					hexStr = "0" + hexStr
+				}
+				left = HexBytes(hexStr)
+				leftOverflow = nil // Don't emit overflow warning for binary case
 			} else {
 				left = uint64(math.MaxUint64)
 			}
@@ -718,6 +738,14 @@ func (e *Executor) evalBinaryOp(v *sqlparser.BinaryExpr) (interface{}, error) {
 			rightOverflow = oe
 			if isBitOp && oe.kind == "DECIMAL" {
 				right = int64(math.MaxInt64)
+			} else if isBitOp && oe.kind == "BINARY" {
+				// Large hex literal overflow in bit op: treat as binary bytes
+				hexStr := oe.val
+				if len(hexStr)%2 != 0 {
+					hexStr = "0" + hexStr
+				}
+				right = HexBytes(hexStr)
+				rightOverflow = nil // Don't emit overflow warning for binary case
 			} else {
 				right = uint64(math.MaxUint64)
 			}
@@ -1446,6 +1474,9 @@ func (e *Executor) evalIntroducerExpr(v *sqlparser.IntroducerExpr) (interface{},
 		cs := strings.ToLower(strings.TrimPrefix(v.CharacterSet, "_"))
 		// Decode charset-encoded bytes to Go string (UTF-8)
 		switch cs {
+		case "binary":
+			// _binary introducer: return as HexBytes so that bitwise ops treat it as binary
+			return HexBytes(strings.ToUpper(hex.EncodeToString(bs))), nil
 		case "utf32":
 			// UTF-32 big-endian: each 4 bytes is a codepoint
 			// MySQL left-pads short hex values to a multiple of 4 bytes

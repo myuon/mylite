@@ -375,8 +375,13 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 		case int64:
 			// Use unsigned format to avoid negative hex output for large values
 			return strings.ToUpper(fmt.Sprintf("%X", uint64(tv))), true, nil
+		case uint64:
+			return strings.ToUpper(fmt.Sprintf("%X", tv)), true, nil
 		case float64:
 			return strings.ToUpper(fmt.Sprintf("%X", uint64(int64(tv)))), true, nil
+		case HexBytes:
+			// HexBytes stores hex digits; return them uppercased as-is
+			return strings.ToUpper(string(tv)), true, nil
 		default:
 			s := toString(val)
 			return strings.ToUpper(hex.EncodeToString([]byte(s))), true, nil
