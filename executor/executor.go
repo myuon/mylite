@@ -11807,23 +11807,18 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 				dbName = tn.Qualifier.String()
 			}
 			fullName := dbName + "." + tblName
-			_, isSelect := s.Rows.(*sqlparser.Select)
-			_, isUnion := s.Rows.(*sqlparser.Union)
 			if dbObj, dbErr := e.Catalog.GetDatabase(dbName); dbErr == nil {
 				if tblDef, tblErr := dbObj.GetTable(tblName); tblErr == nil && tblDef != nil {
 					eng := strings.ToUpper(tblDef.Engine)
 					// Only track for non-InnoDB, non-MEMORY engines.
 					// InnoDB always returns "OK" from ANALYZE TABLE regardless.
 					if eng != "" && eng != "INNODB" && eng != "MEMORY" && eng != "HEAP" {
-						if !(isSelect || isUnion) {
-							// VALUES-based insert: mark table as needing optimize.
-							if e.tableNeedsOptimize == nil {
-								e.tableNeedsOptimize = map[string]bool{}
-							}
-							e.tableNeedsOptimize[fullName] = true
+						// Mark table as needing optimize for all insert types
+						// (VALUES-based, INSERT SELECT, INSERT UNION, etc.)
+						if e.tableNeedsOptimize == nil {
+							e.tableNeedsOptimize = map[string]bool{}
 						}
-						// All inserts (including INSERT SELECT) clear the analyzed flag
-						// since data has changed and stats may be stale.
+						e.tableNeedsOptimize[fullName] = true
 					}
 				}
 			}

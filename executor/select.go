@@ -52,6 +52,17 @@ func (e *Executor) collectTableDefsWithAliases(expr sqlparser.TableExpr) ([]*cat
 					}
 				}
 			}
+			// Check CTE map: build a synthetic TableDef from CTE column names.
+			if e.cteMap != nil {
+				if cteTbl, ok := e.cteMap[strings.ToLower(tblName)]; ok && len(cteTbl.columns) > 0 {
+					cols := make([]catalog.ColumnDef, len(cteTbl.columns))
+					for i, c := range cteTbl.columns {
+						cols[i] = catalog.ColumnDef{Name: c}
+					}
+					syntheticDef := &catalog.TableDef{Name: tblName, Columns: cols}
+					return []*catalog.TableDef{syntheticDef}, []string{alias}
+				}
+			}
 		}
 	case *sqlparser.JoinTableExpr:
 		leftDefs, leftAliases := e.collectTableDefsWithAliases(te.LeftExpr)
@@ -4758,15 +4769,26 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					}
 				}
 			} else {
-				// Empty result set: try to resolve column names from the query's FROM table
-				// by looking up known info schema / performance schema column orders.
+				// Empty result set: try to resolve column names from the query's FROM table.
 				tableName := e.extractStarTableName(se, exprs)
 				if tableName != "" {
 					lowerTable := strings.ToLower(tableName)
-					if order, ok := infoSchemaColumnOrder[lowerTable]; ok {
-						for _, colName := range order {
-							cols = append(cols, colName)
-							colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(colName)})
+					// First, check CTE map for column info.
+					if e.cteMap != nil {
+						if cteTbl, ok := e.cteMap[lowerTable]; ok && len(cteTbl.columns) > 0 {
+							for _, colName := range cteTbl.columns {
+								cols = append(cols, colName)
+								colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(colName)})
+							}
+						}
+					}
+					// Fall back to info schema / performance schema column orders.
+					if len(cols) == 0 {
+						if order, ok := infoSchemaColumnOrder[lowerTable]; ok {
+							for _, colName := range order {
+								cols = append(cols, colName)
+								colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(colName)})
+							}
 						}
 					}
 				}
