@@ -24545,6 +24545,24 @@ func charsetEncoder(charset string) *encoding.Encoder {
 		return japanese.ShiftJIS.NewEncoder()
 	case "ujis":
 		return japanese.EUCJP.NewEncoder()
+	case "latin1":
+		// MySQL treats latin1 as cp1252 (Windows-1252) for unicode conversions.
+		// See WL-1494: "Treat latin1 as cp1252 for unicode conversion"
+		return charmap.Windows1252.NewEncoder()
+	case "latin2":
+		return charmap.ISO8859_2.NewEncoder()
+	case "cp1250":
+		return charmap.Windows1250.NewEncoder()
+	case "cp1251":
+		return charmap.Windows1251.NewEncoder()
+	case "cp1252":
+		return charmap.Windows1252.NewEncoder()
+	case "koi8r":
+		return charmap.KOI8R.NewEncoder()
+	case "hebrew":
+		return charmap.ISO8859_8.NewEncoder()
+	case "greek":
+		return charmap.ISO8859_7.NewEncoder()
 	default:
 		return nil
 	}
@@ -24559,14 +24577,54 @@ func charsetDecoder(charset string) *encoding.Decoder {
 	case "hebrew":
 		return charmap.ISO8859_8.NewDecoder()
 	case "latin1":
-		return charmap.ISO8859_1.NewDecoder()
+		// MySQL treats latin1 as cp1252 (Windows-1252) for unicode conversions.
+		// See WL-1494: "Treat latin1 as cp1252 for unicode conversion"
+		return charmap.Windows1252.NewDecoder()
 	case "greek":
 		return charmap.ISO8859_7.NewDecoder()
 	case "latin2":
 		return charmap.ISO8859_2.NewDecoder()
+	case "cp1250":
+		return charmap.Windows1250.NewDecoder()
+	case "cp1251":
+		return charmap.Windows1251.NewDecoder()
+	case "cp1252":
+		return charmap.Windows1252.NewDecoder()
+	case "koi8r":
+		return charmap.KOI8R.NewDecoder()
 	default:
 		return nil
 	}
+}
+
+// decodeFromCharset decodes a string from the given charset into UTF-8.
+// If the charset is utf8/empty or no decoder is available, returns s unchanged.
+func decodeFromCharset(s, charset string) (string, error) {
+	cs := canonicalCharset(charset)
+	if cs == "utf8" || cs == "" {
+		return s, nil
+	}
+	if cs == "ascii" {
+		// Strip bytes > 127
+		var buf []byte
+		for i := 0; i < len(s); i++ {
+			if s[i] <= 127 {
+				buf = append(buf, s[i])
+			} else {
+				buf = append(buf, '?')
+			}
+		}
+		return string(buf), nil
+	}
+	dec := charsetDecoder(cs)
+	if dec == nil {
+		return s, nil
+	}
+	decoded, _, err := transform.String(dec, s)
+	if err != nil {
+		return s, err
+	}
+	return decoded, nil
 }
 
 func roundTripCharset(s, charset string) (string, error) {
@@ -24637,8 +24695,30 @@ func convertThroughCharset(s, charset string) (string, error) {
 		}
 		decoded = strings.ReplaceAll(decoded, "\x1a", "?")
 		return decoded, nil
+	case "ascii":
+		// Strip bytes > 127; input is UTF-8 so just pass through ASCII codepoints
+		var buf []byte
+		for _, r := range s {
+			if r <= 127 {
+				buf = append(buf, byte(r))
+			} else {
+				buf = append(buf, '?')
+			}
+		}
+		return string(buf), nil
 	default:
-		return s, nil
+		// Handle 8-bit charsets: encode UTF-8 string into target charset bytes,
+		// then round-trip back through the decoder so the Go string holds the
+		// raw single-byte representation that MySQL wire protocol expects.
+		enc := charsetEncoder(cs)
+		if enc == nil {
+			return s, nil
+		}
+		encoded, err := encoding.ReplaceUnsupported(enc).Bytes([]byte(s))
+		if err != nil {
+			return s, err
+		}
+		return string(encoded), nil
 	}
 }
 

@@ -1695,6 +1695,26 @@ func (e *Executor) evalConvertUsingExpr(v *sqlparser.ConvertUsingExpr) (interfac
 	sourceCharset := ""
 	if cn, ok := v.Expr.(*sqlparser.ColName); ok {
 		sourceCharset = strings.ToLower(e.getColumnCharset(cn))
+	} else if intro, ok := v.Expr.(*sqlparser.IntroducerExpr); ok {
+		// e.g. CONVERT(_latin1'string' USING utf8) — source charset from introducer
+		sourceCharset = strings.ToLower(strings.TrimPrefix(intro.CharacterSet, "_"))
+	}
+	// Determine effective source charset: column charset > connection charset > utf8
+	effectiveSource := canonicalCharset(sourceCharset)
+	if effectiveSource == "" {
+		effectiveSource = connCharset
+	}
+	if effectiveSource == "" {
+		effectiveSource = "utf8"
+	}
+	targetCS := canonicalCharset(target)
+	// If source and target differ, decode source bytes to UTF-8 first,
+	// then encode to target charset.
+	if effectiveSource != "utf8" && effectiveSource != targetCS {
+		if decoded, decErr := decodeFromCharset(out, effectiveSource); decErr == nil {
+			out = decoded
+			orig = decoded
+		}
 	}
 	if converted, convErr := convertThroughCharset(out, target); convErr == nil {
 		out = converted
