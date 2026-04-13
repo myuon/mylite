@@ -11669,36 +11669,49 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 		// Handle SHOW GRANTS (vitess parser may fail on some variants)
 		if strings.HasPrefix(upper, "SHOW GRANTS") {
-			grantUser := "root"
-			grantHost := "localhost"
+			// Resolve current session user (default root)
+			sessionUser := "root"
+			sessionHost := "localhost"
+			if cu, ok := e.userVars["__current_user"]; ok {
+				if cuStr, ok2 := cu.(string); ok2 && cuStr != "" {
+					if atIdx := strings.Index(cuStr, "@"); atIdx >= 0 {
+						sessionUser = cuStr[:atIdx]
+						sessionHost = cuStr[atIdx+1:]
+					} else {
+						sessionUser = cuStr
+					}
+				}
+			}
+
+			grantUser := sessionUser
+			grantHost := sessionHost
 			// Parse "SHOW GRANTS FOR user@host" or "SHOW GRANTS FOR 'user'@'host'"
 			if forIdx := strings.Index(upper, " FOR "); forIdx >= 0 {
 				forPart := strings.TrimSpace(trimmed[forIdx+5:])
 				forPart = strings.TrimRight(forPart, ";")
-				if atIdx := strings.LastIndex(forPart, "@"); atIdx >= 0 {
+				// Strip USING clause
+				if usingIdx := strings.Index(strings.ToUpper(forPart), " USING "); usingIdx >= 0 {
+					forPart = strings.TrimSpace(forPart[:usingIdx])
+				}
+				// Check for CURRENT_USER() or CURRENT_USER
+				forUpper := strings.ToUpper(strings.TrimSpace(forPart))
+				if forUpper == "CURRENT_USER()" || forUpper == "CURRENT_USER" {
+					// Already resolved from session user above
+				} else if atIdx := strings.LastIndex(forPart, "@"); atIdx >= 0 {
 					grantUser = strings.Trim(strings.TrimSpace(forPart[:atIdx]), "'`\"")
 					grantHost = strings.Trim(strings.TrimSpace(forPart[atIdx+1:]), "'`\"")
 				} else {
 					grantUser = strings.Trim(strings.TrimSpace(forPart), "'`\"")
 				}
 			}
-			grantRows := [][]interface{}{
-				{fmt.Sprintf("GRANT USAGE ON *.* TO `%s`@`%s`", grantUser, grantHost)},
-			}
-			// Check if any database grants exist for this user
-			if e.Catalog != nil {
-				for _, dbName := range e.Catalog.ListDatabases() {
-					if !strings.EqualFold(dbName, "information_schema") && !strings.EqualFold(dbName, "performance_schema") &&
-						!strings.EqualFold(dbName, "mysql") && !strings.EqualFold(dbName, "sys") {
-						grantRows = append(grantRows, []interface{}{
-							fmt.Sprintf("GRANT ALL PRIVILEGES ON `%s`.* TO `%s`@`%s`", dbName, grantUser, grantHost),
-						})
-					}
-				}
-			}
-			if grantUser == "root" {
+			var grantRows [][]interface{}
+			if strings.EqualFold(grantUser, "root") {
 				grantRows = [][]interface{}{
-					{"GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' WITH GRANT OPTION"},
+					{fmt.Sprintf("GRANT ALL PRIVILEGES ON *.* TO `%s`@`%s` WITH GRANT OPTION", grantUser, grantHost)},
+				}
+			} else {
+				grantRows = [][]interface{}{
+					{fmt.Sprintf("GRANT USAGE ON *.* TO `%s`@`%s`", grantUser, grantHost)},
 				}
 			}
 			return &Result{
@@ -13263,13 +13276,51 @@ func coerceDateTimeValue(colType string, v interface{}, truncateFractional bool)
 		}
 		return s
 	case "DATETIME":
+		// For numeric types, left-pad to standard length before parsing.
+		// For strings, parseMySQLDateValue will right-pad non-standard digit lengths.
+		datetimeInput := s
+		switch v.(type) {
+		case int64, float64, uint64:
+			// All-digit string from numeric: left-pad to nearest standard length
+			isAllDigits := true
+			for _, c := range datetimeInput {
+				if c < '0' || c > '9' {
+					isAllDigits = false
+					break
+				}
+			}
+			if isAllDigits {
+				n := len(datetimeInput)
+				if n > 0 && n != 6 && n != 8 && n != 12 && n != 14 {
+					var targetLen int
+					if n <= 5 {
+						targetLen = 6
+					} else if n <= 11 {
+						targetLen = 12
+					} else if n == 13 {
+						targetLen = 14
+					}
+					if targetLen > 0 {
+						datetimeInput = strings.Repeat("0", targetLen-n) + datetimeInput
+					}
+				}
+			}
+		}
 		// Try parsing various date formats
-		parsed := parseMySQLDateValue(s)
+		parsed := parseMySQLDateValue(datetimeInput)
 		if parsed != "" {
-			timePart := extractTimePart(v, s)
+			timePart := extractTimePart(v, datetimeInput)
 			if timePart != "" {
 				// Normalize time separator chars to ':'
 				timePart = normalizeDateTimeSeparators(timePart)
+				// Convert all-digit HHMMSS to HH:MM:SS format
+				timePart = normalizeDigitTimePart(timePart)
+				// Validate time components (HH:MM:SS must be valid)
+				if isInvalidTimePart(timePart) {
+					return "0000-00-00 00:00:00"
+				}
+				// Strip any trailing content after HH:MM:SS[.frac]
+				timePart = trimTimeTrailer(timePart)
 				result := parsed + " " + timePart
 				// Apply DATETIME(N) fractional seconds precision if specified
 				if datetimeFsp >= 0 {
@@ -13305,8 +13356,8 @@ func applyDatetimePrecision(datetimeStr string, fsp int, truncate bool) string {
 func extractTimePart(v interface{}, parsedDate string) string {
 	origS := fmt.Sprintf("%v", v)
 
-	// Check for space-separated time part (e.g., "98-12-31 11:30:45")
-	if idx := strings.Index(origS, " "); idx >= 0 {
+	// Check for space or T-separated time part (e.g., "98-12-31 11:30:45" or "2001-01-01T01:01:01")
+	if idx := strings.IndexAny(origS, " T"); idx >= 0 {
 		timePart := strings.TrimSpace(origS[idx+1:])
 		if timePart != "" {
 			return timePart
@@ -13843,7 +13894,7 @@ func parseMySQLDateValue(s string) string {
 		return dateStr
 	}
 
-	// Try flexible YYYY-M-D format (non-zero-padded)
+	// Try flexible YYYY-M-D format (non-zero-padded), also handles T-separator
 	if m := flexDateRe.FindStringSubmatch(s); m != nil {
 		y, _ := strconv.Atoi(m[1])
 		mo, _ := strconv.Atoi(m[2])
@@ -13853,9 +13904,9 @@ func parseMySQLDateValue(s string) string {
 		}
 	}
 
-	// Strip time part for datetime strings
+	// Strip time part for datetime strings (space or T separator)
 	datePart := s
-	if idx := strings.Index(s, " "); idx >= 0 {
+	if idx := strings.IndexAny(s, " T"); idx >= 0 {
 		datePart = s[:idx]
 	}
 
@@ -13868,6 +13919,28 @@ func parseMySQLDateValue(s string) string {
 		}
 	}
 	if isAllDigits {
+		// For non-standard lengths, right-pad (for string inputs) to nearest standard length:
+		// 1-5 digits -> 6 (YYMMDD), 7-11 digits -> 12 (YYMMDDHHMMSS), 13 digits -> 14 (YYYYMMDDHHMMSS)
+		// Note: standard lengths (6, 8, 12, 14) are handled directly.
+		n := len(datePart)
+		if n > 0 && n != 6 && n != 8 && n != 12 && n != 14 {
+			var targetLen int
+			if n <= 5 {
+				targetLen = 6
+			} else if n <= 11 {
+				targetLen = 12
+			} else if n == 13 {
+				targetLen = 14
+			}
+			if targetLen > 0 {
+				// Right-pad with zeros
+				padded := datePart + strings.Repeat("0", targetLen-n)
+				datePart = padded
+			} else {
+				// Length > 14: invalid
+				return ""
+			}
+		}
 		switch len(datePart) {
 		case 8: // YYYYMMDD
 			y, _ := strconv.Atoi(datePart[:4])
@@ -13931,6 +14004,10 @@ func parseMySQLDateValue(s string) string {
 
 // isValidDate checks if a date is valid (or is the zero date 0000-00-00).
 func isValidDate(y, m, d int) bool {
+	// Year must be in MySQL range 0-9999
+	if y < 0 || y > 9999 {
+		return false
+	}
 	// Zero date is always valid
 	if y == 0 && m == 0 && d == 0 {
 		return true
@@ -14194,6 +14271,74 @@ func normalizeDateTimeSeparators(s string) string {
 		}
 	}
 	return result.String()
+}
+
+// normalizeDigitTimePart converts a 6-digit all-digit time string "HHMMSS" to "HH:MM:SS".
+// If the string already contains colons or is not 6 digits, it is returned as-is.
+func normalizeDigitTimePart(s string) string {
+	if len(s) != 6 {
+		return s
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return s
+		}
+	}
+	return s[0:2] + ":" + s[2:4] + ":" + s[4:6]
+}
+
+// isInvalidTimePart checks if a time string like "HH:MM:SS" has out-of-range components.
+// Returns true if hours >= 24, minutes >= 60, or seconds >= 60.
+func isInvalidTimePart(s string) bool {
+	// Find HH:MM:SS portion
+	parts := strings.SplitN(s, ":", 3)
+	if len(parts) < 3 {
+		return false
+	}
+	// Strip trailing content from seconds (e.g., fractional, spaces)
+	secStr := parts[2]
+	if idx := strings.IndexAny(secStr, ". \t"); idx >= 0 {
+		secStr = secStr[:idx]
+	}
+	h, errH := strconv.Atoi(strings.TrimSpace(parts[0]))
+	m, errM := strconv.Atoi(strings.TrimSpace(parts[1]))
+	sec, errS := strconv.Atoi(strings.TrimSpace(secStr))
+	if errH != nil || errM != nil || errS != nil {
+		return false
+	}
+	return h >= 24 || m >= 60 || sec >= 60
+}
+
+// trimTimeTrailer trims any trailing non-time content after HH:MM:SS[.frac].
+// For example, "00:00:00 some trailer" -> "00:00:00".
+func trimTimeTrailer(s string) string {
+	// Accept HH:MM:SS or HH:MM:SS.frac, drop anything after that
+	if len(s) < 8 {
+		return s
+	}
+	// Must have at least two colons
+	first := strings.Index(s, ":")
+	if first < 0 {
+		return s
+	}
+	second := strings.Index(s[first+1:], ":")
+	if second < 0 {
+		return s
+	}
+	secStart := first + 1 + second + 1
+	// Find end of seconds (digits and optional . + digits)
+	end := secStart
+	for end < len(s) && (s[end] >= '0' && s[end] <= '9') {
+		end++
+	}
+	// Allow fractional seconds
+	if end < len(s) && s[end] == '.' {
+		end++
+		for end < len(s) && (s[end] >= '0' && s[end] <= '9') {
+			end++
+		}
+	}
+	return s[:end]
 }
 
 // looksLikeDate checks if a string looks like a date value (contains date separators).

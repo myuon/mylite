@@ -923,35 +923,50 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		}, nil
 	}
 
-	// SHOW GRANTS [FOR user@host]
+	// SHOW GRANTS [FOR user@host [USING role,...]]
 	if strings.HasPrefix(upper, "SHOW GRANTS") {
-		grantUser := "root"
-		grantHost := "localhost"
+		// Resolve current session user (default root)
+		sessionUser := "root"
+		sessionHost := "localhost"
+		if cu, ok := e.userVars["__current_user"]; ok {
+			if cuStr, ok2 := cu.(string); ok2 && cuStr != "" {
+				if atIdx := strings.Index(cuStr, "@"); atIdx >= 0 {
+					sessionUser = cuStr[:atIdx]
+					sessionHost = cuStr[atIdx+1:]
+				} else {
+					sessionUser = cuStr
+				}
+			}
+		}
+
+		grantUser := sessionUser
+		grantHost := sessionHost
 		if forIdx := strings.Index(upper, " FOR "); forIdx >= 0 {
 			forPart := strings.TrimSpace(query[forIdx+5:])
 			forPart = strings.TrimRight(forPart, ";")
-			if atIdx := strings.LastIndex(forPart, "@"); atIdx >= 0 {
+			// Strip USING clause: "SHOW GRANTS FOR user USING role"
+			if usingIdx := strings.Index(strings.ToUpper(forPart), " USING "); usingIdx >= 0 {
+				forPart = strings.TrimSpace(forPart[:usingIdx])
+			}
+			// Check for CURRENT_USER() or CURRENT_USER
+			forUpper := strings.ToUpper(strings.TrimSpace(forPart))
+			if forUpper == "CURRENT_USER()" || forUpper == "CURRENT_USER" {
+				// Already resolved from session user above
+			} else if atIdx := strings.LastIndex(forPart, "@"); atIdx >= 0 {
 				grantUser = strings.Trim(strings.TrimSpace(forPart[:atIdx]), "'`\"")
 				grantHost = strings.Trim(strings.TrimSpace(forPart[atIdx+1:]), "'`\"")
 			} else {
 				grantUser = strings.Trim(strings.TrimSpace(forPart), "'`\"")
 			}
 		}
-		grantRows := [][]interface{}{
-			{fmt.Sprintf("GRANT USAGE ON *.* TO `%s`@`%s`", grantUser, grantHost)},
-		}
-		if grantUser == "root" {
+		var grantRows [][]interface{}
+		if strings.EqualFold(grantUser, "root") {
 			grantRows = [][]interface{}{
-				{"GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' WITH GRANT OPTION"},
+				{fmt.Sprintf("GRANT ALL PRIVILEGES ON *.* TO `%s`@`%s` WITH GRANT OPTION", grantUser, grantHost)},
 			}
-		} else if e.Catalog != nil {
-			for _, dbName := range e.Catalog.ListDatabases() {
-				if !strings.EqualFold(dbName, "information_schema") && !strings.EqualFold(dbName, "performance_schema") &&
-					!strings.EqualFold(dbName, "mysql") && !strings.EqualFold(dbName, "sys") {
-					grantRows = append(grantRows, []interface{}{
-						fmt.Sprintf("GRANT ALL PRIVILEGES ON `%s`.* TO `%s`@`%s`", dbName, grantUser, grantHost),
-					})
-				}
+		} else {
+			grantRows = [][]interface{}{
+				{fmt.Sprintf("GRANT USAGE ON *.* TO `%s`@`%s`", grantUser, grantHost)},
 			}
 		}
 		return &Result{
