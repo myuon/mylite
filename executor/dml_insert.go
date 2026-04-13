@@ -854,7 +854,57 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 								}
 							}
 							// Strict mode: validate DATE/DATETIME/TIMESTAMP values
-							if sv, ok := v.(string); ok {
+							// For numeric datetime values, convert to padded string first for validation
+							vForDateCheck := v
+							if col.Type != "" {
+								colUpperCheck := strings.ToUpper(strings.TrimSpace(col.Type))
+								if idx := strings.Index(colUpperCheck, "("); idx >= 0 {
+									colUpperCheck = colUpperCheck[:idx]
+								}
+								isDateCol := colUpperCheck == "DATE" || colUpperCheck == "DATETIME" || colUpperCheck == "TIMESTAMP"
+								if isDateCol {
+									switch n := v.(type) {
+									case int64:
+										ds := fmt.Sprintf("%d", n)
+										if n >= 0 {
+											// Left-pad to nearest standard length
+											l := len(ds)
+											if l > 0 && l != 6 && l != 8 && l != 12 && l != 14 {
+												var tl int
+												if l <= 5 {
+													tl = 6
+												} else if l <= 11 {
+													tl = 12
+												} else if l == 13 {
+													tl = 14
+												}
+												if tl > 0 {
+													ds = strings.Repeat("0", tl-l) + ds
+												}
+											}
+											vForDateCheck = ds
+										}
+									case float64:
+										ds := fmt.Sprintf("%d", int64(n))
+										l := len(ds)
+										if l > 0 && l != 6 && l != 8 && l != 12 && l != 14 {
+											var tl int
+											if l <= 5 {
+												tl = 6
+											} else if l <= 11 {
+												tl = 12
+											} else if l == 13 {
+												tl = 14
+											}
+											if tl > 0 {
+												ds = strings.Repeat("0", tl-l) + ds
+											}
+										}
+										vForDateCheck = ds
+									}
+								}
+							}
+							if sv, ok := vForDateCheck.(string); ok {
 								if err := checkDateStrict(col.Type, col.Name, sv, e.sqlMode); err != nil {
 									// For non-transactional tables (MyISAM) under STRICT_TRANS_TABLES only
 									// (not STRICT_ALL_TABLES), treat as warning not error (like IGNORE).
@@ -869,6 +919,17 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 									strictAllTables := strings.Contains(e.sqlMode, "STRICT_ALL_TABLES") || strings.Contains(e.sqlMode, "TRADITIONAL")
 									if bool(stmt.Ignore) || (isNonTransactional && !strictAllTables) {
 										e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+										// Reset to zero value for date/datetime/timestamp columns when validation fails
+										colUpper := strings.ToUpper(strings.TrimSpace(col.Type))
+										colBase := colUpper
+										if idx := strings.Index(colBase, "("); idx >= 0 {
+											colBase = colBase[:idx]
+										}
+										if colBase == "DATE" {
+											v = "0000-00-00"
+										} else if colBase == "DATETIME" || colBase == "TIMESTAMP" {
+											v = "0000-00-00 00:00:00"
+										}
 									} else {
 										return nil, err
 									}

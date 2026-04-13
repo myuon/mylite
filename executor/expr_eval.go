@@ -1564,12 +1564,32 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 			}
 			return toString(val), nil
 		case "DECIMAL", "FLOAT", "DOUBLE", "REAL":
+			// For CAST(expr AS DECIMAL(M,D)), apply decimal formatting with proper precision.
+			if typeName == "DECIMAL" && v.Type != nil && v.Type.Length != nil && v.Type.Scale != nil {
+				m := *v.Type.Length
+				d := *v.Type.Scale
+				typeStr := fmt.Sprintf("decimal(%d,%d)", m, d)
+				// Convert date/time strings to decimal representation, preserving microseconds.
+				numericVal := val
+				if s, ok := val.(string); ok {
+					numericVal = datetimeStringToDecimalString(s)
+				}
+				return formatDecimalValue(typeStr, numericVal), nil
+			}
 			return toFloat(val), nil
 		case "DATETIME", "TIMESTAMP":
 			if val == nil {
 				return nil, nil
 			}
 			s := toString(val)
+			// Normalize the datetime string first (handles non-standard formats like '2001-1-1')
+			if ns := normalizeDateTimeString(s); ns != "" {
+				s = ns
+			}
+			// CAST AS DATETIME pads date-only values with " 00:00:00"
+			if len(s) == 10 && s[4] == '-' && s[7] == '-' {
+				s = s + " 00:00:00"
+			}
 			// CAST AS DATETIME strips microseconds (returns YYYY-MM-DD HH:MM:SS)
 			if len(s) > 19 && s[19] == '.' {
 				s = s[:19]
@@ -1580,6 +1600,10 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 				return nil, nil
 			}
 			s := toString(val)
+			// Normalize and parse the date value (handles non-standard formats like '2001-1-1 2:3:4')
+			if parsed := parseMySQLDateValue(s); parsed != "" {
+				return parsed, nil
+			}
 			// CAST AS DATE strips time component and returns YYYY-MM-DD
 			if len(s) >= 10 {
 				s = s[:10]
@@ -1594,7 +1618,14 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 			if len(s) > 11 && s[10] == ' ' {
 				s = s[11:]
 			}
-			// Preserve microseconds in CAST AS TIME (MySQL keeps them)
+			// Plain TIME (no fractional seconds precision) strips microseconds.
+			// Only TIME(N) with explicit precision preserves microseconds.
+			if v.Type != nil && v.Type.Length == nil {
+				// No precision specified: strip fractional seconds
+				if dot := strings.IndexByte(s, '.'); dot >= 0 {
+					s = s[:dot]
+				}
+			}
 			return s, nil
 		case "JSON":
 			// Preserve boolean type for CAST(TRUE/FALSE AS JSON)

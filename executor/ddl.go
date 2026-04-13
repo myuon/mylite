@@ -1109,6 +1109,22 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 						// Normalize now() / current_timestamp() to CURRENT_TIMESTAMP
 						defStr = normalizeCurrentTimestampDefault(defStr)
 						colDef.Default = &defStr
+						// Normalize and validate DATE/DATETIME/TIMESTAMP/TIME defaults.
+						colTypeUpper := strings.ToUpper(strings.TrimSpace(col.Type.Type))
+						switch colTypeUpper {
+						case "DATE":
+							if err := normalizeAndValidateDateDefault(colDef.Name, &defStr, e); err != nil {
+								return nil, err
+							}
+						case "DATETIME", "TIMESTAMP":
+							if err := normalizeAndValidateDatetimeDefault(colDef.Name, &defStr, e); err != nil {
+								return nil, err
+							}
+						case "TIME":
+							if err := validateTimeDefault(colDef.Name, defStr); err != nil {
+								return nil, err
+							}
+						}
 					}
 				}
 			}
@@ -5231,4 +5247,97 @@ func isFirstNotNullUnique(tbl *catalog.TableDef, idx catalog.IndexDef) bool {
 		}
 	}
 	return false
+}
+
+// normalizeAndValidateDateDefault normalizes a default value for a DATE column:
+// - Strips time part from datetime strings (e.g. '1962-03-03 23:33:34' → '1962-03-03') with a NOTE warning.
+// - Returns error 1067 if the date is invalid (e.g. day=32).
+func normalizeAndValidateDateDefault(colName string, defStr *string, e *Executor) error {
+	s := strings.TrimSpace(*defStr)
+	// Skip CURRENT_TIMESTAMP and empty
+	if s == "" || strings.ToUpper(s) == "CURRENT_TIMESTAMP" {
+		return nil
+	}
+	// Parse: expect YYYY-MM-DD or YYYY-MM-DD HH:MM:SS
+	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
+		y, ey := strconv.Atoi(s[0:4])
+		m, em := strconv.Atoi(s[5:7])
+		d, ed := strconv.Atoi(s[8:10])
+		if ey != nil || em != nil || ed != nil {
+			return mysqlError(1067, "42000", fmt.Sprintf("Invalid default value for '%s'", colName))
+		}
+		// Invalid date (e.g. day=32) → error 1067
+		if !isValidDate(y, m, d) {
+			return mysqlError(1067, "42000", fmt.Sprintf("Invalid default value for '%s'", colName))
+		}
+		// Strip time part if present, with NOTE warning
+		if len(s) > 10 && s[10] == ' ' {
+			e.addWarning("Note", 1292, fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", s, colName))
+			*defStr = s[:10]
+		}
+		return nil
+	}
+	// Other formats not handled here
+	return nil
+}
+
+// normalizeAndValidateDatetimeDefault normalizes a default value for DATETIME/TIMESTAMP columns:
+// - Pads missing time part (e.g. '1962-03-03' → '1962-03-03 00:00:00').
+// - Returns error 1067 if the datetime is invalid.
+func normalizeAndValidateDatetimeDefault(colName string, defStr *string, e *Executor) error {
+	s := strings.TrimSpace(*defStr)
+	// Skip CURRENT_TIMESTAMP and empty
+	if s == "" || strings.ToUpper(s) == "CURRENT_TIMESTAMP" {
+		return nil
+	}
+	// Pure date YYYY-MM-DD (no time) → pad to YYYY-MM-DD 00:00:00
+	if len(s) == 10 && s[4] == '-' && s[7] == '-' {
+		y, ey := strconv.Atoi(s[0:4])
+		m, em := strconv.Atoi(s[5:7])
+		d, ed := strconv.Atoi(s[8:10])
+		if ey != nil || em != nil || ed != nil {
+			return mysqlError(1067, "42000", fmt.Sprintf("Invalid default value for '%s'", colName))
+		}
+		if !isValidDate(y, m, d) {
+			return mysqlError(1067, "42000", fmt.Sprintf("Invalid default value for '%s'", colName))
+		}
+		*defStr = s + " 00:00:00"
+		return nil
+	}
+	return nil
+}
+
+// validateTimeDefault validates a TIME column default value.
+// Returns error 1067 if the time value contains invalid trailing characters.
+func validateTimeDefault(colName string, defStr string) error {
+	s := strings.TrimSpace(defStr)
+	if s == "" {
+		return nil
+	}
+	// A valid TIME looks like HH:MM:SS or HHH:MM:SS (with optional fractional seconds).
+	// Invalid if there are non-numeric/non-colon/non-dot/non-sign characters after stripping valid part.
+	// Strategy: find the valid time prefix and check nothing invalid follows.
+	timeStr := s
+	if strings.HasPrefix(s, "-") {
+		timeStr = s[1:]
+	}
+	// Must have at least one colon (HH:MM:SS)
+	if strings.Count(timeStr, ":") < 2 {
+		return mysqlError(1067, "42000", fmt.Sprintf("Invalid default value for '%s'", colName))
+	}
+	// Find the end of the valid time portion: digits, colons, and optional dot+digits
+	validEnd := 0
+	for i, c := range timeStr {
+		if c >= '0' && c <= '9' || c == ':' || c == '.' {
+			validEnd = i + 1
+		} else {
+			break
+		}
+	}
+	// If there's anything after the valid time portion (like ' a'), it's invalid
+	rest := strings.TrimSpace(timeStr[validEnd:])
+	if rest != "" {
+		return mysqlError(1067, "42000", fmt.Sprintf("Invalid default value for '%s'", colName))
+	}
+	return nil
 }

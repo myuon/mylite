@@ -13321,6 +13321,14 @@ func coerceDateTimeValue(colType string, v interface{}, truncateFractional bool)
 				}
 				// Strip any trailing content after HH:MM:SS[.frac]
 				timePart = trimTimeTrailer(timePart)
+				// Zero-pad time components to ensure HH:MM:SS format
+				timePart = zeroPadTimePart(timePart)
+				// MySQL quirk: "00-00-00 HH:MM:SS" with non-zero time is year-2000, not zero date.
+				// If parsed date is "0000-00-00" but time is non-zero and original used a 2-digit year,
+				// re-interpret as "2000-00-00".
+				if parsed == "0000-00-00" && isNonZeroTimePart(timePart) {
+					parsed = reinterpretZeroDateWith2DigitYear(datetimeInput)
+				}
 				result := parsed + " " + timePart
 				// Apply DATETIME(N) fractional seconds precision if specified
 				if datetimeFsp >= 0 {
@@ -13960,6 +13968,10 @@ func parseMySQLDateValue(s string) string {
 			yy, _ := strconv.Atoi(datePart[:2])
 			m, _ := strconv.Atoi(datePart[2:4])
 			d, _ := strconv.Atoi(datePart[4:6])
+			// All-zero YYMMDD is the zero date 0000-00-00
+			if yy == 0 && m == 0 && d == 0 {
+				return "0000-00-00"
+			}
 			y := convert2DigitYear(yy)
 			if isValidDate(y, m, d) {
 				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
@@ -13968,6 +13980,10 @@ func parseMySQLDateValue(s string) string {
 			yy, _ := strconv.Atoi(datePart[:2])
 			m, _ := strconv.Atoi(datePart[2:4])
 			d, _ := strconv.Atoi(datePart[4:6])
+			// All-zero YYMMDDHHMMSS is the zero date 0000-00-00
+			if yy == 0 && m == 0 && d == 0 {
+				return "0000-00-00"
+			}
 			y := convert2DigitYear(yy)
 			if isValidDate(y, m, d) {
 				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
@@ -14111,17 +14127,47 @@ func checkDateStrict(colType, colName, originalValue, sqlMode string) error {
 		}
 	}
 	if isAllDigits {
+		// For non-standard lengths, right-pad to nearest standard length (mirrors parseMySQLDateValue)
+		n := len(datePart)
+		if n > 0 && n != 6 && n != 8 && n != 12 && n != 14 {
+			var targetLen int
+			if n <= 5 {
+				targetLen = 6
+			} else if n <= 11 {
+				targetLen = 12
+			} else if n == 13 {
+				targetLen = 14
+			}
+			if targetLen > 0 {
+				datePart = datePart + strings.Repeat("0", targetLen-n)
+			} else {
+				// Length > 14: invalid
+				return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+			}
+		}
 		switch len(datePart) {
 		case 14: // YYYYMMDDHHMMSS - DATETIME format, extract date part
 			yy, _ := strconv.Atoi(datePart[:4])
 			mm, _ := strconv.Atoi(datePart[4:6])
 			dd, _ := strconv.Atoi(datePart[6:8])
+			hh, _ := strconv.Atoi(datePart[8:10])
+			mi, _ := strconv.Atoi(datePart[10:12])
+			ss, _ := strconv.Atoi(datePart[12:14])
+			if hh >= 24 || mi >= 60 || ss >= 60 {
+				return mysqlError(1292, "22007", fmt.Sprintf("Incorrect datetime value: '%s' for column '%s' at row 1", originalValue, colName))
+			}
 			y, m, d = yy, mm, dd
 			parsed = true
 		case 12: // YYMMDDHHMMSS - DATETIME format, extract date part
 			yy, _ := strconv.Atoi(datePart[:2])
 			mm, _ := strconv.Atoi(datePart[2:4])
 			dd, _ := strconv.Atoi(datePart[4:6])
+			hh, _ := strconv.Atoi(datePart[6:8])
+			mi, _ := strconv.Atoi(datePart[8:10])
+			ss, _ := strconv.Atoi(datePart[10:12])
+			if hh >= 24 || mi >= 60 || ss >= 60 {
+				return mysqlError(1292, "22007", fmt.Sprintf("Incorrect datetime value: '%s' for column '%s' at row 1", originalValue, colName))
+			}
 			y, m, d = convert2DigitYear(yy), mm, dd
 			parsed = true
 		case 8: // YYYYMMDD
@@ -14167,6 +14213,15 @@ func checkDateStrict(colType, colName, originalValue, sqlMode string) error {
 			}
 			m, _ = strconv.Atoi(mStr)
 			d, _ = strconv.Atoi(dStr)
+			// Validate time component if present in original string (for DATETIME/TIMESTAMP)
+			if upper == "DATETIME" || strings.HasPrefix(upper, "DATETIME(") || upper == "TIMESTAMP" {
+				if idx := strings.IndexAny(s, " T"); idx >= 0 {
+					tStr := strings.TrimSpace(s[idx+1:])
+					if isInvalidTimePart(tStr) {
+						return mysqlError(1292, "22007", fmt.Sprintf("Incorrect datetime value: '%s' for column '%s' at row 1", originalValue, colName))
+					}
+				}
+			}
 			parsed = true
 		} else {
 			// Not parseable as a date
@@ -14176,6 +14231,11 @@ func checkDateStrict(colType, colName, originalValue, sqlMode string) error {
 
 	if !parsed {
 		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+	}
+
+	// Check year range (MySQL supports 0000-9999)
+	if y < 0 || y > 9999 {
+		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect datetime value: '%s' for column '%s' at row 1", originalValue, colName))
 	}
 
 	// Check for zero date (0000-00-00)
@@ -14271,6 +14331,86 @@ func normalizeDateTimeSeparators(s string) string {
 		}
 	}
 	return result.String()
+}
+
+// zeroPadTimePart zero-pads time components in "H:MM:SS" or "HH:M:SS" format to "HH:MM:SS".
+// For example, "1:01:01" -> "01:01:01", "10:5:03" -> "10:05:03".
+func zeroPadTimePart(s string) string {
+	parts := strings.SplitN(s, ":", 3)
+	if len(parts) != 3 {
+		return s
+	}
+	// Zero-pad each component to at least 2 digits (preserve fractional seconds in last part)
+	secAndFrac := parts[2]
+	secParts := strings.SplitN(secAndFrac, ".", 2)
+	sec := secParts[0]
+	frac := ""
+	if len(secParts) > 1 {
+		frac = "." + secParts[1]
+	}
+	h := strings.TrimSpace(parts[0])
+	m := strings.TrimSpace(parts[1])
+	s2 := strings.TrimSpace(sec)
+	if len(h) < 2 {
+		h = "0" + h
+	}
+	if len(m) < 2 {
+		m = "0" + m
+	}
+	if len(s2) < 2 {
+		s2 = "0" + s2
+	}
+	return h + ":" + m + ":" + s2 + frac
+}
+
+// isNonZeroTimePart returns true if the time string "HH:MM:SS" has any non-zero component.
+func isNonZeroTimePart(s string) bool {
+	if s == "" || s == "00:00:00" {
+		return false
+	}
+	parts := strings.SplitN(s, ":", 3)
+	if len(parts) < 3 {
+		return false
+	}
+	for _, p := range parts {
+		// Strip fractional seconds
+		p = strings.SplitN(p, ".", 2)[0]
+		n, err := strconv.Atoi(strings.TrimSpace(p))
+		if err == nil && n != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// reinterpretZeroDateWith2DigitYear re-parses a date string that resolved to "0000-00-00"
+// as though the 2-digit year "00" means 2000, not 0000. Only applies when the date part
+// has 2-digit year format (YY-MM-DD with YY=00, MM=00, DD=00).
+// Returns the re-interpreted date (e.g. "2000-00-00") or "0000-00-00" if not applicable.
+func reinterpretZeroDateWith2DigitYear(s string) string {
+	// Extract date part (before space or T)
+	datePart := s
+	if idx := strings.IndexAny(s, " T"); idx >= 0 {
+		datePart = s[:idx]
+	}
+	// Normalize delimiters and check if it's 2-digit year format
+	normalized := normalizeDateDelimiters(datePart)
+	parts := strings.Split(normalized, "-")
+	if len(parts) != 3 {
+		return "0000-00-00"
+	}
+	yStr := parts[0]
+	if len(yStr) != 2 {
+		return "0000-00-00"
+	}
+	yy, err := strconv.Atoi(yStr)
+	if err != nil {
+		return "0000-00-00"
+	}
+	m, _ := strconv.Atoi(parts[1])
+	d, _ := strconv.Atoi(parts[2])
+	y := convert2DigitYear(yy)
+	return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
 }
 
 // normalizeDigitTimePart converts a 6-digit all-digit time string "HHMMSS" to "HH:MM:SS".
@@ -14422,6 +14562,7 @@ func normalizeDateTimeString(s string) string {
 	timePart := extractTimePart(s, datePart)
 	if timePart != "" {
 		timePart = normalizeDateTimeSeparators(timePart)
+		timePart = zeroPadTimePart(timePart)
 		return datePart + " " + timePart
 	}
 	return datePart
@@ -21640,6 +21781,19 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 						}
 					}
 				}
+				// Date/datetime normalization: handle 2-digit years, non-standard formats,
+				// and DATE vs DATETIME alignment (e.g. '01-01-01' == '2001-01-01',
+				// '2001-01-03 00:00:00' == '2001-01-03').
+				if looksLikeDate(ls) || looksLikeDate(rs) {
+					ln := normalizeDateTimeString(ls)
+					rn := normalizeDateTimeString(rs)
+					if ln != "" && rn != "" {
+						ln, rn = normalizeDateTimeForCompare(ln, rn)
+						if ln == rn {
+							return v.Operator == sqlparser.InOp, nil
+						}
+					}
+				}
 			}
 			// For NOT IN: if any tuple value is NULL and no match found, result is UNKNOWN (false)
 			if v.Operator == sqlparser.NotInOp && hasNull {
@@ -23385,6 +23539,64 @@ func isDatetimeLikeString(s string) bool {
 		}
 	}
 	return false
+}
+
+// datetimeStringToDecimalString converts a date/time/datetime string to its MySQL numeric
+// decimal string representation, preserving microseconds. For example:
+//   - "2006-08-10 10:11:12.000014" → "20060810101112.000014"
+//   - "2006-08-10" → "20060810"
+//   - "10:11:12" → "101112"
+//   - any other string is returned as-is (for formatDecimalValue to handle)
+func datetimeStringToDecimalString(s string) interface{} {
+	s = strings.TrimSpace(s)
+	// DATE or DATETIME: "YYYY-MM-DD..."
+	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
+		y, ey := strconv.Atoi(s[0:4])
+		mo, em := strconv.Atoi(s[5:7])
+		d, ed := strconv.Atoi(s[8:10])
+		if ey == nil && em == nil && ed == nil {
+			if len(s) >= 19 && s[10] == ' ' && s[13] == ':' && s[16] == ':' {
+				h, eh := strconv.Atoi(s[11:13])
+				mi, emi := strconv.Atoi(s[14:16])
+				se, es := strconv.Atoi(s[17:19])
+				if eh == nil && emi == nil && es == nil {
+					intPart := fmt.Sprintf("%d", int64(y*10000+mo*100+d)*1000000+int64(h*10000+mi*100+se))
+					if len(s) > 19 && s[19] == '.' {
+						return intPart + s[19:] // preserve microseconds: ".000014"
+					}
+					return intPart
+				}
+			}
+			// Pure date
+			return fmt.Sprintf("%d", y*10000+mo*100+d)
+		}
+	}
+	// TIME: "HH:MM:SS..." with two colons
+	if strings.Count(s, ":") == 2 {
+		sign := ""
+		ts := s
+		if strings.HasPrefix(s, "-") {
+			sign = "-"
+			ts = s[1:]
+		}
+		main := ts
+		frac := ""
+		if dot := strings.IndexByte(ts, '.'); dot >= 0 {
+			main = ts[:dot]
+			frac = ts[dot:]
+		}
+		parts := strings.Split(main, ":")
+		if len(parts) == 3 {
+			h, eh := strconv.Atoi(parts[0])
+			mi, emi := strconv.Atoi(parts[1])
+			se, es := strconv.Atoi(parts[2])
+			if eh == nil && emi == nil && es == nil {
+				return sign + fmt.Sprintf("%d", h*10000+mi*100+se) + frac
+			}
+		}
+	}
+	// Not a recognized date/time format - return as float (via toFloat semantics)
+	return toFloat(s)
 }
 
 func toFloat(v interface{}) float64 {
