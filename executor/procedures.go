@@ -1901,21 +1901,6 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 						break
 					}
 				}
-				// Normalize date/datetime default values for DATE/DATETIME/TIMESTAMP variables
-				// so that non-standard formats like '2007-4-10' become '2007-04-10'.
-				if typeName == "DATE" || typeName == "DATETIME" || typeName == "TIMESTAMP" {
-					if s, ok := defaultVal.(string); ok && s != "" {
-						if n := normalizeDateTimeString(s); n != "" {
-							if typeName == "DATETIME" || typeName == "TIMESTAMP" {
-								// Pad date-only values to full datetime
-								if len(n) == 10 {
-									n = n + " 00:00:00"
-								}
-							}
-							defaultVal = n
-						}
-					}
-				}
 				// Build full type string for type tracking (e.g. "DOUBLE(10,3)")
 				fullTypeName := ""
 				if typeIdx < len(declParts) {
@@ -2131,24 +2116,6 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 											}
 										}
 										break
-									}
-								}
-							}
-						}
-						// Normalize date/datetime values when the variable has a DATE/DATETIME/TIMESTAMP type
-						if ctx.localVarTypes != nil {
-							if declaredType, ok := ctx.localVarTypes[strings.ToLower(varName)]; ok {
-								declaredUpper := strings.ToUpper(declaredType)
-								if declaredUpper == "DATE" || declaredUpper == "DATETIME" || declaredUpper == "TIMESTAMP" {
-									if s, ok2 := val.(string); ok2 && s != "" {
-										if n := normalizeDateTimeString(s); n != "" {
-											if declaredUpper == "DATETIME" || declaredUpper == "TIMESTAMP" {
-												if len(n) == 10 {
-													n = n + " 00:00:00"
-												}
-											}
-											val = n
-										}
 									}
 								}
 							}

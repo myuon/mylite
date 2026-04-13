@@ -14568,47 +14568,6 @@ func normalizeDateTimeString(s string) string {
 	return datePart
 }
 
-// normalizeDateValsForLeastGreatest normalizes date/datetime string values for use in
-// LEAST/GREATEST. If any value in the slice is a string that normalizes to a proper
-// date/datetime, all string values in the slice are normalized so that the returned winner
-// is in canonical MySQL date format (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS).
-func normalizeDateValsForLeastGreatest(vals []interface{}) []interface{} {
-	// Check if any value is a date-like string
-	hasDate := false
-	hasDatetime := false
-	for _, v := range vals {
-		if s, ok := v.(string); ok {
-			n := normalizeDateTimeString(s)
-			if n != "" {
-				if len(n) > 10 {
-					hasDatetime = true
-				} else {
-					hasDate = true
-				}
-			}
-		}
-	}
-	if !hasDate && !hasDatetime {
-		return vals
-	}
-	result := make([]interface{}, len(vals))
-	for i, v := range vals {
-		if s, ok := v.(string); ok {
-			n := normalizeDateTimeString(s)
-			if n != "" {
-				// If any arg is datetime, promote all dates to datetime
-				if hasDatetime && len(n) == 10 {
-					n = n + " 00:00:00"
-				}
-				result[i] = n
-				continue
-			}
-		}
-		result[i] = v
-	}
-	return result
-}
-
 // hasInvalidTimeComponent checks if a datetime string has an invalid time component
 // (hour > 23, minute > 59, or second > 59). Returns the invalid string if found.
 // Only applies to strings that look like full datetime values (date + time parts).
@@ -21822,17 +21781,15 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 						}
 					}
 				}
-				// Date/datetime normalization: handle 2-digit years and non-standard formats
-				// (e.g. '01-01-01' == '2001-01-01', '2001-1-1 0:0:0' == '2001-01-01').
-				// Only match same-granularity (DATE vs DATE, DATETIME vs DATETIME) to avoid
-				// false cross-type matches (DATE vs DATETIME literal).
+				// Date/datetime normalization: handle 2-digit years, non-standard formats,
+				// and DATE vs DATETIME alignment (e.g. '01-01-01' == '2001-01-01',
+				// '2001-01-03 00:00:00' == '2001-01-03').
 				if looksLikeDate(ls) || looksLikeDate(rs) {
 					ln := normalizeDateTimeString(ls)
 					rn := normalizeDateTimeString(rs)
 					if ln != "" && rn != "" {
-						lnIsDatetime := len(ln) > 10 && ln[10] == ' '
-						rnIsDatetime := len(rn) > 10 && rn[10] == ' '
-						if lnIsDatetime == rnIsDatetime && ln == rn {
+						ln, rn = normalizeDateTimeForCompare(ln, rn)
+						if ln == rn {
 							return v.Operator == sqlparser.InOp, nil
 						}
 					}

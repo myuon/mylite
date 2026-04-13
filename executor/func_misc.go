@@ -257,7 +257,8 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if len(v.Exprs) < 2 {
 			return nil, true, fmt.Errorf("LEAST requires at least 2 arguments")
 		}
-		vals := make([]interface{}, 0, len(v.Exprs))
+		var result interface{}
+		allNull := true
 		for _, argExpr := range v.Exprs {
 			val, err := e.evalExprMaybeRow(argExpr, row)
 			if err != nil {
@@ -266,26 +267,26 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 			if val == nil {
 				return nil, true, nil
 			}
-			vals = append(vals, val)
-		}
-		if len(vals) == 0 {
-			return nil, true, nil
-		}
-		// Normalize date strings: if any value normalizes to a date, normalize all string values.
-		vals = normalizeDateValsForLeastGreatest(vals)
-		result := vals[0]
-		for _, val := range vals[1:] {
-			cmp := compareNumeric(val, result)
-			if cmp < 0 {
+			allNull = false
+			if result == nil {
 				result = val
+			} else {
+				cmp := compareNumeric(val, result)
+				if cmp < 0 {
+					result = val
+				}
 			}
+		}
+		if allNull {
+			return nil, true, nil
 		}
 		return result, true, nil
 	case "greatest":
 		if len(v.Exprs) < 2 {
 			return nil, true, fmt.Errorf("GREATEST requires at least 2 arguments")
 		}
-		vals := make([]interface{}, 0, len(v.Exprs))
+		var result interface{}
+		allNull := true
 		for _, argExpr := range v.Exprs {
 			val, err := e.evalExprMaybeRow(argExpr, row)
 			if err != nil {
@@ -294,19 +295,18 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 			if val == nil {
 				return nil, true, nil
 			}
-			vals = append(vals, val)
-		}
-		if len(vals) == 0 {
-			return nil, true, nil
-		}
-		// Normalize date strings: if any value normalizes to a date, normalize all string values.
-		vals = normalizeDateValsForLeastGreatest(vals)
-		result := vals[0]
-		for _, val := range vals[1:] {
-			cmp := compareNumeric(val, result)
-			if cmp > 0 {
+			allNull = false
+			if result == nil {
 				result = val
+			} else {
+				cmp := compareNumeric(val, result)
+				if cmp > 0 {
+					result = val
+				}
 			}
+		}
+		if allNull {
+			return nil, true, nil
 		}
 		return result, true, nil
 	case "current_user":

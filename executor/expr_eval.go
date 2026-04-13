@@ -612,18 +612,6 @@ func (e *Executor) evalConvertExpr(v *sqlparser.ConvertExpr) (interface{}, error
 	}
 	switch typeName {
 	case "SIGNED", "INT", "INTEGER", "BIGINT":
-		// For datetime strings, convert to numeric representation (e.g. '2001-01-01 00:00:00' → 20010101000000)
-		if s, ok := val.(string); ok {
-			if looksLikeDate(s) {
-				if ds := datetimeStringToDecimalString(s); ds != nil {
-					if dsStr, ok2 := ds.(string); ok2 {
-						if n, err2 := strconv.ParseInt(dsStr, 10, 64); err2 == nil {
-							return n, nil
-						}
-					}
-				}
-			}
-		}
 		return toInt64(val), nil
 	case "UNSIGNED":
 		// String → UNSIGNED: if string is too large for int64 (float overflow), clamp to MaxUint64.
@@ -1544,18 +1532,6 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 		}
 		switch typeName {
 		case "SIGNED", "INT", "INTEGER", "BIGINT":
-			// For datetime strings, convert to numeric representation (e.g. '2001-01-01 00:00:00' → 20010101000000)
-			if s, ok2 := val.(string); ok2 {
-				if looksLikeDate(s) {
-					if ds := datetimeStringToDecimalString(s); ds != nil {
-						if dsStr, ok3 := ds.(string); ok3 {
-							if n, err2 := strconv.ParseInt(dsStr, 10, 64); err2 == nil {
-								return n, nil
-							}
-						}
-					}
-				}
-			}
 			return toInt64(val), nil
 		case "UNSIGNED":
 			// String → UNSIGNED: if string is too large, clamp to MaxUint64.
