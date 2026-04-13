@@ -239,6 +239,26 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 			e.populatePerfSchemaTable(tbl, lookupTable)
 		}
 		rawAll := tbl.Scan()
+		// MySQL's InnoDB stores mysql.engine_cost in clustered PK order (cost_name, engine_name, device_type).
+		// Sort here to match MySQL's natural row ordering when no ORDER BY is specified.
+		// MySQL uses latin1_swedish_ci collation for these columns, which is case-insensitive.
+		if strings.EqualFold(lookupDB, "mysql") && strings.EqualFold(lookupTable, "engine_cost") {
+			sort.SliceStable(rawAll, func(i, j int) bool {
+				ci := strings.ToLower(fmt.Sprintf("%v", rawAll[i]["cost_name"]))
+				cj := strings.ToLower(fmt.Sprintf("%v", rawAll[j]["cost_name"]))
+				if ci != cj {
+					return ci < cj
+				}
+				ei := strings.ToLower(fmt.Sprintf("%v", rawAll[i]["engine_name"]))
+				ej := strings.ToLower(fmt.Sprintf("%v", rawAll[j]["engine_name"]))
+				if ei != ej {
+					return ei < ej
+				}
+				di := fmt.Sprintf("%v", rawAll[i]["device_type"])
+				dj := fmt.Sprintf("%v", rawAll[j]["device_type"])
+				return di < dj
+			})
+		}
 		// Filter out rows from other connections' uncommitted transactions
 		raw := e.filterUncommittedRows(rawAll)
 		// Build a set of CHAR(N) column names for trailing-space removal.
@@ -1432,6 +1452,10 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 			if stmt.With.Recursive {
 				subResult, err := e.execRecursiveCTE(cteName, cte.Subquery, cte.Columns, newCTEMap)
 				if err != nil {
+					// Don't wrap structured MySQL errors (they already have ERROR <code> format).
+					if strings.HasPrefix(err.Error(), "ERROR ") {
+						return nil, err
+					}
 					return nil, fmt.Errorf("CTE '%s': %w", cteName, err)
 				}
 				// newCTEMap[cteName] is already set by execRecursiveCTE (with all rows).
@@ -4917,6 +4941,10 @@ func (e *Executor) execUnion(stmt *sqlparser.Union) (*Result, error) {
 			if stmt.With.Recursive {
 				subResult, err := e.execRecursiveCTE(cteName, cte.Subquery, cte.Columns, newCTEMap)
 				if err != nil {
+					// Don't wrap structured MySQL errors (they already have ERROR <code> format).
+					if strings.HasPrefix(err.Error(), "ERROR ") {
+						return nil, err
+					}
 					return nil, fmt.Errorf("CTE '%s': %w", cteName, err)
 				}
 				columns := subResult.Columns
@@ -5239,6 +5267,12 @@ func (e *Executor) execRecursiveCTE(cteName string, subquery sqlparser.TableStat
 			recursiveResult, err := e.execTableStmtForUnion(recursivePart)
 			if err != nil {
 				return nil, err
+			}
+			// Only validate when the recursive part successfully resolved its columns.
+			// If it returned 0 columns (e.g. SELECT * from an empty CTE), schema
+			// resolution failed and we cannot meaningfully compare counts.
+			if len(recursiveResult.Columns) > 0 && len(columns) > 0 && len(recursiveResult.Columns) != len(columns) {
+				return nil, mysqlError(1222, "21000", "The used SELECT statements have a different number of columns")
 			}
 			newRows = append(newRows, recursiveResult.Rows...)
 		}

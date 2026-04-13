@@ -1534,6 +1534,15 @@ func (e *Executor) initSystemTables() {
 			{Name: "default_value", Type: "FLOAT", Nullable: true},
 		},
 	})
+	if e.tableRowCount("mysql", "server_cost") == 0 {
+		_, _ = e.Execute(`INSERT INTO mysql.server_cost (cost_name, cost_value, last_update, comment, default_value) VALUES` +
+			` ('disk_temptable_create_cost', NULL, CURRENT_TIMESTAMP, NULL, 20.0),` +
+			` ('disk_temptable_row_cost', NULL, CURRENT_TIMESTAMP, NULL, 0.5),` +
+			` ('key_compare_cost', NULL, CURRENT_TIMESTAMP, NULL, 0.05),` +
+			` ('memory_temptable_create_cost', NULL, CURRENT_TIMESTAMP, NULL, 1.0),` +
+			` ('memory_temptable_row_cost', NULL, CURRENT_TIMESTAMP, NULL, 0.1),` +
+			` ('row_evaluate_cost', NULL, CURRENT_TIMESTAMP, NULL, 0.1)`)
+	}
 	ensure("mysql", &catalog.TableDef{
 		Name: "engine_cost",
 		Columns: []catalog.ColumnDef{
@@ -1546,6 +1555,11 @@ func (e *Executor) initSystemTables() {
 			{Name: "default_value", Type: "FLOAT", Nullable: true},
 		},
 	})
+	if e.tableRowCount("mysql", "engine_cost") == 0 {
+		_, _ = e.Execute(`INSERT INTO mysql.engine_cost (engine_name, device_type, cost_name, cost_value, last_update, comment, default_value) VALUES` +
+			` ('default', 0, 'io_block_read_cost', NULL, CURRENT_TIMESTAMP, NULL, 1.0),` +
+			` ('default', 0, 'memory_block_read_cost', NULL, CURRENT_TIMESTAMP, NULL, 0.25)`)
+	}
 	ensure("mysql", &catalog.TableDef{
 		Name: "tables_priv",
 		Columns: []catalog.ColumnDef{
