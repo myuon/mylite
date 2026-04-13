@@ -450,7 +450,7 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 							}
 						}
 					}
-					val = coerceColumnValue(col.Type, val)
+					val = e.coerceColumnValueForWrite(col.Type, val)
 					break
 				}
 			}
@@ -995,7 +995,7 @@ nextRow:
 								break
 							}
 						}
-						val = coerceColumnValue(col.Type, val)
+						val = e.coerceColumnValueForWrite(col.Type, val)
 						break
 					}
 				}

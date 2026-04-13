@@ -13613,6 +13613,120 @@ func incrementTimeSecond(timeStr string) string {
 	return fmt.Sprintf("%s%02d:%02d:%02d", sign, h, m, sec)
 }
 
+// truncateTimePrecision truncates (without rounding) a TIME or DATETIME string's
+// fractional seconds to the given fsp (0-6). Used with TIME_TRUNCATE_FRACTIONAL mode.
+// For fsp=0 the fractional part is dropped entirely.
+func truncateTimePrecision(timeStr string, fsp int) string {
+	dotIdx := strings.Index(timeStr, ".")
+	if dotIdx < 0 {
+		return timeStr
+	}
+	basePart := timeStr[:dotIdx]
+	fracPart := timeStr[dotIdx+1:]
+
+	if fsp == 0 {
+		return basePart
+	}
+
+	for len(fracPart) < fsp {
+		fracPart += "0"
+	}
+	if len(fracPart) > fsp {
+		fracPart = fracPart[:fsp]
+	}
+	return basePart + "." + fracPart
+}
+
+// truncateFracPartOfValue applies fractional-second truncation to the string
+// representation of a TIME, DATETIME, or TIMESTAMP value.
+// Handles "HH:MM:SS.fff" and "YYYY-MM-DD HH:MM:SS.fff" formats.
+func truncateFracPartOfValue(s string, fsp int) string {
+	if !strings.Contains(s, ".") {
+		return s
+	}
+	// DATETIME/TIMESTAMP: "YYYY-MM-DD HH:MM:SS.ffffff"
+	if len(s) > 19 && s[4] == '-' && s[7] == '-' && s[10] == ' ' {
+		timePart := s[11:]
+		return s[:11] + truncateTimePrecision(timePart, fsp)
+	}
+	// TIME: "HH:MM:SS.ffffff" or "-HH:MM:SS.ffffff"
+	return truncateTimePrecision(s, fsp)
+}
+
+// extractTimeFspFromType returns the fractional seconds precision for TIME/DATETIME/TIMESTAMP
+// column types. Returns (fsp, true) for temporal types, (0, false) otherwise.
+func extractTimeFspFromType(colType string) (int, bool) {
+	upper := strings.ToUpper(strings.TrimSpace(colType))
+	if upper == "TIME" {
+		return 0, true
+	}
+	if strings.HasPrefix(upper, "TIME(") {
+		fsp := 0
+		fmt.Sscanf(upper, "TIME(%d)", &fsp)
+		return fsp, true
+	}
+	if upper == "DATETIME" {
+		return 0, true
+	}
+	if strings.HasPrefix(upper, "DATETIME(") {
+		fsp := 0
+		fmt.Sscanf(upper, "DATETIME(%d)", &fsp)
+		return fsp, true
+	}
+	if upper == "TIMESTAMP" {
+		return 0, true
+	}
+	if strings.HasPrefix(upper, "TIMESTAMP(") {
+		fsp := 0
+		fmt.Sscanf(upper, "TIMESTAMP(%d)", &fsp)
+		return fsp, true
+	}
+	return 0, false
+}
+
+// preTruncateTimeValue converts val to a string and applies fractional-second truncation
+// for TIME/DATETIME/TIMESTAMP columns when TIME_TRUNCATE_FRACTIONAL is active.
+// For float64 values it uses the exact decimal string representation to avoid rounding
+// artifacts from float arithmetic (e.g. 101010.9999999 → "10:10:10.9999999" string path).
+// Returns the possibly-modified value (string) and whether a conversion was made.
+func preTruncateTimeValue(val interface{}, fsp int) interface{} {
+	switch v := val.(type) {
+	case string:
+		return truncateFracPartOfValue(v, fsp)
+	case float64:
+		// Convert float to exact decimal string so that the downstream string parser
+		// sees all fractional digits without float-rounding artifacts.
+		s := strconv.FormatFloat(v, 'f', -1, 64)
+		// For TIME-like floats (HHMMSS.frac), truncate at the decimal point.
+		// The string will be parsed by parseMySQLTimeValue later.
+		return truncateFracPartOfValue(s, fsp)
+	}
+	return val
+}
+
+// coerceColumnValueForWrite applies the standard coercion chain for a column during
+// DML write operations (INSERT/UPDATE). When TIME_TRUNCATE_FRACTIONAL is active in
+// sqlMode, fractional seconds are truncated (not rounded) before the value is stored.
+func (e *Executor) coerceColumnValueForWrite(colType string, val interface{}) interface{} {
+	if val != nil && strings.Contains(e.sqlMode, "TIME_TRUNCATE_FRACTIONAL") {
+		if fsp, ok := extractTimeFspFromType(colType); ok {
+			val = preTruncateTimeValue(val, fsp)
+		}
+	}
+	return coerceColumnValue(colType, val)
+}
+
+// coerceValueForColumnTypeForWrite is like coerceValueForColumnType but applies
+// fractional-second truncation when TIME_TRUNCATE_FRACTIONAL is active.
+func (e *Executor) coerceValueForColumnTypeForWrite(col catalog.ColumnDef, val interface{}) interface{} {
+	if val != nil && strings.Contains(e.sqlMode, "TIME_TRUNCATE_FRACTIONAL") {
+		if fsp, ok := extractTimeFspFromType(col.Type); ok {
+			val = preTruncateTimeValue(val, fsp)
+		}
+	}
+	return coerceValueForColumnType(col, val)
+}
+
 // implicitZeroValue returns the implicit zero/default value for a MySQL type
 // when a NOT NULL column has no explicit default.
 func implicitZeroValue(colType string) interface{} {
@@ -13822,6 +13936,25 @@ func parseMySQLDateValue(s string) string {
 			y := convert2DigitYear(yy)
 			if isValidDate(y, m, d) {
 				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
+			}
+		default:
+			// 1-5 digits: left-pad to 6 digits with zeros and parse as YYMMDD.
+			// Integer 0 is special: it means the zero date 0000-00-00 (not 2000-00-00).
+			if len(datePart) >= 1 && len(datePart) <= 5 {
+				n, err := strconv.Atoi(datePart)
+				if err == nil {
+					if n == 0 {
+						return "0000-00-00"
+					}
+					padded := fmt.Sprintf("%06d", n)
+					yy, _ := strconv.Atoi(padded[:2])
+					m, _ := strconv.Atoi(padded[2:4])
+					d, _ := strconv.Atoi(padded[4:6])
+					y := convert2DigitYear(yy)
+					if isValidDate(y, m, d) {
+						return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
+					}
+				}
 			}
 		}
 		return ""
@@ -24545,6 +24678,20 @@ func charsetEncoder(charset string) *encoding.Encoder {
 		return japanese.ShiftJIS.NewEncoder()
 	case "ujis":
 		return japanese.EUCJP.NewEncoder()
+	case "latin1":
+		return charmap.ISO8859_1.NewEncoder()
+	case "latin2":
+		return charmap.ISO8859_2.NewEncoder()
+	case "cp1250":
+		return charmap.Windows1250.NewEncoder()
+	case "cp1251":
+		return charmap.Windows1251.NewEncoder()
+	case "koi8r":
+		return charmap.KOI8R.NewEncoder()
+	case "greek":
+		return charmap.ISO8859_7.NewEncoder()
+	case "hebrew":
+		return charmap.ISO8859_8.NewEncoder()
 	default:
 		return nil
 	}
@@ -24564,6 +24711,12 @@ func charsetDecoder(charset string) *encoding.Decoder {
 		return charmap.ISO8859_7.NewDecoder()
 	case "latin2":
 		return charmap.ISO8859_2.NewDecoder()
+	case "cp1250":
+		return charmap.Windows1250.NewDecoder()
+	case "cp1251":
+		return charmap.Windows1251.NewDecoder()
+	case "koi8r":
+		return charmap.KOI8R.NewDecoder()
 	default:
 		return nil
 	}
@@ -24621,6 +24774,29 @@ func convertThroughCharset(s, charset string) (string, error) {
 	case "ucs2":
 		// Keep UCS2 display semantics in higher-level query paths.
 		return s, nil
+	case "latin1", "latin2", "cp1250", "cp1251", "koi8r", "greek", "hebrew":
+		// 8-bit charset: encode UTF-8 input to the target charset bytes.
+		// Return the raw charset bytes (not decoded back to UTF-8).
+		enc := charsetEncoder(cs)
+		if enc == nil {
+			return s, nil
+		}
+		encoded, err := encoding.ReplaceUnsupported(enc).Bytes([]byte(s))
+		if err != nil {
+			return s, err
+		}
+		return string(encoded), nil
+	case "ascii":
+		// ASCII is a subset of UTF-8; replace non-ASCII with '?'
+		var buf []byte
+		for _, r := range s {
+			if r < 0x80 {
+				buf = append(buf, byte(r))
+			} else {
+				buf = append(buf, '?')
+			}
+		}
+		return string(buf), nil
 	case "sjis", "ujis":
 		enc := charsetEncoder(cs)
 		dec := charsetDecoder(cs)

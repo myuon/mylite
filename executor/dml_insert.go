@@ -318,7 +318,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				}
 				colName := colNames[i]
 				if cm, ok := colMetaMap[colName]; ok {
-					v = coerceColumnValue(cm.col.Type, v)
+					v = e.coerceColumnValueForWrite(cm.col.Type, v)
 				}
 				row[colName] = v
 			}
@@ -897,7 +897,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							}
 						}
 					}
-					v = coerceColumnValue(col.Type, v)
+					v = e.coerceColumnValueForWrite(col.Type, v)
 					break
 				}
 			}
@@ -1036,7 +1036,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					// Pad BINARY(N) values, coerce DATE/TIME.
 					for _, col := range tbl.Def.Columns {
 						if col.Name == colName {
-							val = coerceColumnValue(col.Type, val)
+							val = e.coerceColumnValueForWrite(col.Type, val)
 							break
 						}
 					}

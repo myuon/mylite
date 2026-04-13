@@ -2617,7 +2617,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				tbl.Lock()
 				for i := range tbl.Rows {
 					if cur, ok := tbl.Rows[i][colDef.Name]; ok {
-						tbl.Rows[i][colDef.Name] = coerceValueForColumnType(colDef, cur)
+						tbl.Rows[i][colDef.Name] = e.coerceValueForColumnTypeForWrite(colDef, cur)
 					}
 				}
 				tbl.Unlock()
@@ -2652,7 +2652,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				tbl.Lock()
 				for i := range tbl.Rows {
 					if cur, ok := tbl.Rows[i][colDef.Name]; ok {
-						tbl.Rows[i][colDef.Name] = coerceValueForColumnType(colDef, cur)
+						tbl.Rows[i][colDef.Name] = e.coerceValueForColumnTypeForWrite(colDef, cur)
 					}
 				}
 				tbl.Unlock()

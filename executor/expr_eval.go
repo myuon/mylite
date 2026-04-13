@@ -1595,6 +1595,15 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 				return nil, nil
 			}
 			s := toString(val)
+			// For short strings (< 8 chars), try compact integer-to-date parsing
+			// (e.g., integer 1111 → "2000-11-11", 0 → "0000-00-00").
+			// This handles MySQL's YYMMDD/YYYMMDD shorthand for CAST AS DATE.
+			if len(s) < 8 {
+				if parsed := parseMySQLDateValue(s); parsed != "" {
+					return parsed, nil
+				}
+				return nil, nil
+			}
 			// CAST AS DATE strips time component and returns YYYY-MM-DD
 			if len(s) >= 10 {
 				s = s[:10]
