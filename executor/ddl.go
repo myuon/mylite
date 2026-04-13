@@ -1042,12 +1042,19 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		// Override/set collation from explicit COLLATE clause.
 		if col.Type.Options != nil && col.Type.Options.Collate != "" {
 			collLower := strings.ToLower(col.Type.Options.Collate)
+			// Validate the collation is known.
+			collCharset, collKnown := catalog.CharsetForCollation(collLower)
+			if !collKnown {
+				return nil, mysqlError(1273, "HY000", fmt.Sprintf("Unknown collation: '%s'", col.Type.Options.Collate))
+			}
+			// Validate collation is compatible with any explicit column charset.
+			if colDef.Charset != "" && !strings.EqualFold(collCharset, colDef.Charset) {
+				return nil, mysqlError(1253, "42000", fmt.Sprintf("COLLATION '%s' is not valid for CHARACTER SET '%s'", col.Type.Options.Collate, colDef.Charset))
+			}
 			colDef.Collation = collLower
 			// If no charset was set explicitly, derive it from the collation.
 			if colDef.Charset == "" {
-				if cs, ok := catalog.CharsetForCollation(collLower); ok {
-					colDef.Charset = cs
-				}
+				colDef.Charset = collCharset
 			}
 		}
 		if tUpper := strings.ToUpper(strings.TrimSpace(colDef.Type)); strings.HasPrefix(tUpper, "BIT(") {
