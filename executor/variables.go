@@ -1821,6 +1821,7 @@ var sysVarGlobalOnly = map[string]bool{
 	"key_cache_division_limit":                 true,
 	"innodb_flush_method":                      true,
 	"disabled_storage_engines":                 true,
+	"temptable_use_mmap":                       true,
 }
 
 // sysVarEnumSet contains system variables that are ENUM types where ON/OFF

@@ -1978,6 +1978,9 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 				} else if idxType == "SPATIAL" {
 					indexTypeStr = "SPATIAL"
 					// SPATIAL indexes show Collation=A in SHOW INDEX (both InnoDB and MyISAM)
+				} else if tblEngine == "MEMORY" || tblEngine == "HEAP" {
+					indexTypeStr = "HASH"
+					collation = nil
 				}
 				for i, col := range cols {
 					colName := normalizeIndexColumnName(col)
