@@ -186,7 +186,7 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 			// Coerce the PK value through the column type so that numeric TIME/YEAR
 			// values match the stored formatted strings (e.g. 111127 -> "11:11:27").
 			if pkColType, ok := colTypeByName[strings.ToLower(pkCol)]; ok {
-				coerced := coerceValueForColumnType(catalog.ColumnDef{Type: pkColType}, pkVal, e.isTimeTruncateFractionalMode())
+				coerced := coerceValueForColumnType(catalog.ColumnDef{Type: pkColType}, pkVal)
 				if coerced != nil {
 					keyStr = fmt.Sprintf("%v", coerced)
 				}
@@ -450,7 +450,7 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 							}
 						}
 					}
-					val = coerceColumnValue(col.Type, val, e.isTimeTruncateFractionalMode())
+					val = coerceColumnValue(col.Type, val)
 					break
 				}
 			}
@@ -995,7 +995,7 @@ nextRow:
 								break
 							}
 						}
-						val = coerceColumnValue(col.Type, val, e.isTimeTruncateFractionalMode())
+						val = coerceColumnValue(col.Type, val)
 						break
 					}
 				}

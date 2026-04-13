@@ -819,7 +819,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 							if i < len(row) {
 								val := row[i]
 								if colType, ok := colTypeMap[colName]; ok && val != nil {
-									val = coerceColumnValue(colType, val, e.isTimeTruncateFractionalMode())
+									val = coerceColumnValue(colType, val)
 								}
 								sRow[colName] = val
 							}
@@ -2599,7 +2599,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				tbl.Lock()
 				for i := range tbl.Rows {
 					if cur, ok := tbl.Rows[i][colDef.Name]; ok {
-						tbl.Rows[i][colDef.Name] = coerceValueForColumnType(colDef, cur, e.isTimeTruncateFractionalMode())
+						tbl.Rows[i][colDef.Name] = coerceValueForColumnType(colDef, cur)
 					}
 				}
 				tbl.Unlock()
@@ -2634,7 +2634,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				tbl.Lock()
 				for i := range tbl.Rows {
 					if cur, ok := tbl.Rows[i][colDef.Name]; ok {
-						tbl.Rows[i][colDef.Name] = coerceValueForColumnType(colDef, cur, e.isTimeTruncateFractionalMode())
+						tbl.Rows[i][colDef.Name] = coerceValueForColumnType(colDef, cur)
 					}
 				}
 				tbl.Unlock()
@@ -4404,38 +4404,6 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 					return argType
 				}
 			}
-		case "makedate":
-			// MAKEDATE(year, dayofyear) → date
-			return "date"
-		case "maketime":
-			// MAKETIME(hour, minute, second) → time
-			return "time"
-		case "timediff":
-			// TIMEDIFF(expr1, expr2) → time(6)
-			return "time(6)"
-		case "addtime", "subtime":
-			// ADDTIME/SUBTIME(expr, time): result type depends on first arg
-			// datetime arg → datetime(6), time arg → time(6)
-			if len(v.Exprs) >= 1 {
-				firstArgType := e.inferExprType(v.Exprs[0])
-				if strings.HasPrefix(firstArgType, "datetime") {
-					return "datetime(6)"
-				}
-				if strings.HasPrefix(firstArgType, "time") {
-					return "time(6)"
-				}
-			}
-			// Default: time(6)
-			return "time(6)"
-		case "timestamp":
-			// TIMESTAMP(expr) or TIMESTAMP(date, time) → datetime
-			return "datetime"
-		case "date":
-			// DATE(expr) → date
-			return "date"
-		case "time":
-			// TIME(expr) → time(6)
-			return "time(6)"
 		case "nullif":
 			// NULLIF(x, y) uses the type of the first argument.
 			if len(v.Exprs) >= 1 {
@@ -5111,7 +5079,7 @@ func (e *Executor) execCreateTableSelect(targetDB, newTableName, selectSQL strin
 			if i < len(row) {
 				val := row[i]
 				if colType, ok := colTypeMap[colName]; ok && val != nil {
-					val = coerceColumnValue(colType, val, e.isTimeTruncateFractionalMode())
+					val = coerceColumnValue(colType, val)
 				}
 				sRow[colName] = val
 			}
