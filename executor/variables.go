@@ -383,8 +383,9 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				if !isKnownCharset(csVal) {
 					return nil, mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", truncateErrVal(val)))
 				}
-				// Reject non-client-safe charsets for character_set_client and character_set_connection
-				if (name == "character_set_client" || name == "character_set_connection") && isNonClientCharset(csVal) {
+				// Reject non-client-safe charsets for character_set_client only
+				// (ucs2/utf16/utf16le/utf32 ARE allowed for character_set_connection and others)
+				if name == "character_set_client" && isNonClientCharset(csVal) {
 					return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", name, csVal))
 				}
 				e.setSysVar(name, csVal, isGlobal)

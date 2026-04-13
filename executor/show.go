@@ -318,8 +318,7 @@ func (e *Executor) describeTableFull(tableName string) (*Result, error) {
 		// String types get a collation
 		if strings.Contains(colTypeUpper, "CHAR") || strings.Contains(colTypeUpper, "TEXT") ||
 			strings.Contains(colTypeUpper, "ENUM") || strings.Contains(colTypeUpper, "SET") {
-			collation = "utf8mb4_0900_ai_ci"
-			// Try to extract charset/collation from column definition
+			// Resolve using structured col.Charset / col.Collation fields.
 			fieldName := ""
 			if row[0] != nil {
 				fieldName = toString(row[0])
@@ -329,66 +328,26 @@ func (e *Executor) describeTableFull(tableName string) (*Result, error) {
 			if strings.Contains(descTbl, ".") {
 				descDB, descTbl = resolveTableNameDB(descTbl, e.CurrentDB)
 			}
+			resolved := false
 			if dbObj, err2 := e.Catalog.GetDatabase(descDB); err2 == nil {
 				if tblDef, err2 := dbObj.GetTable(descTbl); err2 == nil && tblDef != nil {
 					for _, cd := range tblDef.Columns {
 						if strings.EqualFold(cd.Name, fieldName) {
-							// Check for CHARACTER SET in column type
-							cdUpper := strings.ToUpper(cd.Type)
-							if idx := strings.Index(cdUpper, "CHARACTER SET "); idx >= 0 {
-								rest := cd.Type[idx+len("CHARACTER SET "):]
-								parts := strings.Fields(rest)
-								if len(parts) > 0 {
-									cs := strings.ToLower(parts[0])
-									// Map charset to default collation
-									switch cs {
-									case "latin1":
-										collation = "latin1_swedish_ci"
-									case "utf8", "utf8mb3":
-										collation = "utf8_general_ci"
-									case "binary":
-										collation = "binary"
-									case "gb2312":
-										collation = "gb2312_chinese_ci"
-									case "gbk":
-										collation = "gbk_chinese_ci"
-									case "gb18030":
-										collation = "gb18030_chinese_ci"
-									case "cp1250":
-										collation = "cp1250_general_ci"
-									case "ascii":
-										collation = "ascii_general_ci"
-									case "latin2":
-										collation = "latin2_general_ci"
-									case "cp932":
-										collation = "cp932_japanese_ci"
-									case "ujis":
-										collation = "ujis_japanese_ci"
-									case "ucs2":
-										collation = "ucs2_general_ci"
-									case "utf16":
-										collation = "utf16_general_ci"
-									case "utf32":
-										collation = "utf32_general_ci"
-									case "tis620":
-										collation = "tis620_thai_ci"
-									default:
-										collation = cs + "_general_ci"
-									}
-								}
+							if cd.Collation != "" {
+								collation = cd.Collation
+							} else if cd.Charset != "" {
+								collation = catalog.DefaultCollationForCharset(cd.Charset)
+							} else if tblDef.Charset != "" {
+								collation = catalog.DefaultCollationForCharset(tblDef.Charset)
 							}
-							// Check for COLLATE in column type
-							if idx := strings.Index(cdUpper, "COLLATE "); idx >= 0 {
-								rest := cd.Type[idx+len("COLLATE "):]
-								parts := strings.Fields(rest)
-								if len(parts) > 0 {
-									collation = strings.ToLower(parts[0])
-								}
-							}
+							resolved = true
 							break
 						}
 					}
 				}
+			}
+			if !resolved || collation == nil {
+				collation = "utf8mb4_0900_ai_ci"
 			}
 		}
 		privileges := "select,insert,update,references"

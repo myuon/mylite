@@ -1039,6 +1039,17 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		} else if strings.EqualFold(tableCharset, "binary") {
 			// Table-level CHARACTER SET binary propagates to columns without explicit charset.
 		}
+		// Override/set collation from explicit COLLATE clause.
+		if col.Type.Options != nil && col.Type.Options.Collate != "" {
+			collLower := strings.ToLower(col.Type.Options.Collate)
+			colDef.Collation = collLower
+			// If no charset was set explicitly, derive it from the collation.
+			if colDef.Charset == "" {
+				if cs, ok := catalog.CharsetForCollation(collLower); ok {
+					colDef.Charset = cs
+				}
+			}
+		}
 		if tUpper := strings.ToUpper(strings.TrimSpace(colDef.Type)); strings.HasPrefix(tUpper, "BIT(") {
 			var width int
 			if n, err := fmt.Sscanf(tUpper, "BIT(%d)", &width); err == nil && n == 1 {
