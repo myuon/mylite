@@ -20361,14 +20361,6 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				leftOvRow = oe
 				if isBitOpRow && oe.kind == "DECIMAL" {
 					left = int64(math.MaxInt64)
-				} else if isBitOpRow && oe.kind == "BINARY" {
-					// Large hex literal (0x...) overflow in a bit op: treat as binary bytes
-					hexStr := oe.val
-					if len(hexStr)%2 != 0 {
-						hexStr = "0" + hexStr
-					}
-					left = HexBytes(hexStr)
-					leftOvRow = nil // Don't emit overflow warning for binary case
 				} else {
 					left = uint64(math.MaxUint64)
 				}
@@ -20378,11 +20370,18 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				return nil, err
 			}
 		}
-		// When a HexNum literal overflows uint64, the default: case in evalRowExpr returns
-		// the hex digit string (oe.val) without error. Detect this and convert to HexBytes
-		// for correct binary byte-wise operations.
+		// For HexNum literals that fit in uint64, convert to HexBytes for byte-wise bit ops.
+		// Overflow detection (>8 decoded bytes) is deferred until both sides are evaluated,
+		// so we can check whether the other side is also binary (byte-wise context).
+		var leftOverflowHexBytes HexBytes
 		if isBitOpRow && leftIsHexLit && err == nil {
-			if s, ok := left.(string); ok {
+			if hb, ok := left.(HexBytes); ok {
+				decoded, decErr := hex.DecodeString(string(hb))
+				if decErr == nil && len(decoded) > 8 {
+					leftOverflowHexBytes = hb // defer decision until right is known
+				}
+				// If <= 8 bytes, keep as HexBytes for normal byte-wise operations
+			} else if s, ok := left.(string); ok {
 				hexStr := s
 				if len(hexStr)%2 != 0 {
 					hexStr = "0" + hexStr
@@ -20407,14 +20406,6 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				rightOvRow = oe
 				if isBitOpRow && oe.kind == "DECIMAL" {
 					right = int64(math.MaxInt64)
-				} else if isBitOpRow && oe.kind == "BINARY" {
-					// Large hex literal (0x...) overflow in a bit op: treat as binary bytes
-					hexStr := oe.val
-					if len(hexStr)%2 != 0 {
-						hexStr = "0" + hexStr
-					}
-					right = HexBytes(hexStr)
-					rightOvRow = nil // Don't emit overflow warning for binary case
 				} else {
 					right = uint64(math.MaxUint64)
 				}
@@ -20424,11 +20415,17 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				return nil, err
 			}
 		}
-		// When a HexNum literal overflows uint64, the default: case in evalRowExpr returns
-		// the hex digit string (oe.val) without error. Detect this and convert to HexBytes
-		// for correct binary byte-wise operations.
+		// For HexNum literals that fit in uint64, convert to HexBytes for byte-wise bit ops.
+		// Overflow detection (>8 decoded bytes) is deferred until both sides are evaluated.
+		var rightOverflowHexBytes HexBytes
 		if isBitOpRow && rightIsHexLit && err == nil {
-			if s, ok := right.(string); ok {
+			if hb, ok := right.(HexBytes); ok {
+				decoded, decErr := hex.DecodeString(string(hb))
+				if decErr == nil && len(decoded) > 8 {
+					rightOverflowHexBytes = hb // defer decision until left is known
+				}
+				// If <= 8 bytes, keep as HexBytes for normal byte-wise operations
+			} else if s, ok := right.(string); ok {
 				hexStr := s
 				if len(hexStr)%2 != 0 {
 					hexStr = "0" + hexStr
@@ -20443,6 +20440,37 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		if isBitOpRow && err == nil && e.isBinaryExpr(v.Right) {
 			if s, ok := right.(string); ok {
 				right = HexBytes(strings.ToUpper(hex.EncodeToString([]byte(s))))
+			}
+		}
+		// Now that both sides are known, resolve deferred overflow hex literals.
+		// If the other side is binary (HexBytes), keep as HexBytes for byte-wise ops.
+		// If the other side is NOT binary (integer context), clamp to MaxUint64 + warning.
+		if leftOverflowHexBytes != "" {
+			_, rightIsBinary := toBinaryBytesForBitOp(right)
+			if rightIsBinary {
+				left = leftOverflowHexBytes // byte-wise context: keep as HexBytes
+			} else {
+				hbStr := string(leftOverflowHexBytes)
+				oe := &intOverflowError{val: strings.TrimLeft(hbStr, "0"), kind: "BINARY"}
+				if oe.val == "" {
+					oe.val = "0"
+				}
+				e.addWarning("Warning", 1292, formatOverflowWarningMsg(oe))
+				left = uint64(math.MaxUint64)
+			}
+		}
+		if rightOverflowHexBytes != "" {
+			_, leftIsBinary := toBinaryBytesForBitOp(left)
+			if leftIsBinary {
+				right = rightOverflowHexBytes // byte-wise context: keep as HexBytes
+			} else {
+				hbStr := string(rightOverflowHexBytes)
+				oe := &intOverflowError{val: strings.TrimLeft(hbStr, "0"), kind: "BINARY"}
+				if oe.val == "" {
+					oe.val = "0"
+				}
+				e.addWarning("Warning", 1292, formatOverflowWarningMsg(oe))
+				right = uint64(math.MaxUint64)
 			}
 		}
 		if leftOvRow != nil {
@@ -20523,13 +20551,23 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			}
 		}
 		// For plus/minus operations, handle hex literal overflow:
-		// When a HexNum literal overflowed uint64, evalRowExpr default case returns the hex
-		// string (oe.val) instead of an error. Detect this and clamp to MaxUint64 + warning.
+		// When a HexNum literal overflowed uint64, evalRowExpr default case returns HexBytes.
+		// Detect overflow (>8 decoded bytes) and clamp to MaxUint64 + warning.
 		if isPlusMinusRow && leftOvRow == nil && leftIsHexLit {
-			if s, ok := left.(string); ok {
-				// Try to parse as hex: strip leading zeros and check if it overflows uint64.
+			if hb, ok := left.(HexBytes); ok {
+				decoded, decErr := hex.DecodeString(string(hb))
+				if decErr == nil && len(decoded) > 8 {
+					oe := &intOverflowError{val: strings.TrimLeft(string(hb), "0"), kind: "BINARY"}
+					if oe.val == "" {
+						oe.val = "0"
+					}
+					e.addWarning("Warning", 1292, formatOverflowWarningMsg(oe))
+					left = uint64(math.MaxUint64)
+				}
+			} else if s, ok := left.(string); ok {
+				// Fallback: string form (shouldn't happen but handle for safety)
 				hexStr := strings.TrimLeft(s, "0")
-				if len(hexStr) > 16 { // More than 16 hex chars = > 8 bytes = overflows uint64
+				if len(hexStr) > 16 {
 					oe := &intOverflowError{val: s, kind: "BINARY"}
 					e.addWarning("Warning", 1292, formatOverflowWarningMsg(oe))
 					left = uint64(math.MaxUint64)
@@ -20537,7 +20575,17 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			}
 		}
 		if isPlusMinusRow && rightOvRow == nil && rightIsHexLit {
-			if s, ok := right.(string); ok {
+			if hb, ok := right.(HexBytes); ok {
+				decoded, decErr := hex.DecodeString(string(hb))
+				if decErr == nil && len(decoded) > 8 {
+					oe := &intOverflowError{val: strings.TrimLeft(string(hb), "0"), kind: "BINARY"}
+					if oe.val == "" {
+						oe.val = "0"
+					}
+					e.addWarning("Warning", 1292, formatOverflowWarningMsg(oe))
+					right = uint64(math.MaxUint64)
+				}
+			} else if s, ok := right.(string); ok {
 				hexStr := strings.TrimLeft(s, "0")
 				if len(hexStr) > 16 {
 					oe := &intOverflowError{val: s, kind: "BINARY"}

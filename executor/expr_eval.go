@@ -710,14 +710,6 @@ func (e *Executor) evalBinaryOp(v *sqlparser.BinaryExpr) (interface{}, error) {
 			// INTEGER overflow in bitwise ops clamps to MaxUint64.
 			if isBitOp && oe.kind == "DECIMAL" {
 				left = int64(math.MaxInt64)
-			} else if isBitOp && oe.kind == "BINARY" {
-				// Large hex literal overflow in bit op: treat as binary bytes
-				hexStr := oe.val
-				if len(hexStr)%2 != 0 {
-					hexStr = "0" + hexStr
-				}
-				left = HexBytes(hexStr)
-				leftOverflow = nil // Don't emit overflow warning for binary case
 			} else {
 				left = uint64(math.MaxUint64)
 			}
@@ -738,14 +730,6 @@ func (e *Executor) evalBinaryOp(v *sqlparser.BinaryExpr) (interface{}, error) {
 			rightOverflow = oe
 			if isBitOp && oe.kind == "DECIMAL" {
 				right = int64(math.MaxInt64)
-			} else if isBitOp && oe.kind == "BINARY" {
-				// Large hex literal overflow in bit op: treat as binary bytes
-				hexStr := oe.val
-				if len(hexStr)%2 != 0 {
-					hexStr = "0" + hexStr
-				}
-				right = HexBytes(hexStr)
-				rightOverflow = nil // Don't emit overflow warning for binary case
 			} else {
 				right = uint64(math.MaxUint64)
 			}
