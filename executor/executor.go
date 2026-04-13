@@ -24679,13 +24679,16 @@ func charsetEncoder(charset string) *encoding.Encoder {
 	case "ujis":
 		return japanese.EUCJP.NewEncoder()
 	case "latin1":
-		return charmap.ISO8859_1.NewEncoder()
+		// MySQL treats latin1 as cp1252 (Windows-1252) per WL-1494.
+		return charmap.Windows1252.NewEncoder()
 	case "latin2":
 		return charmap.ISO8859_2.NewEncoder()
 	case "cp1250":
 		return charmap.Windows1250.NewEncoder()
 	case "cp1251":
 		return charmap.Windows1251.NewEncoder()
+	case "cp1252":
+		return charmap.Windows1252.NewEncoder()
 	case "koi8r":
 		return charmap.KOI8R.NewEncoder()
 	case "greek":
@@ -24715,6 +24718,8 @@ func charsetDecoder(charset string) *encoding.Decoder {
 		return charmap.Windows1250.NewDecoder()
 	case "cp1251":
 		return charmap.Windows1251.NewDecoder()
+	case "cp1252":
+		return charmap.Windows1252.NewDecoder()
 	case "koi8r":
 		return charmap.KOI8R.NewDecoder()
 	default:
@@ -24774,7 +24779,7 @@ func convertThroughCharset(s, charset string) (string, error) {
 	case "ucs2":
 		// Keep UCS2 display semantics in higher-level query paths.
 		return s, nil
-	case "latin1", "latin2", "cp1250", "cp1251", "koi8r", "greek", "hebrew":
+	case "latin1", "latin2", "cp1250", "cp1251", "cp1252", "koi8r", "greek", "hebrew":
 		// 8-bit charset: encode UTF-8 input to the target charset bytes.
 		// Return the raw charset bytes (not decoded back to UTF-8).
 		enc := charsetEncoder(cs)
