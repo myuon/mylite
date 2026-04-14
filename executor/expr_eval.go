@@ -7229,6 +7229,15 @@ func ftsEvalBoolean(docText, searchStr string, minTokenSize int) float64 {
 // boolTermOp represents a boolean operator for a search term.
 type boolTermOp int
 
+const (
+	boolDefault boolTermOp = iota // optional (OR semantics)
+	boolRequired                  // + (AND required)
+	boolExcluded                  // - (NOT excluded)
+	boolNegate                    // ~ (present but negated rank)
+	boolIncRank                   // > (increase rank)
+	boolDecRank                   // < (decrease rank)
+)
+
 // boolTerm represents a single term or sub-expression in a boolean FTS query.
 type boolTerm struct {
 	op       boolTermOp
