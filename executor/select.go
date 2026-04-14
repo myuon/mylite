@@ -3198,10 +3198,13 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 				groups = append(groups, group{key: key, rows: []storage.Row{row}})
 			}
 		}
-		// MySQL sorts GROUP BY groups by key (ascending, NULLs first)
-		sort.SliceStable(groups, func(i, j int) bool {
-			return compareGroupKeys(groups[i].key, groups[j].key) < 0
-		})
+		// MySQL only sorts GROUP BY groups when WITH ROLLUP is specified.
+		// Without ROLLUP, groups appear in insertion (first-seen) order.
+		if stmt.GroupBy.WithRollup {
+			sort.SliceStable(groups, func(i, j int) bool {
+				return compareGroupKeys(groups[i].key, groups[j].key) < 0
+			})
+		}
 	} else {
 		// No GROUP BY but has aggregates: treat all rows as one group
 		groups = []group{{key: "", rows: allRows}}
@@ -3505,69 +3508,129 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 		// For each level from numGroupCols-1 down to 0:
 		// Insert rollup rows after each change in the prefix key at that level.
 
-		// First, collect rollup rows to insert. Work from deepest to shallowest.
-		// We need the original row data (allRows) grouped by prefix.
-		// Map from group key (from groups) to its allRows subset.
-		groupAllRows := make(map[string][]storage.Row) // group key -> raw rows
-		for _, row := range allRows {
-			key := computeGroupKey(groupByExprs, row)
-			groupAllRows[key] = append(groupAllRows[key], row)
+		// Build a mapping from each GROUP BY expression to its index in colNames/result rows.
+		// This allows us to extract prefix keys directly from result rows.
+		gbColIdxs := make([]int, numGroupCols) // gbColIdxs[k] = colNames index for groupByExprs[k]
+		for k, gbExpr := range groupByExprs {
+			gbColIdxs[k] = -1
+			gbStr := sqlparser.String(gbExpr)
+			for ci, cname := range colNames {
+				if strings.EqualFold(cname, gbStr) {
+					gbColIdxs[k] = ci
+					break
+				}
+			}
+			// Fallback: match by column name only (without table qualifier)
+			if gbColIdxs[k] == -1 {
+				if col, ok := gbExpr.(*sqlparser.ColName); ok {
+					colStr := col.Name.String()
+					for ci, cname := range colNames {
+						if strings.EqualFold(cname, colStr) {
+							gbColIdxs[k] = ci
+							break
+						}
+					}
+				}
+			}
+			// Final fallback: use position k if still not found
+			if gbColIdxs[k] == -1 && k < len(colNames) {
+				gbColIdxs[k] = k
+			}
 		}
 
-		// Now insert rollup rows. Process the resultRows and groups.
+		// rowPrefixKey computes the prefix key for a result row at the given level.
+		// Uses the first `level` GROUP BY column values from the result row.
+		rowPrefixKey := func(row []interface{}, level int) string {
+			parts := make([]string, level)
+			for k := 0; k < level; k++ {
+				idx := gbColIdxs[k]
+				if idx >= 0 && idx < len(row) {
+					parts[k] = fmt.Sprintf("%v", row[idx])
+				} else {
+					parts[k] = "<nil>"
+				}
+			}
+			return strings.Join(parts, "\x00")
+		}
+
+		// isRollupRow returns true if the result row is a rollup row at level `l` or deeper.
+		// A rollup row at level l has nil in its l-th GROUP BY column.
+		isRollupRow := func(row []interface{}, l int) bool {
+			if l >= numGroupCols {
+				return false
+			}
+			idx := gbColIdxs[l]
+			if idx < 0 || idx >= len(row) {
+				return false
+			}
+			return row[idx] == nil
+		}
+
+		// Build a mapping from prefix key (first `level` group-by values) to original storage.Rows.
+		// prefixSourceRows[level][prefixKey] = []storage.Row
+		prefixSourceRows := make([]map[string][]storage.Row, numGroupCols)
+		for l := 0; l < numGroupCols; l++ {
+			prefixSourceRows[l] = make(map[string][]storage.Row)
+		}
+		for _, g := range groups {
+			for l := 0; l < numGroupCols; l++ {
+				prefixKey := computeGroupKey(groupByExprs[:l], g.rows[0])
+				prefixSourceRows[l][prefixKey] = append(prefixSourceRows[l][prefixKey], g.rows...)
+			}
+		}
+
+		// Insert rollup rows. Process from deepest level up to level 0.
+		// At each level, we insert a rollup row after each contiguous block of rows
+		// that share the same prefix at that level. Non-rollup rows AND rollup rows
+		// from deeper levels (which have nil only in columns >= level) all belong
+		// to a prefix group; rollup rows from the same level or shallower are skipped.
 		newResult := make([][]interface{}, 0, len(resultRows)*2)
 		for level := numGroupCols - 1; level >= 0; level-- {
-			// Track prefix key changes at this level
 			prevPrefix := ""
-			var prefixRows []storage.Row
 			source := resultRows
 			if level < numGroupCols-1 {
 				source = newResult
 				newResult = make([][]interface{}, 0, len(source)*2)
 			}
-			for gi, row := range source {
-				// Determine the prefix key for this row from the original groups
+			for i, row := range source {
+				// Skip rows that are rollup rows at this level or shallower
+				// (they were inserted by this or a previous level iteration).
+				if isRollupRow(row, level) {
+					newResult = append(newResult, row)
+					continue
+				}
+				// Compute prefix for this row at the current level
 				var thisPrefix string
 				if level == 0 {
 					thisPrefix = ""
-				} else if gi < len(groups) {
-					if len(groups[gi].rows) > 0 {
-						thisPrefix = computeGroupKey(groupByExprs[:level], groups[gi].rows[0])
-					}
 				} else {
-					// This is a rollup row from a previous level
-					thisPrefix = "__rollup__"
+					thisPrefix = rowPrefixKey(row, level)
 				}
-
-				if gi > 0 && gi <= len(groups) && thisPrefix != prevPrefix && prevPrefix != "__rollup__" {
-					// Prefix changed: insert rollup row for previous prefix
-					rollupRow, err := buildRollupRow(prefixRows, level)
+				// When the prefix changes (and we're not at the very first row), insert rollup
+				if i > 0 && thisPrefix != prevPrefix && prevPrefix != "" {
+					// Find the original rows for prevPrefix
+					srcRows := prefixSourceRows[level][prevPrefix]
+					rollupRow, err := buildRollupRow(srcRows, level)
 					if err != nil {
 						return nil, err
 					}
 					newResult = append(newResult, rollupRow)
-					prefixRows = nil
 				}
-
-				if gi < len(groups) && thisPrefix != "__rollup__" {
-					if thisPrefix != prevPrefix {
-						prefixRows = nil
-					}
-					prefixRows = append(prefixRows, groups[gi].rows...)
-					prevPrefix = thisPrefix
-				}
-
+				prevPrefix = thisPrefix
 				newResult = append(newResult, row)
 			}
-			// Insert final rollup row for the last prefix (or grand total at level 0)
-			if level == 0 && len(allRows) > 0 {
-				rollupRow, err := buildRollupRow(allRows, 0)
-				if err != nil {
-					return nil, err
+			// Insert rollup row for the last prefix
+			if level == 0 {
+				if len(allRows) > 0 {
+					rollupRow, err := buildRollupRow(allRows, 0)
+					if err != nil {
+						return nil, err
+					}
+					newResult = append(newResult, rollupRow)
 				}
-				newResult = append(newResult, rollupRow)
-			} else if len(prefixRows) > 0 {
-				rollupRow, err := buildRollupRow(prefixRows, level)
+			} else if prevPrefix != "" {
+				srcRows := prefixSourceRows[level][prevPrefix]
+				rollupRow, err := buildRollupRow(srcRows, level)
 				if err != nil {
 					return nil, err
 				}
