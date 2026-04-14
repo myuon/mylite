@@ -21152,6 +21152,28 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				}
 				// Row IN tuple-of-tuples: (a,b) IN ((1,2),(3,4)) or nested (a,(b,c)) IN ((1,(2,3)),...)
 				if rightTupleIN, ok := v.Right.(sqlparser.ValTuple); ok {
+					// MySQL validates all IN-list items structurally BEFORE evaluating any
+					// match. Do a pre-validation pass over all items in rightTupleIN.
+					for _, item := range rightTupleIN {
+						switch rItem := item.(type) {
+						case sqlparser.ValTuple:
+							if err := validateRowTupleStructure(leftTupleIN, rItem); err != nil {
+								return nil, err
+							}
+						case *sqlparser.Subquery:
+							// A subquery returns a flat row; if any element of leftTupleIN
+							// is a nested tuple, the subquery can never match that element.
+							for _, lElem := range leftTupleIN {
+								if lNested, ok := lElem.(sqlparser.ValTuple); ok {
+									return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(lNested)))
+								}
+							}
+						default:
+							// Non-tuple item: break out (fall through to scalar handling)
+							break
+						}
+					}
+
 					// Evaluate left tuple values with row context (supports nested tuples)
 					leftValsIN := make([]interface{}, len(leftTupleIN))
 					for i, lExpr := range leftTupleIN {
@@ -21164,33 +21186,67 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 					hasNullIN := false
 					leftRowIN := interface{}(leftValsIN)
 					for _, item := range rightTupleIN {
-						rowTupleIN, isRowTuple := item.(sqlparser.ValTuple)
-						if !isRowTuple {
-							break // fall through to scalar handling
-						}
-						if len(rowTupleIN) != len(leftTupleIN) {
-							return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTupleIN)))
-						}
-						rValsIN := make([]interface{}, len(rowTupleIN))
-						for i, rv := range rowTupleIN {
-							rVal, err := e.evalRowExprTupleAware(rv, row)
+						switch rItemEval := item.(type) {
+						case sqlparser.ValTuple:
+							rValsIN := make([]interface{}, len(rItemEval))
+							for i, rv := range rItemEval {
+								rVal, err := e.evalRowExprTupleAware(rv, row)
+								if err != nil {
+									return nil, err
+								}
+								rValsIN[i] = rVal
+							}
+							equal, rowHasNull, err := rowTuplesEqual(leftRowIN, interface{}(rValsIN))
 							if err != nil {
 								return nil, err
 							}
-							rValsIN[i] = rVal
-						}
-						equal, rowHasNull, err := rowTuplesEqual(leftRowIN, interface{}(rValsIN))
-						if err != nil {
-							return nil, err
-						}
-						if equal {
-							if v.Operator == sqlparser.InOp {
-								return int64(1), nil
+							if equal {
+								if v.Operator == sqlparser.InOp {
+									return int64(1), nil
+								}
+								return int64(0), nil
 							}
-							return int64(0), nil
-						}
-						if rowHasNull {
-							hasNullIN = true
+							if rowHasNull {
+								hasNullIN = true
+							}
+						case *sqlparser.Subquery:
+							// Subquery with no nested left elements: execute and compare.
+							subResult, err := e.execSubquery(rItemEval, row)
+							if err != nil {
+								return nil, err
+							}
+							if len(subResult.Columns) != len(leftTupleIN) {
+								return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTupleIN)))
+							}
+							for _, subRow := range subResult.Rows {
+								if len(subRow) != len(leftValsIN) {
+									continue
+								}
+								allMatch := true
+								rowHasNull := false
+								for i := 0; i < len(leftValsIN); i++ {
+									lv, rv := leftValsIN[i], subRow[i]
+									if lv == nil || rv == nil {
+										rowHasNull = true
+										allMatch = false
+										break
+									}
+									match, _ := compareValues(lv, rv, sqlparser.EqualOp)
+									if !match {
+										allMatch = false
+										break
+									}
+								}
+								if allMatch {
+									if v.Operator == sqlparser.InOp {
+										return int64(1), nil
+									}
+									return int64(0), nil
+								}
+								if rowHasNull {
+									hasNullIN = true
+								}
+							}
 						}
 					}
 					if hasNullIN {

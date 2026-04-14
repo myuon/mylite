@@ -1012,6 +1012,31 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 			// Right side must be a ValTuple where each element is itself a ValTuple.
 			if rightTuple, ok := v.Right.(sqlparser.ValTuple); ok {
 				leftTuple := v.Left.(sqlparser.ValTuple)
+
+				// MySQL validates all IN-list items structurally BEFORE evaluating any
+				// match. Do a pre-validation pass over all items in rightTuple.
+				for _, item := range rightTuple {
+					switch rItem := item.(type) {
+					case sqlparser.ValTuple:
+						// Each tuple item must structurally match leftTuple.
+						if err := validateRowTupleStructure(leftTuple, rItem); err != nil {
+							return nil, err
+						}
+					case *sqlparser.Subquery:
+						// A subquery returns a flat row; if any element of leftTuple
+						// is a nested tuple, the subquery can never match that element.
+						// MySQL reports an error in this case.
+						for _, lElem := range leftTuple {
+							if lNested, ok := lElem.(sqlparser.ValTuple); ok {
+								return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(lNested)))
+							}
+						}
+					default:
+						// Non-tuple, non-subquery item in a tuple-IN context: fall through to scalar path.
+						goto scalarIN
+					}
+				}
+
 				// Evaluate left tuple values once (recursively, to support nested tuples)
 				leftVals := make([]interface{}, len(leftTuple))
 				for i, lExpr := range leftTuple {
@@ -1025,34 +1050,67 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 				// Wrap leftVals as a []interface{} row for recursive comparison
 				leftRow := interface{}(leftVals)
 				for _, item := range rightTuple {
-					rowTuple, isRowTuple := item.(sqlparser.ValTuple)
-					if !isRowTuple {
-						// Degenerate: right contains non-tuple items; fall through to scalar path
-						goto scalarIN
-					}
-					if len(rowTuple) != len(leftTuple) {
-						return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTuple)))
-					}
-					rVals := make([]interface{}, len(rowTuple))
-					for i, rv := range rowTuple {
-						rVal, err := e.evalTupleAware(rv)
+					switch rItem := item.(type) {
+					case sqlparser.ValTuple:
+						rVals := make([]interface{}, len(rItem))
+						for i, rv := range rItem {
+							rVal, err := e.evalTupleAware(rv)
+							if err != nil {
+								return nil, err
+							}
+							rVals[i] = rVal
+						}
+						equal, rowHasNull, err := rowTuplesEqual(leftRow, interface{}(rVals))
 						if err != nil {
 							return nil, err
 						}
-						rVals[i] = rVal
-					}
-					equal, rowHasNull, err := rowTuplesEqual(leftRow, interface{}(rVals))
-					if err != nil {
-						return nil, err
-					}
-					if equal {
-						if v.Operator == sqlparser.InOp {
-							return int64(1), nil
+						if equal {
+							if v.Operator == sqlparser.InOp {
+								return int64(1), nil
+							}
+							return int64(0), nil
 						}
-						return int64(0), nil
-					}
-					if rowHasNull {
-						hasNull = true
+						if rowHasNull {
+							hasNull = true
+						}
+					case *sqlparser.Subquery:
+						// Subquery with no nested left elements: execute and compare.
+						subResult, err := e.execSubquery(rItem, e.correlatedRow)
+						if err != nil {
+							return nil, err
+						}
+						if len(subResult.Columns) != len(leftTuple) {
+							return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTuple)))
+						}
+						for _, subRow := range subResult.Rows {
+							if len(subRow) != len(leftVals) {
+								continue
+							}
+							allMatch := true
+							rowHasNull := false
+							for i := 0; i < len(leftVals); i++ {
+								lv, rv := leftVals[i], subRow[i]
+								if lv == nil || rv == nil {
+									rowHasNull = true
+									allMatch = false
+									break
+								}
+								match, _ := compareValues(lv, rv, sqlparser.EqualOp)
+								if !match {
+									allMatch = false
+									break
+								}
+							}
+							if allMatch {
+								if v.Operator == sqlparser.InOp {
+									return int64(1), nil
+								}
+								return int64(0), nil
+							}
+							if rowHasNull {
+								hasNull = true
+							}
+						}
 					}
 				}
 				if hasNull {
