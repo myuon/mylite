@@ -14200,6 +14200,12 @@ func checkTimeStrict(colType, colName, originalValue string, rowNum int) error {
 		return nil
 	}
 
+	// DATETIME-formatted values (e.g. "2007-02-13 09:09:33") are valid for TIME columns;
+	// MySQL extracts the time portion. Skip strict range check for these.
+	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
+		return nil
+	}
+
 	// Extract fractional-seconds precision from column type, e.g. TIME(6) -> 6
 	fsp := 0
 	if strings.HasPrefix(upper, "TIME(") {
