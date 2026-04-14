@@ -705,8 +705,10 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		if len(parts) >= 4 {
 			// Handle optional IF NOT EXISTS: SHOW CREATE DATABASE IF NOT EXISTS `db`
 			dbName := parts[3]
+			ifNotExists := false
 			if strings.ToUpper(dbName) == "IF" && len(parts) >= 6 {
 				dbName = parts[5]
+				ifNotExists = true
 			}
 			dbName = strings.TrimRight(dbName, ";")
 			dbName = strings.ReplaceAll(dbName, "`", "")
@@ -729,14 +731,18 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			// Show COLLATE when charset is utf8mb4 (MySQL always shows it) or
 			// when collation differs from the charset's default collation.
 			var createSQL string
+			ifne := ""
+			if ifNotExists {
+				ifne = "/*!32312 IF NOT EXISTS*/ "
+			}
 			defaultCollation := catalog.DefaultCollationForCharset(charset)
 			if charset == "utf8mb4" || (collation != "" && collation != defaultCollation) {
 				if collation == "" {
 					collation = defaultCollation
 				}
-				createSQL = fmt.Sprintf("CREATE DATABASE /*!32312 IF NOT EXISTS*/ %s /*!40100 DEFAULT CHARACTER SET %s COLLATE %s */ /*!80016 DEFAULT ENCRYPTION='N' */", quotedName, charset, collation)
+				createSQL = fmt.Sprintf("CREATE DATABASE %s%s /*!40100 DEFAULT CHARACTER SET %s COLLATE %s */ /*!80016 DEFAULT ENCRYPTION='N' */", ifne, quotedName, charset, collation)
 			} else {
-				createSQL = fmt.Sprintf("CREATE DATABASE /*!32312 IF NOT EXISTS*/ %s /*!40100 DEFAULT CHARACTER SET %s */ /*!80016 DEFAULT ENCRYPTION='N' */", quotedName, charset)
+				createSQL = fmt.Sprintf("CREATE DATABASE %s%s /*!40100 DEFAULT CHARACTER SET %s */ /*!80016 DEFAULT ENCRYPTION='N' */", ifne, quotedName, charset)
 			}
 			return &Result{
 				Columns:     []string{"Database", "Create Database"},
