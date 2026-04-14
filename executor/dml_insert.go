@@ -525,10 +525,9 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 		}
 		// Check for ambiguous column references in ON DUPLICATE KEY UPDATE expressions.
-		// MySQL error 1052: if an unqualified column name in the ODKU clause exists in
-		// both the SELECT source result columns AND the target table columns, AND the
-		// expression also contains a table-qualified reference to the source table.
-		// If the ODKU expression only has unqualified references, they refer to the target table.
+		// MySQL error 1052: if an unqualified column name in the ODKU RHS expression
+		// exists in both the SELECT source result columns AND the target table columns,
+		// it is ambiguous and MySQL raises ER_NON_UNIQ_ERROR.
 		if len(stmt.OnDup) > 0 {
 			sourceColSet := make(map[string]bool, len(selResult.Columns))
 			for _, sc := range selResult.Columns {
@@ -539,22 +538,8 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				targetColSet[strings.ToLower(tc.Name)] = true
 			}
 			for _, upd := range stmt.OnDup {
-				// Check if the expression contains ANY table-qualified column reference.
-				// If it does, then unqualified columns that exist in both source and target are ambiguous.
-				hasQualifiedSourceRef := false
-				_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
-					if colName, ok := node.(*sqlparser.ColName); ok {
-						if !colName.Qualifier.IsEmpty() && !strings.EqualFold(colName.Qualifier.Name.String(), tableName) {
-							hasQualifiedSourceRef = true
-							return false, nil
-						}
-					}
-					return true, nil
-				}, upd.Expr)
-				if !hasQualifiedSourceRef {
-					continue
-				}
-				// Collect all unqualified column references in the update expression
+				// Check all unqualified column references in the update RHS expression.
+				// If a column name exists in both source and target, it is ambiguous.
 				if walkErr := sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
 					if colName, ok := node.(*sqlparser.ColName); ok {
 						if colName.Qualifier.IsEmpty() {
