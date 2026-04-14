@@ -1349,6 +1349,27 @@ func mysqlGenExprNode(expr sqlparser.Expr, colCharset string) string {
 	}
 }
 
+// columnTypeSupportsCharset returns true for column types that can carry a charset/collation
+// (CHAR, VARCHAR, TEXT family, ENUM, SET).  Binary types (BINARY, VARBINARY, BLOB) and
+// numeric/temporal types do not carry a charset.
+func columnTypeSupportsCharset(colType string) bool {
+	t := strings.ToLower(strings.TrimSpace(colType))
+	// Strip generated-column suffix if present
+	if idx := strings.Index(strings.ToUpper(t), " GENERATED ALWAYS AS "); idx >= 0 {
+		t = strings.TrimSpace(t[:idx])
+	}
+	// Strip parenthesised parameters to get bare type name
+	base := t
+	if idx := strings.Index(t, "("); idx >= 0 {
+		base = strings.TrimSpace(t[:idx])
+	}
+	switch base {
+	case "char", "varchar", "tinytext", "text", "mediumtext", "longtext", "enum", "set":
+		return true
+	}
+	return false
+}
+
 // mysqlDisplayType returns the MySQL display type with width for SHOW CREATE TABLE.
 func mysqlDisplayType(colType string) string {
 	// Strip generated column clause before processing the base type
@@ -1938,6 +1959,21 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 			} else if collationDiffers {
 				// Same charset as table but different collation: show only COLLATE
 				parts = append(parts, fmt.Sprintf("COLLATE %s", col.Collation))
+			}
+		} else if columnTypeSupportsCharset(col.Type) {
+			// Column has no explicit charset (inherits from table). However, if the table
+			// has a non-default collation (i.e. differs from the default collation for the
+			// table's charset), MySQL shows COLLATE on each inherited text column.
+			tableCharset := def.Charset
+			if tableCharset == "" {
+				tableCharset = "utf8mb4"
+			}
+			tableCollation := def.Collation
+			if tableCollation != "" {
+				defaultCollForTableCharset := catalog.DefaultCollationForCharset(tableCharset)
+				if !strings.EqualFold(tableCollation, defaultCollForTableCharset) {
+					parts = append(parts, fmt.Sprintf("COLLATE %s", tableCollation))
+				}
 			}
 		}
 		colTypeLower := strings.ToLower(col.Type)
