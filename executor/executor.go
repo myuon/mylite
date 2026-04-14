@@ -24995,6 +24995,43 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 				e.checkedForUpgrade[tableName] = true
 				rows = append(rows, []interface{}{tableName, op, "status", "OK"})
 			}
+		} else if op == "check" {
+			// Check for rows where the AUTO_INCREMENT column has value 0
+			// (MySQL emits a warning for this condition)
+			hasZeroAI := false
+			if tbl, err2 := e.Storage.GetTable(e.CurrentDB, bareTable); err2 == nil && tbl != nil {
+				for _, col := range tbl.Def.Columns {
+					if col.AutoIncrement {
+						tbl.Mu.RLock()
+						for _, row := range tbl.Rows {
+							v := row[col.Name]
+							if v != nil {
+								var iv int64
+								switch val := v.(type) {
+								case int64:
+									iv = val
+								case int:
+									iv = int64(val)
+								case int32:
+									iv = int64(val)
+								case float64:
+									iv = int64(val)
+								}
+								if iv == 0 {
+									hasZeroAI = true
+									break
+								}
+							}
+						}
+						tbl.Mu.RUnlock()
+						break
+					}
+				}
+			}
+			if hasZeroAI {
+				rows = append(rows, []interface{}{tableName, op, "warning", "Found row where the auto_increment column has the value 0"})
+			}
+			rows = append(rows, []interface{}{tableName, op, "status", "OK"})
 		} else {
 			rows = append(rows, []interface{}{tableName, op, "status", "OK"})
 		}

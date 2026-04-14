@@ -360,7 +360,15 @@ func (t *Table) Insert(row Row, noAutoValueOnZero ...bool) (int64, error) {
 					if hasMax && id > maxID {
 						id = maxID
 					}
-					t.AutoIncrement.Store(id)
+					// MyISAM per-group AUTO_INCREMENT: if AI column is part of a composite
+					// key where it is not the first column, use max(AI) per group + 1.
+					if prefixCols := t.compositeAIPrefixCols(col.Name); prefixCols != nil {
+						groupMax := t.groupMaxAutoIncrement(row, col.Name, prefixCols)
+						id = groupMax + 1
+						// Do NOT advance the global counter for per-group tables
+					} else {
+						t.AutoIncrement.Store(id)
+					}
 					row[col.Name] = id
 					lastInsertID = id
 				}
@@ -515,8 +523,10 @@ func (t *Table) BulkInsert(rows []Row) ([]int64, error) {
 
 	var autoMaxID int64
 	var autoHasMax, autoIsUnsignedBigint bool
+	var autoPrefixCols []string // non-nil => per-group AI
 	if autoCol != nil {
 		autoMaxID, autoHasMax, autoIsUnsignedBigint = autoIncrementMaxForType(autoCol.Type)
+		autoPrefixCols = t.compositeAIPrefixCols(autoCol.Name)
 	}
 
 	// Determine if we need PK/UNIQUE checks
@@ -601,15 +611,39 @@ func (t *Table) BulkInsert(rows []Row) ([]int64, error) {
 					if autoIsUnsignedBigint && t.AutoIncrement.Load() >= math.MaxInt64 {
 						return ids[:ri], fmt.Errorf("Failed to read auto-increment value from storage engine")
 					}
-					cur := t.AutoIncrement.Load()
-					id := cur + 1
-					if id < cur {
-						id = cur
+					var id int64
+					if autoPrefixCols != nil {
+						// MyISAM per-group AUTO_INCREMENT: use max(AI) for this group + 1.
+						// We must include already-processed rows in this bulk insert too.
+						groupMax := t.groupMaxAutoIncrement(row, autoCol.Name, autoPrefixCols)
+						// Also check rows already appended in this bulk operation
+						for _, prevRow := range rows[:ri] {
+							match := true
+							for _, pc := range autoPrefixCols {
+								if fmt.Sprintf("%v", rowGetCI(prevRow, pc)) != fmt.Sprintf("%v", rowGetCI(row, pc)) {
+									match = false
+									break
+								}
+							}
+							if match {
+								if iv, ok := toInt64(rowGetCI(prevRow, autoCol.Name)); ok && iv > groupMax {
+									groupMax = iv
+								}
+							}
+						}
+						id = groupMax + 1
+						// Do NOT advance global counter for per-group tables
+					} else {
+						cur := t.AutoIncrement.Load()
+						id = cur + 1
+						if id < cur {
+							id = cur
+						}
+						if autoHasMax && id > autoMaxID {
+							id = autoMaxID
+						}
+						t.AutoIncrement.Store(id)
 					}
-					if autoHasMax && id > autoMaxID {
-						id = autoMaxID
-					}
-					t.AutoIncrement.Store(id)
 					row[autoCol.Name] = id
 					lastInsertID = id
 				}
@@ -820,6 +854,82 @@ func bulkUniqueKeyPadSpace(row Row, cols []string, def *catalog.TableDef) string
 		parts[i] = normalizeVal(c, v)
 	}
 	return strings.Join(parts, "\x00")
+}
+
+// compositeAIPrefixCols returns the prefix columns for per-group AUTO_INCREMENT
+// (MyISAM behavior). In MySQL/MyISAM, when an AUTO_INCREMENT column is part of a
+// composite primary key or index but is NOT the first column, the counter is
+// maintained per-group (i.e. resets per unique combination of the preceding columns).
+//
+// Returns prefix column names if composite AI applies, or nil if global counter should be used.
+func (t *Table) compositeAIPrefixCols(aiColName string) []string {
+	aiLower := strings.ToLower(aiColName)
+	// Check primary key
+	if len(t.Def.PrimaryKey) > 1 {
+		for i, pk := range t.Def.PrimaryKey {
+			if strings.ToLower(stripPrefixLength(pk)) == aiLower {
+				if i > 0 {
+					// AI column is not the first PK column => per-group
+					prefix := make([]string, i)
+					for j := 0; j < i; j++ {
+						prefix[j] = stripPrefixLength(t.Def.PrimaryKey[j])
+					}
+					return prefix
+				}
+				// AI is the first PK column => global counter
+				return nil
+			}
+		}
+	}
+	// Check non-unique indexes (MyISAM supports per-group AI on non-unique composite indexes too)
+	for _, idx := range t.Def.Indexes {
+		if idx.Unique {
+			continue // unique indexes don't trigger per-group behavior
+		}
+		if len(idx.Columns) < 2 {
+			continue
+		}
+		for i, col := range idx.Columns {
+			if strings.ToLower(stripPrefixLength(col)) == aiLower {
+				if i > 0 {
+					prefix := make([]string, i)
+					for j := 0; j < i; j++ {
+						prefix[j] = stripPrefixLength(idx.Columns[j])
+					}
+					return prefix
+				}
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+// groupMaxAutoIncrement returns the maximum value of aiColName among rows where
+// all prefixCols match the corresponding values in newRow. Returns 0 if no match.
+// Caller must hold t.Mu (at least read lock).
+func (t *Table) groupMaxAutoIncrement(newRow Row, aiColName string, prefixCols []string) int64 {
+	var maxVal int64
+	for _, row := range t.Rows {
+		// Check if prefix columns match
+		match := true
+		for _, pc := range prefixCols {
+			rv := rowGetCI(row, pc)
+			nv := rowGetCI(newRow, pc)
+			if fmt.Sprintf("%v", rv) != fmt.Sprintf("%v", nv) {
+				match = false
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+		v := rowGetCI(row, aiColName)
+		if iv, ok := toInt64(v); ok && iv > maxVal {
+			maxVal = iv
+		}
+	}
+	return maxVal
 }
 
 func autoIncrementMaxForType(colType string) (int64, bool, bool) {
