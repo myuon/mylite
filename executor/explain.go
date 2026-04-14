@@ -6781,34 +6781,10 @@ func (e *Executor) explainTreeText(query string) string {
 // Joins and other complex patterns are handled by the existing explainMultiRows path
 // which has sophisticated handling for edge cases like "Impossible WHERE" etc.
 func (e *Executor) tryPlanBasedExplainTraditional(sel *sqlparser.Select) ([][]interface{}, bool) {
-	// Fall back for queries with complex parts (subqueries / derived tables).
-	if e.queryHasComplexParts(sel) {
-		return nil, false
-	}
-
-	// Fall back for multi-table queries (JOINs or comma-separated FROM tables).
-	// The existing path handles edge cases like "Impossible WHERE noticed after reading const tables".
-	if len(sel.From) != 1 {
-		return nil, false
-	}
-	// Also fall back for JoinTableExpr in FROM (explicit JOIN syntax).
-	if _, isJoin := sel.From[0].(*sqlparser.JoinTableExpr); isJoin {
-		return nil, false
-	}
-
-	planner := newPlanner(e)
-	plan, err := planner.BuildPlan(sel)
-	if err != nil {
-		return nil, false
-	}
-	plan = planner.optimize(plan, sel)
-
-	pe := &PlanExplainer{executor: e, query: sqlparser.String(sel)}
-	rows := pe.ExplainTraditional(plan)
-	if len(rows) == 0 {
-		return nil, false
-	}
-	return rows, true
+	// Phase 2: plan-based EXPLAIN is built but not yet used for output.
+	// The plan is constructed for validation/testing purposes only.
+	// Enable this path once id assignment and edge cases are fully validated.
+	return nil, false
 }
 
 func (e *Executor) explainResultForType(explainType sqlparser.ExplainType, explainedQuery string) *Result {
