@@ -629,13 +629,24 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 					processed = append(processed, unmergedDerived...)
 					result = processed
 				} else {
-					// materialization=off: all non-SIMPLE rows become id=1, SIMPLE
-					for i := range result {
-						if result[i].selectType != "SIMPLE" {
-							result[i].id = int64(1)
-							result[i].selectType = "SIMPLE"
+					// materialization=off: all non-SIMPLE rows become id=1, SIMPLE.
+					// For DuplicateWeedout/LooseScan strategy, MySQL places the inner
+					// subquery tables BEFORE the outer tables in the join order.
+					// Separate outer (originally SIMPLE) from inner (originally non-SIMPLE)
+					// rows, then reorder: inner first, outer last.
+					var outerSimpleRows []explainSelectType
+					var innerRows []explainSelectType
+					for _, r := range result {
+						if r.selectType != "SIMPLE" {
+							r.id = int64(1)
+							r.selectType = "SIMPLE"
+							innerRows = append(innerRows, r)
+						} else {
+							outerSimpleRows = append(outerSimpleRows, r)
 						}
 					}
+					// Rebuild result: inner tables first, then outer tables.
+					result = append(innerRows, outerSimpleRows...)
 				}
 			} else {
 				result = e.explainSelect(s, &idCounter, "PRIMARY")
@@ -5249,6 +5260,7 @@ func (e *Executor) explainJSONDocument(query string) string {
 	}
 	isDupsweedEnabled := strings.Contains(optimizerSwitch, "duplicateweedout=on")
 	isFirstmatchEnabled := strings.Contains(optimizerSwitch, "firstmatch=on")
+	isLooseScanEnabled := strings.Contains(optimizerSwitch, "loosescan=on")
 
 	// Helper: build a windowing block for a single table
 	buildWindowingBlock := func(tblBlock []orderedKV) []orderedKV {
@@ -5774,8 +5786,8 @@ func (e *Executor) explainJSONDocument(query string) string {
 			{"query_cost", fmt.Sprintf("%.2f", totalCost)},
 		}})
 		// Determine strategy from optimizer_switch
-		if isDupsweedEnabled && !isFirstmatchEnabled {
-			// DuplicateWeedout strategy: wrap nested_loop in duplicates_removal
+		if (isDupsweedEnabled || isLooseScanEnabled) && !isFirstmatchEnabled {
+			// DuplicateWeedout or LooseScan strategy: both produce duplicates_removal wrapper in JSON
 			nl := buildNestedLoop(primaryRows)
 			dupRemoval := []orderedKV{
 				{"using_temporary_table", true},
