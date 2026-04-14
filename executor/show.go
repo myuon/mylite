@@ -703,7 +703,11 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 	if strings.HasPrefix(upper, "SHOW CREATE DATABASE") || strings.HasPrefix(upper, "SHOW CREATE SCHEMA") {
 		parts := strings.Fields(query)
 		if len(parts) >= 4 {
+			// Handle optional IF NOT EXISTS: SHOW CREATE DATABASE IF NOT EXISTS `db`
 			dbName := parts[3]
+			if strings.ToUpper(dbName) == "IF" && len(parts) >= 6 {
+				dbName = parts[5]
+			}
 			dbName = strings.TrimRight(dbName, ";")
 			dbName = strings.ReplaceAll(dbName, "`", "")
 			db, resolvedName, err := findDatabaseCaseInsensitive(e.Catalog, dbName)
@@ -730,9 +734,9 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 				if collation == "" {
 					collation = defaultCollation
 				}
-				createSQL = fmt.Sprintf("CREATE DATABASE %s /*!40100 DEFAULT CHARACTER SET %s COLLATE %s */ /*!80016 DEFAULT ENCRYPTION='N' */", quotedName, charset, collation)
+				createSQL = fmt.Sprintf("CREATE DATABASE /*!32312 IF NOT EXISTS*/ %s /*!40100 DEFAULT CHARACTER SET %s COLLATE %s */ /*!80016 DEFAULT ENCRYPTION='N' */", quotedName, charset, collation)
 			} else {
-				createSQL = fmt.Sprintf("CREATE DATABASE %s /*!40100 DEFAULT CHARACTER SET %s */ /*!80016 DEFAULT ENCRYPTION='N' */", quotedName, charset)
+				createSQL = fmt.Sprintf("CREATE DATABASE /*!32312 IF NOT EXISTS*/ %s /*!40100 DEFAULT CHARACTER SET %s */ /*!80016 DEFAULT ENCRYPTION='N' */", quotedName, charset)
 			}
 			return &Result{
 				Columns:     []string{"Database", "Create Database"},

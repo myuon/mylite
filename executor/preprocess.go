@@ -397,6 +397,17 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		return "", &Result{}, nil
 	}
 
+	// Rewrite SHOW CREATE DATABASE IF NOT EXISTS <db> -> SHOW CREATE DATABASE <db>
+	// (vitess parser doesn't support the IF NOT EXISTS variant, but MySQL 8.3's mysqldump uses it)
+	if strings.HasPrefix(upper, "SHOW CREATE DATABASE IF NOT EXISTS ") {
+		rest := strings.TrimSpace(trimmed[len("SHOW CREATE DATABASE IF NOT EXISTS "):])
+		return "SHOW CREATE DATABASE " + rest, nil, nil
+	}
+	if strings.HasPrefix(upper, "SHOW CREATE SCHEMA IF NOT EXISTS ") {
+		rest := strings.TrimSpace(trimmed[len("SHOW CREATE SCHEMA IF NOT EXISTS "):])
+		return "SHOW CREATE SCHEMA " + rest, nil, nil
+	}
+
 	// Handle SHOW WARNINGS LIMIT / SHOW ERRORS LIMIT (vitess can't parse)
 	if strings.HasPrefix(upper, "SHOW WARNINGS LIMIT") || strings.HasPrefix(upper, "SHOW ERRORS LIMIT") {
 		// Return empty warnings/errors as simplified response
