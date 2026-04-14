@@ -89,37 +89,7 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 		// Check if this SELECT has subqueries, derived tables, etc.
 		if e.queryHasComplexParts(s) {
 			canFlatten := e.queryCanBeSemijoinFlattened(s)
-			if canFlatten && e.outerQueryHasOnlyDerivedTables(s) && e.isOptimizerSwitchEnabled("firstmatch") {
-				// FirstMatch semijoin strategy: when the outer FROM has only derived tables
-				// and firstmatch=on, MySQL uses PRIMARY selectType with inline FirstMatch()
-				// rather than the MATERIALIZED/SIMPLE pattern.
-				// e.g. SELECT * FROM (SELECT * FROM t1) AS d1 WHERE d1.c1 IN (SELECT c1 FROM t2)
-				// → id=1 PRIMARY <derived2>, id=1 PRIMARY t2 (FirstMatch(<derived2>)), id=2 DERIVED t1
-				result = e.explainSelect(s, &idCounter, "PRIMARY")
-				// Find the DERIVED row id for the FirstMatch() reference string.
-				var derivedFirstMatchID int64
-				for _, r := range result {
-					if r.selectType == "DERIVED" {
-						if id, ok := r.id.(int64); ok {
-							derivedFirstMatchID = id
-						}
-						break
-					}
-				}
-				// Convert MATERIALIZED rows to PRIMARY with FirstMatch() in Extra.
-				for i := range result {
-					if result[i].selectType == "MATERIALIZED" {
-						result[i].selectType = "PRIMARY"
-						result[i].id = int64(1)
-						firstMatchStr := fmt.Sprintf("FirstMatch(<derived%d>)", derivedFirstMatchID)
-						if result[i].extra == nil {
-							result[i].extra = firstMatchStr
-						} else {
-							result[i].extra = fmt.Sprintf("%v; %v", result[i].extra, firstMatchStr)
-						}
-					}
-				}
-			} else if canFlatten {
+			if canFlatten {
 				// MySQL flattens IN/NOT EXISTS subqueries into semi-join / anti-join.
 				// With materialization=on, IN subqueries appear as:
 				//   id=1 SIMPLE outer_table
@@ -945,6 +915,22 @@ func (e *Executor) extractAllTableNamesFromSelect(sel *sqlparser.Select) []strin
 		names = append(names, e.extractAllTableNames(te)...)
 	}
 	return names
+}
+
+// getInnerTotalRows returns the total number of rows across all inner subquery tables.
+func (e *Executor) getInnerTotalRows(inner *sqlparser.Select) int {
+	if e.Storage == nil {
+		return 0
+	}
+	total := 0
+	for _, te := range inner.From {
+		for _, tblName := range e.extractAllTableNames(te) {
+			if tbl, err := e.Storage.GetTable(e.CurrentDB, tblName); err == nil {
+				total += len(tbl.Rows)
+			}
+		}
+	}
+	return total
 }
 
 // nilIfEmpty returns nil if v is nil or an empty string, otherwise returns v.
@@ -2018,6 +2004,31 @@ func extractINTableFromExpr(expr sqlparser.Expr) string {
 // extractINColFromNode finds the outer column name for a specific IN subquery `sub`
 // within a WHERE expression node. For "WHERE a IN (sub1) AND b IN (sub2)", calling
 // with sub2 returns "b".
+// isMultiColumnINSubquery returns true if the IN subquery `sub` in `node` is a
+// multi-column IN (i.e., left side is a tuple like `(a,b,c) IN (subquery)`).
+// MySQL cannot use MATERIALIZED strategy for multi-column IN subqueries.
+func isMultiColumnINSubquery(node sqlparser.SQLNode, sub *sqlparser.Subquery) bool {
+	var result bool
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if cmp, ok := n.(*sqlparser.ComparisonExpr); ok {
+			if cmp.Operator == sqlparser.InOp {
+				if rSub, ok := cmp.Right.(*sqlparser.Subquery); ok {
+					if rSub == sub {
+						// ValTuple is a slice type ([]Expr), not a pointer-to-struct,
+						// so assert without the pointer sigil.
+						if _, ok := cmp.Left.(sqlparser.ValTuple); ok {
+							result = true
+							return false, nil
+						}
+					}
+				}
+			}
+		}
+		return true, nil
+	}, node)
+	return result
+}
+
 func extractINColFromNode(node sqlparser.SQLNode, sub *sqlparser.Subquery) string {
 	var result string
 	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
@@ -2499,21 +2510,10 @@ func (e *Executor) shouldMaterializeSubquery(inner *sqlparser.Select, outerIsSys
 	}
 
 	// Empty table handling:
-	// - subquery_materialization_cost_based=off → always materialize (even empty, even firstmatch=on)
-	// - subquery_materialization_cost_based=on + firstmatch=on → use FirstMatch (SIMPLE), not MATERIALIZED
-	// - subquery_materialization_cost_based=on + firstmatch=off → materialize
+	// MySQL always materializes empty inner tables (MATERIALIZED strategy shows the empty table).
+	// This is true regardless of optimizer switches — the materialized temp table is simply empty.
 	if totalRows == 0 {
-		costBased := e.isOptimizerSwitchEnabled("subquery_materialization_cost_based")
-		if !costBased {
-			// Cost-based disabled → always materialize
-			return true
-		}
-		if !firstMatchOn {
-			// firstmatch=off → materialize empty tables too
-			return true
-		}
-		// firstmatch=on + cost_based=on → use FirstMatch (inline/SIMPLE)
-		return false
+		return true
 	}
 
 	// Large single-table subquery with no primary key and no usable index → materialize.
@@ -2521,8 +2521,107 @@ func (e *Executor) shouldMaterializeSubquery(inner *sqlparser.Select, outerIsSys
 		return true
 	}
 
-	// Small non-empty single-table subquery with no primary key (and no FirstMatch) → materialize.
+	// Small non-empty single-table subquery:
+	// subquery_materialization_cost_based controls whether MySQL uses cost estimates to
+	// choose between FirstMatch and MATERIALIZED in the semijoin path. However, even with
+	// cost_based=off, MySQL still uses FirstMatch for very small inner tables (≤ smallMatThreshold)
+	// when firstmatch=on, because FirstMatch is so cheap that no cost comparison is needed.
+	// The cost_based=off flag primarily affects the non-semijoin path and larger tables.
+	const smallMatThreshold = 5
+	if firstMatchOn && totalRows <= smallMatThreshold {
+		return false // Very small inner: use FirstMatch (BNL)
+	}
 	return true
+}
+
+// isSubqueryInOuterJoinON returns true if the given subquery appears in an OUTER (LEFT/RIGHT)
+// JOIN ON condition within the outer SELECT's FROM clause. MySQL always materializes IN
+// subqueries in outer join ON conditions (even for small inner tables), because LooseScan/
+// FirstMatch cannot be applied when the outer join must preserve rows even when ON fails.
+func (e *Executor) isSubqueryInOuterJoinON(sub *sqlparser.Subquery, sel *sqlparser.Select) bool {
+	if sel == nil {
+		return false
+	}
+	found := false
+	var checkTableExpr func(te sqlparser.TableExpr)
+	checkTableExpr = func(te sqlparser.TableExpr) {
+		if found {
+			return
+		}
+		switch t := te.(type) {
+		case *sqlparser.JoinTableExpr:
+			isOuter := t.Join == sqlparser.LeftJoinType || t.Join == sqlparser.NaturalLeftJoinType ||
+				t.Join == sqlparser.RightJoinType || t.Join == sqlparser.NaturalRightJoinType
+			if isOuter && t.Condition != nil && t.Condition.On != nil {
+				// Check if the subquery appears in this outer join's ON condition
+				_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+					if s, ok := n.(*sqlparser.Subquery); ok && s == sub {
+						found = true
+						return false, nil
+					}
+					return true, nil
+				}, t.Condition.On)
+			}
+			checkTableExpr(t.LeftExpr)
+			checkTableExpr(t.RightExpr)
+		case *sqlparser.ParenTableExpr:
+			for _, expr := range t.Exprs {
+				checkTableExpr(expr)
+			}
+		}
+	}
+	for _, te := range sel.From {
+		checkTableExpr(te)
+	}
+	return found
+}
+
+// innerSubqueryHasIndexOnSelectedCol returns true if the inner SELECT's single-table subquery
+// has a PRIMARY KEY or secondary index on the selected column. When true, MySQL can use
+// direct eq_ref access into the inner table without materializing the subquery.
+func (e *Executor) innerSubqueryHasIndexOnSelectedCol(inner *sqlparser.Select) bool {
+	if e.Storage == nil || e.Catalog == nil {
+		return false
+	}
+	// Single-table subquery only
+	var innerTables []string
+	for _, te := range inner.From {
+		innerTables = append(innerTables, e.extractAllTableNames(te)...)
+	}
+	if len(innerTables) != 1 {
+		return false
+	}
+	// Extract the selected column name
+	if inner.SelectExprs == nil || len(inner.SelectExprs.Exprs) != 1 {
+		return false
+	}
+	ae, ok := inner.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr)
+	if !ok {
+		return false
+	}
+	col, ok := ae.Expr.(*sqlparser.ColName)
+	if !ok {
+		return false
+	}
+	colName := strings.ToLower(col.Name.String())
+	tblName := strings.ToLower(innerTables[0])
+	tbl, err := e.Storage.GetTable(e.CurrentDB, tblName)
+	if err != nil || tbl == nil || tbl.Def == nil {
+		return false
+	}
+	// Check PRIMARY KEY
+	for _, pk := range tbl.Def.PrimaryKey {
+		if strings.EqualFold(pk, colName) {
+			return true
+		}
+	}
+	// Check secondary indexes
+	for _, idx := range tbl.Def.Indexes {
+		if len(idx.Columns) > 0 && strings.EqualFold(idx.Columns[0], colName) {
+			return true
+		}
+	}
+	return false
 }
 
 // hasConstPKEquality checks if the WHERE expression has a constant equality condition on the given column.
@@ -2959,6 +3058,11 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 						// Don't use MATERIALIZED here — produce a DEPENDENT SUBQUERY row merged
 						// at the outer id level instead of a new MATERIALIZED subquery.
 						selectType = "DEPENDENT SUBQUERY"
+					} else if inContext && outerSelectTypeOuter == "SUBQUERY" && e.isSemijoinEnabled() {
+						// IN subquery nested inside another IN subquery context (both in WHERE):
+						// MySQL uses DuplicateWeedout to flatten all tables from all nesting levels
+						// into a single id=1 SIMPLE join. No nested MATERIALIZED rows are created.
+						// selectType stays "SUBQUERY" → becomes SIMPLE via semijoin flattening.
 					} else if e.isSemijoinEnabled() && outerCanSemijoin {
 						bigTables := false
 						if v, ok := e.getSysVar("big_tables"); ok && strings.EqualFold(v, "on") {
@@ -2974,7 +3078,6 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 							// tables are empty. The const/system outer table makes FirstMatch optimal.
 							outerINIsConst := outerINExprIsConstant(node, sub)
 							outerIsSystem := e.outerTablesAreSystem(outerTables)
-							firstMatchOn := e.isOptimizerSwitchEnabled("firstmatch")
 							// Check if outer query has only derived tables (no real base tables).
 							// When outer FROM has only derived tables, MySQL prefers MATERIALIZED strategy
 							// for the IN subquery (FirstMatch can't be applied efficiently without base table).
@@ -2983,61 +3086,147 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 							// MATERIALIZED even when the outer IN expression is a constant.
 							// MySQL's cost-based optimizer decides that materializing is cheaper
 							// than FirstMatch when all inner tables are large.
+							// Compute outer/inner range conditions for the IN join column.
+							// When the outer WHERE has a range condition on the IN column (but inner does not),
+							// MySQL prefers MATERIALIZED even for small inner tables (range scan on outer
+							// forces hash-probe strategy). When both outer and inner have ranges, MySQL uses
+							// FirstMatch via ref access (cheaper).
+							outerAlsoHasRange := false
+							innerAlsoHasRange := false
+							outerJoinCol := ""
+							if node != nil {
+								outerJoinCol = extractINColFromNode(node, sub)
+								if outerJoinCol != "" {
+									var outerExpr sqlparser.Expr
+									if w, ok := node.(*sqlparser.Where); ok {
+										outerExpr = w.Expr
+									} else if e, ok := node.(sqlparser.Expr); ok {
+										outerExpr = e
+									}
+									if outerExpr != nil {
+										outerAlsoHasRange = whereHasRangeOnCol(outerExpr, outerJoinCol)
+									}
+								}
+							}
+							if outerAlsoHasRange && outerJoinCol != "" && inner.Where != nil {
+								innerJoinCol := ""
+								if inner.SelectExprs != nil && len(inner.SelectExprs.Exprs) > 0 {
+									if ae, ok := inner.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok {
+										if col, ok := ae.Expr.(*sqlparser.ColName); ok {
+											innerJoinCol = strings.ToLower(col.Name.String())
+										}
+									}
+								}
+								if innerJoinCol != "" {
+									innerAlsoHasRange = whereHasRangeOnCol(inner.Where.Expr, innerJoinCol)
+								}
+							}
+
+							// Check if the outer table has an index (PRIMARY or secondary) on the join column.
+							// When the outer has an index on the join col, MySQL can use eq_ref/ref to
+							// probe the materialized hash table → MATERIALIZED is always preferred.
+							// When the outer has NO index (full scan), MySQL uses FirstMatch for small inner tables.
+							outerHasIndexOnJoinCol := false
+							if outerJoinCol != "" && e.Storage != nil && e.Catalog != nil {
+								if db, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
+									for _, te := range outerSel.From {
+										var tblName, alias string
+										if ate, ok := te.(*sqlparser.AliasedTableExpr); ok {
+											if tn, ok := ate.Expr.(sqlparser.TableName); ok {
+												tblName = strings.ToLower(tn.Name.String())
+											}
+											if !ate.As.IsEmpty() {
+												alias = strings.ToLower(ate.As.String())
+											}
+										}
+										if tblName == "" {
+											continue
+										}
+										if tblDef, err := db.GetTable(tblName); err == nil && tblDef != nil {
+											// Check PRIMARY KEY
+											if len(tblDef.PrimaryKey) > 0 && strings.EqualFold(tblDef.PrimaryKey[0], outerJoinCol) {
+												outerHasIndexOnJoinCol = true
+											}
+											// Check secondary indexes
+											for _, idx := range tblDef.Indexes {
+												if len(idx.Columns) > 0 && strings.EqualFold(idx.Columns[0], outerJoinCol) {
+													outerHasIndexOnJoinCol = true
+													break
+												}
+											}
+										}
+										_ = alias
+										if outerHasIndexOnJoinCol {
+											break
+										}
+									}
+								}
+							}
+
 							if !outerIsSystem && e.allInnerTablesTwoOrMoreRows(inner) {
 								selectType = "MATERIALIZED"
 							} else if outerHasOnlyDerivedTables && !outerINIsConst {
 								// Outer has only derived tables: MySQL cannot do efficient FirstMatch,
 								// so it uses MATERIALIZED strategy for non-constant IN expressions.
 								selectType = "MATERIALIZED"
-							} else if e.inSubqueryTypesCompatibleForMat(outerSel, inner, sub) && e.shouldMaterializeSubquery(inner, outerIsSystem) {
-								// When firstmatch=on and outer IN is a constant literal, MySQL uses
-								// "no matching row in const table" (FirstMatch with const lookup).
-								// When firstmatch=off, MySQL always uses MATERIALIZED strategy.
-								// Note: type incompatibility (e.g., INT vs DATE) skips materialization.
-								//
-								// Exception: when the inner subquery's range on the join column is
-								// "bounded" by an equal range condition in the outer WHERE, MySQL
-								// can use ref access (FirstMatch) instead of materialization.
-								// E.g., "WHERE a IN (SELECT kp1 FROM t1 WHERE kp1<20) AND a<20"
-								// → MySQL uses ref on kp1=t3.a (FirstMatch), not MATERIALIZED.
-								outerAlsoHasRange := false
-								if node != nil {
-									// Extract the outer join column (left side of IN expr)
-									outerJoinCol := extractINColFromNode(node, sub)
-									if outerJoinCol != "" {
-										// Get the expression from the node (could be *sqlparser.Where or Expr)
-										var outerExpr sqlparser.Expr
-										if w, ok := node.(*sqlparser.Where); ok {
-											outerExpr = w.Expr
-										} else if e, ok := node.(sqlparser.Expr); ok {
-											outerExpr = e
-										}
-										if outerExpr != nil {
-											outerAlsoHasRange = whereHasRangeOnCol(outerExpr, outerJoinCol)
-										}
-									}
-								}
-								// Determine whether to use MATERIALIZED strategy:
-								// - For constant IN (e.g. "11 IN (subquery)"): MySQL uses FirstMatch
-								//   strategy (const lookup on semijoin result), so selectType stays SIMPLE.
-								// - For column IN (e.g. "col IN (subquery)"):
-								//   - firstmatch=off: always MATERIALIZED (no FirstMatch available)
-								//   - firstmatch=on: only MATERIALIZED when outer doesn't have a
-								//     bounded range on the same col (if outer also has same range,
-								//     FirstMatch via ref access is cheaper than materialization)
-								if outerINIsConst {
-									// Constant IN: MySQL uses FirstMatch, not MATERIALIZED.
-									// selectType stays as semijoin-flattened SIMPLE.
+							} else if outerINIsConst {
+								// Constant IN: MySQL uses FirstMatch, not MATERIALIZED.
+								// selectType stays as semijoin-flattened SIMPLE.
+							} else if outerAlsoHasRange && innerAlsoHasRange {
+								// Both outer and inner have bounded ranges on the same column:
+								// use FirstMatch via ref access (cheaper than materialization).
+								// selectType stays as SUBQUERY → will become SIMPLE in explainMultiRows.
+							} else if outerAlsoHasRange && !innerAlsoHasRange && e.inSubqueryTypesCompatibleForMat(outerSel, inner, sub) {
+								// Outer has a range condition on the IN column but inner does not:
+								// MySQL prefers MATERIALIZED (range scan on outer forces hash-probe strategy).
+								selectType = "MATERIALIZED"
+							} else if inContext && outerJoinCol == "" && !outerINIsConst && (node == nil || !isMultiColumnINSubquery(node, sub)) && e.inSubqueryTypesCompatibleForMat(outerSel, inner, sub) && e.getInnerTotalRows(inner) > 0 {
+								// Outer IN LHS is a function expression (e.g., COALESCE(col,0) IN ...),
+								// not a plain column. MySQL cannot use FirstMatch/LooseScan because the join
+								// key is non-sargable. It must materialize the inner subquery.
+								// Note: existsCanDecorrelate (EXISTS) is excluded by the inContext check.
+								selectType = "MATERIALIZED"
+							} else if e.inSubqueryTypesCompatibleForMat(outerSel, inner, sub) && (e.shouldMaterializeSubquery(inner, outerIsSystem) || (e.isSubqueryInOuterJoinON(sub, outerSel) && !e.innerSubqueryHasIndexOnSelectedCol(inner))) {
+								// shouldMaterializeSubquery=true, OR IN is in an OUTER JOIN ON condition
+								// where the inner table has NO usable index (forcing hash-probe materialization).
+								// MySQL always materializes IN subqueries in outer join ON conditions
+								// (even for small inner tables) because LooseScan cannot be applied when
+								// the outer join must preserve rows even when the ON condition fails.
+								// When the inner table HAS a usable index (e.g., PRIMARY KEY), MySQL uses
+								// direct eq_ref access without materializing.
+								// Refine the decision based on outer access patterns:
+								// - Outer has index on join col → always MATERIALIZED (eq_ref probe)
+								// - Outer has NO range condition on IN col → MATERIALIZED (no FirstMatch benefit)
+								// - Outer has range on IN col → depends on inner (FirstMatch via ref may win)
+								firstMatchOn := e.isOptimizerSwitchEnabled("firstmatch")
+								innerTables := e.extractAllTableNamesFromSelect(inner)
+								outerINIsMultiColumn := node != nil && isMultiColumnINSubquery(node, sub)
+								if outerINIsMultiColumn && len(innerTables) > 1 {
+									// Multi-column IN + multi-table inner: MySQL uses DuplicateWeedout (SIMPLE).
+									// MATERIALIZED is not applicable here.
+								} else if len(innerTables) > 1 {
+									// Multi-table inner + single-col IN: shouldMaterialize made the right call → MATERIALIZED.
+									selectType = "MATERIALIZED"
 								} else if !firstMatchOn {
-									// firstmatch=off + column IN: always MATERIALIZED
+									// firstmatch=off: always MATERIALIZED.
 									selectType = "MATERIALIZED"
+								} else if outerHasIndexOnJoinCol {
+									// Outer has an index (PK or secondary) on join col:
+									// - Non-empty inner: MySQL uses eq_ref probe into materialized hash → MATERIALIZED.
+									// - Empty inner: trivially cheap FirstMatch → SIMPLE (leave as SIMPLE).
+									if e.getInnerTotalRows(inner) > 0 {
+										selectType = "MATERIALIZED"
+									}
 								} else if !outerAlsoHasRange {
-									// firstmatch=on + column IN + no outer range: MATERIALIZED
+									// Outer has no range condition and no usable index:
+									// FirstMatch is expensive (full outer scan) → MATERIALIZED.
 									selectType = "MATERIALIZED"
 								}
+								// outerAlsoHasRange=true: outer has bounded range, inner is small enough
+								// for FirstMatch/BNL to win → leave as SIMPLE.
 							}
-							// If not materialized, selectType stays "SUBQUERY" but will be
-							// changed to "SIMPLE" by the semijoin flattening in explainMultiRows.
+							// If MATERIALIZED not set, selectType stays "SUBQUERY" → becomes SIMPLE
+							// via semijoin flattening in explainMultiRows.
 						} else {
 							// When materialization=off or big_tables=ON, IN subqueries use EXISTS strategy → DEPENDENT SUBQUERY
 							selectType = "DEPENDENT SUBQUERY"
@@ -6126,8 +6315,9 @@ func (e *Executor) explainTreeMaterializedContent(innerRows [][]interface{}, all
 			lines = append(lines, subpfx+"-> Filter: ("+tbl+" not null)")
 			switch at {
 			case "range":
-				// Range scan inside a Filter: the condition is in the Filter node, not in the range scan.
-				lines = append(lines, subpfx+"    -> Index range scan on "+tbl+" using "+kn)
+				// Range scan with ICP: the filter wrapper checks for null in the join column,
+				// and the range scan itself carries the index condition (ICP).
+				lines = append(lines, subpfx+"    -> Index range scan on "+tbl+" using "+kn+", with index condition: (cond)")
 			case "eq_ref", "ref", "const":
 				lines = append(lines, subpfx+"    -> Single-row index lookup on "+tbl+" using "+kn+" (placeholder)")
 			default:
