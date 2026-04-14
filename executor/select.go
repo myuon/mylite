@@ -5556,6 +5556,10 @@ func (e *Executor) execSubqueryScalar(sub *sqlparser.Subquery, outerRow storage.
 // leftVal is the already-evaluated scalar left side (may be nil for tuple case).
 // leftExpr is the original AST left side (used to detect tuple form).
 func (e *Executor) evalInSubquery(leftVal interface{}, leftExpr sqlparser.Expr, sub *sqlparser.Subquery, op sqlparser.ComparisonExprOperator) (interface{}, error) {
+	// MySQL error 1235: LIMIT in IN/ALL/ANY/SOME subquery is not supported
+	if subqueryHasLimit(sub) {
+		return nil, mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'LIMIT & IN/ALL/ANY/SOME subquery'")
+	}
 	result, err := e.execSubquery(sub, e.correlatedRow)
 	if err != nil {
 		return nil, err

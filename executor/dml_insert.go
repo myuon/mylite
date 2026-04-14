@@ -840,7 +840,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							}
 							// Strict mode: validate DATE/DATETIME/TIMESTAMP values
 							if sv, ok := v.(string); ok {
-								if err := checkDateStrict(col.Type, col.Name, sv, e.sqlMode); err != nil {
+								if err := checkDateStrict(col.Type, col.Name, sv, e.sqlMode, int(totalRows)); err != nil {
 									// For non-transactional tables (MyISAM) under STRICT_TRANS_TABLES only
 									// (not STRICT_ALL_TABLES), treat as warning not error (like IGNORE).
 									tblEngine := strings.ToUpper(tbl.Def.Engine)

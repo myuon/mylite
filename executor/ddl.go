@@ -1154,9 +1154,10 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 					colDef.OnUpdateCurrentTimestamp = true
 				}
 			}
-			// Validate that PRIMARY KEY/KEY cannot be INVISIBLE at column level
+			// Validate that PRIMARY KEY/KEY cannot be INVISIBLE at column level.
+			// MySQL treats "col INT PRIMARY KEY INVISIBLE" as a parse error (ER_PARSE_ERROR).
 			if col.Type.Options.Invisible != nil && (col.Type.Options.KeyOpt == sqlparser.ColKeyPrimary || col.Type.Options.KeyOpt == sqlparser.ColKey) {
-				return nil, mysqlError(3522, "HY000", "A primary key index cannot be invisible")
+				return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'INVISIBLE )' at line 1"))
 			}
 			switch col.Type.Options.KeyOpt {
 			case sqlparser.ColKeyPrimary, sqlparser.ColKey: // PRIMARY KEY or KEY
@@ -1326,6 +1327,15 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				}
 			}
 		}
+		// Validate that PRIMARY KEY cannot be INVISIBLE (ER_PK_INDEX_CANT_BE_INVISIBLE = 3895).
+		// This must be checked before the if/else block since PRIMARY KEY takes the if branch.
+		{
+			for _, opt := range idx.Options {
+				if strings.EqualFold(opt.Name, "INVISIBLE") && idx.Info.Type == sqlparser.IndexTypePrimary {
+					return nil, mysqlError(3895, "HY000", "A primary key index cannot be invisible")
+				}
+			}
+		}
 		if idx.Info.Type == sqlparser.IndexTypePrimary {
 			primaryKeys = nil
 			// Use the actual column names from the columns slice (preserving case)
@@ -1409,10 +1419,6 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				} else if strings.EqualFold(opt.Name, "INVISIBLE") {
 					idxInvisible = true
 				}
-			}
-			// Validate that PRIMARY KEY cannot be INVISIBLE
-			if idxInvisible && idx.Info.Type == sqlparser.IndexTypePrimary {
-				return nil, mysqlError(3522, "HY000", "A primary key index cannot be invisible")
 			}
 			// MySQL returns error for index comments > 1024 in strict/TRADITIONAL mode;
 			// in non-strict mode it truncates silently.
@@ -2239,6 +2245,19 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		}
 	}
 
+	// Pre-check: PRIMARY KEY cannot be INVISIBLE. MySQL checks this before table lookup.
+	for _, opt := range stmt.AlterOptions {
+		if addIdx, ok := opt.(*sqlparser.AddIndexDefinition); ok {
+			if addIdx.IndexDefinition.Info.Type == sqlparser.IndexTypePrimary {
+				for _, idxOpt := range addIdx.IndexDefinition.Options {
+					if strings.EqualFold(idxOpt.Name, "INVISIBLE") {
+						return nil, mysqlError(3895, "HY000", "A primary key index cannot be invisible")
+					}
+				}
+			}
+		}
+	}
+
 	db, err := e.Catalog.GetDatabase(dbName)
 	if err != nil {
 		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
@@ -2851,9 +2870,9 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					idxInvisible = true
 				}
 			}
-			// Validate that PRIMARY KEY cannot be INVISIBLE
+			// Validate that PRIMARY KEY cannot be INVISIBLE (ER_PK_INDEX_CANT_BE_INVISIBLE = 3895)
 			if idxInvisible && isPrimary {
-				return nil, mysqlError(3522, "HY000", "A primary key index cannot be invisible")
+				return nil, mysqlError(3895, "HY000", "A primary key index cannot be invisible")
 			}
 			// Check for duplicate values in existing data when adding UNIQUE/PRIMARY index
 			if isUnique || isPrimary {
@@ -3207,9 +3226,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		case *sqlparser.AlterIndex:
 			// ALTER TABLE ... ALTER INDEX <name> VISIBLE/INVISIBLE
 			idxName := op.Name.String()
-			// PRIMARY KEY cannot be made invisible
+			// PRIMARY KEY cannot be made invisible via ALTER INDEX PRIMARY.
+			// MySQL treats this as a parse error since PRIMARY is a keyword.
 			if op.Invisible && strings.EqualFold(idxName, "PRIMARY") {
-				return nil, mysqlError(3522, "HY000", "A primary key index cannot be invisible")
+				return nil, mysqlError(1064, "42000", "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'PRIMARY INVISIBLE' at line 1")
 			}
 			tableDef, _ := db.GetTable(tableName)
 			if tableDef != nil {
@@ -3218,7 +3238,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 						// If making invisible: check if this is an implicit primary key
 						// (first NOT NULL UNIQUE when table has no explicit primary key)
 						if op.Invisible && !hasPrimaryKey(tableDef) && isFirstNotNullUnique(tableDef, idx) {
-							return nil, mysqlError(3522, "HY000", "A primary key index cannot be invisible")
+							return nil, mysqlError(3895, "HY000", "A primary key index cannot be invisible")
 						}
 						tableDef.Indexes[i].Invisible = op.Invisible
 						break

@@ -11388,6 +11388,12 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 	}
 
+	// MySQL treats "ALTER INDEX PRIMARY ..." as a parse error since PRIMARY is a reserved keyword.
+	// The vitess parser silently drops this option, so we must detect it before parsing.
+	if strings.Contains(upper, "ALTER INDEX PRIMARY") {
+		return nil, mysqlError(1064, "42000", "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'PRIMARY INVISIBLE' at line 1")
+	}
+
 	stmt, err := e.parser().Parse(query)
 	if err != nil {
 		// Accept statements that Vitess parser doesn't support
@@ -14030,7 +14036,7 @@ func isLeapYear(y int) bool {
 // checkDateStrict validates a date string value for a DATE/DATETIME/TIMESTAMP column
 // in strict SQL mode. Returns an error if the date is invalid.
 // The sqlMode string is used to determine which checks to apply.
-func checkDateStrict(colType, colName, originalValue, sqlMode string) error {
+func checkDateStrict(colType, colName, originalValue, sqlMode string, rowNum int) error {
 	upper := strings.ToUpper(strings.TrimSpace(colType))
 	// Only check date-like types
 	isDateType := upper == "DATE" || strings.HasPrefix(upper, "DATETIME") || strings.HasPrefix(upper, "TIMESTAMP")
@@ -14132,7 +14138,7 @@ func checkDateStrict(colType, colName, originalValue, sqlMode string) error {
 			parsed = true
 		default:
 			// Short numeric values like '59' - definitely invalid
-			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
 		}
 	}
 
@@ -14157,25 +14163,25 @@ func checkDateStrict(colType, colName, originalValue, sqlMode string) error {
 				y, parseErr = strconv.Atoi(yStr)
 			}
 			if parseErr != nil {
-				return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+				return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
 			}
 			m, _ = strconv.Atoi(mStr)
 			d, _ = strconv.Atoi(dStr)
 			parsed = true
 		} else {
 			// Not parseable as a date
-			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
 		}
 	}
 
 	if !parsed {
-		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
 	}
 
 	// Check for zero date (0000-00-00)
 	if y == 0 && m == 0 && d == 0 {
 		if isNoZeroDate {
-			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
 		}
 		return nil
 	}
@@ -14183,7 +14189,7 @@ func checkDateStrict(colType, colName, originalValue, sqlMode string) error {
 	// Check for zero month or zero day (partial zero dates)
 	if m == 0 || d == 0 {
 		if isNoZeroInDate {
-			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
 		}
 		// Partial zero dates are allowed in non-NO_ZERO_IN_DATE mode
 		return nil
@@ -14191,13 +14197,13 @@ func checkDateStrict(colType, colName, originalValue, sqlMode string) error {
 
 	// Check month range
 	if m < 1 || m > 12 {
-		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
 	}
 
 	// ALLOW_INVALID_DATES: skip day range check, only month must be valid (1-12)
 	if allowInvalidDates {
 		if d < 1 || d > 31 {
-			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
 		}
 		return nil
 	}
@@ -14209,7 +14215,7 @@ func checkDateStrict(colType, colName, originalValue, sqlMode string) error {
 		maxDay = 29
 	}
 	if d < 1 || d > maxDay {
-		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row 1", originalValue, colName))
+		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
 	}
 
 	return nil
@@ -20748,6 +20754,10 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			// When left is a tuple: (a,b) IN ((1,2),(3,4)) or (a,b) IN (SELECT ...)
 			if leftTupleIN, leftIsTupleIN := v.Left.(sqlparser.ValTuple); leftIsTupleIN {
 				if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+					// MySQL error 1235: LIMIT in IN/ALL/ANY/SOME subquery is not supported
+					if subqueryHasLimit(sub) {
+						return nil, mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'LIMIT & IN/ALL/ANY/SOME subquery'")
+					}
 					// Evaluate tuple elements WITH row context (needed when in IS TRUE/FALSE wrapper)
 					result, err := e.execSubquery(sub, row)
 					if err != nil {
@@ -21776,6 +21786,10 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 		if v.Operator == sqlparser.InOp || v.Operator == sqlparser.NotInOp {
 			// Handle subquery on right side
 			if sub, ok := v.Right.(*sqlparser.Subquery); ok {
+				// MySQL error 1235: LIMIT in IN/ALL/ANY/SOME subquery is not supported
+				if subqueryHasLimit(sub) {
+					return false, mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'LIMIT & IN/ALL/ANY/SOME subquery'")
+				}
 				// Check if left side is a tuple: (a,b) IN (SELECT x,y FROM ...)
 				if leftTuple, ok := v.Left.(sqlparser.ValTuple); ok {
 					result, err := e.execSubquery(sub, row)
