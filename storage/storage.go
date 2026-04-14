@@ -25,6 +25,45 @@ func stripPrefixLength(col string) string {
 // Values are stored as interface{} (nil for NULL).
 type Row map[string]interface{}
 
+// bitIntToBytes converts an integer BIT value to a big-endian byte string.
+// MySQL displays BIT values as binary byte strings in error messages.
+// For BIT(N), the byte length is ceil(N/8).
+func bitIntToBytes(v interface{}, bitWidth int) string {
+	var u uint64
+	switch val := v.(type) {
+	case int64:
+		u = uint64(val)
+	case uint64:
+		u = val
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+	if bitWidth <= 0 {
+		bitWidth = 1
+	}
+	byteLen := (bitWidth + 7) / 8
+	buf := make([]byte, byteLen)
+	for i := byteLen - 1; i >= 0; i-- {
+		buf[i] = byte(u & 0xff)
+		u >>= 8
+	}
+	return string(buf)
+}
+
+// DisplayValueWithColType formats a value for error messages, handling BIT columns specially.
+// Exported so executor package can use it for Duplicate entry error messages.
+func DisplayValueWithColType(v interface{}, colType string) string {
+	upper := strings.ToUpper(strings.TrimSpace(colType))
+	if strings.HasPrefix(upper, "BIT") {
+		bitWidth := 1
+		if strings.HasPrefix(upper, "BIT(") {
+			fmt.Sscanf(upper, "BIT(%d)", &bitWidth)
+		}
+		return displayValue(bitIntToBytes(v, bitWidth))
+	}
+	return displayValue(v)
+}
+
 // displayValue formats a value for error messages, stripping trailing null bytes
 // from strings (for BINARY column display) and escaping non-printable bytes.
 func displayValue(v interface{}) string {
@@ -386,7 +425,8 @@ func (t *Table) Insert(row Row, noAutoValueOnZero ...bool) (int64, error) {
 		if t.pkIndex[key] {
 			pkVal := make([]string, len(t.Def.PrimaryKey))
 			for i, pk := range t.Def.PrimaryKey {
-				pkVal[i] = displayValue(rowGetCI(row, stripPrefixLength(pk)))
+				colName := stripPrefixLength(pk)
+				pkVal[i] = DisplayValueWithColType(rowGetCI(row, colName), t.Def.ColType(colName))
 			}
 			return 0, fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key 'PRIMARY'",
 				strings.Join(pkVal, "-"))
@@ -400,7 +440,7 @@ func (t *Table) Insert(row Row, noAutoValueOnZero ...bool) (int64, error) {
 				valKey := fmt.Sprintf("%v", row[col.Name])
 				if t.colPKIndex[col.Name][valKey] {
 					return 0, fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key 'PRIMARY'",
-						displayValue(row[col.Name]))
+						DisplayValueWithColType(row[col.Name], col.Type))
 				}
 			}
 		}
@@ -414,7 +454,7 @@ func (t *Table) Insert(row Row, noAutoValueOnZero ...bool) (int64, error) {
 				if key != "" && t.uniqueIndex[idx.Name][key] {
 					vals := make([]string, len(idx.Columns))
 					for i, c := range idx.Columns {
-						vals[i] = displayValue(row[c])
+						vals[i] = DisplayValueWithColType(row[c], t.Def.ColType(c))
 					}
 					return 0, fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key '%s'",
 						strings.Join(vals, "-"), idx.Name)
@@ -625,7 +665,8 @@ func (t *Table) BulkInsert(rows []Row) ([]int64, error) {
 				if pkSet[key] {
 					pkVal := make([]string, len(t.Def.PrimaryKey))
 					for i, pk := range t.Def.PrimaryKey {
-						pkVal[i] = displayValue(rowGetCI(row, stripPrefixLength(pk)))
+						colName := stripPrefixLength(pk)
+						pkVal[i] = DisplayValueWithColType(rowGetCI(row, colName), t.Def.ColType(colName))
 					}
 					return ids[:ri], fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key 'PRIMARY'",
 						strings.Join(pkVal, "-"))
@@ -639,7 +680,7 @@ func (t *Table) BulkInsert(rows []Row) ([]int64, error) {
 						key := fmt.Sprintf("%v", v)
 						if colPKSets[col.Name][key] {
 							return ids[:ri], fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key 'PRIMARY'",
-								displayValue(v))
+								DisplayValueWithColType(v, col.Type))
 						}
 						colPKSets[col.Name][key] = true
 					}
@@ -652,7 +693,7 @@ func (t *Table) BulkInsert(rows []Row) ([]int64, error) {
 						if key != "" && uniqueSets[idx.Name][key] {
 							vals := make([]string, len(idx.Columns))
 							for i, c := range idx.Columns {
-								vals[i] = displayValue(row[c])
+								vals[i] = DisplayValueWithColType(row[c], t.Def.ColType(c))
 							}
 							return ids[:ri], fmt.Errorf("ERROR 1062 (23000): Duplicate entry '%s' for key '%s'",
 								strings.Join(vals, "-"), idx.Name)

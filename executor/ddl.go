@@ -2894,11 +2894,13 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				seen := make(map[string]bool)
 				for _, row := range tbl.Rows {
 					keyParts := make([]string, len(baseCols))
+					displayParts := make([]string, len(baseCols))
 					hasNull := false
 					for ci, c := range baseCols {
 						v := rowValueByColumnName(row, c)
 						if v == nil {
 							keyParts[ci] = "NULL"
+							displayParts[ci] = "NULL"
 							hasNull = true
 						} else {
 							s := fmt.Sprintf("%v", v)
@@ -2908,6 +2910,9 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 							}
 							s = strings.TrimRight(s, "\x00 ")
 							keyParts[ci] = s
+							// For error message display, format BIT values as binary byte strings
+							colType := tbl.Def.ColType(c)
+							displayParts[ci] = storage.DisplayValueWithColType(v, colType)
 						}
 					}
 					if hasNull {
@@ -2915,7 +2920,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					}
 					key := strings.Join(keyParts, "-")
 					if seen[key] {
-						return nil, mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key '%s'", strings.Join(keyParts, "-"), idxName))
+						return nil, mysqlError(1062, "23000", fmt.Sprintf("Duplicate entry '%s' for key '%s'", strings.Join(displayParts, "-"), idxName))
 					}
 					seen[key] = true
 				}

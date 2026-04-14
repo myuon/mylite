@@ -59,6 +59,18 @@ type TableDef struct {
 	PartitionColumns  []string           // column names used in partition expression (for ordering)
 }
 
+// ColType returns the type string for a column by name (case-insensitive).
+// Returns an empty string if the column is not found.
+func (td *TableDef) ColType(name string) string {
+	nameLower := strings.ToLower(name)
+	for _, col := range td.Columns {
+		if strings.ToLower(col.Name) == nameLower {
+			return col.Type
+		}
+	}
+	return ""
+}
+
 // CheckConstraint represents a table-level CHECK constraint.
 type CheckConstraint struct {
 	Name string // constraint name (auto-generated if not specified)
