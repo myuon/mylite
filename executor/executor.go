@@ -6044,6 +6044,31 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 		}
 	}
 
+	// When there are both real tables and derived tables in FROM (e.g. a JOIN),
+	// add a <derivedN> placeholder row for each derived table using the current
+	// select's id.  The actual inner rows (with incremented ids) will be appended
+	// below by explainFromExpr.
+	if len(allTableNames) > 0 && numDerived > 0 {
+		nextID := *idCounter + 1
+		for i := 0; i < numDerived; i++ {
+			derivedRef := fmt.Sprintf("<derived%d>", nextID)
+			result = append(result, explainSelectType{
+				id:           myID,
+				selectType:   selectType,
+				table:        derivedRef,
+				extra:        "Using join buffer (Block Nested Loop)",
+				rows:         int64(1),
+				filtered:     "100.00",
+				accessType:   "ALL",
+				possibleKeys: nil,
+				key:          nil,
+				keyLen:       nil,
+				ref:          nil,
+			})
+			nextID++
+		}
+	}
+
 	// Process FROM clause for derived tables.
 	// We collect them separately first so that WHERE-clause subqueries
 	// (DEPENDENT SUBQUERY / SUBQUERY) can be inserted before DERIVED rows,
@@ -6073,6 +6098,7 @@ func (e *Executor) explainFromExpr(te sqlparser.TableExpr, idCounter *int64, res
 		if dt, ok := t.Expr.(*sqlparser.DerivedTable); ok {
 			// This is a derived table (subquery in FROM)
 			*idCounter++
+			myID := *idCounter // capture ID before recursive calls change the counter
 			switch inner := dt.Select.(type) {
 			case *sqlparser.Union:
 				derived := e.explainUnion(inner, idCounter, false)
@@ -6083,10 +6109,9 @@ func (e *Executor) explainFromExpr(te sqlparser.TableExpr, idCounter *int64, res
 				*result = append(*result, derived...)
 			case *sqlparser.Select:
 				innerRows := e.explainSelect(inner, idCounter, "DERIVED")
-				// Fix the id counter: the DERIVED row gets the next id
-				// (already incremented above)
+				// Fix the id: the DERIVED row gets the id captured before recursion
 				if len(innerRows) > 0 {
-					innerRows[0].id = *idCounter
+					innerRows[0].id = myID
 				}
 				*result = append(*result, innerRows...)
 			}
@@ -11137,6 +11162,94 @@ func (e *Executor) explainTreeText(query string) string {
 	if err != nil {
 		return "-> Table scan on " + tbl
 	}
+
+	// Handle INSERT INTO ... SELECT ...
+	if ins, ok := stmt.(*sqlparser.Insert); ok {
+		// Only handle INSERT ... SELECT (not INSERT ... VALUES)
+		if sel, ok2 := ins.Rows.(*sqlparser.Select); ok2 {
+			insertTbl := ""
+			if tn, ok3 := ins.Table.Expr.(sqlparser.TableName); ok3 {
+				insertTbl = tn.Name.String()
+			}
+			// Build the inner SELECT tree
+			selectQuery := sqlparser.String(sel)
+			innerTree := e.explainTreeText(selectQuery)
+			// Indent inner tree lines
+			innerLines := strings.Split(innerTree, "\n")
+			for i, line := range innerLines {
+				if line != "" {
+					innerLines[i] = "    " + line
+				}
+			}
+			return "-> Insert into " + insertTbl + "\n" + strings.Join(innerLines, "\n")
+		}
+		return "-> Table scan on " + tbl
+	}
+
+	// Handle multi-table UPDATE
+	if upd, ok := stmt.(*sqlparser.Update); ok {
+		if len(upd.TableExprs) >= 1 {
+			var tableNames []string
+			for _, te := range upd.TableExprs {
+				tableNames = append(tableNames, e.extractAllTableNames(te)...)
+			}
+			if len(tableNames) >= 2 {
+				headerTables := strings.Join(tableNames, ", ")
+				// Build nested loop join with filter on second table if WHERE exists
+				var lines []string
+				lines = append(lines, "-> Update "+headerTables)
+				lines = append(lines, "    -> Nested loop inner join")
+				lines = append(lines, "        -> Table scan on "+tableNames[0])
+				if upd.Where != nil {
+					whereStr := sqlparser.String(upd.Where.Expr)
+					lines = append(lines, "        -> Filter: ("+whereStr+")")
+					lines = append(lines, "            -> Table scan on "+tableNames[1])
+				} else {
+					lines = append(lines, "        -> Table scan on "+tableNames[1])
+				}
+				return strings.Join(lines, "\n")
+			}
+		}
+		return "-> Table scan on " + tbl
+	}
+
+	// Handle multi-table DELETE
+	if del, ok := stmt.(*sqlparser.Delete); ok {
+		if len(del.TableExprs) >= 1 {
+			var tableNames []string
+			for _, te := range del.TableExprs {
+				tableNames = append(tableNames, e.extractAllTableNames(te)...)
+			}
+			// For multi-table delete, use Targets if available; otherwise use TableExprs
+			var targetNames []string
+			if len(del.Targets) > 0 {
+				for _, t := range del.Targets {
+					targetNames = append(targetNames, t.Name.String())
+				}
+			} else {
+				targetNames = tableNames
+			}
+			if len(tableNames) >= 2 {
+				headerTables := strings.Join(targetNames, ", ")
+				var lines []string
+				lines = append(lines, "-> Delete from "+headerTables)
+				lines = append(lines, "    -> Nested loop inner join")
+				if del.Where != nil {
+					whereStr := sqlparser.String(del.Where.Expr)
+					lines = append(lines, "        -> Table scan on "+tableNames[0])
+					lines = append(lines, "        -> Filter: ("+whereStr+")")
+					lines = append(lines, "            -> Table scan on "+tableNames[1])
+				} else {
+					for _, name := range tableNames {
+						lines = append(lines, "        -> Table scan on "+name)
+					}
+				}
+				return strings.Join(lines, "\n")
+			}
+		}
+		return "-> Table scan on " + tbl
+	}
+
 	sel, ok := stmt.(*sqlparser.Select)
 	if !ok {
 		return "-> Table scan on " + tbl
