@@ -6828,6 +6828,19 @@ func (e *Executor) execExplainStmt(s *sqlparser.ExplainStmt, query string) (*Res
 			}
 		}
 	}
+	// Phase 1: build logical plan (construction only; output still uses existing path)
+	if sel, ok2 := s.Statement.(*sqlparser.Select); ok2 {
+		planner := newPlanner(e)
+		if plan, err := planner.BuildPlan(sel); err == nil {
+			_ = plan // Phase 1: plan constructed but not yet used for output
+		}
+	} else if u, ok2 := s.Statement.(*sqlparser.Union); ok2 {
+		planner := newPlanner(e)
+		if plan, err := planner.BuildPlan(u); err == nil {
+			_ = plan // Phase 1: plan constructed but not yet used for output
+		}
+	}
+
 	// Use explainResultForType which delegates to explainMultiRows for proper select_type detection
 	explainedQuery := query
 	if s.Statement != nil {
