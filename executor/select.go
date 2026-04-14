@@ -3927,7 +3927,8 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		}
 		return count, nil
 	case *sqlparser.Sum:
-		// For SUM(DISTINCT expr), filter to unique values first
+		// For SUM(DISTINCT expr), filter to unique non-NULL values first.
+		// NULL values are excluded from DISTINCT aggregation per SQL standard.
 		rows := groupRows
 		if e.Distinct {
 			seen := make(map[string]bool)
@@ -3943,9 +3944,8 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 						seen[key] = true
 						filtered = append(filtered, row)
 					}
-				} else {
-					filtered = append(filtered, row)
 				}
+				// NULL values are skipped (not added to filtered)
 			}
 			rows = filtered
 		}
@@ -4071,7 +4071,8 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		}
 		return minVal, nil
 	case *sqlparser.Avg:
-		// For AVG(DISTINCT expr), filter to unique values first
+		// For AVG(DISTINCT expr), filter to unique non-NULL values first.
+		// NULL values are excluded from DISTINCT aggregation per SQL standard.
 		avgRows := groupRows
 		if e.Distinct {
 			seen := make(map[string]bool)
@@ -4087,9 +4088,8 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 						seen[key] = true
 						filtered = append(filtered, row)
 					}
-				} else {
-					filtered = append(filtered, row)
 				}
+				// NULL values are skipped (not added to filtered)
 			}
 			avgRows = filtered
 		}

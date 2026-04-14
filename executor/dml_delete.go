@@ -1123,7 +1123,7 @@ func matchRowToTableLenient(matchedRow storage.Row, tbl *storage.Table, alias, t
 
 // maxCrossProductRows limits the result of a cross product to prevent
 // memory exhaustion from multi-way Cartesian products.
-const maxCrossProductRows = 10_000
+const maxCrossProductRows = 100_000
 
 func crossProduct(left, right []storage.Row) []storage.Row {
 	estimated := len(left) * len(right)
