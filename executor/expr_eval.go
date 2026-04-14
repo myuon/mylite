@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/myuon/mylite/catalog"
 	"vitess.io/vitess/go/mysql/collations/charset"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
@@ -767,6 +768,235 @@ func (e *Executor) evalBinaryOp(v *sqlparser.BinaryExpr) (interface{}, error) {
 	return evalBinaryExpr(left, right, v.Operator, e.getDivPrecisionIncrement())
 }
 
+// collCoercibility holds the effective collation name and its coercibility level for an expression.
+// Coercibility levels (lower = stronger):
+//   0 = EXPLICIT (from COLLATE clause)
+//   1 = (unused)
+//   2 = IMPLICIT (column with explicit collation)
+//   3 = SYSCONST (system constant, e.g. @@variable)
+//   4 = COERCIBLE (string literal using connection collation)
+//   5 = NUMERIC (number - not a string)
+//   6 = IGNORABLE (NULL, binary functions)
+//  -1 = not a string expression
+type collCoercibility struct {
+	collation    string
+	coercibility int
+}
+
+// isStringColType returns true if a MySQL column type is a string type (CHAR, VARCHAR, TEXT, ENUM, SET).
+func isStringColType(colType string) bool {
+	t := strings.ToUpper(colType)
+	return strings.Contains(t, "CHAR") || strings.Contains(t, "TEXT") ||
+		strings.Contains(t, "ENUM") || strings.Contains(t, "SET")
+}
+
+// getExprCollationInfo returns the effective collation and coercibility for an expression,
+// using the current queryTableDef for column lookups.
+// Returns coercibility=-1 if the expression is not a string type.
+func (e *Executor) getExprCollationInfo(expr sqlparser.Expr) collCoercibility {
+	switch v := expr.(type) {
+	case *sqlparser.CollateExpr:
+		// EXPLICIT collation via COLLATE clause (coercibility 0)
+		return collCoercibility{collation: v.Collation, coercibility: 0}
+	case *sqlparser.ColName:
+		// IMPLICIT collation from column definition (coercibility 2)
+		colName := v.Name.String()
+		if e.queryTableDef != nil {
+			coll := e.lookupColumnCollation(colName, e.queryTableDef)
+			if coll != "" {
+				return collCoercibility{collation: coll, coercibility: 2}
+			}
+		}
+		// Column not found or not a string type
+		return collCoercibility{coercibility: -1}
+	case *sqlparser.Literal:
+		if v.Type == sqlparser.StrVal {
+			// String literal uses connection collation (coercibility 4 = COERCIBLE)
+			connColl := "utf8mb4_0900_ai_ci"
+			if cv, ok := e.getSysVar("collation_connection"); ok && cv != "" {
+				connColl = cv
+			}
+			return collCoercibility{collation: connColl, coercibility: 4}
+		}
+		return collCoercibility{coercibility: -1}
+	case *sqlparser.IntroducerExpr:
+		// _charset'str' — charset introducer, use the default collation for that charset
+		if lit, ok := v.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
+			cs := strings.ToLower(strings.TrimPrefix(v.CharacterSet, "_"))
+			coll := catalog.DefaultCollationForCharset(cs)
+			if coll == "" {
+				coll = "utf8mb4_0900_ai_ci"
+			}
+			return collCoercibility{collation: coll, coercibility: 4}
+		}
+		return collCoercibility{coercibility: -1}
+	}
+	return collCoercibility{coercibility: -1}
+}
+
+// lookupColumnCollation returns the effective collation for a named column in a table definition.
+// Returns "" if the column is not found or is not a string type.
+func (e *Executor) lookupColumnCollation(colName string, td *catalog.TableDef) string {
+	for _, col := range td.Columns {
+		if strings.EqualFold(col.Name, colName) {
+			if !isStringColType(col.Type) {
+				return "" // not a string column
+			}
+			if col.Collation != "" {
+				return col.Collation
+			}
+			if col.Charset != "" {
+				return catalog.DefaultCollationForCharset(col.Charset)
+			}
+			if td.Collation != "" {
+				return td.Collation
+			}
+			if td.Charset != "" {
+				return catalog.DefaultCollationForCharset(td.Charset)
+			}
+			return "utf8mb4_0900_ai_ci" // server default
+		}
+	}
+	return ""
+}
+
+// checkCollationMixForIN checks if the expressions in an IN expression have incompatible collations.
+// allExprs includes the left operand followed by the tuple items.
+// Returns an appropriate MySQL error (1267, 1270, or 1271) if there is an illegal collation mix,
+// or nil if the collations are compatible.
+func (e *Executor) checkCollationMixForIN(leftExpr sqlparser.Expr, tupleItems []sqlparser.Expr) error {
+	// Build the list of all expressions: left + tuple items
+	allExprs := make([]sqlparser.Expr, 0, 1+len(tupleItems))
+	allExprs = append(allExprs, leftExpr)
+	allExprs = append(allExprs, tupleItems...)
+
+	// Get collation info for each expression
+	infos := make([]collCoercibility, len(allExprs))
+	for i, expr := range allExprs {
+		infos[i] = e.getExprCollationInfo(expr)
+	}
+
+	// Determine the minimum (strongest) coercibility among string expressions
+	minCoercibility := 7 // start above all valid levels
+	for _, info := range infos {
+		if info.coercibility >= 0 && info.coercibility < minCoercibility {
+			minCoercibility = info.coercibility
+		}
+	}
+	if minCoercibility == 7 {
+		// No string expressions — no conflict possible
+		return nil
+	}
+
+	// Collect distinct collations at the minimum coercibility level
+	seen := map[string]bool{}
+	for _, info := range infos {
+		if info.coercibility == minCoercibility {
+			seen[strings.ToLower(info.collation)] = true
+		}
+	}
+
+	if len(seen) <= 1 {
+		// All string operands at strongest level agree on collation — no conflict
+		return nil
+	}
+
+	// There is a conflict. Determine the operation string and error code.
+	totalItems := len(allExprs)
+	coercName := "IMPLICIT"
+	switch minCoercibility {
+	case 0:
+		coercName = "EXPLICIT"
+	case 2:
+		coercName = "IMPLICIT"
+	case 4:
+		coercName = "COERCIBLE"
+	}
+
+	// Build the list of (collation, coercibility_name) strings for conflicting items
+	var conflictList []string
+	seenConflict := map[string]bool{}
+	for _, info := range infos {
+		if info.coercibility == minCoercibility {
+			key := strings.ToLower(info.collation)
+			if !seenConflict[key] {
+				seenConflict[key] = true
+				conflictList = append(conflictList, fmt.Sprintf("(%s,%s)", info.collation, coercName))
+			}
+		}
+	}
+
+	switch totalItems {
+	case 2:
+		// a in (b) — treated as a = b comparison
+		if len(conflictList) >= 2 {
+			return mysqlError(1267, "HY000", fmt.Sprintf(
+				"Illegal mix of collations %s and %s for operation '='",
+				conflictList[0], conflictList[1]))
+		}
+	case 3:
+		if len(conflictList) >= 2 {
+			msg := fmt.Sprintf("Illegal mix of collations %s for operation ' IN '", strings.Join(conflictList, ","))
+			return mysqlError(1270, "HY000", msg)
+		}
+	default:
+		// 4 or more items total (N collations case)
+		return mysqlError(1271, "HY000", "Illegal mix of collations for operation ' IN '")
+	}
+	return nil
+}
+
+// checkCollationMixForEQ checks if a binary = / != comparison has incompatible collations.
+func (e *Executor) checkCollationMixForEQ(leftExpr, rightExpr sqlparser.Expr) error {
+	leftInfo := e.getExprCollationInfo(leftExpr)
+	rightInfo := e.getExprCollationInfo(rightExpr)
+
+	// If either side is not a string, no conflict
+	if leftInfo.coercibility < 0 || rightInfo.coercibility < 0 {
+		return nil
+	}
+
+	// Determine strongest coercibility
+	minCoercibility := leftInfo.coercibility
+	if rightInfo.coercibility < minCoercibility {
+		minCoercibility = rightInfo.coercibility
+	}
+
+	// Only check operands at the strongest level
+	var atMin []collCoercibility
+	if leftInfo.coercibility == minCoercibility {
+		atMin = append(atMin, leftInfo)
+	}
+	if rightInfo.coercibility == minCoercibility {
+		atMin = append(atMin, rightInfo)
+	}
+
+	if len(atMin) < 2 {
+		return nil
+	}
+
+	// Check if all collations at the min level are the same
+	first := strings.ToLower(atMin[0].collation)
+	for _, info := range atMin[1:] {
+		if strings.ToLower(info.collation) != first {
+			coercName := "IMPLICIT"
+			switch minCoercibility {
+			case 0:
+				coercName = "EXPLICIT"
+			case 2:
+				coercName = "IMPLICIT"
+			case 4:
+				coercName = "COERCIBLE"
+			}
+			return mysqlError(1267, "HY000", fmt.Sprintf(
+				"Illegal mix of collations (%s,%s) and (%s,%s) for operation '='",
+				atMin[0].collation, coercName,
+				info.collation, coercName))
+		}
+	}
+	return nil
+}
+
 // evalComparisonExpr handles *sqlparser.ComparisonExpr evaluation.
 func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{}, error) {
 	// Handle IN / NOT IN specially: right side is a ValTuple
@@ -888,6 +1118,12 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 					return int64(1), nil
 				}
 				return int64(0), nil
+			}
+		}
+		// Check collation compatibility for IN/NOT IN before evaluating values.
+		if tuple2, ok2 := v.Right.(sqlparser.ValTuple); ok2 {
+			if collErr := e.checkCollationMixForIN(v.Left, []sqlparser.Expr(tuple2)); collErr != nil {
+				return nil, collErr
 			}
 		}
 		left, err := e.evalExpr(v.Left)

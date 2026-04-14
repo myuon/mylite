@@ -22304,6 +22304,12 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 				}
 				return false, nil
 			}
+			// Check for illegal collation mix in IN/NOT IN before evaluating.
+			if tuple2, ok2 := v.Right.(sqlparser.ValTuple); ok2 {
+				if collErr := e.checkCollationMixForIN(v.Left, []sqlparser.Expr(tuple2)); collErr != nil {
+					return false, collErr
+				}
+			}
 			left, err := e.evalRowExpr(v.Left, row)
 			if err != nil {
 				return false, err
