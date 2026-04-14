@@ -635,6 +635,36 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		}
 	}
 
+	// For transactional engines (InnoDB) in strict mode without IGNORE, a multi-row
+	// INSERT must be atomic: if any row fails, all rows inserted in this INSERT are rolled back.
+	// For non-transactional engines (MyISAM), rows inserted before the error are KEPT
+	// (MySQL's actual behavior: MyISAM commits each row as it's written).
+	tblEngineForSnap := strings.ToUpper(tbl.Def.Engine)
+	if tblEngineForSnap == "" {
+		if eng, ok := e.getSysVar("default_storage_engine"); ok && eng != "" {
+			tblEngineForSnap = strings.ToUpper(eng)
+		}
+	}
+	isTransactionalEngine := tblEngineForSnap != "MYISAM" && tblEngineForSnap != "MRG_MYISAM" && tblEngineForSnap != "MEMORY" && tblEngineForSnap != "ARCHIVE" && tblEngineForSnap != "CSV"
+	snapshotRowCount := -1
+	if isTransactionalEngine && e.isStrictMode() && !bool(stmt.Ignore) && len(rows) > 1 {
+		tbl.Lock()
+		snapshotRowCount = len(tbl.Rows)
+		tbl.Unlock()
+	}
+	// rollbackInsertedRows removes rows added in this INSERT statement after an error (InnoDB only).
+	rollbackInsertedRows := func() {
+		if snapshotRowCount >= 0 {
+			tbl.Lock()
+			if len(tbl.Rows) > snapshotRowCount {
+				tbl.Rows = tbl.Rows[:snapshotRowCount]
+				tbl.InvalidateIndexes()
+			}
+			tbl.Unlock()
+		}
+	}
+
+
 	for _, valTuple := range rows {
 		totalRows++
 		row := make(storage.Row)
@@ -838,24 +868,41 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 									return nil, err
 								}
 							}
-							// Strict mode: validate DATE/DATETIME/TIMESTAMP values
+							// Strict mode: validate DATE/DATETIME/TIMESTAMP/TIME values
 							if sv, ok := v.(string); ok {
-								if err := checkDateStrict(col.Type, col.Name, sv, e.sqlMode, int(totalRows)); err != nil {
-									// For non-transactional tables (MyISAM) under STRICT_TRANS_TABLES only
-									// (not STRICT_ALL_TABLES), treat as warning not error (like IGNORE).
+								// handleDateTimeErr processes a date/time validation error.
+								// For IGNORE or non-transactional MyISAM under STRICT_TRANS_TABLES,
+								// emit a warning and store zero value. Otherwise return the error.
+								handleDateTimeErr := func(err error) error {
 									tblEngine := strings.ToUpper(tbl.Def.Engine)
 									if tblEngine == "" {
-										// No engine specified; use session default_storage_engine.
 										if eng, ok := e.getSysVar("default_storage_engine"); ok && eng != "" {
 											tblEngine = strings.ToUpper(eng)
 										}
 									}
 									isNonTransactional := tblEngine == "MYISAM" || tblEngine == "MRG_MYISAM" || tblEngine == "MEMORY" || tblEngine == "ARCHIVE" || tblEngine == "CSV"
 									strictAllTables := strings.Contains(e.sqlMode, "STRICT_ALL_TABLES") || strings.Contains(e.sqlMode, "TRADITIONAL")
-									if bool(stmt.Ignore) || (isNonTransactional && !strictAllTables) {
+									// For MyISAM under STRICT_TRANS_TABLES (not STRICT_ALL_TABLES):
+									// if at least one row has already been inserted, convert error to warning.
+									// If this is the very first row (affected==0), return the error.
+									isPostFirstRow := isNonTransactional && !strictAllTables && affected > 0
+									if bool(stmt.Ignore) || isPostFirstRow {
 										e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
-									} else {
-										return nil, err
+										v = zeroDateTimeValue(col.Type)
+										return nil
+									}
+									return err
+								}
+								if err := checkDateStrict(col.Type, col.Name, sv, e.sqlMode, int(totalRows)); err != nil {
+									if handledErr := handleDateTimeErr(err); handledErr != nil {
+										rollbackInsertedRows()
+										return nil, handledErr
+									}
+								}
+								if err := checkTimeStrict(col.Type, col.Name, sv, int(totalRows)); err != nil {
+									if handledErr := handleDateTimeErr(err); handledErr != nil {
+										rollbackInsertedRows()
+										return nil, handledErr
 									}
 								}
 							}
@@ -879,6 +926,18 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 										e.addWarning("Note", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 									}
 								}
+							}
+						}
+					}
+					// When ALLOW_INVALID_DATES is active, DATE/DATETIME columns may have
+					// days out of the normal month range. parseMySQLDateValue rejects these,
+					// so we format them directly instead of going through coerce.
+					if strings.Contains(e.sqlMode, "ALLOW_INVALID_DATES") {
+						colUpper3 := strings.ToUpper(col.Type)
+						if sv3, isStr := v.(string); isStr && (colUpper3 == "DATE" || strings.HasPrefix(colUpper3, "DATETIME")) {
+							if formatted := parseMySQLDateValueAllowInvalid(sv3); formatted != "" {
+								v = formatted
+								break
 							}
 						}
 					}

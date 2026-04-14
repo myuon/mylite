@@ -14000,6 +14000,45 @@ func coerceYearValue(v interface{}) interface{} {
 // parseMySQLDateValue parses various MySQL date input formats and returns YYYY-MM-DD or "".
 var flexDateRe = regexp.MustCompile(`^(\d{4})-(\d{1,2})-(\d{1,2})`)
 
+// parseMySQLDateValueAllowInvalid parses a date string like parseMySQLDateValue but
+// allows invalid day values (e.g. 2004-02-30) as required by ALLOW_INVALID_DATES mode.
+// Returns the formatted date string, or "" if the value can't be parsed at all.
+func parseMySQLDateValueAllowInvalid(s string) string {
+	// Try YYYY-M-D format (may have a time component after a space)
+	if m := flexDateRe.FindStringSubmatch(s); m != nil {
+		y, _ := strconv.Atoi(m[1])
+		mo, _ := strconv.Atoi(m[2])
+		d, _ := strconv.Atoi(m[3])
+		// Allow any day 1-31 as long as month is 1-12 (or 0 for partial zero)
+		if mo >= 0 && mo <= 12 && d >= 0 && d <= 31 {
+			datePart := fmt.Sprintf("%04d-%02d-%02d", y, mo, d)
+			// Preserve time component if present (for DATETIME values)
+			if idx := strings.IndexAny(s, " \tT"); idx >= 0 {
+				return datePart + " " + strings.TrimSpace(s[idx+1:])
+			}
+			return datePart
+		}
+	}
+	// Try standard YYYY-MM-DD format
+	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
+		y, _ := strconv.Atoi(s[:4])
+		mo, _ := strconv.Atoi(s[5:7])
+		d, _ := strconv.Atoi(s[8:10])
+		if mo >= 0 && mo <= 12 && d >= 0 && d <= 31 {
+			datePart := fmt.Sprintf("%04d-%02d-%02d", y, mo, d)
+			// Preserve time component if present (for DATETIME values)
+			if len(s) > 10 {
+				if idx := strings.IndexAny(s[10:], " \tT"); idx >= 0 {
+					return datePart + " " + strings.TrimSpace(s[10+idx+1:])
+				}
+			}
+			return datePart
+		}
+	}
+	// Fall through to the normal parser for numeric formats etc.
+	return parseMySQLDateValue(s)
+}
+
 func parseMySQLDateValue(s string) string {
 	// Already in standard format
 	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
@@ -14146,6 +14185,99 @@ func isLeapYear(y int) bool {
 	return (y%4 == 0 && y%100 != 0) || y%400 == 0
 }
 
+// checkTimeStrict validates a TIME string value in strict SQL mode.
+// Returns error 1292 if the time value exceeds the MySQL TIME range [-838:59:59.999999, 838:59:59.999999]
+// after rounding to the column's fractional-seconds precision.
+func checkTimeStrict(colType, colName, originalValue string, rowNum int) error {
+	upper := strings.ToUpper(strings.TrimSpace(colType))
+	isTimeType := upper == "TIME" || strings.HasPrefix(upper, "TIME(")
+	if !isTimeType {
+		return nil
+	}
+
+	s := strings.TrimSpace(originalValue)
+	if s == "" {
+		return nil
+	}
+
+	// Extract fractional-seconds precision from column type, e.g. TIME(6) -> 6
+	fsp := 0
+	if strings.HasPrefix(upper, "TIME(") {
+		fmt.Sscanf(upper, "TIME(%d)", &fsp)
+	}
+
+	// Parse the time value. Strip leading '-' for sign.
+	sign := 1
+	rest := s
+	if strings.HasPrefix(rest, "-") {
+		sign = -1
+		rest = rest[1:]
+	}
+
+	// Parse HH:MM:SS[.fraction]
+	var hours, mins, secs int
+	var fracStr string
+	colonCount := strings.Count(rest, ":")
+	if colonCount == 2 {
+		if dotIdx := strings.Index(rest, "."); dotIdx >= 0 {
+			fracStr = rest[dotIdx+1:]
+			rest = rest[:dotIdx]
+		}
+		parts := strings.Split(rest, ":")
+		if len(parts) == 3 {
+			fmt.Sscanf(parts[0], "%d", &hours)
+			fmt.Sscanf(parts[1], "%d", &mins)
+			fmt.Sscanf(parts[2], "%d", &secs)
+		}
+	} else if colonCount == 1 {
+		// MM:SS format
+		if dotIdx := strings.Index(rest, "."); dotIdx >= 0 {
+			fracStr = rest[dotIdx+1:]
+			rest = rest[:dotIdx]
+		}
+		parts := strings.Split(rest, ":")
+		if len(parts) == 2 {
+			fmt.Sscanf(parts[0], "%d", &mins)
+			fmt.Sscanf(parts[1], "%d", &secs)
+		}
+	} else {
+		// Just digits - not a typical time format we need to check
+		return nil
+	}
+
+	// Check if fractional part rounds up when truncated to fsp digits
+	// If fracStr has more digits than fsp, check if it rounds up
+	if len(fracStr) > fsp {
+		// Check if rounding causes carry: digit at position fsp >= 5
+		roundDigit := 0
+		if fsp < len(fracStr) {
+			d := fracStr[fsp] - '0'
+			roundDigit = int(d)
+		}
+		if roundDigit >= 5 {
+			// Rounding up: carry into seconds
+			secs++
+			if secs >= 60 {
+				secs = 0
+				mins++
+				if mins >= 60 {
+					mins = 0
+					hours++
+				}
+			}
+		}
+	}
+
+	// Check range: max is 838:59:59
+	maxHours := 838
+	_ = sign
+	if hours > maxHours || (hours == maxHours && (mins > 59 || secs > 59)) {
+		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect time value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
+	}
+
+	return nil
+}
+
 // checkDateStrict validates a date string value for a DATE/DATETIME/TIMESTAMP column
 // in strict SQL mode. Returns an error if the date is invalid.
 // The sqlMode string is used to determine which checks to apply.
@@ -14156,6 +14288,15 @@ func checkDateStrict(colType, colName, originalValue, sqlMode string, rowNum int
 	if !isDateType {
 		return nil
 	}
+
+	// Determine the type label for error messages
+	typeLabel := "date"
+	if strings.HasPrefix(upper, "DATETIME") {
+		typeLabel = "datetime"
+	} else if strings.HasPrefix(upper, "TIMESTAMP") {
+		typeLabel = "datetime"
+	}
+	_ = typeLabel // used below
 
 	s := strings.TrimSpace(originalValue)
 	if s == "" {
@@ -14251,7 +14392,7 @@ func checkDateStrict(colType, colName, originalValue, sqlMode string, rowNum int
 			parsed = true
 		default:
 			// Short numeric values like '59' - definitely invalid
-			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
+			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect %s value: '%s' for column '%s' at row %d", typeLabel, originalValue, colName, rowNum))
 		}
 	}
 
@@ -14276,47 +14417,51 @@ func checkDateStrict(colType, colName, originalValue, sqlMode string, rowNum int
 				y, parseErr = strconv.Atoi(yStr)
 			}
 			if parseErr != nil {
-				return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
+				return mysqlError(1292, "22007", fmt.Sprintf("Incorrect %s value: '%s' for column '%s' at row %d", typeLabel, originalValue, colName, rowNum))
 			}
 			m, _ = strconv.Atoi(mStr)
 			d, _ = strconv.Atoi(dStr)
 			parsed = true
 		} else {
 			// Not parseable as a date
-			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
+			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect %s value: '%s' for column '%s' at row %d", typeLabel, originalValue, colName, rowNum))
 		}
 	}
 
 	if !parsed {
-		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
+		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect %s value: '%s' for column '%s' at row %d", typeLabel, originalValue, colName, rowNum))
 	}
 
 	// Check for zero date (0000-00-00)
 	if y == 0 && m == 0 && d == 0 {
 		if isNoZeroDate {
-			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
+			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect %s value: '%s' for column '%s' at row %d", typeLabel, originalValue, colName, rowNum))
 		}
 		return nil
 	}
 
 	// Check for zero month or zero day (partial zero dates)
 	if m == 0 || d == 0 {
-		if isNoZeroInDate {
-			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
+		// TIMESTAMP can never have month=0 or day=0 (out of valid range 1970-2038)
+		isTimestamp := strings.HasPrefix(upper, "TIMESTAMP")
+		if isNoZeroInDate || isTimestamp {
+			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect %s value: '%s' for column '%s' at row %d", typeLabel, originalValue, colName, rowNum))
 		}
-		// Partial zero dates are allowed in non-NO_ZERO_IN_DATE mode
+		// Partial zero dates are allowed in non-NO_ZERO_IN_DATE mode for DATE/DATETIME
 		return nil
 	}
 
 	// Check month range
 	if m < 1 || m > 12 {
-		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
+		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect %s value: '%s' for column '%s' at row %d", typeLabel, originalValue, colName, rowNum))
 	}
 
-	// ALLOW_INVALID_DATES: skip day range check, only month must be valid (1-12)
-	if allowInvalidDates {
+	// ALLOW_INVALID_DATES: skip day range check for DATE/DATETIME only.
+	// TIMESTAMP still requires a valid calendar date (because it must also be in 1970-2038 range).
+	isTimestampForAllow := strings.HasPrefix(upper, "TIMESTAMP")
+	if allowInvalidDates && !isTimestampForAllow {
 		if d < 1 || d > 31 {
-			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
+			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect %s value: '%s' for column '%s' at row %d", typeLabel, originalValue, colName, rowNum))
 		}
 		return nil
 	}
@@ -14328,10 +14473,82 @@ func checkDateStrict(colType, colName, originalValue, sqlMode string, rowNum int
 		maxDay = 29
 	}
 	if d < 1 || d > maxDay {
-		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect date value: '%s' for column '%s' at row %d", originalValue, colName, rowNum))
+		return mysqlError(1292, "22007", fmt.Sprintf("Incorrect %s value: '%s' for column '%s' at row %d", typeLabel, originalValue, colName, rowNum))
+	}
+
+	// For DATETIME/TIMESTAMP columns: validate the time component (HH:MM:SS) if present.
+	// Hours must be 0-23, minutes 0-59, seconds 0-59.
+	if strings.HasPrefix(upper, "DATETIME") || strings.HasPrefix(upper, "TIMESTAMP") {
+		// Extract time portion after the space/T separator
+		timePart := ""
+		if idx := strings.IndexAny(s, " \tT"); idx >= 0 {
+			timePart = strings.TrimSpace(s[idx+1:])
+		}
+		if timePart != "" {
+			timeParts := strings.Split(timePart, ":")
+			// Accept HH:MM or HH:MM:SS[.fraction] — 2 or 3 parts
+			if len(timeParts) == 2 || len(timeParts) == 3 {
+				hh, errH := strconv.Atoi(timeParts[0])
+				mm2, errM := strconv.Atoi(timeParts[1])
+				ss := 0
+				var errS error
+				if len(timeParts) == 3 {
+					secStr := timeParts[2]
+					if dotIdx := strings.IndexByte(secStr, '.'); dotIdx >= 0 {
+						secStr = secStr[:dotIdx]
+					}
+					ss, errS = strconv.Atoi(secStr)
+				}
+				if errH != nil || errM != nil || errS != nil {
+					return mysqlError(1292, "22007", fmt.Sprintf("Incorrect %s value: '%s' for column '%s' at row %d", typeLabel, originalValue, colName, rowNum))
+				}
+				if hh < 0 || hh > 23 || mm2 < 0 || mm2 > 59 || ss < 0 || ss > 59 {
+					return mysqlError(1292, "22007", fmt.Sprintf("Incorrect %s value: '%s' for column '%s' at row %d", typeLabel, originalValue, colName, rowNum))
+				}
+			}
+			// len==1 means no colon (e.g. "001500" compact form) — skip validation here
+		}
+	}
+
+	// For TIMESTAMP columns: check that the value is within the valid range
+	// (1970-01-01 00:00:01 to 2038-01-19 03:14:07 UTC). Values outside this range
+	// are invalid even if the date itself is valid.
+	if strings.HasPrefix(upper, "TIMESTAMP") {
+		// TIMESTAMP range: any date before 1970 or after 2038 is out of range.
+		// Also 0000-xx-xx is invalid.
+		isOutOfRange := false
+		if y < 1970 {
+			isOutOfRange = true
+		} else if y > 2038 {
+			isOutOfRange = true
+		} else if y == 2038 && (m > 1 || (m == 1 && d > 19)) {
+			isOutOfRange = true
+		}
+		if isOutOfRange {
+			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect %s value: '%s' for column '%s' at row %d", typeLabel, originalValue, colName, rowNum))
+		}
 	}
 
 	return nil
+}
+
+// zeroDateTimeValue returns the zero value string for a DATE/DATETIME/TIMESTAMP/TIME column type.
+// Used when a date/time value is invalid and IGNORE suppresses the error.
+func zeroDateTimeValue(colType string) string {
+	upper := strings.ToUpper(strings.TrimSpace(colType))
+	if upper == "DATE" {
+		return "0000-00-00"
+	}
+	if strings.HasPrefix(upper, "DATETIME") {
+		return "0000-00-00 00:00:00"
+	}
+	if strings.HasPrefix(upper, "TIMESTAMP") {
+		return "0000-00-00 00:00:00"
+	}
+	if upper == "TIME" || strings.HasPrefix(upper, "TIME(") {
+		return "00:00:00"
+	}
+	return ""
 }
 
 // extractColumnName extracts the column name from a sqlparser expression.
