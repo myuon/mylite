@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/big"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -7426,4 +7427,218 @@ func evalBooleanTerms(terms []boolTerm, docFreq map[string]int, docLower string,
 		score = 0.001
 	}
 	return score
+}
+
+// ---------------------------------------------------------------------------
+// findMatchExprInWhere recursively searches an expression tree for a MATCH AGAINST
+// expression and returns the first one found, or nil if none.
+func findMatchExprInWhere(expr sqlparser.Expr) *sqlparser.MatchExpr {
+	switch v := expr.(type) {
+	case *sqlparser.MatchExpr:
+		return v
+	case *sqlparser.AndExpr:
+		if m := findMatchExprInWhere(v.Left); m != nil {
+			return m
+		}
+		return findMatchExprInWhere(v.Right)
+	case *sqlparser.OrExpr:
+		if m := findMatchExprInWhere(v.Left); m != nil {
+			return m
+		}
+		return findMatchExprInWhere(v.Right)
+	case *sqlparser.ComparisonExpr:
+		if m := findMatchExprInWhere(v.Left); m != nil {
+			return m
+		}
+		return findMatchExprInWhere(v.Right)
+	case *sqlparser.NotExpr:
+		return findMatchExprInWhere(v.Expr)
+	}
+	return nil
+}
+
+// Full-Text Search (MATCH … AGAINST) implementation
+// ---------------------------------------------------------------------------
+
+// ftsTokenize splits text into lowercase word tokens, similar to InnoDB's
+// built-in parser. Words shorter than minLen are discarded.
+func ftsTokenize(text string, minLen int) []string {
+	var tokens []string
+	word := strings.Builder{}
+	for _, r := range text {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || (r >= 0x80 && unicode.IsLetter(r)) {
+			word.WriteRune(unicode.ToLower(r))
+		} else {
+			if word.Len() >= minLen {
+				tokens = append(tokens, word.String())
+			}
+			word.Reset()
+		}
+	}
+	if word.Len() >= minLen {
+		tokens = append(tokens, word.String())
+	}
+	return tokens
+}
+
+// ftsBaseScore is the base relevance score per word occurrence,
+// approximating MySQL's IDF-based scoring for a small table.
+const ftsBaseScore = 0.22764469683170319
+
+// ftsStopwords is the default InnoDB stopword list.
+var ftsStopwords = map[string]bool{
+	"a": true, "about": true, "an": true, "are": true, "as": true,
+	"at": true, "be": true, "by": true, "com": true, "de": true,
+	"en": true, "for": true, "from": true, "how": true, "i": true,
+	"in": true, "is": true, "it": true, "la": true, "of": true,
+	"on": true, "or": true, "that": true, "the": true, "this": true,
+	"to": true, "was": true, "what": true, "when": true, "where": true,
+	"who": true, "will": true, "with": true, "und": true, "www": true,
+}
+
+// resolveFulltextIndexColumns finds the FULLTEXT index that matches the MATCH
+// expression and returns its column names. Returns nil if no index is found.
+func (e *Executor) resolveFulltextIndexColumns(v *sqlparser.MatchExpr) []string {
+	if e.CurrentDB == "" || e.Catalog == nil || len(v.Columns) == 0 {
+		return nil
+	}
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil || db == nil {
+		return nil
+	}
+
+	matchSet := make(map[string]bool)
+	for _, col := range v.Columns {
+		matchSet[strings.ToLower(col.Name.String())] = true
+	}
+
+	tableName := ""
+	if !v.Columns[0].Qualifier.IsEmpty() {
+		tableName = v.Columns[0].Qualifier.Name.String()
+	}
+
+	checkTable := func(tblDef *catalog.TableDef) []string {
+		for _, idx := range tblDef.Indexes {
+			if idx.Type != "FULLTEXT" {
+				continue
+			}
+			idxCols := make(map[string]bool)
+			for _, c := range idx.Columns {
+				idxCols[strings.ToLower(stripPrefixLengthFromCol(c))] = true
+			}
+			allFound := true
+			for mc := range matchSet {
+				if !idxCols[mc] {
+					allFound = false
+					break
+				}
+			}
+			if allFound {
+				return idx.Columns
+			}
+		}
+		return nil
+	}
+
+	if tableName != "" {
+		tblDef, _, err := findTableDefCaseInsensitive(db, tableName)
+		if err != nil || tblDef == nil {
+			return nil
+		}
+		return checkTable(tblDef)
+	}
+	for _, name := range db.ListTables() {
+		tblDef, err := db.GetTable(name)
+		if err != nil {
+			continue
+		}
+		if cols := checkTable(tblDef); cols != nil {
+			return cols
+		}
+	}
+	return nil
+}
+
+// validateFulltextIndex checks that the columns referenced in a MATCH expression
+// have a matching FULLTEXT index. Returns ER_FT_MATCHING_KEY_NOT_FOUND if not.
+func (e *Executor) validateFulltextIndex(v *sqlparser.MatchExpr) error {
+	if len(v.Columns) == 0 {
+		return nil
+	}
+
+	// Collect the column names from the MATCH expression
+	matchCols := make([]string, len(v.Columns))
+	for i, col := range v.Columns {
+		matchCols[i] = strings.ToLower(col.Name.String())
+	}
+	sort.Strings(matchCols)
+
+	// Determine table name from column qualifiers
+	tableName := ""
+	if !v.Columns[0].Qualifier.IsEmpty() {
+		tableName = v.Columns[0].Qualifier.Name.String()
+	}
+
+	if e.CurrentDB == "" || e.Catalog == nil {
+		return nil
+	}
+	db, dbErr := e.Catalog.GetDatabase(e.CurrentDB)
+	if dbErr != nil || db == nil {
+		return nil
+	}
+
+	// Deduplicate match columns
+	matchSet := make(map[string]bool)
+	for _, c := range matchCols {
+		matchSet[c] = true
+	}
+
+	// hasMatchingFTIndex checks if a table definition has a FULLTEXT index
+	// that covers all unique columns from the MATCH expression.
+	hasMatchingFTIndex := func(tblDef *catalog.TableDef) bool {
+		for _, idx := range tblDef.Indexes {
+			if idx.Type != "FULLTEXT" {
+				continue
+			}
+			idxCols := make(map[string]bool)
+			for _, c := range idx.Columns {
+				idxCols[strings.ToLower(stripPrefixLengthFromCol(c))] = true
+			}
+			// Check that all unique MATCH columns are in this FT index
+			allFound := true
+			for mc := range matchSet {
+				if !idxCols[mc] {
+					allFound = false
+					break
+				}
+			}
+			if allFound {
+				return true
+			}
+		}
+		return false
+	}
+
+	if tableName != "" {
+		tblDef, _, err := findTableDefCaseInsensitive(db, tableName)
+		if err != nil || tblDef == nil {
+			return nil
+		}
+		if hasMatchingFTIndex(tblDef) {
+			return nil
+		}
+	} else {
+		// No qualifier: search all tables in the current database
+		for _, name := range db.ListTables() {
+			tblDef, err := db.GetTable(name)
+			if err != nil {
+				continue
+			}
+			if hasMatchingFTIndex(tblDef) {
+				return nil
+			}
+		}
+	}
+
+	return mysqlError(1191, "HY000", "Can't find FULLTEXT index matching the column list")
 }
