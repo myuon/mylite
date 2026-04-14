@@ -23859,14 +23859,14 @@ func compareByCollation(a, b interface{}, collation string) int {
 func normalizeCollationKey(s string, collation string) string {
 	coll := strings.ToLower(collation)
 
-	// Use Vitess for UCA 0900 collations which need accurate weight tables
-	if strings.Contains(coll, "_0900_") || strings.HasSuffix(coll, "_0900_bin") {
-		if vc := lookupVitessCollation(collation); vc != nil {
-			ws := vitessWeightString(s, vc)
-			return string(ws)
-		}
+	// Use Vitess weight strings for all collations it supports.
+	// This provides accurate MySQL-compatible sort keys for latin1, utf8mb4, cp1251, etc.
+	if vc := lookupVitessCollation(collation); vc != nil {
+		ws := vitessWeightString(s, vc)
+		return string(ws)
 	}
 
+	// Fallback for collations not supported by Vitess:
 	// Collation-specific key normalization
 	switch coll {
 	case "utf8_general_ci", "utf8mb3_general_ci":
