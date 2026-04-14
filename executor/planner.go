@@ -124,7 +124,7 @@ func (p *Planner) buildFromPlan(from []sqlparser.TableExpr, selectType string, i
 
 	// Implicit cross join for additional FROM tables
 	for i := 1; i < len(from); i++ {
-		right, err := p.buildTableExprPlan(from[i], selectType, p.nextID())
+		right, err := p.buildTableExprPlan(from[i], selectType, id)
 		if err != nil {
 			return nil, err
 		}
@@ -224,7 +224,7 @@ func (p *Planner) buildTableExprPlan(te sqlparser.TableExpr, selectType string, 
 		if err != nil {
 			return nil, err
 		}
-		right, err := p.buildTableExprPlan(t.RightExpr, selectType, p.nextID())
+		right, err := p.buildTableExprPlan(t.RightExpr, selectType, id)
 		if err != nil {
 			return nil, err
 		}

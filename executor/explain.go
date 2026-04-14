@@ -6776,15 +6776,48 @@ func (e *Executor) explainTreeText(query string) string {
 // using the new plan-based path (Phase 2). Returns (rows, true) on success,
 // or (nil, false) if the query is too complex and the existing path should be used.
 //
-// The plan-based path is used only for the simplest single-table SELECT queries:
-// no subqueries, no derived tables, no JOIN expressions.
-// Joins and other complex patterns are handled by the existing explainMultiRows path
-// which has sophisticated handling for edge cases like "Impossible WHERE" etc.
+// Falls back for queries with subqueries or derived tables.
+// Simple and JOIN queries are handled by the plan-based path (Phase 3).
 func (e *Executor) tryPlanBasedExplainTraditional(sel *sqlparser.Select) ([][]interface{}, bool) {
-	// Phase 2: plan-based EXPLAIN is built but not yet used for output.
-	// The plan is constructed for validation/testing purposes only.
-	// Enable this path once id assignment and edge cases are fully validated.
-	return nil, false
+	// Fall back for queries with complex parts (subqueries / derived tables).
+	if e.queryHasComplexParts(sel) {
+		return nil, false
+	}
+
+	planner := newPlanner(e)
+	plan, err := planner.BuildPlan(sel)
+	if err != nil {
+		return nil, false
+	}
+	plan = planner.optimize(plan, sel)
+
+	pe := &PlanExplainer{executor: e, query: sqlparser.String(sel)}
+	rows := pe.ExplainTraditional(plan)
+	if len(rows) == 0 {
+		return nil, false
+	}
+
+	// Fall back to the old path when all tables have const/system access type AND
+	// there is a WHERE clause with multiple rows (JOIN). The old path has sophisticated
+	// "Impossible WHERE noticed after reading const tables" detection that executes
+	// the actual query to determine if the WHERE is always false.
+	if len(rows) > 1 && sel.Where != nil {
+		allConst := true
+		for _, row := range rows {
+			if len(row) > 4 {
+				at, ok := row[4].(string)
+				if !ok || (at != "const" && at != "system") {
+					allConst = false
+					break
+				}
+			}
+		}
+		if allConst {
+			return nil, false
+		}
+	}
+
+	return rows, true
 }
 
 func (e *Executor) explainResultForType(explainType sqlparser.ExplainType, explainedQuery string) *Result {
