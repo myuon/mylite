@@ -10,111 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/myuon/mylite/catalog"
-	"vitess.io/vitess/go/mysql/collations"
-	"vitess.io/vitess/go/mysql/collations/charset"
-	"vitess.io/vitess/go/mysql/collations/colldata"
 )
-
-// storageCollEnv is a shared Vitess collation environment for MySQL 8.0.
-var storageCollEnv = collations.NewEnvironment("8.0.40")
-
-// lookupStorageCollation returns a Vitess Collation for the given name, or nil if not found.
-func lookupStorageCollation(name string) colldata.Collation {
-	id := storageCollEnv.LookupByName(strings.ToLower(name))
-	if id == collations.Unknown {
-		return nil
-	}
-	return colldata.Lookup(id)
-}
-
-// storageWeightString returns a MySQL-compatible sort key for string s under the given collation.
-func storageWeightString(s string, coll colldata.Collation) []byte {
-	src := []byte(s)
-	cs := coll.Charset()
-	csName := cs.Name()
-	if csName != "utf8mb4" && csName != "utf8mb3" && csName != "binary" {
-		converted, err := charset.ConvertFromUTF8(nil, cs, src)
-		if err == nil {
-			src = converted
-		}
-	}
-	return coll.WeightString(nil, src, 0)
-}
-
-// effectivePKCollation returns the effective collation name for a PK column in a TableDef.
-// It prefers the column-level collation, then the table-level collation, then derives from charset.
-func effectivePKCollation(def *catalog.TableDef, colName string) string {
-	if def == nil {
-		return "utf8mb4_0900_ai_ci"
-	}
-	// Check column-level collation
-	for _, col := range def.Columns {
-		if strings.EqualFold(col.Name, colName) {
-			if col.Collation != "" {
-				return strings.ToLower(col.Collation)
-			}
-			if col.Charset != "" {
-				return strings.ToLower(catalog.DefaultCollationForCharset(col.Charset))
-			}
-			break
-		}
-	}
-	// Fall back to table-level collation
-	if def.Collation != "" {
-		return strings.ToLower(def.Collation)
-	}
-	charset := def.Charset
-	if charset == "" {
-		charset = "utf8mb4"
-	}
-	return strings.ToLower(catalog.DefaultCollationForCharset(charset))
-}
-
-// compareRowValueWithCollation compares two row values using the given collation name
-// for string values. Non-string values fall back to compareRowValue.
-func compareRowValueWithCollation(a, b interface{}, collationName string) int {
-	if a == nil && b == nil {
-		return 0
-	}
-	if a == nil {
-		return -1
-	}
-	if b == nil {
-		return 1
-	}
-	// Use collation-aware comparison for strings
-	_, aIsStr := a.(string)
-	_, bIsStr := b.(string)
-	if (aIsStr || bIsStr) && collationName != "" {
-		aStr := fmt.Sprintf("%v", a)
-		bStr := fmt.Sprintf("%v", b)
-		if vc := lookupStorageCollation(collationName); vc != nil {
-			wa := storageWeightString(aStr, vc)
-			wb := storageWeightString(bStr, vc)
-			if string(wa) < string(wb) {
-				return -1
-			}
-			if string(wa) > string(wb) {
-				return 1
-			}
-			return 0
-		}
-		// Fallback: case-insensitive for _ci collations
-		coll := strings.ToLower(collationName)
-		if strings.HasSuffix(coll, "_ci") {
-			aStr = strings.ToUpper(aStr)
-			bStr = strings.ToUpper(bStr)
-		}
-		if aStr < bStr {
-			return -1
-		}
-		if aStr > bStr {
-			return 1
-		}
-		return 0
-	}
-	return compareRowValue(a, b)
-}
 
 // stripPrefixLength strips the prefix length from a column name.
 // e.g., "col_1_text(3072)" -> "col_1_text"
@@ -1090,18 +986,14 @@ func (t *Table) Scan() []Row {
 	}
 	// InnoDB table scans are clustered by PRIMARY KEY.
 	// Keep scan order deterministic and MySQL-compatible for tests that rely on it.
-	// Use collation-aware comparison so that character set ordering matches MySQL.
-	if t.Def != nil && len(t.Def.PrimaryKey) > 0 && len(result) > 1 {
+	// Skip sorting for charsets where Go's byte-order comparison does not match
+	// the MySQL collation order (e.g. sjis, cp932, ujis, eucjpms).
+	if t.Def != nil && len(t.Def.PrimaryKey) > 0 && len(result) > 1 && !hasNonSortableCharset(t.Def.Charset) {
 		pkCols := append([]string(nil), t.Def.PrimaryKey...)
-		// Pre-compute collation per PK column.
-		pkCollations := make([]string, len(pkCols))
-		for idx, pk := range pkCols {
-			pkCollations[idx] = effectivePKCollation(t.Def, pk)
-		}
 		sort.SliceStable(result, func(i, j int) bool {
 			ri, rj := result[i], result[j]
-			for idx, pk := range pkCols {
-				cmp := compareRowValueWithCollation(ri[pk], rj[pk], pkCollations[idx])
+			for _, pk := range pkCols {
+				cmp := compareRowValue(ri[pk], rj[pk])
 				if cmp < 0 {
 					return true
 				}
