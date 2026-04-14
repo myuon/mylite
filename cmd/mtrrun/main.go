@@ -22,6 +22,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -37,6 +38,9 @@ import (
 )
 // skipTests lists tests known to be unfixable. Key: "suite/testname".
 var skipTests map[string]bool
+
+// skipGlobs holds skiplist entries that contain glob wildcards (*, ?).
+var skipGlobs []string
 
 // testResultJSON is the per-test entry in the JSON result log.
 type testResultJSON struct {
@@ -71,8 +75,26 @@ func init() {
 	}
 	skipTests = make(map[string]bool, len(sl.Skips))
 	for _, e := range sl.Skips {
-		skipTests[e.Test] = true
+		if strings.ContainsAny(e.Test, "*?") {
+			skipGlobs = append(skipGlobs, e.Test)
+		} else {
+			skipTests[e.Test] = true
+		}
 	}
+}
+
+// isSkipped returns true if the given "suite/testname" key matches any skip entry
+// (exact map lookup first, then glob patterns).
+func isSkipped(key string) bool {
+	if skipTests[key] {
+		return true
+	}
+	for _, pattern := range skipGlobs {
+		if matched, _ := path.Match(pattern, key); matched {
+			return true
+		}
+	}
+	return false
 }
 var mtrrunLockFile = filepath.Join(os.TempDir(), "mtrrun.lock")
 
@@ -387,7 +409,7 @@ func runSuite(suiteName string, testFilter map[string]bool, suiteRoot, includeRo
 		if testFilter != nil && !testFilter[testName] {
 			continue
 		}
-		isSkipped := skipTests[suiteName+"/"+testName]
+		isSkipped := isSkipped(suiteName + "/" + testName)
 		if runSkippedOnly {
 			if !isSkipped {
 				continue

@@ -81,7 +81,13 @@ def cmd_list(args):
         print(f"{entry['test']}\t{entry['reason']}")
 
 
+def is_glob_pattern(test):
+    """Return True if the test name contains glob wildcard characters."""
+    return "*" in test or "?" in test
+
+
 def cmd_validate(args):
+    import fnmatch
     data = load_skiplist()
     missing = 0
     for entry in data["skips"]:
@@ -92,6 +98,9 @@ def cmd_validate(args):
             missing += 1
             continue
         suite, testname = parts
+        # Glob patterns are valid by definition — skip file-existence check.
+        if is_glob_pattern(test):
+            continue
         test_file = os.path.join(TESTDATA_BASE, suite, "t", testname + ".test")
         if not os.path.exists(test_file):
             print(f"MISSING: {test} -> {test_file}")
