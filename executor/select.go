@@ -1264,6 +1264,43 @@ func (e *Executor) updateHandlerReadIndexScanCounters(stmt *sqlparser.Select) {
 	}
 }
 
+// validateNoStandaloneValTuple checks that a ValTuple does not appear in a
+// scalar context (SELECT list, WHERE boolean, HAVING boolean, ORDER BY).
+// A ValTuple is only valid as part of a comparison like ROW(a,b)=ROW(c,d).
+func validateNoStandaloneValTuple(expr sqlparser.Expr) error {
+	if _, ok := expr.(sqlparser.ValTuple); ok {
+		return mysqlError(1241, "21000", "Operand should contain 1 column(s)")
+	}
+	return nil
+}
+
+// validateRowTupleStructure checks that the right-hand-side tuple structurally
+// matches the left-hand-side tuple element by element (nested tuple sizes must match).
+// MySQL validates all IN-list items structurally before evaluating any match.
+func validateRowTupleStructure(left, right sqlparser.ValTuple) error {
+	if len(left) != len(right) {
+		return mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(left)))
+	}
+	for i := range left {
+		lNested, lIsTuple := left[i].(sqlparser.ValTuple)
+		rNested, rIsTuple := right[i].(sqlparser.ValTuple)
+		if lIsTuple && !rIsTuple {
+			// Left has nested tuple but right has scalar
+			return mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(lNested)))
+		}
+		if !lIsTuple && rIsTuple {
+			// Right has nested tuple but left has scalar
+			return mysqlError(1241, "21000", "Operand should contain 1 column(s)")
+		}
+		if lIsTuple && rIsTuple {
+			if err := validateRowTupleStructure(lNested, rNested); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// Validate index hints (USE KEY / IGNORE KEY / FORCE KEY) on FROM tables.
 	if err := e.validateIndexHints(stmt.From); err != nil {
@@ -1372,6 +1409,31 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 			return nil, err
 		}
 	}
+	// Validate that standalone ValTuples are not used in scalar context.
+	// SELECT ROW(1,1), WHERE ROW(1,1), ORDER BY ROW(1,1), HAVING (1,1) all error 1241.
+	for _, expr := range stmt.SelectExprs.Exprs {
+		if ae, ok := expr.(*sqlparser.AliasedExpr); ok {
+			if err := validateNoStandaloneValTuple(ae.Expr); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if stmt.Where != nil {
+		if err := validateNoStandaloneValTuple(stmt.Where.Expr); err != nil {
+			return nil, err
+		}
+	}
+	if stmt.Having != nil {
+		if err := validateNoStandaloneValTuple(stmt.Having.Expr); err != nil {
+			return nil, err
+		}
+	}
+	for _, order := range stmt.OrderBy {
+		if err := validateNoStandaloneValTuple(order.Expr); err != nil {
+			return nil, err
+		}
+	}
+
 	// Handle SELECT without FROM (e.g., SELECT 1, SELECT @@version_comment)
 	if len(stmt.From) == 0 {
 		return e.execSelectNoFrom(stmt)
@@ -5661,6 +5723,9 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 	for _, expr := range stmt.SelectExprs.Exprs {
 		if se, ok := expr.(*sqlparser.AliasedExpr); ok {
 			if err := validateNoFromTopLevelColRefs(se.Expr); err != nil {
+				return nil, err
+			}
+			if err := validateNoStandaloneValTuple(se.Expr); err != nil {
 				return nil, err
 			}
 		}

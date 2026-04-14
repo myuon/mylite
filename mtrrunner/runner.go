@@ -4266,6 +4266,7 @@ var mysqlErrorCodeToName = map[int]string{
 	1467: "ER_AUTOINC_READ_FAILED",
 	3507: "ER_UNSUPPORTED_SQL_MODE",
 	3566: "ER_VARIABLE_NOT_SETTABLE_IN_SP",
+	3895: "ER_PK_INDEX_CANT_BE_INVISIBLE",
 }
 
 // mysqlCodeToSQLState maps a MySQL error code to its SQLSTATE.
