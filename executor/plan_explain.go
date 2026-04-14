@@ -32,17 +32,34 @@ func (pe *PlanExplainer) collectRows(node PlanNode, rows *[][]interface{}, extra
 	switch n := node.(type) {
 	case *TableScanNode:
 		extra := buildExtraString(append(n.Extra, extraAccum...))
+
+		// Use AccessPath data populated by the optimizer pass.
+		accessType := n.AccessPath.Type
+		if accessType == "" {
+			accessType = "ALL"
+		}
+		var possibleKeys interface{} = nilIfEmptyStr(n.AccessPath.PossibleKeys)
+		var key interface{} = nilIfEmptyStr(n.AccessPath.Key)
+		var keyLen interface{} = nilIfEmptyStr(n.AccessPath.KeyLen)
+		var ref interface{} = nilIfEmptyStr(n.AccessPath.Ref)
+
+		// Row count: shrink to 1 for index lookups that guarantee 1 row.
+		rowEstimate := n.RowEstimate
+		if accessType == "const" || accessType == "eq_ref" || accessType == "ref" {
+			rowEstimate = 1
+		}
+
 		*rows = append(*rows, []interface{}{
 			n.ID,
 			n.SelectType,
 			n.TableName,
-			nil,   // partitions
-			"ALL", // access type placeholder; Phase 1 does not recompute
-			nil,   // possible_keys
-			nil,   // key
-			nil,   // key_len
-			nil,   // ref
-			n.RowEstimate,
+			nil, // partitions
+			accessType,
+			possibleKeys,
+			key,
+			keyLen,
+			ref,
+			rowEstimate,
 			"100.00",
 			extra,
 		})
@@ -100,6 +117,14 @@ func (pe *PlanExplainer) collectRows(node PlanNode, rows *[][]interface{}, extra
 	case *DerivedTableNode:
 		pe.collectRows(n.Plan, rows, extraAccum)
 	}
+}
+
+// nilIfEmptyStr returns nil if s is empty, otherwise returns s as interface{}.
+func nilIfEmptyStr(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // buildExtraString joins a list of extra strings with "; ", deduplicating and

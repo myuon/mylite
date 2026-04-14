@@ -6772,6 +6772,45 @@ func (e *Executor) explainTreeText(query string) string {
 	return limitOffset + scanNode
 }
 
+// tryPlanBasedExplainTraditional attempts to generate EXPLAIN Traditional rows
+// using the new plan-based path (Phase 2). Returns (rows, true) on success,
+// or (nil, false) if the query is too complex and the existing path should be used.
+//
+// The plan-based path is used only for the simplest single-table SELECT queries:
+// no subqueries, no derived tables, no JOIN expressions.
+// Joins and other complex patterns are handled by the existing explainMultiRows path
+// which has sophisticated handling for edge cases like "Impossible WHERE" etc.
+func (e *Executor) tryPlanBasedExplainTraditional(sel *sqlparser.Select) ([][]interface{}, bool) {
+	// Fall back for queries with complex parts (subqueries / derived tables).
+	if e.queryHasComplexParts(sel) {
+		return nil, false
+	}
+
+	// Fall back for multi-table queries (JOINs or comma-separated FROM tables).
+	// The existing path handles edge cases like "Impossible WHERE noticed after reading const tables".
+	if len(sel.From) != 1 {
+		return nil, false
+	}
+	// Also fall back for JoinTableExpr in FROM (explicit JOIN syntax).
+	if _, isJoin := sel.From[0].(*sqlparser.JoinTableExpr); isJoin {
+		return nil, false
+	}
+
+	planner := newPlanner(e)
+	plan, err := planner.BuildPlan(sel)
+	if err != nil {
+		return nil, false
+	}
+	plan = planner.optimize(plan, sel)
+
+	pe := &PlanExplainer{executor: e, query: sqlparser.String(sel)}
+	rows := pe.ExplainTraditional(plan)
+	if len(rows) == 0 {
+		return nil, false
+	}
+	return rows, true
+}
+
 func (e *Executor) explainResultForType(explainType sqlparser.ExplainType, explainedQuery string) *Result {
 	switch explainType {
 	case sqlparser.TreeType:
@@ -6828,16 +6867,22 @@ func (e *Executor) execExplainStmt(s *sqlparser.ExplainStmt, query string) (*Res
 			}
 		}
 	}
-	// Phase 1: build logical plan (construction only; output still uses existing path)
+	// Phase 2: use plan-based EXPLAIN Traditional for simple SELECT queries.
+	// For complex cases (UNION, subqueries in WHERE, etc.) fall back to existing path.
 	if sel, ok2 := s.Statement.(*sqlparser.Select); ok2 {
-		planner := newPlanner(e)
-		if plan, err := planner.BuildPlan(sel); err == nil {
-			_ = plan // Phase 1: plan constructed but not yet used for output
+		if s.Type == sqlparser.TraditionalType || (s.Type != sqlparser.TreeType && s.Type != sqlparser.JSONType) {
+			if planRows, ok := e.tryPlanBasedExplainTraditional(sel); ok {
+				return &Result{
+					Columns:     []string{"id", "select_type", "table", "partitions", "type", "possible_keys", "key", "key_len", "ref", "rows", "filtered", "Extra"},
+					Rows:        planRows,
+					IsResultSet: true,
+				}, nil
+			}
 		}
 	} else if u, ok2 := s.Statement.(*sqlparser.Union); ok2 {
 		planner := newPlanner(e)
 		if plan, err := planner.BuildPlan(u); err == nil {
-			_ = plan // Phase 1: plan constructed but not yet used for output
+			_ = plan // constructed but complex path handles output
 		}
 	}
 

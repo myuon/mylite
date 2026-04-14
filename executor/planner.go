@@ -320,6 +320,120 @@ func joinTypeString(jt sqlparser.JoinType) string {
 	}
 }
 
+// optimize runs a post-build optimization pass over the plan tree.
+// It fills in AccessPath information for each TableScanNode and propagates
+// Extra hints (Using where, Using filesort, Using temporary) from parent nodes.
+//
+// The sel parameter is the top-level SELECT (used for WHERE/index lookup).
+// For UNION or complex queries this may be nil, in which case optimization is skipped.
+func (p *Planner) optimize(plan PlanNode, sel *sqlparser.Select) PlanNode {
+	if plan == nil {
+		return plan
+	}
+	p.optimizeNode(plan, sel, false, false, false)
+	return plan
+}
+
+// optimizeNode recursively visits nodes, accumulating context flags.
+// hasSortAbove / hasAggAbove / hasFilterAbove track whether a Sort / Aggregate / Filter
+// node sits above the current node in the tree.
+func (p *Planner) optimizeNode(node PlanNode, sel *sqlparser.Select, hasSortAbove, hasAggAbove, hasFilterAbove bool) {
+	if node == nil {
+		return
+	}
+
+	switch n := node.(type) {
+	case *TableScanNode:
+		// Fill AccessPath from explainDetectAccessType if we have a SELECT context.
+		if sel != nil {
+			ai := p.executor.explainDetectAccessType(sel, n.TableName)
+			n.AccessPath = AccessPath{
+				Type:         ai.accessType,
+				PossibleKeys: stringify(ai.possibleKeys),
+				Key:          stringify(ai.key),
+				KeyLen:       stringify(ai.keyLen),
+				Ref:          stringify(ai.ref),
+			}
+			if n.AccessPath.Type == "" {
+				n.AccessPath.Type = "ALL"
+			}
+		} else {
+			if n.AccessPath.Type == "" {
+				n.AccessPath.Type = "ALL"
+			}
+		}
+
+		// Propagate Extra hints from above.
+		if hasFilterAbove {
+			n.Extra = appendUnique(n.Extra, "Using where")
+		}
+		if hasSortAbove {
+			n.Extra = appendUnique(n.Extra, "Using filesort")
+		}
+		if hasAggAbove {
+			n.Extra = appendUnique(n.Extra, "Using temporary")
+		}
+
+	case *FilterNode:
+		p.optimizeNode(n.Child, sel, hasSortAbove, hasAggAbove, true)
+
+	case *SortNode:
+		p.optimizeNode(n.Child, sel, true, hasAggAbove, hasFilterAbove)
+
+	case *AggregateNode:
+		p.optimizeNode(n.Child, sel, hasSortAbove, true, hasFilterAbove)
+
+	case *ProjectNode:
+		p.optimizeNode(n.Child, sel, hasSortAbove, hasAggAbove, hasFilterAbove)
+
+	case *LimitNode:
+		p.optimizeNode(n.Child, sel, hasSortAbove, hasAggAbove, hasFilterAbove)
+
+	case *JoinNode:
+		// Both sides share the same context flags.
+		p.optimizeNode(n.Left, sel, hasSortAbove, hasAggAbove, hasFilterAbove)
+		p.optimizeNode(n.Right, sel, hasSortAbove, hasAggAbove, hasFilterAbove)
+
+	case *UnionNode:
+		for _, branch := range n.Branches {
+			p.optimizeNode(branch, nil, false, false, false)
+		}
+
+	case *DerivedTableNode:
+		// Derived table inner plan has its own SELECT context.
+		p.optimizeNode(n.Plan, nil, false, false, false)
+
+	case *SubqueryNode:
+		p.optimizeNode(n.Plan, nil, false, false, false)
+
+	default:
+		for _, child := range node.Children() {
+			p.optimizeNode(child, sel, hasSortAbove, hasAggAbove, hasFilterAbove)
+		}
+	}
+}
+
+// stringify converts an interface{} to string; returns "" for nil.
+func stringify(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+// appendUnique appends s to slice only if not already present.
+func appendUnique(slice []string, s string) []string {
+	for _, existing := range slice {
+		if existing == s {
+			return slice
+		}
+	}
+	return append(slice, s)
+}
+
 // walkPlan visits every node in the plan tree in depth-first pre-order.
 func walkPlan(node PlanNode, fn func(PlanNode)) {
 	if node == nil {

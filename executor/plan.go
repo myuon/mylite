@@ -13,6 +13,15 @@ type PlanNode interface {
 
 // ---- Leaf nodes ----
 
+// AccessPath holds index access information for a table scan.
+type AccessPath struct {
+	Type         string // "ALL", "const", "eq_ref", "ref", "range", "index", "index_merge"
+	PossibleKeys string // comma-separated list of possible index names
+	Key          string // chosen key name
+	KeyLen       string // key length as string
+	Ref          string // reference string (e.g. "const", "db.table.col")
+}
+
 // TableScanNode represents a full or index scan of a base table.
 type TableScanNode struct {
 	TableName    string
@@ -23,6 +32,7 @@ type TableScanNode struct {
 	SelectType   string // "SIMPLE", "PRIMARY", "DERIVED", etc.
 	ID           int64
 	Extra        []string
+	AccessPath   AccessPath
 }
 
 func (n *TableScanNode) Children() []PlanNode { return nil }
