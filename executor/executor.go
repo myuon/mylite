@@ -455,6 +455,11 @@ type Executor struct {
 	sysVarsAdminUsers map[string]bool
 	// sysVarsAdminUsersMu protects sysVarsAdminUsers.
 	sysVarsAdminUsersMu *sync.RWMutex
+	// knownUsers tracks users created via CREATE USER for SET PASSWORD FOR validation.
+	// Shared across all connections.
+	knownUsers map[string]bool
+	// knownUsersMu protects knownUsers.
+	knownUsersMu *sync.RWMutex
 	// inUpdateSetContext is set to true while evaluating SET expressions in an UPDATE statement.
 	// When true, CONCAT (and similar) should return an error if the result exceeds max_allowed_packet,
 	// rather than returning NULL with a warning (which is correct for SELECT/INSERT context).
@@ -905,6 +910,8 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	e.superUsersMu = &sync.RWMutex{}
 	e.sysVarsAdminUsers = make(map[string]bool)
 	e.sysVarsAdminUsersMu = &sync.RWMutex{}
+	e.knownUsers = make(map[string]bool)
+	e.knownUsersMu = &sync.RWMutex{}
 	e.initSystemTables()
 	return e
 }
@@ -984,6 +991,8 @@ func (e *Executor) Clone() *Executor {
 		superUsersMu:            e.superUsersMu,
 		sysVarsAdminUsers:       e.sysVarsAdminUsers,
 		sysVarsAdminUsersMu:     e.sysVarsAdminUsersMu,
+		knownUsers:              e.knownUsers,
+		knownUsersMu:            e.knownUsersMu,
 	}
 }
 
@@ -1786,6 +1795,13 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
 				return nil, mysqlError(1192, "HY000", "Can't execute the given command because you have active locked tables or an active transaction")
 			}
+		}
+		// Track CREATE USER / DROP USER in knownUsers for SET PASSWORD FOR validation.
+		if strings.HasPrefix(upper, "CREATE USER ") {
+			e.trackCreateUser(trimmed)
+		}
+		if strings.HasPrefix(upper, "DROP USER ") {
+			e.trackDropUser(trimmed)
 		}
 		if strings.HasPrefix(upper, "CREATE EVENT") ||
 			strings.HasPrefix(upper, "DROP EVENT") ||
@@ -2907,6 +2923,14 @@ func (e *Executor) execPrepare(stmt *sqlparser.PrepareStmt) (*Result, error) {
 	query = strings.ReplaceAll(query, "\\'", "'")
 	query = strings.ReplaceAll(query, "\\\"", "\"")
 	query = strings.ReplaceAll(query, "\\\\", "\\")
+	// Validate SET PASSWORD FOR syntax at PREPARE time.
+	// MySQL rejects invalid SET PASSWORD FOR statements at PREPARE time (not just EXECUTE time).
+	upperQuery := strings.ToUpper(strings.TrimSpace(query))
+	if strings.HasPrefix(upperQuery, "SET PASSWORD FOR ") {
+		if syntaxErr := validateSetPasswordSyntax(strings.TrimSpace(query)); syntaxErr != nil {
+			return nil, syntaxErr
+		}
+	}
 	e.preparedStmts[name] = query
 	return &Result{}, nil
 }
@@ -4862,4 +4886,103 @@ func extractColLiteralForPK(cmp *sqlparser.ComparisonExpr) (string, interface{})
 		}
 	}
 	return "", nil
+}
+
+// parseUserAtHost extracts the normalized "user@host" key from a string like
+// "test_user1@'localhost'" or "'user'@'host'". Returns empty string on failure.
+func parseUserAtHost(s string) string {
+	s = strings.TrimSpace(s)
+	// Find last @ to split user and host
+	atIdx := strings.LastIndex(s, "@")
+	if atIdx < 0 {
+		return ""
+	}
+	user := strings.TrimSpace(s[:atIdx])
+	host := strings.TrimSpace(s[atIdx+1:])
+	user = strings.Trim(user, "'`\"")
+	host = strings.Trim(host, "'`\"")
+	return strings.ToLower(user + "@" + host)
+}
+
+// trackCreateUser records the user(s) created by a CREATE USER statement in knownUsers.
+func (e *Executor) trackCreateUser(raw string) {
+	if e.knownUsers == nil || e.knownUsersMu == nil {
+		return
+	}
+	// Strip CREATE USER [IF NOT EXISTS] prefix
+	upper := strings.ToUpper(raw)
+	rest := ""
+	if strings.HasPrefix(upper, "CREATE USER IF NOT EXISTS ") {
+		rest = strings.TrimSpace(raw[len("CREATE USER IF NOT EXISTS "):])
+	} else if strings.HasPrefix(upper, "CREATE USER ") {
+		rest = strings.TrimSpace(raw[len("CREATE USER "):])
+	} else {
+		return
+	}
+	// Strip trailing semicolons
+	rest = strings.TrimSuffix(strings.TrimSpace(rest), ";")
+	// The user spec may have IDENTIFIED BY ... or other options; extract just user@host part.
+	// Split by comma for multiple users, then take the first token (user@host) of each.
+	userSpecs := strings.Split(rest, ",")
+	e.knownUsersMu.Lock()
+	defer e.knownUsersMu.Unlock()
+	for _, spec := range userSpecs {
+		spec = strings.TrimSpace(spec)
+		// User spec format: 'user'@'host' [IDENTIFIED BY 'password' ...]
+		// Find the user@host part (stop at first space after the @host)
+		userHost := spec
+		if idx := strings.IndexAny(spec, " \t"); idx >= 0 {
+			// Check if the space is after @host
+			atIdx := strings.LastIndex(spec[:idx], "@")
+			if atIdx >= 0 {
+				userHost = strings.TrimSpace(spec[:idx])
+			}
+		}
+		key := parseUserAtHost(userHost)
+		if key != "" {
+			e.knownUsers[key] = true
+		}
+	}
+}
+
+// trackDropUser removes user(s) from knownUsers based on a DROP USER statement.
+func (e *Executor) trackDropUser(raw string) {
+	if e.knownUsers == nil || e.knownUsersMu == nil {
+		return
+	}
+	upper := strings.ToUpper(raw)
+	rest := ""
+	if strings.HasPrefix(upper, "DROP USER IF EXISTS ") {
+		rest = strings.TrimSpace(raw[len("DROP USER IF EXISTS "):])
+	} else if strings.HasPrefix(upper, "DROP USER ") {
+		rest = strings.TrimSpace(raw[len("DROP USER "):])
+	} else {
+		return
+	}
+	rest = strings.TrimSuffix(strings.TrimSpace(rest), ";")
+	userSpecs := strings.Split(rest, ",")
+	e.knownUsersMu.Lock()
+	defer e.knownUsersMu.Unlock()
+	for _, spec := range userSpecs {
+		spec = strings.TrimSpace(spec)
+		key := parseUserAtHost(spec)
+		if key != "" {
+			delete(e.knownUsers, key)
+		}
+	}
+}
+
+// isKnownUser checks if user@host (parsed from "user@host" string like "test_user1@'localhost'")
+// is in the knownUsers map.
+func (e *Executor) isKnownUser(userAtHost string) bool {
+	if e.knownUsers == nil || e.knownUsersMu == nil {
+		return false
+	}
+	key := parseUserAtHost(userAtHost)
+	if key == "" {
+		return false
+	}
+	e.knownUsersMu.RLock()
+	defer e.knownUsersMu.RUnlock()
+	return e.knownUsers[key]
 }

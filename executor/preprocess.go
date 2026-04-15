@@ -662,6 +662,12 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 			queryStr = strings.ReplaceAll(queryStr, "\\'", "'")
 			queryStr = strings.ReplaceAll(queryStr, "\\\"", "\"")
 			queryStr = strings.ReplaceAll(queryStr, "\\\\", "\\")
+			// Validate SET PASSWORD FOR syntax at PREPARE time.
+			if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(queryStr)), "SET PASSWORD FOR ") {
+				if syntaxErr := validateSetPasswordSyntax(strings.TrimSpace(queryStr)); syntaxErr != nil {
+					return "", nil, syntaxErr
+				}
+			}
 			e.preparedStmts[strings.ToLower(stmtName)] = queryStr
 			return "", &Result{}, nil
 		}
