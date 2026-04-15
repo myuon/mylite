@@ -262,7 +262,11 @@ func (e *Executor) execCreateDatabase(stmt *sqlparser.CreateDatabase) (*Result, 
 	for _, opt := range stmt.CreateOptions {
 		switch opt.Type {
 		case sqlparser.CharacterSetType:
-			charset = strings.ToLower(strings.Trim(opt.Value, "'\""))
+			newCS := strings.ToLower(strings.Trim(opt.Value, "'\""))
+			if charset != "" && !strings.EqualFold(charset, newCS) {
+				return nil, mysqlError(1302, "HY000", fmt.Sprintf("Conflicting declarations: 'CHARACTER SET %s' and 'CHARACTER SET %s'", charset, newCS))
+			}
+			charset = newCS
 		case sqlparser.CollateType:
 			collation = strings.ToLower(strings.Trim(opt.Value, "'\""))
 		}
@@ -396,19 +400,30 @@ func (e *Executor) execCreateDatabaseRaw(query string) (*Result, error) {
 	}
 
 	// Extract CHARACTER SET and COLLATE from rest
+	// Check for conflicting CHARACTER SET declarations (MySQL error 1302).
 	charset := ""
 	collation := ""
 	fullUpper := strings.ToUpper(strings.Join(fields[1:], " "))
-	csIdx := strings.Index(fullUpper, "CHARACTER SET ")
-	if csIdx >= 0 {
-		afterCS := strings.TrimSpace(fullUpper[csIdx+len("CHARACTER SET "):])
-		// Skip optional '=' after CHARACTER SET
-		afterCS = strings.TrimPrefix(afterCS, "= ")
-		afterCS = strings.TrimPrefix(afterCS, "=")
-		afterCS = strings.TrimSpace(afterCS)
-		csFields := strings.Fields(afterCS)
-		if len(csFields) > 0 {
-			charset = strings.ToLower(strings.Trim(csFields[0], "'\""))
+	{
+		remaining := fullUpper
+		for {
+			csIdx := strings.Index(remaining, "CHARACTER SET ")
+			if csIdx < 0 {
+				break
+			}
+			afterCS := strings.TrimSpace(remaining[csIdx+len("CHARACTER SET "):])
+			afterCS = strings.TrimPrefix(afterCS, "= ")
+			afterCS = strings.TrimPrefix(afterCS, "=")
+			afterCS = strings.TrimSpace(afterCS)
+			csFields := strings.Fields(afterCS)
+			if len(csFields) > 0 {
+				newCS := strings.ToLower(strings.Trim(csFields[0], "'\""))
+				if charset != "" && !strings.EqualFold(charset, newCS) {
+					return nil, mysqlError(1302, "HY000", fmt.Sprintf("Conflicting declarations: 'CHARACTER SET %s' and 'CHARACTER SET %s'", charset, newCS))
+				}
+				charset = newCS
+			}
+			remaining = remaining[csIdx+len("CHARACTER SET "):]
 		}
 	}
 	// Also check in original (non-uppercased) for COLLATE value quoting
@@ -493,7 +508,18 @@ func (e *Executor) execAlterDatabaseRaw(query string) (*Result, error) {
 	dbName := strings.Trim(fields[0], "`")
 	// ALTER DATABASE DEFAULT CHARACTER SET ... means alter the current database
 	if strings.ToUpper(dbName) == "DEFAULT" {
+		if e.CurrentDB == "" {
+			return nil, mysqlError(1046, "3D000", "No database selected")
+		}
 		dbName = e.CurrentDB
+	}
+	// Empty identifier (e.g. ALTER DATABASE `` ...) is invalid
+	if dbName == "" {
+		return nil, mysqlError(1102, "42000", "Incorrect database name ''")
+	}
+	// Check identifier length before database lookup (MySQL error 1059 / ER_TOO_LONG_IDENT)
+	if len(dbName) > 64 {
+		return nil, mysqlError(1059, "42000", fmt.Sprintf("Identifier name '%s' is too long", dbName))
 	}
 	db, err := e.Catalog.GetDatabase(dbName)
 	if err != nil {
@@ -921,9 +947,13 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 
 	// Extract table-level charset before processing columns so that
 	// buildColumnTypeString can propagate binary charset to columns.
+	// Also check for conflicting CHARACTER SET declarations (MySQL error 1302).
 	var tableCharset string
 	for _, opt := range stmt.TableSpec.Options {
 		if strings.EqualFold(opt.Name, "CHARACTER SET") || strings.EqualFold(opt.Name, "CHARSET") {
+			if tableCharset != "" && !strings.EqualFold(tableCharset, opt.String) {
+				return nil, mysqlError(1302, "HY000", fmt.Sprintf("Conflicting declarations: 'CHARACTER SET %s' and 'CHARACTER SET %s'", tableCharset, opt.String))
+			}
 			tableCharset = opt.String
 		}
 	}
