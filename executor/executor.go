@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1568,6 +1569,22 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 	// The vitess parser silently drops this option, so we must detect it before parsing.
 	if strings.Contains(upper, "ALTER INDEX PRIMARY") {
 		return nil, mysqlError(1064, "42000", "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'PRIMARY INVISIBLE' at line 1")
+	}
+
+	// MySQL treats IS UNKNOWN and IS NOT UNKNOWN as non-associative (like IS TRUE/FALSE/NOT TRUE/NOT FALSE).
+	// Chaining them (e.g. "x IS UNKNOWN IS UNKNOWN") is a syntax error in MySQL.
+	// The vitess parser maps IS UNKNOWN -> IsNullOp (same as IS NULL), so it silently allows chaining.
+	// We must detect and reject this before parsing.
+	if strings.Contains(upper, "UNKNOWN") {
+		// Match: IS [NOT] UNKNOWN followed by whitespace and IS (i.e., chained)
+		chainedUnknownRe := regexp.MustCompile(`(?i)\bIS\s+(NOT\s+)?UNKNOWN\s+IS\b`)
+		if loc := chainedUnknownRe.FindStringIndex(upper); loc != nil {
+			// Find the second IS in the match - that's the start of the "near" text
+			secondIsIdx := strings.Index(upper[loc[0]+2:], "IS")
+			nearStart := loc[0] + 2 + secondIsIdx
+			nearText := strings.TrimRight(query[nearStart:], ";")
+			return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", nearText))
+		}
 	}
 
 	stmt, err := e.parser().Parse(query)

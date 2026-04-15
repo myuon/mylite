@@ -726,7 +726,10 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 			return nil, true, nil
 		}
 		days := toInt64(val)
-		if days <= 0 {
+		// MySQL returns 0000-00-00 (zero date) for day numbers that result in year 0
+		// (days < 366). Day 366 = 0001-01-01, day 365 = 0000-12-31 which MySQL
+		// treats as a zero/invalid date and displays as 0000-00-00.
+		if days < 366 {
 			return "0000-00-00", true, nil
 		}
 		// MySQL's day 1 epoch: 1970-01-01 is MySQL day 719528
