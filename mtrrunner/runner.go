@@ -2773,68 +2773,84 @@ func (ctx *execContext) executeQueryOrExec(stmt string) error {
 		return nil
 	}
 
-	// Write column headers
-	ctx.output.WriteString(strings.Join(columns, "\t") + "\n")
-
-	// Collect result rows
-	var resultLines []string
-	for rows.Next() {
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-		if err := rows.Scan(valuePtrs...); err != nil {
+	// Process all result sets (stored procedures can return multiple result sets)
+	for {
+		columns, err = rows.Columns()
+		if err != nil {
 			return err
 		}
 
-		parts := make([]string, len(columns))
-		for i, v := range values {
-			parts[i] = formatResultCell(v)
-		}
-		// Apply --replace_column
-		if len(ctx.replaceColumns) > 0 {
-			for colIdx, replacement := range ctx.replaceColumns {
-				if colIdx >= 1 && colIdx <= len(parts) {
-					parts[colIdx-1] = replacement
+		if len(columns) > 0 {
+			// Write column headers
+			ctx.output.WriteString(strings.Join(columns, "\t") + "\n")
+
+			// Collect result rows
+			var resultLines []string
+			for rows.Next() {
+				values := make([]interface{}, len(columns))
+				valuePtrs := make([]interface{}, len(columns))
+				for i := range values {
+					valuePtrs[i] = &values[i]
+				}
+				if err := rows.Scan(valuePtrs...); err != nil {
+					return err
+				}
+
+				parts := make([]string, len(columns))
+				for i, v := range values {
+					parts[i] = formatResultCell(v)
+				}
+				// Apply --replace_column
+				if len(ctx.replaceColumns) > 0 {
+					for colIdx, replacement := range ctx.replaceColumns {
+						if colIdx >= 1 && colIdx <= len(parts) {
+							parts[colIdx-1] = replacement
+						}
+					}
+				}
+				resultLines = append(resultLines, strings.Join(parts, "\t"))
+			}
+
+			// Apply --sorted_result (only for single result sets)
+			if ctx.sortResult {
+				sort.Strings(resultLines)
+				ctx.sortResult = false
+			}
+
+			// Apply --replace_result to output (including column headers)
+			if len(ctx.replaceResult) > 0 {
+				for i, col := range columns {
+					columns[i] = applyReplaceResult(col, ctx.replaceResult)
+				}
+				for i, line := range resultLines {
+					resultLines[i] = applyReplaceResult(line, ctx.replaceResult)
 				}
 			}
+			// Apply --replace_regex to output (including column headers)
+			if len(ctx.replaceRegex) > 0 {
+				for i, col := range columns {
+					columns[i] = applyReplaceRegex(col, ctx.replaceRegex)
+				}
+				for i, line := range resultLines {
+					resultLines[i] = applyReplaceRegex(line, ctx.replaceRegex)
+				}
+			}
+
+			for _, line := range resultLines {
+				ctx.output.WriteString(line + "\n")
+			}
 		}
-		resultLines = append(resultLines, strings.Join(parts, "\t"))
+
+		// Advance to next result set
+		if !rows.NextResultSet() {
+			break
+		}
 	}
 
-	// Apply --sorted_result
-	if ctx.sortResult {
-		sort.Strings(resultLines)
-		ctx.sortResult = false
-	}
-	// Clear replace_columns after use
+	// Clear modifiers after all result sets are processed
 	ctx.replaceColumns = nil
-
-	// Apply --replace_result to output (including column headers)
-	if len(ctx.replaceResult) > 0 {
-		for i, col := range columns {
-			columns[i] = applyReplaceResult(col, ctx.replaceResult)
-		}
-		for i, line := range resultLines {
-			resultLines[i] = applyReplaceResult(line, ctx.replaceResult)
-		}
-		ctx.replaceResult = nil
-	}
-	// Apply --replace_regex to output (including column headers)
-	if len(ctx.replaceRegex) > 0 {
-		for i, col := range columns {
-			columns[i] = applyReplaceRegex(col, ctx.replaceRegex)
-		}
-		for i, line := range resultLines {
-			resultLines[i] = applyReplaceRegex(line, ctx.replaceRegex)
-		}
-		ctx.replaceRegex = nil
-	}
-
-	for _, line := range resultLines {
-		ctx.output.WriteString(line + "\n")
-	}
+	ctx.replaceResult = nil
+	ctx.replaceRegex = nil
 
 	return nil
 }

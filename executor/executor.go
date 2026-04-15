@@ -115,6 +115,10 @@ type Result struct {
 	MatchedRows  uint64 // for UPDATE: rows that matched WHERE clause
 	ChangedRows  uint64 // for UPDATE: rows actually modified
 	InfoMessage  string // optional info message (e.g. "Rows matched: 2  Changed: 1  Warnings: 0")
+	// ExtraResultSets holds additional result sets from stored procedures that produce
+	// multiple result sets (e.g., procedures with SELECT in loops). The main result is
+	// the first result set; ExtraResultSets contains subsequent ones.
+	ExtraResultSets []*Result
 }
 
 // intOverflowError is returned when an integer literal exceeds uint64 range.

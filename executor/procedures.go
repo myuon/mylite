@@ -996,12 +996,14 @@ func (e *Executor) callProcedureByNameInDB(dbName string, procName string, argSt
 		}
 	}
 
+	allResultSets := make([]*Result, 0)
 	ctx := &routineContext{
 		localVars:     make(map[string]interface{}),
 		localVarTypes: make(map[string]string),
 		cursors:       make(map[string]*cursorState),
 		cursorDefs:    make(map[string]string),
 		conditionDefs: make(map[string]string),
+		resultSets:    &allResultSets,
 	}
 	for k, v := range paramVars {
 		ctx.localVars[k] = v
@@ -1046,6 +1048,14 @@ func (e *Executor) callProcedureByNameInDB(dbName string, procName string, argSt
 		e.userVars[userVar] = val
 	}
 
+	// If multiple result sets were collected, return them all.
+	if len(allResultSets) > 0 {
+		first := allResultSets[0]
+		if len(allResultSets) > 1 {
+			first.ExtraResultSets = allResultSets[1:]
+		}
+		return first, nil
+	}
 	// If the routine body produced a result set (e.g. from EXIT HANDLER or SELECT), return it.
 	if bodyResult != nil {
 		if r, ok := bodyResult.(*Result); ok && r != nil && r.IsResultSet {
@@ -1119,12 +1129,14 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 
 	// Execute body using the routine executor with cursor support.
 	// We create the context directly so we can read back final variable values.
+	allResultSets := make([]*Result, 0)
 	ctx := &routineContext{
 		localVars:     make(map[string]interface{}),
 		localVarTypes: make(map[string]string),
 		cursors:       make(map[string]*cursorState),
 		cursorDefs:    make(map[string]string),
 		conditionDefs: make(map[string]string),
+		resultSets:    &allResultSets,
 	}
 	for k, v := range paramVars {
 		ctx.localVars[k] = v
@@ -1169,6 +1181,14 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 	}
 
 	// If the routine body produced a result set (e.g. from EXIT HANDLER or SELECT), return it.
+	// If multiple result sets were collected, return them all.
+	if len(allResultSets) > 0 {
+		first := allResultSets[0]
+		if len(allResultSets) > 1 {
+			first.ExtraResultSets = allResultSets[1:]
+		}
+		return first, nil
+	}
 	if bodyResult != nil {
 		if r, ok := bodyResult.(*Result); ok && r != nil && r.IsResultSet {
 			return r, nil
@@ -1599,6 +1619,7 @@ type routineContext struct {
 	triggerOldRow      storage.Row  // non-nil when executing a trigger body (for OLD.col resolution)
 	triggerTiming      string       // "BEFORE" or "AFTER" for trigger execution
 	handlerResult      *Result      // result set produced by EXIT HANDLER body (to return from CALL)
+	resultSets         *[]*Result   // pointer to slice collecting all result sets from SELECT statements; shared across child contexts
 }
 
 // childContext creates a child routineContext that shares state with the parent
@@ -1616,6 +1637,7 @@ func (ctx *routineContext) childContext() *routineContext {
 		triggerNewRow:      ctx.triggerNewRow,
 		triggerOldRow:      ctx.triggerOldRow,
 		triggerTiming:      ctx.triggerTiming,
+		resultSets:         ctx.resultSets, // share pointer so child SELECTs accumulate in same list
 	}
 	return child
 }
@@ -2502,14 +2524,19 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 		// They will be returned if an EXIT HANDLER fires, or from the routine call itself.
 		if stmtResult != nil && stmtResult.IsResultSet {
 			ctx.handlerResult = stmtResult
+			// Collect all result sets so callers can return multiple result sets (e.g. for CALL).
+			if ctx.resultSets != nil {
+				*ctx.resultSets = append(*ctx.resultSets, stmtResult)
+			}
 		}
 	}
 
 	_ = done
-	// Return the last SELECT result set if any, otherwise the return value.
-	if ctx.handlerResult != nil && ctx.handlerResult.IsResultSet {
-		return ctx.handlerResult, nil
-	}
+	// Return the return value (from RETURN statements in functions).
+	// Do NOT return ctx.handlerResult here: SELECT result sets are accumulated in
+	// ctx.resultSets and returned by the top-level procedure call. Returning
+	// handlerResult here would cause loop bodies to exit early after the first SELECT.
+	// (EXIT HANDLER results are returned earlier, at the point the handler fires.)
 	return returnVal, nil
 }
 

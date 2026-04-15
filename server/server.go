@@ -76,6 +76,7 @@ type Handler struct {
 	mu       sync.Mutex
 	stmtsMu  sync.Mutex
 	stmts    map[uint64]string
+	conn     *gomysql.Conn // the underlying MySQL protocol connection, set after handshake
 }
 
 func (h *Handler) UseDB(dbName string) error {
@@ -112,6 +113,28 @@ func (h *Handler) HandleQuery(query string) (*mysql.Result, error) {
 	}
 
 	if result.IsResultSet {
+		// If the procedure produced multiple result sets, write all but the last one
+		// directly to the connection with SERVER_MORE_RESULTS_EXISTS set, then return
+		// the last one normally for the server framework to write.
+		if len(result.ExtraResultSets) > 0 && h.conn != nil {
+			// Write the first result set (and any intermediate ones) directly.
+			allSets := append([]*executor.Result{result}, result.ExtraResultSets...)
+			// Clear ExtraResultSets on the main result to avoid double-writing.
+			result.ExtraResultSets = nil
+			for i := 0; i < len(allSets)-1; i++ {
+				r, convErr := resultToMySQL(allSets[i])
+				if convErr != nil {
+					return nil, convErr
+				}
+				h.conn.SetStatus(mysql.SERVER_MORE_RESULTS_EXISTS)
+				if writeErr := h.conn.WriteValue(r); writeErr != nil {
+					return nil, writeErr
+				}
+				h.conn.UnsetStatus(mysql.SERVER_MORE_RESULTS_EXISTS)
+			}
+			// Return the last result set for normal writing by the server framework.
+			return resultToMySQL(allSets[len(allSets)-1])
+		}
 		return resultToMySQL(result)
 	}
 
@@ -374,6 +397,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 		s.logger.Printf("handshake error: %v", err)
 		return
 	}
+	// Store the connection so HandleQuery can write multiple result sets directly.
+	handler.conn = mysqlConn
 	for {
 		err := mysqlConn.HandleCommand()
 		if err != nil {
