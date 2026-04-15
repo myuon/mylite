@@ -263,6 +263,25 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 			}
 			return false
 		})
+	} else if stmt.Limit != nil && len(tbl.Def.PrimaryKey) > 0 {
+		// When LIMIT without ORDER BY, InnoDB scans in PRIMARY KEY order.
+		sort.SliceStable(matchingIndices, func(a, b int) bool {
+			for _, pkCol := range tbl.Def.PrimaryKey {
+				va := rowValueByColumnName(tbl.Rows[matchingIndices[a]], pkCol)
+				vb := rowValueByColumnName(tbl.Rows[matchingIndices[b]], pkCol)
+				var cmp int
+				if colType, ok := colTypeByName[strings.ToLower(pkCol)]; ok && isNumericOrderColumnType(colType) {
+					cmp = compareNumeric(va, vb)
+				} else {
+					cmp = compareByCollation(va, vb, orderCollation)
+				}
+				if cmp == 0 {
+					continue
+				}
+				return cmp < 0
+			}
+			return false
+		})
 	}
 
 	// Apply LIMIT
