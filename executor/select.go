@@ -3198,13 +3198,12 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 				groups = append(groups, group{key: key, rows: []storage.Row{row}})
 			}
 		}
-		// MySQL only sorts GROUP BY groups when WITH ROLLUP is specified.
-		// Without ROLLUP, groups appear in insertion (first-seen) order.
-		if stmt.GroupBy.WithRollup {
-			sort.SliceStable(groups, func(i, j int) bool {
-				return compareGroupKeys(groups[i].key, groups[j].key) < 0
-			})
-		}
+		// Sort GROUP BY groups by key so that NULL rows appear before non-NULL rows,
+		// matching MySQL/InnoDB behavior where rows are returned in index/PK order.
+		// This applies both for regular GROUP BY and WITH ROLLUP.
+		sort.SliceStable(groups, func(i, j int) bool {
+			return compareGroupKeys(groups[i].key, groups[j].key) < 0
+		})
 	} else {
 		// No GROUP BY but has aggregates: treat all rows as one group
 		groups = []group{{key: "", rows: allRows}}
