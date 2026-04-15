@@ -1398,10 +1398,18 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 			}
 
 			var extra interface{} = nil
-			// Single-table scan on empty table: MySQL shows "no matching row in const table"
-			// with table=NULL in the traditional EXPLAIN output.
+			// Detect access type based on WHERE clause and available indexes.
+			// We need this before the tableIsEmpty check to determine whether "no matching
+			// row in const table" applies: MySQL only uses that message for const-access tables
+			// (primary key / unique key equality lookup), not for ALL-scan empty tables.
+			accessInfo := e.explainDetectAccessType(sel, tblName)
+
+			// "no matching row in const table": MySQL shows this only when the table is accessed
+			// via const access (PRIMARY KEY equality) and the row doesn't exist (empty table).
+			// For ALL-scan empty tables MySQL still shows the plan with the real table name.
 			// Exception: MATERIALIZED subqueries always show the real table name with 0 rows.
-			if tableIsEmpty && len(allTableNames) == 1 && idx == 0 && selectType != "MATERIALIZED" {
+			if tableIsEmpty && len(allTableNames) == 1 && idx == 0 && selectType != "MATERIALIZED" &&
+				(accessInfo.accessType == "const" || accessInfo.accessType == "system") {
 				result = append(result, explainSelectType{
 					id:         myID,
 					selectType: selectType,
@@ -1411,8 +1419,8 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 					filtered:   nil,
 					accessType: nil,
 				})
-				// When the outer table is empty in a semijoin-flattened context (SIMPLE),
-				// return immediately without processing subqueries. MySQL collapses the
+				// When the outer table is empty with const access in a semijoin-flattened context
+				// (SIMPLE), return immediately without processing subqueries. MySQL collapses the
 				// entire result to 1 NULL row in this case.
 				if selectType == "SIMPLE" {
 					return result
@@ -1428,16 +1436,12 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 
 			var accessType interface{} = "ALL"
 			var filtered interface{} = "100.00"
-			if tableIsEmpty {
-				filtered = "0.00"
-			}
 			var possibleKeys interface{} = nil
 			var key interface{} = nil
 			var keyLen interface{} = nil
 			var ref interface{} = nil
 
-			// Detect access type based on WHERE clause and available indexes
-			accessInfo := e.explainDetectAccessType(sel, tblName)
+			// accessInfo was already computed above (before the tableIsEmpty check).
 			accessType = accessInfo.accessType
 			possibleKeys = accessInfo.possibleKeys
 			key = accessInfo.key
@@ -1445,6 +1449,12 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 			ref = accessInfo.ref
 
 			if accessInfo.accessType == "const" || accessInfo.accessType == "eq_ref" || accessInfo.accessType == "ref" {
+				rowCount = int64(1)
+			} else if tableIsEmpty {
+				// For ALL-scan empty tables, use rows=1 to match InnoDB's default statistics
+				// (the minimum estimate for an empty table is 1 row in InnoDB stats).
+				// filtered stays at "100.00" because MySQL's EXPLAIN uses the theoretical plan,
+				// not the actual row counts.
 				rowCount = int64(1)
 			}
 
@@ -2669,6 +2679,37 @@ func (e *Executor) isImpossibleConstPKWhere(inner *sqlparser.Select) bool {
 	return true // No matching row found → impossible WHERE
 }
 
+// hasImpossibleNullComparison returns true if the given WHERE expression contains
+// a non-null-safe comparison with a literal NULL (e.g. "col < NULL", "col = NULL").
+// Such comparisons always evaluate to NULL (not TRUE/FALSE), making the WHERE condition
+// trivially impossible. MySQL's optimizer detects this and shows "Impossible WHERE noticed
+// after reading const tables" in EXPLAIN.
+func hasImpossibleNullComparison(expr sqlparser.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	found := false
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		cmp, ok := n.(*sqlparser.ComparisonExpr)
+		if !ok {
+			return true, nil
+		}
+		// Skip null-safe equality (<=>): it IS defined for NULLs.
+		if cmp.Operator == sqlparser.NullSafeEqualOp {
+			return true, nil
+		}
+		// Check if either side is a literal NULL
+		_, leftNull := cmp.Left.(*sqlparser.NullVal)
+		_, rightNull := cmp.Right.(*sqlparser.NullVal)
+		if leftNull || rightNull {
+			found = true
+			return false, nil
+		}
+		return true, nil
+	}, expr)
+	return found
+}
+
 // isSubqueryInINContext checks if a Subquery node is used in an IN, NOT IN, or = ANY / != ANY context.
 // Note: plain scalar equality like "col = (SELECT 1 FROM t2)" (without ANY/ALL) is NOT IN context;
 // those are SUBQUERY not semijoin-flattenable.
@@ -2948,7 +2989,11 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 				// → treated as semijoin with decorrelated inner subquery
 				existsCanDecorrelate := inExistsContext && e.isSemijoinEnabled() && outerCanSemijoin && !innerHasNoSemijoin && e.isSemiJoinDecorrelatable(inner, outerTables)
 
-				if e.isSemijoinEnabled() && e.isImpossibleConstPKWhere(inner) {
+				// Detect impossible subquery WHERE: either a constant PK mismatch (no matching row)
+				// or a NULL comparison (c6 < NULL is always NULL/false).
+				innerWhereIsImpossible := e.isImpossibleConstPKWhere(inner) ||
+					(inner.Where != nil && hasImpossibleNullComparison(inner.Where.Expr))
+				if e.isSemijoinEnabled() && innerWhereIsImpossible {
 					selectType = "__IMPOSSIBLE__"
 				} else if (correlated || innerHasNoSemijoin) && !existsCanDecorrelate {
 					selectType = "DEPENDENT SUBQUERY"
