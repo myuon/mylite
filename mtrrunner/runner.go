@@ -2212,11 +2212,15 @@ func (ctx *execContext) evaluateIfConditionInner(condStr string) bool {
 		if idx := strings.Index(condStr, op); idx >= 0 {
 			left := strings.TrimSpace(condStr[:idx])
 			right := strings.TrimSpace(condStr[idx+len(op):])
-			// Strip surrounding single quotes (mysqltest convention: 'value')
+			// Strip surrounding single or double quotes (mysqltest convention: 'value' or "value")
 			if len(left) >= 2 && left[0] == '\'' && left[len(left)-1] == '\'' {
+				left = left[1 : len(left)-1]
+			} else if len(left) >= 2 && left[0] == '"' && left[len(left)-1] == '"' {
 				left = left[1 : len(left)-1]
 			}
 			if len(right) >= 2 && right[0] == '\'' && right[len(right)-1] == '\'' {
+				right = right[1 : len(right)-1]
+			} else if len(right) >= 2 && right[0] == '"' && right[len(right)-1] == '"' {
 				right = right[1 : len(right)-1]
 			}
 			lNum, lErr := strconv.ParseFloat(left, 64)
