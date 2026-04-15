@@ -433,7 +433,8 @@ type Executor struct {
 	// "Table is already up to date" otherwise.
 	tableNeedsOptimize map[string]bool
 	// Sort statistics: incremented when ORDER BY operations are performed.
-	sortRows  int64 // total rows sorted
+	sortRows            int64 // total rows sorted
+	createdTmpDiskTables int64 // temp tables written to disk
 	sortRange int64 // sort operations using range scan
 	sortScan  int64 // sort operations using full table scan
 	// questions counts the number of client statements received, reset on FLUSH STATUS.
@@ -1684,6 +1685,7 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			e.sortRows = 0
 			e.sortRange = 0
 			e.sortScan = 0
+			e.createdTmpDiskTables = 0
 			e.questions = 0
 			return &Result{}, nil
 		}
@@ -2420,6 +2422,7 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 				e.sortRows = 0
 				e.sortRange = 0
 				e.sortScan = 0
+				e.createdTmpDiskTables = 0
 				e.questions = 0
 			}
 		}
