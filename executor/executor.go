@@ -438,9 +438,6 @@ type Executor struct {
 	sortScan  int64 // sort operations using full table scan
 	// questions counts the number of client statements received, reset on FLUSH STATUS.
 	questions int64
-	// createdTmpDiskTables counts temp tables written to disk (e.g. when big_tables=ON).
-	// Reset on FLUSH STATUS.
-	createdTmpDiskTables int64
 	// resourceGroups stores resource group names (lowercase-normalized for case+accent-insensitive comparison).
 	// Shared across all connections. Maps normalized name → original name.
 	resourceGroups map[string]string
@@ -1688,7 +1685,6 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			e.sortRange = 0
 			e.sortScan = 0
 			e.questions = 0
-			e.createdTmpDiskTables = 0
 			return &Result{}, nil
 		}
 		// HANDLER ... OPEN/READ/CLOSE: return error for performance_schema tables
@@ -1903,19 +1899,6 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 	if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
 		if lockErr := e.checkTableLockRestrictions(stmt); lockErr != nil {
 			return nil, lockErr
-		}
-	}
-
-	// ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG (1422): DDL and LOCK/UNLOCK TABLES cause an
-	// implicit commit and are therefore forbidden inside stored functions and triggers.
-	if e.routineDepth > 0 {
-		switch stmt.(type) {
-		case *sqlparser.CreateTable, *sqlparser.DropTable, *sqlparser.AlterTable,
-			*sqlparser.CreateDatabase, *sqlparser.DropDatabase,
-			*sqlparser.CreateView, *sqlparser.DropView, *sqlparser.AlterView,
-			*sqlparser.TruncateTable, *sqlparser.RenameTable,
-			*sqlparser.LockTables, *sqlparser.UnlockTables:
-			return nil, mysqlError(1422, "HY000", "Explicit or implicit commit is not allowed in stored function or trigger.")
 		}
 	}
 
