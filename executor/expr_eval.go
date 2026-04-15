@@ -6868,18 +6868,26 @@ func compareByCollation(a, b interface{}, collation string) int {
 	return compareNumeric(a, b)
 }
 
+// isSafeForVitessCollation returns true if the given collation name belongs to a
+// charset family where Vitess weight strings produce correct MySQL-compatible sort
+// order. Only charsets that have been verified are included. Asian multi-byte
+// charsets (sjis/ujis/cp932/eucjpms/euckr/gb2312/gbk/gb18030/big5) are excluded
+// because Vitess does not support them and would produce incorrect results.
+func isSafeForVitessCollation(collationName string) bool {
+	lower := strings.ToLower(collationName)
+	// Only apply Vitess weight strings for charsets where it's proven correct
+	for _, prefix := range []string{"latin1_", "latin2_", "cp1251_", "utf8mb4_", "utf8mb3_", "utf8_", "binary"} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func normalizeCollationKey(s string, collation string) string {
 	coll := strings.ToLower(collation)
 
-	// Use Vitess for UCA 0900 collations which need accurate weight tables
-	if strings.Contains(coll, "_0900_") || strings.HasSuffix(coll, "_0900_bin") {
-		if vc := lookupVitessCollation(collation); vc != nil {
-			ws := vitessWeightString(s, vc)
-			return string(ws)
-		}
-	}
-
-	// Collation-specific key normalization
+	// Collation-specific key normalization (checked first to override generic Vitess path)
 	switch coll {
 	case "utf8_general_ci", "utf8mb3_general_ci":
 		return normalizeUTF8GeneralCIKey(s)
@@ -6894,6 +6902,16 @@ func normalizeCollationKey(s string, collation string) string {
 		// In contrast, ToLower would map letters to 0x61-0x7A which is ABOVE 0x5B-0x60,
 		// causing [, \, etc. to incorrectly appear before letters in the sort output.
 		return strings.ToUpper(s)
+	}
+
+	// Use Vitess for UCA 0900 collations which need accurate weight tables, and for other
+	// safe charsets (latin1, latin2, cp1251, utf8mb4, utf8mb3/utf8, binary) where Vitess
+	// produces correct MySQL-compatible weight strings.
+	if strings.Contains(coll, "_0900_") || strings.HasSuffix(coll, "_0900_bin") || isSafeForVitessCollation(coll) {
+		if vc := lookupVitessCollation(collation); vc != nil {
+			ws := vitessWeightString(s, vc)
+			return string(ws)
+		}
 	}
 	if strings.HasSuffix(coll, "_ci") {
 		// Use ToUpper for case-insensitive collations. MySQL's weight tables for _ci collations
