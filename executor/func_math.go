@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"math/big"
 	"math/rand"
 	"strconv"
 	"strings"
@@ -91,13 +92,9 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 			}
 			decimals = toInt64(dv)
 		}
-		// Clamp decimals to a safe range to avoid overflow in formatting.
-		// MySQL returns 0 for very large negative decimals, and caps precision at 30 for positive.
+		// Clamp very large negative decimals: MySQL returns 0 for very large negative values.
 		if decimals < -30 {
 			return int64(0), true, nil
-		}
-		if decimals > 30 {
-			decimals = 30
 		}
 		// Determine whether the second argument is a literal integer constant.
 		// When it is a literal, MySQL uses exactly `decimals` decimal places in the result.
@@ -125,16 +122,38 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 				return tv, true, nil
 			}
 		}
-		// For decimal strings (from DECIMAL columns), use exact decimal rounding to avoid float64 precision loss.
-		if s, ok := val.(string); ok {
-			if out, ok2 := roundDecimalStringHalfUp(s, int(decimals)); ok2 {
+		// Convert non-string numeric types to string so the exact decimal path can handle them.
+		// This avoids float64 overflow when `decimals` is large (e.g. 40 or 100).
+		var valStr string
+		switch tv := val.(type) {
+		case string:
+			valStr = tv
+		case int64:
+			valStr = strconv.FormatInt(tv, 10)
+		case uint64:
+			valStr = strconv.FormatUint(tv, 10)
+		case float64:
+			valStr = strconv.FormatFloat(tv, 'f', -1, 64)
+		case ScaledValue:
+			valStr = strconv.FormatFloat(tv.Value, 'f', -1, 64)
+		default:
+			valStr = ""
+		}
+		// For decimal strings (including those converted above), use exact decimal rounding.
+		if valStr != "" {
+			// Cap displayScale at MySQL's DECIMAL max precision (30) to avoid unreasonably long output.
+			displayDecimals := decimals
+			if displayDecimals > 30 {
+				displayDecimals = 30
+			}
+			if out, ok2 := roundDecimalStringHalfUp(valStr, int(displayDecimals)); ok2 {
 				// Determine the display scale:
 				// - literal N arg: show exactly N decimal places
 				// - column/expression arg: preserve the source column's scale (max of decimals and origScale)
-				displayScale := int(decimals)
+				displayScale := int(displayDecimals)
 				if !decimalsIsLiteral {
-					if dotIdx := strings.IndexByte(s, '.'); dotIdx >= 0 {
-						origScale := len(s) - dotIdx - 1
+					if dotIdx := strings.IndexByte(valStr, '.'); dotIdx >= 0 {
+						origScale := len(valStr) - dotIdx - 1
 						if origScale > displayScale {
 							displayScale = origScale
 						}
@@ -153,6 +172,11 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 				}
 				return out, true, nil
 			}
+		}
+		// Float fallback — only used when string conversion was not possible.
+		// Clamp decimals to a safe range to avoid int64 overflow in factor multiplication.
+		if decimals > 30 {
+			decimals = 30
 		}
 		f := toFloat(val)
 		if decimals == 0 {
@@ -177,17 +201,6 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if outScale < 0 {
 			outScale = 0
 		}
-		// For the float fallback path: if decimals is not a literal, preserve source scale
-		if !decimalsIsLiteral {
-			if s, ok := val.(string); ok {
-				if dot := strings.IndexByte(s, '.'); dot >= 0 {
-					inScale := len(s) - dot - 1
-					if inScale > outScale {
-						outScale = inScale
-					}
-				}
-			}
-		}
 		return fmt.Sprintf("%.*f", outScale, rounded), true, nil
 	case "truncate":
 		if len(v.Exprs) < 2 {
@@ -204,28 +217,64 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if err != nil {
 			return nil, true, err
 		}
-		f := toFloat(val)
 		decimals := toInt64(dv)
 		if decimals == 0 {
+			f := toFloat(val)
 			if f >= 0 {
 				return int64(f), true, nil
 			}
 			return -int64(-f), true, nil
 		}
 		if decimals > 0 {
+			// Convert value to string for exact decimal truncation, avoiding float64
+			// overflow when decimals is large (e.g. 40 or 100).
+			var valStr string
+			switch tv := val.(type) {
+			case string:
+				valStr = tv
+			case int64:
+				valStr = strconv.FormatInt(tv, 10)
+			case uint64:
+				valStr = strconv.FormatUint(tv, 10)
+			case float64:
+				valStr = strconv.FormatFloat(tv, 'f', -1, 64)
+			case ScaledValue:
+				valStr = strconv.FormatFloat(tv.Value, 'f', -1, 64)
+			}
+			if valStr != "" {
+				// Cap display scale at MySQL's practical maximum of 30.
+				dispDecimals := decimals
+				if dispDecimals > 30 {
+					dispDecimals = 30
+				}
+				// Truncate: keep only dispDecimals decimal places (no rounding).
+				if out, ok2 := truncateDecimalString(valStr, int(dispDecimals)); ok2 {
+					outScale := int(dispDecimals)
+					// Pad with trailing zeros if needed.
+					if outScale > 0 {
+						outDotIdx := strings.IndexByte(out, '.')
+						if outDotIdx < 0 {
+							out += "." + strings.Repeat("0", outScale)
+						} else {
+							curScale := len(out) - outDotIdx - 1
+							if curScale < outScale {
+								out += strings.Repeat("0", outScale-curScale)
+							}
+						}
+					}
+					return out, true, nil
+				}
+			}
+			// Float fallback for small decimals.
+			if decimals > 30 {
+				decimals = 30
+			}
 			factor := 1.0
 			for j := int64(0); j < decimals; j++ {
 				factor *= 10
 			}
+			f := toFloat(val)
 			outScale := int(decimals)
-			if s, ok := val.(string); ok {
-				if dot := strings.IndexByte(s, '.'); dot >= 0 {
-					inScale := len(s) - dot - 1
-					if inScale > outScale {
-						outScale = inScale
-					}
-				}
-			}
 			if f >= 0 {
 				trunc := float64(int64(f*factor)) / factor
 				return fmt.Sprintf("%.*f", outScale, trunc), true, nil
@@ -238,6 +287,7 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		for j := int64(0); j < -decimals; j++ {
 			factor *= 10
 		}
+		f := toFloat(val)
 		return int64(f/factor) * int64(factor), true, nil
 	case "mod":
 		v0, v1, hasNull, err := e.evalArgs2(v.Exprs, "MOD", row)
@@ -247,11 +297,57 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if hasNull {
 			return nil, true, nil
 		}
-		d := toInt64(v1)
-		if d == 0 {
+		// Use big.Rat for high-precision decimal modulo when either argument is a decimal string.
+		// This avoids float64 precision loss for values like MOD(1, 0.123456789123456789...).
+		s0, s0IsStr := v0.(string)
+		s1, s1IsStr := v1.(string)
+		if s0IsStr || s1IsStr {
+			var r0Str, r1Str string
+			if s0IsStr {
+				r0Str = s0
+			} else {
+				r0Str = fmt.Sprintf("%v", v0)
+			}
+			if s1IsStr {
+				r1Str = s1
+			} else {
+				r1Str = fmt.Sprintf("%v", v1)
+			}
+			rat0, ok0 := parseDecimalStringToRat(r0Str)
+			rat1, ok1 := parseDecimalStringToRat(r1Str)
+			if ok0 && ok1 {
+				if rat1.Sign() == 0 {
+					return nil, true, nil
+				}
+				// MOD(a, b) = a - TRUNCATE(a/b, 0) * b  (using big.Rat)
+				quot := new(big.Rat).Quo(rat0, rat1)
+				// Truncate towards zero: take the integer part of the quotient.
+				quotFloat, _ := quot.Float64()
+				truncInt := int64(quotFloat)
+				truncRat := new(big.Rat).SetInt64(truncInt)
+				remainder := new(big.Rat).Sub(rat0, new(big.Rat).Mul(truncRat, rat1))
+				// Determine output scale from the input strings.
+				scale0 := valueScale(r0Str)
+				scale1 := valueScale(r1Str)
+				outScale := scale0
+				if scale1 > outScale {
+					outScale = scale1
+				}
+				result := formatRatFixed(remainder, outScale)
+				return result, true, nil
+			}
+		}
+		// For integer or float operands, use float64 modulo.
+		rf0 := toFloat(v0)
+		rf1 := toFloat(v1)
+		if rf1 == 0 {
 			return nil, true, nil
 		}
-		return toInt64(v0) % d, true, nil
+		mod := math.Mod(rf0, rf1)
+		if mod == float64(int64(mod)) {
+			return int64(mod), true, nil
+		}
+		return mod, true, nil
 	case "sqrt":
 		sqrtVal, isNull, err := e.evalArg1(v.Exprs, "SQRT", row)
 		if err != nil {

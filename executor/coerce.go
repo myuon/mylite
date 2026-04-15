@@ -2475,6 +2475,67 @@ func roundDecimalStringHalfUp(s string, scale int) (string, bool) {
 	return out, true
 }
 
+// truncateDecimalString truncates (not rounds) a decimal string to `scale` decimal places.
+// Returns ("", false) if the string is not a valid decimal number.
+func truncateDecimalString(s string, scale int) (string, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	sign := ""
+	if strings.HasPrefix(s, "-") {
+		sign = "-"
+		s = s[1:]
+	} else if strings.HasPrefix(s, "+") {
+		s = s[1:]
+	}
+	if strings.ContainsAny(s, "eE") {
+		return "", false
+	}
+	intPart := s
+	fracPart := ""
+	if dot := strings.IndexByte(s, '.'); dot >= 0 {
+		intPart = s[:dot]
+		fracPart = s[dot+1:]
+	}
+	if intPart == "" {
+		intPart = "0"
+	}
+	for _, ch := range intPart {
+		if ch < '0' || ch > '9' {
+			return "", false
+		}
+	}
+	for _, ch := range fracPart {
+		if ch < '0' || ch > '9' {
+			return "", false
+		}
+	}
+	if scale < 0 {
+		scale = 0
+	}
+	// Truncate fracPart to `scale` digits (no rounding).
+	keep := fracPart
+	if len(keep) > scale {
+		keep = keep[:scale]
+	}
+	if scale == 0 {
+		if sign == "-" && intPart != "0" {
+			return "-" + intPart, true
+		}
+		return intPart, true
+	}
+	// Pad fracPart to exactly `scale` digits if shorter.
+	if len(keep) < scale {
+		keep += strings.Repeat("0", scale-len(keep))
+	}
+	out := intPart + "." + keep
+	if sign == "-" && out != "0."+strings.Repeat("0", scale) {
+		out = "-" + out
+	}
+	return out, true
+}
+
 func roundNumericStringHalfUp(s string, scale int) (string, bool) {
 	if out, ok := roundDecimalStringHalfUp(s, scale); ok {
 		return out, true

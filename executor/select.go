@@ -2151,6 +2151,18 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 
 	resultRows := make([][]interface{}, 0, len(allRows))
 	for _, row := range allRows {
+		// Apply HAVING filter in non-aggregate path (no GROUP BY, no aggregates).
+		// HAVING without GROUP BY is applied per-row against the source row data.
+		// This handles cases like: SELECT ... FROM t HAVING constant_subquery_expr
+		if stmt.Having != nil {
+			match, err := e.evalHaving(stmt.Having.Expr, row, nil)
+			if err != nil {
+				return nil, err
+			}
+			if !match {
+				continue
+			}
+		}
 		resultRow := make([]interface{}, len(colExprs))
 		for i, expr := range colExprs {
 			val, err := e.evalRowExpr(expr, row)

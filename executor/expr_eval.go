@@ -4084,6 +4084,45 @@ func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator, di
 		}
 		return int64(lf / rf), nil
 	case sqlparser.ModOp:
+		// Use big.Rat for high-precision decimal modulo when either operand is a decimal string.
+		// This preserves full DECIMAL precision for expressions like 1 % 0.123456789123456789...
+		ls, lIsStr := left.(string)
+		rs, rIsStr := right.(string)
+		if lIsStr || rIsStr {
+			var lRatStr, rRatStr string
+			if lIsStr {
+				lRatStr = ls
+			} else {
+				lRatStr = fmt.Sprintf("%v", left)
+			}
+			if rIsStr {
+				rRatStr = rs
+			} else {
+				rRatStr = fmt.Sprintf("%v", right)
+			}
+			rat0, ok0 := parseDecimalStringToRat(lRatStr)
+			rat1, ok1 := parseDecimalStringToRat(rRatStr)
+			if ok0 && ok1 {
+				if rat1.Sign() == 0 {
+					return nil, nil
+				}
+				// MOD(a, b) = a - TRUNCATE(a/b, 0) * b
+				quot := new(big.Rat).Quo(rat0, rat1)
+				quotFloat, _ := quot.Float64()
+				truncInt := int64(quotFloat)
+				truncRat := new(big.Rat).SetInt64(truncInt)
+				remainder := new(big.Rat).Sub(rat0, new(big.Rat).Mul(truncRat, rat1))
+				// Determine output scale from operands.
+				// Use decimalStringScale which handles strings like ".12345" (leading dot).
+				scale0 := decimalStringScale(lRatStr)
+				scale1 := decimalStringScale(rRatStr)
+				outScale := scale0
+				if scale1 > outScale {
+					outScale = scale1
+				}
+				return formatRatFixed(remainder, outScale), nil
+			}
+		}
 		if rf == 0 {
 			return nil, nil
 		}
