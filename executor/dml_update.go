@@ -263,32 +263,6 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 			}
 			return false
 		})
-	} else if stmt.Limit != nil && len(tbl.Def.PrimaryKey) > 0 {
-		// When LIMIT is present without ORDER BY, InnoDB scans in PRIMARY KEY order.
-		// Sort matching indices by PK so that LIMIT trims consistently with MySQL.
-		pkCols := tbl.Def.PrimaryKey
-		sort.SliceStable(matchingIndices, func(a, b int) bool {
-			ra := tbl.Rows[matchingIndices[a]]
-			rb := tbl.Rows[matchingIndices[b]]
-			for _, pk := range pkCols {
-				pkCol := stripPrefixLengthFromCol(pk)
-				va := ra[pkCol]
-				vb := rb[pkCol]
-				var cmp int
-				if colType, ok := colTypeByName[strings.ToLower(pkCol)]; ok && isNumericOrderColumnType(colType) {
-					cmp = compareNumeric(va, vb)
-				} else {
-					cmp = compareByCollation(va, vb, orderCollation)
-				}
-				if cmp < 0 {
-					return true
-				}
-				if cmp > 0 {
-					return false
-				}
-			}
-			return false
-		})
 	}
 
 	// Apply LIMIT
