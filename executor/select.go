@@ -2225,11 +2225,17 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// Track row count before LIMIT for FOUND_ROWS()
 	e.lastFoundRows = int64(len(resultRows))
 
-	// Track sort statistics BEFORE LIMIT (Sort_rows counts all rows actually sorted)
+	// Apply LIMIT
+	if stmt.Limit != nil {
+		resultRows, err = applyLimit(stmt.Limit, resultRows)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Track sort statistics AFTER LIMIT (Sort_rows counts rows actually sorted/returned)
 	if needsSortStats || preSortedOrderBy {
-		rowCount := int64(len(resultRows))
-		e.sortRows += rowCount
-		e.sortMergePasses += computeSortMergePasses(e, rowCount)
+		e.sortRows += int64(len(resultRows))
 		// Sort_range: sort done on a range scan (WHERE with index range condition).
 		// Sort_scan: sort done on a full table scan.
 		// Heuristic: if the WHERE clause specifically uses a BETWEEN condition, classify as range.
@@ -2238,14 +2244,6 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 			e.sortRange++
 		} else {
 			e.sortScan++
-		}
-	}
-
-	// Apply LIMIT
-	if stmt.Limit != nil {
-		resultRows, err = applyLimit(stmt.Limit, resultRows)
-		if err != nil {
-			return nil, err
 		}
 	}
 
@@ -3784,23 +3782,21 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 	// Track row count before LIMIT for FOUND_ROWS()
 	e.lastFoundRows = int64(len(resultRows))
 
-	// Track sort statistics BEFORE LIMIT (Sort_rows counts all rows actually sorted)
-	if needsSortStats2 {
-		rowCount2 := int64(len(resultRows))
-		e.sortRows += rowCount2
-		e.sortMergePasses += computeSortMergePasses(e, rowCount2)
-		if stmt.Where != nil && containsBetweenExpr(stmt.Where.Expr) {
-			e.sortRange++
-		} else {
-			e.sortScan++
-		}
-	}
-
 	// Apply LIMIT
 	if stmt.Limit != nil {
 		resultRows, err = applyLimit(stmt.Limit, resultRows)
 		if err != nil {
 			return nil, err
+		}
+	}
+
+	// Track sort statistics AFTER LIMIT
+	if needsSortStats2 {
+		e.sortRows += int64(len(resultRows))
+		if stmt.Where != nil && containsBetweenExpr(stmt.Where.Expr) {
+			e.sortRange++
+		} else {
+			e.sortScan++
 		}
 	}
 
@@ -6056,43 +6052,6 @@ func (e *Executor) resolveSelectColumns(exprs []sqlparser.SelectExpr, def *catal
 		}
 	}
 	return cols, nil
-}
-
-// computeSortMergePasses estimates the number of sort merge passes MySQL would perform
-// for an external sort with the given row count and sort_buffer_size.
-// MySQL's filesort creates initial sort runs when data exceeds the sort buffer,
-// then merges them. Each run holds approximately (sort_buffer_size / sortKeyBytes) rows.
-// The sort key size constant (6 bytes) approximates MySQL's internal sort record overhead
-// for short fixed-length keys (e.g., short TEXT or VARCHAR columns).
-// Returns 0 if all data fits in the sort buffer (no merge passes needed).
-func computeSortMergePasses(e *Executor, rowCount int64) int64 {
-	if rowCount <= 0 {
-		return 0
-	}
-	sortBufStr, ok := e.getSysVar("sort_buffer_size")
-	if !ok || sortBufStr == "" {
-		return 0
-	}
-	sortBufSize, err := strconv.ParseInt(sortBufStr, 10, 64)
-	if err != nil || sortBufSize <= 0 {
-		return 0
-	}
-	// Each sort key in MySQL's internal format takes approximately sortKeyBytes bytes.
-	// This constant is calibrated to match MySQL's Sort_merge_passes for typical workloads.
-	const sortKeyBytes = int64(6)
-	// If all rows fit in the sort buffer, no merge passes needed.
-	if rowCount*sortKeyBytes <= sortBufSize {
-		return 0
-	}
-	// Number of rows per sort run (initial sort buffer capacity).
-	rowsPerRun := sortBufSize / sortKeyBytes
-	if rowsPerRun <= 0 {
-		return 0
-	}
-	// Number of initial runs = ceil(rowCount / rowsPerRun).
-	// Each run beyond the first requires one merge pass.
-	initialRuns := (rowCount + rowsPerRun - 1) / rowsPerRun
-	return initialRuns
 }
 
 func applyOrderBy(orderBy sqlparser.OrderBy, colNames []string, rows [][]interface{}, collation string) ([][]interface{}, error) {
