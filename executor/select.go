@@ -1302,6 +1302,29 @@ func validateRowTupleStructure(left, right sqlparser.ValTuple) error {
 }
 
 func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
+	// At the outermost SELECT level, take a snapshot of the current session
+	// variables.  This snapshot is used by getSysVarSession (when routineDepth==0)
+	// so that user-defined function side-effects on system variables (e.g.
+	// SET @@sort_buffer_size inside a function body) do not change the apparent
+	// value of those variables when evaluating subsequent rows in the same WHERE
+	// clause – matching MySQL's behaviour of treating system variables as
+	// query-time constants.  We only snapshot when no outer snapshot is already
+	// active (avoids overwriting the snapshot in recursive/subquery calls) and
+	// only at the top-level query (routineDepth==0, i.e. not inside a stored
+	// routine).
+	snapshotSetHere := false
+	if e.routineDepth == 0 && e.sysVarSnapshot == nil && len(e.sessionScopeVars) > 0 {
+		snap := make(map[string]string, len(e.sessionScopeVars))
+		for k, v := range e.sessionScopeVars {
+			snap[k] = v
+		}
+		e.sysVarSnapshot = snap
+		snapshotSetHere = true
+	}
+	if snapshotSetHere {
+		defer func() { e.sysVarSnapshot = nil }()
+	}
+
 	// Validate index hints (USE KEY / IGNORE KEY / FORCE KEY) on FROM tables.
 	if err := e.validateIndexHints(stmt.From); err != nil {
 		return nil, err

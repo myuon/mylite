@@ -4632,6 +4632,49 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 				}
 			}
 			return "binary(0)"
+		case "makedate":
+			// MAKEDATE(year, dayofyear) returns a date value
+			return "date"
+		case "maketime":
+			// MAKETIME(hour, minute, second) returns a time value (no microseconds for integer args)
+			return "time"
+		case "timediff":
+			// TIMEDIFF(expr1, expr2) returns time(6)
+			return "time(6)"
+		case "addtime", "subtime":
+			// ADDTIME(expr, expr) / SUBTIME(expr, expr)
+			// If first arg is datetime/timestamp => datetime(6), if time => time(6)
+			if len(v.Exprs) >= 1 {
+				firstType := e.inferExprType(v.Exprs[0])
+				if strings.HasPrefix(firstType, "datetime") || strings.HasPrefix(firstType, "timestamp") {
+					return "datetime(6)"
+				}
+				if strings.HasPrefix(firstType, "time") {
+					return "time(6)"
+				}
+			}
+			return "time(6)"
+		case "timestamp":
+			// TIMESTAMP(expr) or TIMESTAMP(date, time) returns datetime
+			return "datetime"
+		case "date":
+			// DATE(expr) extracts the date part and returns date
+			return "date"
+		case "time":
+			// TIME(expr) extracts the time part and returns time(6)
+			return "time(6)"
+		case "sec_to_time":
+			// SEC_TO_TIME(seconds) returns time(6)
+			return "time(6)"
+		case "date_format":
+			// DATE_FORMAT(date, format) returns varchar(N); use a fixed width matching MySQL default
+			return "varchar(10)"
+		case "period_add":
+			// PERIOD_ADD(period, months) returns int
+			return "int"
+		case "period_diff":
+			// PERIOD_DIFF(period1, period2) returns int
+			return "int"
 		case "if", "ifnull", "coalesce", "greatest", "least":
 			// For functions where all arguments resolve to NULL, MySQL returns binary(0).
 			// For IF(cond, then, else), check the then/else args (indices 1 and 2).

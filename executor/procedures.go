@@ -1480,17 +1480,6 @@ type cursorState struct {
 // callUserDefinedFunction looks up a user-defined function in the catalog and executes it.
 // qualifier is the optional schema qualifier (e.g. "test" in "test.f()").
 func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Expr, row *storage.Row, qualifier ...string) (interface{}, error) {
-	e.routineDepth++
-	// Save and restore currentQuery so that UDF execution doesn't overwrite
-	// the outer query's text (used for column name extraction).
-	savedQuery := e.currentQuery
-	defer func() {
-		e.routineDepth--
-		e.currentQuery = savedQuery
-	}()
-	if e.routineDepth > 256 {
-		return nil, fmt.Errorf("Error 1456 (HY000): Recursive stored functions and triggers are not allowed")
-	}
 	if e.Catalog == nil {
 		return nil, fmt.Errorf("function not found: %s", name)
 	}
@@ -1511,7 +1500,11 @@ func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Exp
 		return nil, fmt.Errorf("function not found: %s", name)
 	}
 
-	// Evaluate arguments
+	// Evaluate arguments BEFORE incrementing routineDepth so that argument
+	// expressions are evaluated in the caller's context (e.g. using the
+	// sysVarSnapshot when the outer query has one active).  This matches
+	// MySQL's behaviour where function arguments are evaluated at call-site,
+	// not inside the function body.
 	paramVars := make(map[string]interface{})
 	for i, param := range fn.Params {
 		if i < len(argExprs) {
@@ -1527,6 +1520,18 @@ func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Exp
 			}
 			paramVars[param.Name] = val
 		}
+	}
+
+	e.routineDepth++
+	// Save and restore currentQuery so that UDF execution doesn't overwrite
+	// the outer query's text (used for column name extraction).
+	savedQuery := e.currentQuery
+	defer func() {
+		e.routineDepth--
+		e.currentQuery = savedQuery
+	}()
+	if e.routineDepth > 256 {
+		return nil, fmt.Errorf("Error 1456 (HY000): Recursive stored functions and triggers are not allowed")
 	}
 
 	// Execute function body with local variables, cursors, and handlers

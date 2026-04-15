@@ -347,6 +347,14 @@ type Executor struct {
 	// routineDepth tracks the current stored routine call depth to prevent infinite recursion
 	// and to avoid counting internal routine Execute calls in the Questions status counter.
 	routineDepth int
+	// sysVarSnapshot holds a frozen copy of sessionScopeVars taken at the start of a
+	// top-level SELECT execution.  When non-nil and routineDepth==0, system-variable reads
+	// in the outer WHERE/SELECT-list evaluation use this snapshot so that side-effects
+	// from user-defined functions (e.g. SET @@sort_buffer_size inside a function body)
+	// do not affect the predicate evaluation of subsequent rows (matching MySQL behaviour
+	// where system variables act as query-time constants).  The snapshot is set in
+	// execSelect and cleared when that call returns.
+	sysVarSnapshot map[string]string
 	// exprDepth tracks the current expression evaluation depth to prevent Go stack overflow
 	// on deeply nested expressions. MySQL returns ER_STACK_OVERRUN_NEED_MORE (1436) when
 	// the expression stack exceeds its limit.
@@ -580,6 +588,18 @@ func (e *Executor) getSysVarSession(name string) (string, bool) {
 	if strings.HasPrefix(name, "performance_schema_consumer_") ||
 		name == "performance_schema_instrument" {
 		return "", false
+	}
+	// When a query-time snapshot is active (set by execSelect at the top level)
+	// and we are NOT inside a stored routine/UDF (routineDepth==0), use the
+	// frozen snapshot so that UDF side-effects on system variables do not bleed
+	// into the predicate evaluation of subsequent rows.  This mirrors MySQL's
+	// treatment of system variables as query-time constants.
+	if e.sysVarSnapshot != nil && e.routineDepth == 0 {
+		if v, ok := e.sysVarSnapshot[name]; ok {
+			return v, true
+		}
+		// Variable not in snapshot (e.g. never explicitly SET) – fall through
+		// to the normal path so that compiled defaults are still visible.
 	}
 	if v, ok := e.sessionScopeVars[name]; ok {
 		return v, true
