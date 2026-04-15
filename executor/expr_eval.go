@@ -1921,7 +1921,15 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 			if len(s) > 11 && s[10] == ' ' {
 				s = s[11:]
 			}
-			// Preserve microseconds in CAST AS TIME (MySQL keeps them)
+			// Apply TIME precision: bare CAST AS TIME uses fsp=0 (rounds fractional seconds).
+			// CAST AS TIME(N) uses the specified precision N.
+			fsp := 0
+			if v.Type != nil && v.Type.Length != nil {
+				fsp = *v.Type.Length
+			}
+			if strings.Contains(s, ".") {
+				s = applyTimePrecision(s, fsp)
+			}
 			return s, nil
 		case "JSON":
 			// Preserve boolean type for CAST(TRUE/FALSE AS JSON)

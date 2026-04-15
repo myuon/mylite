@@ -128,6 +128,10 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 			if timePart != "" {
 				// Normalize time separator chars to ':'
 				timePart = normalizeDateTimeSeparators(timePart)
+				// DATETIME (no precision) stores at second precision: strip fractional seconds.
+				if dotIdx := strings.Index(timePart, "."); dotIdx >= 0 {
+					timePart = timePart[:dotIdx]
+				}
 				return parsed + " " + timePart
 			}
 			return parsed + " 00:00:00"
