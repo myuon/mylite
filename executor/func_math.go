@@ -99,6 +99,23 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if decimals > 30 {
 			decimals = 30
 		}
+		// Determine whether the second argument is a literal integer constant.
+		// When it is a literal, MySQL uses exactly `decimals` decimal places in the result.
+		// When it is a column/expression reference, MySQL preserves the source DECIMAL column's scale
+		// (result scale = max(decimals, origScale)).
+		decimalsIsLiteral := false
+		if len(v.Exprs) >= 2 {
+			switch arg2 := v.Exprs[1].(type) {
+			case *sqlparser.Literal:
+				if arg2.Type == sqlparser.IntVal {
+					decimalsIsLiteral = true
+				}
+			case *sqlparser.UnaryExpr:
+				if lit, ok2 := arg2.Expr.(*sqlparser.Literal); ok2 && lit.Type == sqlparser.IntVal {
+					decimalsIsLiteral = true
+				}
+			}
+		}
 		// For exact integer types (int64, uint64) with 0 decimals, return as-is to avoid precision loss
 		if decimals == 0 {
 			switch tv := val.(type) {
@@ -109,23 +126,28 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 			}
 		}
 		// For decimal strings (from DECIMAL columns), use exact decimal rounding to avoid float64 precision loss.
-		// Preserve the original scale (trailing zeros) to match MySQL's DECIMAL output format.
 		if s, ok := val.(string); ok {
 			if out, ok2 := roundDecimalStringHalfUp(s, int(decimals)); ok2 {
-				// Preserve original scale: if input had more decimal places, pad with zeros
-				origScale := 0
-				if dotIdx := strings.IndexByte(s, '.'); dotIdx >= 0 {
-					origScale = len(s) - dotIdx - 1
+				// Determine the display scale:
+				// - literal N arg: show exactly N decimal places
+				// - column/expression arg: preserve the source column's scale (max of decimals and origScale)
+				displayScale := int(decimals)
+				if !decimalsIsLiteral {
+					if dotIdx := strings.IndexByte(s, '.'); dotIdx >= 0 {
+						origScale := len(s) - dotIdx - 1
+						if origScale > displayScale {
+							displayScale = origScale
+						}
+					}
 				}
-				if int(decimals) < origScale {
-					// Pad result to original scale
+				if displayScale > 0 {
 					outDotIdx := strings.IndexByte(out, '.')
 					if outDotIdx < 0 {
-						out += "." + strings.Repeat("0", origScale)
+						out += "." + strings.Repeat("0", displayScale)
 					} else {
 						curScale := len(out) - outDotIdx - 1
-						if curScale < origScale {
-							out += strings.Repeat("0", origScale-curScale)
+						if curScale < displayScale {
+							out += strings.Repeat("0", displayScale-curScale)
 						}
 					}
 				}
@@ -155,11 +177,14 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if outScale < 0 {
 			outScale = 0
 		}
-		if s, ok := val.(string); ok {
-			if dot := strings.IndexByte(s, '.'); dot >= 0 {
-				inScale := len(s) - dot - 1
-				if inScale > outScale {
-					outScale = inScale
+		// For the float fallback path: if decimals is not a literal, preserve source scale
+		if !decimalsIsLiteral {
+			if s, ok := val.(string); ok {
+				if dot := strings.IndexByte(s, '.'); dot >= 0 {
+					inScale := len(s) - dot - 1
+					if inScale > outScale {
+						outScale = inScale
+					}
 				}
 			}
 		}

@@ -4071,14 +4071,12 @@ func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator, di
 		if len(divPrecision) > 0 {
 			divIncr = divPrecision[0]
 		}
-		// MySQL computes result scale = max(left_scale, right_scale) + div_precision_increment
+		// MySQL computes result scale = left_scale + div_precision_increment.
+		// The right operand's scale does not affect the output precision.
+		// e.g. 15/(5/3): inner 5/3 has scale=4, but outer 15/... uses leftScale=0+4=4
+		//      vs 15/5/3: left=DivisionResult(scale=4), so 4+4=8
 		leftScale := valueScale(left)
-		rightScale := valueScale(right)
-		maxScale := leftScale
-		if rightScale > maxScale {
-			maxScale = rightScale
-		}
-		prec := maxScale + divIncr
+		prec := leftScale + divIncr
 		return DivisionResult{Value: lf / rf, Precision: prec}, nil
 	case sqlparser.IntDivOp:
 		if rf == 0 {
