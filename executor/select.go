@@ -2882,6 +2882,7 @@ func collectColumnEqualities(expr sqlparser.Expr, pairs *[][2]string) {
 // execSelectGroupBy handles SELECT with GROUP BY or aggregate functions.
 func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.Row) (*Result, error) {
 	// When big_tables=ON (or 1), internal temporary tables are written to disk.
+	e.createdTmpTables++
 	if v, ok := e.getSysVar("big_tables"); ok && (strings.EqualFold(v, "on") || v == "1") {
 		e.createdTmpDiskTables++
 	}
