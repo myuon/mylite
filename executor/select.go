@@ -6364,6 +6364,28 @@ func applyOrderByWithTypeHints(orderBy sqlparser.OrderBy, colNames []string, row
 	return rows, nil
 }
 
+// toInt64Limit converts a LIMIT/OFFSET value to int64.
+// uint64 values that exceed math.MaxInt64 are clamped to math.MaxInt64
+// (they effectively mean "no limit" since no result set can be that large).
+// Non-numeric values return -1 (treated as 0 by applyLimit).
+func toInt64Limit(v interface{}) int64 {
+	switch x := v.(type) {
+	case int64:
+		return x
+	case uint64:
+		if x > uint64(math.MaxInt64) {
+			return math.MaxInt64
+		}
+		return int64(x)
+	case float64:
+		if x < 0 {
+			return int64(x)
+		}
+		return int64(x)
+	}
+	return -1
+}
+
 func applyLimit(limit *sqlparser.Limit, rows [][]interface{}) ([][]interface{}, error) {
 	if limit.Rowcount == nil {
 		return rows, nil
@@ -6375,10 +6397,7 @@ func applyLimit(limit *sqlparser.Limit, rows [][]interface{}) ([][]interface{}, 
 	if err != nil {
 		return nil, err
 	}
-	n, ok := lim.(int64)
-	if !ok {
-		return rows, nil
-	}
+	n := toInt64Limit(lim)
 
 	offset := int64(0)
 	if limit.Offset != nil {
@@ -6386,7 +6405,7 @@ func applyLimit(limit *sqlparser.Limit, rows [][]interface{}) ([][]interface{}, 
 		if err != nil {
 			return nil, err
 		}
-		offset, _ = off.(int64)
+		offset = toInt64Limit(off)
 	}
 
 	if n < 0 {

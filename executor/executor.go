@@ -2967,22 +2967,44 @@ func (e *Executor) execExecute(stmt *sqlparser.ExecuteStmt) (*Result, error) {
 				// Validate LIMIT/OFFSET parameters: negative values are not allowed.
 				// String values are converted to their integer representation
 				// (MySQL converts non-numeric strings to 0 for LIMIT).
+				// uint64 and other types are emitted as unquoted integer literals.
 				if limitArgPositions[argIdx] {
 					if n, isNeg := isNegativeNumeric(val); isNeg {
 						_ = n
 						return nil, mysqlError(1210, "HY000", "Incorrect arguments to EXECUTE")
 					}
-					if sv, ok := val.(string); ok {
-						n, parseErr := strconv.ParseInt(strings.TrimSpace(sv), 10, 64)
+					var limitLit string
+					handled := false
+					switch lv := val.(type) {
+					case string:
+						sv := strings.TrimSpace(lv)
+						n, parseErr := strconv.ParseInt(sv, 10, 64)
 						if parseErr != nil {
+							// Check if the string starts with '-' (large negative number
+							// that overflowed int64 representation, e.g. "-14632475938453979136")
+							if strings.HasPrefix(sv, "-") {
+								return nil, mysqlError(1210, "HY000", "Incorrect arguments to EXECUTE")
+							}
 							n = 0
 						}
 						if n < 0 {
 							return nil, mysqlError(1210, "HY000", "Incorrect arguments to EXECUTE")
 						}
-						lit := strconv.FormatInt(n, 10)
-						finalQuery.WriteString(lit)
-						argSQLLiterals = append(argSQLLiterals, lit)
+						limitLit = strconv.FormatInt(n, 10)
+						handled = true
+					case uint64:
+						limitLit = strconv.FormatUint(lv, 10)
+						handled = true
+					case int64:
+						limitLit = strconv.FormatInt(lv, 10)
+						handled = true
+					case float64:
+						limitLit = strconv.FormatInt(int64(lv), 10)
+						handled = true
+					}
+					if handled {
+						finalQuery.WriteString(limitLit)
+						argSQLLiterals = append(argSQLLiterals, limitLit)
 						argIdx++
 						continue
 					}
