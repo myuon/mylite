@@ -3732,6 +3732,58 @@ func (e *Executor) getColumnCharset(colName *sqlparser.ColName) string {
 	return ""
 }
 
+// getColumnEffectiveCharset returns the effective (column-level) charset of a column,
+// checking column-level charset first before falling back to table-level charset.
+// This is used by functions like HEX that need to know the exact column encoding.
+func (e *Executor) getColumnEffectiveCharset(colName *sqlparser.ColName) string {
+	tableName := ""
+	if !colName.Qualifier.Name.IsEmpty() {
+		tableName = colName.Qualifier.Name.String()
+	}
+	if e.CurrentDB == "" {
+		return ""
+	}
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return ""
+	}
+	colStr := colName.Name.String()
+	lookupInTable := func(td *catalog.TableDef) string {
+		for _, col := range td.Columns {
+			if strings.EqualFold(col.Name, colStr) {
+				if col.Charset != "" {
+					return strings.ToLower(col.Charset)
+				}
+				if td.Charset != "" {
+					return strings.ToLower(td.Charset)
+				}
+				return ""
+			}
+		}
+		return ""
+	}
+	if tableName != "" {
+		if td, err := db.GetTable(tableName); err == nil {
+			return lookupInTable(td)
+		}
+	} else {
+		foundCharset := ""
+		for _, td := range db.Tables {
+			cs := lookupInTable(td)
+			if cs == "" {
+				continue
+			}
+			if foundCharset == "" {
+				foundCharset = cs
+			} else if foundCharset != cs {
+				return ""
+			}
+		}
+		return foundCharset
+	}
+	return ""
+}
+
 // mysqlWeekFull calculates MySQL's WEEK(date, mode) for all 8 modes.
 // MySQL WEEK() mode semantics:
 //
@@ -4542,6 +4594,21 @@ func convertThroughCharset(s, charset string) (string, error) {
 				hi := 0xD800 + (r>>10)&0x3FF
 				lo := 0xDC00 + r&0x3FF
 				buf = append(buf, byte(hi>>8), byte(hi), byte(lo>>8), byte(lo))
+			}
+		}
+		return string(buf), nil
+	case "utf16le":
+		// Encode each rune as 2-byte or 4-byte UTF-16 little-endian
+		var buf []byte
+		for _, r := range s {
+			if r <= 0xFFFF {
+				buf = append(buf, byte(r), byte(r>>8))
+			} else {
+				// Surrogate pair
+				r -= 0x10000
+				hi := 0xD800 + (r>>10)&0x3FF
+				lo := 0xDC00 + r&0x3FF
+				buf = append(buf, byte(hi), byte(hi>>8), byte(lo), byte(lo>>8))
 			}
 		}
 		return string(buf), nil

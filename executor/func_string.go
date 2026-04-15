@@ -373,7 +373,9 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 		}
 		// Determine column charset for multi-byte encoding awareness.
 		colCharset := ""
+		var colNameExpr *sqlparser.ColName
 		if colName, ok := v.Exprs[0].(*sqlparser.ColName); ok {
+			colNameExpr = colName
 			colCharset = strings.ToLower(e.getColumnCharset(colName))
 		}
 		// For utf32/utf16/ucs2 columns, integer and hex-byte values represent
@@ -444,10 +446,28 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 			if bs != nil {
 				return strings.ToUpper(hex.EncodeToString(bs)), true, nil
 			}
-			// Fall through for string values in utf32 column (handled below)
+			// Fall through for string values in utf32/utf16/ucs2 column (handled below)
 			s := toString(val)
 			if encoded, err2 := convertThroughCharset(s, colCharset); err2 == nil {
 				return strings.ToUpper(hex.EncodeToString([]byte(encoded))), true, nil
+			}
+		}
+		// For utf16le columns, the stored string bytes are big-endian UCS-2/UTF-16 pairs
+		// (from _ucs2 introducer or similar). We need to swap each 2-byte pair to produce
+		// the correct little-endian output. Use column-level charset detection.
+		if colNameExpr != nil {
+			effectiveCharset := strings.ToLower(e.getColumnEffectiveCharset(colNameExpr))
+			if effectiveCharset == "utf16le" {
+				s := toString(val)
+				sBytes := []byte(s)
+				if len(sBytes)%2 == 0 {
+					out := make([]byte, len(sBytes))
+					copy(out, sBytes)
+					for i := 0; i+1 < len(out); i += 2 {
+						out[i], out[i+1] = out[i+1], out[i]
+					}
+					return strings.ToUpper(hex.EncodeToString(out)), true, nil
+				}
 			}
 		}
 		switch tv := val.(type) {
