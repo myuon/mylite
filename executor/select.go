@@ -4237,6 +4237,10 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			if err != nil {
 				return nil, err
 			}
+			// MySQL error 3158: JSON documents may not contain NULL member names.
+			if keyVal == nil {
+				return nil, mysqlError(3158, "22032", "JSON documents may not contain NULL member names.")
+			}
 			valVal, err := evalRowExpr(e.Value, row)
 			if err != nil {
 				return nil, err

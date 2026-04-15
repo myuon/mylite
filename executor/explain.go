@@ -6751,6 +6751,97 @@ func (e *Executor) explainTreeText(query string) string {
 		return "-> Table scan on " + tbl
 	}
 
+	// Handle multi-table SELECT (FROM t1, t2 ...) with GROUP BY and/or LIMIT/OFFSET
+	if len(sel.From) > 1 {
+		// Extract table display names (use alias when available)
+		var tableDisplayNames []string
+		for _, te := range sel.From {
+			if ate, ok2 := te.(*sqlparser.AliasedTableExpr); ok2 {
+				if !ate.As.IsEmpty() {
+					tableDisplayNames = append(tableDisplayNames, ate.As.String())
+				} else if tn, ok3 := ate.Expr.(sqlparser.TableName); ok3 {
+					tableDisplayNames = append(tableDisplayNames, tn.Name.String())
+				}
+			}
+		}
+		if len(tableDisplayNames) >= 2 {
+			// Build LIMIT/OFFSET prefix
+			var limitOffsetPrefix string
+			var limitOffsetIndent string
+			if sel.Limit != nil {
+				rowCount := int64(0)
+				offset := int64(0)
+				if sel.Limit.Rowcount != nil {
+					if lit, ok2 := sel.Limit.Rowcount.(*sqlparser.Literal); ok2 {
+						rowCount, _ = strconv.ParseInt(lit.Val, 10, 64)
+					}
+				}
+				if sel.Limit.Offset != nil {
+					if lit, ok2 := sel.Limit.Offset.(*sqlparser.Literal); ok2 {
+						offset, _ = strconv.ParseInt(lit.Val, 10, 64)
+					}
+				}
+				if offset > 0 {
+					limitOffsetPrefix = fmt.Sprintf("-> Limit/Offset: %d/%d row(s)", rowCount, offset)
+					limitOffsetIndent = "    "
+				} else if rowCount > 0 {
+					limitOffsetPrefix = fmt.Sprintf("-> Limit: %d row(s)", rowCount)
+					limitOffsetIndent = "    "
+				}
+			}
+
+			// Detect aggregate expression for GROUP BY
+			var groupAggExpr string
+			if sel.GroupBy != nil && len(sel.GroupBy.Exprs) > 0 && len(sel.SelectExprs.Exprs) > 0 {
+				if ae, ok2 := sel.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok2 {
+					raw := sqlparser.String(ae.Expr)
+					// Normalize to match MySQL's EXPLAIN FORMAT=TREE format:
+					// uppercase NULL, no space after comma
+					groupAggExpr = strings.ReplaceAll(raw, "null", "NULL")
+					groupAggExpr = strings.ReplaceAll(groupAggExpr, ", ", ",")
+				}
+			}
+
+			// Build the tree
+			var lines []string
+
+			// Determine inner join and sort structure
+			hasGroupBy := sel.GroupBy != nil && len(sel.GroupBy.Exprs) > 0
+			var innerLines []string
+			if hasGroupBy {
+				// Sort on group-by column + nested loop inner join
+				groupByColStr := sqlparser.String(sel.GroupBy.Exprs[0])
+				sortLine := limitOffsetIndent + "        -> Sort: " + groupByColStr
+				innerLines = append(innerLines, limitOffsetIndent+"        -> Nested loop inner join")
+				innerLines = append(innerLines, sortLine)
+				innerLines = append(innerLines, limitOffsetIndent+"            -> Table scan on "+tableDisplayNames[0])
+				for _, tblName := range tableDisplayNames[1:] {
+					innerLines = append(innerLines, limitOffsetIndent+"        -> Table scan on "+tblName)
+				}
+			} else {
+				// Plain nested loop inner join
+				innerLines = append(innerLines, limitOffsetIndent+"    -> Nested loop inner join")
+				for _, tblName := range tableDisplayNames {
+					innerLines = append(innerLines, limitOffsetIndent+"        -> Table scan on "+tblName)
+				}
+			}
+
+			// Assemble the full tree
+			if limitOffsetPrefix != "" {
+				lines = append(lines, limitOffsetPrefix)
+			}
+			if groupAggExpr != "" {
+				lines = append(lines, limitOffsetIndent+"-> Group aggregate: "+groupAggExpr)
+				lines = append(lines, innerLines...)
+			} else if hasGroupBy {
+				lines = append(lines, innerLines...)
+			} else {
+				lines = append(lines, innerLines...)
+			}
+			return strings.Join(lines, "\n")
+		}
+	}
+
 	// Detect LIMIT/OFFSET
 	var limitOffset string
 	if sel.Limit != nil {
