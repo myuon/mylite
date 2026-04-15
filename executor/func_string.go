@@ -371,6 +371,85 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 		if isNull {
 			return nil, true, nil
 		}
+		// Determine column charset for multi-byte encoding awareness.
+		colCharset := ""
+		if colName, ok := v.Exprs[0].(*sqlparser.ColName); ok {
+			colCharset = strings.ToLower(e.getColumnCharset(colName))
+		}
+		// For utf32/utf16/ucs2 columns, integer and hex-byte values represent
+		// character codepoints stored as charset bytes; zero-pad to the charset
+		// unit size so HEX() returns the full byte representation.
+		if colCharset == "utf32" || colCharset == "utf16" || colCharset == "ucs2" {
+			unitSize := 4 // utf32: 4 bytes per codepoint
+			if colCharset == "utf16" || colCharset == "ucs2" {
+				unitSize = 2
+			}
+			var bs []byte
+			switch tv := val.(type) {
+			case int64:
+				uv := uint64(tv)
+				// Encode as big-endian bytes, strip leading zeros down to unitSize minimum
+				buf := make([]byte, 8)
+				buf[0] = byte(uv >> 56)
+				buf[1] = byte(uv >> 48)
+				buf[2] = byte(uv >> 40)
+				buf[3] = byte(uv >> 32)
+				buf[4] = byte(uv >> 24)
+				buf[5] = byte(uv >> 16)
+				buf[6] = byte(uv >> 8)
+				buf[7] = byte(uv)
+				// Trim leading zero bytes down to the unit size
+				start := 0
+				for start < len(buf)-unitSize && buf[start] == 0 {
+					start++
+				}
+				// Align to unit size
+				bs = buf[start:]
+				for len(bs)%unitSize != 0 {
+					bs = append([]byte{0}, bs...)
+				}
+			case uint64:
+				buf := make([]byte, 8)
+				buf[0] = byte(tv >> 56)
+				buf[1] = byte(tv >> 48)
+				buf[2] = byte(tv >> 40)
+				buf[3] = byte(tv >> 32)
+				buf[4] = byte(tv >> 24)
+				buf[5] = byte(tv >> 16)
+				buf[6] = byte(tv >> 8)
+				buf[7] = byte(tv)
+				start := 0
+				for start < len(buf)-unitSize && buf[start] == 0 {
+					start++
+				}
+				bs = buf[start:]
+				for len(bs)%unitSize != 0 {
+					bs = append([]byte{0}, bs...)
+				}
+			case HexBytes:
+				hexStr := string(tv)
+				if len(hexStr)%2 != 0 {
+					hexStr = "0" + hexStr
+				}
+				var decErr error
+				bs, decErr = hex.DecodeString(hexStr)
+				if decErr != nil {
+					bs = nil
+				} else {
+					for len(bs)%unitSize != 0 {
+						bs = append([]byte{0}, bs...)
+					}
+				}
+			}
+			if bs != nil {
+				return strings.ToUpper(hex.EncodeToString(bs)), true, nil
+			}
+			// Fall through for string values in utf32 column (handled below)
+			s := toString(val)
+			if encoded, err2 := convertThroughCharset(s, colCharset); err2 == nil {
+				return strings.ToUpper(hex.EncodeToString([]byte(encoded))), true, nil
+			}
+		}
 		switch tv := val.(type) {
 		case int64:
 			// Use unsigned format to avoid negative hex output for large values
