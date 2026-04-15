@@ -4149,7 +4149,7 @@ func (e *Executor) showStatus(upper string) (*Result, error) {
 	}{
 		{Name: "Aborted_clients", Value: "0"},
 		{Name: "Aborted_connects", Value: "0"},
-		{Name: "Created_tmp_disk_tables", Value: "0"},
+		{Name: "Created_tmp_disk_tables", Value: fmt.Sprintf("%d", e.createdTmpDiskTables)},
 		{Name: "Created_tmp_files", Value: "0"},
 		{Name: "Created_tmp_tables", Value: "0"},
 		{Name: "Bytes_received", Value: "0"},

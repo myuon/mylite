@@ -2936,6 +2936,10 @@ func (e *Executor) execExecute(stmt *sqlparser.ExecuteStmt) (*Result, error) {
 	if !ok {
 		return nil, mysqlError(1243, "HY000", fmt.Sprintf("Unknown prepared statement handler (%s) given to EXECUTE", name))
 	}
+	// Identify which ? positions (0-indexed) are LIMIT/OFFSET parameters.
+	// MySQL rejects negative values for LIMIT/OFFSET parameters at EXECUTE time.
+	limitArgPositions := findLimitArgPositions(query)
+
 	// Replace ? placeholders with user variable values outside string literals.
 	argIdx := 0
 	argSQLLiterals := make([]string, 0, len(stmt.Arguments))
@@ -2971,6 +2975,13 @@ func (e *Executor) execExecute(stmt *sqlparser.ExecuteStmt) (*Result, error) {
 				finalQuery.WriteString("NULL")
 				argSQLLiterals = append(argSQLLiterals, "NULL")
 			} else {
+				// Validate LIMIT/OFFSET parameters: negative values are not allowed.
+				if limitArgPositions[argIdx] {
+					if n, isNeg := isNegativeNumeric(val); isNeg {
+						_ = n
+						return nil, mysqlError(1210, "HY000", "Incorrect arguments to EXECUTE")
+					}
+				}
 				switch v := val.(type) {
 				case string:
 					escapedV := strings.ReplaceAll(v, "\\", "\\\\")
@@ -3040,6 +3051,100 @@ func (e *Executor) execDeallocate(stmt *sqlparser.DeallocateStmt) (*Result, erro
 	name := strings.ToLower(stmt.Name.String())
 	delete(e.preparedStmts, name)
 	return &Result{}, nil
+}
+
+// findLimitArgPositions returns a set of ? indices (0-based) that appear in
+// LIMIT or OFFSET position in the prepared query.  MySQL rejects negative
+// values for these parameters at EXECUTE time with ER_WRONG_ARGUMENTS.
+func findLimitArgPositions(query string) map[int]bool {
+	result := make(map[int]bool)
+	// Tokenize the query (respecting string literals) and detect ? tokens
+	// that immediately follow LIMIT or a LIMIT comma (offset position).
+	lower := strings.ToLower(query)
+	argIdx := 0
+	inSingle := false
+	escaped := false
+	afterLimit := false  // just saw LIMIT keyword
+	afterComma := false  // just saw comma inside LIMIT clause (offset position)
+	i := 0
+	for i < len(lower) {
+		ch := lower[i]
+		if inSingle {
+			if escaped {
+				escaped = false
+				i++
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				i++
+				continue
+			}
+			if ch == '\'' {
+				inSingle = false
+			}
+			i++
+			continue
+		}
+		if ch == '\'' {
+			inSingle = true
+			afterLimit = false
+			afterComma = false
+			i++
+			continue
+		}
+		if ch == '?' {
+			if afterLimit || afterComma {
+				result[argIdx] = true
+			}
+			argIdx++
+			afterLimit = false
+			afterComma = false
+			i++
+			continue
+		}
+		// Skip whitespace (keep afterLimit/afterComma state)
+		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+			i++
+			continue
+		}
+		if ch == ',' && (afterLimit) {
+			// comma after LIMIT rowcount — now expect offset
+			afterComma = true
+			afterLimit = false
+			i++
+			continue
+		}
+		// Check for LIMIT keyword
+		if strings.HasPrefix(lower[i:], "limit") {
+			// Make sure it's a word boundary
+			end := i + 5
+			if end >= len(lower) || !isAlphaNum(lower[end]) {
+				afterLimit = true
+				afterComma = false
+				i = end
+				continue
+			}
+		}
+		// Any other non-whitespace token resets limit context
+		if ch != ',' {
+			afterLimit = false
+			afterComma = false
+		}
+		i++
+	}
+	return result
+}
+
+// isNegativeNumeric returns true if val is a negative numeric value.
+func isNegativeNumeric(val interface{}) (interface{}, bool) {
+	switch v := val.(type) {
+	case int64:
+		return v, v < 0
+	case float64:
+		return v, v < 0
+	}
+	return val, false
 }
 
 func (e *Executor) execUse(stmt *sqlparser.Use) (*Result, error) {
