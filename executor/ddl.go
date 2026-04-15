@@ -1355,8 +1355,62 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 					colStr := colName + fmt.Sprintf("(%d)", truncatedLen)
 					idxCols[ci] = colStr
 				}
+			} else {
+				// No explicit prefix length: check full column byte width against the max key length.
+				// For VARCHAR/CHAR with multi-byte charsets, the full column can exceed the limit.
+				colNameLower := strings.ToLower(idxCol.Column.String())
+				for _, col := range columns {
+					if strings.ToLower(col.Name) == colNameLower {
+						colTypeUpper := strings.ToUpper(strings.TrimSpace(col.Type))
+						baseType := colTypeUpper
+						if i := strings.IndexByte(baseType, '('); i >= 0 {
+							baseType = strings.TrimSpace(baseType[:i])
+						}
+						isStringType := baseType == "CHAR" || baseType == "VARCHAR" ||
+							baseType == "BINARY" || baseType == "VARBINARY"
+						if !isStringType {
+							break
+						}
+						charLen := extractCharLength(col.Type)
+						if charLen <= 0 {
+							break
+						}
+						cs := strings.ToLower(col.Charset)
+						if cs == "" {
+							cs = strings.ToLower(tableCharset)
+						}
+						bpc := 1
+						switch cs {
+						case "utf8mb4", "":
+							bpc = 4
+						case "utf8", "utf8mb3":
+							bpc = 3
+						case "utf32", "utf16", "utf16le", "ucs2":
+							bpc = 4
+						}
+						fullByteWidth := charLen * bpc
+						var maxKeyLen int
+						if tableEngine == "MYISAM" || tableEngine == "ARCHIVE" || tableEngine == "HEAP" || tableEngine == "MEMORY" {
+							maxKeyLen = 1000
+						} else {
+							maxKeyLen = 3072
+							if tableRowFormat == "COMPACT" || tableRowFormat == "REDUNDANT" {
+								maxKeyLen = 767
+							}
+						}
+						if fullByteWidth > maxKeyLen {
+							isMyISAM := tableEngine == "MYISAM" || tableEngine == "ARCHIVE" || tableEngine == "HEAP" || tableEngine == "MEMORY"
+							if isUniqueOrPrimary || !isMyISAM {
+								return nil, mysqlError(1071, "42000", fmt.Sprintf("Specified key was too long; max key length is %d bytes", maxKeyLen))
+							}
+							e.addWarning("Warning", 1071, fmt.Sprintf("Specified key was too long; max key length is %d bytes", maxKeyLen))
+						}
+						break
+					}
+				}
 			}
 		}
+
 		// Validate that PRIMARY KEY cannot be INVISIBLE (ER_PK_INDEX_CANT_BE_INVISIBLE = 3895).
 		// This must be checked before the if/else block since PRIMARY KEY takes the if branch.
 		{
@@ -1664,6 +1718,60 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 		if totalKeys > 64 {
 			return nil, mysqlError(1069, "42000", "Too many keys specified; max 64 keys allowed")
+		}
+	}
+
+	// Validate key length for inline PRIMARY KEY column definitions.
+	// Explicit index PRIMARY KEY entries are checked in the index loop above.
+	// Inline column-level "PRIMARY KEY" (ColKeyPrimary) bypasses that loop,
+	// so we check here: for each primary key column, verify full byte width.
+	if len(primaryKeys) > 0 {
+		var maxKeyLen int
+		if tableEngine == "MYISAM" || tableEngine == "ARCHIVE" || tableEngine == "HEAP" || tableEngine == "MEMORY" {
+			maxKeyLen = 1000
+		} else {
+			maxKeyLen = 3072
+			if tableRowFormat == "COMPACT" || tableRowFormat == "REDUNDANT" {
+				maxKeyLen = 767
+			}
+		}
+		for _, pkCol := range primaryKeys {
+			for _, col := range columns {
+				if !strings.EqualFold(col.Name, pkCol) {
+					continue
+				}
+				colTypeUpper := strings.ToUpper(strings.TrimSpace(col.Type))
+				baseType := colTypeUpper
+				if i := strings.IndexByte(baseType, '('); i >= 0 {
+					baseType = strings.TrimSpace(baseType[:i])
+				}
+				isStringType := baseType == "CHAR" || baseType == "VARCHAR" ||
+					baseType == "BINARY" || baseType == "VARBINARY"
+				if !isStringType {
+					break
+				}
+				charLen := extractCharLength(col.Type)
+				if charLen <= 0 {
+					break
+				}
+				cs := strings.ToLower(col.Charset)
+				if cs == "" {
+					cs = strings.ToLower(tableCharset)
+				}
+				bpc := 1
+				switch cs {
+				case "utf8mb4", "":
+					bpc = 4
+				case "utf8", "utf8mb3":
+					bpc = 3
+				case "utf32", "utf16", "utf16le", "ucs2":
+					bpc = 4
+				}
+				if charLen*bpc > maxKeyLen {
+					return nil, mysqlError(1071, "42000", fmt.Sprintf("Specified key was too long; max key length is %d bytes", maxKeyLen))
+				}
+				break
+			}
 		}
 	}
 

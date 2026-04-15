@@ -262,12 +262,28 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 		// Filter out rows from other connections' uncommitted transactions
 		raw := e.filterUncommittedRows(rawAll)
 		// Build a set of CHAR(N) column names for trailing-space removal.
+		// Only include columns whose charset represents a space as the single byte 0x20.
+		// Multi-byte charsets (utf32, utf16, ucs2) encode space as multi-byte sequences,
+		// so byte-level TrimRight(" ") would incorrectly strip non-space trailing bytes.
 		charCols := make(map[string]bool)
 		if tbl.Def != nil {
+			tableCharset := ""
+			if tbl.Def != nil {
+				tableCharset = strings.ToLower(tbl.Def.Charset)
+			}
 			for _, col := range tbl.Def.Columns {
 				lower := strings.ToLower(strings.TrimSpace(col.Type))
 				if strings.HasPrefix(lower, "char(") || lower == "char" {
-					charCols[col.Name] = true
+					colCharset := strings.ToLower(col.Charset)
+					if colCharset == "" {
+						colCharset = tableCharset
+					}
+					// Skip multi-byte charsets where space != 0x20 byte
+					isMultiByte := colCharset == "utf32" || colCharset == "utf16" ||
+						colCharset == "utf16le" || colCharset == "ucs2"
+					if !isMultiByte {
+						charCols[col.Name] = true
+					}
 				}
 			}
 		}

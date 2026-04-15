@@ -2965,10 +2965,26 @@ func (e *Executor) execExecute(stmt *sqlparser.ExecuteStmt) (*Result, error) {
 				argSQLLiterals = append(argSQLLiterals, "NULL")
 			} else {
 				// Validate LIMIT/OFFSET parameters: negative values are not allowed.
+				// String values are converted to their integer representation
+				// (MySQL converts non-numeric strings to 0 for LIMIT).
 				if limitArgPositions[argIdx] {
 					if n, isNeg := isNegativeNumeric(val); isNeg {
 						_ = n
 						return nil, mysqlError(1210, "HY000", "Incorrect arguments to EXECUTE")
+					}
+					if sv, ok := val.(string); ok {
+						n, parseErr := strconv.ParseInt(strings.TrimSpace(sv), 10, 64)
+						if parseErr != nil {
+							n = 0
+						}
+						if n < 0 {
+							return nil, mysqlError(1210, "HY000", "Incorrect arguments to EXECUTE")
+						}
+						lit := strconv.FormatInt(n, 10)
+						finalQuery.WriteString(lit)
+						argSQLLiterals = append(argSQLLiterals, lit)
+						argIdx++
+						continue
 					}
 				}
 				switch v := val.(type) {
@@ -3047,14 +3063,23 @@ func (e *Executor) execDeallocate(stmt *sqlparser.DeallocateStmt) (*Result, erro
 // values for these parameters at EXECUTE time with ER_WRONG_ARGUMENTS.
 func findLimitArgPositions(query string) map[int]bool {
 	result := make(map[int]bool)
-	// Tokenize the query (respecting string literals) and detect ? tokens
-	// that immediately follow LIMIT or a LIMIT comma (offset position).
+	// State machine: track whether we're in LIMIT count or LIMIT offset position.
+	// Handles:
+	//   LIMIT ?              -> ? is count (limit position)
+	//   LIMIT ?, ?           -> both ? are limit positions
+	//   LIMIT 1, ?           -> second ? is offset (limit position)
+	//   LIMIT ? OFFSET ?     -> both ? are limit positions
+	//   LIMIT 1 OFFSET ?     -> second ? is offset (limit position)
 	lower := strings.ToLower(query)
 	argIdx := 0
 	inSingle := false
 	escaped := false
-	afterLimit := false  // just saw LIMIT keyword
-	afterComma := false  // just saw comma inside LIMIT clause (offset position)
+	// inLimitCount: just after LIMIT keyword, expecting the count value
+	// inLimitOffset: just after LIMIT count (number or ?), expecting offset after comma or OFFSET keyword
+	// inOffsetVal: just after comma or OFFSET keyword, expecting offset value
+	inLimitCount := false
+	inLimitOffset := false // after the count part, looking for comma or OFFSET
+	inOffsetVal := false
 	i := 0
 	for i < len(lower) {
 		ch := lower[i]
@@ -3077,48 +3102,79 @@ func findLimitArgPositions(query string) map[int]bool {
 		}
 		if ch == '\'' {
 			inSingle = true
-			afterLimit = false
-			afterComma = false
+			inLimitCount = false
+			inLimitOffset = false
+			inOffsetVal = false
 			i++
 			continue
 		}
-		if ch == '?' {
-			if afterLimit || afterComma {
-				result[argIdx] = true
-			}
-			argIdx++
-			afterLimit = false
-			afterComma = false
-			i++
-			continue
-		}
-		// Skip whitespace (keep afterLimit/afterComma state)
+		// Skip whitespace (keep state)
 		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
 			i++
 			continue
 		}
-		if ch == ',' && (afterLimit) {
-			// comma after LIMIT rowcount — now expect offset
-			afterComma = true
-			afterLimit = false
+		if ch == '?' {
+			if inLimitCount || inOffsetVal {
+				result[argIdx] = true
+			}
+			argIdx++
+			if inLimitCount {
+				// After count ?, expect possible offset
+				inLimitCount = false
+				inLimitOffset = true
+			} else {
+				inLimitOffset = false
+				inOffsetVal = false
+			}
 			i++
 			continue
 		}
-		// Check for LIMIT keyword
-		if strings.HasPrefix(lower[i:], "limit") {
-			// Make sure it's a word boundary
-			end := i + 5
+		// Comma inside LIMIT clause separates count from offset
+		if ch == ',' && inLimitOffset {
+			inLimitOffset = false
+			inOffsetVal = true
+			i++
+			continue
+		}
+		// Check for OFFSET keyword (SQL standard LIMIT count OFFSET offset)
+		if (inLimitOffset) && strings.HasPrefix(lower[i:], "offset") {
+			end := i + 6
 			if end >= len(lower) || !isAlphaNum(lower[end]) {
-				afterLimit = true
-				afterComma = false
+				inLimitOffset = false
+				inOffsetVal = true
 				i = end
 				continue
 			}
 		}
+		// Check for LIMIT keyword
+		if strings.HasPrefix(lower[i:], "limit") {
+			end := i + 5
+			if end >= len(lower) || !isAlphaNum(lower[end]) {
+				inLimitCount = true
+				inLimitOffset = false
+				inOffsetVal = false
+				i = end
+				continue
+			}
+		}
+		// A digit in count position: skip the number, transition to offset-waiting state
+		if (inLimitCount || inOffsetVal) && ch >= '0' && ch <= '9' {
+			for i < len(lower) && lower[i] >= '0' && lower[i] <= '9' {
+				i++
+			}
+			if inLimitCount {
+				inLimitCount = false
+				inLimitOffset = true
+			} else {
+				inOffsetVal = false
+			}
+			continue
+		}
 		// Any other non-whitespace token resets limit context
 		if ch != ',' {
-			afterLimit = false
-			afterComma = false
+			inLimitCount = false
+			inLimitOffset = false
+			inOffsetVal = false
 		}
 		i++
 	}
