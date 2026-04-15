@@ -453,7 +453,15 @@ func normalizeFuncArgSpaces(s string) string {
 
 // normalizeAggColNameNulls replaces lowercase "null" with "NULL" in aggregate
 // column names (outside of quoted strings), matching MySQL display behavior.
+// MySQL preserves original keyword case inside CASE expressions, so null is not
+// uppercased when the expression contains a CASE...END construct.
 func normalizeAggColNameNulls(s string) string {
+	// If the expression contains a CASE construct, MySQL preserves original case
+	// of keywords including null. Skip uppercasing null in that case.
+	lowerS := strings.ToLower(s)
+	if strings.Contains(lowerS, "case ") || strings.Contains(lowerS, "(case ") {
+		return s
+	}
 	var result strings.Builder
 	inQuote := byte(0)
 	for i := 0; i < len(s); i++ {
@@ -710,7 +718,7 @@ func uppercaseSQLKeywords(s string) string {
 		"any", "some", "all", "as", "on", "join", "left", "right", "inner",
 		"outer", "cross", "group", "by", "order", "having", "limit", "offset",
 		"union", "except", "intersect", "between", "like", "is",
-		"null", "true", "false", "case", "when", "then", "else", "end",
+		"true", "false",
 		"asc", "desc", "count", "sum", "avg", "min", "max", "upper", "lower",
 		"row", "with", "cast", "convert", "json_extract", "json_valid", "json_type",
 		"json_depth", "json_length", "json_keys", "json_array", "json_object",
