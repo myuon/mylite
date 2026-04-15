@@ -1507,7 +1507,19 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 				return true, false, nil
 			}
 			if output != "" && ctx.resultLogEnabled {
-				ctx.output.WriteString(output)
+				// Filter out spurious ANALYZE TABLE ... UPDATE HISTOGRAM lines emitted
+				// by mysqldump (MySQL 8.0+ conditional comments like /*!80002 ... */).
+				// These are internal histogram-update statements that are not part of
+				// the test's expected output.
+				filteredLines := make([]string, 0)
+				for _, line := range strings.Split(output, "\n") {
+					upper := strings.ToUpper(line)
+					if strings.Contains(upper, "UPDATE HISTOGRAM") || strings.Contains(upper, "DROP HISTOGRAM") {
+						continue
+					}
+					filteredLines = append(filteredLines, line)
+				}
+				ctx.output.WriteString(strings.Join(filteredLines, "\n"))
 			}
 			return true, false, nil
 		}
