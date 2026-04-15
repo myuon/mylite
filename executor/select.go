@@ -2200,6 +2200,8 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		}
 		// Build a set of column names that have BINARY/VARBINARY type (require binary collation for sort)
 		binaryColNames := make(map[string]bool)
+		// Build a set of column names that have numeric types (require numeric comparison for sort)
+		numericColNames := make(map[string]bool)
 		for _, td := range selectTableDefs {
 			if td == nil {
 				continue
@@ -2209,9 +2211,12 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				if strings.HasPrefix(ct, "BINARY") || strings.HasPrefix(ct, "VARBINARY") || strings.HasPrefix(ct, "BLOB") {
 					binaryColNames[strings.ToLower(col.Name)] = true
 				}
+				if isFloatOrderColumnType(col.Type) {
+					numericColNames[strings.ToLower(col.Name)] = true
+				}
 			}
 		}
-		resultRows, err = applyOrderByWithBinaryCols(stmt.OrderBy, colNames, resultRows, resolveOrderByCollation(selectTableDefs, fromExpr2), binaryColNames)
+		resultRows, err = applyOrderByWithBinaryCols(stmt.OrderBy, colNames, resultRows, resolveOrderByCollation(selectTableDefs, fromExpr2), binaryColNames, numericColNames)
 		if err != nil {
 			return nil, err
 		}
@@ -6129,12 +6134,14 @@ func applyOrderBy(orderBy sqlparser.OrderBy, colNames []string, rows [][]interfa
 }
 
 // applyOrderByWithBinaryCols is like applyOrderBy but overrides collation to "binary"
-// for ORDER BY columns that are BINARY/VARBINARY/BLOB type (byte-by-byte comparison).
-func applyOrderByWithBinaryCols(orderBy sqlparser.OrderBy, colNames []string, rows [][]interface{}, collation string, binaryColNames map[string]bool) ([][]interface{}, error) {
+// for ORDER BY columns that are BINARY/VARBINARY/BLOB type (byte-by-byte comparison),
+// and uses numeric comparison for numeric column types (INT, FLOAT, DOUBLE, DECIMAL, etc.)
+// to ensure correct ordering when values are stored as formatted strings (e.g. "5.00" < "11.11").
+func applyOrderByWithBinaryCols(orderBy sqlparser.OrderBy, colNames []string, rows [][]interface{}, collation string, binaryColNames map[string]bool, numericColNames map[string]bool) ([][]interface{}, error) {
 	if len(orderBy) == 0 {
 		return rows, nil
 	}
-	if len(binaryColNames) == 0 {
+	if len(binaryColNames) == 0 && len(numericColNames) == 0 {
 		return applyOrderBy(orderBy, colNames, rows, collation)
 	}
 
@@ -6142,6 +6149,7 @@ func applyOrderByWithBinaryCols(orderBy sqlparser.OrderBy, colNames []string, ro
 		colIdx    int
 		asc       bool
 		collation string
+		numeric   bool
 	}
 	var specs []orderSpec
 	for _, order := range orderBy {
@@ -6185,8 +6193,10 @@ func applyOrderByWithBinaryCols(orderBy sqlparser.OrderBy, colNames []string, ro
 		if binaryColNames[strings.ToLower(colName)] {
 			orderCollation = "binary"
 		}
+		// If the column is a numeric type, use numeric comparison
+		isNumeric := numericColNames[strings.ToLower(colName)]
 		asc := order.Direction == sqlparser.AscOrder || order.Direction == 0
-		specs = append(specs, orderSpec{colIdx: colIdx, asc: asc, collation: orderCollation})
+		specs = append(specs, orderSpec{colIdx: colIdx, asc: asc, collation: orderCollation, numeric: isNumeric})
 	}
 	if len(specs) == 0 {
 		return rows, nil
@@ -6194,11 +6204,16 @@ func applyOrderByWithBinaryCols(orderBy sqlparser.OrderBy, colNames []string, ro
 
 	sort.SliceStable(rows, func(i, j int) bool {
 		for _, spec := range specs {
-			coll := spec.collation
-			if coll == "" {
-				coll = collation
+			var cmp int
+			if spec.numeric {
+				cmp = compareNumeric(rows[i][spec.colIdx], rows[j][spec.colIdx])
+			} else {
+				coll := spec.collation
+				if coll == "" {
+					coll = collation
+				}
+				cmp = compareByCollation(rows[i][spec.colIdx], rows[j][spec.colIdx], coll)
 			}
-			cmp := compareByCollation(rows[i][spec.colIdx], rows[j][spec.colIdx], coll)
 			if cmp == 0 {
 				continue
 			}

@@ -464,6 +464,26 @@ func isNonSortableCharset(cs string) bool {
 	return false
 }
 
+// isFloatOrderColumnType returns true for floating-point and decimal column types whose values
+// may be stored as formatted strings and need explicit numeric comparison in ORDER BY to avoid
+// incorrect lexicographic ordering. For example, "5.00" < "11.11" lexicographically but
+// 5.00 < 11.11 numerically.
+// Note: NUMERIC is normalized to DECIMAL in DDL, so "decimal" covers both NUMERIC and DECIMAL.
+func isFloatOrderColumnType(colType string) bool {
+	t := strings.ToLower(strings.TrimSpace(colType))
+	t = strings.TrimSuffix(t, " unsigned")
+	t = strings.TrimSpace(t)
+	if i := strings.IndexByte(t, '('); i >= 0 {
+		t = strings.TrimSpace(t[:i])
+	}
+	switch t {
+	case "double", "real", "numeric", "decimal":
+		return true
+	default:
+		return false
+	}
+}
+
 func isNumericOrderColumnType(colType string) bool {
 	t := strings.ToLower(strings.TrimSpace(colType))
 	t = strings.TrimSuffix(t, " unsigned")
