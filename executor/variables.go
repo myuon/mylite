@@ -978,9 +978,21 @@ func (e *Executor) handleRawSet(raw string) error {
 	// Validate SET PASSWORD FOR syntax.
 	// MySQL rejects: SET PASSWORD FOR @var = '...' (variable as user part) with ER_PARSE_ERROR.
 	// MySQL rejects: SET PASSWORD FOR user@host = NULL with ER_PARSE_ERROR.
+	// MySQL rejects: SET PASSWORD FOR unknown_user@host = '...' with ER_PASSWORD_NO_MATCH (1133).
 	if strings.HasPrefix(upperTrimmed, "SET PASSWORD FOR ") {
 		if syntaxErr := validateSetPasswordSyntax(trimmed); syntaxErr != nil {
 			return syntaxErr
+		}
+		// Check user existence: the "FOR user@host" part is between "FOR " and " = "
+		rest := strings.TrimSpace(trimmed[len("SET PASSWORD FOR "):])
+		rest = strings.TrimSuffix(rest, ";")
+		rest = strings.TrimSpace(rest)
+		eqIdx := strings.LastIndex(rest, "=")
+		if eqIdx >= 0 {
+			userAtHost := strings.TrimSpace(rest[:eqIdx])
+			if !e.isKnownUser(userAtHost) {
+				return mysqlError(1133, "42000", "Can't find any matching row in the user table")
+			}
 		}
 	}
 	if strings.HasPrefix(upperTrimmed, "SET STARTUP ") {
