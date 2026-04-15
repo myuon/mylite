@@ -2503,10 +2503,14 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 func extractRawSelectExprs(query string) []string {
 	q := strings.TrimSpace(query)
 	lq := strings.ToLower(q)
-	if !strings.HasPrefix(lq, "select ") {
+	if len(lq) < 7 || !strings.HasPrefix(lq, "select") || (lq[6] != ' ' && lq[6] != '\t' && lq[6] != '\n' && lq[6] != '\r') {
 		return nil
 	}
-	start := len("select ")
+	// Track whether SELECT was followed by a newline (vs space/tab).
+	// When SELECT is followed by a newline, non-subquery expressions that span
+	// multiple lines should be normalized to single-line (MySQL behavior).
+	selectFollowedByNewline := lq[6] == '\n' || lq[6] == '\r'
+	start := 7 // length of "select" (6) + 1 whitespace character
 	// Skip DISTINCT keyword and SQL hints so they don't appear in column headers
 	rest := strings.TrimSpace(q[start:])
 	for {
@@ -2610,6 +2614,21 @@ func extractRawSelectExprs(query string) []string {
 		}
 	}
 	parts = append(parts, strings.TrimSpace(selectList[last:]))
+	// When SELECT was immediately followed by a newline, non-subquery expressions
+	// that span multiple lines need to be returned as empty string so that the
+	// caller falls back to sqlparser.String() normalization. Subquery expressions
+	// (starting with "(SELECT") preserve their original multi-line formatting
+	// because MySQL outputs them that way in column headers.
+	if selectFollowedByNewline {
+		for i, part := range parts {
+			if strings.Contains(part, "\n") {
+				lp := strings.ToLower(strings.TrimSpace(part))
+				if !strings.HasPrefix(lp, "(select") {
+					parts[i] = "" // signal to caller to use normalized form
+				}
+			}
+		}
+	}
 	return parts
 }
 
