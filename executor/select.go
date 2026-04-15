@@ -2068,6 +2068,58 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		}
 	}
 
+	// For MEMORY/HEAP tables with a HASH index: when the WHERE clause is purely
+	// equality-based (=, OR of =, or IN) on a uniquely-indexed column and there is
+	// no explicit ORDER BY, MySQL returns rows in hash-bucket traversal order.
+	// In practice this is equivalent to ascending sorted order for equality lookups.
+	if stmt.OrderBy == nil && stmt.Where != nil && len(selectTableDefs) == 1 {
+		td := selectTableDefs[0]
+		if td != nil {
+			engineName := strings.ToUpper(td.Engine)
+			if engineName == "MEMORY" || engineName == "HEAP" {
+				// Find the first UNIQUE (HASH) index column that the WHERE is equality on.
+				var hashSortCol string
+				for _, idx := range td.Indexes {
+					if !idx.Unique {
+						continue
+					}
+					if len(idx.Columns) == 0 {
+						continue
+					}
+					col := strings.ToLower(stripPrefixLengthFromCol(idx.Columns[0]))
+					if whereIsHashEqualityOnCol(stmt.Where.Expr, col) {
+						hashSortCol = col
+						break
+					}
+				}
+				if hashSortCol != "" {
+					// Determine if the column is numeric for proper sort.
+					isNumeric := false
+					for _, c := range td.Columns {
+						if strings.EqualFold(c.Name, hashSortCol) {
+							if isNumericOrderColumnType(c.Type) {
+								isNumeric = true
+							}
+							break
+						}
+					}
+					sortExpr := &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(hashSortCol)}
+					sort.SliceStable(allRows, func(a, b int) bool {
+						va, _ := e.evalRowExpr(sortExpr, allRows[a])
+						vb, _ := e.evalRowExpr(sortExpr, allRows[b])
+						var cmp int
+						if isNumeric {
+							cmp = compareNumeric(va, vb)
+						} else {
+							cmp = compareByCollation(va, vb, effectiveTableCollation(td))
+						}
+						return cmp < 0
+					})
+				}
+			}
+		}
+	}
+
 	// Extract USING columns from JOIN for proper star expansion
 	// In MySQL, JOIN ... USING(col) merges the col and shows it only once in SELECT *
 	var joinUsingCols []string
@@ -2726,6 +2778,34 @@ func collectEqCols(expr sqlparser.Expr, cols map[string]bool) {
 	case *sqlparser.AndExpr:
 		collectEqCols(e.Left, cols)
 		collectEqCols(e.Right, cols)
+	}
+}
+
+// whereIsHashEqualityOnCol returns true when the WHERE expression is purely an
+// equality condition (or OR/IN of equalities) on the given column name, i.e. the
+// kind of predicate that would use a HASH index lookup in MySQL's MEMORY engine.
+// Mixed predicates (e.g. range conditions combined with equalities) return false.
+func whereIsHashEqualityOnCol(expr sqlparser.Expr, col string) bool {
+	switch e := expr.(type) {
+	case *sqlparser.ComparisonExpr:
+		if e.Operator == sqlparser.EqualOp {
+			if c, ok := e.Left.(*sqlparser.ColName); ok && strings.ToLower(c.Name.String()) == col {
+				return true
+			}
+			if c, ok := e.Right.(*sqlparser.ColName); ok && strings.ToLower(c.Name.String()) == col {
+				return true
+			}
+		}
+		if e.Operator == sqlparser.InOp {
+			if c, ok := e.Left.(*sqlparser.ColName); ok && strings.ToLower(c.Name.String()) == col {
+				return true
+			}
+		}
+		return false
+	case *sqlparser.OrExpr:
+		return whereIsHashEqualityOnCol(e.Left, col) && whereIsHashEqualityOnCol(e.Right, col)
+	default:
+		return false
 	}
 }
 

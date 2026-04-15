@@ -574,6 +574,14 @@ func normalizeAddIndexUsing(query string) string {
 	// With name: ADD KEY i1 USING BTREE (col) -> ADD KEY i1 (col) USING BTREE
 	re2 := regexp.MustCompile(`(?i)(ADD\s+(UNIQUE\s+)?(KEY|INDEX)\s+` + "`?" + `\w+` + "`?" + `)\s+USING\s+(\w+)\s*(\([^)]*\))`)
 	query = re2.ReplaceAllString(query, "${1} ${5} USING ${4}")
+	// ADD UNIQUE name USING BTREE/HASH (cols) -> ADD UNIQUE KEY name (cols) USING BTREE/HASH
+	// (missing KEY/INDEX keyword before the index name)
+	re3 := regexp.MustCompile(`(?i)(ADD\s+UNIQUE)\s+(\w+)\s+USING\s+(\w+)\s*(\([^)]*\))`)
+	query = re3.ReplaceAllString(query, "${1} KEY ${2} ${4} USING ${3}")
+	// ADD UNIQUE USING BTREE/HASH (cols) -> ADD UNIQUE KEY (cols) USING BTREE/HASH
+	// (missing KEY/INDEX keyword, no name)
+	re4 := regexp.MustCompile(`(?i)(ADD\s+UNIQUE)\s+USING\s+(\w+)\s*(\([^)]*\))`)
+	query = re4.ReplaceAllString(query, "${1} KEY ${3} USING ${2}")
 	return query
 }
 
