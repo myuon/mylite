@@ -3058,80 +3058,75 @@ func (e *Executor) execDeallocate(stmt *sqlparser.DeallocateStmt) (*Result, erro
 // values for these parameters at EXECUTE time with ER_WRONG_ARGUMENTS.
 func findLimitArgPositions(query string) map[int]bool {
 	result := make(map[int]bool)
-	// Tokenize the query (respecting string literals) and detect ? tokens
-	// that immediately follow LIMIT or a LIMIT comma (offset position).
 	lower := strings.ToLower(query)
+
+	// Find all ? positions and their indices, and find all LIMIT clause ranges.
+	// For each ?, determine if it falls within a LIMIT clause.
+
+	// Collect ? indices (ignoring string literals)
+	type qmark struct {
+		pos    int // byte position in query
+		argIdx int // argument index
+	}
+	var qmarks []qmark
 	argIdx := 0
 	inSingle := false
 	escaped := false
-	afterLimit := false  // just saw LIMIT keyword
-	afterComma := false  // just saw comma inside LIMIT clause (offset position)
-	i := 0
-	for i < len(lower) {
-		ch := lower[i]
+	for i := 0; i < len(query); i++ {
+		ch := query[i]
 		if inSingle {
 			if escaped {
 				escaped = false
-				i++
 				continue
 			}
 			if ch == '\\' {
 				escaped = true
-				i++
 				continue
 			}
 			if ch == '\'' {
 				inSingle = false
 			}
-			i++
 			continue
 		}
 		if ch == '\'' {
 			inSingle = true
-			afterLimit = false
-			afterComma = false
-			i++
 			continue
 		}
 		if ch == '?' {
-			if afterLimit || afterComma {
-				result[argIdx] = true
-			}
+			qmarks = append(qmarks, qmark{pos: i, argIdx: argIdx})
 			argIdx++
-			afterLimit = false
-			afterComma = false
-			i++
-			continue
 		}
-		// Skip whitespace (keep afterLimit/afterComma state)
-		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
-			i++
-			continue
+	}
+
+	// For each ?, check if the text immediately before (skipping whitespace/digits/commas)
+	// contains a LIMIT keyword, making it a LIMIT or OFFSET parameter.
+	for _, qm := range qmarks {
+		pos := qm.pos - 1
+		// Skip whitespace
+		for pos >= 0 && (lower[pos] == ' ' || lower[pos] == '\t' || lower[pos] == '\n' || lower[pos] == '\r') {
+			pos--
 		}
-		if ch == ',' && (afterLimit) {
-			// comma after LIMIT rowcount — now expect offset
-			afterComma = true
-			afterLimit = false
-			i++
-			continue
-		}
-		// Check for LIMIT keyword
-		if strings.HasPrefix(lower[i:], "limit") {
-			// Make sure it's a word boundary
-			end := i + 5
-			if end >= len(lower) || !isAlphaNum(lower[end]) {
-				afterLimit = true
-				afterComma = false
-				i = end
-				continue
+		// Could be:
+		// 1. LIMIT ? — directly after LIMIT keyword
+		// 2. LIMIT N, ? — after "N," where N is the rowcount
+		// 3. LIMIT ?, ? — second ? is offset
+		// Check back: skip digits, then skip comma if present, then skip whitespace, then check for LIMIT
+		if pos >= 0 && lower[pos] == ',' {
+			// possible offset position: go back further
+			pos--
+			// skip digits/whitespace
+			for pos >= 0 && (lower[pos] == ' ' || lower[pos] == '\t' || lower[pos] == '\n' || lower[pos] == '\r' || (lower[pos] >= '0' && lower[pos] <= '9') || lower[pos] == '?') {
+				pos--
 			}
 		}
-		// Any other non-whitespace token resets limit context
-		if ch != ',' {
-			afterLimit = false
-			afterComma = false
+		// Now check if what precedes is the LIMIT keyword
+		for pos >= 0 && (lower[pos] == ' ' || lower[pos] == '\t' || lower[pos] == '\n' || lower[pos] == '\r') {
+			pos--
 		}
-		i++
+		// pos should now point to the last char of a keyword
+		if pos >= 4 && lower[pos-4:pos+1] == "limit" && (pos-5 < 0 || !isAlphaNum(lower[pos-5])) {
+			result[qm.argIdx] = true
+		}
 	}
 	return result
 }
