@@ -3951,6 +3951,16 @@ func valueScale(v interface{}) int {
 	}
 }
 
+// decimalStringScale returns the number of fractional digits in a decimal string.
+// Unlike valueScale, it handles strings like ".12345" (leading dot) where the
+// first character is '.' rather than a digit.
+func decimalStringScale(s string) int {
+	if idx := strings.Index(s, "."); idx >= 0 {
+		return len(s) - idx - 1
+	}
+	return 0
+}
+
 // evalBinaryExpr evaluates arithmetic binary expressions.
 func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator, divPrecision ...int) (interface{}, error) {
 	// MySQL arithmetic/bit operations with NULL yield NULL.
@@ -4120,7 +4130,27 @@ func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator, di
 				if scale1 > outScale {
 					outScale = scale1
 				}
-				return formatRatFixed(remainder, outScale), nil
+				// MySQL's internal DECIMAL arithmetic uses 8 groups of 9 digits = 72
+				// significant fractional digits. Compute at precision 72 then pad to
+				// outScale with zeros (matching MySQL's DECIMAL precision behavior).
+				const mysqlDecimalMaxFracDigits = 72
+				computeScale := outScale
+				if computeScale > mysqlDecimalMaxFracDigits {
+					computeScale = mysqlDecimalMaxFracDigits
+				}
+				result := formatRatFixed(remainder, computeScale)
+				// Pad to outScale with trailing zeros if needed.
+				if outScale > computeScale {
+					if dotIdx := strings.Index(result, "."); dotIdx >= 0 {
+						curFrac := len(result) - dotIdx - 1
+						if curFrac < outScale {
+							result += strings.Repeat("0", outScale-curFrac)
+						}
+					} else {
+						result += "." + strings.Repeat("0", outScale)
+					}
+				}
+				return result, nil
 			}
 		}
 		if rf == 0 {

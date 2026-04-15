@@ -100,7 +100,10 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		// When it is a literal, MySQL uses exactly `decimals` decimal places in the result.
 		// When it is a column/expression reference, MySQL preserves the source DECIMAL column's scale
 		// (result scale = max(decimals, origScale)).
-		decimalsIsLiteral := false
+		// decimalsIsLiteral: true when the 2nd arg is a literal integer (or absent, meaning default 0).
+		// In that case, the output scale is exactly `decimals` decimal places.
+		// When false (column/expression), MySQL uses the source column's scale for output.
+		decimalsIsLiteral := len(v.Exprs) < 2 // no 2nd arg → default 0, treated as literal
 		if len(v.Exprs) >= 2 {
 			switch arg2 := v.Exprs[1].(type) {
 			case *sqlparser.Literal:
@@ -122,6 +125,16 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 				return tv, true, nil
 			}
 		}
+		// For negative decimals, use float-based rounding to nearest 10^|decimals|.
+		if decimals < 0 {
+			f := toFloat(val)
+			factor := 1.0
+			for i := decimals; i < 0; i++ {
+				factor *= 10
+			}
+			rounded := float64(int64(f/factor+0.5)) * factor
+			return int64(rounded), true, nil
+		}
 		// Convert non-string numeric types to string so the exact decimal path can handle them.
 		// This avoids float64 overflow when `decimals` is large (e.g. 40 or 100).
 		var valStr string
@@ -141,24 +154,29 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		}
 		// For decimal strings (including those converted above), use exact decimal rounding.
 		if valStr != "" {
-			// Cap displayScale at MySQL's DECIMAL max precision (30) to avoid unreasonably long output.
-			displayDecimals := decimals
-			if displayDecimals > 30 {
-				displayDecimals = 30
-			}
-			if out, ok2 := roundDecimalStringHalfUp(valStr, int(displayDecimals)); ok2 {
-				// Determine the display scale:
-				// - literal N arg: show exactly N decimal places
-				// - column/expression arg: preserve the source column's scale (max of decimals and origScale)
-				displayScale := int(displayDecimals)
-				if !decimalsIsLiteral {
-					if dotIdx := strings.IndexByte(valStr, '.'); dotIdx >= 0 {
-						origScale := len(valStr) - dotIdx - 1
-						if origScale > displayScale {
-							displayScale = origScale
-						}
-					}
+			// Determine the display scale for the output:
+			// - literal N arg: show exactly min(N, 30) decimal places
+			// - column/expression arg: MySQL uses the source column's DECIMAL scale as output scale
+			//   (i.e. ROUND(decimal(10,0), col=40) → same scale as decimal(10,0) = 0)
+			var displayScale int
+			if decimalsIsLiteral {
+				displayScale = int(decimals)
+				if displayScale > 30 {
+					displayScale = 30
 				}
+			} else {
+				// For non-literal decimals arg, use the source value's own scale.
+				if dotIdx := strings.IndexByte(valStr, '.'); dotIdx >= 0 {
+					displayScale = len(valStr) - dotIdx - 1
+				} else {
+					displayScale = 0
+				}
+			}
+			roundDecimals := int(decimals)
+			if roundDecimals > 30 {
+				roundDecimals = 30
+			}
+			if out, ok2 := roundDecimalStringHalfUp(valStr, roundDecimals); ok2 {
 				if displayScale > 0 {
 					outDotIdx := strings.IndexByte(out, '.')
 					if outDotIdx < 0 {
@@ -167,7 +185,14 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 						curScale := len(out) - outDotIdx - 1
 						if curScale < displayScale {
 							out += strings.Repeat("0", displayScale-curScale)
+						} else if curScale > displayScale {
+							out = out[:len(out)-(curScale-displayScale)]
 						}
+					}
+				} else {
+					// Strip any trailing decimal point and zeros if displayScale=0.
+					if dotIdx := strings.IndexByte(out, '.'); dotIdx >= 0 {
+						out = out[:dotIdx]
 					}
 				}
 				return out, true, nil
@@ -217,6 +242,19 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if err != nil {
 			return nil, true, err
 		}
+		// Detect whether the second argument is a literal integer.
+		// When it is a column/expression, MySQL uses the source column's scale for output.
+		truncDecimalsIsLiteral := false
+		switch arg2 := v.Exprs[1].(type) {
+		case *sqlparser.Literal:
+			if arg2.Type == sqlparser.IntVal {
+				truncDecimalsIsLiteral = true
+			}
+		case *sqlparser.UnaryExpr:
+			if lit, ok2 := arg2.Expr.(*sqlparser.Literal); ok2 && lit.Type == sqlparser.IntVal {
+				truncDecimalsIsLiteral = true
+			}
+		}
 		decimals := toInt64(dv)
 		if decimals == 0 {
 			f := toFloat(val)
@@ -242,15 +280,28 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 				valStr = strconv.FormatFloat(tv.Value, 'f', -1, 64)
 			}
 			if valStr != "" {
-				// Cap display scale at MySQL's practical maximum of 30.
-				dispDecimals := decimals
-				if dispDecimals > 30 {
-					dispDecimals = 30
+				// Determine display scale:
+				// - literal N: show exactly min(N, 30) decimal places
+				// - column/expression: use source value's own scale
+				var outScale int
+				if truncDecimalsIsLiteral {
+					outScale = int(decimals)
+					if outScale > 30 {
+						outScale = 30
+					}
+				} else {
+					if dotIdx := strings.IndexByte(valStr, '.'); dotIdx >= 0 {
+						outScale = len(valStr) - dotIdx - 1
+					} else {
+						outScale = 0
+					}
 				}
-				// Truncate: keep only dispDecimals decimal places (no rounding).
-				if out, ok2 := truncateDecimalString(valStr, int(dispDecimals)); ok2 {
-					outScale := int(dispDecimals)
-					// Pad with trailing zeros if needed.
+				truncDecimals := int(decimals)
+				if truncDecimals > 30 {
+					truncDecimals = 30
+				}
+				// Truncate: keep only truncDecimals decimal places (no rounding).
+				if out, ok2 := truncateDecimalString(valStr, truncDecimals); ok2 {
 					if outScale > 0 {
 						outDotIdx := strings.IndexByte(out, '.')
 						if outDotIdx < 0 {
@@ -259,7 +310,14 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 							curScale := len(out) - outDotIdx - 1
 							if curScale < outScale {
 								out += strings.Repeat("0", outScale-curScale)
+							} else if curScale > outScale {
+								out = out[:len(out)-(curScale-outScale)]
 							}
+						}
+					} else {
+						// Strip trailing decimal point and zeros.
+						if dotIdx := strings.IndexByte(out, '.'); dotIdx >= 0 {
+							out = out[:dotIdx]
 						}
 					}
 					return out, true, nil
@@ -327,13 +385,32 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 				truncRat := new(big.Rat).SetInt64(truncInt)
 				remainder := new(big.Rat).Sub(rat0, new(big.Rat).Mul(truncRat, rat1))
 				// Determine output scale from the input strings.
-				scale0 := valueScale(r0Str)
-				scale1 := valueScale(r1Str)
+				// Use decimalStringScale to handle strings like ".12345" (leading dot).
+				scale0 := decimalStringScale(r0Str)
+				scale1 := decimalStringScale(r1Str)
 				outScale := scale0
 				if scale1 > outScale {
 					outScale = scale1
 				}
-				result := formatRatFixed(remainder, outScale)
+				// MySQL's internal DECIMAL arithmetic uses 8 groups of 9 digits = 72
+				// significant fractional digits. Compute at precision 72 then pad to
+				// outScale with zeros (matching MySQL's DECIMAL precision behavior).
+				const mysqlDecimalMaxFracDigits = 72
+				computeScale := outScale
+				if computeScale > mysqlDecimalMaxFracDigits {
+					computeScale = mysqlDecimalMaxFracDigits
+				}
+				result := formatRatFixed(remainder, computeScale)
+				if outScale > computeScale {
+					if dotIdx := strings.Index(result, "."); dotIdx >= 0 {
+						curFrac := len(result) - dotIdx - 1
+						if curFrac < outScale {
+							result += strings.Repeat("0", outScale-curFrac)
+						}
+					} else {
+						result += "." + strings.Repeat("0", outScale)
+					}
+				}
 				return result, true, nil
 			}
 		}
