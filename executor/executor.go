@@ -434,6 +434,7 @@ type Executor struct {
 	tableNeedsOptimize map[string]bool
 	// Sort statistics: incremented when ORDER BY operations are performed.
 	sortRows            int64 // total rows sorted
+	sortMergePasses     int64 // merge passes for external sort (simulated based on sort_buffer_size)
 	createdTmpDiskTables int64 // temp tables written to disk
 	createdTmpTables     int64 // total internal temporary tables created
 	sortRange int64 // sort operations using range scan
@@ -1684,6 +1685,7 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			e.handlerReadRnd = 0
 			e.handlerReadRndNext = 0
 			e.sortRows = 0
+			e.sortMergePasses = 0
 			e.sortRange = 0
 			e.sortScan = 0
 			e.createdTmpDiskTables = 0
@@ -2422,6 +2424,7 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 				e.handlerReadRnd = 0
 				e.handlerReadRndNext = 0
 				e.sortRows = 0
+				e.sortMergePasses = 0
 				e.sortRange = 0
 				e.sortScan = 0
 				e.createdTmpDiskTables = 0
@@ -2907,6 +2910,14 @@ func (e *Executor) execPrepare(stmt *sqlparser.PrepareStmt) (*Result, error) {
 	query = strings.ReplaceAll(query, "\\'", "'")
 	query = strings.ReplaceAll(query, "\\\"", "\"")
 	query = strings.ReplaceAll(query, "\\\\", "\\")
+	// Validate SET PASSWORD FOR syntax at PREPARE time.
+	// MySQL rejects invalid SET PASSWORD FOR statements at PREPARE time (not just EXECUTE time).
+	upperQuery := strings.ToUpper(strings.TrimSpace(query))
+	if strings.HasPrefix(upperQuery, "SET PASSWORD FOR ") {
+		if syntaxErr := validateSetPasswordSyntax(strings.TrimSpace(query)); syntaxErr != nil {
+			return nil, syntaxErr
+		}
+	}
 	e.preparedStmts[name] = query
 	return &Result{}, nil
 }

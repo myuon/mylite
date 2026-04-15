@@ -941,11 +941,48 @@ func (e *Executor) resolveSystemVarInValue(val string) string {
 	return val
 }
 
+// validateSetPasswordSyntax checks SET PASSWORD FOR statements for syntax errors.
+// MySQL rejects @variable as the user part (requires a literal user@host).
+// MySQL also rejects NULL as the password value.
+// Returns a syntax error if the statement is invalid, or nil if it looks valid.
+func validateSetPasswordSyntax(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	upperTrimmed := strings.ToUpper(trimmed)
+	if !strings.HasPrefix(upperTrimmed, "SET PASSWORD FOR ") {
+		return nil
+	}
+	rest := strings.TrimSpace(trimmed[len("SET PASSWORD FOR "):])
+	rest = strings.TrimSuffix(rest, ";")
+	rest = strings.TrimSpace(rest)
+	// Reject if user part starts with @ (variable reference, not user@host literal)
+	if strings.HasPrefix(rest, "@") {
+		return mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '@%s' at line 1", strings.TrimPrefix(rest, "@")))
+	}
+	// Reject if value is NULL
+	if eqIdx := strings.LastIndex(rest, "="); eqIdx >= 0 {
+		val := strings.TrimSpace(rest[eqIdx+1:])
+		val = strings.TrimSuffix(val, ";")
+		val = strings.TrimSpace(val)
+		if strings.EqualFold(val, "NULL") {
+			return mysqlError(1064, "42000", "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'NULL' at line 1")
+		}
+	}
+	return nil
+}
+
 // handleRawSet handles SET statements that the parser couldn't parse.
 func (e *Executor) handleRawSet(raw string) error {
 	// Handle user variables: SET @var = value or SET @var := value
 	trimmed := strings.TrimSpace(raw)
 	upperTrimmed := strings.ToUpper(trimmed)
+	// Validate SET PASSWORD FOR syntax.
+	// MySQL rejects: SET PASSWORD FOR @var = '...' (variable as user part) with ER_PARSE_ERROR.
+	// MySQL rejects: SET PASSWORD FOR user@host = NULL with ER_PARSE_ERROR.
+	if strings.HasPrefix(upperTrimmed, "SET PASSWORD FOR ") {
+		if syntaxErr := validateSetPasswordSyntax(trimmed); syntaxErr != nil {
+			return syntaxErr
+		}
+	}
 	if strings.HasPrefix(upperTrimmed, "SET STARTUP ") {
 		rest := strings.TrimSpace(trimmed[len("SET STARTUP "):])
 		if eqIdx := strings.Index(rest, "="); eqIdx > 0 {
@@ -4185,7 +4222,7 @@ func (e *Executor) showStatus(upper string) (*Result, error) {
 		{Name: "Queries", Value: fmt.Sprintf("%d", e.questions)},
 		{Name: "Questions", Value: fmt.Sprintf("%d", e.questions)},
 		{Name: "Slow_queries", Value: "0"},
-		{Name: "Sort_merge_passes", Value: "0"},
+		{Name: "Sort_merge_passes", Value: fmt.Sprintf("%d", e.sortMergePasses)},
 		{Name: "Sort_range", Value: fmt.Sprintf("%d", e.sortRange)},
 		{Name: "Sort_rows", Value: fmt.Sprintf("%d", e.sortRows)},
 		{Name: "Sort_scan", Value: fmt.Sprintf("%d", e.sortScan)},
