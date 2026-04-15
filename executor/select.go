@@ -280,7 +280,7 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 					}
 					// Skip multi-byte charsets where space != 0x20 byte
 					isMultiByte := colCharset == "utf32" || colCharset == "utf16" ||
-						colCharset == "utf16le" || colCharset == "ucs2"
+						colCharset == "utf16le"
 					if !isMultiByte {
 						charCols[col.Name] = true
 					}
