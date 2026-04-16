@@ -5365,7 +5365,10 @@ func (ctx *execContext) runExternalCommand(cmdStr string) (string, error) {
 	if len(args) == 0 {
 		return "", nil
 	}
-	c := exec.Command(args[0], args[1:]...)
+	// Apply a 10-second timeout to prevent external commands from hanging the test.
+	execCtx, execCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer execCancel()
+	c := exec.CommandContext(execCtx, args[0], args[1:]...)
 	// Inherit environment and add overrides
 	if len(envOverrides) > 0 {
 		c.Env = append(os.Environ(), envOverrides...)

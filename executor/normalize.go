@@ -600,8 +600,8 @@ func normalizeCreateTableParenSelect(query string) string {
 		return query
 	}
 	// Skip normalization if WITH clause (CTE) is present to avoid mistaking CTE subqueries
-	// for the parenthesized SELECT pattern. A CTE WITH clause has the form "WITH name AS (".
-	if regexp.MustCompile(`(?i)\bWITH\s+\w+\s+AS\s*\(`).MatchString(query) {
+	// for the parenthesized SELECT pattern. A CTE WITH clause has the form "WITH [RECURSIVE] name AS (".
+	if regexp.MustCompile(`(?i)\bWITH\s+(?:RECURSIVE\s+)?\w+\s+AS\s*\(`).MatchString(query) {
 		return query
 	}
 	trimmed := strings.TrimSpace(query)

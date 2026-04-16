@@ -891,6 +891,24 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 	// NormalJoinType is CROSS JOIN only if there's no ON or USING condition
 	isCross := joinType == sqlparser.NormalJoinType && (join.Condition == nil || (join.Condition.On == nil && len(join.Condition.Using) == 0))
 
+	// Detect trivially-true ON condition (e.g. ON 1, ON TRUE, ON 1=1).
+	// When the ON condition is always true, the join degenerates into a cross join.
+	// We apply maxCrossProductRows to avoid materializing the full Cartesian product,
+	// which can be prohibitively expensive (e.g. 2000×2000 = 4M rows).
+	isTriviallyTrueON := false
+	if !isCross && join.Condition != nil && join.Condition.On != nil {
+		switch v := join.Condition.On.(type) {
+		case *sqlparser.Literal:
+			if v.Type == sqlparser.IntVal && v.Val == "1" {
+				isTriviallyTrueON = true
+			}
+		case sqlparser.BoolVal:
+			if bool(v) {
+				isTriviallyTrueON = true
+			}
+		}
+	}
+
 	// Handle USING clause: build an ON-equivalent condition from USING columns
 	var usingCols []string
 	if join.Condition != nil && len(join.Condition.Using) > 0 {
@@ -902,7 +920,16 @@ func (e *Executor) buildJoinedRowsFromJoin(join *sqlparser.JoinTableExpr) ([]sto
 	var result []storage.Row
 	for _, leftRow := range leftRows {
 		matched := false
+		// For trivially-true ON conditions (cross join), apply maxCrossProductRows limit
+		// to prevent materializing huge Cartesian products (e.g. 2000×2000 = 4M rows).
+		if isTriviallyTrueON && len(result) >= maxCrossProductRows {
+			break
+		}
 		for _, rightRow := range rightRows {
+			// Enforce cross product limit inside the inner loop too
+			if isTriviallyTrueON && len(result) >= maxCrossProductRows {
+				break
+			}
 			combined := make(storage.Row)
 			for k, v := range leftRow {
 				combined[k] = v
@@ -1200,6 +1227,127 @@ func (e *Executor) preFilterRows(rows []storage.Row, preds []sqlparser.Expr) ([]
 		}
 	}
 	return filtered, nil
+}
+
+// equiJoinPair represents a single equality in a join: left = right.
+// left references columns only from "left" (accumulated) tables, right from the new table.
+type equiJoinPair struct {
+	left  sqlparser.Expr // probe key expression (evaluated against accumulated row)
+	right sqlparser.Expr // build key expression (evaluated against new right row)
+}
+
+// extractEquiJoinPairs splits predicates into:
+//   - equi: equi-join pairs where one side references only "rightIdx" tables and
+//     the other references only tables < rightIdx
+//   - remaining: predicates that are not simple equi-joins of this form
+func extractEquiJoinPairs(preds []sqlparser.Expr, aliases []string, rightIdx int) (equi []equiJoinPair, remaining []sqlparser.Expr) {
+	for _, p := range preds {
+		cmp, ok := p.(*sqlparser.ComparisonExpr)
+		if !ok || cmp.Operator != sqlparser.EqualOp {
+			remaining = append(remaining, p)
+			continue
+		}
+		leftRefs := exprReferencedTables(cmp.Left, aliases)
+		rightRefs := exprReferencedTables(cmp.Right, aliases)
+
+		// Check if Left references only tables < rightIdx and Right references only rightIdx
+		leftOnlyLeft := true
+		for t := range leftRefs {
+			if t >= rightIdx {
+				leftOnlyLeft = false
+				break
+			}
+		}
+		rightOnlyRight := len(rightRefs) == 1 && rightRefs[rightIdx]
+
+		if leftOnlyLeft && rightOnlyRight {
+			equi = append(equi, equiJoinPair{left: cmp.Left, right: cmp.Right})
+			continue
+		}
+
+		// Check if Right references only tables < rightIdx and Left references only rightIdx
+		rightOnlyLeft := true
+		for t := range rightRefs {
+			if t >= rightIdx {
+				rightOnlyLeft = false
+				break
+			}
+		}
+		leftOnlyRight := len(leftRefs) == 1 && leftRefs[rightIdx]
+
+		if rightOnlyLeft && leftOnlyRight {
+			// Swap so that equi.left probes accumulated table and equi.right probes new table
+			equi = append(equi, equiJoinPair{left: cmp.Right, right: cmp.Left})
+			continue
+		}
+
+		remaining = append(remaining, p)
+	}
+	return equi, remaining
+}
+
+// hashJoinRows performs an equi-join between accumulated leftRows and new rightRows using
+// a hash map built from rightRows. buildExprs are evaluated against rightRows to form keys;
+// probeExprs are evaluated against leftRows to form probe keys (must match 1:1 with buildExprs).
+// Additional filtering from filterExpr (if non-nil) is applied after the hash lookup.
+func (e *Executor) hashJoinRows(leftRows, rightRows []storage.Row, equiPairs []equiJoinPair, filterExpr sqlparser.Expr) ([]storage.Row, error) {
+	if len(rightRows) == 0 || len(leftRows) == 0 {
+		return nil, nil
+	}
+
+	// Build phase: create hash map keyed by tuple of build-key values.
+	type hashKey = string
+	hashMap := make(map[hashKey][]storage.Row, len(rightRows))
+	for _, rightRow := range rightRows {
+		var keyParts []interface{}
+		for _, ep := range equiPairs {
+			v, err := e.evalRowExpr(ep.right, rightRow)
+			if err != nil {
+				return nil, err
+			}
+			keyParts = append(keyParts, v)
+		}
+		key := hashKey(fmt.Sprintf("%v", keyParts))
+		hashMap[key] = append(hashMap[key], rightRow)
+	}
+
+	// Probe phase: for each left row, compute probe key and look up matching right rows.
+	var result []storage.Row
+	for _, leftRow := range leftRows {
+		var keyParts []interface{}
+		for _, ep := range equiPairs {
+			v, err := e.evalRowExpr(ep.left, leftRow)
+			if err != nil {
+				return nil, err
+			}
+			keyParts = append(keyParts, v)
+		}
+		key := hashKey(fmt.Sprintf("%v", keyParts))
+		matchingRights, ok := hashMap[key]
+		if !ok {
+			continue
+		}
+		for _, rightRow := range matchingRights {
+			combined := make(storage.Row, len(leftRow)+len(rightRow))
+			for k, v := range leftRow {
+				combined[k] = v
+			}
+			for k, v := range rightRow {
+				combined[k] = v
+			}
+			if filterExpr != nil {
+				match, err := e.evalWhere(filterExpr, combined)
+				if err != nil {
+					return nil, err
+				}
+				if !match {
+					continue
+				}
+			}
+			result = append(result, combined)
+		}
+	}
+	return result, nil
 }
 
 // updateHandlerReadIndexScanCounters increments Handler_read_first, Handler_read_last,
@@ -1751,7 +1899,12 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				return nil, err
 			}
 		}
-		joinExpr := composeAndPredicates(joinPreds)
+		// remainingJoinPreds tracks which join predicates have not yet been applied.
+		// We apply each predicate as early as possible (greedy pushdown): a predicate
+		// can be applied at step i when ALL tables it references are in 0..i.
+		remainingJoinPreds := make([]sqlparser.Expr, len(joinPreds))
+		copy(remainingJoinPreds, joinPreds)
+
 		for i := 1; i < len(stmt.From); i++ {
 			rightRows, err := e.buildFromExpr(stmt.From[i])
 			if err != nil {
@@ -1764,56 +1917,93 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 					return nil, err
 				}
 			}
-			isLastJoin := i == len(stmt.From)-1
-			var crossed []storage.Row
-			// For the last join step, use a reusable scratch map for WHERE eval
-			// to avoid allocating a map per pair when most pairs are filtered out.
-			var scratch storage.Row
-			if isLastJoin && joinExpr != nil && len(allRows) > 0 && len(rightRows) > 0 {
-				scratch = make(storage.Row, len(allRows[0])+len(rightRows[0]))
-			}
-			for _, leftRow := range allRows {
-				for _, rightRow := range rightRows {
-					if isLastJoin && joinExpr != nil {
-						// Reuse scratch map: clear and repopulate
-						for k := range scratch {
-							delete(scratch, k)
-						}
-						for k, v := range leftRow {
-							scratch[k] = v
-						}
-						for k, v := range rightRow {
-							scratch[k] = v
-						}
-						match, err := e.evalWhere(joinExpr, scratch)
-						if err != nil {
-							return nil, err
-						}
-						if !match {
-							continue
-						}
-						// Match found: allocate a new row to keep
-						combined := make(storage.Row, len(leftRow)+len(rightRow))
-						for k, v := range scratch {
-							combined[k] = v
-						}
-						crossed = append(crossed, combined)
-					} else {
-						if len(crossed) >= maxCrossProductRows {
-							break
-						}
-						combined := make(storage.Row, len(leftRow)+len(rightRow))
-						for k, v := range leftRow {
-							combined[k] = v
-						}
-						for k, v := range rightRow {
-							combined[k] = v
-						}
-						crossed = append(crossed, combined)
+
+			// Determine which join predicates can be applied at this step:
+			// those whose referenced tables are all in {0..i}.
+			var stepPreds []sqlparser.Expr
+			var deferred []sqlparser.Expr
+			for _, p := range remainingJoinPreds {
+				refs := exprReferencedTables(p, aliases)
+				canApply := true
+				for tbl := range refs {
+					if tbl > i {
+						canApply = false
+						break
 					}
 				}
-				if !isLastJoin && len(crossed) >= maxCrossProductRows {
-					break
+				if canApply {
+					stepPreds = append(stepPreds, p)
+				} else {
+					deferred = append(deferred, p)
+				}
+			}
+			remainingJoinPreds = deferred
+
+			// Prefer hash join for equi-join predicates to avoid O(N^2) nested loops.
+			// Extract equi-join pairs: predicates of the form exprLeft = exprRight
+			// where exprLeft references only accumulated tables (0..i-1) and exprRight
+			// references only the new table (i), or vice-versa.
+			equiPairs, nonEquiPreds := extractEquiJoinPairs(stepPreds, aliases, i)
+
+			var crossed []storage.Row
+			if len(equiPairs) > 0 {
+				// Hash join: build from right table, probe from accumulated left rows.
+				filterExpr := composeAndPredicates(nonEquiPreds)
+				var hjErr error
+				crossed, hjErr = e.hashJoinRows(allRows, rightRows, equiPairs, filterExpr)
+				if hjErr != nil {
+					return nil, hjErr
+				}
+			} else {
+				stepExpr := composeAndPredicates(stepPreds)
+				// Use a reusable scratch map to avoid per-pair allocation when filtering.
+				var scratch storage.Row
+				if stepExpr != nil && len(allRows) > 0 && len(rightRows) > 0 {
+					scratch = make(storage.Row, len(allRows[0])+len(rightRows[0]))
+				}
+				for _, leftRow := range allRows {
+					for _, rightRow := range rightRows {
+						if stepExpr != nil {
+							// Reuse scratch map: clear and repopulate
+							for k := range scratch {
+								delete(scratch, k)
+							}
+							for k, v := range leftRow {
+								scratch[k] = v
+							}
+							for k, v := range rightRow {
+								scratch[k] = v
+							}
+							match, err := e.evalWhere(stepExpr, scratch)
+							if err != nil {
+								return nil, err
+							}
+							if !match {
+								continue
+							}
+							// Match found: allocate a new row to keep
+							combined := make(storage.Row, len(leftRow)+len(rightRow))
+							for k, v := range scratch {
+								combined[k] = v
+							}
+							crossed = append(crossed, combined)
+						} else {
+							if len(crossed) >= maxCrossProductRows {
+								break
+							}
+							combined := make(storage.Row, len(leftRow)+len(rightRow))
+							for k, v := range leftRow {
+								combined[k] = v
+							}
+							for k, v := range rightRow {
+								combined[k] = v
+							}
+							crossed = append(crossed, combined)
+						}
+					}
+					if stepExpr == nil && len(crossed) >= maxCrossProductRows {
+						break
+					}
 				}
 			}
 			allRows = crossed
@@ -5412,6 +5602,116 @@ func flattenUnionParts(stmt sqlparser.TableStatement) ([]sqlparser.TableStatemen
 	return parts, union.Distinct
 }
 
+// extractAnchorColMaxLengths inspects the SELECT expressions of the anchor part(s) and
+// returns a per-column max string length based on CAST(... AS CHAR(n)) / CAST(... AS BINARY(n))
+// expressions. A value of -1 means no declared limit. This is used to detect ER_DATA_TOO_LONG.
+func extractAnchorColMaxLengths(anchorParts []sqlparser.TableStatement) []int64 {
+	for _, part := range anchorParts {
+		sel, ok := part.(*sqlparser.Select)
+		if !ok {
+			continue
+		}
+		lengths := make([]int64, len(sel.SelectExprs.Exprs))
+		for i, expr := range sel.SelectExprs.Exprs {
+			lengths[i] = -1
+			ae, ok := expr.(*sqlparser.AliasedExpr)
+			if !ok {
+				continue
+			}
+			var castType *sqlparser.ConvertType
+			switch ce := ae.Expr.(type) {
+			case *sqlparser.CastExpr:
+				castType = ce.Type
+			case *sqlparser.ConvertExpr:
+				castType = ce.Type
+			}
+			if castType == nil {
+				continue
+			}
+			typeName := strings.ToUpper(castType.Type)
+			if typeName == "CHAR" || typeName == "CHARACTER" || typeName == "VARCHAR" ||
+				typeName == "BINARY" || typeName == "VARBINARY" {
+				if castType.Length != nil {
+					lengths[i] = int64(*castType.Length)
+				}
+			}
+		}
+		return lengths
+	}
+	return nil
+}
+
+// recursiveCTEHasForbiddenJoinOrder checks if a recursive SELECT's FROM clause
+// places the CTE name on the RIGHT side of a STRAIGHT_JOIN or an outer join,
+// which MySQL disallows because it would prevent the recursive reference from
+// being the driving table (ER_CTE_RECURSIVE_FORBIDDEN_JOIN_ORDER).
+func recursiveCTEHasForbiddenJoinOrder(sel *sqlparser.Select, cteName string) bool {
+	lower := strings.ToLower(cteName)
+	for _, fromExpr := range sel.From {
+		if hasForbiddenCTEPosition(fromExpr, lower) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasForbiddenCTEPosition returns true if the CTE name appears on the RIGHT side
+// of a STRAIGHT_JOIN or a LEFT/RIGHT outer join anywhere in the table expression tree.
+func hasForbiddenCTEPosition(te sqlparser.TableExpr, cteLower string) bool {
+	join, ok := te.(*sqlparser.JoinTableExpr)
+	if !ok {
+		return false
+	}
+	// STRAIGHT_JOIN: recursive CTE on the right is forbidden.
+	// LEFT/RIGHT outer join: recursive CTE on the right (for LEFT) or left (for RIGHT) is forbidden.
+	switch join.Join {
+	case sqlparser.StraightJoinType:
+		// CTE must not appear on the right of a STRAIGHT_JOIN
+		if tableExprReferences(join.RightExpr, cteLower) {
+			return true
+		}
+	case sqlparser.LeftJoinType:
+		// CTE on the right of a LEFT JOIN is forbidden (left table drives, right is preserved)
+		if tableExprReferences(join.RightExpr, cteLower) {
+			return true
+		}
+	case sqlparser.RightJoinType:
+		// CTE on the left of a RIGHT JOIN is forbidden
+		if tableExprReferences(join.LeftExpr, cteLower) {
+			return true
+		}
+	}
+	// Recurse into left and right subtrees
+	return hasForbiddenCTEPosition(join.LeftExpr, cteLower) || hasForbiddenCTEPosition(join.RightExpr, cteLower)
+}
+
+// tableExprReferences returns true if a table expression references the given table name (lowercased).
+func tableExprReferences(te sqlparser.TableExpr, nameLower string) bool {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		switch n := t.Expr.(type) {
+		case sqlparser.TableName:
+			name := strings.ToLower(n.Name.String())
+			if name == nameLower {
+				return true
+			}
+			// Also check the alias
+			if t.As.String() != "" && strings.ToLower(t.As.String()) == nameLower {
+				return true
+			}
+		}
+	case *sqlparser.JoinTableExpr:
+		return tableExprReferences(t.LeftExpr, nameLower) || tableExprReferences(t.RightExpr, nameLower)
+	case *sqlparser.ParenTableExpr:
+		for _, inner := range t.Exprs {
+			if tableExprReferences(inner, nameLower) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // execRecursiveCTE executes a WITH RECURSIVE CTE by iterating anchor then recursive parts.
 // cteName is the CTE name, subquery is the CTE body (must be a *sqlparser.Union),
 // colAliases are the column aliases from WITH qn(a,b) AS (...), and cteMap is the
@@ -5483,6 +5783,22 @@ func (e *Executor) execRecursiveCTE(cteName string, subquery sqlparser.TableStat
 		recursiveParts = []sqlparser.TableStatement{topUnion.Right}
 	}
 
+	// Validate recursive parts for ER_CTE_RECURSIVE_FORBIDDEN_JOIN_ORDER (3200):
+	// MySQL requires that the recursive table reference appear first in the join order.
+	// If the CTE name appears on the RIGHT side of a STRAIGHT_JOIN or a LEFT/RIGHT outer join,
+	// the optimizer cannot reorder it to be the driving table, which is an error.
+	for _, rp := range recursiveParts {
+		if sel, ok := rp.(*sqlparser.Select); ok {
+			if recursiveCTEHasForbiddenJoinOrder(sel, cteName) {
+				return nil, mysqlError(3200, "HY000",
+					fmt.Sprintf("In recursive query block of Recursive Common Table Expression '%s', the recursive table must be referenced only once, and not in any subquery", cteName))
+			}
+		}
+	}
+
+	// Extract max string lengths from CAST(... AS CHAR(n)) in anchor to enforce ER_DATA_TOO_LONG.
+	anchorColMaxLengths := extractAnchorColMaxLengths(anchorParts)
+
 	// Execute all anchor parts and combine their results.
 	var anchorResult *Result
 	for i, part := range anchorParts {
@@ -5531,7 +5847,11 @@ func (e *Executor) execRecursiveCTE(cteName string, subquery sqlparser.TableStat
 	}
 
 	// Iteratively execute all recursive parts.
-	for depth := int64(0); depth < maxDepth; depth++ {
+	// depth tracks how many recursive iterations have been completed.
+	// When depth reaches maxDepth and rows are still being produced, MySQL raises
+	// ER_CTE_MAX_RECURSION_DEPTH (3636) to prevent infinite loops.
+	var depth int64
+	for ; depth < maxDepth; depth++ {
 		var newRows [][]interface{}
 		for _, recursivePart := range recursiveParts {
 			recursiveResult, err := e.execTableStmtForUnion(recursivePart)
@@ -5548,6 +5868,31 @@ func (e *Executor) execRecursiveCTE(cteName string, subquery sqlparser.TableStat
 		}
 		if len(newRows) == 0 {
 			break
+		}
+
+		// Enforce column max string lengths derived from CAST(... AS CHAR(n)) in the anchor.
+		// MySQL raises ER_DATA_TOO_LONG (1406) in strict mode when a recursive iteration
+		// produces a value longer than the column's declared width.
+		if len(anchorColMaxLengths) > 0 {
+			for _, row := range newRows {
+				for ci, maxLen := range anchorColMaxLengths {
+					if maxLen < 0 || ci >= len(row) {
+						continue
+					}
+					var strVal string
+					switch v := row[ci].(type) {
+					case string:
+						strVal = v
+					case []byte:
+						strVal = string(v)
+					default:
+						continue
+					}
+					if int64(len([]rune(strVal))) > maxLen {
+						return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row %d", columns[ci], depth+1))
+					}
+				}
+			}
 		}
 
 		// For UNION DISTINCT, filter out rows already seen.
@@ -5581,6 +5926,14 @@ func (e *Executor) execRecursiveCTE(cteName string, subquery sqlparser.TableStat
 			columns: columns,
 			rows:    rowsToStorageRows(columns, newRows),
 		}
+	}
+
+	// MySQL raises ER_CTE_MAX_RECURSION_DEPTH (3636) when cte_max_recursion_depth
+	// iterations are exhausted without the recursion terminating on its own.
+	// We detect this by checking whether the loop completed all maxDepth iterations
+	// AND the last working table was non-empty (i.e., recursion did not terminate).
+	if depth == maxDepth && len(cteMap[cteName].rows) > 0 {
+		return nil, mysqlError(3636, "HY000", fmt.Sprintf("Recursive query aborted after %d iterations. Try increasing @@cte_max_recursion_depth to a larger value.", maxDepth))
 	}
 
 	return &Result{
