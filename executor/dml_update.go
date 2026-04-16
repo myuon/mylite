@@ -973,10 +973,12 @@ func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error)
 	var affected uint64
 
 	// Pre-resolve each SET expression's target table so we can group by table.
+	// aliasToReal maps alias -> real table name (built earlier in this function).
 	type resolvedUpd struct {
 		colName     string
 		targetDB    string
-		targetTable string
+		targetTable string // real table name (after alias resolution)
+		targetAlias string // original qualifier from SET clause (may be alias)
 		upd         *sqlparser.UpdateExpr
 	}
 	resolvedUpds := make([]resolvedUpd, 0, len(stmt.Exprs))
@@ -986,14 +988,25 @@ func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error)
 		qualStr := sqlparser.String(upd.Name.Qualifier)
 		qualStr = strings.Trim(qualStr, "`")
 
-		var targetDB, targetTable string
+		var targetDB, targetTable, targetAlias string
 		if strings.Contains(qualStr, ".") {
 			parts := strings.SplitN(qualStr, ".", 2)
 			targetDB = parts[0]
 			targetTable = parts[1]
+			targetAlias = parts[1]
+			// Resolve alias to real table name
+			if real, ok := aliasToReal[strings.ToLower(targetTable)]; ok {
+				targetTable = real
+			}
 		} else if qualStr != "" {
-			targetTable = qualStr
+			targetAlias = qualStr
 			targetDB = e.CurrentDB
+			// Resolve alias to real table name
+			if real, ok := aliasToReal[strings.ToLower(qualStr)]; ok {
+				targetTable = real
+			} else {
+				targetTable = qualStr
+			}
 		} else {
 			targetDB = e.CurrentDB
 			targetTable = ""
@@ -1001,19 +1014,25 @@ func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error)
 				resolved := resolveColumnTable(te, colName, e)
 				if resolved != "" {
 					targetTable = resolved
+					// Resolve alias to real table if needed
+					if real, ok := aliasToReal[strings.ToLower(resolved)]; ok {
+						targetAlias = resolved
+						targetTable = real
+					} else {
+						targetAlias = resolved
+					}
 					break
 				}
 			}
 		}
-		resolvedUpds = append(resolvedUpds, resolvedUpd{colName, targetDB, targetTable, upd})
+		resolvedUpds = append(resolvedUpds, resolvedUpd{colName, targetDB, targetTable, targetAlias, upd})
 	}
 
 nextRow:
 	for _, mrow := range matchedRows {
-		// Group SET expressions by target table key (db.table) and apply all
-		// columns for the same table together so that matchRowToTableLenient
-		// is called only once per table before any storage modifications.
-		type tableKey struct{ db, table string }
+		// Group SET expressions by (db, realTable, alias) so that multiple aliases
+		// to the same physical table are processed independently.
+		type tableKey struct{ db, table, alias string }
 		type pendingCol struct {
 			colName string
 			upd     *sqlparser.UpdateExpr
@@ -1021,7 +1040,7 @@ nextRow:
 		tableOrder := make([]tableKey, 0, 4)
 		tableGroups := make(map[tableKey][]pendingCol)
 		for _, ru := range resolvedUpds {
-			tk := tableKey{ru.targetDB, ru.targetTable}
+			tk := tableKey{ru.targetDB, ru.targetTable, ru.targetAlias}
 			if _, exists := tableGroups[tk]; !exists {
 				tableOrder = append(tableOrder, tk)
 			}
@@ -1036,9 +1055,14 @@ nextRow:
 				continue
 			}
 
-			targetAlias := tk.table
-			if tk.db != e.CurrentDB {
-				targetAlias = tk.db + "." + tk.table
+			// Use the original alias (qualifier) for row matching so we can find
+			// the correct columns when the same table appears under multiple aliases.
+			targetAlias := tk.alias
+			if targetAlias == "" {
+				targetAlias = tk.table
+				if tk.db != e.CurrentDB {
+					targetAlias = tk.db + "." + tk.table
+				}
 			}
 
 			tbl.Lock()

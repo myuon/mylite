@@ -52,6 +52,21 @@ func (e *Executor) collectTableDefsWithAliases(expr sqlparser.TableExpr) ([]*cat
 					}
 				}
 			}
+			// Check CTE map: synthesize a TableDef from CTE column metadata.
+			if e.cteMap != nil {
+				cteLookup := tblName
+				if cte, ok := e.cteMap[cteLookup]; ok && len(cte.columns) > 0 {
+					syntheticCols := make([]catalog.ColumnDef, len(cte.columns))
+					for i, col := range cte.columns {
+						syntheticCols[i] = catalog.ColumnDef{Name: col}
+					}
+					td := &catalog.TableDef{
+						Name:    tblName,
+						Columns: syntheticCols,
+					}
+					return []*catalog.TableDef{td}, []string{alias}
+				}
+			}
 		}
 	case *sqlparser.JoinTableExpr:
 		leftDefs, leftAliases := e.collectTableDefsWithAliases(te.LeftExpr)
@@ -2019,11 +2034,11 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				return nil, err
 			}
 			var crossed []storage.Row
-			// MySQL cross-join ordering: the rightmost table is the outer loop
-			// and the accumulated left rows are the inner loop. This matches
-			// MySQL behaviour for "FROM t1, t2" (t2 is outer, t1 is inner).
-			for _, rightRow := range rightRows {
-				for _, leftRow := range allRows {
+			// MySQL cross-join ordering: the leftmost (accumulated) table is the outer loop
+			// and the new right table is the inner loop. This matches MySQL's nested-loop
+			// execution for "FROM t1, t2" (t1 is outer, t2 is inner).
+			for _, leftRow := range allRows {
+				for _, rightRow := range rightRows {
 					if len(crossed) >= maxCrossProductRows {
 						break
 					}

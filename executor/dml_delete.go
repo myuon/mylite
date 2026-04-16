@@ -1115,6 +1115,54 @@ func matchRowToTable(matchedRow storage.Row, tbl *storage.Table, alias, tableNam
 // skips columns not found in matchedRow, and requires at least one column to match.
 // This preserves the original multi-table UPDATE matching behavior.
 func matchRowToTableLenient(matchedRow storage.Row, tbl *storage.Table, alias, tableName string) int {
+	// When the table has a primary key, match by PK columns only.
+	// This is more robust when other columns may have been modified in a
+	// previous step (e.g., multi-alias self-join updates).
+	pkCols := tbl.Def.PrimaryKey
+	if len(pkCols) == 0 {
+		for _, col := range tbl.Def.Columns {
+			if col.PrimaryKey {
+				pkCols = append(pkCols, col.Name)
+			}
+		}
+	}
+	if len(pkCols) > 0 {
+		// Build PK values from the matched (snapshot) row using the alias prefix.
+		pkVals := make(map[string]string, len(pkCols))
+		allPKFound := true
+		for _, pk := range pkCols {
+			qualKey := alias + "." + pk
+			mv, ok := matchedRow[qualKey]
+			if !ok {
+				mv, ok = matchedRow[tableName+"."+pk]
+			}
+			if !ok {
+				mv, ok = matchedRow[pk]
+			}
+			if !ok {
+				allPKFound = false
+				break
+			}
+			pkVals[pk] = fmt.Sprintf("%v", mv)
+		}
+		if allPKFound {
+			for i, existingRow := range tbl.Rows {
+				match := true
+				for _, pk := range pkCols {
+					if fmt.Sprintf("%v", existingRow[pk]) != pkVals[pk] {
+						match = false
+						break
+					}
+				}
+				if match {
+					return i
+				}
+			}
+			return -1
+		}
+	}
+
+	// Fallback: full-row match using alias-qualified keys.
 	for i, existingRow := range tbl.Rows {
 		isMatch := true
 		matchedCols := 0

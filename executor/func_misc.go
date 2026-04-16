@@ -461,40 +461,37 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if isNull {
 			return nil, true, nil
 		}
-		iaParts := strings.Split(toString(iaVal), ".")
+		iaStr := toString(iaVal)
+		iaParts := strings.Split(iaStr, ".")
 		if len(iaParts) < 1 || len(iaParts) > 4 {
+			e.addWarning("Warning", 1411, fmt.Sprintf("Incorrect string value: ''%s'' for function inet_aton", iaStr))
 			return nil, true, nil
 		}
-		// MySQL short notation rules:
-		// 1 part:  a       -> last part fills 4 octets (0-4294967295)
-		// 2 parts: a.b     -> a fills 1 octet; b fills 3 octets (0-16777215)
-		// 3 parts: a.b.c   -> a,b fill 1 octet each; c fills 2 octets (0-65535)
-		// 4 parts: a.b.c.d -> each fills 1 octet (0-255)
-		var iaResult uint64
+		// MySQL short notation: all components must be 0-255.
+		// 1 part:  a       -> 0.0.0.a (a in last octet)
+		// 2 parts: a.b     -> a.0.0.b (b in last octet)
+		// 3 parts: a.b.c   -> a.b.0.c (c in last octet)
+		// 4 parts: a.b.c.d -> standard
+		var iaOctets [4]uint64
 		n := len(iaParts)
-		// Number of octets the last part fills: 5-n (e.g. n=1 -> 4, n=2 -> 3, n=3 -> 2, n=4 -> 1)
-		lastOctets := uint(5 - n)
-		for i, iaP := range iaParts {
-			iaN, err := strconv.ParseUint(iaP, 10, 64)
-			if err != nil {
+		for _, iaP := range iaParts {
+			iaN, perr := strconv.ParseUint(iaP, 10, 64)
+			if perr != nil || iaN > 255 {
+				e.addWarning("Warning", 1411, fmt.Sprintf("Incorrect string value: ''%s'' for function inet_aton", iaStr))
 				return nil, true, nil
 			}
-			if i < n-1 {
-				// Non-last parts must be 0-255
-				if iaN > 255 {
-					return nil, true, nil
-				}
-				iaResult = (iaResult << 8) | iaN
-			} else {
-				// Last part fills lastOctets octets
-				maxVal := uint64(1)<<(lastOctets*8) - 1
-				if iaN > maxVal {
-					return nil, true, nil
-				}
-				iaResult = (iaResult << (lastOctets * 8)) | iaN
-			}
+			_ = iaN
 		}
+		// Place non-last components in leading octets, last component in last octet
+		for i := 0; i < n-1; i++ {
+			iaN, _ := strconv.ParseUint(iaParts[i], 10, 64)
+			iaOctets[i] = iaN
+		}
+		lastN, _ := strconv.ParseUint(iaParts[n-1], 10, 64)
+		iaOctets[3] = lastN
+		iaResult := (iaOctets[0] << 24) | (iaOctets[1] << 16) | (iaOctets[2] << 8) | iaOctets[3]
 		if iaResult > 0xFFFFFFFF {
+			e.addWarning("Warning", 1411, fmt.Sprintf("Incorrect string value: ''%s'' for function inet_aton", iaStr))
 			return nil, true, nil
 		}
 		return int64(iaResult), true, nil
@@ -947,11 +944,23 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 			return nil, true, err
 		}
 		if isNull {
-			return int64(0), true, nil
+			return nil, true, nil
 		}
 		iuStr := toString(iuVal)
+		// Support standard format: 8-4-4-4-12 hex digits
 		iuRe := regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 		if iuRe.MatchString(iuStr) {
+			return int64(1), true, nil
+		}
+		// Support braced format: {8-4-4-4-12}
+		if len(iuStr) >= 2 && iuStr[0] == '{' && iuStr[len(iuStr)-1] == '}' {
+			if iuRe.MatchString(iuStr[1 : len(iuStr)-1]) {
+				return int64(1), true, nil
+			}
+		}
+		// Support 32-char hex (no dashes)
+		iuRe32 := regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+		if iuRe32.MatchString(iuStr) {
 			return int64(1), true, nil
 		}
 		return int64(0), true, nil

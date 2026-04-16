@@ -207,6 +207,61 @@ func binaryShiftRight(b []byte, n uint64) string {
 	return string(result)
 }
 
+// toDateTimeStringAsFloat converts a DATE/DATETIME/TIME string to a float value
+// using MySQL's numeric conversion rules (e.g., "2015-10-24 12:00:00" → 20151024120000).
+// Returns 0 if the string is not a recognized date/time format.
+// Does NOT handle binary byte strings (unlike toFloat).
+func toDateTimeStringAsFloat(s string) float64 {
+	// TIME format: HH:MM:SS
+	if strings.Count(s, ":") == 2 {
+		sign := 1.0
+		main := s
+		if strings.HasPrefix(s, "-") {
+			sign = -1.0
+			main = s[1:]
+		}
+		fracPart := ""
+		if dot := strings.IndexByte(main, '.'); dot >= 0 {
+			fracPart = main[dot+1:]
+			main = main[:dot]
+		}
+		tparts := strings.Split(main, ":")
+		if len(tparts) == 3 {
+			h, eh := strconv.Atoi(tparts[0])
+			m, em := strconv.Atoi(tparts[1])
+			sec, es := strconv.Atoi(tparts[2])
+			if eh == nil && em == nil && es == nil {
+				base := float64(h*10000 + m*100 + sec)
+				if fracPart != "" {
+					if fracDigits, err := strconv.ParseFloat("0."+fracPart, 64); err == nil {
+						base += fracDigits
+					}
+				}
+				return sign * base
+			}
+		}
+	}
+	// DATE/DATETIME format: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS
+	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
+		y, ey := strconv.Atoi(s[0:4])
+		mo, em := strconv.Atoi(s[5:7])
+		d, ed := strconv.Atoi(s[8:10])
+		if ey == nil && em == nil && ed == nil {
+			base := float64(y*10000 + mo*100 + d)
+			if len(s) >= 19 && s[10] == ' ' && s[13] == ':' && s[16] == ':' {
+				h, eh := strconv.Atoi(s[11:13])
+				mi, emi := strconv.Atoi(s[14:16])
+				se, es := strconv.Atoi(s[17:19])
+				if eh == nil && emi == nil && es == nil {
+					base = float64((y*10000+mo*100+d)*1000000 + h*10000 + mi*100 + se)
+				}
+			}
+			return base
+		}
+	}
+	return 0
+}
+
 // toUint64ForBitOp converts a value to uint64 for bitwise operations,
 // preserving the full uint64 range without float precision loss.
 func toUint64ForBitOp(v interface{}) uint64 {
@@ -226,14 +281,27 @@ func toUint64ForBitOp(v interface{}) uint64 {
 		}
 		return val
 	case string:
+		s := strings.TrimSpace(n)
 		// Try uint64 first, then int64, then float
-		if u, err := strconv.ParseUint(strings.TrimSpace(n), 10, 64); err == nil {
+		if u, err := strconv.ParseUint(s, 10, 64); err == nil {
 			return u
 		}
-		if i, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64); err == nil {
+		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
 			return uint64(i)
 		}
-		if f, err := strconv.ParseFloat(strings.TrimSpace(n), 64); err == nil {
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			if f < 0 {
+				return uint64(int64(f))
+			}
+			if f >= float64(math.MaxUint64) {
+				return math.MaxUint64
+			}
+			return uint64(f)
+		}
+		// Handle DATE/DATETIME string formats (e.g., "2015-10-24 12:00:00" → 20151024120000).
+		// Only for printable ASCII strings that look like date/time formats.
+		f := toDateTimeStringAsFloat(s)
+		if f != 0 {
 			if f < 0 {
 				return uint64(int64(f))
 			}
