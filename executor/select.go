@@ -5678,6 +5678,44 @@ func recursiveCTEHasForbiddenJoinOrder(sel *sqlparser.Select, cteName string) bo
 	return false
 }
 
+// recursiveCTEHasAggregationOrWindow returns true if the SELECT contains aggregate
+// functions (e.g. MAX, SUM, COUNT) or window functions (e.g. RANK() OVER ...) in
+// the SELECT list or WHERE/HAVING clauses. MySQL forbids these in recursive query blocks.
+func recursiveCTEHasAggregationOrWindow(sel *sqlparser.Select) bool {
+	if sel == nil {
+		return false
+	}
+	// Check GROUP BY / HAVING (these imply aggregation).
+	if sel.GroupBy != nil && len(sel.GroupBy.Exprs) > 0 {
+		return true
+	}
+	if sel.Having != nil {
+		return true
+	}
+	// Check SELECT expressions for aggregate or window function calls.
+	// Use the existing selectExprsHaveWindowFuncs helper and check aggregates manually.
+	if selectExprsHaveWindowFuncs(sel.SelectExprs.Exprs) {
+		return true
+	}
+	// Check for aggregate functions in SELECT list.
+	found := false
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		switch node.(type) {
+		case *sqlparser.GroupConcatExpr:
+			found = true
+			return false, nil
+		case *sqlparser.CountStar, *sqlparser.Count, *sqlparser.Sum, *sqlparser.Avg,
+			*sqlparser.Max, *sqlparser.Min, *sqlparser.Variance, *sqlparser.VarPop,
+			*sqlparser.VarSamp, *sqlparser.Std, *sqlparser.StdDev, *sqlparser.StdPop,
+			*sqlparser.StdSamp, *sqlparser.BitAnd, *sqlparser.BitOr, *sqlparser.BitXor:
+			found = true
+			return false, nil
+		}
+		return true, nil
+	}, sel.SelectExprs)
+	return found
+}
+
 // hasForbiddenCTEPosition returns true if the CTE name appears on the RIGHT side
 // of a STRAIGHT_JOIN or a LEFT/RIGHT outer join anywhere in the table expression tree.
 func hasForbiddenCTEPosition(te sqlparser.TableExpr, cteLower string) bool {
@@ -5767,9 +5805,15 @@ func (e *Executor) execRecursiveCTE(cteName string, subquery sqlparser.TableStat
 	}
 
 	// For a recursive CTE, the subquery must be a UNION (anchor UNION ALL recursive).
-	// If it's not a union, just execute non-recursively.
+	// If it's not a union, MySQL errors: ER_CTE_RECURSIVE_REQUIRES_UNION (3172).
 	topUnion, isUnion := subquery.(*sqlparser.Union)
 	if !isUnion {
+		// Check if the non-union query references the CTE itself.
+		if cteRefersToName(subquery, cteName) {
+			return nil, mysqlError(3172, "HY000",
+				fmt.Sprintf("Recursive Common Table Expression '%s' should contain a UNION", cteName))
+		}
+		// Non-recursive use of WITH RECURSIVE with a single SELECT — just execute it.
 		result, err := e.execTableStmtForUnion(subquery)
 		if err != nil {
 			return nil, err
@@ -5800,10 +5844,33 @@ func (e *Executor) execRecursiveCTE(cteName string, subquery sqlparser.TableStat
 		}
 	}
 
-	// If no anchor parts found, fall back to executing Left as anchor.
+	// If no anchor parts found, it means ALL parts reference the CTE (no non-recursive member).
+	// MySQL errors: ER_CTE_RECURSIVE_REQUIRES_NONRECURSIVE_FIRST (3173).
 	if len(anchorParts) == 0 {
-		anchorParts = []sqlparser.TableStatement{topUnion.Left}
-		recursiveParts = []sqlparser.TableStatement{topUnion.Right}
+		return nil, mysqlError(3173, "HY000",
+			fmt.Sprintf("Recursive Common Table Expression '%s' should have one or more non-recursive query blocks followed by one or more recursive ones", cteName))
+	}
+
+	// Validate ordering: all anchor parts must appear BEFORE all recursive parts.
+	// If a recursive part appears before a non-recursive part in the flattened union list,
+	// MySQL errors: ER_CTE_RECURSIVE_REQUIRES_NONRECURSIVE_FIRST (3173).
+	// Find the last index of an anchor part and first index of a recursive part.
+	lastAnchorIdx := -1
+	firstRecursiveIdx := len(allParts)
+	for i, part := range allParts {
+		if cteRefersToName(part, cteName) {
+			if i < firstRecursiveIdx {
+				firstRecursiveIdx = i
+			}
+		} else {
+			if i > lastAnchorIdx {
+				lastAnchorIdx = i
+			}
+		}
+	}
+	if firstRecursiveIdx < lastAnchorIdx {
+		return nil, mysqlError(3173, "HY000",
+			fmt.Sprintf("Recursive Common Table Expression '%s' should have one or more non-recursive query blocks followed by one or more recursive ones", cteName))
 	}
 
 	// Validate recursive parts for ER_CTE_RECURSIVE_FORBIDDEN_JOIN_ORDER (3200):
@@ -5815,6 +5882,12 @@ func (e *Executor) execRecursiveCTE(cteName string, subquery sqlparser.TableStat
 			if recursiveCTEHasForbiddenJoinOrder(sel, cteName) {
 				return nil, mysqlError(3200, "HY000",
 					fmt.Sprintf("In recursive query block of Recursive Common Table Expression '%s', the recursive table must be referenced only once, and not in any subquery", cteName))
+			}
+			// Validate: recursive part cannot contain aggregation or window functions.
+			// ER_CTE_RECURSIVE_FORBIDS_AGGREGATION (3176).
+			if recursiveCTEHasAggregationOrWindow(sel) {
+				return nil, mysqlError(3176, "HY000",
+					fmt.Sprintf("Recursive Common Table Expression '%s' can contain neither aggregation nor window functions in recursive query block", cteName))
 			}
 		}
 	}

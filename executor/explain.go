@@ -1024,6 +1024,14 @@ func (e *Executor) queryCanBeSemijoinFlattened(sel *sqlparser.Select) bool {
 		return false
 	}
 
+	// NO_SEMIJOIN hint in the outer query's comments (e.g. /*+ NO_SEMIJOIN(@subq) */) prevents
+	// semijoin flattening even when the hint references a named query block (@subq).
+	for _, c := range sel.Comments.GetComments() {
+		if strings.Contains(strings.ToUpper(c), "NO_SEMIJOIN") {
+			return false
+		}
+	}
+
 	// The outer query must have at least one real table or derived table (not just DUAL).
 	// If there are no real tables or derived tables, MySQL cannot form an anti-join and keeps
 	// the subquery as a separate PRIMARY+SUBQUERY pair.
