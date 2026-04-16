@@ -1951,6 +1951,11 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 				}
 			}
 		}
+		// FLUSH PRIVILEGES: reload grant store from mysql.db and mysql.tables_priv
+		if (upper == "FLUSH PRIVILEGES" || upper == "FLUSH PRIVILEGES;" ||
+			strings.HasPrefix(upper, "FLUSH PRIVILEGES ")) && e.grantStore != nil {
+			e.reloadGrantStoreFromStorage()
+		}
 		if strings.HasPrefix(upper, "CREATE EVENT") ||
 			strings.HasPrefix(upper, "DROP EVENT") ||
 			strings.HasPrefix(upper, "CREATE USER") ||
@@ -2538,6 +2543,14 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 					if eng != "" && eng != "innodb" {
 						return nil, mysqlError(1031, "HY000", fmt.Sprintf("Table storage engine for '%s' doesn't have this option", tblName))
 					}
+				}
+			}
+		}
+		// FLUSH PRIVILEGES: reload grant store from mysql.db and mysql.tables_priv
+		for _, opt := range s.FlushOptions {
+			if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(opt)), "PRIVILEGES") {
+				if e.grantStore != nil {
+					e.reloadGrantStoreFromStorage()
 				}
 			}
 		}
@@ -5451,6 +5464,84 @@ func decodeBacktickedIdentifiers(query string, charset string) string {
 		i++
 	}
 	return result.String()
+}
+
+// reloadGrantStoreFromStorage reloads the grant store from mysql.db and mysql.tables_priv.
+// Called on FLUSH PRIVILEGES. Clears existing entries and rebuilds from storage.
+func (e *Executor) reloadGrantStoreFromStorage() {
+	if e.grantStore == nil || e.Storage == nil {
+		return
+	}
+	// Clear all privilege entries (keep role registrations and role memberships)
+	e.grantStore.mu.Lock()
+	e.grantStore.entries = make(map[string][]GrantEntry)
+	// Also clear privilege grants from roles (but keep role registrations)
+	for k := range e.grantStore.roles {
+		e.grantStore.roles[k] = []GrantEntry{}
+	}
+	e.grantStore.mu.Unlock()
+
+	// Reload from mysql.db
+	dbTbl, err := e.Storage.GetTable("mysql", "db")
+	if err == nil {
+		dbTbl.Mu.RLock()
+		for _, row := range dbTbl.Rows {
+			user := toString(row["User"])
+			host := toString(row["Host"])
+			db := toString(row["Db"])
+			if user == "" {
+				continue
+			}
+			// Collect privileges
+			var privs []string
+			privMap := map[string]string{
+				"SELECT": "Select_priv", "INSERT": "Insert_priv", "UPDATE": "Update_priv",
+				"DELETE": "Delete_priv", "CREATE": "Create_priv", "DROP": "Drop_priv",
+				"REFERENCES": "References_priv", "INDEX": "Index_priv", "ALTER": "Alter_priv",
+				"CREATE TEMPORARY TABLES": "Create_tmp_table_priv", "LOCK TABLES": "Lock_tables_priv",
+				"CREATE VIEW": "Create_view_priv", "SHOW VIEW": "Show_view_priv",
+				"CREATE ROUTINE": "Create_routine_priv", "ALTER ROUTINE": "Alter_routine_priv",
+				"EXECUTE": "Execute_priv", "EVENT": "Event_priv", "TRIGGER": "Trigger_priv",
+			}
+			allY := true
+			for priv, col := range privMap {
+				if toString(row[col]) == "Y" {
+					privs = append(privs, priv)
+				} else {
+					allY = false
+				}
+			}
+			if allY {
+				privs = []string{"ALL PRIVILEGES"}
+			}
+			if len(privs) == 0 {
+				continue
+			}
+			grantOption := toString(row["Grant_priv"]) == "Y"
+			object := strings.ToLower(db) + ".*"
+			e.grantStore.AddPrivGrant(user, host, strings.Join(privs, ","), object, grantOption)
+		}
+		dbTbl.Mu.RUnlock()
+	}
+
+	// Reload from mysql.tables_priv
+	tblPriv, err := e.Storage.GetTable("mysql", "tables_priv")
+	if err == nil {
+		tblPriv.Mu.RLock()
+		for _, row := range tblPriv.Rows {
+			user := toString(row["User"])
+			host := toString(row["Host"])
+			db := toString(row["Db"])
+			tableName := toString(row["Table_name"])
+			tablePrivStr := toString(row["Table_priv"])
+			if user == "" || tablePrivStr == "" {
+				continue
+			}
+			object := strings.ToLower(db) + "." + strings.ToLower(tableName)
+			e.grantStore.AddPrivGrant(user, host, tablePrivStr, object, false)
+		}
+		tblPriv.Mu.RUnlock()
+	}
 }
 
 // syncGrantToMysqlTables inserts/updates rows in mysql.db or mysql.tables_priv
