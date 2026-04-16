@@ -211,8 +211,16 @@ func (t *TxnActiveSet) TrackInsert(connID int64, dbTable string, rowPtr int) {
 
 // cteTable holds pre-computed rows for a Common Table Expression.
 type cteTable struct {
-	columns []string
-	rows    []storage.Row
+	columns  []string
+	rows     []storage.Row
+	// colEqPairs stores column equality pairs extracted from the CTE's WHERE clause
+	// (e.g., WHERE a=b → [["a","b"]]). Used for functional dependency analysis in
+	// GROUP BY validation of outer queries.
+	colEqPairs [][2]string
+	// groupByKey is the set of columns that form a unique key for the CTE result
+	// (e.g., from GROUP BY in the CTE subquery). Any outer GROUP BY on these columns
+	// functionally determines all other CTE columns.
+	groupByKey []string
 }
 
 // EnumValue wraps a string value from an ENUM column so that compareValues

@@ -1311,16 +1311,25 @@ func (e *Executor) hashJoinRows(leftRows, rightRows []storage.Row, equiPairs []e
 	}
 
 	// Build phase: create hash map keyed by tuple of build-key values.
+	// Rows with any NULL key part are skipped (NULL != NULL in SQL).
 	type hashKey = string
 	hashMap := make(map[hashKey][]storage.Row, len(rightRows))
 	for _, rightRow := range rightRows {
 		var keyParts []interface{}
+		hasNull := false
 		for _, ep := range equiPairs {
 			v, err := e.evalRowExpr(ep.right, rightRow)
 			if err != nil {
 				return nil, err
 			}
+			if v == nil {
+				hasNull = true
+				break
+			}
 			keyParts = append(keyParts, v)
+		}
+		if hasNull {
+			continue // NULL keys can never match (NULL != NULL in SQL)
 		}
 		key := hashKey(fmt.Sprintf("%v", keyParts))
 		hashMap[key] = append(hashMap[key], rightRow)
@@ -1330,12 +1339,20 @@ func (e *Executor) hashJoinRows(leftRows, rightRows []storage.Row, equiPairs []e
 	var result []storage.Row
 	for _, leftRow := range leftRows {
 		var keyParts []interface{}
+		hasNull := false
 		for _, ep := range equiPairs {
 			v, err := e.evalRowExpr(ep.left, leftRow)
 			if err != nil {
 				return nil, err
 			}
+			if v == nil {
+				hasNull = true
+				break
+			}
 			keyParts = append(keyParts, v)
+		}
+		if hasNull {
+			continue // NULL keys can never match
 		}
 		key := hashKey(fmt.Sprintf("%v", keyParts))
 		matchingRights, ok := hashMap[key]
@@ -1784,9 +1801,49 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				r["__column_order__"] = colOrder
 				cteRows[i] = r
 			}
+			// Extract column equality pairs and GROUP BY key from the CTE for FD analysis.
+			var cteColEqPairs [][2]string
+			var cteGroupByKey []string
+			if subSel, ok := cte.Subquery.(*sqlparser.Select); ok {
+				if subSel.Where != nil {
+					collectColumnEqualities(subSel.Where.Expr, &cteColEqPairs)
+				}
+				// Capture GROUP BY columns as a unique key for the CTE result.
+				if subSel.GroupBy != nil {
+					for _, gbExpr := range subSel.GroupBy.Exprs {
+						if col, ok2 := gbExpr.(*sqlparser.ColName); ok2 {
+							cteGroupByKey = append(cteGroupByKey, strings.ToLower(col.Name.String()))
+						}
+					}
+				}
+				// Remap column names using CTE column aliases if present.
+				if len(cte.Columns) > 0 {
+					origToAlias := make(map[string]string)
+					for ci, ca := range cte.Columns {
+						if ci < len(subResult.Columns) {
+							origToAlias[strings.ToLower(subResult.Columns[ci])] = strings.ToLower(ca.String())
+						}
+					}
+					for i := range cteColEqPairs {
+						if alias, ok2 := origToAlias[cteColEqPairs[i][0]]; ok2 {
+							cteColEqPairs[i][0] = alias
+						}
+						if alias, ok2 := origToAlias[cteColEqPairs[i][1]]; ok2 {
+							cteColEqPairs[i][1] = alias
+						}
+					}
+					for i := range cteGroupByKey {
+						if alias, ok2 := origToAlias[cteGroupByKey[i]]; ok2 {
+							cteGroupByKey[i] = alias
+						}
+					}
+				}
+			}
 			newCTEMap[cteName] = &cteTable{
-				columns: columns,
-				rows:    cteRows,
+				columns:    columns,
+				rows:       cteRows,
+				colEqPairs: cteColEqPairs,
+				groupByKey: cteGroupByKey,
 			}
 		}
 	}
@@ -3301,6 +3358,21 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 				}
 			}
 		}
+		// Collect column equality pairs from CTE definitions: when the outer query
+		// references a CTE whose WHERE clause has column equalities (e.g. WHERE a=b),
+		// those equalities propagate as functional dependencies to the outer query.
+		if e.cteMap != nil {
+			for _, tableExpr := range stmt.From {
+				if ate, ok := tableExpr.(*sqlparser.AliasedTableExpr); ok {
+					if tn, ok := ate.Expr.(sqlparser.TableName); ok {
+						tblName := tn.Name.String()
+						if cteTbl, ok := e.cteMap[tblName]; ok {
+							colEqPairs = append(colEqPairs, cteTbl.colEqPairs...)
+						}
+					}
+				}
+			}
+		}
 		// Expand groupByColSet: if col1 is in groupByColSet and col1=col2, add col2
 		changed := true
 		for changed {
@@ -3418,6 +3490,37 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 										tablesFullyDetermined[tblAlias] = true
 										break
 									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		// Check CTE tables: if the outer GROUP BY covers the CTE's groupByKey,
+		// all CTE columns are functionally dependent.
+		if e.cteMap != nil {
+			for _, te := range stmt.From {
+				if ate, ok := te.(*sqlparser.AliasedTableExpr); ok {
+					if tn, ok2 := ate.Expr.(sqlparser.TableName); ok2 {
+						tblName := strings.ToLower(tn.Name.String())
+						tblAlias := tblName
+						if !ate.As.IsEmpty() {
+							tblAlias = strings.ToLower(ate.As.String())
+						}
+						if cteTbl, ok3 := e.cteMap[tn.Name.String()]; ok3 {
+							// Check if outer GROUP BY covers all CTE GROUP BY key columns.
+							if len(cteTbl.groupByKey) > 0 {
+								allCovered := true
+								for _, gbk := range cteTbl.groupByKey {
+									if !groupByColSet[gbk] {
+										allCovered = false
+										break
+									}
+								}
+								if allCovered {
+									tablesFullyDetermined[tblName] = true
+									tablesFullyDetermined[tblAlias] = true
 								}
 							}
 						}
