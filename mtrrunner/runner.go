@@ -1561,10 +1561,10 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 	case "inc":
 		// Increment a variable: --inc $var
 		varName := strings.TrimSpace(args)
-		varName = strings.TrimRight(varName, ";")
+		varName = strings.TrimSpace(strings.TrimRight(varName, ";"))
 		if ctx.variables != nil {
 			if val, ok := ctx.variables[varName]; ok {
-				if n, err2 := strconv.Atoi(val); err2 == nil {
+				if n, err2 := strconv.Atoi(strings.TrimSpace(val)); err2 == nil {
 					ctx.variables[varName] = strconv.Itoa(n + 1)
 				}
 			}
@@ -1574,10 +1574,10 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 	case "dec":
 		// Decrement a variable: --dec $var
 		varName := strings.TrimSpace(args)
-		varName = strings.TrimRight(varName, ";")
+		varName = strings.TrimSpace(strings.TrimRight(varName, ";"))
 		if ctx.variables != nil {
 			if val, ok := ctx.variables[varName]; ok {
-				if n, err2 := strconv.Atoi(val); err2 == nil {
+				if n, err2 := strconv.Atoi(strings.TrimSpace(val)); err2 == nil {
 					ctx.variables[varName] = strconv.Itoa(n - 1)
 				}
 			}
@@ -3762,6 +3762,23 @@ func (ctx *execContext) sourceFile(filename string) error {
 		}
 		// Reset $restart_parameters to default after use.
 		ctx.variables["$restart_parameters"] = "restart"
+		return nil
+	}
+	// wait_until_disconnected.inc waits for the current connection to be
+	// dropped by the server.  In our single-node runner, disconnect() closes
+	// the named connection immediately so no actual waiting is needed.
+	// Executing the include as-is causes it to spin-sleep for up to 50 s
+	// because "show session status" always succeeds on the default connection
+	// (it never returns an error, so $mysql_errno stays 0 and the loop never
+	// terminates naturally).  Treat it as a no-op.
+	if baseName == "wait_until_disconnected.inc" {
+		return nil
+	}
+	// running_event_scheduler.inc waits for the event_scheduler daemon to
+	// appear in the processlist.  Our single-node runner does not run an
+	// event scheduler, so the wait loop would spin for up to 30 seconds.
+	// Treat it as a no-op.
+	if baseName == "running_event_scheduler.inc" {
 		return nil
 	}
 
