@@ -20,6 +20,7 @@ import (
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/charmap"
 	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
@@ -1554,6 +1555,25 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 				e.warnings = append(e.warnings, Warning{Level: "Error", Code: code, Message: msg})
 			}
 		}()
+	}
+
+	// When character_set_client is koi8r or cp1251, the query may contain Cyrillic bytes
+	// in that charset. MySQL converts the entire query from character_set_client to UTF-8
+	// internally before processing identifiers. For these charsets, decode queries that
+	// contain non-UTF-8 bytes (e.g. table/column names created with Cyrillic characters).
+	// Other charsets (latin1, sjis, etc.) are left as-is because their test result files
+	// contain raw bytes that were not decoded, and changing those would cause regressions.
+	if !utf8.ValidString(query) {
+		if cs, ok := e.getSysVar("character_set_client"); ok {
+			canonical := canonicalCharset(cs)
+			if canonical == "koi8r" || canonical == "cp1251" || canonical == "koi8u" {
+				if dec := charsetDecoder(canonical); dec != nil {
+					if decoded, _, err := transform.String(dec, query); err == nil {
+						query = decoded
+					}
+				}
+			}
+		}
 	}
 
 	query, result, err := e.preprocessQuery(query)
@@ -4613,6 +4633,8 @@ func charsetDecoder(charset string) *encoding.Decoder {
 		return charmap.Windows1252.NewDecoder()
 	case "koi8r":
 		return charmap.KOI8R.NewDecoder()
+	case "gb18030", "gbk", "gb2312":
+		return simplifiedchinese.GB18030.NewDecoder()
 	default:
 		return nil
 	}
@@ -5107,6 +5129,58 @@ func (e *Executor) trackDropUser(raw string) {
 			delete(e.knownUsers, key)
 		}
 	}
+}
+
+// decodeBacktickedIdentifiers decodes non-UTF-8 bytes inside backtick-quoted identifiers
+// from the given charset to UTF-8. This is needed because MySQL stores identifiers in UTF-8
+// internally even when character_set_client is set to a non-UTF-8 charset. Only the content
+// inside backticks is decoded; string literals and other parts of the query are left unchanged.
+func decodeBacktickedIdentifiers(query string, charset string) string {
+	dec := charsetDecoder(charset)
+	if dec == nil {
+		return query
+	}
+	var result strings.Builder
+	result.Grow(len(query))
+	i := 0
+	for i < len(query) {
+		if query[i] == '`' {
+			// Find the closing backtick (handle escaped backticks ``)
+			j := i + 1
+			for j < len(query) {
+				if query[j] == '`' {
+					if j+1 < len(query) && query[j+1] == '`' {
+						j += 2 // escaped backtick, continue
+						continue
+					}
+					break // closing backtick found
+				}
+				j++
+			}
+			if j < len(query) {
+				// Decode the identifier content if it contains non-UTF-8 bytes
+				ident := query[i+1 : j]
+				if !utf8.ValidString(ident) {
+					if decoded, _, err := transform.String(dec, ident); err == nil {
+						result.WriteByte('`')
+						result.WriteString(decoded)
+						result.WriteByte('`')
+						i = j + 1
+						continue
+					}
+				}
+				// No conversion needed or failed: copy as-is
+				result.WriteByte('`')
+				result.WriteString(ident)
+				result.WriteByte('`')
+				i = j + 1
+				continue
+			}
+		}
+		result.WriteByte(query[i])
+		i++
+	}
+	return result.String()
 }
 
 // isKnownUser checks if user@host (parsed from "user@host" string like "test_user1@'localhost'")

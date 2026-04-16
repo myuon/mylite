@@ -1609,13 +1609,23 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 									}
 								}
 							}
-							// SET: if the validated value differs from original,
-							// it means some members were invalid
+							// SET: if some members were dropped during validation,
+							// it means some members were invalid. Compare member counts
+							// rather than string equality to handle case-insensitive
+							// matches where the canonical form may differ from the input
+							// (e.g., "Ä" vs "ä" with non-UTF-8 charsets).
 							if isSetType && origStr != "" && sv != origStr {
-								if bool(stmt.Ignore) || !e.isStrictMode() {
-									e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
-								} else {
-									return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+								inputMembers := strings.Split(origStr, ",")
+								validMembers := strings.Split(sv, ",")
+								// A mismatch is only a truncation error if members were dropped
+								membersDropped := len(validMembers) < len(inputMembers) ||
+									(len(sv) == 0 && len(origStr) > 0)
+								if membersDropped {
+									if bool(stmt.Ignore) || !e.isStrictMode() {
+										e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+									} else {
+										return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+									}
 								}
 							}
 						} else if nv, ok := rv.(int64); ok {

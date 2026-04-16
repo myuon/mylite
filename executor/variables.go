@@ -157,6 +157,20 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				e.sessionScopeVars["character_set_connection"] = charset
 				e.sessionScopeVars["character_set_results"] = charset
 			}
+		case "charset":
+			// SET CHARACTER SET charset_name (or SET CHARSET charset_name)
+			// Sets character_set_client and character_set_results to charset_name.
+			// character_set_connection is set to the database default charset (not changed here).
+			charset := strings.ToLower(val)
+			if charset == "default" {
+				delete(e.sessionScopeVars, "character_set_client")
+				delete(e.sessionScopeVars, "character_set_results")
+			} else if charset != "binary" && !isKnownCharset(charset) {
+				return nil, mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", charset))
+			} else {
+				e.sessionScopeVars["character_set_client"] = charset
+				e.sessionScopeVars["character_set_results"] = charset
+			}
 		case "sql_mode":
 			if _, isNull := expr.Expr.(*sqlparser.NullVal); isNull {
 				return nil, mysqlError(1231, "42000", "Variable 'sql_mode' can't be set to the value of 'NULL'")

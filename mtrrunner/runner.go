@@ -25,6 +25,7 @@ import (
 
 	"golang.org/x/text/encoding/charmap"
 	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
 )
 
@@ -288,6 +289,11 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		if decoded, err := decodeEUCJP(expectedBytes); err == nil {
 			expectedBytes = decoded
 		}
+	} else if isGB18030Encoded(expectedBytes) {
+		// GB18030/GBK: decode result file to match the decoded test file
+		if decoded, err := decodeGB18030(expectedBytes); err == nil {
+			expectedBytes = decoded
+		}
 	} else if !isValidUTF8(expectedBytes) {
 		// If result file is not valid UTF-8 and test name contains encoding hints,
 		// try to decode based on the test name.
@@ -301,10 +307,11 @@ func (r *Runner) RunFile(testPath string) TestResult {
 				expectedBytes = decoded
 			}
 		} else {
-			// Try KOI8-R decoding if the test file sets names koi8r
+			// Try KOI8-R decoding if the test file sets names koi8r or character set koi8r
 			testFileContent := strings.Join(lines, "\n")
 			testFileLower := strings.ToLower(testFileContent)
-			if strings.Contains(testFileLower, "set names koi8r") || strings.Contains(testFileLower, "set names koi8-r") {
+			if strings.Contains(testFileLower, "set names koi8r") || strings.Contains(testFileLower, "set names koi8-r") ||
+				strings.Contains(testFileLower, "character set koi8r") || strings.Contains(testFileLower, "character_set koi8r") {
 				if decoded, err := decodeKOI8R(expectedBytes); err == nil {
 					expectedBytes = decoded
 				}
@@ -3860,6 +3867,13 @@ func readLines(path string) ([]string, error) {
 		if err == nil {
 			data = decoded
 		}
+	} else if isGB18030Encoded(data) {
+		// GB18030/GBK: second bytes can be 0x5C (backslash), which confuses SQL string
+		// tracking. Decode to UTF-8 before processing so the runner sees valid characters.
+		decoded, err := decodeGB18030(data)
+		if err == nil {
+			data = decoded
+		}
 	}
 
 	var lines []string
@@ -3911,6 +3925,31 @@ func decodeEUCJP(data []byte) ([]byte, error) {
 // decodeKOI8R converts KOI8-R encoded bytes to UTF-8.
 func decodeKOI8R(data []byte) ([]byte, error) {
 	reader := transform.NewReader(bytes.NewReader(data), charmap.KOI8R.NewDecoder())
+	return readAll(reader)
+}
+
+// isGB18030Encoded checks if the file content starts with a GB18030/GBK/GB2312 charset directive.
+// GB18030 second bytes can be 0x5C (backslash), which confuses SQL string parsing.
+func isGB18030Encoded(data []byte) bool {
+	header := data
+	if len(header) > 512 {
+		header = header[:512]
+	}
+	lower := bytes.ToLower(header)
+	return bytes.Contains(lower, []byte("character_set gb18030")) ||
+		bytes.Contains(lower, []byte("charset gb18030")) ||
+		bytes.Contains(lower, []byte("character_set gbk")) ||
+		bytes.Contains(lower, []byte("charset gbk")) ||
+		bytes.Contains(lower, []byte("character_set gb2312")) ||
+		bytes.Contains(lower, []byte("charset gb2312")) ||
+		bytes.Contains(lower, []byte("names gb18030")) ||
+		bytes.Contains(lower, []byte("names gbk")) ||
+		bytes.Contains(lower, []byte("names gb2312"))
+}
+
+// decodeGB18030 converts GB18030/GBK encoded bytes to UTF-8.
+func decodeGB18030(data []byte) ([]byte, error) {
+	reader := transform.NewReader(bytes.NewReader(data), simplifiedchinese.GB18030.NewDecoder())
 	return readAll(reader)
 }
 
