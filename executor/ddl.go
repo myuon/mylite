@@ -797,6 +797,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 					e.insideDML = true
 					selResult, selErr := e.Execute(selectSQL)
 					e.insideDML = prevInsideDML
+					// Release any row locks acquired by the inner SELECT (insideDML=true causes
+					// shared locks to be acquired; release them since CREATE TEMPORARY TABLE is not transactional).
+					if e.rowLockManager != nil && !e.inTransaction {
+						e.rowLockManager.ReleaseRowLocks(e.connectionID)
+					}
 					if selErr != nil {
 						return nil, selErr
 					}
@@ -5412,6 +5417,12 @@ func (e *Executor) execCreateTableSelect(targetDB, newTableName, selectSQL strin
 	e.insideDML = true
 	result, err := e.Execute(selectSQL)
 	e.insideDML = prevInsideDML
+	// Release any row locks acquired by the inner SELECT (insideDML=true causes shared
+	// locks to be acquired on source rows; those locks must not outlive this call since
+	// CREATE TABLE ... SELECT is not a transactional operation).
+	if e.rowLockManager != nil && !e.inTransaction {
+		e.rowLockManager.ReleaseRowLocks(e.connectionID)
+	}
 	if err != nil {
 		return nil, err
 	}
