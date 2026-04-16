@@ -3393,13 +3393,8 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 				colNames = append(colNames, colName.Name.String())
 			} else if lit, ok := se.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
 				// String literal in UNION context: MySQL uses the literal value (unquoted) as column name.
-				// For adjacent string literals like 'hello' 'monty', MySQL uses only the first literal
-				// as the column name. Check raw expression text for this pattern.
-				colName := lit.Val
-				if rawExprIdx < len(rawExprs) {
-					colName = extractFirstStringLiteralFromRaw(rawExprs[rawExprIdx], colName)
-				}
-				colNames = append(colNames, colName)
+				// We use the AST directly to avoid picking up the "UNION ..." suffix from rawExprs.
+				colNames = append(colNames, lit.Val)
 				rawExprIdx++
 				continue
 			} else if _, ok := se.Expr.(*sqlparser.IntervalDateExpr); ok {
@@ -5054,12 +5049,7 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 			} else if lit, ok := se.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
 				// String literal: use the value directly (unquoted), even if the raw expression
 				// includes "UNION ..." suffix (which happens when called from a UNION context).
-				// For adjacent string literals like 'hello' 'monty', MySQL uses only the first
-				// literal as the column name. Check raw expression text for this pattern.
 				name = lit.Val
-				if rawExprIdx < len(rawExprs) {
-					name = extractFirstStringLiteralFromRaw(rawExprs[rawExprIdx], name)
-				}
 			} else if colName, ok := se.Expr.(*sqlparser.ColName); ok {
 				name = colName.Name.String()
 				// Case-insensitive column name resolution: if the row has a

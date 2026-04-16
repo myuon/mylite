@@ -14,23 +14,6 @@ import (
 	"github.com/myuon/mylite/catalog"
 )
 
-// toDatetimeInt returns the integer representation of a numeric value (int64, float64, uint64)
-// and true. Returns 0, false for non-numeric types.
-func toDatetimeInt(v interface{}) (int64, bool) {
-	switch n := v.(type) {
-	case int64:
-		return n, true
-	case float64:
-		return int64(n), true
-	case uint64:
-		if n > math.MaxInt64 {
-			return math.MaxInt64, true
-		}
-		return int64(n), true
-	}
-	return 0, false
-}
-
 // coerceDateTimeValue truncates datetime values to match the column type.
 // For DATE columns, "2007-02-13 15:09:33" becomes "2007-02-13".
 // For TIME columns, "2007-02-13 15:09:33" becomes "15:09:33".
@@ -82,14 +65,8 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 			}
 			return "0000-00-00"
 		}
-		// MySQL allows colon as date delimiter in DATE context (e.g. "97:02:03" → 1997-02-03).
-		// Normalize YY:MM:DD or YYYY:MM:DD strings when coercing to DATE column specifically.
-		dateInput := s
-		if colonDateParsed := normalizeColonDate(s); colonDateParsed != "" {
-			dateInput = colonDateParsed
-		}
 		// Try parsing various MySQL DATE formats
-		parsed := parseMySQLDateValue(dateInput)
+		parsed := parseMySQLDateValue(s)
 		if parsed != "" {
 			return parsed
 		}
@@ -144,137 +121,16 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 		}
 		return s
 	case "DATETIME":
-		// For numeric integer values with 7, 9, 10, or 11 digits, MySQL uses integer arithmetic:
-		// date part = n / 1000000, time part = n % 1000000. This is different from
-		// string handling where MySQL right-pads to 12 digits.
-		// Note: 8 digits = YYYYMMDD, 12 = YYMMDDHHMMSS, 14 = YYYYMMDDHHMMSS are handled
-		// by parseMySQLDateValue directly, so we skip those cases.
-		if n, isInt := toDatetimeInt(v); isInt {
-			sLen := len(s) // length of string representation (no leading zeros for negatives)
-			if (sLen >= 7 && sLen <= 11) && sLen != 8 {
-				datePart := n / 1000000
-				timePart := n % 1000000
-				dateStr := fmt.Sprintf("%d", datePart)
-				parsedDate := parseMySQLDateValue(dateStr)
-				if parsedDate != "" {
-					h := int(timePart / 10000)
-					m := int((timePart / 100) % 100)
-					sec := int(timePart % 100)
-					if h > 23 || m > 59 || sec > 59 {
-						return "0000-00-00 00:00:00"
-					}
-					return fmt.Sprintf("%s %02d:%02d:%02d", parsedDate, h, m, sec)
-				}
-				return "0000-00-00 00:00:00"
-			}
-		}
-		// Handle ISO 8601 T-separator: "20030102T131415" or "2001-01-01T01:01:01"
-		// Replace T with space when it looks like a date/time separator.
-		datetimeInput := s
-		if tIdx := strings.IndexByte(s, 'T'); tIdx > 0 && tIdx < len(s)-1 {
-			// Only replace if the part before T looks like a date (all digits or has dashes)
-			// and the part after T looks like a time.
-			before := s[:tIdx]
-			after := s[tIdx+1:]
-			beforeHasDash := strings.Contains(before, "-")
-			beforeAllDigits := true
-			for _, c := range before {
-				if c < '0' || c > '9' {
-					beforeAllDigits = false
-					break
-				}
-			}
-			if beforeHasDash || beforeAllDigits {
-				datetimeInput = before + " " + after
-			}
-		}
-		// Strip trailing non-datetime text after a valid datetime+space (e.g. "2003-01-01 00:00:00 some trailer").
-		// MySQL accepts the datetime portion and ignores the trailer.
-		if spIdx := strings.Index(datetimeInput, " "); spIdx > 0 {
-			afterSpace := datetimeInput[spIdx+1:]
-			// If there's a second space after the time part (HH:MM:SS), strip from there.
-			if sp2Idx := strings.Index(afterSpace, " "); sp2Idx > 0 {
-				timePortion := afterSpace[:sp2Idx]
-				// Validate that timePortion looks like HH:MM:SS
-				if strings.Count(timePortion, ":") == 2 {
-					datetimeInput = datetimeInput[:spIdx+1+sp2Idx]
-				}
-			}
-		}
 		// Try parsing various date formats
-		parsed := parseMySQLDateValue(datetimeInput)
+		parsed := parseMySQLDateValue(s)
 		if parsed != "" {
-			// Use datetimeInput (possibly T-normalized) as the value for time extraction,
-			// but fall back to original v for numeric formats (int64, float64).
-			var timeExtractVal interface{} = datetimeInput
-			if _, isStr := v.(string); !isStr {
-				timeExtractVal = v
-			}
-			timePart := extractTimePart(timeExtractVal, datetimeInput)
+			timePart := extractTimePart(v, s)
 			if timePart != "" {
 				// Normalize time separator chars to ':'
 				timePart = normalizeDateTimeSeparators(timePart)
-				// Convert all-digit HHMMSS string (6 chars) to HH:MM:SS format.
-				if len(timePart) == 6 {
-					allDig := true
-					for _, c := range timePart {
-						if c < '0' || c > '9' {
-							allDig = false
-							break
-						}
-					}
-					if allDig {
-						timePart = timePart[:2] + ":" + timePart[2:4] + ":" + timePart[4:6]
-					}
-				}
 				// DATETIME (no precision) stores at second precision: strip fractional seconds.
 				if dotIdx := strings.Index(timePart, "."); dotIdx >= 0 {
 					timePart = timePart[:dotIdx]
-				}
-				// Validate time components: HH must be 0-23, MM and SS must be 0-59.
-				// Also zero-pad to ensure HH:MM:SS format.
-				timeParts := strings.SplitN(timePart, ":", 3)
-				if len(timeParts) == 3 {
-					hh, _ := strconv.Atoi(timeParts[0])
-					mm, _ := strconv.Atoi(timeParts[1])
-					ss, _ := strconv.Atoi(timeParts[2])
-					if hh > 23 || mm > 59 || ss > 59 {
-						return "0000-00-00 00:00:00"
-					}
-					timePart = fmt.Sprintf("%02d:%02d:%02d", hh, mm, ss)
-				}
-				// Special case: if parsed is 0000-00-00 and the original date part had
-				// a 2-digit year ("00"), convert year to 2000 when time is non-zero.
-				// MySQL treats "00-00-00 HH:MM:SS" (with non-zero time) as year 2000,
-				// but "00-00-00" alone (or with zero time) is the zero date 0000-00-00.
-				if parsed == "0000-00-00" {
-					if hh, mm, ss := func() (int, int, int) {
-						tp := strings.SplitN(timePart, ":", 3)
-						if len(tp) == 3 {
-							h, _ := strconv.Atoi(tp[0])
-							m, _ := strconv.Atoi(tp[1])
-							s, _ := strconv.Atoi(tp[2])
-							return h, m, s
-						}
-						return 0, 0, 0
-					}(); hh != 0 || mm != 0 || ss != 0 {
-						// Non-zero time: check if original date is "YY-00-00" format
-						dateSrc := datetimeInput
-						if spaceIdx := strings.Index(dateSrc, " "); spaceIdx > 0 {
-							dateSrc = dateSrc[:spaceIdx]
-						}
-						normalized2 := normalizeDateDelimiters(dateSrc)
-						twoDigitAllZeroParts := strings.Split(normalized2, "-")
-						if len(twoDigitAllZeroParts) == 3 && len(twoDigitAllZeroParts[0]) <= 2 {
-							yy, _ := strconv.Atoi(twoDigitAllZeroParts[0])
-							mm2, _ := strconv.Atoi(twoDigitAllZeroParts[1])
-							dd, _ := strconv.Atoi(twoDigitAllZeroParts[2])
-							y := convert2DigitYear(yy)
-							if y > 0 || mm2 > 0 || dd > 0 {
-								parsed = fmt.Sprintf("%04d-%02d-%02d", y, mm2, dd)
-							}
-						}
-					}
 				}
 				return parsed + " " + timePart
 			}
@@ -801,8 +657,7 @@ func coerceYearValue(v interface{}) interface{} {
 		numVal = int(n)
 	case float64:
 		isNumericType = true
-		// MySQL rounds float values to nearest integer for YEAR columns
-		numVal = int(math.Round(n))
+		numVal = int(n)
 	case uint64:
 		isNumericType = true
 		numVal = int(n)
@@ -862,8 +717,7 @@ func coerceYearValue(v interface{}) interface{} {
 				return "0000"
 			}
 		} else {
-			// MySQL rounds float values to nearest integer for YEAR columns
-			n = int(math.Round(f))
+			n = int(f)
 		}
 	}
 
@@ -981,11 +835,6 @@ func parseMySQLDateValue(s string) string {
 			y, _ := strconv.Atoi(datePart[:4])
 			m, _ := strconv.Atoi(datePart[4:6])
 			d, _ := strconv.Atoi(datePart[6:8])
-			// In compact 14-digit format, MySQL requires fully valid date (no zero month/day)
-			// unless the entire date is 0000-00-00. Partial zeros → invalid.
-			if (m == 0 || d == 0) && !(y == 0 && m == 0 && d == 0) {
-				return ""
-			}
 			if isValidDate(y, m, d) {
 				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
 			}
@@ -1024,18 +873,6 @@ func parseMySQLDateValue(s string) string {
 					}
 				}
 			}
-			// 7-11 digits: right-pad to 12 digits and parse as YYMMDDHHMMSS (date part only).
-			// MySQL treats string values by reading left-to-right: YY, MM, DD pairs.
-			if len(datePart) >= 7 && len(datePart) <= 11 {
-				padded := datePart + strings.Repeat("0", 12-len(datePart))
-				yy, _ := strconv.Atoi(padded[:2])
-				m, _ := strconv.Atoi(padded[2:4])
-				d, _ := strconv.Atoi(padded[4:6])
-				y := convert2DigitYear(yy)
-				if isValidDate(y, m, d) {
-					return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
-				}
-			}
 		}
 		return ""
 	}
@@ -1071,10 +908,6 @@ func isValidDate(y, m, d int) bool {
 	// Zero date is always valid
 	if y == 0 && m == 0 && d == 0 {
 		return true
-	}
-	// MySQL max year is 9999
-	if y > 9999 {
-		return false
 	}
 	// Allow zero month/day for MySQL partial zero dates
 	if m == 0 || d == 0 {
@@ -1309,18 +1142,8 @@ func checkDateStrict(colType, colName, originalValue, sqlMode string, rowNum int
 			y, m, d = convert2DigitYear(yy), mm, dd
 			parsed = true
 		default:
-			// 7-11 digits: left-pad to 12 and parse as YYMMDDHHMMSS.
-			if len(datePart) >= 7 && len(datePart) <= 11 {
-				padded := strings.Repeat("0", 12-len(datePart)) + datePart
-				yy, _ := strconv.Atoi(padded[:2])
-				mm, _ := strconv.Atoi(padded[2:4])
-				dd, _ := strconv.Atoi(padded[4:6])
-				y, m, d = convert2DigitYear(yy), mm, dd
-				parsed = true
-			} else {
-				// Short/unrecognized numeric values - invalid
-				return mysqlError(1292, "22007", fmt.Sprintf("Incorrect %s value: '%s' for column '%s' at row %d", typeLabel, originalValue, colName, rowNum))
-			}
+			// Short numeric values like '59' - definitely invalid
+			return mysqlError(1292, "22007", fmt.Sprintf("Incorrect %s value: '%s' for column '%s' at row %d", typeLabel, originalValue, colName, rowNum))
 		}
 	}
 
@@ -1477,36 +1300,6 @@ func zeroDateTimeValue(colType string) string {
 		return "00:00:00"
 	}
 	return ""
-}
-
-// normalizeColonDate converts a colon-delimited date string (YY:MM:DD or YYYY:MM:DD) to
-// dash-delimited (YY-MM-DD or YYYY-MM-DD) when used in a DATE column context.
-// MySQL allows "97:02:03" to be stored as 1997-02-03 in a DATE column.
-// Returns the normalized string, or "" if not a colon-delimited date.
-func normalizeColonDate(s string) string {
-	// Find the date part (before any space)
-	datePart := s
-	if idx := strings.Index(s, " "); idx >= 0 {
-		datePart = s[:idx]
-	}
-	// Must have exactly 2 colons and no other date/slash delimiters
-	if strings.Count(datePart, ":") != 2 || strings.ContainsAny(datePart, "-/.@") {
-		return ""
-	}
-	colonParts := strings.SplitN(datePart, ":", 3)
-	if len(colonParts) != 3 {
-		return ""
-	}
-	// Validate all parts are numeric
-	for _, p := range colonParts {
-		for _, c := range p {
-			if c < '0' || c > '9' {
-				return ""
-			}
-		}
-	}
-	// Return with colons replaced by dashes (the caller handles month/day validation)
-	return strings.ReplaceAll(s, ":", "-")
 }
 
 // normalizeDateDelimiters replaces various date delimiters with '-'.

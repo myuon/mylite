@@ -4037,48 +4037,24 @@ func (e *Executor) explainJSONTableBlock(row []interface{}, query string) []orde
 	if row[6] != nil {
 		keyStr := fmt.Sprintf("%v", row[6])
 		kvs = append(kvs, orderedKV{"key", keyStr})
-		// used_key_parts: resolve the index columns actually used in the lookup.
+		// used_key_parts: resolve "PRIMARY" to actual PK column names
 		var usedKeyParts []interface{}
-		tblName := ""
-		if row[2] != nil {
-			tblName = fmt.Sprintf("%v", row[2])
-		}
-		if strings.EqualFold(keyStr, "PRIMARY") && tblName != "" {
+		if strings.EqualFold(keyStr, "PRIMARY") && row[2] != nil {
 			// Look up the actual primary key columns for this table
+			tblName := fmt.Sprintf("%v", row[2])
 			if td := e.explainGetTableDef(tblName); td != nil && len(td.PrimaryKey) > 0 {
 				for _, pk := range td.PrimaryKey {
 					usedKeyParts = append(usedKeyParts, pk)
 				}
 			}
 		}
-		if len(usedKeyParts) == 0 && tblName != "" {
-			// For named indexes: look up the index definition to find the key columns.
-			// Use the ref column (row[8]) to determine how many columns are used.
-			if td := e.explainGetTableDef(tblName); td != nil {
-				for _, idx := range td.Indexes {
-					if strings.EqualFold(idx.Name, keyStr) {
-						// Determine number of key parts from the ref column.
-						numParts := len(idx.Columns)
-						if row[8] != nil {
-							refStr := fmt.Sprintf("%v", row[8])
-							if refStr != "" {
-								refParts := strings.Split(refStr, ",")
-								if len(refParts) > 0 && len(refParts) <= len(idx.Columns) {
-									numParts = len(refParts)
-								}
-							}
-						}
-						for i := 0; i < numParts && i < len(idx.Columns); i++ {
-							usedKeyParts = append(usedKeyParts, idx.Columns[i])
-						}
-						break
-					}
-				}
-			}
-		}
 		if len(usedKeyParts) == 0 {
-			// Fallback: use the key name itself as the single used key part
-			usedKeyParts = []interface{}{keyStr}
+			// Fallback: split the key string by comma
+			parts := strings.Split(keyStr, ",")
+			usedKeyParts = make([]interface{}, len(parts))
+			for i, p := range parts {
+				usedKeyParts[i] = strings.TrimSpace(p)
+			}
 		}
 		kvs = append(kvs, orderedKV{"used_key_parts", usedKeyParts})
 	}
