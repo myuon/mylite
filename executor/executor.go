@@ -1555,6 +1555,25 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 	trimmed := strings.TrimSpace(query)
 	upper := strings.ToUpper(trimmed)
 
+	// KILL [CONNECTION | QUERY] thread_id — unregister the target connection from
+	// the process list so that tests waiting on "COUNT(*) = 0 WHERE id = X" can
+	// proceed.  The underlying TCP connection is not actually closed (we have no
+	// mechanism for that from SQL), but removing the process-list entry is
+	// sufficient for the test-suite wait loops.
+	// Handled here (before the parser) because the Vitess parser parses KILL
+	// but the executor's switch statement has no case for it, resulting in an
+	// "unsupported statement type" error that would silently be swallowed.
+	if strings.HasPrefix(upper, "KILL ") {
+		rest := strings.TrimSpace(strings.TrimPrefix(upper, "KILL "))
+		rest = strings.TrimPrefix(rest, "CONNECTION ")
+		rest = strings.TrimPrefix(rest, "QUERY ")
+		rest = strings.TrimSpace(rest)
+		if id, err2 := strconv.ParseInt(rest, 10, 64); err2 == nil && e.processList != nil {
+			e.processList.Unregister(id)
+		}
+		return &Result{}, nil
+	}
+
 	// MySQL has a stack depth limit for deeply nested IF expressions.
 	// Count IF( occurrences as a proxy for nesting depth.
 	// A threshold of 30 allows tests with up to 30 nested IFs (func_if test has exactly 30)
@@ -1630,10 +1649,6 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			if err := e.handleRawSet(trimmed); err != nil {
 				return nil, err
 			}
-			return &Result{}, nil
-		}
-		// KILL [CONNECTION | QUERY] thread_id: accept as no-op
-		if strings.HasPrefix(upper, "KILL ") {
 			return &Result{}, nil
 		}
 		if strings.HasPrefix(upper, "USE ") {

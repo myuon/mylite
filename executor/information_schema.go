@@ -669,9 +669,9 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 				} else {
 					info = nil
 				}
-				db := entry.DB
-				if db == "" {
-					db = "test"
+				var db interface{}
+				if entry.DB != "" {
+					db = entry.DB
 				}
 				rawRows = append(rawRows, storage.Row{
 					"ID":      entry.ID,
