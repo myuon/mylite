@@ -964,12 +964,44 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		if col.Type.Length != nil {
 			length := int64(*col.Type.Length)
 			switch colTypeLower {
+			case "int", "integer", "tinyint", "smallint", "mediumint", "bigint":
+				// MySQL limits the display width of integer types to 255.
+				if length > 255 {
+					return nil, mysqlError(1439, "42000", fmt.Sprintf("Display width out of range for column '%s' (max = 255)", col.Name.String()))
+				}
 			case "char", "binary":
 				if length > 255 {
 					return nil, mysqlError(1074, "42000", fmt.Sprintf("Column length too big for column '%s' (max = 255); use BLOB or TEXT instead", col.Name.String()))
 				}
-			case "varchar", "varbinary":
-				// For varchar(N) with N > 65535: MySQL promotes to text type silently,
+			case "varchar":
+				// Determine effective charset bytes per character to enforce row-size limit.
+				// MySQL enforces: length * bytes_per_char <= 65535.
+				effectiveCharset := col.Type.Charset.Name
+				if effectiveCharset == "" {
+					effectiveCharset = tableCharset
+				}
+				if effectiveCharset == "" {
+					if dbCharset, ok := e.getSysVarSession("character_set_database"); ok && dbCharset != "" {
+						effectiveCharset = dbCharset
+					} else {
+						effectiveCharset = "utf8mb4"
+					}
+				}
+				bytesPerChar := charsetBytesPerChar(effectiveCharset)
+				maxChars := int64(65535) / int64(bytesPerChar)
+				if length > maxChars {
+					return nil, mysqlError(1074, "42000", fmt.Sprintf("Column length too big for column '%s' (max = %d); use BLOB or TEXT instead", col.Name.String(), maxChars))
+				}
+				// Also check the absolute limit
+				if length > 65535 {
+					hasNonNullDefault := col.Type.Options != nil && col.Type.Options.Default != nil &&
+						!strings.EqualFold(sqlparser.String(col.Type.Options.Default), "null")
+					if hasNonNullDefault {
+						return nil, mysqlError(1074, "42000", fmt.Sprintf("Column length too big for column '%s' (max = 65535); use BLOB or TEXT instead", col.Name.String()))
+					}
+				}
+			case "varbinary":
+				// For varbinary(N) with N > 65535: MySQL promotes to text type silently,
 				// UNLESS the column has a non-NULL default (which can't be stored in a text type).
 				// In that case, error 1074 is returned.
 				// We check this here before default processing; the promotion happens in buildColumnTypeString.
@@ -2576,6 +2608,66 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			}
 			if netCols <= 0 {
 				return nil, mysqlError(1090, "42000", "You can't delete all columns with ALTER TABLE; use DROP TABLE instead")
+			}
+		}
+	}
+
+	// Pre-validate RENAME INDEX and ALTER INDEX sources against the ORIGINAL table state.
+	// All RENAME sources are validated against the pre-rename state to catch cases like
+	// "RENAME a→x, RENAME x→a" which would otherwise silently succeed.
+	// ALTER INDEX sources are validated against the post-rename state (all renames applied first),
+	// but that is handled below via the rename pre-pass.
+	{
+		origTableDef, _ := db.GetTable(tableName)
+		if origTableDef != nil {
+			origIndexSet := make(map[string]bool, len(origTableDef.Indexes))
+			for _, idx := range origTableDef.Indexes {
+				origIndexSet[strings.ToLower(idx.Name)] = true
+			}
+			for _, altOpt := range stmt.AlterOptions {
+				switch op := altOpt.(type) {
+				case *sqlparser.RenameIndex:
+					oldName := op.OldName.String()
+					if !origIndexSet[strings.ToLower(oldName)] {
+						return nil, mysqlError(1176, "42000", fmt.Sprintf("Key '%s' doesn't exist in table '%s'", oldName, tableName))
+					}
+				}
+			}
+		}
+	}
+
+	// Apply all RENAME INDEX operations first (before ALTER INDEX operations),
+	// matching MySQL semantics where renames are applied before visibility changes.
+	// This allows "RENAME a TO x, ALTER INDEX x INVISIBLE" to work correctly.
+	var appliedRenames []struct{ oldName, newName string }
+	for _, altOpt := range stmt.AlterOptions {
+		if op, ok := altOpt.(*sqlparser.RenameIndex); ok {
+			oldName := op.OldName.String()
+			newName := op.NewName.String()
+			tableDef, _ := db.GetTable(tableName)
+			if tableDef != nil {
+				for i, idx := range tableDef.Indexes {
+					if strings.EqualFold(idx.Name, oldName) {
+						tableDef.Indexes[i].Name = newName
+						appliedRenames = append(appliedRenames, struct{ oldName, newName string }{oldName, newName})
+						break
+					}
+				}
+			}
+		}
+	}
+	rollbackRenames := func() {
+		tableDef, _ := db.GetTable(tableName)
+		if tableDef == nil {
+			return
+		}
+		for i := len(appliedRenames) - 1; i >= 0; i-- {
+			r := appliedRenames[i]
+			for j, idx := range tableDef.Indexes {
+				if strings.EqualFold(idx.Name, r.newName) {
+					tableDef.Indexes[j].Name = r.oldName
+					break
+				}
 			}
 		}
 	}
@@ -5410,7 +5502,11 @@ func (e *Executor) execCreateTableSelect(targetDB, newTableName, selectSQL strin
 	// Mark as DML context so that overflow in strict mode raises errors (not warnings).
 	prevInsideDML := e.insideDML
 	e.insideDML = true
+	// Increment routineDepth so that the inner Execute call does not double-record
+	// errors in the diagnostics area (which would cause SHOW ERRORS to show 2 rows).
+	e.routineDepth++
 	result, err := e.Execute(selectSQL)
+	e.routineDepth--
 	e.insideDML = prevInsideDML
 	if err != nil {
 		return nil, err

@@ -2138,6 +2138,38 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		return nil, err
 	}
 
+	// Validate bare column references in non-aggregate SELECT list against table schema.
+	// e.g. SELECT b FROM t1 where b doesn't exist → error 1054.
+	if len(selectTableDefs) > 0 && selectTableDefs[0] != nil {
+		allColsSet := make(map[string]bool)
+		for _, td := range selectTableDefs {
+			if td == nil {
+				continue
+			}
+			for _, col := range td.Columns {
+				allColsSet[strings.ToLower(col.Name)] = true
+			}
+		}
+		for _, se := range stmt.SelectExprs.Exprs {
+			ae, ok := se.(*sqlparser.AliasedExpr)
+			if !ok {
+				continue
+			}
+			col, ok := ae.Expr.(*sqlparser.ColName)
+			if !ok || !col.Qualifier.IsEmpty() {
+				continue // skip non-column or qualified refs (validated elsewhere)
+			}
+			colLower := strings.ToLower(col.Name.String())
+			// _rowid is a MySQL pseudo-column alias for the integer primary key.
+			if colLower == "_rowid" {
+				continue
+			}
+			if !allColsSet[colLower] {
+				return nil, mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'field list'", col.Name.String()))
+			}
+		}
+	}
+
 	preSortedOrderBy := false
 	// If ORDER BY references base columns that are not projected, pre-sort source rows.
 	if stmt.OrderBy != nil && needsPreProjectionOrderBy(stmt.OrderBy, colNames) {
@@ -2266,6 +2298,38 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				pos := int(toInt64(lit.Val))
 				if pos < 1 || pos > len(colNames) {
 					return nil, mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%d' in 'order clause'", pos))
+				}
+			}
+			// Validate qualified column references in ORDER BY against table schema.
+			// e.g. ORDER BY t1.b where b doesn't exist → error 1054.
+			if col, ok := expr.(*sqlparser.ColName); ok && !col.Qualifier.IsEmpty() && len(selectTableDefs) > 0 {
+				colNameLower := strings.ToLower(col.Name.String())
+				tablePart := strings.ToLower(col.Qualifier.Name.String())
+				found := false
+				for _, td := range selectTableDefs {
+					if !strings.EqualFold(td.Name, tablePart) {
+						continue
+					}
+					for _, c := range td.Columns {
+						if strings.EqualFold(c.Name, colNameLower) {
+							found = true
+							break
+						}
+					}
+				}
+				// Also check if it refers to a select alias (e.g. ORDER BY alias)
+				if !found {
+					for _, cn := range colNames {
+						if strings.EqualFold(cn, col.Name.String()) {
+							found = true
+							break
+						}
+					}
+				}
+				if !found {
+					// Use qualified name for error: table.col
+					qualifiedName := col.Qualifier.Name.String() + "." + col.Name.String()
+					return nil, mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'order clause'", qualifiedName))
 				}
 			}
 		}
@@ -2836,6 +2900,150 @@ func validateImplicitScopeQualifiedCols(stmt *sqlparser.Select) error {
 	return walkErr
 }
 
+// validateAggregateQualifiedColRefs validates column references in SELECT expressions
+// when executing an aggregate query (GROUP BY or aggregate functions):
+//  1. Qualified column references inside aggregate function arguments (e.g. COUNT(test.t1.b)):
+//     - For 3-part (db.table.col): checks that db matches current DB and col exists in table.
+//     - For 2-part (table.col): checks that col exists in the referenced table.
+//  2. Bare (unqualified) non-aggregate column references in the SELECT list (e.g. SELECT count(*),b):
+//     - Checks that the column exists in the table schema.
+//
+// This prevents queries from silently returning NULL/0 for non-existent columns.
+func (e *Executor) validateAggregateQualifiedColRefs(selectExprs []sqlparser.SelectExpr, tableDefs []*catalog.TableDef, aliases []string) error {
+	if len(tableDefs) == 0 {
+		return nil // no schema info — skip validation (e.g. subqueries, views)
+	}
+
+	// Build a map of table-name/alias -> set of column names (lowercase)
+	tableColsMap := make(map[string]map[string]bool) // key: lowercase table-name or alias
+	// Also build a union set of all column names across all tables
+	allColsSet := make(map[string]bool)
+	for i, td := range tableDefs {
+		colSet := make(map[string]bool, len(td.Columns))
+		for _, col := range td.Columns {
+			colSet[strings.ToLower(col.Name)] = true
+			allColsSet[strings.ToLower(col.Name)] = true
+		}
+		tableColsMap[strings.ToLower(td.Name)] = colSet
+		if i < len(aliases) && aliases[i] != "" {
+			tableColsMap[strings.ToLower(aliases[i])] = colSet
+		}
+	}
+
+	// Build set of all known table names/aliases (lowercase) in FROM clause
+	fromTableNames := make(map[string]bool)
+	for k := range tableColsMap {
+		fromTableNames[k] = true
+	}
+
+	var walkSelectExpr func(expr sqlparser.Expr) error
+	walkSelectExpr = func(expr sqlparser.Expr) error {
+		switch v := expr.(type) {
+		case *sqlparser.Count:
+			for _, arg := range v.Args {
+				if col, ok := arg.(*sqlparser.ColName); ok {
+					if err := e.checkQualifiedColExists(col, tableColsMap, fromTableNames); err != nil {
+						return err
+					}
+				}
+			}
+		case *sqlparser.Sum:
+			if col, ok := v.Arg.(*sqlparser.ColName); ok {
+				if err := e.checkQualifiedColExists(col, tableColsMap, fromTableNames); err != nil {
+					return err
+				}
+			}
+		case *sqlparser.Max:
+			if col, ok := v.Arg.(*sqlparser.ColName); ok {
+				if err := e.checkQualifiedColExists(col, tableColsMap, fromTableNames); err != nil {
+					return err
+				}
+			}
+		case *sqlparser.Min:
+			if col, ok := v.Arg.(*sqlparser.ColName); ok {
+				if err := e.checkQualifiedColExists(col, tableColsMap, fromTableNames); err != nil {
+					return err
+				}
+			}
+		case *sqlparser.Avg:
+			if col, ok := v.Arg.(*sqlparser.ColName); ok {
+				if err := e.checkQualifiedColExists(col, tableColsMap, fromTableNames); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	for _, se := range selectExprs {
+		ae, ok := se.(*sqlparser.AliasedExpr)
+		if !ok {
+			continue
+		}
+		// Check non-aggregate bare column refs in SELECT list.
+		// e.g. SELECT count(*), b FROM t1 where b doesn't exist → error 1054.
+		if !isAggregateExpr(ae.Expr) {
+			if col, ok := ae.Expr.(*sqlparser.ColName); ok && col.Qualifier.IsEmpty() {
+				colLower := strings.ToLower(col.Name.String())
+				if !allColsSet[colLower] {
+					return mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'field list'", col.Name.String()))
+				}
+			}
+		}
+		if err := walkSelectExpr(ae.Expr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkQualifiedColExists validates a qualified column reference against the schema.
+// For 3-part (db.table.col): checks that db matches current DB and col exists in table.
+// For 2-part (table.col): checks that col exists in the referenced table.
+// Returns error 1054 if the column does not exist.
+func (e *Executor) checkQualifiedColExists(col *sqlparser.ColName, tableColsMap map[string]map[string]bool, fromTableNames map[string]bool) error {
+	if col.Qualifier.IsEmpty() {
+		return nil // unqualified column — handled elsewhere
+	}
+
+	colName := col.Name.String()
+	tablePart := strings.ToLower(col.Qualifier.Name.String())
+	dbPart := strings.ToLower(col.Qualifier.Qualifier.String())
+
+	// Build the full display name for error messages (strip backticks)
+	fullName := strings.Trim(sqlparser.String(col), "`")
+	fullName = strings.ReplaceAll(fullName, "`.`", ".")
+
+	if dbPart != "" {
+		// 3-part reference: db.table.col
+		// Check if the database matches the current database
+		if !strings.EqualFold(dbPart, e.CurrentDB) {
+			return mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'field list'", fullName))
+		}
+		// Check if the column exists in the table
+		if colSet, ok := tableColsMap[tablePart]; ok {
+			if !colSet[strings.ToLower(colName)] {
+				return mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'field list'", fullName))
+			}
+		}
+		// If the table isn't in our map, it might be from a subquery — skip validation
+	} else {
+		// 2-part reference: table.col
+		if fromTableNames[tablePart] {
+			// Table is in FROM clause — validate column exists
+			if colSet, ok := tableColsMap[tablePart]; ok {
+				if !colSet[strings.ToLower(colName)] {
+					return mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'field list'", fullName))
+				}
+			}
+		} else {
+			// Table qualifier not found in FROM — treat as unknown column
+			return mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'field list'", fullName))
+		}
+	}
+	return nil
+}
+
 // selectExprsHaveAggregates returns true if any select expression is or contains an aggregate function.
 func selectExprsHaveAggregates(exprs []sqlparser.SelectExpr) bool {
 	for _, expr := range exprs {
@@ -3024,6 +3232,21 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 					}
 				}
 			}
+		}
+	}
+
+	// Validate qualified column references inside aggregate function arguments.
+	// e.g. count(test.t1.b) where b doesn't exist in t1 should return error 1054.
+	if len(stmt.From) > 0 {
+		var allTableDefs []*catalog.TableDef
+		var allAliases []string
+		for _, fromExpr := range stmt.From {
+			defs, aliases := e.collectTableDefsWithAliases(fromExpr)
+			allTableDefs = append(allTableDefs, defs...)
+			allAliases = append(allAliases, aliases...)
+		}
+		if err := e.validateAggregateQualifiedColRefs(stmt.SelectExprs.Exprs, allTableDefs, allAliases); err != nil {
+			return nil, err
 		}
 	}
 
