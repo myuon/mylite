@@ -1778,36 +1778,22 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 			case "CHAR", "VARCHAR", "TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT", "ENUM", "SET":
 				cs := col.Charset
 				if cs == "" {
-					cs = "utf8mb4"
+					// No explicit column charset: inherit from table then database.
+					if tbl.Charset != "" {
+						cs = tbl.Charset
+					} else {
+						cs = "utf8mb4"
+					}
 				}
 				charSetName = cs
-				// Determine default collation for charset
-				switch strings.ToLower(cs) {
-				case "utf8mb4":
-					collationName = "utf8mb4_0900_ai_ci"
-				case "utf8", "utf8mb3":
-					collationName = "utf8_general_ci"
-					if cs == "utf8mb3" {
-						collationName = "utf8mb3_general_ci"
-					}
-				case "latin1":
-					collationName = "latin1_swedish_ci"
-				case "binary":
-					collationName = "binary"
-				case "ascii":
-					collationName = "ascii_general_ci"
-				case "ucs2":
-					collationName = "ucs2_general_ci"
-				case "utf16":
-					collationName = "utf16_general_ci"
-				case "utf32":
-					collationName = "utf32_general_ci"
-				default:
-					collationName = cs + "_general_ci"
-				}
-				// Use column-specific collation if set
+				// Determine default collation for charset, then apply overrides.
+				collationName = catalogPkg.DefaultCollationForCharset(cs)
+				// Column inherits table-level collation when it has no explicit collation.
 				if col.Collation != "" {
 					collationName = col.Collation
+				} else if col.Charset == "" && tbl.Collation != "" {
+					// No explicit column charset/collation: inherit table collation.
+					collationName = tbl.Collation
 				}
 			}
 

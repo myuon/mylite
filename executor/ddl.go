@@ -278,6 +278,12 @@ func (e *Executor) execCreateDatabase(stmt *sqlparser.CreateDatabase) (*Result, 
 		}
 		// Fall through to catalog default (utf8mb4) if session value not set
 	}
+	// If no explicit collation, use the session-level collation_server.
+	if collation == "" {
+		if collVal, ok := e.getSysVarSession("collation_server"); ok && collVal != "" {
+			collation = strings.ToLower(collVal)
+		}
+	}
 	// Validate charset name
 	if charset != "" && !isKnownCharset(charset) {
 		return nil, mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", charset))
@@ -2304,6 +2310,24 @@ func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 		Name:     col.Name.String(),
 		Type:     buildColumnTypeString(col.Type, ""),
 		Nullable: true, // default nullable unless NOT NULL specified
+	}
+	// Capture column-level charset if explicitly specified (same logic as CREATE TABLE path).
+	if col.Type.Charset.Name != "" {
+		csLower := strings.ToLower(col.Type.Charset.Name)
+		if csLower != "binary" {
+			colDef.Charset = csLower
+			colDef.Collation = catalog.DefaultCollationForCharset(colDef.Charset)
+		}
+	}
+	// Override/set collation from explicit COLLATE clause.
+	if col.Type.Options != nil && col.Type.Options.Collate != "" {
+		collLower := strings.ToLower(col.Type.Options.Collate)
+		colDef.Collation = collLower
+		if colDef.Charset == "" {
+			if collCharset, ok := catalog.CharsetForCollation(collLower); ok {
+				colDef.Charset = collCharset
+			}
+		}
 	}
 	if col.Type.Options != nil {
 		if col.Type.Options.Null != nil {
@@ -4539,7 +4563,8 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 	case *sqlparser.Literal:
 		switch v.Type {
 		case sqlparser.StrVal:
-			n := len(v.Val)
+			// Use character (rune) count, not byte count, for the VARCHAR width.
+			n := len([]rune(v.Val))
 			return fmt.Sprintf("varchar(%d)", n)
 		case sqlparser.IntVal:
 			n, err := strconv.ParseUint(v.Val, 10, 64)
@@ -4973,7 +4998,12 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 		}
 		attrs.charset = cs
 		if lit, ok := v.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
-			attrs.colType = fmt.Sprintf("varchar(%d)", len(lit.Val))
+			// Use character (rune) count, not byte count, for the VARCHAR width.
+			attrs.colType = fmt.Sprintf("varchar(%d)", len([]rune(lit.Val)))
+			// MySQL: charset-introduced string literals produce NOT NULL DEFAULT '' columns.
+			attrs.nullable = false
+			attrs.hasDefault = true
+			attrs.defaultVal = ""
 		}
 	}
 	if attrs.colType == "" {

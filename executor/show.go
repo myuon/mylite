@@ -337,6 +337,9 @@ func (e *Executor) describeTableFull(tableName string) (*Result, error) {
 								collation = cd.Collation
 							} else if cd.Charset != "" {
 								collation = catalog.DefaultCollationForCharset(cd.Charset)
+							} else if tblDef.Collation != "" {
+								// Column inherits table collation.
+								collation = tblDef.Collation
 							} else if tblDef.Charset != "" {
 								collation = catalog.DefaultCollationForCharset(tblDef.Charset)
 							}
