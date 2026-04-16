@@ -2562,6 +2562,233 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 
 // stripLeadingCStyleComments is defined in display.go
 
+// extractCTEBodyText extracts the SQL text inside the body (AS (...)) of a named CTE
+// from the outer query text. Returns "" if not found.
+// E.g. for "WITH qn2 AS (SELECT 3*a FROM qn) SELECT ...", name="qn2" returns "SELECT 3*a FROM qn".
+func extractCTEBodyText(outerQuery, cteName string) string {
+	q := outerQuery
+	lq := strings.ToLower(q)
+	if !strings.HasPrefix(lq, "with") {
+		return ""
+	}
+	i := 4
+	// skip optional RECURSIVE
+	for i < len(q) && (q[i] == ' ' || q[i] == '\t' || q[i] == '\n' || q[i] == '\r') {
+		i++
+	}
+	lqI := strings.ToLower(q[i:])
+	if strings.HasPrefix(lqI, "recursive") {
+		i += 9
+	}
+	for {
+		for i < len(q) && (q[i] == ' ' || q[i] == '\t' || q[i] == '\n' || q[i] == '\r') {
+			i++
+		}
+		if i >= len(q) {
+			return ""
+		}
+		// Record start of name
+		nameStart := i
+		// Read CTE name
+		var name string
+		if q[i] == '`' {
+			i++
+			end := strings.Index(q[i:], "`")
+			if end < 0 {
+				return ""
+			}
+			name = q[i : i+end]
+			i += end + 1
+		} else {
+			end := i
+			for end < len(q) && q[end] != ' ' && q[end] != '\t' && q[end] != '\n' && q[end] != '\r' && q[end] != '(' {
+				end++
+			}
+			name = q[nameStart:end]
+			i = end
+		}
+		_ = name // suppress unused
+		for i < len(q) && (q[i] == ' ' || q[i] == '\t' || q[i] == '\n' || q[i] == '\r') {
+			i++
+		}
+		// optional column list
+		if i < len(q) && q[i] == '(' {
+			// check if this is a column list (before AS) - skip it
+			// We check by looking for AS after the closing paren
+			depth := 1
+			i++
+			for i < len(q) && depth > 0 {
+				if q[i] == '(' {
+					depth++
+				} else if q[i] == ')' {
+					depth--
+				}
+				i++
+			}
+			for i < len(q) && (q[i] == ' ' || q[i] == '\t' || q[i] == '\n' || q[i] == '\r') {
+				i++
+			}
+		}
+		// expect AS
+		if i+2 > len(q) || !strings.EqualFold(q[i:i+2], "as") {
+			return ""
+		}
+		i += 2
+		for i < len(q) && (q[i] == ' ' || q[i] == '\t' || q[i] == '\n' || q[i] == '\r') {
+			i++
+		}
+		// skip body parentheses
+		if i >= len(q) || q[i] != '(' {
+			return ""
+		}
+		bodyStart := i + 1
+		depth := 1
+		i++
+		inQ := byte(0)
+		for i < len(q) && depth > 0 {
+			ch := q[i]
+			if inQ != 0 {
+				if ch == inQ && (i == 0 || q[i-1] != '\\') {
+					inQ = 0
+				}
+				i++
+				continue
+			}
+			if ch == '\'' || ch == '"' || ch == '`' {
+				inQ = ch
+			} else if ch == '(' {
+				depth++
+			} else if ch == ')' {
+				depth--
+			}
+			i++
+		}
+		bodyText := strings.TrimSpace(q[bodyStart : i-1])
+
+		if strings.EqualFold(name, cteName) {
+			return bodyText
+		}
+
+		for i < len(q) && (q[i] == ' ' || q[i] == '\t' || q[i] == '\n' || q[i] == '\r') {
+			i++
+		}
+		if i >= len(q) || q[i] != ',' {
+			break
+		}
+		i++ // skip comma
+	}
+	return ""
+}
+
+// stripWithClausePrefix removes the leading "WITH name AS (...)[, name AS (...)] "
+// prefix from a query, returning the rest starting from the outer SELECT/INSERT/etc.
+// It handles RECURSIVE keyword and multiple CTEs separated by commas.
+func stripWithClausePrefix(query string) string {
+	q := query
+	lq := strings.ToLower(q)
+	if !strings.HasPrefix(lq, "with") {
+		return query
+	}
+	i := 4 // after "with"
+	// skip optional RECURSIVE keyword
+	for i < len(q) && (q[i] == ' ' || q[i] == '\t' || q[i] == '\n' || q[i] == '\r') {
+		i++
+	}
+	lqFromI := strings.ToLower(q[i:])
+	if strings.HasPrefix(lqFromI, "recursive") {
+		i += 9
+	}
+	// Parse one or more CTEs: NAME AS (...)
+	for {
+		// skip whitespace
+		for i < len(q) && (q[i] == ' ' || q[i] == '\t' || q[i] == '\n' || q[i] == '\r') {
+			i++
+		}
+		// skip CTE name (identifier or backtick-quoted)
+		if i >= len(q) {
+			return query
+		}
+		if q[i] == '`' {
+			i++
+			for i < len(q) && q[i] != '`' {
+				i++
+			}
+			if i < len(q) {
+				i++ // skip closing backtick
+			}
+		} else {
+			for i < len(q) && q[i] != ' ' && q[i] != '\t' && q[i] != '\n' && q[i] != '\r' && q[i] != '(' {
+				i++
+			}
+		}
+		// skip whitespace
+		for i < len(q) && (q[i] == ' ' || q[i] == '\t' || q[i] == '\n' || q[i] == '\r') {
+			i++
+		}
+		// optional column list: (col1, col2, ...)
+		if i < len(q) && q[i] == '(' {
+			// check if this is column list or subquery
+			// we need to peek: if next non-paren content looks like AS, it's a column list
+			// Actually vitess grammar: WITH name(cols) AS (query)
+			// We can't distinguish easily; let's just skip one paren-balanced group and check
+			// We'll handle this by looking for AS keyword after the identifier
+		}
+		// expect AS keyword
+		if i+2 <= len(q) && strings.EqualFold(q[i:i+2], "as") {
+			i += 2
+		} else {
+			return query
+		}
+		// skip whitespace
+		for i < len(q) && (q[i] == ' ' || q[i] == '\t' || q[i] == '\n' || q[i] == '\r') {
+			i++
+		}
+		// skip the parenthesized subquery body
+		if i >= len(q) || q[i] != '(' {
+			return query
+		}
+		depth := 0
+		inQ := byte(0)
+		for i < len(q) {
+			ch := q[i]
+			if inQ != 0 {
+				if ch == inQ && (i == 0 || q[i-1] != '\\') {
+					inQ = 0
+				}
+				i++
+				continue
+			}
+			if ch == '\'' || ch == '"' || ch == '`' {
+				inQ = ch
+				i++
+				continue
+			}
+			if ch == '(' {
+				depth++
+			} else if ch == ')' {
+				depth--
+				if depth == 0 {
+					i++
+					break
+				}
+			}
+			i++
+		}
+		// skip whitespace
+		for i < len(q) && (q[i] == ' ' || q[i] == '\t' || q[i] == '\n' || q[i] == '\r') {
+			i++
+		}
+		// check for comma (more CTEs) or end
+		if i < len(q) && q[i] == ',' {
+			i++ // skip comma, loop to next CTE
+			continue
+		}
+		// we've consumed all CTEs; rest is the main query
+		break
+	}
+	return strings.TrimSpace(q[i:])
+}
+
 func extractRawSelectExprs(query string) []string {
 	q := strings.TrimSpace(query)
 	lq := strings.ToLower(q)

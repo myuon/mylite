@@ -1772,23 +1772,38 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				continue
 			}
 			// Execute the CTE subquery (supports both SELECT and UNION).
+			// Temporarily set currentQuery to the CTE subquery text so that
+			// extractRawSelectExprs produces the right column names for the CTE.
 			var subResult *Result
+			savedCurrentQueryForCTE := e.currentQuery
+			// Try to extract the original CTE body text from the outer query to preserve
+			// the user's original formatting (e.g. "3*a" not "3 * a").
+			cteBodyText := extractCTEBodyText(e.currentQuery, cteName)
+			if cteBodyText != "" {
+				e.currentQuery = cteBodyText
+			} else {
+				e.currentQuery = sqlparser.String(cte.Subquery)
+			}
 			switch sub := cte.Subquery.(type) {
 			case *sqlparser.Select:
 				var err error
 				subResult, err = e.execSelect(sub)
 				if err != nil {
+					e.currentQuery = savedCurrentQueryForCTE
 					return nil, err
 				}
 			case *sqlparser.Union:
 				var err error
 				subResult, err = e.execUnion(sub)
 				if err != nil {
+					e.currentQuery = savedCurrentQueryForCTE
 					return nil, err
 				}
 			default:
+				e.currentQuery = savedCurrentQueryForCTE
 				return nil, fmt.Errorf("CTE '%s': unsupported subquery type", cteName)
 			}
+			e.currentQuery = savedCurrentQueryForCTE
 			columns := make([]string, len(subResult.Columns))
 			copy(columns, subResult.Columns)
 			// Apply CTE column aliases if specified: WITH qn(a,b) AS (...)
@@ -2414,7 +2429,24 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	if len(allRows) == 0 && len(preWhereRows) > 0 && (len(selectTableDefs) == 0 || selectTableDefs[0] == nil) {
 		rowsForColResolution = preWhereRows
 	}
+	// When e.currentQuery starts with WITH, extractRawSelectExprs can't parse the select
+	// expressions (it only handles plain SELECT queries). Strip the WITH clause prefix
+	// temporarily so that column names from subquery expressions preserve original casing.
+	// We do this here (after CTE registration) so that CTE sub-executions earlier in this
+	// function didn't use the stripped query.
+	var savedQueryForColNames string
+	lowerCQ := strings.ToLower(strings.TrimSpace(e.currentQuery))
+	if strings.HasPrefix(lowerCQ, "with ") || strings.HasPrefix(lowerCQ, "with\t") || strings.HasPrefix(lowerCQ, "with\n") {
+		savedQueryForColNames = e.currentQuery
+		stripped := stripWithClausePrefix(e.currentQuery)
+		if stripped != e.currentQuery {
+			e.currentQuery = stripped
+		}
+	}
 	colNames, colExprs, err := e.resolveSelectExprs(stmt.SelectExprs.Exprs, rowsForColResolution, joinUsingCols, selectTableDefs...)
+	if savedQueryForColNames != "" {
+		e.currentQuery = savedQueryForColNames
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -6088,9 +6120,14 @@ func (e *Executor) execRecursiveCTE(cteName string, subquery sqlparser.TableStat
 	anchorColMaxLengths := extractAnchorColMaxLengths(anchorParts)
 
 	// Execute all anchor parts and combine their results.
+	// Set e.currentQuery to each part's SQL so that resolveSelectExprs
+	// uses the correct raw expressions for column name extraction.
+	savedCQForAnchor := e.currentQuery
 	var anchorResult *Result
 	for i, part := range anchorParts {
+		e.currentQuery = sqlparser.String(part)
 		r, err := e.execTableStmtForUnion(part)
+		e.currentQuery = savedCQForAnchor
 		if err != nil {
 			return nil, err
 		}
@@ -6142,7 +6179,9 @@ func (e *Executor) execRecursiveCTE(cteName string, subquery sqlparser.TableStat
 	for ; depth < maxDepth; depth++ {
 		var newRows [][]interface{}
 		for _, recursivePart := range recursiveParts {
+			e.currentQuery = sqlparser.String(recursivePart)
 			recursiveResult, err := e.execTableStmtForUnion(recursivePart)
+			e.currentQuery = savedCQForAnchor
 			if err != nil {
 				return nil, err
 			}
