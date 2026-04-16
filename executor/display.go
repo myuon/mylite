@@ -304,8 +304,17 @@ func compactOperatorsInSubexpressions(s string) string {
 			continue
 		}
 		if ch == ' ' {
+			// Compact arithmetic operators at all depths: MySQL displays "3*a" not "3 * a".
+			for _, op := range []string{" * ", " / ", " + ", " - "} {
+				if i+len(op) <= len(s) && s[i:i+len(op)] == op {
+					compact := strings.TrimSpace(op)
+					result.WriteString(compact)
+					i += len(op) - 1
+					goto nextChar
+				}
+			}
 			if parenDepth > 0 {
-				// Inside parentheses: compact all binary operators
+				// Inside parentheses: compact comparison operators too
 				for _, op := range []string{" = ", " != ", " <> ", " >= ", " <= ", " > ", " < "} {
 					if i+len(op) <= len(s) && s[i:i+len(op)] == op {
 						compact := strings.TrimSpace(op)
