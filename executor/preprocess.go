@@ -649,6 +649,9 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 				return "", nil, mysqlError(1064, "42000", "You have an error in your SQL syntax")
 			}
 			queryStr := fmt.Sprintf("%v", val)
+			// The variable may contain raw bytes from CONVERT(str USING utf16/utf32).
+			// Decode multi-byte encodings back to UTF-8 so the SQL parser can handle it.
+			queryStr = decodeMultiByteToUTF8(queryStr)
 			e.preparedStmts[stmtName] = queryStr
 			return "", &Result{}, nil
 		}
@@ -960,6 +963,104 @@ func extractPrepareFromStringLiteral(trimmed string) (string, string, bool) {
 	}
 	// Unterminated string
 	return "", "", false
+}
+
+// decodeMultiByteToUTF8 attempts to decode a string that may contain raw bytes
+// from a multi-byte charset (UTF-16 BE, UTF-16 LE, UTF-32) back to a valid
+// UTF-8 string. This is needed when a user variable contains the result of
+// CONVERT(str USING utf16/utf32), and that variable is used in PREPARE ... FROM @var.
+// If the string is already valid UTF-8, it is returned unchanged.
+func decodeMultiByteToUTF8(s string) string {
+	b := []byte(s)
+	n := len(b)
+	if n == 0 {
+		return s
+	}
+	// Try UTF-32 big-endian: length must be divisible by 4, and the pattern
+	// for ASCII text would be 0x00 0x00 0x00 ch (e.g., "select" -> 00 00 00 73 ...)
+	if n%4 == 0 && n >= 4 && b[0] == 0 && b[1] == 0 && b[2] == 0 {
+		var runes []rune
+		valid := true
+		for i := 0; i+3 < n; i += 4 {
+			r := rune(b[i])<<24 | rune(b[i+1])<<16 | rune(b[i+2])<<8 | rune(b[i+3])
+			if r > 0x10FFFF || (r >= 0xD800 && r <= 0xDFFF) {
+				valid = false
+				break
+			}
+			runes = append(runes, r)
+		}
+		if valid && len(runes) > 0 {
+			return string(runes)
+		}
+	}
+	// Try UTF-16 big-endian: length must be divisible by 2, and for ASCII text
+	// the pattern is 0x00 ch (e.g., "select" -> 00 73 00 65 ...)
+	if n%2 == 0 && n >= 2 && b[0] == 0 {
+		var runes []rune
+		valid := true
+		i := 0
+		for i+1 < n {
+			hi := uint16(b[i])<<8 | uint16(b[i+1])
+			i += 2
+			if hi >= 0xD800 && hi <= 0xDBFF {
+				// High surrogate - need a low surrogate
+				if i+1 >= n {
+					valid = false
+					break
+				}
+				lo := uint16(b[i])<<8 | uint16(b[i+1])
+				i += 2
+				if lo < 0xDC00 || lo > 0xDFFF {
+					valid = false
+					break
+				}
+				r := rune(hi-0xD800)<<10 | rune(lo-0xDC00) + 0x10000
+				runes = append(runes, r)
+			} else if hi >= 0xDC00 && hi <= 0xDFFF {
+				// Lone low surrogate - invalid
+				valid = false
+				break
+			} else {
+				runes = append(runes, rune(hi))
+			}
+		}
+		if valid && len(runes) > 0 {
+			return string(runes)
+		}
+	}
+	// Try UTF-16 little-endian: for ASCII text the pattern is ch 0x00
+	if n%2 == 0 && n >= 2 && b[1] == 0 {
+		var runes []rune
+		valid := true
+		i := 0
+		for i+1 < n {
+			lo := uint16(b[i]) | uint16(b[i+1])<<8
+			i += 2
+			if lo >= 0xD800 && lo <= 0xDBFF {
+				if i+1 >= n {
+					valid = false
+					break
+				}
+				hi := uint16(b[i]) | uint16(b[i+1])<<8
+				i += 2
+				if hi < 0xDC00 || hi > 0xDFFF {
+					valid = false
+					break
+				}
+				r := rune(lo-0xD800)<<10 | rune(hi-0xDC00) + 0x10000
+				runes = append(runes, r)
+			} else if lo >= 0xDC00 && lo <= 0xDFFF {
+				valid = false
+				break
+			} else {
+				runes = append(runes, rune(lo))
+			}
+		}
+		if valid && len(runes) > 0 {
+			return string(runes)
+		}
+	}
+	return s
 }
 
 // the vitess SQL parser does not recognize MID as a built-in function.
