@@ -884,11 +884,28 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 
 		// TableSpec is nil but it's not a CREATE TABLE ... LIKE or ... SELECT.
-		// This happens when vitess accepts invalid syntax that MySQL rejects
-		// (e.g. CHECK without parentheses, bare CONSTRAINT without key type).
-		// Return a parse error to match MySQL behaviour.
-		return nil, mysqlError(1064, "42000",
-			"You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '' at line 1")
+		// This can happen when vitess cannot fully parse partition syntax
+		// (e.g. NODEGROUP, RANGE COLUMNS with multi-value MAXVALUE, etc.).
+		// Try re-parsing with the PARTITION BY clause stripped so the table
+		// structure can still be created (partitioning is treated as a no-op).
+		recoveredFromPartition := false
+		if upper := strings.ToUpper(e.currentQuery); strings.Contains(upper, "PARTITION BY") {
+			if stripped := stripCreateTablePartitionClause(e.currentQuery); stripped != "" {
+				if newStmt, err2 := e.parser().Parse(stripped); err2 == nil {
+					if ct2, ok := newStmt.(*sqlparser.CreateTable); ok && ct2.TableSpec != nil {
+						stmt = ct2
+						recoveredFromPartition = true
+					}
+				}
+			}
+		}
+		if !recoveredFromPartition {
+			// This happens when vitess accepts invalid syntax that MySQL rejects
+			// (e.g. CHECK without parentheses, bare CONSTRAINT without key type).
+			// Return a parse error to match MySQL behaviour.
+			return nil, mysqlError(1064, "42000",
+				"You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '' at line 1")
+		}
 	}
 
 	columns := make([]catalog.ColumnDef, 0)
@@ -2403,7 +2420,13 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 						// FEDERATED is compiled in but disabled
 						return nil, mysqlError(1286, "42000", fmt.Sprintf("Unknown storage engine '%s'", tableOptionString(to)))
 					default:
-						return nil, mysqlError(1286, "42000", fmt.Sprintf("Unknown storage engine '%s'", tableOptionString(to)))
+						// When NO_ENGINE_SUBSTITUTION is active, return error; otherwise substitute with InnoDB and warn.
+						if strings.Contains(e.sqlMode, "NO_ENGINE_SUBSTITUTION") {
+							return nil, mysqlError(1286, "42000", fmt.Sprintf("Unknown storage engine '%s'", tableOptionString(to)))
+						}
+						e.warnings = append(e.warnings, Warning{Level: "Warning", Code: 1286, Message: fmt.Sprintf("Unknown storage engine '%s'", tableOptionString(to))})
+						// Engine substitution: proceed with InnoDB (handled via the table option being stored as unknown;
+						// subsequent logic will use INNODB as the stored engine)
 					}
 					// MEMORY and similar engines cannot be used for log tables
 					if isMySQLLogTable(dbName, tableName) {
@@ -5614,4 +5637,96 @@ func isFirstNotNullUnique(tbl *catalog.TableDef, idx catalog.IndexDef) bool {
 		}
 	}
 	return false
+}
+
+// stripCreateTablePartitionClause removes the PARTITION BY ... clause from a
+// CREATE TABLE statement, returning the stripped SQL or "" if the clause could
+// not be found. This is used as a fallback when vitess cannot fully parse the
+// partition syntax (e.g. NODEGROUP, multi-column MAXVALUE in RANGE COLUMNS).
+// The table column definition body (inside the outermost parens) is preserved.
+func stripCreateTablePartitionClause(query string) string {
+	// Find the outermost CREATE TABLE ... ( ... ) block — we want the position
+	// of the closing paren of the column definition list. Everything after that
+	// (before any ENGINE= or other table options) is the PARTITION BY clause.
+	upper := strings.ToUpper(query)
+	// Locate "CREATE" at the beginning
+	if !strings.HasPrefix(strings.TrimSpace(upper), "CREATE") {
+		return ""
+	}
+	// Find the first '(' which opens the column definition list
+	openIdx := strings.Index(query, "(")
+	if openIdx < 0 {
+		return ""
+	}
+	// Walk to find the matching closing paren at depth 0
+	depth := 0
+	closeIdx := -1
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	for i := openIdx; i < len(query); i++ {
+		ch := query[i]
+		if inSingle {
+			if ch == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '`':
+			inBacktick = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				closeIdx = i
+				goto foundClose
+			}
+		}
+	}
+foundClose:
+	if closeIdx < 0 {
+		return ""
+	}
+	// Everything up to and including the closing paren is the table definition.
+	// Check if there's a PARTITION BY after the closing paren.
+	afterClose := strings.TrimSpace(query[closeIdx+1:])
+	afterCloseUpper := strings.ToUpper(afterClose)
+	if !strings.HasPrefix(afterCloseUpper, "PARTITION BY") {
+		// There may be table options (ENGINE=, CHARSET=) before PARTITION BY
+		// Check if PARTITION BY appears anywhere after closeIdx
+		if !strings.Contains(afterCloseUpper, "PARTITION BY") {
+			return ""
+		}
+	}
+	// Return the CREATE TABLE ... (defs) part only, stripping PARTITION BY onwards.
+	// Also strip any table options that appear between the closing paren and PARTITION BY.
+	partitionIdx := strings.Index(afterCloseUpper, "PARTITION BY")
+	if partitionIdx < 0 {
+		return ""
+	}
+	// Keep table options between ) and PARTITION BY (e.g. ENGINE=InnoDB)
+	tableOptions := strings.TrimSpace(afterClose[:partitionIdx])
+	result := query[:closeIdx+1]
+	if tableOptions != "" {
+		result += " " + tableOptions
+	}
+	return result
 }

@@ -1267,7 +1267,10 @@ func stripNestedConditionalComments(query string, e *Executor) string {
 					// Closing the outer /*! comment
 					break
 				}
-				inner.WriteByte(query[i])
+				// Only include content when at the outer level (depth==1), not inside nested comments.
+				if depth == 1 {
+					inner.WriteByte(query[i])
+				}
 				i++
 			}
 			_ = start
