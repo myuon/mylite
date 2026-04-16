@@ -1855,6 +1855,9 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 					// For now handle single user (most common case)
 					e.grantStore.AddPrivGrant(toUser, toHost, privs, object, grantOption)
 
+					// Also populate mysql.db / mysql.tables_priv for raw table queries
+					e.syncGrantToMysqlTables(privs, object, toUser, toHost, grantOption)
+
 					// Track specific privileges for internal use
 					upperPrivs := strings.ToUpper(privs)
 					if strings.Contains(upperPrivs, "SUPER") || upperPrivs == "ALL" || upperPrivs == "ALL PRIVILEGES" {
@@ -5448,6 +5451,143 @@ func decodeBacktickedIdentifiers(query string, charset string) string {
 		i++
 	}
 	return result.String()
+}
+
+// syncGrantToMysqlTables inserts/updates rows in mysql.db or mysql.tables_priv
+// when a GRANT statement is executed, so that SELECT * FROM mysql.db works correctly.
+func (e *Executor) syncGrantToMysqlTables(privs, object, user, host string, grantOption bool) {
+	if e.Storage == nil {
+		return
+	}
+	gtype := objectToGrantType(object)
+	privList := normalizePrivList(privs)
+	isAll := len(privList) == 1 && privList[0] == "ALL PRIVILEGES"
+
+	privY := func(priv string) string {
+		if isAll {
+			return "Y"
+		}
+		for _, p := range privList {
+			if strings.EqualFold(p, priv) {
+				return "Y"
+			}
+		}
+		return "N"
+	}
+	grantPriv := "N"
+	if grantOption {
+		grantPriv = "Y"
+	}
+
+	if gtype == GrantTypeDB {
+		// Insert or update mysql.db
+		dbName := strings.TrimSuffix(object, ".*")
+		tbl, err := e.Storage.GetTable("mysql", "db")
+		if err != nil {
+			return
+		}
+		tbl.Mu.Lock()
+		defer tbl.Mu.Unlock()
+		// Find existing row
+		for i, row := range tbl.Rows {
+			if strings.EqualFold(toString(row["User"]), user) &&
+				strings.EqualFold(toString(row["Host"]), host) &&
+				strings.EqualFold(toString(row["Db"]), dbName) {
+				// Update existing row
+				tbl.Rows[i]["Select_priv"] = mergePrivY(toString(row["Select_priv"]), privY("SELECT"))
+				tbl.Rows[i]["Insert_priv"] = mergePrivY(toString(row["Insert_priv"]), privY("INSERT"))
+				tbl.Rows[i]["Update_priv"] = mergePrivY(toString(row["Update_priv"]), privY("UPDATE"))
+				tbl.Rows[i]["Delete_priv"] = mergePrivY(toString(row["Delete_priv"]), privY("DELETE"))
+				tbl.Rows[i]["Create_priv"] = mergePrivY(toString(row["Create_priv"]), privY("CREATE"))
+				tbl.Rows[i]["Drop_priv"] = mergePrivY(toString(row["Drop_priv"]), privY("DROP"))
+				tbl.Rows[i]["Grant_priv"] = mergePrivY(toString(row["Grant_priv"]), grantPriv)
+				tbl.Rows[i]["References_priv"] = mergePrivY(toString(row["References_priv"]), privY("REFERENCES"))
+				tbl.Rows[i]["Index_priv"] = mergePrivY(toString(row["Index_priv"]), privY("INDEX"))
+				tbl.Rows[i]["Alter_priv"] = mergePrivY(toString(row["Alter_priv"]), privY("ALTER"))
+				tbl.Rows[i]["Create_tmp_table_priv"] = mergePrivY(toString(row["Create_tmp_table_priv"]), privY("CREATE TEMPORARY TABLES"))
+				tbl.Rows[i]["Lock_tables_priv"] = mergePrivY(toString(row["Lock_tables_priv"]), privY("LOCK TABLES"))
+				tbl.Rows[i]["Create_view_priv"] = mergePrivY(toString(row["Create_view_priv"]), privY("CREATE VIEW"))
+				tbl.Rows[i]["Show_view_priv"] = mergePrivY(toString(row["Show_view_priv"]), privY("SHOW VIEW"))
+				tbl.Rows[i]["Create_routine_priv"] = mergePrivY(toString(row["Create_routine_priv"]), privY("CREATE ROUTINE"))
+				tbl.Rows[i]["Alter_routine_priv"] = mergePrivY(toString(row["Alter_routine_priv"]), privY("ALTER ROUTINE"))
+				tbl.Rows[i]["Execute_priv"] = mergePrivY(toString(row["Execute_priv"]), privY("EXECUTE"))
+				tbl.Rows[i]["Event_priv"] = mergePrivY(toString(row["Event_priv"]), privY("EVENT"))
+				tbl.Rows[i]["Trigger_priv"] = mergePrivY(toString(row["Trigger_priv"]), privY("TRIGGER"))
+				return
+			}
+		}
+		// New row
+		tbl.Rows = append(tbl.Rows, storage.Row{
+			"Host":                  host,
+			"Db":                    dbName,
+			"User":                  user,
+			"Select_priv":           privY("SELECT"),
+			"Insert_priv":           privY("INSERT"),
+			"Update_priv":           privY("UPDATE"),
+			"Delete_priv":           privY("DELETE"),
+			"Create_priv":           privY("CREATE"),
+			"Drop_priv":             privY("DROP"),
+			"Grant_priv":            grantPriv,
+			"References_priv":       privY("REFERENCES"),
+			"Index_priv":            privY("INDEX"),
+			"Alter_priv":            privY("ALTER"),
+			"Create_tmp_table_priv": privY("CREATE TEMPORARY TABLES"),
+			"Lock_tables_priv":      privY("LOCK TABLES"),
+			"Create_view_priv":      privY("CREATE VIEW"),
+			"Show_view_priv":        privY("SHOW VIEW"),
+			"Create_routine_priv":   privY("CREATE ROUTINE"),
+			"Alter_routine_priv":    privY("ALTER ROUTINE"),
+			"Execute_priv":          privY("EXECUTE"),
+			"Event_priv":            privY("EVENT"),
+			"Trigger_priv":          privY("TRIGGER"),
+		})
+	} else if gtype == GrantTypeTable {
+		// Insert or update mysql.tables_priv
+		parts := strings.SplitN(object, ".", 2)
+		if len(parts) != 2 {
+			return
+		}
+		dbName := parts[0]
+		tableName := parts[1]
+		tbl, err := e.Storage.GetTable("mysql", "tables_priv")
+		if err != nil {
+			return
+		}
+		var tablePrivs []string
+		for _, p := range privList {
+			tablePrivs = append(tablePrivs, p)
+		}
+		tablePrivStr := strings.Join(tablePrivs, ",")
+		tbl.Mu.Lock()
+		defer tbl.Mu.Unlock()
+		for i, row := range tbl.Rows {
+			if strings.EqualFold(toString(row["User"]), user) &&
+				strings.EqualFold(toString(row["Host"]), host) &&
+				strings.EqualFold(toString(row["Db"]), dbName) &&
+				strings.EqualFold(toString(row["Table_name"]), tableName) {
+				tbl.Rows[i]["Table_priv"] = tablePrivStr
+				return
+			}
+		}
+		tbl.Rows = append(tbl.Rows, storage.Row{
+			"Host":        host,
+			"Db":          dbName,
+			"User":        user,
+			"Table_name":  tableName,
+			"Grantor":     "root@localhost",
+			"Timestamp":   "0000-00-00 00:00:00",
+			"Table_priv":  tablePrivStr,
+			"Column_priv": "",
+		})
+	}
+}
+
+// mergePrivY returns "Y" if either a or b is "Y".
+func mergePrivY(a, b string) string {
+	if a == "Y" || b == "Y" {
+		return "Y"
+	}
+	return "N"
 }
 
 // isKnownUser checks if user@host (parsed from "user@host" string like "test_user1@'localhost'")
