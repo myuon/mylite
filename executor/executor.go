@@ -2005,7 +2005,28 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		return e.execUse(s)
 	case *sqlparser.CreateTable:
 		e.ddlImplicitCommit()
-		return e.execCreateTable(s)
+		res, err := e.execCreateTable(s)
+		// For non-InnoDB tables: mark as needing analyze so first ANALYZE TABLE returns "OK".
+		if err == nil {
+			tblName := s.Table.Name.String()
+			dbName := e.CurrentDB
+			if !s.Table.Qualifier.IsEmpty() {
+				dbName = s.Table.Qualifier.String()
+			}
+			if db, dbErr := e.Catalog.GetDatabase(dbName); dbErr == nil {
+				if def, tblErr := db.GetTable(tblName); tblErr == nil && def != nil {
+					eng := strings.ToUpper(def.Engine)
+					if eng != "" && eng != "INNODB" && eng != "MEMORY" && eng != "HEAP" {
+						fullName := dbName + "." + tblName
+						if e.tableNeedsAnalyze == nil {
+							e.tableNeedsAnalyze = map[string]bool{}
+						}
+						e.tableNeedsAnalyze[fullName] = true
+					}
+				}
+			}
+		}
+		return res, err
 	case *sqlparser.DropTable:
 		e.ddlImplicitCommit()
 		return e.execDropTable(s)
@@ -2033,6 +2054,12 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 								e.tableNeedsOptimize = map[string]bool{}
 							}
 							e.tableNeedsOptimize[fullName] = true
+						} else {
+							// INSERT SELECT: stats are computed during insert, so clear the
+							// needs-analyze flag. ANALYZE TABLE returns "Table is already up to date".
+							if e.tableNeedsAnalyze != nil {
+								delete(e.tableNeedsAnalyze, fullName)
+							}
 						}
 						// All inserts (including INSERT SELECT) clear the analyzed flag
 						// since data has changed and stats may be stale.

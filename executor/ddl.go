@@ -1156,6 +1156,18 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 						}
 						// Normalize now() / current_timestamp() to CURRENT_TIMESTAMP
 						defStr = normalizeCurrentTimestampDefault(defStr)
+						// Coerce DATE/DATETIME/TIMESTAMP default values to match column type.
+						// DATE default with time part → strip time. DATETIME default without time → add time.
+						// Skip special defaults like CURRENT_TIMESTAMP that are not date strings.
+						if !strings.EqualFold(defStr, "CURRENT_TIMESTAMP") && !strings.EqualFold(defStr, "NOW()") {
+							colTypeU := strings.ToUpper(strings.TrimSpace(colDef.Type))
+							if colTypeU == "DATE" || strings.HasPrefix(colTypeU, "DATETIME") {
+								coerced := coerceDateTimeValue(colDef.Type, defStr)
+								if cs, ok := coerced.(string); ok && cs != "" {
+									defStr = cs
+								}
+							}
+						}
 						colDef.Default = &defStr
 					}
 				}

@@ -169,6 +169,50 @@ func isSimpleStringLiteral(s string) bool {
 	return true
 }
 
+// extractFirstStringLiteralFromRaw detects adjacent string literals (e.g. "'hello' 'monty'")
+// in the raw SQL expression text and returns the first literal's value (unquoted).
+// MySQL uses only the first literal as the column name for such expressions.
+// Returns fallback if no adjacent literals pattern is found.
+func extractFirstStringLiteralFromRaw(rawExpr, fallback string) string {
+	raw := strings.TrimSpace(rawExpr)
+	if len(raw) < 2 || raw[0] != '\'' {
+		return fallback
+	}
+	// Find the end of the first string literal, handling '' (double-quote escape) and \' (backslash escape).
+	i := 1
+	for i < len(raw) {
+		if raw[i] == '\'' {
+			// Check for '' (MySQL escape sequence for literal ')
+			if i+1 < len(raw) && raw[i+1] == '\'' {
+				i += 2 // skip both quotes
+				continue
+			}
+			// Check for \' (backslash escape)
+			if i > 0 && raw[i-1] == '\\' {
+				i++
+				continue
+			}
+			break // End of first literal
+		}
+		i++
+	}
+	// i is now the position of the closing quote of the first literal
+	if i >= len(raw) {
+		return fallback // No closing quote found
+	}
+	// Check if there's more content after the first literal (adjacent literals)
+	rest := strings.TrimSpace(raw[i+1:])
+	if len(rest) == 0 {
+		return fallback // No adjacent literal
+	}
+	// There's more content → this is an adjacent literal pattern
+	// Return the first literal's content (between position 1 and i, unescaped)
+	firstContent := raw[1:i]
+	// Unescape '' → '
+	firstContent = strings.ReplaceAll(firstContent, "''", "'")
+	return firstContent
+}
+
 func normalizeSelectedFunctionArgDisplaySpacing(s string) string {
 	for _, fn := range []string{"JSON_SCHEMA_VALID", "JSON_SCHEMA_VALIDATION_REPORT", "JSON_MERGE_PRESERVE"} {
 		prefix := fn + "("
