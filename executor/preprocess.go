@@ -226,8 +226,27 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		return "", &Result{Columns: []string{"@@session.error_count"}, Rows: [][]interface{}{{cnt}}, IsResultSet: true}, nil
 	}
 
-	// Handle CREATE/DROP ROLE, SET DEFAULT ROLE, SET ROLE as no-ops
-	if strings.HasPrefix(upper, "CREATE ROLE") || strings.HasPrefix(upper, "DROP ROLE") ||
+	// Handle CREATE/DROP ROLE, SET DEFAULT ROLE, SET ROLE
+	if strings.HasPrefix(upper, "CREATE ROLE") {
+		// Register role(s) in the grant store
+		if e.grantStore != nil {
+			rolePart := strings.TrimSpace(query[len("CREATE ROLE"):])
+			rolePart = strings.TrimRight(rolePart, ";")
+			// Strip IF NOT EXISTS
+			if strings.HasPrefix(strings.ToUpper(rolePart), "IF NOT EXISTS") {
+				rolePart = strings.TrimSpace(rolePart[len("IF NOT EXISTS"):])
+			}
+			for _, rn := range strings.Split(rolePart, ",") {
+				rn = strings.TrimSpace(rn)
+				rn = strings.Trim(rn, "`'\"")
+				if rn != "" {
+					e.grantStore.RegisterRole(rn)
+				}
+			}
+		}
+		return "", &Result{}, nil
+	}
+	if strings.HasPrefix(upper, "DROP ROLE") ||
 		strings.HasPrefix(upper, "SET DEFAULT ROLE") || strings.HasPrefix(upper, "SET ROLE") {
 		return "", &Result{}, nil
 	}

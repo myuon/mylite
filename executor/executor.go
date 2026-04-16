@@ -474,6 +474,9 @@ type Executor struct {
 	knownUsers map[string]bool
 	// knownUsersMu protects knownUsers.
 	knownUsersMu *sync.RWMutex
+	// grantStore holds all GRANT records (privileges and role memberships).
+	// Shared across all connections.
+	grantStore *GrantStore
 	// inUpdateSetContext is set to true while evaluating SET expressions in an UPDATE statement.
 	// When true, CONCAT (and similar) should return an error if the result exceeds max_allowed_packet,
 	// rather than returning NULL with a warning (which is correct for SELECT/INSERT context).
@@ -926,6 +929,7 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	e.sysVarsAdminUsersMu = &sync.RWMutex{}
 	e.knownUsers = make(map[string]bool)
 	e.knownUsersMu = &sync.RWMutex{}
+	e.grantStore = NewGrantStore()
 	e.initSystemTables()
 	return e
 }
@@ -1007,6 +1011,7 @@ func (e *Executor) Clone() *Executor {
 		sysVarsAdminUsersMu:     e.sysVarsAdminUsersMu,
 		knownUsers:              e.knownUsers,
 		knownUsersMu:            e.knownUsersMu,
+		grantStore:              e.grantStore,
 	}
 }
 
@@ -1827,38 +1832,76 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'extended' at line 1"))
 		}
 		if strings.HasPrefix(upper, "GRANT ") {
-			// Helper to extract username from "GRANT ... TO 'user'@'host'"
-			extractGrantUser := func() string {
-				if idx := strings.Index(upper, " TO "); idx >= 0 {
-					userPart := strings.TrimSpace(trimmed[idx+4:])
-					// Strip WITH GRANT OPTION suffix
-					if wi := strings.Index(strings.ToUpper(userPart), " WITH "); wi >= 0 {
-						userPart = strings.TrimSpace(userPart[:wi])
+			// Parse and store the grant
+			if e.grantStore != nil {
+				privs, object, toUser, toHost, isRoleGrant, grantOption, adminOption := ParseGrantStatement(trimmed)
+				if isRoleGrant {
+					// GRANT role TO user - record role membership
+					// Handle comma-separated roles: "GRANT r1, r2 TO user"
+					for _, roleName := range strings.Split(privs, ",") {
+						roleName = strings.TrimSpace(roleName)
+						roleName = strings.Trim(roleName, "`'\"")
+						if roleName != "" {
+							rh := "%"
+							if atIdx := strings.Index(roleName, "@"); atIdx >= 0 {
+								rh = roleName[atIdx+1:]
+								roleName = roleName[:atIdx]
+							}
+							e.grantStore.AddRoleGrant(roleName, rh, toUser, toHost, adminOption)
+						}
 					}
-					// Extract bare username (strip quotes and @host)
-					userPart = strings.Trim(userPart, "'`\"")
-					if at := strings.Index(userPart, "@"); at >= 0 {
-						userPart = userPart[:at]
+				} else if privs != "" && object != "" && toUser != "" {
+					// Handle multiple users: "GRANT privs ON obj TO u1, u2"
+					// For now handle single user (most common case)
+					e.grantStore.AddPrivGrant(toUser, toHost, privs, object, grantOption)
+
+					// Track specific privileges for internal use
+					upperPrivs := strings.ToUpper(privs)
+					if strings.Contains(upperPrivs, "SUPER") || upperPrivs == "ALL" || upperPrivs == "ALL PRIVILEGES" {
+						if toUser != "" && e.superUsersMu != nil {
+							e.superUsersMu.Lock()
+							e.superUsers[strings.ToLower(toUser)] = true
+							e.superUsersMu.Unlock()
+						}
 					}
-					userPart = strings.Trim(userPart, "'`\"")
-					return strings.ToLower(strings.TrimSpace(userPart))
+					if strings.Contains(upperPrivs, "SYSTEM_VARIABLES_ADMIN") {
+						if toUser != "" && e.sysVarsAdminUsersMu != nil {
+							e.sysVarsAdminUsersMu.Lock()
+							e.sysVarsAdminUsers[strings.ToLower(toUser)] = true
+							e.sysVarsAdminUsersMu.Unlock()
+						}
+					}
 				}
-				return ""
-			}
-			// Track GRANT SUPER ON *.* TO user for privilege checking
-			if strings.Contains(upper, "SUPER") {
-				if username := extractGrantUser(); username != "" && e.superUsersMu != nil {
-					e.superUsersMu.Lock()
-					e.superUsers[username] = true
-					e.superUsersMu.Unlock()
+			} else {
+				// Fallback: track SUPER and SYSTEM_VARIABLES_ADMIN the old way
+				extractGrantUser := func() string {
+					if idx := strings.Index(upper, " TO "); idx >= 0 {
+						userPart := strings.TrimSpace(trimmed[idx+4:])
+						if wi := strings.Index(strings.ToUpper(userPart), " WITH "); wi >= 0 {
+							userPart = strings.TrimSpace(userPart[:wi])
+						}
+						userPart = strings.Trim(userPart, "'`\"")
+						if at := strings.Index(userPart, "@"); at >= 0 {
+							userPart = userPart[:at]
+						}
+						userPart = strings.Trim(userPart, "'`\"")
+						return strings.ToLower(strings.TrimSpace(userPart))
+					}
+					return ""
 				}
-			}
-			// Track GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO user for SET GLOBAL privilege checking
-			if strings.Contains(upper, "SYSTEM_VARIABLES_ADMIN") {
-				if username := extractGrantUser(); username != "" && e.sysVarsAdminUsersMu != nil {
-					e.sysVarsAdminUsersMu.Lock()
-					e.sysVarsAdminUsers[username] = true
-					e.sysVarsAdminUsersMu.Unlock()
+				if strings.Contains(upper, "SUPER") {
+					if username := extractGrantUser(); username != "" && e.superUsersMu != nil {
+						e.superUsersMu.Lock()
+						e.superUsers[username] = true
+						e.superUsersMu.Unlock()
+					}
+				}
+				if strings.Contains(upper, "SYSTEM_VARIABLES_ADMIN") {
+					if username := extractGrantUser(); username != "" && e.sysVarsAdminUsersMu != nil {
+						e.sysVarsAdminUsersMu.Lock()
+						e.sysVarsAdminUsers[username] = true
+						e.sysVarsAdminUsersMu.Unlock()
+					}
 				}
 			}
 			return &Result{}, nil
@@ -1882,11 +1925,36 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		if strings.HasPrefix(upper, "DROP USER ") {
 			e.trackDropUser(trimmed)
 		}
+		// Track CREATE ROLE for the grant store.
+		if strings.HasPrefix(upper, "CREATE ROLE ") && e.grantStore != nil {
+			rolePart := strings.TrimSpace(trimmed[12:])
+			rolePart = strings.TrimRight(rolePart, ";")
+			for _, rn := range strings.Split(rolePart, ",") {
+				rn = strings.TrimSpace(rn)
+				rn = strings.Trim(rn, "`'\"")
+				if rn != "" {
+					e.grantStore.RegisterRole(rn)
+				}
+			}
+		}
+		// Handle REVOKE to remove stored grants.
+		if strings.HasPrefix(upper, "REVOKE ") && e.grantStore != nil {
+			privs, object, fromUser, fromHost, isRoleRevoke := ParseRevokeStatement(trimmed)
+			if !isRoleRevoke && privs != "" && object != "" && fromUser != "" {
+				if strings.ToUpper(privs) == "ALL PRIVILEGES" {
+					e.grantStore.RevokeAllPrivGrants(fromUser, fromHost)
+				} else {
+					e.grantStore.RevokePrivGrant(fromUser, fromHost, privs, object)
+				}
+			}
+		}
 		if strings.HasPrefix(upper, "CREATE EVENT") ||
 			strings.HasPrefix(upper, "DROP EVENT") ||
 			strings.HasPrefix(upper, "CREATE USER") ||
 			strings.HasPrefix(upper, "DROP USER") ||
 			strings.HasPrefix(upper, "ALTER USER") ||
+			strings.HasPrefix(upper, "CREATE ROLE") ||
+			strings.HasPrefix(upper, "DROP ROLE") ||
 			strings.HasPrefix(upper, "REVOKE ") ||
 			strings.HasPrefix(upper, "FLUSH ") ||
 			strings.HasPrefix(upper, "RESET ") ||
@@ -1953,43 +2021,7 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 		// Handle SHOW GRANTS (vitess parser may fail on some variants)
 		if strings.HasPrefix(upper, "SHOW GRANTS") {
-			grantUser := "root"
-			grantHost := "localhost"
-			// Parse "SHOW GRANTS FOR user@host" or "SHOW GRANTS FOR 'user'@'host'"
-			if forIdx := strings.Index(upper, " FOR "); forIdx >= 0 {
-				forPart := strings.TrimSpace(trimmed[forIdx+5:])
-				forPart = strings.TrimRight(forPart, ";")
-				if atIdx := strings.LastIndex(forPart, "@"); atIdx >= 0 {
-					grantUser = strings.Trim(strings.TrimSpace(forPart[:atIdx]), "'`\"")
-					grantHost = strings.Trim(strings.TrimSpace(forPart[atIdx+1:]), "'`\"")
-				} else {
-					grantUser = strings.Trim(strings.TrimSpace(forPart), "'`\"")
-				}
-			}
-			grantRows := [][]interface{}{
-				{fmt.Sprintf("GRANT USAGE ON *.* TO `%s`@`%s`", grantUser, grantHost)},
-			}
-			// Check if any database grants exist for this user
-			if e.Catalog != nil {
-				for _, dbName := range e.Catalog.ListDatabases() {
-					if !strings.EqualFold(dbName, "information_schema") && !strings.EqualFold(dbName, "performance_schema") &&
-						!strings.EqualFold(dbName, "mysql") && !strings.EqualFold(dbName, "sys") {
-						grantRows = append(grantRows, []interface{}{
-							fmt.Sprintf("GRANT ALL PRIVILEGES ON `%s`.* TO `%s`@`%s`", dbName, grantUser, grantHost),
-						})
-					}
-				}
-			}
-			if grantUser == "root" {
-				grantRows = [][]interface{}{
-					{"GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' WITH GRANT OPTION"},
-				}
-			}
-			return &Result{
-				Columns:     []string{fmt.Sprintf("Grants for %s@%s", grantUser, grantHost)},
-				Rows:        grantRows,
-				IsResultSet: true,
-			}, nil
+			return e.execShowGrants(trimmed)
 		}
 		return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", extractNearFromParseError(trimmed, err)))
 	}

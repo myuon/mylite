@@ -897,55 +897,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 
 	// SHOW GRANTS [FOR user@host [USING role,...]]
 	if strings.HasPrefix(upper, "SHOW GRANTS") {
-		// Resolve current session user (default root)
-		sessionUser := "root"
-		sessionHost := "localhost"
-		if cu, ok := e.userVars["__current_user"]; ok {
-			if cuStr, ok2 := cu.(string); ok2 && cuStr != "" {
-				if atIdx := strings.Index(cuStr, "@"); atIdx >= 0 {
-					sessionUser = cuStr[:atIdx]
-					sessionHost = cuStr[atIdx+1:]
-				} else {
-					sessionUser = cuStr
-				}
-			}
-		}
-
-		grantUser := sessionUser
-		grantHost := sessionHost
-		if forIdx := strings.Index(upper, " FOR "); forIdx >= 0 {
-			forPart := strings.TrimSpace(query[forIdx+5:])
-			forPart = strings.TrimRight(forPart, ";")
-			// Strip USING clause: "SHOW GRANTS FOR user USING role"
-			if usingIdx := strings.Index(strings.ToUpper(forPart), " USING "); usingIdx >= 0 {
-				forPart = strings.TrimSpace(forPart[:usingIdx])
-			}
-			// Check for CURRENT_USER() or CURRENT_USER
-			forUpper := strings.ToUpper(strings.TrimSpace(forPart))
-			if forUpper == "CURRENT_USER()" || forUpper == "CURRENT_USER" {
-				// Already resolved from session user above
-			} else if atIdx := strings.LastIndex(forPart, "@"); atIdx >= 0 {
-				grantUser = strings.Trim(strings.TrimSpace(forPart[:atIdx]), "'`\"")
-				grantHost = strings.Trim(strings.TrimSpace(forPart[atIdx+1:]), "'`\"")
-			} else {
-				grantUser = strings.Trim(strings.TrimSpace(forPart), "'`\"")
-			}
-		}
-		var grantRows [][]interface{}
-		if strings.EqualFold(grantUser, "root") {
-			grantRows = [][]interface{}{
-				{fmt.Sprintf("GRANT ALL PRIVILEGES ON *.* TO `%s`@`%s` WITH GRANT OPTION", grantUser, grantHost)},
-			}
-		} else {
-			grantRows = [][]interface{}{
-				{fmt.Sprintf("GRANT USAGE ON *.* TO `%s`@`%s`", grantUser, grantHost)},
-			}
-		}
-		return &Result{
-			Columns:     []string{fmt.Sprintf("Grants for %s@%s", grantUser, grantHost)},
-			Rows:        grantRows,
-			IsResultSet: true,
-		}, nil
+		return e.execShowGrants(query)
 	}
 
 	// SHOW [FULL] PROCESSLIST
@@ -2526,6 +2478,76 @@ func (e *Executor) showCreateView(viewName string) (*Result, error) {
 	return &Result{
 		Columns:     []string{"View", "Create View", "character_set_client", "collation_connection"},
 		Rows:        [][]interface{}{{viewName, createSQL, "utf8mb4", "utf8mb4_0900_ai_ci"}},
+		IsResultSet: true,
+	}, nil
+}
+
+// execShowGrants handles SHOW GRANTS [FOR user@host [USING role,...]]
+func (e *Executor) execShowGrants(query string) (*Result, error) {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+
+	// Resolve current session user (default root)
+	sessionUser := "root"
+	sessionHost := "localhost"
+	if cu, ok := e.userVars["__current_user"]; ok {
+		if cuStr, ok2 := cu.(string); ok2 && cuStr != "" {
+			if atIdx := strings.Index(cuStr, "@"); atIdx >= 0 {
+				sessionUser = cuStr[:atIdx]
+				sessionHost = cuStr[atIdx+1:]
+			} else {
+				sessionUser = cuStr
+			}
+		}
+	}
+
+	grantUser := sessionUser
+	grantHost := sessionHost
+	var usingRoles []string
+
+	if forIdx := strings.Index(upper, " FOR "); forIdx >= 0 {
+		forPart := strings.TrimSpace(query[forIdx+5:])
+		forPart = strings.TrimRight(forPart, ";")
+		// Extract USING clause: "SHOW GRANTS FOR user USING role1, role2"
+		if usingIdx := strings.Index(strings.ToUpper(forPart), " USING "); usingIdx >= 0 {
+			usingPart := strings.TrimSpace(forPart[usingIdx+7:])
+			forPart = strings.TrimSpace(forPart[:usingIdx])
+			// Parse role list
+			for _, rn := range strings.Split(usingPart, ",") {
+				rn = strings.TrimSpace(rn)
+				rn = strings.Trim(rn, "`'\"")
+				if rn != "" {
+					usingRoles = append(usingRoles, rn)
+				}
+			}
+		}
+		// Check for CURRENT_USER() or CURRENT_USER
+		forUpper := strings.ToUpper(strings.TrimSpace(forPart))
+		if forUpper == "CURRENT_USER()" || forUpper == "CURRENT_USER" {
+			// Already resolved from session user above
+		} else if atIdx := strings.LastIndex(forPart, "@"); atIdx >= 0 {
+			grantUser = strings.Trim(strings.TrimSpace(forPart[:atIdx]), "'`\"")
+			grantHost = strings.Trim(strings.TrimSpace(forPart[atIdx+1:]), "'`\"")
+		} else {
+			grantUser = strings.Trim(strings.TrimSpace(forPart), "'`\"")
+		}
+	}
+
+	var grantStrs []string
+	if strings.EqualFold(grantUser, "root") {
+		grantStrs = []string{fmt.Sprintf("GRANT ALL PRIVILEGES ON *.* TO `%s`@`%s` WITH GRANT OPTION", grantUser, grantHost)}
+	} else if e.grantStore != nil {
+		grantStrs = e.grantStore.BuildShowGrants(grantUser, grantHost, usingRoles)
+	} else {
+		grantStrs = []string{fmt.Sprintf("GRANT USAGE ON *.* TO `%s`@`%s`", grantUser, grantHost)}
+	}
+
+	grantRows := make([][]interface{}, len(grantStrs))
+	for i, s := range grantStrs {
+		grantRows[i] = []interface{}{s}
+	}
+	return &Result{
+		Columns:     []string{fmt.Sprintf("Grants for %s@%s", grantUser, grantHost)},
+		Rows:        grantRows,
 		IsResultSet: true,
 	}, nil
 }
