@@ -60,6 +60,10 @@ func (e *Executor) ddlImplicitCommit() {
 func (e *Executor) execBegin() (*Result, error) {
 	if e.inTransaction {
 		// Implicit commit of previous transaction before starting a new one.
+		// Release row locks held by the previous transaction (MySQL behavior).
+		if e.rowLockManager != nil {
+			e.rowLockManager.ReleaseRowLocks(e.connectionID)
+		}
 		e.savepoint = nil
 		e.txnUndoLog = nil
 		if e.txnActiveSet != nil {

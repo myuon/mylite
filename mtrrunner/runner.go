@@ -404,6 +404,7 @@ type execContext struct {
 	pendingSendNext   bool                    // next SQL statement should be sent asynchronously
 	pendingSendEval   bool                    // pending send should use variable substitution
 	pendingEval       bool                    // next SQL statement should have variables expanded in echo
+	disconnectedConns map[string]bool         // set of connection names that have been disconnected
 }
 
 type tableSnapshot struct {
@@ -1410,8 +1411,19 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 			conn.Close()                                       //nolint:errcheck
 			delete(ctx.connByName, key)
 		}
+		// Note: do NOT reset currentConn to "" on disconnect. In real mysqltest,
+		// after --disconnect con1, the current connection stays on the disconnected
+		// connection until a --connection directive changes it. This allows
+		// wait_until_disconnected.inc to detect that the connection is gone (SQL fails).
+		// Track disconnected connections so SQL attempts return a connection error.
+		if ctx.disconnectedConns == nil {
+			ctx.disconnectedConns = map[string]bool{}
+		}
 		if ctx.currentConn == key {
-			ctx.currentConn = ""
+			ctx.disconnectedConns[key] = true
+		} else {
+			// For non-current disconnects, nothing changes about currentConn.
+			_ = key
 		}
 		return true, false, nil
 
@@ -2463,6 +2475,22 @@ func (ctx *execContext) executeSQLNoEcho(stmt string) error {
 }
 
 func (ctx *execContext) executeSQLInner(stmt string) error {
+	// If the current named connection has been disconnected, simulate a lost-connection error.
+	// This matches real mysqltest behaviour: after --disconnect con1, the connection pointer
+	// stays on con1 and any SQL on it fails, allowing wait_until_disconnected.inc to exit.
+	if ctx.isCurrentConnDisconnected() {
+		// errno 2013 = CR_SERVER_LOST: "Lost connection to MySQL server during query"
+		if ctx.variables == nil {
+			ctx.variables = make(map[string]string)
+		}
+		ctx.variables["$mysql_errno"] = "2013"
+		ctx.variables["$mysql_errname"] = "CR_SERVER_LOST"
+		if ctx.expectedError != "" {
+			ctx.expectedError = ""
+			return nil
+		}
+		return fmt.Errorf("Lost connection to MySQL server during query (errno=2013)")
+	}
 	// Strip trailing # comments from SQL (MySQL treats # as line comment)
 	if strings.Contains(stmt, " #") {
 		lines := strings.Split(stmt, "\n")
@@ -3116,6 +3144,17 @@ func (ctx *execContext) getActiveConn() *sql.Conn {
 		return ctx.defaultConn
 	}
 	return ctx.connByName[strings.ToLower(ctx.currentConn)]
+}
+
+// isCurrentConnDisconnected returns true when the active named connection has been
+// explicitly disconnected (--disconnect). This allows SQL on the dead connection to
+// return a "Lost connection" error, matching real mysqltest behaviour (which keeps the
+// current connection pointer on the disconnected conn until --connection changes it).
+func (ctx *execContext) isCurrentConnDisconnected() bool {
+	if ctx.currentConn == "" {
+		return false
+	}
+	return ctx.disconnectedConns != nil && ctx.disconnectedConns[strings.ToLower(ctx.currentConn)]
 }
 
 // queryRows executes a SQL query and returns the results as a slice of string slices.

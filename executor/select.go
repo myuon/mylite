@@ -2092,6 +2092,9 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 			needsRowLock = true
 		}
 	}
+	// isExplicitLock is true for SELECT ... FOR UPDATE / FOR SHARE / LOCK IN SHARE MODE.
+	// In autocommit mode, explicit locks are released at statement end (MySQL auto-commit behavior).
+	isExplicitLock := stmt.Lock == sqlparser.ForUpdateLock || stmt.Lock == sqlparser.ShareModeLock || stmt.Lock == sqlparser.ForShareLock
 	if needsRowLock && e.rowLockManager != nil && len(allRows) > 0 {
 		filteredRows, err := e.acquireRowLocksForSelect(stmt, allRows, preWhereRows)
 		if err != nil {
@@ -2100,6 +2103,11 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		if filteredRows != nil {
 			// SKIP LOCKED: use only the rows we could lock
 			allRows = filteredRows
+		}
+		// In autocommit mode (no explicit transaction), SELECT FOR UPDATE/SHARE locks
+		// are released at statement end, like MySQL's implicit single-statement transaction.
+		if isExplicitLock && !e.shouldAcquireRowLocks() {
+			defer e.rowLockManager.ReleaseRowLocks(e.connectionID)
 		}
 	}
 
