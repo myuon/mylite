@@ -1727,6 +1727,17 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		e.cteMap = newCTEMap
 		defer func() { e.cteMap = outerCTEMap }()
 
+
+		// Check for duplicate CTE names: MySQL errors ER_NONUNIQ_TABLE (1066).
+		seenCTENames := make(map[string]bool)
+		for _, cte := range stmt.With.CTEs {
+			nameLower := strings.ToLower(cte.ID.String())
+			if seenCTENames[nameLower] {
+				return nil, mysqlError(1066, "42000", fmt.Sprintf("Not unique table/alias: '%s'", cte.ID.String()))
+			}
+			seenCTENames[nameLower] = true
+		}
+
 		for _, cte := range stmt.With.CTEs {
 			cteName := cte.ID.String()
 			// For recursive CTEs, use the iterative recursive executor.
@@ -1767,13 +1778,13 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				var err error
 				subResult, err = e.execSelect(sub)
 				if err != nil {
-					return nil, fmt.Errorf("CTE '%s': %w", cteName, err)
+					return nil, err
 				}
 			case *sqlparser.Union:
 				var err error
 				subResult, err = e.execUnion(sub)
 				if err != nil {
-					return nil, fmt.Errorf("CTE '%s': %w", cteName, err)
+					return nil, err
 				}
 			default:
 				return nil, fmt.Errorf("CTE '%s': unsupported subquery type", cteName)
@@ -2409,8 +2420,13 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	}
 
 	preSortedOrderBy := false
+	hasPreProjectionOrderBy := stmt.OrderBy != nil && needsPreProjectionOrderBy(stmt.OrderBy, colNames)
 	// If ORDER BY references base columns that are not projected, pre-sort source rows.
-	if stmt.OrderBy != nil && needsPreProjectionOrderBy(stmt.OrderBy, colNames) {
+	// Exception: when DISTINCT is also requested, we must NOT pre-sort because MySQL
+	// picks the first occurrence of each distinct value in natural (insertion) order,
+	// then sorts the deduplicated result. Pre-sorting before DISTINCT would cause the
+	// wrong "first" occurrence to be retained.
+	if hasPreProjectionOrderBy && !stmt.Distinct {
 		var fromExpr sqlparser.TableExpr
 		if len(stmt.From) > 0 {
 			fromExpr = stmt.From[0]
@@ -2471,7 +2487,18 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 
 	}
 
+	// When DISTINCT is combined with a pre-projection ORDER BY (ORDER BY references
+	// columns not in SELECT), we need to track source allRows for each result row
+	// so we can sort by non-projected columns after deduplication.
+	// MySQL semantics: pick first occurrence of each distinct value (in natural order),
+	// then sort the deduplicated result by the ORDER BY expression.
+	var distinctSourceRows []storage.Row // parallel to resultRows, set only when needed
+	needDistinctSourceTracking := stmt.Distinct && hasPreProjectionOrderBy
+
 	resultRows := make([][]interface{}, 0, len(allRows))
+	if needDistinctSourceTracking {
+		distinctSourceRows = make([]storage.Row, 0, len(allRows))
+	}
 	for _, row := range allRows {
 		// Apply HAVING filter in non-aggregate path (no GROUP BY, no aggregates).
 		// HAVING without GROUP BY is applied per-row against the source row data.
@@ -2504,6 +2531,9 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 			resultRow[i] = val
 		}
 		resultRows = append(resultRows, resultRow)
+		if needDistinctSourceTracking {
+			distinctSourceRows = append(distinctSourceRows, row)
+		}
 	}
 
 	// Apply window functions (ROW_NUMBER, RANK, LAG, SUM OVER, etc.)
@@ -2517,14 +2547,62 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	if stmt.Distinct {
 		seen := make(map[string]bool)
 		unique := make([][]interface{}, 0)
-		for _, row := range resultRows {
+		var uniqueSourceRows []storage.Row
+		if needDistinctSourceTracking {
+			uniqueSourceRows = make([]storage.Row, 0)
+		}
+		for i, row := range resultRows {
 			key := fmt.Sprintf("%v", row)
 			if !seen[key] {
 				seen[key] = true
 				unique = append(unique, row)
+				if needDistinctSourceTracking {
+					uniqueSourceRows = append(uniqueSourceRows, distinctSourceRows[i])
+				}
 			}
 		}
 		resultRows = unique
+		if needDistinctSourceTracking {
+			// Sort the deduplicated result using the ORDER BY expression on source rows.
+			// This matches MySQL behavior: DISTINCT keeps first occurrence (natural order),
+			// then the final result is sorted by ORDER BY.
+			var fromExprD sqlparser.TableExpr
+			if len(stmt.From) > 0 {
+				fromExprD = stmt.From[0]
+			}
+			defaultCollationD := resolveOrderByCollation(selectTableDefs, fromExprD)
+			srcRows := uniqueSourceRows
+			sort.SliceStable(resultRows, func(a, b int) bool {
+				for _, order := range stmt.OrderBy {
+					expr := order.Expr
+					orderCollation := defaultCollationD
+					if collateExpr, ok := expr.(*sqlparser.CollateExpr); ok {
+						orderCollation = collateExpr.Collation
+						expr = collateExpr.Expr
+					}
+					if convExpr, ok := expr.(*sqlparser.ConvertExpr); ok {
+						if convExpr.Type != nil && strings.EqualFold(convExpr.Type.Type, "binary") {
+							orderCollation = "binary"
+							expr = convExpr.Expr
+						}
+					}
+					va := resolveOrderByExprValue(e, expr, srcRows[a])
+					vb := resolveOrderByExprValue(e, expr, srcRows[b])
+					cmp := compareByCollation(va, vb, orderCollation)
+					if cmp == 0 {
+						continue
+					}
+					asc := order.Direction == sqlparser.AscOrder || order.Direction == 0
+					if asc {
+						return cmp < 0
+					}
+					return cmp > 0
+				}
+				return false
+			})
+			// Also sort uniqueSourceRows to keep in sync (needed if further sorts happen)
+			preSortedOrderBy = true // mark as sorted, skip second ORDER BY pass
+		}
 	}
 
 	// Validate ORDER BY positions: numeric literals out of range → error 1054.
@@ -5521,6 +5599,17 @@ func (e *Executor) execUnion(stmt *sqlparser.Union) (*Result, error) {
 		e.cteMap = newCTEMap
 		defer func() { e.cteMap = outerCTEMap }()
 
+
+		// Check for duplicate CTE names: MySQL errors ER_NONUNIQ_TABLE (1066).
+		seenCTENames := make(map[string]bool)
+		for _, cte := range stmt.With.CTEs {
+			nameLower := strings.ToLower(cte.ID.String())
+			if seenCTENames[nameLower] {
+				return nil, mysqlError(1066, "42000", fmt.Sprintf("Not unique table/alias: '%s'", cte.ID.String()))
+			}
+			seenCTENames[nameLower] = true
+		}
+
 		for _, cte := range stmt.With.CTEs {
 			cteName := cte.ID.String()
 			// For recursive CTEs, use the iterative recursive executor.
@@ -5554,7 +5643,7 @@ func (e *Executor) execUnion(stmt *sqlparser.Union) (*Result, error) {
 			}
 			subResult, err := e.execTableStmtForUnion(cte.Subquery)
 			if err != nil {
-				return nil, fmt.Errorf("CTE '%s': %w", cteName, err)
+				return nil, err
 			}
 			columns := subResult.Columns
 			// Apply CTE column aliases if specified.
