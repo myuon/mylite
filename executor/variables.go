@@ -4294,6 +4294,8 @@ func (e *Executor) showStatus(upper string) (*Result, error) {
 		{Name: "Performance_schema_users_lost", Value: "0"},
 		// SSL / OpenSSL status variables (stubs for MTR have_openssl.inc)
 		{Name: "Rsa_public_key", Value: ""},
+		// ACL cache status variables
+		{Name: "Acl_cache_items_count", Value: "0"},
 	}
 	rows := make([][]interface{}, 0, len(statusVars))
 	for _, sv := range statusVars {

@@ -228,6 +228,10 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 
 	// Handle CREATE/DROP ROLE, SET DEFAULT ROLE, SET ROLE
 	if strings.HasPrefix(upper, "CREATE ROLE") {
+		// CREATE ROLE ... IDENTIFIED BY ... is a parse error
+		if strings.Contains(upper, " IDENTIFIED ") {
+			return "", nil, mysqlError(1064, "42000", "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'IDENTIFIED BY' at line 1")
+		}
 		// Register role(s) in the grant store
 		if e.grantStore != nil {
 			rolePart := strings.TrimSpace(query[len("CREATE ROLE"):])
@@ -247,7 +251,60 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		return "", &Result{}, nil
 	}
 	if strings.HasPrefix(upper, "DROP ROLE") ||
-		strings.HasPrefix(upper, "SET DEFAULT ROLE") || strings.HasPrefix(upper, "SET ROLE") {
+		strings.HasPrefix(upper, "SET DEFAULT ROLE") {
+		return "", &Result{}, nil
+	}
+	if strings.HasPrefix(upper, "SET ROLE") {
+		// Parse SET ROLE and store active roles in user variable __active_roles
+		rolePart := strings.TrimSpace(query[len("SET ROLE"):])
+		rolePart = strings.TrimRight(rolePart, ";")
+		upperRole := strings.ToUpper(strings.TrimSpace(rolePart))
+		if upperRole == "NONE" {
+			if e.userVars == nil {
+				e.userVars = make(map[string]interface{})
+			}
+			e.userVars["__active_roles"] = []string{}
+		} else if upperRole == "ALL" || upperRole == "DEFAULT" {
+			// Set all granted roles as active
+			if e.userVars == nil {
+				e.userVars = make(map[string]interface{})
+			}
+			// Get current user's granted roles
+			if e.grantStore != nil {
+				cu := ""
+				if cuv, ok := e.userVars["__current_user"]; ok {
+					if cus, ok := cuv.(string); ok {
+						cu = cus
+					}
+				}
+				var roles []string
+				for _, entry := range e.grantStore.GetGrants(cu, "localhost") {
+					if entry.Type == GrantTypeRole {
+						roles = append(roles, entry.RoleName)
+					}
+				}
+				e.userVars["__active_roles"] = roles
+			}
+		} else {
+			// Parse comma-separated role names
+			var roles []string
+			for _, rn := range strings.Split(rolePart, ",") {
+				rn = strings.TrimSpace(rn)
+				rn = strings.Trim(rn, "`'\"")
+				// Handle role@host format
+				if atIdx := strings.LastIndex(rn, "@"); atIdx >= 0 {
+					rn = strings.TrimSpace(rn[:atIdx])
+					rn = strings.Trim(rn, "`'\"")
+				}
+				if rn != "" {
+					roles = append(roles, rn)
+				}
+			}
+			if e.userVars == nil {
+				e.userVars = make(map[string]interface{})
+			}
+			e.userVars["__active_roles"] = roles
+		}
 		return "", &Result{}, nil
 	}
 

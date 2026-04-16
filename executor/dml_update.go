@@ -423,8 +423,10 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 			if err != nil {
 				return nil, err
 			}
+			canonicalColName := colName // will be overwritten with schema-defined case if found
 			for _, col := range tbl.Def.Columns {
-				if col.Name == colName {
+				if strings.EqualFold(col.Name, colName) {
+					canonicalColName = col.Name
 						if val != nil {
 						colUpper := strings.ToUpper(col.Type)
 						// In non-strict mode, invalid numeric strings are coerced to 0 with warning.
@@ -528,7 +530,7 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 					break
 				}
 			}
-			newRow[colName] = val
+			newRow[canonicalColName] = val
 		}
 
 		// Recalculate generated/virtual columns after SET clauses are applied,
@@ -1081,8 +1083,10 @@ nextRow:
 					unlockAndReturn = err
 					break
 				}
+				canonicalColName := pc.colName // will be overwritten with schema-defined case if found
 				for _, col := range tbl.Def.Columns {
-					if col.Name == pc.colName {
+					if strings.EqualFold(col.Name, pc.colName) {
+						canonicalColName = col.Name
 						if val == nil && !col.Nullable {
 							if bool(stmt.Ignore) {
 								// UPDATE IGNORE: convert NULL to zero value and add warning
@@ -1100,7 +1104,7 @@ nextRow:
 				if unlockAndReturn != nil {
 					break
 				}
-				colVals[pc.colName] = val
+				colVals[canonicalColName] = val
 			}
 			if unlockAndReturn != nil {
 				tbl.Unlock()

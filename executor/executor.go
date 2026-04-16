@@ -2094,6 +2094,11 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 	}
 
+	// Enforce table-level privileges for non-root users.
+	if privErr := e.checkTablePrivilege(stmt); privErr != nil {
+		return nil, privErr
+	}
+
 	switch s := stmt.(type) {
 	case *sqlparser.CreateDatabase:
 		return e.execCreateDatabase(s)
@@ -5694,4 +5699,182 @@ func (e *Executor) isKnownUser(userAtHost string) bool {
 	e.knownUsersMu.RLock()
 	defer e.knownUsersMu.RUnlock()
 	return e.knownUsers[key]
+}
+
+// getCurrentUserAndRoles returns the current non-root user, host, and their active roles.
+// Returns ("", "", nil) if the current user is root or no user is set.
+func (e *Executor) getCurrentUserAndRoles() (string, string, []string) {
+	if e.userVars == nil {
+		return "", "", nil
+	}
+	cuv, ok := e.userVars["__current_user"]
+	if !ok {
+		return "", "", nil
+	}
+	cu, ok := cuv.(string)
+	if !ok || cu == "" || strings.EqualFold(cu, "root") {
+		return "", "", nil
+	}
+	// Host defaults to localhost for client connections
+	host := "localhost"
+	// Get active roles
+	var activeRoles []string
+	if arv, ok2 := e.userVars["__active_roles"]; ok2 {
+		if roles, ok3 := arv.([]string); ok3 {
+			activeRoles = roles
+		}
+	}
+	return cu, host, activeRoles
+}
+
+// checkTablePrivilege checks if the current user has the required privilege for the given statement.
+// Returns an error if access is denied, or nil if access is allowed.
+// Only enforces for non-root users when grantStore is populated.
+func (e *Executor) checkTablePrivilege(stmt sqlparser.Statement) error {
+	if e.grantStore == nil {
+		return nil
+	}
+	// Skip privilege checks inside stored routines (DEFINER security context is not yet implemented).
+	// SQL SECURITY DEFINER procedures run with the definer's (creator's) privileges, not the invoker's.
+	if e.routineDepth > 0 {
+		return nil
+	}
+	user, host, activeRoles := e.getCurrentUserAndRoles()
+	if user == "" {
+		return nil // root or no user context
+	}
+
+	// Only enforce if the user has at least one known table-level privilege grant entry.
+	// This prevents false denials for:
+	//   - Users with only role memberships (whose default roles we may not track)
+	//   - Users with only non-table privileges (EXECUTE, FILE, PROCESS, etc.)
+	//   - Users with IP-based/CIDR grants or other unsupported host formats
+	// We do enforce if there are active roles set (via SET ROLE).
+	if len(activeRoles) == 0 && !e.grantStore.UserHasAnyTablePrivGrant(user, host) {
+		return nil
+	}
+
+	// Helper to check a single table access
+	checkAccess := func(priv, dbName, tableName string) error {
+		// Skip system/information databases - always allow
+		dbLower := strings.ToLower(dbName)
+		if dbLower == "information_schema" || dbLower == "performance_schema" {
+			return nil
+		}
+		// Skip temporary tables - the user created them so they own them
+		if e.tempTables != nil {
+			tblLower := strings.ToLower(tableName)
+			if e.tempTables[tableName] || e.tempTables[tblLower] {
+				return nil
+			}
+		}
+		if !e.grantStore.HasPrivilege(user, host, priv, dbName, tableName, activeRoles) {
+			// Format: "<priv> command denied to user '<user>'@'<host>' for table '<table>'"
+			return mysqlError(1142, "42000", fmt.Sprintf("%s command denied to user '%s'@'%s' for table '%s'",
+				priv, user, host, tableName))
+		}
+		return nil
+	}
+
+	// Determine the required privilege and tables based on statement type
+	switch s := stmt.(type) {
+	case *sqlparser.Select:
+		// Collect CTE names to skip privilege check for them (they're virtual tables)
+		cteNames := make(map[string]bool)
+		if s.With != nil {
+			for _, cte := range s.With.CTEs {
+				cteNames[strings.ToLower(cte.ID.String())] = true
+			}
+		}
+		// Check SELECT privilege on all referenced real tables (skip subqueries and CTEs)
+		for _, tblExpr := range s.From {
+			if err := checkTableExprPrivSkipCTEs(tblExpr, "SELECT", e.CurrentDB, cteNames, checkAccess); err != nil {
+				return err
+			}
+		}
+	case *sqlparser.Insert:
+		dbName := e.CurrentDB
+		tblName := s.Table.TableNameString()
+		if tn, ok := s.Table.Expr.(sqlparser.TableName); ok && !tn.Qualifier.IsEmpty() {
+			dbName = tn.Qualifier.String()
+		}
+		return checkAccess("INSERT", dbName, tblName)
+	case *sqlparser.Update:
+		for _, tblExpr := range s.TableExprs {
+			if err := checkTableExprPriv(tblExpr, "UPDATE", e.CurrentDB, checkAccess); err != nil {
+				return err
+			}
+		}
+	case *sqlparser.Delete:
+		for _, tblExpr := range s.TableExprs {
+			if err := checkTableExprPriv(tblExpr, "DELETE", e.CurrentDB, checkAccess); err != nil {
+				return err
+			}
+		}
+	case *sqlparser.DropTable:
+		for _, tbl := range s.FromTables {
+			dbName := e.CurrentDB
+			if !tbl.Qualifier.IsEmpty() {
+				dbName = tbl.Qualifier.String()
+			}
+			if err := checkAccess("DROP", dbName, tbl.Name.String()); err != nil {
+				return err
+			}
+		}
+	case *sqlparser.CreateTable:
+		dbName := e.CurrentDB
+		if !s.Table.Qualifier.IsEmpty() {
+			dbName = s.Table.Qualifier.String()
+		}
+		// For temporary tables, also accept CREATE TEMPORARY TABLES privilege
+		if s.Temp {
+			user, host, activeRoles := e.getCurrentUserAndRoles()
+			if e.grantStore.HasPrivilege(user, host, "CREATE TEMPORARY TABLES", dbName, s.Table.Name.String(), activeRoles) {
+				return nil
+			}
+		}
+		return checkAccess("CREATE", dbName, s.Table.Name.String())
+	}
+	return nil
+}
+
+// checkTableExprPriv recursively checks privilege for a table expression.
+func checkTableExprPriv(tblExpr sqlparser.TableExpr, priv, currentDB string, check func(priv, db, table string) error) error {
+	return checkTableExprPrivSkipCTEs(tblExpr, priv, currentDB, nil, check)
+}
+
+// checkTableExprPrivSkipCTEs recursively checks privilege for a table expression, skipping CTE virtual tables.
+func checkTableExprPrivSkipCTEs(tblExpr sqlparser.TableExpr, priv, currentDB string, cteNames map[string]bool, check func(priv, db, table string) error) error {
+	switch t := tblExpr.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if tn, ok := t.Expr.(sqlparser.TableName); ok {
+			tblName := tn.Name.String()
+			// Skip DUAL (MySQL's virtual table for SELECT without FROM)
+			if strings.EqualFold(tblName, "dual") {
+				return nil
+			}
+			// Skip CTE references (they're virtual tables defined in the WITH clause)
+			if cteNames != nil && cteNames[strings.ToLower(tblName)] {
+				return nil
+			}
+			dbName := currentDB
+			if !tn.Qualifier.IsEmpty() {
+				dbName = tn.Qualifier.String()
+			}
+			return check(priv, dbName, tblName)
+		}
+		// Subquery or derived table - no table-level privilege check here
+	case *sqlparser.JoinTableExpr:
+		if err := checkTableExprPrivSkipCTEs(t.LeftExpr, priv, currentDB, cteNames, check); err != nil {
+			return err
+		}
+		return checkTableExprPrivSkipCTEs(t.RightExpr, priv, currentDB, cteNames, check)
+	case *sqlparser.ParenTableExpr:
+		for _, te := range t.Exprs {
+			if err := checkTableExprPrivSkipCTEs(te, priv, currentDB, cteNames, check); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

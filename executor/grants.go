@@ -205,6 +205,175 @@ func (gs *GrantStore) GetRoleGrants(roleName string) []GrantEntry {
 	return result
 }
 
+// HasPrivilege checks if a user (with active roles) has a specific privilege on db.table.
+// priv is like "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", etc.
+// db and table are the target (empty table means DB-level check, both empty means global check).
+// activeRoles is the list of currently active role names.
+func (gs *GrantStore) HasPrivilege(user, host, priv, db, table string, activeRoles []string) bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	priv = strings.ToUpper(priv)
+
+	// checkEntries checks a list of entries for the given privilege on db.table
+	var checkEntries func(entries []GrantEntry) bool
+	checkEntries = func(entries []GrantEntry) bool {
+		for _, e := range entries {
+			if e.Type == GrantTypeRole {
+				continue
+			}
+			// Check if this entry covers the required privilege
+			hasPriv := false
+			for _, p := range e.Privs {
+				if p == "ALL PRIVILEGES" || strings.EqualFold(p, priv) {
+					hasPriv = true
+					break
+				}
+				// Handle column-level grants: "SELECT(c1)" counts as SELECT privilege
+				// at the table level (column enforcement would be separate)
+				if parenIdx := strings.Index(p, "("); parenIdx > 0 {
+					basePriv := strings.TrimSpace(p[:parenIdx])
+					if strings.EqualFold(basePriv, priv) {
+						hasPriv = true
+						break
+					}
+				}
+			}
+			if !hasPriv {
+				continue
+			}
+			// Check scope: does this entry cover db.table?
+			switch e.Type {
+			case GrantTypeGlobal: // *.* covers everything
+				return true
+			case GrantTypeDB: // db.* covers this db
+				entryDB := strings.TrimSuffix(e.Object, ".*")
+				if db != "" && dbNameMatches(entryDB, db) {
+					return true
+				}
+			case GrantTypeTable: // db.tbl covers this specific table
+				parts := strings.SplitN(e.Object, ".", 2)
+				if len(parts) == 2 && db != "" && table != "" &&
+					dbNameMatches(parts[0], db) && strings.EqualFold(parts[1], table) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// Check user's own grants (exact host, then wildcard host)
+	uk := userKey(user, host)
+	if checkEntries(gs.entries[uk]) {
+		return true
+	}
+	// Also check grants stored with wildcard host "%"
+	if host != "%" {
+		ukWild := userKey(user, "%")
+		if checkEntries(gs.entries[ukWild]) {
+			return true
+		}
+	}
+
+	// Expand active roles recursively
+	var checkRole func(roleName, roleHost string, visited map[string]bool) bool
+	checkRole = func(roleName, roleHost string, visited map[string]bool) bool {
+		rk := userKey(roleName, roleHost)
+		if visited[rk] {
+			return false
+		}
+		visited[rk] = true
+		// Check role's privilege grants
+		if checkEntries(gs.roles[rk]) {
+			return true
+		}
+		// Also check gs.entries for this role (role-to-role grants are in entries)
+		allEntries := append(gs.roles[rk], gs.entries[rk]...)
+		for _, e := range allEntries {
+			if e.Type == GrantTypeRole {
+				nestedHost := e.RoleHost
+				if nestedHost == "" {
+					nestedHost = "%"
+				}
+				if checkRole(e.RoleName, nestedHost, visited) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	visited := make(map[string]bool)
+	for _, roleName := range activeRoles {
+		if checkRole(roleName, "%", visited) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// tablePrivileges is the set of privileges that affect table-level access.
+// We only enforce table-level checks when the user has explicit table-level privilege grants.
+var tablePrivileges = map[string]bool{
+	"SELECT": true, "INSERT": true, "UPDATE": true, "DELETE": true,
+	"CREATE": true, "DROP": true, "ALTER": true, "INDEX": true,
+	"ALL PRIVILEGES": true, "ALL": true,
+	"CREATE TEMPORARY TABLES": true,
+}
+
+// UserHasAnyTablePrivGrant returns true if the given user (at exact host or wildcard %) has any
+// table-level privilege grant entries (not just role membership or non-table grants like EXECUTE/FILE).
+// This is used to determine if privilege enforcement should be applied.
+// Users with only EXECUTE, FILE, PROCESS etc. or role memberships don't get table-level enforcement.
+func (gs *GrantStore) UserHasAnyTablePrivGrant(user, host string) bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	hasTablePrivEntry := func(entries []GrantEntry) bool {
+		for _, e := range entries {
+			if e.Type == GrantTypeRole {
+				continue
+			}
+			for _, p := range e.Privs {
+				basePriv := strings.ToUpper(strings.TrimSpace(p))
+				if idx := strings.Index(basePriv, "("); idx >= 0 {
+					basePriv = strings.TrimSpace(basePriv[:idx])
+				}
+				if tablePrivileges[basePriv] {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	uk := userKey(user, host)
+	if hasTablePrivEntry(gs.entries[uk]) {
+		return true
+	}
+	if host != "%" {
+		ukWild := userKey(user, "%")
+		if hasTablePrivEntry(gs.entries[ukWild]) {
+			return true
+		}
+	}
+	return false
+}
+
+// dbNameMatches checks if a stored DB name pattern matches the actual DB name.
+// Supports MySQL LIKE patterns (% and _) for database name matching.
+func dbNameMatches(pattern, dbName string) bool {
+	if strings.EqualFold(pattern, dbName) {
+		return true
+	}
+	// Check if pattern contains wildcard characters
+	if strings.ContainsAny(pattern, "%_") {
+		return matchLike(strings.ToLower(dbName), strings.ToLower(pattern))
+	}
+	return false
+}
+
 // BuildShowGrants builds SHOW GRANTS output rows for a user.
 // usingRoles is the list of role names to expand (from USING clause).
 // Returns rows like ["GRANT SELECT ON *.* TO `u`@`h`"].
@@ -229,7 +398,7 @@ func (gs *GrantStore) BuildShowGrants(user, host string, usingRoles []string) []
 
 	privMap := make(map[privKey]*privSet)
 
-	addEntries := func(es []GrantEntry) {
+	addPrivEntries := func(es []GrantEntry) {
 		for _, e := range es {
 			if e.Type == GrantTypeRole {
 				continue // role grants handled separately
@@ -247,13 +416,39 @@ func (gs *GrantStore) BuildShowGrants(user, host string, usingRoles []string) []
 		}
 	}
 
-	addEntries(entries)
+	// expandRole recursively expands a role's privilege grants into privMap.
+	// visited prevents infinite recursion on circular role grants.
+	// Roles store privilege grants in gs.roles, but role-to-role grants go into gs.entries.
+	var expandRole func(roleName, roleHost string, visited map[string]bool)
+	expandRole = func(roleName, roleHost string, visited map[string]bool) {
+		rk := userKey(roleName, roleHost)
+		if visited[rk] {
+			return
+		}
+		visited[rk] = true
+		// Privilege grants for this role are in gs.roles
+		rolePrivEntries := gs.roles[rk]
+		addPrivEntries(rolePrivEntries)
+		// Nested role grants for this role may be in gs.entries (role-to-role grants)
+		// or in gs.roles (if AddRoleGrant was corrected for roles)
+		allEntries := append(rolePrivEntries, gs.entries[rk]...)
+		for _, e := range allEntries {
+			if e.Type == GrantTypeRole {
+				nestedHost := e.RoleHost
+				if nestedHost == "" {
+					nestedHost = "%"
+				}
+				expandRole(e.RoleName, nestedHost, visited)
+			}
+		}
+	}
 
-	// Expand using roles
+	addPrivEntries(entries)
+
+	// Expand using roles (with recursive nested role expansion)
+	visited := make(map[string]bool)
 	for _, roleName := range usingRoles {
-		roleKey := userKey(roleName, "%")
-		roleEntries := gs.roles[roleKey]
-		addEntries(roleEntries)
+		expandRole(roleName, "%", visited)
 	}
 
 	// Check if there's a global privilege entry
@@ -320,26 +515,89 @@ func (gs *GrantStore) BuildShowGrants(user, host string, usingRoles []string) []
 		rows = append(rows, fmt.Sprintf("GRANT %s ON `%s`.`%s` TO `%s`@`%s`%s", privStr, parts[0], parts[1], user, host, suffix))
 	}
 
-	// Role membership grants (sorted by role name)
-	var roleGrants []GrantEntry
-	for _, e := range entries {
-		if e.Type == GrantTypeRole {
-			roleGrants = append(roleGrants, e)
+	// Role membership grants: group by admin option, sort, and format as comma-separated
+	// Also collect WITH ADMIN OPTION roles inherited from USING roles (recursively).
+	var roleGrantsNoAdmin []GrantEntry
+	var roleGrantsWithAdmin []GrantEntry
+	// Track inherited admin roles to avoid duplicates
+	inheritedAdminRoles := make(map[string]bool) // "roleName@host" -> true
+
+	// Collect inherited WITH ADMIN OPTION roles from USING roles (recursively)
+	var collectInheritedAdminRoles func(roleName, roleHost string, visitedAdm map[string]bool)
+	collectInheritedAdminRoles = func(roleName, roleHost string, visitedAdm map[string]bool) {
+		rk := userKey(roleName, roleHost)
+		if visitedAdm[rk] {
+			return
+		}
+		visitedAdm[rk] = true
+		// Look in both gs.roles and gs.entries for this role's nested role grants
+		allEntries := append(gs.roles[rk], gs.entries[rk]...)
+		for _, e := range allEntries {
+			if e.Type == GrantTypeRole && e.GrantOption {
+				nestedHost := e.RoleHost
+				if nestedHost == "" {
+					nestedHost = "%"
+				}
+				inheritedKey := userKey(e.RoleName, nestedHost)
+				if !inheritedAdminRoles[inheritedKey] {
+					inheritedAdminRoles[inheritedKey] = true
+					roleGrantsWithAdmin = append(roleGrantsWithAdmin, GrantEntry{
+						Type:        GrantTypeRole,
+						RoleName:    e.RoleName,
+						RoleHost:    nestedHost,
+						GrantOption: true,
+					})
+				}
+				// Recurse
+				collectInheritedAdminRoles(e.RoleName, nestedHost, visitedAdm)
+			}
 		}
 	}
-	sort.Slice(roleGrants, func(i, j int) bool {
-		return strings.ToLower(roleGrants[i].RoleName) < strings.ToLower(roleGrants[j].RoleName)
+
+	for _, roleName := range usingRoles {
+		collectInheritedAdminRoles(roleName, "%", make(map[string]bool))
+	}
+
+	for _, e := range entries {
+		if e.Type == GrantTypeRole {
+			if e.GrantOption {
+				// Only add if not already in inherited list
+				rk := userKey(e.RoleName, e.RoleHost)
+				if !inheritedAdminRoles[rk] {
+					roleGrantsWithAdmin = append(roleGrantsWithAdmin, e)
+				}
+			} else {
+				roleGrantsNoAdmin = append(roleGrantsNoAdmin, e)
+			}
+		}
+	}
+	sort.Slice(roleGrantsNoAdmin, func(i, j int) bool {
+		return strings.ToLower(roleGrantsNoAdmin[i].RoleName) < strings.ToLower(roleGrantsNoAdmin[j].RoleName)
 	})
-	for _, e := range roleGrants {
-		rh := e.RoleHost
-		if rh == "" {
-			rh = "%"
+	sort.Slice(roleGrantsWithAdmin, func(i, j int) bool {
+		return strings.ToLower(roleGrantsWithAdmin[i].RoleName) < strings.ToLower(roleGrantsWithAdmin[j].RoleName)
+	})
+	if len(roleGrantsNoAdmin) > 0 {
+		var parts []string
+		for _, e := range roleGrantsNoAdmin {
+			rh := e.RoleHost
+			if rh == "" {
+				rh = "%"
+			}
+			parts = append(parts, fmt.Sprintf("`%s`@`%s`", e.RoleName, rh))
 		}
-		suffix := ""
-		if e.GrantOption {
-			suffix = " WITH ADMIN OPTION"
+		rows = append(rows, fmt.Sprintf("GRANT %s TO `%s`@`%s`", strings.Join(parts, ","), user, host))
+	}
+	if len(roleGrantsWithAdmin) > 0 {
+		var parts []string
+		for _, e := range roleGrantsWithAdmin {
+			rh := e.RoleHost
+			if rh == "" {
+				rh = "%"
+			}
+			parts = append(parts, fmt.Sprintf("`%s`@`%s`", e.RoleName, rh))
 		}
-		rows = append(rows, fmt.Sprintf("GRANT `%s`@`%s` TO `%s`@`%s`%s", e.RoleName, rh, user, host, suffix))
+		rows = append(rows, fmt.Sprintf("GRANT %s TO `%s`@`%s` WITH ADMIN OPTION", strings.Join(parts, ","), user, host))
 	}
 
 	return rows
@@ -357,6 +615,8 @@ func objectToGrantType(object string) GrantType {
 }
 
 // normalizePrivList converts a comma-separated privilege string into a sorted uppercase list.
+// For column-level grants like "SELECT(c1)", the priv name is uppercased but column names
+// are kept lowercase (MySQL stores them lowercase).
 func normalizePrivList(privs string) []string {
 	// Expand ALL / ALL PRIVILEGES
 	upper := strings.ToUpper(strings.TrimSpace(privs))
@@ -366,9 +626,19 @@ func normalizePrivList(privs string) []string {
 	parts := strings.Split(privs, ",")
 	var result []string
 	for _, p := range parts {
-		p = strings.ToUpper(strings.TrimSpace(p))
-		if p != "" {
-			result = append(result, p)
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// Handle column-level grants: "SELECT(c1)" -> "SELECT(c1)" with uppercase priv name
+		if parenIdx := strings.Index(p, "("); parenIdx > 0 {
+			basePriv := strings.ToUpper(strings.TrimSpace(p[:parenIdx]))
+			colPart := p[parenIdx:] // "(c1)" - preserve as-is but lowercase col names
+			// Lowercase the column names inside parens
+			colPart = "(" + strings.ToLower(strings.Trim(strings.TrimSpace(colPart), "()")) + ")"
+			result = append(result, basePriv+colPart)
+		} else {
+			result = append(result, strings.ToUpper(p))
 		}
 	}
 	sort.Strings(result)
@@ -450,12 +720,46 @@ func formatPrivList(privs map[string]bool) string {
 			ordered = append(ordered, p)
 			seen[p] = true
 		}
+		// Also check for column-level grants (e.g., "SELECT(c1)")
+		for pv := range privs {
+			if !seen[pv] {
+				if parenIdx := strings.Index(pv, "("); parenIdx > 0 {
+					basePriv := strings.ToUpper(strings.TrimSpace(pv[:parenIdx]))
+					if basePriv == p {
+						// Format as: "SELECT (`c1`)"
+						colPart := strings.Trim(pv[parenIdx:], "()")
+						// Backtick each column
+						cols := strings.Split(colPart, ",")
+						var quotedCols []string
+						for _, c := range cols {
+							c = strings.TrimSpace(c)
+							quotedCols = append(quotedCols, "`"+c+"`")
+						}
+						ordered = append(ordered, fmt.Sprintf("%s (%s)", p, strings.Join(quotedCols, ", ")))
+						seen[pv] = true
+					}
+				}
+			}
+		}
 	}
 	// Add any remaining privs not in our order list
 	var rest []string
 	for p := range privs {
 		if !seen[p] {
-			rest = append(rest, p)
+			// Check if it's a column-level grant
+			if parenIdx := strings.Index(p, "("); parenIdx > 0 {
+				basePriv := strings.ToUpper(strings.TrimSpace(p[:parenIdx]))
+				colPart := strings.Trim(p[parenIdx:], "()")
+				cols := strings.Split(colPart, ",")
+				var quotedCols []string
+				for _, c := range cols {
+					c = strings.TrimSpace(c)
+					quotedCols = append(quotedCols, "`"+c+"`")
+				}
+				rest = append(rest, fmt.Sprintf("%s (%s)", basePriv, strings.Join(quotedCols, ", ")))
+			} else {
+				rest = append(rest, p)
+			}
 		}
 	}
 	sort.Strings(rest)
