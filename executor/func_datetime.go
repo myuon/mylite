@@ -503,7 +503,10 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		// Use smart (type-aware) output format only when both arguments are string literals.
 		// When either arg is a column reference or expression, MySQL returns datetime(6) format.
 		_, fmtIsLit := v.Exprs[1].(*sqlparser.Literal)
-		parsed := mysqlStrToDate(toString(strVal), toString(fmtVal2), fmtIsLit)
+		parsed, err := mysqlStrToDate(toString(strVal), toString(fmtVal2), fmtIsLit, e.isStrictMode())
+		if err != nil {
+			return nil, true, err
+		}
 		if parsed == nil {
 			return nil, true, nil
 		}
@@ -2617,21 +2620,49 @@ func timestampDiff(unit sqlparser.IntervalType, t1, t2 time.Time) int64 {
 }
 
 // mysqlStrToDate parses a date string using a MySQL format string (like STR_TO_DATE).
-// Returns nil if the string cannot be parsed.
+// Returns (nil, nil) if the string cannot be parsed (format mismatch → NULL result).
+// In strict mode, returns (nil, err) with MySQL error 1411 if the string is parsed but
+// contains an invalid date component (zero year/month/day, or out-of-range month/day).
+// In non-strict mode, invalid date components return (nil, nil) instead of an error.
 // When literalFormat is true, returns a smart type-aware format (date, time, or datetime).
 
-func mysqlStrToDate(dateStr, format string, literalFormat bool) *string {
+func mysqlStrToDate(dateStr, format string, literalFormat bool, strictMode bool) (*string, error) {
 	// Use a custom MySQL-compatible parser rather than Go's time.Parse,
 	// because MySQL supports specifiers that Go doesn't (e.g. %D, %#, %j, %U, %W).
 	p := &mysqlDateParser{s: dateStr, f: format, literalMode: literalFormat}
 	if !p.parse() {
-		return nil
+		return nil, nil
 	}
 	if !p.validate() {
-		return nil
+		return nil, nil
+	}
+	// After successful parsing, check for invalid date component values.
+	// MySQL error 1411 (HY000): "Incorrect datetime value: '%s' for function str_to_date"
+	// In strict mode: return error. In non-strict mode: return NULL silently.
+	if p.hasDate || p.hasYear || p.hasMonth || p.hasDay {
+		yr, mo, dy := p.resolveDate()
+		invalid := false
+		if p.hasYear && yr == 0 {
+			invalid = true
+		} else if p.hasMonth && mo == 0 {
+			invalid = true
+		} else if p.hasDay && dy == 0 {
+			invalid = true
+		} else if p.hasMonth && mo > 12 {
+			invalid = true
+		} else if p.hasDay && dy > 31 {
+			invalid = true
+		}
+		if invalid {
+			if strictMode {
+				return nil, mysqlError(1411, "HY000", fmt.Sprintf("Incorrect datetime value: '%s' for function str_to_date", dateStr))
+			}
+			// Non-strict mode: return NULL
+			return nil, nil
+		}
 	}
 	result := p.format()
-	return &result
+	return &result, nil
 }
 
 type mysqlDateParser struct {
@@ -2651,7 +2682,7 @@ type mysqlDateParser struct {
 	weekV, weekv               int // week number for %V/%v, -1=unset
 	yearX, yearx               int // year for %X/%x
 	hasDate, hasTime, hasMicro bool
-	hasYear, hasMonth          bool // true if %Y/%y or %m/%c/%M/%b present
+	hasYear, hasMonth, hasDay  bool // true if %Y/%y or %m/%c/%M/%b or %d/%e/%D present
 	hasAMPM                    bool
 	has24hHour                 bool // true if %H or %k was used (24-hour format)
 	hasWeekday                 bool // true if %W or %w was used
@@ -2800,6 +2831,7 @@ func (p *mysqlDateParser) parse() bool {
 				}
 				p.day = n
 				p.hasDate = true
+				p.hasDay = true
 			case 'e': // day 1-31 (no leading zero)
 				n, ok := p.readInt(2)
 				if !ok {
@@ -2807,6 +2839,7 @@ func (p *mysqlDateParser) parse() bool {
 				}
 				p.day = n
 				p.hasDate = true
+				p.hasDay = true
 			case 'D': // day with ordinal suffix (1st, 2nd, 3rd...)
 				n, ok := p.readInt(2)
 				if !ok {
@@ -2814,6 +2847,7 @@ func (p *mysqlDateParser) parse() bool {
 				}
 				p.day = n
 				p.hasDate = true
+				p.hasDay = true
 				// Skip ordinal suffix (st, nd, rd, th)
 				for p.si < len(p.s) && p.s[p.si] >= 'a' && p.s[p.si] <= 'z' {
 					p.si++

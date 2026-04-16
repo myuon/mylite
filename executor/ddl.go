@@ -1811,7 +1811,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			}
 			def.Comment = comment
 		case "CHARSET", "CHARACTER SET":
-			def.Charset = strings.ToLower(opt.String)
+			csVal := strings.ToLower(opt.String)
+			if !isKnownCharset(csVal) {
+				return nil, mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", csVal))
+			}
+			def.Charset = csVal
 			charsetSpecified = true
 		case "COLLATE":
 			def.Collation = strings.ToLower(opt.String)
