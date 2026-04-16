@@ -1364,6 +1364,21 @@ func isKnownCollation(name string) bool {
 	return false
 }
 
+// charsetAliasEqual returns true if two charset names are equivalent,
+// treating "utf8" and "utf8mb3" as aliases of each other.
+func charsetAliasEqual(a, b string) bool {
+	a = strings.ToLower(a)
+	b = strings.ToLower(b)
+	if strings.EqualFold(a, b) {
+		return true
+	}
+	// utf8 and utf8mb3 are aliases
+	if (a == "utf8" || a == "utf8mb3") && (b == "utf8" || b == "utf8mb3") {
+		return true
+	}
+	return false
+}
+
 // resolveCollationID resolves a numeric collation ID to the collation name.
 func resolveCollationID(id int64) (string, bool) {
 	for _, row := range allCollations() {

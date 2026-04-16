@@ -248,6 +248,8 @@ func allCollations() [][]interface{} {
 		{"utf8mb4_vi_0900_ai_ci", "utf8mb4", int64(277), "", "Yes", int64(1), "NO PAD"},
 		{"utf8mb4_vi_0900_as_cs", "utf8mb4", int64(300), "", "Yes", int64(1), "NO PAD"},
 		{"utf8mb4_zh_0900_as_cs", "utf8mb4", int64(308), "", "Yes", int64(1), "NO PAD"},
+		{"utf8_bengali_standard_ci", "utf8", int64(216), "", "Yes", int64(1), "PAD SPACE"},
+		{"utf8_bengali_traditional_ci", "utf8", int64(217), "", "Yes", int64(1), "PAD SPACE"},
 		{"utf8_bin", "utf8", int64(83), "", "Yes", int64(1), "PAD SPACE"},
 		{"utf8_croatian_ci", "utf8", int64(213), "", "Yes", int64(1), "PAD SPACE"},
 		{"utf8_czech_ci", "utf8", int64(202), "", "Yes", int64(1), "PAD SPACE"},

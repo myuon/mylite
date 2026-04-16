@@ -295,7 +295,7 @@ func (e *Executor) execCreateDatabase(stmt *sqlparser.CreateDatabase) (*Result, 
 	// Validate collation is compatible with charset (ER_COLLATION_CHARSET_MISMATCH = 1253)
 	if charset != "" && collation != "" {
 		if collCharset, ok := catalog.CharsetForCollation(collation); ok {
-			if !strings.EqualFold(collCharset, charset) {
+			if !charsetAliasEqual(collCharset, charset) {
 				return nil, mysqlError(1253, "42000", fmt.Sprintf("COLLATION '%s' is not valid for CHARACTER SET '%s'", collation, charset))
 			}
 		}
@@ -477,7 +477,7 @@ func (e *Executor) execCreateDatabaseRaw(query string) (*Result, error) {
 	// Validate collation is compatible with charset (ER_COLLATION_CHARSET_MISMATCH = 1253)
 	if charset != "" && collation != "" {
 		if collCharset, ok := catalog.CharsetForCollation(collation); ok {
-			if !strings.EqualFold(collCharset, charset) {
+			if !charsetAliasEqual(collCharset, charset) {
 				return nil, mysqlError(1253, "42000", fmt.Sprintf("COLLATION '%s' is not valid for CHARACTER SET '%s'", collation, charset))
 			}
 		}
@@ -1089,7 +1089,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				return nil, mysqlError(1273, "HY000", fmt.Sprintf("Unknown collation: '%s'", col.Type.Options.Collate))
 			}
 			// Validate collation is compatible with any explicit column charset.
-			if colDef.Charset != "" && !strings.EqualFold(collCharset, colDef.Charset) {
+			if colDef.Charset != "" && !charsetAliasEqual(collCharset, colDef.Charset) {
 				return nil, mysqlError(1253, "42000", fmt.Sprintf("COLLATION '%s' is not valid for CHARACTER SET '%s'", col.Type.Options.Collate, colDef.Charset))
 			}
 			colDef.Collation = collLower
@@ -1882,7 +1882,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	// Validate collation is compatible with charset (ER_COLLATION_CHARSET_MISMATCH = 1253)
 	if charsetSpecified && collationSpecified && def.Charset != "" && def.Collation != "" {
 		if collCharset, ok := catalog.CharsetForCollation(def.Collation); ok {
-			if !strings.EqualFold(collCharset, def.Charset) {
+			if !charsetAliasEqual(collCharset, def.Charset) {
 				return nil, mysqlError(1253, "42000", fmt.Sprintf("COLLATION '%s' is not valid for CHARACTER SET '%s'", def.Collation, def.Charset))
 			}
 		}
