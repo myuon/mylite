@@ -114,7 +114,9 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if err != nil {
 			return nil, true, err
 		}
-		if fmt.Sprintf("%v", v0) == fmt.Sprintf("%v", v1) {
+		// Use compareValues for MySQL-compatible equality (e.g. 1.0 = 1 is true).
+		eq, _ := compareValues(v0, v1, sqlparser.EqualOp)
+		if eq {
 			return nil, true, nil
 		}
 		return v0, true, nil
