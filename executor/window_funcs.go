@@ -2,6 +2,7 @@ package executor
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -63,6 +64,10 @@ func containsWindowFunc(expr sqlparser.Expr) bool {
 		return v.OverClause != nil
 	case *sqlparser.BitXor:
 		return v.OverClause != nil
+	case *sqlparser.JSONArrayAgg:
+		return v.OverClause != nil
+	case *sqlparser.JSONObjectAgg:
+		return v.OverClause != nil
 	case *sqlparser.BinaryExpr:
 		return containsWindowFunc(v.Left) || containsWindowFunc(v.Right)
 	case *sqlparser.UnaryExpr:
@@ -85,6 +90,10 @@ func containsWindowFunc(expr sqlparser.Expr) bool {
 				return true
 			}
 		}
+	case *sqlparser.CastExpr:
+		return containsWindowFunc(v.Expr)
+	case *sqlparser.ConvertExpr:
+		return containsWindowFunc(v.Expr)
 	}
 	return false
 }
@@ -188,6 +197,10 @@ func getOverClause(expr sqlparser.Expr) *sqlparser.OverClause {
 		return v.OverClause
 	case *sqlparser.BitXor:
 		return v.OverClause
+	case *sqlparser.JSONArrayAgg:
+		return v.OverClause
+	case *sqlparser.JSONObjectAgg:
+		return v.OverClause
 	}
 	return nil
 }
@@ -239,6 +252,10 @@ func findInnerOverClause(expr sqlparser.Expr) *sqlparser.OverClause {
 		}
 		return findInnerOverClause(v.Right)
 	case *sqlparser.UnaryExpr:
+		return findInnerOverClause(v.Expr)
+	case *sqlparser.CastExpr:
+		return findInnerOverClause(v.Expr)
+	case *sqlparser.ConvertExpr:
 		return findInnerOverClause(v.Expr)
 	}
 	return nil
@@ -1268,6 +1285,51 @@ func (e *Executor) evalWindowFuncForRow(
 			}
 		}
 		return result, nil
+
+	case *sqlparser.JSONArrayAgg:
+		start, end := e.computeFrameBounds(ws.FrameClause, ws.OrderClause, partRows, localIdx, orderByVals)
+		if start < 0 {
+			start = 0
+		}
+		if end >= n {
+			end = n - 1
+		}
+		arr := make([]interface{}, 0)
+		for i := start; i <= end; i++ {
+			val, _ := e.evalRowExpr(v.Expr, partRows[i])
+			arr = append(arr, toJSONValue(val))
+		}
+		return jsonMarshalMySQL(arr), nil
+
+	case *sqlparser.JSONObjectAgg:
+		start, end := e.computeFrameBounds(ws.FrameClause, ws.OrderClause, partRows, localIdx, orderByVals)
+		if start < 0 {
+			start = 0
+		}
+		if end >= n {
+			end = n - 1
+		}
+		obj := make(map[string]interface{})
+		var keys []string
+		for i := start; i <= end; i++ {
+			keyVal, _ := e.evalRowExpr(v.Key, partRows[i])
+			if keyVal == nil {
+				// MySQL skips NULL keys in window function context
+				continue
+			}
+			valVal, _ := e.evalRowExpr(v.Value, partRows[i])
+			k := toString(keyVal)
+			if _, exists := obj[k]; !exists {
+				keys = append(keys, k)
+			}
+			obj[k] = toJSONValue(valVal)
+		}
+		var parts []string
+		for _, k := range keys {
+			kb, _ := json.Marshal(k)
+			parts = append(parts, string(kb)+": "+jsonMarshalMySQL(obj[k]))
+		}
+		return "{" + strings.Join(parts, ", ") + "}", nil
 	}
 
 	// Handle FuncExpr (or BinaryExpr etc.) that wraps a window function
@@ -1303,36 +1365,66 @@ func (e *Executor) evalWindowFuncExprSubstitute(
 			if err != nil {
 				return nil, err
 			}
-			return e.applyFuncToVal(v.Name.Lowered(), innerVal, partRows[localIdx])
+			// Build a synthetic FuncExpr with the computed value as a literal arg, then evaluate it.
+			litExpr := valToLiteralExpr(innerVal)
+			syntheticFunc := &sqlparser.FuncExpr{
+				Name:  v.Name,
+				Exprs: []sqlparser.Expr{litExpr},
+			}
+			return e.evalRowExpr(syntheticFunc, partRows[localIdx])
+		}
+	case *sqlparser.BinaryExpr:
+		// Handle binary expressions containing window functions, e.g. `0 & (JSON_ARRAYAGG(1) OVER w)`
+		left := v.Left
+		right := v.Right
+		if containsWindowFunc(left) {
+			lv, err := e.evalWindowFuncForRow(left, ws, partRows, localIdx, orderByVals)
+			if err != nil {
+				return nil, err
+			}
+			left = valToLiteralExpr(lv)
+		}
+		if containsWindowFunc(right) {
+			rv, err := e.evalWindowFuncForRow(right, ws, partRows, localIdx, orderByVals)
+			if err != nil {
+				return nil, err
+			}
+			right = valToLiteralExpr(rv)
+		}
+		synthetic := &sqlparser.BinaryExpr{Operator: v.Operator, Left: left, Right: right}
+		return e.evalRowExpr(synthetic, partRows[localIdx])
+	case *sqlparser.CastExpr:
+		// Handle CAST(window_func AS type)
+		if containsWindowFunc(v.Expr) {
+			innerVal, err := e.evalWindowFuncForRow(v.Expr, ws, partRows, localIdx, orderByVals)
+			if err != nil {
+				return nil, err
+			}
+			litExpr := valToLiteralExpr(innerVal)
+			syntheticCast := &sqlparser.CastExpr{Expr: litExpr, Type: v.Type}
+			return e.evalRowExpr(syntheticCast, partRows[localIdx])
 		}
 	}
 	return e.evalRowExpr(expr, partRows[localIdx])
 }
 
-// applyFuncToVal applies a single-argument function to a pre-computed value.
-func (e *Executor) applyFuncToVal(funcName string, val interface{}, row storage.Row) (interface{}, error) {
-	switch funcName {
-	case "hex":
-		switch tv := val.(type) {
-		case int64:
-			return strings.ToUpper(fmt.Sprintf("%X", uint64(tv))), nil
-		case uint64:
-			return strings.ToUpper(fmt.Sprintf("%X", tv)), nil
-		case float64:
-			return strings.ToUpper(fmt.Sprintf("%X", uint64(int64(tv)))), nil
-		case HexBytes:
-			return strings.ToUpper(string(tv)), nil
-		default:
-			s := fmt.Sprintf("%v", val)
-			var hexResult strings.Builder
-			for _, b := range []byte(s) {
-				hexResult.WriteString(fmt.Sprintf("%02X", b))
-			}
-			return hexResult.String(), nil
-		}
+// valToLiteralExpr converts a Go value to a sqlparser literal expression for use in synthetic queries.
+func valToLiteralExpr(val interface{}) sqlparser.Expr {
+	if val == nil {
+		return &sqlparser.NullVal{}
 	}
-	// For other functions, fall back to evalRowExpr
-	return e.evalRowExpr(&sqlparser.FuncExpr{}, row)
+	switch v := val.(type) {
+	case int64:
+		return sqlparser.NewIntLiteral(fmt.Sprintf("%d", v))
+	case uint64:
+		return sqlparser.NewIntLiteral(fmt.Sprintf("%d", v))
+	case float64:
+		return sqlparser.NewFloatLiteral(fmt.Sprintf("%v", v))
+	case string:
+		return sqlparser.NewStrLiteral(v)
+	default:
+		return sqlparser.NewStrLiteral(fmt.Sprintf("%v", val))
+	}
 }
 
 // formatWindowSumFloat formats a float64 SUM result for display.

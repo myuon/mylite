@@ -2531,6 +2531,13 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	if needDistinctSourceTracking {
 		distinctSourceRows = make([]storage.Row, 0, len(allRows))
 	}
+	// filteredAllRows tracks the source storage.Row for each resultRow entry,
+	// needed when window functions are evaluated after HAVING filtering.
+	var filteredAllRows []storage.Row
+	hasWindowFuncs := selectExprsHaveWindowFuncs(stmt.SelectExprs.Exprs)
+	if hasWindowFuncs && stmt.Having != nil {
+		filteredAllRows = make([]storage.Row, 0, len(allRows))
+	}
 	for _, row := range allRows {
 		// Apply HAVING filter in non-aggregate path (no GROUP BY, no aggregates).
 		// HAVING without GROUP BY is applied per-row against the source row data.
@@ -2543,6 +2550,9 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 			if !match {
 				continue
 			}
+		}
+		if filteredAllRows != nil {
+			filteredAllRows = append(filteredAllRows, row)
 		}
 		resultRow := make([]interface{}, len(colExprs))
 		for i, expr := range colExprs {
@@ -2569,8 +2579,13 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	}
 
 	// Apply window functions (ROW_NUMBER, RANK, LAG, SUM OVER, etc.)
-	if selectExprsHaveWindowFuncs(stmt.SelectExprs.Exprs) {
-		if err := e.processWindowFunctionsWithNamedWindows(colExprs, allRows, resultRows, stmt.Windows); err != nil {
+	if hasWindowFuncs {
+		// Use filteredAllRows when HAVING was applied to keep allRows and resultRows in sync.
+		windowInputRows := allRows
+		if filteredAllRows != nil {
+			windowInputRows = filteredAllRows
+		}
+		if err := e.processWindowFunctionsWithNamedWindows(colExprs, windowInputRows, resultRows, stmt.Windows); err != nil {
 			return nil, err
 		}
 	}
