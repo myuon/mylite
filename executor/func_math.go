@@ -375,6 +375,9 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 			rat1, ok1 := parseDecimalStringToRat(r1Str)
 			if ok0 && ok1 {
 				if rat1.Sign() == 0 {
+					if e.insideDML && e.isStrictMode() && (strings.Contains(e.sqlMode, "ERROR_FOR_DIVISION_BY_ZERO") || strings.Contains(e.sqlMode, "TRADITIONAL")) {
+						return nil, true, mysqlError(1365, "22012", "Division by 0")
+					}
 					return nil, true, nil
 				}
 				// MOD(a, b) = a - TRUNCATE(a/b, 0) * b  (using big.Rat)
@@ -418,6 +421,9 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		rf0 := toFloat(v0)
 		rf1 := toFloat(v1)
 		if rf1 == 0 {
+			if e.insideDML && e.isStrictMode() && (strings.Contains(e.sqlMode, "ERROR_FOR_DIVISION_BY_ZERO") || strings.Contains(e.sqlMode, "TRADITIONAL")) {
+				return nil, true, mysqlError(1365, "22012", "Division by 0")
+			}
 			return nil, true, nil
 		}
 		mod := math.Mod(rf0, rf1)

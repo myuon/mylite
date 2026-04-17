@@ -421,7 +421,19 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 			// values already updated by preceding clauses, so use newRow.
 			val, err := e.evalRowExpr(upd.Expr, newRow)
 			if err != nil {
-				return nil, err
+				// In TRADITIONAL mode, division by zero in SET raises error 1365.
+				// With IGNORE, the error is suppressed and NULL is stored instead.
+				if isMySQLError(err, 1365) {
+					if bool(stmt.Ignore) {
+						e.addWarning("Warning", 1365, "Division by 0")
+						val = nil // store NULL
+					} else if e.isStrictMode() && (strings.Contains(e.sqlMode, "ERROR_FOR_DIVISION_BY_ZERO") || strings.Contains(e.sqlMode, "TRADITIONAL")) {
+						return nil, err
+					}
+					// else: non-strict, just store NULL (fall through with val=nil)
+				} else {
+					return nil, err
+				}
 			}
 			canonicalColName := colName // will be overwritten with schema-defined case if found
 			for _, col := range tbl.Def.Columns {

@@ -818,6 +818,15 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					if err != nil {
 						if bool(stmt.Ignore) {
 							e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", colNames[i]))
+							// In IGNORE mode, coerce overflow literal to clamped value.
+							// Use overflowStr to determine the correct clamped value.
+							for _, col := range tbl.Def.Columns {
+								if col.Name == colNames[i] {
+									v = coerceIntegerValue(col.Type, overflowStr)
+									break
+								}
+							}
+							err = nil
 						} else {
 							return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colNames[i]))
 						}

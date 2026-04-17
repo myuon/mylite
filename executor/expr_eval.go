@@ -774,6 +774,9 @@ func (e *Executor) evalBinaryOp(v *sqlparser.BinaryExpr) (interface{}, error) {
 			}
 		}
 	}
+	// In TRADITIONAL (strict + ERROR_FOR_DIVISION_BY_ZERO) mode, division by zero
+	// is an error (not NULL) when inside a DML context.
+	// Note: ERROR_FOR_DIVISION_BY_ZERO alone (without strict) only produces a warning.
 	return evalBinaryExpr(left, right, v.Operator, e.getDivPrecisionIncrement())
 }
 
@@ -4643,6 +4646,17 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 					oe := &intOverflowError{val: s, kind: "BINARY"}
 					e.addWarning("Warning", 1292, formatOverflowWarningMsg(oe))
 					right = uint64(math.MaxUint64)
+				}
+			}
+		}
+		// In TRADITIONAL/ERROR_FOR_DIVISION_BY_ZERO + strict mode during DML:
+		// division by zero raises error 1365. NULL divisor returns NULL (not an error).
+		if (v.Operator == sqlparser.DivOp || v.Operator == sqlparser.IntDivOp || v.Operator == sqlparser.ModOp) && e.insideDML && right != nil {
+			rf := toFloat(right)
+			if rf == 0 {
+				isDivError := e.isStrictMode() && (strings.Contains(e.sqlMode, "ERROR_FOR_DIVISION_BY_ZERO") || strings.Contains(e.sqlMode, "TRADITIONAL"))
+				if isDivError {
+					return nil, mysqlError(1365, "22012", "Division by 0")
 				}
 			}
 		}

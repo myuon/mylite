@@ -1982,12 +1982,64 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 		} else {
 			n, err := strconv.ParseInt(numStr, 10, 64)
 			if err != nil {
+				// For signed BIGINT, use big.Int to avoid float64 precision issues at boundary.
+				if !isUnsigned && baseType == "BIGINT" {
+					bi := new(big.Int)
+					if _, ok := bi.SetString(numStr, 10); ok {
+						maxIBig := new(big.Int).SetInt64(maxVal)
+						minIBig := new(big.Int).SetInt64(minVal)
+						if bi.Cmp(maxIBig) > 0 {
+							return maxVal
+						}
+						if bi.Cmp(minIBig) < 0 {
+							return minVal
+						}
+						return bi.Int64()
+					}
+					return maxVal
+				}
+				// For unsigned types, try ParseUint first to handle values > MaxInt64.
+				if isUnsigned && !strings.HasPrefix(numStr, "-") && baseType == "BIGINT" {
+					u, uerr := strconv.ParseUint(numStr, 10, 64)
+					if uerr == nil {
+						if u > maxUnsigned {
+							return maxUnsigned
+						}
+						return u
+					}
+					// ParseUint failed: number overflows uint64. Use big.Float for accurate comparison.
+					bf := new(big.Float).SetPrec(128)
+					if _, ok := bf.SetString(numStr); ok {
+						maxUBig := new(big.Float).SetPrec(128).SetUint64(maxUnsigned)
+						if bf.Sign() < 0 {
+							return uint64(0)
+						}
+						if bf.Cmp(maxUBig) > 0 {
+							return maxUnsigned
+						}
+						// Value is within range, extract as uint64
+						u64, _ := bf.Uint64()
+						return u64
+					}
+					return maxUnsigned
+				}
 				// Might be too large for int64
 				f, err2 := strconv.ParseFloat(numStr, 64)
 				if err2 != nil {
 					return int64(0)
 				}
-				if f > float64(maxVal) {
+				if isUnsigned {
+					if f < 0 {
+						intVal = 0
+					} else if f > float64(maxUnsigned) {
+						if baseType == "BIGINT" {
+							return maxUnsigned
+						}
+						intVal = int64(maxUnsigned)
+					} else {
+						intVal = mysqlRoundToInt(f)
+					}
+				} else if f > float64(maxVal) {
 					intVal = maxVal
 				} else if f < float64(minVal) {
 					intVal = minVal
@@ -2216,7 +2268,8 @@ func checkIntegerStrict(colType string, colName string, v interface{}) error {
 	if s, ok := v.(string); ok {
 		s = strings.TrimSpace(s)
 		if s == "" {
-			return nil // empty string -> 0 is OK even in strict mode for non-strict numeric
+			// Empty string → integer column: error in strict mode (MySQL error 1366).
+			return mysqlError(1366, "HY000", fmt.Sprintf("Incorrect integer value: '' for column '%s' at row 1", colName))
 		}
 		sl := strings.ToLower(s)
 		if sl == "true" || sl == "false" {
@@ -2226,17 +2279,19 @@ func checkIntegerStrict(colType string, colName string, v interface{}) error {
 		_, errInt := strconv.ParseInt(s, 10, 64)
 		_, errFloat := strconv.ParseFloat(s, 64)
 		if errInt != nil && errFloat != nil {
-			// Try to extract leading numeric part
-			hasNumeric := false
+			// Check if the FIRST character starts a numeric sequence (leading numeric prefix).
+			// MySQL: 'a59b' → error 1366 (no leading numeric); '1a' → error 1265 Data truncated (has leading numeric but trailing garbage).
+			firstChar := rune(0)
 			for _, c := range s {
-				if (c >= '0' && c <= '9') || c == '-' || c == '.' {
-					hasNumeric = true
-					break
-				}
+				firstChar = c
+				break
 			}
-			if !hasNumeric {
+			hasLeadingNumeric := (firstChar >= '0' && firstChar <= '9') || firstChar == '-' || firstChar == '.'
+			if !hasLeadingNumeric {
 				return mysqlError(1366, "HY000", fmt.Sprintf("Incorrect integer value: '%s' for column '%s' at row 1", s, colName))
 			}
+			// Has leading numeric but also trailing non-numeric → Data truncated.
+			return mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", colName))
 		}
 	}
 
@@ -2246,16 +2301,48 @@ func checkIntegerStrict(colType string, colName string, v interface{}) error {
 	case int64:
 		intVal = val
 	case float64:
-		intVal = int64(val)
+		// Avoid undefined behavior when float64 is out of int64 range.
+		// Use explicit out-of-range check before converting to int64.
+		if isUnsigned {
+			if val < 0 {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+			}
+			if val > float64(maxUnsigned) {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+			}
+			// val is in unsigned range, convert safely via big.Float for BIGINT to avoid precision issues
+			if baseType == "BIGINT" {
+				bf := new(big.Float).SetPrec(64).SetFloat64(val)
+				u, _ := bf.Uint64()
+				if u > maxUnsigned {
+					return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+				}
+				return nil
+			}
+			intVal = int64(val)
+		} else {
+			if val > float64(maxVal) {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+			}
+			if val < float64(minVal) {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+			}
+			intVal = int64(val)
+		}
 	case uint64:
 		if isUnsigned && val > maxUnsigned {
+			return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+		}
+		if !isUnsigned && val > uint64(maxVal) {
+			// e.g. uint64(9223372036854775808) into BIGINT (maxVal=9223372036854775807)
 			return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
 		}
 		return nil
 	case string:
 		val = strings.TrimSpace(val)
 		if val == "" {
-			return nil
+			// Empty string → integer column: error in strict mode.
+			return mysqlError(1366, "HY000", fmt.Sprintf("Incorrect integer value: '' for column '%s' at row 1", colName))
 		}
 		vLower := strings.ToLower(val)
 		if vLower == "true" {
