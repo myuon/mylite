@@ -1858,9 +1858,11 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 					// Also populate mysql.db / mysql.tables_priv for raw table queries
 					e.syncGrantToMysqlTables(privs, object, toUser, toHost, grantOption)
 
-					// Track specific privileges for internal use
+					// Track specific privileges for internal use.
+					// SUPER is a global-only privilege, so only grant it when object is *.* (global scope).
 					upperPrivs := strings.ToUpper(privs)
-					if strings.Contains(upperPrivs, "SUPER") || upperPrivs == "ALL" || upperPrivs == "ALL PRIVILEGES" {
+					isGlobalScope := object == "*.*"
+					if isGlobalScope && (strings.Contains(upperPrivs, "SUPER") || upperPrivs == "ALL" || upperPrivs == "ALL PRIVILEGES") {
 						if toUser != "" && e.superUsersMu != nil {
 							e.superUsersMu.Lock()
 							e.superUsers[strings.ToLower(toUser)] = true
