@@ -1527,6 +1527,28 @@ func normalizeDateTimeSeparators(s string) string {
 	return result.String()
 }
 
+// isYearColumnString returns true if the string represents a YEAR column value:
+// exactly 4 digits, in the range 0000 or 1901-2155.
+func isYearColumnString(s string) bool {
+	if len(s) != 4 {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	// "0000" is valid YEAR zero value
+	if s == "0000" {
+		return true
+	}
+	y, err := strconv.Atoi(s)
+	if err != nil {
+		return false
+	}
+	return y >= 1901 && y <= 2155
+}
+
 // looksLikeDate checks if a string looks like a date value (contains date separators).
 func looksLikeDate(s string) bool {
 	// Contains date-like separator and has digits

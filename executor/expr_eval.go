@@ -6749,6 +6749,17 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 					ln, rn = normalizeDateTimeForCompare(ln, rn)
 					return ln == rn, nil
 				}
+				// Handle YEAR column (4-digit string, e.g. "2026") compared with DATETIME string.
+				// MySQL extracts the year from the DATETIME and compares only the year portion.
+				// e.g.: YEAR_col = NOW() where YEAR_col="2026" and NOW()="2026-04-17 15:55:12" -> true
+				if isYearColumnString(ls) && rn != "" {
+					yearFromDT := rn[:4]
+					return ls == yearFromDT, nil
+				}
+				if isYearColumnString(rs) && ln != "" {
+					yearFromDT := ln[:4]
+					return rs == yearFromDT, nil
+				}
 			}
 			// Try TIME normalization if either looks like a time.
 			// Use strict check to avoid false positives from strings that contain ':'
