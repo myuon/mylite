@@ -702,6 +702,21 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		return "", result, err
 	}
 
+	// LOAD XML INFILE: unsupported feature (vitess parser can't parse it either)
+	if strings.HasPrefix(upper, "LOAD XML ") {
+		return "", nil, ErrUnsupported("LOAD XML INFILE")
+	}
+
+	// IMPORT TABLE FROM: unsupported feature
+	if strings.HasPrefix(upper, "IMPORT TABLE ") {
+		return "", nil, ErrUnsupported("IMPORT TABLE")
+	}
+
+	// INSTALL COMPONENT / UNINSTALL COMPONENT: unsupported feature
+	if strings.HasPrefix(upper, "INSTALL COMPONENT") || strings.HasPrefix(upper, "UNINSTALL COMPONENT") {
+		return "", nil, ErrUnsupported("INSTALL COMPONENT")
+	}
+
 	// Handle ALTER TABLE ... DISCARD/IMPORT TABLESPACE (InnoDB transportable tablespace, no-op)
 	if strings.HasPrefix(upper, "ALTER TABLE") &&
 		(strings.Contains(upper, "DISCARD TABLESPACE") || strings.Contains(upper, "IMPORT TABLESPACE")) {
