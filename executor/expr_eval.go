@@ -668,7 +668,17 @@ func (e *Executor) evalConvertExpr(v *sqlparser.ConvertExpr) (interface{}, error
 		return toString(val), nil
 	case "DECIMAL", "FLOAT", "DOUBLE", "REAL":
 		return toFloat(val), nil
-	case "DATETIME", "DATE", "TIME", "TIMESTAMP":
+	case "DATETIME", "TIMESTAMP":
+		if val == nil {
+			return nil, nil
+		}
+		return e.castToDatetime(toString(val))
+	case "DATE":
+		if val == nil {
+			return nil, nil
+		}
+		return e.castToDate(toString(val))
+	case "TIME":
 		if val == nil {
 			return nil, nil
 		}
@@ -1897,31 +1907,12 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 			if val == nil {
 				return nil, nil
 			}
-			s := toString(val)
-			// CAST AS DATETIME strips microseconds (returns YYYY-MM-DD HH:MM:SS)
-			if len(s) > 19 && s[19] == '.' {
-				s = s[:19]
-			}
-			return s, nil
+			return e.castToDatetime(toString(val))
 		case "DATE":
 			if val == nil {
 				return nil, nil
 			}
-			s := toString(val)
-			// For short strings (< 8 chars), try compact integer-to-date parsing
-			// (e.g., integer 1111 → "2000-11-11", 0 → "0000-00-00").
-			// This handles MySQL's YYMMDD/YYYMMDD shorthand for CAST AS DATE.
-			if len(s) < 8 {
-				if parsed := parseMySQLDateValue(s); parsed != "" {
-					return parsed, nil
-				}
-				return nil, nil
-			}
-			// CAST AS DATE strips time component and returns YYYY-MM-DD
-			if len(s) >= 10 {
-				s = s[:10]
-			}
-			return s, nil
+			return e.castToDate(toString(val))
 		case "TIME":
 			if val == nil {
 				return nil, nil
@@ -2011,6 +2002,112 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 		}
 	}
 	return val, nil
+}
+
+// castToDatetime normalizes a string value for CAST/CONVERT AS DATETIME.
+// Handles date-only or datetime strings with single-digit month/day/hour/min.
+// In TRADITIONAL/NO_ZERO_DATE strict mode during DML, zero dates return an error.
+func (e *Executor) castToDatetime(s string) (interface{}, error) {
+	// Strip microseconds (YYYY-MM-DD HH:MM:SS.ffffff → YYYY-MM-DD HH:MM:SS)
+	if len(s) > 19 && s[19] == '.' {
+		s = s[:19]
+	}
+	// Check for delimited date strings that may need zero-date enforcement or normalization.
+	if strings.ContainsAny(s, "-/") {
+		datePortion := s
+		timePortion := ""
+		hasTimeSep := false
+		if idx := strings.IndexAny(s, " \tT"); idx >= 0 {
+			datePortion = s[:idx]
+			timePortion = strings.TrimSpace(s[idx+1:])
+			hasTimeSep = true
+		}
+		dateParts := strings.SplitN(datePortion, "-", 3)
+		if len(dateParts) == 3 {
+			y, ey := strconv.Atoi(dateParts[0])
+			m, em := strconv.Atoi(dateParts[1])
+			d, ed := strconv.Atoi(dateParts[2])
+			if ey == nil && em == nil && ed == nil {
+				// In TRADITIONAL/NO_ZERO_DATE mode during DML, CAST('0000-00-00' AS DATETIME)
+				// returns "Incorrect datetime value: '0000-00-00'" error (no column info).
+				if y == 0 && m == 0 && d == 0 && e.isStrictMode() && e.insideDML {
+					isNoZeroDate := strings.Contains(e.sqlMode, "NO_ZERO_DATE") || strings.Contains(e.sqlMode, "TRADITIONAL")
+					if isNoZeroDate {
+						normalizedDate := fmt.Sprintf("%04d-%02d-%02d", y, m, d)
+						return nil, mysqlError(1292, "22007", fmt.Sprintf("Incorrect datetime value: '%s'", normalizedDate))
+					}
+				}
+				// Only normalize (pad single-digit parts and add missing time components)
+				// when inside DML (INSERT/UPDATE) context. In SELECT/expression context,
+				// preserve the original string format.
+				if e.insideDML {
+					normalizedDate := fmt.Sprintf("%04d-%02d-%02d", y, m, d)
+					if !hasTimeSep {
+						return normalizedDate + " 00:00:00", nil
+					}
+					timeParts := strings.SplitN(timePortion, ":", 3)
+					hh, mm2, ss := 0, 0, 0
+					if len(timeParts) >= 1 {
+						hh, _ = strconv.Atoi(timeParts[0])
+					}
+					if len(timeParts) >= 2 {
+						mm2, _ = strconv.Atoi(timeParts[1])
+					}
+					if len(timeParts) >= 3 {
+						secStr := timeParts[2]
+						if dotIdx := strings.IndexByte(secStr, '.'); dotIdx >= 0 {
+							secStr = secStr[:dotIdx]
+						}
+						ss, _ = strconv.Atoi(secStr)
+					}
+					return fmt.Sprintf("%s %02d:%02d:%02d", normalizedDate, hh, mm2, ss), nil
+				}
+			}
+		}
+	}
+	return s, nil
+}
+
+// castToDate normalizes a string value for CAST/CONVERT AS DATE.
+// Handles compact numeric formats and delimited date strings with single-digit parts.
+// In TRADITIONAL/NO_ZERO_DATE strict mode during DML, zero dates return an error.
+func (e *Executor) castToDate(s string) (interface{}, error) {
+	// For short strings (< 8 chars), try compact integer-to-date parsing.
+	if len(s) < 8 {
+		if parsed := parseMySQLDateValue(s); parsed != "" {
+			return parsed, nil
+		}
+		return nil, nil
+	}
+	// Parse delimited date strings (YYYY-M-D, YYYY-MM-D, etc.) and normalize.
+	if strings.ContainsAny(s, "-/") {
+		datePortion := s
+		if idx := strings.IndexAny(s, " \tT"); idx >= 0 {
+			datePortion = s[:idx]
+		}
+		parts := strings.SplitN(datePortion, "-", 3)
+		if len(parts) == 3 {
+			y, ey := strconv.Atoi(parts[0])
+			m, em := strconv.Atoi(parts[1])
+			d, ed := strconv.Atoi(parts[2])
+			if ey == nil && em == nil && ed == nil {
+				normalized := fmt.Sprintf("%04d-%02d-%02d", y, m, d)
+				// In TRADITIONAL/NO_ZERO_DATE mode, CAST('0000-00-00' AS DATE) returns
+				// "Incorrect datetime value: '0000-00-00'" error (no column info).
+				if y == 0 && m == 0 && d == 0 && e.isStrictMode() && e.insideDML {
+					isNoZeroDate := strings.Contains(e.sqlMode, "NO_ZERO_DATE") || strings.Contains(e.sqlMode, "TRADITIONAL")
+					if isNoZeroDate {
+						return nil, mysqlError(1292, "22007", fmt.Sprintf("Incorrect datetime value: '%s'", normalized))
+					}
+				}
+				return normalized, nil
+			}
+		}
+	}
+	if len(s) >= 10 {
+		s = s[:10]
+	}
+	return s, nil
 }
 
 // evalIsExpr handles *sqlparser.IsExpr evaluation.

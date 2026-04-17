@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -473,6 +474,19 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 								if (unsignedCol && (cls == "overflow_neg" || f < 0)) || outOfRange {
 									e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row %d", col.Name, i+1))
 								}
+							}
+						}
+						// In strict mode, check integer column range constraints.
+						if e.isStrictMode() && !bool(stmt.Ignore) {
+							if err := checkIntegerStrict(col.Type, col.Name, val); err != nil {
+								// Adjust row number: checkIntegerStrict hardcodes "at row 1",
+								// but UPDATE reports the actual table row index (i+1).
+								rowNum := i + 1
+								if rowNum != 1 {
+									errMsg := strings.ReplaceAll(err.Error(), "at row 1", fmt.Sprintf("at row %d", rowNum))
+									return nil, errors.New(errMsg)
+								}
+								return nil, err
 							}
 						}
 					}
