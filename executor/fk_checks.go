@@ -121,14 +121,14 @@ func (e *Executor) checkParentRowExists(dbName, childTableName string, fk catalo
 		}
 	}
 
-	parentRef := fmt.Sprintf("`%s`.`%s`", dbName, fk.ReferencedTable)
 	return mysqlError(1452, "23000",
-		fmt.Sprintf("Cannot add or update a child row: a foreign key constraint fails (`%s`.`%s`, CONSTRAINT `%s` FOREIGN KEY (%s) REFERENCES %s (%s))",
+		fmt.Sprintf("Cannot add or update a child row: a foreign key constraint fails (`%s`.`%s`, CONSTRAINT `%s` FOREIGN KEY (%s) REFERENCES `%s` (%s)%s)",
 			dbName, childTableName,
 			fk.Name,
 			formatColumnList(fk.Columns),
-			parentRef,
-			formatColumnList(fk.ReferencedColumns)))
+			fk.ReferencedTable,
+			formatColumnList(fk.ReferencedColumns),
+			fkActionSuffix(fk)))
 }
 
 // handleParentRowRemoval processes FK actions when a parent row is deleted.
@@ -403,24 +403,30 @@ func formatColumnList(cols []string) string {
 }
 
 // fkActionSuffix returns the ON DELETE/ON UPDATE suffix for FK error messages.
-// MySQL includes these in the error when the action is not the default (RESTRICT).
+// MySQL includes these in the error when the action is explicitly specified.
 func fkActionSuffix(fk catalog.ForeignKeyDef) string {
 	var suffix string
 	del := strings.ToUpper(fk.OnDelete)
 	upd := strings.ToUpper(fk.OnUpdate)
-	if del == "CASCADE" {
+	switch del {
+	case "CASCADE":
 		suffix += " ON DELETE CASCADE"
-	} else if del == "SET NULL" {
+	case "SET NULL":
 		suffix += " ON DELETE SET NULL"
-	} else if del == "NO ACTION" {
+	case "NO ACTION":
 		suffix += " ON DELETE NO ACTION"
+	case "RESTRICT":
+		suffix += " ON DELETE RESTRICT"
 	}
-	if upd == "CASCADE" {
+	switch upd {
+	case "CASCADE":
 		suffix += " ON UPDATE CASCADE"
-	} else if upd == "SET NULL" {
+	case "SET NULL":
 		suffix += " ON UPDATE SET NULL"
-	} else if upd == "NO ACTION" {
+	case "NO ACTION":
 		suffix += " ON UPDATE NO ACTION"
+	case "RESTRICT":
+		suffix += " ON UPDATE RESTRICT"
 	}
 	return suffix
 }

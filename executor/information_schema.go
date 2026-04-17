@@ -1652,6 +1652,7 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 				if col.Default != nil {
 					colDefault = *col.Default
 				}
+				// colDefault will be post-processed below after type info is determined
 
 				// Derive DATA_TYPE and precision/scale from col.Type
 				dataType := strings.ToLower(col.Type)
@@ -1667,6 +1668,26 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 				// Normalize type aliases
 				if dataType == "integer" {
 					dataType = "int"
+				} else if dataType == "real" {
+					dataType = "double"
+				}
+				// Normalize FLOAT(n) precision: float(1-24) -> float, float(25-53) -> double
+				if dataType == "float" {
+					// Check the colTypeUpper for precision
+					colTypeUp2 := strings.ToUpper(strings.TrimSpace(col.Type))
+					if idx := strings.Index(colTypeUp2, "("); idx >= 0 {
+						end := strings.Index(colTypeUp2[idx:], ")")
+						if end > 0 {
+							inner := strings.TrimSpace(colTypeUp2[idx+1 : idx+end])
+							// Remove any modifiers after the number
+							if commaIdx := strings.Index(inner, ","); commaIdx >= 0 {
+								inner = strings.TrimSpace(inner[:commaIdx])
+							}
+							if prec, err := strconv.ParseInt(inner, 10, 64); err == nil && prec >= 25 && prec <= 53 {
+								dataType = "double"
+							}
+						}
+					}
 				}
 
 				var charMaxLen interface{}
@@ -1754,6 +1775,69 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 						charOctetLen = charLen * charsetMaxBytes
 					}
 				}
+			case "ENUM":
+				// CHARACTER_MAXIMUM_LENGTH = max length of the longest enum value
+				if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
+					end := strings.LastIndex(colTypeUpper, ")")
+					if end > idx {
+						inner := colTypeUpper[idx+1 : end]
+						vals := splitEnumSetValues(inner)
+						maxLen := int64(0)
+						for _, v := range vals {
+							if int64(len(v)) > maxLen {
+								maxLen = int64(len(v))
+							}
+						}
+						charMaxLen = maxLen
+						colCharsetForEnum := strings.ToLower(col.Charset)
+						if colCharsetForEnum == "" {
+							if tbl.Charset != "" {
+								colCharsetForEnum = strings.ToLower(tbl.Charset)
+							} else {
+								colCharsetForEnum = "utf8mb4"
+							}
+						}
+						maxBytes := int64(4)
+						if colCharsetForEnum == "latin1" || colCharsetForEnum == "ascii" {
+							maxBytes = 1
+						} else if colCharsetForEnum == "utf8" || colCharsetForEnum == "utf8mb3" {
+							maxBytes = 3
+						}
+						charOctetLen = maxLen * maxBytes
+					}
+				}
+			case "SET":
+				// CHARACTER_MAXIMUM_LENGTH = sum of all set values + commas
+				if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
+					end := strings.LastIndex(colTypeUpper, ")")
+					if end > idx {
+						inner := colTypeUpper[idx+1 : end]
+						vals := splitEnumSetValues(inner)
+						totalLen := int64(0)
+						for i, v := range vals {
+							totalLen += int64(len(v))
+							if i > 0 {
+								totalLen++ // for comma separator
+							}
+						}
+						charMaxLen = totalLen
+						colCharsetForSet := strings.ToLower(col.Charset)
+						if colCharsetForSet == "" {
+							if tbl.Charset != "" {
+								colCharsetForSet = strings.ToLower(tbl.Charset)
+							} else {
+								colCharsetForSet = "utf8mb4"
+							}
+						}
+						maxBytes := int64(4)
+						if colCharsetForSet == "latin1" || colCharsetForSet == "ascii" {
+							maxBytes = 1
+						} else if colCharsetForSet == "utf8" || colCharsetForSet == "utf8mb3" {
+							maxBytes = 3
+						}
+						charOctetLen = totalLen * maxBytes
+					}
+				}
 			case "TINYBLOB":
 				charMaxLen = int64(255)
 				charOctetLen = int64(255)
@@ -1815,6 +1899,9 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 						parts := strings.Split(inner, ",")
 						if len(parts) >= 1 {
 							if p, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64); err == nil {
+								if p == 0 {
+									p = 10 // MySQL normalizes DECIMAL(0) to DECIMAL(10,0)
+								}
 								numPrecision = p
 							}
 						}
@@ -1831,9 +1918,167 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 					numPrecision = int64(10)
 					numScale = int64(0)
 				}
-			case "FLOAT", "DOUBLE":
-				numPrecision = nil
+			case "BIT":
+				// BIT(n): NUMERIC_PRECISION = n
+				if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
+					end := strings.Index(colTypeUpper[idx:], ")")
+					if end > 0 {
+						if n, err := strconv.ParseInt(strings.TrimSpace(colTypeUpper[idx+1:idx+end]), 10, 64); err == nil {
+							numPrecision = n
+						}
+					}
+				} else {
+					numPrecision = int64(1) // BIT without length defaults to BIT(1)
+				}
+			case "FLOAT":
+				// MySQL reports NUMERIC_PRECISION=12 for FLOAT (1-24 bits) or 22 for DOUBLE (25-53 bits)
+				numPrecision = int64(12)
 				numScale = nil
+				// Check if this is actually a double-precision float
+				if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
+					end := strings.Index(colTypeUpper[idx:], ")")
+					if end > 0 {
+						inner := strings.TrimSpace(colTypeUpper[idx+1 : idx+end])
+						if prec, err := strconv.ParseInt(inner, 10, 64); err == nil && prec >= 25 && prec <= 53 {
+							numPrecision = int64(22)
+						}
+					}
+				}
+			case "DOUBLE", "REAL":
+				// MySQL reports NUMERIC_PRECISION=22 for DOUBLE/REAL
+				numPrecision = int64(22)
+				numScale = nil
+			}
+
+			// Coerce COLUMN_DEFAULT for DECIMAL/NUMERIC types: apply scale rounding
+			// and zerofill formatting to match MySQL INFORMATION_SCHEMA output.
+			if colDefault != nil && (baseType == "DECIMAL" || baseType == "NUMERIC" || baseType == "DEC") {
+				if defStr, ok := colDefault.(string); ok {
+					if scale, ok2 := numScale.(int64); ok2 {
+						if prec, ok3 := numPrecision.(int64); ok3 {
+							colTypeUp := strings.ToUpper(col.Type)
+							isZF := strings.Contains(colTypeUp, "ZEROFILL")
+							// Format the decimal value with the correct number of scale digits.
+							// Use string manipulation to avoid float64 precision issues.
+							formatted := formatDecimalDefault(defStr, int(scale))
+							if isZF && prec > 0 {
+								// Zerofill: pad with zeros to total display width.
+								// For DECIMAL(p,s): integer part = (p-s) digits, scale part = s digits.
+								// Total width = (p-s) + 1 + s = p+1 when scale>0, or p when scale=0.
+								// But display is actually: integerPart + "." + scalePart
+								// where integerPart is zero-padded to (p-s) width.
+								var totalWidth int
+								if scale > 0 {
+									intPart := int(prec) - int(scale)
+									totalWidth = intPart + 1 + int(scale) // integer_digits + "." + scale_digits
+								} else {
+									totalWidth = int(prec)
+								}
+								if len(formatted) < totalWidth {
+									formatted = strings.Repeat("0", totalWidth-len(formatted)) + formatted
+								}
+							}
+							colDefault = formatted
+						}
+					}
+				}
+			}
+
+			// Coerce COLUMN_DEFAULT for temporal types
+			if colDefault != nil {
+				if defStr, ok := colDefault.(string); ok {
+					switch baseType {
+					case "TIME":
+						// Normalize time default to HH:MM:SS format
+						normalized := normalizeTimeDefault(defStr)
+						if normalized != "" {
+							colDefault = normalized
+						}
+					case "DATETIME":
+						// Normalize datetime default to YYYY-MM-DD HH:MM:SS
+						normalized := normalizeDatetimeDefault(defStr)
+						if normalized != "" {
+							colDefault = normalized
+						}
+					case "TIMESTAMP":
+						// Normalize timestamp default (e.g., 20001231235959 -> 2000-12-31 23:59:59)
+						normalized := normalizeTimestampDefault(defStr)
+						if normalized != "" {
+							colDefault = normalized
+						}
+					}
+				}
+			}
+
+			// Coerce COLUMN_DEFAULT for binary literal defaults (b'...' notation)
+			if colDefault != nil {
+				if defStr, ok := colDefault.(string); ok {
+					if strings.HasPrefix(defStr, "0b") || strings.HasPrefix(defStr, "b'") {
+						// Binary literal: decode to actual value
+						binaryVal := normalizeBinaryLiteralDefault(defStr, baseType)
+						colDefault = binaryVal
+					}
+				}
+			}
+
+			// Coerce COLUMN_DEFAULT for integer zerofill types
+			if colDefault != nil && (baseType == "INT" || baseType == "INTEGER" || baseType == "TINYINT" ||
+				baseType == "SMALLINT" || baseType == "MEDIUMINT" || baseType == "BIGINT") {
+				if defStr, ok := colDefault.(string); ok {
+					colTypeUp := strings.ToUpper(col.Type)
+					isZF := strings.Contains(colTypeUp, "ZEROFILL")
+					if isZF {
+						// Get display width from type spec
+						displayWidth := 0
+						if idx := strings.Index(colTypeUp, "("); idx >= 0 {
+							end := strings.Index(colTypeUp[idx:], ")")
+							if end > 0 {
+								if w, err := strconv.Atoi(strings.TrimSpace(colTypeUp[idx+1 : idx+end])); err == nil {
+									displayWidth = w
+								}
+							}
+						}
+						if displayWidth == 0 {
+							// Default widths
+							switch baseType {
+							case "TINYINT":
+								displayWidth = 3
+							case "SMALLINT":
+								displayWidth = 5
+							case "MEDIUMINT":
+								displayWidth = 8
+							case "INT", "INTEGER":
+								displayWidth = 10
+							case "BIGINT":
+								displayWidth = 20
+							}
+						}
+						if displayWidth > 0 && len(defStr) < displayWidth {
+							defStr = strings.Repeat("0", displayWidth-len(defStr)) + defStr
+							colDefault = defStr
+						}
+					}
+				}
+			}
+
+			// Coerce COLUMN_DEFAULT for FLOAT/DOUBLE zerofill types
+			if colDefault != nil && (baseType == "FLOAT" || baseType == "DOUBLE" || baseType == "REAL") {
+				if defStr, ok := colDefault.(string); ok {
+					colTypeUp := strings.ToUpper(col.Type)
+					isZF := strings.Contains(colTypeUp, "ZEROFILL")
+					if isZF {
+						// Display width: FLOAT(1-24) = 12, DOUBLE/REAL/FLOAT(25-53) = 22
+						// Use numPrecision which is already set correctly above
+						displayWidth := int64(12)
+						if np, ok2 := numPrecision.(int64); ok2 {
+							displayWidth = np
+						}
+						if int64(len(defStr)) < displayWidth {
+							defStr = strings.Repeat("0", int(displayWidth)-len(defStr)) + defStr
+						}
+						colDefault = defStr
+					}
+				}
 			}
 
 			// Determine character set and collation for string types
@@ -4396,6 +4641,193 @@ func (e *Executor) infoSchemaCheckConstraints() []storage.Row {
 	return rows
 }
 
+// normalizeTimeDefault normalizes a TIME column default value to HH:MM:SS format.
+func normalizeTimeDefault(s string) string {
+	s = strings.TrimSpace(s)
+	// If already in HH:MM:SS format, return as-is
+	if len(s) == 8 && s[2] == ':' && s[5] == ':' {
+		return s
+	}
+	// If it's a pure number, treat as seconds
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		hours := n / 3600
+		mins := (n % 3600) / 60
+		secs := n % 60
+		return fmt.Sprintf("%02d:%02d:%02d", hours, mins, secs)
+	}
+	return ""
+}
+
+// normalizeDatetimeDefault normalizes a DATETIME column default to YYYY-MM-DD HH:MM:SS format.
+func normalizeDatetimeDefault(s string) string {
+	s = strings.TrimSpace(strings.Trim(s, "'\""))
+	// If already in full format, return as-is
+	if len(s) == 19 && s[4] == '-' && s[7] == '-' && s[10] == ' ' {
+		return s
+	}
+	// Try parsing short date formats like '2/2/2' = year/month/day or month/day/year
+	// MySQL interprets '2/2/2' as 0002-02-02
+	parts := strings.FieldsFunc(s, func(r rune) bool {
+		return r == '/' || r == '-'
+	})
+	if len(parts) >= 3 {
+		year, errY := strconv.ParseInt(parts[0], 10, 64)
+		month, errM := strconv.ParseInt(parts[1], 10, 64)
+		day, errD := strconv.ParseInt(parts[2], 10, 64)
+		if errY == nil && errM == nil && errD == nil {
+			return fmt.Sprintf("%04d-%02d-%02d 00:00:00", year, month, day)
+		}
+	}
+	return ""
+}
+
+// normalizeTimestampDefault normalizes a TIMESTAMP column default to YYYY-MM-DD HH:MM:SS.
+func normalizeTimestampDefault(s string) string {
+	s = strings.TrimSpace(strings.Trim(s, "'\""))
+	// If already in full format, return as-is
+	if len(s) == 19 && s[4] == '-' && s[7] == '-' && s[10] == ' ' {
+		return s
+	}
+	// Compact format: YYYYMMDDHHMMSS (14 digits)
+	if len(s) == 14 {
+		if _, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return fmt.Sprintf("%s-%s-%s %s:%s:%s",
+				s[0:4], s[4:6], s[6:8], s[8:10], s[10:12], s[12:14])
+		}
+	}
+	return ""
+}
+
+// normalizeBinaryLiteralDefault converts a binary literal default value to its
+// expected INFORMATION_SCHEMA representation.
+func normalizeBinaryLiteralDefault(s, baseType string) interface{} {
+	// Parse binary literal: "0b101" or "b'101'" → value 5 = 0x05
+	var bits string
+	if strings.HasPrefix(s, "0b") {
+		bits = s[2:]
+	} else if strings.HasPrefix(s, "b'") && strings.HasSuffix(s, "'") {
+		bits = s[2 : len(s)-1]
+	} else {
+		return s
+	}
+
+	// Parse bits to integer
+	n, err := strconv.ParseInt(bits, 2, 64)
+	if err != nil {
+		return s
+	}
+
+	switch baseType {
+	case "BINARY", "VARBINARY":
+		// Display as 0xNN hex format
+		return fmt.Sprintf("0x%02X", n)
+	case "CHAR", "VARCHAR":
+		// Non-printable chars → display as their byte value char
+		// MySQL INFORMATION_SCHEMA shows the actual character
+		// For non-printable chars (like 0x05), MySQL shows the raw byte
+		// which the runner might display as empty or as the hex escape
+		// Based on expected: empty string for char b'101' (= 0x05)
+		if n < 0x20 || n == 0x7f {
+			// Non-printable: return the actual byte as string
+			return string(rune(n))
+		}
+		return string(rune(n))
+	}
+	return s
+}
+
+// splitEnumSetValues splits ENUM/SET value list like "'a','b c','d'" into individual values
+// (without surrounding quotes).
+func splitEnumSetValues(inner string) []string {
+	var vals []string
+	i := 0
+	for i < len(inner) {
+		if inner[i] == '\'' {
+			j := i + 1
+			for j < len(inner) {
+				if inner[j] == '\'' && (j+1 >= len(inner) || inner[j+1] != '\'') {
+					break
+				}
+				if inner[j] == '\'' && j+1 < len(inner) && inner[j+1] == '\'' {
+					j += 2 // skip escaped quote
+					continue
+				}
+				j++
+			}
+			vals = append(vals, inner[i+1:j])
+			i = j + 1
+			// skip comma
+			for i < len(inner) && (inner[i] == ',' || inner[i] == ' ') {
+				i++
+			}
+		} else {
+			i++
+		}
+	}
+	return vals
+}
+
+// formatDecimalDefault formats a decimal default value string with exactly `scale`
+// decimal places, using string manipulation to avoid float64 precision issues.
+func formatDecimalDefault(val string, scale int) string {
+	// Remove sign for processing, add back later
+	negative := strings.HasPrefix(val, "-")
+	if negative {
+		val = val[1:]
+	}
+
+	// Split into integer and fractional parts
+	parts := strings.SplitN(val, ".", 2)
+	intPart := parts[0]
+	fracPart := ""
+	if len(parts) > 1 {
+		fracPart = parts[1]
+	}
+
+	if scale == 0 {
+		// Round the fractional part: if first frac digit >= 5, increment integer
+		carry := 0
+		if len(fracPart) > 0 {
+			firstFrac := int(fracPart[0] - '0')
+			if firstFrac >= 5 {
+				carry = 1
+			}
+		}
+		if carry > 0 {
+			// Increment intPart
+			intDigits := []byte(intPart)
+			for i := len(intDigits) - 1; i >= 0; i-- {
+				if intDigits[i] < '9' {
+					intDigits[i]++
+					carry = 0
+					break
+				}
+				intDigits[i] = '0'
+			}
+			intPart = string(intDigits)
+			if carry > 0 {
+				intPart = "1" + intPart
+			}
+		}
+		if negative {
+			return "-" + intPart
+		}
+		return intPart
+	}
+
+	// Pad or truncate fracPart to exactly scale digits
+	for len(fracPart) < scale {
+		fracPart += "0"
+	}
+	fracPart = fracPart[:scale]
+
+	result := intPart + "." + fracPart
+	if negative {
+		return "-" + result
+	}
+	return result
+}
+
 // canonicalEngineName returns the MySQL-canonical engine name with proper casing.
 func canonicalEngineName(engine string) string {
 	switch strings.ToUpper(engine) {
@@ -4428,8 +4860,9 @@ func normalizeColumnType(colType string) string {
 	t := strings.ToLower(strings.TrimSpace(colType))
 	upper := strings.ToUpper(t)
 
-	// Normalize INTEGER -> int alias
+	// Normalize type aliases
 	t = strings.Replace(t, "integer", "int", 1)
+	t = strings.Replace(t, "real", "double", 1)
 	upper = strings.ToUpper(t)
 
 	isUnsigned := strings.Contains(upper, "UNSIGNED")
@@ -4455,9 +4888,43 @@ func normalizeColumnType(colType string) string {
 		if baseType == "decimal" || baseType == "numeric" || baseType == "dec" {
 			parenEnd := strings.Index(baseClean, ")")
 			if parenEnd > idx {
-				inner := baseClean[idx+1 : parenEnd]
+				inner := strings.TrimSpace(baseClean[idx+1 : parenEnd])
 				if !strings.Contains(inner, ",") {
-					return baseType + "(" + inner + ",0)" + suffix
+					// Normalize precision=0 to 10 (MySQL minimum)
+					prec := inner
+					if prec == "0" {
+						prec = "10"
+					}
+					return baseType + "(" + prec + ",0)" + suffix
+				} else {
+					// Has both precision and scale - normalize precision=0 to 10
+					parts := strings.SplitN(inner, ",", 2)
+					prec := strings.TrimSpace(parts[0])
+					scale := strings.TrimSpace(parts[1])
+					if prec == "0" {
+						prec = "10"
+					}
+					return baseType + "(" + prec + "," + scale + ")" + suffix
+				}
+			}
+		}
+		// Normalize float/double precision values:
+		// float(0), float(23), float(24) -> float
+		// float(25..53), float(53), double(53) -> double
+		if baseType == "float" || baseType == "double" || baseType == "real" {
+			parenStart := strings.Index(baseClean, "(")
+			parenEnd := strings.Index(baseClean, ")")
+			if parenStart >= 0 && parenEnd > parenStart {
+				inner := strings.TrimSpace(baseClean[parenStart+1 : parenEnd])
+				if prec, err := strconv.ParseInt(inner, 10, 64); err == nil {
+					if prec == 0 || (prec >= 1 && prec <= 24) {
+						return "float" + suffix
+					} else if prec >= 25 && prec <= 53 {
+						return "double" + suffix
+					}
+				}
+				if inner == "0" {
+					return baseType + suffix
 				}
 			}
 		}
@@ -4498,6 +4965,12 @@ func normalizeColumnType(colType string) string {
 	case "decimal", "numeric", "dec":
 		// Default precision/scale: DECIMAL(10,0)
 		return "decimal(10,0)" + suffix
+	}
+	// For any other type with zerofill (e.g., double zerofill, float zerofill),
+	// ensure "unsigned" is included since zerofill implies unsigned in MySQL.
+	if isZerofill && !strings.Contains(t, "unsigned") {
+		// Replace "zerofill" with "unsigned zerofill"
+		t = strings.Replace(t, " zerofill", " unsigned zerofill", 1)
 	}
 	return t
 }
