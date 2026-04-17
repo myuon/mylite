@@ -1916,16 +1916,54 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 			if val == nil {
 				return nil, nil
 			}
-			s := toString(val)
-			// CAST AS TIME: extract time component
-			if len(s) > 11 && s[10] == ' ' {
-				s = s[11:]
-			}
 			// Apply TIME precision: bare CAST AS TIME uses fsp=0 (rounds fractional seconds).
 			// CAST AS TIME(N) uses the specified precision N.
 			fsp := 0
 			if v.Type != nil && v.Type.Length != nil {
 				fsp = *v.Type.Length
+			}
+			var s string
+			switch fv := val.(type) {
+			case int64, uint64:
+				// Numeric HHMMSS integer: convert to HH:MM:SS format.
+				s = parseMySQLTimeValueRaw(val)
+			case float64:
+				// Float: convert integer part as HHMMSS, apply fractional precision.
+				// Check for overflow (float too large to fit in int64 → NULL).
+				const maxSafeFloat = 9.999999e+17 // max float safely convertible to int64
+				absV := fv
+				if absV < 0 {
+					absV = -absV
+				}
+				if absV > maxSafeFloat {
+					return nil, nil
+				}
+				s = parseMySQLTimeValueRaw(val)
+			default:
+				s = toString(val)
+				// CAST AS TIME: extract time component from datetime.
+				if len(s) > 11 && s[10] == ' ' {
+					s = s[11:]
+				}
+				// Handle compact numeric HHMMSS strings (e.g., "235959" or "235959.123456").
+				// These come from decimal literals which are kept as strings.
+				if !strings.Contains(s, ":") && !strings.Contains(s, "-") {
+					// Looks like a numeric time - parse via parseMySQLTimeValue.
+					dotIdx := strings.Index(s, ".")
+					intStr := s
+					fracStr := ""
+					if dotIdx >= 0 {
+						intStr = s[:dotIdx]
+						fracStr = s[dotIdx+1:]
+					}
+					if _, err := strconv.ParseInt(intStr, 10, 64); err == nil {
+						parsed := parseMySQLTimeValue(intStr)
+						if fracStr != "" {
+							parsed += "." + fracStr
+						}
+						s = parsed
+					}
+				}
 			}
 			if strings.Contains(s, ".") {
 				s = applyTimePrecision(s, fsp)
