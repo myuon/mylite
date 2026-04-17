@@ -1306,7 +1306,13 @@ func (e *Executor) handleRawSet(raw string) error {
 			val = strings.Trim(val, "'\"")
 			val = strings.TrimSuffix(val, ";")
 			val = strings.TrimSpace(val)
-			_ = e.parseTimeZone(val)
+			if tzErr := e.parseTimeZone(val); tzErr != nil {
+				// We are in handleRawSet because the vitess parser rejected the statement.
+				// An unquoted timezone value that also fails parseTimeZone means the SQL
+				// was syntactically invalid (e.g. SET @@time_zone = GMT+;).
+				// Return a 1064 parse error to match MySQL behavior.
+				return mysqlError(1064, "42000", "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '' at line 1")
+			}
 		}
 	}
 	// Detect SET @@SESSION varname / SET @@GLOBAL varname (space instead of dot)

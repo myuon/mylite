@@ -3637,9 +3637,12 @@ func (e *Executor) nowTime() time.Time {
 func (e *Executor) parseTimeZone(val string) error {
 	val = strings.Trim(val, "'\"")
 	val = strings.TrimSpace(val)
-	if strings.ToUpper(val) == "SYSTEM" || strings.ToUpper(val) == "DEFAULT" || val == "" {
+	if strings.ToUpper(val) == "SYSTEM" || strings.ToUpper(val) == "DEFAULT" {
 		e.timeZone = nil
 		return nil
+	}
+	if val == "" {
+		return fmt.Errorf("Unknown or incorrect time zone: ''")
 	}
 	// Parse offset like "+03:00", "-05:00", "+0:0"
 	if (val[0] == '+' || val[0] == '-') && strings.Contains(val, ":") {
