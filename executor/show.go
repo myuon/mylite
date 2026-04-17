@@ -734,9 +734,10 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			// Show COLLATE when charset is utf8mb4 (MySQL always shows it) or
 			// when collation differs from the charset's default collation.
 			var createSQL string
-			// MySQL always includes /*!32312 IF NOT EXISTS*/ in SHOW CREATE DATABASE output
-			_ = ifNotExists
-			ifne := "/*!32312 IF NOT EXISTS*/ "
+			ifne := ""
+			if ifNotExists {
+				ifne = "/*!32312 IF NOT EXISTS*/ "
+			}
 			defaultCollation := catalog.DefaultCollationForCharset(charset)
 			if charset == "utf8mb4" || (collation != "" && collation != defaultCollation) {
 				if collation == "" {
