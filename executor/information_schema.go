@@ -1664,6 +1664,10 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 				dataType = strings.Replace(dataType, " zerofill", "", 1)
 				dataType = strings.Replace(dataType, " signed", "", 1)
 				dataType = strings.TrimSpace(dataType)
+				// Normalize type aliases
+				if dataType == "integer" {
+					dataType = "int"
+				}
 
 				var charMaxLen interface{}
 				var charOctetLen interface{}
@@ -1701,7 +1705,12 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 				// which depends on the charset's max bytes per char
 				colCharset := strings.ToLower(col.Charset)
 				if colCharset == "" {
-					colCharset = "utf8mb4"
+					// Inherit from table charset, then default to utf8mb4
+					if tbl.Charset != "" {
+						colCharset = strings.ToLower(tbl.Charset)
+					} else {
+						colCharset = "utf8mb4"
+					}
 				}
 				charsetMaxBytes := int64(4) // default utf8mb4
 				switch {
@@ -1745,8 +1754,39 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 						charOctetLen = charLen * charsetMaxBytes
 					}
 				}
-			case "INT", "TINYINT", "SMALLINT", "MEDIUMINT", "BIGINT":
-				isUnsigned := strings.Contains(strings.ToUpper(col.Type), "UNSIGNED")
+			case "TINYBLOB":
+				charMaxLen = int64(255)
+				charOctetLen = int64(255)
+			case "BLOB":
+				charMaxLen = int64(65535)
+				charOctetLen = int64(65535)
+			case "MEDIUMBLOB":
+				charMaxLen = int64(16777215)
+				charOctetLen = int64(16777215)
+			case "LONGBLOB":
+				charMaxLen = int64(4294967295)
+				charOctetLen = int64(4294967295)
+			case "BINARY", "VARBINARY":
+				// Extract length from type spec
+				binLen := int64(1) // BINARY without length defaults to BINARY(1)
+				if baseType == "VARBINARY" {
+					binLen = 0
+				}
+				if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
+					end := strings.Index(colTypeUpper[idx:], ")")
+					if end > 0 {
+						n, err := strconv.ParseInt(colTypeUpper[idx+1:idx+end], 10, 64)
+						if err == nil {
+							binLen = n
+						}
+					}
+				}
+				charMaxLen = binLen
+				charOctetLen = binLen
+			case "INT", "INTEGER", "TINYINT", "SMALLINT", "MEDIUMINT", "BIGINT":
+				colTypeUp := strings.ToUpper(col.Type)
+				// zerofill implies unsigned in MySQL
+				isUnsignedInt := strings.Contains(colTypeUp, "UNSIGNED") || strings.Contains(colTypeUp, "ZEROFILL")
 				switch baseType {
 				case "TINYINT":
 					numPrecision = int64(3)
@@ -1754,10 +1794,10 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 					numPrecision = int64(5)
 				case "MEDIUMINT":
 					numPrecision = int64(7)
-				case "INT":
+				case "INT", "INTEGER":
 					numPrecision = int64(10)
 				case "BIGINT":
-					if isUnsigned {
+					if isUnsignedInt {
 						numPrecision = int64(20)
 					} else {
 						numPrecision = int64(19)
@@ -1766,7 +1806,32 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 					numPrecision = int64(10)
 				}
 				numScale = int64(0)
-			case "FLOAT", "DOUBLE", "DECIMAL":
+			case "DECIMAL", "NUMERIC", "DEC":
+				// Extract precision and scale from DECIMAL(p,s)
+				if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
+					end := strings.Index(colTypeUpper[idx:], ")")
+					if end > 0 {
+						inner := colTypeUpper[idx+1 : idx+end]
+						parts := strings.Split(inner, ",")
+						if len(parts) >= 1 {
+							if p, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64); err == nil {
+								numPrecision = p
+							}
+						}
+						if len(parts) >= 2 {
+							if s, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64); err == nil {
+								numScale = s
+							}
+						} else {
+							numScale = int64(0)
+						}
+					}
+				} else {
+					// No explicit precision/scale - MySQL defaults: DECIMAL(10,0)
+					numPrecision = int64(10)
+					numScale = int64(0)
+				}
+			case "FLOAT", "DOUBLE":
 				numPrecision = nil
 				numScale = nil
 			}
@@ -4362,56 +4427,77 @@ func canonicalEngineName(engine string) string {
 func normalizeColumnType(colType string) string {
 	t := strings.ToLower(strings.TrimSpace(colType))
 	upper := strings.ToUpper(t)
+
+	// Normalize INTEGER -> int alias
+	t = strings.Replace(t, "integer", "int", 1)
+	upper = strings.ToUpper(t)
+
 	isUnsigned := strings.Contains(upper, "UNSIGNED")
+	isZerofill := strings.Contains(upper, "ZEROFILL")
 
-	// Check if it already has a parenthesized width
-	base := t
-	if idx := strings.Index(base, "("); idx >= 0 {
-		return t // already has explicit width
-	}
-	// Strip unsigned/zerofill for base type matching
-	baseClean := strings.TrimSpace(strings.Replace(strings.Replace(base, "unsigned", "", 1), "zerofill", "", 1))
-	baseClean = strings.TrimSpace(baseClean)
-
+	// Build type suffix (zerofill implies unsigned in MySQL)
 	suffix := ""
-	if isUnsigned {
+	if isZerofill {
+		suffix = " unsigned zerofill"
+	} else if isUnsigned {
 		suffix = " unsigned"
 	}
-	if strings.Contains(strings.ToLower(colType), "zerofill") {
-		suffix += " zerofill"
+
+	// Determine the base type (before any parenthesized spec)
+	base := t
+	baseClean := strings.TrimSpace(strings.Replace(strings.Replace(base, " unsigned", "", 1), " zerofill", "", 1))
+	baseClean = strings.TrimSpace(baseClean)
+
+	// Check if it already has a parenthesized width
+	if idx := strings.Index(baseClean, "("); idx >= 0 {
+		// For DECIMAL with only precision but no scale, add ",0"
+		baseType := baseClean[:idx]
+		if baseType == "decimal" || baseType == "numeric" || baseType == "dec" {
+			parenEnd := strings.Index(baseClean, ")")
+			if parenEnd > idx {
+				inner := baseClean[idx+1 : parenEnd]
+				if !strings.Contains(inner, ",") {
+					return baseType + "(" + inner + ",0)" + suffix
+				}
+			}
+		}
+		return t // already has explicit width with correct format
 	}
 
 	switch baseClean {
 	case "tinyint":
-		if isUnsigned {
-			return "tinyint(3) unsigned"
+		if isUnsigned || isZerofill {
+			return "tinyint(3)" + suffix
 		}
 		return "tinyint(4)"
 	case "smallint":
-		if isUnsigned {
-			return "smallint(5) unsigned"
+		if isUnsigned || isZerofill {
+			return "smallint(5)" + suffix
 		}
 		return "smallint(6)"
 	case "mediumint":
-		if isUnsigned {
-			return "mediumint(8) unsigned"
+		if isUnsigned || isZerofill {
+			return "mediumint(8)" + suffix
 		}
 		return "mediumint(9)"
-	case "int":
-		if isUnsigned {
-			return "int(10) unsigned"
+	case "int", "integer":
+		if isUnsigned || isZerofill {
+			return "int(10)" + suffix
 		}
 		return "int(11)"
 	case "bigint":
-		if isUnsigned {
-			return "bigint(20) unsigned"
-		}
-		return "bigint(20)"
+		return "bigint(20)" + suffix
 	case "char":
 		// CHAR without length defaults to CHAR(1)
 		return "char(1)"
+	case "binary":
+		// BINARY without length defaults to BINARY(1)
+		return "binary(1)"
 	case "year":
 		return "year(4)"
+	case "decimal", "numeric", "dec":
+		// Default precision/scale: DECIMAL(10,0)
+		return "decimal(10,0)" + suffix
 	}
 	return t
 }

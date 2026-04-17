@@ -2098,10 +2098,31 @@ func checkFloatVarType(name string, expr sqlparser.Expr) error {
 	return nil
 }
 
-// truncateErrVal truncates a value to 64 characters for MySQL error messages.
+// truncateErrVal truncates a value to 64 characters for MySQL error messages,
+// and replaces invalid UTF-8 bytes with '?' (matching MySQL behavior).
 func truncateErrVal(val string) string {
 	if len(val) > 64 {
-		return val[:64]
+		val = val[:64]
+	}
+	// Replace non-ASCII bytes with '?' to match MySQL behavior in error messages
+	// when the charset name contains invalid/non-ASCII bytes
+	hasNonASCII := false
+	for i := 0; i < len(val); i++ {
+		if val[i] >= 0x80 {
+			hasNonASCII = true
+			break
+		}
+	}
+	if hasNonASCII {
+		var b strings.Builder
+		for i := 0; i < len(val); i++ {
+			if val[i] >= 0x80 {
+				b.WriteByte('?')
+			} else {
+				b.WriteByte(val[i])
+			}
+		}
+		return b.String()
 	}
 	return val
 }
