@@ -2012,8 +2012,11 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", extractNearFromParseError(trimmed, err)))
 	}
 
-	// Enforce LOCK TABLES restrictions before dispatching
-	if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
+	// Enforce LOCK TABLES restrictions before dispatching.
+	// Skip lock checks when inside a routine (trigger/SP/function) because MySQL
+	// uses prelocking to automatically add routine-dependent tables to the lock set.
+	// Mylite doesn't implement full prelocking, so we relax the check inside routines.
+	if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) && e.routineDepth == 0 {
 		if lockErr := e.checkTableLockRestrictions(stmt); lockErr != nil {
 			return nil, lockErr
 		}
@@ -3166,6 +3169,11 @@ func (e *Executor) checkTableLockRestrictions(stmt sqlparser.Statement) error {
 							if !tn.Qualifier.IsEmpty() {
 								srcDB = tn.Qualifier.String()
 							}
+							// information_schema tables are exempt from LOCK TABLE checks
+							// (MySQL allows IS queries within LOCK TABLE sessions without explicit locking)
+							if strings.EqualFold(srcDB, "information_schema") {
+								continue
+							}
 							// Use alias name for lock check if present
 							checkName := srcName
 							if !ate.As.IsEmpty() {
@@ -3254,9 +3262,12 @@ func (e *Executor) checkTableLockRestrictions(stmt sqlparser.Statement) error {
 				}
 			}
 			key := dbName + "." + tableName
-			locked, _ := e.tableLockManager.IsLocked(e.connectionID, key)
-			if !locked {
-				return mysqlError(1100, "HY000", fmt.Sprintf("Table '%s' was not locked with LOCK TABLES", tableName))
+			locked, mode := e.tableLockManager.IsLocked(e.connectionID, key)
+			// In MySQL, DROP TABLE under LOCK TABLES is allowed even if the table is
+			// not explicitly in the lock set (e.g., underlying tables of locked views).
+			// Only reject if the table is explicitly READ-locked (needs WRITE for DDL).
+			if locked && mode == "READ" {
+				return mysqlError(1099, "HY000", fmt.Sprintf("Table '%s' was locked with a READ lock and can't be updated", tableName))
 			}
 		}
 	}
@@ -3972,6 +3983,14 @@ func (e *Executor) execMyliteCommand(query string) (*Result, error) {
 		e.sqlMode = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
 		e.userVars = make(map[string]interface{})
 		e.preparedStmts = make(map[string]string)
+		// Release any table locks and global read lock held by this connection
+		// (important when pooled connections are reused across connect/disconnect cycles)
+		if e.tableLockManager != nil {
+			e.tableLockManager.UnlockAll(e.connectionID)
+		}
+		if e.globalReadLock != nil {
+			e.globalReadLock.Release(e.connectionID)
+		}
 		// Clear shared resource groups to avoid cross-test contamination
 		if e.resourceGroupsMu != nil {
 			e.resourceGroupsMu.Lock()

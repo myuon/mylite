@@ -840,6 +840,11 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		query = "LOCK TABLES " + query[len("LOCK TABLE "):]
 	}
 
+	// Normalize "DROP TEMPORARY TABLES" (plural) to "DROP TEMPORARY TABLE" (singular) for vitess parser
+	if strings.HasPrefix(upper, "DROP TEMPORARY TABLES ") {
+		query = "DROP TEMPORARY TABLE " + query[len("DROP TEMPORARY TABLES "):]
+	}
+
 	return query, nil, nil
 }
 

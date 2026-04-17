@@ -1351,7 +1351,8 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 			return true, false, nil
 		}
 		if existing := ctx.connByName[key]; existing != nil {
-			existing.Close() //nolint:errcheck
+			existing.ExecContext(context.Background(), "UNLOCK TABLES") //nolint:errcheck
+			existing.Close()                                             //nolint:errcheck
 			delete(ctx.connByName, key)
 		}
 		conn, err := ctx.db.Conn(context.Background())
@@ -1400,21 +1401,19 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		key := strings.ToLower(target)
 		if conn := ctx.connByName[key]; conn != nil {
 			// Issue KILL with the connection's own ID so that the server removes
-			// it from the process list immediately.  Because the Go sql.DB pool
-			// keeps the underlying TCP socket alive after conn.Close(), the
-			// process-list entry would otherwise linger and tests that wait on
-			// "COUNT(*) = 0 WHERE id = <connID>" would spin for up to 30 s.
+			// it from the process list immediately.
 			if row := conn.QueryRowContext(context.Background(), "SELECT connection_id()"); row != nil {
 				var cid int64
 				if err2 := row.Scan(&cid); err2 == nil && cid > 0 {
 					conn.ExecContext(context.Background(), fmt.Sprintf("KILL %d", cid)) //nolint:errcheck
 				}
 			}
-			// Clean up transaction state before returning the connection to the pool.
-			// Without this, a pooled connection may retain inTransaction/row-lock state
+			// Clean up transaction and lock state before returning the connection to the pool.
+			// Without this, a pooled connection may retain inTransaction/row-lock/table-lock state
 			// that leaks into the next user of the same underlying connection.
-			conn.ExecContext(context.Background(), "ROLLBACK") //nolint:errcheck
-			conn.Close()                                       //nolint:errcheck
+			conn.ExecContext(context.Background(), "ROLLBACK")    //nolint:errcheck
+			conn.ExecContext(context.Background(), "UNLOCK TABLES") //nolint:errcheck
+			conn.Close()                                            //nolint:errcheck
 			delete(ctx.connByName, key)
 		}
 		if ctx.currentConn == key {

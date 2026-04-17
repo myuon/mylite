@@ -639,6 +639,41 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 	paramStr := strings.TrimSpace(rest[paramStart:paramEnd])
 	params := parseProcParams(paramStr)
 
+	// Check for reserved keyword 'of' used as a procedure label.
+	// MySQL 8.0 added OF as a reserved word; using it as a label causes a parse error.
+	{
+		afterParen := strings.TrimSpace(rest[paramEnd+1:])
+		upperAfter := strings.ToUpper(afterParen)
+		// Detect patterns like "of:" or "END LOOP of" where 'of' is used as a label name.
+		// We look for word-boundary matches of 'of' followed by ':' (label declaration)
+		// or preceded by 'LEAVE ', 'ITERATE ', 'END LOOP ', 'END REPEAT ', 'END WHILE '.
+		checkLabel := func(body string) bool {
+			upperBody := strings.ToUpper(body)
+			// Label declaration: word boundary + "of" + ":"
+			// e.g., "of: LOOP" or "BEGIN of: LOOP"
+			ofColon := regexp.MustCompile(`(?i)\bof\s*:`)
+			if ofColon.MatchString(upperBody) {
+				return true
+			}
+			// Label use: LEAVE/ITERATE/END LOOP/END REPEAT/END WHILE + "of"
+			labelUse := regexp.MustCompile(`(?i)\b(LEAVE|ITERATE|END\s+LOOP|END\s+REPEAT|END\s+WHILE)\s+of\b`)
+			return labelUse.MatchString(upperBody)
+		}
+		if checkLabel(upperAfter) {
+			// Find where 'of' appears to construct the 'near' part of the error message
+			near := "of"
+			ofIdx := strings.Index(strings.ToUpper(afterParen), "OF")
+			if ofIdx >= 0 && ofIdx < len(afterParen) {
+				end := ofIdx
+				for end < len(afterParen) && end < ofIdx+20 {
+					end++
+				}
+				near = strings.TrimSpace(afterParen[ofIdx:end])
+			}
+			return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", near))
+		}
+	}
+
 	// Extract body: find BEGIN...END or single-statement body
 	_ = upper
 	afterParams := rest[paramEnd+1:]
