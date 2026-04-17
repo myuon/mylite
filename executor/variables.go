@@ -404,6 +404,72 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				}
 				e.setSysVar(name, csVal, isGlobal)
 			}
+		case "lc_time_names":
+			isGlobal := scope == sqlparser.GlobalScope
+			locVal := val
+			if strings.ToUpper(locVal) == "DEFAULT" {
+				if isGlobal {
+					e.deleteSysVar(name, true)
+				} else {
+					if gv, ok := e.getGlobalVar(name); ok {
+						e.sessionScopeVars[name] = gv
+					} else {
+						delete(e.sessionScopeVars, name)
+					}
+				}
+			} else {
+				// Validate locale name against known MySQL 8.4 locales.
+				// Strip surrounding quotes if any.
+				locVal = strings.Trim(locVal, "'\"")
+				// Preserve appropriate case for error messages.
+				// MySQL keywords ON/OFF/TRUE/FALSE are parsed as literals 'on'/'off'/etc.
+				// by the parser; MySQL displays them uppercase in error messages.
+				// For locale-like strings with underscore (en_EN, US_en), preserve input case.
+				if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
+					_ = lit
+					// Keywords parsed as literals (ON, OFF, TRUE, FALSE) → uppercase
+					if !strings.Contains(locVal, "_") && !strings.ContainsAny(locVal, " ") {
+						up := strings.ToUpper(locVal)
+						switch up {
+						case "ON", "OFF", "TRUE", "FALSE", "YES", "NO":
+							locVal = up
+						}
+					}
+				} else if colName, isCol := expr.Expr.(*sqlparser.ColName); isCol {
+					rawName := colName.Name.String()
+					if !strings.Contains(rawName, "_") {
+						// Simple keyword-like identifier → uppercase
+						locVal = strings.ToUpper(rawName)
+					}
+				}
+				// Floats are ER_WRONG_TYPE_FOR_VAR
+				if strings.ContainsAny(locVal, ".eE") {
+					if _, fErr := strconv.ParseFloat(locVal, 64); fErr == nil {
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable 'lc_time_names'"))
+					}
+				}
+				// Numeric locale ID: 0-110 are valid.
+				if id, err := strconv.ParseInt(locVal, 10, 64); err == nil {
+					if locName, ok := mysqlLocaleByID[int(id)]; ok {
+						e.setSysVar(name, locName, isGlobal)
+					} else {
+						return nil, mysqlError(1649, "HY000", fmt.Sprintf("Unknown locale: '%s'", locVal))
+					}
+				} else {
+					// String locale name: normalize and validate.
+					// sr_YU is deprecated but maps to sr_RS with a warning.
+					if strings.EqualFold(locVal, "sr_YU") {
+						e.addWarning("Warning", 1287, "'sr_YU' is deprecated and will be removed in a future release. Please use sr_RS instead")
+						e.setSysVar(name, "sr_RS", isGlobal)
+					} else {
+						normalizedLoc := normalizeMySQLLocale(locVal)
+						if normalizedLoc == "" {
+							return nil, mysqlError(1649, "HY000", fmt.Sprintf("Unknown locale: '%s'", locVal))
+						}
+						e.setSysVar(name, normalizedLoc, isGlobal)
+					}
+				}
+			}
 		case "collation_connection", "collation_server", "collation_database":
 			isGlobal := scope == sqlparser.GlobalScope
 			if strings.ToUpper(val) == "DEFAULT" {
@@ -1951,6 +2017,89 @@ var sysVarEnumSet = map[string]bool{
 	"thread_handling":                 true,
 	"master_info_repository":          true,
 	"relay_log_info_repository":       true,
+}
+
+// mysqlLocaleByID maps numeric locale IDs (0-110) to locale names in MySQL 8.4.
+// Used by lc_time_names when set to an integer value.
+// IDs 0-110 are valid; 111+ is invalid (returns error 1649).
+var mysqlLocaleByID = map[int]string{
+	0: "en_US", 1: "en_GB", 2: "ja_JP", 3: "sv_SE", 4: "de_DE", 5: "de_AT",
+	6: "de_BE", 7: "de_CH", 8: "de_LU", 9: "pt_PT", 10: "ar_SY", 11: "ar_SA",
+	12: "ar_YE", 13: "ar_TN", 14: "ar_SD", 15: "ar_QA", 16: "ar_OM", 17: "ar_MA",
+	18: "ar_LY", 19: "ar_LB", 20: "ar_KW", 21: "ar_JO", 22: "ar_IQ", 23: "ar_EG",
+	24: "ar_DZ", 25: "ar_BH", 26: "ar_AE", 27: "ca_ES", 28: "cs_CZ", 29: "da_DK",
+	30: "el_GR", 31: "en_AU", 32: "en_CA", 33: "en_IN", 34: "en_NZ", 35: "en_PH",
+	36: "en_ZA", 37: "en_ZW", 38: "es_AR", 39: "es_BO", 40: "es_CL", 41: "es_CO",
+	42: "es_CR", 43: "es_DO", 44: "es_EC", 45: "es_ES", 46: "es_GT", 47: "es_HN",
+	48: "es_MX", 49: "es_NI", 50: "te_IN", 51: "es_PA", 52: "es_PE", 53: "es_PR",
+	54: "es_PY", 55: "es_SV", 56: "es_US", 57: "es_UY", 58: "es_VE", 59: "eu_ES",
+	60: "fi_FI", 61: "fo_FO", 62: "fr_BE", 63: "fr_CA", 64: "fr_CH", 65: "fr_FR",
+	66: "fr_LU", 67: "gl_ES", 68: "gu_IN", 69: "he_IL", 70: "hi_IN", 71: "hr_HR",
+	72: "hu_HU", 73: "id_ID", 74: "is_IS", 75: "it_CH", 76: "it_IT", 77: "ko_KR",
+	78: "lt_LT", 79: "lv_LV", 80: "mk_MK", 81: "mn_MN", 82: "ms_MY", 83: "nb_NO",
+	84: "nl_BE", 85: "nl_NL", 86: "no_NO", 87: "pl_PL", 88: "pt_BR", 89: "ro_RO",
+	90: "ru_RU", 91: "ru_UA", 92: "sk_SK", 93: "sl_SI", 94: "sq_AL", 95: "sr_RS",
+	96: "sr_YU", 97: "be_BY", 98: "bg_BG", 99: "uk_UA", 100: "fr_BE",
+	101: "fr_CA", 102: "ar_IN", 103: "tr_TR", 104: "ta_IN", 105: "vi_VN",
+	106: "zh_CN", 107: "sv_FI", 108: "zh_HK", 109: "el_GR", 110: "rm_CH",
+}
+
+// validMySQLLocales contains all valid locale names for lc_time_names in MySQL 8.4.
+// Invalid locale names produce ERROR HY000: Unknown locale: 'XX' (error 1649).
+var validMySQLLocales = map[string]bool{
+	"ar_AE": true, "ar_BH": true, "ar_DZ": true, "ar_EG": true, "ar_IN": true,
+	"ar_IQ": true, "ar_JO": true, "ar_KW": true, "ar_LB": true, "ar_LY": true,
+	"ar_MA": true, "ar_OM": true, "ar_QA": true, "ar_SA": true, "ar_SD": true,
+	"ar_SY": true, "ar_TN": true, "ar_YE": true,
+	"be_BY": true, "bg_BG": true,
+	"ca_ES": true, "cs_CZ": true,
+	"da_DK": true,
+	"de_AT": true, "de_BE": true, "de_CH": true, "de_DE": true, "de_LU": true,
+	"el_GR": true,
+	"en_AU": true, "en_CA": true, "en_GB": true, "en_IN": true, "en_NZ": true,
+	"en_PH": true, "en_US": true, "en_ZA": true, "en_ZW": true,
+	"es_AR": true, "es_BO": true, "es_CL": true, "es_CO": true, "es_CR": true,
+	"es_DO": true, "es_EC": true, "es_ES": true, "es_GT": true, "es_HN": true,
+	"es_MX": true, "es_NI": true, "es_PA": true, "es_PE": true, "es_PR": true,
+	"es_PY": true, "es_SV": true, "es_US": true, "es_UY": true, "es_VE": true,
+	"eu_ES": true,
+	"fi_FI": true, "fo_FO": true,
+	"fr_BE": true, "fr_CA": true, "fr_CH": true, "fr_FR": true, "fr_LU": true,
+	"gl_ES": true, "gu_IN": true,
+	"he_IL": true, "hi_IN": true, "hr_HR": true, "hu_HU": true,
+	"id_ID": true, "is_IS": true,
+	"it_CH": true, "it_IT": true,
+	"ja_JP": true,
+	"ko_KR": true,
+	"lt_LT": true, "lv_LV": true,
+	"mk_MK": true, "mn_MN": true, "ms_MY": true,
+	"nb_NO": true,
+	"nl_BE": true, "nl_NL": true, "no_NO": true,
+	"pl_PL": true, "pt_BR": true, "pt_PT": true,
+	"rm_CH": true,
+	"ro_RO": true, "ru_RU": true, "ru_UA": true,
+	"sk_SK": true, "sl_SI": true, "sq_AL": true,
+	"sr_RS": true, "sr_YU": true,
+	"sv_FI": true, "sv_SE": true,
+	"ta_IN": true, "te_IN": true, "th_TH": true, "tr_TR": true,
+	"uk_UA": true, "ur_PK": true,
+	"vi_VN": true,
+	"zh_CN": true, "zh_HK": true, "zh_TW": true,
+}
+
+// normalizeMySQLLocale normalizes a locale name to MySQL canonical form (e.g. "en_us" -> "en_US").
+// Returns the canonical form if valid, or "" if not a known MySQL locale.
+func normalizeMySQLLocale(loc string) string {
+	// MySQL locale format: lang_COUNTRY (e.g., en_US). Try case-insensitive lookup.
+	parts := strings.SplitN(loc, "_", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	canonical := strings.ToLower(parts[0]) + "_" + strings.ToUpper(parts[1])
+	if validMySQLLocales[canonical] {
+		return canonical
+	}
+	return ""
 }
 
 // sysVarCommaSeparatedEnum contains enum variables that accept comma-separated values (SET type).
