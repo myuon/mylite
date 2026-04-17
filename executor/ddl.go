@@ -2404,6 +2404,27 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		return nil, mysqlError(1580, "HY000", "You cannot 'ALTER' a log table if logging is enabled")
 	}
 
+	// Check for WITH VALIDATION / WITHOUT VALIDATION clauses
+	// MySQL restricts WITH VALIDATION to index-only changes (no column modifications)
+	withValidation := false
+	for _, opt := range stmt.AlterOptions {
+		if validation, ok := opt.(*sqlparser.Validation); ok && validation.With {
+			withValidation = true
+			// WITH VALIDATION is not allowed with index-only changes
+			hasColumnChange := false
+			for _, o := range stmt.AlterOptions {
+				switch o.(type) {
+				case *sqlparser.AddColumns, *sqlparser.DropColumn,
+					*sqlparser.ModifyColumn, *sqlparser.ChangeColumn:
+					hasColumnChange = true
+				}
+			}
+			if !hasColumnChange {
+				return nil, mysqlError(3869, "HY000", "Incorrect usage of ALTER and WITH VALIDATION")
+			}
+		}
+	}
+
 	// Check engine restrictions (disabled engines, unknown engines, log table constraints)
 	for _, opt := range stmt.AlterOptions {
 		if tblOpts, ok := opt.(sqlparser.TableOptions); ok {
@@ -2755,6 +2776,16 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 							tbl.DropColumn(colDef.Name)
 							return nil, err
 						}
+						// Check if value is out of range for the column type
+						// Only enforce range check when WITH VALIDATION is specified
+						if withValidation {
+							if rangeErr := checkIntegerRangeForColumn(colDef.Type, colDef.Name, v); rangeErr != nil {
+								tbl.Mu.Unlock()
+								db.DropColumn(tableName, colDef.Name)
+								tbl.DropColumn(colDef.Name)
+								return nil, rangeErr
+							}
+						}
 						tbl.Rows[i][colDef.Name] = v
 					}
 					tbl.Mu.Unlock()
@@ -2825,12 +2856,21 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			// Recompute generated column values if expression changed
 			if genExpr := generatedColumnExpr(colDef.Type); genExpr != "" {
 				tbl.Lock()
+				var rangeErr error
 				for i := range tbl.Rows {
 					if v, err := e.evalGeneratedColumnExpr(genExpr, tbl.Rows[i]); err == nil {
+						// For MODIFY COLUMN, always check range (existing data must fit new type)
+						if re := checkIntegerRangeForColumn(colDef.Type, colDef.Name, v); re != nil {
+							rangeErr = re
+							break
+						}
 						tbl.Rows[i][colDef.Name] = v
 					}
 				}
 				tbl.Unlock()
+				if rangeErr != nil {
+					return nil, rangeErr
+				}
 			} else {
 				tbl.Lock()
 				for i := range tbl.Rows {
@@ -2860,12 +2900,21 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			// Recompute generated column values if expression changed
 			if genExpr := generatedColumnExpr(colDef.Type); genExpr != "" {
 				tbl.Lock()
+				var rangeErr2 error
 				for i := range tbl.Rows {
 					if v, err := e.evalGeneratedColumnExpr(genExpr, tbl.Rows[i]); err == nil {
+						// For CHANGE COLUMN, always check range (existing data must fit new type)
+						if re := checkIntegerRangeForColumn(colDef.Type, colDef.Name, v); re != nil {
+							rangeErr2 = re
+							break
+						}
 						tbl.Rows[i][colDef.Name] = v
 					}
 				}
 				tbl.Unlock()
+				if rangeErr2 != nil {
+					return nil, rangeErr2
+				}
 			} else {
 				tbl.Lock()
 				for i := range tbl.Rows {

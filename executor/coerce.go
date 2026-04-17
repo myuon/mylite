@@ -3196,3 +3196,57 @@ func coerceValueForColumnType(col catalog.ColumnDef, val interface{}) interface{
 	}
 	return val
 }
+
+// checkIntegerRangeForColumn checks if the value is out of range for the given integer column type.
+// Returns an error (MySQL 1264/22003) if out of range, nil otherwise.
+// Only applies to integer types (TINYINT, SMALLINT, MEDIUMINT, INT, BIGINT).
+func checkIntegerRangeForColumn(colType string, colName string, v interface{}) error {
+	upper := strings.ToUpper(strings.TrimSpace(colType))
+	// Strip generated column expression: everything from "GENERATED" onward
+	if genIdx := strings.Index(upper, " GENERATED"); genIdx >= 0 {
+		upper = strings.TrimSpace(upper[:genIdx])
+	}
+	isUnsigned := strings.Contains(upper, "UNSIGNED") || strings.Contains(upper, "ZEROFILL")
+	baseType := upper
+	// Remove display width like SMALLINT(6)
+	if idx := strings.Index(baseType, "("); idx >= 0 {
+		baseType = baseType[:idx]
+	}
+	baseType = strings.TrimSpace(strings.Replace(strings.Replace(baseType, "UNSIGNED", "", 1), "ZEROFILL", "", 1))
+	baseType = strings.TrimSpace(baseType)
+
+	rng, isIntType := intTypeRanges[baseType]
+	if !isIntType {
+		return nil
+	}
+
+	var intVal int64
+	switch val := v.(type) {
+	case int64:
+		intVal = val
+	case uint64:
+		if isUnsigned {
+			if val > rng.MaxUnsigned {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+			}
+			return nil
+		}
+		if val > uint64(rng.Max) {
+			return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+		}
+		return nil
+	default:
+		return nil
+	}
+
+	if isUnsigned {
+		if intVal < 0 || uint64(intVal) > rng.MaxUnsigned {
+			return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+		}
+	} else {
+		if intVal < rng.Min || intVal > rng.Max {
+			return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", colName))
+		}
+	}
+	return nil
+}
