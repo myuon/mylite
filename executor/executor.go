@@ -2022,6 +2022,24 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 	}
 
+	// Enforce error 1422: DDL that causes implicit commit is not allowed inside
+	// stored functions or triggers (routineDepth > 0).
+	if e.routineDepth > 0 {
+		switch s := stmt.(type) {
+		case *sqlparser.CreateTable:
+			if !s.Temp {
+				return nil, mysqlError(1422, "HY000", "Explicit or implicit commit is not allowed in stored function or trigger.")
+			}
+		case *sqlparser.AlterTable, *sqlparser.CreateDatabase, *sqlparser.DropDatabase,
+			*sqlparser.CreateView, *sqlparser.TruncateTable:
+			return nil, mysqlError(1422, "HY000", "Explicit or implicit commit is not allowed in stored function or trigger.")
+		case *sqlparser.DropTable:
+			if !s.Temp {
+				return nil, mysqlError(1422, "HY000", "Explicit or implicit commit is not allowed in stored function or trigger.")
+			}
+		}
+	}
+
 	// Enforce super_read_only: blocks ALL users including SUPER (only TEMP tables exempt).
 	if superROVal, ok := e.getGlobalVar("super_read_only"); ok {
 		superROOn := superROVal == "1" || strings.EqualFold(superROVal, "ON")
