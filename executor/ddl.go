@@ -914,17 +914,15 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	// Check for unsupported storage engines with generated columns
 	{
 		engine := "InnoDB" // default
-		explicitEngine := ""
 		// Check explicit ENGINE= in CREATE TABLE
 		for _, opt := range stmt.TableSpec.Options {
 			if strings.EqualFold(opt.Name, "ENGINE") || strings.EqualFold(opt.Name, "engine") {
 				engine = tableOptionString(opt)
-				explicitEngine = engine
 				break
 			}
 		}
 		// If no explicit engine, check session default_storage_engine
-		if explicitEngine == "" {
+		if engine == "InnoDB" {
 			if e.sessionScopeVars != nil || e.globalScopeVars != nil {
 				if eng, ok := e.getSysVar("default_storage_engine"); ok && eng != "" {
 					engine = eng
@@ -935,14 +933,6 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		// FEDERATED is compiled in but disabled
 		if engineUpper == "FEDERATED" {
 			return nil, mysqlError(1286, "42000", fmt.Sprintf("Unknown storage engine '%s'", engine))
-		}
-		// Reject non-InnoDB engines that are explicitly specified and not supported by mylite.
-		// Only trigger when ENGINE= is explicitly written (not when relying on default).
-		if explicitEngine != "" && engineUpper != "INNODB" && engineUpper != "CSV" {
-			switch engineUpper {
-			case "MYISAM", "MEMORY", "HEAP", "MERGE", "MRG_MYISAM", "BLACKHOLE", "ARCHIVE":
-				return nil, ErrUnsupported(fmt.Sprintf("ENGINE=%s (only InnoDB is supported)", explicitEngine))
-			}
 		}
 		if engineUpper == "MEMORY" || engineUpper == "MERGE" || engineUpper == "MRG_MYISAM" || engineUpper == "BLACKHOLE" || engineUpper == "ARCHIVE" {
 			for _, col := range stmt.TableSpec.Columns {
