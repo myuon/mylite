@@ -361,6 +361,10 @@ type Executor struct {
 	// routineDepth tracks the current stored routine call depth to prevent infinite recursion
 	// and to avoid counting internal routine Execute calls in the Questions status counter.
 	routineDepth int
+	// functionOrTriggerDepth tracks depth inside stored functions or triggers only.
+	// Used to enforce error 1422 (no implicit-commit DDL inside functions/triggers).
+	// Stored procedures are excluded because they are allowed to execute DDL.
+	functionOrTriggerDepth int
 	// sysVarSnapshot holds a frozen copy of sessionScopeVars taken at the start of a
 	// top-level SELECT execution.  When non-nil and routineDepth==0, system-variable reads
 	// in the outer WHERE/SELECT-list evaluation use this snapshot so that side-effects
@@ -2023,15 +2027,15 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 	}
 
 	// Enforce error 1422: DDL that causes implicit commit is not allowed inside
-	// stored functions or triggers (routineDepth > 0).
-	if e.routineDepth > 0 {
+	// stored functions or triggers (but NOT stored procedures).
+	if e.functionOrTriggerDepth > 0 {
 		switch s := stmt.(type) {
 		case *sqlparser.CreateTable:
 			if !s.Temp {
 				return nil, mysqlError(1422, "HY000", "Explicit or implicit commit is not allowed in stored function or trigger.")
 			}
 		case *sqlparser.AlterTable, *sqlparser.CreateDatabase, *sqlparser.DropDatabase,
-			*sqlparser.CreateView, *sqlparser.TruncateTable:
+			*sqlparser.CreateView, *sqlparser.TruncateTable, *sqlparser.RenameTable:
 			return nil, mysqlError(1422, "HY000", "Explicit or implicit commit is not allowed in stored function or trigger.")
 		case *sqlparser.DropTable:
 			if !s.Temp {

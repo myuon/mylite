@@ -392,6 +392,7 @@ func (e *Executor) fireTriggers(tableName, timing, event string, newRow, oldRow 
 
 		// Enter trigger — internal Execute calls should not count as client Questions.
 		e.routineDepth++
+		e.functionOrTriggerDepth++
 		for _, stmtStr := range tr.Body {
 			stmtUpper := strings.ToUpper(strings.TrimSpace(stmtStr))
 			// Handle SET NEW.col = value in BEFORE triggers
@@ -404,10 +405,12 @@ func (e *Executor) fireTriggers(tableName, timing, event string, newRow, oldRow 
 			_, err := e.Execute(resolved)
 			if err != nil {
 				e.routineDepth--
+				e.functionOrTriggerDepth--
 				return err
 			}
 		}
 		e.routineDepth--
+		e.functionOrTriggerDepth--
 	}
 	return nil
 }
@@ -442,8 +445,10 @@ func (e *Executor) fireTriggerWithRoutineInterpreter(tr *catalog.TriggerDef, tim
 
 	// Enter trigger routine — internal Execute calls should not count as client Questions.
 	e.routineDepth++
+	e.functionOrTriggerDepth++
 	_, err := e.execRoutineBodyWithContext(tr.Body, ctx)
 	e.routineDepth--
+	e.functionOrTriggerDepth--
 	if err != nil {
 		return err
 	}
@@ -1578,11 +1583,13 @@ func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Exp
 	}
 
 	e.routineDepth++
+	e.functionOrTriggerDepth++
 	// Save and restore currentQuery so that UDF execution doesn't overwrite
 	// the outer query's text (used for column name extraction).
 	savedQuery := e.currentQuery
 	defer func() {
 		e.routineDepth--
+		e.functionOrTriggerDepth--
 		e.currentQuery = savedQuery
 	}()
 	if e.routineDepth > 256 {
