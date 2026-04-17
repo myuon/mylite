@@ -1322,6 +1322,10 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				for _, col := range columns {
 					if strings.ToLower(col.Name) == colNameLower {
 						colTypeUpper := strings.ToUpper(strings.TrimSpace(col.Type))
+						// Strip generated column expression (GENERATED ALWAYS AS ...) before type check
+						if genIdx := strings.Index(colTypeUpper, " GENERATED"); genIdx >= 0 {
+							colTypeUpper = strings.TrimSpace(colTypeUpper[:genIdx])
+						}
 						if i := strings.IndexByte(colTypeUpper, '('); i >= 0 {
 							colTypeUpper = colTypeUpper[:i]
 						}
