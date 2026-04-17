@@ -210,6 +210,7 @@ func extractTimePart(v interface{}, parsedDate string) string {
 // parseMySQLTimeValueRaw handles raw interface values for TIME conversion.
 // This properly handles numeric values (int64, float64) using HHMMSS format.
 func parseMySQLTimeValueRaw(v interface{}) string {
+	const maxTimeHours = 838
 	switch n := v.(type) {
 	case int64:
 		negative := n < 0
@@ -219,6 +220,14 @@ func parseMySQLTimeValueRaw(v interface{}) string {
 		sec := int(n % 100)
 		m := int((n / 100) % 100)
 		h := int(n / 10000)
+		// If hours exceed TIME max, clamp to 838:59:59 regardless of m/sec validity.
+		if h > maxTimeHours {
+			sign := ""
+			if negative {
+				sign = "-"
+			}
+			return sign + "838:59:59"
+		}
 		return formatTimeValue(negative, h, m, sec, "")
 	case float64:
 		negative := n < 0
@@ -236,11 +245,23 @@ func parseMySQLTimeValueRaw(v interface{}) string {
 			frac = strings.TrimPrefix(fracStr, "0.")
 			frac = strings.TrimRight(frac, "0")
 		}
+		// If hours exceed TIME max, clamp to 838:59:59 regardless of m/sec validity.
+		if h > maxTimeHours {
+			sign := ""
+			if negative {
+				sign = "-"
+			}
+			return sign + "838:59:59"
+		}
 		return formatTimeValue(negative, h, m, sec, frac)
 	case uint64:
 		sec := int(n % 100)
 		m := int((n / 100) % 100)
 		h := int(n / 10000)
+		// If hours exceed TIME max, clamp to 838:59:59 regardless of m/sec validity.
+		if h > maxTimeHours {
+			return "838:59:59"
+		}
 		return formatTimeValue(false, h, m, sec, "")
 	}
 	return parseMySQLTimeValue(fmt.Sprintf("%v", v))
@@ -361,6 +382,14 @@ func parseMySQLTimeValue(s string) string {
 		sec = int(n % 100)
 		m = int((n / 100) % 100)
 		h = int(n / 10000)
+		// If hours exceed TIME max, clamp to 838:59:59 regardless of m/sec validity.
+		if h > 838 {
+			sign := ""
+			if negative {
+				sign = "-"
+			}
+			return sign + "838:59:59"
+		}
 	}
 
 	return formatTimeValue(negative, h, m, sec, frac)
