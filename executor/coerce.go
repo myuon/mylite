@@ -1624,6 +1624,55 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 		}
 		// Try parsing as number - extract leading numeric part
 		val = strings.TrimSpace(val)
+		// Detect TIME format "HH:MM:SS[.frac]" or "-HH:MM:SS[.frac]" and convert to HHMMSS integer.
+		// MySQL converts TIME to integer as HHMMSS (e.g., "10:10:59" -> 101059).
+		{
+			negative := false
+			rest := val
+			if strings.HasPrefix(rest, "-") {
+				negative = true
+				rest = rest[1:]
+			}
+			// Match HH:MM:SS pattern (colons at positions 2 and 5, or similar)
+			colonCount := strings.Count(rest, ":")
+			if colonCount == 2 {
+				parts := strings.SplitN(rest, ":", 3)
+				// parts[2] may have fractional seconds - strip them (MySQL truncates)
+				secPart := parts[2]
+				if dotIdx := strings.Index(secPart, "."); dotIdx >= 0 {
+					secPart = secPart[:dotIdx]
+				}
+				// Parse each component as integer
+				h, errH := strconv.ParseInt(parts[0], 10, 64)
+				m, errM := strconv.ParseInt(parts[1], 10, 64)
+				s, errS := strconv.ParseInt(secPart, 10, 64)
+				if errH == nil && errM == nil && errS == nil {
+					hhmmss := h*10000 + m*100 + s
+					// MySQL truncates the fractional part when converting TIME to integer (no rounding)
+					// So "10:10:59.5" -> 101059, not 101060
+					if negative {
+						hhmmss = -hhmmss
+					}
+					// Clamp to type range
+					if isUnsigned {
+						if hhmmss < 0 {
+							return uint64(0)
+						}
+						if uint64(hhmmss) > maxUnsigned {
+							return maxUnsigned
+						}
+						return uint64(hhmmss)
+					}
+					if hhmmss > maxVal {
+						return maxVal
+					}
+					if hhmmss < minVal {
+						return minVal
+					}
+					return hhmmss
+				}
+			}
+		}
 		// Parse leading numeric portion
 		numStr := ""
 		hasDot := false
