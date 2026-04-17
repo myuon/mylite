@@ -143,6 +143,8 @@ func main() {
 	force := flag.Bool("force", false, "kill existing mtrrun process and remove lock before starting")
 	skippedOnly := flag.Bool("skipped-only", false, "run only tests that are in the skiplist (inverse of normal behavior)")
 	verbose := flag.Bool("verbose", false, "show server logs and other verbose output")
+	validateFeatures := flag.Bool("validate-features", false, "validate feature registry against test results after running (or with --result, without running tests)")
+	resultFile := flag.String("result", "", "path to an existing result JSON; implies --validate-features and skips test execution")
 	flag.Parse()
 	runSkippedOnly = *skippedOnly
 	verboseMode = *verbose
@@ -166,10 +168,24 @@ func main() {
 		os.Exit(1)
 	}
 	defer unlock()
+	// --result: validate-only mode, no test execution needed.
+	if *resultFile != "" {
+		if err := mtrrunner.ValidateFeatures(*resultFile); err != nil {
+			fmt.Fprintln(os.Stderr, "validate-features:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	args := flag.Args()
 	// No args: run all suites (with optional -suite/-test filtering)
 	if len(args) == 0 {
-		runAllSuites(*suiteRoot, *includeRoot, *maxTests, *jobs, *timeout, *suiteFilter, *testFilter)
+		resultPath := runAllSuites(*suiteRoot, *includeRoot, *maxTests, *jobs, *timeout, *suiteFilter, *testFilter)
+		if *validateFeatures && resultPath != "" {
+			if err := mtrrunner.ValidateFeatures(resultPath); err != nil {
+				fmt.Fprintln(os.Stderr, "validate-features:", err)
+			}
+		}
 		return
 	}
 	target := args[0]
@@ -192,7 +208,8 @@ func main() {
 // runAllSuites discovers and runs all test suites sequentially.
 // suiteFilter: comma-separated suite names to run (empty=all enabled).
 // testFilterStr: comma-separated "suite/testname" pairs to run (empty=all).
-func runAllSuites(suiteRoot, includeRoot string, maxTests, jobs int, timeout time.Duration, suiteFilter, testFilterStr string) {
+// Returns the path to the saved result JSON (empty on error).
+func runAllSuites(suiteRoot, includeRoot string, maxTests, jobs int, timeout time.Duration, suiteFilter, testFilterStr string) string {
 	start := time.Now()
 
 	// Parse -test flag into per-suite test name sets, and collect implied suites.
@@ -336,14 +353,16 @@ func runAllSuites(suiteRoot, includeRoot string, maxTests, jobs int, timeout tim
 	fmt.Printf("Time: %.1fs\n", elapsed.Seconds())
 
 	// Save results to JSON log
-	saveResultLog(allResultsJSON, totalPassed, totalFailed, totalSkipped, totalErrors, totalTimeouts, elapsed)
+	resultPath := saveResultLog(allResultsJSON, totalPassed, totalFailed, totalSkipped, totalErrors, totalTimeouts, elapsed)
 
 	if totalFailed+totalErrors > 0 {
 		os.Exit(1)
 	}
+	return resultPath
 }
 // saveResultLog writes test results to a timestamped JSON file in .mtrrun-logs/.
-func saveResultLog(results []testResultJSON, passed, failed, skipped, errors, timeouts int, elapsed time.Duration) {
+// Returns the path of the saved file.
+func saveResultLog(results []testResultJSON, passed, failed, skipped, errors, timeouts int, elapsed time.Duration) string {
 	logDir := ".mtrrun-logs"
 	os.MkdirAll(logDir, 0755)
 	ts := time.Now().Format("20060102-150405")
@@ -371,6 +390,7 @@ func saveResultLog(results []testResultJSON, passed, failed, skipped, errors, ti
 	}, "", "  ")
 	os.WriteFile(filename, data, 0644)
 	fmt.Printf("Results saved to: %s\n", filename)
+	return filename
 }
 
 // runSuite runs all tests in a single suite and returns results.
