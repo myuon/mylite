@@ -144,6 +144,10 @@ func isWindowAggregateExpr(expr sqlparser.Expr) bool {
 		return v.OverClause != nil
 	case *sqlparser.StdSamp:
 		return v.OverClause != nil
+	case *sqlparser.JSONArrayAgg:
+		return v.OverClause != nil
+	case *sqlparser.JSONObjectAgg:
+		return v.OverClause != nil
 	}
 	return false
 }
