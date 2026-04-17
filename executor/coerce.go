@@ -121,16 +121,105 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 		}
 		return s
 	case "DATETIME":
+		// Determine if the raw value is numeric (integer type)
+		isNumericV := false
+		switch v.(type) {
+		case int64, uint64, float64:
+			isNumericV = true
+		}
+		isAllDigitStr := func(st string) bool {
+			for _, c := range st {
+				if c < '0' || c > '9' {
+					return false
+				}
+			}
+			return len(st) > 0
+		}
+
+		// Track if the original value was a compact numeric string (all digits or numeric type).
+		// We only validate time-part range for compact numeric inputs; delimited strings (with
+		// separators like '-' or ':') are stored verbatim for out-of-range time components in
+		// non-strict mode to match MySQL/Dolt behavior.
+		wasCompactNumeric := isNumericV || isAllDigitStr(s)
+
+		// Handle ISO-8601 T-separator without dashes: "20030102T131415" (15 chars) -> "20030102131415"
+		if len(s) == 15 && s[8] == 'T' && isAllDigitStr(s[:8]) && isAllDigitStr(s[9:]) {
+			s = s[:8] + s[9:]
+			wasCompactNumeric = true
+		}
+
+		// Pad compact numeric strings to nearest parseable length.
+		// Integers: left-pad (no leading digits in numeric value).
+		// Strings: right-pad (zero-fill trailing fields).
+		if isAllDigitStr(s) {
+			needPadLen := 0
+			switch len(s) {
+			case 7, 9, 10, 11:
+				needPadLen = 12
+			case 13:
+				needPadLen = 14
+			}
+			if needPadLen > 0 {
+				if isNumericV {
+					s = strings.Repeat("0", needPadLen-len(s)) + s
+				} else {
+					s = s + strings.Repeat("0", needPadLen-len(s))
+				}
+			}
+		}
+
 		// Try parsing various date formats
 		parsed := parseMySQLDateValue(s)
 		if parsed != "" {
+			// Check for year > 9999 (parseMySQLDateValue may return "10000-12-02")
+			if dashIdx := strings.Index(parsed, "-"); dashIdx > 0 {
+				if y, err := strconv.Atoi(parsed[:dashIdx]); err == nil && y > 9999 {
+					return "0000-00-00 00:00:00"
+				}
+			}
 			timePart := extractTimePart(v, s)
 			if timePart != "" {
 				// Normalize time separator chars to ':'
 				timePart = normalizeDateTimeSeparators(timePart)
+				// Expand compact 6-digit time "131415" -> "13:14:15"
+				timePart = expandCompactTime(timePart)
+				// Zero-pad single-digit hour: "1:01:01" -> "01:01:01"
+				if colonCount := strings.Count(timePart, ":"); colonCount == 2 {
+					parts := strings.SplitN(timePart, ":", 3)
+					if len(parts[0]) == 1 {
+						timePart = "0" + timePart
+					}
+				}
 				// DATETIME (no precision) stores at second precision: strip fractional seconds.
 				if dotIdx := strings.Index(timePart, "."); dotIdx >= 0 {
 					timePart = timePart[:dotIdx]
+				}
+				// Validate: H<=23, M<=59, S<=59.
+				// Only apply this check for compact numeric inputs (all-digit strings, integers).
+				// Delimited strings like "2009-01-01 23:59:60" are stored verbatim in non-strict mode.
+				if wasCompactNumeric && !isValidTimePart(timePart) {
+					return "0000-00-00 00:00:00"
+				}
+				// Special case: if parsed is "0000-00-00" but has a non-zero time,
+				// and original string has a 2-digit year like "00-00-00 HH:MM:SS",
+				// re-interpret the 2-digit "00" year as 2000.
+				if parsed == "0000-00-00" && timePart != "00:00:00" {
+					origDatePart := s
+					if spIdx := strings.IndexAny(s, " T"); spIdx >= 0 {
+						origDatePart = s[:spIdx]
+					}
+					origNorm := normalizeDateDelimiters(origDatePart)
+					origParts := strings.Split(origNorm, "-")
+					if len(origParts) == 3 {
+						yStr := origParts[0]
+						if len(yStr) <= 2 {
+							yy, _ := strconv.Atoi(yStr)
+							y2 := convert2DigitYear(yy)
+							if y2 != 0 {
+								parsed = fmt.Sprintf("%04d-00-00", y2)
+							}
+						}
+					}
 				}
 				return parsed + " " + timePart
 			}
@@ -142,16 +231,74 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 	return v
 }
 
+// expandCompactTime converts a 6-digit all-numeric string "HHMMSS" to "HH:MM:SS".
+func expandCompactTime(s string) string {
+	if len(s) != 6 {
+		return s
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return s
+		}
+	}
+	return s[:2] + ":" + s[2:4] + ":" + s[4:]
+}
+
+// isValidTimePart validates HH:MM:SS time for DATETIME coercion.
+// Returns false if H>23, M>59, or S>59.
+func isValidTimePart(timePart string) bool {
+	parts := strings.SplitN(timePart, ":", 3)
+	if len(parts) != 3 {
+		return true
+	}
+	h, err := strconv.Atoi(parts[0])
+	if err != nil || h > 23 {
+		return false
+	}
+	m, err := strconv.Atoi(parts[1])
+	if err != nil || m > 59 {
+		return false
+	}
+	secStr := parts[2]
+	if dotIdx := strings.Index(secStr, "."); dotIdx >= 0 {
+		secStr = secStr[:dotIdx]
+	}
+	sec, err := strconv.Atoi(secStr)
+	if err != nil || sec > 59 {
+		return false
+	}
+	return true
+}
+
 // extractTimePart extracts the time component from a datetime value.
-// It handles both string values with space separators and numeric YYYYMMDDHHMMSS/YYMMDDHHMMSS formats.
+// It handles both string values with space/T separators and numeric YYYYMMDDHHMMSS/YYMMDDHHMMSS formats.
 func extractTimePart(v interface{}, parsedDate string) string {
 	origS := fmt.Sprintf("%v", v)
 
-	// Check for space-separated time part (e.g., "98-12-31 11:30:45")
-	if idx := strings.Index(origS, " "); idx >= 0 {
-		timePart := strings.TrimSpace(origS[idx+1:])
-		if timePart != "" {
-			return timePart
+	// Check for space- or T-separated time part (e.g., "98-12-31 11:30:45" or "2001-01-01T01:01:01")
+	for _, sep := range []byte{' ', 'T'} {
+		if idx := strings.IndexByte(origS, sep); idx >= 0 {
+			timePart := strings.TrimSpace(origS[idx+1:])
+			if timePart != "" {
+				// Only strip trailing non-time characters if the time part already uses
+				// proper colon separators (HH:MM:SS). If it uses other separators like
+				// 11*30*45 or 11+30+45, let normalizeDateTimeSeparators handle it.
+				if strings.Contains(timePart, ":") {
+					end := 0
+					for end < len(timePart) {
+						c := timePart[end]
+						if (c >= '0' && c <= '9') || c == ':' || c == '.' {
+							end++
+						} else {
+							break
+						}
+					}
+					timePart = timePart[:end]
+				}
+				if timePart != "" {
+					return timePart
+				}
+			}
 		}
 	}
 
@@ -686,7 +833,7 @@ func coerceYearValue(v interface{}) interface{} {
 		numVal = int(n)
 	case float64:
 		isNumericType = true
-		numVal = int(n)
+		numVal = int(math.Round(n))
 	case uint64:
 		isNumericType = true
 		numVal = int(n)
@@ -746,7 +893,8 @@ func coerceYearValue(v interface{}) interface{} {
 				return "0000"
 			}
 		} else {
-			n = int(f)
+			// MySQL rounds float YEAR values (e.g., 2000.5 → 2001)
+			n = int(math.Round(f))
 		}
 	}
 
@@ -843,6 +991,19 @@ func parseMySQLDateValue(s string) string {
 		datePart = s[:idx]
 	}
 
+	// isValidCompactDate rejects partial zeros (m=0 or d=0 with non-all-zero date)
+	// for compact numeric formats (YYMMDD, YYYYMMDD, etc.).
+	// In delimited formats, partial zeros like "2003-01-00" are allowed.
+	isValidCompactDate := func(y, m, d int) bool {
+		if y == 0 && m == 0 && d == 0 {
+			return true // Zero date is always valid
+		}
+		if m == 0 || d == 0 {
+			return false // Partial zeros invalid in compact form
+		}
+		return isValidDate(y, m, d)
+	}
+
 	// Try YYYYMMDD or YYYYMMDDHHMMSS format (no delimiters)
 	isAllDigits := true
 	for _, c := range datePart {
@@ -857,14 +1018,14 @@ func parseMySQLDateValue(s string) string {
 			y, _ := strconv.Atoi(datePart[:4])
 			m, _ := strconv.Atoi(datePart[4:6])
 			d, _ := strconv.Atoi(datePart[6:8])
-			if isValidDate(y, m, d) {
+			if isValidCompactDate(y, m, d) {
 				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
 			}
 		case 14: // YYYYMMDDHHMMSS - extract date part
 			y, _ := strconv.Atoi(datePart[:4])
 			m, _ := strconv.Atoi(datePart[4:6])
 			d, _ := strconv.Atoi(datePart[6:8])
-			if isValidDate(y, m, d) {
+			if isValidCompactDate(y, m, d) {
 				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
 			}
 		case 6: // YYMMDD
@@ -872,7 +1033,7 @@ func parseMySQLDateValue(s string) string {
 			m, _ := strconv.Atoi(datePart[2:4])
 			d, _ := strconv.Atoi(datePart[4:6])
 			y := convert2DigitYear(yy)
-			if isValidDate(y, m, d) {
+			if isValidCompactDate(y, m, d) {
 				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
 			}
 		case 12: // YYMMDDHHMMSS - extract date part
@@ -880,7 +1041,7 @@ func parseMySQLDateValue(s string) string {
 			m, _ := strconv.Atoi(datePart[2:4])
 			d, _ := strconv.Atoi(datePart[4:6])
 			y := convert2DigitYear(yy)
-			if isValidDate(y, m, d) {
+			if isValidCompactDate(y, m, d) {
 				return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
 			}
 		default:
@@ -916,7 +1077,7 @@ func parseMySQLDateValue(s string) string {
 		m, errM := strconv.Atoi(mStr)
 		d, errD := strconv.Atoi(dStr)
 		if errY == nil && errM == nil && errD == nil {
-			// Special case: all-zero date (e.g., 00-00-00) -> 0000-00-00
+			// Special case: all parts zero (e.g., 00-00-00) -> 0000-00-00 (zero date)
 			if y == 0 && m == 0 && d == 0 {
 				return "0000-00-00"
 			}
@@ -1145,6 +1306,13 @@ func checkDateStrict(colType, colName, originalValue, sqlMode string, rowNum int
 		}
 	}
 	if isAllDigits {
+		// Pad 7-11 digit strings to 12, 13-digit to 14 (right-pad, string coercion)
+		switch len(datePart) {
+		case 7, 9, 10, 11:
+			datePart = datePart + strings.Repeat("0", 12-len(datePart))
+		case 13:
+			datePart = datePart + "0"
+		}
 		switch len(datePart) {
 		case 14: // YYYYMMDDHHMMSS - DATETIME format, extract date part
 			yy, _ := strconv.Atoi(datePart[:4])

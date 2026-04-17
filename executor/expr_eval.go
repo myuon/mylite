@@ -1882,6 +1882,13 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 			}
 			return toString(val), nil
 		case "DECIMAL", "FLOAT", "DOUBLE", "REAL":
+			// If scale is specified (e.g. DECIMAL(20,6)), format with that many decimal places.
+			if typeName == "DECIMAL" && v.Type != nil && v.Type.Scale != nil {
+				scale := *v.Type.Scale
+				f := toFloat(val)
+				formatted := strconv.FormatFloat(f, 'f', scale, 64)
+				return formatted, nil
+			}
 			return toFloat(val), nil
 		case "DATETIME", "TIMESTAMP":
 			if val == nil {
