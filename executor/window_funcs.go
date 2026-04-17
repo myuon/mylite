@@ -94,6 +94,16 @@ func containsWindowFunc(expr sqlparser.Expr) bool {
 		return containsWindowFunc(v.Expr)
 	case *sqlparser.ConvertExpr:
 		return containsWindowFunc(v.Expr)
+	case *sqlparser.ComparisonExpr:
+		return containsWindowFunc(v.Left) || containsWindowFunc(v.Right)
+	case *sqlparser.AndExpr:
+		return containsWindowFunc(v.Left) || containsWindowFunc(v.Right)
+	case *sqlparser.OrExpr:
+		return containsWindowFunc(v.Left) || containsWindowFunc(v.Right)
+	case *sqlparser.NotExpr:
+		return containsWindowFunc(v.Expr)
+	case *sqlparser.IsExpr:
+		return containsWindowFunc(v.Left)
 	}
 	return false
 }
@@ -257,6 +267,11 @@ func findInnerOverClause(expr sqlparser.Expr) *sqlparser.OverClause {
 		return findInnerOverClause(v.Expr)
 	case *sqlparser.ConvertExpr:
 		return findInnerOverClause(v.Expr)
+	case *sqlparser.ComparisonExpr:
+		if oc := findInnerOverClause(v.Left); oc != nil {
+			return oc
+		}
+		return findInnerOverClause(v.Right)
 	}
 	return nil
 }
@@ -1359,17 +1374,31 @@ func (e *Executor) evalWindowFuncExprSubstitute(
 ) (interface{}, error) {
 	switch v := expr.(type) {
 	case *sqlparser.FuncExpr:
-		// Handle single-argument functions wrapping a window func (e.g., HEX(BIT_OR(b) OVER w))
-		if len(v.Exprs) == 1 && containsWindowFunc(v.Exprs[0]) {
-			innerVal, err := e.evalWindowFuncForRow(v.Exprs[0], ws, partRows, localIdx, orderByVals)
-			if err != nil {
-				return nil, err
+		// Handle function arguments that contain window functions.
+		// Substitute window function values with literals, then evaluate the outer function.
+		hasWindowArg := false
+		for _, arg := range v.Exprs {
+			if containsWindowFunc(arg) {
+				hasWindowArg = true
+				break
 			}
-			// Build a synthetic FuncExpr with the computed value as a literal arg, then evaluate it.
-			litExpr := valToLiteralExpr(innerVal)
+		}
+		if hasWindowArg {
+			newExprs := make([]sqlparser.Expr, len(v.Exprs))
+			for i, arg := range v.Exprs {
+				if containsWindowFunc(arg) {
+					innerVal, err := e.evalWindowFuncForRow(arg, ws, partRows, localIdx, orderByVals)
+					if err != nil {
+						return nil, err
+					}
+					newExprs[i] = valToLiteralExpr(innerVal)
+				} else {
+					newExprs[i] = arg
+				}
+			}
 			syntheticFunc := &sqlparser.FuncExpr{
 				Name:  v.Name,
-				Exprs: []sqlparser.Expr{litExpr},
+				Exprs: newExprs,
 			}
 			return e.evalRowExpr(syntheticFunc, partRows[localIdx])
 		}
@@ -1404,6 +1433,26 @@ func (e *Executor) evalWindowFuncExprSubstitute(
 			syntheticCast := &sqlparser.CastExpr{Expr: litExpr, Type: v.Type}
 			return e.evalRowExpr(syntheticCast, partRows[localIdx])
 		}
+	case *sqlparser.ComparisonExpr:
+		// Handle comparison containing window function
+		left := v.Left
+		right := v.Right
+		if containsWindowFunc(left) {
+			lv, err := e.evalWindowFuncForRow(left, ws, partRows, localIdx, orderByVals)
+			if err != nil {
+				return nil, err
+			}
+			left = valToLiteralExpr(lv)
+		}
+		if containsWindowFunc(right) {
+			rv, err := e.evalWindowFuncForRow(right, ws, partRows, localIdx, orderByVals)
+			if err != nil {
+				return nil, err
+			}
+			right = valToLiteralExpr(rv)
+		}
+		synthetic := &sqlparser.ComparisonExpr{Operator: v.Operator, Left: left, Right: right}
+		return e.evalRowExpr(synthetic, partRows[localIdx])
 	}
 	return e.evalRowExpr(expr, partRows[localIdx])
 }
@@ -1425,6 +1474,23 @@ func valToLiteralExpr(val interface{}) sqlparser.Expr {
 	default:
 		return sqlparser.NewStrLiteral(fmt.Sprintf("%v", val))
 	}
+}
+
+// evalWindowFuncOverSyntheticRow evaluates a window function expression over a single synthetic empty row.
+// Used for window functions evaluated in contexts without FROM clause (e.g. SELECT JSON_OBJECTAGG(1,2) OVER ()).
+func (e *Executor) evalWindowFuncOverSyntheticRow(expr sqlparser.Expr) (interface{}, error) {
+	oc := getOverClause(expr)
+	var ws *sqlparser.WindowSpecification
+	if oc != nil {
+		ws = oc.WindowSpec
+	}
+	if ws == nil {
+		ws = &sqlparser.WindowSpecification{}
+	}
+	syntheticRow := storage.Row{}
+	partRows := []storage.Row{syntheticRow}
+	orderByVals := [][]interface{}{nil}
+	return e.evalWindowFuncForRow(expr, ws, partRows, 0, orderByVals)
 }
 
 // formatWindowSumFloat formats a float64 SUM result for display.

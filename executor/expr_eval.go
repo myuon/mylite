@@ -3768,6 +3768,17 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		return e.evalExpr(v.Arg)
 	case *sqlparser.PerformanceSchemaFuncExpr:
 		return e.evalPerformanceSchemaFuncExpr(v)
+	case *sqlparser.JSONObjectAgg:
+		// JSONObjectAgg with OVER clause is a window function; without, it's an aggregate.
+		// In evalExpr (no-row context), evaluate it as a window function over a single synthetic row.
+		if v.OverClause != nil {
+			return e.evalWindowFuncOverSyntheticRow(v)
+		}
+	case *sqlparser.JSONArrayAgg:
+		// JSONArrayAgg with OVER clause is a window function; without, it's an aggregate.
+		if v.OverClause != nil {
+			return e.evalWindowFuncOverSyntheticRow(v)
+		}
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
 }

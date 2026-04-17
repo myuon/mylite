@@ -6697,6 +6697,25 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 			colNames = append(colNames, name)
 			rawExprIdx++
 
+			// Handle window functions in no-FROM context by treating them as a single
+			// synthetic row (OVER () with no rows evaluates over one pseudo-row).
+			if containsWindowFunc(se.Expr) {
+				syntheticRow := storage.Row{}
+				syntheticAllRows := []storage.Row{syntheticRow}
+				syntheticResultRows := [][]interface{}{{nil}}
+				wfInfo := findWindowFuncs([]sqlparser.Expr{se.Expr})
+				if len(wfInfo) > 0 {
+					wfInfo = resolveNamedWindows(wfInfo, stmt.Windows)
+					for _, wf := range wfInfo {
+						if err := e.computeWindowFunc(wf, syntheticAllRows, syntheticResultRows); err != nil {
+							return nil, err
+						}
+					}
+					values = append(values, syntheticResultRows[0][0])
+					continue
+				}
+			}
+
 			v, err := e.evalExpr(se.Expr)
 			if err != nil {
 				return nil, err
