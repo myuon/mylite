@@ -745,6 +745,11 @@ func numericEqualForComparison(ls, rs string, origLeft, origRight interface{}) b
 	if math.Abs(fl-fr) > 0.0005 {
 		return false
 	}
+	// Don't use float32 comparison if one value is exactly zero and the other is not.
+	// float32(1e-308) underflows to 0, causing false positives (e.g. 0 == '1E-308').
+	if (fl == 0) != (fr == 0) {
+		return false
+	}
 	return float32(fl) == float32(fr)
 }
 
