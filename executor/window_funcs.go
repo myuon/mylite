@@ -796,9 +796,25 @@ func (e *Executor) evalWindowFuncForRow(
 			end = n - 1
 		}
 		if v.Type == sqlparser.FirstValueExprType {
+			if containsWindowFunc(v.Expr) {
+				innerOverClause := findInnerOverClause(v.Expr)
+				innerWs := ws
+				if innerOverClause != nil && innerOverClause.WindowSpec != nil {
+					innerWs = innerOverClause.WindowSpec
+				}
+				return e.evalWindowFuncForRow(v.Expr, innerWs, partRows, start, orderByVals)
+			}
 			return e.evalRowExpr(v.Expr, partRows[start])
 		}
 		// LAST_VALUE
+		if containsWindowFunc(v.Expr) {
+			innerOverClause := findInnerOverClause(v.Expr)
+			innerWs := ws
+			if innerOverClause != nil && innerOverClause.WindowSpec != nil {
+				innerWs = innerOverClause.WindowSpec
+			}
+			return e.evalWindowFuncForRow(v.Expr, innerWs, partRows, end, orderByVals)
+		}
 		return e.evalRowExpr(v.Expr, partRows[end])
 
 	case *sqlparser.NTHValueExpr:
@@ -1429,9 +1445,11 @@ func (e *Executor) evalWindowFuncExprSubstitute(
 			if err != nil {
 				return nil, err
 			}
-			litExpr := valToLiteralExpr(innerVal)
-			syntheticCast := &sqlparser.CastExpr{Expr: litExpr, Type: v.Type}
-			return e.evalRowExpr(syntheticCast, partRows[localIdx])
+			// Apply the cast directly to avoid isStrictJSONStringCastSource misidentifying
+			// the window function result as a user-typed string literal (which would trigger
+			// Error 3141 for CAST(window_func AS JSON) with non-JSON string values).
+			// We pass strictStringLiteral=false because the source is a column/expression value.
+			return e.applyCastToVal(innerVal, v.Type, false)
 		}
 	case *sqlparser.ComparisonExpr:
 		// Handle comparison containing window function
@@ -1474,6 +1492,40 @@ func valToLiteralExpr(val interface{}) sqlparser.Expr {
 	default:
 		return sqlparser.NewStrLiteral(fmt.Sprintf("%v", val))
 	}
+}
+
+// applyCastToVal applies a SQL CAST type to a pre-computed Go value.
+// strictStringLiteral controls whether string values are strictly validated for JSON casting.
+func (e *Executor) applyCastToVal(val interface{}, castType *sqlparser.ConvertType, strictStringLiteral bool) (interface{}, error) {
+	if castType == nil || val == nil {
+		return val, nil
+	}
+	typeName := strings.ToUpper(castType.Type)
+	switch typeName {
+	case "SIGNED", "INT", "INTEGER", "BIGINT":
+		return toInt64(val), nil
+	case "UNSIGNED":
+		return uint64(toInt64(val)), nil
+	case "DECIMAL", "FLOAT", "DOUBLE", "REAL":
+		return windowToFloat64(val), nil
+	case "CHAR", "NCHAR", "VARCHAR", "TEXT":
+		return toString(val), nil
+	case "JSON":
+		return castToJSONValue(val, strictStringLiteral)
+	case "DATE":
+		s := toString(val)
+		return s, nil
+	case "DATETIME", "TIMESTAMP":
+		s := toString(val)
+		return s, nil
+	case "TIME":
+		s := toString(val)
+		return s, nil
+	case "BINARY", "VARBINARY":
+		return toString(val), nil
+	}
+	// For unknown types, return as-is
+	return val, nil
 }
 
 // evalWindowFuncOverSyntheticRow evaluates a window function expression over a single synthetic empty row.

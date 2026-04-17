@@ -2,6 +2,7 @@ package executor
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -3770,15 +3771,34 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		return e.evalPerformanceSchemaFuncExpr(v)
 	case *sqlparser.JSONObjectAgg:
 		// JSONObjectAgg with OVER clause is a window function; without, it's an aggregate.
-		// In evalExpr (no-row context), evaluate it as a window function over a single synthetic row.
 		if v.OverClause != nil {
 			return e.evalWindowFuncOverSyntheticRow(v)
 		}
+		// Without OVER, evaluate as single-row aggregate using current context (correlatedRow).
+		keyVal, err := e.evalExpr(v.Key)
+		if err != nil {
+			return nil, err
+		}
+		if keyVal == nil {
+			return nil, mysqlError(3158, "22032", "JSON documents may not contain NULL member names.")
+		}
+		valVal, err := e.evalExpr(v.Value)
+		if err != nil {
+			return nil, err
+		}
+		kb, _ := json.Marshal(toString(keyVal))
+		return "{" + string(kb) + ": " + jsonMarshalMySQL(toJSONValue(valVal)) + "}", nil
 	case *sqlparser.JSONArrayAgg:
 		// JSONArrayAgg with OVER clause is a window function; without, it's an aggregate.
 		if v.OverClause != nil {
 			return e.evalWindowFuncOverSyntheticRow(v)
 		}
+		// Without OVER, evaluate as single-row aggregate using current context.
+		val, err := e.evalExpr(v.Expr)
+		if err != nil {
+			return nil, err
+		}
+		return "[" + jsonMarshalMySQL(toJSONValue(val)) + "]", nil
 	}
 	return nil, fmt.Errorf("unsupported expression: %T (%s)", expr, sqlparser.String(expr))
 }
