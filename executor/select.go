@@ -2117,11 +2117,11 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				return nil, err
 			}
 			var crossed []storage.Row
-			// MySQL cross-join ordering: the leftmost (accumulated) table is the outer loop
-			// and the new right table is the inner loop. This matches MySQL's nested-loop
-			// execution for "FROM t1, t2" (t1 is outer, t2 is inner).
-			for _, leftRow := range allRows {
-				for _, rightRow := range rightRows {
+			// MySQL cross-join ordering: the rightmost (new) table is the outer loop
+			// and the accumulated left rows are the inner loop. This matches MySQL's
+			// natural row ordering for "FROM t1, t2" (t2 is outer, t1 is inner).
+			for _, rightRow := range rightRows {
+				for _, leftRow := range allRows {
 					if len(crossed) >= maxCrossProductRows {
 						break
 					}
