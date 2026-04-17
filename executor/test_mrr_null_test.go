@@ -53,7 +53,7 @@ func TestMRRBug58463(t *testing.T) {
 	e.CurrentDB = "test"
 
 	queries := []string{
-		`CREATE TABLE t1 (pk INT NOT NULL, PRIMARY KEY (pk)) ENGINE=MyISAM`,
+		`CREATE TABLE t1 (pk INT NOT NULL, PRIMARY KEY (pk)) ENGINE=InnoDB`,
 		`INSERT INTO t1 VALUES (2)`,
 		`CREATE TABLE t2 (pk INT NOT NULL, i1 INT NOT NULL, i2 INT NOT NULL, c1 VARCHAR(1024) CHARACTER SET utf8, PRIMARY KEY (pk), KEY k1 (i1))`,
 		`INSERT INTO t2 VALUES (3, 9, 1, NULL)`,

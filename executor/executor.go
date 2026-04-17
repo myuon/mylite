@@ -1043,6 +1043,12 @@ func mysqlError(code int, state, message string) error {
 	return fmt.Errorf("ERROR %d (%s): %s", code, state, message)
 }
 
+// ErrUnsupported returns a standardized "Feature not supported" error.
+// Error code 50001 is mylite-specific and triggers auto-skip in mtrrunner.
+func ErrUnsupported(feature string) error {
+	return fmt.Errorf("ERROR 50001 (HY000): Feature not supported: %s", feature)
+}
+
 // isMySQLError checks if err is a MySQL error with the given error code.
 func isMySQLError(err error, code int) bool {
 	if err == nil {

@@ -2644,6 +2644,9 @@ func (ctx *execContext) executeQuery(stmt string) error {
 			ctx.expectedError = ""
 			return nil
 		}
+		if isUnsupportedFeatureError(err) {
+			return errSkipTest
+		}
 		return fmt.Errorf("query failed: %s: %v", stmt, err)
 	}
 	defer rows.Close()
@@ -2782,6 +2785,9 @@ func (ctx *execContext) executeQueryOrExec(stmt string) error {
 			ctx.expectedError = ""
 			return nil
 		}
+		if isUnsupportedFeatureError(err) {
+			return errSkipTest
+		}
 		return fmt.Errorf("query failed: %s: %v", stmt, err)
 	}
 	defer rows.Close()
@@ -2903,6 +2909,9 @@ func (ctx *execContext) executeExec(stmt string) error {
 	if err != nil {
 		if ctx.handleRetryableExecError(stmt, err, activeConn) {
 			return nil
+		}
+		if isUnsupportedFeatureError(err) {
+			return errSkipTest
 		}
 		return fmt.Errorf("exec failed: %s: %v", stmt, err)
 	}
@@ -4213,6 +4222,15 @@ func parseConnectDirectiveArgsWithPassword(args string) (connName string, dbName
 		}
 	}
 	return connName, dbName, userName, password
+}
+
+// isUnsupportedFeatureError returns true if the error is a mylite Error 50001
+// (Feature not supported). These errors trigger auto-skip in mtrrunner.
+func isUnsupportedFeatureError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "Error 50001") || strings.Contains(err.Error(), "ERROR 50001")
 }
 
 // formatMySQLError formats an error into mysqltest expected format.
