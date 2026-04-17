@@ -2517,6 +2517,11 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		if isInplace && hasStoredGcolAdd {
 			return nil, mysqlError(1845, "0A000", "ALGORITHM=INPLACE is not supported. Reason: Cannot change column type INPLACE. Try ALGORITHM=COPY.")
 		}
+		// WITH VALIDATION + ALGORITHM=INPLACE is not supported for virtual generated columns
+		// MySQL requires ALGORITHM=COPY to perform validation scans
+		if isInplace && withValidation {
+			return nil, mysqlError(1846, "0A000", "ALGORITHM=INPLACE is not supported for this operation. Try ALGORITHM=COPY.")
+		}
 	}
 
 	// Pre-check: CSV engine requires all columns to be NOT NULL (ER_CHECK_NOT_IMPLEMENTED = 1178)
