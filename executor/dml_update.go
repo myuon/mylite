@@ -995,7 +995,11 @@ func (e *Executor) execMultiTableUpdate(stmt *sqlparser.Update) (*Result, error)
 			parts := strings.SplitN(qualStr, ".", 2)
 			targetDB = parts[0]
 			targetTable = parts[1]
-			targetAlias = parts[1]
+			// For cross-database references like "d1.t1", use the full qualifier
+			// as the alias so matchRowToTableLenient can find "d1.t1.colname" keys
+			// in the merged cross-product row (which uses the full table ref as prefix).
+			// For plain alias references like "alias", the else branch handles it.
+			targetAlias = qualStr
 			// Resolve alias to real table name
 			if real, ok := aliasToReal[strings.ToLower(targetTable)]; ok {
 				targetTable = real
