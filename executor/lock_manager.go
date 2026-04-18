@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -158,9 +159,10 @@ func (lm *LockManager) IsUsedLock(name string) interface{} {
 //   - Multiple shared locks from different connections are compatible.
 //   - An exclusive lock is incompatible with any other lock from a different connection.
 type RowLockManager struct {
-	mu         sync.Mutex
-	locks      map[string]*rowLockEntry  // lockKey -> entry
-	waitingFor map[int64]map[int64]bool  // waiter connID -> set of blocker connIDs
+	mu                   sync.Mutex
+	locks                map[string]*rowLockEntry // lockKey -> entry
+	waitingFor           map[int64]map[int64]bool // waiter connID -> set of blocker connIDs
+	deadlockDetectEnabled atomic.Int32             // 1 = enabled (default), 0 = disabled
 }
 
 // errDeadlock is returned when a deadlock cycle is detected.
@@ -174,9 +176,20 @@ type rowLockEntry struct {
 
 // NewRowLockManager creates a new RowLockManager.
 func NewRowLockManager() *RowLockManager {
-	return &RowLockManager{
+	rlm := &RowLockManager{
 		locks:      make(map[string]*rowLockEntry),
 		waitingFor: make(map[int64]map[int64]bool),
+	}
+	rlm.deadlockDetectEnabled.Store(1) // enabled by default
+	return rlm
+}
+
+// SetDeadlockDetect enables or disables deadlock detection (innodb_deadlock_detect).
+func (rlm *RowLockManager) SetDeadlockDetect(enabled bool) {
+	if enabled {
+		rlm.deadlockDetectEnabled.Store(1)
+	} else {
+		rlm.deadlockDetectEnabled.Store(0)
 	}
 }
 
@@ -251,7 +264,7 @@ func (rlm *RowLockManager) acquireRowLockInner(connID int64, key string, exclusi
 		}
 		if len(blockers) > 0 {
 			rlm.waitingFor[connID] = blockers
-			if rlm.detectDeadlock(connID) {
+			if rlm.deadlockDetectEnabled.Load() != 0 && rlm.detectDeadlock(connID) {
 				delete(rlm.waitingFor, connID)
 				rlm.mu.Unlock()
 				return errDeadlock

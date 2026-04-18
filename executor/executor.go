@@ -578,11 +578,16 @@ func (e *Executor) getGlobalVar(name string) (string, bool) {
 func (e *Executor) setGlobalVar(name, value string) {
 	if e.globalVarsMu == nil {
 		e.globalScopeVars[name] = value
-		return
+	} else {
+		e.globalVarsMu.Lock()
+		e.globalScopeVars[name] = value
+		e.globalVarsMu.Unlock()
 	}
-	e.globalVarsMu.Lock()
-	e.globalScopeVars[name] = value
-	e.globalVarsMu.Unlock()
+	// Propagate innodb_deadlock_detect changes to the row lock manager.
+	if name == "innodb_deadlock_detect" && e.rowLockManager != nil {
+		enabled := value != "0" && strings.ToUpper(value) != "OFF"
+		e.rowLockManager.SetDeadlockDetect(enabled)
+	}
 }
 
 // deleteGlobalVar deletes a key from globalScopeVars under Lock.

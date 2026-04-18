@@ -1662,7 +1662,12 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		sendInfoEnabled := ctx.infoEnabled
 
 		go func() {
-			// Create a temporary execContext for the goroutine to format output
+			// Create a temporary execContext for the goroutine to format output.
+			// abortOnError=true ensures that unexpected query errors are returned
+			// as result.err (not swallowed into output), so the reap handler can
+			// distinguish success from failure and trigger retry logic when needed.
+			// Expected errors (sendExpectedError != "") are still handled internally
+			// by executeSQLInner before the abortOnError check.
 			tmpCtx := &execContext{
 				runner:           ctx.runner,
 				db:               ctx.db,
@@ -1683,6 +1688,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 				replaceRegex:     sendReplaceRegex,
 				infoEnabled:      sendInfoEnabled,
 				expectedError:    sendExpectedError,
+				abortOnError:     true,
 			}
 			err := tmpCtx.executeSQLInner(query)
 			ch <- sendResult{output: tmpCtx.output.String(), err: err, query: query}
