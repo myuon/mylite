@@ -7350,8 +7350,13 @@ var reLoadReplace = regexp.MustCompile(`(?i)REPLACE\s+INTO\s+TABLE`)
 var reLoadIgnore = regexp.MustCompile(`(?i)IGNORE\s+INTO\s+TABLE`)
 
 // extractSQLString extracts a SQL quoted string starting at pos in query.
+// Handles both single-quoted ('...') and double-quoted ("...") strings.
 func extractSQLString(query string, pos int) (string, int) {
-	if pos >= len(query) || query[pos] != '\'' {
+	if pos >= len(query) {
+		return "", pos
+	}
+	quote := query[pos]
+	if quote != '\'' && quote != '"' {
 		return "", pos
 	}
 	pos++ // skip opening quote
@@ -7371,15 +7376,17 @@ func extractSQLString(query string, pos int) (string, int) {
 				sb.WriteByte('\\')
 			case '\'':
 				sb.WriteByte('\'')
+			case '"':
+				sb.WriteByte('"')
 			default:
 				sb.WriteByte(next)
 			}
 			pos += 2
 			continue
 		}
-		if ch == '\'' {
-			if pos+1 < len(query) && query[pos+1] == '\'' {
-				sb.WriteByte('\'')
+		if ch == quote {
+			if pos+1 < len(query) && query[pos+1] == quote {
+				sb.WriteByte(quote)
 				pos += 2
 				continue
 			}
@@ -7401,7 +7408,7 @@ func findKeywordAndExtractString(query, keyword string) (string, bool) {
 		return "", false
 	}
 	pos := idx + len(keyword)
-	for pos < len(query) && query[pos] != '\'' {
+	for pos < len(query) && query[pos] != '\'' && query[pos] != '"' {
 		pos++
 	}
 	if pos >= len(query) {
@@ -7452,7 +7459,7 @@ func parseLoadDataSQL(query string) (*loadDataOptions, error) {
 				for pos < len(query) && query[pos] == ' ' {
 					pos++
 				}
-				if pos < len(query) && query[pos] == '\'' {
+				if pos < len(query) && (query[pos] == '\'' || query[pos] == '"') {
 					val, _ := extractSQLString(query, pos)
 					opts.fieldsTermBy = val
 				}
@@ -7467,7 +7474,7 @@ func parseLoadDataSQL(query string) (*loadDataOptions, error) {
 					for pos < len(query) && query[pos] == ' ' {
 						pos++
 					}
-					if pos < len(query) && query[pos] == '\'' {
+					if pos < len(query) && (query[pos] == '\'' || query[pos] == '"') {
 						val, _ := extractSQLString(query, pos)
 						opts.fieldsEnclosedBy = val
 					}
@@ -7476,7 +7483,7 @@ func parseLoadDataSQL(query string) (*loadDataOptions, error) {
 					for pos < len(query) && query[pos] == ' ' {
 						pos++
 					}
-					if pos < len(query) && query[pos] == '\'' {
+					if pos < len(query) && (query[pos] == '\'' || query[pos] == '"') {
 						val, _ := extractSQLString(query, pos)
 						opts.fieldsEnclosedBy = val
 					}
@@ -7488,7 +7495,7 @@ func parseLoadDataSQL(query string) (*loadDataOptions, error) {
 				for pos < len(query) && query[pos] == ' ' {
 					pos++
 				}
-				if pos < len(query) && query[pos] == '\'' {
+				if pos < len(query) && (query[pos] == '\'' || query[pos] == '"') {
 					val, _ := extractSQLString(query, pos)
 					opts.fieldsEscapedBy = val
 				}
@@ -7518,7 +7525,7 @@ func parseLoadDataSQL(query string) (*loadDataOptions, error) {
 				for pos < len(query) && query[pos] == ' ' {
 					pos++
 				}
-				if pos < len(query) && query[pos] == '\'' {
+				if pos < len(query) && (query[pos] == '\'' || query[pos] == '"') {
 					val, _ := extractSQLString(query, pos)
 					opts.linesStartingBy = val
 				}
@@ -7530,7 +7537,7 @@ func parseLoadDataSQL(query string) (*loadDataOptions, error) {
 				for pos < len(query) && query[pos] == ' ' {
 					pos++
 				}
-				if pos < len(query) && query[pos] == '\'' {
+				if pos < len(query) && (query[pos] == '\'' || query[pos] == '"') {
 					val, _ := extractSQLString(query, pos)
 					opts.linesTermBy = val
 				}
