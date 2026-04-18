@@ -521,6 +521,27 @@ func (e *Executor) addWarning(level string, code int, message string) {
 			return
 		}
 	}
+	// Enforce max_error_count limit: when at capacity, drop the oldest warning.
+	maxErrCount := 64 // MySQL default
+	if v, ok := e.sessionScopeVars["max_error_count"]; ok {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			maxErrCount = n
+		}
+	} else if e.compiledDefaults != nil {
+		if v2, ok2 := e.compiledDefaults["max_error_count"]; ok2 {
+			if n, err := strconv.Atoi(v2); err == nil && n >= 0 {
+				maxErrCount = n
+			}
+		}
+	}
+	if maxErrCount > 0 && len(e.warnings) >= maxErrCount {
+		// Drop oldest warning to make room
+		e.warnings = e.warnings[1:]
+	}
+	if maxErrCount == 0 {
+		// max_error_count=0 means don't store any warnings
+		return
+	}
 	e.warnings = append(e.warnings, Warning{Level: level, Code: code, Message: message})
 }
 
@@ -1091,6 +1112,31 @@ func extractMySQLSQLState(err error) string {
 	return s[open+2 : open+close]
 }
 
+// extractMySQLErrorCodeAndMessage parses an error string of the form
+// "ERROR N (STATE): message" and returns (code, message). Returns (0, "") if not parseable.
+func extractMySQLErrorCodeAndMessage(s string) (int, string) {
+	if !strings.HasPrefix(s, "ERROR ") {
+		return 0, ""
+	}
+	rest := s[6:]
+	// Find space before '('
+	spaceIdx := strings.IndexByte(rest, ' ')
+	if spaceIdx < 0 {
+		return 0, ""
+	}
+	code, err := strconv.Atoi(rest[:spaceIdx])
+	if err != nil {
+		return 0, ""
+	}
+	// Find ': ' after SQLSTATE
+	colonIdx := strings.Index(rest, "): ")
+	if colonIdx < 0 {
+		return 0, ""
+	}
+	msg := rest[colonIdx+3:]
+	return code, msg
+}
+
 // perfSchemaTruncateDenied returns true if TRUNCATE is denied on the given
 // performance_schema table. Most PS tables allow TRUNCATE (resets statistics),
 // but certain tables with live/config data deny it.
@@ -1585,7 +1631,7 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 						}
 					}
 				}
-				e.warnings = append(e.warnings, Warning{Level: "Error", Code: code, Message: msg})
+				e.addWarning("Error", code, msg)
 			}
 			// Update ROW_COUNT() tracking (MySQL semantics):
 			// - After SELECT: -1

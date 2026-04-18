@@ -3074,6 +3074,25 @@ func (e *Executor) tryHandler(err error, ctx *routineContext) (bool, bool) {
 					// so the caller can propagate it upward (instead of the original error).
 					var handlerSig *signalError
 					if errors.As(herr, &handlerSig) {
+						// Push the triggering error onto the warning/diagnostics stack.
+						// MySQL accumulates the error chain when RESIGNAL propagates through handlers.
+						var trigSig *signalError
+						if errors.As(err, &trigSig) {
+							code := trigSig.mysqlErrno
+							if code == 0 {
+								code = 1644 // generic SIGNAL error code
+							}
+							e.addWarning("Error", code, trigSig.messageText)
+						} else {
+							// Extract code/message from mysql error string "ERROR N (STATE): msg"
+							errStr := err.Error()
+							code, msg := extractMySQLErrorCodeAndMessage(errStr)
+							if code > 0 {
+								e.addWarning("Error", code, msg)
+							} else {
+								e.addWarning("Error", 1644, errStr)
+							}
+						}
 						ctx.propagatedSignal = herr
 						return true, true // mark as handled+exit so caller checks propagatedSignal
 					}

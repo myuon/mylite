@@ -420,6 +420,7 @@ func resultToMySQLBinary(result *executor.Result) (*mysql.Result, error) {
 			return nil, err
 		}
 		applyBinaryColumnFlags(r, result.ColumnTypes)
+		applyColumnLengths(r, result.ColumnTypes)
 		return &mysql.Result{Resultset: r}, nil
 	}
 
@@ -441,6 +442,7 @@ func resultToMySQLBinary(result *executor.Result) (*mysql.Result, error) {
 		return nil, err
 	}
 	applyBinaryColumnFlags(r, result.ColumnTypes)
+	applyColumnLengths(r, result.ColumnTypes)
 	return &mysql.Result{Resultset: r}, nil
 }
 
@@ -590,6 +592,7 @@ func resultToMySQL(result *executor.Result) (*mysql.Result, error) {
 			return nil, err
 		}
 		applyBinaryColumnFlags(r, result.ColumnTypes)
+		applyColumnLengths(r, result.ColumnTypes)
 		return &mysql.Result{
 			Resultset: r,
 		}, nil
@@ -605,9 +608,76 @@ func resultToMySQL(result *executor.Result) (*mysql.Result, error) {
 		return nil, err
 	}
 	applyBinaryColumnFlags(r, result.ColumnTypes)
+	applyColumnLengths(r, result.ColumnTypes)
 	return &mysql.Result{
 		Resultset: r,
 	}, nil
+}
+
+// applyColumnLengths sets the ColumnLength field on each result field based on
+// the MySQL column type. This allows clients (e.g., mysql --table) to format
+// column widths correctly based on type rather than just actual data width.
+func applyColumnLengths(r *mysql.Resultset, columnTypes []string) {
+	if r == nil || len(columnTypes) == 0 {
+		return
+	}
+	for i, colType := range columnTypes {
+		if i >= len(r.Fields) || r.Fields[i] == nil {
+			break
+		}
+		if colType == "" {
+			continue
+		}
+		upper := strings.ToUpper(strings.TrimSpace(colType))
+		isUnsigned := strings.Contains(upper, "UNSIGNED")
+		if idx := strings.IndexByte(upper, '('); idx >= 0 {
+			upper = strings.TrimSpace(upper[:idx])
+		}
+		var colLen uint32
+		switch upper {
+		case "TINYINT":
+			if isUnsigned {
+				colLen = 3
+			} else {
+				colLen = 4
+			}
+		case "SMALLINT":
+			if isUnsigned {
+				colLen = 5
+			} else {
+				colLen = 6
+			}
+		case "MEDIUMINT":
+			if isUnsigned {
+				colLen = 8
+			} else {
+				colLen = 9
+			}
+		case "INT", "INTEGER":
+			if isUnsigned {
+				colLen = 10
+			} else {
+				colLen = 11
+			}
+		case "BIGINT":
+			colLen = 20
+		case "FLOAT":
+			colLen = 12
+		case "DOUBLE":
+			colLen = 22
+		case "DATE":
+			colLen = 10
+		case "TIME":
+			colLen = 10
+		case "DATETIME", "TIMESTAMP":
+			colLen = 19
+		case "YEAR":
+			colLen = 4
+		}
+		if colLen > 0 {
+			r.Fields[i].ColumnLength = colLen
+		}
+	}
 }
 
 // isBinaryColumnType returns true if the MySQL column type should be treated as binary
