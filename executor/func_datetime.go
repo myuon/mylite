@@ -523,6 +523,14 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		_, fmtIsLit := v.Exprs[1].(*sqlparser.Literal)
 		parsed, err := mysqlStrToDate(toString(strVal), toString(fmtVal2), fmtIsLit, e.isStrictMode())
 		if err != nil {
+			// MySQL treats STR_TO_DATE invalid-value errors (1411) as warnings,
+			// returning NULL even in strict mode. Convert to a warning.
+			if isMySQLError(err, 1411) {
+				// Extract the message from the error and add as a warning
+				msg := strings.TrimPrefix(err.Error(), "ERROR 1411 (HY000): ")
+				e.addWarning("Warning", 1411, msg)
+				return nil, true, nil
+			}
 			return nil, true, err
 		}
 		if parsed == nil {

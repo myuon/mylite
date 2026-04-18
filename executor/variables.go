@@ -2012,6 +2012,7 @@ var sysVarGlobalOnly = map[string]bool{
 	"innodb_flush_method":                      true,
 	"disabled_storage_engines":                 true,
 	"temptable_use_mmap":                       true,
+	"partial_revokes":                          true,
 }
 
 // sysVarEnumSet contains system variables that are ENUM types where ON/OFF
@@ -2741,6 +2742,7 @@ var sysVarBoolean = map[string]bool{
 	"innodb_doublewrite":         true,
 	"automatic_sp_privileges":    true,
 	"mysqlx_enable_hello_notice": true,
+	"partial_revokes":            true,
 }
 
 func isBooleanVariable(name string) bool {
@@ -4136,6 +4138,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"myisam_mmap_size":                       "18446744073709551615",
 		"offline_mode":                           "OFF",
 		"parser_max_mem_size":                    "18446744073709551615",
+		"partial_revokes":                         "OFF",
 		"persisted_globals_load":                 "ON",
 		"print_identified_with_as_hex":           "OFF",
 		"pseudo_slave_mode":                      "OFF",
