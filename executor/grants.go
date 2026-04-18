@@ -394,6 +394,165 @@ func (gs *GrantStore) HasPrivilege(user, host, priv, db, table string, activeRol
 	return false
 }
 
+// HasFullTablePrivilege checks if a user has a non-column-restricted privilege on db.table.
+// "Full" means the privilege applies to all columns in the table (not restricted to specific columns).
+// This is used for IS.COLUMNS filtering: a full table/DB/global privilege reveals all columns.
+func (gs *GrantStore) HasFullTablePrivilege(user, host, db, table string, activeRoles []string) bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	// Checks if any entry has a non-column-restricted privilege covering db.table
+	checkEntries := func(entries []GrantEntry) bool {
+		for _, e := range entries {
+			if e.Type == GrantTypeRole {
+				continue
+			}
+			// Check if this entry covers db.table at the right scope
+			covers := false
+			switch e.Type {
+			case GrantTypeGlobal:
+				covers = true
+			case GrantTypeDB:
+				entryDB := strings.TrimSuffix(e.Object, ".*")
+				covers = db != "" && dbNameMatches(entryDB, db)
+			case GrantTypeTable:
+				parts := strings.SplitN(e.Object, ".", 2)
+				covers = len(parts) == 2 && db != "" && table != "" &&
+					dbNameMatches(parts[0], db) && strings.EqualFold(parts[1], table)
+			}
+			if !covers {
+				continue
+			}
+			// Check if any privilege in this entry is NON-column-restricted
+			for _, p := range e.Privs {
+				// Skip column-restricted grants (those with parenthesized column list)
+				if strings.Contains(p, "(") {
+					continue
+				}
+				return true
+			}
+		}
+		return false
+	}
+
+	uk := userKey(user, host)
+	if checkEntries(gs.entries[uk]) {
+		return true
+	}
+	if host != "%" {
+		if checkEntries(gs.entries[userKey(user, "%")]) {
+			return true
+		}
+	}
+
+	// Check via active roles
+	var checkRole func(roleName, roleHost string, visited map[string]bool) bool
+	checkRole = func(roleName, roleHost string, visited map[string]bool) bool {
+		rk := userKey(roleName, roleHost)
+		if visited[rk] {
+			return false
+		}
+		visited[rk] = true
+		if checkEntries(gs.roles[rk]) {
+			return true
+		}
+		allEntries := append(gs.roles[rk], gs.entries[rk]...)
+		for _, e := range allEntries {
+			if e.Type == GrantTypeRole {
+				nh := e.RoleHost
+				if nh == "" {
+					nh = "%"
+				}
+				if checkRole(e.RoleName, nh, visited) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	visited := make(map[string]bool)
+	for _, r := range activeRoles {
+		if checkRole(r, "%", visited) {
+			return true
+		}
+	}
+	return false
+}
+
+// HasColumnPrivilege checks if a user has a column-level privilege explicitly granted for a column.
+// This is used to filter INFORMATION_SCHEMA.COLUMNS for non-root users.
+// Returns true if the user has any column-specific grant for the given db.table.column.
+func (gs *GrantStore) HasColumnPrivilege(user, host, db, table, column string, activeRoles []string) bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	checkEntries := func(entries []GrantEntry) bool {
+		for _, e := range entries {
+			if e.Type != GrantTypeTable {
+				continue
+			}
+			// Check if this entry covers db.table
+			parts := strings.SplitN(e.Object, ".", 2)
+			if len(parts) != 2 || !dbNameMatches(parts[0], db) || !strings.EqualFold(parts[1], table) {
+				continue
+			}
+			// Check if any priv has a column specifier for this column
+			for _, p := range e.Privs {
+				if parenIdx := strings.Index(p, "("); parenIdx > 0 {
+					colPart := strings.Trim(p[parenIdx+1:strings.LastIndex(p, ")")], " `'\"")
+					if strings.EqualFold(colPart, column) {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+
+	uk := userKey(user, host)
+	if checkEntries(gs.entries[uk]) {
+		return true
+	}
+	if host != "%" {
+		if checkEntries(gs.entries[userKey(user, "%")]) {
+			return true
+		}
+	}
+
+	// Check via active roles
+	var checkRole func(roleName, roleHost string, visited map[string]bool) bool
+	checkRole = func(roleName, roleHost string, visited map[string]bool) bool {
+		rk := userKey(roleName, roleHost)
+		if visited[rk] {
+			return false
+		}
+		visited[rk] = true
+		if checkEntries(gs.roles[rk]) {
+			return true
+		}
+		allEntries := append(gs.roles[rk], gs.entries[rk]...)
+		for _, e := range allEntries {
+			if e.Type == GrantTypeRole {
+				nh := e.RoleHost
+				if nh == "" {
+					nh = "%"
+				}
+				if checkRole(e.RoleName, nh, visited) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	visited := make(map[string]bool)
+	for _, r := range activeRoles {
+		if checkRole(r, "%", visited) {
+			return true
+		}
+	}
+	return false
+}
+
 // tablePrivileges is the set of privileges that affect table-level access.
 // We only enforce table-level checks when the user has explicit table-level privilege grants.
 var tablePrivileges = map[string]bool{
@@ -436,6 +595,83 @@ func (gs *GrantStore) UserHasAnyTablePrivGrant(user, host string) bool {
 	if host != "%" {
 		ukWild := userKey(user, "%")
 		if hasTablePrivEntry(gs.entries[ukWild]) {
+			return true
+		}
+	}
+	return false
+}
+
+// HasAnyTableAccess returns true if the user has any privilege (full or column-level)
+// covering the given db.table. This is used for statements that require "any privilege
+// on any column combination" (e.g., SHOW INDEX, CHECK TABLE).
+func (gs *GrantStore) HasAnyTableAccess(user, host, db, table string, activeRoles []string) bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	checkEntries := func(entries []GrantEntry) bool {
+		for _, e := range entries {
+			if e.Type == GrantTypeRole {
+				continue
+			}
+			switch e.Type {
+			case GrantTypeGlobal:
+				if len(e.Privs) > 0 {
+					return true
+				}
+			case GrantTypeDB:
+				entryDB := strings.TrimSuffix(e.Object, ".*")
+				if db != "" && dbNameMatches(entryDB, db) && len(e.Privs) > 0 {
+					return true
+				}
+			case GrantTypeTable:
+				parts := strings.SplitN(e.Object, ".", 2)
+				if len(parts) == 2 && db != "" && table != "" &&
+					dbNameMatches(parts[0], db) && strings.EqualFold(parts[1], table) && len(e.Privs) > 0 {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	uk := userKey(user, host)
+	if checkEntries(gs.entries[uk]) {
+		return true
+	}
+	if host != "%" {
+		if checkEntries(gs.entries[userKey(user, "%")]) {
+			return true
+		}
+	}
+
+	// Check via active roles
+	var checkRole func(roleName, roleHost string, visited map[string]bool) bool
+	checkRole = func(roleName, roleHost string, visited map[string]bool) bool {
+		rk := userKey(roleName, roleHost)
+		if visited[rk] {
+			return false
+		}
+		visited[rk] = true
+		if checkEntries(gs.roles[rk]) {
+			return true
+		}
+		allEntries := append(gs.roles[rk], gs.entries[rk]...)
+		for _, e := range allEntries {
+			if e.Type == GrantTypeRole {
+				nh := e.RoleHost
+				if nh == "" {
+					nh = "%"
+				}
+				if checkRole(e.RoleName, nh, visited) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	visited := make(map[string]bool)
+	for _, r := range activeRoles {
+		if checkRole(r, "%", visited) {
 			return true
 		}
 	}

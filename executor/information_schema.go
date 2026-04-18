@@ -1630,6 +1630,25 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 	dbNames := e.Catalog.ListDatabases()
 	sort.Strings(dbNames)
 
+	// For non-root users, filter columns to only those the user has any privilege on.
+	// MySQL filters IS.COLUMNS so non-privileged columns are not shown.
+	// Get current user context for privilege filtering.
+	isColUser, isColHost, isColRoles := e.getCurrentUserAndRoles()
+	// hasColAccess returns true if the current user has any privilege on the given column.
+	hasColAccess := func(dbName, tblName, colName string) bool {
+		if isColUser == "" || e.grantStore == nil {
+			return true // root or no grantStore: show all
+		}
+		// Check if user has any full (non-column-restricted) privilege at global, DB, or table level.
+		// Column-restricted grants like INSERT(a) only grant access to that specific column,
+		// not the entire table, so they can't be used to reveal all columns.
+		if e.grantStore.HasFullTablePrivilege(isColUser, isColHost, dbName, tblName, isColRoles) {
+			return true
+		}
+		// Check column-level grants specifically for this column
+		return e.grantStore.HasColumnPrivilege(isColUser, isColHost, dbName, tblName, colName, isColRoles)
+	}
+
 	var rows []storage.Row
 	for _, dbName := range dbNames {
 		db, err := e.Catalog.GetDatabase(dbName)
@@ -2155,6 +2174,11 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 					}
 				}
 
+				// Filter by column access for non-root users
+				if !hasColAccess(dbName, tblName, col.Name) {
+					continue
+				}
+
 				rows = append(rows, storage.Row{
 					"TABLE_CATALOG":            "def",
 					"TABLE_SCHEMA":             dbName,
@@ -2220,6 +2244,8 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 	dbNames := e.Catalog.ListDatabases()
 	sort.Strings(dbNames)
 
+	// Get current user for privilege filtering (once, before the loop)
+	statsUser, statsHost, statsRoles := e.getCurrentUserAndRoles()
 	var rows []storage.Row
 	for _, dbName := range dbNames {
 		db, err := e.Catalog.GetDatabase(dbName)
@@ -2229,6 +2255,12 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 		tableNames := db.ListTables()
 		sort.Strings(tableNames)
 		for _, tblName := range tableNames {
+			// Filter by privilege: non-root users only see tables they have any access to
+			if statsUser != "" && e.grantStore != nil {
+				if !e.grantStore.HasAnyTableAccess(statsUser, statsHost, dbName, tblName, statsRoles) {
+					continue
+				}
+			}
 			tbl, err := db.GetTable(tblName)
 			if err != nil {
 				continue

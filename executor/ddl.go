@@ -5938,6 +5938,18 @@ func mergeColumnTypes(types []string) string {
 
 // execCreateTableLike handles CREATE TABLE t2 LIKE t1.
 func (e *Executor) execCreateTableLike(targetDBName, newTableName, srcDBName, srcTableName string) (*Result, error) {
+	// Privilege check: user needs SELECT on the source table.
+	// MySQL returns "SELECT command denied" even if the table doesn't exist
+	// (to avoid revealing whether the table exists).
+	if e.grantStore != nil {
+		user, host, activeRoles := e.getCurrentUserAndRoles()
+		if user != "" {
+			if !e.grantStore.HasPrivilege(user, host, "SELECT", srcDBName, srcTableName, activeRoles) {
+				return nil, mysqlError(1142, "42000", fmt.Sprintf("SELECT command denied to user '%s'@'%s' for table '%s'", user, host, srcTableName))
+			}
+		}
+	}
+
 	db, err := e.Catalog.GetDatabase(targetDBName)
 	if err != nil {
 		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", targetDBName))

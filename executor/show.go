@@ -207,7 +207,41 @@ func (e *Executor) describeTable(tableName string) (*Result, error) {
 
 	cols := []string{"Field", "Type", "Null", "Key", "Default", "Extra"}
 	rows := make([][]interface{}, 0, len(tblDef.Columns))
+
+	// For non-root users, filter columns by privilege.
+	// SHOW COLUMNS requires the user to have at least one privilege on any column.
+	// If the user has no privilege at all, return SELECT denied error.
+	descUser, descUserHost, descUserRoles := e.getCurrentUserAndRoles()
+	if descUser != "" && e.grantStore != nil {
+		// Check if user has any access to this table (full or column-level)
+		hasAnyAccess := e.grantStore.HasFullTablePrivilege(descUser, descUserHost, descDB, tableName, descUserRoles)
+		if !hasAnyAccess {
+			// Check if user has any column-level access to any column
+			for _, col := range tblDef.Columns {
+				if e.grantStore.HasColumnPrivilege(descUser, descUserHost, descDB, tableName, col.Name, descUserRoles) {
+					hasAnyAccess = true
+					break
+				}
+			}
+		}
+		if !hasAnyAccess {
+			return nil, mysqlError(1142, "42000", fmt.Sprintf("SELECT command denied to user '%s'@'%s' for table '%s'", descUser, descUserHost, tableName))
+		}
+	}
+	showColFilter := func(colName string) bool {
+		if descUser == "" || e.grantStore == nil {
+			return true
+		}
+		if e.grantStore.HasFullTablePrivilege(descUser, descUserHost, descDB, tableName, descUserRoles) {
+			return true
+		}
+		return e.grantStore.HasColumnPrivilege(descUser, descUserHost, descDB, tableName, colName, descUserRoles)
+	}
+
 	for _, col := range tblDef.Columns {
+		if !showColFilter(col.Name) {
+			continue
+		}
 		nullable := "YES"
 		if !col.Nullable {
 			nullable = "NO"
@@ -1010,6 +1044,17 @@ func parseShowIndexTarget(query, currentDB string) (dbName, tableName string, ok
 }
 
 func (e *Executor) showIndexes(dbName, tableName string) (*Result, error) {
+	// Privilege check: SHOW INDEX requires any privilege on any column combination.
+	// MySQL returns "SELECT command denied" even if the table doesn't exist.
+	if e.grantStore != nil {
+		user, host, activeRoles := e.getCurrentUserAndRoles()
+		if user != "" {
+			if !e.grantStore.HasAnyTableAccess(user, host, dbName, tableName, activeRoles) {
+				return nil, mysqlError(1142, "42000", fmt.Sprintf("SELECT command denied to user '%s'@'%s' for table '%s'", user, host, tableName))
+			}
+		}
+	}
+
 	db, resolvedDBName, err := findDatabaseCaseInsensitive(e.Catalog, dbName)
 	if err != nil {
 		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
@@ -1834,6 +1879,18 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		showDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
 	}
 
+	// Privilege check: user must have a full table-level privilege on the table
+	// (column-only grants are not enough for SHOW CREATE TABLE).
+	// MySQL returns "SHOW command denied" even if the table doesn't exist.
+	if e.grantStore != nil && !strings.EqualFold(showDB, "information_schema") && !strings.EqualFold(showDB, "performance_schema") {
+		user, host, activeRoles := e.getCurrentUserAndRoles()
+		if user != "" {
+			if !e.grantStore.HasFullTablePrivilege(user, host, showDB, tableName, activeRoles) {
+				return nil, mysqlError(1142, "42000", fmt.Sprintf("SHOW command denied to user '%s'@'%s' for table '%s'", user, host, tableName))
+			}
+		}
+	}
+
 	// Handle SHOW CREATE TABLE for information_schema virtual tables.
 	if strings.ToLower(showDB) == "information_schema" {
 		lowerName := strings.ToLower(tableName)
@@ -2497,33 +2554,52 @@ func normalizeViewLiterals(sql string) string {
 
 // showCreateView handles SHOW CREATE VIEW <viewName>.
 func (e *Executor) showCreateView(viewName string) (*Result, error) {
+	viewDB := e.CurrentDB
+	resolvedViewName := viewName
+	if strings.Contains(viewName, ".") {
+		viewDB, resolvedViewName = resolveTableNameDB(viewName, e.CurrentDB)
+	}
+
+	// Privilege check: SHOW CREATE VIEW requires both SHOW VIEW and SELECT privileges.
+	// MySQL returns "SELECT command denied" even for non-existent views.
+	if e.grantStore != nil {
+		user, host, activeRoles := e.getCurrentUserAndRoles()
+		if user != "" {
+			hasShowView := e.grantStore.HasPrivilege(user, host, "SHOW VIEW", viewDB, resolvedViewName, activeRoles)
+			hasSelect := e.grantStore.HasPrivilege(user, host, "SELECT", viewDB, resolvedViewName, activeRoles)
+			if !hasShowView || !hasSelect {
+				return nil, mysqlError(1142, "42000", fmt.Sprintf("SELECT command denied to user '%s'@'%s' for table '%s'", user, host, resolvedViewName))
+			}
+		}
+	}
+
 	// Look up stored CREATE VIEW SQL
 	createSQL := ""
 	if e.viewCreateStatements != nil {
-		if sql, ok := e.viewCreateStatements[viewName]; ok {
+		if sql, ok := e.viewCreateStatements[resolvedViewName]; ok {
 			createSQL = sql
 		}
 	}
 	// Fall back to reconstructing from the stored select SQL
 	if createSQL == "" {
 		if e.views != nil {
-			if selectSQL, ok := e.views[viewName]; ok {
-				createSQL = fmt.Sprintf("CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `%s` AS %s", viewName, selectSQL)
+			if selectSQL, ok := e.views[resolvedViewName]; ok {
+				createSQL = fmt.Sprintf("CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `%s` AS %s", resolvedViewName, selectSQL)
 			}
 		}
 	}
 	// Try shared viewStore (views created on other connections)
 	if createSQL == "" && e.viewStore != nil {
-		if sql, ok := e.viewStore.LookupCreateSQL(e.CurrentDB, viewName); ok {
+		if sql, ok := e.viewStore.LookupCreateSQL(viewDB, resolvedViewName); ok {
 			createSQL = sql
 		}
 	}
 	if createSQL == "" {
-		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s' doesn't exist", viewName))
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s' doesn't exist", resolvedViewName))
 	}
 	return &Result{
 		Columns:     []string{"View", "Create View", "character_set_client", "collation_connection"},
-		Rows:        [][]interface{}{{viewName, createSQL, "utf8mb4", "utf8mb4_0900_ai_ci"}},
+		Rows:        [][]interface{}{{resolvedViewName, createSQL, "utf8mb4", "utf8mb4_0900_ai_ci"}},
 		IsResultSet: true,
 	}, nil
 }

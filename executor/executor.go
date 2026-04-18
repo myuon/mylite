@@ -1902,6 +1902,13 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			// Parse and store the grant
 			if e.grantStore != nil {
 				privs, object, toUser, toHost, isRoleGrant, grantOption, adminOption := ParseGrantStatement(trimmed)
+				// If the object has no database qualifier (e.g., "tbl" not "db.tbl"),
+				// use the current database to fully qualify it.
+				if !isRoleGrant && object != "" && !strings.Contains(object, ".") {
+					if e.CurrentDB != "" {
+						object = strings.ToLower(e.CurrentDB) + "." + object
+					}
+				}
 				if isRoleGrant {
 					// GRANT role TO user - record role membership
 					// Handle comma-separated roles: "GRANT r1, r2 TO user"
@@ -1991,8 +1998,41 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			}
 		}
 		// Track CREATE USER / DROP USER in knownUsers for SET PASSWORD FOR validation.
-		if strings.HasPrefix(upper, "CREATE USER ") {
+		if strings.HasPrefix(upper, "CREATE USER") {
 			e.trackCreateUser(trimmed)
+			// Check for IDENTIFIED WITH unknown_plugin: return plugin not loaded error.
+			// Handle both " IDENTIFIED WITH " (with spaces) and "IDENTIFIED WITH" directly after user spec.
+			identWithIdx := strings.Index(upper, "IDENTIFIED WITH")
+			if identWithIdx >= 0 {
+				afterIdent := strings.TrimSpace(trimmed[identWithIdx+len("IDENTIFIED WITH"):])
+				pluginPart := afterIdent
+				// Extract plugin name (quoted or unquoted)
+				pluginName := ""
+				if len(pluginPart) > 0 && (pluginPart[0] == '\'' || pluginPart[0] == '"' || pluginPart[0] == '`') {
+					q := pluginPart[0]
+					end := strings.IndexByte(pluginPart[1:], q)
+					if end >= 0 {
+						pluginName = pluginPart[1 : end+1]
+					}
+				} else {
+					end := strings.IndexAny(pluginPart, " \t\n\r;")
+					if end >= 0 {
+						pluginName = pluginPart[:end]
+					} else {
+						pluginName = strings.TrimRight(pluginPart, ";")
+					}
+				}
+				knownPlugins := map[string]bool{
+					"mysql_native_password": true,
+					"caching_sha2_password": true,
+					"sha256_password":       true,
+					"auth_socket":           true,
+					"authentication_fido":   true,
+				}
+				if pluginName != "" && !knownPlugins[strings.ToLower(pluginName)] {
+					return nil, mysqlError(1524, "HY000", fmt.Sprintf("Plugin '%s' is not loaded", pluginName))
+				}
+			}
 		}
 		if strings.HasPrefix(upper, "DROP USER ") {
 			e.trackDropUser(trimmed)
@@ -2032,6 +2072,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			strings.HasPrefix(upper, "FLUSH PRIVILEGES ")) && e.grantStore != nil {
 			e.reloadGrantStoreFromStorage()
 		}
+		// CHECKSUM TABLE: requires SELECT privilege, returns 0 checksum for each table
+		if strings.HasPrefix(upper, "CHECKSUM TABLE ") || upper == "CHECKSUM TABLE" {
+			return e.execOtherAdmin(query)
+		}
 		if strings.HasPrefix(upper, "CREATE EVENT") ||
 			strings.HasPrefix(upper, "DROP EVENT") ||
 			strings.HasPrefix(upper, "CREATE USER") ||
@@ -2044,7 +2088,6 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			strings.HasPrefix(upper, "RESET ") ||
 			strings.HasPrefix(upper, "INSTALL ") ||
 			strings.HasPrefix(upper, "UNINSTALL ") ||
-			strings.HasPrefix(upper, "CHECKSUM ") ||
 			strings.HasPrefix(upper, "REPAIR ") ||
 			strings.HasPrefix(upper, "OPTIMIZE ") ||
 			strings.HasPrefix(upper, "CHECK ") ||
@@ -5058,6 +5101,37 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 	} else if strings.HasPrefix(upper, "CHECK TABLE") {
 		op = "check"
 		rest = strings.TrimSpace(query[len("CHECK TABLE"):])
+	} else if strings.HasPrefix(upper, "CHECKSUM TABLE") {
+		// CHECKSUM TABLE requires SELECT privilege on the table.
+		rest = strings.TrimSpace(query[len("CHECKSUM TABLE"):])
+		rest = strings.TrimRight(rest, ";")
+		tableNames := strings.Split(rest, ",")
+		var rows [][]interface{}
+		for _, t := range tableNames {
+			t = strings.TrimSpace(t)
+			t = strings.Trim(t, "`")
+			tDB := e.CurrentDB
+			tName := t
+			if strings.Contains(t, ".") {
+				parts := strings.SplitN(t, ".", 2)
+				tDB = strings.Trim(parts[0], "`")
+				tName = strings.Trim(parts[1], "`")
+			}
+			fullName := tDB + "." + tName
+			// Privilege check: need full SELECT access (not just column-level)
+			if e.grantStore != nil {
+				user, host, activeRoles := e.getCurrentUserAndRoles()
+				if user != "" && !e.grantStore.HasFullTablePrivilege(user, host, tDB, tName, activeRoles) {
+					return nil, mysqlError(1142, "42000", fmt.Sprintf("SELECT command denied to user '%s'@'%s' for table '%s'", user, host, tName))
+				}
+			}
+			rows = append(rows, []interface{}{fullName, int64(0)})
+		}
+		return &Result{
+			Columns:     []string{"Table", "Checksum"},
+			Rows:        rows,
+			IsResultSet: true,
+		}, nil
 	} else if strings.HasPrefix(upper, "DO ") {
 		// DO expr — evaluate expressions but discard results
 		exprStr := strings.TrimSpace(query[3:])
@@ -5134,6 +5208,23 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 		tableName := t
 		if !strings.Contains(tableName, ".") {
 			tableName = e.CurrentDB + "." + tableName
+		}
+		// Privilege check for CHECK TABLE: requires any privilege on any column combination.
+		if op == "check" && e.grantStore != nil {
+			user, host, activeRoles := e.getCurrentUserAndRoles()
+			if user != "" {
+				// Parse db and table from tableName (which is "db.table" at this point)
+				chkDB := e.CurrentDB
+				chkTable := t
+				if strings.Contains(tableName, ".") {
+					parts := strings.SplitN(tableName, ".", 2)
+					chkDB = parts[0]
+					chkTable = parts[1]
+				}
+				if !e.grantStore.HasAnyTableAccess(user, host, chkDB, chkTable, activeRoles) {
+					return nil, mysqlError(1142, "42000", fmt.Sprintf("SELECT command denied to user '%s'@'%s' for table '%s'", user, host, chkTable))
+				}
+			}
 		}
 		// Check table lock restrictions for CHECK/REPAIR when LOCK TABLES is active
 		if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
