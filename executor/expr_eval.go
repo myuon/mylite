@@ -6546,6 +6546,27 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 				return cmp >= 0, nil
 			}
 		}
+		// MySQL numeric column vs non-numeric string: coerce the string to 0.
+		// e.g. DECIMAL_COL > 'A' → DECIMAL_COL > 0 (MySQL converts non-numeric string to 0 with warning).
+		// This only applies when the column side is DECIMAL/FLOAT/DOUBLE and the string side is a literal.
+		// Exclude TIME/DATE-like strings from coercion (e.g. TIME column vs DECIMAL column comparison).
+		if ls, lok := left.(string); lok {
+			if rs, rok := right.(string); rok {
+				if e.isNumericDecimalColExpr(leftExprW) {
+					if _, ferr := strconv.ParseFloat(rs, 64); ferr != nil && rs != "" && !looksLikeTime(rs) && !looksLikeDate(rs) {
+						// right is non-numeric string literal: coerce to "0"
+						right = "0"
+						e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect DOUBLE value: '%s'", rs))
+					}
+				} else if e.isNumericDecimalColExpr(rightExprW) {
+					if _, ferr := strconv.ParseFloat(ls, 64); ferr != nil && ls != "" && !looksLikeTime(ls) && !looksLikeDate(ls) {
+						// left is non-numeric string literal: coerce to "0"
+						left = "0"
+						e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect DOUBLE value: '%s'", ls))
+					}
+				}
+			}
+		}
 		result, err := compareValues(left, right, v.Operator)
 		if err != nil {
 			return false, err

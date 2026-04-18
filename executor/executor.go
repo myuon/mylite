@@ -4389,6 +4389,61 @@ func (e *Executor) isColumnBinary(tableName, colName string) bool {
 	return false
 }
 
+// isNumericDecimalColExpr checks if expr is a column reference to a DECIMAL, FLOAT, DOUBLE, or REAL
+// column in the current query context. This is used to apply MySQL's string-to-number coercion rule:
+// when a numeric column is compared to a non-numeric string, the string is treated as 0.
+func (e *Executor) isNumericDecimalColExpr(expr sqlparser.Expr) bool {
+	cn, ok := expr.(*sqlparser.ColName)
+	if !ok {
+		return false
+	}
+	colName := cn.Name.String()
+	// Try queryTableDef first (current query's table definition)
+	if e.queryTableDef != nil {
+		for _, col := range e.queryTableDef.Columns {
+			if strings.EqualFold(col.Name, colName) {
+				lower := strings.ToLower(col.Type)
+				return strings.HasPrefix(lower, "decimal") || strings.HasPrefix(lower, "float") ||
+					strings.HasPrefix(lower, "double") || strings.HasPrefix(lower, "real") ||
+					strings.HasPrefix(lower, "numeric")
+			}
+		}
+	}
+	// Fall back to catalog lookup
+	if e.CurrentDB == "" {
+		return false
+	}
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return false
+	}
+	tableName := ""
+	if !cn.Qualifier.Name.IsEmpty() {
+		tableName = cn.Qualifier.Name.String()
+	}
+	var tables []string
+	if tableName != "" {
+		tables = []string{tableName}
+	} else {
+		tables = db.ListTables()
+	}
+	for _, tbl := range tables {
+		tDef, _ := db.GetTable(tbl)
+		if tDef == nil {
+			continue
+		}
+		for _, col := range tDef.Columns {
+			if strings.EqualFold(col.Name, colName) {
+				lower := strings.ToLower(col.Type)
+				return strings.HasPrefix(lower, "decimal") || strings.HasPrefix(lower, "float") ||
+					strings.HasPrefix(lower, "double") || strings.HasPrefix(lower, "real") ||
+					strings.HasPrefix(lower, "numeric")
+			}
+		}
+	}
+	return false
+}
+
 // isSpatialExpr checks if an expression references a spatial/geometry column (POINT, GEOMETRY, etc.)
 // Spatial types are not valid in bitwise operations and raise error 1210.
 func (e *Executor) isSpatialExpr(expr sqlparser.Expr) bool {

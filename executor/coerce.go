@@ -19,7 +19,26 @@ import (
 // For TIME columns, "2007-02-13 15:09:33" becomes "15:09:33".
 // For YEAR columns, "2007-02-13 15:09:33" becomes "2007".
 func coerceDateTimeValue(colType string, v interface{}) interface{} {
+	return coerceDateTimeValueWithSession(colType, v, nil)
+}
+
+// coerceDateTimeValueWithSession is like coerceDateTimeValue but uses sessionTime to
+// determine the current date when converting TIME values to TIMESTAMP columns.
+// If sessionTime is nil, TIME -> TIMESTAMP conversion returns "0000-00-00 00:00:00".
+// timeTruncateFractional should be true when the TIME_TRUNCATE_FRACTIONAL SQL mode is active;
+// in that mode, a TIME-format string like "10:10:10.999999" stored into TIMESTAMP gets the
+// session date prepended. Without that mode, such strings are treated as invalid datetimes (→ zero).
+func coerceDateTimeValueWithSession(colType string, v interface{}, sessionTime *time.Time) interface{} {
+	return coerceDateTimeValueWithSessionEx(colType, v, sessionTime, false)
+}
+
+func coerceDateTimeValueWithSessionEx(colType string, v interface{}, sessionTime *time.Time, timeTruncateFractional bool) interface{} {
 	upper := strings.ToUpper(strings.TrimSpace(colType))
+	// Convert ScaledValue to its decimal string representation so downstream
+	// date/time parsing can handle it correctly (e.g. DECIMAL(30,6) column value).
+	if sv, ok := v.(ScaledValue); ok {
+		v = fmt.Sprintf("%."+strconv.Itoa(sv.Scale)+"f", sv.Value)
+	}
 	s := fmt.Sprintf("%v", v)
 	if len(s) == 0 {
 		// Empty string for YEAR -> "0000"
@@ -53,6 +72,15 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 	if isTimeType {
 		upper = "TIME"
 	}
+	// Extract DATETIME(N) / TIMESTAMP(N) precision and normalize to base type.
+	dtFsp := -1 // -1 means no precision specified (plain DATETIME/TIMESTAMP)
+	if strings.HasPrefix(upper, "DATETIME(") {
+		fmt.Sscanf(upper, "DATETIME(%d)", &dtFsp)
+		upper = "DATETIME"
+	} else if strings.HasPrefix(upper, "TIMESTAMP(") {
+		fmt.Sscanf(upper, "TIMESTAMP(%d)", &dtFsp)
+		upper = "TIMESTAMP"
+	}
 	switch upper {
 	case "DATE":
 		// If the value looks like a datetime, truncate to date-only
@@ -84,6 +112,90 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 	case "YEAR":
 		return coerceYearValue(v)
 	case "TIMESTAMP":
+		// Handle TIME-only values (HH:MM:SS[.ffffff]) being stored into a TIMESTAMP column.
+		// This behavior (prepend session date) is only active in TIME_TRUNCATE_FRACTIONAL mode.
+		// Without that mode, a TIME-like string (e.g. '10:45:15') stored into TIMESTAMP is
+		// treated as an invalid datetime and becomes '0000-00-00 00:00:00'.
+		if timeTruncateFractional {
+			isTimeOnlyStr := func(st string) bool {
+				// Must contain ':' and not contain '-' (which would indicate a date part)
+				return strings.Contains(st, ":") && !strings.Contains(st, "-")
+			}
+			if isTimeOnlyStr(s) {
+				// s is a TIME-only string like "10:10:10.999999"
+				var datePrefix string
+				if sessionTime != nil {
+					datePrefix = sessionTime.Format("2006-01-02")
+				} else {
+					return "0000-00-00 00:00:00"
+				}
+				s = datePrefix + " " + s
+			}
+		}
+		// Handle compact numeric YYYYMMDDHHMMSS[.ffffff] format by converting to
+		// standard "YYYY-MM-DD HH:MM:SS[.ffffff]" before further processing.
+		// This handles DECIMAL values like 20010101101010.999999 stored in TIMESTAMP.
+		{
+			isAllDigitStr := func(st string) bool {
+				for _, c := range st {
+					if c < '0' || c > '9' {
+						return false
+					}
+				}
+				return len(st) > 0
+			}
+			tsDotIdx := strings.IndexByte(s, '.')
+			tsIntPart, tsFracPart := s, ""
+			if tsDotIdx >= 0 {
+				tsIntPart = s[:tsDotIdx]
+				tsFracPart = s[tsDotIdx+1:]
+			}
+			if isAllDigitStr(tsIntPart) && len(tsIntPart) == 14 {
+				y, _ := strconv.Atoi(tsIntPart[0:4])
+				mo, _ := strconv.Atoi(tsIntPart[4:6])
+				d, _ := strconv.Atoi(tsIntPart[6:8])
+				h, _ := strconv.Atoi(tsIntPart[8:10])
+				mi, _ := strconv.Atoi(tsIntPart[10:12])
+				sec, _ := strconv.Atoi(tsIntPart[12:14])
+				s = fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, h, mi, sec)
+				if tsFracPart != "" {
+					s += "." + tsFracPart
+				}
+			}
+		}
+		// Apply TIMESTAMP(N) fractional precision if specified.
+		if dtFsp >= 0 {
+			if dotIdx2 := strings.IndexByte(s, '.'); dotIdx2 > 10 {
+				if dtFsp == 0 {
+					s = s[:dotIdx2]
+				} else {
+					frac := s[dotIdx2+1:]
+					for len(frac) < dtFsp {
+						frac += "0"
+					}
+					if len(frac) > dtFsp {
+						frac = frac[:dtFsp]
+					}
+					s = s[:dotIdx2+1] + frac
+				}
+			} else if dtFsp > 0 && len(s) >= 19 && s[4] == '-' {
+				// No fractional part but dtFsp > 0: pad with zeros
+				s = s + "." + strings.Repeat("0", dtFsp)
+			}
+		} else {
+			// Plain TIMESTAMP: strip fractional seconds
+			if dotIdx2 := strings.IndexByte(s, '.'); dotIdx2 > 10 {
+				s = s[:dotIdx2]
+			}
+		}
+		// Save the full time part (including fractional) before parseMySQLDateValue strips it.
+		// parseMySQLDateValue only returns the date (10 chars), so we extract the time here.
+		fullTimeForTS := ""
+		if spIdx := strings.IndexAny(s, " \tT"); spIdx >= 0 {
+			fullTimeForTS = strings.TrimSpace(s[spIdx+1:])
+		} else if len(s) >= 19 && s[4] == '-' && s[7] == '-' {
+			// no space found but could be edge case - skip
+		}
 		// Try parsing various date formats first
 		parsed := parseMySQLDateValue(s)
 		if parsed == "" {
@@ -91,11 +203,13 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 			return "0000-00-00 00:00:00"
 		}
 		s = parsed
-		// Check if we need to append time from the original value
-		if len(s) == 10 {
+		// Append the saved time part (which includes fractional seconds)
+		if fullTimeForTS != "" {
+			timePart := normalizeDateTimeSeparators(fullTimeForTS)
+			s = s + " " + timePart
+		} else if len(s) == 10 {
 			timePart := extractTimePart(v, s)
 			if timePart != "" {
-				// Normalize time separator chars to ':'
 				timePart = normalizeDateTimeSeparators(timePart)
 				s = s + " " + timePart
 			}
@@ -103,11 +217,20 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 		// TIMESTAMP range: '1970-01-01 00:00:01' to '2038-01-19 03:14:07' UTC
 		// Out-of-range values are stored as '0000-00-00 00:00:00'
 		if len(s) >= 10 && s[4] == '-' {
-			datePart := s
-			if len(datePart) > 10 {
-				datePart = datePart[:10]
+			// Try to parse full datetime for accurate range check.
+			// Strip fractional seconds for parsing (time.Parse doesn't handle them in the base format).
+			checkStr := s
+			if len(checkStr) > 19 && checkStr[19] == '.' {
+				checkStr = checkStr[:19]
 			}
-			if t, err := time.Parse("2006-01-02", datePart); err == nil {
+			var t time.Time
+			var parseErr error
+			if len(checkStr) >= 19 && checkStr[10] == ' ' {
+				t, parseErr = time.Parse("2006-01-02 15:04:05", checkStr[:19])
+			} else {
+				t, parseErr = time.Parse("2006-01-02", checkStr[:10])
+			}
+			if parseErr == nil {
 				minTS := time.Date(1970, 1, 1, 0, 0, 1, 0, time.UTC)
 				maxTS := time.Date(2038, 1, 19, 3, 14, 7, 0, time.UTC)
 				if t.Before(minTS) || t.After(maxTS) {
@@ -148,6 +271,15 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 			wasCompactNumeric = true
 		}
 
+		// Handle compact numeric datetime with fractional seconds: "YYYYMMDDHHMMSS.ffffff"
+		// Split at decimal point, remember fractional part for later.
+		var compactFrac string
+		if dotIdx := strings.IndexByte(s, '.'); dotIdx >= 0 && isAllDigitStr(s[:dotIdx]) && len(s[:dotIdx]) == 14 {
+			compactFrac = s[dotIdx+1:]
+			s = s[:dotIdx]
+			wasCompactNumeric = true
+		}
+
 		// Pad compact numeric strings to nearest parseable length.
 		// Integers: left-pad (no leading digits in numeric value).
 		// Strings: right-pad (zero-fill trailing fields).
@@ -178,6 +310,14 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 				}
 			}
 			timePart := extractTimePart(v, s)
+			// For compact decimal datetime "YYYYMMDDHHMMSS.ffffff", extractTimePart may fail
+			// because the original v has a dot. Extract time directly from stripped s in this case.
+			if timePart == "" && compactFrac != "" && len(s) == 14 && isAllDigitStr(s) {
+				h, _ := strconv.Atoi(s[8:10])
+				m2, _ := strconv.Atoi(s[10:12])
+				sec2, _ := strconv.Atoi(s[12:14])
+				timePart = fmt.Sprintf("%02d:%02d:%02d", h, m2, sec2)
+			}
 			if timePart != "" {
 				// Normalize time separator chars to ':'
 				timePart = normalizeDateTimeSeparators(timePart)
@@ -190,9 +330,15 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 						timePart = "0" + timePart
 					}
 				}
-				// DATETIME (no precision) stores at second precision: strip fractional seconds.
+				// Extract fractional seconds from timePart if present.
+				var fracPart string
 				if dotIdx := strings.Index(timePart, "."); dotIdx >= 0 {
+					fracPart = timePart[dotIdx+1:]
 					timePart = timePart[:dotIdx]
+				}
+				// Use compactFrac (from "YYYYMMDDHHMMSS.ffffff" splitting) if no frac in timePart.
+				if fracPart == "" && compactFrac != "" {
+					fracPart = compactFrac
 				}
 				// Validate: H<=23, M<=59, S<=59.
 				// Only apply this check for compact numeric inputs (all-digit strings, integers).
@@ -220,6 +366,26 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 							}
 						}
 					}
+				}
+				// Apply fractional seconds precision.
+				if dtFsp >= 0 {
+					// DATETIME(N): keep exactly N fractional digits (pad with zeros or truncate).
+					// MySQL always displays DATETIME(N) with exactly N fractional digits.
+					if dtFsp == 0 {
+						// DATETIME(0) or plain DATETIME: drop fractional part.
+						return parsed + " " + timePart
+					}
+					frac := fracPart
+					for len(frac) < dtFsp {
+						frac += "0"
+					}
+					if len(frac) > dtFsp {
+						frac = frac[:dtFsp]
+					}
+					return parsed + " " + timePart + "." + frac
+				} else if dtFsp < 0 {
+					// Plain DATETIME (no precision specified): strip fractional seconds.
+					// fracPart is ignored.
 				}
 				return parsed + " " + timePart
 			}
@@ -556,6 +722,10 @@ func formatTimeValue(negative bool, h, m, sec int, frac string) string {
 		// If hours > 838, clip to max
 		h, m, sec = 838, 59, 59
 		frac = ""
+	} else if totalSecs == maxSecs && frac != "" && strings.TrimRight(frac, "0") != "" {
+		// 838:59:59.xxx where xxx > 0 exceeds the max TIME value (838:59:59); clamp by dropping fractional part.
+		// 838:59:59.000000 is exactly at max and is valid (no clamping).
+		frac = ""
 	}
 
 	sign := ""
@@ -585,8 +755,12 @@ func applyTimePrecision(timeStr string, fsp int) string {
 	// Find the fractional part
 	dotIdx := strings.Index(timeStr, ".")
 	if dotIdx < 0 {
-		// No fractional part, nothing to do
-		return timeStr
+		if fsp == 0 {
+			// No fractional part for non-fractional TIME, nothing to do
+			return timeStr
+		}
+		// TIME(N) with fsp>0 but no fractional part: pad with zeros (e.g. "838:59:59" -> "838:59:59.000000")
+		return timeStr + "." + strings.Repeat("0", fsp)
 	}
 	basePart := timeStr[:dotIdx]
 	fracPart := timeStr[dotIdx+1:]
@@ -767,7 +941,27 @@ func (e *Executor) coerceColumnValueForWrite(colType string, val interface{}) in
 			val = preTruncateTimeValue(val, fsp)
 		}
 	}
-	return coerceColumnValue(colType, val)
+	return e.coerceColumnValueWithSession(colType, val)
+}
+
+// coerceColumnValueWithSession is like coerceColumnValue but passes the session time
+// for TIME -> TIMESTAMP conversion.
+func (e *Executor) coerceColumnValueWithSession(colType string, val interface{}) interface{} {
+	if padLen := binaryPadLength(colType); padLen > 0 && val != nil {
+		val = padBinaryValue(val, padLen)
+	} else if isVarbinaryType(colType) && val != nil {
+		val = hexIntToBytes(val)
+	}
+	if val != nil {
+		val = formatDecimalValue(colType, val)
+		val = validateEnumSetValue(colType, val)
+		st := e.nowTime()
+		ttf := strings.Contains(e.sqlMode, "TIME_TRUNCATE_FRACTIONAL")
+		val = coerceDateTimeValueWithSessionEx(colType, val, &st, ttf)
+		val = coerceIntegerValue(colType, val)
+		val = coerceBitValue(colType, val)
+	}
+	return val
 }
 
 // coerceValueForColumnTypeForWrite is like coerceValueForColumnType but applies
@@ -778,7 +972,48 @@ func (e *Executor) coerceValueForColumnTypeForWrite(col catalog.ColumnDef, val i
 			val = preTruncateTimeValue(val, fsp)
 		}
 	}
-	return coerceValueForColumnType(col, val)
+	return e.coerceValueForColumnTypeWithSession(col, val)
+}
+
+// coerceValueForColumnTypeWithSession is like coerceValueForColumnType but passes
+// the session time for TIME -> TIMESTAMP conversion.
+func (e *Executor) coerceValueForColumnTypeWithSession(col catalog.ColumnDef, val interface{}) interface{} {
+	if val == nil {
+		return nil
+	}
+	if padLen := binaryPadLength(col.Type); padLen > 0 {
+		val = padBinaryValue(val, padLen)
+	} else if isVarbinaryType(col.Type) {
+		val = hexIntToBytes(val)
+	}
+	val = formatDecimalValue(col.Type, val)
+	val = validateEnumSetValue(col.Type, val)
+	st := e.nowTime()
+	ttf := strings.Contains(e.sqlMode, "TIME_TRUNCATE_FRACTIONAL")
+	val = coerceDateTimeValueWithSessionEx(col.Type, val, &st, ttf)
+	val = coerceIntegerValue(col.Type, val)
+	val = coerceBitValue(col.Type, val)
+	// Truncate BLOB/TEXT values when column type changes (e.g., LONGBLOB→BLOB)
+	colUp := strings.ToUpper(col.Type)
+	isBlobTy := colUp == "BLOB" || colUp == "TINYBLOB" || colUp == "MEDIUMBLOB"
+	isTextTy := colUp == "TEXT" || colUp == "TINYTEXT" || colUp == "MEDIUMTEXT"
+	if isBlobTy || isTextTy {
+		if sv, ok := val.(string); ok {
+			maxLen := extractCharLength(col.Type)
+			if maxLen > 0 {
+				if isBlobTy {
+					if len(sv) > maxLen {
+						val = "" // MySQL sets to empty string when BLOB data exceeds new column max
+					}
+				} else {
+					if len([]rune(sv)) > maxLen {
+						val = "" // MySQL sets to empty string when TEXT data exceeds new column max
+					}
+				}
+			}
+		}
+	}
+	return val
 }
 
 // implicitZeroValue returns the implicit zero/default value for a MySQL type
@@ -1622,6 +1857,31 @@ func looksLikeActualTime(s string) bool {
 // For datetime values: returns "YYYY-MM-DD HH:MM:SS".
 // Returns "" if the string cannot be parsed as a date.
 func normalizeDateTimeString(s string) string {
+	// Handle compact decimal YYYYMMDDHHMMSS.ffffff format (e.g. "20010101112233.000000").
+	// parseMySQLDateValue can't handle the '.' separator, so we convert it manually.
+	if dotIdx := strings.IndexByte(s, '.'); dotIdx == 14 {
+		intPart := s[:14]
+		fracPart := s[15:]
+		isAllDigitsFn := func(st string) bool {
+			for _, c := range st {
+				if c < '0' || c > '9' {
+					return false
+				}
+			}
+			return len(st) > 0
+		}
+		if isAllDigitsFn(intPart) && isAllDigitsFn(fracPart) {
+			y, _ := strconv.Atoi(intPart[0:4])
+			mo, _ := strconv.Atoi(intPart[4:6])
+			d, _ := strconv.Atoi(intPart[6:8])
+			h, _ := strconv.Atoi(intPart[8:10])
+			mi, _ := strconv.Atoi(intPart[10:12])
+			sec, _ := strconv.Atoi(intPart[12:14])
+			if mo >= 1 && mo <= 12 && d >= 1 && d <= 31 {
+				return fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d.%s", y, mo, d, h, mi, sec, fracPart)
+			}
+		}
+	}
 	datePart := parseMySQLDateValue(s)
 	if datePart == "" {
 		return ""
@@ -1843,6 +2103,33 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 		}
 		// Try parsing as number - extract leading numeric part
 		val = strings.TrimSpace(val)
+		// Detect DATETIME format "YYYY-MM-DD HH:MM:SS[.frac]" and convert to YYYYMMDDHHMMSS integer.
+		// MySQL converts DATETIME to integer as YYYYMMDDHHMMSS (e.g., "2001-01-01 10:10:59" -> 20010101101059).
+		if len(val) >= 19 && val[4] == '-' && val[7] == '-' && val[10] == ' ' && val[13] == ':' && val[16] == ':' {
+			y, _ := strconv.ParseInt(val[0:4], 10, 64)
+			mo, _ := strconv.ParseInt(val[5:7], 10, 64)
+			d, _ := strconv.ParseInt(val[8:10], 10, 64)
+			h, _ := strconv.ParseInt(val[11:13], 10, 64)
+			mi, _ := strconv.ParseInt(val[14:16], 10, 64)
+			sec, _ := strconv.ParseInt(val[17:19], 10, 64)
+			datetimeInt := y*10000000000 + mo*100000000 + d*1000000 + h*10000 + mi*100 + sec
+			if isUnsigned {
+				if datetimeInt < 0 {
+					return uint64(0)
+				}
+				if uint64(datetimeInt) > maxUnsigned {
+					return maxUnsigned
+				}
+				return uint64(datetimeInt)
+			}
+			if datetimeInt > maxVal {
+				return maxVal
+			}
+			if datetimeInt < minVal {
+				return minVal
+			}
+			return int64(datetimeInt)
+		}
 		// Detect TIME format "HH:MM:SS[.frac]" or "-HH:MM:SS[.frac]" and convert to HHMMSS integer.
 		// MySQL converts TIME to integer as HHMMSS (e.g., "10:10:59" -> 101059).
 		{
@@ -2295,6 +2582,12 @@ func checkIntegerStrict(colType string, colName string, v interface{}) error {
 		}
 		sl := strings.ToLower(s)
 		if sl == "true" || sl == "false" {
+			return nil
+		}
+		// TIME-like strings (HH:MM:SS[.ffffff]) and DATETIME-like strings are converted
+		// to their numeric HHMMSS or YYYYMMDDHHMMSS representation. MySQL allows this
+		// even in strict mode (no error is raised).
+		if strings.Count(s, ":") == 2 || (len(s) >= 19 && s[4] == '-' && s[7] == '-' && s[10] == ' ') {
 			return nil
 		}
 		// Check if it's a valid number
@@ -3405,13 +3698,13 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 		// FLOAT/DOUBLE/REAL(M,D): round to d decimal places (banker's rounding).
 		f = roundToEvenScale(f, d)
 		if prefix == "float" {
-			// FLOAT is single-precision after scale rounding.
 			f = float64(float32(f))
 		}
 		return fmt.Sprintf("%.*f", d, f)
 	}
 	return v
 }
+
 
 func roundToEvenScale(f float64, d int) float64 {
 	if d <= 0 {
