@@ -2322,18 +2322,18 @@ func formatResultCell(v interface{}) string {
 			s = strings.Replace(s, "e+0", "e", 1)
 			s = strings.Replace(s, "e-0", "e-", 1)
 			s = strings.Replace(s, "e+", "e", 1)
-			// Strip trailing zeros only for values that exceed float32 range (true DOUBLE values).
-			if isOutOfFloat32Range {
-				eIdx := strings.IndexByte(s, 'e')
-				if eIdx > 0 {
-					mantissa := s[:eIdx]
-					exponent := s[eIdx:]
-					if strings.IndexByte(mantissa, '.') >= 0 {
-						mantissa = strings.TrimRight(mantissa, "0")
-						mantissa = strings.TrimRight(mantissa, ".")
-					}
-					s = mantissa + exponent
+			// Strip trailing zeros for all float values (both FLOAT and DOUBLE).
+			// MySQL displays e.g. "3.4e38" not "3.40000e38".
+			_ = isOutOfFloat32Range
+			eIdx := strings.IndexByte(s, 'e')
+			if eIdx > 0 {
+				mantissa := s[:eIdx]
+				exponent := s[eIdx:]
+				if strings.IndexByte(mantissa, '.') >= 0 {
+					mantissa = strings.TrimRight(mantissa, "0")
+					mantissa = strings.TrimRight(mantissa, ".")
 				}
+				s = mantissa + exponent
 			}
 			return s
 		}

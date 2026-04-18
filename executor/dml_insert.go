@@ -987,9 +987,20 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 								isFloatType := !isDecimalOrNumeric && (strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || strings.Contains(colUpper, "REAL"))
 								if sv, isStr := v.(string); isStr {
 									svTrimmed := strings.TrimSpace(sv)
-									if _, pfErr := strconv.ParseFloat(svTrimmed, 64); pfErr != nil {
-										// String doesn't parse as a valid float.
-										if bool(stmt.Ignore) {
+									pfVal, pfErr := strconv.ParseFloat(svTrimmed, 64)
+									if pfErr != nil {
+										// String doesn't parse (or parses with overflow to ±Inf).
+										// For FLOAT/DOUBLE/REAL: overflow (±Inf result) → out-of-range error 22003.
+										// Non-numeric / truncated strings → data-truncated error 01000.
+										if math.IsInf(pfVal, 0) {
+											// Overflow (e.g. "+1.8E+309" for DOUBLE) → out of range
+											if bool(stmt.Ignore) {
+												e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+												v = float64(0)
+											} else {
+												return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+											}
+										} else if bool(stmt.Ignore) {
 											if prefix2, ok2 := extractNumericPrefix(svTrimmed); ok2 && prefix2 != svTrimmed {
 												e.addWarning("Note", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 												v = prefix2
