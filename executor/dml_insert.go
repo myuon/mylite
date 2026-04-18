@@ -490,6 +490,11 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		return &Result{AffectedRows: affected, InsertID: uint64(lastInsertID)}, nil
 	}
 
+	// odkvExtSourceRows holds per-row source context (all columns from the FROM clause)
+	// for use in ON DUPLICATE KEY UPDATE expressions that reference qualified columns
+	// (e.g. dt.c, t2.c2) not present in the projected SELECT result.
+	var odkvExtSourceRows []storage.Row
+
 	if sel, ok := stmt.Rows.(*sqlparser.Select); ok {
 		// For INSERT...SELECT with no real FROM clause, validate bare column references
 		// in the SELECT list. MySQL raises ER_BAD_FIELD_ERROR for unresolvable column names.
@@ -641,6 +646,56 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			valRows = append(valRows, tuple)
 		}
 		stmt.Rows = valRows
+
+		// For ODKU with qualified column references (e.g. dt.c, t2.c2), collect full source
+		// rows by re-executing a SELECT * version of the same query. This makes all source
+		// table/derived-table columns accessible in ODKU expressions even if not in the
+		// outer SELECT list.
+		if len(stmt.OnDup) > 0 && len(sel.From) == 1 {
+			hasQualifiedRefs := false
+			for _, upd := range stmt.OnDup {
+				_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+					if cn, ok2 := node.(*sqlparser.ColName); ok2 && !cn.Qualifier.IsEmpty() {
+						hasQualifiedRefs = true
+					}
+					return !hasQualifiedRefs, nil
+				}, upd.Expr)
+				if hasQualifiedRefs {
+					break
+				}
+			}
+			if hasQualifiedRefs {
+				// Build "SELECT *" version of sel (same FROM/WHERE/etc, but project all columns)
+				fullSel := sqlparser.CloneRefOfSelect(sel)
+				fullSel.SelectExprs = &sqlparser.SelectExprs{Exprs: []sqlparser.SelectExpr{&sqlparser.StarExpr{}}}
+				// Determine the FROM alias (used to qualify result column names)
+				var fromAlias string
+				if ate, ok2 := sel.From[0].(*sqlparser.AliasedTableExpr); ok2 {
+					if !ate.As.IsEmpty() {
+						fromAlias = strings.ToLower(ate.As.String())
+					} else if tname, ok3 := ate.Expr.(sqlparser.TableName); ok3 {
+						fromAlias = strings.ToLower(tname.Name.String())
+					}
+				}
+				if fullResult, fErr := e.execSelect(fullSel); fErr == nil && len(fullResult.Rows) == len(selResult.Rows) {
+					odkvExtSourceRows = make([]storage.Row, len(fullResult.Rows))
+					for i, fRow := range fullResult.Rows {
+						sr := make(storage.Row)
+						for j, col := range fullResult.Columns {
+							if j < len(fRow) {
+								colLower := strings.ToLower(col)
+								sr[colLower] = fRow[j]
+								if fromAlias != "" {
+									sr[fromAlias+"."+colLower] = fRow[j]
+								}
+							}
+						}
+						odkvExtSourceRows[i] = sr
+					}
+				}
+			}
+		}
+
 		// Save source column names for ON DUPLICATE KEY UPDATE column reference resolution.
 		// When INSERT...SELECT ON DUPLICATE KEY UPDATE uses bare column names like 'a',
 		// they refer to the source SELECT columns, not the target table columns.
@@ -793,7 +848,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	}
 
 
-	for _, valTuple := range rows {
+	for rowIdx, valTuple := range rows {
 		totalRows++
 		row := make(storage.Row)
 		origValues := make(storage.Row) // original values before formatting (for strict mode checks)
@@ -1294,6 +1349,23 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 								// Also add qualified "table.col" form (e.g. "t1.a")
 								// so that t1.a resolves correctly.
 							}
+						}
+					}
+				}
+				// Augment odkvRow with extended source context rows (all columns from source
+				// tables/derived tables). This enables ODKU expressions like dt.c or t2.c2 to
+				// resolve correctly even when those columns are not in the projected SELECT list.
+				if rowIdx < len(odkvExtSourceRows) {
+					if len(e.onDupSourceColNames) == 0 {
+						// We didn't already build an augmented row; create one now.
+						odkvRow = make(storage.Row, len(row)+len(odkvExtSourceRows[rowIdx]))
+						for k, v := range row {
+							odkvRow[k] = v
+						}
+					}
+					for k, v := range odkvExtSourceRows[rowIdx] {
+						if _, exists := odkvRow[k]; !exists {
+							odkvRow[k] = v
 						}
 					}
 				}
