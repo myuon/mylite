@@ -2325,28 +2325,20 @@ func formatResultCell(v interface{}) string {
 		}
 		abs := math.Abs(f)
 		if abs != 0 && (abs >= 1e14 || abs < 1e-4) {
-			// Determine if this value should be formatted with FLOAT (32-bit) or DOUBLE (64-bit) precision.
-			// Values from FLOAT columns have been normalized to 6 significant digits and fit within float32 range.
-			// Values from DOUBLE arithmetic may exceed float32 range (e.g., 1e43 → float32 = +Inf).
-			// If the value exceeds float32 range, it's a true DOUBLE value → strip trailing zeros.
-			// If it fits in float32 range, it's likely from a FLOAT column → keep 5-decimal format.
-			isOutOfFloat32Range := math.IsInf(float64(float32(f)), 0)
 			s := strconv.FormatFloat(f, 'e', 5, bitSize)
 			s = strings.Replace(s, "e+0", "e", 1)
 			s = strings.Replace(s, "e-0", "e-", 1)
 			s = strings.Replace(s, "e+", "e", 1)
-			// Strip trailing zeros only for values that exceed float32 range (true DOUBLE values).
-			if isOutOfFloat32Range {
-				eIdx := strings.IndexByte(s, 'e')
-				if eIdx > 0 {
-					mantissa := s[:eIdx]
-					exponent := s[eIdx:]
-					if strings.IndexByte(mantissa, '.') >= 0 {
-						mantissa = strings.TrimRight(mantissa, "0")
-						mantissa = strings.TrimRight(mantissa, ".")
-					}
-					s = mantissa + exponent
+			// Always strip trailing zeros from the mantissa (MySQL does this for both FLOAT and DOUBLE).
+			eIdx := strings.IndexByte(s, 'e')
+			if eIdx > 0 {
+				mantissa := s[:eIdx]
+				exponent := s[eIdx:]
+				if strings.IndexByte(mantissa, '.') >= 0 {
+					mantissa = strings.TrimRight(mantissa, "0")
+					mantissa = strings.TrimRight(mantissa, ".")
 				}
+				s = mantissa + exponent
 			}
 			return s
 		}
