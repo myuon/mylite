@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -506,7 +507,21 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 						isBlobType := colUp == "BLOB" || colUp == "TINYBLOB" || colUp == "MEDIUMBLOB" || colUp == "LONGBLOB"
 						isTextType := colUp == "TEXT" || colUp == "TINYTEXT" || colUp == "MEDIUMTEXT" || colUp == "LONGTEXT"
 						if isCharType || isBlobType || isTextType {
+							// Resolve raw bytes from val (string or HexBytes).
+							var rawBytes []byte
+							var hasRawBytes bool
+							isHexLiteral := false
 							if sv, ok := val.(string); ok {
+								rawBytes, hasRawBytes = []byte(sv), true
+							} else if hb, ok := val.(HexBytes); ok {
+								decoded, err := hex.DecodeString(string(hb))
+								if err == nil {
+									rawBytes, hasRawBytes = decoded, true
+									isHexLiteral = true
+								}
+							}
+							if hasRawBytes {
+								sv := string(rawBytes)
 								maxLen := extractCharLength(col.Type)
 								isBinaryCol := strings.Contains(colUp, "BINARY") || isBlobType
 								var svLen int
@@ -556,6 +571,24 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 											// Non-strict mode: warn but do NOT truncate (Dolt compatibility)
 											e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", col.Name, i+1))
 										}
+									}
+								}
+								// Charset validation for non-binary columns.
+								if !isBinaryCol {
+									colCs := col.Charset
+									if colCs == "" && tbl.Def != nil {
+										colCs = tbl.Def.Charset
+									}
+									colCsLower := strings.ToLower(colCs)
+									isUtf8Cs := colCsLower == "utf8" || colCsLower == "utf8mb3" || colCsLower == "utf8mb4"
+									if isUtf8Cs && !utf8.ValidString(sv) {
+										if e.isStrictMode() && isHexLiteral {
+											// In strict mode, x'...' hex literals with invalid UTF-8 are errors.
+											return nil, mysqlError(1300, "HY000", fmt.Sprintf("Incorrect string value: '%s' for column '%s' at row %d", formatBytesForWarning(sv), col.Name, i+1))
+										}
+										e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect string value: '%s' for column '%s' at row %d", formatBytesForWarning(sv), col.Name, i+1))
+									} else if colCsLower == "ascii" && !isValidAsciiString(sv) {
+										e.addWarning("Warning", 1300, fmt.Sprintf("Invalid ascii character string: '%s'", formatAsciiInvalidBytes(sv)))
 									}
 								}
 							}

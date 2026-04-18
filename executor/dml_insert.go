@@ -1620,16 +1620,41 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						strings.Contains(colTypeLower, "char") ||
 						strings.Contains(colTypeLower, "blob"))
 					if isTextOrCharType && !strings.Contains(colTypeLower, "binary") {
-						if sv, ok := rv.(string); ok {
+						var rawBytes []byte
+						var hasRawBytes bool
+						isHexLiteral := false
+						if s, ok := rv.(string); ok {
+							rawBytes, hasRawBytes = []byte(s), true
+						} else if hb, ok := rv.(HexBytes); ok {
+							// HexBytes stores hex digits (e.g. "F4B8AD"), decode to raw bytes.
+							decoded, err := hex.DecodeString(string(hb))
+							if err == nil {
+								rawBytes, hasRawBytes = decoded, true
+								isHexLiteral = true
+							}
+						}
+						if hasRawBytes {
 							colCharset := col.Charset
 							if colCharset == "" && tbl.Def != nil {
 								colCharset = tbl.Def.Charset
 							}
 							colCharset = strings.ToLower(colCharset)
 							isUtf8Charset := colCharset == "utf8" || colCharset == "utf8mb3" || colCharset == "utf8mb4"
-							if isUtf8Charset && !utf8.ValidString(sv) {
-								e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect string value: '%s' for column '%s' at row %d", formatBytesForWarning(sv), col.Name, 1))
+							isAsciiCharset := colCharset == "ascii"
+							rawStr := string(rawBytes)
+							if isUtf8Charset && !utf8.ValidString(rawStr) {
+								if e.isStrictMode() && isHexLiteral && !bool(stmt.Ignore) {
+									// In strict mode, x'...' hex literals with invalid UTF-8 are errors.
+									// String literals may use connection charset encoding; we only enforce
+									// for hex literals where the binary content is explicit.
+									// INSERT IGNORE converts errors to warnings.
+									return nil, mysqlError(1300, "HY000", fmt.Sprintf("Incorrect string value: '%s' for column '%s' at row 1", formatBytesForWarning(rawStr), col.Name))
+								}
+								e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect string value: '%s' for column '%s' at row 1", formatBytesForWarning(rawStr), col.Name))
 								row[col.Name] = ""
+							} else if isAsciiCharset && !isValidAsciiString(rawStr) {
+								// ascii charset: bytes > 0x7F are invalid
+								e.addWarning("Warning", 1300, fmt.Sprintf("Invalid ascii character string: '%s'", formatAsciiInvalidBytes(rawStr)))
 							}
 						}
 					}
@@ -2378,6 +2403,31 @@ func formatBytesForWarning(s string) string {
 	}
 	if result.Len() == 0 {
 		return s
+	}
+	return result.String()
+}
+
+// isValidAsciiString returns true if all bytes in s are valid ASCII (0x00-0x7F).
+func isValidAsciiString(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 0x7F {
+			return false
+		}
+	}
+	return true
+}
+
+// formatAsciiInvalidBytes formats a string with invalid ASCII bytes for Warning 1300.
+// MySQL shows: first non-ASCII byte as \xNN, then remaining bytes as printable chars.
+// Example: x'8142' → '\x81B'
+func formatAsciiInvalidBytes(s string) string {
+	var result strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] > 0x7F {
+			fmt.Fprintf(&result, "\\x%02X", s[i])
+		} else {
+			result.WriteByte(s[i])
+		}
 	}
 	return result.String()
 }

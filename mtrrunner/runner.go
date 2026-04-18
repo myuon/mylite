@@ -169,6 +169,7 @@ func (r *Runner) RunFile(testPath string) TestResult {
 		resultLogEnabled: true,
 		sortResult:       false,
 		tmpDir:           tmpDir,
+		abortOnError:     true,
 		ttsBackups:       map[string]tableSnapshot{},
 		variables: func() map[string]string {
 			port := "3306"
@@ -411,6 +412,7 @@ type execContext struct {
 	pendingSendNext   bool                    // next SQL statement should be sent asynchronously
 	pendingSendEval   bool                    // pending send should use variable substitution
 	pendingEval       bool                    // next SQL statement should have variables expanded in echo
+	abortOnError     bool                    // if false, SQL errors are output as ERROR lines instead of aborting (--disable_abort_on_error)
 }
 
 type tableSnapshot struct {
@@ -1782,7 +1784,6 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"if", "while", "end",
 		"require", "result_format",
 		"disable_reconnect", "enable_reconnect",
-		"disable_abort_on_error", "enable_abort_on_error",
 		"query_get_value",
 		"save_master_pos", "sync_with_master",
 		"change_user",
@@ -1798,6 +1799,12 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		return true, false, nil
 	case "disable_info":
 		ctx.infoEnabled = false
+		return true, false, nil
+	case "enable_abort_on_error":
+		ctx.abortOnError = true
+		return true, false, nil
+	case "disable_abort_on_error":
+		ctx.abortOnError = false
 		return true, false, nil
 	case "disable_testcase":
 		ctx.testcaseDisabled = true
@@ -2646,6 +2653,23 @@ func (ctx *execContext) executeQuery(stmt string) error {
 		if isUnsupportedFeatureError(err) {
 			return errSkipTest
 		}
+		if !ctx.abortOnError {
+			// --disable_abort_on_error: output the error as a line and continue.
+			if ctx.resultLogEnabled {
+				ctx.output.WriteString(formatMySQLError(err) + "\n")
+				errCode := extractMySQLErrorCode(err)
+				if ctx.variables == nil {
+					ctx.variables = make(map[string]string)
+				}
+				ctx.variables["$mysql_errno"] = strconv.Itoa(errCode)
+				if name, ok := mysqlErrorCodeToName[errCode]; ok {
+					ctx.variables["$mysql_errname"] = name
+				} else {
+					ctx.variables["$mysql_errname"] = strconv.Itoa(errCode)
+				}
+			}
+			return nil
+		}
 		return fmt.Errorf("query failed: %s: %v", stmt, err)
 	}
 	defer rows.Close()
@@ -2911,6 +2935,24 @@ func (ctx *execContext) executeExec(stmt string) error {
 		}
 		if isUnsupportedFeatureError(err) {
 			return errSkipTest
+		}
+		if !ctx.abortOnError {
+			// --disable_abort_on_error: output the error as a line and continue.
+			if ctx.resultLogEnabled {
+				ctx.output.WriteString(formatMySQLError(err) + "\n")
+				// Update $mysql_errno/$mysql_errname for scripts that check them.
+				errCode := extractMySQLErrorCode(err)
+				if ctx.variables == nil {
+					ctx.variables = make(map[string]string)
+				}
+				ctx.variables["$mysql_errno"] = strconv.Itoa(errCode)
+				if name, ok := mysqlErrorCodeToName[errCode]; ok {
+					ctx.variables["$mysql_errname"] = name
+				} else {
+					ctx.variables["$mysql_errname"] = strconv.Itoa(errCode)
+				}
+			}
+			return nil
 		}
 		return fmt.Errorf("exec failed: %s: %v", stmt, err)
 	}

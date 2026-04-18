@@ -2119,8 +2119,8 @@ func (e *Executor) evalSubstrExpr(v *sqlparser.SubstrExpr) (interface{}, error) 
 // evalIntroducerExpr handles *sqlparser.IntroducerExpr evaluation.
 func (e *Executor) evalIntroducerExpr(v *sqlparser.IntroducerExpr) (interface{}, error) {
 	// e.g. _latin1 'string' or _latin1 0xFF — charset introducer
-	// For hex literals, convert to byte string (not integer)
-	if lit, ok := v.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.HexNum {
+	// For hex literals (HexNum 0x... or HexVal x'...'), convert to byte string (not integer)
+	if lit, ok := v.Expr.(*sqlparser.Literal); ok && (lit.Type == sqlparser.HexNum || lit.Type == sqlparser.HexVal) {
 		s := lit.Val
 		if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
 			s = s[2:]

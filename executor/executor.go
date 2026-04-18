@@ -515,12 +515,6 @@ func (e *Executor) viewDefinitionForDisplay(viewName string) string {
 
 // addWarning adds a warning to the current statement's warning list.
 func (e *Executor) addWarning(level string, code int, message string) {
-	// De-duplicate identical warnings (same level, code, message) matching MySQL behavior.
-	for _, w := range e.warnings {
-		if w.Level == level && w.Code == code && w.Message == message {
-			return
-		}
-	}
 	// Enforce max_error_count limit: when at capacity, drop the oldest warning.
 	maxErrCount := 64 // MySQL default
 	if v, ok := e.sessionScopeVars["max_error_count"]; ok {
