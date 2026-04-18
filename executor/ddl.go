@@ -1161,17 +1161,27 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 						colTypeForDefault == "multipoint" || colTypeForDefault == "multilinestring" || colTypeForDefault == "multipolygon" ||
 						colTypeForDefault == "geometrycollection" || colTypeForDefault == "geomcollection"
 					if isBlobTextDefault {
-						// Get the raw default value to check if it's empty
-						rawDefault := sqlparser.String(col.Type.Options.Default)
-						// Strip quotes if present
-						if len(rawDefault) >= 2 && rawDefault[0] == '\'' && rawDefault[len(rawDefault)-1] == '\'' {
-							rawDefault = rawDefault[1 : len(rawDefault)-1]
+						// MySQL 8.0 allows expression-based defaults (e.g., DEFAULT (CAST(...) AS JSON))
+						// for JSON/BLOB/TEXT columns. Only literal defaults are disallowed.
+						_, isLiteralDefault := col.Type.Options.Default.(*sqlparser.Literal)
+						if isLiteralDefault {
+							// Get the raw default value to check if it's empty
+							rawDefault := sqlparser.String(col.Type.Options.Default)
+							// Strip quotes if present
+							if len(rawDefault) >= 2 && rawDefault[0] == '\'' && rawDefault[len(rawDefault)-1] == '\'' {
+								rawDefault = rawDefault[1 : len(rawDefault)-1]
+							}
+							if rawDefault != "" {
+								return nil, mysqlError(1101, "42000", fmt.Sprintf("BLOB, TEXT, GEOMETRY or JSON column '%s' can't have a default value", col.Name.String()))
+							}
+							// Empty default '' on blob type: MySQL emits warning but allows it.
+							// Skip default processing for this column (leave colDef.Default as nil).
 						}
-						if rawDefault != "" {
-							return nil, mysqlError(1101, "42000", fmt.Sprintf("BLOB, TEXT, GEOMETRY or JSON column '%s' can't have a default value", col.Name.String()))
+						// Expression default (non-literal): MySQL allows it, store it as-is.
+						if !isLiteralDefault {
+							defStr = sqlparser.String(col.Type.Options.Default)
+							colDef.Default = &defStr
 						}
-						// Empty default '' on blob type: MySQL emits warning but allows it.
-						// Skip default processing for this column (leave colDef.Default as nil).
 					} else {
 						// Strip surrounding quotes from default values (vitess adds them)
 						if len(defStr) >= 2 && defStr[0] == '\'' && defStr[len(defStr)-1] == '\'' {
