@@ -2413,10 +2413,37 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// equality-based (=, OR of =, or IN) on a uniquely-indexed column and there is
 	// no explicit ORDER BY, MySQL returns rows in hash-bucket traversal order.
 	// In practice this is equivalent to ascending sorted order for equality lookups.
+	// For non-unique indexes, MySQL's MEMORY engine uses a LIFO hash chain,
+	// so rows matching a non-unique key are returned in reverse insertion order.
 	if stmt.OrderBy == nil && stmt.Where != nil && len(selectTableDefs) == 1 {
 		td := selectTableDefs[0]
 		if td != nil {
 			engineName := strings.ToUpper(td.Engine)
+			if engineName == "MEMORY" || engineName == "HEAP" {
+				// Check if WHERE references a non-unique index column (LIFO order)
+				isNonUniqueKeyLookup := false
+				for _, idx := range td.Indexes {
+					if idx.Unique {
+						continue
+					}
+					for _, idxCol := range idx.Columns {
+						col := strings.ToLower(stripPrefixLengthFromCol(idxCol))
+						if whereIsHashEqualityOnCol(stmt.Where.Expr, col) {
+							isNonUniqueKeyLookup = true
+							break
+						}
+					}
+					if isNonUniqueKeyLookup {
+						break
+					}
+				}
+				if isNonUniqueKeyLookup {
+					// Reverse allRows to simulate LIFO hash chain behavior
+					for left, right := 0, len(allRows)-1; left < right; left, right = left+1, right-1 {
+						allRows[left], allRows[right] = allRows[right], allRows[left]
+					}
+				}
+			}
 			if engineName == "MEMORY" || engineName == "HEAP" {
 				// Find the first UNIQUE (HASH) index column that the WHERE is equality on.
 				var hashSortCol string
