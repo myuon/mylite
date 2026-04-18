@@ -1627,7 +1627,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		rest = strings.TrimPrefix(rest, "QUERY ")
 		rest = strings.TrimSpace(rest)
 		if id, err2 := strconv.ParseInt(rest, 10, 64); err2 == nil && e.processList != nil {
-			e.processList.Unregister(id)
+			// Kill closes the underlying TCP connection so the server goroutine exits.
+			// This ensures the pool cannot reuse the old connection, and the next --connect
+			// truly opens a new TCP connection with a fresh process list registration.
+			e.processList.Kill(id)
 		}
 		return &Result{}, nil
 	}
@@ -2006,7 +2009,16 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 		// For multi-table DELETE: DELETE t1,t2 FROM t1,t2,t3 WHERE ...
 		// or DELETE [QUICK] FROM t1,t2 USING t1,t2,t3 WHERE ...
+		// Only fall back to string-based parser if vitess produced a non-USING syntax error.
+		// If vitess fails because of an alias before USING (e.g., "DELETE FROM t1 alias USING ..."),
+		// that's genuinely invalid SQL (ER_PARSE_ERROR). Other parse failures (e.g., t1.* syntax)
+		// should still fall back to the string-based handler.
 		if strings.HasPrefix(upper, "DELETE ") {
+			errStr := err.Error()
+			if strings.Contains(errStr, "syntax error at position") && strings.Contains(errStr, "near 'USING'") {
+				// "DELETE FROM <table> <alias> USING ..." is a genuine parse error
+				return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", extractNearFromParseError(trimmed, err)))
+			}
 			return e.execMultiTableDelete(trimmed)
 		}
 		// Handle SHOW GRANTS (vitess parser may fail on some variants)

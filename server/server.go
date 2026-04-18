@@ -373,10 +373,10 @@ func (s *Server) handleConnection(conn net.Conn) {
 	handler := &Handler{srv: s, executor: connExec}
 	connID := connExec.GetConnectionID()
 
-	// Register connection in the process list
+	// Register connection in the process list, including the net.Conn so KILL can close it.
 	pl := connExec.GetProcessList()
 	if pl != nil {
-		pl.RegisterWithID(connID, "root", conn.RemoteAddr().String(), connExec.CurrentDB)
+		pl.RegisterWithConn(connID, "root", conn.RemoteAddr().String(), connExec.CurrentDB, conn)
 	}
 
 	defer func() {

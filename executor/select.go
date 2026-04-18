@@ -1249,6 +1249,7 @@ func (e *Executor) preFilterRows(rows []storage.Row, preds []sqlparser.Expr) ([]
 type equiJoinPair struct {
 	left  sqlparser.Expr // probe key expression (evaluated against accumulated row)
 	right sqlparser.Expr // build key expression (evaluated against new right row)
+	expr  sqlparser.Expr // original comparison expression (left = right) for post-hash verification
 }
 
 // extractEquiJoinPairs splits predicates into:
@@ -1276,7 +1277,7 @@ func extractEquiJoinPairs(preds []sqlparser.Expr, aliases []string, rightIdx int
 		rightOnlyRight := len(rightRefs) == 1 && rightRefs[rightIdx]
 
 		if leftOnlyLeft && rightOnlyRight {
-			equi = append(equi, equiJoinPair{left: cmp.Left, right: cmp.Right})
+			equi = append(equi, equiJoinPair{left: cmp.Left, right: cmp.Right, expr: p})
 			continue
 		}
 
@@ -1292,7 +1293,7 @@ func extractEquiJoinPairs(preds []sqlparser.Expr, aliases []string, rightIdx int
 
 		if rightOnlyLeft && leftOnlyRight {
 			// Swap so that equi.left probes accumulated table and equi.right probes new table
-			equi = append(equi, equiJoinPair{left: cmp.Right, right: cmp.Left})
+			equi = append(equi, equiJoinPair{left: cmp.Right, right: cmp.Left, expr: p})
 			continue
 		}
 
@@ -1301,10 +1302,24 @@ func extractEquiJoinPairs(preds []sqlparser.Expr, aliases []string, rightIdx int
 	return equi, remaining
 }
 
+// hashNormalizeValue normalizes a value for use as a hash join key.
+// Strings are uppercased so that case-insensitive collation comparisons
+// (e.g. ascii_general_ci, utf8mb4_general_ci) bucket 'a' and 'A' together.
+// Actual equality is verified post-lookup using the original predicate to
+// handle any false positives (e.g. for binary collations).
+func hashNormalizeValue(v interface{}) interface{} {
+	if s, ok := v.(string); ok {
+		return strings.ToUpper(s)
+	}
+	return v
+}
+
 // hashJoinRows performs an equi-join between accumulated leftRows and new rightRows using
 // a hash map built from rightRows. buildExprs are evaluated against rightRows to form keys;
 // probeExprs are evaluated against leftRows to form probe keys (must match 1:1 with buildExprs).
 // Additional filtering from filterExpr (if non-nil) is applied after the hash lookup.
+// String hash keys are normalized (uppercased) to handle case-insensitive collations correctly;
+// actual equality is verified using the original equiPair expressions.
 func (e *Executor) hashJoinRows(leftRows, rightRows []storage.Row, equiPairs []equiJoinPair, filterExpr sqlparser.Expr) ([]storage.Row, error) {
 	if len(rightRows) == 0 || len(leftRows) == 0 {
 		return nil, nil
@@ -1312,6 +1327,7 @@ func (e *Executor) hashJoinRows(leftRows, rightRows []storage.Row, equiPairs []e
 
 	// Build phase: create hash map keyed by tuple of build-key values.
 	// Rows with any NULL key part are skipped (NULL != NULL in SQL).
+	// String values are uppercased so that case-insensitive collations group 'a' and 'A'.
 	type hashKey = string
 	hashMap := make(map[hashKey][]storage.Row, len(rightRows))
 	for _, rightRow := range rightRows {
@@ -1326,7 +1342,7 @@ func (e *Executor) hashJoinRows(leftRows, rightRows []storage.Row, equiPairs []e
 				hasNull = true
 				break
 			}
-			keyParts = append(keyParts, v)
+			keyParts = append(keyParts, hashNormalizeValue(v))
 		}
 		if hasNull {
 			continue // NULL keys can never match (NULL != NULL in SQL)
@@ -1349,7 +1365,7 @@ func (e *Executor) hashJoinRows(leftRows, rightRows []storage.Row, equiPairs []e
 				hasNull = true
 				break
 			}
-			keyParts = append(keyParts, v)
+			keyParts = append(keyParts, hashNormalizeValue(v))
 		}
 		if hasNull {
 			continue // NULL keys can never match
@@ -1366,6 +1382,25 @@ func (e *Executor) hashJoinRows(leftRows, rightRows []storage.Row, equiPairs []e
 			}
 			for k, v := range rightRow {
 				combined[k] = v
+			}
+			// Verify actual MySQL equality using the original equi-pair expressions.
+			// This catches false positives from the case-insensitive hash normalization
+			// (e.g. for binary collations where 'a' != 'A').
+			actualMatch := true
+			for _, ep := range equiPairs {
+				if ep.expr != nil {
+					match, err := e.evalWhere(ep.expr, combined)
+					if err != nil {
+						return nil, err
+					}
+					if !match {
+						actualMatch = false
+						break
+					}
+				}
+			}
+			if !actualMatch {
+				continue
 			}
 			if filterExpr != nil {
 				match, err := e.evalWhere(filterExpr, combined)

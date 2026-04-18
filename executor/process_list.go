@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"net"
 	"sync"
 	"time"
 )
@@ -15,6 +16,7 @@ type ProcessEntry struct {
 	StartTime time.Time
 	State     string // e.g. "User lock", "executing", ""
 	Info      string // current query text, or ""
+	conn      net.Conn // underlying TCP connection for KILL support; may be nil
 }
 
 // ProcessList is a shared registry of all active connections and their states.
@@ -45,11 +47,38 @@ func (pl *ProcessList) RegisterWithID(id int64, user, host, db string) {
 	pl.mu.Unlock()
 }
 
+// RegisterWithConn adds a connection with its underlying net.Conn so KILL can close it.
+func (pl *ProcessList) RegisterWithConn(id int64, user, host, db string, conn net.Conn) {
+	pl.mu.Lock()
+	pl.entries[id] = &ProcessEntry{
+		ID:        id,
+		User:      user,
+		Host:      host,
+		DB:        db,
+		Command:   "Sleep",
+		StartTime: time.Now(),
+		conn:      conn,
+	}
+	pl.mu.Unlock()
+}
+
 // Unregister removes a connection from the process list.
 func (pl *ProcessList) Unregister(id int64) {
 	pl.mu.Lock()
 	delete(pl.entries, id)
 	pl.mu.Unlock()
+}
+
+// Kill removes the connection from the process list AND closes the underlying TCP connection.
+// This causes the server goroutine to exit, so the next connection from the pool is truly new.
+func (pl *ProcessList) Kill(id int64) {
+	pl.mu.Lock()
+	entry := pl.entries[id]
+	delete(pl.entries, id)
+	pl.mu.Unlock()
+	if entry != nil && entry.conn != nil {
+		entry.conn.Close() //nolint:errcheck
+	}
 }
 
 // SetQuery sets the current query and state for a connection.

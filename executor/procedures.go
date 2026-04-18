@@ -1598,6 +1598,13 @@ func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Exp
 		return nil, fmt.Errorf("function not found: %s", name)
 	}
 
+	// Validate argument count: MySQL error 1318 if actual != expected.
+	if len(argExprs) != len(fn.Params) {
+		return nil, mysqlError(1318, "42000",
+			fmt.Sprintf("Incorrect number of arguments for FUNCTION %s.%s; expected %d, got %d",
+				dbName, name, len(fn.Params), len(argExprs)))
+	}
+
 	// Evaluate arguments BEFORE incrementing routineDepth so that argument
 	// expressions are evaluated in the caller's context (e.g. using the
 	// sysVarSnapshot when the outer query has one active).  This matches

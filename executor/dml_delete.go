@@ -268,6 +268,16 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 							fmt.Sprintf("Unknown column '%s.%s' in 'order clause'", e2.Qualifier.Name.String(), e2.Name.String()))
 					}
 				}
+			default:
+				// For function calls or other expressions in ORDER BY, evaluate them to catch errors.
+				// MySQL evaluates ORDER BY expressions and errors on invalid ones (e.g., f1(10) when f1 takes 0 args).
+				dummyRow := storage.Row{}
+				if len(tbl.Rows) > 0 {
+					dummyRow = tbl.Rows[0]
+				}
+				if _, evalErr := e.evalRowExpr(expr, dummyRow); evalErr != nil {
+					return nil, evalErr
+				}
 			case *sqlparser.Subquery:
 				// Subquery in ORDER BY: validate inner SELECT's columns for the no-FROM case.
 				// MySQL: "DELETE FROM t1 ORDER BY (SELECT x)" where x doesn't exist is an error.
@@ -731,11 +741,101 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 		}
 	}
 
-	// Collect table aliases for per-table predicate classification
+	// Collect table aliases for per-table predicate classification.
+	// Also build a flat list of all table info for target validation.
+	type tableExprInfo struct {
+		name         string
+		explicitAlias string // empty if no explicit alias
+		db           string
+		effectiveAlias string // alias if aliased, else name
+	}
+	// collectAllTableInfos recursively extracts all leaf AliasedTableExprs from a TableExpr.
+	var collectAllTableInfos func(te sqlparser.TableExpr) []tableExprInfo
+	collectAllTableInfos = func(te sqlparser.TableExpr) []tableExprInfo {
+		switch t := te.(type) {
+		case *sqlparser.AliasedTableExpr:
+			dbName := e.CurrentDB
+			tblName := ""
+			if tn, ok2 := t.Expr.(sqlparser.TableName); ok2 {
+				tblName = tn.Name.String()
+				if !tn.Qualifier.IsEmpty() {
+					dbName = tn.Qualifier.String()
+				}
+			}
+			explAlias := ""
+			if !t.As.IsEmpty() {
+				explAlias = t.As.String()
+			}
+			effAlias := tblName
+			if explAlias != "" {
+				effAlias = explAlias
+			}
+			return []tableExprInfo{{name: tblName, explicitAlias: explAlias, db: dbName, effectiveAlias: effAlias}}
+		case *sqlparser.JoinTableExpr:
+			left := collectAllTableInfos(t.LeftExpr)
+			right := collectAllTableInfos(t.RightExpr)
+			return append(left, right...)
+		case *sqlparser.ParenTableExpr:
+			var result []tableExprInfo
+			for _, inner := range t.Exprs {
+				result = append(result, collectAllTableInfos(inner)...)
+			}
+			return result
+		}
+		return nil
+	}
+
 	var tableAliases []string
+	var allTableExprInfos []tableExprInfo
 	for _, te := range stmt.TableExprs {
 		alias, _, _ := extractTableAlias(te)
 		tableAliases = append(tableAliases, alias)
+		allTableExprInfos = append(allTableExprInfos, collectAllTableInfos(te)...)
+	}
+
+	// Validate target tables: each target must match a table expr by alias (if aliased) or by name (if not aliased).
+	// MySQL error 1109 (ER_UNKNOWN_TABLE): "Unknown table 'T' in MULTI DELETE".
+	if len(stmt.Targets) > 0 {
+		for _, target := range stmt.Targets {
+			targetName := target.Name.String()
+			targetDB := e.CurrentDB
+			if !target.Qualifier.IsEmpty() {
+				targetDB = target.Qualifier.String()
+			}
+			found := false
+			for _, info := range allTableExprInfos {
+				if !target.Qualifier.IsEmpty() {
+					// Qualified target (e.g. db2.alias): match by TABLE NAME only (not alias),
+					// because the qualifier implies a real table reference.
+					if strings.EqualFold(info.name, targetName) && strings.EqualFold(info.db, targetDB) {
+						// When the table has an explicit alias, the target must use the alias (not the table name),
+						// unless the table is NOT aliased.
+						if info.explicitAlias == "" {
+							found = true
+							break
+						}
+						// Has explicit alias: qualified target by table name is invalid (must use alias)
+						// e.g., "DELETE FROM db2.t1 USING db2.t1 AS alias ..." - must target as "alias"
+					}
+				} else if info.explicitAlias != "" {
+					// Target has no qualifier, and table has explicit alias: match by alias only
+					if strings.EqualFold(info.explicitAlias, targetName) {
+						found = true
+						break
+					}
+				} else {
+					// No qualifier, no explicit alias: match by table name
+					if strings.EqualFold(info.name, targetName) {
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				return nil, mysqlError(1109, "42S02",
+					fmt.Sprintf("Unknown table '%s' in MULTI DELETE", targetName))
+			}
+		}
 	}
 
 	// Classify WHERE predicates into per-table-only predicates
