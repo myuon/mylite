@@ -59,6 +59,19 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		query = rewriteAggregateAll(query)
 	}
 
+	// Vitess parser doesn't handle inline column-level CHECK constraints without a preceding comma.
+	// e.g. "col INT CHECK (expr)" fails to parse. Add a comma to turn it into a table-level constraint.
+	// MySQL allows inline CHECK on columns; the constraint behavior is equivalent.
+	{
+		upperQ := strings.ToUpper(query)
+		if (strings.HasPrefix(upperQ, "CREATE") || strings.HasPrefix(upperQ, "ALTER")) &&
+			strings.Contains(upperQ, "TABLE") && strings.Contains(upperQ, "CHECK") {
+			if rewritten := rewriteInlineCheckConstraints(query); rewritten != query {
+				query = rewritten
+			}
+		}
+	}
+
 	// Vitess parser cannot handle AS aliases that start with a digit (e.g. AS 1Eq).
 	// MySQL allows these; quote them: AS 1Eq -> AS `1Eq`.
 	if rewritten := rewriteNumericAliases(query); rewritten != query {
@@ -1974,4 +1987,39 @@ foundClose:
 	}
 	// Rewrite: SELECT * FROM (inner) AS _paren_subq <after>
 	return "SELECT * FROM (" + innerSQL + ") AS _paren_subq " + after
+}
+
+// rewriteInlineCheckConstraints rewrites inline column-level CHECK constraints to table-level
+// CHECK constraints (with a preceding comma). This works around a vitess parser limitation
+// where "col_type CHECK (expr)" without a leading comma fails to parse.
+// Example: "f1 INT CHECK (f1 < 10)" -> "f1 INT, CHECK (f1 < 10)"
+// It must NOT add a comma in "CONSTRAINT [name] CHECK (...)" patterns.
+//
+// Strategy: two-pass.
+//  1. Replace "CONSTRAINT [name] CHECK" with a placeholder so the regex below skips it.
+//  2. Add comma before remaining inline CHECK patterns.
+//  3. Restore the placeholder.
+//
+// Two forms of CONSTRAINT:
+//   - Named:   CONSTRAINT name CHECK (...)  where name is backtick-quoted or a plain identifier
+//   - Unnamed: CONSTRAINT CHECK (...)       where CHECK immediately follows CONSTRAINT
+// Matches named CONSTRAINT (backtick-quoted or plain identifier as name).
+var reConstraintNamedCheck = regexp.MustCompile("(?i)(CONSTRAINT\\s+(?:`[^`]*`|\\S+)\\s+)(CHECK\\s*\\()")
+
+// Matches unnamed CONSTRAINT CHECK (...).
+var reConstraintUnnamedCheck = regexp.MustCompile(`(?i)(CONSTRAINT\s+)(CHECK\s*\()`)
+var reInlineCheck = regexp.MustCompile(`(?i)([^\s,])(\s+CHECK\s*\()`)
+
+const inlineCheckPlaceholder = "\x00CHECKPLACEHOLDER\x00("
+
+func rewriteInlineCheckConstraints(query string) string {
+	// Step 1: protect named CONSTRAINT name CHECK patterns
+	protected := reConstraintNamedCheck.ReplaceAllString(query, "${1}"+inlineCheckPlaceholder)
+	// Step 1b: protect unnamed CONSTRAINT CHECK patterns
+	protected = reConstraintUnnamedCheck.ReplaceAllString(protected, "${1}"+inlineCheckPlaceholder)
+	// Step 2: add comma before remaining bare inline CHECKs
+	rewritten := reInlineCheck.ReplaceAllString(protected, "$1, CHECK (")
+	// Step 3: restore protected patterns
+	rewritten = strings.ReplaceAll(rewritten, inlineCheckPlaceholder, "CHECK (")
+	return rewritten
 }

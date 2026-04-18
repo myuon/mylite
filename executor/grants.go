@@ -830,14 +830,21 @@ func ParseRevokeStatement(query string) (privs, object, fromUser, fromHost strin
 	q := strings.TrimRight(strings.TrimSpace(query), ";")
 	upper := strings.ToUpper(q)
 
-	// REVOKE ALL PRIVILEGES, GRANT OPTION FROM user
+	// REVOKE ALL PRIVILEGES, GRANT OPTION FROM user (no ON clause — revoke everything globally)
+	// Distinguish from "REVOKE ALL PRIVILEGES ON db.tbl FROM user" which has an ON clause.
 	if strings.HasPrefix(upper, "REVOKE ALL PRIVILEGES") && strings.Contains(upper, " FROM ") {
+		// Check if there is an ON clause between "REVOKE ALL PRIVILEGES" and "FROM"
 		fromIdx := strings.LastIndex(upper, " FROM ")
-		fromPart := strings.TrimSpace(q[fromIdx+6:])
-		fromUser, fromHost = parseUserHost(fromPart)
-		privs = "ALL PRIVILEGES"
-		object = "*.*"
-		return
+		revokePart := strings.TrimSpace(upper[len("REVOKE "):fromIdx])
+		if !strings.Contains(revokePart, " ON ") {
+			// No ON clause → this is the global REVOKE ALL PRIVILEGES, GRANT OPTION FROM user form
+			fromPart := strings.TrimSpace(q[fromIdx+6:])
+			fromUser, fromHost = parseUserHost(fromPart)
+			privs = "ALL PRIVILEGES"
+			object = "*.*"
+			return
+		}
+		// Has ON clause → fall through to the general parsing below
 	}
 
 	fromIdx := strings.Index(upper, " FROM ")

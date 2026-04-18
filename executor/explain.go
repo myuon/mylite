@@ -7266,6 +7266,11 @@ func (e *Executor) explainResultForType(explainType sqlparser.ExplainType, expla
 // execExplainStmt handles EXPLAIN SELECT ... statements.
 // Returns a simplified explain result set for compatibility.
 func (e *Executor) execExplainStmt(s *sqlparser.ExplainStmt, query string) (*Result, error) {
+	// Check privileges for the explained statement before producing any output.
+	// MySQL requires the same privileges for EXPLAIN <stmt> as for <stmt> itself.
+	if privErr := e.checkTablePrivilege(s.Statement); privErr != nil {
+		return nil, privErr
+	}
 	// Validate index hints (USE KEY / IGNORE KEY / FORCE KEY) before producing explain output.
 	if sel, ok := s.Statement.(*sqlparser.Select); ok {
 		if err := e.validateIndexHints(sel.From); err != nil {

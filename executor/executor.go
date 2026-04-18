@@ -322,6 +322,9 @@ type Executor struct {
 	viewCheckOptions map[string]string
 	// viewCreateStatements stores the full CREATE VIEW SQL for SHOW CREATE VIEW (view name -> full SQL).
 	viewCreateStatements map[string]string
+	// viewStore is a shared view store across all connections. Views created on any connection
+	// are accessible by all other connections (like MySQL's shared information_schema).
+	viewStore *ViewStore
 	// queryTableDef holds the table definition for the current query context,
 	// used for column-level checks (e.g., IS NULL on NOT NULL columns).
 	queryTableDef *catalog.TableDef
@@ -972,6 +975,7 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	e.knownUsers = make(map[string]bool)
 	e.knownUsersMu = &sync.RWMutex{}
 	e.grantStore = NewGrantStore()
+	e.viewStore = NewViewStore()
 	e.initSystemTables()
 	return e
 }
@@ -1054,6 +1058,7 @@ func (e *Executor) Clone() *Executor {
 		knownUsers:              e.knownUsers,
 		knownUsersMu:            e.knownUsersMu,
 		grantStore:              e.grantStore,
+		viewStore:               e.viewStore,
 	}
 }
 
@@ -2006,8 +2011,12 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		if strings.HasPrefix(upper, "REVOKE ") && e.grantStore != nil {
 			privs, object, fromUser, fromHost, isRoleRevoke := ParseRevokeStatement(trimmed)
 			if !isRoleRevoke && privs != "" && object != "" && fromUser != "" {
-				if strings.ToUpper(privs) == "ALL PRIVILEGES" {
+				if strings.ToUpper(privs) == "ALL PRIVILEGES" && object == "*.*" {
+					// REVOKE ALL PRIVILEGES, GRANT OPTION FROM user — revoke everything
 					e.grantStore.RevokeAllPrivGrants(fromUser, fromHost)
+				} else if strings.ToUpper(privs) == "ALL PRIVILEGES" {
+					// REVOKE ALL PRIVILEGES ON db.tbl FROM user — revoke all privs on that object only
+					e.grantStore.RevokePrivGrant(fromUser, fromHost, "ALL PRIVILEGES", object)
 				} else {
 					e.grantStore.RevokePrivGrant(fromUser, fromHost, privs, object)
 				}
@@ -2576,6 +2585,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 	case *sqlparser.CreateView:
 		// Store view definition
 		viewName := s.ViewName.Name.String()
+		viewDB := e.CurrentDB
+		if !s.ViewName.Qualifier.IsEmpty() {
+			viewDB = s.ViewName.Qualifier.String()
+		}
 		// Use sqlparser.String(s.Select) to preserve the full SELECT including FROM clause.
 		// For literal-only SELECT (no FROM), sqlparser adds "from dual" which is handled fine by the executor.
 		selectSQL := sqlparser.String(s.Select)
@@ -2597,16 +2610,27 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			e.viewCreateStatements = make(map[string]string)
 		}
 		e.viewCreateStatements[viewName] = e.buildCreateViewSQLFromQuery(s, query)
+		// Also write to the shared view store so other connections can see this view.
+		if e.viewStore != nil {
+			e.viewStore.Set(viewDB, viewName, selectSQL, buildViewSelectSQL(s, query), s.CheckOption, e.viewCreateStatements[viewName])
+		}
 		return &Result{}, nil
 	case *sqlparser.DropView:
 		// Remove view definitions
 		for _, name := range s.FromTables {
 			viewName := name.Name.String()
+			viewDB := e.CurrentDB
+			if !name.Qualifier.IsEmpty() {
+				viewDB = name.Qualifier.String()
+			}
 			if e.views != nil {
 				delete(e.views, viewName)
 			}
 			if e.viewCreateStatements != nil {
 				delete(e.viewCreateStatements, viewName)
+			}
+			if e.viewStore != nil {
+				e.viewStore.Delete(viewDB, viewName)
 			}
 		}
 		return &Result{}, nil
@@ -2678,6 +2702,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		return e.execOtherAdmin(query)
 	case *sqlparser.AlterView:
 		viewName := s.ViewName.Name.String()
+		viewDB := e.CurrentDB
+		if !s.ViewName.Qualifier.IsEmpty() {
+			viewDB = s.ViewName.Qualifier.String()
+		}
 		selectSQL := sqlparser.String(s.Select)
 		if e.views == nil {
 			e.views = make(map[string]string)
@@ -2701,6 +2729,11 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			CheckOption: s.CheckOption,
 		}
 		e.viewCreateStatements[viewName] = e.buildCreateViewSQLFromQuery(cv, query)
+		// Also write to the shared view store so other connections can see this view.
+		if e.viewStore != nil {
+			displaySQL := buildViewSelectSQL(cv, query)
+			e.viewStore.Set(viewDB, viewName, selectSQL, displaySQL, s.CheckOption, e.viewCreateStatements[viewName])
+		}
 		return &Result{}, nil
 	case *sqlparser.CommentOnly:
 		return &Result{}, nil
@@ -4724,16 +4757,22 @@ func resolveTableNameDB(name, currentDB string) (string, string) {
 
 // lookupView looks up a view by name (case-insensitive) and returns the
 // view SQL and the canonical name. Returns ("", "", false) if not found.
+// It checks the local per-executor map first, then the shared viewStore.
 func (e *Executor) lookupView(name string) (viewSQL string, canonicalName string, ok bool) {
-	if e.views == nil {
-		return "", "", false
+	if e.views != nil {
+		if sql, found := e.views[name]; found {
+			return sql, name, true
+		}
+		for vn, sql := range e.views {
+			if strings.EqualFold(vn, name) {
+				return sql, vn, true
+			}
+		}
 	}
-	if sql, found := e.views[name]; found {
-		return sql, name, true
-	}
-	for vn, sql := range e.views {
-		if strings.EqualFold(vn, name) {
-			return sql, vn, true
+	// Fall back to shared view store (for views created on other connections).
+	if e.viewStore != nil {
+		if sql, found := e.viewStore.Lookup(e.CurrentDB, name); found {
+			return sql, name, true
 		}
 	}
 	return "", "", false
@@ -6107,16 +6146,132 @@ func (e *Executor) checkTablePrivilege(stmt sqlparser.Statement) error {
 		if tn, ok := s.Table.Expr.(sqlparser.TableName); ok && !tn.Qualifier.IsEmpty() {
 			dbName = tn.Qualifier.String()
 		}
+		if s.Action == sqlparser.ReplaceAct {
+			// REPLACE requires both INSERT and DELETE privileges.
+			// MySQL error message lists all missing privileges separated by ", ".
+			hasInsert := e.grantStore.HasPrivilege(user, host, "INSERT", dbName, tblName, activeRoles)
+			hasDelete := e.grantStore.HasPrivilege(user, host, "DELETE", dbName, tblName, activeRoles)
+			if !hasInsert && !hasDelete {
+				return mysqlError(1142, "42000", fmt.Sprintf("INSERT, DELETE command denied to user '%s'@'%s' for table '%s'",
+					user, host, tblName))
+			} else if !hasInsert {
+				return mysqlError(1142, "42000", fmt.Sprintf("INSERT command denied to user '%s'@'%s' for table '%s'",
+					user, host, tblName))
+			} else if !hasDelete {
+				return mysqlError(1142, "42000", fmt.Sprintf("DELETE command denied to user '%s'@'%s' for table '%s'",
+					user, host, tblName))
+			}
+			return nil
+		}
 		return checkAccess("INSERT", dbName, tblName)
 	case *sqlparser.Update:
+		// For multi-table UPDATE, only tables that appear in SET clause need UPDATE privilege.
+		// Tables only referenced in WHERE clause need SELECT privilege.
+		// For single-table UPDATE, the one table needs UPDATE privilege.
+		updatedTables := make(map[string]bool)
+		for _, upd := range s.Exprs {
+			if upd.Name != nil && !upd.Name.Qualifier.IsEmpty() {
+				updatedTables[strings.ToLower(upd.Name.Qualifier.Name.String())] = true
+			}
+		}
+		isMultiTable := len(s.TableExprs) > 1 || func() bool {
+			if len(s.TableExprs) == 1 {
+				_, isJoin := s.TableExprs[0].(*sqlparser.JoinTableExpr)
+				return isJoin
+			}
+			return false
+		}()
+		// checkUpdateTableExpr recursively checks privileges for table expressions in a multi-table UPDATE.
+		// Tables in the SET clause need UPDATE; tables only in WHERE need SELECT.
+		var checkUpdateTableExpr func(te sqlparser.TableExpr) error
+		checkUpdateTableExpr = func(te sqlparser.TableExpr) error {
+			switch t := te.(type) {
+			case *sqlparser.AliasedTableExpr:
+				if tn, ok := t.Expr.(sqlparser.TableName); ok {
+					tblName := strings.ToLower(tn.Name.String())
+					aliasName := tblName
+					if !t.As.IsEmpty() {
+						aliasName = strings.ToLower(t.As.String())
+					}
+					var tblPriv string
+					if !isMultiTable || updatedTables[tblName] || updatedTables[aliasName] || len(updatedTables) == 0 {
+						tblPriv = "UPDATE"
+					} else {
+						tblPriv = "SELECT"
+					}
+					dbName := e.CurrentDB
+					if !tn.Qualifier.IsEmpty() {
+						dbName = tn.Qualifier.String()
+					}
+					return checkAccess(tblPriv, dbName, tn.Name.String())
+				}
+			case *sqlparser.JoinTableExpr:
+				if err := checkUpdateTableExpr(t.LeftExpr); err != nil {
+					return err
+				}
+				return checkUpdateTableExpr(t.RightExpr)
+			case *sqlparser.ParenTableExpr:
+				for _, inner := range t.Exprs {
+					if err := checkUpdateTableExpr(inner); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		}
 		for _, tblExpr := range s.TableExprs {
-			if err := checkTableExprPriv(tblExpr, "UPDATE", e.CurrentDB, checkAccess); err != nil {
+			if err := checkUpdateTableExpr(tblExpr); err != nil {
 				return err
 			}
 		}
 	case *sqlparser.Delete:
+		// For multi-table DELETE (DELETE t1 FROM t1, t2 WHERE ...), tables in Targets need DELETE
+		// and tables only in TableExprs (join sources) need SELECT.
+		// For single-table DELETE, the one table needs DELETE.
+		deletedTables := make(map[string]bool)
+		for _, tgt := range s.Targets {
+			deletedTables[strings.ToLower(tgt.Name.String())] = true
+		}
+		isMultiDelete := len(s.Targets) > 0
+		// Helper to check DELETE privileges recursively, applying DELETE or SELECT per table
+		var checkDeleteTableExpr func(te sqlparser.TableExpr) error
+		checkDeleteTableExpr = func(te sqlparser.TableExpr) error {
+			switch t := te.(type) {
+			case *sqlparser.AliasedTableExpr:
+				if tn, ok := t.Expr.(sqlparser.TableName); ok {
+					tblName := strings.ToLower(tn.Name.String())
+					aliasName := tblName
+					if !t.As.IsEmpty() {
+						aliasName = strings.ToLower(t.As.String())
+					}
+					var tblPriv string
+					if !isMultiDelete || deletedTables[tblName] || deletedTables[aliasName] || len(deletedTables) == 0 {
+						tblPriv = "DELETE"
+					} else {
+						tblPriv = "SELECT"
+					}
+					dbName := e.CurrentDB
+					if !tn.Qualifier.IsEmpty() {
+						dbName = tn.Qualifier.String()
+					}
+					return checkAccess(tblPriv, dbName, tn.Name.String())
+				}
+			case *sqlparser.JoinTableExpr:
+				if err := checkDeleteTableExpr(t.LeftExpr); err != nil {
+					return err
+				}
+				return checkDeleteTableExpr(t.RightExpr)
+			case *sqlparser.ParenTableExpr:
+				for _, inner := range t.Exprs {
+					if err := checkDeleteTableExpr(inner); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		}
 		for _, tblExpr := range s.TableExprs {
-			if err := checkTableExprPriv(tblExpr, "DELETE", e.CurrentDB, checkAccess); err != nil {
+			if err := checkDeleteTableExpr(tblExpr); err != nil {
 				return err
 			}
 		}

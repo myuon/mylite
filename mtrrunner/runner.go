@@ -1372,6 +1372,9 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		// variable capping (e.g. parser_max_mem_size) works correctly.
 		if userName != "" && !strings.EqualFold(userName, "root") {
 			conn.ExecContext(context.Background(), fmt.Sprintf("SET @__current_user = '%s'", userName)) //nolint:errcheck
+		} else {
+			// Clear any previous user context so root connections are not treated as non-root.
+			conn.ExecContext(context.Background(), "SET @__current_user = ''") //nolint:errcheck
 		}
 		ctx.connByName[key] = conn
 		ctx.currentConn = key
@@ -1382,6 +1385,10 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		target = strings.Trim(target, "()")
 		target = strings.TrimSpace(target)
 		if target == "" || strings.EqualFold(target, "default") {
+			// Clear any non-root user context on the default connection when switching back to it.
+			if defaultConn := ctx.connByName[""]; defaultConn != nil {
+				defaultConn.ExecContext(context.Background(), "SET @__current_user = ''") //nolint:errcheck
+			}
 			ctx.currentConn = ""
 			return true, false, nil
 		}

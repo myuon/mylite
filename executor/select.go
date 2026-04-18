@@ -223,34 +223,55 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 		}
 		tbl, err := e.Storage.GetTable(lookupDB, lookupTable)
 		if err != nil {
-			// Check if it's a view
-			if e.views != nil {
-				if viewSQL, ok := e.views[lookupTable]; ok {
-					// Save and restore currentQuery so that view execution doesn't
-					// overwrite the outer query's text (used for column name extraction).
-					savedCurrentQuery := e.currentQuery
-					viewResult, err := e.Execute(viewSQL)
-					e.currentQuery = savedCurrentQuery
-					if err != nil {
-						return nil, err
-					}
-					// Convert view result to storage.Rows
-					rows := make([]storage.Row, 0, len(viewResult.Rows))
-					// Store column order as a special metadata key for SELECT * resolution
-					colOrderStr := strings.Join(viewResult.Columns, "\x00")
-					for _, vrow := range viewResult.Rows {
-						row := make(storage.Row)
-						row["__column_order__"] = colOrderStr
-						for ci, col := range viewResult.Columns {
-							if ci < len(vrow) {
-								row[col] = vrow[ci]
-								row[alias+"."+col] = vrow[ci]
-							}
-						}
-						rows = append(rows, row)
-					}
-					return rows, nil
+			// Check if it's a view (local per-executor map, then shared viewStore).
+			// Also try lookupDB explicitly in case the table is qualified to a different db.
+			viewSQL, _, isView := e.lookupView(lookupTable)
+			crossDB := false
+			if !isView && lookupDB != e.CurrentDB && e.viewStore != nil {
+				if sql, found := e.viewStore.Lookup(lookupDB, lookupTable); found {
+					viewSQL, isView = sql, true
+					crossDB = true
 				}
+			}
+			if isView {
+				// Save and restore currentQuery so that view execution doesn't
+				// overwrite the outer query's text (used for column name extraction).
+				savedCurrentQuery := e.currentQuery
+				// SQL SECURITY DEFINER: view executes with definer's privileges, not invoker's.
+				// To implement this, temporarily clear __current_user so underlying table
+				// access uses root/definer privileges (no privilege checks).
+				savedCurrentUser := e.userVars["__current_user"]
+				e.userVars["__current_user"] = ""
+				// For cross-database views, temporarily set CurrentDB to the view's database.
+				savedCurrentDB := e.CurrentDB
+				if crossDB {
+					e.CurrentDB = lookupDB
+				}
+				viewResult, err := e.Execute(viewSQL)
+				if crossDB {
+					e.CurrentDB = savedCurrentDB
+				}
+				e.userVars["__current_user"] = savedCurrentUser
+				e.currentQuery = savedCurrentQuery
+				if err != nil {
+					return nil, err
+				}
+				// Convert view result to storage.Rows
+				rows := make([]storage.Row, 0, len(viewResult.Rows))
+				// Store column order as a special metadata key for SELECT * resolution
+				colOrderStr := strings.Join(viewResult.Columns, "\x00")
+				for _, vrow := range viewResult.Rows {
+					row := make(storage.Row)
+					row["__column_order__"] = colOrderStr
+					for ci, col := range viewResult.Columns {
+						if ci < len(vrow) {
+							row[col] = vrow[ci]
+							row[alias+"."+col] = vrow[ci]
+						}
+					}
+					rows = append(rows, row)
+				}
+				return rows, nil
 			}
 			// Distinguish "unknown database" from "table not found":
 			// MySQL returns ER_BAD_DB_ERROR (1049, 42000) when the database itself doesn't exist.

@@ -2500,6 +2500,12 @@ func (e *Executor) showCreateView(viewName string) (*Result, error) {
 			}
 		}
 	}
+	// Try shared viewStore (views created on other connections)
+	if createSQL == "" && e.viewStore != nil {
+		if sql, ok := e.viewStore.LookupCreateSQL(e.CurrentDB, viewName); ok {
+			createSQL = sql
+		}
+	}
 	if createSQL == "" {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s' doesn't exist", viewName))
 	}

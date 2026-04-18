@@ -754,6 +754,24 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	}
 
 	if stmt.TableSpec == nil {
+		// Workaround: vitess parser returns TableSpec=nil for CREATE TEMPORARY TABLE with CHECK constraints.
+		// Re-parse as CREATE TABLE (non-temporary) to get the TableSpec, then re-execute as temporary.
+		if stmt.Temp && stmt.OptLike == nil && stmt.Select == nil {
+			// Try stripping TEMPORARY from the SQL and re-parsing
+			rewritten := e.currentQuery
+			if idx := strings.Index(strings.ToUpper(rewritten), "TEMPORARY "); idx >= 0 {
+				// Remove "TEMPORARY " from the query
+				rewritten = rewritten[:idx] + rewritten[idx+10:]
+				if newStmt, err2 := e.parser().Parse(rewritten); err2 == nil {
+					if ct2, ok := newStmt.(*sqlparser.CreateTable); ok && ct2.TableSpec != nil {
+						ct2.Temp = true
+						ct2.IfNotExists = stmt.IfNotExists
+						// Re-execute with the recovered statement
+						return e.execCreateTable(ct2)
+					}
+				}
+			}
+		}
 		// CREATE TABLE ... LIKE
 		if stmt.OptLike != nil {
 			srcName := stmt.OptLike.LikeTable.Name.String()
@@ -1194,6 +1212,14 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 						}
 						// Normalize now() / current_timestamp() to CURRENT_TIMESTAMP
 						defStr = normalizeCurrentTimestampDefault(defStr)
+						// CURRENT_TIMESTAMP is only valid as DEFAULT for DATETIME and TIMESTAMP columns.
+						// For all other types (BIT, INT, TINYINT, etc.), it's invalid.
+						if strings.Contains(strings.ToUpper(defStr), "CURRENT_TIMESTAMP") || strings.EqualFold(defStr, "NOW()") {
+							colTypeUpper := strings.ToUpper(strings.TrimSpace(col.Type.Type))
+							if colTypeUpper != "TIMESTAMP" && colTypeUpper != "DATETIME" {
+								return nil, mysqlError(1067, "42000", fmt.Sprintf("Invalid default value for '%s'", colDef.Name))
+							}
+						}
 						colDef.Default = &defStr
 					}
 				}
