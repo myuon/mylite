@@ -1586,11 +1586,16 @@ func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Exp
 	e.functionOrTriggerDepth++
 	// Save and restore currentQuery so that UDF execution doesn't overwrite
 	// the outer query's text (used for column name extraction).
+	// Also save and restore CurrentDB: MySQL functions execute in the context
+	// of the database where they were created (not the caller's current database).
 	savedQuery := e.currentQuery
+	savedDB := e.CurrentDB
+	e.CurrentDB = dbName
 	defer func() {
 		e.routineDepth--
 		e.functionOrTriggerDepth--
 		e.currentQuery = savedQuery
+		e.CurrentDB = savedDB
 	}()
 	if e.routineDepth > 256 {
 		return nil, fmt.Errorf("Error 1456 (HY000): Recursive stored functions and triggers are not allowed")
