@@ -369,10 +369,18 @@ func coerceDateTimeValueWithSessionEx(colType string, v interface{}, sessionTime
 				}
 				// Apply fractional seconds precision.
 				if dtFsp >= 0 {
-					// DATETIME(N): keep exactly N fractional digits (pad with zeros or truncate).
+					// DATETIME(N): keep exactly N fractional digits (pad with zeros or truncate/round).
 					// MySQL always displays DATETIME(N) with exactly N fractional digits.
 					if dtFsp == 0 {
 						// DATETIME(0) or plain DATETIME: drop fractional part.
+						// When not in truncate mode, check if rounding up fractional seconds
+						// would cause an overflow (e.g., .9999999 rounded to 0 digits = carry).
+						// For zero-date components (month=0 or day=0), this makes the date out of range.
+						if !timeTruncateFractional && fracPart != "" {
+							if roundFracOverflows(fracPart, 0) && isZeroDateComponent(parsed) {
+								return "0000-00-00 00:00:00"
+							}
+						}
 						return parsed + " " + timePart
 					}
 					frac := fracPart
@@ -380,12 +388,25 @@ func coerceDateTimeValueWithSessionEx(colType string, v interface{}, sessionTime
 						frac += "0"
 					}
 					if len(frac) > dtFsp {
+						if !timeTruncateFractional {
+							// Rounding mode: check if rounding up would overflow.
+							// If it does and date has zero components, store as zero.
+							if roundFracOverflows(frac[dtFsp:], 0) && isZeroDateComponent(parsed) {
+								return zeroDateTimeForFsp(dtFsp)
+							}
+						}
 						frac = frac[:dtFsp]
 					}
 					return parsed + " " + timePart + "." + frac
 				} else if dtFsp < 0 {
 					// Plain DATETIME (no precision specified): strip fractional seconds.
-					// fracPart is ignored.
+					// When not in truncate mode, check rounding overflow for zero-date components.
+					if !timeTruncateFractional && fracPart != "" {
+						if roundFracOverflows(fracPart, 0) && isZeroDateComponent(parsed) {
+							return "0000-00-00 00:00:00"
+						}
+					}
+					// fracPart is ignored (stripped).
 				}
 				return parsed + " " + timePart
 			}
@@ -434,6 +455,60 @@ func isValidTimePart(timePart string) bool {
 		return false
 	}
 	return true
+}
+
+// roundFracOverflows returns true if rounding the fractional string `frac` to `precision` digits
+// would cause an overflow (carry into the seconds). This happens when all digits at and after
+// position `precision` are 5-9 and there's a carry chain.
+// For simplicity, we check if frac[0] (first digit after precision) is >= '5'.
+func roundFracOverflows(frac string, precision int) bool {
+	if len(frac) == 0 {
+		return false
+	}
+	// Check if the first digit after precision position causes a round-up.
+	// For a complete check: round `frac` to `precision` digits and see if it overflows.
+	// Pad with zeros to at least precision+1 digits.
+	padded := frac
+	for len(padded) <= precision {
+		padded += "0"
+	}
+	// Take only `precision` digits and check if rounding (next digit >= 5) would carry.
+	keepDigits := padded[:precision]
+	roundDigit := padded[precision]
+	if roundDigit < '5' {
+		return false
+	}
+	// Round up keepDigits: carry propagates from right to left.
+	carry := true
+	result := []byte(keepDigits)
+	for i := len(result) - 1; i >= 0 && carry; i-- {
+		d := result[i] - '0' + 1
+		if d >= 10 {
+			result[i] = '0'
+		} else {
+			result[i] = '0' + d
+			carry = false
+		}
+	}
+	return carry // true means all digits overflowed (e.g., 999999 + 1 = 1000000)
+}
+
+// isZeroDateComponent returns true if the parsed date string (YYYY-MM-DD) has month=0 or day=0.
+func isZeroDateComponent(parsedDate string) bool {
+	if len(parsedDate) < 10 || parsedDate[4] != '-' || parsedDate[7] != '-' {
+		return false
+	}
+	month := parsedDate[5:7]
+	day := parsedDate[8:10]
+	return month == "00" || day == "00"
+}
+
+// zeroDateTimeForFsp returns the zero datetime string for a given fractional seconds precision.
+func zeroDateTimeForFsp(fsp int) string {
+	if fsp <= 0 {
+		return "0000-00-00 00:00:00"
+	}
+	return "0000-00-00 00:00:00." + strings.Repeat("0", fsp)
 }
 
 // extractTimePart extracts the time component from a datetime value.

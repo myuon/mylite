@@ -131,11 +131,29 @@ func formatTimeDiffMicrosOpt(diffUs int64, e *Executor, origHadMicros bool) stri
 func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.Row) (interface{}, bool, error) {
 	switch name {
 	case "now", "current_timestamp", "sysdate":
-		return e.nowTime().Format("2006-01-02 15:04:05"), true, nil
+		t := e.nowTime()
+		if len(v.Exprs) > 0 {
+			precVal, _, _ := e.evalArg1(v.Exprs, name, row)
+			prec := int(toFloat(precVal))
+			if prec > 0 && prec <= 6 {
+				frac := fmt.Sprintf("%06d", t.Nanosecond()/1000)[:prec]
+				return t.Format("2006-01-02 15:04:05") + "." + frac, true, nil
+			}
+		}
+		return t.Format("2006-01-02 15:04:05"), true, nil
 	case "curdate", "current_date":
 		return e.nowTime().Format("2006-01-02"), true, nil
 	case "curtime", "current_time":
-		return e.nowTime().Format("15:04:05"), true, nil
+		t := e.nowTime()
+		if len(v.Exprs) > 0 {
+			precVal, _, _ := e.evalArg1(v.Exprs, name, row)
+			prec := int(toFloat(precVal))
+			if prec > 0 && prec <= 6 {
+				frac := fmt.Sprintf("%06d", t.Nanosecond()/1000)[:prec]
+				return t.Format("15:04:05") + "." + frac, true, nil
+			}
+		}
+		return t.Format("15:04:05"), true, nil
 	case "utc_date":
 		return e.nowTime().UTC().Format("2006-01-02"), true, nil
 	case "utc_time":

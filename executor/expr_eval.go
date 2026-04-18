@@ -210,6 +210,48 @@ func normalizeTimestampLiteral(s string) (string, error) {
 		// Return as-is, MySQL will handle normalization
 		return s, nil
 	}
+	// Handle packed format with trailing dot or fractional: YYYYMMDDHHMMSS. or YYYYMMDDHHMMSS.f
+	// e.g., "20130710010203." → accept (trailing dot means zero fractional, strip dot)
+	// e.g., "20130710010203.1" → accept, preserve fractional
+	// e.g., "20130710010203.1234567" → accept with 7 digits (MySQL rounds to 6 when displaying)
+	if dotIdx := strings.Index(s, "."); dotIdx == 14 && allDigits(s[:14]) {
+		fracPart := ""
+		if len(s) > 15 {
+			fracPart = s[15:]
+		}
+		if fracPart == "" || allDigits(fracPart) {
+			// Return packed part; coerce will expand YYYYMMDDHHMMSS to datetime.
+			// Fractional is returned as part of the value for coerce to handle.
+			// MySQL rounds fractional seconds > 6 digits to 6 digits.
+			if len(fracPart) > 6 {
+				// Round to 6 digits.
+				keep := fracPart[:6]
+				roundUp := fracPart[6] >= '5'
+				if roundUp {
+					// Increment last digit.
+					keepBytes := []byte(keep)
+					carry := true
+					for i := len(keepBytes) - 1; i >= 0 && carry; i-- {
+						d := keepBytes[i] - '0' + 1
+						if d >= 10 {
+							keepBytes[i] = '0'
+						} else {
+							keepBytes[i] = '0' + d
+							carry = false
+						}
+					}
+					keep = string(keepBytes)
+					// If carry out, the fractional part overflowed - return as-is (MySQL handles it)
+				}
+				fracPart = keep
+			}
+			if fracPart != "" {
+				return s[:14] + "." + fracPart, nil
+			}
+			return s[:14], nil // strip trailing dot only
+		}
+		return "", errFn()
+	}
 	// Must contain at least a space separator (date + time)
 	spaceIdx := strings.Index(s, " ")
 	if spaceIdx < 0 {
@@ -221,8 +263,8 @@ func normalizeTimestampLiteral(s string) (string, error) {
 	if datePart == "" || timePart == "" {
 		return "", errFn()
 	}
-	// Validate date part: must have 3 components (Y, M, D) separated by - or /
-	dateParts := strings.FieldsFunc(datePart, func(r rune) bool { return r == '-' || r == '/' || r == '.' })
+	// Validate date part: must have 3 components (Y, M, D) separated by -, /, . or :
+	dateParts := strings.FieldsFunc(datePart, func(r rune) bool { return r == '-' || r == '/' || r == '.' || r == ':' })
 	if len(dateParts) < 3 {
 		return "", errFn()
 	}
@@ -257,33 +299,71 @@ func normalizeTimestampLiteral(s string) (string, error) {
 
 	// Normalize the time component to HH:MM:SS[.frac]
 	// Time part may be: HH, HH:MM, HH:MM:SS, HH:MM:SS.frac, HH:MM:SS.
-	timeParts := strings.Split(timePart, ":")
+	// Also supports dot-separated time: HH.MM.SS.frac (MySQL TIMESTAMP extension).
 	h, m, secFull := "00", "00", "00"
-	switch len(timeParts) {
-	case 1:
-		h = fmt.Sprintf("%02s", timeParts[0])
-	case 2:
-		h = fmt.Sprintf("%02s", timeParts[0])
-		mStr := timeParts[1]
-		frac := ""
-		if dot := strings.Index(mStr, "."); dot >= 0 {
-			frac = mStr[dot:]
-			mStr = mStr[:dot]
+
+	// Check if the time part uses dot separators (no colons in the H/M/S section).
+	// Pattern: contains '.' but not ':' (before the fractional second position).
+	// Dot-separated: "01.02.03.456" → HH=01, MM=02, SS=03, frac=456
+	//                "01.02.0.31"   → HH=01, MM=02, SS=0, frac=31
+	if !strings.Contains(timePart, ":") && strings.Contains(timePart, ".") {
+		// Dot-separated time format.
+		dotParts := strings.Split(timePart, ".")
+		// Need at least H and M (2 parts).
+		if len(dotParts) < 2 {
+			return "", errFn()
 		}
-		m = fmt.Sprintf("%02s", mStr)
-		secFull = "00" + frac
-	case 3:
-		h = fmt.Sprintf("%02s", timeParts[0])
-		m = fmt.Sprintf("%02s", timeParts[1])
-		sStr := timeParts[2]
-		frac := ""
-		if dot := strings.Index(sStr, "."); dot >= 0 {
-			frac = strings.TrimRight(sStr[dot:], ".")
-			sStr = sStr[:dot]
+		h = fmt.Sprintf("%02s", dotParts[0])
+		m = fmt.Sprintf("%02s", dotParts[1])
+		if len(dotParts) >= 3 {
+			sStr := dotParts[2]
+			// Validate seconds: must be 1-2 digits and ≤59.
+			sVal, sErr := strconv.Atoi(sStr)
+			if sErr != nil || sVal > 59 || len(sStr) > 2 {
+				return "", errFn()
+			}
+			secFull = fmt.Sprintf("%02d", sVal)
+			if len(dotParts) >= 4 {
+				// Remaining parts form the fractional seconds.
+				// Only the 4th part is fractional (remaining are invalid).
+				if len(dotParts) > 4 {
+					return "", errFn()
+				}
+				frac := dotParts[3]
+				if len(frac) > 6 {
+					return "", errFn()
+				}
+				secFull = secFull + "." + frac
+			}
 		}
-		secFull = fmt.Sprintf("%02s", sStr) + frac
-		// Strip trailing just-dot
-		secFull = strings.TrimRight(secFull, ".")
+	} else {
+		timeParts := strings.Split(timePart, ":")
+		switch len(timeParts) {
+		case 1:
+			h = fmt.Sprintf("%02s", timeParts[0])
+		case 2:
+			h = fmt.Sprintf("%02s", timeParts[0])
+			mStr := timeParts[1]
+			frac := ""
+			if dot := strings.Index(mStr, "."); dot >= 0 {
+				frac = mStr[dot:]
+				mStr = mStr[:dot]
+			}
+			m = fmt.Sprintf("%02s", mStr)
+			secFull = "00" + frac
+		case 3:
+			h = fmt.Sprintf("%02s", timeParts[0])
+			m = fmt.Sprintf("%02s", timeParts[1])
+			sStr := timeParts[2]
+			frac := ""
+			if dot := strings.Index(sStr, "."); dot >= 0 {
+				frac = strings.TrimRight(sStr[dot:], ".")
+				sStr = sStr[:dot]
+			}
+			secFull = fmt.Sprintf("%02s", sStr) + frac
+			// Strip trailing just-dot
+			secFull = strings.TrimRight(secFull, ".")
+		}
 	}
 
 	return fmt.Sprintf("%s %s:%s:%s", datePart, h, m, secFull), nil
@@ -3559,21 +3639,52 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		// NOW(), CURRENT_TIMESTAMP(), CURTIME(), etc.
 		name := strings.ToLower(v.Name.String())
 		now := e.nowTime()
+		fsp := v.Fsp // fractional seconds precision (0-6)
+		// Helper to format with fractional seconds precision.
+		withFrac := func(base string) string {
+			if fsp <= 0 {
+				return base
+			}
+			prec := fsp
+			if prec > 6 {
+				prec = 6
+			}
+			frac := fmt.Sprintf("%06d", now.Nanosecond()/1000)[:prec]
+			return base + "." + frac
+		}
 		switch name {
 		case "now", "current_timestamp", "localtime", "localtimestamp", "sysdate":
-			return now.Format("2006-01-02 15:04:05"), nil
+			return withFrac(now.Format("2006-01-02 15:04:05")), nil
 		case "curdate", "current_date":
 			return now.Format("2006-01-02"), nil
 		case "curtime", "current_time":
-			return now.Format("15:04:05"), nil
+			return withFrac(now.Format("15:04:05")), nil
 		case "utc_timestamp":
-			return e.nowTime().UTC().Format("2006-01-02 15:04:05"), nil
+			utcNow := e.nowTime().UTC()
+			if fsp > 0 {
+				prec := fsp
+				if prec > 6 {
+					prec = 6
+				}
+				frac := fmt.Sprintf("%06d", utcNow.Nanosecond()/1000)[:prec]
+				return utcNow.Format("2006-01-02 15:04:05") + "." + frac, nil
+			}
+			return utcNow.Format("2006-01-02 15:04:05"), nil
 		case "utc_date":
 			return e.nowTime().UTC().Format("2006-01-02"), nil
 		case "utc_time":
-			return e.nowTime().UTC().Format("15:04:05"), nil
+			utcNow := e.nowTime().UTC()
+			if fsp > 0 {
+				prec := fsp
+				if prec > 6 {
+					prec = 6
+				}
+				frac := fmt.Sprintf("%06d", utcNow.Nanosecond()/1000)[:prec]
+				return utcNow.Format("15:04:05") + "." + frac, nil
+			}
+			return utcNow.Format("15:04:05"), nil
 		default:
-			return now.Format("2006-01-02 15:04:05"), nil
+			return withFrac(now.Format("2006-01-02 15:04:05")), nil
 		}
 	case *sqlparser.Subquery:
 		// Scalar subquery: execute and return the single value
