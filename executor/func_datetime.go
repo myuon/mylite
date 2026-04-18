@@ -2168,6 +2168,40 @@ func addTimeStrings(base, interval string, subtract bool) interface{} {
 	return formatMicrosAsTimeString(resultMicros)
 }
 
+// timeStringToNumericString converts a TIME string like "01:02:03.456" to its numeric HHMMSS.fff form "10203.456".
+// Returns "" if the string doesn't look like a TIME value.
+// MySQL stores TIME literals in REAL/FLOAT/DOUBLE columns as the numeric HHMMSS.fff representation.
+func timeStringToNumericString(s string) string {
+	neg := ""
+	if strings.HasPrefix(s, "-") {
+		neg = "-"
+		s = s[1:]
+	}
+	// Match HH:MM:SS[.fff] or HHH:MM:SS[.fff]
+	parts := strings.SplitN(s, ":", 3)
+	if len(parts) != 3 {
+		return ""
+	}
+	h, errH := strconv.Atoi(parts[0])
+	m, errM := strconv.Atoi(parts[1])
+	if errH != nil || errM != nil || h < 0 || m < 0 || m > 59 {
+		return ""
+	}
+	// Third part may have fractional seconds
+	secStr := parts[2]
+	fracStr := ""
+	if dotIdx := strings.Index(secStr, "."); dotIdx >= 0 {
+		fracStr = "." + secStr[dotIdx+1:]
+		secStr = secStr[:dotIdx]
+	}
+	sec, errS := strconv.Atoi(secStr)
+	if errS != nil || sec < 0 || sec > 59 {
+		return ""
+	}
+	// Format as HHMMSS[.fff]
+	return fmt.Sprintf("%s%d%02d%02d%s", neg, h, m, sec, fracStr)
+}
+
 // parseTimeStringToMicros parses a MySQL TIME string to total microseconds.
 // Handles negative signs, D HH:MM:SS, HH:MM:SS.ffffff, and garbage at end.
 

@@ -3189,21 +3189,52 @@ func (e *Executor) evalExtractFuncExpr(v *sqlparser.ExtractFuncExpr) (interface{
 	efT, efErr := parseDateTimeValue(efStr)
 	// For compound time-based extractions, also try parsing as a time duration (D HH:MM:SS)
 	// when parseDateTimeValue fails (e.g., "02 10:11:12" is a time duration, not a date).
+	// Also, if the string looks like "N HH:MM:SS" (integer days + time), always prefer
+	// duration parsing over datetime parsing for compound interval types.
 	var totalSecFromDuration int64
 	var durationParsed bool
-	if efErr != nil {
-		// Try to parse as MySQL time duration (e.g., "02 10:11:12" = 2 days 10h 11m 12s)
-		dur, durErr := parseMySQLTimeInterval(efStr)
-		if durErr == nil {
-			absNs := int64(dur)
-			if absNs < 0 {
-				absNs = -absNs
+	{
+		// Check if string looks like a time duration ("D HH:MM:SS" or "HH:MM:SS")
+		// by detecting a space with colon-separated time after it.
+		looksLikeTimeDuration := false
+		if spaceIdx := strings.Index(efStr, " "); spaceIdx > 0 {
+			rest := efStr[spaceIdx+1:]
+			if strings.Contains(rest, ":") {
+				// Before the space, check if it's purely numeric (day count)
+				dayPart := efStr[:spaceIdx]
+				if dayPart[0] == '-' {
+					dayPart = dayPart[1:]
+				}
+				isNumDay := true
+				for _, c := range dayPart {
+					if c < '0' || c > '9' {
+						isNumDay = false
+						break
+					}
+				}
+				if isNumDay {
+					looksLikeTimeDuration = true
+				}
 			}
-			totalSecFromDuration = absNs / int64(1e9) // nanoseconds to seconds
-			if dur < 0 {
-				totalSecFromDuration = -totalSecFromDuration
+		}
+		if efErr != nil || looksLikeTimeDuration {
+			// Try to parse as MySQL time duration (e.g., "02 10:11:12" = 2 days 10h 11m 12s)
+			dur, durErr := parseMySQLTimeInterval(efStr)
+			if durErr == nil {
+				absNs := int64(dur)
+				if absNs < 0 {
+					absNs = -absNs
+				}
+				totalSecFromDuration = absNs / int64(1e9) // nanoseconds to seconds
+				if dur < 0 {
+					totalSecFromDuration = -totalSecFromDuration
+				}
+				durationParsed = true
+				// For time-duration strings, override efErr to force the duration path
+				if looksLikeTimeDuration {
+					efErr = fmt.Errorf("time duration string")
+				}
 			}
-			durationParsed = true
 		}
 	}
 	switch intervalType {

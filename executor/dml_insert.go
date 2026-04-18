@@ -1054,6 +1054,12 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 								isFloatType := !isDecimalOrNumeric && (strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || strings.Contains(colUpper, "REAL"))
 								if sv, isStr := v.(string); isStr {
 									svTrimmed := strings.TrimSpace(sv)
+									// If the string looks like a TIME value (HH:MM:SS[.fff] or -HH:MM:SS),
+									// convert to numeric HHMMSS[.fff] before attempting float parse.
+									// MySQL stores TIME-in-REAL as the numeric HHMMSS.fff representation.
+									if timeNumStr := timeStringToNumericString(svTrimmed); timeNumStr != "" {
+										svTrimmed = timeNumStr
+									}
 									pfVal, pfErr := strconv.ParseFloat(svTrimmed, 64)
 									if pfErr != nil {
 										// String doesn't parse (or parses with overflow to ±Inf).
