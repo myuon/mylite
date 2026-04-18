@@ -196,6 +196,12 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", deleteDB, tableName))
 	}
 
+	// Set queryTableDef so that IS NULL checks on zero-date NOT NULL columns work correctly
+	// (MySQL: 0000-00-00 IS NULL = TRUE for NOT NULL date columns).
+	oldQueryTableDef := e.queryTableDef
+	e.queryTableDef = tbl.Def
+	defer func() { e.queryTableDef = oldQueryTableDef }()
+
 	tbl.Lock()
 	defer tbl.Unlock()
 
@@ -229,6 +235,63 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		}
 	}
 
+	// Validate ORDER BY column references for single-table DELETE.
+	// MySQL requires that ORDER BY columns exist in the deleted table.
+	if stmt.OrderBy != nil {
+		availCols := make(map[string]bool)
+		for _, col := range tbl.Def.Columns {
+			availCols[strings.ToLower(col.Name)] = true
+		}
+		for _, order := range stmt.OrderBy {
+			expr := order.Expr
+			switch e2 := expr.(type) {
+			case *sqlparser.ColName:
+				colName := strings.ToLower(e2.Name.String())
+				if !availCols[colName] {
+					if !e2.Qualifier.IsEmpty() {
+						// Qualified reference like t2.x - check if qualifier matches the table
+						qualifier := strings.ToLower(e2.Qualifier.Name.String())
+						if !strings.EqualFold(qualifier, tableName) {
+							// Qualifier doesn't match the table being deleted
+							return nil, mysqlError(1054, "42S22",
+								fmt.Sprintf("Unknown column '%s.%s' in 'order clause'", e2.Qualifier.Name.String(), e2.Name.String()))
+						}
+					}
+					return nil, mysqlError(1054, "42S22",
+						fmt.Sprintf("Unknown column '%s' in 'order clause'", e2.Name.String()))
+				}
+				// Even if column exists, qualifier must match the table
+				if !e2.Qualifier.IsEmpty() {
+					qualifier := strings.ToLower(e2.Qualifier.Name.String())
+					if !strings.EqualFold(qualifier, tableName) && !strings.EqualFold(qualifier, deleteDB) {
+						return nil, mysqlError(1054, "42S22",
+							fmt.Sprintf("Unknown column '%s.%s' in 'order clause'", e2.Qualifier.Name.String(), e2.Name.String()))
+					}
+				}
+			case *sqlparser.Subquery:
+				// Subquery in ORDER BY: validate inner SELECT's columns for the no-FROM case.
+				// MySQL: "DELETE FROM t1 ORDER BY (SELECT x)" where x doesn't exist is an error.
+				if e2.Select != nil {
+					sel, ok := e2.Select.(*sqlparser.Select)
+					if ok && sel.SelectExprs != nil && len(sel.SelectExprs.Exprs) > 0 {
+						firstExpr := sel.SelectExprs.Exprs[0]
+						if _, isStarExpr := firstExpr.(*sqlparser.StarExpr); !isStarExpr {
+							if aliasedExpr, ok2 := firstExpr.(*sqlparser.AliasedExpr); ok2 {
+								if colExpr, ok3 := aliasedExpr.Expr.(*sqlparser.ColName); ok3 {
+									colName := strings.ToLower(colExpr.Name.String())
+									if !availCols[colName] {
+										return nil, mysqlError(1054, "42S22",
+											fmt.Sprintf("Unknown column '%s' in 'field list'", colExpr.Name.String()))
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// SQL_SAFE_UPDATES: reject DELETE without WHERE using a KEY column (unless LIMIT present).
 	if err := e.checkSafeUpdate(tbl.Def, func() sqlparser.Expr {
 		if stmt.Where != nil {
@@ -257,19 +320,67 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		}
 		numericOrderCols := numericOrderColumnSet(def, colNames)
 
-		// Build a list of candidate row indices that match WHERE.
+		// When ORDER BY is specified, sort ALL rows first, then evaluate WHERE in sorted
+		// order (MySQL semantics: rows are scanned in ORDER BY order, WHERE is evaluated
+		// per-row in that order, and scanning stops once LIMIT rows match).
+		// This ensures side effects in WHERE (e.g. @a:= col) reflect only the deleted rows.
 		type indexedRow struct {
 			idx int
 			row storage.Row
 		}
-		var candidates []indexedRow
+
+		// Build flat representation of ALL rows for sorting.
+		allFlatRows := make([][]interface{}, len(tbl.Rows))
 		for i, row := range tbl.Rows {
+			r := make([]interface{}, len(colNames))
+			for j, cn := range colNames {
+				r[j] = row[cn]
+			}
+			r = append(r, i) // original index as last element
+			allFlatRows[i] = r
+		}
+
+		// Sort ALL rows if ORDER BY is present.
+		if stmt.OrderBy != nil {
+			allFlatRows, err = applyOrderByWithTypeHints(stmt.OrderBy, colNames, allFlatRows, effectiveTableCollation(def), numericOrderCols)
+			if err != nil {
+				return nil, err
+			}
+		} else if stmt.Limit != nil && len(def.PrimaryKey) > 0 {
+			// When LIMIT without ORDER BY, InnoDB scans in PRIMARY KEY order.
+			var orderBy sqlparser.OrderBy
+			for _, pkCol := range def.PrimaryKey {
+				orderBy = append(orderBy, &sqlparser.Order{
+					Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(pkCol)},
+					Direction: sqlparser.AscOrder,
+				})
+			}
+			allFlatRows, err = applyOrderByWithTypeHints(orderBy, colNames, allFlatRows, effectiveTableCollation(def), numericOrderCols)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// Compute limit count.
+		limitCount := int64(-1) // -1 means no limit
+		if stmt.Limit != nil {
+			flatLimit, applyErr := applyLimit(stmt.Limit, allFlatRows)
+			if applyErr != nil {
+				return nil, applyErr
+			}
+			limitCount = int64(len(flatLimit))
+		}
+
+		// Evaluate WHERE in sorted order, stopping at limitCount matches.
+		var flatRows [][]interface{}
+		for _, r := range allFlatRows {
+			origIdx := r[len(r)-1].(int)
+			row := tbl.Rows[origIdx]
 			match := true
 			if stmt.Where != nil {
 				m, wErr := e.evalWhere(stmt.Where.Expr, row)
 				if wErr != nil {
 					if bool(stmt.Ignore) {
-						// DELETE IGNORE: suppress WHERE eval errors (e.g. subquery > 1 row), skip row
 						e.addWarning("Warning", 1242, strings.TrimPrefix(wErr.Error(), "ERROR 1242 (21000): "))
 						match = false
 					} else {
@@ -280,46 +391,10 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 				}
 			}
 			if match {
-				candidates = append(candidates, indexedRow{idx: i, row: row})
-			}
-		}
-
-		// Convert candidates to [][]interface{} for applyOrderBy / applyLimit.
-		flatRows := make([][]interface{}, len(candidates))
-		for i, c := range candidates {
-			r := make([]interface{}, len(colNames))
-			for j, cn := range colNames {
-				r[j] = c.row[cn]
-			}
-			// Append original index as last element for tracking.
-			r = append(r, c.idx)
-			flatRows[i] = r
-		}
-
-		if stmt.OrderBy != nil {
-			flatRows, err = applyOrderByWithTypeHints(stmt.OrderBy, colNames, flatRows, effectiveTableCollation(def), numericOrderCols)
-			if err != nil {
-				return nil, err
-			}
-		} else if stmt.Limit != nil && len(def.PrimaryKey) > 0 {
-			// When LIMIT without ORDER BY, InnoDB scans in PRIMARY KEY order.
-			// Build an ORDER BY clause from the primary key columns.
-			var orderBy sqlparser.OrderBy
-			for _, pkCol := range def.PrimaryKey {
-				orderBy = append(orderBy, &sqlparser.Order{
-					Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(pkCol)},
-					Direction: sqlparser.AscOrder,
-				})
-			}
-			flatRows, err = applyOrderByWithTypeHints(orderBy, colNames, flatRows, effectiveTableCollation(def), numericOrderCols)
-			if err != nil {
-				return nil, err
-			}
-		}
-		if stmt.Limit != nil {
-			flatRows, err = applyLimit(stmt.Limit, flatRows)
-			if err != nil {
-				return nil, err
+				flatRows = append(flatRows, r)
+				if limitCount >= 0 && int64(len(flatRows)) >= limitCount {
+					break
+				}
 			}
 		}
 
@@ -610,6 +685,50 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 	// Start with first table
 	if len(stmt.TableExprs) == 0 {
 		return &Result{}, nil
+	}
+
+	// SQL_SAFE_UPDATES: for multi-table DELETE, check if safe update mode requires a key-based WHERE.
+	// MySQL allows multi-table DELETE in safe update mode only if there's a LIMIT or a WHERE using a key.
+	if e.isSafeUpdateEnabled() && stmt.Limit == nil {
+		// Check if WHERE uses a key column from any of the deleted tables.
+		safeOK := false
+		var whereExpr sqlparser.Expr
+		if stmt.Where != nil {
+			whereExpr = stmt.Where.Expr
+		}
+		// Look through target tables (stmt.Targets, or the first table in stmt.TableExprs if no targets).
+		targetTables := stmt.Targets
+		if len(targetTables) == 0 && len(stmt.TableExprs) > 0 {
+			// Single-table style: first TableExpr is the target.
+			alias, _, _ := extractTableAlias(stmt.TableExprs[0])
+			targetTables = sqlparser.TableNames{sqlparser.TableName{Name: sqlparser.NewIdentifierCS(alias)}}
+		}
+		for _, te := range stmt.TableExprs {
+			_, tableName, _ := extractTableAlias(te)
+			dbName := e.CurrentDB
+			if dbCat, err := e.Catalog.GetDatabase(dbName); err == nil {
+				if tblDef, err2 := dbCat.GetTable(tableName); err2 == nil {
+					if whereExpr != nil && whereUsesKeyColumnDirectly(whereExpr, func() map[string]bool {
+						kc := make(map[string]bool)
+						for _, col := range tblDef.PrimaryKey {
+							kc[strings.ToLower(stripPrefixLengthFromCol(col))] = true
+						}
+						for _, idx := range tblDef.Indexes {
+							for _, col := range idx.Columns {
+								kc[strings.ToLower(stripPrefixLengthFromCol(col))] = true
+							}
+						}
+						return kc
+					}()) {
+						safeOK = true
+						break
+					}
+				}
+			}
+		}
+		if !safeOK {
+			return nil, mysqlError(1175, "HY000", "You are using safe update mode and you tried to update a table without a WHERE that uses a KEY column.")
+		}
 	}
 
 	// Collect table aliases for per-table predicate classification

@@ -725,13 +725,25 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 			return [][]interface{}{e.dummyExplainRow(query)}
 		}
 	case *sqlparser.Delete:
-		// EXPLAIN DELETE: show "DELETE" as select_type.
+		// EXPLAIN DELETE: show "DELETE" as select_type for deleted tables, "SIMPLE" for others.
 		// For DELETE without WHERE, Extra is "Deleting all rows".
 		var tableNames []string
 		for _, te := range s.TableExprs {
 			tableNames = append(tableNames, e.extractAllTableNames(te)...)
 		}
-		for i, tblName := range tableNames {
+		// Build set of tables being deleted (from stmt.Targets).
+		// For single-table DELETE (no Targets), all tables are deleted.
+		deletedTables := make(map[string]bool)
+		if len(s.Targets) > 0 {
+			for _, tgt := range s.Targets {
+				deletedTables[strings.ToLower(tgt.Name.String())] = true
+			}
+		} else if len(tableNames) > 0 {
+			// No explicit targets: first table is deleted.
+			deletedTables[strings.ToLower(tableNames[0])] = true
+		}
+		isMultiTable := len(s.Targets) > 0
+		for _, tblName := range tableNames {
 			var rowCount int64 = 1
 			if e.Storage != nil {
 				if tbl, err := e.Storage.GetTable(e.CurrentDB, tblName); err == nil {
@@ -740,14 +752,15 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 					}
 				}
 			}
+			isDeleted := deletedTables[strings.ToLower(tblName)]
 			st := "SIMPLE"
-			if i == 0 {
+			if isDeleted {
 				st = "DELETE"
 			}
 			var extra interface{} = nil
-			if i == 0 && s.Where == nil {
+			if isDeleted && !isMultiTable && s.Where == nil {
 				extra = "Deleting all rows"
-			} else if i == 0 && s.Where != nil {
+			} else if isDeleted && !isMultiTable && s.Where != nil {
 				extra = "Using where"
 			}
 			result = append(result, explainSelectType{

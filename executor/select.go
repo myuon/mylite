@@ -7143,6 +7143,19 @@ func applyOrderByWithTypeHints(orderBy sqlparser.OrderBy, colNames []string, row
 				break
 			}
 		}
+		// If not found with qualified name (e.g. "t1.a"), try unqualified name (e.g. "a").
+		// This handles ORDER BY t1.col when colNames only contains unqualified "col".
+		if colIdx == -1 {
+			if col, ok := expr.(*sqlparser.ColName); ok && col != nil && !col.Qualifier.IsEmpty() {
+				unqualName := strings.Trim(col.Name.String(), "`")
+				for i, c := range colNames {
+					if strings.EqualFold(c, unqualName) {
+						colIdx = i
+						break
+					}
+				}
+			}
+		}
 		if colIdx == -1 {
 			continue
 		}
