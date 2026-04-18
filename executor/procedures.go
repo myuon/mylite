@@ -1721,6 +1721,7 @@ type routineContext struct {
 	triggerTiming      string       // "BEFORE" or "AFTER" for trigger execution
 	handlerResult      *Result      // result set produced by EXIT HANDLER body (to return from CALL)
 	resultSets         *[]*Result   // pointer to slice collecting all result sets from SELECT statements; shared across child contexts
+	propagatedSignal   error        // RESIGNAL error raised from within a handler body (propagates up)
 }
 
 // childContext creates a child routineContext that shares state with the parent
@@ -2575,6 +2576,12 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 				handled, exitFlag := e.tryHandler(err, ctx)
 				if handled {
 					if exitFlag {
+						// If the handler itself raised a RESIGNAL, propagate that signal upward.
+						if ctx.propagatedSignal != nil {
+							sig := ctx.propagatedSignal
+							ctx.propagatedSignal = nil
+							return nil, sig
+						}
 						return nil, nil
 					}
 					continue
@@ -2614,6 +2621,12 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 			handled, exitFlag := e.tryHandler(err, ctx)
 			if handled {
 				if exitFlag {
+					// If the handler itself raised a RESIGNAL, propagate that signal upward.
+					if ctx.propagatedSignal != nil {
+						sig := ctx.propagatedSignal
+						ctx.propagatedSignal = nil
+						return nil, sig
+					}
 					// Return the result set from the EXIT HANDLER body (if any)
 					return ctx.handlerResult, nil
 				}
@@ -3019,6 +3032,13 @@ func (e *Executor) tryHandler(err error, ctx *routineContext) (bool, bool) {
 				ctx.handlers = savedHandlers
 				if herr != nil {
 					ctx.currentSignal = prevSignal
+					// If the handler body itself raised a SIGNAL/RESIGNAL, store it
+					// so the caller can propagate it upward (instead of the original error).
+					var handlerSig *signalError
+					if errors.As(herr, &handlerSig) {
+						ctx.propagatedSignal = herr
+						return true, true // mark as handled+exit so caller checks propagatedSignal
+					}
 					return false, false
 				}
 				// Store the result set from the handler body (for EXIT handlers,
