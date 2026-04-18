@@ -1493,6 +1493,14 @@ func valToLiteralExpr(val interface{}) sqlparser.Expr {
 		return sqlparser.NewFloatLiteral(fmt.Sprintf("%v", v))
 	case string:
 		return sqlparser.NewStrLiteral(v)
+	case HexBytes:
+		// HexBytes represents binary data stored as uppercase hex digits.
+		// Wrap as a hex literal (x'...') so binary-aware functions (HEX, etc.)
+		// see the original binary data rather than the hex string.
+		return sqlparser.NewHexLiteral(strings.ToLower(string(v)))
+	case []byte:
+		// Raw byte slice: encode as hex literal
+		return sqlparser.NewHexLiteral(strings.ToLower(hex.EncodeToString(v)))
 	default:
 		return sqlparser.NewStrLiteral(fmt.Sprintf("%v", val))
 	}
