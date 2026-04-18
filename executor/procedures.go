@@ -1151,6 +1151,12 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 		return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", e.CurrentDB, procName))
 	}
 
+	// Validate argument count (MySQL ER_SP_WRONG_NO_OF_ARGS = 1318, SQLSTATE 42000).
+	if len(argStrs) != len(proc.Params) {
+		return nil, mysqlError(1318, "42000", fmt.Sprintf("Incorrect number of arguments for PROCEDURE %s.%s; expected %d, got %d",
+			e.CurrentDB, procName, len(proc.Params), len(argStrs)))
+	}
+
 	// Build parameter mapping: bind IN/INOUT params, track OUT param user-variable targets.
 	paramVars := make(map[string]interface{})
 	// outTargets maps parameter name -> caller's user variable name (without '@')
