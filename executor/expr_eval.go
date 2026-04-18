@@ -184,12 +184,31 @@ func (e *Executor) evalLiteralExpr(v *sqlparser.Literal) (interface{}, error) {
 	}
 }
 
+// allDigits returns true if the string contains only decimal digits.
+func allDigits(s string) bool {
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
 // normalizeTimestampLiteral validates and normalizes a TIMESTAMP/DATETIME literal.
 // MySQL requires at minimum YYYY-MM-DD HH (date + hour component).
 // Just a date (YYYY-MM-DD) is not sufficient.
+// Also accepts packed format YYYYMMDDHHMMSS.
 func normalizeTimestampLiteral(s string) (string, error) {
 	errFn := func() error {
 		return mysqlError(1292, "HY000", fmt.Sprintf("Incorrect DATETIME value: '%s'", s))
+	}
+	// Check for packed format (all digits, no separators): YYYYMMDDHHMMSS
+	if allDigits(s) {
+		if len(s) < 12 {
+			return "", errFn()
+		}
+		// Return as-is, MySQL will handle normalization
+		return s, nil
 	}
 	// Must contain at least a space separator (date + time)
 	spaceIdx := strings.Index(s, " ")

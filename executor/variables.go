@@ -1286,16 +1286,31 @@ func (e *Executor) handleRawSet(raw string) error {
 			val = strings.Trim(val, "'\"")
 			val = strings.TrimSuffix(val, ";")
 			val = strings.TrimSpace(val)
-			n, err := strconv.ParseFloat(val, 64)
-			if err == nil {
-				if n == 0 {
-					e.fixedTimestamp = nil
-				} else {
-					t := time.Unix(int64(n), 0)
-					if e.timeZone != nil {
-						t = t.In(e.timeZone)
+			// Handle DEFAULT: reset fixedTimestamp
+			if strings.ToUpper(val) == "DEFAULT" {
+				e.fixedTimestamp = nil
+			} else {
+				// Try evaluating as an expression (e.g. UNIX_TIMESTAMP('...')) before ParseFloat.
+				if evalStmt, evalErr := e.parser().Parse("SELECT " + val); evalErr == nil {
+					if selStmt, ok := evalStmt.(*sqlparser.Select); ok && selStmt.SelectExprs != nil && len(selStmt.SelectExprs.Exprs) == 1 {
+						if aliasedExpr, ok := selStmt.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok {
+							if evalVal, evalErr2 := e.evalExpr(aliasedExpr.Expr); evalErr2 == nil && evalVal != nil {
+								val = fmt.Sprintf("%v", evalVal)
+							}
+						}
 					}
-					e.fixedTimestamp = &t
+				}
+				n, err := strconv.ParseFloat(val, 64)
+				if err == nil {
+					if n == 0 {
+						e.fixedTimestamp = nil
+					} else {
+						t := time.Unix(int64(n), 0)
+						if e.timeZone != nil {
+							t = t.In(e.timeZone)
+						}
+						e.fixedTimestamp = &t
+					}
 				}
 			}
 		}

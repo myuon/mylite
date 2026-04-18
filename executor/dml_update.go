@@ -449,11 +449,20 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 						if !e.isStrictMode() && isNumericType {
 							if sv, ok := val.(string); ok {
 								if _, err := strconv.ParseFloat(strings.TrimSpace(sv), 64); err != nil {
-									e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row %d", sv, col.Name, i+1))
-									if pv, ok := parseNumericPrefixMySQL(sv); ok {
-										val = pv
+									// If the string looks like a TIME value (HH:MM:SS) or DATETIME value
+									// (YYYY-MM-DD HH:MM:SS), let coerceIntegerValue handle the conversion.
+									// Do NOT fall through to parseNumericPrefixMySQL which would strip at the
+									// first colon or dash.
+									if strings.Count(sv, ":") == 2 ||
+										(len(sv) >= 19 && sv[4] == '-' && sv[7] == '-' && sv[10] == ' ') {
+										// TIME/DATETIME-like string: skip numeric prefix parse; coerceIntegerValue handles it.
 									} else {
-										val = int64(0)
+										e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row %d", sv, col.Name, i+1))
+										if pv, ok := parseNumericPrefixMySQL(sv); ok {
+											val = pv
+										} else {
+											val = int64(0)
+										}
 									}
 								}
 							}

@@ -1042,7 +1042,33 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 			mtNeg = "-"
 			mtHi = -mtHi
 		}
-		return fmt.Sprintf("%s%02d:%02d:%02d", mtNeg, mtHi, mtMi, mtSi), true, nil
+		// Extract fractional seconds from the second argument.
+		// Use string representation to avoid float64 rounding artifacts.
+		// MySQL MAKETIME result precision = min(fracDigitsOfSecondArg, 6).
+		// Trailing zeros ARE preserved to fill the declared precision.
+		var mtFrac string
+		mtSecStr := toString(mtSec)
+		if dot := strings.IndexByte(mtSecStr, '.'); dot >= 0 {
+			rawFrac := mtSecStr[dot+1:]
+			// Determine precision: min(len(rawFrac), 6)
+			prec := len(rawFrac)
+			if prec > 6 {
+				prec = 6
+			}
+			// Truncate to prec digits (no rounding in time_truncate_fractional mode)
+			frac := rawFrac[:prec]
+			// Pad to prec if shorter (shouldn't happen but be safe)
+			for len(frac) < prec {
+				frac += "0"
+			}
+			// Only include if non-zero (but keep trailing zeros within the precision)
+			// Exception: if all zeros, still include (MySQL shows .000000 for 59.0000005 truncated)
+			mtFrac = "." + frac
+		}
+		timeStr := fmt.Sprintf("%s%02d:%02d:%02d%s", mtNeg, mtHi, mtMi, mtSi, mtFrac)
+		// Clip to max TIME: if at 838:59:59 with fractional > 0, clamp.
+		// This is handled by formatTimeValue when the result is stored; here just return the string.
+		return timeStr, true, nil
 	case "microsecond":
 		usVal, isNull, err := e.evalArg1(v.Exprs, "MICROSECOND", row)
 		if err != nil {
@@ -1307,6 +1333,21 @@ func secToTimeValue(v interface{}) string {
 			fracPrec = dr.Precision
 		}
 	}
+
+	// When the input is a string (e.g. a DECIMAL literal like "3661.9999999"), extract
+	// the fractional part directly from the string representation to avoid float64 rounding.
+	// This preserves precision for truncation (time_truncate_fractional mode).
+	var strFracPart string
+	if sv, ok := v.(string); ok {
+		sv = strings.TrimSpace(sv)
+		if strings.HasPrefix(sv, "-") {
+			sv = sv[1:]
+		}
+		if dot := strings.IndexByte(sv, '.'); dot >= 0 {
+			strFracPart = sv[dot+1:] // raw fractional digits from string
+		}
+	}
+
 	f := toFloat(v)
 	sign := ""
 	if f < 0 {
@@ -1314,15 +1355,37 @@ func secToTimeValue(v interface{}) string {
 		f = -f
 	}
 	totalSec := int64(f)
-	frac := f - float64(totalSec)
 	h := totalSec / 3600
 	m := (totalSec % 3600) / 60
 	s := totalSec % 60
-	if frac > 1e-9 && fracPrec > 0 {
-		// Format fractional seconds with the appropriate precision, stripping trailing zeros
-		fracStr := fmt.Sprintf("%."+strconv.Itoa(fracPrec)+"f", frac)[1:] // e.g., ".4235"
-		fracStr = strings.TrimRight(fracStr, "0")
-		if fracStr != "." {
+
+	if fracPrec > 0 {
+		var fracStr string
+		if strFracPart != "" {
+			// Use string-based truncation (no float rounding artifacts).
+			frac := strFracPart
+			// Pad to at least fracPrec digits
+			for len(frac) < fracPrec {
+				frac += "0"
+			}
+			// Truncate to fracPrec digits (do not round)
+			frac = frac[:fracPrec]
+			frac = strings.TrimRight(frac, "0")
+			if frac != "" {
+				fracStr = "." + frac
+			}
+		} else {
+			// Float-based fallback: format and strip trailing zeros
+			frac := f - float64(totalSec)
+			if frac > 1e-9 {
+				fs := fmt.Sprintf("%."+strconv.Itoa(fracPrec)+"f", frac)[1:] // e.g., ".4235"
+				fs = strings.TrimRight(fs, "0")
+				if fs != "." {
+					fracStr = fs
+				}
+			}
+		}
+		if fracStr != "" {
 			return fmt.Sprintf("%s%02d:%02d:%02d%s", sign, h, m, s, fracStr)
 		}
 	}
@@ -1569,11 +1632,45 @@ func parseDateTimeValue(val interface{}) (time.Time, error) {
 		}
 	}
 	// Try to parse YYYYMMDDHHMMSS or YYMMDDHHMMSS format (all-digit, no separators)
+	isAllDigitsStr := func(st string) bool {
+		for _, c := range st {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		return len(st) > 0
+	}
 	isAllDigits := true
 	for _, c := range s {
 		if c < '0' || c > '9' {
 			isAllDigits = false
 			break
+		}
+	}
+	// Handle YYYYMMDDHHMMSS.ffffff (compact numeric with fractional seconds)
+	if !isAllDigits {
+		if dotIdx := strings.IndexByte(s, '.'); dotIdx == 14 && isAllDigitsStr(s[:14]) && isAllDigitsStr(s[15:]) {
+			intPart := s[:14]
+			fracPart := s[15:]
+			y, _ := strconv.Atoi(intPart[0:4])
+			mo, _ := strconv.Atoi(intPart[4:6])
+			d, _ := strconv.Atoi(intPart[6:8])
+			h, _ := strconv.Atoi(intPart[8:10])
+			mi, _ := strconv.Atoi(intPart[10:12])
+			sec, _ := strconv.Atoi(intPart[12:14])
+			if mo >= 1 && mo <= 12 && d >= 1 && d <= 31 {
+				// Convert fractional to nanoseconds (up to 6 digits = microseconds)
+				frac := fracPart
+				if len(frac) > 6 {
+					frac = frac[:6]
+				}
+				for len(frac) < 6 {
+					frac += "0"
+				}
+				usec, _ := strconv.Atoi(frac)
+				nsec := usec * 1000
+				return time.Date(y, time.Month(mo), d, h, mi, sec, nsec, time.UTC), nil
+			}
 		}
 	}
 	if isAllDigits {
@@ -3638,6 +3735,27 @@ func normalizeDateTimeForCompare(a, b string) (string, string) {
 		a = a + " 00:00:00"
 	} else if bIsDate && !bIsDatetime && aIsDatetime {
 		b = b + " 00:00:00"
+	}
+
+	// Datetime fractional precision alignment: when both are datetime strings
+	// with different fractional digit counts, truncate the longer one to the
+	// shorter one's length. This matches MySQL's TIME_TRUNCATE_FRACTIONAL behavior
+	// where literals are truncated to match the column's display precision.
+	// E.g.: '2001-01-01 00:00:00.999999' (stored in DATETIME(6)) compared with
+	//       '2001-01-01 00:00:00.9999998' (7-digit literal) → truncate to 6 digits.
+	aDotIdx := strings.LastIndex(a, ".")
+	bDotIdx := strings.LastIndex(b, ".")
+	if aDotIdx > 10 && bDotIdx > 10 { // both have fractional parts in a datetime context
+		aFrac := a[aDotIdx+1:]
+		bFrac := b[bDotIdx+1:]
+		if len(aFrac) != len(bFrac) {
+			// Truncate the longer to match the shorter
+			if len(aFrac) > len(bFrac) {
+				a = a[:aDotIdx+1+len(bFrac)]
+			} else {
+				b = b[:bDotIdx+1+len(aFrac)]
+			}
+		}
 	}
 
 	return a, b
