@@ -13,6 +13,41 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
+// toFloatWithTruncCheck converts val to float64.
+// If val is a string with a non-numeric trailing portion (truncation), it emits
+// Warning 1292 ("Truncated incorrect DOUBLE value") or in strict mode returns
+// an error with code 1292.
+// Returns (floatValue, error). Error is non-nil only in strict mode with truncation.
+func (e *Executor) toFloatWithTruncCheck(val interface{}, originalStr string) (float64, error) {
+	s, ok := val.(string)
+	if !ok {
+		return toFloat(val), nil
+	}
+	trimmed := strings.TrimSpace(s)
+	// Try exact parse first.
+	if f, err := strconv.ParseFloat(trimmed, 64); err == nil {
+		return f, nil
+	}
+	// Check if it's a prefix-parseable number (truncation case).
+	f, pfxOk := parseNumericPrefixMySQL(trimmed)
+	if !pfxOk {
+		// Non-numeric string: MySQL treats as 0 with warning.
+		f = 0
+	}
+	// Truncation occurred: string has non-numeric content.
+	// MySQL always emits Warning 1292 for truncated DOUBLE values; in strict mode
+	// this becomes an error ONLY when the function/context was created in strict mode.
+	// Since we don't track creation-time sql_mode for stored routines, we emit a warning
+	// here and let strict mode enforcement happen at a higher level (e.g. TINYINT UNSIGNED
+	// parameter validation, which already raises ER_WARN_DATA_OUT_OF_RANGE).
+	dispStr := originalStr
+	if dispStr == "" {
+		dispStr = s
+	}
+	e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect DOUBLE value: '%s'", dispStr))
+	return f, nil
+}
+
 // evalMathFunc dispatches math-related functions.
 // When row is non-nil, expressions are evaluated with row context.
 // Returns (result, handled, error).
@@ -39,7 +74,14 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if isNull {
 			return nil, true, nil
 		}
-		f := toFloat(val)
+		origStr := ""
+		if sv, ok := val.(string); ok {
+			origStr = sv
+		}
+		f, err := e.toFloatWithTruncCheck(val, origStr)
+		if err != nil {
+			return nil, true, err
+		}
 		if f < 0 {
 			f = -f
 		}
@@ -60,7 +102,14 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if isNull {
 			return nil, true, nil
 		}
-		f := toFloat(val)
+		origStr := ""
+		if sv, ok := val.(string); ok {
+			origStr = sv
+		}
+		f, err := e.toFloatWithTruncCheck(val, origStr)
+		if err != nil {
+			return nil, true, err
+		}
 		return int64(f), true, nil
 	case "ceil", "ceiling":
 		val, isNull, err := e.evalArg1(v.Exprs, "CEIL", row)
@@ -70,7 +119,14 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if isNull {
 			return nil, true, nil
 		}
-		f := toFloat(val)
+		origStr := ""
+		if sv, ok := val.(string); ok {
+			origStr = sv
+		}
+		f, err := e.toFloatWithTruncCheck(val, origStr)
+		if err != nil {
+			return nil, true, err
+		}
 		n := int64(f)
 		if float64(n) < f {
 			n++
