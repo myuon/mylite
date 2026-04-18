@@ -1036,6 +1036,25 @@ func (e *Executor) callProcedureByNameInDB(dbName string, procName string, argSt
 		}
 	}
 
+	// In strict mode, validate IN/INOUT parameter values against their declared types.
+	// Only validate numeric (int64/float64/uint64) values - string values may be
+	// unevaluated expression strings (e.g. "f2()") that can't be range-checked here.
+	if e.isStrictMode() {
+		for _, param := range proc.Params {
+			if param.Mode == "IN" || param.Mode == "INOUT" {
+				if val, ok := paramVars[param.Name]; ok && param.Type != "" {
+					switch val.(type) {
+					case int64, float64, uint64:
+						if err := checkIntegerStrict(param.Type, param.Name, val); err != nil {
+							return nil, mysqlError(1264, "22003",
+								fmt.Sprintf("Out of range value for column '%s' at row 1", param.Name))
+						}
+					}
+				}
+			}
+		}
+	}
+
 	allResultSets := make([]*Result, 0)
 	ctx := &routineContext{
 		localVars:     make(map[string]interface{}),
@@ -1163,6 +1182,25 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 					paramVars[param.Name] = nil
 				}
 				// Note: INOUT and OUT with literal args have no writeback target
+			}
+		}
+	}
+
+	// In strict mode, validate IN/INOUT parameter values against their declared types.
+	// Only validate numeric (int64/float64/uint64) values - string values may be
+	// unevaluated expression strings (e.g. "f2()") that can't be range-checked here.
+	if e.isStrictMode() {
+		for _, param := range proc.Params {
+			if param.Mode == "IN" || param.Mode == "INOUT" {
+				if val, ok := paramVars[param.Name]; ok && param.Type != "" {
+					switch val.(type) {
+					case int64, float64, uint64:
+						if err := checkIntegerStrict(param.Type, param.Name, val); err != nil {
+							return nil, mysqlError(1264, "22003",
+								fmt.Sprintf("Out of range value for column '%s' at row 1", param.Name))
+						}
+					}
+				}
 			}
 		}
 	}
@@ -1577,6 +1615,15 @@ func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Exp
 			}
 			if evalErr != nil {
 				return nil, evalErr
+			}
+			// In strict mode, validate parameter value against its declared type.
+			// MySQL raises ER_WARN_DATA_OUT_OF_RANGE (1264, SQLSTATE 22003) when a value
+			// is out of range for the parameter type (e.g., -25 for TINYINT UNSIGNED).
+			if e.isStrictMode() && param.Type != "" {
+				if err := checkIntegerStrict(param.Type, param.Name, val); err != nil {
+					return nil, mysqlError(1264, "22003",
+						fmt.Sprintf("Out of range value for column '%s' at row 1", param.Name))
+				}
 			}
 			paramVars[param.Name] = val
 		}
