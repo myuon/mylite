@@ -4174,6 +4174,16 @@ func (e *Executor) inferColumnType(selectSQL, colName string) string {
 // from a SELECT SQL string. Falls back to type-only inference when full attrs aren't available.
 func (e *Executor) inferColumnAttrs(selectSQL, colName string) columnAttrs {
 	attrs := columnAttrs{nullable: true}
+	// Preprocess ODBC escape sequences before parsing (e.g. {d'...'} → DATE '...')
+	// Also map ODBC colName to its rewritten form for expression matching.
+	rewrittenColName := colName
+	if rewritten, hasODBC := rewriteODBCEscapes(selectSQL); hasODBC {
+		selectSQL = rewritten
+		// Also rewrite the colName so that it matches the rewritten expression
+		if rewrittenCol, hasODBCCol := rewriteODBCEscapes(colName); hasODBCCol {
+			rewrittenColName = rewrittenCol
+		}
+	}
 	stmt, err := e.parser().Parse(selectSQL)
 	if err != nil {
 		return attrs
@@ -4219,22 +4229,33 @@ func (e *Executor) inferColumnAttrs(selectSQL, colName string) columnAttrs {
 			alias = ae.As.String()
 		}
 		if alias != "" {
-			if !strings.EqualFold(alias, colName) {
+			if !strings.EqualFold(alias, colName) && !strings.EqualFold(alias, rewrittenColName) {
 				continue
 			}
 		} else {
 			if col, ok2 := ae.Expr.(*sqlparser.ColName); ok2 {
-				if !strings.EqualFold(col.Name.String(), colName) {
+				if !strings.EqualFold(col.Name.String(), colName) && !strings.EqualFold(col.Name.String(), rewrittenColName) {
 					continue
 				}
 			} else {
 				exprStr := normalizeCharsetIntroducersForMatch(sqlparser.String(ae.Expr))
 				normalizedColName := normalizeCharsetIntroducersForMatch(colName)
+				normalizedRewrittenColName := normalizeCharsetIntroducersForMatch(rewrittenColName)
 				// Normalize whitespace for comparison: sqlparser.String() may collapse or
 				// add spaces differently (e.g., "a, b" vs "a,b"). Strip all whitespace.
 				exprStrNorm := strings.ReplaceAll(strings.ToLower(exprStr), " ", "")
 				colNameNorm := strings.ReplaceAll(strings.ToLower(normalizedColName), " ", "")
-				if exprStrNorm != colNameNorm {
+				rewrittenColNameNorm := strings.ReplaceAll(strings.ToLower(normalizedRewrittenColName), " ", "")
+				// For string literals, also try matching the unquoted value against colName.
+				// (e.g. colName "2001-01-01 10:10:10" matches expr "'2001-01-01 10:10:10'")
+				strLitMatch := false
+				if lit, ok3 := ae.Expr.(*sqlparser.Literal); ok3 && lit.Type == sqlparser.StrVal {
+					litNorm := strings.ReplaceAll(strings.ToLower(lit.Val), " ", "")
+					if litNorm == colNameNorm {
+						strLitMatch = true
+					}
+				}
+				if exprStrNorm != colNameNorm && exprStrNorm != rewrittenColNameNorm && !strLitMatch {
 					continue
 				}
 			}
@@ -4695,8 +4716,32 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 		case sqlparser.DateVal:
 			return "date"
 		case sqlparser.TimeVal:
+			// Determine fractional seconds precision from the literal value
+			if dot := strings.LastIndex(v.Val, "."); dot >= 0 {
+				frac := strings.TrimRight(v.Val[dot+1:], "0")
+				if len(frac) == 0 {
+					return "time"
+				}
+				// Use full fractional length (not stripped of trailing zeros)
+				n := len(v.Val) - dot - 1
+				if n > 6 {
+					n = 6
+				}
+				return fmt.Sprintf("time(%d)", n)
+			}
 			return "time"
 		case sqlparser.TimestampVal:
+			// Determine fractional seconds precision from the literal
+			if spIdx := strings.Index(v.Val, " "); spIdx >= 0 {
+				timePart := v.Val[spIdx+1:]
+				if dot := strings.LastIndex(timePart, "."); dot >= 0 {
+					frac := timePart[dot+1:]
+					n := len(frac)
+					if n > 0 && n <= 6 {
+						return fmt.Sprintf("datetime(%d)", n)
+					}
+				}
+			}
 			return "datetime"
 		case sqlparser.HexVal:
 			// MySQL: x'...' hex literals
@@ -5147,15 +5192,43 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 			attrs.hasDefault = true
 			attrs.defaultVal = "0000-00-00"
 		case sqlparser.TimeVal:
-			attrs.colType = "time"
+			// Determine fractional seconds precision from the literal value
+			colType := "time"
+			defaultVal := "00:00:00"
+			if dot := strings.LastIndex(v.Val, "."); dot >= 0 {
+				frac := v.Val[dot+1:]
+				// Only count non-trailing-zero digits for precision
+				n := len(frac)
+				if n > 0 {
+					// Use full length including trailing zeros
+					if n > 6 {
+						n = 6
+					}
+					colType = fmt.Sprintf("time(%d)", n)
+					defaultVal = "00:00:00." + strings.Repeat("0", n)
+				}
+			}
+			attrs.colType = colType
 			attrs.nullable = false
 			attrs.hasDefault = true
-			attrs.defaultVal = "00:00:00"
+			attrs.defaultVal = defaultVal
 		case sqlparser.TimestampVal:
-			attrs.colType = "datetime"
+			// Determine fractional seconds precision from the literal value
+			colType := "datetime"
+			if spIdx := strings.Index(v.Val, " "); spIdx >= 0 {
+				timePart := v.Val[spIdx+1:]
+				if dot := strings.LastIndex(timePart, "."); dot >= 0 {
+					frac := timePart[dot+1:]
+					n := len(frac)
+					if n > 0 && n <= 6 {
+						colType = fmt.Sprintf("datetime(%d)", n)
+					}
+				}
+			}
+			attrs.colType = colType
 			attrs.nullable = false
-			attrs.hasDefault = true
-			attrs.defaultVal = "0000-00-00 00:00:00"
+			// MySQL TIMESTAMP/DATETIME literal columns don't show an explicit DEFAULT in SHOW CREATE TABLE
+			attrs.hasDefault = false
 		case sqlparser.IntVal:
 			// Integer literals produce NOT NULL DEFAULT '0' columns
 			attrs.nullable = false
@@ -5166,6 +5239,18 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 			attrs.nullable = false
 			attrs.hasDefault = true
 			attrs.defaultVal = "0"
+		case sqlparser.StrVal:
+			// String literals produce NOT NULL DEFAULT '' varchar columns.
+			// The charset comes from the current connection charset (character_set_client).
+			n := len([]rune(v.Val))
+			attrs.colType = fmt.Sprintf("varchar(%d)", n)
+			attrs.nullable = false
+			attrs.hasDefault = true
+			attrs.defaultVal = ""
+			// Inherit the current connection charset for string literal columns.
+			if cs, ok := e.getSysVar("character_set_client"); ok && cs != "" && cs != "utf8mb4" && cs != "utf8" {
+				attrs.charset = cs
+			}
 		}
 	case *sqlparser.IntroducerExpr:
 		// _charset'string' — charset comes from the introducer

@@ -1507,22 +1507,76 @@ func rewriteODBCEscapes(query string) (string, bool) {
 			// {fn func_name(args)} → func_name(args)
 			result.WriteString(inner)
 		case "d", "date":
-			// {d 'value'} or { date "value" } → DATE 'value' → just output the value
+			// {d 'value'} or { date "value" } → DATE 'value' (when valid date) or 'value' (when not)
 			// The inner is the date string (possibly quoted)
 			if inner == "" {
 				result.WriteString("NULL")
 			} else {
 				// inner might be "1997-10-20" or '1997-10-20'
-				result.WriteString(inner)
+				// Only use DATE literal syntax when the value is a proper date (no time component).
+				// Strip quotes to check the value.
+				unquoted := inner
+				if (strings.HasPrefix(inner, "'") && strings.HasSuffix(inner, "'")) ||
+					(strings.HasPrefix(inner, "\"") && strings.HasSuffix(inner, "\"")) {
+					unquoted = inner[1 : len(inner)-1]
+				}
+				// A proper date has format YYYY-MM-DD (10 chars, no time component)
+				isProperDate := len(unquoted) == 10 && unquoted[4] == '-' && unquoted[7] == '-'
+				if isProperDate {
+					result.WriteString("DATE ")
+					result.WriteString(inner)
+				} else {
+					// Has time component or is in a different format — output as string literal
+					result.WriteString(inner)
+				}
 			}
 		case "t", "time":
-			// {t 'value'} → TIME 'value'
-			result.WriteString("TIME ")
-			result.WriteString(inner)
+			// {t 'value'} → TIME 'value' when the value looks like a valid time format.
+			// Otherwise, treat as a plain string literal.
+			if inner == "" {
+				result.WriteString("NULL")
+			} else {
+				unquoted := inner
+				if (strings.HasPrefix(inner, "'") && strings.HasSuffix(inner, "'")) ||
+					(strings.HasPrefix(inner, "\"") && strings.HasSuffix(inner, "\"")) {
+					unquoted = inner[1 : len(inner)-1]
+				}
+				// A valid time has only digits, ':', '.', ' ', and optionally a leading '-'
+				isTimeFormat := true
+				for _, c := range strings.TrimPrefix(unquoted, "-") {
+					if !((c >= '0' && c <= '9') || c == ':' || c == '.' || c == ' ') {
+						isTimeFormat = false
+						break
+					}
+				}
+				if isTimeFormat {
+					result.WriteString("TIME ")
+					result.WriteString(inner)
+				} else {
+					// Not a valid time format — output as string literal
+					result.WriteString(inner)
+				}
+			}
 		case "ts", "timestamp":
-			// {ts 'value'} → TIMESTAMP 'value'
-			result.WriteString("TIMESTAMP ")
-			result.WriteString(inner)
+			// {ts 'value'} → TIMESTAMP 'value' when it looks like a complete datetime (has space).
+			// Otherwise, treat as a plain string literal.
+			if inner == "" {
+				result.WriteString("NULL")
+			} else {
+				unquoted := inner
+				if (strings.HasPrefix(inner, "'") && strings.HasSuffix(inner, "'")) ||
+					(strings.HasPrefix(inner, "\"") && strings.HasSuffix(inner, "\"")) {
+					unquoted = inner[1 : len(inner)-1]
+				}
+				// A valid timestamp must have a space (date + time separator)
+				if strings.Contains(unquoted, " ") {
+					result.WriteString("TIMESTAMP ")
+					result.WriteString(inner)
+				} else {
+					// Not a complete timestamp — output as string literal
+					result.WriteString(inner)
+				}
+			}
 		default:
 			// Unknown ODBC escape - output as-is
 			result.WriteString(query[i : k+1])
