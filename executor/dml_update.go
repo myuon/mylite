@@ -507,6 +507,26 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 										rowNum := i + 1
 										return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", col.Name, rowNum))
 									}
+								} else {
+									// numericTypeRange returns false for bare FLOAT/DOUBLE/REAL.
+									// Handle these manually: FLOAT max is float32 range, DOUBLE/REAL max is float64 range.
+									colUpperBase := colUpper
+									if idx := strings.Index(colUpperBase, "("); idx >= 0 {
+										colUpperBase = colUpperBase[:idx]
+									}
+									colUpperBase = strings.TrimSpace(colUpperBase)
+									isUnsigned := strings.Contains(colUpper, "UNSIGNED") || strings.Contains(colUpper, "ZEROFILL")
+									outOfRange := false
+									if colUpperBase == "FLOAT" {
+										f32 := float32(f)
+										outOfRange = math.IsInf(float64(f32), 0) || (cls == "overflow_pos") || (cls == "overflow_neg")
+									} else if colUpperBase == "DOUBLE" || colUpperBase == "REAL" {
+										outOfRange = math.IsInf(f, 0) || (cls == "overflow_pos") || (cls == "overflow_neg")
+									}
+									if outOfRange || (isUnsigned && (f < 0 || cls == "overflow_neg")) {
+										rowNum := i + 1
+										return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", col.Name, rowNum))
+									}
 								}
 							}
 						}

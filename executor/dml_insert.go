@@ -978,32 +978,44 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							isDecType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || colUpper == "REAL" || strings.HasPrefix(colUpper, "REAL ")
 							if isDecType {
 								// In strict mode, string values that cannot be parsed as a valid
-								// float are "Incorrect decimal value" (1366), not "Out of range" (1264).
+								// float need special handling depending on the column type:
+								//   - DECIMAL/NUMERIC: "Incorrect decimal value" error 1366 (HY000)
+								//   - FLOAT/DOUBLE/REAL: "Data truncated" error 1265 (01000)
 								// This check must happen BEFORE checkDecimalRange which calls toFloat()
 								// and may treat the value as in-range.
+								isDecimalOrNumeric := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "NUMERIC")
+								isFloatType := !isDecimalOrNumeric && (strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || strings.Contains(colUpper, "REAL"))
 								if sv, isStr := v.(string); isStr {
 									svTrimmed := strings.TrimSpace(sv)
 									if _, pfErr := strconv.ParseFloat(svTrimmed, 64); pfErr != nil {
 										// String doesn't parse as a valid float.
-										// In IGNORE mode: if there is a valid numeric prefix, truncate (Note 1265);
-										// otherwise emit Warning 1366 and store 0.
 										if bool(stmt.Ignore) {
 											if prefix2, ok2 := extractNumericPrefix(svTrimmed); ok2 && prefix2 != svTrimmed {
 												e.addWarning("Note", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 												v = prefix2
-												// fall through to let coerceColumnValueForWrite format it
-											} else {
+												// fall through to coerceColumnValueForWrite for proper formatting
+											} else if isDecimalOrNumeric {
 												e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row 1", sv, col.Name))
 												v = float64(0)
+											} else {
+												// FLOAT/DOUBLE/REAL: Warning 1265 (Data truncated)
+												e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+												v = float64(0)
 											}
-										} else {
+										} else if isDecimalOrNumeric {
 											return nil, mysqlError(1366, "HY000", fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row 1", sv, col.Name))
+										} else if isFloatType {
+											// FLOAT/DOUBLE/REAL: Data truncated error 1265 / 01000
+											return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 										}
-										// Skip further decimal validation since we've handled it
+										// Skip further decimal range validation since we've handled it.
+										// Run coerceColumnValueForWrite for proper formatting then break.
+										v = e.coerceColumnValueForWrite(col.Type, v)
 										row[colNames[i]] = v
 										break
 									}
 								}
+								_ = isFloatType
 								if strings.Contains(colUpper, "UNSIGNED") || strings.Contains(colUpper, "ZEROFILL") {
 									f := toFloat(v)
 									if f < 0 {
@@ -1020,6 +1032,32 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 										e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
 									} else {
 										return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+									}
+								}
+								// Bare FLOAT/DOUBLE/REAL: check if value exceeds float32/float64 range in strict mode.
+								// float64(float32(x)) returns ±Inf when x exceeds float32 range for FLOAT columns.
+								colUpperBase := colUpper
+								if idx := strings.Index(colUpperBase, "("); idx >= 0 {
+									colUpperBase = colUpperBase[:idx]
+								}
+								colUpperBase = strings.TrimSpace(colUpperBase)
+								if colUpperBase == "FLOAT" {
+									f := toFloat(v)
+									if f32 := float32(f); math.IsInf(float64(f32), 0) {
+										if bool(stmt.Ignore) {
+											e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+										} else {
+											return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+										}
+									}
+								} else if colUpperBase == "DOUBLE" || colUpperBase == "REAL" {
+									f := toFloat(v)
+									if math.IsInf(f, 0) {
+										if bool(stmt.Ignore) {
+											e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+										} else {
+											return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+										}
 									}
 								}
 							}
