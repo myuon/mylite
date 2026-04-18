@@ -3695,7 +3695,15 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 			}
 			return applyZerofillStr(fmt.Sprintf("%.*f", d, f))
 		}
-		// FLOAT/DOUBLE/REAL(M,D): round to d decimal places (banker's rounding).
+		// FLOAT/DOUBLE/REAL(M,D): round to d decimal places.
+		// For d <= 2, use fmt.Sprintf directly on the float64 value, which correctly
+		// handles tie-breaking (e.g. 999.985 → 999.99) by using the full float64 binary
+		// representation rather than scaled multiplication which loses precision.
+		// For d > 2, use banker's rounding (RoundToEven) which matches MySQL behavior
+		// for values like FLOAT(5,4) with -9.12345 → -9.1234 (RoundToEven(-91234.5) = -91234).
+		if d <= 2 {
+			return fmt.Sprintf("%.*f", d, f)
+		}
 		f = roundToEvenScale(f, d)
 		if prefix == "float" {
 			f = float64(float32(f))
