@@ -103,6 +103,7 @@ type ProcedureDef struct {
 	Body        []string // SQL statements in the procedure body
 	BodyText    string   // original body text (begin...end or full body) for information_schema
 	OriginalSQL string   // original CREATE PROCEDURE statement
+	SqlMode     string   // sql_mode at procedure creation time
 }
 
 // ProcParam represents a parameter in a stored procedure.
@@ -121,6 +122,7 @@ type FunctionDef struct {
 	BodyText      string   // original body text for information_schema
 	Deterministic bool     // true if declared DETERMINISTIC
 	OriginalSQL   string   // original CREATE FUNCTION statement
+	SqlMode       string   // sql_mode at function creation time
 }
 
 // Database represents a database containing tables.

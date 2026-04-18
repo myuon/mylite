@@ -770,12 +770,17 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 		bodyText = bodyStr
 	}
 
+	currentSqlMode := ""
+	if v, ok := e.getSysVar("sql_mode"); ok {
+		currentSqlMode = v
+	}
 	procDef := &catalog.ProcedureDef{
 		Name:        procName,
 		Params:      params,
 		Body:        bodyStmts,
 		BodyText:    bodyText,
 		OriginalSQL: query,
+		SqlMode:     currentSqlMode,
 	}
 	db.CreateProcedure(procDef)
 
@@ -1068,10 +1073,16 @@ func (e *Executor) callProcedureByNameInDB(dbName string, procName string, argSt
 		ctx.localVars[k] = v
 	}
 
+	// Track whether this procedure was created in strict mode.
+	procIsStrict := isStrictSqlMode(proc.SqlMode)
+	savedInsideStrictRoutineProc := e.insideStrictRoutine
+	e.insideStrictRoutine = procIsStrict
+
 	// Enter stored routine — internal Execute calls should not count as client Questions.
 	e.routineDepth++
 	bodyResult, err := e.execRoutineBodyWithContext(proc.Body, ctx)
 	e.routineDepth--
+	e.insideStrictRoutine = savedInsideStrictRoutineProc
 	if err != nil {
 		// SIGNAL with SQLSTATE class '01' (warning) should produce a warning, not an error.
 		var sigErr *signalError
@@ -1219,10 +1230,17 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 	for k, v := range paramVars {
 		ctx.localVars[k] = v
 	}
+
+	// Track whether this procedure was created in strict mode.
+	procIsStrict2 := isStrictSqlMode(proc.SqlMode)
+	savedInsideStrictRoutineProc2 := e.insideStrictRoutine
+	e.insideStrictRoutine = procIsStrict2
+
 	// Enter stored routine — internal Execute calls should not count as client Questions.
 	e.routineDepth++
 	bodyResult, err := e.execRoutineBodyWithContext(proc.Body, ctx)
 	e.routineDepth--
+	e.insideStrictRoutine = savedInsideStrictRoutineProc2
 	if err != nil {
 		// SIGNAL with SQLSTATE class '01' (warning) should produce a warning, not an error.
 		var sigErr *signalError
@@ -1492,12 +1510,17 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 		bodyStmts = []string{returnExpr}
 	}
 
+	funcSqlMode := ""
+	if v, ok := e.getSysVar("sql_mode"); ok {
+		funcSqlMode = v
+	}
 	funcDef := &catalog.FunctionDef{
 		Name:        funcName,
 		Params:      params,
 		ReturnType:  returnType,
 		Body:        bodyStmts,
 		OriginalSQL: query,
+		SqlMode:     funcSqlMode,
 	}
 	db.CreateFunction(funcDef)
 
@@ -1645,11 +1668,18 @@ func (e *Executor) callUserDefinedFunction(name string, argExprs []sqlparser.Exp
 	savedQuery := e.currentQuery
 	savedDB := e.CurrentDB
 	e.CurrentDB = dbName
+	// Track whether this function was created in strict mode.
+	// MySQL executes stored function bodies with the function's creation-time sql_mode
+	// determining whether type conversion errors are promoted to hard errors.
+	fnIsStrict := isStrictSqlMode(fn.SqlMode)
+	savedInsideStrictRoutine := e.insideStrictRoutine
+	e.insideStrictRoutine = fnIsStrict
 	defer func() {
 		e.routineDepth--
 		e.functionOrTriggerDepth--
 		e.currentQuery = savedQuery
 		e.CurrentDB = savedDB
+		e.insideStrictRoutine = savedInsideStrictRoutine
 	}()
 	if e.routineDepth > 256 {
 		return nil, fmt.Errorf("Error 1456 (HY000): Recursive stored functions and triggers are not allowed")
@@ -2239,16 +2269,42 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 			if eqIdx >= 0 {
 				varName := strings.TrimSpace(setPart[:eqIdx])
 				valStr := strings.TrimSpace(setPart[eqIdx+1:])
+				// User variables (@var) have no declared type, so string-to-number truncation
+				// is only a warning (not an error) even inside strict-mode stored functions.
+				// MySQL only raises ERROR 22007 for RETURN expressions or typed column storage.
+				// Temporarily clear insideStrictRoutine for user variable evaluations.
+				if strings.HasPrefix(varName, "@") && !strings.HasPrefix(varName, "@@") {
+					savedISR := e.insideStrictRoutine
+					e.insideStrictRoutine = false
+					val, evalErr := e.evaluateExprWithVars(valStr, localVars)
+					e.insideStrictRoutine = savedISR
+					if evalErr != nil {
+						// Propagate errors from called functions (e.g. fn2() returning ERROR 22007).
+						// The insideStrictRoutine flag is restored so the called function's behavior
+						// is determined by its own SqlMode, not the caller's context.
+						resolvedSQL := e.substituteLocalVars(stmtStr, localVars)
+						savedISR2 := e.insideStrictRoutine
+						e.insideStrictRoutine = false
+						_, execErr := e.Execute(resolvedSQL)
+						e.insideStrictRoutine = savedISR2
+						if execErr != nil {
+							return nil, execErr
+						}
+					} else {
+						if e.userVars == nil {
+							e.userVars = make(map[string]interface{})
+						}
+						e.userVars[strings.TrimPrefix(varName, "@")] = val
+					}
+					continue
+				}
 				// Evaluate expression
 				val, err := e.evaluateExprWithVars(valStr, localVars)
 				if err != nil {
-					// Fall back to Execute; propagate errors for system variable assignments.
+					// Fall back to Execute; propagate all errors.
 					resolvedSQL := e.substituteLocalVars(stmtStr, localVars)
 					if _, execErr := e.Execute(resolvedSQL); execErr != nil {
-						if strings.HasPrefix(varName, "@@") {
-							return nil, execErr
-						}
-						// For local variables, silently ignore execute errors (best-effort fallback)
+						return nil, execErr
 					}
 				} else {
 					// User variables (@var) are session-scoped and must persist outside the routine.

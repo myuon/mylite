@@ -35,14 +35,14 @@ func (e *Executor) toFloatWithTruncCheck(val interface{}, originalStr string) (f
 		f = 0
 	}
 	// Truncation occurred: string has non-numeric content.
-	// MySQL always emits Warning 1292 for truncated DOUBLE values; in strict mode
-	// this becomes an error ONLY when the function/context was created in strict mode.
-	// Since we don't track creation-time sql_mode for stored routines, we emit a warning
-	// here and let strict mode enforcement happen at a higher level (e.g. TINYINT UNSIGNED
-	// parameter validation, which already raises ER_WARN_DATA_OUT_OF_RANGE).
+	// MySQL promotes this from a warning to an error inside stored routines that were
+	// created in STRICT mode. Outside stored routines, it's always a warning.
 	dispStr := originalStr
 	if dispStr == "" {
 		dispStr = s
+	}
+	if e.insideStrictRoutine {
+		return f, fmt.Errorf("ERROR 22007 (22007): Truncated incorrect DOUBLE value: '%s'", dispStr)
 	}
 	e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect DOUBLE value: '%s'", dispStr))
 	return f, nil

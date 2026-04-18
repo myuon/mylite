@@ -493,6 +493,10 @@ type Executor struct {
 	// When true, CONCAT (and similar) should return an error if the result exceeds max_allowed_packet,
 	// rather than returning NULL with a warning (which is correct for SELECT/INSERT context).
 	inUpdateSetContext bool
+	// insideStrictRoutine is set to true when executing inside a stored function or procedure
+	// that was created with a strict sql_mode (STRICT_TRANS_TABLES, STRICT_ALL_TABLES, or TRADITIONAL).
+	// When true, type conversion warnings (like 1292 Truncated DOUBLE value) become hard errors.
+	insideStrictRoutine bool
 }
 
 // Warning represents a MySQL warning.
@@ -3965,6 +3969,14 @@ func (e *Executor) isStrictMode() bool {
 	return strings.Contains(e.sqlMode, "TRADITIONAL") ||
 		strings.Contains(e.sqlMode, "STRICT_TRANS_TABLES") ||
 		strings.Contains(e.sqlMode, "STRICT_ALL_TABLES")
+}
+
+// isStrictSqlMode returns true if the given sql_mode string includes strict mode flags.
+// Used to check creation-time sql_mode of stored routines.
+func isStrictSqlMode(sqlMode string) bool {
+	return strings.Contains(sqlMode, "TRADITIONAL") ||
+		strings.Contains(sqlMode, "STRICT_TRANS_TABLES") ||
+		strings.Contains(sqlMode, "STRICT_ALL_TABLES")
 }
 
 // isTraditionalMode returns true when sql_mode includes TRADITIONAL or STRICT_ALL_TABLES.

@@ -22,9 +22,27 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		// Handle user variables (@var)
 		if expr.Var.Scope == sqlparser.VariableScope {
 			varName := expr.Var.Name.String()
+			// User variables have no declared type, so string-to-number truncation is
+			// only a warning (not an error) even inside strict-mode stored functions.
+			// MySQL only raises ERROR 22007 for expressions used as RETURN values or
+			// stored in typed columns, not for SET @user_var = expr.
+			savedInsideStrictRoutine := e.insideStrictRoutine
+			e.insideStrictRoutine = false
 			val, err := e.evalExpr(expr.Expr)
+			e.insideStrictRoutine = savedInsideStrictRoutine
 			if err != nil {
-				// Fallback: use the string representation
+				// Propagate real MySQL runtime errors from function calls (e.g. ERROR 22007
+				// raised by a strict-mode stored function's RETURN statement).
+				// The insideStrictRoutine flag was cleared above so that direct conversions
+				// like floor('1a') only generate a warning. But if the called function itself
+				// raises an error (e.g. fn2() returns ERROR 22007), propagate it.
+				if strings.Contains(err.Error(), "ERROR ") &&
+					!strings.Contains(err.Error(), "does not exist") &&
+					!strings.Contains(err.Error(), "not found") &&
+					!strings.Contains(err.Error(), "50001") {
+					return nil, err
+				}
+				// Fallback: use the string representation for non-MySQL or "not found" errors
 				val = strings.Trim(sqlparser.String(expr.Expr), "'\"")
 			}
 			// Unwrap SysVarDouble to plain float64 so user variables
