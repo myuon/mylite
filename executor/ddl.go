@@ -4655,13 +4655,17 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 		case sqlparser.IntVal:
 			n, err := strconv.ParseUint(v.Val, 10, 64)
 			if err == nil {
-				if n > 4294967295 { // > UINT32_MAX: needs bigint
-					return "bigint unsigned"
+				if n > 4294967295 { // > UINT32_MAX: needs bigint unsigned
+					// Display width = number of digits in the value
+					digits := len(v.Val)
+					return fmt.Sprintf("bigint(%d) unsigned", digits)
 				} else if n > 2147483647 { // > INT32_MAX: needs int unsigned
 					return "int unsigned"
 				}
 			}
-			return "int"
+			// Display width = number of digits in the literal
+			digits := len(v.Val)
+			return fmt.Sprintf("int(%d)", digits)
 		case sqlparser.FloatVal:
 			return "double"
 		case sqlparser.DecimalVal:
@@ -4892,8 +4896,42 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			// TIME(expr) extracts the time part and returns time(6)
 			return "time(6)"
 		case "sec_to_time":
-			// SEC_TO_TIME(seconds) returns time(6)
-			return "time(6)"
+			// SEC_TO_TIME(seconds) returns time(N) where N is the fractional precision of the argument.
+			// For integer arguments: time. For decimal/float with D fractional digits: time(min(D,6)).
+			if len(v.Exprs) == 1 {
+				fsp := 0
+				if lit, ok := v.Exprs[0].(*sqlparser.Literal); ok {
+					switch lit.Type {
+					case sqlparser.DecimalVal:
+						if dot := strings.IndexByte(lit.Val, '.'); dot >= 0 {
+							fsp = len(lit.Val) - dot - 1
+						}
+					case sqlparser.FloatVal:
+						if dot := strings.IndexByte(lit.Val, '.'); dot >= 0 {
+							fsp = len(lit.Val) - dot - 1
+						}
+					}
+				} else {
+					// Non-literal argument: infer from type
+					argType := e.inferExprType(v.Exprs[0])
+					if strings.HasPrefix(argType, "decimal(") {
+						// Extract scale from decimal(M,D)
+						var m, d int
+						fmt.Sscanf(argType, "decimal(%d,%d)", &m, &d)
+						fsp = d
+					} else if argType == "double" || argType == "float" {
+						fsp = 6
+					}
+				}
+				if fsp > 6 {
+					fsp = 6
+				}
+				if fsp == 0 {
+					return "time"
+				}
+				return fmt.Sprintf("time(%d)", fsp)
+			}
+			return "time"
 		case "date_format":
 			// DATE_FORMAT(date, format) returns varchar(N); use a fixed width matching MySQL default
 			return "varchar(10)"
@@ -4956,12 +4994,55 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 		return "binary(0)"
 	case *sqlparser.ConvertExpr:
 		// CAST(x AS type) / CONVERT(x, type) — use the target type
-		return convertTypeToSQLType(v.Type)
+		ct := convertTypeToSQLType(v.Type)
+		// For CAST(x AS CHAR) with no length, infer varchar width from inner expression type.
+		if ct == "char(0)" {
+			ct = inferCastAsCharType(e.inferExprType(v.Expr))
+		}
+		return ct
 	case *sqlparser.CastExpr:
 		// CAST(x AS type) — use the target type
-		return convertTypeToSQLType(v.Type)
+		ct := convertTypeToSQLType(v.Type)
+		// For CAST(x AS CHAR) with no length, infer varchar width from inner expression type.
+		if ct == "char(0)" {
+			ct = inferCastAsCharType(e.inferExprType(v.Expr))
+		}
+		return ct
 	}
 	return ""
+}
+
+// inferCastAsCharType returns the appropriate varchar type for CAST(x AS CHAR) when no length
+// is specified, based on the display width of the inner expression type.
+func inferCastAsCharType(innerType string) string {
+	upperInner := strings.ToUpper(strings.TrimSpace(innerType))
+	switch {
+	case upperInner == "TIME":
+		return "varchar(10)"
+	case strings.HasPrefix(upperInner, "TIME("):
+		// TIME(N) display width: HH:MM:SS.ffffff = 8+1+N = 9+N, but MySQL uses 10+N-1... actually:
+		// time(0) = HH:MM:SS = 8, time(1) = HH:MM:SS.f = 10, time(6) = HH:MM:SS.ffffff = 15
+		// but for small N, MySQL rounds up. Use 10 for consistency when N==0, or 10+N for larger.
+		fsp := 0
+		fmt.Sscanf(upperInner, "TIME(%d)", &fsp)
+		if fsp == 0 {
+			return "varchar(10)"
+		}
+		return fmt.Sprintf("varchar(%d)", 9+fsp)
+	case upperInner == "DATE":
+		return "varchar(10)"
+	case upperInner == "DATETIME":
+		return "varchar(19)"
+	case strings.HasPrefix(upperInner, "DATETIME("):
+		fsp := 0
+		fmt.Sscanf(upperInner, "DATETIME(%d)", &fsp)
+		if fsp == 0 {
+			return "varchar(19)"
+		}
+		return fmt.Sprintf("varchar(%d)", 19+1+fsp)
+	default:
+		return "varchar(10)"
+	}
 }
 
 // convertTypeToSQLType converts a vitess ConvertType to a MySQL column type string.
@@ -5075,6 +5156,16 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 			attrs.nullable = false
 			attrs.hasDefault = true
 			attrs.defaultVal = "0000-00-00 00:00:00"
+		case sqlparser.IntVal:
+			// Integer literals produce NOT NULL DEFAULT '0' columns
+			attrs.nullable = false
+			attrs.hasDefault = true
+			attrs.defaultVal = "0"
+		case sqlparser.FloatVal, sqlparser.DecimalVal:
+			// Float/decimal literals produce NOT NULL DEFAULT '0' columns
+			attrs.nullable = false
+			attrs.hasDefault = true
+			attrs.defaultVal = "0"
 		}
 	case *sqlparser.IntroducerExpr:
 		// _charset'string' — charset comes from the introducer
