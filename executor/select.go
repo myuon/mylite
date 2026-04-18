@@ -3853,23 +3853,12 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 				groups = append(groups, group{key: key, rows: []storage.Row{row}})
 			}
 		}
-		// Move NULL groups to the front without changing the relative order of
-		// non-NULL groups. MySQL/InnoDB returns NULL groups first (index NULL values
-		// sort before non-NULL), but otherwise returns groups in processing order
-		// (which is determined by the storage scan order / hash bucket order).
-		// For indexed columns MySQL does sort by key value; for expressions the
-		// order is hash-processing order. We use insertion-encounter order for
-		// expressions as a reasonable approximation.
-		nullGroups := groups[:0:0]
-		nonNullGroups := groups[:0:0]
-		for _, g := range groups {
-			if g.key == "<nil>" || strings.HasPrefix(g.key, "<nil>\x00") {
-				nullGroups = append(nullGroups, g)
-			} else {
-				nonNullGroups = append(nonNullGroups, g)
-			}
-		}
-		groups = append(nullGroups, nonNullGroups...)
+		// Sort GROUP BY groups by key so that NULL rows appear before non-NULL rows,
+		// matching MySQL/InnoDB behavior where rows are returned in index/PK order.
+		// This applies both for regular GROUP BY and WITH ROLLUP.
+		sort.SliceStable(groups, func(i, j int) bool {
+			return compareGroupKeys(groups[i].key, groups[j].key) < 0
+		})
 	} else {
 		// No GROUP BY but has aggregates: treat all rows as one group
 		groups = []group{{key: "", rows: allRows}}
