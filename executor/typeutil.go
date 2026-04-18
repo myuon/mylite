@@ -725,6 +725,26 @@ func numericEqualForComparison(ls, rs string, origLeft, origRight interface{}) b
 		if ri, okR := parseStrictBigInt(rs); okR {
 			return li.Cmp(ri) == 0
 		}
+		// ls is an exact integer, rs is a decimal (has fractional part).
+		// Use exact big.Rat comparison to avoid float64 precision loss near
+		// int64/uint64 boundaries (e.g. 18446744073709551615 == 18446744073709551615.00001).
+		if strings.ContainsRune(rs, '.') {
+			rr := new(big.Rat)
+			if _, ok := rr.SetString(rs); ok {
+				lr := new(big.Rat).SetInt(li)
+				return lr.Cmp(rr) == 0
+			}
+		}
+	}
+	if ri, okR := parseStrictBigInt(rs); okR {
+		// rs is an exact integer, ls is a decimal (has fractional part).
+		if strings.ContainsRune(ls, '.') {
+			lr := new(big.Rat)
+			if _, ok := lr.SetString(ls); ok {
+				rr := new(big.Rat).SetInt(ri)
+				return lr.Cmp(rr) == 0
+			}
+		}
 	}
 
 	fl, errL := strconv.ParseFloat(ls, 64)

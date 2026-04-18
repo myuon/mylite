@@ -3,6 +3,7 @@ package executor
 import (
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"strconv"
 	"strings"
 
@@ -1391,6 +1392,22 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 			nextID++
 		}
 	} else {
+		// Check for "Impossible WHERE" due to out-of-range constant comparisons.
+		// This is needed for multi-table joins where MySQL's optimizer detects that
+		// a constant is out of range for a column type (e.g. TINYINT col = 128) and
+		// propagates through equality conditions to produce a single "Impossible WHERE" row.
+		if e.Storage != nil && len(allTableNames) > 1 && e.isWhereImpossibleDueToConstantOutOfRange(sel) {
+			result = append(result, explainSelectType{
+				id:         myID,
+				selectType: selectType,
+				table:      nil,
+				extra:      "Impossible WHERE",
+				rows:       nil,
+				filtered:   nil,
+				accessType: nil,
+			})
+			return result
+		}
 		for idx, tblName := range allTableNames {
 			var rowCount int64 = 1
 			tableIsEmpty := false
@@ -2685,6 +2702,209 @@ func (e *Executor) isImpossibleConstPKWhere(inner *sqlparser.Select) bool {
 		}
 	}
 	return true // No matching row found → impossible WHERE
+}
+
+// isWhereImpossibleDueToConstantOutOfRange returns true if the WHERE clause contains a
+// comparison that makes the condition trivially false due to a constant being out of range
+// for an integer column type. It handles constant propagation through equality chains:
+// e.g. "t1.i=t2.i AND t2.i=128" where t1.i is TINYINT makes t1.i=128 propagated, which is
+// impossible since 128 > TINYINT max (127).
+//
+// This is used to detect the "Impossible WHERE" case in EXPLAIN for multi-table queries.
+func (e *Executor) isWhereImpossibleDueToConstantOutOfRange(sel *sqlparser.Select) bool {
+	if sel.Where == nil {
+		return false
+	}
+
+	// Step 1: collect all AND-connected conditions from the WHERE
+	var conditions []sqlparser.Expr
+	collectAndConds := func(expr sqlparser.Expr, conds *[]sqlparser.Expr) {}
+	collectAndConds = func(expr sqlparser.Expr, conds *[]sqlparser.Expr) {
+		if andExpr, ok := expr.(*sqlparser.AndExpr); ok {
+			collectAndConds(andExpr.Left, conds)
+			collectAndConds(andExpr.Right, conds)
+		} else {
+			*conds = append(*conds, expr)
+		}
+	}
+	collectAndConds(sel.Where.Expr, &conditions)
+
+	// Step 2: build a map from column (table.col or col) → set of constants compared via =
+	// and a list of col=col equalities for propagation.
+	type colKey struct{ table, col string }
+	colConstants := make(map[colKey][]string) // col → list of integer constants it's equal to
+	var colEqualities [][2]colKey              // pairs of equal columns
+
+	getColKey := func(expr sqlparser.Expr) (colKey, bool) {
+		col, ok := expr.(*sqlparser.ColName)
+		if !ok {
+			return colKey{}, false
+		}
+		tbl := strings.ToLower(col.Qualifier.Name.String())
+		name := strings.ToLower(col.Name.String())
+		return colKey{tbl, name}, true
+	}
+
+	getIntLiteral := func(expr sqlparser.Expr) (string, bool) {
+		switch v := expr.(type) {
+		case *sqlparser.Literal:
+			if v.Type == sqlparser.IntVal {
+				return v.Val, true
+			}
+		case *sqlparser.UnaryExpr:
+			if v.Operator == sqlparser.UMinusOp {
+				if lit, ok := v.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.IntVal {
+					return "-" + lit.Val, true
+				}
+			}
+		}
+		return "", false
+	}
+
+	for _, cond := range conditions {
+		cmp, ok := cond.(*sqlparser.ComparisonExpr)
+		if !ok {
+			continue
+		}
+		if cmp.Operator != sqlparser.EqualOp {
+			continue
+		}
+		lk, lIsCol := getColKey(cmp.Left)
+		rk, rIsCol := getColKey(cmp.Right)
+		llit, lIsInt := getIntLiteral(cmp.Left)
+		rlit, rIsInt := getIntLiteral(cmp.Right)
+
+		if lIsCol && rIsInt {
+			colConstants[lk] = append(colConstants[lk], rlit)
+		} else if rIsCol && lIsInt {
+			colConstants[rk] = append(colConstants[rk], llit)
+		} else if lIsCol && rIsCol {
+			colEqualities = append(colEqualities, [2]colKey{lk, rk})
+		}
+	}
+
+	if len(colConstants) == 0 {
+		return false
+	}
+
+	// Step 3: propagate constants through equality chains (BFS/union-find style)
+	// Build adjacency list for col=col equalities
+	colNeighbors := make(map[colKey][]colKey)
+	for _, eq := range colEqualities {
+		colNeighbors[eq[0]] = append(colNeighbors[eq[0]], eq[1])
+		colNeighbors[eq[1]] = append(colNeighbors[eq[1]], eq[0])
+	}
+
+	// BFS to propagate constants to all connected columns
+	if len(colEqualities) > 0 {
+		visited := make(map[colKey]bool)
+		queue := make([]colKey, 0)
+		// Start from columns that already have constants
+		for k := range colConstants {
+			if !visited[k] {
+				visited[k] = true
+				queue = append(queue, k)
+			}
+		}
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			consts := colConstants[cur]
+			if len(consts) == 0 {
+				continue
+			}
+			for _, neighbor := range colNeighbors[cur] {
+				// Propagate constants to neighbor
+				colConstants[neighbor] = append(colConstants[neighbor], consts...)
+				if !visited[neighbor] {
+					visited[neighbor] = true
+					queue = append(queue, neighbor)
+				}
+			}
+		}
+	}
+
+	// Step 4: for each column with constants, check if any constant is out of range
+	dbName := e.CurrentDB
+	if dbName == "" {
+		dbName = "test"
+	}
+	for k, consts := range colConstants {
+		if len(consts) == 0 {
+			continue
+		}
+		// Look up table to find column type
+		// k.table may be empty (unqualified column), try all tables in FROM
+		var colType string
+		tryTable := func(tblName string) bool {
+			tbl, err := e.Storage.GetTable(dbName, tblName)
+			if err != nil || tbl.Def == nil {
+				return false
+			}
+			ct := tbl.Def.ColType(k.col)
+			if ct == "" {
+				return false
+			}
+			colType = ct
+			return true
+		}
+
+		if k.table != "" {
+			tryTable(k.table)
+		} else {
+			// Try all tables in FROM
+			for _, te := range sel.From {
+				for _, tn := range e.extractAllTableNames(te) {
+					if tryTable(tn) {
+						break
+					}
+				}
+			}
+		}
+
+		if colType == "" {
+			continue
+		}
+
+		// Check if any constant is out of range for this column type
+		upper := strings.ToUpper(strings.TrimSpace(colType))
+		baseType := upper
+		if idx := strings.Index(baseType, "("); idx >= 0 {
+			baseType = baseType[:idx]
+		}
+		isUnsigned := strings.Contains(upper, "UNSIGNED")
+		baseType = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(baseType, "UNSIGNED", ""), "ZEROFILL", ""))
+		baseType = strings.TrimSpace(baseType)
+
+		rng, isIntType := intTypeRanges[baseType]
+		if !isIntType {
+			continue
+		}
+
+		for _, constStr := range consts {
+			// Parse constant as big.Int for exact comparison
+			n := new(big.Int)
+			if _, ok := n.SetString(constStr, 10); !ok {
+				continue
+			}
+			if isUnsigned {
+				// Check against [0, MaxUnsigned]
+				minVal := new(big.Int)
+				maxVal := new(big.Int).SetUint64(rng.MaxUnsigned)
+				if n.Cmp(minVal) < 0 || n.Cmp(maxVal) > 0 {
+					return true
+				}
+			} else {
+				// Check against [Min, Max]
+				minVal := big.NewInt(rng.Min)
+				maxVal := big.NewInt(rng.Max)
+				if n.Cmp(minVal) < 0 || n.Cmp(maxVal) > 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // hasImpossibleNullComparison returns true if the given WHERE expression contains
@@ -6938,6 +7158,22 @@ func (e *Executor) tryPlanBasedExplainTraditional(sel *sqlparser.Select) ([][]in
 	// Fall back for queries with complex parts (subqueries / derived tables).
 	if e.queryHasComplexParts(sel) {
 		return nil, false
+	}
+
+	// Check for "Impossible WHERE" due to constant out-of-range for multi-table joins.
+	// MySQL's optimizer propagates constants through equi-join conditions and detects that
+	// a constant is out of range for a column's integer type, producing a single Impossible WHERE row.
+	if e.Storage != nil && sel.Where != nil && e.isWhereImpossibleDueToConstantOutOfRange(sel) {
+		// Count real tables to decide if it's a multi-table scenario
+		var tableCount int
+		for _, te := range sel.From {
+			tableCount += len(e.extractAllTableNames(te))
+		}
+		if tableCount > 1 {
+			return [][]interface{}{
+				{int64(1), "SIMPLE", nil, nil, nil, nil, nil, nil, nil, nil, nil, "Impossible WHERE"},
+			}, true
+		}
 	}
 
 	planner := newPlanner(e)

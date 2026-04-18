@@ -1908,7 +1908,12 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 			if val == nil {
 				return nil, nil
 			}
-			return e.castToDatetime(toString(val))
+			// Extract FSP (fractional seconds precision) from CAST(x AS DATETIME(N))
+			dtCastFsp := -1 // -1 = plain DATETIME (strip fractional)
+			if v.Type != nil && v.Type.Length != nil {
+				dtCastFsp = *v.Type.Length
+			}
+			return e.castToDatetimeFsp(toString(val), dtCastFsp)
 		case "DATE":
 			if val == nil {
 				return nil, nil
@@ -2008,10 +2013,82 @@ func (e *Executor) evalCastExpr(v *sqlparser.CastExpr) (interface{}, error) {
 // castToDatetime normalizes a string value for CAST/CONVERT AS DATETIME.
 // Handles date-only or datetime strings with single-digit month/day/hour/min.
 // In TRADITIONAL/NO_ZERO_DATE strict mode during DML, zero dates return an error.
+// fsp is the fractional seconds precision (-1 = plain DATETIME = strip fractional, 0-6 = keep N digits).
 func (e *Executor) castToDatetime(s string) (interface{}, error) {
-	// Strip microseconds (YYYY-MM-DD HH:MM:SS.ffffff → YYYY-MM-DD HH:MM:SS)
+	return e.castToDatetimeFsp(s, -1)
+}
+
+// castToDatetimeFsp is like castToDatetime but with explicit FSP.
+// fsp = -1: plain DATETIME (strip fractional seconds, MySQL behavior for CAST(x AS DATETIME))
+// fsp = 0-6: keep exactly fsp fractional digits (CAST(x AS DATETIME(N)))
+func (e *Executor) castToDatetimeFsp(s string, fsp int) (interface{}, error) {
+	// Handle compact numeric YYYYMMDDHHMMSS or YYYYMMDDHHMMSS.ffffff format.
+	// Convert to "YYYY-MM-DD HH:MM:SS[.ffffff]" so that EXTRACT/MICROSECOND can parse it.
+	isAllDigits := func(st string) bool {
+		for _, c := range st {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		return len(st) > 0
+	}
+	dotIdx := strings.IndexByte(s, '.')
+	intPart := s
+	fracPart := ""
+	if dotIdx >= 0 {
+		intPart = s[:dotIdx]
+		fracPart = s[dotIdx+1:]
+	}
+	if isAllDigits(intPart) && len(intPart) == 14 {
+		// YYYYMMDDHHMMSS or YYYYMMDDHHMMSS.ffffff
+		y, _ := strconv.Atoi(intPart[0:4])
+		mo, _ := strconv.Atoi(intPart[4:6])
+		d, _ := strconv.Atoi(intPart[6:8])
+		h, _ := strconv.Atoi(intPart[8:10])
+		mi, _ := strconv.Atoi(intPart[10:12])
+		sec, _ := strconv.Atoi(intPart[12:14])
+		result := fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, h, mi, sec)
+		if fsp > 0 && fracPart != "" {
+			// Apply FSP: pad/truncate fracPart to fsp digits
+			frac := fracPart
+			for len(frac) < fsp {
+				frac += "0"
+			}
+			if len(frac) > fsp {
+				frac = frac[:fsp]
+			}
+			result += "." + frac
+		} else if fsp > 0 {
+			// No frac in input but FSP > 0: pad with zeros
+			result += "." + strings.Repeat("0", fsp)
+		}
+		// If fsp == -1 (plain DATETIME): strip fractional
+		return result, nil
+	}
+	// Handle delimited datetime format "YYYY-MM-DD HH:MM:SS[.ffffff]"
+	// Strip or apply fractional seconds based on fsp.
 	if len(s) > 19 && s[19] == '.' {
-		s = s[:19]
+		if fsp == -1 {
+			// Plain DATETIME: strip fractional seconds
+			s = s[:19]
+		} else {
+			// DATETIME(N): apply FSP
+			frac := s[20:]
+			for len(frac) < fsp {
+				frac += "0"
+			}
+			if len(frac) > fsp {
+				frac = frac[:fsp]
+			}
+			if fsp == 0 {
+				s = s[:19]
+			} else {
+				s = s[:19] + "." + frac
+			}
+		}
+	} else if fsp > 0 && len(s) == 19 && s[4] == '-' && s[7] == '-' {
+		// "YYYY-MM-DD HH:MM:SS" with no fractional, but fsp > 0: pad with zeros
+		s = s + "." + strings.Repeat("0", fsp)
 	}
 	// Check for delimited date strings that may need zero-date enforcement or normalization.
 	if strings.ContainsAny(s, "-/") {
@@ -5748,6 +5825,45 @@ func isBinaryConvertExpr(expr sqlparser.Expr) bool {
 	return false
 }
 
+// isCompactDecimalDatetime returns true if s is in "YYYYMMDDHHMMSS.ffffff" compact decimal datetime format.
+// This is a 14-digit integer part followed by a '.' and fractional seconds.
+func isCompactDecimalDatetime(s string) bool {
+	dotIdx := strings.IndexByte(s, '.')
+	if dotIdx != 14 {
+		return false
+	}
+	for i := 0; i < 14; i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	for i := 15; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// datetimeStringToFloat64 converts a standard datetime string "YYYY-MM-DD HH:MM:SS[.ffffff]"
+// to its compact decimal float64 representation YYYYMMDDHHMMSS[.ffffff].
+// Returns 0 if the string is not a valid datetime.
+func datetimeStringToFloat64(s string) float64 {
+	// Expect at least "YYYY-MM-DD HH:MM:SS" (19 chars)
+	if len(s) < 19 || s[4] != '-' || s[7] != '-' || s[10] != ' ' || s[13] != ':' || s[16] != ':' {
+		return 0
+	}
+	compact := s[0:4] + s[5:7] + s[8:10] + s[11:13] + s[14:16] + s[17:19]
+	if len(s) > 19 && s[19] == '.' {
+		compact += s[19:] // preserve ".ffffff"
+	}
+	f, err := strconv.ParseFloat(compact, 64)
+	if err != nil {
+		return 0
+	}
+	return f
+}
+
 // compareValuesBinary compares two values case-sensitively (binary collation).
 func compareValuesBinary(left, right interface{}) bool {
 	if left == nil || right == nil {
@@ -6346,12 +6462,32 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 			rightExprW = ce.Expr
 		}
 		left, err := e.evalRowExpr(leftExprW, row)
+		var leftWhereOvErr *intOverflowError
 		if err != nil {
-			return false, err
+			var oe *intOverflowError
+			if errors.As(err, &oe) {
+				leftWhereOvErr = oe
+				left = uint64(math.MaxUint64)
+			} else {
+				return false, err
+			}
 		}
 		right, err := e.evalRowExpr(rightExprW, row)
+		var rightWhereOvErr *intOverflowError
 		if err != nil {
-			return false, err
+			var oe *intOverflowError
+			if errors.As(err, &oe) {
+				rightWhereOvErr = oe
+				right = uint64(math.MaxUint64)
+			} else {
+				return false, err
+			}
+		}
+		if leftWhereOvErr != nil {
+			e.addWarning("Warning", 1292, formatOverflowWarningMsg(leftWhereOvErr))
+		}
+		if rightWhereOvErr != nil {
+			e.addWarning("Warning", 1292, formatOverflowWarningMsg(rightWhereOvErr))
 		}
 		// Collation-aware LIKE/NOT LIKE or LIKE with ESCAPE clause
 		if v.Operator == sqlparser.LikeOp || v.Operator == sqlparser.NotLikeOp {
@@ -6601,12 +6737,30 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 				left = decoded
 				right = hexIntToBytes(right)
 			}
-		} else if _, ok2 := right.(string); ok2 {
-			// HexBytes vs string (e.g. raw binary from VARBINARY bitwise op result vs HexBytes from 0x overflow)
-			// Decode HexBytes to raw bytes for comparison with the raw byte string
-			decoded, err := hexDecodeString(string(hb))
-			if err == nil {
-				left = decoded
+		} else if rs, ok2 := right.(string); ok2 {
+			// HexBytes vs string: if right is a decimal number (contains '.'),
+			// convert HexBytes to its big integer decimal representation for numeric comparison.
+			if strings.ContainsRune(rs, '.') {
+				hexStr := string(hb)
+				if len(hexStr)%2 != 0 {
+					hexStr = "0" + hexStr
+				}
+				n := new(big.Int)
+				if _, ok3 := n.SetString(hexStr, 16); ok3 {
+					left = n.Text(10)
+				} else {
+					decoded, err := hexDecodeString(string(hb))
+					if err == nil {
+						left = decoded
+					}
+				}
+			} else {
+				// HexBytes vs string (e.g. raw binary from VARBINARY bitwise op result vs HexBytes from 0x overflow)
+				// Decode HexBytes to raw bytes for comparison with the raw byte string
+				decoded, err := hexDecodeString(string(hb))
+				if err == nil {
+					left = decoded
+				}
 			}
 		}
 	} else if hb, ok := right.(HexBytes); ok {
@@ -6616,11 +6770,31 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 				right = decoded
 				left = hexIntToBytes(left)
 			}
-		} else if _, ok2 := left.(string); ok2 {
-			// HexBytes vs string (e.g. raw binary from VARBINARY bitwise op result vs HexBytes from 0x overflow)
-			decoded, err := hexDecodeString(string(hb))
-			if err == nil {
-				right = decoded
+		} else if ls, ok2 := left.(string); ok2 {
+			// HexBytes vs string: check if the string is a decimal number (contains '.').
+			// In that case, convert HexBytes to its big integer decimal representation
+			// for numeric comparison (e.g. DECIMAL column vs overflowed 0x hex literal).
+			if strings.ContainsRune(ls, '.') {
+				hexStr := string(hb)
+				if len(hexStr)%2 != 0 {
+					hexStr = "0" + hexStr
+				}
+				n := new(big.Int)
+				if _, ok3 := n.SetString(hexStr, 16); ok3 {
+					right = n.Text(10)
+				} else {
+					decoded, err := hexDecodeString(string(hb))
+					if err == nil {
+						right = decoded
+					}
+				}
+			} else {
+				// HexBytes vs string (e.g. raw binary from VARBINARY bitwise op result vs HexBytes from 0x overflow)
+				// Decode HexBytes to raw bytes for comparison with the raw byte string
+				decoded, err := hexDecodeString(string(hb))
+				if err == nil {
+					right = decoded
+				}
 			}
 		}
 	}
@@ -6778,7 +6952,27 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 				if ln != "" && rn != "" {
 					// Use the two-arg normalizer to align date vs datetime granularity
 					ln, rn = normalizeDateTimeForCompare(ln, rn)
-					return ln == rn, nil
+					if ln == rn {
+						return true, nil
+					}
+					// Fallback: convert both datetime strings to compact decimal float64
+					// for numeric comparison. This handles precision loss in large datetime
+					// numbers (e.g. 20010101112233.123456 vs 20010101112233.123457 are
+					// equal as float64 at this magnitude). Only apply this fallback when
+					// one of the ORIGINAL strings was in compact decimal YYYYMMDDHHMMSS.ffffff
+					// format (14-digit int part before '.'), not standard datetime strings.
+					// This avoids false positives from datetime strings that differ only in
+					// the fractional second (e.g. 00:00:00.999999 vs 00:00:01.000000).
+					lsIsCompactDecimalDT := isCompactDecimalDatetime(ls)
+					rsIsCompactDecimalDT := isCompactDecimalDatetime(rs)
+					if lsIsCompactDecimalDT || rsIsCompactDecimalDT {
+						lf := datetimeStringToFloat64(ln)
+						rf := datetimeStringToFloat64(rn)
+						if lf != 0 && rf != 0 {
+							return lf == rf, nil
+						}
+					}
+					return false, nil
 				}
 				// Handle YEAR column (4-digit string, e.g. "2026") compared with DATETIME string.
 				// MySQL extracts the year from the DATETIME and compares only the year portion.
@@ -6795,7 +6989,23 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 			// Try TIME normalization if either looks like a time.
 			// Use strict check to avoid false positives from strings that contain ':'
 			// but are not actually time values (e.g. instrument names like 'hash_filo::lock').
-			if looksLikeActualTime(ls) || looksLikeActualTime(rs) {
+			// Skip normalization only when both sides already have fractional seconds AND
+			// are in normalized HH:MM:SS.frac format; in that case string comparison is used
+			// so that TIME(6) '11:22:33.123000' != VARCHAR '11:22:33.123' (MySQL behavior).
+			isNormalizedTimeFrac := func(s string) bool {
+				dotIdx := strings.Index(s, ".")
+				if dotIdx < 5 {
+					return false // no fractional part or too short
+				}
+				// Check HH:MM before the dot
+				colonIdx := strings.Index(s[:dotIdx], ":")
+				if colonIdx < 2 {
+					return false // first component must be at least 2 digits
+				}
+				return true
+			}
+			skipTimeNorm := isNormalizedTimeFrac(ls) && isNormalizedTimeFrac(rs)
+			if (looksLikeActualTime(ls) || looksLikeActualTime(rs)) && !skipTimeNorm {
 				lt := parseMySQLTimeValue(ls)
 				rt := parseMySQLTimeValue(rs)
 				if lt == rt {
@@ -7251,6 +7461,29 @@ func normalizeUTF8GeneralCIKey(s string) string {
 	return b.String()
 }
 
+// compareIntVsDecimalString compares a native integer (int64/uint64) against a
+// decimal string using exact big.Rat arithmetic. This avoids float64 precision
+// loss when values are near the boundaries of int64/uint64 (e.g. comparing
+// BIGINT UNSIGNED MAX against a decimal like 18446744073709551615.00001).
+// Returns (cmp, true) where cmp is -1/0/1, or (0, false) if not applicable.
+func compareIntVsDecimalString(intVal interface{}, decStr string) (int, bool) {
+	var intRat *big.Rat
+	switch n := intVal.(type) {
+	case int64:
+		intRat = new(big.Rat).SetInt64(n)
+	case uint64:
+		intRat = new(big.Rat).SetUint64(n)
+	default:
+		return 0, false
+	}
+	decRat := new(big.Rat)
+	if _, ok := decRat.SetString(decStr); !ok {
+		return 0, false
+	}
+	cmp := intRat.Cmp(decRat)
+	return cmp, true
+}
+
 func compareNumeric(a, b interface{}) int {
 	// If both values are strings (or one is), try numeric comparison first
 	aIsStr := isStringValue(a)
@@ -7265,7 +7498,31 @@ func compareNumeric(a, b interface{}) int {
 			// Both are strings, but short enough to be valid numbers
 			shouldTryNumeric = true
 		}
+		// When both are strings but at least one has a decimal point, try big.Rat comparison
+		// to handle long DECIMAL values correctly (e.g. DECIMAL(65,30) vs large integer string).
+		if !shouldTryNumeric && (strings.ContainsRune(sa, '.') || strings.ContainsRune(sb, '.')) {
+			ra := new(big.Rat)
+			rb := new(big.Rat)
+			if _, okA := ra.SetString(sa); okA {
+				if _, okB := rb.SetString(sb); okB {
+					return ra.Cmp(rb)
+				}
+			}
+		}
 		if shouldTryNumeric {
+			// Use exact big.Rat comparison when one side is a native integer and the
+			// other is a decimal string. This avoids float64 precision loss for values
+			// near the boundaries of int64/uint64 (e.g. BIGINT UNSIGNED MAX comparisons).
+			if !aIsStr && bIsStr && strings.ContainsRune(sb, '.') {
+				if cmp, ok := compareIntVsDecimalString(a, sb); ok {
+					return cmp
+				}
+			}
+			if !bIsStr && aIsStr && strings.ContainsRune(sa, '.') {
+				if cmp, ok := compareIntVsDecimalString(b, sa); ok {
+					return -cmp
+				}
+			}
 			fa, errA := strconv.ParseFloat(sa, 64)
 			fb, errB := strconv.ParseFloat(sb, 64)
 			if errA == nil && errB == nil {
@@ -7334,6 +7591,58 @@ func compareNumeric(a, b interface{}) int {
 			return 1
 		}
 		return 0
+	}
+	// Use exact integer comparison for int64/uint64 pairs to avoid float64 precision loss
+	// near boundary values (e.g. INT64_MAX-1 vs INT64_MAX both round to the same float64).
+	switch al := a.(type) {
+	case int64:
+		switch br := b.(type) {
+		case int64:
+			if al < br {
+				return -1
+			}
+			if al > br {
+				return 1
+			}
+			return 0
+		case uint64:
+			// int64 vs uint64: if int64 is negative, it's always less than any uint64.
+			if al < 0 {
+				return -1
+			}
+			aU := uint64(al)
+			if aU < br {
+				return -1
+			}
+			if aU > br {
+				return 1
+			}
+			return 0
+		}
+	case uint64:
+		switch br := b.(type) {
+		case uint64:
+			if al < br {
+				return -1
+			}
+			if al > br {
+				return 1
+			}
+			return 0
+		case int64:
+			// uint64 vs int64: if int64 is negative, uint64 is always greater.
+			if br < 0 {
+				return 1
+			}
+			bU := uint64(br)
+			if al < bU {
+				return -1
+			}
+			if al > bU {
+				return 1
+			}
+			return 0
+		}
 	}
 	fa := toFloat(a)
 	fb := toFloat(b)
