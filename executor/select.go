@@ -5595,6 +5595,7 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					// Skip for InnoDB IS tables and performance_schema tables which preserve user's column casing.
 					isInnoDBISTable := false
 					isPSTable := false
+					isNonISNonPSTable := false
 					for _, td := range tableDefs {
 						if td != nil && strings.HasPrefix(strings.ToLower(td.Name), "innodb_") {
 							isInnoDBISTable = true
@@ -5604,9 +5605,18 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 							if _, ok := perfSchemaColumnOrder[strings.ToLower(td.Name)]; ok {
 								isPSTable = true
 							}
+							if _, ok := infoSchemaColumnOrder[strings.ToLower(td.Name)]; !ok {
+								// Table def exists but is not in infoSchemaColumnOrder → it's a non-IS table
+								// (e.g., mysql.user, regular user tables). Preserve user-specified casing.
+								isNonISNonPSTable = true
+							}
 						}
 					}
-					if !isInnoDBISTable && !isPSTable {
+					// Only apply schema-name capitalization for IS tables and non-InnoDB/non-PS tables that
+					// are information_schema tables. For mysql.* and regular user tables, preserve the
+					// user-specified casing from the query.
+					// isNonISNonPSTable is only set when tableDefs is non-empty AND contains non-IS tables.
+					if !isInnoDBISTable && !isPSTable && !isNonISNonPSTable {
 						resolved := false
 						upperName := strings.ToUpper(name)
 						for _, td := range tableDefs {
