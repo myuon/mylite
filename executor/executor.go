@@ -3285,15 +3285,133 @@ func (e *Executor) checkTableLockRestrictions(stmt sqlparser.Statement) error {
 			}
 			key := dbName + "." + tableName
 			locked, mode := e.tableLockManager.IsLocked(e.connectionID, key)
-			// In MySQL, DROP TABLE under LOCK TABLES is allowed even if the table is
-			// not explicitly in the lock set (e.g., underlying tables of locked views).
-			// Only reject if the table is explicitly READ-locked (needs WRITE for DDL).
-			if locked && mode == "READ" {
-				return mysqlError(1099, "HY000", fmt.Sprintf("Table '%s' was locked with a READ lock and can't be updated", tableName))
+			if locked {
+				if mode == "READ" {
+					return mysqlError(1099, "HY000", fmt.Sprintf("Table '%s' was locked with a READ lock and can't be updated", tableName))
+				}
+			} else {
+				// MySQL allows DROP TABLE on implicitly locked tables (underlying tables
+				// of locked views). Check if this table is referenced by any locked view.
+				if !e.isTableImplicitlyLockedViaView(dbName, tableName) {
+					return mysqlError(1100, "HY000", fmt.Sprintf("Table '%s' was not locked with LOCK TABLES", tableName))
+				}
 			}
 		}
 	}
 	return nil
+}
+
+// isTableImplicitlyLockedViaView returns true if the given table is implicitly
+// locked in the current session via prelocking (underlying table of a locked view,
+// referenced by a trigger on a locked table, or referenced by a function called
+// from a locked view). MySQL allows DROP TABLE on such implicitly-locked tables.
+func (e *Executor) isTableImplicitlyLockedViaView(dbName, tableName string) bool {
+	if e.tableLockManager == nil {
+		return false
+	}
+	target := strings.ToLower(tableName)
+	locks := e.tableLockManager.GetLocks(e.connectionID)
+	if len(locks) == 0 {
+		return false
+	}
+
+	// sqlContainsTable checks whether a slice of SQL statements references the target table.
+	sqlContainsTable := func(stmts []string) bool {
+		for _, stmt := range stmts {
+			parsed, err := e.parser().Parse(stmt)
+			if err != nil {
+				// Fallback: string search
+				if strings.Contains(strings.ToLower(stmt), target) {
+					return true
+				}
+				continue
+			}
+			found := false
+			_ = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
+				if tn, ok := node.(sqlparser.TableName); ok {
+					if strings.EqualFold(tn.Name.String(), target) {
+						found = true
+						return false, nil
+					}
+				}
+				return true, nil
+			}, parsed)
+			if found {
+				return true
+			}
+		}
+		return false
+	}
+
+	for lockedKey := range locks {
+		parts := strings.SplitN(lockedKey, ".", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		lockedDB := parts[0]
+		lockedName := parts[1]
+
+		// Case 1: Locked entity is a view that directly or indirectly references target table.
+		if e.views != nil {
+			for vname, vsql := range e.views {
+				if !strings.EqualFold(vname, lockedName) {
+					continue
+				}
+				// Direct check: parse view SQL for table references
+				parsed, err := e.parser().Parse(vsql)
+				if err == nil {
+					found := false
+					_ = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
+						if tn, ok := node.(sqlparser.TableName); ok {
+							if strings.EqualFold(tn.Name.String(), target) {
+								found = true
+								return false, nil
+							}
+						}
+						return true, nil
+					}, parsed)
+					if found {
+						return true
+					}
+					// Indirect check: view calls a function that references target table.
+					// Collect function names from view SQL and check their bodies.
+					_ = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
+						if fc, ok := node.(*sqlparser.FuncExpr); ok {
+							fnName := fc.Name.Lowered()
+							db2, dbErr := e.Catalog.GetDatabase(lockedDB)
+							if dbErr != nil {
+								db2, _ = e.Catalog.GetDatabase(e.CurrentDB)
+							}
+							if db2 != nil {
+								if fn := db2.GetFunction(fnName); fn != nil {
+									if sqlContainsTable(fn.Body) {
+										found = true
+										return false, nil
+									}
+								}
+							}
+						}
+						return true, nil
+					}, parsed)
+					if found {
+						return true
+					}
+				}
+				break
+			}
+		}
+
+		// Case 2: Locked entity is a regular table with triggers that reference target table.
+		if db, dbErr := e.Catalog.GetDatabase(lockedDB); dbErr == nil {
+			triggers := db.GetAllTriggersForTable(lockedName)
+			for _, tr := range triggers {
+				if sqlContainsTable(tr.Body) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // execPrepare handles PREPARE stmt_name FROM 'query'.

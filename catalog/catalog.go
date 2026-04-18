@@ -722,6 +722,19 @@ func (db *Database) GetTriggersForTable(table, timing, event string) []*TriggerD
 	return result
 }
 
+// GetAllTriggersForTable returns all triggers defined on the given table (any timing/event).
+func (db *Database) GetAllTriggersForTable(table string) []*TriggerDef {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	var result []*TriggerDef
+	for _, tr := range db.Triggers {
+		if strings.EqualFold(tr.Table, table) {
+			result = append(result, tr)
+		}
+	}
+	return result
+}
+
 // CreateProcedure adds a stored procedure definition.
 func (db *Database) CreateProcedure(def *ProcedureDef) {
 	db.mu.Lock()

@@ -505,6 +505,22 @@ func (tlm *TableLockManager) IsLocked(connID int64, dbTable string) (locked bool
 	return true, mode
 }
 
+// GetLocks returns a copy of all locks held by the given connection.
+// The returned map keys are lowercase "db.table" strings, values are lock modes.
+func (tlm *TableLockManager) GetLocks(connID int64) map[string]string {
+	tlm.mu.Lock()
+	defer tlm.mu.Unlock()
+	m, ok := tlm.locks[connID]
+	if !ok {
+		return nil
+	}
+	result := make(map[string]string, len(m))
+	for k, v := range m {
+		result[k] = v
+	}
+	return result
+}
+
 // IsLockedByOther checks if a table is locked by any connection OTHER than connID.
 // Returns (true, mode) if locked by another connection, where mode is the strongest
 // lock mode held (WRITE > READ). Returns (false, "") if not locked by others.
