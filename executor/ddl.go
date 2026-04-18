@@ -1188,6 +1188,16 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 					}
 				}
 			}
+			// Validate: ENUM/SET NOT NULL columns cannot have explicit NULL default (error 1067).
+			if !nullable && col.Type.Options != nil && col.Type.Options.Default != nil {
+				defStr2 := sqlparser.String(col.Type.Options.Default)
+				if strings.EqualFold(defStr2, "null") {
+					colTypeLower2 := strings.ToLower(strings.TrimSpace(col.Type.Type))
+					if colTypeLower2 == "enum" || colTypeLower2 == "set" {
+						return nil, mysqlError(1067, "42000", fmt.Sprintf("Invalid default value for '%s'", colDef.Name))
+					}
+				}
+			}
 			// Validate zero date/datetime/timestamp defaults in strict mode
 			if colDef.Default != nil && e.isStrictMode() {
 				colTypeUpper := strings.ToUpper(strings.TrimSpace(col.Type.Type))
@@ -2884,7 +2894,12 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				tbl.Lock()
 				for i := range tbl.Rows {
 					if cur, ok := tbl.Rows[i][colDef.Name]; ok {
-						tbl.Rows[i][colDef.Name] = e.coerceValueForColumnTypeForWrite(colDef, cur)
+						if cur == nil && !colDef.Nullable {
+							// ALTER TABLE MODIFY COLUMN x NOT NULL: convert NULL to zero value
+							tbl.Rows[i][colDef.Name] = implicitDefaultForType(colDef.Type)
+						} else {
+							tbl.Rows[i][colDef.Name] = e.coerceValueForColumnTypeForWrite(colDef, cur)
+						}
 					}
 				}
 				tbl.Unlock()
@@ -2928,7 +2943,12 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				tbl.Lock()
 				for i := range tbl.Rows {
 					if cur, ok := tbl.Rows[i][colDef.Name]; ok {
-						tbl.Rows[i][colDef.Name] = e.coerceValueForColumnTypeForWrite(colDef, cur)
+						if cur == nil && !colDef.Nullable {
+							// ALTER TABLE CHANGE COLUMN x NOT NULL: convert NULL to zero value
+							tbl.Rows[i][colDef.Name] = implicitDefaultForType(colDef.Type)
+						} else {
+							tbl.Rows[i][colDef.Name] = e.coerceValueForColumnTypeForWrite(colDef, cur)
+						}
 					}
 				}
 				tbl.Unlock()
@@ -3477,6 +3497,13 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 						} else if op.DefaultVal != nil {
 							defStr := sqlparser.String(op.DefaultVal)
 							defStr = strings.Trim(defStr, "'")
+							// Validate: NOT NULL ENUM/SET cannot have NULL default
+							if strings.EqualFold(defStr, "null") && !col.Nullable {
+								colTypeLower2 := strings.ToLower(strings.TrimSpace(col.Type))
+								if strings.HasPrefix(colTypeLower2, "enum(") || strings.HasPrefix(colTypeLower2, "set(") {
+									return nil, mysqlError(1067, "42000", fmt.Sprintf("Invalid default value for '%s'", colName))
+								}
+							}
 							tableDef.Columns[i].Default = &defStr
 							tableDef.Columns[i].DefaultDropped = false
 						}
@@ -4310,6 +4337,44 @@ func (e *Executor) inferColumnAttrs(selectSQL, colName string) columnAttrs {
 		if a.colType == "" {
 			a.colType = e.inferColumnTypeFromSelect(sel, colName)
 		}
+		// If result is binary(0) from a FuncExpr (e.g. IFNULL with column args where all
+		// non-null args are column references), try to infer from source table column types.
+		if a.colType == "binary(0)" {
+			if fn, ok := ae.Expr.(*sqlparser.FuncExpr); ok {
+				fname := strings.ToLower(fn.Name.String())
+				switch fname {
+				case "if", "ifnull", "coalesce", "greatest", "least", "nullif":
+					// Find any column reference among args and use its type
+					argsToCheck := fn.Exprs
+					if fname == "if" && len(fn.Exprs) == 3 {
+						argsToCheck = fn.Exprs[1:]
+					}
+					for _, arg := range argsToCheck {
+						if colRef, ok2 := arg.(*sqlparser.ColName); ok2 {
+							for _, tblDef := range srcTableDefs {
+								for _, col := range tblDef.Columns {
+									if strings.EqualFold(col.Name, colRef.Name.String()) {
+										// For inferred result types, ZEROFILL is stripped but UNSIGNED is kept.
+										colT := col.Type
+										if strings.Contains(strings.ToLower(colT), "zerofill") {
+											colT = strings.TrimSpace(strings.ReplaceAll(strings.ToLower(colT), "zerofill", ""))
+											colT = strings.TrimSpace(colT)
+											if !strings.Contains(colT, "unsigned") {
+												colT = colT + " unsigned"
+											}
+										}
+										a.colType = colT
+										a.nullable = true // IFNULL with NULL arg is nullable
+										goto foundColType
+									}
+								}
+							}
+						}
+					}
+				foundColType:
+				}
+			}
+		}
 		return a
 	}
 	// Fall back to type inference
@@ -4902,13 +4967,183 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			}
 		case "nullif":
 			// NULLIF(x, y) uses the type of the first argument.
+			// If first arg is NULL, MySQL returns char(0).
 			if len(v.Exprs) >= 1 {
 				t := e.inferExprType(v.Exprs[0])
 				if t != "" && t != "binary(0)" {
 					return t
 				}
 			}
-			return "binary(0)"
+			// first arg is null or unknown — return char(0)
+			return "char(0)"
+		case "substring_index":
+			// SUBSTRING_INDEX(str, delim, count) — return type based on first arg
+			if len(v.Exprs) >= 1 {
+				t := e.inferExprType(v.Exprs[0])
+				if t == "binary(0)" || t == "" {
+					return "char(0)"
+				}
+				return t
+			}
+			return "char(0)"
+		case "elt":
+			// ELT(n, str1, str2, ...) — return type is max varchar of string args
+			maxLen := 0
+			for i, arg := range v.Exprs {
+				if i == 0 {
+					continue // skip the index arg
+				}
+				t := e.inferExprType(arg)
+				if strings.HasPrefix(t, "varchar(") {
+					var n int
+					if _, err := fmt.Sscanf(t, "varchar(%d)", &n); err == nil && n > maxLen {
+						maxLen = n
+					}
+				}
+			}
+			if maxLen > 0 {
+				return fmt.Sprintf("varchar(%d)", maxLen)
+			}
+		case "concat":
+			// CONCAT(str1, str2, ...) — sum of varchar lengths of non-null args
+			totalLen := 0
+			hasStr := false
+			for _, arg := range v.Exprs {
+				t := e.inferExprType(arg)
+				if t == "binary(0)" || t == "" {
+					continue
+				}
+				if strings.HasPrefix(t, "varchar(") {
+					var n int
+					if _, err := fmt.Sscanf(t, "varchar(%d)", &n); err == nil {
+						totalLen += n
+						hasStr = true
+					}
+				}
+			}
+			if hasStr {
+				return fmt.Sprintf("varchar(%d)", totalLen)
+			}
+			return "char(0)"
+		case "concat_ws":
+			// CONCAT_WS(sep, str1, str2, ...) — MySQL computes max potential length as:
+			// sum of all positional arg lengths (null args = 0) + sep*(numArgs-1)
+			// If sep is null → result length = sum of all arg lengths (no separators)
+			if len(v.Exprs) >= 1 {
+				sepType := e.inferExprType(v.Exprs[0])
+				sepLen := 0
+				sepIsNull := (sepType == "binary(0)" || sepType == "")
+				if !sepIsNull {
+					if strings.HasPrefix(sepType, "varchar(") {
+						fmt.Sscanf(sepType, "varchar(%d)", &sepLen)
+					}
+				}
+				numArgs := len(v.Exprs) - 1 // number of data args (excluding sep)
+				strTotal := 0
+				for i, arg := range v.Exprs {
+					if i == 0 {
+						continue
+					}
+					t := e.inferExprType(arg)
+					if t != "binary(0)" && t != "" && strings.HasPrefix(t, "varchar(") {
+						var n int
+						if _, err := fmt.Sscanf(t, "varchar(%d)", &n); err == nil {
+							strTotal += n
+						}
+					}
+				}
+				total := strTotal
+				if !sepIsNull && numArgs > 1 {
+					total += sepLen * (numArgs - 1)
+				}
+				return fmt.Sprintf("varchar(%d)", total)
+			}
+			return "char(0)"
+		case "make_set":
+			// MAKE_SET(bits, str1, str2, ...) — MySQL counts all args (including null args as 0-len)
+			// for string total, plus (numArgs-1) commas for separators between them.
+			numDataArgs := len(v.Exprs) - 1 // number of string args (excluding bits)
+			strTotal := 0
+			for i, arg := range v.Exprs {
+				if i == 0 {
+					continue // skip bits arg
+				}
+				t := e.inferExprType(arg)
+				if t != "binary(0)" && t != "" && strings.HasPrefix(t, "varchar(") {
+					var n int
+					if _, err := fmt.Sscanf(t, "varchar(%d)", &n); err == nil {
+						strTotal += n
+					}
+				}
+			}
+			if numDataArgs > 0 {
+				total := strTotal
+				if numDataArgs > 1 {
+					total += numDataArgs - 1 // commas between all arg slots
+				}
+				return fmt.Sprintf("varchar(%d)", total)
+			}
+			return "char(0)"
+		case "export_set":
+			// EXPORT_SET(bits, on, off, [sep, [num_bits]])
+			// MySQL: varchar computed from on/off/sep lengths * num_bits
+			// Default num_bits=64. MySQL uses a fixed formula.
+			// on=len(on_str), off=len(off_str), sep=len(sep_str), n=num_bits
+			// Result length = n*max(on,off) + (n-1)*len(sep)
+			onLen, offLen, sepLen := 0, 0, 0
+			numBits := 64
+			if len(v.Exprs) >= 2 {
+				t := e.inferExprType(v.Exprs[1])
+				if strings.HasPrefix(t, "varchar(") {
+					fmt.Sscanf(t, "varchar(%d)", &onLen)
+				}
+			}
+			if len(v.Exprs) >= 3 {
+				t := e.inferExprType(v.Exprs[2])
+				if strings.HasPrefix(t, "varchar(") {
+					fmt.Sscanf(t, "varchar(%d)", &offLen)
+				}
+			}
+			if len(v.Exprs) >= 4 {
+				t := e.inferExprType(v.Exprs[3])
+				if strings.HasPrefix(t, "varchar(") {
+					fmt.Sscanf(t, "varchar(%d)", &sepLen)
+				}
+			}
+			if len(v.Exprs) >= 5 {
+				if lit, ok := v.Exprs[4].(*sqlparser.Literal); ok && lit.Type == sqlparser.IntVal {
+					if n, err := strconv.Atoi(lit.Val); err == nil {
+						numBits = n
+					}
+				}
+			}
+			maxOnOff := onLen
+			if offLen > maxOnOff {
+				maxOnOff = offLen
+			}
+			total := numBits*maxOnOff + (numBits-1)*sepLen
+			return fmt.Sprintf("varchar(%d)", total)
+		case "replace":
+			// REPLACE(str, from_str, to_str) — if str is null, char(0); otherwise varchar(len(str))
+			if len(v.Exprs) >= 1 {
+				t := e.inferExprType(v.Exprs[0])
+				if t == "binary(0)" || t == "" {
+					return "char(0)"
+				}
+				return t
+			}
+			return "char(0)"
+		case "lpad", "rpad":
+			// LPAD(str, len, padstr) / RPAD(str, len, padstr)
+			// Result length is always the second arg (len)
+			if len(v.Exprs) >= 2 {
+				if lit, ok := v.Exprs[1].(*sqlparser.Literal); ok && lit.Type == sqlparser.IntVal {
+					if n, err := strconv.Atoi(lit.Val); err == nil {
+						return fmt.Sprintf("varchar(%d)", n)
+					}
+				}
+			}
+			return "text"
 		case "makedate":
 			// MAKEDATE(year, dayofyear) returns a date value
 			return "date"
@@ -5000,6 +5235,7 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			var decimalType string
 			hasDouble := false
 			hasNullArg := false
+			maxVarcharLen := 0
 			for _, arg := range argsToCheck {
 				t := e.inferExprType(arg)
 				if t == "binary(0)" || t == "" {
@@ -5013,6 +5249,16 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 					decimalType = t
 				} else if t == "double" {
 					hasDouble = true
+				} else if strings.HasPrefix(t, "varchar(") {
+					var n int
+					if _, err := fmt.Sscanf(t, "varchar(%d)", &n); err == nil && n > maxVarcharLen {
+						maxVarcharLen = n
+					}
+				} else if strings.HasPrefix(t, "char(") {
+					var n int
+					if _, err := fmt.Sscanf(t, "char(%d)", &n); err == nil && n > maxVarcharLen {
+						maxVarcharLen = n
+					}
 				}
 			}
 			if allNull {
@@ -5028,11 +5274,74 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 				_ = hasNullArg // nullable handled in inferExprAttrs
 				return decimalType
 			}
+			// If any arg is a string (varchar/char), return varchar with max length.
+			if maxVarcharLen > 0 {
+				return fmt.Sprintf("varchar(%d)", maxVarcharLen)
+			}
 		}
 	case *sqlparser.IntroducerExpr:
 		// _charset'string' — type is varchar(len) with the given charset
 		if lit, ok := v.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
 			return fmt.Sprintf("varchar(%d)", len(lit.Val))
+		}
+	case *sqlparser.InsertExpr:
+		// INSERT(str, pos, len, newstr) — type based on str (first arg).
+		// If str is null → use newstr; if both null → char(0).
+		t := e.inferExprType(v.Str)
+		if t != "binary(0)" && t != "" {
+			return t
+		}
+		t2 := e.inferExprType(v.NewStr)
+		if t2 != "binary(0)" && t2 != "" {
+			return t2
+		}
+		return "char(0)"
+	case *sqlparser.TrimFuncExpr:
+		// TRIM([remstr FROM] str) — type based on StringArg (the main string).
+		// If StringArg is null → char(0), otherwise varchar(len).
+		t := e.inferExprType(v.StringArg)
+		if t == "binary(0)" || t == "" {
+			return "char(0)"
+		}
+		return t
+	case *sqlparser.CaseExpr:
+		// CASE WHEN ... THEN val ELSE val END — return the widest type among non-null branches.
+		maxVarcharLen := 0
+		for _, when := range v.Whens {
+			t := e.inferExprType(when.Val)
+			if t == "binary(0)" || t == "" {
+				continue
+			}
+			if strings.HasPrefix(t, "varchar(") {
+				var n int
+				if _, err := fmt.Sscanf(t, "varchar(%d)", &n); err == nil && n > maxVarcharLen {
+					maxVarcharLen = n
+				}
+			} else if strings.HasPrefix(t, "char(") {
+				var n int
+				if _, err := fmt.Sscanf(t, "char(%d)", &n); err == nil && n > maxVarcharLen {
+					maxVarcharLen = n
+				}
+			}
+		}
+		if v.Else != nil {
+			t := e.inferExprType(v.Else)
+			if t != "binary(0)" && t != "" {
+				if strings.HasPrefix(t, "varchar(") {
+					var n int
+					if _, err := fmt.Sscanf(t, "varchar(%d)", &n); err == nil && n > maxVarcharLen {
+						maxVarcharLen = n
+					}
+				} else if strings.HasPrefix(t, "char(") {
+					var n int
+					if _, err := fmt.Sscanf(t, "char(%d)", &n); err == nil && n > maxVarcharLen {
+						maxVarcharLen = n
+					}
+				}
+			}
+		}
+		if maxVarcharLen > 0 {
+			return fmt.Sprintf("varchar(%d)", maxVarcharLen)
 		}
 	case *sqlparser.NullVal:
 		// MySQL uses binary(0) for NULL literal columns in CREATE TABLE AS SELECT
@@ -5271,6 +5580,14 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 	if attrs.colType == "" {
 		attrs.colType = e.inferExprType(expr)
 	}
+	// For varchar/char result types inferred from string expressions,
+	// propagate the current connection charset (e.g. latin2 from "set names latin2").
+	colTypeLowerForCS := strings.ToLower(attrs.colType)
+	if attrs.charset == "" && (strings.HasPrefix(colTypeLowerForCS, "varchar(") || strings.HasPrefix(colTypeLowerForCS, "char(")) {
+		if cs, ok := e.getSysVar("character_set_client"); ok && cs != "" && cs != "utf8mb4" && cs != "utf8" {
+			attrs.charset = cs
+		}
+	}
 	// For arithmetic expressions involving hex/integer literals, MySQL uses NOT NULL with DEFAULT 0
 	if _, isBin := expr.(*sqlparser.BinaryExpr); isBin {
 		colType := strings.ToLower(attrs.colType)
@@ -5322,6 +5639,7 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 		case "if", "ifnull", "coalesce", "greatest", "least":
 			colTypeLower := strings.ToLower(attrs.colType)
 			isNumericType := strings.HasPrefix(colTypeLower, "decimal(") || colTypeLower == "double"
+			isVarcharType := strings.HasPrefix(colTypeLower, "varchar(") || strings.HasPrefix(colTypeLower, "char(")
 			if isNumericType {
 				// Check if any value arg is a NULL literal
 				argsToCheck := fn.Exprs
@@ -5349,6 +5667,34 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 						}
 					} else {
 						attrs.defaultVal = "0"
+					}
+				}
+			} else if isVarcharType {
+				// For varchar result: determine nullability based on MySQL rules.
+				// IFNULL(a,b): NOT NULL if b is non-null (guaranteed fallback).
+				// COALESCE: NOT NULL if any non-null arg exists at a position before all nulls.
+				// Actually MySQL's rule: COALESCE/IFNULL is NOT NULL if ANY arg is guaranteed non-null.
+				switch fname {
+				case "ifnull":
+					// ifnull(a, b): NOT NULL if b is non-null
+					if len(fn.Exprs) >= 2 {
+						bt := e.inferExprType(fn.Exprs[1])
+						if bt != "binary(0)" && bt != "" {
+							attrs.nullable = false
+							attrs.hasDefault = true
+							attrs.defaultVal = ""
+						}
+					}
+				case "coalesce":
+					// coalesce: NOT NULL if any arg is non-null
+					for _, arg := range fn.Exprs {
+						t := e.inferExprType(arg)
+						if t != "binary(0)" && t != "" {
+							attrs.nullable = false
+							attrs.hasDefault = true
+							attrs.defaultVal = ""
+							break
+						}
 					}
 				}
 			}
