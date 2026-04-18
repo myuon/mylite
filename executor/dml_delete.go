@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -196,11 +197,23 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", deleteDB, tableName))
 	}
 
+	// MySQL error 1442: can't modify a table inside a trigger if the triggering statement is
+	// already modifying that table.
+	if e.functionOrTriggerDepth > 0 && strings.EqualFold(e.modifyingTable, tableName) {
+		return nil, mysqlError(1442, "HY000",
+			fmt.Sprintf("Can't update table '%s' in stored function/trigger because it is already used by statement which invoked this stored function/trigger.", tableName))
+	}
+
 	// Set queryTableDef so that IS NULL checks on zero-date NOT NULL columns work correctly
 	// (MySQL: 0000-00-00 IS NULL = TRUE for NOT NULL date columns).
 	oldQueryTableDef := e.queryTableDef
 	e.queryTableDef = tbl.Def
 	defer func() { e.queryTableDef = oldQueryTableDef }()
+
+	// Track which table we're modifying so triggers can detect recursive modification.
+	prevModifyingTable := e.modifyingTable
+	e.modifyingTable = tableName
+	defer func() { e.modifyingTable = prevModifyingTable }()
 
 	tbl.Lock()
 	defer tbl.Unlock()
@@ -697,6 +710,42 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 		return &Result{}, nil
 	}
 
+	// When there is no current database, any unqualified target reference → "No database selected".
+	// MySQL returns ER_NO_DB_ERROR (3D000) before doing any other validation.
+	if e.CurrentDB == "" {
+		for _, target := range stmt.Targets {
+			if target.Qualifier.IsEmpty() {
+				return nil, mysqlError(1046, "3D000", "No database selected")
+			}
+		}
+		// Also check FROM tables: if any unqualified table ref uses no qualifier, no DB selected.
+		hasUnqualifiedFrom := false
+		var checkTableExprs func(te sqlparser.TableExpr)
+		checkTableExprs = func(te sqlparser.TableExpr) {
+			switch t := te.(type) {
+			case *sqlparser.AliasedTableExpr:
+				if tn, ok := t.Expr.(sqlparser.TableName); ok {
+					if tn.Qualifier.IsEmpty() {
+						hasUnqualifiedFrom = true
+					}
+				}
+			case *sqlparser.JoinTableExpr:
+				checkTableExprs(t.LeftExpr)
+				checkTableExprs(t.RightExpr)
+			case *sqlparser.ParenTableExpr:
+				for _, inner := range t.Exprs {
+					checkTableExprs(inner)
+				}
+			}
+		}
+		for _, te := range stmt.TableExprs {
+			checkTableExprs(te)
+		}
+		if hasUnqualifiedFrom {
+			return nil, mysqlError(1046, "3D000", "No database selected")
+		}
+	}
+
 	// SQL_SAFE_UPDATES: for multi-table DELETE, check if safe update mode requires a key-based WHERE.
 	// MySQL allows multi-table DELETE in safe update mode only if there's a LIMIT or a WHERE using a key.
 	if e.isSafeUpdateEnabled() && stmt.Limit == nil {
@@ -744,10 +793,11 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 	// Collect table aliases for per-table predicate classification.
 	// Also build a flat list of all table info for target validation.
 	type tableExprInfo struct {
-		name         string
-		explicitAlias string // empty if no explicit alias
-		db           string
-		effectiveAlias string // alias if aliased, else name
+		name           string
+		explicitAlias  string // empty if no explicit alias
+		db             string
+		effectiveAlias string // alias if aliased, else name (table name only, no db prefix)
+		rowAlias       string // alias used as row key prefix by buildFromExpr (matches extractTableAliasFromAliased)
 	}
 	// collectAllTableInfos recursively extracts all leaf AliasedTableExprs from a TableExpr.
 	var collectAllTableInfos func(te sqlparser.TableExpr) []tableExprInfo
@@ -756,10 +806,12 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 		case *sqlparser.AliasedTableExpr:
 			dbName := e.CurrentDB
 			tblName := ""
+			hasDBQualifier := false
 			if tn, ok2 := t.Expr.(sqlparser.TableName); ok2 {
 				tblName = tn.Name.String()
 				if !tn.Qualifier.IsEmpty() {
 					dbName = tn.Qualifier.String()
+					hasDBQualifier = true
 				}
 			}
 			explAlias := ""
@@ -770,7 +822,13 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 			if explAlias != "" {
 				effAlias = explAlias
 			}
-			return []tableExprInfo{{name: tblName, explicitAlias: explAlias, db: dbName, effectiveAlias: effAlias}}
+			// rowAlias is what buildFromExpr uses as the key prefix in rows.
+			// extractTableAliasFromAliased returns "db.table" when there's a DB qualifier and no AS.
+			rowAlias := effAlias
+			if explAlias == "" && hasDBQualifier {
+				rowAlias = dbName + "." + tblName
+			}
+			return []tableExprInfo{{name: tblName, explicitAlias: explAlias, db: dbName, effectiveAlias: effAlias, rowAlias: rowAlias}}
 		case *sqlparser.JoinTableExpr:
 			left := collectAllTableInfos(t.LeftExpr)
 			right := collectAllTableInfos(t.RightExpr)
@@ -791,6 +849,58 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 		alias, _, _ := extractTableAlias(te)
 		tableAliases = append(tableAliases, alias)
 		allTableExprInfos = append(allTableExprInfos, collectAllTableInfos(te)...)
+	}
+
+	// Check for duplicate table aliases/names in the FROM clause.
+	// MySQL returns ER_NONUNIQ_TABLE (1066, 42000): "Not unique table/alias: 'X'".
+	// MySQL fires this error when:
+	// - Two entries share the same explicit alias (both have AS <same>)
+	// - An unqualified table name (no db prefix, no explicit alias) duplicates another alias
+	// When a cross-DB qualified table (e.g. db1.a1) "conflicts" with an explicit alias,
+	// MySQL instead lets the table-not-found error take priority.
+	{
+		type aliasEntry struct {
+			explicitAlias string
+			hasDBQualifier bool // true if table has a non-current-db qualifier AND no explicit alias
+		}
+		seenAliases := make(map[string]aliasEntry)
+		for _, info := range allTableExprInfos {
+			key := strings.ToLower(info.effectiveAlias)
+			isQualifiedNoAlias := info.explicitAlias == "" && info.db != "" && !strings.EqualFold(info.db, e.CurrentDB)
+			entry := aliasEntry{
+				explicitAlias:  info.explicitAlias,
+				hasDBQualifier: isQualifiedNoAlias,
+			}
+			if prev, seen := seenAliases[key]; seen {
+				// Fire "Not unique table/alias" unless BOTH entries are cross-DB qualified tables
+				// with no explicit aliases (in that case, table-not-found takes priority).
+				// Also skip if one entry is a cross-DB qualified table-name-only (no explicit alias)
+				// and the other has an explicit alias — MySQL lets table-not-found win.
+				prevQualifiedNoAlias := prev.hasDBQualifier && prev.explicitAlias == ""
+				curQualifiedNoAlias := entry.hasDBQualifier && entry.explicitAlias == ""
+				if !prevQualifiedNoAlias && !curQualifiedNoAlias {
+					return nil, mysqlError(1066, "42000",
+						fmt.Sprintf("Not unique table/alias: '%s'", info.effectiveAlias))
+				}
+				// Both are qualified-no-alias: skip dup check, let table-not-found win
+			} else {
+				seenAliases[key] = entry
+			}
+		}
+	}
+
+	// Check if any target is a non-updatable view (e.g. has LIMIT, GROUP BY, etc.).
+	// MySQL returns ER_NON_UPDATABLE_TABLE (1288) in this case.
+	for _, target := range stmt.Targets {
+		targetName := target.Name.String()
+		if _, _, isView := e.lookupView(targetName); isView {
+			// It's a view - check if it's updatable
+			_, _, _, resolveErr := e.resolveViewToBaseTable(targetName)
+			if resolveErr != nil {
+				return nil, mysqlError(1288, "HY000",
+					fmt.Sprintf("The target table %s of the DELETE is not updatable", targetName))
+			}
+		}
 	}
 
 	// Validate target tables: each target must match a table expr by alias (if aliased) or by name (if not aliased).
@@ -824,8 +934,8 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 						break
 					}
 				} else {
-					// No qualifier, no explicit alias: match by table name
-					if strings.EqualFold(info.name, targetName) {
+					// No qualifier, no explicit alias: match by table name only if same DB as current
+					if strings.EqualFold(info.name, targetName) && strings.EqualFold(info.db, e.CurrentDB) {
 						found = true
 						break
 					}
@@ -927,6 +1037,18 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 		for j := 1; j < len(crossPreds); j++ {
 			crossPred = &sqlparser.AndExpr{Left: crossPred, Right: crossPreds[j]}
 		}
+		// Even when there are no rows (e.g. INNER JOIN produces 0 rows), MySQL still
+		// evaluates non-correlated scalar subqueries in the WHERE clause and raises
+		// errors such as ER_SUBQUERY_NO_1_ROW (1242). We simulate this by evaluating
+		// the predicate once on an empty dummy row when allRows is empty. Column
+		// references in the predicate will return NULL (harmless), but subquery errors
+		// will propagate correctly.
+		if len(allRows) == 0 && !bool(stmt.Ignore) {
+			_, evalErr := e.evalWhere(crossPred, storage.Row{})
+			if evalErr != nil {
+				return nil, evalErr
+			}
+		}
 		filtered := make([]storage.Row, 0)
 		for _, row := range allRows {
 			match, err := e.evalWhere(crossPred, row)
@@ -945,41 +1067,160 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 		allRows = filtered
 	}
 
-	// Delete matched rows from target tables
-	var totalAffected uint64
+	// Delete matched rows from target tables.
+	// Two-phase approach:
+	//   Phase 1: Collect all rows to delete and fire BEFORE triggers.
+	//             If any BEFORE trigger fails, abort (MySQL semantics: whole statement rolls back).
+	//   Phase 2: Do the actual deletions, then fire AFTER triggers.
+	type deleteEntry struct {
+		tbl          *storage.Table
+		resolvedName string
+		resolvedDB   string
+		targetAlias  string
+		targetName   string
+		indices      []int
+		rows         []storage.Row
+	}
+	var deleteEntries []deleteEntry
+
+	// Collect what to delete
 	for _, target := range stmt.Targets {
 		targetName := target.Name.String()
 		targetDB := e.CurrentDB
 		if !target.Qualifier.IsEmpty() {
 			targetDB = target.Qualifier.String()
 		}
-		tbl, err := e.Storage.GetTable(targetDB, targetName)
+
+		// Resolve the target to the actual table name/db via allTableExprInfos.
+		// The target might be an alias (e.g. "t1" which is "db1.t2 AS t1"),
+		// so we must look up by effectiveAlias to get the real table and DB.
+		// Also extract rowAlias: the key prefix used in row maps by buildFromExpr.
+		resolvedName := targetName
+		resolvedDB := targetDB
+		resolvedRowAlias := targetName // the alias used as row key prefix by buildFromExpr
+		for _, info := range allTableExprInfos {
+			if strings.EqualFold(info.effectiveAlias, targetName) {
+				resolvedName = info.name
+				resolvedDB = info.db
+				if resolvedDB == "" {
+					resolvedDB = e.CurrentDB
+				}
+				resolvedRowAlias = info.rowAlias
+				break
+			}
+		}
+
+		tbl, err := e.Storage.GetTable(resolvedDB, resolvedName)
 		if err != nil {
 			continue
 		}
-		// Build alias for qualified column lookup (e.g., "d1.t1")
-		targetAlias := targetName
-		if targetDB != e.CurrentDB {
-			targetAlias = targetDB + "." + targetName
-		}
-		deleteIndices := make(map[int]bool)
+		targetAlias := resolvedRowAlias
+		deleteIndicesMap := make(map[int]bool)
 		for _, matchedRow := range allRows {
-			if idx := matchRowToTable(matchedRow, tbl, targetAlias, targetName); idx >= 0 && !deleteIndices[idx] {
-				deleteIndices[idx] = true
+			if idx := matchRowToTable(matchedRow, tbl, targetAlias, targetName); idx >= 0 && !deleteIndicesMap[idx] {
+				deleteIndicesMap[idx] = true
 			}
 		}
-		if len(deleteIndices) > 0 {
-			tbl.Lock()
-			newRows := make([]storage.Row, 0, len(tbl.Rows)-len(deleteIndices))
-			for i, row := range tbl.Rows {
-				if !deleteIndices[i] {
-					newRows = append(newRows, row)
-				}
+		if len(deleteIndicesMap) == 0 {
+			continue
+		}
+		sortedIdx := make([]int, 0, len(deleteIndicesMap))
+		for idx := range deleteIndicesMap {
+			sortedIdx = append(sortedIdx, idx)
+		}
+		sort.Ints(sortedIdx)
+		rows := make([]storage.Row, len(sortedIdx))
+		for i, idx := range sortedIdx {
+			rows[i] = tbl.Rows[idx]
+		}
+		deleteEntries = append(deleteEntries, deleteEntry{
+			tbl:          tbl,
+			resolvedName: resolvedName,
+			resolvedDB:   resolvedDB,
+			targetAlias:  targetAlias,
+			targetName:   targetName,
+			indices:      sortedIdx,
+			rows:         rows,
+		})
+	}
+
+	// Phase 1: Fire all BEFORE DELETE triggers and check FK constraints.
+	// If any fail, abort before deleting anything.
+	// For IGNORE mode: skip FK-violated rows rather than aborting.
+	var finalEntries []deleteEntry
+	for _, de := range deleteEntries {
+		var validIndices []int
+		var validRows []storage.Row
+		for i, row := range de.rows {
+			// Fire BEFORE DELETE trigger.
+			if err := e.fireTriggers(de.resolvedName, "BEFORE", "DELETE", nil, row); err != nil {
+				return nil, err
 			}
-			tbl.Rows = newRows
-			tbl.InvalidateIndexes()
-			tbl.Unlock()
-			totalAffected += uint64(len(deleteIndices))
+			// Check FK constraints.
+			if fkErr := e.checkForeignKeyOnDelete(de.resolvedDB, de.resolvedName, row); fkErr != nil {
+				if bool(stmt.Ignore) {
+					// IGNORE: skip this row, add a warning.
+					errCode := 1451
+					msg := strings.TrimPrefix(fkErr.Error(), "ERROR 1451 (23000): ")
+					e.addWarning("Warning", errCode, msg)
+					continue
+				}
+				return nil, fkErr
+			}
+			validIndices = append(validIndices, de.indices[i])
+			validRows = append(validRows, row)
+		}
+		if len(validIndices) > 0 {
+			de.indices = validIndices
+			de.rows = validRows
+			finalEntries = append(finalEntries, de)
+		}
+	}
+	deleteEntries = finalEntries
+
+	// Phase 2: Do all deletions and fire AFTER DELETE triggers.
+	// Save original rows for rollback if an AFTER trigger fails.
+	type tableSnapshot struct {
+		tbl      *storage.Table
+		origRows []storage.Row
+	}
+	var snapshots []tableSnapshot
+
+	var totalAffected uint64
+	for _, de := range deleteEntries {
+		deleteIndicesSet := make(map[int]bool, len(de.indices))
+		for _, idx := range de.indices {
+			deleteIndicesSet[idx] = true
+		}
+		de.tbl.Lock()
+		// Save original rows before deletion.
+		origRows := make([]storage.Row, len(de.tbl.Rows))
+		copy(origRows, de.tbl.Rows)
+		snapshots = append(snapshots, tableSnapshot{tbl: de.tbl, origRows: origRows})
+
+		newRows := make([]storage.Row, 0, len(de.tbl.Rows)-len(de.indices))
+		for i, row := range de.tbl.Rows {
+			if !deleteIndicesSet[i] {
+				newRows = append(newRows, row)
+			}
+		}
+		de.tbl.Rows = newRows
+		de.tbl.InvalidateIndexes()
+		de.tbl.Unlock()
+		totalAffected += uint64(len(de.indices))
+
+		// Fire AFTER DELETE triggers. On failure, roll back all deletions.
+		for _, row := range de.rows {
+			if err := e.fireTriggers(de.resolvedName, "AFTER", "DELETE", nil, row); err != nil {
+				// Rollback: restore all modified tables to their original rows.
+				for _, snap := range snapshots {
+					snap.tbl.Lock()
+					snap.tbl.Rows = snap.origRows
+					snap.tbl.InvalidateIndexes()
+					snap.tbl.Unlock()
+				}
+				return nil, err
+			}
 		}
 	}
 

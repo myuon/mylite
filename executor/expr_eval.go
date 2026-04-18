@@ -4024,21 +4024,36 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 		return int64(0), nil
 	case *sqlparser.OrExpr:
-		left, err := e.evalExpr(v.Left)
-		if err != nil {
-			return nil, err
-		}
-		right, err := e.evalExpr(v.Right)
-		if err != nil {
-			return nil, err
-		}
+		left, leftErr := e.evalExpr(v.Left)
 		// When PIPES_AS_CONCAT is active, || acts as string concatenation (same as CONCAT()).
-		// The SQL parser converts || to OrExpr, so we intercept it here.
 		if strings.Contains(e.sqlMode, "PIPES_AS_CONCAT") {
+			if leftErr != nil {
+				return nil, leftErr
+			}
+			right, rightErr := e.evalExpr(v.Right)
+			if rightErr != nil {
+				return nil, rightErr
+			}
 			if left == nil || right == nil {
 				return nil, nil
 			}
 			return toString(left) + toString(right), nil
+		}
+		// Short-circuit: if left is true, skip right evaluation entirely.
+		if leftErr == nil && isTruthy(left) {
+			return int64(1), nil
+		}
+		right, rightErr := e.evalExpr(v.Right)
+		// If left errored, propagate the error (right may be true or false).
+		if leftErr != nil {
+			if rightErr == nil && isTruthy(right) {
+				// Right is true; return true even though left errored.
+				return int64(1), nil
+			}
+			return nil, leftErr
+		}
+		if rightErr != nil {
+			return nil, rightErr
 		}
 		lb := isTruthy(left)
 		rb := isTruthy(right)
@@ -6989,13 +7004,21 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 		}
 		return l && r, nil
 	case *sqlparser.OrExpr:
-		l, err := e.evalWhere(v.Left, row)
-		if err != nil {
-			return false, err
+		l, lErr := e.evalWhere(v.Left, row)
+		// Short-circuit: if left is true, skip right evaluation.
+		if lErr == nil && l {
+			return true, nil
 		}
-		r, err := e.evalWhere(v.Right, row)
-		if err != nil {
-			return false, err
+		r, rErr := e.evalWhere(v.Right, row)
+		if lErr != nil {
+			// Left errored; if right is true, return true.
+			if rErr == nil && r {
+				return true, nil
+			}
+			return false, lErr
+		}
+		if rErr != nil {
+			return false, rErr
 		}
 		return l || r, nil
 	case *sqlparser.IsExpr:

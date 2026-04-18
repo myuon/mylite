@@ -213,6 +213,11 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 		if lookupTable == "" {
 			lookupTable = tableName
 		}
+		// When there is no current database and the table reference is unqualified,
+		// return "No database selected" (ER_NO_DB_ERROR, 3D000) like MySQL does.
+		if lookupDB == "" {
+			return nil, mysqlError(1046, "3D000", "No database selected")
+		}
 		if e.Storage == nil {
 			return nil, fmt.Errorf("no storage available")
 		}
@@ -246,6 +251,11 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 					}
 					return rows, nil
 				}
+			}
+			// Distinguish "unknown database" from "table not found":
+			// MySQL returns ER_BAD_DB_ERROR (1049, 42000) when the database itself doesn't exist.
+			if strings.Contains(err.Error(), "unknown database") {
+				return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", lookupDB))
 			}
 			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", lookupDB, lookupTable))
 		}

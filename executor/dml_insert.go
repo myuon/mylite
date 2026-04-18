@@ -156,6 +156,13 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		tableName = baseTable
 	}
 
+	// MySQL error 1442: can't modify a table inside a trigger if the triggering statement is
+	// already modifying that table.
+	if e.functionOrTriggerDepth > 0 && strings.EqualFold(e.modifyingTable, tableName) {
+		return nil, mysqlError(1442, "HY000",
+			fmt.Sprintf("Can't update table '%s' in stored function/trigger because it is already used by statement which invoked this stored function/trigger.", tableName))
+	}
+
 	// Reject INSERT on information_schema tables.
 	if strings.EqualFold(insertDB, "information_schema") {
 		return nil, mysqlError(1044, "42000", fmt.Sprintf("Access denied for user 'root'@'localhost' to database 'information_schema'"))
@@ -223,6 +230,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		colNames[i] = col.String()
 	}
 	// Normalize column names to match actual table column names (case-insensitive lookup)
+	// and validate that all specified columns exist in the table.
 	if len(colNames) > 0 {
 		colNameByLower := make(map[string]string, len(tbl.Def.Columns))
 		for _, col := range tbl.Def.Columns {
@@ -231,6 +239,9 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		for i, cn := range colNames {
 			if actual, ok := colNameByLower[strings.ToLower(cn)]; ok {
 				colNames[i] = actual
+			} else {
+				return nil, mysqlError(1054, "42S22",
+					fmt.Sprintf("Unknown column '%s' in 'field list'", cn))
 			}
 		}
 	}

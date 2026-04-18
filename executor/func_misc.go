@@ -937,7 +937,7 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		ulLen := binary.LittleEndian.Uint32(ulBytes[:4])
 		return int64(ulLen), true, nil
 	case "row_count":
-		return int64(-1), true, nil
+		return e.lastAffectedRows, true, nil
 	case "uuid_short":
 		return int64(rand.Int63()), true, nil
 	case "is_uuid":

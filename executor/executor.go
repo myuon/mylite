@@ -254,9 +254,13 @@ type Executor struct {
 	// DDL statements (implicit commit) clears this map, so ROLLBACK TO SAVEPOINT fails.
 	namedSavepoints map[string]bool
 	snapshots      map[string]*fullSnapshot
-	lastInsertID   int64
+	lastInsertID      int64
+	lastAffectedRows  int64 // stores ROW_COUNT() value: affected rows after DML, -1 after SELECT
 	lastUpdateInfo string // stores info message from last UPDATE (e.g. "Rows matched: 2  Changed: 1  Warnings: 0")
 	lastInsertInfo string // stores info message from last INSERT/REPLACE (e.g. "Records: 5  Duplicates: 2  Warnings: 0")
+	// modifyingTable tracks the table currently being modified by a DML statement,
+	// used to detect recursive table use in triggers (MySQL error 1442).
+	modifyingTable string
 	// cteMap holds CTE virtual tables for the currently executing query.
 	cteMap map[string]*cteTable
 	// sqlMode stores the current SQL mode (e.g. "TRADITIONAL", "STRICT_TRANS_TABLES").
@@ -1577,6 +1581,20 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 				}
 				e.warnings = append(e.warnings, Warning{Level: "Error", Code: code, Message: msg})
 			}
+			// Update ROW_COUNT() tracking (MySQL semantics):
+			// - After SELECT: -1
+			// - After failed DML: -1 (remains unchanged since it was already -1 or a previous value)
+			// - After successful DML: AffectedRows
+			if retErr == nil && res != nil {
+				if res.Columns != nil {
+					// SELECT result: set to -1
+					e.lastAffectedRows = -1
+				} else {
+					// DML result: set to affected rows
+					e.lastAffectedRows = int64(res.AffectedRows)
+				}
+			}
+			// On error, leave lastAffectedRows as -1 (MySQL returns -1 after failed statements)
 		}()
 	}
 
@@ -4700,7 +4718,20 @@ func (e *Executor) resolveViewToBaseTable(tableName string) (string, bool, sqlpa
 	if sel.Where != nil {
 		viewWhere = sel.Where.Expr
 	}
-	return tn.Name.String(), true, viewWhere, nil
+	baseTableName := tn.Name.String()
+	// If the resolved base table is itself a view, recursively resolve.
+	// If the inner view is non-updatable, report a join view error for the original view.
+	if _, _, isNestedView := e.lookupView(baseTableName); isNestedView {
+		_, _, _, innerErr := e.resolveViewToBaseTable(baseTableName)
+		if innerErr != nil {
+			// The nested view is not updatable (join/non-simple view).
+			// MySQL reports "Can not delete from join view" for the outer view.
+			return "", true, nil, mysqlError(1395, "HY000",
+				fmt.Sprintf("Can not delete from join view '%s.%s'", e.CurrentDB, tableName))
+		}
+		// Nested view is also a simple single-table view - it's OK.
+	}
+	return baseTableName, true, viewWhere, nil
 }
 
 // getViewCheckCondition returns the WHERE expression from a view definition if it has WITH CHECK OPTION.
