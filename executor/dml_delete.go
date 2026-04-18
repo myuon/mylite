@@ -395,28 +395,31 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		}
 
 		// Evaluate WHERE in sorted order, stopping at limitCount matches.
+		// If limitCount == 0, skip entirely (LIMIT 0 deletes nothing).
 		var flatRows [][]interface{}
-		for _, r := range allFlatRows {
-			origIdx := r[len(r)-1].(int)
-			row := tbl.Rows[origIdx]
-			match := true
-			if stmt.Where != nil {
-				m, wErr := e.evalWhere(stmt.Where.Expr, row)
-				if wErr != nil {
-					if bool(stmt.Ignore) {
-						e.addWarning("Warning", 1242, strings.TrimPrefix(wErr.Error(), "ERROR 1242 (21000): "))
-						match = false
+		if limitCount != 0 {
+			for _, r := range allFlatRows {
+				origIdx := r[len(r)-1].(int)
+				row := tbl.Rows[origIdx]
+				match := true
+				if stmt.Where != nil {
+					m, wErr := e.evalWhere(stmt.Where.Expr, row)
+					if wErr != nil {
+						if bool(stmt.Ignore) {
+							e.addWarning("Warning", 1242, strings.TrimPrefix(wErr.Error(), "ERROR 1242 (21000): "))
+							match = false
+						} else {
+							return nil, wErr
+						}
 					} else {
-						return nil, wErr
+						match = m
 					}
-				} else {
-					match = m
 				}
-			}
-			if match {
-				flatRows = append(flatRows, r)
-				if limitCount >= 0 && int64(len(flatRows)) >= limitCount {
-					break
+				if match {
+					flatRows = append(flatRows, r)
+					if limitCount > 0 && int64(len(flatRows)) >= limitCount {
+						break
+					}
 				}
 			}
 		}
@@ -1254,6 +1257,40 @@ func findTopLevelWhereIndex(s string) int {
 		}
 	}
 	return -1
+}
+
+// isAliasBeforeUsing returns true if the DELETE SQL has the pattern
+// "DELETE [mods] FROM single_table alias USING ..." which is invalid MySQL syntax.
+// Returns false for valid multi-table USING syntax like "DELETE FROM t1, t2 USING ...".
+// The upper argument must be the uppercased, normalized query.
+func isAliasBeforeUsing(upper string) bool {
+	// Strip leading "DELETE " and modifiers
+	rest := strings.TrimSpace(upper[len("DELETE "):])
+	for _, mod := range []string{"LOW_PRIORITY ", "QUICK ", "IGNORE "} {
+		for strings.HasPrefix(rest, mod) {
+			rest = strings.TrimSpace(rest[len(mod):])
+		}
+	}
+	// Must start with "FROM "
+	if !strings.HasPrefix(rest, "FROM ") {
+		return false
+	}
+	rest = strings.TrimSpace(rest[len("FROM "):])
+	// Find USING keyword
+	usingIdx := strings.Index(rest, " USING ")
+	if usingIdx < 0 {
+		return false
+	}
+	// Get the part between FROM and USING
+	targetsStr := strings.TrimSpace(rest[:usingIdx])
+	// If there's a comma, it's a valid multi-table target list (not alias-before-USING)
+	if strings.Contains(targetsStr, ",") {
+		return false
+	}
+	// Single table name with no comma — check if there's a space (indicating an alias)
+	// e.g., "t1 alias" has a space, while "t1" or "db.t1" do not
+	fields := strings.Fields(targetsStr)
+	return len(fields) > 1
 }
 
 // execMultiTableDelete handles multi-table DELETE statements:

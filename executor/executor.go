@@ -2027,15 +2027,19 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 		// For multi-table DELETE: DELETE t1,t2 FROM t1,t2,t3 WHERE ...
 		// or DELETE [QUICK] FROM t1,t2 USING t1,t2,t3 WHERE ...
-		// Only fall back to string-based parser if vitess produced a non-USING syntax error.
-		// If vitess fails because of an alias before USING (e.g., "DELETE FROM t1 alias USING ..."),
-		// that's genuinely invalid SQL (ER_PARSE_ERROR). Other parse failures (e.g., t1.* syntax)
-		// should still fall back to the string-based handler.
+		// Fall back to string-based parser for multi-table delete variants.
+		// Exception: "DELETE FROM t1 alias USING ..." is a genuine parse error (ER_PARSE_ERROR),
+		// but only when there's a single table target with an alias (no comma) before USING.
 		if strings.HasPrefix(upper, "DELETE ") {
 			errStr := err.Error()
 			if strings.Contains(errStr, "syntax error at position") && strings.Contains(errStr, "near 'USING'") {
-				// "DELETE FROM <table> <alias> USING ..." is a genuine parse error
-				return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", extractNearFromParseError(trimmed, err)))
+				// Check if this is the alias-before-USING error vs valid multi-table USING syntax.
+				// Valid: DELETE [mods] FROM t1, t2 USING ... (comma between targets)
+				// Invalid: DELETE FROM t1 alias USING ... (single target with space-separated alias)
+				// Detect by looking for comma between FROM and USING in normalized query.
+				if isAliasBeforeUsing(upper) {
+					return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", extractNearFromParseError(trimmed, err)))
+				}
 			}
 			return e.execMultiTableDelete(trimmed)
 		}
