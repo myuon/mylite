@@ -332,6 +332,7 @@ func normalizeTimeLiteral(s string) (string, error) {
 		sec := n % 100
 		n /= 100
 		min := n % 100
+		n /= 100
 		hrs := n
 		if min >= 60 || sec >= 60 {
 			return "", errFn()
