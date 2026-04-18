@@ -977,6 +977,33 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							colUpper := strings.ToUpper(col.Type)
 							isDecType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || colUpper == "REAL" || strings.HasPrefix(colUpper, "REAL ")
 							if isDecType {
+								// In strict mode, string values that cannot be parsed as a valid
+								// float are "Incorrect decimal value" (1366), not "Out of range" (1264).
+								// This check must happen BEFORE checkDecimalRange which calls toFloat()
+								// and may treat the value as in-range.
+								if sv, isStr := v.(string); isStr {
+									svTrimmed := strings.TrimSpace(sv)
+									if _, pfErr := strconv.ParseFloat(svTrimmed, 64); pfErr != nil {
+										// String doesn't parse as a valid float.
+										// In IGNORE mode: if there is a valid numeric prefix, truncate (Note 1265);
+										// otherwise emit Warning 1366 and store 0.
+										if bool(stmt.Ignore) {
+											if prefix2, ok2 := extractNumericPrefix(svTrimmed); ok2 && prefix2 != svTrimmed {
+												e.addWarning("Note", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+												v = prefix2
+												// fall through to let coerceColumnValueForWrite format it
+											} else {
+												e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row 1", sv, col.Name))
+												v = float64(0)
+											}
+										} else {
+											return nil, mysqlError(1366, "HY000", fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row 1", sv, col.Name))
+										}
+										// Skip further decimal validation since we've handled it
+										row[colNames[i]] = v
+										break
+									}
+								}
 								if strings.Contains(colUpper, "UNSIGNED") || strings.Contains(colUpper, "ZEROFILL") {
 									f := toFloat(v)
 									if f < 0 {
@@ -1598,8 +1625,38 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 								}
 							} else if isDecimalType {
 								if _, perr := strconv.ParseFloat(numText, 64); perr != nil {
-									// Try to extract a valid numeric prefix (e.g. "123.4e" -> "123.4")
+									// Try to extract a valid numeric prefix (e.g. "123.4abc" -> "123.4")
 									// MySQL behavior: truncate invalid suffix and emit Note 1265.
+									// Exception: if the string ends with E/e not followed by digits (incomplete
+									// scientific notation like "-100E"), MySQL emits "Incorrect decimal value" (1366).
+									trimmedNum := strings.TrimSpace(numText)
+									hasIncompleteExp := false
+									if len(trimmedNum) > 0 {
+										lastChar := trimmedNum[len(trimmedNum)-1]
+										// Check if string ends with E/e (or E+/e+/e-/E-) without following digits
+										if lastChar == 'E' || lastChar == 'e' || lastChar == '+' || lastChar == '-' {
+											// ends with E, E+, E-, etc. → incomplete scientific notation
+											for k := len(trimmedNum) - 1; k >= 0; k-- {
+												ch := trimmedNum[k]
+												if ch == 'E' || ch == 'e' {
+													hasIncompleteExp = true
+													break
+												}
+												if ch >= '0' && ch <= '9' {
+													break // digit found before E: not an exponent issue
+												}
+											}
+										}
+									}
+									if hasIncompleteExp {
+										// Incomplete scientific notation → "Incorrect decimal value"
+										if bool(stmt.Ignore) {
+											e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row 1", val, col.Name))
+											row[col.Name] = float64(0)
+											break
+										}
+										return nil, mysqlError(1366, "HY000", fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row 1", val, col.Name))
+									}
 									if prefix, ok := extractNumericPrefix(numText); ok && prefix != numText {
 										e.addWarning("Note", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 										numText = prefix
