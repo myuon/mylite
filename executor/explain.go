@@ -1488,6 +1488,20 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 
 			if accessInfo.accessType == "const" || accessInfo.accessType == "eq_ref" || accessInfo.accessType == "ref" {
 				rowCount = int64(1)
+			} else if accessInfo.accessType == "range" && sel.Where != nil && e.Storage != nil {
+				// For range access, estimate row count by evaluating the WHERE on stored rows.
+				// This gives accurate estimates for small in-memory tables.
+				if tbl, err := e.Storage.GetTable(e.CurrentDB, tblName); err == nil && len(tbl.Rows) > 0 {
+					rangeCount := int64(0)
+					for _, row := range tbl.Rows {
+						if match, merr := e.evalWhere(sel.Where.Expr, row); merr == nil && match {
+							rangeCount++
+						}
+					}
+					if rangeCount > 0 {
+						rowCount = rangeCount
+					}
+				}
 			} else if tableIsEmpty {
 				// For ALL-scan empty tables, use rows=1 to match InnoDB's default statistics
 				// (the minimum estimate for an empty table is 1 row in InnoDB stats).
