@@ -410,23 +410,12 @@ func FormatMySQLFloat32(v float32) string {
 	}
 	abs := math.Abs(f)
 	if abs != 0 && (abs >= 1e14 || abs < 1e-4) {
-		// Use bitSize=32 for float32 precision, up to 6 significant digits.
-		// MySQL strips trailing zeros from the mantissa (e.g. "3.40000e38" → "3.4e38",
-		// but "3.40282e38" stays as is since those digits are significant).
+		// Use bitSize=32 for float32 precision, keeping 5 decimal places (6 sig figs)
 		s := strconv.FormatFloat(f, 'e', 5, 32)
-		// Strip trailing zeros from mantissa (the part before the 'e')
-		if eIdx := strings.IndexByte(s, 'e'); eIdx >= 0 {
-			mantissa := s[:eIdx]
-			exp := s[eIdx:]
-			if strings.ContainsRune(mantissa, '.') {
-				mantissa = strings.TrimRight(mantissa, "0")
-				mantissa = strings.TrimRight(mantissa, ".")
-			}
-			s = mantissa + exp
-		}
 		s = strings.Replace(s, "e+0", "e", 1)
 		s = strings.Replace(s, "e-0", "e-", 1)
 		s = strings.Replace(s, "e+", "e", 1)
+		// For FLOAT, MySQL keeps trailing zeros (6 significant digits)
 		return s
 	}
 	return strconv.FormatFloat(f, 'f', -1, 32)
