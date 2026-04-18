@@ -1162,44 +1162,57 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						}
 					}
 				}
-				// Apply ON UPDATE CURRENT_TIMESTAMP for columns with that property
-				for _, col := range tbl.Def.Columns {
-					if col.OnUpdateCurrentTimestamp {
-						// Only update if the column wasn't explicitly set in the ON DUP clause
-						explicitlySet := false
-						for _, upd := range stmt.OnDup {
-							if upd.Name.Name.String() == col.Name {
-								explicitlySet = true
-								break
+				// Apply ON UPDATE CURRENT_TIMESTAMP for columns with that property.
+				// MySQL only fires ON UPDATE if the row actually changed (at least one column value differs).
+				rowActuallyChanged := false
+				for k, newVal := range tbl.Rows[dupIdx] {
+					if fmt.Sprintf("%v", newVal) != fmt.Sprintf("%v", odduSnap[k]) {
+						rowActuallyChanged = true
+						break
+					}
+				}
+				if rowActuallyChanged {
+					for _, col := range tbl.Def.Columns {
+						if col.OnUpdateCurrentTimestamp {
+							// Only update if the column wasn't explicitly set in the ON DUP clause
+							explicitlySet := false
+							for _, upd := range stmt.OnDup {
+								if upd.Name.Name.String() == col.Name {
+									explicitlySet = true
+									break
+								}
 							}
-						}
-						if !explicitlySet {
-							nowStr := e.nowTime().Format("2006-01-02 15:04:05")
-							tbl.Rows[dupIdx][col.Name] = nowStr
+							if !explicitlySet {
+								nowStr := e.nowTime().Format("2006-01-02 15:04:05")
+								tbl.Rows[dupIdx][col.Name] = nowStr
+							}
 						}
 					}
 				}
 				// Check NOT NULL constraints on the updated row.
 				updatedRow := tbl.Rows[dupIdx]
-				var notNullColName string
+				var firstNotNullViolation string
 				for _, col := range tbl.Def.Columns {
 					if !col.Nullable && !col.AutoIncrement && !isGeneratedColumnType(col.Type) {
 						if updatedRow[col.Name] == nil {
-							notNullColName = col.Name
-							break
+							if bool(stmt.Ignore) {
+								// INSERT IGNORE: coerce NULL to zero value, add warning, continue update
+								e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", col.Name))
+								tbl.Rows[dupIdx][col.Name] = implicitZeroValue(col.Type)
+							} else {
+								if firstNotNullViolation == "" {
+									firstNotNullViolation = col.Name
+								}
+							}
 						}
 					}
 				}
-				if notNullColName != "" {
+				if firstNotNullViolation != "" {
 					// Rollback the update
 					tbl.Rows[dupIdx] = odduSnap
 					tbl.InvalidateIndexes()
 					tbl.Unlock()
-					if bool(stmt.Ignore) {
-						e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", notNullColName))
-						continue
-					}
-					return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", notNullColName))
+					return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", firstNotNullViolation))
 				}
 				// Check that the updated row does not violate any other unique constraints.
 				// E.g. ON DUPLICATE KEY UPDATE b=4 might create a duplicate on another UNIQUE key.
