@@ -337,6 +337,10 @@ type Executor struct {
 	// onDupValuesRow holds the candidate INSERT row while evaluating
 	// ON DUPLICATE KEY UPDATE expressions (for VALUES(col) support).
 	onDupValuesRow storage.Row
+	// onDupSourceColNames holds the source column names (from SELECT) for INSERT...SELECT
+	// ON DUPLICATE KEY UPDATE, so that bare column references in the UPDATE expression
+	// can be resolved using source column names.
+	onDupSourceColNames []string
 	// defaultsTableDef holds the table definition for evaluating DEFAULT(col) expressions.
 	// Set during INSERT/UPDATE operations so that DEFAULT(colname) can look up the column default.
 	defaultsTableDef *catalog.TableDef

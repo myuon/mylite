@@ -567,10 +567,33 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		// MySQL error 1052: if an unqualified column name in the ODKU RHS expression
 		// exists in both the SELECT source result columns AND the target table columns,
 		// it is ambiguous and MySQL raises ER_NON_UNIQ_ERROR.
+		// MySQL WL#5094: when the source SELECT is grouped (GROUP BY) or has aggregates,
+		// column references in ODKU must refer only to target table columns (source cols
+		// are not accessible from grouped queries).
 		if len(stmt.OnDup) > 0 {
-			sourceColSet := make(map[string]bool, len(selResult.Columns))
-			for _, sc := range selResult.Columns {
-				sourceColSet[strings.ToLower(sc)] = true
+			// Determine if the source SELECT is grouped or aggregate-only.
+			selectIsGrouped := sel.GroupBy != nil && len(sel.GroupBy.Exprs) > 0
+			if !selectIsGrouped {
+				// Check for aggregate functions in select exprs
+				for _, se := range sel.SelectExprs.Exprs {
+					if ae, ok := se.(*sqlparser.AliasedExpr); ok {
+						if isAggregateExpr(ae.Expr) {
+							selectIsGrouped = true
+							break
+						}
+					}
+				}
+			}
+			var sourceColSet map[string]bool
+			if !selectIsGrouped {
+				// Non-grouped SELECT: source column names are accessible in ODKU.
+				sourceColSet = make(map[string]bool, len(selResult.Columns))
+				for _, sc := range selResult.Columns {
+					sourceColSet[strings.ToLower(sc)] = true
+				}
+			} else {
+				// Grouped SELECT: source column names are NOT accessible in ODKU.
+				sourceColSet = make(map[string]bool)
 			}
 			targetColSet := make(map[string]bool, len(tbl.Def.Columns))
 			for _, tc := range tbl.Def.Columns {
@@ -618,6 +641,28 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			valRows = append(valRows, tuple)
 		}
 		stmt.Rows = valRows
+		// Save source column names for ON DUPLICATE KEY UPDATE column reference resolution.
+		// When INSERT...SELECT ON DUPLICATE KEY UPDATE uses bare column names like 'a',
+		// they refer to the source SELECT columns, not the target table columns.
+		// Exception: grouped queries (GROUP BY or aggregates) don't expose source col names.
+		if len(stmt.OnDup) > 0 {
+			odkvSourceIsGrouped := sel.GroupBy != nil && len(sel.GroupBy.Exprs) > 0
+			if !odkvSourceIsGrouped {
+				for _, se := range sel.SelectExprs.Exprs {
+					if ae, ok2 := se.(*sqlparser.AliasedExpr); ok2 {
+						if isAggregateExpr(ae.Expr) {
+							odkvSourceIsGrouped = true
+							break
+						}
+					}
+				}
+			}
+			if !odkvSourceIsGrouped {
+				prevSourceColNames := e.onDupSourceColNames
+				e.onDupSourceColNames = selResult.Columns
+				defer func() { e.onDupSourceColNames = prevSourceColNames }()
+			}
+		}
 	} else if union, ok := stmt.Rows.(*sqlparser.Union); ok {
 		unionResult, err := e.execUnion(union)
 		if err != nil {
@@ -629,6 +674,40 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			return result, nil
 		}
 		// Fall through to slow path
+		// For UNION queries, source column names are NOT accessible in ODKU (same as grouped SELECT).
+		// MySQL WL#5094: validate that ODKU column references don't refer to source columns.
+		if len(stmt.OnDup) > 0 {
+			// UNION source: column names are not accessible in ODKU; target cols only.
+			sourceColSet := make(map[string]bool) // empty: no source col names for UNION
+			targetColSet := make(map[string]bool, len(tbl.Def.Columns))
+			for _, tc := range tbl.Def.Columns {
+				targetColSet[strings.ToLower(tc.Name)] = true
+			}
+			for _, upd := range stmt.OnDup {
+				if walkErr := sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+					switch node.(type) {
+					case *sqlparser.Subquery, *sqlparser.Select, *sqlparser.Union:
+						return false, nil
+					}
+					if colName, ok := node.(*sqlparser.ColName); ok {
+						if colName.Qualifier.IsEmpty() {
+							cn := strings.ToLower(colName.Name.String())
+							if sourceColSet[cn] && targetColSet[cn] {
+								return false, mysqlError(1052, "23000",
+									fmt.Sprintf("Column '%s' in field list is ambiguous", colName.Name.String()))
+							}
+							if !sourceColSet[cn] && !targetColSet[cn] {
+								return false, mysqlError(1054, "42S22",
+									fmt.Sprintf("Unknown column '%s' in 'field list'", colName.Name.String()))
+							}
+						}
+					}
+					return true, nil
+				}, upd.Expr); walkErr != nil {
+					return nil, walkErr
+				}
+			}
+		}
 		var valRows sqlparser.Values
 		for _, selRow := range unionResult.Rows {
 			var tuple sqlparser.ValTuple
@@ -1120,7 +1199,29 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					odduSnap[k] = v
 				}
 				prevOnDupValuesRow := e.onDupValuesRow
-				e.onDupValuesRow = row
+				// Augment the VALUES row with source column names (for INSERT...SELECT ODKU).
+				// In INSERT t0 SELECT a FROM t1 ON DUPLICATE KEY UPDATE k = a + t1.a + 10,
+				// 'a' refers to the source column, not the target 'k'. We add source col
+				// name entries to the row so that evalColNameExpr can find them.
+				odkvRow := row
+				if len(e.onDupSourceColNames) > 0 {
+					odkvRow = make(storage.Row, len(row)+len(e.onDupSourceColNames))
+					for k, v := range row {
+						odkvRow[k] = v
+					}
+					// Add source column name → value mappings.
+					// colNames[i] is the target column; onDupSourceColNames[i] is the source column.
+					for i, srcColName := range e.onDupSourceColNames {
+						if i < len(colNames) {
+							if v, ok := row[colNames[i]]; ok {
+								odkvRow[srcColName] = v
+								// Also add qualified "table.col" form (e.g. "t1.a")
+								// so that t1.a resolves correctly.
+							}
+						}
+					}
+				}
+				e.onDupValuesRow = odkvRow
 				prevCorrelatedRow := e.correlatedRow
 				e.correlatedRow = odduSnap
 				prevDefaultsTableDef := e.defaultsTableDef

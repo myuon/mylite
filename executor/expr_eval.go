@@ -627,6 +627,29 @@ func (e *Executor) evalColNameExpr(v *sqlparser.ColName) (interface{}, error) {
 				return rv, nil
 			}
 		}
+		// In ON DUPLICATE KEY UPDATE context, bare column names that are not found
+		// in the existing row (correlatedRow) should be looked up in the VALUES row
+		// (the row being inserted). This handles cases like:
+		//   INSERT INTO t0 SELECT a FROM t1 ON DUPLICATE KEY UPDATE k = a + t1.a + 10
+		// where 'a' and 't1.a' refer to the source row being inserted.
+		if e.onDupValuesRow != nil {
+			colName := v.Name.String()
+			if !v.Qualifier.IsEmpty() {
+				qualified := v.Qualifier.Name.String() + "." + colName
+				if val, ok := e.onDupValuesRow[qualified]; ok {
+					return val, nil
+				}
+			}
+			if val, ok := e.onDupValuesRow[colName]; ok {
+				return val, nil
+			}
+			upperName := strings.ToUpper(colName)
+			for k, rv := range e.onDupValuesRow {
+				if strings.ToUpper(k) == upperName {
+					return rv, nil
+				}
+			}
+		}
 	}
 	// Return column name as string for use in row lookup
 	return v.Name.String(), nil
