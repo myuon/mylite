@@ -480,6 +480,34 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	}
 
 	if sel, ok := stmt.Rows.(*sqlparser.Select); ok {
+		// For INSERT...SELECT with no real FROM clause, validate bare column references
+		// in the SELECT list. MySQL raises ER_BAD_FIELD_ERROR for unresolvable column names.
+		selHasRealFrom := false
+		for _, f := range sel.From {
+			if ate, ok2 := f.(*sqlparser.AliasedTableExpr); ok2 {
+				if tn, ok3 := ate.Expr.(sqlparser.TableName); ok3 {
+					if strings.ToLower(tn.Name.String()) != "dual" {
+						selHasRealFrom = true
+						break
+					}
+				} else {
+					selHasRealFrom = true
+					break
+				}
+			} else {
+				selHasRealFrom = true
+				break
+			}
+		}
+		if !selHasRealFrom {
+			for _, expr := range sel.SelectExprs.Exprs {
+				if se, ok2 := expr.(*sqlparser.AliasedExpr); ok2 {
+					if err := validateNoFromTopLevelColRefs(se.Expr); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
 		selResult, err := e.execSelect(sel)
 		if err != nil {
 			return nil, err
@@ -540,13 +568,23 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			for _, upd := range stmt.OnDup {
 				// Check all unqualified column references in the update RHS expression.
 				// If a column name exists in both source and target, it is ambiguous.
+				// If a column name exists in neither source nor target, it is unknown.
 				if walkErr := sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+					// Don't walk into subqueries – column references there are validated separately.
+					switch node.(type) {
+					case *sqlparser.Subquery, *sqlparser.Select, *sqlparser.Union:
+						return false, nil
+					}
 					if colName, ok := node.(*sqlparser.ColName); ok {
 						if colName.Qualifier.IsEmpty() {
 							cn := strings.ToLower(colName.Name.String())
 							if sourceColSet[cn] && targetColSet[cn] {
 								return false, mysqlError(1052, "23000",
 									fmt.Sprintf("Column '%s' in field list is ambiguous", colName.Name.String()))
+							}
+							if !sourceColSet[cn] && !targetColSet[cn] {
+								return false, mysqlError(1054, "42S22",
+									fmt.Sprintf("Unknown column '%s' in 'field list'", colName.Name.String()))
 							}
 						}
 					}

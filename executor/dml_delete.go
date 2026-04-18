@@ -199,6 +199,36 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 	tbl.Lock()
 	defer tbl.Unlock()
 
+	// Validate WHERE clause column references against table columns.
+	// This catches unknown columns even when the table has no rows.
+	if stmt.Where != nil {
+		availCols := make(map[string]bool)
+		for _, col := range tbl.Def.Columns {
+			availCols[strings.ToLower(col.Name)] = true
+		}
+		if len(availCols) > 0 {
+			walkErr := sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+				switch node.(type) {
+				case *sqlparser.Subquery, *sqlparser.Select, *sqlparser.Union:
+					return false, nil
+				}
+				if colName, ok := node.(*sqlparser.ColName); ok {
+					if colName.Qualifier.IsEmpty() {
+						cn := strings.ToLower(colName.Name.String())
+						if !availCols[cn] {
+							return false, mysqlError(1054, "42S22",
+								fmt.Sprintf("Unknown column '%s' in 'where clause'", colName.Name.String()))
+						}
+					}
+				}
+				return true, nil
+			}, stmt.Where.Expr)
+			if walkErr != nil {
+				return nil, walkErr
+			}
+		}
+	}
+
 	// SQL_SAFE_UPDATES: reject DELETE without WHERE using a KEY column (unless LIMIT present).
 	if err := e.checkSafeUpdate(tbl.Def, func() sqlparser.Expr {
 		if stmt.Where != nil {
@@ -598,6 +628,46 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 		perTablePreds = make([][]sqlparser.Expr, len(tableAliases))
 	}
 
+	// Validate WHERE clause column references against available table columns.
+	// This ensures unknown columns are caught even when tables are empty.
+	if stmt.Where != nil {
+		availCols := make(map[string]bool)
+		for _, te := range stmt.TableExprs {
+			alias, tableName, _ := extractTableAlias(te)
+			dbName := e.CurrentDB
+			if dbCat, err2 := e.Catalog.GetDatabase(dbName); err2 == nil {
+				if tblCat, err3 := dbCat.GetTable(tableName); err3 == nil {
+					for _, col := range tblCat.Columns {
+						availCols[strings.ToLower(col.Name)] = true
+						// Also add alias-qualified form
+						availCols[strings.ToLower(alias+"."+col.Name)] = true
+					}
+				}
+			}
+		}
+		if len(availCols) > 0 {
+			walkErr := sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+				switch node.(type) {
+				case *sqlparser.Subquery, *sqlparser.Select, *sqlparser.Union:
+					return false, nil
+				}
+				if colName, ok := node.(*sqlparser.ColName); ok {
+					if colName.Qualifier.IsEmpty() {
+						cn := strings.ToLower(colName.Name.String())
+						if !availCols[cn] {
+							return false, mysqlError(1054, "42S22",
+								fmt.Sprintf("Unknown column '%s' in 'where clause'", colName.Name.String()))
+						}
+					}
+				}
+				return true, nil
+			}, stmt.Where.Expr)
+			if walkErr != nil {
+				return nil, walkErr
+			}
+		}
+	}
+
 	// Build rows from each table, pre-filtering with table-specific predicates
 	allTableRows := make([][]storage.Row, len(stmt.TableExprs))
 	for i, te := range stmt.TableExprs {
@@ -867,6 +937,53 @@ func (e *Executor) execMultiTableDelete(query string) (*Result, error) {
 
 	if len(tableRefs) == 0 {
 		return &Result{}, nil
+	}
+
+	// Validate WHERE clause column references against available table columns.
+	// This catches unknown columns even when the tables are empty.
+	if sel.Where != nil {
+		availCols := make(map[string]bool)
+		for _, ref := range tableRefs {
+			db := ref.db
+			if db == "" {
+				db = e.CurrentDB
+			}
+			if tblDef, err2 := e.Storage.GetTable(db, ref.name); err2 == nil {
+				for _, row := range tblDef.Rows {
+					for k := range row {
+						availCols[strings.ToLower(k)] = true
+					}
+					break
+				}
+			}
+			// Also use catalog for column definitions
+			if dbCat, err2 := e.Catalog.GetDatabase(db); err2 == nil {
+				if tblCat, err3 := dbCat.GetTable(ref.name); err3 == nil {
+					for _, col := range tblCat.Columns {
+						availCols[strings.ToLower(col.Name)] = true
+					}
+				}
+			}
+		}
+		walkErr := sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+			switch node.(type) {
+			case *sqlparser.Subquery, *sqlparser.Select, *sqlparser.Union:
+				return false, nil
+			}
+			if colName, ok := node.(*sqlparser.ColName); ok {
+				if colName.Qualifier.IsEmpty() {
+					cn := strings.ToLower(colName.Name.String())
+					if !availCols[cn] {
+						return false, mysqlError(1054, "42S22",
+							fmt.Sprintf("Unknown column '%s' in 'where clause'", colName.Name.String()))
+					}
+				}
+			}
+			return true, nil
+		}, sel.Where.Expr)
+		if walkErr != nil {
+			return nil, walkErr
+		}
 	}
 
 	// Build joined rows from the FROM clause, handling JOINs.
