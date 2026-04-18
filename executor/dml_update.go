@@ -498,6 +498,17 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 								}
 								return nil, err
 							}
+							// In strict mode, also check DECIMAL/FLOAT/DOUBLE/REAL range.
+							if strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "NUMERIC") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || strings.Contains(colUpper, "REAL") {
+								f, cls := decimalParseValue(val)
+								if maxAbs, unsignedCol, ok := numericTypeRange(col.Type); ok {
+									outOfRange := cls == "overflow_pos" || cls == "overflow_neg" || math.Abs(f) > maxAbs
+									if (unsignedCol && (cls == "overflow_neg" || f < 0)) || outOfRange {
+										rowNum := i + 1
+										return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", col.Name, rowNum))
+									}
+								}
+							}
 						}
 					}
 					// String length check for CHAR/VARCHAR/BINARY/VARBINARY/BLOB/TEXT columns
