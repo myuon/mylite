@@ -238,10 +238,45 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 				// overwrite the outer query's text (used for column name extraction).
 				savedCurrentQuery := e.currentQuery
 				// SQL SECURITY DEFINER: view executes with definer's privileges, not invoker's.
-				// To implement this, temporarily clear __current_user so underlying table
+				// For DEFINER views, temporarily clear __current_user so underlying table
 				// access uses root/definer privileges (no privilege checks).
+				// For INVOKER views, keep __current_user so the invoker's privileges are used.
+				isInvoker := e.isInvokerView(lookupDB, lookupTable)
 				savedCurrentUser := e.userVars["__current_user"]
-				e.userVars["__current_user"] = ""
+				savedActiveRoles := e.userVars["__active_roles"]
+				if !isInvoker {
+					// DEFINER view: execute with definer's privileges (not invoker's).
+					// Find the definer from the view's createSQL and set __current_user to
+					// the definer so privilege checks run under the definer's account.
+					// Also set __active_roles to the definer's default roles.
+					definerSet := false
+					if e.viewStore != nil && e.grantStore != nil {
+						if createSQL, ok2 := e.viewStore.LookupCreateSQL(lookupDB, lookupTable); ok2 {
+							if defUser, defHost, found := extractDefiner(createSQL); found {
+								if strings.EqualFold(defUser, "root") {
+									// Root definer: bypass all privilege checks
+									e.userVars["__current_user"] = ""
+									e.userVars["__active_roles"] = []string{}
+								} else {
+									// Non-root definer: use definer's account with their active default roles
+									// (only roles that are still currently granted to the definer).
+									e.userVars["__current_user"] = defUser
+									defRoles := e.grantStore.GetActiveDefaultRoles(defUser, defHost)
+									if len(defRoles) > 0 {
+										e.userVars["__active_roles"] = defRoles
+									} else {
+										e.userVars["__active_roles"] = []string{}
+									}
+								}
+								definerSet = true
+							}
+						}
+					}
+					if !definerSet {
+						// No definer info found: fall back to clearing current_user (root-like)
+						e.userVars["__current_user"] = ""
+					}
+				}
 				// For cross-database views, temporarily set CurrentDB to the view's database.
 				savedCurrentDB := e.CurrentDB
 				if crossDB {
@@ -252,8 +287,15 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 					e.CurrentDB = savedCurrentDB
 				}
 				e.userVars["__current_user"] = savedCurrentUser
+				e.userVars["__active_roles"] = savedActiveRoles
 				e.currentQuery = savedCurrentQuery
 				if err != nil {
+					// For INVOKER and DEFINER views, wrap privilege errors into MySQL error 1356
+					// "View references invalid table(s) or column(s) or definer/invoker lacks rights"
+					// Only wrap privilege denial (1142) errors, not table-not-found or other errors.
+					if isMySQLError(err, 1142) || isMySQLError(err, 1356) {
+						return nil, mysqlError(1356, "HY000", fmt.Sprintf("View '%s.%s' references invalid table(s) or column(s) or function(s) or definer/invoker of view lack rights to use them", lookupDB, lookupTable))
+					}
 					return nil, err
 				}
 				// Convert view result to storage.Rows
@@ -270,6 +312,16 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 						}
 					}
 					rows = append(rows, row)
+				}
+				// For empty view result sets, preserve column information by storing it
+				// in a metadata row. This allows SELECT * to resolve column names even
+				// when the view returns 0 data rows.
+				// The __view_columns__ key signals this is metadata, not a real row.
+				if len(rows) == 0 && len(viewResult.Columns) > 0 {
+					metaRow := make(storage.Row)
+					metaRow["__column_order__"] = colOrderStr
+					metaRow["__view_columns__"] = viewResult.Columns
+					rows = append(rows, metaRow)
 				}
 				return rows, nil
 			}
@@ -2636,6 +2688,10 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		filteredAllRows = make([]storage.Row, 0, len(allRows))
 	}
 	for _, row := range allRows {
+		// Skip view column metadata rows (added when a view returns 0 data rows to preserve column info).
+		if _, isMeta := row["__view_columns__"]; isMeta {
+			continue
+		}
 		// Apply HAVING filter in non-aggregate path (no GROUP BY, no aggregates).
 		// HAVING without GROUP BY is applied per-row against the source row data.
 		// This handles cases like: SELECT ... FROM t HAVING constant_subquery_expr

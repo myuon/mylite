@@ -42,13 +42,16 @@ type GrantStore struct {
 	entries map[string][]GrantEntry
 	// roles maps role name (lowercase) -> list of grant entries for that role.
 	roles map[string][]GrantEntry
+	// defaultRoles maps "user@host" -> list of default role names (lowercase).
+	defaultRoles map[string][]string
 }
 
 // NewGrantStore creates a new empty GrantStore.
 func NewGrantStore() *GrantStore {
 	return &GrantStore{
-		entries: make(map[string][]GrantEntry),
-		roles:   make(map[string][]GrantEntry),
+		entries:      make(map[string][]GrantEntry),
+		roles:        make(map[string][]GrantEntry),
+		defaultRoles: make(map[string][]string),
 	}
 }
 
@@ -64,6 +67,57 @@ func (gs *GrantStore) isRole(name, host string) bool {
 	defer gs.mu.RUnlock()
 	_, ok := gs.roles[userKey(name, host)]
 	return ok
+}
+
+// SetDefaultRoles stores the default roles for a user (called on ALTER USER ... DEFAULT ROLE ...).
+// roles is a list of role names (without host). Pass nil or empty slice to clear.
+func (gs *GrantStore) SetDefaultRoles(user, host string, roles []string) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	key := userKey(user, host)
+	if len(roles) == 0 {
+		gs.defaultRoles[key] = nil
+	} else {
+		normalized := make([]string, 0, len(roles))
+		for _, r := range roles {
+			normalized = append(normalized, strings.ToLower(strings.Trim(r, "`'\"")))
+		}
+		gs.defaultRoles[key] = normalized
+	}
+}
+
+// GetDefaultRoles returns the default roles for a user.
+func (gs *GrantStore) GetDefaultRoles(user, host string) []string {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	key := userKey(user, host)
+	return gs.defaultRoles[key]
+}
+
+// GetActiveDefaultRoles returns the default roles for a user that are still actually granted to them.
+// This filters out roles that have been revoked since DEFAULT ROLE was set.
+func (gs *GrantStore) GetActiveDefaultRoles(user, host string) []string {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	key := userKey(user, host)
+	defaultRoles := gs.defaultRoles[key]
+	if len(defaultRoles) == 0 {
+		return nil
+	}
+	// Build set of currently granted roles for this user
+	grantedRoles := make(map[string]bool)
+	for _, e := range gs.entries[key] {
+		if e.Type == GrantTypeRole {
+			grantedRoles[strings.ToLower(e.RoleName)] = true
+		}
+	}
+	var active []string
+	for _, r := range defaultRoles {
+		if grantedRoles[strings.ToLower(r)] {
+			active = append(active, r)
+		}
+	}
+	return active
 }
 
 // RegisterRole marks a name as a role (called on CREATE ROLE).
@@ -183,6 +237,33 @@ func (gs *GrantStore) RevokeAllPrivGrants(user, host string) {
 	defer gs.mu.Unlock()
 	key := userKey(user, host)
 	delete(gs.entries, key)
+}
+
+// RevokeRoleGrant removes a role membership grant for a user.
+// roleName may include @host (e.g. "r1@%") or just the role name (e.g. "r1").
+func (gs *GrantStore) RevokeRoleGrant(user, host, roleName string) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	key := userKey(user, host)
+	// Parse role name, stripping host if present
+	rn := roleName
+	if atIdx := strings.LastIndex(rn, "@"); atIdx >= 0 {
+		rn = strings.TrimSpace(rn[:atIdx])
+	}
+	rn = strings.Trim(strings.TrimSpace(rn), "`'\"")
+	entries := gs.entries[key]
+	newEntries := entries[:0]
+	for _, e := range entries {
+		if e.Type == GrantTypeRole && strings.EqualFold(e.RoleName, rn) {
+			continue // remove this role grant
+		}
+		newEntries = append(newEntries, e)
+	}
+	if len(newEntries) == 0 {
+		delete(gs.entries, key)
+	} else {
+		gs.entries[key] = newEntries
+	}
 }
 
 // GetGrants returns all grant entries for a user.

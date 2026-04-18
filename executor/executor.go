@@ -320,6 +320,8 @@ type Executor struct {
 	viewDisplaySQL map[string]string
 	// viewCheckOptions stores WITH CHECK OPTION for views (view name -> check option string: "cascaded", "local", or "").
 	viewCheckOptions map[string]string
+	// viewSecurity stores SQL SECURITY type for views (view name -> "definer" or "invoker").
+	viewSecurity map[string]string
 	// viewCreateStatements stores the full CREATE VIEW SQL for SHOW CREATE VIEW (view name -> full SQL).
 	viewCreateStatements map[string]string
 	// viewStore is a shared view store across all connections. Views created on any connection
@@ -2010,7 +2012,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		// Handle REVOKE to remove stored grants.
 		if strings.HasPrefix(upper, "REVOKE ") && e.grantStore != nil {
 			privs, object, fromUser, fromHost, isRoleRevoke := ParseRevokeStatement(trimmed)
-			if !isRoleRevoke && privs != "" && object != "" && fromUser != "" {
+			if isRoleRevoke && privs != "" && fromUser != "" {
+				// REVOKE role FROM user — remove the role membership grant
+				e.grantStore.RevokeRoleGrant(fromUser, fromHost, privs)
+			} else if !isRoleRevoke && privs != "" && object != "" && fromUser != "" {
 				if strings.ToUpper(privs) == "ALL PRIVILEGES" && object == "*.*" {
 					// REVOKE ALL PRIVILEGES, GRANT OPTION FROM user — revoke everything
 					e.grantStore.RevokeAllPrivGrants(fromUser, fromHost)
@@ -2605,6 +2610,11 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			e.viewCheckOptions = make(map[string]string)
 		}
 		e.viewCheckOptions[viewName] = s.CheckOption
+		// Store SQL SECURITY type (definer or invoker)
+		if e.viewSecurity == nil {
+			e.viewSecurity = make(map[string]string)
+		}
+		e.viewSecurity[viewName] = s.Security
 		// Store full CREATE VIEW statement for SHOW CREATE VIEW
 		if e.viewCreateStatements == nil {
 			e.viewCreateStatements = make(map[string]string)
@@ -2612,7 +2622,7 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		e.viewCreateStatements[viewName] = e.buildCreateViewSQLFromQuery(s, query)
 		// Also write to the shared view store so other connections can see this view.
 		if e.viewStore != nil {
-			e.viewStore.Set(viewDB, viewName, selectSQL, buildViewSelectSQL(s, query), s.CheckOption, e.viewCreateStatements[viewName])
+			e.viewStore.Set(viewDB, viewName, selectSQL, buildViewSelectSQL(s, query), s.CheckOption, e.viewCreateStatements[viewName], s.Security)
 		}
 		return &Result{}, nil
 	case *sqlparser.DropView:
@@ -2732,7 +2742,7 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		// Also write to the shared view store so other connections can see this view.
 		if e.viewStore != nil {
 			displaySQL := buildViewSelectSQL(cv, query)
-			e.viewStore.Set(viewDB, viewName, selectSQL, displaySQL, s.CheckOption, e.viewCreateStatements[viewName])
+			e.viewStore.Set(viewDB, viewName, selectSQL, displaySQL, s.CheckOption, e.viewCreateStatements[viewName], s.Security)
 		}
 		return &Result{}, nil
 	case *sqlparser.CommentOnly:
@@ -4776,6 +4786,71 @@ func (e *Executor) lookupView(name string) (viewSQL string, canonicalName string
 		}
 	}
 	return "", "", false
+}
+
+// isInvokerView returns true if the named view uses SQL SECURITY INVOKER.
+// Checks local per-executor viewSecurity map first, then the shared viewStore.
+func (e *Executor) isInvokerView(db, name string) bool {
+	// Check local map first
+	if e.viewSecurity != nil {
+		for vn, sec := range e.viewSecurity {
+			if strings.EqualFold(vn, name) {
+				return strings.EqualFold(sec, "invoker")
+			}
+		}
+	}
+	// Check shared viewStore
+	if e.viewStore != nil {
+		return e.viewStore.IsInvokerSecurity(db, name)
+	}
+	return false
+}
+
+// extractDefiner parses the DEFINER clause from a CREATE [ALGORITHM=...] DEFINER=`user`@`host` ...
+// statement. Returns (user, host, true) if found.
+func extractDefiner(createSQL string) (string, string, bool) {
+	upper := strings.ToUpper(createSQL)
+	idx := strings.Index(upper, "DEFINER=")
+	if idx < 0 {
+		return "", "", false
+	}
+	rest := strings.TrimSpace(createSQL[idx+len("DEFINER="):])
+	// Parse `user`@`host` or user@host
+	var user, host string
+	if len(rest) > 0 && rest[0] == '`' {
+		end := strings.Index(rest[1:], "`")
+		if end < 0 {
+			return "", "", false
+		}
+		user = rest[1 : end+1]
+		rest = rest[end+2:] // skip closing backtick
+	} else {
+		end := strings.IndexAny(rest, "@; \t\n")
+		if end < 0 {
+			end = len(rest)
+		}
+		user = rest[:end]
+		rest = rest[end:]
+	}
+	rest = strings.TrimSpace(rest)
+	if len(rest) == 0 || rest[0] != '@' {
+		return user, "%", true
+	}
+	rest = strings.TrimSpace(rest[1:])
+	if len(rest) > 0 && rest[0] == '`' {
+		end := strings.Index(rest[1:], "`")
+		if end < 0 {
+			return user, "%", true
+		}
+		host = rest[1 : end+1]
+	} else {
+		end := strings.IndexAny(rest, " \t\n;")
+		if end < 0 {
+			end = len(rest)
+		}
+		host = rest[:end]
+	}
+	return user, host, true
 }
 
 // resolveViewToBaseTable checks if the given table name is a view, and if so,

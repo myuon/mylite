@@ -267,6 +267,56 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		strings.HasPrefix(upper, "SET DEFAULT ROLE") {
 		return "", &Result{}, nil
 	}
+	// Handle ALTER USER ... DEFAULT ROLE ...
+	// Syntax: ALTER USER user@host DEFAULT ROLE {NONE | ALL | role1, role2, ...}
+	if strings.HasPrefix(upper, "ALTER USER ") && strings.Contains(upper, " DEFAULT ROLE") {
+		if e.grantStore != nil {
+			rest := strings.TrimSpace(query[len("ALTER USER "):])
+			rest = strings.TrimRight(rest, ";")
+			drIdx := strings.Index(strings.ToUpper(rest), " DEFAULT ROLE")
+			if drIdx >= 0 {
+				userPart := strings.TrimSpace(rest[:drIdx])
+				rolePart := strings.TrimSpace(rest[drIdx+len(" DEFAULT ROLE"):])
+				// Parse user@host
+				var altUser, altHost string
+				if atIdx := strings.LastIndex(userPart, "@"); atIdx >= 0 {
+					altUser = strings.Trim(strings.TrimSpace(userPart[:atIdx]), "`'\"")
+					altHost = strings.Trim(strings.TrimSpace(userPart[atIdx+1:]), "`'\"")
+				} else {
+					altUser = strings.Trim(userPart, "`'\"")
+					altHost = "%"
+				}
+				// Parse role list
+				upperRole := strings.ToUpper(strings.TrimSpace(rolePart))
+				if upperRole == "NONE" {
+					e.grantStore.SetDefaultRoles(altUser, altHost, nil)
+				} else if upperRole == "ALL" {
+					// Set all granted roles as default
+					var roles []string
+					for _, entry := range e.grantStore.GetGrants(altUser, altHost) {
+						if entry.Type == GrantTypeRole {
+							roles = append(roles, entry.RoleName)
+						}
+					}
+					e.grantStore.SetDefaultRoles(altUser, altHost, roles)
+				} else {
+					var roles []string
+					for _, rn := range strings.Split(rolePart, ",") {
+						rn = strings.TrimSpace(rn)
+						rn = strings.Trim(rn, "`'\"")
+						if atIdx := strings.LastIndex(rn, "@"); atIdx >= 0 {
+							rn = strings.Trim(strings.TrimSpace(rn[:atIdx]), "`'\"")
+						}
+						if rn != "" {
+							roles = append(roles, rn)
+						}
+					}
+					e.grantStore.SetDefaultRoles(altUser, altHost, roles)
+				}
+			}
+		}
+		return "", &Result{}, nil
+	}
 	if strings.HasPrefix(upper, "SET ROLE") {
 		// Parse SET ROLE and store active roles in user variable __active_roles
 		rolePart := strings.TrimSpace(query[len("SET ROLE"):])

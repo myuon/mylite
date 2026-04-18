@@ -1,6 +1,9 @@
 package executor
 
-import "sync"
+import (
+	"strings"
+	"sync"
+)
 
 // ViewStore holds view definitions shared across all connections (executors).
 // It stores the view's SELECT SQL, display SQL, check options, and CREATE VIEW
@@ -15,6 +18,8 @@ type ViewStore struct {
 	checkOptions map[string]string
 	// createSQL maps "db.viewname" -> full CREATE VIEW SQL (for SHOW CREATE VIEW).
 	createSQL map[string]string
+	// security maps "db.viewname" -> "definer" or "invoker" (SQL SECURITY clause).
+	security map[string]string
 }
 
 // NewViewStore creates a new empty ViewStore.
@@ -24,6 +29,7 @@ func NewViewStore() *ViewStore {
 		displaySQL:   make(map[string]string),
 		checkOptions: make(map[string]string),
 		createSQL:    make(map[string]string),
+		security:     make(map[string]string),
 	}
 }
 
@@ -35,7 +41,8 @@ func viewKey(db, name string) string {
 }
 
 // Set stores all view definition components.
-func (vs *ViewStore) Set(db, name, selectSQL, displaySQL, checkOption, createSQL string) {
+// security is "definer" or "invoker" (SQL SECURITY clause).
+func (vs *ViewStore) Set(db, name, selectSQL, displaySQL, checkOption, createSQL, security string) {
 	key := viewKey(db, name)
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
@@ -43,6 +50,17 @@ func (vs *ViewStore) Set(db, name, selectSQL, displaySQL, checkOption, createSQL
 	vs.displaySQL[key] = displaySQL
 	vs.checkOptions[key] = checkOption
 	vs.createSQL[key] = createSQL
+	if security != "" {
+		vs.security[key] = strings.ToLower(security)
+	}
+}
+
+// IsInvokerSecurity returns true if the view uses SQL SECURITY INVOKER.
+func (vs *ViewStore) IsInvokerSecurity(db, name string) bool {
+	key := viewKey(db, name)
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+	return strings.ToLower(vs.security[key]) == "invoker"
 }
 
 // Delete removes a view definition.

@@ -2309,7 +2309,19 @@ func (e *Executor) buildCreateViewSQLFromQuery(s *sqlparser.CreateView, original
 	if s.Definer != nil {
 		b.WriteString(fmt.Sprintf("DEFINER=`%s`@`%s` ", s.Definer.Name, s.Definer.Address))
 	} else {
-		b.WriteString("DEFINER=`root`@`localhost` ")
+		// No explicit DEFINER: use the current session user as the definer.
+		// MySQL uses CURRENT_USER as the implicit definer when no DEFINER clause is given.
+		defUser := "root"
+		defHost := "localhost"
+		if e.userVars != nil {
+			if cuv, ok := e.userVars["__current_user"]; ok {
+				if cu, ok2 := cuv.(string); ok2 && cu != "" && !strings.EqualFold(cu, "root") {
+					defUser = cu
+					defHost = "localhost"
+				}
+			}
+		}
+		b.WriteString(fmt.Sprintf("DEFINER=`%s`@`%s` ", defUser, defHost))
 	}
 
 	// SQL SECURITY clause
@@ -2537,6 +2549,7 @@ func (e *Executor) execShowGrants(query string) (*Result, error) {
 	grantUser := sessionUser
 	grantHost := sessionHost
 	var usingRoles []string
+	isForCurrentUser := false
 
 	if forIdx := strings.Index(upper, " FOR "); forIdx >= 0 {
 		forPart := strings.TrimSpace(query[forIdx+5:])
@@ -2558,11 +2571,25 @@ func (e *Executor) execShowGrants(query string) (*Result, error) {
 		forUpper := strings.ToUpper(strings.TrimSpace(forPart))
 		if forUpper == "CURRENT_USER()" || forUpper == "CURRENT_USER" {
 			// Already resolved from session user above
+			isForCurrentUser = true
 		} else if atIdx := strings.LastIndex(forPart, "@"); atIdx >= 0 {
 			grantUser = strings.Trim(strings.TrimSpace(forPart[:atIdx]), "'`\"")
 			grantHost = strings.Trim(strings.TrimSpace(forPart[atIdx+1:]), "'`\"")
 		} else {
 			grantUser = strings.Trim(strings.TrimSpace(forPart), "'`\"")
+		}
+	} else {
+		// Plain "SHOW GRANTS" without FOR - this is for current user
+		isForCurrentUser = true
+	}
+
+	// If showing grants for the current session user and no USING clause was given,
+	// automatically include the session's active roles so privileges from SET ROLE are reflected.
+	if isForCurrentUser && len(usingRoles) == 0 {
+		if arv, ok := e.userVars["__active_roles"]; ok {
+			if roles, ok2 := arv.([]string); ok2 {
+				usingRoles = roles
+			}
 		}
 	}
 
