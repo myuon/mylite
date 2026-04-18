@@ -4843,6 +4843,46 @@ func evalBinaryExpr(left, right interface{}, op sqlparser.BinaryExprOperator, di
 				return result, nil
 			}
 		}
+		// Use integer arithmetic for int64/uint64 to avoid float64 precision loss.
+		switch la := left.(type) {
+		case int64:
+			switch ra := right.(type) {
+			case int64:
+				if ra == 0 {
+					return nil, nil
+				}
+				return la % ra, nil
+			case uint64:
+				if ra == 0 {
+					return nil, nil
+				}
+				if la < 0 {
+					// MySQL: negative mod positive = negative result
+					r := int64(uint64(-la) % ra)
+					if r != 0 {
+						r = -r
+					}
+					return r, nil
+				}
+				return int64(uint64(la) % ra), nil
+			}
+		case uint64:
+			switch ra := right.(type) {
+			case uint64:
+				if ra == 0 {
+					return nil, nil
+				}
+				return la % ra, nil
+			case int64:
+				if ra == 0 {
+					return nil, nil
+				}
+				if ra < 0 {
+					ra = -ra
+				}
+				return la % uint64(ra), nil
+			}
+		}
 		if rf == 0 {
 			return nil, nil
 		}

@@ -3707,6 +3707,22 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 		if d == 0 {
 			// Keep DECIMAL(M,0) as string for large precisions to avoid int64 overflow.
 			if prefix == "decimal" {
+				// Convert int64/uint64 to string to avoid float64 precision loss for large values.
+				if n, ok := v.(int64); ok {
+					s := strconv.FormatInt(n, 10)
+					if isUnsigned && n < 0 {
+						return applyZerofillStr("0")
+					}
+					if rounded, ok2 := roundNumericStringHalfUp(s, 0); ok2 {
+						return applyZerofillStr(clipDecimalIntegerString(rounded, m, isUnsigned))
+					}
+				}
+				if n, ok := v.(uint64); ok {
+					s := strconv.FormatUint(n, 10)
+					if rounded, ok2 := roundNumericStringHalfUp(s, 0); ok2 {
+						return applyZerofillStr(clipDecimalIntegerString(rounded, m, isUnsigned))
+					}
+				}
 				if s, ok := v.(string); ok {
 					_, sCls := parseDecimalString(s)
 					if sCls == "overflow_pos" {

@@ -961,9 +961,21 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						}
 					}
 					if err != nil && isDecCol {
-						if f, ferr := strconv.ParseFloat(overflowStr, 64); ferr == nil {
-							v = f
-							err = nil
+						// For DECIMAL columns, store as string to preserve full precision.
+						// For FLOAT/DOUBLE/REAL, use float64.
+						for _, col := range tbl.Def.Columns {
+							if col.Name == colNames[i] {
+								colUpper := strings.ToUpper(col.Type)
+								if strings.Contains(colUpper, "DECIMAL") {
+									// Store as string to avoid float64 precision loss
+									v = overflowStr
+									err = nil
+								} else if f, ferr := strconv.ParseFloat(overflowStr, 64); ferr == nil {
+									v = f
+									err = nil
+								}
+								break
+							}
 						}
 					}
 					// For INT columns in non-strict mode, clip to type range
