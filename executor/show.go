@@ -1500,9 +1500,18 @@ func (e *Executor) showCreateProcedure(procName string) (*Result, error) {
 	} else {
 		createSQL = normalizeCreateRoutine(createSQL, "PROCEDURE", procDef.Name)
 	}
+	// Use the connection's current character set and collation (set via SET NAMES).
+	charSetClient := "utf8mb4"
+	collationConn := "utf8mb4_0900_ai_ci"
+	if v, ok := e.getSysVar("character_set_client"); ok && v != "" {
+		charSetClient = v
+	}
+	if v, ok := e.getSysVar("collation_connection"); ok && v != "" {
+		collationConn = v
+	}
 	return &Result{
 		Columns:     []string{"Procedure", "sql_mode", "Create Procedure", "character_set_client", "collation_connection", "Database Collation"},
-		Rows:        [][]interface{}{{procDef.Name, e.sqlMode, createSQL, "utf8mb4", "utf8mb4_0900_ai_ci", "utf8mb4_0900_ai_ci"}},
+		Rows:        [][]interface{}{{procDef.Name, e.sqlMode, createSQL, charSetClient, collationConn, "utf8mb4_0900_ai_ci"}},
 		IsResultSet: true,
 	}, nil
 }
@@ -1534,9 +1543,18 @@ func (e *Executor) showCreateFunction(funcName string) (*Result, error) {
 	} else {
 		createSQL = normalizeCreateRoutine(createSQL, "FUNCTION", funcDef.Name)
 	}
+	// Use the connection's current character set and collation (set via SET NAMES).
+	charSetClientFn := "utf8mb4"
+	collationConnFn := "utf8mb4_0900_ai_ci"
+	if v, ok := e.getSysVar("character_set_client"); ok && v != "" {
+		charSetClientFn = v
+	}
+	if v, ok := e.getSysVar("collation_connection"); ok && v != "" {
+		collationConnFn = v
+	}
 	return &Result{
 		Columns:     []string{"Function", "sql_mode", "Create Function", "character_set_client", "collation_connection", "Database Collation"},
-		Rows:        [][]interface{}{{funcDef.Name, e.sqlMode, createSQL, "utf8mb4", "utf8mb4_0900_ai_ci", "utf8mb4_0900_ai_ci"}},
+		Rows:        [][]interface{}{{funcDef.Name, e.sqlMode, createSQL, charSetClientFn, collationConnFn, "utf8mb4_0900_ai_ci"}},
 		IsResultSet: true,
 	}, nil
 }
@@ -1685,6 +1703,16 @@ func normalizeCreateRoutine(originalSQL string, routineType string, routineName 
 	rest = strings.TrimSpace(rest)
 
 	_ = hasDefiner
+	// MySQL always puts BEGIN on a new line in SHOW CREATE output.
+	// If the body starts with "(...) BEGIN" on one line, insert a newline before BEGIN.
+	restUpper2 := strings.ToUpper(rest)
+	if !strings.Contains(rest, "\n") {
+		// Find ") BEGIN" pattern and add newline
+		beginIdx2 := strings.Index(restUpper2, ") BEGIN")
+		if beginIdx2 >= 0 {
+			rest = rest[:beginIdx2+1] + "\n" + rest[beginIdx2+1:]
+		}
+	}
 	return prefix + rest
 }
 

@@ -4,7 +4,27 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"unicode"
+
+	"golang.org/x/text/unicode/norm"
 )
+
+// normalizeName converts a stored procedure/function name to a canonical form
+// for case-insensitive and accent-insensitive comparison (matching MySQL behavior).
+// MySQL uses Unicode case folding + accent stripping for routine names.
+func normalizeName(name string) string {
+	// Apply NFKD normalization to decompose accented characters into base+combining mark
+	nfkd := norm.NFKD.String(strings.ToLower(name))
+	// Remove Unicode combining marks (category Mn = Non-spacing Mark)
+	var result []rune
+	for _, r := range nfkd {
+		if unicode.Is(unicode.Mn, r) {
+			continue // skip combining/diacritic marks
+		}
+		result = append(result, r)
+	}
+	return string(result)
+}
 
 // ColumnDef represents a column definition in a table.
 type ColumnDef struct {
@@ -744,22 +764,23 @@ func (db *Database) CreateProcedure(def *ProcedureDef) {
 	if db.Procedures == nil {
 		db.Procedures = make(map[string]*ProcedureDef)
 	}
-	// Store with lowercase key for case-insensitive lookup
-	db.Procedures[strings.ToLower(def.Name)] = def
+	// Store with normalized key for case-insensitive and accent-insensitive lookup.
+	// MySQL treats routine names as case and accent insensitive.
+	db.Procedures[normalizeName(def.Name)] = def
 }
 
 // DropProcedure removes a stored procedure by name.
 func (db *Database) DropProcedure(name string) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	delete(db.Procedures, strings.ToLower(name))
+	delete(db.Procedures, normalizeName(name))
 }
 
-// GetProcedure returns a stored procedure by name (case-insensitive).
+// GetProcedure returns a stored procedure by name (case-insensitive, accent-insensitive).
 func (db *Database) GetProcedure(name string) *ProcedureDef {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	return db.Procedures[strings.ToLower(name)]
+	return db.Procedures[normalizeName(name)]
 }
 
 // CreateFunction adds a stored function definition.
@@ -769,24 +790,24 @@ func (db *Database) CreateFunction(def *FunctionDef) {
 	if db.Functions == nil {
 		db.Functions = make(map[string]*FunctionDef)
 	}
-	db.Functions[strings.ToLower(def.Name)] = def
+	db.Functions[normalizeName(def.Name)] = def
 }
 
 // DropFunction removes a stored function by name.
 func (db *Database) DropFunction(name string) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	delete(db.Functions, strings.ToLower(name))
+	delete(db.Functions, normalizeName(name))
 }
 
-// GetFunction returns a stored function by name.
+// GetFunction returns a stored function by name (case-insensitive, accent-insensitive).
 func (db *Database) GetFunction(name string) *FunctionDef {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	if db.Functions == nil {
 		return nil
 	}
-	return db.Functions[strings.ToLower(name)]
+	return db.Functions[normalizeName(name)]
 }
 
 // ListFunctions returns all stored function definitions in the database.

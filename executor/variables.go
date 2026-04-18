@@ -174,6 +174,11 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				e.sessionScopeVars["character_set_client"] = charset
 				e.sessionScopeVars["character_set_connection"] = charset
 				e.sessionScopeVars["character_set_results"] = charset
+				// Also set collation_connection to the default collation for this charset.
+				// MySQL's SET NAMES also updates collation_connection.
+				if defColl := catalog.DefaultCollationForCharset(charset); defColl != "" {
+					e.sessionScopeVars["collation_connection"] = defColl
+				}
 			}
 		case "charset":
 			// SET CHARACTER SET charset_name (or SET CHARSET charset_name)
@@ -1570,6 +1575,21 @@ func (e *Executor) handleRawSet(raw string) error {
 				e.sessionScopeVars["character_set_client"] = charset
 				e.sessionScopeVars["character_set_connection"] = charset
 				e.sessionScopeVars["character_set_results"] = charset
+				// Also set collation_connection to the default collation for this charset,
+				// unless an explicit COLLATE clause is given (SET NAMES utf8 COLLATE utf8_unicode_ci).
+				collation := ""
+				for i := 1; i < len(fields)-1; i++ {
+					if strings.EqualFold(fields[i], "COLLATE") {
+						collation = strings.ToLower(strings.Trim(fields[i+1], "'\";"))
+						break
+					}
+				}
+				if collation == "" {
+					collation = catalog.DefaultCollationForCharset(charset)
+				}
+				if collation != "" {
+					e.sessionScopeVars["collation_connection"] = collation
+				}
 			}
 		}
 	}

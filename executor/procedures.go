@@ -770,6 +770,11 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 		bodyText = bodyStr
 	}
 
+	// Check for duplicate procedure name (case and accent insensitive).
+	if db.GetProcedure(procName) != nil {
+		return nil, mysqlError(1304, "42000", fmt.Sprintf("PROCEDURE %s already exists", procName))
+	}
+
 	currentSqlMode := ""
 	if v, ok := e.getSysVar("sql_mode"); ok {
 		currentSqlMode = v
@@ -1514,6 +1519,11 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 		returnExpr := strings.TrimSpace(afterParams[returnIdx:])
 		returnExpr = strings.TrimSuffix(returnExpr, ";")
 		bodyStmts = []string{returnExpr}
+	}
+
+	// Check for duplicate function name (case and accent insensitive).
+	if db.GetFunction(funcName) != nil {
+		return nil, mysqlError(1304, "42000", fmt.Sprintf("FUNCTION %s already exists", funcName))
 	}
 
 	funcSqlMode := ""
