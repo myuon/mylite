@@ -473,6 +473,13 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 			}
 		}
 		tbl.Rows = newRows
+		// For HEAP/MEMORY tables: if the table is now completely empty after a DELETE,
+		// set HeapInsertFront so that subsequent inserts prepend (LIFO slot reuse behavior).
+		if tbl.IsHeap() {
+			if len(tbl.Rows) == 0 {
+				tbl.HeapInsertFront = true
+			}
+		}
 		tbl.InvalidateIndexes()
 		return &Result{AffectedRows: uint64(len(deleteSet))}, nil
 	}
@@ -560,6 +567,10 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		}
 	}
 	tbl.Rows = newRows
+	// For HEAP/MEMORY tables: if the table is now completely empty, set HeapInsertFront.
+	if tbl.IsHeap() && len(tbl.Rows) == 0 {
+		tbl.HeapInsertFront = true
+	}
 	tbl.InvalidateIndexes()
 
 	return &Result{AffectedRows: affected}, nil
@@ -1208,6 +1219,9 @@ func (e *Executor) execMultiTableDeleteAST(stmt *sqlparser.Delete) (*Result, err
 			}
 		}
 		de.tbl.Rows = newRows
+		if de.tbl.IsHeap() && len(de.tbl.Rows) == 0 {
+			de.tbl.HeapInsertFront = true
+		}
 		de.tbl.InvalidateIndexes()
 		de.tbl.Unlock()
 		totalAffected += uint64(len(de.indices))
@@ -1541,6 +1555,9 @@ func (e *Executor) execMultiTableDelete(query string) (*Result, error) {
 				}
 			}
 			tbl.Rows = newRows
+			if tbl.IsHeap() && len(tbl.Rows) == 0 {
+				tbl.HeapInsertFront = true
+			}
 			tbl.InvalidateIndexes()
 			tbl.Unlock()
 			totalAffected += uint64(len(deleteIndices))

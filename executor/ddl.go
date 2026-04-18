@@ -2852,10 +2852,12 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				}
 				colDef.Comment = mysqlTruncateChars(colDef.Comment, 1024)
 			}
-			// Check for STORED<->VIRTUAL change on generated columns
+			// Check for STORED<->VIRTUAL change on generated columns; also capture old column type.
+			var oldColType string
 			if tableDef, tdErr := db.GetTable(tableName); tdErr == nil {
 				for _, existCol := range tableDef.Columns {
 					if strings.EqualFold(existCol.Name, colDef.Name) {
+						oldColType = existCol.Type
 						oldIsGen := isGeneratedColumnType(existCol.Type)
 						newIsGen := isGeneratedColumnType(colDef.Type)
 						if oldIsGen && newIsGen {
@@ -2869,6 +2871,11 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					}
 				}
 			}
+			// When converting CHAR → VARCHAR, MySQL strips trailing spaces from stored values
+			// (since CHAR pads with spaces, but VARCHAR preserves exact content).
+			oldIsChar := strings.HasPrefix(strings.ToLower(strings.TrimSpace(oldColType)), "char(") || strings.EqualFold(strings.TrimSpace(oldColType), "char")
+			newIsVarchar := strings.HasPrefix(strings.ToLower(strings.TrimSpace(colDef.Type)), "varchar(")
+			charToVarchar := oldIsChar && newIsVarchar
 			if modErr := db.ModifyColumn(tableName, colDef); modErr != nil {
 				return nil, modErr
 			}
@@ -2891,14 +2898,42 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					return nil, rangeErr
 				}
 			} else {
+				// VARCHAR/CHAR truncation: compute new max length once.
+				newColTypeLower := strings.ToLower(strings.TrimSpace(colDef.Type))
+				newMaxLen := 0
+				isVarcharOrChar := strings.HasPrefix(newColTypeLower, "varchar(") || strings.HasPrefix(newColTypeLower, "char(")
+				if isVarcharOrChar {
+					newMaxLen = extractCharLength(colDef.Type)
+				}
 				tbl.Lock()
+				truncWarningIssued := false
 				for i := range tbl.Rows {
 					if cur, ok := tbl.Rows[i][colDef.Name]; ok {
 						if cur == nil && !colDef.Nullable {
 							// ALTER TABLE MODIFY COLUMN x NOT NULL: convert NULL to zero value
 							tbl.Rows[i][colDef.Name] = implicitDefaultForType(colDef.Type)
 						} else {
-							tbl.Rows[i][colDef.Name] = e.coerceValueForColumnTypeForWrite(colDef, cur)
+							val := e.coerceValueForColumnTypeForWrite(colDef, cur)
+							// CHAR → VARCHAR: strip trailing spaces from stored padded values
+							if charToVarchar {
+								if s, ok := val.(string); ok {
+									val = strings.TrimRight(s, " ")
+								}
+							}
+							// VARCHAR/CHAR: truncate to new column max length if too long
+							if isVarcharOrChar && newMaxLen > 0 {
+								if s, ok := val.(string); ok {
+									runes := []rune(s)
+									if len(runes) > newMaxLen {
+										val = string(runes[:newMaxLen])
+										if !truncWarningIssued {
+											e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", colDef.Name, i+1))
+											truncWarningIssued = true
+										}
+									}
+								}
+							}
+							tbl.Rows[i][colDef.Name] = val
 						}
 					}
 				}
@@ -2914,6 +2949,19 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				}
 				colDef.Comment = mysqlTruncateChars(colDef.Comment, 1024)
 			}
+			// Capture old column type to detect CHAR→VARCHAR conversion.
+			var oldColTypeChg string
+			if tableDef2, tdErr2 := db.GetTable(tableName); tdErr2 == nil {
+				for _, existCol := range tableDef2.Columns {
+					if strings.EqualFold(existCol.Name, oldName) {
+						oldColTypeChg = existCol.Type
+						break
+					}
+				}
+			}
+			oldIsCharChg := strings.HasPrefix(strings.ToLower(strings.TrimSpace(oldColTypeChg)), "char(") || strings.EqualFold(strings.TrimSpace(oldColTypeChg), "char")
+			newIsVarcharChg := strings.HasPrefix(strings.ToLower(strings.TrimSpace(colDef.Type)), "varchar(")
+			charToVarcharChg := oldIsCharChg && newIsVarcharChg
 			if chgErr := db.ChangeColumn(tableName, oldName, colDef); chgErr != nil {
 				return nil, chgErr
 			}
@@ -2940,14 +2988,42 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					return nil, rangeErr2
 				}
 			} else {
+				// VARCHAR/CHAR truncation: compute new max length once.
+				newColTypeLowerChg := strings.ToLower(strings.TrimSpace(colDef.Type))
+				newMaxLenChg := 0
+				isVarcharOrCharChg := strings.HasPrefix(newColTypeLowerChg, "varchar(") || strings.HasPrefix(newColTypeLowerChg, "char(")
+				if isVarcharOrCharChg {
+					newMaxLenChg = extractCharLength(colDef.Type)
+				}
 				tbl.Lock()
+				truncWarnChg := false
 				for i := range tbl.Rows {
 					if cur, ok := tbl.Rows[i][colDef.Name]; ok {
 						if cur == nil && !colDef.Nullable {
 							// ALTER TABLE CHANGE COLUMN x NOT NULL: convert NULL to zero value
 							tbl.Rows[i][colDef.Name] = implicitDefaultForType(colDef.Type)
 						} else {
-							tbl.Rows[i][colDef.Name] = e.coerceValueForColumnTypeForWrite(colDef, cur)
+							val := e.coerceValueForColumnTypeForWrite(colDef, cur)
+							// CHAR → VARCHAR: strip trailing spaces from stored padded values
+							if charToVarcharChg {
+								if s, ok := val.(string); ok {
+									val = strings.TrimRight(s, " ")
+								}
+							}
+							// VARCHAR/CHAR: truncate to new column max length if too long
+							if isVarcharOrCharChg && newMaxLenChg > 0 {
+								if s, ok := val.(string); ok {
+									runes := []rune(s)
+									if len(runes) > newMaxLenChg {
+										val = string(runes[:newMaxLenChg])
+										if !truncWarnChg {
+											e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", colDef.Name, i+1))
+											truncWarnChg = true
+										}
+									}
+								}
+							}
+							tbl.Rows[i][colDef.Name] = val
 						}
 					}
 				}

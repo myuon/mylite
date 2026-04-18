@@ -25,6 +25,7 @@ func stripPrefixLength(col string) string {
 // Values are stored as interface{} (nil for NULL).
 type Row map[string]interface{}
 
+
 // bitIntToBytes converts an integer BIT value to a big-endian byte string.
 // MySQL displays BIT values as binary byte strings in error messages.
 // For BIT(N), the byte length is ceil(N/8).
@@ -115,6 +116,11 @@ type Table struct {
 	AutoIncrement   atomic.Int64
 	AIExplicitlySet bool // true if AUTO_INCREMENT was explicitly set via ALTER/CREATE TABLE
 	Mu              sync.RWMutex
+	// HeapInsertFront is set when a DELETE operation empties a HEAP/MEMORY table.
+	// When true, subsequent Insert() calls prepend instead of append, simulating
+	// MySQL HEAP LIFO slot-reuse: after delete-all, new rows reuse freed slots in
+	// reverse order (last freed = first reused), so newly inserted rows appear first.
+	HeapInsertFront bool
 	// pkIndex is a hash set of primary key values for O(1) uniqueness checks.
 	// Lazily built on first Insert and maintained during Insert/BulkInsert.
 	// Invalidated (set to nil) on delete/update/truncate operations.
@@ -135,6 +141,15 @@ type Table struct {
 func (t *Table) Lock()                     { t.Mu.Lock() }
 func (t *Table) Unlock()                   { t.Mu.Unlock() }
 func (t *Table) AutoIncrementValue() int64 { return t.AutoIncrement.Load() }
+
+// IsHeap reports whether this table uses the HEAP or MEMORY storage engine.
+func (t *Table) IsHeap() bool {
+	if t.Def == nil {
+		return false
+	}
+	e := strings.ToUpper(t.Def.Engine)
+	return e == "HEAP" || e == "MEMORY"
+}
 
 // InvalidateIndexes clears cached PK/UNIQUE indexes so they are rebuilt on next Insert.
 // Must be called (or indexes will be stale) after delete/update/truncate/row-removal.
@@ -471,7 +486,15 @@ func (t *Table) Insert(row Row, noAutoValueOnZero ...bool) (int64, error) {
 		}
 	}
 
-	t.Rows = append(t.Rows, row)
+	// For HEAP/MEMORY tables in "insert-front" mode (table was emptied by DELETE):
+	// prepend the new row instead of appending. This simulates MySQL's LIFO slot-reuse:
+	// after delete-all, the free list is in LIFO order, so newly inserted rows end up
+	// at lower slot numbers (earlier in scan order) than previously-deleted rows.
+	if t.HeapInsertFront && t.IsHeap() {
+		t.Rows = append([]Row{row}, t.Rows...)
+	} else {
+		t.Rows = append(t.Rows, row)
+	}
 
 	// Maintain indexes after successful insert
 	if t.pkIndex != nil && len(t.Def.PrimaryKey) > 0 {
@@ -740,7 +763,12 @@ func (t *Table) BulkInsert(rows []Row) ([]int64, error) {
 			}
 		}
 
-		t.Rows = append(t.Rows, row)
+		// For HEAP/MEMORY tables in "insert-front" mode: prepend instead of append.
+		if t.HeapInsertFront && t.IsHeap() {
+			t.Rows = append([]Row{row}, t.Rows...)
+		} else {
+			t.Rows = append(t.Rows, row)
+		}
 		ids[ri] = lastInsertID
 	}
 
@@ -1151,6 +1179,7 @@ func (t *Table) Truncate() {
 	defer t.Mu.Unlock()
 	t.Rows = make([]Row, 0)
 	t.AutoIncrement.Store(0)
+	t.HeapInsertFront = false // TRUNCATE resets slot layout; no LIFO reuse needed
 	t.InvalidateIndexes()
 }
 
