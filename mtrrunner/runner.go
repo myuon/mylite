@@ -2912,9 +2912,11 @@ func columnTypeToMySQLInfo(typeName string, nullable bool, decimals int) mysqlTy
 	if idx := strings.IndexByte(upper, '('); idx >= 0 {
 		upper = strings.TrimSpace(upper[:idx])
 	}
-	isUnsigned := strings.Contains(upper, " UNSIGNED")
+	// Handle both "BIGINT UNSIGNED" (our format) and "UNSIGNED BIGINT" (go-sql-driver format)
+	isUnsigned := strings.Contains(upper, " UNSIGNED") || strings.HasPrefix(upper, "UNSIGNED ")
 	if isUnsigned {
 		upper = strings.TrimSuffix(upper, " UNSIGNED")
+		upper = strings.TrimPrefix(upper, "UNSIGNED ")
 	}
 
 	info := mysqlTypeInfo{charsetnr: 63} // default: binary charset

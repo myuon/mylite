@@ -4904,8 +4904,17 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 		if v.Operator == sqlparser.UMinusOp {
 			if lit, ok := v.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.IntVal {
 				n, err := strconv.ParseUint(lit.Val, 10, 64)
-				if err == nil && n > 2147483647 { // > INT32_MAX: needs bigint (signed)
-					return "bigint"
+				if err == nil {
+					if n > 9223372036854775808 { // negation would be < INT64_MIN: use decimal
+						digits := len(lit.Val)
+						return fmt.Sprintf("decimal(%d,0)", digits)
+					} else if n > 2147483647 { // > INT32_MAX: needs bigint (signed)
+						return "bigint"
+					}
+				} else {
+					// ParseUint failed: value is too large even for uint64 → overflow → decimal
+					digits := len(lit.Val)
+					return fmt.Sprintf("decimal(%d,0)", digits)
 				}
 			}
 			// Unary minus on a decimal preserves the decimal type.
@@ -5692,7 +5701,8 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 		}
 	}
 	if _, isUnary := expr.(*sqlparser.UnaryExpr); isUnary {
-		if strings.HasPrefix(strings.ToLower(attrs.colType), "decimal(") {
+		colTypeLower := strings.ToLower(attrs.colType)
+		if strings.HasPrefix(colTypeLower, "decimal(") {
 			attrs.nullable = false
 			attrs.hasDefault = true
 			var m, d int
@@ -5701,6 +5711,11 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 			} else {
 				attrs.defaultVal = "0"
 			}
+		} else if strings.HasPrefix(colTypeLower, "bigint") || strings.HasPrefix(colTypeLower, "int") {
+			// Unary minus on an integer literal: NOT NULL DEFAULT 0
+			attrs.nullable = false
+			attrs.hasDefault = true
+			attrs.defaultVal = "0"
 		}
 	}
 	// For IF/COALESCE/IFNULL/NULLIF/GREATEST/LEAST with a decimal result type,
