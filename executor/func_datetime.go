@@ -684,9 +684,9 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if isDatetimeLikeString(intervalStr) {
 			return nil, true, nil
 		}
-		// If base is a datetime (has YYYY-MM-DD), use datetime arithmetic.
-		// Otherwise (TIME string), use time string arithmetic.
-		if isDatetimeLikeString(baseStr) {
+		// If base is a full DATETIME (has YYYY-MM-DD HH:MM:SS), use datetime arithmetic.
+		// Plain DATE strings (YYYY-MM-DD only) are treated as TIME strings by MySQL.
+		if isDatetimeWithTimeComponent(baseStr) {
 			t, dtErr := parseDateTimeValue(base)
 			if dtErr == nil {
 				dur, err := parseMySQLTimeInterval(intervalStr)
@@ -697,7 +697,11 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 				return formatDateTimeWithOptionalMicros(result), true, nil
 			}
 		}
-		// Base is a TIME string (possibly with garbage at end) - use time arithmetic
+		// Base is a TIME string (possibly with garbage at end) - use time arithmetic.
+		// If base looks like a date string (YYYY-MM-DD), MySQL emits a warning.
+		if isDatetimeLikeString(baseStr) {
+			e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect time value: '%s'", baseStr))
+		}
 		return addTimeStrings(baseStr, intervalStr, false), true, nil
 	case "subtime":
 		if len(v.Exprs) < 2 {
@@ -723,9 +727,9 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if isDatetimeLikeString(intervalStr) {
 			return nil, true, nil
 		}
-		// If base is a datetime (has YYYY-MM-DD), use datetime arithmetic.
-		// Otherwise (TIME string), use time string arithmetic.
-		if isDatetimeLikeString(baseStr) {
+		// If base is a full DATETIME (has YYYY-MM-DD HH:MM:SS), use datetime arithmetic.
+		// Plain DATE strings (YYYY-MM-DD only) are treated as TIME strings by MySQL.
+		if isDatetimeWithTimeComponent(baseStr) {
 			t, dtErr := parseDateTimeValue(base)
 			if dtErr == nil {
 				dur, err := parseMySQLTimeInterval(intervalStr)
@@ -736,7 +740,11 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 				return formatDateTimeWithOptionalMicros(result), true, nil
 			}
 		}
-		// Base is a TIME string - use time arithmetic
+		// Base is a TIME string - use time arithmetic.
+		// If base looks like a date string (YYYY-MM-DD), MySQL emits a warning.
+		if isDatetimeLikeString(baseStr) {
+			e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect time value: '%s'", baseStr))
+		}
 		return addTimeStrings(baseStr, intervalStr, true), true, nil
 	case "from_days":
 		val, isNull, err := e.evalArg1Quiet(v.Exprs, row)
@@ -2209,7 +2217,38 @@ func parseTimeStringToMicros(s string) *int64 {
 		h, _ = strconv.Atoi(parts[0])
 		m, _ = strconv.Atoi(parts[1])
 	case 1:
-		h, _ = strconv.Atoi(parts[0])
+		// No colon: parse as right-aligned HHMMSS numeric string.
+		// MySQL treats bare numeric time strings with HHMMSS right-alignment:
+		//   1-2 digits → SS, 3-4 digits → MMSS (00:MM:SS), 5-6 digits → HHMMSS.
+		p := parts[0]
+		// Strip fractional part if present
+		if dotIdx := strings.Index(p, "."); dotIdx >= 0 {
+			fracStr := p[dotIdx+1:]
+			p = p[:dotIdx]
+			for len(fracStr) < 6 {
+				fracStr += "0"
+			}
+			if len(fracStr) > 6 {
+				fracStr = fracStr[:6]
+			}
+			usecs, _ = strconv.Atoi(fracStr)
+		}
+		switch {
+		case len(p) <= 2:
+			sec, _ = strconv.Atoi(p)
+		case len(p) <= 4:
+			// MMSS
+			m, _ = strconv.Atoi(p[:len(p)-2])
+			sec, _ = strconv.Atoi(p[len(p)-2:])
+		default:
+			// HHMMSS (take last 4 as MMSS, rest as HH)
+			secPart := p[len(p)-2:]
+			minPart := p[len(p)-4 : len(p)-2]
+			hourPart := p[:len(p)-4]
+			sec, _ = strconv.Atoi(secPart)
+			m, _ = strconv.Atoi(minPart)
+			h, _ = strconv.Atoi(hourPart)
+		}
 	default:
 		return nil
 	}
@@ -3794,6 +3833,17 @@ func isTimeString(s string) bool {
 
 func isDatetimeString(s string) bool {
 	return len(s) == 19 && s[4] == '-' && s[7] == '-' && s[10] == ' ' && s[13] == ':' && s[16] == ':'
+}
+
+// isDatetimeWithTimeComponent returns true if s is a full DATETIME string with a time component
+// (e.g., '2006-07-16 10:30:00'), as opposed to a plain DATE string ('2006-07-16').
+// For ADDTIME/SUBTIME, only DATETIME (not DATE) strings should use datetime arithmetic.
+func isDatetimeWithTimeComponent(s string) bool {
+	if !isDatetimeLikeString(s) {
+		return false
+	}
+	// Must have space or 'T' separator after date part (position 10)
+	return len(s) > 10 && (s[10] == ' ' || s[10] == 'T')
 }
 
 // isDateLikeButInvalid returns true if s looks like a date/datetime string (YYYY-MM-DD...)

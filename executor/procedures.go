@@ -2018,6 +2018,44 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 							defaultVal = nil
 						} else if n, err := strconv.ParseInt(defStr, 10, 64); err == nil {
 							defaultVal = n
+							// Validate integer range for typed integer declarations in strict mode.
+							if e.isStrictMode() {
+								typeUpper := strings.ToUpper(typeName)
+								var minVal, maxVal int64
+								var isRangeType bool
+								isUnsigned := false
+								for _, dp := range declParts {
+									if strings.ToUpper(dp) == "UNSIGNED" {
+										isUnsigned = true
+									}
+								}
+								switch {
+								case strings.HasPrefix(typeUpper, "TINYINT"):
+									if isUnsigned {
+										minVal, maxVal = 0, 255
+									} else {
+										minVal, maxVal = -128, 127
+									}
+									isRangeType = true
+								case strings.HasPrefix(typeUpper, "SMALLINT"):
+									if isUnsigned {
+										minVal, maxVal = 0, 65535
+									} else {
+										minVal, maxVal = -32768, 32767
+									}
+									isRangeType = true
+								case strings.HasPrefix(typeUpper, "MEDIUMINT"):
+									if isUnsigned {
+										minVal, maxVal = 0, 16777215
+									} else {
+										minVal, maxVal = -8388608, 8388607
+									}
+									isRangeType = true
+								}
+								if isRangeType && (n < minVal || n > maxVal) {
+									return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column 'v1' at row 1"))
+								}
+							}
 						} else if f, err := strconv.ParseFloat(defStr, 64); err == nil {
 							defaultVal = f
 						} else if strings.ToUpper(defStr) == "TRUE" {
