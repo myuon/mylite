@@ -835,8 +835,19 @@ func splitByComma(s string) []string {
 	var parts []string
 	var current strings.Builder
 	depth := 0
+	inQuote := rune(0)
 	for _, ch := range s {
+		if inQuote != 0 {
+			current.WriteRune(ch)
+			if ch == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
 		switch ch {
+		case '\'', '"', '`':
+			inQuote = ch
+			current.WriteRune(ch)
 		case '(':
 			depth++
 			current.WriteRune(ch)

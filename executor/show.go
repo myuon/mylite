@@ -474,7 +474,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			if !strings.EqualFold(targetDB, "information_schema") {
 				db, err := e.Catalog.GetDatabase(targetDB)
 				if err != nil {
-					return nil, err
+					return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", targetDB))
 				}
 				tables = db.ListTables()
 			}
@@ -561,7 +561,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		}
 		db, err := e.Catalog.GetDatabase(targetDB)
 		if err != nil {
-			return nil, err
+			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", targetDB))
 		}
 		tables := db.ListTables()
 		// Include views in SHOW TABLES

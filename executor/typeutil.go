@@ -578,6 +578,18 @@ func (e *Executor) addAggregatesToRow(expr sqlparser.Expr, row storage.Row, grou
 	case *sqlparser.IsExpr:
 		// Walk into IS expressions to find aggregates (e.g., avg(x) IS NOT NULL)
 		e.addAggregatesToRow(v.Left, row, groupRows)
+	case *sqlparser.FuncExpr:
+		// Walk into function arguments to find nested aggregates (e.g., INSTR(GROUP_CONCAT(x), y))
+		for _, arg := range v.Exprs {
+			e.addAggregatesToRow(arg, row, groupRows)
+		}
+	case *sqlparser.BinaryExpr:
+		e.addAggregatesToRow(v.Left, row, groupRows)
+		e.addAggregatesToRow(v.Right, row, groupRows)
+	case *sqlparser.UnaryExpr:
+		e.addAggregatesToRow(v.Expr, row, groupRows)
+	case *sqlparser.NotExpr:
+		e.addAggregatesToRow(v.Expr, row, groupRows)
 	}
 }
 

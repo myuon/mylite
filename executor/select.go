@@ -2257,6 +2257,10 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// Check if we have GROUP BY or aggregate functions
 	hasGroupBy := stmt.GroupBy != nil && len(stmt.GroupBy.Exprs) > 0
 	hasAggregates := selectExprsHaveAggregates(stmt.SelectExprs.Exprs)
+	// Also check if the HAVING clause contains aggregates (e.g. HAVING COUNT(*) > 0)
+	if !hasAggregates && stmt.Having != nil {
+		hasAggregates = containsAggregate(stmt.Having.Expr)
+	}
 
 	if hasGroupBy || hasAggregates {
 		return e.execSelectGroupBy(stmt, allRows)
