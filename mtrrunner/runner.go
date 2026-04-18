@@ -413,6 +413,7 @@ type execContext struct {
 	pendingSendEval   bool                    // pending send should use variable substitution
 	pendingEval       bool                    // next SQL statement should have variables expanded in echo
 	abortOnError     bool                    // if false, SQL errors are output as ERROR lines instead of aborting (--disable_abort_on_error)
+	metadataEnabled  bool                    // --enable_metadata: output column type metadata before each result set
 }
 
 type tableSnapshot struct {
@@ -1689,6 +1690,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 				infoEnabled:      sendInfoEnabled,
 				expectedError:    sendExpectedError,
 				abortOnError:     true,
+				metadataEnabled:  ctx.metadataEnabled,
 			}
 			err := tmpCtx.executeSQLInner(query)
 			ch <- sendResult{output: tmpCtx.output.String(), err: err, query: query}
@@ -1774,8 +1776,13 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 	// Directives we accept but ignore
 	case "character_set", "charset":
 		return true, false, nil
-	case "disable_metadata", "enable_metadata",
-		"disable_ps_protocol", "enable_ps_protocol",
+	case "enable_metadata":
+		ctx.metadataEnabled = true
+		return true, false, nil
+	case "disable_metadata":
+		ctx.metadataEnabled = false
+		return true, false, nil
+	case "disable_ps_protocol", "enable_ps_protocol",
 		"disable_cursor_protocol", "enable_cursor_protocol",
 		"disable_view_protocol", "enable_view_protocol",
 		"disable_session_track_info", "enable_session_track_info",
@@ -2699,8 +2706,17 @@ func (ctx *execContext) executeQuery(stmt string) error {
 		return nil
 	}
 
+	// Collect column type info when metadata output is enabled.
+	var colTypes []*sql.ColumnType
+	if ctx.metadataEnabled {
+		colTypes, _ = rows.ColumnTypes()
+	}
+
 	// Collect result rows
 	var resultLines []string
+	// Track per-column cell strings for Max_length computation when metadata is enabled.
+	colMaxLen := make([]int, len(columns))
+	var resultCells [][]string // only populated when metadataEnabled
 	for rows.Next() {
 		values := make([]interface{}, len(columns))
 		valuePtrs := make([]interface{}, len(columns))
@@ -2723,6 +2739,17 @@ func (ctx *execContext) executeQuery(stmt string) error {
 				}
 			}
 		}
+		// Track per-column max lengths for metadata output.
+		if ctx.metadataEnabled {
+			for i, s := range parts {
+				if len(s) > colMaxLen[i] {
+					colMaxLen[i] = len(s)
+				}
+			}
+			rowCopy := make([]string, len(parts))
+			copy(rowCopy, parts)
+			resultCells = append(resultCells, rowCopy)
+		}
 		if useVertical {
 			for i, col := range columns {
 				resultLines = append(resultLines, col+"\t"+parts[i])
@@ -2736,6 +2763,12 @@ func (ctx *execContext) executeQuery(stmt string) error {
 	if ctx.sortResult {
 		sort.Strings(resultLines)
 		ctx.sortResult = false
+		// Re-sort resultCells to match.
+		if ctx.metadataEnabled && len(resultCells) > 0 {
+			sort.Slice(resultCells, func(i, j int) bool {
+				return strings.Join(resultCells[i], "\t") < strings.Join(resultCells[j], "\t")
+			})
+		}
 	}
 	// Clear replace_columns after use
 	ctx.replaceColumns = nil
@@ -2761,6 +2794,39 @@ func (ctx *execContext) executeQuery(stmt string) error {
 		ctx.replaceRegex = nil
 	}
 
+	// Output --enable_metadata header and per-column metadata rows.
+	if ctx.metadataEnabled && !useVertical {
+		ctx.output.WriteString("Catalog\tDatabase\tTable\tTable_alias\tColumn\tColumn_alias\tType\tLength\tMax length\tIs_null\tFlags\tDecimals\tCharsetnr\n")
+		for i, colName := range columns {
+			var typeCode, length, flags, decimals, charsetnr int
+			nullable := true
+			if colTypes != nil && i < len(colTypes) {
+				ct := colTypes[i]
+				n, nok := ct.Nullable()
+				if nok {
+					nullable = n
+				}
+				d, _, dok := ct.DecimalSize()
+				if dok {
+					decimals = int(d)
+				}
+				info := columnTypeToMySQLInfo(ct.DatabaseTypeName(), nullable, decimals)
+				typeCode = info.typeCode
+				length = info.length
+				flags = int(info.flags)
+				decimals = info.decimals
+				charsetnr = info.charsetnr
+			}
+			maxLen := colMaxLen[i]
+			isNull := "Y"
+			if !nullable {
+				isNull = "N"
+			}
+			ctx.output.WriteString(fmt.Sprintf("def\t\t\t\t\t%s\t%d\t%d\t%d\t%s\t%d\t%d\t%d\n",
+				colName, typeCode, length, maxLen, isNull, flags, decimals, charsetnr))
+		}
+	}
+
 	if !useVertical {
 		// Write column headers for regular (horizontal) results.
 		ctx.output.WriteString(strings.Join(columns, "\t") + "\n")
@@ -2777,6 +2843,223 @@ func (ctx *execContext) executeQuery(stmt string) error {
 	}
 
 	return nil
+}
+
+// mysqlTypeInfo holds the MySQL wire-protocol type code, flags, and charset number
+// for a given Go sql.ColumnType as derived from DatabaseTypeName and Nullable.
+type mysqlTypeInfo struct {
+	typeCode  int    // MySQL type code (e.g. 8 for LONGLONG/BIGINT)
+	length    int    // display/max length reported in the metadata row
+	flags     uint32 // MySQL field flags bitmap
+	decimals  int
+	charsetnr int
+}
+
+// columnTypeToMySQLInfo maps a DatabaseTypeName string (and nullable flag) to mysqlTypeInfo.
+// These values approximate what real MySQL reports via the protocol for expression columns.
+func columnTypeToMySQLInfo(typeName string, nullable bool, decimals int) mysqlTypeInfo {
+	// MySQL type codes (from MySQL internal definitions)
+	const (
+		mysqlTypeDecimal    = 0
+		mysqlTypeTiny       = 1
+		mysqlTypeShort      = 2
+		mysqlTypeLong       = 3
+		mysqlTypeFloat      = 4
+		mysqlTypeDouble     = 5
+		mysqlTypeNull       = 6
+		mysqlTypeTimestamp  = 7
+		mysqlTypeLonglong   = 8
+		mysqlTypeInt24      = 9
+		mysqlTypeDate       = 10
+		mysqlTypeTime       = 11
+		mysqlTypeDatetime   = 12
+		mysqlTypeYear       = 13
+		mysqlTypeNewdate    = 14
+		mysqlTypeVarchar    = 15
+		mysqlTypeBit        = 16
+		mysqlTypeNewDecimal = 246
+		mysqlTypeEnum       = 247
+		mysqlTypeSet        = 248
+		mysqlTypeTinyBlob   = 249
+		mysqlTypeMediumBlob = 250
+		mysqlTypeLongBlob   = 251
+		mysqlTypeBlob       = 252
+		mysqlTypeVarString  = 253
+		mysqlTypeString     = 254
+		mysqlTypeGeometry   = 255
+	)
+	// MySQL field flag bits
+	const (
+		flagNotNull       uint32 = 1
+		flagPriKey        uint32 = 2
+		flagUniqueKey     uint32 = 4
+		flagMultipleKey   uint32 = 8
+		flagBlob          uint32 = 16
+		flagUnsigned      uint32 = 32
+		flagZerofill      uint32 = 64
+		flagBinary        uint32 = 128
+		flagEnum          uint32 = 256
+		flagAutoIncrement uint32 = 512
+		flagTimestamp     uint32 = 1024
+		flagSet           uint32 = 2048
+		flagNoDefaultVal  uint32 = 4096
+		flagOnUpdateNow   uint32 = 8192
+		flagNum           uint32 = 32768
+	)
+
+	upper := strings.ToUpper(strings.TrimSpace(typeName))
+	// Strip precision/scale like "DECIMAL(10,2)" -> "DECIMAL"
+	if idx := strings.IndexByte(upper, '('); idx >= 0 {
+		upper = strings.TrimSpace(upper[:idx])
+	}
+	isUnsigned := strings.Contains(upper, " UNSIGNED")
+	if isUnsigned {
+		upper = strings.TrimSuffix(upper, " UNSIGNED")
+	}
+
+	info := mysqlTypeInfo{charsetnr: 63} // default: binary charset
+	if !nullable {
+		info.flags |= flagNotNull
+	}
+	if isUnsigned {
+		info.flags |= flagUnsigned
+	}
+
+	switch upper {
+	case "TINYINT", "BOOL", "BOOLEAN":
+		info.typeCode = mysqlTypeTiny
+		if isUnsigned {
+			info.length = 3
+		} else {
+			info.length = 4
+		}
+		info.flags |= flagBinary | flagNum
+	case "SMALLINT":
+		info.typeCode = mysqlTypeShort
+		if isUnsigned {
+			info.length = 5
+		} else {
+			info.length = 6
+		}
+		info.flags |= flagBinary | flagNum
+	case "MEDIUMINT":
+		info.typeCode = mysqlTypeInt24
+		if isUnsigned {
+			info.length = 8
+		} else {
+			info.length = 9
+		}
+		info.flags |= flagBinary | flagNum
+	case "INT", "INTEGER":
+		info.typeCode = mysqlTypeLong
+		if isUnsigned {
+			info.length = 10
+		} else {
+			info.length = 11
+		}
+		info.flags |= flagBinary | flagNum
+	case "BIGINT":
+		info.typeCode = mysqlTypeLonglong
+		info.length = 20
+		info.flags |= flagBinary | flagNum
+	case "FLOAT":
+		info.typeCode = mysqlTypeFloat
+		info.length = 12
+		info.flags |= flagBinary | flagNum
+		if decimals > 0 {
+			info.decimals = decimals
+		}
+	case "DOUBLE", "REAL":
+		info.typeCode = mysqlTypeDouble
+		info.length = 22
+		info.flags |= flagBinary | flagNum
+		if decimals > 0 {
+			info.decimals = decimals
+		}
+	case "DECIMAL", "NUMERIC", "NEWDECIMAL":
+		info.typeCode = mysqlTypeNewDecimal
+		info.length = 10 // will be overridden by actual precision+scale
+		info.flags |= flagBinary | flagNum
+		if decimals > 0 {
+			info.decimals = decimals
+		}
+	case "DATE":
+		info.typeCode = mysqlTypeDate
+		info.length = 10
+		info.flags |= flagBinary
+	case "DATETIME":
+		info.typeCode = mysqlTypeDatetime
+		info.length = 19
+		info.flags |= flagBinary
+	case "TIMESTAMP":
+		info.typeCode = mysqlTypeTimestamp
+		info.length = 19
+		info.flags |= flagBinary | flagTimestamp
+	case "TIME":
+		info.typeCode = mysqlTypeTime
+		info.length = 10
+		info.flags |= flagBinary
+	case "YEAR":
+		info.typeCode = mysqlTypeYear
+		info.length = 4
+		info.flags |= flagUnsigned | flagZerofill | flagBinary | flagNum
+	case "BIT":
+		info.typeCode = mysqlTypeBit
+		info.length = 1
+		info.flags |= flagUnsigned | flagBinary
+	case "CHAR":
+		info.typeCode = mysqlTypeString
+		info.length = 1
+		info.charsetnr = 33 // utf8
+	case "VARCHAR", "TEXT", "MEDIUMTEXT", "LONGTEXT", "TINYTEXT":
+		info.typeCode = mysqlTypeVarString
+		info.length = 255
+		info.charsetnr = 33 // utf8
+	case "BINARY":
+		info.typeCode = mysqlTypeString
+		info.length = 1
+		info.flags |= flagBinary
+	case "VARBINARY":
+		info.typeCode = mysqlTypeVarString
+		info.length = 255
+		info.flags |= flagBinary
+	case "BLOB", "TINYBLOB", "MEDIUMBLOB", "LONGBLOB":
+		info.typeCode = mysqlTypeBlob
+		info.length = 65535
+		info.flags |= flagBlob | flagBinary
+	case "ENUM":
+		info.typeCode = mysqlTypeString
+		info.length = 1
+		info.flags |= flagEnum
+		info.charsetnr = 33
+	case "SET":
+		info.typeCode = mysqlTypeString
+		info.length = 0
+		info.flags |= flagSet
+		info.charsetnr = 33
+	case "GEOMETRY":
+		info.typeCode = mysqlTypeGeometry
+		info.length = 0
+		info.flags |= flagBlob | flagBinary
+	case "JSON":
+		info.typeCode = mysqlTypeBlob
+		info.length = 4294967295
+		info.flags |= flagBlob
+		info.charsetnr = 33
+	case "NULL":
+		info.typeCode = mysqlTypeNull
+		info.length = 0
+		info.flags = flagBinary
+		if !nullable {
+			info.flags |= flagNotNull
+		}
+	default:
+		// Unknown type - treat as var string
+		info.typeCode = mysqlTypeVarString
+		info.length = 255
+		info.charsetnr = 33
+	}
+	return info
 }
 
 // executeQueryOrExec tries to execute a statement as a query first (returning rows),

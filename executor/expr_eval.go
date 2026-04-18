@@ -921,11 +921,31 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 func (e *Executor) evalUnaryExpr(v *sqlparser.UnaryExpr) (interface{}, error) {
 	val, err := e.evalExpr(v.Expr)
 	if err != nil {
+		// For unary minus applied to an overflow value, negate the sign in the
+		// overflow error so that callers (e.g. CAST AS SIGNED) can clamp to the
+		// correct bound.  E.g. CAST(-19999999999999999999 AS SIGNED) should clamp
+		// to INT64_MIN, not INT64_MAX.
+		if v.Operator == sqlparser.UMinusOp {
+			var oe *intOverflowError
+			if errors.As(err, &oe) {
+				negVal := oe.val
+				if strings.HasPrefix(negVal, "-") {
+					negVal = strings.TrimPrefix(negVal, "-")
+				} else {
+					negVal = "-" + negVal
+				}
+				return nil, &intOverflowError{val: negVal, kind: oe.kind}
+			}
+		}
 		return nil, err
 	}
 	if v.Operator == sqlparser.UMinusOp {
 		switch n := val.(type) {
 		case int64:
+			// -INT64_MIN overflows int64; return uint64(INT64_MAX+1) = 9223372036854775808.
+			if n == math.MinInt64 {
+				return uint64(1 << 63), nil
+			}
 			return -n, nil
 		case uint64:
 			if n == 1<<63 {
@@ -6041,6 +6061,10 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		if v.Operator == sqlparser.UMinusOp {
 			switch n := val.(type) {
 			case int64:
+				// -INT64_MIN overflows int64; return uint64(INT64_MAX+1).
+				if n == math.MinInt64 {
+					return uint64(1 << 63), nil
+				}
 				return -n, nil
 			case uint64:
 				if n == 1<<63 {
