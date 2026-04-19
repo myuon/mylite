@@ -2077,6 +2077,18 @@ func evalIntervalDateExprStrict(dateVal, intervalVal interface{}, unit sqlparser
 			n = -n
 		}
 		t = t.AddDate(0, 0, n*7)
+	case sqlparser.IntervalQuarter:
+		n, ov := parseIntervalInt(iStr)
+		if ov {
+			if strict {
+				return nil, mysqlError(1441, "22008", "Datetime function: datetime field overflow")
+			}
+			return nil, nil
+		}
+		if isSubtract {
+			n = -n
+		}
+		t = addDateMonths(t, 0, n*3)
 	case sqlparser.IntervalYearMonth:
 		// Format: 'Y M' or 'Y:M' or 'Y-M'
 		s := strings.TrimSpace(iStr)
@@ -2205,6 +2217,31 @@ func evalIntervalDateExprStrict(dateVal, intervalVal interface{}, unit sqlparser
 		}
 	}
 
+	// Format output based on whether the original had time component
+	ds := toString(dateVal)
+
+	// If the input was a pure TIME value (no date component, format HH:MM:SS),
+	// return the result as a TIME string rather than a datetime.
+	isPureTime := func(s string) bool {
+		// A pure time string has colons but no dashes or spaces before the colon.
+		// e.g. "06:07:08", "06:07:08.123456" but not "2003-01-02 06:07:08"
+		if dashIdx := strings.IndexByte(s, '-'); dashIdx >= 0 {
+			return false
+		}
+		if spaceIdx := strings.IndexByte(s, ' '); spaceIdx >= 0 {
+			return false
+		}
+		return strings.IndexByte(s, ':') >= 0
+	}
+	if isPureTime(ds) {
+		usec := t.Nanosecond() / 1000
+		base := t.Format("15:04:05")
+		if usec != 0 {
+			base = fmt.Sprintf("%s.%06d", base, usec)
+		}
+		return base, nil
+	}
+
 	// Check for datetime overflow (year out of MySQL's valid range 1000-9999)
 	if t.Year() < 1000 || t.Year() > 9999 {
 		if strict {
@@ -2213,8 +2250,6 @@ func evalIntervalDateExprStrict(dateVal, intervalVal interface{}, unit sqlparser
 		return nil, nil
 	}
 
-	// Format output based on whether the original had time component
-	ds := toString(dateVal)
 	usec := t.Nanosecond() / 1000
 	if strings.Contains(ds, " ") || strings.Contains(ds, ":") || t.Hour() != 0 || t.Minute() != 0 || t.Second() != 0 || usec != 0 {
 		base := t.Format("2006-01-02 15:04:05")
@@ -2892,10 +2927,17 @@ func timestampDiff(unit sqlparser.IntervalType, t1, t2 time.Time) int64 {
 		y1, m1, _ := t1.Date()
 		y2, m2, d2 := t2.Date()
 		months := int64((y2-y1)*12 + int(m2-m1))
-		// If the day of t2 is before the day of t1, subtract one month
+		// Antisymmetric day+time adjustment: if not a complete month, adjust toward zero.
 		_, _, d1 := t1.Date()
-		if d2 < d1 {
+		// When days are equal, also compare intraday time.
+		t1IntraDay := int64(t1.Hour())*3600 + int64(t1.Minute())*60 + int64(t1.Second())
+		t2IntraDay := int64(t2.Hour())*3600 + int64(t2.Minute())*60 + int64(t2.Second())
+		t2LessThanT1 := d2 < d1 || (d2 == d1 && t2IntraDay < t1IntraDay)
+		t2GreaterThanT1 := d2 > d1 || (d2 == d1 && t2IntraDay > t1IntraDay)
+		if months > 0 && t2LessThanT1 {
 			months--
+		} else if months < 0 && t2GreaterThanT1 {
+			months++
 		}
 		return months
 	case sqlparser.IntervalQuarter:
@@ -2903,18 +2945,31 @@ func timestampDiff(unit sqlparser.IntervalType, t1, t2 time.Time) int64 {
 		y2, m2, d2 := t2.Date()
 		months := int64((y2-y1)*12 + int(m2-m1))
 		_, _, d1 := t1.Date()
-		if d2 < d1 {
+		t1IntraDay := int64(t1.Hour())*3600 + int64(t1.Minute())*60 + int64(t1.Second())
+		t2IntraDay := int64(t2.Hour())*3600 + int64(t2.Minute())*60 + int64(t2.Second())
+		t2LessThanT1 := d2 < d1 || (d2 == d1 && t2IntraDay < t1IntraDay)
+		t2GreaterThanT1 := d2 > d1 || (d2 == d1 && t2IntraDay > t1IntraDay)
+		if months > 0 && t2LessThanT1 {
 			months--
+		} else if months < 0 && t2GreaterThanT1 {
+			months++
 		}
 		return months / 3
 	case sqlparser.IntervalYear:
-		y1, m1, d1 := t1.Date()
+		y1, m1, _ := t1.Date()
 		y2, m2, d2 := t2.Date()
-		years := int64(y2 - y1)
-		if m2 < m1 || (m2 == m1 && d2 < d1) {
-			years--
+		months := int64((y2-y1)*12 + int(m2-m1))
+		_, _, d1 := t1.Date()
+		t1IntraDay := int64(t1.Hour())*3600 + int64(t1.Minute())*60 + int64(t1.Second())
+		t2IntraDay := int64(t2.Hour())*3600 + int64(t2.Minute())*60 + int64(t2.Second())
+		t2LessThanT1 := d2 < d1 || (d2 == d1 && t2IntraDay < t1IntraDay)
+		t2GreaterThanT1 := d2 > d1 || (d2 == d1 && t2IntraDay > t1IntraDay)
+		if months > 0 && t2LessThanT1 {
+			months--
+		} else if months < 0 && t2GreaterThanT1 {
+			months++
 		}
-		return years
+		return months / 12
 	}
 	return 0
 }

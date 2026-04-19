@@ -150,6 +150,9 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 			switch funcName {
 			case "aes_encrypt", "aes_decrypt", "random_bytes", "compress":
 				return "binary", true, nil
+			// Date/time functions that return utf8mb4 strings in MySQL 8.0+
+			case "dayname", "monthname":
+				return "utf8mb4", true, nil
 			}
 		}
 		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
