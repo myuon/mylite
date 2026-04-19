@@ -6643,6 +6643,50 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 			attrs.defaultVal = "0"
 		}
 	}
+	// For CASE WHEN ... THEN val ELSE val END:
+	// If all branches are non-null literals, result is NOT NULL.
+	if caseExpr, ok := expr.(*sqlparser.CaseExpr); ok {
+		colTypeLower := strings.ToLower(attrs.colType)
+		isString := strings.HasPrefix(colTypeLower, "varchar(") || strings.HasPrefix(colTypeLower, "char(")
+		isNumeric := strings.HasPrefix(colTypeLower, "decimal(") || strings.HasPrefix(colTypeLower, "bigint") ||
+			strings.HasPrefix(colTypeLower, "int") || colTypeLower == "double"
+		if isString || isNumeric {
+			allNonNull := true
+			// Check all THEN branches
+			for _, when := range caseExpr.Whens {
+				t := e.inferExprType(when.Val)
+				if t == "binary(0)" || t == "" {
+					allNonNull = false
+					break
+				}
+			}
+			// Check ELSE branch: if no ELSE, MySQL uses NULL → nullable
+			if caseExpr.Else == nil {
+				allNonNull = false
+			} else if allNonNull {
+				t := e.inferExprType(caseExpr.Else)
+				if t == "binary(0)" || t == "" {
+					allNonNull = false
+				}
+			}
+			if allNonNull {
+				attrs.nullable = false
+				attrs.hasDefault = true
+				if isString {
+					attrs.defaultVal = ""
+				} else if strings.HasPrefix(colTypeLower, "decimal(") {
+					var m, d int
+					if n, _ := fmt.Sscanf(attrs.colType, "decimal(%d,%d)", &m, &d); n == 2 && d > 0 {
+						attrs.defaultVal = "0." + strings.Repeat("0", d)
+					} else {
+						attrs.defaultVal = "0"
+					}
+				} else {
+					attrs.defaultVal = "0"
+				}
+			}
+		}
+	}
 	// For IF/COALESCE/IFNULL/NULLIF/GREATEST/LEAST with a decimal result type,
 	// MySQL uses NOT NULL with DEFAULT '0.0' (or '0.00' for scale=2, etc.),
 	// unless any value arg is NULL (then DEFAULT NULL is used).
