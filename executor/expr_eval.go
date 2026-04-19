@@ -7255,8 +7255,7 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 			}
 			// MySQL: 0000-00-00 IS NULL = TRUE for NOT NULL date columns
 			if isZeroDate(val) {
-				colName := extractColumnName(v.Left)
-				if colName != "" && e.isColumnNotNull(colName) {
+				if e.isColumnNotNullExpr(v.Left) {
 					return true, nil
 				}
 			}

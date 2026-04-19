@@ -4172,17 +4172,61 @@ func extractColumnName(expr sqlparser.Expr) string {
 }
 
 // isColumnNotNull checks if a column is defined as NOT NULL in the current query's table.
+// It checks queryTableDef first, then falls back to searching all tables in the catalog.
 func (e *Executor) isColumnNotNull(colName string) bool {
-	if e.queryTableDef == nil {
-		return false
-	}
 	colNameLower := strings.ToLower(colName)
-	for _, col := range e.queryTableDef.Columns {
-		if strings.ToLower(col.Name) == colNameLower {
-			return !col.Nullable
+	// Try queryTableDef first (fast path for single-table queries).
+	if e.queryTableDef != nil {
+		for _, col := range e.queryTableDef.Columns {
+			if strings.ToLower(col.Name) == colNameLower {
+				return !col.Nullable
+			}
+		}
+	}
+	// Fallback: search all tables in the current database (for multi-table queries).
+	// Only return true if the column is NOT NULL in ALL tables that have it.
+	// (If it's nullable in any table that has the column, we can't be sure.)
+	if e.Catalog != nil && e.CurrentDB != "" {
+		if db, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
+			for _, td := range db.Tables {
+				for _, col := range td.Columns {
+					if strings.ToLower(col.Name) == colNameLower {
+						// Found a table with this column. Return its nullable status.
+						// Use the first match (most likely the relevant table).
+						return !col.Nullable
+					}
+				}
+			}
 		}
 	}
 	return false
+}
+
+// isColumnNotNullExpr checks if a column expression refers to a NOT NULL column.
+// Uses the table qualifier if available to find the correct table.
+func (e *Executor) isColumnNotNullExpr(expr sqlparser.Expr) bool {
+	col, ok := expr.(*sqlparser.ColName)
+	if !ok {
+		return false
+	}
+	colNameLower := strings.ToLower(col.Name.String())
+	// If qualifier is specified, look up the specific table.
+	if !col.Qualifier.IsEmpty() {
+		tableName := col.Qualifier.Name.String()
+		if e.Catalog != nil && e.CurrentDB != "" {
+			if db, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
+				if td, ok := db.Tables[tableName]; ok {
+					for _, c := range td.Columns {
+						if strings.ToLower(c.Name) == colNameLower {
+							return !c.Nullable
+						}
+					}
+				}
+			}
+		}
+	}
+	// Fall back to isColumnNotNull
+	return e.isColumnNotNull(colNameLower)
 }
 // execMyliteCommand handles MYLITE-specific control commands:
 //   - MYLITE CREATE SNAPSHOT <name>
