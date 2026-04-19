@@ -242,7 +242,10 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 			return nil, true, nil
 		}
 		if isZeroDate(val) {
-			return int64(0), true, nil
+			if e.isNonDateTypeExpr(v.Exprs[0]) {
+				return nil, true, nil // string literal or non-date column → NULL
+			}
+			return int64(0), true, nil // date-typed column → 0
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
@@ -261,7 +264,10 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 			return nil, true, nil
 		}
 		if isZeroDate(val) {
-			return int64(0), true, nil
+			if e.isNonDateTypeExpr(v.Exprs[0]) {
+				return nil, true, nil // string literal or non-date column → NULL
+			}
+			return int64(0), true, nil // date-typed column → 0
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
@@ -280,7 +286,10 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 			return nil, true, nil
 		}
 		if isZeroDate(val) {
-			return int64(0), true, nil
+			if e.isNonDateTypeExpr(v.Exprs[0]) {
+				return nil, true, nil // string literal or non-date column → NULL
+			}
+			return int64(0), true, nil // date-typed column → 0
 		}
 		t, err := parseDateTimeValue(val)
 		if err != nil {
@@ -820,7 +829,10 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 			return nil, true, nil
 		}
 		if isZeroDate(val) {
-			return int64(0), true, nil
+			if len(v.Exprs) > 0 && e.isNonDateTypeExpr(v.Exprs[0]) {
+				return nil, true, nil // string literal or non-date column → NULL
+			}
+			return int64(0), true, nil // date-typed column → 0
 		}
 		t, parseErr := parseDateTimeValue(val)
 		if parseErr != nil {
@@ -1368,6 +1380,58 @@ func isTimeOnlyStr(s string) bool {
 		return false // has date separator → not time-only
 	}
 	return strings.Contains(s, ":")
+}
+
+// isNonDateTypeExpr returns true if expr is a string literal or refers to a non-DATE/DATETIME/TIMESTAMP column.
+// Used to determine if zero dates should return NULL (non-date context) vs 0 (date column context).
+func (e *Executor) isNonDateTypeExpr(expr sqlparser.Expr) bool {
+	// String literals always use NULL semantics for zero dates
+	if lit, ok := expr.(*sqlparser.Literal); ok {
+		return lit.Type == sqlparser.StrVal
+	}
+	// For column references, check the column type
+	if col, ok := expr.(*sqlparser.ColName); ok {
+		colName := col.Name.String()
+		if e.queryTableDef != nil {
+			for _, c := range e.queryTableDef.Columns {
+				if strings.EqualFold(c.Name, colName) {
+					ct := strings.ToUpper(strings.TrimSpace(c.Type))
+					if paren := strings.IndexByte(ct, '('); paren >= 0 {
+						ct = strings.TrimSpace(ct[:paren])
+					}
+					switch ct {
+					case "DATE", "DATETIME", "TIMESTAMP":
+						return false // date-typed column → return 0
+					}
+					return true // non-date column (CHAR, VARCHAR, TEXT, etc.) → return NULL
+				}
+			}
+		} else {
+			// queryTableDef is nil: try to look up from catalog using current DB
+			// This handles cases where queryTableDef was not set (e.g., complex queries)
+			if e.Catalog != nil && e.CurrentDB != "" {
+				if db, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
+					for _, td := range db.Tables {
+						for _, c := range td.Columns {
+							if strings.EqualFold(c.Name, colName) {
+								ct := strings.ToUpper(strings.TrimSpace(c.Type))
+								if paren := strings.IndexByte(ct, '('); paren >= 0 {
+									ct = strings.TrimSpace(ct[:paren])
+								}
+								switch ct {
+								case "DATE", "DATETIME", "TIMESTAMP":
+									return false
+								}
+								return true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	// Default: treat as non-date (return NULL for zero dates)
+	return true
 }
 
 func isZeroDate(val interface{}) bool {

@@ -599,9 +599,10 @@ func resultToMySQL(result *executor.Result) (*mysql.Result, error) {
 	}
 
 	rows := convertBinaryColumnValues(result.Rows, result.ColumnTypes)
+	normalizedRows := fixEmptyStrings(normalizeRows(rows))
 	r, err := mysql.BuildSimpleResultset(
 		makeFields(result.Columns),
-		fixEmptyStrings(normalizeRows(rows)),
+		normalizedRows,
 		false,
 	)
 	if err != nil {
