@@ -5241,23 +5241,79 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 		if leftType == "double" || rightType == "double" {
 			return "double"
 		}
-		// Extract integer display widths for int(N) types
-		extractIntWidth := func(t string) (int, bool) {
-			if t == "int" || t == "bigint" {
-				return 20, true
+		// TIME types in arithmetic context: treated as HHMMSS integer (int(7))
+		// e.g., sec_to_time(1)+0 → int(9), time_col-time_col → int(9)
+		timeToIntWidth := func(t string) (int, bool) {
+			if t == "time" {
+				return 7, true
 			}
-			for _, pfx := range []string{"int(", "bigint(", "tinyint(", "smallint(", "mediumint("} {
-				if strings.HasPrefix(t, pfx) {
-					var n int
-					if _, err := fmt.Sscanf(t, pfx+"%d", &n); err == nil {
-						return n, true
+			if strings.HasPrefix(t, "time(") {
+				// time(fsp) → 7 digits base + fsp for fractional + 1 for dot = 7+1+fsp
+				var fsp int
+				if _, err := fmt.Sscanf(t, "time(%d)", &fsp); err == nil {
+					if fsp > 0 {
+						return 7 + 1 + fsp, true
 					}
+					return 7, true
 				}
 			}
 			return 0, false
 		}
-		leftN, leftIsInt := extractIntWidth(leftType)
-		rightN, rightIsInt := extractIntWidth(rightType)
+		leftTimeN, leftIsTime := timeToIntWidth(leftType)
+		rightTimeN, rightIsTime := timeToIntWidth(rightType)
+		if leftIsTime || rightIsTime {
+			// Treat time as int(N) for arithmetic purposes
+			leftN2 := leftTimeN
+			rightN2 := rightTimeN
+			if !leftIsTime {
+				// infer width from right type or use 0
+				if _, ok := timeToIntWidth(rightType); !ok {
+					leftN2 = 1 // 0 literal → int(1)
+				}
+			}
+			if !rightIsTime {
+				// Use default int width for integer literal
+				rightN2 = 1
+			}
+			m := leftN2
+			if rightN2 > m {
+				m = rightN2
+			}
+			switch v.Operator {
+			case sqlparser.PlusOp, sqlparser.MinusOp:
+				return fmt.Sprintf("int(%d)", m+2)
+			}
+		}
+		// Extract integer display widths for int(N) types
+		// Returns (width, isInt, isBigint)
+		extractIntWidth := func(t string) (int, bool, bool) {
+			if t == "int" {
+				return 11, true, false
+			}
+			if t == "bigint" {
+				return 20, true, true
+			}
+			for _, pfx := range []string{"int(", "tinyint(", "smallint(", "mediumint("} {
+				if strings.HasPrefix(t, pfx) {
+					var n int
+					if _, err := fmt.Sscanf(t, pfx+"%d", &n); err == nil {
+						return n, true, false
+					}
+				}
+			}
+			for _, pfx := range []string{"bigint("} {
+				if strings.HasPrefix(t, pfx) {
+					var n int
+					if _, err := fmt.Sscanf(t, pfx+"%d", &n); err == nil {
+						return n, true, true
+					}
+				}
+			}
+			return 0, false, false
+		}
+		leftN, leftIsInt, leftIsBigint := extractIntWidth(leftType)
+		rightN, rightIsInt, rightIsBigint := extractIntWidth(rightType)
+		bothSmallInt := leftIsInt && rightIsInt && !leftIsBigint && !rightIsBigint
 		if leftIsInt && rightIsInt {
 			switch v.Operator {
 			case sqlparser.PlusOp, sqlparser.MinusOp:
@@ -5265,6 +5321,9 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 				m := leftN
 				if rightN > m {
 					m = rightN
+				}
+				if bothSmallInt {
+					return fmt.Sprintf("int(%d)", m+2)
 				}
 				return fmt.Sprintf("bigint(%d)", m+2)
 			case sqlparser.MultOp:
@@ -5335,6 +5394,16 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			return "bigint unsigned"
 		case "last_insert_id", "row_count", "found_rows":
 			return "bigint"
+		// Datetime functions: return specific int types used in arithmetic context.
+		// When used in NOW()-NOW() etc., the YYYYMMDDHHMMSS value is a 14-digit number.
+		case "now", "sysdate", "current_timestamp", "localtime", "localtimestamp",
+			"from_unixtime":
+			// NOW() as number: YYYYMMDDHHMMSS = bigint(14); subtract gives bigint(16)
+			return "bigint(14)"
+		case "curtime", "current_time":
+			// CURTIME() as number: HHMMSS = int(6); subtract gives int(8)
+			// MySQL uses int(7) to give int(9) result with subtract
+			return "int(7)"
 		case "round", "truncate":
 			// ROUND(x, d) / TRUNCATE(x, d): if x is a decimal literal, infer decimal(M,D)
 			// where D is the number of decimal places requested (or 0 for negative d).
@@ -5901,6 +5970,19 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 	case *sqlparser.LocateExpr:
 		// LOCATE(substr, str [, pos]) returns int(11)
 		return "int(11)"
+	case *sqlparser.CurTimeFuncExpr:
+		// CurTimeFuncExpr covers curtime(), current_time(), now(), sysdate(),
+		// current_timestamp(), localtime(), localtimestamp(), utc_time(), utc_timestamp()
+		name := strings.ToLower(v.Name.String())
+		switch name {
+		case "curtime", "current_time", "utc_time":
+			// HHMMSS = 6 digits; MySQL uses int(7) so subtract gives int(9)
+			return "int(7)"
+		case "now", "sysdate", "current_timestamp", "localtime", "localtimestamp", "utc_timestamp":
+			// YYYYMMDDHHMMSS = 14 digits; MySQL uses bigint(14) so subtract gives bigint(16)
+			return "bigint(14)"
+		}
+		return "bigint"
 	case *sqlparser.LockingFunc:
 		switch v.Type {
 		case sqlparser.IsFreeLock, sqlparser.ReleaseLock:
@@ -6196,13 +6278,40 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 			attrs.charset = cs
 		}
 	}
-	// For arithmetic expressions involving hex/integer literals, MySQL uses NOT NULL with DEFAULT 0
-	if _, isBin := expr.(*sqlparser.BinaryExpr); isBin {
+	// For arithmetic expressions involving hex/integer literals, MySQL uses NOT NULL with DEFAULT 0,
+	// but only when no operand can return NULL.
+	if binExpr, isBin := expr.(*sqlparser.BinaryExpr); isBin {
 		colType := strings.ToLower(attrs.colType)
 		if strings.Contains(colType, "int") || colType == "double" || colType == "decimal" {
-			attrs.nullable = false
-			attrs.hasDefault = true
-			attrs.defaultVal = "0"
+			// Check if any operand might return NULL (FuncExpr that is not guaranteed non-null)
+			anyNullable := false
+			for _, operand := range []sqlparser.Expr{binExpr.Left, binExpr.Right} {
+				switch op := operand.(type) {
+				case *sqlparser.FuncExpr:
+					// Most FuncExpr can return NULL (e.g., sec_to_time, from_unixtime, etc.)
+					name := strings.ToLower(op.Name.String())
+					switch name {
+					case "abs", "sign", "length", "char_length", "character_length",
+						"bit_length", "octet_length", "connection_id", "last_insert_id",
+						"found_rows", "row_count":
+						// These functions don't typically return NULL for valid inputs
+					default:
+						anyNullable = true
+					}
+				case *sqlparser.CurTimeFuncExpr:
+					// now(), curtime(), etc. never return NULL
+				case *sqlparser.Literal:
+					// Literals are never NULL
+				default:
+					// Unknown/complex expression — assume potentially nullable
+					anyNullable = true
+				}
+			}
+			if !anyNullable {
+				attrs.nullable = false
+				attrs.hasDefault = true
+				attrs.defaultVal = "0"
+			}
 		}
 	}
 	// For numeric functions that return decimal, MySQL uses NOT NULL with appropriate DEFAULT.
