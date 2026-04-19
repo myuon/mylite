@@ -2361,6 +2361,12 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 					}
 					// For InnoDB with STATS_PERSISTENT=1 and no entry: NULL (unexpected, but handled)
 					// For empty MyISAM (len(dataRows)==0) with no entry: NULL (dynamic not computed)
+					// Exception: MyISAM PRIMARY KEY always shows 0 cardinality (even for empty tables)
+					if tblIsNonInnoDB && cardinality == nil && indexTypeStr != "HASH" &&
+						!(tblEngine == "MEMORY" || tblEngine == "HEAP") &&
+						strings.EqualFold(indexName, "PRIMARY") {
+						cardinality = int64(0)
+					}
 					// For MEMORY/HEAP tables with BTREE indexes, cardinality is always NULL
 					// (MySQL's MEMORY engine reports NULL cardinality for BTREE but computes for HASH)
 					if (tblEngine == "MEMORY" || tblEngine == "HEAP") && indexTypeStr == "BTREE" {
