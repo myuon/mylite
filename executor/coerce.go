@@ -29,10 +29,10 @@ func coerceDateTimeValue(colType string, v interface{}) interface{} {
 // in that mode, a TIME-format string like "10:10:10.999999" stored into TIMESTAMP gets the
 // session date prepended. Without that mode, such strings are treated as invalid datetimes (→ zero).
 func coerceDateTimeValueWithSession(colType string, v interface{}, sessionTime *time.Time) interface{} {
-	return coerceDateTimeValueWithSessionEx(colType, v, sessionTime, false)
+	return coerceDateTimeValueWithSessionEx(colType, v, sessionTime, false, nil)
 }
 
-func coerceDateTimeValueWithSessionEx(colType string, v interface{}, sessionTime *time.Time, timeTruncateFractional bool) interface{} {
+func coerceDateTimeValueWithSessionEx(colType string, v interface{}, sessionTime *time.Time, timeTruncateFractional bool, tz *time.Location) interface{} {
 	upper := strings.ToUpper(strings.TrimSpace(colType))
 	// Convert ScaledValue to its decimal string representation so downstream
 	// date/time parsing can handle it correctly (e.g. DECIMAL(30,6) column value).
@@ -238,7 +238,14 @@ func coerceDateTimeValueWithSessionEx(colType string, v interface{}, sessionTime
 			if parseErr == nil {
 				minTS := time.Date(1970, 1, 1, 0, 0, 1, 0, time.UTC)
 				maxTS := time.Date(2038, 1, 19, 3, 14, 7, 0, time.UTC)
-				if t.Before(minTS) || t.After(maxTS) {
+				// t was parsed without timezone (UTC). If session has a timezone,
+				// re-interpret t as a local time in that timezone, then convert to UTC.
+				tUTC := t
+				if tz != nil {
+					tLocal := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), tz)
+					tUTC = tLocal.UTC()
+				}
+				if tUTC.Before(minTS) || tUTC.After(maxTS) {
 					return "0000-00-00 00:00:00"
 				}
 			}
@@ -1037,7 +1044,7 @@ func (e *Executor) coerceColumnValueWithSession(colType string, val interface{})
 		val = validateEnumSetValue(colType, val)
 		st := e.nowTime()
 		ttf := strings.Contains(e.sqlMode, "TIME_TRUNCATE_FRACTIONAL")
-		val = coerceDateTimeValueWithSessionEx(colType, val, &st, ttf)
+		val = coerceDateTimeValueWithSessionEx(colType, val, &st, ttf, e.timeZone)
 		val = coerceIntegerValue(colType, val)
 		val = coerceBitValue(colType, val)
 	}
@@ -1070,7 +1077,7 @@ func (e *Executor) coerceValueForColumnTypeWithSession(col catalog.ColumnDef, va
 	val = validateEnumSetValue(col.Type, val)
 	st := e.nowTime()
 	ttf := strings.Contains(e.sqlMode, "TIME_TRUNCATE_FRACTIONAL")
-	val = coerceDateTimeValueWithSessionEx(col.Type, val, &st, ttf)
+	val = coerceDateTimeValueWithSessionEx(col.Type, val, &st, ttf, e.timeZone)
 	val = coerceIntegerValue(col.Type, val)
 	val = coerceBitValue(col.Type, val)
 	// Truncate BLOB/TEXT values when column type changes (e.g., LONGBLOB→BLOB)
