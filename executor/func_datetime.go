@@ -1044,6 +1044,13 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if ttsNeg {
 			ttsSecs = -ttsSecs
 		}
+		// MySQL TIME_TO_SEC clamps to max TIME value 838:59:59 = 3020399 seconds
+		const maxTTSSec = 838*3600 + 59*60 + 59
+		if ttsSecs > maxTTSSec {
+			ttsSecs = maxTTSSec
+		} else if ttsSecs < -maxTTSSec {
+			ttsSecs = -maxTTSSec
+		}
 		return ttsSecs, true, nil
 	case "period_add":
 		paP, paN, hasNull, err := e.evalArgs2(v.Exprs, "PERIOD_ADD", row)
@@ -1130,9 +1137,18 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 			// Exception: if all zeros, still include (MySQL shows .000000 for 59.0000005 truncated)
 			mtFrac = "." + frac
 		}
-		timeStr := fmt.Sprintf("%s%02d:%02d:%02d%s", mtNeg, mtHi, mtMi, mtSi, mtFrac)
-		// Clip to max TIME: if at 838:59:59 with fractional > 0, clamp.
-		// This is handled by formatTimeValue when the result is stored; here just return the string.
+		// Clamp to MySQL TIME maximum value: 838:59:59
+		const maxMakeTimeH = int64(838)
+		clampedH := mtHi
+		clampedM := mtMi
+		clampedS := mtSi
+		if mtHi > maxMakeTimeH || (mtHi == maxMakeTimeH && (mtMi > 59 || mtSi > 59)) {
+			clampedH = maxMakeTimeH
+			clampedM = 59
+			clampedS = 59
+			mtFrac = ""
+		}
+		timeStr := fmt.Sprintf("%s%02d:%02d:%02d%s", mtNeg, clampedH, clampedM, clampedS, mtFrac)
 		return timeStr, true, nil
 	case "microsecond":
 		usVal, isNull, err := e.evalArg1(v.Exprs, "MICROSECOND", row)
@@ -1481,12 +1497,19 @@ func secToTimeValue(v interface{}) string {
 		sign = "-"
 		f = -f
 	}
+	// MySQL SEC_TO_TIME clamps to max TIME value 838:59:59
+	const maxTimeSec = 838*3600 + 59*60 + 59 // 3020399
 	totalSec := int64(f)
+	clamped := false
+	if totalSec > maxTimeSec {
+		totalSec = maxTimeSec
+		clamped = true
+	}
 	h := totalSec / 3600
 	m := (totalSec % 3600) / 60
 	s := totalSec % 60
 
-	if fracPrec > 0 {
+	if fracPrec > 0 && !clamped {
 		var fracStr string
 		if strFracPart != "" {
 			// Use string-based truncation (no float rounding artifacts).
@@ -2286,6 +2309,12 @@ func addTimeStrings(base, interval string, subtract bool) interface{} {
 		return base
 	}
 	baseMicros := *baseTime
+	// MySQL clamps the base TIME value to [-838:59:59, 838:59:59] before arithmetic.
+	if baseMicros > maxTimeMicros {
+		baseMicros = maxTimeMicros
+	} else if baseMicros < -maxTimeMicros {
+		baseMicros = -maxTimeMicros
+	}
 	intervalMicros := *intervalTime
 	var resultMicros int64
 	if subtract {
@@ -2433,10 +2462,18 @@ func parseTimeStringToMicros(s string) *int64 {
 	return &total
 }
 
+// maxTimeMicros is the maximum MySQL TIME value in microseconds: 838:59:59 (no fractional)
+// MySQL clamps overflow TIME results to exactly 838:59:59 (without fractional seconds).
+const maxTimeMicros int64 = (838*3600 + 59*60 + 59) * 1_000_000
+
 func formatMicrosAsTimeString(micros int64) string {
 	negative := micros < 0
 	if negative {
 		micros = -micros
+	}
+	// Clamp to MySQL TIME maximum value (838:59:59)
+	if micros > maxTimeMicros {
+		micros = maxTimeMicros
 	}
 	us := micros % int64(time.Second/time.Microsecond)
 	micros /= int64(time.Second / time.Microsecond)
