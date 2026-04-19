@@ -4490,14 +4490,56 @@ func (e *Executor) inferColumnAttrs(selectSQL, colName string) columnAttrs {
 	if !ok {
 		attrs.colType = e.inferColumnType(selectSQL, colName)
 		// For UNION queries, MySQL sets nullable/default based on the merged type.
-		// If the merged type is a varchar/char type, MySQL uses NOT NULL DEFAULT ''.
-		// If it's a numeric type, MySQL uses NOT NULL DEFAULT '0'.
+		// Only mark as NOT NULL if all branches are pure-literal selects (no real FROM tables),
+		// since column references from tables can be NULL. Vitess adds an implicit "dual" table
+		// for FROM-less selects, so we treat "dual" as if it's no table.
+		isDualTable := func(f sqlparser.TableExpr) bool {
+			if ate, ok2 := f.(*sqlparser.AliasedTableExpr); ok2 {
+				if tn, ok3 := ate.Expr.(sqlparser.TableName); ok3 {
+					return strings.EqualFold(tn.Name.String(), "dual") && tn.Qualifier.IsEmpty()
+				}
+			}
+			return false
+		}
+		allPureLiteral := false
+		if u, isUnion := stmt.(*sqlparser.Union); isUnion {
+			allPureLiteral = true
+			for _, s := range e.flattenUnionStatements(u) {
+				if sel2, ok2 := s.(*sqlparser.Select); ok2 {
+					for _, from := range sel2.From {
+						if !isDualTable(from) {
+							// Has a real table in FROM → may have nullable columns
+							allPureLiteral = false
+							break
+						}
+					}
+				} else {
+					allPureLiteral = false
+				}
+				if !allPureLiteral {
+					break
+				}
+			}
+		}
 		ct := strings.ToLower(attrs.colType)
-		if strings.HasPrefix(ct, "varchar(") || strings.HasPrefix(ct, "char(") {
+		if allPureLiteral && (strings.HasPrefix(ct, "varchar(") || strings.HasPrefix(ct, "char(")) {
 			attrs.nullable = false
 			attrs.hasDefault = true
 			attrs.defaultVal = ""
-		} else if strings.Contains(ct, "int") || ct == "double" || ct == "float" || strings.HasPrefix(ct, "decimal(") {
+			// Propagate connection charset (e.g. "binary" from "set names binary")
+			if cs, ok2 := e.getSysVar("character_set_client"); ok2 && cs != "" && cs != "utf8mb4" && cs != "utf8" {
+				if strings.ToLower(cs) == "binary" {
+					// Convert varchar→varbinary, char→binary when charset=binary
+					if strings.HasPrefix(ct, "varchar(") {
+						attrs.colType = "varbinary" + ct[7:]
+					} else if strings.HasPrefix(ct, "char(") {
+						attrs.colType = "binary" + ct[4:]
+					}
+				} else {
+					attrs.charset = cs
+				}
+			}
+		} else if allPureLiteral && (strings.Contains(ct, "int") || ct == "double" || ct == "float" || strings.HasPrefix(ct, "decimal(")) {
 			attrs.nullable = false
 			attrs.hasDefault = true
 			attrs.defaultVal = "0"
@@ -6289,6 +6331,18 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 	if attrs.charset == "" && (strings.HasPrefix(colTypeLowerForCS, "varchar(") || strings.HasPrefix(colTypeLowerForCS, "char(")) {
 		if cs, ok := e.getSysVar("character_set_client"); ok && cs != "" && cs != "utf8mb4" && cs != "utf8" {
 			attrs.charset = cs
+		}
+	}
+	// When charset is "binary", normalize varchar→varbinary and char→binary.
+	// MySQL represents binary character set string columns as binary types in DDL.
+	if strings.ToLower(attrs.charset) == "binary" {
+		ct := strings.ToLower(attrs.colType)
+		if strings.HasPrefix(ct, "varchar(") {
+			attrs.colType = "varbinary" + ct[7:] // replace "varchar" prefix with "varbinary"
+			attrs.charset = ""
+		} else if strings.HasPrefix(ct, "char(") {
+			attrs.colType = "binary" + ct[4:] // replace "char" prefix with "binary"
+			attrs.charset = ""
 		}
 	}
 	// For arithmetic expressions involving hex/integer literals, MySQL uses NOT NULL with DEFAULT 0,
