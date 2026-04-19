@@ -157,6 +157,11 @@ func coerceDateTimeValueWithSessionEx(colType string, v interface{}, sessionTime
 				h, _ := strconv.Atoi(tsIntPart[8:10])
 				mi, _ := strconv.Atoi(tsIntPart[10:12])
 				sec, _ := strconv.Atoi(tsIntPart[12:14])
+				// Validate date/time components: invalid values (like seconds=60, hours=25,
+				// zero month or zero day) result in zero timestamp, matching MySQL's behavior.
+				if mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || sec > 59 {
+					return "0000-00-00 00:00:00"
+				}
 				s = fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, h, mi, sec)
 				if tsFracPart != "" {
 					s += "." + tsFracPart
