@@ -4504,13 +4504,26 @@ func (e *Executor) inferColumnAttrs(selectSQL, colName string) columnAttrs {
 		allPureLiteral := false
 		if u, isUnion := stmt.(*sqlparser.Union); isUnion {
 			allPureLiteral = true
-			for _, s := range e.flattenUnionStatements(u) {
+			selects := e.flattenUnionStatements(u)
+			for _, s := range selects {
 				if sel2, ok2 := s.(*sqlparser.Select); ok2 {
 					for _, from := range sel2.From {
 						if !isDualTable(from) {
 							// Has a real table in FROM → may have nullable columns
 							allPureLiteral = false
 							break
+						}
+					}
+					// Check if any SELECT column in this branch is NULL literal
+					// (which makes the result nullable)
+					if allPureLiteral {
+						for _, sexpr := range sel2.SelectExprs.Exprs {
+							if ae2, ok3 := sexpr.(*sqlparser.AliasedExpr); ok3 {
+								if e.inferExprType(ae2.Expr) == "binary(0)" {
+									allPureLiteral = false
+									break
+								}
+							}
 						}
 					}
 				} else {
