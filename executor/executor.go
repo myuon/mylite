@@ -5283,6 +5283,61 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 				rows = append(rows, []interface{}{tableName, op, "status", "OK"})
 			}
 		} else {
+			if op == "check" {
+				// CHECK TABLE: warn if any row has auto_increment column value 0
+				if e.Storage != nil {
+					chkDB := e.CurrentDB
+					chkTable := bareTable
+					if strings.Contains(tableName, ".") {
+						parts := strings.SplitN(tableName, ".", 2)
+						chkDB = parts[0]
+						chkTable = parts[1]
+					}
+					if tbl, err := e.Storage.GetTable(chkDB, chkTable); err == nil && tbl != nil {
+						var aiColName string
+						for _, col := range tbl.Def.Columns {
+							if col.AutoIncrement {
+								aiColName = col.Name
+								break
+							}
+						}
+						if aiColName != "" {
+							foundZero := false
+							tbl.Lock()
+							for _, row := range tbl.Rows {
+								v := row[aiColName]
+								switch vv := v.(type) {
+								case int64:
+									if vv == 0 {
+										foundZero = true
+									}
+								case uint64:
+									if vv == 0 {
+										foundZero = true
+									}
+								case int:
+									if vv == 0 {
+										foundZero = true
+									}
+								case string:
+									if vv == "0" {
+										foundZero = true
+									}
+								case nil:
+									// NULL is not 0
+								}
+								if foundZero {
+									break
+								}
+							}
+							tbl.Unlock()
+							if foundZero {
+								rows = append(rows, []interface{}{tableName, op, "warning", "Found row where the auto_increment column has the value 0"})
+							}
+						}
+					}
+				}
+			}
 			rows = append(rows, []interface{}{tableName, op, "status", "OK"})
 		}
 	}
