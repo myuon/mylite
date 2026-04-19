@@ -4489,6 +4489,19 @@ func (e *Executor) inferColumnAttrs(selectSQL, colName string) columnAttrs {
 	sel, ok := stmt.(*sqlparser.Select)
 	if !ok {
 		attrs.colType = e.inferColumnType(selectSQL, colName)
+		// For UNION queries, MySQL sets nullable/default based on the merged type.
+		// If the merged type is a varchar/char type, MySQL uses NOT NULL DEFAULT ''.
+		// If it's a numeric type, MySQL uses NOT NULL DEFAULT '0'.
+		ct := strings.ToLower(attrs.colType)
+		if strings.HasPrefix(ct, "varchar(") || strings.HasPrefix(ct, "char(") {
+			attrs.nullable = false
+			attrs.hasDefault = true
+			attrs.defaultVal = ""
+		} else if strings.Contains(ct, "int") || ct == "double" || ct == "float" || strings.HasPrefix(ct, "decimal(") {
+			attrs.nullable = false
+			attrs.hasDefault = true
+			attrs.defaultVal = "0"
+		}
 		return attrs
 	}
 	// Build source table definitions for column type lookups (same as inferColumnTypeFromSelect)
