@@ -43,6 +43,9 @@ func classifySkipReason(err error) string {
 	if strings.Contains(msg, "unsupported:") {
 		return "unsupported"
 	}
+	if strings.Contains(msg, "directive:") {
+		return "directive"
+	}
 	return ""
 }
 
@@ -521,7 +524,7 @@ func (ctx *execContext) executeLines(lines []string) error {
 		ifHandled, ifSkip, newI := ctx.handleIfBlock(lines, i)
 		if ifHandled {
 			if ifSkip {
-				return errSkipTest
+				return fmt.Errorf("%w: directive: if-block skip", errSkipTest)
 			}
 			i = newI
 			continue
@@ -802,7 +805,7 @@ func (ctx *execContext) executeLines(lines []string) error {
 				return fmt.Errorf("line %d: %v", i+1, err)
 			}
 			if skip {
-				return errSkipTest
+				return fmt.Errorf("%w: directive: skip directive", errSkipTest)
 			}
 			if handled {
 				i++
@@ -921,7 +924,7 @@ func (ctx *execContext) executeLines(lines []string) error {
 				return fmt.Errorf("line %d: %v", i+1, err)
 			}
 			if skip {
-				return errSkipTest
+				return fmt.Errorf("%w: directive: bare skip directive", errSkipTest)
 			}
 			if handled {
 				if !advancedLine {
