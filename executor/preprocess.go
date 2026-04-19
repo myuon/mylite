@@ -537,13 +537,16 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	}
 
 	// Rewrite SHOW CREATE DATABASE IF NOT EXISTS <db> -> SHOW CREATE DATABASE <db>
+	// and set showCreateDBIfNotExists flag so show.go includes /*!32312 IF NOT EXISTS*/.
 	// (vitess parser doesn't support the IF NOT EXISTS variant, but MySQL 8.3's mysqldump uses it)
 	if strings.HasPrefix(upper, "SHOW CREATE DATABASE IF NOT EXISTS ") {
 		rest := strings.TrimSpace(trimmed[len("SHOW CREATE DATABASE IF NOT EXISTS "):])
+		e.showCreateDBIfNotExists = true
 		return "SHOW CREATE DATABASE " + rest, nil, nil
 	}
 	if strings.HasPrefix(upper, "SHOW CREATE SCHEMA IF NOT EXISTS ") {
 		rest := strings.TrimSpace(trimmed[len("SHOW CREATE SCHEMA IF NOT EXISTS "):])
+		e.showCreateDBIfNotExists = true
 		return "SHOW CREATE SCHEMA " + rest, nil, nil
 	}
 

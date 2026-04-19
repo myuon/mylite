@@ -741,10 +741,11 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		parts := strings.Fields(query)
 		if len(parts) >= 4 {
 			// Handle optional IF NOT EXISTS: SHOW CREATE DATABASE IF NOT EXISTS `db`
+			// Preprocess rewrites "SHOW CREATE DATABASE IF NOT EXISTS db" to
+			// "SHOW CREATE DATABASE db" and sets e.showCreateDBIfNotExists.
 			dbName := parts[3]
-			if strings.ToUpper(dbName) == "IF" && len(parts) >= 6 {
-				dbName = parts[5]
-			}
+			ifNotExists := e.showCreateDBIfNotExists
+			e.showCreateDBIfNotExists = false // reset after consuming
 			dbName = strings.TrimRight(dbName, ";")
 			dbName = strings.ReplaceAll(dbName, "`", "")
 			db, resolvedName, err := findDatabaseCaseInsensitive(e.Catalog, dbName)
@@ -766,9 +767,10 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			// Show COLLATE when charset is utf8mb4 (MySQL always shows it) or
 			// when collation differs from the charset's default collation.
 			var createSQL string
-			// MySQL always includes /*!32312 IF NOT EXISTS*/ in SHOW CREATE DATABASE output
-			// (regardless of whether IF NOT EXISTS was specified in the SHOW statement).
-			ifne := "/*!32312 IF NOT EXISTS*/ "
+			ifne := ""
+			if ifNotExists {
+				ifne = "/*!32312 IF NOT EXISTS*/ "
+			}
 			defaultCollation := catalog.DefaultCollationForCharset(charset)
 			if charset == "utf8mb4" || (collation != "" && collation != defaultCollation) {
 				if collation == "" {

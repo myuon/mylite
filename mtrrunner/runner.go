@@ -4063,6 +4063,13 @@ func (ctx *execContext) sourceFile(filename string) error {
 	defer func() { ctx.sourceDepth-- }()
 
 	filename = strings.TrimSpace(filename)
+	// Strip surrounding single or double quotes (e.g. source 'include/foo.inc')
+	if len(filename) >= 2 {
+		if (filename[0] == '\'' && filename[len(filename)-1] == '\'') ||
+			(filename[0] == '"' && filename[len(filename)-1] == '"') {
+			filename = filename[1 : len(filename)-1]
+		}
+	}
 	// Apply variable substitution in filename
 	filename = ctx.substituteVars(filename)
 	baseName := strings.ToLower(filepath.Base(filename))

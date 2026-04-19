@@ -339,6 +339,10 @@ type Executor struct {
 	lastErrorCount   int64
 	// currentQuery holds the current raw SQL text for display-name reconstruction.
 	currentQuery string
+	// showCreateDBIfNotExists is set by preprocessQuery when the original query was
+	// "SHOW CREATE DATABASE IF NOT EXISTS db", so that execShow can include the
+	// /*!32312 IF NOT EXISTS*/ comment in the Create Database column value.
+	showCreateDBIfNotExists bool
 	// onDupValuesRow holds the candidate INSERT row while evaluating
 	// ON DUPLICATE KEY UPDATE expressions (for VALUES(col) support).
 	onDupValuesRow storage.Row

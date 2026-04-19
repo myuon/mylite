@@ -5640,6 +5640,9 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 		case "charset", "collation":
 			// MySQL: charset()/collation() return varchar(64) CHARACTER SET utf8
 			return "varchar(64)"
+		case "current_role", "roles_graphml":
+			// MySQL: CURRENT_ROLE() and ROLES_GRAPHML() return longtext CHARACTER SET utf8
+			return "longtext"
 		case "connection_id":
 			return "bigint unsigned"
 		case "last_insert_id", "row_count", "found_rows":
@@ -6486,6 +6489,11 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 			attrs.nullable = false
 			attrs.hasDefault = true
 			attrs.defaultVal = ""
+		case "current_role", "roles_graphml":
+			// MySQL: CURRENT_ROLE() and ROLES_GRAPHML() return longtext CHARACTER SET utf8
+			attrs.colType = "longtext"
+			attrs.charset = "utf8"
+			attrs.nullable = true
 		}
 	case *sqlparser.Literal:
 		// Temporal literals: DATE'...', TIME'...', TIMESTAMP'...' — MySQL uses NOT NULL with zero default
