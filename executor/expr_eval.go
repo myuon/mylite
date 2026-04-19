@@ -2546,14 +2546,48 @@ func (e *Executor) castToDatetimeFsp(s string, fsp int) (interface{}, error) {
 				}
 				// Only normalize (pad single-digit parts and add missing time components)
 				// when inside DML (INSERT/UPDATE) context. In SELECT/expression context,
-				// preserve the original string format.
-				if e.insideDML {
+				// also normalize if the string has single-digit date/time parts that need
+				// zero-padding for correct comparisons (e.g., "2006-1-1 12:1:1").
+				needsNormalization := e.insideDML
+				// In SELECT context, check if the date parts have single-digit components
+				// that would cause incorrect string comparisons.
+				if !needsNormalization {
+					// Check if year, month, or day are not standard 2-digit zero-padded
+					// (y always 4 digits, m or d may be 1 digit)
+					if m < 10 || d < 10 {
+						needsNormalization = true
+					}
+					// Check if time parts have single-digit components
+					if hasTimeSep {
+						timeParts := strings.SplitN(timePortion, ":", 3)
+						if len(timeParts) >= 1 {
+							hh, _ := strconv.Atoi(timeParts[0])
+							if hh < 10 && len(timeParts[0]) < 2 {
+								needsNormalization = true
+							}
+						}
+						if len(timeParts) >= 2 {
+							mm3, _ := strconv.Atoi(timeParts[1])
+							if mm3 < 10 && len(timeParts[1]) < 2 {
+								needsNormalization = true
+							}
+						}
+						if len(timeParts) >= 3 {
+							sec, _ := strconv.Atoi(strings.Split(timeParts[2], ".")[0])
+							if sec < 10 && len(strings.Split(timeParts[2], ".")[0]) < 2 {
+								needsNormalization = true
+							}
+						}
+					}
+				}
+				if needsNormalization {
 					normalizedDate := fmt.Sprintf("%04d-%02d-%02d", y, m, d)
 					if !hasTimeSep {
 						return normalizedDate + " 00:00:00", nil
 					}
 					timeParts := strings.SplitN(timePortion, ":", 3)
 					hh, mm2, ss := 0, 0, 0
+					fracStr := ""
 					if len(timeParts) >= 1 {
 						hh, _ = strconv.Atoi(timeParts[0])
 					}
@@ -2563,11 +2597,12 @@ func (e *Executor) castToDatetimeFsp(s string, fsp int) (interface{}, error) {
 					if len(timeParts) >= 3 {
 						secStr := timeParts[2]
 						if dotIdx := strings.IndexByte(secStr, '.'); dotIdx >= 0 {
+							fracStr = secStr[dotIdx:] // preserve fractional part including dot
 							secStr = secStr[:dotIdx]
 						}
 						ss, _ = strconv.Atoi(secStr)
 					}
-					return fmt.Sprintf("%s %02d:%02d:%02d", normalizedDate, hh, mm2, ss), nil
+					return fmt.Sprintf("%s %02d:%02d:%02d%s", normalizedDate, hh, mm2, ss, fracStr), nil
 				}
 			}
 		}
@@ -2586,28 +2621,50 @@ func (e *Executor) castToDate(s string) (interface{}, error) {
 		}
 		return nil, nil
 	}
+	// Handle 8-digit compact YYYYMMDD format (e.g., CAST(20060101 as date)).
+	if len(s) == 8 && !strings.ContainsAny(s, "-/ \t:") {
+		allDigits := true
+		for _, c := range s {
+			if c < '0' || c > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			y, _ := strconv.Atoi(s[:4])
+			m, _ := strconv.Atoi(s[4:6])
+			d, _ := strconv.Atoi(s[6:8])
+			if m >= 1 && m <= 12 && d >= 1 && d <= 31 {
+				return fmt.Sprintf("%04d-%02d-%02d", y, m, d), nil
+			}
+			return nil, nil
+		}
+	}
 	// Parse delimited date strings (YYYY-M-D, YYYY-MM-D, etc.) and normalize.
-	if strings.ContainsAny(s, "-/") {
+	// MySQL accepts -, /, and . as date separators in CAST AS DATE.
+	if strings.ContainsAny(s, "-/.") {
 		datePortion := s
 		if idx := strings.IndexAny(s, " \tT"); idx >= 0 {
 			datePortion = s[:idx]
 		}
+		// Normalize separators (., /) to - for uniform splitting
+		datePortion = strings.NewReplacer(".", "-", "/", "-").Replace(datePortion)
 		parts := strings.SplitN(datePortion, "-", 3)
 		if len(parts) == 3 {
 			y, ey := strconv.Atoi(parts[0])
 			m, em := strconv.Atoi(parts[1])
 			d, ed := strconv.Atoi(parts[2])
 			if ey == nil && em == nil && ed == nil {
-				normalized := fmt.Sprintf("%04d-%02d-%02d", y, m, d)
+				result := fmt.Sprintf("%04d-%02d-%02d", y, m, d)
 				// In TRADITIONAL/NO_ZERO_DATE mode, CAST('0000-00-00' AS DATE) returns
 				// "Incorrect datetime value: '0000-00-00'" error (no column info).
 				if y == 0 && m == 0 && d == 0 && e.isStrictMode() && e.insideDML {
 					isNoZeroDate := strings.Contains(e.sqlMode, "NO_ZERO_DATE") || strings.Contains(e.sqlMode, "TRADITIONAL")
 					if isNoZeroDate {
-						return nil, mysqlError(1292, "22007", fmt.Sprintf("Incorrect datetime value: '%s'", normalized))
+						return nil, mysqlError(1292, "22007", fmt.Sprintf("Incorrect datetime value: '%s'", result))
 					}
 				}
-				return normalized, nil
+				return result, nil
 			}
 		}
 	}
