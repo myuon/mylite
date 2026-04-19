@@ -3449,6 +3449,30 @@ func coerceColumnValue(colType string, val interface{}) interface{} {
 		// For VARBINARY, convert integer hex literals (int64/uint64) to their
 		// big-endian byte string representation without fixed-length padding.
 		val = hexIntToBytes(val)
+	} else {
+		// For string column types (VARCHAR/CHAR/TEXT/ENUM/SET), coerce numeric
+		// values to their string representation. This ensures that e.g. an int64(1)
+		// stored into a varchar(1) column becomes "1" (string), so HEX("1") = "31"
+		// rather than HEX(1) = "1".
+		colUpper := strings.ToUpper(strings.TrimSpace(colType))
+		colBase := colUpper
+		if idx := strings.IndexByte(colBase, '('); idx >= 0 {
+			colBase = colBase[:idx]
+		}
+		isStringCol := colBase == "VARCHAR" || colBase == "CHAR" ||
+			colBase == "TEXT" || colBase == "TINYTEXT" || colBase == "MEDIUMTEXT" || colBase == "LONGTEXT" ||
+			colBase == "ENUM" || colBase == "SET"
+		if isStringCol && val != nil {
+			switch v := val.(type) {
+			case int64:
+				val = fmt.Sprintf("%d", v)
+			case uint64:
+				val = fmt.Sprintf("%d", v)
+			case float64:
+				// Format without trailing zeros (e.g., 1.0 → "1")
+				val = strconv.FormatFloat(v, 'f', -1, 64)
+			}
+		}
 	}
 	if val != nil {
 		val = formatDecimalValue(colType, val)
