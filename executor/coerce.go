@@ -211,6 +211,9 @@ func coerceDateTimeValueWithSessionEx(colType string, v interface{}, sessionTime
 		// Append the saved time part (which includes fractional seconds)
 		if fullTimeForTS != "" {
 			timePart := normalizeDateTimeSeparators(fullTimeForTS)
+			if strings.Count(timePart, ":") == 1 {
+				timePart += ":00"
+			}
 			s = s + " " + timePart
 		} else if len(s) == 10 {
 			timePart := extractTimePart(v, s)
@@ -335,6 +338,10 @@ func coerceDateTimeValueWithSessionEx(colType string, v interface{}, sessionTime
 				timePart = normalizeDateTimeSeparators(timePart)
 				// Expand compact 6-digit time "131415" -> "13:14:15"
 				timePart = expandCompactTime(timePart)
+				// Append missing seconds: "12:34" -> "12:34:00"
+				if strings.Count(timePart, ":") == 1 && !strings.Contains(timePart, ".") {
+					timePart += ":00"
+				}
 				// Zero-pad single-digit hour: "1:01:01" -> "01:01:01"
 				if colonCount := strings.Count(timePart, ":"); colonCount == 2 {
 					parts := strings.SplitN(timePart, ":", 3)
