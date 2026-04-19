@@ -1174,7 +1174,14 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 									isPostFirstRow := isNonTransactional && !strictAllTables && affected > 0
 									if bool(stmt.Ignore) || isPostFirstRow {
 										e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
-										v = zeroDateTimeValue(col.Type)
+										// For TIME columns, out-of-range values are clamped (e.g. 916:00:00 → 838:59:59)
+										// not zeroed. Let coerceColumnValueForWrite handle the clamping.
+										colUpper4 := strings.ToUpper(col.Type)
+										if colUpper4 == "TIME" || strings.HasPrefix(colUpper4, "TIME(") {
+											v = e.coerceColumnValueForWrite(col.Type, sv)
+										} else {
+											v = zeroDateTimeValue(col.Type)
+										}
 										return nil
 									}
 									return err

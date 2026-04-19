@@ -3350,6 +3350,18 @@ func (e *Executor) evalExtractFuncExpr(v *sqlparser.ExtractFuncExpr) (interface{
 		}
 		return int64(efT.Day()), nil
 	case "HOUR":
+		if durationParsed {
+			// For time-duration strings (HH:MM:SS), return the total hours clamped to MySQL max TIME (838).
+			absTotal := totalSecFromDuration
+			if absTotal < 0 {
+				absTotal = -absTotal
+			}
+			h := absTotal / 3600
+			if h > 838 {
+				h = 838
+			}
+			return h, nil
+		}
 		if efErr != nil {
 			return nil, nil
 		}
