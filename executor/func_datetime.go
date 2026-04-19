@@ -1214,8 +1214,10 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 				tfSec, _ = strconv.Atoi(tfParts[2])
 			}
 		}
-		// For AM/PM and 12-hour clock, normalize using h mod 24
-		tfH24 := tfH % 24 // hour within a day (0-23)
+		// For AM/PM and 12-hour clock, normalize using h mod 24.
+		// Note: %H and %k show the TOTAL hours (e.g. 120 for a 5-day interval),
+		// not the hour within a day. Only %h/%I/%l and %p use the mod-24 value.
+		tfH24 := tfH % 24 // hour within a day (0-23), for 12-hr clock and AM/PM
 		if tfH24 < 0 {
 			tfH24 += 24
 		}
@@ -1235,9 +1237,11 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 				i++
 				switch tfFmtStr[i] {
 				case 'H':
-					tfSb.WriteString(fmt.Sprintf("%02d", tfH24))
+					// %H: total hours (can exceed 24 for TIME values)
+					tfSb.WriteString(fmt.Sprintf("%02d", tfH))
 				case 'k':
-					tfSb.WriteString(fmt.Sprintf("%d", tfH24))
+					// %k: total hours without leading zero
+					tfSb.WriteString(fmt.Sprintf("%d", tfH))
 				case 'h', 'I':
 					tfSb.WriteString(fmt.Sprintf("%02d", tfH12))
 				case 'l':
