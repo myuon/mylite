@@ -3263,19 +3263,32 @@ func (e *Executor) evalExtractFuncExpr(v *sqlparser.ExtractFuncExpr) (interface{
 			}
 		}
 	}
+	// For zero dates on date-typed columns, EXTRACT returns 0 (not NULL).
+	// For string literals and non-date columns, zero dates return NULL.
+	zeroDateReturnZero := efErr != nil && isZeroDate(efStr) && !e.isNonDateTypeExpr(v.Expr)
+
 	switch intervalType {
 	case "YEAR":
 		if efErr != nil {
+			if zeroDateReturnZero {
+				return int64(0), nil
+			}
 			return nil, nil
 		}
 		return int64(efT.Year()), nil
 	case "MONTH":
 		if efErr != nil {
+			if zeroDateReturnZero {
+				return int64(0), nil
+			}
 			return nil, nil
 		}
 		return int64(efT.Month()), nil
 	case "DAY":
 		if efErr != nil {
+			if zeroDateReturnZero {
+				return int64(0), nil
+			}
 			return nil, nil
 		}
 		return int64(efT.Day()), nil
@@ -3296,6 +3309,9 @@ func (e *Executor) evalExtractFuncExpr(v *sqlparser.ExtractFuncExpr) (interface{
 		return int64(efT.Second()), nil
 	case "QUARTER":
 		if efErr != nil {
+			if zeroDateReturnZero {
+				return int64(0), nil
+			}
 			return nil, nil
 		}
 		return int64((efT.Month()-1)/3 + 1), nil
