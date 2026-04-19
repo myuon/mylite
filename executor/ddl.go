@@ -5424,6 +5424,9 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 				}
 			}
 			return "text"
+		case "last_day", "from_days", "curdate", "current_date":
+			// These functions always return a DATE value.
+			return "date"
 		case "makedate":
 			// MAKEDATE(year, dayofyear) returns a date value
 			return "date"

@@ -813,6 +813,15 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if isZeroDate(val) {
 			return nil, true, nil
 		}
+		// Check if the date string has a zero month component (e.g., '2005-00-00', '2005-00-01')
+		// MySQL treats month=0 as invalid for LAST_DAY and returns NULL with a warning.
+		valStr := toString(val)
+		if len(valStr) >= 7 && valStr[4] == '-' {
+			mo, moErr := strconv.Atoi(valStr[5:7])
+			if moErr == nil && mo == 0 {
+				return nil, true, nil
+			}
+		}
 		t, parseErr := parseDateTimeValue(val)
 		if parseErr != nil {
 			return nil, true, nil
@@ -3007,6 +3016,10 @@ func mysqlStrToDate(dateStr, format string, literalFormat bool, strictMode bool)
 			invalid = true
 		} else if p.hasDay && dy > 31 {
 			invalid = true
+		} else if p.hasMonth && !p.hasYear && yr == 0 {
+			// Month is present but year was not specified: the implicit year 0000 makes
+			// the resulting date invalid (e.g., str_to_date(1, '%m') → 0000-01-00 is invalid).
+			invalid = true
 		}
 		if invalid {
 			if strictMode {
@@ -3076,6 +3089,25 @@ func (p *mysqlDateParser) readInt(maxDigits int) (int, bool) {
 	}
 	n, err := strconv.Atoi(p.s[start:p.si])
 	return n, err == nil
+}
+
+// readExactInt reads exactly n digits. Returns false if fewer than n digits are available.
+// Used for fixed-width format specifiers like %m (month 01-12), %d (day 01-31), etc.
+// If there are more digits than n following, they are left unconsumed (same as readInt).
+func (p *mysqlDateParser) readExactInt(n int) (int, bool) {
+	start := p.si
+	count := 0
+	for p.si < len(p.s) && p.s[p.si] >= '0' && p.s[p.si] <= '9' && count < n {
+		p.si++
+		count++
+	}
+	if count < n {
+		// Not enough digits: reset and fail
+		p.si = start
+		return 0, false
+	}
+	val, err := strconv.Atoi(p.s[start:p.si])
+	return val, err == nil
 }
 
 func (p *mysqlDateParser) readFrac() (int, bool) {
