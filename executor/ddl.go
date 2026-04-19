@@ -2827,6 +2827,51 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		}
 	}
 
+	// Pre-validate RENAME INDEX and ALTER INDEX operations to detect conflicts early.
+	// Rules:
+	//   - RENAME a→x: source `a` must exist in the original schema
+	//   - ALTER INDEX n: `n` must exist in the original schema
+	//   - Any key used as a RENAME source cannot be referenced by any other operation
+	//     (AlterIndex or another RenameIndex source) in the same ALTER TABLE statement
+	//   - Any key not in the original schema cannot be referenced as RENAME source or ALTER INDEX target
+	{
+		tableDef, _ := db.GetTable(tableName)
+		if tableDef != nil {
+			origIdxNames := make(map[string]bool)
+			for _, idx := range tableDef.Indexes {
+				origIdxNames[strings.ToLower(idx.Name)] = true
+			}
+			// Collect rename sources and alter-index targets separately
+			renameSources := make(map[string]bool)
+			alterTargets := make(map[string]bool)
+			for _, opt := range stmt.AlterOptions {
+				switch op := opt.(type) {
+				case *sqlparser.RenameIndex:
+					oldName := strings.ToLower(op.OldName.String())
+					if !origIdxNames[oldName] {
+						return nil, mysqlError(1176, "42000", fmt.Sprintf("Key '%s' doesn't exist in table '%s'", op.OldName.String(), tableName))
+					}
+					renameSources[oldName] = true
+				case *sqlparser.AlterIndex:
+					idxName := strings.ToLower(op.Name.String())
+					if strings.EqualFold(idxName, "PRIMARY") {
+						break // handled later as parse error
+					}
+					if !origIdxNames[idxName] {
+						return nil, mysqlError(1176, "42000", fmt.Sprintf("Key '%s' doesn't exist in table '%s'", op.Name.String(), tableName))
+					}
+					alterTargets[idxName] = true
+				}
+			}
+			// Check that no key is both a RENAME source and an ALTER INDEX target
+			for k := range renameSources {
+				if alterTargets[k] {
+					return nil, mysqlError(1176, "42000", fmt.Sprintf("Key '%s' doesn't exist in table '%s'", k, tableName))
+				}
+			}
+		}
+	}
+
 	for _, opt := range stmt.AlterOptions {
 		switch op := opt.(type) {
 
