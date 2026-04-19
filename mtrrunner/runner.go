@@ -1532,6 +1532,18 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		// This supports commands like --exec $MYSQL_DUMP ... that need real execution.
 		cmdStr := ctx.substituteVars(args)
 		if cmdStr != "" && !strings.HasPrefix(cmdStr, " ") {
+			// Check if the binary exists before running — if not, skip the test.
+			// This handles test infrastructure that requires external tools (e.g. mysqld, innochecksum).
+			tokens := shellSplit(cmdStr)
+			if len(tokens) > 0 && tokens[0] != "" {
+				binPath := tokens[0]
+				// Only check for absolute paths or bare command names (not variable references)
+				if !strings.HasPrefix(binPath, "$") {
+					if _, lookErr := exec.LookPath(binPath); lookErr != nil {
+						return true, true, fmt.Errorf("%w: infrastructure: external binary not found: %s", errSkipTest, binPath)
+					}
+				}
+			}
 			output, exitErr := ctx.runExternalCommand(cmdStr)
 			expectedErr := ctx.expectedError
 			ctx.expectedError = ""
@@ -1570,6 +1582,19 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		path := ctx.substituteVars(args)
 		path = ctx.resolveFilePath(path)
 		os.Remove(path) //nolint:errcheck
+		return true, false, nil
+
+	case "mkdir":
+		dirPath := ctx.substituteVars(args)
+		dirPath = strings.TrimSpace(dirPath)
+		dirPath = strings.Trim(dirPath, "\"'")
+		dirPath = ctx.resolveFilePath(dirPath)
+		if err := os.MkdirAll(dirPath, 0755); err != nil {
+			if os.IsPermission(err) {
+				return true, true, fmt.Errorf("%w: infrastructure: mkdir permission denied: %s", errSkipTest, dirPath)
+			}
+			// Non-permission errors: silently ignore (directory may already exist)
+		}
 		return true, false, nil
 
 	case "copy_file":
@@ -1798,7 +1823,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"send_shutdown",
 		"replace_numeric_round",
 		"write_file", "append_file", "cat_file",
-		"mkdir", "rmdir", "move_file",
+		"rmdir", "move_file",
 		"list_files", "file_exists",
 		"system",
 		"die", "exit",
@@ -5915,6 +5940,10 @@ func (ctx *execContext) handleCopyFile(args string) error {
 		// Skip the whole test instead of reporting an execution error.
 		if os.IsNotExist(err) && isInnoDBPhysicalFile(src) {
 			return errSkipTest
+		}
+		// Any other "file not found" error is also infrastructure: skip rather than fail.
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%w: infrastructure: copy_file: cannot read source '%s'", errSkipTest, src)
 		}
 		return fmt.Errorf("copy_file: cannot read source '%s': %v", src, err)
 	}

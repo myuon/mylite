@@ -15,11 +15,25 @@ import (
 //   - Direct result (no parsing needed): returns ("", result, nil)
 //   - Error: returns ("", nil, err)
 func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
+	// MySQL requires conditional comments to have EXACTLY 5 digits after "/*!".
+	// Fewer digits (e.g., /*!2*/, /*!22*/) is a parse error in MySQL 8.0+.
+	if strings.Contains(query, "/*!") {
+		// Check for /*!<less-than-5-digits>*/ pattern — parse error in MySQL
+		if err := validateConditionalCommentDigits(query); err != nil {
+			return "", nil, err
+		}
+	}
 	// Handle nested comments inside MySQL versioned conditional comments (/*!NNNNN...*/):
 	// MySQL allows but deprecates nesting /* */ inside /*! ... */. Preprocess to strip
 	// the inner nested comments so the vitess parser can handle the query.
-	if strings.Contains(query, "/*!") && strings.Contains(query, "/*") {
-		query = stripNestedConditionalComments(query, e)
+	// Only call if there are more "/*" occurrences than "/*!" occurrences, indicating
+	// there are regular /* */ comments nested inside conditional comments.
+	if strings.Contains(query, "/*!") {
+		countExcl := strings.Count(query, "/*!")
+		countAll := strings.Count(query, "/*")
+		if countAll > countExcl {
+			query = stripNestedConditionalComments(query, e)
+		}
 	}
 	// Vitess parser does not support multiple window definitions in a WINDOW clause
 	// (e.g., "WINDOW w AS (...), w1 AS (...)"). Inline named windows into OVER clauses.
@@ -808,6 +822,13 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		return "", nil, ErrUnsupported("INSTALL COMPONENT")
 	}
 
+	// RESOURCE GROUP optimizer hint (/*+ RESOURCE_GROUP(...) */): unsupported feature.
+	// These hints appear in SELECT/DML statements and cause parse errors (Error 1064) in
+	// the vitess parser. Return ErrUnsupported so mtrrunner can auto-skip the test.
+	if strings.Contains(upper, "/*+") && strings.Contains(upper, "RESOURCE_GROUP") {
+		return "", nil, ErrUnsupported("RESOURCE GROUP hint")
+	}
+
 	// Handle ALTER TABLE ... DISCARD/IMPORT TABLESPACE (InnoDB transportable tablespace, no-op)
 	if strings.HasPrefix(upper, "ALTER TABLE") &&
 		(strings.Contains(upper, "DISCARD TABLESPACE") || strings.Contains(upper, "IMPORT TABLESPACE")) {
@@ -1400,6 +1421,36 @@ func inlineNamedWindows(query string) string {
 		result += "\n" + trailingText
 	}
 	return result
+}
+
+// validateConditionalCommentDigits checks that all /*!NNNNN...*/ conditional comments
+// in the query have either 0 digits (plain executable comment /*!...*/) or exactly 5 digits
+// (version conditional comment). MySQL requires exactly 5 digits or 0 digits after "/*!".
+// 1-4 digits or 6+ digits is a MySQL parse error.
+// Returns a 1064 syntax error if any conditional comment has the wrong number of digits.
+func validateConditionalCommentDigits(query string) error {
+	i := 0
+	for i < len(query) {
+		// Find /*!
+		idx := strings.Index(query[i:], "/*!")
+		if idx < 0 {
+			break
+		}
+		pos := i + idx + 3 // position right after /*!
+		i = i + idx + 3    // advance past /*!
+		// Count digits
+		digitCount := 0
+		for pos+digitCount < len(query) && query[pos+digitCount] >= '0' && query[pos+digitCount] <= '9' {
+			digitCount++
+		}
+		// 0 digits: valid (plain executable comment /*!...*/)
+		// 5+ digits: valid (MySQL reads 5 digits as version, rest is content)
+		// 1-4 digits: PARSE ERROR in MySQL 8.0+ (too few digits)
+		if digitCount > 0 && digitCount < 5 {
+			return mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", strings.TrimRight(query, ";")))
+		}
+	}
+	return nil
 }
 
 // stripNestedConditionalComments handles nested /* */ inside /*!NNNNN */ comment blocks.
