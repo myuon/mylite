@@ -4671,6 +4671,98 @@ func (e *Executor) inferColumnAttrs(selectSQL, colName string) columnAttrs {
 				}
 			}
 		}
+		// For hex(colName) / unhex(colName), use source table column width.
+		if fn, ok2 := ae.Expr.(*sqlparser.FuncExpr); ok2 {
+			fname3 := strings.ToLower(fn.Name.String())
+			if fname3 == "hex" && len(fn.Exprs) == 1 {
+				if colRef, ok3 := fn.Exprs[0].(*sqlparser.ColName); ok3 {
+					srcType := ""
+					for _, tblDef := range srcTableDefs {
+						for _, col := range tblDef.Columns {
+							if strings.EqualFold(col.Name, colRef.Name.String()) {
+								srcType = col.Type
+								break
+							}
+						}
+						if srcType != "" {
+							break
+						}
+					}
+					if srcType != "" {
+						lower := strings.ToLower(srcType)
+						// Get the session charset for varchar results
+						hexCharset := ""
+						if cs, ok4 := e.getSysVar("character_set_client"); ok4 && cs != "" && cs != "utf8mb4" && cs != "utf8" {
+							hexCharset = cs
+						}
+						width := 0
+						if n, err := fmt.Sscanf(lower, "varbinary(%d)", &width); n == 1 && err == nil {
+							return columnAttrs{colType: fmt.Sprintf("varchar(%d)", 2*width), charset: hexCharset, nullable: true}
+						}
+						if n, err := fmt.Sscanf(lower, "binary(%d)", &width); n == 1 && err == nil {
+							return columnAttrs{colType: fmt.Sprintf("varchar(%d)", 2*width), charset: hexCharset, nullable: true}
+						}
+						if n, err := fmt.Sscanf(lower, "varchar(%d)", &width); n == 1 && err == nil {
+							return columnAttrs{colType: fmt.Sprintf("varchar(%d)", 2*width), charset: hexCharset, nullable: true}
+						}
+						if n, err := fmt.Sscanf(lower, "char(%d)", &width); n == 1 && err == nil {
+							return columnAttrs{colType: fmt.Sprintf("varchar(%d)", 2*width), charset: hexCharset, nullable: true}
+						}
+						// For TEXT/BLOB types: hex produces a text type 2x the size
+						// blob (65535 bytes) -> 131070 chars -> longtext; tinyblob -> mediumtext etc.
+						if lower == "tinyblob" || lower == "tinytext" {
+							return columnAttrs{colType: "mediumtext", charset: hexCharset, nullable: true}
+						}
+						if lower == "blob" || lower == "text" {
+							return columnAttrs{colType: "longtext", charset: hexCharset, nullable: true}
+						}
+						if lower == "mediumblob" || lower == "mediumtext" {
+							return columnAttrs{colType: "longtext", charset: hexCharset, nullable: true}
+						}
+						if lower == "longblob" || lower == "longtext" {
+							return columnAttrs{colType: "longtext", charset: hexCharset, nullable: true}
+						}
+						if strings.Contains(lower, "bigint") {
+							return columnAttrs{colType: "varchar(16)", charset: hexCharset, nullable: true}
+						}
+						if strings.Contains(lower, "int") {
+							return columnAttrs{colType: "varchar(8)", charset: hexCharset, nullable: true}
+						}
+					}
+				}
+			} else if fname3 == "unhex" && len(fn.Exprs) == 1 {
+				if colRef, ok3 := fn.Exprs[0].(*sqlparser.ColName); ok3 {
+					srcType := ""
+					for _, tblDef := range srcTableDefs {
+						for _, col := range tblDef.Columns {
+							if strings.EqualFold(col.Name, colRef.Name.String()) {
+								srcType = col.Type
+								break
+							}
+						}
+						if srcType != "" {
+							break
+						}
+					}
+					if srcType != "" {
+						lower := strings.ToLower(srcType)
+						width := 0
+						if n, err := fmt.Sscanf(lower, "varchar(%d)", &width); n == 1 && err == nil {
+							return columnAttrs{colType: fmt.Sprintf("varbinary(%d)", width/2), nullable: true}
+						}
+						if n, err := fmt.Sscanf(lower, "char(%d)", &width); n == 1 && err == nil {
+							return columnAttrs{colType: fmt.Sprintf("varbinary(%d)", width/2), nullable: true}
+						}
+						if n, err := fmt.Sscanf(lower, "binary(%d)", &width); n == 1 && err == nil {
+							return columnAttrs{colType: fmt.Sprintf("varbinary(%d)", width/2), nullable: true}
+						}
+						if n, err := fmt.Sscanf(lower, "varbinary(%d)", &width); n == 1 && err == nil {
+							return columnAttrs{colType: fmt.Sprintf("varbinary(%d)", width/2), nullable: true}
+						}
+					}
+				}
+			}
+		}
 		// Get full attrs
 		a := e.inferExprAttrs(ae.Expr)
 		if a.colType == "" {
@@ -4827,6 +4919,52 @@ func (e *Executor) inferColumnTypeFromSelect(sel *sqlparser.Select, colName stri
 					}
 				}
 			}
+		case *sqlparser.FuncExpr:
+			fname := strings.ToLower(ex.Name.String())
+			if fname == "hex" && len(ex.Exprs) == 1 {
+				// hex(colName) — width is 2x the source column byte-width
+				if colRef, ok2 := ex.Exprs[0].(*sqlparser.ColName); ok2 {
+					srcType := findColType(colRef.Name.String())
+					if srcType != "" {
+						lower := strings.ToLower(srcType)
+						width := 0
+						if n, err := fmt.Sscanf(lower, "varbinary(%d)", &width); n == 1 && err == nil {
+							return fmt.Sprintf("varchar(%d)", 2*width)
+						}
+						if n, err := fmt.Sscanf(lower, "binary(%d)", &width); n == 1 && err == nil {
+							return fmt.Sprintf("varchar(%d)", 2*width)
+						}
+						if n, err := fmt.Sscanf(lower, "varchar(%d)", &width); n == 1 && err == nil {
+							return fmt.Sprintf("varchar(%d)", 2*width)
+						}
+						if n, err := fmt.Sscanf(lower, "char(%d)", &width); n == 1 && err == nil {
+							return fmt.Sprintf("varchar(%d)", 2*width)
+						}
+						// Integer types produce at most 16 hex chars
+						if strings.Contains(lower, "bigint") {
+							return "varchar(16)"
+						}
+						if strings.Contains(lower, "int") {
+							return "varchar(8)"
+						}
+					}
+				}
+			} else if fname == "unhex" && len(ex.Exprs) == 1 {
+				// unhex(colName) — width is half the source column char-width
+				if colRef, ok2 := ex.Exprs[0].(*sqlparser.ColName); ok2 {
+					srcType := findColType(colRef.Name.String())
+					if srcType != "" {
+						lower := strings.ToLower(srcType)
+						width := 0
+						if n, err := fmt.Sscanf(lower, "varchar(%d)", &width); n == 1 && err == nil {
+							return fmt.Sprintf("varbinary(%d)", width/2)
+						}
+						if n, err := fmt.Sscanf(lower, "char(%d)", &width); n == 1 && err == nil {
+							return fmt.Sprintf("varbinary(%d)", width/2)
+						}
+					}
+				}
+			}
 		case *sqlparser.BinaryExpr:
 			// For bitwise ops (&, |, ^, <<, >>), if either operand is BINARY/VARBINARY,
 			// the result type in MySQL is VARBINARY with the operand's width.
@@ -4898,6 +5036,37 @@ func (e *Executor) inferColumnTypeFromSelect(sel *sqlparser.Select, colName stri
 				normalizedColName := normalizeCharsetIntroducersForMatch(colName)
 				if !strings.EqualFold(exprStr, normalizedColName) {
 					continue
+				}
+			}
+		}
+		// For hex(colName), use source table column width.
+		if fn, ok2 := ae.Expr.(*sqlparser.FuncExpr); ok2 {
+			fname2 := strings.ToLower(fn.Name.String())
+			if fname2 == "hex" && len(fn.Exprs) == 1 {
+				if colRef, ok3 := fn.Exprs[0].(*sqlparser.ColName); ok3 {
+					srcType := findColType(colRef.Name.String())
+					if srcType != "" {
+						lower := strings.ToLower(srcType)
+						width := 0
+						if n, err := fmt.Sscanf(lower, "varbinary(%d)", &width); n == 1 && err == nil {
+							return fmt.Sprintf("varchar(%d)", 2*width)
+						}
+						if n, err := fmt.Sscanf(lower, "binary(%d)", &width); n == 1 && err == nil {
+							return fmt.Sprintf("varchar(%d)", 2*width)
+						}
+						if n, err := fmt.Sscanf(lower, "varchar(%d)", &width); n == 1 && err == nil {
+							return fmt.Sprintf("varchar(%d)", 2*width)
+						}
+						if n, err := fmt.Sscanf(lower, "char(%d)", &width); n == 1 && err == nil {
+							return fmt.Sprintf("varchar(%d)", 2*width)
+						}
+						if strings.Contains(lower, "bigint") {
+							return "varchar(16)"
+						}
+						if strings.Contains(lower, "int") {
+							return "varchar(8)"
+						}
+					}
 				}
 			}
 		}
@@ -5582,6 +5751,50 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 		case "is_free_lock", "is_used_lock", "release_lock":
 			// Lock functions return 1 or 0 (int(1) display width)
 			return "int(1)"
+		case "hex":
+			// HEX(str) returns a hex string of length 2*input_bytes.
+			// HEX(int) returns the hex of the integer (max 16 chars for BIGINT).
+			if len(v.Exprs) == 1 {
+				argType := e.inferExprType(v.Exprs[0])
+				argTypeLower := strings.ToLower(argType)
+				if strings.HasPrefix(argTypeLower, "varchar(") || strings.HasPrefix(argTypeLower, "char(") {
+					var n int
+					if _, err := fmt.Sscanf(argTypeLower, "varchar(%d)", &n); err != nil {
+						fmt.Sscanf(argTypeLower, "char(%d)", &n)
+					}
+					return fmt.Sprintf("varchar(%d)", 2*n)
+				}
+				if strings.HasPrefix(argTypeLower, "varbinary(") || strings.HasPrefix(argTypeLower, "binary(") {
+					var n int
+					if _, err := fmt.Sscanf(argTypeLower, "varbinary(%d)", &n); err != nil {
+						fmt.Sscanf(argTypeLower, "binary(%d)", &n)
+					}
+					return fmt.Sprintf("varchar(%d)", 2*n)
+				}
+				// For literals
+				if lit, ok := v.Exprs[0].(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
+					return fmt.Sprintf("varchar(%d)", 2*len(lit.Val))
+				}
+				// For integer types: HEX(bigint) max = 16 chars
+				if strings.Contains(argTypeLower, "bigint") || strings.HasPrefix(argTypeLower, "int") {
+					return "varchar(16)"
+				}
+			}
+			return "varchar(16)"
+		case "unhex":
+			// UNHEX(str) returns varbinary of length input_len/2
+			if len(v.Exprs) == 1 {
+				argType := e.inferExprType(v.Exprs[0])
+				argTypeLower := strings.ToLower(argType)
+				var n int
+				if _, err := fmt.Sscanf(argTypeLower, "varchar(%d)", &n); err == nil {
+					return fmt.Sprintf("varbinary(%d)", n/2)
+				}
+				if lit, ok := v.Exprs[0].(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
+					return fmt.Sprintf("varbinary(%d)", len(lit.Val)/2)
+				}
+			}
+			return "varbinary(255)"
 		case "md5":
 			// MD5 always returns a 32-character hex string
 			return "varchar(32)"
