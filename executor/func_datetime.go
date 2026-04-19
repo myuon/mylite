@@ -1816,7 +1816,18 @@ func parseDateTimeValue(val interface{}) (time.Time, error) {
 		}
 	}
 	// Handle YYYYMMDDHHMMSS.ffffff (compact numeric with fractional seconds)
+	// Also handle YYYYMMDD.ff (8 digits + dot: treat as date, ignore fractional part)
 	if !isAllDigits {
+		if dotIdx := strings.IndexByte(s, '.'); dotIdx == 8 && isAllDigitsStr(s[:8]) {
+			// YYYYMMDD.ff → parse as YYYYMMDD date, ignore fractional part
+			intPart := s[:8]
+			y, _ := strconv.Atoi(intPart[0:4])
+			mo, _ := strconv.Atoi(intPart[4:6])
+			d, _ := strconv.Atoi(intPart[6:8])
+			if mo >= 1 && mo <= 12 && d >= 1 && d <= 31 {
+				return time.Date(y, time.Month(mo), d, 0, 0, 0, 0, time.UTC), nil
+			}
+		}
 		if dotIdx := strings.IndexByte(s, '.'); dotIdx == 14 && isAllDigitsStr(s[:14]) && isAllDigitsStr(s[15:]) {
 			intPart := s[:14]
 			fracPart := s[15:]
