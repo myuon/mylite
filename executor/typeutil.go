@@ -415,7 +415,16 @@ func FormatMySQLFloat32(v float32) string {
 		s = strings.Replace(s, "e+0", "e", 1)
 		s = strings.Replace(s, "e-0", "e-", 1)
 		s = strings.Replace(s, "e+", "e", 1)
-		// For FLOAT, MySQL keeps trailing zeros (6 significant digits)
+		// Strip trailing zeros from the mantissa (MySQL omits them for FLOAT scientific notation too)
+		if eIdx := strings.IndexByte(s, 'e'); eIdx > 0 {
+			mantissa := s[:eIdx]
+			exp := s[eIdx:]
+			if strings.Contains(mantissa, ".") {
+				mantissa = strings.TrimRight(mantissa, "0")
+				mantissa = strings.TrimRight(mantissa, ".")
+			}
+			s = mantissa + exp
+		}
 		return s
 	}
 	return strconv.FormatFloat(f, 'f', -1, 32)
