@@ -1260,11 +1260,28 @@ func (e *Executor) getExprCollationInfo(expr sqlparser.Expr) collCoercibility {
 	return collCoercibility{coercibility: -1}
 }
 
+// isBinaryColType returns true if the column type uses binary collation (BLOB, BINARY, VARBINARY).
+func isBinaryColType(colType string) bool {
+	t := strings.ToUpper(strings.TrimSpace(colType))
+	// Strip size spec: BINARY(10) -> BINARY, VARBINARY(100) -> VARBINARY
+	if paren := strings.IndexByte(t, '('); paren >= 0 {
+		t = strings.TrimSpace(t[:paren])
+	}
+	switch t {
+	case "BLOB", "TINYBLOB", "MEDIUMBLOB", "LONGBLOB", "BINARY", "VARBINARY":
+		return true
+	}
+	return false
+}
+
 // lookupColumnCollation returns the effective collation for a named column in a table definition.
-// Returns "" if the column is not found or is not a string type.
+// Returns "" if the column is not found or is not a string/binary type.
 func (e *Executor) lookupColumnCollation(colName string, td *catalog.TableDef) string {
 	for _, col := range td.Columns {
 		if strings.EqualFold(col.Name, colName) {
+			if isBinaryColType(col.Type) {
+				return "binary" // binary types always use binary collation
+			}
 			if !isStringColType(col.Type) {
 				return "" // not a string column
 			}
@@ -1907,6 +1924,15 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 		collationName = ce.Collation
 		rightExpr = ce.Expr
 	}
+	// If LIKE operator and no explicit COLLATE, infer collation from column type.
+	// Binary columns (BLOB, BINARY, VARBINARY) use case-sensitive "binary" collation.
+	if collationName == "" && (v.Operator == sqlparser.LikeOp || v.Operator == sqlparser.NotLikeOp) {
+		if colExpr, ok := leftExpr.(*sqlparser.ColName); ok && e.queryTableDef != nil {
+			if coll := e.lookupColumnCollation(colExpr.Name.String(), e.queryTableDef); coll != "" {
+				collationName = coll
+			}
+		}
+	}
 	// If left side is a bare column reference (no table context), MySQL returns
 	// ER_BAD_FIELD_ERROR before evaluating the right side. This matters when the
 	// right side would produce a different error (e.g. @@GLOBAL on a session-only var).
@@ -1943,7 +1969,7 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 			}
 		}
 		collLower := strings.ToLower(collationName)
-		isCaseSensitive := collationName != "" && (strings.Contains(collLower, "_bin") || strings.Contains(collLower, "_cs"))
+		isCaseSensitive := collationName != "" && (strings.Contains(collLower, "_bin") || strings.Contains(collLower, "_cs") || collLower == "binary")
 		var re *regexp.Regexp
 		if isCaseSensitive {
 			re = likeToRegexpCaseSensitiveEscape(rs, escapeChar)
@@ -5891,6 +5917,15 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 			collationName = ce.Collation
 			rightExpr2 = ce.Expr
 		}
+		// If LIKE operator and no explicit COLLATE, infer collation from column type.
+		// Binary columns (BLOB, BINARY, VARBINARY) use case-sensitive "binary" collation.
+		if collationName == "" && (v.Operator == sqlparser.LikeOp || v.Operator == sqlparser.NotLikeOp) {
+			if colExpr, ok := leftExpr2.(*sqlparser.ColName); ok && e.queryTableDef != nil {
+				if coll := e.lookupColumnCollation(colExpr.Name.String(), e.queryTableDef); coll != "" {
+					collationName = coll
+				}
+			}
+		}
 		// If left side is a bare column reference not found in the row, MySQL returns
 		// ER_BAD_FIELD_ERROR before evaluating the right side. This prevents a right-side
 		// error (e.g. @@GLOBAL on a session-only var) from masking the column error.
@@ -5936,7 +5971,7 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				}
 			}
 			collLower := strings.ToLower(collationName)
-			isCaseSensitive := collationName != "" && (strings.Contains(collLower, "_bin") || strings.Contains(collLower, "_cs"))
+			isCaseSensitive := collationName != "" && (strings.Contains(collLower, "_bin") || strings.Contains(collLower, "_cs") || collLower == "binary")
 			var re *regexp.Regexp
 			if isCaseSensitive {
 				re = likeToRegexpCaseSensitiveEscape(rs, escapeChar)
@@ -7024,6 +7059,15 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 			whereCollation = ce.Collation
 			rightExprW = ce.Expr
 		}
+		// If LIKE operator and no explicit COLLATE clause, try to infer collation from column type.
+		// Binary columns (BLOB, BINARY, VARBINARY) use case-sensitive "binary" collation.
+		if whereCollation == "" && (v.Operator == sqlparser.LikeOp || v.Operator == sqlparser.NotLikeOp) {
+			if colExpr, ok := leftExprW.(*sqlparser.ColName); ok && e.queryTableDef != nil {
+				if coll := e.lookupColumnCollation(colExpr.Name.String(), e.queryTableDef); coll != "" {
+					whereCollation = coll
+				}
+			}
+		}
 		left, err := e.evalRowExpr(leftExprW, row)
 		var leftWhereOvErr *intOverflowError
 		if err != nil {
@@ -7069,7 +7113,7 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 				}
 			}
 			collLower := strings.ToLower(whereCollation)
-			isCaseSensitive := whereCollation != "" && (strings.Contains(collLower, "_bin") || strings.Contains(collLower, "_cs"))
+			isCaseSensitive := whereCollation != "" && (strings.Contains(collLower, "_bin") || strings.Contains(collLower, "_cs") || collLower == "binary")
 			var re *regexp.Regexp
 			if isCaseSensitive {
 				re = likeToRegexpCaseSensitiveEscape(rs, escapeChar)
