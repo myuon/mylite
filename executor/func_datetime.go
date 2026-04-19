@@ -1106,6 +1106,14 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		mtHi := toInt64(mtH)
 		mtMi := toInt64(mtM)
 		mtSi := toInt64(mtSec)
+		// If the hour was a uint64 value that overflows int64 (e.g., CAST(-1 AS UNSIGNED)
+		// = 18446744073709551615), treat it as a very large positive value (clamp to max).
+		if mtHi < 0 {
+			if u, ok := mtH.(uint64); ok && u > uint64(9223372036854775807) {
+				// Large unsigned value overflowed into negative int64 - treat as huge positive
+				mtHi = 838 + 1 // will be clamped below
+			}
+		}
 		if mtMi < 0 || mtMi > 59 || mtSi < 0 || mtSi > 59 {
 			return nil, true, nil
 		}
@@ -1500,7 +1508,13 @@ func secToTimeValue(v interface{}) string {
 	// MySQL SEC_TO_TIME clamps to max TIME value 838:59:59
 	const maxTimeSec = 838*3600 + 59*60 + 59 // 3020399
 	totalSec := int64(f)
+	// If the float is large enough to overflow int64 (f > MaxInt64), int64(f) wraps
+	// around to a negative value. In that case, clamp directly.
 	clamped := false
+	if f > float64(maxTimeSec) && totalSec <= 0 {
+		totalSec = maxTimeSec
+		clamped = true
+	}
 	if totalSec > maxTimeSec {
 		totalSec = maxTimeSec
 		clamped = true
