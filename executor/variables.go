@@ -366,12 +366,13 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			"character_set_filesystem", "character_set_server", "character_set_database":
 			isGlobal := scope == sqlparser.GlobalScope
 			// MySQL allows SET @@character_set_results = NULL to disable result conversion.
+			// Store empty string as sentinel (so SHOW VARIABLES shows empty value).
 			if _, isNull := expr.Expr.(*sqlparser.NullVal); isNull {
 				if name == "character_set_results" {
 					if isGlobal {
-						e.deleteSysVar(name, true)
+						e.setGlobalVar(name, "")
 					} else {
-						delete(e.sessionScopeVars, name)
+						e.sessionScopeVars[name] = ""
 					}
 				}
 				break
@@ -379,9 +380,9 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			if strings.ToUpper(val) == "NULL" {
 				if name == "character_set_results" {
 					if isGlobal {
-						e.deleteSysVar(name, true)
+						e.setGlobalVar(name, "")
 					} else {
-						delete(e.sessionScopeVars, name)
+						e.sessionScopeVars[name] = ""
 					}
 				}
 				break
