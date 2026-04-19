@@ -2696,7 +2696,24 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		// HAVING without GROUP BY is applied per-row against the source row data.
 		// This handles cases like: SELECT ... FROM t HAVING constant_subquery_expr
 		if stmt.Having != nil {
-			match, err := e.evalHaving(stmt.Having.Expr, row, nil)
+			// Build an enriched row that includes SELECT-list aliases so that
+			// HAVING can reference them (e.g. HAVING field1 < 8 where field1 is
+			// an alias for int_key in the SELECT list).
+			havingRow := make(storage.Row, len(row)+len(colNames))
+			for k, v := range row {
+				havingRow[k] = v
+			}
+			for i, alias := range colNames {
+				if i < len(colExprs) {
+					if _, exists := havingRow[alias]; !exists {
+						val, err2 := e.evalRowExpr(colExprs[i], row)
+						if err2 == nil {
+							havingRow[alias] = val
+						}
+					}
+				}
+			}
+			match, err := e.evalHaving(stmt.Having.Expr, havingRow, nil)
 			if err != nil {
 				return nil, err
 			}
