@@ -5495,6 +5495,9 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 				return fmt.Sprintf("time(%d)", fsp)
 			}
 			return "time"
+		case "uuid", "bin_to_uuid":
+			// UUID() and BIN_TO_UUID() return a varchar(36) UUID string.
+			return "varchar(36)"
 		case "date_format":
 			// DATE_FORMAT(date, format) returns varchar(N); use a fixed width matching MySQL default
 			return "varchar(10)"
