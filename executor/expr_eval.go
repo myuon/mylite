@@ -6695,6 +6695,33 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 			if left == nil {
 				return false, nil
 			}
+			// Determine effective collation for the entire IN expression.
+			// The dominant collation is chosen by lowest coercibility across all items.
+			inEffectiveCollation := ""
+			inCaseSensitive := false
+			if _, isString := left.(string); isString {
+				// Collect collation from left side and all tuple items
+				allInExprs := make([]sqlparser.Expr, 0, 1+len(tuple))
+				allInExprs = append(allInExprs, v.Left)
+				for _, te := range tuple {
+					allInExprs = append(allInExprs, te)
+				}
+				bestCoercibility := 7
+				bestCollation := ""
+				for _, te := range allInExprs {
+					ci := e.getExprCollationInfo(te)
+					if ci.coercibility >= 0 && ci.coercibility < bestCoercibility {
+						bestCoercibility = ci.coercibility
+						bestCollation = ci.collation
+					}
+				}
+				if bestCollation != "" {
+					inEffectiveCollation = bestCollation
+					collLower := strings.ToLower(inEffectiveCollation)
+					isBin := strings.HasSuffix(collLower, "_bin") || collLower == "binary"
+					inCaseSensitive = isBin || strings.Contains(collLower, "_cs")
+				}
+			}
 			hasNull := false
 			for _, tupleExpr := range tuple {
 				val, err := e.evalRowExpr(tupleExpr, row)
@@ -6738,6 +6765,18 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 							if strings.EqualFold(ls, rs) {
 								return v.Operator == sqlparser.InOp, nil
 							}
+						}
+					}
+				}
+				// Collation-aware comparison: use the effective collation for the IN expression.
+				// If the effective collation is case-insensitive, compare case-insensitively.
+				if inEffectiveCollation != "" {
+					if _, isLS := left.(string); isLS {
+						if _, isRS := val.(string); isRS {
+							if !inCaseSensitive && strings.EqualFold(ls, rs) {
+								return v.Operator == sqlparser.InOp, nil
+							}
+							// If case-sensitive and strings are not equal, skip.
 						}
 					}
 				}
