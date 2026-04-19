@@ -153,7 +153,27 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 			// Date/time functions that return utf8mb4 strings in MySQL 8.0+
 			case "dayname", "monthname":
 				return "utf8mb4", true, nil
+			// String/concat functions return utf8mb4 in MySQL 8.0+
+			case "concat", "concat_ws", "group_concat",
+				"upper", "lower", "lcase", "ucase",
+				"trim", "ltrim", "rtrim",
+				"substring", "substr", "mid",
+				"replace", "insert", "repeat",
+				"reverse", "hex", "unhex",
+				"left", "right", "lpad", "rpad",
+				"str_to_date", "date_format", "time_format",
+				"format", "convert",
+				"date", "time", "timestamp",
+				"year", "month", "day", "hour", "minute", "second",
+				"now", "curdate", "curtime", "current_date", "current_time", "current_timestamp",
+				"from_unixtime", "from_days",
+				"ifnull", "if", "coalesce", "nullif", "greatest", "least", "elt":
+				return "utf8mb4", true, nil
 			}
+		}
+		// Binary expressions (arithmetic, bit ops): number-to-string coercion uses utf8mb4
+		if _, ok := v.Exprs[0].(*sqlparser.BinaryExpr); ok {
+			return "utf8mb4", true, nil
 		}
 		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
 		if err != nil {

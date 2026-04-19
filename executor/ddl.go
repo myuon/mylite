@@ -5000,6 +5000,98 @@ func (e *Executor) inferColumnTypeFromSelectByPosition(sel *sqlparser.Select, co
 	return ""
 }
 
+// concatTypeWidth returns the varchar display width that a given SQL type contributes
+// when used as an argument to CONCAT(). Numeric types are converted to strings and their
+// display widths determine the varchar length. Returns 0 if the type is unknown/null.
+func concatTypeWidth(t string) int {
+	// varchar(N) or char(N): use N directly
+	if strings.HasPrefix(t, "varchar(") {
+		var n int
+		if _, err := fmt.Sscanf(t, "varchar(%d)", &n); err == nil {
+			return n
+		}
+	}
+	if strings.HasPrefix(t, "char(") {
+		var n int
+		if _, err := fmt.Sscanf(t, "char(%d)", &n); err == nil {
+			return n
+		}
+	}
+	// Date/time types in concat context: converted to string representation
+	if t == "date" {
+		return 10 // "YYYY-MM-DD"
+	}
+	if t == "time" {
+		return 10 // "HHH:MM:SS"
+	}
+	if strings.HasPrefix(t, "time(") {
+		var fsp int
+		if _, err := fmt.Sscanf(t, "time(%d)", &fsp); err == nil && fsp > 0 {
+			return 10 + 1 + fsp // "HHH:MM:SS.ffffff"
+		}
+		return 10
+	}
+	if t == "datetime" {
+		return 19 // "YYYY-MM-DD HH:MM:SS"
+	}
+	if strings.HasPrefix(t, "datetime(") {
+		var fsp int
+		if _, err := fmt.Sscanf(t, "datetime(%d)", &fsp); err == nil && fsp > 0 {
+			return 19 + 1 + fsp
+		}
+		return 19
+	}
+	if t == "timestamp" {
+		return 19
+	}
+	if strings.HasPrefix(t, "timestamp(") {
+		var fsp int
+		if _, err := fmt.Sscanf(t, "timestamp(%d)", &fsp); err == nil && fsp > 0 {
+			return 19 + 1 + fsp
+		}
+		return 19
+	}
+	// double/float: MySQL uses 22 chars for double in concat context
+	if t == "double" || t == "float" {
+		return 22
+	}
+	// bigint unsigned (no explicit width, from bit operations): 20 digits + 1 sign = 21
+	if t == "bigint unsigned" {
+		return 21
+	}
+	// bigint (no explicit width): 20 digits + sign = 21 (MySQL's canonical bigint signed width)
+	if t == "bigint" {
+		return 21
+	}
+	// decimal(M,D): display width = M + 2 (sign + decimal point)
+	if strings.HasPrefix(t, "decimal(") {
+		var m, d int
+		if n, _ := fmt.Sscanf(t, "decimal(%d,%d)", &m, &d); n == 2 {
+			return m + 2
+		}
+	}
+	// int(N), bigint(N), bigint(N) unsigned, tinyint(N), smallint(N), mediumint(N): use N
+	for _, prefix := range []string{"int(", "bigint(", "tinyint(", "smallint(", "mediumint("} {
+		if strings.HasPrefix(t, prefix) {
+			var n int
+			if _, err := fmt.Sscanf(t, prefix+"%d", &n); err == nil {
+				return n
+			}
+		}
+	}
+	// int unsigned, tinyint unsigned, etc. without explicit width
+	if t == "int unsigned" || t == "mediumint unsigned" {
+		return 10
+	}
+	if t == "tinyint unsigned" {
+		return 3
+	}
+	if t == "smallint unsigned" {
+		return 5
+	}
+	return 0
+}
+
 // inferExprType infers the SQL column type from a literal or function expression.
 func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 	switch v := expr.(type) {
@@ -5095,6 +5187,10 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			return "bigint unsigned"
 		}
 	case *sqlparser.UnaryExpr:
+		// Bitwise NOT (~) always returns bigint unsigned
+		if v.Operator == sqlparser.TildaOp {
+			return "bigint unsigned"
+		}
 		// Handle negative integer literals: -9223372036854775808 etc.
 		if v.Operator == sqlparser.UMinusOp {
 			if lit, ok := v.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.IntVal {
@@ -5111,11 +5207,23 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 					digits := len(lit.Val)
 					return fmt.Sprintf("decimal(%d,0)", digits)
 				}
+				// Negative int literal: display width = digits + 1 (for minus sign)
+				digits := len(lit.Val)
+				return fmt.Sprintf("int(%d)", digits+1)
 			}
 			// Unary minus on a decimal preserves the decimal type.
 			inner := e.inferExprType(v.Expr)
 			if strings.HasPrefix(inner, "decimal(") {
 				return inner
+			}
+			// Unary minus on int(N): add 1 for minus sign
+			for _, pfx := range []string{"int(", "bigint("} {
+				if strings.HasPrefix(inner, pfx) {
+					var iN int
+					if _, err := fmt.Sscanf(inner, pfx+"%d", &iN); err == nil {
+						return fmt.Sprintf("%s%d)", pfx, iN+1)
+					}
+				}
 			}
 		}
 		return e.inferExprType(v.Expr)
@@ -5132,6 +5240,52 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 		}
 		if leftType == "double" || rightType == "double" {
 			return "double"
+		}
+		// Extract integer display widths for int(N) types
+		extractIntWidth := func(t string) (int, bool) {
+			if t == "int" || t == "bigint" {
+				return 20, true
+			}
+			for _, pfx := range []string{"int(", "bigint(", "tinyint(", "smallint(", "mediumint("} {
+				if strings.HasPrefix(t, pfx) {
+					var n int
+					if _, err := fmt.Sscanf(t, pfx+"%d", &n); err == nil {
+						return n, true
+					}
+				}
+			}
+			return 0, false
+		}
+		leftN, leftIsInt := extractIntWidth(leftType)
+		rightN, rightIsInt := extractIntWidth(rightType)
+		if leftIsInt && rightIsInt {
+			switch v.Operator {
+			case sqlparser.PlusOp, sqlparser.MinusOp:
+				// Result = max(leftN, rightN) + 2 (sign + carry)
+				m := leftN
+				if rightN > m {
+					m = rightN
+				}
+				return fmt.Sprintf("bigint(%d)", m+2)
+			case sqlparser.MultOp:
+				// Result = leftN + rightN + 1 (sign)
+				return fmt.Sprintf("bigint(%d)", leftN+rightN+1)
+			case sqlparser.DivOp:
+				// Integer/integer division: decimal(M, 4) where M = intDigits + 4
+				// varchar width in concat context = M + 2 (sign + decimal point)
+				m := leftN + 4
+				return fmt.Sprintf("decimal(%d,4)", m)
+			case sqlparser.IntDivOp:
+				// DIV operation (integer division floor): result width = leftN
+				return fmt.Sprintf("bigint(%d)", leftN)
+			case sqlparser.ModOp:
+				// MOD operation: result width = min(leftN, rightN) (no extra sign slot for small ints)
+				m := leftN
+				if rightN < m {
+					m = rightN
+				}
+				return fmt.Sprintf("bigint(%d)", m)
+			}
 		}
 		if leftType == "int" || rightType == "int" {
 			return "bigint"
@@ -5189,8 +5343,13 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 				if strings.HasPrefix(argType, "decimal(") {
 					var argM, argD int
 					if n, _ := fmt.Sscanf(argType, "decimal(%d,%d)", &argM, &argD); n == 2 {
-						outD := argD // default: same scale
-						scaleVal := argD
+						// For ROUND/TRUNCATE with no second arg, scale defaults to 0.
+						defaultD := argD
+						if name == "round" && len(v.Exprs) < 2 {
+							defaultD = 0
+						}
+						outD := defaultD // default: same scale (or 0 for round with no 2nd arg)
+						scaleVal := defaultD
 						if len(v.Exprs) >= 2 {
 							scaleArg := v.Exprs[1]
 							scaleOK := false
@@ -5223,8 +5382,8 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 							intDigits = 1
 						}
 						outM := intDigits + outD
-						if name == "round" {
-							outM++ // extra digit for rounding carry
+						if name == "round" && len(v.Exprs) >= 2 {
+							outM++ // extra digit for rounding carry (only when scale specified)
 						}
 						if outM < 1 {
 							outM = 1
@@ -5234,17 +5393,95 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 				}
 			}
 		case "abs":
-			// ABS(x): preserve decimal type of x, but +1 to M to accommodate sign.
+			// ABS(x): preserve the type (and display width) of x.
 			if len(v.Exprs) >= 1 {
 				argType := e.inferExprType(v.Exprs[0])
-				if strings.HasPrefix(argType, "decimal(") {
-					var m, d int
-					if n, _ := fmt.Sscanf(argType, "decimal(%d,%d)", &m, &d); n == 2 {
-						return fmt.Sprintf("decimal(%d,%d)", m+1, d)
-					}
+				if argType != "" && argType != "binary(0)" {
 					return argType
 				}
 			}
+		case "exp", "log", "log2", "log10", "sqrt", "pow", "power",
+			"sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+			"degrees", "radians", "rand":
+			// These math functions always return double
+			return "double"
+		case "length", "char_length", "character_length", "octet_length",
+			"bit_length", "coercibility":
+			// String length functions return int(10) (MySQL's UNSIGNED INT display width)
+			return "int(10)"
+		case "locate", "position", "instr":
+			// LOCATE/INSTR return int(11)
+			return "int(11)"
+		case "field", "ascii", "find_in_set", "strcmp", "interval":
+			// These functions return small integer results, int(3) display width
+			return "int(3)"
+		case "ord", "bit_count":
+			// ORD and bit_count return bigint
+			return "bigint"
+		case "crc32", "uncompressed_length":
+			// CRC32/UNCOMPRESSED_LENGTH returns a 32-bit unsigned integer (max 10 digits)
+			return "bigint(10)"
+		case "inet_aton":
+			// INET_ATON returns bigint (IP as integer)
+			return "bigint"
+		case "inet_ntoa":
+			// INET_NTOA returns IPv4 string, MySQL uses varchar(31)
+			return "varchar(31)"
+		case "inet6_ntoa":
+			// INET6_NTOA returns IPv6 string, MySQL uses varchar(39)
+			return "varchar(39)"
+		case "inet6_aton":
+			// INET6_ATON returns varbinary(16)
+			return "varbinary(16)"
+		case "uuid_short":
+			// UUID_SHORT returns a 64-bit unsigned integer
+			return "bigint unsigned"
+		case "benchmark":
+			// BENCHMARK always returns 0 (int(1))
+			return "int(1)"
+		case "sleep":
+			// SLEEP returns 0 as bigint
+			return "bigint"
+		case "is_free_lock", "is_used_lock", "release_lock":
+			// Lock functions return 1 or 0 (int(1) display width)
+			return "int(1)"
+		case "md5":
+			// MD5 always returns a 32-character hex string
+			return "varchar(32)"
+		case "sha", "sha1":
+			// SHA/SHA1 always returns a 40-character hex string
+			return "varchar(40)"
+		case "sha2":
+			// SHA2(str, hash_len): result length = hash_len/4
+			// Common: 224→56, 256→64, 384→96, 512→128; default 256
+			hashLen := 256
+			if len(v.Exprs) >= 2 {
+				if lit, ok := v.Exprs[1].(*sqlparser.Literal); ok && lit.Type == sqlparser.IntVal {
+					if n, err := strconv.Atoi(lit.Val); err == nil {
+						hashLen = n
+					}
+				}
+			}
+			return fmt.Sprintf("varchar(%d)", hashLen/4)
+		case "ceiling", "ceil", "floor":
+			// CEILING/FLOOR return bigint for int args, decimal for decimal args
+			if len(v.Exprs) >= 1 {
+				argType := e.inferExprType(v.Exprs[0])
+				if strings.HasPrefix(argType, "decimal(") {
+					// result has same M, D=0
+					var m, d int
+					if n, _ := fmt.Sscanf(argType, "decimal(%d,%d)", &m, &d); n == 2 {
+						return fmt.Sprintf("decimal(%d,0)", m)
+					}
+				}
+				if strings.HasPrefix(argType, "double") || argType == "double" {
+					return "double"
+				}
+			}
+			return "bigint(21)"
+		case "sign":
+			// SIGN(x) returns -1, 0, or 1 as bigint
+			return "bigint"
 		case "nullif":
 			// NULLIF(x, y) uses the type of the first argument.
 			// If first arg is NULL, MySQL returns char(0).
@@ -5285,7 +5522,8 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 				return fmt.Sprintf("varchar(%d)", maxLen)
 			}
 		case "concat":
-			// CONCAT(str1, str2, ...) — sum of varchar lengths of non-null args
+			// CONCAT(str1, str2, ...) — sum of varchar lengths of non-null args.
+			// Numeric types are converted to strings, so their display width is used.
 			totalLen := 0
 			hasStr := false
 			for _, arg := range v.Exprs {
@@ -5293,12 +5531,10 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 				if t == "binary(0)" || t == "" {
 					continue
 				}
-				if strings.HasPrefix(t, "varchar(") {
-					var n int
-					if _, err := fmt.Sscanf(t, "varchar(%d)", &n); err == nil {
-						totalLen += n
-						hasStr = true
-					}
+				n := concatTypeWidth(t)
+				if n > 0 {
+					totalLen += n
+					hasStr = true
 				}
 			}
 			if hasStr {
@@ -5314,8 +5550,11 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 				sepLen := 0
 				sepIsNull := (sepType == "binary(0)" || sepType == "")
 				if !sepIsNull {
-					if strings.HasPrefix(sepType, "varchar(") {
-						fmt.Sscanf(sepType, "varchar(%d)", &sepLen)
+					sepLen = concatTypeWidth(sepType)
+					if sepLen == 0 {
+						if strings.HasPrefix(sepType, "varchar(") {
+							fmt.Sscanf(sepType, "varchar(%d)", &sepLen)
+						}
 					}
 				}
 				numArgs := len(v.Exprs) - 1 // number of data args (excluding sep)
@@ -5325,12 +5564,11 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 						continue
 					}
 					t := e.inferExprType(arg)
-					if t != "binary(0)" && t != "" && strings.HasPrefix(t, "varchar(") {
-						var n int
-						if _, err := fmt.Sscanf(t, "varchar(%d)", &n); err == nil {
-							strTotal += n
-						}
+					if t == "binary(0)" || t == "" {
+						continue
 					}
+					n := concatTypeWidth(t)
+					strTotal += n
 				}
 				total := strTotal
 				if !sepIsNull && numArgs > 1 {
@@ -5522,6 +5760,8 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			hasDouble := false
 			hasNullArg := false
 			maxVarcharLen := 0
+			maxIntWidth := 0
+			hasInt := false
 			for _, arg := range argsToCheck {
 				t := e.inferExprType(arg)
 				if t == "binary(0)" || t == "" {
@@ -5545,6 +5785,15 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 					if _, err := fmt.Sscanf(t, "char(%d)", &n); err == nil && n > maxVarcharLen {
 						maxVarcharLen = n
 					}
+				} else {
+					// Integer types: extract display width
+					w := concatTypeWidth(t)
+					if w > 0 {
+						hasInt = true
+						if w > maxIntWidth {
+							maxIntWidth = w
+						}
+					}
 				}
 			}
 			if allNull {
@@ -5563,6 +5812,10 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			// If any arg is a string (varchar/char), return varchar with max length.
 			if maxVarcharLen > 0 {
 				return fmt.Sprintf("varchar(%d)", maxVarcharLen)
+			}
+			// If any arg is an integer, return bigint(N) with widest width.
+			if hasInt {
+				return fmt.Sprintf("bigint(%d)", maxIntWidth)
 			}
 		}
 	case *sqlparser.IntroducerExpr:
@@ -5592,12 +5845,26 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 		return t
 	case *sqlparser.CaseExpr:
 		// CASE WHEN ... THEN val ELSE val END — return the widest type among non-null branches.
-		maxVarcharLen := 0
+		// Collect all branch types
+		var branchTypes []string
 		for _, when := range v.Whens {
 			t := e.inferExprType(when.Val)
-			if t == "binary(0)" || t == "" {
-				continue
+			if t != "binary(0)" && t != "" {
+				branchTypes = append(branchTypes, t)
 			}
+		}
+		if v.Else != nil {
+			t := e.inferExprType(v.Else)
+			if t != "binary(0)" && t != "" {
+				branchTypes = append(branchTypes, t)
+			}
+		}
+		// Find the widest type
+		maxVarcharLen := 0
+		maxNumWidth := 0
+		hasDouble := false
+		var decType string
+		for _, t := range branchTypes {
 			if strings.HasPrefix(t, "varchar(") {
 				var n int
 				if _, err := fmt.Sscanf(t, "varchar(%d)", &n); err == nil && n > maxVarcharLen {
@@ -5608,26 +5875,43 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 				if _, err := fmt.Sscanf(t, "char(%d)", &n); err == nil && n > maxVarcharLen {
 					maxVarcharLen = n
 				}
-			}
-		}
-		if v.Else != nil {
-			t := e.inferExprType(v.Else)
-			if t != "binary(0)" && t != "" {
-				if strings.HasPrefix(t, "varchar(") {
-					var n int
-					if _, err := fmt.Sscanf(t, "varchar(%d)", &n); err == nil && n > maxVarcharLen {
-						maxVarcharLen = n
-					}
-				} else if strings.HasPrefix(t, "char(") {
-					var n int
-					if _, err := fmt.Sscanf(t, "char(%d)", &n); err == nil && n > maxVarcharLen {
-						maxVarcharLen = n
-					}
+			} else if t == "double" {
+				hasDouble = true
+			} else if strings.HasPrefix(t, "decimal(") {
+				decType = t
+			} else {
+				w := concatTypeWidth(t)
+				if w > maxNumWidth {
+					maxNumWidth = w
 				}
 			}
 		}
 		if maxVarcharLen > 0 {
 			return fmt.Sprintf("varchar(%d)", maxVarcharLen)
+		}
+		if hasDouble {
+			return "double"
+		}
+		if decType != "" {
+			return decType
+		}
+		if maxNumWidth > 0 {
+			return fmt.Sprintf("bigint(%d)", maxNumWidth)
+		}
+	case *sqlparser.LocateExpr:
+		// LOCATE(substr, str [, pos]) returns int(11)
+		return "int(11)"
+	case *sqlparser.LockingFunc:
+		switch v.Type {
+		case sqlparser.IsFreeLock, sqlparser.ReleaseLock:
+			// IS_FREE_LOCK/RELEASE_LOCK: returns 0 or 1 (int(1))
+			return "int(1)"
+		case sqlparser.IsUsedLock:
+			// IS_USED_LOCK: returns connection ID (bigint) or NULL
+			return "bigint"
+		case sqlparser.GetLock:
+			// GET_LOCK: returns 1 or 0 (int(1))
+			return "int(1)"
 		}
 	case *sqlparser.NullVal:
 		// MySQL uses binary(0) for NULL literal columns in CREATE TABLE AS SELECT
@@ -5639,6 +5923,25 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 		if ct == "char(0)" {
 			ct = inferCastAsCharType(e.inferExprType(v.Expr))
 		}
+		// For CAST(literal AS SIGNED/UNSIGNED), infer display width from the literal value.
+		if (ct == "bigint" || ct == "bigint unsigned") && v.Type != nil {
+			typeName := strings.ToLower(v.Type.Type)
+			if typeName == "signed" || typeName == "signed integer" || typeName == "unsigned" || typeName == "unsigned integer" {
+				if lit, ok := v.Expr.(*sqlparser.Literal); ok && (lit.Type == sqlparser.StrVal || lit.Type == sqlparser.IntVal) {
+					s := strings.TrimSpace(lit.Val)
+					n, err := strconv.ParseInt(s, 10, 64)
+					if err == nil {
+						var repr string
+						if typeName == "signed" || typeName == "signed integer" {
+							repr = strconv.FormatInt(n, 10)
+						} else {
+							repr = strconv.FormatUint(uint64(n), 10)
+						}
+						return fmt.Sprintf("int(%d)", len(repr))
+					}
+				}
+			}
+		}
 		return ct
 	case *sqlparser.CastExpr:
 		// CAST(x AS type) — use the target type
@@ -5646,6 +5949,25 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 		// For CAST(x AS CHAR) with no length, infer varchar width from inner expression type.
 		if ct == "char(0)" {
 			ct = inferCastAsCharType(e.inferExprType(v.Expr))
+		}
+		// For CAST(literal AS SIGNED/UNSIGNED), infer display width from the literal value.
+		if (ct == "bigint" || ct == "bigint unsigned") && v.Type != nil {
+			typeName := strings.ToLower(v.Type.Type)
+			if typeName == "signed" || typeName == "signed integer" || typeName == "unsigned" || typeName == "unsigned integer" {
+				if lit, ok := v.Expr.(*sqlparser.Literal); ok && (lit.Type == sqlparser.StrVal || lit.Type == sqlparser.IntVal) {
+					s := strings.TrimSpace(lit.Val)
+					n, err := strconv.ParseInt(s, 10, 64)
+					if err == nil {
+						var repr string
+						if typeName == "signed" || typeName == "signed integer" {
+							repr = strconv.FormatInt(n, 10)
+						} else {
+							repr = strconv.FormatUint(uint64(n), 10)
+						}
+						return fmt.Sprintf("int(%d)", len(repr))
+					}
+				}
+			}
 		}
 		return ct
 	}
