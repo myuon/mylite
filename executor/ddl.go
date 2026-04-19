@@ -1332,6 +1332,10 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			idxCols = append(idxCols, colStr)
 			if idxCol.Direction == sqlparser.DescOrder {
 				idxOrders = append(idxOrders, "DESC")
+				// HEAP and MEMORY engines do not support descending indexes (ER_TABLE_CANT_HANDLE_BLOB = 1082)
+				if tableEngine == "HEAP" || tableEngine == "MEMORY" {
+					return nil, mysqlError(1178, "42000", "The storage engine for the table doesn't support descending indexes")
+				}
 			} else {
 				idxOrders = append(idxOrders, "")
 			}

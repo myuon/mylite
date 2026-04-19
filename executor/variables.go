@@ -63,6 +63,15 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			cleanVarName == "performance_schema_instrument" {
 			return nil, mysqlError(1193, "HY000", fmt.Sprintf("Unknown system variable '%s'", cleanVarName))
 		}
+		// Removed/deprecated MySQL variables that no longer exist in MySQL 8.0+.
+		// These should return ER_UNKNOWN_SYSTEM_VARIABLE (1193).
+		removedVars := map[string]bool{
+			"log_bin_trust_routine_creators": true, // removed in MySQL 8.0 (use log_bin_trust_function_creators)
+			"table_type":                     true, // removed in MySQL 8.0 (use default_storage_engine)
+		}
+		if removedVars[cleanVarName] {
+			return nil, mysqlError(1193, "HY000", fmt.Sprintf("Unknown system variable '%s'", cleanVarName))
+		}
 		// Type check for pure-string system variables must happen BEFORE read-only check
 		// (MySQL returns ER_WRONG_TYPE_FOR_VAR when you pass a numeric to a string-only var,
 		// even if that var is also read-only).

@@ -245,6 +245,31 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		if strings.Contains(upper, " IDENTIFIED ") {
 			return "", nil, mysqlError(1064, "42000", "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'IDENTIFIED BY' at line 1")
 		}
+		// In MySQL 8.0+, certain reserved keywords cannot be used as unquoted role names.
+		// "OF" is reserved and causes a parse error when used as CREATE ROLE of.
+		{
+			rolePart := strings.TrimSpace(trimmed[len("CREATE ROLE"):])
+			rolePart = strings.TrimRight(rolePart, ";")
+			// Strip IF NOT EXISTS
+			rp := strings.TrimSpace(rolePart)
+			if strings.HasPrefix(strings.ToUpper(rp), "IF NOT EXISTS") {
+				rp = strings.TrimSpace(rp[len("IF NOT EXISTS"):])
+			}
+			// Check for reserved keywords used as unquoted role names
+			// (only check the first role name for parse error detection)
+			firstRole := rp
+			if commaIdx := strings.Index(rp, ","); commaIdx >= 0 {
+				firstRole = strings.TrimSpace(rp[:commaIdx])
+			}
+			firstRole = strings.TrimRight(firstRole, ";")
+			// Reserved keywords that cannot be used as unquoted identifiers in role names
+			reservedAsRoleNames := map[string]bool{
+				"of": true,
+			}
+			if reservedAsRoleNames[strings.ToLower(firstRole)] {
+				return "", nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", strings.TrimSpace(trimmed[len("CREATE ROLE"):])))
+			}
+		}
 		// Register role(s) in the grant store
 		if e.grantStore != nil {
 			rolePart := strings.TrimSpace(query[len("CREATE ROLE"):])
