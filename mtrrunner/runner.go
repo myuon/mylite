@@ -32,6 +32,20 @@ import (
 // errSkipTest is a sentinel error indicating the test should be skipped.
 var errSkipTest = errors.New("skip test")
 
+// classifySkipReason returns a category string based on the wrapped errSkipTest message.
+// Returns "infra" for infrastructure skips, "unsupported" for unsupported feature skips,
+// and "" for all other skips (e.g. skiplist or directive, handled at a higher level).
+func classifySkipReason(err error) string {
+	msg := err.Error()
+	if strings.Contains(msg, "infrastructure:") {
+		return "infra"
+	}
+	if strings.Contains(msg, "unsupported:") {
+		return "unsupported"
+	}
+	return ""
+}
+
 // regexReplace holds a compiled regex and its replacement string for --replace_regex.
 type regexReplace struct {
 	re   *regexp.Regexp
@@ -40,15 +54,16 @@ type regexReplace struct {
 
 // TestResult represents the outcome of running a single .test file.
 type TestResult struct {
-	Name     string
-	Passed   bool
-	Skipped  bool
-	Timeout  bool
-	Error    string
-	Output   string
-	Expected string
-	Diff     string
-	Elapsed  time.Duration
+	Name       string
+	Passed     bool
+	Skipped    bool
+	SkipReason string // "skiplist", "unsupported", "infra", "directive", or "" when not skipped
+	Timeout    bool
+	Error      string
+	Output     string
+	Expected   string
+	Diff       string
+	Elapsed    time.Duration
 }
 
 // Runner executes .test files against a MySQL-compatible server.
@@ -254,7 +269,7 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	ctx := ectx
 	ctx.closeConnections()
 	if errors.Is(err, errSkipTest) {
-		return TestResult{Name: name, Skipped: true}
+		return TestResult{Name: name, Skipped: true, SkipReason: classifySkipReason(err)}
 	}
 	if err != nil {
 		return TestResult{
@@ -266,7 +281,7 @@ func (r *Runner) RunFile(testPath string) TestResult {
 
 	// Check if test was skipped via --skip directive
 	if ctx.skipped {
-		return TestResult{Name: name, Skipped: true}
+		return TestResult{Name: name, Skipped: true, SkipReason: "directive"}
 	}
 
 	actual := ctx.output.String()
@@ -2701,7 +2716,7 @@ func (ctx *execContext) executeQuery(stmt string) error {
 			return nil
 		}
 		if isUnsupportedFeatureError(err) {
-			return errSkipTest
+			return fmt.Errorf("%w: unsupported: %v", errSkipTest, err)
 		}
 		if !ctx.abortOnError {
 			// --disable_abort_on_error: output the error as a line and continue.
@@ -3137,7 +3152,7 @@ func (ctx *execContext) executeQueryOrExec(stmt string) error {
 			return nil
 		}
 		if isUnsupportedFeatureError(err) {
-			return errSkipTest
+			return fmt.Errorf("%w: unsupported: %v", errSkipTest, err)
 		}
 		return fmt.Errorf("query failed: %s: %v", stmt, err)
 	}
@@ -3262,7 +3277,7 @@ func (ctx *execContext) executeExec(stmt string) error {
 			return nil
 		}
 		if isUnsupportedFeatureError(err) {
-			return errSkipTest
+			return fmt.Errorf("%w: unsupported: %v", errSkipTest, err)
 		}
 		if !ctx.abortOnError {
 			// --disable_abort_on_error: output the error as a line and continue.

@@ -44,12 +44,13 @@ var skipGlobs []string
 
 // testResultJSON is the per-test entry in the JSON result log.
 type testResultJSON struct {
-	Suite   string `json:"suite"`
-	Name    string `json:"name"`
-	Status  string `json:"status"` // "pass", "fail", "error", "timeout", "skip"
-	Elapsed string `json:"elapsed,omitempty"`
-	Error   string `json:"error,omitempty"`
-	Diff    string `json:"diff,omitempty"`
+	Suite      string `json:"suite"`
+	Name       string `json:"name"`
+	Status     string `json:"status"` // "pass", "fail", "error", "timeout", "skip"
+	Elapsed    string `json:"elapsed,omitempty"`
+	Error      string `json:"error,omitempty"`
+	Diff       string `json:"diff,omitempty"`
+	SkipReason string `json:"skip_reason,omitempty"`
 }
 
 // runSkippedOnly when true, inverts the skip logic: only run tests IN the skiplist.
@@ -328,6 +329,7 @@ func runAllSuites(suiteRoot, includeRoot string, maxTests, jobs int, timeout tim
 				jr.Status = "pass"
 			case r.Skipped:
 				jr.Status = "skip"
+				jr.SkipReason = r.SkipReason
 			case r.Timeout:
 				jr.Status = "timeout"
 			case r.Error != "":
@@ -437,8 +439,9 @@ func runSuite(suiteName string, testFilter map[string]bool, suiteRoot, includeRo
 		} else {
 			if isSkipped {
 				skippedResults = append(skippedResults, mtrrunner.TestResult{
-					Name:    testName,
-					Skipped: true,
+					Name:       testName,
+					Skipped:    true,
+					SkipReason: "skiplist",
 				})
 				continue
 			}
