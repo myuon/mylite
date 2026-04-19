@@ -925,6 +925,13 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if parseErr != nil {
 			return nil, true, nil
 		}
+		// If the value is a TIME-only string (no date component), combine with current date.
+		// A TIME-only value parses with year=0 when format "15:04:05" matches.
+		// Detect TIME-only: contains ':' but no '-' date separator.
+		if isTimeOnlyStr(valStr) {
+			now := e.nowTime()
+			t = time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), now.Location())
+		}
 		if len(v.Exprs) == 1 {
 			// Single arg: return datetime (preserving microseconds from input string)
 			fracStr := ""
@@ -1351,6 +1358,16 @@ func formatDateTimeWithOptionalMicros(t time.Time) string {
 		return fmt.Sprintf("%s.%06d", base, usec)
 	}
 	return base
+}
+
+// isTimeOnlyStr returns true if s looks like a TIME-only value (HH:MM:SS) with no date component.
+// A TIME-only string has ':' but no '-' date separator.
+func isTimeOnlyStr(s string) bool {
+	s = strings.TrimSpace(s)
+	if strings.Contains(s, "-") {
+		return false // has date separator → not time-only
+	}
+	return strings.Contains(s, ":")
 }
 
 func isZeroDate(val interface{}) bool {
@@ -2581,8 +2598,28 @@ func parseMySQLTimeInterval(s string) (time.Duration, error) {
 		hours, mins = h, m
 	case 1:
 		if parts[0] != "" {
-			h, _ := strconv.Atoi(parts[0])
-			hours = h
+			// A bare integer in TIME context is parsed as HHMMSS format.
+			// e.g. "1" → 0:00:01, "100" → 0:01:00, "10000" → 1:00:00.
+			// Extract fractional part if present.
+			numStr := parts[0]
+			var fracStr string
+			if dotIdx := strings.Index(numStr, "."); dotIdx >= 0 {
+				fracStr = numStr[dotIdx+1:]
+				numStr = numStr[:dotIdx]
+			}
+			// Pad to at least 1 digit for HHMMSS interpretation
+			n, _ := strconv.Atoi(numStr)
+			// Interpret n as HHMMSS: last 2 digits = seconds, next 2 = minutes, rest = hours
+			secs = n % 100
+			mins = (n / 100) % 100
+			hours = n / 10000
+			if fracStr != "" {
+				for len(fracStr) < 6 {
+					fracStr += "0"
+				}
+				fracStr = fracStr[:6]
+				usecs, _ = strconv.Atoi(fracStr)
+			}
 		}
 	}
 
