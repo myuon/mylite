@@ -4621,7 +4621,15 @@ func (e *Executor) inferColumnAttrs(selectSQL, colName string) columnAttrs {
 						strLitMatch = true
 					}
 				}
-				if exprStrNorm != colNameNorm && exprStrNorm != rewrittenColNameNorm && !strLitMatch {
+				// Also try matching after stripping parentheses (e.g. "- -1.1" matches "-(-1.1)")
+				exprStrNoParen := strings.ReplaceAll(exprStrNorm, "(", "")
+				exprStrNoParen = strings.ReplaceAll(exprStrNoParen, ")", "")
+				colNameNoParen := strings.ReplaceAll(colNameNorm, "(", "")
+				colNameNoParen = strings.ReplaceAll(colNameNoParen, ")", "")
+				rewrittenNoParen := strings.ReplaceAll(rewrittenColNameNorm, "(", "")
+				rewrittenNoParen = strings.ReplaceAll(rewrittenNoParen, ")", "")
+				if exprStrNorm != colNameNorm && exprStrNorm != rewrittenColNameNorm && !strLitMatch &&
+					exprStrNoParen != colNameNoParen && exprStrNoParen != rewrittenNoParen {
 					continue
 				}
 			}
@@ -5034,7 +5042,12 @@ func (e *Executor) inferColumnTypeFromSelect(sel *sqlparser.Select, colName stri
 				// but MySQL column names show _utf8'x').
 				exprStr := normalizeCharsetIntroducersForMatch(sqlparser.String(ae.Expr))
 				normalizedColName := normalizeCharsetIntroducersForMatch(colName)
-				if !strings.EqualFold(exprStr, normalizedColName) {
+				exprStrNorm2 := strings.ReplaceAll(strings.ToLower(exprStr), " ", "")
+				colNameNorm2 := strings.ReplaceAll(strings.ToLower(normalizedColName), " ", "")
+				// Also match after stripping parentheses (e.g. "- -1.1" matches "-(-1.1)")
+				exprNoParen2 := strings.ReplaceAll(strings.ReplaceAll(exprStrNorm2, "(", ""), ")", "")
+				colNoParen2 := strings.ReplaceAll(strings.ReplaceAll(colNameNorm2, "(", ""), ")", "")
+				if exprStrNorm2 != colNameNorm2 && exprNoParen2 != colNoParen2 {
 					continue
 				}
 			}
@@ -5699,10 +5712,21 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 				}
 			}
 		case "abs":
-			// ABS(x): preserve the type (and display width) of x.
+			// ABS(x): for signed decimal input, MySQL adds 1 to M; for other types preserve.
 			if len(v.Exprs) >= 1 {
-				argType := e.inferExprType(v.Exprs[0])
+				arg := v.Exprs[0]
+				argType := e.inferExprType(arg)
 				if argType != "" && argType != "binary(0)" {
+					// For decimal type with potentially negative input, MySQL uses M+1
+					if strings.HasPrefix(argType, "decimal(") {
+						// Check if arg can be negative (UnaryExpr with minus)
+						if ue, ok := arg.(*sqlparser.UnaryExpr); ok && ue.Operator == sqlparser.UMinusOp {
+							var m, d int
+							if n, _ := fmt.Sscanf(argType, "decimal(%d,%d)", &m, &d); n == 2 {
+								return fmt.Sprintf("decimal(%d,%d)", m+1, d)
+							}
+						}
+					}
 					return argType
 				}
 			}
