@@ -2286,7 +2286,7 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 				!e.innodbStatsPersistentEnabled(tbl)
 			// Temporary tables always use dynamic stats (no persistent stats stored)
 			tblIsTemp := e.tempTables != nil && (e.tempTables[tblName] || e.tempTables[strings.ToLower(tblName)])
-			appendIndexRows := func(indexName string, cols []string, nonUnique int64, idxComment string, idxType string, invisible bool) {
+			appendIndexRows := func(indexName string, cols []string, nonUnique int64, idxComment string, idxType string, idxUsing string, invisible bool) {
 				var dynamic []int64
 				tblIsNonInnoDB := tblEngine != "" && tblEngine != "INNODB"
 				if (!readPersistent && (tblUsesTransientStats || tblIsTemp || len(dataRows) > 0)) ||
@@ -2306,7 +2306,12 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 				} else if idxType == "SPATIAL" {
 					indexTypeStr = "SPATIAL"
 					// SPATIAL indexes show Collation=A in SHOW INDEX (both InnoDB and MyISAM)
-				} else if tblEngine == "MEMORY" || tblEngine == "HEAP" {
+				} else if (tblEngine == "MEMORY" || tblEngine == "HEAP") && !strings.EqualFold(idxUsing, "BTREE") {
+					// MEMORY/HEAP engine defaults to HASH unless explicitly specified as BTREE
+					indexTypeStr = "HASH"
+					collation = nil
+				} else if strings.EqualFold(idxUsing, "HASH") {
+					// Explicit HASH index on any engine
 					indexTypeStr = "HASH"
 					collation = nil
 				}
@@ -2356,6 +2361,11 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 					}
 					// For InnoDB with STATS_PERSISTENT=1 and no entry: NULL (unexpected, but handled)
 					// For empty MyISAM (len(dataRows)==0) with no entry: NULL (dynamic not computed)
+					// For MEMORY/HEAP tables with BTREE indexes, cardinality is always NULL
+					// (MySQL's MEMORY engine reports NULL cardinality for BTREE but computes for HASH)
+					if (tblEngine == "MEMORY" || tblEngine == "HEAP") && indexTypeStr == "BTREE" {
+						cardinality = nil
+					}
 					// SPATIAL indexes use a 32-byte MBR key prefix
 					var subPart interface{}
 					if idxType == "SPATIAL" {
@@ -2390,10 +2400,10 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 				if idx.Unique {
 					nonUnique = 0
 				}
-				appendIndexRows(idx.Name, idx.Columns, nonUnique, idx.Comment, idx.Type, idx.Invisible)
+				appendIndexRows(idx.Name, idx.Columns, nonUnique, idx.Comment, idx.Type, idx.Using, idx.Invisible)
 			}
 			if len(tbl.PrimaryKey) > 0 {
-				appendIndexRows("PRIMARY", tbl.PrimaryKey, 0, "", "", false)
+				appendIndexRows("PRIMARY", tbl.PrimaryKey, 0, "", "", "", false)
 			}
 		}
 	}

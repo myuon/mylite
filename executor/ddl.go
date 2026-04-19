@@ -1961,6 +1961,67 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		def.Collation = catalog.DefaultCollationForCharset(def.Charset)
 	}
 
+	// Validate maximum row size (ER_TOO_BIG_ROWSIZE = 1118).
+	// MySQL enforces that the total storage size for all columns must not exceed 65535 bytes.
+	// For VARCHAR/VARBINARY columns, storage = byte_length + length_prefix (1 or 2 bytes).
+	// A null bitmap adds 1 byte per 8 nullable columns.
+	{
+		totalRowBytes := 0
+		nullableCount := 0
+		for _, c := range def.Columns {
+			if c.Nullable {
+				nullableCount++
+			}
+			colType := strings.ToUpper(c.Type)
+			baseType := colType
+			colLen := 0
+			if lparen := strings.IndexByte(baseType, '('); lparen >= 0 {
+				rparen := strings.IndexByte(baseType, ')')
+				if rparen > lparen {
+					lenStr := baseType[lparen+1 : rparen]
+					if comma := strings.IndexByte(lenStr, ','); comma >= 0 {
+						lenStr = lenStr[:comma]
+					}
+					colLen, _ = strconv.Atoi(strings.TrimSpace(lenStr))
+				}
+				baseType = strings.TrimSpace(baseType[:lparen])
+			}
+			// Determine effective charset
+			charset := c.Charset
+			if charset == "" {
+				charset = def.Charset
+			}
+			bpc := charsetBytesPerChar(charset)
+			switch baseType {
+			case "VARCHAR":
+				byteLen := colLen * bpc
+				prefix := 2
+				if byteLen <= 255 {
+					prefix = 1
+				}
+				totalRowBytes += byteLen + prefix
+			case "VARBINARY":
+				prefix := 2
+				if colLen <= 255 {
+					prefix = 1
+				}
+				totalRowBytes += colLen + prefix
+			case "CHAR":
+				totalRowBytes += colLen * bpc
+			case "BINARY":
+				totalRowBytes += colLen
+			}
+		}
+		// Add null bitmap overhead (1 byte per 8 nullable columns, minimum 1 if any nullable)
+		if nullableCount > 0 {
+			totalRowBytes += (nullableCount + 7) / 8
+		}
+		if totalRowBytes > 65535 {
+			return nil, mysqlError(1118, "42000",
+				"Row size too large. The maximum row size for the used table type, not counting BLOBs, is 65535. This includes storage overhead, check the manual. You have to change some columns to TEXT or BLOBs")
+		}
+	}
+
 	// Extract partition metadata for row ordering.
 	// MySQL returns rows in partition order; for RANGE partitions this means
 	// ascending order on the partition expression column(s).
@@ -1981,6 +2042,59 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		if po.Type == sqlparser.RangeType && po.Expr != nil {
 			if col, ok := po.Expr.(*sqlparser.ColName); ok {
 				def.PartitionColumns = []string{col.Name.String()}
+			}
+		}
+		// For KEY partitions, validate that the total byte length of partition
+		// columns does not exceed 3072 bytes (MySQL's max partition key length).
+		if po.Type == sqlparser.KeyType && len(po.ColList) > 0 {
+			// Build a map of column name -> column def for quick lookup
+			colByName := make(map[string]catalog.ColumnDef, len(def.Columns))
+			for _, c := range def.Columns {
+				colByName[strings.ToLower(c.Name)] = c
+			}
+			const maxPartitionKeyBytes = 3072
+			totalBytes := 0
+			for _, partCol := range po.ColList {
+				colName := strings.ToLower(partCol.String())
+				if c, ok := colByName[colName]; ok {
+					// Determine effective charset for this column
+					charset := c.Charset
+					if charset == "" {
+						charset = def.Charset
+					}
+					bpc := charsetBytesPerChar(charset)
+					colType := strings.ToUpper(c.Type)
+					// Parse the length from the type string (e.g. "VARCHAR(3070)" -> 3070)
+					colLen := 0
+					if lparen := strings.IndexByte(colType, '('); lparen >= 0 {
+						rparen := strings.IndexByte(colType, ')')
+						if rparen > lparen {
+							lenStr := colType[lparen+1 : rparen]
+							// Handle "length,decimals" format - take first part
+							if comma := strings.IndexByte(lenStr, ','); comma >= 0 {
+								lenStr = lenStr[:comma]
+							}
+							colLen, _ = strconv.Atoi(strings.TrimSpace(lenStr))
+						}
+					}
+					baseType := colType
+					if lparen := strings.IndexByte(baseType, '('); lparen >= 0 {
+						baseType = baseType[:lparen]
+					}
+					baseType = strings.TrimSpace(baseType)
+					// Only variable-length string types use charset bytes per char
+					if baseType == "VARCHAR" || baseType == "CHAR" ||
+						baseType == "VARBINARY" || baseType == "BINARY" ||
+						baseType == "TINYTEXT" || baseType == "TEXT" || baseType == "MEDIUMTEXT" || baseType == "LONGTEXT" {
+						totalBytes += colLen * bpc
+					} else {
+						// For non-string types use the parsed length directly
+						totalBytes += colLen
+					}
+				}
+			}
+			if totalBytes > maxPartitionKeyBytes {
+				return nil, mysqlError(1572, "HY000", "The total length of the partitioning fields is too large")
 			}
 		}
 	}
