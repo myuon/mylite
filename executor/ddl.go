@@ -5759,8 +5759,8 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			// CRC32/UNCOMPRESSED_LENGTH returns a 32-bit unsigned integer (max 10 digits)
 			return "bigint(10)"
 		case "inet_aton":
-			// INET_ATON returns bigint (IP as integer)
-			return "bigint"
+			// INET_ATON returns bigint(21) unsigned (IPv4 max 4294967295, display width = unsigned digits + 1)
+			return "bigint(21) unsigned"
 		case "inet_ntoa":
 			// INET_NTOA returns IPv4 string, MySQL uses varchar(31)
 			return "varchar(31)"
