@@ -13,6 +13,20 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
+// isKnownStorageEngine reports whether the given engine name (already uppercased) is
+// a storage engine recognized by MySQL.  FEDERATED is intentionally excluded because
+// it is compiled-in but disabled, and callers handle it separately.
+func isKnownStorageEngine(engineUpper string) bool {
+	switch engineUpper {
+	case "INNODB", "MYISAM", "MEMORY", "HEAP",
+		"MERGE", "MRG_MYISAM", "BLACKHOLE", "ARCHIVE",
+		"CSV", "NDB", "NDBCLUSTER",
+		"EXAMPLE", "PERFORMANCE_SCHEMA":
+		return true
+	}
+	return false
+}
+
 // validateUTF8StringForDDL checks if a string contains valid utf8mb3 (3-byte UTF-8) when character_set_client=binary.
 // MySQL raises ER_INVALID_CHARACTER_STRING (1300) when binary strings contain invalid utf8/utf8mb3 sequences in DDL contexts.
 // Returns an error with the invalid bytes shown in hex if the string is invalid.
@@ -967,19 +981,21 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		// Known MySQL engines (MyISAM, Archive, etc.) are silently accepted without
 		// warnings since tests relying on those engines expect no warnings.
 		if engineExplicit {
-			knownEngines := map[string]bool{
-				"INNODB": true, "MYISAM": true, "MEMORY": true, "HEAP": true,
-				"MERGE": true, "MRG_MYISAM": true, "BLACKHOLE": true, "ARCHIVE": true,
-				"CSV": true, "NDB": true, "NDBCLUSTER": true,
-				"EXAMPLE": true, "PERFORMANCE_SCHEMA": true,
-			}
-			if !knownEngines[engineUpper] {
+			if !isKnownStorageEngine(engineUpper) {
 				// Truly unknown engine: error or warn + substitute with InnoDB
 				if strings.Contains(e.sqlMode, "NO_ENGINE_SUBSTITUTION") {
 					return nil, mysqlError(1286, "42000", fmt.Sprintf("Unknown storage engine '%s'", engine))
 				}
 				e.addWarning("Warning", 1286, fmt.Sprintf("Unknown storage engine '%s'", engine))
 				e.addWarning("Warning", 1266, fmt.Sprintf("Using storage engine InnoDB for table '%s'", tableName))
+				// Rewrite the ENGINE option to InnoDB so that def.Engine is stored correctly
+				// and SHOW CREATE TABLE returns ENGINE=InnoDB instead of the unknown engine.
+				for i, opt := range stmt.TableSpec.Options {
+					if strings.EqualFold(opt.Name, "ENGINE") {
+						stmt.TableSpec.Options[i].String = "InnoDB"
+						break
+					}
+				}
 			}
 		}
 	}
@@ -2623,22 +2639,18 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				if strings.EqualFold(to.Name, "ENGINE") {
 					engineVal := strings.ToUpper(tableOptionString(to))
 					// Check if engine exists
-					switch engineVal {
-					case "INNODB", "MYISAM", "CSV", "ARCHIVE", "BLACKHOLE", "HEAP", "MEMORY",
-						"MERGE", "MRG_MYISAM", "NDB", "NDBCLUSTER", "EXAMPLE",
-						"PERFORMANCE_SCHEMA":
-						// Known engines
-					case "FEDERATED":
+					if engineVal == "FEDERATED" {
 						// FEDERATED is compiled in but disabled
 						return nil, mysqlError(1286, "42000", fmt.Sprintf("Unknown storage engine '%s'", tableOptionString(to)))
-					default:
-						// When NO_ENGINE_SUBSTITUTION is active, return error; otherwise substitute with InnoDB and warn.
+					} else if !isKnownStorageEngine(engineVal) {
+						// Truly unknown engine: error or warn + substitute with InnoDB
 						if strings.Contains(e.sqlMode, "NO_ENGINE_SUBSTITUTION") {
 							return nil, mysqlError(1286, "42000", fmt.Sprintf("Unknown storage engine '%s'", tableOptionString(to)))
 						}
-						e.warnings = append(e.warnings, Warning{Level: "Warning", Code: 1286, Message: fmt.Sprintf("Unknown storage engine '%s'", tableOptionString(to))})
-						// Engine substitution: proceed with InnoDB (handled via the table option being stored as unknown;
-						// subsequent logic will use INNODB as the stored engine)
+						e.addWarning("Warning", 1286, fmt.Sprintf("Unknown storage engine '%s'", tableOptionString(to)))
+						e.addWarning("Warning", 1266, fmt.Sprintf("Using storage engine InnoDB for table '%s'", tableName))
+						// Engine substitution: rewrite option to InnoDB so tableDef.Engine is stored correctly.
+						to.String = "InnoDB"
 					}
 					// MEMORY and similar engines cannot be used for log tables
 					if isMySQLLogTable(dbName, tableName) {
