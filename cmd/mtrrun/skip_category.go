@@ -49,17 +49,17 @@ var directiveIncludeCategory = map[string]string{
 	"kill_and_restart_mysqld.inc": "infra_lifecycle",
 	"wait_until_disconnected.inc": "infra_lifecycle",
 
-	// deferred (将来実装したい)
-	"have_plugin_auth.inc":    "deferred",
-	"have_plugin_interface.inc": "deferred",
-	"have_plugin_server.inc":  "deferred",
-	"resource_group_init.inc": "deferred",
-	"have_ngram.inc":          "deferred",
-	"wait_condition.inc":      "deferred",
-	"wait_condition_sp.inc":   "deferred",
-	"idx_explain_test.inc":    "deferred",
-	"import.inc":              "deferred",
-	"deadlock.inc":            "deferred",
+	// out_of_scope (issue-tracked features; was "deferred")
+	"have_plugin_auth.inc":      "out_of_scope", // plugin loading, see #94
+	"have_plugin_interface.inc": "out_of_scope", // see #94
+	"have_plugin_server.inc":    "out_of_scope", // see #94
+	"resource_group_init.inc":   "out_of_scope", // resource group, see #94
+	"have_ngram.inc":            "out_of_scope", // ngram FULLTEXT, see #59
+	"wait_condition.inc":        "out_of_scope", // P_S sync wait, see #15
+	"wait_condition_sp.inc":     "out_of_scope", // SP wait, see #92
+	"idx_explain_test.inc":      "out_of_scope", // P_S idx, see #15
+	"import.inc":                "out_of_scope", // InnoDB import, see #71
+	"deadlock.inc":              "out_of_scope", // InnoDB lock, see #71
 }
 
 // 2. skiplist skip: suite名 → category (デフォルト)
@@ -111,7 +111,55 @@ var skiplistPatternOverride = []struct {
 }{
 	{"funcs_1/myisam_*", "out_of_scope"},
 	{"funcs_1/memory_*", "out_of_scope"}, // MEMORY engine
+	{"other/*_myisam", "out_of_scope"},   // tests with _myisam suffix that force MyISAM default
 	// 他の明確な例外があれば追加
+}
+
+// 4. issueTrackedPatterns maps "deferred" test patterns to GitHub issue numbers.
+// Tests matching these are large features whose implementation is tracked in
+// a GitHub issue. Until the issue is closed, they are reclassified from
+// "deferred" to "out_of_scope" so they don't pollute the deferred metric.
+//
+// Order matters: most specific patterns first (filepath.Match is not greedy).
+var issueTrackedPatterns = []struct {
+	pattern string
+	issue   string // GitHub issue reference, e.g. "#15"
+}{
+	// Performance Schema (174 tests)
+	{"perfschema/*", "#15"},
+	// sys schema views/procs/funcs (78)
+	{"sysschema/*", "#64"},
+	// FULLTEXT search (26)
+	{"innodb_fts/*", "#59"},
+	// Partitioning (62)
+	{"parts/*", "#60"},
+	{"max_parts/*", "#60"},
+	// InnoDB internals: LOB/encryption/INSTANT/virtual cols/JSON/etc (~150)
+	{"innodb/*", "#71"},
+	{"innodb_zip/*", "#71"},
+	{"innodb_undo/*", "#71"},
+	// Generated columns (21)
+	{"gcol/*", "#89"},
+	// System variables comprehensive (117)
+	{"sys_vars/*", "#90"},
+	// Triggers
+	{"funcs_1/innodb_trig_*", "#91"},
+	// Cursors / Stored procedures
+	{"funcs_1/innodb_storedproc_*", "#92"},
+	{"funcs_1/innodb_cursors", "#92"},
+	{"funcs_1/storedproc", "#92"},
+	// Information Schema missing tables (funcs_1/is_*)
+	{"funcs_1/is_*", "#93"},
+	// Collations
+	{"collations/*", "#85"},
+	// other suite mixed (130) — catch-all
+	{"other/*", "#94"},
+	// engine_funcs / engine_iuds / json — absorbed into other-mixed catch-all
+	{"engine_funcs/*", "#94"},
+	{"engine_iuds/*", "#94"},
+	{"json/*", "#94"},
+	// remaining funcs_1 entries (charset_collation, processlist_*, etc.)
+	{"funcs_1/*", "#94"},
 }
 
 // Matches both "--source foo.inc" and "-- source foo.inc" (MTR allows a space after --)
@@ -139,6 +187,21 @@ var skipMessageCategory = []struct {
 // classifySkipCategory determines a skip category from the test path and skip_reason.
 // Returns "" if no rule matches.
 func classifySkipCategory(suite, name, reason, suiteRoot string) string {
+	cat := classifyRaw(suite, name, reason, suiteRoot)
+	// Reclassify "deferred" to "out_of_scope" if the test matches an issue-tracked pattern.
+	if cat == "deferred" {
+		testPath := suite + "/" + name
+		for _, ov := range issueTrackedPatterns {
+			if matched, _ := filepath.Match(ov.pattern, testPath); matched {
+				return "out_of_scope"
+			}
+		}
+	}
+	return cat
+}
+
+// classifyRaw is the raw classifier without issue-tracked reclassification.
+func classifyRaw(suite, name, reason, suiteRoot string) string {
 	switch reason {
 	case "unsupported":
 		return "deferred"
@@ -186,7 +249,7 @@ func classifySkipCategory(suite, name, reason, suiteRoot string) string {
 		return ""
 	case "skiplist":
 		testPath := suite + "/" + name
-		// pattern overrides first
+		// pattern overrides first (definite category assignments)
 		for _, ov := range skiplistPatternOverride {
 			if matched, _ := filepath.Match(ov.pattern, testPath); matched {
 				return ov.category
