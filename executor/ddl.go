@@ -181,13 +181,14 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", srcDB, oldName))
 		}
 
-		// Simulate this rename for subsequent validations
-		removed[tableKey{srcDB, oldName}] = true
-		added[tableKey{targetDB, newName}] = true
-		// If we had previously "added" the source, remove it from added too
+		// Simulate this rename for subsequent validations.
+		// Order matters: clean up added[src] first, then mark removed/added,
+		// so that src==target (self-rename) and multi-step chains are handled correctly.
 		if added[tableKey{srcDB, oldName}] {
 			delete(added, tableKey{srcDB, oldName})
 		}
+		removed[tableKey{srcDB, oldName}] = true
+		added[tableKey{targetDB, newName}] = true
 
 		pairs = append(pairs, renamePair{srcDB, oldName, targetDB, newName})
 	}
