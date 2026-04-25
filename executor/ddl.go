@@ -123,11 +123,14 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 
 	tableExists := func(db, name string) bool {
 		k := tableKey{db, name}
-		if removed[k] {
-			return false
-		}
+		// Check "added" before "removed": a name can be in both if it was
+		// used as a source (added to removed) and later re-introduced as a
+		// target (added to added). In that case it exists as a target.
 		if added[k] {
 			return true
+		}
+		if removed[k] {
+			return false
 		}
 		catDB, err := e.Catalog.GetDatabase(db)
 		if err != nil {
@@ -169,20 +172,13 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", srcDB))
 		}
 
-		// Skip validation for no-op renames (same table, same db) - MySQL allows this
-		isSameTable := strings.EqualFold(srcDB, targetDB) && strings.EqualFold(oldName, newName)
 		// Validate target doesn't exist first (MySQL checks destination conflicts before source existence)
-		if !isSameTable && tableExists(targetDB, newName) {
+		if tableExists(targetDB, newName) {
 			return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newName))
 		}
 		// Validate source exists (considering prior simulated renames)
 		if !tableExists(srcDB, oldName) {
 			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", srcDB, oldName))
-		}
-
-		// Skip no-op renames (same table, same db) - MySQL allows this silently
-		if isSameTable {
-			continue
 		}
 
 		// Simulate this rename for subsequent validations
