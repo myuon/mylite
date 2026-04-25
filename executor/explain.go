@@ -3215,11 +3215,27 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
 		switch sub := n.(type) {
 		case *sqlparser.ExistsExpr:
-			// Handle NOT EXISTS / EXISTS anti-join pattern when semijoin-flattening is disabled.
-			// When the outer query cannot be semijoin-flattened (outerCanSemijoin=false),
-			// MySQL emits anti-join rows at the outer query id, not as a new SUBQUERY block.
+			// Handle NOT EXISTS / EXISTS anti-join pattern: only when the EXISTS inner SELECT
+			// contains nested scalar subqueries. In that case, MySQL cannot use a simple
+			// semijoin/anti-join and instead emits the inner tables at the outer query id
+			// level (id=outerQueryID, PRIMARY/SIMPLE) with "Using where; Not exists",
+			// while the nested scalar subquery gets a new id.
+			// A simple EXISTS without nested subqueries is NOT handled here — it falls
+			// through to the regular Subquery case via return true, nil.
 			if !outerCanSemijoin {
 				if inner, ok := sub.Subquery.Select.(*sqlparser.Select); ok {
+					// Only apply anti-join handling if the EXISTS inner SELECT has nested subqueries.
+					innerHasNestedSubquery := false
+					_ = sqlparser.Walk(func(n2 sqlparser.SQLNode) (bool, error) {
+						if _, ok2 := n2.(*sqlparser.Subquery); ok2 {
+							innerHasNestedSubquery = true
+							return false, nil
+						}
+						return true, nil
+					}, inner.SelectExprs, inner.Where, inner.Having)
+					if !innerHasNestedSubquery {
+						return true, nil
+					}
 					var innerFromTables []string
 					for _, te := range inner.From {
 						for _, tn := range e.extractAllTableNames(te) {
