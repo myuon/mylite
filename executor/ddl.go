@@ -123,11 +123,14 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 
 	tableExists := func(db, name string) bool {
 		k := tableKey{db, name}
-		if removed[k] {
-			return false
-		}
+		// Check "added" before "removed": a name can be in both if it was
+		// used as a source (added to removed) and later re-introduced as a
+		// target (added to added). In that case it exists as a target.
 		if added[k] {
 			return true
+		}
+		if removed[k] {
+			return false
 		}
 		catDB, err := e.Catalog.GetDatabase(db)
 		if err != nil {
@@ -169,10 +172,8 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", srcDB))
 		}
 
-		// Skip validation for no-op renames (same table, same db) - MySQL allows this
-		isSameTable := strings.EqualFold(srcDB, targetDB) && strings.EqualFold(oldName, newName)
 		// Validate target doesn't exist first (MySQL checks destination conflicts before source existence)
-		if !isSameTable && tableExists(targetDB, newName) {
+		if tableExists(targetDB, newName) {
 			return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newName))
 		}
 		// Validate source exists (considering prior simulated renames)
@@ -180,18 +181,14 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 			return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", srcDB, oldName))
 		}
 
-		// Skip no-op renames (same table, same db) - MySQL allows this silently
-		if isSameTable {
-			continue
-		}
-
-		// Simulate this rename for subsequent validations
-		removed[tableKey{srcDB, oldName}] = true
-		added[tableKey{targetDB, newName}] = true
-		// If we had previously "added" the source, remove it from added too
+		// Simulate this rename for subsequent validations.
+		// Order matters: clean up added[src] first, then mark removed/added,
+		// so that src==target (self-rename) and multi-step chains are handled correctly.
 		if added[tableKey{srcDB, oldName}] {
 			delete(added, tableKey{srcDB, oldName})
 		}
+		removed[tableKey{srcDB, oldName}] = true
+		added[tableKey{targetDB, newName}] = true
 
 		pairs = append(pairs, renamePair{srcDB, oldName, targetDB, newName})
 	}
