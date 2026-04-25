@@ -1132,6 +1132,21 @@ func (e *Executor) queryCanBeSemijoinFlattened(sel *sqlparser.Select) bool {
 					allFlattenable = false
 					return false, nil
 				}
+				// If the EXISTS inner SELECT itself contains nested subqueries (e.g. correlated
+				// scalar subqueries in WHERE), MySQL cannot flatten it into a simple anti-join
+				// at the outer id level — it produces a separate anti-join row plus new subquery ids.
+				innerHasNestedSubquery := false
+				_ = sqlparser.Walk(func(n2 sqlparser.SQLNode) (bool, error) {
+					if _, ok2 := n2.(*sqlparser.Subquery); ok2 {
+						innerHasNestedSubquery = true
+						return false, nil
+					}
+					return true, nil
+				}, inner.SelectExprs, inner.Where, inner.Having)
+				if innerHasNestedSubquery {
+					allFlattenable = false
+					return false, nil
+				}
 				hasAny = true
 			}
 			return false, nil
@@ -3196,8 +3211,79 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 	if node == nil {
 		return
 	}
+	outerQueryID := *idCounter
 	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
 		switch sub := n.(type) {
+		case *sqlparser.ExistsExpr:
+			// Handle NOT EXISTS / EXISTS anti-join pattern when semijoin-flattening is disabled.
+			// When the outer query cannot be semijoin-flattened (outerCanSemijoin=false),
+			// MySQL emits anti-join rows at the outer query id, not as a new SUBQUERY block.
+			if !outerCanSemijoin {
+				if inner, ok := sub.Subquery.Select.(*sqlparser.Select); ok {
+					var innerFromTables []string
+					for _, te := range inner.From {
+						for _, tn := range e.extractAllTableNames(te) {
+							if !strings.EqualFold(tn, "dual") {
+								innerFromTables = append(innerFromTables, tn)
+							}
+						}
+					}
+					if len(innerFromTables) > 0 {
+						// "Use up" an id slot for the EXISTS wrapper (it doesn't appear in output).
+						*idCounter++
+						outerST := outerSelectTypeOuter
+						if outerST == "" {
+							outerST = "PRIMARY"
+						}
+						for _, tblName := range innerFromTables {
+							var rowCount int64 = 1
+							if e.Storage != nil {
+								if tbl, err2 := e.Storage.GetTable(e.CurrentDB, tblName); err2 == nil && len(tbl.Rows) > 0 {
+									rowCount = int64(len(tbl.Rows))
+								}
+							}
+							ai := e.explainDetectAccessType(inner, tblName)
+							var extra interface{} = "Using where; Not exists"
+							*result = append(*result, explainSelectType{
+								id:           outerQueryID,
+								selectType:   outerST,
+								table:        tblName,
+								accessType:   ai.accessType,
+								possibleKeys: nilIfEmpty(ai.possibleKeys),
+								key:          nilIfEmpty(ai.key),
+								keyLen:       nilIfEmpty(ai.keyLen),
+								ref:          nilIfEmpty(ai.ref),
+								rows:         rowCount,
+								filtered:     "100.00",
+								extra:        extra,
+							})
+						}
+						// Recursively walk nested subqueries inside the EXISTS inner SELECT.
+						allTables := make(map[string]bool)
+						for k, v := range outerTables {
+							allTables[k] = v
+						}
+						for _, tn := range innerFromTables {
+							allTables[strings.ToLower(tn)] = true
+						}
+						var nestedNodes []sqlparser.SQLNode
+						if inner.SelectExprs != nil {
+							nestedNodes = append(nestedNodes, inner.SelectExprs)
+						}
+						if inner.Where != nil {
+							nestedNodes = append(nestedNodes, inner.Where)
+						}
+						if inner.Having != nil {
+							nestedNodes = append(nestedNodes, inner.Having)
+						}
+						for _, nestedNode := range nestedNodes {
+							e.walkForSubqueries(nestedNode, idCounter, result, allTables, false, false, inner, outerST)
+						}
+						return false, nil
+					}
+				}
+			}
+			return true, nil
 		case *sqlparser.Subquery:
 			outerIDBeforeIncrement := *idCounter
 			*idCounter++
