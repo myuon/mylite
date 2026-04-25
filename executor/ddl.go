@@ -929,18 +929,21 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	columns := make([]catalog.ColumnDef, 0)
 	var primaryKeys []string
 
-	// Check for unsupported storage engines with generated columns
+	// Check for unsupported storage engines with generated columns, and emit
+	// engine-substitution warnings when a truly unknown engine is specified.
 	{
 		engine := "InnoDB" // default
+		engineExplicit := false
 		// Check explicit ENGINE= in CREATE TABLE
 		for _, opt := range stmt.TableSpec.Options {
 			if strings.EqualFold(opt.Name, "ENGINE") || strings.EqualFold(opt.Name, "engine") {
 				engine = tableOptionString(opt)
+				engineExplicit = true
 				break
 			}
 		}
 		// If no explicit engine, check session default_storage_engine
-		if engine == "InnoDB" {
+		if !engineExplicit {
 			if e.sessionScopeVars != nil || e.globalScopeVars != nil {
 				if eng, ok := e.getSysVar("default_storage_engine"); ok && eng != "" {
 					engine = eng
@@ -957,6 +960,26 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				if col.Type.Options != nil && col.Type.Options.As != nil {
 					return nil, mysqlError(3106, "HY000", "'Specified storage engine' is not supported for generated columns.")
 				}
+			}
+		}
+		// For truly unknown engines (not recognized by MySQL), emit engine-substitution
+		// warnings matching MySQL behaviour with NO_ENGINE_SUBSTITUTION mode.
+		// Known MySQL engines (MyISAM, Archive, etc.) are silently accepted without
+		// warnings since tests relying on those engines expect no warnings.
+		if engineExplicit {
+			knownEngines := map[string]bool{
+				"INNODB": true, "MYISAM": true, "MEMORY": true, "HEAP": true,
+				"MERGE": true, "MRG_MYISAM": true, "BLACKHOLE": true, "ARCHIVE": true,
+				"CSV": true, "NDB": true, "NDBCLUSTER": true,
+				"EXAMPLE": true, "PERFORMANCE_SCHEMA": true,
+			}
+			if !knownEngines[engineUpper] {
+				// Truly unknown engine: error or warn + substitute with InnoDB
+				if strings.Contains(e.sqlMode, "NO_ENGINE_SUBSTITUTION") {
+					return nil, mysqlError(1286, "42000", fmt.Sprintf("Unknown storage engine '%s'", engine))
+				}
+				e.addWarning("Warning", 1286, fmt.Sprintf("Unknown storage engine '%s'", engine))
+				e.addWarning("Warning", 1266, fmt.Sprintf("Using storage engine InnoDB for table '%s'", tableName))
 			}
 		}
 	}
