@@ -7900,7 +7900,75 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 
 	content := string(data)
 
-	tbl, err := e.Storage.GetTable(e.CurrentDB, opts.tableName)
+	// Resolve views: if target is a view, find the underlying base table.
+	loadTargetName := opts.tableName
+	isLoadTargetView := false
+	var loadViewSelectExprs *sqlparser.SelectExprs
+	if baseTable, isView, _, viewErr := e.resolveViewToBaseTable(opts.tableName); viewErr != nil {
+		// Non-updatable view (e.g. has GROUP BY, DISTINCT, JOINs, aggregates).
+		return nil, mysqlError(1288, "HY000", fmt.Sprintf("The target table %s of the LOAD is not updatable", opts.tableName))
+	} else if isView {
+		isLoadTargetView = true
+		loadTargetName = baseTable
+		// Parse the view SELECT to get column expressions for updatability checks.
+		if viewSQL, _, ok := e.lookupView(opts.tableName); ok {
+			if viewStmt, perr := e.parser().Parse(viewSQL); perr == nil {
+				if viewSel, ok2 := viewStmt.(*sqlparser.Select); ok2 {
+					loadViewSelectExprs = viewSel.SelectExprs
+				}
+			}
+		}
+	}
+	_ = isLoadTargetView
+
+	// If loading into a view with a column list, validate that each column is updatable.
+	if isLoadTargetView && len(opts.columns) > 0 && loadViewSelectExprs != nil {
+		// Check if the view uses SELECT * — all columns are then updatable.
+		hasStar := false
+		for _, se := range loadViewSelectExprs.Exprs {
+			if _, ok := se.(*sqlparser.StarExpr); ok {
+				hasStar = true
+				break
+			}
+		}
+		if !hasStar {
+			for _, col := range opts.columns {
+				if strings.HasPrefix(col, "@") {
+					continue
+				}
+				// Find this column in the view's SELECT expressions.
+				found := false
+				for _, se := range loadViewSelectExprs.Exprs {
+					ae, ok := se.(*sqlparser.AliasedExpr)
+					if !ok {
+						continue
+					}
+					// Determine the alias or column name for this expression.
+					alias := ae.As.String()
+					if alias == "" {
+						if colName, ok2 := ae.Expr.(*sqlparser.ColName); ok2 {
+							alias = colName.Name.String()
+						}
+					}
+					if strings.EqualFold(alias, col) {
+						found = true
+						// Check if the expression is a direct column reference (updatable).
+						if _, isCol := ae.Expr.(*sqlparser.ColName); !isCol {
+							// Computed expression (e.g. 1+2) — not updatable.
+							return nil, mysqlError(1471, "HY000", fmt.Sprintf("Column '%s' is not updatable", col))
+						}
+						break
+					}
+				}
+				if !found {
+					// Column not in view SELECT — MySQL treats this as non-updatable.
+					return nil, mysqlError(1471, "HY000", fmt.Sprintf("Column '%s' is not updatable", col))
+				}
+			}
+		}
+	}
+
+	tbl, err := e.Storage.GetTable(e.CurrentDB, loadTargetName)
 	if err != nil {
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", e.CurrentDB, opts.tableName))
 	}
@@ -7935,6 +8003,7 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 	}
 
 	var affected uint64
+	var rowNum int
 	for _, line := range lines {
 		if line == "" {
 			continue
@@ -7946,6 +8015,7 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 			}
 			line = line[idx+len(opts.linesStartingBy):]
 		}
+		rowNum++
 
 		fields := splitLoadDataFields(line, opts.fieldsTermBy, opts.fieldsEnclosedBy, opts.fieldsEscapedBy)
 		targetCols := tableColNames
@@ -7953,18 +8023,32 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 			targetCols = opts.columns
 		}
 
+		// Warn if row has more fields than there are target columns (1262).
+		// Only applies when not using a fixed-size (empty terminator) format.
+		if opts.fieldsTermBy != "" && len(fields) > len(targetCols) {
+			e.addWarning("Warning", 1262, fmt.Sprintf("Row %d was truncated; it contained more data than there were input columns", rowNum))
+		}
+
 		row := make(storage.Row)
 		varMap := make(map[string]interface{})
+		missingCols := false
 		for i, col := range targetCols {
 			var val interface{}
 			if i < len(fields) {
 				val = processLoadDataField(fields[i], opts.fieldsEscapedBy, opts.fieldsEnclosedBy)
+			} else {
+				// Row has fewer fields than target columns.
+				missingCols = true
 			}
 			if strings.HasPrefix(col, "@") {
 				varMap[col] = val
 			} else {
 				row[col] = val
 			}
+		}
+		// Emit 1261 once per row if any column was missing data.
+		if missingCols {
+			e.addWarning("Warning", 1261, fmt.Sprintf("Row %d doesn't contain data for all columns", rowNum))
 		}
 
 		if opts.setExprs != "" {
@@ -7984,10 +8068,14 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 					}
 				}
 			}
-			// Coerce date/time values and pad BINARY columns
+			// Coerce date/time values and pad BINARY columns, emitting warnings as appropriate.
 			if v, exists := row[colDef.Name]; exists && v != nil {
 				if padLen := binaryPadLength(colDef.Type); padLen > 0 {
 					v = padBinaryValue(v, padLen)
+				}
+				// Emit type-conversion warnings before coercing (only for string values).
+				if sv, isStr := v.(string); isStr {
+					e.emitLoadDataColumnWarning(colDef, sv, rowNum)
 				}
 				row[colDef.Name] = coerceDateTimeValue(colDef.Type, v)
 			}
@@ -8033,6 +8121,81 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 	}
 
 	return &Result{AffectedRows: affected}, nil
+}
+
+// emitLoadDataColumnWarning inspects the string value being loaded into colDef and emits the
+// appropriate MySQL warning (1265 Data truncated, 1264 Out of range, 1366 Incorrect integer value).
+// This mirrors the warning behaviour of INSERT ... IGNORE for type-mismatched column values.
+func (e *Executor) emitLoadDataColumnWarning(colDef catalog.ColumnDef, sv string, rowNum int) {
+	upper := strings.ToUpper(strings.TrimSpace(colDef.Type))
+
+	// --- DATE / DATETIME / TIMESTAMP ---
+	isDateType := upper == "DATE" || strings.HasPrefix(upper, "DATETIME") || strings.HasPrefix(upper, "TIMESTAMP")
+	if isDateType {
+		// Determine whether the value needs a warning by testing coerceDateTimeValue.
+		// If the coercion result differs from a "clean" representation of sv (meaning sv
+		// was not already a valid date literal), a warning is needed.
+		if sv == "" {
+			// Empty string → no data, always data-truncated.
+			e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", colDef.Name, rowNum))
+			return
+		}
+		coerced := coerceDateTimeValue(colDef.Type, sv)
+		coercedStr := fmt.Sprintf("%v", coerced)
+		// Check if the original value, when passed directly through coerceDateTimeValue,
+		// would produce the same canonical result as itself.  If the coerced form is
+		// a zero date / zero datetime AND the input was non-zero, coercion happened.
+		isZeroResult := coercedStr == "0000-00-00" || coercedStr == "0000-00-00 00:00:00"
+		// Also check if the value already looks like a valid canonical date (YYYY-MM-DD)
+		// after coercion — if so, no warning is needed.
+		if !isZeroResult {
+			return // coercion produced a non-zero valid date, no warning needed
+		}
+		// Coerced to zero value — determine warning code.
+		// If input looks date-like (all digits / date separators) → "Out of range" (1264).
+		// Otherwise → "Data truncated" (1265).
+		trimmed := strings.TrimSpace(sv)
+		isDateLike := loadDataIsDateLike(trimmed)
+		if isDateLike {
+			e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row %d", colDef.Name, rowNum))
+		} else {
+			e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", colDef.Name, rowNum))
+		}
+		return
+	}
+
+	// --- INT types ---
+	isIntType := strings.Contains(upper, "INT") || strings.Contains(upper, "INTEGER")
+	if isIntType {
+		err := checkIntegerStrict(colDef.Type, colDef.Name, sv)
+		if err != nil {
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "ERROR 1366") {
+				e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect integer value: '%s' for column '%s' at row %d", sv, colDef.Name, rowNum))
+			} else if strings.Contains(errMsg, "ERROR 1265") {
+				e.addWarning("Note", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", colDef.Name, rowNum))
+			} else if strings.Contains(errMsg, "ERROR 1264") {
+				e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row %d", colDef.Name, rowNum))
+			}
+		}
+		return
+	}
+}
+
+// loadDataIsDateLike returns true when s looks like a date/datetime-format value
+// (digits only, or digits mixed with recognized date separators), such that a
+// coercion failure should be reported as "Out of range" (1264) rather than
+// "Data truncated" (1265).
+func loadDataIsDateLike(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || c == '-' || c == '/' || c == ':' || c == ' ' || c == '.' || c == 'T') {
+			return false
+		}
+	}
+	return true
 }
 
 func splitLoadDataLines(content, linesTerm string) []string {
