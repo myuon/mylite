@@ -12,10 +12,62 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
+// Geometry values are stored as strings. When a geometry has a non-zero SRID,
+// it is encoded in Extended WKT (EWKT) format: "SRID=N;WKT_GEOMETRY".
+// When SRID is 0 or absent, plain WKT is used.
+
+// geomSetSRID sets the SRID on a geometry string, returning EWKT if srid != 0 or plain WKT if srid == 0.
+func geomSetSRID(geom string, srid uint32) string {
+	// Strip existing SRID prefix if present
+	wkt := geomStripSRID(geom)
+	if srid == 0 {
+		return wkt
+	}
+	return "SRID=" + strconv.FormatUint(uint64(srid), 10) + ";" + wkt
+}
+
+// geomGetSRID returns the SRID encoded in a geometry string (0 if absent).
+func geomGetSRID(geom string) uint32 {
+	upper := geom
+	if len(geom) > 8 && (geom[0] == 'S' || geom[0] == 's') {
+		upper = strings.ToUpper(geom[:5])
+	}
+	if !strings.HasPrefix(upper, "SRID=") {
+		return 0
+	}
+	semi := strings.IndexByte(geom, ';')
+	if semi < 0 {
+		return 0
+	}
+	sridStr := geom[5:semi]
+	v, err := strconv.ParseUint(strings.TrimSpace(sridStr), 10, 32)
+	if err != nil {
+		return 0
+	}
+	return uint32(v)
+}
+
+// geomStripSRID strips the EWKT SRID prefix from a geometry, returning plain WKT.
+func geomStripSRID(geom string) string {
+	if len(geom) > 5 {
+		upper := geom
+		if geom[0] == 'S' || geom[0] == 's' {
+			upper = strings.ToUpper(geom[:5])
+		}
+		if strings.HasPrefix(upper, "SRID=") {
+			semi := strings.IndexByte(geom, ';')
+			if semi >= 0 {
+				return geom[semi+1:]
+			}
+		}
+	}
+	return geom
+}
+
 // parseSpatialPointCoords extracts X,Y from a WKT POINT string like "POINT(1 2)" or "POINT (1 2)".
 // Returns [x, y] or nil if parsing fails.
 func parseSpatialPointCoords(wkt string) []float64 {
-	wkt = strings.TrimSpace(wkt)
+	wkt = geomStripSRID(strings.TrimSpace(wkt))
 	upper := strings.ToUpper(wkt)
 	if !strings.HasPrefix(upper, "POINT") {
 		return nil
@@ -58,8 +110,10 @@ func extractSpatialPointCoord(wkt string, prop sqlparser.PointPropertyType) (int
 }
 
 // setSpatialPointCoord sets a coordinate on a WKT POINT and returns the modified WKT.
+// Preserves EWKT SRID prefix if present.
 func setSpatialPointCoord(wkt string, prop sqlparser.PointPropertyType, newVal interface{}) (interface{}, error) {
-	coords := parseSpatialPointCoords(wkt)
+	srid := geomGetSRID(wkt)
+	coords := parseSpatialPointCoords(wkt) // parseSpatialPointCoords strips SRID internally
 	if coords == nil {
 		return nil, nil
 	}
@@ -70,7 +124,8 @@ func setSpatialPointCoord(wkt string, prop sqlparser.PointPropertyType, newVal i
 	case sqlparser.YCordinate, sqlparser.Latitude:
 		coords[1] = nv
 	}
-	return fmt.Sprintf("POINT(%s %s)", formatSpatialFloat(coords[0]), formatSpatialFloat(coords[1])), nil
+	result := fmt.Sprintf("POINT(%s %s)", formatSpatialFloat(coords[0]), formatSpatialFloat(coords[1]))
+	return geomSetSRID(result, srid), nil
 }
 
 // formatSpatialFloat formats a float for WKT output matching MySQL's ST_AsText format.
@@ -112,7 +167,9 @@ func formatSpatialFloat(f float64) string {
 
 // evalGeomProperty evaluates geometry property functions.
 func evalGeomProperty(wkt string, prop sqlparser.GeomPropertyType) (interface{}, error) {
-	upper := strings.TrimSpace(strings.ToUpper(wkt))
+	// Strip EWKT SRID prefix before processing
+	plainWKT := geomStripSRID(strings.TrimSpace(wkt))
+	upper := strings.ToUpper(plainWKT)
 	switch prop {
 	case sqlparser.IsSimple:
 		return int64(1), nil
@@ -133,7 +190,7 @@ func evalGeomProperty(wkt string, prop sqlparser.GeomPropertyType) (interface{},
 	case sqlparser.GeometryType:
 		return detectGeometryType(upper), nil
 	case sqlparser.Envelope:
-		return computeEnvelope(wkt), nil
+		return computeEnvelope(plainWKT), nil
 	}
 	return nil, nil
 }
@@ -909,21 +966,25 @@ func extractPolygonCoords(wkt string) string {
 
 // normalizeWKT normalizes a WKT geometry string to MySQL's canonical display format.
 // Currently handles MULTIPOINT(x y, ...) -> MULTIPOINT((x y), ...) normalization.
+// EWKT SRID prefix (SRID=N;) is preserved if present.
 func normalizeWKT(wkt string) string {
-	upper := strings.ToUpper(strings.TrimSpace(wkt))
+	// Preserve SRID prefix if present
+	srid := geomGetSRID(wkt)
+	plainWKT := geomStripSRID(wkt)
+	upper := strings.ToUpper(strings.TrimSpace(plainWKT))
 	if !strings.HasPrefix(upper, "MULTIPOINT") {
 		return wkt
 	}
-	// Find the content inside outermost parentheses
-	idx := strings.Index(wkt, "(")
+	// Find the content inside outermost parentheses (work on plainWKT)
+	idx := strings.Index(plainWKT, "(")
 	if idx < 0 {
 		return wkt
 	}
-	end := strings.LastIndex(wkt, ")")
+	end := strings.LastIndex(plainWKT, ")")
 	if end <= idx {
 		return wkt
 	}
-	inner := strings.TrimSpace(wkt[idx+1 : end])
+	inner := strings.TrimSpace(plainWKT[idx+1 : end])
 	// Check if already has nested parens (e.g., "(0 0),(10 10)") - already normalized
 	if strings.HasPrefix(inner, "(") {
 		return wkt
@@ -937,8 +998,9 @@ func normalizeWKT(wkt string) string {
 			normalized = append(normalized, "("+p+")")
 		}
 	}
-	prefix := wkt[:idx+1]
-	return prefix + strings.Join(normalized, ",") + ")"
+	prefix := plainWKT[:idx+1]
+	normalizedWKT := prefix + strings.Join(normalized, ",") + ")"
+	return geomSetSRID(normalizedWKT, srid)
 }
 
 // parseSRIDValue parses a SRID value (like an integer or string) and returns:
@@ -996,57 +1058,19 @@ func evalSpatialFunc(e *Executor, name string, exprs []sqlparser.Expr) (interfac
 			if val == nil || sridVal == nil {
 				return nil, true, nil
 			}
-			// Get geometry as binary (validates geometry first, before checking SRID)
-			var geomBytes []byte
+			// Get geometry as WKT string (validate it is a non-empty geometry)
+			var geomStr string
 			if b, ok := val.([]byte); ok {
-				geomBytes = b
-			} else {
-				// Convert WKT to binary
-				geomBytes = wktToWKBWithSRID(toString(val), 0)
-			}
-			// Validate geometry: must have at least 5 bytes
-			if geomBytes == nil || len(geomBytes) < 5 {
-				return nil, true, mysqlError(3516, "22023", "Invalid GIS data provided to function st_srid.")
-			}
-			// Determine if geomBytes has a SRID prefix (MySQL format) or is pure WKB.
-			// Use the same two-pass detection as wkbToWKTAndSRID:
-			//   - If geomBytes[0] is not 0x00/0x01: must be SRID-prefixed (non-WKB byte order marker).
-			//   - If geomBytes[0] is 0x00/0x01: try pure WKB first (exact length match);
-			//     if that fails, try SRID-prefixed (offset 4).
-			hasSRIDPrefix := false
-			geomBodyStart := 0
-			if geomBytes[0] != 0x00 && geomBytes[0] != 0x01 {
-				// Definitely SRID-prefixed
-				if len(geomBytes) < 9 {
+				// Binary input: convert to WKT
+				geomStr = wkbToWKT(b)
+				if geomStr == "" {
 					return nil, true, mysqlError(3516, "22023", "Invalid GIS data provided to function st_srid.")
 				}
-				hasSRIDPrefix = true
-				geomBodyStart = 4
 			} else {
-				// geomBytes[0] is 0x00/0x01 — try pure WKB parse first
-				testOffset0 := 0
-				_, ok0 := parseWKB(geomBytes, &testOffset0)
-				if ok0 && testOffset0 == len(geomBytes) {
-					// Parses exactly as pure WKB
-					hasSRIDPrefix = false
-					geomBodyStart = 0
-				} else if len(geomBytes) >= 9 && (geomBytes[4] == 0x00 || geomBytes[4] == 0x01) {
-					// Try SRID-prefixed interpretation
-					hasSRIDPrefix = true
-					geomBodyStart = 4
-				} else if ok0 {
-					// Pure WKB parse succeeded but didn't consume all bytes — treat as pure WKB
-					hasSRIDPrefix = false
-					geomBodyStart = 0
-				} else {
+				geomStr = toString(val)
+				if geomStr == "" {
 					return nil, true, mysqlError(3516, "22023", "Invalid GIS data provided to function st_srid.")
 				}
-			}
-			// Validate the WKB body by parsing it
-			testOffset := geomBodyStart
-			_, ok := parseWKB(geomBytes, &testOffset)
-			if !ok {
-				return nil, true, mysqlError(3516, "22023", "Invalid GIS data provided to function st_srid.")
 			}
 			// Parse SRID value, emit warning for non-integer strings
 			sridInt, sridTruncated, sridOrigStr := parseSRIDValue(sridVal)
@@ -1063,35 +1087,16 @@ func evalSpatialFunc(e *Executor, name string, exprs []sqlparser.Expr) (interfac
 			if srid != 0 && srid != 4326 {
 				return nil, true, mysqlError(3548, "SR001", fmt.Sprintf("There's no spatial reference system with SRID %d.", srid))
 			}
-			// Build new geometry with updated SRID prefix
-			var newGeomBytes []byte
-			if hasSRIDPrefix {
-				// Replace SRID in existing prefix
-				newGeomBytes = replaceSRIDInBinary(geomBytes, srid)
-				if newGeomBytes == nil {
-					return nil, true, mysqlError(3516, "22023", "Invalid GIS data provided to function st_srid.")
-				}
-			} else {
-				// Pure WKB: add SRID prefix
-				newGeomBytes = make([]byte, 4+len(geomBytes))
-				binary.LittleEndian.PutUint32(newGeomBytes[0:4], srid)
-				copy(newGeomBytes[4:], geomBytes)
-			}
-			return newGeomBytes, true, nil
+			// Return geometry with updated SRID as EWKT string
+			return geomSetSRID(geomStr, srid), true, nil
 		}
 		// Getter form: ST_SRID(geom)
 		if val == nil {
 			return nil, true, nil
 		}
-		if b, ok := val.([]byte); ok {
-			srid, hasSRID := readSRIDFromBinary(b)
-			if !hasSRID {
-				return int64(0), true, nil
-			}
-			return int64(srid), true, nil
-		}
-		// WKT string: SRID is always 0
-		return int64(0), true, nil
+		geomStr := toString(val)
+		// Getter form: ST_SRID(geom) — return the SRID
+		return int64(geomGetSRID(geomStr)), true, nil
 	case "st_isvalid":
 		if len(exprs) < 1 {
 			return nil, true, nil
@@ -1493,16 +1498,19 @@ func WktToWKB(wkt string) []byte {
 
 // wktToWKB converts a WKT geometry string (e.g. "POINT(1 2)") to MySQL's internal
 // binary geometry format: 4-byte SRID (little-endian) + WKB (ISO).
-// Returns nil if parsing fails.
+// Returns nil if parsing fails. Handles EWKT SRID prefix.
 func wktToWKB(wkt string) []byte {
-	return wktToWKBWithSRID(wkt, 0)
+	// Extract SRID from EWKT prefix if present, then delegate to wktToWKBWithSRID
+	srid := geomGetSRID(wkt)
+	return wktToWKBWithSRID(wkt, srid)
 }
 
 // wktToWKBWithSRID converts a WKT geometry string to MySQL's internal binary
 // format: [srid:4 bytes LE][WKB body]. Returns nil if parsing fails.
+// The srid parameter is used as the SRID prefix; any EWKT SRID in wkt is stripped by wktToWKBBody.
 func wktToWKBWithSRID(wkt string, srid uint32) []byte {
 	wkt = strings.TrimSpace(wkt)
-	wkbBody := wktToWKBBody(wkt)
+	wkbBody := wktToWKBBody(wkt) // strips EWKT SRID prefix internally
 	if wkbBody == nil {
 		return nil
 	}
@@ -1558,9 +1566,9 @@ func isGeographicSRID(srid uint32) bool {
 
 // wktToWKBBody converts a WKT geometry to pure WKB (ISO WKB, no SRID prefix).
 // This is used both for the top-level conversion and for sub-geometries in collections.
-// Returns nil if parsing fails.
+// Returns nil if parsing fails. Strips EWKT SRID prefix if present.
 func wktToWKBBody(wkt string) []byte {
-	wkt = strings.TrimSpace(wkt)
+	wkt = geomStripSRID(strings.TrimSpace(wkt))
 	upper := strings.ToUpper(wkt)
 	switch {
 	case strings.HasPrefix(upper, "MULTIPOLYGON"):

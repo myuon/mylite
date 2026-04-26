@@ -40,6 +40,7 @@ type ColumnDef struct {
 	OnUpdateCurrentTimestamp bool   // true for TIMESTAMP/DATETIME with ON UPDATE CURRENT_TIMESTAMP
 	Charset                 string // column-level charset override (e.g. "latin1"); empty means inherit table default
 	Collation               string // column-level collation override; empty means inherit table default
+	SRIDConstraint          *uint32 // SRID constraint for spatial columns; nil means no constraint
 }
 
 // IndexDef represents an index definition.
