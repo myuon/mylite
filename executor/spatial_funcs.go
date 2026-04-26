@@ -73,12 +73,41 @@ func setSpatialPointCoord(wkt string, prop sqlparser.PointPropertyType, newVal i
 	return fmt.Sprintf("POINT(%s %s)", formatSpatialFloat(coords[0]), formatSpatialFloat(coords[1])), nil
 }
 
-// formatSpatialFloat formats a float for WKT output (no trailing zeros).
+// formatSpatialFloat formats a float for WKT output matching MySQL's ST_AsText format.
+// MySQL uses decimal notation for values in [1e-6, 1e15) range, scientific notation otherwise.
+// No '+' in exponent, and negative zero is preserved as "-0".
 func formatSpatialFloat(f float64) string {
-	if f == float64(int64(f)) && !math.IsInf(f, 0) {
+	// Handle negative zero specially
+	if f == 0 {
+		if math.Signbit(f) {
+			return "-0"
+		}
+		return "0"
+	}
+	abs := math.Abs(f)
+	// Integer values in safe range
+	if f == float64(int64(f)) && !math.IsInf(f, 0) && abs < 1e15 {
 		return strconv.FormatInt(int64(f), 10)
 	}
-	return strconv.FormatFloat(f, 'g', -1, 64)
+	// Use fixed notation for values between 1e-6 and 1e15 (MySQL behavior)
+	if abs >= 1e-6 && abs < 1e15 {
+		s := strconv.FormatFloat(f, 'f', -1, 64)
+		// Strip trailing zeros after decimal point but keep at least one digit
+		if strings.Contains(s, ".") {
+			s = strings.TrimRight(s, "0")
+			s = strings.TrimRight(s, ".")
+		}
+		return s
+	}
+	// Scientific notation for very large or very small values
+	s := strconv.FormatFloat(f, 'e', -1, 64)
+	// Remove '+' from exponent and leading zeros in exponent
+	// e.g., "1e+308" -> "1e308", "1e-06" -> "1e-06" (keep negative)
+	s = strings.ReplaceAll(s, "e+0", "e")
+	s = strings.ReplaceAll(s, "e+", "e")
+	// For negative exponents: remove leading zeros (e-06 -> e-06 stays, but e-006 -> e-06)
+	// Go doesn't produce leading zeros in exponent for 'e' format with -1 precision
+	return s
 }
 
 // evalGeomProperty evaluates geometry property functions.
@@ -104,10 +133,177 @@ func evalGeomProperty(wkt string, prop sqlparser.GeomPropertyType) (interface{},
 	case sqlparser.GeometryType:
 		return detectGeometryType(upper), nil
 	case sqlparser.Envelope:
-		// Return the geometry itself as a simplified envelope stub
-		return wkt, nil
+		return computeEnvelope(wkt), nil
 	}
 	return nil, nil
+}
+
+// computeEnvelope computes the MBR (Minimum Bounding Rectangle) for a WKT geometry
+// and returns the result as MySQL ST_Envelope would:
+//   - POINT if the MBR collapses to a single point
+//   - LINESTRING if the MBR collapses to a line (one dimension zero)
+//   - POLYGON with 5 points for a normal 2D bounding box
+//   - GEOMETRYCOLLECTION EMPTY for an empty geometry collection
+func computeEnvelope(wkt string) interface{} {
+	upper := strings.TrimSpace(strings.ToUpper(wkt))
+
+	// Handle empty geometry collections
+	if strings.HasPrefix(upper, "GEOMETRYCOLLECTION") || strings.HasPrefix(upper, "GEOMCOLLECTION") {
+		pts := collectAllPoints(wkt)
+		if len(pts) == 0 {
+			return "GEOMETRYCOLLECTION EMPTY"
+		}
+		return mbrFromPoints(pts)
+	}
+
+	pts := collectAllPoints(wkt)
+	if len(pts) == 0 {
+		return wkt
+	}
+	return mbrFromPoints(pts)
+}
+
+// normalizeMBRFloat normalizes -0 to +0 for MBR coordinate output.
+// MySQL's ST_Envelope treats -0 as 0 in the output coordinates.
+func normalizeMBRFloat(f float64) float64 {
+	if f == 0 {
+		return 0 // converts -0 to +0
+	}
+	return f
+}
+
+// mbrFromPoints computes the MBR polygon/linestring/point from a set of points.
+func mbrFromPoints(pts [][]float64) interface{} {
+	if len(pts) == 0 {
+		return nil
+	}
+	minX, minY := pts[0][0], pts[0][1]
+	maxX, maxY := minX, minY
+	for _, p := range pts[1:] {
+		if p[0] < minX {
+			minX = p[0]
+		}
+		if p[1] < minY {
+			minY = p[1]
+		}
+		if p[0] > maxX {
+			maxX = p[0]
+		}
+		if p[1] > maxY {
+			maxY = p[1]
+		}
+	}
+	// Normalize -0 to +0 for output (MySQL behavior)
+	minX = normalizeMBRFloat(minX)
+	minY = normalizeMBRFloat(minY)
+	maxX = normalizeMBRFloat(maxX)
+	maxY = normalizeMBRFloat(maxY)
+
+	if minX == maxX && minY == maxY {
+		// Single point
+		return fmt.Sprintf("POINT(%s %s)", formatSpatialFloat(minX), formatSpatialFloat(minY))
+	}
+	if minX == maxX || minY == maxY {
+		// Collinear: return a LINESTRING
+		return fmt.Sprintf("LINESTRING(%s %s,%s %s)",
+			formatSpatialFloat(minX), formatSpatialFloat(minY),
+			formatSpatialFloat(maxX), formatSpatialFloat(maxY))
+	}
+	// Normal bounding rectangle
+	return fmt.Sprintf("POLYGON((%s %s,%s %s,%s %s,%s %s,%s %s))",
+		formatSpatialFloat(minX), formatSpatialFloat(minY),
+		formatSpatialFloat(maxX), formatSpatialFloat(minY),
+		formatSpatialFloat(maxX), formatSpatialFloat(maxY),
+		formatSpatialFloat(minX), formatSpatialFloat(maxY),
+		formatSpatialFloat(minX), formatSpatialFloat(minY))
+}
+
+// collectAllPoints recursively collects all coordinate points from any WKT geometry.
+func collectAllPoints(wkt string) [][]float64 {
+	wkt = strings.TrimSpace(wkt)
+	upper := strings.ToUpper(wkt)
+
+	switch {
+	case strings.HasPrefix(upper, "POINT"):
+		coords := parseSpatialPointCoords(wkt)
+		if coords == nil {
+			return nil
+		}
+		return [][]float64{coords}
+	case strings.HasPrefix(upper, "LINESTRING"):
+		return parseLineStringPoints(wkt)
+	case strings.HasPrefix(upper, "MULTILINESTRING"):
+		return collectPointsFromMultiLineString(wkt)
+	case strings.HasPrefix(upper, "MULTIPOLYGON"):
+		rings := parsePolygonRings(wkt)
+		var pts [][]float64
+		for _, ring := range rings {
+			pts = append(pts, ring...)
+		}
+		return pts
+	case strings.HasPrefix(upper, "POLYGON"):
+		rings := parsePolygonRings(wkt)
+		var pts [][]float64
+		for _, ring := range rings {
+			pts = append(pts, ring...)
+		}
+		return pts
+	case strings.HasPrefix(upper, "MULTIPOINT"):
+		rings := parsePolygonRings(wkt)
+		var pts [][]float64
+		for _, ring := range rings {
+			pts = append(pts, ring...)
+		}
+		return pts
+	case strings.HasPrefix(upper, "GEOMETRYCOLLECTION"), strings.HasPrefix(upper, "GEOMCOLLECTION"):
+		geoms := parseGeomCollection(wkt)
+		var pts [][]float64
+		for _, g := range geoms {
+			pts = append(pts, collectAllPoints(g)...)
+		}
+		return pts
+	}
+	return nil
+}
+
+// collectPointsFromMultiLineString extracts all points from a MULTILINESTRING.
+func collectPointsFromMultiLineString(wkt string) [][]float64 {
+	idx := strings.Index(wkt, "(")
+	end := strings.LastIndex(wkt, ")")
+	if idx < 0 || end <= idx {
+		return nil
+	}
+	inner := strings.TrimSpace(wkt[idx+1 : end])
+	// Each component is a linestring ring: (x1 y1, x2 y2, ...)
+	var pts [][]float64
+	depth := 0
+	start := -1
+	for i, ch := range inner {
+		switch ch {
+		case '(':
+			if depth == 0 {
+				start = i + 1
+			}
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && start >= 0 {
+				ringStr := inner[start:i]
+				for _, part := range strings.Split(ringStr, ",") {
+					fields := strings.Fields(strings.TrimSpace(part))
+					if len(fields) >= 2 {
+						x, err1 := strconv.ParseFloat(fields[0], 64)
+						y, err2 := strconv.ParseFloat(fields[1], 64)
+						if err1 == nil && err2 == nil {
+							pts = append(pts, []float64{x, y})
+						}
+					}
+				}
+				start = -1
+			}
+		}
+	}
+	return pts
 }
 
 // detectGeometryType returns the MySQL geometry type name.
@@ -929,8 +1125,8 @@ func evalSpatialFunc(e *Executor, name string, exprs []sqlparser.Expr) (interfac
 		}
 		return fmt.Sprintf("GEOMETRYCOLLECTION(%s)", strings.Join(parts, ",")), true, nil
 	case "st_makeenvelope":
-		if len(exprs) < 2 {
-			return nil, true, nil
+		if len(exprs) != 2 {
+			return nil, true, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'ST_MAKEENVELOPE'")
 		}
 		a, err := e.evalExpr(exprs[0])
 		if err != nil {
@@ -1107,16 +1303,7 @@ func makeSpatialEnvelope(a, b string) interface{} {
 	if ca == nil || cb == nil {
 		return nil
 	}
-	minX := math.Min(ca[0], cb[0])
-	minY := math.Min(ca[1], cb[1])
-	maxX := math.Max(ca[0], cb[0])
-	maxY := math.Max(ca[1], cb[1])
-	return fmt.Sprintf("POLYGON((%s %s,%s %s,%s %s,%s %s,%s %s))",
-		formatSpatialFloat(minX), formatSpatialFloat(minY),
-		formatSpatialFloat(maxX), formatSpatialFloat(minY),
-		formatSpatialFloat(maxX), formatSpatialFloat(maxY),
-		formatSpatialFloat(minX), formatSpatialFloat(maxY),
-		formatSpatialFloat(minX), formatSpatialFloat(minY))
+	return mbrFromPoints([][]float64{ca, cb})
 }
 
 // wktBoundingBox extracts the bounding box (MBR) from a WKT geometry string.
