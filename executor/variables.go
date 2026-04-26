@@ -198,6 +198,9 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				delete(e.sessionScopeVars, "collation_connection")
 			} else if charset != "binary" && !isKnownCharset(charset) {
 				return nil, mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", charset))
+			} else if isNonClientCharset(charset) {
+				// ucs2/utf16/utf16le/utf32 cannot be used as client charset
+				return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'character_set_client' can't be set to the value of '%s'", charset))
 			} else {
 				e.sessionScopeVars["character_set_client"] = charset
 				e.sessionScopeVars["character_set_connection"] = charset
@@ -1600,6 +1603,9 @@ func (e *Executor) handleRawSet(raw string) error {
 				delete(e.sessionScopeVars, "character_set_connection")
 				delete(e.sessionScopeVars, "character_set_results")
 				delete(e.sessionScopeVars, "collation_connection")
+			} else if isNonClientCharset(charset) {
+				// ucs2/utf16/utf16le/utf32 cannot be used as client charset
+				return mysqlError(1231, "42000", fmt.Sprintf("Variable 'character_set_client' can't be set to the value of '%s'", charset))
 			} else {
 				e.sessionScopeVars["character_set_client"] = charset
 				e.sessionScopeVars["character_set_connection"] = charset
