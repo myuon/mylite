@@ -4979,6 +4979,12 @@ func (e *Executor) inferColumnAttrs(selectSQL, colName string) columnAttrs {
 			attrs.nullable = false
 			attrs.hasDefault = true
 			attrs.defaultVal = "0"
+		} else if allPureLiteral && (ct == "datetime" || strings.HasPrefix(ct, "datetime(") ||
+			ct == "timestamp" || strings.HasPrefix(ct, "timestamp(") ||
+			ct == "date" || ct == "time" || strings.HasPrefix(ct, "time(")) {
+			// Temporal function columns (NOW(), CURRENT_TIME(), etc.) in pure-literal SELECT
+			// are NOT NULL with no DEFAULT (MySQL does not emit a DEFAULT clause for these).
+			attrs.nullable = false
 		}
 		return attrs
 	}
@@ -5059,8 +5065,14 @@ func (e *Executor) inferColumnAttrs(selectSQL, colName string) columnAttrs {
 				colNameNoParen = strings.ReplaceAll(colNameNoParen, ")", "")
 				rewrittenNoParen := strings.ReplaceAll(rewrittenColNameNorm, "(", "")
 				rewrittenNoParen = strings.ReplaceAll(rewrittenNoParen, ")", "")
+				// Special case: CurTimeFuncExpr with Fsp=0 stringifies as "now()" but column
+				// name may be "now(0)" (since the SQL text had NOW(0)). Normalize by replacing
+				// "(0)" with "()" in the column name for comparison.
+				colNameNormAltFsp0 := strings.ReplaceAll(colNameNorm, "(0)", "()")
+				rewrittenNormAltFsp0 := strings.ReplaceAll(rewrittenColNameNorm, "(0)", "()")
 				if exprStrNorm != colNameNorm && exprStrNorm != rewrittenColNameNorm && !strLitMatch &&
-					exprStrNoParen != colNameNoParen && exprStrNoParen != rewrittenNoParen {
+					exprStrNoParen != colNameNoParen && exprStrNoParen != rewrittenNoParen &&
+					exprStrNorm != colNameNormAltFsp0 && exprStrNorm != rewrittenNormAltFsp0 {
 					continue
 				}
 			}
@@ -5492,7 +5504,11 @@ func (e *Executor) inferColumnTypeFromSelect(sel *sqlparser.Select, colName stri
 				// Also match after stripping parentheses (e.g. "- -1.1" matches "-(-1.1)")
 				exprNoParen2 := strings.ReplaceAll(strings.ReplaceAll(exprStrNorm2, "(", ""), ")", "")
 				colNoParen2 := strings.ReplaceAll(strings.ReplaceAll(colNameNorm2, "(", ""), ")", "")
-				if exprStrNorm2 != colNameNorm2 && exprNoParen2 != colNoParen2 {
+				// Special case: CurTimeFuncExpr with Fsp=0 stringifies as "now()" but column
+				// name may be "now(0)" (since the SQL text had NOW(0)). Normalize by replacing
+				// "(0)" with "()" in the column name for comparison.
+				colNameNorm2AltFsp0 := strings.ReplaceAll(colNameNorm2, "(0)", "()")
+				if exprStrNorm2 != colNameNorm2 && exprNoParen2 != colNoParen2 && exprStrNorm2 != colNameNorm2AltFsp0 {
 					continue
 				}
 			}
@@ -5693,6 +5709,36 @@ func (e *Executor) inferColumnTypeFromSelectByPosition(sel *sqlparser.Select, co
 		}
 	}
 	return ""
+}
+
+// concatExprWidth returns the varchar width that an expression contributes to CONCAT().
+// It handles CurTimeFuncExpr (CURRENT_TIME, NOW, etc.) specially, since the function
+// return values have tighter bounds than the general TIME/DATETIME column type.
+// Falls back to e.inferExprType + concatTypeWidth for all other expressions.
+func (e *Executor) concatExprWidth(expr sqlparser.Expr) int {
+	if ct, ok := expr.(*sqlparser.CurTimeFuncExpr); ok {
+		name := strings.ToLower(ct.Name.String())
+		fsp := int(ct.Fsp)
+		switch name {
+		case "curtime", "current_time", "utc_time":
+			// CURRENT_TIME() → "HH:MM:SS" (8 chars), CURRENT_TIME(6) → "HH:MM:SS.ffffff" (15 chars)
+			if fsp > 0 {
+				return 8 + 1 + fsp // HH:MM:SS.ffffff...
+			}
+			return 8
+		case "now", "sysdate", "current_timestamp", "localtime", "localtimestamp", "utc_timestamp":
+			// NOW() → "YYYY-MM-DD HH:MM:SS" (19 chars), NOW(6) → "YYYY-MM-DD HH:MM:SS.ffffff" (26 chars)
+			if fsp > 0 {
+				return 19 + 1 + fsp
+			}
+			return 19
+		}
+	}
+	t := e.inferExprType(expr)
+	if t == "binary(0)" || t == "" {
+		return 0
+	}
+	return concatTypeWidth(t)
 }
 
 // concatTypeWidth returns the varchar display width that a given SQL type contributes
@@ -5936,33 +5982,50 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 		if leftType == "double" || rightType == "double" {
 			return "double"
 		}
-		// TIME types in arithmetic context: treated as HHMMSS integer (int(7))
-		// e.g., sec_to_time(1)+0 → int(9), time_col-time_col → int(9)
-		timeToIntWidth := func(t string) (int, bool) {
+		// TIME/DATETIME types in arithmetic context: converted to integer representation.
+		// TIME  → HHMMSS integer (width 7, give int(9) for subtract)
+		// DATETIME/TIMESTAMP → YYYYMMDDHHMMSS integer (width 14, gives bigint(16) for subtract)
+		// Returns (width, isTimeLike, isBigintSize)
+		timeToIntWidth := func(t string) (int, bool, bool) {
 			if t == "time" {
-				return 7, true
+				return 7, true, false
 			}
 			if strings.HasPrefix(t, "time(") {
 				// time(fsp) → 7 digits base + fsp for fractional + 1 for dot = 7+1+fsp
 				var fsp int
 				if _, err := fmt.Sscanf(t, "time(%d)", &fsp); err == nil {
 					if fsp > 0 {
-						return 7 + 1 + fsp, true
+						return 7 + 1 + fsp, true, false
 					}
-					return 7, true
+					return 7, true, false
 				}
 			}
-			return 0, false
+			if t == "datetime" || t == "timestamp" || t == "date" {
+				// YYYYMMDDHHMMSS = 14 digits; bigint(14) for arithmetic
+				return 14, true, true
+			}
+			if strings.HasPrefix(t, "datetime(") || strings.HasPrefix(t, "timestamp(") {
+				var fsp int
+				pfx := "datetime("
+				if strings.HasPrefix(t, "timestamp(") {
+					pfx = "timestamp("
+				}
+				if _, err := fmt.Sscanf(t, pfx+"%d)", &fsp); err == nil && fsp > 0 {
+					return 14 + 1 + fsp, true, true
+				}
+				return 14, true, true
+			}
+			return 0, false, false
 		}
-		leftTimeN, leftIsTime := timeToIntWidth(leftType)
-		rightTimeN, rightIsTime := timeToIntWidth(rightType)
+		leftTimeN, leftIsTime, leftTimeIsBigint := timeToIntWidth(leftType)
+		rightTimeN, rightIsTime, rightTimeIsBigint := timeToIntWidth(rightType)
 		if leftIsTime || rightIsTime {
-			// Treat time as int(N) for arithmetic purposes
+			// Treat time/datetime as integer for arithmetic purposes
 			leftN2 := leftTimeN
 			rightN2 := rightTimeN
+			isBigint := leftTimeIsBigint || rightTimeIsBigint
 			if !leftIsTime {
-				// infer width from right type or use 0
-				if _, ok := timeToIntWidth(rightType); !ok {
+				if _, ok, _ := timeToIntWidth(rightType); !ok {
 					leftN2 = 1 // 0 literal → int(1)
 				}
 			}
@@ -5976,6 +6039,9 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			}
 			switch v.Operator {
 			case sqlparser.PlusOp, sqlparser.MinusOp:
+				if isBigint {
+					return fmt.Sprintf("bigint(%d)", m+2)
+				}
 				return fmt.Sprintf("int(%d)", m+2)
 			}
 		}
@@ -6092,16 +6158,59 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 			return "bigint unsigned"
 		case "last_insert_id", "row_count", "found_rows":
 			return "bigint"
-		// Datetime functions: return specific int types used in arithmetic context.
-		// When used in NOW()-NOW() etc., the YYYYMMDDHHMMSS value is a 14-digit number.
-		case "now", "sysdate", "current_timestamp", "localtime", "localtimestamp",
-			"from_unixtime":
-			// NOW() as number: YYYYMMDDHHMMSS = bigint(14); subtract gives bigint(16)
-			return "bigint(14)"
-		case "curtime", "current_time":
-			// CURTIME() as number: HHMMSS = int(6); subtract gives int(8)
-			// MySQL uses int(7) to give int(9) result with subtract
-			return "int(7)"
+		// Datetime functions: return temporal types so CONCAT() infers correct varchar width.
+		// The BinaryExpr arithmetic handler treats time/datetime via timeToIntWidth.
+		case "now", "sysdate", "current_timestamp", "localtime", "localtimestamp":
+			// Infer fsp from first argument if present (e.g. NOW(6))
+			if len(v.Exprs) >= 1 {
+				if fspLit, ok := v.Exprs[0].(*sqlparser.Literal); ok && fspLit.Type == sqlparser.IntVal {
+					if fspVal, err := strconv.Atoi(fspLit.Val); err == nil && fspVal > 0 && fspVal <= 6 {
+						return fmt.Sprintf("datetime(%d)", fspVal)
+					}
+				}
+			}
+			return "datetime"
+		case "from_unixtime":
+			// FROM_UNIXTIME(timestamp[, format]): FSP comes from fractional part of the timestamp arg.
+			// FROM_UNIXTIME(1) → datetime, FROM_UNIXTIME(1.1) → datetime(1), etc.
+			// MySQL caps FSP at 6: FROM_UNIXTIME(1.1234567) → datetime(6)
+			if len(v.Exprs) >= 1 {
+				if fspLit, ok := v.Exprs[0].(*sqlparser.Literal); ok {
+					switch fspLit.Type {
+					case sqlparser.DecimalVal, sqlparser.FloatVal:
+						// Count decimal places in the literal, capped at 6
+						if dot := strings.IndexByte(fspLit.Val, '.'); dot >= 0 {
+							frac := strings.TrimRight(fspLit.Val[dot+1:], "0")
+							if n := len(frac); n > 0 {
+								if n > 6 {
+									n = 6
+								}
+								return fmt.Sprintf("datetime(%d)", n)
+							}
+						}
+					}
+				}
+			}
+			return "datetime"
+		case "utc_timestamp":
+			if len(v.Exprs) >= 1 {
+				if fspLit, ok := v.Exprs[0].(*sqlparser.Literal); ok && fspLit.Type == sqlparser.IntVal {
+					if fspVal, err := strconv.Atoi(fspLit.Val); err == nil && fspVal > 0 && fspVal <= 6 {
+						return fmt.Sprintf("datetime(%d)", fspVal)
+					}
+				}
+			}
+			return "datetime"
+		case "curtime", "current_time", "utc_time":
+			// Infer fsp from first argument if present (e.g. CURTIME(6))
+			if len(v.Exprs) >= 1 {
+				if fspLit, ok := v.Exprs[0].(*sqlparser.Literal); ok && fspLit.Type == sqlparser.IntVal {
+					if fspVal, err := strconv.Atoi(fspLit.Val); err == nil && fspVal > 0 && fspVal <= 6 {
+						return fmt.Sprintf("time(%d)", fspVal)
+					}
+				}
+			}
+			return "time"
 		case "round", "truncate":
 			// ROUND(x, d) / TRUNCATE(x, d): if x is a decimal literal, infer decimal(M,D)
 			// where D is the number of decimal places requested (or 0 for negative d).
@@ -6346,14 +6455,11 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 		case "concat":
 			// CONCAT(str1, str2, ...) — sum of varchar lengths of non-null args.
 			// Numeric types are converted to strings, so their display width is used.
+			// Use concatExprWidth to properly handle CurTimeFuncExpr (CURRENT_TIME, NOW, etc.)
 			totalLen := 0
 			hasStr := false
 			for _, arg := range v.Exprs {
-				t := e.inferExprType(arg)
-				if t == "binary(0)" || t == "" {
-					continue
-				}
-				n := concatTypeWidth(t)
+				n := e.concatExprWidth(arg)
 				if n > 0 {
 					totalLen += n
 					hasStr = true
@@ -6726,16 +6832,25 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 	case *sqlparser.CurTimeFuncExpr:
 		// CurTimeFuncExpr covers curtime(), current_time(), now(), sysdate(),
 		// current_timestamp(), localtime(), localtimestamp(), utc_time(), utc_timestamp()
+		// Return the actual temporal type so that CONCAT() infers the correct varchar width.
+		// The BinaryExpr arithmetic handler treats time/datetime types via timeToIntWidth.
 		name := strings.ToLower(v.Name.String())
+		fsp := int(v.Fsp)
 		switch name {
 		case "curtime", "current_time", "utc_time":
-			// HHMMSS = 6 digits; MySQL uses int(7) so subtract gives int(9)
-			return "int(7)"
+			// TIME type: HH:MM:SS or HH:MM:SS.ffffff
+			if fsp > 0 {
+				return fmt.Sprintf("time(%d)", fsp)
+			}
+			return "time"
 		case "now", "sysdate", "current_timestamp", "localtime", "localtimestamp", "utc_timestamp":
-			// YYYYMMDDHHMMSS = 14 digits; MySQL uses bigint(14) so subtract gives bigint(16)
-			return "bigint(14)"
+			// DATETIME type: YYYY-MM-DD HH:MM:SS or YYYY-MM-DD HH:MM:SS.ffffff
+			if fsp > 0 {
+				return fmt.Sprintf("datetime(%d)", fsp)
+			}
+			return "datetime"
 		}
-		return "bigint"
+		return "datetime"
 	case *sqlparser.LockingFunc:
 		switch v.Type {
 		case sqlparser.IsFreeLock, sqlparser.ReleaseLock:
@@ -6940,6 +7055,27 @@ func (e *Executor) inferExprAttrs(expr sqlparser.Expr) columnAttrs {
 			attrs.charset = "utf8"
 			attrs.nullable = true
 		}
+	case *sqlparser.CurTimeFuncExpr:
+		// NOW(), CURRENT_TIMESTAMP(), CURTIME(), CURRENT_TIME(), SYSDATE(), UTC_TIME(), UTC_TIMESTAMP()
+		// These functions never return NULL and produce NOT NULL columns in CTAS.
+		// MySQL does NOT emit a DEFAULT clause for these in SHOW CREATE TABLE.
+		name := strings.ToLower(v.Name.String())
+		fsp := int(v.Fsp)
+		switch name {
+		case "curtime", "current_time", "utc_time":
+			if fsp > 0 {
+				attrs.colType = fmt.Sprintf("time(%d)", fsp)
+			} else {
+				attrs.colType = "time"
+			}
+		default: // now, sysdate, current_timestamp, localtime, localtimestamp, utc_timestamp
+			if fsp > 0 {
+				attrs.colType = fmt.Sprintf("datetime(%d)", fsp)
+			} else {
+				attrs.colType = "datetime"
+			}
+		}
+		attrs.nullable = false
 	case *sqlparser.Literal:
 		// Temporal literals: DATE'...', TIME'...', TIMESTAMP'...' — MySQL uses NOT NULL with zero default
 		switch v.Type {
