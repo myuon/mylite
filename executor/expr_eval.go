@@ -6451,7 +6451,20 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 	// For spatial functions that need column values, set correlatedRow so column references resolve.
 	funcNameLower := strings.ToLower(v.Name.String())
 	switch funcNameLower {
-	case "mbrwithin", "st_within", "mbrcontains", "st_contains", "mbrintersects", "st_intersects":
+	case "mbrwithin", "st_within", "mbrcontains", "st_contains", "mbrintersects", "st_intersects",
+		"st_srid", "st_isvalid", "st_validate", "st_isempty", "st_issimple", "st_dimension",
+		"st_geometrytype", "st_envelope", "st_asbinary", "st_aswkb", "st_astext", "st_aswkt",
+		"st_x", "st_y", "st_latitude", "st_longitude",
+		"st_distance", "st_distance_sphere", "st_equals", "st_touches", "st_crosses",
+		"st_overlaps", "st_disjoint", "st_convexhull", "st_area", "st_length",
+		"st_numpoints", "st_pointn", "st_startpoint", "st_endpoint", "st_isclosed",
+		"st_exteriorring", "st_interiorringn", "st_numinteriorrings", "st_numgeometries",
+		"st_geometryn", "st_centroid", "st_buffer",
+		"st_geomfromwkb", "st_pointfromwkb", "st_linestringfromwkb", "st_polyfromwkb",
+		"st_geomfromtext", "st_pointfromtext", "st_linefromtext", "st_linestringfromtext",
+		"st_polyfromtext", "st_polygonfromtext",
+		"st_union", "st_intersection", "st_difference",
+		"st_geohash", "st_latfromgeohash", "st_longfromgeohash", "st_pointfromgeohash":
 		oldCorrelated := e.correlatedRow
 		e.correlatedRow = row
 		result, err := e.evalFuncExpr(v)
