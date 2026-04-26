@@ -503,8 +503,6 @@ var emptyStubTables = map[string]bool{
 	"innodb_ft_config":       true,
 	"innodb_ft_being_deleted": true,
 	"innodb_ft_deleted":      true,
-	"schema_privileges":      true,
-	"table_privileges":       true,
 	"column_privileges":      true,
 	"persisted_variables":    true,
 	// "variables_by_thread" is handled dynamically
@@ -999,6 +997,10 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.infoSchemaCollCharSetAppl()
 	case "user_privileges":
 		rawRows = e.infoSchemaUserPrivileges()
+	case "schema_privileges":
+		rawRows = e.infoSchemaSchemaPrivileges()
+	case "table_privileges":
+		rawRows = e.infoSchemaTablePrivileges()
 	case "routines":
 		rawRows = e.infoSchemaRoutines()
 	case "views":
@@ -4575,8 +4577,14 @@ func (e *Executor) infoSchemaCollCharSetAppl() []storage.Row {
 }
 
 // infoSchemaUserPrivileges returns rows for INFORMATION_SCHEMA.USER_PRIVILEGES.
+// Only global-level (*.*) privileges are shown here; DB- and table-level grants
+// appear in SCHEMA_PRIVILEGES and TABLE_PRIVILEGES respectively.
+// Users with no global privileges get a single USAGE row (MySQL convention).
 func (e *Executor) infoSchemaUserPrivileges() []storage.Row {
-	privTypes := []string{
+	var rows []storage.Row
+
+	// Always include root@localhost with ALL PRIVILEGES + GRANT OPTION.
+	rootPrivTypes := []string{
 		"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "RELOAD",
 		"SHUTDOWN", "PROCESS", "FILE", "REFERENCES", "INDEX", "ALTER",
 		"SHOW DATABASES", "SUPER", "CREATE TEMPORARY TABLES", "LOCK TABLES",
@@ -4584,14 +4592,120 @@ func (e *Executor) infoSchemaUserPrivileges() []storage.Row {
 		"SHOW VIEW", "CREATE ROUTINE", "ALTER ROUTINE", "CREATE USER", "EVENT",
 		"TRIGGER", "CREATE TABLESPACE", "CREATE ROLE", "DROP ROLE",
 	}
-	rows := make([]storage.Row, 0, len(privTypes))
-	for _, p := range privTypes {
+	for _, p := range rootPrivTypes {
 		rows = append(rows, storage.Row{
 			"GRANTEE":        "'root'@'localhost'",
 			"TABLE_CATALOG":  "def",
 			"PRIVILEGE_TYPE": p,
-			"IS_GRANTABLE":  "YES",
+			"IS_GRANTABLE":   "YES",
 		})
+	}
+
+	if e.grantStore == nil {
+		return rows
+	}
+
+	// Enumerate all non-root users registered in the grant store.
+	for _, uh := range e.grantStore.ListAllUserHosts() {
+		if strings.EqualFold(uh.User, "root") {
+			continue
+		}
+		grantee := fmt.Sprintf("'%s'@'%s'", uh.User, uh.Host)
+		globalGrants := e.grantStore.GetGrantsByType(uh.User, uh.Host, GrantTypeGlobal)
+		if len(globalGrants) == 0 {
+			// No global privileges: emit USAGE row.
+			rows = append(rows, storage.Row{
+				"GRANTEE":        grantee,
+				"TABLE_CATALOG":  "def",
+				"PRIVILEGE_TYPE": "USAGE",
+				"IS_GRANTABLE":   "NO",
+			})
+			continue
+		}
+		for _, entry := range globalGrants {
+			isGrantable := "NO"
+			if entry.GrantOption {
+				isGrantable = "YES"
+			}
+			for _, p := range entry.Privs {
+				rows = append(rows, storage.Row{
+					"GRANTEE":        grantee,
+					"TABLE_CATALOG":  "def",
+					"PRIVILEGE_TYPE": p,
+					"IS_GRANTABLE":   isGrantable,
+				})
+			}
+		}
+	}
+
+	return rows
+}
+
+// infoSchemaSchemaPrivileges returns rows for INFORMATION_SCHEMA.SCHEMA_PRIVILEGES.
+// Only DB-level (db.*) privileges are shown.
+func (e *Executor) infoSchemaSchemaPrivileges() []storage.Row {
+	if e.grantStore == nil {
+		return []storage.Row{}
+	}
+	var rows []storage.Row
+	for _, uh := range e.grantStore.ListAllUserHosts() {
+		grantee := fmt.Sprintf("'%s'@'%s'", uh.User, uh.Host)
+		dbGrants := e.grantStore.GetGrantsByType(uh.User, uh.Host, GrantTypeDB)
+		for _, entry := range dbGrants {
+			dbName := strings.TrimSuffix(entry.Object, ".*")
+			isGrantable := "NO"
+			if entry.GrantOption {
+				isGrantable = "YES"
+			}
+			for _, p := range entry.Privs {
+				rows = append(rows, storage.Row{
+					"GRANTEE":        grantee,
+					"TABLE_CATALOG":  "def",
+					"TABLE_SCHEMA":   dbName,
+					"PRIVILEGE_TYPE": p,
+					"IS_GRANTABLE":   isGrantable,
+				})
+			}
+		}
+	}
+	return rows
+}
+
+// infoSchemaTablePrivileges returns rows for INFORMATION_SCHEMA.TABLE_PRIVILEGES.
+// Only table-level (db.table) privileges are shown.
+func (e *Executor) infoSchemaTablePrivileges() []storage.Row {
+	if e.grantStore == nil {
+		return []storage.Row{}
+	}
+	var rows []storage.Row
+	for _, uh := range e.grantStore.ListAllUserHosts() {
+		grantee := fmt.Sprintf("'%s'@'%s'", uh.User, uh.Host)
+		tableGrants := e.grantStore.GetGrantsByType(uh.User, uh.Host, GrantTypeTable)
+		for _, entry := range tableGrants {
+			parts := strings.SplitN(entry.Object, ".", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			dbName, tableName := parts[0], parts[1]
+			isGrantable := "NO"
+			if entry.GrantOption {
+				isGrantable = "YES"
+			}
+			for _, p := range entry.Privs {
+				// Skip column-level grants (those with parenthesized column list)
+				if strings.Contains(p, "(") {
+					continue
+				}
+				rows = append(rows, storage.Row{
+					"GRANTEE":        grantee,
+					"TABLE_CATALOG":  "def",
+					"TABLE_SCHEMA":   dbName,
+					"TABLE_NAME":     tableName,
+					"PRIVILEGE_TYPE": p,
+					"IS_GRANTABLE":   isGrantable,
+				})
+			}
+		}
 	}
 	return rows
 }
