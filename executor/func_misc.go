@@ -533,6 +533,14 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if isNull {
 			return nil, true, nil
 		}
+		// If the value is binary WKB (e.g. from ST_SRID setter), convert to WKT
+		if b, ok := stVal.([]byte); ok {
+			wkt := wkbToWKT(b)
+			if wkt == "" {
+				return nil, true, nil
+			}
+			return wkt, true, nil
+		}
 		return toString(stVal), true, nil
 	case "st_equals":
 		steA, steB, hasNull, err := e.evalArgs2(v.Exprs, "ST_EQUALS", row)

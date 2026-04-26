@@ -1003,6 +1003,33 @@ func normalizeWKT(wkt string) string {
 	return geomSetSRID(normalizedWKT, srid)
 }
 
+// parseSRIDValue parses a SRID value (like an integer or string) and returns:
+// - the int64 value (0 if non-numeric)
+// - whether a truncation happened (non-numeric string)
+// - the original string representation (for warning messages)
+func parseSRIDValue(v interface{}) (int64, bool, string) {
+	switch n := v.(type) {
+	case int64:
+		return n, false, ""
+	case uint64:
+		return int64(n), false, ""
+	case float64:
+		return int64(n), false, ""
+	case string:
+		// Try parsing as integer
+		if i, err := strconv.ParseInt(n, 10, 64); err == nil {
+			return i, false, ""
+		}
+		// Try as float
+		if f, err := strconv.ParseFloat(n, 64); err == nil {
+			return int64(f), false, ""
+		}
+		// Non-numeric: truncate to 0 with warning
+		return 0, true, n
+	}
+	return toInt64(v), false, ""
+}
+
 // Spatial function helpers for evalFuncExpr — these handle functions called by name
 // (as opposed to AST node types).
 
@@ -1014,26 +1041,60 @@ func evalSpatialFunc(e *Executor, name string, exprs []sqlparser.Expr) (interfac
 	lower := strings.ToLower(name)
 	switch lower {
 	case "st_srid":
-		if len(exprs) < 1 {
-			return nil, true, nil
+		// ST_SRID requires exactly 1 or 2 arguments.
+		if len(exprs) == 0 || len(exprs) > 2 {
+			return nil, true, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'ST_SRID'")
 		}
 		val, err := e.evalExpr(exprs[0])
 		if err != nil {
 			return nil, true, err
 		}
-		if val == nil {
-			return nil, true, nil
-		}
-		geomStr := toString(val)
-		// If setter form with 2 args: ST_SRID(geom, new_srid) — set SRID and return geometry
-		if len(exprs) >= 2 {
+		if len(exprs) == 2 {
+			// Setter form: ST_SRID(geom, srid)
 			sridVal, err2 := e.evalExpr(exprs[1])
 			if err2 != nil {
 				return nil, true, err2
 			}
-			newSRID := uint32(asInt64Or(sridVal, 0))
-			return geomSetSRID(geomStr, newSRID), true, nil
+			if val == nil || sridVal == nil {
+				return nil, true, nil
+			}
+			// Get geometry as WKT string (validate it is a non-empty geometry)
+			var geomStr string
+			if b, ok := val.([]byte); ok {
+				// Binary input: convert to WKT
+				geomStr = wkbToWKT(b)
+				if geomStr == "" {
+					return nil, true, mysqlError(3516, "22023", "Invalid GIS data provided to function st_srid.")
+				}
+			} else {
+				geomStr = toString(val)
+				if geomStr == "" {
+					return nil, true, mysqlError(3516, "22023", "Invalid GIS data provided to function st_srid.")
+				}
+			}
+			// Parse SRID value, emit warning for non-integer strings
+			sridInt, sridTruncated, sridOrigStr := parseSRIDValue(sridVal)
+			if sridTruncated {
+				e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect INTEGER value: '%s'", sridOrigStr))
+			}
+			// Validate SRID range: must be in [0, 2^32-1]
+			if sridInt < 0 || sridInt > 4294967295 {
+				return nil, true, mysqlError(3037, "22003", "SRID value is out of range in 'st_srid'")
+			}
+			srid := uint32(sridInt)
+			// Check known SRIDs: only 0 (Cartesian) and 4326 (WGS84) are supported.
+			// All other valid-range SRIDs return ER_SRS_NOT_FOUND.
+			if srid != 0 && srid != 4326 {
+				return nil, true, mysqlError(3548, "SR001", fmt.Sprintf("There's no spatial reference system with SRID %d.", srid))
+			}
+			// Return geometry with updated SRID as EWKT string
+			return geomSetSRID(geomStr, srid), true, nil
 		}
+		// Getter form: ST_SRID(geom)
+		if val == nil {
+			return nil, true, nil
+		}
+		geomStr := toString(val)
 		// Getter form: ST_SRID(geom) — return the SRID
 		return int64(geomGetSRID(geomStr)), true, nil
 	case "st_isvalid":
@@ -1436,20 +1497,71 @@ func WktToWKB(wkt string) []byte {
 }
 
 // wktToWKB converts a WKT geometry string (e.g. "POINT(1 2)") to MySQL's internal
-// binary geometry format: 4-byte SRID (big-endian) + WKB (ISO).
+// binary geometry format: 4-byte SRID (little-endian) + WKB (ISO).
 // Returns nil if parsing fails. Handles EWKT SRID prefix.
 func wktToWKB(wkt string) []byte {
-	wkt = strings.TrimSpace(wkt)
+	// Extract SRID from EWKT prefix if present, then delegate to wktToWKBWithSRID
 	srid := geomGetSRID(wkt)
-	wkbBody := wktToWKBBody(wkt) // strips SRID internally
+	return wktToWKBWithSRID(wkt, srid)
+}
+
+// wktToWKBWithSRID converts a WKT geometry string to MySQL's internal binary
+// format: [srid:4 bytes LE][WKB body]. Returns nil if parsing fails.
+// The srid parameter is used as the SRID prefix; any EWKT SRID in wkt is stripped by wktToWKBBody.
+func wktToWKBWithSRID(wkt string, srid uint32) []byte {
+	wkt = strings.TrimSpace(wkt)
+	wkbBody := wktToWKBBody(wkt) // strips EWKT SRID prefix internally
 	if wkbBody == nil {
 		return nil
 	}
-	// Prepend 4-byte SRID (big-endian)
+	// Prepend 4-byte SRID (little-endian)
 	buf := make([]byte, 4+len(wkbBody))
-	binary.BigEndian.PutUint32(buf[0:4], srid)
+	binary.LittleEndian.PutUint32(buf[0:4], srid)
 	copy(buf[4:], wkbBody)
 	return buf
+}
+
+// readSRIDFromBinary reads the 4-byte little-endian SRID prefix from binary geometry data.
+// Returns (srid, hasSRID) where hasSRID is true if the data appears to have a valid SRID prefix.
+// MySQL geometry binary format: [srid:4 LE][wkb_body]
+// WKB body starts with a byte order marker (0x00 or 0x01).
+func readSRIDFromBinary(data []byte) (uint32, bool) {
+	if len(data) < 5 {
+		return 0, false
+	}
+	// Check if byte 4 is a valid WKB byte order marker (0x00=big-endian, 0x01=little-endian)
+	if data[4] == 0x00 || data[4] == 0x01 {
+		srid := binary.LittleEndian.Uint32(data[0:4])
+		return srid, true
+	}
+	return 0, false
+}
+
+// replaceSRIDInBinary replaces the 4-byte SRID prefix in binary geometry data.
+// Returns nil if data is too short or malformed.
+func replaceSRIDInBinary(data []byte, newSRID uint32) []byte {
+	if len(data) < 5 {
+		return nil
+	}
+	// Verify byte 4 is a valid WKB byte order marker
+	if data[4] != 0x00 && data[4] != 0x01 {
+		return nil
+	}
+	// Must have at least SRID(4) + byteOrder(1) + geomType(4) = 9 bytes minimum
+	if len(data) < 9 {
+		return nil
+	}
+	result := make([]byte, len(data))
+	copy(result, data)
+	binary.LittleEndian.PutUint32(result[0:4], newSRID)
+	return result
+}
+
+// isGeographicSRID returns true if the given SRID uses geographic coordinates
+// (latitude/longitude) where ST_AsText should swap X/Y for display.
+// MySQL only supports SRID 4326 (WGS84) as a built-in geographic SRS.
+func isGeographicSRID(srid uint32) bool {
+	return srid == 4326
 }
 
 // wktToWKBBody converts a WKT geometry to pure WKB (ISO WKB, no SRID prefix).
@@ -1737,29 +1849,97 @@ func parseMultiPolygonSubs(wkt string) []string {
 // wkbToWKT converts WKB bytes to a WKT string.
 // Input may optionally have a 4-byte SRID prefix (MySQL internal format).
 // Returns "" if parsing fails.
+// For geographic SRIDs (e.g. 4326), X and Y coordinates are swapped in the output
+// to match MySQL's ST_AsText behavior (latitude, longitude order).
 func wkbToWKT(data []byte) string {
+	wkt, _ := wkbToWKTAndSRID(data)
+	return wkt
+}
+
+// wkbToWKTAndSRID converts WKB bytes to a WKT string, also returning the SRID.
+// Input may optionally have a 4-byte SRID prefix (MySQL internal format).
+// Returns ("", 0) if parsing fails.
+// For geographic SRIDs (e.g. 4326), X and Y coordinates are swapped in the output.
+func wkbToWKTAndSRID(data []byte) (string, uint32) {
 	if len(data) == 0 {
-		return ""
+		return "", 0
 	}
-	// Try to detect if there's a 4-byte SRID prefix.
-	// MySQL internal format: 4-byte SRID (big-endian) + WKB
-	// Pure WKB: starts with 0x00 or 0x01 (byte order marker)
-	// If first byte is 0x00 or 0x01, it's pure WKB.
-	// If first byte is not 0x00/0x01 but byte at offset 4 is 0x00/0x01, it has SRID prefix.
-	offset := 0
-	if len(data) >= 5 && data[0] != 0x00 && data[0] != 0x01 {
-		// Likely has 4-byte SRID prefix
-		if data[4] == 0x00 || data[4] == 0x01 {
-			offset = 4
+	// Detect whether the input is MySQL-internal format [srid:4 LE][WKB] or pure ISO WKB.
+	//
+	// Pure WKB always starts with a byte-order marker: 0x00 (big-endian) or 0x01 (little-endian).
+	// MySQL-internal format has a 4-byte SRID prefix followed by the byte-order marker at offset 4.
+	//
+	// Ambiguous case: SRID=0 prefix is 00 00 00 00, so data[0]=0x00, which is also a valid WKB
+	// byte-order marker. In this case we must use another heuristic to decide.
+	//
+	// Strategy:
+	//   1. If data[0] is NOT a valid byte-order marker (not 0x00/0x01): must be SRID-prefixed.
+	//   2. If data[0] IS a valid byte-order marker:
+	//      a. Try parsing as pure WKB from offset 0. If it consumes exactly all bytes, it's pure WKB.
+	//      b. Otherwise, try parsing as SRID-prefixed (offset 4).
+
+	srid := uint32(0)
+
+	if data[0] != 0x00 && data[0] != 0x01 {
+		// Definitely SRID-prefixed: data[0] is not a WKB byte-order marker.
+		if len(data) < 9 {
+			return "", 0
+		}
+		srid = binary.LittleEndian.Uint32(data[0:4])
+		offset := 4
+		wkt, ok := parseWKBWithSRID(data, &offset, srid)
+		if !ok {
+			return "", 0
+		}
+		return wkt, srid
+	}
+
+	// data[0] is 0x00 or 0x01 — could be pure WKB or SRID=0 prefix.
+	// Try parsing as pure WKB first: if it exactly consumes all bytes, treat as pure WKB.
+	offset0 := 0
+	wkt0, ok0 := parseWKB(data, &offset0)
+	if ok0 && offset0 == len(data) {
+		// Successfully parsed all bytes as pure WKB.
+		return wkt0, 0
+	}
+
+	// Pure WKB parse failed or didn't consume all bytes. Try as SRID-prefixed.
+	if len(data) >= 9 && (data[4] == 0x00 || data[4] == 0x01) {
+		srid = binary.LittleEndian.Uint32(data[0:4])
+		offset4 := 4
+		wkt4, ok4 := parseWKBWithSRID(data, &offset4, srid)
+		if ok4 {
+			return wkt4, srid
 		}
 	}
-	wkt, _ := parseWKB(data, &offset)
-	return wkt
+
+	// Both attempts failed. Try the original pure WKB parse result even if incomplete
+	// (e.g. collections with trailing data).
+	if ok0 {
+		return wkt0, 0
+	}
+
+	return "", 0
+}
+
+// parseWKBWithSRID parses WKB at data[*offset] and advances offset.
+// If the SRID indicates a geographic SRS, X and Y coordinates are swapped in output.
+// Returns the WKT string and true if successful.
+func parseWKBWithSRID(data []byte, offset *int, srid uint32) (string, bool) {
+	swapXY := isGeographicSRID(srid)
+	return parseWKBSwap(data, offset, swapXY)
 }
 
 // parseWKB parses WKB at data[*offset] and advances offset.
 // Returns the WKT string and true if successful.
 func parseWKB(data []byte, offset *int) (string, bool) {
+	return parseWKBSwap(data, offset, false)
+}
+
+// parseWKBSwap parses WKB at data[*offset] and advances offset.
+// If swapXY is true, X and Y coordinates are swapped in the output WKT.
+// Returns the WKT string and true if successful.
+func parseWKBSwap(data []byte, offset *int, swapXY bool) (string, bool) {
 	if *offset+5 > len(data) {
 		return "", false
 	}
@@ -1774,19 +1954,19 @@ func parseWKB(data []byte, offset *int) (string, bool) {
 
 	switch geomType {
 	case 1: // POINT
-		return parseWKBPoint(data, offset, littleEndian)
+		return parseWKBPointSwap(data, offset, littleEndian, swapXY)
 	case 2: // LINESTRING
-		return parseWKBLineString(data, offset, littleEndian)
+		return parseWKBLineStringSwap(data, offset, littleEndian, swapXY)
 	case 3: // POLYGON
-		return parseWKBPolygon(data, offset, littleEndian)
+		return parseWKBPolygonSwap(data, offset, littleEndian, swapXY)
 	case 4: // MULTIPOINT
-		return parseWKBMulti(data, offset, littleEndian, "MULTIPOINT", true)
+		return parseWKBMultiSwap(data, offset, littleEndian, "MULTIPOINT", true, swapXY)
 	case 5: // MULTILINESTRING
-		return parseWKBMulti(data, offset, littleEndian, "MULTILINESTRING", false)
+		return parseWKBMultiSwap(data, offset, littleEndian, "MULTILINESTRING", false, swapXY)
 	case 6: // MULTIPOLYGON
-		return parseWKBMulti(data, offset, littleEndian, "MULTIPOLYGON", false)
+		return parseWKBMultiSwap(data, offset, littleEndian, "MULTIPOLYGON", false, swapXY)
 	case 7: // GEOMETRYCOLLECTION
-		return parseWKBGeomColl(data, offset, littleEndian)
+		return parseWKBGeomCollSwap(data, offset, littleEndian, swapXY)
 	}
 	return "", false
 }
@@ -1820,15 +2000,26 @@ func readFloat64(data []byte, offset *int, littleEndian bool) float64 {
 }
 
 func parseWKBPoint(data []byte, offset *int, littleEndian bool) (string, bool) {
+	return parseWKBPointSwap(data, offset, littleEndian, false)
+}
+
+func parseWKBPointSwap(data []byte, offset *int, littleEndian bool, swapXY bool) (string, bool) {
 	if *offset+16 > len(data) {
 		return "", false
 	}
 	x := readFloat64(data, offset, littleEndian)
 	y := readFloat64(data, offset, littleEndian)
+	if swapXY {
+		return fmt.Sprintf("POINT(%s %s)", formatSpatialFloat(y), formatSpatialFloat(x)), true
+	}
 	return fmt.Sprintf("POINT(%s %s)", formatSpatialFloat(x), formatSpatialFloat(y)), true
 }
 
 func parseWKBLineString(data []byte, offset *int, littleEndian bool) (string, bool) {
+	return parseWKBLineStringSwap(data, offset, littleEndian, false)
+}
+
+func parseWKBLineStringSwap(data []byte, offset *int, littleEndian bool, swapXY bool) (string, bool) {
 	n := readUint32(data, offset, littleEndian)
 	if *offset+int(n)*16 > len(data) {
 		return "", false
@@ -1837,12 +2028,20 @@ func parseWKBLineString(data []byte, offset *int, littleEndian bool) (string, bo
 	for i := uint32(0); i < n; i++ {
 		x := readFloat64(data, offset, littleEndian)
 		y := readFloat64(data, offset, littleEndian)
-		parts = append(parts, fmt.Sprintf("%s %s", formatSpatialFloat(x), formatSpatialFloat(y)))
+		if swapXY {
+			parts = append(parts, fmt.Sprintf("%s %s", formatSpatialFloat(y), formatSpatialFloat(x)))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s %s", formatSpatialFloat(x), formatSpatialFloat(y)))
+		}
 	}
 	return fmt.Sprintf("LINESTRING(%s)", strings.Join(parts, ",")), true
 }
 
 func parseWKBPolygon(data []byte, offset *int, littleEndian bool) (string, bool) {
+	return parseWKBPolygonSwap(data, offset, littleEndian, false)
+}
+
+func parseWKBPolygonSwap(data []byte, offset *int, littleEndian bool, swapXY bool) (string, bool) {
 	numRings := readUint32(data, offset, littleEndian)
 	var rings []string
 	for r := uint32(0); r < numRings; r++ {
@@ -1854,7 +2053,11 @@ func parseWKBPolygon(data []byte, offset *int, littleEndian bool) (string, bool)
 		for i := uint32(0); i < n; i++ {
 			x := readFloat64(data, offset, littleEndian)
 			y := readFloat64(data, offset, littleEndian)
-			pts = append(pts, fmt.Sprintf("%s %s", formatSpatialFloat(x), formatSpatialFloat(y)))
+			if swapXY {
+				pts = append(pts, fmt.Sprintf("%s %s", formatSpatialFloat(y), formatSpatialFloat(x)))
+			} else {
+				pts = append(pts, fmt.Sprintf("%s %s", formatSpatialFloat(x), formatSpatialFloat(y)))
+			}
 		}
 		rings = append(rings, "("+strings.Join(pts, ",")+")")
 	}
@@ -1865,11 +2068,15 @@ func parseWKBPolygon(data []byte, offset *int, littleEndian bool) (string, bool)
 // wrapSubsInParens controls whether sub-geometry WKTs get wrapped in extra parens
 // (needed for MULTIPOINT display: MULTIPOINT((0 1),(2 3))).
 func parseWKBMulti(data []byte, offset *int, littleEndian bool, typeName string, wrapSubsInParens bool) (string, bool) {
+	return parseWKBMultiSwap(data, offset, littleEndian, typeName, wrapSubsInParens, false)
+}
+
+func parseWKBMultiSwap(data []byte, offset *int, littleEndian bool, typeName string, wrapSubsInParens bool, swapXY bool) (string, bool) {
 	n := readUint32(data, offset, littleEndian)
 	var parts []string
 	for i := uint32(0); i < n; i++ {
 		// Each sub-geometry has its own WKB header
-		wkt, ok := parseWKB(data, offset)
+		wkt, ok := parseWKBSwap(data, offset, swapXY)
 		if !ok {
 			return "", false
 		}
@@ -1900,10 +2107,17 @@ func parseWKBMulti(data []byte, offset *int, littleEndian bool, typeName string,
 
 // parseWKBGeomColl parses WKB for GEOMETRYCOLLECTION.
 func parseWKBGeomColl(data []byte, offset *int, littleEndian bool) (string, bool) {
+	return parseWKBGeomCollSwap(data, offset, littleEndian, false)
+}
+
+func parseWKBGeomCollSwap(data []byte, offset *int, littleEndian bool, swapXY bool) (string, bool) {
 	n := readUint32(data, offset, littleEndian)
+	if n == 0 {
+		return "GEOMETRYCOLLECTION EMPTY", true
+	}
 	var parts []string
 	for i := uint32(0); i < n; i++ {
-		wkt, ok := parseWKB(data, offset)
+		wkt, ok := parseWKBSwap(data, offset, swapXY)
 		if !ok {
 			return "", false
 		}
