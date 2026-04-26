@@ -1651,6 +1651,10 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	if err := e.validateIndexHints(stmt.From); err != nil {
 		return nil, err
 	}
+	// Validate FOR SHARE/UPDATE OF <table> locking clause table references.
+	if err := e.validateSelectLockClauses(stmt); err != nil {
+		return nil, err
+	}
 	// Increment handler read counters used by SHOW STATUS.
 	// Only count queries with real FROM clauses (not dual / no-FROM).
 	selectHasRealFrom := false
@@ -8340,4 +8344,128 @@ func containsBetweenExpr(expr sqlparser.Expr) bool {
 		return containsBetweenExpr(e.Expr)
 	}
 	return false
+}
+
+// fromTableRef represents a table reference in a FROM clause.
+type fromTableRef struct {
+	tableName string // bare table name
+	dbName    string // optional db qualifier
+	alias     string // alias used to reference this table (= tableName when no AS)
+	hasAlias  bool   // true when an explicit AS alias was given
+}
+
+// collectFromTableRefs flattens a TableExpr tree into individual table refs.
+func collectFromTableRefs(expr sqlparser.TableExpr) []fromTableRef {
+	switch te := expr.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if tn, ok := te.Expr.(sqlparser.TableName); ok {
+			ref := fromTableRef{
+				tableName: tn.Name.String(),
+				dbName:    tn.Qualifier.String(),
+			}
+			if !te.As.IsEmpty() {
+				ref.alias = te.As.String()
+				ref.hasAlias = true
+			} else {
+				ref.alias = ref.tableName
+			}
+			return []fromTableRef{ref}
+		}
+	case *sqlparser.JoinTableExpr:
+		return append(collectFromTableRefs(te.LeftExpr), collectFromTableRefs(te.RightExpr)...)
+	case *sqlparser.ParenTableExpr:
+		var refs []fromTableRef
+		for _, inner := range te.Exprs {
+			refs = append(refs, collectFromTableRefs(inner)...)
+		}
+		return refs
+	}
+	return nil
+}
+
+// validateSelectLockClauses checks FOR SHARE/UPDATE OF <table> locking clauses.
+// Returns ER_UNRESOLVED_TABLE_LOCK (3537) when a table name in an OF clause
+// does not match any FROM clause entry, and ER_DUPLICATE_TABLE_LOCK (3569) when
+// a table is covered by more than one locking clause.
+func (e *Executor) validateSelectLockClauses(stmt *sqlparser.Select) error {
+	clauses := e.selectLockClauses
+	if len(clauses) == 0 {
+		return nil
+	}
+
+	// Collect FROM table refs.
+	var fromRefs []fromTableRef
+	for _, te := range stmt.From {
+		fromRefs = append(fromRefs, collectFromTableRefs(te)...)
+	}
+
+	// Build lookup set of valid OF-clause names.
+	// Rules (MySQL 8.0):
+	//  - If a table has an explicit AS alias, it can ONLY be referenced by that alias.
+	//  - If a table has no alias, it can be referenced by bare table name.
+	//  - A db-qualified reference (OF db.t) must match a FROM entry with the same db
+	//    and table name (alias not applicable for db-qualified references).
+	type refKey struct{ db, tbl string }
+	validByAlias := make(map[string]bool)  // "alias" (for bare OF names)
+	validByFull := make(map[refKey]bool)   // db+tbl (for db.tbl OF names)
+	for _, r := range fromRefs {
+		if !r.hasAlias {
+			validByAlias[strings.ToLower(r.tableName)] = true
+		}
+		// Always accept by alias (even aliased tables can be referenced by alias)
+		validByAlias[strings.ToLower(r.alias)] = true
+		// db-qualified references match only non-aliased tables
+		if !r.hasAlias {
+			validByFull[refKey{strings.ToLower(r.dbName), strings.ToLower(r.tableName)}] = true
+		}
+	}
+
+	// Validate each clause and check for duplicates.
+	// locked tracks which tables (by alias/name) have already been assigned a lock clause.
+	locked := make(map[string]bool) // lowercased alias/name -> locked
+
+	for _, lc := range clauses {
+		if lc.tableName == "*" {
+			// Wildcard clause — covers all FROM tables.
+			// If any table was already explicitly locked, error without backtick.
+			for _, r := range fromRefs {
+				key := strings.ToLower(r.alias)
+				if locked[key] {
+					// Duplicate: previous explicit OF clause then wildcard.
+					// MySQL produces no backtick in this case.
+					return mysqlError(3569, "HY000", fmt.Sprintf("Table %s appears in multiple locking clauses.", r.alias))
+				}
+				locked[key] = true
+			}
+			continue
+		}
+
+		// Explicit OF clause — validate the name.
+		if lc.dbName != "" {
+			// db-qualified reference
+			k := refKey{strings.ToLower(lc.dbName), strings.ToLower(lc.tableName)}
+			if !validByFull[k] {
+				return mysqlError(3537, "HY000", fmt.Sprintf("Unresolved table name `%s`.`%s` in locking clause.", lc.dbName, lc.tableName))
+			}
+			key := strings.ToLower(lc.tableName)
+			if locked[key] {
+				return mysqlError(3569, "HY000", fmt.Sprintf("Table `%s` appears in multiple locking clauses.", lc.tableName))
+			}
+			locked[key] = true
+		} else {
+			// Bare name — must match a FROM alias or unaliased table name.
+			key := strings.ToLower(lc.tableName)
+			if !validByAlias[key] {
+				return mysqlError(3537, "HY000", fmt.Sprintf("Unresolved table name `%s` in locking clause.", lc.tableName))
+			}
+			// Duplicate: explicit OF clause encounters a table already locked
+			// (whether by a previous explicit OF or a wildcard).
+			// MySQL uses backtick format when the duplicate comes from an explicit OF clause.
+			if locked[key] {
+				return mysqlError(3569, "HY000", fmt.Sprintf("Table `%s` appears in multiple locking clauses.", lc.tableName))
+			}
+			locked[key] = true
+		}
+	}
+	return nil
 }

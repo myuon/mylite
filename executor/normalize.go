@@ -934,8 +934,8 @@ func normalizeForShareOf(query string) string {
 	if !strings.Contains(uq, "FOR SHARE") && !strings.Contains(uq, "FOR UPDATE") {
 		return query
 	}
-	// Strip "OF table1[, table2...]" after FOR SHARE/FOR UPDATE
-	fsRe := regexp.MustCompile(`(?i)(FOR\s+(?:SHARE|UPDATE))\s+OF\s+[\w` + "`" + `]+(?:\s*,\s*[\w` + "`" + `]+)*`)
+	// Strip "OF table1[, table2...]" after FOR SHARE/FOR UPDATE (table may be db.table)
+	fsRe := regexp.MustCompile(`(?i)(FOR\s+(?:SHARE|UPDATE))\s+OF\s+[\w` + "`" + `.]+(?:\s*,\s*[\w` + "`" + `.]+)*`)
 	query = fsRe.ReplaceAllString(query, "${1}")
 	// Strip SKIP LOCKED / NOWAIT
 	fsRe2 := regexp.MustCompile(`(?i)(FOR\s+(?:SHARE|UPDATE))\s+(?:SKIP\s+LOCKED|NOWAIT)`)
@@ -960,7 +960,8 @@ func parseSelectLockClauses(query string) []selectLockClause {
 		return nil
 	}
 	// Match: FOR (SHARE|UPDATE) [OF table[,table...]] [SKIP LOCKED|NOWAIT]
-	re := regexp.MustCompile(`(?i)FOR\s+(SHARE|UPDATE)(?:\s+OF\s+([\w` + "`" + `]+(?:\s*,\s*[\w` + "`" + `]+)*))?(?:\s+(SKIP\s+LOCKED|NOWAIT))?`)
+	// table may be db.table or `db`.`table` etc.
+	re := regexp.MustCompile(`(?i)FOR\s+(SHARE|UPDATE)(?:\s+OF\s+([\w` + "`" + `.]+(?:\s*,\s*[\w` + "`" + `.]+)*))?(?:\s+(SKIP\s+LOCKED|NOWAIT))?`)
 	matches := re.FindAllStringSubmatch(query, -1)
 	if len(matches) == 0 {
 		return nil
@@ -998,10 +999,19 @@ func parseSelectLockClauses(query string) []selectLockClause {
 			tables := strings.Split(tablesStr, ",")
 			for _, t := range tables {
 				t = strings.TrimSpace(t)
-				t = strings.Trim(t, "`")
-				if t != "" {
+				// Parse optional db qualifier: db.table or `db`.`table`
+				dbPart := ""
+				tblPart := t
+				if dotIdx := strings.Index(t, "."); dotIdx >= 0 {
+					dbPart = strings.Trim(t[:dotIdx], "`")
+					tblPart = strings.Trim(t[dotIdx+1:], "`")
+				} else {
+					tblPart = strings.Trim(t, "`")
+				}
+				if tblPart != "" {
 					clauses = append(clauses, selectLockClause{
-						tableName:  t,
+						tableName:  tblPart,
+						dbName:     dbPart,
 						exclusive:  exclusive,
 						skipLocked: skipLocked,
 						nowait:     nowait,
