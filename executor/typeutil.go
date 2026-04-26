@@ -57,7 +57,7 @@ func isIntValLiteral(expr sqlparser.Expr) bool {
 // isHexNumLiteral returns true if the expression is a HexNum literal (0x...).
 func isHexNumLiteral(expr sqlparser.Expr) bool {
 	if lit, ok := expr.(*sqlparser.Literal); ok {
-		return lit.Type == sqlparser.HexNum
+		return lit.Type == sqlparser.HexNum || lit.Type == sqlparser.HexVal
 	}
 	return false
 }

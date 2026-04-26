@@ -5527,6 +5527,39 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				}
 			}
 		}
+		// When a hex literal (x'...' or 0x...) is used in a bit operation alongside a
+		// non-binary operand, MySQL treats the hex literal as an integer (big-endian), not
+		// as raw binary bytes. For example: integer_col | x'cafebabe' treats x'cafebabe'
+		// as the integer 0xcafebabe. This conversion only applies when the OTHER operand is
+		// NOT binary; if the other side is a BINARY/VARBINARY column, byte-wise ops apply.
+		if isBitOpRow && leftIsHexLit {
+			if hb, ok := left.(HexBytes); ok {
+				_, rightIsBin := toBinaryBytesForBitOp(right)
+				if !rightIsBin {
+					if decoded, err2 := hex.DecodeString(string(hb)); err2 == nil {
+						var val uint64
+						for _, b := range decoded {
+							val = val<<8 | uint64(b)
+						}
+						left = val
+					}
+				}
+			}
+		}
+		if isBitOpRow && rightIsHexLit {
+			if hb, ok := right.(HexBytes); ok {
+				_, leftIsBin := toBinaryBytesForBitOp(left)
+				if !leftIsBin {
+					if decoded, err2 := hex.DecodeString(string(hb)); err2 == nil {
+						var val uint64
+						for _, b := range decoded {
+							val = val<<8 | uint64(b)
+						}
+						right = val
+					}
+				}
+			}
+		}
 		// In TRADITIONAL/ERROR_FOR_DIVISION_BY_ZERO + strict mode during DML:
 		// division by zero raises error 1365. NULL divisor returns NULL (not an error).
 		if (v.Operator == sqlparser.DivOp || v.Operator == sqlparser.IntDivOp || v.Operator == sqlparser.ModOp) && e.insideDML && right != nil {
