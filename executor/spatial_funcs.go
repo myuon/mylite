@@ -1184,24 +1184,484 @@ func WktToWKB(wkt string) []byte {
 // Returns nil if parsing fails.
 func wktToWKB(wkt string) []byte {
 	wkt = strings.TrimSpace(wkt)
+	wkbBody := wktToWKBBody(wkt)
+	if wkbBody == nil {
+		return nil
+	}
+	// Prepend 4-byte SRID = 0 (big-endian)
+	buf := make([]byte, 4+len(wkbBody))
+	binary.BigEndian.PutUint32(buf[0:4], 0)
+	copy(buf[4:], wkbBody)
+	return buf
+}
+
+// wktToWKBBody converts a WKT geometry to pure WKB (ISO WKB, no SRID prefix).
+// This is used both for the top-level conversion and for sub-geometries in collections.
+// Returns nil if parsing fails.
+func wktToWKBBody(wkt string) []byte {
+	wkt = strings.TrimSpace(wkt)
 	upper := strings.ToUpper(wkt)
-	if strings.HasPrefix(upper, "POINT") {
-		coords := parseSpatialPointCoords(wkt)
-		if len(coords) < 2 {
-			return nil
-		}
-		buf := make([]byte, 4+1+4+8+8) // SRID + byteOrder + type + X + Y
-		// SRID = 0 (big-endian)
-		binary.BigEndian.PutUint32(buf[0:4], 0)
-		// Byte order = 1 (little-endian)
-		buf[4] = 1
-		// Geometry type = 1 (POINT), little-endian
-		binary.LittleEndian.PutUint32(buf[5:9], 1)
-		// X coordinate
-		binary.LittleEndian.PutUint64(buf[9:17], math.Float64bits(coords[0]))
-		// Y coordinate
-		binary.LittleEndian.PutUint64(buf[17:25], math.Float64bits(coords[1]))
-		return buf
+	switch {
+	case strings.HasPrefix(upper, "MULTIPOLYGON"):
+		return wktMultiPolygonToWKB(wkt)
+	case strings.HasPrefix(upper, "MULTILINESTRING"):
+		return wktMultiLineStringToWKB(wkt)
+	case strings.HasPrefix(upper, "MULTIPOINT"):
+		return wktMultiPointToWKB(wkt)
+	case strings.HasPrefix(upper, "GEOMETRYCOLLECTION"), strings.HasPrefix(upper, "GEOMCOLLECTION"):
+		return wktGeomCollToWKB(wkt)
+	case strings.HasPrefix(upper, "POLYGON"):
+		return wktPolygonToWKB(wkt)
+	case strings.HasPrefix(upper, "LINESTRING"):
+		return wktLineStringToWKB(wkt)
+	case strings.HasPrefix(upper, "POINT"):
+		return wktPointToWKB(wkt)
 	}
 	return nil
+}
+
+// wktPointToWKB encodes a WKT POINT to WKB bytes (no SRID).
+func wktPointToWKB(wkt string) []byte {
+	coords := parseSpatialPointCoords(wkt)
+	if len(coords) < 2 {
+		return nil
+	}
+	buf := make([]byte, 1+4+8+8) // byteOrder + type + X + Y
+	buf[0] = 1                   // little-endian
+	binary.LittleEndian.PutUint32(buf[1:5], 1) // type = POINT
+	binary.LittleEndian.PutUint64(buf[5:13], math.Float64bits(coords[0]))
+	binary.LittleEndian.PutUint64(buf[13:21], math.Float64bits(coords[1]))
+	return buf
+}
+
+// wktLineStringToWKB encodes a WKT LINESTRING to WKB bytes (no SRID).
+func wktLineStringToWKB(wkt string) []byte {
+	pts := parseLineStringPoints(wkt)
+	if pts == nil {
+		return nil
+	}
+	n := len(pts)
+	buf := make([]byte, 1+4+4+n*16)
+	buf[0] = 1
+	binary.LittleEndian.PutUint32(buf[1:5], 2) // type = LINESTRING
+	binary.LittleEndian.PutUint32(buf[5:9], uint32(n))
+	for i, p := range pts {
+		off := 9 + i*16
+		binary.LittleEndian.PutUint64(buf[off:off+8], math.Float64bits(p[0]))
+		binary.LittleEndian.PutUint64(buf[off+8:off+16], math.Float64bits(p[1]))
+	}
+	return buf
+}
+
+// wktPolygonToWKB encodes a WKT POLYGON to WKB bytes (no SRID).
+func wktPolygonToWKB(wkt string) []byte {
+	rings := parsePolygonRings(wkt)
+	if rings == nil {
+		return nil
+	}
+	// Calculate total size
+	size := 1 + 4 + 4 // byteOrder + type + numRings
+	for _, ring := range rings {
+		size += 4 + len(ring)*16 // numPoints + points
+	}
+	buf := make([]byte, size)
+	buf[0] = 1
+	binary.LittleEndian.PutUint32(buf[1:5], 3) // type = POLYGON
+	binary.LittleEndian.PutUint32(buf[5:9], uint32(len(rings)))
+	off := 9
+	for _, ring := range rings {
+		binary.LittleEndian.PutUint32(buf[off:off+4], uint32(len(ring)))
+		off += 4
+		for _, p := range ring {
+			binary.LittleEndian.PutUint64(buf[off:off+8], math.Float64bits(p[0]))
+			binary.LittleEndian.PutUint64(buf[off+8:off+16], math.Float64bits(p[1]))
+			off += 16
+		}
+	}
+	return buf
+}
+
+// wktMultiPointToWKB encodes a WKT MULTIPOINT to WKB bytes (no SRID).
+func wktMultiPointToWKB(wkt string) []byte {
+	// Parse points from MULTIPOINT
+	upper := strings.TrimSpace(strings.ToUpper(wkt))
+	_ = upper
+	idx := strings.Index(wkt, "(")
+	end := strings.LastIndex(wkt, ")")
+	if idx < 0 || end <= idx {
+		return nil
+	}
+	inner := strings.TrimSpace(wkt[idx+1 : end])
+
+	// Parse comma-separated points (possibly wrapped in parens)
+	var points [][]float64
+	depth := 0
+	start := 0
+	for i, ch := range inner {
+		switch ch {
+		case '(':
+			if depth == 0 {
+				start = i + 1
+			}
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				// Extract point inside parens
+				ptStr := strings.TrimSpace(inner[start:i])
+				fields := strings.Fields(ptStr)
+				if len(fields) >= 2 {
+					x, _ := strconv.ParseFloat(fields[0], 64)
+					y, _ := strconv.ParseFloat(fields[1], 64)
+					points = append(points, []float64{x, y})
+				}
+			}
+		}
+	}
+	// If no nested parens, parse as flat coordinate list
+	if len(points) == 0 {
+		for _, part := range strings.Split(inner, ",") {
+			fields := strings.Fields(strings.TrimSpace(part))
+			if len(fields) >= 2 {
+				x, _ := strconv.ParseFloat(fields[0], 64)
+				y, _ := strconv.ParseFloat(fields[1], 64)
+				points = append(points, []float64{x, y})
+			}
+		}
+	}
+
+	n := len(points)
+	// Each sub-geometry is a WKB POINT: 1+4+8+8 = 21 bytes
+	buf := make([]byte, 1+4+4+n*21)
+	buf[0] = 1
+	binary.LittleEndian.PutUint32(buf[1:5], 4) // type = MULTIPOINT
+	binary.LittleEndian.PutUint32(buf[5:9], uint32(n))
+	off := 9
+	for _, p := range points {
+		buf[off] = 1 // byte order
+		binary.LittleEndian.PutUint32(buf[off+1:off+5], 1) // POINT
+		binary.LittleEndian.PutUint64(buf[off+5:off+13], math.Float64bits(p[0]))
+		binary.LittleEndian.PutUint64(buf[off+13:off+21], math.Float64bits(p[1]))
+		off += 21
+	}
+	return buf
+}
+
+// wktMultiLineStringToWKB encodes a WKT MULTILINESTRING to WKB bytes (no SRID).
+func wktMultiLineStringToWKB(wkt string) []byte {
+	linestrings := parseMultiSubGeometries(wkt, "LINESTRING")
+	if linestrings == nil {
+		return nil
+	}
+	var subWKBs [][]byte
+	for _, ls := range linestrings {
+		sub := wktLineStringToWKB(ls)
+		if sub == nil {
+			return nil
+		}
+		subWKBs = append(subWKBs, sub)
+	}
+	return buildMultiWKB(5, subWKBs) // type = MULTILINESTRING
+}
+
+// wktMultiPolygonToWKB encodes a WKT MULTIPOLYGON to WKB bytes (no SRID).
+func wktMultiPolygonToWKB(wkt string) []byte {
+	polygons := parseMultiPolygonSubs(wkt)
+	if polygons == nil {
+		return nil
+	}
+	var subWKBs [][]byte
+	for _, poly := range polygons {
+		sub := wktPolygonToWKB(poly)
+		if sub == nil {
+			return nil
+		}
+		subWKBs = append(subWKBs, sub)
+	}
+	return buildMultiWKB(6, subWKBs) // type = MULTIPOLYGON
+}
+
+// wktGeomCollToWKB encodes a WKT GEOMETRYCOLLECTION to WKB bytes (no SRID).
+func wktGeomCollToWKB(wkt string) []byte {
+	geoms := parseGeomCollection(wkt)
+	var subWKBs [][]byte
+	for _, g := range geoms {
+		sub := wktToWKBBody(g)
+		if sub == nil {
+			return nil
+		}
+		subWKBs = append(subWKBs, sub)
+	}
+	return buildMultiWKB(7, subWKBs) // type = GEOMETRYCOLLECTION
+}
+
+// buildMultiWKB builds a WKB multi-geometry from sub-geometry WKB bodies.
+// typeCode is the WKB type for the multi-geometry.
+func buildMultiWKB(typeCode uint32, subWKBs [][]byte) []byte {
+	totalSize := 1 + 4 + 4 // byteOrder + type + numGeometries
+	for _, sub := range subWKBs {
+		totalSize += len(sub)
+	}
+	buf := make([]byte, totalSize)
+	buf[0] = 1
+	binary.LittleEndian.PutUint32(buf[1:5], typeCode)
+	binary.LittleEndian.PutUint32(buf[5:9], uint32(len(subWKBs)))
+	off := 9
+	for _, sub := range subWKBs {
+		copy(buf[off:], sub)
+		off += len(sub)
+	}
+	return buf
+}
+
+// parseMultiSubGeometries parses sub-geometries from MULTILINESTRING WKT.
+// Returns strings like "LINESTRING(0 1,2 3)" for each sub-geometry.
+func parseMultiSubGeometries(wkt string, prefix string) []string {
+	idx := strings.Index(wkt, "(")
+	end := strings.LastIndex(wkt, ")")
+	if idx < 0 || end <= idx {
+		return nil
+	}
+	inner := strings.TrimSpace(wkt[idx+1 : end])
+	// Split at depth 0 commas, each part is a ring "(...)"
+	var result []string
+	depth := 0
+	start := 0
+	for i, ch := range inner {
+		switch ch {
+		case '(':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				ring := strings.TrimSpace(inner[start : i+1])
+				result = append(result, prefix+ring)
+			}
+		}
+	}
+	return result
+}
+
+// parseMultiPolygonSubs parses sub-polygons from MULTIPOLYGON WKT.
+// Returns strings like "POLYGON((0 1,2 3,...))" for each sub-geometry.
+func parseMultiPolygonSubs(wkt string) []string {
+	idx := strings.Index(wkt, "(")
+	end := strings.LastIndex(wkt, ")")
+	if idx < 0 || end <= idx {
+		return nil
+	}
+	inner := strings.TrimSpace(wkt[idx+1 : end])
+	// Each sub-polygon starts with "(("
+	var result []string
+	depth := 0
+	start := -1
+	for i, ch := range inner {
+		switch ch {
+		case '(':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && start >= 0 {
+				poly := strings.TrimSpace(inner[start : i+1])
+				result = append(result, "POLYGON"+poly)
+				start = -1
+			}
+		}
+	}
+	return result
+}
+
+// wkbToWKT converts WKB bytes to a WKT string.
+// Input may optionally have a 4-byte SRID prefix (MySQL internal format).
+// Returns "" if parsing fails.
+func wkbToWKT(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	// Try to detect if there's a 4-byte SRID prefix.
+	// MySQL internal format: 4-byte SRID (big-endian) + WKB
+	// Pure WKB: starts with 0x00 or 0x01 (byte order marker)
+	// If first byte is 0x00 or 0x01, it's pure WKB.
+	// If first byte is not 0x00/0x01 but byte at offset 4 is 0x00/0x01, it has SRID prefix.
+	offset := 0
+	if len(data) >= 5 && data[0] != 0x00 && data[0] != 0x01 {
+		// Likely has 4-byte SRID prefix
+		if data[4] == 0x00 || data[4] == 0x01 {
+			offset = 4
+		}
+	}
+	wkt, _ := parseWKB(data, &offset)
+	return wkt
+}
+
+// parseWKB parses WKB at data[*offset] and advances offset.
+// Returns the WKT string and true if successful.
+func parseWKB(data []byte, offset *int) (string, bool) {
+	if *offset+5 > len(data) {
+		return "", false
+	}
+	byteOrder := data[*offset]
+	*offset++
+	if byteOrder != 0 && byteOrder != 1 {
+		return "", false
+	}
+	littleEndian := byteOrder == 1
+
+	geomType := readUint32(data, offset, littleEndian)
+
+	switch geomType {
+	case 1: // POINT
+		return parseWKBPoint(data, offset, littleEndian)
+	case 2: // LINESTRING
+		return parseWKBLineString(data, offset, littleEndian)
+	case 3: // POLYGON
+		return parseWKBPolygon(data, offset, littleEndian)
+	case 4: // MULTIPOINT
+		return parseWKBMulti(data, offset, littleEndian, "MULTIPOINT", true)
+	case 5: // MULTILINESTRING
+		return parseWKBMulti(data, offset, littleEndian, "MULTILINESTRING", false)
+	case 6: // MULTIPOLYGON
+		return parseWKBMulti(data, offset, littleEndian, "MULTIPOLYGON", false)
+	case 7: // GEOMETRYCOLLECTION
+		return parseWKBGeomColl(data, offset, littleEndian)
+	}
+	return "", false
+}
+
+func readUint32(data []byte, offset *int, littleEndian bool) uint32 {
+	if *offset+4 > len(data) {
+		return 0
+	}
+	var v uint32
+	if littleEndian {
+		v = binary.LittleEndian.Uint32(data[*offset : *offset+4])
+	} else {
+		v = binary.BigEndian.Uint32(data[*offset : *offset+4])
+	}
+	*offset += 4
+	return v
+}
+
+func readFloat64(data []byte, offset *int, littleEndian bool) float64 {
+	if *offset+8 > len(data) {
+		return 0
+	}
+	var bits uint64
+	if littleEndian {
+		bits = binary.LittleEndian.Uint64(data[*offset : *offset+8])
+	} else {
+		bits = binary.BigEndian.Uint64(data[*offset : *offset+8])
+	}
+	*offset += 8
+	return math.Float64frombits(bits)
+}
+
+func parseWKBPoint(data []byte, offset *int, littleEndian bool) (string, bool) {
+	if *offset+16 > len(data) {
+		return "", false
+	}
+	x := readFloat64(data, offset, littleEndian)
+	y := readFloat64(data, offset, littleEndian)
+	return fmt.Sprintf("POINT(%s %s)", formatSpatialFloat(x), formatSpatialFloat(y)), true
+}
+
+func parseWKBLineString(data []byte, offset *int, littleEndian bool) (string, bool) {
+	n := readUint32(data, offset, littleEndian)
+	if *offset+int(n)*16 > len(data) {
+		return "", false
+	}
+	var parts []string
+	for i := uint32(0); i < n; i++ {
+		x := readFloat64(data, offset, littleEndian)
+		y := readFloat64(data, offset, littleEndian)
+		parts = append(parts, fmt.Sprintf("%s %s", formatSpatialFloat(x), formatSpatialFloat(y)))
+	}
+	return fmt.Sprintf("LINESTRING(%s)", strings.Join(parts, ",")), true
+}
+
+func parseWKBPolygon(data []byte, offset *int, littleEndian bool) (string, bool) {
+	numRings := readUint32(data, offset, littleEndian)
+	var rings []string
+	for r := uint32(0); r < numRings; r++ {
+		n := readUint32(data, offset, littleEndian)
+		if *offset+int(n)*16 > len(data) {
+			return "", false
+		}
+		var pts []string
+		for i := uint32(0); i < n; i++ {
+			x := readFloat64(data, offset, littleEndian)
+			y := readFloat64(data, offset, littleEndian)
+			pts = append(pts, fmt.Sprintf("%s %s", formatSpatialFloat(x), formatSpatialFloat(y)))
+		}
+		rings = append(rings, "("+strings.Join(pts, ",")+")")
+	}
+	return fmt.Sprintf("POLYGON(%s)", strings.Join(rings, ",")), true
+}
+
+// parseWKBMulti parses WKB for MULTIPOINT, MULTILINESTRING, MULTIPOLYGON.
+// wrapSubsInParens controls whether sub-geometry WKTs get wrapped in extra parens
+// (needed for MULTIPOINT display: MULTIPOINT((0 1),(2 3))).
+func parseWKBMulti(data []byte, offset *int, littleEndian bool, typeName string, wrapSubsInParens bool) (string, bool) {
+	n := readUint32(data, offset, littleEndian)
+	var parts []string
+	for i := uint32(0); i < n; i++ {
+		// Each sub-geometry has its own WKB header
+		wkt, ok := parseWKB(data, offset)
+		if !ok {
+			return "", false
+		}
+		if wrapSubsInParens {
+			// For MULTIPOINT, extract coords from POINT(x y) and wrap as (x y)
+			coords := parseSpatialPointCoords(wkt)
+			if coords != nil {
+				parts = append(parts, fmt.Sprintf("(%s %s)", formatSpatialFloat(coords[0]), formatSpatialFloat(coords[1])))
+			} else {
+				parts = append(parts, wkt)
+			}
+		} else {
+			// For MULTILINESTRING/MULTIPOLYGON, strip the type prefix and keep the coords
+			switch typeName {
+			case "MULTILINESTRING":
+				// wkt is "LINESTRING(0 1,2 3,...)" → extract "0 1,2 3,..."
+				parts = append(parts, extractInnerCoords(wkt))
+			case "MULTIPOLYGON":
+				// wkt is "POLYGON((0 0,...),...)" → extract "((0 0,...),...)"
+				parts = append(parts, extractInnerCoords(wkt))
+			default:
+				parts = append(parts, wkt)
+			}
+		}
+	}
+	return fmt.Sprintf("%s(%s)", typeName, strings.Join(parts, ",")), true
+}
+
+// parseWKBGeomColl parses WKB for GEOMETRYCOLLECTION.
+func parseWKBGeomColl(data []byte, offset *int, littleEndian bool) (string, bool) {
+	n := readUint32(data, offset, littleEndian)
+	var parts []string
+	for i := uint32(0); i < n; i++ {
+		wkt, ok := parseWKB(data, offset)
+		if !ok {
+			return "", false
+		}
+		parts = append(parts, wkt)
+	}
+	return fmt.Sprintf("GEOMETRYCOLLECTION(%s)", strings.Join(parts, ",")), true
+}
+
+// extractInnerCoords strips the type name from a WKT string and returns the coordinate part.
+// E.g. "LINESTRING(0 1,2 3)" → "(0 1,2 3)"
+// E.g. "POLYGON((0 0,10 10))" → "((0 0,10 10))"
+func extractInnerCoords(wkt string) string {
+	idx := strings.Index(wkt, "(")
+	if idx < 0 {
+		return wkt
+	}
+	return wkt[idx:]
 }

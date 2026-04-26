@@ -3944,7 +3944,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 		return normalizeWKT(toString(val)), nil
 	case *sqlparser.GeomFormatExpr:
-		// ST_AsText/ST_AsWKT/ST_AsBinary/ST_AsWKB
+		// ST_AsText/ST_AsWKT returns WKT string; ST_AsBinary/ST_AsWKB returns WKB []byte
 		val, err := e.evalExpr(v.Geom)
 		if err != nil {
 			return nil, err
@@ -3952,9 +3952,31 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		if val == nil {
 			return nil, nil
 		}
+		if v.FormatType == sqlparser.BinaryFormat {
+			// Return WKB binary representation
+			wkt := toString(val)
+			wkb := wktToWKBBody(wkt)
+			if wkb != nil {
+				return wkb, nil
+			}
+			// Fallback: if val is already []byte (WKB), pass through
+			if b, ok := val.([]byte); ok {
+				return b, nil
+			}
+			return nil, nil
+		}
+		// TextFormat: ensure WKT string is returned
+		// If val is []byte (WKB), convert back to WKT
+		if b, ok := val.([]byte); ok {
+			wkt := wkbToWKT(b)
+			if wkt == "" {
+				return nil, nil
+			}
+			return wkt, nil
+		}
 		return toString(val), nil
 	case *sqlparser.GeomFromWKBExpr:
-		// ST_GeomFromWKB, ST_PointFromWKB, etc. — treat WKB as passthrough
+		// ST_GeomFromWKB, ST_PointFromWKB, etc. — parse WKB and return WKT string
 		val, err := e.evalExpr(v.WkbBlob)
 		if err != nil {
 			return nil, err
@@ -3962,6 +3984,15 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		if val == nil {
 			return nil, nil
 		}
+		// If val is []byte (WKB), decode it to WKT
+		if b, ok := val.([]byte); ok {
+			wkt := wkbToWKT(b)
+			if wkt == "" {
+				return nil, nil
+			}
+			return wkt, nil
+		}
+		// If val is a string (possibly WKT), return as-is
 		return toString(val), nil
 	case *sqlparser.PointPropertyFuncExpr:
 		// ST_X, ST_Y, ST_Latitude, ST_Longitude
