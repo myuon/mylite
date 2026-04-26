@@ -510,6 +510,71 @@ func (gs *GrantStore) ScanRoleEdges() []storage.Row {
 	return rows
 }
 
+// UserHostEntry represents a known user@host pair.
+type UserHostEntry struct {
+	User string
+	Host string
+}
+
+// ListAllUserHosts returns all known user@host pairs in the grant store,
+// including users registered via CREATE USER and users with grant entries.
+// Roles (stored in gs.roles) are excluded.
+func (gs *GrantStore) ListAllUserHosts() []UserHostEntry {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	seen := make(map[string]bool)
+	var result []UserHostEntry
+
+	// Include all knownUserHosts (registered via CREATE USER)
+	for key := range gs.knownUserHosts {
+		// Skip roles
+		if _, isRole := gs.roles[key]; isRole {
+			continue
+		}
+		seen[key] = true
+	}
+	// Include all users with grant entries
+	for key := range gs.entries {
+		if _, isRole := gs.roles[key]; isRole {
+			continue
+		}
+		seen[key] = true
+	}
+
+	keys := make([]string, 0, len(seen))
+	for k := range seen {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		atIdx := strings.LastIndex(key, "@")
+		if atIdx < 0 {
+			continue
+		}
+		result = append(result, UserHostEntry{
+			User: key[:atIdx],
+			Host: key[atIdx+1:],
+		})
+	}
+	return result
+}
+
+// GetGrantsByType returns all GrantEntry records for user@host filtered by GrantType.
+func (gs *GrantStore) GetGrantsByType(user, host string, gtype GrantType) []GrantEntry {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	key := userKey(user, host)
+	var result []GrantEntry
+	for _, e := range gs.entries[key] {
+		if e.Type == gtype {
+			result = append(result, e)
+		}
+	}
+	return result
+}
+
 // HasPrivilege checks if a user (with active roles) has a specific privilege on db.table.
 // priv is like "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", etc.
 // db and table are the target (empty table means DB-level check, both empty means global check).
