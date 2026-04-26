@@ -302,6 +302,7 @@ func (e *Executor) execCreateDatabase(stmt *sqlparser.CreateDatabase) (*Result, 
 	// Extract charset and collation from CREATE DATABASE options
 	charset := ""
 	collation := ""
+	explicitCharset := false
 	for _, opt := range stmt.CreateOptions {
 		switch opt.Type {
 		case sqlparser.CharacterSetType:
@@ -310,6 +311,7 @@ func (e *Executor) execCreateDatabase(stmt *sqlparser.CreateDatabase) (*Result, 
 				return nil, mysqlError(1302, "HY000", fmt.Sprintf("Conflicting declarations: 'CHARACTER SET %s' and 'CHARACTER SET %s'", charset, newCS))
 			}
 			charset = newCS
+			explicitCharset = true
 		case sqlparser.CollateType:
 			collation = strings.ToLower(strings.Trim(opt.Value, "'\""))
 		}
@@ -321,10 +323,18 @@ func (e *Executor) execCreateDatabase(stmt *sqlparser.CreateDatabase) (*Result, 
 		}
 		// Fall through to catalog default (utf8mb4) if session value not set
 	}
-	// If no explicit collation, use the session-level collation_server.
+	// If no explicit collation:
+	// - When charset was explicitly set: use that charset's default collation (to avoid
+	//   mismatching collation_server with a different charset, e.g. gb18030 + utf8mb4_0900_ai_ci).
+	// - When charset came from character_set_server: use collation_server (preserving server defaults).
 	if collation == "" {
-		if collVal, ok := e.getSysVarSession("collation_server"); ok && collVal != "" {
-			collation = strings.ToLower(collVal)
+		if explicitCharset && charset != "" {
+			collation = catalog.DefaultCollationForCharset(charset)
+		}
+		if collation == "" {
+			if collVal, ok := e.getSysVarSession("collation_server"); ok && collVal != "" {
+				collation = strings.ToLower(collVal)
+			}
 		}
 	}
 	// Validate charset name
