@@ -159,7 +159,8 @@ func formatOverflowWarningMsg(oe *intOverflowError) string {
 // selectLockClause describes a per-table locking clause parsed from
 // "FOR SHARE OF t1 SKIP LOCKED" or "FOR UPDATE OF t2 NOWAIT".
 type selectLockClause struct {
-	tableName  string // the table this clause applies to
+	tableName  string // the table/alias this clause applies to ("*" = all tables)
+	dbName     string // optional db qualifier (e.g. "db1" from "FOR SHARE OF db1.t1")
 	exclusive  bool   // true = FOR UPDATE, false = FOR SHARE
 	skipLocked bool
 	nowait     bool
