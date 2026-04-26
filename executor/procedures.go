@@ -27,14 +27,70 @@ func (e *Executor) execCreateTrigger(query string) (*Result, error) {
 	// Remove "CREATE TRIGGER " prefix
 	rest := strings.TrimSpace(query[len("CREATE TRIGGER "):])
 
+	// Helper to return a MySQL-style syntax error.
+	// lineNum: pass 0 to auto-detect from query newlines.
+	syntaxError := func(near string, lineNum int) error {
+		if near == "" {
+			near = rest
+		}
+		// Truncate at newline to avoid multi-line near text
+		if nl := strings.IndexAny(near, "\n\r"); nl >= 0 {
+			near = near[:nl]
+		}
+		near = strings.TrimSpace(near)
+		// Truncate to a reasonable length
+		if len(near) > 80 {
+			near = near[:80]
+		}
+		if lineNum <= 0 {
+			lineNum = 1 + strings.Count(query, "\n")
+		}
+		return mysqlError(1064, "42000", fmt.Sprintf(
+			"You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line %d",
+			near, lineNum))
+	}
+
 	// Extract trigger name
 	parts := strings.Fields(rest)
 	if len(parts) < 6 {
-		return nil, fmt.Errorf("invalid CREATE TRIGGER syntax")
+		return nil, syntaxError(rest, 1)
 	}
-	triggerName := parts[0]
+	rawName := parts[0]
+	// If name is backtick-quoted, strip the backticks
+	isQuoted := len(rawName) >= 2 && rawName[0] == '`' && rawName[len(rawName)-1] == '`'
+	triggerName := strings.Trim(rawName, "`")
+
+	// Validate trigger name: must be a valid MySQL identifier (unquoted names).
+	// If not backtick-quoted, must match [a-zA-Z_$][a-zA-Z0-9_$]* pattern.
+	if !isQuoted {
+		validNameRe := regexp.MustCompile(`^[a-zA-Z_$][a-zA-Z0-9_$]*$`)
+		if !validNameRe.MatchString(triggerName) {
+			return nil, syntaxError(triggerName+" "+strings.Join(parts[1:], " "), 1)
+		}
+		// Reserved words cannot be trigger names (without quoting)
+		reservedForTrigger := map[string]bool{
+			"trigger": true, "select": true, "insert": true, "update": true, "delete": true,
+			"create": true, "drop": true, "table": true, "view": true, "index": true,
+			"procedure": true, "function": true, "database": true, "schema": true,
+		}
+		if reservedForTrigger[strings.ToLower(triggerName)] {
+			return nil, syntaxError(triggerName+" "+strings.Join(parts[1:], " "), 1)
+		}
+	}
+
+	// Validate trigger name length (MySQL identifier max = 64 chars)
+	if len(triggerName) > 64 {
+		return nil, mysqlError(1059, "42000", fmt.Sprintf("Identifier name '%s' is too long", triggerName))
+	}
 	timing := strings.ToUpper(parts[1]) // BEFORE or AFTER
 	event := strings.ToUpper(parts[2])  // INSERT, UPDATE, or DELETE
+
+	// Validate timing and event
+	validTiming := timing == "BEFORE" || timing == "AFTER"
+	validEvent := event == "INSERT" || event == "UPDATE" || event == "DELETE"
+	if !validTiming || !validEvent {
+		return nil, syntaxError(parts[1], 1)
+	}
 
 	// Find "ON" keyword
 	onIdx := -1
@@ -45,29 +101,53 @@ func (e *Executor) execCreateTrigger(query string) (*Result, error) {
 		}
 	}
 	if onIdx < 0 {
-		return nil, fmt.Errorf("invalid CREATE TRIGGER syntax: missing ON")
+		return nil, syntaxError(rest, 1)
 	}
-	tableName := parts[onIdx+1]
-	tableName = strings.Trim(tableName, "`")
+	rawTableName := strings.Trim(parts[onIdx+1], "`")
+	trigDB := e.CurrentDB
 
-	// Check if table references performance_schema — deny CREATE TRIGGER on PS tables
-	if strings.Contains(tableName, ".") {
-		dbTbl := strings.SplitN(tableName, ".", 2)
-		trigDB := strings.Trim(dbTbl[0], "`")
-		if strings.EqualFold(trigDB, "performance_schema") {
+	// Handle qualified table names (e.g. test.t1)
+	if strings.Contains(rawTableName, ".") {
+		dbTbl := strings.SplitN(rawTableName, ".", 2)
+		qualDB := strings.Trim(dbTbl[0], "`")
+		qualTbl := strings.Trim(dbTbl[1], "`")
+		// Check if table references performance_schema — deny CREATE TRIGGER on PS tables
+		if strings.EqualFold(qualDB, "performance_schema") {
 			return nil, mysqlError(1044, "42000", fmt.Sprintf("Access denied for user 'root'@'localhost' to database 'performance_schema'"))
 		}
+		// Trigger must be created in the same database as the table
+		if !strings.EqualFold(qualDB, e.CurrentDB) {
+			return nil, mysqlError(1435, "HY000", fmt.Sprintf("Trigger in wrong schema"))
+		}
+		trigDB = qualDB
+		rawTableName = qualTbl
 	}
+	tableName := rawTableName
+	_ = trigDB // used for the db to store the trigger
 
-	// Extract body: everything after "FOR EACH ROW"
+	// Extract body: everything after "FOR EACH ROW".
+	// "FOR EACH ROW" must appear AFTER the "ON table_name" position.
 	// Use a regex to handle variable whitespace (e.g. "FOR  EACH ROW" with two spaces).
 	_ = upper // already have it
 	forEachRe := regexp.MustCompile(`(?i)FOR\s+EACH\s+ROW`)
-	forEachLoc := forEachRe.FindStringIndex(query)
-	if forEachLoc == nil {
-		return nil, fmt.Errorf("invalid CREATE TRIGGER syntax: missing FOR EACH ROW")
+
+	// Find the position of "ON tableName" in the original query
+	onTableRe := regexp.MustCompile(`(?i)\bON\s+\S+`)
+	onTableLoc := onTableRe.FindStringIndex(query)
+	onTableEnd := 0
+	if onTableLoc != nil {
+		onTableEnd = onTableLoc[1]
 	}
-	body := strings.TrimSpace(query[forEachLoc[1]:])
+
+	// Find "FOR EACH ROW" that appears AFTER "ON tableName"
+	queryAfterOn := query[onTableEnd:]
+	forEachLoc := forEachRe.FindStringIndex(queryAfterOn)
+	if forEachLoc == nil {
+		return nil, syntaxError(rest, 0)
+	}
+	// Adjust to absolute position in original query
+	forEachAbsEnd := onTableEnd + forEachLoc[1]
+	body := strings.TrimSpace(query[forEachAbsEnd:])
 
 	// Strip optional FOLLOWS <trigger_name> or PRECEDES <trigger_name> clause.
 	// These are ordering hints; we ignore the ordering and just store the body.
@@ -100,6 +180,18 @@ func (e *Executor) execCreateTrigger(query string) (*Result, error) {
 		// Single statement trigger
 		body = strings.TrimRight(body, ";")
 		bodyStatements = []string{strings.TrimSpace(body)}
+	}
+
+	// Validate: trigger body must not be empty
+	hasBody := false
+	for _, stmt := range bodyStatements {
+		if strings.TrimSpace(stmt) != "" {
+			hasBody = true
+			break
+		}
+	}
+	if !hasBody {
+		return nil, syntaxError(rest, 1)
 	}
 
 	// Validate: AFTER triggers cannot modify NEW row
@@ -395,9 +487,17 @@ func (e *Executor) fireTriggers(tableName, timing, event string, newRow, oldRow 
 		e.functionOrTriggerDepth++
 		for _, stmtStr := range tr.Body {
 			stmtUpper := strings.ToUpper(strings.TrimSpace(stmtStr))
-			// Handle SET NEW.col = value in BEFORE triggers
-			if strings.HasPrefix(stmtUpper, "SET NEW.") && timing == "BEFORE" && newRow != nil {
-				e.handleSetNew(stmtStr, newRow, oldRow)
+			// Handle SET statements in BEFORE triggers that contain NEW.col assignments.
+			// This includes both simple "SET NEW.col = val" and compound statements like
+			// "SET @var = val, NEW.col = @var". We handle these specially to avoid
+			// resolveNewOldRefs substituting NEW.col values in assignment targets.
+			if strings.HasPrefix(stmtUpper, "SET ") && timing == "BEFORE" && newRow != nil &&
+				containsNewColAssignment(stmtUpper) {
+				if err := e.handleSetWithNew(stmtStr, newRow, oldRow); err != nil {
+					e.routineDepth--
+					e.functionOrTriggerDepth--
+					return err
+				}
 				continue
 			}
 			// Substitute NEW.col and OLD.col references
@@ -463,6 +563,72 @@ func (e *Executor) fireTriggerWithRoutineInterpreter(tr *catalog.TriggerDef, tim
 		}
 	}
 
+	return nil
+}
+
+// containsNewColAssignment checks if a SET statement (already uppercased) contains
+// a NEW.col assignment like "SET NEW.col = val" or "SET @v = x, NEW.col = y".
+func containsNewColAssignment(stmtUpper string) bool {
+	// Look for "NEW." followed by an identifier, occurring as an assignment target.
+	// It must be at the start (after SET) or after a comma.
+	rest := strings.TrimSpace(stmtUpper[4:]) // strip "SET "
+	// Scan comma-delimited assignments
+	parts := splitSetAssignments(rest)
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "NEW.") {
+			return true
+		}
+	}
+	return false
+}
+
+// handleSetWithNew processes a SET statement in a BEFORE trigger that contains
+// one or more NEW.col assignments (possibly mixed with @var assignments).
+// Non-NEW assignments are executed immediately (so @var values are up-to-date
+// when later NEW.col = @var assignments are evaluated).
+func (e *Executor) handleSetWithNew(stmtStr string, newRow, oldRow storage.Row) error {
+	rest := strings.TrimSpace(stmtStr)
+	// Strip "SET " prefix (case-insensitive)
+	if len(rest) < 4 || !strings.EqualFold(rest[:4], "set ") {
+		return nil
+	}
+	rest = strings.TrimSpace(rest[4:])
+	rest = strings.TrimRight(rest, ";")
+
+	parts := splitSetAssignments(rest)
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		partUpper := strings.ToUpper(part)
+		if strings.HasPrefix(partUpper, "NEW.") {
+			// Parse: NEW.col = expr
+			eqIdx := strings.Index(part, "=")
+			if eqIdx < 0 {
+				continue
+			}
+			colRef := strings.TrimSpace(part[:eqIdx])
+			valExpr := strings.TrimSpace(part[eqIdx+1:])
+			// colRef is "NEW.colname"
+			colName := colRef[4:] // strip "NEW."
+			// Resolve OLD/NEW references in the value expression
+			resolved := e.resolveNewOldRefs(valExpr, newRow, oldRow)
+			// Evaluate the value expression (can reference @vars set in earlier assignments)
+			val, err := e.evaluateSimpleExpr(resolved)
+			if err != nil {
+				return err
+			}
+			newRow[colName] = val
+		} else {
+			// Regular assignment (e.g. @var = expr): execute as SQL
+			_, err := e.Execute("SET " + part)
+			if err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 

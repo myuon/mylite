@@ -512,6 +512,14 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 
 	newRows := make([]storage.Row, 0)
 	var affected uint64
+	// afterDeleteRows collects rows that need AFTER DELETE trigger firing.
+	// We fire AFTER DELETE triggers after the row has been physically removed from tbl.Rows,
+	// so that trigger queries (e.g. SELECT COUNT(*)) see the post-deletion state.
+	type afterDeleteEntry struct {
+		row storage.Row
+	}
+	var afterDeleteRows []afterDeleteEntry
+
 	for _, row := range tbl.Rows {
 		match := true
 		if stmt.Where != nil {
@@ -554,14 +562,8 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 			tbl.Lock()
 
 			affected++
-
-			// Fire AFTER DELETE triggers
-			tbl.Unlock()
-			if err := e.fireTriggers(tableName, "AFTER", "DELETE", nil, row); err != nil {
-				tbl.Lock()
-				return nil, err
-			}
-			tbl.Lock()
+			// Collect row for AFTER DELETE trigger (fired after tbl.Rows is updated)
+			afterDeleteRows = append(afterDeleteRows, afterDeleteEntry{row: row})
 		} else {
 			newRows = append(newRows, row)
 		}
@@ -572,6 +574,17 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		tbl.HeapInsertFront = true
 	}
 	tbl.InvalidateIndexes()
+
+	// Fire AFTER DELETE triggers now that tbl.Rows reflects the post-deletion state.
+	// This ensures trigger queries (e.g. SELECT COUNT(*)) see the correct row counts.
+	for _, entry := range afterDeleteRows {
+		tbl.Unlock()
+		if err := e.fireTriggers(tableName, "AFTER", "DELETE", nil, entry.row); err != nil {
+			tbl.Lock()
+			return nil, err
+		}
+		tbl.Lock()
+	}
 
 	return &Result{AffectedRows: affected}, nil
 }

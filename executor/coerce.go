@@ -2504,9 +2504,32 @@ func coerceIntegerValue(colType string, v interface{}) interface{} {
 	return intVal
 }
 
+// defaultZerofillWidth returns the default display width for a ZEROFILL integer type.
+// In MySQL, ZEROFILL columns without explicit width use the default display width
+// for the integer type (e.g., INT ZEROFILL defaults to 10 digits).
+func defaultZerofillWidth(upperColType string) int {
+	// Get base type (strip UNSIGNED, ZEROFILL, whitespace)
+	base := upperColType
+	base = strings.ReplaceAll(base, "UNSIGNED", "")
+	base = strings.ReplaceAll(base, "ZEROFILL", "")
+	base = strings.TrimSpace(base)
+	switch {
+	case strings.HasPrefix(base, "TINYINT"):
+		return 3
+	case strings.HasPrefix(base, "SMALLINT"):
+		return 5
+	case strings.HasPrefix(base, "MEDIUMINT"):
+		return 8
+	case strings.HasPrefix(base, "BIGINT"):
+		return 20
+	default: // INT, INTEGER
+		return 10
+	}
+}
+
 // applyIntZerofill applies ZEROFILL zero-padding to an integer value for display.
 // The display width is extracted from the column type (e.g., "INT(2) ZEROFILL" -> width 2).
-// Returns a zero-padded string if a display width is specified, otherwise returns val unchanged.
+// If no explicit width is given, the MySQL default display width for the type is used.
 func applyIntZerofill(val interface{}, upperColType string) interface{} {
 	// Extract display width from INT(N), TINYINT(N), etc.
 	var width int
@@ -2514,6 +2537,10 @@ func applyIntZerofill(val interface{}, upperColType string) interface{} {
 		if n, err := fmt.Sscanf(upperColType[idx:], "(%d)", &width); err != nil || n == 0 {
 			width = 0
 		}
+	}
+	if width <= 0 {
+		// No explicit width: use MySQL default display width for the type
+		width = defaultZerofillWidth(upperColType)
 	}
 	if width <= 0 {
 		return val

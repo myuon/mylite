@@ -3041,6 +3041,39 @@ func stripWithClausePrefix(query string) string {
 	return strings.TrimSpace(q[i:])
 }
 
+// extractExplicitStringAlias checks if a raw SELECT expression has an explicit
+// AS '...' or AS "..." alias. Returns (alias, true) if found, ("", false) otherwise.
+// This is needed because vitess treats AS "" as no alias (IsEmpty() returns true),
+// but MySQL uses the empty string as the column name.
+func extractExplicitStringAlias(raw string) (string, bool) {
+	// Look for " AS " (case-insensitive) followed by a quoted string at the end.
+	// Returns (alias, true) if found, ("", false) otherwise.
+	// This is needed because Vitess treats AS "" as no alias (IsEmpty() returns true),
+	// but MySQL uses the empty string as the explicit column name.
+	rLower := strings.ToLower(strings.TrimSpace(raw))
+	i := len(rLower) - 1
+	for i >= 3 {
+		if rLower[i] == '\'' || rLower[i] == '"' {
+			// Found a closing quote; find the matching opening quote.
+			quote := rLower[i]
+			j := i - 1
+			for j >= 0 && rLower[j] != quote {
+				j--
+			}
+			if j >= 0 {
+				// Check if preceded by " as" (space or tab before "as").
+				before := strings.TrimRight(rLower[:j], " \t")
+				if strings.HasSuffix(before, " as") || strings.HasSuffix(before, "\tas") {
+					// Extract the alias content (between the quotes), using original case.
+					return raw[j+1 : i], true
+				}
+			}
+		}
+		i--
+	}
+	return "", false
+}
+
 func extractRawSelectExprs(query string) []string {
 	q := strings.TrimSpace(query)
 	lq := strings.ToLower(q)
