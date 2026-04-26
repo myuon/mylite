@@ -123,6 +123,38 @@ func (vs *ViewStore) LookupCreateSQL(db, name string) (string, bool) {
 	return v, ok
 }
 
+// Rename renames a view from oldName to newName within the given database.
+// Returns true if the view was found and renamed.
+func (vs *ViewStore) Rename(db, oldName, newName string) bool {
+	oldKey := viewKey(db, oldName)
+	newKey := viewKey(db, newName)
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	sql, ok := vs.selectSQL[oldKey]
+	if !ok {
+		return false
+	}
+	vs.selectSQL[newKey] = sql
+	delete(vs.selectSQL, oldKey)
+	if v, ok2 := vs.displaySQL[oldKey]; ok2 {
+		vs.displaySQL[newKey] = v
+		delete(vs.displaySQL, oldKey)
+	}
+	if v, ok2 := vs.checkOptions[oldKey]; ok2 {
+		vs.checkOptions[newKey] = v
+		delete(vs.checkOptions, oldKey)
+	}
+	if v, ok2 := vs.createSQL[oldKey]; ok2 {
+		vs.createSQL[newKey] = v
+		delete(vs.createSQL, oldKey)
+	}
+	if v, ok2 := vs.security[oldKey]; ok2 {
+		vs.security[newKey] = v
+		delete(vs.security, oldKey)
+	}
+	return true
+}
+
 // AllViews returns a snapshot of all view entries as (db, name, selectSQL) tuples.
 func (vs *ViewStore) AllViews() []viewEntry {
 	vs.mu.RLock()

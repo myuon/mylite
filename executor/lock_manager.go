@@ -534,6 +534,25 @@ func (tlm *TableLockManager) GetLocks(connID int64) map[string]string {
 	return result
 }
 
+// RenameTableLock transfers the lock for oldKey to newKey for the given connection.
+// This implements MySQL's behavior where RENAME TABLE under LOCK TABLES transfers
+// the table lock to the new name.
+func (tlm *TableLockManager) RenameTableLock(connID int64, oldDBTable, newDBTable string) {
+	tlm.mu.Lock()
+	defer tlm.mu.Unlock()
+	m, ok := tlm.locks[connID]
+	if !ok {
+		return
+	}
+	oldKey := strings.ToLower(oldDBTable)
+	mode, exists := m[oldKey]
+	if !exists {
+		return
+	}
+	delete(m, oldKey)
+	m[strings.ToLower(newDBTable)] = mode
+}
+
 // IsLockedByOther checks if a table is locked by any connection OTHER than connID.
 // Returns (true, mode) if locked by another connection, where mode is the strongest
 // lock mode held (WRITE > READ). Returns (false, "") if not locked by others.
