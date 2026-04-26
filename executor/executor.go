@@ -2039,6 +2039,18 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			}
 		}
 		if strings.HasPrefix(upper, "DROP USER ") {
+			// DROP USER (without IF EXISTS) must return error 1396 if any user doesn't exist.
+			if !strings.HasPrefix(upper, "DROP USER IF EXISTS ") && e.grantStore != nil {
+				rest := strings.TrimSpace(trimmed[len("DROP USER "):])
+				rest = strings.TrimSuffix(strings.TrimSpace(rest), ";")
+				for _, spec := range strings.Split(rest, ",") {
+					spec = strings.TrimSpace(spec)
+					u, h := parseUserHost(spec)
+					if !e.grantStore.UserExists(u, h) {
+						return nil, mysqlError(1396, "HY000", fmt.Sprintf("Operation DROP USER failed for '%s'@'%s'", u, h))
+					}
+				}
+			}
 			e.trackDropUser(trimmed)
 		}
 		// Track CREATE ROLE for the grant store.
@@ -5953,6 +5965,15 @@ func extractColLiteralForPK(cmp *sqlparser.ComparisonExpr) (string, interface{})
 	return "", nil
 }
 
+// splitUserAtHost splits a "user@host" key (as returned by parseUserAtHost) into user and host.
+func splitUserAtHost(key string) (user, host string) {
+	atIdx := strings.LastIndex(key, "@")
+	if atIdx < 0 {
+		return key, "%"
+	}
+	return key[:atIdx], key[atIdx+1:]
+}
+
 // parseUserAtHost extracts the normalized "user@host" key from a string like
 // "test_user1@'localhost'" or "'user'@'host'". Returns empty string on failure.
 func parseUserAtHost(s string) string {
@@ -6004,8 +6025,20 @@ func (e *Executor) trackCreateUser(raw string) {
 			}
 		}
 		key := parseUserAtHost(userHost)
+		if key == "" {
+			// No @ in userHost — user has no explicit host, default to @%
+			u := strings.Trim(userHost, "`'\"")
+			if u != "" {
+				key = strings.ToLower(u) + "@%"
+			}
+		}
 		if key != "" {
 			e.knownUsers[key] = true
+			// Also register in grant store so UserExists() works for ALTER USER validation.
+			if e.grantStore != nil {
+				u, h := splitUserAtHost(key)
+				e.grantStore.RegisterUser(u, h)
+			}
 		}
 	}
 }
@@ -6031,8 +6064,20 @@ func (e *Executor) trackDropUser(raw string) {
 	for _, spec := range userSpecs {
 		spec = strings.TrimSpace(spec)
 		key := parseUserAtHost(spec)
+		if key == "" {
+			// No @ in spec — user has no explicit host, default to @%
+			u := strings.Trim(spec, "`'\"")
+			if u != "" {
+				key = strings.ToLower(u) + "@%"
+			}
+		}
 		if key != "" {
 			delete(e.knownUsers, key)
+			// Also unregister from grant store
+			if e.grantStore != nil {
+				u, h := splitUserAtHost(key)
+				e.grantStore.UnregisterUser(u, h)
+			}
 		}
 	}
 }
@@ -6362,13 +6407,14 @@ func (e *Executor) checkTablePrivilege(stmt sqlparser.Statement) error {
 		return nil // root or no user context
 	}
 
-	// Only enforce if the user has at least one known table-level privilege grant entry.
+	// Only enforce if the user has at least one known privilege or role grant entry.
 	// This prevents false denials for:
-	//   - Users with only role memberships (whose default roles we may not track)
 	//   - Users with only non-table privileges (EXECUTE, FILE, PROCESS, etc.)
 	//   - Users with IP-based/CIDR grants or other unsupported host formats
-	// We do enforce if there are active roles set (via SET ROLE).
-	if len(activeRoles) == 0 && !e.grantStore.UserHasAnyTablePrivGrant(user, host) {
+	// We do enforce if there are active roles set (via SET ROLE) or if the user has
+	// role memberships (so SET ROLE NONE correctly denies access).
+	if len(activeRoles) == 0 && !e.grantStore.UserHasAnyTablePrivGrant(user, host) &&
+		!e.grantStore.UserHasAnyRoleGrant(user, host) {
 		return nil
 	}
 

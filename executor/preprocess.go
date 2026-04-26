@@ -296,9 +296,35 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 				rn = strings.TrimSpace(rn)
 				rn = strings.Trim(rn, "`'\"")
 				if rn != "" {
-					e.grantStore.RegisterRole(rn)
+					roleUser, roleHost := parseUserHost(rn)
+					e.grantStore.RegisterRoleWithHost(roleUser, roleHost)
 				}
 			}
+		}
+		return "", &Result{}, nil
+	}
+	if strings.HasPrefix(upper, "DROP ROLE ") && e.grantStore != nil {
+		// DROP ROLE (without IF EXISTS) must fail with error 1396 if any role doesn't exist.
+		var rolePart string
+		ifExists := false
+		if strings.HasPrefix(upper, "DROP ROLE IF EXISTS ") {
+			ifExists = true
+			rolePart = strings.TrimSpace(trimmed[len("DROP ROLE IF EXISTS "):])
+		} else {
+			rolePart = strings.TrimSpace(trimmed[len("DROP ROLE "):])
+		}
+		rolePart = strings.TrimSuffix(strings.TrimSpace(rolePart), ";")
+		for _, rn := range strings.Split(rolePart, ",") {
+			rn = strings.TrimSpace(rn)
+			rn = strings.Trim(rn, "`'\"")
+			if rn == "" {
+				continue
+			}
+			roleUser, roleHost := parseUserHost(rn)
+			if !ifExists && !e.grantStore.UserExists(roleUser, roleHost) {
+				return "", nil, mysqlError(1396, "HY000", fmt.Sprintf("Operation DROP ROLE failed for '%s'@'%s'", roleUser, roleHost))
+			}
+			e.grantStore.UnregisterRole(roleUser, roleHost)
 		}
 		return "", &Result{}, nil
 	}
@@ -324,6 +350,11 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 				} else {
 					altUser = strings.Trim(userPart, "`'\"")
 					altHost = "%"
+				}
+				// Validate user existence: return error if the user is not known.
+				// MySQL returns: ERROR HY000: Unknown authorization ID 'user'@'host'
+				if !e.grantStore.UserExists(altUser, altHost) {
+					return "", nil, mysqlError(3532, "HY000", fmt.Sprintf("Unknown authorization ID `%s`@`%s`", altUser, altHost))
 				}
 				// Parse role list
 				upperRole := strings.ToUpper(strings.TrimSpace(rolePart))
@@ -565,8 +596,73 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		}, nil
 	}
 
-	// Handle RENAME USER as no-op
+	// Handle RENAME USER - update grant store and knownUsers
 	if strings.HasPrefix(upper, "RENAME USER") {
+		if e.grantStore != nil {
+			// Parse "RENAME USER old TO new [, old2 TO new2, ...]"
+			rest := strings.TrimSpace(trimmed[len("RENAME USER"):])
+			rest = strings.TrimRight(rest, ";")
+			// Split by commas that separate "old TO new" pairs
+			// Simple parsing: find all " TO " occurrences
+			parts := strings.Split(rest, ",")
+			// First pass: check if any user being renamed is a role that is currently in use
+			// (granted to someone in the role graph). MySQL error 3162: Renaming of a role
+			// identifier is forbidden when the role has active grantees.
+			for _, part := range parts {
+				part = strings.TrimSpace(part)
+				toIdx := strings.Index(strings.ToUpper(part), " TO ")
+				if toIdx < 0 {
+					continue
+				}
+				oldPart := strings.TrimSpace(part[:toIdx])
+				oldUser, oldHost := parseUserHost(oldPart)
+				if oldUser != "" && e.grantStore.IsRoleInGraph(oldUser, oldHost) {
+					return "", nil, mysqlError(3162, "HY000", "Renaming of a role identifier is forbidden")
+				}
+			}
+			// Second pass: perform the renames
+			for _, part := range parts {
+				part = strings.TrimSpace(part)
+				toIdx := strings.Index(strings.ToUpper(part), " TO ")
+				if toIdx < 0 {
+					continue
+				}
+				oldPart := strings.TrimSpace(part[:toIdx])
+				newPart := strings.TrimSpace(part[toIdx+4:])
+				oldUser, oldHost := parseUserHost(oldPart)
+				newUser, newHost := parseUserHost(newPart)
+				if oldUser != "" && newUser != "" {
+					e.grantStore.RenameUser(oldUser, oldHost, newUser, newHost)
+				}
+			}
+		}
+		// Update knownUsers map
+		if e.knownUsers != nil && e.knownUsersMu != nil {
+			rest := strings.TrimSpace(trimmed[len("RENAME USER"):])
+			rest = strings.TrimRight(rest, ";")
+			parts := strings.Split(rest, ",")
+			e.knownUsersMu.Lock()
+			for _, part := range parts {
+				part = strings.TrimSpace(part)
+				toIdx := strings.Index(strings.ToUpper(part), " TO ")
+				if toIdx < 0 {
+					continue
+				}
+				oldPart := strings.TrimSpace(part[:toIdx])
+				newPart := strings.TrimSpace(part[toIdx+4:])
+				oldUser, oldHost := parseUserHost(oldPart)
+				newUser, newHost := parseUserHost(newPart)
+				if oldUser != "" {
+					oldKey := strings.ToLower(oldUser) + "@" + strings.ToLower(oldHost)
+					newKey := strings.ToLower(newUser) + "@" + strings.ToLower(newHost)
+					if e.knownUsers[oldKey] {
+						e.knownUsers[newKey] = true
+						delete(e.knownUsers, oldKey)
+					}
+				}
+			}
+			e.knownUsersMu.Unlock()
+		}
 		return "", &Result{}, nil
 	}
 

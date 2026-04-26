@@ -51,6 +51,25 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				val = sd.Value
 			}
 			e.userVars[varName] = val
+			// When __current_user is set (e.g. on --connect), activate the user's default roles.
+			if varName == "__current_user" && e.grantStore != nil {
+				cuStr, _ := val.(string)
+				if cuStr != "" {
+					var cuUser, cuHost string
+					if atIdx := strings.Index(cuStr, "@"); atIdx >= 0 {
+						cuUser = cuStr[:atIdx]
+						cuHost = cuStr[atIdx+1:]
+					} else {
+						cuUser = cuStr
+						cuHost = "localhost"
+					}
+					activeRoles := e.grantStore.GetActiveDefaultRoles(cuUser, cuHost)
+					e.userVars["__active_roles"] = activeRoles
+				} else {
+					// User logged out / switched to root - clear active roles
+					e.userVars["__active_roles"] = []string{}
+				}
+			}
 			continue
 		}
 		name := strings.ToLower(expr.Var.Name.String())
