@@ -336,6 +336,14 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 		if strings.EqualFold(lookupDB, "performance_schema") {
 			e.populatePerfSchemaTable(tbl, lookupTable)
 		}
+		// Virtual table: mysql.default_roles - return rows from the grant store.
+		if strings.EqualFold(lookupDB, "mysql") && strings.EqualFold(lookupTable, "default_roles") && e.grantStore != nil {
+			return e.grantStore.ScanDefaultRoles(), nil
+		}
+		// Virtual table: mysql.role_edges - return rows from the grant store.
+		if strings.EqualFold(lookupDB, "mysql") && strings.EqualFold(lookupTable, "role_edges") && e.grantStore != nil {
+			return e.grantStore.ScanRoleEdges(), nil
+		}
 		rawAll := tbl.Scan()
 		// MySQL's InnoDB stores mysql.engine_cost in clustered PK order (cost_name, engine_name, device_type).
 		// Sort here to match MySQL's natural row ordering when no ORDER BY is specified.

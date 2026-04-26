@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/myuon/mylite/storage"
 )
 
 // GrantType represents the type of grant.
@@ -44,14 +46,17 @@ type GrantStore struct {
 	roles map[string][]GrantEntry
 	// defaultRoles maps "user@host" -> list of default role names (lowercase).
 	defaultRoles map[string][]string
+	// knownUserHosts tracks explicitly registered users (via CREATE USER / RENAME USER).
+	knownUserHosts map[string]bool
 }
 
 // NewGrantStore creates a new empty GrantStore.
 func NewGrantStore() *GrantStore {
 	return &GrantStore{
-		entries:      make(map[string][]GrantEntry),
-		roles:        make(map[string][]GrantEntry),
-		defaultRoles: make(map[string][]string),
+		entries:        make(map[string][]GrantEntry),
+		roles:          make(map[string][]GrantEntry),
+		defaultRoles:   make(map[string][]string),
+		knownUserHosts: make(map[string]bool),
 	}
 }
 
@@ -67,6 +72,102 @@ func (gs *GrantStore) isRole(name, host string) bool {
 	defer gs.mu.RUnlock()
 	_, ok := gs.roles[userKey(name, host)]
 	return ok
+}
+
+// IsRoleInGraph returns true if the authID (name@host) is currently granted to at least one
+// user or role (i.e., is part of the role grant graph). Used to decide if RENAME USER
+// of a user/role is forbidden (MySQL error 3162: Renaming of a role identifier is forbidden).
+// In MySQL, any authID that is currently acting as a role in the grant graph cannot be renamed.
+func (gs *GrantStore) IsRoleInGraph(roleName, roleHost string) bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	// Check if any user or role has this authID granted to them (in gs.entries)
+	for _, entries := range gs.entries {
+		for _, e := range entries {
+			if e.Type == GrantTypeRole && strings.EqualFold(e.RoleName, roleName) {
+				rh := e.RoleHost
+				if rh == "" {
+					rh = "%"
+				}
+				if strings.EqualFold(rh, roleHost) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// UserExists returns true if the user@host has ever been registered (via RegisterUser or RegisterRole).
+func (gs *GrantStore) UserExists(user, host string) bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	key := userKey(user, host)
+	if _, ok := gs.knownUserHosts[key]; ok {
+		return true
+	}
+	// Also check if they have any grant entries (created via GRANT ... TO user@host).
+	if _, ok := gs.entries[key]; ok {
+		return true
+	}
+	// Check if it's a role
+	if _, ok := gs.roles[key]; ok {
+		return true
+	}
+	return false
+}
+
+// RegisterUser marks a user@host as known (called on CREATE USER).
+func (gs *GrantStore) RegisterUser(user, host string) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if gs.knownUserHosts == nil {
+		gs.knownUserHosts = make(map[string]bool)
+	}
+	gs.knownUserHosts[userKey(user, host)] = true
+}
+
+// UnregisterUser removes a user@host from known users (called on DROP USER / RENAME USER old name).
+func (gs *GrantStore) UnregisterUser(user, host string) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if gs.knownUserHosts != nil {
+		delete(gs.knownUserHosts, userKey(user, host))
+	}
+	// Also remove grant entries so they are no longer visible.
+	key := userKey(user, host)
+	delete(gs.entries, key)
+	delete(gs.defaultRoles, key)
+}
+
+// RenameUser renames a user in the grant store, transferring all grants.
+func (gs *GrantStore) RenameUser(oldUser, oldHost, newUser, newHost string) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	oldKey := userKey(oldUser, oldHost)
+	newKey := userKey(newUser, newHost)
+	// Transfer grant entries
+	if entries, ok := gs.entries[oldKey]; ok {
+		gs.entries[newKey] = entries
+		delete(gs.entries, oldKey)
+	}
+	// Transfer default roles
+	if dr, ok := gs.defaultRoles[oldKey]; ok {
+		gs.defaultRoles[newKey] = dr
+		delete(gs.defaultRoles, oldKey)
+	}
+	// Transfer role registration (for roles created with CREATE ROLE)
+	if roleEntries, ok := gs.roles[oldKey]; ok {
+		gs.roles[newKey] = roleEntries
+		delete(gs.roles, oldKey)
+	}
+	// Transfer known user registration
+	if gs.knownUserHosts != nil {
+		if gs.knownUserHosts[oldKey] {
+			gs.knownUserHosts[newKey] = true
+			delete(gs.knownUserHosts, oldKey)
+		}
+	}
 }
 
 // SetDefaultRoles stores the default roles for a user (called on ALTER USER ... DEFAULT ROLE ...).
@@ -96,19 +197,36 @@ func (gs *GrantStore) GetDefaultRoles(user, host string) []string {
 
 // GetActiveDefaultRoles returns the default roles for a user that are still actually granted to them.
 // This filters out roles that have been revoked since DEFAULT ROLE was set.
+// Falls back to host="%" if no entry found for exact host (e.g. user created without explicit host).
 func (gs *GrantStore) GetActiveDefaultRoles(user, host string) []string {
 	gs.mu.RLock()
 	defer gs.mu.RUnlock()
 	key := userKey(user, host)
 	defaultRoles := gs.defaultRoles[key]
+	// Fallback: try wildcard host if exact host not found
+	if len(defaultRoles) == 0 && host != "%" {
+		wildcardKey := userKey(user, "%")
+		defaultRoles = gs.defaultRoles[wildcardKey]
+		if len(defaultRoles) > 0 {
+			key = wildcardKey
+		}
+	}
 	if len(defaultRoles) == 0 {
 		return nil
 	}
-	// Build set of currently granted roles for this user
+	// Build set of currently granted roles for this user (check exact host and wildcard)
 	grantedRoles := make(map[string]bool)
 	for _, e := range gs.entries[key] {
 		if e.Type == GrantTypeRole {
 			grantedRoles[strings.ToLower(e.RoleName)] = true
+		}
+	}
+	// Also check exact host entries if we fell back to wildcard
+	if key != userKey(user, host) {
+		for _, e := range gs.entries[userKey(user, host)] {
+			if e.Type == GrantTypeRole {
+				grantedRoles[strings.ToLower(e.RoleName)] = true
+			}
 		}
 	}
 	var active []string
@@ -120,14 +238,40 @@ func (gs *GrantStore) GetActiveDefaultRoles(user, host string) []string {
 	return active
 }
 
-// RegisterRole marks a name as a role (called on CREATE ROLE).
-func (gs *GrantStore) RegisterRole(name string) {
+// UnregisterRole removes a role from the grant store (called on DROP ROLE).
+func (gs *GrantStore) UnregisterRole(name, host string) {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
-	key := userKey(name, "%")
+	key := userKey(name, host)
+	delete(gs.roles, key)
+	delete(gs.entries, key)
+	delete(gs.defaultRoles, key)
+	if gs.knownUserHosts != nil {
+		delete(gs.knownUserHosts, key)
+	}
+}
+
+// RegisterRole marks a name as a role with default host "%" (called on CREATE ROLE name).
+func (gs *GrantStore) RegisterRole(name string) {
+	gs.RegisterRoleWithHost(name, "%")
+}
+
+// RegisterRoleWithHost marks a name@host as a role (called on CREATE ROLE name@host).
+func (gs *GrantStore) RegisterRoleWithHost(name, host string) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if host == "" {
+		host = "%"
+	}
+	key := userKey(name, host)
 	if gs.roles[key] == nil {
 		gs.roles[key] = []GrantEntry{}
 	}
+	// Also register in knownUserHosts so UserExists works for roles
+	if gs.knownUserHosts == nil {
+		gs.knownUserHosts = make(map[string]bool)
+	}
+	gs.knownUserHosts[key] = true
 }
 
 // AddPrivGrant adds a privilege grant on an object for a user.
@@ -284,6 +428,86 @@ func (gs *GrantStore) GetRoleGrants(roleName string) []GrantEntry {
 	result := make([]GrantEntry, len(gs.roles[key]))
 	copy(result, gs.roles[key])
 	return result
+}
+
+// ScanDefaultRoles returns rows for the mysql.default_roles virtual table from the grant store.
+// Columns: HOST, USER, DEFAULT_ROLE_HOST, DEFAULT_ROLE_USER
+func (gs *GrantStore) ScanDefaultRoles() []storage.Row {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	var rows []storage.Row
+	// Sort keys for deterministic output
+	keys := make([]string, 0, len(gs.defaultRoles))
+	for k := range gs.defaultRoles {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		roles := gs.defaultRoles[key]
+		if len(roles) == 0 {
+			continue
+		}
+		// Parse user@host from the key
+		atIdx := strings.LastIndex(key, "@")
+		if atIdx < 0 {
+			continue
+		}
+		user := key[:atIdx]
+		host := key[atIdx+1:]
+		for _, role := range roles {
+			row := make(storage.Row)
+			row["HOST"] = host
+			row["USER"] = user
+			row["DEFAULT_ROLE_HOST"] = "%"
+			row["DEFAULT_ROLE_USER"] = role
+			rows = append(rows, row)
+		}
+	}
+	return rows
+}
+
+// ScanRoleEdges returns rows for the mysql.role_edges virtual table from the grant store.
+// Columns: FROM_HOST, FROM_USER, TO_HOST, TO_USER, WITH_ADMIN_OPTION
+func (gs *GrantStore) ScanRoleEdges() []storage.Row {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	var rows []storage.Row
+	// Collect all role grants from gs.entries
+	keys := make([]string, 0, len(gs.entries))
+	for k := range gs.entries {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		entries := gs.entries[key]
+		atIdx := strings.LastIndex(key, "@")
+		if atIdx < 0 {
+			continue
+		}
+		toUser := key[:atIdx]
+		toHost := key[atIdx+1:]
+		for _, e := range entries {
+			if e.Type != GrantTypeRole {
+				continue
+			}
+			row := make(storage.Row)
+			rh := e.RoleHost
+			if rh == "" {
+				rh = "%"
+			}
+			row["FROM_HOST"] = rh
+			row["FROM_USER"] = e.RoleName
+			row["TO_HOST"] = toHost
+			row["TO_USER"] = toUser
+			if e.GrantOption {
+				row["WITH_ADMIN_OPTION"] = "Y"
+			} else {
+				row["WITH_ADMIN_OPTION"] = "N"
+			}
+			rows = append(rows, row)
+		}
+	}
+	return rows
 }
 
 // HasPrivilege checks if a user (with active roles) has a specific privilege on db.table.
@@ -560,6 +784,28 @@ var tablePrivileges = map[string]bool{
 	"CREATE": true, "DROP": true, "ALTER": true, "INDEX": true,
 	"ALL PRIVILEGES": true, "ALL": true,
 	"CREATE TEMPORARY TABLES": true,
+}
+
+// UserHasAnyRoleGrant returns true if the given user has any role membership (GRANT role TO user).
+// Used to determine if privilege enforcement is needed even when there are no direct table grants.
+func (gs *GrantStore) UserHasAnyRoleGrant(user, host string) bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	uk := userKey(user, host)
+	for _, e := range gs.entries[uk] {
+		if e.Type == GrantTypeRole {
+			return true
+		}
+	}
+	if host != "%" {
+		ukWild := userKey(user, "%")
+		for _, e := range gs.entries[ukWild] {
+			if e.Type == GrantTypeRole {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // UserHasAnyTablePrivGrant returns true if the given user (at exact host or wildcard %) has any
@@ -1120,14 +1366,9 @@ func ParseGrantStatement(query string) (privs, object, toUser, toHost string, is
 	onIdx := strings.Index(strings.ToUpper(grantPart), " ON ")
 	if onIdx < 0 {
 		// No ON clause -> this is a role grant: GRANT role TO user
-		// grantPart is the role name(s), possibly comma-separated
-		// For now handle single role
-		rolePart := strings.TrimSpace(grantPart)
-		// Could be multiple roles: "r1, r2" - just use first
-		if commaIdx := strings.Index(rolePart, ","); commaIdx >= 0 {
-			rolePart = strings.TrimSpace(rolePart[:commaIdx])
-		}
-		privs = rolePart // role name stored in privs for caller to check
+		// grantPart is the role name(s), possibly comma-separated (e.g. "r1, r2, r3")
+		// Return all role names joined by comma so the caller can split them.
+		privs = strings.TrimSpace(grantPart)
 		isRoleGrant = true
 		return
 	}

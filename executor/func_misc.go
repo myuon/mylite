@@ -17,6 +17,7 @@ import (
 	"math/rand"
 	"net"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -465,6 +466,24 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		}
 		return int64(0), true, nil
 	case "current_role":
+		// Return active roles from the session variable __active_roles
+		if arv, ok := e.userVars["__active_roles"]; ok {
+			if roles, ok2 := arv.([]string); ok2 && len(roles) > 0 {
+				var parts []string
+				for _, r := range roles {
+					// Format as `role`@`%`
+					rName := r
+					rHost := "%"
+					if atIdx := strings.LastIndex(r, "@"); atIdx >= 0 {
+						rName = r[:atIdx]
+						rHost = r[atIdx+1:]
+					}
+					parts = append(parts, fmt.Sprintf("`%s`@`%s`", rName, rHost))
+				}
+				sort.Strings(parts)
+				return strings.Join(parts, ","), true, nil
+			}
+		}
 		return "NONE", true, nil
 	case "inet_ntoa":
 		inVal, isNull, err := e.evalArg1(v.Exprs, "INET_NTOA", row)
