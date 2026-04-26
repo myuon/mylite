@@ -10,7 +10,132 @@ import (
 	"sync/atomic"
 
 	"github.com/myuon/mylite/catalog"
+	"vitess.io/vitess/go/mysql/collations"
+	"vitess.io/vitess/go/mysql/collations/charset"
+	"vitess.io/vitess/go/mysql/collations/colldata"
 )
+
+// storageCollEnv is a shared Vitess collation environment for MySQL 8.0.
+var storageCollEnv = collations.NewEnvironment("8.0.40")
+
+// isSafeForVitessCollationStorage returns true if the given collation name belongs to a
+// charset family where Vitess weight strings produce correct MySQL-compatible sort
+// order. Only charsets that have been verified are included. Asian multi-byte
+// charsets (sjis/ujis/cp932/eucjpms/euckr/gb2312/gbk/gb18030/big5) are excluded
+// because Vitess does not support them and would produce incorrect results.
+func isSafeForVitessCollationStorage(collationName string) bool {
+	lower := strings.ToLower(collationName)
+	for _, prefix := range []string{"latin1_", "latin2_", "cp1251_", "utf8mb4_", "utf8mb3_", "utf8_", "binary"} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// lookupStorageCollation returns a Vitess Collation for the given name, or nil if not found.
+func lookupStorageCollation(name string) colldata.Collation {
+	id := storageCollEnv.LookupByName(strings.ToLower(name))
+	if id == collations.Unknown {
+		return nil
+	}
+	return colldata.Lookup(id)
+}
+
+// storageWeightString returns a MySQL-compatible sort key for string s under the given collation.
+func storageWeightString(s string, coll colldata.Collation) []byte {
+	src := []byte(s)
+	cs := coll.Charset()
+	csName := cs.Name()
+	if csName != "utf8mb4" && csName != "utf8mb3" && csName != "binary" {
+		converted, err := charset.ConvertFromUTF8(nil, cs, src)
+		if err == nil {
+			src = converted
+		}
+	}
+	return coll.WeightString(nil, src, 0)
+}
+
+// effectivePKCollation returns the effective collation name for a PK column in a TableDef.
+// It prefers the column-level collation, then the table-level collation, then derives from charset.
+func effectivePKCollation(def *catalog.TableDef, colName string) string {
+	if def == nil {
+		return "utf8mb4_0900_ai_ci"
+	}
+	// Check column-level collation
+	for _, col := range def.Columns {
+		if strings.EqualFold(col.Name, colName) {
+			if col.Collation != "" {
+				return strings.ToLower(col.Collation)
+			}
+			if col.Charset != "" {
+				return strings.ToLower(catalog.DefaultCollationForCharset(col.Charset))
+			}
+			break
+		}
+	}
+	// Fall back to table-level collation
+	if def.Collation != "" {
+		return strings.ToLower(def.Collation)
+	}
+	cs := def.Charset
+	if cs == "" {
+		cs = "utf8mb4"
+	}
+	return strings.ToLower(catalog.DefaultCollationForCharset(cs))
+}
+
+// compareRowValueWithCollation compares two row values using the given collation name
+// for string values. Non-string values fall back to compareRowValue.
+// Only safe charsets (latin1, utf8mb4, utf8, etc.) are handled by Vitess; others
+// fall back to plain compareRowValue.
+func compareRowValueWithCollation(a, b interface{}, collationName string) int {
+	if a == nil && b == nil {
+		return 0
+	}
+	if a == nil {
+		return -1
+	}
+	if b == nil {
+		return 1
+	}
+	// Only attempt collation-aware comparison for strings with safe charsets
+	_, aIsStr := a.(string)
+	_, bIsStr := b.(string)
+	if (aIsStr || bIsStr) && collationName != "" && isSafeForVitessCollationStorage(collationName) {
+		aStr := fmt.Sprintf("%v", a)
+		bStr := fmt.Sprintf("%v", b)
+		if strings.Contains(strings.ToLower(collationName), "_0900_") ||
+			strings.HasSuffix(strings.ToLower(collationName), "_0900_bin") ||
+			isSafeForVitessCollationStorage(collationName) {
+			if vc := lookupStorageCollation(collationName); vc != nil {
+				wa := storageWeightString(aStr, vc)
+				wb := storageWeightString(bStr, vc)
+				if string(wa) < string(wb) {
+					return -1
+				}
+				if string(wa) > string(wb) {
+					return 1
+				}
+				return 0
+			}
+		}
+		// Fallback: case-insensitive for _ci collations
+		coll := strings.ToLower(collationName)
+		if strings.HasSuffix(coll, "_ci") {
+			aStr = strings.ToUpper(aStr)
+			bStr = strings.ToUpper(bStr)
+		}
+		if aStr < bStr {
+			return -1
+		}
+		if aStr > bStr {
+			return 1
+		}
+		return 0
+	}
+	return compareRowValue(a, b)
+}
 
 // stripPrefixLength strips the prefix length from a column name.
 // e.g., "col_1_text(3072)" -> "col_1_text"
@@ -1016,12 +1141,18 @@ func (t *Table) Scan() []Row {
 	// Keep scan order deterministic and MySQL-compatible for tests that rely on it.
 	// Skip sorting for charsets where Go's byte-order comparison does not match
 	// the MySQL collation order (e.g. sjis, cp932, ujis, eucjpms).
+	// For supported charsets (utf8mb4, latin1, etc.), use collation-aware comparison.
 	if t.Def != nil && len(t.Def.PrimaryKey) > 0 && len(result) > 1 && !hasNonSortableCharset(t.Def.Charset) {
 		pkCols := append([]string(nil), t.Def.PrimaryKey...)
+		// Pre-compute collation per PK column for collation-aware comparison.
+		pkCollations := make([]string, len(pkCols))
+		for idx, pk := range pkCols {
+			pkCollations[idx] = effectivePKCollation(t.Def, pk)
+		}
 		sort.SliceStable(result, func(i, j int) bool {
 			ri, rj := result[i], result[j]
-			for _, pk := range pkCols {
-				cmp := compareRowValue(ri[pk], rj[pk])
+			for idx, pk := range pkCols {
+				cmp := compareRowValueWithCollation(ri[pk], rj[pk], pkCollations[idx])
 				if cmp < 0 {
 					return true
 				}
