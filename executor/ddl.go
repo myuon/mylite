@@ -1129,8 +1129,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 
 		// Validate generated column expressions for blocked functions
 		if col.Type.Options != nil && col.Type.Options.As != nil {
-			blocked, found := findBlockedFunctionInExpr(col.Type.Options.As)
+			blocked, isGroupFunc, found := findBlockedFunctionInExpr(col.Type.Options.As)
 			if found {
+				if isGroupFunc {
+					return nil, mysqlError(1111, "HY000", "Invalid use of group function")
+				}
 				if blocked != "" {
 					return nil, mysqlError(3102, "HY000",
 						fmt.Sprintf("Expression of generated column '%s' contains a disallowed function: %s.",
@@ -1139,6 +1142,66 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				return nil, mysqlError(3102, "HY000",
 					fmt.Sprintf("Expression of generated column '%s' contains a disallowed function.",
 						col.Name.String()))
+			}
+			// Also check for stored procedures/functions and unknown user functions
+			if udfName := findStoredOrUnknownFuncInExpr(col.Type.Options.As, db); udfName != "" {
+				return nil, mysqlError(3102, "HY000",
+					fmt.Sprintf("Expression of generated column '%s' contains a disallowed function: %s.",
+						col.Name.String(), fmt.Sprintf("`%s`", udfName)))
+			}
+			// Check for forward references and auto-increment references in the GC expression.
+			colName := strings.ToLower(col.Name.String())
+			// Collect ALL auto-increment columns in the table spec
+			autoIncrCols := map[string]bool{}
+			for _, c2 := range stmt.TableSpec.Columns {
+				if c2.Type.Options != nil && c2.Type.Options.Autoincrement {
+					autoIncrCols[strings.ToLower(c2.Name.String())] = true
+				}
+			}
+			// Build a map of GC columns defined AFTER the current column (including current)
+			// A GC can reference non-GC columns (regular columns) anywhere, but can only
+			// reference GC columns defined BEFORE it. Self-reference is also disallowed.
+			gcColsAfterOrSelf := map[string]bool{}
+			foundSelf := false
+			for _, c2 := range stmt.TableSpec.Columns {
+				c2Lower := strings.ToLower(c2.Name.String())
+				if c2Lower == colName {
+					foundSelf = true
+				}
+				if foundSelf && c2.Type.Options != nil && c2.Type.Options.As != nil {
+					gcColsAfterOrSelf[c2Lower] = true
+				}
+			}
+			// Walk the expression looking for column references
+			var refErrFound bool
+			var refErrIsAutoInc bool
+			sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+				if refErrFound {
+					return false, nil
+				}
+				cn, ok := node.(*sqlparser.ColName)
+				if !ok {
+					return true, nil
+				}
+				refName := strings.ToLower(cn.Name.String())
+				if autoIncrCols[refName] {
+					refErrFound = true
+					refErrIsAutoInc = true
+					return false, nil
+				}
+				if gcColsAfterOrSelf[refName] {
+					refErrFound = true
+					refErrIsAutoInc = false
+					return false, nil
+				}
+				return true, nil
+			}, col.Type.Options.As)
+			if refErrFound {
+				if refErrIsAutoInc {
+					// MySQL reports the GC column name, not the referenced auto-increment column name
+					return nil, mysqlError(3109, "HY000", fmt.Sprintf("Generated column '%s' cannot refer to auto-increment column.", col.Name.String()))
+				}
+				return nil, mysqlError(3107, "HY000", "Generated column can refer only to generated columns defined prior to it.")
 			}
 		}
 
@@ -1197,7 +1260,8 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			}
 			colDef.Collation = collLower
 			// If no charset was set explicitly, derive it from the collation.
-			if colDef.Charset == "" {
+			// Only set charset for character types; numeric/temporal types don't carry charset.
+			if colDef.Charset == "" && columnTypeSupportsCharset(colDef.Type) {
 				colDef.Charset = collCharset
 			}
 		}
@@ -2294,21 +2358,46 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		if selResult != nil && selResult.IsResultSet {
 			tbl, tblErr := e.Storage.GetTable(dbName, tableName)
 			if tblErr == nil {
-				// Build the final column list following SELECT column order (MySQL behavior).
-				// Columns from the SELECT are placed first (in SELECT order), then any
-				// explicitly-defined columns that don't appear in the SELECT.
-				// When a SELECT column matches an explicit column def, the explicit def is used.
+				// Build the final column list following MySQL behavior:
+				// 1. Spec-only columns (not in SELECT) come first (in spec order).
+				//    Generated columns fall in this category since SELECT cannot provide their values.
+				// 2. SELECT columns come next (in SELECT order), using spec defs for matching columns.
+				//    Spec-only generated columns that also appear in the SELECT trigger an error.
+				// 3. SELECT-only columns (not in spec) are included in step 2.
+				// This matches MySQL's column ordering for CREATE TABLE (spec) SELECT.
 				explicitColsByName := make(map[string]catalog.ColumnDef, len(def.Columns))
 				for _, c := range def.Columns {
 					explicitColsByName[strings.ToLower(c.Name)] = c
 				}
-				var reorderedCols []catalog.ColumnDef
-				seenInSelect := make(map[string]bool)
+				selectColSet := make(map[string]bool, len(selResult.Columns))
+				for _, selCol := range selResult.Columns {
+					selectColSet[strings.ToLower(selCol)] = true
+				}
+				// First: check if any SELECT column provides a value for a generated spec column
 				for _, selCol := range selResult.Columns {
 					key := strings.ToLower(selCol)
-					seenInSelect[key] = true
 					if defCol, ok := explicitColsByName[key]; ok {
-						// Use the explicit column definition
+						if isGeneratedColumnType(defCol.Type) {
+							// Drop the partially-created table to match MySQL behavior
+							db.DropTable(tableName)       //nolint:errcheck
+							e.Storage.DropTable(dbName, tableName)
+							return nil, mysqlError(3105, "HY000", fmt.Sprintf("The value specified for generated column '%s' in table '%s' is not allowed.", defCol.Name, tableName))
+						}
+					}
+				}
+				var reorderedCols []catalog.ColumnDef
+				// First: spec columns NOT in SELECT (generated columns, etc.) in spec order
+				for _, c := range def.Columns {
+					if !selectColSet[strings.ToLower(c.Name)] {
+						reorderedCols = append(reorderedCols, c)
+					}
+				}
+				// Then: SELECT columns in SELECT order
+				// Use spec def for matching columns, infer type for new columns
+				for _, selCol := range selResult.Columns {
+					key := strings.ToLower(selCol)
+					if defCol, ok := explicitColsByName[key]; ok {
+						// Use the explicit spec column definition
 						reorderedCols = append(reorderedCols, defCol)
 					} else {
 						// New column from SELECT — infer type and attributes
@@ -2330,13 +2419,6 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 						tbl.AddColumn(selCol, nil)
 					}
 				}
-				// Append any explicit columns not present in the SELECT
-				for _, c := range def.Columns {
-					if !seenInSelect[strings.ToLower(c.Name)] {
-						reorderedCols = append(reorderedCols, c)
-						tbl.AddColumn(c.Name, nil)
-					}
-				}
 				def.Columns = reorderedCols
 				// Insert select results
 				var insertErr error
@@ -2346,6 +2428,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 						if j < len(selRow) {
 							row[selCol] = selRow[j]
 						}
+					}
+					// Evaluate generated columns from spec (they don't come from the SELECT)
+					if err2 := e.populateGeneratedColumns(row, reorderedCols); err2 != nil {
+						insertErr = err2
+						break
 					}
 					if _, err := tbl.Insert(row); err != nil {
 						insertErr = err
@@ -2618,10 +2705,11 @@ func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 				colDef.OnUpdateCurrentTimestamp = true
 			}
 		}
-		if col.Type.Options.KeyOpt == 1 { // colKeyPrimary
+		if col.Type.Options.KeyOpt == 1 || col.Type.Options.KeyOpt == 6 { // ColKeyPrimary or ColKey
 			colDef.PrimaryKey = true
+			colDef.Nullable = false // PRIMARY KEY implies NOT NULL
 		}
-		if col.Type.Options.KeyOpt == 2 { // colKeyUnique
+		if col.Type.Options.KeyOpt == 4 || col.Type.Options.KeyOpt == 5 { // ColKeyUnique or ColKeyUniqueKey
 			colDef.Unique = true
 		}
 		if col.Type.Options.Comment != nil {
@@ -2984,13 +3072,11 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				}
 				// Check for multiple primary key before virtual PK check
 				if col.Type.Options != nil && (col.Type.Options.KeyOpt == 1 || col.Type.Options.KeyOpt == 6) {
-					// KeyOpt 1 = PRIMARY KEY, 6 = KEY
-					if col.Type.Options.KeyOpt == 1 {
-						// Check if table already has a primary key
-						tableDef, _ := db.GetTable(tableName)
-						if tableDef != nil && len(tableDef.PrimaryKey) > 0 {
-							return nil, mysqlError(1068, "42000", "Multiple primary key defined")
-						}
+					// KeyOpt 1 = PRIMARY KEY, 6 = KEY (which MySQL promotes to PK if no PK exists)
+					// Both can cause "Multiple primary key defined" if a PK already exists
+					tableDef, _ := db.GetTable(tableName)
+					if tableDef != nil && len(tableDef.PrimaryKey) > 0 {
+						return nil, mysqlError(1068, "42000", "Multiple primary key defined")
 					}
 				}
 				// Check virtual generated column with KEY/PRIMARY KEY
@@ -3015,6 +3101,29 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					}
 					if tableEngine == "MEMORY" || tableEngine == "MERGE" || tableEngine == "MRG_MYISAM" || tableEngine == "BLACKHOLE" || tableEngine == "ARCHIVE" {
 						return nil, mysqlError(3106, "HY000", "'Specified storage engine' is not supported for generated columns.")
+					}
+				}
+				// Validate generated column expressions for blocked functions (ALTER TABLE ADD COLUMN path)
+				if col.Type.Options != nil && col.Type.Options.As != nil {
+					blocked, isGroupFunc, found := findBlockedFunctionInExpr(col.Type.Options.As)
+					if found {
+						if isGroupFunc {
+							return nil, mysqlError(1111, "HY000", "Invalid use of group function")
+						}
+						if blocked != "" {
+							return nil, mysqlError(3102, "HY000",
+								fmt.Sprintf("Expression of generated column '%s' contains a disallowed function: %s.",
+									col.Name.String(), blocked))
+						}
+						return nil, mysqlError(3102, "HY000",
+							fmt.Sprintf("Expression of generated column '%s' contains a disallowed function.",
+								col.Name.String()))
+					}
+					// Also check for stored procedures/functions
+					if udfName := findStoredOrUnknownFuncInExpr(col.Type.Options.As, db); udfName != "" {
+						return nil, mysqlError(3102, "HY000",
+							fmt.Sprintf("Expression of generated column '%s' contains a disallowed function: `%s`.",
+								col.Name.String(), udfName))
 					}
 				}
 				colDef := columnDefFromAST(col)
@@ -3068,6 +3177,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					}
 					return nil, addErr
 				}
+				// If the new column is a primary key (inline KEY or PRIMARY KEY), set it
+				if colDef.PrimaryKey {
+					db.SetPrimaryKey(tableName, []string{colDef.Name})
+				}
 				// Determine the default value to fill in existing rows.
 				genExpr := generatedColumnExpr(colDef.Type)
 				if genExpr != "" {
@@ -3082,6 +3195,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 							db.DropColumn(tableName, colDef.Name)
 							tbl.DropColumn(colDef.Name)
 							return nil, err
+						}
+						// Coerce the computed value to the declared column type (use base type without GC expr)
+						if v != nil {
+							v = coerceColumnValue(baseColumnType(colDef.Type), v)
 						}
 						// Check if value is out of range for the column type
 						// Only enforce range check when WITH VALIDATION is specified
@@ -3134,6 +3251,12 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					return nil, mysqlError(1818, "HY000", "Supports only YEAR or YEAR(4) column.")
 				}
 			}
+			// MySQL returns error 1064 when MODIFY COLUMN on a generated column has inline REFERENCES clause.
+			if op.NewColDefinition.Type.Options != nil && op.NewColDefinition.Type.Options.As != nil &&
+				op.NewColDefinition.Type.Options.Reference != nil {
+				refTbl := op.NewColDefinition.Type.Options.Reference.ReferencedTable.Name.String()
+				return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'references %s(a)' at line 1", refTbl))
+			}
 			if mysqlCharLen(colDef.Comment) > 1024 {
 				if e.isStrictMode() {
 					return nil, mysqlError(1629, "HY000", fmt.Sprintf("Comment for field '%s' is too long (max = 1024)", colDef.Name))
@@ -3173,6 +3296,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				var rangeErr error
 				for i := range tbl.Rows {
 					if v, err := e.evalGeneratedColumnExpr(genExpr, tbl.Rows[i]); err == nil {
+						// Coerce the computed value to the declared column type (use base type without GC expr)
+						if v != nil {
+							v = coerceColumnValue(baseColumnType(colDef.Type), v)
+						}
 						// For MODIFY COLUMN, always check range (existing data must fit new type)
 						if re := checkIntegerRangeForColumn(colDef.Type, colDef.Name, v); re != nil {
 							rangeErr = re
@@ -3263,6 +3390,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				var rangeErr2 error
 				for i := range tbl.Rows {
 					if v, err := e.evalGeneratedColumnExpr(genExpr, tbl.Rows[i]); err == nil {
+						// Coerce the computed value to the declared column type (use base type without GC expr)
+						if v != nil {
+							v = coerceColumnValue(baseColumnType(colDef.Type), v)
+						}
 						// For CHANGE COLUMN, always check range (existing data must fit new type)
 						if re := checkIntegerRangeForColumn(colDef.Type, colDef.Name, v); re != nil {
 							rangeErr2 = re
@@ -3671,8 +3802,24 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		case *sqlparser.AddConstraintDefinition:
 			// Create implicit index for foreign key constraints (MySQL auto-creates these).
 			if fkDef, ok := op.ConstraintDefinition.Details.(*sqlparser.ForeignKeyDefinition); ok {
-				// Reject FK on virtual generated columns and certain FK actions on stored generated columns
+				// First check all FK source columns actually exist in the table
 				tableDef0, _ := db.GetTable(tableName)
+				if tableDef0 != nil {
+					for _, srcCol := range fkDef.Source {
+						srcName := srcCol.String()
+						found := false
+						for _, col := range tableDef0.Columns {
+							if strings.EqualFold(col.Name, srcName) {
+								found = true
+								break
+							}
+						}
+						if !found {
+							return nil, mysqlError(1072, "42000", fmt.Sprintf("Key column '%s' doesn't exist in table", srcName))
+						}
+					}
+				}
+				// Reject FK on virtual generated columns and certain FK actions on stored generated columns
 				if tableDef0 != nil {
 					for _, srcCol := range fkDef.Source {
 						srcName := srcCol.String()
@@ -3762,6 +3909,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 		case *sqlparser.DropKey:
 			if op.Type == sqlparser.PrimaryKeyType {
+				// Check that a primary key actually exists before dropping
+				if td, tdErr := db.GetTable(tableName); tdErr == nil && td != nil && len(td.PrimaryKey) == 0 {
+					return nil, mysqlError(1091, "42000", "Can't DROP 'PRIMARY'; check that column/key exists")
+				}
 				db.DropPrimaryKey(tableName)
 			} else if op.Type == sqlparser.ForeignKeyType {
 				// Remove FK constraint from table definition
@@ -4098,21 +4249,50 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 	// ALTER TABLE affected rows: MySQL reports the number of rows when data modification
 	// is required (adding stored columns, modifying column types, etc.). Adding only virtual
 	// generated columns doesn't require row rewrite so affected rows = 0.
+	// For MyISAM (and other non-InnoDB engines), ALL column additions require a table copy.
+	// For InnoDB, only STORED generated columns, MODIFY/CHANGE require a table rebuild.
 	var alterAffected uint64
 	requiresRowRewrite := false
+	// Determine the storage engine of the table being altered.
+	isMyISAMEngine := false
+	{
+		if tableDef, tdErr := db.GetTable(tableName); tdErr == nil && tableDef != nil {
+			eng := strings.ToUpper(tableDef.Engine)
+			if eng == "MYISAM" || eng == "ARCHIVE" || eng == "HEAP" || eng == "MEMORY" {
+				isMyISAMEngine = true
+			}
+		}
+		// Check if the ALTER TABLE itself changes the engine
+		for _, opt := range stmt.AlterOptions {
+			if to, ok := opt.(sqlparser.TableOptions); ok {
+				for _, tableOpt := range to {
+					if strings.EqualFold(tableOpt.Name, "ENGINE") {
+						eng := strings.ToUpper(tableOpt.String)
+						if eng == "MYISAM" || eng == "ARCHIVE" || eng == "HEAP" || eng == "MEMORY" {
+							isMyISAMEngine = true
+						} else {
+							isMyISAMEngine = false
+						}
+					}
+				}
+			}
+		}
+	}
 	for _, opt := range stmt.AlterOptions {
 		switch op := opt.(type) {
 		case *sqlparser.AddColumns:
 			for _, col := range op.Columns {
-				if col.Type.Options != nil && col.Type.Options.As != nil {
-					// Stored generated column requires row rewrite
+				if isMyISAMEngine {
+					// MyISAM always rewrites the table for any column addition
+					requiresRowRewrite = true
+				} else if col.Type.Options != nil && col.Type.Options.As != nil {
+					// InnoDB: Stored generated column requires row rewrite
 					if col.Type.Options.Storage == sqlparser.StoredStorage {
 						requiresRowRewrite = true
 					}
-				} else {
-					// Regular (non-generated) column doesn't require row rewrite for virtual-only ALTERs
-					// but does if there are stored columns too
+					// Virtual generated column: no row rewrite needed on InnoDB
 				}
+				// InnoDB: Regular column addition uses instant/inplace DDL (affected rows = 0)
 			}
 		case *sqlparser.ModifyColumn:
 			requiresRowRewrite = true
@@ -4902,6 +5082,12 @@ func (e *Executor) inferColumnAttrs(selectSQL, colName string) columnAttrs {
 									if strings.EqualFold(col.Name, colRef.Name.String()) {
 										// For inferred result types, ZEROFILL is stripped but UNSIGNED is kept.
 										colT := col.Type
+										// Strip generated column expression - CTAS produces plain columns
+										if upperColT := strings.ToUpper(colT); strings.Contains(upperColT, " GENERATED ALWAYS AS ") {
+											if gIdx := strings.Index(upperColT, " GENERATED ALWAYS AS "); gIdx >= 0 {
+												colT = strings.TrimSpace(colT[:gIdx])
+											}
+										}
 										if strings.Contains(strings.ToLower(colT), "zerofill") {
 											colT = strings.TrimSpace(strings.ReplaceAll(strings.ToLower(colT), "zerofill", ""))
 											colT = strings.TrimSpace(colT)
@@ -4956,12 +5142,20 @@ func (e *Executor) inferColumnTypeFromSelect(sel *sqlparser.Select, colName stri
 		srcTableDefs = append(srcTableDefs, tblDef)
 	}
 
-	// Helper: find column type in all source table defs
+	// Helper: find column type in all source table defs.
+	// Strips any generated-column expression from the type, since CTAS should produce
+	// plain columns (the values are already materialized in the SELECT result).
 	findColType := func(cn string) string {
 		for _, tblDef := range srcTableDefs {
 			for _, col := range tblDef.Columns {
 				if strings.EqualFold(col.Name, cn) {
-					return col.Type
+					t := col.Type
+					// Strip " GENERATED ALWAYS AS (...) VIRTUAL/STORED" suffix
+					upperT := strings.ToUpper(t)
+					if idx := strings.Index(upperT, " GENERATED ALWAYS AS "); idx >= 0 {
+						t = strings.TrimSpace(t[:idx])
+					}
+					return t
 				}
 			}
 		}
