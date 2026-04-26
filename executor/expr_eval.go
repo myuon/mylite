@@ -8956,6 +8956,10 @@ func (e *Executor) validateFulltextIndex(v *sqlparser.MatchExpr) error {
 		if hasMatchingFTIndex(tblDef) {
 			return nil
 		}
+		// MyISAM allows MATCH without a FULLTEXT index (full table scan without index).
+		if strings.EqualFold(tblDef.Engine, "MYISAM") {
+			return nil
+		}
 	} else {
 		// No qualifier: search all tables in the current database
 		for _, name := range db.ListTables() {
@@ -8965,6 +8969,29 @@ func (e *Executor) validateFulltextIndex(v *sqlparser.MatchExpr) error {
 			}
 			if hasMatchingFTIndex(tblDef) {
 				return nil
+			}
+		}
+		// No matching FULLTEXT index found. For MyISAM tables, MATCH without an
+		// explicit FULLTEXT index is allowed (the engine performs a full table scan).
+		// Check if any table in the database that contains one of the MATCH columns
+		// uses the MyISAM engine. Also allow when the session default_storage_engine
+		// is set to MyISAM (e.g. via force_myisam_default.inc).
+		if eng, ok := e.getSysVar("default_storage_engine"); ok && strings.EqualFold(eng, "MYISAM") {
+			return nil
+		}
+		for _, name := range db.ListTables() {
+			tblDef, err := db.GetTable(name)
+			if err != nil || tblDef == nil {
+				continue
+			}
+			if !strings.EqualFold(tblDef.Engine, "MYISAM") {
+				continue
+			}
+			// Check if this MyISAM table has at least one of the MATCH columns
+			for _, col := range tblDef.Columns {
+				if matchSet[strings.ToLower(col.Name)] {
+					return nil
+				}
 			}
 		}
 	}
