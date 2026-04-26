@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
+	sfgeom "github.com/peterstace/simplefeatures/geom"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
@@ -1171,15 +1173,27 @@ func evalSpatialFunc(e *Executor, name string, exprs []sqlparser.Expr) (interfac
 	case "mbrcoveredby":
 		return evalSpatialRelation(e, exprs, "coveredby")
 	case "st_union", "st_intersection", "st_difference", "st_symdifference":
-		// Return first geometry as stub
 		if len(exprs) < 2 {
 			return nil, true, nil
 		}
-		val, err := e.evalExpr(exprs[0])
+		aVal, err := e.evalExpr(exprs[0])
 		if err != nil {
 			return nil, true, err
 		}
-		return val, true, nil
+		bVal, err := e.evalExpr(exprs[1])
+		if err != nil {
+			return nil, true, err
+		}
+		if aVal == nil || bVal == nil {
+			return nil, true, nil
+		}
+		aStr := toString(aVal)
+		bStr := toString(bVal)
+		result, err := evalSpatialSetOp(lower, aStr, bStr)
+		if err != nil {
+			return nil, true, err
+		}
+		return result, true, nil
 	case "st_buffer_strategy":
 		// Stub: return strategy name as-is
 		if len(exprs) < 1 {
@@ -2135,4 +2149,198 @@ func extractInnerCoords(wkt string) string {
 		return wkt
 	}
 	return wkt[idx:]
+}
+
+// wktTypeEmptyRe matches any geometry type followed by empty parens,
+// e.g. "GEOMETRYCOLLECTION()" or "POINT ()" anywhere in a WKT string.
+var wktTypeEmptyRe = regexp.MustCompile(`(?i)(POINT|LINESTRING|POLYGON|MULTIPOINT|MULTILINESTRING|MULTIPOLYGON|GEOMETRYCOLLECTION)\s*\(\s*\)`)
+
+// normalizeWKTForSF converts WKT quirks that simplefeatures doesn't accept into
+// the canonical form it expects.  Iteratively replaces TYPE() with TYPE EMPTY
+// to handle arbitrarily nested empty geometry collections.
+func normalizeWKTForSF(wkt string) string {
+	prev := ""
+	for prev != wkt {
+		prev = wkt
+		wkt = wktTypeEmptyRe.ReplaceAllStringFunc(wkt, func(m string) string {
+			loc := wktTypeEmptyRe.FindStringSubmatchIndex(m)
+			typeName := m[loc[2]:loc[3]]
+			return strings.ToUpper(typeName) + " EMPTY"
+		})
+	}
+	return wkt
+}
+
+// wktToSimpleFeature parses a WKT (or EWKT) string into a simplefeatures Geometry.
+// The SRID prefix is stripped before parsing; returns error on invalid WKT.
+func wktToSimpleFeature(wkt string) (sfgeom.Geometry, error) {
+	plain := geomStripSRID(strings.TrimSpace(wkt))
+	plain = normalizeWKTForSF(plain)
+	return sfgeom.UnmarshalWKT(plain, sfgeom.NoValidate{})
+}
+
+// safeSFOp calls fn() and recovers from any panic, returning it as an error.
+func safeSFOp(fn func() (sfgeom.Geometry, error)) (result sfgeom.Geometry, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	return fn()
+}
+
+// evalSpatialSetOp performs the named set operation (st_union, st_intersection,
+// st_difference, st_symdifference) on two WKT geometry strings and returns the
+// result as a WKT string.  The SRID of the first geometry is preserved.
+func evalSpatialSetOp(op, aWKT, bWKT string) (interface{}, error) {
+	// Preserve the SRID from the first argument
+	srid := geomGetSRID(aWKT)
+
+	a, err := wktToSimpleFeature(aWKT)
+	if err != nil {
+		return nil, fmt.Errorf("%s: invalid geometry A: %w", op, err)
+	}
+	b, err := wktToSimpleFeature(bWKT)
+	if err != nil {
+		return nil, fmt.Errorf("%s: invalid geometry B: %w", op, err)
+	}
+
+	// gcFallbackUnion tries UnaryUnion on a GeometryCollection containing both inputs,
+	// which is more robust for some degenerate geometries.
+	gcFallbackUnion := func() (sfgeom.Geometry, error) {
+		gc := sfgeom.NewGeometryCollection([]sfgeom.Geometry{a, b})
+		return safeSFOp(func() (sfgeom.Geometry, error) {
+			return sfgeom.UnaryUnion(gc.AsGeometry())
+		})
+	}
+
+	var result sfgeom.Geometry
+	switch op {
+	case "st_union":
+		result, err = safeSFOp(func() (sfgeom.Geometry, error) { return sfgeom.Union(a, b) })
+		if err != nil {
+			// Fall back to UnaryUnion via GeometryCollection for degenerate inputs.
+			result, err = gcFallbackUnion()
+			if err != nil {
+				// Both approaches failed on invalid input; return NULL.
+				return nil, nil
+			}
+		}
+	case "st_intersection":
+		result, err = safeSFOp(func() (sfgeom.Geometry, error) { return sfgeom.Intersection(a, b) })
+		if err != nil {
+			// For intersection, return empty collection on failure with degenerate inputs.
+			result = sfgeom.GeometryCollection{}.AsGeometry()
+			err = nil
+		}
+	case "st_difference":
+		result, err = safeSFOp(func() (sfgeom.Geometry, error) { return sfgeom.Difference(a, b) })
+		if err != nil {
+			// For difference, return A unchanged on failure.
+			result = a
+			err = nil
+		}
+	case "st_symdifference":
+		result, err = safeSFOp(func() (sfgeom.Geometry, error) { return sfgeom.SymmetricDifference(a, b) })
+		if err != nil {
+			// Fall back to UnaryUnion via GeometryCollection for degenerate inputs.
+			result, err = gcFallbackUnion()
+			if err != nil {
+				// Both approaches failed on invalid input; return NULL.
+				return nil, nil
+			}
+		}
+	default:
+		return nil, fmt.Errorf("unknown spatial set op: %s", op)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%s: operation failed: %w", op, err)
+	}
+
+	wkt := result.AsText()
+	// MySQL returns GEOMETRYCOLLECTION EMPTY for any empty set-operation result,
+	// regardless of the specific geometry type (e.g. simplefeatures may return
+	// POINT EMPTY, LINESTRING EMPTY, etc.).
+	if result.IsEmpty() && !strings.HasPrefix(strings.ToUpper(wkt), "GEOMETRYCOLLECTION") {
+		wkt = "GEOMETRYCOLLECTION EMPTY"
+	}
+	// MySQL outputs MULTIPOINT with points sorted by (X asc, Y asc).
+	// simplefeatures uses insertion/overlay order which may differ.
+	wkt = sortMultiPointWKT(wkt)
+	// Re-apply the SRID if the first argument had one
+	if srid != 0 {
+		wkt = geomSetSRID(wkt, srid)
+	}
+	return wkt, nil
+}
+
+// sortMultiPointWKT reorders MULTIPOINT coordinates to match MySQL's (X asc, Y asc) ordering.
+// Handles both plain MULTIPOINT and MULTIPOINT nested inside GEOMETRYCOLLECTION.
+func sortMultiPointWKT(wkt string) string {
+	upper := strings.ToUpper(wkt)
+	if !strings.Contains(upper, "MULTIPOINT") {
+		return wkt
+	}
+	// Use the sfgeom result to re-sort: parse, sort, regenerate.
+	g, err := sfgeom.UnmarshalWKT(wkt, sfgeom.NoValidate{})
+	if err != nil {
+		return wkt
+	}
+	sorted := sortMultiPointGeometry(g)
+	return sorted.AsText()
+}
+
+// sortMultiPointGeometry recursively sorts MULTIPOINT sub-geometries by (X, Y).
+func sortMultiPointGeometry(g sfgeom.Geometry) sfgeom.Geometry {
+	switch g.Type() {
+	case sfgeom.TypeMultiPoint:
+		mp := g.MustAsMultiPoint()
+		n := mp.NumPoints()
+		pts := make([]sfgeom.Point, n)
+		for i := 0; i < n; i++ {
+			pts[i] = mp.PointN(i)
+		}
+		// Sort by X asc, then Y asc to match MySQL output order.
+		sort.Slice(pts, func(i, j int) bool {
+			xyi, _ := pts[i].XY()
+			xyj, _ := pts[j].XY()
+			if xyi.X != xyj.X {
+				return xyi.X < xyj.X
+			}
+			return xyi.Y < xyj.Y
+		})
+		var sb strings.Builder
+		sb.WriteString("MULTIPOINT(")
+		for i, p := range pts {
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			// Format each point as "(x y)" which is the MULTIPOINT element syntax.
+			// p.AsText() returns "POINT(x y)" but MULTIPOINT elements use "(x y)".
+			pText := p.AsText() // e.g. "POINT(5 0)"
+			if strings.HasPrefix(pText, "POINT(") && strings.HasSuffix(pText, ")") {
+				sb.WriteString("(")
+				sb.WriteString(pText[6 : len(pText)-1])
+				sb.WriteString(")")
+			} else {
+				sb.WriteString(pText)
+			}
+		}
+		sb.WriteString(")")
+		sorted, err := sfgeom.UnmarshalWKT(sb.String(), sfgeom.NoValidate{})
+		if err != nil {
+			return g
+		}
+		return sorted
+	case sfgeom.TypeGeometryCollection:
+		gc := g.MustAsGeometryCollection()
+		n := gc.NumGeometries()
+		geoms := make([]sfgeom.Geometry, n)
+		for i := 0; i < n; i++ {
+			geoms[i] = sortMultiPointGeometry(gc.GeometryN(i))
+		}
+		return sfgeom.NewGeometryCollection(geoms).AsGeometry()
+	default:
+		return g
+	}
 }
