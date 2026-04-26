@@ -3969,8 +3969,21 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 	for _, expr := range stmt.SelectExprs.Exprs {
 		switch se := expr.(type) {
 		case *sqlparser.AliasedExpr:
+			// Vitess treats AS "" as no alias (IsEmpty()=true), but MySQL uses ""
+			// as the explicit column name. Check raw text for explicit string alias first.
+			rawForAlias := ""
+			if rawExprIdx < len(rawExprs) {
+				rawForAlias = strings.TrimSpace(rawExprs[rawExprIdx])
+			}
 			if !se.As.IsEmpty() {
 				colNames = append(colNames, se.As.String())
+				rawExprIdx++
+				continue
+			} else if alias, ok := extractExplicitStringAlias(rawForAlias); ok {
+				// Explicit string alias (e.g. AS "" or AS 'name') detected in raw text
+				colNames = append(colNames, alias)
+				rawExprIdx++
+				continue
 			} else if isAggregateExpr(se.Expr) {
 				// Use raw expression text for aggregates, then normalize
 				// MySQL displays function args without space after comma: JSON_OBJECTAGG(k,b)
@@ -5680,6 +5693,16 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 			rawExprIdx++
 		case *sqlparser.AliasedExpr:
 			name := ""
+			// Check for explicit string alias (e.g. AS "" or AS 'name') in raw text FIRST,
+			// because Vitess treats AS "" as no alias (IsEmpty() returns true), but MySQL uses "" as column name.
+			if rawExprIdx < len(rawExprs) {
+				if alias, ok := extractExplicitStringAlias(strings.TrimSpace(rawExprs[rawExprIdx])); ok {
+					cols = append(cols, alias)
+					colExprs = append(colExprs, se.Expr)
+					rawExprIdx++
+					continue
+				}
+			}
 			if !se.As.IsEmpty() {
 				name = se.As.String()
 			} else if lit, ok := se.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
@@ -6855,6 +6878,38 @@ func (e *Executor) execSelectNoFrom(stmt *sqlparser.Select) (*Result, error) {
 		switch se := expr.(type) {
 		case *sqlparser.AliasedExpr:
 			name := ""
+			// Check for explicit string alias (e.g. AS "" or AS 'name') in raw text FIRST,
+			// because Vitess treats AS "" as no alias (IsEmpty() returns true), but MySQL uses "" as column name.
+			if rawExprIdx < len(rawExprs) {
+				if alias, ok := extractExplicitStringAlias(strings.TrimSpace(rawExprs[rawExprIdx])); ok {
+					name = alias
+					colNames = append(colNames, name)
+					rawExprIdx++
+					// Evaluate the value for this expression and continue
+					if containsWindowFunc(se.Expr) {
+						syntheticRow := storage.Row{}
+						syntheticAllRows := []storage.Row{syntheticRow}
+						syntheticResultRows := [][]interface{}{{nil}}
+						wfInfo := findWindowFuncs([]sqlparser.Expr{se.Expr})
+						if len(wfInfo) > 0 {
+							wfInfo = resolveNamedWindows(wfInfo, stmt.Windows)
+							for _, wf := range wfInfo {
+								if err := e.computeWindowFunc(wf, syntheticAllRows, syntheticResultRows); err != nil {
+									return nil, err
+								}
+							}
+							values = append(values, syntheticResultRows[0][0])
+							continue
+						}
+					}
+					v, err := e.evalExpr(se.Expr)
+					if err != nil {
+						return nil, err
+					}
+					values = append(values, v)
+					continue
+				}
+			}
 			if !se.As.IsEmpty() {
 				name = se.As.String()
 			} else if lit, ok := se.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
