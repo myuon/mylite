@@ -1523,6 +1523,13 @@ func (e *Executor) execCallProcFromAST(stmt *sqlparser.CallProc) (*Result, error
 
 // callProcedureByNameInDB looks up and executes a stored procedure in a specific database.
 func (e *Executor) callProcedureByNameInDB(dbName string, procName string, argStrs []string) (*Result, error) {
+	// Handle sys schema native procedures
+	if strings.EqualFold(dbName, "sys") {
+		if result, handled, err := e.execSysSchemaProcedure(procName, argStrs); handled {
+			return result, err
+		}
+	}
+
 	db, err := e.Catalog.GetDatabase(dbName)
 	if err != nil {
 		// Silently accept calls to procedures in unknown databases for compatibility

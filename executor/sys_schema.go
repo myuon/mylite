@@ -1607,6 +1607,77 @@ func sysStrPtr(s string) *string {
 	return &s
 }
 
+// execSysSchemaProcedure handles native Go implementations of sys schema procedures.
+// Returns (result, handled, error). If handled is false, fall through to stored procedure lookup.
+func (e *Executor) execSysSchemaProcedure(procName string, argStrs []string) (*Result, bool, error) {
+	switch strings.ToLower(procName) {
+	case "table_exists":
+		// CALL sys.table_exists(in_db VARCHAR(64), in_table VARCHAR(64), OUT out_table_exists VARCHAR(64))
+		// Sets out param to 'BASE TABLE', 'VIEW', 'TEMPORARY', or ''
+		if len(argStrs) < 3 {
+			return nil, true, nil
+		}
+		// Evaluate in_db
+		inDB := e.evalProcArg(argStrs[0])
+		inTable := e.evalProcArg(argStrs[1])
+
+		dbStr := ""
+		if inDB != nil {
+			dbStr = toString(inDB)
+		}
+		tableStr := ""
+		if inTable != nil {
+			tableStr = toString(inTable)
+		}
+
+		// Validate lengths (max 64 chars for each param)
+		if len(dbStr) > 64 {
+			return nil, true, mysqlError(1406, "22001", "Data too long for column 'in_db' at row 1")
+		}
+		if len(tableStr) > 64 {
+			return nil, true, mysqlError(1406, "22001", "Data too long for column 'in_table' at row 1")
+		}
+
+		// Determine table type
+		tableType := ""
+		tableNameLower := strings.ToLower(tableStr)
+
+		// Check for TEMPORARY first (overrides BASE TABLE)
+		if e.tempTables != nil && (e.tempTables[tableStr] || e.tempTables[tableNameLower]) {
+			tableType = "TEMPORARY"
+		} else {
+			// Check for VIEW
+			if e.viewStore != nil {
+				if _, ok := e.viewStore.Lookup(dbStr, tableStr); ok {
+					tableType = "VIEW"
+				}
+			}
+			if tableType == "" {
+				// Check for BASE TABLE in catalog
+				if db, err := e.Catalog.GetDatabase(dbStr); err == nil {
+					if _, err := db.GetTable(tableStr); err == nil {
+						tableType = "BASE TABLE"
+					}
+				}
+			}
+		}
+
+		// Write result to OUT parameter user variable
+		outArgStr := strings.TrimSpace(argStrs[2])
+		if strings.HasPrefix(outArgStr, "@") {
+			userVar := strings.TrimPrefix(outArgStr, "@")
+			if e.userVars == nil {
+				e.userVars = make(map[string]interface{})
+			}
+			e.userVars[userVar] = tableType // empty string "" when not found
+		}
+		return &Result{}, true, nil
+
+	default:
+		return nil, false, nil
+	}
+}
+
 // evalSysSchemaFunc evaluates built-in sys schema functions.
 // Returns (result, handled, error). If handled is false, the caller should try other dispatch paths.
 func (e *Executor) evalSysSchemaFunc(name string, args []sqlparser.Expr) (interface{}, bool, error) {
@@ -1755,6 +1826,106 @@ func (e *Executor) evalSysSchemaFunc(name string, args []sqlparser.Expr) (interf
 			return val, true, nil
 		}
 		return defaultVal, true, nil
+
+	case "format_statement":
+		// format_statement(statement) — truncate statement to statement_truncate_len characters.
+		// The truncation replaces the middle portion with " ... " to indicate truncation.
+		if len(args) < 1 {
+			return nil, true, nil
+		}
+		val, err := e.evalExpr(args[0])
+		if err != nil {
+			return nil, true, err
+		}
+		if val == nil {
+			return nil, true, nil
+		}
+		stmt := toString(val)
+		// Get truncation length from user variable @sys.statement_truncate_len, fallback to 64
+		truncLen := int64(64)
+		if uv, ok := e.userVars["sys.statement_truncate_len"]; ok && uv != nil {
+			n := toInt64(uv)
+			if n > 0 {
+				truncLen = n
+			}
+		}
+		if int64(len(stmt)) <= truncLen {
+			return stmt, true, nil
+		}
+		// Truncate: MySQL uses floor((truncLen-4)/2) chars for front and back,
+		// with ' ... ' (5 chars) as separator. Result length = truncLen+1.
+		half := int((truncLen - 4) / 2)
+		front := stmt[:half]
+		back := stmt[len(stmt)-half:]
+		return front + " ... " + back, true, nil
+
+	case "list_add":
+		// list_add(in_list, in_add_value) — add in_add_value to a comma-separated in_list.
+		// Returns error if in_add_value is NULL.
+		// Returns error if resulting string would exceed 4194304 bytes.
+		if len(args) < 2 {
+			return nil, true, nil
+		}
+		listVal, err := e.evalExpr(args[0])
+		if err != nil {
+			return nil, true, err
+		}
+		addVal, err := e.evalExpr(args[1])
+		if err != nil {
+			return nil, true, err
+		}
+		if addVal == nil {
+			return nil, true, mysqlError(1138, "02200", "Function sys.list_add: in_add_value input variable should not be NULL")
+		}
+		// Validate in_list size (max < 4MB = 4194304 bytes, per MySQL sys schema behavior)
+		if listVal != nil {
+			listStr := toString(listVal)
+			if len(listStr) >= 4194304 {
+				return nil, true, mysqlError(1406, "22001", "Data too long for column 'in_list' at row 1")
+			}
+		}
+		addStr := toString(addVal)
+		if listVal == nil || toString(listVal) == "" {
+			return addStr, true, nil
+		}
+		// Strip trailing comma/space from list before appending
+		listStr := strings.TrimRight(toString(listVal), ", ")
+		return listStr + "," + addStr, true, nil
+
+	case "list_drop":
+		// list_drop(in_list, in_drop_value) — remove in_drop_value from a comma-separated in_list.
+		// Returns error if in_drop_value is NULL.
+		if len(args) < 2 {
+			return nil, true, nil
+		}
+		listVal, err := e.evalExpr(args[0])
+		if err != nil {
+			return nil, true, err
+		}
+		dropVal, err := e.evalExpr(args[1])
+		if err != nil {
+			return nil, true, err
+		}
+		if dropVal == nil {
+			return nil, true, mysqlError(1138, "02200", "Function sys.list_drop: in_drop_value input variable should not be NULL")
+		}
+		if listVal == nil {
+			return nil, true, nil
+		}
+		listStr := toString(listVal)
+		dropStr := toString(dropVal)
+		// Split by comma, remove the matching element, rejoin
+		// Handle both "a,b,c" and "a, b, c" (with spaces) patterns
+		// MySQL's list_drop does exact match on trimmed tokens
+		parts := strings.Split(listStr, ",")
+		var result []string
+		for _, part := range parts {
+			trimmed := strings.TrimSpace(part)
+			if trimmed != dropStr {
+				result = append(result, part)
+			}
+		}
+		return strings.Join(result, ","), true, nil
 
 	default:
 		return nil, false, nil

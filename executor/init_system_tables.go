@@ -2,11 +2,40 @@ package executor
 
 import (
 	"github.com/myuon/mylite/catalog"
+	"github.com/myuon/mylite/storage"
 )
 
 func (e *Executor) initSystemTables() {
 	if e.Catalog == nil || e.Storage == nil {
 		return
+	}
+
+	// Initialize sys schema: register all stub tables/views, functions, procedures, triggers
+	// and seed initial data rows.
+	if sysDB, err := e.Catalog.GetDatabase("sys"); err == nil {
+		if len(sysDB.Tables) == 0 {
+			initSysSchema(sysDB)
+			e.Storage.EnsureDatabase("sys")
+			for _, tbl := range sysDB.Tables {
+				e.Storage.CreateTable("sys", tbl)
+			}
+		}
+		// Seed sys.version (idempotent: only insert if empty)
+		if vt, vtErr := e.Storage.GetTable("sys", "version"); vtErr == nil {
+			if e.tableRowCount("sys", "version") == 0 {
+				vt.Insert(storage.Row{"sys_version": "2.1.0", "mysql_version": "8.0.36"}) //nolint:errcheck
+			}
+		}
+		// Seed sys.sys_config (idempotent: only insert if empty)
+		if e.tableRowCount("sys", "sys_config") == 0 {
+			_, _ = e.Execute(`INSERT INTO sys.sys_config (variable, value) VALUES` +
+				` ('diagnostics.allow_i_s_tables', 'OFF'),` +
+				` ('diagnostics.include_raw', 'OFF'),` +
+				` ('ps_thread_trx_info.max_length', '65535'),` +
+				` ('statement_performance_analyzer.limit', '100'),` +
+				` ('statement_performance_analyzer.view', NULL),` +
+				` ('statement_truncate_len', '64')`)
+		}
 	}
 
 	ensure := func(dbName string, def *catalog.TableDef) {
