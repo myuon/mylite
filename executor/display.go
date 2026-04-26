@@ -137,16 +137,29 @@ func stripCharsetIntroducerForColName(s string) string {
 	if len(s) >= 3 && (s[0] == 'n' || s[0] == 'N') && s[1] == '\'' && s[len(s)-1] == '\'' {
 		return s[1:]
 	}
-	// Handle _charset'...' pattern
+	// Handle _charset'...' pattern (e.g. _utf8'abc', _latin1'hello')
+	// A charset introducer has no spaces or operators between _ and the quote.
+	// Expressions like "_bit | x'cafebabe'" start with _ but are not charset introducers.
 	if len(s) >= 3 && s[0] == '_' {
-		// Find the quote
+		// Find the quote, but only if all chars between _ and ' are identifier chars
+		isCharsetIntroducer := false
+		quotePos := -1
 		for i := 1; i < len(s); i++ {
-			if s[i] == '\'' {
-				if i < len(s)-1 && s[len(s)-1] == '\'' {
-					return s[i:]
-				}
+			ch := s[i]
+			if ch == '\'' {
+				quotePos = i
 				break
 			}
+			// Charset names are letters, digits, underscore only (e.g. utf8mb4, latin1)
+			if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_') {
+				break // space, operator, etc. → not a charset introducer
+			}
+		}
+		if quotePos > 0 && s[len(s)-1] == '\'' {
+			isCharsetIntroducer = true
+		}
+		if isCharsetIntroducer {
+			return s[quotePos:]
 		}
 	}
 	return s
