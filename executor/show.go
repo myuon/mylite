@@ -1262,8 +1262,19 @@ func mysqlFormatGenExpr(exprStr string, colCharset string) string {
 		*sqlparser.CastExpr:
 		// Function-like expressions: no extra parens
 		return inner
+	case *sqlparser.IntroducerExpr:
+		// Charset-introduced literals like _utf8mb4'aaaabb': no extra parens
+		return inner
+	case *sqlparser.ColName:
+		// Simple column references: no extra parens (mysqlGeneratedClause already adds outer parens)
+		return inner
 	case *sqlparser.Literal:
-		// When column has explicit charset, the charset introducer makes the
+		lit := aliased.Expr.(*sqlparser.Literal)
+		if lit.Type != sqlparser.StrVal {
+			// Numeric and other non-string literals: no extra parens
+			return inner
+		}
+		// String literals: when column has explicit charset, the charset introducer makes the
 		// literal a complete expression (e.g. _latin1'...') — no extra parens.
 		if colCharset != "" {
 			return inner
@@ -1296,7 +1307,12 @@ func mysqlGenExprNode(expr sqlparser.Expr, colCharset string) string {
 	case *sqlparser.Literal:
 		if e.Type == sqlparser.StrVal {
 			if colCharset != "" {
-				return "_" + colCharset + "'" + e.Val + "'"
+				// MySQL 8.0 normalizes "utf8" to "utf8mb4" in charset introducers
+				displayCharset := colCharset
+				if strings.EqualFold(displayCharset, "utf8") || strings.EqualFold(displayCharset, "utf8mb3") {
+					displayCharset = "utf8mb4"
+				}
+				return "_" + displayCharset + "'" + e.Val + "'"
 			}
 			return "'" + e.Val + "'"
 		}
@@ -1484,7 +1500,8 @@ func mysqlDisplayType(colType string) string {
 		"MULTIPOINT", "MULTILINESTRING", "MULTIPOLYGON":
 		return strings.ToLower(base)
 	default:
-		return strings.ToLower(colType)
+		// Use stripped (GC clause removed) to avoid duplicating the generated column expression
+		return strings.ToLower(stripped)
 	}
 }
 
@@ -1986,7 +2003,8 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		parts = append(parts, fmt.Sprintf("  %s", quoteFunc(col.Name)))
 		parts = append(parts, mysqlDisplayType(col.Type))
 		// Column-level CHARACTER SET / COLLATE (when different from table default)
-		if col.Charset != "" {
+		// Only show charset/collation for character types; numeric/temporal types don't carry charset.
+		if col.Charset != "" && columnTypeSupportsCharset(col.Type) {
 			tableCharset := def.Charset
 			if tableCharset == "" {
 				tableCharset = "utf8mb4"
@@ -2030,8 +2048,17 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		genExpr := generatedColumnExpr(col.Type)
 		isGenerated := genExpr != ""
 		if isGenerated {
-			// Append GENERATED ALWAYS AS (...) VIRTUAL/STORED
-			parts = append(parts, mysqlGeneratedClause(genExpr, col.Type, col.Charset))
+			// Append GENERATED ALWAYS AS (...) VIRTUAL/STORED.
+			// Use the effective charset (column charset if set, else table charset) so that
+			// string literals in the expression get the correct _utf8mb4 introducer prefix.
+			effectiveCharset := col.Charset
+			if effectiveCharset == "" && columnTypeSupportsCharset(col.Type) {
+				effectiveCharset = def.Charset
+				if effectiveCharset == "" {
+					effectiveCharset = "utf8mb4"
+				}
+			}
+			parts = append(parts, mysqlGeneratedClause(genExpr, col.Type, effectiveCharset))
 		}
 		if !col.Nullable {
 			parts = append(parts, "NOT NULL")

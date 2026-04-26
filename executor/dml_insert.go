@@ -2395,6 +2395,17 @@ func isGeneratedColumnType(colType string) bool {
 	return generatedColumnExpr(colType) != ""
 }
 
+// baseColumnType strips the GENERATED ALWAYS AS (...) [STORED|VIRTUAL] suffix
+// from a column type string, returning just the base data type (e.g. "INTEGER").
+func baseColumnType(colType string) string {
+	upper := strings.ToUpper(colType)
+	idx := strings.Index(upper, " GENERATED ALWAYS AS ")
+	if idx < 0 {
+		return colType
+	}
+	return strings.TrimSpace(colType[:idx])
+}
+
 func (e *Executor) evalGeneratedColumnExpr(expr string, row storage.Row) (interface{}, error) {
 	stmt, err := e.parser().Parse("SELECT " + expr)
 	if err != nil {
@@ -2456,14 +2467,126 @@ var blockedGcolFunctions = map[string]string{
 	"source_pos_wait":       "source_pos_wait",
 	"encrypt":               "`encrypt`",
 	"updatexml":             "updatexml",
-	"json_merge":            "json_merge",
+	"json_merge":            "json_merge_preserve", // JSON_MERGE is deprecated alias for JSON_MERGE_PRESERVE
+	"json_merge_preserve":   "json_merge_preserve",
+}
+
+// knownMySQLBuiltinFunctions is the whitelist of MySQL built-in functions allowed in
+// generated column expressions. Any FuncExpr not in this set (and not already in
+// blockedGcolFunctions) is treated as a user-defined or unknown function and rejected.
+var knownMySQLBuiltinFunctions = map[string]bool{
+	// Math functions
+	"abs": true, "acos": true, "asin": true, "atan": true, "atan2": true,
+	"ceil": true, "ceiling": true, "conv": true, "cos": true, "cot": true,
+	"crc32": true, "degrees": true, "exp": true, "floor": true, "format": true,
+	"greatest": true, "hex": true, "least": true, "ln": true,
+	"log": true, "log10": true, "log2": true, "mod": true,
+	"oct": true, "pi": true, "pow": true, "power": true, "radians": true,
+	"rand": true, "round": true, "sign": true, "sin": true, "sqrt": true,
+	"tan": true, "truncate": true,
+	// String functions
+	"ascii": true, "bin": true, "bit_count": true, "bit_length": true,
+	"char": true, "char_length": true, "character_length": true,
+	"charset": true, "coercibility": true, "collation": true,
+	"compress": true, "concat": true, "concat_ws": true,
+	"convert": true, "elt": true, "export_set": true,
+	"field": true, "find_in_set": true, "from_base64": true,
+	"instr": true, "insert": true,
+	"lcase": true, "left": true, "length": true, "lower": true,
+	"lpad": true, "ltrim": true, "make_set": true, "mid": true,
+	"nullif": true, "coalesce": true, "isnull": true,
+	"octet_length": true, "ord": true, "position": true,
+	"quote": true, "repeat": true, "replace": true, "reverse": true,
+	"right": true, "rpad": true, "rtrim": true,
+	"soundex": true, "space": true, "strcmp": true, "str_to_date": true,
+	"substr": true, "substring": true, "substring_index": true,
+	"to_base64": true, "trim": true, "ucase": true, "uncompress": true,
+	"uncompressed_length": true, "unhex": true, "upper": true,
+	"weight_string": true,
+	// Date/time functions
+	"adddate": true, "addtime": true, "convert_tz": true,
+	"date": true, "date_add": true, "date_format": true, "date_sub": true,
+	"datediff": true, "day": true, "dayname": true, "dayofmonth": true,
+	"dayofweek": true, "dayofyear": true, "extract": true,
+	"from_days": true, "from_unixtime": true, "get_format": true,
+	"hour": true, "last_day": true, "makedate": true, "maketime": true,
+	"microsecond": true, "minute": true, "month": true, "monthname": true,
+	"period_add": true, "period_diff": true, "quarter": true,
+	"sec_to_time": true, "second": true,
+	"subdate": true, "subtime": true, "time": true, "time_format": true,
+	"time_to_sec": true, "timediff": true, "timestamp": true,
+	"timestampadd": true, "timestampdiff": true, "to_days": true,
+	"to_seconds": true, "week": true, "weekday": true, "weekofyear": true,
+	"year": true, "yearweek": true,
+	// Encryption/hash functions
+	"aes_decrypt": true, "aes_encrypt": true, "md5": true, "random_bytes": true,
+	"sha": true, "sha1": true, "sha2": true,
+	// Type conversion
+	"cast": true, "binary": true,
+	// Conditional functions
+	"if": true, "ifnull": true, "interval": true,
+	// Network functions
+	"inet_aton": true, "inet_ntoa": true, "inet6_aton": true, "inet6_ntoa": true,
+	"is_ipv4": true, "is_ipv4_compat": true, "is_ipv4_mapped": true, "is_ipv6": true,
+	// UUID functions
+	"bin_to_uuid": true, "is_uuid": true, "uuid_to_bin": true,
+	// JSON functions (partial)
+	"json_array": true, "json_contains": true, "json_contains_path": true,
+	"json_depth": true, "json_extract": true, "json_insert": true,
+	"json_keys": true, "json_length": true, "json_merge_patch": true,
+	"json_merge_preserve": true, "json_object": true, "json_overlaps": true,
+	"json_pretty": true, "json_quote": true, "json_remove": true,
+	"json_replace": true, "json_search": true, "json_set": true,
+	"json_table": true, "json_type": true, "json_unquote": true,
+	"json_valid": true, "json_value": true,
+	// Spatial functions
+	"st_area": true, "st_astext": true, "st_aswkt": true,
+	"st_buffer": true, "st_centroid": true, "st_contains": true,
+	"st_convexhull": true, "st_crosses": true, "st_difference": true,
+	"st_dimension": true, "st_disjoint": true, "st_distance": true,
+	"st_distance_sphere": true, "st_envelope": true, "st_equals": true,
+	"st_exteriorring": true, "st_geohash": true, "st_geomcollection": true,
+	"st_geometrycollectionfromtext": true, "st_geometrycollectionfromwkb": true,
+	"st_geometryfromtext": true, "st_geometryfromwkb": true,
+	"st_geometryn": true, "st_geometrytype": true,
+	"st_intersection": true, "st_intersects": true, "st_isvalid": true,
+	"st_latfromgeohash": true, "st_latitude": true,
+	"st_linefromtext": true, "st_linefromwkb": true,
+	"st_linestringfromtext": true, "st_linestringfromwkb": true,
+	"st_longitude": true, "st_longfromgeohash": true,
+	"st_makeenvelope": true, "st_mlinefromtext": true, "st_mlinefromwkb": true,
+	"st_mpointfromtext": true, "st_mpointfromwkb": true,
+	"st_mpolyfromtext": true, "st_mpolyfromwkb": true,
+	"st_multilinestringfromtext": true, "st_multilinestringfromwkb": true,
+	"st_multipointfromtext": true, "st_multipointfromwkb": true,
+	"st_multipolygonfromtext": true, "st_multipolygonfromwkb": true,
+	"st_numgeometries": true, "st_numinteriorring": true,
+	"st_numinteriorrings": true, "st_numpoints": true,
+	"st_overlaps": true, "st_pointfromgeohash": true,
+	"st_pointfromtext": true, "st_pointfromwkb": true,
+	"st_pointn": true, "st_polyfromtext": true, "st_polyfromwkb": true,
+	"st_polygonfromtext": true, "st_polygonfromwkb": true,
+	"st_simplify": true, "st_srid": true, "st_startpoint": true,
+	"st_swapxy": true, "st_symdifference": true, "st_touches": true,
+	"st_transform": true, "st_union": true, "st_validate": true,
+	"st_within": true, "st_x": true, "st_y": true,
+	// Misc functions
+	"default": true,
+	"regexp_like": true, "regexp_instr": true, "regexp_replace": true,
+	"regexp_substr": true,
+	"roles_graphml": true, "row_number": true,
+	// Also allow some common aliases
+	"now": true, // blocked but recognized as built-in
 }
 
 // findBlockedFunctionInExpr walks an expression tree and returns the name of the
 // first disallowed function found, or "" if none.
-func findBlockedFunctionInExpr(expr sqlparser.Expr) (string, bool) {
+// Returns (funcName, isGroupFunc, found) where isGroupFunc=true means error 1111
+// "Invalid use of group function" should be raised.
+func findBlockedFunctionInExpr(expr sqlparser.Expr) (string, bool, bool) {
 	var blocked string
 	found := false
+	isGroupFunc := false
 	sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
 		if found {
 			return false, nil
@@ -2497,10 +2620,78 @@ func findBlockedFunctionInExpr(expr sqlparser.Expr) (string, bool) {
 			blocked = "values"
 			found = true
 			return false, nil
+		case *sqlparser.MatchExpr:
+			// MATCH ... AGAINST is not allowed in generated column expressions
+			blocked = "match"
+			found = true
+			return false, nil
+		case *sqlparser.UpdateXMLExpr:
+			// UpdateXML() is not allowed in generated column expressions
+			blocked = "updatexml"
+			found = true
+			return false, nil
+		case *sqlparser.JSONValueMergeExpr:
+			// JSON_MERGE (deprecated alias for JSON_MERGE_PRESERVE) and JSON_MERGE_PRESERVE
+			// are not allowed in generated column expressions.
+			// JSON_MERGE_PATCH is allowed.
+			if v.Type == sqlparser.JSONMergeType || v.Type == sqlparser.JSONMergePreserveType {
+				blocked = "json_merge_preserve"
+				found = true
+				return false, nil
+			}
+		case *sqlparser.Subquery:
+			// Subqueries are not allowed in generated column expressions (error 3102 generic)
+			found = true
+			return false, nil
+		case sqlparser.AggrFunc:
+			// Aggregate functions (AVG, COUNT, SUM, BIT_AND, BIT_OR, BIT_XOR, GROUP_CONCAT, etc.)
+			// are not allowed in generated column expressions (error 1111)
+			_ = v
+			found = true
+			isGroupFunc = true
+			return false, nil
 		}
 		return true, nil
 	}, expr)
-	return blocked, found
+	return blocked, isGroupFunc, found
+}
+
+// findStoredOrUnknownFuncInExpr checks whether a generated column expression contains
+// a call to a stored function/procedure (which is not allowed in generated columns).
+// Returns the function name if found, empty string otherwise.
+// db may be nil, in which case stored function detection is skipped.
+func findStoredOrUnknownFuncInExpr(expr sqlparser.Expr, db *catalog.Database) string {
+	var foundName string
+	sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if foundName != "" {
+			return false, nil
+		}
+		switch v := node.(type) {
+		case *sqlparser.FuncExpr:
+			name := strings.ToLower(v.Name.String())
+			// Skip if already in the blockedGcolFunctions list (already handled by findBlockedFunctionInExpr)
+			if _, ok := blockedGcolFunctions[name]; ok {
+				return true, nil
+			}
+			// Skip if it's a known built-in MySQL function
+			if knownMySQLBuiltinFunctions[name] {
+				return true, nil
+			}
+			// It's not a known built-in. Check if it's a stored function/procedure
+			// (or completely unknown). Both cases are disallowed in generated columns.
+			if db != nil {
+				if db.GetFunction(name) != nil || db.GetProcedure(name) != nil {
+					foundName = name
+					return false, nil
+				}
+			}
+			// Unknown function (not built-in, not stored) - also disallowed
+			foundName = name
+			return false, nil
+		}
+		return true, nil
+	}, expr)
+	return foundName
 }
 
 func (e *Executor) populateGeneratedColumns(row storage.Row, cols []catalog.ColumnDef) error {
@@ -2515,6 +2706,12 @@ func (e *Executor) populateGeneratedColumns(row storage.Row, cols []catalog.Colu
 		v, err := e.evalGeneratedColumnExpr(expr, row)
 		if err != nil {
 			return err
+		}
+		// Coerce the generated value to the declared column type (e.g. INTEGER truncates decimals).
+		// Use the base type only (strip GENERATED ALWAYS AS ... suffix) so coercion functions
+		// recognise the type correctly.
+		if v != nil {
+			v = coerceColumnValue(baseColumnType(col.Type), v)
 		}
 		row[col.Name] = v
 	}
