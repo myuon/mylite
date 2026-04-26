@@ -272,6 +272,10 @@ type Executor struct {
 	lastAutoIncID int64
 	// fixedTimestamp holds a fixed time for SET TIMESTAMP=N support.
 	fixedTimestamp *time.Time
+	// stmtTimestamp holds the statement-start time for NOW()/CURRENT_TIME()/etc.
+	// MySQL evaluates all current-time functions to the same value within one statement.
+	// This is set at the start of Execute() and cleared when it returns.
+	stmtTimestamp *time.Time
 	// timeZone holds the session time zone location for SET TIME_ZONE.
 	timeZone *time.Location
 	// correlatedRow holds the outer row for correlated subquery evaluation.
@@ -1629,6 +1633,17 @@ func (e *Executor) recordStatementDigest(query string) {
 }
 
 func (e *Executor) Execute(query string) (res *Result, retErr error) {
+	// Set the per-statement timestamp so that all NOW()/CURRENT_TIME()/CURRENT_TIMESTAMP()
+	// calls within one statement return the same value (MySQL-compatible behavior).
+	// Save and restore so that nested Execute() calls (e.g. stored-procedure statements)
+	// each get their own fresh start time.
+	{
+		prevStmtTimestamp := e.stmtTimestamp
+		now := time.Now()
+		e.stmtTimestamp = &now
+		defer func() { e.stmtTimestamp = prevStmtTimestamp }()
+	}
+
 	// Increment the Questions counter for every statement received from the client,
 	// including statements that preprocessQuery short-circuits (e.g. SHOW COUNT(*) WARNINGS).
 	// Skip incrementing for empty queries and for internal routine statements.
@@ -4064,10 +4079,19 @@ func (e *Executor) execUse(stmt *sqlparser.Use) (*Result, error) {
 	return &Result{}, nil
 }
 
-// nowTime returns the current time, respecting SET TIMESTAMP.
+// nowTime returns the current time, respecting SET TIMESTAMP and per-statement caching.
+// MySQL evaluates NOW()/CURRENT_TIME()/CURRENT_TIMESTAMP() to the same value within one statement.
 func (e *Executor) nowTime() time.Time {
 	if e.fixedTimestamp != nil {
 		t := *e.fixedTimestamp
+		if e.timeZone != nil {
+			t = t.In(e.timeZone)
+		}
+		return t
+	}
+	// Use the statement-start timestamp if set (ensures consistent values within one statement).
+	if e.stmtTimestamp != nil {
+		t := *e.stmtTimestamp
 		if e.timeZone != nil {
 			t = t.In(e.timeZone)
 		}
