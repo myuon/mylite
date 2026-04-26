@@ -133,6 +133,9 @@ var infoSchemaColumnOrder = map[string][]string{
 	"column_privileges":                {"GRANTEE", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "PRIVILEGE_TYPE", "IS_GRANTABLE"},
 	"routines":                         {"SPECIFIC_NAME", "ROUTINE_CATALOG", "ROUTINE_SCHEMA", "ROUTINE_NAME", "ROUTINE_TYPE", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH", "CHARACTER_OCTET_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE", "DATETIME_PRECISION", "CHARACTER_SET_NAME", "COLLATION_NAME", "DTD_IDENTIFIER", "ROUTINE_BODY", "ROUTINE_DEFINITION", "EXTERNAL_NAME", "EXTERNAL_LANGUAGE", "PARAMETER_STYLE", "IS_DETERMINISTIC", "SQL_DATA_ACCESS", "SQL_PATH", "SECURITY_TYPE", "CREATED", "LAST_ALTERED", "SQL_MODE", "ROUTINE_COMMENT", "DEFINER", "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION", "DATABASE_COLLATION"},
 	"views":                            {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "VIEW_DEFINITION", "CHECK_OPTION", "IS_UPDATABLE", "DEFINER", "SECURITY_TYPE", "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION"},
+	"st_spatial_reference_systems":     {"SRS_NAME", "SRS_ID", "ORGANIZATION", "ORGANIZATION_COORDSYS_ID", "DEFINITION", "DESCRIPTION"},
+	"st_geometry_columns":              {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "SRS_NAME", "SRS_ID", "GEOMETRY_TYPE_NAME"},
+	"st_units_of_measure":              {"UNIT_NAME", "UNIT_TYPE", "CONVERSION_FACTOR", "DESCRIPTION"},
 	// performance_schema stub tables
 	"accounts":                         {"USER", "HOST", "CURRENT_CONNECTIONS", "TOTAL_CONNECTIONS"},
 	"users":                            {"USER", "CURRENT_CONNECTIONS", "TOTAL_CONNECTIONS"},
@@ -491,7 +494,8 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 			"triggers", "table_constraints", "character_sets", "collations",
 			"collation_character_set_applicability", "user_privileges", "schema_privileges",
 			"table_privileges", "column_privileges", "routines", "views", "check_constraints",
-			"events", "partitions", "plugins", "resource_groups", "view_table_usage":
+			"events", "partitions", "plugins", "resource_groups", "view_table_usage",
+			"st_spatial_reference_systems", "st_geometry_columns", "st_units_of_measure":
 			return true
 		}
 		return false
@@ -872,6 +876,12 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.infoSchemaRoutines()
 	case "views":
 		rawRows = e.infoSchemaViews()
+	case "st_spatial_reference_systems":
+		rawRows = infoSchemaSpatialReferenceSystems()
+	case "st_geometry_columns":
+		rawRows = e.infoSchemaSTGeometryColumns()
+	case "st_units_of_measure":
+		rawRows = []storage.Row{}
 	// performance_schema stub tables – return empty result sets
 	case "accounts":
 		if v, ok := e.startupVars["performance_schema_accounts_size"]; ok && v == "0" {
@@ -5747,6 +5757,112 @@ func (e *Executor) perfSchemaESMHByDigest() []storage.Row {
 			"COUNT_BUCKET_AND_LOWER": d.CountStar,
 			"BUCKET_QUANTILE":        1.0,
 		})
+	}
+	return rows
+}
+
+// wgs84Definition is the WKT definition string for WGS 84 (SRID 4326).
+const wgs84Definition = `GEOGCS["WGS 84",DATUM["World Geodetic System 1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.017453292519943278,AUTHORITY["EPSG","9122"]],AXIS["Lat",NORTH],AXIS["Lon",EAST],AUTHORITY["EPSG","4326"]]`
+
+// infoSchemaSpatialReferenceSystems returns the minimal SRS catalog rows.
+// Columns: SRS_NAME, SRS_ID, ORGANIZATION, ORGANIZATION_COORDSYS_ID, DEFINITION, DESCRIPTION
+func infoSchemaSpatialReferenceSystems() []storage.Row {
+	return []storage.Row{
+		{
+			"SRS_NAME":                 "",
+			"SRS_ID":                   uint32(0),
+			"ORGANIZATION":             nil,
+			"ORGANIZATION_COORDSYS_ID": nil,
+			"DEFINITION":               "",
+			"DESCRIPTION":              nil,
+		},
+		{
+			"SRS_NAME":                 "WGS 84",
+			"SRS_ID":                   uint32(4326),
+			"ORGANIZATION":             "EPSG",
+			"ORGANIZATION_COORDSYS_ID": uint32(4326),
+			"DEFINITION":               wgs84Definition,
+			"DESCRIPTION":              nil,
+		},
+	}
+}
+
+// infoSchemaSTGeometryColumns returns rows for INFORMATION_SCHEMA.ST_GEOMETRY_COLUMNS.
+// Columns: TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SRS_NAME, SRS_ID, GEOMETRY_TYPE_NAME
+func (e *Executor) infoSchemaSTGeometryColumns() []storage.Row {
+	var rows []storage.Row
+	dbNames := e.Catalog.ListDatabases()
+	sort.Strings(dbNames)
+	for _, dbName := range dbNames {
+		switch strings.ToLower(dbName) {
+		case "information_schema", "mysql", "performance_schema", "sys":
+			continue
+		}
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		tableNames := db.ListTables()
+		sort.Strings(tableNames)
+		for _, tblName := range tableNames {
+			tbl, err := db.GetTable(tblName)
+			if err != nil {
+				continue
+			}
+			for _, col := range tbl.Columns {
+				colUpper := strings.ToUpper(col.Type)
+				// Check if this is a spatial type
+				if !strings.Contains(colUpper, "POINT") &&
+					!strings.Contains(colUpper, "LINESTRING") &&
+					!strings.Contains(colUpper, "POLYGON") &&
+					!strings.Contains(colUpper, "GEOMETRY") &&
+					!strings.Contains(colUpper, "GEOMCOLLECTION") {
+					continue
+				}
+				// Determine geometry type name (lowercase)
+				geomTypeName := "geometry"
+				switch {
+				case strings.Contains(colUpper, "MULTIPOLYGON"):
+					geomTypeName = "multipolygon"
+				case strings.Contains(colUpper, "MULTILINESTRING"):
+					geomTypeName = "multilinestring"
+				case strings.Contains(colUpper, "MULTIPOINT"):
+					geomTypeName = "multipoint"
+				case strings.Contains(colUpper, "GEOMETRYCOLLECTION"), strings.Contains(colUpper, "GEOMCOLLECTION"):
+					geomTypeName = "geomcollection"
+				case strings.Contains(colUpper, "POLYGON"):
+					geomTypeName = "polygon"
+				case strings.Contains(colUpper, "LINESTRING"):
+					geomTypeName = "linestring"
+				case strings.Contains(colUpper, "POINT"):
+					geomTypeName = "point"
+				}
+				// Extract SRID from column definition if present
+				var srsName interface{} = nil
+				var srsID interface{} = nil
+				if col.SRIDConstraint != nil {
+					srsID = *col.SRIDConstraint
+					// Look up SRS name from known SRS catalog
+					for _, srs := range infoSchemaSpatialReferenceSystems() {
+						if id, ok := srs["SRS_ID"].(uint32); ok && id == *col.SRIDConstraint {
+							if name, ok2 := srs["SRS_NAME"].(string); ok2 && name != "" {
+								srsName = name
+							}
+							break
+						}
+					}
+				}
+				rows = append(rows, storage.Row{
+					"TABLE_CATALOG":      "def",
+					"TABLE_SCHEMA":       dbName,
+					"TABLE_NAME":         tblName,
+					"COLUMN_NAME":        col.Name,
+					"SRS_NAME":           srsName,
+					"SRS_ID":             srsID,
+					"GEOMETRY_TYPE_NAME": geomTypeName,
+				})
+			}
+		}
 	}
 	return rows
 }

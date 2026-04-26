@@ -2115,6 +2115,7 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			strings.HasPrefix(upper, "END") ||
 			strings.HasPrefix(upper, "ALTER INSTANCE") ||
 			strings.HasPrefix(upper, "CREATE SPATIAL REFERENCE SYSTEM") ||
+			strings.HasPrefix(upper, "CREATE OR REPLACE SPATIAL REFERENCE SYSTEM") ||
 			strings.HasPrefix(upper, "DROP SPATIAL REFERENCE SYSTEM") {
 			return &Result{}, nil
 		}
