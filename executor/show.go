@@ -2383,11 +2383,189 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	}
 	b.WriteString(trailer)
 
+	// Append partition clause if present: /*!50100 PARTITION BY ... */
+	if def.PartitionType != "" {
+		b.WriteString("\n")
+		b.WriteString(buildPartitionClause(def))
+	}
+
 	return &Result{
 		Columns:     []string{"Table", "Create Table"},
 		Rows:        [][]interface{}{{tableName, b.String()}},
 		IsResultSet: true,
 	}, nil
+}
+
+// formatPartitionExpr parses a partition expression string and formats it in
+// MySQL SHOW CREATE TABLE style: lowercase function names, backtick-quoted column names.
+// Falls back to the raw string if parsing fails.
+func formatPartitionExpr(exprStr string) string {
+	if exprStr == "" {
+		return ""
+	}
+	// Try to parse as an expression
+	parsed, err := sqlparser.NewTestParser().ParseExpr(exprStr)
+	if err != nil {
+		return exprStr
+	}
+	return mysqlGenExprNode(parsed, "")
+}
+
+// buildPartitionClause renders the /*!50100 PARTITION BY ... */ block for SHOW CREATE TABLE.
+// MySQL format: /*!50100 PARTITION BY RANGE (`col`)\n(PARTITION p0 ...) */
+func buildPartitionClause(def *catalog.TableDef) string {
+	var b strings.Builder
+	b.WriteString("/*!50100 PARTITION BY ")
+
+	// Partition type
+	switch def.PartitionType {
+	case "RANGE":
+		if def.PartitionIsLinear {
+			b.WriteString("LINEAR RANGE ")
+		} else {
+			b.WriteString("RANGE ")
+		}
+		if def.PartitionExpression != "" {
+			b.WriteString("(")
+			b.WriteString(formatPartitionExpr(def.PartitionExpression))
+			b.WriteString(")")
+		} else if len(def.PartitionExprCols) > 0 {
+			b.WriteString("COLUMNS (")
+			for i, c := range def.PartitionExprCols {
+				if i > 0 {
+					b.WriteString(",")
+				}
+				b.WriteString("`")
+				b.WriteString(c)
+				b.WriteString("`")
+			}
+			b.WriteString(")")
+		}
+	case "LIST":
+		if def.PartitionIsLinear {
+			b.WriteString("LINEAR LIST ")
+		} else {
+			b.WriteString("LIST ")
+		}
+		if def.PartitionExpression != "" {
+			b.WriteString("(")
+			b.WriteString(formatPartitionExpr(def.PartitionExpression))
+			b.WriteString(")")
+		} else if len(def.PartitionExprCols) > 0 {
+			b.WriteString("COLUMNS (")
+			for i, c := range def.PartitionExprCols {
+				if i > 0 {
+					b.WriteString(",")
+				}
+				b.WriteString("`")
+				b.WriteString(c)
+				b.WriteString("`")
+			}
+			b.WriteString(")")
+		}
+	case "HASH":
+		if def.PartitionIsLinear {
+			b.WriteString("LINEAR HASH (")
+		} else {
+			b.WriteString("HASH (")
+		}
+		b.WriteString(formatPartitionExpr(def.PartitionExpression))
+		b.WriteString(")")
+	case "KEY":
+		if def.PartitionIsLinear {
+			b.WriteString("LINEAR KEY ")
+		} else {
+			b.WriteString("KEY ")
+		}
+		if def.PartitionKeyAlgorithm != 0 {
+			fmt.Fprintf(&b, "ALGORITHM = %d ", def.PartitionKeyAlgorithm)
+		}
+		if len(def.PartitionExprCols) > 0 {
+			b.WriteString("(")
+			for i, c := range def.PartitionExprCols {
+				if i > 0 {
+					b.WriteString(",")
+				}
+				b.WriteString(c)
+			}
+			b.WriteString(")")
+		} else {
+			b.WriteString("()")
+		}
+	}
+
+	// PARTITIONS N
+	if def.PartitionCount > 0 {
+		fmt.Fprintf(&b, "\nPARTITIONS %d", def.PartitionCount)
+	}
+
+	// SUBPARTITION BY ...
+	if def.PartitionSubpartition != nil {
+		sp := def.PartitionSubpartition
+		b.WriteString("\n")
+		if sp.IsLinear {
+			b.WriteString("SUBPARTITION BY LINEAR ")
+		} else {
+			b.WriteString("SUBPARTITION BY ")
+		}
+		switch sp.Type {
+		case "HASH":
+			b.WriteString("HASH (")
+			b.WriteString(formatPartitionExpr(sp.Expression))
+			b.WriteString(")")
+		case "KEY":
+			if sp.KeyAlgorithm != 0 {
+				fmt.Fprintf(&b, "KEY ALGORITHM = %d ", sp.KeyAlgorithm)
+			} else {
+				b.WriteString("KEY ")
+			}
+			if len(sp.Columns) > 0 {
+				b.WriteString("(")
+				for i, c := range sp.Columns {
+					if i > 0 {
+						b.WriteString(",")
+					}
+					b.WriteString(c)
+				}
+				b.WriteString(")")
+			} else {
+				b.WriteString("()")
+			}
+		}
+		if sp.SubPartitions > 0 {
+			fmt.Fprintf(&b, "\nSUBPARTITIONS %d", sp.SubPartitions)
+		}
+	}
+
+	// Individual partition definitions
+	if len(def.PartitionDefs) > 0 {
+		b.WriteString("\n(")
+		for i, pd := range def.PartitionDefs {
+			if i > 0 {
+				b.WriteString(",\n ")
+			}
+			b.WriteString("PARTITION ")
+			b.WriteString(pd.Name)
+			if pd.ValueRange != "" {
+				b.WriteString(" VALUES ")
+				b.WriteString(pd.ValueRange)
+			}
+			if pd.MaxRows != nil {
+				fmt.Fprintf(&b, " MAX_ROWS = %d", *pd.MaxRows)
+			}
+			if pd.MinRows != nil {
+				fmt.Fprintf(&b, " MIN_ROWS = %d", *pd.MinRows)
+			}
+			if pd.Engine != "" {
+				b.WriteString(" ENGINE = ")
+				b.WriteString(pd.Engine)
+			}
+		}
+		b.WriteString(")")
+	}
+
+	b.WriteString(" */")
+	return b.String()
 }
 
 // buildCreateViewSQLFromQuery reconstructs the CREATE VIEW SQL statement from a parsed CreateView node,
