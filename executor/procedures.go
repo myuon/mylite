@@ -194,21 +194,34 @@ func (e *Executor) execCreateTrigger(query string) (*Result, error) {
 		return nil, syntaxError(rest, 1)
 	}
 
+	// Validate: BEFORE/AFTER DELETE triggers cannot reference NEW (including SET NEW.)
+	// This check must come before the general "AFTER trigger cannot SET NEW" check,
+	// because DELETE triggers give error 1363 (no NEW row) even for SET NEW.col.
+	if event == "DELETE" {
+		for _, stmt := range bodyStatements {
+			stmtUpper := strings.ToUpper(stmt)
+			if strings.Contains(stmtUpper, "NEW.") {
+				return nil, mysqlError(1363, "HY000", "There is no NEW row in on DELETE trigger")
+			}
+		}
+	}
+	// Validate: OLD columns are read-only in all triggers.
+	// SET OLD.col = val is an error in any trigger (error 1362).
+	// This check must come before the "no OLD row in INSERT" check so that
+	// AFTER INSERT triggers with "SET OLD.col = val" get 1362 (ER_TRG_CANT_CHANGE_ROW)
+	// rather than 1363 (ER_TRG_NO_SUCH_ROW_IN_TRG).
+	for _, stmt := range bodyStatements {
+		stmtUpper := strings.ToUpper(strings.TrimSpace(stmt))
+		if containsOldColAssignment(stmtUpper) {
+			return nil, mysqlError(1362, "HY000", "Updating of OLD row is not allowed in trigger")
+		}
+	}
 	// Validate: AFTER triggers cannot modify NEW row
 	if timing == "AFTER" {
 		for _, stmt := range bodyStatements {
 			stmtUpper := strings.ToUpper(stmt)
 			if strings.Contains(stmtUpper, "SET NEW.") {
 				return nil, mysqlError(1362, "HY000", "Updating of NEW row is not allowed in after trigger")
-			}
-		}
-	}
-	// Validate: BEFORE/AFTER DELETE triggers cannot reference NEW
-	if event == "DELETE" {
-		for _, stmt := range bodyStatements {
-			stmtUpper := strings.ToUpper(stmt)
-			if strings.Contains(stmtUpper, "NEW.") {
-				return nil, mysqlError(1363, "HY000", "There is no NEW row in on DELETE trigger")
 			}
 		}
 	}
@@ -577,6 +590,24 @@ func containsNewColAssignment(stmtUpper string) bool {
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		if strings.HasPrefix(part, "NEW.") {
+			return true
+		}
+	}
+	return false
+}
+
+// containsOldColAssignment checks if a SET statement (already uppercased) contains
+// an OLD.col assignment like "SET OLD.col = val" or "SET @v = x, OLD.col = y".
+// OLD columns are read-only in all triggers; assigning to them is error 1362.
+func containsOldColAssignment(stmtUpper string) bool {
+	if !strings.HasPrefix(stmtUpper, "SET ") {
+		return false
+	}
+	rest := strings.TrimSpace(stmtUpper[4:]) // strip "SET "
+	parts := splitSetAssignments(rest)
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "OLD.") {
 			return true
 		}
 	}
