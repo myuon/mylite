@@ -1436,6 +1436,35 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 			})
 			return result
 		}
+		// Pre-scan: determine which tables in a multi-table join qualify for
+		// "Range checked for each record".  We use this to reorder the table
+		// list so driver tables (no range-check) appear before inner tables
+		// (range-checked), matching MySQL's EXPLAIN output order.
+		rangeCheckedTables := make(map[string]bool)
+		if len(allTableNames) > 1 && sel.Where != nil && e.Storage != nil {
+			for _, tbl := range allTableNames {
+				td := e.explainGetTableDef(tbl)
+				if td != nil && explainTotalIndexCount(td) > 0 {
+					if e.explainHasRangeFromOtherTable(sel.Where.Expr, tbl, allTableNames) {
+						rangeCheckedTables[tbl] = true
+					}
+				}
+			}
+		}
+		// Reorder: driver tables (not range-checked) first, inner tables last.
+		if len(rangeCheckedTables) > 0 {
+			var drivers []string
+			var inners []string
+			for _, tbl := range allTableNames {
+				if rangeCheckedTables[tbl] {
+					inners = append(inners, tbl)
+				} else {
+					drivers = append(drivers, tbl)
+				}
+			}
+			allTableNames = append(drivers, inners...)
+		}
+
 		for idx, tblName := range allTableNames {
 			var rowCount int64 = 1
 			tableIsEmpty := false
@@ -1480,10 +1509,31 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 				}
 				continue
 			} else if idx == 0 && !orderByNull && (strings.Contains(upperQ, "GROUP BY") || strings.Contains(upperQ, "SQL_BIG_RESULT")) {
-				extra = "Using filesort"
+				// When GROUP BY is on a constant expression (e.g. GROUP BY 1), MySQL does
+				// not need a filesort because all rows share the same group key.
+				if !explainGroupByIsAllConstant(sel.GroupBy) {
+					extra = "Using filesort"
+				}
 			}
-			// For secondary tables in a cross-join, MySQL shows "Using join buffer"
-			if idx > 0 {
+			// "Range checked for each record" detection: applies to any table in a
+			// multi-table join where an indexed column is constrained by a range
+			// condition whose other side is a column from a different table
+			// (e.g. WHERE inner.b < outer.c).  MySQL shows this instead of a fixed
+			// access type because the index choice depends on each outer row's value.
+			rangeCheckedForEachRecord := false
+			if len(allTableNames) > 1 && sel.Where != nil && e.Storage != nil {
+				td := e.explainGetTableDef(tblName)
+				if td != nil && explainTotalIndexCount(td) > 0 {
+					if e.explainHasRangeFromOtherTable(sel.Where.Expr, tblName, allTableNames) {
+						n := explainTotalIndexCount(td)
+						extra = fmt.Sprintf("Range checked for each record (index map: %s)", explainIndexBitmapHex(n))
+						rangeCheckedForEachRecord = true
+					}
+				}
+			}
+			// For secondary tables in a cross-join that do not qualify for
+			// "Range checked for each record", MySQL shows "Using join buffer".
+			if idx > 0 && !rangeCheckedForEachRecord {
 				extra = "Using join buffer (Block Nested Loop)"
 			}
 
@@ -1495,11 +1545,21 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 			var ref interface{} = nil
 
 			// accessInfo was already computed above (before the tableIsEmpty check).
-			accessType = accessInfo.accessType
-			possibleKeys = accessInfo.possibleKeys
-			key = accessInfo.key
-			keyLen = accessInfo.keyLen
-			ref = accessInfo.ref
+			// For "Range checked for each record", MySQL shows type=ALL (no key chosen in
+			// advance), while possible_keys still lists the candidate indexes.
+			if rangeCheckedForEachRecord {
+				accessType = "ALL"
+				possibleKeys = accessInfo.possibleKeys
+				key = nil
+				keyLen = nil
+				ref = nil
+			} else {
+				accessType = accessInfo.accessType
+				possibleKeys = accessInfo.possibleKeys
+				key = accessInfo.key
+				keyLen = accessInfo.keyLen
+				ref = accessInfo.ref
+			}
 
 			if accessInfo.accessType == "const" || accessInfo.accessType == "eq_ref" || accessInfo.accessType == "ref" {
 				rowCount = int64(1)
@@ -1523,6 +1583,11 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 				// filtered stays at "100.00" because MySQL's EXPLAIN uses the theoretical plan,
 				// not the actual row counts.
 				rowCount = int64(1)
+			}
+
+			// For "Range checked for each record", MySQL estimates filtered as 100/rowCount.
+			if rangeCheckedForEachRecord && rowCount > 0 {
+				filtered = fmt.Sprintf("%.2f", 100.0/float64(rowCount))
 			}
 
 			// Set "Using index condition" for ref access with IS NULL or range conditions on indexed columns
@@ -4253,6 +4318,157 @@ func explainExtractColumnName(expr sqlparser.Expr) string {
 		return e.Name.String()
 	}
 	return ""
+}
+
+// explainHasRangeFromOtherTable checks whether the WHERE expression contains a
+// range condition (>, >=, <, <=, BETWEEN) where one side is a column on
+// innerTable and the other side is a column on a different table listed in
+// allTables.  This is the pattern that produces MySQL's "Range checked for
+// each record" optimisation.
+//
+// For unqualified column names, we resolve which table the column belongs to
+// by looking up each table's column definitions.
+func (e *Executor) explainHasRangeFromOtherTable(where sqlparser.Expr, innerTable string, allTables []string) bool {
+	if where == nil {
+		return false
+	}
+
+	// Build per-table column sets for unqualified-column resolution.
+	innerCols := make(map[string]bool)
+	outerCols := make(map[string]bool) // columns belonging to "other" tables
+	if e.Storage != nil {
+		for _, tbl := range allTables {
+			td := e.explainGetTableDef(tbl)
+			if td == nil {
+				continue
+			}
+			for _, col := range td.Columns {
+				lc := strings.ToLower(col.Name)
+				if strings.EqualFold(tbl, innerTable) {
+					innerCols[lc] = true
+				} else {
+					outerCols[lc] = true
+				}
+			}
+		}
+	}
+
+	// Build a set of "other" table names for qualifier-based matching.
+	others := make(map[string]bool, len(allTables))
+	for _, t := range allTables {
+		if !strings.EqualFold(t, innerTable) {
+			others[strings.ToLower(t)] = true
+		}
+	}
+
+	// colBelongsToInner returns true if this ColName clearly belongs to innerTable.
+	colBelongsToInner := func(col *sqlparser.ColName) bool {
+		qual := strings.ToLower(col.Qualifier.Name.String())
+		name := strings.ToLower(col.Name.String())
+		if qual != "" {
+			return strings.EqualFold(qual, innerTable)
+		}
+		// Unqualified: belongs to innerTable if it's in innerCols but NOT in outerCols,
+		// or if innerCols has it (allow ambiguous case to match — we prefer not to miss).
+		return innerCols[name] && !outerCols[name]
+	}
+	// colBelongsToOther returns true if this ColName clearly belongs to another table.
+	colBelongsToOther := func(col *sqlparser.ColName) bool {
+		qual := strings.ToLower(col.Qualifier.Name.String())
+		name := strings.ToLower(col.Name.String())
+		if qual != "" {
+			return others[qual]
+		}
+		// Unqualified: belongs to an outer table if it's in outerCols but NOT in innerCols.
+		return outerCols[name] && !innerCols[name]
+	}
+
+	var checkExpr func(sqlparser.Expr) bool
+	checkExpr = func(expr sqlparser.Expr) bool {
+		switch ev := expr.(type) {
+		case *sqlparser.AndExpr:
+			return checkExpr(ev.Left) || checkExpr(ev.Right)
+		case *sqlparser.OrExpr:
+			return checkExpr(ev.Left) || checkExpr(ev.Right)
+		case *sqlparser.ComparisonExpr:
+			switch ev.Operator {
+			case sqlparser.GreaterThanOp, sqlparser.GreaterEqualOp,
+				sqlparser.LessThanOp, sqlparser.LessEqualOp:
+			default:
+				return false
+			}
+			lCol, lOk := ev.Left.(*sqlparser.ColName)
+			rCol, rOk := ev.Right.(*sqlparser.ColName)
+			if lOk && rOk {
+				// Both sides are column references: one must be inner, one outer.
+				return (colBelongsToInner(lCol) && colBelongsToOther(rCol)) ||
+					(colBelongsToOther(lCol) && colBelongsToInner(rCol))
+			}
+		case *sqlparser.BetweenExpr:
+			if col, ok := ev.Left.(*sqlparser.ColName); ok && colBelongsToInner(col) {
+				// BETWEEN with column references on either bound qualifies.
+				if rCol, fromOk := ev.From.(*sqlparser.ColName); fromOk && colBelongsToOther(rCol) {
+					return true
+				}
+				if rCol, toOk := ev.To.(*sqlparser.ColName); toOk && colBelongsToOther(rCol) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return checkExpr(where)
+}
+
+// explainTotalIndexCount returns the total number of index entries for a table
+// (primary key counts as one entry, each secondary index counts as one).
+func explainTotalIndexCount(td *catalog.TableDef) int {
+	if td == nil {
+		return 0
+	}
+	n := 0
+	if len(td.PrimaryKey) > 0 {
+		n++
+	}
+	n += len(td.Indexes)
+	return n
+}
+
+// explainIndexBitmapHex returns a hexadecimal string (with "0x" prefix) for a
+// bitmask where the lowest numIndexes bits are set, matching MySQL's
+// "Range checked for each record (index map: 0x...)" output.
+func explainIndexBitmapHex(numIndexes int) string {
+	if numIndexes <= 0 {
+		return "0x0"
+	}
+	if numIndexes < 64 {
+		val := (uint64(1) << uint(numIndexes)) - 1
+		return fmt.Sprintf("0x%X", val)
+	}
+	// For very large index counts use math/big.
+	one := big.NewInt(1)
+	val := new(big.Int).Lsh(one, uint(numIndexes))
+	val.Sub(val, one)
+	return fmt.Sprintf("0x%X", val)
+}
+
+// explainGroupByIsAllConstant returns true when every expression in a GROUP BY
+// clause is a constant (integer literal, string literal, etc.).  MySQL does not
+// add "Using filesort" when GROUP BY is a pure constant because all rows share
+// the same group key.
+func explainGroupByIsAllConstant(groupBy *sqlparser.GroupBy) bool {
+	if groupBy == nil || len(groupBy.Exprs) == 0 {
+		return true // no GROUP BY → vacuously true (not our concern)
+	}
+	for _, expr := range groupBy.Exprs {
+		switch expr.(type) {
+		case *sqlparser.Literal, *sqlparser.NullVal:
+			// constant literal
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // findColumnDef finds a column definition by name in a table definition.
