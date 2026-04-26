@@ -4648,6 +4648,14 @@ func (e *Executor) inferColumnAttrs(selectSQL, colName string) columnAttrs {
 				exprStrNorm := strings.ReplaceAll(strings.ToLower(exprStr), " ", "")
 				colNameNorm := strings.ReplaceAll(strings.ToLower(normalizedColName), " ", "")
 				rewrittenColNameNorm := strings.ReplaceAll(strings.ToLower(normalizedRewrittenColName), " ", "")
+				// Normalize double-quoted strings to single-quoted: sqlparser.String() always
+				// emits single quotes, but the raw query (and thus colName) may use double quotes.
+				// e.g. date_format("2004-01-01","%Y") vs date_format('2004-01-01','%Y')
+				normalizeQuotes := func(s string) string {
+					return strings.ReplaceAll(s, "\"", "'")
+				}
+				colNameNorm = normalizeQuotes(colNameNorm)
+				rewrittenColNameNorm = normalizeQuotes(rewrittenColNameNorm)
 				// For string literals, also try matching the unquoted value against colName.
 				// (e.g. colName "2001-01-01 10:10:10" matches expr "'2001-01-01 10:10:10'")
 				strLitMatch := false
