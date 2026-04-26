@@ -511,6 +511,9 @@ type Executor struct {
 	// When true, CONCAT (and similar) should return an error if the result exceeds max_allowed_packet,
 	// rather than returning NULL with a warning (which is correct for SELECT/INSERT context).
 	inUpdateSetContext bool
+	// ftsCollStatsCache caches per-table FTS collection statistics (N, df, avgdl) for BM25 scoring.
+	// Cleared at the start of each top-level query. Key: "db.table:col1,col2,...".
+	ftsCollStatsCache map[string]*ftsCollStats
 	// insideStrictRoutine is set to true when executing inside a stored function or procedure
 	// that was created with a strict sql_mode (STRICT_TRANS_TABLES, STRICT_ALL_TABLES, or TRADITIONAL).
 	// When true, type conversion warnings (like 1292 Truncated DOUBLE value) become hard errors.
