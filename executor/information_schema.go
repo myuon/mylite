@@ -294,6 +294,116 @@ var perfSchemaColumnOrder = map[string]bool{
 	"threads": true,
 	"objects_summary_global_by_type": true,
 }
+// perfSchemaVirtualTableNames returns the canonical sorted list of all virtual
+// performance_schema table names (lowercase). This list matches MySQL 8.0.
+func perfSchemaVirtualTableNames() []string {
+	return []string{
+		"accounts",
+		"cond_instances",
+		"data_lock_waits",
+		"data_locks",
+		"events_errors_summary_by_account_by_error",
+		"events_errors_summary_by_host_by_error",
+		"events_errors_summary_by_thread_by_error",
+		"events_errors_summary_by_user_by_error",
+		"events_errors_summary_global_by_error",
+		"events_stages_current",
+		"events_stages_history",
+		"events_stages_history_long",
+		"events_stages_summary_by_account_by_event_name",
+		"events_stages_summary_by_host_by_event_name",
+		"events_stages_summary_by_thread_by_event_name",
+		"events_stages_summary_by_user_by_event_name",
+		"events_stages_summary_global_by_event_name",
+		"events_statements_current",
+		"events_statements_histogram_by_digest",
+		"events_statements_histogram_global",
+		"events_statements_history",
+		"events_statements_history_long",
+		"events_statements_summary_by_account_by_event_name",
+		"events_statements_summary_by_digest",
+		"events_statements_summary_by_host_by_event_name",
+		"events_statements_summary_by_program",
+		"events_statements_summary_by_thread_by_event_name",
+		"events_statements_summary_by_user_by_event_name",
+		"events_statements_summary_global_by_event_name",
+		"events_transactions_current",
+		"events_transactions_history",
+		"events_transactions_history_long",
+		"events_transactions_summary_by_account_by_event_name",
+		"events_transactions_summary_by_host_by_event_name",
+		"events_transactions_summary_by_thread_by_event_name",
+		"events_transactions_summary_by_user_by_event_name",
+		"events_transactions_summary_global_by_event_name",
+		"events_waits_current",
+		"events_waits_history",
+		"events_waits_history_long",
+		"events_waits_summary_by_account_by_event_name",
+		"events_waits_summary_by_host_by_event_name",
+		"events_waits_summary_by_instance",
+		"events_waits_summary_by_thread_by_event_name",
+		"events_waits_summary_by_user_by_event_name",
+		"events_waits_summary_global_by_event_name",
+		"file_instances",
+		"file_summary_by_event_name",
+		"file_summary_by_instance",
+		"global_status",
+		"global_variables",
+		"host_cache",
+		"hosts",
+		"keyring_keys",
+		"log_status",
+		"memory_summary_by_account_by_event_name",
+		"memory_summary_by_host_by_event_name",
+		"memory_summary_by_thread_by_event_name",
+		"memory_summary_by_user_by_event_name",
+		"memory_summary_global_by_event_name",
+		"metadata_locks",
+		"mutex_instances",
+		"objects_summary_global_by_type",
+		"performance_timers",
+		"persisted_variables",
+		"prepared_statements_instances",
+		"replication_applier_configuration",
+		"replication_applier_filters",
+		"replication_applier_global_filters",
+		"replication_applier_status",
+		"replication_applier_status_by_coordinator",
+		"replication_applier_status_by_worker",
+		"replication_connection_configuration",
+		"replication_connection_status",
+		"replication_group_member_stats",
+		"replication_group_members",
+		"rwlock_instances",
+		"session_account_connect_attrs",
+		"session_connect_attrs",
+		"session_status",
+		"session_variables",
+		"setup_actors",
+		"setup_consumers",
+		"setup_instruments",
+		"setup_objects",
+		"setup_threads",
+		"socket_instances",
+		"socket_summary_by_event_name",
+		"socket_summary_by_instance",
+		"status_by_account",
+		"status_by_host",
+		"status_by_thread",
+		"status_by_user",
+		"table_handles",
+		"table_io_waits_summary_by_index_usage",
+		"table_io_waits_summary_by_table",
+		"table_lock_waits_summary_by_table",
+		"threads",
+		"user_defined_functions",
+		"user_variables_by_thread",
+		"users",
+		"variables_by_thread",
+		"variables_info",
+	}
+}
+
 // perfSchemaCreateTable maps performance_schema table names to their CREATE TABLE statements.
 // These are fixed MySQL system table definitions.
 var perfSchemaCreateTable = map[string]string{
@@ -367,6 +477,23 @@ var perfSchemaCreateTable = map[string]string{
 	"threads": "CREATE TABLE `threads` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `NAME` varchar(128) NOT NULL,\n  `TYPE` varchar(10) NOT NULL,\n  `PROCESSLIST_ID` bigint(20) unsigned DEFAULT NULL,\n  `PROCESSLIST_USER` varchar(32) DEFAULT NULL,\n  `PROCESSLIST_HOST` varchar(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `PROCESSLIST_DB` varchar(64) DEFAULT NULL,\n  `PROCESSLIST_COMMAND` varchar(16) DEFAULT NULL,\n  `PROCESSLIST_TIME` bigint(20) DEFAULT NULL,\n  `PROCESSLIST_STATE` varchar(64) DEFAULT NULL,\n  `PROCESSLIST_INFO` longtext,\n  `PARENT_THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  `ROLE` varchar(64) DEFAULT NULL,\n  `INSTRUMENTED` enum('YES','NO') NOT NULL,\n  `HISTORY` enum('YES','NO') NOT NULL,\n  `CONNECTION_TYPE` varchar(16) DEFAULT NULL,\n  `THREAD_OS_ID` bigint(20) unsigned DEFAULT NULL,\n  `RESOURCE_GROUP` varchar(64) DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`),\n  KEY `PROCESSLIST_ID` (`PROCESSLIST_ID`),\n  KEY `THREAD_OS_ID` (`THREAD_OS_ID`),\n  KEY `NAME` (`NAME`),\n  KEY `PROCESSLIST_ACCOUNT` (`PROCESSLIST_USER`,`PROCESSLIST_HOST`),\n  KEY `PROCESSLIST_HOST` (`PROCESSLIST_HOST`),\n  KEY `RESOURCE_GROUP` (`RESOURCE_GROUP`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 	"users": "CREATE TABLE `users` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `CURRENT_CONNECTIONS` bigint(20) NOT NULL,\n  `TOTAL_CONNECTIONS` bigint(20) NOT NULL,\n  UNIQUE KEY `USER` (`USER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 	"variables_info": "CREATE TABLE `variables_info` (\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_SOURCE` enum('COMPILED','GLOBAL','SERVER','EXPLICIT','EXTRA','USER','LOGIN','COMMAND_LINE','PERSISTED','DYNAMIC') DEFAULT 'COMPILED',\n  `VARIABLE_PATH` varchar(1024) DEFAULT NULL,\n  `MIN_VALUE` varchar(64) DEFAULT NULL,\n  `MAX_VALUE` varchar(64) DEFAULT NULL,\n  `SET_TIME` timestamp(6) NULL DEFAULT NULL,\n  `SET_USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `SET_HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_errors_summary_by_account_by_error": "CREATE TABLE `events_errors_summary_by_account_by_error` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `ERROR_NUMBER` int(11) DEFAULT NULL,\n  `ERROR_NAME` varchar(64) DEFAULT NULL,\n  `SQL_STATE` varchar(5) DEFAULT NULL,\n  `SUM_ERROR_RAISED` bigint(20) unsigned NOT NULL,\n  `SUM_ERROR_HANDLED` bigint(20) unsigned NOT NULL,\n  `FIRST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  UNIQUE KEY `ACCOUNT` (`USER`,`HOST`,`ERROR_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_errors_summary_by_host_by_error": "CREATE TABLE `events_errors_summary_by_host_by_error` (\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `ERROR_NUMBER` int(11) DEFAULT NULL,\n  `ERROR_NAME` varchar(64) DEFAULT NULL,\n  `SQL_STATE` varchar(5) DEFAULT NULL,\n  `SUM_ERROR_RAISED` bigint(20) unsigned NOT NULL,\n  `SUM_ERROR_HANDLED` bigint(20) unsigned NOT NULL,\n  `FIRST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  UNIQUE KEY `HOST` (`HOST`,`ERROR_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_errors_summary_by_thread_by_error": "CREATE TABLE `events_errors_summary_by_thread_by_error` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `ERROR_NUMBER` int(11) DEFAULT NULL,\n  `ERROR_NAME` varchar(64) DEFAULT NULL,\n  `SQL_STATE` varchar(5) DEFAULT NULL,\n  `SUM_ERROR_RAISED` bigint(20) unsigned NOT NULL,\n  `SUM_ERROR_HANDLED` bigint(20) unsigned NOT NULL,\n  `FIRST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  UNIQUE KEY `THREAD_ID` (`THREAD_ID`,`ERROR_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_errors_summary_by_user_by_error": "CREATE TABLE `events_errors_summary_by_user_by_error` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `ERROR_NUMBER` int(11) DEFAULT NULL,\n  `ERROR_NAME` varchar(64) DEFAULT NULL,\n  `SQL_STATE` varchar(5) DEFAULT NULL,\n  `SUM_ERROR_RAISED` bigint(20) unsigned NOT NULL,\n  `SUM_ERROR_HANDLED` bigint(20) unsigned NOT NULL,\n  `FIRST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  UNIQUE KEY `USER` (`USER`,`ERROR_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_errors_summary_global_by_error": "CREATE TABLE `events_errors_summary_global_by_error` (\n  `ERROR_NUMBER` int(11) DEFAULT NULL,\n  `ERROR_NAME` varchar(64) DEFAULT NULL,\n  `SQL_STATE` varchar(5) DEFAULT NULL,\n  `SUM_ERROR_RAISED` bigint(20) unsigned NOT NULL,\n  `SUM_ERROR_HANDLED` bigint(20) unsigned NOT NULL,\n  `FIRST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  UNIQUE KEY `ERROR_NUMBER` (`ERROR_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_statements_histogram_by_digest": "CREATE TABLE `events_statements_histogram_by_digest` (\n  `SCHEMA_NAME` varchar(64) DEFAULT NULL,\n  `DIGEST` varchar(64) DEFAULT NULL,\n  `BUCKET_NUMBER` int(10) unsigned NOT NULL,\n  `BUCKET_TIMER_LOW` bigint(20) unsigned NOT NULL,\n  `BUCKET_TIMER_HIGH` bigint(20) unsigned NOT NULL,\n  `COUNT_BUCKET` bigint(20) unsigned NOT NULL,\n  `COUNT_BUCKET_AND_LOWER` bigint(20) unsigned NOT NULL,\n  `BUCKET_QUANTILE` double(23,20) NOT NULL,\n  UNIQUE KEY `SCHEMA_NAME` (`SCHEMA_NAME`,`DIGEST`,`BUCKET_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_statements_histogram_global": "CREATE TABLE `events_statements_histogram_global` (\n  `BUCKET_NUMBER` int(10) unsigned NOT NULL,\n  `BUCKET_TIMER_LOW` bigint(20) unsigned NOT NULL,\n  `BUCKET_TIMER_HIGH` bigint(20) unsigned NOT NULL,\n  `COUNT_BUCKET` bigint(20) unsigned NOT NULL,\n  `COUNT_BUCKET_AND_LOWER` bigint(20) unsigned NOT NULL,\n  `BUCKET_QUANTILE` double(23,20) NOT NULL,\n  PRIMARY KEY (`BUCKET_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"global_status": "CREATE TABLE `global_status` (\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"global_variables": "CREATE TABLE `global_variables` (\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"session_account_connect_attrs": "CREATE TABLE `session_account_connect_attrs` (\n  `PROCESSLIST_ID` int(11) NOT NULL,\n  `ATTR_NAME` varchar(32) NOT NULL,\n  `ATTR_VALUE` varchar(1024) DEFAULT NULL,\n  `ORDINAL_POSITION` int(11) DEFAULT NULL,\n  PRIMARY KEY (`PROCESSLIST_ID`,`ATTR_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+	"session_connect_attrs": "CREATE TABLE `session_connect_attrs` (\n  `PROCESSLIST_ID` int(11) NOT NULL,\n  `ATTR_NAME` varchar(32) NOT NULL,\n  `ATTR_VALUE` varchar(1024) DEFAULT NULL,\n  `ORDINAL_POSITION` int(11) DEFAULT NULL,\n  PRIMARY KEY (`PROCESSLIST_ID`,`ATTR_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+	"session_status": "CREATE TABLE `session_status` (\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"session_variables": "CREATE TABLE `session_variables` (\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"setup_threads": "CREATE TABLE `setup_threads` (\n  `NAME` varchar(128) NOT NULL,\n  `ENABLED` enum('YES','NO') NOT NULL,\n  `HISTORY` enum('YES','NO') NOT NULL,\n  `PROPERTIES` set('singleton','progress') NOT NULL,\n  `VOLATILITY` int(11) NOT NULL DEFAULT '0',\n  `DOCUMENTATION` longtext,\n  PRIMARY KEY (`NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"status_by_thread": "CREATE TABLE `status_by_thread` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"user_variables_by_thread": "CREATE TABLE `user_variables_by_thread` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` longtext,\n  PRIMARY KEY (`THREAD_ID`,`VARIABLE_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"variables_by_thread": "CREATE TABLE `variables_by_thread` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`VARIABLE_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 }
 
 // emptyStubTables lists virtual tables that always return an empty result set.
@@ -1628,6 +1755,60 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 			"TABLE_COLLATION": nil,
 			"CHECKSUM":        nil,
 			"CREATE_OPTIONS":  nil,
+			"TABLE_COMMENT":   "",
+		})
+	}
+
+	// Tables with Fixed ROW_FORMAT in performance_schema (all others are Dynamic)
+	psFixedRowFormat := map[string]bool{
+		"accounts":                           true,
+		"events_statements_histogram_global": true,
+		"hosts":                              true,
+		"performance_timers":                 true,
+		"replication_applier_configuration":  true,
+		"replication_applier_status":         true,
+		"replication_group_members":          true,
+		"setup_actors":                       true,
+		"users":                              true,
+	}
+	// Tables with non-default collation in performance_schema
+	psTableCollation := map[string]string{
+		"keyring_keys":                 "utf8mb4_bin",
+		"session_account_connect_attrs": "utf8mb4_bin",
+		"session_connect_attrs":         "utf8mb4_bin",
+	}
+
+	// Add performance_schema virtual tables as PERFORMANCE_SCHEMA entries
+	for _, tblName := range perfSchemaVirtualTableNames() {
+		rowFormat := "Dynamic"
+		if psFixedRowFormat[tblName] {
+			rowFormat = "Fixed"
+		}
+		collation := "utf8mb4_0900_ai_ci"
+		if c, ok := psTableCollation[tblName]; ok {
+			collation = c
+		}
+		rows = append(rows, storage.Row{
+			"TABLE_CATALOG":   "def",
+			"TABLE_SCHEMA":    "performance_schema",
+			"TABLE_NAME":      tblName,
+			"TABLE_TYPE":      "BASE TABLE",
+			"ENGINE":          "PERFORMANCE_SCHEMA",
+			"VERSION":         int64(10),
+			"ROW_FORMAT":      rowFormat,
+			"TABLE_ROWS":      int64(0),
+			"AVG_ROW_LENGTH":  int64(0),
+			"DATA_LENGTH":     int64(0),
+			"MAX_DATA_LENGTH": int64(0),
+			"INDEX_LENGTH":    int64(0),
+			"DATA_FREE":       int64(0),
+			"AUTO_INCREMENT":  nil,
+			"CREATE_TIME":     nil,
+			"UPDATE_TIME":     nil,
+			"CHECK_TIME":      nil,
+			"TABLE_COLLATION": collation,
+			"CHECKSUM":        nil,
+			"CREATE_OPTIONS":  "",
 			"TABLE_COMMENT":   "",
 		})
 	}

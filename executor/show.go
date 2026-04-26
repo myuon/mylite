@@ -505,7 +505,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 				targetDB = basic.DbName.String()
 			}
 			var tables []string
-			if !strings.EqualFold(targetDB, "information_schema") {
+			if !strings.EqualFold(targetDB, "information_schema") && !strings.EqualFold(targetDB, "performance_schema") {
 				db, err := e.Catalog.GetDatabase(targetDB)
 				if err != nil {
 					return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", targetDB))
@@ -546,6 +546,15 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 						tables = append(tables, t)
 					}
 				}
+			}
+			// For performance_schema, use canonical virtual P_S table list.
+			// All P_S tables are virtual; catalog entries are ignored.
+			if strings.EqualFold(targetDB, "performance_schema") {
+				// Validate the database exists
+				if _, err := e.Catalog.GetDatabase(targetDB); err != nil {
+					return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", targetDB))
+				}
+				tables = perfSchemaVirtualTableNames()
 			}
 			sort.Strings(tables)
 			rows := make([][]interface{}, 0, len(tables))
@@ -632,6 +641,11 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 					tables = append(tables, t)
 				}
 			}
+		}
+		// For performance_schema, use canonical virtual P_S table list.
+		// All P_S tables are virtual; catalog entries are ignored.
+		if strings.EqualFold(targetDB, "performance_schema") {
+			tables = perfSchemaVirtualTableNames()
 		}
 		sort.Strings(tables)
 		rows := make([][]interface{}, 0, len(tables))
