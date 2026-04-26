@@ -3157,6 +3157,32 @@ func (e *Executor) explainSubqueries(sel *sqlparser.Select, idCounter *int64, re
 		outerST = outerSelectType[0]
 	}
 	for _, node := range nodes {
+		// When semijoin is disabled but materialization is on, IN subqueries appear as
+		// SUBQUERY (not DEPENDENT SUBQUERY) in EXPLAIN. MySQL outputs multiple outer-level
+		// SUBQUERY groups in reverse order of their definition. Apply group-aware reversal:
+		// process each direct subquery separately and output groups in reverse order.
+		// This matches MySQL's optimizer processing order (last-defined subquery first).
+		if whereNode, ok := node.(*sqlparser.Where); ok && !outerCanSemijoin &&
+			!e.isSemijoinEnabled() && e.isOptimizerSwitchEnabled("materialization") && whereNode != nil {
+			directExprs := collectDirectSubqueryExprs(whereNode.Expr)
+			if len(directExprs) > 1 {
+				var groups [][]explainSelectType
+				for _, expr := range directExprs {
+					gStart := len(*result)
+					e.walkForSubqueries(expr, idCounter, result, outerTables, outerCanSemijoin, outerHasOnlyDerived, sel, outerST)
+					group := make([]explainSelectType, len(*result)-gStart)
+					copy(group, (*result)[gStart:])
+					*result = (*result)[:gStart]
+					groups = append(groups, group)
+				}
+				// Output groups in reverse order (last-defined subquery group first)
+				for i := len(groups) - 1; i >= 0; i-- {
+					*result = append(*result, groups[i]...)
+				}
+				continue
+			}
+		}
+
 		startIdx := len(*result)
 		e.walkForSubqueries(node, idCounter, result, outerTables, outerCanSemijoin, outerHasOnlyDerived, sel, outerST)
 		// MySQL displays DEPENDENT SUBQUERY rows from the WHERE clause in reverse order
@@ -3178,6 +3204,39 @@ func (e *Executor) explainSubqueries(sel *sqlparser.Select, idCounter *int64, re
 			}
 		}
 	}
+}
+
+// collectDirectSubqueryExprs collects the direct IN/EXISTS/scalar subquery expressions
+// from the given expression tree without descending into sub-selects.
+// Each returned node is a ComparisonExpr (with InOp/NotInOp), ExistsExpr, or Subquery
+// that is directly referenced in the given expression (not nested inside another subquery).
+// This is used to identify outer-level subquery groups for EXPLAIN ordering.
+func collectDirectSubqueryExprs(expr sqlparser.Expr) []sqlparser.SQLNode {
+	var exprs []sqlparser.SQLNode
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		switch v := n.(type) {
+		case *sqlparser.ComparisonExpr:
+			if _, ok := v.Right.(*sqlparser.Subquery); ok {
+				// Only collect IN/NOT IN/= ANY/!= ANY etc. with a subquery on the right
+				switch v.Operator {
+				case sqlparser.InOp, sqlparser.NotInOp:
+					exprs = append(exprs, n)
+					return false, nil // don't descend into this subquery
+				default:
+					// Scalar subquery comparison (e.g. col = (SELECT ...))
+					if v.Modifier == sqlparser.Any || v.Modifier == sqlparser.All {
+						exprs = append(exprs, n)
+						return false, nil
+					}
+				}
+			}
+		case *sqlparser.ExistsExpr:
+			exprs = append(exprs, n)
+			return false, nil
+		}
+		return true, nil
+	}, expr)
+	return exprs
 }
 
 // collectJoinOnConditions recursively collects ON condition expressions from JOIN table expressions.
