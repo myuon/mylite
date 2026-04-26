@@ -810,6 +810,18 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 	paramStr := strings.TrimSpace(rest[paramStart:paramEnd])
 	params := parseProcParams(paramStr)
 
+	// Check for duplicate parameter names (error 1330).
+	{
+		seen := make(map[string]bool)
+		for _, p := range params {
+			lname := strings.ToLower(p.Name)
+			if seen[lname] {
+				return nil, mysqlError(1330, "42000", fmt.Sprintf("Duplicate parameter: %s", p.Name))
+			}
+			seen[lname] = true
+		}
+	}
+
 	// Check for reserved keyword 'of' used as a procedure label.
 	// MySQL 8.0 added OF as a reserved word; using it as a label causes a parse error.
 	{
@@ -936,6 +948,11 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 		bodyText = bodyStr
 	}
 
+	// Validate routine body: cursor-for-non-SELECT (1064) and condition handler refs (1319).
+	if err := validateRoutineBody(bodyStmts); err != nil {
+		return nil, err
+	}
+
 	// Check for duplicate procedure name (case and accent insensitive).
 	if db.GetProcedure(procName) != nil {
 		return nil, mysqlError(1304, "42000", fmt.Sprintf("PROCEDURE %s already exists", procName))
@@ -994,6 +1011,342 @@ func parseProcParams(paramStr string) []catalog.ProcParam {
 		params = append(params, param)
 	}
 	return params
+}
+
+// validateRoutineBody checks for common stored routine body errors at CREATE time:
+//   - DECLARE CURSOR FOR non-SELECT statements (parse error 1064)
+//   - DECLARE CURSOR FOR SELECT ... INTO ... (error 1323)
+//   - OPEN/CLOSE/FETCH with undeclared cursor name (error 1324)
+//   - FETCH INTO with undeclared variable (error 1327)
+//   - Duplicate variable declaration (error 1331)
+//   - Duplicate condition declaration (error 1332)
+//   - Duplicate cursor declaration (error 1333)
+//   - USE statement in stored routine (ER_SP_BADSTATEMENT = 1295)
+//   - Variable/condition after cursor/handler declaration (error 1337)
+//   - Cursor after handler declaration (error 1338)
+//   - DECLARE HANDLER FOR references to undeclared condition names (error 1319)
+func validateRoutineBody(bodyStmts []string) error {
+	// First pass: collect all declared names (for dup checks and FETCH INTO validation)
+	declaredVars := make(map[string]bool)
+	declaredConds := make(map[string]bool)
+	declaredCursors := make(map[string]bool)
+
+	// Track declaration ordering for errors 1337/1338:
+	// Standard order: variables/conditions, then cursors, then handlers
+	// 0=none, 1=var/cond, 2=cursor, 3=handler
+	seenKind := 0
+
+	for _, stmt := range bodyStmts {
+		upper := strings.ToUpper(strings.TrimSpace(stmt))
+		if !strings.HasPrefix(upper, "DECLARE") {
+			continue
+		}
+		rest := strings.TrimSpace(upper[len("DECLARE"):])
+		words := strings.Fields(rest)
+		if len(words) == 0 {
+			continue
+		}
+
+		if cursorIdx := strings.Index(rest, " CURSOR FOR "); cursorIdx >= 0 {
+			cursorName := strings.ToLower(strings.TrimSpace(rest[:cursorIdx]))
+			// Error 1333: duplicate cursor
+			if declaredCursors[cursorName] {
+				return mysqlError(1333, "42000", fmt.Sprintf("Duplicate cursor: %s", cursorName))
+			}
+			// Error 1338: cursor after handler
+			if seenKind == 3 {
+				return mysqlError(1338, "42000", "Cursor declaration after handler declaration")
+			}
+			// Error 1337: cursor before variable/condition (reverse order)
+			// MySQL actually checks: cursor after handler OR var/cond after cursor/handler
+			if seenKind < 2 {
+				seenKind = 2
+			}
+			declaredCursors[cursorName] = true
+		} else if len(words) >= 2 && words[1] == "CONDITION" {
+			condName := strings.ToLower(words[0])
+			// Error 1332: duplicate condition
+			if declaredConds[condName] {
+				return mysqlError(1332, "42000", fmt.Sprintf("Duplicate condition: %s", condName))
+			}
+			// Error 1337: condition after cursor or handler
+			if seenKind >= 2 {
+				return mysqlError(1337, "42000", "Variable or condition declaration after cursor or handler declaration")
+			}
+			if seenKind < 1 {
+				seenKind = 1
+			}
+			declaredConds[condName] = true
+		} else if strings.HasPrefix(rest, "CONTINUE HANDLER") || strings.HasPrefix(rest, "EXIT HANDLER") || strings.HasPrefix(rest, "UNDO HANDLER") {
+			if seenKind < 3 {
+				seenKind = 3
+			}
+		} else {
+			// Variable declaration: DECLARE name type [DEFAULT ...]
+			varName := strings.ToLower(words[0])
+			// Error 1331: duplicate variable
+			if declaredVars[varName] {
+				return mysqlError(1331, "42000", fmt.Sprintf("Duplicate variable: %s", varName))
+			}
+			// Error 1337: variable after cursor or handler
+			if seenKind >= 2 {
+				return mysqlError(1337, "42000", "Variable or condition declaration after cursor or handler declaration")
+			}
+			if seenKind < 1 {
+				seenKind = 1
+			}
+			declaredVars[varName] = true
+		}
+	}
+
+	// All declared locals (for FETCH INTO variable checks)
+	allDeclared := make(map[string]bool)
+	for k := range declaredVars {
+		allDeclared[k] = true
+	}
+
+	for _, stmt := range bodyStmts {
+		upper := strings.ToUpper(strings.TrimSpace(stmt))
+
+		// Error ER_SP_BADSTATEMENT (1295): USE is not allowed in stored routines
+		if strings.HasPrefix(upper, "USE ") || upper == "USE" {
+			return mysqlError(1295, "0A000", "USE is not allowed in stored procedures")
+		}
+
+		// Check OPEN/CLOSE/FETCH for undeclared cursor names (error 1324)
+		var opCursorName string
+		if strings.HasPrefix(upper, "OPEN ") {
+			opCursorName = strings.ToLower(strings.TrimSpace(strings.TrimRight(upper[5:], " \t\n\r;")))
+		} else if strings.HasPrefix(upper, "CLOSE ") {
+			opCursorName = strings.ToLower(strings.TrimSpace(strings.TrimRight(upper[6:], " \t\n\r;")))
+		} else if strings.HasPrefix(upper, "FETCH ") {
+			// FETCH [NEXT FROM] cursor_name INTO var1, var2, ...
+			rest := strings.TrimSpace(upper[6:])
+			if strings.HasPrefix(rest, "NEXT FROM ") {
+				rest = strings.TrimSpace(rest[10:])
+			} else if strings.HasPrefix(rest, "FROM ") {
+				rest = strings.TrimSpace(rest[5:])
+			}
+			// cursor name is first word
+			fwords := strings.Fields(rest)
+			if len(fwords) > 0 {
+				opCursorName = strings.ToLower(strings.TrimRight(fwords[0], ",;"))
+			}
+			// Check FETCH INTO variables (error 1327)
+			if intoIdx := strings.Index(rest, " INTO "); intoIdx >= 0 {
+				intoVars := strings.TrimSpace(rest[intoIdx+len(" INTO "):])
+				for _, v := range strings.Split(intoVars, ",") {
+					vname := strings.ToLower(strings.TrimSpace(strings.TrimRight(v, " \t\n\r;")))
+					// User variables (@var) are always ok
+					if strings.HasPrefix(vname, "@") {
+						continue
+					}
+					if !allDeclared[vname] {
+						// Preserve original casing from the statement for the error message
+						origVname := strings.TrimSpace(strings.TrimRight(v, " \t\n\r;"))
+						return mysqlError(1327, "42000", fmt.Sprintf("Undeclared variable: %s", origVname))
+					}
+				}
+			}
+		}
+		if opCursorName != "" && !declaredCursors[opCursorName] {
+			return mysqlError(1324, "42000", fmt.Sprintf("Undefined CURSOR: %s", opCursorName))
+		}
+
+		if !strings.HasPrefix(upper, "DECLARE") {
+			continue
+		}
+		rest := strings.TrimSpace(upper[len("DECLARE"):])
+		// DECLARE <name> CURSOR FOR <stmt> - check stmt is SELECT (not INSERT/UPDATE/etc.)
+		if cursorIdx := strings.Index(rest, " CURSOR FOR "); cursorIdx >= 0 {
+			afterFor := strings.TrimSpace(rest[cursorIdx+len(" CURSOR FOR "):])
+			// Valid cursor for statements: SELECT, (SELECT ...), WITH ...
+			if !strings.HasPrefix(afterFor, "SELECT") &&
+				!strings.HasPrefix(afterFor, "(SELECT") &&
+				!strings.HasPrefix(afterFor, "WITH ") {
+				// Not a SELECT — MySQL returns a parse error
+				origStmt := strings.TrimSpace(stmt)
+				near := origStmt
+				if len(near) > 80 {
+					near = near[:80]
+				}
+				return mysqlError(1064, "42000", fmt.Sprintf(
+					"You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", near))
+			}
+			// Check SELECT ... INTO ... is not allowed in cursor definition (error 1323)
+			if strings.HasPrefix(afterFor, "SELECT") {
+				if containsTopLevelInto(afterFor) {
+					return mysqlError(1323, "42000", "Cursor SELECT must not have INTO")
+				}
+			}
+		}
+	}
+	return validateRoutineConditionHandlers(bodyStmts)
+}
+
+// containsTopLevelInto checks if a SELECT statement (uppercased) contains an INTO clause
+// at the top level (not inside a subquery).
+func containsTopLevelInto(upperSelect string) bool {
+	depth := 0
+	i := 0
+	for i < len(upperSelect) {
+		ch := upperSelect[i]
+		if ch == '(' {
+			depth++
+			i++
+			continue
+		}
+		if ch == ')' {
+			depth--
+			i++
+			continue
+		}
+		if ch == '\'' || ch == '"' {
+			// Skip string literal
+			q := ch
+			i++
+			for i < len(upperSelect) && upperSelect[i] != q {
+				i++
+			}
+			i++
+			continue
+		}
+		if depth == 0 && i+5 < len(upperSelect) {
+			// Check for " INTO " with word boundary
+			if upperSelect[i] == ' ' && strings.HasPrefix(upperSelect[i:], " INTO ") {
+				return true
+			}
+		}
+		i++
+	}
+	return false
+}
+
+// validateRoutineConditionHandlers checks that all DECLARE HANDLER FOR <name> references
+// refer to valid conditions (declared, standard, or numeric). Returns error 1319 if not.
+func validateRoutineConditionHandlers(bodyStmts []string) error {
+	// Standard condition names that are always valid
+	standardConditions := map[string]bool{
+		"SQLEXCEPTION": true,
+		"SQLWARNING":   true,
+		"NOT":          true, // "NOT FOUND" is two words, handled separately
+	}
+
+	// Collect all declared condition names from DECLARE ... CONDITION FOR
+	declaredConditions := make(map[string]bool)
+	for _, stmt := range bodyStmts {
+		upper := strings.ToUpper(strings.TrimSpace(stmt))
+		if !strings.HasPrefix(upper, "DECLARE") {
+			continue
+		}
+		rest := strings.TrimSpace(upper[len("DECLARE"):])
+		// DECLARE <name> CONDITION FOR ...
+		words := strings.Fields(rest)
+		if len(words) >= 2 && words[1] == "CONDITION" {
+			condName := strings.ToLower(words[0])
+			declaredConditions[condName] = true
+		}
+	}
+
+	// Check all DECLARE HANDLER FOR references
+	for _, stmt := range bodyStmts {
+		upper := strings.ToUpper(strings.TrimSpace(stmt))
+		if !strings.HasPrefix(upper, "DECLARE") {
+			continue
+		}
+		rest := strings.TrimSpace(upper[len("DECLARE"):])
+		// Look for CONTINUE/EXIT HANDLER FOR <condition>
+		var afterFor string
+		if strings.HasPrefix(rest, "CONTINUE HANDLER FOR ") {
+			afterFor = strings.TrimSpace(rest[len("CONTINUE HANDLER FOR "):])
+		} else if strings.HasPrefix(rest, "EXIT HANDLER FOR ") {
+			afterFor = strings.TrimSpace(rest[len("EXIT HANDLER FOR "):])
+		} else {
+			continue
+		}
+
+		// Check condition type
+		if strings.HasPrefix(afterFor, "NOT FOUND") ||
+			strings.HasPrefix(afterFor, "SQLEXCEPTION") ||
+			strings.HasPrefix(afterFor, "SQLWARNING") ||
+			strings.HasPrefix(afterFor, "SQLSTATE") {
+			continue // standard condition, ok
+		}
+
+		// Check for numeric error code
+		words := strings.Fields(afterFor)
+		if len(words) == 0 {
+			continue
+		}
+		condRef := strings.TrimRight(words[0], ",;")
+		if _, err := strconv.ParseInt(condRef, 10, 64); err == nil {
+			continue // numeric error code, ok
+		}
+		// Check if it's a declared condition name
+		if declaredConditions[strings.ToLower(condRef)] || standardConditions[condRef] {
+			continue
+		}
+		// Condition name not found
+		return mysqlError(1319, "42000", fmt.Sprintf("Undefined CONDITION: %s", condRef))
+	}
+	return nil
+}
+
+// containsReturnStmt checks whether body text (upper-cased) contains a RETURN statement
+// at word boundary. This is used to validate that a stored function has a RETURN.
+func containsReturnStmt(upperBody string) bool {
+	idx := 0
+	for {
+		pos := strings.Index(upperBody[idx:], "RETURN")
+		if pos < 0 {
+			break
+		}
+		absPos := idx + pos
+		// Check word boundary before
+		beforeOK := absPos == 0 || !isAlphaNum(upperBody[absPos-1])
+		// Check word boundary after (RETURN followed by space, newline, or end)
+		afterPos := absPos + len("RETURN")
+		afterOK := afterPos >= len(upperBody) || upperBody[afterPos] == ' ' || upperBody[afterPos] == '\t' || upperBody[afterPos] == '\n' || upperBody[afterPos] == '\r' || upperBody[afterPos] == ';'
+		if beforeOK && afterOK {
+			return true
+		}
+		idx = absPos + len("RETURN")
+	}
+	return false
+}
+
+// evalProcArg evaluates a procedure call argument that is not a user variable.
+// It tries integer, float, and quoted-string parsing first.
+// If the argument contains operators (expressions like "n-1"), it evaluates via SQL SELECT.
+func (e *Executor) evalProcArg(argVal string) interface{} {
+	upperArgVal := strings.ToUpper(strings.TrimSpace(argVal))
+	if upperArgVal == "NULL" {
+		return nil
+	}
+	// Integer literal
+	if n, err := strconv.ParseInt(argVal, 10, 64); err == nil {
+		return n
+	}
+	// Unsigned integer literal (e.g. very large numbers)
+	if n, err := strconv.ParseUint(argVal, 10, 64); err == nil {
+		return n
+	}
+	// Float literal
+	if f, err := strconv.ParseFloat(argVal, 64); err == nil {
+		return f
+	}
+	// Quoted string literal
+	trimmed := strings.TrimSpace(argVal)
+	if len(trimmed) >= 2 && (trimmed[0] == '\'' || trimmed[0] == '"') {
+		return strings.Trim(trimmed, "'\"")
+	}
+	// Expression (e.g. "n-1", "x+y"): evaluate via SELECT
+	result, err := e.Execute("SELECT " + argVal)
+	if err == nil && result != nil && len(result.Rows) > 0 && len(result.Rows[0]) > 0 {
+		return result.Rows[0][0]
+	}
+	// Fallback: return as string (stripped of quotes)
+	return strings.Trim(argVal, "'\"")
 }
 
 // splitByComma splits a string by commas, respecting parentheses.
@@ -1205,15 +1558,7 @@ func (e *Executor) callProcedureByNameInDB(dbName string, procName string, argSt
 					paramVars[param.Name] = nil
 				}
 			} else {
-				upperArgVal := strings.ToUpper(argVal)
-				var literalVal interface{}
-				if upperArgVal == "NULL" {
-					literalVal = nil
-				} else if n, err2 := strconv.ParseInt(argVal, 10, 64); err2 == nil {
-					literalVal = n
-				} else {
-					literalVal = strings.Trim(argVal, "'\"")
-				}
+				literalVal := e.evalProcArg(argVal)
 				if param.Mode == "IN" || param.Mode == "INOUT" {
 					paramVars[param.Name] = literalVal
 				} else if param.Mode == "OUT" {
@@ -1333,6 +1678,39 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 		return nil, mysqlError(1305, "42000", fmt.Sprintf("PROCEDURE %s.%s does not exist", e.CurrentDB, procName))
 	}
 
+	// Check max_sp_recursion_depth: recursive calls are only allowed when this variable > 0.
+	// Only apply this check when the SAME procedure is already on the call stack (true recursion).
+	// Calls to different procedures from within a procedure are allowed unconditionally.
+	procNameLower := strings.ToLower(procName)
+	isRecursive := false
+	for _, stackEntry := range e.routineCallStack {
+		if stackEntry == procNameLower {
+			isRecursive = true
+			break
+		}
+	}
+	if isRecursive {
+		maxDepth := int64(0)
+		if v, ok := e.getSysVar("max_sp_recursion_depth"); ok {
+			if n, err2 := strconv.ParseInt(fmt.Sprintf("%v", v), 10, 64); err2 == nil {
+				maxDepth = n
+			}
+		}
+		// Count how many times this procedure appears in the call stack (current recursion depth).
+		recursionCount := int64(0)
+		for _, stackEntry := range e.routineCallStack {
+			if stackEntry == procNameLower {
+				recursionCount++
+			}
+		}
+		if maxDepth == 0 {
+			return nil, mysqlError(1456, "HY000", fmt.Sprintf("Recursive limit %d exceeded for routine '%s'", maxDepth, procName))
+		}
+		if recursionCount > maxDepth {
+			return nil, mysqlError(1456, "HY000", fmt.Sprintf("Recursive limit %d exceeded for routine '%s'", maxDepth, procName))
+		}
+	}
+
 	// Validate argument count (MySQL ER_SP_WRONG_NO_OF_ARGS = 1318, SQLSTATE 42000).
 	if len(argStrs) != len(proc.Params) {
 		return nil, mysqlError(1318, "42000", fmt.Sprintf("Incorrect number of arguments for PROCEDURE %s.%s; expected %d, got %d",
@@ -1365,16 +1743,8 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 					paramVars[param.Name] = nil
 				}
 			} else {
-				// Literal value or NULL passed as argument
-				var literalVal interface{}
-				upperArgVal := strings.ToUpper(argVal)
-				if upperArgVal == "NULL" {
-					literalVal = nil
-				} else if n, err := strconv.ParseInt(argVal, 10, 64); err == nil {
-					literalVal = n
-				} else {
-					literalVal = strings.Trim(argVal, "'\"")
-				}
+				// Literal value, NULL, or expression passed as argument
+				literalVal := e.evalProcArg(argVal)
 				if param.Mode == "IN" || param.Mode == "INOUT" {
 					paramVars[param.Name] = literalVal
 				} else if param.Mode == "OUT" {
@@ -1425,9 +1795,15 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 	e.insideStrictRoutine = procIsStrict2
 
 	// Enter stored routine — internal Execute calls should not count as client Questions.
+	// Push procedure name onto call stack for recursion detection.
+	e.routineCallStack = append(e.routineCallStack, procNameLower)
 	e.routineDepth++
 	bodyResult, err := e.execRoutineBodyWithContext(proc.Body, ctx)
 	e.routineDepth--
+	// Pop procedure name from call stack.
+	if len(e.routineCallStack) > 0 {
+		e.routineCallStack = e.routineCallStack[:len(e.routineCallStack)-1]
+	}
 	e.insideStrictRoutine = savedInsideStrictRoutineProc2
 	if err != nil {
 		// SIGNAL with SQLSTATE class '01' (warning) should produce a warning, not an error.
@@ -1652,6 +2028,18 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 	paramStr := strings.TrimSpace(rest[paramStart:paramEnd])
 	params := parseProcParams(paramStr)
 
+	// Check for duplicate parameter names (error 1330).
+	{
+		seen := make(map[string]bool)
+		for _, p := range params {
+			lname := strings.ToLower(p.Name)
+			if seen[lname] {
+				return nil, mysqlError(1330, "42000", fmt.Sprintf("Duplicate parameter: %s", p.Name))
+			}
+			seen[lname] = true
+		}
+	}
+
 	// Extract RETURNS type and body
 	afterParams := rest[paramEnd+1:]
 	upperAfter := strings.ToUpper(afterParams)
@@ -1681,13 +2069,36 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 
 	// Extract body: BEGIN...END or single RETURN expression.
 	var bodyStmts []string
+	var hasReturnInBody bool
 	beginIdx := strings.Index(strings.ToUpper(afterParams), "BEGIN")
 	if beginIdx >= 0 {
 		bodyStr := strings.TrimSpace(afterParams[beginIdx+len("BEGIN"):])
-		if strings.HasSuffix(strings.ToUpper(strings.TrimSpace(bodyStr)), "END") {
+		// Only apply the 1320 check when the body is complete (ends with END).
+		// If the body is truncated (e.g., sent without the closing END due to
+		// delimiter handling), we skip the check to avoid false positives.
+		bodyHasEnd := strings.HasSuffix(strings.ToUpper(strings.TrimSpace(bodyStr)), "END")
+		if bodyHasEnd {
 			bodyStr = strings.TrimSpace(bodyStr[:len(bodyStr)-len("END")])
 		}
 		bodyStmts = splitTriggerBody(bodyStr)
+		// Check whether any statement in the body is a RETURN statement.
+		// MySQL error 1320 is raised at CREATE time if a function has no RETURN in its body.
+		// Only check when the body is complete (has matching END).
+		if bodyHasEnd {
+			for _, stmt := range bodyStmts {
+				if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(stmt)), "RETURN") {
+					hasReturnInBody = true
+					break
+				}
+			}
+			// Also check the raw body text (for nested blocks where RETURN appears inside IF/CASE/LOOP).
+			if !hasReturnInBody {
+				hasReturnInBody = containsReturnStmt(strings.ToUpper(bodyStr))
+			}
+			if !hasReturnInBody {
+				return nil, mysqlError(1320, "2F005", fmt.Sprintf("FUNCTION %s ended without RETURN", funcName))
+			}
+		}
 	} else {
 		returnIdx := strings.Index(strings.ToUpper(afterParams), "RETURN ")
 		if returnIdx < 0 {
@@ -1696,6 +2107,11 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 		returnExpr := strings.TrimSpace(afterParams[returnIdx:])
 		returnExpr = strings.TrimSuffix(returnExpr, ";")
 		bodyStmts = []string{returnExpr}
+	}
+
+	// Validate routine body: cursor-for-non-SELECT (1064) and condition handler refs (1319).
+	if err := validateRoutineBody(bodyStmts); err != nil {
+		return nil, err
 	}
 
 	// Check for duplicate function name (case and accent insensitive).

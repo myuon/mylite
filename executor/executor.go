@@ -378,6 +378,10 @@ type Executor struct {
 	// routineDepth tracks the current stored routine call depth to prevent infinite recursion
 	// and to avoid counting internal routine Execute calls in the Questions status counter.
 	routineDepth int
+	// routineCallStack tracks the names of stored routines currently on the call stack.
+	// Used to detect true recursive calls (same procedure calling itself) vs. nested calls
+	// to different procedures. Only same-name recursion is subject to max_sp_recursion_depth.
+	routineCallStack []string
 	// functionOrTriggerDepth tracks depth inside stored functions or triggers only.
 	// Used to enforce error 1422 (no implicit-commit DDL inside functions/triggers).
 	// Stored procedures are excluded because they are allowed to execute DDL.
