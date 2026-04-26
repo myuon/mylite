@@ -76,8 +76,34 @@ type TableDef struct {
 	MaxRows          *uint64  // MAX_ROWS table option (clamped to uint32 max for non-64-bit engines)
 	CheckConstraints  []CheckConstraint // CHECK constraint definitions
 	ForeignKeys       []ForeignKeyDef    // FOREIGN KEY constraint definitions
-	PartitionType     string             // "RANGE", "LIST", "HASH", "KEY" or "" for non-partitioned
-	PartitionColumns  []string           // column names used in partition expression (for ordering)
+	PartitionType         string              // "RANGE", "LIST", "HASH", "KEY" or "" for non-partitioned
+	PartitionColumns      []string            // column names used in partition expression (for ordering)
+	PartitionIsLinear     bool                // true if LINEAR modifier present
+	PartitionKeyAlgorithm int                 // KEY algorithm number (0 = unset)
+	PartitionExpression   string              // raw expression string (e.g. "year(`c3`)", "`c1`")
+	PartitionExprCols     []string            // column list for RANGE/LIST COLUMNS or KEY
+	PartitionCount        int                 // PARTITIONS N (0 = unset/implicit)
+	PartitionSubpartition *PartitionSubpart   // subpartition definition (nil if none)
+	PartitionDefs         []PartitionDef      // individual PARTITION definitions
+}
+
+// PartitionSubpart holds the SUBPARTITION BY clause details.
+type PartitionSubpart struct {
+	Type          string // "HASH" or "KEY"
+	IsLinear      bool
+	KeyAlgorithm  int
+	Expression    string   // expression for HASH
+	Columns       []string // columns for KEY
+	SubPartitions int      // SUBPARTITIONS N (0 = unset/implicit)
+}
+
+// PartitionDef holds one partition definition (PARTITION p0 VALUES ...).
+type PartitionDef struct {
+	Name       string
+	ValueRange string   // "LESS THAN (expr)", "LESS THAN MAXVALUE", "IN (v1,v2,...)"
+	MaxRows    *int
+	MinRows    *int
+	Engine     string // e.g. "InnoDB"
 }
 
 // ColType returns the type string for a column by name (case-insensitive).

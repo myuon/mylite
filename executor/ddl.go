@@ -2203,6 +2203,100 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				def.PartitionColumns = []string{col.Name.String()}
 			}
 		}
+		// Capture full partition metadata for SHOW CREATE TABLE.
+		def.PartitionIsLinear = po.IsLinear
+		def.PartitionKeyAlgorithm = po.KeyAlgorithm
+		if po.Partitions > 0 {
+			def.PartitionCount = po.Partitions
+		}
+		// Expression (HASH/RANGE/LIST with expression)
+		if po.Expr != nil {
+			def.PartitionExpression = sqlparser.String(po.Expr)
+		}
+		// Column list (KEY or RANGE/LIST COLUMNS)
+		if len(po.ColList) > 0 {
+			colNames := make([]string, len(po.ColList))
+			for i, c := range po.ColList {
+				colNames[i] = c.String()
+			}
+			def.PartitionExprCols = colNames
+		}
+		// Subpartition
+		if po.SubPartition != nil {
+			sp := po.SubPartition
+			sub := &catalog.PartitionSubpart{
+				IsLinear:     sp.IsLinear,
+				KeyAlgorithm: sp.KeyAlgorithm,
+			}
+			switch sp.Type {
+			case sqlparser.HashType:
+				sub.Type = "HASH"
+				if sp.Expr != nil {
+					sub.Expression = sqlparser.String(sp.Expr)
+				}
+			case sqlparser.KeyType:
+				sub.Type = "KEY"
+				if len(sp.ColList) > 0 {
+					cols := make([]string, len(sp.ColList))
+					for i, c := range sp.ColList {
+						cols[i] = c.String()
+					}
+					sub.Columns = cols
+				}
+			}
+			if sp.SubPartitions > 0 {
+				sub.SubPartitions = sp.SubPartitions
+			}
+			def.PartitionSubpartition = sub
+		}
+		// Partition definitions
+		engineName := "InnoDB" // default engine for partitions
+		if def.Engine != "" {
+			switch strings.ToUpper(def.Engine) {
+			case "INNODB":
+				engineName = "InnoDB"
+			case "MYISAM":
+				engineName = "MyISAM"
+			}
+		}
+		for _, pd := range po.Definitions {
+			pdef := catalog.PartitionDef{
+				Name:   pd.Name.String(),
+				Engine: engineName,
+			}
+			if pd.Options != nil {
+				if pd.Options.MaxRows != nil {
+					pdef.MaxRows = pd.Options.MaxRows
+				}
+				if pd.Options.MinRows != nil {
+					pdef.MinRows = pd.Options.MinRows
+				}
+				if pd.Options.Engine != nil && pd.Options.Engine.Name != "" {
+					pdef.Engine = pd.Options.Engine.Name
+				}
+				if pd.Options.ValueRange != nil {
+					vr := pd.Options.ValueRange
+					if vr.Maxvalue {
+						pdef.ValueRange = "LESS THAN MAXVALUE"
+					} else if vr.Type == sqlparser.LessThanType {
+						// RANGE: LESS THAN (expr)
+						parts := make([]string, len(vr.Range))
+						for i, v := range vr.Range {
+							parts[i] = sqlparser.String(v)
+						}
+						pdef.ValueRange = "LESS THAN (" + strings.Join(parts, ",") + ")"
+					} else {
+						// LIST: IN (v1,v2,...)
+						parts := make([]string, len(vr.Range))
+						for i, v := range vr.Range {
+							parts[i] = sqlparser.String(v)
+						}
+						pdef.ValueRange = "IN (" + strings.Join(parts, ",") + ")"
+					}
+				}
+			}
+			def.PartitionDefs = append(def.PartitionDefs, pdef)
+		}
 		// For KEY partitions, validate that the total byte length of partition
 		// columns does not exceed 3072 bytes (MySQL's max partition key length).
 		if po.Type == sqlparser.KeyType && len(po.ColList) > 0 {
@@ -2745,6 +2839,46 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 	}
 
 	tableName := stmt.Table.Name.String()
+
+	// Handle partition maintenance operations: ANALYZE/CHECK/REPAIR/REBUILD/OPTIMIZE PARTITION.
+	// These are no-ops in mylite (partitioning is not enforced at storage level).
+	// MySQL returns a result set for these operations; we return a no-op result set.
+	if stmt.PartitionSpec != nil {
+		switch stmt.PartitionSpec.Action {
+		case sqlparser.AnalyzeAction, sqlparser.CheckAction, sqlparser.RepairAction,
+			sqlparser.RebuildAction, sqlparser.OptimizeAction:
+			// Return a result set matching MySQL's output format.
+			// One row per partition operation: <db>.<table>  <op>  status  OK
+			var opStr string
+			switch stmt.PartitionSpec.Action {
+			case sqlparser.AnalyzeAction:
+				opStr = "analyze"
+			case sqlparser.CheckAction:
+				opStr = "check"
+			case sqlparser.RepairAction:
+				opStr = "repair"
+			case sqlparser.RebuildAction:
+				opStr = "rebuild"
+			case sqlparser.OptimizeAction:
+				opStr = "optimize"
+			}
+			qualTable := tableName
+			if dbName != "" {
+				qualTable = dbName + "." + tableName
+			}
+			return &Result{
+				Columns:     []string{"Table", "Op", "Msg_type", "Msg_text"},
+				Rows:        [][]interface{}{{qualTable, opStr, "status", "OK"}},
+				IsResultSet: true,
+			}, nil
+		case sqlparser.TruncateAction, sqlparser.DiscardAction, sqlparser.ImportAction,
+			sqlparser.CoalesceAction, sqlparser.RemoveAction, sqlparser.UpgradeAction,
+			sqlparser.ReorganizeAction, sqlparser.AddAction, sqlparser.DropAction,
+			sqlparser.ExchangeAction:
+			// These partition DDL operations are not fully implemented; ignore silently.
+			return &Result{}, nil
+		}
+	}
 
 	// Protect MySQL log tables from ALTER when logging is enabled
 	if isMySQLLogTable(dbName, tableName) && e.isLogTableLoggingEnabled(tableName) {
