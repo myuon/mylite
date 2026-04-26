@@ -3942,7 +3942,17 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		if val == nil {
 			return nil, nil
 		}
-		return normalizeWKT(toString(val)), nil
+		wkt := normalizeWKT(toString(val))
+		// Handle optional SRID parameter
+		if v.Srid != nil {
+			sridVal, err2 := e.evalExpr(v.Srid)
+			if err2 != nil {
+				return nil, err2
+			}
+			srid := uint32(asInt64Or(sridVal, 0))
+			return geomSetSRID(wkt, srid), nil
+		}
+		return wkt, nil
 	case *sqlparser.GeomFormatExpr:
 		// ST_AsText/ST_AsWKT returns WKT string; ST_AsBinary/ST_AsWKB returns WKB []byte
 		val, err := e.evalExpr(v.Geom)
@@ -3954,7 +3964,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		}
 		if v.FormatType == sqlparser.BinaryFormat {
 			// Return WKB binary representation
-			wkt := toString(val)
+			wkt := geomStripSRID(toString(val))
 			wkb := wktToWKBBody(wkt)
 			if wkb != nil {
 				return wkb, nil
@@ -3974,7 +3984,8 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			}
 			return wkt, nil
 		}
-		return toString(val), nil
+		// Strip EWKT SRID prefix if present (ST_AsText returns plain WKT)
+		return geomStripSRID(toString(val)), nil
 	case *sqlparser.GeomFromWKBExpr:
 		// ST_GeomFromWKB, ST_PointFromWKB, etc. — parse WKB and return WKT string
 		val, err := e.evalExpr(v.WkbBlob)
@@ -6448,18 +6459,13 @@ func (e *Executor) evalFuncExprWithRow(v *sqlparser.FuncExpr, row storage.Row) (
 		return result, nil
 	}
 	// Fallback: delegate to evalFuncExpr.
-	// For spatial functions that need column values, set correlatedRow so column references resolve.
-	funcNameLower := strings.ToLower(v.Name.String())
-	switch funcNameLower {
-	case "mbrwithin", "st_within", "mbrcontains", "st_contains", "mbrintersects", "st_intersects":
-		oldCorrelated := e.correlatedRow
-		e.correlatedRow = row
-		result, err := e.evalFuncExpr(v)
-		e.correlatedRow = oldCorrelated
-		return result, err
-	default:
-		return e.evalFuncExpr(v)
-	}
+	// Always set correlatedRow so that column references inside any function are resolved
+	// from the current row (e.g. ST_SRID(g, 4326) in UPDATE SET needs to read 'g').
+	oldCorrelated := e.correlatedRow
+	e.correlatedRow = row
+	result, err := e.evalFuncExpr(v)
+	e.correlatedRow = oldCorrelated
+	return result, err
 }
 
 // evalComparisonWithRow evaluates a comparison expression with row context.

@@ -1688,6 +1688,19 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				if exists && rv != nil {
 					colUpper := strings.ToUpper(col.Type)
 					isSpatialType := strings.Contains(colUpper, "POINT") || strings.Contains(colUpper, "LINESTRING") || strings.Contains(colUpper, "POLYGON") || strings.Contains(colUpper, "GEOMETRY") || strings.Contains(colUpper, "GEOMCOLLECTION")
+					// SRID constraint validation for spatial columns
+					if isSpatialType && col.SRIDConstraint != nil {
+						geomStr := toString(rv)
+						geomSRID := geomGetSRID(geomStr)
+						if geomSRID != *col.SRIDConstraint {
+							if bool(stmt.Ignore) {
+								e.addWarning("Warning", 3643, fmt.Sprintf("The SRID of the geometry does not match the SRID of the column '%s'. The SRID of the geometry is %d, but the SRID of the column is %d. Consider changing the SRID of the geometry or the SRID property of the column.", col.Name, geomSRID, *col.SRIDConstraint))
+								row[col.Name] = nil
+							} else {
+								return nil, mysqlError(3643, "HY000", fmt.Sprintf("The SRID of the geometry does not match the SRID of the column '%s'. The SRID of the geometry is %d, but the SRID of the column is %d. Consider changing the SRID of the geometry or the SRID property of the column.", col.Name, geomSRID, *col.SRIDConstraint))
+							}
+						}
+					}
 					isIntType := !isSpatialType && (strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER"))
 					isDecimalType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || colUpper == "REAL" || strings.HasPrefix(colUpper, "REAL ")
 					isNumericType := isIntType || isDecimalType

@@ -13,6 +13,11 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
+// isSRIDKnown returns true if the given SRID is in the known SRS catalog (0 or 4326).
+func isSRIDKnown(srid uint32) bool {
+	return srid == 0 || srid == 4326
+}
+
 // isKnownStorageEngine reports whether the given engine name (already uppercased) is
 // a storage engine recognized by MySQL.  FEDERATED is intentionally excluded because
 // it is compiled-in but disabled, and callers handle it separately.
@@ -1325,6 +1330,19 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				comment = mysqlTruncateChars(comment, 1024)
 			}
 			colDef.Comment = comment
+		}
+
+		// Extract SRID constraint for spatial columns
+		if col.Type.Options != nil && col.Type.Options.SRID != nil {
+			sridVal, err := strconv.ParseUint(col.Type.Options.SRID.Val, 10, 32)
+			if err == nil {
+				// Validate that the SRID exists in our SRS catalog (0 and 4326)
+				sridU32 := uint32(sridVal)
+				if !isSRIDKnown(sridU32) {
+					return nil, mysqlError(3716, "SR001", fmt.Sprintf("There's no spatial reference system with SRID %d.", sridU32))
+				}
+				colDef.SRIDConstraint = &sridU32
+			}
 		}
 
 		columns = append(columns, colDef)
