@@ -4974,20 +4974,38 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		// Apply ORDER BY if present
 		sortedRows := make([]storage.Row, len(groupRows))
 		copy(sortedRows, groupRows)
+		// Determine the collation to use for sorting and distinct deduplication.
+		// Use the session's collation_connection (default: utf8mb4_0900_ai_ci).
+		gcCollation := "utf8mb4_0900_ai_ci"
+		if exec != nil {
+			if cv, ok := exec.getSysVar("collation_connection"); ok && cv != "" {
+				gcCollation = cv
+			}
+		}
 		if len(e.OrderBy) > 0 {
 			sort.SliceStable(sortedRows, func(i, j int) bool {
 				for _, ord := range e.OrderBy {
-					vi, _ := evalRowExpr(ord.Expr, sortedRows[i])
-					vj, _ := evalRowExpr(ord.Expr, sortedRows[j])
-					lt, _ := compareValues(vi, vj, sqlparser.LessThanOp)
-					eq, _ := compareValues(vi, vj, sqlparser.EqualOp)
-					if eq {
+					// Resolve positional ORDER BY (e.g. ORDER BY 1 refers to the first
+					// expression in the GROUP_CONCAT expression list).
+					ordExpr := ord.Expr
+					if lit, ok := ordExpr.(*sqlparser.Literal); ok && lit.Type == sqlparser.IntVal {
+						if pos, err2 := strconv.Atoi(lit.Val); err2 == nil && pos >= 1 && pos <= len(e.Exprs) {
+							ordExpr = e.Exprs[pos-1]
+						}
+					}
+					vi, _ := evalRowExpr(ordExpr, sortedRows[i])
+					vj, _ := evalRowExpr(ordExpr, sortedRows[j])
+					// Use collation-aware comparison without tie-breaking on raw string value.
+					// For equal collation-key values (e.g. D and d under _ci), the stable
+					// sort preserves insertion order, matching MySQL behavior.
+					cmp := compareByCollationNoTieBreak(vi, vj, gcCollation)
+					if cmp == 0 {
 						continue
 					}
 					if ord.Direction == sqlparser.DescOrder {
-						return !lt
+						return cmp > 0
 					}
-					return lt
+					return cmp < 0
 				}
 				return false
 			})
@@ -5013,12 +5031,19 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 			}
 			s := part.String()
 			if e.Distinct {
-				if _, ok := distinct[s]; ok {
+				// Use collation key for deduplication so that case-insensitive
+				// collations treat 'D' and 'd' as the same value (matching MySQL behavior).
+				distinctKey := normalizeCollationKey(s, gcCollation)
+				if _, ok := distinct[distinctKey]; ok {
 					continue
 				}
-				distinct[s] = struct{}{}
+				distinct[distinctKey] = struct{}{}
 			}
 			out = append(out, s)
+		}
+		// MySQL returns NULL when all input values were NULL (i.e., no non-NULL values contributed).
+		if len(out) == 0 {
+			return nil, nil
 		}
 		result := strings.Join(out, sep)
 		// Apply group_concat_max_len limit.

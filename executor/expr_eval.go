@@ -8019,6 +8019,40 @@ func extractFromDatabase(expr sqlparser.TableExpr) string {
 	return ""
 }
 
+// compareByCollationNoTieBreak compares two values using the given collation,
+// but unlike compareByCollation it does NOT apply a secondary tie-break based on
+// the raw string when collation keys are equal. This is used for GROUP_CONCAT ORDER BY
+// where MySQL relies on stable sort to preserve insertion order for equal elements
+// (e.g. 'D' and 'd' under utf8mb4_0900_ai_ci should be considered truly equal).
+func compareByCollationNoTieBreak(a, b interface{}, collation string) int {
+	if a == nil && b == nil {
+		return 0
+	}
+	if a == nil {
+		return -1
+	}
+	if b == nil {
+		return 1
+	}
+
+	aIsStr := isStringValue(a)
+	bIsStr := isStringValue(b)
+	if aIsStr || bIsStr {
+		aStr := toString(a)
+		bStr := toString(b)
+		sa := normalizeCollationKey(aStr, collation)
+		sb := normalizeCollationKey(bStr, collation)
+		if sa < sb {
+			return -1
+		}
+		if sa > sb {
+			return 1
+		}
+		return 0 // no tie-break: equal collation keys are treated as equal
+	}
+	return compareNumeric(a, b)
+}
+
 func compareByCollation(a, b interface{}, collation string) int {
 	if a == nil && b == nil {
 		return 0
