@@ -1759,6 +1759,13 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 	}
 
+	// MySQL supports "RENAME TABLES" as a synonym for "RENAME TABLE".
+	// The Vitess parser only recognizes "RENAME TABLE", so rewrite the query.
+	if strings.HasPrefix(upper, "RENAME TABLES ") || strings.EqualFold(strings.TrimSpace(query), "RENAME TABLES") {
+		query = query[:len("RENAME TABLE")] + query[len("RENAME TABLES"):]
+		upper = strings.ToUpper(strings.TrimSpace(query))
+	}
+
 	stmt, err := e.parser().Parse(query)
 	if err != nil {
 		// Accept statements that Vitess parser doesn't support
@@ -3473,6 +3480,61 @@ func (e *Executor) checkTableLockRestrictions(stmt sqlparser.Statement) error {
 					}
 				}
 			}
+		}
+	case *sqlparser.RenameTable:
+		// RENAME TABLE under LOCK TABLES: each source table must be locked for WRITE
+		// unless it is an intermediate name produced by an earlier step in the same
+		// multi-rename statement (MySQL allows chains like t3→t4,t4→t5 when only
+		// t3 is explicitly locked — t4 is implicitly available as it was just created).
+		// Additionally, if a rename would provide a parent for an orphan FK (i.e., a
+		// child table has a FK referencing the new target name), that child table must
+		// be write-locked as well (MySQL behavior for FK invariant safety).
+		introducedByChain := map[string]bool{}
+		for _, pair := range s.TablePairs {
+			srcName := pair.FromTable.Name.String()
+			srcDB := e.CurrentDB
+			if !pair.FromTable.Qualifier.IsEmpty() {
+				srcDB = pair.FromTable.Qualifier.String()
+			}
+			targetName := pair.ToTable.Name.String()
+			targetDB := e.CurrentDB
+			if !pair.ToTable.Qualifier.IsEmpty() {
+				targetDB = pair.ToTable.Qualifier.String()
+			}
+			srcKey := srcDB + "." + srcName
+			// Skip lock check if this source was introduced as a target by a prior
+			// step in the same RENAME statement (intermediate chain table).
+			if !introducedByChain[srcKey] {
+				locked, mode := e.tableLockManager.IsLocked(e.connectionID, srcKey)
+				if !locked {
+					return mysqlError(1100, "HY000", fmt.Sprintf("Table '%s' was not locked with LOCK TABLES", srcName))
+				}
+				if mode == "READ" {
+					return mysqlError(1099, "HY000", fmt.Sprintf("Table '%s' was locked with a READ lock and can't be updated", srcName))
+				}
+			}
+			// Check FK child tables: if any table in the catalog has a FK that
+			// references targetName (the new name), that child table must be write-locked.
+			// This enforces MySQL's FK invariant safety under LOCK TABLES.
+			if catDB, err := e.Catalog.GetDatabase(targetDB); err == nil {
+				for childTableName, childDef := range catDB.Tables {
+					for _, fk := range childDef.ForeignKeys {
+						if strings.EqualFold(fk.ReferencedTable, targetName) {
+							childKey := targetDB + "." + childTableName
+							childLocked, childMode := e.tableLockManager.IsLocked(e.connectionID, childKey)
+							if !childLocked {
+								return mysqlError(1100, "HY000", fmt.Sprintf("Table '%s' was not locked with LOCK TABLES", childTableName))
+							}
+							if childMode == "READ" {
+								return mysqlError(1099, "HY000", fmt.Sprintf("Table '%s' was locked with a READ lock and can't be updated", childTableName))
+							}
+						}
+					}
+				}
+			}
+			// Track target as introduced by this chain step.
+			targetKey := targetDB + "." + targetName
+			introducedByChain[targetKey] = true
 		}
 	case *sqlparser.CreateTable:
 		// CREATE TABLE when LOCK TABLES is active: the new table must be locked

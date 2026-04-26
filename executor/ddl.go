@@ -156,7 +156,16 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 			return false
 		}
 		_, err = catDB.GetTable(name)
-		return err == nil
+		if err == nil {
+			return true
+		}
+		// Also check if it's a view in viewStore.
+		if e.viewStore != nil {
+			if _, isView := e.viewStore.Lookup(db, name); isView {
+				return true
+			}
+		}
+		return false
 	}
 
 	type renamePair struct {
@@ -219,7 +228,17 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 
 		def, err := srcCatDB.GetTable(p.oldName)
 		if err != nil {
-			continue // shouldn't happen after validation
+			// May be a view rather than a table — try renaming it in viewStore.
+			if e.viewStore != nil && p.srcDB == p.targetDB {
+				e.viewStore.Rename(p.srcDB, p.oldName, p.newName)
+			}
+			// Transfer lock regardless.
+			if e.tableLockManager != nil {
+				oldKey := p.srcDB + "." + p.oldName
+				newKey := p.targetDB + "." + p.newName
+				e.tableLockManager.RenameTableLock(e.connectionID, oldKey, newKey)
+			}
+			continue
 		}
 		// Rename in catalog
 		def.Name = p.newName
@@ -238,6 +257,14 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 		}
 		e.removeInnoDBStatsRows(p.srcDB, p.oldName)
 		e.upsertInnoDBStatsRows(p.targetDB, p.newName, e.tableRowCount(p.targetDB, p.newName))
+		// Transfer table lock to new name when LOCK TABLES is active.
+		// MySQL behavior: after RENAME TABLE under LOCK TABLES, the renamed table
+		// is accessible under the new name with the original lock mode.
+		if e.tableLockManager != nil {
+			oldKey := p.srcDB + "." + p.oldName
+			newKey := p.targetDB + "." + p.newName
+			e.tableLockManager.RenameTableLock(e.connectionID, oldKey, newKey)
+		}
 		// Handle temporary table tracking: if the renamed table was a temp table,
 		// update the tempTables map and restore any saved permanent table.
 		if e.tempTables != nil && e.tempTables[p.oldName] {
@@ -2704,6 +2731,18 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 	// Ensure the storage table exists.
 	tbl, err := e.Storage.GetTable(dbName, tableName)
 	if err != nil {
+		// If a view exists with this name, return ER_WRONG_OBJECT (1347) for
+		// ALTER TABLE ... RENAME operations. For other ALTER operations, still
+		// return "doesn't exist" as the view is not a base table.
+		if e.viewStore != nil {
+			if _, isView := e.viewStore.Lookup(dbName, tableName); isView {
+				for _, opt := range stmt.AlterOptions {
+					if _, ok := opt.(*sqlparser.RenameTableName); ok {
+						return nil, mysqlError(1347, "HY000", fmt.Sprintf("'%s.%s' is not BASE TABLE", dbName, tableName))
+					}
+				}
+			}
+		}
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", dbName, tableName))
 	}
 
@@ -3888,6 +3927,12 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			// Get the current table def
 			def, getErr := db.GetTable(tableName)
 			if getErr != nil {
+				// If a view exists with this name, return ER_WRONG_OBJECT instead of "doesn't exist".
+				if e.viewStore != nil {
+					if _, isView := e.viewStore.Lookup(dbName, tableName); isView {
+						return nil, mysqlError(1347, "HY000", fmt.Sprintf("'%s.%s' is not BASE TABLE", dbName, tableName))
+					}
+				}
 				return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", dbName, tableName))
 			}
 			// Determine if the table being renamed is a temporary table

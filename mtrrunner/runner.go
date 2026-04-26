@@ -442,9 +442,11 @@ type tableSnapshot struct {
 
 // sendResult holds the result of an asynchronously sent query.
 type sendResult struct {
-	output string
-	err    error
-	query  string // original query (for retry on lock wait timeout)
+	output  string
+	err     error
+	query   string // original query (for retry on lock wait timeout)
+	errno   string // $mysql_errno after the query completes
+	errname string // $mysql_errname after the query completes
 }
 
 // pendingSend tracks a query that was dispatched via the "send" directive.
@@ -1713,6 +1715,13 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		ctx.replaceRegex = nil // consumed by send
 		sendInfoEnabled := ctx.infoEnabled
 
+		// Copy variables map for goroutine to avoid concurrent map writes.
+		// The goroutine needs a snapshot of current variables (for substitution),
+		// but must not share the map reference with the main goroutine.
+		sendVarsCopy := make(map[string]string, len(ctx.variables))
+		for k, v := range ctx.variables {
+			sendVarsCopy[k] = v
+		}
 		go func() {
 			// Create a temporary execContext for the goroutine to format output.
 			// abortOnError=true ensures that unexpected query errors are returned
@@ -1732,7 +1741,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 				resultLogEnabled: sendResultLogEnabled,
 				sortResult:       sendSortResult,
 				tmpDir:           ctx.tmpDir,
-				variables:        ctx.variables,
+				variables:        sendVarsCopy,
 				verticalResult:   sendVerticalResult,
 				verticalResults:  sendVerticalResults,
 				replaceColumns:   sendReplaceColumns,
@@ -1744,7 +1753,14 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 				metadataEnabled:  ctx.metadataEnabled,
 			}
 			err := tmpCtx.executeSQLInner(query)
-			ch <- sendResult{output: tmpCtx.output.String(), err: err, query: query}
+			// Capture errno/errname so reap can propagate them to the parent context.
+			errno := ""
+			errname := ""
+			if tmpCtx.variables != nil {
+				errno = tmpCtx.variables["$mysql_errno"]
+				errname = tmpCtx.variables["$mysql_errname"]
+			}
+			ch <- sendResult{output: tmpCtx.output.String(), err: err, query: query, errno: errno, errname: errname}
 		}()
 		return true, false, nil
 
@@ -1761,6 +1777,14 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		}
 		result := <-pending.resultCh
 		delete(ctx.pendingSendByConn, connKey)
+		// Propagate $mysql_errno/$mysql_errname from the goroutine to ctx.
+		if result.errno != "" || result.errname != "" {
+			if ctx.variables == nil {
+				ctx.variables = make(map[string]string)
+			}
+			ctx.variables["$mysql_errno"] = result.errno
+			ctx.variables["$mysql_errname"] = result.errname
+		}
 		if result.output != "" {
 			ctx.output.WriteString(result.output)
 		}
@@ -2723,24 +2747,36 @@ func (ctx *execContext) executeQuery(stmt string) error {
 		}
 		if !ctx.abortOnError {
 			// --disable_abort_on_error: output the error as a line and continue.
+			// Always update $mysql_errno/$mysql_errname regardless of resultLogEnabled
+			// so that include files like wait_for_query_to_succeed.inc can detect failure.
+			errCode := extractMySQLErrorCode(err)
+			if ctx.variables == nil {
+				ctx.variables = make(map[string]string)
+			}
+			ctx.variables["$mysql_errno"] = strconv.Itoa(errCode)
+			if name, ok := mysqlErrorCodeToName[errCode]; ok {
+				ctx.variables["$mysql_errname"] = name
+			} else {
+				ctx.variables["$mysql_errname"] = strconv.Itoa(errCode)
+			}
 			if ctx.resultLogEnabled {
 				ctx.output.WriteString(formatMySQLError(err) + "\n")
-				errCode := extractMySQLErrorCode(err)
-				if ctx.variables == nil {
-					ctx.variables = make(map[string]string)
-				}
-				ctx.variables["$mysql_errno"] = strconv.Itoa(errCode)
-				if name, ok := mysqlErrorCodeToName[errCode]; ok {
-					ctx.variables["$mysql_errname"] = name
-				} else {
-					ctx.variables["$mysql_errname"] = strconv.Itoa(errCode)
-				}
 			}
 			return nil
 		}
 		return fmt.Errorf("query failed: %s: %v", stmt, err)
 	}
 	defer rows.Close()
+
+	// Reset $mysql_errno to 0 on success (matches MySQL mysqltest behavior).
+	// This must happen regardless of resultLogEnabled so that include files that
+	// use "while ($mysql_errno)" (e.g. wait_for_query_to_succeed.inc) correctly
+	// detect query success even when result logging is disabled.
+	if ctx.variables == nil {
+		ctx.variables = make(map[string]string)
+	}
+	ctx.variables["$mysql_errno"] = "0"
+	ctx.variables["$mysql_errname"] = ""
 
 	if ctx.expectedError != "" {
 		ctx.expectedError = ""
@@ -3284,24 +3320,35 @@ func (ctx *execContext) executeExec(stmt string) error {
 		}
 		if !ctx.abortOnError {
 			// --disable_abort_on_error: output the error as a line and continue.
+			// Always update $mysql_errno/$mysql_errname regardless of resultLogEnabled
+			// so that include files like wait_for_query_to_succeed.inc can detect failure.
+			errCode := extractMySQLErrorCode(err)
+			if ctx.variables == nil {
+				ctx.variables = make(map[string]string)
+			}
+			ctx.variables["$mysql_errno"] = strconv.Itoa(errCode)
+			if name, ok := mysqlErrorCodeToName[errCode]; ok {
+				ctx.variables["$mysql_errname"] = name
+			} else {
+				ctx.variables["$mysql_errname"] = strconv.Itoa(errCode)
+			}
 			if ctx.resultLogEnabled {
 				ctx.output.WriteString(formatMySQLError(err) + "\n")
-				// Update $mysql_errno/$mysql_errname for scripts that check them.
-				errCode := extractMySQLErrorCode(err)
-				if ctx.variables == nil {
-					ctx.variables = make(map[string]string)
-				}
-				ctx.variables["$mysql_errno"] = strconv.Itoa(errCode)
-				if name, ok := mysqlErrorCodeToName[errCode]; ok {
-					ctx.variables["$mysql_errname"] = name
-				} else {
-					ctx.variables["$mysql_errname"] = strconv.Itoa(errCode)
-				}
 			}
 			return nil
 		}
 		return fmt.Errorf("exec failed: %s: %v", stmt, err)
 	}
+	// Reset $mysql_errno to 0 on success (matches MySQL mysqltest behavior).
+	// This must happen regardless of resultLogEnabled so that include files that
+	// use "while ($mysql_errno)" (e.g. wait_for_query_to_succeed.inc) correctly
+	// detect statement success even when result logging is disabled.
+	if ctx.variables == nil {
+		ctx.variables = make(map[string]string)
+	}
+	ctx.variables["$mysql_errno"] = "0"
+	ctx.variables["$mysql_errname"] = ""
+
 	// Warning output after exec is handled by the caller or by SHOW WARNINGS queries in the test.
 	if ctx.infoEnabled && result != nil {
 		affected, _ := result.RowsAffected()
