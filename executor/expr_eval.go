@@ -8616,32 +8616,41 @@ func (e *Executor) evalMatchExpr(v *sqlparser.MatchExpr) (interface{}, error) {
 
 	minTokenSize := 3
 
-	// 3. Dispatch based on match option
+	// 3. Compute collection-level stats for scoring (all table engines).
+	var stats *ftsCollStats
+	tableName := e.resolveFulltextTableName(v)
+	if tableName != "" {
+		colsForStats := ftCols
+		if len(colsForStats) == 0 {
+			// Build fallback column list from MATCH columns
+			seen := make(map[string]bool)
+			for _, col := range v.Columns {
+				k := strings.ToLower(col.Name.String())
+				if !seen[k] {
+					seen[k] = true
+					colsForStats = append(colsForStats, k)
+				}
+			}
+		}
+		stats = e.computeFtsCollStats(tableName, colsForStats, minTokenSize)
+	}
+
+	// 4. Dispatch based on match option
 	switch v.Option {
 	case sqlparser.BooleanModeOpt:
+		if stats != nil && !e.isMyISAMTable(tableName) {
+			// InnoDB boolean mode: use IDF^2 scoring (same formula as natural language mode)
+			return ftsEvalInnoDB(docText, searchStr, minTokenSize, stats), nil
+		}
 		return ftsEvalBoolean(docText, searchStr, minTokenSize), nil
 	default:
 		// Natural language mode (also covers NoOption, QueryExpansionOpt, NaturalLanguageModeWithQueryExpansionOpt)
-		// Use BM25 collection-level scoring only for MyISAM tables.
-		// InnoDB FTS uses a different (simpler) scoring model that matches the constant ftsBaseScore.
-		var stats *ftsCollStats
-		tableName := e.resolveFulltextTableName(v)
-		if tableName != "" && e.isMyISAMTable(tableName) {
-			colsForStats := ftCols
-			if len(colsForStats) == 0 {
-				// Build fallback column list from MATCH columns
-				seen := make(map[string]bool)
-				for _, col := range v.Columns {
-					k := strings.ToLower(col.Name.String())
-					if !seen[k] {
-						seen[k] = true
-						colsForStats = append(colsForStats, k)
-					}
-				}
-			}
-			stats = e.computeFtsCollStats(tableName, colsForStats, minTokenSize)
+		if stats != nil && e.isMyISAMTable(tableName) {
+			// MyISAM: use BM25 scoring
+			return ftsEvalNaturalLanguage(docText, searchStr, minTokenSize, stats), nil
 		}
-		return ftsEvalNaturalLanguage(docText, searchStr, minTokenSize, stats), nil
+		// InnoDB: use IDF^2 scoring (log10(N/n)^2 per term)
+		return ftsEvalInnoDB(docText, searchStr, minTokenSize, stats), nil
 	}
 }
 
@@ -8726,6 +8735,74 @@ func ftsEvalNaturalLanguage(docText, searchStr string, minTokenSize int, stats *
 			// Simple TF-based scoring
 			totalScore += float64(cnt) * ftsBaseScore
 		}
+	}
+	return totalScore
+}
+
+// ftsEvalInnoDB computes the InnoDB natural language FTS relevance score.
+// The formula matches MySQL InnoDB's scoring model: score = sum of log10(N/n)^2
+// for each non-stopword query term present in the document, where N is the total
+// number of rows in the table and n is the number of rows containing that term.
+// If stats is nil (e.g. no rows in the table), returns 0.
+func ftsEvalInnoDB(docText, searchStr string, minTokenSize int, stats *ftsCollStats) float64 {
+	docTokens := ftsTokenize(docText, minTokenSize)
+	queryTokens := ftsTokenize(searchStr, minTokenSize)
+
+	if len(queryTokens) == 0 {
+		return float64(0)
+	}
+
+	// Build document token presence set
+	docSet := make(map[string]bool)
+	for _, t := range docTokens {
+		docSet[t] = true
+	}
+
+	if stats == nil || stats.N == 0 {
+		// No collection stats available: fall back to constant scoring for terms present.
+		var totalScore float64
+		for _, qt := range queryTokens {
+			if ftsStopwords[qt] {
+				continue
+			}
+			if docSet[qt] {
+				totalScore += ftsBaseScore
+			}
+		}
+		return totalScore
+	}
+
+	N := float64(stats.N)
+	var totalScore float64
+	matchedTerms := 0
+	for _, qt := range queryTokens {
+		if ftsStopwords[qt] {
+			continue
+		}
+		if !docSet[qt] {
+			continue
+		}
+		matchedTerms++
+		n := float64(stats.DF[qt])
+		if n == 0 {
+			continue
+		}
+		// InnoDB IDF: log10(N/n), score contribution = IDF^2.
+		// MySQL InnoDB stores IDF as float32 internally, so we use float32 arithmetic
+		// for the squaring step to match MySQL's floating-point behavior.
+		idf := math.Log10(N / n)
+		if idf < 0 {
+			continue // term too common (n > N), skip contribution
+		}
+		idf32 := float32(idf)
+		totalScore += float64(idf32 * idf32)
+	}
+	// If document contains matching terms but all have zero IDF (e.g. appear in
+	// all rows), return a minimum positive score so the row is not excluded by
+	// a WHERE MATCH AGAINST filter. MySQL InnoDB returns a small positive
+	// relevance in this case rather than 0.
+	if matchedTerms > 0 && totalScore == 0 {
+		return ftsBaseScore
 	}
 	return totalScore
 }
