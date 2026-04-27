@@ -3873,10 +3873,6 @@
       "reason": "output mismatch, timeout, or error"
     },
     {
-      "test": "perfschema/connection",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
       "test": "perfschema/connection_3a",
       "reason": "output mismatch, timeout, or error"
     },
@@ -4502,10 +4498,6 @@
     },
     {
       "test": "perfschema/idx_show_status",
-      "reason": "requires multi-user connection testing"
-    },
-    {
-      "test": "perfschema/idx_threads",
       "reason": "requires multi-user connection testing"
     },
     {

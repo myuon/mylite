@@ -1016,32 +1016,24 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.infoSchemaSTGeometryColumns()
 	case "st_units_of_measure":
 		rawRows = []storage.Row{}
-	// performance_schema stub tables – return empty result sets
+	// performance_schema tables – dynamic based on ProcessList
 	case "accounts":
 		if v, ok := e.startupVars["performance_schema_accounts_size"]; ok && v == "0" {
 			rawRows = []storage.Row{}
 		} else {
-			rawRows = []storage.Row{
-				{"USER": "root", "HOST": "localhost", "CURRENT_CONNECTIONS": int64(1), "TOTAL_CONNECTIONS": int64(1)},
-				{"USER": "foo", "HOST": "localhost", "CURRENT_CONNECTIONS": int64(0), "TOTAL_CONNECTIONS": int64(1)},
-			}
+			rawRows = e.perfSchemaAccounts()
 		}
 	case "users":
 		if v, ok := e.startupVars["performance_schema_users_size"]; ok && v == "0" {
 			rawRows = []storage.Row{}
 		} else {
-			rawRows = []storage.Row{
-				{"USER": "root", "CURRENT_CONNECTIONS": int64(1), "TOTAL_CONNECTIONS": int64(1)},
-				{"USER": "foo", "CURRENT_CONNECTIONS": int64(0), "TOTAL_CONNECTIONS": int64(1)},
-			}
+			rawRows = e.perfSchemaUsers()
 		}
 	case "hosts":
 		if v, ok := e.startupVars["performance_schema_hosts_size"]; ok && v == "0" {
 			rawRows = []storage.Row{}
 		} else {
-			rawRows = []storage.Row{
-				{"HOST": "localhost", "CURRENT_CONNECTIONS": int64(1), "TOTAL_CONNECTIONS": int64(1)},
-			}
+			rawRows = e.perfSchemaHosts()
 		}
 	case "setup_actors":
 		if e.psSetupActorsInit {
@@ -3374,10 +3366,12 @@ func (e *Executor) perfSchemaStatus() []storage.Row {
 					val = "1"
 				}
 			}
-			upperName := strings.ToUpper(name)
+			// Preserve the original mixed-case variable name (e.g. "Performance_schema_accounts_lost")
+			// as MySQL stores status variable names in their canonical mixed-case form.
+			// WHERE filtering uses case-insensitive comparison.
 			rows = append(rows, storage.Row{
-				"VARIABLE_NAME":  upperName,
-				"variable_name":  upperName,
+				"VARIABLE_NAME":  name,
+				"variable_name":  name,
 				"VARIABLE_VALUE": val,
 				"variable_value": val,
 			})
@@ -3698,6 +3692,63 @@ func (e *Executor) perfSchemaThreads() []storage.Row {
 			"CONNECTION_TYPE":     "TCP/IP",
 			"THREAD_OS_ID":        10000 + connID, // unique fake OS thread ID per connection
 			"RESOURCE_GROUP":      "USR_default",
+		})
+	}
+	return rows
+}
+
+// perfSchemaAccounts returns rows for performance_schema.accounts, dynamically computed
+// from the shared ProcessList. After TRUNCATE, TOTAL_CONNECTIONS equals CURRENT_CONNECTIONS.
+func (e *Executor) perfSchemaAccounts() []storage.Row {
+	if e.processList == nil {
+		return []storage.Row{}
+	}
+	accts := e.processList.AccountsFull()
+	rows := make([]storage.Row, 0, len(accts))
+	for _, a := range accts {
+		var userVal interface{} = a.User
+		var hostVal interface{} = a.Host
+		rows = append(rows, storage.Row{
+			"USER":                userVal,
+			"HOST":                hostVal,
+			"CURRENT_CONNECTIONS": a.Current,
+			"TOTAL_CONNECTIONS":   a.Total,
+		})
+	}
+	return rows
+}
+
+// perfSchemaUsers returns rows for performance_schema.users, dynamically computed
+// from the shared ProcessList. Groups connections by user only.
+func (e *Executor) perfSchemaUsers() []storage.Row {
+	if e.processList == nil {
+		return []storage.Row{}
+	}
+	users := e.processList.UsersFull()
+	rows := make([]storage.Row, 0, len(users))
+	for _, u := range users {
+		rows = append(rows, storage.Row{
+			"USER":                u.User,
+			"CURRENT_CONNECTIONS": u.Current,
+			"TOTAL_CONNECTIONS":   u.Total,
+		})
+	}
+	return rows
+}
+
+// perfSchemaHosts returns rows for performance_schema.hosts, dynamically computed
+// from the shared ProcessList. Groups connections by host only.
+func (e *Executor) perfSchemaHosts() []storage.Row {
+	if e.processList == nil {
+		return []storage.Row{}
+	}
+	hosts := e.processList.HostsFull()
+	rows := make([]storage.Row, 0, len(hosts))
+	for _, h := range hosts {
+		rows = append(rows, storage.Row{
+			"HOST":                h.Host,
+			"CURRENT_CONNECTIONS": h.Current,
+			"TOTAL_CONNECTIONS":   h.Total,
 		})
 	}
 	return rows

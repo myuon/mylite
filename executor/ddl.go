@@ -5404,6 +5404,19 @@ func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, er
 		case "setup_objects":
 			e.psSetupObjects = []storage.Row{}
 			e.psSetupObjectsInit = true
+		case "accounts":
+			// Reset historical account totals so TOTAL_CONNECTIONS resets to CURRENT_CONNECTIONS.
+			if e.processList != nil {
+				e.processList.ResetAccountTotals()
+			}
+		case "users":
+			if e.processList != nil {
+				e.processList.ResetUserTotals()
+			}
+		case "hosts":
+			if e.processList != nil {
+				e.processList.ResetHostTotals()
+			}
 		case "events_statements_summary_by_digest", "events_statements_histogram_by_digest":
 			// Clear digests and mark as truncated so new statements are recorded
 			e.psDigests = nil

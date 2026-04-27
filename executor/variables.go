@@ -51,23 +51,39 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				val = sd.Value
 			}
 			e.userVars[varName] = val
-			// When __current_user is set (e.g. on --connect), activate the user's default roles.
-			if varName == "__current_user" && e.grantStore != nil {
+			// When __current_user is set (e.g. on --connect), activate the user's default roles
+			// and update the ProcessList user entry so threads/processlist queries reflect the real user.
+			if varName == "__current_user" {
 				cuStr, _ := val.(string)
-				if cuStr != "" {
-					var cuUser, cuHost string
-					if atIdx := strings.Index(cuStr, "@"); atIdx >= 0 {
-						cuUser = cuStr[:atIdx]
-						cuHost = cuStr[atIdx+1:]
+				// Update processlist user so performance_schema.threads shows the correct user name.
+				if e.processList != nil {
+					if cuStr == "" {
+						e.processList.SetUser(e.connectionID, "root")
 					} else {
-						cuUser = cuStr
-						cuHost = "localhost"
+						// cuStr may be "user1" or "user1@localhost"; extract just the user part.
+						userName := cuStr
+						if atIdx := strings.Index(cuStr, "@"); atIdx >= 0 {
+							userName = cuStr[:atIdx]
+						}
+						e.processList.SetUser(e.connectionID, userName)
 					}
-					activeRoles := e.grantStore.GetActiveDefaultRoles(cuUser, cuHost)
-					e.userVars["__active_roles"] = activeRoles
-				} else {
-					// User logged out / switched to root - clear active roles
-					e.userVars["__active_roles"] = []string{}
+				}
+				if e.grantStore != nil {
+					if cuStr != "" {
+						var cuUser, cuHost string
+						if atIdx := strings.Index(cuStr, "@"); atIdx >= 0 {
+							cuUser = cuStr[:atIdx]
+							cuHost = cuStr[atIdx+1:]
+						} else {
+							cuUser = cuStr
+							cuHost = "localhost"
+						}
+						activeRoles := e.grantStore.GetActiveDefaultRoles(cuUser, cuHost)
+						e.userVars["__active_roles"] = activeRoles
+					} else {
+						// User logged out / switched to root - clear active roles
+						e.userVars["__active_roles"] = []string{}
+					}
 				}
 			}
 			continue
