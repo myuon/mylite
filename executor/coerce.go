@@ -2929,8 +2929,13 @@ func validateEnumSetValue(colType string, v interface{}) interface{} {
 			// Out of range: leave as int64 for strict mode to handle
 			return v
 		}
-		// SET bitmask: only convert if within valid range (0..2^N-1)
+		// SET bitmask: convert to string using canonical element order.
+		// Negative values are treated as unsigned: e.g. -1 = all bits set = full SET.
 		maxMask := int64((1 << uint(len(allowed))) - 1)
+		// Wrap negative values to their unsigned bitmask equivalent (MySQL behavior).
+		if iv < 0 {
+			iv = int64(uint64(iv) & uint64(maxMask))
+		}
 		if iv >= 0 && iv <= maxMask {
 			if iv == 0 {
 				return ""
@@ -3857,12 +3862,18 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 			return applyZerofillStr(fmt.Sprintf("%.*f", d, f))
 		}
 		// FLOAT/DOUBLE/REAL(M,D): round to d decimal places.
+		// For FLOAT(M,D), apply single-precision rounding via float32 cast first so that
+		// the value reflects what single-precision arithmetic produces (e.g. 4294967295 →
+		// 4294967296.0 because float32 cannot represent 4294967295 exactly).
 		// For d <= 2, use fmt.Sprintf directly on the float64 value, which correctly
 		// handles tie-breaking (e.g. 999.985 → 999.99) by using the full float64 binary
 		// representation rather than scaled multiplication which loses precision.
 		// For d > 2, use banker's rounding (RoundToEven) which matches MySQL behavior
 		// for values like FLOAT(5,4) with -9.12345 → -9.1234 (RoundToEven(-91234.5) = -91234).
 		if d <= 2 {
+			if prefix == "float" {
+				f = float64(float32(f))
+			}
 			return fmt.Sprintf("%.*f", d, f)
 		}
 		f = roundToEvenScale(f, d)

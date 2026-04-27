@@ -1252,6 +1252,29 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							}
 						}
 					}
+					// Emit Warning 1265 for out-of-range ENUM/SET integer values (non-strict mode).
+					// coerceColumnValueForWrite will clamp/convert the value; we warn here first.
+					if v != nil {
+						colTypeLowerW := strings.ToLower(col.Type)
+						if strings.HasPrefix(colTypeLowerW, "enum(") {
+							if nv, ok := v.(int64); ok {
+								enumInnerW := col.Type[5 : len(col.Type)-1]
+								allowedCountW := len(splitEnumValues(enumInnerW))
+								if nv < 0 || nv > int64(allowedCountW) {
+									e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+								}
+							}
+						} else if strings.HasPrefix(colTypeLowerW, "set(") {
+							if nv, ok := v.(int64); ok {
+								setInnerW := col.Type[4 : len(col.Type)-1]
+								allowedCountW := len(splitEnumValues(setInnerW))
+								maxMaskW := int64((1 << uint(allowedCountW)) - 1)
+								if nv < 0 || nv > maxMaskW {
+									e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+								}
+							}
+						}
+					}
 					v = e.coerceColumnValueForWrite(col.Type, v)
 					break
 				}
