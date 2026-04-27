@@ -9,6 +9,37 @@ import (
 	"github.com/myuon/mylite/storage"
 )
 
+// recordFKError stores the FK constraint message from err into the active
+// transaction's metadata (trx_last_foreign_key_error in INNODB_TRX).
+// The error message format is:
+//
+//	Cannot add or update a child row: a foreign key constraint fails (`db`.`tbl`, CONSTRAINT ...)
+//
+// or
+//
+//	Cannot delete or update a parent row: a foreign key constraint fails (`db`.`tbl`, CONSTRAINT ...)
+//
+// We extract and store only the content inside the outermost parentheses (after "constraint fails ").
+func (e *Executor) recordFKError(err error) {
+	if err == nil || e.txnActiveSet == nil || !e.inTransaction {
+		return
+	}
+	msg := err.Error()
+	// Find "constraint fails (" to locate the start of the constraint description.
+	const marker = "constraint fails ("
+	idx := strings.Index(strings.ToLower(msg), marker)
+	if idx < 0 {
+		return
+	}
+	start := idx + len(marker)
+	part := msg[start:]
+	// Remove the trailing ')' (the matching close of "constraint fails (...")
+	if strings.HasSuffix(part, ")") {
+		part = part[:len(part)-1]
+	}
+	e.txnActiveSet.SetFKError(e.connectionID, part)
+}
+
 // txSavepoint holds the catalog and storage state captured at BEGIN time.
 type txSavepoint struct {
 	// Storage snapshot per database name.
@@ -113,9 +144,92 @@ func (e *Executor) execBegin() (*Result, error) {
 	e.namedSavepoints = make(map[string]bool)
 	e.inTransaction = true
 	if e.txnActiveSet != nil {
-		e.txnActiveSet.Begin(e.connectionID)
+		iso, uq, fk := e.txnSessionMeta()
+		e.txnActiveSet.Begin(e.connectionID, iso, uq, fk)
 	}
+	// nextTxnIsolationPrev stays set until the transaction ends (execCommit/execRollback),
+	// at which point we restore sessionScopeVars["transaction_isolation"] to the saved
+	// previous value. While the transaction is active, sessionScopeVars still holds the
+	// NextTxScope value so all isolation-level reads (gap locks, SERIALIZABLE checks, etc.)
+	// see the correct isolation level.
 	return &Result{}, nil
+}
+
+// ensureImplicitTxnTracked registers the current connection in TxnActiveSet when
+// autocommit=0 is active. MySQL treats autocommit=0 as starting an implicit
+// transaction on the first DML, so we need it to show in INNODB_TRX.
+// This is a no-op when already in an explicit transaction or when autocommit is ON.
+func (e *Executor) ensureImplicitTxnTracked() {
+	if e.txnActiveSet == nil {
+		return
+	}
+	if e.inTransaction {
+		// Already tracked via execBegin.
+		return
+	}
+	// Check autocommit=0
+	v, ok := e.getSysVar("autocommit")
+	if !ok {
+		return
+	}
+	upper := strings.ToUpper(v)
+	if upper != "0" && upper != "OFF" {
+		return
+	}
+	// autocommit=0: register in TxnActiveSet if not already there.
+	e.txnActiveSet.mu.RLock()
+	_, alreadyActive := e.txnActiveSet.active[e.connectionID]
+	e.txnActiveSet.mu.RUnlock()
+	if alreadyActive {
+		return
+	}
+	iso, uq, fk := e.txnSessionMeta()
+	e.txnActiveSet.Begin(e.connectionID, iso, uq, fk)
+}
+
+// endImplicitTxnTracked removes the connection from TxnActiveSet after an
+// autocommit=0 implicit transaction ends (COMMIT/ROLLBACK when !inTransaction).
+func (e *Executor) endImplicitTxnTracked() {
+	if e.txnActiveSet == nil || e.inTransaction {
+		return
+	}
+	e.txnActiveSet.End(e.connectionID)
+}
+
+// restoreNextTxnIsolation restores the session isolation level after a transaction
+// that was started with a NextTxScope (SET TRANSACTION ISOLATION LEVEL) override.
+// If nextTxnIsolationPrev is set, it means the current session's transaction_isolation
+// was temporarily overridden for the last transaction. We restore it here.
+func (e *Executor) restoreNextTxnIsolation() {
+	if e.nextTxnIsolationPrev == "" {
+		return
+	}
+	e.sessionScopeVars["transaction_isolation"] = e.nextTxnIsolationPrev
+	e.nextTxnIsolationPrev = ""
+}
+
+// txnSessionMeta returns the current session's isolation level, unique_checks,
+// and foreign_key_checks values for INNODB_TRX metadata.
+func (e *Executor) txnSessionMeta() (isolationLevel string, uniqueChecks, foreignKeyChecks int64) {
+	isolationLevel = "REPEATABLE-READ"
+	uniqueChecks = 1
+	foreignKeyChecks = 1
+	if iso, ok := e.getSysVar("transaction_isolation"); ok {
+		isolationLevel = iso
+	} else if iso, ok := e.getSysVar("tx_isolation"); ok {
+		isolationLevel = iso
+	}
+	if uq, ok := e.getSysVar("unique_checks"); ok {
+		if uq == "0" || strings.EqualFold(uq, "OFF") {
+			uniqueChecks = 0
+		}
+	}
+	if fk, ok := e.getSysVar("foreign_key_checks"); ok {
+		if fk == "0" || strings.EqualFold(fk, "OFF") {
+			foreignKeyChecks = 0
+		}
+	}
+	return
 }
 
 func (e *Executor) execCommit() (*Result, error) {
@@ -124,6 +238,9 @@ func (e *Executor) execCommit() (*Result, error) {
 		e.rowLockManager.ReleaseRowLocks(e.connectionID)
 	}
 	if !e.inTransaction {
+		// End implicit autocommit=0 transaction tracking if present.
+		e.endImplicitTxnTracked()
+		e.restoreNextTxnIsolation()
 		return &Result{}, nil
 	}
 	// Block COMMIT if another connection holds FLUSH TABLES WITH READ LOCK,
@@ -152,6 +269,8 @@ func (e *Executor) execCommit() (*Result, error) {
 	if e.txnActiveSet != nil {
 		e.txnActiveSet.End(e.connectionID)
 	}
+	// Restore session isolation level if it was temporarily overridden by a NextTxScope set.
+	e.restoreNextTxnIsolation()
 	return &Result{}, nil
 }
 
@@ -242,6 +361,9 @@ func (e *Executor) execRollback() (*Result, error) {
 		e.rowLockManager.ReleaseRowLocks(e.connectionID)
 	}
 	if !e.inTransaction {
+		// End implicit autocommit=0 transaction tracking if present.
+		e.endImplicitTxnTracked()
+		e.restoreNextTxnIsolation()
 		return &Result{}, nil
 	}
 	sp := e.savepoint
@@ -253,6 +375,8 @@ func (e *Executor) execRollback() (*Result, error) {
 	if e.txnActiveSet != nil {
 		e.txnActiveSet.End(e.connectionID)
 	}
+	// Restore session isolation level if it was temporarily overridden by a NextTxScope set.
+	e.restoreNextTxnIsolation()
 
 	// If we have an undo log, use it for precise per-connection rollback
 	// instead of the snapshot-based approach which can clobber other connections' data.

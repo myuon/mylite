@@ -103,7 +103,7 @@ var infoSchemaColumnOrder = map[string][]string{
 	"innodb_cmp_reset":         {"page_size", "compress_ops", "compress_ops_ok", "compress_time", "uncompress_ops", "uncompress_time"},
 	"innodb_cmpmem":            {"page_size", "buffer_pool_instance", "pages_used", "pages_free", "relocation_ops", "relocation_time"},
 	"innodb_cmpmem_reset":      {"page_size", "buffer_pool_instance", "pages_used", "pages_free", "relocation_ops", "relocation_time"},
-	"innodb_trx":               {"trx_id", "trx_state", "trx_started"},
+	"innodb_trx":               {"trx_id", "trx_state", "trx_started", "trx_requested_lock_id", "trx_wait_started", "trx_weight", "trx_mysql_thread_id", "trx_query", "trx_operation_state", "trx_tables_in_use", "trx_tables_locked", "trx_lock_structs", "trx_lock_memory_bytes", "trx_rows_locked", "trx_rows_modified", "trx_concurrency_tickets", "trx_isolation_level", "trx_unique_checks", "trx_foreign_key_checks", "trx_last_foreign_key_error", "trx_adaptive_hash_latched", "trx_adaptive_hash_timeout", "trx_is_read_only", "trx_autocommit_non_locking"},
 	"innodb_foreign_cols":      {"ID", "FOR_COL_NAME", "REF_COL_NAME", "POS"},
 	"innodb_fields":            {"INDEX_ID", "NAME", "POS"},
 	"optimizer_trace":          {"QUERY", "TRACE", "MISSING_BYTES_BEYOND_MAX_MEM_SIZE", "INSUFFICIENT_PRIVILEGES"},
@@ -554,7 +554,7 @@ var singleRowStubTables = map[string]storage.Row{
 	"innodb_cmp_reset":    {"page_size": int64(4096), "compress_ops": int64(0), "compress_ops_ok": int64(0), "compress_time": int64(0), "uncompress_ops": int64(0), "uncompress_time": int64(0)},
 	"innodb_cmpmem":       {"page_size": int64(4096), "buffer_pool_instance": int64(0), "pages_used": int64(0), "pages_free": int64(0), "relocation_ops": int64(0), "relocation_time": int64(0)},
 	"innodb_cmpmem_reset": {"page_size": int64(4096), "buffer_pool_instance": int64(0), "pages_used": int64(0), "pages_free": int64(0), "relocation_ops": int64(0), "relocation_time": int64(0)},
-	"innodb_trx":            {"trx_id": "", "trx_state": "RUNNING", "trx_started": nil},
+	// innodb_trx is handled dynamically in buildInformationSchemaRows (from TxnActiveSet).
 	"innodb_fields":         {"INDEX_ID": int64(0), "NAME": "", "POS": int64(0)},
 	"optimizer_trace":       {"QUERY": "", "TRACE": "", "MISSING_BYTES_BEYOND_MAX_MEM_SIZE": int64(0), "INSUFFICIENT_PRIVILEGES": int64(0)},
 	"files":                 {"FILE_NAME": "", "FILE_TYPE": "", "TABLESPACE_NAME": ""},
@@ -784,6 +784,8 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.infoSchemaInnoDBForeignCols()
 	case "innodb_buffer_page":
 		rawRows = []storage.Row{} // empty stub - no buffer pool tracking
+	case "innodb_trx":
+		rawRows = e.infoSchemaInnoDBTrx()
 	case "processlist":
 		if e.processList != nil {
 			entries := e.processList.Snapshot()
@@ -1629,6 +1631,53 @@ func (e *Executor) infoSchemaReferentialConstraints() []storage.Row {
 				})
 			}
 		}
+	}
+	return rows
+}
+
+// infoSchemaInnoDBTrx returns rows for INFORMATION_SCHEMA.INNODB_TRX
+// by reading the current active transactions from TxnActiveSet.
+func (e *Executor) infoSchemaInnoDBTrx() []storage.Row {
+	if e.txnActiveSet == nil {
+		return []storage.Row{}
+	}
+	txns := e.txnActiveSet.SnapshotTxns()
+	rows := make([]storage.Row, 0, len(txns))
+	for _, t := range txns {
+		// Convert isolation level from internal format (REPEATABLE-READ) to
+		// MySQL display format (REPEATABLE READ) used in INNODB_TRX.
+		isoDisplay := strings.ReplaceAll(t.IsolationLevel, "-", " ")
+
+		var lastFKErr interface{}
+		if t.LastFKError != "" {
+			lastFKErr = t.LastFKError
+		}
+		rows = append(rows, storage.Row{
+			"trx_id":                    fmt.Sprintf("%d", t.ConnID),
+			"trx_state":                 "RUNNING",
+			"trx_started":               t.StartedAt.Format("2006-01-02 15:04:05"),
+			"trx_requested_lock_id":     nil,
+			"trx_wait_started":          nil,
+			"trx_weight":                int64(0),
+			"trx_mysql_thread_id":       t.ConnID,
+			"trx_query":                 nil,
+			"trx_operation_state":       nil,
+			"trx_tables_in_use":         int64(0),
+			"trx_tables_locked":         int64(0),
+			"trx_lock_structs":          int64(0),
+			"trx_lock_memory_bytes":     int64(0),
+			"trx_rows_locked":           int64(0),
+			"trx_rows_modified":         int64(0),
+			"trx_concurrency_tickets":   int64(0),
+			"trx_isolation_level":       isoDisplay,
+			"trx_unique_checks":         t.UniqueChecks,
+			"trx_foreign_key_checks":    t.ForeignKeyChecks,
+			"trx_last_foreign_key_error": lastFKErr,
+			"trx_adaptive_hash_latched": int64(0),
+			"trx_adaptive_hash_timeout": int64(0),
+			"trx_is_read_only":          int64(0),
+			"trx_autocommit_non_locking": int64(0),
+		})
 	}
 	return rows
 }

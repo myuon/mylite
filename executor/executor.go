@@ -166,12 +166,22 @@ type selectLockClause struct {
 	nowait     bool
 }
 
+// txnMeta holds per-connection transaction metadata for INFORMATION_SCHEMA.INNODB_TRX.
+type txnMeta struct {
+	StartedAt       time.Time
+	IsolationLevel  string // e.g. "REPEATABLE-READ"
+	UniqueChecks    int64
+	ForeignKeyChecks int64
+	LastFKError     string
+}
+
 // TxnActiveSet tracks which connections are currently in an active transaction.
 // Used for filtering uncommitted rows during reads.
 type TxnActiveSet struct {
 	mu      sync.RWMutex
 	active  map[int64]bool                    // connectionID -> true if in transaction
 	inserts map[int64]map[string]map[int]bool // connectionID -> "db:table" -> set of row pointers
+	meta    map[int64]*txnMeta               // connectionID -> transaction metadata
 }
 
 // NewTxnActiveSet creates a new TxnActiveSet.
@@ -179,14 +189,77 @@ func NewTxnActiveSet() *TxnActiveSet {
 	return &TxnActiveSet{
 		active:  make(map[int64]bool),
 		inserts: make(map[int64]map[string]map[int]bool),
+		meta:    make(map[int64]*txnMeta),
 	}
 }
 
-// Begin marks a connection as being in a transaction.
-func (t *TxnActiveSet) Begin(connID int64) {
+// Begin marks a connection as being in a transaction and records metadata.
+func (t *TxnActiveSet) Begin(connID int64, isolationLevel string, uniqueChecks, foreignKeyChecks int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.active[connID] = true
+	t.meta[connID] = &txnMeta{
+		StartedAt:       time.Now(),
+		IsolationLevel:  isolationLevel,
+		UniqueChecks:    uniqueChecks,
+		ForeignKeyChecks: foreignKeyChecks,
+	}
+}
+
+// UpdateMeta updates the session-variable metadata for an active transaction.
+func (t *TxnActiveSet) UpdateMeta(connID int64, isolationLevel string, uniqueChecks, foreignKeyChecks int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if m, ok := t.meta[connID]; ok {
+		m.IsolationLevel  = isolationLevel
+		m.UniqueChecks    = uniqueChecks
+		m.ForeignKeyChecks = foreignKeyChecks
+	}
+}
+
+// SetFKError records the last FK constraint error message for an active transaction.
+func (t *TxnActiveSet) SetFKError(connID int64, errMsg string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if m, ok := t.meta[connID]; ok {
+		m.LastFKError = errMsg
+	}
+}
+
+// TxnRow is a snapshot of a single active transaction for INNODB_TRX.
+type TxnRow struct {
+	ConnID          int64
+	StartedAt       time.Time
+	IsolationLevel  string
+	UniqueChecks    int64
+	ForeignKeyChecks int64
+	LastFKError     string
+}
+
+// SnapshotTxns returns a snapshot of all active transactions.
+func (t *TxnActiveSet) SnapshotTxns() []TxnRow {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	rows := make([]TxnRow, 0, len(t.active))
+	for connID := range t.active {
+		m := t.meta[connID]
+		var row TxnRow
+		row.ConnID = connID
+		if m != nil {
+			row.StartedAt       = m.StartedAt
+			row.IsolationLevel  = m.IsolationLevel
+			row.UniqueChecks    = m.UniqueChecks
+			row.ForeignKeyChecks = m.ForeignKeyChecks
+			row.LastFKError     = m.LastFKError
+		} else {
+			row.StartedAt      = time.Now()
+			row.IsolationLevel = "REPEATABLE-READ"
+			row.UniqueChecks   = 1
+			row.ForeignKeyChecks = 1
+		}
+		rows = append(rows, row)
+	}
+	return rows
 }
 
 // End marks a connection as no longer being in a transaction.
@@ -195,6 +268,7 @@ func (t *TxnActiveSet) End(connID int64) {
 	defer t.mu.Unlock()
 	delete(t.active, connID)
 	delete(t.inserts, connID)
+	delete(t.meta, connID)
 }
 
 // TrackInsert records that a connection inserted a row (identified by pointer identity).
@@ -446,6 +520,11 @@ type Executor struct {
 	// txnActiveSet is a shared set tracking which connections are currently in a transaction.
 	// Used for filtering uncommitted rows from other connections during reads.
 	txnActiveSet *TxnActiveSet
+	// nextTxnIsolationPrev holds the session isolation level that was in place BEFORE
+	// a "next transaction only" SET TRANSACTION ISOLATION LEVEL was applied. When the
+	// CURRENT transaction ends (execCommit / execRollback), sessionScopeVars is restored
+	// to this value. Empty string means no pending restoration needed.
+	nextTxnIsolationPrev string
 	// selectSkipLocked is set when the current SELECT uses SKIP LOCKED.
 	selectSkipLocked bool
 	// selectNowait is set when the current SELECT uses NOWAIT.
@@ -747,6 +826,13 @@ func (e *Executor) setSysVar(name string, value string, isGlobal bool) {
 		e.setGlobalVar(name, value)
 	} else {
 		e.sessionScopeVars[name] = value
+	}
+	// Keep INNODB_TRX metadata in sync when session-level transaction-relevant vars change.
+	if !isGlobal && e.inTransaction && e.txnActiveSet != nil &&
+		(name == "transaction_isolation" || name == "tx_isolation" ||
+			name == "unique_checks" || name == "foreign_key_checks") {
+		iso, uq, fk := e.txnSessionMeta()
+		e.txnActiveSet.UpdateMeta(e.connectionID, iso, uq, fk)
 	}
 }
 

@@ -122,6 +122,8 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	if e.inTransaction {
 		e.txnHasWrites = true
 	}
+	// Register this connection in TxnActiveSet for INNODB_TRX when autocommit=0.
+	e.ensureImplicitTxnTracked()
 	// Set insideDML so that sub-SELECTs (INSERT...SELECT, subqueries in
 	// VALUES) acquire row locks, mimicking InnoDB's implicit locking.
 	// InnoDB always acquires shared locks on source rows during INSERT...SELECT,
@@ -396,6 +398,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 
 			// Enforce FOREIGN KEY constraints: verify parent row exists
 			if err := e.checkForeignKeyOnInsert(insertDB, tableName, row); err != nil {
+				e.recordFKError(err)
 				return nil, err
 			}
 
@@ -2195,6 +2198,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				e.addWarning("Warning", 1452, err.Error())
 				continue
 			}
+			e.recordFKError(err)
 			return nil, err
 		}
 
