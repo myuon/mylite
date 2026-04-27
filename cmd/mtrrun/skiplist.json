@@ -4513,10 +4513,6 @@
       "reason": "requires actual lock tracking"
     },
     {
-      "test": "perfschema/index_schema",
-      "reason": "PS table INDEX metadata not implemented"
-    },
-    {
       "test": "other/alter_table",
       "reason": "TIMEOUT: Multi-connection metadata lock test with wait_condition loop; requires simultaneous connections and INFORMATION_SCHEMA.PROCESSLIST state tracking"
     },
