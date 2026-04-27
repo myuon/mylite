@@ -599,7 +599,9 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 												return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row %d", col.Name, i+1))
 											}
 										} else {
-											// Non-strict mode: warn but do NOT truncate (Dolt compatibility)
+											// Non-strict mode: truncate to max length with warning.
+											// MySQL truncates CHAR/VARCHAR values in non-strict mode.
+											val = string([]rune(sv)[:maxLen])
 											e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", col.Name, i+1))
 										}
 									}
