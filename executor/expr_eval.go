@@ -1418,10 +1418,18 @@ func (e *Executor) checkCollationMixForEQ(leftExpr, rightExpr sqlparser.Expr) er
 		return nil
 	}
 
-	// Check if all collations at the min level are the same
+	// Check if all collations at the min level are the same.
+	// MySQL rule: at equal coercibility, if one side uses a binary collation (_bin or "binary"),
+	// the binary collation wins and no error is raised (binary can compare against any same-charset collation).
 	first := strings.ToLower(atMin[0].collation)
 	for _, info := range atMin[1:] {
 		if strings.ToLower(info.collation) != first {
+			// Binary collation wins: no error if one side is _bin or "binary"
+			firstIsBin := strings.HasSuffix(first, "_bin") || first == "binary"
+			otherIsBin := strings.HasSuffix(strings.ToLower(info.collation), "_bin") || strings.ToLower(info.collation) == "binary"
+			if firstIsBin || otherIsBin {
+				return nil
+			}
 			coercName := "IMPLICIT"
 			switch minCoercibility {
 			case 0:
@@ -1438,6 +1446,49 @@ func (e *Executor) checkCollationMixForEQ(leftExpr, rightExpr sqlparser.Expr) er
 		}
 	}
 	return nil
+}
+
+// resolveEffectiveCollation returns the effective collation to use for a comparison
+// between two expressions, applying MySQL's coercibility rules.
+// Returns "" if neither side has a string collation (non-string types).
+// When one side has a binary collation (_bin or "binary"), that wins.
+// When coercibility levels differ, the lower level (stronger) wins.
+// When both are equal coercibility with the same collation, that collation is used.
+// When both are equal coercibility with different non-binary collations, "" is returned
+// (caller should have already detected the error via checkCollationMixForEQ).
+func (e *Executor) resolveEffectiveCollation(leftExpr, rightExpr sqlparser.Expr) string {
+	leftInfo := e.getExprCollationInfo(leftExpr)
+	rightInfo := e.getExprCollationInfo(rightExpr)
+
+	// If either side is not a string type, don't infer a collation.
+	// Non-string values (integers, hex nums, etc.) must go through the normal comparison path.
+	if leftInfo.coercibility < 0 || rightInfo.coercibility < 0 {
+		return ""
+	}
+
+	// Both sides have string collations.
+	// Lower coercibility (stronger) wins.
+	if leftInfo.coercibility < rightInfo.coercibility {
+		return leftInfo.collation
+	}
+	if rightInfo.coercibility < leftInfo.coercibility {
+		return rightInfo.collation
+	}
+
+	// Equal coercibility: prefer binary collation if one side has it.
+	leftColl := strings.ToLower(leftInfo.collation)
+	rightColl := strings.ToLower(rightInfo.collation)
+	leftIsBin := strings.HasSuffix(leftColl, "_bin") || leftColl == "binary"
+	rightIsBin := strings.HasSuffix(rightColl, "_bin") || rightColl == "binary"
+	if leftIsBin {
+		return leftInfo.collation
+	}
+	if rightIsBin {
+		return rightInfo.collation
+	}
+
+	// Both same collation → use it; different non-binary → conflict (return first, checkCollationMixForEQ handles error)
+	return leftInfo.collation
 }
 
 // evalComparisonExpr handles *sqlparser.ComparisonExpr evaluation.
@@ -1931,6 +1982,13 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 			if coll := e.lookupColumnCollation(colExpr.Name.String(), e.queryTableDef); coll != "" {
 				collationName = coll
 			}
+		}
+	}
+	// Check for illegal collation mix on = / != between columns with different collations.
+	// Only when there is no explicit COLLATE override.
+	if collationName == "" && (v.Operator == sqlparser.EqualOp || v.Operator == sqlparser.NotEqualOp) {
+		if collErr := e.checkCollationMixForEQ(leftExpr, rightExpr); collErr != nil {
+			return nil, collErr
 		}
 	}
 	// If left side is a bare column reference (no table context), MySQL returns
@@ -7242,6 +7300,25 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 				}
 			}
 		}
+		// Check for illegal collation mix on = / != / <=> between columns with different collations.
+		// Only check when there is no explicit COLLATE override.
+		if whereCollation == "" && (v.Operator == sqlparser.EqualOp || v.Operator == sqlparser.NotEqualOp) {
+			if collErr := e.checkCollationMixForEQ(leftExprW, rightExprW); collErr != nil {
+				return false, collErr
+			}
+		}
+		// Resolve effective collation from column expressions when no explicit COLLATE is given.
+		// This handles: binary collation wins, or explicit column collation used for comparison.
+		if whereCollation == "" {
+			if eff := e.resolveEffectiveCollation(leftExprW, rightExprW); eff != "" {
+				collLower := strings.ToLower(eff)
+				// Only apply collation-aware comparison for binary or case-sensitive collations,
+				// since compareValues already handles default case-insensitive semantics.
+				if strings.HasSuffix(collLower, "_bin") || collLower == "binary" || strings.Contains(collLower, "_cs") {
+					whereCollation = eff
+				}
+			}
+		}
 		left, err := e.evalRowExpr(leftExprW, row)
 		var leftWhereOvErr *intOverflowError
 		if err != nil {
@@ -7299,6 +7376,42 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 				return matched, nil
 			}
 			return !matched, nil
+		}
+		// If COLLATE was specified, use collation-aware comparison for all comparison operators.
+		if whereCollation != "" {
+			if vc := lookupVitessCollation(whereCollation); vc != nil {
+				if left == nil || right == nil {
+					return false, nil
+				}
+				ls := toString(left)
+				rs := toString(right)
+				lBytes := []byte(ls)
+				rBytes := []byte(rs)
+				cs := vc.Charset()
+				if cs.Name() != "utf8mb4" && cs.Name() != "utf8mb3" && cs.Name() != "binary" {
+					if conv, convErr := charset.ConvertFromUTF8(nil, cs, lBytes); convErr == nil {
+						lBytes = conv
+					}
+					if conv, convErr := charset.ConvertFromUTF8(nil, cs, rBytes); convErr == nil {
+						rBytes = conv
+					}
+				}
+				cmp := vc.Collate(lBytes, rBytes, false)
+				switch v.Operator {
+				case sqlparser.EqualOp:
+					return cmp == 0, nil
+				case sqlparser.NotEqualOp:
+					return cmp != 0, nil
+				case sqlparser.LessThanOp:
+					return cmp < 0, nil
+				case sqlparser.GreaterThanOp:
+					return cmp > 0, nil
+				case sqlparser.LessEqualOp:
+					return cmp <= 0, nil
+				case sqlparser.GreaterEqualOp:
+					return cmp >= 0, nil
+				}
+			}
 		}
 		// For binary/varbinary column comparisons, use NO PAD (byte-for-byte) semantics.
 		// Check if either side references a binary column.
