@@ -2972,6 +2972,23 @@ func (e *Executor) execShowGrants(query string) (*Result, error) {
 		}
 	}
 
+	// Privilege check: a non-root user can only SHOW GRANTS for themselves
+	// unless they have SELECT privilege on mysql.user (SUPER or global SELECT).
+	// MySQL error 1142: SELECT command denied to user X for table 'user'.
+	sessionUser2, sessionHost2, sessionActiveRoles := e.getCurrentUserAndRoles()
+	if sessionUser2 != "" && !isForCurrentUser {
+		// Non-root user trying to see another user's grants
+		isSelf := strings.EqualFold(sessionUser2, grantUser) && strings.EqualFold(sessionHost2, grantHost)
+		if !isSelf && e.grantStore != nil {
+			// Check if the session user has global SELECT or SUPER privilege
+			hasSelect := e.grantStore.HasGlobalPrivilege(sessionUser2, sessionHost2, "SELECT", sessionActiveRoles)
+			hasSuper := e.grantStore.HasGlobalPrivilege(sessionUser2, sessionHost2, "SUPER", sessionActiveRoles)
+			if !hasSelect && !hasSuper {
+				return nil, mysqlError(1142, "42000", fmt.Sprintf("SELECT command denied to user '%s'@'%s' for table 'user'", sessionUser2, sessionHost2))
+			}
+		}
+	}
+
 	var grantStrs []string
 	if strings.EqualFold(grantUser, "root") {
 		// MySQL 8.0 SHOW GRANTS for root returns three rows:
@@ -2984,6 +3001,11 @@ func (e *Executor) execShowGrants(query string) (*Result, error) {
 			fmt.Sprintf("GRANT PROXY ON ''@'' TO '%s'@'%s' WITH GRANT OPTION", grantUser, grantHost),
 		}
 	} else if e.grantStore != nil {
+		// For SHOW GRANTS FOR specific user (not current user), return error 1141
+		// if the user doesn't exist in the grant store.
+		if !isForCurrentUser && !e.grantStore.UserExists(grantUser, grantHost) {
+			return nil, mysqlError(1141, "42000", fmt.Sprintf("There is no such grant defined for user '%s' on host '%s'", grantUser, grantHost))
+		}
 		grantStrs = e.grantStore.BuildShowGrants(grantUser, grantHost, usingRoles)
 	} else {
 		grantStrs = []string{fmt.Sprintf("GRANT USAGE ON *.* TO `%s`@`%s`", grantUser, grantHost)}

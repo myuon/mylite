@@ -50,13 +50,50 @@ type GrantStore struct {
 	knownUserHosts map[string]bool
 }
 
-// NewGrantStore creates a new empty GrantStore.
+// NewGrantStore creates a new empty GrantStore with built-in MySQL system user grants.
 func NewGrantStore() *GrantStore {
-	return &GrantStore{
+	gs := &GrantStore{
 		entries:        make(map[string][]GrantEntry),
 		roles:          make(map[string][]GrantEntry),
 		defaultRoles:   make(map[string][]string),
 		knownUserHosts: make(map[string]bool),
+	}
+	gs.seedBuiltinGrants()
+	return gs
+}
+
+// seedBuiltinGrants registers the default MySQL 8.0 system user accounts and
+// their privileges so that INFORMATION_SCHEMA privilege tables reflect the
+// standard MySQL installation state.
+func (gs *GrantStore) seedBuiltinGrants() {
+	// mysql.sys@localhost: used by the sys schema — TRIGGER on sys.*, SELECT on sys.sys_config
+	gs.knownUserHosts[userKey("mysql.sys", "localhost")] = true
+	gs.entries[userKey("mysql.sys", "localhost")] = []GrantEntry{
+		{Privs: []string{"TRIGGER"}, Object: "sys.*", Type: GrantTypeDB},
+		{Privs: []string{"SELECT"}, Object: "sys.sys_config", Type: GrantTypeTable},
+	}
+
+	// mysql.session@localhost: used for internal MySQL sessions — SELECT on performance_schema.* and mysql.user
+	gs.knownUserHosts[userKey("mysql.session", "localhost")] = true
+	gs.entries[userKey("mysql.session", "localhost")] = []GrantEntry{
+		{Privs: []string{"SELECT"}, Object: "performance_schema.*", Type: GrantTypeDB},
+		{Privs: []string{"SELECT"}, Object: "mysql.user", Type: GrantTypeTable},
+	}
+
+	// ''@'%': anonymous/public user — standard test database privileges (MySQL canonical order).
+	gs.knownUserHosts[userKey("", "%")] = true
+	gs.entries[userKey("", "%")] = []GrantEntry{
+		{
+			Privs: []string{
+				"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP",
+				"REFERENCES", "INDEX", "ALTER",
+				"CREATE TEMPORARY TABLES", "LOCK TABLES",
+				"CREATE VIEW", "SHOW VIEW", "CREATE ROUTINE",
+				"EVENT", "TRIGGER",
+			},
+			Object: "test.*",
+			Type:   GrantTypeDB,
+		},
 	}
 }
 
@@ -1893,6 +1930,33 @@ func removePrivs(existing, toRemove []string) []string {
 // PROCESS, FILE, REFERENCES, INDEX, ALTER, SHOW DATABASES, SUPER, CREATE TEMPORARY TABLES,
 // LOCK TABLES, EXECUTE, REPLICATION SLAVE, REPLICATION CLIENT, CREATE VIEW, SHOW VIEW,
 // CREATE ROUTINE, ALTER ROUTINE, CREATE USER, EVENT, TRIGGER, CREATE TABLESPACE, ...
+// sortPrivsByCanonicalOrder returns a copy of the privilege list sorted by the canonical
+// MySQL privilege display order. Privileges not in the canonical list are appended at the end.
+func sortPrivsByCanonicalOrder(privs []string) []string {
+	// Build index map
+	orderIdx := make(map[string]int, len(privOrder))
+	for i, p := range privOrder {
+		orderIdx[p] = i
+	}
+	result := make([]string, len(privs))
+	copy(result, privs)
+	sort.SliceStable(result, func(i, j int) bool {
+		ii, iOK := orderIdx[result[i]]
+		ij, jOK := orderIdx[result[j]]
+		if iOK && jOK {
+			return ii < ij
+		}
+		if iOK {
+			return true
+		}
+		if jOK {
+			return false
+		}
+		return result[i] < result[j]
+	})
+	return result
+}
+
 var privOrder = []string{
 	"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "RELOAD",
 	"SHUTDOWN", "PROCESS", "FILE", "REFERENCES", "INDEX", "ALTER",
@@ -1963,8 +2027,8 @@ func formatPrivList(privs map[string]bool) string {
 // ParseGrantStatement parses a GRANT statement and returns its components.
 // Returns: privs, object, toUser, toHost, isRoleGrant, grantOption, adminOption
 func ParseGrantStatement(query string) (privs, object, toUser, toHost string, isRoleGrant bool, grantOption, adminOption bool) {
-	// Normalize
-	q := strings.TrimRight(strings.TrimSpace(query), ";")
+	// Normalize: collapse any whitespace (including newlines from multi-line queries) to single spaces
+	q := strings.Join(strings.Fields(strings.TrimRight(strings.TrimSpace(query), ";")), " ")
 	upper := strings.ToUpper(q)
 
 	// Find " TO " separator
@@ -2015,7 +2079,7 @@ func ParseGrantStatement(query string) (privs, object, toUser, toHost string, is
 // ParseRevokeStatement parses a REVOKE statement.
 // Returns: privs, object, fromUser, fromHost, isRoleRevoke
 func ParseRevokeStatement(query string) (privs, object, fromUser, fromHost string, isRoleRevoke bool) {
-	q := strings.TrimRight(strings.TrimSpace(query), ";")
+	q := strings.Join(strings.Fields(strings.TrimRight(strings.TrimSpace(query), ";")), " ")
 	upper := strings.ToUpper(q)
 
 	// REVOKE ALL PRIVILEGES, GRANT OPTION FROM user (no ON clause — revoke everything globally)
@@ -2100,4 +2164,158 @@ func normalizeGrantObject(obj string) string {
 		return db + ".*"
 	}
 	return db + "." + strings.ToLower(table)
+}
+
+// HasAnyPrivilegeOnDB returns true if the user has any privilege covering the given database.
+// This includes global (*.* grants), DB-level (db.* grants), and table-level grants for tables
+// within the database. MySQL allows USE <db> as long as the user has ANY privilege on any
+// object in the database.
+// USAGE-only users (no actual non-USAGE privileges) are denied access.
+func (gs *GrantStore) HasAnyPrivilegeOnDB(user, host, dbName string, activeRoles []string) bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	dbLower := strings.ToLower(dbName)
+
+	checkEntries := func(entries []GrantEntry) bool {
+		for _, e := range entries {
+			if e.Type == GrantTypeRole {
+				continue
+			}
+			switch e.Type {
+			case GrantTypeGlobal:
+				// ANY global privilege (not just USAGE) grants db access
+				for _, p := range e.Privs {
+					if p != "USAGE" {
+						return true
+					}
+				}
+			case GrantTypeDB:
+				entryDB := strings.ToLower(strings.TrimSuffix(e.Object, ".*"))
+				if dbNameMatches(entryDB, dbLower) && len(e.Privs) > 0 {
+					return true
+				}
+			case GrantTypeTable:
+				// Table-level grants within the database also grant USE access.
+				parts := strings.SplitN(e.Object, ".", 2)
+				if len(parts) == 2 && dbNameMatches(strings.ToLower(parts[0]), dbLower) && len(e.Privs) > 0 {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	if checkEntries(gs.findEntriesForUser(user, host)) {
+		return true
+	}
+
+	// Check via active roles
+	var checkRole func(roleName, roleHost string, visited map[string]bool) bool
+	checkRole = func(roleName, roleHost string, visited map[string]bool) bool {
+		rk := userKey(roleName, roleHost)
+		if visited[rk] {
+			return false
+		}
+		visited[rk] = true
+		if checkEntries(gs.roles[rk]) {
+			return true
+		}
+		allEntries := append(gs.roles[rk], gs.entries[rk]...)
+		for _, e := range allEntries {
+			if e.Type == GrantTypeRole {
+				nh := e.RoleHost
+				if nh == "" {
+					nh = "%"
+				}
+				if checkRole(e.RoleName, nh, visited) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	visited := make(map[string]bool)
+	for _, r := range activeRoles {
+		if checkRole(r, "%", visited) {
+			return true
+		}
+	}
+	return false
+}
+
+// GetDbPrivSnapshot returns the set of privileges the user currently has on the given database.
+// This is used to snapshot privileges into a session cache when USE <db> is executed.
+// The returned map keys are uppercase privilege names.
+func (gs *GrantStore) GetDbPrivSnapshot(user, host, dbName string, activeRoles []string) map[string]bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	dbLower := strings.ToLower(dbName)
+	privs := make(map[string]bool)
+
+	addPrivs := func(entries []GrantEntry) {
+		for _, e := range entries {
+			if e.Type == GrantTypeRole {
+				continue
+			}
+			switch e.Type {
+			case GrantTypeGlobal:
+				for _, p := range e.Privs {
+					privs[strings.ToUpper(p)] = true
+				}
+			case GrantTypeDB:
+				entryDB := strings.ToLower(strings.TrimSuffix(e.Object, ".*"))
+				if dbNameMatches(entryDB, dbLower) {
+					for _, p := range e.Privs {
+						privs[strings.ToUpper(p)] = true
+					}
+				}
+			// Table-level grants are NOT included in the session db privilege cache.
+			// They are always checked against the live grantStore.
+			}
+		}
+	}
+
+	addPrivs(gs.findEntriesForUser(user, host))
+
+	// Expand active roles
+	var addRole func(roleName, roleHost string, visited map[string]bool)
+	addRole = func(roleName, roleHost string, visited map[string]bool) {
+		rk := userKey(roleName, roleHost)
+		if visited[rk] {
+			return
+		}
+		visited[rk] = true
+		addPrivs(gs.roles[rk])
+		allEntries := append(gs.roles[rk], gs.entries[rk]...)
+		for _, e := range allEntries {
+			if e.Type == GrantTypeRole {
+				nh := e.RoleHost
+				if nh == "" {
+					nh = "%"
+				}
+				addRole(e.RoleName, nh, visited)
+			}
+		}
+	}
+	visited := make(map[string]bool)
+	for _, r := range activeRoles {
+		addRole(r, "%", visited)
+	}
+	return privs
+}
+
+// SnapshotHasDataPrivileges returns true if the privilege snapshot contains at least one
+// privilege that affects table-level data access (SELECT, INSERT, CREATE, ALL PRIVILEGES, etc.).
+// This is used to decide whether to create a session privilege cache: users with only
+// operational privileges (SUPER, PROCESS, FILE, etc.) should NOT have a session cache,
+// as the cache would deny data access that should bypass enforcement.
+func SnapshotHasDataPrivileges(snapshot map[string]bool) bool {
+	for p := range snapshot {
+		if tablePrivileges[p] {
+			return true
+		}
+	}
+	return false
 }
