@@ -1927,6 +1927,7 @@ func (e *Executor) evalSysSchemaFunc(name string, args []sqlparser.Expr) (interf
 	case "sys_get_config":
 		// sys_get_config(variable_name, default_value): look up sys.sys_config table.
 		// Return the configured value if found, otherwise return the default.
+		// MySQL also checks the @sys.<variable_name> user variable first.
 		if len(args) < 1 {
 			return nil, true, nil
 		}
@@ -1942,23 +1943,18 @@ func (e *Executor) evalSysSchemaFunc(name string, args []sqlparser.Expr) (interf
 			}
 		}
 		paramName := toString(nameVal)
-		// Hardcoded defaults matching MySQL's sys_config table defaults
-		sysConfigDefaults := map[string]interface{}{
-			"diagnostics.allow_i_s_tables":               "OFF",
-			"diagnostics.include_raw":                    "OFF",
-			"ps_thread_trx_info.max_length":              int64(65535),
-			"statement_performance_analyzer.limit":       int64(100),
-			"statement_performance_analyzer.view":        nil,
-			"statement_truncate_len":                     int64(64),
-			"sys.diagnostics.allow_i_s_tables":           "OFF",
-			"sys.diagnostics.include_raw":                "OFF",
-			"sys.ps_thread_trx_info.max_length":          int64(65535),
-			"sys.statement_performance_analyzer.limit":   int64(100),
-			"sys.statement_performance_analyzer.view":    nil,
-			"sys.statement_truncate_len":                 int64(64),
+		// Check @sys.<variable_name> user variable first (MySQL behavior)
+		if uv, ok := e.userVars["sys."+paramName]; ok && uv != nil {
+			return uv, true, nil
 		}
-		if val, ok := sysConfigDefaults[paramName]; ok {
-			return val, true, nil
+		// Read from sys.sys_config table
+		if tbl, tblErr := e.Storage.GetTable("sys", "sys_config"); tblErr == nil {
+			rows := tbl.Scan()
+			for _, row := range rows {
+				if varName, ok2 := row["variable"]; ok2 && toString(varName) == paramName {
+					return row["value"], true, nil
+				}
+			}
 		}
 		return defaultVal, true, nil
 
