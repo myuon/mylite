@@ -1200,6 +1200,26 @@ nextRow:
 								break
 							}
 						}
+						// In strict mode (without IGNORE), check integer column range before coercion.
+						if e.isStrictMode() && !bool(stmt.Ignore) && val != nil {
+							if err := checkIntegerStrict(col.Type, col.Name, val); err != nil {
+								// Report row 1 (multi-table UPDATE doesn't track absolute row numbers here).
+								unlockAndReturn = mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
+								break
+							}
+						}
+						// In IGNORE or non-strict mode, emit warning 1264 for out-of-range integer values.
+						if val != nil {
+							if e.isStrictMode() && bool(stmt.Ignore) {
+								if err := checkIntegerStrict(col.Type, col.Name, val); err != nil {
+									e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row %d", col.Name, i+1))
+								}
+							} else if !e.isStrictMode() {
+								if err := checkIntegerStrict(col.Type, col.Name, val); err != nil {
+									e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row %d", col.Name, i+1))
+								}
+							}
+						}
 						val = e.coerceColumnValueForWrite(col.Type, val)
 						break
 					}
