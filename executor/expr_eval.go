@@ -252,8 +252,9 @@ func normalizeTimestampLiteral(s string) (string, error) {
 		}
 		return "", errFn()
 	}
-	// Must contain at least a space separator (date + time)
-	spaceIdx := strings.Index(s, " ")
+	// Must contain at least a space (or newline) separator (date + time).
+	// SQL literals may have embedded newlines when the query wraps across lines.
+	spaceIdx := strings.IndexAny(s, " \t\n\r")
 	if spaceIdx < 0 {
 		return "", errFn()
 	}
