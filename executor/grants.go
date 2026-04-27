@@ -632,17 +632,10 @@ func (gs *GrantStore) HasPrivilege(user, host, priv, db, table string, activeRol
 		return false
 	}
 
-	// Check user's own grants (exact host, then wildcard host)
-	uk := userKey(user, host)
-	if checkEntries(gs.entries[uk]) {
+	// Check user's own grants (exact host, wildcard host, and host patterns like "192.168.%")
+	allUserEntries := gs.findEntriesForUser(user, host)
+	if checkEntries(allUserEntries) {
 		return true
-	}
-	// Also check grants stored with wildcard host "%"
-	if host != "%" {
-		ukWild := userKey(user, "%")
-		if checkEntries(gs.entries[ukWild]) {
-			return true
-		}
 	}
 
 	// Expand active roles recursively
@@ -724,14 +717,9 @@ func (gs *GrantStore) HasFullTablePrivilege(user, host, db, table string, active
 		return false
 	}
 
-	uk := userKey(user, host)
-	if checkEntries(gs.entries[uk]) {
+	allUserEntries2 := gs.findEntriesForUser(user, host)
+	if checkEntries(allUserEntries2) {
 		return true
-	}
-	if host != "%" {
-		if checkEntries(gs.entries[userKey(user, "%")]) {
-			return true
-		}
 	}
 
 	// Check via active roles
@@ -798,14 +786,9 @@ func (gs *GrantStore) HasColumnPrivilege(user, host, db, table, column string, a
 		return false
 	}
 
-	uk := userKey(user, host)
-	if checkEntries(gs.entries[uk]) {
+	allUserEntries := gs.findEntriesForUser(user, host)
+	if checkEntries(allUserEntries) {
 		return true
-	}
-	if host != "%" {
-		if checkEntries(gs.entries[userKey(user, "%")]) {
-			return true
-		}
 	}
 
 	// Check via active roles
@@ -856,18 +839,9 @@ var tablePrivileges = map[string]bool{
 func (gs *GrantStore) UserHasAnyRoleGrant(user, host string) bool {
 	gs.mu.RLock()
 	defer gs.mu.RUnlock()
-	uk := userKey(user, host)
-	for _, e := range gs.entries[uk] {
+	for _, e := range gs.findEntriesForUser(user, host) {
 		if e.Type == GrantTypeRole {
 			return true
-		}
-	}
-	if host != "%" {
-		ukWild := userKey(user, "%")
-		for _, e := range gs.entries[ukWild] {
-			if e.Type == GrantTypeRole {
-				return true
-			}
 		}
 	}
 	return false
@@ -899,17 +873,7 @@ func (gs *GrantStore) UserHasAnyTablePrivGrant(user, host string) bool {
 		return false
 	}
 
-	uk := userKey(user, host)
-	if hasTablePrivEntry(gs.entries[uk]) {
-		return true
-	}
-	if host != "%" {
-		ukWild := userKey(user, "%")
-		if hasTablePrivEntry(gs.entries[ukWild]) {
-			return true
-		}
-	}
-	return false
+	return hasTablePrivEntry(gs.findEntriesForUser(user, host))
 }
 
 // HasAnyTableAccess returns true if the user has any privilege (full or column-level)
@@ -945,14 +909,9 @@ func (gs *GrantStore) HasAnyTableAccess(user, host, db, table string, activeRole
 		return false
 	}
 
-	uk := userKey(user, host)
-	if checkEntries(gs.entries[uk]) {
+	allUserEntries3 := gs.findEntriesForUser(user, host)
+	if checkEntries(allUserEntries3) {
 		return true
-	}
-	if host != "%" {
-		if checkEntries(gs.entries[userKey(user, "%")]) {
-			return true
-		}
 	}
 
 	// Check via active roles
@@ -1000,6 +959,196 @@ func dbNameMatches(pattern, dbName string) bool {
 		return matchLike(strings.ToLower(dbName), strings.ToLower(pattern))
 	}
 	return false
+}
+
+// hostPatternMatches checks if a stored host pattern matches the connecting host.
+// MySQL host patterns support:
+//   - exact match (case-insensitive)
+//   - "%" wildcard (matches any host)
+//   - "%" and "_" wildcards in patterns like "192.168.%", "%.example.com"
+//   - IP subnet masks like "192.168.0.0/255.255.0.0" (not yet implemented: treated as exact)
+func hostPatternMatches(pattern, connectingHost string) bool {
+	// Exact match (most common case)
+	if strings.EqualFold(pattern, connectingHost) {
+		return true
+	}
+	// Wildcard "%" matches any host
+	if pattern == "%" {
+		return true
+	}
+	// Pattern with % or _ wildcard characters
+	if strings.ContainsAny(pattern, "%_") {
+		return matchLike(strings.ToLower(connectingHost), strings.ToLower(pattern))
+	}
+	return false
+}
+
+// findEntriesForUser returns all grant entries for the given user across all stored host
+// patterns that match the connecting host. This supports patterns like "192.168.%" that
+// may not match the exact key but whose pattern matches the connecting host.
+func (gs *GrantStore) findEntriesForUser(user, connectingHost string) []GrantEntry {
+	// Fast path: exact key match
+	uk := userKey(user, connectingHost)
+	exact := gs.entries[uk]
+
+	// Fast path: wildcard host "%"
+	var wildcard []GrantEntry
+	if connectingHost != "%" {
+		ukWild := userKey(user, "%")
+		wildcard = gs.entries[ukWild]
+	}
+
+	// Check all other stored keys for pattern matches
+	// This handles cases like user@'192.168.%'
+	userLower := strings.ToLower(user)
+	var patternMatches []GrantEntry
+	for key, entries := range gs.entries {
+		// Skip exact and wildcard already covered
+		if key == uk || key == userKey(user, "%") {
+			continue
+		}
+		// Parse user@host from key
+		atIdx := strings.LastIndex(key, "@")
+		if atIdx < 0 {
+			continue
+		}
+		keyUser := key[:atIdx]
+		keyHost := key[atIdx+1:]
+		if keyUser != userLower {
+			continue
+		}
+		// Check if this host pattern matches the connecting host
+		if hostPatternMatches(keyHost, connectingHost) {
+			patternMatches = append(patternMatches, entries...)
+		}
+	}
+
+	if len(wildcard) == 0 && len(patternMatches) == 0 {
+		return exact
+	}
+	combined := make([]GrantEntry, 0, len(exact)+len(wildcard)+len(patternMatches))
+	combined = append(combined, exact...)
+	combined = append(combined, wildcard...)
+	combined = append(combined, patternMatches...)
+	return combined
+}
+
+// GetGrantedColumnsForPriv returns the set of columns explicitly granted for a privilege
+// on the given db.table for the user, along with whether the user has full (non-column-restricted)
+// access. If hasFullAccess is true, all columns are accessible. If false, only grantedCols are.
+// Returns hasFullAccess=true if the user has a non-column-restricted grant (global, DB, or table-level).
+// Returns hasFullAccess=false with grantedCols containing the explicit columns otherwise.
+// Returns hasFullAccess=false with empty grantedCols if the user has no privilege at all.
+func (gs *GrantStore) GetGrantedColumnsForPriv(user, host, priv, db, table string, activeRoles []string) (hasFullAccess bool, grantedCols []string) {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	priv = strings.ToUpper(priv)
+
+	var colSet []string
+	var foundAny bool
+
+	checkEntries := func(entries []GrantEntry) {
+		for _, e := range entries {
+			if e.Type == GrantTypeRole {
+				continue
+			}
+			// Check scope
+			covers := false
+			switch e.Type {
+			case GrantTypeGlobal:
+				covers = true
+			case GrantTypeDB:
+				entryDB := strings.TrimSuffix(e.Object, ".*")
+				covers = db != "" && dbNameMatches(entryDB, db)
+			case GrantTypeTable:
+				parts := strings.SplitN(e.Object, ".", 2)
+				covers = len(parts) == 2 && db != "" && table != "" &&
+					dbNameMatches(parts[0], db) && strings.EqualFold(parts[1], table)
+			}
+			if !covers {
+				continue
+			}
+			for _, p := range e.Privs {
+				if p == "ALL PRIVILEGES" {
+					hasFullAccess = true
+					return
+				}
+				if parenIdx := strings.Index(p, "("); parenIdx > 0 {
+					basePriv := strings.TrimSpace(p[:parenIdx])
+					if strings.EqualFold(basePriv, priv) {
+						// Column-restricted grant
+						foundAny = true
+						colPart := strings.Trim(p[parenIdx:], "()")
+						for _, col := range strings.Split(colPart, ",") {
+							col = strings.TrimSpace(col)
+							col = strings.Trim(col, "`'\"")
+							colSet = append(colSet, strings.ToLower(col))
+						}
+					}
+				} else if strings.EqualFold(p, priv) {
+					// Full (non-column-restricted) grant
+					hasFullAccess = true
+					return
+				}
+			}
+		}
+	}
+
+	// Check user's own entries (including host-pattern matches)
+	allEntries := gs.findEntriesForUser(user, host)
+	checkEntries(allEntries)
+	if hasFullAccess {
+		return true, nil
+	}
+
+	// Check via active roles recursively
+	var checkRole func(roleName, roleHost string, visited map[string]bool)
+	checkRole = func(roleName, roleHost string, visited map[string]bool) {
+		rk := userKey(roleName, roleHost)
+		if visited[rk] {
+			return
+		}
+		visited[rk] = true
+		checkEntries(gs.roles[rk])
+		if hasFullAccess {
+			return
+		}
+		allRoleEntries := append(gs.roles[rk], gs.entries[rk]...)
+		for _, e := range allRoleEntries {
+			if e.Type == GrantTypeRole {
+				nh := e.RoleHost
+				if nh == "" {
+					nh = "%"
+				}
+				checkRole(e.RoleName, nh, visited)
+				if hasFullAccess {
+					return
+				}
+			}
+		}
+	}
+	visited := make(map[string]bool)
+	for _, roleName := range activeRoles {
+		checkRole(roleName, "%", visited)
+		if hasFullAccess {
+			return true, nil
+		}
+	}
+
+	if !foundAny && len(colSet) == 0 {
+		return false, nil
+	}
+	// Deduplicate
+	seen := make(map[string]bool)
+	var deduped []string
+	for _, c := range colSet {
+		if !seen[c] {
+			seen[c] = true
+			deduped = append(deduped, c)
+		}
+	}
+	return false, deduped
 }
 
 // BuildShowGrants builds SHOW GRANTS output rows for a user.

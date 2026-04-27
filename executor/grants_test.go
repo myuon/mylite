@@ -5,6 +5,98 @@ import (
 	"testing"
 )
 
+// TestHostPatternMatching verifies that GRANT user@'192.168.%' type patterns match correctly.
+func TestHostPatternMatching(t *testing.T) {
+	gs := NewGrantStore()
+
+	// Grant SELECT on *.* to testuser@'192.168.%'
+	gs.RegisterUser("testuser", "192.168.%")
+	gs.AddPrivGrant("testuser", "192.168.%", "SELECT", "*.*", false)
+
+	// Check that a connecting host matching the pattern gets the privilege
+	if !gs.HasPrivilege("testuser", "192.168.1.100", "SELECT", "db", "tbl", nil) {
+		t.Error("HasPrivilege should return true for host matching pattern 192.168.%")
+	}
+	// Non-matching host should not get the privilege
+	if gs.HasPrivilege("testuser", "10.0.0.1", "SELECT", "db", "tbl", nil) {
+		t.Error("HasPrivilege should return false for host not matching pattern 192.168.%")
+	}
+	// Exact wildcard % matches everything
+	gs.AddPrivGrant("allhosts", "%", "INSERT", "*.*", false)
+	if !gs.HasPrivilege("allhosts", "anything.example.com", "INSERT", "db", "tbl", nil) {
+		t.Error("HasPrivilege should return true for host % pattern")
+	}
+}
+
+// TestColumnLevelSelectPrivilege verifies that GRANT SELECT(col1) restricts col2 access.
+func TestColumnLevelSelectPrivilege(t *testing.T) {
+	e := newTestExecutor(t)
+
+	// Create test table and user
+	if _, err := e.Execute("CREATE TABLE t_colpriv (pub INT, priv INT)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if _, err := e.Execute("INSERT INTO t_colpriv VALUES (1, 2)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	if _, err := e.Execute("CREATE USER user1@localhost"); err != nil {
+		t.Fatalf("CREATE USER: %v", err)
+	}
+	// Grant SELECT on only the 'pub' column
+	if _, err := e.Execute("GRANT SELECT(pub) ON test.t_colpriv TO user1@localhost"); err != nil {
+		t.Fatalf("GRANT SELECT(pub): %v", err)
+	}
+
+	// Set current user to user1
+	if _, err := e.Execute("SET @__current_user = 'user1'"); err != nil {
+		t.Fatalf("SET current_user: %v", err)
+	}
+
+	// SELECT pub should succeed
+	if _, err := e.Execute("SELECT pub FROM t_colpriv"); err != nil {
+		t.Fatalf("SELECT pub should succeed: %v", err)
+	}
+
+	// SELECT priv should fail with error 1143
+	_, err := e.Execute("SELECT priv FROM t_colpriv")
+	if err == nil {
+		t.Fatal("SELECT priv should be denied for column-restricted user")
+	}
+	if !strings.Contains(err.Error(), "1143") {
+		t.Fatalf("expected error 1143, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "column 'priv'") {
+		t.Fatalf("expected 'column 'priv'' in error, got: %v", err)
+	}
+
+	// Clear user context
+	if _, err := e.Execute("SET @__current_user = ''"); err != nil {
+		t.Fatalf("SET current_user: %v", err)
+	}
+}
+
+// TestGetGrantedColumnsForPriv verifies the column grant introspection function.
+func TestGetGrantedColumnsForPriv(t *testing.T) {
+	gs := NewGrantStore()
+	gs.RegisterUser("u1", "localhost")
+	gs.AddPrivGrant("u1", "localhost", "SELECT(pub,name)", "db.t1", false)
+
+	hasFullAccess, cols := gs.GetGrantedColumnsForPriv("u1", "localhost", "SELECT", "db", "t1", nil)
+	if hasFullAccess {
+		t.Error("expected hasFullAccess=false for column-restricted grant")
+	}
+	if len(cols) != 2 {
+		t.Errorf("expected 2 granted columns, got %v", cols)
+	}
+
+	// Full SELECT grant
+	gs.AddPrivGrant("u2", "localhost", "SELECT", "db.t1", false)
+	hasFullAccess2, _ := gs.GetGrantedColumnsForPriv("u2", "localhost", "SELECT", "db", "t1", nil)
+	if !hasFullAccess2 {
+		t.Error("expected hasFullAccess=true for full SELECT grant")
+	}
+}
+
 func TestGrantStoreBasic(t *testing.T) {
 	gs := NewGrantStore()
 	gs.RegisterRole("r1")
