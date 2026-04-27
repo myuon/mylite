@@ -929,6 +929,47 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					} else {
 						e.sessionScopeVars[cleanName] = normalized
 					}
+				} else if cleanName == "ft_boolean_syntax" {
+					// ft_boolean_syntax must be exactly 14 characters with no duplicates
+					// (except the phrase delimiter pair at positions 10-11, which may be equal).
+					evalVal, _ := e.evalExpr(expr.Expr)
+					ftBoolVal := toString(evalVal)
+					if ftBoolVal == "" {
+						ftBoolVal = strings.Trim(val, "'\"")
+					}
+					runes := []rune(ftBoolVal)
+					if len(runes) != 14 {
+						return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'ft_boolean_syntax' can't be set to the value of '%s'", ftBoolVal))
+					}
+					// Check for duplicate characters (positions 10 and 11 may be equal as phrase pair)
+					charCount := make(map[rune]int)
+					for _, r := range runes {
+						charCount[r]++
+					}
+					invalid := false
+					for r, cnt := range charCount {
+						if cnt > 1 {
+							// Allowed only if the duplicates are exactly at positions 10 and 11
+							if cnt == 2 && runes[10] == r && runes[11] == r {
+								continue
+							}
+							invalid = true
+							break
+						}
+					}
+					if invalid {
+						return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'ft_boolean_syntax' can't be set to the value of '%s'", ftBoolVal))
+					}
+					e.sessionScopeVars[cleanName] = ftBoolVal
+					if isGlobal {
+						e.setGlobalVar(cleanName, ftBoolVal)
+						if prevVal, had := savedSessionVal[cleanName]; had {
+							e.sessionScopeVars[cleanName] = prevVal
+						} else {
+							delete(e.sessionScopeVars, cleanName)
+						}
+					}
+					continue
 				} else if cleanName == "innodb_ft_aux_table" || cleanName == "innodb_ft_server_stopword_table" || cleanName == "innodb_ft_user_stopword_table" {
 					// These variables require either empty string or "schema/table" format.
 					evalVal, _ := e.evalExpr(expr.Expr)
