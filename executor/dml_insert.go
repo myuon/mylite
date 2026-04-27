@@ -1648,6 +1648,14 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			return nil, err
 		}
 
+		// Recompute generated columns after BEFORE trigger may have modified base columns.
+		// MySQL always recomputes generated column values from the (possibly modified) base
+		// columns after a BEFORE trigger fires, ignoring any direct SET NEW.generated_col
+		// assignments inside the trigger body.
+		if err := e.populateGeneratedColumns(fullRow, tbl.Def.Columns); err != nil {
+			return nil, err
+		}
+
 		// Apply trigger modifications back to the row being inserted
 		// Only copy columns that were explicitly set by the user or modified by triggers
 		for _, col := range tbl.Def.Columns {

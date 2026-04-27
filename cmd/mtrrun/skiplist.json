@@ -2605,10 +2605,6 @@
       "reason": "FK/SP feature gaps remaining"
     },
     {
-      "test": "gcol/gcol_trigger_sp_myisam",
-      "reason": "generated column decimal formatting and SP cursor/warnings mismatch"
-    },
-    {
       "test": "x/cursor_fetch",
       "reason": "FK/SP feature gaps remaining"
     },
@@ -3635,10 +3631,6 @@
     {
       "test": "gcol/gcol_supported_sql_funcs_myisam",
       "reason": "failures"
-    },
-    {
-      "test": "gcol/gcol_trigger_sp_innodb",
-      "reason": "cursor/procedure failures"
     },
     {
       "test": "parts/partition_icp",
