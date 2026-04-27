@@ -1235,6 +1235,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			if csLower != "binary" {
 				colDef.Charset = csLower
 				colDef.Collation = catalog.DefaultCollationForCharset(colDef.Charset)
+				colDef.CharsetExplicit = true // user explicitly wrote CHARACTER SET
 			}
 		} else if col.Type.Charset.Binary {
 			// BINARY modifier without explicit CHARACTER SET means binary collation of the current charset.
@@ -1252,6 +1253,8 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				}
 				colDef.Charset = cs
 				colDef.Collation = catalog.BinaryCollationForCharset(cs)
+				// Do NOT set CharsetExplicit: BINARY modifier inherits charset from the table.
+				// SHOW CREATE TABLE should display only COLLATE (not CHARACTER SET) for these columns.
 			}
 		} else if strings.EqualFold(tableCharset, "binary") {
 			// Table-level CHARACTER SET binary propagates to columns without explicit charset.
@@ -2789,6 +2792,7 @@ func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 		if csLower != "binary" {
 			colDef.Charset = csLower
 			colDef.Collation = catalog.DefaultCollationForCharset(colDef.Charset)
+			colDef.CharsetExplicit = true // user explicitly wrote CHARACTER SET
 		}
 	}
 	// Override/set collation from explicit COLLATE clause.
@@ -4163,6 +4167,50 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					tableDef, _ := db.GetTable(tableName)
 					if tableDef != nil {
 						tableDef.InsertMethod = strings.ToUpper(tableOptionString(to))
+					}
+				case "CHARSET", "CHARACTER SET":
+					// ALTER TABLE ... DEFAULT CHARSET=newcs
+					// Pin existing columns that were inheriting the old table charset
+					// to the old charset explicitly, so SHOW CREATE TABLE can display
+					// "CHARACTER SET old" when they differ from the new table default.
+					newCharset := strings.ToLower(tableOptionString(to))
+					tableDef, _ := db.GetTable(tableName)
+					if tableDef != nil {
+						oldCharset := tableDef.Charset
+						if oldCharset == "" {
+							oldCharset = "utf8mb4"
+						}
+						if !strings.EqualFold(oldCharset, newCharset) {
+							// Pin implicit-charset columns to the old charset, so that
+							// SHOW CREATE TABLE can display "CHARACTER SET old_cs" when
+							// they differ from the new table default. Do NOT pin collation
+							// (leave it empty) so that SHOW CREATE TABLE only shows
+							// "CHARACTER SET old_cs" without a COLLATE clause.
+							for i, col := range tableDef.Columns {
+								if col.Charset == "" && columnTypeSupportsCharset(col.Type) {
+									tableDef.Columns[i].Charset = oldCharset
+									// Collation stays empty: inherited columns had no explicit
+									// collation, and pinning should not introduce one.
+									tableDef.Columns[i].CharsetExplicit = true
+								}
+							}
+						}
+						tableDef.Charset = newCharset
+						// Reset collation to default for the new charset (may be overridden by COLLATE option).
+						tableDef.Collation = catalog.DefaultCollationForCharset(newCharset)
+					}
+				case "COLLATE":
+					// ALTER TABLE ... COLLATE=newcoll
+					newCollation := strings.ToLower(tableOptionString(to))
+					tableDef, _ := db.GetTable(tableName)
+					if tableDef != nil {
+						tableDef.Collation = newCollation
+						// Infer charset from collation if not already set.
+						if tableDef.Charset == "" {
+							if cs, ok := catalog.CharsetForCollation(newCollation); ok {
+								tableDef.Charset = cs
+							}
+						}
 					}
 				}
 			}
