@@ -77,8 +77,10 @@ func (pe *PlanExplainer) collectRows(node PlanNode, rows *[][]interface{}, extra
 		})
 
 	case *FilterNode:
-		// Propagate "Using where" down to the leaf
-		pe.collectRows(n.Child, rows, append(extraAccum, "Using where"))
+		// Do not unconditionally propagate "Using where" here; the planner's optimizeNode
+		// already adds "Using where" to the TableScanNode.Extra when appropriate (ALL access only).
+		// Just recurse without adding to extraAccum.
+		pe.collectRows(n.Child, rows, extraAccum)
 
 	case *ProjectNode:
 		pe.collectRows(n.Child, rows, extraAccum)

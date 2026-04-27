@@ -1714,7 +1714,9 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 				// When GROUP BY is on a constant expression (e.g. GROUP BY 1), MySQL does
 				// not need a filesort because all rows share the same group key.
 				if !explainGroupByIsAllConstant(sel.GroupBy) {
-					extra = "Using filesort"
+					// GROUP BY on non-constant columns → MySQL uses a temporary table for
+					// grouping and then filesort to order the groups.
+					extra = "Using temporary; Using filesort"
 				}
 			}
 			// "Range checked for each record" detection: applies to any table in a
@@ -1818,6 +1820,18 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 						extra = "Using where"
 					} else {
 						extra = fmt.Sprintf("Using where; %v", extra)
+					}
+				}
+			}
+
+			// Add "Using index" when all selected columns are covered by the chosen index.
+			if accessInfo.usingIndex {
+				if extra == nil {
+					extra = "Using index"
+				} else {
+					extraStr := fmt.Sprintf("%v", extra)
+					if !strings.Contains(extraStr, "Using index") {
+						extra = extraStr + "; Using index"
 					}
 				}
 			}
@@ -4489,6 +4503,7 @@ type explainAccessInfo struct {
 	key          interface{} // chosen key name or nil
 	keyLen       interface{} // string representation of key length or nil
 	ref          interface{} // "const", column ref, or nil
+	usingIndex   bool        // true when all selected columns are covered by the chosen index
 }
 
 // explainDetectAccessType analyzes a SELECT's WHERE clause against available indexes
@@ -4512,7 +4527,30 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 	}
 
 	if len(whereCols) == 0 {
-		// No WHERE conditions, check if all selected columns are covered by an index → "index" type
+		// No WHERE conditions: check if all selected columns are covered by a secondary index
+		// → "index" access type (full index scan) + "Using index".
+		// Only applies when the SELECT references specific columns (not SELECT *).
+		if sel.SelectExprs != nil {
+			selectCols, isStar := explainExtractSelectColumns(sel.SelectExprs, tableName)
+			if !isStar && len(selectCols) > 0 {
+				for _, idx := range td.Indexes {
+					if explainIndexCoversColumns(td, idx.Name, selectCols) {
+						keyLen := 0
+						for _, col := range idx.Columns {
+							colDef := findColumnDef(td, col)
+							if colDef != nil {
+								keyLen += explainKeyLen(colDef, td.Charset)
+							}
+						}
+						result.accessType = "index"
+						result.key = idx.Name
+						result.keyLen = strconv.Itoa(keyLen)
+						result.usingIndex = true
+						return result
+					}
+				}
+			}
+		}
 		return result
 	}
 
@@ -4728,7 +4766,86 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 		result.accessType = "range"
 	}
 
+	// Check if the chosen key covers all selected columns → "Using index".
+	// This applies when access type is ref, eq_ref, const, range (and the key is set).
+	if result.key != nil && result.accessType != "ALL" && sel.SelectExprs != nil {
+		keyName := fmt.Sprintf("%v", result.key)
+		selectCols, isStar := explainExtractSelectColumns(sel.SelectExprs, tableName)
+		if !isStar && len(selectCols) > 0 && explainIndexCoversColumns(td, keyName, selectCols) {
+			result.usingIndex = true
+		}
+	}
+
 	return result
+}
+
+// explainExtractSelectColumns returns the set of column names referenced in a SELECT
+// expression list, lower-cased. Returns (cols, false) normally; returns (nil, true) when
+// SELECT * is used or when any non-column expression is found (i.e. covering check is N/A).
+func explainExtractSelectColumns(exprs *sqlparser.SelectExprs, tableName string) (map[string]bool, bool) {
+	if exprs == nil {
+		return nil, true
+	}
+	cols := map[string]bool{}
+	for _, expr := range exprs.Exprs {
+		switch e := expr.(type) {
+		case *sqlparser.StarExpr:
+			// SELECT * — not coverable unless the index contains all columns, which we don't verify here.
+			return nil, true
+		case *sqlparser.AliasedExpr:
+			col, ok := e.Expr.(*sqlparser.ColName)
+			if !ok {
+				// Non-column expression (function, literal, etc.) — cannot be covered.
+				return nil, true
+			}
+			qual := col.Qualifier.Name.String()
+			if qual != "" && !strings.EqualFold(qual, tableName) {
+				// Column from a different table — skip
+				continue
+			}
+			cols[strings.ToLower(col.Name.String())] = true
+		default:
+			return nil, true
+		}
+	}
+	return cols, false
+}
+
+// explainIndexCoversColumns returns true when all columns in wantCols are present in the
+// given index (for secondary indexes) or primary key columns.
+func explainIndexCoversColumns(td *catalog.TableDef, indexName string, wantCols map[string]bool) bool {
+	if len(wantCols) == 0 {
+		return false
+	}
+	var indexCols []string
+	if strings.EqualFold(indexName, "PRIMARY") {
+		indexCols = td.PrimaryKey
+	} else {
+		for _, idx := range td.Indexes {
+			if strings.EqualFold(idx.Name, indexName) {
+				indexCols = idx.Columns
+				break
+			}
+		}
+	}
+	if len(indexCols) == 0 {
+		return false
+	}
+	idxColSet := map[string]bool{}
+	for _, c := range indexCols {
+		idxColSet[strings.ToLower(c)] = true
+	}
+	// InnoDB secondary indexes implicitly include the primary key columns.
+	// Add them so that "SELECT idx_col, pk_col FROM t WHERE idx_col=val" is also considered covering.
+	for _, pkc := range td.PrimaryKey {
+		idxColSet[strings.ToLower(pkc)] = true
+	}
+	for c := range wantCols {
+		if !idxColSet[c] {
+			return false
+		}
+	}
+	return true
 }
 
 // explainWhereCondition represents a column condition extracted from a WHERE clause.

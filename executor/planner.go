@@ -357,6 +357,9 @@ func (p *Planner) optimizeNode(node PlanNode, sel *sqlparser.Select, hasSortAbov
 			if n.AccessPath.Type == "" {
 				n.AccessPath.Type = "ALL"
 			}
+			if ai.usingIndex {
+				n.Extra = appendUnique(n.Extra, "Using index")
+			}
 		} else {
 			if n.AccessPath.Type == "" {
 				n.AccessPath.Type = "ALL"
@@ -364,14 +367,19 @@ func (p *Planner) optimizeNode(node PlanNode, sel *sqlparser.Select, hasSortAbov
 		}
 
 		// Propagate Extra hints from above.
-		if hasFilterAbove {
+		// "Using where" is only shown when the access type is ALL (table scan) and
+		// the WHERE filter is applied by the server after reading from the engine.
+		// For index-based access (ref, const, eq_ref, range), the WHERE condition is
+		// handled by the index lookup and "Using where" is not added.
+		if hasFilterAbove && n.AccessPath.Type == "ALL" {
 			n.Extra = appendUnique(n.Extra, "Using where")
+		}
+		// MySQL Extra order: Using temporary before Using filesort.
+		if hasAggAbove {
+			n.Extra = appendUnique(n.Extra, "Using temporary")
 		}
 		if hasSortAbove {
 			n.Extra = appendUnique(n.Extra, "Using filesort")
-		}
-		if hasAggAbove {
-			n.Extra = appendUnique(n.Extra, "Using temporary")
 		}
 
 	case *FilterNode:
@@ -381,7 +389,9 @@ func (p *Planner) optimizeNode(node PlanNode, sel *sqlparser.Select, hasSortAbov
 		p.optimizeNode(n.Child, sel, true, hasAggAbove, hasFilterAbove)
 
 	case *AggregateNode:
-		p.optimizeNode(n.Child, sel, hasSortAbove, true, hasFilterAbove)
+		// GROUP BY always requires a temporary table + filesort when no index covers the grouping.
+		// Propagate both hasSortAbove and hasAggAbove so the leaf gets "Using temporary; Using filesort".
+		p.optimizeNode(n.Child, sel, true, true, hasFilterAbove)
 
 	case *ProjectNode:
 		p.optimizeNode(n.Child, sel, hasSortAbove, hasAggAbove, hasFilterAbove)
