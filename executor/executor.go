@@ -6608,10 +6608,25 @@ func (e *Executor) checkTablePrivilege(stmt sqlparser.Statement) error {
 			for _, cte := range s.With.CTEs {
 				cteNames[strings.ToLower(cte.ID.String())] = true
 			}
+			// Check privileges inside CTE bodies (e.g. with qn as (select priv from t1) ...)
+			for _, cte := range s.With.CTEs {
+				if innerSel, ok := cte.Subquery.(*sqlparser.Select); ok {
+					if err := e.checkSelectPrivRecursive(innerSel, user, host, activeRoles, e.CurrentDB); err != nil {
+						return err
+					}
+				}
+			}
 		}
 		// Check SELECT privilege on all referenced real tables (skip subqueries and CTEs)
 		for _, tblExpr := range s.From {
 			if err := checkTableExprPrivSkipCTEs(tblExpr, "SELECT", e.CurrentDB, cteNames, checkAccess); err != nil {
+				return err
+			}
+		}
+		// Column-level SELECT enforcement: when user has only column-restricted grants,
+		// verify each explicitly referenced column is in the granted set.
+		for _, tblExpr := range s.From {
+			if err := e.checkColumnSelectPriv(s, tblExpr, user, host, activeRoles, e.CurrentDB, cteNames); err != nil {
 				return err
 			}
 		}
@@ -6792,6 +6807,270 @@ func checkTableExprPriv(tblExpr sqlparser.TableExpr, priv, currentDB string, che
 	return checkTableExprPrivSkipCTEs(tblExpr, priv, currentDB, nil, check)
 }
 
+// collectColNames walks a sqlparser.Expr tree and appends all ColName references
+// (as lowercased bare column names) to the dst slice.
+func collectColNames(expr sqlparser.Expr, dst *[]string) {
+	if expr == nil {
+		return
+	}
+	switch e := expr.(type) {
+	case *sqlparser.ColName:
+		*dst = append(*dst, strings.ToLower(e.Name.String()))
+	case *sqlparser.BinaryExpr:
+		collectColNames(e.Left, dst)
+		collectColNames(e.Right, dst)
+	case *sqlparser.UnaryExpr:
+		collectColNames(e.Expr, dst)
+	case *sqlparser.FuncExpr:
+		for _, arg := range e.Exprs {
+			if ae, ok := arg.(sqlparser.SelectExpr); ok {
+				if ali, ok2 := ae.(*sqlparser.AliasedExpr); ok2 {
+					collectColNames(ali.Expr, dst)
+				}
+			}
+		}
+	case *sqlparser.CaseExpr:
+		collectColNames(e.Expr, dst)
+		for _, w := range e.Whens {
+			collectColNames(w.Cond, dst)
+			collectColNames(w.Val, dst)
+		}
+		collectColNames(e.Else, dst)
+	case *sqlparser.ComparisonExpr:
+		collectColNames(e.Left, dst)
+		collectColNames(e.Right, dst)
+	case *sqlparser.AndExpr:
+		collectColNames(e.Left, dst)
+		collectColNames(e.Right, dst)
+	case *sqlparser.OrExpr:
+		collectColNames(e.Left, dst)
+		collectColNames(e.Right, dst)
+	case *sqlparser.NotExpr:
+		collectColNames(e.Expr, dst)
+	case *sqlparser.IsExpr:
+		collectColNames(e.Left, dst)
+	case *sqlparser.ConvertExpr:
+		collectColNames(e.Expr, dst)
+	case *sqlparser.CastExpr:
+		collectColNames(e.Expr, dst)
+	case *sqlparser.CollateExpr:
+		collectColNames(e.Expr, dst)
+	}
+}
+
+// collectSelectColNames extracts all column names referenced in a SELECT statement's
+// select expressions and WHERE clause. Returns lowercased column names.
+func collectSelectColNames(s *sqlparser.Select) []string {
+	var cols []string
+	for _, expr := range s.SelectExprs.Exprs {
+		if ae, ok := expr.(*sqlparser.AliasedExpr); ok {
+			collectColNames(ae.Expr, &cols)
+		}
+	}
+	if s.Where != nil {
+		collectColNames(s.Where.Expr, &cols)
+	}
+	if s.GroupBy != nil {
+		for _, g := range s.GroupBy.Exprs {
+			collectColNames(g, &cols)
+		}
+	}
+	if s.Having != nil {
+		collectColNames(s.Having.Expr, &cols)
+	}
+	if s.OrderBy != nil {
+		for _, o := range s.OrderBy {
+			collectColNames(o.Expr, &cols)
+		}
+	}
+	return cols
+}
+
+// hasStarExpr returns true if the SELECT expression list contains a star (SELECT *).
+func hasStarExpr(s *sqlparser.Select) bool {
+	for _, expr := range s.SelectExprs.Exprs {
+		if _, ok := expr.(*sqlparser.StarExpr); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// checkSelectPrivRecursive performs full privilege checking for a SELECT statement,
+// recursing into derived table subqueries. It checks both table-level and column-level
+// SELECT privileges.
+func (e *Executor) checkSelectPrivRecursive(sel *sqlparser.Select, user, host string, activeRoles []string, currentDB string) error {
+	// Collect CTE names to skip privilege check for them (they're virtual tables)
+	cteNames := make(map[string]bool)
+	if sel.With != nil {
+		for _, cte := range sel.With.CTEs {
+			cteNames[strings.ToLower(cte.ID.String())] = true
+			// Recurse into CTE body
+			if innerSel, ok := cte.Subquery.(*sqlparser.Select); ok {
+				if err := e.checkSelectPrivRecursive(innerSel, user, host, activeRoles, currentDB); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// checkAccess checks table-level SELECT privilege
+	checkAccess := func(priv, dbName, tableName string) error {
+		dbLower := strings.ToLower(dbName)
+		if dbLower == "information_schema" || dbLower == "performance_schema" {
+			return nil
+		}
+		if e.tempTables != nil {
+			tblLower := strings.ToLower(tableName)
+			if e.tempTables[tableName] || e.tempTables[tblLower] {
+				return nil
+			}
+		}
+		if !e.grantStore.HasPrivilege(user, host, priv, dbName, tableName, activeRoles) {
+			return mysqlError(1142, "42000", fmt.Sprintf("%s command denied to user '%s'@'%s' for table '%s'",
+				priv, user, host, tableName))
+		}
+		return nil
+	}
+
+	// Walk all table expressions
+	var checkTblExpr func(te sqlparser.TableExpr) error
+	checkTblExpr = func(te sqlparser.TableExpr) error {
+		switch t := te.(type) {
+		case *sqlparser.AliasedTableExpr:
+			if tn, ok := t.Expr.(sqlparser.TableName); ok {
+				tblName := tn.Name.String()
+				if strings.EqualFold(tblName, "dual") {
+					return nil
+				}
+				if cteNames[strings.ToLower(tblName)] {
+					return nil
+				}
+				dbName := currentDB
+				if !tn.Qualifier.IsEmpty() {
+					dbName = tn.Qualifier.String()
+				}
+				// Table-level check
+				if err := checkAccess("SELECT", dbName, tblName); err != nil {
+					return err
+				}
+				// Column-level check
+				if err := e.checkColumnAccessForTable(sel, tblName, dbName, user, host, activeRoles); err != nil {
+					return err
+				}
+			} else if dt, ok := t.Expr.(*sqlparser.DerivedTable); ok {
+				// Recurse into derived table subquery
+				if innerSel, ok2 := dt.Select.(*sqlparser.Select); ok2 {
+					if err := e.checkSelectPrivRecursive(innerSel, user, host, activeRoles, currentDB); err != nil {
+						return err
+					}
+				}
+			}
+		case *sqlparser.JoinTableExpr:
+			if err := checkTblExpr(t.LeftExpr); err != nil {
+				return err
+			}
+			return checkTblExpr(t.RightExpr)
+		case *sqlparser.ParenTableExpr:
+			for _, inner := range t.Exprs {
+				if err := checkTblExpr(inner); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	for _, te := range sel.From {
+		if err := checkTblExpr(te); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkColumnAccessForTable checks column-level SELECT privilege for a specific table reference
+// within a SELECT statement. When the user has only column-restricted grants, verifies that
+// each referenced column is in the granted set.
+func (e *Executor) checkColumnAccessForTable(sel *sqlparser.Select, tblName, dbName, user, host string, activeRoles []string) error {
+	dbLower := strings.ToLower(dbName)
+	if dbLower == "information_schema" || dbLower == "performance_schema" {
+		return nil
+	}
+	hasFullAccess, grantedCols := e.grantStore.GetGrantedColumnsForPriv(user, host, "SELECT", dbName, tblName, activeRoles)
+	if hasFullAccess || len(grantedCols) == 0 {
+		// Full access or no column-restricted grant (table-level check already handles denial)
+		return nil
+	}
+	// User has only column-restricted SELECT: verify referenced columns
+	grantedSet := make(map[string]bool, len(grantedCols))
+	for _, c := range grantedCols {
+		grantedSet[strings.ToLower(c)] = true
+	}
+	// If SELECT *, that accesses all columns - deny for any non-granted column
+	if hasStarExpr(sel) {
+		// Find the first non-granted column in the table definition
+		// For simplicity, return generic error (MySQL returns the first column alphabetically)
+		return mysqlError(1143, "42000", fmt.Sprintf("SELECT command denied to user '%s'@'%s' for column '*' in table '%s'",
+			user, host, tblName))
+	}
+	// Check explicitly named columns
+	refCols := collectSelectColNames(sel)
+	for _, col := range refCols {
+		if col == "" {
+			continue
+		}
+		if !grantedSet[col] {
+			return mysqlError(1143, "42000", fmt.Sprintf("SELECT command denied to user '%s'@'%s' for column '%s' in table '%s'",
+				user, host, col, tblName))
+		}
+	}
+	return nil
+}
+
+// checkColumnSelectPriv checks column-level SELECT privilege for a table expression.
+// When the user has only column-restricted SELECT grants (e.g. GRANT SELECT(pub) ON t),
+// each referenced column name is verified against the granted column list.
+// Returns error 1143 if a column is not in the granted set.
+func (e *Executor) checkColumnSelectPriv(sel *sqlparser.Select, tblExpr sqlparser.TableExpr, user, host string, activeRoles []string, currentDB string, cteNames map[string]bool) error {
+	switch t := tblExpr.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if tn, ok := t.Expr.(sqlparser.TableName); ok {
+			tblName := tn.Name.String()
+			if strings.EqualFold(tblName, "dual") {
+				return nil
+			}
+			if cteNames != nil && cteNames[strings.ToLower(tblName)] {
+				return nil
+			}
+			dbName := currentDB
+			if !tn.Qualifier.IsEmpty() {
+				dbName = tn.Qualifier.String()
+			}
+			return e.checkColumnAccessForTable(sel, tblName, dbName, user, host, activeRoles)
+		} else if dt, ok := t.Expr.(*sqlparser.DerivedTable); ok {
+			// Recurse into derived table subquery
+			if innerSel, ok2 := dt.Select.(*sqlparser.Select); ok2 {
+				if err := e.checkSelectPrivRecursive(innerSel, user, host, activeRoles, currentDB); err != nil {
+					return err
+				}
+			}
+		}
+	case *sqlparser.JoinTableExpr:
+		if err := e.checkColumnSelectPriv(sel, t.LeftExpr, user, host, activeRoles, currentDB, cteNames); err != nil {
+			return err
+		}
+		return e.checkColumnSelectPriv(sel, t.RightExpr, user, host, activeRoles, currentDB, cteNames)
+	case *sqlparser.ParenTableExpr:
+		for _, te := range t.Exprs {
+			if err := e.checkColumnSelectPriv(sel, te, user, host, activeRoles, currentDB, cteNames); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // checkTableExprPrivSkipCTEs recursively checks privilege for a table expression, skipping CTE virtual tables.
 func checkTableExprPrivSkipCTEs(tblExpr sqlparser.TableExpr, priv, currentDB string, cteNames map[string]bool, check func(priv, db, table string) error) error {
 	switch t := tblExpr.(type) {
@@ -6811,8 +7090,23 @@ func checkTableExprPrivSkipCTEs(tblExpr sqlparser.TableExpr, priv, currentDB str
 				dbName = tn.Qualifier.String()
 			}
 			return check(priv, dbName, tblName)
+		} else if dt, ok := t.Expr.(*sqlparser.DerivedTable); ok {
+			// Recurse into derived table subquery (SELECT priv FROM t checks t's privileges)
+			if innerSel, ok2 := dt.Select.(*sqlparser.Select); ok2 {
+				innerCTEs := make(map[string]bool)
+				if innerSel.With != nil {
+					for _, cte := range innerSel.With.CTEs {
+						innerCTEs[strings.ToLower(cte.ID.String())] = true
+					}
+				}
+				for _, te := range innerSel.From {
+					if err := checkTableExprPrivSkipCTEs(te, priv, currentDB, innerCTEs, check); err != nil {
+						return err
+					}
+				}
+			}
 		}
-		// Subquery or derived table - no table-level privilege check here
+		// Other subquery forms - no table-level privilege check here
 	case *sqlparser.JoinTableExpr:
 		if err := checkTableExprPrivSkipCTEs(t.LeftExpr, priv, currentDB, cteNames, check); err != nil {
 			return err
