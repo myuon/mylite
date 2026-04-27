@@ -613,6 +613,11 @@ type Executor struct {
 	// that was created with a strict sql_mode (STRICT_TRANS_TABLES, STRICT_ALL_TABLES, or TRADITIONAL).
 	// When true, type conversion warnings (like 1292 Truncated DOUBLE value) become hard errors.
 	insideStrictRoutine bool
+	// groupConcatRowCount is a running counter of non-NULL values processed by GROUP_CONCAT
+	// aggregate functions across all groups in the current query. MySQL uses this to report
+	// "Row N was cut by GROUP_CONCAT()" where N is the position of the value that triggered
+	// the truncation. Reset at the start of each SELECT execution.
+	groupConcatRowCount int
 }
 
 // Warning represents a MySQL warning.
