@@ -651,6 +651,43 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 				}
 			} else {
 				result = e.explainSelect(s, &idCounter, "PRIMARY")
+				// Partial semijoin flattening: when some inner subqueries have NO_SEMIJOIN
+				// (or are targeted by outer QB-targeted NO_SEMIJOIN hints) and others don't,
+				// MySQL uses PRIMARY for the outer query and inlines the flattenable subqueries
+				// at id=1 PRIMARY (FirstMatch strategy), while keeping NO_SEMIJOIN subqueries
+				// as DEPENDENT SUBQUERY.
+				if e.queryHasPartialSemijoin(s) {
+					// Collect rows by type
+					var primaryRows []explainSelectType    // outer table rows (already PRIMARY, id=1)
+					var inlinedRows []explainSelectType    // inner subquery rows that CAN be flattened
+					var dependentRows []explainSelectType  // inner subquery rows that cannot (DEPENDENT)
+					var otherRows []explainSelectType      // any other rows
+					for _, r := range result {
+						switch r.selectType {
+						case "PRIMARY", "SIMPLE":
+							// Already-assigned outer rows (outer tables at id=1 PRIMARY)
+							primaryRows = append(primaryRows, r)
+						case "SUBQUERY":
+							// Non-correlated IN subquery: flattenable → inline at id=1 PRIMARY
+							r.id = int64(1)
+							r.selectType = "PRIMARY"
+							inlinedRows = append(inlinedRows, r)
+						case "DEPENDENT SUBQUERY":
+							// Correlated or NO_SEMIJOIN subquery: keep as-is
+							dependentRows = append(dependentRows, r)
+						default:
+							otherRows = append(otherRows, r)
+						}
+					}
+					// Order: outer tables (PRIMARY), inlined inner tables (PRIMARY), DEPENDENT SUBQUERYs
+					// DEPENDENT SUBQUERY rows are shown in reverse id order (higher id first).
+					if len(dependentRows) > 1 {
+						for i, j := 0, len(dependentRows)-1; i < j; i, j = i+1, j-1 {
+							dependentRows[i], dependentRows[j] = dependentRows[j], dependentRows[i]
+						}
+					}
+					result = append(append(append(primaryRows, inlinedRows...), dependentRows...), otherRows...)
+				}
 			}
 		} else {
 			// Simple query
@@ -1039,12 +1076,17 @@ func (e *Executor) queryCanBeSemijoinFlattened(sel *sqlparser.Select) bool {
 	}
 
 	// NO_SEMIJOIN hint in the outer query's comments (e.g. /*+ NO_SEMIJOIN(@subq) */) prevents
-	// semijoin flattening even when the hint references a named query block (@subq).
-	for _, c := range sel.Comments.GetComments() {
-		if strings.Contains(strings.ToUpper(c), "NO_SEMIJOIN") {
-			return false
-		}
+	// semijoin flattening entirely when given with no strategy list and no QB_NAME.
+	// However, NO_SEMIJOIN(@subq FIRSTMATCH, LOOSESCAN) only disables specific strategies
+	// and still allows materialization/DuplicateWeedout — so flattening still applies.
+	// And NO_SEMIJOIN(@subq1) only targets the specific named subquery, not all subqueries.
+	outerHint := parseSemijoinHintFromComments(sel.Comments.GetComments())
+	if outerHint.disablesSemijoinTransformation() {
+		return false
 	}
+	// Collect all QB-targeted NO_SEMIJOIN hints from the outer query.
+	// These are NO_SEMIJOIN(@name) hints that target specific named inner subqueries.
+	outerQBTargetedHints := parseAllSemijoinHintsFromComments(sel.Comments.GetComments())
 
 	// The outer query must have at least one real table or derived table (not just DUAL).
 	// If there are no real tables or derived tables, MySQL cannot form an anti-join and keeps
@@ -1194,11 +1236,34 @@ func (e *Executor) queryCanBeSemijoinFlattened(sel *sqlparser.Select) bool {
 						}
 						// Check for NO_SEMIJOIN optimizer hint in the inner SELECT.
 						// e.g. SELECT /*+ NO_SEMIJOIN() */ a FROM t1 prevents flattening.
+						innerHasNoSemijoin := false
 						for _, c := range inner.Comments.GetComments() {
 							if strings.Contains(strings.ToUpper(c), "NO_SEMIJOIN") {
-								allFlattenable = false
-								return false, nil
+								innerHasNoSemijoin = true
+								break
 							}
+						}
+						// Also check if outer query's QB-targeted NO_SEMIJOIN hints target this inner subquery.
+						// e.g. outer has NO_SEMIJOIN(@subq1) and inner has QB_NAME(subq1).
+						// Only block flattening when no strategy list is given (i.e., ALL strategies disabled).
+						// NO_SEMIJOIN(@subq1 LOOSESCAN) only disables LooseScan but still allows
+						// FirstMatch/Materialization/DuplicateWeedout — so flattening still applies.
+						if !innerHasNoSemijoin && len(outerQBTargetedHints) > 0 {
+							innerQBName := getQBNameFromComments(inner.Comments.GetComments())
+							if innerQBName != "" {
+								for _, outerH := range outerQBTargetedHints {
+									if outerH.hintType == "NO_SEMIJOIN" && outerH.hasQBName &&
+										!outerH.hasStrategies &&
+										strings.EqualFold(outerH.qbName, innerQBName) {
+										innerHasNoSemijoin = true
+										break
+									}
+								}
+							}
+						}
+						if innerHasNoSemijoin {
+							allFlattenable = false
+							return false, nil
 						}
 						// STRAIGHT_JOIN as a SELECT modifier in the inner subquery prevents semijoin flattening.
 						// Note: STRAIGHT_JOIN as a join type (t1 STRAIGHT_JOIN t2) does NOT prevent it.
@@ -1275,6 +1340,139 @@ func (e *Executor) queryCanBeSemijoinFlattened(sel *sqlparser.Select) bool {
 
 	// semijoin must be enabled (it is on by default).
 	return e.isOptimizerSwitchEnabled("semijoin")
+}
+
+// queryHasPartialSemijoin returns true when the query has a mix of flattenable and
+// non-flattenable (due to NO_SEMIJOIN hint) inner subqueries. In this case, MySQL
+// uses the PRIMARY selectType for the outer query, inlines the flattenable subqueries
+// at id=1, and keeps the NO_SEMIJOIN subqueries as DEPENDENT SUBQUERY at new ids.
+// This requires: semijoin enabled, outer has real tables, NOT all subqueries blocked,
+// and the blocking reason is specifically NO_SEMIJOIN hints (not structural reasons).
+func (e *Executor) queryHasPartialSemijoin(sel *sqlparser.Select) bool {
+	if !e.isOptimizerSwitchEnabled("semijoin") {
+		return false
+	}
+	// If full flattening is possible, no partial flattening needed.
+	if e.queryCanBeSemijoinFlattened(sel) {
+		return false
+	}
+	// Check structural requirements for partial flattening (same as full flattenability).
+	if sel.StraightJoinHint {
+		return false
+	}
+	outerHint := parseSemijoinHintFromComments(sel.Comments.GetComments())
+	if outerHint.disablesSemijoinTransformation() {
+		return false
+	}
+	// Collect outer QB-targeted hints
+	outerQBTargetedHints := parseAllSemijoinHintsFromComments(sel.Comments.GetComments())
+	var outerTables []string
+	for _, te := range sel.From {
+		outerTables = append(outerTables, e.extractAllTableNames(te)...)
+	}
+	numDerivedOuter := 0
+	for _, te := range sel.From {
+		numDerivedOuter += countDerivedTablesInExpr(te)
+	}
+	hasRealTable := numDerivedOuter > 0
+	for _, tn := range outerTables {
+		if strings.ToLower(tn) != "dual" {
+			hasRealTable = true
+			break
+		}
+	}
+	if !hasRealTable {
+		return false
+	}
+	hasSelectSubquery := false
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if _, ok := n.(*sqlparser.Subquery); ok {
+			hasSelectSubquery = true
+			return false, nil
+		}
+		return true, nil
+	}, sel.SelectExprs)
+	if hasSelectSubquery {
+		return false
+	}
+	if sel.Where == nil {
+		return false
+	}
+	// Walk WHERE to detect partial flattening: hasFlattenable + hasNonFlattenableByNoSemijoin
+	hasFlattenable := false
+	hasNonFlattenableByNoSemijoin := false
+	hasNonFlattenableByOtherReason := false
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		comp, ok := n.(*sqlparser.ComparisonExpr)
+		if !ok {
+			return true, nil
+		}
+		if comp.Operator != sqlparser.InOp {
+			return true, nil
+		}
+		sub, ok := comp.Right.(*sqlparser.Subquery)
+		if !ok {
+			return true, nil
+		}
+		inner, ok := sub.Select.(*sqlparser.Select)
+		if !ok {
+			// Union subquery - can't flatten
+			hasNonFlattenableByOtherReason = true
+			return false, nil
+		}
+		// Check real tables
+		var innerTables []string
+		for _, te := range inner.From {
+			innerTables = append(innerTables, e.extractAllTableNames(te)...)
+		}
+		hasRealInner := false
+		for _, tn := range innerTables {
+			if strings.ToLower(tn) != "dual" {
+				hasRealInner = true
+				break
+			}
+		}
+		if !hasRealInner {
+			hasNonFlattenableByOtherReason = true
+			return false, nil
+		}
+		// Check NO_SEMIJOIN in inner
+		innerHasNoSemijoin := false
+		for _, c := range inner.Comments.GetComments() {
+			if strings.Contains(strings.ToUpper(c), "NO_SEMIJOIN") {
+				innerHasNoSemijoin = true
+				break
+			}
+		}
+		// Check outer QB-targeted hints (only when no strategy list — strategy-specific NO_SEMIJOIN
+		// like NO_SEMIJOIN(@subq1 LOOSESCAN) only disables one strategy, not all flattening)
+		if !innerHasNoSemijoin && len(outerQBTargetedHints) > 0 {
+			innerQBName := getQBNameFromComments(inner.Comments.GetComments())
+			if innerQBName != "" {
+				for _, outerH := range outerQBTargetedHints {
+					if outerH.hintType == "NO_SEMIJOIN" && outerH.hasQBName &&
+						!outerH.hasStrategies &&
+						strings.EqualFold(outerH.qbName, innerQBName) {
+						innerHasNoSemijoin = true
+						break
+					}
+				}
+			}
+		}
+		if innerHasNoSemijoin {
+			hasNonFlattenableByNoSemijoin = true
+			return false, nil
+		}
+		// Check structural blockers
+		if inner.StraightJoinHint || (inner.GroupBy != nil && len(inner.GroupBy.Exprs) > 0) || inner.Having != nil {
+			hasNonFlattenableByOtherReason = true
+			return false, nil
+		}
+		hasFlattenable = true
+		return false, nil
+	}, sel.Where)
+	// Partial semijoin: some flattenable, some blocked ONLY by NO_SEMIJOIN, none by other reasons
+	return hasFlattenable && hasNonFlattenableByNoSemijoin && !hasNonFlattenableByOtherReason
 }
 
 // tableExprHasSubquery checks if a table expression contains a derived table (subquery in FROM).
@@ -1752,6 +1950,259 @@ func (e *Executor) collectTableNamesAndAliases(te sqlparser.TableExpr, names map
 }
 
 // isCorrelatedSubquery checks whether a subquery SELECT references any of the outer table names.
+// semijoinHintInfo holds parsed information from SEMIJOIN / NO_SEMIJOIN optimizer hints.
+type semijoinHintInfo struct {
+	hintType      string   // "NO_SEMIJOIN" or "SEMIJOIN" or "" (none)
+	strategies    []string // uppercase strategy names, e.g. ["FIRSTMATCH", "LOOSESCAN"]
+	hasStrategies bool     // true if specific strategies were listed
+	hasQBName     bool     // true if a query block name (@name) was specified
+	qbName        string   // uppercase query block name if hasQBName is true
+}
+
+// parseSemijoinHintFromComments parses SEMIJOIN/NO_SEMIJOIN optimizer hints from
+// SQL comment strings (e.g. "/*+ NO_SEMIJOIN(@subq1 FIRSTMATCH, LOOSESCAN) */").
+// Returns a semijoinHintInfo describing the first SEMIJOIN/NO_SEMIJOIN hint found.
+// If no hint is present, hintType is "".
+func parseSemijoinHintFromComments(comments []string) semijoinHintInfo {
+	for _, c := range comments {
+		upper := strings.ToUpper(c)
+		var hintType string
+		var rest string
+		if idx := strings.Index(upper, "NO_SEMIJOIN"); idx >= 0 {
+			hintType = "NO_SEMIJOIN"
+			rest = strings.TrimSpace(upper[idx+len("NO_SEMIJOIN"):])
+		} else if idx := strings.Index(upper, "SEMIJOIN"); idx >= 0 {
+			hintType = "SEMIJOIN"
+			rest = strings.TrimSpace(upper[idx+len("SEMIJOIN"):])
+		}
+		if hintType == "" {
+			continue
+		}
+		// rest looks like "(@subq1 FIRSTMATCH, LOOSESCAN)" or "()" or "@subq1"
+		// Strip leading "@subq..." query block reference and parentheses
+		rest = strings.TrimPrefix(rest, "(")
+		// Extract optional query block name "@..."
+		hasQBName := false
+		qbName := ""
+		if strings.HasPrefix(rest, "@") {
+			// Extract the query block reference (ends at space, comma, or closing paren or backtick)
+			// The reference may be quoted with backticks, e.g. @`subq1` or @subq1
+			rest = rest[1:] // skip the '@'
+			// Handle backtick-quoted names
+			if strings.HasPrefix(rest, "`") {
+				end := strings.Index(rest[1:], "`")
+				if end >= 0 {
+					qbName = rest[1 : end+1]
+					rest = strings.TrimSpace(rest[end+2:]) // skip closing backtick
+				} else {
+					// No closing backtick: read until space/comma/paren
+					end = strings.IndexAny(rest, " ,)")
+					if end < 0 {
+						end = len(rest)
+					}
+					qbName = strings.Trim(rest[:end], "`")
+					rest = strings.TrimSpace(rest[end:])
+				}
+			} else {
+				end := strings.IndexAny(rest, " ,)")
+				if end < 0 {
+					end = len(rest)
+				}
+				qbName = rest[:end]
+				rest = strings.TrimSpace(rest[end:])
+			}
+			hasQBName = true
+		}
+		// Trim from first closing paren onwards (handles "STRAT1, STRAT2) */" → "STRAT1, STRAT2")
+		if paren := strings.Index(rest, ")"); paren >= 0 {
+			rest = rest[:paren]
+		}
+		rest = strings.TrimSpace(rest)
+		// rest is now the strategy list: "FIRSTMATCH, LOOSESCAN" or ""
+		var strategies []string
+		hasStrategies := false
+		if rest != "" {
+			for _, part := range strings.Split(rest, ",") {
+				s := strings.TrimSpace(part)
+				if s != "" {
+					strategies = append(strategies, s)
+					hasStrategies = true
+				}
+			}
+		}
+		return semijoinHintInfo{
+			hintType:      hintType,
+			strategies:    strategies,
+			hasStrategies: hasStrategies,
+			hasQBName:     hasQBName,
+			qbName:        qbName,
+		}
+	}
+	return semijoinHintInfo{}
+}
+
+// parseAllSemijoinHintsFromComments parses ALL SEMIJOIN/NO_SEMIJOIN hints from
+// SQL comment strings. A single comment like "/*+ NO_SEMIJOIN(@subq1) NO_SEMIJOIN(@subq2) */"
+// can contain multiple hints for different query blocks.
+func parseAllSemijoinHintsFromComments(comments []string) []semijoinHintInfo {
+	var result []semijoinHintInfo
+	for _, c := range comments {
+		upper := strings.ToUpper(c)
+		// Scan through all occurrences of NO_SEMIJOIN and SEMIJOIN in this comment
+		remaining := upper
+		for {
+			var hintType string
+			var idx int
+			if i := strings.Index(remaining, "NO_SEMIJOIN"); i >= 0 {
+				if j := strings.Index(remaining, "SEMIJOIN"); j >= 0 && j < i {
+					hintType = "SEMIJOIN"
+					idx = j
+				} else {
+					hintType = "NO_SEMIJOIN"
+					idx = i
+				}
+			} else if i := strings.Index(remaining, "SEMIJOIN"); i >= 0 {
+				hintType = "SEMIJOIN"
+				idx = i
+			} else {
+				break
+			}
+			rest := strings.TrimSpace(remaining[idx+len(hintType):])
+			remaining = remaining[idx+len(hintType):]
+			// Parse the hint arguments
+			rest = strings.TrimPrefix(rest, "(")
+			hasQBName := false
+			qbName := ""
+			if strings.HasPrefix(rest, "@") {
+				rest = rest[1:] // skip '@'
+				if strings.HasPrefix(rest, "`") {
+					end := strings.Index(rest[1:], "`")
+					if end >= 0 {
+						qbName = rest[1 : end+1]
+						rest = strings.TrimSpace(rest[end+2:])
+					} else {
+						end = strings.IndexAny(rest, " ,)")
+						if end < 0 {
+							end = len(rest)
+						}
+						qbName = strings.Trim(rest[:end], "`")
+						rest = strings.TrimSpace(rest[end:])
+					}
+				} else {
+					end := strings.IndexAny(rest, " ,)")
+					if end < 0 {
+						end = len(rest)
+					}
+					qbName = rest[:end]
+					rest = strings.TrimSpace(rest[end:])
+				}
+				hasQBName = true
+			}
+			if paren := strings.Index(rest, ")"); paren >= 0 {
+				remaining = remaining[strings.Index(remaining, ")")+1:]
+				rest = rest[:paren]
+			} else {
+				break
+			}
+			rest = strings.TrimSpace(rest)
+			var strategies []string
+			hasStrategies := false
+			if rest != "" {
+				for _, part := range strings.Split(rest, ",") {
+					s := strings.TrimSpace(part)
+					if s != "" {
+						strategies = append(strategies, s)
+						hasStrategies = true
+					}
+				}
+			}
+			result = append(result, semijoinHintInfo{
+				hintType:      hintType,
+				strategies:    strategies,
+				hasStrategies: hasStrategies,
+				hasQBName:     hasQBName,
+				qbName:        qbName,
+			})
+		}
+	}
+	return result
+}
+
+// getQBNameFromComments extracts the QB_NAME from optimizer hint comments like "/*+ QB_NAME(subq1) */".
+// Returns the name (uppercase) or "" if not found.
+func getQBNameFromComments(comments []string) string {
+	for _, c := range comments {
+		upper := strings.ToUpper(c)
+		idx := strings.Index(upper, "QB_NAME")
+		if idx < 0 {
+			continue
+		}
+		rest := strings.TrimSpace(upper[idx+len("QB_NAME"):])
+		rest = strings.TrimPrefix(rest, "(")
+		// Strip backtick or backtick variants
+		rest = strings.Trim(rest, "`")
+		if paren := strings.IndexAny(rest, ")`"); paren >= 0 {
+			rest = rest[:paren]
+		}
+		rest = strings.TrimSpace(rest)
+		if rest != "" {
+			return rest
+		}
+	}
+	return ""
+}
+
+// disablesSemijoinTransformation returns true if the hint completely disables semijoin
+// transformation (not just specific strategies). This only applies when NO_SEMIJOIN
+// is given with NO strategy list AND NO query block name — in that case the entire
+// semijoin transformation is disabled and MySQL falls back to EXISTS/DEPENDENT SUBQUERY.
+// When specific strategies are listed (even all 4), MySQL still uses DuplicateWeedout
+// as a fallback, so semijoin transformation is still applied.
+// When a query block name is given (e.g. NO_SEMIJOIN(@subq1)), only that specific
+// subquery is targeted — the overall outer query can still use semijoin for other
+// subqueries, so this does NOT disable the overall semijoin transformation.
+func (h semijoinHintInfo) disablesSemijoinTransformation() bool {
+	if h.hintType != "NO_SEMIJOIN" {
+		return false
+	}
+	// QB-targeted hints don't disable global semijoin transformation
+	if h.hasQBName {
+		return false
+	}
+	// Only NO_SEMIJOIN() without strategy list or QB_NAME disables the entire transformation
+	return !h.hasStrategies
+}
+
+// strategyDisabled returns true if the given strategy name is in the disabled list.
+func (h semijoinHintInfo) strategyDisabled(strategy string) bool {
+	if h.hintType != "NO_SEMIJOIN" {
+		return false
+	}
+	if !h.hasStrategies {
+		// NO_SEMIJOIN() with no strategies disables all
+		return true
+	}
+	for _, s := range h.strategies {
+		if strings.EqualFold(s, strategy) {
+			return true
+		}
+	}
+	return false
+}
+
+// strategyForced returns true if the given SEMIJOIN hint forces this specific strategy.
+func (h semijoinHintInfo) strategyForced(strategy string) bool {
+	if h.hintType != "SEMIJOIN" || !h.hasStrategies {
+		return false
+	}
+	for _, s := range h.strategies {
+		if strings.EqualFold(s, strategy) {
+			return true
+		}
+	}
+	return false
+}
+
 // isOptimizerSwitchEnabled checks if a specific optimizer_switch flag is enabled.
 // Returns true if the flag is "on" or if the switch is not set (defaults to on for most flags).
 func (e *Executor) isOptimizerSwitchEnabled(flag string) bool {
@@ -3463,6 +3914,26 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 						break
 					}
 				}
+				// Also check if the outer query's QB-targeted NO_SEMIJOIN hints target this inner subquery.
+				// e.g. outer has /*+ NO_SEMIJOIN(@subq1) */ and inner has /*+ QB_NAME(subq1) */.
+				// Only apply when no strategy list: NO_SEMIJOIN(@subq1 LOOSESCAN) only disables
+				// LooseScan but allows other semijoin strategies — does NOT force DEPENDENT SUBQUERY.
+				if !innerHasNoSemijoin && outerSel != nil {
+					allOuterHints := parseAllSemijoinHintsFromComments(outerSel.Comments.GetComments())
+					if len(allOuterHints) > 0 {
+						innerQBName := getQBNameFromComments(inner.Comments.GetComments())
+						if innerQBName != "" {
+							for _, outerH := range allOuterHints {
+								if outerH.hintType == "NO_SEMIJOIN" && outerH.hasQBName &&
+									!outerH.hasStrategies &&
+									strings.EqualFold(outerH.qbName, innerQBName) {
+									innerHasNoSemijoin = true
+									break
+								}
+							}
+						}
+					}
+				}
 				// Check for "impossible WHERE" first (before considering correlation):
 				// When all inner tables are empty OR const PK lookup fails, MySQL uses
 				// "no matching row in const table" for the entire outer query.
@@ -3473,6 +3944,13 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 				// EXISTS (SELECT * FROM t2 LEFT JOIN t3 WHERE outer.col = inner.col)
 				// → treated as semijoin with decorrelated inner subquery
 				existsCanDecorrelate := inExistsContext && e.isSemijoinEnabled() && outerCanSemijoin && !innerHasNoSemijoin && e.isSemiJoinDecorrelatable(inner, outerTables)
+				// MySQL also decorrelates simple correlated IN subqueries when:
+				// - The correlation consists of simple equality conditions (e.g. WHERE t3.b = t1.a)
+				// - semijoin=on and outer can semijoin
+				// - Inner has no NO_SEMIJOIN hint (strategy-free)
+				// When correlated IN is decorrelatable, MySQL may still use MATERIALIZED strategy
+				// (e.g. when FIRSTMATCH is disabled and LooseScan is not applicable for correlated subqueries).
+				inCanDecorrelate := inContext && correlated && e.isSemijoinEnabled() && outerCanSemijoin && !innerHasNoSemijoin && e.isSemiJoinDecorrelatable(inner, outerTables)
 
 				// Detect impossible subquery WHERE: either a constant PK mismatch (no matching row)
 				// or a NULL comparison (c6 < NULL is always NULL/false).
@@ -3480,7 +3958,7 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 					(inner.Where != nil && hasImpossibleNullComparison(inner.Where.Expr))
 				if e.isSemijoinEnabled() && innerWhereIsImpossible {
 					selectType = "__IMPOSSIBLE__"
-				} else if (correlated || innerHasNoSemijoin) && !existsCanDecorrelate {
+				} else if (correlated || innerHasNoSemijoin) && !existsCanDecorrelate && !inCanDecorrelate {
 					selectType = "DEPENDENT SUBQUERY"
 				} else if inContext || existsCanDecorrelate {
 					if inContext && outerSelectTypeOuter == "DEPENDENT SUBQUERY" && e.isSemijoinEnabled() {
@@ -3505,6 +3983,52 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 							outerINIsConst := outerINExprIsConstant(node, sub)
 							outerIsSystem := e.outerTablesAreSystem(outerTables)
 							firstMatchOn := e.isOptimizerSwitchEnabled("firstmatch")
+							looseScanOn := e.isOptimizerSwitchEnabled("loosescan")
+							// Check outer query's semijoin hint: NO_SEMIJOIN(@subq FIRSTMATCH, LOOSESCAN)
+							// disables specific strategies. Adjust effective flags accordingly.
+							// When there are multiple hints (e.g., SEMIJOIN(@subq1 ...) SEMIJOIN(@subq2 ...)),
+							// find the hint that specifically targets the current inner subquery by QB_NAME.
+							var outerSemijoinHint semijoinHintInfo
+							if outerSel != nil {
+								allOuterHintsForStrategy := parseAllSemijoinHintsFromComments(outerSel.Comments.GetComments())
+								if len(allOuterHintsForStrategy) > 0 {
+									// Look for a QB_NAME-targeted hint matching this inner subquery
+									innerQBNameForStrategy := getQBNameFromComments(inner.Comments.GetComments())
+									if innerQBNameForStrategy != "" {
+										for _, h := range allOuterHintsForStrategy {
+											if h.hasQBName && strings.EqualFold(h.qbName, innerQBNameForStrategy) {
+												outerSemijoinHint = h
+												break
+											}
+										}
+									}
+									// Fall back to first hint if no QB_NAME-matched hint found
+									if outerSemijoinHint.hintType == "" {
+										outerSemijoinHint = allOuterHintsForStrategy[0]
+									}
+								}
+							}
+							if outerSemijoinHint.strategyDisabled("FIRSTMATCH") {
+								firstMatchOn = false
+							}
+							if outerSemijoinHint.strategyDisabled("LOOSESCAN") {
+								looseScanOn = false
+							}
+							materializationDisabledByHint := outerSemijoinHint.strategyDisabled("MATERIALIZATION")
+							_ = looseScanOn
+							// When a SEMIJOIN hint explicitly forces LooseScan strategy, that overrides
+							// the cost-based MATERIALIZED decision. LooseScan is applicable when the
+							// inner subquery's first column has an index (which we check implicitly via
+							// looseScanOn being true and the hint forcing it).
+							looseScanForced := outerSemijoinHint.strategyForced("LOOSESCAN")
+							// When a SEMIJOIN hint includes FIRSTMATCH in its strategy list (without LooseScan),
+							// FirstMatch takes priority over the cost-based MATERIALIZED decision.
+							// MySQL strategy priority: LooseScan > FirstMatch > Materialization > DuplicateWeedout.
+							firstMatchForced := outerSemijoinHint.strategyForced("FIRSTMATCH")
+							// correlatedIN is true when the IN subquery is correlated (e.g. WHERE t3.b = t1.a)
+							// but decorrelatable. In that case LooseScan is NOT applicable (LooseScan requires
+							// non-correlated inner subquery), so looseScanForced should not suppress MATERIALIZED.
+							correlatedIN := inCanDecorrelate
 							// Check if outer query has only derived tables (no real base tables).
 							// When outer FROM has only derived tables, MySQL prefers MATERIALIZED strategy
 							// for the IN subquery (FirstMatch can't be applied efficiently without base table).
@@ -3513,12 +4037,33 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 							// MATERIALIZED even when the outer IN expression is a constant.
 							// MySQL's cost-based optimizer decides that materializing is cheaper
 							// than FirstMatch when all inner tables are large.
-							if !outerIsSystem && e.allInnerTablesTwoOrMoreRows(inner) {
+							// Exception: when SEMIJOIN hint forces LooseScan (and it's applicable) or FirstMatch, those take priority.
+							looseScanForcedAndApplicable := looseScanForced && !correlatedIN
+							if !outerIsSystem && e.allInnerTablesTwoOrMoreRows(inner) && !looseScanForcedAndApplicable && !firstMatchForced {
 								selectType = "MATERIALIZED"
 							} else if outerHasOnlyDerivedTables && !outerINIsConst {
 								// Outer has only derived tables: MySQL cannot do efficient FirstMatch,
 								// so it uses MATERIALIZED strategy for non-constant IN expressions.
 								selectType = "MATERIALIZED"
+							} else if !materializationDisabledByHint && !firstMatchOn && (!looseScanOn || correlatedIN) && !outerINIsConst {
+								// When FirstMatch is disabled AND (LooseScan is also disabled OR LooseScan is not
+								// applicable for correlated subqueries) and Materialization is allowed, use MATERIALIZED.
+								// This handles:
+								// - NO_SEMIJOIN(@subq FIRSTMATCH, LOOSESCAN): both disabled → MATERIALIZED
+								// - NO_SEMIJOIN(@subq FIRSTMATCH, DUPSWEEDOUT) with correlated subquery: FirstMatch
+								//   disabled and LooseScan not applicable (correlated) → MATERIALIZED
+								// Note: if only FirstMatch is disabled but LooseScan is still available and applicable,
+								// LooseScan takes priority over MATERIALIZED.
+								if e.isOptimizerSwitchEnabled("materialization") {
+									selectType = "MATERIALIZED"
+								}
+							} else if outerSemijoinHint.strategyForced("MATERIALIZATION") && !outerINIsConst && !looseScanForcedAndApplicable && !firstMatchForced {
+								// SEMIJOIN(@subq MATERIALIZATION) hint forces materialization strategy.
+								// Exception: when LOOSESCAN (and applicable) or FIRSTMATCH is also forced, those take priority
+								// (MySQL strategy priority: LooseScan > FirstMatch > Materialization > DuplicateWeedout).
+								if e.isOptimizerSwitchEnabled("materialization") {
+									selectType = "MATERIALIZED"
+								}
 							} else if e.inSubqueryTypesCompatibleForMat(outerSel, inner, sub) && e.shouldMaterializeSubquery(inner, outerIsSystem) {
 								// When firstmatch=on and outer IN is a constant literal, MySQL uses
 								// "no matching row in const table" (FirstMatch with const lookup).
