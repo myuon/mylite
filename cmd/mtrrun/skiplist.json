@@ -2573,10 +2573,6 @@
       "reason": "=== encryption suite === === large_tests suite === === binlog_nogtid suite === === innodb_undo suite === === innodb_zip suite === === gcol_ndb suite === === innodb_gis suite === === innodb_stress suite === === max_parts suite === === opt_trace suite === === auth_sec suite === === binlog suite === collations suite: partially supported via Vitess UCA 0900 weight tables Remaining failures require multi-character contraction tie-breaking === query_rewrite_plugins suite === (requires rewriter plugin)"
     },
     {
-      "test": "funcs_1/innodb_cursors",
-      "reason": "FK/SP feature gaps remaining"
-    },
-    {
       "test": "funcs_1/memory_cursors",
       "reason": "FK/SP feature gaps remaining"
     },

@@ -32,6 +32,12 @@ import (
 // errSkipTest is a sentinel error indicating the test should be skipped.
 var errSkipTest = errors.New("skip test")
 
+// errExitFile is a sentinel error indicating that the `exit` directive was encountered.
+// When raised inside a --source'd file, it exits only that file (sourceFile swallows it).
+// When raised at the top-level test file, it stops test execution and the output is
+// compared against the expected result (i.e. it is treated as a normal completion).
+var errExitFile = errors.New("exit file")
+
 // classifySkipReason returns a category string based on the wrapped errSkipTest message.
 // Returns "infra" for infrastructure skips, "unsupported" for unsupported feature skips,
 // and "" for all other skips (e.g. skiplist or directive, handled at a higher level).
@@ -273,6 +279,10 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	ctx.closeConnections()
 	if errors.Is(err, errSkipTest) {
 		return TestResult{Name: name, Skipped: true, SkipReason: classifySkipReason(err)}
+	}
+	// exit directive: stop test execution and compare output against expected result.
+	if errors.Is(err, errExitFile) {
+		err = nil
 	}
 	if err != nil {
 		return TestResult{
@@ -795,6 +805,10 @@ func (ctx *execContext) executeLines(lines []string) error {
 
 			handled, skip, err := ctx.handleDirective(directive)
 			if err != nil && !errors.Is(err, errSkipTest) {
+				// exit directive: propagate directly without wrapping so callers can detect it.
+				if errors.Is(err, errExitFile) {
+					return errExitFile
+				}
 				// Check if the error was expected (e.g., --error before --connect)
 				if ctx.expectedError != "" && handled {
 					if ctx.resultLogEnabled {
@@ -941,6 +955,10 @@ func (ctx *execContext) executeLines(lines []string) error {
 			}
 			handled, skip, err := ctx.handleDirective(bareDirective)
 			if err != nil && !errors.Is(err, errSkipTest) {
+				// exit directive: propagate directly without wrapping.
+				if errors.Is(err, errExitFile) {
+					return errExitFile
+				}
 				// Check if the error was expected (e.g., --error before connect)
 				if ctx.expectedError != "" && handled {
 					if ctx.resultLogEnabled {
@@ -1381,6 +1399,10 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		err := ctx.sourceFile(args)
 		if errors.Is(err, errSkipTest) {
 			return true, true, errSkipTest
+		}
+		// exit inside a sourced file propagates up to terminate the whole test.
+		if errors.Is(err, errExitFile) {
+			return true, false, errExitFile
 		}
 		return true, false, err
 
@@ -1897,7 +1919,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"rmdir", "move_file",
 		"list_files", "file_exists",
 		"system",
-		"die", "exit",
+		"die",
 		"if", "while", "end",
 		"require", "result_format",
 		"disable_reconnect", "enable_reconnect",
@@ -1911,6 +1933,11 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		"dirty_close",
 		"force-rmdir", "force_rmdir":
 		return true, false, nil
+	case "exit":
+		// exit: stop execution of the current file (sourced or top-level).
+		// sourceFile() will catch errExitFile and swallow it (exit only exits one source level).
+		// At the top level the RunTest caller treats errExitFile as a normal completion.
+		return true, false, errExitFile
 	case "enable_info":
 		ctx.infoEnabled = true
 		return true, false, nil
