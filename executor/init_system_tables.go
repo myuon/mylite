@@ -325,6 +325,8 @@ func (e *Executor) initSystemTables() {
 		Columns: []catalog.ColumnDef{
 			{Name: "QUERY", Type: "LONGTEXT"},
 			{Name: "TRACE", Type: "LONGTEXT"},
+			{Name: "MISSING_BYTES_BEYOND_MAX_MEM_SIZE", Type: "BIGINT"},
+			{Name: "INSUFFICIENT_PRIVILEGES", Type: "TINYINT"},
 		},
 	})
 	ensure("information_schema", &catalog.TableDef{
