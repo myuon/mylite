@@ -60,6 +60,11 @@ func classifyDeletePredsForTables(where sqlparser.Expr, tableAliases []string) (
 }
 
 func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
+	// Mark the current transaction as having writes so COMMIT can be blocked
+	// by FLUSH TABLES WITH READ LOCK if needed.
+	if e.inTransaction {
+		e.txnHasWrites = true
+	}
 	// Handle WITH clause (CTEs) on DELETE statements.
 	if stmt.With != nil && len(stmt.With.CTEs) > 0 {
 		outerCTEMap := e.cteMap

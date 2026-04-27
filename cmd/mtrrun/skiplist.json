@@ -2749,10 +2749,6 @@
       "reason": "timeout in mtrrun"
     },
     {
-      "test": "other/flush_block_commit",
-      "reason": "timeout in mtrrun"
-    },
-    {
       "test": "other/flush_table",
       "reason": "timeout in mtrrun"
     },
@@ -2818,10 +2814,6 @@
     },
     {
       "test": "other/join_nested_bka_nixbnl",
-      "reason": "timeout in mtrrun"
-    },
-    {
-      "test": "other/lock_backup",
       "reason": "timeout in mtrrun"
     },
     {

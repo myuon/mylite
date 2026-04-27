@@ -64,6 +64,11 @@ func subqueryReferencesTable(exprs sqlparser.UpdateExprs, tableName string) bool
 }
 
 func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
+	// Mark the current transaction as having writes so COMMIT can be blocked
+	// by FLUSH TABLES WITH READ LOCK if needed.
+	if e.inTransaction {
+		e.txnHasWrites = true
+	}
 	// Handle WITH clause (CTEs) on UPDATE statements.
 	if stmt.With != nil && len(stmt.With.CTEs) > 0 {
 		outerCTEMap := e.cteMap

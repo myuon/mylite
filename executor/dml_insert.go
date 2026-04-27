@@ -117,6 +117,11 @@ func (e *Executor) checkGapLockForInsert(dbName, tableName string, stmt *sqlpars
 }
 
 func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
+	// Mark the current transaction as having writes so COMMIT can be blocked
+	// by FLUSH TABLES WITH READ LOCK if needed.
+	if e.inTransaction {
+		e.txnHasWrites = true
+	}
 	// Set insideDML so that sub-SELECTs (INSERT...SELECT, subqueries in
 	// VALUES) acquire row locks, mimicking InnoDB's implicit locking.
 	// InnoDB always acquires shared locks on source rows during INSERT...SELECT,
