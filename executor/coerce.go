@@ -4078,3 +4078,185 @@ func checkIntegerRangeForColumn(colType string, colName string, v interface{}) e
 	}
 	return nil
 }
+
+// checkIntegerRangeForColumnAtRow is like checkIntegerRangeForColumn but uses a specific row number.
+func checkIntegerRangeForColumnAtRow(colType string, colName string, v interface{}, rowNum int) error {
+	err := checkIntegerRangeForColumn(colType, colName, v)
+	if err == nil {
+		return nil
+	}
+	// Re-issue the error with the correct row number
+	return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+}
+
+// checkTruncationForColumn checks whether converting a string value to an integer column
+// would produce a "Incorrect integer value" error (ER_TRUNCATED_WRONG_VALUE_FOR_FIELD, 1366).
+// This is used for STORED generated columns in ALTER TABLE, where MySQL strictly validates
+// that string values can be converted to the target integer type.
+func checkTruncationForColumn(colType string, colName string, v interface{}) error {
+	return checkTruncationForColumnAtRow(colType, colName, v, 1)
+}
+
+// checkTruncationForColumnAtRow is like checkTruncationForColumn but uses a specific row number.
+func checkTruncationForColumnAtRow(colType string, colName string, v interface{}, rowNum int) error {
+	upper := strings.ToUpper(strings.TrimSpace(colType))
+	// Strip generated column expression
+	if genIdx := strings.Index(upper, " GENERATED"); genIdx >= 0 {
+		upper = strings.TrimSpace(upper[:genIdx])
+	}
+	isUnsigned := strings.Contains(upper, "UNSIGNED") || strings.Contains(upper, "ZEROFILL")
+	baseType := upper
+	if idx := strings.Index(baseType, "("); idx >= 0 {
+		baseType = baseType[:idx]
+	}
+	baseType = strings.TrimSpace(strings.Replace(strings.Replace(baseType, "UNSIGNED", "", 1), "ZEROFILL", "", 1))
+	// Only applies to integer types
+	rng, isIntType := intTypeRanges[baseType]
+	if !isIntType {
+		return nil
+	}
+	// Check if the value is a non-numeric or temporal string that would overflow the integer range
+	switch val := v.(type) {
+	case string:
+		trimmed := strings.TrimSpace(val)
+		if trimmed == "" {
+			return mysqlError(1366, "HY000", fmt.Sprintf("Incorrect integer value: '%s' for column '%s' at row %d", val, colName, rowNum))
+		}
+		// Check for DATETIME format "YYYY-MM-DD HH:MM:SS"
+		if len(trimmed) >= 19 && trimmed[4] == '-' && trimmed[7] == '-' && trimmed[10] == ' ' && trimmed[13] == ':' && trimmed[16] == ':' {
+			y, _ := strconv.ParseInt(trimmed[0:4], 10, 64)
+			mo, _ := strconv.ParseInt(trimmed[5:7], 10, 64)
+			d, _ := strconv.ParseInt(trimmed[8:10], 10, 64)
+			h, _ := strconv.ParseInt(trimmed[11:13], 10, 64)
+			mi, _ := strconv.ParseInt(trimmed[14:16], 10, 64)
+			sec, _ := strconv.ParseInt(trimmed[17:19], 10, 64)
+			datetimeInt := y*10000000000 + mo*100000000 + d*1000000 + h*10000 + mi*100 + sec
+			if isUnsigned {
+				if datetimeInt < 0 || uint64(datetimeInt) > rng.MaxUnsigned {
+					return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+				}
+			} else if datetimeInt < rng.Min || datetimeInt > rng.Max {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+			}
+			return nil
+		}
+		// Check for TIME format "HH:MM:SS" (or "HHH:MM:SS" for large hours).
+		// MySQL converts TIME to integer by HHMMSS numeric value.
+		if strings.Count(trimmed, ":") == 2 && !strings.Contains(trimmed, "-") {
+			parts := strings.SplitN(trimmed, ":", 3)
+			secStr := parts[2]
+			if dotIdx := strings.Index(secStr, "."); dotIdx >= 0 {
+				secStr = secStr[:dotIdx]
+			}
+			h, herr := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
+			m2, merr := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+			s2, serr := strconv.ParseInt(strings.TrimSpace(secStr), 10, 64)
+			if herr == nil && merr == nil && serr == nil {
+				timeInt := h*10000 + m2*100 + s2
+				if isUnsigned {
+					if timeInt < 0 || uint64(timeInt) > rng.MaxUnsigned {
+						return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+					}
+				} else if timeInt < rng.Min || timeInt > rng.Max {
+					return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+				}
+				return nil
+			}
+		}
+		// Check for DATE format "YYYY-MM-DD".
+		// MySQL converts DATE values to DATETIME (YYYYMMDDHHMMSS = YYYYMMDD000000) when
+		// stored in integer columns, because DATE strings become DATETIME strings internally.
+		if len(trimmed) == 10 && trimmed[4] == '-' && trimmed[7] == '-' {
+			y, _ := strconv.ParseInt(trimmed[0:4], 10, 64)
+			mo, _ := strconv.ParseInt(trimmed[5:7], 10, 64)
+			d, _ := strconv.ParseInt(trimmed[8:10], 10, 64)
+			// MySQL uses DATETIME representation for DATE in integer context: YYYYMMDD000000
+			dateInt := y*10000000000 + mo*100000000 + d*1000000
+			if isUnsigned {
+				if dateInt < 0 || uint64(dateInt) > rng.MaxUnsigned {
+					return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+				}
+			} else if dateInt < rng.Min || dateInt > rng.Max {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+			}
+			return nil
+		}
+		// Check if it starts with a digit or sign; otherwise it's non-numeric
+		if (trimmed[0] < '0' || trimmed[0] > '9') && trimmed[0] != '-' && trimmed[0] != '+' {
+			return mysqlError(1366, "HY000", fmt.Sprintf("Incorrect integer value: '%s' for column '%s' at row %d", val, colName, rowNum))
+		}
+		// Also check if the numeric string value is in range.
+		// Try integer parsing first, then float (for values like "-99999999.99").
+		if n, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+			if isUnsigned {
+				if n < 0 || uint64(n) > rng.MaxUnsigned {
+					return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+				}
+			} else if n < rng.Min || n > rng.Max {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+			}
+		} else if fval, ferr := strconv.ParseFloat(trimmed, 64); ferr == nil {
+			// Decimal string like "-99999999.99": compare as float to integer range.
+			if isUnsigned {
+				if fval < 0 || fval > float64(rng.MaxUnsigned)+0.9999 {
+					return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+				}
+			} else if fval < float64(rng.Min)-0.9999 || fval > float64(rng.Max)+0.9999 {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+			}
+		}
+	case ScaledValue:
+		// DECIMAL values stored into integer columns: check if the float value is in range.
+		fval := val.Value
+		if isUnsigned {
+			if fval < 0 || fval > float64(rng.MaxUnsigned)+0.9999 {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+			}
+		} else {
+			if fval < float64(rng.Min)-0.9999 || fval > float64(rng.Max)+0.9999 {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+			}
+		}
+	case float64:
+		// Float values stored into integer columns: check if the value is in range.
+		// MySQL truncates (toward zero) the float before range-checking.
+		// Use float comparison directly to avoid int64 overflow for very large floats.
+		if isUnsigned {
+			if val < 0 || val > float64(rng.MaxUnsigned)+0.9999 {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+			}
+		} else {
+			if val < float64(rng.Min)-0.9999 || val > float64(rng.Max)+0.9999 {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+			}
+		}
+	case float32:
+		fval := float64(val)
+		if isUnsigned {
+			if fval < 0 || fval > float64(rng.MaxUnsigned)+0.9999 {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+			}
+		} else {
+			if fval < float64(rng.Min)-0.9999 || fval > float64(rng.Max)+0.9999 {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+			}
+		}
+	case int64:
+		if isUnsigned {
+			if val < 0 || uint64(val) > rng.MaxUnsigned {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+			}
+		} else if val < rng.Min || val > rng.Max {
+			return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+		}
+	case uint64:
+		if isUnsigned {
+			if val > rng.MaxUnsigned {
+				return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+			}
+		} else if val > uint64(rng.Max) {
+			return mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row %d", colName, rowNum))
+		}
+	}
+	return nil
+}

@@ -3715,6 +3715,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					// For generated columns, compute values for existing rows
 					tbl.AddColumn(colDef.Name, nil)
 					tbl.Mu.Lock()
+					isStoredGen := strings.Contains(strings.ToUpper(colDef.Type), " STORED")
 					for i := range tbl.Rows {
 						v, err := e.evalGeneratedColumnExpr(genExpr, tbl.Rows[i])
 						if err != nil {
@@ -3724,13 +3725,32 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 							tbl.DropColumn(colDef.Name)
 							return nil, err
 						}
+						// For STORED generated columns, always check range before coercing,
+						// so that out-of-range values raise an error rather than being silently clipped.
+						// Use 1-indexed row number for error messages.
+						rowNum := i + 1
+						if isStoredGen && v != nil {
+							if rangeErr := checkIntegerRangeForColumnAtRow(colDef.Type, colDef.Name, v, rowNum); rangeErr != nil {
+								tbl.Mu.Unlock()
+								db.DropColumn(tableName, colDef.Name)
+								tbl.DropColumn(colDef.Name)
+								return nil, rangeErr
+							}
+							// Also check truncation errors for string-to-int conversions
+							if truncErr := checkTruncationForColumnAtRow(colDef.Type, colDef.Name, v, rowNum); truncErr != nil {
+								tbl.Mu.Unlock()
+								db.DropColumn(tableName, colDef.Name)
+								tbl.DropColumn(colDef.Name)
+								return nil, truncErr
+							}
+						}
 						// Coerce the computed value to the declared column type (use base type without GC expr)
 						if v != nil {
 							v = coerceColumnValue(baseColumnType(colDef.Type), v)
 						}
 						// Check if value is out of range for the column type
-						// Only enforce range check when WITH VALIDATION is specified
-						if withValidation {
+						// Only enforce range check when WITH VALIDATION is specified (for non-generated columns)
+						if withValidation && !isStoredGen {
 							if rangeErr := checkIntegerRangeForColumn(colDef.Type, colDef.Name, v); rangeErr != nil {
 								tbl.Mu.Unlock()
 								db.DropColumn(tableName, colDef.Name)

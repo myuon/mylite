@@ -3525,14 +3525,6 @@
       "reason": "duplicate key with PAD SPACE collation"
     },
     {
-      "test": "gcol/gcol_blocked_sql_funcs_innodb",
-      "reason": "function order mismatch in generated column blocking"
-    },
-    {
-      "test": "gcol/gcol_blocked_sql_funcs_myisam",
-      "reason": "function order mismatch in generated column blocking"
-    },
-    {
       "test": "innodb/innodb-alter",
       "reason": "EXPLAIN output differences"
     },

@@ -1348,6 +1348,15 @@ func mysqlGenExprNode(expr sqlparser.Expr, colCharset string) string {
 		// MySQL outputs function names in lowercase in SHOW CREATE TABLE
 		// for generated column expressions.
 		name = strings.ToLower(name)
+		// MySQL normalizes certain function name aliases in generated column display:
+		// - atan2 → atan (MySQL uses atan() for both 1- and 2-arg forms)
+		// - ceil → ceiling (MySQL always shows the full name)
+		switch name {
+		case "atan2":
+			name = "atan"
+		case "ceil":
+			name = "ceiling"
+		}
 		return name + "(" + strings.Join(args, ",") + ")"
 	case *sqlparser.Literal:
 		if e.Type == sqlparser.StrVal {
