@@ -145,6 +145,51 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 				}
 			}
 		}
+		// WKB functions require at least 1 argument. When called with 0 arguments,
+		// the Vitess parser returns a syntax error; intercept here to return the
+		// proper MySQL ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT error instead.
+		// The canonical function names (as used in MySQL error messages) are listed here.
+		for _, wkbFn := range []string{
+			"ST_GeomFromWKB", "ST_GeometryFromWKB",
+			"ST_PointFromWKB",
+			"ST_LineFromWKB", "ST_LineStringFromWKB",
+			"ST_PolyFromWKB", "ST_PolygonFromWKB",
+			"ST_MPointFromWKB", "ST_MultiPointFromWKB",
+			"ST_MLineFromWKB", "ST_MultiLineStringFromWKB",
+			"ST_MPolyFromWKB", "ST_MultiPolygonFromWKB",
+			"ST_GeomCollFromWKB", "ST_GeometryCollectionFromWKB",
+		} {
+			fnUpper := strings.ToUpper(wkbFn)
+			if strings.Contains(compact, fnUpper+"(") {
+				idx := strings.Index(compact, fnUpper+"(")
+				// Only match if not preceded by '.' (schema-qualified)
+				if idx >= 0 && (idx == 0 || compact[idx-1] != '.') {
+					inner := compact[idx+len(fnUpper)+1:]
+					if closeIdx := strings.Index(inner, ")"); closeIdx >= 0 {
+						args := strings.TrimSpace(inner[:closeIdx])
+						if args == "" {
+							return "", nil, mysqlError(1582, "42000", fmt.Sprintf("Incorrect parameter count in the call to native function '%s'", wkbFn))
+						}
+					}
+				}
+			}
+		}
+		// ST_ASWKB and ST_ASBINARY accept at most 2 arguments.
+		// When called with 3+ arguments, Vitess returns a parse error; intercept here.
+		for _, asFn := range []struct{ upper, canonical string }{
+			{"ST_ASWKB", "ST_ASWKB"},
+			{"ST_ASBINARY", "ST_ASBINARY"},
+		} {
+			if strings.Contains(upper, asFn.upper+"(") {
+				// Use the original trimmed query for paren-matching to handle nested calls.
+				fnArgs := extractFunctionArgList(trimmed, asFn.upper)
+				if fnArgs != "" {
+					if n := countTopLevelSQLArgs(fnArgs); n > 2 {
+						return "", nil, mysqlError(1582, "42000", fmt.Sprintf("Incorrect parameter count in the call to native function '%s'", asFn.canonical))
+					}
+				}
+			}
+		}
 		// ps_current_thread_id() takes no arguments
 		if strings.Contains(compact, "PS_CURRENT_THREAD_ID(") {
 			idx := strings.Index(compact, "PS_CURRENT_THREAD_ID(")
@@ -1066,6 +1111,52 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	}
 
 	return query, nil, nil
+}
+
+// extractFunctionArgList finds the first occurrence of fnName( in query (case-insensitive)
+// and returns the string between the opening and matching closing parentheses.
+// Returns "" if not found. fnName should be uppercase.
+func extractFunctionArgList(query string, fnName string) string {
+	upper := strings.ToUpper(query)
+	search := strings.ToUpper(fnName) + "("
+	idx := strings.Index(upper, search)
+	if idx < 0 {
+		return ""
+	}
+	start := idx + len(search)
+	depth := 1
+	i := start
+	n := len(query)
+	inStr := byte(0)
+	for i < n && depth > 0 {
+		c := query[i]
+		if inStr != 0 {
+			if c == '\\' {
+				i += 2
+				continue
+			}
+			if c == inStr {
+				inStr = 0
+			}
+			i++
+			continue
+		}
+		if c == '\'' || c == '"' || c == '`' {
+			inStr = c
+			i++
+			continue
+		}
+		if c == '(' {
+			depth++
+		} else if c == ')' {
+			depth--
+		}
+		i++
+	}
+	if depth != 0 {
+		return ""
+	}
+	return query[start : i-1]
 }
 
 // stripStringLiterals replaces string literal contents with 'X' placeholders

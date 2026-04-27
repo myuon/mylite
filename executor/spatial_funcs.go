@@ -2,6 +2,7 @@ package executor
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -1546,6 +1547,502 @@ func WktToWKB(wkt string) []byte {
 	return wktToWKB(wkt)
 }
 
+// wkbToWKTWithSwap converts WKB bytes to WKT, optionally swapping X and Y coordinates.
+// This is used for WKB functions that support axis-order option (axis-order=lat-long swaps coords).
+func wkbToWKTWithSwap(data []byte, needsSwap bool) string {
+	if !needsSwap {
+		return wkbToWKT(data)
+	}
+	if len(data) == 0 {
+		return ""
+	}
+	// Handle MySQL-internal format [srid:4 LE][WKB] or pure ISO WKB.
+	if data[0] != 0x00 && data[0] != 0x01 {
+		// SRID-prefixed
+		if len(data) < 9 {
+			return ""
+		}
+		offset := 4
+		wkt, ok := parseWKBSwap(data, &offset, true)
+		if !ok {
+			return ""
+		}
+		return wkt
+	}
+	// Try pure WKB first
+	offset0 := 0
+	wkt0, ok0 := parseWKBSwap(data, &offset0, true)
+	if ok0 && offset0 == len(data) {
+		return wkt0
+	}
+	// Try as SRID-prefixed
+	if len(data) >= 9 && (data[4] == 0x00 || data[4] == 0x01) {
+		offset4 := 4
+		wkt4, ok4 := parseWKBSwap(data, &offset4, true)
+		if ok4 {
+			return wkt4
+		}
+	}
+	if ok0 {
+		return wkt0
+	}
+	return ""
+}
+
+// swapXYString swaps X and Y coordinates in a WKT geometry string.
+// Used for axis-order=lat-long handling in WKB functions.
+func swapXYString(wkt string) string {
+	plain := geomStripSRID(strings.TrimSpace(wkt))
+	upper := strings.ToUpper(plain)
+	switch {
+	case strings.HasPrefix(upper, "POINT"):
+		coords := parseSpatialPointCoords(plain)
+		if coords != nil {
+			return fmt.Sprintf("POINT(%s %s)", formatSpatialFloat(coords[1]), formatSpatialFloat(coords[0]))
+		}
+	case strings.HasPrefix(upper, "LINESTRING"):
+		pts := parseLineStringPoints(plain)
+		if pts != nil {
+			var parts []string
+			for _, p := range pts {
+				parts = append(parts, fmt.Sprintf("%s %s", formatSpatialFloat(p[1]), formatSpatialFloat(p[0])))
+			}
+			return "LINESTRING(" + strings.Join(parts, ",") + ")"
+		}
+	case strings.HasPrefix(upper, "POLYGON"):
+		rings := parsePolygonRings(plain)
+		if rings != nil {
+			var ringParts []string
+			for _, ring := range rings {
+				var pts []string
+				for _, p := range ring {
+					pts = append(pts, fmt.Sprintf("%s %s", formatSpatialFloat(p[1]), formatSpatialFloat(p[0])))
+				}
+				ringParts = append(ringParts, "("+strings.Join(pts, ",")+")")
+			}
+			return "POLYGON(" + strings.Join(ringParts, ",") + ")"
+		}
+	}
+	return wkt
+}
+
+// swapAllXYInWKT swaps all X and Y coordinates in a WKT geometry string.
+// This handles all geometry types (POINT, LINESTRING, POLYGON, MULTI*, GEOMETRYCOLLECTION).
+// Each coordinate pair "X Y" is replaced with "Y X".
+func swapAllXYInWKT(wkt string) string {
+	// Strategy: find all coordinate pairs in the WKT and swap them.
+	// Coordinate pairs appear as "N1 N2" where N1 and N2 are floating-point numbers.
+	// They appear within parentheses, separated by commas or adjacent to other parens.
+	// We scan the string and whenever we find a number, check if it's followed by
+	// a space and another number (forming a coord pair), then swap them.
+	plain := geomStripSRID(strings.TrimSpace(wkt))
+	if len(plain) == 0 {
+		return wkt
+	}
+	// Find the geometry type prefix (letters before first '(')
+	parenIdx := strings.IndexByte(plain, '(')
+	if parenIdx < 0 {
+		return plain
+	}
+	prefix := plain[:parenIdx]
+	body := plain[parenIdx:]
+	// Swap coordinate pairs in the body
+	result := swapCoordPairsInBody(body)
+	return prefix + result
+}
+
+// swapCoordPairsInBody scans a WKT body (starting with '(' ) and swaps all coordinate pairs.
+func swapCoordPairsInBody(s string) string {
+	var buf strings.Builder
+	i := 0
+	n := len(s)
+	for i < n {
+		ch := s[i]
+		if ch == '(' || ch == ')' || ch == ',' {
+			buf.WriteByte(ch)
+			i++
+			continue
+		}
+		if ch == ' ' {
+			// Skip spaces between tokens (but not within coord pairs - we handle those below)
+			buf.WriteByte(ch)
+			i++
+			continue
+		}
+		// Try to parse a floating-point number
+		if ch == '-' || (ch >= '0' && ch <= '9') {
+			x, xLen := parseFloatFromWKT(s[i:])
+			if xLen > 0 {
+				j := i + xLen
+				// Check for a space followed by another number (coord pair)
+				if j < n && s[j] == ' ' {
+					k := j + 1
+					if k < n && (s[k] == '-' || (s[k] >= '0' && s[k] <= '9')) {
+						y, yLen := parseFloatFromWKT(s[k:])
+						if yLen > 0 {
+							// Write swapped pair: Y X
+							buf.WriteString(formatSpatialFloat(y))
+							buf.WriteByte(' ')
+							buf.WriteString(formatSpatialFloat(x))
+							i = k + yLen
+							continue
+						}
+					}
+				}
+				// Just a single number (shouldn't happen in well-formed WKT, but handle gracefully)
+				buf.WriteString(s[i : i+xLen])
+				i += xLen
+				continue
+			}
+		}
+		buf.WriteByte(ch)
+		i++
+	}
+	return buf.String()
+}
+
+// wkbFuncName returns the canonical MySQL function name for a GeomFromWkbType.
+func wkbFuncName(t sqlparser.GeomFromWkbType) string {
+	switch t {
+	case sqlparser.GeometryFromWKB:
+		return "st_geomfromwkb"
+	case sqlparser.GeometryCollectionFromWKB:
+		return "st_geomcollfromwkb"
+	case sqlparser.PointFromWKB:
+		return "st_pointfromwkb"
+	case sqlparser.LineStringFromWKB:
+		return "st_linefromwkb"
+	case sqlparser.PolygonFromWKB:
+		return "st_polyfromwkb"
+	case sqlparser.MultiPointFromWKB:
+		return "st_mpointfromwkb"
+	case sqlparser.MultiPolygonFromWKB:
+		return "st_mpolyfromwkb"
+	case sqlparser.MultiLinestringFromWKB:
+		return "st_mlinefromwkb"
+	}
+	return "st_geomfromwkb"
+}
+
+// toSpatialOptionStr converts a value to a string suitable for use as a spatial function option.
+// For HexBytes (x'...' hex literals), the hex digits are decoded to actual binary bytes.
+// This allows null bytes and other binary content to be properly handled during option parsing.
+// For other types, behaves like toString.
+func toSpatialOptionStr(v interface{}) string {
+	if hb, ok := v.(HexBytes); ok {
+		// Decode hex digits to actual binary bytes.
+		decoded, err := hex.DecodeString(string(hb))
+		if err != nil {
+			// If decode fails, fall through to toString behavior.
+			return toString(v)
+		}
+		return string(decoded)
+	}
+	return toString(v)
+}
+
+// truncateAtNull returns the string up to (but not including) the first null byte.
+// Used for display in error messages where MySQL uses C-string display behavior.
+func truncateAtNull(s string) string {
+	if idx := strings.IndexByte(s, 0); idx >= 0 {
+		return s[:idx]
+	}
+	return s
+}
+
+// parseWKBAxisOrderOption parses the axis-order option string from WKB functions.
+// Returns (needsSwap bool, err error).
+// The option string format is a comma-separated list of "key=value" pairs (whitespace trimmed).
+// MySQL supports only one option key: "axis-order" with values "long-lat", "lat-long", "srid-defined".
+// An empty or whitespace-only option string is valid and means "no axis-order option" (no swap).
+func parseWKBAxisOrderOption(optStr string, sridIsLatLong bool, fnName string) (bool, error) {
+	trimmed := strings.TrimSpace(optStr)
+	// Empty or whitespace-only → valid, no axis-order (default long-lat, no swap)
+	if trimmed == "" {
+		return false, nil
+	}
+	// Check for invalid start character '='
+	if strings.HasPrefix(trimmed, "=") {
+		return false, mysqlError(3516, "22023", fmt.Sprintf("The options argument in function %s starts with the invalid character '='.", fnName))
+	}
+	// Check for double-equals '==' (invalid character sequence)
+	if strings.Contains(trimmed, "==") {
+		return false, mysqlError(3516, "22023", fmt.Sprintf("The options argument in function %s contains the invalid character sequence '=='.", fnName))
+	}
+	// Check for invalid end character '='
+	if strings.HasSuffix(trimmed, "=") {
+		return false, mysqlError(3516, "22023", fmt.Sprintf("The options argument in function %s ends with the invalid character '='.", fnName))
+	}
+	// Split by comma for multiple key-value pairs
+	parts := strings.Split(trimmed, ",")
+	axisOrderSeen := false
+	needsSwap := false
+	for _, part := range parts {
+		kv := strings.TrimSpace(part)
+		if kv == "" {
+			continue
+		}
+		// Must contain exactly one '=' to be a valid key=value pair
+		eqIdx := strings.Index(kv, "=")
+		if eqIdx < 0 {
+			return false, mysqlError(3516, "22023", fmt.Sprintf("The string '%s' is not a valid key = value pair in function %s.", truncateAtNull(kv), fnName))
+		}
+		key := strings.TrimSpace(kv[:eqIdx])
+		value := strings.TrimSpace(kv[eqIdx+1:])
+		keyLower := strings.ToLower(key)
+		// Validate key name
+		if keyLower != "axis-order" {
+			return false, mysqlError(3516, "22023", fmt.Sprintf("Invalid option key '%s' in function %s.", key, fnName))
+		}
+		// Check for duplicate axis-order key
+		if axisOrderSeen {
+			// MySQL uses "funtion" (typo) for duplicate key error
+			return false, mysqlError(3516, "22023", fmt.Sprintf("Duplicate option key 'axis-order' in funtion '%s'.", fnName))
+		}
+		axisOrderSeen = true
+		// Validate value and compute needsSwap.
+		// The formula is: needsSwap = axisIsLatLong XOR sridIsLatLong
+		// This accounts for both the WKB input axis-order and the SRS's native output axis-order.
+		// For geographic SRS with lat-long ordering, the output is in (lat, long) order,
+		// so if the WKB is also in lat-long order, no swap is needed (XOR = false).
+		valueLower := strings.ToLower(value)
+		switch valueLower {
+		case "long-lat":
+			// axisIsLatLong = false; needsSwap = false XOR sridIsLatLong = sridIsLatLong
+			needsSwap = sridIsLatLong
+		case "lat-long":
+			// axisIsLatLong = true; needsSwap = true XOR sridIsLatLong = !sridIsLatLong
+			needsSwap = !sridIsLatLong
+		case "srid-defined":
+			// axisIsLatLong = sridIsLatLong; needsSwap = sridIsLatLong XOR sridIsLatLong = false
+			needsSwap = false
+		default:
+			return false, mysqlError(3516, "22023", fmt.Sprintf("Invalid value '%s' for option 'axis-order' in function '%s'.", value, fnName))
+		}
+	}
+	return needsSwap, nil
+}
+
+// axisOrderEnum represents the axis-order option value.
+type axisOrderEnum int8
+
+const (
+	axisOrderLongLat    axisOrderEnum = 0 // long-lat (default/LONG-LAT)
+	axisOrderLatLong    axisOrderEnum = 1 // lat-long
+	axisOrderSridDefined axisOrderEnum = 2 // srid-defined
+)
+
+// parseAxisOrderStr parses an axis-order option string using the same format validation
+// as parseWKBAxisOrderOption but returns an axisOrderEnum instead of a bool.
+// This is used for ST_ASWKB which has different swap semantics.
+// An empty or whitespace-only string returns (axisOrderSridDefined, nil) (default behavior).
+func parseAxisOrderStr(optStr string, fnName string) (axisOrderEnum, error) {
+	trimmed := strings.TrimSpace(optStr)
+	if trimmed == "" {
+		return axisOrderSridDefined, nil
+	}
+	// Check for invalid leading/trailing/double characters at the full-string level.
+	if strings.HasPrefix(trimmed, "=") {
+		return 0, mysqlError(3516, "22023", fmt.Sprintf("The options argument in function %s starts with the invalid character '='.", fnName))
+	}
+	if strings.Contains(trimmed, "==") {
+		return 0, mysqlError(3516, "22023", fmt.Sprintf("The options argument in function %s contains the invalid character sequence '=='.", fnName))
+	}
+	if strings.HasSuffix(trimmed, "=") {
+		return 0, mysqlError(3516, "22023", fmt.Sprintf("The options argument in function %s ends with the invalid character '='.", fnName))
+	}
+	if strings.HasSuffix(trimmed, ",") {
+		return 0, mysqlError(3516, "22023", fmt.Sprintf("The options argument in function %s ends with the invalid character ','.", fnName))
+	}
+	if strings.HasPrefix(trimmed, ",") {
+		return 0, mysqlError(3516, "22023", fmt.Sprintf("The options argument in function %s starts with the invalid character ','.", fnName))
+	}
+	if strings.Contains(trimmed, ",,") {
+		return 0, mysqlError(3516, "22023", fmt.Sprintf("The options argument in function %s contains the invalid character sequence ',,'.", fnName))
+	}
+	parts := strings.Split(trimmed, ",")
+	// Pass 1: structural validation of each segment (leading/trailing '=', no '=' at all,
+	// space in value, embedded '=' in value). These errors take priority over semantic errors.
+	for _, part := range parts {
+		kv := strings.TrimSpace(part)
+		if kv == "" {
+			continue
+		}
+		if strings.HasPrefix(kv, "=") {
+			return 0, mysqlError(3516, "22023", fmt.Sprintf("The options argument in function %s starts with the invalid character '='.", fnName))
+		}
+		if strings.HasSuffix(kv, "=") {
+			return 0, mysqlError(3516, "22023", fmt.Sprintf("The options argument in function %s ends with the invalid character '='.", fnName))
+		}
+		eqIdx := strings.Index(kv, "=")
+		if eqIdx < 0 {
+			return 0, mysqlError(3516, "22023", fmt.Sprintf("The string '%s' is not a valid key = value pair in function %s.", truncateAtNull(kv), fnName))
+		}
+		value := strings.TrimSpace(kv[eqIdx+1:])
+		// If the value contains spaces or embedded '=', the segment is not a valid key=value pair.
+		if strings.ContainsAny(value, " \t") || strings.Contains(value, "=") {
+			return 0, mysqlError(3516, "22023", fmt.Sprintf("The string '%s' is not a valid key = value pair in function %s.", truncateAtNull(kv), fnName))
+		}
+	}
+	// Pass 2: semantic validation (key name, value, duplicates).
+	axisOrderSeen := false
+	result := axisOrderSridDefined
+	for _, part := range parts {
+		kv := strings.TrimSpace(part)
+		if kv == "" {
+			continue
+		}
+		eqIdx := strings.Index(kv, "=")
+		key := strings.TrimSpace(kv[:eqIdx])
+		value := strings.TrimSpace(kv[eqIdx+1:])
+		keyLower := strings.ToLower(key)
+		if keyLower != "axis-order" {
+			return 0, mysqlError(3516, "22023", fmt.Sprintf("Invalid option key '%s' in function %s.", key, fnName))
+		}
+		if axisOrderSeen {
+			return 0, mysqlError(3516, "22023", fmt.Sprintf("Duplicate option key 'axis-order' in funtion '%s'.", fnName))
+		}
+		axisOrderSeen = true
+		valueLower := strings.ToLower(value)
+		switch valueLower {
+		case "long-lat":
+			result = axisOrderLongLat
+		case "lat-long":
+			result = axisOrderLatLong
+		case "srid-defined":
+			result = axisOrderSridDefined
+		default:
+			return 0, mysqlError(3516, "22023", fmt.Sprintf("Invalid value '%s' for option 'axis-order' in function '%s'.", value, fnName))
+		}
+	}
+	return result, nil
+}
+
+// validateWKTCoordsForGeographicSRS checks that all coordinate pairs in a WKT geometry
+// are within valid geographic bounds for the given SRS.
+// For LONG-LAT SRS: X is longitude in [-180, 180], Y is latitude in [-90, 90].
+// For LAT-LONG SRS: X is latitude in [-90, 90], Y is longitude in [-180, 180].
+// Returns a MySQL error if any coordinate is out of range.
+func validateWKTCoordsForGeographicSRS(wkt string, isLatLongSRS bool, fnName string) error {
+	// Parse all coordinate pairs from the WKT.
+	// Each coordinate pair is "X Y" where X and Y are float64 numbers.
+	// We scan through the WKT looking for number pairs inside parentheses.
+	plain := strings.TrimSpace(geomStripSRID(wkt))
+	// Remove geometry type prefix (e.g., "POINT", "LINESTRING", etc.)
+	// Focus on extracting all (x y) pairs.
+	return validateCoordPairsInWKT(plain, isLatLongSRS, fnName)
+}
+
+// validateCoordPairsInWKT recursively validates coordinate pairs in a WKT geometry string.
+func validateCoordPairsInWKT(wkt string, isLatLongSRS bool, fnName string) error {
+	// Find all number pairs separated by spaces within parentheses.
+	// Strategy: scan through the string looking for digits/minus signs followed by space + digit/minus.
+	// Simple approach: find the innermost parenthetical content and scan for coordinate pairs.
+	i := 0
+	n := len(wkt)
+	for i < n {
+		// Skip until we find a digit or minus sign that could start a coordinate
+		if wkt[i] == '(' || wkt[i] == ',' {
+			i++
+			continue
+		}
+		if wkt[i] == ')' {
+			i++
+			continue
+		}
+		// Try to read a coordinate pair: X Y
+		if wkt[i] == '-' || (wkt[i] >= '0' && wkt[i] <= '9') {
+			// Read first number (X)
+			x, xLen := parseFloatFromWKT(wkt[i:])
+			if xLen <= 0 {
+				i++
+				continue
+			}
+			j := i + xLen
+			// Skip spaces
+			for j < n && wkt[j] == ' ' {
+				j++
+			}
+			if j >= n {
+				break
+			}
+			// Read second number (Y)
+			if wkt[j] == '-' || (wkt[j] >= '0' && wkt[j] <= '9') {
+				y, yLen := parseFloatFromWKT(wkt[j:])
+				if yLen > 0 {
+					// Validate the coordinate pair
+					var lon, lat float64
+					if isLatLongSRS {
+						// X is latitude, Y is longitude
+						lat = x
+						lon = y
+					} else {
+						// X is longitude, Y is latitude (long-lat ordering)
+						lon = x
+						lat = y
+					}
+					if lon < -180.0 || lon > 180.0 {
+						return mysqlError(3617, "22S02", fmt.Sprintf(
+							"Longitude %f is out of range in function %s. It must be within (-180.000000, 180.000000].",
+							lon, fnName))
+					}
+					if lat < -90.0 || lat > 90.0 {
+						return mysqlError(3616, "22S03", fmt.Sprintf(
+							"Latitude %f is out of range in function %s. It must be within [-90.000000, 90.000000].",
+							lat, fnName))
+					}
+					i = j + yLen
+					continue
+				}
+			}
+			i = j
+			continue
+		}
+		i++
+	}
+	return nil
+}
+
+// parseFloatFromWKT parses a floating-point number from the start of s.
+// Returns the parsed float64 and the number of characters consumed.
+// Returns (0, 0) if no number could be parsed.
+func parseFloatFromWKT(s string) (float64, int) {
+	i := 0
+	n := len(s)
+	if i < n && s[i] == '-' {
+		i++
+	}
+	hasDigit := false
+	for i < n && s[i] >= '0' && s[i] <= '9' {
+		hasDigit = true
+		i++
+	}
+	if i < n && s[i] == '.' {
+		i++
+		for i < n && s[i] >= '0' && s[i] <= '9' {
+			hasDigit = true
+			i++
+		}
+	}
+	if i < n && (s[i] == 'e' || s[i] == 'E') {
+		i++
+		if i < n && (s[i] == '+' || s[i] == '-') {
+			i++
+		}
+		for i < n && s[i] >= '0' && s[i] <= '9' {
+			i++
+		}
+	}
+	if !hasDigit {
+		return 0, 0
+	}
+	f, err := strconv.ParseFloat(s[:i], 64)
+	if err != nil {
+		return 0, 0
+	}
+	return f, i
+}
+
 // wktToWKB converts a WKT geometry string (e.g. "POINT(1 2)") to MySQL's internal
 // binary geometry format: 4-byte SRID (little-endian) + WKB (ISO).
 // Returns nil if parsing fails. Handles EWKT SRID prefix.
@@ -2213,6 +2710,73 @@ func wktToSimpleFeature(wkt string) (sfgeom.Geometry, error) {
 	plain := geomStripSRID(strings.TrimSpace(wkt))
 	plain = normalizeWKTForSF(plain)
 	return sfgeom.UnmarshalWKT(plain, sfgeom.NoValidate{})
+}
+
+// wktSingleTypeEmptyRe matches single-geometry types followed by empty parens:
+// POINT(), LINESTRING(), POLYGON() — these are invalid in MySQL.
+var wktSingleTypeEmptyRe = regexp.MustCompile(`(?i)^(POINT|LINESTRING|POLYGON)\s*\(\s*\)$`)
+
+// wktMultiTypeEmptyRe matches multi-geometry types followed by empty parens:
+// MULTIPOINT(), MULTILINESTRING(), MULTIPOLYGON(), GEOMETRYCOLLECTION(), GEOMCOLLECTION() — valid empty geometries.
+var wktMultiTypeEmptyRe = regexp.MustCompile(`(?i)(MULTIPOINT|MULTILINESTRING|MULTIPOLYGON|GEOMETRYCOLLECTION|GEOMCOLLECTION)\s*\(\s*\)`)
+
+// normalizeWKTForSFMultiOnly converts empty multi-type geometries (TYPE() -> TYPE EMPTY)
+// but does NOT convert single-type empty geometries (POINT(), LINESTRING(), POLYGON()).
+// This is used for WKT validation where POINT() should be rejected as invalid.
+func normalizeWKTForSFMultiOnly(wkt string) string {
+	prev := ""
+	for prev != wkt {
+		prev = wkt
+		wkt = wktMultiTypeEmptyRe.ReplaceAllStringFunc(wkt, func(m string) string {
+			loc := wktMultiTypeEmptyRe.FindStringSubmatchIndex(m)
+			typeName := m[loc[2]:loc[3]]
+			return strings.ToUpper(typeName) + " EMPTY"
+		})
+	}
+	return wkt
+}
+
+// isValidWKTSyntax validates whether a WKT string is syntactically valid according
+// to MySQL's rules for ST_GeomFromText. Returns false for invalid WKT such as:
+//   - POINT() (no coordinates)
+//   - LINESTRING with non-numeric coordinates
+//   - Unbalanced parentheses
+//   - MULTIPOINT with wrong number of coordinates per point
+//
+// Valid empty multi-geometries (GEOMETRYCOLLECTION(), MULTIPOINT(), etc.) return true.
+func isValidWKTSyntax(wkt string) bool {
+	plain := geomStripSRID(strings.TrimSpace(wkt))
+	// Normalize MULTIPOINT notation for simplefeatures
+	plain = normalizeWKT(plain)
+	upper := strings.ToUpper(strings.TrimSpace(plain))
+	// Reject single-type empty geometries: POINT(), LINESTRING(), POLYGON()
+	if wktSingleTypeEmptyRe.MatchString(plain) {
+		return false
+	}
+	// Handle GEOMCOLLECTION alias
+	if strings.HasPrefix(upper, "GEOMCOLLECTION") {
+		plain = "GEOMETRYCOLLECTION" + plain[14:]
+		upper = strings.ToUpper(plain)
+	}
+	// Check balanced parentheses
+	depth := 0
+	for _, ch := range plain {
+		if ch == '(' {
+			depth++
+		} else if ch == ')' {
+			depth--
+			if depth < 0 {
+				return false
+			}
+		}
+	}
+	if depth != 0 {
+		return false
+	}
+	// Convert multi-type empty geometries to "TYPE EMPTY" for simplefeatures
+	normalized := normalizeWKTForSFMultiOnly(plain)
+	_, err := sfgeom.UnmarshalWKT(normalized, sfgeom.NoValidate{})
+	return err == nil
 }
 
 // safeSFOp calls fn() and recovers from any panic, returning it as an error.
