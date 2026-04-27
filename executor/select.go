@@ -7945,6 +7945,12 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 		return nil, err
 	}
 
+	// Check if the target is a non-updatable view before attempting file I/O.
+	// MySQL validates the target table first (before reading the file).
+	if _, isView, _, viewErr := e.resolveViewToBaseTable(opts.tableName); viewErr != nil && isView {
+		return nil, mysqlError(1288, "HY000", fmt.Sprintf("The target table %s of the LOAD is not updatable", opts.tableName))
+	}
+
 	// Enforce secure_file_priv before attempting to open the file.
 	if !opts.isLocal {
 		if err := e.checkSecureFilePriv(opts.filePath); err != nil {
@@ -8029,6 +8035,11 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 		if decoded, err := decodeEUCJP(data); err == nil {
 			data = decoded
 		}
+	case "gb18030", "gbk", "gb2312":
+		// GB18030/GBK: multi-byte charset where the second byte of a multi-byte
+		// sequence can be 0x5C (backslash). Store raw bytes so HEX() reflects the
+		// gb18030 encoding. Escape processing in processLoadDataField is byte-level
+		// and correctly handles the leading escape before a multi-byte sequence.
 	case "latin1", "utf8", "utf8mb3", "utf8mb4", "binary", "ascii":
 		// latin1 is a superset of ASCII; Go strings handle bytes directly.
 		// utf8/utf8mb4 is Go's native encoding. No conversion needed.
@@ -8112,6 +8123,17 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 	tableColNames := make([]string, len(tbl.Def.Columns))
 	for i, col := range tbl.Def.Columns {
 		tableColNames[i] = col.Name
+	}
+
+	// ER_BLOBS_AND_NO_TERMINATED (1162): if the table has a BLOB/TEXT column and
+	// FIELDS TERMINATED BY is empty (fixed-row mode), MySQL rejects the statement.
+	if opts.fieldsTermBy == "" {
+		for _, col := range tbl.Def.Columns {
+			upperColType := strings.ToUpper(col.Type)
+			if strings.Contains(upperColType, "BLOB") || strings.Contains(upperColType, "TEXT") {
+				return nil, mysqlError(1162, "42000", "You can't use fixed rowlength with BLOBs; please use 'fields terminated by'")
+			}
+		}
 	}
 
 	var pkCols []string
