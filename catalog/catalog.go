@@ -147,12 +147,15 @@ type TriggerDef struct {
 
 // ProcedureDef represents a stored procedure definition.
 type ProcedureDef struct {
-	Name        string
-	Params      []ProcParam
-	Body        []string // SQL statements in the procedure body
-	BodyText    string   // original body text (begin...end or full body) for information_schema
-	OriginalSQL string   // original CREATE PROCEDURE statement
-	SqlMode     string   // sql_mode at procedure creation time
+	Name          string
+	Params        []ProcParam
+	Body          []string // SQL statements in the procedure body
+	BodyText      string   // original body text (begin...end or full body) for information_schema
+	SecurityType  string   // "DEFINER" or "INVOKER" (default: "DEFINER")
+	Comment       string   // optional COMMENT string
+	SqlDataAccess string   // "CONTAINS SQL", "NO SQL", "READS SQL DATA", "MODIFIES SQL DATA"
+	OriginalSQL   string   // original CREATE PROCEDURE statement
+	SqlMode       string   // sql_mode at procedure creation time
 }
 
 // ProcParam represents a parameter in a stored procedure.
@@ -170,6 +173,9 @@ type FunctionDef struct {
 	Body          []string // SQL statements in the function body
 	BodyText      string   // original body text for information_schema
 	Deterministic bool     // true if declared DETERMINISTIC
+	SecurityType  string   // "DEFINER" or "INVOKER" (default: "DEFINER")
+	Comment       string   // optional COMMENT string
+	SqlDataAccess string   // "CONTAINS SQL", "NO SQL", "READS SQL DATA", "MODIFIES SQL DATA"
 	OriginalSQL   string   // original CREATE FUNCTION statement
 	SqlMode       string   // sql_mode at function creation time
 }

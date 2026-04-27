@@ -4945,6 +4945,50 @@ func (e *Executor) routineDefinitionText(stmts []string, bodyText string) string
 	return strings.Join(stmts, ";\n")
 }
 
+// normalizeDTDIdentifier converts a function return type string to the canonical
+// DTD_IDENTIFIER format as shown by MySQL INFORMATION_SCHEMA.ROUTINES.
+// For example, MySQL always reports YEAR as "year(4)".
+func normalizeDTDIdentifier(returnType string) string {
+	lower := strings.ToLower(strings.TrimSpace(returnType))
+	switch lower {
+	case "year":
+		return "year(4)"
+	}
+	return lower
+}
+
+// procSecurityTypeVal returns the SECURITY_TYPE for a ProcedureDef.
+func procSecurityTypeVal(p *catalogPkg.ProcedureDef) string {
+	if p.SecurityType != "" {
+		return p.SecurityType
+	}
+	return "DEFINER"
+}
+
+// procSqlDataAccessVal returns the SQL_DATA_ACCESS for a ProcedureDef.
+func procSqlDataAccessVal(p *catalogPkg.ProcedureDef) string {
+	if p.SqlDataAccess != "" {
+		return p.SqlDataAccess
+	}
+	return "CONTAINS SQL"
+}
+
+// funcSecurityType returns the SECURITY_TYPE for a FunctionDef.
+func funcSecurityType(f *catalogPkg.FunctionDef) string {
+	if f.SecurityType != "" {
+		return f.SecurityType
+	}
+	return "DEFINER"
+}
+
+// funcSqlDataAccess returns the SQL_DATA_ACCESS for a FunctionDef.
+func funcSqlDataAccess(f *catalogPkg.FunctionDef) string {
+	if f.SqlDataAccess != "" {
+		return f.SqlDataAccess
+	}
+	return "CONTAINS SQL"
+}
+
 // infoSchemaRoutines returns rows for INFORMATION_SCHEMA.ROUTINES.
 func (e *Executor) infoSchemaRoutines() []storage.Row {
 	var rows []storage.Row
@@ -4988,13 +5032,13 @@ func (e *Executor) infoSchemaRoutines() []storage.Row {
 					"EXTERNAL_LANGUAGE":         "SQL",
 					"PARAMETER_STYLE":           "SQL",
 					"IS_DETERMINISTIC":          "NO",
-					"SQL_DATA_ACCESS":           "CONTAINS SQL",
+					"SQL_DATA_ACCESS":           procSqlDataAccessVal(p),
 					"SQL_PATH":                  nil,
-					"SECURITY_TYPE":             "DEFINER",
+					"SECURITY_TYPE":             procSecurityTypeVal(p),
 					"CREATED":                   "2024-01-01 00:00:00",
 					"LAST_ALTERED":              "2024-01-01 00:00:00",
 					"SQL_MODE":                  "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
-					"ROUTINE_COMMENT":           "",
+					"ROUTINE_COMMENT":           p.Comment,
 					"DEFINER":                   "root@localhost",
 					"CHARACTER_SET_CLIENT":      "utf8mb4",
 					"COLLATION_CONNECTION":      "utf8mb4_general_ci",
@@ -5021,7 +5065,7 @@ func (e *Executor) infoSchemaRoutines() []storage.Row {
 					"ROUTINE_SCHEMA":            dbName,
 					"ROUTINE_NAME":              f.Name,
 					"ROUTINE_TYPE":              "FUNCTION",
-					"DATA_TYPE":                 f.ReturnType,
+					"DATA_TYPE":                 strings.ToLower(strings.TrimSpace(f.ReturnType)),
 					"CHARACTER_MAXIMUM_LENGTH":  nil,
 					"CHARACTER_OCTET_LENGTH":    nil,
 					"NUMERIC_PRECISION":         nil,
@@ -5029,20 +5073,20 @@ func (e *Executor) infoSchemaRoutines() []storage.Row {
 					"DATETIME_PRECISION":        nil,
 					"CHARACTER_SET_NAME":        nil,
 					"COLLATION_NAME":            nil,
-					"DTD_IDENTIFIER":            f.ReturnType,
+					"DTD_IDENTIFIER":            normalizeDTDIdentifier(f.ReturnType),
 					"ROUTINE_BODY":              "SQL",
 					"ROUTINE_DEFINITION":        e.routineDefinitionText(f.Body, f.BodyText),
 					"EXTERNAL_NAME":             nil,
 					"EXTERNAL_LANGUAGE":         "SQL",
 					"PARAMETER_STYLE":           "SQL",
 					"IS_DETERMINISTIC":          det,
-					"SQL_DATA_ACCESS":           "CONTAINS SQL",
+					"SQL_DATA_ACCESS":           funcSqlDataAccess(f),
 					"SQL_PATH":                  nil,
-					"SECURITY_TYPE":             "DEFINER",
+					"SECURITY_TYPE":             funcSecurityType(f),
 					"CREATED":                   "2024-01-01 00:00:00",
 					"LAST_ALTERED":              "2024-01-01 00:00:00",
 					"SQL_MODE":                  "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
-					"ROUTINE_COMMENT":           "",
+					"ROUTINE_COMMENT":           f.Comment,
 					"DEFINER":                   "root@localhost",
 					"CHARACTER_SET_CLIENT":      "utf8mb4",
 					"COLLATION_CONNECTION":      "utf8mb4_general_ci",

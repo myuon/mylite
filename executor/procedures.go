@@ -1058,21 +1058,100 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 		return nil, mysqlError(1304, "42000", fmt.Sprintf("PROCEDURE %s already exists", procName))
 	}
 
+	// Extract characteristics (SQL SECURITY, COMMENT, etc.) from the text before the body.
+	procSecurityType := "DEFINER" // default
+	procComment := ""
+	procSqlDataAccess := "CONTAINS SQL" // default
+	{
+		upperAfterParams := strings.ToUpper(afterParams)
+		if strings.Contains(upperAfterParams, "SQL SECURITY INVOKER") {
+			procSecurityType = "INVOKER"
+		} else if strings.Contains(upperAfterParams, "SQL SECURITY DEFINER") {
+			procSecurityType = "DEFINER"
+		}
+		if strings.Contains(upperAfterParams, "NO SQL") {
+			procSqlDataAccess = "NO SQL"
+		} else if strings.Contains(upperAfterParams, "READS SQL DATA") {
+			procSqlDataAccess = "READS SQL DATA"
+		} else if strings.Contains(upperAfterParams, "MODIFIES SQL DATA") {
+			procSqlDataAccess = "MODIFIES SQL DATA"
+		} else if strings.Contains(upperAfterParams, "CONTAINS SQL") {
+			procSqlDataAccess = "CONTAINS SQL"
+		}
+		if commentIdx := strings.Index(upperAfterParams, "COMMENT "); commentIdx >= 0 {
+			commentRest := strings.TrimSpace(afterParams[commentIdx+len("COMMENT "):])
+			if len(commentRest) > 0 && (commentRest[0] == '\'' || commentRest[0] == '"') {
+				q := commentRest[0]
+				end := strings.IndexByte(commentRest[1:], q)
+				if end >= 0 {
+					procComment = commentRest[1 : end+1]
+				}
+			}
+		}
+	}
+
 	currentSqlMode := ""
 	if v, ok := e.getSysVar("sql_mode"); ok {
 		currentSqlMode = v
 	}
 	procDef := &catalog.ProcedureDef{
-		Name:        procName,
-		Params:      params,
-		Body:        bodyStmts,
-		BodyText:    bodyText,
-		OriginalSQL: query,
-		SqlMode:     currentSqlMode,
+		Name:          procName,
+		Params:        params,
+		Body:          bodyStmts,
+		BodyText:      bodyText,
+		SecurityType:  procSecurityType,
+		Comment:       procComment,
+		SqlDataAccess: procSqlDataAccess,
+		OriginalSQL:   query,
+		SqlMode:       currentSqlMode,
 	}
 	db.CreateProcedure(procDef)
 
 	return &Result{}, nil
+}
+
+// extractFuncReturnType extracts the SQL type from the text that follows the RETURNS keyword
+// in a CREATE FUNCTION statement. It stops at the first characteristic keyword or BEGIN/RETURN.
+// For example: "YEAR SQL SECURITY INVOKER BEGIN" -> "YEAR"
+//              "VARCHAR(100) DETERMINISTIC BEGIN" -> "VARCHAR(100)"
+//              "INT(11) UNSIGNED DETERMINISTIC BEGIN" -> "INT(11) UNSIGNED"
+func extractFuncReturnType(afterReturns string) string {
+	// characteristic keywords that terminate the return type
+	stopKeywords := []string{
+		"DETERMINISTIC", "NOT DETERMINISTIC",
+		"CONTAINS SQL", "NO SQL", "READS SQL DATA", "MODIFIES SQL DATA",
+		"SQL SECURITY DEFINER", "SQL SECURITY INVOKER",
+		"COMMENT ", // followed by a string literal
+		"BEGIN",
+		"RETURN ",
+	}
+
+	upper := strings.ToUpper(afterReturns)
+	minIdx := -1
+	for _, kw := range stopKeywords {
+		idx := strings.Index(upper, kw)
+		if idx < 0 {
+			continue
+		}
+		// Make sure it's a word boundary (preceded by whitespace, newline, or start)
+		if idx > 0 {
+			prev := afterReturns[idx-1]
+			if (prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') || (prev >= '0' && prev <= '9') || prev == '_' {
+				continue // not a word boundary
+			}
+		}
+		if minIdx < 0 || idx < minIdx {
+			minIdx = idx
+		}
+	}
+
+	var raw string
+	if minIdx < 0 {
+		raw = afterReturns
+	} else {
+		raw = afterReturns[:minIdx]
+	}
+	return strings.TrimSpace(raw)
 }
 
 // parseProcParams parses a procedure parameter list string.
@@ -2182,29 +2261,59 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 	returnType := ""
 	if returnsIdx >= 0 {
 		afterReturns := strings.TrimSpace(afterParams[returnsIdx+len("RETURNS "):])
-		// Return type ends at BEGIN/RETURN or at a characteristic keyword
-		beginIdx := strings.Index(strings.ToUpper(afterReturns), "BEGIN")
-		returnIdx := strings.Index(strings.ToUpper(afterReturns), "RETURN ")
-		endIdx := beginIdx
-		if endIdx < 0 || (returnIdx >= 0 && returnIdx < endIdx) {
-			endIdx = returnIdx
+		returnType = extractFuncReturnType(afterReturns)
+	}
+
+	// Parse characteristics (DETERMINISTIC, SQL SECURITY, COMMENT, etc.) from afterParams.
+	isDeterministic := false
+	securityType := "DEFINER" // default
+	routineComment := ""
+	sqlDataAccess := "CONTAINS SQL" // default
+	{
+		upperAfterParams := strings.ToUpper(afterParams)
+		if strings.Contains(upperAfterParams, "DETERMINISTIC") && !strings.Contains(upperAfterParams, "NOT DETERMINISTIC") {
+			isDeterministic = true
 		}
-		if endIdx < 0 {
-			endIdx = len(afterReturns)
+		if strings.Contains(upperAfterParams, "SQL SECURITY INVOKER") {
+			securityType = "INVOKER"
+		} else if strings.Contains(upperAfterParams, "SQL SECURITY DEFINER") {
+			securityType = "DEFINER"
 		}
-		returnType = strings.TrimSpace(afterReturns[:endIdx])
-		// Strip optional characteristics like CONTAINS SQL, NO SQL, READS SQL DATA, etc.
-		for _, kw := range []string{"DETERMINISTIC", "NOT DETERMINISTIC", "CONTAINS SQL", "NO SQL", "READS SQL DATA", "MODIFIES SQL DATA", "SQL SECURITY DEFINER", "SQL SECURITY INVOKER"} {
-			returnType = strings.TrimSuffix(strings.TrimSpace(returnType), kw)
+		if strings.Contains(upperAfterParams, "NO SQL") {
+			sqlDataAccess = "NO SQL"
+		} else if strings.Contains(upperAfterParams, "READS SQL DATA") {
+			sqlDataAccess = "READS SQL DATA"
+		} else if strings.Contains(upperAfterParams, "MODIFIES SQL DATA") {
+			sqlDataAccess = "MODIFIES SQL DATA"
+		} else if strings.Contains(upperAfterParams, "CONTAINS SQL") {
+			sqlDataAccess = "CONTAINS SQL"
 		}
-		returnType = strings.TrimSpace(returnType)
+		// Extract COMMENT 'text' characteristic
+		if commentIdx := strings.Index(upperAfterParams, "COMMENT "); commentIdx >= 0 {
+			commentRest := strings.TrimSpace(afterParams[commentIdx+len("COMMENT "):])
+			if len(commentRest) > 0 && (commentRest[0] == '\'' || commentRest[0] == '"') {
+				q := commentRest[0]
+				end := strings.IndexByte(commentRest[1:], q)
+				if end >= 0 {
+					routineComment = commentRest[1 : end+1]
+				}
+			}
+		}
 	}
 
 	// Extract body: BEGIN...END or single RETURN expression.
 	var bodyStmts []string
+	var bodyText string
 	var hasReturnInBody bool
 	beginIdx := strings.Index(strings.ToUpper(afterParams), "BEGIN")
 	if beginIdx >= 0 {
+		// bodyText for INFORMATION_SCHEMA: full BEGIN...END block
+		rawBodyBlock := strings.TrimSpace(afterParams[beginIdx:])
+		// Strip trailing semicolons
+		rawBodyBlock = strings.TrimRight(rawBodyBlock, ";")
+		rawBodyBlock = strings.TrimSpace(rawBodyBlock)
+		bodyText = rawBodyBlock
+
 		bodyStr := strings.TrimSpace(afterParams[beginIdx+len("BEGIN"):])
 		// Only apply the 1320 check when the body is complete (ends with END).
 		// If the body is truncated (e.g., sent without the closing END due to
@@ -2240,6 +2349,7 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 		returnExpr := strings.TrimSpace(afterParams[returnIdx:])
 		returnExpr = strings.TrimSuffix(returnExpr, ";")
 		bodyStmts = []string{returnExpr}
+		bodyText = returnExpr
 	}
 
 	// Validate routine body: cursor-for-non-SELECT (1064) and condition handler refs (1319).
@@ -2257,12 +2367,17 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 		funcSqlMode = v
 	}
 	funcDef := &catalog.FunctionDef{
-		Name:        funcName,
-		Params:      params,
-		ReturnType:  returnType,
-		Body:        bodyStmts,
-		OriginalSQL: query,
-		SqlMode:     funcSqlMode,
+		Name:          funcName,
+		Params:        params,
+		ReturnType:    returnType,
+		Body:          bodyStmts,
+		BodyText:      bodyText,
+		Deterministic: isDeterministic,
+		SecurityType:  securityType,
+		Comment:       routineComment,
+		SqlDataAccess: sqlDataAccess,
+		OriginalSQL:   query,
+		SqlMode:       funcSqlMode,
 	}
 	db.CreateFunction(funcDef)
 
