@@ -5468,6 +5468,13 @@ func normalizeOutput(s string) string {
 	// Normalize function name case: MySQL preserves original query case for function names,
 	// but vitess normalizes to lowercase. Lowercase all function names for comparison.
 	out = normalizeFunctionNameCase(out)
+	// Normalize DISTINCT keyword case in aggregate function contexts:
+	// MySQL outputs "COUNT(DISTINCT col)" but vitess produces "count(distinct col)".
+	// After normalizeFunctionNameCase, "COUNT(" is lowercased to "count(", but "DISTINCT"
+	// remains uppercase in MySQL output. Lowercase it for consistent comparison.
+	if strings.Contains(out, "(DISTINCT ") {
+		out = strings.ReplaceAll(out, "(DISTINCT ", "(distinct ")
+	}
 	// Normalize syntax error "near" text: MySQL shows error position starting from the
 	// actual error point, but our parser may show a different starting position.
 	// Normalize: strip the near '...' portion from syntax error messages.
