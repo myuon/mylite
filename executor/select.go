@@ -7626,7 +7626,8 @@ type loadDataOptions struct {
 }
 
 // reLoadData matches LOAD DATA [LOCAL] INFILE 'file' [REPLACE|IGNORE] INTO TABLE tablename ...
-var reLoadDataFile = regexp.MustCompile(`(?i)LOAD\s+DATA\s+(?:CONCURRENT\s+)?(?:LOW_PRIORITY\s+)?(?:(LOCAL)\s+)?INFILE\s+'([^']*)'`)
+// Accepts both single-quoted and double-quoted file paths.
+var reLoadDataFile = regexp.MustCompile(`(?i)LOAD\s+DATA\s+(?:CONCURRENT\s+)?(?:LOW_PRIORITY\s+)?(?:(LOCAL)\s+)?INFILE\s+(?:'([^']*)'|"([^"]*)")`)
 
 var reLoadDataTable = regexp.MustCompile(`(?i)INTO\s+TABLE\s+(\S+)`)
 
@@ -7717,7 +7718,12 @@ func parseLoadDataSQL(query string) (*loadDataOptions, error) {
 		return nil, fmt.Errorf("cannot parse LOAD DATA statement")
 	}
 	opts.isLocal = strings.ToUpper(m[1]) == "LOCAL"
-	opts.filePath = m[2]
+	// m[2] is the single-quoted path, m[3] is the double-quoted path.
+	if m[2] != "" {
+		opts.filePath = m[2]
+	} else {
+		opts.filePath = m[3]
+	}
 
 	mTbl := reLoadDataTable.FindStringSubmatch(query)
 	if mTbl == nil {
@@ -7897,10 +7903,53 @@ func findColumnListStart(query string) int {
 	return -1
 }
 
+// checkSecureFilePriv enforces the secure_file_priv restriction for LOAD DATA
+// INFILE and SELECT ... INTO OUTFILE. When secure_file_priv is set to a
+// non-empty path, the given filePath must start with that prefix. Returns a
+// MySQL error 1290 (ER_OPTION_PREVENTS_STATEMENT) when the check fails.
+// When secure_file_priv is empty (""), all paths are allowed (no restriction).
+func (e *Executor) checkSecureFilePriv(filePath string) error {
+	sfp := ""
+	if v, ok := e.getGlobalVar("secure_file_priv"); ok {
+		sfp = v
+	} else if v, ok := e.startupVars["secure_file_priv"]; ok {
+		sfp = v
+	}
+	if sfp == "" {
+		// Empty string means no restriction.
+		return nil
+	}
+	// Ensure the prefix ends with a path separator so partial directory names
+	// don't accidentally match (e.g. /tmp2 should not match prefix /tmp).
+	prefix := sfp
+	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+		prefix += string(filepath.Separator)
+	}
+	// Resolve the given file path to an absolute path for reliable comparison.
+	abs := filePath
+	if !filepath.IsAbs(abs) {
+		// Relative paths are never within the allowed prefix directory.
+		return mysqlError(1290, "HY000", "The MySQL server is running with the --secure-file-priv option so it cannot execute this statement")
+	}
+	// Clean the path to remove .., ., double slashes, etc.
+	abs = filepath.Clean(abs)
+	if !strings.HasPrefix(abs+string(filepath.Separator), prefix) && abs != filepath.Clean(sfp) {
+		return mysqlError(1290, "HY000", "The MySQL server is running with the --secure-file-priv option so it cannot execute this statement")
+	}
+	return nil
+}
+
 func (e *Executor) execLoadData(query string) (*Result, error) {
 	opts, err := parseLoadDataSQL(query)
 	if err != nil {
 		return nil, err
+	}
+
+	// Enforce secure_file_priv before attempting to open the file.
+	if !opts.isLocal {
+		if err := e.checkSecureFilePriv(opts.filePath); err != nil {
+			return nil, err
+		}
 	}
 
 	filePath := opts.filePath
@@ -8443,6 +8492,11 @@ func (e *Executor) execSelectIntoOutfile(into *sqlparser.SelectInto, colNames []
 	}
 	if !filepath.IsAbs(fileName) && e.DataDir != "" {
 		fileName = filepath.Join(e.DataDir, fileName)
+	}
+
+	// Enforce secure_file_priv before writing the file.
+	if err := e.checkSecureFilePriv(fileName); err != nil {
+		return nil, err
 	}
 
 	exportOpt := into.ExportOption
