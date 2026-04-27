@@ -1152,20 +1152,32 @@ func evalSpatialFunc(e *Executor, name string, exprs []sqlparser.Expr) (interfac
 			return nil, true, nil
 		}
 		return computeDistanceSphere(toString(a), toString(b)), true, nil
-	case "st_contains", "mbrcontains":
+	case "st_contains":
+		return evalSpatialRelationDE9IM(e, exprs, "contains")
+	case "mbrcontains":
 		return evalSpatialRelation(e, exprs, "contains")
-	case "st_within", "mbrwithin":
+	case "st_within":
+		return evalSpatialRelationDE9IM(e, exprs, "within")
+	case "mbrwithin":
 		return evalSpatialRelation(e, exprs, "within")
-	case "st_intersects", "mbrintersects":
+	case "st_intersects":
+		return evalSpatialRelationDE9IM(e, exprs, "intersects")
+	case "mbrintersects":
 		return evalSpatialRelation(e, exprs, "intersects")
-	case "st_disjoint", "mbrdisjoint":
+	case "st_disjoint":
+		return evalSpatialRelationDE9IM(e, exprs, "disjoint")
+	case "mbrdisjoint":
 		return evalSpatialRelation(e, exprs, "disjoint")
-	case "st_touches", "mbrtouches":
+	case "st_touches":
+		return evalSpatialRelationDE9IM(e, exprs, "touches")
+	case "mbrtouches":
 		return evalSpatialRelation(e, exprs, "touches")
-	case "st_overlaps", "mbroverlaps":
+	case "st_overlaps":
+		return evalSpatialRelationDE9IM(e, exprs, "overlaps")
+	case "mbroverlaps":
 		return evalSpatialRelation(e, exprs, "overlaps")
 	case "st_crosses":
-		return evalSpatialRelation(e, exprs, "crosses")
+		return evalSpatialRelationDE9IM(e, exprs, "crosses")
 	case "mbrequals":
 		return evalSpatialRelation(e, exprs, "equals")
 	case "mbrcovers":
@@ -1221,16 +1233,40 @@ func evalSpatialFunc(e *Executor, name string, exprs []sqlparser.Expr) (interfac
 		if err != nil {
 			return nil, true, err
 		}
-		return val, true, nil
+		if val == nil {
+			return nil, true, nil
+		}
+		wktStr := toString(val)
+		result, convexErr := evalSpatialConvexHull(wktStr)
+		if convexErr != nil {
+			return nil, true, convexErr
+		}
+		return result, true, nil
 	case "st_simplify":
-		if len(exprs) < 1 {
+		if len(exprs) < 2 {
 			return nil, true, nil
 		}
 		val, err := e.evalExpr(exprs[0])
 		if err != nil {
 			return nil, true, err
 		}
-		return val, true, nil
+		threshVal, err := e.evalExpr(exprs[1])
+		if err != nil {
+			return nil, true, err
+		}
+		if val == nil || threshVal == nil {
+			return nil, true, nil
+		}
+		wktStr := toString(val)
+		threshold, parseErr := strconv.ParseFloat(fmt.Sprintf("%v", threshVal), 64)
+		if parseErr != nil {
+			return nil, true, fmt.Errorf("st_simplify: invalid threshold: %v", threshVal)
+		}
+		result, simplifyErr := evalSpatialSimplify(wktStr, threshold)
+		if simplifyErr != nil {
+			return nil, true, simplifyErr
+		}
+		return result, true, nil
 	case "st_transform":
 		if len(exprs) < 1 {
 			return nil, true, nil
@@ -2343,4 +2379,204 @@ func sortMultiPointGeometry(g sfgeom.Geometry) sfgeom.Geometry {
 	default:
 		return g
 	}
+}
+
+// evalSpatialConvexHull computes the convex hull of the given WKT geometry
+// and returns the result as WKT, preserving any SRID from the input.
+func evalSpatialConvexHull(wkt string) (interface{}, error) {
+	srid := geomGetSRID(wkt)
+	g, err := wktToSimpleFeature(wkt)
+	if err != nil {
+		return nil, fmt.Errorf("st_convexhull: invalid geometry: %w", err)
+	}
+	hull := g.ConvexHull()
+	result := hull.AsText()
+	if srid != 0 {
+		result = geomSetSRID(result, srid)
+	}
+	return result, nil
+}
+
+// evalSpatialSimplify simplifies the given WKT geometry using the
+// Douglas-Peucker algorithm with the specified distance threshold,
+// preserving any SRID from the input.
+func evalSpatialSimplify(wkt string, threshold float64) (interface{}, error) {
+	srid := geomGetSRID(wkt)
+	g, err := wktToSimpleFeature(wkt)
+	if err != nil {
+		return nil, fmt.Errorf("st_simplify: invalid geometry: %w", err)
+	}
+	simplified, err := g.Simplify(threshold, sfgeom.NoValidate{})
+	if err != nil {
+		// Return the original geometry on simplification failure.
+		result := g.AsText()
+		if srid != 0 {
+			result = geomSetSRID(result, srid)
+		}
+		return result, nil
+	}
+	result := simplified.AsText()
+	if srid != 0 {
+		result = geomSetSRID(result, srid)
+	}
+	return result, nil
+}
+
+// de9imPatterns maps spatial relation names to their DE-9IM intersection matrix patterns.
+// These are the standard OGC/ISO SQL/MM patterns used by MySQL.
+var de9imPatterns = map[string]string{
+	"contains":   "T*****FF*",
+	"within":     "T*F**F***",
+	"intersects": "T********",
+	"disjoint":   "FF2FF1212",
+	"touches":    "FT*******",
+	"overlaps":   "T*T***T**",
+	"crosses":    "T*T******",
+	"equals":     "TFFFTFFFT",
+	"covers":     "T*****FF*",
+	"coveredby":  "T*F**F***",
+}
+
+// evalSpatialRelationDE9IM evaluates ST_ spatial predicate functions using
+// the exact DE-9IM model via simplefeatures, instead of MBR approximation.
+func evalSpatialRelationDE9IM(e *Executor, exprs []sqlparser.Expr, rel string) (interface{}, bool, error) {
+	if len(exprs) < 2 {
+		return nil, true, nil
+	}
+	a, err := e.evalExpr(exprs[0])
+	if err != nil {
+		return nil, true, err
+	}
+	b, err := e.evalExpr(exprs[1])
+	if err != nil {
+		return nil, true, err
+	}
+	if a == nil || b == nil {
+		return nil, true, nil
+	}
+	sa, sb := toString(a), toString(b)
+
+	gA, err := wktToSimpleFeature(sa)
+	if err != nil {
+		// Fall back to MBR approximation on parse error.
+		return evalSpatialRelation(e, exprs, rel)
+	}
+	gB, err := wktToSimpleFeature(sb)
+	if err != nil {
+		return evalSpatialRelation(e, exprs, rel)
+	}
+
+	// disjoint: use negation of intersects for efficiency.
+	if rel == "disjoint" {
+		matrix, relErr := sfgeom.Relate(gA, gB)
+		if relErr != nil {
+			return evalSpatialRelation(e, exprs, rel)
+		}
+		// disjoint means no intersection at all: II=F, IB=F, BI=F, BB=F
+		intersectsPattern := "T********"
+		matches, matchErr := sfgeom.RelateMatches(matrix, intersectsPattern)
+		if matchErr != nil {
+			return evalSpatialRelation(e, exprs, rel)
+		}
+		if matches {
+			return int64(0), true, nil
+		}
+		return int64(1), true, nil
+	}
+
+	// touches has alternate patterns depending on geometry dimension.
+	if rel == "touches" {
+		matrix, relErr := sfgeom.Relate(gA, gB)
+		if relErr != nil {
+			return evalSpatialRelation(e, exprs, rel)
+		}
+		// touches: II=F and (IB or BI or BB intersects)
+		patterns := []string{"FT*******", "F**T*****", "F***T****"}
+		for _, pat := range patterns {
+			matches, matchErr := sfgeom.RelateMatches(matrix, pat)
+			if matchErr != nil {
+				continue
+			}
+			if matches {
+				return int64(1), true, nil
+			}
+		}
+		return int64(0), true, nil
+	}
+
+	// overlaps has dimension-dependent patterns.
+	if rel == "overlaps" {
+		matrix, relErr := sfgeom.Relate(gA, gB)
+		if relErr != nil {
+			return evalSpatialRelation(e, exprs, rel)
+		}
+		patterns := []string{"T*T***T**", "1*T***T**"}
+		for _, pat := range patterns {
+			matches, matchErr := sfgeom.RelateMatches(matrix, pat)
+			if matchErr != nil {
+				continue
+			}
+			if matches {
+				return int64(1), true, nil
+			}
+		}
+		return int64(0), true, nil
+	}
+
+	// crosses has dimension-dependent patterns.
+	if rel == "crosses" {
+		matrix, relErr := sfgeom.Relate(gA, gB)
+		if relErr != nil {
+			return evalSpatialRelation(e, exprs, rel)
+		}
+		patterns := []string{"T*T******", "0********"}
+		for _, pat := range patterns {
+			matches, matchErr := sfgeom.RelateMatches(matrix, pat)
+			if matchErr != nil {
+				continue
+			}
+			if matches {
+				return int64(1), true, nil
+			}
+		}
+		return int64(0), true, nil
+	}
+
+	// intersects: true if not disjoint (any non-F entry in II,IB,BI,BB).
+	if rel == "intersects" {
+		matrix, relErr := sfgeom.Relate(gA, gB)
+		if relErr != nil {
+			return evalSpatialRelation(e, exprs, rel)
+		}
+		// intersects = not disjoint = II, IB, BI, or BB is not F
+		disjointPattern := "FF*FF****"
+		matches, matchErr := sfgeom.RelateMatches(matrix, disjointPattern)
+		if matchErr != nil {
+			return evalSpatialRelation(e, exprs, rel)
+		}
+		if matches {
+			return int64(0), true, nil
+		}
+		return int64(1), true, nil
+	}
+
+	pat, ok := de9imPatterns[rel]
+	if !ok {
+		return evalSpatialRelation(e, exprs, rel)
+	}
+
+	matrix, relErr := sfgeom.Relate(gA, gB)
+	if relErr != nil {
+		// Fall back to MBR approximation on DE-9IM error.
+		return evalSpatialRelation(e, exprs, rel)
+	}
+
+	matches, matchErr := sfgeom.RelateMatches(matrix, pat)
+	if matchErr != nil {
+		return evalSpatialRelation(e, exprs, rel)
+	}
+	if matches {
+		return int64(1), true, nil
+	}
+	return int64(0), true, nil
 }
