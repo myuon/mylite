@@ -401,6 +401,16 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 			for _, r := range allFlatRows {
 				origIdx := r[len(r)-1].(int)
 				row := tbl.Rows[origIdx]
+				// Apply PARTITION filter.
+				if len(stmt.Partitions) > 0 && tbl.Def != nil {
+					inPart, partErr := e.rowBelongsToPartitions(stmt.Partitions, tbl.Def, row)
+					if partErr != nil {
+						continue
+					}
+					if !inPart {
+						continue
+					}
+				}
 				match := true
 				if stmt.Where != nil {
 					m, wErr := e.evalWhere(stmt.Where.Expr, row)
@@ -510,6 +520,13 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		}
 	}
 
+	// Validate PARTITION clause if present (fail fast on unknown partition names).
+	if len(stmt.Partitions) > 0 && tbl.Def != nil {
+		if _, _, partErr := buildPartitionNameSets(tbl.Def, stmt.Partitions); partErr != nil {
+			return nil, partErr
+		}
+	}
+
 	newRows := make([]storage.Row, 0)
 	var affected uint64
 	// afterDeleteRows collects rows that need AFTER DELETE trigger firing.
@@ -522,6 +539,18 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 
 	for _, row := range tbl.Rows {
 		match := true
+		// Apply PARTITION filter: skip rows not belonging to the specified partitions.
+		if len(stmt.Partitions) > 0 && tbl.Def != nil {
+			inPart, partErr := e.rowBelongsToPartitions(stmt.Partitions, tbl.Def, row)
+			if partErr != nil {
+				newRows = append(newRows, row)
+				continue
+			}
+			if !inPart {
+				newRows = append(newRows, row)
+				continue
+			}
+		}
 		if stmt.Where != nil {
 			m, err := e.evalWhere(stmt.Where.Expr, row)
 			if err != nil {

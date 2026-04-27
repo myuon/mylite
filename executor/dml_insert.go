@@ -441,6 +441,20 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				if e.inTransaction && e.txnActiveSet != nil {
 					row["__txn_conn_id__"] = e.connectionID
 				}
+				// Validate PARTITION clause for INSERT ... SELECT
+				if len(stmt.Partitions) > 0 && tbl.Def != nil && tbl.Def.PartitionType != "" {
+					inPart, partErr := e.rowBelongsToPartitions(stmt.Partitions, tbl.Def, row)
+					if partErr != nil {
+						return nil, partErr
+					}
+					if !inPart {
+						if bool(stmt.Ignore) {
+							e.addWarning("Warning", 1748, fmt.Sprintf("Found a row not matching the given partition set"))
+							continue
+						}
+						return nil, mysqlError(1748, "HY000", "Found a row not matching the given partition set")
+					}
+				}
 				id, err := tbl.Insert(row, noAutoValueOnZeroSelect)
 				if err != nil {
 					if lockMode0 {
@@ -2259,6 +2273,22 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					}
 					break
 				}
+			}
+		}
+
+		// Validate PARTITION clause: if the INSERT specifies a partition list,
+		// the row must naturally belong to one of those partitions.
+		if len(stmt.Partitions) > 0 && tbl.Def != nil && tbl.Def.PartitionType != "" {
+			inPart, partErr := e.rowBelongsToPartitions(stmt.Partitions, tbl.Def, row)
+			if partErr != nil {
+				return nil, partErr
+			}
+			if !inPart {
+				if bool(stmt.Ignore) {
+					e.addWarning("Warning", 1748, fmt.Sprintf("Found a row not matching the given partition set"))
+					continue
+				}
+				return nil, mysqlError(1748, "HY000", "Found a row not matching the given partition set")
 			}
 		}
 

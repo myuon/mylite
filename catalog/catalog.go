@@ -100,11 +100,12 @@ type PartitionSubpart struct {
 
 // PartitionDef holds one partition definition (PARTITION p0 VALUES ...).
 type PartitionDef struct {
-	Name       string
-	ValueRange string   // "LESS THAN (expr)", "LESS THAN MAXVALUE", "IN (v1,v2,...)"
-	MaxRows    *int
-	MinRows    *int
-	Engine     string // e.g. "InnoDB"
+	Name              string
+	ValueRange        string   // "LESS THAN (expr)", "LESS THAN MAXVALUE", "IN (v1,v2,...)"
+	MaxRows           *int
+	MinRows           *int
+	Engine            string   // e.g. "InnoDB"
+	SubPartitionNames []string // names of subpartitions within this partition (if subpartitioned)
 }
 
 // ColType returns the type string for a column by name (case-insensitive).
