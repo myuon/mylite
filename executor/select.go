@@ -67,6 +67,14 @@ func (e *Executor) collectTableDefsWithAliases(expr sqlparser.TableExpr) ([]*cat
 					return []*catalog.TableDef{td}, []string{alias}
 				}
 			}
+			// Check if this is a view: look up the view SQL and synthesize a TableDef
+			// from the view's underlying table columns. This ensures SELECT * from a JOIN
+			// with a view produces the correct number of columns.
+			if viewSQL, _, isView := e.lookupView(tblName); isView {
+				if td := e.syntheticTableDefFromViewSQL(tblName, viewSQL); td != nil {
+					return []*catalog.TableDef{td}, []string{alias}
+				}
+			}
 		}
 	case *sqlparser.JoinTableExpr:
 		leftDefs, leftAliases := e.collectTableDefsWithAliases(te.LeftExpr)
@@ -83,6 +91,73 @@ func (e *Executor) collectTableDefsWithAliases(expr sqlparser.TableExpr) ([]*cat
 		return defs, aliases
 	}
 	return nil, nil
+}
+
+// syntheticTableDefFromViewSQL creates a synthetic TableDef for a view by parsing
+// its SELECT SQL and resolving column names from the underlying tables.
+// Returns nil if the view SQL cannot be resolved to a known set of columns.
+func (e *Executor) syntheticTableDefFromViewSQL(viewName, viewSQL string) *catalog.TableDef {
+	stmt, err := e.parser().Parse(viewSQL)
+	if err != nil {
+		return nil
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return nil
+	}
+	// If SELECT * FROM single_table, use that table's columns.
+	if len(sel.From) == 1 {
+		if ate, ok := sel.From[0].(*sqlparser.AliasedTableExpr); ok {
+			if tn, ok := ate.Expr.(sqlparser.TableName); ok {
+				underlyingTable := tn.Name.String()
+				// Check if it's SELECT * or SELECT col1, col2, ...
+				if len(sel.SelectExprs.Exprs) == 1 {
+					if _, isStar := sel.SelectExprs.Exprs[0].(*sqlparser.StarExpr); isStar {
+						// SELECT * FROM table: use the underlying table's columns
+						defs, _ := e.collectTableDefsWithAliases(sel.From[0])
+						if len(defs) == 1 && defs[0] != nil {
+							// Return a copy of the underlying table def, renamed to the view
+							td := &catalog.TableDef{
+								Name:    viewName,
+								Columns: defs[0].Columns,
+							}
+							return td
+						}
+						// Try catalog lookup directly
+						if e.Catalog != nil {
+							if db, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
+								if td, err := db.GetTable(underlyingTable); err == nil {
+									return &catalog.TableDef{Name: viewName, Columns: td.Columns}
+								}
+							}
+						}
+					}
+				}
+				// For named column lists, synthesize from SELECT expressions
+				var synCols []catalog.ColumnDef
+				for _, se := range sel.SelectExprs.Exprs {
+					switch s := se.(type) {
+					case *sqlparser.StarExpr:
+						return nil // can't handle qualified star here
+					case *sqlparser.AliasedExpr:
+						name := ""
+						if !s.As.IsEmpty() {
+							name = s.As.String()
+						} else if col, ok := s.Expr.(*sqlparser.ColName); ok {
+							name = col.Name.String()
+						}
+						if name != "" {
+							synCols = append(synCols, catalog.ColumnDef{Name: name})
+						}
+					}
+				}
+				if len(synCols) > 0 {
+					return &catalog.TableDef{Name: viewName, Columns: synCols}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // extractJoinUsingCols extracts column names from JOIN ... USING(...) clauses.

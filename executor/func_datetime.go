@@ -705,7 +705,6 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 			return nil, true, nil
 		}
 		// If base is a full DATETIME (has YYYY-MM-DD HH:MM:SS), use datetime arithmetic.
-		// Plain DATE strings (YYYY-MM-DD only) are treated as TIME strings by MySQL.
 		if isDatetimeWithTimeComponent(baseStr) {
 			t, dtErr := parseDateTimeValue(base)
 			if dtErr == nil {
@@ -717,8 +716,24 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 				return formatDateTimeWithOptionalMicros(result), true, nil
 			}
 		}
+		// If base is a pure DATE value coming from a DATE-typed column (YYYY-MM-DD exactly),
+		// MySQL treats it as midnight (YYYY-MM-DD 00:00:00) and returns a DATETIME result.
+		// NOTE: when the argument is a string literal like '2006-07-16', MySQL treats it
+		// as an invalid TIME string (with warning), NOT as a DATE for datetime arithmetic.
+		// We distinguish the two cases by checking the expression type.
+		if isPureDateString(baseStr) && !e.isNonDateTypeExpr(v.Exprs[0]) {
+			t, dtErr := parseDateTimeValue(baseStr + " 00:00:00")
+			if dtErr == nil {
+				dur, err := parseMySQLTimeInterval(intervalStr)
+				if err != nil {
+					return baseStr, true, nil
+				}
+				result := t.Add(dur)
+				return formatDateTimeWithOptionalMicros(result), true, nil
+			}
+		}
 		// Base is a TIME string (possibly with garbage at end) - use time arithmetic.
-		// If base looks like a date string (YYYY-MM-DD), MySQL emits a warning.
+		// If base looks like a datetime/date string, MySQL emits a warning.
 		if isDatetimeLikeString(baseStr) {
 			e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect time value: '%s'", baseStr))
 		}
@@ -748,7 +763,6 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 			return nil, true, nil
 		}
 		// If base is a full DATETIME (has YYYY-MM-DD HH:MM:SS), use datetime arithmetic.
-		// Plain DATE strings (YYYY-MM-DD only) are treated as TIME strings by MySQL.
 		if isDatetimeWithTimeComponent(baseStr) {
 			t, dtErr := parseDateTimeValue(base)
 			if dtErr == nil {
@@ -760,8 +774,23 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 				return formatDateTimeWithOptionalMicros(result), true, nil
 			}
 		}
+		// If base is a pure DATE value coming from a DATE-typed column (YYYY-MM-DD exactly),
+		// MySQL treats it as midnight (YYYY-MM-DD 00:00:00) and returns a DATETIME result.
+		// NOTE: when the argument is a string literal, MySQL treats it as an invalid TIME
+		// string (with warning), NOT as a DATE for datetime arithmetic.
+		if isPureDateString(baseStr) && !e.isNonDateTypeExpr(v.Exprs[0]) {
+			t, dtErr := parseDateTimeValue(baseStr + " 00:00:00")
+			if dtErr == nil {
+				dur, err := parseMySQLTimeInterval(intervalStr)
+				if err != nil {
+					return baseStr, true, nil
+				}
+				result := t.Add(-dur)
+				return formatDateTimeWithOptionalMicros(result), true, nil
+			}
+		}
 		// Base is a TIME string - use time arithmetic.
-		// If base looks like a date string (YYYY-MM-DD), MySQL emits a warning.
+		// If base looks like a datetime/date string, MySQL emits a warning.
 		if isDatetimeLikeString(baseStr) {
 			e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect time value: '%s'", baseStr))
 		}
@@ -1106,6 +1135,14 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		mtHi := toInt64(mtH)
 		mtMi := toInt64(mtM)
 		mtSi := toInt64(mtSec)
+		// Capture original hour string for potential warning message (before any modification).
+		var origHourStr string
+		if u, ok := mtH.(uint64); ok && mtHi < 0 {
+			// Large unsigned value that overflowed int64 - use original uint64 string.
+			origHourStr = strconv.FormatUint(u, 10)
+		} else {
+			origHourStr = toString(mtH)
+		}
 		// If the hour was a uint64 value that overflows int64 (e.g., CAST(-1 AS UNSIGNED)
 		// = 18446744073709551615), treat it as a very large positive value (clamp to max).
 		if mtHi < 0 {
@@ -1155,6 +1192,14 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 			clampedM = 59
 			clampedS = 59
 			mtFrac = ""
+			// MySQL emits warning 1292 when the hour value overflows the TIME range.
+			// Build the original time string using the raw input values.
+			origSecStr := fmt.Sprintf("%02d", mtSi)
+			if dot := strings.IndexByte(mtSecStr, '.'); dot >= 0 {
+				origSecStr = mtSecStr // use full original seconds string
+			}
+			origTimeStr := fmt.Sprintf("%s%s:%02d:%s", mtNeg, origHourStr, mtMi, origSecStr)
+			e.addWarning("Warning", 1292, fmt.Sprintf("Truncated incorrect time value: '%s'", origTimeStr))
 		}
 		timeStr := fmt.Sprintf("%s%02d:%02d:%02d%s", mtNeg, clampedH, clampedM, clampedS, mtFrac)
 		return timeStr, true, nil
@@ -4119,6 +4164,15 @@ func normalizeDateTimeForCompare(a, b string) (string, string) {
 
 func isDateString(s string) bool {
 	return len(s) >= 10 && s[4] == '-' && s[7] == '-' && (len(s) == 10 || s[10] == ' ')
+}
+
+// isPureDateString returns true if s is exactly a DATE string (YYYY-MM-DD, 10 chars,
+// no time component). This is used to distinguish DATE from DATETIME in ADDTIME/SUBTIME.
+func isPureDateString(s string) bool {
+	if len(s) != 10 {
+		return false
+	}
+	return s[4] == '-' && s[7] == '-'
 }
 
 func isTimeString(s string) bool {
