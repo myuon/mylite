@@ -571,6 +571,23 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				cleanName = strings.TrimPrefix(cleanName, "session.")
 				cleanName = strings.TrimPrefix(cleanName, "local.")
 				isGlobal := scope == sqlparser.GlobalScope
+				// SET TRANSACTION ISOLATION LEVEL (NextTxScope) and SET @@transaction_isolation
+				// in MySQL apply only to the NEXT transaction. We store the value in
+				// sessionScopeVars (so getSysVar returns it for locking/isolation checks),
+				// but also save the PREVIOUS session value in nextTxnIsolation so that
+				// execBegin can restore it after the transaction ends (see execCommit/execRollback).
+				if scope == sqlparser.NextTxScope && (cleanName == "transaction_isolation" || cleanName == "tx_isolation") {
+					// Save the current session isolation level for restoration after the next transaction.
+					if prev, ok := e.sessionScopeVars[cleanName]; ok {
+						e.nextTxnIsolationPrev = prev
+					} else if gv, ok := e.getGlobalVar(cleanName); ok {
+						e.nextTxnIsolationPrev = gv
+					} else {
+						e.nextTxnIsolationPrev = "REPEATABLE-READ"
+					}
+					// Fall through to the normal setSysVar path (validates and stores the value).
+					// The restoration happens in execCommit/execRollback via prevSessionIsolation.
+				}
 				// Enforce SUPER or SYSTEM_VARIABLES_ADMIN privilege for setting global variables.
 				// Non-privileged users get ER_SPECIFIC_ACCESS_DENIED_ERROR (1227).
 				if isGlobal {

@@ -3677,10 +3677,6 @@
       "reason": "SHOW CREATE TABLE ordering issues"
     },
     {
-      "test": "innodb/innodb_i_s_innodb_trx",
-      "reason": "trx_isolation_level and lock_data showing NULL"
-    },
-    {
       "test": "other/cast",
       "reason": "timeout"
     },
