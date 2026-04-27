@@ -2481,11 +2481,19 @@ func formatPartitionExpr(exprStr string) string {
 	return mysqlGenExprNode(parsed, "")
 }
 
-// buildPartitionClause renders the /*!50100 PARTITION BY ... */ block for SHOW CREATE TABLE.
-// MySQL format: /*!50100 PARTITION BY RANGE (`col`)\n(PARTITION p0 ...) */
+// buildPartitionClause renders the /*!50100 or /*!50500 PARTITION BY ... */ block for SHOW CREATE TABLE.
+// MySQL uses /*!50100 for basic partitioning (RANGE/LIST/HASH/KEY with expression)
+// and /*!50500 for COLUMNS-based partitioning (RANGE COLUMNS, LIST COLUMNS) introduced in MySQL 5.5.
 func buildPartitionClause(def *catalog.TableDef) string {
 	var b strings.Builder
-	b.WriteString("/*!50100 PARTITION BY ")
+	// Use 50500 for COLUMNS-based partitioning (RANGE COLUMNS or LIST COLUMNS)
+	isColumns := len(def.PartitionExprCols) > 0 &&
+		(def.PartitionType == "RANGE" || def.PartitionType == "LIST")
+	if isColumns {
+		b.WriteString("/*!50500 PARTITION BY ")
+	} else {
+		b.WriteString("/*!50100 PARTITION BY ")
+	}
 
 	// Partition type
 	switch def.PartitionType {
@@ -2500,14 +2508,13 @@ func buildPartitionClause(def *catalog.TableDef) string {
 			b.WriteString(formatPartitionExpr(def.PartitionExpression))
 			b.WriteString(")")
 		} else if len(def.PartitionExprCols) > 0 {
-			b.WriteString("COLUMNS (")
+			// RANGE COLUMNS: output " COLUMNS(col1,col2)" - no backticks, no space before "("
+			b.WriteString(" COLUMNS(")
 			for i, c := range def.PartitionExprCols {
 				if i > 0 {
 					b.WriteString(",")
 				}
-				b.WriteString("`")
 				b.WriteString(c)
-				b.WriteString("`")
 			}
 			b.WriteString(")")
 		}
@@ -2522,14 +2529,13 @@ func buildPartitionClause(def *catalog.TableDef) string {
 			b.WriteString(formatPartitionExpr(def.PartitionExpression))
 			b.WriteString(")")
 		} else if len(def.PartitionExprCols) > 0 {
-			b.WriteString("COLUMNS (")
+			// LIST COLUMNS: output " COLUMNS(col1,col2)" - no backticks, no space before "("
+			b.WriteString(" COLUMNS(")
 			for i, c := range def.PartitionExprCols {
 				if i > 0 {
 					b.WriteString(",")
 				}
-				b.WriteString("`")
 				b.WriteString(c)
-				b.WriteString("`")
 			}
 			b.WriteString(")")
 		}

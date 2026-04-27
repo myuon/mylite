@@ -8,6 +8,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
+
+	"golang.org/x/text/unicode/norm"
+
 	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
 	"vitess.io/vitess/go/vt/sqlparser"
@@ -25,6 +29,109 @@ func isKnownStorageEngine(engineUpper string) bool {
 		return true
 	}
 	return false
+}
+
+// normalizePartitionName normalizes a partition name for duplicate detection.
+// MySQL uses case-insensitive and accent-insensitive comparison for partition names,
+// consistent with the utf8mb4_0900_ai_ci collation behavior.
+func normalizePartitionName(name string) string {
+	// Apply NFKD normalization to decompose accented characters
+	nfkd := norm.NFKD.String(strings.ToLower(name))
+	// Remove Unicode combining marks (diacritics)
+	var result []rune
+	for _, r := range nfkd {
+		if unicode.Is(unicode.Mn, r) {
+			continue
+		}
+		result = append(result, r)
+	}
+	return string(result)
+}
+
+// disallowedPartitionFunctions is the set of function names not allowed in partition expressions.
+// MySQL allows only a specific subset of functions; these are explicitly disallowed.
+var disallowedPartitionFunctions = map[string]bool{
+	"greatest":         true,
+	"least":            true,
+	"isnull":           true,
+	"nullif":           true,
+	"ifnull":           true,
+	"ascii":            true, // string function, not allowed in partition expressions
+	"bit_length":       true,
+	"char_length":      true,
+	"character_length": true,
+	"find_in_set":      true,
+	"instr":            true,
+	"length":           true,
+	"locate":           true,
+	"octet_length":     true,
+	"position":         true,
+	"strcmp":           true,
+	"crc32":            true,
+	"round":            true,
+	"sign":             true,
+	"period_add":       true,
+	"period_diff":      true,
+	"timestampdiff":    true,
+	"week":             true,
+	"bit_count":        true,
+	"inet_aton":        true,
+}
+
+// validatePartitionExpr walks a partition expression and returns true
+// if it contains disallowed functions or operators (ER_PARTITION_FUNCTION_IS_NOT_ALLOWED).
+// Returns false if expression is allowed.
+func validatePartitionExpr(expr sqlparser.Expr) (disallowed bool, wrongExpr bool) {
+	if expr == nil {
+		return false, false
+	}
+	switch e := expr.(type) {
+	case *sqlparser.FuncExpr:
+		name := strings.ToLower(e.Name.String())
+		if disallowedPartitionFunctions[name] {
+			return true, false
+		}
+		// Recurse into arguments (FuncExpr.Exprs is []Expr in vitess)
+		for _, arg := range e.Exprs {
+			if d, w := validatePartitionExpr(arg); d || w {
+				return d, w
+			}
+		}
+	case *sqlparser.CastExpr:
+		return true, false
+	case *sqlparser.ConvertExpr:
+		return true, false
+	case *sqlparser.CaseExpr:
+		return true, false
+	case *sqlparser.BinaryExpr:
+		switch e.Operator {
+		case sqlparser.BitAndOp, sqlparser.BitOrOp, sqlparser.BitXorOp,
+			sqlparser.ShiftLeftOp, sqlparser.ShiftRightOp:
+			return true, false
+		}
+		// Recurse into children
+		if d, w := validatePartitionExpr(e.Left); d || w {
+			return d, w
+		}
+		if d, w := validatePartitionExpr(e.Right); d || w {
+			return d, w
+		}
+	case *sqlparser.UnaryExpr:
+		if e.Operator == sqlparser.TildaOp {
+			return true, false
+		}
+		if d, w := validatePartitionExpr(e.Expr); d || w {
+			return d, w
+		}
+	case *sqlparser.LocateExpr:
+		// locate(substr, str) and position(substr IN str) - always disallowed
+		return true, false
+	case *sqlparser.ColName:
+		// Column references are always allowed
+	case *sqlparser.Literal:
+		// Literal values are always allowed
+	}
+	return false, false
 }
 
 // validateUTF8StringForDDL checks if a string contains valid utf8mb3 (3-byte UTF-8) when character_set_client=binary.
@@ -2274,6 +2381,12 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		// Expression (HASH/RANGE/LIST with expression)
 		if po.Expr != nil {
 			def.PartitionExpression = sqlparser.String(po.Expr)
+			// Validate partition expression for disallowed functions/operators.
+			if po.Type != sqlparser.KeyType {
+				if disallowed, _ := validatePartitionExpr(po.Expr); disallowed {
+					return nil, mysqlError(1491, "HY000", "This partition function is not allowed")
+				}
+			}
 		}
 		// Column list (KEY or RANGE/LIST COLUMNS)
 		if len(po.ColList) > 0 {
@@ -2362,6 +2475,28 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				}
 			}
 			def.PartitionDefs = append(def.PartitionDefs, pdef)
+		}
+		// Check for duplicate partition names (case-insensitive, accent-insensitive).
+		if len(def.PartitionDefs) > 0 {
+			seen := make(map[string]bool, len(def.PartitionDefs))
+			for _, pd := range def.PartitionDefs {
+				key := normalizePartitionName(pd.Name)
+				if seen[key] {
+					return nil, mysqlError(1517, "HY000", fmt.Sprintf("Duplicate partition name %s", pd.Name))
+				}
+				seen[key] = true
+			}
+		}
+		// For KEY partitions, check for duplicate column names in the partition key.
+		if po.Type == sqlparser.KeyType && len(po.ColList) > 0 {
+			seenCols := make(map[string]bool, len(po.ColList))
+			for _, partCol := range po.ColList {
+				colLower := strings.ToLower(partCol.String())
+				if seenCols[colLower] {
+					return nil, mysqlError(1473, "HY000", fmt.Sprintf("Duplicate partition field name '%s'", strings.ToLower(partCol.String())))
+				}
+				seenCols[colLower] = true
+			}
 		}
 		// For KEY partitions, validate that the total byte length of partition
 		// columns does not exceed 3072 bytes (MySQL's max partition key length).
@@ -3077,10 +3212,20 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				Rows:        [][]interface{}{{qualTable, opStr, "status", "OK"}},
 				IsResultSet: true,
 			}, nil
+		case sqlparser.ExchangeAction:
+			// EXCHANGE PARTITION: check if the target table is a view.
+			// MySQL returns ER_CHECK_NO_SUCH_TABLE (1177) when the target is a view.
+			if !stmt.PartitionSpec.TableName.IsEmpty() {
+				exchangeTableName := stmt.PartitionSpec.TableName.Name.String()
+				if _, _, isView := e.lookupView(exchangeTableName); isView {
+					return nil, mysqlError(1177, "42000", "Can't open table")
+				}
+			}
+			// Not fully implemented; ignore silently.
+			return &Result{}, nil
 		case sqlparser.TruncateAction, sqlparser.DiscardAction, sqlparser.ImportAction,
 			sqlparser.CoalesceAction, sqlparser.RemoveAction, sqlparser.UpgradeAction,
-			sqlparser.ReorganizeAction, sqlparser.AddAction, sqlparser.DropAction,
-			sqlparser.ExchangeAction:
+			sqlparser.ReorganizeAction, sqlparser.AddAction, sqlparser.DropAction:
 			// These partition DDL operations are not fully implemented; ignore silently.
 			return &Result{}, nil
 		}
