@@ -1224,7 +1224,28 @@ func evalSpatialFunc(e *Executor, name string, exprs []sqlparser.Expr) (interfac
 		if err != nil {
 			return nil, true, err
 		}
-		return val, true, nil
+		distVal, err := e.evalExpr(exprs[1])
+		if err != nil {
+			return nil, true, err
+		}
+		if val == nil || distVal == nil {
+			return nil, true, nil
+		}
+		wktStr := toString(val)
+		distStr := strings.TrimSpace(fmt.Sprintf("%v", distVal))
+		if distStr == "" {
+			distStr = "0"
+		}
+		dist, parseErr := strconv.ParseFloat(distStr, 64)
+		if parseErr != nil {
+			// MySQL treats non-numeric strings as 0 (implicit conversion)
+			dist = 0
+		}
+		result, bufErr := evalSpatialBuffer(wktStr, dist)
+		if bufErr != nil {
+			return nil, true, bufErr
+		}
+		return result, true, nil
 	case "st_convexhull":
 		if len(exprs) < 1 {
 			return nil, true, nil
@@ -2420,6 +2441,37 @@ func evalSpatialSimplify(wkt string, threshold float64) (interface{}, error) {
 		result = geomSetSRID(result, srid)
 	}
 	return result, nil
+}
+
+// evalSpatialBuffer computes the buffer of the given WKT geometry with the
+// specified distance using simplefeatures/JTS, preserving any SRID from the input.
+// A zero or negative distance for points/linestrings returns the original geometry.
+func evalSpatialBuffer(wkt string, distance float64) (interface{}, error) {
+	srid := geomGetSRID(wkt)
+	g, err := wktToSimpleFeature(wkt)
+	if err != nil {
+		return nil, fmt.Errorf("st_buffer: invalid geometry: %w", err)
+	}
+	result, err := safeSFOp(func() (sfgeom.Geometry, error) {
+		return sfgeom.Buffer(g, distance)
+	})
+	if err != nil || result.IsEmpty() {
+		// For zero-distance buffer of non-polygon types, MySQL returns the original geometry
+		if distance == 0 {
+			wktOut := g.AsText()
+			if srid != 0 {
+				wktOut = geomSetSRID(wktOut, srid)
+			}
+			return wktOut, nil
+		}
+		// Buffer failed; return NULL
+		return nil, nil
+	}
+	wktOut := result.AsText()
+	if srid != 0 {
+		wktOut = geomSetSRID(wktOut, srid)
+	}
+	return wktOut, nil
 }
 
 // de9imPatterns maps spatial relation names to their DE-9IM intersection matrix patterns.
