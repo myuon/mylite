@@ -393,6 +393,117 @@ func fkRowMatches(childCols, parentCols []string, childRow, parentRow storage.Ro
 	return true
 }
 
+// tableHasIndexForColumns returns true if the table has a PRIMARY KEY or index
+// whose leading columns match the given columns (prefix match).
+// It also skips FULLTEXT and SPATIAL indexes (they cannot serve as FK support indexes).
+// geomColumns is an optional set of column names known to be geometry/spatial type;
+// those columns cannot be used as FK index columns either.
+func tableHasIndexForColumns(def *catalog.TableDef, cols []string) bool {
+	if def == nil || len(cols) == 0 {
+		return false
+	}
+	// Check PRIMARY KEY
+	if len(def.PrimaryKey) >= len(cols) {
+		match := true
+		for i, c := range cols {
+			if !strings.EqualFold(def.PrimaryKey[i], c) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	// Check secondary indexes
+	for _, idx := range def.Indexes {
+		// FULLTEXT and SPATIAL indexes cannot be used for FK support
+		if strings.EqualFold(idx.Type, "FULLTEXT") || strings.EqualFold(idx.Type, "SPATIAL") {
+			continue
+		}
+		if len(idx.Columns) < len(cols) {
+			continue
+		}
+		match := true
+		for i, c := range cols {
+			idxCol := idx.Columns[i]
+			// Strip length prefix (e.g. "a(10)" → "a")
+			if p := strings.Index(idxCol, "("); p >= 0 {
+				idxCol = idxCol[:p]
+			}
+			if !strings.EqualFold(idxCol, c) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// validateFKChildIndex checks that the child (referencing) table has an index covering
+// the FK columns. Returns error 1005 if validation fails.
+// Note: for CREATE TABLE, the FK index is auto-created, so this check mainly applies
+// to certain edge cases (e.g. GEOMETRY columns that can't be indexed for FK).
+func (e *Executor) validateFKChildIndex(db *catalog.Database, childTable, fkName string, fkCols []string) error {
+	def, err := db.GetTable(childTable)
+	if err != nil || def == nil {
+		return nil
+	}
+	// Check if FK columns include a GEOMETRY/SPATIAL type column (cannot be FK column)
+	for _, col := range fkCols {
+		for _, colDef := range def.Columns {
+			if strings.EqualFold(colDef.Name, col) {
+				colTypeUpper := strings.ToUpper(strings.TrimSpace(colDef.Type))
+				baseType := colTypeUpper
+				if p := strings.IndexByte(baseType, '('); p >= 0 {
+					baseType = strings.TrimSpace(baseType[:p])
+				}
+				if baseType == "GEOMETRY" || baseType == "POINT" || baseType == "LINESTRING" ||
+					baseType == "POLYGON" || baseType == "MULTIPOINT" || baseType == "MULTILINESTRING" ||
+					baseType == "MULTIPOLYGON" || baseType == "GEOMETRYCOLLECTION" {
+					// MySQL quirk (Bug#20752436): when the table already has an
+					// existing FK-supporting BTREE index, MySQL tries to reuse/modify
+					// that index internally and returns ER_DROP_INDEX_FK (1553) with
+					// the name of the conflicting index instead of the normal 1005 error.
+					for _, existFK := range def.ForeignKeys {
+						// Find the BTREE index that supports this FK
+						for _, idx := range def.Indexes {
+							if strings.EqualFold(idx.Name, existFK.Name) &&
+								!strings.EqualFold(idx.Type, "FULLTEXT") &&
+								!strings.EqualFold(idx.Type, "SPATIAL") {
+								return mysqlError(1553, "HY000",
+									fmt.Sprintf("Cannot drop index '%s': needed in a foreign key constraint", idx.Name))
+							}
+						}
+					}
+					return mysqlError(1005, "HY000",
+						fmt.Sprintf("Failed to add the foreign key constraint. Missing index for constraint '%s' in the foreign table '%s'", fkName, childTable))
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// validateFKParentIndex checks that the parent (referenced) table has an index
+// on the referenced columns. MySQL requires this even when foreign_key_checks=0.
+// Returns error 1215 (ER_FK_NO_INDEX_PARENT) if the index is missing.
+func (e *Executor) validateFKParentIndex(db *catalog.Database, childTable, fkName, parentTable string, refCols []string) error {
+	parentDef, err := db.GetTable(parentTable)
+	if err != nil || parentDef == nil {
+		// Parent table doesn't exist in this database – skip check (could be cross-db)
+		return nil
+	}
+	if tableHasIndexForColumns(parentDef, refCols) {
+		return nil
+	}
+	return mysqlError(1215, "HY000",
+		fmt.Sprintf("Failed to add the foreign key constraint. Missing index for constraint '%s' in the referenced table '%s'", fkName, parentTable))
+}
+
 // formatColumnList formats a list of column names for error messages.
 func formatColumnList(cols []string) string {
 	parts := make([]string, len(cols))
