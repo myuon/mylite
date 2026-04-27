@@ -469,10 +469,35 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		case sqlparser.Database: // SHOW DATABASES / SHOW SCHEMAS
 			dbs := e.Catalog.ListDatabases()
 			sort.Strings(dbs)
+			// Get current user for privilege filtering.
+			showDBUser, showDBHost, showDBRoles := e.getCurrentUserAndRoles()
 			rows := make([][]interface{}, 0, len(dbs))
 			for _, d := range dbs {
 				if likePattern != "" && !matchLike(d, likePattern) {
 					continue
+				}
+				// For non-root users, filter databases by privilege visibility.
+				// In MySQL, non-privileged users see:
+				//   - information_schema and performance_schema (always visible)
+				//   - test (visible to all, legacy MySQL default)
+				//   - Any database they have at least one privilege on
+				if showDBUser != "" && e.grantStore != nil {
+					lowerDB := strings.ToLower(d)
+					if lowerDB != "information_schema" && lowerDB != "performance_schema" && lowerDB != "test" {
+						// Check if user has any privilege on this DB (via global, DB-level, or table-level grant).
+						hasAccess := e.grantStore.HasPrivilege(showDBUser, showDBHost, "SELECT", d, "", showDBRoles) ||
+							e.grantStore.HasPrivilege(showDBUser, showDBHost, "INSERT", d, "", showDBRoles) ||
+							e.grantStore.HasPrivilege(showDBUser, showDBHost, "UPDATE", d, "", showDBRoles) ||
+							e.grantStore.HasPrivilege(showDBUser, showDBHost, "DELETE", d, "", showDBRoles) ||
+							e.grantStore.HasPrivilege(showDBUser, showDBHost, "CREATE", d, "", showDBRoles) ||
+							e.grantStore.HasPrivilege(showDBUser, showDBHost, "DROP", d, "", showDBRoles) ||
+							e.grantStore.HasPrivilege(showDBUser, showDBHost, "ALTER", d, "", showDBRoles) ||
+							e.grantStore.HasPrivilege(showDBUser, showDBHost, "INDEX", d, "", showDBRoles) ||
+							e.grantStore.HasAnyDBAccess(showDBUser, showDBHost, d, showDBRoles)
+						if !hasAccess {
+							continue
+						}
+					}
 				}
 				rows = append(rows, []interface{}{d})
 			}
