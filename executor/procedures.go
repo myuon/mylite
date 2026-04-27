@@ -403,6 +403,26 @@ func isStandaloneEnd(lineUpper string) bool {
 	return true
 }
 
+// stripLeadingLineComments removes leading # and -- line comments from a SQL statement.
+// This is needed when a statement body (e.g., inside BEGIN...END) starts with comment lines
+// followed by the actual SQL keyword (e.g., DECLARE, OPEN, etc.).
+func stripLeadingLineComments(s string) string {
+	for {
+		s = strings.TrimSpace(s)
+		if strings.HasPrefix(s, "#") || strings.HasPrefix(s, "--") {
+			// Find end of line
+			idx := strings.IndexByte(s, '\n')
+			if idx < 0 {
+				return ""
+			}
+			s = s[idx+1:]
+		} else {
+			break
+		}
+	}
+	return s
+}
+
 // countOccurrences counts the number of non-overlapping occurrences of substr in s.
 // It only counts whole-word occurrences where "IF " means IF followed by space (not part of END IF).
 func countOccurrences(s, substr string) int {
@@ -1117,7 +1137,7 @@ func validateRoutineBody(bodyStmts []string) error {
 	seenKind := 0
 
 	for _, stmt := range bodyStmts {
-		upper := strings.ToUpper(strings.TrimSpace(stmt))
+		upper := strings.ToUpper(stripLeadingLineComments(strings.TrimSpace(stmt)))
 		if !strings.HasPrefix(upper, "DECLARE") {
 			continue
 		}
@@ -1127,8 +1147,17 @@ func validateRoutineBody(bodyStmts []string) error {
 			continue
 		}
 
-		if cursorIdx := strings.Index(rest, " CURSOR FOR "); cursorIdx >= 0 {
-			cursorName := strings.ToLower(strings.TrimSpace(rest[:cursorIdx]))
+		// Find CURSOR FOR: handle space, newline, or space+newline after FOR
+		cursorForIdx := -1
+		if idx := strings.Index(rest, " CURSOR FOR "); idx >= 0 {
+			cursorForIdx = idx
+		} else if idx := strings.Index(rest, " CURSOR FOR\n"); idx >= 0 {
+			cursorForIdx = idx
+		} else if idx := strings.Index(rest, " CURSOR FOR\t"); idx >= 0 {
+			cursorForIdx = idx
+		}
+		if cursorForIdx >= 0 {
+			cursorName := strings.ToLower(strings.TrimSpace(rest[:cursorForIdx]))
 			// Error 1333: duplicate cursor
 			if declaredCursors[cursorName] {
 				return mysqlError(1333, "42000", fmt.Sprintf("Duplicate cursor: %s", cursorName))
@@ -1186,7 +1215,7 @@ func validateRoutineBody(bodyStmts []string) error {
 	}
 
 	for _, stmt := range bodyStmts {
-		upper := strings.ToUpper(strings.TrimSpace(stmt))
+		upper := strings.ToUpper(stripLeadingLineComments(strings.TrimSpace(stmt)))
 
 		// Error ER_SP_BADSTATEMENT (1295): USE is not allowed in stored routines
 		if strings.HasPrefix(upper, "USE ") || upper == "USE" {
@@ -1238,8 +1267,20 @@ func validateRoutineBody(bodyStmts []string) error {
 		}
 		rest := strings.TrimSpace(upper[len("DECLARE"):])
 		// DECLARE <name> CURSOR FOR <stmt> - check stmt is SELECT (not INSERT/UPDATE/etc.)
-		if cursorIdx := strings.Index(rest, " CURSOR FOR "); cursorIdx >= 0 {
-			afterFor := strings.TrimSpace(rest[cursorIdx+len(" CURSOR FOR "):])
+		// Find CURSOR FOR: handle space, newline, or tab after FOR
+		cursorForIdx2 := -1
+		cursorForSkip2 := len(" CURSOR FOR ")
+		if idx := strings.Index(rest, " CURSOR FOR "); idx >= 0 {
+			cursorForIdx2 = idx
+		} else if idx := strings.Index(rest, " CURSOR FOR\n"); idx >= 0 {
+			cursorForIdx2 = idx
+			cursorForSkip2 = len(" CURSOR FOR\n")
+		} else if idx := strings.Index(rest, " CURSOR FOR\t"); idx >= 0 {
+			cursorForIdx2 = idx
+			cursorForSkip2 = len(" CURSOR FOR\t")
+		}
+		if cursorForIdx2 >= 0 {
+			afterFor := strings.TrimSpace(rest[cursorForIdx2+cursorForSkip2:])
 			// Valid cursor for statements: SELECT, (SELECT ...), WITH ...
 			if !strings.HasPrefix(afterFor, "SELECT") &&
 				!strings.HasPrefix(afterFor, "(SELECT") &&
@@ -2524,6 +2565,14 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 				break // unterminated comment - leave stmtStr as-is
 			}
 			stmtStr = strings.TrimSpace(stmtStr[endComment+2:])
+			stmtUpper = strings.ToUpper(stmtStr)
+		}
+
+		// Strip leading # and -- line comments (e.g. "# comment\nDECLARE ...")
+		// so that control-flow keyword checks work when a statement starts with SQL comments.
+		stripped := stripLeadingLineComments(stmtStr)
+		if stripped != stmtStr {
+			stmtStr = stripped
 			stmtUpper = strings.ToUpper(stmtStr)
 		}
 
