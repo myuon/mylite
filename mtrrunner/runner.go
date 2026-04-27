@@ -2982,7 +2982,16 @@ func (ctx *execContext) executeQuery(stmt string) error {
 
 	if !useVertical {
 		// Write column headers for regular (horizontal) results.
-		ctx.output.WriteString(strings.Join(columns, "\t") + "\n")
+		// MySQL's mysql client truncates column names to 255 bytes maximum.
+		truncatedCols := make([]string, len(columns))
+		for i, col := range columns {
+			if len(col) > 255 {
+				truncatedCols[i] = col[:255]
+			} else {
+				truncatedCols[i] = col
+			}
+		}
+		ctx.output.WriteString(strings.Join(truncatedCols, "\t") + "\n")
 	}
 
 	for _, line := range resultLines {
