@@ -1710,6 +1710,28 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 					return result
 				}
 				continue
+			} else if selectType == "PRIMARY" && tableIsEmpty && len(allTableNames) == 1 && idx == 0 {
+				// PRIMARY query with empty outer table and a non-IN, non-EXISTS non-correlated
+				// subquery in WHERE (e.g. f1 > ALL(subquery), a = (scalar subquery)).
+				// MySQL shows "no matching row in const table" for PRIMARY, then
+				// "Not optimized, outer query is empty" for each such subquery.
+				// This applies ONLY to non-flattenable subquery types (not IN/EXISTS semijoin),
+				// so we check that at least one non-flattenable non-correlated subquery exists.
+				outerTableMap := e.extractTableNamesAndAliases(sel)
+				if e.selectHasNonFlattenableSubqueryInWhere(sel, outerTableMap) {
+					result = append(result, explainSelectType{
+						id:         myID,
+						selectType: selectType,
+						table:      nil,
+						extra:      "no matching row in const table",
+						rows:       nil,
+						filtered:   nil,
+						accessType: nil,
+					})
+					// Add "Not optimized, outer query is empty" for each subquery found.
+					e.explainSubqueriesNotOptimized(sel, idCounter, &result)
+					return result
+				}
 			} else if idx == 0 && !orderByNull && (strings.Contains(upperQ, "GROUP BY") || strings.Contains(upperQ, "SQL_BIG_RESULT")) {
 				// When GROUP BY is on a constant expression (e.g. GROUP BY 1), MySQL does
 				// not need a filesort because all rows share the same group key.
@@ -3545,6 +3567,63 @@ func isSubqueryInINContext(node sqlparser.SQLNode, sub *sqlparser.Subquery) bool
 	return found
 }
 
+// selectHasNonFlattenableSubqueryInWhere returns true if the SELECT's WHERE clause
+// contains at least one subquery that produces "no matching row in const table" when the
+// outer table is empty. This includes:
+// - Scalar subqueries: col = (SELECT ...) with no modifier (Modifier == Missing)
+// - ALL-subqueries: col > ALL(SELECT ...), col < ALL(SELECT ...), etc. (Modifier == All)
+// These are NOT semijoin-flattenable, so MySQL evaluates them differently from IN subqueries.
+// Returns true only when at least one such non-correlated subquery is found.
+func (e *Executor) selectHasNonFlattenableSubqueryInWhere(sel *sqlparser.Select, outerTables map[string]bool) bool {
+	if sel.Where == nil {
+		return false
+	}
+	found := false
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		sub, ok := n.(*sqlparser.Subquery)
+		if !ok {
+			return true, nil
+		}
+		// Check if this subquery is in EXISTS context (these are handled separately).
+		if isSubqueryInExistsContext(sel.Where, sub) {
+			return false, nil
+		}
+		// Check if this is a plain IN (col IN (subquery)) — exclude these.
+		// We do this by checking the parent comparison expression.
+		isINorANY := false
+		_ = sqlparser.Walk(func(n2 sqlparser.SQLNode) (bool, error) {
+			if cmp, ok := n2.(*sqlparser.ComparisonExpr); ok {
+				if subR, ok := cmp.Right.(*sqlparser.Subquery); ok && subR == sub {
+					switch cmp.Operator {
+					case sqlparser.InOp, sqlparser.NotInOp:
+						isINorANY = true
+						return false, nil
+					default:
+						// ANY modifier maps to IN-style (= ANY is like IN).
+						if cmp.Modifier == sqlparser.Any {
+							isINorANY = true
+							return false, nil
+						}
+						// ALL modifier (> ALL, = ALL, etc.) and scalar (no modifier) are non-flattenable.
+					}
+				}
+			}
+			return true, nil
+		}, sel.Where)
+		if isINorANY {
+			return false, nil
+		}
+		// Check if the subquery is non-correlated.
+		if e.isCorrelatedSubquery(sub.Select, outerTables) {
+			return false, nil
+		}
+		// Found a non-flattenable, non-correlated subquery.
+		found = true
+		return false, nil
+	}, sel.Where)
+	return found
+}
+
 // isSubqueryInExistsContext checks if a Subquery node is inside an ExistsExpr.
 func isSubqueryInExistsContext(node sqlparser.SQLNode, sub *sqlparser.Subquery) bool {
 	found := false
@@ -3653,6 +3732,42 @@ func outerINExprIsConstant(node sqlparser.SQLNode, sub *sqlparser.Subquery) bool
 		return true, nil
 	}, node)
 	return isConst
+}
+
+// explainSubqueriesNotOptimized walks subqueries in WHERE/SELECT/HAVING and emits
+// "Not optimized, outer query is empty" rows for each top-level subquery found.
+// This is called when the outer table is empty and has non-IN non-correlated subqueries
+// in the WHERE: MySQL does not execute them and marks them as "Not optimized".
+func (e *Executor) explainSubqueriesNotOptimized(sel *sqlparser.Select, idCounter *int64, result *[]explainSelectType) {
+	var nodes []sqlparser.SQLNode
+	if sel.SelectExprs != nil {
+		nodes = append(nodes, sel.SelectExprs)
+	}
+	if sel.Where != nil {
+		nodes = append(nodes, sel.Where)
+	}
+	if sel.Having != nil {
+		nodes = append(nodes, sel.Having)
+	}
+	for _, node := range nodes {
+		_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+			if _, ok := n.(*sqlparser.Subquery); ok {
+				*idCounter++
+				subID := *idCounter
+				*result = append(*result, explainSelectType{
+					id:         subID,
+					selectType: "SUBQUERY",
+					table:      nil,
+					extra:      "Not optimized, outer query is empty",
+					rows:       nil,
+					filtered:   nil,
+					accessType: nil,
+				})
+				return false, nil // don't descend into the subquery
+			}
+			return true, nil
+		}, node)
+	}
 }
 
 // explainSubqueries finds subqueries in SELECT expressions, WHERE, and HAVING clauses.

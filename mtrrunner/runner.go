@@ -4353,6 +4353,14 @@ func readLines(path string) ([]string, error) {
 		if err == nil {
 			data = decoded
 		}
+	} else if isKOI8REncoded(data) {
+		// KOI8-R: Cyrillic encoding. Test files using "set names koi8r" may contain
+		// KOI8-R bytes for table/column names. Decode to UTF-8 so the server receives
+		// valid UTF-8 and echoes the names correctly.
+		decoded, err := decodeKOI8R(data)
+		if err == nil {
+			data = decoded
+		}
 	}
 
 	var lines []string
@@ -4387,6 +4395,16 @@ func isEUCJPEncoded(data []byte) bool {
 		bytes.Contains(lower, []byte("charset ujis")) ||
 		bytes.Contains(lower, []byte("character_set eucjpms")) ||
 		bytes.Contains(lower, []byte("charset eucjpms"))
+}
+
+// isKOI8REncoded checks if the file content contains a "set names koi8r" directive,
+// indicating that identifier names may be KOI8-R encoded.
+func isKOI8REncoded(data []byte) bool {
+	// KOI8-R files contain ASCII directives, so we can scan the raw bytes for the directive.
+	lower := bytes.ToLower(data)
+	return bytes.Contains(lower, []byte("set names koi8r")) ||
+		bytes.Contains(lower, []byte("character_set koi8r")) ||
+		bytes.Contains(lower, []byte("charset koi8r"))
 }
 
 // decodeSJIS converts SJIS/CP932 encoded bytes to UTF-8.
