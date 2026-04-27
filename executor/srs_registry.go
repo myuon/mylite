@@ -183,6 +183,47 @@ func srsIsGeographicFromDefinition(definition string) bool {
 	return strings.HasPrefix(upper, "GEOGCS[") || strings.HasPrefix(upper, "GEOGCS(")
 }
 
+// srsDefinitionIsLatLong checks if the WKT SRS definition has a first axis representing
+// latitude (LAT or NORTH in the first AXIS[...] clause). Returns true for lat-long ordering.
+// Used to determine axis swapping for axis-order=srid-defined.
+func srsDefinitionIsLatLong(definition string) bool {
+	// Find the first AXIS[...] in the definition
+	upper := strings.ToUpper(definition)
+	// Look for AXIS[ or AXIS(
+	axisIdx := strings.Index(upper, "AXIS[")
+	if axisIdx < 0 {
+		axisIdx = strings.Index(upper, "AXIS(")
+	}
+	if axisIdx < 0 {
+		return false
+	}
+	// Extract the first axis name
+	rest := upper[axisIdx+5:] // skip "AXIS["
+	quoteIdx := strings.IndexByte(rest, '"')
+	if quoteIdx < 0 {
+		// No quoted name, look for direct identifier
+		return false
+	}
+	rest = rest[quoteIdx+1:] // skip opening quote
+	endQuote := strings.IndexByte(rest, '"')
+	if endQuote < 0 {
+		return false
+	}
+	firstAxisName := strings.TrimSpace(rest[:endQuote])
+	// If first axis name starts with "LAT" or is "NORTH" (in geographic), it's lat-long ordered
+	return strings.HasPrefix(firstAxisName, "LAT") || firstAxisName == "NORTH"
+}
+
+// sridIsLatLongOrdered returns true if the given SRID's SRS has latitude as the first axis
+// (lat-long ordering). Returns false for long-lat ordering or if SRID is unknown.
+func (e *Executor) sridIsLatLongOrdered(srid uint32) bool {
+	entry := e.srsGetEntry(srid)
+	if entry == nil {
+		return false
+	}
+	return srsDefinitionIsLatLong(entry.Definition)
+}
+
 // checkSuperPrivilege returns ER_SPECIFIC_ACCESS_DENIED_ERROR if the current user lacks SUPER privilege.
 // command is the human-readable command name for the error message (e.g. "CREATE SPATIAL REFERENCE SYSTEM").
 func (e *Executor) checkSuperPrivilege(command string) error {

@@ -960,6 +960,44 @@ func (gs *GrantStore) HasGlobalPrivilege(user, host, priv string, activeRoles []
 	return gs.HasPrivilege(user, host, priv, "", "", activeRoles)
 }
 
+// HasAnyDBAccess returns true if the user has any privilege on any table within the given database.
+// This is used for SHOW DATABASES filtering: if the user has a table-level grant in a database,
+// they should be able to see the database in SHOW DATABASES.
+func (gs *GrantStore) HasAnyDBAccess(user, host, dbName string, activeRoles []string) bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	entries := gs.findEntriesForUser(user, host)
+	for _, e := range entries {
+		if e.Type == GrantTypeRole {
+			continue
+		}
+		switch e.Type {
+		case GrantTypeGlobal:
+			// Global privilege → can see all databases
+			return true
+		case GrantTypeDB:
+			// DB-level grant: check if it matches this database
+			entryDB := strings.TrimSuffix(e.Object, ".*")
+			if strings.EqualFold(entryDB, dbName) {
+				return true
+			}
+		case GrantTypeTable:
+			// Table-level grant: check if the object is in this database
+			parts := strings.SplitN(e.Object, ".", 2)
+			if len(parts) == 2 && strings.EqualFold(parts[0], dbName) {
+				return true
+			}
+		}
+	}
+	// Also check roles
+	for _, roleName := range activeRoles {
+		if gs.HasAnyDBAccess(roleName, "%", dbName, nil) {
+			return true
+		}
+	}
+	return false
+}
+
 // UserHasAnyRoleGrant returns true if the given user has any role membership (GRANT role TO user).
 // Used to determine if privilege enforcement is needed even when there are no direct table grants.
 func (gs *GrantStore) UserHasAnyRoleGrant(user, host string) bool {
@@ -2027,59 +2065,64 @@ func formatPrivList(privs map[string]bool) string {
 // ParseGrantStatement parses a GRANT statement and returns its components.
 // Returns: privs, object, toUser, toHost, isRoleGrant, grantOption, adminOption
 func ParseGrantStatement(query string) (privs, object, toUser, toHost string, isRoleGrant bool, grantOption, adminOption bool) {
-	// Normalize: collapse any whitespace (including newlines from multi-line queries) to single spaces
+	// Normalize: replace all whitespace (newlines, tabs) with single spaces so that
+	// multi-line GRANT statements like "GRANT ... TO user\nWITH GRANT OPTION;" are
+	// parsed correctly.
 	q := strings.Join(strings.Fields(strings.TrimRight(strings.TrimSpace(query), ";")), " ")
-	upper := strings.ToUpper(q)
+q = strings.TrimRight(q, ";")
+upper := strings.ToUpper(q)
 
-	// Find " TO " separator
-	toIdx := strings.Index(upper, " TO ")
-	if toIdx < 0 {
-		return
-	}
-
-	grantPart := strings.TrimSpace(q[6:toIdx]) // strip "GRANT "
-	toPart := strings.TrimSpace(q[toIdx+4:])
-
-	// Check for WITH GRANT OPTION / WITH ADMIN OPTION
-	upperTo := strings.ToUpper(toPart)
-	if wi := strings.Index(upperTo, " WITH GRANT OPTION"); wi >= 0 {
-		grantOption = true
-		toPart = strings.TrimSpace(toPart[:wi])
-	} else if wi := strings.Index(upperTo, " WITH ADMIN OPTION"); wi >= 0 {
-		adminOption = true
-		toPart = strings.TrimSpace(toPart[:wi])
-	}
-
-	// Parse toUser@toHost
-	toPart = strings.TrimRight(toPart, ";")
-	// Handle multiple targets - just take first for now
-	// toUser@toHost format: user@host, `user`@`host`, 'user'@'host'
-	toUser, toHost = parseUserHost(toPart)
-
-	// Check for " ON " to distinguish privilege grant from role grant
-	onIdx := strings.Index(strings.ToUpper(grantPart), " ON ")
-	if onIdx < 0 {
-		// No ON clause -> this is a role grant: GRANT role TO user
-		// grantPart is the role name(s), possibly comma-separated (e.g. "r1, r2, r3")
-		// Return all role names joined by comma so the caller can split them.
-		privs = strings.TrimSpace(grantPart)
-		isRoleGrant = true
-		return
-	}
-
-	// GRANT privs ON object TO user
-	privs = strings.TrimSpace(grantPart[:onIdx])
-	object = strings.TrimSpace(grantPart[onIdx+4:])
-
-	// Normalize object: remove backticks and normalize
-	object = normalizeGrantObject(object)
+// Find " TO " separator
+toIdx := strings.Index(upper, " TO ")
+if toIdx < 0 {
 	return
+}
+
+grantPart := strings.TrimSpace(q[6:toIdx]) // strip "GRANT "
+toPart := strings.TrimSpace(q[toIdx+4:])
+
+// Check for WITH GRANT OPTION / WITH ADMIN OPTION
+upperTo := strings.ToUpper(toPart)
+if wi := strings.Index(upperTo, " WITH GRANT OPTION"); wi >= 0 {
+	grantOption = true
+	toPart = strings.TrimSpace(toPart[:wi])
+} else if wi := strings.Index(upperTo, " WITH ADMIN OPTION"); wi >= 0 {
+	adminOption = true
+	toPart = strings.TrimSpace(toPart[:wi])
+}
+
+// Parse toUser@toHost
+toPart = strings.TrimRight(toPart, ";")
+// Handle multiple targets - just take first for now
+// toUser@toHost format: user@host, `user`@`host`, 'user'@'host'
+toUser, toHost = parseUserHost(toPart)
+
+// Check for " ON " to distinguish privilege grant from role grant
+onIdx := strings.Index(strings.ToUpper(grantPart), " ON ")
+if onIdx < 0 {
+	// No ON clause -> this is a role grant: GRANT role TO user
+	// grantPart is the role name(s), possibly comma-separated (e.g. "r1, r2, r3")
+	// Return all role names joined by comma so the caller can split them.
+	privs = strings.TrimSpace(grantPart)
+	isRoleGrant = true
+	return
+}
+
+// GRANT privs ON object TO user
+privs = strings.TrimSpace(grantPart[:onIdx])
+object = strings.TrimSpace(grantPart[onIdx+4:])
+
+// Normalize object: remove backticks and normalize
+object = normalizeGrantObject(object)
+return
 }
 
 // ParseRevokeStatement parses a REVOKE statement.
 // Returns: privs, object, fromUser, fromHost, isRoleRevoke
 func ParseRevokeStatement(query string) (privs, object, fromUser, fromHost string, isRoleRevoke bool) {
+	// Normalize: replace all whitespace (newlines, tabs) with single spaces.
 	q := strings.Join(strings.Fields(strings.TrimRight(strings.TrimSpace(query), ";")), " ")
+	q = strings.TrimRight(q, ";")
 	upper := strings.ToUpper(q)
 
 	// REVOKE ALL PRIVILEGES, GRANT OPTION FROM user (no ON clause — revoke everything globally)

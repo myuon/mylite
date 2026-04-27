@@ -6058,20 +6058,32 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 								break
 							}
 						}
-						// Fall back to information_schema column names only if not resolved.
-						// Skip performance_schema tables since they preserve user-specified casing.
-						if !resolved {
-							for tblKey, order := range infoSchemaColumnOrder {
-								if perfSchemaColumnOrder[tblKey] {
-									continue
-								}
-								for _, col := range order {
-									if col == upperName {
-										name = col
-										break
-									}
+						// Do NOT fall back to infoSchemaColumnOrder: for explicit column names
+						// in SELECT (non-star), MySQL preserves the user's specified case in
+						// result headers, even for INFORMATION_SCHEMA tables.
+					} else if isNonISNonPSTable && len(tableDefs) > 0 {
+						// For regular (non-IS, non-PS) user tables with empty results,
+						// validate that the column exists in the table definition.
+						// This catches cases like SELECT f3 FROM t after ALTER TABLE DROP COLUMN f3.
+						upperName := strings.ToUpper(name)
+						found := false
+						for _, td := range tableDefs {
+							if td == nil {
+								continue
+							}
+							for _, col := range td.Columns {
+								if strings.ToUpper(col.Name) == upperName {
+									name = col.Name
+									found = true
+									break
 								}
 							}
+							if found {
+								break
+							}
+						}
+						if !found {
+							return nil, nil, mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'field list'", name))
 						}
 					}
 				}

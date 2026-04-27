@@ -4028,7 +4028,13 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		if val == nil {
 			return nil, nil
 		}
-		wkt := normalizeWKT(toString(val))
+		rawWKT := toString(val)
+		// Validate the WKT syntax before accepting. MySQL returns ER_GIS_INVALID_DATA (22023)
+		// for syntactically invalid WKT such as POINT() (no coordinates), non-numeric coords, etc.
+		if !isValidWKTSyntax(rawWKT) {
+			return nil, mysqlError(3516, "22023", "Invalid GIS data provided to function st_geomfromtext.")
+		}
+		wkt := normalizeWKT(rawWKT)
 		// Handle optional SRID parameter
 		if v.Srid != nil {
 			sridVal, err2 := e.evalExpr(v.Srid)
@@ -4049,9 +4055,50 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return nil, nil
 		}
 		if v.FormatType == sqlparser.BinaryFormat {
-			// Return WKB binary representation
-			wkt := geomStripSRID(toString(val))
-			wkb := wktToWKBBody(wkt)
+			// Return WKB binary representation.
+			// The axis-order option controls coordinate ordering in the WKB output:
+			//   long-lat: output (lon, lat) order — no swap (default for Cartesian/projected SRS)
+			//   lat-long: output (lat, lon) order — swap for geographic SRS only
+			//   srid-defined (default): swap only for geographic LAT-LONG SRS
+			valStr := toString(val)
+			// Extract SRID from EWKT prefix if present.
+			geomSRID := geomGetSRID(valStr)
+			wktPlain := geomStripSRID(valStr)
+			// Determine whether to swap based on axis-order option and SRID.
+			needsSwap := false
+			sridIsGeographic := e.sridIsGeographic(geomSRID)
+			if v.AxisOrderOpt != nil {
+				axisOptVal, err2 := e.evalExpr(v.AxisOrderOpt)
+				if err2 != nil {
+					return nil, err2
+				}
+				if axisOptVal == nil {
+					return nil, nil
+				}
+				axisOrder, parseErr := parseAxisOrderStr(toSpatialOptionStr(axisOptVal), "st_aswkb")
+				if parseErr != nil {
+					return nil, parseErr
+				}
+				switch axisOrder {
+				case axisOrderLatLong:
+					// Swap for ALL geographic SRS (both LONG-LAT and LAT-LONG ordering).
+					needsSwap = sridIsGeographic
+				case axisOrderLongLat:
+					// Never swap.
+					needsSwap = false
+				case axisOrderSridDefined:
+					// Swap only for geographic LAT-LONG SRS.
+					needsSwap = sridIsGeographic && e.sridIsLatLongOrdered(geomSRID)
+				}
+			} else {
+				// No axis-order option: default is srid-defined behavior.
+				// Swap only for geographic LAT-LONG SRS.
+				needsSwap = sridIsGeographic && e.sridIsLatLongOrdered(geomSRID)
+			}
+			if needsSwap {
+				wktPlain = swapAllXYInWKT(wktPlain)
+			}
+			wkb := wktToWKBBody(wktPlain)
 			if wkb != nil {
 				return wkb, nil
 			}
@@ -4081,16 +4128,74 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 		if val == nil {
 			return nil, nil
 		}
+		// Handle optional SRID parameter: validate SRID if provided.
+		srid := uint32(0)
+		if v.Srid != nil {
+			sridVal, err2 := e.evalExpr(v.Srid)
+			if err2 != nil {
+				return nil, err2
+			}
+			// If SRID argument is NULL, the result is NULL.
+			if sridVal == nil {
+				return nil, nil
+			}
+			srid = uint32(asInt64Or(sridVal, 0))
+			if !e.sridIsKnown(srid) {
+				return nil, mysqlError(3548, "SR001", fmt.Sprintf("There's no spatial reference system with SRID %d.", srid))
+			}
+		}
+		// Determine if coordinates should be swapped based on axis-order option.
+		// axis-order=long-lat: treat WKB (X,Y) as (long,lat) → no swap relative to SRS output
+		// axis-order=lat-long: treat WKB (X,Y) as (lat,long) → swap if SRS output is long-lat
+		// axis-order=srid-defined: use SRS's native ordering → never swap (consistent)
+		needsSwap := false
+		if v.AxisOrderOpt != nil {
+			axisOptVal, err2 := e.evalExpr(v.AxisOrderOpt)
+			if err2 != nil {
+				return nil, err2
+			}
+			// If axis-order option argument is NULL, the result is NULL.
+			if axisOptVal == nil {
+				return nil, nil
+			}
+			fnName := strings.ToLower(wkbFuncName(v.Type))
+			sridIsLatLong := e.sridIsLatLongOrdered(srid)
+			var parseErr error
+			needsSwap, parseErr = parseWKBAxisOrderOption(toSpatialOptionStr(axisOptVal), sridIsLatLong, fnName)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+		}
+		// Compute the function name and SRS properties for validation.
+		fnNameForValidation := strings.ToLower(wkbFuncName(v.Type))
+		sridIsGeographic := e.sridIsGeographic(srid)
+		sridIsLatLongForValidation := e.sridIsLatLongOrdered(srid)
 		// If val is []byte (WKB), decode it to WKT
 		if b, ok := val.([]byte); ok {
-			wkt := wkbToWKT(b)
+			wkt := wkbToWKTWithSwap(b, needsSwap)
 			if wkt == "" {
 				return nil, nil
 			}
+			// Validate coordinates against geographic SRS bounds if applicable.
+			if sridIsGeographic {
+				if err2 := validateWKTCoordsForGeographicSRS(wkt, sridIsLatLongForValidation, fnNameForValidation); err2 != nil {
+					return nil, err2
+				}
+			}
 			return wkt, nil
 		}
-		// If val is a string (possibly WKT), return as-is
-		return toString(val), nil
+		// If val is a string (possibly WKT), apply swap to WKT directly
+		wktStr := toString(val)
+		if needsSwap {
+			wktStr = swapXYString(wktStr)
+		}
+		// Validate coordinates against geographic SRS bounds if applicable.
+		if sridIsGeographic {
+			if err2 := validateWKTCoordsForGeographicSRS(wktStr, sridIsLatLongForValidation, fnNameForValidation); err2 != nil {
+				return nil, err2
+			}
+		}
+		return wktStr, nil
 	case *sqlparser.PointPropertyFuncExpr:
 		// ST_X, ST_Y, ST_Latitude, ST_Longitude
 		ptVal, err := e.evalExpr(v.Point)

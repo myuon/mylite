@@ -5221,6 +5221,15 @@ var builtinSchemaGrantUsers = []struct{ user, host string }{
 	{"", "%"},
 }
 
+// dbLevelPrivileges lists the individual privileges that ALL PRIVILEGES expands to
+// at the database (schema) level in INFORMATION_SCHEMA.SCHEMA_PRIVILEGES.
+// Order matches MySQL 8.0 output ordering.
+var dbLevelPrivileges = []string{
+	"ALTER", "ALTER ROUTINE", "CREATE", "CREATE ROUTINE", "CREATE TEMPORARY TABLES",
+	"CREATE VIEW", "DELETE", "DROP", "EVENT", "EXECUTE", "INDEX", "INSERT",
+	"LOCK TABLES", "REFERENCES", "SELECT", "SHOW VIEW", "TRIGGER", "UPDATE",
+}
+
 // infoSchemaSchemaPrivileges returns rows for INFORMATION_SCHEMA.SCHEMA_PRIVILEGES.
 // Only DB-level (db.*) privileges are shown.
 func (e *Executor) infoSchemaSchemaPrivileges() []storage.Row {
@@ -5249,7 +5258,7 @@ func (e *Executor) infoSchemaSchemaPrivileges() []storage.Row {
 				// Expand ALL PRIVILEGES into individual schema-level privileges
 				privsToEmit := []string{p}
 				if strings.EqualFold(p, "ALL PRIVILEGES") || strings.EqualFold(p, "ALL") {
-					privsToEmit = allSchemaPrivileges
+					privsToEmit = dbLevelPrivileges
 				}
 				for _, ep := range privsToEmit {
 					out = append(out, storage.Row{
@@ -5378,8 +5387,16 @@ func (e *Executor) infoSchemaColumnPrivileges() []storage.Row {
 	if e.grantStore == nil {
 		return []storage.Row{}
 	}
+	// For non-root users, only show their own column privileges.
+	// MySQL's INFORMATION_SCHEMA.COLUMN_PRIVILEGES filters by the current user
+	// (non-privileged users see only their own grants).
+	currentUser, currentHost, _ := e.getCurrentUserAndRoles()
 	var rows []storage.Row
 	for _, uh := range e.grantStore.ListAllUserHosts() {
+		// If running as a non-root user, skip other users' grants.
+		if currentUser != "" && !(strings.EqualFold(uh.User, currentUser) && strings.EqualFold(uh.Host, currentHost)) {
+			continue
+		}
 		grantee := fmt.Sprintf("'%s'@'%s'", uh.User, uh.Host)
 		tableGrants := e.grantStore.GetGrantsByType(uh.User, uh.Host, GrantTypeTable)
 		for _, entry := range tableGrants {
