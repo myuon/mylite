@@ -3972,6 +3972,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					Comment:   idxComment,
 					Invisible: idxInvisible,
 				})
+
 			}
 
 		case *sqlparser.AddConstraintDefinition:

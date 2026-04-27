@@ -3955,6 +3955,11 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 	var whereCols []explainWhereCondition
 	if sel.Where != nil {
 		whereCols = explainExtractWhereConditions(sel.Where.Expr, tableName)
+		// Augment with generated column expression substitution:
+		// If a WHERE condition matches a stored generated column's expression, add a condition
+		// for the generated column itself so the index on the gcol can be used.
+		gcolConditions := e.explainExtractGcolConditions(sel.Where.Expr, td)
+		whereCols = append(whereCols, gcolConditions...)
 	}
 
 	if len(whereCols) == 0 {
@@ -4318,6 +4323,111 @@ func explainExtractColumnName(expr sqlparser.Expr) string {
 		return e.Name.String()
 	}
 	return ""
+}
+
+// normalizeExprStr returns a normalized string representation of an expression
+// for comparison purposes (lowercased, backtick-stripped).
+func normalizeExprStr(expr sqlparser.Expr) string {
+	s := sqlparser.String(expr)
+	s = strings.ToLower(s)
+	s = strings.ReplaceAll(s, "`", "")
+	return s
+}
+
+// gcolExprInfo holds a generated column name and its normalized expression string.
+type gcolExprInfo struct {
+	colName string
+	exprStr string
+}
+
+// explainExtractGcolConditions checks if any WHERE sub-expression matches a
+// generated column's expression. If it does, it returns additional WHERE conditions
+// for the generated column, enabling index use on that column.
+// This implements MySQL's "substitute_generated_columns" optimization.
+func (e *Executor) explainExtractGcolConditions(where sqlparser.Expr, td *catalog.TableDef) []explainWhereCondition {
+	if where == nil || td == nil {
+		return nil
+	}
+
+	// Build a list of gcol expression info entries
+	var gcols []gcolExprInfo
+	for _, col := range td.Columns {
+		if !isGeneratedColumnType(col.Type) {
+			continue
+		}
+		exprStr := generatedColumnExpr(col.Type)
+		if exprStr == "" {
+			continue
+		}
+		// Parse and normalize the expression
+		testStmt, parseErr := e.parser().Parse("SELECT " + exprStr)
+		if parseErr != nil {
+			continue
+		}
+		testSel, ok := testStmt.(*sqlparser.Select)
+		if !ok || len(testSel.SelectExprs.Exprs) == 0 {
+			continue
+		}
+		aliased, ok := testSel.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr)
+		if !ok {
+			continue
+		}
+		normalized := normalizeExprStr(aliased.Expr)
+		gcols = append(gcols, gcolExprInfo{colName: col.Name, exprStr: normalized})
+	}
+
+	if len(gcols) == 0 {
+		return nil
+	}
+
+	var result []explainWhereCondition
+	explainExtractGcolFromExpr(where, gcols, &result)
+	return result
+}
+
+// explainExtractGcolFromExpr recursively walks a WHERE expression, checking if
+// any comparison's LHS matches a gcol expression.
+func explainExtractGcolFromExpr(expr sqlparser.Expr, gcols []gcolExprInfo, result *[]explainWhereCondition) {
+	if expr == nil {
+		return
+	}
+	switch e := expr.(type) {
+	case *sqlparser.AndExpr:
+		explainExtractGcolFromExpr(e.Left, gcols, result)
+		explainExtractGcolFromExpr(e.Right, gcols, result)
+	case *sqlparser.OrExpr:
+		explainExtractGcolFromExpr(e.Left, gcols, result)
+		explainExtractGcolFromExpr(e.Right, gcols, result)
+	case *sqlparser.ComparisonExpr:
+		// Check if LHS is not a simple column name and matches a gcol expression
+		if _, isCol := e.Left.(*sqlparser.ColName); !isCol {
+			lhsStr := normalizeExprStr(e.Left)
+			for _, gc := range gcols {
+				if lhsStr == gc.exprStr {
+					switch e.Operator {
+					case sqlparser.EqualOp, sqlparser.NullSafeEqualOp:
+						*result = append(*result, explainWhereCondition{column: gc.colName, isEquality: true})
+					case sqlparser.InOp:
+						*result = append(*result, explainWhereCondition{column: gc.colName, isEquality: true, isRange: true})
+					case sqlparser.GreaterThanOp, sqlparser.GreaterEqualOp,
+						sqlparser.LessThanOp, sqlparser.LessEqualOp:
+						*result = append(*result, explainWhereCondition{column: gc.colName, isRange: true})
+					}
+					break
+				}
+			}
+		}
+	case *sqlparser.BetweenExpr:
+		if _, isCol := e.Left.(*sqlparser.ColName); !isCol {
+			lhsStr := normalizeExprStr(e.Left)
+			for _, gc := range gcols {
+				if lhsStr == gc.exprStr {
+					*result = append(*result, explainWhereCondition{column: gc.colName, isRange: true})
+					break
+				}
+			}
+		}
+	}
 }
 
 // explainHasRangeFromOtherTable checks whether the WHERE expression contains a
