@@ -561,7 +561,93 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		}
 		return int64(0), true, nil
 	case "roles_graphml":
-		return "<graphml/>", true, nil
+		if e.grantStore == nil {
+			return "<graphml/>", true, nil
+		}
+		// Build a GraphML document representing the role grant graph.
+		// Nodes = all roles + all known users. Edges = role-to-user and role-to-role grants.
+		var sb strings.Builder
+		sb.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
+		sb.WriteString(`<graphml xmlns="http://graphml.graphdrawing.org/graphml">`)
+		sb.WriteString(`<graph id="roles" edgedefault="directed">`)
+
+		// Collect nodes: roles first, then users
+		roles := e.grantStore.ListAllRoles()
+		users := e.grantStore.ListAllUserHosts()
+
+		nodeID := make(map[string]string)
+		nodeCounter := 0
+		makeNode := func(key string) string {
+			if id, ok := nodeID[key]; ok {
+				return id
+			}
+			id := fmt.Sprintf("n%d", nodeCounter)
+			nodeID[key] = id
+			nodeCounter++
+			return id
+		}
+
+		// Add role nodes
+		for _, r := range roles {
+			key := r.User + "@" + r.Host
+			id := makeNode(key)
+			sb.WriteString(fmt.Sprintf(`<node id="%s">`, id))
+			sb.WriteString(fmt.Sprintf(`<data key="key_0">%s@%s</data>`, r.User, r.Host))
+			sb.WriteString(`</node>`)
+		}
+		// Add user nodes (built-in mysql.* users + created users)
+		builtinUsers := []UserHostEntry{
+			{User: "mysql.infoschema", Host: "localhost"},
+			{User: "mysql.session", Host: "localhost"},
+			{User: "mysql.sys", Host: "localhost"},
+			{User: "root", Host: "localhost"},
+		}
+		// Merge builtins with users list (dedup)
+		seenUser := make(map[string]bool)
+		for _, u := range builtinUsers {
+			key := u.User + "@" + u.Host
+			seenUser[key] = true
+			id := makeNode(key)
+			sb.WriteString(fmt.Sprintf(`<node id="%s">`, id))
+			sb.WriteString(fmt.Sprintf(`<data key="key_0">%s@%s</data>`, u.User, u.Host))
+			sb.WriteString(`</node>`)
+		}
+		for _, u := range users {
+			key := u.User + "@" + u.Host
+			if seenUser[key] {
+				continue
+			}
+			seenUser[key] = true
+			id := makeNode(key)
+			sb.WriteString(fmt.Sprintf(`<node id="%s">`, id))
+			sb.WriteString(fmt.Sprintf(`<data key="key_0">%s@%s</data>`, u.User, u.Host))
+			sb.WriteString(`</node>`)
+		}
+
+		// Add edges from ScanRoleEdges
+		edges := e.grantStore.ScanRoleEdges()
+		edgeCounter := 0
+		for _, edge := range edges {
+			fromKey := edge["FROM_USER"].(string) + "@" + edge["FROM_HOST"].(string)
+			toKey := edge["TO_USER"].(string) + "@" + edge["TO_HOST"].(string)
+			// Ensure nodes exist
+			if _, ok := nodeID[fromKey]; !ok {
+				makeNode(fromKey)
+			}
+			if _, ok := nodeID[toKey]; !ok {
+				makeNode(toKey)
+			}
+			fromID := nodeID[fromKey]
+			toID := nodeID[toKey]
+			sb.WriteString(fmt.Sprintf(`<edge id="e%d" source="%s" target="%s">`, edgeCounter, fromID, toID))
+			sb.WriteString(fmt.Sprintf(`<data key="key_1">%s</data>`, edge["WITH_ADMIN_OPTION"]))
+			sb.WriteString(`</edge>`)
+			edgeCounter++
+		}
+
+		sb.WriteString(`</graph>`)
+		sb.WriteString(`</graphml>`)
+		return sb.String(), true, nil
 	case "uuid":
 		uuidB := make([]byte, 16)
 		rand.Read(uuidB)
