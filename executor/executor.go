@@ -6650,15 +6650,25 @@ func (e *Executor) checkTablePrivilege(stmt sqlparser.Statement) error {
 					if !t.As.IsEmpty() {
 						aliasName = strings.ToLower(t.As.String())
 					}
-					var tblPriv string
-					if !isMultiTable || updatedTables[tblName] || updatedTables[aliasName] || len(updatedTables) == 0 {
-						tblPriv = "UPDATE"
-					} else {
-						tblPriv = "SELECT"
-					}
 					dbName := e.CurrentDB
 					if !tn.Qualifier.IsEmpty() {
 						dbName = tn.Qualifier.String()
+					}
+					var tblPriv string
+					if !isMultiTable || updatedTables[tblName] || updatedTables[aliasName] {
+						tblPriv = "UPDATE"
+					} else if len(updatedTables) == 0 {
+						// SET clause uses unqualified columns: we can't determine which table each
+						// column belongs to without schema resolution. Check if user has any UPDATE
+						// privilege (table-level or column-level) on this table. If yes, require UPDATE.
+						// If user only has SELECT (any form), require only SELECT.
+						if e.grantStore.HasPrivilege(user, host, "UPDATE", dbName, tn.Name.String(), activeRoles) {
+							tblPriv = "UPDATE"
+						} else {
+							tblPriv = "SELECT"
+						}
+					} else {
+						tblPriv = "SELECT"
 					}
 					return checkAccess(tblPriv, dbName, tn.Name.String())
 				}

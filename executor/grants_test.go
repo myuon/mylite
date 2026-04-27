@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -64,6 +65,134 @@ func TestParseGrantStatement(t *testing.T) {
 		if isRoleGrant != tc.wantRoleGrant {
 			t.Errorf("ParseGrantStatement(%q) isRoleGrant = %v, want %v", tc.query, isRoleGrant, tc.wantRoleGrant)
 		}
+	}
+}
+
+// TestSelectPrivilegeEnforcement verifies that SELECT privilege checks work:
+//   - root (no __current_user) has full access
+//   - non-root user without SELECT is denied with error 1142
+//   - non-root user with SELECT on the specific table is allowed
+//   - non-root user with global SELECT (ON *.*) is allowed
+//   - non-root user with DB-level SELECT (ON db.*) is allowed
+//   - GRANT/REVOKE is reflected immediately
+func TestSelectPrivilegeEnforcement(t *testing.T) {
+	e := newTestExecutor(t)
+
+	// Create test table
+	if _, err := e.Execute("CREATE TABLE t_priv (id INT, val VARCHAR(10))"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if _, err := e.Execute("INSERT INTO t_priv VALUES (1, 'a')"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	// Create user u1 with no privileges
+	if _, err := e.Execute("CREATE USER u1@localhost"); err != nil {
+		t.Fatalf("CREATE USER: %v", err)
+	}
+
+	// GRANT SELECT on test.t_priv to u1
+	if _, err := e.Execute("GRANT SELECT ON test.t_priv TO u1@localhost"); err != nil {
+		t.Fatalf("GRANT SELECT: %v", err)
+	}
+
+	// Root (no __current_user set) should always succeed
+	if _, err := e.Execute("SELECT * FROM t_priv"); err != nil {
+		t.Fatalf("root SELECT should succeed: %v", err)
+	}
+
+	// Set current user to u1 (simulating non-root connection)
+	if _, err := e.Execute("SET @__current_user = 'u1'"); err != nil {
+		t.Fatalf("SET current_user: %v", err)
+	}
+
+	// u1 has SELECT on test.t_priv - should succeed
+	if _, err := e.Execute("SELECT * FROM t_priv"); err != nil {
+		t.Fatalf("u1 SELECT on t_priv should succeed: %v", err)
+	}
+
+	// Create another table with no grant for u1
+	if _, err := e.Execute("SET @__current_user = ''"); err != nil {
+		t.Fatalf("SET current_user: %v", err)
+	}
+	if _, err := e.Execute("CREATE TABLE t_priv2 (id INT)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if _, err := e.Execute("SET @__current_user = 'u1'"); err != nil {
+		t.Fatalf("SET current_user: %v", err)
+	}
+
+	// u1 has no SELECT on test.t_priv2 - should fail with 1142
+	_, err := e.Execute("SELECT * FROM t_priv2")
+	if err == nil {
+		t.Fatal("u1 SELECT on t_priv2 should be denied")
+	}
+	if !strings.Contains(err.Error(), "1142") {
+		t.Fatalf("expected error 1142, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "SELECT command denied") {
+		t.Fatalf("expected 'SELECT command denied', got: %v", err)
+	}
+
+	// Clear user context back to root
+	if _, err := e.Execute("SET @__current_user = ''"); err != nil {
+		t.Fatalf("SET current_user: %v", err)
+	}
+
+	// Create u2 with global SELECT
+	if _, err := e.Execute("CREATE USER u2@localhost"); err != nil {
+		t.Fatalf("CREATE USER u2: %v", err)
+	}
+	if _, err := e.Execute("GRANT SELECT ON *.* TO u2@localhost"); err != nil {
+		t.Fatalf("GRANT SELECT *.*: %v", err)
+	}
+	if _, err := e.Execute("SET @__current_user = 'u2'"); err != nil {
+		t.Fatalf("SET current_user: %v", err)
+	}
+
+	// u2 has global SELECT - should succeed on any table
+	if _, err := e.Execute("SELECT * FROM t_priv"); err != nil {
+		t.Fatalf("u2 global SELECT on t_priv should succeed: %v", err)
+	}
+	if _, err := e.Execute("SELECT * FROM t_priv2"); err != nil {
+		t.Fatalf("u2 global SELECT on t_priv2 should succeed: %v", err)
+	}
+
+	// Test REVOKE: grant u1 SELECT on t_priv AND t_priv2, then revoke t_priv2.
+	// u1 should be denied on t_priv2 but allowed on t_priv.
+	if _, err := e.Execute("SET @__current_user = ''"); err != nil {
+		t.Fatalf("SET current_user: %v", err)
+	}
+	// Grant u1 SELECT on both tables
+	if _, err := e.Execute("GRANT SELECT ON test.t_priv TO u1@localhost"); err != nil {
+		t.Fatalf("GRANT SELECT t_priv: %v", err)
+	}
+	if _, err := e.Execute("GRANT SELECT ON test.t_priv2 TO u1@localhost"); err != nil {
+		t.Fatalf("GRANT SELECT t_priv2: %v", err)
+	}
+	// Now REVOKE t_priv2 - u1 still has t_priv grant so enforcement applies
+	if _, err := e.Execute("REVOKE SELECT ON test.t_priv2 FROM u1@localhost"); err != nil {
+		t.Fatalf("REVOKE SELECT t_priv2: %v", err)
+	}
+	if _, err := e.Execute("SET @__current_user = 'u1'"); err != nil {
+		t.Fatalf("SET current_user: %v", err)
+	}
+
+	// u1 still has SELECT on t_priv - should succeed
+	if _, err := e.Execute("SELECT * FROM t_priv"); err != nil {
+		t.Fatalf("u1 SELECT on t_priv should succeed after partial REVOKE: %v", err)
+	}
+
+	// u1 no longer has SELECT on t_priv2 - should fail with 1142
+	_, err = e.Execute("SELECT * FROM t_priv2")
+	if err == nil {
+		t.Fatal("u1 SELECT on t_priv2 should be denied after REVOKE")
+	}
+	if !strings.Contains(err.Error(), "1142") {
+		t.Fatalf("expected error 1142 after REVOKE, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "SELECT command denied") {
+		t.Fatalf("expected 'SELECT command denied' after REVOKE, got: %v", err)
 	}
 }
 
