@@ -1242,26 +1242,53 @@ func objectToGrantType(object string) GrantType {
 	return GrantTypeTable
 }
 
+// splitPrivs splits a privilege list string on commas that are outside parentheses.
+// This handles column-level grants like "SELECT(a,b), INSERT" correctly, producing
+// ["SELECT(a,b)", "INSERT"] rather than ["SELECT(a", "b)", "INSERT"].
+func splitPrivs(privs string) []string {
+	var parts []string
+	depth := 0
+	start := 0
+	for i, ch := range privs {
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				parts = append(parts, privs[start:i])
+				start = i + 1
+			}
+		}
+	}
+	parts = append(parts, privs[start:])
+	return parts
+}
+
 // normalizePrivList converts a comma-separated privilege string into a sorted uppercase list.
-// For column-level grants like "SELECT(c1)", the priv name is uppercased but column names
-// are kept lowercase (MySQL stores them lowercase).
+// For column-level grants like "SELECT(c1,c2)", the priv name is uppercased but column names
+// are kept lowercase (MySQL stores them lowercase). Commas inside parentheses (column lists)
+// are not treated as privilege separators.
 func normalizePrivList(privs string) []string {
 	// Expand ALL / ALL PRIVILEGES
 	upper := strings.ToUpper(strings.TrimSpace(privs))
 	if upper == "ALL" || upper == "ALL PRIVILEGES" {
 		return []string{"ALL PRIVILEGES"}
 	}
-	parts := strings.Split(privs, ",")
+	parts := splitPrivs(privs)
 	var result []string
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
-		// Handle column-level grants: "SELECT(c1)" -> "SELECT(c1)" with uppercase priv name
+		// Handle column-level grants: "SELECT(c1,c2)" -> "SELECT(c1,c2)" with uppercase priv name
 		if parenIdx := strings.Index(p, "("); parenIdx > 0 {
 			basePriv := strings.ToUpper(strings.TrimSpace(p[:parenIdx]))
-			colPart := p[parenIdx:] // "(c1)" - preserve as-is but lowercase col names
+			colPart := p[parenIdx:] // "(c1,c2)" - preserve as-is but lowercase col names
 			// Lowercase the column names inside parens
 			colPart = "(" + strings.ToLower(strings.Trim(strings.TrimSpace(colPart), "()")) + ")"
 			result = append(result, basePriv+colPart)

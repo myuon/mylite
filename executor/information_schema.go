@@ -503,7 +503,7 @@ var emptyStubTables = map[string]bool{
 	"innodb_ft_config":       true,
 	"innodb_ft_being_deleted": true,
 	"innodb_ft_deleted":      true,
-	"column_privileges":      true,
+	// "column_privileges" is handled dynamically via infoSchemaColumnPrivileges.
 	"persisted_variables":    true,
 	// "variables_by_thread" is handled dynamically
 	// "status_by_thread" is handled dynamically
@@ -1001,6 +1001,8 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.infoSchemaSchemaPrivileges()
 	case "table_privileges":
 		rawRows = e.infoSchemaTablePrivileges()
+	case "column_privileges":
+		rawRows = e.infoSchemaColumnPrivileges()
 	case "routines":
 		rawRows = e.infoSchemaRoutines()
 	case "views":
@@ -4771,6 +4773,57 @@ func (e *Executor) infoSchemaTablePrivileges() []storage.Row {
 					"PRIVILEGE_TYPE": p,
 					"IS_GRANTABLE":   isGrantable,
 				})
+			}
+		}
+	}
+	return rows
+}
+
+// infoSchemaColumnPrivileges returns rows for INFORMATION_SCHEMA.COLUMN_PRIVILEGES.
+// Only table-level (db.table) grants that have column-level specifiers (e.g. SELECT(col))
+// are emitted here — one row per (grantee, db, table, column, privilege) combination.
+func (e *Executor) infoSchemaColumnPrivileges() []storage.Row {
+	if e.grantStore == nil {
+		return []storage.Row{}
+	}
+	var rows []storage.Row
+	for _, uh := range e.grantStore.ListAllUserHosts() {
+		grantee := fmt.Sprintf("'%s'@'%s'", uh.User, uh.Host)
+		tableGrants := e.grantStore.GetGrantsByType(uh.User, uh.Host, GrantTypeTable)
+		for _, entry := range tableGrants {
+			parts := strings.SplitN(entry.Object, ".", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			dbName, tableName := parts[0], parts[1]
+			isGrantable := "NO"
+			if entry.GrantOption {
+				isGrantable = "YES"
+			}
+			for _, p := range entry.Privs {
+				parenIdx := strings.Index(p, "(")
+				if parenIdx < 0 {
+					// Not a column-level grant; skip.
+					continue
+				}
+				basePriv := strings.TrimSpace(p[:parenIdx])
+				// Column list is inside parens, comma-separated, already lowercased.
+				colList := strings.Trim(p[parenIdx:], "()")
+				for _, col := range strings.Split(colList, ",") {
+					col = strings.TrimSpace(col)
+					if col == "" {
+						continue
+					}
+					rows = append(rows, storage.Row{
+						"GRANTEE":        grantee,
+						"TABLE_CATALOG":  "def",
+						"TABLE_SCHEMA":   dbName,
+						"TABLE_NAME":     tableName,
+						"COLUMN_NAME":    col,
+						"PRIVILEGE_TYPE": basePriv,
+						"IS_GRANTABLE":   isGrantable,
+					})
+				}
 			}
 		}
 	}

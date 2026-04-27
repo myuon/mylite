@@ -196,6 +196,45 @@ func TestSelectPrivilegeEnforcement(t *testing.T) {
 	}
 }
 
+func TestInfoSchemaColumnPrivileges(t *testing.T) {
+	e := newTestExecutor(t)
+
+	// Set up: create table, user, and column-level grant.
+	if _, err := e.Execute("CREATE TABLE t_col (id INT, name VARCHAR(10), secret INT)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if _, err := e.Execute("CREATE USER u_col@localhost"); err != nil {
+		t.Fatalf("CREATE USER: %v", err)
+	}
+	// GRANT SELECT(id,name) on test.t_col TO u_col@localhost
+	if _, err := e.Execute("GRANT SELECT(id,name) ON test.t_col TO u_col@localhost"); err != nil {
+		t.Fatalf("GRANT SELECT(id,name): %v", err)
+	}
+	// Also grant a full table-level privilege (should NOT appear in COLUMN_PRIVILEGES).
+	if _, err := e.Execute("GRANT INSERT ON test.t_col TO u_col@localhost"); err != nil {
+		t.Fatalf("GRANT INSERT: %v", err)
+	}
+
+	res, err := e.Execute("SELECT GRANTEE, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, PRIVILEGE_TYPE FROM INFORMATION_SCHEMA.COLUMN_PRIVILEGES ORDER BY COLUMN_NAME")
+	if err != nil {
+		t.Fatalf("SELECT COLUMN_PRIVILEGES: %v", err)
+	}
+
+	// Should return exactly two rows: id and name (not secret, not INSERT).
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 COLUMN_PRIVILEGES rows, got %d: %v", len(res.Rows), res.Rows)
+	}
+	for _, row := range res.Rows {
+		if row[4] != "SELECT" {
+			t.Errorf("PRIVILEGE_TYPE should be SELECT, got %v", row[4])
+		}
+		colName, _ := row[3].(string)
+		if colName != "id" && colName != "name" {
+			t.Errorf("unexpected column_name %q in COLUMN_PRIVILEGES", colName)
+		}
+	}
+}
+
 func TestExecutorGrantFlow(t *testing.T) {
 	// Test the full executor grant flow
 	e := newTestExecutor(t)
