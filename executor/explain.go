@@ -1486,12 +1486,16 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 			// (primary key / unique key equality lookup), not for ALL-scan empty tables.
 			accessInfo := e.explainDetectAccessType(sel, tblName)
 
-			// "no matching row in const table": MySQL shows this only when the table is accessed
-			// via const access (PRIMARY KEY equality) and the row doesn't exist (empty table).
-			// For ALL-scan empty tables MySQL still shows the plan with the real table name.
+			// "no matching row in const table": MySQL shows this for single-table SELECT queries
+			// where the table is empty, regardless of access type (ALL, const, system, etc.).
+			// This applies for SIMPLE top-level queries with no complex parts (no subqueries),
+			// or for const/system access types in any context.
+			// For queries with subqueries, the behavior is different (e.g. "Impossible WHERE
+			// noticed after reading const tables"), so only apply the ALL case for truly simple queries.
 			// Exception: MATERIALIZED subqueries always show the real table name with 0 rows.
+			isSimpleTopLevel := selectType == "SIMPLE" && !e.queryHasComplexParts(sel)
 			if tableIsEmpty && len(allTableNames) == 1 && idx == 0 && selectType != "MATERIALIZED" &&
-				(accessInfo.accessType == "const" || accessInfo.accessType == "system") {
+				(isSimpleTopLevel || accessInfo.accessType == "const" || accessInfo.accessType == "system") {
 				result = append(result, explainSelectType{
 					id:         myID,
 					selectType: selectType,
@@ -4779,19 +4783,56 @@ func (e *Executor) explainJSONTableBlock(row []interface{}, query string) []orde
 	if row[6] != nil {
 		keyStr := fmt.Sprintf("%v", row[6])
 		kvs = append(kvs, orderedKV{"key", keyStr})
-		// used_key_parts: resolve "PRIMARY" to actual PK column names
+		// used_key_parts: determine which leading columns of the index were used.
+		// We infer this from key_len: accumulate column sizes until we reach key_len.
 		var usedKeyParts []interface{}
-		if strings.EqualFold(keyStr, "PRIMARY") && row[2] != nil {
-			// Look up the actual primary key columns for this table
+		if row[2] != nil {
 			tblName := fmt.Sprintf("%v", row[2])
-			if td := e.explainGetTableDef(tblName); td != nil && len(td.PrimaryKey) > 0 {
-				for _, pk := range td.PrimaryKey {
-					usedKeyParts = append(usedKeyParts, pk)
+			td := e.explainGetTableDef(tblName)
+			if td != nil {
+				// Find the key_len value to determine how many columns were used
+				keyLenVal := 0
+				if row[7] != nil {
+					if kl, err := strconv.Atoi(fmt.Sprintf("%v", row[7])); err == nil {
+						keyLenVal = kl
+					}
+				}
+				// Find the index columns
+				var idxCols []string
+				if strings.EqualFold(keyStr, "PRIMARY") {
+					idxCols = td.PrimaryKey
+				} else {
+					for _, idx := range td.Indexes {
+						if strings.EqualFold(idx.Name, keyStr) {
+							idxCols = idx.Columns
+							break
+						}
+					}
+				}
+				if len(idxCols) > 0 && keyLenVal > 0 {
+					// Accumulate column sizes until we reach key_len
+					accum := 0
+					for _, col := range idxCols {
+						colDef := findColumnDef(td, col)
+						if colDef == nil {
+							break
+						}
+						accum += explainKeyLen(colDef, td.Charset)
+						usedKeyParts = append(usedKeyParts, col)
+						if accum >= keyLenVal {
+							break
+						}
+					}
+				} else if len(idxCols) > 0 {
+					// No key_len, use all index columns
+					for _, col := range idxCols {
+						usedKeyParts = append(usedKeyParts, col)
+					}
 				}
 			}
 		}
 		if len(usedKeyParts) == 0 {
-			// Fallback: split the key string by comma
+			// Fallback: split the key string by comma (for special keys like <auto_key>)
 			parts := strings.Split(keyStr, ",")
 			usedKeyParts = make([]interface{}, len(parts))
 			for i, p := range parts {
