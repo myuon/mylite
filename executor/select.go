@@ -2893,8 +2893,18 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				fromExprD = stmt.From[0]
 			}
 			defaultCollationD := resolveOrderByCollation(selectTableDefs, fromExprD)
-			srcRows := uniqueSourceRows
-			sort.SliceStable(resultRows, func(a, b int) bool {
+			// Build a combined slice so that resultRows and uniqueSourceRows are sorted
+			// in tandem. Sorting resultRows alone while reading from uniqueSourceRows by
+			// index is incorrect because uniqueSourceRows does not move with resultRows.
+			type distinctPair struct {
+				result []interface{}
+				source storage.Row
+			}
+			pairs := make([]distinctPair, len(resultRows))
+			for i := range resultRows {
+				pairs[i] = distinctPair{result: resultRows[i], source: uniqueSourceRows[i]}
+			}
+			sort.SliceStable(pairs, func(a, b int) bool {
 				for _, order := range stmt.OrderBy {
 					expr := order.Expr
 					orderCollation := defaultCollationD
@@ -2908,8 +2918,8 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 							expr = convExpr.Expr
 						}
 					}
-					va := resolveOrderByExprValue(e, expr, srcRows[a])
-					vb := resolveOrderByExprValue(e, expr, srcRows[b])
+					va := resolveOrderByExprValue(e, expr, pairs[a].source)
+					vb := resolveOrderByExprValue(e, expr, pairs[b].source)
 					cmp := compareByCollation(va, vb, orderCollation)
 					if cmp == 0 {
 						continue
@@ -2922,7 +2932,10 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				}
 				return false
 			})
-			// Also sort uniqueSourceRows to keep in sync (needed if further sorts happen)
+			for i, p := range pairs {
+				resultRows[i] = p.result
+				uniqueSourceRows[i] = p.source
+			}
 			preSortedOrderBy = true // mark as sorted, skip second ORDER BY pass
 		}
 	}
