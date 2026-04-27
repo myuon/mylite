@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -527,27 +528,25 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		}
 	}
 
-	newRows := make([]storage.Row, 0)
 	var affected uint64
-	// afterDeleteRows collects rows that need AFTER DELETE trigger firing.
-	// We fire AFTER DELETE triggers after the row has been physically removed from tbl.Rows,
-	// so that trigger queries (e.g. SELECT COUNT(*)) see the post-deletion state.
-	type afterDeleteEntry struct {
-		row storage.Row
-	}
-	var afterDeleteRows []afterDeleteEntry
 
-	for _, row := range tbl.Rows {
+	// Process rows one at a time, matching MySQL's per-row trigger semantics:
+	//   BEFORE DELETE → delete row → AFTER DELETE
+	// We take a snapshot of the original rows to iterate over (so WHERE evaluation
+	// sees the full original table), then process each matching row: fire BEFORE DELETE,
+	// remove the row from tbl.Rows, and fire AFTER DELETE immediately.
+	originalRows := make([]storage.Row, len(tbl.Rows))
+	copy(originalRows, tbl.Rows)
+
+	for _, row := range originalRows {
 		match := true
 		// Apply PARTITION filter: skip rows not belonging to the specified partitions.
 		if len(stmt.Partitions) > 0 && tbl.Def != nil {
 			inPart, partErr := e.rowBelongsToPartitions(stmt.Partitions, tbl.Def, row)
 			if partErr != nil {
-				newRows = append(newRows, row)
 				continue
 			}
 			if !inPart {
-				newRows = append(newRows, row)
 				continue
 			}
 		}
@@ -565,57 +564,78 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 				match = m
 			}
 		}
-		if match {
-			// Fire BEFORE DELETE triggers
-			tbl.Unlock()
-			if err := e.fireTriggers(tableName, "BEFORE", "DELETE", nil, row); err != nil {
-				tbl.Lock()
-				return nil, err
-			}
-			tbl.Lock()
-
-			// Enforce FOREIGN KEY constraints: check child rows referencing this parent row
-			tbl.Unlock()
-			if err := e.checkForeignKeyOnDelete(deleteDB, tableName, row); err != nil {
-				tbl.Lock()
-				if bool(stmt.Ignore) {
-					// DELETE IGNORE: add warning, skip this row (don't delete it)
-					errCode := 1451
-					msg := strings.TrimPrefix(err.Error(), "ERROR 1451 (23000): ")
-					e.addWarning("Warning", errCode, msg)
-					newRows = append(newRows, row)
-					continue
-				}
-				return nil, err
-			}
-			tbl.Lock()
-
-			affected++
-			// Collect row for AFTER DELETE trigger (fired after tbl.Rows is updated)
-			afterDeleteRows = append(afterDeleteRows, afterDeleteEntry{row: row})
-		} else {
-			newRows = append(newRows, row)
+		if !match {
+			continue
 		}
-	}
-	tbl.Rows = newRows
-	// For HEAP/MEMORY tables: if the table is now completely empty, set HeapInsertFront.
-	if tbl.IsHeap() && len(tbl.Rows) == 0 {
-		tbl.HeapInsertFront = true
-	}
-	tbl.InvalidateIndexes()
 
-	// Fire AFTER DELETE triggers now that tbl.Rows reflects the post-deletion state.
-	// This ensures trigger queries (e.g. SELECT COUNT(*)) see the correct row counts.
-	for _, entry := range afterDeleteRows {
+		// Fire BEFORE DELETE triggers
 		tbl.Unlock()
-		if err := e.fireTriggers(tableName, "AFTER", "DELETE", nil, entry.row); err != nil {
+		if err := e.fireTriggers(tableName, "BEFORE", "DELETE", nil, row); err != nil {
+			tbl.Lock()
+			return nil, err
+		}
+		tbl.Lock()
+
+		// Enforce FOREIGN KEY constraints: check child rows referencing this parent row
+		tbl.Unlock()
+		if err := e.checkForeignKeyOnDelete(deleteDB, tableName, row); err != nil {
+			tbl.Lock()
+			if bool(stmt.Ignore) {
+				// DELETE IGNORE: add warning, skip this row (don't delete it)
+				errCode := 1451
+				msg := strings.TrimPrefix(err.Error(), "ERROR 1451 (23000): ")
+				e.addWarning("Warning", errCode, msg)
+				continue
+			}
+			return nil, err
+		}
+		tbl.Lock()
+
+		// Remove this row from tbl.Rows (find and remove the first matching entry).
+		// Use pointer identity: storage.Row is a map, so we compare the map header.
+		newRows := make([]storage.Row, 0, len(tbl.Rows))
+		rowRemoved := false
+		for _, r := range tbl.Rows {
+			if !rowRemoved && rowPtrEqual(r, row) {
+				rowRemoved = true
+				continue
+			}
+			newRows = append(newRows, r)
+		}
+		tbl.Rows = newRows
+		tbl.InvalidateIndexes()
+		affected++
+
+		// Fire AFTER DELETE trigger immediately after removing this row.
+		// This matches MySQL semantics: AFTER DELETE sees the row already gone.
+		tbl.Unlock()
+		if err := e.fireTriggers(tableName, "AFTER", "DELETE", nil, row); err != nil {
 			tbl.Lock()
 			return nil, err
 		}
 		tbl.Lock()
 	}
 
+	// For HEAP/MEMORY tables: if the table is now completely empty, set HeapInsertFront.
+	if tbl.IsHeap() && len(tbl.Rows) == 0 {
+		tbl.HeapInsertFront = true
+	}
+
 	return &Result{AffectedRows: affected}, nil
+}
+
+// rowPtrEqual returns true if two storage.Row map values refer to the same
+// underlying map (pointer identity). Used to uniquely identify a specific row
+// from an originalRows snapshot within the current tbl.Rows slice.
+func rowPtrEqual(a, b storage.Row) bool {
+	va, vb := reflect.ValueOf(a), reflect.ValueOf(b)
+	if !va.IsValid() || !vb.IsValid() {
+		return !va.IsValid() && !vb.IsValid()
+	}
+	if va.IsNil() || vb.IsNil() {
+		return va.IsNil() && vb.IsNil()
+	}
+	return va.Pointer() == vb.Pointer()
 }
 
 func numericOrderColumnSet(def *catalog.TableDef, colNames []string) map[int]bool {
