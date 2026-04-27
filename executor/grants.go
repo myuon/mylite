@@ -948,6 +948,306 @@ func (gs *GrantStore) HasAnyTableAccess(user, host, db, table string, activeRole
 	return false
 }
 
+// HasAdminOption checks if a user (with active roles) has WITH ADMIN OPTION for the given role.
+// This is required to grant a role to others. The user must have the role granted to them
+// WITH ADMIN OPTION, either directly or via an active role with WITH ADMIN OPTION.
+func (gs *GrantStore) HasAdminOption(user, host, roleName, roleHost string, activeRoles []string) bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	checkEntriesForAdminOption := func(entries []GrantEntry) bool {
+		for _, e := range entries {
+			if e.Type != GrantTypeRole {
+				continue
+			}
+			if !e.GrantOption {
+				continue
+			}
+			if strings.EqualFold(e.RoleName, roleName) {
+				rh := e.RoleHost
+				if rh == "" {
+					rh = "%"
+				}
+				if strings.EqualFold(rh, roleHost) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// Check user's direct grants
+	allUserEntries := gs.findEntriesForUser(user, host)
+	if checkEntriesForAdminOption(allUserEntries) {
+		return true
+	}
+
+	// Check via active roles recursively
+	var checkRole func(rn, rh string, visited map[string]bool) bool
+	checkRole = func(rn, rh string, visited map[string]bool) bool {
+		rk := userKey(rn, rh)
+		if visited[rk] {
+			return false
+		}
+		visited[rk] = true
+		// Check role's privilege grants (in gs.roles) AND membership grants (in gs.entries)
+		// Role membership grants for a role go into gs.entries (via AddRoleGrant).
+		if checkEntriesForAdminOption(gs.roles[rk]) {
+			return true
+		}
+		if checkEntriesForAdminOption(gs.entries[rk]) {
+			return true
+		}
+		// Recurse into nested roles
+		allEntries := append(gs.roles[rk], gs.entries[rk]...)
+		for _, e := range allEntries {
+			if e.Type == GrantTypeRole {
+				nh := e.RoleHost
+				if nh == "" {
+					nh = "%"
+				}
+				if checkRole(e.RoleName, nh, visited) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	visited := make(map[string]bool)
+	for _, r := range activeRoles {
+		if checkRole(r, "%", visited) {
+			return true
+		}
+	}
+	return false
+}
+
+// HasGrantOption checks if a user (with active roles) has GRANT OPTION for the given privilege
+// on the given scope (object like "*.*", "db.*", "db.table"). Returns true if they can grant
+// that privilege on that scope. A wider-scope GRANT OPTION covers narrower scopes.
+func (gs *GrantStore) HasGrantOption(user, host, priv, object string, activeRoles []string) bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	priv = strings.ToUpper(priv)
+	gtype := objectToGrantType(object)
+
+	// Parse object to db/table for scope checking.
+	var targetDB, targetTable string
+	switch gtype {
+	case GrantTypeGlobal:
+		// no db/table needed
+	case GrantTypeDB:
+		targetDB = strings.TrimSuffix(object, ".*")
+	case GrantTypeTable:
+		parts := strings.SplitN(object, ".", 2)
+		if len(parts) == 2 {
+			targetDB = parts[0]
+			targetTable = parts[1]
+		}
+	}
+
+	// checkEntriesForGrantOption checks if a list of entries grants GRANT OPTION
+	// for the given privilege covering the given scope (object/gtype).
+	checkEntriesForGrantOption := func(entries []GrantEntry) bool {
+		for _, e := range entries {
+			if e.Type == GrantTypeRole || !e.GrantOption {
+				continue
+			}
+			// Check if this entry has the required privilege
+			hasPriv := false
+			for _, p := range e.Privs {
+				if p == "ALL PRIVILEGES" || strings.EqualFold(p, priv) {
+					hasPriv = true
+					break
+				}
+				// Column-level grants count for base priv
+				if parenIdx := strings.Index(p, "("); parenIdx > 0 {
+					if strings.EqualFold(strings.TrimSpace(p[:parenIdx]), priv) {
+						hasPriv = true
+						break
+					}
+				}
+			}
+			if !hasPriv {
+				continue
+			}
+			// Check if this entry's scope covers the target scope.
+			// For GRANT authority, a stored grant on pattern P covers requested scope T
+			// if P (as a LIKE pattern) matches T (as a literal string).
+			// Example: stored "db%.*" covers "db_.*" because "db_" matches LIKE "db%".
+			// Example: stored "secdb1.*" does NOT cover "secdb_.*" because "secdb_" does NOT match LIKE "secdb1".
+			switch e.Type {
+			case GrantTypeGlobal:
+				// Global GRANT OPTION covers everything
+				return true
+			case GrantTypeDB:
+				// DB GRANT OPTION covers db.* and db.table grants if the stored DB pattern matches targetDB
+				if gtype == GrantTypeDB || gtype == GrantTypeTable {
+					entryDB := strings.TrimSuffix(e.Object, ".*")
+					if targetDB != "" && grantScopeCovers(entryDB, targetDB) {
+						return true
+					}
+				}
+			case GrantTypeTable:
+				// Table GRANT OPTION only covers the exact table (with optional LIKE matching for DB part)
+				if gtype == GrantTypeTable {
+					parts := strings.SplitN(e.Object, ".", 2)
+					if len(parts) == 2 && targetDB != "" && targetTable != "" &&
+						grantScopeCovers(parts[0], targetDB) && strings.EqualFold(parts[1], targetTable) {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+
+	// Check user's own entries
+	allUserEntries := gs.findEntriesForUser(user, host)
+	if checkEntriesForGrantOption(allUserEntries) {
+		return true
+	}
+
+	// Check via active roles recursively
+	var checkRole func(roleName, roleHost string, visited map[string]bool) bool
+	checkRole = func(roleName, roleHost string, visited map[string]bool) bool {
+		rk := userKey(roleName, roleHost)
+		if visited[rk] {
+			return false
+		}
+		visited[rk] = true
+		if checkEntriesForGrantOption(gs.roles[rk]) {
+			return true
+		}
+		allEntries := append(gs.roles[rk], gs.entries[rk]...)
+		for _, e := range allEntries {
+			if e.Type == GrantTypeRole {
+				nh := e.RoleHost
+				if nh == "" {
+					nh = "%"
+				}
+				if checkRole(e.RoleName, nh, visited) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	visited := make(map[string]bool)
+	for _, roleName := range activeRoles {
+		if checkRole(roleName, "%", visited) {
+			return true
+		}
+	}
+	return false
+}
+
+// HasDbOrGlobalGrantOption checks if a user (with active roles) has GRANT OPTION at DB level
+// or global level that covers the given database. This is used to determine the format of
+// GRANT denial error messages at the table level:
+// - If yes: format is "<priv>, GRANT command denied" (user has broader authority but not exact table)
+// - If no: format is "GRANT command denied" (user has no relevant GRANT OPTION)
+func (gs *GrantStore) HasDbOrGlobalGrantOption(user, host, priv, db string, activeRoles []string) bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	priv = strings.ToUpper(priv)
+
+	checkEntriesForDbOrGlobalGrantOption := func(entries []GrantEntry) bool {
+		for _, e := range entries {
+			if e.Type == GrantTypeRole || !e.GrantOption {
+				continue
+			}
+			// Only check global and DB-level grants (not table-level)
+			if e.Type != GrantTypeGlobal && e.Type != GrantTypeDB {
+				continue
+			}
+			// Check if this entry has the required privilege
+			hasPriv := false
+			for _, p := range e.Privs {
+				if p == "ALL PRIVILEGES" || strings.EqualFold(p, priv) {
+					hasPriv = true
+					break
+				}
+			}
+			if !hasPriv {
+				continue
+			}
+			// Check if this entry covers the target DB.
+			// We check if the stored entry DB (as a literal) matches the target DB (as a pattern).
+			// e.g., stored="secdb1", target="secdb_" → matchLike("secdb1", "secdb_") = true
+			switch e.Type {
+			case GrantTypeGlobal:
+				return true
+			case GrantTypeDB:
+				entryDB := strings.TrimSuffix(e.Object, ".*")
+				// Check if the stored DB (literal) matches the target DB (possibly a pattern)
+				if db != "" && dbNameMatches(db, entryDB) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	allUserEntries := gs.findEntriesForUser(user, host)
+	if checkEntriesForDbOrGlobalGrantOption(allUserEntries) {
+		return true
+	}
+
+	var checkRole func(roleName, roleHost string, visited map[string]bool) bool
+	checkRole = func(roleName, roleHost string, visited map[string]bool) bool {
+		rk := userKey(roleName, roleHost)
+		if visited[rk] {
+			return false
+		}
+		visited[rk] = true
+		if checkEntriesForDbOrGlobalGrantOption(gs.roles[rk]) {
+			return true
+		}
+		allEntries := append(gs.roles[rk], gs.entries[rk]...)
+		for _, e := range allEntries {
+			if e.Type == GrantTypeRole {
+				nh := e.RoleHost
+				if nh == "" {
+					nh = "%"
+				}
+				if checkRole(e.RoleName, nh, visited) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	visited := make(map[string]bool)
+	for _, roleName := range activeRoles {
+		if checkRole(roleName, "%", visited) {
+			return true
+		}
+	}
+	return false
+}
+
+// grantScopeCovers checks if a stored grant scope (entryScope) covers the requested scope (targetScope)
+// for GRANT authority purposes. The stored scope may contain LIKE wildcards (% and _).
+// A stored pattern P covers target T if the literal string T matches the LIKE pattern P.
+// This means: stored "db%.*" covers "db_.*" (db_ matches LIKE db%), but
+// stored "secdb1.*" does NOT cover "secdb_.*" (secdb_ does NOT match LIKE secdb1).
+// For literal stored scopes (no wildcards), exact case-insensitive match is required.
+func grantScopeCovers(entryScope, targetScope string) bool {
+	if strings.EqualFold(entryScope, targetScope) {
+		return true
+	}
+	if strings.ContainsAny(entryScope, "%_") {
+		return matchLike(strings.ToLower(targetScope), strings.ToLower(entryScope))
+	}
+	return false
+}
+
 // dbNameMatches checks if a stored DB name pattern matches the actual DB name.
 // Supports MySQL LIKE patterns (% and _) for database name matching.
 func dbNameMatches(pattern, dbName string) bool {

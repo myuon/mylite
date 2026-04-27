@@ -2085,6 +2085,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 						object = strings.ToLower(e.CurrentDB) + "." + object
 					}
 				}
+				// Check if the current user has permission to issue this GRANT.
+				if grantErr := e.checkGrantPrivilege(privs, object, isRoleGrant); grantErr != nil {
+					return nil, grantErr
+				}
 				if isRoleGrant {
 					// GRANT role TO user - record role membership
 					// Handle comma-separated roles: "GRANT r1, r2 TO user"
@@ -6950,6 +6954,110 @@ func (e *Executor) checkTablePrivilege(stmt sqlparser.Statement) error {
 		}
 		return checkAccess("CREATE", dbName, s.Table.Name.String())
 	}
+	return nil
+}
+
+// checkGrantPrivilege checks if the current (non-root) user is allowed to execute a GRANT statement.
+// In MySQL, granting requires the grantor to have the privilege WITH GRANT OPTION on the same or wider scope.
+// Returns an appropriate MySQL error if access is denied, or nil if allowed.
+func (e *Executor) checkGrantPrivilege(privs, object string, isRoleGrant bool) error {
+	if e.grantStore == nil {
+		return nil
+	}
+	user, host, activeRoles := e.getCurrentUserAndRoles()
+	if user == "" {
+		return nil // root or no user context — always allowed
+	}
+
+	// Role grants (GRANT role TO user) require:
+	// - SUPER privilege, OR
+	// - ROLE_ADMIN privilege, OR
+	// - The grantor has WITH ADMIN OPTION for each role being granted (directly or via active roles)
+	if isRoleGrant {
+		// Check if user has SUPER privilege (superUsers map)
+		if e.superUsersMu != nil {
+			e.superUsersMu.RLock()
+			isSuper := e.superUsers[strings.ToLower(user)]
+			e.superUsersMu.RUnlock()
+			if isSuper {
+				return nil
+			}
+		}
+		// Check if user has ROLE_ADMIN privilege (allows granting any role)
+		if e.grantStore.HasPrivilege(user, host, "ROLE_ADMIN", "", "", activeRoles) {
+			return nil
+		}
+
+		// Check WITH ADMIN OPTION for each role being granted.
+		// privs is a comma-separated list of role names.
+		for _, roleName := range strings.Split(privs, ",") {
+			roleName = strings.TrimSpace(roleName)
+			roleName = strings.Trim(roleName, "`'\"")
+			rh := "%"
+			if atIdx := strings.Index(roleName, "@"); atIdx >= 0 {
+				rh = strings.Trim(roleName[atIdx+1:], "`'\"")
+				roleName = strings.Trim(roleName[:atIdx], "`'\"")
+			}
+			if !e.grantStore.HasAdminOption(user, host, roleName, rh, activeRoles) {
+				// ER_SPECIFIC_ACCESS_DENIED_ERROR
+				return mysqlError(1227, "42000", fmt.Sprintf("Access denied; you need (at least one of) the WITH GRANT OPTION privilege(s) for this operation"))
+			}
+		}
+		return nil
+	}
+
+	// For privilege grants: check each requested privilege individually.
+	// MySQL requires the grantor to have WITH GRANT OPTION for each privilege being granted.
+	gtype := objectToGrantType(object)
+
+	// Parse db name for error messages
+	var dbName, tableName string
+	switch gtype {
+	case GrantTypeDB:
+		dbName = strings.TrimSuffix(object, ".*")
+	case GrantTypeTable:
+		parts := strings.SplitN(object, ".", 2)
+		if len(parts) == 2 {
+			dbName = parts[0]
+			tableName = parts[1]
+		}
+	}
+
+	// Check each privilege in the privs list
+	privList := normalizePrivList(privs)
+	for _, priv := range privList {
+		// Extract base priv (without column list)
+		basePriv := priv
+		if idx := strings.Index(priv, "("); idx > 0 {
+			basePriv = strings.TrimSpace(priv[:idx])
+		}
+
+		if !e.grantStore.HasGrantOption(user, host, basePriv, object, activeRoles) {
+			// Return appropriate error based on grant scope
+			switch gtype {
+			case GrantTypeGlobal:
+				// ER_ACCESS_DENIED_ERROR
+				return mysqlError(1045, "28000", fmt.Sprintf("Access denied for user '%s'@'%s' (using password: YES)", user, host))
+			case GrantTypeDB:
+				// ER_DBACCESS_DENIED_ERROR
+				return mysqlError(1044, "42000", fmt.Sprintf("Access denied for user '%s'@'%s' to database '%s'", user, host, dbName))
+			case GrantTypeTable:
+				// ER_TABLEACCESS_DENIED_ERROR for GRANT.
+				// MySQL format differs based on whether the user has DB-level or global GRANT OPTION
+				// that could cover the target table's database:
+				// - Has DB/global GRANT OPTION covering target DB → "<PRIV>, GRANT command denied"
+				// - Has only table-level GRANT OPTION (different table) or no GRANT OPTION → "GRANT command denied"
+				var errMsg string
+				if e.grantStore.HasDbOrGlobalGrantOption(user, host, basePriv, dbName, activeRoles) {
+					errMsg = fmt.Sprintf("%s, GRANT command denied to user '%s'@'%s' for table '%s'", basePriv, user, host, tableName)
+				} else {
+					errMsg = fmt.Sprintf("GRANT command denied to user '%s'@'%s' for table '%s'", user, host, tableName)
+				}
+				return mysqlError(1142, "42000", errMsg)
+			}
+		}
+	}
+
 	return nil
 }
 

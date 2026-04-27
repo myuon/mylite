@@ -4638,7 +4638,14 @@ func (e *Executor) showStatus(upper string) (*Result, error) {
 		// SSL / OpenSSL status variables (stubs for MTR have_openssl.inc)
 		{Name: "Rsa_public_key", Value: ""},
 		// ACL cache status variables
-		{Name: "Acl_cache_items_count", Value: "0"},
+		// Count = 1 (root) + number of known users in the grant store
+		{Name: "Acl_cache_items_count", Value: func() string {
+			count := 1 // root is always counted
+			if e.grantStore != nil {
+				count += len(e.grantStore.ListAllUserHosts())
+			}
+			return fmt.Sprintf("%d", count)
+		}()},
 	}
 	rows := make([][]interface{}, 0, len(statusVars))
 	for _, sv := range statusVars {
