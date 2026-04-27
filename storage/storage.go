@@ -105,20 +105,17 @@ func compareRowValueWithCollation(a, b interface{}, collationName string) int {
 	if (aIsStr || bIsStr) && collationName != "" && isSafeForVitessCollationStorage(collationName) {
 		aStr := fmt.Sprintf("%v", a)
 		bStr := fmt.Sprintf("%v", b)
-		if strings.Contains(strings.ToLower(collationName), "_0900_") ||
-			strings.HasSuffix(strings.ToLower(collationName), "_0900_bin") ||
-			isSafeForVitessCollationStorage(collationName) {
-			if vc := lookupStorageCollation(collationName); vc != nil {
-				wa := storageWeightString(aStr, vc)
-				wb := storageWeightString(bStr, vc)
-				if string(wa) < string(wb) {
-					return -1
-				}
-				if string(wa) > string(wb) {
-					return 1
-				}
-				return 0
+		// Use Vitess weight strings for accurate MySQL-compatible collation ordering.
+		if vc := lookupStorageCollation(collationName); vc != nil {
+			wa := storageWeightString(aStr, vc)
+			wb := storageWeightString(bStr, vc)
+			if string(wa) < string(wb) {
+				return -1
 			}
+			if string(wa) > string(wb) {
+				return 1
+			}
+			return 0
 		}
 		// Fallback: case-insensitive for _ci collations
 		coll := strings.ToLower(collationName)
