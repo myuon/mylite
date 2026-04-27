@@ -492,6 +492,11 @@ type Executor struct {
 	resourceGroups map[string]string
 	// resourceGroupsMu protects resourceGroups.
 	resourceGroupsMu *sync.RWMutex
+	// srsRegistry holds user-defined Spatial Reference Systems created via
+	// CREATE SPATIAL REFERENCE SYSTEM. Shared across all connections.
+	srsRegistry map[uint32]*srsEntry
+	// srsRegistryMu protects srsRegistry.
+	srsRegistryMu *sync.RWMutex
 	// superUsers tracks users that have been granted SUPER privilege via GRANT SUPER ON *.* TO user.
 	// Shared across all connections (like globalScopeVars). Key is lowercase username.
 	superUsers map[string]bool
@@ -989,6 +994,8 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	e.globalReadLock = NewGlobalReadLock()
 	e.resourceGroups = make(map[string]string)
 	e.resourceGroupsMu = &sync.RWMutex{}
+	e.srsRegistry = make(map[uint32]*srsEntry)
+	e.srsRegistryMu = &sync.RWMutex{}
 	e.superUsers = make(map[string]bool)
 	e.superUsersMu = &sync.RWMutex{}
 	e.sysVarsAdminUsers = make(map[string]bool)
@@ -1072,6 +1079,8 @@ func (e *Executor) Clone() *Executor {
 		globalReadLock:          e.globalReadLock,
 		resourceGroups:          e.resourceGroups,
 		resourceGroupsMu:        e.resourceGroupsMu,
+		srsRegistry:             e.srsRegistry,
+		srsRegistryMu:           e.srsRegistryMu,
 		superUsers:              e.superUsers,
 		superUsersMu:            e.superUsersMu,
 		sysVarsAdminUsers:       e.sysVarsAdminUsers,
@@ -2158,11 +2167,17 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			strings.HasPrefix(upper, "PURGE ") ||
 			strings.HasPrefix(upper, "BINLOG ") ||
 			strings.HasPrefix(upper, "END") ||
-			strings.HasPrefix(upper, "ALTER INSTANCE") ||
-			strings.HasPrefix(upper, "CREATE SPATIAL REFERENCE SYSTEM") ||
-			strings.HasPrefix(upper, "CREATE OR REPLACE SPATIAL REFERENCE SYSTEM") ||
-			strings.HasPrefix(upper, "DROP SPATIAL REFERENCE SYSTEM") {
+			strings.HasPrefix(upper, "ALTER INSTANCE") {
 			return &Result{}, nil
+		}
+		// CREATE [OR REPLACE] SPATIAL REFERENCE SYSTEM [IF NOT EXISTS]
+		if strings.HasPrefix(upper, "CREATE SPATIAL REFERENCE SYSTEM") ||
+			strings.HasPrefix(upper, "CREATE OR REPLACE SPATIAL REFERENCE SYSTEM") {
+			return e.execCreateSpatialReferenceSystem(trimmed)
+		}
+		// DROP SPATIAL REFERENCE SYSTEM
+		if strings.HasPrefix(upper, "DROP SPATIAL REFERENCE SYSTEM") {
+			return e.execDropSpatialReferenceSystem(trimmed)
 		}
 		// LOCK TABLES: check for performance_schema tables
 		if strings.HasPrefix(upper, "LOCK TABLE ") || strings.HasPrefix(upper, "LOCK TABLES ") {

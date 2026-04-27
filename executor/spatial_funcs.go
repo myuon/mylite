@@ -1084,9 +1084,9 @@ func evalSpatialFunc(e *Executor, name string, exprs []sqlparser.Expr) (interfac
 				return nil, true, mysqlError(3037, "22003", "SRID value is out of range in 'st_srid'")
 			}
 			srid := uint32(sridInt)
-			// Check known SRIDs: only 0 (Cartesian) and 4326 (WGS84) are supported.
+			// Check known SRIDs: only known SRIDs are supported.
 			// All other valid-range SRIDs return ER_SRS_NOT_FOUND.
-			if srid != 0 && srid != 4326 {
+			if !e.sridIsKnown(srid) {
 				return nil, true, mysqlError(3548, "SR001", fmt.Sprintf("There's no spatial reference system with SRID %d.", srid))
 			}
 			// Return geometry with updated SRID as EWKT string

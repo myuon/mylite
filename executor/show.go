@@ -2153,6 +2153,10 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 		if col.Comment != "" {
 			parts = append(parts, fmt.Sprintf("COMMENT '%s'", col.Comment))
 		}
+		// Append SRID constraint as a MySQL 8.0.3+ conditional comment: /*!80003 SRID n */
+		if col.SRIDConstraint != nil {
+			parts = append(parts, fmt.Sprintf("/*!80003 SRID %d */", *col.SRIDConstraint))
+		}
 		colDefs = append(colDefs, strings.Join(parts, " "))
 	}
 	pkCols = append(pkCols, def.PrimaryKey...)
