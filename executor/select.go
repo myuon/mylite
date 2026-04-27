@@ -2966,6 +2966,13 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				}
 			}
 		}
+		// Also detect SELECT expression aliases whose expressions contain a BINARY conversion
+		// (e.g. IF(cond, binary col, col) → the alias should sort with binary collation).
+		for i, colExpr := range colExprs {
+			if i < len(colNames) && exprHasBinaryConvert(colExpr) {
+				binaryColNames[strings.ToLower(colNames[i])] = true
+			}
+		}
 		resultRows, err = applyOrderByWithBinaryCols(stmt.OrderBy, colNames, resultRows, resolveOrderByCollation(selectTableDefs, fromExpr2), binaryColNames, numericColNames)
 		if err != nil {
 			return nil, err
@@ -7478,6 +7485,43 @@ func applyOrderByWithBinaryCols(orderBy sqlparser.OrderBy, colNames []string, ro
 		return false
 	})
 	return rows, nil
+}
+
+// exprHasBinaryConvert returns true if the expression tree contains a CONVERT(x, binary)
+// node (i.e. a `binary x` expression). This is used to detect when IF/CASE expressions
+// produce a binary-collated result that should affect ORDER BY collation.
+func exprHasBinaryConvert(expr sqlparser.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	switch e := expr.(type) {
+	case *sqlparser.ConvertExpr:
+		if e.Type != nil && strings.EqualFold(e.Type.Type, "binary") {
+			return true
+		}
+		return exprHasBinaryConvert(e.Expr)
+	case *sqlparser.FuncExpr:
+		// FuncExpr.Exprs is []SelectExpr, not []Expr
+		for _, arg := range e.Exprs {
+			if argExpr, ok := arg.(sqlparser.Expr); ok {
+				if exprHasBinaryConvert(argExpr) {
+					return true
+				}
+			}
+		}
+	case *sqlparser.CaseExpr:
+		for _, when := range e.Whens {
+			if exprHasBinaryConvert(when.Val) {
+				return true
+			}
+		}
+		if exprHasBinaryConvert(e.Else) {
+			return true
+		}
+	case *sqlparser.BinaryExpr:
+		return exprHasBinaryConvert(e.Left) || exprHasBinaryConvert(e.Right)
+	}
+	return false
 }
 
 func needsPreProjectionOrderBy(orderBy sqlparser.OrderBy, colNames []string) bool {

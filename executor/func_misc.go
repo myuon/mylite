@@ -286,58 +286,14 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if len(v.Exprs) < 2 {
 			return nil, true, fmt.Errorf("LEAST requires at least 2 arguments")
 		}
-		var result interface{}
-		allNull := true
-		for _, argExpr := range v.Exprs {
-			val, err := e.evalExprMaybeRow(argExpr, row)
-			if err != nil {
-				return nil, true, err
-			}
-			if val == nil {
-				return nil, true, nil
-			}
-			allNull = false
-			if result == nil {
-				result = val
-			} else {
-				cmp := compareNumeric(val, result)
-				if cmp < 0 {
-					result = val
-				}
-			}
-		}
-		if allNull {
-			return nil, true, nil
-		}
-		return result, true, nil
+		result, handled, err := evalLeastGreatest(e, v.Exprs, row, false)
+		return result, handled, err
 	case "greatest":
 		if len(v.Exprs) < 2 {
 			return nil, true, fmt.Errorf("GREATEST requires at least 2 arguments")
 		}
-		var result interface{}
-		allNull := true
-		for _, argExpr := range v.Exprs {
-			val, err := e.evalExprMaybeRow(argExpr, row)
-			if err != nil {
-				return nil, true, err
-			}
-			if val == nil {
-				return nil, true, nil
-			}
-			allNull = false
-			if result == nil {
-				result = val
-			} else {
-				cmp := compareNumeric(val, result)
-				if cmp > 0 {
-					result = val
-				}
-			}
-		}
-		if allNull {
-			return nil, true, nil
-		}
-		return result, true, nil
+		result, handled, err := evalLeastGreatest(e, v.Exprs, row, true)
+		return result, handled, err
 	case "current_user":
 		if cu, ok := e.userVars["__current_user"]; ok {
 			if cuStr, ok := cu.(string); ok && cuStr != "" {
@@ -1437,4 +1393,111 @@ func btuBinaryEscapeStr(b []byte) string {
 		}
 	}
 	return sb.String()
+}
+
+// evalLeastGreatest evaluates LEAST() or GREATEST() with MySQL-compatible type coercion.
+// MySQL rules:
+//   - If any arg is NULL → return NULL
+//   - If all args are strings → string comparison, return string
+//   - If any arg is a numeric type (int/float/decimal) and at least one arg is a string →
+//     convert all to float64, perform numeric comparison, return numeric result
+//   - If any arg is float/double → return float64
+//   - If any arg is decimal (string with decimal point) and no float → return decimal string
+//   - If all args are integers → return integer
+//
+// wantMax=true for GREATEST, false for LEAST.
+func evalLeastGreatest(e *Executor, exprs []sqlparser.Expr, row *storage.Row, wantMax bool) (interface{}, bool, error) {
+	vals := make([]interface{}, 0, len(exprs))
+	for _, argExpr := range exprs {
+		val, err := e.evalExprMaybeRow(argExpr, row)
+		if err != nil {
+			return nil, true, err
+		}
+		if val == nil {
+			// MySQL: any NULL arg → result is NULL
+			return nil, true, nil
+		}
+		vals = append(vals, val)
+	}
+	if len(vals) == 0 {
+		return nil, true, nil
+	}
+
+	// Determine whether we have any numeric (non-string) value.
+	hasNumeric := false
+	hasFloat := false
+	hasDecimalStr := false // a string with a decimal point (like "1.5")
+	hasNonNumericString := false
+	for _, val := range vals {
+		if isStringValue(val) {
+			s := toString(val)
+			if _, err := strconv.ParseFloat(s, 64); err == nil {
+				if strings.ContainsRune(s, '.') {
+					hasDecimalStr = true
+				}
+				// numeric-looking string; defer to comparison
+			} else {
+				hasNonNumericString = true
+			}
+		} else {
+			hasNumeric = true
+			switch val.(type) {
+			case float32, float64:
+				hasFloat = true
+			}
+		}
+	}
+
+	// If there's a mix of numeric types and strings, or any non-numeric string with numerics,
+	// we do numeric comparison and return a numeric value (MySQL converts strings to double).
+	if hasNumeric || (hasDecimalStr && !hasNonNumericString) {
+		// Pure string comparison is not appropriate: use numeric comparison.
+		// Find the extreme value numerically.
+		var extremeIdx int
+		for i := 1; i < len(vals); i++ {
+			cmp := compareNumeric(vals[i], vals[extremeIdx])
+			if (wantMax && cmp > 0) || (!wantMax && cmp < 0) {
+				extremeIdx = i
+			}
+		}
+		winner := vals[extremeIdx]
+		// If the winner is a string, convert to numeric so MySQL semantics are preserved.
+		// (e.g. LEAST('a', 1) → min(0.0, 1.0) = 0.0, return 0 not "a")
+		if isStringValue(winner) {
+			if f, err := strconv.ParseFloat(toString(winner), 64); err == nil {
+				// Return as float64 or as formatted decimal string depending on context.
+				if hasFloat || hasNonNumericString {
+					return f, true, nil
+				}
+				// If no float but decimal involved, keep as string representation.
+				return f, true, nil
+			}
+			// Non-numeric string converted to 0 in MySQL numeric context
+			if hasNumeric {
+				return float64(0), true, nil
+			}
+		}
+		// If winner is float and no decimal/string context, return as float.
+		// Otherwise return the value as-is (already int/float).
+		if hasFloat && !isStringValue(winner) {
+			switch v := winner.(type) {
+			case float64:
+				return v, true, nil
+			case float32:
+				return float64(v), true, nil
+			}
+		}
+		return winner, true, nil
+	}
+
+	// All args are pure strings (or look numeric but we compare lexicographically).
+	// Use compareNumeric which handles string comparisons correctly.
+	extremeIdx := 0
+	for i := 1; i < len(vals); i++ {
+		cmp := compareNumeric(vals[i], vals[extremeIdx])
+		if (wantMax && cmp > 0) || (!wantMax && cmp < 0) {
+			extremeIdx = i
+		}
+	}
+	return vals[extremeIdx], true, nil
 }
