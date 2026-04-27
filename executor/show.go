@@ -2028,18 +2028,41 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 			// This handles cases like VARCHAR BINARY which gets latin1_bin vs latin1's default latin1_swedish_ci.
 			defaultCollForColCharset := catalog.DefaultCollationForCharset(col.Charset)
 			collationDiffers := col.Collation != "" && !strings.EqualFold(col.Collation, defaultCollForColCharset)
-			if charsetDiffers {
+			// showCharset: true when we need to emit the CHARACTER SET clause.
+			// We show charset when:
+			//  - col.CharsetExplicit (user wrote CHARACTER SET explicitly or charset was pinned
+			//    during ALTER TABLE DEFAULT CHARSET change)
+			//  - or the charset differs from the table default.
+			showCharset := charsetDiffers || col.CharsetExplicit
+			if showCharset {
 				collation := col.Collation
 				if collation == "" {
-					// No explicit collation: show only CHARACTER SET (MySQL behavior for
-					// columns whose collation was not explicitly set, e.g. from SELECT result)
+					// No explicit collation: show only CHARACTER SET.
 					parts = append(parts, fmt.Sprintf("CHARACTER SET %s", col.Charset))
 				} else {
+					// Show CHARACTER SET + COLLATE (MySQL includes collation whenever it's stored).
 					parts = append(parts, fmt.Sprintf("CHARACTER SET %s COLLATE %s", col.Charset, collation))
 				}
 			} else if collationDiffers {
-				// Same charset as table but different collation: show only COLLATE
-				parts = append(parts, fmt.Sprintf("COLLATE %s", col.Collation))
+				// Charset matches table but column collation differs from the charset default.
+				// If the column collation also differs from the TABLE collation, the charset was
+				// inferred from an explicit COLLATE clause — MySQL shows CHARACTER SET + COLLATE.
+				// If the column collation MATCHES the table collation, the column is inheriting
+				// the table's non-default collation (e.g. via BINARY modifier) — show only COLLATE.
+				tableCollation := def.Collation
+				if tableCollation == "" {
+					tableCollation = catalog.DefaultCollationForCharset(def.Charset)
+					if def.Charset == "" {
+						tableCollation = catalog.DefaultCollationForCharset("utf8mb4")
+					}
+				}
+				if !strings.EqualFold(col.Collation, tableCollation) {
+					// Column's collation differs from the table collation: charset was inferred.
+					parts = append(parts, fmt.Sprintf("CHARACTER SET %s COLLATE %s", col.Charset, col.Collation))
+				} else {
+					// Column's collation matches the table collation: show only COLLATE.
+					parts = append(parts, fmt.Sprintf("COLLATE %s", col.Collation))
+				}
 			}
 		} else if columnTypeSupportsCharset(col.Type) {
 			// Column has no explicit charset (inherits from table). However, if the table
