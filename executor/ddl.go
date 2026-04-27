@@ -2312,6 +2312,10 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 						pdef.ValueRange = "IN (" + strings.Join(parts, ",") + ")"
 					}
 				}
+				// Collect subpartition names
+				for _, sp := range pd.Options.SubPartitionDefinitions {
+					pdef.SubPartitionNames = append(pdef.SubPartitionNames, sp.Name.String())
+				}
 			}
 			def.PartitionDefs = append(def.PartitionDefs, pdef)
 		}

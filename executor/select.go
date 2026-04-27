@@ -412,6 +412,13 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 			}
 			result[i] = newRow
 		}
+		// Apply PARTITION(...) filter for SELECT FROM t PARTITION(p1,p2) syntax.
+		if len(te.Partitions) > 0 && tbl.Def != nil {
+			result, err = e.filterRowsByPartitions(result, te.Partitions, tbl.Def)
+			if err != nil {
+				return nil, err
+			}
+		}
 		return result, nil
 	case *sqlparser.JoinTableExpr:
 		return e.buildJoinedRowsFromJoin(te)
