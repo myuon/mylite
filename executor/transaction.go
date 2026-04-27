@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/myuon/mylite/catalog"
@@ -88,6 +89,41 @@ func (e *Executor) ddlImplicitCommit() {
 	}
 }
 
+// waitForInstanceBackupLock blocks until no other connection holds LOCK INSTANCE FOR BACKUP,
+// or until lock_wait_timeout expires. Sets the processlist state to "Waiting for backup lock"
+// while blocked. Returns nil if safe to proceed, error on timeout.
+// Connections that hold the backup lock themselves may still run DDL.
+func (e *Executor) waitForInstanceBackupLock() error {
+	if e.instanceBackupLock == nil {
+		return nil
+	}
+	held, _ := e.instanceBackupLock.IsHeldByOther(e.connectionID)
+	if !held {
+		return nil
+	}
+	// Determine timeout from lock_wait_timeout session variable.
+	timeoutSec := 31536000.0 // default: essentially infinite
+	if e.sessionScopeVars != nil {
+		if v, ok := e.sessionScopeVars["lock_wait_timeout"]; ok {
+			if t, err := strconv.ParseFloat(v, 64); err == nil {
+				timeoutSec = t
+			}
+		}
+	}
+	// Set process state while waiting.
+	if e.processList != nil {
+		e.processList.SetState(e.connectionID, "Waiting for backup lock")
+	}
+	err := e.instanceBackupLock.WaitUntilFreeForDDL(e.connectionID, timeoutSec)
+	if e.processList != nil {
+		e.processList.SetState(e.connectionID, "")
+	}
+	if err != nil {
+		return mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
+	}
+	return nil
+}
+
 func (e *Executor) execBegin() (*Result, error) {
 	if e.inTransaction {
 		// Implicit commit of previous transaction before starting a new one.
@@ -97,12 +133,14 @@ func (e *Executor) execBegin() (*Result, error) {
 		}
 		e.savepoint = nil
 		e.txnUndoLog = nil
+		e.txnHasWrites = false
 		if e.txnActiveSet != nil {
 			e.txnActiveSet.End(e.connectionID)
 		}
 	}
 	e.savepoint = e.captureSnapshot()
 	e.txnUndoLog = nil
+	e.txnHasWrites = false
 	e.namedSavepoints = make(map[string]bool)
 	e.inTransaction = true
 	if e.txnActiveSet != nil {
@@ -205,8 +243,10 @@ func (e *Executor) execCommit() (*Result, error) {
 		e.restoreNextTxnIsolation()
 		return &Result{}, nil
 	}
-	// Block COMMIT if another connection holds FLUSH TABLES WITH READ LOCK
-	if e.globalReadLock != nil {
+	// Block COMMIT if another connection holds FLUSH TABLES WITH READ LOCK,
+	// but only for write transactions (INSERT/UPDATE/DELETE). Read-only transactions
+	// (BEGIN; SELECT; COMMIT) are never blocked since they have no dirty pages.
+	if e.globalReadLock != nil && e.txnHasWrites {
 		if e.processList != nil {
 			e.processList.SetState(e.connectionID, "Waiting for commit lock")
 		}
@@ -225,6 +265,7 @@ func (e *Executor) execCommit() (*Result, error) {
 	e.inTransaction = false
 	e.savepoint = nil
 	e.txnUndoLog = nil
+	e.txnHasWrites = false
 	if e.txnActiveSet != nil {
 		e.txnActiveSet.End(e.connectionID)
 	}
@@ -330,6 +371,7 @@ func (e *Executor) execRollback() (*Result, error) {
 	e.inTransaction = false
 	e.savepoint = nil
 	e.txnUndoLog = nil
+	e.txnHasWrites = false
 	if e.txnActiveSet != nil {
 		e.txnActiveSet.End(e.connectionID)
 	}

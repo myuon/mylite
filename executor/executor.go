@@ -514,6 +514,9 @@ type Executor struct {
 	rowLockManager *RowLockManager
 	// txnUndoLog records DML mutations made during a transaction for per-connection rollback.
 	txnUndoLog []undoEntry
+	// txnHasWrites is true if the current transaction has performed any write (INSERT/UPDATE/DELETE).
+	// Used to determine whether COMMIT should be blocked by FLUSH TABLES WITH READ LOCK.
+	txnHasWrites bool
 	// txnActiveSet is a shared set tracking which connections are currently in a transaction.
 	// Used for filtering uncommitted rows from other connections during reads.
 	txnActiveSet *TxnActiveSet
@@ -536,6 +539,11 @@ type Executor struct {
 	// globalReadLock manages FLUSH TABLES WITH READ LOCK (FTWRL).
 	// Shared across all executor instances.
 	globalReadLock *GlobalReadLock
+	// instanceBackupLock manages LOCK INSTANCE FOR BACKUP / UNLOCK INSTANCE.
+	// Multiple connections may hold the lock simultaneously; DDL from non-holders
+	// must wait until all holders have released it.
+	// Shared across all executor instances.
+	instanceBackupLock *InstanceBackupLock
 	// handlerReadKey counts the number of index-based reads (SELECT queries).
 	// Incremented per SELECT, reset on FLUSH STATUS.
 	handlerReadKey int64
@@ -1069,7 +1077,7 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 			"innodb_commit_concurrency": "0",
 		},
 		timeZone:   defaultTZ,
-		nextConnID: &atomic.Int64{},
+		nextConnID: func() *atomic.Int64 { v := &atomic.Int64{}; v.Store(7); return v }(),
 	}
 	e.connectionID = e.nextConnID.Add(1)
 	e.processList = NewProcessList()
@@ -1078,6 +1086,7 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	e.txnActiveSet = NewTxnActiveSet()
 	e.tableLockManager = NewTableLockManager()
 	e.globalReadLock = NewGlobalReadLock()
+	e.instanceBackupLock = NewInstanceBackupLock()
 	e.resourceGroups = make(map[string]string)
 	e.resourceGroupsMu = &sync.RWMutex{}
 	e.srsRegistry = make(map[uint32]*srsEntry)
@@ -1163,6 +1172,7 @@ func (e *Executor) Clone() *Executor {
 		txnActiveSet:            e.txnActiveSet,
 		tableLockManager:        e.tableLockManager,
 		globalReadLock:          e.globalReadLock,
+		instanceBackupLock:      e.instanceBackupLock,
 		resourceGroups:          e.resourceGroups,
 		resourceGroupsMu:        e.resourceGroupsMu,
 		srsRegistry:             e.srsRegistry,
@@ -1192,6 +1202,35 @@ func (e *Executor) OnDisconnect() {
 	if e.globalReadLock != nil {
 		e.globalReadLock.Release(e.connectionID)
 	}
+	if e.instanceBackupLock != nil {
+		e.instanceBackupLock.Release(e.connectionID)
+	}
+}
+
+// checkBackupAdminPrivilege checks if the current user has the BACKUP_ADMIN privilege.
+// Root user always passes. Non-root users get ER_SPECIFIC_ACCESS_DENIED_ERROR (1227).
+func (e *Executor) checkBackupAdminPrivilege() error {
+	if e == nil || e.userVars == nil {
+		return nil // no user context → root assumed
+	}
+	cuv, ok := e.userVars["__current_user"]
+	if !ok {
+		return nil // no user set → root
+	}
+	cu, ok := cuv.(string)
+	if !ok || cu == "" || strings.EqualFold(cu, "root") {
+		return nil // root user
+	}
+	// Non-root: check superUsers (SUPER implies BACKUP_ADMIN).
+	if e.superUsersMu != nil {
+		e.superUsersMu.RLock()
+		isSuper := e.superUsers[strings.ToLower(cu)]
+		e.superUsersMu.RUnlock()
+		if isSuper {
+			return nil
+		}
+	}
+	return mysqlError(1227, "42000", "Access denied; you need (at least one of) the BACKUP_ADMIN privilege(s) for this operation")
 }
 
 // SetStartupVar sets a variable as a startup default. This is used by the test
@@ -2405,15 +2444,27 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 
 	switch s := stmt.(type) {
 	case *sqlparser.CreateDatabase:
+		if err := e.waitForInstanceBackupLock(); err != nil {
+			return nil, err
+		}
 		return e.execCreateDatabase(s)
 	case *sqlparser.DropDatabase:
+		if err := e.waitForInstanceBackupLock(); err != nil {
+			return nil, err
+		}
 		return e.execDropDatabase(s)
 	case *sqlparser.Use:
 		return e.execUse(s)
 	case *sqlparser.CreateTable:
+		if err := e.waitForInstanceBackupLock(); err != nil {
+			return nil, err
+		}
 		e.ddlImplicitCommit()
 		return e.execCreateTable(s)
 	case *sqlparser.DropTable:
+		if err := e.waitForInstanceBackupLock(); err != nil {
+			return nil, err
+		}
 		e.ddlImplicitCommit()
 		return e.execDropTable(s)
 	case *sqlparser.Insert:
@@ -2523,6 +2574,9 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 		return res, err
 	case *sqlparser.AlterTable:
+		if err := e.waitForInstanceBackupLock(); err != nil {
+			return nil, err
+		}
 		res, err := e.execAlterTable(s)
 		if err == nil {
 			// Mark the table as needing analysis/optimize after structural changes.
@@ -2613,6 +2667,9 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		delete(e.namedSavepoints, spName)
 		return &Result{}, nil
 	case *sqlparser.TruncateTable:
+		if err := e.waitForInstanceBackupLock(); err != nil {
+			return nil, err
+		}
 		return e.execTruncateTable(s)
 	case *sqlparser.Set:
 		return e.execSet(s)
@@ -2841,6 +2898,9 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 	case *sqlparser.Union:
 		return e.execUnion(s)
 	case *sqlparser.RenameTable:
+		if err := e.waitForInstanceBackupLock(); err != nil {
+			return nil, err
+		}
 		return e.execRenameTable(s)
 	case *sqlparser.Flush:
 		// FLUSH TABLES WITH READ LOCK: acquire global read lock

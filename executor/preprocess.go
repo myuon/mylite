@@ -441,8 +441,20 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		return "", &Result{}, nil
 	}
 
-	// Handle LOCK INSTANCE / UNLOCK INSTANCE as no-ops
-	if strings.HasPrefix(upper, "LOCK INSTANCE") || strings.HasPrefix(upper, "UNLOCK INSTANCE") {
+	// Handle LOCK INSTANCE FOR BACKUP / UNLOCK INSTANCE
+	if strings.HasPrefix(upper, "LOCK INSTANCE FOR BACKUP") {
+		if err := e.checkBackupAdminPrivilege(); err != nil {
+			return "", nil, err
+		}
+		if e.instanceBackupLock != nil {
+			e.instanceBackupLock.Acquire(e.connectionID)
+		}
+		return "", &Result{}, nil
+	}
+	if strings.HasPrefix(upper, "UNLOCK INSTANCE") {
+		if e.instanceBackupLock != nil {
+			e.instanceBackupLock.Release(e.connectionID)
+		}
 		return "", &Result{}, nil
 	}
 

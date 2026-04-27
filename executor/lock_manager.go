@@ -463,6 +463,108 @@ func (rlm *RowLockManager) GetOtherLockedKeysWithPrefix(connID int64, prefix str
 // the proper MySQL error code when returning to the client.
 var errLockWaitTimeout = fmt.Errorf("lock_wait_timeout")
 
+// InstanceBackupLock implements LOCK INSTANCE FOR BACKUP / UNLOCK INSTANCE.
+//
+// MySQL semantics:
+//   - Multiple connections can hold the backup lock simultaneously (shared holders).
+//   - DDL statements must wait until all backup lock holders have released the lock.
+//   - The DDL waiter's processlist state is set to "Waiting for backup lock".
+//   - Connections that hold the backup lock can still run DDL (the lock only blocks
+//     DDL from *other* connections that don't hold the lock, i.e. DDL tries exclusive).
+//
+// Implementation: holders is a set of connIDs. When a DDL from a non-holder wants to
+// proceed, it must wait for holders to become empty. When the set transitions from
+// non-empty to empty, ch is closed and re-created so waiters are notified.
+type InstanceBackupLock struct {
+	mu      sync.Mutex
+	holders map[int64]bool // connIDs currently holding the backup lock
+	ch      chan struct{}   // closed when holders becomes empty; recreated on next acquire
+}
+
+// NewInstanceBackupLock creates a new InstanceBackupLock.
+func NewInstanceBackupLock() *InstanceBackupLock {
+	return &InstanceBackupLock{
+		holders: make(map[int64]bool),
+		ch:      make(chan struct{}),
+	}
+}
+
+// Acquire adds connID to the backup lock holder set.
+// Multiple connections may hold the lock concurrently.
+func (ibl *InstanceBackupLock) Acquire(connID int64) {
+	ibl.mu.Lock()
+	defer ibl.mu.Unlock()
+	if ibl.ch == nil {
+		ibl.ch = make(chan struct{})
+	}
+	ibl.holders[connID] = true
+}
+
+// Release removes connID from the holder set.
+// If no holders remain, waiting DDL statements are unblocked.
+func (ibl *InstanceBackupLock) Release(connID int64) {
+	ibl.mu.Lock()
+	defer ibl.mu.Unlock()
+	delete(ibl.holders, connID)
+	if len(ibl.holders) == 0 && ibl.ch != nil {
+		close(ibl.ch)
+		ibl.ch = nil
+	}
+}
+
+// IsHeldByOther returns true if any connection OTHER than connID holds the backup lock,
+// along with the current wait channel. When the wait channel is closed, the caller
+// should re-check IsHeldByOther to see if the lock has truly been released.
+func (ibl *InstanceBackupLock) IsHeldByOther(connID int64) (bool, chan struct{}) {
+	ibl.mu.Lock()
+	defer ibl.mu.Unlock()
+	for id := range ibl.holders {
+		if id != connID {
+			return true, ibl.ch
+		}
+	}
+	return false, nil
+}
+
+// WaitUntilFreeForDDL blocks until no other connection holds the backup lock,
+// or until the timeout expires. Returns nil if safe to proceed, error on timeout.
+// While waiting, the caller is responsible for updating processlist state.
+func (ibl *InstanceBackupLock) WaitUntilFreeForDDL(connID int64, timeoutSec float64) error {
+	deadline := time.Now().Add(time.Duration(timeoutSec * float64(time.Second)))
+
+	for {
+		held, waitCh := ibl.IsHeldByOther(connID)
+		if !held {
+			return nil
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			select {
+			case <-waitCh:
+				continue
+			default:
+				return errLockWaitTimeout
+			}
+		}
+
+		timer := time.NewTimer(remaining)
+		select {
+		case <-waitCh:
+			timer.Stop()
+			// Holders may have changed; re-check
+			continue
+		case <-timer.C:
+			select {
+			case <-waitCh:
+				continue
+			default:
+				return errLockWaitTimeout
+			}
+		}
+	}
+}
+
 // TableLockManager manages LOCK TABLE READ/WRITE per connection.
 // When a connection holds LOCK TABLE, only those tables are accessible and
 // the lock mode (READ vs WRITE) restricts operations.
@@ -603,80 +705,96 @@ func (tlm *TableLockManager) IsLockedByOther(connID int64, dbTable string) (lock
 }
 
 // GlobalReadLock implements FLUSH TABLES WITH READ LOCK (FTWRL).
-// When held, all DML/DDL and COMMIT from other connections are blocked.
-// Only one connection can hold the global read lock at a time.
 //
-// FTWRL has two phases:
-//  1. Acquire the exclusive FTWRL mutex (only one connection at a time)
-//  2. Wait for all other active transactions to commit
+// MySQL FTWRL semantics:
+//   - Multiple connections can each independently hold FTWRL simultaneously.
+//   - Each connection goes through two phases to acquire:
+//     Phase 1: Add this connection to the holder set (no blocking needed —
+//              multiple holders are allowed).
+//     Phase 2: Wait for all other connections' active queries to complete,
+//              so that no query is running concurrently with the lock.
+//   - Once a connection has fully acquired FTWRL (phase 2 complete), it is
+//     "ready". COMMITs from connections that are NOT in the holder set and were
+//     NOT part of an active query during phase 2 are blocked until holders release.
+//   - UNLOCK TABLES on the connection removes it from the holder set. When the
+//     last holder releases, the commit-blocked connections are unblocked.
 //
-// Once fully acquired, COMMIT from other connections is blocked until UNLOCK TABLES.
+// Important: connections that had active queries during phase 2 (and thus caused
+// the wait) are exempted from COMMIT blocking. This matches MySQL's behavior where
+// transactions that were in-progress before FTWRL became ready can still commit.
+//
+// Implementation note:
+//   - holders: connIDs that have fully acquired FTWRL (ready set).
+//   - pendingHolders: connIDs in phase 2 (not yet ready; COMMITs not yet blocked).
+//   - exemptFromBlock: connIDs whose active queries we waited on during phase 2.
+//     These connections are exempt from the COMMIT block.
+//   - ch: closed when the last holder releases; recreated on the next acquire.
 type GlobalReadLock struct {
-	mu     sync.Mutex
-	holder int64         // connectionID that holds FTWRL, 0 if none
-	held   bool          // true when FTWRL mutex is acquired (may still be in phase 2)
-	ready  bool          // true when FTWRL is fully acquired (phase 2 complete, blocking commits)
-	ch     chan struct{} // closed when FTWRL is released; recreated on next acquire
+	mu             sync.Mutex
+	holders        map[int64]bool // connections with fully-acquired FTWRL (ready)
+	pendingHolders map[int64]bool // connections in phase 2
+	exemptFromBlock map[int64]bool // connections exempted from COMMIT block
+	ch             chan struct{}   // closed when holders becomes empty; nil if no holders
 }
 
 // NewGlobalReadLock creates a new GlobalReadLock.
 func NewGlobalReadLock() *GlobalReadLock {
 	return &GlobalReadLock{
-		ch: make(chan struct{}),
+		holders:         make(map[int64]bool),
+		pendingHolders:  make(map[int64]bool),
+		exemptFromBlock: make(map[int64]bool),
 	}
 }
 
-// Acquire tries to acquire the global read lock for the given connection.
-// If another connection holds it, blocks until released or timeout expires.
-// After acquiring the mutex, waits for all other active queries to complete.
+// Acquire adds connID to FTWRL holders.
+// Phase 1: register as pending (doesn't block other connections from acquiring).
+// Phase 2: wait for all other connections' active queries to complete.
 // Returns nil on success, error on timeout.
 func (grl *GlobalReadLock) Acquire(connID int64, timeoutSec float64, pl *ProcessList) error {
 	deadline := time.Now().Add(time.Duration(timeoutSec * float64(time.Second)))
 
-	// Phase 1: Acquire the FTWRL mutex
-	for {
-		grl.mu.Lock()
-		if !grl.held {
-			grl.held = true
-			grl.holder = connID
-			grl.ch = make(chan struct{})
-			grl.mu.Unlock()
-			break
-		}
-		if grl.holder == connID {
-			// Already hold it - re-entrant
-			grl.mu.Unlock()
-			return nil
-		}
-		waitCh := grl.ch
+	// Phase 1: Register as a pending holder (does not block other connections).
+	grl.mu.Lock()
+	if grl.holders[connID] || grl.pendingHolders[connID] {
+		// Already hold it (re-entrant)
 		grl.mu.Unlock()
-
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return errLockWaitTimeout
-		}
-
-		timer := time.NewTimer(remaining)
-		select {
-		case <-waitCh:
-			timer.Stop()
-			continue
-		case <-timer.C:
-			return errLockWaitTimeout
-		}
+		return nil
 	}
+	if grl.ch == nil {
+		grl.ch = make(chan struct{})
+	}
+	grl.pendingHolders[connID] = true
+	grl.mu.Unlock()
 
 	// Phase 2: Wait for all other connections' active queries to complete.
-	// We hold the FTWRL mutex but haven't set ready=true yet,
-	// so existing transactions can still COMMIT during this phase.
+	// During this phase, COMMITs are not yet blocked by this connection.
+	// Track which connections we had to wait on (they are exempt from COMMIT blocking).
 	if pl != nil {
 		for {
+			grl.mu.Lock()
+			// Collect all holder connIDs (both ready and pending) that belong to this acquisition.
+			holderSet := make(map[int64]bool)
+			for id := range grl.holders {
+				holderSet[id] = true
+			}
+			for id := range grl.pendingHolders {
+				holderSet[id] = true
+			}
+			grl.mu.Unlock()
+
 			entries := pl.Snapshot()
 			hasActiveQuery := false
 			for _, entry := range entries {
-				if entry.ID != connID && entry.Command == "Query" {
+				// Ignore queries from connections that also hold FTWRL (they're allowed).
+				if holderSet[entry.ID] {
+					continue
+				}
+				if entry.Command == "Query" {
 					hasActiveQuery = true
-					break
+					// Track this connection as exempt (it had a query during our wait).
+					grl.mu.Lock()
+					grl.exemptFromBlock[entry.ID] = true
+					grl.mu.Unlock()
 				}
 			}
 
@@ -686,11 +804,9 @@ func (grl *GlobalReadLock) Acquire(connID int64, timeoutSec float64, pl *Process
 
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
-				// Release the lock since we couldn't fully acquire
+				// Remove from pending since we couldn't fully acquire
 				grl.mu.Lock()
-				grl.held = false
-				grl.holder = 0
-				close(grl.ch)
+				delete(grl.pendingHolders, connID)
 				grl.mu.Unlock()
 				return errLockWaitTimeout
 			}
@@ -700,54 +816,66 @@ func (grl *GlobalReadLock) Acquire(connID int64, timeoutSec float64, pl *Process
 		}
 	}
 
-	// Phase 2 complete: now block new COMMITs from other connections
+	// Phase 2 complete: move from pending to ready holders.
 	grl.mu.Lock()
-	grl.ready = true
+	delete(grl.pendingHolders, connID)
+	grl.holders[connID] = true
 	grl.mu.Unlock()
 
 	return nil
 }
 
-// Release releases the global read lock if held by the given connection.
+// Release removes connID from the holder set.
+// If no holders remain, waiting COMMITs are unblocked.
 func (grl *GlobalReadLock) Release(connID int64) {
 	grl.mu.Lock()
 	defer grl.mu.Unlock()
-	if grl.held && grl.holder == connID {
-		grl.held = false
-		grl.ready = false
-		grl.holder = 0
+	delete(grl.holders, connID)
+	delete(grl.pendingHolders, connID)
+	if len(grl.holders) == 0 && len(grl.pendingHolders) == 0 && grl.ch != nil {
 		close(grl.ch)
+		grl.ch = nil
+		// Clear exemptions when no holders remain
+		for id := range grl.exemptFromBlock {
+			delete(grl.exemptFromBlock, id)
+		}
 	}
 }
 
-// IsHeld returns true if the global read lock is held.
+// IsHeld returns true if any connection holds the global read lock (ready or pending).
 func (grl *GlobalReadLock) IsHeld() bool {
 	grl.mu.Lock()
 	defer grl.mu.Unlock()
-	return grl.held
+	return len(grl.holders) > 0 || len(grl.pendingHolders) > 0
 }
 
-// IsHeldByConn returns true if the global read lock is held by the given connID.
+// IsHeldByConn returns true if connID is a ready FTWRL holder.
 func (grl *GlobalReadLock) IsHeldByConn(connID int64) bool {
 	grl.mu.Lock()
 	defer grl.mu.Unlock()
-	return grl.held && grl.holder == connID
+	return grl.holders[connID]
 }
 
-// IsHeldByOther returns true if the global read lock is fully acquired (ready)
-// by a connection other than connID. If held, also returns the wait channel.
+// IsHeldByOther returns true if any connection OTHER than connID has a
+// fully-acquired (ready) FTWRL AND connID is not exempt from blocking.
+// If held and not exempt, also returns the wait channel.
 func (grl *GlobalReadLock) IsHeldByOther(connID int64) (bool, chan struct{}) {
 	grl.mu.Lock()
 	defer grl.mu.Unlock()
-	if grl.held && grl.ready && grl.holder != connID {
-		return true, grl.ch
+	// If connID is exempt (had an active query during phase 2 wait), don't block it.
+	if grl.exemptFromBlock[connID] {
+		return false, nil
+	}
+	for id := range grl.holders {
+		if id != connID {
+			return true, grl.ch
+		}
 	}
 	return false, nil
 }
 
-// WaitIfHeldByOther blocks until the global read lock is released by another
-// connection, or until the timeout expires. Returns nil if lock was released
-// (or not held), error on timeout.
+// WaitIfHeldByOther blocks until all other connections' FTWRL is released,
+// or until the timeout expires. Returns nil if no blocking needed.
 func (grl *GlobalReadLock) WaitIfHeldByOther(connID int64, timeoutSec float64) error {
 	held, waitCh := grl.IsHeldByOther(connID)
 	if !held {

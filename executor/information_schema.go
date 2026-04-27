@@ -1189,13 +1189,16 @@ applyAlias:
 	// are data dictionary tables rather than system views.
 	isInnoDBTable := strings.HasPrefix(strings.ToLower(tableName), "innodb_")
 
+	// PROCESSLIST preserves user-specified column casing, like MySQL 8.0.
+	isProcesslist := strings.ToLower(tableName) == "processlist"
+
 	result := make([]storage.Row, len(rawRows))
 	for i, row := range rawRows {
 		newRow := make(storage.Row, len(row)*3+1)
 		// Mark row as INFORMATION_SCHEMA for case-insensitive WHERE comparison
 		newRow["__is_info_schema__"] = true
-		// Performance_schema and InnoDB IS tables preserve user-specified column casing in SELECT
-		if isPerfSchema || isInnoDBTable {
+		// Performance_schema, InnoDB IS tables, and PROCESSLIST preserve user-specified column casing in SELECT
+		if isPerfSchema || isInnoDBTable || isProcesslist {
 			newRow["__ps_preserve_col_case__"] = true
 		}
 		for k, v := range row {

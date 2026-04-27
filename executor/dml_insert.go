@@ -117,6 +117,11 @@ func (e *Executor) checkGapLockForInsert(dbName, tableName string, stmt *sqlpars
 }
 
 func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
+	// Mark the current transaction as having writes so COMMIT can be blocked
+	// by FLUSH TABLES WITH READ LOCK if needed.
+	if e.inTransaction {
+		e.txnHasWrites = true
+	}
 	// Register this connection in TxnActiveSet for INNODB_TRX when autocommit=0.
 	e.ensureImplicitTxnTracked()
 	// Set insideDML so that sub-SELECTs (INSERT...SELECT, subqueries in
