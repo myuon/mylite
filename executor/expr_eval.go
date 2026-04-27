@@ -2979,6 +2979,25 @@ func (e *Executor) evalBetweenExpr(v *sqlparser.BetweenExpr) (interface{}, error
 	return int64(1), nil
 }
 
+// validateUserLockName checks that a user-level lock name is valid per MySQL rules:
+// - must not be NULL
+// - must not be empty string
+// - must not exceed 64 characters
+// Returns ER_USER_LOCK_WRONG_NAME (3100, SQLSTATE 42000) if invalid.
+func validateUserLockName(name interface{}) (string, error) {
+	if name == nil {
+		return "", mysqlError(3100, "42000", "Incorrect user-level lock name 'NULL'.")
+	}
+	s := fmt.Sprintf("%v", name)
+	if s == "" {
+		return "", mysqlError(3100, "42000", "Incorrect user-level lock name ''.")
+	}
+	if len([]rune(s)) > 64 {
+		return "", mysqlError(3100, "42000", fmt.Sprintf("Incorrect user-level lock name '%s'.", s))
+	}
+	return s, nil
+}
+
 // evalLockingFuncExpr handles *sqlparser.LockingFunc evaluation.
 func (e *Executor) evalLockingFuncExpr(v *sqlparser.LockingFunc) (interface{}, error) {
 	switch v.Type {
@@ -2990,10 +3009,10 @@ func (e *Executor) evalLockingFuncExpr(v *sqlparser.LockingFunc) (interface{}, e
 		if err != nil {
 			return nil, err
 		}
-		if nameVal == nil {
-			return nil, nil
+		lockName, err := validateUserLockName(nameVal)
+		if err != nil {
+			return nil, err
 		}
-		lockName := fmt.Sprintf("%v", nameVal)
 		timeout := 0.0
 		if v.Timeout != nil {
 			tv, err := e.evalExpr(v.Timeout)
@@ -3020,10 +3039,10 @@ func (e *Executor) evalLockingFuncExpr(v *sqlparser.LockingFunc) (interface{}, e
 		if err != nil {
 			return nil, err
 		}
-		if nameVal == nil {
-			return nil, nil
+		lockName, err := validateUserLockName(nameVal)
+		if err != nil {
+			return nil, err
 		}
-		lockName := fmt.Sprintf("%v", nameVal)
 		return e.lockManager.IsFreeLock(lockName), nil
 	case sqlparser.IsUsedLock:
 		if e.lockManager == nil {
@@ -3033,10 +3052,10 @@ func (e *Executor) evalLockingFuncExpr(v *sqlparser.LockingFunc) (interface{}, e
 		if err != nil {
 			return nil, err
 		}
-		if nameVal == nil {
-			return nil, nil
+		lockName, err := validateUserLockName(nameVal)
+		if err != nil {
+			return nil, err
 		}
-		lockName := fmt.Sprintf("%v", nameVal)
 		return e.lockManager.IsUsedLock(lockName), nil
 	case sqlparser.ReleaseLock:
 		if e.lockManager == nil {
@@ -3046,10 +3065,10 @@ func (e *Executor) evalLockingFuncExpr(v *sqlparser.LockingFunc) (interface{}, e
 		if err != nil {
 			return nil, err
 		}
-		if nameVal == nil {
-			return nil, nil
+		lockName, err := validateUserLockName(nameVal)
+		if err != nil {
+			return nil, err
 		}
-		lockName := fmt.Sprintf("%v", nameVal)
 		return e.lockManager.ReleaseLock(lockName, e.connectionID), nil
 	case sqlparser.ReleaseAllLocks:
 		if e.lockManager == nil {

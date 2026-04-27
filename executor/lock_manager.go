@@ -9,14 +9,18 @@ import (
 )
 
 // LockManager manages MySQL user-level locks (GET_LOCK/RELEASE_LOCK).
+// Lock names are case-insensitive (stored as lowercase) and support re-entrant
+// acquisition: the same connection can acquire the same name multiple times,
+// requiring an equal number of RELEASE_LOCK calls to fully release it.
 type LockManager struct {
 	mu    sync.Mutex
-	locks map[string]*userLock // lock name -> lock info
+	locks map[string]*userLock // lock name (lowercase) -> lock info
 }
 
 type userLock struct {
-	ownerID int64         // connection ID that owns the lock
-	ch      chan struct{} // closed when the lock is released
+	ownerID int64        // connection ID that owns the lock
+	count   int          // re-entrant acquisition count (>= 1 when held)
+	ch      chan struct{} // closed when the lock is fully released
 }
 
 // NewLockManager creates a new LockManager.
@@ -26,25 +30,35 @@ func NewLockManager() *LockManager {
 	}
 }
 
+// normalizeLockName returns the case-folded (lowercase) lock name for storage/lookup.
+func normalizeLockName(name string) string {
+	return strings.ToLower(name)
+}
+
 // GetLock tries to acquire a named lock with a timeout (in seconds).
-// Returns 1 if acquired, 0 if timed out, nil if error.
+// Returns 1 if acquired, 0 if timed out.
 // The connID identifies the connection requesting the lock.
+// Lock names are case-insensitive. The same connection may acquire the same lock
+// multiple times (re-entrant); each acquisition increments the internal counter.
 // If setStateFn is non-nil, it is called with "User lock" before blocking
 // and with "" after acquiring.
 func (lm *LockManager) GetLock(name string, timeout float64, connID int64, setStateFn func(string)) int64 {
+	key := normalizeLockName(name)
 	lm.mu.Lock()
 
-	existing, exists := lm.locks[name]
+	existing, exists := lm.locks[key]
 	if exists && existing.ownerID == connID {
-		// Already own it - re-entrant
+		// Re-entrant: increment count
+		existing.count++
 		lm.mu.Unlock()
 		return 1
 	}
 
 	if !exists {
 		// Lock is free, acquire it
-		lm.locks[name] = &userLock{
+		lm.locks[key] = &userLock{
 			ownerID: connID,
+			count:   1,
 			ch:      make(chan struct{}),
 		}
 		lm.mu.Unlock()
@@ -79,9 +93,10 @@ func (lm *LockManager) GetLock(name string, timeout float64, connID int64, setSt
 		}
 		lm.mu.Lock()
 		// Check again - someone else might have grabbed it
-		if _, stillExists := lm.locks[name]; !stillExists {
-			lm.locks[name] = &userLock{
+		if _, stillExists := lm.locks[key]; !stillExists {
+			lm.locks[key] = &userLock{
 				ownerID: connID,
+				count:   1,
 				ch:      make(chan struct{}),
 			}
 			lm.mu.Unlock()
@@ -97,12 +112,16 @@ func (lm *LockManager) GetLock(name string, timeout float64, connID int64, setSt
 	}
 }
 
-// ReleaseLock releases a named lock. Returns 1 if released, 0 if not owned by this connection, nil if not exists.
+// ReleaseLock releases one acquisition of a named lock.
+// Returns 1 if released (count decremented or fully removed), 0 if not owned by
+// this connection, nil if lock does not exist.
+// For re-entrant locks, the lock is only fully released after count reaches zero.
 func (lm *LockManager) ReleaseLock(name string, connID int64) interface{} {
+	key := normalizeLockName(name)
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
-	existing, exists := lm.locks[name]
+	existing, exists := lm.locks[key]
 	if !exists {
 		return nil
 	}
@@ -110,12 +129,16 @@ func (lm *LockManager) ReleaseLock(name string, connID int64) interface{} {
 		return int64(0)
 	}
 
-	close(existing.ch)
-	delete(lm.locks, name)
+	existing.count--
+	if existing.count <= 0 {
+		close(existing.ch)
+		delete(lm.locks, key)
+	}
 	return int64(1)
 }
 
-// ReleaseAllLocks releases all locks held by a connection. Returns the count released.
+// ReleaseAllLocks releases all locks held by a connection, counting each
+// re-entrant acquisition separately. Returns total count of acquisitions released.
 func (lm *LockManager) ReleaseAllLocks(connID int64) int64 {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
@@ -123,31 +146,35 @@ func (lm *LockManager) ReleaseAllLocks(connID int64) int64 {
 	var count int64
 	for name, lock := range lm.locks {
 		if lock.ownerID == connID {
+			count += int64(lock.count)
 			close(lock.ch)
 			delete(lm.locks, name)
-			count++
 		}
 	}
 	return count
 }
 
 // IsFreeLock checks if a lock name is free. Returns 1 if free, 0 if in use.
+// Lock name comparison is case-insensitive.
 func (lm *LockManager) IsFreeLock(name string) int64 {
+	key := normalizeLockName(name)
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
-	if _, exists := lm.locks[name]; exists {
+	if _, exists := lm.locks[key]; exists {
 		return 0
 	}
 	return 1
 }
 
-// IsUsedLock checks if a lock is in use. Returns the connection ID of the owner, or nil.
+// IsUsedLock checks if a lock is in use. Returns the connection ID of the owner,
+// or nil if the lock is not held. Lock name comparison is case-insensitive.
 func (lm *LockManager) IsUsedLock(name string) interface{} {
+	key := normalizeLockName(name)
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
-	if lock, exists := lm.locks[name]; exists {
+	if lock, exists := lm.locks[key]; exists {
 		return lock.ownerID
 	}
 	return nil
