@@ -415,6 +415,9 @@ type Executor struct {
 	psSetupObjects []storage.Row
 	// psSetupObjectsInit tracks whether psSetupObjects has been explicitly set.
 	psSetupObjectsInit bool
+	// psConsumerEnabled tracks per-session ENABLED overrides for setup_consumers.
+	// When non-nil, a key's presence overrides the startup-var default.
+	psConsumerEnabled map[string]string
 	// psDigests tracks statement digests for events_statements_summary_by_digest
 	// and events_statements_histogram_by_digest tables.
 	psDigests []psDigestEntry

@@ -1143,9 +1143,18 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = make([]storage.Row, 0, len(consumers))
 		for _, c := range consumers {
 			enabled := "YES"
+			// Check per-session override first
+			if e.psConsumerEnabled != nil {
+				if v, ok := e.psConsumerEnabled[c]; ok {
+					enabled = v
+					rawRows = append(rawRows, storage.Row{"NAME": c, "ENABLED": enabled})
+					continue
+				}
+			}
 			// Check if consumer was disabled via startup variable
+			// Accept OFF/0/NO/FALSE as disabled (matching MySQL's --loose-performance-schema-consumer-X=0)
 			varName := "performance_schema_consumer_" + strings.Replace(c, "-", "_", -1)
-			if v, ok := e.startupVars[varName]; ok && strings.EqualFold(v, "OFF") {
+			if v, ok := e.startupVars[varName]; ok && isPerfSchemaConsumerDisabled(v) {
 				enabled = "NO"
 			}
 			rawRows = append(rawRows, storage.Row{"NAME": c, "ENABLED": enabled})
@@ -3723,6 +3732,18 @@ func isPerfSchemaEnumValid(val string) bool {
 	return strings.EqualFold(val, "YES") || strings.EqualFold(val, "NO")
 }
 
+// isPerfSchemaConsumerDisabled returns true when a startup-variable value
+// represents a disabled consumer (OFF/0/FALSE/NO, all case-insensitive).
+// MySQL accepts these forms for --loose-performance-schema-consumer-*=<val>.
+func isPerfSchemaConsumerDisabled(v string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(v))
+	switch upper {
+	case "OFF", "0", "FALSE", "NO":
+		return true
+	}
+	return false
+}
+
 // validSetupObjectTypes are the allowed OBJECT_TYPE values for setup_objects.
 var validSetupObjectTypes = map[string]bool{
 	"EVENT": true, "FUNCTION": true, "PROCEDURE": true, "TABLE": true, "TRIGGER": true,
@@ -4188,7 +4209,53 @@ func (e *Executor) execPerfSchemaUpdate(stmt *sqlparser.Update, tableName string
 		return &Result{AffectedRows: 0}, nil
 	}
 
-	// For setup_instruments, setup_consumers, setup_threads - silently succeed
+	// For setup_consumers: persist per-session ENABLED state
+	if tableName == "setup_consumers" {
+		// Build current consumer state to apply WHERE filter against
+		consumers := []string{
+			"events_stages_current", "events_stages_history", "events_stages_history_long",
+			"events_statements_current", "events_statements_history", "events_statements_history_long",
+			"events_transactions_current", "events_transactions_history", "events_transactions_history_long",
+			"events_waits_current", "events_waits_history", "events_waits_history_long",
+			"global_instrumentation", "thread_instrumentation", "statements_digest",
+		}
+		affected := uint64(0)
+		for _, c := range consumers {
+			enabled := "YES"
+			if e.psConsumerEnabled != nil {
+				if v, ok := e.psConsumerEnabled[c]; ok {
+					enabled = v
+				}
+			} else {
+				varName := "performance_schema_consumer_" + strings.Replace(c, "-", "_", -1)
+				if v, ok := e.startupVars[varName]; ok && isPerfSchemaConsumerDisabled(v) {
+					enabled = "NO"
+				}
+			}
+			row := storage.Row{"NAME": c, "ENABLED": enabled}
+			match := true
+			if stmt.Where != nil {
+				m, err := e.evalWhere(stmt.Where.Expr, row)
+				if err != nil {
+					return nil, err
+				}
+				match = m
+			}
+			if match {
+				if e.psConsumerEnabled == nil {
+					e.psConsumerEnabled = make(map[string]string)
+				}
+				for _, expr := range stmt.Exprs {
+					val, _ := e.evalExpr(expr.Expr)
+					e.psConsumerEnabled[c] = strings.ToUpper(fmt.Sprintf("%v", val))
+				}
+				affected++
+			}
+		}
+		return &Result{AffectedRows: affected}, nil
+	}
+
+	// For setup_instruments, setup_threads - silently succeed
 	return &Result{AffectedRows: 0}, nil
 }
 
