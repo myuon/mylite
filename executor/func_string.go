@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
@@ -467,6 +468,58 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 						out[i], out[i+1] = out[i+1], out[i]
 					}
 					return strings.ToUpper(hex.EncodeToString(out)), true, nil
+				}
+			}
+		}
+		// For charset introducer expressions (_utf16 x'...', _utf32 x'...', _ucs2 x'...')
+		// or when character_set_connection is a multi-byte charset (utf16/utf32/ucs2),
+		// encode string values to the appropriate charset bytes.
+		// This makes HEX(_utf16 X'0420') return the UTF-16 byte representation (0420),
+		// and HEX('a') with character_set_connection=utf16 return 0061.
+		hexEncodeCharset := ""
+		if colCharset == "" {
+			// Check for explicit charset introducer: _utf16 x'...', _utf32 x'...', etc.
+			if intro, ok := v.Exprs[0].(*sqlparser.IntroducerExpr); ok {
+				cs := strings.ToLower(strings.TrimPrefix(intro.CharacterSet, "_"))
+				switch cs {
+				case "utf16", "utf32", "ucs2", "utf16le":
+					hexEncodeCharset = cs
+				}
+			}
+			// If no introducer charset found, check character_set_connection.
+			// Also check collation_connection as a fallback (setting collation_connection
+			// to utf16le_general_ci implies utf16le connection encoding for literals).
+			if hexEncodeCharset == "" {
+				if connCS, ok := e.getSysVar("character_set_connection"); ok {
+					cs := strings.ToLower(canonicalCharset(connCS))
+					switch cs {
+					case "utf16", "utf32", "ucs2", "utf16le":
+						hexEncodeCharset = cs
+					}
+				}
+			}
+			if hexEncodeCharset == "" {
+				if collCS, ok := e.getSysVar("collation_connection"); ok {
+					if cs, ok2 := catalog.CharsetForCollation(collCS); ok2 {
+						switch strings.ToLower(cs) {
+						case "utf16", "utf32", "utf16le":
+							hexEncodeCharset = strings.ToLower(cs)
+						}
+					}
+				}
+			}
+		}
+		if hexEncodeCharset != "" {
+			switch val.(type) {
+			case int64, uint64, float64:
+				// Numeric values: fall through to default integer hex encoding
+			case HexBytes:
+				// Raw binary data: fall through to HexBytes handler
+			default:
+				// String value: encode to target charset
+				s := toString(val)
+				if encoded, err2 := convertThroughCharset(s, hexEncodeCharset); err2 == nil {
+					return strings.ToUpper(hex.EncodeToString([]byte(encoded))), true, nil
 				}
 			}
 		}
