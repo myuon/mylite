@@ -8753,7 +8753,15 @@ func (e *Executor) evalMatchExpr(v *sqlparser.MatchExpr) (interface{}, error) {
 	switch v.Option {
 	case sqlparser.BooleanModeOpt:
 		if stats != nil && !e.isMyISAMTable(tableName) {
-			// InnoDB boolean mode: use IDF^2 scoring (same formula as natural language mode)
+			// InnoDB boolean mode: use boolean filtering to enforce operators like +/-,
+			// but return IDF-based score (same as natural language mode) when the row matches.
+			// MySQL InnoDB boolean mode returns IDF scores (not simple 0/1) while still
+			// respecting the required/excluded operators for filtering.
+			boolScore := ftsEvalBoolean(docText, searchStr, minTokenSize)
+			if boolScore == 0 {
+				return float64(0), nil
+			}
+			// Row passes boolean filter; return the IDF-based score.
 			return ftsEvalInnoDB(docText, searchStr, minTokenSize, stats), nil
 		}
 		return ftsEvalBoolean(docText, searchStr, minTokenSize), nil
