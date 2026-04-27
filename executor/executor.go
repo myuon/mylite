@@ -5088,10 +5088,24 @@ func extractDefiner(createSQL string) (string, string, bool) {
 // Returns (baseTable, isView, viewWhere, error). If isView is false, the caller should
 // proceed with normal table handling. viewWhere is the WHERE clause from the view definition.
 func (e *Executor) resolveViewToBaseTable(tableName string) (string, bool, sqlparser.Expr, error) {
+	return e.resolveViewToBaseTableVisited(tableName, nil)
+}
+
+func (e *Executor) resolveViewToBaseTableVisited(tableName string, visited map[string]bool) (string, bool, sqlparser.Expr, error) {
+	// Cycle detection: if we've already visited this view name in this resolution chain,
+	// treat it as a non-updatable (self-referencing) view to prevent infinite recursion.
+	if visited == nil {
+		visited = make(map[string]bool)
+	}
+	lowerName := strings.ToLower(tableName)
+	if visited[lowerName] {
+		return "", true, nil, mysqlError(1288, "HY000", "The target table of the statement is not updatable")
+	}
 	viewSQL, _, ok := e.lookupView(tableName)
 	if !ok {
 		return "", false, nil, nil
 	}
+	visited[lowerName] = true
 	stmt, err := e.parser().Parse(viewSQL)
 	if err != nil {
 		return "", true, nil, fmt.Errorf("cannot parse view definition: %v", err)
@@ -5135,7 +5149,7 @@ func (e *Executor) resolveViewToBaseTable(tableName string) (string, bool, sqlpa
 	// If the resolved base table is itself a view, recursively resolve.
 	// If the inner view is non-updatable, report a join view error for the original view.
 	if _, _, isNestedView := e.lookupView(baseTableName); isNestedView {
-		_, _, _, innerErr := e.resolveViewToBaseTable(baseTableName)
+		_, _, _, innerErr := e.resolveViewToBaseTableVisited(baseTableName, visited)
 		if innerErr != nil {
 			// The nested view is not updatable (join/non-simple view).
 			// MySQL reports "Can not delete from join view" for the outer view.

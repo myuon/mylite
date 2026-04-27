@@ -877,6 +877,35 @@ func (ctx *execContext) executeLines(lines []string) error {
 					advancedLine = true
 				}
 			}
+			// For bare 'echo' with no args and no trailing ';', collect multi-line echo
+			// content until a line ending with ';'. In mysqltest:
+			//   echo
+			//   This is a multi-line
+			//   echo message;
+			// outputs "This is a multi-line\necho message".
+			if bdLower == "echo" && !strings.HasSuffix(strings.TrimSpace(trimmed), ";") {
+				fullEcho := ""
+				i++
+				for i < len(lines) {
+					l := lines[i]
+					lTrimmed := strings.TrimSpace(l)
+					if strings.HasSuffix(lTrimmed, ";") {
+						// Last line of echo content (strip the trailing semicolon)
+						fullEcho += lTrimmed[:len(lTrimmed)-1]
+						i++
+						break
+					}
+					if lTrimmed == "" {
+						// Empty line ends the echo too (safety valve)
+						break
+					}
+					fullEcho += lTrimmed + "\n"
+					i++
+				}
+				bareDirective = "echo " + strings.TrimRight(fullEcho, "\n")
+				bdLower = strings.ToLower(bareDirective)
+				advancedLine = true
+			}
 			if strings.HasPrefix(bdLower, "query ") ||
 				strings.HasPrefix(bdLower, "query_vertical ") ||
 				strings.HasPrefix(bdLower, "eval ") {
