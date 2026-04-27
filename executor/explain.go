@@ -4176,15 +4176,21 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 								selectType = "MATERIALIZED"
 							} else if !materializationDisabledByHint && !firstMatchOn && (!looseScanOn || correlatedIN) && !outerINIsConst {
 								// When FirstMatch is disabled AND (LooseScan is also disabled OR LooseScan is not
-								// applicable for correlated subqueries) and Materialization is allowed, use MATERIALIZED.
+								// applicable for correlated subqueries) and Materialization is allowed, use MATERIALIZED
+								// only when the inner subquery would benefit from materialization (large/no-index tables).
 								// This handles:
-								// - NO_SEMIJOIN(@subq FIRSTMATCH, LOOSESCAN): both disabled → MATERIALIZED
+								// - NO_SEMIJOIN(@subq FIRSTMATCH, LOOSESCAN): both disabled → MATERIALIZED for large tables
 								// - NO_SEMIJOIN(@subq FIRSTMATCH, DUPSWEEDOUT) with correlated subquery: FirstMatch
-								//   disabled and LooseScan not applicable (correlated) → MATERIALIZED
+								//   disabled and LooseScan not applicable (correlated) → MATERIALIZED for large tables
 								// Note: if only FirstMatch is disabled but LooseScan is still available and applicable,
 								// LooseScan takes priority over MATERIALIZED.
+								// Note: when the inner table has a PRIMARY KEY on the join column, MySQL uses
+								// SJ-Mat Scan (shows as SIMPLE join rows) rather than SJ-Mat Lookup (shows MATERIALIZED).
 								if e.isOptimizerSwitchEnabled("materialization") {
-									selectType = "MATERIALIZED"
+									if e.inSubqueryTypesCompatibleForMat(outerSel, inner, sub) && e.shouldMaterializeSubquery(inner, outerIsSystem) {
+										selectType = "MATERIALIZED"
+									}
+									// else: SJ-Mat Scan → inline semijoin (SIMPLE rows, no placeholder)
 								}
 							} else if outerSemijoinHint.strategyForced("MATERIALIZATION") && !outerINIsConst && !looseScanForcedAndApplicable && !firstMatchForced {
 								// SEMIJOIN(@subq MATERIALIZATION) hint forces materialization strategy.

@@ -3283,10 +3283,14 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 							return nil, mysqlError(1579, "HY000", "This storage engine cannot be used for log tables")
 						}
 					}
-					// Reject non-InnoDB engines not supported by mylite
+					// Accept known MySQL engines that we treat as InnoDB internally.
+					// MyISAM, MEMORY, etc. are accepted (not returning ErrUnsupported) so that
+					// tests using force_myisam_default.inc and similar patterns can run.
+					// The table is always stored using our InnoDB-compatible engine regardless.
 					switch engineVal {
 					case "MYISAM", "MEMORY", "HEAP", "MERGE", "MRG_MYISAM", "BLACKHOLE", "ARCHIVE":
-						return nil, ErrUnsupported(fmt.Sprintf("ENGINE=%s (only InnoDB is supported)", tableOptionString(to)))
+						// Rewrite to InnoDB so that SHOW CREATE TABLE reflects the actual storage
+						to.String = "InnoDB"
 					}
 				}
 			}

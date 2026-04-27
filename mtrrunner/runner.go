@@ -2372,7 +2372,13 @@ func (ctx *execContext) evaluateIfConditionInner(condStr string) bool {
 			if val == nil {
 				return false
 			}
-			s := fmt.Sprintf("%v", val)
+			var s string
+			switch v := val.(type) {
+			case []byte:
+				s = string(v)
+			default:
+				s = fmt.Sprintf("%v", v)
+			}
 			// In mysqltest, backtick returns "1" for true
 			return s != "0" && s != "" && s != "FALSE"
 		}
@@ -3661,6 +3667,8 @@ func (ctx *execContext) queryRows(stmt string) ([][]string, error) {
 		for i, v := range vals {
 			if v == nil {
 				row[i] = "NULL"
+			} else if b, ok := v.([]byte); ok {
+				row[i] = string(b)
 			} else {
 				row[i] = fmt.Sprintf("%v", v)
 			}
