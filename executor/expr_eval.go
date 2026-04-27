@@ -2302,6 +2302,14 @@ func (e *Executor) evalIntroducerExpr(v *sqlparser.IntroducerExpr) (interface{},
 		case "ucs2":
 			// Keep UCS-2 as raw bytes for compatibility with JP charset tests
 			return string(bs), nil
+		case "utf16le":
+			// UTF-16 little-endian hex literal: left-pad to even length and return
+			// as HexBytes so HEX() can return the padded bytes directly.
+			// MySQL treats _utf16le 0x44 as the same hex output as _utf16 0x44 (left-padded).
+			for len(bs)%2 != 0 {
+				bs = append([]byte{0}, bs...)
+			}
+			return HexBytes(strings.ToUpper(hex.EncodeToString(bs))), nil
 		default:
 			// For other charsets (latin1, sjis, etc.), return raw bytes as-is.
 			// The existing JP charset conversion tests rely on this behavior.
