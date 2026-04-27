@@ -5057,6 +5057,8 @@ func (e *Executor) infoSchemaRoutines() []storage.Row {
 // infoSchemaViews returns rows for INFORMATION_SCHEMA.VIEWS.
 func (e *Executor) infoSchemaViews() []storage.Row {
 	var rows []storage.Row
+	// Track which (db, name) pairs we've already added from local e.views
+	addedKeys := make(map[string]bool)
 	if e.views != nil {
 		viewNames := make([]string, 0, len(e.views))
 		for n := range e.views {
@@ -5064,15 +5066,81 @@ func (e *Executor) infoSchemaViews() []storage.Row {
 		}
 		sort.Strings(viewNames)
 		for _, vName := range viewNames {
+			secType := "DEFINER"
+			if e.viewSecurity != nil {
+				if s := strings.ToUpper(e.viewSecurity[vName]); s == "INVOKER" {
+					secType = "INVOKER"
+				}
+			}
+			checkOpt := "NONE"
+			if e.viewCheckOptions != nil {
+				co := strings.ToUpper(e.viewCheckOptions[vName])
+				if co == "CASCADED" || co == "LOCAL" {
+					checkOpt = co
+				}
+			}
 			rows = append(rows, storage.Row{
 				"TABLE_CATALOG":        "def",
 				"TABLE_SCHEMA":         e.CurrentDB,
 				"TABLE_NAME":           vName,
 				"VIEW_DEFINITION":      e.viewDefinitionForDisplay(vName),
-				"CHECK_OPTION":         "NONE",
+				"CHECK_OPTION":         checkOpt,
 				"IS_UPDATABLE":         "YES",
 				"DEFINER":              "root@localhost",
-				"SECURITY_TYPE":        "DEFINER",
+				"SECURITY_TYPE":        secType,
+				"CHARACTER_SET_CLIENT": "utf8mb4",
+				"COLLATION_CONNECTION": "utf8mb4_general_ci",
+			})
+			addedKeys[e.CurrentDB+"."+vName] = true
+		}
+	}
+	// Also include views from the shared viewStore for all databases (e.g. views created in other
+	// databases during the session, such as by sys.create_synonym_db).
+	if e.viewStore != nil {
+		type vsEntry struct {
+			db, name, secType, displaySQL string
+		}
+		var vsEntries []vsEntry
+		allViewEntries := e.viewStore.AllViews()
+		for _, entry := range allViewEntries {
+			// key is "db.name"
+			dotIdx := strings.Index(entry.key, ".")
+			if dotIdx < 0 {
+				continue
+			}
+			db := entry.key[:dotIdx]
+			name := entry.key[dotIdx+1:]
+			if addedKeys[db+"."+name] {
+				continue // already added from local e.views
+			}
+			secType := "DEFINER"
+			if e.viewStore.IsInvokerSecurity(db, name) {
+				secType = "INVOKER"
+			}
+			displaySQL, _ := e.viewStore.LookupDisplaySQL(db, name)
+			vsEntries = append(vsEntries, vsEntry{db: db, name: name, secType: secType, displaySQL: displaySQL})
+		}
+		sort.Slice(vsEntries, func(i, j int) bool {
+			if vsEntries[i].db != vsEntries[j].db {
+				return vsEntries[i].db < vsEntries[j].db
+			}
+			return vsEntries[i].name < vsEntries[j].name
+		})
+		for _, ve := range vsEntries {
+			checkOpt := "NONE"
+			co := strings.ToUpper(e.viewStore.LookupCheckOption(ve.db, ve.name))
+			if co == "CASCADED" || co == "LOCAL" {
+				checkOpt = co
+			}
+			rows = append(rows, storage.Row{
+				"TABLE_CATALOG":        "def",
+				"TABLE_SCHEMA":         ve.db,
+				"TABLE_NAME":           ve.name,
+				"VIEW_DEFINITION":      ve.displaySQL,
+				"CHECK_OPTION":         checkOpt,
+				"IS_UPDATABLE":         "YES",
+				"DEFINER":              "root@localhost",
+				"SECURITY_TYPE":        ve.secType,
 				"CHARACTER_SET_CLIENT": "utf8mb4",
 				"COLLATION_CONNECTION": "utf8mb4_general_ci",
 			})

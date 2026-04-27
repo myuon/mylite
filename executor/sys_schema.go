@@ -1673,6 +1673,141 @@ func (e *Executor) execSysSchemaProcedure(procName string, argStrs []string) (*R
 		}
 		return &Result{}, true, nil
 
+	case "execute_prepared_stmt":
+		// CALL sys.execute_prepared_stmt(in_query LONGTEXT)
+		// Executes the SQL statement given in in_query using PREPARE/EXECUTE/DEALLOCATE.
+		// Raises SIGNAL SQLSTATE '45000' if in_query is NULL or invalid SQL.
+		if len(argStrs) < 1 {
+			return nil, true, &signalError{
+				sqlState:    "45000",
+				messageText: "The @sys.execute_prepared_stmt.sql must contain a query",
+			}
+		}
+		inQuery := e.evalProcArg(argStrs[0])
+		if inQuery == nil {
+			return nil, true, &signalError{
+				sqlState:    "45000",
+				messageText: "The @sys.execute_prepared_stmt.sql must contain a query",
+			}
+		}
+		queryStr := toString(inQuery)
+		queryStr = strings.TrimSpace(queryStr)
+		if queryStr == "" {
+			return nil, true, &signalError{
+				sqlState:    "45000",
+				messageText: "The @sys.execute_prepared_stmt.sql must contain a query",
+			}
+		}
+
+		// Directly execute the query. Any error is wrapped in a 45000 SIGNAL,
+		// matching the behaviour of the real MySQL sys.execute_prepared_stmt procedure.
+		execResult, execErr := e.Execute(queryStr)
+		if execErr != nil {
+			return nil, true, &signalError{
+				sqlState:    "45000",
+				messageText: "The @sys.execute_prepared_stmt.sql must contain a query",
+			}
+		}
+		if execResult != nil && execResult.IsResultSet {
+			return execResult, true, nil
+		}
+		return &Result{}, true, nil
+
+	case "create_synonym_db":
+		// CALL sys.create_synonym_db(in_db_name VARCHAR(64), in_synonym VARCHAR(64))
+		// Creates a new database named in_synonym and populates it with SQL SECURITY INVOKER views
+		// pointing to all tables and views in in_db_name.
+		// Returns a result set: summary VARCHAR(91)
+		// Raises SIGNAL HY000 if in_synonym already exists as a database.
+		if len(argStrs) < 2 {
+			return nil, true, mysqlError(1318, "42000", "Incorrect number of arguments for PROCEDURE sys.create_synonym_db; expected 2, got 0")
+		}
+		srcDBVal := e.evalProcArg(argStrs[0])
+		synDBVal := e.evalProcArg(argStrs[1])
+
+		srcDB := ""
+		if srcDBVal != nil {
+			srcDB = toString(srcDBVal)
+		}
+		synDB := ""
+		if synDBVal != nil {
+			synDB = toString(synDBVal)
+		}
+
+		// Check that source database exists
+		srcDatabase, err := e.Catalog.GetDatabase(srcDB)
+		if err != nil {
+			return nil, true, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", srcDB))
+		}
+
+		// Check that target database does NOT already exist
+		if _, err2 := e.Catalog.GetDatabase(synDB); err2 == nil {
+			// Database exists - signal error matching MySQL
+			return nil, true, &signalError{
+				sqlState:    "HY000",
+				messageText: fmt.Sprintf("Can't create database %s; database exists", synDB),
+			}
+		}
+
+		// Create the synonym database
+		if err3 := e.Catalog.CreateDatabase(synDB); err3 != nil {
+			return nil, true, &signalError{
+				sqlState:    "HY000",
+				messageText: fmt.Sprintf("Can't create database %s; database exists", synDB),
+			}
+		}
+
+		// Collect all table and view names from source database
+		// Get table names from catalog
+		tableNames := srcDatabase.ListTables()
+
+		// Get view names from viewStore
+		viewNames := []string{}
+		if e.viewStore != nil {
+			viewNames = e.viewStore.ListViewNames(srcDB)
+		}
+
+		// Combine and sort all object names
+		allNames := make([]string, 0, len(tableNames)+len(viewNames))
+		allNames = append(allNames, tableNames...)
+		allNames = append(allNames, viewNames...)
+		// Deduplicate (views may be stored in both places)
+		seen := make(map[string]bool)
+		uniqueNames := allNames[:0]
+		for _, n := range allNames {
+			if !seen[n] {
+				seen[n] = true
+				uniqueNames = append(uniqueNames, n)
+			}
+		}
+		allNames = uniqueNames
+
+		// Create SQL SECURITY INVOKER views in synonym DB pointing to source DB tables/views
+		// Backtick-quote the DB and table names to handle reserved words and special characters
+		quoteSynDB := "`" + strings.ReplaceAll(synDB, "`", "``") + "`"
+		quoteSrcDB := "`" + strings.ReplaceAll(srcDB, "`", "``") + "`"
+
+		viewCount := 0
+		for _, tblName := range allNames {
+			quotedView := "`" + strings.ReplaceAll(tblName, "`", "``") + "`"
+			createSQL := fmt.Sprintf(
+				"CREATE SQL SECURITY INVOKER VIEW %s.%s AS SELECT * FROM %s.%s",
+				quoteSynDB, quotedView, quoteSrcDB, quotedView,
+			)
+			if _, err4 := e.Execute(createSQL); err4 == nil {
+				viewCount++
+			}
+		}
+
+		// Return summary result set
+		summaryMsg := fmt.Sprintf("Created %d views in the %s database", viewCount, quoteSynDB)
+		result := &Result{
+			Columns:     []string{"summary"},
+			IsResultSet: true,
+			Rows:        [][]interface{}{{summaryMsg}},
+		}
+		return result, true, nil
+
 	default:
 		return nil, false, nil
 	}

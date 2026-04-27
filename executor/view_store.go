@@ -171,6 +171,20 @@ type viewEntry struct {
 	selectSQL string
 }
 
+// ListViewNames returns all view names in the given database.
+func (vs *ViewStore) ListViewNames(db string) []string {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+	prefix := db + "."
+	var names []string
+	for key := range vs.selectSQL {
+		if strings.HasPrefix(key, prefix) {
+			names = append(names, key[len(prefix):])
+		}
+	}
+	return names
+}
+
 // AllViewCreateSQLs returns all view names and their CREATE VIEW SQL.
 func (vs *ViewStore) AllViewCreateSQLs() map[string]string {
 	vs.mu.RLock()
