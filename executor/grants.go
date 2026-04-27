@@ -516,6 +516,31 @@ type UserHostEntry struct {
 	Host string
 }
 
+// ListAllRoles returns all known roles (entries in gs.roles).
+func (gs *GrantStore) ListAllRoles() []UserHostEntry {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	keys := make([]string, 0, len(gs.roles))
+	for k := range gs.roles {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var result []UserHostEntry
+	for _, key := range keys {
+		atIdx := strings.LastIndex(key, "@")
+		if atIdx < 0 {
+			continue
+		}
+		result = append(result, UserHostEntry{
+			User: key[:atIdx],
+			Host: key[atIdx+1:],
+		})
+	}
+	return result
+}
+
 // ListAllUserHosts returns all known user@host pairs in the grant store,
 // including users registered via CREATE USER and users with grant entries.
 // Roles (stored in gs.roles) are excluded.
@@ -832,6 +857,70 @@ var tablePrivileges = map[string]bool{
 	"CREATE": true, "DROP": true, "ALTER": true, "INDEX": true,
 	"ALL PRIVILEGES": true, "ALL": true,
 	"CREATE TEMPORARY TABLES": true,
+}
+
+// HasRoleWithAdminOption checks if a user (with active roles) has WITH ADMIN OPTION
+// on the given role. This is required to GRANT or REVOKE a role.
+// Returns true if:
+//   - The user has the role directly with GrantOption=true in their entries
+//   - Any active role in their chain has the role with GrantOption=true (recursive)
+//
+// Note: caller must NOT hold gs.mu (this method acquires RLock internally).
+func (gs *GrantStore) HasRoleWithAdminOption(user, host, roleName string, activeRoles []string) bool {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	roleLower := strings.ToLower(roleName)
+
+	// Check user's direct grants for the role with admin option
+	userEntries := gs.findEntriesForUser(user, host)
+	for _, e := range userEntries {
+		if e.Type == GrantTypeRole && strings.ToLower(e.RoleName) == roleLower && e.GrantOption {
+			return true
+		}
+	}
+
+	// Check via active roles recursively: does any active role chain have the role WITH ADMIN OPTION?
+	var checkRole func(rn, rh string, visited map[string]bool) bool
+	checkRole = func(rn, rh string, visited map[string]bool) bool {
+		rk := userKey(rn, rh)
+		if visited[rk] {
+			return false
+		}
+		visited[rk] = true
+		// Check all entries for this role (in both gs.roles and gs.entries)
+		allEntries := append(gs.roles[rk], gs.entries[rk]...)
+		for _, e := range allEntries {
+			if e.Type == GrantTypeRole {
+				if strings.ToLower(e.RoleName) == roleLower && e.GrantOption {
+					return true
+				}
+				// Recurse into nested roles
+				nestedHost := e.RoleHost
+				if nestedHost == "" {
+					nestedHost = "%"
+				}
+				if checkRole(e.RoleName, nestedHost, visited) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	visited := make(map[string]bool)
+	for _, ar := range activeRoles {
+		if checkRole(ar, "%", visited) {
+			return true
+		}
+	}
+	return false
+}
+
+// HasGlobalPrivilege checks if the user has a global-level privilege (e.g. ROLE_ADMIN, SUPER).
+// Used for GRANT role privilege checks.
+func (gs *GrantStore) HasGlobalPrivilege(user, host, priv string, activeRoles []string) bool {
+	return gs.HasPrivilege(user, host, priv, "", "", activeRoles)
 }
 
 // UserHasAnyRoleGrant returns true if the given user has any role membership (GRANT role TO user).

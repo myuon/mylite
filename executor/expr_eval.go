@@ -4438,7 +4438,27 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.RegexpReplaceExpr:
 		return e.evalRegexpReplaceExpr(v)
 	case *sqlparser.ExtractValueExpr:
-		// EXTRACTVALUE(xml, xpath) - simplified stub
+		// EXTRACTVALUE(xml, xpath) - handle count(//element) XPath expressions
+		xmlVal, err := e.evalExpr(v.Fragment)
+		if err != nil || xmlVal == nil {
+			return nil, nil
+		}
+		xpathVal, err := e.evalExpr(v.XPathExpr)
+		if err != nil || xpathVal == nil {
+			return nil, nil
+		}
+		xmlStr := toString(xmlVal)
+		xpathStr := strings.ToLower(strings.TrimSpace(toString(xpathVal)))
+		// Handle count(//tagname) pattern
+		if strings.HasPrefix(xpathStr, "count(//") && strings.HasSuffix(xpathStr, ")") {
+			tagName := xpathStr[len("count(//") : len(xpathStr)-1]
+			if tagName != "" {
+				// Count occurrences of <tagName ... in xml string
+				openTag := "<" + tagName
+				count := int64(strings.Count(xmlStr, openTag))
+				return count, nil
+			}
+		}
 		return nil, nil
 	case *sqlparser.UpdateXMLExpr:
 		// UPDATEXML(target, xpath, new) - stub

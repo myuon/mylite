@@ -419,6 +419,84 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 		if strings.EqualFold(lookupDB, "mysql") && strings.EqualFold(lookupTable, "role_edges") && e.grantStore != nil {
 			return e.grantStore.ScanRoleEdges(), nil
 		}
+		// Virtual table: mysql.user - merge physical rows with grantStore data.
+		// The physical table may be empty or missing rows for users created via CREATE USER.
+		// We augment it with all known user@host pairs from the grant store.
+		if strings.EqualFold(lookupDB, "mysql") && strings.EqualFold(lookupTable, "user") && e.grantStore != nil {
+			// newMysqlUserRow creates a synthetic mysql.user row with all required defaults.
+			// All privilege columns default to 'N', string columns to '', nullable columns to nil.
+			// This ensures INSERT INTO mysql.user SELECT * FROM <snapshot> does not hit NOT NULL violations.
+			newMysqlUserRow := func(user, host string) storage.Row {
+				r := make(storage.Row)
+				r["Host"] = host
+				r["User"] = user
+				r["Select_priv"] = "N"
+				r["Insert_priv"] = "N"
+				r["Update_priv"] = "N"
+				r["Delete_priv"] = "N"
+				r["Create_priv"] = "N"
+				r["Drop_priv"] = "N"
+				r["Grant_priv"] = "N"
+				r["Shutdown_priv"] = "N"
+				r["authentication_string"] = ""
+				r["plugin"] = "caching_sha2_password"
+				r["account_locked"] = "N"
+				r["ssl_cipher"] = ""
+				r["x509_issuer"] = ""
+				r["x509_subject"] = ""
+				r["password_last_changed"] = nil
+				r["Password_reuse_history"] = nil
+				r["Password_reuse_time"] = nil
+				r["create_role_priv"] = "N"
+				r["drop_role_priv"] = "N"
+				return r
+			}
+			physicalRows := tbl.Scan()
+			// Build a map of existing user@host in physical table
+			physicalKeys := make(map[string]bool)
+			for _, r := range physicalRows {
+				u := strings.ToLower(fmt.Sprintf("%v", r["User"]))
+				h := strings.ToLower(fmt.Sprintf("%v", r["Host"]))
+				physicalKeys[u+"@"+h] = true
+			}
+			// Add built-in system users if not present
+			builtinSysUsers := []struct{ user, host string }{
+				{"mysql.infoschema", "localhost"},
+				{"mysql.session", "localhost"},
+				{"mysql.sys", "localhost"},
+				{"root", "localhost"},
+			}
+			var result []storage.Row
+			result = append(result, physicalRows...)
+			for _, bu := range builtinSysUsers {
+				key := bu.user + "@" + bu.host
+				if !physicalKeys[key] {
+					result = append(result, newMysqlUserRow(bu.user, bu.host))
+					physicalKeys[key] = true
+				}
+			}
+			// Add users from grant store that aren't in the physical table
+			allUsers := e.grantStore.ListAllUserHosts()
+			for _, u := range allUsers {
+				key := strings.ToLower(u.User) + "@" + strings.ToLower(u.Host)
+				if !physicalKeys[key] {
+					result = append(result, newMysqlUserRow(u.User, u.Host))
+					physicalKeys[key] = true
+				}
+			}
+			// Sort by User, Host for deterministic order
+			sort.SliceStable(result, func(i, j int) bool {
+				ui := strings.ToLower(fmt.Sprintf("%v", result[i]["User"]))
+				uj := strings.ToLower(fmt.Sprintf("%v", result[j]["User"]))
+				if ui != uj {
+					return ui < uj
+				}
+				hi := strings.ToLower(fmt.Sprintf("%v", result[i]["Host"]))
+				hj := strings.ToLower(fmt.Sprintf("%v", result[j]["Host"]))
+				return hi < hj
+			})
+			return result, nil
+		}
 		rawAll := tbl.Scan()
 		// MySQL's InnoDB stores mysql.engine_cost in clustered PK order (cost_name, engine_name, device_type).
 		// Sort here to match MySQL's natural row ordering when no ORDER BY is specified.

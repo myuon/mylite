@@ -2088,6 +2088,29 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 				if isRoleGrant {
 					// GRANT role TO user - record role membership
 					// Handle comma-separated roles: "GRANT r1, r2 TO user"
+					// Privilege check: non-root must have WITH ADMIN OPTION or ROLE_ADMIN or SUPER
+					grantUser, grantHost, grantActiveRoles := e.getCurrentUserAndRoles()
+					if grantUser != "" {
+						// Non-root: check authorization for each role
+						hasRoleAdmin := e.grantStore.HasGlobalPrivilege(grantUser, grantHost, "ROLE_ADMIN", grantActiveRoles)
+						hasSuper := e.grantStore.HasGlobalPrivilege(grantUser, grantHost, "SUPER", grantActiveRoles)
+						for _, roleName := range strings.Split(privs, ",") {
+							roleName = strings.TrimSpace(roleName)
+							roleName = strings.Trim(roleName, "`'\"")
+							if roleName == "" {
+								continue
+							}
+							rn := roleName
+							if atIdx := strings.Index(rn, "@"); atIdx >= 0 {
+								rn = rn[:atIdx]
+							}
+							rn = strings.Trim(rn, "`'\"")
+							if !hasRoleAdmin && !hasSuper &&
+								!e.grantStore.HasRoleWithAdminOption(grantUser, grantHost, rn, grantActiveRoles) {
+								return nil, mysqlError(1227, "42000", "Access denied; you need (at least one of) the WITH ADMIN,ROLE_ADMIN,SUPER privilege(s) for this operation")
+							}
+						}
+					}
 					for _, roleName := range strings.Split(privs, ",") {
 						roleName = strings.TrimSpace(roleName)
 						roleName = strings.Trim(roleName, "`'\"")
@@ -2102,6 +2125,86 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 					}
 				} else if privs != "" && object != "" && toUser != "" {
 					// Handle multiple users: "GRANT privs ON obj TO u1, u2"
+					// Privilege check: non-root must have SUPER or WITH GRANT OPTION for the priv
+					grantUser, grantHost, grantActiveRoles := e.getCurrentUserAndRoles()
+					if grantUser != "" {
+						// Non-root: check if user has SUPER or the privilege WITH GRANT OPTION
+						hasSuper := e.grantStore.HasGlobalPrivilege(grantUser, grantHost, "SUPER", grantActiveRoles)
+						hasRoleAdmin := e.grantStore.HasGlobalPrivilege(grantUser, grantHost, "ROLE_ADMIN", grantActiveRoles)
+						if !hasSuper {
+							if hasRoleAdmin {
+								// ROLE_ADMIN allows granting roles, not privileges
+								return nil, mysqlError(1227, "28000", fmt.Sprintf("Access denied for user '%s'@'%s' (using password: YES)", grantUser, grantHost))
+							}
+							// Check WITH GRANT OPTION on the target object
+							hasGrantOption := false
+							// Check direct user entries
+							allEntries := e.grantStore.GetGrants(grantUser, grantHost)
+							for _, entry := range allEntries {
+								if entry.GrantOption {
+									switch entry.Type {
+									case GrantTypeGlobal:
+										hasGrantOption = true
+									case GrantTypeDB:
+										if strings.HasSuffix(object, ".*") {
+											entryDB := strings.TrimSuffix(entry.Object, ".*")
+											objDB := strings.TrimSuffix(object, ".*")
+											if strings.EqualFold(entryDB, objDB) {
+												hasGrantOption = true
+											}
+										}
+									case GrantTypeTable:
+										if entry.Object == object {
+											hasGrantOption = true
+										}
+									}
+								}
+								if hasGrantOption {
+									break
+								}
+							}
+							// Also check via active roles
+							if !hasGrantOption {
+								for _, ar := range grantActiveRoles {
+									roleEntries := e.grantStore.GetRoleGrants(ar)
+									for _, entry := range roleEntries {
+										if entry.GrantOption {
+											switch entry.Type {
+											case GrantTypeGlobal:
+												hasGrantOption = true
+											case GrantTypeDB:
+												if strings.HasSuffix(object, ".*") {
+													entryDB := strings.TrimSuffix(entry.Object, ".*")
+													objDB := strings.TrimSuffix(object, ".*")
+													if strings.EqualFold(entryDB, objDB) {
+														hasGrantOption = true
+													}
+												}
+											case GrantTypeTable:
+												if entry.Object == object {
+													hasGrantOption = true
+												}
+											}
+										}
+										if hasGrantOption {
+											break
+										}
+									}
+									if hasGrantOption {
+										break
+									}
+								}
+							}
+							if !hasGrantOption {
+								// Determine error type: for DB-level access, use ER_DBACCESS_DENIED_ERROR
+								if strings.HasSuffix(object, ".*") {
+									dbName := strings.TrimSuffix(object, ".*")
+									return nil, mysqlError(1044, "42000", fmt.Sprintf("Access denied for user '%s'@'%s' to database '%s'", grantUser, grantHost, dbName))
+								}
+								return nil, mysqlError(1227, "28000", fmt.Sprintf("Access denied for user '%s'@'%s' (using password: YES)", grantUser, grantHost))
+							}
+						}
+					}
 					// For now handle single user (most common case)
 					e.grantStore.AddPrivGrant(toUser, toHost, privs, object, grantOption)
 
@@ -2241,6 +2344,23 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		if strings.HasPrefix(upper, "REVOKE ") && e.grantStore != nil {
 			privs, object, fromUser, fromHost, isRoleRevoke := ParseRevokeStatement(trimmed)
 			if isRoleRevoke && privs != "" && fromUser != "" {
+				// REVOKE role FROM user — privilege check same as GRANT role
+				revokeUser, revokeHost, revokeActiveRoles := e.getCurrentUserAndRoles()
+				if revokeUser != "" {
+					hasRoleAdmin := e.grantStore.HasGlobalPrivilege(revokeUser, revokeHost, "ROLE_ADMIN", revokeActiveRoles)
+					hasSuper := e.grantStore.HasGlobalPrivilege(revokeUser, revokeHost, "SUPER", revokeActiveRoles)
+					// Parse the role name from privs
+					rn := strings.TrimSpace(privs)
+					rn = strings.Trim(rn, "`'\"")
+					if atIdx := strings.LastIndex(rn, "@"); atIdx >= 0 {
+						rn = strings.TrimSpace(rn[:atIdx])
+					}
+					rn = strings.Trim(rn, "`'\"")
+					if !hasRoleAdmin && !hasSuper &&
+						!e.grantStore.HasRoleWithAdminOption(revokeUser, revokeHost, rn, revokeActiveRoles) {
+						return nil, mysqlError(1227, "42000", "Access denied; you need (at least one of) the WITH ADMIN,ROLE_ADMIN,SUPER privilege(s) for this operation")
+					}
+				}
 				// REVOKE role FROM user — remove the role membership grant
 				e.grantStore.RevokeRoleGrant(fromUser, fromHost, privs)
 			} else if !isRoleRevoke && privs != "" && object != "" && fromUser != "" {
