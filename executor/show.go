@@ -1899,9 +1899,13 @@ func (e *Executor) showRoutineStatus(routineType string, rest string) (*Result, 
 						continue
 					}
 				}
+				secType := funcDef.SecurityType
+				if secType == "" {
+					secType = "DEFINER"
+				}
 				rows = append(rows, []interface{}{
 					dbName, name, "FUNCTION", "root@localhost",
-					now, now, "DEFINER", "",
+					now, now, secType, funcDef.Comment,
 					"utf8mb4", "utf8mb4_0900_ai_ci", "utf8mb4_0900_ai_ci",
 				})
 			}
@@ -1918,9 +1922,13 @@ func (e *Executor) showRoutineStatus(routineType string, rest string) (*Result, 
 						continue
 					}
 				}
+				secType := procDef.SecurityType
+				if secType == "" {
+					secType = "DEFINER"
+				}
 				rows = append(rows, []interface{}{
 					dbName, name, "PROCEDURE", "root@localhost",
-					now, now, "DEFINER", "",
+					now, now, secType, procDef.Comment,
 					"utf8mb4", "utf8mb4_0900_ai_ci", "utf8mb4_0900_ai_ci",
 				})
 			}
