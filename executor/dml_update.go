@@ -660,6 +660,20 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		}
 		tbl.Lock()
 
+		// Recompute generated columns after BEFORE UPDATE trigger may have modified base columns.
+		// MySQL always recomputes generated column values from the (possibly modified) base
+		// columns after a BEFORE trigger fires, ignoring any direct SET NEW.generated_col
+		// assignments inside the trigger body.
+		for _, col := range tbl.Def.Columns {
+			genExpr := generatedColumnExpr(col.Type)
+			if genExpr == "" {
+				continue
+			}
+			if v, err := e.evalGeneratedColumnExpr(genExpr, newRow); err == nil {
+				newRow[col.Name] = v
+			}
+		}
+
 		// Enforce NOT NULL constraints on final NEW values.
 		// Convert NULL to the implicit zero/default value first so that
 		// subsequent constraint checks (duplicate key, etc.) see the

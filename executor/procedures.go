@@ -614,10 +614,13 @@ func (e *Executor) fireTriggerWithRoutineInterpreter(tr *catalog.TriggerDef, tim
 		return err
 	}
 
-	// For BEFORE triggers, copy any modified NEW.col values back to newRow
+	// For BEFORE triggers, copy any modified NEW.col values back to newRow.
+	// Use case-insensitive prefix check to handle keys stored with either
+	// "NEW." or "new." prefix (e.g. from SET new.col := val in trigger body).
 	if timing == "BEFORE" && newRow != nil {
 		for k, v := range ctx.localVars {
-			if strings.HasPrefix(k, "NEW.") {
+			kUpper := strings.ToUpper(k)
+			if strings.HasPrefix(kUpper, "NEW.") {
 				colName := k[4:]
 				newRow[colName] = v
 			}
@@ -3144,6 +3147,8 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 			eqIdx := strings.Index(setPart, "=")
 			if eqIdx >= 0 {
 				varName := strings.TrimSpace(setPart[:eqIdx])
+				// Handle := assignment operator (MySQL stored routine syntax): strip trailing colon.
+				varName = strings.TrimSuffix(varName, ":")
 				valStr := strings.TrimSpace(setPart[eqIdx+1:])
 				// User variables (@var) have no declared type, so string-to-number truncation
 				// is only a warning (not an error) even inside strict-mode stored functions.
@@ -3219,7 +3224,25 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 								}
 							}
 						}
-						localVars[varName] = val
+						// Normalize NEW.col and OLD.col variable names to canonical uppercase prefix
+						// so that the copy-back in fireTriggerWithRoutineInterpreter works correctly.
+						varNameUpper := strings.ToUpper(varName)
+						if strings.HasPrefix(varNameUpper, "NEW.") {
+							canonicalKey := "NEW." + varName[4:]
+							localVars[canonicalKey] = val
+							// Also update triggerNewRow immediately so that subsequent condition
+							// evaluations in the same trigger body see the updated value.
+							if ctx.triggerNewRow != nil && ctx.triggerTiming == "BEFORE" {
+								colName := varName[4:]
+								ctx.triggerNewRow[colName] = val
+							}
+						} else if strings.HasPrefix(varNameUpper, "OLD.") {
+							// OLD columns are read-only; assignment should have been caught earlier,
+							// but normalise the key for consistency.
+							localVars["OLD."+varName[4:]] = val
+						} else {
+							localVars[varName] = val
+						}
 					}
 				}
 			} else {
