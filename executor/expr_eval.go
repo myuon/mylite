@@ -8603,12 +8603,49 @@ func (e *Executor) evalMatchExpr(v *sqlparser.MatchExpr) (interface{}, error) {
 		return ftsEvalBoolean(docText, searchStr, minTokenSize), nil
 	default:
 		// Natural language mode (also covers NoOption, QueryExpansionOpt, NaturalLanguageModeWithQueryExpansionOpt)
-		return ftsEvalNaturalLanguage(docText, searchStr, minTokenSize), nil
+		// Use BM25 collection-level scoring only for MyISAM tables.
+		// InnoDB FTS uses a different (simpler) scoring model that matches the constant ftsBaseScore.
+		var stats *ftsCollStats
+		tableName := e.resolveFulltextTableName(v)
+		if tableName != "" && e.isMyISAMTable(tableName) {
+			colsForStats := ftCols
+			if len(colsForStats) == 0 {
+				// Build fallback column list from MATCH columns
+				seen := make(map[string]bool)
+				for _, col := range v.Columns {
+					k := strings.ToLower(col.Name.String())
+					if !seen[k] {
+						seen[k] = true
+						colsForStats = append(colsForStats, k)
+					}
+				}
+			}
+			stats = e.computeFtsCollStats(tableName, colsForStats, minTokenSize)
+		}
+		return ftsEvalNaturalLanguage(docText, searchStr, minTokenSize, stats), nil
 	}
 }
 
+// isMyISAMTable returns true if the named table (in CurrentDB) uses the MyISAM engine.
+func (e *Executor) isMyISAMTable(tableName string) bool {
+	if e.CurrentDB == "" || e.Catalog == nil {
+		return false
+	}
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil || db == nil {
+		return false
+	}
+	tblDef, err := db.GetTable(tableName)
+	if err != nil || tblDef == nil {
+		return false
+	}
+	return strings.EqualFold(tblDef.Engine, "MYISAM")
+}
+
 // Returns a relevance score (float64). 0 means no match.
-func ftsEvalNaturalLanguage(docText, searchStr string, minTokenSize int) float64 {
+// stats provides collection-level statistics for BM25 scoring; if nil, falls back to
+// simple TF-based scoring using ftsBaseScore.
+func ftsEvalNaturalLanguage(docText, searchStr string, minTokenSize int, stats *ftsCollStats) float64 {
 	docTokens := ftsTokenize(docText, minTokenSize)
 	queryTokens := ftsTokenize(searchStr, minTokenSize)
 
@@ -8621,8 +8658,46 @@ func ftsEvalNaturalLanguage(docText, searchStr string, minTokenSize int) float64
 	for _, t := range docTokens {
 		docFreq[t]++
 	}
+	docLen := len(docTokens)
 
-	// Count matching query terms (exclude stopwords)
+	if stats != nil && stats.N > 0 {
+		// BM25 scoring using collection statistics.
+		// IDF = ln((N - n + 0.5) / (n + 0.5))  (Okapi BM25 variant)
+		// TF_weight = tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avgdl))
+		// score = sum(IDF * TF_weight) for each non-stopword query term
+		const k1 = 1.2
+		const b = 0.75
+		N := float64(stats.N)
+		avgDL := stats.AvgDL
+		if avgDL <= 0 {
+			avgDL = 1.0
+		}
+		dl := float64(docLen)
+
+		var totalScore float64
+		for _, qt := range queryTokens {
+			if ftsStopwords[qt] {
+				continue
+			}
+			tf := float64(docFreq[qt])
+			if tf == 0 {
+				continue
+			}
+			n := float64(stats.DF[qt])
+			if n == 0 {
+				continue
+			}
+			idf := math.Log((N - n + 0.5) / (n + 0.5))
+			if idf < 0 {
+				idf = 0
+			}
+			tfWeight := tf * (k1 + 1) / (tf + k1*(1-b+b*dl/avgDL))
+			totalScore += idf * tfWeight
+		}
+		return totalScore
+	}
+
+	// Fallback: simple TF-based scoring without collection stats.
 	var totalScore float64
 	for _, qt := range queryTokens {
 		if ftsStopwords[qt] {
@@ -8807,9 +8882,11 @@ func evalBooleanTerms(terms []boolTerm, docFreq map[string]int, docLower string,
 		} else {
 			// In boolean mode, stopwords never match
 			if !ftsStopwords[t.word] {
-				if cnt, ok := docFreq[t.word]; ok {
+				if _, ok := docFreq[t.word]; ok {
 					matched = true
-					termScore = float64(cnt) * ftsBaseScore
+					// Boolean mode simple word match returns 1.0 per matching term
+					// (binary presence/absence indicator), not a weighted score.
+					termScore = 1.0
 				}
 			}
 			// If it's a stopword, matched stays false
@@ -8918,6 +8995,17 @@ func ftsTokenize(text string, minLen int) []string {
 // approximating MySQL's IDF-based scoring for a small table.
 const ftsBaseScore = 0.22764469683170319
 
+// ftsCollStats holds per-table collection-level statistics used for BM25 scoring.
+// These must be computed by scanning the entire table before per-row scoring.
+type ftsCollStats struct {
+	// N is the total number of documents (rows) in the collection.
+	N int
+	// DF maps each token to the number of documents it appears in.
+	DF map[string]int
+	// AvgDL is the average number of tokens per document (for BM25 length normalization).
+	AvgDL float64
+}
+
 // ftsStopwords is the default InnoDB stopword list.
 var ftsStopwords = map[string]bool{
 	"a": true, "about": true, "an": true, "are": true, "as": true,
@@ -8990,6 +9078,148 @@ func (e *Executor) resolveFulltextIndexColumns(v *sqlparser.MatchExpr) []string 
 		}
 	}
 	return nil
+}
+
+// resolveFulltextTableName returns the canonical (lowercase) table name that owns the
+// FULLTEXT index matching the MATCH expression, or "" if not found.
+func (e *Executor) resolveFulltextTableName(v *sqlparser.MatchExpr) string {
+	if e.CurrentDB == "" || e.Catalog == nil || len(v.Columns) == 0 {
+		return ""
+	}
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil || db == nil {
+		return ""
+	}
+
+	matchSet := make(map[string]bool)
+	for _, col := range v.Columns {
+		matchSet[strings.ToLower(col.Name.String())] = true
+	}
+
+	tableName := ""
+	if !v.Columns[0].Qualifier.IsEmpty() {
+		tableName = v.Columns[0].Qualifier.Name.String()
+	}
+
+	hasMatchingFT := func(tblDef *catalog.TableDef) bool {
+		for _, idx := range tblDef.Indexes {
+			if idx.Type != "FULLTEXT" {
+				continue
+			}
+			idxCols := make(map[string]bool)
+			for _, c := range idx.Columns {
+				idxCols[strings.ToLower(stripPrefixLengthFromCol(c))] = true
+			}
+			allFound := true
+			for mc := range matchSet {
+				if !idxCols[mc] {
+					allFound = false
+					break
+				}
+			}
+			if allFound {
+				return true
+			}
+		}
+		return false
+	}
+
+	if tableName != "" {
+		tblDef, _, err := findTableDefCaseInsensitive(db, tableName)
+		if err != nil || tblDef == nil {
+			return ""
+		}
+		if hasMatchingFT(tblDef) {
+			return strings.ToLower(tableName)
+		}
+		return ""
+	}
+	for _, name := range db.ListTables() {
+		tblDef, err := db.GetTable(name)
+		if err != nil {
+			continue
+		}
+		if hasMatchingFT(tblDef) {
+			return strings.ToLower(name)
+		}
+	}
+	return ""
+}
+
+// computeFtsCollStats scans all rows in the given table and computes collection-level
+// BM25 statistics (N, DF per term, AvgDL) for the specified FULLTEXT index columns.
+// Results are cached in e.ftsCollStatsCache under key "db.table:col1,col2,...".
+func (e *Executor) computeFtsCollStats(tableName string, ftCols []string, minTokenSize int) *ftsCollStats {
+	if e.Storage == nil || e.CurrentDB == "" {
+		return nil
+	}
+
+	// Build cache key
+	colKey := strings.Join(ftCols, ",")
+	cacheKey := e.CurrentDB + "." + tableName + ":" + colKey
+	if e.ftsCollStatsCache != nil {
+		if cached, ok := e.ftsCollStatsCache[cacheKey]; ok {
+			return cached
+		}
+	}
+
+	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
+	if err != nil || tbl == nil {
+		return nil
+	}
+
+	rows := tbl.Scan()
+	N := len(rows)
+	if N == 0 {
+		return nil
+	}
+
+	// Compute DF (document frequency) and total token count
+	dfMap := make(map[string]int)
+	var totalTokens int
+	for _, row := range rows {
+		var parts []string
+		seen := make(map[string]bool)
+		for _, colName := range ftCols {
+			if seen[colName] {
+				continue
+			}
+			seen[colName] = true
+			if val, ok := row[colName]; ok && val != nil {
+				parts = append(parts, toString(val))
+			}
+		}
+		docText := strings.Join(parts, " ")
+		tokens := ftsTokenize(docText, minTokenSize)
+		totalTokens += len(tokens)
+
+		// Count each unique token once per document for DF
+		tokenSet := make(map[string]bool)
+		for _, tok := range tokens {
+			tokenSet[tok] = true
+		}
+		for tok := range tokenSet {
+			dfMap[tok]++
+		}
+	}
+
+	avgDL := float64(totalTokens) / float64(N)
+	if N == 0 {
+		avgDL = 1.0
+	}
+
+	stats := &ftsCollStats{
+		N:     N,
+		DF:    dfMap,
+		AvgDL: avgDL,
+	}
+
+	// Cache the result
+	if e.ftsCollStatsCache == nil {
+		e.ftsCollStatsCache = make(map[string]*ftsCollStats)
+	}
+	e.ftsCollStatsCache[cacheKey] = stats
+	return stats
 }
 
 // validateFulltextIndex checks that the columns referenced in a MATCH expression

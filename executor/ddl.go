@@ -1258,15 +1258,23 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 		// Override/set collation from explicit COLLATE clause.
 		if col.Type.Options != nil && col.Type.Options.Collate != "" {
-			collLower := strings.ToLower(col.Type.Options.Collate)
+			rawCollate := col.Type.Options.Collate
+			// Strip surrounding single quotes or backticks: COLLATE 'latin1_bin' or COLLATE `latin1_bin`
+			if len(rawCollate) >= 2 {
+				if (rawCollate[0] == '\'' && rawCollate[len(rawCollate)-1] == '\'') ||
+					(rawCollate[0] == '`' && rawCollate[len(rawCollate)-1] == '`') {
+					rawCollate = rawCollate[1 : len(rawCollate)-1]
+				}
+			}
+			collLower := strings.ToLower(rawCollate)
 			// Validate the collation is known.
 			collCharset, collKnown := catalog.CharsetForCollation(collLower)
 			if !collKnown {
-				return nil, mysqlError(1273, "HY000", fmt.Sprintf("Unknown collation: '%s'", col.Type.Options.Collate))
+				return nil, mysqlError(1273, "HY000", fmt.Sprintf("Unknown collation: '%s'", rawCollate))
 			}
 			// Validate collation is compatible with any explicit column charset.
 			if colDef.Charset != "" && !charsetAliasEqual(collCharset, colDef.Charset) {
-				return nil, mysqlError(1253, "42000", fmt.Sprintf("COLLATION '%s' is not valid for CHARACTER SET '%s'", col.Type.Options.Collate, colDef.Charset))
+				return nil, mysqlError(1253, "42000", fmt.Sprintf("COLLATION '%s' is not valid for CHARACTER SET '%s'", rawCollate, colDef.Charset))
 			}
 			colDef.Collation = collLower
 			// If no charset was set explicitly, derive it from the collation.
@@ -1519,8 +1527,15 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		// Also check ER_WRONG_SUB_KEY (1089): prefix key on non-string column
 		// MyISAM: max 1000 bytes; InnoDB COMPACT/REDUNDANT: 767; InnoDB DYNAMIC: 3072
 		// For PRIMARY KEY or UNIQUE: error; for regular INDEX: warning (key silently used as-is)
+		// FULLTEXT indexes are exempt from key length limits: they store tokenized words,
+		// not the full column value, so any TEXT/VARCHAR size is allowed.
+		isFulltextIdx := idx.Info.Type == sqlparser.IndexTypeFullText
 		isUniqueOrPrimary := idx.Info.Type == sqlparser.IndexTypeUnique || idx.Info.Type == sqlparser.IndexTypePrimary
 		for ci, idxCol := range idx.Columns {
+			if isFulltextIdx {
+				_ = ci // FULLTEXT indexes have no key length restriction
+				continue
+			}
 			if idxCol.Length != nil {
 				// ER_WRONG_SUB_KEY (1089): prefix lengths are only valid for string/blob columns
 				colNameLower := strings.ToLower(idxCol.Column.String())
@@ -2778,7 +2793,15 @@ func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 	}
 	// Override/set collation from explicit COLLATE clause.
 	if col.Type.Options != nil && col.Type.Options.Collate != "" {
-		collLower := strings.ToLower(col.Type.Options.Collate)
+		rawCollate := col.Type.Options.Collate
+		// Strip surrounding single quotes or backticks: COLLATE 'latin1_bin' or COLLATE `latin1_bin`
+		if len(rawCollate) >= 2 {
+			if (rawCollate[0] == '\'' && rawCollate[len(rawCollate)-1] == '\'') ||
+				(rawCollate[0] == '`' && rawCollate[len(rawCollate)-1] == '`') {
+				rawCollate = rawCollate[1 : len(rawCollate)-1]
+			}
+		}
+		collLower := strings.ToLower(rawCollate)
 		colDef.Collation = collLower
 		if colDef.Charset == "" {
 			if collCharset, ok := catalog.CharsetForCollation(collLower); ok {

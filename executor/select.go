@@ -1646,6 +1646,11 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	if snapshotSetHere {
 		defer func() { e.sysVarSnapshot = nil }()
 	}
+	// Clear per-query FTS collection stats cache at the start of each top-level query
+	// so that stats are recomputed if the table changes between queries.
+	if e.routineDepth == 0 {
+		e.ftsCollStatsCache = nil
+	}
 
 	// Validate index hints (USE KEY / IGNORE KEY / FORCE KEY) on FROM tables.
 	if err := e.validateIndexHints(stmt.From); err != nil {
