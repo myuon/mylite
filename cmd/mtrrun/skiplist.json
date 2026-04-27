@@ -3457,10 +3457,6 @@
       "reason": "engine does not support session_track_gtids default OFF"
     },
     {
-      "test": "innodb/stored_fk",
-      "reason": "FK restrictions on stored/virtual generated columns not fully implemented"
-    },
-    {
       "test": "innodb/high_prio_trx_fk",
       "reason": "Requires multi-connection high-priority transaction testing"
     },
@@ -3639,10 +3635,6 @@
     {
       "test": "innodb/autoinc_persist",
       "reason": "internally skipped"
-    },
-    {
-      "test": "innodb/foreign_key",
-      "reason": "show create table error"
     },
     {
       "test": "funcs_1/is_cml_myisam",

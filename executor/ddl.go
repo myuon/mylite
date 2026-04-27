@@ -1832,6 +1832,31 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 						}
 					}
 				}
+				// Also reject FK with CASCADE/SET NULL actions on a column that is a
+				// base column of any STORED generated column in the same table.
+				// MySQL error 1005 (ER_CANNOT_ADD_FOREIGN): Cannot add foreign key constraint.
+				if fkDef.ReferenceDefinition != nil {
+					onDelete := fkDef.ReferenceDefinition.OnDelete
+					onUpdate := fkDef.ReferenceDefinition.OnUpdate
+					hasCascadeOrSetNull := onDelete == sqlparser.Cascade || onDelete == sqlparser.SetNull ||
+						onUpdate == sqlparser.Cascade || onUpdate == sqlparser.SetNull
+					if hasCascadeOrSetNull {
+						for _, col := range columns {
+							colTypeUpper := strings.ToUpper(col.Type)
+							if !strings.Contains(colTypeUpper, "STORED") {
+								continue
+							}
+							if !isGeneratedColumnType(col.Type) {
+								continue
+							}
+							// Check if the FK source column name appears in the stored column's expression
+							genExpr := generatedColumnExpr(col.Type)
+							if isColumnReferencedInExpr(srcName, genExpr) {
+								return nil, mysqlError(1005, "HY000", fmt.Sprintf("Cannot add foreign key constraint"))
+							}
+						}
+					}
+				}
 			}
 			// Create implicit index for FK columns (MySQL does this automatically)
 			var fkCols []string
@@ -1839,9 +1864,13 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				fkCols = append(fkCols, col.String())
 			}
 			if len(fkCols) > 0 {
-				// Check if an index already covers these columns
+				// Check if a usable (non-FULLTEXT, non-SPATIAL) index already covers
+				// the FK columns in the CREATE TABLE index list.
 				covered := false
 				for _, idx := range indexes {
+					if strings.EqualFold(idx.Type, "FULLTEXT") || strings.EqualFold(idx.Type, "SPATIAL") {
+						continue
+					}
 					if len(idx.Columns) >= len(fkCols) {
 						match := true
 						for k, fc := range fkCols {
@@ -1943,6 +1972,10 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			if name == "" {
 				fkAutoIdx++
 				name = fmt.Sprintf("%s_ibfk_%d", tableName, fkAutoIdx)
+			}
+			// MySQL enforces max 64-character identifier length for FK constraint names
+			if len(name) > 64 {
+				return nil, mysqlError(1059, "42000", fmt.Sprintf("Identifier name '%s' is too long", name))
 			}
 			var cols []string
 			for _, col := range fkDef.Source {
@@ -2415,6 +2448,19 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		delete(e.tempTables, tableName)
 	}
 
+	// Validate FK parent index before creating the table (when foreign_key_checks=1).
+	// This prevents the table from being created when the referenced parent table
+	// does not have the required index (ER_FK_NO_INDEX_PARENT = 1215).
+	if e.foreignKeyChecksEnabled() {
+		for _, fk := range foreignKeys {
+			if fk.ReferencedTable != "" && len(fk.ReferencedColumns) > 0 {
+				if err2 := e.validateFKParentIndex(db, tableName, fk.Name, fk.ReferencedTable, fk.ReferencedColumns); err2 != nil {
+					return nil, err2
+				}
+			}
+		}
+	}
+
 	err = db.CreateTable(def)
 	if err != nil {
 		if stmt.IfNotExists {
@@ -2694,6 +2740,37 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 				continue
 			}
 			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
+		}
+		// When foreign_key_checks is ON, prevent dropping a table that is
+		// referenced as a parent by a FK in another table (ER_FK_CANNOT_DROP_PARENT = 3730).
+		// Exception: if the referencing table is also in the same DROP TABLE statement,
+		// MySQL allows the drop (both parent and child are being dropped together).
+		if e.foreignKeyChecksEnabled() {
+			droppingTableNames := make(map[string]bool)
+			for _, t := range stmt.FromTables {
+				droppingTableNames[strings.ToLower(t.Name.String())] = true
+			}
+			tableNames := db.ListTables()
+			for _, otherName := range tableNames {
+				if strings.EqualFold(otherName, tableName) {
+					continue
+				}
+				// If this other table is also being dropped in the same statement, skip
+				if droppingTableNames[strings.ToLower(otherName)] {
+					continue
+				}
+				otherDef, err2 := db.GetTable(otherName)
+				if err2 != nil || otherDef == nil {
+					continue
+				}
+				for _, fk := range otherDef.ForeignKeys {
+					if strings.EqualFold(fk.ReferencedTable, tableName) {
+						return nil, mysqlError(3730, "HY000",
+							fmt.Sprintf("Cannot drop table '%s' referenced by a foreign key constraint '%s' on table '%s'.",
+								tableName, fk.Name, otherName))
+					}
+				}
+			}
 		}
 		err = db.DropTable(tableName)
 		if err != nil {
@@ -3010,6 +3087,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 	}
 
 	// Pre-check: ALGORITHM=INPLACE rejection for operations that require COPY
+	alterIsInplace := false
 	{
 		isInplace := false
 		hasStoredGcolAdd := false
@@ -3018,6 +3096,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			case sqlparser.AlgorithmValue:
 				if strings.EqualFold(string(av), "INPLACE") {
 					isInplace = true
+					alterIsInplace = true
 				}
 			case *sqlparser.AddColumns:
 				for _, col := range av.Columns {
@@ -3031,7 +3110,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			}
 		}
 		if isInplace && hasStoredGcolAdd {
-			return nil, mysqlError(1845, "0A000", "ALGORITHM=INPLACE is not supported. Reason: Cannot change column type INPLACE. Try ALGORITHM=COPY.")
+			return nil, mysqlError(1846, "0A000", "ALGORITHM=INPLACE is not supported for this operation. Try ALGORITHM=COPY.")
 		}
 		// WITH VALIDATION + ALGORITHM=INPLACE is not supported for virtual generated columns
 		// MySQL requires ALGORITHM=COPY to perform validation scans
@@ -3345,6 +3424,29 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				} else if op.After != nil {
 					position = "AFTER"
 					afterCol = op.After.Name.String()
+				}
+				// Reject adding a STORED generated column whose expression references
+				// a column that is used in a FK with CASCADE/SET NULL action.
+				// MySQL error 1005 (ER_CANNOT_ADD_FOREIGN): Cannot add foreign key constraint.
+				if isGeneratedColumnType(colDef.Type) &&
+					strings.Contains(strings.ToUpper(colDef.Type), "STORED") {
+					genExprNew := generatedColumnExpr(colDef.Type)
+					if tableDef0, _ := db.GetTable(tableName); tableDef0 != nil {
+						for _, fk := range tableDef0.ForeignKeys {
+							onDelete := strings.ToUpper(fk.OnDelete)
+							onUpdate := strings.ToUpper(fk.OnUpdate)
+							hasCascadeOrSetNull := onDelete == "CASCADE" || onDelete == "SET NULL" ||
+								onUpdate == "CASCADE" || onUpdate == "SET NULL"
+							if !hasCascadeOrSetNull {
+								continue
+							}
+							for _, fkCol := range fk.Columns {
+								if isColumnReferencedInExpr(fkCol, genExprNew) {
+									return nil, mysqlError(1005, "HY000", "Cannot add foreign key constraint")
+								}
+							}
+						}
+					}
 				}
 				if addErr := db.AddColumnAt(tableName, colDef, position, afterCol); addErr != nil {
 					if strings.Contains(addErr.Error(), "already exists") {
@@ -4022,50 +4124,73 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 								}
 							}
 						}
+						// Reject FK with CASCADE/SET NULL on a column that is a base column
+						// of any STORED generated column in the same table.
+						// Error 1005 when ALGORITHM=COPY (or default), 3104 when ALGORITHM=INPLACE.
+						if fkDef.ReferenceDefinition != nil {
+							onDelete := fkDef.ReferenceDefinition.OnDelete
+							onUpdate := fkDef.ReferenceDefinition.OnUpdate
+							hasCascadeOrSetNull := onDelete == sqlparser.Cascade || onDelete == sqlparser.SetNull ||
+								onUpdate == sqlparser.Cascade || onUpdate == sqlparser.SetNull
+							if hasCascadeOrSetNull {
+								for _, col := range tableDef0.Columns {
+									colTypeUpper := strings.ToUpper(col.Type)
+									if !strings.Contains(colTypeUpper, "STORED") || !isGeneratedColumnType(col.Type) {
+										continue
+									}
+									genExpr := generatedColumnExpr(col.Type)
+									if isColumnReferencedInExpr(srcName, genExpr) {
+										if alterIsInplace {
+											return nil, mysqlError(3104, "HY000", "Cannot add foreign key on the base column of stored column.")
+										}
+										return nil, mysqlError(1005, "HY000", "Cannot add foreign key constraint")
+									}
+								}
+							}
+						}
 					}
 				}
 				var fkCols []string
 				for _, col := range fkDef.Source {
 					fkCols = append(fkCols, col.String())
 				}
-				if len(fkCols) > 0 {
-					idxName := op.ConstraintDefinition.Name.String()
-					if idxName == "" {
-						idxName = fkCols[0]
-					}
-					// Check if an index already covers these columns
-					covered := false
-					tableDef, _ := db.GetTable(tableName)
-					if tableDef != nil {
-						for _, idx := range tableDef.Indexes {
-							if len(idx.Columns) >= len(fkCols) {
-								match := true
-								for k, fc := range fkCols {
-									if !strings.EqualFold(idx.Columns[k], fc) {
-										match = false
-										break
-									}
-								}
-								if match {
-									covered = true
+				// Determine FK constraint name before validation (needed for error messages).
+				fkName := op.ConstraintDefinition.Name.String()
+				if fkName == "" {
+					// Auto-generate a unique name based on table name and existing FK count
+					if td0, _ := db.GetTable(tableName); td0 != nil {
+						for suffix := 1; ; suffix++ {
+							candidate := fmt.Sprintf("%s_ibfk_%d", tableName, suffix)
+							taken := false
+							for _, existFK := range td0.ForeignKeys {
+								if strings.EqualFold(existFK.Name, candidate) {
+									taken = true
 									break
 								}
 							}
+							if !taken {
+								fkName = candidate
+								break
+							}
+						}
+					} else {
+						fkName = tableName + "_ibfk_1"
+					}
+				}
+				// MySQL enforces max 64-character identifier length for FK constraint names
+				if len(fkName) > 64 {
+					return nil, mysqlError(1059, "42000", fmt.Sprintf("Identifier name '%s' is too long", fkName))
+				}
+				// Check for duplicate FK constraint name (ER_FK_DUP_NAME = 1826)
+				// This check is NOT skipped even when foreign_key_checks=0.
+				if td0, _ := db.GetTable(tableName); td0 != nil {
+					for _, existFK := range td0.ForeignKeys {
+						if strings.EqualFold(existFK.Name, fkName) {
+							return nil, mysqlError(1826, "HY000", fmt.Sprintf("Duplicate foreign key constraint name '%s'", fkName))
 						}
 					}
-					if !covered {
-						db.AddIndex(tableName, catalog.IndexDef{
-							Name:    idxName,
-							Columns: fkCols,
-							Orders:  make([]string, len(fkCols)),
-						})
-					}
 				}
-				// Store the FK constraint in the table definition
-				fkName := op.ConstraintDefinition.Name.String()
-				if fkName == "" {
-					fkName = tableName + "_ibfk_1"
-				}
+				// Build the FK definition for validation.
 				fk := catalog.ForeignKeyDef{
 					Name:    fkName,
 					Columns: fkCols,
@@ -4077,6 +4202,42 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					}
 					fk.OnDelete = referenceActionToString(fkDef.ReferenceDefinition.OnDelete)
 					fk.OnUpdate = referenceActionToString(fkDef.ReferenceDefinition.OnUpdate)
+				}
+				// Validate that the child table has an index covering the FK columns.
+				// This check must happen BEFORE creating the auto-FK-index so that if it
+				// fails (e.g. GEOMETRY column), no index is left behind.
+				// (ER_FK_NO_INDEX_CHILD = 1005 / "Failed to add the foreign key constraint.
+				//  Missing index for constraint '...' in the foreign table '...'")
+				if err := e.validateFKChildIndex(db, tableName, fkName, fkCols); err != nil {
+					return nil, err
+				}
+				// Validate that the parent (referenced) table has an index covering the
+				// referenced columns. MySQL requires this even when foreign_key_checks=0.
+				// Error 1215 (ER_FK_NO_INDEX_PARENT): "Failed to add the foreign key constraint.
+				//  Missing index for constraint '...' in the referenced table '...'"
+				if fk.ReferencedTable != "" && len(fk.ReferencedColumns) > 0 {
+					if err := e.validateFKParentIndex(db, tableName, fkName, fk.ReferencedTable, fk.ReferencedColumns); err != nil {
+						return nil, err
+					}
+				}
+				// Create implicit FK index if needed (AFTER validation passes).
+				if len(fkCols) > 0 {
+					idxName := op.ConstraintDefinition.Name.String()
+					if idxName == "" {
+						idxName = fkCols[0]
+					}
+					// Check if a usable (non-FULLTEXT, non-SPATIAL) index already covers
+					// the FK columns. FULLTEXT/SPATIAL indexes cannot serve as FK support
+					// indexes, so they must be excluded from this check.
+					tableDef, _ := db.GetTable(tableName)
+					covered := tableHasIndexForColumns(tableDef, fkCols)
+					if !covered {
+						db.AddIndex(tableName, catalog.IndexDef{
+							Name:    idxName,
+							Columns: fkCols,
+							Orders:  make([]string, len(fkCols)),
+						})
+					}
 				}
 				if td, _ := db.GetTable(tableName); td != nil {
 					td.ForeignKeys = append(td.ForeignKeys, fk)

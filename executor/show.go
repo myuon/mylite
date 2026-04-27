@@ -1102,9 +1102,21 @@ func (e *Executor) showIndexes(dbName, tableName string) (*Result, error) {
 			r["EXPRESSION"],    // Expression
 		})
 	}
-	// MySQL's SHOW INDEX preserves index definition order, with PRIMARY always first.
-	// Use a stable sort that only moves PRIMARY to the front and orders by
-	// Seq_in_index within the same index name.
+	// MySQL's SHOW INDEX preserves index definition order, with PRIMARY first.
+	// Within the same table, InnoDB stores SPATIAL indexes before BTREE and
+	// BTREE before FULLTEXT (e.g. when both SPATIAL and FULLTEXT are added in
+	// the same ALTER TABLE). Seq_in_index orders columns within one index.
+	indexTypePriority := func(row []interface{}) int {
+		// row[10] is Index_type
+		switch strings.ToUpper(toString(row[10])) {
+		case "SPATIAL":
+			return 1
+		case "FULLTEXT":
+			return 3
+		default: // BTREE, HASH, etc.
+			return 2
+		}
+	}
 	sort.SliceStable(rows, func(i, j int) bool {
 		ki := toString(rows[i][2])
 		kj := toString(rows[j][2])
@@ -1116,6 +1128,12 @@ func (e *Executor) showIndexes(dbName, tableName string) (*Result, error) {
 		// Within the same index, order by Seq_in_index
 		if strings.EqualFold(ki, kj) {
 			return toInt64(rows[i][3]) < toInt64(rows[j][3])
+		}
+		// Different indexes: sort by type priority (SPATIAL < BTREE < FULLTEXT)
+		pi := indexTypePriority(rows[i])
+		pj := indexTypePriority(rows[j])
+		if pi != pj {
+			return pi < pj
 		}
 		return false
 	})
@@ -1906,7 +1924,11 @@ func (e *Executor) showRoutineStatus(routineType string, rest string) (*Result, 
 func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	showDB := e.CurrentDB
 	if strings.Contains(tableName, ".") {
-		showDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
+		// Only treat as db.table if the part before the first dot is non-empty (a valid db name).
+		// A table name like `......` (all dots) should not be split.
+		if idx := strings.Index(tableName, "."); idx > 0 {
+			showDB, tableName = resolveTableNameDB(tableName, e.CurrentDB)
+		}
 	}
 
 	// Privilege check: user must have a full table-level privilege on the table

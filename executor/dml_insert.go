@@ -2463,6 +2463,36 @@ func baseColumnType(colType string) string {
 	return strings.TrimSpace(colType[:idx])
 }
 
+// isColumnReferencedInExpr checks whether a column name appears as an identifier
+// in a SQL expression string (case-insensitive). This is used to determine if
+// a regular column is a base column of a generated column expression.
+// It uses a simple word-boundary check to avoid false positives.
+func isColumnReferencedInExpr(colName, expr string) bool {
+	// Use case-insensitive search with word boundaries
+	// We look for the column name surrounded by non-identifier characters
+	colLower := strings.ToLower(colName)
+	exprLower := strings.ToLower(expr)
+	// Remove backticks to normalize
+	exprLower = strings.ReplaceAll(exprLower, "`", "")
+	start := 0
+	for {
+		idx := strings.Index(exprLower[start:], colLower)
+		if idx < 0 {
+			return false
+		}
+		pos := start + idx
+		// Check left boundary
+		leftOK := pos == 0 || !isIdentChar(exprLower[pos-1])
+		// Check right boundary
+		end := pos + len(colLower)
+		rightOK := end >= len(exprLower) || !isIdentChar(exprLower[end])
+		if leftOK && rightOK {
+			return true
+		}
+		start = pos + 1
+	}
+}
+
 func (e *Executor) evalGeneratedColumnExpr(expr string, row storage.Row) (interface{}, error) {
 	stmt, err := e.parser().Parse("SELECT " + expr)
 	if err != nil {

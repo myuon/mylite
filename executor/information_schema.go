@@ -558,7 +558,6 @@ var singleRowStubTables = map[string]storage.Row{
 	"innodb_fields":         {"INDEX_ID": int64(0), "NAME": "", "POS": int64(0)},
 	"optimizer_trace":       {"QUERY": "", "TRACE": "", "MISSING_BYTES_BEYOND_MAX_MEM_SIZE": int64(0), "INSUFFICIENT_PRIVILEGES": int64(0)},
 	"files":                 {"FILE_NAME": "", "FILE_TYPE": "", "TABLESPACE_NAME": ""},
-	"referential_constraints": {"CONSTRAINT_CATALOG": "def", "CONSTRAINT_SCHEMA": "", "CONSTRAINT_NAME": "", "UNIQUE_CONSTRAINT_CATALOG": "def", "UNIQUE_CONSTRAINT_SCHEMA": "", "UNIQUE_CONSTRAINT_NAME": "", "MATCH_OPTION": "NONE", "UPDATE_RULE": "RESTRICT", "DELETE_RULE": "RESTRICT", "TABLE_NAME": "", "REFERENCED_TABLE_NAME": ""},
 	"innodb_temp_table_info": {"TABLE_ID": int64(0), "NAME": "", "N_COLS": int64(0), "SPACE": int64(0)},
 }
 
@@ -821,6 +820,8 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		}
 	case "key_column_usage":
 		rawRows = e.infoSchemaKeyColumnUsage()
+	case "referential_constraints":
+		rawRows = e.infoSchemaReferentialConstraints()
 	case "innodb_ft_default_stopword":
 		// MySQL default fulltext stopword list
 		rawRows = []storage.Row{
@@ -1521,6 +1522,110 @@ func (e *Executor) infoSchemaInnoDBForeignCols() []storage.Row {
 	rows := make([]storage.Row, len(colRows))
 	for i, cr := range colRows {
 		rows[i] = cr.row
+	}
+	return rows
+}
+
+// infoSchemaReferentialConstraints returns rows for INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS.
+// Columns: CONSTRAINT_CATALOG, CONSTRAINT_SCHEMA, CONSTRAINT_NAME,
+//          UNIQUE_CONSTRAINT_CATALOG, UNIQUE_CONSTRAINT_SCHEMA, UNIQUE_CONSTRAINT_NAME,
+//          MATCH_OPTION, UPDATE_RULE, DELETE_RULE, TABLE_NAME, REFERENCED_TABLE_NAME
+func (e *Executor) infoSchemaReferentialConstraints() []storage.Row {
+	dbNames := e.Catalog.ListDatabases()
+	sort.Strings(dbNames)
+	var rows []storage.Row
+	for _, dbName := range dbNames {
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		tableNames := db.ListTables()
+		sort.Strings(tableNames)
+		for _, tableName := range tableNames {
+			def, err := db.GetTable(tableName)
+			if err != nil || def == nil {
+				continue
+			}
+			for _, fk := range def.ForeignKeys {
+				// Determine the name of the unique constraint in the parent table.
+				// MySQL looks for: PRIMARY KEY first, then UNIQUE index covering fk.ReferencedColumns.
+				uniqueConstraintName := ""
+				parentDef, perr := db.GetTable(fk.ReferencedTable)
+				if perr == nil && parentDef != nil {
+					// Check if the FK references the primary key columns
+					if len(fk.ReferencedColumns) > 0 && len(parentDef.PrimaryKey) > 0 {
+						pkMatch := len(fk.ReferencedColumns) <= len(parentDef.PrimaryKey)
+						if pkMatch {
+							for i, rc := range fk.ReferencedColumns {
+								if !strings.EqualFold(rc, parentDef.PrimaryKey[i]) {
+									pkMatch = false
+									break
+								}
+							}
+						}
+						if pkMatch {
+							uniqueConstraintName = "PRIMARY"
+						}
+					}
+					// If not a PK match, look for UNIQUE index
+					if uniqueConstraintName == "" {
+						for _, idx := range parentDef.Indexes {
+							if !idx.Unique {
+								continue
+							}
+							if len(fk.ReferencedColumns) > len(idx.Columns) {
+								continue
+							}
+							match := true
+							for i, rc := range fk.ReferencedColumns {
+								idxCol := idx.Columns[i]
+								// Strip length prefix if any
+								if p := strings.Index(idxCol, "("); p >= 0 {
+									idxCol = idxCol[:p]
+								}
+								if !strings.EqualFold(rc, idxCol) {
+									match = false
+									break
+								}
+							}
+							if match {
+								uniqueConstraintName = idx.Name
+								break
+							}
+						}
+					}
+				}
+
+				deleteRule := "RESTRICT"
+				if fk.OnDelete != "" {
+					deleteRule = strings.ToUpper(fk.OnDelete)
+					if deleteRule == "" {
+						deleteRule = "RESTRICT"
+					}
+				}
+				updateRule := "RESTRICT"
+				if fk.OnUpdate != "" {
+					updateRule = strings.ToUpper(fk.OnUpdate)
+					if updateRule == "" {
+						updateRule = "RESTRICT"
+					}
+				}
+
+				rows = append(rows, storage.Row{
+					"CONSTRAINT_CATALOG":        "def",
+					"CONSTRAINT_SCHEMA":         dbName,
+					"CONSTRAINT_NAME":           fk.Name,
+					"UNIQUE_CONSTRAINT_CATALOG": "def",
+					"UNIQUE_CONSTRAINT_SCHEMA":  dbName,
+					"UNIQUE_CONSTRAINT_NAME":    uniqueConstraintName,
+					"MATCH_OPTION":              "NONE",
+					"UPDATE_RULE":               updateRule,
+					"DELETE_RULE":               deleteRule,
+					"TABLE_NAME":                tableName,
+					"REFERENCED_TABLE_NAME":     fk.ReferencedTable,
+				})
+			}
+		}
 	}
 	return rows
 }
