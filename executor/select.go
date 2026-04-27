@@ -1725,6 +1725,12 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		e.sysVarSnapshot = snap
 		snapshotSetHere = true
 	}
+	// Reset the GROUP_CONCAT row counter at the outermost SELECT level.
+	// This counter tracks the cumulative number of non-NULL values processed by
+	// GROUP_CONCAT across all groups, used for MySQL-compatible warning messages.
+	if e.routineDepth == 0 {
+		e.groupConcatRowCount = 0
+	}
 	if snapshotSetHere {
 		defer func() { e.sysVarSnapshot = nil }()
 	}
@@ -5083,9 +5089,23 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		} else if len(sep) >= 2 && sep[0] == '"' && sep[len(sep)-1] == '"' {
 			sep = sep[1 : len(sep)-1]
 		}
+		// Validate: nested aggregate functions inside GROUP_CONCAT are not allowed.
+		for _, arg := range e.Exprs {
+			if containsAggregate(arg) {
+				return nil, mysqlError(1111, "HY000", "Invalid use of group function")
+			}
+		}
+		// Validate: positional ORDER BY references must be within the expression list range.
+		for _, ord := range e.OrderBy {
+			if lit, ok := ord.Expr.(*sqlparser.Literal); ok && lit.Type == sqlparser.IntVal {
+				if pos, err2 := strconv.Atoi(lit.Val); err2 == nil {
+					if pos < 1 || pos > len(e.Exprs) {
+						return nil, mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%d' in 'order clause'", pos))
+					}
+				}
+			}
+		}
 		// Apply ORDER BY if present
-		sortedRows := make([]storage.Row, len(groupRows))
-		copy(sortedRows, groupRows)
 		// Determine the collation to use for sorting and distinct deduplication.
 		// Use the session's collation_connection (default: utf8mb4_0900_ai_ci).
 		gcCollation := "utf8mb4_0900_ai_ci"
@@ -5094,8 +5114,21 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 				gcCollation = cv
 			}
 		}
+
+		// Build an indexed list to track original row positions for tiebreaking.
+		// MySQL sorts rows with equal ORDER BY values using the physical row position:
+		// ASC keeps the original (insertion) order; DESC reverses it.
+		type indexedRow struct {
+			idx int
+			row storage.Row
+		}
+		indexed := make([]indexedRow, len(groupRows))
+		for i, r := range groupRows {
+			indexed[i] = indexedRow{idx: i, row: r}
+		}
+
 		if len(e.OrderBy) > 0 {
-			sort.SliceStable(sortedRows, func(i, j int) bool {
+			sort.SliceStable(indexed, func(i, j int) bool {
 				for _, ord := range e.OrderBy {
 					// Resolve positional ORDER BY (e.g. ORDER BY 1 refers to the first
 					// expression in the GROUP_CONCAT expression list).
@@ -5105,11 +5138,9 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 							ordExpr = e.Exprs[pos-1]
 						}
 					}
-					vi, _ := evalRowExpr(ordExpr, sortedRows[i])
-					vj, _ := evalRowExpr(ordExpr, sortedRows[j])
-					// Use collation-aware comparison without tie-breaking on raw string value.
-					// For equal collation-key values (e.g. D and d under _ci), the stable
-					// sort preserves insertion order, matching MySQL behavior.
+					vi, _ := evalRowExpr(ordExpr, indexed[i].row)
+					vj, _ := evalRowExpr(ordExpr, indexed[j].row)
+					// Use collation-aware comparison.
 					cmp := compareByCollationNoTieBreak(vi, vj, gcCollation)
 					if cmp == 0 {
 						continue
@@ -5119,9 +5150,49 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 					}
 					return cmp < 0
 				}
-				return false
+				// All ORDER BY keys are equal: use reverse insertion order as tiebreaker.
+				// MySQL always uses the reverse of insertion order (higher row index first)
+				// as the secondary sort key when ORDER BY values are equal, regardless of
+				// the ORDER BY direction (ASC or DESC).
+				return indexed[i].idx > indexed[j].idx
+			})
+		} else if e.Distinct {
+			// GROUP_CONCAT(DISTINCT ...) without ORDER BY: MySQL sorts the distinct values
+			// by the concatenated expression value in ASC collation order, using reverse
+			// insertion order as a tiebreaker for equal values.
+			sort.SliceStable(indexed, func(i, j int) bool {
+				var vi, vj interface{}
+				if len(e.Exprs) == 1 {
+					vi, _ = evalRowExpr(e.Exprs[0], indexed[i].row)
+					vj, _ = evalRowExpr(e.Exprs[0], indexed[j].row)
+				} else {
+					// Multi-expression: build the concatenated string for comparison.
+					var bi, bj strings.Builder
+					for _, arg := range e.Exprs {
+						v, _ := evalRowExpr(arg, indexed[i].row)
+						bi.WriteString(toString(v))
+					}
+					for _, arg := range e.Exprs {
+						v, _ := evalRowExpr(arg, indexed[j].row)
+						bj.WriteString(toString(v))
+					}
+					vi = bi.String()
+					vj = bj.String()
+				}
+				cmp := compareByCollationNoTieBreak(vi, vj, gcCollation)
+				if cmp != 0 {
+					return cmp < 0
+				}
+				return indexed[i].idx > indexed[j].idx
 			})
 		}
+
+		// Rebuild sorted rows from indexed list.
+		sortedRows := make([]storage.Row, len(indexed))
+		for i, ir := range indexed {
+			sortedRows[i] = ir.row
+		}
+
 		distinct := make(map[string]struct{})
 		out := make([]string, 0, len(sortedRows))
 		for _, row := range sortedRows {
@@ -5159,10 +5230,7 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		}
 		result := strings.Join(out, sep)
 		// Apply group_concat_max_len limit.
-		// MySQL limits GROUP_CONCAT output based on group_concat_max_len.
-		// For BLOB/binary columns with multibyte session charset (e.g. utf8mb4, mbmaxlen=4),
-		// MySQL uses group_concat_max_len / mbmaxlen as the effective byte limit.
-		// The default session charset in MySQL 8.0 is utf8mb4 (mbmaxlen=4).
+		// MySQL limits GROUP_CONCAT output to group_concat_max_len bytes.
 		if len(execCtx) > 0 && execCtx[0] != nil {
 			exec := execCtx[0]
 			maxLen := int64(1024) // MySQL default group_concat_max_len
@@ -5171,17 +5239,17 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 					maxLen = n
 				}
 			}
-			// Effective byte limit: group_concat_max_len / mbmaxlen_of_session_charset.
-			// For utf8mb4 (default), mbmaxlen=4; for latin1/binary, mbmaxlen=1.
-			// We use mbmaxlen=4 as the default (MySQL 8.0 default charset is utf8mb4).
-			const mbmaxlen = 4
-			effectiveMaxBytes := int(maxLen) / mbmaxlen
-			if len(result) > effectiveMaxBytes {
-				// Truncate to effectiveMaxBytes and emit Warning 1260 for each source row.
-				result = result[:effectiveMaxBytes]
-				for i := range sortedRows {
-					exec.addWarning("Warning", 1260, "Row "+strconv.Itoa(i+1)+" was cut by GROUP_CONCAT()")
-				}
+			if int64(len(result)) > maxLen {
+				// Truncate to maxLen bytes.
+				result = result[:maxLen]
+				// Update the cumulative row counter and emit one warning.
+				// MySQL tracks how many non-NULL values have been processed globally
+				// across all groups in the query, and reports the position of the
+				// value that caused the truncation.
+				exec.groupConcatRowCount += len(out)
+				exec.addWarning("Warning", 1260, "Row "+strconv.Itoa(exec.groupConcatRowCount)+" was cut by GROUP_CONCAT()")
+			} else {
+				exec.groupConcatRowCount += len(out)
 			}
 		}
 		return result, nil
