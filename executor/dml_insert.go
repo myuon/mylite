@@ -162,6 +162,10 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		return nil, mysqlError(1442, "HY000",
 			fmt.Sprintf("Can't update table '%s' in stored function/trigger because it is already used by statement which invoked this stored function/trigger.", tableName))
 	}
+	// Track the table being modified so nested trigger calls can detect recursive modifications.
+	prevModifyingTable := e.modifyingTable
+	e.modifyingTable = tableName
+	defer func() { e.modifyingTable = prevModifyingTable }()
 
 	// Reject INSERT on information_schema tables.
 	if strings.EqualFold(insertDB, "information_schema") {

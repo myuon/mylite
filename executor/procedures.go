@@ -304,16 +304,17 @@ func splitTriggerBody(body string) []string {
 				remaining := strings.ToUpper(words[i:])
 				prevIsAlpha := i > 0 && isAlphaNum(words[i-1])
 				// A keyword is at "statement start" if the preceding non-whitespace char
-				// is ';', a newline (start of line), or the beginning of the body.
+				// is ';', a newline (start of line), the beginning of the body, or a label
+				// colon (e.g. "label1: LOOP" — the LOOP after ':' should increment depth).
 				// This prevents matching SQL function calls like repeat('x', 10) or if(cond, a, b).
 				isStmtStart := i == 0
 				if !isStmtStart && i > 0 {
-					// Check if preceded only by whitespace since last ';' or start
+					// Check if preceded only by whitespace since last ';', start, or label colon.
 					j := i - 1
 					for j >= 0 && (words[j] == ' ' || words[j] == '\t') {
 						j--
 					}
-					if j < 0 || words[j] == ';' || words[j] == '\n' {
+					if j < 0 || words[j] == ';' || words[j] == '\n' || words[j] == ':' {
 						isStmtStart = true
 					}
 				}
@@ -480,6 +481,16 @@ func triggerBodyNeedsRoutineInterpreter(body []string) bool {
 // The newRow and oldRow maps provide NEW and OLD pseudo-record values.
 // For BEFORE triggers, SET NEW.col = val modifies newRow in place.
 func (e *Executor) fireTriggers(tableName, timing, event string, newRow, oldRow storage.Row) error {
+	// Guard against deeply nested / recursive trigger chains (MySQL limit is ~16 levels).
+	// functionOrTriggerDepth is incremented inside this function's trigger loop, so by
+	// the time a nested fireTriggers call reaches this check the depth already reflects
+	// the outer trigger's level.  Stopping at 32 prevents Go stack overflow from
+	// infinite mutual-trigger recursion (e.g. t1 trigger inserts into t2 which has a
+	// trigger that inserts back into t1).
+	if e.functionOrTriggerDepth > 32 {
+		return mysqlError(1436, "HY000", "Thread stack overrun: trigger nesting limit exceeded")
+	}
+
 	db, err := e.Catalog.GetDatabase(e.CurrentDB)
 	if err != nil {
 		return err
@@ -970,8 +981,29 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 			}
 		}
 		bodyStr = strings.TrimSpace(bodyStr)
-		bodyStr = strings.TrimSuffix(bodyStr, ";")
-		bodyStr = strings.TrimSpace(bodyStr)
+		// For single-statement procedures (no BEGIN...END), the body is only the
+		// first semicolon-terminated statement. Any trailing statements (e.g. from
+		// MySQL multi-query mode where the block up to the custom delimiter contains
+		// multiple ';'-separated statements) are NOT part of the procedure body.
+		// This matches MySQL behavior: "CREATE PROCEDURE p() stmt1; stmt2;" creates
+		// a procedure with body "stmt1" only.
+		if firstSemiIdx := strings.Index(bodyStr, ";"); firstSemiIdx >= 0 {
+			bodyStr = strings.TrimSpace(bodyStr[:firstSemiIdx])
+		} else {
+			bodyStr = strings.TrimSuffix(bodyStr, ";")
+			bodyStr = strings.TrimSpace(bodyStr)
+		}
+		// Discard any trailing content that came from a spurious "END" keyword
+		// appearing after the procedure body in a no-BEGIN multi-query context.
+		// e.g. body = "SELECT 1\nEND" → trim trailing END (it was not a real END).
+		bodyUpper2 := strings.ToUpper(bodyStr)
+		if strings.HasSuffix(bodyUpper2, "\nEND") {
+			bodyStr = strings.TrimSpace(bodyStr[:len(bodyStr)-len("\nEND")])
+		} else if strings.HasSuffix(bodyUpper2, " END") {
+			bodyStr = strings.TrimSpace(bodyStr[:len(bodyStr)-len(" END")])
+		} else if bodyUpper2 == "END" {
+			bodyStr = ""
+		}
 		if bodyStr == "" {
 			return nil, fmt.Errorf("invalid CREATE PROCEDURE syntax: missing body")
 		}
@@ -2399,6 +2431,7 @@ type routineContext struct {
 	handlerResult      *Result      // result set produced by EXIT HANDLER body (to return from CALL)
 	resultSets         *[]*Result   // pointer to slice collecting all result sets from SELECT statements; shared across child contexts
 	propagatedSignal   error        // RESIGNAL error raised from within a handler body (propagates up)
+	nestDepth          int          // nesting depth of execRoutineBodyWithContext calls, to detect infinite recursion
 }
 
 // childContext creates a child routineContext that shares state with the parent
@@ -2417,6 +2450,7 @@ func (ctx *routineContext) childContext() *routineContext {
 		triggerOldRow:      ctx.triggerOldRow,
 		triggerTiming:      ctx.triggerTiming,
 		resultSets:         ctx.resultSets, // share pointer so child SELECTs accumulate in same list
+		nestDepth:          ctx.nestDepth,  // propagate nesting depth for overflow detection
 	}
 	return child
 }
@@ -2439,6 +2473,15 @@ func (e *Executor) execRoutineBody(body []string, paramVars map[string]interface
 
 // execRoutineBodyWithContext executes routine body statements with shared context.
 func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext) (interface{}, error) {
+	// Guard against infinite recursion caused by malformed procedure bodies (e.g. a LOOP
+	// whose body was not properly parsed and still contains a LOOP that triggers this path again).
+	ctx.nestDepth++
+	if ctx.nestDepth > 200 {
+		ctx.nestDepth--
+		return nil, fmt.Errorf("stored procedure: execution depth exceeded (possible infinite recursion in control flow)")
+	}
+	defer func() { ctx.nestDepth-- }()
+
 	localVars := ctx.localVars
 	cursors := ctx.cursors
 	cursorDefs := ctx.cursorDefs
