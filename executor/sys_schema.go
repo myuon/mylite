@@ -1927,6 +1927,174 @@ func (e *Executor) evalSysSchemaFunc(name string, args []sqlparser.Expr) (interf
 		}
 		return strings.Join(result, ","), true, nil
 
+	case "ps_is_account_enabled":
+		// ps_is_account_enabled(in_host, in_user) — returns 'YES' or 'NO'
+		// Checks performance_schema.setup_actors for a matching entry with ENABLED='YES'.
+		// The table supports host/user wildcards ('%' matches anything).
+		if len(args) < 2 {
+			return "NO", true, nil
+		}
+		hostVal, err := e.evalExpr(args[0])
+		if err != nil {
+			return nil, true, err
+		}
+		userVal, err := e.evalExpr(args[1])
+		if err != nil {
+			return nil, true, err
+		}
+		inHost := ""
+		if hostVal != nil {
+			inHost = toString(hostVal)
+		}
+		inUser := ""
+		if userVal != nil {
+			inUser = toString(userVal)
+		}
+		actorsRows := e.getSetupActorsRows()
+		// MySQL uses specificity ordering: exact match > wildcard.
+		// For enabled check, iterate rows; if any matching row has ENABLED='YES', return YES.
+		// Matching: row HOST/USER of '%' matches any value; exact otherwise.
+		matchesActor := func(rowHost, rowUser, host, user string) bool {
+			hostMatch := rowHost == "%" || strings.EqualFold(rowHost, host)
+			userMatch := rowUser == "%" || strings.EqualFold(rowUser, user)
+			return hostMatch && userMatch
+		}
+		for _, row := range actorsRows {
+			rowHost := fmt.Sprintf("%v", row["HOST"])
+			rowUser := fmt.Sprintf("%v", row["USER"])
+			rowEnabled := strings.ToUpper(fmt.Sprintf("%v", row["ENABLED"]))
+			if matchesActor(rowHost, rowUser, inHost, inUser) && rowEnabled == "YES" {
+				return "YES", true, nil
+			}
+		}
+		return "NO", true, nil
+
+	case "ps_is_consumer_enabled":
+		// ps_is_consumer_enabled(in_consumer) — returns 'YES' or 'NO'.
+		// Returns error (HY000) if the consumer name is not valid.
+		// Respects the consumer hierarchy:
+		//   global_instrumentation
+		//     thread_instrumentation
+		//       events_*_current
+		//         events_*_history
+		//           events_*_history_long
+		//     statements_digest
+		if len(args) < 1 {
+			return nil, true, nil
+		}
+		consumerVal, err := e.evalExpr(args[0])
+		if err != nil {
+			return nil, true, err
+		}
+		consumerName := ""
+		if consumerVal != nil {
+			consumerName = toString(consumerVal)
+		}
+		consumerNameLower := strings.ToLower(consumerName)
+
+		// Valid consumer names (MySQL 8.0)
+		validConsumers := map[string]bool{
+			"global_instrumentation":              true,
+			"thread_instrumentation":              true,
+			"statements_digest":                   true,
+			"events_stages_current":               true,
+			"events_stages_history":               true,
+			"events_stages_history_long":          true,
+			"events_statements_current":           true,
+			"events_statements_history":           true,
+			"events_statements_history_long":      true,
+			"events_transactions_current":         true,
+			"events_transactions_history":         true,
+			"events_transactions_history_long":    true,
+			"events_waits_current":                true,
+			"events_waits_history":                true,
+			"events_waits_history_long":           true,
+		}
+		if !validConsumers[consumerNameLower] {
+			return nil, true, mysqlError(3000, "HY000", fmt.Sprintf("Invalid argument error: %s in function sys.ps_is_consumer_enabled.", consumerName))
+		}
+
+		// Helper to get a single consumer's ENABLED state
+		getConsumerEnabled := func(name string) string {
+			if e.psConsumerEnabled != nil {
+				if v, ok := e.psConsumerEnabled[name]; ok {
+					return strings.ToUpper(v)
+				}
+			}
+			varName := "performance_schema_consumer_" + strings.ReplaceAll(name, "-", "_")
+			if v, ok := e.startupVars[varName]; ok && isPerfSchemaConsumerDisabled(v) {
+				return "NO"
+			}
+			return "YES"
+		}
+
+		// Consumer hierarchy: parent must be YES for child to be YES.
+		// Parent chain per consumer:
+		consumerParents := map[string][]string{
+			"global_instrumentation":           {},
+			"thread_instrumentation":           {"global_instrumentation"},
+			"statements_digest":                {"global_instrumentation"},
+			"events_stages_current":            {"global_instrumentation", "thread_instrumentation"},
+			"events_stages_history":            {"global_instrumentation", "thread_instrumentation", "events_stages_current"},
+			"events_stages_history_long":       {"global_instrumentation", "thread_instrumentation", "events_stages_current"},
+			"events_statements_current":        {"global_instrumentation", "thread_instrumentation"},
+			"events_statements_history":        {"global_instrumentation", "thread_instrumentation", "events_statements_current"},
+			"events_statements_history_long":   {"global_instrumentation", "thread_instrumentation", "events_statements_current"},
+			"events_transactions_current":      {"global_instrumentation", "thread_instrumentation"},
+			"events_transactions_history":      {"global_instrumentation", "thread_instrumentation", "events_transactions_current"},
+			"events_transactions_history_long": {"global_instrumentation", "thread_instrumentation", "events_transactions_current"},
+			"events_waits_current":             {"global_instrumentation", "thread_instrumentation"},
+			"events_waits_history":             {"global_instrumentation", "thread_instrumentation", "events_waits_current"},
+			"events_waits_history_long":        {"global_instrumentation", "thread_instrumentation", "events_waits_current"},
+		}
+
+		// Check if this consumer and all its parents are enabled
+		parents := consumerParents[consumerNameLower]
+		for _, parent := range parents {
+			if getConsumerEnabled(parent) != "YES" {
+				return "NO", true, nil
+			}
+		}
+		if getConsumerEnabled(consumerNameLower) != "YES" {
+			return "NO", true, nil
+		}
+		return "YES", true, nil
+
+	case "ps_is_thread_instrumented":
+		// ps_is_thread_instrumented(in_connection_id) — returns 'YES', 'NO', 'UNKNOWN', or NULL.
+		// NULL argument returns NULL. Looks up the thread's INSTRUMENTED column in
+		// performance_schema.threads by PROCESSLIST_ID.
+		if len(args) < 1 {
+			return nil, true, nil
+		}
+		connIDVal, err := e.evalExpr(args[0])
+		if err != nil {
+			return nil, true, err
+		}
+		if connIDVal == nil {
+			return nil, true, nil
+		}
+		lookupConnID := toInt64(connIDVal)
+		// Check our per-session override map first
+		if e.psThreadInstrumented != nil {
+			if v, ok := e.psThreadInstrumented[lookupConnID]; ok {
+				return strings.ToUpper(v), true, nil
+			}
+		}
+		// Check if this connection is known from the process list
+		if e.processList != nil {
+			for _, proc := range e.processList.Snapshot() {
+				if proc.ID == lookupConnID {
+					return "YES", true, nil
+				}
+			}
+		}
+		// Also check current connection
+		if e.connectionID == lookupConnID {
+			return "YES", true, nil
+		}
+		return "UNKNOWN", true, nil
+
 	default:
 		return nil, false, nil
 	}
