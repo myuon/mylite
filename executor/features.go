@@ -20,15 +20,14 @@ type Feature struct {
 // Features is the canonical registry of MySQL feature support in mylite.
 var Features = []Feature{
 	// Storage Engines
-	// CREATE TABLE accepts MyISAM/MEMORY/etc without NO_ENGINE_SUBSTITUTION; treated as InnoDB.
-	// ALTER TABLE to MyISAM/MEMORY/HEAP/MERGE/BLACKHOLE/ARCHIVE returns Error 50001.
+	// CREATE TABLE and ALTER TABLE both accept MyISAM/MEMORY/etc; all treated as InnoDB internally.
 	{Name: "ENGINE=InnoDB", Category: "Storage Engine", Status: Supported, Description: "Default and only storage engine"},
-	{Name: "ENGINE=MyISAM", Category: "Storage Engine", Status: Unsupported, Description: "Accepted in CREATE TABLE (treated as InnoDB); ALTER TABLE to MyISAM returns Error 50001"},
-	{Name: "ENGINE=MEMORY / HEAP", Category: "Storage Engine", Status: Unsupported, Description: "Accepted in CREATE TABLE (treated as InnoDB); ALTER TABLE returns Error 50001"},
-	{Name: "ENGINE=MERGE / MRG_MYISAM", Category: "Storage Engine", Status: Unsupported, Description: "Accepted in CREATE TABLE (treated as InnoDB); ALTER TABLE returns Error 50001"},
-	{Name: "ENGINE=CSV", Category: "Storage Engine", Status: Unsupported, Description: "Accepted but requires all columns to be NOT NULL; ALTER TABLE returns Error 50001"},
-	{Name: "ENGINE=ARCHIVE", Category: "Storage Engine", Status: Unsupported, Description: "Accepted in CREATE TABLE (treated as InnoDB); ALTER TABLE returns Error 50001"},
-	{Name: "ENGINE=BLACKHOLE", Category: "Storage Engine", Status: Unsupported, Description: "Accepted in CREATE TABLE (treated as InnoDB); ALTER TABLE returns Error 50001"},
+	{Name: "ENGINE=MyISAM", Category: "Storage Engine", Status: Unsupported, Description: "Accepted in CREATE TABLE and ALTER TABLE (treated as InnoDB)"},
+	{Name: "ENGINE=MEMORY / HEAP", Category: "Storage Engine", Status: Unsupported, Description: "Accepted in CREATE TABLE and ALTER TABLE (treated as InnoDB)"},
+	{Name: "ENGINE=MERGE / MRG_MYISAM", Category: "Storage Engine", Status: Unsupported, Description: "Accepted in CREATE TABLE and ALTER TABLE (treated as InnoDB)"},
+	{Name: "ENGINE=CSV", Category: "Storage Engine", Status: Unsupported, Description: "Accepted but requires all columns to be NOT NULL"},
+	{Name: "ENGINE=ARCHIVE", Category: "Storage Engine", Status: Unsupported, Description: "Accepted in CREATE TABLE and ALTER TABLE (treated as InnoDB)"},
+	{Name: "ENGINE=BLACKHOLE", Category: "Storage Engine", Status: Unsupported, Description: "Accepted in CREATE TABLE and ALTER TABLE (treated as InnoDB)"},
 	{Name: "ENGINE=FEDERATED", Category: "Storage Engine", Status: Unsupported, Description: "Returns ER_UNKNOWN_STORAGE_ENGINE (1286)"},
 	{Name: "ENGINE=NDB / NDBCLUSTER", Category: "Storage Engine", Status: Unsupported, Description: "Accepted in ALTER TABLE but ignored (substituted with InnoDB)"},
 
