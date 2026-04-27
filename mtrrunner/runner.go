@@ -4318,6 +4318,14 @@ func (ctx *execContext) sourceFile(filename string) error {
 	if baseName == "running_event_scheduler.inc" {
 		return nil
 	}
+	// wait_for_pfs_thread_count.inc waits for "count(*) = 2 from information_schema.processlist"
+	// (one test session plus one daemon) which never holds in our single-node runner that has
+	// no background daemon entry.  The include also waits for performance_schema.threads
+	// FOREGROUND count which is always small at test start.  Since each test starts with a
+	// clean executor state there are no stray threads to wait for, so treat it as a no-op.
+	if baseName == "wait_for_pfs_thread_count.inc" {
+		return nil
+	}
 
 	// Normalize common MySQL test suite paths
 	// suite/engines/funcs/t/foo.inc -> just the basename (search in include paths)

@@ -374,9 +374,15 @@ func (s *Server) handleConnection(conn net.Conn) {
 	connID := connExec.GetConnectionID()
 
 	// Register connection in the process list, including the net.Conn so KILL can close it.
+	// Normalize localhost addresses (127.0.0.1 / ::1) to "localhost" for MySQL compatibility.
 	pl := connExec.GetProcessList()
 	if pl != nil {
-		pl.RegisterWithConn(connID, "root", conn.RemoteAddr().String(), connExec.CurrentDB, conn)
+		remoteAddr := conn.RemoteAddr().String()
+		host, _, err := net.SplitHostPort(remoteAddr)
+		if err == nil && (host == "127.0.0.1" || host == "::1") {
+			remoteAddr = "localhost"
+		}
+		pl.RegisterWithConn(connID, "root", remoteAddr, connExec.CurrentDB, conn)
 	}
 
 	defer func() {
