@@ -856,6 +856,19 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		return e.showRoutineStatus("PROCEDURE", query[len("SHOW PROCEDURE STATUS"):])
 	}
 
+	// SHOW TRIGGERS [FROM/IN <db>] [LIKE 'pattern' | WHERE expr]
+	if strings.HasPrefix(upper, "SHOW TRIGGERS") {
+		return e.showTriggers(query)
+	}
+
+	// SHOW CREATE TRIGGER <name>
+	if strings.HasPrefix(upper, "SHOW CREATE TRIGGER") {
+		rest := strings.TrimSpace(query[len("SHOW CREATE TRIGGER"):])
+		rest = strings.TrimRight(rest, ";")
+		rest = strings.Trim(rest, "`")
+		return e.showCreateTrigger(rest)
+	}
+
 	// SHOW INDEX/INDEXES/KEYS FROM <table>
 	if strings.HasPrefix(upper, "SHOW INDEX ") || strings.HasPrefix(upper, "SHOW INDEXES ") || strings.HasPrefix(upper, "SHOW KEYS ") {
 		showDB, showTable, ok := parseShowIndexTarget(query, e.CurrentDB)
@@ -2960,6 +2973,136 @@ func (e *Executor) execShowGrants(query string) (*Result, error) {
 	return &Result{
 		Columns:     []string{fmt.Sprintf("Grants for %s@%s", grantUser, grantHost)},
 		Rows:        grantRows,
+		IsResultSet: true,
+	}, nil
+}
+
+// showTriggers handles SHOW TRIGGERS [FROM/IN <db>] [LIKE 'pattern' | WHERE expr].
+// Returns columns: Trigger, Event, Table, Statement, Timing, Created, sql_mode,
+// Definer, character_set_client, collation_connection, Database Collation.
+func (e *Executor) showTriggers(query string) (*Result, error) {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+
+	// Determine target database
+	targetDB := e.CurrentDB
+	rest := strings.TrimSpace(query[len("SHOW TRIGGERS"):])
+	restU := strings.ToUpper(rest)
+
+	if strings.HasPrefix(restU, "FROM ") || strings.HasPrefix(restU, "IN ") {
+		skip := 5
+		if strings.HasPrefix(restU, "IN ") {
+			skip = 3
+		}
+		parts := strings.Fields(rest[skip:])
+		if len(parts) > 0 {
+			targetDB = strings.Trim(parts[0], "`;")
+		}
+		rest = strings.TrimSpace(rest[skip+len(strings.Fields(rest[skip:])[0]):])
+		restU = strings.ToUpper(rest)
+	}
+
+	// Parse optional LIKE or WHERE clause
+	likePattern := ""
+	if strings.HasPrefix(restU, "LIKE ") {
+		likePattern = strings.Trim(strings.TrimRight(strings.TrimSpace(rest[5:]), ";"), "'\"")
+	}
+	_ = upper
+
+	db, err := e.Catalog.GetDatabase(targetDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", targetDB))
+	}
+
+	cols := []string{
+		"Trigger", "Event", "Table", "Statement", "Timing",
+		"Created", "sql_mode", "Definer",
+		"character_set_client", "collation_connection", "Database Collation",
+	}
+
+	trigNames := make([]string, 0, len(db.Triggers))
+	for n := range db.Triggers {
+		trigNames = append(trigNames, n)
+	}
+	sort.Strings(trigNames)
+
+	sqlMode := "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+	dbColl := db.CollationName
+	if dbColl == "" {
+		dbColl = "utf8mb4_0900_ai_ci"
+	}
+
+	var rows [][]interface{}
+	for _, trigName := range trigNames {
+		if likePattern != "" && !matchLike(trigName, likePattern) {
+			continue
+		}
+		tr := db.Triggers[trigName]
+		stmt := strings.Join(tr.Body, ";\n")
+		rows = append(rows, []interface{}{
+			tr.Name,
+			tr.Event,
+			tr.Table,
+			stmt,
+			tr.Timing,
+			nil, // Created
+			sqlMode,
+			"root@localhost",
+			"utf8mb4",
+			"utf8mb4_0900_ai_ci",
+			dbColl,
+		})
+	}
+
+	return &Result{
+		Columns:     cols,
+		Rows:        rows,
+		IsResultSet: true,
+	}, nil
+}
+
+// showCreateTrigger handles SHOW CREATE TRIGGER <name>.
+// Returns columns: Trigger, sql_mode, SQL Original Statement,
+// character_set_client, collation_connection, Database Collation, Created.
+func (e *Executor) showCreateTrigger(triggerName string) (*Result, error) {
+	db, err := e.Catalog.GetDatabase(e.CurrentDB)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
+	}
+
+	tr, ok := db.Triggers[triggerName]
+	if !ok {
+		// Try case-insensitive lookup
+		for n, trig := range db.Triggers {
+			if strings.EqualFold(n, triggerName) {
+				tr = trig
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok {
+		return nil, mysqlError(1360, "HY000", fmt.Sprintf("Trigger '%s' does not exist", triggerName))
+	}
+
+	body := strings.Join(tr.Body, ";\n")
+	var createSQL string
+	if len(tr.Body) == 1 {
+		createSQL = fmt.Sprintf("CREATE DEFINER=`root`@`localhost` TRIGGER `%s` %s %s ON `%s` FOR EACH ROW %s",
+			tr.Name, tr.Timing, tr.Event, tr.Table, body)
+	} else {
+		createSQL = fmt.Sprintf("CREATE DEFINER=`root`@`localhost` TRIGGER `%s` %s %s ON `%s` FOR EACH ROW BEGIN\n%s\nEND",
+			tr.Name, tr.Timing, tr.Event, tr.Table, body)
+	}
+
+	sqlMode := "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+	dbColl := db.CollationName
+	if dbColl == "" {
+		dbColl = "utf8mb4_0900_ai_ci"
+	}
+
+	return &Result{
+		Columns:     []string{"Trigger", "sql_mode", "SQL Original Statement", "character_set_client", "collation_connection", "Database Collation", "Created"},
+		Rows:        [][]interface{}{{tr.Name, sqlMode, createSQL, "utf8mb4", "utf8mb4_0900_ai_ci", dbColl, nil}},
 		IsResultSet: true,
 	}, nil
 }
