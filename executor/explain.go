@@ -5672,6 +5672,10 @@ func (e *Executor) explainJSONTableBlock(row []interface{}, query string) []orde
 				kvs = append(kvs, orderedKV{"index_condition", cond})
 			}
 		}
+		// using_join_buffer: appears after filtered (before cost_info) when a join buffer is used.
+		if strings.Contains(extraStr, "Block Nested Loop") {
+			kvs = append(kvs, orderedKV{"using_join_buffer", "Block Nested Loop"})
+		}
 	}
 
 	// cost_info - MySQL's cost model:
@@ -5912,13 +5916,24 @@ func (e *Executor) explainJSONUsedColumns(tableName string, query string) []stri
 		return cols
 	}
 
-	// Collect all column names referenced in the query
+	// Collect all column names referenced in the query, respecting table qualifiers.
+	// A column like t1.a should only be counted for table "t1", not for other tables like "t2".
 	referencedCols := map[string]bool{}
 	hasStar := false
+	tableNameLower := strings.ToLower(tableName)
 	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
 		switch n := node.(type) {
 		case *sqlparser.ColName:
-			referencedCols[strings.ToLower(n.Name.String())] = true
+			colName := strings.ToLower(n.Name.String())
+			qualifier := strings.ToLower(n.Qualifier.Name.String())
+			if qualifier == "" {
+				// Unqualified column: could belong to any table, include it
+				referencedCols[colName] = true
+			} else if qualifier == tableNameLower {
+				// Qualified with this table's name
+				referencedCols[colName] = true
+			}
+			// If qualified with a DIFFERENT table name, skip it for this table
 		case *sqlparser.StarExpr:
 			hasStar = true
 		}
@@ -5956,14 +5971,8 @@ func (e *Executor) explainJSONUsedColumns(tableName string, query string) []stri
 			result = append(result, c.Name)
 		}
 	}
-	if len(result) == 0 {
-		// Fallback if no columns matched (shouldn't happen normally)
-		cols := make([]string, len(td.Columns))
-		for i, c := range td.Columns {
-			cols[i] = c.Name
-		}
-		return cols
-	}
+	// If no columns matched, return nil (no used_columns for this table).
+	// This is correct for joined tables with no column references (e.g., t2 in a cross join).
 	return result
 }
 
@@ -6645,6 +6654,149 @@ func (e *Executor) explainJSONWindowFuncNamesForWindow(query string, winName str
 	return funcNames
 }
 
+// explainJSONExtractDerivedAlias extracts the alias of a derived table from the query's FROM clause.
+// It returns the alias for the Nth derived table (1-indexed by select_id).
+// For example, SELECT 1 FROM (SELECT ...) AS s1 → returns "s1" for id=2.
+func (e *Executor) explainJSONExtractDerivedAlias(query string, derivedID int64) string {
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		return ""
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return ""
+	}
+	// Count derived tables in FROM to match by order (first derived = id 2, second = id 3, etc.)
+	counter := int64(1)
+	for _, te := range sel.From {
+		alias := e.findDerivedAliasInExpr(te, derivedID, &counter)
+		if alias != "" {
+			return alias
+		}
+	}
+	return ""
+}
+
+// findDerivedAliasInExpr recursively searches for a derived table alias by its sequential order.
+// counter starts at 1 and is incremented for each derived table found; when counter matches derivedID-1,
+// the next derived table's alias is returned.
+func (e *Executor) findDerivedAliasInExpr(te sqlparser.TableExpr, derivedID int64, counter *int64) string {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if _, ok := t.Expr.(*sqlparser.DerivedTable); ok {
+			*counter++
+			if *counter == derivedID {
+				if !t.As.IsEmpty() {
+					return t.As.String()
+				}
+			}
+		}
+	case *sqlparser.JoinTableExpr:
+		if alias := e.findDerivedAliasInExpr(t.LeftExpr, derivedID, counter); alias != "" {
+			return alias
+		}
+		return e.findDerivedAliasInExpr(t.RightExpr, derivedID, counter)
+	case *sqlparser.ParenTableExpr:
+		for _, expr := range t.Exprs {
+			if alias := e.findDerivedAliasInExpr(expr, derivedID, counter); alias != "" {
+				return alias
+			}
+		}
+	}
+	return ""
+}
+
+// explainJSONExtractDerivedColumns extracts the column expression strings from the
+// Nth derived table's SELECT list (1-indexed by select_id, so id=2 → 1st derived table).
+// Returns a slice of column name strings (e.g. ["COUNT(DISTINCT t1.a)"]) for use in
+// the outer table's used_columns field in EXPLAIN FORMAT=JSON.
+func (e *Executor) explainJSONExtractDerivedColumns(query string, derivedID int64) []string {
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		return nil
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return nil
+	}
+	counter := int64(1)
+	for _, te := range sel.From {
+		if cols := e.findDerivedColumnsInExpr(te, derivedID, &counter); cols != nil {
+			return cols
+		}
+	}
+	return nil
+}
+
+// findDerivedColumnsInExpr recursively finds the SELECT expressions of a derived table
+// with the given select_id, returning them as formatted strings.
+func (e *Executor) findDerivedColumnsInExpr(te sqlparser.TableExpr, derivedID int64, counter *int64) []string {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if dt, ok := t.Expr.(*sqlparser.DerivedTable); ok {
+			*counter++
+			if *counter == derivedID {
+				if inner, ok := dt.Select.(*sqlparser.Select); ok {
+					return explainJSONSelectExprNames(inner.SelectExprs)
+				}
+			}
+		}
+	case *sqlparser.JoinTableExpr:
+		if cols := e.findDerivedColumnsInExpr(t.LeftExpr, derivedID, counter); cols != nil {
+			return cols
+		}
+		return e.findDerivedColumnsInExpr(t.RightExpr, derivedID, counter)
+	case *sqlparser.ParenTableExpr:
+		for _, expr := range t.Exprs {
+			if cols := e.findDerivedColumnsInExpr(expr, derivedID, counter); cols != nil {
+				return cols
+			}
+		}
+	}
+	return nil
+}
+
+// explainJSONSelectExprNames returns the display names for a set of SELECT expressions.
+// For aliased expressions, returns the alias. For unaliased expressions, returns the
+// canonical uppercase-formatted expression string (e.g., "COUNT(DISTINCT t1.a)").
+func explainJSONSelectExprNames(exprs *sqlparser.SelectExprs) []string {
+	if exprs == nil {
+		return nil
+	}
+	var result []string
+	for _, expr := range exprs.Exprs {
+		switch ae := expr.(type) {
+		case *sqlparser.AliasedExpr:
+			if !ae.As.IsEmpty() {
+				result = append(result, ae.As.String())
+			} else {
+				// Use the formatted expression string with SQL keywords uppercased
+				s := sqlparser.String(ae.Expr)
+				s = explainJSONUppercaseSQLKeywords(s)
+				result = append(result, s)
+			}
+		case *sqlparser.StarExpr:
+			result = append(result, "*")
+		}
+	}
+	return result
+}
+
+// explainJSONUppercaseSQLKeywords uppercases SQL function names and keywords in an
+// expression string produced by sqlparser.String(), which lowercases them.
+// This is used to produce MySQL-compatible column names in EXPLAIN FORMAT=JSON used_columns.
+func explainJSONUppercaseSQLKeywords(s string) string {
+	// Uppercase aggregate function names
+	for _, fn := range []string{"count", "sum", "avg", "min", "max", "group_concat"} {
+		if strings.Contains(s, fn+"(") {
+			s = strings.ReplaceAll(s, fn+"(", strings.ToUpper(fn)+"(")
+		}
+	}
+	// Uppercase DISTINCT keyword inside function calls
+	s = strings.ReplaceAll(s, "(distinct ", "(DISTINCT ")
+	return s
+}
+
 // explainJSONRowCount extracts the row count from an EXPLAIN row.
 func explainJSONRowCount(row []interface{}) int64 {
 	if row[9] != nil {
@@ -6770,10 +6922,22 @@ func (e *Executor) explainJSONDocument(query string) string {
 
 	// Detect filesort and GROUP BY
 	sortCost := 0.0
-	hasGroupBy := strings.Contains(upper, "GROUP BY")
+	// hasGroupBy should only be true if the OUTER (top-level) SELECT has GROUP BY,
+	// not if GROUP BY appears only inside a subquery or derived table.
+	hasGroupBy := false
 	hasSQLBufferResult := strings.Contains(upper, "SQL_BUFFER_RESULT")
+	if stmt, err := e.parser().Parse(query); err == nil {
+		if sel, ok := stmt.(*sqlparser.Select); ok {
+			hasGroupBy = sel.GroupBy != nil && len(sel.GroupBy.Exprs) > 0
+		}
+	}
+	// hasFilesort should only be true for PRIMARY/SIMPLE rows (not DERIVED rows),
+	// because DERIVED row filesort is inside the subquery, not the outer query.
 	hasFilesort := false
 	for _, p := range parsed {
+		if p.selectType != "SIMPLE" && p.selectType != "PRIMARY" {
+			continue
+		}
 		if p.row[11] != nil {
 			extraStr := fmt.Sprintf("%v", p.row[11])
 			if strings.Contains(extraStr, "Using filesort") {
@@ -7447,19 +7611,142 @@ func (e *Executor) explainJSONDocument(query string) string {
 				// Check if the primary table references a derived table
 				tableName := fmt.Sprintf("%v", p.row[2])
 				if strings.HasPrefix(tableName, "<derived") {
-					// Find the corresponding DERIVED row
+					// Extract the derived table ID (e.g., 2 from "<derived2>")
+					var derivedID int64
+					fmt.Sscanf(tableName, "<derived%d>", &derivedID)
+
+					// Collect all DERIVED rows with matching select_id
+					var matchedDerived []parsedRow
 					for _, d := range derivedRows {
-						if d.row[2] != nil {
-							innerQB := e.explainJSONQueryBlockForRow(d.row, query)
-							derivedBlock := []orderedKV{
-								{"using_temporary_table", true},
-								{"query_block", innerQB},
+						if d.id != nil {
+							if id, ok := d.id.(int64); ok && id == derivedID {
+								matchedDerived = append(matchedDerived, d)
 							}
-							tblBlock = append(tblBlock, orderedKV{"materialized_from_subquery", derivedBlock})
 						}
+					}
+					// Fallback: if no id match, use all derived rows
+					if len(matchedDerived) == 0 {
+						matchedDerived = derivedRows
+					}
+
+					if len(matchedDerived) > 0 {
+						// Build the inner query block for the derived table.
+						// Detect if the inner derived query has GROUP BY (Using temporary; Using filesort in Extra).
+						innerHasGroupBy := false
+						innerHasFilesort := false
+						for _, d := range matchedDerived {
+							if d.row[11] != nil {
+								extraStr := fmt.Sprintf("%v", d.row[11])
+								if strings.Contains(extraStr, "Using temporary") {
+									innerHasGroupBy = true
+								}
+								if strings.Contains(extraStr, "Using filesort") {
+									innerHasFilesort = true
+								}
+							}
+						}
+
+						// For multi-table joins with filesort, the sort operates on the JOIN result
+						// (product of all joined rows), not just the row count of the table with filesort.
+						innerSortRows := int64(1)
+						if innerHasFilesort {
+							for _, d := range matchedDerived {
+								rc := explainJSONRowCount(d.row)
+								innerSortRows *= rc
+							}
+						}
+
+						// Compute inner query cost
+						innerCost := 0.0
+						innerSortCost := 0.0
+						for _, d := range matchedDerived {
+							rc := explainJSONRowCount(d.row)
+							innerCost += float64(rc)*0.10 + 0.25
+						}
+						if innerHasFilesort {
+							innerSortCost = float64(innerSortRows) * 1.0
+							innerCost += innerSortCost
+						}
+
+						// Build inner table blocks
+						var innerQB []orderedKV
+						innerQB = append(innerQB, orderedKV{"select_id", derivedID})
+						innerQB = append(innerQB, orderedKV{"cost_info", []orderedKV{
+							{"query_cost", fmt.Sprintf("%.2f", innerCost)},
+						}})
+
+						if innerHasGroupBy {
+							// Wrap in grouping_operation
+							var groupOp []orderedKV
+							groupOp = append(groupOp, orderedKV{"using_temporary_table", true})
+							if innerHasFilesort {
+								groupOp = append(groupOp, orderedKV{"using_filesort", true})
+								groupOp = append(groupOp, orderedKV{"cost_info", []orderedKV{
+									{"sort_cost", fmt.Sprintf("%.2f", innerSortCost)},
+								}})
+							}
+							// Build nested_loop or single table inside grouping_operation
+							if len(matchedDerived) == 1 {
+								innerTblBlock := e.explainJSONTableBlock(matchedDerived[0].row, query)
+								groupOp = append(groupOp, orderedKV{"table", innerTblBlock})
+							} else {
+								var innerLoop []interface{}
+								for _, d := range matchedDerived {
+									innerTblBlock := e.explainJSONTableBlock(d.row, query)
+									innerLoop = append(innerLoop, []orderedKV{{"table", innerTblBlock}})
+								}
+								groupOp = append(groupOp, orderedKV{"nested_loop", innerLoop})
+							}
+							innerQB = append(innerQB, orderedKV{"grouping_operation", groupOp})
+						} else if len(matchedDerived) == 1 {
+							innerTblBlock := e.explainJSONTableBlock(matchedDerived[0].row, query)
+							innerQB = append(innerQB, orderedKV{"table", innerTblBlock})
+						} else {
+							var innerLoop []interface{}
+							for _, d := range matchedDerived {
+								innerTblBlock := e.explainJSONTableBlock(d.row, query)
+								innerLoop = append(innerLoop, []orderedKV{{"table", innerTblBlock}})
+							}
+							innerQB = append(innerQB, orderedKV{"nested_loop", innerLoop})
+						}
+
+						derivedBlock := []orderedKV{
+							{"using_temporary_table", true},
+							{"dependent", false},
+							{"cacheable", true},
+							{"query_block", innerQB},
+						}
+
+						// Use the alias as table_name in tblBlock instead of <derivedN>.
+						// Parse the FROM clause to find the alias.
+						alias := e.explainJSONExtractDerivedAlias(query, derivedID)
+						if alias != "" {
+							// Replace the table_name field in tblBlock with the alias.
+							for i, kv := range tblBlock {
+								if kv.Key == "table_name" {
+									tblBlock[i] = orderedKV{"table_name", alias}
+									break
+								}
+							}
+						}
+
+						// Add used_columns for the derived table: these are the SELECT expressions
+						// of the inner derived query that appear as columns in the outer context.
+						derivedCols := e.explainJSONExtractDerivedColumns(query, derivedID)
+						if len(derivedCols) > 0 {
+							arr := make([]interface{}, len(derivedCols))
+							for i, c := range derivedCols {
+								arr[i] = c
+							}
+							tblBlock = append(tblBlock, orderedKV{"used_columns", arr})
+						}
+
+						tblBlock = append(tblBlock, orderedKV{"materialized_from_subquery", derivedBlock})
 					}
 				}
 
+				// Outer query: always emit as "table" (not grouping_operation),
+				// even if the query string contains GROUP BY (which might be inside a subquery).
 				if hasGroupBy && hasFilesort {
 					groupOp := []orderedKV{
 						{"using_filesort", true},
