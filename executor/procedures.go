@@ -1222,6 +1222,11 @@ func validateRoutineBody(bodyStmts []string) error {
 			return mysqlError(1295, "0A000", "USE is not allowed in stored procedures")
 		}
 
+		// Error ER_SP_BADSTATEMENT (1295): LOAD DATA is not allowed in stored routines
+		if strings.HasPrefix(upper, "LOAD DATA ") || strings.HasPrefix(upper, "LOAD DATA\t") {
+			return mysqlError(1295, "0A000", "LOAD DATA is not allowed in stored procedures")
+		}
+
 		// Check OPEN/CLOSE/FETCH for undeclared cursor names (error 1324)
 		var opCursorName string
 		if strings.HasPrefix(upper, "OPEN ") {
