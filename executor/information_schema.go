@@ -1184,13 +1184,19 @@ applyAlias:
 	// PROCESSLIST preserves user-specified column casing, like MySQL 8.0.
 	isProcesslist := strings.ToLower(tableName) == "processlist"
 
+	// Privilege IS tables (*_PRIVILEGES) preserve user-specified column casing.
+	// MySQL preserves the user's SELECT expression casing for these tables.
+	lowerTableName := strings.ToLower(tableName)
+	isPrivilegeTable := lowerTableName == "user_privileges" || lowerTableName == "schema_privileges" ||
+		lowerTableName == "table_privileges" || lowerTableName == "column_privileges"
+
 	result := make([]storage.Row, len(rawRows))
 	for i, row := range rawRows {
 		newRow := make(storage.Row, len(row)*3+1)
 		// Mark row as INFORMATION_SCHEMA for case-insensitive WHERE comparison
 		newRow["__is_info_schema__"] = true
-		// Performance_schema, InnoDB IS tables, and PROCESSLIST preserve user-specified column casing in SELECT
-		if isPerfSchema || isInnoDBTable || isProcesslist {
+		// Performance_schema, InnoDB IS tables, PROCESSLIST, and privilege tables preserve user-specified column casing in SELECT
+		if isPerfSchema || isInnoDBTable || isProcesslist || isPrivilegeTable {
 			newRow["__ps_preserve_col_case__"] = true
 		}
 		for k, v := range row {
@@ -5112,6 +5118,43 @@ func (e *Executor) infoSchemaCollCharSetAppl() []storage.Row {
 func (e *Executor) infoSchemaUserPrivileges() []storage.Row {
 	var rows []storage.Row
 
+	// Determine current user for visibility filtering.
+	currentUser, currentHost, _ := e.getCurrentUserAndRoles()
+	isNonRoot := currentUser != ""
+
+	if isNonRoot {
+		// Non-root: show only own global privileges.
+		grantee := fmt.Sprintf("'%s'@'%s'", currentUser, currentHost)
+		if e.grantStore != nil {
+			globalGrants := e.grantStore.GetGrantsByType(currentUser, currentHost, GrantTypeGlobal)
+			if len(globalGrants) == 0 {
+				rows = append(rows, storage.Row{
+					"GRANTEE":        grantee,
+					"TABLE_CATALOG":  "def",
+					"PRIVILEGE_TYPE": "USAGE",
+					"IS_GRANTABLE":   "NO",
+				})
+			}
+			for _, entry := range globalGrants {
+				isGrantable := "NO"
+				if entry.GrantOption {
+					isGrantable = "YES"
+				}
+				for _, p := range sortPrivsByCanonicalOrder(entry.Privs) {
+					rows = append(rows, storage.Row{
+						"GRANTEE":        grantee,
+						"TABLE_CATALOG":  "def",
+						"PRIVILEGE_TYPE": p,
+						"IS_GRANTABLE":   isGrantable,
+					})
+				}
+			}
+		}
+		return rows
+	}
+
+	// Root: show all users.
+
 	// Always include root@localhost with ALL PRIVILEGES + GRANT OPTION.
 	rootPrivTypes := []string{
 		"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "RELOAD",
@@ -5156,7 +5199,7 @@ func (e *Executor) infoSchemaUserPrivileges() []storage.Row {
 			if entry.GrantOption {
 				isGrantable = "YES"
 			}
-			for _, p := range entry.Privs {
+			for _, p := range sortPrivsByCanonicalOrder(entry.Privs) {
 				rows = append(rows, storage.Row{
 					"GRANTEE":        grantee,
 					"TABLE_CATALOG":  "def",
@@ -5168,6 +5211,14 @@ func (e *Executor) infoSchemaUserPrivileges() []storage.Row {
 	}
 
 	return rows
+}
+
+// builtinSchemaGrantUsers is the ordered set of built-in MySQL system users that
+// appear first in INFORMATION_SCHEMA.SCHEMA_PRIVILEGES, in MySQL's canonical order.
+var builtinSchemaGrantUsers = []struct{ user, host string }{
+	{"mysql.sys", "localhost"},
+	{"mysql.session", "localhost"},
+	{"", "%"},
 }
 
 // dbLevelPrivileges lists the individual privileges that ALL PRIVILEGES expands to
@@ -5185,10 +5236,18 @@ func (e *Executor) infoSchemaSchemaPrivileges() []storage.Row {
 	if e.grantStore == nil {
 		return []storage.Row{}
 	}
-	var rows []storage.Row
-	for _, uh := range e.grantStore.ListAllUserHosts() {
-		grantee := fmt.Sprintf("'%s'@'%s'", uh.User, uh.Host)
-		dbGrants := e.grantStore.GetGrantsByType(uh.User, uh.Host, GrantTypeDB)
+
+	// Track which users are the built-in system users so we can emit them first
+	// in the canonical MySQL order, then append dynamically-created user grants.
+	builtinSet := make(map[string]bool)
+	for _, b := range builtinSchemaGrantUsers {
+		builtinSet[userKey(b.user, b.host)] = true
+	}
+
+	emitDBGrants := func(user, host string) []storage.Row {
+		var out []storage.Row
+		grantee := fmt.Sprintf("'%s'@'%s'", user, host)
+		dbGrants := e.grantStore.GetGrantsByType(user, host, GrantTypeDB)
 		for _, entry := range dbGrants {
 			dbName := strings.TrimSuffix(entry.Object, ".*")
 			isGrantable := "NO"
@@ -5196,42 +5255,83 @@ func (e *Executor) infoSchemaSchemaPrivileges() []storage.Row {
 				isGrantable = "YES"
 			}
 			for _, p := range entry.Privs {
-				// ALL PRIVILEGES expands to individual privileges in SCHEMA_PRIVILEGES.
-				if p == "ALL PRIVILEGES" {
-					for _, expanded := range dbLevelPrivileges {
-						rows = append(rows, storage.Row{
-							"GRANTEE":        grantee,
-							"TABLE_CATALOG":  "def",
-							"TABLE_SCHEMA":   dbName,
-							"PRIVILEGE_TYPE": expanded,
-							"IS_GRANTABLE":   isGrantable,
-						})
-					}
-					continue
+				// Expand ALL PRIVILEGES into individual schema-level privileges
+				privsToEmit := []string{p}
+				if strings.EqualFold(p, "ALL PRIVILEGES") || strings.EqualFold(p, "ALL") {
+					privsToEmit = dbLevelPrivileges
 				}
-				rows = append(rows, storage.Row{
-					"GRANTEE":        grantee,
-					"TABLE_CATALOG":  "def",
-					"TABLE_SCHEMA":   dbName,
-					"PRIVILEGE_TYPE": p,
-					"IS_GRANTABLE":   isGrantable,
-				})
+				for _, ep := range privsToEmit {
+					out = append(out, storage.Row{
+						"GRANTEE":        grantee,
+						"TABLE_CATALOG":  "def",
+						"TABLE_SCHEMA":   dbName,
+						"PRIVILEGE_TYPE": ep,
+						"IS_GRANTABLE":   isGrantable,
+					})
+				}
 			}
+		}
+		return out
+	}
+
+	// Determine current user for visibility filtering.
+	currentUser, currentHost, _ := e.getCurrentUserAndRoles()
+	isNonRoot := currentUser != ""
+
+	var rows []storage.Row
+
+	if isNonRoot {
+		// Non-root: show only grants where grantee matches the current user.
+		rows = append(rows, emitDBGrants(currentUser, currentHost)...)
+	} else {
+		// Root: emit built-in system user grants first, in canonical MySQL order.
+		for _, b := range builtinSchemaGrantUsers {
+			rows = append(rows, emitDBGrants(b.user, b.host)...)
+		}
+
+		// Emit dynamically-created user grants (skip built-in users already emitted above).
+		for _, uh := range e.grantStore.ListAllUserHosts() {
+			if builtinSet[userKey(uh.User, uh.Host)] {
+				continue
+			}
+			rows = append(rows, emitDBGrants(uh.User, uh.Host)...)
 		}
 	}
 	return rows
 }
 
+// allTablePrivileges is the ordered list of privileges that MySQL expands ALL PRIVILEGES to
+// for table-level grants in INFORMATION_SCHEMA.TABLE_PRIVILEGES.
+var allTablePrivileges = []string{
+	"ALTER", "CREATE", "CREATE VIEW", "DELETE", "DROP", "INDEX",
+	"INSERT", "REFERENCES", "SELECT", "SHOW VIEW", "TRIGGER", "UPDATE",
+}
+
+// allSchemaPrivileges is the ordered list of privileges that MySQL expands ALL PRIVILEGES to
+// for database-level grants in INFORMATION_SCHEMA.SCHEMA_PRIVILEGES.
+var allSchemaPrivileges = []string{
+	"ALTER", "CREATE", "CREATE ROUTINE", "CREATE TEMPORARY TABLES",
+	"CREATE VIEW", "DELETE", "DROP", "EVENT", "EXECUTE",
+	"INDEX", "INSERT", "LOCK TABLES", "REFERENCES", "SELECT",
+	"SHOW VIEW", "TRIGGER", "UPDATE",
+}
+
 // infoSchemaTablePrivileges returns rows for INFORMATION_SCHEMA.TABLE_PRIVILEGES.
 // Only table-level (db.table) privileges are shown.
+// Non-root users only see their own grants (MySQL visibility rule).
 func (e *Executor) infoSchemaTablePrivileges() []storage.Row {
 	if e.grantStore == nil {
 		return []storage.Row{}
 	}
-	var rows []storage.Row
-	for _, uh := range e.grantStore.ListAllUserHosts() {
-		grantee := fmt.Sprintf("'%s'@'%s'", uh.User, uh.Host)
-		tableGrants := e.grantStore.GetGrantsByType(uh.User, uh.Host, GrantTypeTable)
+
+	// Determine current user for visibility filtering.
+	currentUser, currentHost, _ := e.getCurrentUserAndRoles()
+	isNonRoot := currentUser != ""
+
+	emitTableGrants := func(user, host string) []storage.Row {
+		var out []storage.Row
+		grantee := fmt.Sprintf("'%s'@'%s'", user, host)
+		tableGrants := e.grantStore.GetGrantsByType(user, host, GrantTypeTable)
 		for _, entry := range tableGrants {
 			parts := strings.SplitN(entry.Object, ".", 2)
 			if len(parts) != 2 {
@@ -5247,15 +5347,34 @@ func (e *Executor) infoSchemaTablePrivileges() []storage.Row {
 				if strings.Contains(p, "(") {
 					continue
 				}
-				rows = append(rows, storage.Row{
-					"GRANTEE":        grantee,
-					"TABLE_CATALOG":  "def",
-					"TABLE_SCHEMA":   dbName,
-					"TABLE_NAME":     tableName,
-					"PRIVILEGE_TYPE": p,
-					"IS_GRANTABLE":   isGrantable,
-				})
+				// Expand ALL PRIVILEGES into individual table-level privileges
+				privsToEmit := []string{p}
+				if strings.EqualFold(p, "ALL PRIVILEGES") || strings.EqualFold(p, "ALL") {
+					privsToEmit = allTablePrivileges
+				}
+				for _, ep := range privsToEmit {
+					out = append(out, storage.Row{
+						"GRANTEE":        grantee,
+						"TABLE_CATALOG":  "def",
+						"TABLE_SCHEMA":   dbName,
+						"TABLE_NAME":     tableName,
+						"PRIVILEGE_TYPE": ep,
+						"IS_GRANTABLE":   isGrantable,
+					})
+				}
 			}
+		}
+		return out
+	}
+
+	var rows []storage.Row
+	if isNonRoot {
+		// Non-root: show only grants where grantee matches the current user.
+		rows = append(rows, emitTableGrants(currentUser, currentHost)...)
+	} else {
+		// Root: show all users' table grants.
+		for _, uh := range e.grantStore.ListAllUserHosts() {
+			rows = append(rows, emitTableGrants(uh.User, uh.Host)...)
 		}
 	}
 	return rows

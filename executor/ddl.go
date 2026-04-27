@@ -331,8 +331,14 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 		def, err := srcCatDB.GetTable(p.oldName)
 		if err != nil {
 			// May be a view rather than a table — try renaming it in viewStore.
-			if e.viewStore != nil && p.srcDB == p.targetDB {
-				e.viewStore.Rename(p.srcDB, p.oldName, p.newName)
+			if e.viewStore != nil {
+				if _, isView := e.viewStore.Lookup(p.srcDB, p.oldName); isView {
+					// MySQL does not allow renaming a view to a different schema.
+					if p.srcDB != p.targetDB {
+						return nil, mysqlError(1435, "HY000", fmt.Sprintf("Changing schema from '%s' to '%s' is not allowed.", p.srcDB, p.targetDB))
+					}
+					e.viewStore.Rename(p.srcDB, p.oldName, p.newName)
+				}
 			}
 			// Transfer lock regardless.
 			if e.tableLockManager != nil {

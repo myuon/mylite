@@ -80,9 +80,30 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						}
 						activeRoles := e.grantStore.GetActiveDefaultRoles(cuUser, cuHost)
 						e.userVars["__active_roles"] = activeRoles
+						// Snapshot DB/global-level privileges for the current database into the session cache.
+						// This mirrors MySQL behavior where USE <db> caches privileges at connection time.
+						// When the test runner does "connect (testuser1, ..., db_datadict)", it sends
+						// USE db_datadict first, then SET @__current_user = 'testuser1'.
+						// We capture the privilege snapshot here so that subsequent DML on db_datadict
+						// uses the cached privileges (not live grantStore) until the next USE.
+						// Only create the cache if there are DB-level or global privileges; users with
+						// only table-level grants use the live grantStore directly.
+						if e.CurrentDB != "" {
+							dbLower := strings.ToLower(e.CurrentDB)
+							if dbLower != "information_schema" && dbLower != "performance_schema" {
+								privSnapshot := e.grantStore.GetDbPrivSnapshot(cuUser, cuHost, e.CurrentDB, activeRoles)
+								if len(privSnapshot) > 0 && SnapshotHasDataPrivileges(privSnapshot) {
+									if e.sessionDbPrivCache == nil {
+										e.sessionDbPrivCache = make(map[string]map[string]bool)
+									}
+									e.sessionDbPrivCache[dbLower] = privSnapshot
+								}
+							}
+						}
 					} else {
-						// User logged out / switched to root - clear active roles
+						// User logged out / switched to root - clear active roles and session cache
 						e.userVars["__active_roles"] = []string{}
+						e.sessionDbPrivCache = nil
 					}
 				}
 			}

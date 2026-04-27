@@ -483,6 +483,10 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 			}
 			e.userVars["__active_roles"] = roles
 		}
+		// After SET ROLE, refresh the session DB privilege cache for the current database.
+		// This ensures that privileges from newly-activated roles are reflected immediately
+		// without requiring the user to re-issue USE <db>.
+		e.refreshSessionCacheForCurrentDB()
 		return "", &Result{}, nil
 	}
 
@@ -690,6 +694,9 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 				newUser, newHost := parseUserHost(newPart)
 				if oldUser != "" && newUser != "" {
 					e.grantStore.RenameUser(oldUser, oldHost, newUser, newHost)
+					// Also update the mysql.user, mysql.db, and mysql.tables_priv storage tables
+					// so that FLUSH PRIVILEGES reloads the correct (renamed) user.
+					e.renameUserInStorage(oldUser, oldHost, newUser, newHost)
 				}
 			}
 		}

@@ -430,25 +430,38 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 				r := make(storage.Row)
 				r["Host"] = host
 				r["User"] = user
-				r["Select_priv"] = "N"
-				r["Insert_priv"] = "N"
-				r["Update_priv"] = "N"
-				r["Delete_priv"] = "N"
-				r["Create_priv"] = "N"
-				r["Drop_priv"] = "N"
-				r["Grant_priv"] = "N"
-				r["Shutdown_priv"] = "N"
-				r["authentication_string"] = ""
+				// All privilege columns (ENUM('N','Y') NOT NULL DEFAULT 'N')
+				for _, col := range []string{
+					"Select_priv", "Insert_priv", "Update_priv", "Delete_priv",
+					"Create_priv", "Drop_priv", "Reload_priv", "Shutdown_priv",
+					"Process_priv", "File_priv", "Grant_priv", "References_priv",
+					"Index_priv", "Alter_priv", "Show_db_priv", "Super_priv",
+					"Create_tmp_table_priv", "Lock_tables_priv", "Execute_priv",
+					"Repl_slave_priv", "Repl_client_priv", "Create_view_priv",
+					"Show_view_priv", "Create_routine_priv", "Alter_routine_priv",
+					"Create_user_priv", "Event_priv", "Trigger_priv",
+					"Create_tablespace_priv", "Create_role_priv", "Drop_role_priv",
+					"password_expired", "account_locked",
+				} {
+					r[col] = "N"
+				}
+				// SSL/connection restriction columns (VARCHAR/BLOB NOT NULL DEFAULT '')
+				for _, col := range []string{"ssl_type", "ssl_cipher", "x509_issuer", "x509_subject"} {
+					r[col] = ""
+				}
+				// Integer resource limit columns (INT UNSIGNED NOT NULL DEFAULT 0)
+				for _, col := range []string{"max_questions", "max_updates", "max_connections", "max_user_connections"} {
+					r[col] = int64(0)
+				}
 				r["plugin"] = "caching_sha2_password"
-				r["account_locked"] = "N"
-				r["ssl_cipher"] = ""
-				r["x509_issuer"] = ""
-				r["x509_subject"] = ""
+				r["authentication_string"] = ""
+				// Nullable columns
 				r["password_last_changed"] = nil
+				r["password_lifetime"] = nil
 				r["Password_reuse_history"] = nil
 				r["Password_reuse_time"] = nil
-				r["create_role_priv"] = "N"
-				r["drop_role_priv"] = "N"
+				r["Password_require_current"] = nil
+				r["User_attributes"] = nil
 				return r
 			}
 			physicalRows := tbl.Scan()
