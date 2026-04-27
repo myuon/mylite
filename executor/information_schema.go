@@ -1009,7 +1009,7 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 	case "views":
 		rawRows = e.infoSchemaViews()
 	case "st_spatial_reference_systems":
-		rawRows = infoSchemaSpatialReferenceSystems()
+		rawRows = e.infoSchemaSpatialReferenceSystems()
 	case "st_geometry_columns":
 		rawRows = e.infoSchemaSTGeometryColumns()
 	case "st_units_of_measure":
@@ -6284,27 +6284,38 @@ func (e *Executor) perfSchemaESMHByDigest() []storage.Row {
 // wgs84Definition is the WKT definition string for WGS 84 (SRID 4326).
 const wgs84Definition = `GEOGCS["WGS 84",DATUM["World Geodetic System 1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.017453292519943278,AUTHORITY["EPSG","9122"]],AXIS["Lat",NORTH],AXIS["Lon",EAST],AUTHORITY["EPSG","4326"]]`
 
-// infoSchemaSpatialReferenceSystems returns the minimal SRS catalog rows.
+// infoSchemaSpatialReferenceSystems returns rows for INFORMATION_SCHEMA.ST_SPATIAL_REFERENCE_SYSTEMS,
+// including built-in SRIDs (0, 2000, 4326) and any user-defined SRS created via
+// CREATE SPATIAL REFERENCE SYSTEM.
 // Columns: SRS_NAME, SRS_ID, ORGANIZATION, ORGANIZATION_COORDSYS_ID, DEFINITION, DESCRIPTION
-func infoSchemaSpatialReferenceSystems() []storage.Row {
-	return []storage.Row{
-		{
-			"SRS_NAME":                 "",
-			"SRS_ID":                   uint32(0),
-			"ORGANIZATION":             nil,
-			"ORGANIZATION_COORDSYS_ID": nil,
-			"DEFINITION":               "",
-			"DESCRIPTION":              nil,
-		},
-		{
-			"SRS_NAME":                 "WGS 84",
-			"SRS_ID":                   uint32(4326),
-			"ORGANIZATION":             "EPSG",
-			"ORGANIZATION_COORDSYS_ID": uint32(4326),
-			"DEFINITION":               wgs84Definition,
-			"DESCRIPTION":              nil,
-		},
+func (e *Executor) infoSchemaSpatialReferenceSystems() []storage.Row {
+	var rows []storage.Row
+	for _, entry := range e.srsListAll() {
+		var orgVal interface{}
+		if entry.Organization != "" {
+			orgVal = entry.Organization
+		}
+		var orgIDVal interface{}
+		if entry.OrgCoordsys != nil {
+			orgIDVal = *entry.OrgCoordsys
+		} else if entry.Organization != "" {
+			// Built-in SRIDs with organization but no explicit OrgCoordsys default to SRID.
+			orgIDVal = entry.SRID
+		}
+		var descVal interface{}
+		if entry.Description != "" {
+			descVal = entry.Description
+		}
+		rows = append(rows, storage.Row{
+			"SRS_NAME":                 entry.Name,
+			"SRS_ID":                   entry.SRID,
+			"ORGANIZATION":             orgVal,
+			"ORGANIZATION_COORDSYS_ID": orgIDVal,
+			"DEFINITION":               entry.Definition,
+			"DESCRIPTION":              descVal,
+		})
 	}
+	return rows
 }
 
 // infoSchemaSTGeometryColumns returns rows for INFORMATION_SCHEMA.ST_GEOMETRY_COLUMNS.
@@ -6362,14 +6373,12 @@ func (e *Executor) infoSchemaSTGeometryColumns() []storage.Row {
 				var srsID interface{} = nil
 				if col.SRIDConstraint != nil {
 					srsID = *col.SRIDConstraint
-					// Look up SRS name from known SRS catalog
-					for _, srs := range infoSchemaSpatialReferenceSystems() {
-						if id, ok := srs["SRS_ID"].(uint32); ok && id == *col.SRIDConstraint {
-							if name, ok2 := srs["SRS_NAME"].(string); ok2 && name != "" {
-								srsName = name
-							}
-							break
-						}
+					// Look up SRS name from built-in + user-defined SRS catalog.
+					// When SRID constraint is set, SRS_NAME is always non-NULL (may be empty string).
+					if entry := e.srsGetEntry(*col.SRIDConstraint); entry != nil {
+						srsName = entry.Name // may be "" for Cartesian SRID 0
+					} else {
+						srsName = "" // unknown SRID, use empty string
 					}
 				}
 				rows = append(rows, storage.Row{

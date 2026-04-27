@@ -13,11 +13,6 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
-// isSRIDKnown returns true if the given SRID is in the known SRS catalog (0 or 4326).
-func isSRIDKnown(srid uint32) bool {
-	return srid == 0 || srid == 4326
-}
-
 // isKnownStorageEngine reports whether the given engine name (already uppercased) is
 // a storage engine recognized by MySQL.  FEDERATED is intentionally excluded because
 // it is compiled-in but disabled, and callers handle it separately.
@@ -1444,17 +1439,22 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			colDef.Comment = comment
 		}
 
-		// Extract SRID constraint for spatial columns
+		// Extract SRID constraint; validate geometry type and SRS catalog membership.
 		if col.Type.Options != nil && col.Type.Options.SRID != nil {
-			sridVal, err := strconv.ParseUint(col.Type.Options.SRID.Val, 10, 32)
-			if err == nil {
-				// Validate that the SRID exists in our SRS catalog (0 and 4326)
-				sridU32 := uint32(sridVal)
-				if !isSRIDKnown(sridU32) {
-					return nil, mysqlError(3716, "SR001", fmt.Sprintf("There's no spatial reference system with SRID %d.", sridU32))
-				}
-				colDef.SRIDConstraint = &sridU32
+			// SRID on a non-geometry column is an error.
+			if !isSpatialColumnType(strings.ToLower(col.Type.Type)) {
+				return nil, mysqlError(1235, "HY000", "Incorrect usage of SRID and non-geometry column")
 			}
+			sridStr := col.Type.Options.SRID.Val
+			sridVal, err := strconv.ParseUint(sridStr, 10, 64)
+			if err != nil || sridVal > 4294967295 {
+				return nil, mysqlError(1690, "22003", "SRID value is out of range in 'SRID'")
+			}
+			sridU32 := uint32(sridVal)
+			if !e.sridIsKnown(sridU32) {
+				return nil, mysqlError(3716, "SR001", fmt.Sprintf("There's no spatial reference system with SRID %d.", sridU32))
+			}
+			colDef.SRIDConstraint = &sridU32
 		}
 
 		columns = append(columns, colDef)
@@ -1469,6 +1469,17 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			tableRowFormat = strings.ToUpper(tableOptionString(opt))
 		} else if name == "ENGINE" {
 			tableEngine = strings.ToUpper(tableOptionString(opt))
+		}
+	}
+
+	// MyISAM does not support geographic spatial reference systems.
+	// Reject geographic SRID constraints (e.g. 4326) on MyISAM tables.
+	if tableEngine == "MYISAM" {
+		for _, col := range columns {
+			if col.SRIDConstraint != nil && e.sridIsGeographic(*col.SRIDConstraint) {
+				return nil, mysqlError(1178, "42000",
+					"The storage engine for the table doesn't support geographic spatial reference systems")
+			}
 		}
 	}
 
@@ -2931,6 +2942,93 @@ func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 	return colDef
 }
 
+// alterApplySRID extracts the SRID option from col and validates it.
+// It returns the SRID (or nil if absent), or an error.
+// If the column type is non-spatial and SRID is specified, it returns ER_WRONG_USAGE.
+// If the SRID is not in the catalog, it returns SR001.
+func (e *Executor) alterApplySRID(col *sqlparser.ColumnDefinition, colDef *catalog.ColumnDef) error {
+	if col.Type.Options == nil || col.Type.Options.SRID == nil {
+		return nil
+	}
+	// SRID on a non-geometry column is an error.
+	if !isSpatialColumnType(strings.ToLower(col.Type.Type)) {
+		return mysqlError(1235, "HY000", "Incorrect usage of SRID and non-geometry column")
+	}
+	sridStr := col.Type.Options.SRID.Val
+	sridVal, parseErr := strconv.ParseUint(sridStr, 10, 64)
+	if parseErr != nil || sridVal > 4294967295 {
+		return mysqlError(1690, "22003", "SRID value is out of range in 'SRID'")
+	}
+	sridU32 := uint32(sridVal)
+	if !e.sridIsKnown(sridU32) {
+		return mysqlError(3716, "SR001", fmt.Sprintf("There's no spatial reference system with SRID %d.", sridU32))
+	}
+	colDef.SRIDConstraint = &sridU32
+	return nil
+}
+
+// sridChangedForColumn returns true if the new SRID constraint differs from the existing one.
+func sridChangedForColumn(colName string, newSRID *uint32, tblDef *catalog.TableDef) bool {
+	if tblDef == nil {
+		return false
+	}
+	for _, col := range tblDef.Columns {
+		if strings.EqualFold(col.Name, colName) {
+			// SRID changes if old and new differ (both nil = no change, one nil = change, both non-nil but different = change)
+			if col.SRIDConstraint == nil && newSRID == nil {
+				return false
+			}
+			if col.SRIDConstraint == nil || newSRID == nil {
+				return true
+			}
+			return *col.SRIDConstraint != *newSRID
+		}
+	}
+	return false
+}
+
+// hasSpatialIndexOnColumn returns true if the table has a SPATIAL index on the given column.
+func hasSpatialIndexOnColumn(tblDef *catalog.TableDef, colName string) bool {
+	if tblDef == nil {
+		return false
+	}
+	for _, idx := range tblDef.Indexes {
+		if strings.EqualFold(idx.Type, "spatial") {
+			for _, c := range idx.Columns {
+				if strings.EqualFold(c, colName) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// validateExistingDataSRID checks that all existing rows in tbl with the given column
+// have a geometry SRID matching newSRID. Returns ER_WRONG_SRID_FOR_COLUMN on mismatch.
+func (e *Executor) validateExistingDataSRID(tbl *storage.Table, oldColName, newColName string, newSRID uint32) error {
+	tbl.Mu.RLock()
+	defer tbl.Mu.RUnlock()
+	for _, row := range tbl.Rows {
+		// Try old column name first, then new (for CHANGE COLUMN rename).
+		val := row[oldColName]
+		if val == nil {
+			val = row[newColName]
+		}
+		if val == nil {
+			continue
+		}
+		geomStr := toString(val)
+		geomSRID := geomGetSRID(geomStr)
+		if geomSRID != newSRID {
+			return mysqlError(3643, "HY000", fmt.Sprintf(
+				"The SRID of the geometry does not match the SRID of the column '%s'. The SRID of the geometry is %d, but the SRID of the column is %d. Consider changing the SRID of the geometry or the SRID property of the column.",
+				newColName, geomSRID, newSRID))
+		}
+	}
+	return nil
+}
+
 func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 	dbName := e.CurrentDB
 	if !stmt.Table.Qualifier.IsEmpty() {
@@ -3381,6 +3479,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					}
 				}
 				colDef := columnDefFromAST(col)
+				// Extract and validate SRID constraint for ADD COLUMN.
+				if sridErr := e.alterApplySRID(col, &colDef); sridErr != nil {
+					return nil, sridErr
+				}
 				// YEAR column only supports YEAR or YEAR(4).
 				if strings.EqualFold(col.Type.Type, "year") && col.Type.Length != nil {
 					yearLen := int(*col.Type.Length)
@@ -3521,6 +3623,21 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 		case *sqlparser.ModifyColumn:
 			colDef := columnDefFromAST(op.NewColDefinition)
+			// Extract and validate SRID constraint for MODIFY COLUMN.
+			if sridErr := e.alterApplySRID(op.NewColDefinition, &colDef); sridErr != nil {
+				return nil, sridErr
+			}
+			// If changing SRID on a column that has a spatial index, reject.
+			{
+				modTblDef, _ := db.GetTable(tableName)
+				if sridChangedForColumn(op.NewColDefinition.Name.String(), colDef.SRIDConstraint, modTblDef) {
+					if hasSpatialIndexOnColumn(modTblDef, op.NewColDefinition.Name.String()) {
+						return nil, mysqlError(3668, "HY000", fmt.Sprintf(
+							"The SRID specification on the column '%s' cannot be changed because there is a spatial index on the column. Please remove the spatial index before altering the SRID specification.",
+							op.NewColDefinition.Name.String()))
+					}
+				}
+			}
 			// YEAR column only supports YEAR or YEAR(4).
 			if strings.EqualFold(op.NewColDefinition.Type.Type, "year") && op.NewColDefinition.Type.Length != nil {
 				yearLen := int(*op.NewColDefinition.Type.Length)
@@ -3564,6 +3681,12 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			oldIsChar := strings.HasPrefix(strings.ToLower(strings.TrimSpace(oldColType)), "char(") || strings.EqualFold(strings.TrimSpace(oldColType), "char")
 			newIsVarchar := strings.HasPrefix(strings.ToLower(strings.TrimSpace(colDef.Type)), "varchar(")
 			charToVarchar := oldIsChar && newIsVarchar
+			// Validate existing data against new SRID constraint.
+			if colDef.SRIDConstraint != nil {
+				if sridErr := e.validateExistingDataSRID(tbl, colDef.Name, colDef.Name, *colDef.SRIDConstraint); sridErr != nil {
+					return nil, sridErr
+				}
+			}
 			if modErr := db.ModifyColumn(tableName, colDef); modErr != nil {
 				return nil, modErr
 			}
@@ -3635,6 +3758,21 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		case *sqlparser.ChangeColumn:
 			oldName := op.OldColumn.Name.String()
 			colDef := columnDefFromAST(op.NewColDefinition)
+			// Extract and validate SRID constraint for CHANGE COLUMN.
+			if sridErr := e.alterApplySRID(op.NewColDefinition, &colDef); sridErr != nil {
+				return nil, sridErr
+			}
+			// If changing SRID on a column that has a spatial index, reject.
+			{
+				chgTblDef, _ := db.GetTable(tableName)
+				if sridChangedForColumn(oldName, colDef.SRIDConstraint, chgTblDef) {
+					if hasSpatialIndexOnColumn(chgTblDef, oldName) {
+						return nil, mysqlError(3668, "HY000", fmt.Sprintf(
+							"The SRID specification on the column '%s' cannot be changed because there is a spatial index on the column. Please remove the spatial index before altering the SRID specification.",
+							oldName))
+					}
+				}
+			}
 			if mysqlCharLen(colDef.Comment) > 1024 {
 				if e.isStrictMode() {
 					return nil, mysqlError(1629, "HY000", fmt.Sprintf("Comment for field '%s' is too long (max = 1024)", colDef.Name))
@@ -3654,6 +3792,12 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			oldIsCharChg := strings.HasPrefix(strings.ToLower(strings.TrimSpace(oldColTypeChg)), "char(") || strings.EqualFold(strings.TrimSpace(oldColTypeChg), "char")
 			newIsVarcharChg := strings.HasPrefix(strings.ToLower(strings.TrimSpace(colDef.Type)), "varchar(")
 			charToVarcharChg := oldIsCharChg && newIsVarcharChg
+			// Validate existing data against new SRID constraint before applying the change.
+			if colDef.SRIDConstraint != nil {
+				if sridErr := e.validateExistingDataSRID(tbl, oldName, colDef.Name, *colDef.SRIDConstraint); sridErr != nil {
+					return nil, sridErr
+				}
+			}
 			if chgErr := db.ChangeColumn(tableName, oldName, colDef); chgErr != nil {
 				return nil, chgErr
 			}
@@ -3862,6 +4006,33 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 						}
 						if !isGeo {
 							return nil, mysqlError(1687, "42000", "A SPATIAL index may only contain a geometrical type column")
+						}
+					}
+				}
+			}
+			// Check: adding any index on a virtual generated geometry column is not allowed.
+			// MySQL returns ER_UNSUPPORTED_ACTION_ON_GENERATED_COLUMN (3106) with
+			// "'Spatial index on virtual generated column' is not supported for generated columns."
+			{
+				currentTblDef, _ := db.GetTable(tableName)
+				if currentTblDef != nil {
+					for _, ic := range idxCols {
+						icName := stripPrefixLengthFromCol(ic)
+						for _, col := range currentTblDef.Columns {
+							if strings.EqualFold(col.Name, icName) && isGeneratedColumnType(col.Type) {
+								// It's a generated column. Check if it's VIRTUAL (not STORED).
+								if !strings.Contains(strings.ToUpper(col.Type), "STORED") {
+									// Check if it's a geometry column.
+									colUpper := strings.ToUpper(baseColumnType(col.Type))
+									if strings.Contains(colUpper, "GEOMETRY") || strings.Contains(colUpper, "POINT") ||
+										strings.Contains(colUpper, "LINESTRING") || strings.Contains(colUpper, "POLYGON") ||
+										strings.Contains(colUpper, "MULTIPOINT") || strings.Contains(colUpper, "MULTILINESTRING") ||
+										strings.Contains(colUpper, "MULTIPOLYGON") || strings.Contains(colUpper, "GEOMETRYCOLLECTION") {
+										return nil, mysqlError(3106, "HY000", "'Spatial index on virtual generated column' is not supported for generated columns.")
+									}
+								}
+								break
+							}
 						}
 					}
 				}
