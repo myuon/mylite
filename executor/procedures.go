@@ -362,6 +362,23 @@ func isAlphaNum(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
 }
 
+// isIdentifierLabel returns true if s (trimmed) is a valid SQL label identifier:
+// non-empty and containing only letters, digits, and underscores (no spaces or
+// special chars). This ensures we don't mistake a multi-word expression that
+// happens to contain a colon (e.g. inside a CASE block) for a loop label.
+func isIdentifierLabel(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) == 0 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
 // isStandaloneEnd returns true if the upper-cased line represents a standalone
 // END (optionally followed by a label) but NOT "END IF", "END WHILE",
 // "END LOOP", "END CASE", or "END REPEAT".
@@ -3113,18 +3130,25 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 		}
 
 		// Handle LOOP...END LOOP (with optional label)
-		if strings.HasPrefix(stmtUpper, "LOOP") || (strings.Contains(stmtUpper, ":") && strings.Contains(stmtUpper, "LOOP")) {
-			// Check for labeled loop: label: LOOP ... END LOOP [label]
+		// Check for labeled loop: label: LOOP ... END LOOP [label]
+		// The label must be at the START of the statement (not nested inside another block).
+		isLabeledLoop := false
+		var loopLabelCandidate, loopBlockCandidate string
+		if colonIdx := strings.Index(stmtUpper, ":"); colonIdx >= 0 {
+			possibleLabel := strings.TrimSpace(stmtStr[:colonIdx])
+			afterColon := strings.TrimSpace(stmtStr[colonIdx+1:])
+			if isIdentifierLabel(possibleLabel) && strings.HasPrefix(strings.ToUpper(afterColon), "LOOP") && (len(afterColon) == 4 || !isAlphaNum(afterColon[4])) {
+				isLabeledLoop = true
+				loopLabelCandidate = possibleLabel
+				loopBlockCandidate = afterColon
+			}
+		}
+		if strings.HasPrefix(stmtUpper, "LOOP") || isLabeledLoop {
 			loopBlock := stmtStr
 			loopLabel := ""
-			startUpper := stmtUpper
-			if colonIdx := strings.Index(startUpper, ":"); colonIdx >= 0 {
-				possibleLabel := strings.TrimSpace(stmtStr[:colonIdx])
-				afterColon := strings.TrimSpace(stmtStr[colonIdx+1:])
-				if strings.HasPrefix(strings.ToUpper(afterColon), "LOOP") {
-					loopLabel = possibleLabel
-					loopBlock = afterColon
-				}
+			if isLabeledLoop {
+				loopLabel = loopLabelCandidate
+				loopBlock = loopBlockCandidate
 			}
 			// Collect the full LOOP block
 			for !strings.HasSuffix(strings.ToUpper(strings.TrimSpace(loopBlock)), "END LOOP") &&
@@ -3143,9 +3167,10 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 		}
 
 		// Handle labeled WHILE: label: WHILE ... END WHILE
+		// The label must be a pure identifier (only word chars) at the start of the statement.
 		if strings.Contains(stmtUpper, ":") && !strings.HasPrefix(stmtUpper, "WHILE ") {
 			colonIdx := strings.Index(stmtStr, ":")
-			if colonIdx >= 0 {
+			if colonIdx >= 0 && isIdentifierLabel(stmtStr[:colonIdx]) {
 				afterColon := strings.TrimSpace(stmtStr[colonIdx+1:])
 				afterColonUpper := strings.ToUpper(afterColon)
 				if strings.HasPrefix(afterColonUpper, "WHILE ") {
