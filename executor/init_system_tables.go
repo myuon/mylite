@@ -52,32 +52,38 @@ func (e *Executor) initSystemTables() {
 
 	ensure("mysql", &catalog.TableDef{
 		Name:      "innodb_table_stats",
-		Charset:   "utf8mb4",
-		Collation: "utf8mb4_bin",
-		Columns: []catalog.ColumnDef{
-			{Name: "database_name", Type: "VARCHAR(64)"},
-			{Name: "table_name", Type: "VARCHAR(199)"},
-			{Name: "last_update", Type: "TIMESTAMP"},
-			{Name: "n_rows", Type: "BIGINT"},
-			{Name: "clustered_index_size", Type: "BIGINT"},
-			{Name: "sum_of_other_index_sizes", Type: "BIGINT"},
-		},
+		Charset:   "utf8",
+		Collation: "utf8_bin",
+		Columns: func() []catalog.ColumnDef {
+			defCT := "CURRENT_TIMESTAMP"
+			return []catalog.ColumnDef{
+				{Name: "database_name", Type: "VARCHAR(64)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true},
+				{Name: "table_name", Type: "VARCHAR(199)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true},
+				{Name: "last_update", Type: "TIMESTAMP", Default: &defCT, OnUpdateCurrentTimestamp: true},
+				{Name: "n_rows", Type: "BIGINT(20) UNSIGNED"},
+				{Name: "clustered_index_size", Type: "BIGINT(20) UNSIGNED"},
+				{Name: "sum_of_other_index_sizes", Type: "BIGINT(20) UNSIGNED"},
+			}
+		}(),
 	})
 
 	ensure("mysql", &catalog.TableDef{
 		Name:      "innodb_index_stats",
-		Charset:   "utf8mb4",
-		Collation: "utf8mb4_bin",
-		Columns: []catalog.ColumnDef{
-			{Name: "database_name", Type: "VARCHAR(64)"},
-			{Name: "table_name", Type: "VARCHAR(199)"},
-			{Name: "index_name", Type: "VARCHAR(64)"},
-			{Name: "last_update", Type: "TIMESTAMP"},
-			{Name: "stat_name", Type: "VARCHAR(64)"},
-			{Name: "stat_value", Type: "BIGINT"},
-			{Name: "sample_size", Type: "BIGINT", Nullable: true},
-			{Name: "stat_description", Type: "VARCHAR(1024)"},
-		},
+		Charset:   "utf8",
+		Collation: "utf8_bin",
+		Columns: func() []catalog.ColumnDef {
+			defCT := "CURRENT_TIMESTAMP"
+			return []catalog.ColumnDef{
+				{Name: "database_name", Type: "VARCHAR(64)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true},
+				{Name: "table_name", Type: "VARCHAR(199)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true},
+				{Name: "index_name", Type: "VARCHAR(64)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true},
+				{Name: "last_update", Type: "TIMESTAMP", Default: &defCT, OnUpdateCurrentTimestamp: true},
+				{Name: "stat_name", Type: "VARCHAR(64)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true},
+				{Name: "stat_value", Type: "BIGINT(20) UNSIGNED"},
+				{Name: "sample_size", Type: "BIGINT(20) UNSIGNED", Nullable: true},
+				{Name: "stat_description", Type: "VARCHAR(1024)", Charset: "utf8", Collation: "utf8_bin"},
+			}
+		}(),
 	})
 
 	ensure("performance_schema", &catalog.TableDef{
@@ -460,56 +466,56 @@ func (e *Executor) initSystemTables() {
 			def0 := "0"
 			defPlugin := "caching_sha2_password"
 			return []catalog.ColumnDef{
-				{Name: "Host", Type: "VARCHAR(255)", Default: &defEmpty},
-				{Name: "User", Type: "VARCHAR(32)", Default: &defEmpty},
-				{Name: "Select_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Insert_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Update_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Delete_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Create_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Drop_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Reload_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Shutdown_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Process_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "File_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Grant_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "References_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Index_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Alter_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Show_db_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Super_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Create_tmp_table_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Lock_tables_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Execute_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Repl_slave_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Repl_client_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Create_view_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Show_view_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Create_routine_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Alter_routine_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Create_user_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Event_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Trigger_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Create_tablespace_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "ssl_type", Type: "ENUM('','ANY','X509','SPECIFIED')", Default: &defEmpty},
-				{Name: "ssl_cipher", Type: "BLOB", Default: &defEmpty},
-				{Name: "x509_issuer", Type: "BLOB", Default: &defEmpty},
-				{Name: "x509_subject", Type: "BLOB", Default: &defEmpty},
+				{Name: "Host", Type: "CHAR(255)", Charset: "ascii", Collation: "ascii_general_ci", PrimaryKey: true, Default: &defEmpty},
+				{Name: "User", Type: "CHAR(32)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "Select_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Insert_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Update_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Delete_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Create_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Drop_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Reload_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Shutdown_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Process_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "File_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Grant_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "References_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Index_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Alter_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Show_db_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Super_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Create_tmp_table_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Lock_tables_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Execute_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Repl_slave_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Repl_client_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Create_view_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Show_view_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Create_routine_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Alter_routine_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Create_user_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Event_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Trigger_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Create_tablespace_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "ssl_type", Type: "ENUM('','ANY','X509','SPECIFIED')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defEmpty},
+				{Name: "ssl_cipher", Type: "BLOB"},
+				{Name: "x509_issuer", Type: "BLOB"},
+				{Name: "x509_subject", Type: "BLOB"},
 				{Name: "max_questions", Type: "INT(11) UNSIGNED", Default: &def0},
 				{Name: "max_updates", Type: "INT(11) UNSIGNED", Default: &def0},
 				{Name: "max_connections", Type: "INT(11) UNSIGNED", Default: &def0},
 				{Name: "max_user_connections", Type: "INT(11) UNSIGNED", Default: &def0},
-				{Name: "plugin", Type: "VARCHAR(64)", Default: &defPlugin},
-				{Name: "authentication_string", Type: "TEXT", Default: &defEmpty},
-				{Name: "password_expired", Type: "ENUM('N','Y')", Default: &defN},
+				{Name: "plugin", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_bin", Default: &defPlugin},
+				{Name: "authentication_string", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Nullable: true},
+				{Name: "password_expired", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
 				{Name: "password_last_changed", Type: "TIMESTAMP", Nullable: true},
 				{Name: "password_lifetime", Type: "SMALLINT UNSIGNED", Nullable: true},
-				{Name: "account_locked", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Create_role_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Drop_role_priv", Type: "ENUM('N','Y')", Default: &defN},
+				{Name: "account_locked", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Create_role_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Drop_role_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
 				{Name: "Password_reuse_history", Type: "SMALLINT UNSIGNED", Nullable: true},
 				{Name: "Password_reuse_time", Type: "SMALLINT UNSIGNED", Nullable: true},
-				{Name: "Password_require_current", Type: "ENUM('N','Y')", Nullable: true},
+				{Name: "Password_require_current", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Nullable: true},
 				{Name: "User_attributes", Type: "JSON", Nullable: true},
 			}
 		}(),
@@ -520,28 +526,28 @@ func (e *Executor) initSystemTables() {
 			defEmpty := ""
 			defN := "N"
 			return []catalog.ColumnDef{
-				{Name: "Host", Type: "VARCHAR(255)", Default: &defEmpty},
-				{Name: "Db", Type: "VARCHAR(64)", Default: &defEmpty},
-				{Name: "User", Type: "VARCHAR(32)", Default: &defEmpty},
-				{Name: "Select_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Insert_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Update_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Delete_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Create_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Drop_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Grant_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "References_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Index_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Alter_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Create_tmp_table_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Lock_tables_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Create_view_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Show_view_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Create_routine_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Alter_routine_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Execute_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Event_priv", Type: "ENUM('N','Y')", Default: &defN},
-				{Name: "Trigger_priv", Type: "ENUM('N','Y')", Default: &defN},
+				{Name: "Host", Type: "CHAR(255)", Charset: "ascii", Collation: "ascii_general_ci", PrimaryKey: true, Default: &defEmpty},
+				{Name: "Db", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "User", Type: "CHAR(32)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "Select_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Insert_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Update_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Delete_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Create_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Drop_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Grant_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "References_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Index_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Alter_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Create_tmp_table_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Lock_tables_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Create_view_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Show_view_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Create_routine_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Alter_routine_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Execute_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Event_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+				{Name: "Trigger_priv", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
 			}
 		}(),
 	})
@@ -550,13 +556,14 @@ func (e *Executor) initSystemTables() {
 		Name:    "general_log",
 		Engine:  "CSV",
 		Charset: "utf8",
+		Collation: "utf8_general_ci",
 		Comment: "General log",
 		Columns: []catalog.ColumnDef{
 			{Name: "event_time", Type: "TIMESTAMP(6)", Default: &logDefaultTS, OnUpdateCurrentTimestamp: true},
-			{Name: "user_host", Type: "MEDIUMTEXT"},
+			{Name: "user_host", Type: "MEDIUMTEXT", Charset: "utf8", Collation: "utf8_general_ci"},
 			{Name: "thread_id", Type: "BIGINT(21) UNSIGNED"},
 			{Name: "server_id", Type: "INT(10) UNSIGNED"},
-			{Name: "command_type", Type: "VARCHAR(64)"},
+			{Name: "command_type", Type: "VARCHAR(64)", Charset: "utf8", Collation: "utf8_general_ci"},
 			{Name: "argument", Type: "MEDIUMBLOB"},
 		},
 	})
@@ -564,15 +571,16 @@ func (e *Executor) initSystemTables() {
 		Name:    "slow_log",
 		Engine:  "CSV",
 		Charset: "utf8",
+		Collation: "utf8_general_ci",
 		Comment: "Slow log",
 		Columns: []catalog.ColumnDef{
 			{Name: "start_time", Type: "TIMESTAMP(6)", Default: &logDefaultTS, OnUpdateCurrentTimestamp: true},
-			{Name: "user_host", Type: "MEDIUMTEXT"},
+			{Name: "user_host", Type: "MEDIUMTEXT", Charset: "utf8", Collation: "utf8_general_ci"},
 			{Name: "query_time", Type: "TIME(6)"},
 			{Name: "lock_time", Type: "TIME(6)"},
 			{Name: "rows_sent", Type: "INT(11)"},
 			{Name: "rows_examined", Type: "INT(11)"},
-			{Name: "db", Type: "VARCHAR(512)"},
+			{Name: "db", Type: "VARCHAR(512)", Charset: "utf8", Collation: "utf8_general_ci"},
 			{Name: "last_insert_id", Type: "INT(11)"},
 			{Name: "insert_id", Type: "INT(11)"},
 			{Name: "server_id", Type: "INT(10) UNSIGNED"},
@@ -582,320 +590,375 @@ func (e *Executor) initSystemTables() {
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "server_cost",
-		Columns: []catalog.ColumnDef{
-			{Name: "cost_name", Type: "VARCHAR(64)"},
-			{Name: "cost_value", Type: "FLOAT", Nullable: true},
-			{Name: "last_update", Type: "TIMESTAMP"},
-			{Name: "comment", Type: "VARCHAR(1024)", Nullable: true},
-			{Name: "default_value", Type: "FLOAT", Nullable: true},
-		},
+		Columns: func() []catalog.ColumnDef {
+			defCT := "CURRENT_TIMESTAMP"
+			return []catalog.ColumnDef{
+				{Name: "cost_name", Type: "VARCHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", PrimaryKey: true},
+				{Name: "cost_value", Type: "FLOAT", Nullable: true},
+				{Name: "last_update", Type: "TIMESTAMP", Default: &defCT, OnUpdateCurrentTimestamp: true},
+				{Name: "comment", Type: "VARCHAR(1024)", Charset: "utf8", Collation: "utf8_general_ci", Nullable: true},
+				{Name: "default_value", Type: "FLOAT GENERATED ALWAYS AS (case cost_name when 'disk_temptable_create_cost' then 20.0 when 'disk_temptable_row_cost' then 0.5 when 'key_compare_cost' then 0.05 when 'memory_temptable_create_cost' then 1.0 when 'memory_temptable_row_cost' then 0.1 when 'row_evaluate_cost' then 0.1 else NULL end) VIRTUAL", Nullable: true},
+			}
+		}(),
 	})
 	if e.tableRowCount("mysql", "server_cost") == 0 {
-		_, _ = e.Execute(`INSERT INTO mysql.server_cost (cost_name, cost_value, last_update, comment, default_value) VALUES` +
-			` ('disk_temptable_create_cost', NULL, CURRENT_TIMESTAMP, NULL, 20.0),` +
-			` ('disk_temptable_row_cost', NULL, CURRENT_TIMESTAMP, NULL, 0.5),` +
-			` ('key_compare_cost', NULL, CURRENT_TIMESTAMP, NULL, 0.05),` +
-			` ('memory_temptable_create_cost', NULL, CURRENT_TIMESTAMP, NULL, 1.0),` +
-			` ('memory_temptable_row_cost', NULL, CURRENT_TIMESTAMP, NULL, 0.1),` +
-			` ('row_evaluate_cost', NULL, CURRENT_TIMESTAMP, NULL, 0.1)`)
+		_, _ = e.Execute(`INSERT INTO mysql.server_cost (cost_name, cost_value, last_update, comment) VALUES` +
+			` ('disk_temptable_create_cost', NULL, CURRENT_TIMESTAMP, NULL),` +
+			` ('disk_temptable_row_cost', NULL, CURRENT_TIMESTAMP, NULL),` +
+			` ('key_compare_cost', NULL, CURRENT_TIMESTAMP, NULL),` +
+			` ('memory_temptable_create_cost', NULL, CURRENT_TIMESTAMP, NULL),` +
+			` ('memory_temptable_row_cost', NULL, CURRENT_TIMESTAMP, NULL),` +
+			` ('row_evaluate_cost', NULL, CURRENT_TIMESTAMP, NULL)`)
 	}
 	ensure("mysql", &catalog.TableDef{
 		Name: "engine_cost",
-		Columns: []catalog.ColumnDef{
-			{Name: "engine_name", Type: "VARCHAR(64)"},
-			{Name: "device_type", Type: "INT"},
-			{Name: "cost_name", Type: "VARCHAR(64)"},
-			{Name: "cost_value", Type: "FLOAT", Nullable: true},
-			{Name: "last_update", Type: "TIMESTAMP"},
-			{Name: "comment", Type: "VARCHAR(1024)", Nullable: true},
-			{Name: "default_value", Type: "FLOAT", Nullable: true},
-		},
+		Columns: func() []catalog.ColumnDef {
+			defCT := "CURRENT_TIMESTAMP"
+			return []catalog.ColumnDef{
+				{Name: "engine_name", Type: "VARCHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", PrimaryKey: true},
+				{Name: "device_type", Type: "INT", PrimaryKey: true},
+				{Name: "cost_name", Type: "VARCHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", PrimaryKey: true},
+				{Name: "cost_value", Type: "FLOAT", Nullable: true},
+				{Name: "last_update", Type: "TIMESTAMP", Default: &defCT, OnUpdateCurrentTimestamp: true},
+				{Name: "comment", Type: "VARCHAR(1024)", Charset: "utf8", Collation: "utf8_general_ci", Nullable: true},
+				{Name: "default_value", Type: "FLOAT GENERATED ALWAYS AS (case cost_name when 'io_block_read_cost' then 1.0 when 'memory_block_read_cost' then 0.25 else NULL end) VIRTUAL", Nullable: true},
+			}
+		}(),
 	})
 	if e.tableRowCount("mysql", "engine_cost") == 0 {
-		_, _ = e.Execute(`INSERT INTO mysql.engine_cost (engine_name, device_type, cost_name, cost_value, last_update, comment, default_value) VALUES` +
-			` ('default', 0, 'io_block_read_cost', NULL, CURRENT_TIMESTAMP, NULL, 1.0),` +
-			` ('default', 0, 'memory_block_read_cost', NULL, CURRENT_TIMESTAMP, NULL, 0.25)`)
+		_, _ = e.Execute(`INSERT INTO mysql.engine_cost (engine_name, device_type, cost_name, cost_value, last_update, comment) VALUES` +
+			` ('default', 0, 'io_block_read_cost', NULL, CURRENT_TIMESTAMP, NULL),` +
+			` ('default', 0, 'memory_block_read_cost', NULL, CURRENT_TIMESTAMP, NULL)`)
 	}
 	ensure("mysql", &catalog.TableDef{
 		Name: "tables_priv",
-		Columns: []catalog.ColumnDef{
-			{Name: "Host", Type: "VARCHAR(255)"},
-			{Name: "Db", Type: "VARCHAR(64)"},
-			{Name: "User", Type: "VARCHAR(32)"},
-			{Name: "Table_name", Type: "VARCHAR(64)"},
-			{Name: "Grantor", Type: "VARCHAR(288)"},
-			{Name: "Timestamp", Type: "TIMESTAMP"},
-			{Name: "Table_priv", Type: "VARCHAR(200)"},
-			{Name: "Column_priv", Type: "VARCHAR(200)"},
+		Indexes: []catalog.IndexDef{
+			{Name: "Grantor", Columns: []string{"Grantor"}, Unique: false},
 		},
+		Columns: func() []catalog.ColumnDef {
+			defEmpty := ""
+			defCT := "CURRENT_TIMESTAMP"
+			return []catalog.ColumnDef{
+				{Name: "Host", Type: "CHAR(255)", Charset: "ascii", Collation: "ascii_general_ci", PrimaryKey: true, Default: &defEmpty},
+				{Name: "Db", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "User", Type: "CHAR(32)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "Table_name", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "Grantor", Type: "VARCHAR(288)", Charset: "utf8", Collation: "utf8_bin", Default: &defEmpty},
+				{Name: "Timestamp", Type: "TIMESTAMP", Default: &defCT, OnUpdateCurrentTimestamp: true},
+				{Name: "Table_priv", Type: "SET('Select','Insert','Update','Delete','Create','Drop','Grant','References','Index','Alter','Create View','Show view','Trigger')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defEmpty},
+				{Name: "Column_priv", Type: "SET('Select','Insert','Update','References')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defEmpty},
+			}
+		}(),
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "columns_priv",
-		Columns: []catalog.ColumnDef{
-			{Name: "Host", Type: "VARCHAR(255)"},
-			{Name: "Db", Type: "VARCHAR(64)"},
-			{Name: "User", Type: "VARCHAR(32)"},
-			{Name: "Table_name", Type: "VARCHAR(64)"},
-			{Name: "Column_name", Type: "VARCHAR(64)"},
-			{Name: "Timestamp", Type: "TIMESTAMP"},
-			{Name: "Column_priv", Type: "VARCHAR(200)"},
-		},
+		Columns: func() []catalog.ColumnDef {
+			defEmpty := ""
+			defCT := "CURRENT_TIMESTAMP"
+			return []catalog.ColumnDef{
+				{Name: "Host", Type: "CHAR(255)", Charset: "ascii", Collation: "ascii_general_ci", PrimaryKey: true, Default: &defEmpty},
+				{Name: "Db", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "User", Type: "CHAR(32)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "Table_name", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "Column_name", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "Timestamp", Type: "TIMESTAMP", Default: &defCT, OnUpdateCurrentTimestamp: true},
+				{Name: "Column_priv", Type: "SET('Select','Insert','Update','References')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defEmpty},
+			}
+		}(),
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "role_edges",
-		Columns: []catalog.ColumnDef{
-			{Name: "FROM_HOST", Type: "VARCHAR(255)"},
-			{Name: "FROM_USER", Type: "VARCHAR(32)"},
-			{Name: "TO_HOST", Type: "VARCHAR(255)"},
-			{Name: "TO_USER", Type: "VARCHAR(32)"},
-			{Name: "WITH_ADMIN_OPTION", Type: "VARCHAR(1)"},
-		},
+		Columns: func() []catalog.ColumnDef {
+			defEmpty := ""
+			defN := "N"
+			return []catalog.ColumnDef{
+				{Name: "FROM_HOST", Type: "CHAR(255)", Charset: "ascii", Collation: "ascii_general_ci", PrimaryKey: true, Default: &defEmpty},
+				{Name: "FROM_USER", Type: "CHAR(32)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "TO_HOST", Type: "CHAR(255)", Charset: "ascii", Collation: "ascii_general_ci", PrimaryKey: true, Default: &defEmpty},
+				{Name: "TO_USER", Type: "CHAR(32)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "WITH_ADMIN_OPTION", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+			}
+		}(),
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "default_roles",
-		Columns: []catalog.ColumnDef{
-			{Name: "HOST", Type: "VARCHAR(255)"},
-			{Name: "USER", Type: "VARCHAR(32)"},
-			{Name: "DEFAULT_ROLE_HOST", Type: "VARCHAR(255)"},
-			{Name: "DEFAULT_ROLE_USER", Type: "VARCHAR(32)"},
-		},
+		Columns: func() []catalog.ColumnDef {
+			defPercent := "%"
+			defEmpty := ""
+			return []catalog.ColumnDef{
+				{Name: "HOST", Type: "CHAR(255)", Charset: "ascii", Collation: "ascii_general_ci", PrimaryKey: true, Default: &defEmpty},
+				{Name: "USER", Type: "CHAR(32)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "DEFAULT_ROLE_HOST", Type: "CHAR(255)", Charset: "ascii", Collation: "ascii_general_ci", PrimaryKey: true, Default: &defPercent},
+				{Name: "DEFAULT_ROLE_USER", Type: "CHAR(32)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+			}
+		}(),
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "func",
-		Columns: []catalog.ColumnDef{
-			{Name: "name", Type: "VARCHAR(64)"},
-			{Name: "ret", Type: "INT"},
-			{Name: "dl", Type: "VARCHAR(128)"},
-			{Name: "type", Type: "VARCHAR(10)"},
-		},
+		Columns: func() []catalog.ColumnDef {
+			def0 := "0"
+			defEmpty := ""
+			return []catalog.ColumnDef{
+				{Name: "name", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "ret", Type: "TINYINT(1)", Default: &def0},
+				{Name: "dl", Type: "CHAR(128)", Charset: "utf8", Collation: "utf8_bin", Default: &defEmpty},
+				{Name: "type", Type: "ENUM('function','aggregate')", Charset: "utf8", Collation: "utf8_general_ci"},
+			}
+		}(),
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "procs_priv",
-		Columns: []catalog.ColumnDef{
-			{Name: "Host", Type: "VARCHAR(255)"},
-			{Name: "Db", Type: "VARCHAR(64)"},
-			{Name: "User", Type: "VARCHAR(32)"},
-			{Name: "Routine_name", Type: "VARCHAR(64)"},
-			{Name: "Routine_type", Type: "VARCHAR(20)"},
-			{Name: "Grantor", Type: "VARCHAR(288)"},
-			{Name: "Proc_priv", Type: "VARCHAR(200)"},
-			{Name: "Timestamp", Type: "TIMESTAMP"},
+		Indexes: []catalog.IndexDef{
+			{Name: "Grantor", Columns: []string{"Grantor"}, Unique: false},
 		},
+		Columns: func() []catalog.ColumnDef {
+			defEmpty := ""
+			defCT := "CURRENT_TIMESTAMP"
+			return []catalog.ColumnDef{
+				{Name: "Host", Type: "CHAR(255)", Charset: "ascii", Collation: "ascii_general_ci", PrimaryKey: true, Default: &defEmpty},
+				{Name: "Db", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "User", Type: "CHAR(32)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "Routine_name", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", PrimaryKey: true, Default: &defEmpty},
+				{Name: "Routine_type", Type: "ENUM('FUNCTION','PROCEDURE')", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true},
+				{Name: "Grantor", Type: "VARCHAR(288)", Charset: "utf8", Collation: "utf8_bin", Default: &defEmpty},
+				{Name: "Proc_priv", Type: "SET('Execute','Alter Routine','Grant')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defEmpty},
+				{Name: "Timestamp", Type: "TIMESTAMP", Default: &defCT, OnUpdateCurrentTimestamp: true},
+			}
+		}(),
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "component",
 		Columns: []catalog.ColumnDef{
-			{Name: "component_id", Type: "INT UNSIGNED"},
-			{Name: "component_group_id", Type: "INT UNSIGNED"},
-			{Name: "component_urn", Type: "TEXT"},
+			{Name: "component_id", Type: "INT(10) UNSIGNED", AutoIncrement: true, PrimaryKey: true},
+			{Name: "component_group_id", Type: "INT(10) UNSIGNED"},
+			{Name: "component_urn", Type: "TEXT", Charset: "utf8", Collation: "utf8_general_ci"},
 		},
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "global_grants",
-		Columns: []catalog.ColumnDef{
-			{Name: "USER", Type: "VARCHAR(32)"},
-			{Name: "HOST", Type: "VARCHAR(255)"},
-			{Name: "PRIV", Type: "VARCHAR(32)"},
-			{Name: "WITH_GRANT_OPTION", Type: "VARCHAR(1)"},
-		},
+		Columns: func() []catalog.ColumnDef {
+			defEmpty := ""
+			defN := "N"
+			return []catalog.ColumnDef{
+				{Name: "USER", Type: "CHAR(32)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "HOST", Type: "CHAR(255)", Charset: "ascii", Collation: "ascii_general_ci", PrimaryKey: true, Default: &defEmpty},
+				{Name: "PRIV", Type: "CHAR(32)", Charset: "utf8", Collation: "utf8_general_ci", PrimaryKey: true, Default: &defEmpty},
+				{Name: "WITH_GRANT_OPTION", Type: "ENUM('N','Y')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+			}
+		}(),
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "gtid_executed",
 		Columns: []catalog.ColumnDef{
-			{Name: "source_uuid", Type: "CHAR(36)"},
-			{Name: "interval_start", Type: "BIGINT"},
-			{Name: "interval_end", Type: "BIGINT"},
+			{Name: "source_uuid", Type: "CHAR(36)", Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci", PrimaryKey: true, Comment: "uuid of the source where the transaction was originally executed."},
+			{Name: "interval_start", Type: "BIGINT(20)", PrimaryKey: true, Comment: "First number of interval."},
+			{Name: "interval_end", Type: "BIGINT(20)", Comment: "Last number of interval."},
 		},
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "help_category",
 		Columns: []catalog.ColumnDef{
-			{Name: "help_category_id", Type: "SMALLINT UNSIGNED"},
-			{Name: "name", Type: "VARCHAR(64)"},
-			{Name: "parent_category_id", Type: "SMALLINT UNSIGNED"},
-			{Name: "url", Type: "TEXT"},
+			{Name: "help_category_id", Type: "SMALLINT(5) UNSIGNED", PrimaryKey: true},
+			{Name: "name", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", Unique: true},
+			{Name: "parent_category_id", Type: "SMALLINT(5) UNSIGNED", Nullable: true},
+			{Name: "url", Type: "TEXT", Charset: "utf8", Collation: "utf8_general_ci"},
 		},
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "help_keyword",
 		Columns: []catalog.ColumnDef{
-			{Name: "help_keyword_id", Type: "INT UNSIGNED"},
-			{Name: "name", Type: "VARCHAR(64)"},
+			{Name: "help_keyword_id", Type: "INT(10) UNSIGNED", PrimaryKey: true},
+			{Name: "name", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", Unique: true},
 		},
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "help_relation",
 		Columns: []catalog.ColumnDef{
-			{Name: "help_topic_id", Type: "INT UNSIGNED"},
-			{Name: "help_keyword_id", Type: "INT UNSIGNED"},
+			{Name: "help_topic_id", Type: "INT(10) UNSIGNED", PrimaryKey: true},
+			{Name: "help_keyword_id", Type: "INT(10) UNSIGNED", PrimaryKey: true},
 		},
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "help_topic",
 		Columns: []catalog.ColumnDef{
-			{Name: "help_topic_id", Type: "INT UNSIGNED"},
-			{Name: "name", Type: "VARCHAR(64)"},
-			{Name: "help_category_id", Type: "SMALLINT UNSIGNED"},
-			{Name: "description", Type: "TEXT"},
-			{Name: "example", Type: "TEXT"},
-			{Name: "url", Type: "TEXT"},
+			{Name: "help_topic_id", Type: "INT(10) UNSIGNED", PrimaryKey: true},
+			{Name: "name", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", Unique: true},
+			{Name: "help_category_id", Type: "SMALLINT(5) UNSIGNED"},
+			{Name: "description", Type: "TEXT", Charset: "utf8", Collation: "utf8_general_ci"},
+			{Name: "example", Type: "TEXT", Charset: "utf8", Collation: "utf8_general_ci"},
+			{Name: "url", Type: "TEXT", Charset: "utf8", Collation: "utf8_general_ci"},
 		},
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "password_history",
-		Columns: []catalog.ColumnDef{
-			{Name: "Host", Type: "VARCHAR(255)"},
-			{Name: "User", Type: "VARCHAR(32)"},
-			{Name: "Password_timestamp", Type: "TIMESTAMP(6)"},
-			{Name: "Password", Type: "TEXT"},
-		},
+		Columns: func() []catalog.ColumnDef {
+			defEmpty := ""
+			defCT6 := "CURRENT_TIMESTAMP(6)"
+			return []catalog.ColumnDef{
+				{Name: "Host", Type: "CHAR(255)", Charset: "ascii", Collation: "ascii_general_ci", PrimaryKey: true, Default: &defEmpty},
+				{Name: "User", Type: "CHAR(32)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "Password_timestamp", Type: "TIMESTAMP(6)", PrimaryKey: true, Default: &defCT6},
+				{Name: "Password", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Nullable: true},
+			}
+		}(),
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "plugin",
-		Columns: []catalog.ColumnDef{
-			{Name: "name", Type: "VARCHAR(64)"},
-			{Name: "dl", Type: "VARCHAR(128)"},
-		},
+		Columns: func() []catalog.ColumnDef {
+			defEmpty := ""
+			return []catalog.ColumnDef{
+				{Name: "name", Type: "VARCHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", PrimaryKey: true, Default: &defEmpty},
+				{Name: "dl", Type: "VARCHAR(128)", Charset: "utf8", Collation: "utf8_general_ci", Default: &defEmpty},
+			}
+		}(),
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "proxies_priv",
-		Columns: []catalog.ColumnDef{
-			{Name: "Host", Type: "VARCHAR(255)"},
-			{Name: "User", Type: "VARCHAR(32)"},
-			{Name: "Proxied_host", Type: "VARCHAR(255)"},
-			{Name: "Proxied_user", Type: "VARCHAR(32)"},
-			{Name: "With_grant", Type: "TINYINT"},
-			{Name: "Grantor", Type: "VARCHAR(288)"},
-			{Name: "Timestamp", Type: "TIMESTAMP"},
+		Indexes: []catalog.IndexDef{
+			{Name: "Grantor", Columns: []string{"Grantor"}, Unique: false},
 		},
+		Columns: func() []catalog.ColumnDef {
+			def0 := "0"
+			defEmpty := ""
+			defCT := "CURRENT_TIMESTAMP"
+			return []catalog.ColumnDef{
+				{Name: "Host", Type: "CHAR(255)", Charset: "ascii", Collation: "ascii_general_ci", PrimaryKey: true, Default: &defEmpty},
+				{Name: "User", Type: "CHAR(32)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "Proxied_host", Type: "CHAR(255)", Charset: "ascii", Collation: "ascii_general_ci", PrimaryKey: true, Default: &defEmpty},
+				{Name: "Proxied_user", Type: "CHAR(32)", Charset: "utf8", Collation: "utf8_bin", PrimaryKey: true, Default: &defEmpty},
+				{Name: "With_grant", Type: "TINYINT(1)", Default: &def0},
+				{Name: "Grantor", Type: "VARCHAR(288)", Charset: "utf8", Collation: "utf8_bin", Default: &defEmpty},
+				{Name: "Timestamp", Type: "TIMESTAMP", Default: &defCT, OnUpdateCurrentTimestamp: true},
+			}
+		}(),
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "servers",
-		Columns: []catalog.ColumnDef{
-			{Name: "Server_name", Type: "VARCHAR(64)"},
-			{Name: "Host", Type: "VARCHAR(255)"},
-			{Name: "Db", Type: "VARCHAR(64)"},
-			{Name: "Username", Type: "VARCHAR(64)"},
-			{Name: "Password", Type: "VARCHAR(64)"},
-			{Name: "Port", Type: "INT"},
-			{Name: "Socket", Type: "VARCHAR(64)"},
-			{Name: "Wrapper", Type: "VARCHAR(64)"},
-			{Name: "Owner", Type: "VARCHAR(64)"},
-		},
+		Columns: func() []catalog.ColumnDef {
+			defEmpty := ""
+			def0 := "0"
+			return []catalog.ColumnDef{
+				{Name: "Server_name", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", PrimaryKey: true, Default: &defEmpty},
+				{Name: "Host", Type: "CHAR(255)", Charset: "ascii", Collation: "ascii_general_ci", Default: &defEmpty},
+				{Name: "Db", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", Default: &defEmpty},
+				{Name: "Username", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", Default: &defEmpty},
+				{Name: "Password", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", Default: &defEmpty},
+				{Name: "Port", Type: "INT(4)", Default: &def0},
+				{Name: "Socket", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", Default: &defEmpty},
+				{Name: "Wrapper", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", Default: &defEmpty},
+				{Name: "Owner", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", Default: &defEmpty},
+			}
+		}(),
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "slave_master_info",
 		Columns: []catalog.ColumnDef{
-			{Name: "Number_of_lines", Type: "INT UNSIGNED"},
-			{Name: "Master_log_name", Type: "TEXT"},
-			{Name: "Master_log_pos", Type: "BIGINT UNSIGNED"},
-			{Name: "Host", Type: "VARCHAR(255)"},
-			{Name: "User_name", Type: "TEXT"},
-			{Name: "User_password", Type: "TEXT"},
-			{Name: "Port", Type: "INT UNSIGNED"},
-			{Name: "Connect_retry", Type: "INT UNSIGNED"},
-			{Name: "Enabled_ssl", Type: "TINYINT UNSIGNED"},
-			{Name: "Ssl_ca", Type: "TEXT"},
-			{Name: "Ssl_capath", Type: "TEXT"},
-			{Name: "Ssl_cert", Type: "TEXT"},
-			{Name: "Ssl_cipher", Type: "TEXT"},
-			{Name: "Ssl_key", Type: "TEXT"},
-			{Name: "Ssl_verify_server_cert", Type: "TINYINT UNSIGNED"},
+			{Name: "Number_of_lines", Type: "INT(10) UNSIGNED", Comment: "Number of lines in the file."},
+			{Name: "Master_log_name", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Comment: "The name of the master binary log currently being read from the master."},
+			{Name: "Master_log_pos", Type: "BIGINT(20) UNSIGNED", Comment: "The master log position of the last read event."},
+			{Name: "Host", Type: "CHAR(255)", Charset: "ascii", Collation: "ascii_general_ci", Nullable: true, Comment: "The host name of the master."},
+			{Name: "User_name", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Nullable: true, Comment: "The user name used to connect to the master."},
+			{Name: "User_password", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Nullable: true, Comment: "The password used to connect to the master."},
+			{Name: "Port", Type: "INT(10) UNSIGNED", Comment: "The network port used to connect to the master."},
+			{Name: "Connect_retry", Type: "INT(10) UNSIGNED", Comment: "The period (in seconds) that the slave will wait before trying to reconnect to the master."},
+			{Name: "Enabled_ssl", Type: "TINYINT(1)", Comment: "Indicates whether the server supports SSL connections."},
+			{Name: "Ssl_ca", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Nullable: true, Comment: "The file used for the Certificate Authority (CA) certificate."},
+			{Name: "Ssl_capath", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Nullable: true, Comment: "The path to the Certificate Authority (CA) certificates."},
+			{Name: "Ssl_cert", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Nullable: true, Comment: "The name of the SSL certificate file."},
+			{Name: "Ssl_cipher", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Nullable: true, Comment: "The name of the cipher in use for the SSL connection."},
+			{Name: "Ssl_key", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Nullable: true, Comment: "The name of the SSL key file."},
+			{Name: "Ssl_verify_server_cert", Type: "TINYINT(1)", Comment: "Whether to verify the server certificate."},
 			{Name: "Heartbeat", Type: "FLOAT"},
-			{Name: "Bind", Type: "TEXT"},
-			{Name: "Ignored_server_ids", Type: "TEXT"},
-			{Name: "Uuid", Type: "TEXT"},
-			{Name: "Retry_count", Type: "BIGINT UNSIGNED"},
-			{Name: "Ssl_crl", Type: "TEXT"},
-			{Name: "Ssl_crlpath", Type: "TEXT"},
-			{Name: "Enabled_auto_position", Type: "TINYINT UNSIGNED"},
-			{Name: "Channel_name", Type: "VARCHAR(64)"},
-			{Name: "Tls_version", Type: "TEXT"},
-			{Name: "Public_key_path", Type: "TEXT"},
-			{Name: "Get_public_key", Type: "TINYINT UNSIGNED"},
-			{Name: "Network_namespace", Type: "TEXT"},
-			{Name: "Master_compression_algorithm", Type: "VARCHAR(64)"},
-			{Name: "Master_zstd_compression_level", Type: "INT UNSIGNED"},
-			{Name: "Tls_ciphersuites", Type: "TEXT"},
-			{Name: "Source_connection_auto_failover", Type: "TINYINT UNSIGNED"},
-			{Name: "Gtid_only", Type: "TINYINT UNSIGNED"},
+			{Name: "Bind", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Nullable: true, Comment: "Displays which interface is employed when connecting to the MySQL server"},
+			{Name: "Ignored_server_ids", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Nullable: true, Comment: "The number of server IDs to be ignored, followed by the actual server IDs"},
+			{Name: "Uuid", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Nullable: true, Comment: "The master server uuid."},
+			{Name: "Retry_count", Type: "BIGINT(20) UNSIGNED", Comment: "Number of reconnect attempts, to the master, before giving up."},
+			{Name: "Ssl_crl", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Nullable: true, Comment: "The file used for the Certificate Revocation List (CRL)"},
+			{Name: "Ssl_crlpath", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Nullable: true, Comment: "The path used for Certificate Revocation List (CRL) files"},
+			{Name: "Enabled_auto_position", Type: "TINYINT(1)", Comment: "Indicates whether GTIDs will be used to retrieve events from the master."},
+			{Name: "Channel_name", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", PrimaryKey: true, Comment: "The channel on which the slave is connected to a source. Used in Multisource Replication"},
+			{Name: "Tls_version", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Nullable: true, Comment: "Tls version"},
+			{Name: "Public_key_path", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Nullable: true, Comment: "The file containing public key of master server."},
+			{Name: "Get_public_key", Type: "TINYINT(1)", Comment: "Preference to get public key from master."},
+			{Name: "Network_namespace", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Nullable: true, Comment: "Network namespace used for communication with the master server."},
 		},
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "slave_relay_log_info",
 		Columns: []catalog.ColumnDef{
-			{Name: "Number_of_lines", Type: "INT UNSIGNED"},
-			{Name: "Relay_log_name", Type: "TEXT"},
-			{Name: "Relay_log_pos", Type: "BIGINT UNSIGNED"},
-			{Name: "Master_log_name", Type: "TEXT"},
-			{Name: "Master_log_pos", Type: "BIGINT UNSIGNED"},
-			{Name: "Sql_delay", Type: "INT"},
-			{Name: "Number_of_workers", Type: "INT UNSIGNED"},
-			{Name: "Id", Type: "INT UNSIGNED"},
-			{Name: "Channel_name", Type: "VARCHAR(64)"},
-			{Name: "Privilege_checks_username", Type: "TEXT"},
-			{Name: "Privilege_checks_hostname", Type: "TEXT"},
-			{Name: "Require_row_format", Type: "TINYINT UNSIGNED"},
-			{Name: "Require_table_primary_key_check", Type: "ENUM('STREAM','ON','OFF','GENERATE')"},
-			{Name: "Assign_gtids_to_anonymous_transactions_type", Type: "ENUM('OFF','LOCAL','UUID')"},
-			{Name: "Assign_gtids_to_anonymous_transactions_value", Type: "TEXT"},
+			{Name: "Number_of_lines", Type: "INT(10) UNSIGNED", Comment: "Number of lines in the file or rows in the table. Used to version table definitions."},
+			{Name: "Relay_log_name", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Comment: "The name of the current relay log file."},
+			{Name: "Relay_log_pos", Type: "BIGINT(20) UNSIGNED", Comment: "The relay log position of the last executed event."},
+			{Name: "Master_log_name", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin", Comment: "The name of the master binary log file from which the events in the relay log file were read."},
+			{Name: "Master_log_pos", Type: "BIGINT(20) UNSIGNED", Comment: "The master log position of the last executed event."},
+			{Name: "Sql_delay", Type: "INT(11)", Comment: "The number of seconds that the slave must lag behind the master."},
+			{Name: "Number_of_workers", Type: "INT(10) UNSIGNED"},
+			{Name: "Id", Type: "INT(10) UNSIGNED", Comment: "Internal Id that uniquely identifies this record."},
+			{Name: "Channel_name", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", PrimaryKey: true, Comment: "The channel on which the slave is connected to a source. Used in Multisource Replication"},
 		},
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "slave_worker_info",
 		Columns: []catalog.ColumnDef{
-			{Name: "Id", Type: "INT UNSIGNED"},
-			{Name: "Relay_log_name", Type: "TEXT"},
-			{Name: "Relay_log_pos", Type: "BIGINT UNSIGNED"},
-			{Name: "Master_log_name", Type: "TEXT"},
-			{Name: "Master_log_pos", Type: "BIGINT UNSIGNED"},
-			{Name: "Checkpoint_relay_log_name", Type: "TEXT"},
-			{Name: "Checkpoint_relay_log_pos", Type: "BIGINT UNSIGNED"},
-			{Name: "Checkpoint_master_log_name", Type: "TEXT"},
-			{Name: "Checkpoint_master_log_pos", Type: "BIGINT UNSIGNED"},
-			{Name: "Checkpoint_seqno", Type: "INT UNSIGNED"},
-			{Name: "Checkpoint_group_size", Type: "INT UNSIGNED"},
+			{Name: "Id", Type: "INT(10) UNSIGNED", PrimaryKey: true},
+			{Name: "Relay_log_name", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin"},
+			{Name: "Relay_log_pos", Type: "BIGINT(20) UNSIGNED"},
+			{Name: "Master_log_name", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin"},
+			{Name: "Master_log_pos", Type: "BIGINT(20) UNSIGNED"},
+			{Name: "Checkpoint_relay_log_name", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin"},
+			{Name: "Checkpoint_relay_log_pos", Type: "BIGINT(20) UNSIGNED"},
+			{Name: "Checkpoint_master_log_name", Type: "TEXT", Charset: "utf8", Collation: "utf8_bin"},
+			{Name: "Checkpoint_master_log_pos", Type: "BIGINT(20) UNSIGNED"},
+			{Name: "Checkpoint_seqno", Type: "INT(10) UNSIGNED"},
+			{Name: "Checkpoint_group_size", Type: "INT(10) UNSIGNED"},
 			{Name: "Checkpoint_group_bitmap", Type: "BLOB"},
-			{Name: "Channel_name", Type: "VARCHAR(64)"},
+			{Name: "Channel_name", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", PrimaryKey: true, Comment: "The channel on which the slave is connected to a source. Used in Multisource Replication"},
 		},
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "time_zone",
-		Columns: []catalog.ColumnDef{
-			{Name: "Time_zone_id", Type: "INT UNSIGNED"},
-			{Name: "Use_leap_seconds", Type: "VARCHAR(1)"},
-		},
+		Columns: func() []catalog.ColumnDef {
+			defN := "N"
+			return []catalog.ColumnDef{
+				{Name: "Time_zone_id", Type: "INT(10) UNSIGNED", AutoIncrement: true, PrimaryKey: true},
+				{Name: "Use_leap_seconds", Type: "ENUM('Y','N')", Charset: "utf8", Collation: "utf8_general_ci", Default: &defN},
+			}
+		}(),
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "time_zone_leap_second",
 		Columns: []catalog.ColumnDef{
-			{Name: "Transition_time", Type: "BIGINT"},
-			{Name: "Correction", Type: "INT"},
+			{Name: "Transition_time", Type: "BIGINT(20)", PrimaryKey: true},
+			{Name: "Correction", Type: "INT(11)"},
 		},
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "time_zone_name",
 		Columns: []catalog.ColumnDef{
-			{Name: "Name", Type: "VARCHAR(64)"},
-			{Name: "Time_zone_id", Type: "INT UNSIGNED"},
+			{Name: "Name", Type: "CHAR(64)", Charset: "utf8", Collation: "utf8_general_ci", PrimaryKey: true},
+			{Name: "Time_zone_id", Type: "INT(10) UNSIGNED"},
 		},
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "time_zone_transition",
 		Columns: []catalog.ColumnDef{
-			{Name: "Time_zone_id", Type: "INT UNSIGNED"},
-			{Name: "Transition_time", Type: "BIGINT"},
-			{Name: "Transition_type_id", Type: "INT UNSIGNED"},
+			{Name: "Time_zone_id", Type: "INT(10) UNSIGNED", PrimaryKey: true},
+			{Name: "Transition_time", Type: "BIGINT(20)", PrimaryKey: true},
+			{Name: "Transition_type_id", Type: "INT(10) UNSIGNED"},
 		},
 	})
 	ensure("mysql", &catalog.TableDef{
 		Name: "time_zone_transition_type",
-		Columns: []catalog.ColumnDef{
-			{Name: "Time_zone_id", Type: "INT UNSIGNED"},
-			{Name: "Transition_type_id", Type: "INT UNSIGNED"},
-			{Name: "Offset", Type: "INT"},
-			{Name: "Is_DST", Type: "TINYINT UNSIGNED"},
-			{Name: "Abbreviation", Type: "VARCHAR(8)"},
-		},
+		Columns: func() []catalog.ColumnDef {
+			def0 := "0"
+			defEmpty := ""
+			return []catalog.ColumnDef{
+				{Name: "Time_zone_id", Type: "INT(10) UNSIGNED", PrimaryKey: true},
+				{Name: "Transition_type_id", Type: "INT(10) UNSIGNED", PrimaryKey: true},
+				{Name: "Offset", Type: "INT(11)", Default: &def0},
+				{Name: "Is_DST", Type: "TINYINT(3) UNSIGNED", Default: &def0},
+				{Name: "Abbreviation", Type: "CHAR(8)", Charset: "utf8", Collation: "utf8_general_ci", Default: &defEmpty},
+			}
+		}(),
 	})
 }

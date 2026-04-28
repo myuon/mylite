@@ -1453,6 +1453,15 @@ func mysqlGenExprNode(expr sqlparser.Expr, colCharset string) string {
 	}
 }
 
+// mysqlGenExprForIS formats a generated column expression for INFORMATION_SCHEMA.COLUMNS
+// GENERATION_EXPRESSION output. String literals are prefixed with _utf8mb4 and single quotes
+// are escaped with backslash (MySQL 8.0 behavior for IS.COLUMNS storage).
+func mysqlGenExprForIS(exprStr string) string {
+	formatted := mysqlFormatGenExpr(exprStr, "utf8mb4")
+	// MySQL stores single quotes as \' in GENERATION_EXPRESSION
+	return strings.ReplaceAll(formatted, "'", "\\'")
+}
+
 // columnTypeSupportsCharset returns true for column types that can carry a charset/collation
 // (CHAR, VARCHAR, TEXT family, ENUM, SET).  Binary types (BINARY, VARBINARY, BLOB) and
 // numeric/temporal types do not carry a charset.

@@ -3525,6 +3525,8 @@ func coerceColumnValue(colType string, val interface{}) interface{} {
 
 // formatDecimalValue formats a value for DECIMAL(M,D), DOUBLE(M,D), or FLOAT(M,D) columns.
 func formatDecimalValue(colType string, v interface{}) interface{} {
+	// Strip GENERATED ALWAYS AS (...) clause for virtual/stored generated columns
+	colType = baseColumnType(colType)
 	lower := strings.ToLower(colType)
 	// Strip all trailing modifiers (unsigned, zerofill) in any order to get the base type
 	cleanLower := strings.TrimSpace(lower)

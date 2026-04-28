@@ -2033,7 +2033,8 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 				// colDefault will be post-processed below after type info is determined
 
 				// Derive DATA_TYPE and precision/scale from col.Type
-				dataType := strings.ToLower(col.Type)
+				// Use base type (strip GENERATED ALWAYS AS clause if present) before lowercasing
+				dataType := strings.ToLower(baseColumnType(col.Type))
 				// Strip parenthesized length info for DATA_TYPE
 				if idx := strings.Index(dataType, "("); idx >= 0 {
 					dataType = dataType[:idx]
@@ -2129,19 +2130,20 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 				isTextType := false
 				var textByteLen int64
 				if baseType == "TINYTEXT" {
-					charLen = 255 / charsetMaxBytes
+					// MySQL reports CHARACTER_MAXIMUM_LENGTH = byte_limit for TEXT types
+					charLen = 255
 					textByteLen = 255
 					isTextType = true
 				} else if baseType == "TEXT" {
-					charLen = 65535 / charsetMaxBytes
+					charLen = 65535
 					textByteLen = 65535
 					isTextType = true
 				} else if baseType == "MEDIUMTEXT" {
-					charLen = 16777215 / charsetMaxBytes
+					charLen = 16777215
 					textByteLen = 16777215
 					isTextType = true
 				} else if baseType == "LONGTEXT" {
-					charLen = 4294967295 / charsetMaxBytes
+					charLen = 4294967295
 					textByteLen = 4294967295
 					isTextType = true
 				}
@@ -2506,11 +2508,27 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 				}
 				if col.AutoIncrement {
 					extra = "auto_increment"
-				} else if col.OnUpdateCurrentTimestamp {
-					if col.Default != nil && strings.HasPrefix(strings.ToUpper(*col.Default), "CURRENT_TIMESTAMP") {
-						extra = "DEFAULT_GENERATED on update CURRENT_TIMESTAMP"
+				} else if isGeneratedColumnType(col.Type) {
+					if strings.Contains(strings.ToUpper(col.Type), " STORED") {
+						extra = "STORED GENERATED"
 					} else {
-						extra = "on update CURRENT_TIMESTAMP"
+						extra = "VIRTUAL GENERATED"
+					}
+				} else if col.OnUpdateCurrentTimestamp {
+					// Include fractional seconds precision if column type has it, e.g. TIMESTAMP(6)
+					fspSuffix := ""
+					if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
+						end := strings.Index(colTypeUpper[idx:], ")")
+						if end > 0 {
+							if fsp, err := strconv.ParseInt(strings.TrimSpace(colTypeUpper[idx+1:idx+end]), 10, 64); err == nil && fsp > 0 {
+								fspSuffix = fmt.Sprintf("(%d)", fsp)
+							}
+						}
+					}
+					if col.Default != nil && strings.HasPrefix(strings.ToUpper(*col.Default), "CURRENT_TIMESTAMP") {
+						extra = "DEFAULT_GENERATED on update CURRENT_TIMESTAMP" + fspSuffix
+					} else {
+						extra = "on update CURRENT_TIMESTAMP" + fspSuffix
 					}
 				} else if col.Default != nil && strings.HasPrefix(strings.ToUpper(*col.Default), "CURRENT_TIMESTAMP") {
 					// TIMESTAMP/DATETIME with DEFAULT CURRENT_TIMESTAMP (no ON UPDATE)
@@ -2554,12 +2572,19 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 					"DATETIME_PRECISION":       datetimePrecision,
 					"CHARACTER_SET_NAME":       charSetName,
 					"COLLATION_NAME":           collationName,
-					"COLUMN_TYPE":              normalizeColumnType(col.Type),
+					"COLUMN_TYPE":              normalizeColumnType(baseColumnType(col.Type)),
 					"COLUMN_KEY":               columnKey,
 					"EXTRA":                    extra,
 					"PRIVILEGES":               "select,insert,update,references",
 					"COLUMN_COMMENT":           col.Comment,
-					"GENERATION_EXPRESSION":    "",
+					"GENERATION_EXPRESSION":    func() string {
+						if expr := generatedColumnExpr(col.Type); expr != "" {
+							// Format the generation expression with backtick-quoted column refs
+							// and charset-introduced literals like MySQL reports in IS.COLUMNS
+							return mysqlGenExprForIS(expr)
+						}
+						return ""
+					}(),
 					"SRS_ID":                   nil,
 				})
 			}
@@ -6051,7 +6076,17 @@ func canonicalEngineName(engine string) string {
 // normalizeColumnType returns the MySQL COLUMN_TYPE string for a given column type.
 // For integer types without explicit display width, it adds the default display width.
 func normalizeColumnType(colType string) string {
-	t := strings.ToLower(strings.TrimSpace(colType))
+	// For ENUM and SET types, preserve the case of the values but lowercase the keyword.
+	trimmed := strings.TrimSpace(colType)
+	upperTrimmed := strings.ToUpper(trimmed)
+	if strings.HasPrefix(upperTrimmed, "ENUM(") || strings.HasPrefix(upperTrimmed, "SET(") {
+		// Lowercase just the keyword (enum/set), preserve the rest as-is.
+		parenIdx := strings.Index(trimmed, "(")
+		keyword := strings.ToLower(trimmed[:parenIdx])
+		return keyword + trimmed[parenIdx:]
+	}
+
+	t := strings.ToLower(trimmed)
 	upper := strings.ToUpper(t)
 
 	// Normalize type aliases

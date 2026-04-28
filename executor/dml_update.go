@@ -647,6 +647,9 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 				continue
 			}
 			if v, err := e.evalGeneratedColumnExpr(genExpr, newRow); err == nil {
+				if v != nil {
+					v = coerceColumnValue(baseColumnType(col.Type), v)
+				}
 				newRow[col.Name] = v
 			}
 		}
@@ -670,6 +673,9 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 				continue
 			}
 			if v, err := e.evalGeneratedColumnExpr(genExpr, newRow); err == nil {
+				if v != nil {
+					v = coerceColumnValue(baseColumnType(col.Type), v)
+				}
 				newRow[col.Name] = v
 			}
 		}

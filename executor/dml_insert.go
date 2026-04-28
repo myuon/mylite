@@ -359,6 +359,9 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						// Let storage handle it
 					} else if genExpr := generatedColumnExpr(col.Type); genExpr != "" {
 						if v, err := e.evalGeneratedColumnExpr(genExpr, row); err == nil {
+							if v != nil {
+								v = coerceColumnValue(baseColumnType(col.Type), v)
+							}
 							row[col.Name] = v
 						}
 					} else if col.Default != nil {
@@ -1623,6 +1626,9 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					fullRow[col.Name] = tbl.AutoIncrement.Load() + 1
 				} else if genExpr := generatedColumnExpr(col.Type); genExpr != "" {
 					if v, err := e.evalGeneratedColumnExpr(genExpr, fullRow); err == nil {
+						if v != nil {
+							v = coerceColumnValue(baseColumnType(col.Type), v)
+						}
 						fullRow[col.Name] = v
 					}
 				} else if col.Default != nil {
