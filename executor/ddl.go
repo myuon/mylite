@@ -3229,9 +3229,58 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			}
 			// Not fully implemented; ignore silently.
 			return &Result{}, nil
+		case sqlparser.AddAction:
+			// ADD PARTITION: append new partitions to the table definition.
+			db, dbErr := e.Catalog.GetDatabase(dbName)
+			if dbErr == nil {
+				if tableDef, tblErr := db.GetTable(tableName); tblErr == nil && tableDef != nil {
+					for _, pd := range stmt.PartitionSpec.Definitions {
+						pdef := catalog.PartitionDef{Name: pd.Name.String()}
+						if pd.Options != nil && pd.Options.ValueRange != nil {
+							vr := pd.Options.ValueRange
+							if vr.Maxvalue {
+								pdef.ValueRange = "LESS THAN MAXVALUE"
+							} else if vr.Type == sqlparser.LessThanType {
+								parts := make([]string, len(vr.Range))
+								for i, v := range vr.Range {
+									parts[i] = sqlparser.String(v)
+								}
+								pdef.ValueRange = "LESS THAN (" + strings.Join(parts, ",") + ")"
+							} else {
+								parts := make([]string, len(vr.Range))
+								for i, v := range vr.Range {
+									parts[i] = sqlparser.String(v)
+								}
+								pdef.ValueRange = "IN (" + strings.Join(parts, ",") + ")"
+							}
+						}
+						tableDef.PartitionDefs = append(tableDef.PartitionDefs, pdef)
+					}
+				}
+			}
+			return &Result{}, nil
+		case sqlparser.DropAction:
+			// DROP PARTITION: remove partitions from the table definition.
+			db, dbErr := e.Catalog.GetDatabase(dbName)
+			if dbErr == nil {
+				if tableDef, tblErr := db.GetTable(tableName); tblErr == nil && tableDef != nil {
+					dropSet := make(map[string]bool)
+					for _, pd := range stmt.PartitionSpec.Names {
+						dropSet[strings.ToLower(pd.String())] = true
+					}
+					var remaining []catalog.PartitionDef
+					for _, pd := range tableDef.PartitionDefs {
+						if !dropSet[strings.ToLower(pd.Name)] {
+							remaining = append(remaining, pd)
+						}
+					}
+					tableDef.PartitionDefs = remaining
+				}
+			}
+			return &Result{}, nil
 		case sqlparser.TruncateAction, sqlparser.DiscardAction, sqlparser.ImportAction,
 			sqlparser.CoalesceAction, sqlparser.RemoveAction, sqlparser.UpgradeAction,
-			sqlparser.ReorganizeAction, sqlparser.AddAction, sqlparser.DropAction:
+			sqlparser.ReorganizeAction:
 			// These partition DDL operations are not fully implemented; ignore silently.
 			return &Result{}, nil
 		}

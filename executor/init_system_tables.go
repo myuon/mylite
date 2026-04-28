@@ -256,6 +256,14 @@ func (e *Executor) initSystemTables() {
 	})
 
 	ensure("mtr", &catalog.TableDef{
+		Name:   "global_suppressions",
+		Engine: "InnoDB",
+		Columns: []catalog.ColumnDef{
+			{Name: "pattern", Type: "VARCHAR(255)"},
+		},
+	})
+
+	ensure("mtr", &catalog.TableDef{
 		Name:   "test_suppressions",
 		Engine: "InnoDB",
 		Columns: []catalog.ColumnDef{
