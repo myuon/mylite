@@ -168,11 +168,12 @@ type selectLockClause struct {
 
 // txnMeta holds per-connection transaction metadata for INFORMATION_SCHEMA.INNODB_TRX.
 type txnMeta struct {
-	StartedAt       time.Time
-	IsolationLevel  string // e.g. "REPEATABLE-READ"
-	UniqueChecks    int64
+	StartedAt        time.Time
+	IsolationLevel   string // e.g. "REPEATABLE-READ"
+	UniqueChecks     int64
 	ForeignKeyChecks int64
-	LastFKError     string
+	LastFKError      string
+	RowsModified     int64 // count of rows inserted/updated/deleted in this transaction
 }
 
 // TxnActiveSet tracks which connections are currently in an active transaction.
@@ -228,12 +229,13 @@ func (t *TxnActiveSet) SetFKError(connID int64, errMsg string) {
 
 // TxnRow is a snapshot of a single active transaction for INNODB_TRX.
 type TxnRow struct {
-	ConnID          int64
-	StartedAt       time.Time
-	IsolationLevel  string
-	UniqueChecks    int64
+	ConnID           int64
+	StartedAt        time.Time
+	IsolationLevel   string
+	UniqueChecks     int64
 	ForeignKeyChecks int64
-	LastFKError     string
+	LastFKError      string
+	RowsModified     int64 // number of rows inserted/updated/deleted
 }
 
 // SnapshotTxns returns a snapshot of all active transactions.
@@ -246,20 +248,30 @@ func (t *TxnActiveSet) SnapshotTxns() []TxnRow {
 		var row TxnRow
 		row.ConnID = connID
 		if m != nil {
-			row.StartedAt       = m.StartedAt
-			row.IsolationLevel  = m.IsolationLevel
-			row.UniqueChecks    = m.UniqueChecks
+			row.StartedAt        = m.StartedAt
+			row.IsolationLevel   = m.IsolationLevel
+			row.UniqueChecks     = m.UniqueChecks
 			row.ForeignKeyChecks = m.ForeignKeyChecks
-			row.LastFKError     = m.LastFKError
+			row.LastFKError      = m.LastFKError
+			row.RowsModified     = m.RowsModified
 		} else {
-			row.StartedAt      = time.Now()
-			row.IsolationLevel = "REPEATABLE-READ"
-			row.UniqueChecks   = 1
+			row.StartedAt        = time.Now()
+			row.IsolationLevel   = "REPEATABLE-READ"
+			row.UniqueChecks     = 1
 			row.ForeignKeyChecks = 1
 		}
 		rows = append(rows, row)
 	}
 	return rows
+}
+
+// IncrRowsModified increments the RowsModified counter for an active transaction.
+func (t *TxnActiveSet) IncrRowsModified(connID int64, delta int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if m, ok := t.meta[connID]; ok {
+		m.RowsModified += delta
+	}
 }
 
 // End marks a connection as no longer being in a transaction.

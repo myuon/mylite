@@ -1650,30 +1650,56 @@ func (e *Executor) infoSchemaInnoDBTrx() []storage.Row {
 		if t.LastFKError != "" {
 			lastFKErr = t.LastFKError
 		}
+
+		// Compute lock statistics from the row lock manager.
+		var explicitRowsLocked, tablesLocked int64
+		if e.rowLockManager != nil {
+			explicitRowsLocked, tablesLocked = e.rowLockManager.GetRowLockStats(t.ConnID)
+		}
+		rowsModified := t.RowsModified
+		// Approximate trx_rows_locked to match InnoDB's reported value:
+		// - Each inserted row has an implicit exclusive lock (add rowsModified).
+		// - Range scans in REPEATABLE READ add a supremum next-key lock (add 1 if any
+		//   explicit record locks are held).
+		rowsLocked := explicitRowsLocked + rowsModified
+		if explicitRowsLocked > 0 {
+			rowsLocked++ // supremum / next-key lock for the range scan
+		}
+		// Approximate trx_weight = lock_structs + rows_modified, where lock_structs is
+		// estimated as: tablesLocked (table intent lock) + 1 per lock structure (one
+		// per page+lock-mode combination). In practice one per DML operation type.
+		trxWeight := tablesLocked + rowsModified
+		if explicitRowsLocked > 0 {
+			trxWeight++ // lock struct for record locks
+		}
+		if rowsModified > 0 {
+			trxWeight++ // lock struct for implicit insert locks
+		}
+
 		rows = append(rows, storage.Row{
-			"trx_id":                    fmt.Sprintf("%d", t.ConnID),
-			"trx_state":                 "RUNNING",
-			"trx_started":               t.StartedAt.Format("2006-01-02 15:04:05"),
-			"trx_requested_lock_id":     nil,
-			"trx_wait_started":          nil,
-			"trx_weight":                int64(0),
-			"trx_mysql_thread_id":       t.ConnID,
-			"trx_query":                 nil,
-			"trx_operation_state":       nil,
-			"trx_tables_in_use":         int64(0),
-			"trx_tables_locked":         int64(0),
-			"trx_lock_structs":          int64(0),
-			"trx_lock_memory_bytes":     int64(0),
-			"trx_rows_locked":           int64(0),
-			"trx_rows_modified":         int64(0),
-			"trx_concurrency_tickets":   int64(0),
-			"trx_isolation_level":       isoDisplay,
-			"trx_unique_checks":         t.UniqueChecks,
-			"trx_foreign_key_checks":    t.ForeignKeyChecks,
+			"trx_id":                     fmt.Sprintf("%d", t.ConnID),
+			"trx_state":                  "RUNNING",
+			"trx_started":                t.StartedAt.Format("2006-01-02 15:04:05"),
+			"trx_requested_lock_id":      nil,
+			"trx_wait_started":           nil,
+			"trx_weight":                 trxWeight,
+			"trx_mysql_thread_id":        t.ConnID,
+			"trx_query":                  nil,
+			"trx_operation_state":        nil,
+			"trx_tables_in_use":          int64(0),
+			"trx_tables_locked":          tablesLocked,
+			"trx_lock_structs":           int64(0),
+			"trx_lock_memory_bytes":      int64(0),
+			"trx_rows_locked":            rowsLocked,
+			"trx_rows_modified":          rowsModified,
+			"trx_concurrency_tickets":    int64(0),
+			"trx_isolation_level":        isoDisplay,
+			"trx_unique_checks":          t.UniqueChecks,
+			"trx_foreign_key_checks":     t.ForeignKeyChecks,
 			"trx_last_foreign_key_error": lastFKErr,
-			"trx_adaptive_hash_latched": int64(0),
-			"trx_adaptive_hash_timeout": int64(0),
-			"trx_is_read_only":          int64(0),
+			"trx_adaptive_hash_latched":  int64(0),
+			"trx_adaptive_hash_timeout":  int64(0),
+			"trx_is_read_only":           int64(0),
 			"trx_autocommit_non_locking": int64(0),
 		})
 	}

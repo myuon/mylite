@@ -459,6 +459,36 @@ func (rlm *RowLockManager) GetOtherLockedKeysWithPrefix(connID int64, prefix str
 	return keys
 }
 
+// GetRowLockStats returns the number of row locks and distinct tables locked
+// by the given connection. Lock keys have the form "db:table:pkValue".
+func (rlm *RowLockManager) GetRowLockStats(connID int64) (rowsLocked int64, tablesLocked int64) {
+	rlm.mu.Lock()
+	defer rlm.mu.Unlock()
+
+	tables := make(map[string]bool)
+	for key, entry := range rlm.locks {
+		if !entry.owners[connID] {
+			continue
+		}
+		rowsLocked++
+		// Extract "db:table" prefix (first two colon-separated segments).
+		first := strings.Index(key, ":")
+		if first < 0 {
+			continue
+		}
+		second := strings.Index(key[first+1:], ":")
+		var tablePrefix string
+		if second < 0 {
+			tablePrefix = key
+		} else {
+			tablePrefix = key[:first+1+second]
+		}
+		tables[tablePrefix] = true
+	}
+	tablesLocked = int64(len(tables))
+	return
+}
+
 // errLockWaitTimeout is a sentinel used internally; the executor wraps it with
 // the proper MySQL error code when returning to the client.
 var errLockWaitTimeout = fmt.Errorf("lock_wait_timeout")
