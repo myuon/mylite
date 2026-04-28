@@ -3909,6 +3909,28 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 	case *sqlparser.CurTimeFuncExpr:
 		// NOW(), CURRENT_TIMESTAMP(), CURTIME(), etc.
 		name := strings.ToLower(v.Name.String())
+		// MySQL SYSDATE() returns the actual wall-clock time at execution, not the
+		// statement-start cached time (unlike NOW()/CURRENT_TIMESTAMP()).
+		// Handle sysdate separately before computing "now" via the cached nowTime().
+		// Exception: when --sysdate-is-now startup option is set, SYSDATE() behaves
+		// exactly like NOW() (uses the cached statement-start time).
+		if name == "sysdate" {
+			var sysNow time.Time
+			if e.startupVars["sysdate_is_now"] == "1" {
+				sysNow = e.nowTime()
+			} else {
+				sysNow = time.Now()
+				if e.timeZone != nil {
+					sysNow = sysNow.In(e.timeZone)
+				}
+			}
+			fsp := v.Fsp
+			if fsp > 0 && fsp <= 6 {
+				frac := fmt.Sprintf("%06d", sysNow.Nanosecond()/1000)[:fsp]
+				return sysNow.Format("2006-01-02 15:04:05") + "." + frac, nil
+			}
+			return sysNow.Format("2006-01-02 15:04:05"), nil
+		}
 		now := e.nowTime()
 		fsp := v.Fsp // fractional seconds precision (0-6)
 		// Helper to format with fractional seconds precision.
@@ -3924,7 +3946,7 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			return base + "." + frac
 		}
 		switch name {
-		case "now", "current_timestamp", "localtime", "localtimestamp", "sysdate":
+		case "now", "current_timestamp", "localtime", "localtimestamp":
 			return withFrac(now.Format("2006-01-02 15:04:05")), nil
 		case "curdate", "current_date":
 			return now.Format("2006-01-02"), nil
