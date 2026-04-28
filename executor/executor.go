@@ -2654,6 +2654,21 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 					if !s.Temp {
 						return nil, mysqlError(1290, "HY000", "The MySQL server is running with the --read-only option so it cannot execute this statement")
 					}
+				case *sqlparser.Select:
+					// SELECT ... FOR UPDATE is treated as a write operation under read_only=ON.
+					// FOR SHARE is allowed since it only acquires shared locks.
+					hasExclusiveLock := s.Lock == sqlparser.ForUpdateLock
+					if !hasExclusiveLock {
+						for _, lc := range e.selectLockClauses {
+							if lc.exclusive {
+								hasExclusiveLock = true
+								break
+							}
+						}
+					}
+					if hasExclusiveLock {
+						return nil, mysqlError(1290, "HY000", "The MySQL server is running with the --read-only option so it cannot execute this statement")
+					}
 				}
 			}
 		}
