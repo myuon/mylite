@@ -1208,6 +1208,60 @@ applyAlias:
 	return result, nil
 }
 
+// getEffectiveRowFormat returns the effective row format for a table definition
+// as used by INNODB_TABLES (the format the table was actually created with).
+// Priority: EffectiveRowFormat > RowFormat (explicit) > current innodb_default_row_format.
+func (e *Executor) getEffectiveRowFormat(def *catalogPkg.TableDef) string {
+	if def != nil && def.EffectiveRowFormat != "" {
+		rf := strings.ToLower(def.EffectiveRowFormat)
+		return strings.ToUpper(rf[:1]) + rf[1:]
+	}
+	if def != nil && def.RowFormat != "" {
+		// Explicit row format set but EffectiveRowFormat not stored (backward compat)
+		rf := strings.ToLower(def.RowFormat)
+		return strings.ToUpper(rf[:1]) + rf[1:]
+	}
+	// Fall back to innodb_default_row_format (for tables that predate EffectiveRowFormat tracking)
+	if v, ok := e.getSysVar("innodb_default_row_format"); ok && v != "" {
+		rf := strings.ToLower(v)
+		return strings.ToUpper(rf[:1]) + rf[1:]
+	}
+	return "Dynamic"
+}
+
+// innodbFlagForRowFormat returns the InnoDB FLAG value for a given row format.
+// FLAG encoding:
+//
+//	Redundant = 0
+//	Compact   = 1
+//	Dynamic   = 33 (= 0x21: bit0=compact, bit5=atomic_blobs)
+//	Compressed = 35 (= 0x23: bit0=compact, bit1=zip, bit5=atomic_blobs)
+func innodbFlagForRowFormat(rowFmt string) int64 {
+	switch strings.ToLower(rowFmt) {
+	case "redundant":
+		return 0
+	case "compact":
+		return 1
+	case "compressed":
+		return 35
+	default: // dynamic
+		return 33
+	}
+}
+
+// innodbZipPageSize returns the ZIP_PAGE_SIZE for a table.
+// For COMPRESSED tables this is KEY_BLOCK_SIZE * 1024; otherwise 0.
+func innodbZipPageSize(def *catalogPkg.TableDef, rowFmt string) int64 {
+	if !strings.EqualFold(rowFmt, "compressed") {
+		return 0
+	}
+	if def != nil && def.KeyBlockSize != nil && *def.KeyBlockSize > 0 {
+		return int64(*def.KeyBlockSize) * 1024
+	}
+	// Default key block size for compressed is 8KB when not specified
+	return int64(8192)
+}
+
 func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 	rows := make([]storage.Row, 0)
 	dbNames := e.Catalog.ListDatabases()
@@ -1245,6 +1299,16 @@ func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 			def, _ := db.GetTable(tblName)
 			prefix := strings.ToLower(dbName + "/" + tblName)
 
+			// Compute effective row format (explicit or from innodb_default_row_format)
+			rowFmt := e.getEffectiveRowFormat(def)
+			flag := innodbFlagForRowFormat(rowFmt)
+			zipPageSize := innodbZipPageSize(def, rowFmt)
+			// N_COLS = actual column count + 3 hidden InnoDB columns (DB_ROW_ID, DB_TRX_ID, DB_ROLL_PTR)
+			nCols := int64(5) // default when def is nil
+			if def != nil {
+				nCols = int64(len(def.Columns)) + 3
+			}
+
 			// For partitioned tables, emit one entry per partition (MySQL behavior).
 			// Partition names follow the pattern: db/table#p#partname
 			// Subpartition names: db/table#p#partname#sp#subpartname
@@ -1255,10 +1319,10 @@ func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 						"TABLE_ID":      tableID,
 						"NAME":          prefix + "#p#" + partName,
 						"SPACE":         space,
-						"FLAG":          int64(33),
-						"N_COLS":        int64(5),
-						"ROW_FORMAT":    "Dynamic",
-						"ZIP_PAGE_SIZE": int64(0),
+						"FLAG":          flag,
+						"N_COLS":        nCols,
+						"ROW_FORMAT":    rowFmt,
+						"ZIP_PAGE_SIZE": zipPageSize,
 						"SPACE_TYPE":    "Single",
 					})
 					tableID++
@@ -1269,10 +1333,10 @@ func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 					"TABLE_ID":      tableID,
 					"NAME":          prefix,
 					"SPACE":         space,
-					"FLAG":          int64(33),
-					"N_COLS":        int64(5),
-					"ROW_FORMAT":    "Dynamic",
-					"ZIP_PAGE_SIZE": int64(0),
+					"FLAG":          flag,
+					"N_COLS":        nCols,
+					"ROW_FORMAT":    rowFmt,
+					"ZIP_PAGE_SIZE": zipPageSize,
 					"SPACE_TYPE":    "Single",
 				})
 				tableID++
@@ -1472,12 +1536,18 @@ func (e *Executor) infoSchemaInnoDBTablespaces() []storage.Row {
 	tables := e.infoSchemaInnoDBTables()
 	for _, t := range tables {
 		name := toString(t["NAME"])
+		zipPageSize := int64(0)
+		if zps, ok := t["ZIP_PAGE_SIZE"]; ok {
+			if z, ok2 := zps.(int64); ok2 {
+				zipPageSize = z
+			}
+		}
 		rows = append(rows, storage.Row{
 			"SPACE":         t["SPACE"],
 			"NAME":          name,
 			"ROW_FORMAT":    t["ROW_FORMAT"],
 			"PAGE_SIZE":     int64(16384),
-			"ZIP_PAGE_SIZE": int64(0),
+			"ZIP_PAGE_SIZE": zipPageSize,
 			"SPACE_TYPE":    "Single",
 		})
 	}
@@ -1958,11 +2028,9 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 				engine = canonicalEngineName(tblDef.Engine)
 			}
 
-			// Determine ROW_FORMAT from table definition
-			rowFormat := "Dynamic"
-			if tblDef != nil && tblDef.RowFormat != "" {
-				rowFormat = tblDef.RowFormat
-			} else if strings.EqualFold(engine, "MEMORY") {
+			// Determine ROW_FORMAT: use effective (creation-time) format for InnoDB
+			rowFormat := e.getEffectiveRowFormat(tblDef)
+			if strings.EqualFold(engine, "MEMORY") {
 				rowFormat = "Fixed"
 			}
 

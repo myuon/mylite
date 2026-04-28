@@ -823,8 +823,6 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 		return int64(1), nil
 	case "innodb_page_size":
 		return int64(16384), nil
-	case "innodb_default_row_format":
-		return "dynamic", nil
 	case "innodb_lock_wait_timeout":
 		return int64(50), nil
 	case "innodb_autoinc_lock_mode":

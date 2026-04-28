@@ -2664,6 +2664,21 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 	}
 
+	// Record the effective row format at table creation time (for INNODB_TABLES reporting).
+	// This captures the format the table was actually created with, whether explicit or from
+	// the innodb_default_row_format global variable.
+	if def.RowFormat != "" {
+		def.EffectiveRowFormat = def.RowFormat
+	} else {
+		// No explicit ROW_FORMAT: capture current default so innodb_tables shows the
+		// correct format even after innodb_default_row_format changes.
+		if v, ok := e.getSysVar("innodb_default_row_format"); ok && v != "" {
+			def.EffectiveRowFormat = strings.ToUpper(v)
+		} else {
+			def.EffectiveRowFormat = "DYNAMIC"
+		}
+	}
+
 	err = db.CreateTable(def)
 	if err != nil {
 		if stmt.IfNotExists {
@@ -4747,6 +4762,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					tableDef, _ := db.GetTable(tableName)
 					if tableDef != nil {
 						tableDef.RowFormat = strings.ToUpper(tableOptionString(to))
+						tableDef.EffectiveRowFormat = tableDef.RowFormat
 					}
 				case "KEY_BLOCK_SIZE":
 					tableDef, _ := db.GetTable(tableName)
@@ -5127,11 +5143,50 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			requiresRowRewrite = true
 		case *sqlparser.AlterColumn:
 			// ALTER COLUMN SET DEFAULT doesn't require row rewrite
+		case *sqlparser.DropKey:
+			// DROP PRIMARY KEY requires a table rebuild on InnoDB (cannot be done in-place)
+			if op.Type == sqlparser.PrimaryKeyType {
+				requiresRowRewrite = true
+			}
 		}
 	}
 	if requiresRowRewrite && tbl != nil {
 		alterAffected = uint64(len(tbl.Scan()))
 	}
+
+	// Update EffectiveRowFormat when a table rebuild (COPY) occurs.
+	// If ALGORITHM=COPY (or a column change triggers a rebuild), and the table has no
+	// explicit ROW_FORMAT, update the effective format to the current innodb_default_row_format.
+	// If ALGORITHM=INPLACE, preserve the existing format.
+	// If ROW_FORMAT was explicitly set in this ALTER, EffectiveRowFormat was already updated above.
+	{
+		isCopyAlgorithm := false
+		for _, opt := range stmt.AlterOptions {
+			if av, ok := opt.(sqlparser.AlgorithmValue); ok {
+				if strings.EqualFold(string(av), "COPY") {
+					isCopyAlgorithm = true
+				}
+			}
+		}
+		// A "rebuild" happens for ALGORITHM=COPY or for operations that require row rewrite
+		// (unless INPLACE was specified).
+		isRebuild := isCopyAlgorithm || (requiresRowRewrite && !alterIsInplace)
+		if isRebuild {
+			if tableDef, tdErr := db.GetTable(tableName); tdErr == nil && tableDef != nil {
+				// Only update EffectiveRowFormat if there's no explicit ROW_FORMAT
+				if tableDef.RowFormat == "" {
+					if v, ok := e.getSysVar("innodb_default_row_format"); ok && v != "" {
+						tableDef.EffectiveRowFormat = strings.ToUpper(v)
+					} else {
+						tableDef.EffectiveRowFormat = "DYNAMIC"
+					}
+				}
+				// If explicit RowFormat exists, EffectiveRowFormat should match RowFormat
+				// (already updated in the ROW_FORMAT table option case above)
+			}
+		}
+	}
+
 	return &Result{AffectedRows: alterAffected}, nil
 }
 
