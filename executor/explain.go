@@ -643,10 +643,11 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 					result = processed
 				} else {
 					// materialization=off: all non-SIMPLE rows become id=1, SIMPLE.
-					// For DuplicateWeedout/LooseScan strategy, MySQL places the inner
-					// subquery tables BEFORE the outer tables in the join order.
-					// Separate outer (originally SIMPLE) from inner (originally non-SIMPLE)
-					// rows, then reorder: inner first, outer last.
+					// Strategy ordering:
+					// - FirstMatch: outer table(s) first, inner table(s) last
+					//   (with FirstMatch(outerTable) annotation on the last inner row)
+					// - DuplicateWeedout/LooseScan: inner tables first, outer tables last
+					firstmatchOn := e.isOptimizerSwitchEnabled("firstmatch")
 					var outerSimpleRows []explainSelectType
 					var innerRows []explainSelectType
 					for _, r := range result {
@@ -658,8 +659,137 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 							outerSimpleRows = append(outerSimpleRows, r)
 						}
 					}
-					// Rebuild result: inner tables first, then outer tables.
-					result = append(innerRows, outerSimpleRows...)
+
+					// Detect IN subquery join column for key usage analysis.
+					// For "WHERE outerTable.col IN (SELECT col FROM innerTable)",
+					// outerJoinCol = "col".
+					outerJoinCol := extractINSubqueryOuterCol(s)
+
+					// Extract the first inner table name from the IN subquery for ref construction.
+					innerTableNameForRef := ""
+					if s.Where != nil {
+						_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+							if cmp, ok := n.(*sqlparser.ComparisonExpr); ok && cmp.Operator == sqlparser.InOp {
+								if sub, ok := cmp.Right.(*sqlparser.Subquery); ok {
+									if innerSel, ok := sub.Select.(*sqlparser.Select); ok {
+										for _, te := range innerSel.From {
+											tns := e.extractAllTableNames(te)
+											if len(tns) > 0 {
+												innerTableNameForRef = tns[0]
+												return false, nil
+											}
+										}
+									}
+								}
+							}
+							return true, nil
+						}, s.Where.Expr)
+					}
+
+					if firstmatchOn && len(innerRows) > 0 {
+						// FirstMatch strategy: outer tables first, inner tables last.
+						// Add FirstMatch(outerTable) annotation to the last inner row.
+						// Also annotate outer table with possible_keys when it has a key on the join col.
+						outerIsConst := inSubqueryOuterIsConst(s)
+						var firstMatchExtra string
+						if outerIsConst {
+							firstMatchExtra = "FirstMatch"
+						} else {
+							// Use the name of the first outer table as the FirstMatch reference.
+							outerTableName := ""
+							for _, r := range outerSimpleRows {
+								if r.table != nil {
+									outerTableName = fmt.Sprintf("%v", r.table)
+									break
+								}
+							}
+							if outerTableName != "" {
+								firstMatchExtra = fmt.Sprintf("FirstMatch(%s)", outerTableName)
+							} else {
+								firstMatchExtra = "FirstMatch"
+							}
+						}
+						// Add FirstMatch to the Extra of the last inner row.
+						last := &innerRows[len(innerRows)-1]
+						if last.extra == nil {
+							last.extra = firstMatchExtra
+						} else {
+							last.extra = fmt.Sprintf("%v; %s", last.extra, firstMatchExtra)
+						}
+						// For outer tables in FirstMatch: if the join column matches a primary key,
+						// add possible_keys even though access type remains ALL (optimizer considered the key).
+						if outerJoinCol != "" {
+							for i := range outerSimpleRows {
+								outerTblName := fmt.Sprintf("%v", outerSimpleRows[i].table)
+								if td := e.explainGetTableDef(outerTblName); td != nil {
+									for _, pkCol := range td.PrimaryKey {
+										if strings.EqualFold(pkCol, outerJoinCol) {
+											outerSimpleRows[i].possibleKeys = "PRIMARY"
+											break
+										}
+									}
+								}
+							}
+						}
+						// Rebuild result: outer tables first, then inner tables.
+						result = append(outerSimpleRows, innerRows...)
+					} else {
+						// DuplicateWeedout/LooseScan strategy: inner tables first, outer tables last.
+						// For outer tables probed by inner tables via join column:
+						// if the outer table has a primary key on the join column, use eq_ref access.
+						if outerJoinCol != "" && innerTableNameForRef != "" {
+							dbName := e.CurrentDB
+							if dbName == "" {
+								dbName = "test"
+							}
+							refStr := fmt.Sprintf("%s.%s.%s", dbName, innerTableNameForRef, outerJoinCol)
+							for i := range outerSimpleRows {
+								outerTblName := fmt.Sprintf("%v", outerSimpleRows[i].table)
+								if td := e.explainGetTableDef(outerTblName); td != nil {
+									// Check if primary key covers the join column
+									pkMatches := false
+									for _, pkCol := range td.PrimaryKey {
+										if strings.EqualFold(pkCol, outerJoinCol) {
+											pkMatches = true
+											break
+										}
+									}
+									if pkMatches {
+										// Compute key length for INT (4 bytes)
+										pkKeyLen := 0
+										for _, pkCol := range td.PrimaryKey {
+											if colDef := findColumnDef(td, pkCol); colDef != nil {
+												pkKeyLen += explainKeyLen(colDef, td.Charset)
+											}
+										}
+										outerSimpleRows[i].accessType = "eq_ref"
+										outerSimpleRows[i].possibleKeys = "PRIMARY"
+										outerSimpleRows[i].key = "PRIMARY"
+										outerSimpleRows[i].keyLen = strconv.Itoa(pkKeyLen)
+										outerSimpleRows[i].ref = refStr
+										// Remove "Using join buffer" from Extra since eq_ref doesn't use BNL
+										if outerSimpleRows[i].extra != nil {
+											extraStr := fmt.Sprintf("%v", outerSimpleRows[i].extra)
+											extraStr = strings.ReplaceAll(extraStr, "Using join buffer (Block Nested Loop)", "")
+											extraStr = strings.ReplaceAll(extraStr, "; ;", ";")
+											extraStr = strings.TrimSuffix(extraStr, "; ")
+											extraStr = strings.TrimPrefix(extraStr, "; ")
+											extraStr = strings.TrimSpace(extraStr)
+											if extraStr == "" {
+												outerSimpleRows[i].extra = nil
+											} else {
+												outerSimpleRows[i].extra = extraStr
+											}
+										}
+										// For eq_ref access, set rows=1 (unique key lookup) and filtered=100.00
+										outerSimpleRows[i].rows = int64(1)
+										outerSimpleRows[i].filtered = "100.00"
+									}
+								}
+							}
+						}
+						result = append(innerRows, outerSimpleRows...)
+					}
 				}
 			} else {
 				result = e.explainSelect(s, &idCounter, "PRIMARY")
@@ -6721,13 +6851,36 @@ func (e *Executor) explainJSONUsedColumns(tableName string, query string) []stri
 		return true, nil
 	}, stmt)
 
-	// If SELECT *, return all columns
+	// If SELECT *, return all columns — but only if the table is in the outer FROM clause.
+	// When the table is only referenced inside an IN subquery (not in the outer FROM),
+	// the outer SELECT * does not apply to it; only columns used within the subquery count.
 	if hasStar {
-		cols := make([]string, len(td.Columns))
-		for i, c := range td.Columns {
-			cols[i] = c.Name
+		outerTableInFrom := false
+		if sel, ok := stmt.(*sqlparser.Select); ok {
+			for _, te := range sel.From {
+				for _, tn := range e.extractAllTableNames(te) {
+					if strings.EqualFold(tn, tableName) {
+						outerTableInFrom = true
+						break
+					}
+				}
+				if outerTableInFrom {
+					break
+				}
+			}
+		} else {
+			// Not a simple SELECT (e.g. UNION): conservative fallback
+			outerTableInFrom = true
 		}
-		return cols
+		if outerTableInFrom {
+			cols := make([]string, len(td.Columns))
+			for i, c := range td.Columns {
+				cols[i] = c.Name
+			}
+			return cols
+		}
+		// Table is only in a subquery: hasStar from outer SELECT doesn't apply.
+		// Fall through to use referencedCols from the subquery references.
 	}
 
 	// If query has window functions, also include primary key columns (MySQL needs them for row ordering)
