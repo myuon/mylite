@@ -189,6 +189,7 @@ type RowLockManager struct {
 	mu                   sync.Mutex
 	locks                map[string]*rowLockEntry // lockKey -> entry
 	waitingFor           map[int64]map[int64]bool // waiter connID -> set of blocker connIDs
+	waitStarted          map[int64]time.Time      // waiter connID -> time when wait began
 	deadlockDetectEnabled atomic.Int32             // 1 = enabled (default), 0 = disabled
 }
 
@@ -204,11 +205,38 @@ type rowLockEntry struct {
 // NewRowLockManager creates a new RowLockManager.
 func NewRowLockManager() *RowLockManager {
 	rlm := &RowLockManager{
-		locks:      make(map[string]*rowLockEntry),
-		waitingFor: make(map[int64]map[int64]bool),
+		locks:       make(map[string]*rowLockEntry),
+		waitingFor:  make(map[int64]map[int64]bool),
+		waitStarted: make(map[int64]time.Time),
 	}
 	rlm.deadlockDetectEnabled.Store(1) // enabled by default
 	return rlm
+}
+
+// IsWaiting reports whether connID is currently waiting for a row lock.
+// If waiting, it also returns the time at which the wait began.
+func (rlm *RowLockManager) IsWaiting(connID int64) (bool, time.Time) {
+	rlm.mu.Lock()
+	defer rlm.mu.Unlock()
+	if t, ok := rlm.waitStarted[connID]; ok {
+		return true, t
+	}
+	return false, time.Time{}
+}
+
+// WaitingConnIDsSnapshot returns a snapshot of all connection IDs that are
+// currently waiting for a row lock, along with the time each wait started.
+func (rlm *RowLockManager) WaitingConnIDsSnapshot() map[int64]time.Time {
+	rlm.mu.Lock()
+	defer rlm.mu.Unlock()
+	if len(rlm.waitStarted) == 0 {
+		return nil
+	}
+	out := make(map[int64]time.Time, len(rlm.waitStarted))
+	for id, t := range rlm.waitStarted {
+		out[id] = t
+	}
+	return out
 }
 
 // SetDeadlockDetect enables or disables deadlock detection (innodb_deadlock_detect).
@@ -248,6 +276,7 @@ func (rlm *RowLockManager) acquireRowLockInner(connID int64, key string, exclusi
 				ch:        make(chan struct{}),
 			}
 			delete(rlm.waitingFor, connID)
+			delete(rlm.waitStarted, connID)
 			rlm.mu.Unlock()
 			return nil
 		}
@@ -278,6 +307,7 @@ func (rlm *RowLockManager) acquireRowLockInner(connID int64, key string, exclusi
 			// Shared + shared = compatible, add ourselves
 			existing.owners[connID] = true
 			delete(rlm.waitingFor, connID)
+			delete(rlm.waitStarted, connID)
 			rlm.mu.Unlock()
 			return nil
 		}
@@ -291,8 +321,13 @@ func (rlm *RowLockManager) acquireRowLockInner(connID int64, key string, exclusi
 		}
 		if len(blockers) > 0 {
 			rlm.waitingFor[connID] = blockers
+			// Record when the wait started (only on the first iteration).
+			if _, alreadyWaiting := rlm.waitStarted[connID]; !alreadyWaiting {
+				rlm.waitStarted[connID] = time.Now()
+			}
 			if rlm.deadlockDetectEnabled.Load() != 0 && rlm.detectDeadlock(connID) {
 				delete(rlm.waitingFor, connID)
+				delete(rlm.waitStarted, connID)
 				rlm.mu.Unlock()
 				return errDeadlock
 			}
@@ -310,6 +345,7 @@ func (rlm *RowLockManager) acquireRowLockInner(connID int64, key string, exclusi
 			default:
 				rlm.mu.Lock()
 				delete(rlm.waitingFor, connID)
+				delete(rlm.waitStarted, connID)
 				rlm.mu.Unlock()
 				return errLockWaitTimeout
 			}
@@ -327,6 +363,7 @@ func (rlm *RowLockManager) acquireRowLockInner(connID int64, key string, exclusi
 			default:
 				rlm.mu.Lock()
 				delete(rlm.waitingFor, connID)
+				delete(rlm.waitStarted, connID)
 				rlm.mu.Unlock()
 				return errLockWaitTimeout
 			}
@@ -405,6 +442,7 @@ func (rlm *RowLockManager) ReleaseRowLocks(connID int64) {
 	defer rlm.mu.Unlock()
 
 	delete(rlm.waitingFor, connID)
+	delete(rlm.waitStarted, connID)
 
 	for key, entry := range rlm.locks {
 		if entry.owners[connID] {

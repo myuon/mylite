@@ -1725,12 +1725,51 @@ func (e *Executor) infoSchemaReferentialConstraints() []storage.Row {
 // infoSchemaInnoDBTrx returns rows for INFORMATION_SCHEMA.INNODB_TRX
 // by reading the current active transactions from TxnActiveSet.
 func (e *Executor) infoSchemaInnoDBTrx() []storage.Row {
-	if e.txnActiveSet == nil {
-		return []storage.Row{}
+	// Build a map of connID -> ProcessEntry for fast lookup.
+	var procByConn map[int64]ProcessEntry
+	if e.processList != nil {
+		entries := e.processList.Snapshot()
+		procByConn = make(map[int64]ProcessEntry, len(entries))
+		for _, pe := range entries {
+			procByConn[pe.ID] = pe
+		}
 	}
-	txns := e.txnActiveSet.SnapshotTxns()
-	rows := make([]storage.Row, 0, len(txns))
-	for _, t := range txns {
+
+	// Collect snapshot of connections waiting for row locks (includes autocommit txns).
+	var waitingConns map[int64]time.Time
+	if e.rowLockManager != nil {
+		waitingConns = e.rowLockManager.WaitingConnIDsSnapshot()
+	}
+
+	// Build a map of connID -> TxnRow from the active transaction set.
+	txnByConn := make(map[int64]TxnRow)
+	if e.txnActiveSet != nil {
+		for _, t := range e.txnActiveSet.SnapshotTxns() {
+			txnByConn[t.ConnID] = t
+		}
+	}
+
+	// Merge: any connection waiting for a row lock must appear in innodb_trx, even
+	// if it started an implicit (autocommit) transaction not tracked by txnActiveSet.
+	for connID, waitAt := range waitingConns {
+		if _, alreadyTracked := txnByConn[connID]; !alreadyTracked {
+			// Synthesise a TxnRow from process list info.
+			iso := "REPEATABLE-READ"
+			if pe, ok := procByConn[connID]; ok {
+				_ = pe // use below
+			}
+			txnByConn[connID] = TxnRow{
+				ConnID:           connID,
+				StartedAt:        waitAt,
+				IsolationLevel:   iso,
+				UniqueChecks:     1,
+				ForeignKeyChecks: 1,
+			}
+		}
+	}
+
+	rows := make([]storage.Row, 0, len(txnByConn))
+	for _, t := range txnByConn {
 		// Convert isolation level from internal format (REPEATABLE-READ) to
 		// MySQL display format (REPEATABLE READ) used in INNODB_TRX.
 		isoDisplay := strings.ReplaceAll(t.IsolationLevel, "-", " ")
@@ -1765,16 +1804,45 @@ func (e *Executor) infoSchemaInnoDBTrx() []storage.Row {
 			trxWeight++ // lock struct for implicit insert locks
 		}
 
+		// Determine whether this transaction is waiting for a row lock.
+		trxState := "RUNNING"
+		var trxWaitStarted interface{}
+		var trxRequestedLockID interface{}
+		if waitAt, isWaiting := waitingConns[t.ConnID]; isWaiting {
+			trxState = "LOCK WAIT"
+			trxWaitStarted = waitAt.Format("2006-01-02 15:04:05")
+			trxRequestedLockID = fmt.Sprintf("%d:0:0:0", t.ConnID)
+		}
+
+		// Populate trx_query and trx_operation_state from the process list.
+		var trxQuery interface{}
+		var trxOperationState interface{}
+		if pe, ok := procByConn[t.ConnID]; ok && pe.Info != "" {
+			trxQuery = pe.Info
+			// Derive operation state from the first keyword of the query.
+			q := strings.ToUpper(strings.TrimSpace(pe.Info))
+			switch {
+			case strings.HasPrefix(q, "INSERT"):
+				trxOperationState = "inserting"
+			case strings.HasPrefix(q, "UPDATE"):
+				trxOperationState = "updating"
+			case strings.HasPrefix(q, "DELETE"):
+				trxOperationState = "deleting"
+			case strings.HasPrefix(q, "SELECT"):
+				trxOperationState = "fetching rows"
+			}
+		}
+
 		rows = append(rows, storage.Row{
 			"trx_id":                     fmt.Sprintf("%d", t.ConnID),
-			"trx_state":                  "RUNNING",
+			"trx_state":                  trxState,
 			"trx_started":                t.StartedAt.Format("2006-01-02 15:04:05"),
-			"trx_requested_lock_id":      nil,
-			"trx_wait_started":           nil,
+			"trx_requested_lock_id":      trxRequestedLockID,
+			"trx_wait_started":           trxWaitStarted,
 			"trx_weight":                 trxWeight,
 			"trx_mysql_thread_id":        t.ConnID,
-			"trx_query":                  nil,
-			"trx_operation_state":        nil,
+			"trx_query":                  trxQuery,
+			"trx_operation_state":        trxOperationState,
 			"trx_tables_in_use":          int64(0),
 			"trx_tables_locked":          tablesLocked,
 			"trx_lock_structs":           int64(0),
