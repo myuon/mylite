@@ -7,6 +7,8 @@ import (
 	"unicode"
 
 	"golang.org/x/text/unicode/norm"
+
+	"github.com/myuon/mylite/catalog"
 )
 
 // preprocessQuery performs pre-parse processing on the query string before
@@ -793,6 +795,15 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	// Handle ALTER TABLE ... REORGANIZE PARTITION as no-op
 	if strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, "REORGANIZE PARTITION") {
 		return "", &Result{}, nil
+	}
+
+	// Vitess parser cannot handle ADD PARTITION with multiple partition definitions
+	// (e.g. ADD PARTITION (PARTITION p4 ..., PARTITION p5 ...)).
+	// Detect this case and handle it by directly updating the catalog.
+	if strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, "ADD PARTITION") {
+		if result, err, handled := e.handleMultiAddPartition(query); handled {
+			return "", result, err
+		}
 	}
 
 	// Strip DELETE/UPDATE LOW_PRIORITY modifiers
@@ -2357,4 +2368,182 @@ func rewriteInlineCheckConstraints(query string) string {
 	// Step 3: restore protected patterns
 	rewritten = strings.ReplaceAll(rewritten, inlineCheckPlaceholder, "CHECK (")
 	return rewritten
+}
+
+// reAddPartitionTableRef captures the table reference from an ALTER TABLE ... ADD PARTITION statement.
+var reAddPartitionTableRef = regexp.MustCompile(`(?i)ALTER\s+TABLE\s+` +
+	`(` + // start capture group 1: full table reference
+	`(?:` + "`[^`]*`" + `|[A-Za-z0-9_]+)` + // db or table name (backtick-quoted or plain)
+	`(?:\.(?:` + "`[^`]*`" + `|[A-Za-z0-9_]+))?` + // optional .tableName
+	`)`) // end capture group 1
+
+// reAddPartitionParens matches: ALTER TABLE [db.]tbl [options,] ADD PARTITION (
+var reAddPartitionParens = regexp.MustCompile(`(?i)ALTER\s+TABLE\s+` +
+	`(?:` + "`[^`]*`" + `|[A-Za-z0-9_]+)` + // db or table name
+	`(?:\.(?:` + "`[^`]*`" + `|[A-Za-z0-9_]+))?` + // optional .tableName
+	`(?:\s+[^(]*?)?\s+ADD\s+PARTITION\s*\(`) // options before ADD PARTITION
+
+// reAddPartitionCount matches: ALTER TABLE ... ADD PARTITION PARTITIONS N
+var reAddPartitionCount = regexp.MustCompile(`(?i)ALTER\s+TABLE\s+` +
+	`(?:` + "`[^`]*`" + `|[A-Za-z0-9_]+)` + // db or table name
+	`(?:\.(?:` + "`[^`]*`" + `|[A-Za-z0-9_]+))?` + // optional .tableName
+	`(?:\s+[^(]*?)?\s+ADD\s+PARTITION\s+PARTITIONS\s+(\d+)`) // ADD PARTITION PARTITIONS N
+
+// handleMultiAddPartition handles ALTER TABLE ... ADD PARTITION cases that the vitess parser
+// cannot parse:
+//   - Multiple named partition defs: ADD PARTITION (PARTITION p1 ..., PARTITION p2 ...)
+//   - Hash count extension: ADD PARTITION PARTITIONS N
+//
+// Returns (result, error, handled): if handled==true the caller should short-circuit.
+// Single-definition ADD PARTITION (PARTITION p ...) is left to the normal parser path.
+func (e *Executor) handleMultiAddPartition(query string) (*Result, error, bool) {
+	// Case 1: ADD PARTITION PARTITIONS N (for HASH/KEY tables)
+	if m := reAddPartitionCount.FindStringSubmatch(query); m != nil {
+		countStr := m[1]
+		n := 0
+		for _, ch := range countStr {
+			n = n*10 + int(ch-'0')
+		}
+		tableRef := reAddPartitionTableRef.FindStringSubmatch(query)
+		if tableRef == nil {
+			return nil, nil, false
+		}
+		dbName, tableName := e.splitTableRef(strings.Trim(tableRef[1], "`"))
+		db, dbErr := e.Catalog.GetDatabase(dbName)
+		if dbErr != nil {
+			return nil, dbErr, true
+		}
+		tableDef, tblErr := db.GetTable(tableName)
+		if tblErr != nil {
+			return nil, tblErr, true
+		}
+		tableDef.PartitionCount += n
+		return &Result{}, nil, true
+	}
+
+	// Case 2: ADD PARTITION (...) — may have multiple partition definitions
+	m := reAddPartitionParens.FindStringIndex(query)
+	if m == nil {
+		return nil, nil, false
+	}
+	// m[1] points to just after the '(' in "ADD PARTITION ("
+	// Find the matching closing ')' for the outer parentheses list.
+	rest := query[m[1]:]
+	closeIdx := -1
+	depth := 1
+	for i, ch := range rest {
+		if ch == '(' {
+			depth++
+		} else if ch == ')' {
+			depth--
+			if depth == 0 {
+				closeIdx = i
+				break
+			}
+		}
+	}
+	if closeIdx < 0 {
+		return nil, nil, false
+	}
+	partListStr := rest[:closeIdx]
+
+	// Split partListStr into individual PARTITION ... definitions.
+	// Splitting on "," at depth 0 (respecting nested parentheses).
+	partDefs := splitPartitionDefs(partListStr)
+	if len(partDefs) <= 1 {
+		// Single or zero definitions: let normal parser path handle it.
+		return nil, nil, false
+	}
+
+	// Extract the table name from the ALTER TABLE header.
+	tableRef := reAddPartitionTableRef.FindStringSubmatch(query)
+	if tableRef == nil {
+		return nil, nil, false
+	}
+	dbName, tableName := e.splitTableRef(strings.Trim(tableRef[1], "`"))
+
+	db, dbErr := e.Catalog.GetDatabase(dbName)
+	if dbErr != nil {
+		return nil, dbErr, true
+	}
+	tableDef, tblErr := db.GetTable(tableName)
+	if tblErr != nil {
+		return nil, tblErr, true
+	}
+
+	for _, defStr := range partDefs {
+		pdef := parsePartitionDef(strings.TrimSpace(defStr))
+		tableDef.PartitionDefs = append(tableDef.PartitionDefs, pdef)
+	}
+
+	return &Result{}, nil, true
+}
+
+// splitTableRef splits a [db.]tableName reference into (dbName, tableName).
+// Uses e.CurrentDB as the database if no qualifier is present.
+func (e *Executor) splitTableRef(fullRef string) (string, string) {
+	dbName := e.CurrentDB
+	tableName := fullRef
+	if idx := strings.Index(fullRef, "."); idx >= 0 {
+		dbName = strings.Trim(fullRef[:idx], "`")
+		tableName = strings.Trim(fullRef[idx+1:], "`")
+	}
+	return dbName, tableName
+}
+
+// splitPartitionDefs splits a comma-separated list of PARTITION definitions,
+// respecting nested parentheses so commas inside VALUE lists are not treated as separators.
+func splitPartitionDefs(s string) []string {
+	var parts []string
+	depth := 0
+	start := 0
+	for i, ch := range s {
+		if ch == '(' {
+			depth++
+		} else if ch == ')' {
+			depth--
+		} else if ch == ',' && depth == 0 {
+			parts = append(parts, s[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		parts = append(parts, s[start:])
+	}
+	return parts
+}
+
+// rePartitionDef parses a single "PARTITION name VALUES LESS THAN (expr)" definition.
+// It extracts the partition name and its value range.
+var rePartitionDefLessThan = regexp.MustCompile(`(?i)PARTITION\s+` +
+	"(`[^`]*`|[A-Za-z0-9_]+)" + // partition name
+	`\s+VALUES\s+LESS\s+THAN\s+` +
+	`(MAXVALUE|\(.*\))`) // value range
+var rePartitionDefIn = regexp.MustCompile(`(?i)PARTITION\s+` +
+	"(`[^`]*`|[A-Za-z0-9_]+)" + // partition name
+	`\s+VALUES\s+IN\s+(\(.*\))`) // value range
+var rePartitionDefName = regexp.MustCompile(`(?i)PARTITION\s+(` + "`[^`]*`|[A-Za-z0-9_]+" + `)`)
+
+func parsePartitionDef(defStr string) catalog.PartitionDef {
+	// Try LESS THAN
+	if m := rePartitionDefLessThan.FindStringSubmatch(defStr); m != nil {
+		name := strings.Trim(m[1], "`")
+		val := m[2]
+		if strings.EqualFold(val, "MAXVALUE") {
+			return catalog.PartitionDef{Name: name, ValueRange: "LESS THAN MAXVALUE"}
+		}
+		return catalog.PartitionDef{Name: name, ValueRange: "LESS THAN " + val}
+	}
+	// Try IN
+	if m := rePartitionDefIn.FindStringSubmatch(defStr); m != nil {
+		name := strings.Trim(m[1], "`")
+		val := m[2]
+		return catalog.PartitionDef{Name: name, ValueRange: "IN " + val}
+	}
+	// Fallback: just get the name
+	if m := rePartitionDefName.FindStringSubmatch(defStr); m != nil {
+		name := strings.Trim(m[1], "`")
+		return catalog.PartitionDef{Name: name}
+	}
+	return catalog.PartitionDef{}
 }

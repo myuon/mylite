@@ -1216,7 +1216,23 @@ func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 	space := int64(1)
 	for _, dbName := range dbNames {
 		switch strings.ToLower(dbName) {
-		case "information_schema", "mysql", "performance_schema", "sys":
+		case "information_schema", "mysql", "performance_schema":
+			continue
+		case "sys":
+			// Only sys.sys_config is an actual InnoDB table in MySQL 8.0.
+			// All other sys tables are views and do not appear in INNODB_TABLES.
+			rows = append(rows, storage.Row{
+				"TABLE_ID":      tableID,
+				"NAME":          "sys/sys_config",
+				"SPACE":         space,
+				"FLAG":          int64(33),
+				"N_COLS":        int64(9),
+				"ROW_FORMAT":    "Dynamic",
+				"ZIP_PAGE_SIZE": int64(0),
+				"SPACE_TYPE":    "Single",
+			})
+			tableID++
+			space++
 			continue
 		}
 		db, err := e.Catalog.GetDatabase(dbName)
@@ -1226,24 +1242,73 @@ func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 		tableNames := db.ListTables()
 		sort.Strings(tableNames)
 		for _, tblName := range tableNames {
-			rows = append(rows, storage.Row{
-				"TABLE_ID":      tableID,
-				"NAME":          strings.ToLower(dbName + "/" + tblName),
-				"SPACE":         space,
-				"FLAG":          int64(33),
-				"N_COLS":        int64(5),
-				"ROW_FORMAT":    "Dynamic",
-				"ZIP_PAGE_SIZE": int64(0),
-				"SPACE_TYPE":    "Single",
-			})
-			tableID++
-			space++
+			def, _ := db.GetTable(tblName)
+			prefix := strings.ToLower(dbName + "/" + tblName)
+
+			// For partitioned tables, emit one entry per partition (MySQL behavior).
+			// Partition names follow the pattern: db/table#p#partname
+			// Subpartition names: db/table#p#partname#sp#subpartname
+			if def != nil && def.PartitionType != "" {
+				partNames := innodbPartitionNames(def)
+				for _, partName := range partNames {
+					rows = append(rows, storage.Row{
+						"TABLE_ID":      tableID,
+						"NAME":          prefix + "#p#" + partName,
+						"SPACE":         space,
+						"FLAG":          int64(33),
+						"N_COLS":        int64(5),
+						"ROW_FORMAT":    "Dynamic",
+						"ZIP_PAGE_SIZE": int64(0),
+						"SPACE_TYPE":    "Single",
+					})
+					tableID++
+					space++
+				}
+			} else {
+				rows = append(rows, storage.Row{
+					"TABLE_ID":      tableID,
+					"NAME":          prefix,
+					"SPACE":         space,
+					"FLAG":          int64(33),
+					"N_COLS":        int64(5),
+					"ROW_FORMAT":    "Dynamic",
+					"ZIP_PAGE_SIZE": int64(0),
+					"SPACE_TYPE":    "Single",
+				})
+				tableID++
+				space++
+			}
 		}
 	}
 	if len(rows) == 0 {
 		return []storage.Row{{"TABLE_ID": int64(0), "NAME": "", "SPACE": int64(0), "FLAG": int64(33), "N_COLS": int64(0), "ROW_FORMAT": "Dynamic", "ZIP_PAGE_SIZE": int64(0), "SPACE_TYPE": "Single"}}
 	}
 	return rows
+}
+
+// innodbPartitionNames returns the list of partition/subpartition name suffixes
+// for a partitioned table, in MySQL-style ordering (p0, p1, p2 etc.).
+// For subpartitioned tables, returns names like "p0#sp#sp0", "p0#sp#sp1", etc.
+func innodbPartitionNames(def *catalogPkg.TableDef) []string {
+	var names []string
+	if len(def.PartitionDefs) > 0 {
+		for _, pd := range def.PartitionDefs {
+			if len(pd.SubPartitionNames) > 0 {
+				// Subpartitioned: emit per subpartition
+				for _, sp := range pd.SubPartitionNames {
+					names = append(names, strings.ToLower(pd.Name)+"#sp#"+strings.ToLower(sp))
+				}
+			} else {
+				names = append(names, strings.ToLower(pd.Name))
+			}
+		}
+	} else if def.PartitionCount > 0 {
+		// Hash/Key partitions with PARTITIONS N: auto-named p0..p{N-1}
+		for i := 0; i < def.PartitionCount; i++ {
+			names = append(names, fmt.Sprintf("p%d", i))
+		}
+	}
+	return names
 }
 
 // infoSchemaInnoDBIndexes returns rows for information_schema.INNODB_INDEXES.
@@ -1257,7 +1322,21 @@ func (e *Executor) infoSchemaInnoDBIndexes() []storage.Row {
 	space := int64(1)
 	for _, dbName := range dbNames {
 		switch strings.ToLower(dbName) {
-		case "information_schema", "mysql", "performance_schema", "sys":
+		case "information_schema", "mysql", "performance_schema":
+			continue
+		case "sys":
+			// sys.sys_config is the only actual InnoDB table in the sys schema.
+			// It has a single PRIMARY key on (variable).
+			rows = append(rows, storage.Row{
+				"INDEX_ID": indexID,
+				"NAME":     "PRIMARY",
+				"TABLE_ID": tableID,
+				"TYPE":     int64(3),
+				"SPACE":    space,
+			})
+			indexID++
+			tableID++
+			space++
 			continue
 		}
 		db, err := e.Catalog.GetDatabase(dbName)
@@ -1318,7 +1397,17 @@ func (e *Executor) infoSchemaInnoDBCachedIndexes() []storage.Row {
 	space := int64(1)
 	for _, dbName := range dbNames {
 		switch strings.ToLower(dbName) {
-		case "information_schema", "mysql", "performance_schema", "sys":
+		case "information_schema", "mysql", "performance_schema":
+			continue
+		case "sys":
+			// sys.sys_config is the only actual InnoDB table in the sys schema.
+			rows = append(rows, storage.Row{
+				"SPACE_ID":       space,
+				"INDEX_ID":       indexID,
+				"N_CACHED_PAGES": int64(0),
+			})
+			indexID++
+			space++
 			continue
 		}
 		db, err := e.Catalog.GetDatabase(dbName)
