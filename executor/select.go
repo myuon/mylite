@@ -97,6 +97,16 @@ func (e *Executor) collectTableDefsWithAliases(expr sqlparser.TableExpr) ([]*cat
 // its SELECT SQL and resolving column names from the underlying tables.
 // Returns nil if the view SQL cannot be resolved to a known set of columns.
 func (e *Executor) syntheticTableDefFromViewSQL(viewName, viewSQL string) *catalog.TableDef {
+	// If the view has an explicit column list (CREATE VIEW v (c1,c2,...) AS SELECT ...),
+	// use those column names directly — they override the SELECT expression names.
+	if viewColNames := e.getViewColumnNames(viewName); len(viewColNames) > 0 {
+		synCols := make([]catalog.ColumnDef, len(viewColNames))
+		for i, name := range viewColNames {
+			synCols[i] = catalog.ColumnDef{Name: name}
+		}
+		return &catalog.TableDef{Name: viewName, Columns: synCols}
+	}
+
 	stmt, err := e.parser().Parse(viewSQL)
 	if err != nil {
 		return nil
@@ -133,7 +143,7 @@ func (e *Executor) syntheticTableDefFromViewSQL(viewName, viewSQL string) *catal
 						}
 					}
 				}
-				// For named column lists, synthesize from SELECT expressions
+				// For named column lists, synthesize from SELECT expressions (alias or ColName only).
 				var synCols []catalog.ColumnDef
 				for _, se := range sel.SelectExprs.Exprs {
 					switch s := se.(type) {
@@ -357,7 +367,12 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 				if crossDB {
 					e.CurrentDB = lookupDB
 				}
+				// Mark that we're executing a re-serialized view SQL (from sqlparser.String()),
+				// so column name derivation can compact arithmetic operators (e.g. "b + 1" → "b+1").
+				savedExecutingViewSQL := e.executingViewSQL
+				e.executingViewSQL = true
 				viewResult, err := e.Execute(viewSQL)
+				e.executingViewSQL = savedExecutingViewSQL
 				if crossDB {
 					e.CurrentDB = savedCurrentDB
 				}
@@ -375,12 +390,25 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 				}
 				// Convert view result to storage.Rows
 				rows := make([]storage.Row, 0, len(viewResult.Rows))
+				// If the view has an explicit column list (CREATE VIEW v (c1,c2,...) AS SELECT ...),
+				// rename output columns to the view's defined names.
+				effectiveCols := viewResult.Columns
+				if viewColNames := e.getViewColumnNames(lookupTable); len(viewColNames) > 0 {
+					renamed := make([]string, len(effectiveCols))
+					copy(renamed, effectiveCols)
+					for i, vn := range viewColNames {
+						if i < len(renamed) {
+							renamed[i] = vn
+						}
+					}
+					effectiveCols = renamed
+				}
 				// Store column order as a special metadata key for SELECT * resolution
-				colOrderStr := strings.Join(viewResult.Columns, "\x00")
+				colOrderStr := strings.Join(effectiveCols, "\x00")
 				for _, vrow := range viewResult.Rows {
 					row := make(storage.Row)
 					row["__column_order__"] = colOrderStr
-					for ci, col := range viewResult.Columns {
+					for ci, col := range effectiveCols {
 						if ci < len(vrow) {
 							row[col] = vrow[ci]
 							row[alias+"."+col] = vrow[ci]
@@ -392,10 +420,10 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 				// in a metadata row. This allows SELECT * to resolve column names even
 				// when the view returns 0 data rows.
 				// The __view_columns__ key signals this is metadata, not a real row.
-				if len(rows) == 0 && len(viewResult.Columns) > 0 {
+				if len(rows) == 0 && len(effectiveCols) > 0 {
 					metaRow := make(storage.Row)
 					metaRow["__column_order__"] = colOrderStr
-					metaRow["__view_columns__"] = viewResult.Columns
+					metaRow["__view_columns__"] = effectiveCols
 					rows = append(rows, metaRow)
 				}
 				return rows, nil
@@ -4286,6 +4314,12 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 					}
 					// Normalize charset introducers (e.g. _utf8mb3 'x' → _utf8'x')
 					raw = normalizeCharsetIntroducers(raw)
+					// When executing a re-serialized view SQL (from sqlparser.String()), sqlparser
+					// adds spaces around arithmetic operators (e.g. "b+1" → "b + 1"). Compact
+					// them back so the column name matches what MySQL reports (e.g. "b+1").
+					if e.executingViewSQL {
+						raw = compactOperatorsInSubexpressions(raw)
+					}
 					// Preserve original query text for column name (MySQL behavior)
 					colNames = append(colNames, raw)
 				} else {
@@ -6149,6 +6183,12 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 					}
 					// Normalize charset introducers (e.g. _utf8mb3 'x' → _utf8'x')
 					raw = normalizeCharsetIntroducers(raw)
+					// When executing a re-serialized view SQL (from sqlparser.String()), sqlparser
+					// adds spaces around arithmetic operators (e.g. "b+1" → "b + 1"). Compact
+					// them back so the column name matches what MySQL reports (e.g. "b+1").
+					if e.executingViewSQL {
+						raw = compactOperatorsInSubexpressions(raw)
+					}
 					name = raw
 				}
 				if name == "" {

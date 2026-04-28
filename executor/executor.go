@@ -403,6 +403,11 @@ type Executor struct {
 	viewSecurity map[string]string
 	// viewCreateStatements stores the full CREATE VIEW SQL for SHOW CREATE VIEW (view name -> full SQL).
 	viewCreateStatements map[string]string
+	// viewColumnNames stores the column alias list for views (view name -> []string).
+	// This is the explicit column list from CREATE VIEW v (col1, col2, ...) AS SELECT ...
+	viewColumnNames map[string][]string
+	// viewAlgorithm stores the algorithm for views (view name -> "temptable", "merge", or "undefined").
+	viewAlgorithm map[string]string
 	// viewStore is a shared view store across all connections. Views created on any connection
 	// are accessible by all other connections (like MySQL's shared information_schema).
 	viewStore *ViewStore
@@ -418,6 +423,11 @@ type Executor struct {
 	lastErrorCount   int64
 	// currentQuery holds the current raw SQL text for display-name reconstruction.
 	currentQuery string
+	// executingViewSQL is true when the current query is a re-serialized view SELECT
+	// (from sqlparser.String(), not from the original user-typed query). Used to
+	// decide whether to compact arithmetic operators in column names (e.g. "b + 1" → "b+1"),
+	// since sqlparser re-serialization adds spaces that the original query text did not have.
+	executingViewSQL bool
 	// showCreateDBIfNotExists is set by preprocessQuery when the original query was
 	// "SHOW CREATE DATABASE IF NOT EXISTS db", so that execShow can include the
 	// /*!32312 IF NOT EXISTS*/ comment in the Create Database column value.
@@ -3048,9 +3058,39 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			e.viewCreateStatements = make(map[string]string)
 		}
 		e.viewCreateStatements[viewName] = e.buildCreateViewSQLFromQuery(s, query)
+		// Store the explicit column list from CREATE VIEW v (col1, col2, ...) AS SELECT ...
+		if len(s.Columns) > 0 {
+			if e.viewColumnNames == nil {
+				e.viewColumnNames = make(map[string][]string)
+			}
+			cols := make([]string, len(s.Columns))
+			for i, c := range s.Columns {
+				cols[i] = c.String()
+			}
+			e.viewColumnNames[viewName] = cols
+		}
+		// Store the view algorithm.
+		if s.Algorithm != "" {
+			if e.viewAlgorithm == nil {
+				e.viewAlgorithm = make(map[string]string)
+			}
+			e.viewAlgorithm[viewName] = strings.ToLower(s.Algorithm)
+		}
 		// Also write to the shared view store so other connections can see this view.
 		if e.viewStore != nil {
 			e.viewStore.Set(viewDB, viewName, selectSQL, buildViewSelectSQL(s, query), s.CheckOption, e.viewCreateStatements[viewName], s.Security)
+			// Store column list in shared view store too.
+			if len(s.Columns) > 0 {
+				cols := make([]string, len(s.Columns))
+				for i, c := range s.Columns {
+					cols[i] = c.String()
+				}
+				e.viewStore.SetColumnList(viewDB, viewName, cols)
+			}
+			// Store algorithm in shared view store.
+			if s.Algorithm != "" {
+				e.viewStore.SetAlgorithm(viewDB, viewName, s.Algorithm)
+			}
 		}
 		return &Result{}, nil
 	case *sqlparser.DropView:
@@ -3066,6 +3106,12 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			}
 			if e.viewCreateStatements != nil {
 				delete(e.viewCreateStatements, viewName)
+			}
+			if e.viewColumnNames != nil {
+				delete(e.viewColumnNames, viewName)
+			}
+			if e.viewAlgorithm != nil {
+				delete(e.viewAlgorithm, viewName)
 			}
 			if e.viewStore != nil {
 				e.viewStore.Delete(viewDB, viewName)
@@ -3170,10 +3216,48 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			CheckOption: s.CheckOption,
 		}
 		e.viewCreateStatements[viewName] = e.buildCreateViewSQLFromQuery(cv, query)
+		// Store the explicit column list from ALTER VIEW v (col1, col2, ...) AS SELECT ...
+		if len(s.Columns) > 0 {
+			if e.viewColumnNames == nil {
+				e.viewColumnNames = make(map[string][]string)
+			}
+			cols := make([]string, len(s.Columns))
+			for i, c := range s.Columns {
+				cols[i] = c.String()
+			}
+			e.viewColumnNames[viewName] = cols
+		} else if e.viewColumnNames != nil {
+			delete(e.viewColumnNames, viewName)
+		}
+		// Store the view algorithm.
+		if s.Algorithm != "" {
+			if e.viewAlgorithm == nil {
+				e.viewAlgorithm = make(map[string]string)
+			}
+			e.viewAlgorithm[viewName] = strings.ToLower(s.Algorithm)
+		} else if e.viewAlgorithm != nil {
+			delete(e.viewAlgorithm, viewName)
+		}
 		// Also write to the shared view store so other connections can see this view.
 		if e.viewStore != nil {
 			displaySQL := buildViewSelectSQL(cv, query)
 			e.viewStore.Set(viewDB, viewName, selectSQL, displaySQL, s.CheckOption, e.viewCreateStatements[viewName], s.Security)
+			// Update column list in shared view store.
+			if len(s.Columns) > 0 {
+				cols := make([]string, len(s.Columns))
+				for i, c := range s.Columns {
+					cols[i] = c.String()
+				}
+				e.viewStore.SetColumnList(viewDB, viewName, cols)
+			} else {
+				e.viewStore.SetColumnList(viewDB, viewName, nil)
+			}
+			// Update algorithm in shared view store.
+			if s.Algorithm != "" {
+				e.viewStore.SetAlgorithm(viewDB, viewName, s.Algorithm)
+			} else {
+				e.viewStore.SetAlgorithm(viewDB, viewName, "")
+			}
 		}
 		return &Result{}, nil
 	case *sqlparser.CommentOnly:
@@ -5557,6 +5641,229 @@ func (e *Executor) resolveViewToBaseTableVisited(tableName string, visited map[s
 		// Nested view is also a simple single-table view - it's OK.
 	}
 	return baseTableName, true, viewWhere, nil
+}
+
+// getViewAlgorithm returns the view algorithm ("temptable", "merge", "undefined", or "").
+func (e *Executor) getViewAlgorithm(viewName string) string {
+	if e.viewAlgorithm != nil {
+		for vn, algo := range e.viewAlgorithm {
+			if strings.EqualFold(vn, viewName) {
+				return algo
+			}
+		}
+	}
+	if e.viewStore != nil {
+		return e.viewStore.LookupAlgorithm(e.CurrentDB, viewName)
+	}
+	return ""
+}
+
+// isViewUpdatable checks whether a view is updatable.
+// A view is updatable if it is a simple single-table SELECT with no GROUP BY, HAVING,
+// DISTINCT, aggregate functions, and all SELECT columns are direct column references
+// (not computed expressions). Subquery-based views are also not updatable.
+func (e *Executor) isViewUpdatable(viewName string) bool {
+	viewSQL, _, ok := e.lookupView(viewName)
+	if !ok {
+		return false
+	}
+	stmt, err := e.parser().Parse(viewSQL)
+	if err != nil {
+		return false
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return false // UNION etc.
+	}
+	if len(sel.From) != 1 {
+		return false // JOIN
+	}
+	ate, ok := sel.From[0].(*sqlparser.AliasedTableExpr)
+	if !ok {
+		return false
+	}
+	if _, isSubq := ate.Expr.(*sqlparser.DerivedTable); isSubq {
+		return false
+	}
+	if sel.GroupBy != nil || sel.Having != nil || sel.Distinct {
+		return false
+	}
+	for _, sexpr := range sel.SelectExprs.Exprs {
+		ae, ok := sexpr.(*sqlparser.AliasedExpr)
+		if !ok {
+			return false
+		}
+		if containsAggregate(ae.Expr) {
+			return false
+		}
+		// Each SELECT expression must be a direct column reference
+		if _, ok := ae.Expr.(*sqlparser.ColName); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// isViewNonMerge returns true if the view must be materialized (non-merge) for EXPLAIN purposes.
+// MySQL uses TEMPTABLE (non-merge) when:
+//   - ALGORITHM=TEMPTABLE is specified
+//   - ALGORITHM=UNDEFINED and view contains DISTINCT, GROUP BY, HAVING, aggregate functions,
+//     LIMIT, UNION, or a subquery in FROM
+//
+// A simple single-table SELECT (even with computed expressions) is MERGE.
+func (e *Executor) isViewNonMerge(viewName string) bool {
+	algo := strings.ToLower(e.getViewAlgorithm(viewName))
+	if algo == "temptable" {
+		return true
+	}
+	if algo == "merge" {
+		return false
+	}
+	// ALGORITHM=UNDEFINED: inspect the view SQL
+	viewSQL, _, ok := e.lookupView(viewName)
+	if !ok {
+		return false
+	}
+	stmt, err := e.parser().Parse(viewSQL)
+	if err != nil {
+		return false
+	}
+	switch s := stmt.(type) {
+	case *sqlparser.Select:
+		// Non-merge if DISTINCT, GROUP BY, HAVING, LIMIT, or subquery in FROM
+		if s.Distinct {
+			return true
+		}
+		if s.GroupBy != nil && len(s.GroupBy.Exprs) > 0 {
+			return true
+		}
+		if s.Having != nil {
+			return true
+		}
+		if s.Limit != nil {
+			return true
+		}
+		// Check for aggregate functions in SELECT expressions
+		for _, sexpr := range s.SelectExprs.Exprs {
+			if ae, ok := sexpr.(*sqlparser.AliasedExpr); ok {
+				if containsAggregate(ae.Expr) {
+					return true
+				}
+			}
+		}
+		// Check for subqueries in FROM
+		for _, te := range s.From {
+			if hasSubqueryInTableExpr(te) {
+				return true
+			}
+		}
+		return false
+	default:
+		// UNION etc. — always non-merge
+		return true
+	}
+}
+
+// hasSubqueryInTableExpr returns true if a table expression contains a subquery (DerivedTable).
+func hasSubqueryInTableExpr(te sqlparser.TableExpr) bool {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if _, ok := t.Expr.(*sqlparser.DerivedTable); ok {
+			return true
+		}
+	case *sqlparser.JoinTableExpr:
+		return hasSubqueryInTableExpr(t.LeftExpr) || hasSubqueryInTableExpr(t.RightExpr)
+	case *sqlparser.ParenTableExpr:
+		for _, expr := range t.Exprs {
+			if hasSubqueryInTableExpr(expr) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// getViewColumnNames returns the ordered column alias list for a view.
+// Returns nil if the view has no explicit column list.
+func (e *Executor) getViewColumnNames(viewName string) []string {
+	// Check local map first
+	if e.viewColumnNames != nil {
+		for vn, cols := range e.viewColumnNames {
+			if strings.EqualFold(vn, viewName) {
+				return cols
+			}
+		}
+	}
+	// Fall back to shared view store
+	if e.viewStore != nil {
+		if cols := e.viewStore.LookupColumnList(e.CurrentDB, viewName); cols != nil {
+			return cols
+		}
+	}
+	return nil
+}
+
+// viewColumnMapping holds per-view-column info for UPDATE/INSERT through view.
+type viewColumnMapping struct {
+	// expr is the underlying SELECT expression (non-nil for computed cols, nil for direct col refs)
+	expr sqlparser.Expr
+	// baseColName is the underlying base table column name (non-empty if this is a direct col ref)
+	baseColName string
+}
+
+// getViewExprMapping parses the view's SELECT SQL and returns a map from view column name
+// (lowercased) to viewColumnMapping. This is used to resolve view aliases in UPDATE SET
+// and INSERT column lists.
+// Returns nil if the view SQL cannot be parsed or has no column mapping.
+func (e *Executor) getViewExprMapping(viewName string) map[string]viewColumnMapping {
+	viewSQL, _, ok := e.lookupView(viewName)
+	if !ok {
+		return nil
+	}
+	stmt, err := e.parser().Parse(viewSQL)
+	if err != nil {
+		return nil
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return nil
+	}
+
+	// Get column alias names (either from explicit CREATE VIEW column list or SELECT AS aliases)
+	columnNames := e.getViewColumnNames(viewName)
+
+	result := make(map[string]viewColumnMapping)
+	for i, sexpr := range sel.SelectExprs.Exprs {
+		ae, ok := sexpr.(*sqlparser.AliasedExpr)
+		if !ok {
+			continue
+		}
+		// Determine the alias name for this position
+		var alias string
+		if i < len(columnNames) {
+			alias = columnNames[i]
+		} else if !ae.As.IsEmpty() {
+			alias = ae.As.String()
+		} else {
+			// Use the expression string as the alias (e.g. a simple column name)
+			alias = sqlparser.String(ae.Expr)
+			alias = strings.Trim(alias, "`")
+		}
+		if alias == "" {
+			continue
+		}
+		// Determine if this is a direct column reference
+		var mapping viewColumnMapping
+		if cn, ok2 := ae.Expr.(*sqlparser.ColName); ok2 {
+			// Direct column reference
+			mapping.baseColName = cn.Name.String()
+		} else {
+			// Computed expression
+			mapping.expr = ae.Expr
+		}
+		result[strings.ToLower(alias)] = mapping
+	}
+	return result
 }
 
 // getViewCheckCondition returns the WHERE expression from a view definition if it has WITH CHECK OPTION.

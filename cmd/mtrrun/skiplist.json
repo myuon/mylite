@@ -3461,10 +3461,6 @@
       "reason": "complex query failures"
     },
     {
-      "test": "gcol/gcol_view_innodb",
-      "reason": "view update failures"
-    },
-    {
       "test": "gcol/gcol_view_myisam",
       "reason": "view update failures"
     },

@@ -156,11 +156,29 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	// Also capture any WITH CHECK OPTION condition for enforcement.
 	originalViewName := tableName
 	var viewCheckExpr sqlparser.Expr
+	var isInsertThroughView bool
 	if baseTable, isView, _, err := e.resolveViewToBaseTable(tableName); err != nil {
 		return nil, err
 	} else if isView {
+		isInsertThroughView = true
 		viewCheckExpr = e.getViewCheckCondition(originalViewName)
 		tableName = baseTable
+	}
+	// When inserting through a view, check that all specified columns are updatable (direct col refs).
+	if isInsertThroughView && len(stmt.Columns) > 0 {
+		viewColMap := e.getViewExprMapping(originalViewName)
+		if viewColMap != nil {
+			for _, col := range stmt.Columns {
+				colLower := strings.ToLower(col.String())
+				if m, found := viewColMap[colLower]; found {
+					if m.baseColName == "" {
+						// Computed expression column - not updatable
+						return nil, mysqlError(1348, "HY000",
+							fmt.Sprintf("Column '%s' is not updatable", col.String()))
+					}
+				}
+			}
+		}
 	}
 
 	// MySQL error 1442: can't modify a table inside a trigger if the triggering statement is

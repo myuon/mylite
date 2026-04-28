@@ -1843,7 +1843,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 			// Check if this error was expected (--error before --reap)
 			if ctx.expectedError != "" {
 				if ctx.resultLogEnabled {
-					if strings.Contains(ctx.expectedError, ",") {
+					if countNonEmptyErrorCodes(ctx.expectedError) > 1 {
 						codes := strings.Split(ctx.expectedError, ",")
 						includesZero := false
 						for _, c := range codes {
@@ -2782,10 +2782,9 @@ func (ctx *execContext) executeQuery(stmt string) error {
 		if ctx.expectedError != "" {
 			// Output the error message (mysqltest format)
 			if ctx.resultLogEnabled {
-				if strings.Contains(ctx.expectedError, ",") {
-					// When expected error list includes 0 (success allowed),
-					// errors are silently absorbed with no output line.
-					// Otherwise, output "Got one of the listed errors".
+				if countNonEmptyErrorCodes(ctx.expectedError) > 1 {
+					// Multiple error codes: check if any is 0 (success allowed),
+					// otherwise output "Got one of the listed errors".
 					codes := strings.Split(ctx.expectedError, ",")
 					includesZero := false
 					for _, c := range codes {
@@ -2798,6 +2797,7 @@ func (ctx *execContext) executeQuery(stmt string) error {
 						ctx.output.WriteString("Got one of the listed errors\n")
 					}
 				} else {
+					// Single error code (possibly with trailing comma): output full error.
 					ctx.output.WriteString(formatMySQLError(err) + "\n")
 				}
 			}
@@ -3242,7 +3242,7 @@ func (ctx *execContext) executeQueryOrExec(stmt string) error {
 	if err != nil {
 		if ctx.expectedError != "" {
 			if ctx.resultLogEnabled {
-				if strings.Contains(ctx.expectedError, ",") {
+				if countNonEmptyErrorCodes(ctx.expectedError) > 1 {
 					codes := strings.Split(ctx.expectedError, ",")
 					includesZero := false
 					for _, c := range codes {
@@ -3544,7 +3544,7 @@ func (ctx *execContext) executeExecWithExpectedError(stmt string) error {
 			ctx.variables["$mysql_errname"] = strconv.Itoa(errCode)
 		}
 		if ctx.resultLogEnabled {
-			if strings.Contains(expectedCode, ",") {
+			if countNonEmptyErrorCodes(expectedCode) > 1 {
 				codes := strings.Split(expectedCode, ",")
 				includesZero := false
 				for _, c := range codes {
@@ -6232,6 +6232,19 @@ func normalizeDeprecationWarnings(s string) string {
 // 2. Lowercases charset/collation names in "Unknown character set/collation" errors
 var charsetErrRe = regexp.MustCompile(`(Unknown character set: ')([^']+)(')`)
 var collationErrRe = regexp.MustCompile(`(Unknown collation: ')([^']+)(')`)
+
+// countNonEmptyErrorCodes counts the number of non-empty error codes in a comma-separated
+// error code string (e.g. "ER_A,ER_B" → 2, "ER_A," → 1). Trailing commas from MySQL test
+// files are treated as single-code directives.
+func countNonEmptyErrorCodes(errCodes string) int {
+	n := 0
+	for _, c := range strings.Split(errCodes, ",") {
+		if strings.TrimSpace(c) != "" {
+			n++
+		}
+	}
+	return n
+}
 
 func normalizeCharsetErrors(s string) string {
 	s = charsetErrRe.ReplaceAllStringFunc(s, func(m string) string {

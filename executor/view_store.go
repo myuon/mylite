@@ -20,6 +20,11 @@ type ViewStore struct {
 	createSQL map[string]string
 	// security maps "db.viewname" -> "definer" or "invoker" (SQL SECURITY clause).
 	security map[string]string
+	// columnList maps "db.viewname" -> ordered list of view column alias names
+	// (from the CREATE VIEW v (...) column list). Empty list means no explicit column list.
+	columnList map[string][]string
+	// algorithm maps "db.viewname" -> view algorithm ("temptable", "merge", "undefined", or "").
+	algorithm map[string]string
 }
 
 // NewViewStore creates a new empty ViewStore.
@@ -30,6 +35,8 @@ func NewViewStore() *ViewStore {
 		checkOptions: make(map[string]string),
 		createSQL:    make(map[string]string),
 		security:     make(map[string]string),
+		columnList:   make(map[string][]string),
+		algorithm:    make(map[string]string),
 	}
 }
 
@@ -55,6 +62,67 @@ func (vs *ViewStore) Set(db, name, selectSQL, displaySQL, checkOption, createSQL
 	}
 }
 
+// SetColumnList stores the ordered list of view column alias names for a view.
+// This is the column list from CREATE VIEW v (col1, col2, ...) AS SELECT ...
+func (vs *ViewStore) SetColumnList(db, name string, cols []string) {
+	key := viewKey(db, name)
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	vs.columnList[key] = cols
+}
+
+// SetAlgorithm stores the view algorithm (e.g. "temptable", "merge", "undefined").
+func (vs *ViewStore) SetAlgorithm(db, name, algo string) {
+	key := viewKey(db, name)
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	vs.algorithm[key] = strings.ToLower(algo)
+}
+
+// LookupAlgorithm returns the view algorithm (lowercased), or "" if not set.
+func (vs *ViewStore) LookupAlgorithm(db, name string) string {
+	key := viewKey(db, name)
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+	if algo, ok := vs.algorithm[key]; ok {
+		return algo
+	}
+	// Try case-insensitive name match
+	prefix := db + "."
+	for k, algo := range vs.algorithm {
+		if len(k) > len(prefix) && k[:len(prefix)] == prefix {
+			if equalFoldASCII(k[len(prefix):], name) {
+				return algo
+			}
+		} else if db == "" && equalFoldASCII(k, name) {
+			return algo
+		}
+	}
+	return ""
+}
+
+// LookupColumnList returns the column alias list for a view, or nil if not set.
+func (vs *ViewStore) LookupColumnList(db, name string) []string {
+	key := viewKey(db, name)
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+	if cols, ok := vs.columnList[key]; ok {
+		return cols
+	}
+	// Try case-insensitive name match
+	prefix := db + "."
+	for k, cols := range vs.columnList {
+		if len(k) > len(prefix) && k[:len(prefix)] == prefix {
+			if equalFoldASCII(k[len(prefix):], name) {
+				return cols
+			}
+		} else if db == "" && equalFoldASCII(k, name) {
+			return cols
+		}
+	}
+	return nil
+}
+
 // IsInvokerSecurity returns true if the view uses SQL SECURITY INVOKER.
 func (vs *ViewStore) IsInvokerSecurity(db, name string) bool {
 	key := viewKey(db, name)
@@ -72,6 +140,8 @@ func (vs *ViewStore) Delete(db, name string) {
 	delete(vs.displaySQL, key)
 	delete(vs.checkOptions, key)
 	delete(vs.createSQL, key)
+	delete(vs.columnList, key)
+	delete(vs.algorithm, key)
 }
 
 // Lookup looks up a view by db+name (case-insensitive for the name part).
@@ -151,6 +221,14 @@ func (vs *ViewStore) Rename(db, oldName, newName string) bool {
 	if v, ok2 := vs.security[oldKey]; ok2 {
 		vs.security[newKey] = v
 		delete(vs.security, oldKey)
+	}
+	if v, ok2 := vs.columnList[oldKey]; ok2 {
+		vs.columnList[newKey] = v
+		delete(vs.columnList, oldKey)
+	}
+	if v, ok2 := vs.algorithm[oldKey]; ok2 {
+		vs.algorithm[newKey] = v
+		delete(vs.algorithm, oldKey)
 	}
 	return true
 }
