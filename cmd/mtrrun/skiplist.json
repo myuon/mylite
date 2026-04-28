@@ -3429,14 +3429,6 @@
       "reason": "complex failures"
     },
     {
-      "test": "parts/partition_list_error",
-      "reason": "partition failures"
-    },
-    {
-      "test": "parts/partition_value_error",
-      "reason": "partition failures"
-    },
-    {
       "test": "parts/partition_syntax_innodb",
       "reason": "partition failures"
     },
