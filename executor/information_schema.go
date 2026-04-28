@@ -5627,13 +5627,17 @@ func (e *Executor) infoSchemaViews() []storage.Row {
 					checkOpt = co
 				}
 			}
+			isUpdatableStr := "NO"
+			if e.isViewUpdatable(vName) {
+				isUpdatableStr = "YES"
+			}
 			rows = append(rows, storage.Row{
 				"TABLE_CATALOG":        "def",
 				"TABLE_SCHEMA":         e.CurrentDB,
 				"TABLE_NAME":           vName,
 				"VIEW_DEFINITION":      e.viewDefinitionForDisplay(vName),
 				"CHECK_OPTION":         checkOpt,
-				"IS_UPDATABLE":         "YES",
+				"IS_UPDATABLE":         isUpdatableStr,
 				"DEFINER":              "root@localhost",
 				"SECURITY_TYPE":        secType,
 				"CHARACTER_SET_CLIENT": "utf8mb4",
@@ -5680,13 +5684,17 @@ func (e *Executor) infoSchemaViews() []storage.Row {
 			if co == "CASCADED" || co == "LOCAL" {
 				checkOpt = co
 			}
+			isUpdatableStr2 := "NO"
+			if e.isViewUpdatable(ve.name) {
+				isUpdatableStr2 = "YES"
+			}
 			rows = append(rows, storage.Row{
 				"TABLE_CATALOG":        "def",
 				"TABLE_SCHEMA":         ve.db,
 				"TABLE_NAME":           ve.name,
 				"VIEW_DEFINITION":      ve.displaySQL,
 				"CHECK_OPTION":         checkOpt,
-				"IS_UPDATABLE":         "YES",
+				"IS_UPDATABLE":         isUpdatableStr2,
 				"DEFINER":              "root@localhost",
 				"SECURITY_TYPE":        ve.secType,
 				"CHARACTER_SET_CLIENT": "utf8mb4",

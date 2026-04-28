@@ -162,11 +162,32 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 	// Resolve views: if tableName is a view, replace with the underlying base table.
 	// Also collect the view's WHERE condition to merge with the UPDATE's WHERE.
 	var viewWhereExpr sqlparser.Expr
+	var viewColMap map[string]viewColumnMapping // non-nil when updating through a view
+	originalTableName := tableName
 	if baseTable, isView, viewWhere, err := e.resolveViewToBaseTable(tableName); err != nil {
 		return nil, err
 	} else if isView {
+		// Build view column mapping before overwriting tableName
+		viewColMap = e.getViewExprMapping(originalTableName)
 		tableName = baseTable
 		viewWhereExpr = viewWhere
+	}
+	// If updating through a view, validate that SET targets are updatable columns (direct col refs).
+	if viewColMap != nil {
+		for _, upd := range stmt.Exprs {
+			if _, isDefault := upd.Expr.(*sqlparser.Default); isDefault {
+				continue
+			}
+			colName := strings.ToLower(upd.Name.Name.String())
+			if m, found := viewColMap[colName]; found {
+				// View column exists in the mapping - check if it's a direct column reference
+				if m.baseColName == "" {
+					// Computed expression - not updatable
+					return nil, mysqlError(1348, "HY000",
+						fmt.Sprintf("Column '%s' is not updatable", upd.Name.Name.String()))
+				}
+			}
+		}
 	}
 	// Merge view's WHERE condition into the UPDATE's WHERE clause.
 	// If the view has a WHERE clause, AND it with the UPDATE's WHERE clause.
@@ -421,6 +442,31 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		newRow := make(storage.Row, len(row))
 		for k, v := range row {
 			newRow[k] = v
+		}
+		// When updating through a view, populate view alias values so that RHS expressions
+		// like "a = a + e" can resolve view alias "e" to its underlying expression value.
+		if viewColMap != nil {
+			for alias, m := range viewColMap {
+				if m.expr != nil {
+					// Computed expression - evaluate it against the base row
+					if v, err2 := e.evalRowExpr(m.expr, newRow); err2 == nil {
+						newRow[alias] = v
+					}
+				} else if m.baseColName != "" {
+					// Direct column reference - map alias to base col value
+					if v, ok := newRow[m.baseColName]; ok {
+						newRow[alias] = v
+					} else {
+						// Try case-insensitive lookup
+						for k, v2 := range newRow {
+							if strings.EqualFold(k, m.baseColName) {
+								newRow[alias] = v2
+								break
+							}
+						}
+					}
+				}
+			}
 		}
 		for _, upd := range stmt.Exprs {
 			colName := upd.Name.Name.String()

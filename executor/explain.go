@@ -1097,7 +1097,7 @@ func (e *Executor) queryCanBeSemijoinFlattened(sel *sqlparser.Select) bool {
 	}
 	numDerivedOuter := 0
 	for _, te := range sel.From {
-		numDerivedOuter += countDerivedTablesInExpr(te)
+		numDerivedOuter += e.countDerivedTablesInExpr(te)
 	}
 	hasRealTable := numDerivedOuter > 0 // derived tables also count as "real" outer tables
 	for _, tn := range outerTables {
@@ -1372,7 +1372,7 @@ func (e *Executor) queryHasPartialSemijoin(sel *sqlparser.Select) bool {
 	}
 	numDerivedOuter := 0
 	for _, te := range sel.From {
-		numDerivedOuter += countDerivedTablesInExpr(te)
+		numDerivedOuter += e.countDerivedTablesInExpr(te)
 	}
 	hasRealTable := numDerivedOuter > 0
 	for _, tn := range outerTables {
@@ -1513,6 +1513,7 @@ func (e *Executor) tableExprHasStraightJoin(te sqlparser.TableExpr) bool {
 }
 
 // extractAllTableNames collects all real table names from a table expression tree.
+// Non-merge views (which will be shown as derived tables in EXPLAIN) are excluded.
 func (e *Executor) extractAllTableNames(te sqlparser.TableExpr) []string {
 	switch t := te.(type) {
 	case *sqlparser.AliasedTableExpr:
@@ -1520,7 +1521,12 @@ func (e *Executor) extractAllTableNames(te sqlparser.TableExpr) []string {
 			return nil
 		}
 		if tn, ok := t.Expr.(sqlparser.TableName); ok {
-			return []string{tn.Name.String()}
+			name := tn.Name.String()
+			// Non-merge views are treated as derived tables in EXPLAIN output.
+			if e.isViewNonMerge(name) {
+				return nil
+			}
+			return []string{name}
 		}
 	case *sqlparser.JoinTableExpr:
 		left := e.extractAllTableNames(t.LeftExpr)
@@ -1536,20 +1542,44 @@ func (e *Executor) extractAllTableNames(te sqlparser.TableExpr) []string {
 	return nil
 }
 
+// tableExprHasNonMergeView returns true if any table in the expression is a non-merge view.
+func (e *Executor) tableExprHasNonMergeView(te sqlparser.TableExpr) bool {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if tn, ok := t.Expr.(sqlparser.TableName); ok {
+			return e.isViewNonMerge(tn.Name.String())
+		}
+	case *sqlparser.JoinTableExpr:
+		return e.tableExprHasNonMergeView(t.LeftExpr) || e.tableExprHasNonMergeView(t.RightExpr)
+	case *sqlparser.ParenTableExpr:
+		for _, expr := range t.Exprs {
+			if e.tableExprHasNonMergeView(expr) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // countDerivedTablesInExpr counts how many direct derived tables (subqueries in FROM) exist
-// in a table expression.
-func countDerivedTablesInExpr(te sqlparser.TableExpr) int {
+// in a table expression. Non-merge views are also counted as derived tables.
+func (e *Executor) countDerivedTablesInExpr(te sqlparser.TableExpr) int {
 	switch t := te.(type) {
 	case *sqlparser.AliasedTableExpr:
 		if _, ok := t.Expr.(*sqlparser.DerivedTable); ok {
 			return 1
 		}
+		if tn, ok := t.Expr.(sqlparser.TableName); ok {
+			if e.isViewNonMerge(tn.Name.String()) {
+				return 1
+			}
+		}
 	case *sqlparser.JoinTableExpr:
-		return countDerivedTablesInExpr(t.LeftExpr) + countDerivedTablesInExpr(t.RightExpr)
+		return e.countDerivedTablesInExpr(t.LeftExpr) + e.countDerivedTablesInExpr(t.RightExpr)
 	case *sqlparser.ParenTableExpr:
 		n := 0
 		for _, expr := range t.Exprs {
-			n += countDerivedTablesInExpr(expr)
+			n += e.countDerivedTablesInExpr(expr)
 		}
 		return n
 	}
@@ -1571,10 +1601,10 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 		}
 	}
 
-	// Count direct derived tables in FROM clause
+	// Count direct derived tables in FROM clause (including non-merge views)
 	numDerived := 0
 	for _, te := range sel.From {
-		numDerived += countDerivedTablesInExpr(te)
+		numDerived += e.countDerivedTablesInExpr(te)
 	}
 
 	// Check for GROUP BY / SQL_BIG_RESULT
@@ -1597,14 +1627,20 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 			accessType: nil,
 		})
 	} else if len(allTableNames) == 0 && numDerived > 0 {
-		// Only derived tables in FROM - add a row for each derived table reference.
+		// Only derived tables in FROM (either subquery-derived tables or non-merge views).
 		// Derived tables will get ids starting at *idCounter+1 (assigned in explainFromExpr).
+		// When the derived tables come from non-merge views (and the outer selectType is SIMPLE),
+		// MySQL shows "PRIMARY" in the outer row.
+		outerSelectType := selectType
+		if outerSelectType == "SIMPLE" {
+			outerSelectType = "PRIMARY"
+		}
 		nextID := *idCounter + 1
 		for i := 0; i < numDerived; i++ {
 			derivedRef := fmt.Sprintf("<derived%d>", nextID)
 			result = append(result, explainSelectType{
 				id:           myID,
-				selectType:   selectType,
+				selectType:   outerSelectType,
 				table:        derivedRef,
 				extra:        nil,
 				rows:         int64(1),
@@ -1921,7 +1957,7 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 	return result
 }
 
-// explainFromExpr processes table expressions to find derived tables.
+// explainFromExpr processes table expressions to find derived tables and non-merge views.
 func (e *Executor) explainFromExpr(te sqlparser.TableExpr, idCounter *int64, result *[]explainSelectType) {
 	switch t := te.(type) {
 	case *sqlparser.AliasedTableExpr:
@@ -1944,6 +1980,32 @@ func (e *Executor) explainFromExpr(te sqlparser.TableExpr, idCounter *int64, res
 					innerRows[0].id = myID
 				}
 				*result = append(*result, innerRows...)
+			}
+		} else if tn, ok := t.Expr.(sqlparser.TableName); ok {
+			// Check if this is a non-merge view (should appear as DERIVED in EXPLAIN)
+			viewName := tn.Name.String()
+			if e.isViewNonMerge(viewName) {
+				if viewSQL, _, found := e.lookupView(viewName); found {
+					*idCounter++
+					myID := *idCounter
+					if innerStmt, err := e.parser().Parse(viewSQL); err == nil {
+						switch inner := innerStmt.(type) {
+						case *sqlparser.Select:
+							innerRows := e.explainSelect(inner, idCounter, "DERIVED")
+							if len(innerRows) > 0 {
+								innerRows[0].id = myID
+							}
+							*result = append(*result, innerRows...)
+						case *sqlparser.Union:
+							derived := e.explainUnion(inner, idCounter, false)
+							if len(derived) > 0 {
+								derived[0].selectType = "DERIVED"
+								derived[0].id = myID
+							}
+							*result = append(*result, derived...)
+						}
+					}
+				}
 			}
 		}
 	case *sqlparser.JoinTableExpr:
@@ -2442,7 +2504,7 @@ func (e *Executor) outerQueryHasOnlyDerivedTables(sel *sqlparser.Select) bool {
 	numDerived := 0
 	numBase := 0
 	for _, te := range sel.From {
-		numDerived += countDerivedTablesInExpr(te)
+		numDerived += e.countDerivedTablesInExpr(te)
 		baseNames := e.extractAllTableNames(te)
 		for _, name := range baseNames {
 			if !strings.EqualFold(name, "dual") {
@@ -8783,6 +8845,13 @@ func (e *Executor) tryPlanBasedExplainTraditional(sel *sqlparser.Select) ([][]in
 	// Fall back for queries with complex parts (subqueries / derived tables).
 	if e.queryHasComplexParts(sel) {
 		return nil, false
+	}
+	// Fall back when any FROM table is a non-merge view (requires PRIMARY+DERIVED rows in EXPLAIN).
+	// The explainMultiRows/explainSelect path handles this correctly.
+	for _, te := range sel.From {
+		if e.tableExprHasNonMergeView(te) {
+			return nil, false
+		}
 	}
 
 	// Check for "Impossible WHERE" due to constant out-of-range for multi-table joins.
