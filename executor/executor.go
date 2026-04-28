@@ -524,6 +524,14 @@ type Executor struct {
 	psThreadInstrumented map[int64]string
 	// psThreadHistory tracks per-connection HISTORY column for threads table.
 	psThreadHistory map[int64]string
+	// psSetupInstrumentsOverride holds per-instrument column overrides for setup_instruments.
+	// Key is lowercase instrument name; value maps lowercase column name to new value.
+	// nil means no overrides have been applied.
+	psSetupInstrumentsOverride map[string]map[string]string
+	// psSetupThreadsOverride holds per-thread-type column overrides for setup_threads.
+	// Key is lowercase thread name; value maps lowercase column name to new value.
+	// nil means no overrides have been applied.
+	psSetupThreadsOverride map[string]map[string]string
 	// processList is a shared registry of active connections and their states.
 	// It is shared across all executor instances (connections).
 	processList *ProcessList
