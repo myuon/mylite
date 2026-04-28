@@ -916,22 +916,10 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 
 	// SHOW WARNINGS
 	if strings.HasPrefix(upper, "SHOW WARNINGS") || strings.HasPrefix(upper, "SHOW COUNT(*) WARNINGS") {
-		// MySQL returns warnings in severity order: Errors first, Warnings second, Notes last.
+		// MySQL returns warnings in insertion order (the order they were added).
 		rows := make([][]interface{}, 0, len(e.warnings))
 		for _, w := range e.warnings {
-			if strings.EqualFold(w.Level, "Error") {
-				rows = append(rows, []interface{}{w.Level, int64(w.Code), w.Message})
-			}
-		}
-		for _, w := range e.warnings {
-			if strings.EqualFold(w.Level, "Warning") {
-				rows = append(rows, []interface{}{w.Level, int64(w.Code), w.Message})
-			}
-		}
-		for _, w := range e.warnings {
-			if strings.EqualFold(w.Level, "Note") {
-				rows = append(rows, []interface{}{w.Level, int64(w.Code), w.Message})
-			}
+			rows = append(rows, []interface{}{w.Level, int64(w.Code), w.Message})
 		}
 		return &Result{
 			Columns:     []string{"Level", "Code", "Message"},

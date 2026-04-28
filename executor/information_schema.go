@@ -4453,11 +4453,29 @@ func (e *Executor) execPerfSchemaInsert(stmt *sqlparser.Insert, tableName string
 					newRow["HISTORY"] = strings.ToUpper(history)
 				}
 			} else {
+				// Validate OBJECT_TYPE
 				if objType, ok := newRow["OBJECT_TYPE"].(string); ok {
 					if !validSetupObjectTypes[strings.ToUpper(objType)] {
+						e.addWarning("Warning", 1265, "Data truncated for column 'OBJECT_TYPE' at row 1")
 						return nil, mysqlError(1452, "23000", "Cannot add or update a child row: a foreign key constraint fails ()")
 					}
 					newRow["OBJECT_TYPE"] = strings.ToUpper(objType)
+				}
+				// Validate ENABLED
+				if enabled, ok := newRow["ENABLED"].(string); ok {
+					if !isPerfSchemaEnumValid(enabled) {
+						e.addWarning("Warning", 1265, "Data truncated for column 'ENABLED' at row 1")
+						return nil, mysqlError(1452, "23000", "Cannot add or update a child row: a foreign key constraint fails ()")
+					}
+					newRow["ENABLED"] = strings.ToUpper(enabled)
+				}
+				// Validate TIMED
+				if timed, ok := newRow["TIMED"].(string); ok {
+					if !isPerfSchemaEnumValid(timed) {
+						e.addWarning("Warning", 1265, "Data truncated for column 'TIMED' at row 1")
+						return nil, mysqlError(1452, "23000", "Cannot add or update a child row: a foreign key constraint fails ()")
+					}
+					newRow["TIMED"] = strings.ToUpper(timed)
 				}
 			}
 
@@ -4600,9 +4618,26 @@ func (e *Executor) execPerfSchemaInsert(stmt *sqlparser.Insert, tableName string
 			// Validate OBJECT_TYPE
 			if objType, ok := newRow["OBJECT_TYPE"].(string); ok {
 				if !validSetupObjectTypes[strings.ToUpper(objType)] {
+					e.addWarning("Warning", 1265, "Data truncated for column 'OBJECT_TYPE' at row 1")
 					return nil, mysqlError(1452, "23000", "Cannot add or update a child row: a foreign key constraint fails ()")
 				}
 				newRow["OBJECT_TYPE"] = strings.ToUpper(objType)
+			}
+			// Validate ENABLED
+			if enabled, ok := newRow["ENABLED"].(string); ok {
+				if !isPerfSchemaEnumValid(enabled) {
+					e.addWarning("Warning", 1265, "Data truncated for column 'ENABLED' at row 1")
+					return nil, mysqlError(1452, "23000", "Cannot add or update a child row: a foreign key constraint fails ()")
+				}
+				newRow["ENABLED"] = strings.ToUpper(enabled)
+			}
+			// Validate TIMED
+			if timed, ok := newRow["TIMED"].(string); ok {
+				if !isPerfSchemaEnumValid(timed) {
+					e.addWarning("Warning", 1265, "Data truncated for column 'TIMED' at row 1")
+					return nil, mysqlError(1452, "23000", "Cannot add or update a child row: a foreign key constraint fails ()")
+				}
+				newRow["TIMED"] = strings.ToUpper(timed)
 			}
 		}
 
@@ -4725,6 +4760,11 @@ func (e *Executor) execPerfSchemaUpdate(stmt *sqlparser.Update, tableName string
 		}
 		strVal := fmt.Sprintf("%v", val)
 		if !isPerfSchemaEnumValid(strVal) {
+			// setup_objects uses foreign-key-style error (1452) with a preceding warning (1265)
+			if tableName == "setup_objects" {
+				e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", colName))
+				return nil, mysqlError(1452, "23000", "Cannot add or update a child row: a foreign key constraint fails ()")
+			}
 			return nil, mysqlError(1265, "01000", fmt.Sprintf("Data truncated for column '%s' at row 1", colName))
 		}
 	}

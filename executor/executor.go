@@ -428,6 +428,9 @@ type Executor struct {
 	queryTableDef *catalog.TableDef
 	// warnings stores the warnings from the last executed statement.
 	warnings []Warning
+	// postErrorWarnings stores warnings to be appended AFTER the main error is added
+	// to the warnings list by the Execute() defer. Use addPostErrorWarning() to stage them.
+	postErrorWarnings []Warning
 	// lastWarningCount / lastErrorCount hold the warning/error counts from the
 	// previous statement so that SELECT @@warning_count / @@error_count return
 	// the correct value (the counts are snapshotted before warnings are cleared).
@@ -694,6 +697,13 @@ func (e *Executor) addWarning(level string, code int, message string) {
 		return
 	}
 	e.warnings = append(e.warnings, Warning{Level: level, Code: code, Message: message})
+}
+
+// addPostErrorWarning stages a warning to be appended AFTER the main error is added
+// to the warnings list by the Execute() defer. This ensures correct ordering when
+// MySQL adds a warning after the error event (e.g., cleanup warnings).
+func (e *Executor) addPostErrorWarning(level string, code int, message string) {
+	e.postErrorWarnings = append(e.postErrorWarnings, Warning{Level: level, Code: code, Message: message})
 }
 
 // sqlNotesEnabled returns true if the sql_notes session variable is ON (default).
@@ -1843,6 +1853,11 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 					}
 				}
 				e.addWarning("Error", code, msg)
+				// Append any post-error warnings (staged via addPostErrorWarning).
+				for _, pw := range e.postErrorWarnings {
+					e.warnings = append(e.warnings, pw)
+				}
+				e.postErrorWarnings = nil
 			}
 			// Update ROW_COUNT() tracking (MySQL semantics):
 			// - After SELECT: -1
