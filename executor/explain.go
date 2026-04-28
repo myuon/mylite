@@ -90,12 +90,16 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 		// Check if this SELECT has subqueries, derived tables, etc.
 		if e.queryHasComplexParts(s) {
 			canFlatten := e.queryCanBeSemijoinFlattened(s)
-			if canFlatten && e.outerQueryHasOnlyDerivedTables(s) && e.isOptimizerSwitchEnabled("firstmatch") {
-				// FirstMatch semijoin strategy: when the outer FROM has only derived tables
-				// and firstmatch=on, MySQL uses PRIMARY selectType with inline FirstMatch()
-				// rather than the MATERIALIZED/SIMPLE pattern.
+			derivedMergeOff := !e.isOptimizerSwitchEnabled("derived_merge")
+			if canFlatten && e.outerQueryHasOnlyDerivedTables(s) && e.isOptimizerSwitchEnabled("firstmatch") && derivedMergeOff {
+				// FirstMatch semijoin strategy: when the outer FROM has only derived tables,
+				// derived_merge=off, and firstmatch=on, MySQL keeps the derived table as
+				// a DERIVED row with PRIMARY selectType and uses FirstMatch() in Extra.
 				// e.g. SELECT * FROM (SELECT * FROM t1) AS d1 WHERE d1.c1 IN (SELECT c1 FROM t2)
-				// → id=1 PRIMARY <derived2>, id=1 PRIMARY t2 (FirstMatch(<derived2>)), id=2 DERIVED t1
+				//   with derived_merge=off:
+				//   → id=1 PRIMARY <derived2>, id=1 PRIMARY t2 (FirstMatch(<derived2>)), id=2 DERIVED t1
+				// When derived_merge=on (default), MySQL merges the derived table and uses
+				// SIMPLE+MATERIALIZED instead (handled by the canFlatten branch below).
 				result = e.explainSelect(s, &idCounter, "PRIMARY")
 				// Find the DERIVED row id for the FirstMatch() reference string.
 				var derivedFirstMatchID int64
@@ -284,9 +288,17 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 													for _, idx := range tbl.Def.Indexes {
 														if len(idx.Columns) > 0 && strings.EqualFold(idx.Columns[0], outerJoinColForRef) {
 															// Change range → ref with <subquery>.col as ref
+															// Change range to ref with <subquery>.col as ref.
+															// Also clear "Using index condition" if present: when the ref is
+															// via a materialized subquery, range conditions are applied at the
+															// <subqueryN> placeholder level, not as ICP on this table.
 															simpleRows[i].accessType = "ref"
 															simpleRows[i].ref = subqueryRef + "." + outerJoinColForRef
-															break
+															if simpleRows[i].extra != nil {
+																if extraStr := fmt.Sprintf("%v", simpleRows[i].extra); extraStr == "Using index condition" {
+																	simpleRows[i].extra = nil
+																}
+															}
 														}
 													}
 												}
@@ -1052,6 +1064,30 @@ func (e *Executor) queryHasComplexParts(sel *sqlparser.Select) bool {
 	return hasComplex
 }
 
+// whereHasSingleSubquery returns true if the WHERE clause of sel contains exactly ONE
+// top-level IN/EXISTS subquery (possibly nested under AND). This is used to determine
+// whether MySQL would show "no matching row in const table" when the outer table is empty:
+// MySQL collapses to 1 row when there is exactly one semijoin subquery in WHERE but keeps
+// the full EXPLAIN plan when there are two or more semijoin subqueries (which create a more
+// complex multi-semijoin optimization path where MySQL does not perform this shortcut).
+func (e *Executor) whereHasSingleSubquery(sel *sqlparser.Select) bool {
+	if sel.Where == nil {
+		return false
+	}
+	count := 0
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		switch node.(type) {
+		case *sqlparser.Subquery:
+			count++
+			if count > 1 {
+				return false, nil
+			}
+		}
+		return true, nil
+	}, sel.Where)
+	return count == 1
+}
+
 // queryCanBeSemijoinFlattened returns true if the SELECT's WHERE-clause subqueries
 // can all be flattened into a single SIMPLE query block (MySQL anti-join / semi-join
 // optimization). The rules:
@@ -1741,11 +1777,13 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 			// "no matching row in const table": MySQL shows this for single-table SELECT queries
 			// where the table is empty, regardless of access type (ALL, const, system, etc.).
 			// This applies for SIMPLE top-level queries with no complex parts (no subqueries),
-			// or for const/system access types in any context.
-			// For queries with subqueries, the behavior is different (e.g. "Impossible WHERE
-			// noticed after reading const tables"), so only apply the ALL case for truly simple queries.
+			// or for SIMPLE queries with exactly ONE WHERE subquery (Bug#46692: MySQL collapses
+			// to "no matching row in const table" when the outer table is empty, regardless of
+			// inner table states, but only when there is exactly one semijoin subquery).
+			// When there are TWO OR MORE subqueries in WHERE (multi-semijoin), MySQL uses the
+			// full EXPLAIN plan even when the outer table is empty (InnoDB Bug#42742 behavior).
 			// Exception: MATERIALIZED subqueries always show the real table name with 0 rows.
-			isSimpleTopLevel := selectType == "SIMPLE" && !e.queryHasComplexParts(sel)
+			isSimpleTopLevel := selectType == "SIMPLE" && (!e.queryHasComplexParts(sel) || e.whereHasSingleSubquery(sel))
 			if tableIsEmpty && len(allTableNames) == 1 && idx == 0 && selectType != "MATERIALIZED" &&
 				(isSimpleTopLevel || accessInfo.accessType == "const" || accessInfo.accessType == "system") {
 				result = append(result, explainSelectType{
@@ -1812,8 +1850,11 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 				}
 			}
 			// For secondary tables in a cross-join that do not qualify for
-			// "Range checked for each record", MySQL shows "Using join buffer".
-			if idx > 0 && !rangeCheckedForEachRecord {
+			// "Range checked for each record" and have no usable index (ALL scan),
+			// MySQL shows "Using join buffer (Block Nested Loop)".
+			// For tables with index access (ref, eq_ref, range), BNL doesn't apply
+			// because the index provides direct row lookup without buffering.
+			if idx > 0 && !rangeCheckedForEachRecord && accessInfo.accessType == "ALL" {
 				extra = "Using join buffer (Block Nested Loop)"
 			}
 
@@ -1870,12 +1911,25 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 				filtered = fmt.Sprintf("%.2f", 100.0/float64(rowCount))
 			}
 
-			// Set "Using index condition" for ref access with IS NULL or range conditions on indexed columns
-			if extra == nil && (accessInfo.accessType == "ref" || accessInfo.accessType == "range") {
+			// Set "Using index condition" for ref access with IS NULL or range conditions on indexed columns.
+			// ICP (Index Condition Pushdown) applies when the WHERE has a range or IS NULL condition
+			// on an indexed column that can be evaluated during the index scan.
+			//
+			// Exception: when the ref key comes from a materialized subquery placeholder (<subqueryN>),
+			// any range conditions on the ref column are applied at the subquery placeholder level
+			// (shown as "Using where" on the <subqueryN> entry), not as ICP on this table.
+			// So ICP should not be applied for ref-via-subquery access.
+			refViaSubquery := false
+			if accessInfo.ref != nil {
+				if refStr, ok := accessInfo.ref.(string); ok && strings.Contains(refStr, "<subquery") {
+					refViaSubquery = true
+				}
+			}
+			if extra == nil && !refViaSubquery && (accessInfo.accessType == "ref" || accessInfo.accessType == "range") {
 				if sel.Where != nil {
 					wcs := explainExtractWhereConditions(sel.Where.Expr, tblName)
 					for _, wc := range wcs {
-						if wc.isNull {
+						if wc.isNull || wc.isRange {
 							extra = "Using index condition"
 							break
 						}
@@ -2751,6 +2805,39 @@ func extractINColFromNode(node sqlparser.SQLNode, sub *sqlparser.Subquery) strin
 	return result
 }
 
+// inSubqueryIsInTupleContext returns true if the given subquery `sub` is the right-hand side
+// of a tuple IN expression (e.g., `(a,b,c) IN (SELECT ...)`). In this case, MySQL uses
+// DuplicateWeedout strategy instead of MATERIALIZED.
+func inSubqueryIsInTupleContext(node sqlparser.SQLNode, sub *sqlparser.Subquery) bool {
+	if node == nil || sub == nil {
+		return false
+	}
+	found := false
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if cmp, ok := n.(*sqlparser.ComparisonExpr); ok {
+			if cmp.Operator == sqlparser.InOp {
+				if rSub, ok := cmp.Right.(*sqlparser.Subquery); ok {
+					if rSub == sub {
+						// Check if left side is a tuple (ValTuple) rather than a single column.
+						// ValTuple is a slice type (not a pointer), so use value assertion.
+						if _, ok := cmp.Left.(sqlparser.ValTuple); ok {
+							found = true
+							return false, nil
+						}
+					}
+				}
+			}
+		}
+		// Don't descend into Subquery nodes: if we see a Subquery that's NOT our sub,
+		// we still want to continue. But if we descend, we might find a different ComparisonExpr
+		// inside the subquery that matches (false positive). We DON'T want to descend into
+		// the target subquery's content (only check the outer comparison).
+		// We CAN descend into non-subquery nodes.
+		return true, nil
+	}, node)
+	return found
+}
+
 func extractINColFromExpr(expr sqlparser.Expr) string {
 	if expr == nil {
 		return ""
@@ -2776,7 +2863,9 @@ func extractINColFromExpr(expr sqlparser.Expr) string {
 // MySQL only uses materialization when the outer column and inner column have
 // compatible type classes (same class). Cross-class comparisons (e.g., INT vs DATE,
 // INT vs CHAR) fall back to DuplicateWeedout/non-materialized strategies.
-// Classes: "numeric", "string", "temporal", "other"
+// BLOB/TEXT types return "blob" — these cannot be indexed, so materialization temp tables
+// cannot do hash lookups on them, and MySQL refuses to materialize for BLOB/TEXT columns.
+// Classes: "numeric", "string", "temporal", "blob", "other"
 func matTypeClass(colType string) string {
 	upper := strings.ToUpper(strings.TrimSpace(colType))
 	// Strip type parameters e.g. VARCHAR(255) → VARCHAR
@@ -2788,10 +2877,12 @@ func matTypeClass(colType string) string {
 		"FLOAT", "DOUBLE", "REAL", "DECIMAL", "NUMERIC",
 		"UNSIGNED", "BIT":
 		return "numeric"
-	case "CHAR", "VARCHAR", "TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT",
-		"BINARY", "VARBINARY", "TINYBLOB", "BLOB", "MEDIUMBLOB", "LONGBLOB",
-		"ENUM", "SET":
+	case "CHAR", "VARCHAR", "BINARY", "VARBINARY", "ENUM", "SET":
 		return "string"
+	case "TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT",
+		"TINYBLOB", "BLOB", "MEDIUMBLOB", "LONGBLOB":
+		// BLOBs/TEXTs cannot be indexed → materialization is not possible
+		return "blob"
 	case "DATE", "DATETIME", "TIMESTAMP", "TIME", "YEAR":
 		return "temporal"
 	}
@@ -2841,13 +2932,18 @@ func hasNonINRangeConditionOnCol(expr sqlparser.Expr, colName string) bool {
 // inSubqueryTypesCompatibleForMat returns true if the outer join column type
 // and inner select column type are compatible for materialization (same type class).
 // When types are incompatible (e.g., INT vs DATE), MySQL falls back to DuplicateWeedout.
+// Also returns false when BLOB/TEXT columns are involved, since materialization requires
+// indexing the temp table and BLOBs/TEXTs cannot be indexed.
 func (e *Executor) inSubqueryTypesCompatibleForMat(outerSel *sqlparser.Select, inner *sqlparser.Select, subNode *sqlparser.Subquery) bool {
 	if e.Storage == nil || e.Catalog == nil {
 		return true // assume compatible if we can't check
 	}
 
-	// Find the outer join column name from the WHERE clause
+	// Find the outer join column(s) from the WHERE clause.
+	// For single-column IN: cmp.Left is a ColName.
+	// For tuple IN (e.g., "(a1,a2) IN (...)"): cmp.Left is a ValTuple.
 	var outerColName, outerTableName string
+	var outerColNames []string // for tuple IN
 	if outerSel != nil && outerSel.Where != nil {
 		_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
 			if cmp, ok := n.(*sqlparser.ComparisonExpr); ok {
@@ -2871,11 +2967,52 @@ func (e *Executor) inSubqueryTypesCompatibleForMat(outerSel *sqlparser.Select, i
 						}
 						return false, nil
 					}
+					// Tuple IN: extract all column names from the tuple
+					if tuple, ok := cmp.Left.(sqlparser.ValTuple); ok {
+						for _, expr := range tuple {
+							if col, ok := expr.(*sqlparser.ColName); ok {
+								outerColNames = append(outerColNames, strings.ToLower(col.Name.String()))
+							}
+						}
+						return false, nil
+					}
 				}
 			}
 			return true, nil
 		}, outerSel.Where.Expr)
 	}
+
+	// For tuple IN, check if any tuple column is BLOB/TEXT → not materializable
+	if len(outerColNames) > 0 {
+		db, err := e.Catalog.GetDatabase(e.CurrentDB)
+		if err != nil {
+			return true
+		}
+		for _, te := range outerSel.From {
+			var tblName string
+			if ate, ok := te.(*sqlparser.AliasedTableExpr); ok {
+				if tn, ok := ate.Expr.(sqlparser.TableName); ok {
+					tblName = strings.ToLower(tn.Name.String())
+				}
+			}
+			if tblName == "" {
+				continue
+			}
+			if tblDef, err := db.GetTable(tblName); err == nil && tblDef != nil {
+				for _, col := range tblDef.Columns {
+					for _, outerCol := range outerColNames {
+						if strings.EqualFold(col.Name, outerCol) {
+							if matTypeClass(col.Type) == "blob" {
+								return false // BLOB/TEXT cannot be materialized
+							}
+						}
+					}
+				}
+			}
+		}
+		return true // tuple columns are not BLOBs → compatible
+	}
+
 	if outerColName == "" {
 		return true // no column to check
 	}
@@ -2958,6 +3095,10 @@ func (e *Executor) inSubqueryTypesCompatibleForMat(outerSel *sqlparser.Select, i
 	// Check if type classes are the same
 	outerClass := matTypeClass(outerColType)
 	innerClass := matTypeClass(innerColType)
+	// BLOB/TEXT columns cannot be indexed → materialization is not possible
+	if outerClass == "blob" || innerClass == "blob" {
+		return false
+	}
 	return outerClass == innerClass || outerClass == "other" || innerClass == "other"
 }
 
@@ -3278,6 +3419,38 @@ func whereHasRangeOnCol(expr sqlparser.Expr, col string) bool {
 		return whereHasRangeOnCol(e.Left, col) || whereHasRangeOnCol(e.Right, col)
 	}
 	return false
+}
+
+// whereHasNonINConditions returns true if the WHERE expression contains any condition
+// other than an IN-subquery comparison. This is used to determine if the outer WHERE
+// has additional filter conditions (like range conditions) beyond just the IN expression.
+// E.g., "WHERE a IN (SELECT a FROM t2) AND (a > 5 OR a < 10)" → true (has extra conditions)
+// E.g., "WHERE a IN (SELECT a FROM t2)" → false (only the IN expression)
+func whereHasNonINConditions(expr sqlparser.Expr) bool {
+	switch e := expr.(type) {
+	case *sqlparser.ComparisonExpr:
+		// It's an IN subquery? → no non-IN conditions at this level.
+		if e.Operator == sqlparser.InOp {
+			if _, ok := e.Right.(*sqlparser.Subquery); ok {
+				return false
+			}
+		}
+		// Any other comparison (range, equality, etc.) → yes, has non-IN conditions.
+		return true
+	case *sqlparser.AndExpr:
+		return whereHasNonINConditions(e.Left) || whereHasNonINConditions(e.Right)
+	case *sqlparser.OrExpr:
+		// An OR is a non-IN condition (even if both branches reference the IN column).
+		return true
+	case *sqlparser.NotExpr:
+		return true
+	case *sqlparser.IsExpr:
+		return true
+	case *sqlparser.BetweenExpr:
+		return true
+	default:
+		return false
+	}
 }
 
 func hasConstPKEquality(expr sqlparser.Expr, pkCol string) bool {
@@ -4551,7 +4724,7 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 							// than FirstMatch when all inner tables are large.
 							// Exception: when SEMIJOIN hint forces LooseScan (and it's applicable) or FirstMatch, those take priority.
 							looseScanForcedAndApplicable := looseScanForced && !correlatedIN
-							if !outerIsSystem && e.allInnerTablesTwoOrMoreRows(inner) && !looseScanForcedAndApplicable && !firstMatchForced {
+							if !outerIsSystem && e.allInnerTablesTwoOrMoreRows(inner) && !looseScanForcedAndApplicable && !firstMatchForced && e.inSubqueryTypesCompatibleForMat(outerSel, inner, sub) {
 								selectType = "MATERIALIZED"
 							} else if outerHasOnlyDerivedTables && !outerINIsConst {
 								// Outer has only derived tables: MySQL cannot do efficient FirstMatch,
@@ -4605,28 +4778,233 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 										} else if e, ok := node.(sqlparser.Expr); ok {
 											outerExpr = e
 										}
-										if outerExpr != nil {
-											outerAlsoHasRange = whereHasRangeOnCol(outerExpr, outerJoinCol)
+										if outerExpr != nil && whereHasRangeOnCol(outerExpr, outerJoinCol) {
+											// Outer has a range on the join column. Only skip MATERIALIZED
+											// when the INNER subquery ALSO has a range on its projected column.
+											// E.g., "WHERE a IN (SELECT kp1 FROM t1 WHERE kp1<20) AND a<20"
+											// → both inner and outer restrict the range, so FirstMatch is cheaper.
+											// But "WHERE a IN (SELECT a FROM t2) AND (a > 5 OR a < 10)"
+											// → only outer has a range; inner has no WHERE condition, so use MATERIALIZED.
+											if inner.Where != nil && inner.SelectExprs != nil && len(inner.SelectExprs.Exprs) > 0 {
+												// Get the inner projected column name (first SELECT expr)
+												var innerCol string
+												if ae, ok := inner.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok {
+													if col, ok := ae.Expr.(*sqlparser.ColName); ok {
+														innerCol = col.Name.String()
+													}
+												}
+												if innerCol != "" && whereHasRangeOnCol(inner.Where.Expr, innerCol) {
+													outerAlsoHasRange = true
+												}
+											}
 										}
 									}
 								}
-								// Determine whether to use MATERIALIZED strategy:
-								// - For constant IN (e.g. "11 IN (subquery)"): MySQL uses FirstMatch
-								//   strategy (const lookup on semijoin result), so selectType stays SIMPLE.
-								// - For column IN (e.g. "col IN (subquery)"):
-								//   - firstmatch=off: always MATERIALIZED (no FirstMatch available)
-								//   - firstmatch=on: only MATERIALIZED when outer doesn't have a
-								//     bounded range on the same col (if outer also has same range,
-								//     FirstMatch via ref access is cheaper than materialization)
-								if outerINIsConst {
-									// Constant IN: MySQL uses FirstMatch, not MATERIALIZED.
+								// shouldMaterializeSubquery() returned true, meaning the cost model
+								// or rule-based strategy chose MATERIALIZED for this subquery.
+								// We refine the decision based on table count and other factors:
+								//
+								// Multi-table inner (2+ tables in FROM):
+								//   shouldMaterializeSubquery handles STRAIGHT_JOIN, empty tables, etc.
+								//   For multi-table, trust its decision → MATERIALIZED.
+								//   Exceptions:
+								//     - Constant outer + firstmatch=on → FirstMatch (cheaper for const)
+								//     - Both inner AND outer have matching range → ref access (SIMPLE)
+								//
+								// Single-table inner (1 table in FROM):
+								//   shouldMaterializeSubquery returns true conservatively (no PK/index).
+								//   For single-table, apply cost_based-aware refinement:
+								//     - cost_based=ON (default): MATERIALIZED (cost model always prefers mat for no-index tables)
+								//     - cost_based=OFF + firstmatch=ON:
+								//       MySQL uses rule-based threshold (empirically ~6 rows):
+								//         - outer has non-IN conditions → MATERIALIZED (extra filters make mat cheaper)
+								//         - inner has range on join col → MATERIALIZED
+								//         - table rows > threshold → MATERIALIZED
+								//         - small table, no extra conditions → FirstMatch (SIMPLE)
+								//     - cost_based=OFF + firstmatch=OFF: MATERIALIZED
+
+								// Count inner tables for multi-table vs single-table decision
+								innerTableCount := 0
+								for _, te := range inner.From {
+									innerTableCount += len(e.extractAllTableNames(te))
+								}
+
+								if outerINIsConst && firstMatchOn {
+									// Constant outer + firstmatch=on → FirstMatch (SIMPLE).
+									// Applies for both single-table and multi-table inner.
 									// selectType stays as semijoin-flattened SIMPLE.
-								} else if !firstMatchOn {
-									// firstmatch=off + column IN: always MATERIALIZED
+								} else if outerAlsoHasRange {
+									// Both inner AND outer have matching range → ref access (SIMPLE).
+									// Applies for both single-table and multi-table inner.
+									// selectType stays SIMPLE.
+								} else if innerTableCount > 1 {
+									// Multi-table inner:
+									// For TUPLE IN subqueries (left side is a ValTuple like (a,b,c)),
+									// MySQL uses DuplicateWeedout strategy instead of MATERIALIZED.
+									// DuplicateWeedout shows all inner tables at id=1 SIMPLE level
+									// with "Start temporary" on the first and "End temporary" on the last.
+									// For regular single-column IN with multi-table inner, use MATERIALIZED.
+									if inSubqueryIsInTupleContext(node, sub) {
+										// Tuple IN: DuplicateWeedout — flatten inner tables into SIMPLE rows
+										// Collect inner table names
+										var innerTblNames []string
+										for _, te := range inner.From {
+											innerTblNames = append(innerTblNames, e.extractAllTableNames(te)...)
+										}
+										for i, tblName := range innerTblNames {
+											var rowCount int64 = 1
+											if e.Storage != nil {
+												if tbl, tblErr := e.Storage.GetTable(e.CurrentDB, tblName); tblErr == nil {
+													rowCount = int64(len(tbl.Rows))
+												}
+											}
+											var extra interface{}
+											if i == 0 {
+												extra = "Using where; Start temporary"
+											} else if i == len(innerTblNames)-1 {
+												extra = "Using where; End temporary; Using join buffer (Block Nested Loop)"
+											} else {
+												extra = "Using where; Using join buffer (Block Nested Loop)"
+											}
+											*result = append(*result, explainSelectType{
+												id:         int64(1),
+												selectType: "SIMPLE",
+												table:      tblName,
+												accessType: "ALL",
+												rows:       rowCount,
+												filtered:   "100.00",
+												extra:      extra,
+											})
+										}
+										// selectType stays "SUBQUERY" (no MATERIALIZED rows added)
+										// The outer table's SIMPLE row was already added by explainSelect.
+										return false, nil
+									}
+									// Regular single-column multi-table IN: MATERIALIZED.
 									selectType = "MATERIALIZED"
-								} else if !outerAlsoHasRange {
-									// firstmatch=on + column IN + no outer range: MATERIALIZED
-									selectType = "MATERIALIZED"
+								} else {
+									// Single-table inner: apply cost_based-aware refinement.
+									// shouldMaterializeSubquery returned true (no PK/index), but we check
+									// if cost_based=OFF + firstmatch=ON + small non-empty table allows FirstMatch.
+									costBased := e.isOptimizerSwitchEnabled("subquery_materialization_cost_based")
+
+									// Compute inner row count
+									innerRowCount := 0
+									for _, te := range inner.From {
+										tblNames := e.extractAllTableNames(te)
+										for _, tblName := range tblNames {
+											if tbl, err := e.Storage.GetTable(e.CurrentDB, tblName); err == nil {
+												innerRowCount += len(tbl.Rows)
+											}
+										}
+									}
+
+									if innerRowCount == 0 {
+										// Empty table: always MATERIALIZED (MySQL materializes empty subqueries
+										// regardless of cost_based or firstmatch settings, showing 0 rows).
+										selectType = "MATERIALIZED"
+									} else if !costBased && firstMatchOn {
+										// cost_based=OFF + firstmatch=ON + non-empty table:
+										// MySQL uses rule-based threshold. Check additional conditions
+										// that push toward MATERIALIZED even for small tables.
+
+										// Check if inner has a range on its join column
+										innerHasRange := false
+										if inner.Where != nil && inner.SelectExprs != nil && len(inner.SelectExprs.Exprs) > 0 {
+											if ae, ok := inner.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok {
+												if col, ok := ae.Expr.(*sqlparser.ColName); ok {
+													innerHasRange = whereHasRangeOnCol(inner.Where.Expr, col.Name.String())
+												}
+											}
+										}
+										// Check if outer has non-IN conditions (additional filters)
+										outerHasNonIN := false
+										if node != nil {
+											var outerExpr2 sqlparser.Expr
+											if w, ok := node.(*sqlparser.Where); ok {
+												outerExpr2 = w.Expr
+											} else if ex, ok := node.(sqlparser.Expr); ok {
+												outerExpr2 = ex
+											}
+											if outerExpr2 != nil {
+												outerHasNonIN = whereHasNonINConditions(outerExpr2)
+											}
+										}
+										// Threshold: empirically ~6 rows (4 rows → FirstMatch, 8 rows → MATERIALIZED)
+										const singleTableFirstMatchThreshold = 6
+										if innerHasRange || outerHasNonIN || innerRowCount > singleTableFirstMatchThreshold {
+											// Force MATERIALIZED: range, extra outer conditions, or large table
+											selectType = "MATERIALIZED"
+										}
+										// Else: small non-empty table, no extra conditions → SIMPLE (FirstMatch)
+									} else if costBased && firstMatchOn {
+										// cost_based=ON + firstmatch=ON + non-empty table:
+										// MySQL uses a cost-based decision that considers both row count
+										// and whether the outer table has a usable index on the join column.
+										//
+										// Key distinction:
+										// - If the OUTER table has an index on the join column (ref access):
+										//   MySQL can do eq_ref/ref lookups via the materialized hash table,
+										//   making materialization cheaper than FirstMatch. → MATERIALIZED.
+										// - If the OUTER table has no index on join column (ALL scan):
+										//   MySQL uses a row-count threshold similar to cost_based=OFF.
+										//   For small tables (≤ threshold), FirstMatch is cheaper. → SIMPLE.
+										//   For large tables (> threshold), materialization wins. → MATERIALIZED.
+										//
+										// Empirically, the threshold for "no outer index" case is ~6 rows
+										// (same as cost_based=OFF with firstmatch=ON):
+										//   - 4-row DATE inner, no outer index → SIMPLE
+										//   - 22-row large inner, no outer index → MATERIALIZED
+										outerHasIndexOnJoinCol := false
+										if outerSel != nil && e.Storage != nil {
+											// Get the outer join column name
+											outerJoinColCB := extractINColFromNode(node, sub)
+											if outerJoinColCB != "" {
+												// Check outer tables for index on join column
+												for _, outerTE := range outerSel.From {
+													outerTblNames := e.extractAllTableNames(outerTE)
+													for _, outerTblName := range outerTblNames {
+														if outerTbl, err := e.Storage.GetTable(e.CurrentDB, outerTblName); err == nil && outerTbl.Def != nil {
+															// Check primary key
+															if len(outerTbl.Def.PrimaryKey) > 0 && strings.EqualFold(outerTbl.Def.PrimaryKey[0], outerJoinColCB) {
+																outerHasIndexOnJoinCol = true
+																break
+															}
+															// Check secondary indexes
+															for _, idx := range outerTbl.Def.Indexes {
+																if len(idx.Columns) > 0 && strings.EqualFold(idx.Columns[0], outerJoinColCB) {
+																	outerHasIndexOnJoinCol = true
+																	break
+																}
+															}
+														}
+														if outerHasIndexOnJoinCol {
+															break
+														}
+													}
+													if outerHasIndexOnJoinCol {
+														break
+													}
+												}
+											}
+										}
+										if outerHasIndexOnJoinCol {
+											// Outer has index on join col → ref/eq_ref access available →
+											// materialization + hash lookup is cheaper than FirstMatch.
+											selectType = "MATERIALIZED"
+										} else {
+											// Outer has no index on join col (ALL scan):
+											// use same threshold as cost_based=OFF with firstmatch=ON.
+											const costBasedNoIndexThreshold = 6
+											if innerRowCount > costBasedNoIndexThreshold {
+												selectType = "MATERIALIZED"
+											}
+											// Else: small table, no outer index → FirstMatch (SIMPLE)
+										}
+									} else {
+										// firstmatch=OFF (regardless of cost_based): always MATERIALIZED
+										selectType = "MATERIALIZED"
+									}
 								}
 							}
 							// If not materialized, selectType stays "SUBQUERY" but will be
@@ -8414,15 +8792,19 @@ func (e *Executor) explainTreeMaterializedContent(innerRows [][]interface{}, all
 	lines = append(lines, pfx+"-> Filter: (inner not null)")
 	lines = append(lines, pfx+"    -> Nested loop inner join")
 	for i, row := range innerRows {
-		tbl, at, kn, _, _, _, _ := explainTreeRowInfo(row)
+		tbl, at, kn, _, extraStr, _, _ := explainTreeRowInfo(row)
+		hasICP := strings.Contains(extraStr, "Using index condition")
 		subpfx := explainTreeIndent(indent + 2)
 		if i == 0 {
 			// First (driving) table gets a filter wrapper
 			lines = append(lines, subpfx+"-> Filter: ("+tbl+" not null)")
 			switch at {
 			case "range":
-				// Range scan inside a Filter: the condition is in the Filter node, not in the range scan.
-				lines = append(lines, subpfx+"    -> Index range scan on "+tbl+" using "+kn)
+				if hasICP {
+					lines = append(lines, subpfx+"    -> Index range scan on "+tbl+" using "+kn+", with index condition: (cond)")
+				} else {
+					lines = append(lines, subpfx+"    -> Index range scan on "+tbl+" using "+kn)
+				}
 			case "eq_ref", "ref", "const":
 				lines = append(lines, subpfx+"    -> Single-row index lookup on "+tbl+" using "+kn+" (placeholder)")
 			default:
