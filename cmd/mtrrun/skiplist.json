@@ -3001,10 +3001,6 @@
       "reason": "output mismatch or execution error"
     },
     {
-      "test": "sys_vars/innodb_tmpdir_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/lc_messages_basic",
       "reason": "output mismatch or execution error"
     },

@@ -891,12 +891,22 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					evalVal, _ := e.evalExpr(expr.Expr)
 					tmpPath := toString(evalVal)
 					if tmpPath != "" {
+						// Check path length first (MySQL limit: 512 bytes).
+						// Error value is truncated to 200 characters in MySQL error messages.
+						// Note: the Error warning is added automatically by Execute's defer
+						// when the returned error is non-nil, so we only add the Warning 1210 here.
+						if len(tmpPath) > 512 {
+							truncated := tmpPath
+							if len(truncated) > 200 {
+								truncated = truncated[:200]
+							}
+							e.addWarning("Warning", 1210, "Path length should not exceed 512 bytes")
+							errMsg := fmt.Sprintf("Variable 'innodb_tmpdir' can't be set to the value of '%s'", truncated)
+							return nil, mysqlError(1231, "42000", errMsg)
+						}
 						if _, err := os.Stat(tmpPath); os.IsNotExist(err) {
 							errMsg := fmt.Sprintf("Variable 'innodb_tmpdir' can't be set to the value of '%s'", tmpPath)
-							e.warnings = append(e.warnings,
-								Warning{Level: "Warning", Code: 1210, Message: "InnoDB: Path doesn't exist."},
-								Warning{Level: "Error", Code: 1231, Message: errMsg},
-							)
+							e.addWarning("Warning", 1210, "InnoDB: Path doesn't exist.")
 							return nil, mysqlError(1231, "42000", errMsg)
 						}
 					}
@@ -2396,6 +2406,7 @@ var sysVarPureStringType = map[string]bool{
 	"innodb_ft_user_stopword_table":   true,
 	"general_log_file":                true,
 	"slow_query_log_file":             true,
+	"innodb_tmpdir":                   true, // path variable: rejects numeric literals with ER_WRONG_TYPE_FOR_VAR
 	// SSL path variables: reject numeric literals with ER_WRONG_TYPE_FOR_VAR
 	"ssl_ca": true, "ssl_capath": true, "ssl_cert": true, "ssl_cipher": true,
 	"ssl_key": true, "ssl_crl": true, "ssl_crlpath": true,
@@ -3667,6 +3678,7 @@ var sysVarNullableEmpty = map[string]bool{
 	"mysqlx_ssl_crl": true, "mysqlx_ssl_crlpath": true,
 	// Note: mysqlx_ssl_ca, mysqlx_ssl_cert, mysqlx_ssl_key are auto-generated in MySQL
 	// and have non-empty defaults, so they are NOT in this list.
+	"innodb_tmpdir": true, // NULL means "use tmpdir"; empty string is returned as NULL in SELECT
 }
 
 // sysVarStringToSelectValueForVar converts with variable name awareness.
