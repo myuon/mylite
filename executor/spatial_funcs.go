@@ -253,16 +253,20 @@ func mbrFromPoints(pts [][]float64) interface{} {
 			maxY = p[1]
 		}
 	}
-	// Normalize -0 to +0 for output (MySQL behavior)
+
+	// Check for single-point degenerate case before normalization,
+	// so we can preserve negative zero in the output (MySQL behavior).
+	if minX == maxX && minY == maxY {
+		// Single point: preserve original coordinate values including -0
+		return fmt.Sprintf("POINT(%s %s)", formatSpatialFloat(minX), formatSpatialFloat(minY))
+	}
+
+	// Normalize -0 to +0 for non-degenerate MBR output (MySQL behavior)
 	minX = normalizeMBRFloat(minX)
 	minY = normalizeMBRFloat(minY)
 	maxX = normalizeMBRFloat(maxX)
 	maxY = normalizeMBRFloat(maxY)
 
-	if minX == maxX && minY == maxY {
-		// Single point
-		return fmt.Sprintf("POINT(%s %s)", formatSpatialFloat(minX), formatSpatialFloat(minY))
-	}
 	if minX == maxX || minY == maxY {
 		// Collinear: return a LINESTRING
 		return fmt.Sprintf("LINESTRING(%s %s,%s %s)",
@@ -1006,6 +1010,182 @@ func normalizeWKT(wkt string) string {
 	return geomSetSRID(normalizedWKT, srid)
 }
 
+// swapWKTCoords swaps X and Y coordinates in all coordinate pairs of a WKT geometry.
+// This is needed when converting from Cartesian to geographic SRS (e.g., SRID=4326),
+// where MySQL stores coordinates as (latitude, longitude) = (Y, X).
+// The EWKT SRID prefix (SRID=N;) is preserved if present.
+func swapWKTCoords(wkt string) string {
+	srid := geomGetSRID(wkt)
+	plain := geomStripSRID(wkt)
+	swapped := swapWKTCoordsPlain(plain)
+	return geomSetSRID(swapped, srid)
+}
+
+// swapWKTCoordsPlain swaps X↔Y in all coordinate pairs of a plain WKT string (no SRID prefix).
+func swapWKTCoordsPlain(wkt string) string {
+	wkt = strings.TrimSpace(wkt)
+	upper := strings.ToUpper(wkt)
+
+	// Determine geometry keyword and the rest of the string
+	// Find the first '(' which delimits the keyword from coordinates
+	paren := strings.Index(wkt, "(")
+	if paren < 0 {
+		return wkt
+	}
+	keyword := wkt[:paren]
+	rest := wkt[paren:]
+
+	upperKw := strings.ToUpper(strings.TrimSpace(keyword))
+	_ = upper
+
+	switch {
+	case upperKw == "POINT":
+		// POINT(x y)
+		return keyword + swapCoordPairsInRing(rest)
+	case upperKw == "LINESTRING":
+		// LINESTRING(x1 y1,x2 y2,...)
+		return keyword + swapCoordPairsInRing(rest)
+	case upperKw == "POLYGON":
+		// POLYGON((x1 y1,...),(x1 y1,...))
+		return keyword + swapCoordPairsInNestedRings(rest)
+	case upperKw == "MULTIPOINT":
+		// MULTIPOINT((x1 y1),(x2 y2),...) or MULTIPOINT(x1 y1,x2 y2,...)
+		return keyword + swapCoordPairsInNestedOrFlat(rest)
+	case upperKw == "MULTILINESTRING":
+		// MULTILINESTRING((x1 y1,...),(x1 y1,...))
+		return keyword + swapCoordPairsInNestedRings(rest)
+	case upperKw == "MULTIPOLYGON":
+		// MULTIPOLYGON(((x1 y1,...)),...) — deeper nesting
+		return keyword + swapCoordPairsInMultiPolygon(rest)
+	case upperKw == "GEOMETRYCOLLECTION" || upperKw == "GEOMCOLLECTION":
+		return swapGeomCollection(wkt)
+	}
+	return wkt
+}
+
+// swapCoordPair swaps two space-separated floats: "x y" → "y x"
+func swapCoordPair(pair string) string {
+	pair = strings.TrimSpace(pair)
+	fields := strings.Fields(pair)
+	if len(fields) < 2 {
+		return pair
+	}
+	// Swap first two fields, keep any extra (e.g., Z coordinate)
+	result := fields[1] + " " + fields[0]
+	for _, f := range fields[2:] {
+		result += " " + f
+	}
+	return result
+}
+
+// swapCoordPairsInRing swaps all coord pairs inside a single ring like "(x1 y1,x2 y2,...)"
+func swapCoordPairsInRing(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
+		return s
+	}
+	inner := s[1 : len(s)-1]
+	pairs := strings.Split(inner, ",")
+	var result []string
+	for _, p := range pairs {
+		result = append(result, swapCoordPair(p))
+	}
+	return "(" + strings.Join(result, ",") + ")"
+}
+
+// swapCoordPairsInNestedRings handles strings like "((r1),(r2),...)" where each ring is "(x y,...)"
+func swapCoordPairsInNestedRings(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
+		return s
+	}
+	inner := s[1 : len(s)-1]
+	// Split by commas at depth 0
+	parts := splitAtDepth0(inner)
+	var result []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		result = append(result, swapCoordPairsInRing(p))
+	}
+	return "(" + strings.Join(result, ",") + ")"
+}
+
+// swapCoordPairsInNestedOrFlat handles MULTIPOINT which may be nested or flat
+func swapCoordPairsInNestedOrFlat(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
+		return s
+	}
+	inner := strings.TrimSpace(s[1 : len(s)-1])
+	// Check if nested (starts with '(')
+	if strings.HasPrefix(inner, "(") {
+		return swapCoordPairsInNestedRings(s)
+	}
+	// Flat: "x1 y1,x2 y2,..."
+	return swapCoordPairsInRing(s)
+}
+
+// swapCoordPairsInMultiPolygon handles MULTIPOLYGON structure: "(((r1),(r2)),((r3)),...)"
+func swapCoordPairsInMultiPolygon(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
+		return s
+	}
+	inner := s[1 : len(s)-1]
+	// Split polygons at depth 0
+	parts := splitAtDepth0(inner)
+	var result []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		// Each part is "((rings))"
+		result = append(result, swapCoordPairsInNestedRings(p))
+	}
+	return "(" + strings.Join(result, ",") + ")"
+}
+
+// swapGeomCollection handles GEOMETRYCOLLECTION/GEOMCOLLECTION
+func swapGeomCollection(wkt string) string {
+	wkt = strings.TrimSpace(wkt)
+	paren := strings.Index(wkt, "(")
+	if paren < 0 {
+		return wkt
+	}
+	keyword := wkt[:paren]
+	rest := strings.TrimSpace(wkt[paren:])
+	if len(rest) < 2 || rest[0] != '(' || rest[len(rest)-1] != ')' {
+		return wkt
+	}
+	inner := rest[1 : len(rest)-1]
+	parts := splitAtDepth0(inner)
+	var result []string
+	for _, p := range parts {
+		result = append(result, swapWKTCoordsPlain(strings.TrimSpace(p)))
+	}
+	return keyword + "(" + strings.Join(result, ",") + ")"
+}
+
+// splitAtDepth0 splits a string by commas at depth 0 (not inside parentheses).
+func splitAtDepth0(s string) []string {
+	var result []string
+	depth := 0
+	start := 0
+	for i, ch := range s {
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				result = append(result, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	result = append(result, s[start:])
+	return result
+}
+
 // parseSRIDValue parses a SRID value (like an integer or string) and returns:
 // - the int64 value (0 if non-numeric)
 // - whether a truncation happened (non-numeric string)
@@ -1089,6 +1269,17 @@ func evalSpatialFunc(e *Executor, name string, exprs []sqlparser.Expr) (interfac
 			// All other valid-range SRIDs return ER_SRS_NOT_FOUND.
 			if !e.sridIsKnown(srid) {
 				return nil, true, mysqlError(3548, "SR001", fmt.Sprintf("There's no spatial reference system with SRID %d.", srid))
+			}
+			// When converting to/from a geographic SRS, swap X↔Y coordinates.
+			// MySQL stores geographic coordinates as (latitude=Y, longitude=X), so
+			// switching between Cartesian (SRID=0 or projected) and geographic (e.g., 4326)
+			// requires a coordinate axis swap.
+			oldSRID := geomGetSRID(geomStr)
+			oldIsGeo := isGeographicSRID(oldSRID)
+			newIsGeo := isGeographicSRID(srid)
+			if oldIsGeo != newIsGeo {
+				// Swap coordinates when axis order changes between Cartesian and geographic
+				geomStr = swapWKTCoords(geomStr)
 			}
 			// Return geometry with updated SRID as EWKT string
 			return geomSetSRID(geomStr, srid), true, nil
