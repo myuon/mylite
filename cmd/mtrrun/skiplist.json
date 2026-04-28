@@ -3677,10 +3677,6 @@
       "reason": "LOAD DATA with column list not supported"
     },
     {
-      "test": "funcs_1/storedproc",
-      "reason": "SQL syntax error with multi-line echo statement"
-    },
-    {
       "test": "innodb_fts/foreign_key_check",
       "reason": "SHOW CREATE TABLE missing FOREIGN KEY clause"
     },

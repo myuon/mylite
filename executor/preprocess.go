@@ -62,6 +62,15 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		return "", &Result{}, nil
 	}
 
+	// When NO_BACKSLASH_ESCAPES is active, backslashes inside string literals are not
+	// escape characters. The vitess parser always treats '\' as escape, which causes it
+	// to misparse strings like ESCAPED BY '\' (TERMINATED BY appears outside the string).
+	// Rewrite single-quoted strings so that lone backslashes are doubled (\→\\), making
+	// the vitess parser interpret them correctly as literal backslash characters.
+	if e.isNoBackslashEscapes() {
+		query = rewriteStringsForNoBackslashEscapes(query)
+	}
+
 	// Handle ODBC escape syntax: {fn func(args)}, { date "value" }, {d 'value'}, {ts '...'}, {t '...'}.
 	// MySQL supports ODBC escape sequences for compatibility. We preprocess them to standard MySQL syntax.
 	// e.currentQuery is already set to the original for rawExprs column name extraction.
@@ -2546,4 +2555,99 @@ func parsePartitionDef(defStr string) catalog.PartitionDef {
 		return catalog.PartitionDef{Name: name}
 	}
 	return catalog.PartitionDef{}
+}
+// isNoBackslashEscapes returns true when the current sql_mode includes NO_BACKSLASH_ESCAPES.
+func (e *Executor) isNoBackslashEscapes() bool {
+	mode := strings.ToUpper(e.sqlMode)
+	for _, part := range strings.Split(mode, ",") {
+		if strings.TrimSpace(part) == "NO_BACKSLASH_ESCAPES" {
+			return true
+		}
+	}
+	return false
+}
+
+// rewriteStringsForNoBackslashEscapes rewrites single-quoted string literals in a SQL query
+// so that lone backslashes (those not immediately followed by another backslash) are doubled.
+// This is necessary because the vitess parser always treats '\' as an escape character, but in
+// NO_BACKSLASH_ESCAPES mode backslashes are literal characters that don't escape the closing quote.
+// For example, ESCAPED BY '\' (where '\' is a single-backslash string in NO_BACKSLASH_ESCAPES mode)
+// would be rewritten to ESCAPED BY '\\' which the vitess parser correctly handles.
+func rewriteStringsForNoBackslashEscapes(query string) string {
+	var result strings.Builder
+	i := 0
+	n := len(query)
+	for i < n {
+		ch := query[i]
+		// Handle backtick-quoted identifiers — pass through unchanged.
+		if ch == '`' {
+			result.WriteByte('`')
+			i++
+			for i < n && query[i] != '`' {
+				result.WriteByte(query[i])
+				i++
+			}
+			if i < n {
+				result.WriteByte('`')
+				i++
+			}
+			continue
+		}
+		// Handle double-quoted strings — pass through unchanged (no backslash issue).
+		if ch == '"' {
+			result.WriteByte('"')
+			i++
+			for i < n {
+				c := query[i]
+				result.WriteByte(c)
+				i++
+				if c == '"' {
+					// Check for doubled quote (escape sequence "")
+					if i < n && query[i] == '"' {
+						result.WriteByte('"')
+						i++
+					} else {
+						break
+					}
+				}
+			}
+			continue
+		}
+		// Handle single-quoted strings.
+		if ch == '\'' {
+			result.WriteByte('\'')
+			i++
+			for i < n {
+				c := query[i]
+				if c == '\'' {
+					// Check for doubled quote '' (escape sequence)
+					if i+1 < n && query[i+1] == '\'' {
+						result.WriteByte('\'')
+						result.WriteByte('\'')
+						i += 2
+					} else {
+						// Closing quote
+						result.WriteByte('\'')
+						i++
+						break
+					}
+				} else if c == '\\' {
+					// In NO_BACKSLASH_ESCAPES mode, backslash is a literal character.
+					// Double it so the vitess parser treats it as a literal backslash,
+					// not as an escape character.
+					result.WriteByte('\\')
+					result.WriteByte('\\')
+					i++
+				} else {
+					result.WriteByte(c)
+					i++
+				}
+			}
+			continue
+		}
+		// Regular character outside of string literal.
+		result.WriteByte(ch)
+		i++
+	}
+	return result.String()
 }
