@@ -3177,6 +3177,11 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		return e.execSelectIntoOutfile(stmt.Into, colNames, resultRows)
 	}
 
+	// Handle SELECT ... INTO DUMPFILE
+	if stmt.Into != nil && stmt.Into.Type == sqlparser.IntoDumpfile {
+		return e.execSelectIntoDumpfile(stmt.Into, resultRows)
+	}
+
 	// Handle SELECT ... INTO @var1, @var2, ...
 	if stmt.Into != nil && stmt.Into.Type == sqlparser.IntoVariables {
 		return e.execSelectIntoUserVars(stmt.Into, colNames, resultRows)
@@ -4799,6 +4804,11 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 	// Handle SELECT ... INTO OUTFILE (GROUP BY path)
 	if stmt.Into != nil && stmt.Into.Type == sqlparser.IntoOutfile {
 		return e.execSelectIntoOutfile(stmt.Into, colNames, resultRows)
+	}
+
+	// Handle SELECT ... INTO DUMPFILE (GROUP BY path)
+	if stmt.Into != nil && stmt.Into.Type == sqlparser.IntoDumpfile {
+		return e.execSelectIntoDumpfile(stmt.Into, resultRows)
 	}
 
 	// Handle SELECT ... INTO @var1, @var2, ... (GROUP BY path)
@@ -8509,15 +8519,23 @@ func (e *Executor) execLoadData(query string) (*Result, error) {
 				}
 			}
 			// Coerce date/time values and pad BINARY columns, emitting warnings as appropriate.
-			if v, exists := row[colDef.Name]; exists && v != nil {
-				if padLen := binaryPadLength(colDef.Type); padLen > 0 {
-					v = padBinaryValue(v, padLen)
+			if v, exists := row[colDef.Name]; exists {
+				if v == nil {
+					// NULL value: warn if column is NOT NULL.
+					// MySQL emits Warning 1263 in this case.
+					if !colDef.Nullable && !colDef.AutoIncrement {
+						e.addWarning("Warning", 1263, fmt.Sprintf("Column set to default value; NULL supplied to NOT NULL column '%s' at row %d", colDef.Name, rowNum))
+					}
+				} else {
+					if padLen := binaryPadLength(colDef.Type); padLen > 0 {
+						v = padBinaryValue(v, padLen)
+					}
+					// Emit type-conversion warnings before coercing (only for string values).
+					if sv, isStr := v.(string); isStr {
+						e.emitLoadDataColumnWarning(colDef, sv, rowNum)
+					}
+					row[colDef.Name] = coerceDateTimeValue(colDef.Type, v)
 				}
-				// Emit type-conversion warnings before coercing (only for string values).
-				if sv, isStr := v.(string); isStr {
-					e.emitLoadDataColumnWarning(colDef, sv, rowNum)
-				}
-				row[colDef.Name] = coerceDateTimeValue(colDef.Type, v)
 			}
 		}
 
@@ -8604,6 +8622,33 @@ func (e *Executor) emitLoadDataColumnWarning(colDef catalog.ColumnDef, sv string
 		return
 	}
 
+	// --- VARCHAR / CHAR types ---
+	// Emit 1265 when the value exceeds the column's declared length.
+	isVarcharType := strings.HasPrefix(upper, "VARCHAR") || strings.HasPrefix(upper, "CHAR") ||
+		strings.HasPrefix(upper, "VARBINARY") || strings.HasPrefix(upper, "BINARY")
+	if isVarcharType {
+		// Extract the length from the type, e.g. VARCHAR(5) → 5
+		if parenIdx := strings.Index(upper, "("); parenIdx >= 0 {
+			closeIdx := strings.Index(upper, ")")
+			if closeIdx > parenIdx {
+				lenStr := upper[parenIdx+1 : closeIdx]
+				if maxLen, err := strconv.Atoi(strings.TrimSpace(lenStr)); err == nil {
+					// Use rune count for character types, byte count for binary types
+					var actualLen int
+					if strings.HasPrefix(upper, "VARBINARY") || strings.HasPrefix(upper, "BINARY") {
+						actualLen = len(sv)
+					} else {
+						actualLen = len([]rune(sv))
+					}
+					if actualLen > maxLen {
+						e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", colDef.Name, rowNum))
+					}
+				}
+			}
+		}
+		return
+	}
+
 	// --- INT types ---
 	isIntType := strings.Contains(upper, "INT") || strings.Contains(upper, "INTEGER")
 	if isIntType {
@@ -8613,7 +8658,7 @@ func (e *Executor) emitLoadDataColumnWarning(colDef catalog.ColumnDef, sv string
 			if strings.Contains(errMsg, "ERROR 1366") {
 				e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect integer value: '%s' for column '%s' at row %d", sv, colDef.Name, rowNum))
 			} else if strings.Contains(errMsg, "ERROR 1265") {
-				e.addWarning("Note", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", colDef.Name, rowNum))
+				e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row %d", colDef.Name, rowNum))
 			} else if strings.Contains(errMsg, "ERROR 1264") {
 				e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row %d", colDef.Name, rowNum))
 			}
@@ -8878,6 +8923,44 @@ func (e *Executor) execSelectIntoOutfile(into *sqlparser.SelectInto, colNames []
 	}
 	if err := os.WriteFile(fileName, []byte(sb.String()), 0644); err != nil {
 		return nil, fmt.Errorf("cannot write outfile: %v", err)
+	}
+
+	return &Result{AffectedRows: uint64(len(rows))}, nil
+}
+
+// execSelectIntoDumpfile implements SELECT ... INTO DUMPFILE.
+// DUMPFILE writes a single row to a file as raw bytes with no field/line terminators
+// and no escape processing. If the result has multiple rows, only the first row is written.
+func (e *Executor) execSelectIntoDumpfile(into *sqlparser.SelectInto, rows [][]interface{}) (*Result, error) {
+	fileName := into.FileName
+	if len(fileName) >= 2 && fileName[0] == '\'' && fileName[len(fileName)-1] == '\'' {
+		fileName = fileName[1 : len(fileName)-1]
+	}
+	if !filepath.IsAbs(fileName) && e.DataDir != "" {
+		fileName = filepath.Join(e.DataDir, fileName)
+	}
+
+	// Enforce secure_file_priv before writing the file.
+	if err := e.checkSecureFilePriv(fileName); err != nil {
+		return nil, err
+	}
+
+	var content strings.Builder
+	if len(rows) > 0 {
+		row := rows[0]
+		for _, val := range row {
+			if val != nil {
+				content.WriteString(fmt.Sprintf("%v", val))
+			}
+		}
+	}
+
+	dir := filepath.Dir(fileName)
+	if errDir := os.MkdirAll(dir, 0755); errDir != nil {
+		return nil, fmt.Errorf("cannot create directory for dumpfile: %v", errDir)
+	}
+	if err := os.WriteFile(fileName, []byte(content.String()), 0644); err != nil {
+		return nil, fmt.Errorf("cannot write dumpfile: %v", err)
 	}
 
 	return &Result{AffectedRows: uint64(len(rows))}, nil
