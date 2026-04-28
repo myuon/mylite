@@ -130,8 +130,31 @@ func formatTimeDiffMicrosOpt(diffUs int64, e *Executor, origHadMicros bool) stri
 // Returns (result, handled, error).
 func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.Row) (interface{}, bool, error) {
 	switch name {
-	case "now", "current_timestamp", "sysdate":
+	case "now", "current_timestamp":
 		t := e.nowTime()
+		if len(v.Exprs) > 0 {
+			precVal, _, _ := e.evalArg1(v.Exprs, name, row)
+			prec := int(toFloat(precVal))
+			if prec > 0 && prec <= 6 {
+				frac := fmt.Sprintf("%06d", t.Nanosecond()/1000)[:prec]
+				return t.Format("2006-01-02 15:04:05") + "." + frac, true, nil
+			}
+		}
+		return t.Format("2006-01-02 15:04:05"), true, nil
+	case "sysdate":
+		// MySQL SYSDATE() returns the actual current time at execution, not the
+		// statement-start time. Unlike NOW(), it is not cached per statement.
+		// Exception: when --sysdate-is-now startup option is set, SYSDATE() behaves
+		// exactly like NOW() (uses the cached statement-start time).
+		var t time.Time
+		if e.startupVars["sysdate_is_now"] == "1" {
+			t = e.nowTime()
+		} else {
+			t = time.Now()
+			if e.timeZone != nil {
+				t = t.In(e.timeZone)
+			}
+		}
 		if len(v.Exprs) > 0 {
 			precVal, _, _ := e.evalArg1(v.Exprs, name, row)
 			prec := int(toFloat(precVal))

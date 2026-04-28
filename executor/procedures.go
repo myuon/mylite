@@ -4310,7 +4310,17 @@ func (e *Executor) execSelectIntoForRoutine(stmtStr string, localVars map[string
 		row := result.Rows[0]
 		for j, vn := range varNames {
 			if j < len(row) {
-				localVars[vn] = row[j]
+				// User variables (@var) must go into e.userVars, not localVars.
+				// Storing them in localVars would cause them to be text-substituted
+				// into subsequent SQL statements via substituteLocalVars.
+				if strings.HasPrefix(vn, "@") && !strings.HasPrefix(vn, "@@") {
+					if e.userVars == nil {
+						e.userVars = make(map[string]interface{})
+					}
+					e.userVars[strings.TrimPrefix(vn, "@")] = row[j]
+				} else {
+					localVars[vn] = row[j]
+				}
 			}
 		}
 	}
@@ -4361,7 +4371,15 @@ func (e *Executor) execSelectIntoLocal(stmtStr string, localVars map[string]inte
 		row := result.Rows[0]
 		for j, vn := range varNames {
 			if j < len(row) {
-				localVars[vn] = row[j]
+				// User variables (@var) must go into e.userVars, not localVars.
+				if strings.HasPrefix(vn, "@") && !strings.HasPrefix(vn, "@@") {
+					if e.userVars == nil {
+						e.userVars = make(map[string]interface{})
+					}
+					e.userVars[strings.TrimPrefix(vn, "@")] = row[j]
+				} else {
+					localVars[vn] = row[j]
+				}
 			}
 		}
 	}

@@ -1442,6 +1442,20 @@ func exprReferencedTables(expr sqlparser.Expr, aliases []string) map[int]bool {
 			walk(v.Right)
 		case *sqlparser.UnaryExpr:
 			walk(v.Expr)
+		case *sqlparser.CastExpr:
+			walk(v.Expr)
+		case *sqlparser.ConvertExpr:
+			walk(v.Expr)
+		case *sqlparser.IntervalDateExpr:
+			walk(v.Date)
+			walk(v.Interval)
+		case *sqlparser.CollateExpr:
+			walk(v.Expr)
+		case *sqlparser.IntervalFuncExpr:
+			walk(v.Expr)
+			for _, arg := range v.Exprs {
+				walk(arg)
+			}
 		}
 	}
 	walk(expr)
