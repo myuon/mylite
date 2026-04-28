@@ -1636,15 +1636,33 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 			outerSelectType = "PRIMARY"
 		}
 		nextID := *idCounter + 1
+		// Collect derived table SELECTs for zero-row detection.
+		// We iterate FROM expressions to get the inner AST for each derived table.
+		derivedSelects := make([]*sqlparser.Select, 0, numDerived)
+		for _, te := range sel.From {
+			e.collectDerivedSelects(te, &derivedSelects)
+		}
 		for i := 0; i < numDerived; i++ {
 			derivedRef := fmt.Sprintf("<derived%d>", nextID)
+			// Check if this derived table would produce 0 rows (e.g., cross-table NULL comparison).
+			// MySQL shows "no matching row in const table" for the outer row and NULL filtered.
+			derivedIsEmpty := false
+			if i < len(derivedSelects) && derivedSelects[i] != nil {
+				derivedIsEmpty = e.explainDerivedTableHasZeroRows(derivedSelects[i])
+			}
+			outerFiltered := "100.00"
+			var outerExtra interface{} = nil
+			if derivedIsEmpty {
+				outerFiltered = ""
+				outerExtra = "no matching row in const table"
+			}
 			result = append(result, explainSelectType{
 				id:           myID,
 				selectType:   outerSelectType,
 				table:        derivedRef,
-				extra:        nil,
+				extra:        outerExtra,
 				rows:         int64(1),
-				filtered:     "100.00",
+				filtered:     nilIfEmptyStr(outerFiltered),
 				accessType:   "ALL",
 				possibleKeys: nil,
 				key:          nil,
@@ -3320,6 +3338,309 @@ func extractConstPKValue(expr sqlparser.Expr, pkCol string) (string, bool) {
 	return "", false
 }
 
+// validateDerivedTableColRefs checks that WHERE clause column references of the form
+// "derivedAlias.col" refer to columns that actually exist in the derived table's SELECT list.
+// If not, it returns an "Unknown column" error matching MySQL's behavior.
+func (e *Executor) validateDerivedTableColRefs(sel *sqlparser.Select) error {
+	// Build a map: lower(alias) → set of exposed column names for each derived table in FROM.
+	type derivedInfo struct {
+		alias   string
+		columns map[string]bool // nil means star / unknown (skip validation)
+	}
+	var derived []derivedInfo
+
+	var collectFrom func(te sqlparser.TableExpr)
+	collectFrom = func(te sqlparser.TableExpr) {
+		switch t := te.(type) {
+		case *sqlparser.AliasedTableExpr:
+			if dt, ok := t.Expr.(*sqlparser.DerivedTable); ok {
+				alias := strings.ToLower(t.As.String())
+				if alias == "" {
+					return
+				}
+				// Collect exposed column names from the derived SELECT list.
+				var cols map[string]bool
+				if innerSel, ok := dt.Select.(*sqlparser.Select); ok {
+					cols = make(map[string]bool)
+					for _, expr := range innerSel.SelectExprs.Exprs {
+						switch ex := expr.(type) {
+						case *sqlparser.StarExpr:
+							// SELECT * — can't enumerate columns, skip validation for this derived table
+							cols = nil
+						case *sqlparser.AliasedExpr:
+							if cols == nil {
+								break
+							}
+							if !ex.As.IsEmpty() {
+								// Has explicit alias: the exposed column name is the alias
+								cols[strings.ToLower(ex.As.String())] = true
+							} else if col, ok2 := ex.Expr.(*sqlparser.ColName); ok2 {
+								// No alias: the exposed column name is the column name
+								cols[strings.ToLower(col.Name.String())] = true
+							} else {
+								// Non-column expression without alias (e.g. literal, function)
+								// Cannot determine name, skip validation for safety
+								cols = nil
+							}
+						}
+						if cols == nil {
+							break
+						}
+					}
+				}
+				derived = append(derived, derivedInfo{alias: alias, columns: cols})
+			}
+		case *sqlparser.JoinTableExpr:
+			collectFrom(t.LeftExpr)
+			collectFrom(t.RightExpr)
+		case *sqlparser.ParenTableExpr:
+			for _, expr := range t.Exprs {
+				collectFrom(expr)
+			}
+		}
+	}
+	for _, te := range sel.From {
+		collectFrom(te)
+	}
+
+	if len(derived) == 0 {
+		return nil
+	}
+
+	// Build lookup map: alias → columns
+	derivedMap := make(map[string]map[string]bool, len(derived))
+	for _, d := range derived {
+		derivedMap[d.alias] = d.columns
+	}
+
+	// Walk WHERE expression looking for qualifier.column references.
+	var walkExpr func(expr sqlparser.Expr) error
+	walkExpr = func(expr sqlparser.Expr) error {
+		if expr == nil {
+			return nil
+		}
+		switch x := expr.(type) {
+		case *sqlparser.ColName:
+			qual := strings.ToLower(x.Qualifier.Name.String())
+			if qual == "" {
+				return nil
+			}
+			cols, isDerived := derivedMap[qual]
+			if !isDerived {
+				return nil
+			}
+			if cols == nil {
+				// Star select — skip validation
+				return nil
+			}
+			colName := strings.ToLower(x.Name.String())
+			if !cols[colName] {
+				return mysqlError(1054, "42S22",
+					fmt.Sprintf("Unknown column '%s.%s' in 'where clause'", qual, x.Name.String()))
+			}
+		case *sqlparser.ComparisonExpr:
+			if err := walkExpr(x.Left); err != nil {
+				return err
+			}
+			return walkExpr(x.Right)
+		case *sqlparser.AndExpr:
+			if err := walkExpr(x.Left); err != nil {
+				return err
+			}
+			return walkExpr(x.Right)
+		case *sqlparser.OrExpr:
+			if err := walkExpr(x.Left); err != nil {
+				return err
+			}
+			return walkExpr(x.Right)
+		case *sqlparser.NotExpr:
+			return walkExpr(x.Expr)
+		case *sqlparser.IsExpr:
+			return walkExpr(x.Left)
+		case *sqlparser.BetweenExpr:
+			if err := walkExpr(x.Left); err != nil {
+				return err
+			}
+			if err := walkExpr(x.From); err != nil {
+				return err
+			}
+			return walkExpr(x.To)
+		case *sqlparser.BinaryExpr:
+			if err := walkExpr(x.Left); err != nil {
+				return err
+			}
+			return walkExpr(x.Right)
+		case *sqlparser.FuncExpr:
+			for _, arg := range x.Exprs {
+				if err := walkExpr(arg); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	return walkExpr(sel.Where.Expr)
+}
+
+// collectDerivedSelects collects the inner *sqlparser.Select for each derived table
+// (subquery in FROM) found in a table expression. Used to check for zero-row cases.
+func (e *Executor) collectDerivedSelects(te sqlparser.TableExpr, selects *[]*sqlparser.Select) {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if dt, ok := t.Expr.(*sqlparser.DerivedTable); ok {
+			if innerSel, ok := dt.Select.(*sqlparser.Select); ok {
+				*selects = append(*selects, innerSel)
+			}
+		}
+	case *sqlparser.JoinTableExpr:
+		e.collectDerivedSelects(t.LeftExpr, selects)
+		e.collectDerivedSelects(t.RightExpr, selects)
+	case *sqlparser.ParenTableExpr:
+		for _, expr := range t.Exprs {
+			e.collectDerivedSelects(expr, selects)
+		}
+	}
+}
+
+// explainDerivedTableHasZeroRows returns true if the inner SELECT of a derived table would
+// produce 0 rows. This is detected by checking for cross-table range/inequality comparisons
+// in the WHERE clause where at least one of the referenced columns is entirely NULL in its table.
+// For example, WHERE b < c with t2.b all-NULL always evaluates to NULL (never true), yielding 0 rows.
+func (e *Executor) explainDerivedTableHasZeroRows(innerSel *sqlparser.Select) bool {
+	if e.Storage == nil || innerSel.Where == nil {
+		return false
+	}
+
+	// Collect all real table names from the FROM clause of the inner SELECT.
+	// Build a map: column qualifier (alias or table name) → real table name.
+	tableAliasMap := make(map[string]string) // lower qualifier → lower actual table name
+	for _, te := range innerSel.From {
+		e.collectDerivedTableAliasMap(te, tableAliasMap)
+	}
+	if len(tableAliasMap) < 2 {
+		// Need at least 2 tables for a cross-table comparison
+		return false
+	}
+
+	// Check for cross-table comparisons with range/inequality operators
+	return e.explainHasCrossTableNullComparison(innerSel.Where.Expr, tableAliasMap)
+}
+
+// collectDerivedTableAliasMap fills tableAliasMap with qualifier → real table name mappings
+// for all real tables (non-derived) in a table expression.
+func (e *Executor) collectDerivedTableAliasMap(te sqlparser.TableExpr, tableAliasMap map[string]string) {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if tn, ok := t.Expr.(sqlparser.TableName); ok {
+			realName := strings.ToLower(tn.Name.String())
+			tableAliasMap[realName] = realName // table name maps to itself
+			if !t.As.IsEmpty() {
+				alias := strings.ToLower(t.As.String())
+				tableAliasMap[alias] = realName // alias maps to real table name
+			}
+		}
+	case *sqlparser.JoinTableExpr:
+		e.collectDerivedTableAliasMap(t.LeftExpr, tableAliasMap)
+		e.collectDerivedTableAliasMap(t.RightExpr, tableAliasMap)
+	case *sqlparser.ParenTableExpr:
+		for _, expr := range t.Exprs {
+			e.collectDerivedTableAliasMap(expr, tableAliasMap)
+		}
+	}
+}
+
+// explainHasCrossTableNullComparison checks if the WHERE expression has any cross-table
+// range/inequality comparison where at least one of the referenced columns is entirely NULL.
+func (e *Executor) explainHasCrossTableNullComparison(expr sqlparser.Expr, tableAliasMap map[string]string) bool {
+	if expr == nil {
+		return false
+	}
+	switch x := expr.(type) {
+	case *sqlparser.AndExpr:
+		// For AND: if any branch is impossible (0 rows), the whole thing is
+		return e.explainHasCrossTableNullComparison(x.Left, tableAliasMap) ||
+			e.explainHasCrossTableNullComparison(x.Right, tableAliasMap)
+	case *sqlparser.ComparisonExpr:
+		// Only check range/inequality ops (not equality, which could be valid with NULLs in IS NULL)
+		switch x.Operator {
+		case sqlparser.LessThanOp, sqlparser.GreaterThanOp,
+			sqlparser.LessEqualOp, sqlparser.GreaterEqualOp,
+			sqlparser.NotEqualOp:
+			// Check if both sides are column references from different tables
+			leftCol, leftOk := x.Left.(*sqlparser.ColName)
+			rightCol, rightOk := x.Right.(*sqlparser.ColName)
+			if !leftOk || !rightOk {
+				return false
+			}
+			leftQual := strings.ToLower(leftCol.Qualifier.Name.String())
+			rightQual := strings.ToLower(rightCol.Qualifier.Name.String())
+			leftName := strings.ToLower(leftCol.Name.String())
+			rightName := strings.ToLower(rightCol.Name.String())
+
+			// Resolve qualifiers to real table names
+			leftTable := leftQual
+			if realName, ok := tableAliasMap[leftQual]; ok {
+				leftTable = realName
+			} else if leftQual == "" {
+				// Unqualified: search all tables for this column
+				for _, realName := range tableAliasMap {
+					leftTable = realName
+					break
+				}
+			}
+			rightTable := rightQual
+			if realName, ok := tableAliasMap[rightQual]; ok {
+				rightTable = realName
+			} else if rightQual == "" {
+				for _, realName := range tableAliasMap {
+					rightTable = realName
+					break
+				}
+			}
+
+			// Cross-table check (qualifiers from different tables)
+			if leftTable == rightTable && leftQual != "" && rightQual != "" {
+				return false // Same table, not cross-table
+			}
+
+			// Check if leftCol is all-NULL in leftTable
+			if leftTable != "" && e.explainColumnIsAllNull(leftTable, leftName) {
+				return true
+			}
+			// Check if rightCol is all-NULL in rightTable
+			if rightTable != "" && e.explainColumnIsAllNull(rightTable, rightName) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// explainColumnIsAllNull returns true if all rows in the given table have NULL for the given column.
+func (e *Executor) explainColumnIsAllNull(tableName, columnName string) bool {
+	if e.Storage == nil {
+		return false
+	}
+	tbl, err := e.Storage.GetTable(e.CurrentDB, tableName)
+	if err != nil || len(tbl.Rows) == 0 {
+		return false
+	}
+	colLower := strings.ToLower(columnName)
+	for _, row := range tbl.Rows {
+		// Check if column value is non-NULL
+		for k, v := range row {
+			if strings.ToLower(k) == colLower {
+				if v != nil {
+					return false // Found a non-NULL value
+				}
+				break // This row has NULL for this column
+			}
+		}
+		// If column key not in row map, it's NULL by default
+	}
+	return true // All rows have NULL for this column
+}
+
 // isImpossibleConstPKWhere checks if the inner SELECT's WHERE clause is a constant PK equality
 // that doesn't match any existing row, OR if ALL inner tables are empty (making the result empty).
 // Used for MySQL's "no matching row in const table" EXPLAIN optimization.
@@ -4865,12 +5186,26 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 	// Choose the best index: prefer const > eq_ref > ref > range
 	best := matches[0]
 	for _, m := range matches[1:] {
-		// Prefer more equality matches, then unique indexes
-		if m.matchedEq > best.matchedEq {
+		if best.matchedAll && m.matchedAll {
+			// Both indexes are fully matched (all columns have equality conditions).
+			// MySQL prefers the shorter key (fewer columns = fewer bytes per lookup).
+			if m.matchedEq < best.matchedEq {
+				best = m
+			} else if m.matchedEq == best.matchedEq && m.index.Unique && !best.index.Unique {
+				best = m
+			}
+		} else if m.matchedAll && !best.matchedAll {
+			// m covers all its index columns, best does not — prefer m.
 			best = m
-		} else if m.matchedEq == best.matchedEq && m.index.Unique && !best.index.Unique {
-			best = m
+		} else if !best.matchedAll && !m.matchedAll {
+			// Neither is fully matched: prefer more equality matches, then unique indexes.
+			if m.matchedEq > best.matchedEq {
+				best = m
+			} else if m.matchedEq == best.matchedEq && m.index.Unique && !best.index.Unique {
+				best = m
+			}
 		}
+		// else: best.matchedAll && !m.matchedAll → keep best
 	}
 
 	// Compute key_len for matched prefix
@@ -8964,6 +9299,15 @@ func (e *Executor) execExplainStmt(s *sqlparser.ExplainStmt, query string) (*Res
 						}
 					}
 				}
+			}
+		}
+	}
+	// Validate column references in WHERE against derived table column lists.
+	// e.g. "FROM (...) AS d1 WHERE t1.a = d1.a" where d1 only exposes "away" → error.
+	if sel, ok := s.Statement.(*sqlparser.Select); ok {
+		if sel.Where != nil {
+			if err := e.validateDerivedTableColRefs(sel); err != nil {
+				return nil, err
 			}
 		}
 	}
