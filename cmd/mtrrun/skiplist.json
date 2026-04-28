@@ -3889,10 +3889,6 @@
       "reason": "output mismatch, timeout, or error"
     },
     {
-      "test": "perfschema/idx_persisted_variables",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
       "test": "perfschema/indexed_table_io",
       "reason": "output mismatch, timeout, or error"
     },
