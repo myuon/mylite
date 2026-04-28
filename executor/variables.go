@@ -2708,6 +2708,25 @@ var sysVarEnumValues = map[string]map[string]string{
 		"STRICT":     "STRICT",
 		"IDEMPOTENT": "IDEMPOTENT",
 	},
+	"slave_parallel_type": {
+		"DATABASE":      "DATABASE",
+		"LOGICAL_CLOCK": "LOGICAL_CLOCK",
+	},
+	// slave_type_conversions is a SET type (comma-separated); empty string is valid (no conversions).
+	// Individual valid values: ALL_LOSSY, ALL_NON_LOSSY.
+	"slave_type_conversions": {
+		"":              "",
+		"ALL_LOSSY":     "ALL_LOSSY",
+		"ALL_NON_LOSSY": "ALL_NON_LOSSY",
+	},
+	// slave_rows_search_algorithms is a SET type (comma-separated).
+	// Valid values: TABLE_SCAN, INDEX_SCAN, HASH_SCAN.
+	// Canonical order: TABLE_SCAN, INDEX_SCAN, HASH_SCAN.
+	"slave_rows_search_algorithms": {
+		"TABLE_SCAN": "TABLE_SCAN",
+		"INDEX_SCAN": "INDEX_SCAN",
+		"HASH_SCAN":  "HASH_SCAN",
+	},
 	"log_output": {
 		"TABLE": "TABLE",
 		"FILE":  "FILE",
@@ -2862,6 +2881,7 @@ var sysVarBoolean = map[string]bool{
 	"log_queries_not_using_indexes": true, "log_slow_admin_statements": true,
 	"log_slow_extra": true, "log_slow_replica_statements": true,
 	"log_slow_slave_statements": true, "log_bin_trust_function_creators": true,
+	"log_statements_unsafe_for_binlog": true,
 	"binlog_order_commits": true, "binlog_rows_query_log_events": true,
 	"binlog_direct_non_transactional_updates": true, "binlog_encryption": true,
 	"binlog_transaction_compression": true,
@@ -2998,7 +3018,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"binlog_stmt_cache_size":                     {Min: 4096, Max: 18446744073709547520, IsUnsigned: true, BlockSize: 4096},
 	"binlog_expire_logs_seconds":                 {Min: 0, Max: 4294967295, IsUnsigned: true},
 	"binlog_group_commit_sync_delay":             {Min: 0, Max: 1000000, IsUnsigned: true},
-	"binlog_group_commit_sync_no_delay_count":    {Min: 0, Max: 1000000, IsUnsigned: true},
+	"binlog_group_commit_sync_no_delay_count":    {Min: 0, Max: 100000, IsUnsigned: true},
 	"binlog_max_flush_queue_time":                {Min: 0, Max: 10000, IsUnsigned: true},
 	"binlog_transaction_dependency_history_size": {Min: 1, Max: 1000000, IsUnsigned: true},
 	"cte_max_recursion_depth":                    {Min: 0, Max: 4294967295, IsUnsigned: true},
@@ -3535,6 +3555,13 @@ func normalizeEnumSetValue(name string, expr sqlparser.Expr, evalVal interface{}
 				if name == "log_output" {
 					sort.Slice(normalized, func(i, j int) bool {
 						order := map[string]int{"NONE": 0, "FILE": 1, "TABLE": 2}
+						return order[normalized[i]] < order[normalized[j]]
+					})
+				}
+				// Sort in canonical order for slave_rows_search_algorithms: TABLE_SCAN, INDEX_SCAN, HASH_SCAN
+				if name == "slave_rows_search_algorithms" {
+					sort.Slice(normalized, func(i, j int) bool {
+						order := map[string]int{"TABLE_SCAN": 0, "INDEX_SCAN": 1, "HASH_SCAN": 2}
 						return order[normalized[i]] < order[normalized[j]]
 					})
 				}

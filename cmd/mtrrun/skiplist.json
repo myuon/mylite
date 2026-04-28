@@ -2993,10 +2993,6 @@
       "reason": "output mismatch or execution error"
     },
     {
-      "test": "sys_vars/log_statements_unsafe_for_binlog_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/max_delayed_threads_basic",
       "reason": "output mismatch or execution error"
     },
@@ -3046,14 +3042,6 @@
     },
     {
       "test": "sys_vars/rpl_read_size_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/slave_parallel_type_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/slave_type_conversions_basic",
       "reason": "output mismatch or execution error"
     },
     {
@@ -3355,10 +3343,6 @@
     {
       "test": "sys_vars/insert_id_func",
       "reason": "output mismatch"
-    },
-    {
-      "test": "sys_vars/binlog_group_commit_sync_no_delay_count_basic",
-      "reason": "engine does not truncate out-of-range values for binlog_group_commit_sync_no_delay_count"
     },
     {
       "test": "sys_vars/binlog_encryption",
@@ -4483,10 +4467,6 @@
     {
       "test": "sys_vars/slave_pending_jobs_size_max_basic",
       "reason": "result file has literal $var from eval echo behavior"
-    },
-    {
-      "test": "sys_vars/slave_rows_search_algorithms_basic",
-      "reason": "needs SET value canonicalization and invalid value rejection"
     },
     {
       "test": "sys_vars/session_track_system_variables_basic",
