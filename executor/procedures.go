@@ -1719,9 +1719,10 @@ func (e *Executor) execDropProcedureAST(stmt *sqlparser.DropProcedure) (*Result,
 	}
 	// MySQL tries to revoke privileges from mysql.procs_priv when dropping a routine.
 	// If the table doesn't exist, return an error and a warning.
+	// Warning 1405 is added AFTER the error (post-error warning) to match MySQL's ordering.
 	if mysqlDB, err2 := e.Catalog.GetDatabase("mysql"); err2 == nil {
 		if _, tblErr := mysqlDB.GetTable("procs_priv"); tblErr != nil {
-			e.warnings = append(e.warnings, Warning{Level: "Warning", Code: 1405, Message: "Failed to revoke all privileges to dropped routine"})
+			e.addPostErrorWarning("Warning", 1405, "Failed to revoke all privileges to dropped routine")
 			return nil, mysqlError(1146, "42S02", "Table 'mysql.procs_priv' doesn't exist")
 		}
 	}
@@ -2507,9 +2508,10 @@ func (e *Executor) execDropFunction(query string) (*Result, error) {
 	}
 	// MySQL tries to revoke privileges from mysql.procs_priv when dropping a routine.
 	// If the table doesn't exist, return an error and a warning.
+	// Warning 1405 is added AFTER the error (post-error warning) to match MySQL's ordering.
 	if mysqlDB, err2 := e.Catalog.GetDatabase("mysql"); err2 == nil {
 		if _, tblErr := mysqlDB.GetTable("procs_priv"); tblErr != nil {
-			e.warnings = append(e.warnings, Warning{Level: "Warning", Code: 1405, Message: "Failed to revoke all privileges to dropped routine"})
+			e.addPostErrorWarning("Warning", 1405, "Failed to revoke all privileges to dropped routine")
 			return nil, mysqlError(1146, "42S02", "Table 'mysql.procs_priv' doesn't exist")
 		}
 	}

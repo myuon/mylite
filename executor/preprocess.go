@@ -292,6 +292,7 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		}
 		e.lastErrorCount = errCnt
 		e.warnings = nil
+		e.postErrorWarnings = nil
 	}
 
 	// Handle SHOW COUNT(*) WARNINGS / SHOW COUNT(*) ERRORS before parser

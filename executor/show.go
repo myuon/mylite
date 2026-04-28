@@ -919,14 +919,14 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 		// MySQL returns warnings in the order they were generated (insertion order),
 		// not sorted by severity. This matches real MySQL 8.0 behavior.
 		rows := make([][]interface{}, 0, len(e.warnings))
-		for _, w := range e.warnings {
-			rows = append(rows, []interface{}{w.Level, int64(w.Code), w.Message})
-		}
-		return &Result{
-			Columns:     []string{"Level", "Code", "Message"},
-			Rows:        rows,
-			IsResultSet: true,
-		}, nil
+	for _, w := range e.warnings {
+		rows = append(rows, []interface{}{w.Level, int64(w.Code), w.Message})
+	}
+	return &Result{
+		Columns:     []string{"Level", "Code", "Message"},
+		Rows:        rows,
+		IsResultSet: true,
+	}, nil
 	}
 
 	// SHOW ERRORS
