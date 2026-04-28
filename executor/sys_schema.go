@@ -2226,6 +2226,43 @@ func (e *Executor) evalSysSchemaFunc(name string, args []sqlparser.Expr) (interf
 		}
 		return "UNKNOWN", true, nil
 
+	case "ps_thread_id":
+		// ps_thread_id(in_connection_id) — returns the thread_id for a given connection ID.
+		// NULL argument returns the current connection's thread ID.
+		// Unknown connection ID returns NULL.
+		// Note 1585 is emitted because ps_thread_id is also a native MySQL function.
+		e.addWarning("Note", 1585, "This function 'ps_thread_id' has the same name as a native function")
+		if len(args) < 1 {
+			// No argument: return current connection's thread ID
+			return e.connectionID + 1, true, nil
+		}
+		connIDVal, err := e.evalExpr(args[0])
+		if err != nil {
+			return nil, true, err
+		}
+		if connIDVal == nil {
+			// NULL argument: return current connection's thread ID
+			return e.connectionID + 1, true, nil
+		}
+		lookupConnID := toInt64(connIDVal)
+		if lookupConnID <= 0 {
+			return nil, true, nil
+		}
+		// Current connection
+		if lookupConnID == e.connectionID {
+			return lookupConnID + 1, true, nil
+		}
+		// Check process list for other connections
+		if e.processList != nil {
+			for _, proc := range e.processList.Snapshot() {
+				if proc.ID == lookupConnID {
+					return lookupConnID + 1, true, nil
+				}
+			}
+		}
+		// Unknown connection ID -> NULL
+		return nil, true, nil
+
 	default:
 		return nil, false, nil
 	}
