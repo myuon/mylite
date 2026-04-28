@@ -4041,7 +4041,12 @@ func (e *Executor) evalExpr(expr sqlparser.Expr) (interface{}, error) {
 			if err2 != nil {
 				return nil, err2
 			}
-			srid := uint32(asInt64Or(sridVal, 0))
+			sridInt := asInt64Or(sridVal, 0)
+			// MySQL returns ERROR 22003 for SRID values outside the valid range [0, 4294967295]
+			if sridInt < 0 || sridInt > 4294967295 {
+				return nil, mysqlError(3037, "22003", "SRID value is out of range in 'st_geomfromtext'")
+			}
+			srid := uint32(sridInt)
 			return geomSetSRID(wkt, srid), nil
 		}
 		return wkt, nil
