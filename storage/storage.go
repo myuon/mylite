@@ -322,15 +322,19 @@ func (t *Table) ensureIndexes() {
 			t.pkIndex[key] = true
 		}
 	}
-	// Column-level PK
-	hasPKCol := false
+	// Column-level PK: count how many columns have PrimaryKey=true.
+	// If exactly one column has PrimaryKey=true, use colPKIndex (individual check).
+	// If multiple columns have PrimaryKey=true, they form a composite PK; use pkIndex
+	// (composite check) to avoid false duplicates when only one column value matches.
+	pkColCount := 0
+	var pkColNames []string
 	for _, col := range t.Def.Columns {
 		if col.PrimaryKey {
-			hasPKCol = true
-			break
+			pkColCount++
+			pkColNames = append(pkColNames, col.Name)
 		}
 	}
-	if hasPKCol && t.colPKIndex == nil {
+	if pkColCount == 1 && t.colPKIndex == nil {
 		t.colPKIndex = make(map[string]map[string]bool)
 		for _, col := range t.Def.Columns {
 			if col.PrimaryKey {
@@ -341,6 +345,16 @@ func (t *Table) ensureIndexes() {
 				t.colPKIndex[col.Name] = s
 			}
 		}
+	} else if pkColCount > 1 && len(t.Def.PrimaryKey) == 0 && t.pkIndex == nil {
+		// Multiple column-level PK flags with no table-level PrimaryKey slice: treat as composite PK.
+		t.pkIndex = make(map[string]bool, len(t.Rows))
+		for _, existing := range t.Rows {
+			key := bulkPKKey(existing, pkColNames)
+			t.pkIndex[key] = true
+		}
+		// Store the composite PK column list in Def.PrimaryKey so the duplicate error
+		// message and pkIndex update code can find it.
+		t.Def.PrimaryKey = pkColNames
 	}
 	// Unique indexes
 	hasUnique := false
@@ -676,12 +690,20 @@ func (t *Table) BulkInsert(rows []Row) ([]int64, error) {
 
 	// Determine if we need PK/UNIQUE checks
 	hasPK := len(t.Def.PrimaryKey) > 0
-	hasPKCol := false
+	pkColCount := 0
+	var pkColNames []string
 	for _, col := range t.Def.Columns {
 		if col.PrimaryKey {
-			hasPKCol = true
-			break
+			pkColCount++
+			pkColNames = append(pkColNames, col.Name)
 		}
+	}
+	hasPKCol := pkColCount > 0
+	// When multiple columns have PrimaryKey=true but no table-level PrimaryKey slice,
+	// treat them as a composite PK (use pkSet not colPKSets to avoid false duplicates).
+	if pkColCount > 1 && !hasPK {
+		hasPK = true
+		t.Def.PrimaryKey = pkColNames
 	}
 	hasUnique := false
 	for _, idx := range t.Def.Indexes {
@@ -706,7 +728,8 @@ func (t *Table) BulkInsert(rows []Row) ([]int64, error) {
 				pkSet[key] = true
 			}
 		}
-		if hasPKCol {
+		// Only use colPKSets for single-column PKs; composite PKs are handled by pkSet above.
+		if hasPKCol && !hasPK {
 			colPKSets = make(map[string]map[string]bool)
 			for _, col := range t.Def.Columns {
 				if col.PrimaryKey {
@@ -852,7 +875,8 @@ func (t *Table) BulkInsert(rows []Row) ([]int64, error) {
 				}
 				pkSet[key] = true
 			}
-			if hasPKCol {
+			// Only use colPKSets for single-column PKs (composite PKs are handled by pkSet above).
+			if hasPKCol && !hasPK {
 				for _, col := range t.Def.Columns {
 					if col.PrimaryKey {
 						v := rowGetCI(row, col.Name)
