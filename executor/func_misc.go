@@ -529,7 +529,10 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 			return int64(1), true, nil
 		}
 		return int64(0), true, nil
-	case "mbrintersects", "st_intersects", "mbrwithin", "st_within", "mbrcontains", "st_contains":
+	case "mbrintersects", "mbrwithin", "mbrcontains":
+		// MBR-only spatial predicates: use bounding-box comparison with MySQL 5.7 semantics.
+		// ST_CONTAINS / ST_WITHIN / ST_INTERSECTS use DE-9IM via evalSpatialFunc and are
+		// intentionally NOT handled here (they fall through to spatial_funcs.go).
 		g1Val, g2Val, hasNull, err := e.evalArgs2(v.Exprs, strings.ToUpper(name), row)
 		if err != nil {
 			return nil, true, err
@@ -537,26 +540,50 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if hasNull {
 			return nil, true, nil
 		}
-		g1Str := toString(g1Val)
-		g2Str := toString(g2Val)
+		// Convert binary WKB inputs to EWKT strings so SRID can be extracted properly.
+		g1Str, srid1 := geomValueToEWKT(g1Val)
+		g2Str, srid2 := geomValueToEWKT(g2Val)
+		// MySQL returns HY000 error when geometries have different SRIDs.
+		if srid1 != srid2 {
+			return nil, true, mysqlError(3572, "HY000", fmt.Sprintf("Binary geometry function %s given two geometries of different srids: %d and %d, which should have been identical.", name, srid1, srid2))
+		}
+		// For geographic SRIDs (e.g. 4326), validate coordinate bounds before computing relation.
+		if isGeographicSRID(srid1) {
+			isLatLong := e.sridIsLatLongOrdered(srid1)
+			if valErr := validateGeogCoordsForSpatialPredicate(g1Str, isLatLong, name); valErr != nil {
+				return nil, true, valErr
+			}
+			if valErr := validateGeogCoordsForSpatialPredicate(g2Str, isLatLong, name); valErr != nil {
+				return nil, true, valErr
+			}
+		}
+		// MySQL returns ERROR 22023 when non-geometry data is passed.
+		if !isLikelyWKT(g1Str) {
+			return nil, true, mysqlError(3516, "22023", fmt.Sprintf("Invalid GIS data provided to function %s.", name))
+		}
+		if !isLikelyWKT(g2Str) {
+			return nil, true, mysqlError(3516, "22023", fmt.Sprintf("Invalid GIS data provided to function %s.", name))
+		}
 		mbr1 := wktBoundingBox(g1Str)
 		mbr2 := wktBoundingBox(g2Str)
 		if mbr1 == nil || mbr2 == nil {
 			return nil, true, nil
 		}
-		if name == "mbrintersects" || name == "st_intersects" {
+		if name == "mbrintersects" {
 			if mbr1[2] >= mbr2[0] && mbr2[2] >= mbr1[0] && mbr1[3] >= mbr2[1] && mbr2[3] >= mbr1[1] {
 				return int64(1), true, nil
 			}
 			return int64(0), true, nil
 		}
-		if name == "mbrwithin" || name == "st_within" {
-			if mbr1[0] >= mbr2[0] && mbr1[1] >= mbr2[1] && mbr1[2] <= mbr2[2] && mbr1[3] <= mbr2[3] {
+		if name == "mbrwithin" {
+			// MBRWITHIN(g1,g2): g1's MBR is within g2's MBR (g2 contains g1)
+			if mbrContainsBoxes(mbr2, mbr1) {
 				return int64(1), true, nil
 			}
 			return int64(0), true, nil
 		}
-		if mbr2[0] >= mbr1[0] && mbr2[1] >= mbr1[1] && mbr2[2] <= mbr1[2] && mbr2[3] <= mbr1[3] {
+		// MBRCONTAINS: g1's MBR contains g2's MBR
+		if mbrContainsBoxes(mbr1, mbr2) {
 			return int64(1), true, nil
 		}
 		return int64(0), true, nil

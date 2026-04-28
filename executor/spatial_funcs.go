@@ -1376,6 +1376,37 @@ func computeDistanceSphere(a, b string) interface{} {
 	return R * c
 }
 
+// relToFuncName maps internal relation names to MySQL function names for error messages.
+func relToFuncName(rel string, mbr bool) string {
+	prefix := "st_"
+	if mbr {
+		prefix = "mbr"
+	}
+	switch rel {
+	case "contains":
+		return prefix + "contains"
+	case "within":
+		return prefix + "within"
+	case "intersects":
+		return prefix + "intersects"
+	case "disjoint":
+		return prefix + "disjoint"
+	case "touches":
+		return prefix + "touches"
+	case "overlaps":
+		return prefix + "overlaps"
+	case "crosses":
+		return prefix + "crosses"
+	case "equals":
+		return prefix + "equals"
+	case "covers":
+		return prefix + "covers"
+	case "coveredby":
+		return prefix + "coveredby"
+	}
+	return prefix + rel
+}
+
 // evalSpatialRelation evaluates spatial predicate functions (contains, within, etc.).
 func evalSpatialRelation(e *Executor, exprs []sqlparser.Expr, rel string) (interface{}, bool, error) {
 	if len(exprs) < 2 {
@@ -1394,7 +1425,37 @@ func evalSpatialRelation(e *Executor, exprs []sqlparser.Expr, rel string) (inter
 	}
 	// Simple stub: equals returns 1 for identical geometries, 0 otherwise.
 	// For other relations, use MBR-based approximation.
-	sa, sb := toString(a), toString(b)
+	// Convert binary WKB inputs to EWKT strings so SRID can be extracted properly.
+	sa, sridA := geomValueToEWKT(a)
+	sb, sridB := geomValueToEWKT(b)
+
+	// Validate SRID mismatch (MySQL returns HY000 error for mismatched SRIDs).
+	if sridA != sridB {
+		fnName := relToFuncName(rel, true)
+		return nil, true, mysqlError(3572, "HY000", fmt.Sprintf("Binary geometry function %s given two geometries of different srids: %d and %d, which should have been identical.", fnName, sridA, sridB))
+	}
+
+	// For geographic SRIDs (e.g. 4326), validate coordinate bounds before computing relation.
+	if isGeographicSRID(sridA) {
+		mbrFnName := relToFuncName(rel, true)
+		isLatLong := e.sridIsLatLongOrdered(sridA)
+		if valErr := validateGeogCoordsForSpatialPredicate(sa, isLatLong, mbrFnName); valErr != nil {
+			return nil, true, valErr
+		}
+		if valErr := validateGeogCoordsForSpatialPredicate(sb, isLatLong, mbrFnName); valErr != nil {
+			return nil, true, valErr
+		}
+	}
+
+	// Validate that geometry arguments are actually WKT geometries (not e.g. numeric columns).
+	if !isLikelyWKT(sa) {
+		fnName := relToFuncName(rel, true)
+		return nil, true, mysqlError(3516, "22023", fmt.Sprintf("Invalid GIS data provided to function %s.", fnName))
+	}
+	if !isLikelyWKT(sb) {
+		fnName := relToFuncName(rel, true)
+		return nil, true, mysqlError(3516, "22023", fmt.Sprintf("Invalid GIS data provided to function %s.", fnName))
+	}
 	switch rel {
 	case "equals":
 		if strings.EqualFold(strings.TrimSpace(sa), strings.TrimSpace(sb)) {
@@ -1485,10 +1546,48 @@ func mbrOverlap(a, b string) bool {
 	return ax1 <= bx2 && ax2 >= bx1 && ay1 <= by2 && ay2 >= by1
 }
 
+// mbrDimContains checks MySQL 5.7 MBRCONTAINS semantics for a single dimension.
+// For non-degenerate outer (oMin < oMax): inner range must strictly intersect outer's open interior.
+// For degenerate outer (oMin == oMax): inner range must equal that single value.
+func mbrDimContains(oMin, oMax, iMin, iMax float64) bool {
+	if oMin == oMax {
+		// Degenerate outer in this dimension: inner must be exactly at this value.
+		return iMin == oMin && iMax == oMin
+	}
+	// Non-degenerate outer: inner range must strictly intersect open interval (oMin, oMax).
+	// (oMin, oMax) ∩ [iMin, iMax] ≠ ∅  iff  iMin < oMax AND iMax > oMin
+	return iMin < oMax && iMax > oMin
+}
+
+// mbrContainsBoxes returns true if outer MBR box [ox1,oy1,ox2,oy2] contains inner
+// MBR box [ix1,iy1,ix2,iy2] according to MySQL 5.7 MBRCONTAINS semantics:
+//   - Exact equality → true (handles degenerate equal MBRs like POINT=POINT)
+//   - Inner weakly contained in outer (all coordinates), AND for each dimension,
+//     inner must strictly intersect the open interior of outer in that dimension
+//     (or exactly equal a degenerate outer dimension).
+func mbrContainsBoxes(outer, inner []float64) bool {
+	ox1, oy1, ox2, oy2 := outer[0], outer[1], outer[2], outer[3]
+	ix1, iy1, ix2, iy2 := inner[0], inner[1], inner[2], inner[3]
+	// Weak containment
+	if !(ox1 <= ix1 && oy1 <= iy1 && ox2 >= ix2 && oy2 >= iy2) {
+		return false
+	}
+	// Exact equality
+	if ox1 == ix1 && oy1 == iy1 && ox2 == ix2 && oy2 == iy2 {
+		return true
+	}
+	// Per-dimension containment check
+	return mbrDimContains(ox1, ox2, ix1, ix2) && mbrDimContains(oy1, oy2, iy1, iy2)
+}
+
+// mbrContains returns true if outer geometry's MBR contains inner geometry's MBR
+// according to MySQL 5.7 MBRCONTAINS semantics.
 func mbrContains(outer, inner string) bool {
 	ox1, oy1, ox2, oy2 := getMBR(outer)
 	ix1, iy1, ix2, iy2 := getMBR(inner)
-	return ox1 <= ix1 && oy1 <= iy1 && ox2 >= ix2 && oy2 >= iy2
+	outerBox := []float64{ox1, oy1, ox2, oy2}
+	innerBox := []float64{ix1, iy1, ix2, iy2}
+	return mbrContainsBoxes(outerBox, innerBox)
 }
 
 func swapXY(wkt string) interface{} {
@@ -1509,55 +1608,76 @@ func makeSpatialEnvelope(a, b string) interface{} {
 }
 
 // wktBoundingBox extracts the bounding box (MBR) from a WKT geometry string.
-// Returns [minX, minY, maxX, maxY] or nil if the geometry can't be parsed.
+// Returns [minX, minY, maxX, maxY] or nil if the geometry can't be parsed or is empty.
+// Handles all geometry types: POINT, LINESTRING, POLYGON, MULTILINESTRING,
+// MULTIPOLYGON, MULTIPOINT, GEOMETRYCOLLECTION, and GEOMCOLLECTION.
 func wktBoundingBox(wkt string) []float64 {
 	wkt = strings.TrimSpace(wkt)
 	upper := strings.ToUpper(wkt)
 
-	var allPoints [][]float64
-
-	switch {
-	case strings.HasPrefix(upper, "POINT"):
-		coords := parseSpatialPointCoords(wkt)
-		if coords == nil {
+	// Handle GEOMETRYCOLLECTION / GEOMCOLLECTION recursively.
+	if strings.HasPrefix(upper, "GEOMETRYCOLLECTION") || strings.HasPrefix(upper, "GEOMCOLLECTION") {
+		subGeoms := parseGeomCollection(wkt)
+		if len(subGeoms) == 0 {
 			return nil
 		}
-		allPoints = append(allPoints, coords)
-	case strings.HasPrefix(upper, "LINESTRING"):
-		pts := parseLineStringPoints(wkt)
-		allPoints = append(allPoints, pts...)
-	case strings.HasPrefix(upper, "POLYGON"), strings.HasPrefix(upper, "MULTIPOLYGON"):
-		rings := parsePolygonRings(wkt)
-		for _, ring := range rings {
-			allPoints = append(allPoints, ring...)
+		var minX, minY, maxX, maxY float64
+		first := true
+		for _, sg := range subGeoms {
+			bb := wktBoundingBox(sg)
+			if bb == nil {
+				continue
+			}
+			if first {
+				minX, minY, maxX, maxY = bb[0], bb[1], bb[2], bb[3]
+				first = false
+			} else {
+				if bb[0] < minX {
+					minX = bb[0]
+				}
+				if bb[1] < minY {
+					minY = bb[1]
+				}
+				if bb[2] > maxX {
+					maxX = bb[2]
+				}
+				if bb[3] > maxY {
+					maxY = bb[3]
+				}
+			}
 		}
-	case strings.HasPrefix(upper, "MULTIPOINT"):
-		rings := parsePolygonRings(wkt)
-		for _, ring := range rings {
-			allPoints = append(allPoints, ring...)
+		if first {
+			return nil
 		}
-	default:
-		return nil
+		return []float64{minX, minY, maxX, maxY}
 	}
 
-	if len(allPoints) == 0 {
+	// For all other geometry types, use getMBR which strips all parentheses and
+	// splits on commas to extract coordinate pairs — works for POINT, LINESTRING,
+	// POLYGON, MULTIPOINT, MULTILINESTRING, MULTIPOLYGON.
+	if !strings.Contains(wkt, "(") {
 		return nil
 	}
-
-	minX, minY := allPoints[0][0], allPoints[0][1]
-	maxX, maxY := minX, minY
-	for _, p := range allPoints[1:] {
-		if p[0] < minX {
-			minX = p[0]
+	minX, minY, maxX, maxY := getMBR(wkt)
+	// getMBR returns 0,0,0,0 when no coordinates were found (count == 0).
+	// We must disambiguate "no data" from "all-zero coordinates" by re-checking.
+	if minX == 0 && minY == 0 && maxX == 0 && maxY == 0 {
+		inner := wkt[strings.Index(wkt, "("):]
+		inner = strings.NewReplacer("(", " ", ")", " ").Replace(inner)
+		found := false
+		for _, part := range strings.Split(inner, ",") {
+			fields := strings.Fields(strings.TrimSpace(part))
+			if len(fields) >= 2 {
+				_, err1 := strconv.ParseFloat(fields[0], 64)
+				_, err2 := strconv.ParseFloat(fields[1], 64)
+				if err1 == nil && err2 == nil {
+					found = true
+					break
+				}
+			}
 		}
-		if p[1] < minY {
-			minY = p[1]
-		}
-		if p[0] > maxX {
-			maxX = p[0]
-		}
-		if p[1] > maxY {
-			maxY = p[1]
+		if !found {
+			return nil
 		}
 	}
 	return []float64{minX, minY, maxX, maxY}
@@ -2022,6 +2142,92 @@ func validateCoordPairsInWKT(wkt string, isLatLongSRS bool, fnName string) error
 		i++
 	}
 	return nil
+}
+
+// validateGeogCoordsForSpatialPredicate checks that all coordinate pairs in a WKT geometry
+// are within valid geographic bounds for a geographic SRS, using the MySQL error message format
+// for spatial predicate functions (ST_Contains, MBRContains, etc.).
+// For LAT-LONG SRS (isLatLongSRS=true): X is latitude in [-90,90], Y is longitude in (-180,180].
+// For LONG-LAT SRS (isLatLongSRS=false): X is longitude in (-180,180], Y is latitude in [-90,90].
+// fnName should be the lowercase function name (e.g. "st_contains").
+func validateGeogCoordsForSpatialPredicate(wkt string, isLatLongSRS bool, fnName string) error {
+	plain := strings.TrimSpace(geomStripSRID(wkt))
+	i := 0
+	n := len(plain)
+	for i < n {
+		if plain[i] == '(' || plain[i] == ',' || plain[i] == ')' {
+			i++
+			continue
+		}
+		if plain[i] == '-' || (plain[i] >= '0' && plain[i] <= '9') {
+			x, xLen := parseFloatFromWKT(plain[i:])
+			if xLen <= 0 {
+				i++
+				continue
+			}
+			j := i + xLen
+			for j < n && plain[j] == ' ' {
+				j++
+			}
+			if j < n && (plain[j] == '-' || (plain[j] >= '0' && plain[j] <= '9')) {
+				y, yLen := parseFloatFromWKT(plain[j:])
+				if yLen > 0 {
+					var lon, lat float64
+					if isLatLongSRS {
+						lat = x
+						lon = y
+					} else {
+						lon = x
+						lat = y
+					}
+					if lat < -90.0 || lat > 90.0 {
+						return mysqlError(3616, "22S03", fmt.Sprintf(
+							"A parameter of function %s contains a geometry with latitude %f, which is out of range. It must be within [-90.000000, 90.000000].",
+							fnName, lat))
+					}
+					if lon < -180.0 || lon > 180.0 {
+						return mysqlError(3617, "22S02", fmt.Sprintf(
+							"A parameter of function %s contains a geometry with longitude %f, which is out of range. It must be within (-180.000000, 180.000000].",
+							fnName, lon))
+					}
+					i = j + yLen
+					continue
+				}
+			}
+			i = j
+			continue
+		}
+		i++
+	}
+	return nil
+}
+
+// geomValueToEWKT converts a geometry value (either []byte/HexBytes WKB or string WKT) to an EWKT string.
+// For binary WKB input ([]byte or HexBytes hex string), extracts the SRID and WKT using wkbToWKTAndSRID.
+// Returns the EWKT string and the parsed SRID.
+func geomValueToEWKT(v interface{}) (string, uint32) {
+	var binData []byte
+	switch val := v.(type) {
+	case []byte:
+		binData = val
+	case HexBytes:
+		// HexBytes stores raw hex digits (e.g. "E6100000..."); decode to actual bytes.
+		if decoded, err := hex.DecodeString(string(val)); err == nil {
+			binData = decoded
+		}
+	}
+	if binData != nil {
+		wkt, srid := wkbToWKTAndSRID(binData)
+		if wkt == "" {
+			return toString(v), 0
+		}
+		if srid == 0 {
+			return wkt, 0
+		}
+		return "SRID=" + strconv.FormatUint(uint64(srid), 10) + ";" + wkt, srid
+	}
+	s := toString(v)
+	return s, geomGetSRID(s)
 }
 
 // parseFloatFromWKT parses a floating-point number from the start of s.
@@ -2757,12 +2963,151 @@ func normalizeWKTForSFMultiOnly(wkt string) string {
 	return wkt
 }
 
+// countCoordPairs counts the number of valid "x y" coordinate pairs in a ring string.
+// The ringStr should be the bare coordinate content without wrapping parens, e.g. "x1 y1,x2 y2,...".
+func countCoordPairs(ringStr string) int {
+	count := 0
+	for _, part := range strings.Split(ringStr, ",") {
+		fields := strings.Fields(strings.TrimSpace(part))
+		if len(fields) >= 2 {
+			_, e1 := strconv.ParseFloat(fields[0], 64)
+			_, e2 := strconv.ParseFloat(fields[1], 64)
+			if e1 == nil && e2 == nil {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+// extractParenContent extracts the content between the outermost parentheses of a string.
+// e.g. "(x1 y1,x2 y2)" → "x1 y1,x2 y2". Returns ("", false) if not wrapped in parens.
+func extractParenContent(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
+		return "", false
+	}
+	return s[1 : len(s)-1], true
+}
+
+// iterateParenBlocks iterates over parenthesized sub-blocks at depth=0 within an outer string.
+// For each block, fn(content) is called with the content INSIDE the parens (without the parens).
+func iterateParenBlocks(s string, fn func(content string) bool) bool {
+	depth := 0
+	start := -1
+	for i, ch := range s {
+		switch ch {
+		case '(':
+			if depth == 0 {
+				start = i + 1
+			}
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && start >= 0 {
+				if !fn(s[start:i]) {
+					return false
+				}
+				start = -1
+			}
+		}
+	}
+	return true
+}
+
+// checkWKTPointCountConstraints validates MySQL's structural point count requirements:
+//   - LINESTRING must have >= 2 coordinate pairs
+//   - Each POLYGON ring must have >= 4 coordinate pairs (3 unique + closing)
+//   - MULTILINESTRING components must each have >= 2 coordinate pairs
+//   - MULTIPOLYGON polygon rings must each have >= 4 coordinate pairs
+//   - GEOMETRYCOLLECTION/GEOMCOLLECTION: recursively validate components
+//
+// Returns false if any constraint is violated.
+func checkWKTPointCountConstraints(wkt string) bool {
+	plain := strings.TrimSpace(geomStripSRID(wkt))
+	upper := strings.ToUpper(plain)
+
+	switch {
+	case strings.HasPrefix(upper, "GEOMETRYCOLLECTION"), strings.HasPrefix(upper, "GEOMCOLLECTION"):
+		// Recursively validate each sub-geometry
+		subGeoms := parseGeomCollection(plain)
+		for _, sg := range subGeoms {
+			if !checkWKTPointCountConstraints(sg) {
+				return false
+			}
+		}
+		return true
+
+	case strings.HasPrefix(upper, "MULTIPOLYGON"):
+		// Structure: MULTIPOLYGON( (polygon1) , (polygon2) , ... )
+		// Each polygon: ( (ring1) , (ring2) , ... )
+		// Each ring: ( x1 y1, x2 y2, ... ) — must have >= 4 coord pairs
+		idx := strings.Index(plain, "(")
+		if idx < 0 {
+			return true
+		}
+		outerContent := plain[idx+1 : strings.LastIndex(plain, ")")]
+		// Iterate over polygon blocks (each wrapped in parens)
+		return iterateParenBlocks(outerContent, func(polygonContent string) bool {
+			// Iterate over ring blocks within each polygon
+			return iterateParenBlocks(polygonContent, func(ringContent string) bool {
+				if countCoordPairs(ringContent) < 4 {
+					return false
+				}
+				return true
+			})
+		})
+
+	case strings.HasPrefix(upper, "POLYGON"):
+		// Structure: POLYGON( (ring1) , (ring2) , ... )
+		// Each ring must have >= 4 coordinate pairs
+		idx := strings.Index(plain, "(")
+		if idx < 0 {
+			return true
+		}
+		outerContent := plain[idx+1 : strings.LastIndex(plain, ")")]
+		return iterateParenBlocks(outerContent, func(ringContent string) bool {
+			if countCoordPairs(ringContent) < 4 {
+				return false
+			}
+			return true
+		})
+
+	case strings.HasPrefix(upper, "MULTILINESTRING"):
+		// Structure: MULTILINESTRING( (line1) , (line2) , ... )
+		// Each component line must have >= 2 coordinate pairs
+		idx := strings.Index(plain, "(")
+		if idx < 0 {
+			return true
+		}
+		outerContent := plain[idx+1 : strings.LastIndex(plain, ")")]
+		return iterateParenBlocks(outerContent, func(lineContent string) bool {
+			if countCoordPairs(lineContent) < 2 {
+				return false
+			}
+			return true
+		})
+
+	case strings.HasPrefix(upper, "LINESTRING"):
+		// Must have >= 2 coordinate pairs
+		pts := parseLineStringPoints(plain)
+		if len(pts) < 2 {
+			return false
+		}
+		return true
+	}
+
+	return true
+}
+
 // isValidWKTSyntax validates whether a WKT string is syntactically valid according
 // to MySQL's rules for ST_GeomFromText. Returns false for invalid WKT such as:
 //   - POINT() (no coordinates)
 //   - LINESTRING with non-numeric coordinates
 //   - Unbalanced parentheses
 //   - MULTIPOINT with wrong number of coordinates per point
+//   - LINESTRING with fewer than 2 points
+//   - POLYGON ring with fewer than 4 coordinate pairs
 //
 // Valid empty multi-geometries (GEOMETRYCOLLECTION(), MULTIPOINT(), etc.) return true.
 func isValidWKTSyntax(wkt string) bool {
@@ -2792,6 +3137,10 @@ func isValidWKTSyntax(wkt string) bool {
 		}
 	}
 	if depth != 0 {
+		return false
+	}
+	// Check MySQL structural point count constraints (LINESTRING >= 2 pts, POLYGON ring >= 4 pts)
+	if !checkWKTPointCountConstraints(plain) {
 		return false
 	}
 	// Convert multi-type empty geometries to "TYPE EMPTY" for simplefeatures
@@ -3053,6 +3402,93 @@ var de9imPatterns = map[string]string{
 	"coveredby":  "T*F**F***",
 }
 
+// sfContainsGeometry returns true if gA contains gB per the DE-9IM "T*****FF*" pattern.
+// It handles known simplefeatures limitations for MULTIPOLYGON and GEOMETRYCOLLECTION:
+// - For MULTIPOLYGON: also tries union(A).contains(B) to handle cases where B is inside
+//   a single component but simplefeatures gives wrong EI due to multi-component geometry.
+// - For GEOMETRYCOLLECTION: also checks whether any individual member contains B, since
+//   simplefeatures may not properly account for lower-dimensional members whose interior
+//   coincides with a polygon boundary.
+func sfContainsGeometry(gA, gB sfgeom.Geometry) bool {
+	// Standard DE-9IM check
+	matrix, err := sfgeom.Relate(gA, gB)
+	if err != nil {
+		return false
+	}
+	match, _ := sfgeom.RelateMatches(matrix, "T*****FF*")
+	if match {
+		// MySQL returns 0 for ST_CONTAINS(MULTIPOLYGON, MULTIPOLYGON) when both are
+		// topologically equal (same spatial extent). The specific DE-9IM pattern for
+		// equal multi-component geometries is "2FFF1FFF2": interiors are equal (II=2),
+		// boundaries share only a point (BB=1), and no cross-exterior intersections.
+		// Under this pattern, MySQL returns 0 (does not consider A to "contain" B
+		// when they are identical multi-component geometries sharing boundary points).
+		if gA.Type() == sfgeom.TypeMultiPolygon && matrix == "2FFF1FFF2" {
+			return false
+		}
+		return true
+	}
+
+	// Fallback for MULTIPOLYGON: try union of all components.
+	// This is needed because simplefeatures computes DE-9IM for MULTIPOLYGON by
+	// treating it as a single multi-component geometry, which can give incorrect EI
+	// when B is inside only ONE component (e.g., a linestring inside one polygon).
+	// We only apply this fallback when B is a lower-dimensional geometry (not a polygon
+	// or multipolygon), because for polygon-in-component cases, the raw DE-9IM correctly
+	// gives EI=1 (the component polygon's boundary lies on the multipolygon's boundary).
+	if gA.Type() == sfgeom.TypeMultiPolygon {
+		bDim := gB.Dimension()
+		if bDim < 2 {
+			uA, err := sfgeom.UnaryUnion(gA)
+			if err == nil && !uA.IsEmpty() {
+				uMatrix, err := sfgeom.Relate(uA, gB)
+				if err == nil {
+					uMatch, _ := sfgeom.RelateMatches(uMatrix, "T*****FF*")
+					if uMatch {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	// Fallback for GEOMETRYCOLLECTION: check each member
+	if gA.Type() == sfgeom.TypeGeometryCollection {
+		gc := gA.MustAsGeometryCollection()
+		for i := 0; i < gc.NumGeometries(); i++ {
+			member := gc.GeometryN(i)
+			if member.IsEmpty() {
+				continue
+			}
+			if sfContainsGeometry(member, gB) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// isLikelyWKT returns true if s looks like a WKT geometry string.
+// This is used to distinguish genuine WKT parse failures from non-geometry arguments.
+func isLikelyWKT(s string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(s))
+	for _, prefix := range []string{
+		"POINT", "LINESTRING", "POLYGON",
+		"MULTIPOINT", "MULTILINESTRING", "MULTIPOLYGON",
+		"GEOMETRYCOLLECTION", "GEOMCOLLECTION",
+	} {
+		if strings.HasPrefix(upper, prefix) {
+			return true
+		}
+	}
+	// Also handle EWKT prefix
+	if strings.HasPrefix(upper, "SRID=") {
+		return true
+	}
+	return false
+}
+
 // evalSpatialRelationDE9IM evaluates ST_ spatial predicate functions using
 // the exact DE-9IM model via simplefeatures, instead of MBR approximation.
 func evalSpatialRelationDE9IM(e *Executor, exprs []sqlparser.Expr, rel string) (interface{}, bool, error) {
@@ -3070,16 +3506,129 @@ func evalSpatialRelationDE9IM(e *Executor, exprs []sqlparser.Expr, rel string) (
 	if a == nil || b == nil {
 		return nil, true, nil
 	}
-	sa, sb := toString(a), toString(b)
+	// Convert binary WKB inputs to EWKT strings so SRID can be extracted properly.
+	sa, sridA := geomValueToEWKT(a)
+	sb, sridB := geomValueToEWKT(b)
 
-	gA, err := wktToSimpleFeature(sa)
-	if err != nil {
-		// Fall back to MBR approximation on parse error.
+	// MySQL returns an error if two geometries have different SRIDs.
+	if sridA != sridB {
+		fnName := rel
+		switch rel {
+		case "contains":
+			fnName = "st_contains"
+		case "within":
+			fnName = "st_within"
+		case "intersects":
+			fnName = "st_intersects"
+		case "disjoint":
+			fnName = "st_disjoint"
+		case "touches":
+			fnName = "st_touches"
+		case "overlaps":
+			fnName = "st_overlaps"
+		case "crosses":
+			fnName = "st_crosses"
+		case "equals":
+			fnName = "st_equals"
+		case "covers":
+			fnName = "st_covers"
+		case "coveredby":
+			fnName = "st_coveredby"
+		}
+		return nil, true, mysqlError(3572, "HY000", fmt.Sprintf("Binary geometry function %s given two geometries of different srids: %d and %d, which should have been identical.", fnName, sridA, sridB))
+	}
+
+	// For geographic SRIDs (e.g. 4326), validate coordinate bounds before computing relation.
+	if isGeographicSRID(sridA) {
+		stFnName := relToFuncName(rel, false)
+		isLatLong := e.sridIsLatLongOrdered(sridA)
+		if valErr := validateGeogCoordsForSpatialPredicate(sa, isLatLong, stFnName); valErr != nil {
+			return nil, true, valErr
+		}
+		if valErr := validateGeogCoordsForSpatialPredicate(sb, isLatLong, stFnName); valErr != nil {
+			return nil, true, valErr
+		}
+	}
+
+	gA, errA := wktToSimpleFeature(sa)
+	if errA != nil {
+		// If the first geometry is not valid WKT (e.g. an integer column), return ERROR 22023.
+		// Only fall back to MBR if the WKT "looks like" a geometry (has geometry type keyword).
+		if !isLikelyWKT(sa) {
+			fnName := rel
+			switch rel {
+			case "contains":
+				fnName = "st_contains"
+			case "within":
+				fnName = "st_within"
+			case "intersects":
+				fnName = "st_intersects"
+			case "disjoint":
+				fnName = "st_disjoint"
+			case "touches":
+				fnName = "st_touches"
+			case "overlaps":
+				fnName = "st_overlaps"
+			case "crosses":
+				fnName = "st_crosses"
+			case "equals":
+				fnName = "st_equals"
+			}
+			return nil, true, mysqlError(3516, "22023", fmt.Sprintf("Invalid GIS data provided to function %s.", fnName))
+		}
 		return evalSpatialRelation(e, exprs, rel)
 	}
-	gB, err := wktToSimpleFeature(sb)
-	if err != nil {
+	gB, errB := wktToSimpleFeature(sb)
+	if errB != nil {
+		if !isLikelyWKT(sb) {
+			fnName := rel
+			switch rel {
+			case "contains":
+				fnName = "st_contains"
+			case "within":
+				fnName = "st_within"
+			case "intersects":
+				fnName = "st_intersects"
+			case "disjoint":
+				fnName = "st_disjoint"
+			case "touches":
+				fnName = "st_touches"
+			case "overlaps":
+				fnName = "st_overlaps"
+			case "crosses":
+				fnName = "st_crosses"
+			case "equals":
+				fnName = "st_equals"
+			}
+			return nil, true, mysqlError(3516, "22023", fmt.Sprintf("Invalid GIS data provided to function %s.", fnName))
+		}
 		return evalSpatialRelation(e, exprs, rel)
+	}
+
+	// MySQL returns NULL for spatial predicates when either geometry is empty.
+	if gA.IsEmpty() || gB.IsEmpty() {
+		return nil, true, nil
+	}
+
+	// MySQL returns 0 for ST_CONTAINS/ST_WITHIN when either POLYGON argument is non-simple
+	// (self-intersecting ring). simplefeatures with NoValidate accepts such polygons,
+	// but validates ring simplicity only when the geometry type is strictly Polygon.
+	// We detect this by re-parsing with full validation: if it fails for a Polygon, return 0.
+	if rel == "contains" || rel == "covers" || rel == "within" || rel == "coveredby" {
+		if gA.Type() == sfgeom.TypePolygon {
+			plainA := geomStripSRID(strings.TrimSpace(sa))
+			plainA = normalizeWKTForSF(plainA)
+			if _, errValidA := sfgeom.UnmarshalWKT(plainA); errValidA != nil {
+				return int64(0), true, nil
+			}
+		}
+		if gB.Type() == sfgeom.TypePolygon {
+			plainB := geomStripSRID(strings.TrimSpace(sb))
+			plainB = normalizeWKTForSF(plainB)
+			if _, errValidB := sfgeom.UnmarshalWKT(plainB); errValidB != nil {
+				return int64(0), true, nil
+			}
+		}
 	}
 
 	// disjoint: use negation of intersects for efficiency.
@@ -3174,6 +3723,22 @@ func evalSpatialRelationDE9IM(e *Executor, exprs []sqlparser.Expr, rel string) (
 			return int64(0), true, nil
 		}
 		return int64(1), true, nil
+	}
+
+	// "contains" and "within" use enhanced fallback for MULTIPOLYGON/GEOMETRYCOLLECTION
+	// to work around simplefeatures DE-9IM limitations with multi-component geometries.
+	if rel == "contains" || rel == "covers" {
+		if sfContainsGeometry(gA, gB) {
+			return int64(1), true, nil
+		}
+		return int64(0), true, nil
+	}
+	if rel == "within" || rel == "coveredby" {
+		// within(A, B) = contains(B, A)
+		if sfContainsGeometry(gB, gA) {
+			return int64(1), true, nil
+		}
+		return int64(0), true, nil
 	}
 
 	pat, ok := de9imPatterns[rel]
