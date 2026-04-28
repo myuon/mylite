@@ -81,153 +81,153 @@ func distinctPrefixCounts(rows []storage.Row, cols []string) []int64 {
 
 // infoSchemaColumnOrder defines the canonical column order for INFORMATION_SCHEMA tables.
 var infoSchemaColumnOrder = map[string][]string{
-	"schemata":                 {"CATALOG_NAME", "SCHEMA_NAME", "DEFAULT_CHARACTER_SET_NAME", "DEFAULT_COLLATION_NAME", "SQL_PATH", "DEFAULT_ENCRYPTION"},
-	"tables":                   {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE", "ENGINE", "VERSION", "ROW_FORMAT", "TABLE_ROWS", "AVG_ROW_LENGTH", "DATA_LENGTH", "MAX_DATA_LENGTH", "INDEX_LENGTH", "DATA_FREE", "AUTO_INCREMENT", "CREATE_TIME", "UPDATE_TIME", "CHECK_TIME", "TABLE_COLLATION", "CHECKSUM", "CREATE_OPTIONS", "TABLE_COMMENT"},
-	"columns":                  {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "COLUMN_DEFAULT", "IS_NULLABLE", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH", "CHARACTER_OCTET_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE", "DATETIME_PRECISION", "CHARACTER_SET_NAME", "COLLATION_NAME", "COLUMN_TYPE", "COLUMN_KEY", "EXTRA", "PRIVILEGES", "COLUMN_COMMENT", "GENERATION_EXPRESSION", "SRS_ID"},
-	"statistics":               {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "NON_UNIQUE", "INDEX_SCHEMA", "INDEX_NAME", "SEQ_IN_INDEX", "COLUMN_NAME", "COLLATION", "CARDINALITY", "SUB_PART", "PACKED", "NULLABLE", "INDEX_TYPE", "COMMENT", "INDEX_COMMENT", "IS_VISIBLE", "EXPRESSION"},
-	"column_statistics":        {"SCHEMA_NAME", "TABLE_NAME", "COLUMN_NAME", "HISTOGRAM"},
-	"engines":                  {"ENGINE", "SUPPORT", "COMMENT", "TRANSACTIONS", "XA", "SAVEPOINTS"},
-	"innodb_tables":            {"TABLE_ID", "NAME", "SPACE", "FLAG", "N_COLS", "ROW_FORMAT", "ZIP_PAGE_SIZE", "SPACE_TYPE"},
-	"innodb_tablespaces":       {"SPACE", "NAME", "ROW_FORMAT", "PAGE_SIZE", "ZIP_PAGE_SIZE", "SPACE_TYPE"},
-	"innodb_datafiles":         {"SPACE", "PATH"},
-	"innodb_columns":           {"TABLE_ID", "NAME", "POS", "MTYPE", "PRTYPE", "LEN"},
-	"innodb_virtual":           {"TABLE_ID", "POS", "BASE_POS"},
-	"innodb_foreign":           {"ID", "FOR_NAME", "REF_NAME", "N_COLS", "TYPE"},
-	"innodb_metrics":           {"NAME", "COUNT", "TYPE", "STATUS", "SUBSYSTEM", "COMMENT"},
-	"innodb_cached_indexes":    {"SPACE_ID", "INDEX_ID", "N_CACHED_PAGES"},
-	"innodb_indexes":           {"INDEX_ID", "NAME", "TABLE_ID", "TYPE", "SPACE"},
-	"innodb_buffer_page_lru":   {"POOL_ID", "LRU_POSITION", "SPACE", "PAGE_NUMBER"},
-	"innodb_buffer_page":       {"SPACE", "PAGE_NUMBER", "PAGE_TYPE", "NUMBER_RECORDS", "TABLE_NAME"},
-	"innodb_buffer_pool_stats": {"POOL_ID", "POOL_SIZE"},
-	"innodb_cmp":               {"page_size", "compress_ops", "compress_ops_ok", "compress_time", "uncompress_ops", "uncompress_time"},
-	"innodb_cmp_reset":         {"page_size", "compress_ops", "compress_ops_ok", "compress_time", "uncompress_ops", "uncompress_time"},
-	"innodb_cmpmem":            {"page_size", "buffer_pool_instance", "pages_used", "pages_free", "relocation_ops", "relocation_time"},
-	"innodb_cmpmem_reset":      {"page_size", "buffer_pool_instance", "pages_used", "pages_free", "relocation_ops", "relocation_time"},
-	"innodb_trx":               {"trx_id", "trx_state", "trx_started", "trx_requested_lock_id", "trx_wait_started", "trx_weight", "trx_mysql_thread_id", "trx_query", "trx_operation_state", "trx_tables_in_use", "trx_tables_locked", "trx_lock_structs", "trx_lock_memory_bytes", "trx_rows_locked", "trx_rows_modified", "trx_concurrency_tickets", "trx_isolation_level", "trx_unique_checks", "trx_foreign_key_checks", "trx_last_foreign_key_error", "trx_adaptive_hash_latched", "trx_adaptive_hash_timeout", "trx_is_read_only", "trx_autocommit_non_locking"},
-	"innodb_foreign_cols":      {"ID", "FOR_COL_NAME", "REF_COL_NAME", "POS"},
-	"innodb_fields":            {"INDEX_ID", "NAME", "POS"},
-	"optimizer_trace":          {"QUERY", "TRACE", "MISSING_BYTES_BEYOND_MAX_MEM_SIZE", "INSUFFICIENT_PRIVILEGES"},
-	"files":                    {"FILE_NAME", "FILE_TYPE", "TABLESPACE_NAME"},
-	"processlist":              {"ID", "USER", "HOST", "DB", "COMMAND", "TIME", "STATE", "INFO"},
-	"key_column_usage":         {"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "POSITION_IN_UNIQUE_CONSTRAINT", "REFERENCED_TABLE_SCHEMA", "REFERENCED_TABLE_NAME", "REFERENCED_COLUMN_NAME"},
-	"referential_constraints":  {"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "UNIQUE_CONSTRAINT_CATALOG", "UNIQUE_CONSTRAINT_SCHEMA", "UNIQUE_CONSTRAINT_NAME", "MATCH_OPTION", "UPDATE_RULE", "DELETE_RULE", "TABLE_NAME", "REFERENCED_TABLE_NAME"},
-	"innodb_temp_table_info":          {"TABLE_ID", "NAME", "N_COLS", "SPACE"},
-	"global_variables":                {"VARIABLE_NAME", "VARIABLE_VALUE"},
-	"session_variables":               {"VARIABLE_NAME", "VARIABLE_VALUE"},
-	"events_waits_history_long":       {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SPINS", "OBJECT_SCHEMA", "OBJECT_NAME", "INDEX_NAME", "OBJECT_TYPE", "OBJECT_INSTANCE_BEGIN", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE", "OPERATION", "NUMBER_OF_BYTES", "FLAGS"},
-	"events_waits_current":            {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SPINS", "OBJECT_SCHEMA", "OBJECT_NAME", "INDEX_NAME", "OBJECT_TYPE", "OBJECT_INSTANCE_BEGIN", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE", "OPERATION", "NUMBER_OF_BYTES", "FLAGS"},
-	"events_statements_history_long":  {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SQL_TEXT", "DIGEST", "DIGEST_TEXT"},
-	"events_stages_history_long":      {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "WORK_COMPLETED", "WORK_ESTIMATED", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
-	"performance_timers":              {"TIMER_NAME", "TIMER_FREQUENCY", "TIMER_RESOLUTION", "TIMER_OVERHEAD"},
-	"threads":                         {"THREAD_ID", "NAME", "TYPE", "PROCESSLIST_ID", "PROCESSLIST_USER", "PROCESSLIST_HOST", "PROCESSLIST_DB", "PROCESSLIST_COMMAND", "PROCESSLIST_TIME", "PROCESSLIST_STATE", "PROCESSLIST_INFO", "PARENT_THREAD_ID", "ROLE", "INSTRUMENTED", "HISTORY", "CONNECTION_TYPE", "THREAD_OS_ID", "RESOURCE_GROUP"},
-	"setup_actors":                    {"HOST", "USER", "ROLE", "ENABLED", "HISTORY"},
-	"triggers":                        {"TRIGGER_CATALOG", "TRIGGER_SCHEMA", "TRIGGER_NAME", "EVENT_MANIPULATION", "EVENT_OBJECT_CATALOG", "EVENT_OBJECT_SCHEMA", "EVENT_OBJECT_TABLE", "ACTION_ORDER", "ACTION_CONDITION", "ACTION_STATEMENT", "ACTION_ORIENTATION", "ACTION_TIMING", "ACTION_REFERENCE_OLD_TABLE", "ACTION_REFERENCE_NEW_TABLE", "ACTION_REFERENCE_OLD_ROW", "ACTION_REFERENCE_NEW_ROW", "CREATED", "SQL_MODE", "DEFINER", "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION", "DATABASE_COLLATION"},
-	"table_constraints":               {"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "TABLE_SCHEMA", "TABLE_NAME", "CONSTRAINT_TYPE", "ENFORCED"},
-	"check_constraints":               {"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "CHECK_CLAUSE"},
-	"character_sets":                   {"CHARACTER_SET_NAME", "DEFAULT_COLLATE_NAME", "DESCRIPTION", "MAXLEN"},
-	"collations":                       {"COLLATION_NAME", "CHARACTER_SET_NAME", "ID", "IS_DEFAULT", "IS_COMPILED", "SORTLEN", "PAD_ATTRIBUTE"},
+	"schemata":                              {"CATALOG_NAME", "SCHEMA_NAME", "DEFAULT_CHARACTER_SET_NAME", "DEFAULT_COLLATION_NAME", "SQL_PATH", "DEFAULT_ENCRYPTION"},
+	"tables":                                {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE", "ENGINE", "VERSION", "ROW_FORMAT", "TABLE_ROWS", "AVG_ROW_LENGTH", "DATA_LENGTH", "MAX_DATA_LENGTH", "INDEX_LENGTH", "DATA_FREE", "AUTO_INCREMENT", "CREATE_TIME", "UPDATE_TIME", "CHECK_TIME", "TABLE_COLLATION", "CHECKSUM", "CREATE_OPTIONS", "TABLE_COMMENT"},
+	"columns":                               {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "COLUMN_DEFAULT", "IS_NULLABLE", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH", "CHARACTER_OCTET_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE", "DATETIME_PRECISION", "CHARACTER_SET_NAME", "COLLATION_NAME", "COLUMN_TYPE", "COLUMN_KEY", "EXTRA", "PRIVILEGES", "COLUMN_COMMENT", "GENERATION_EXPRESSION", "SRS_ID"},
+	"statistics":                            {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "NON_UNIQUE", "INDEX_SCHEMA", "INDEX_NAME", "SEQ_IN_INDEX", "COLUMN_NAME", "COLLATION", "CARDINALITY", "SUB_PART", "PACKED", "NULLABLE", "INDEX_TYPE", "COMMENT", "INDEX_COMMENT", "IS_VISIBLE", "EXPRESSION"},
+	"column_statistics":                     {"SCHEMA_NAME", "TABLE_NAME", "COLUMN_NAME", "HISTOGRAM"},
+	"engines":                               {"ENGINE", "SUPPORT", "COMMENT", "TRANSACTIONS", "XA", "SAVEPOINTS"},
+	"innodb_tables":                         {"TABLE_ID", "NAME", "SPACE", "FLAG", "N_COLS", "ROW_FORMAT", "ZIP_PAGE_SIZE", "SPACE_TYPE"},
+	"innodb_tablespaces":                    {"SPACE", "NAME", "ROW_FORMAT", "PAGE_SIZE", "ZIP_PAGE_SIZE", "SPACE_TYPE"},
+	"innodb_datafiles":                      {"SPACE", "PATH"},
+	"innodb_columns":                        {"TABLE_ID", "NAME", "POS", "MTYPE", "PRTYPE", "LEN"},
+	"innodb_virtual":                        {"TABLE_ID", "POS", "BASE_POS"},
+	"innodb_foreign":                        {"ID", "FOR_NAME", "REF_NAME", "N_COLS", "TYPE"},
+	"innodb_metrics":                        {"NAME", "COUNT", "TYPE", "STATUS", "SUBSYSTEM", "COMMENT"},
+	"innodb_cached_indexes":                 {"SPACE_ID", "INDEX_ID", "N_CACHED_PAGES"},
+	"innodb_indexes":                        {"INDEX_ID", "NAME", "TABLE_ID", "TYPE", "SPACE"},
+	"innodb_buffer_page_lru":                {"POOL_ID", "LRU_POSITION", "SPACE", "PAGE_NUMBER"},
+	"innodb_buffer_page":                    {"SPACE", "PAGE_NUMBER", "PAGE_TYPE", "NUMBER_RECORDS", "TABLE_NAME"},
+	"innodb_buffer_pool_stats":              {"POOL_ID", "POOL_SIZE"},
+	"innodb_cmp":                            {"page_size", "compress_ops", "compress_ops_ok", "compress_time", "uncompress_ops", "uncompress_time"},
+	"innodb_cmp_reset":                      {"page_size", "compress_ops", "compress_ops_ok", "compress_time", "uncompress_ops", "uncompress_time"},
+	"innodb_cmpmem":                         {"page_size", "buffer_pool_instance", "pages_used", "pages_free", "relocation_ops", "relocation_time"},
+	"innodb_cmpmem_reset":                   {"page_size", "buffer_pool_instance", "pages_used", "pages_free", "relocation_ops", "relocation_time"},
+	"innodb_trx":                            {"trx_id", "trx_state", "trx_started", "trx_requested_lock_id", "trx_wait_started", "trx_weight", "trx_mysql_thread_id", "trx_query", "trx_operation_state", "trx_tables_in_use", "trx_tables_locked", "trx_lock_structs", "trx_lock_memory_bytes", "trx_rows_locked", "trx_rows_modified", "trx_concurrency_tickets", "trx_isolation_level", "trx_unique_checks", "trx_foreign_key_checks", "trx_last_foreign_key_error", "trx_adaptive_hash_latched", "trx_adaptive_hash_timeout", "trx_is_read_only", "trx_autocommit_non_locking"},
+	"innodb_foreign_cols":                   {"ID", "FOR_COL_NAME", "REF_COL_NAME", "POS"},
+	"innodb_fields":                         {"INDEX_ID", "NAME", "POS"},
+	"optimizer_trace":                       {"QUERY", "TRACE", "MISSING_BYTES_BEYOND_MAX_MEM_SIZE", "INSUFFICIENT_PRIVILEGES"},
+	"files":                                 {"FILE_NAME", "FILE_TYPE", "TABLESPACE_NAME"},
+	"processlist":                           {"ID", "USER", "HOST", "DB", "COMMAND", "TIME", "STATE", "INFO"},
+	"key_column_usage":                      {"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "POSITION_IN_UNIQUE_CONSTRAINT", "REFERENCED_TABLE_SCHEMA", "REFERENCED_TABLE_NAME", "REFERENCED_COLUMN_NAME"},
+	"referential_constraints":               {"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "UNIQUE_CONSTRAINT_CATALOG", "UNIQUE_CONSTRAINT_SCHEMA", "UNIQUE_CONSTRAINT_NAME", "MATCH_OPTION", "UPDATE_RULE", "DELETE_RULE", "TABLE_NAME", "REFERENCED_TABLE_NAME"},
+	"innodb_temp_table_info":                {"TABLE_ID", "NAME", "N_COLS", "SPACE"},
+	"global_variables":                      {"VARIABLE_NAME", "VARIABLE_VALUE"},
+	"session_variables":                     {"VARIABLE_NAME", "VARIABLE_VALUE"},
+	"events_waits_history_long":             {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SPINS", "OBJECT_SCHEMA", "OBJECT_NAME", "INDEX_NAME", "OBJECT_TYPE", "OBJECT_INSTANCE_BEGIN", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE", "OPERATION", "NUMBER_OF_BYTES", "FLAGS"},
+	"events_waits_current":                  {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SPINS", "OBJECT_SCHEMA", "OBJECT_NAME", "INDEX_NAME", "OBJECT_TYPE", "OBJECT_INSTANCE_BEGIN", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE", "OPERATION", "NUMBER_OF_BYTES", "FLAGS"},
+	"events_statements_history_long":        {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SQL_TEXT", "DIGEST", "DIGEST_TEXT"},
+	"events_stages_history_long":            {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "WORK_COMPLETED", "WORK_ESTIMATED", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
+	"performance_timers":                    {"TIMER_NAME", "TIMER_FREQUENCY", "TIMER_RESOLUTION", "TIMER_OVERHEAD"},
+	"threads":                               {"THREAD_ID", "NAME", "TYPE", "PROCESSLIST_ID", "PROCESSLIST_USER", "PROCESSLIST_HOST", "PROCESSLIST_DB", "PROCESSLIST_COMMAND", "PROCESSLIST_TIME", "PROCESSLIST_STATE", "PROCESSLIST_INFO", "PARENT_THREAD_ID", "ROLE", "INSTRUMENTED", "HISTORY", "CONNECTION_TYPE", "THREAD_OS_ID", "RESOURCE_GROUP"},
+	"setup_actors":                          {"HOST", "USER", "ROLE", "ENABLED", "HISTORY"},
+	"triggers":                              {"TRIGGER_CATALOG", "TRIGGER_SCHEMA", "TRIGGER_NAME", "EVENT_MANIPULATION", "EVENT_OBJECT_CATALOG", "EVENT_OBJECT_SCHEMA", "EVENT_OBJECT_TABLE", "ACTION_ORDER", "ACTION_CONDITION", "ACTION_STATEMENT", "ACTION_ORIENTATION", "ACTION_TIMING", "ACTION_REFERENCE_OLD_TABLE", "ACTION_REFERENCE_NEW_TABLE", "ACTION_REFERENCE_OLD_ROW", "ACTION_REFERENCE_NEW_ROW", "CREATED", "SQL_MODE", "DEFINER", "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION", "DATABASE_COLLATION"},
+	"table_constraints":                     {"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "TABLE_SCHEMA", "TABLE_NAME", "CONSTRAINT_TYPE", "ENFORCED"},
+	"check_constraints":                     {"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "CHECK_CLAUSE"},
+	"character_sets":                        {"CHARACTER_SET_NAME", "DEFAULT_COLLATE_NAME", "DESCRIPTION", "MAXLEN"},
+	"collations":                            {"COLLATION_NAME", "CHARACTER_SET_NAME", "ID", "IS_DEFAULT", "IS_COMPILED", "SORTLEN", "PAD_ATTRIBUTE"},
 	"collation_character_set_applicability": {"COLLATION_NAME", "CHARACTER_SET_NAME"},
-	"user_privileges":                  {"GRANTEE", "TABLE_CATALOG", "PRIVILEGE_TYPE", "IS_GRANTABLE"},
-	"schema_privileges":                {"GRANTEE", "TABLE_CATALOG", "TABLE_SCHEMA", "PRIVILEGE_TYPE", "IS_GRANTABLE"},
-	"table_privileges":                 {"GRANTEE", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "PRIVILEGE_TYPE", "IS_GRANTABLE"},
-	"column_privileges":                {"GRANTEE", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "PRIVILEGE_TYPE", "IS_GRANTABLE"},
-	"routines":                         {"SPECIFIC_NAME", "ROUTINE_CATALOG", "ROUTINE_SCHEMA", "ROUTINE_NAME", "ROUTINE_TYPE", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH", "CHARACTER_OCTET_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE", "DATETIME_PRECISION", "CHARACTER_SET_NAME", "COLLATION_NAME", "DTD_IDENTIFIER", "ROUTINE_BODY", "ROUTINE_DEFINITION", "EXTERNAL_NAME", "EXTERNAL_LANGUAGE", "PARAMETER_STYLE", "IS_DETERMINISTIC", "SQL_DATA_ACCESS", "SQL_PATH", "SECURITY_TYPE", "CREATED", "LAST_ALTERED", "SQL_MODE", "ROUTINE_COMMENT", "DEFINER", "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION", "DATABASE_COLLATION"},
-	"views":                            {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "VIEW_DEFINITION", "CHECK_OPTION", "IS_UPDATABLE", "DEFINER", "SECURITY_TYPE", "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION"},
-	"st_spatial_reference_systems":     {"SRS_NAME", "SRS_ID", "ORGANIZATION", "ORGANIZATION_COORDSYS_ID", "DEFINITION", "DESCRIPTION"},
-	"st_geometry_columns":              {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "SRS_NAME", "SRS_ID", "GEOMETRY_TYPE_NAME"},
-	"st_units_of_measure":              {"UNIT_NAME", "UNIT_TYPE", "CONVERSION_FACTOR", "DESCRIPTION"},
+	"user_privileges":                       {"GRANTEE", "TABLE_CATALOG", "PRIVILEGE_TYPE", "IS_GRANTABLE"},
+	"schema_privileges":                     {"GRANTEE", "TABLE_CATALOG", "TABLE_SCHEMA", "PRIVILEGE_TYPE", "IS_GRANTABLE"},
+	"table_privileges":                      {"GRANTEE", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "PRIVILEGE_TYPE", "IS_GRANTABLE"},
+	"column_privileges":                     {"GRANTEE", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "PRIVILEGE_TYPE", "IS_GRANTABLE"},
+	"routines":                              {"SPECIFIC_NAME", "ROUTINE_CATALOG", "ROUTINE_SCHEMA", "ROUTINE_NAME", "ROUTINE_TYPE", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH", "CHARACTER_OCTET_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE", "DATETIME_PRECISION", "CHARACTER_SET_NAME", "COLLATION_NAME", "DTD_IDENTIFIER", "ROUTINE_BODY", "ROUTINE_DEFINITION", "EXTERNAL_NAME", "EXTERNAL_LANGUAGE", "PARAMETER_STYLE", "IS_DETERMINISTIC", "SQL_DATA_ACCESS", "SQL_PATH", "SECURITY_TYPE", "CREATED", "LAST_ALTERED", "SQL_MODE", "ROUTINE_COMMENT", "DEFINER", "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION", "DATABASE_COLLATION"},
+	"views":                                 {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "VIEW_DEFINITION", "CHECK_OPTION", "IS_UPDATABLE", "DEFINER", "SECURITY_TYPE", "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION"},
+	"st_spatial_reference_systems":          {"SRS_NAME", "SRS_ID", "ORGANIZATION", "ORGANIZATION_COORDSYS_ID", "DEFINITION", "DESCRIPTION"},
+	"st_geometry_columns":                   {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "SRS_NAME", "SRS_ID", "GEOMETRY_TYPE_NAME"},
+	"st_units_of_measure":                   {"UNIT_NAME", "UNIT_TYPE", "CONVERSION_FACTOR", "DESCRIPTION"},
 	// performance_schema stub tables
-	"accounts":                         {"USER", "HOST", "CURRENT_CONNECTIONS", "TOTAL_CONNECTIONS"},
-	"users":                            {"USER", "CURRENT_CONNECTIONS", "TOTAL_CONNECTIONS"},
-	"hosts":                            {"HOST", "CURRENT_CONNECTIONS", "TOTAL_CONNECTIONS"},
-	"setup_objects":                    {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "ENABLED", "TIMED"},
-	"setup_instruments":                {"NAME", "ENABLED", "TIMED", "PROPERTIES", "VOLATILITY", "DOCUMENTATION"},
-	"setup_threads":                    {"NAME", "ENABLED", "HISTORY", "PROPERTIES", "VOLATILITY", "DOCUMENTATION"},
-	"persisted_variables":              {"VARIABLE_NAME", "VARIABLE_VALUE"},
-	"variables_info":                   {"VARIABLE_NAME", "VARIABLE_SOURCE", "VARIABLE_PATH", "MIN_VALUE", "MAX_VALUE", "SET_TIME", "SET_USER", "SET_HOST"},
-	"variables_by_thread":              {"THREAD_ID", "VARIABLE_NAME", "VARIABLE_VALUE"},
-	"mutex_instances":                  {"NAME", "OBJECT_INSTANCE_BEGIN", "LOCKED_BY_THREAD_ID"},
-	"rwlock_instances":                 {"NAME", "OBJECT_INSTANCE_BEGIN", "WRITE_LOCKED_BY_THREAD_ID", "READ_LOCKED_BY_COUNT"},
-	"cond_instances":                   {"NAME", "OBJECT_INSTANCE_BEGIN"},
-	"file_instances":                   {"FILE_NAME", "EVENT_NAME", "OPEN_COUNT"},
-	"file_summary_by_instance":         {"FILE_NAME", "EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "COUNT_STAR", "SUM_TIMER_WAIT"},
-	"file_summary_by_event_name":       {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "COUNT_READ", "SUM_TIMER_READ", "SUM_NUMBER_OF_BYTES_READ", "COUNT_WRITE", "SUM_TIMER_WRITE", "SUM_NUMBER_OF_BYTES_WRITE", "COUNT_MISC", "SUM_TIMER_MISC"},
-	"socket_instances":                 {"EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "THREAD_ID", "SOCKET_ID", "IP", "PORT", "STATE"},
-	"socket_summary_by_event_name":     {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"socket_summary_by_instance":       {"EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "COUNT_STAR", "SUM_TIMER_WAIT"},
-	"table_handles":                    {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "OBJECT_INSTANCE_BEGIN", "OWNER_THREAD_ID", "OWNER_EVENT_ID", "INTERNAL_LOCK", "EXTERNAL_LOCK"},
-	"table_io_waits_summary_by_table":  {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "COUNT_READ", "COUNT_WRITE", "COUNT_FETCH", "COUNT_INSERT", "COUNT_UPDATE", "COUNT_DELETE"},
-	"table_io_waits_summary_by_index_usage": {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "INDEX_NAME", "COUNT_STAR", "SUM_TIMER_WAIT"},
-	"table_lock_waits_summary_by_table": {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT"},
-	"events_waits_history":             {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SPINS", "OBJECT_SCHEMA", "OBJECT_NAME", "INDEX_NAME", "OBJECT_TYPE", "OBJECT_INSTANCE_BEGIN", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE", "OPERATION", "NUMBER_OF_BYTES", "FLAGS"},
-	"events_stages_current":            {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "WORK_COMPLETED", "WORK_ESTIMATED", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
-	"events_stages_history":            {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "WORK_COMPLETED", "WORK_ESTIMATED", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
-	"events_statements_current":        {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SQL_TEXT", "DIGEST", "DIGEST_TEXT", "CURRENT_SCHEMA", "ROWS_AFFECTED", "ROWS_SENT", "ROWS_EXAMINED", "CREATED_TMP_DISK_TABLES", "CREATED_TMP_TABLES", "ERRORS", "WARNINGS", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
-	"events_statements_history":        {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SQL_TEXT", "DIGEST", "DIGEST_TEXT"},
-	"events_transactions_current":      {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "STATE", "TRX_ID", "GTID", "XID_FORMAT_ID", "XID_GTRID", "XID_BQUAL", "XA_STATE", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "ACCESS_MODE", "ISOLATION_LEVEL", "AUTOCOMMIT", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
-	"events_transactions_history":      {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "STATE", "TRX_ID", "GTID", "XID_FORMAT_ID", "XID_GTRID", "XID_BQUAL", "XA_STATE", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "ACCESS_MODE", "ISOLATION_LEVEL", "AUTOCOMMIT", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
-	"events_transactions_history_long": {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "STATE", "TRX_ID", "GTID", "XID_FORMAT_ID", "XID_GTRID", "XID_BQUAL", "XA_STATE", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "ACCESS_MODE", "ISOLATION_LEVEL", "AUTOCOMMIT", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
-	"events_waits_summary_by_account_by_event_name":  {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"events_waits_summary_by_host_by_event_name":     {"HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"events_waits_summary_by_instance":               {"EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"events_waits_summary_by_thread_by_event_name":   {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"events_waits_summary_by_user_by_event_name":     {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"events_waits_summary_global_by_event_name":      {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"events_stages_summary_by_account_by_event_name": {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"events_stages_summary_by_host_by_event_name":    {"HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"events_stages_summary_by_thread_by_event_name":  {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"events_stages_summary_by_user_by_event_name":    {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"events_stages_summary_global_by_event_name":     {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"events_statements_summary_by_account_by_event_name": {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
-	"events_statements_summary_by_digest":           {"SCHEMA_NAME", "DIGEST", "DIGEST_TEXT", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED", "FIRST_SEEN", "LAST_SEEN", "QUANTILE_95", "QUANTILE_99", "QUANTILE_999", "QUERY_SAMPLE_TEXT", "QUERY_SAMPLE_SEEN", "QUERY_SAMPLE_TIMER_WAIT"},
-	"events_statements_summary_by_host_by_event_name":   {"HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
-	"events_statements_summary_by_thread_by_event_name": {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
-	"events_statements_summary_by_user_by_event_name":   {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
-	"events_statements_summary_global_by_event_name":    {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
-	"events_statements_summary_by_program":   {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "COUNT_STATEMENTS", "SUM_STATEMENTS_WAIT", "MIN_STATEMENTS_WAIT", "AVG_STATEMENTS_WAIT", "MAX_STATEMENTS_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
-	"events_statements_histogram_by_digest":  {"SCHEMA_NAME", "DIGEST", "BUCKET_NUMBER", "BUCKET_TIMER_LOW", "BUCKET_TIMER_HIGH", "COUNT_BUCKET", "COUNT_BUCKET_AND_LOWER", "BUCKET_QUANTILE"},
-	"events_statements_histogram_global":     {"BUCKET_NUMBER", "BUCKET_TIMER_LOW", "BUCKET_TIMER_HIGH", "COUNT_BUCKET", "COUNT_BUCKET_AND_LOWER", "BUCKET_QUANTILE"},
+	"accounts":                                             {"USER", "HOST", "CURRENT_CONNECTIONS", "TOTAL_CONNECTIONS"},
+	"users":                                                {"USER", "CURRENT_CONNECTIONS", "TOTAL_CONNECTIONS"},
+	"hosts":                                                {"HOST", "CURRENT_CONNECTIONS", "TOTAL_CONNECTIONS"},
+	"setup_objects":                                        {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "ENABLED", "TIMED"},
+	"setup_instruments":                                    {"NAME", "ENABLED", "TIMED", "PROPERTIES", "VOLATILITY", "DOCUMENTATION"},
+	"setup_threads":                                        {"NAME", "ENABLED", "HISTORY", "PROPERTIES", "VOLATILITY", "DOCUMENTATION"},
+	"persisted_variables":                                  {"VARIABLE_NAME", "VARIABLE_VALUE"},
+	"variables_info":                                       {"VARIABLE_NAME", "VARIABLE_SOURCE", "VARIABLE_PATH", "MIN_VALUE", "MAX_VALUE", "SET_TIME", "SET_USER", "SET_HOST"},
+	"variables_by_thread":                                  {"THREAD_ID", "VARIABLE_NAME", "VARIABLE_VALUE"},
+	"mutex_instances":                                      {"NAME", "OBJECT_INSTANCE_BEGIN", "LOCKED_BY_THREAD_ID"},
+	"rwlock_instances":                                     {"NAME", "OBJECT_INSTANCE_BEGIN", "WRITE_LOCKED_BY_THREAD_ID", "READ_LOCKED_BY_COUNT"},
+	"cond_instances":                                       {"NAME", "OBJECT_INSTANCE_BEGIN"},
+	"file_instances":                                       {"FILE_NAME", "EVENT_NAME", "OPEN_COUNT"},
+	"file_summary_by_instance":                             {"FILE_NAME", "EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "COUNT_STAR", "SUM_TIMER_WAIT"},
+	"file_summary_by_event_name":                           {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "COUNT_READ", "SUM_TIMER_READ", "SUM_NUMBER_OF_BYTES_READ", "COUNT_WRITE", "SUM_TIMER_WRITE", "SUM_NUMBER_OF_BYTES_WRITE", "COUNT_MISC", "SUM_TIMER_MISC"},
+	"socket_instances":                                     {"EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "THREAD_ID", "SOCKET_ID", "IP", "PORT", "STATE"},
+	"socket_summary_by_event_name":                         {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"socket_summary_by_instance":                           {"EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "COUNT_STAR", "SUM_TIMER_WAIT"},
+	"table_handles":                                        {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "OBJECT_INSTANCE_BEGIN", "OWNER_THREAD_ID", "OWNER_EVENT_ID", "INTERNAL_LOCK", "EXTERNAL_LOCK"},
+	"table_io_waits_summary_by_table":                      {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "COUNT_READ", "COUNT_WRITE", "COUNT_FETCH", "COUNT_INSERT", "COUNT_UPDATE", "COUNT_DELETE"},
+	"table_io_waits_summary_by_index_usage":                {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "INDEX_NAME", "COUNT_STAR", "SUM_TIMER_WAIT"},
+	"table_lock_waits_summary_by_table":                    {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT"},
+	"events_waits_history":                                 {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SPINS", "OBJECT_SCHEMA", "OBJECT_NAME", "INDEX_NAME", "OBJECT_TYPE", "OBJECT_INSTANCE_BEGIN", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE", "OPERATION", "NUMBER_OF_BYTES", "FLAGS"},
+	"events_stages_current":                                {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "WORK_COMPLETED", "WORK_ESTIMATED", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
+	"events_stages_history":                                {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "WORK_COMPLETED", "WORK_ESTIMATED", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
+	"events_statements_current":                            {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SQL_TEXT", "DIGEST", "DIGEST_TEXT", "CURRENT_SCHEMA", "ROWS_AFFECTED", "ROWS_SENT", "ROWS_EXAMINED", "CREATED_TMP_DISK_TABLES", "CREATED_TMP_TABLES", "ERRORS", "WARNINGS", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
+	"events_statements_history":                            {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "SQL_TEXT", "DIGEST", "DIGEST_TEXT"},
+	"events_transactions_current":                          {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "STATE", "TRX_ID", "GTID", "XID_FORMAT_ID", "XID_GTRID", "XID_BQUAL", "XA_STATE", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "ACCESS_MODE", "ISOLATION_LEVEL", "AUTOCOMMIT", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
+	"events_transactions_history":                          {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "STATE", "TRX_ID", "GTID", "XID_FORMAT_ID", "XID_GTRID", "XID_BQUAL", "XA_STATE", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "ACCESS_MODE", "ISOLATION_LEVEL", "AUTOCOMMIT", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
+	"events_transactions_history_long":                     {"THREAD_ID", "EVENT_ID", "END_EVENT_ID", "EVENT_NAME", "STATE", "TRX_ID", "GTID", "XID_FORMAT_ID", "XID_GTRID", "XID_BQUAL", "XA_STATE", "SOURCE", "TIMER_START", "TIMER_END", "TIMER_WAIT", "ACCESS_MODE", "ISOLATION_LEVEL", "AUTOCOMMIT", "NESTING_EVENT_ID", "NESTING_EVENT_TYPE"},
+	"events_waits_summary_by_account_by_event_name":        {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_waits_summary_by_host_by_event_name":           {"HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_waits_summary_by_instance":                     {"EVENT_NAME", "OBJECT_INSTANCE_BEGIN", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_waits_summary_by_thread_by_event_name":         {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_waits_summary_by_user_by_event_name":           {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_waits_summary_global_by_event_name":            {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_stages_summary_by_account_by_event_name":       {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_stages_summary_by_host_by_event_name":          {"HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_stages_summary_by_thread_by_event_name":        {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_stages_summary_by_user_by_event_name":          {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_stages_summary_global_by_event_name":           {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"events_statements_summary_by_account_by_event_name":   {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
+	"events_statements_summary_by_digest":                  {"SCHEMA_NAME", "DIGEST", "DIGEST_TEXT", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED", "FIRST_SEEN", "LAST_SEEN", "QUANTILE_95", "QUANTILE_99", "QUANTILE_999", "QUERY_SAMPLE_TEXT", "QUERY_SAMPLE_SEEN", "QUERY_SAMPLE_TIMER_WAIT"},
+	"events_statements_summary_by_host_by_event_name":      {"HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
+	"events_statements_summary_by_thread_by_event_name":    {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
+	"events_statements_summary_by_user_by_event_name":      {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
+	"events_statements_summary_global_by_event_name":       {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
+	"events_statements_summary_by_program":                 {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "COUNT_STATEMENTS", "SUM_STATEMENTS_WAIT", "MIN_STATEMENTS_WAIT", "AVG_STATEMENTS_WAIT", "MAX_STATEMENTS_WAIT", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
+	"events_statements_histogram_by_digest":                {"SCHEMA_NAME", "DIGEST", "BUCKET_NUMBER", "BUCKET_TIMER_LOW", "BUCKET_TIMER_HIGH", "COUNT_BUCKET", "COUNT_BUCKET_AND_LOWER", "BUCKET_QUANTILE"},
+	"events_statements_histogram_global":                   {"BUCKET_NUMBER", "BUCKET_TIMER_LOW", "BUCKET_TIMER_HIGH", "COUNT_BUCKET", "COUNT_BUCKET_AND_LOWER", "BUCKET_QUANTILE"},
 	"events_transactions_summary_by_account_by_event_name": {"USER", "HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "COUNT_READ_WRITE", "SUM_TIMER_READ_WRITE", "MIN_TIMER_READ_WRITE", "AVG_TIMER_READ_WRITE", "MAX_TIMER_READ_WRITE", "COUNT_READ_ONLY", "SUM_TIMER_READ_ONLY", "MIN_TIMER_READ_ONLY", "AVG_TIMER_READ_ONLY", "MAX_TIMER_READ_ONLY"},
 	"events_transactions_summary_by_host_by_event_name":    {"HOST", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "COUNT_READ_WRITE", "SUM_TIMER_READ_WRITE", "MIN_TIMER_READ_WRITE", "AVG_TIMER_READ_WRITE", "MAX_TIMER_READ_WRITE", "COUNT_READ_ONLY", "SUM_TIMER_READ_ONLY", "MIN_TIMER_READ_ONLY", "AVG_TIMER_READ_ONLY", "MAX_TIMER_READ_ONLY"},
 	"events_transactions_summary_by_thread_by_event_name":  {"THREAD_ID", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "COUNT_READ_WRITE", "SUM_TIMER_READ_WRITE", "MIN_TIMER_READ_WRITE", "AVG_TIMER_READ_WRITE", "MAX_TIMER_READ_WRITE", "COUNT_READ_ONLY", "SUM_TIMER_READ_ONLY", "MIN_TIMER_READ_ONLY", "AVG_TIMER_READ_ONLY", "MAX_TIMER_READ_ONLY"},
 	"events_transactions_summary_by_user_by_event_name":    {"USER", "EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "COUNT_READ_WRITE", "SUM_TIMER_READ_WRITE", "MIN_TIMER_READ_WRITE", "AVG_TIMER_READ_WRITE", "MAX_TIMER_READ_WRITE", "COUNT_READ_ONLY", "SUM_TIMER_READ_ONLY", "MIN_TIMER_READ_ONLY", "AVG_TIMER_READ_ONLY", "MAX_TIMER_READ_ONLY"},
 	"events_transactions_summary_global_by_event_name":     {"EVENT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT", "COUNT_READ_WRITE", "SUM_TIMER_READ_WRITE", "MIN_TIMER_READ_WRITE", "AVG_TIMER_READ_WRITE", "MAX_TIMER_READ_WRITE", "COUNT_READ_ONLY", "SUM_TIMER_READ_ONLY", "MIN_TIMER_READ_ONLY", "AVG_TIMER_READ_ONLY", "MAX_TIMER_READ_ONLY"},
-	"events_errors_summary_by_account_by_error": {"USER", "HOST", "ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
-	"events_errors_summary_by_host_by_error":    {"HOST", "ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
-	"events_errors_summary_by_thread_by_error":  {"THREAD_ID", "ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
-	"events_errors_summary_by_user_by_error":    {"USER", "ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
-	"events_errors_summary_global_by_error":     {"ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
-	"memory_summary_by_account_by_event_name":   {"USER", "HOST", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "LOW_COUNT_USED", "CURRENT_COUNT_USED", "HIGH_COUNT_USED", "LOW_NUMBER_OF_BYTES_USED", "CURRENT_NUMBER_OF_BYTES_USED", "HIGH_NUMBER_OF_BYTES_USED"},
-	"memory_summary_by_host_by_event_name":      {"HOST", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "LOW_COUNT_USED", "CURRENT_COUNT_USED", "HIGH_COUNT_USED", "LOW_NUMBER_OF_BYTES_USED", "CURRENT_NUMBER_OF_BYTES_USED", "HIGH_NUMBER_OF_BYTES_USED"},
-	"memory_summary_by_thread_by_event_name":    {"THREAD_ID", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "LOW_COUNT_USED", "CURRENT_COUNT_USED", "HIGH_COUNT_USED", "LOW_NUMBER_OF_BYTES_USED", "CURRENT_NUMBER_OF_BYTES_USED", "HIGH_NUMBER_OF_BYTES_USED"},
-	"memory_summary_by_user_by_event_name":      {"USER", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "LOW_COUNT_USED", "CURRENT_COUNT_USED", "HIGH_COUNT_USED", "LOW_NUMBER_OF_BYTES_USED", "CURRENT_NUMBER_OF_BYTES_USED", "HIGH_NUMBER_OF_BYTES_USED"},
-	"status_by_account":                {"USER", "HOST", "VARIABLE_NAME", "VARIABLE_VALUE"},
-	"status_by_host":                   {"HOST", "VARIABLE_NAME", "VARIABLE_VALUE"},
-	"status_by_thread":                 {"THREAD_ID", "VARIABLE_NAME", "VARIABLE_VALUE"},
-	"status_by_user":                   {"USER", "VARIABLE_NAME", "VARIABLE_VALUE"},
-	"replication_connection_configuration": {"CHANNEL_NAME", "HOST", "PORT", "USER", "NETWORK_INTERFACE", "AUTO_POSITION", "SSL_ALLOWED", "SSL_CA_FILE", "SSL_CA_PATH", "SSL_CERTIFICATE", "SSL_CIPHER", "SSL_KEY"},
-	"replication_connection_status":    {"CHANNEL_NAME", "GROUP_NAME", "SOURCE_UUID", "THREAD_ID", "SERVICE_STATE"},
-	"replication_applier_configuration": {"CHANNEL_NAME", "DESIRED_DELAY"},
-	"replication_applier_status":       {"CHANNEL_NAME", "SERVICE_STATE", "REMAINING_DELAY", "COUNT_TRANSACTIONS_RETRIES"},
-	"replication_applier_status_by_coordinator": {"CHANNEL_NAME", "THREAD_ID", "SERVICE_STATE"},
-	"replication_applier_status_by_worker": {"CHANNEL_NAME", "WORKER_ID", "THREAD_ID", "SERVICE_STATE"},
-	"replication_applier_filters":      {"CHANNEL_NAME", "FILTER_NAME", "FILTER_RULE", "CONFIGURED_BY", "ACTIVE_SINCE"},
-	"replication_applier_global_filters": {"FILTER_NAME", "FILTER_RULE", "CONFIGURED_BY", "ACTIVE_SINCE"},
-	"replication_group_members":        {"CHANNEL_NAME", "MEMBER_ID", "MEMBER_HOST", "MEMBER_PORT", "MEMBER_STATE", "MEMBER_ROLE", "MEMBER_VERSION", "MEMBER_COMMUNICATION_STACK"},
-	"replication_group_member_stats":   {"CHANNEL_NAME", "VIEW_ID", "MEMBER_ID", "COUNT_TRANSACTIONS_IN_QUEUE", "COUNT_TRANSACTIONS_CHECKED", "COUNT_CONFLICTS_DETECTED", "COUNT_TRANSACTIONS_ROWS_VALIDATING", "TRANSACTIONS_COMMITTED_ALL_MEMBERS", "LAST_CONFLICT_FREE_TRANSACTION", "COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE", "COUNT_TRANSACTIONS_REMOTE_APPLIED", "COUNT_TRANSACTIONS_LOCAL_PROPOSED", "COUNT_TRANSACTIONS_LOCAL_ROLLBACK"},
-	"keyring_keys":                     {"KEY_ID", "KEY_OWNER", "BACKEND_KEY_ID"},
-	"host_cache":                       {"IP", "HOST", "HOST_VALIDATED", "SUM_CONNECT_ERRORS", "COUNT_HOST_BLOCKED_ERRORS", "COUNT_NAMEINFO_TRANSIENT_ERRORS", "COUNT_NAMEINFO_PERMANENT_ERRORS", "COUNT_FORMAT_ERRORS", "COUNT_ADDRINFO_TRANSIENT_ERRORS", "COUNT_ADDRINFO_PERMANENT_ERRORS", "COUNT_FCRDNS_ERRORS", "COUNT_HOST_ACL_ERRORS", "COUNT_NO_AUTH_PLUGIN_ERRORS", "COUNT_AUTH_PLUGIN_ERRORS", "COUNT_HANDSHAKE_ERRORS", "COUNT_PROXY_USER_ERRORS", "COUNT_PROXY_USER_ACL_ERRORS", "COUNT_AUTHENTICATION_ERRORS", "COUNT_SSL_ERRORS", "COUNT_MAX_USER_CONNECTIONS_ERRORS", "COUNT_MAX_USER_CONNECTIONS_PER_HOUR_ERRORS", "COUNT_DEFAULT_DATABASE_ERRORS", "COUNT_INIT_CONNECT_ERRORS", "COUNT_LOCAL_ERRORS", "COUNT_UNKNOWN_ERRORS", "FIRST_SEEN", "LAST_SEEN", "FIRST_ERROR_SEEN", "LAST_ERROR_SEEN"},
-	"log_status":                       {"SERVER_UUID", "LOCAL", "REPLICATION", "STORAGE_ENGINES"},
-	"objects_summary_global_by_type":   {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
-	"prepared_statements_instances":    {"OBJECT_INSTANCE_BEGIN", "STATEMENT_ID", "STATEMENT_NAME", "SQL_TEXT", "OWNER_THREAD_ID", "OWNER_EVENT_ID", "OWNER_OBJECT_TYPE", "OWNER_OBJECT_SCHEMA", "OWNER_OBJECT_NAME", "TIMER_PREPARE", "COUNT_REPREPARE", "COUNT_EXECUTE", "SUM_TIMER_EXECUTE", "MIN_TIMER_EXECUTE", "AVG_TIMER_EXECUTE", "MAX_TIMER_EXECUTE", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
-	"user_defined_functions":           {"UDF_NAME", "UDF_RETURN_TYPE", "UDF_TYPE", "UDF_LIBRARY", "UDF_USAGE_COUNT"},
-	"user_variables_by_thread":         {"THREAD_ID", "VARIABLE_NAME", "VARIABLE_VALUE"},
-	"session_connect_attrs":            {"PROCESSLIST_ID", "ATTR_NAME", "ATTR_VALUE", "ORDINAL_POSITION"},
-	"session_account_connect_attrs":    {"PROCESSLIST_ID", "ATTR_NAME", "ATTR_VALUE", "ORDINAL_POSITION"},
-	"metadata_locks":                   {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COLUMN_NAME", "OBJECT_INSTANCE_BEGIN", "LOCK_TYPE", "LOCK_DURATION", "LOCK_STATUS", "SOURCE", "OWNER_THREAD_ID", "OWNER_EVENT_ID"},
-	"data_locks":                       {"ENGINE", "ENGINE_LOCK_ID", "ENGINE_TRANSACTION_ID", "THREAD_ID", "EVENT_ID", "OBJECT_SCHEMA", "OBJECT_NAME", "PARTITION_NAME", "SUBPARTITION_NAME", "INDEX_NAME", "OBJECT_INSTANCE_BEGIN", "LOCK_TYPE", "LOCK_MODE", "LOCK_STATUS", "LOCK_DATA"},
-	"setup_consumers":                  {"NAME", "ENABLED"},
-	"data_lock_waits":                  {"ENGINE", "REQUESTING_ENGINE_LOCK_ID", "REQUESTING_ENGINE_TRANSACTION_ID", "REQUESTING_THREAD_ID", "REQUESTING_EVENT_ID", "REQUESTING_OBJECT_INSTANCE_BEGIN", "BLOCKING_ENGINE_LOCK_ID", "BLOCKING_ENGINE_TRANSACTION_ID", "BLOCKING_THREAD_ID", "BLOCKING_EVENT_ID", "BLOCKING_OBJECT_INSTANCE_BEGIN"},
+	"events_errors_summary_by_account_by_error":            {"USER", "HOST", "ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
+	"events_errors_summary_by_host_by_error":               {"HOST", "ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
+	"events_errors_summary_by_thread_by_error":             {"THREAD_ID", "ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
+	"events_errors_summary_by_user_by_error":               {"USER", "ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
+	"events_errors_summary_global_by_error":                {"ERROR_NUMBER", "ERROR_NAME", "SQL_STATE", "SUM_ERROR_RAISED", "SUM_ERROR_HANDLED", "FIRST_SEEN", "LAST_SEEN"},
+	"memory_summary_by_account_by_event_name":              {"USER", "HOST", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "LOW_COUNT_USED", "CURRENT_COUNT_USED", "HIGH_COUNT_USED", "LOW_NUMBER_OF_BYTES_USED", "CURRENT_NUMBER_OF_BYTES_USED", "HIGH_NUMBER_OF_BYTES_USED"},
+	"memory_summary_by_host_by_event_name":                 {"HOST", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "LOW_COUNT_USED", "CURRENT_COUNT_USED", "HIGH_COUNT_USED", "LOW_NUMBER_OF_BYTES_USED", "CURRENT_NUMBER_OF_BYTES_USED", "HIGH_NUMBER_OF_BYTES_USED"},
+	"memory_summary_by_thread_by_event_name":               {"THREAD_ID", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "LOW_COUNT_USED", "CURRENT_COUNT_USED", "HIGH_COUNT_USED", "LOW_NUMBER_OF_BYTES_USED", "CURRENT_NUMBER_OF_BYTES_USED", "HIGH_NUMBER_OF_BYTES_USED"},
+	"memory_summary_by_user_by_event_name":                 {"USER", "EVENT_NAME", "COUNT_ALLOC", "COUNT_FREE", "SUM_NUMBER_OF_BYTES_ALLOC", "SUM_NUMBER_OF_BYTES_FREE", "LOW_COUNT_USED", "CURRENT_COUNT_USED", "HIGH_COUNT_USED", "LOW_NUMBER_OF_BYTES_USED", "CURRENT_NUMBER_OF_BYTES_USED", "HIGH_NUMBER_OF_BYTES_USED"},
+	"status_by_account":                                    {"USER", "HOST", "VARIABLE_NAME", "VARIABLE_VALUE"},
+	"status_by_host":                                       {"HOST", "VARIABLE_NAME", "VARIABLE_VALUE"},
+	"status_by_thread":                                     {"THREAD_ID", "VARIABLE_NAME", "VARIABLE_VALUE"},
+	"status_by_user":                                       {"USER", "VARIABLE_NAME", "VARIABLE_VALUE"},
+	"replication_connection_configuration":                 {"CHANNEL_NAME", "HOST", "PORT", "USER", "NETWORK_INTERFACE", "AUTO_POSITION", "SSL_ALLOWED", "SSL_CA_FILE", "SSL_CA_PATH", "SSL_CERTIFICATE", "SSL_CIPHER", "SSL_KEY"},
+	"replication_connection_status":                        {"CHANNEL_NAME", "GROUP_NAME", "SOURCE_UUID", "THREAD_ID", "SERVICE_STATE"},
+	"replication_applier_configuration":                    {"CHANNEL_NAME", "DESIRED_DELAY"},
+	"replication_applier_status":                           {"CHANNEL_NAME", "SERVICE_STATE", "REMAINING_DELAY", "COUNT_TRANSACTIONS_RETRIES"},
+	"replication_applier_status_by_coordinator":            {"CHANNEL_NAME", "THREAD_ID", "SERVICE_STATE"},
+	"replication_applier_status_by_worker":                 {"CHANNEL_NAME", "WORKER_ID", "THREAD_ID", "SERVICE_STATE"},
+	"replication_applier_filters":                          {"CHANNEL_NAME", "FILTER_NAME", "FILTER_RULE", "CONFIGURED_BY", "ACTIVE_SINCE"},
+	"replication_applier_global_filters":                   {"FILTER_NAME", "FILTER_RULE", "CONFIGURED_BY", "ACTIVE_SINCE"},
+	"replication_group_members":                            {"CHANNEL_NAME", "MEMBER_ID", "MEMBER_HOST", "MEMBER_PORT", "MEMBER_STATE", "MEMBER_ROLE", "MEMBER_VERSION", "MEMBER_COMMUNICATION_STACK"},
+	"replication_group_member_stats":                       {"CHANNEL_NAME", "VIEW_ID", "MEMBER_ID", "COUNT_TRANSACTIONS_IN_QUEUE", "COUNT_TRANSACTIONS_CHECKED", "COUNT_CONFLICTS_DETECTED", "COUNT_TRANSACTIONS_ROWS_VALIDATING", "TRANSACTIONS_COMMITTED_ALL_MEMBERS", "LAST_CONFLICT_FREE_TRANSACTION", "COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE", "COUNT_TRANSACTIONS_REMOTE_APPLIED", "COUNT_TRANSACTIONS_LOCAL_PROPOSED", "COUNT_TRANSACTIONS_LOCAL_ROLLBACK"},
+	"keyring_keys":                                         {"KEY_ID", "KEY_OWNER", "BACKEND_KEY_ID"},
+	"host_cache":                                           {"IP", "HOST", "HOST_VALIDATED", "SUM_CONNECT_ERRORS", "COUNT_HOST_BLOCKED_ERRORS", "COUNT_NAMEINFO_TRANSIENT_ERRORS", "COUNT_NAMEINFO_PERMANENT_ERRORS", "COUNT_FORMAT_ERRORS", "COUNT_ADDRINFO_TRANSIENT_ERRORS", "COUNT_ADDRINFO_PERMANENT_ERRORS", "COUNT_FCRDNS_ERRORS", "COUNT_HOST_ACL_ERRORS", "COUNT_NO_AUTH_PLUGIN_ERRORS", "COUNT_AUTH_PLUGIN_ERRORS", "COUNT_HANDSHAKE_ERRORS", "COUNT_PROXY_USER_ERRORS", "COUNT_PROXY_USER_ACL_ERRORS", "COUNT_AUTHENTICATION_ERRORS", "COUNT_SSL_ERRORS", "COUNT_MAX_USER_CONNECTIONS_ERRORS", "COUNT_MAX_USER_CONNECTIONS_PER_HOUR_ERRORS", "COUNT_DEFAULT_DATABASE_ERRORS", "COUNT_INIT_CONNECT_ERRORS", "COUNT_LOCAL_ERRORS", "COUNT_UNKNOWN_ERRORS", "FIRST_SEEN", "LAST_SEEN", "FIRST_ERROR_SEEN", "LAST_ERROR_SEEN"},
+	"log_status":                                           {"SERVER_UUID", "LOCAL", "REPLICATION", "STORAGE_ENGINES"},
+	"objects_summary_global_by_type":                       {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COUNT_STAR", "SUM_TIMER_WAIT", "MIN_TIMER_WAIT", "AVG_TIMER_WAIT", "MAX_TIMER_WAIT"},
+	"prepared_statements_instances":                        {"OBJECT_INSTANCE_BEGIN", "STATEMENT_ID", "STATEMENT_NAME", "SQL_TEXT", "OWNER_THREAD_ID", "OWNER_EVENT_ID", "OWNER_OBJECT_TYPE", "OWNER_OBJECT_SCHEMA", "OWNER_OBJECT_NAME", "TIMER_PREPARE", "COUNT_REPREPARE", "COUNT_EXECUTE", "SUM_TIMER_EXECUTE", "MIN_TIMER_EXECUTE", "AVG_TIMER_EXECUTE", "MAX_TIMER_EXECUTE", "SUM_LOCK_TIME", "SUM_ERRORS", "SUM_WARNINGS", "SUM_ROWS_AFFECTED", "SUM_ROWS_SENT", "SUM_ROWS_EXAMINED", "SUM_CREATED_TMP_DISK_TABLES", "SUM_CREATED_TMP_TABLES", "SUM_SELECT_FULL_JOIN", "SUM_SELECT_FULL_RANGE_JOIN", "SUM_SELECT_RANGE", "SUM_SELECT_RANGE_CHECK", "SUM_SELECT_SCAN", "SUM_SORT_MERGE_PASSES", "SUM_SORT_RANGE", "SUM_SORT_ROWS", "SUM_SORT_SCAN", "SUM_NO_INDEX_USED", "SUM_NO_GOOD_INDEX_USED"},
+	"user_defined_functions":                               {"UDF_NAME", "UDF_RETURN_TYPE", "UDF_TYPE", "UDF_LIBRARY", "UDF_USAGE_COUNT"},
+	"user_variables_by_thread":                             {"THREAD_ID", "VARIABLE_NAME", "VARIABLE_VALUE"},
+	"session_connect_attrs":                                {"PROCESSLIST_ID", "ATTR_NAME", "ATTR_VALUE", "ORDINAL_POSITION"},
+	"session_account_connect_attrs":                        {"PROCESSLIST_ID", "ATTR_NAME", "ATTR_VALUE", "ORDINAL_POSITION"},
+	"metadata_locks":                                       {"OBJECT_TYPE", "OBJECT_SCHEMA", "OBJECT_NAME", "COLUMN_NAME", "OBJECT_INSTANCE_BEGIN", "LOCK_TYPE", "LOCK_DURATION", "LOCK_STATUS", "SOURCE", "OWNER_THREAD_ID", "OWNER_EVENT_ID"},
+	"data_locks":                                           {"ENGINE", "ENGINE_LOCK_ID", "ENGINE_TRANSACTION_ID", "THREAD_ID", "EVENT_ID", "OBJECT_SCHEMA", "OBJECT_NAME", "PARTITION_NAME", "SUBPARTITION_NAME", "INDEX_NAME", "OBJECT_INSTANCE_BEGIN", "LOCK_TYPE", "LOCK_MODE", "LOCK_STATUS", "LOCK_DATA"},
+	"setup_consumers":                                      {"NAME", "ENABLED"},
+	"data_lock_waits":                                      {"ENGINE", "REQUESTING_ENGINE_LOCK_ID", "REQUESTING_ENGINE_TRANSACTION_ID", "REQUESTING_THREAD_ID", "REQUESTING_EVENT_ID", "REQUESTING_OBJECT_INSTANCE_BEGIN", "BLOCKING_ENGINE_LOCK_ID", "BLOCKING_ENGINE_TRANSACTION_ID", "BLOCKING_THREAD_ID", "BLOCKING_EVENT_ID", "BLOCKING_OBJECT_INSTANCE_BEGIN"},
 }
 
 // perfSchemaColumnOrder lists performance_schema table names (lowercase).
@@ -245,41 +245,41 @@ var perfSchemaColumnOrder = map[string]bool{
 	"events_stages_current": true, "events_stages_history": true, "events_stages_history_long": true,
 	"events_statements_current": true, "events_statements_history": true, "events_statements_history_long": true,
 	"events_transactions_current": true, "events_transactions_history": true, "events_transactions_history_long": true,
-	"events_waits_summary_by_account_by_event_name": true,
-	"events_waits_summary_by_host_by_event_name": true,
-	"events_waits_summary_by_instance": true,
-	"events_waits_summary_by_thread_by_event_name": true,
-	"events_waits_summary_by_user_by_event_name": true,
-	"events_waits_summary_global_by_event_name": true,
-	"events_stages_summary_by_account_by_event_name": true,
-	"events_stages_summary_by_host_by_event_name": true,
-	"events_stages_summary_by_thread_by_event_name": true,
-	"events_stages_summary_by_user_by_event_name": true,
-	"events_stages_summary_global_by_event_name": true,
-	"events_statements_summary_by_account_by_event_name": true,
-	"events_statements_summary_by_digest": true,
-	"events_statements_summary_by_host_by_event_name": true,
-	"events_statements_summary_by_thread_by_event_name": true,
-	"events_statements_summary_by_user_by_event_name": true,
-	"events_statements_summary_global_by_event_name": true,
-	"events_statements_summary_by_program": true,
-	"events_statements_histogram_by_digest": true,
-	"events_statements_histogram_global": true,
+	"events_waits_summary_by_account_by_event_name":        true,
+	"events_waits_summary_by_host_by_event_name":           true,
+	"events_waits_summary_by_instance":                     true,
+	"events_waits_summary_by_thread_by_event_name":         true,
+	"events_waits_summary_by_user_by_event_name":           true,
+	"events_waits_summary_global_by_event_name":            true,
+	"events_stages_summary_by_account_by_event_name":       true,
+	"events_stages_summary_by_host_by_event_name":          true,
+	"events_stages_summary_by_thread_by_event_name":        true,
+	"events_stages_summary_by_user_by_event_name":          true,
+	"events_stages_summary_global_by_event_name":           true,
+	"events_statements_summary_by_account_by_event_name":   true,
+	"events_statements_summary_by_digest":                  true,
+	"events_statements_summary_by_host_by_event_name":      true,
+	"events_statements_summary_by_thread_by_event_name":    true,
+	"events_statements_summary_by_user_by_event_name":      true,
+	"events_statements_summary_global_by_event_name":       true,
+	"events_statements_summary_by_program":                 true,
+	"events_statements_histogram_by_digest":                true,
+	"events_statements_histogram_global":                   true,
 	"events_transactions_summary_by_account_by_event_name": true,
-	"events_transactions_summary_by_host_by_event_name": true,
-	"events_transactions_summary_by_thread_by_event_name": true,
-	"events_transactions_summary_by_user_by_event_name": true,
-	"events_transactions_summary_global_by_event_name": true,
-	"events_errors_summary_by_account_by_error": true,
-	"events_errors_summary_by_host_by_error": true,
-	"events_errors_summary_by_thread_by_error": true,
-	"events_errors_summary_by_user_by_error": true,
-	"events_errors_summary_global_by_error": true,
-	"memory_summary_by_account_by_event_name": true,
-	"memory_summary_by_host_by_event_name": true,
-	"memory_summary_by_thread_by_event_name": true,
-	"memory_summary_by_user_by_event_name": true,
-	"status_by_account": true, "status_by_host": true, "status_by_thread": true, "status_by_user": true,
+	"events_transactions_summary_by_host_by_event_name":    true,
+	"events_transactions_summary_by_thread_by_event_name":  true,
+	"events_transactions_summary_by_user_by_event_name":    true,
+	"events_transactions_summary_global_by_event_name":     true,
+	"events_errors_summary_by_account_by_error":            true,
+	"events_errors_summary_by_host_by_error":               true,
+	"events_errors_summary_by_thread_by_error":             true,
+	"events_errors_summary_by_user_by_error":               true,
+	"events_errors_summary_global_by_error":                true,
+	"memory_summary_by_account_by_event_name":              true,
+	"memory_summary_by_host_by_event_name":                 true,
+	"memory_summary_by_thread_by_event_name":               true,
+	"memory_summary_by_user_by_event_name":                 true,
+	"status_by_account":                                    true, "status_by_host": true, "status_by_thread": true, "status_by_user": true,
 	"replication_connection_configuration": true, "replication_connection_status": true,
 	"replication_applier_configuration": true, "replication_applier_status": true,
 	"replication_applier_status_by_coordinator": true, "replication_applier_status_by_worker": true,
@@ -287,13 +287,14 @@ var perfSchemaColumnOrder = map[string]bool{
 	"replication_group_members": true, "replication_group_member_stats": true,
 	"keyring_keys": true, "host_cache": true, "log_status": true,
 	"prepared_statements_instances": true,
-	"user_defined_functions": true, "user_variables_by_thread": true,
+	"user_defined_functions":        true, "user_variables_by_thread": true,
 	"session_connect_attrs": true, "session_account_connect_attrs": true,
 	"metadata_locks": true, "data_locks": true, "data_lock_waits": true,
 	"setup_consumers": true, "setup_actors": true, "performance_timers": true,
-	"threads": true,
+	"threads":                        true,
 	"objects_summary_global_by_type": true,
 }
+
 // perfSchemaVirtualTableNames returns the canonical sorted list of all virtual
 // performance_schema table names (lowercase). This list matches MySQL 8.0.
 func perfSchemaVirtualTableNames() []string {
@@ -407,104 +408,104 @@ func perfSchemaVirtualTableNames() []string {
 // perfSchemaCreateTable maps performance_schema table names to their CREATE TABLE statements.
 // These are fixed MySQL system table definitions.
 var perfSchemaCreateTable = map[string]string{
-	"accounts": "CREATE TABLE `accounts` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `CURRENT_CONNECTIONS` bigint(20) NOT NULL,\n  `TOTAL_CONNECTIONS` bigint(20) NOT NULL,\n  UNIQUE KEY `ACCOUNT` (`USER`,`HOST`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"cond_instances": "CREATE TABLE `cond_instances` (\n  `NAME` varchar(128) NOT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `NAME` (`NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"data_lock_waits": "CREATE TABLE `data_lock_waits` (\n  `ENGINE` varchar(32) NOT NULL,\n  `REQUESTING_ENGINE_LOCK_ID` varchar(128) NOT NULL,\n  `REQUESTING_ENGINE_TRANSACTION_ID` bigint(20) unsigned DEFAULT NULL,\n  `REQUESTING_THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  `REQUESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `REQUESTING_OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `BLOCKING_ENGINE_LOCK_ID` varchar(128) NOT NULL,\n  `BLOCKING_ENGINE_TRANSACTION_ID` bigint(20) unsigned DEFAULT NULL,\n  `BLOCKING_THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  `BLOCKING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `BLOCKING_OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  KEY `REQUESTING_ENGINE_LOCK_ID` (`REQUESTING_ENGINE_LOCK_ID`,`ENGINE`),\n  KEY `BLOCKING_ENGINE_LOCK_ID` (`BLOCKING_ENGINE_LOCK_ID`,`ENGINE`),\n  KEY `REQUESTING_ENGINE_TRANSACTION_ID` (`REQUESTING_ENGINE_TRANSACTION_ID`,`ENGINE`),\n  KEY `BLOCKING_ENGINE_TRANSACTION_ID` (`BLOCKING_ENGINE_TRANSACTION_ID`,`ENGINE`),\n  KEY `REQUESTING_THREAD_ID` (`REQUESTING_THREAD_ID`,`REQUESTING_EVENT_ID`),\n  KEY `BLOCKING_THREAD_ID` (`BLOCKING_THREAD_ID`,`BLOCKING_EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"data_locks": "CREATE TABLE `data_locks` (\n  `ENGINE` varchar(32) NOT NULL,\n  `ENGINE_LOCK_ID` varchar(128) NOT NULL,\n  `ENGINE_TRANSACTION_ID` bigint(20) unsigned DEFAULT NULL,\n  `THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `PARTITION_NAME` varchar(64) DEFAULT NULL,\n  `SUBPARTITION_NAME` varchar(64) DEFAULT NULL,\n  `INDEX_NAME` varchar(64) DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `LOCK_TYPE` varchar(32) NOT NULL,\n  `LOCK_MODE` varchar(32) NOT NULL,\n  `LOCK_STATUS` varchar(32) NOT NULL,\n  `LOCK_DATA` varchar(8192) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci DEFAULT NULL,\n  PRIMARY KEY (`ENGINE_LOCK_ID`,`ENGINE`),\n  KEY `ENGINE_TRANSACTION_ID` (`ENGINE_TRANSACTION_ID`,`ENGINE`),\n  KEY `THREAD_ID` (`THREAD_ID`,`EVENT_ID`),\n  KEY `OBJECT_SCHEMA` (`OBJECT_SCHEMA`,`OBJECT_NAME`,`PARTITION_NAME`,`SUBPARTITION_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_stages_current": "CREATE TABLE `events_stages_current` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `WORK_COMPLETED` bigint(20) unsigned DEFAULT NULL,\n  `WORK_ESTIMATED` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_stages_history": "CREATE TABLE `events_stages_history` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `WORK_COMPLETED` bigint(20) unsigned DEFAULT NULL,\n  `WORK_ESTIMATED` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"accounts":                   "CREATE TABLE `accounts` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `CURRENT_CONNECTIONS` bigint(20) NOT NULL,\n  `TOTAL_CONNECTIONS` bigint(20) NOT NULL,\n  UNIQUE KEY `ACCOUNT` (`USER`,`HOST`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"cond_instances":             "CREATE TABLE `cond_instances` (\n  `NAME` varchar(128) NOT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `NAME` (`NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"data_lock_waits":            "CREATE TABLE `data_lock_waits` (\n  `ENGINE` varchar(32) NOT NULL,\n  `REQUESTING_ENGINE_LOCK_ID` varchar(128) NOT NULL,\n  `REQUESTING_ENGINE_TRANSACTION_ID` bigint(20) unsigned DEFAULT NULL,\n  `REQUESTING_THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  `REQUESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `REQUESTING_OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `BLOCKING_ENGINE_LOCK_ID` varchar(128) NOT NULL,\n  `BLOCKING_ENGINE_TRANSACTION_ID` bigint(20) unsigned DEFAULT NULL,\n  `BLOCKING_THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  `BLOCKING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `BLOCKING_OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  KEY `REQUESTING_ENGINE_LOCK_ID` (`REQUESTING_ENGINE_LOCK_ID`,`ENGINE`),\n  KEY `BLOCKING_ENGINE_LOCK_ID` (`BLOCKING_ENGINE_LOCK_ID`,`ENGINE`),\n  KEY `REQUESTING_ENGINE_TRANSACTION_ID` (`REQUESTING_ENGINE_TRANSACTION_ID`,`ENGINE`),\n  KEY `BLOCKING_ENGINE_TRANSACTION_ID` (`BLOCKING_ENGINE_TRANSACTION_ID`,`ENGINE`),\n  KEY `REQUESTING_THREAD_ID` (`REQUESTING_THREAD_ID`,`REQUESTING_EVENT_ID`),\n  KEY `BLOCKING_THREAD_ID` (`BLOCKING_THREAD_ID`,`BLOCKING_EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"data_locks":                 "CREATE TABLE `data_locks` (\n  `ENGINE` varchar(32) NOT NULL,\n  `ENGINE_LOCK_ID` varchar(128) NOT NULL,\n  `ENGINE_TRANSACTION_ID` bigint(20) unsigned DEFAULT NULL,\n  `THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `PARTITION_NAME` varchar(64) DEFAULT NULL,\n  `SUBPARTITION_NAME` varchar(64) DEFAULT NULL,\n  `INDEX_NAME` varchar(64) DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `LOCK_TYPE` varchar(32) NOT NULL,\n  `LOCK_MODE` varchar(32) NOT NULL,\n  `LOCK_STATUS` varchar(32) NOT NULL,\n  `LOCK_DATA` varchar(8192) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci DEFAULT NULL,\n  PRIMARY KEY (`ENGINE_LOCK_ID`,`ENGINE`),\n  KEY `ENGINE_TRANSACTION_ID` (`ENGINE_TRANSACTION_ID`,`ENGINE`),\n  KEY `THREAD_ID` (`THREAD_ID`,`EVENT_ID`),\n  KEY `OBJECT_SCHEMA` (`OBJECT_SCHEMA`,`OBJECT_NAME`,`PARTITION_NAME`,`SUBPARTITION_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_stages_current":      "CREATE TABLE `events_stages_current` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `WORK_COMPLETED` bigint(20) unsigned DEFAULT NULL,\n  `WORK_ESTIMATED` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_stages_history":      "CREATE TABLE `events_stages_history` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `WORK_COMPLETED` bigint(20) unsigned DEFAULT NULL,\n  `WORK_ESTIMATED` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 	"events_stages_history_long": "CREATE TABLE `events_stages_history_long` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `WORK_COMPLETED` bigint(20) unsigned DEFAULT NULL,\n  `WORK_ESTIMATED` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_stages_summary_by_account_by_event_name": "CREATE TABLE `events_stages_summary_by_account_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `ACCOUNT` (`USER`,`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_stages_summary_by_host_by_event_name": "CREATE TABLE `events_stages_summary_by_host_by_event_name` (\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `HOST` (`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_stages_summary_by_thread_by_event_name": "CREATE TABLE `events_stages_summary_by_thread_by_event_name` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_stages_summary_by_user_by_event_name": "CREATE TABLE `events_stages_summary_by_user_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `USER` (`USER`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_stages_summary_global_by_event_name": "CREATE TABLE `events_stages_summary_global_by_event_name` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_statements_current": "CREATE TABLE `events_statements_current` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SQL_TEXT` longtext,\n  `DIGEST` varchar(64) DEFAULT NULL,\n  `DIGEST_TEXT` longtext,\n  `CURRENT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned DEFAULT NULL,\n  `MYSQL_ERRNO` int(11) DEFAULT NULL,\n  `RETURNED_SQLSTATE` varchar(5) DEFAULT NULL,\n  `MESSAGE_TEXT` varchar(128) DEFAULT NULL,\n  `ERRORS` bigint(20) unsigned NOT NULL,\n  `WARNINGS` bigint(20) unsigned NOT NULL,\n  `ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  `NESTING_EVENT_LEVEL` int(11) DEFAULT NULL,\n  `STATEMENT_ID` bigint(20) unsigned DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_statements_history": "CREATE TABLE `events_statements_history` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SQL_TEXT` longtext,\n  `DIGEST` varchar(64) DEFAULT NULL,\n  `DIGEST_TEXT` longtext,\n  `CURRENT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned DEFAULT NULL,\n  `MYSQL_ERRNO` int(11) DEFAULT NULL,\n  `RETURNED_SQLSTATE` varchar(5) DEFAULT NULL,\n  `MESSAGE_TEXT` varchar(128) DEFAULT NULL,\n  `ERRORS` bigint(20) unsigned NOT NULL,\n  `WARNINGS` bigint(20) unsigned NOT NULL,\n  `ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  `NESTING_EVENT_LEVEL` int(11) DEFAULT NULL,\n  `STATEMENT_ID` bigint(20) unsigned DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_statements_history_long": "CREATE TABLE `events_statements_history_long` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SQL_TEXT` longtext,\n  `DIGEST` varchar(64) DEFAULT NULL,\n  `DIGEST_TEXT` longtext,\n  `CURRENT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned DEFAULT NULL,\n  `MYSQL_ERRNO` int(11) DEFAULT NULL,\n  `RETURNED_SQLSTATE` varchar(5) DEFAULT NULL,\n  `MESSAGE_TEXT` varchar(128) DEFAULT NULL,\n  `ERRORS` bigint(20) unsigned NOT NULL,\n  `WARNINGS` bigint(20) unsigned NOT NULL,\n  `ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  `NESTING_EVENT_LEVEL` int(11) DEFAULT NULL,\n  `STATEMENT_ID` bigint(20) unsigned DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_statements_summary_by_account_by_event_name": "CREATE TABLE `events_statements_summary_by_account_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `SUM_LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SUM_ERRORS` bigint(20) unsigned NOT NULL,\n  `SUM_WARNINGS` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `SUM_NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `ACCOUNT` (`USER`,`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_statements_summary_by_digest": "CREATE TABLE `events_statements_summary_by_digest` (\n  `SCHEMA_NAME` varchar(64) DEFAULT NULL,\n  `DIGEST` varchar(64) DEFAULT NULL,\n  `DIGEST_TEXT` longtext,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `SUM_LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SUM_ERRORS` bigint(20) unsigned NOT NULL,\n  `SUM_WARNINGS` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `SUM_NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `FIRST_SEEN` timestamp(6) NOT NULL DEFAULT '0000-00-00 00:00:00.000000',\n  `LAST_SEEN` timestamp(6) NOT NULL DEFAULT '0000-00-00 00:00:00.000000',\n  `QUANTILE_95` bigint(20) unsigned NOT NULL,\n  `QUANTILE_99` bigint(20) unsigned NOT NULL,\n  `QUANTILE_999` bigint(20) unsigned NOT NULL,\n  `QUERY_SAMPLE_TEXT` longtext,\n  `QUERY_SAMPLE_SEEN` timestamp(6) NOT NULL DEFAULT '0000-00-00 00:00:00.000000',\n  `QUERY_SAMPLE_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `SCHEMA_NAME` (`SCHEMA_NAME`,`DIGEST`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_statements_summary_by_host_by_event_name": "CREATE TABLE `events_statements_summary_by_host_by_event_name` (\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `SUM_LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SUM_ERRORS` bigint(20) unsigned NOT NULL,\n  `SUM_WARNINGS` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `SUM_NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `HOST` (`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_statements_summary_by_thread_by_event_name": "CREATE TABLE `events_statements_summary_by_thread_by_event_name` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `SUM_LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SUM_ERRORS` bigint(20) unsigned NOT NULL,\n  `SUM_WARNINGS` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `SUM_NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_statements_summary_by_user_by_event_name": "CREATE TABLE `events_statements_summary_by_user_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `SUM_LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SUM_ERRORS` bigint(20) unsigned NOT NULL,\n  `SUM_WARNINGS` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `SUM_NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `USER` (`USER`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_statements_summary_global_by_event_name": "CREATE TABLE `events_statements_summary_global_by_event_name` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `SUM_LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SUM_ERRORS` bigint(20) unsigned NOT NULL,\n  `SUM_WARNINGS` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `SUM_NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_transactions_current": "CREATE TABLE `events_transactions_current` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `STATE` enum('ACTIVE','COMMITTED','ROLLED BACK') DEFAULT NULL,\n  `TRX_ID` bigint(20) unsigned DEFAULT NULL,\n  `GTID` varchar(64) DEFAULT NULL,\n  `XID_FORMAT_ID` int(11) DEFAULT NULL,\n  `XID_GTRID` varchar(130) DEFAULT NULL,\n  `XID_BQUAL` varchar(130) DEFAULT NULL,\n  `XA_STATE` varchar(64) DEFAULT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `ACCESS_MODE` enum('READ ONLY','READ WRITE') DEFAULT NULL,\n  `ISOLATION_LEVEL` varchar(64) DEFAULT NULL,\n  `AUTOCOMMIT` enum('YES','NO') NOT NULL,\n  `NUMBER_OF_SAVEPOINTS` bigint(20) unsigned DEFAULT NULL,\n  `NUMBER_OF_ROLLBACK_TO_SAVEPOINT` bigint(20) unsigned DEFAULT NULL,\n  `NUMBER_OF_RELEASE_SAVEPOINT` bigint(20) unsigned DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_transactions_history": "CREATE TABLE `events_transactions_history` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `STATE` enum('ACTIVE','COMMITTED','ROLLED BACK') DEFAULT NULL,\n  `TRX_ID` bigint(20) unsigned DEFAULT NULL,\n  `GTID` varchar(64) DEFAULT NULL,\n  `XID_FORMAT_ID` int(11) DEFAULT NULL,\n  `XID_GTRID` varchar(130) DEFAULT NULL,\n  `XID_BQUAL` varchar(130) DEFAULT NULL,\n  `XA_STATE` varchar(64) DEFAULT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `ACCESS_MODE` enum('READ ONLY','READ WRITE') DEFAULT NULL,\n  `ISOLATION_LEVEL` varchar(64) DEFAULT NULL,\n  `AUTOCOMMIT` enum('YES','NO') NOT NULL,\n  `NUMBER_OF_SAVEPOINTS` bigint(20) unsigned DEFAULT NULL,\n  `NUMBER_OF_ROLLBACK_TO_SAVEPOINT` bigint(20) unsigned DEFAULT NULL,\n  `NUMBER_OF_RELEASE_SAVEPOINT` bigint(20) unsigned DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_transactions_history_long": "CREATE TABLE `events_transactions_history_long` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `STATE` enum('ACTIVE','COMMITTED','ROLLED BACK') DEFAULT NULL,\n  `TRX_ID` bigint(20) unsigned DEFAULT NULL,\n  `GTID` varchar(64) DEFAULT NULL,\n  `XID_FORMAT_ID` int(11) DEFAULT NULL,\n  `XID_GTRID` varchar(130) DEFAULT NULL,\n  `XID_BQUAL` varchar(130) DEFAULT NULL,\n  `XA_STATE` varchar(64) DEFAULT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `ACCESS_MODE` enum('READ ONLY','READ WRITE') DEFAULT NULL,\n  `ISOLATION_LEVEL` varchar(64) DEFAULT NULL,\n  `AUTOCOMMIT` enum('YES','NO') NOT NULL,\n  `NUMBER_OF_SAVEPOINTS` bigint(20) unsigned DEFAULT NULL,\n  `NUMBER_OF_ROLLBACK_TO_SAVEPOINT` bigint(20) unsigned DEFAULT NULL,\n  `NUMBER_OF_RELEASE_SAVEPOINT` bigint(20) unsigned DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_stages_summary_by_account_by_event_name":       "CREATE TABLE `events_stages_summary_by_account_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `ACCOUNT` (`USER`,`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_stages_summary_by_host_by_event_name":          "CREATE TABLE `events_stages_summary_by_host_by_event_name` (\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `HOST` (`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_stages_summary_by_thread_by_event_name":        "CREATE TABLE `events_stages_summary_by_thread_by_event_name` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_stages_summary_by_user_by_event_name":          "CREATE TABLE `events_stages_summary_by_user_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `USER` (`USER`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_stages_summary_global_by_event_name":           "CREATE TABLE `events_stages_summary_global_by_event_name` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_statements_current":                            "CREATE TABLE `events_statements_current` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SQL_TEXT` longtext,\n  `DIGEST` varchar(64) DEFAULT NULL,\n  `DIGEST_TEXT` longtext,\n  `CURRENT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned DEFAULT NULL,\n  `MYSQL_ERRNO` int(11) DEFAULT NULL,\n  `RETURNED_SQLSTATE` varchar(5) DEFAULT NULL,\n  `MESSAGE_TEXT` varchar(128) DEFAULT NULL,\n  `ERRORS` bigint(20) unsigned NOT NULL,\n  `WARNINGS` bigint(20) unsigned NOT NULL,\n  `ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  `NESTING_EVENT_LEVEL` int(11) DEFAULT NULL,\n  `STATEMENT_ID` bigint(20) unsigned DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_statements_history":                            "CREATE TABLE `events_statements_history` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SQL_TEXT` longtext,\n  `DIGEST` varchar(64) DEFAULT NULL,\n  `DIGEST_TEXT` longtext,\n  `CURRENT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned DEFAULT NULL,\n  `MYSQL_ERRNO` int(11) DEFAULT NULL,\n  `RETURNED_SQLSTATE` varchar(5) DEFAULT NULL,\n  `MESSAGE_TEXT` varchar(128) DEFAULT NULL,\n  `ERRORS` bigint(20) unsigned NOT NULL,\n  `WARNINGS` bigint(20) unsigned NOT NULL,\n  `ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  `NESTING_EVENT_LEVEL` int(11) DEFAULT NULL,\n  `STATEMENT_ID` bigint(20) unsigned DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_statements_history_long":                       "CREATE TABLE `events_statements_history_long` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SQL_TEXT` longtext,\n  `DIGEST` varchar(64) DEFAULT NULL,\n  `DIGEST_TEXT` longtext,\n  `CURRENT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned DEFAULT NULL,\n  `MYSQL_ERRNO` int(11) DEFAULT NULL,\n  `RETURNED_SQLSTATE` varchar(5) DEFAULT NULL,\n  `MESSAGE_TEXT` varchar(128) DEFAULT NULL,\n  `ERRORS` bigint(20) unsigned NOT NULL,\n  `WARNINGS` bigint(20) unsigned NOT NULL,\n  `ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  `NESTING_EVENT_LEVEL` int(11) DEFAULT NULL,\n  `STATEMENT_ID` bigint(20) unsigned DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_statements_summary_by_account_by_event_name":   "CREATE TABLE `events_statements_summary_by_account_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `SUM_LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SUM_ERRORS` bigint(20) unsigned NOT NULL,\n  `SUM_WARNINGS` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `SUM_NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `ACCOUNT` (`USER`,`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_statements_summary_by_digest":                  "CREATE TABLE `events_statements_summary_by_digest` (\n  `SCHEMA_NAME` varchar(64) DEFAULT NULL,\n  `DIGEST` varchar(64) DEFAULT NULL,\n  `DIGEST_TEXT` longtext,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `SUM_LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SUM_ERRORS` bigint(20) unsigned NOT NULL,\n  `SUM_WARNINGS` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `SUM_NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `FIRST_SEEN` timestamp(6) NOT NULL DEFAULT '0000-00-00 00:00:00.000000',\n  `LAST_SEEN` timestamp(6) NOT NULL DEFAULT '0000-00-00 00:00:00.000000',\n  `QUANTILE_95` bigint(20) unsigned NOT NULL,\n  `QUANTILE_99` bigint(20) unsigned NOT NULL,\n  `QUANTILE_999` bigint(20) unsigned NOT NULL,\n  `QUERY_SAMPLE_TEXT` longtext,\n  `QUERY_SAMPLE_SEEN` timestamp(6) NOT NULL DEFAULT '0000-00-00 00:00:00.000000',\n  `QUERY_SAMPLE_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `SCHEMA_NAME` (`SCHEMA_NAME`,`DIGEST`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_statements_summary_by_host_by_event_name":      "CREATE TABLE `events_statements_summary_by_host_by_event_name` (\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `SUM_LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SUM_ERRORS` bigint(20) unsigned NOT NULL,\n  `SUM_WARNINGS` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `SUM_NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `HOST` (`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_statements_summary_by_thread_by_event_name":    "CREATE TABLE `events_statements_summary_by_thread_by_event_name` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `SUM_LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SUM_ERRORS` bigint(20) unsigned NOT NULL,\n  `SUM_WARNINGS` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `SUM_NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_statements_summary_by_user_by_event_name":      "CREATE TABLE `events_statements_summary_by_user_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `SUM_LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SUM_ERRORS` bigint(20) unsigned NOT NULL,\n  `SUM_WARNINGS` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `SUM_NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `USER` (`USER`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_statements_summary_global_by_event_name":       "CREATE TABLE `events_statements_summary_global_by_event_name` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `SUM_LOCK_TIME` bigint(20) unsigned NOT NULL,\n  `SUM_ERRORS` bigint(20) unsigned NOT NULL,\n  `SUM_WARNINGS` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_AFFECTED` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_SENT` bigint(20) unsigned NOT NULL,\n  `SUM_ROWS_EXAMINED` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_DISK_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_CREATED_TMP_TABLES` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_FULL_RANGE_JOIN` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_RANGE_CHECK` bigint(20) unsigned NOT NULL,\n  `SUM_SELECT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_MERGE_PASSES` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_RANGE` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_ROWS` bigint(20) unsigned NOT NULL,\n  `SUM_SORT_SCAN` bigint(20) unsigned NOT NULL,\n  `SUM_NO_INDEX_USED` bigint(20) unsigned NOT NULL,\n  `SUM_NO_GOOD_INDEX_USED` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_transactions_current":                          "CREATE TABLE `events_transactions_current` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `STATE` enum('ACTIVE','COMMITTED','ROLLED BACK') DEFAULT NULL,\n  `TRX_ID` bigint(20) unsigned DEFAULT NULL,\n  `GTID` varchar(64) DEFAULT NULL,\n  `XID_FORMAT_ID` int(11) DEFAULT NULL,\n  `XID_GTRID` varchar(130) DEFAULT NULL,\n  `XID_BQUAL` varchar(130) DEFAULT NULL,\n  `XA_STATE` varchar(64) DEFAULT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `ACCESS_MODE` enum('READ ONLY','READ WRITE') DEFAULT NULL,\n  `ISOLATION_LEVEL` varchar(64) DEFAULT NULL,\n  `AUTOCOMMIT` enum('YES','NO') NOT NULL,\n  `NUMBER_OF_SAVEPOINTS` bigint(20) unsigned DEFAULT NULL,\n  `NUMBER_OF_ROLLBACK_TO_SAVEPOINT` bigint(20) unsigned DEFAULT NULL,\n  `NUMBER_OF_RELEASE_SAVEPOINT` bigint(20) unsigned DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_transactions_history":                          "CREATE TABLE `events_transactions_history` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `STATE` enum('ACTIVE','COMMITTED','ROLLED BACK') DEFAULT NULL,\n  `TRX_ID` bigint(20) unsigned DEFAULT NULL,\n  `GTID` varchar(64) DEFAULT NULL,\n  `XID_FORMAT_ID` int(11) DEFAULT NULL,\n  `XID_GTRID` varchar(130) DEFAULT NULL,\n  `XID_BQUAL` varchar(130) DEFAULT NULL,\n  `XA_STATE` varchar(64) DEFAULT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `ACCESS_MODE` enum('READ ONLY','READ WRITE') DEFAULT NULL,\n  `ISOLATION_LEVEL` varchar(64) DEFAULT NULL,\n  `AUTOCOMMIT` enum('YES','NO') NOT NULL,\n  `NUMBER_OF_SAVEPOINTS` bigint(20) unsigned DEFAULT NULL,\n  `NUMBER_OF_ROLLBACK_TO_SAVEPOINT` bigint(20) unsigned DEFAULT NULL,\n  `NUMBER_OF_RELEASE_SAVEPOINT` bigint(20) unsigned DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_transactions_history_long":                     "CREATE TABLE `events_transactions_history_long` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `STATE` enum('ACTIVE','COMMITTED','ROLLED BACK') DEFAULT NULL,\n  `TRX_ID` bigint(20) unsigned DEFAULT NULL,\n  `GTID` varchar(64) DEFAULT NULL,\n  `XID_FORMAT_ID` int(11) DEFAULT NULL,\n  `XID_GTRID` varchar(130) DEFAULT NULL,\n  `XID_BQUAL` varchar(130) DEFAULT NULL,\n  `XA_STATE` varchar(64) DEFAULT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `ACCESS_MODE` enum('READ ONLY','READ WRITE') DEFAULT NULL,\n  `ISOLATION_LEVEL` varchar(64) DEFAULT NULL,\n  `AUTOCOMMIT` enum('YES','NO') NOT NULL,\n  `NUMBER_OF_SAVEPOINTS` bigint(20) unsigned DEFAULT NULL,\n  `NUMBER_OF_ROLLBACK_TO_SAVEPOINT` bigint(20) unsigned DEFAULT NULL,\n  `NUMBER_OF_RELEASE_SAVEPOINT` bigint(20) unsigned DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 	"events_transactions_summary_by_account_by_event_name": "CREATE TABLE `events_transactions_summary_by_account_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `ACCOUNT` (`USER`,`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_transactions_summary_by_host_by_event_name": "CREATE TABLE `events_transactions_summary_by_host_by_event_name` (\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `HOST` (`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_transactions_summary_by_thread_by_event_name": "CREATE TABLE `events_transactions_summary_by_thread_by_event_name` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_transactions_summary_by_user_by_event_name": "CREATE TABLE `events_transactions_summary_by_user_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `USER` (`USER`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_transactions_summary_global_by_event_name": "CREATE TABLE `events_transactions_summary_global_by_event_name` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_waits_current": "CREATE TABLE `events_waits_current` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `SPINS` int(10) unsigned DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(512) DEFAULT NULL,\n  `INDEX_NAME` varchar(64) DEFAULT NULL,\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  `OPERATION` varchar(32) NOT NULL,\n  `NUMBER_OF_BYTES` bigint(20) DEFAULT NULL,\n  `FLAGS` int(10) unsigned DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_waits_history": "CREATE TABLE `events_waits_history` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `SPINS` int(10) unsigned DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(512) DEFAULT NULL,\n  `INDEX_NAME` varchar(64) DEFAULT NULL,\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  `OPERATION` varchar(32) NOT NULL,\n  `NUMBER_OF_BYTES` bigint(20) DEFAULT NULL,\n  `FLAGS` int(10) unsigned DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_waits_history_long": "CREATE TABLE `events_waits_history_long` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `SPINS` int(10) unsigned DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(512) DEFAULT NULL,\n  `INDEX_NAME` varchar(64) DEFAULT NULL,\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  `OPERATION` varchar(32) NOT NULL,\n  `NUMBER_OF_BYTES` bigint(20) DEFAULT NULL,\n  `FLAGS` int(10) unsigned DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_waits_summary_by_account_by_event_name": "CREATE TABLE `events_waits_summary_by_account_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `ACCOUNT` (`USER`,`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_waits_summary_by_host_by_event_name": "CREATE TABLE `events_waits_summary_by_host_by_event_name` (\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `HOST` (`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_waits_summary_by_instance": "CREATE TABLE `events_waits_summary_by_instance` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `EVENT_NAME` (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_waits_summary_by_thread_by_event_name": "CREATE TABLE `events_waits_summary_by_thread_by_event_name` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_waits_summary_by_user_by_event_name": "CREATE TABLE `events_waits_summary_by_user_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `USER` (`USER`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_waits_summary_global_by_event_name": "CREATE TABLE `events_waits_summary_global_by_event_name` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"file_instances": "CREATE TABLE `file_instances` (\n  `FILE_NAME` varchar(512) NOT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `OPEN_COUNT` int(10) unsigned NOT NULL,\n  PRIMARY KEY (`FILE_NAME`),\n  KEY `EVENT_NAME` (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"file_summary_by_event_name": "CREATE TABLE `file_summary_by_event_name` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_READ` bigint(20) NOT NULL,\n  `COUNT_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_WRITE` bigint(20) NOT NULL,\n  `COUNT_MISC` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"file_summary_by_instance": "CREATE TABLE `file_summary_by_instance` (\n  `FILE_NAME` varchar(512) NOT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_READ` bigint(20) NOT NULL,\n  `COUNT_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_WRITE` bigint(20) NOT NULL,\n  `COUNT_MISC` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `FILE_NAME` (`FILE_NAME`),\n  KEY `EVENT_NAME` (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"host_cache": "CREATE TABLE `host_cache` (\n  `IP` varchar(64) NOT NULL,\n  `HOST` varchar(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `HOST_VALIDATED` enum('YES','NO') NOT NULL,\n  `SUM_CONNECT_ERRORS` bigint(20) NOT NULL,\n  `COUNT_HOST_BLOCKED_ERRORS` bigint(20) NOT NULL,\n  `COUNT_NAMEINFO_TRANSIENT_ERRORS` bigint(20) NOT NULL,\n  `COUNT_NAMEINFO_PERMANENT_ERRORS` bigint(20) NOT NULL,\n  `COUNT_FORMAT_ERRORS` bigint(20) NOT NULL,\n  `COUNT_ADDRINFO_TRANSIENT_ERRORS` bigint(20) NOT NULL,\n  `COUNT_ADDRINFO_PERMANENT_ERRORS` bigint(20) NOT NULL,\n  `COUNT_FCRDNS_ERRORS` bigint(20) NOT NULL,\n  `COUNT_HOST_ACL_ERRORS` bigint(20) NOT NULL,\n  `COUNT_NO_AUTH_PLUGIN_ERRORS` bigint(20) NOT NULL,\n  `COUNT_AUTH_PLUGIN_ERRORS` bigint(20) NOT NULL,\n  `COUNT_HANDSHAKE_ERRORS` bigint(20) NOT NULL,\n  `COUNT_PROXY_USER_ERRORS` bigint(20) NOT NULL,\n  `COUNT_PROXY_USER_ACL_ERRORS` bigint(20) NOT NULL,\n  `COUNT_AUTHENTICATION_ERRORS` bigint(20) NOT NULL,\n  `COUNT_SSL_ERRORS` bigint(20) NOT NULL,\n  `COUNT_MAX_USER_CONNECTIONS_ERRORS` bigint(20) NOT NULL,\n  `COUNT_MAX_USER_CONNECTIONS_PER_HOUR_ERRORS` bigint(20) NOT NULL,\n  `COUNT_DEFAULT_DATABASE_ERRORS` bigint(20) NOT NULL,\n  `COUNT_INIT_CONNECT_ERRORS` bigint(20) NOT NULL,\n  `COUNT_LOCAL_ERRORS` bigint(20) NOT NULL,\n  `COUNT_UNKNOWN_ERRORS` bigint(20) NOT NULL,\n  `FIRST_SEEN` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_SEEN` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00',\n  `FIRST_ERROR_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_ERROR_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  PRIMARY KEY (`IP`),\n  KEY `HOST` (`HOST`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"hosts": "CREATE TABLE `hosts` (\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `CURRENT_CONNECTIONS` bigint(20) NOT NULL,\n  `TOTAL_CONNECTIONS` bigint(20) NOT NULL,\n  UNIQUE KEY `HOST` (`HOST`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"keyring_keys": "CREATE TABLE `keyring_keys` (\n  `KEY_ID` varchar(255) COLLATE utf8mb4_bin NOT NULL,\n  `KEY_OWNER` varchar(255) COLLATE utf8mb4_bin DEFAULT NULL,\n  `BACKEND_KEY_ID` varchar(255) COLLATE utf8mb4_bin DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
-	"memory_summary_by_account_by_event_name": "CREATE TABLE `memory_summary_by_account_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_ALLOC` bigint(20) unsigned NOT NULL,\n  `COUNT_FREE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_ALLOC` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_FREE` bigint(20) unsigned NOT NULL,\n  `LOW_COUNT_USED` bigint(20) NOT NULL,\n  `CURRENT_COUNT_USED` bigint(20) NOT NULL,\n  `HIGH_COUNT_USED` bigint(20) NOT NULL,\n  `LOW_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `CURRENT_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `HIGH_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  UNIQUE KEY `ACCOUNT` (`USER`,`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"memory_summary_by_host_by_event_name": "CREATE TABLE `memory_summary_by_host_by_event_name` (\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_ALLOC` bigint(20) unsigned NOT NULL,\n  `COUNT_FREE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_ALLOC` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_FREE` bigint(20) unsigned NOT NULL,\n  `LOW_COUNT_USED` bigint(20) NOT NULL,\n  `CURRENT_COUNT_USED` bigint(20) NOT NULL,\n  `HIGH_COUNT_USED` bigint(20) NOT NULL,\n  `LOW_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `CURRENT_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `HIGH_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  UNIQUE KEY `HOST` (`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"memory_summary_by_thread_by_event_name": "CREATE TABLE `memory_summary_by_thread_by_event_name` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_ALLOC` bigint(20) unsigned NOT NULL,\n  `COUNT_FREE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_ALLOC` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_FREE` bigint(20) unsigned NOT NULL,\n  `LOW_COUNT_USED` bigint(20) NOT NULL,\n  `CURRENT_COUNT_USED` bigint(20) NOT NULL,\n  `HIGH_COUNT_USED` bigint(20) NOT NULL,\n  `LOW_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `CURRENT_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `HIGH_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"memory_summary_by_user_by_event_name": "CREATE TABLE `memory_summary_by_user_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_ALLOC` bigint(20) unsigned NOT NULL,\n  `COUNT_FREE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_ALLOC` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_FREE` bigint(20) unsigned NOT NULL,\n  `LOW_COUNT_USED` bigint(20) NOT NULL,\n  `CURRENT_COUNT_USED` bigint(20) NOT NULL,\n  `HIGH_COUNT_USED` bigint(20) NOT NULL,\n  `LOW_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `CURRENT_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `HIGH_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  UNIQUE KEY `USER` (`USER`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"memory_summary_global_by_event_name": "CREATE TABLE `memory_summary_global_by_event_name` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_ALLOC` bigint(20) unsigned NOT NULL,\n  `COUNT_FREE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_ALLOC` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_FREE` bigint(20) unsigned NOT NULL,\n  `LOW_COUNT_USED` bigint(20) NOT NULL,\n  `CURRENT_COUNT_USED` bigint(20) NOT NULL,\n  `HIGH_COUNT_USED` bigint(20) NOT NULL,\n  `LOW_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `CURRENT_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `HIGH_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  PRIMARY KEY (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"metadata_locks": "CREATE TABLE `metadata_locks` (\n  `OBJECT_TYPE` varchar(64) NOT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `COLUMN_NAME` varchar(64) DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `LOCK_TYPE` varchar(32) NOT NULL,\n  `LOCK_DURATION` varchar(32) NOT NULL,\n  `LOCK_STATUS` varchar(32) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `OWNER_THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  `OWNER_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `OBJECT_TYPE` (`OBJECT_TYPE`,`OBJECT_SCHEMA`,`OBJECT_NAME`,`COLUMN_NAME`),\n  KEY `OWNER_THREAD_ID` (`OWNER_THREAD_ID`,`OWNER_EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"mutex_instances": "CREATE TABLE `mutex_instances` (\n  `NAME` varchar(128) NOT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `LOCKED_BY_THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `NAME` (`NAME`),\n  KEY `LOCKED_BY_THREAD_ID` (`LOCKED_BY_THREAD_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"objects_summary_global_by_type": "CREATE TABLE `objects_summary_global_by_type` (\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `OBJECT` (`OBJECT_TYPE`,`OBJECT_SCHEMA`,`OBJECT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"performance_timers": "CREATE TABLE `performance_timers` (\n  `TIMER_NAME` enum('CYCLE','NANOSECOND','MICROSECOND','MILLISECOND') NOT NULL,\n  `TIMER_FREQUENCY` bigint(20) DEFAULT NULL,\n  `TIMER_RESOLUTION` bigint(20) DEFAULT NULL,\n  `TIMER_OVERHEAD` bigint(20) DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"persisted_variables": "CREATE TABLE `persisted_variables` (\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL,\n  PRIMARY KEY (`VARIABLE_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"replication_group_member_stats": "CREATE TABLE `replication_group_member_stats` (\n  `CHANNEL_NAME` char(64) NOT NULL,\n  `VIEW_ID` char(60) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,\n  `MEMBER_ID` char(36) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,\n  `COUNT_TRANSACTIONS_IN_QUEUE` bigint(20) unsigned NOT NULL,\n  `COUNT_TRANSACTIONS_CHECKED` bigint(20) unsigned NOT NULL,\n  `COUNT_CONFLICTS_DETECTED` bigint(20) unsigned NOT NULL,\n  `COUNT_TRANSACTIONS_ROWS_VALIDATING` bigint(20) unsigned NOT NULL,\n  `TRANSACTIONS_COMMITTED_ALL_MEMBERS` longtext NOT NULL,\n  `LAST_CONFLICT_FREE_TRANSACTION` text NOT NULL,\n  `COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE` bigint(20) unsigned NOT NULL,\n  `COUNT_TRANSACTIONS_REMOTE_APPLIED` bigint(20) unsigned NOT NULL,\n  `COUNT_TRANSACTIONS_LOCAL_PROPOSED` bigint(20) unsigned NOT NULL,\n  `COUNT_TRANSACTIONS_LOCAL_ROLLBACK` bigint(20) unsigned NOT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"rwlock_instances": "CREATE TABLE `rwlock_instances` (\n  `NAME` varchar(128) NOT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `WRITE_LOCKED_BY_THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  `READ_LOCKED_BY_COUNT` int(10) unsigned NOT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `NAME` (`NAME`),\n  KEY `WRITE_LOCKED_BY_THREAD_ID` (`WRITE_LOCKED_BY_THREAD_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"setup_actors": "CREATE TABLE `setup_actors` (\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci NOT NULL DEFAULT '%',\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '%',\n  `ROLE` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '%',\n  `ENABLED` enum('YES','NO') NOT NULL DEFAULT 'YES',\n  `HISTORY` enum('YES','NO') NOT NULL DEFAULT 'YES',\n  PRIMARY KEY (`HOST`,`USER`,`ROLE`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"setup_consumers": "CREATE TABLE `setup_consumers` (\n  `NAME` varchar(64) NOT NULL,\n  `ENABLED` enum('YES','NO') NOT NULL,\n  PRIMARY KEY (`NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"setup_instruments": "CREATE TABLE `setup_instruments` (\n  `NAME` varchar(128) NOT NULL,\n  `ENABLED` enum('YES','NO') NOT NULL,\n  `TIMED` enum('YES','NO') DEFAULT NULL,\n  `PROPERTIES` set('singleton','progress','user','global_statistics','mutable') NOT NULL,\n  `VOLATILITY` int(11) NOT NULL,\n  `DOCUMENTATION` longtext,\n  PRIMARY KEY (`NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"setup_objects": "CREATE TABLE `setup_objects` (\n  `OBJECT_TYPE` enum('EVENT','FUNCTION','PROCEDURE','TABLE','TRIGGER') NOT NULL DEFAULT 'TABLE',\n  `OBJECT_SCHEMA` varchar(64) DEFAULT '%',\n  `OBJECT_NAME` varchar(64) NOT NULL DEFAULT '%',\n  `ENABLED` enum('YES','NO') NOT NULL DEFAULT 'YES',\n  `TIMED` enum('YES','NO') NOT NULL DEFAULT 'YES',\n  UNIQUE KEY `OBJECT` (`OBJECT_TYPE`,`OBJECT_SCHEMA`,`OBJECT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"socket_instances": "CREATE TABLE `socket_instances` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  `SOCKET_ID` int(11) NOT NULL,\n  `IP` varchar(64) NOT NULL,\n  `PORT` int(11) NOT NULL,\n  `STATE` enum('IDLE','ACTIVE') NOT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `THREAD_ID` (`THREAD_ID`),\n  KEY `SOCKET_ID` (`SOCKET_ID`),\n  KEY `IP` (`IP`,`PORT`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"socket_summary_by_event_name": "CREATE TABLE `socket_summary_by_event_name` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_READ` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_MISC` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"socket_summary_by_instance": "CREATE TABLE `socket_summary_by_instance` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_READ` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_MISC` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `EVENT_NAME` (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"table_handles": "CREATE TABLE `table_handles` (\n  `OBJECT_TYPE` varchar(64) NOT NULL,\n  `OBJECT_SCHEMA` varchar(64) NOT NULL,\n  `OBJECT_NAME` varchar(64) NOT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `OWNER_THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  `OWNER_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `INTERNAL_LOCK` varchar(64) DEFAULT NULL,\n  `EXTERNAL_LOCK` varchar(64) DEFAULT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `OBJECT_TYPE` (`OBJECT_TYPE`,`OBJECT_SCHEMA`,`OBJECT_NAME`),\n  KEY `OWNER_THREAD_ID` (`OWNER_THREAD_ID`,`OWNER_EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"table_io_waits_summary_by_index_usage": "CREATE TABLE `table_io_waits_summary_by_index_usage` (\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `INDEX_NAME` varchar(64) DEFAULT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_FETCH` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_FETCH` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_FETCH` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_FETCH` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_FETCH` bigint(20) unsigned NOT NULL,\n  `COUNT_INSERT` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_INSERT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_INSERT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_INSERT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_INSERT` bigint(20) unsigned NOT NULL,\n  `COUNT_UPDATE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_UPDATE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_UPDATE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_UPDATE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_UPDATE` bigint(20) unsigned NOT NULL,\n  `COUNT_DELETE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_DELETE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_DELETE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_DELETE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_DELETE` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `OBJECT` (`OBJECT_TYPE`,`OBJECT_SCHEMA`,`OBJECT_NAME`,`INDEX_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"table_io_waits_summary_by_table": "CREATE TABLE `table_io_waits_summary_by_table` (\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_FETCH` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_FETCH` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_FETCH` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_FETCH` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_FETCH` bigint(20) unsigned NOT NULL,\n  `COUNT_INSERT` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_INSERT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_INSERT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_INSERT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_INSERT` bigint(20) unsigned NOT NULL,\n  `COUNT_UPDATE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_UPDATE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_UPDATE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_UPDATE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_UPDATE` bigint(20) unsigned NOT NULL,\n  `COUNT_DELETE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_DELETE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_DELETE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_DELETE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_DELETE` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `OBJECT` (`OBJECT_TYPE`,`OBJECT_SCHEMA`,`OBJECT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"table_lock_waits_summary_by_table": "CREATE TABLE `table_lock_waits_summary_by_table` (\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_NORMAL` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_NORMAL` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_NORMAL` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_NORMAL` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_NORMAL` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_WITH_SHARED_LOCKS` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_WITH_SHARED_LOCKS` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_WITH_SHARED_LOCKS` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_WITH_SHARED_LOCKS` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_WITH_SHARED_LOCKS` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_HIGH_PRIORITY` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_HIGH_PRIORITY` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_HIGH_PRIORITY` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_HIGH_PRIORITY` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_HIGH_PRIORITY` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_NO_INSERT` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_NO_INSERT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_NO_INSERT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_NO_INSERT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_NO_INSERT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE_ALLOW_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE_ALLOW_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE_ALLOW_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE_ALLOW_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE_ALLOW_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE_CONCURRENT_INSERT` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE_CONCURRENT_INSERT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE_CONCURRENT_INSERT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE_CONCURRENT_INSERT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE_CONCURRENT_INSERT` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE_LOW_PRIORITY` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE_LOW_PRIORITY` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE_LOW_PRIORITY` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE_LOW_PRIORITY` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE_LOW_PRIORITY` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE_NORMAL` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE_NORMAL` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE_NORMAL` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE_NORMAL` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE_NORMAL` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE_EXTERNAL` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `OBJECT` (`OBJECT_TYPE`,`OBJECT_SCHEMA`,`OBJECT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"threads": "CREATE TABLE `threads` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `NAME` varchar(128) NOT NULL,\n  `TYPE` varchar(10) NOT NULL,\n  `PROCESSLIST_ID` bigint(20) unsigned DEFAULT NULL,\n  `PROCESSLIST_USER` varchar(32) DEFAULT NULL,\n  `PROCESSLIST_HOST` varchar(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `PROCESSLIST_DB` varchar(64) DEFAULT NULL,\n  `PROCESSLIST_COMMAND` varchar(16) DEFAULT NULL,\n  `PROCESSLIST_TIME` bigint(20) DEFAULT NULL,\n  `PROCESSLIST_STATE` varchar(64) DEFAULT NULL,\n  `PROCESSLIST_INFO` longtext,\n  `PARENT_THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  `ROLE` varchar(64) DEFAULT NULL,\n  `INSTRUMENTED` enum('YES','NO') NOT NULL,\n  `HISTORY` enum('YES','NO') NOT NULL,\n  `CONNECTION_TYPE` varchar(16) DEFAULT NULL,\n  `THREAD_OS_ID` bigint(20) unsigned DEFAULT NULL,\n  `RESOURCE_GROUP` varchar(64) DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`),\n  KEY `PROCESSLIST_ID` (`PROCESSLIST_ID`),\n  KEY `THREAD_OS_ID` (`THREAD_OS_ID`),\n  KEY `NAME` (`NAME`),\n  KEY `PROCESSLIST_ACCOUNT` (`PROCESSLIST_USER`,`PROCESSLIST_HOST`),\n  KEY `PROCESSLIST_HOST` (`PROCESSLIST_HOST`),\n  KEY `RESOURCE_GROUP` (`RESOURCE_GROUP`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"users": "CREATE TABLE `users` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `CURRENT_CONNECTIONS` bigint(20) NOT NULL,\n  `TOTAL_CONNECTIONS` bigint(20) NOT NULL,\n  UNIQUE KEY `USER` (`USER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"variables_info": "CREATE TABLE `variables_info` (\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_SOURCE` enum('COMPILED','GLOBAL','SERVER','EXPLICIT','EXTRA','USER','LOGIN','COMMAND_LINE','PERSISTED','DYNAMIC') DEFAULT 'COMPILED',\n  `VARIABLE_PATH` varchar(1024) DEFAULT NULL,\n  `MIN_VALUE` varchar(64) DEFAULT NULL,\n  `MAX_VALUE` varchar(64) DEFAULT NULL,\n  `SET_TIME` timestamp(6) NULL DEFAULT NULL,\n  `SET_USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `SET_HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_errors_summary_by_account_by_error": "CREATE TABLE `events_errors_summary_by_account_by_error` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `ERROR_NUMBER` int(11) DEFAULT NULL,\n  `ERROR_NAME` varchar(64) DEFAULT NULL,\n  `SQL_STATE` varchar(5) DEFAULT NULL,\n  `SUM_ERROR_RAISED` bigint(20) unsigned NOT NULL,\n  `SUM_ERROR_HANDLED` bigint(20) unsigned NOT NULL,\n  `FIRST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  UNIQUE KEY `ACCOUNT` (`USER`,`HOST`,`ERROR_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_errors_summary_by_host_by_error": "CREATE TABLE `events_errors_summary_by_host_by_error` (\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `ERROR_NUMBER` int(11) DEFAULT NULL,\n  `ERROR_NAME` varchar(64) DEFAULT NULL,\n  `SQL_STATE` varchar(5) DEFAULT NULL,\n  `SUM_ERROR_RAISED` bigint(20) unsigned NOT NULL,\n  `SUM_ERROR_HANDLED` bigint(20) unsigned NOT NULL,\n  `FIRST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  UNIQUE KEY `HOST` (`HOST`,`ERROR_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_errors_summary_by_thread_by_error": "CREATE TABLE `events_errors_summary_by_thread_by_error` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `ERROR_NUMBER` int(11) DEFAULT NULL,\n  `ERROR_NAME` varchar(64) DEFAULT NULL,\n  `SQL_STATE` varchar(5) DEFAULT NULL,\n  `SUM_ERROR_RAISED` bigint(20) unsigned NOT NULL,\n  `SUM_ERROR_HANDLED` bigint(20) unsigned NOT NULL,\n  `FIRST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  UNIQUE KEY `THREAD_ID` (`THREAD_ID`,`ERROR_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_errors_summary_by_user_by_error": "CREATE TABLE `events_errors_summary_by_user_by_error` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `ERROR_NUMBER` int(11) DEFAULT NULL,\n  `ERROR_NAME` varchar(64) DEFAULT NULL,\n  `SQL_STATE` varchar(5) DEFAULT NULL,\n  `SUM_ERROR_RAISED` bigint(20) unsigned NOT NULL,\n  `SUM_ERROR_HANDLED` bigint(20) unsigned NOT NULL,\n  `FIRST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  UNIQUE KEY `USER` (`USER`,`ERROR_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_errors_summary_global_by_error": "CREATE TABLE `events_errors_summary_global_by_error` (\n  `ERROR_NUMBER` int(11) DEFAULT NULL,\n  `ERROR_NAME` varchar(64) DEFAULT NULL,\n  `SQL_STATE` varchar(5) DEFAULT NULL,\n  `SUM_ERROR_RAISED` bigint(20) unsigned NOT NULL,\n  `SUM_ERROR_HANDLED` bigint(20) unsigned NOT NULL,\n  `FIRST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  UNIQUE KEY `ERROR_NUMBER` (`ERROR_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_statements_histogram_by_digest": "CREATE TABLE `events_statements_histogram_by_digest` (\n  `SCHEMA_NAME` varchar(64) DEFAULT NULL,\n  `DIGEST` varchar(64) DEFAULT NULL,\n  `BUCKET_NUMBER` int(10) unsigned NOT NULL,\n  `BUCKET_TIMER_LOW` bigint(20) unsigned NOT NULL,\n  `BUCKET_TIMER_HIGH` bigint(20) unsigned NOT NULL,\n  `COUNT_BUCKET` bigint(20) unsigned NOT NULL,\n  `COUNT_BUCKET_AND_LOWER` bigint(20) unsigned NOT NULL,\n  `BUCKET_QUANTILE` double(23,20) NOT NULL,\n  UNIQUE KEY `SCHEMA_NAME` (`SCHEMA_NAME`,`DIGEST`,`BUCKET_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"events_statements_histogram_global": "CREATE TABLE `events_statements_histogram_global` (\n  `BUCKET_NUMBER` int(10) unsigned NOT NULL,\n  `BUCKET_TIMER_LOW` bigint(20) unsigned NOT NULL,\n  `BUCKET_TIMER_HIGH` bigint(20) unsigned NOT NULL,\n  `COUNT_BUCKET` bigint(20) unsigned NOT NULL,\n  `COUNT_BUCKET_AND_LOWER` bigint(20) unsigned NOT NULL,\n  `BUCKET_QUANTILE` double(23,20) NOT NULL,\n  PRIMARY KEY (`BUCKET_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"global_status": "CREATE TABLE `global_status` (\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"global_variables": "CREATE TABLE `global_variables` (\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"session_account_connect_attrs": "CREATE TABLE `session_account_connect_attrs` (\n  `PROCESSLIST_ID` int(11) NOT NULL,\n  `ATTR_NAME` varchar(32) NOT NULL,\n  `ATTR_VALUE` varchar(1024) DEFAULT NULL,\n  `ORDINAL_POSITION` int(11) DEFAULT NULL,\n  PRIMARY KEY (`PROCESSLIST_ID`,`ATTR_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
-	"session_connect_attrs": "CREATE TABLE `session_connect_attrs` (\n  `PROCESSLIST_ID` int(11) NOT NULL,\n  `ATTR_NAME` varchar(32) NOT NULL,\n  `ATTR_VALUE` varchar(1024) DEFAULT NULL,\n  `ORDINAL_POSITION` int(11) DEFAULT NULL,\n  PRIMARY KEY (`PROCESSLIST_ID`,`ATTR_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
-	"session_status": "CREATE TABLE `session_status` (\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"session_variables": "CREATE TABLE `session_variables` (\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"setup_threads": "CREATE TABLE `setup_threads` (\n  `NAME` varchar(128) NOT NULL,\n  `ENABLED` enum('YES','NO') NOT NULL,\n  `HISTORY` enum('YES','NO') NOT NULL,\n  `PROPERTIES` set('singleton','progress') NOT NULL,\n  `VOLATILITY` int(11) NOT NULL DEFAULT '0',\n  `DOCUMENTATION` longtext,\n  PRIMARY KEY (`NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"status_by_thread": "CREATE TABLE `status_by_thread` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"user_variables_by_thread": "CREATE TABLE `user_variables_by_thread` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` longtext,\n  PRIMARY KEY (`THREAD_ID`,`VARIABLE_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	"variables_by_thread": "CREATE TABLE `variables_by_thread` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`VARIABLE_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_transactions_summary_by_host_by_event_name":    "CREATE TABLE `events_transactions_summary_by_host_by_event_name` (\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `HOST` (`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_transactions_summary_by_thread_by_event_name":  "CREATE TABLE `events_transactions_summary_by_thread_by_event_name` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_transactions_summary_by_user_by_event_name":    "CREATE TABLE `events_transactions_summary_by_user_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `USER` (`USER`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_transactions_summary_global_by_event_name":     "CREATE TABLE `events_transactions_summary_global_by_event_name` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_ONLY` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_waits_current":                                 "CREATE TABLE `events_waits_current` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `SPINS` int(10) unsigned DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(512) DEFAULT NULL,\n  `INDEX_NAME` varchar(64) DEFAULT NULL,\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  `OPERATION` varchar(32) NOT NULL,\n  `NUMBER_OF_BYTES` bigint(20) DEFAULT NULL,\n  `FLAGS` int(10) unsigned DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_waits_history":                                 "CREATE TABLE `events_waits_history` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `SPINS` int(10) unsigned DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(512) DEFAULT NULL,\n  `INDEX_NAME` varchar(64) DEFAULT NULL,\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  `OPERATION` varchar(32) NOT NULL,\n  `NUMBER_OF_BYTES` bigint(20) DEFAULT NULL,\n  `FLAGS` int(10) unsigned DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_waits_history_long":                            "CREATE TABLE `events_waits_history_long` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_ID` bigint(20) unsigned NOT NULL,\n  `END_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `TIMER_START` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_END` bigint(20) unsigned DEFAULT NULL,\n  `TIMER_WAIT` bigint(20) unsigned DEFAULT NULL,\n  `SPINS` int(10) unsigned DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(512) DEFAULT NULL,\n  `INDEX_NAME` varchar(64) DEFAULT NULL,\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `NESTING_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `NESTING_EVENT_TYPE` enum('TRANSACTION','STATEMENT','STAGE','WAIT') DEFAULT NULL,\n  `OPERATION` varchar(32) NOT NULL,\n  `NUMBER_OF_BYTES` bigint(20) DEFAULT NULL,\n  `FLAGS` int(10) unsigned DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_waits_summary_by_account_by_event_name":        "CREATE TABLE `events_waits_summary_by_account_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `ACCOUNT` (`USER`,`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_waits_summary_by_host_by_event_name":           "CREATE TABLE `events_waits_summary_by_host_by_event_name` (\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `HOST` (`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_waits_summary_by_instance":                     "CREATE TABLE `events_waits_summary_by_instance` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `EVENT_NAME` (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_waits_summary_by_thread_by_event_name":         "CREATE TABLE `events_waits_summary_by_thread_by_event_name` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_waits_summary_by_user_by_event_name":           "CREATE TABLE `events_waits_summary_by_user_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `USER` (`USER`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_waits_summary_global_by_event_name":            "CREATE TABLE `events_waits_summary_global_by_event_name` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"file_instances":                                       "CREATE TABLE `file_instances` (\n  `FILE_NAME` varchar(512) NOT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `OPEN_COUNT` int(10) unsigned NOT NULL,\n  PRIMARY KEY (`FILE_NAME`),\n  KEY `EVENT_NAME` (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"file_summary_by_event_name":                           "CREATE TABLE `file_summary_by_event_name` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_READ` bigint(20) NOT NULL,\n  `COUNT_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_WRITE` bigint(20) NOT NULL,\n  `COUNT_MISC` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"file_summary_by_instance":                             "CREATE TABLE `file_summary_by_instance` (\n  `FILE_NAME` varchar(512) NOT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_READ` bigint(20) NOT NULL,\n  `COUNT_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_WRITE` bigint(20) NOT NULL,\n  `COUNT_MISC` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `FILE_NAME` (`FILE_NAME`),\n  KEY `EVENT_NAME` (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"host_cache":                                           "CREATE TABLE `host_cache` (\n  `IP` varchar(64) NOT NULL,\n  `HOST` varchar(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `HOST_VALIDATED` enum('YES','NO') NOT NULL,\n  `SUM_CONNECT_ERRORS` bigint(20) NOT NULL,\n  `COUNT_HOST_BLOCKED_ERRORS` bigint(20) NOT NULL,\n  `COUNT_NAMEINFO_TRANSIENT_ERRORS` bigint(20) NOT NULL,\n  `COUNT_NAMEINFO_PERMANENT_ERRORS` bigint(20) NOT NULL,\n  `COUNT_FORMAT_ERRORS` bigint(20) NOT NULL,\n  `COUNT_ADDRINFO_TRANSIENT_ERRORS` bigint(20) NOT NULL,\n  `COUNT_ADDRINFO_PERMANENT_ERRORS` bigint(20) NOT NULL,\n  `COUNT_FCRDNS_ERRORS` bigint(20) NOT NULL,\n  `COUNT_HOST_ACL_ERRORS` bigint(20) NOT NULL,\n  `COUNT_NO_AUTH_PLUGIN_ERRORS` bigint(20) NOT NULL,\n  `COUNT_AUTH_PLUGIN_ERRORS` bigint(20) NOT NULL,\n  `COUNT_HANDSHAKE_ERRORS` bigint(20) NOT NULL,\n  `COUNT_PROXY_USER_ERRORS` bigint(20) NOT NULL,\n  `COUNT_PROXY_USER_ACL_ERRORS` bigint(20) NOT NULL,\n  `COUNT_AUTHENTICATION_ERRORS` bigint(20) NOT NULL,\n  `COUNT_SSL_ERRORS` bigint(20) NOT NULL,\n  `COUNT_MAX_USER_CONNECTIONS_ERRORS` bigint(20) NOT NULL,\n  `COUNT_MAX_USER_CONNECTIONS_PER_HOUR_ERRORS` bigint(20) NOT NULL,\n  `COUNT_DEFAULT_DATABASE_ERRORS` bigint(20) NOT NULL,\n  `COUNT_INIT_CONNECT_ERRORS` bigint(20) NOT NULL,\n  `COUNT_LOCAL_ERRORS` bigint(20) NOT NULL,\n  `COUNT_UNKNOWN_ERRORS` bigint(20) NOT NULL,\n  `FIRST_SEEN` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_SEEN` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00',\n  `FIRST_ERROR_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_ERROR_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  PRIMARY KEY (`IP`),\n  KEY `HOST` (`HOST`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"hosts":                                                "CREATE TABLE `hosts` (\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `CURRENT_CONNECTIONS` bigint(20) NOT NULL,\n  `TOTAL_CONNECTIONS` bigint(20) NOT NULL,\n  UNIQUE KEY `HOST` (`HOST`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"keyring_keys":                                         "CREATE TABLE `keyring_keys` (\n  `KEY_ID` varchar(255) COLLATE utf8mb4_bin NOT NULL,\n  `KEY_OWNER` varchar(255) COLLATE utf8mb4_bin DEFAULT NULL,\n  `BACKEND_KEY_ID` varchar(255) COLLATE utf8mb4_bin DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+	"memory_summary_by_account_by_event_name":              "CREATE TABLE `memory_summary_by_account_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_ALLOC` bigint(20) unsigned NOT NULL,\n  `COUNT_FREE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_ALLOC` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_FREE` bigint(20) unsigned NOT NULL,\n  `LOW_COUNT_USED` bigint(20) NOT NULL,\n  `CURRENT_COUNT_USED` bigint(20) NOT NULL,\n  `HIGH_COUNT_USED` bigint(20) NOT NULL,\n  `LOW_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `CURRENT_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `HIGH_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  UNIQUE KEY `ACCOUNT` (`USER`,`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"memory_summary_by_host_by_event_name":                 "CREATE TABLE `memory_summary_by_host_by_event_name` (\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_ALLOC` bigint(20) unsigned NOT NULL,\n  `COUNT_FREE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_ALLOC` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_FREE` bigint(20) unsigned NOT NULL,\n  `LOW_COUNT_USED` bigint(20) NOT NULL,\n  `CURRENT_COUNT_USED` bigint(20) NOT NULL,\n  `HIGH_COUNT_USED` bigint(20) NOT NULL,\n  `LOW_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `CURRENT_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `HIGH_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  UNIQUE KEY `HOST` (`HOST`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"memory_summary_by_thread_by_event_name":               "CREATE TABLE `memory_summary_by_thread_by_event_name` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_ALLOC` bigint(20) unsigned NOT NULL,\n  `COUNT_FREE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_ALLOC` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_FREE` bigint(20) unsigned NOT NULL,\n  `LOW_COUNT_USED` bigint(20) NOT NULL,\n  `CURRENT_COUNT_USED` bigint(20) NOT NULL,\n  `HIGH_COUNT_USED` bigint(20) NOT NULL,\n  `LOW_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `CURRENT_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `HIGH_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  PRIMARY KEY (`THREAD_ID`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"memory_summary_by_user_by_event_name":                 "CREATE TABLE `memory_summary_by_user_by_event_name` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_ALLOC` bigint(20) unsigned NOT NULL,\n  `COUNT_FREE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_ALLOC` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_FREE` bigint(20) unsigned NOT NULL,\n  `LOW_COUNT_USED` bigint(20) NOT NULL,\n  `CURRENT_COUNT_USED` bigint(20) NOT NULL,\n  `HIGH_COUNT_USED` bigint(20) NOT NULL,\n  `LOW_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `CURRENT_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `HIGH_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  UNIQUE KEY `USER` (`USER`,`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"memory_summary_global_by_event_name":                  "CREATE TABLE `memory_summary_global_by_event_name` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_ALLOC` bigint(20) unsigned NOT NULL,\n  `COUNT_FREE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_ALLOC` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_FREE` bigint(20) unsigned NOT NULL,\n  `LOW_COUNT_USED` bigint(20) NOT NULL,\n  `CURRENT_COUNT_USED` bigint(20) NOT NULL,\n  `HIGH_COUNT_USED` bigint(20) NOT NULL,\n  `LOW_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `CURRENT_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  `HIGH_NUMBER_OF_BYTES_USED` bigint(20) NOT NULL,\n  PRIMARY KEY (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"metadata_locks":                                       "CREATE TABLE `metadata_locks` (\n  `OBJECT_TYPE` varchar(64) NOT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `COLUMN_NAME` varchar(64) DEFAULT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `LOCK_TYPE` varchar(32) NOT NULL,\n  `LOCK_DURATION` varchar(32) NOT NULL,\n  `LOCK_STATUS` varchar(32) NOT NULL,\n  `SOURCE` varchar(64) DEFAULT NULL,\n  `OWNER_THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  `OWNER_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `OBJECT_TYPE` (`OBJECT_TYPE`,`OBJECT_SCHEMA`,`OBJECT_NAME`,`COLUMN_NAME`),\n  KEY `OWNER_THREAD_ID` (`OWNER_THREAD_ID`,`OWNER_EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"mutex_instances":                                      "CREATE TABLE `mutex_instances` (\n  `NAME` varchar(128) NOT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `LOCKED_BY_THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `NAME` (`NAME`),\n  KEY `LOCKED_BY_THREAD_ID` (`LOCKED_BY_THREAD_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"objects_summary_global_by_type":                       "CREATE TABLE `objects_summary_global_by_type` (\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `OBJECT` (`OBJECT_TYPE`,`OBJECT_SCHEMA`,`OBJECT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"performance_timers":                                   "CREATE TABLE `performance_timers` (\n  `TIMER_NAME` enum('CYCLE','NANOSECOND','MICROSECOND','MILLISECOND') NOT NULL,\n  `TIMER_FREQUENCY` bigint(20) DEFAULT NULL,\n  `TIMER_RESOLUTION` bigint(20) DEFAULT NULL,\n  `TIMER_OVERHEAD` bigint(20) DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"persisted_variables":                                  "CREATE TABLE `persisted_variables` (\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL,\n  PRIMARY KEY (`VARIABLE_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"replication_group_member_stats":                       "CREATE TABLE `replication_group_member_stats` (\n  `CHANNEL_NAME` char(64) NOT NULL,\n  `VIEW_ID` char(60) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,\n  `MEMBER_ID` char(36) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,\n  `COUNT_TRANSACTIONS_IN_QUEUE` bigint(20) unsigned NOT NULL,\n  `COUNT_TRANSACTIONS_CHECKED` bigint(20) unsigned NOT NULL,\n  `COUNT_CONFLICTS_DETECTED` bigint(20) unsigned NOT NULL,\n  `COUNT_TRANSACTIONS_ROWS_VALIDATING` bigint(20) unsigned NOT NULL,\n  `TRANSACTIONS_COMMITTED_ALL_MEMBERS` longtext NOT NULL,\n  `LAST_CONFLICT_FREE_TRANSACTION` text NOT NULL,\n  `COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE` bigint(20) unsigned NOT NULL,\n  `COUNT_TRANSACTIONS_REMOTE_APPLIED` bigint(20) unsigned NOT NULL,\n  `COUNT_TRANSACTIONS_LOCAL_PROPOSED` bigint(20) unsigned NOT NULL,\n  `COUNT_TRANSACTIONS_LOCAL_ROLLBACK` bigint(20) unsigned NOT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"rwlock_instances":                                     "CREATE TABLE `rwlock_instances` (\n  `NAME` varchar(128) NOT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `WRITE_LOCKED_BY_THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  `READ_LOCKED_BY_COUNT` int(10) unsigned NOT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `NAME` (`NAME`),\n  KEY `WRITE_LOCKED_BY_THREAD_ID` (`WRITE_LOCKED_BY_THREAD_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"setup_actors":                                         "CREATE TABLE `setup_actors` (\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci NOT NULL DEFAULT '%',\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '%',\n  `ROLE` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '%',\n  `ENABLED` enum('YES','NO') NOT NULL DEFAULT 'YES',\n  `HISTORY` enum('YES','NO') NOT NULL DEFAULT 'YES',\n  PRIMARY KEY (`HOST`,`USER`,`ROLE`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"setup_consumers":                                      "CREATE TABLE `setup_consumers` (\n  `NAME` varchar(64) NOT NULL,\n  `ENABLED` enum('YES','NO') NOT NULL,\n  PRIMARY KEY (`NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"setup_instruments":                                    "CREATE TABLE `setup_instruments` (\n  `NAME` varchar(128) NOT NULL,\n  `ENABLED` enum('YES','NO') NOT NULL,\n  `TIMED` enum('YES','NO') DEFAULT NULL,\n  `PROPERTIES` set('singleton','progress','user','global_statistics','mutable') NOT NULL,\n  `VOLATILITY` int(11) NOT NULL,\n  `DOCUMENTATION` longtext,\n  PRIMARY KEY (`NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"setup_objects":                                        "CREATE TABLE `setup_objects` (\n  `OBJECT_TYPE` enum('EVENT','FUNCTION','PROCEDURE','TABLE','TRIGGER') NOT NULL DEFAULT 'TABLE',\n  `OBJECT_SCHEMA` varchar(64) DEFAULT '%',\n  `OBJECT_NAME` varchar(64) NOT NULL DEFAULT '%',\n  `ENABLED` enum('YES','NO') NOT NULL DEFAULT 'YES',\n  `TIMED` enum('YES','NO') NOT NULL DEFAULT 'YES',\n  UNIQUE KEY `OBJECT` (`OBJECT_TYPE`,`OBJECT_SCHEMA`,`OBJECT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"socket_instances":                                     "CREATE TABLE `socket_instances` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  `SOCKET_ID` int(11) NOT NULL,\n  `IP` varchar(64) NOT NULL,\n  `PORT` int(11) NOT NULL,\n  `STATE` enum('IDLE','ACTIVE') NOT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `THREAD_ID` (`THREAD_ID`),\n  KEY `SOCKET_ID` (`SOCKET_ID`),\n  KEY `IP` (`IP`,`PORT`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"socket_summary_by_event_name":                         "CREATE TABLE `socket_summary_by_event_name` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_READ` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_MISC` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"socket_summary_by_instance":                           "CREATE TABLE `socket_summary_by_instance` (\n  `EVENT_NAME` varchar(128) NOT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_READ` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_NUMBER_OF_BYTES_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_MISC` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_MISC` bigint(20) unsigned NOT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `EVENT_NAME` (`EVENT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"table_handles":                                        "CREATE TABLE `table_handles` (\n  `OBJECT_TYPE` varchar(64) NOT NULL,\n  `OBJECT_SCHEMA` varchar(64) NOT NULL,\n  `OBJECT_NAME` varchar(64) NOT NULL,\n  `OBJECT_INSTANCE_BEGIN` bigint(20) unsigned NOT NULL,\n  `OWNER_THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  `OWNER_EVENT_ID` bigint(20) unsigned DEFAULT NULL,\n  `INTERNAL_LOCK` varchar(64) DEFAULT NULL,\n  `EXTERNAL_LOCK` varchar(64) DEFAULT NULL,\n  PRIMARY KEY (`OBJECT_INSTANCE_BEGIN`),\n  KEY `OBJECT_TYPE` (`OBJECT_TYPE`,`OBJECT_SCHEMA`,`OBJECT_NAME`),\n  KEY `OWNER_THREAD_ID` (`OWNER_THREAD_ID`,`OWNER_EVENT_ID`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"table_io_waits_summary_by_index_usage":                "CREATE TABLE `table_io_waits_summary_by_index_usage` (\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `INDEX_NAME` varchar(64) DEFAULT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_FETCH` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_FETCH` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_FETCH` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_FETCH` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_FETCH` bigint(20) unsigned NOT NULL,\n  `COUNT_INSERT` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_INSERT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_INSERT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_INSERT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_INSERT` bigint(20) unsigned NOT NULL,\n  `COUNT_UPDATE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_UPDATE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_UPDATE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_UPDATE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_UPDATE` bigint(20) unsigned NOT NULL,\n  `COUNT_DELETE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_DELETE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_DELETE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_DELETE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_DELETE` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `OBJECT` (`OBJECT_TYPE`,`OBJECT_SCHEMA`,`OBJECT_NAME`,`INDEX_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"table_io_waits_summary_by_table":                      "CREATE TABLE `table_io_waits_summary_by_table` (\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_FETCH` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_FETCH` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_FETCH` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_FETCH` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_FETCH` bigint(20) unsigned NOT NULL,\n  `COUNT_INSERT` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_INSERT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_INSERT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_INSERT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_INSERT` bigint(20) unsigned NOT NULL,\n  `COUNT_UPDATE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_UPDATE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_UPDATE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_UPDATE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_UPDATE` bigint(20) unsigned NOT NULL,\n  `COUNT_DELETE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_DELETE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_DELETE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_DELETE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_DELETE` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `OBJECT` (`OBJECT_TYPE`,`OBJECT_SCHEMA`,`OBJECT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"table_lock_waits_summary_by_table":                    "CREATE TABLE `table_lock_waits_summary_by_table` (\n  `OBJECT_TYPE` varchar(64) DEFAULT NULL,\n  `OBJECT_SCHEMA` varchar(64) DEFAULT NULL,\n  `OBJECT_NAME` varchar(64) DEFAULT NULL,\n  `COUNT_STAR` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WAIT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_NORMAL` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_NORMAL` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_NORMAL` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_NORMAL` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_NORMAL` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_WITH_SHARED_LOCKS` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_WITH_SHARED_LOCKS` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_WITH_SHARED_LOCKS` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_WITH_SHARED_LOCKS` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_WITH_SHARED_LOCKS` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_HIGH_PRIORITY` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_HIGH_PRIORITY` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_HIGH_PRIORITY` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_HIGH_PRIORITY` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_HIGH_PRIORITY` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_NO_INSERT` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_NO_INSERT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_NO_INSERT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_NO_INSERT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_NO_INSERT` bigint(20) unsigned NOT NULL,\n  `COUNT_READ_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_READ_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_READ_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_READ_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_READ_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE_ALLOW_WRITE` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE_ALLOW_WRITE` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE_ALLOW_WRITE` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE_ALLOW_WRITE` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE_ALLOW_WRITE` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE_CONCURRENT_INSERT` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE_CONCURRENT_INSERT` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE_CONCURRENT_INSERT` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE_CONCURRENT_INSERT` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE_CONCURRENT_INSERT` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE_LOW_PRIORITY` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE_LOW_PRIORITY` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE_LOW_PRIORITY` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE_LOW_PRIORITY` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE_LOW_PRIORITY` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE_NORMAL` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE_NORMAL` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE_NORMAL` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE_NORMAL` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE_NORMAL` bigint(20) unsigned NOT NULL,\n  `COUNT_WRITE_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `SUM_TIMER_WRITE_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `MIN_TIMER_WRITE_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `AVG_TIMER_WRITE_EXTERNAL` bigint(20) unsigned NOT NULL,\n  `MAX_TIMER_WRITE_EXTERNAL` bigint(20) unsigned NOT NULL,\n  UNIQUE KEY `OBJECT` (`OBJECT_TYPE`,`OBJECT_SCHEMA`,`OBJECT_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"threads":                                              "CREATE TABLE `threads` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `NAME` varchar(128) NOT NULL,\n  `TYPE` varchar(10) NOT NULL,\n  `PROCESSLIST_ID` bigint(20) unsigned DEFAULT NULL,\n  `PROCESSLIST_USER` varchar(32) DEFAULT NULL,\n  `PROCESSLIST_HOST` varchar(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `PROCESSLIST_DB` varchar(64) DEFAULT NULL,\n  `PROCESSLIST_COMMAND` varchar(16) DEFAULT NULL,\n  `PROCESSLIST_TIME` bigint(20) DEFAULT NULL,\n  `PROCESSLIST_STATE` varchar(64) DEFAULT NULL,\n  `PROCESSLIST_INFO` longtext,\n  `PARENT_THREAD_ID` bigint(20) unsigned DEFAULT NULL,\n  `ROLE` varchar(64) DEFAULT NULL,\n  `INSTRUMENTED` enum('YES','NO') NOT NULL,\n  `HISTORY` enum('YES','NO') NOT NULL,\n  `CONNECTION_TYPE` varchar(16) DEFAULT NULL,\n  `THREAD_OS_ID` bigint(20) unsigned DEFAULT NULL,\n  `RESOURCE_GROUP` varchar(64) DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`),\n  KEY `PROCESSLIST_ID` (`PROCESSLIST_ID`),\n  KEY `THREAD_OS_ID` (`THREAD_OS_ID`),\n  KEY `NAME` (`NAME`),\n  KEY `PROCESSLIST_ACCOUNT` (`PROCESSLIST_USER`,`PROCESSLIST_HOST`),\n  KEY `PROCESSLIST_HOST` (`PROCESSLIST_HOST`),\n  KEY `RESOURCE_GROUP` (`RESOURCE_GROUP`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"users":                                                "CREATE TABLE `users` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `CURRENT_CONNECTIONS` bigint(20) NOT NULL,\n  `TOTAL_CONNECTIONS` bigint(20) NOT NULL,\n  UNIQUE KEY `USER` (`USER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"variables_info":                                       "CREATE TABLE `variables_info` (\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_SOURCE` enum('COMPILED','GLOBAL','SERVER','EXPLICIT','EXTRA','USER','LOGIN','COMMAND_LINE','PERSISTED','DYNAMIC') DEFAULT 'COMPILED',\n  `VARIABLE_PATH` varchar(1024) DEFAULT NULL,\n  `MIN_VALUE` varchar(64) DEFAULT NULL,\n  `MAX_VALUE` varchar(64) DEFAULT NULL,\n  `SET_TIME` timestamp(6) NULL DEFAULT NULL,\n  `SET_USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `SET_HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_errors_summary_by_account_by_error":            "CREATE TABLE `events_errors_summary_by_account_by_error` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `ERROR_NUMBER` int(11) DEFAULT NULL,\n  `ERROR_NAME` varchar(64) DEFAULT NULL,\n  `SQL_STATE` varchar(5) DEFAULT NULL,\n  `SUM_ERROR_RAISED` bigint(20) unsigned NOT NULL,\n  `SUM_ERROR_HANDLED` bigint(20) unsigned NOT NULL,\n  `FIRST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  UNIQUE KEY `ACCOUNT` (`USER`,`HOST`,`ERROR_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_errors_summary_by_host_by_error":               "CREATE TABLE `events_errors_summary_by_host_by_error` (\n  `HOST` char(255) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,\n  `ERROR_NUMBER` int(11) DEFAULT NULL,\n  `ERROR_NAME` varchar(64) DEFAULT NULL,\n  `SQL_STATE` varchar(5) DEFAULT NULL,\n  `SUM_ERROR_RAISED` bigint(20) unsigned NOT NULL,\n  `SUM_ERROR_HANDLED` bigint(20) unsigned NOT NULL,\n  `FIRST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  UNIQUE KEY `HOST` (`HOST`,`ERROR_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_errors_summary_by_thread_by_error":             "CREATE TABLE `events_errors_summary_by_thread_by_error` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `ERROR_NUMBER` int(11) DEFAULT NULL,\n  `ERROR_NAME` varchar(64) DEFAULT NULL,\n  `SQL_STATE` varchar(5) DEFAULT NULL,\n  `SUM_ERROR_RAISED` bigint(20) unsigned NOT NULL,\n  `SUM_ERROR_HANDLED` bigint(20) unsigned NOT NULL,\n  `FIRST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  UNIQUE KEY `THREAD_ID` (`THREAD_ID`,`ERROR_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_errors_summary_by_user_by_error":               "CREATE TABLE `events_errors_summary_by_user_by_error` (\n  `USER` char(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `ERROR_NUMBER` int(11) DEFAULT NULL,\n  `ERROR_NAME` varchar(64) DEFAULT NULL,\n  `SQL_STATE` varchar(5) DEFAULT NULL,\n  `SUM_ERROR_RAISED` bigint(20) unsigned NOT NULL,\n  `SUM_ERROR_HANDLED` bigint(20) unsigned NOT NULL,\n  `FIRST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  UNIQUE KEY `USER` (`USER`,`ERROR_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_errors_summary_global_by_error":                "CREATE TABLE `events_errors_summary_global_by_error` (\n  `ERROR_NUMBER` int(11) DEFAULT NULL,\n  `ERROR_NAME` varchar(64) DEFAULT NULL,\n  `SQL_STATE` varchar(5) DEFAULT NULL,\n  `SUM_ERROR_RAISED` bigint(20) unsigned NOT NULL,\n  `SUM_ERROR_HANDLED` bigint(20) unsigned NOT NULL,\n  `FIRST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  `LAST_SEEN` timestamp NULL DEFAULT '0000-00-00 00:00:00',\n  UNIQUE KEY `ERROR_NUMBER` (`ERROR_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_statements_histogram_by_digest":                "CREATE TABLE `events_statements_histogram_by_digest` (\n  `SCHEMA_NAME` varchar(64) DEFAULT NULL,\n  `DIGEST` varchar(64) DEFAULT NULL,\n  `BUCKET_NUMBER` int(10) unsigned NOT NULL,\n  `BUCKET_TIMER_LOW` bigint(20) unsigned NOT NULL,\n  `BUCKET_TIMER_HIGH` bigint(20) unsigned NOT NULL,\n  `COUNT_BUCKET` bigint(20) unsigned NOT NULL,\n  `COUNT_BUCKET_AND_LOWER` bigint(20) unsigned NOT NULL,\n  `BUCKET_QUANTILE` double(23,20) NOT NULL,\n  UNIQUE KEY `SCHEMA_NAME` (`SCHEMA_NAME`,`DIGEST`,`BUCKET_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"events_statements_histogram_global":                   "CREATE TABLE `events_statements_histogram_global` (\n  `BUCKET_NUMBER` int(10) unsigned NOT NULL,\n  `BUCKET_TIMER_LOW` bigint(20) unsigned NOT NULL,\n  `BUCKET_TIMER_HIGH` bigint(20) unsigned NOT NULL,\n  `COUNT_BUCKET` bigint(20) unsigned NOT NULL,\n  `COUNT_BUCKET_AND_LOWER` bigint(20) unsigned NOT NULL,\n  `BUCKET_QUANTILE` double(23,20) NOT NULL,\n  PRIMARY KEY (`BUCKET_NUMBER`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"global_status":                                        "CREATE TABLE `global_status` (\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"global_variables":                                     "CREATE TABLE `global_variables` (\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"session_account_connect_attrs":                        "CREATE TABLE `session_account_connect_attrs` (\n  `PROCESSLIST_ID` int(11) NOT NULL,\n  `ATTR_NAME` varchar(32) NOT NULL,\n  `ATTR_VALUE` varchar(1024) DEFAULT NULL,\n  `ORDINAL_POSITION` int(11) DEFAULT NULL,\n  PRIMARY KEY (`PROCESSLIST_ID`,`ATTR_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+	"session_connect_attrs":                                "CREATE TABLE `session_connect_attrs` (\n  `PROCESSLIST_ID` int(11) NOT NULL,\n  `ATTR_NAME` varchar(32) NOT NULL,\n  `ATTR_VALUE` varchar(1024) DEFAULT NULL,\n  `ORDINAL_POSITION` int(11) DEFAULT NULL,\n  PRIMARY KEY (`PROCESSLIST_ID`,`ATTR_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+	"session_status":                                       "CREATE TABLE `session_status` (\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"session_variables":                                    "CREATE TABLE `session_variables` (\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"setup_threads":                                        "CREATE TABLE `setup_threads` (\n  `NAME` varchar(128) NOT NULL,\n  `ENABLED` enum('YES','NO') NOT NULL,\n  `HISTORY` enum('YES','NO') NOT NULL,\n  `PROPERTIES` set('singleton','progress') NOT NULL,\n  `VOLATILITY` int(11) NOT NULL DEFAULT '0',\n  `DOCUMENTATION` longtext,\n  PRIMARY KEY (`NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"status_by_thread":                                     "CREATE TABLE `status_by_thread` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"user_variables_by_thread":                             "CREATE TABLE `user_variables_by_thread` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` longtext,\n  PRIMARY KEY (`THREAD_ID`,`VARIABLE_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	"variables_by_thread":                                  "CREATE TABLE `variables_by_thread` (\n  `THREAD_ID` bigint(20) unsigned NOT NULL,\n  `VARIABLE_NAME` varchar(64) NOT NULL,\n  `VARIABLE_VALUE` varchar(1024) DEFAULT NULL,\n  PRIMARY KEY (`THREAD_ID`,`VARIABLE_NAME`)\n) ENGINE=PERFORMANCE_SCHEMA DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 }
 
 // emptyStubTables lists virtual tables that always return an empty result set.
 var emptyStubTables = map[string]bool{
-	"innodb_ft_index_cache":  true,
-	"innodb_ft_index_table":  true,
-	"innodb_ft_config":       true,
+	"innodb_ft_index_cache":   true,
+	"innodb_ft_index_table":   true,
+	"innodb_ft_config":        true,
 	"innodb_ft_being_deleted": true,
-	"innodb_ft_deleted":      true,
+	"innodb_ft_deleted":       true,
 	// "column_privileges" is handled dynamically via infoSchemaColumnPrivileges.
-	"persisted_variables":    true,
+	// "persisted_variables" is handled dynamically from Executor.persistedVars.
 	// "variables_by_thread" is handled dynamically
 	// "status_by_thread" is handled dynamically
 	// "user_variables_by_thread" is handled dynamically
@@ -513,32 +514,32 @@ var emptyStubTables = map[string]bool{
 	// "socket_summary_by_event_name" is handled dynamically
 	// "events_statements_summary_by_digest" is handled dynamically
 	// "events_statements_histogram_by_digest" is handled dynamically
-	"events_statements_summary_by_program":    true,
-	"status_by_account":                       true,
-	"status_by_host":                          true,
-	"status_by_user":                          true,
-	"replication_connection_configuration":     true,
-	"replication_connection_status":            true,
-	"replication_applier_configuration":        true,
-	"replication_applier_status":               true,
+	"events_statements_summary_by_program":      true,
+	"status_by_account":                         true,
+	"status_by_host":                            true,
+	"status_by_user":                            true,
+	"replication_connection_configuration":      true,
+	"replication_connection_status":             true,
+	"replication_applier_configuration":         true,
+	"replication_applier_status":                true,
 	"replication_applier_status_by_coordinator": true,
-	"replication_applier_status_by_worker":     true,
-	"replication_applier_filters":              true,
-	"replication_applier_global_filters":       true,
-	"replication_group_members":                true,
-	"replication_group_member_stats":           true,
-	"keyring_keys":               true,
-	"host_cache":                 true,
-	"log_status":                 true,
-	"prepared_statements_instances": true,
-	"user_defined_functions":     true,
-	"metadata_locks":             true,
-	"data_locks":                 true,
-	"data_lock_waits":            true,
-	"file_instances":             true,
-	"file_summary_by_instance":   true,
-	"socket_summary_by_instance":    true,
-	"table_handles":              true,
+	"replication_applier_status_by_worker":      true,
+	"replication_applier_filters":               true,
+	"replication_applier_global_filters":        true,
+	"replication_group_members":                 true,
+	"replication_group_member_stats":            true,
+	"keyring_keys":                              true,
+	"host_cache":                                true,
+	"log_status":                                true,
+	"prepared_statements_instances":             true,
+	"user_defined_functions":                    true,
+	"metadata_locks":                            true,
+	"data_locks":                                true,
+	"data_lock_waits":                           true,
+	"file_instances":                            true,
+	"file_summary_by_instance":                  true,
+	"socket_summary_by_instance":                true,
+	"table_handles":                             true,
 	// table_io_waits_summary_by_table, table_io_waits_summary_by_index_usage,
 	// table_lock_waits_summary_by_table are handled dynamically (see buildInformationSchemaRows).
 }
@@ -546,26 +547,26 @@ var emptyStubTables = map[string]bool{
 // singleRowStubTables maps table names to their single stub row definition.
 // These are InnoDB metadata tables that return one row of zero/empty values.
 var singleRowStubTables = map[string]storage.Row{
-	"innodb_columns":        {"TABLE_ID": int64(0), "NAME": "", "POS": int64(0), "MTYPE": int64(0), "PRTYPE": int64(0), "LEN": int64(0)},
-	"innodb_virtual":        {"TABLE_ID": int64(0), "POS": int64(0), "BASE_POS": int64(0)},
-	"innodb_buffer_page_lru": {"POOL_ID": int64(0), "LRU_POSITION": int64(0), "SPACE": int64(0), "PAGE_NUMBER": int64(0)},
+	"innodb_columns":           {"TABLE_ID": int64(0), "NAME": "", "POS": int64(0), "MTYPE": int64(0), "PRTYPE": int64(0), "LEN": int64(0)},
+	"innodb_virtual":           {"TABLE_ID": int64(0), "POS": int64(0), "BASE_POS": int64(0)},
+	"innodb_buffer_page_lru":   {"POOL_ID": int64(0), "LRU_POSITION": int64(0), "SPACE": int64(0), "PAGE_NUMBER": int64(0)},
 	"innodb_buffer_pool_stats": {"POOL_ID": int64(0), "POOL_SIZE": int64(0)},
-	"innodb_cmp":          {"page_size": int64(4096), "compress_ops": int64(0), "compress_ops_ok": int64(0), "compress_time": int64(0), "uncompress_ops": int64(0), "uncompress_time": int64(0)},
-	"innodb_cmp_reset":    {"page_size": int64(4096), "compress_ops": int64(0), "compress_ops_ok": int64(0), "compress_time": int64(0), "uncompress_ops": int64(0), "uncompress_time": int64(0)},
-	"innodb_cmpmem":       {"page_size": int64(4096), "buffer_pool_instance": int64(0), "pages_used": int64(0), "pages_free": int64(0), "relocation_ops": int64(0), "relocation_time": int64(0)},
-	"innodb_cmpmem_reset": {"page_size": int64(4096), "buffer_pool_instance": int64(0), "pages_used": int64(0), "pages_free": int64(0), "relocation_ops": int64(0), "relocation_time": int64(0)},
+	"innodb_cmp":               {"page_size": int64(4096), "compress_ops": int64(0), "compress_ops_ok": int64(0), "compress_time": int64(0), "uncompress_ops": int64(0), "uncompress_time": int64(0)},
+	"innodb_cmp_reset":         {"page_size": int64(4096), "compress_ops": int64(0), "compress_ops_ok": int64(0), "compress_time": int64(0), "uncompress_ops": int64(0), "uncompress_time": int64(0)},
+	"innodb_cmpmem":            {"page_size": int64(4096), "buffer_pool_instance": int64(0), "pages_used": int64(0), "pages_free": int64(0), "relocation_ops": int64(0), "relocation_time": int64(0)},
+	"innodb_cmpmem_reset":      {"page_size": int64(4096), "buffer_pool_instance": int64(0), "pages_used": int64(0), "pages_free": int64(0), "relocation_ops": int64(0), "relocation_time": int64(0)},
 	// innodb_trx is handled dynamically in buildInformationSchemaRows (from TxnActiveSet).
-	"innodb_fields":         {"INDEX_ID": int64(0), "NAME": "", "POS": int64(0)},
-	"optimizer_trace":       {"QUERY": "", "TRACE": "", "MISSING_BYTES_BEYOND_MAX_MEM_SIZE": int64(0), "INSUFFICIENT_PRIVILEGES": int64(0)},
-	"files":                 {"FILE_NAME": "", "FILE_TYPE": "", "TABLESPACE_NAME": ""},
+	"innodb_fields":          {"INDEX_ID": int64(0), "NAME": "", "POS": int64(0)},
+	"optimizer_trace":        {"QUERY": "", "TRACE": "", "MISSING_BYTES_BEYOND_MAX_MEM_SIZE": int64(0), "INSUFFICIENT_PRIVILEGES": int64(0)},
+	"files":                  {"FILE_NAME": "", "FILE_TYPE": "", "TABLESPACE_NAME": ""},
 	"innodb_temp_table_info": {"TABLE_ID": int64(0), "NAME": "", "N_COLS": int64(0), "SPACE": int64(0)},
 }
 
 // psSummaryTables maps summary table names to their definitions.
 // Each entry follows the pattern: check psClassDisabled/startupVar, then call seed fn.
 type psSummaryDef struct {
-	disableClass string   // for psClassDisabled check ("wait", "transaction", "stage", "")
-	disableVar   string   // for startupVars check (empty means use disableClass instead)
+	disableClass string // for psClassDisabled check ("wait", "transaction", "stage", "")
+	disableVar   string // for startupVars check (empty means use disableClass instead)
 	seedFn       func(e *Executor) []storage.Row
 }
 
@@ -573,10 +574,12 @@ var psSummaryTables = map[string]psSummaryDef{
 	// wait summaries
 	"events_waits_summary_by_account_by_event_name": {disableClass: "wait", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByAccountByEventName(psWaitEventNames) }},
 	"events_waits_summary_by_host_by_event_name":    {disableClass: "wait", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByHostByEventName(psWaitEventNames) }},
-	"events_waits_summary_by_instance":              {disableClass: "wait", seedFn: func(_ *Executor) []storage.Row { return []storage.Row{{"EVENT_NAME": "wait/lock/table/sql/handler", "OBJECT_INSTANCE_BEGIN": int64(1), "COUNT_STAR": int64(0), "SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0), "AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0)}} }},
-	"events_waits_summary_by_thread_by_event_name":  {disableClass: "wait", seedFn: func(e *Executor) []storage.Row { return e.perfSchemaSeedByThreadByEventName(psWaitEventNames) }},
-	"events_waits_summary_by_user_by_event_name":    {disableClass: "wait", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByUserByEventName(psWaitEventNames) }},
-	"events_waits_summary_global_by_event_name":     {disableClass: "wait", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedGlobalByEventName(psWaitEventNames) }},
+	"events_waits_summary_by_instance": {disableClass: "wait", seedFn: func(_ *Executor) []storage.Row {
+		return []storage.Row{{"EVENT_NAME": "wait/lock/table/sql/handler", "OBJECT_INSTANCE_BEGIN": int64(1), "COUNT_STAR": int64(0), "SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0), "AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0)}}
+	}},
+	"events_waits_summary_by_thread_by_event_name": {disableClass: "wait", seedFn: func(e *Executor) []storage.Row { return e.perfSchemaSeedByThreadByEventName(psWaitEventNames) }},
+	"events_waits_summary_by_user_by_event_name":   {disableClass: "wait", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByUserByEventName(psWaitEventNames) }},
+	"events_waits_summary_global_by_event_name":    {disableClass: "wait", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedGlobalByEventName(psWaitEventNames) }},
 	// stage summaries
 	"events_stages_summary_by_account_by_event_name": {disableVar: "performance_schema_max_stage_classes", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByAccountByEventName(psStageEventNames) }},
 	"events_stages_summary_by_host_by_event_name":    {disableVar: "performance_schema_max_stage_classes", seedFn: func(_ *Executor) []storage.Row { return perfSchemaSeedByHostByEventName(psStageEventNames) }},
@@ -841,6 +844,8 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.perfSchemaVariablesScoped(true)
 	case "session_variables":
 		rawRows = e.perfSchemaVariablesScoped(false)
+	case "persisted_variables":
+		rawRows = e.persistedVariableRows()
 	case "global_status", "session_status":
 		rawRows = e.perfSchemaStatus()
 	case "table_io_waits_summary_by_table":
@@ -1512,7 +1517,7 @@ func innodbFKType(onDelete, onUpdate string) int64 {
 		t |= 2
 	case "NO ACTION", "":
 		t |= 16
-	// RESTRICT = 0 (no bits set)
+		// RESTRICT = 0 (no bits set)
 	}
 	switch strings.ToUpper(onUpdate) {
 	case "CASCADE":
@@ -1521,7 +1526,7 @@ func innodbFKType(onDelete, onUpdate string) int64 {
 		t |= 8
 	case "NO ACTION", "":
 		t |= 32
-	// RESTRICT = 0 (no bits set)
+		// RESTRICT = 0 (no bits set)
 	}
 	return t
 }
@@ -1620,8 +1625,9 @@ func (e *Executor) infoSchemaInnoDBForeignCols() []storage.Row {
 
 // infoSchemaReferentialConstraints returns rows for INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS.
 // Columns: CONSTRAINT_CATALOG, CONSTRAINT_SCHEMA, CONSTRAINT_NAME,
-//          UNIQUE_CONSTRAINT_CATALOG, UNIQUE_CONSTRAINT_SCHEMA, UNIQUE_CONSTRAINT_NAME,
-//          MATCH_OPTION, UPDATE_RULE, DELETE_RULE, TABLE_NAME, REFERENCED_TABLE_NAME
+//
+//	UNIQUE_CONSTRAINT_CATALOG, UNIQUE_CONSTRAINT_SCHEMA, UNIQUE_CONSTRAINT_NAME,
+//	MATCH_OPTION, UPDATE_RULE, DELETE_RULE, TABLE_NAME, REFERENCED_TABLE_NAME
 func (e *Executor) infoSchemaReferentialConstraints() []storage.Row {
 	dbNames := e.Catalog.ListDatabases()
 	sort.Strings(dbNames)
@@ -2056,7 +2062,7 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 	}
 	// Tables with non-default collation in performance_schema
 	psTableCollation := map[string]string{
-		"keyring_keys":                 "utf8mb4_bin",
+		"keyring_keys":                  "utf8mb4_bin",
 		"session_account_connect_attrs": "utf8mb4_bin",
 		"session_connect_attrs":         "utf8mb4_bin",
 	}
@@ -2189,418 +2195,418 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 				var numPrecision interface{}
 				var numScale interface{}
 				colTypeUpper := strings.ToUpper(strings.TrimSpace(col.Type))
-			baseType := colTypeUpper
-			if idx := strings.Index(baseType, "("); idx >= 0 {
-				baseType = strings.TrimSpace(baseType[:idx])
-			}
-			// Strip UNSIGNED, ZEROFILL, etc.
-			baseType = strings.TrimSpace(strings.Split(baseType, " ")[0])
+				baseType := colTypeUpper
+				if idx := strings.Index(baseType, "("); idx >= 0 {
+					baseType = strings.TrimSpace(baseType[:idx])
+				}
+				// Strip UNSIGNED, ZEROFILL, etc.
+				baseType = strings.TrimSpace(strings.Split(baseType, " ")[0])
 
-			switch baseType {
-			case "CHAR", "VARCHAR", "TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT":
-				// Extract character length from type spec
-				charLen := int64(-1) // -1 means not found
-				if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
-					end := strings.Index(colTypeUpper[idx:], ")")
-					if end > 0 {
-						n, err := strconv.ParseInt(colTypeUpper[idx+1:idx+end], 10, 64)
-						if err == nil {
-							charLen = n
-						}
-					}
-				}
-				if baseType == "CHAR" && charLen == -1 {
-					charLen = 1 // CHAR without length defaults to CHAR(1)
-				} else if baseType == "VARCHAR" && charLen == -1 {
-					charLen = 0
-				} else if charLen == -1 {
-					charLen = 0
-				}
-				// For TEXT types, CHARACTER_MAXIMUM_LENGTH is in characters
-				// which depends on the charset's max bytes per char
-				colCharset := strings.ToLower(col.Charset)
-				if colCharset == "" {
-					// Inherit from table charset, then default to utf8mb4
-					if tbl.Charset != "" {
-						colCharset = strings.ToLower(tbl.Charset)
-					} else {
-						colCharset = "utf8mb4"
-					}
-				}
-				charsetMaxBytes := int64(4) // default utf8mb4
-				switch {
-				case colCharset == "latin1" || colCharset == "ascii" || colCharset == "binary":
-					charsetMaxBytes = 1
-				case colCharset == "ucs2":
-					charsetMaxBytes = 2
-				case colCharset == "utf16" || colCharset == "utf16le":
-					charsetMaxBytes = 4 // surrogate pairs
-				case colCharset == "utf8" || colCharset == "utf8mb3":
-					charsetMaxBytes = 3
-				case colCharset == "utf8mb4":
-					charsetMaxBytes = 4
-				case colCharset == "utf32":
-					charsetMaxBytes = 4
-				}
-				isTextType := false
-				var textByteLen int64
-				if baseType == "TINYTEXT" {
-					// MySQL reports CHARACTER_MAXIMUM_LENGTH = byte_limit for TEXT types
-					charLen = 255
-					textByteLen = 255
-					isTextType = true
-				} else if baseType == "TEXT" {
-					charLen = 65535
-					textByteLen = 65535
-					isTextType = true
-				} else if baseType == "MEDIUMTEXT" {
-					charLen = 16777215
-					textByteLen = 16777215
-					isTextType = true
-				} else if baseType == "LONGTEXT" {
-					charLen = 4294967295
-					textByteLen = 4294967295
-					isTextType = true
-				}
-				{
-					charMaxLen = charLen
-					if isTextType {
-						charOctetLen = textByteLen
-					} else {
-						charOctetLen = charLen * charsetMaxBytes
-					}
-				}
-			case "ENUM":
-				// CHARACTER_MAXIMUM_LENGTH = max length of the longest enum value
-				if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
-					end := strings.LastIndex(colTypeUpper, ")")
-					if end > idx {
-						inner := colTypeUpper[idx+1 : end]
-						vals := splitEnumSetValues(inner)
-						maxLen := int64(0)
-						for _, v := range vals {
-							if int64(len(v)) > maxLen {
-								maxLen = int64(len(v))
-							}
-						}
-						charMaxLen = maxLen
-						colCharsetForEnum := strings.ToLower(col.Charset)
-						if colCharsetForEnum == "" {
-							if tbl.Charset != "" {
-								colCharsetForEnum = strings.ToLower(tbl.Charset)
-							} else {
-								colCharsetForEnum = "utf8mb4"
-							}
-						}
-						maxBytes := int64(4)
-						if colCharsetForEnum == "latin1" || colCharsetForEnum == "ascii" {
-							maxBytes = 1
-						} else if colCharsetForEnum == "utf8" || colCharsetForEnum == "utf8mb3" {
-							maxBytes = 3
-						}
-						charOctetLen = maxLen * maxBytes
-					}
-				}
-			case "SET":
-				// CHARACTER_MAXIMUM_LENGTH = sum of all set values + commas
-				if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
-					end := strings.LastIndex(colTypeUpper, ")")
-					if end > idx {
-						inner := colTypeUpper[idx+1 : end]
-						vals := splitEnumSetValues(inner)
-						totalLen := int64(0)
-						for i, v := range vals {
-							totalLen += int64(len(v))
-							if i > 0 {
-								totalLen++ // for comma separator
-							}
-						}
-						charMaxLen = totalLen
-						colCharsetForSet := strings.ToLower(col.Charset)
-						if colCharsetForSet == "" {
-							if tbl.Charset != "" {
-								colCharsetForSet = strings.ToLower(tbl.Charset)
-							} else {
-								colCharsetForSet = "utf8mb4"
-							}
-						}
-						maxBytes := int64(4)
-						if colCharsetForSet == "latin1" || colCharsetForSet == "ascii" {
-							maxBytes = 1
-						} else if colCharsetForSet == "utf8" || colCharsetForSet == "utf8mb3" {
-							maxBytes = 3
-						}
-						charOctetLen = totalLen * maxBytes
-					}
-				}
-			case "TINYBLOB":
-				charMaxLen = int64(255)
-				charOctetLen = int64(255)
-			case "BLOB":
-				charMaxLen = int64(65535)
-				charOctetLen = int64(65535)
-			case "MEDIUMBLOB":
-				charMaxLen = int64(16777215)
-				charOctetLen = int64(16777215)
-			case "LONGBLOB":
-				charMaxLen = int64(4294967295)
-				charOctetLen = int64(4294967295)
-			case "BINARY", "VARBINARY":
-				// Extract length from type spec
-				binLen := int64(1) // BINARY without length defaults to BINARY(1)
-				if baseType == "VARBINARY" {
-					binLen = 0
-				}
-				if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
-					end := strings.Index(colTypeUpper[idx:], ")")
-					if end > 0 {
-						n, err := strconv.ParseInt(colTypeUpper[idx+1:idx+end], 10, 64)
-						if err == nil {
-							binLen = n
-						}
-					}
-				}
-				charMaxLen = binLen
-				charOctetLen = binLen
-			case "INT", "INTEGER", "TINYINT", "SMALLINT", "MEDIUMINT", "BIGINT":
-				colTypeUp := strings.ToUpper(col.Type)
-				// zerofill implies unsigned in MySQL
-				isUnsignedInt := strings.Contains(colTypeUp, "UNSIGNED") || strings.Contains(colTypeUp, "ZEROFILL")
 				switch baseType {
-				case "TINYINT":
-					numPrecision = int64(3)
-				case "SMALLINT":
-					numPrecision = int64(5)
-				case "MEDIUMINT":
-					numPrecision = int64(7)
-				case "INT", "INTEGER":
-					numPrecision = int64(10)
-				case "BIGINT":
-					if isUnsignedInt {
-						numPrecision = int64(20)
-					} else {
-						numPrecision = int64(19)
-					}
-				default:
-					numPrecision = int64(10)
-				}
-				numScale = int64(0)
-			case "DECIMAL", "NUMERIC", "DEC":
-				// Extract precision and scale from DECIMAL(p,s)
-				if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
-					end := strings.Index(colTypeUpper[idx:], ")")
-					if end > 0 {
-						inner := colTypeUpper[idx+1 : idx+end]
-						parts := strings.Split(inner, ",")
-						if len(parts) >= 1 {
-							if p, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64); err == nil {
-								if p == 0 {
-									p = 10 // MySQL normalizes DECIMAL(0) to DECIMAL(10,0)
-								}
-								numPrecision = p
+				case "CHAR", "VARCHAR", "TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT":
+					// Extract character length from type spec
+					charLen := int64(-1) // -1 means not found
+					if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
+						end := strings.Index(colTypeUpper[idx:], ")")
+						if end > 0 {
+							n, err := strconv.ParseInt(colTypeUpper[idx+1:idx+end], 10, 64)
+							if err == nil {
+								charLen = n
 							}
 						}
-						if len(parts) >= 2 {
-							if s, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64); err == nil {
-								numScale = s
-							}
+					}
+					if baseType == "CHAR" && charLen == -1 {
+						charLen = 1 // CHAR without length defaults to CHAR(1)
+					} else if baseType == "VARCHAR" && charLen == -1 {
+						charLen = 0
+					} else if charLen == -1 {
+						charLen = 0
+					}
+					// For TEXT types, CHARACTER_MAXIMUM_LENGTH is in characters
+					// which depends on the charset's max bytes per char
+					colCharset := strings.ToLower(col.Charset)
+					if colCharset == "" {
+						// Inherit from table charset, then default to utf8mb4
+						if tbl.Charset != "" {
+							colCharset = strings.ToLower(tbl.Charset)
 						} else {
-							numScale = int64(0)
+							colCharset = "utf8mb4"
 						}
 					}
-				} else {
-					// No explicit precision/scale - MySQL defaults: DECIMAL(10,0)
-					numPrecision = int64(10)
-					numScale = int64(0)
-				}
-			case "BIT":
-				// BIT(n): NUMERIC_PRECISION = n
-				if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
-					end := strings.Index(colTypeUpper[idx:], ")")
-					if end > 0 {
-						if n, err := strconv.ParseInt(strings.TrimSpace(colTypeUpper[idx+1:idx+end]), 10, 64); err == nil {
-							numPrecision = n
+					charsetMaxBytes := int64(4) // default utf8mb4
+					switch {
+					case colCharset == "latin1" || colCharset == "ascii" || colCharset == "binary":
+						charsetMaxBytes = 1
+					case colCharset == "ucs2":
+						charsetMaxBytes = 2
+					case colCharset == "utf16" || colCharset == "utf16le":
+						charsetMaxBytes = 4 // surrogate pairs
+					case colCharset == "utf8" || colCharset == "utf8mb3":
+						charsetMaxBytes = 3
+					case colCharset == "utf8mb4":
+						charsetMaxBytes = 4
+					case colCharset == "utf32":
+						charsetMaxBytes = 4
+					}
+					isTextType := false
+					var textByteLen int64
+					if baseType == "TINYTEXT" {
+						// MySQL reports CHARACTER_MAXIMUM_LENGTH = byte_limit for TEXT types
+						charLen = 255
+						textByteLen = 255
+						isTextType = true
+					} else if baseType == "TEXT" {
+						charLen = 65535
+						textByteLen = 65535
+						isTextType = true
+					} else if baseType == "MEDIUMTEXT" {
+						charLen = 16777215
+						textByteLen = 16777215
+						isTextType = true
+					} else if baseType == "LONGTEXT" {
+						charLen = 4294967295
+						textByteLen = 4294967295
+						isTextType = true
+					}
+					{
+						charMaxLen = charLen
+						if isTextType {
+							charOctetLen = textByteLen
+						} else {
+							charOctetLen = charLen * charsetMaxBytes
 						}
 					}
-				} else {
-					numPrecision = int64(1) // BIT without length defaults to BIT(1)
-				}
-			case "FLOAT":
-				// MySQL reports NUMERIC_PRECISION=12 for FLOAT (1-24 bits) or 22 for DOUBLE (25-53 bits)
-				numPrecision = int64(12)
-				numScale = nil
-				// Check if this is actually a double-precision float
-				if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
-					end := strings.Index(colTypeUpper[idx:], ")")
-					if end > 0 {
-						inner := strings.TrimSpace(colTypeUpper[idx+1 : idx+end])
-						if prec, err := strconv.ParseInt(inner, 10, 64); err == nil && prec >= 25 && prec <= 53 {
-							numPrecision = int64(22)
-						}
-					}
-				}
-			case "DOUBLE", "REAL":
-				// MySQL reports NUMERIC_PRECISION=22 for DOUBLE/REAL
-				numPrecision = int64(22)
-				numScale = nil
-			}
-
-			// Coerce COLUMN_DEFAULT for DECIMAL/NUMERIC types: apply scale rounding
-			// and zerofill formatting to match MySQL INFORMATION_SCHEMA output.
-			if colDefault != nil && (baseType == "DECIMAL" || baseType == "NUMERIC" || baseType == "DEC") {
-				if defStr, ok := colDefault.(string); ok {
-					if scale, ok2 := numScale.(int64); ok2 {
-						if prec, ok3 := numPrecision.(int64); ok3 {
-							colTypeUp := strings.ToUpper(col.Type)
-							isZF := strings.Contains(colTypeUp, "ZEROFILL")
-							// Format the decimal value with the correct number of scale digits.
-							// Use string manipulation to avoid float64 precision issues.
-							formatted := formatDecimalDefault(defStr, int(scale))
-							if isZF && prec > 0 {
-								// Zerofill: pad with zeros to total display width.
-								// For DECIMAL(p,s): integer part = (p-s) digits, scale part = s digits.
-								// Total width = (p-s) + 1 + s = p+1 when scale>0, or p when scale=0.
-								// But display is actually: integerPart + "." + scalePart
-								// where integerPart is zero-padded to (p-s) width.
-								var totalWidth int
-								if scale > 0 {
-									intPart := int(prec) - int(scale)
-									totalWidth = intPart + 1 + int(scale) // integer_digits + "." + scale_digits
+				case "ENUM":
+					// CHARACTER_MAXIMUM_LENGTH = max length of the longest enum value
+					if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
+						end := strings.LastIndex(colTypeUpper, ")")
+						if end > idx {
+							inner := colTypeUpper[idx+1 : end]
+							vals := splitEnumSetValues(inner)
+							maxLen := int64(0)
+							for _, v := range vals {
+								if int64(len(v)) > maxLen {
+									maxLen = int64(len(v))
+								}
+							}
+							charMaxLen = maxLen
+							colCharsetForEnum := strings.ToLower(col.Charset)
+							if colCharsetForEnum == "" {
+								if tbl.Charset != "" {
+									colCharsetForEnum = strings.ToLower(tbl.Charset)
 								} else {
-									totalWidth = int(prec)
-								}
-								if len(formatted) < totalWidth {
-									formatted = strings.Repeat("0", totalWidth-len(formatted)) + formatted
+									colCharsetForEnum = "utf8mb4"
 								}
 							}
-							colDefault = formatted
+							maxBytes := int64(4)
+							if colCharsetForEnum == "latin1" || colCharsetForEnum == "ascii" {
+								maxBytes = 1
+							} else if colCharsetForEnum == "utf8" || colCharsetForEnum == "utf8mb3" {
+								maxBytes = 3
+							}
+							charOctetLen = maxLen * maxBytes
 						}
 					}
-				}
-			}
-
-			// Coerce COLUMN_DEFAULT for temporal types
-			if colDefault != nil {
-				if defStr, ok := colDefault.(string); ok {
-					switch baseType {
-					case "TIME":
-						// Normalize time default to HH:MM:SS format
-						normalized := normalizeTimeDefault(defStr)
-						if normalized != "" {
-							colDefault = normalized
-						}
-					case "DATETIME":
-						// Normalize datetime default to YYYY-MM-DD HH:MM:SS
-						normalized := normalizeDatetimeDefault(defStr)
-						if normalized != "" {
-							colDefault = normalized
-						}
-					case "TIMESTAMP":
-						// Normalize timestamp default (e.g., 20001231235959 -> 2000-12-31 23:59:59)
-						normalized := normalizeTimestampDefault(defStr)
-						if normalized != "" {
-							colDefault = normalized
+				case "SET":
+					// CHARACTER_MAXIMUM_LENGTH = sum of all set values + commas
+					if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
+						end := strings.LastIndex(colTypeUpper, ")")
+						if end > idx {
+							inner := colTypeUpper[idx+1 : end]
+							vals := splitEnumSetValues(inner)
+							totalLen := int64(0)
+							for i, v := range vals {
+								totalLen += int64(len(v))
+								if i > 0 {
+									totalLen++ // for comma separator
+								}
+							}
+							charMaxLen = totalLen
+							colCharsetForSet := strings.ToLower(col.Charset)
+							if colCharsetForSet == "" {
+								if tbl.Charset != "" {
+									colCharsetForSet = strings.ToLower(tbl.Charset)
+								} else {
+									colCharsetForSet = "utf8mb4"
+								}
+							}
+							maxBytes := int64(4)
+							if colCharsetForSet == "latin1" || colCharsetForSet == "ascii" {
+								maxBytes = 1
+							} else if colCharsetForSet == "utf8" || colCharsetForSet == "utf8mb3" {
+								maxBytes = 3
+							}
+							charOctetLen = totalLen * maxBytes
 						}
 					}
-				}
-			}
-
-			// Coerce COLUMN_DEFAULT for binary literal defaults (b'...' notation)
-			if colDefault != nil {
-				if defStr, ok := colDefault.(string); ok {
-					if strings.HasPrefix(defStr, "0b") || strings.HasPrefix(defStr, "b'") {
-						// Binary literal: decode to actual value
-						binaryVal := normalizeBinaryLiteralDefault(defStr, baseType)
-						colDefault = binaryVal
+				case "TINYBLOB":
+					charMaxLen = int64(255)
+					charOctetLen = int64(255)
+				case "BLOB":
+					charMaxLen = int64(65535)
+					charOctetLen = int64(65535)
+				case "MEDIUMBLOB":
+					charMaxLen = int64(16777215)
+					charOctetLen = int64(16777215)
+				case "LONGBLOB":
+					charMaxLen = int64(4294967295)
+					charOctetLen = int64(4294967295)
+				case "BINARY", "VARBINARY":
+					// Extract length from type spec
+					binLen := int64(1) // BINARY without length defaults to BINARY(1)
+					if baseType == "VARBINARY" {
+						binLen = 0
 					}
-				}
-			}
-
-			// Coerce COLUMN_DEFAULT for integer zerofill types
-			if colDefault != nil && (baseType == "INT" || baseType == "INTEGER" || baseType == "TINYINT" ||
-				baseType == "SMALLINT" || baseType == "MEDIUMINT" || baseType == "BIGINT") {
-				if defStr, ok := colDefault.(string); ok {
+					if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
+						end := strings.Index(colTypeUpper[idx:], ")")
+						if end > 0 {
+							n, err := strconv.ParseInt(colTypeUpper[idx+1:idx+end], 10, 64)
+							if err == nil {
+								binLen = n
+							}
+						}
+					}
+					charMaxLen = binLen
+					charOctetLen = binLen
+				case "INT", "INTEGER", "TINYINT", "SMALLINT", "MEDIUMINT", "BIGINT":
 					colTypeUp := strings.ToUpper(col.Type)
-					isZF := strings.Contains(colTypeUp, "ZEROFILL")
-					if isZF {
-						// Get display width from type spec
-						displayWidth := 0
-						if idx := strings.Index(colTypeUp, "("); idx >= 0 {
-							end := strings.Index(colTypeUp[idx:], ")")
-							if end > 0 {
-								if w, err := strconv.Atoi(strings.TrimSpace(colTypeUp[idx+1 : idx+end])); err == nil {
-									displayWidth = w
+					// zerofill implies unsigned in MySQL
+					isUnsignedInt := strings.Contains(colTypeUp, "UNSIGNED") || strings.Contains(colTypeUp, "ZEROFILL")
+					switch baseType {
+					case "TINYINT":
+						numPrecision = int64(3)
+					case "SMALLINT":
+						numPrecision = int64(5)
+					case "MEDIUMINT":
+						numPrecision = int64(7)
+					case "INT", "INTEGER":
+						numPrecision = int64(10)
+					case "BIGINT":
+						if isUnsignedInt {
+							numPrecision = int64(20)
+						} else {
+							numPrecision = int64(19)
+						}
+					default:
+						numPrecision = int64(10)
+					}
+					numScale = int64(0)
+				case "DECIMAL", "NUMERIC", "DEC":
+					// Extract precision and scale from DECIMAL(p,s)
+					if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
+						end := strings.Index(colTypeUpper[idx:], ")")
+						if end > 0 {
+							inner := colTypeUpper[idx+1 : idx+end]
+							parts := strings.Split(inner, ",")
+							if len(parts) >= 1 {
+								if p, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64); err == nil {
+									if p == 0 {
+										p = 10 // MySQL normalizes DECIMAL(0) to DECIMAL(10,0)
+									}
+									numPrecision = p
 								}
 							}
-						}
-						if displayWidth == 0 {
-							// Default widths
-							switch baseType {
-							case "TINYINT":
-								displayWidth = 3
-							case "SMALLINT":
-								displayWidth = 5
-							case "MEDIUMINT":
-								displayWidth = 8
-							case "INT", "INTEGER":
-								displayWidth = 10
-							case "BIGINT":
-								displayWidth = 20
+							if len(parts) >= 2 {
+								if s, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64); err == nil {
+									numScale = s
+								}
+							} else {
+								numScale = int64(0)
 							}
 						}
-						if displayWidth > 0 && len(defStr) < displayWidth {
-							defStr = strings.Repeat("0", displayWidth-len(defStr)) + defStr
+					} else {
+						// No explicit precision/scale - MySQL defaults: DECIMAL(10,0)
+						numPrecision = int64(10)
+						numScale = int64(0)
+					}
+				case "BIT":
+					// BIT(n): NUMERIC_PRECISION = n
+					if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
+						end := strings.Index(colTypeUpper[idx:], ")")
+						if end > 0 {
+							if n, err := strconv.ParseInt(strings.TrimSpace(colTypeUpper[idx+1:idx+end]), 10, 64); err == nil {
+								numPrecision = n
+							}
+						}
+					} else {
+						numPrecision = int64(1) // BIT without length defaults to BIT(1)
+					}
+				case "FLOAT":
+					// MySQL reports NUMERIC_PRECISION=12 for FLOAT (1-24 bits) or 22 for DOUBLE (25-53 bits)
+					numPrecision = int64(12)
+					numScale = nil
+					// Check if this is actually a double-precision float
+					if idx := strings.Index(colTypeUpper, "("); idx >= 0 {
+						end := strings.Index(colTypeUpper[idx:], ")")
+						if end > 0 {
+							inner := strings.TrimSpace(colTypeUpper[idx+1 : idx+end])
+							if prec, err := strconv.ParseInt(inner, 10, 64); err == nil && prec >= 25 && prec <= 53 {
+								numPrecision = int64(22)
+							}
+						}
+					}
+				case "DOUBLE", "REAL":
+					// MySQL reports NUMERIC_PRECISION=22 for DOUBLE/REAL
+					numPrecision = int64(22)
+					numScale = nil
+				}
+
+				// Coerce COLUMN_DEFAULT for DECIMAL/NUMERIC types: apply scale rounding
+				// and zerofill formatting to match MySQL INFORMATION_SCHEMA output.
+				if colDefault != nil && (baseType == "DECIMAL" || baseType == "NUMERIC" || baseType == "DEC") {
+					if defStr, ok := colDefault.(string); ok {
+						if scale, ok2 := numScale.(int64); ok2 {
+							if prec, ok3 := numPrecision.(int64); ok3 {
+								colTypeUp := strings.ToUpper(col.Type)
+								isZF := strings.Contains(colTypeUp, "ZEROFILL")
+								// Format the decimal value with the correct number of scale digits.
+								// Use string manipulation to avoid float64 precision issues.
+								formatted := formatDecimalDefault(defStr, int(scale))
+								if isZF && prec > 0 {
+									// Zerofill: pad with zeros to total display width.
+									// For DECIMAL(p,s): integer part = (p-s) digits, scale part = s digits.
+									// Total width = (p-s) + 1 + s = p+1 when scale>0, or p when scale=0.
+									// But display is actually: integerPart + "." + scalePart
+									// where integerPart is zero-padded to (p-s) width.
+									var totalWidth int
+									if scale > 0 {
+										intPart := int(prec) - int(scale)
+										totalWidth = intPart + 1 + int(scale) // integer_digits + "." + scale_digits
+									} else {
+										totalWidth = int(prec)
+									}
+									if len(formatted) < totalWidth {
+										formatted = strings.Repeat("0", totalWidth-len(formatted)) + formatted
+									}
+								}
+								colDefault = formatted
+							}
+						}
+					}
+				}
+
+				// Coerce COLUMN_DEFAULT for temporal types
+				if colDefault != nil {
+					if defStr, ok := colDefault.(string); ok {
+						switch baseType {
+						case "TIME":
+							// Normalize time default to HH:MM:SS format
+							normalized := normalizeTimeDefault(defStr)
+							if normalized != "" {
+								colDefault = normalized
+							}
+						case "DATETIME":
+							// Normalize datetime default to YYYY-MM-DD HH:MM:SS
+							normalized := normalizeDatetimeDefault(defStr)
+							if normalized != "" {
+								colDefault = normalized
+							}
+						case "TIMESTAMP":
+							// Normalize timestamp default (e.g., 20001231235959 -> 2000-12-31 23:59:59)
+							normalized := normalizeTimestampDefault(defStr)
+							if normalized != "" {
+								colDefault = normalized
+							}
+						}
+					}
+				}
+
+				// Coerce COLUMN_DEFAULT for binary literal defaults (b'...' notation)
+				if colDefault != nil {
+					if defStr, ok := colDefault.(string); ok {
+						if strings.HasPrefix(defStr, "0b") || strings.HasPrefix(defStr, "b'") {
+							// Binary literal: decode to actual value
+							binaryVal := normalizeBinaryLiteralDefault(defStr, baseType)
+							colDefault = binaryVal
+						}
+					}
+				}
+
+				// Coerce COLUMN_DEFAULT for integer zerofill types
+				if colDefault != nil && (baseType == "INT" || baseType == "INTEGER" || baseType == "TINYINT" ||
+					baseType == "SMALLINT" || baseType == "MEDIUMINT" || baseType == "BIGINT") {
+					if defStr, ok := colDefault.(string); ok {
+						colTypeUp := strings.ToUpper(col.Type)
+						isZF := strings.Contains(colTypeUp, "ZEROFILL")
+						if isZF {
+							// Get display width from type spec
+							displayWidth := 0
+							if idx := strings.Index(colTypeUp, "("); idx >= 0 {
+								end := strings.Index(colTypeUp[idx:], ")")
+								if end > 0 {
+									if w, err := strconv.Atoi(strings.TrimSpace(colTypeUp[idx+1 : idx+end])); err == nil {
+										displayWidth = w
+									}
+								}
+							}
+							if displayWidth == 0 {
+								// Default widths
+								switch baseType {
+								case "TINYINT":
+									displayWidth = 3
+								case "SMALLINT":
+									displayWidth = 5
+								case "MEDIUMINT":
+									displayWidth = 8
+								case "INT", "INTEGER":
+									displayWidth = 10
+								case "BIGINT":
+									displayWidth = 20
+								}
+							}
+							if displayWidth > 0 && len(defStr) < displayWidth {
+								defStr = strings.Repeat("0", displayWidth-len(defStr)) + defStr
+								colDefault = defStr
+							}
+						}
+					}
+				}
+
+				// Coerce COLUMN_DEFAULT for FLOAT/DOUBLE zerofill types
+				if colDefault != nil && (baseType == "FLOAT" || baseType == "DOUBLE" || baseType == "REAL") {
+					if defStr, ok := colDefault.(string); ok {
+						colTypeUp := strings.ToUpper(col.Type)
+						isZF := strings.Contains(colTypeUp, "ZEROFILL")
+						if isZF {
+							// Display width: FLOAT(1-24) = 12, DOUBLE/REAL/FLOAT(25-53) = 22
+							// Use numPrecision which is already set correctly above
+							displayWidth := int64(12)
+							if np, ok2 := numPrecision.(int64); ok2 {
+								displayWidth = np
+							}
+							if int64(len(defStr)) < displayWidth {
+								defStr = strings.Repeat("0", int(displayWidth)-len(defStr)) + defStr
+							}
 							colDefault = defStr
 						}
 					}
 				}
-			}
 
-			// Coerce COLUMN_DEFAULT for FLOAT/DOUBLE zerofill types
-			if colDefault != nil && (baseType == "FLOAT" || baseType == "DOUBLE" || baseType == "REAL") {
-				if defStr, ok := colDefault.(string); ok {
-					colTypeUp := strings.ToUpper(col.Type)
-					isZF := strings.Contains(colTypeUp, "ZEROFILL")
-					if isZF {
-						// Display width: FLOAT(1-24) = 12, DOUBLE/REAL/FLOAT(25-53) = 22
-						// Use numPrecision which is already set correctly above
-						displayWidth := int64(12)
-						if np, ok2 := numPrecision.(int64); ok2 {
-							displayWidth = np
+				// Determine character set and collation for string types
+				var charSetName interface{} = nil
+				var collationName interface{} = nil
+				switch baseType {
+				case "CHAR", "VARCHAR", "TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT", "ENUM", "SET":
+					cs := col.Charset
+					if cs == "" {
+						// No explicit column charset: inherit from table then database.
+						if tbl.Charset != "" {
+							cs = tbl.Charset
+						} else {
+							cs = "utf8mb4"
 						}
-						if int64(len(defStr)) < displayWidth {
-							defStr = strings.Repeat("0", int(displayWidth)-len(defStr)) + defStr
-						}
-						colDefault = defStr
+					}
+					charSetName = cs
+					// Determine default collation for charset, then apply overrides.
+					collationName = catalogPkg.DefaultCollationForCharset(cs)
+					// Column inherits table-level collation when it has no explicit collation.
+					if col.Collation != "" {
+						collationName = col.Collation
+					} else if col.Charset == "" && tbl.Collation != "" {
+						// No explicit column charset/collation: inherit table collation.
+						collationName = tbl.Collation
 					}
 				}
-			}
-
-			// Determine character set and collation for string types
-			var charSetName interface{} = nil
-			var collationName interface{} = nil
-			switch baseType {
-			case "CHAR", "VARCHAR", "TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT", "ENUM", "SET":
-				cs := col.Charset
-				if cs == "" {
-					// No explicit column charset: inherit from table then database.
-					if tbl.Charset != "" {
-						cs = tbl.Charset
-					} else {
-						cs = "utf8mb4"
-					}
-				}
-				charSetName = cs
-				// Determine default collation for charset, then apply overrides.
-				collationName = catalogPkg.DefaultCollationForCharset(cs)
-				// Column inherits table-level collation when it has no explicit collation.
-				if col.Collation != "" {
-					collationName = col.Collation
-				} else if col.Charset == "" && tbl.Collation != "" {
-					// No explicit column charset/collation: inherit table collation.
-					collationName = tbl.Collation
-				}
-			}
 
 				columnKey := ""
 				extra := ""
@@ -2692,7 +2698,7 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 					"EXTRA":                    extra,
 					"PRIVILEGES":               "select,insert,update,references",
 					"COLUMN_COMMENT":           col.Comment,
-					"GENERATION_EXPRESSION":    func() string {
+					"GENERATION_EXPRESSION": func() string {
 						if expr := generatedColumnExpr(col.Type); expr != "" {
 							// Format the generation expression with backtick-quoted column refs
 							// and charset-introduced literals like MySQL reports in IS.COLUMNS
@@ -2700,7 +2706,7 @@ func (e *Executor) infoSchemaColumns() []storage.Row {
 						}
 						return ""
 					}(),
-					"SRS_ID":                   nil,
+					"SRS_ID": nil,
 				})
 			}
 		}
@@ -2893,8 +2899,13 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 						"INDEX_TYPE":    indexTypeStr,
 						"COMMENT":       "",
 						"INDEX_COMMENT": idxComment,
-						"IS_VISIBLE":    func() string { if invisible { return "NO" }; return "YES" }(),
-						"EXPRESSION":    nil,
+						"IS_VISIBLE": func() string {
+							if invisible {
+								return "NO"
+							}
+							return "YES"
+						}(),
+						"EXPRESSION": nil,
 					})
 				}
 			}
@@ -3441,8 +3452,18 @@ func (e *Executor) perfSchemaVariables() []storage.Row {
 // perfSchemaVariablesScoped returns sorted rows scoped to global or session.
 func (e *Executor) perfSchemaVariablesScoped(globalOnly bool) []storage.Row {
 	vars := e.buildVariablesMapScoped(globalOnly)
+	if !globalOnly {
+		for name, val := range e.buildVariablesMapScoped(true) {
+			if sysVarGlobalOnly[name] && !sysVarBothScope[name] {
+				vars[name] = val
+			}
+		}
+	}
 	names := make([]string, 0, len(vars))
 	for n := range vars {
+		if sysVarPerfSchemaHidden[n] {
+			continue
+		}
 		// For global_variables, exclude session-only variables
 		if globalOnly && sysVarSessionOnly[n] {
 			continue
@@ -3472,33 +3493,33 @@ func (e *Executor) perfSchemaStatus() []storage.Row {
 	}
 	// Build mapping of PS lost counters to their size variables
 	psLostToSize := map[string]string{
-		"Performance_schema_accounts_lost":             "performance_schema_accounts_size",
-		"Performance_schema_cond_classes_lost":         "performance_schema_max_cond_classes",
-		"Performance_schema_cond_instances_lost":       "performance_schema_max_cond_instances",
-		"Performance_schema_file_classes_lost":         "performance_schema_max_file_classes",
-		"Performance_schema_file_handles_lost":         "performance_schema_max_file_handles",
-		"Performance_schema_file_instances_lost":       "performance_schema_max_file_instances",
-		"Performance_schema_hosts_lost":                "performance_schema_hosts_size",
-		"Performance_schema_index_stat_lost":           "performance_schema_max_index_stat",
-		"Performance_schema_memory_classes_lost":       "performance_schema_max_memory_classes",
-		"Performance_schema_metadata_lock_lost":        "performance_schema_max_metadata_locks",
-		"Performance_schema_mutex_classes_lost":        "performance_schema_max_mutex_classes",
-		"Performance_schema_mutex_instances_lost":      "performance_schema_max_mutex_instances",
-		"Performance_schema_prepared_statements_lost":  "performance_schema_max_prepared_statements_instances",
-		"Performance_schema_program_lost":              "performance_schema_max_program_instances",
-		"Performance_schema_rwlock_classes_lost":       "performance_schema_max_rwlock_classes",
-		"Performance_schema_rwlock_instances_lost":     "performance_schema_max_rwlock_instances",
+		"Performance_schema_accounts_lost":              "performance_schema_accounts_size",
+		"Performance_schema_cond_classes_lost":          "performance_schema_max_cond_classes",
+		"Performance_schema_cond_instances_lost":        "performance_schema_max_cond_instances",
+		"Performance_schema_file_classes_lost":          "performance_schema_max_file_classes",
+		"Performance_schema_file_handles_lost":          "performance_schema_max_file_handles",
+		"Performance_schema_file_instances_lost":        "performance_schema_max_file_instances",
+		"Performance_schema_hosts_lost":                 "performance_schema_hosts_size",
+		"Performance_schema_index_stat_lost":            "performance_schema_max_index_stat",
+		"Performance_schema_memory_classes_lost":        "performance_schema_max_memory_classes",
+		"Performance_schema_metadata_lock_lost":         "performance_schema_max_metadata_locks",
+		"Performance_schema_mutex_classes_lost":         "performance_schema_max_mutex_classes",
+		"Performance_schema_mutex_instances_lost":       "performance_schema_max_mutex_instances",
+		"Performance_schema_prepared_statements_lost":   "performance_schema_max_prepared_statements_instances",
+		"Performance_schema_program_lost":               "performance_schema_max_program_instances",
+		"Performance_schema_rwlock_classes_lost":        "performance_schema_max_rwlock_classes",
+		"Performance_schema_rwlock_instances_lost":      "performance_schema_max_rwlock_instances",
 		"Performance_schema_session_connect_attrs_lost": "performance_schema_session_connect_attrs_size",
-		"Performance_schema_socket_classes_lost":       "performance_schema_max_socket_classes",
-		"Performance_schema_socket_instances_lost":     "performance_schema_max_socket_instances",
-		"Performance_schema_stage_classes_lost":        "performance_schema_max_stage_classes",
-		"Performance_schema_statement_classes_lost":    "performance_schema_max_statement_classes",
-		"Performance_schema_table_handles_lost":        "performance_schema_max_table_handles",
-		"Performance_schema_table_instances_lost":      "performance_schema_max_table_instances",
-		"Performance_schema_table_lock_stat_lost":      "performance_schema_max_table_lock_stat",
-		"Performance_schema_thread_classes_lost":       "performance_schema_max_thread_classes",
-		"Performance_schema_thread_instances_lost":     "performance_schema_max_thread_instances",
-		"Performance_schema_users_lost":                "performance_schema_users_size",
+		"Performance_schema_socket_classes_lost":        "performance_schema_max_socket_classes",
+		"Performance_schema_socket_instances_lost":      "performance_schema_max_socket_instances",
+		"Performance_schema_stage_classes_lost":         "performance_schema_max_stage_classes",
+		"Performance_schema_statement_classes_lost":     "performance_schema_max_statement_classes",
+		"Performance_schema_table_handles_lost":         "performance_schema_max_table_handles",
+		"Performance_schema_table_instances_lost":       "performance_schema_max_table_instances",
+		"Performance_schema_table_lock_stat_lost":       "performance_schema_max_table_lock_stat",
+		"Performance_schema_thread_classes_lost":        "performance_schema_max_thread_classes",
+		"Performance_schema_thread_instances_lost":      "performance_schema_max_thread_instances",
+		"Performance_schema_users_lost":                 "performance_schema_users_size",
 	}
 	rows := make([]storage.Row, 0, len(statusResult.Rows))
 	for _, srow := range statusResult.Rows {
@@ -3944,14 +3965,14 @@ func (e *Executor) perfSchemaObjectsSummaryGlobalByType() []storage.Row {
 				continue
 			}
 			rows = append(rows, storage.Row{
-				"OBJECT_TYPE":      "TABLE",
-				"OBJECT_SCHEMA":    dbName,
-				"OBJECT_NAME":      tblName,
-				"COUNT_STAR":       int64(0),
-				"SUM_TIMER_WAIT":   int64(0),
-				"MIN_TIMER_WAIT":   int64(0),
-				"AVG_TIMER_WAIT":   int64(0),
-				"MAX_TIMER_WAIT":   int64(0),
+				"OBJECT_TYPE":    "TABLE",
+				"OBJECT_SCHEMA":  dbName,
+				"OBJECT_NAME":    tblName,
+				"COUNT_STAR":     int64(0),
+				"SUM_TIMER_WAIT": int64(0),
+				"MIN_TIMER_WAIT": int64(0),
+				"AVG_TIMER_WAIT": int64(0),
+				"MAX_TIMER_WAIT": int64(0),
 			})
 		}
 	}
@@ -5120,14 +5141,14 @@ func (e *Executor) infoSchemaTriggers() []storage.Row {
 				"TRIGGER_CATALOG":            "def",
 				"TRIGGER_SCHEMA":             dbName,
 				"TRIGGER_NAME":               tr.Name,
-				"EVENT_MANIPULATION":          tr.Event,
-				"EVENT_OBJECT_CATALOG":        "def",
-				"EVENT_OBJECT_SCHEMA":         dbName,
-				"EVENT_OBJECT_TABLE":          tr.Table,
+				"EVENT_MANIPULATION":         tr.Event,
+				"EVENT_OBJECT_CATALOG":       "def",
+				"EVENT_OBJECT_SCHEMA":        dbName,
+				"EVENT_OBJECT_TABLE":         tr.Table,
 				"ACTION_ORDER":               int64(1),
 				"ACTION_CONDITION":           nil,
-				"ACTION_STATEMENT":            body,
-				"ACTION_ORIENTATION":          "ROW",
+				"ACTION_STATEMENT":           body,
+				"ACTION_ORIENTATION":         "ROW",
 				"ACTION_TIMING":              tr.Timing,
 				"ACTION_REFERENCE_OLD_TABLE": nil,
 				"ACTION_REFERENCE_NEW_TABLE": nil,
@@ -5205,10 +5226,10 @@ func (e *Executor) infoSchemaCharacterSets() []storage.Row {
 		defaultColl := cs[2].(string)
 		maxlen := cs[3].(int64)
 		rows = append(rows, storage.Row{
-			"CHARACTER_SET_NAME":  name,
+			"CHARACTER_SET_NAME":   name,
 			"DEFAULT_COLLATE_NAME": defaultColl,
-			"DESCRIPTION":         desc,
-			"MAXLEN":              maxlen,
+			"DESCRIPTION":          desc,
+			"MAXLEN":               maxlen,
 		})
 	}
 	return rows
@@ -5656,37 +5677,37 @@ func (e *Executor) infoSchemaRoutines() []storage.Row {
 			for _, pName := range procNames {
 				p := db.Procedures[pName]
 				rows = append(rows, storage.Row{
-					"SPECIFIC_NAME":             p.Name,
-					"ROUTINE_CATALOG":           "def",
-					"ROUTINE_SCHEMA":            dbName,
-					"ROUTINE_NAME":              p.Name,
-					"ROUTINE_TYPE":              "PROCEDURE",
-					"DATA_TYPE":                 "",
-					"CHARACTER_MAXIMUM_LENGTH":  nil,
-					"CHARACTER_OCTET_LENGTH":    nil,
-					"NUMERIC_PRECISION":         nil,
-					"NUMERIC_SCALE":             nil,
-					"DATETIME_PRECISION":        nil,
-					"CHARACTER_SET_NAME":        nil,
-					"COLLATION_NAME":            nil,
-					"DTD_IDENTIFIER":            nil,
-					"ROUTINE_BODY":              "SQL",
-					"ROUTINE_DEFINITION":        e.routineDefinitionText(p.Body, p.BodyText),
-					"EXTERNAL_NAME":             nil,
-					"EXTERNAL_LANGUAGE":         "SQL",
-					"PARAMETER_STYLE":           "SQL",
-					"IS_DETERMINISTIC":          "NO",
-					"SQL_DATA_ACCESS":           procSqlDataAccessVal(p),
-					"SQL_PATH":                  nil,
-					"SECURITY_TYPE":             procSecurityTypeVal(p),
-					"CREATED":                   "2024-01-01 00:00:00",
-					"LAST_ALTERED":              "2024-01-01 00:00:00",
-					"SQL_MODE":                  "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
-					"ROUTINE_COMMENT":           p.Comment,
-					"DEFINER":                   "root@localhost",
-					"CHARACTER_SET_CLIENT":      "utf8mb4",
-					"COLLATION_CONNECTION":      "utf8mb4_general_ci",
-					"DATABASE_COLLATION":        "utf8mb4_general_ci",
+					"SPECIFIC_NAME":            p.Name,
+					"ROUTINE_CATALOG":          "def",
+					"ROUTINE_SCHEMA":           dbName,
+					"ROUTINE_NAME":             p.Name,
+					"ROUTINE_TYPE":             "PROCEDURE",
+					"DATA_TYPE":                "",
+					"CHARACTER_MAXIMUM_LENGTH": nil,
+					"CHARACTER_OCTET_LENGTH":   nil,
+					"NUMERIC_PRECISION":        nil,
+					"NUMERIC_SCALE":            nil,
+					"DATETIME_PRECISION":       nil,
+					"CHARACTER_SET_NAME":       nil,
+					"COLLATION_NAME":           nil,
+					"DTD_IDENTIFIER":           nil,
+					"ROUTINE_BODY":             "SQL",
+					"ROUTINE_DEFINITION":       e.routineDefinitionText(p.Body, p.BodyText),
+					"EXTERNAL_NAME":            nil,
+					"EXTERNAL_LANGUAGE":        "SQL",
+					"PARAMETER_STYLE":          "SQL",
+					"IS_DETERMINISTIC":         "NO",
+					"SQL_DATA_ACCESS":          procSqlDataAccessVal(p),
+					"SQL_PATH":                 nil,
+					"SECURITY_TYPE":            procSecurityTypeVal(p),
+					"CREATED":                  "2024-01-01 00:00:00",
+					"LAST_ALTERED":             "2024-01-01 00:00:00",
+					"SQL_MODE":                 "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+					"ROUTINE_COMMENT":          p.Comment,
+					"DEFINER":                  "root@localhost",
+					"CHARACTER_SET_CLIENT":     "utf8mb4",
+					"COLLATION_CONNECTION":     "utf8mb4_general_ci",
+					"DATABASE_COLLATION":       "utf8mb4_general_ci",
 				})
 			}
 		}
@@ -5704,37 +5725,37 @@ func (e *Executor) infoSchemaRoutines() []storage.Row {
 					det = "YES"
 				}
 				rows = append(rows, storage.Row{
-					"SPECIFIC_NAME":             f.Name,
-					"ROUTINE_CATALOG":           "def",
-					"ROUTINE_SCHEMA":            dbName,
-					"ROUTINE_NAME":              f.Name,
-					"ROUTINE_TYPE":              "FUNCTION",
-					"DATA_TYPE":                 strings.ToLower(strings.TrimSpace(f.ReturnType)),
-					"CHARACTER_MAXIMUM_LENGTH":  nil,
-					"CHARACTER_OCTET_LENGTH":    nil,
-					"NUMERIC_PRECISION":         nil,
-					"NUMERIC_SCALE":             nil,
-					"DATETIME_PRECISION":        nil,
-					"CHARACTER_SET_NAME":        nil,
-					"COLLATION_NAME":            nil,
-					"DTD_IDENTIFIER":            normalizeDTDIdentifier(f.ReturnType),
-					"ROUTINE_BODY":              "SQL",
-					"ROUTINE_DEFINITION":        e.routineDefinitionText(f.Body, f.BodyText),
-					"EXTERNAL_NAME":             nil,
-					"EXTERNAL_LANGUAGE":         "SQL",
-					"PARAMETER_STYLE":           "SQL",
-					"IS_DETERMINISTIC":          det,
-					"SQL_DATA_ACCESS":           funcSqlDataAccess(f),
-					"SQL_PATH":                  nil,
-					"SECURITY_TYPE":             funcSecurityType(f),
-					"CREATED":                   "2024-01-01 00:00:00",
-					"LAST_ALTERED":              "2024-01-01 00:00:00",
-					"SQL_MODE":                  "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
-					"ROUTINE_COMMENT":           f.Comment,
-					"DEFINER":                   "root@localhost",
-					"CHARACTER_SET_CLIENT":      "utf8mb4",
-					"COLLATION_CONNECTION":      "utf8mb4_general_ci",
-					"DATABASE_COLLATION":        "utf8mb4_general_ci",
+					"SPECIFIC_NAME":            f.Name,
+					"ROUTINE_CATALOG":          "def",
+					"ROUTINE_SCHEMA":           dbName,
+					"ROUTINE_NAME":             f.Name,
+					"ROUTINE_TYPE":             "FUNCTION",
+					"DATA_TYPE":                strings.ToLower(strings.TrimSpace(f.ReturnType)),
+					"CHARACTER_MAXIMUM_LENGTH": nil,
+					"CHARACTER_OCTET_LENGTH":   nil,
+					"NUMERIC_PRECISION":        nil,
+					"NUMERIC_SCALE":            nil,
+					"DATETIME_PRECISION":       nil,
+					"CHARACTER_SET_NAME":       nil,
+					"COLLATION_NAME":           nil,
+					"DTD_IDENTIFIER":           normalizeDTDIdentifier(f.ReturnType),
+					"ROUTINE_BODY":             "SQL",
+					"ROUTINE_DEFINITION":       e.routineDefinitionText(f.Body, f.BodyText),
+					"EXTERNAL_NAME":            nil,
+					"EXTERNAL_LANGUAGE":        "SQL",
+					"PARAMETER_STYLE":          "SQL",
+					"IS_DETERMINISTIC":         det,
+					"SQL_DATA_ACCESS":          funcSqlDataAccess(f),
+					"SQL_PATH":                 nil,
+					"SECURITY_TYPE":            funcSecurityType(f),
+					"CREATED":                  "2024-01-01 00:00:00",
+					"LAST_ALTERED":             "2024-01-01 00:00:00",
+					"SQL_MODE":                 "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+					"ROUTINE_COMMENT":          f.Comment,
+					"DEFINER":                  "root@localhost",
+					"CHARACTER_SET_CLIENT":     "utf8mb4",
+					"COLLATION_CONNECTION":     "utf8mb4_general_ci",
+					"DATABASE_COLLATION":       "utf8mb4_general_ci",
 				})
 			}
 		}
@@ -6551,13 +6572,13 @@ func perfSchemaSeedStmtGlobalByEventName() []storage.Row {
 			"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
 			"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
 			"SUM_LOCK_TIME": int64(0),
-			"SUM_ERRORS": int64(0), "SUM_WARNINGS": int64(0),
+			"SUM_ERRORS":    int64(0), "SUM_WARNINGS": int64(0),
 			"SUM_ROWS_AFFECTED": int64(0), "SUM_ROWS_SENT": int64(0),
-			"SUM_ROWS_EXAMINED": int64(0),
+			"SUM_ROWS_EXAMINED":           int64(0),
 			"SUM_CREATED_TMP_DISK_TABLES": int64(0), "SUM_CREATED_TMP_TABLES": int64(0),
 			"SUM_SELECT_FULL_JOIN": int64(0), "SUM_SELECT_FULL_RANGE_JOIN": int64(0),
 			"SUM_SELECT_RANGE": int64(0), "SUM_SELECT_RANGE_CHECK": int64(0),
-			"SUM_SELECT_SCAN": int64(0),
+			"SUM_SELECT_SCAN":       int64(0),
 			"SUM_SORT_MERGE_PASSES": int64(0), "SUM_SORT_RANGE": int64(0),
 			"SUM_SORT_ROWS": int64(0), "SUM_SORT_SCAN": int64(0),
 			"SUM_NO_INDEX_USED": int64(0), "SUM_NO_GOOD_INDEX_USED": int64(0),
@@ -6575,13 +6596,13 @@ func (e *Executor) perfSchemaSeedStmtByThreadByEventName() []storage.Row {
 			"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
 			"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
 			"SUM_LOCK_TIME": int64(0),
-			"SUM_ERRORS": int64(0), "SUM_WARNINGS": int64(0),
+			"SUM_ERRORS":    int64(0), "SUM_WARNINGS": int64(0),
 			"SUM_ROWS_AFFECTED": int64(0), "SUM_ROWS_SENT": int64(0),
-			"SUM_ROWS_EXAMINED": int64(0),
+			"SUM_ROWS_EXAMINED":           int64(0),
 			"SUM_CREATED_TMP_DISK_TABLES": int64(0), "SUM_CREATED_TMP_TABLES": int64(0),
 			"SUM_SELECT_FULL_JOIN": int64(0), "SUM_SELECT_FULL_RANGE_JOIN": int64(0),
 			"SUM_SELECT_RANGE": int64(0), "SUM_SELECT_RANGE_CHECK": int64(0),
-			"SUM_SELECT_SCAN": int64(0),
+			"SUM_SELECT_SCAN":       int64(0),
 			"SUM_SORT_MERGE_PASSES": int64(0), "SUM_SORT_RANGE": int64(0),
 			"SUM_SORT_ROWS": int64(0), "SUM_SORT_SCAN": int64(0),
 			"SUM_NO_INDEX_USED": int64(0), "SUM_NO_GOOD_INDEX_USED": int64(0),
@@ -6600,13 +6621,13 @@ func perfSchemaSeedStmtByAccountByEventName() []storage.Row {
 				"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
 				"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
 				"SUM_LOCK_TIME": int64(0),
-				"SUM_ERRORS": int64(0), "SUM_WARNINGS": int64(0),
+				"SUM_ERRORS":    int64(0), "SUM_WARNINGS": int64(0),
 				"SUM_ROWS_AFFECTED": int64(0), "SUM_ROWS_SENT": int64(0),
-				"SUM_ROWS_EXAMINED": int64(0),
+				"SUM_ROWS_EXAMINED":           int64(0),
 				"SUM_CREATED_TMP_DISK_TABLES": int64(0), "SUM_CREATED_TMP_TABLES": int64(0),
 				"SUM_SELECT_FULL_JOIN": int64(0), "SUM_SELECT_FULL_RANGE_JOIN": int64(0),
 				"SUM_SELECT_RANGE": int64(0), "SUM_SELECT_RANGE_CHECK": int64(0),
-				"SUM_SELECT_SCAN": int64(0),
+				"SUM_SELECT_SCAN":       int64(0),
 				"SUM_SORT_MERGE_PASSES": int64(0), "SUM_SORT_RANGE": int64(0),
 				"SUM_SORT_ROWS": int64(0), "SUM_SORT_SCAN": int64(0),
 				"SUM_NO_INDEX_USED": int64(0), "SUM_NO_GOOD_INDEX_USED": int64(0),
@@ -6624,13 +6645,13 @@ func perfSchemaSeedStmtByHostByEventName() []storage.Row {
 			"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
 			"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
 			"SUM_LOCK_TIME": int64(0),
-			"SUM_ERRORS": int64(0), "SUM_WARNINGS": int64(0),
+			"SUM_ERRORS":    int64(0), "SUM_WARNINGS": int64(0),
 			"SUM_ROWS_AFFECTED": int64(0), "SUM_ROWS_SENT": int64(0),
-			"SUM_ROWS_EXAMINED": int64(0),
+			"SUM_ROWS_EXAMINED":           int64(0),
 			"SUM_CREATED_TMP_DISK_TABLES": int64(0), "SUM_CREATED_TMP_TABLES": int64(0),
 			"SUM_SELECT_FULL_JOIN": int64(0), "SUM_SELECT_FULL_RANGE_JOIN": int64(0),
 			"SUM_SELECT_RANGE": int64(0), "SUM_SELECT_RANGE_CHECK": int64(0),
-			"SUM_SELECT_SCAN": int64(0),
+			"SUM_SELECT_SCAN":       int64(0),
 			"SUM_SORT_MERGE_PASSES": int64(0), "SUM_SORT_RANGE": int64(0),
 			"SUM_SORT_ROWS": int64(0), "SUM_SORT_SCAN": int64(0),
 			"SUM_NO_INDEX_USED": int64(0), "SUM_NO_GOOD_INDEX_USED": int64(0),
@@ -6649,13 +6670,13 @@ func perfSchemaSeedStmtByUserByEventName() []storage.Row {
 				"SUM_TIMER_WAIT": int64(0), "MIN_TIMER_WAIT": int64(0),
 				"AVG_TIMER_WAIT": int64(0), "MAX_TIMER_WAIT": int64(0),
 				"SUM_LOCK_TIME": int64(0),
-				"SUM_ERRORS": int64(0), "SUM_WARNINGS": int64(0),
+				"SUM_ERRORS":    int64(0), "SUM_WARNINGS": int64(0),
 				"SUM_ROWS_AFFECTED": int64(0), "SUM_ROWS_SENT": int64(0),
-				"SUM_ROWS_EXAMINED": int64(0),
+				"SUM_ROWS_EXAMINED":           int64(0),
 				"SUM_CREATED_TMP_DISK_TABLES": int64(0), "SUM_CREATED_TMP_TABLES": int64(0),
 				"SUM_SELECT_FULL_JOIN": int64(0), "SUM_SELECT_FULL_RANGE_JOIN": int64(0),
 				"SUM_SELECT_RANGE": int64(0), "SUM_SELECT_RANGE_CHECK": int64(0),
-				"SUM_SELECT_SCAN": int64(0),
+				"SUM_SELECT_SCAN":       int64(0),
 				"SUM_SORT_MERGE_PASSES": int64(0), "SUM_SORT_RANGE": int64(0),
 				"SUM_SORT_ROWS": int64(0), "SUM_SORT_SCAN": int64(0),
 				"SUM_NO_INDEX_USED": int64(0), "SUM_NO_GOOD_INDEX_USED": int64(0),
@@ -6819,12 +6840,12 @@ func perfSchemaSeedHistogramGlobal() []storage.Row {
 	rows := make([]storage.Row, 0, 20)
 	for i := int64(0); i < 20; i++ {
 		rows = append(rows, storage.Row{
-			"BUCKET_NUMBER": i,
-			"BUCKET_TIMER_LOW": i * 1000000,
-			"BUCKET_TIMER_HIGH": (i + 1) * 1000000,
-			"COUNT_BUCKET": int64(0),
+			"BUCKET_NUMBER":          i,
+			"BUCKET_TIMER_LOW":       i * 1000000,
+			"BUCKET_TIMER_HIGH":      (i + 1) * 1000000,
+			"COUNT_BUCKET":           int64(0),
 			"COUNT_BUCKET_AND_LOWER": int64(0),
-			"BUCKET_QUANTILE": 0.0,
+			"BUCKET_QUANTILE":        0.0,
 		})
 	}
 	return rows
@@ -6955,8 +6976,8 @@ func (e *Executor) perfSchemaESMSByDigest() []storage.Row {
 			return []storage.Row{{
 				"SCHEMA_NAME":                 nil,
 				"DIGEST":                      nil,
-				"DIGEST_TEXT":                  nil,
-				"COUNT_STAR":                   int64(0),
+				"DIGEST_TEXT":                 nil,
+				"COUNT_STAR":                  int64(0),
 				"SUM_TIMER_WAIT":              int64(0),
 				"MIN_TIMER_WAIT":              int64(0),
 				"AVG_TIMER_WAIT":              int64(0),
@@ -6994,41 +7015,41 @@ func (e *Executor) perfSchemaESMSByDigest() []storage.Row {
 	rows := make([]storage.Row, 0, len(e.psDigests))
 	for _, d := range e.psDigests {
 		rows = append(rows, storage.Row{
-			"SCHEMA_NAME":                  d.SchemaName,
-			"DIGEST":                       d.Digest,
-			"DIGEST_TEXT":                   d.DigestText,
-			"COUNT_STAR":                    d.CountStar,
-			"SUM_TIMER_WAIT":               int64(0),
-			"MIN_TIMER_WAIT":               int64(0),
-			"AVG_TIMER_WAIT":               int64(0),
-			"MAX_TIMER_WAIT":               int64(0),
-			"SUM_LOCK_TIME":                int64(0),
-			"SUM_ERRORS":                   int64(0),
-			"SUM_WARNINGS":                 int64(0),
-			"SUM_ROWS_AFFECTED":            int64(0),
-			"SUM_ROWS_SENT":                int64(0),
-			"SUM_ROWS_EXAMINED":            int64(0),
-			"SUM_CREATED_TMP_DISK_TABLES":  int64(0),
-			"SUM_CREATED_TMP_TABLES":       int64(0),
-			"SUM_SELECT_FULL_JOIN":         int64(0),
-			"SUM_SELECT_FULL_RANGE_JOIN":   int64(0),
-			"SUM_SELECT_RANGE":             int64(0),
-			"SUM_SELECT_RANGE_CHECK":       int64(0),
-			"SUM_SELECT_SCAN":              int64(0),
-			"SUM_SORT_MERGE_PASSES":        int64(0),
-			"SUM_SORT_RANGE":               int64(0),
-			"SUM_SORT_ROWS":                int64(0),
-			"SUM_SORT_SCAN":                int64(0),
-			"SUM_NO_INDEX_USED":            int64(0),
-			"SUM_NO_GOOD_INDEX_USED":       int64(0),
-			"FIRST_SEEN":                   "2024-01-01 00:00:00.000000",
-			"LAST_SEEN":                    "2024-01-01 00:00:00.000000",
-			"QUANTILE_95":                  int64(0),
-			"QUANTILE_99":                  int64(0),
-			"QUANTILE_999":                 int64(0),
-			"QUERY_SAMPLE_TEXT":            d.DigestText,
-			"QUERY_SAMPLE_SEEN":            "2024-01-01 00:00:00.000000",
-			"QUERY_SAMPLE_TIMER_WAIT":      int64(0),
+			"SCHEMA_NAME":                 d.SchemaName,
+			"DIGEST":                      d.Digest,
+			"DIGEST_TEXT":                 d.DigestText,
+			"COUNT_STAR":                  d.CountStar,
+			"SUM_TIMER_WAIT":              int64(0),
+			"MIN_TIMER_WAIT":              int64(0),
+			"AVG_TIMER_WAIT":              int64(0),
+			"MAX_TIMER_WAIT":              int64(0),
+			"SUM_LOCK_TIME":               int64(0),
+			"SUM_ERRORS":                  int64(0),
+			"SUM_WARNINGS":                int64(0),
+			"SUM_ROWS_AFFECTED":           int64(0),
+			"SUM_ROWS_SENT":               int64(0),
+			"SUM_ROWS_EXAMINED":           int64(0),
+			"SUM_CREATED_TMP_DISK_TABLES": int64(0),
+			"SUM_CREATED_TMP_TABLES":      int64(0),
+			"SUM_SELECT_FULL_JOIN":        int64(0),
+			"SUM_SELECT_FULL_RANGE_JOIN":  int64(0),
+			"SUM_SELECT_RANGE":            int64(0),
+			"SUM_SELECT_RANGE_CHECK":      int64(0),
+			"SUM_SELECT_SCAN":             int64(0),
+			"SUM_SORT_MERGE_PASSES":       int64(0),
+			"SUM_SORT_RANGE":              int64(0),
+			"SUM_SORT_ROWS":               int64(0),
+			"SUM_SORT_SCAN":               int64(0),
+			"SUM_NO_INDEX_USED":           int64(0),
+			"SUM_NO_GOOD_INDEX_USED":      int64(0),
+			"FIRST_SEEN":                  "2024-01-01 00:00:00.000000",
+			"LAST_SEEN":                   "2024-01-01 00:00:00.000000",
+			"QUANTILE_95":                 int64(0),
+			"QUANTILE_99":                 int64(0),
+			"QUANTILE_999":                int64(0),
+			"QUERY_SAMPLE_TEXT":           d.DigestText,
+			"QUERY_SAMPLE_SEEN":           "2024-01-01 00:00:00.000000",
+			"QUERY_SAMPLE_TIMER_WAIT":     int64(0),
 		})
 	}
 	return rows

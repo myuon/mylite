@@ -3069,14 +3069,6 @@
       "reason": "output mismatch or execution error"
     },
     {
-      "test": "sys_vars/slave_parallel_type_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/slave_type_conversions_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/slow_launch_time_func",
       "reason": "output mismatch or execution error"
     },
@@ -3369,20 +3361,8 @@
       "reason": "still failing"
     },
     {
-      "test": "sys_vars/binlog_checksum_basic",
-      "reason": "output mismatch"
-    },
-    {
       "test": "sys_vars/insert_id_func",
       "reason": "output mismatch"
-    },
-    {
-      "test": "sys_vars/binlog_group_commit_sync_no_delay_count_basic",
-      "reason": "engine does not truncate out-of-range values for binlog_group_commit_sync_no_delay_count"
-    },
-    {
-      "test": "sys_vars/binlog_encryption",
-      "reason": "engine does not support binlog_encryption"
     },
     {
       "test": "sys_vars/gtid_purged_basic",
@@ -4501,28 +4481,12 @@
       "reason": "off-by-one in value computation and needs privilege checking"
     },
     {
-      "test": "sys_vars/slave_parallel_workers_basic",
-      "reason": "result file has literal $var from eval echo behavior"
-    },
-    {
-      "test": "sys_vars/slave_pending_jobs_size_max_basic",
-      "reason": "result file has literal $var from eval echo behavior"
-    },
-    {
-      "test": "sys_vars/slave_rows_search_algorithms_basic",
-      "reason": "needs SET value canonicalization and invalid value rejection"
-    },
-    {
       "test": "sys_vars/session_track_system_variables_basic",
       "reason": "needs special session tracking behavior"
     },
     {
       "test": "sys_vars/max_allowed_packet_basic",
       "reason": "single-line diff at comparison query"
-    },
-    {
-      "test": "sys_vars/binlog_row_event_max_size_basic",
-      "reason": "needs persist support"
     },
     {
       "test": "x/*",

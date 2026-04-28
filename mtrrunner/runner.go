@@ -116,8 +116,8 @@ func (r *Runner) RunFile(testPath string) TestResult {
 	defer defaultConn.Close()
 
 	// Reset state using the dedicated default connection
-	defaultConn.ExecContext(context.Background(), "USE test") //nolint:errcheck
-	defaultConn.ExecContext(context.Background(), "MYLITE RESET_SESSION") //nolint:errcheck
+	defaultConn.ExecContext(context.Background(), "USE test")                 //nolint:errcheck
+	defaultConn.ExecContext(context.Background(), "MYLITE RESET_SESSION")     //nolint:errcheck
 	defaultConn.ExecContext(context.Background(), "MYLITE RESET_TEMP_TABLES") //nolint:errcheck
 	if rows, err2 := defaultConn.QueryContext(context.Background(), "SHOW TABLES"); err2 == nil {
 		var tables []string
@@ -138,7 +138,9 @@ func (r *Runner) RunFile(testPath string) TestResult {
 			var db, name string
 			var rest [14]interface{}
 			ptrs := []interface{}{&db, &name}
-			for i := range rest { ptrs = append(ptrs, &rest[i]) }
+			for i := range rest {
+				ptrs = append(ptrs, &rest[i])
+			}
 			rows.Scan(ptrs...) //nolint:errcheck
 			procs = append(procs, name)
 		}
@@ -153,7 +155,9 @@ func (r *Runner) RunFile(testPath string) TestResult {
 			var db, name string
 			var rest [14]interface{}
 			ptrs := []interface{}{&db, &name}
-			for i := range rest { ptrs = append(ptrs, &rest[i]) }
+			for i := range rest {
+				ptrs = append(ptrs, &rest[i])
+			}
 			rows.Scan(ptrs...) //nolint:errcheck
 			funcs = append(funcs, name)
 		}
@@ -408,41 +412,41 @@ func (r *Runner) RunSuite(suiteDir string) []TestResult {
 
 // execContext holds state during test file execution.
 type execContext struct {
-	runner           *Runner
-	db               *sql.DB
-	defaultConn      *sql.Conn            // dedicated default connection (not pooled)
-	connByName       map[string]*sql.Conn // mysqltest named connections
-	currentConn      string               // empty means default connection
-	output           *strings.Builder
-	warningsEnabled  bool
-	queryLogEnabled  bool
-	resultLogEnabled bool
-	sortResult       bool
-	expectedError    string // expected error code/name for next statement
-	variables        map[string]string
-	delimiter        string
-	tmpDir           string         // temporary directory for file operations
-	replaceColumns   map[int]string // column index (1-based) -> replacement value for next query
-	replaceResult    []string       // pairs of [from, to] for --replace_result
-	replaceRegex     []regexReplace // regex pairs for --replace_regex
-	verticalResult   bool           // format next query result as vertical key/value pairs
-	verticalResults  bool           // persistent vertical output mode (--vertical_results)
-	infoEnabled        bool           // --enable_info: show affected rows and info after DML
-	skipped            bool           // set to true when --skip directive is encountered
-	testcaseDisabled   bool           // set by --disable_testcase, cleared by --enable_testcase
-	sourceDepth        int            // current --source recursion depth
-	queryLogOnce       bool           // if true, restore queryLogEnabled after next statement
-	queryLogOnceRestore bool          // value to restore queryLogEnabled to after once
-	resultLogOnce      bool           // if true, restore resultLogEnabled after next statement
-	resultLogOnceRestore bool         // value to restore resultLogEnabled to after once
-	ttsBackups       map[string]tableSnapshot
-	errorConn        *sql.Conn // cached connection for --error expected error handling
-	pendingSendByConn map[string]*pendingSend // keyed by connection name ("" for default)
-	pendingSendNext   bool                    // next SQL statement should be sent asynchronously
-	pendingSendEval   bool                    // pending send should use variable substitution
-	pendingEval       bool                    // next SQL statement should have variables expanded in echo
-	abortOnError     bool                    // if false, SQL errors are output as ERROR lines instead of aborting (--disable_abort_on_error)
-	metadataEnabled  bool                    // --enable_metadata: output column type metadata before each result set
+	runner               *Runner
+	db                   *sql.DB
+	defaultConn          *sql.Conn            // dedicated default connection (not pooled)
+	connByName           map[string]*sql.Conn // mysqltest named connections
+	currentConn          string               // empty means default connection
+	output               *strings.Builder
+	warningsEnabled      bool
+	queryLogEnabled      bool
+	resultLogEnabled     bool
+	sortResult           bool
+	expectedError        string // expected error code/name for next statement
+	variables            map[string]string
+	delimiter            string
+	tmpDir               string         // temporary directory for file operations
+	replaceColumns       map[int]string // column index (1-based) -> replacement value for next query
+	replaceResult        []string       // pairs of [from, to] for --replace_result
+	replaceRegex         []regexReplace // regex pairs for --replace_regex
+	verticalResult       bool           // format next query result as vertical key/value pairs
+	verticalResults      bool           // persistent vertical output mode (--vertical_results)
+	infoEnabled          bool           // --enable_info: show affected rows and info after DML
+	skipped              bool           // set to true when --skip directive is encountered
+	testcaseDisabled     bool           // set by --disable_testcase, cleared by --enable_testcase
+	sourceDepth          int            // current --source recursion depth
+	queryLogOnce         bool           // if true, restore queryLogEnabled after next statement
+	queryLogOnceRestore  bool           // value to restore queryLogEnabled to after once
+	resultLogOnce        bool           // if true, restore resultLogEnabled after next statement
+	resultLogOnceRestore bool           // value to restore resultLogEnabled to after once
+	ttsBackups           map[string]tableSnapshot
+	errorConn            *sql.Conn               // cached connection for --error expected error handling
+	pendingSendByConn    map[string]*pendingSend // keyed by connection name ("" for default)
+	pendingSendNext      bool                    // next SQL statement should be sent asynchronously
+	pendingSendEval      bool                    // pending send should use variable substitution
+	pendingEval          bool                    // next SQL statement should have variables expanded in echo
+	abortOnError         bool                    // if false, SQL errors are output as ERROR lines instead of aborting (--disable_abort_on_error)
+	metadataEnabled      bool                    // --enable_metadata: output column type metadata before each result set
 }
 
 type tableSnapshot struct {
@@ -1013,9 +1017,9 @@ func (ctx *execContext) executeLines(lines []string) error {
 		// Collect raw lines for echoing and build SQL statement
 		var rawLines []string
 		stmt := ""
-		inSingleQuote := false  // track if we're inside a single-quoted string literal
-		inDoubleQuote := false  // track if we're inside a double-quoted string literal
-		inBlockComment := false // track if we're inside a /* ... */ block comment
+		inSingleQuote := false   // track if we're inside a single-quoted string literal
+		inDoubleQuote := false   // track if we're inside a double-quoted string literal
+		inBlockComment := false  // track if we're inside a /* ... */ block comment
 		inStringLiteral := false // combined: true when inside either quote type
 		for i < len(lines) {
 			l := lines[i]
@@ -1427,7 +1431,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		}
 		if existing := ctx.connByName[key]; existing != nil {
 			existing.ExecContext(context.Background(), "UNLOCK TABLES") //nolint:errcheck
-			existing.Close()                                             //nolint:errcheck
+			existing.Close()                                            //nolint:errcheck
 			delete(ctx.connByName, key)
 		}
 		conn, err := ctx.db.Conn(context.Background())
@@ -1493,7 +1497,7 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 			// Clean up transaction and lock state before returning the connection to the pool.
 			// Without this, a pooled connection may retain inTransaction/row-lock/table-lock state
 			// that leaks into the next user of the same underlying connection.
-			conn.ExecContext(context.Background(), "ROLLBACK")    //nolint:errcheck
+			conn.ExecContext(context.Background(), "ROLLBACK")      //nolint:errcheck
 			conn.ExecContext(context.Background(), "UNLOCK TABLES") //nolint:errcheck
 			conn.Close()                                            //nolint:errcheck
 			delete(ctx.connByName, key)
@@ -2028,7 +2032,7 @@ func (ctx *execContext) handleIfBlock(lines []string, i int) (handled bool, skip
 	for i < len(lines) && depth > 0 {
 		t := strings.TrimSpace(lines[i])
 		// Check for } with possible trailing comment
-		closingBrace := t == "}" || strings.HasPrefix(t, "} ")  || strings.HasPrefix(t, "}#")
+		closingBrace := t == "}" || strings.HasPrefix(t, "} ") || strings.HasPrefix(t, "}#")
 		openingBrace := t == "{" || strings.HasSuffix(t, "{")
 		if closingBrace {
 			depth--
@@ -4934,6 +4938,8 @@ var mysqlErrorCodeToName = map[int]string{
 	1463: "ER_FIELD_IN_ORDER_NOT_SELECT",
 	1465: "ER_DUP_LIST_ENTRY",
 	1467: "ER_AUTOINC_READ_FAILED",
+	1766: "ER_VARIABLE_NOT_SETTABLE_IN_TRANSACTION",
+	1790: "ER_CANT_SET_VARIABLE_WHEN_OWNING_GTID",
 	3100: "ER_USER_LOCK_WRONG_NAME",
 	3116: "ER_USER_LOCK_DEADLOCK",
 	3507: "ER_UNSUPPORTED_SQL_MODE",
@@ -5545,7 +5551,9 @@ func normalizeOutput(s string) string {
 
 // normalizeVerticalColLine normalizes the column name case in a single vertical output line.
 // In vertical output mode (--vertical_results or \G), each line has the format:
-//   COLUMN_NAME\tvalue   (or COLUMN_NAME\t  with empty/trailing whitespace)
+//
+//	COLUMN_NAME\tvalue   (or COLUMN_NAME\t  with empty/trailing whitespace)
+//
 // MySQL 5.7 always outputs IS column names in UPPERCASE; MySQL 8.0 preserves user's case.
 // We lowercase the key part so both old and new result files compare equally.
 // Also handles lines without a tab (e.g. after trimming) where the whole line is an identifier.

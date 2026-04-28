@@ -126,8 +126,8 @@ var infoSchemaColumnMeta = map[string]map[string]isColMeta{
 
 // infoSchemaCreateView maps IS table names to their MySQL view definitions (returned as VIEW).
 var infoSchemaCreateView = map[string]string{
-	"character_sets": "CREATE ALGORITHM=UNDEFINED DEFINER=`mysql.infoschema`@`localhost` SQL SECURITY DEFINER VIEW `information_schema`.`CHARACTER_SETS` AS select `cs`.`name` AS `CHARACTER_SET_NAME`,`col`.`name` AS `DEFAULT_COLLATE_NAME`,`cs`.`comment` AS `DESCRIPTION`,`cs`.`mb_max_length` AS `MAXLEN` from (`mysql`.`character_sets` `cs` join `mysql`.`collations` `col` on((`cs`.`default_collation_id` = `col`.`id`)))",
-	"collations": "CREATE ALGORITHM=UNDEFINED DEFINER=`mysql.infoschema`@`localhost` SQL SECURITY DEFINER VIEW `information_schema`.`COLLATIONS` AS select `col`.`name` AS `COLLATION_NAME`,`cs`.`name` AS `CHARACTER_SET_NAME`,`col`.`id` AS `ID`,if(exists(select 1 from `mysql`.`character_sets` where (`mysql`.`character_sets`.`default_collation_id` = `col`.`id`)),'Yes','') AS `IS_DEFAULT`,if(`col`.`is_compiled`,'Yes','') AS `IS_COMPILED`,`col`.`sort_length` AS `SORTLEN`,`col`.`pad_attribute` AS `PAD_ATTRIBUTE` from (`mysql`.`collations` `col` join `mysql`.`character_sets` `cs` on((`col`.`character_set_id` = `cs`.`id`)))",
+	"character_sets":                        "CREATE ALGORITHM=UNDEFINED DEFINER=`mysql.infoschema`@`localhost` SQL SECURITY DEFINER VIEW `information_schema`.`CHARACTER_SETS` AS select `cs`.`name` AS `CHARACTER_SET_NAME`,`col`.`name` AS `DEFAULT_COLLATE_NAME`,`cs`.`comment` AS `DESCRIPTION`,`cs`.`mb_max_length` AS `MAXLEN` from (`mysql`.`character_sets` `cs` join `mysql`.`collations` `col` on((`cs`.`default_collation_id` = `col`.`id`)))",
+	"collations":                            "CREATE ALGORITHM=UNDEFINED DEFINER=`mysql.infoschema`@`localhost` SQL SECURITY DEFINER VIEW `information_schema`.`COLLATIONS` AS select `col`.`name` AS `COLLATION_NAME`,`cs`.`name` AS `CHARACTER_SET_NAME`,`col`.`id` AS `ID`,if(exists(select 1 from `mysql`.`character_sets` where (`mysql`.`character_sets`.`default_collation_id` = `col`.`id`)),'Yes','') AS `IS_DEFAULT`,if(`col`.`is_compiled`,'Yes','') AS `IS_COMPILED`,`col`.`sort_length` AS `SORTLEN`,`col`.`pad_attribute` AS `PAD_ATTRIBUTE` from (`mysql`.`collations` `col` join `mysql`.`character_sets` `cs` on((`col`.`character_set_id` = `cs`.`id`)))",
 	"collation_character_set_applicability": "CREATE ALGORITHM=UNDEFINED DEFINER=`mysql.infoschema`@`localhost` SQL SECURITY DEFINER VIEW `information_schema`.`COLLATION_CHARACTER_SET_APPLICABILITY` AS select `col`.`name` AS `COLLATION_NAME`,`cs`.`name` AS `CHARACTER_SET_NAME` from (`mysql`.`character_sets` `cs` join `mysql`.`collations` `col` on((`cs`.`id` = `col`.`character_set_id`)))",
 }
 
@@ -1260,13 +1260,18 @@ func (e *Executor) populatePerfSchemaTable(tbl *storage.Table, tableName string)
 		// Sort by name for deterministic output
 		names := make([]string, 0, len(vars))
 		for name := range vars {
+			if sysVarPerfSchemaHidden[name] {
+				continue
+			}
 			names = append(names, name)
 		}
 		sort.Strings(names)
 		for _, name := range names {
 			r := make(storage.Row)
 			r["VARIABLE_NAME"] = name
+			r["variable_name"] = name
 			r["VARIABLE_VALUE"] = vars[name]
+			r["variable_value"] = vars[name]
 			tbl.Rows = append(tbl.Rows, r)
 		}
 		tbl.Mu.Unlock()
@@ -1276,14 +1281,27 @@ func (e *Executor) populatePerfSchemaTable(tbl *storage.Table, tableName string)
 		tbl.Rows = nil
 		names := make([]string, 0, len(vars))
 		for name := range vars {
+			if sysVarPerfSchemaHidden[name] {
+				continue
+			}
 			names = append(names, name)
 		}
 		sort.Strings(names)
 		for _, name := range names {
 			r := make(storage.Row)
 			r["VARIABLE_NAME"] = name
+			r["variable_name"] = name
 			r["VARIABLE_VALUE"] = vars[name]
+			r["variable_value"] = vars[name]
 			tbl.Rows = append(tbl.Rows, r)
+		}
+		tbl.Mu.Unlock()
+	case "persisted_variables":
+		rows := e.persistedVariableRows()
+		tbl.Mu.Lock()
+		tbl.Rows = nil
+		for _, row := range rows {
+			tbl.Rows = append(tbl.Rows, row)
 		}
 		tbl.Mu.Unlock()
 	}

@@ -114,6 +114,10 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		cleanVarName := strings.TrimPrefix(name, "global.")
 		cleanVarName = strings.TrimPrefix(cleanVarName, "session.")
 		cleanVarName = strings.TrimPrefix(cleanVarName, "local.")
+		isPersistOnlySet := strings.HasPrefix(cleanVarName, "persist_only.")
+		isPersistSet := strings.HasPrefix(cleanVarName, "persist.")
+		cleanVarName = strings.TrimPrefix(cleanVarName, "persist_only.")
+		cleanVarName = strings.TrimPrefix(cleanVarName, "persist.")
 		// performance_schema_consumer_* are startup-only options, not settable variables.
 		if strings.HasPrefix(cleanVarName, "performance_schema_consumer_") ||
 			cleanVarName == "performance_schema_instrument" {
@@ -136,6 +140,17 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		}
 		// Check if variable is read-only
 		if sysVarReadOnly[cleanVarName] {
+			if isPersistOnlySet {
+				persistVal, err := e.persistValueForReadOnlyVar(cleanVarName, sqlparser.String(expr.Expr))
+				if err != nil {
+					return nil, err
+				}
+				e.setPersistedVar(cleanVarName, persistVal)
+				continue
+			}
+			return nil, mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a read only variable", cleanVarName))
+		}
+		if isPersistSet && sysVarReadOnly[cleanVarName] {
 			return nil, mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a read only variable", cleanVarName))
 		}
 		// Check if GLOBAL-only variable is being set at SESSION scope
@@ -161,6 +176,9 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		// Check if session-read-only variable is being set at SESSION scope
 		if sysVarSessionReadOnly[cleanVarName] && scope != sqlparser.GlobalScope {
 			return nil, mysqlError(1238, "HY000", fmt.Sprintf("SESSION variable '%s' is read-only. Use SET GLOBAL to assign the value", cleanVarName))
+		}
+		if err := e.checkBinlogChecksumSettable(cleanVarName); err != nil {
+			return nil, err
 		}
 		// Emit deprecation warning for deprecated variables
 		if msg, ok := sysVarDeprecated[cleanVarName]; ok {
@@ -284,7 +302,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				// These generate ER_UNSUPPORTED_SQL_MODE (3507).
 				// Exception: when pseudo_slave_mode is TRUE (replication slave mode),
 				// these unsupported bits are silently stripped with a warning instead of an error.
-				const unsupportedBits = uint64((1<<8)|(1<<9)|(1<<10)|(1<<11)|(1<<12)|(1<<13)|(1<<14)|(1<<15)|(1<<16)|(1<<17)|(1<<28))
+				const unsupportedBits = uint64((1 << 8) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16) | (1 << 17) | (1 << 28))
 				if n&unsupportedBits != 0 {
 					// pseudo_slave_mode bypass only applies to direct (non-routine) SET statements.
 					pseudoSlaveMode := e.sessionScopeVars["pseudo_slave_mode"]
@@ -653,6 +671,12 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							return nil, mysqlError(1227, "42000", "Access denied; you need (at least one of) the SUPER or SYSTEM_VARIABLES_ADMIN privilege(s) for this operation")
 						}
 					}
+				}
+				if isGlobal && cleanName == "binlog_encryption" && !e.hasBinlogEncryptionAdminPrivilege() {
+					return nil, mysqlError(1227, "42000", "Access denied; you need (at least one of) the SUPER or BINLOG_ENCRYPTION_ADMIN privilege(s) for this operation")
+				}
+				if err := e.checkBinlogChecksumSettable(cleanName); err != nil {
+					return nil, err
 				}
 				// Save previous session value before SET GLOBAL overwrites it.
 				savedSessionVal := map[string]string{}
@@ -1142,6 +1166,41 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 	return &Result{}, nil
 }
 
+func (e *Executor) checkBinlogChecksumSettable(varName string) error {
+	if varName != "binlog_checksum" {
+		return nil
+	}
+	if e.inTransaction || e.userVars["__xa_active"] == true {
+		return mysqlError(1766, "HY000", "The system variable binlog_checksum cannot be set when there is an ongoing transaction.")
+	}
+	if gtidNext, ok := e.sessionScopeVars["gtid_next"]; ok && gtidNext != "" && !strings.EqualFold(gtidNext, "AUTOMATIC") {
+		owner := strings.ToLower(gtidNext)
+		return mysqlError(1790, "HY000", fmt.Sprintf("Variable binlog_checksum cannot be changed by a client that owns a GTID. The client owns %s. Ownership is released on COMMIT or ROLLBACK.", owner))
+	}
+	return nil
+}
+
+func (e *Executor) persistValueForReadOnlyVar(varName, rawVal string) (string, error) {
+	val := strings.TrimSpace(rawVal)
+	val = strings.TrimSuffix(val, ";")
+	val = strings.TrimSpace(strings.Trim(val, "'\""))
+	if strings.EqualFold(val, "DEFAULT") {
+		if def, ok := e.getCompiledDefault(varName); ok {
+			return def, nil
+		}
+		return "", nil
+	}
+	if varName == "binlog_row_event_max_size" {
+		if strings.ContainsAny(val, ".eE") {
+			return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", varName))
+		}
+		if _, err := strconv.ParseUint(val, 10, 64); err != nil {
+			return "", mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", varName))
+		}
+	}
+	return val, nil
+}
+
 // resolveSystemVarInValue resolves @@system_var and @user_var references in a value string.
 func (e *Executor) resolveSystemVarInValue(val string) string {
 	trimVal := strings.TrimSpace(val)
@@ -1494,8 +1553,9 @@ func (e *Executor) handleRawSet(raw string) error {
 	// Store any SET GLOBAL/SESSION variable generically
 	rest := strings.TrimSpace(trimmed[4:])
 	restUpper := strings.ToUpper(rest)
-	isPersistOnly := strings.HasPrefix(restUpper, "PERSIST_ONLY ")
-	isGlobalScope := strings.HasPrefix(restUpper, "GLOBAL ") || strings.HasPrefix(restUpper, "@@GLOBAL.") || strings.HasPrefix(restUpper, "PERSIST ") || isPersistOnly
+	isPersistOnly := strings.HasPrefix(restUpper, "PERSIST_ONLY ") || strings.HasPrefix(restUpper, "@@PERSIST_ONLY.")
+	isPersist := strings.HasPrefix(restUpper, "PERSIST ") || strings.HasPrefix(restUpper, "@@PERSIST.")
+	isGlobalScope := strings.HasPrefix(restUpper, "GLOBAL ") || strings.HasPrefix(restUpper, "@@GLOBAL.") || isPersist || isPersistOnly
 	// Use case-insensitive prefix stripping for scope keywords
 	if strings.HasPrefix(restUpper, "GLOBAL ") {
 		rest = rest[len("GLOBAL "):]
@@ -1511,6 +1571,10 @@ func (e *Executor) handleRawSet(raw string) error {
 	// Strip @@ scope prefix case-insensitively
 	if strings.HasPrefix(restUpper, "@@GLOBAL.") {
 		rest = rest[len("@@GLOBAL."):]
+	} else if strings.HasPrefix(restUpper, "@@PERSIST_ONLY.") {
+		rest = rest[len("@@PERSIST_ONLY."):]
+	} else if strings.HasPrefix(restUpper, "@@PERSIST.") {
+		rest = rest[len("@@PERSIST."):]
 	} else if strings.HasPrefix(restUpper, "@@SESSION.") {
 		rest = rest[len("@@SESSION."):]
 	} else if strings.HasPrefix(restUpper, "@@LOCAL.") {
@@ -1521,6 +1585,9 @@ func (e *Executor) handleRawSet(raw string) error {
 	_ = restUpper
 	if eqIdx := strings.Index(rest, "="); eqIdx > 0 {
 		varName := strings.TrimSpace(strings.ToLower(rest[:eqIdx]))
+		val := strings.TrimSpace(rest[eqIdx+1:])
+		val = strings.TrimSuffix(val, ";")
+		val = strings.TrimSpace(val)
 		// Check read-only
 		if sysVarReadOnly[varName] {
 			if isPersistOnly {
@@ -1528,10 +1595,16 @@ func (e *Executor) handleRawSet(raw string) error {
 				if sysVarNonPersistReadOnly[varName] {
 					return mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a non persistent read only variable", varName))
 				}
-				// Regular read-only variables: SET PERSIST_ONLY is allowed (writes to mysqld-auto.cnf for next restart)
-				// without affecting the current running value. Return success silently.
+				persistVal, err := e.persistValueForReadOnlyVar(varName, val)
+				if err != nil {
+					return err
+				}
+				e.setPersistedVar(varName, persistVal)
 				return nil
 			}
+			return mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a read only variable", varName))
+		}
+		if isPersist {
 			return mysqlError(1238, "HY000", fmt.Sprintf("Variable '%s' is a read only variable", varName))
 		}
 		// Check GLOBAL-only
@@ -1546,13 +1619,19 @@ func (e *Executor) handleRawSet(raw string) error {
 		if sysVarSessionReadOnly[varName] && !isGlobalScope {
 			return mysqlError(1238, "HY000", fmt.Sprintf("SESSION variable '%s' is read-only. Use SET GLOBAL to assign the value", varName))
 		}
+		if isGlobalScope && !e.hasSystemVariablesAdminPrivilege() {
+			return mysqlError(1227, "42000", "Access denied; you need (at least one of) the SUPER or SYSTEM_VARIABLES_ADMIN privilege(s) for this operation")
+		}
+		if err := e.checkBinlogChecksumSettable(varName); err != nil {
+			return err
+		}
+		if isGlobalScope && varName == "binlog_encryption" && !e.hasBinlogEncryptionAdminPrivilege() {
+			return mysqlError(1227, "42000", "Access denied; you need (at least one of) the SUPER or BINLOG_ENCRYPTION_ADMIN privilege(s) for this operation")
+		}
 		// Emit deprecation warning for deprecated variables
 		if msg, ok := sysVarDeprecated[varName]; ok {
 			e.addWarning("Warning", 1287, msg)
 		}
-		val := strings.TrimSpace(rest[eqIdx+1:])
-		val = strings.TrimSuffix(val, ";")
-		val = strings.TrimSpace(val)
 		// Reject NULL for string-type system variables
 		if strings.ToUpper(val) == "NULL" && sysVarStringType[varName] {
 			return mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of 'NULL'", varName))
@@ -1878,7 +1957,7 @@ var sysVarReadOnly = map[string]bool{
 	"lock_order_trace_missing_arc":                 true,
 	"lock_order_trace_missing_key":                 true,
 	"lock_order_trace_missing_unlock":              true,
-	"log_error": true,
+	"log_error":                                    true,
 }
 
 // sysVarNonPersistReadOnly contains system variables that cannot be SET even via PERSIST_ONLY.
@@ -1913,6 +1992,7 @@ var sysVarGlobalOnly = map[string]bool{
 	"binlog_max_flush_queue_time":             true,
 	"binlog_order_commits":                    true,
 	"binlog_stmt_cache_size":                  true,
+	"binlog_encryption":                       true,
 	"check_proxy_users":                       true,
 	"concurrent_insert":                       true,
 	"connect_timeout":                         true,
@@ -2532,6 +2612,19 @@ var sysVarEnumValues = map[string]map[string]string{
 		"IGNORE_ERROR": "IGNORE_ERROR",
 		"ABORT_SERVER": "ABORT_SERVER",
 	},
+	"slave_parallel_type": {
+		"DATABASE":      "DATABASE",
+		"LOGICAL_CLOCK": "LOGICAL_CLOCK",
+	},
+	"slave_rows_search_algorithms": {
+		"TABLE_SCAN": "TABLE_SCAN",
+		"INDEX_SCAN": "INDEX_SCAN",
+		"HASH_SCAN":  "HASH_SCAN",
+	},
+	"slave_type_conversions": {
+		"ALL_LOSSY":     "ALL_LOSSY",
+		"ALL_NON_LOSSY": "ALL_NON_LOSSY",
+	},
 	"innodb_stats_method": {
 		"0":             "nulls_equal",
 		"1":             "nulls_unequal",
@@ -2775,6 +2868,11 @@ var sysVarBothScope = map[string]bool{
 	"net_buffer_length":    true,
 }
 
+var sysVarPerfSchemaHidden = map[string]bool{
+	"slave_parallel_workers":      true,
+	"slave_pending_jobs_size_max": true,
+}
+
 // sysVarSessionReadOnly contains system variables that are read-only at SESSION scope.
 // SET SESSION var = val should return error 1238 with "SESSION variable 'var' is read-only. Use SET GLOBAL to assign the value".
 var sysVarSessionReadOnly = map[string]bool{
@@ -2987,7 +3085,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"binlog_stmt_cache_size":                     {Min: 4096, Max: 18446744073709547520, IsUnsigned: true, BlockSize: 4096},
 	"binlog_expire_logs_seconds":                 {Min: 0, Max: 4294967295, IsUnsigned: true},
 	"binlog_group_commit_sync_delay":             {Min: 0, Max: 1000000, IsUnsigned: true},
-	"binlog_group_commit_sync_no_delay_count":    {Min: 0, Max: 1000000, IsUnsigned: true},
+	"binlog_group_commit_sync_no_delay_count":    {Min: 0, Max: 100000, IsUnsigned: true},
 	"binlog_max_flush_queue_time":                {Min: 0, Max: 10000, IsUnsigned: true},
 	"binlog_transaction_dependency_history_size": {Min: 1, Max: 1000000, IsUnsigned: true},
 	"cte_max_recursion_depth":                    {Min: 0, Max: 4294967295, IsUnsigned: true},
@@ -3526,6 +3624,11 @@ func normalizeEnumSetValue(name string, expr sqlparser.Expr, evalVal interface{}
 						order := map[string]int{"NONE": 0, "FILE": 1, "TABLE": 2}
 						return order[normalized[i]] < order[normalized[j]]
 					})
+				} else if name == "slave_rows_search_algorithms" {
+					sort.Slice(normalized, func(i, j int) bool {
+						order := map[string]int{"TABLE_SCAN": 0, "INDEX_SCAN": 1, "HASH_SCAN": 2}
+						return order[normalized[i]] < order[normalized[j]]
+					})
 				}
 				return strings.Join(normalized, ","), true
 			}
@@ -3534,6 +3637,9 @@ func normalizeEnumSetValue(name string, expr sqlparser.Expr, evalVal interface{}
 	}
 	if lit, isLit := expr.(*sqlparser.Literal); isLit {
 		litStr := strings.TrimSpace(sqlparser.String(lit))
+		if name == "slave_type_conversions" && strings.Trim(litStr, "'\"") == "" {
+			return "", nil
+		}
 		// First try to normalize the value as an enum (handles quoted strings like 'RELEASE')
 		if v, ok := normalize(litStr); ok {
 			return v, nil
@@ -3571,6 +3677,9 @@ func normalizeEnumSetValue(name string, expr sqlparser.Expr, evalVal interface{}
 		}
 		return "", mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", name, boolStr))
 	default:
+		if name == "slave_type_conversions" && fmt.Sprintf("%v", v) == "" {
+			return "", nil
+		}
 		if mapped, ok := normalize(fmt.Sprintf("%v", v)); ok {
 			return mapped, nil
 		}
@@ -4268,7 +4377,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"myisam_mmap_size":                       "18446744073709551615",
 		"offline_mode":                           "OFF",
 		"parser_max_mem_size":                    "18446744073709551615",
-		"partial_revokes":                         "OFF",
+		"partial_revokes":                        "OFF",
 		"persisted_globals_load":                 "ON",
 		"print_identified_with_as_hex":           "OFF",
 		"pseudo_slave_mode":                      "OFF",
@@ -4530,6 +4639,13 @@ func (e *Executor) showVariables(upper string) (*Result, error) {
 
 	isGlobalShow := strings.Contains(upper, "GLOBAL")
 	vars := e.buildVariablesMapScoped(isGlobalShow)
+	if !isGlobalShow {
+		for name, val := range e.buildVariablesMapScoped(true) {
+			if sysVarGlobalOnly[name] && !sysVarBothScope[name] {
+				vars[name] = val
+			}
+		}
+	}
 
 	var rows [][]interface{}
 	for name, val := range vars {

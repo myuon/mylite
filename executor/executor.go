@@ -182,7 +182,7 @@ type TxnActiveSet struct {
 	mu      sync.RWMutex
 	active  map[int64]bool                    // connectionID -> true if in transaction
 	inserts map[int64]map[string]map[int]bool // connectionID -> "db:table" -> set of row pointers
-	meta    map[int64]*txnMeta               // connectionID -> transaction metadata
+	meta    map[int64]*txnMeta                // connectionID -> transaction metadata
 }
 
 // NewTxnActiveSet creates a new TxnActiveSet.
@@ -200,9 +200,9 @@ func (t *TxnActiveSet) Begin(connID int64, isolationLevel string, uniqueChecks, 
 	defer t.mu.Unlock()
 	t.active[connID] = true
 	t.meta[connID] = &txnMeta{
-		StartedAt:       time.Now(),
-		IsolationLevel:  isolationLevel,
-		UniqueChecks:    uniqueChecks,
+		StartedAt:        time.Now(),
+		IsolationLevel:   isolationLevel,
+		UniqueChecks:     uniqueChecks,
 		ForeignKeyChecks: foreignKeyChecks,
 	}
 }
@@ -212,8 +212,8 @@ func (t *TxnActiveSet) UpdateMeta(connID int64, isolationLevel string, uniqueChe
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if m, ok := t.meta[connID]; ok {
-		m.IsolationLevel  = isolationLevel
-		m.UniqueChecks    = uniqueChecks
+		m.IsolationLevel = isolationLevel
+		m.UniqueChecks = uniqueChecks
 		m.ForeignKeyChecks = foreignKeyChecks
 	}
 }
@@ -248,16 +248,16 @@ func (t *TxnActiveSet) SnapshotTxns() []TxnRow {
 		var row TxnRow
 		row.ConnID = connID
 		if m != nil {
-			row.StartedAt        = m.StartedAt
-			row.IsolationLevel   = m.IsolationLevel
-			row.UniqueChecks     = m.UniqueChecks
+			row.StartedAt = m.StartedAt
+			row.IsolationLevel = m.IsolationLevel
+			row.UniqueChecks = m.UniqueChecks
 			row.ForeignKeyChecks = m.ForeignKeyChecks
-			row.LastFKError      = m.LastFKError
-			row.RowsModified     = m.RowsModified
+			row.LastFKError = m.LastFKError
+			row.RowsModified = m.RowsModified
 		} else {
-			row.StartedAt        = time.Now()
-			row.IsolationLevel   = "REPEATABLE-READ"
-			row.UniqueChecks     = 1
+			row.StartedAt = time.Now()
+			row.IsolationLevel = "REPEATABLE-READ"
+			row.UniqueChecks = 1
 			row.ForeignKeyChecks = 1
 		}
 		rows = append(rows, row)
@@ -298,8 +298,8 @@ func (t *TxnActiveSet) TrackInsert(connID int64, dbTable string, rowPtr int) {
 
 // cteTable holds pre-computed rows for a Common Table Expression.
 type cteTable struct {
-	columns  []string
-	rows     []storage.Row
+	columns []string
+	rows    []storage.Row
 	// colEqPairs stores column equality pairs extracted from the CTE's WHERE clause
 	// (e.g., WHERE a=b → [["a","b"]]). Used for functional dependency analysis in
 	// GROUP BY validation of outer queries.
@@ -332,19 +332,19 @@ type savedPermTable struct {
 
 // Executor handles SQL execution.
 type Executor struct {
-	Catalog        *catalog.Catalog
-	Storage        *storage.Engine
-	CurrentDB      string
-	inTransaction  bool
-	savepoint      *txSavepoint
+	Catalog       *catalog.Catalog
+	Storage       *storage.Engine
+	CurrentDB     string
+	inTransaction bool
+	savepoint     *txSavepoint
 	// namedSavepoints tracks savepoint names set in the current transaction.
 	// DDL statements (implicit commit) clears this map, so ROLLBACK TO SAVEPOINT fails.
-	namedSavepoints map[string]bool
-	snapshots      map[string]*fullSnapshot
-	lastInsertID      int64
-	lastAffectedRows  int64 // stores ROW_COUNT() value: affected rows after DML, -1 after SELECT
-	lastUpdateInfo string // stores info message from last UPDATE (e.g. "Rows matched: 2  Changed: 1  Warnings: 0")
-	lastInsertInfo string // stores info message from last INSERT/REPLACE (e.g. "Records: 5  Duplicates: 2  Warnings: 0")
+	namedSavepoints  map[string]bool
+	snapshots        map[string]*fullSnapshot
+	lastInsertID     int64
+	lastAffectedRows int64  // stores ROW_COUNT() value: affected rows after DML, -1 after SELECT
+	lastUpdateInfo   string // stores info message from last UPDATE (e.g. "Rows matched: 2  Changed: 1  Warnings: 0")
+	lastInsertInfo   string // stores info message from last INSERT/REPLACE (e.g. "Records: 5  Duplicates: 2  Warnings: 0")
 	// modifyingTable tracks the table currently being modified by a DML statement,
 	// used to detect recursive table use in triggers (MySQL error 1442).
 	modifyingTable string
@@ -394,6 +394,10 @@ type Executor struct {
 	// globalVarsMu protects concurrent access to globalScopeVars.
 	// It is a pointer so it is shared across all Clone()d executors.
 	globalVarsMu *sync.RWMutex
+	// persistedVars stores SET PERSIST / SET PERSIST_ONLY values exposed through
+	// performance_schema.persisted_variables.
+	persistedVars   map[string]string
+	persistedVarsMu *sync.RWMutex
 	// sessionScopeVars stores SET SESSION/LOCAL variable overrides.
 	sessionScopeVars map[string]string
 	// startupVars stores variable values set at server startup (e.g., from master.opt).
@@ -589,11 +593,11 @@ type Executor struct {
 	// "Table is already up to date" otherwise.
 	tableNeedsOptimize map[string]bool
 	// Sort statistics: incremented when ORDER BY operations are performed.
-	sortRows            int64 // total rows sorted
+	sortRows             int64 // total rows sorted
 	createdTmpDiskTables int64 // temp tables written to disk
 	createdTmpTables     int64 // total internal temporary tables created
-	sortRange int64 // sort operations using range scan
-	sortScan  int64 // sort operations using full table scan
+	sortRange            int64 // sort operations using range scan
+	sortScan             int64 // sort operations using full table scan
 	// questions counts the number of client statements received, reset on FLUSH STATUS.
 	questions int64
 	// resourceGroups stores resource group names (lowercase-normalized for case+accent-insensitive comparison).
@@ -768,6 +772,58 @@ func (e *Executor) rangeGlobalVars(f func(name, val string)) {
 		f(k, v)
 	}
 	e.globalVarsMu.RUnlock()
+}
+
+func (e *Executor) setPersistedVar(name, value string) {
+	if e.persistedVars == nil {
+		e.persistedVars = make(map[string]string)
+	}
+	if e.persistedVarsMu == nil {
+		e.persistedVars[name] = value
+		return
+	}
+	e.persistedVarsMu.Lock()
+	e.persistedVars[name] = value
+	e.persistedVarsMu.Unlock()
+}
+
+func (e *Executor) deletePersistedVar(name string) {
+	if e.persistedVars == nil {
+		return
+	}
+	if e.persistedVarsMu == nil {
+		delete(e.persistedVars, name)
+		return
+	}
+	e.persistedVarsMu.Lock()
+	delete(e.persistedVars, name)
+	e.persistedVarsMu.Unlock()
+}
+
+func (e *Executor) persistedVariableRows() []storage.Row {
+	if e.persistedVars == nil {
+		return nil
+	}
+	if e.persistedVarsMu != nil {
+		e.persistedVarsMu.RLock()
+		defer e.persistedVarsMu.RUnlock()
+	}
+	names := make([]string, 0, len(e.persistedVars))
+	for name := range e.persistedVars {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	rows := make([]storage.Row, 0, len(names))
+	for _, name := range names {
+		val := e.persistedVars[name]
+		rows = append(rows, storage.Row{
+			"VARIABLE_NAME":  name,
+			"variable_name":  name,
+			"VARIABLE_VALUE": val,
+			"variable_value": val,
+		})
+	}
+	return rows
 }
 
 // getSysVar reads a system variable with proper scope resolution:
@@ -1105,6 +1161,8 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 			"log_bin_trust_function_creators": "ON",
 		},
 		globalVarsMu:     &sync.RWMutex{},
+		persistedVars:    make(map[string]string),
+		persistedVarsMu:  &sync.RWMutex{},
 		sessionScopeVars: make(map[string]string),
 		startupVars: map[string]string{
 			"innodb_commit_concurrency": "0",
@@ -1191,6 +1249,8 @@ func (e *Executor) Clone() *Executor {
 		tempTableSavedPermanent: make(map[string]*savedPermTable),
 		globalScopeVars:         e.globalScopeVars,
 		globalVarsMu:            e.globalVarsMu,
+		persistedVars:           e.persistedVars,
+		persistedVarsMu:         e.persistedVarsMu,
 		sessionScopeVars:        sessVars,
 		startupVars:             e.startupVars,
 		timeZone:                defaultTZ,
@@ -1264,6 +1324,54 @@ func (e *Executor) checkBackupAdminPrivilege() error {
 		}
 	}
 	return mysqlError(1227, "42000", "Access denied; you need (at least one of) the BACKUP_ADMIN privilege(s) for this operation")
+}
+
+func (e *Executor) hasBinlogEncryptionAdminPrivilege() bool {
+	user, host, roles := e.getCurrentUserAndRoles()
+	if user == "" || strings.EqualFold(user, "root") {
+		return true
+	}
+	if e.superUsersMu != nil {
+		e.superUsersMu.RLock()
+		isSuper := e.superUsers[strings.ToLower(user)]
+		e.superUsersMu.RUnlock()
+		if isSuper {
+			return true
+		}
+	}
+	if e.grantStore != nil {
+		return e.grantStore.HasGlobalPrivilege(user, host, "SUPER", roles) ||
+			e.grantStore.HasGlobalPrivilege(user, host, "BINLOG_ENCRYPTION_ADMIN", roles)
+	}
+	return false
+}
+
+func (e *Executor) hasSystemVariablesAdminPrivilege() bool {
+	user, host, roles := e.getCurrentUserAndRoles()
+	if user == "" || strings.EqualFold(user, "root") {
+		return true
+	}
+	if e.superUsersMu != nil {
+		e.superUsersMu.RLock()
+		isSuper := e.superUsers[strings.ToLower(user)]
+		e.superUsersMu.RUnlock()
+		if isSuper {
+			return true
+		}
+	}
+	if e.sysVarsAdminUsersMu != nil {
+		e.sysVarsAdminUsersMu.RLock()
+		hasPriv := e.sysVarsAdminUsers[strings.ToLower(user)]
+		e.sysVarsAdminUsersMu.RUnlock()
+		if hasPriv {
+			return true
+		}
+	}
+	if e.grantStore != nil {
+		return e.grantStore.HasGlobalPrivilege(user, host, "SUPER", roles) ||
+			e.grantStore.HasGlobalPrivilege(user, host, "SYSTEM_VARIABLES_ADMIN", roles)
+	}
+	return false
 }
 
 // SetStartupVar sets a variable as a startup default. This is used by the test
@@ -2447,6 +2555,17 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 					e.grantStore.RevokePrivGrant(fromUser, fromHost, privs, object)
 					e.syncRevokePrivFromStorage(fromUser, fromHost, privs, object)
 				}
+				upperPrivs := strings.ToUpper(privs)
+				if object == "*.*" && strings.Contains(upperPrivs, "SYSTEM_VARIABLES_ADMIN") && e.sysVarsAdminUsersMu != nil {
+					e.sysVarsAdminUsersMu.Lock()
+					delete(e.sysVarsAdminUsers, strings.ToLower(fromUser))
+					e.sysVarsAdminUsersMu.Unlock()
+				}
+				if object == "*.*" && strings.Contains(upperPrivs, "SUPER") && e.superUsersMu != nil {
+					e.superUsersMu.Lock()
+					delete(e.superUsers, strings.ToLower(fromUser))
+					e.superUsersMu.Unlock()
+				}
 			}
 		}
 		// FLUSH PRIVILEGES: reload grant store from mysql.db and mysql.tables_priv
@@ -2457,6 +2576,38 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		// CHECKSUM TABLE: requires SELECT privilege, returns 0 checksum for each table
 		if strings.HasPrefix(upper, "CHECKSUM TABLE ") || upper == "CHECKSUM TABLE" {
 			return e.execOtherAdmin(query)
+		}
+		if strings.HasPrefix(upper, "RESET PERSIST") {
+			rest := strings.TrimSpace(trimmed[len("RESET PERSIST"):])
+			rest = strings.TrimSuffix(rest, ";")
+			rest = strings.TrimSpace(strings.TrimPrefix(rest, "@@"))
+			rest = strings.TrimPrefix(strings.ToLower(rest), "global.")
+			if rest == "" {
+				if e.persistedVarsMu != nil {
+					e.persistedVarsMu.Lock()
+				}
+				e.persistedVars = make(map[string]string)
+				if e.persistedVarsMu != nil {
+					e.persistedVarsMu.Unlock()
+				}
+			} else {
+				e.deletePersistedVar(strings.ToLower(rest))
+			}
+			return &Result{}, nil
+		}
+		if strings.HasPrefix(upper, "XA START") {
+			e.userVars["__xa_active"] = true
+			return &Result{}, nil
+		}
+		if strings.HasPrefix(upper, "XA ROLLBACK") || strings.HasPrefix(upper, "XA COMMIT") {
+			delete(e.userVars, "__xa_active")
+			return &Result{}, nil
+		}
+		if strings.HasPrefix(upper, "ALTER INSTANCE ROTATE BINLOG MASTER KEY") {
+			if !e.hasBinlogEncryptionAdminPrivilege() {
+				return nil, mysqlError(1227, "42000", "Access denied; you need (at least one of) the SUPER or BINLOG_ENCRYPTION_ADMIN privilege(s) for this operation")
+			}
+			return &Result{}, nil
 		}
 		if strings.HasPrefix(upper, "CREATE EVENT") ||
 			strings.HasPrefix(upper, "DROP EVENT") ||
@@ -4796,6 +4947,7 @@ func isSingleByteCharset(charset string) bool {
 	}
 	return false
 }
+
 // extractColumnName extracts the column name from a sqlparser expression.
 // Returns empty string if the expression is not a simple column reference.
 func extractColumnName(expr sqlparser.Expr) string {
@@ -4863,6 +5015,7 @@ func (e *Executor) isColumnNotNullExpr(expr sqlparser.Expr) bool {
 	// Fall back to isColumnNotNull
 	return e.isColumnNotNull(colNameLower)
 }
+
 // execMyliteCommand handles MYLITE-specific control commands:
 //   - MYLITE CREATE SNAPSHOT <name>
 //   - MYLITE RESTORE SNAPSHOT <name>
@@ -6938,12 +7091,12 @@ func (e *Executor) insertUserIntoStorage(user, host string) {
 		"Show_view_priv": "N", "Create_routine_priv": "N", "Alter_routine_priv": "N",
 		"Create_user_priv": "N", "Event_priv": "N", "Trigger_priv": "N",
 		"Create_tablespace_priv": "N",
-		"ssl_type": "", "ssl_cipher": "", "x509_issuer": "", "x509_subject": "",
+		"ssl_type":               "", "ssl_cipher": "", "x509_issuer": "", "x509_subject": "",
 		"max_questions": int64(0), "max_updates": int64(0),
 		"max_connections": int64(0), "max_user_connections": int64(0),
 		"plugin": "caching_sha2_password", "authentication_string": "",
 		"password_expired": "N", "password_last_changed": time.Now().Format("2006-01-02 15:04:05"), "password_lifetime": nil,
-		"account_locked": "N",
+		"account_locked":   "N",
 		"Create_role_priv": "N", "Drop_role_priv": "N",
 		"Password_reuse_history": nil, "Password_reuse_time": nil,
 		"Password_require_current": nil, "User_attributes": nil,
