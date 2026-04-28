@@ -2153,6 +2153,7 @@ var sysVarGlobalOnly = map[string]bool{
 	"disabled_storage_engines":                 true,
 	"temptable_use_mmap":                       true,
 	"partial_revokes":                          true,
+	"innodb_default_row_format":                true,
 }
 
 // sysVarEnumSet contains system variables that are ENUM types where ON/OFF

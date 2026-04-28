@@ -65,8 +65,9 @@ type TableDef struct {
 	Comment          string
 	Charset          string // e.g. "latin1", "utf8mb4"; empty means default (utf8mb4)
 	Collation        string // e.g. "latin1_swedish_ci"; empty means default
-	Engine           string // e.g. "InnoDB", "MyISAM", "MEMORY"; empty means default (InnoDB)
-	RowFormat        string // e.g. "DYNAMIC", "COMPACT", "REDUNDANT", "COMPRESSED"
+	Engine              string // e.g. "InnoDB", "MyISAM", "MEMORY"; empty means default (InnoDB)
+	RowFormat           string // e.g. "DYNAMIC", "COMPACT", "REDUNDANT", "COMPRESSED"; only when explicitly set by user
+	EffectiveRowFormat  string // actual format used at table creation (from explicit or innodb_default_row_format)
 	KeyBlockSize     *int
 	PrimaryKeyOrders []string // per-PK-column order: "", "ASC", "DESC"
 	StatsPersistent  *int
