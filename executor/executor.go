@@ -5405,6 +5405,13 @@ func (d SysVarDouble) String() string {
 	return strconv.FormatFloat(d.Value, 'f', 6, 64)
 }
 
+// String formats ScaledValue as a fixed-point decimal string so that it can be
+// safely interpolated back into SQL text (e.g. when a procedure local variable
+// holds a ScaledValue and substituteLocalVars formats it via %v or %s).
+func (d ScaledValue) String() string {
+	return fmt.Sprintf("%.*f", d.Scale, d.Value)
+}
+
 func (d DivisionResult) String() string {
 	return fmt.Sprintf("%.*f", d.Precision, d.Value)
 }

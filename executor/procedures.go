@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
@@ -79,7 +80,7 @@ func (e *Executor) execCreateTrigger(query string) (*Result, error) {
 	}
 
 	// Validate trigger name length (MySQL identifier max = 64 chars)
-	if len(triggerName) > 64 {
+	if utf8.RuneCountInString(triggerName) > 64 {
 		return nil, mysqlError(1059, "42000", fmt.Sprintf("Identifier name '%s' is too long", triggerName))
 	}
 	timing := strings.ToUpper(parts[1]) // BEFORE or AFTER
@@ -875,6 +876,11 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 		db = targetDB
 	}
 
+	// MySQL enforces a 64-character limit on identifier names (error 1059).
+	if utf8.RuneCountInString(procName) > 64 {
+		return nil, mysqlError(1059, "42000", fmt.Sprintf("Identifier name '%s' is too long", procName))
+	}
+
 	// Extract params between first '(' and matching ')'
 	paramStart := parenIdx + 1
 	depth := 1
@@ -1273,11 +1279,46 @@ func validateRoutineBody(bodyStmts []string) error {
 				seenKind = 3
 			}
 		} else {
-			// Variable declaration: DECLARE name type [DEFAULT ...]
-			varName := strings.ToLower(words[0])
-			// Error 1331: duplicate variable
-			if declaredVars[varName] {
-				return mysqlError(1331, "42000", fmt.Sprintf("Duplicate variable: %s", varName))
+			// Variable declaration: DECLARE name[, name2, ...] type [DEFAULT ...]
+			// MySQL allows declaring multiple variables of the same type in one DECLARE:
+			//   DECLARE a, b, c INT;
+			// Extract all variable names: they are the comma-separated tokens before
+			// the first token that does not end with a comma or is a SQL type keyword.
+			var varNames []string
+			for _, w := range words {
+				// Strip trailing comma/semicolon from word to get the name
+				name := strings.TrimRight(w, ",;")
+				if name == "" {
+					break
+				}
+				// If the original token had a trailing comma, it's still a variable name
+				if strings.HasSuffix(w, ",") {
+					varNames = append(varNames, strings.ToLower(name))
+					continue
+				}
+				// No trailing comma: this is the last name (before the type keyword)
+				// Check if it looks like a variable name (not a SQL type keyword)
+				upperName := strings.ToUpper(name)
+				sqlTypes := map[string]bool{
+					"INT": true, "INTEGER": true, "TINYINT": true, "SMALLINT": true,
+					"MEDIUMINT": true, "BIGINT": true, "DECIMAL": true, "NUMERIC": true,
+					"FLOAT": true, "DOUBLE": true, "REAL": true, "BIT": true,
+					"BOOLEAN": true, "BOOL": true, "DATE": true, "DATETIME": true,
+					"TIMESTAMP": true, "TIME": true, "YEAR": true, "CHAR": true,
+					"VARCHAR": true, "BINARY": true, "VARBINARY": true, "BLOB": true,
+					"TEXT": true, "ENUM": true, "SET": true, "JSON": true,
+					"TINYBLOB": true, "MEDIUMBLOB": true, "LONGBLOB": true,
+					"TINYTEXT": true, "MEDIUMTEXT": true, "LONGTEXT": true,
+					"DEFAULT": true,
+				}
+				if !sqlTypes[upperName] {
+					varNames = append(varNames, strings.ToLower(name))
+				}
+				break
+			}
+			if len(varNames) == 0 {
+				// Fallback: just use first word stripped of comma
+				varNames = []string{strings.ToLower(strings.TrimRight(words[0], ",;"))}
 			}
 			// Error 1337: variable after cursor or handler
 			if seenKind >= 2 {
@@ -1286,7 +1327,13 @@ func validateRoutineBody(bodyStmts []string) error {
 			if seenKind < 1 {
 				seenKind = 1
 			}
-			declaredVars[varName] = true
+			for _, varName := range varNames {
+				// Error 1331: duplicate variable
+				if declaredVars[varName] {
+					return mysqlError(1331, "42000", fmt.Sprintf("Duplicate variable: %s", varName))
+				}
+				declaredVars[varName] = true
+			}
 		}
 	}
 
@@ -1624,6 +1671,11 @@ func (e *Executor) execDropProcedureFallback(query string) (*Result, error) {
 		name = strings.Trim(name[dotIdx+1:], "`")
 	}
 
+	// MySQL enforces a 64-character limit on identifier names (error 1059).
+	if utf8.RuneCountInString(name) > 64 {
+		return nil, mysqlError(1059, "42000", fmt.Sprintf("Identifier name '%s' is too long", name))
+	}
+
 	db, err := e.Catalog.GetDatabase(dbName)
 	if err != nil {
 		if ifExists {
@@ -1704,7 +1756,16 @@ func (e *Executor) execCallProcedure(query string) (*Result, error) {
 		parts := strings.SplitN(procName, ".", 2)
 		dbName := strings.Trim(parts[0], "`")
 		procName = strings.Trim(parts[1], "`")
+		// MySQL enforces a 64-character limit on identifier names (error 1059).
+		if utf8.RuneCountInString(procName) > 64 {
+			return nil, mysqlError(1059, "42000", fmt.Sprintf("Identifier name '%s' is too long", procName))
+		}
 		return e.callProcedureByNameInDB(dbName, procName, argStrs)
+	}
+
+	// MySQL enforces a 64-character limit on identifier names (error 1059).
+	if utf8.RuneCountInString(procName) > 64 {
+		return nil, mysqlError(1059, "42000", fmt.Sprintf("Identifier name '%s' is too long", procName))
 	}
 
 	return e.callProcedureByName(procName, argStrs)
@@ -1820,10 +1881,15 @@ func (e *Executor) callProcedureByNameInDB(dbName string, procName string, argSt
 	savedInsideStrictRoutineProc := e.insideStrictRoutine
 	e.insideStrictRoutine = procIsStrict
 
+	// MySQL stored procedures execute in the context of the database where they were defined,
+	// not the caller's current database. Save and restore CurrentDB around the body execution.
+	savedCurrentDB := e.CurrentDB
+	e.CurrentDB = dbName
 	// Enter stored routine — internal Execute calls should not count as client Questions.
 	e.routineDepth++
 	bodyResult, err := e.execRoutineBodyWithContext(proc.Body, ctx)
 	e.routineDepth--
+	e.CurrentDB = savedCurrentDB
 	e.insideStrictRoutine = savedInsideStrictRoutineProc
 	if err != nil {
 		// SIGNAL with SQLSTATE class '01' (warning) should produce a warning, not an error.
@@ -3477,6 +3543,19 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 			}
 			retVal, err := e.execCaseBlockCtx(caseBlock, ctx)
 			if err != nil {
+				// Check if a handler can catch this error
+				handled, exitFlag := e.tryHandler(err, ctx)
+				if handled {
+					if exitFlag {
+						if ctx.propagatedSignal != nil {
+							sig := ctx.propagatedSignal
+							ctx.propagatedSignal = nil
+							return nil, sig
+						}
+						return ctx.handlerResult, nil
+					}
+					continue
+				}
 				return nil, err
 			}
 			if retVal != nil {
@@ -3997,9 +4076,11 @@ func (e *Executor) tryHandler(err error, ctx *routineContext) (bool, bool) {
 					matched = true
 				} else if mysqlSQLState != "" && mysqlSQLState == cond {
 					matched = true
-				} else if !isSignal && mysqlSQLState == "" {
+				} else {
 					// Check if condition is a numeric error code
-					// e.g., cond = "1305" matches isMySQLError(err, 1305)
+					// e.g., "DECLARE CONTINUE HANDLER FOR 1318" matches ERROR 1318 (...):...
+					// This case applies even when mysqlSQLState is set, because numeric error
+					// codes and SQLSTATE codes are distinct condition specifiers in MySQL.
 					if code, parseErr := strconv.Atoi(cond); parseErr == nil {
 						if isMySQLError(err, code) {
 							matched = true

@@ -101,3 +101,74 @@ func TestProcedureInoutParam(t *testing.T) {
 		t.Errorf("expected 15, got %v (type %T)", val, val)
 	}
 }
+
+// TestProcHandlerDropRecreate reproduces the storedproc test scenario where:
+// 1. h1 has handler for 1318, calls sp1 with wrong args (caught), succeeds
+// 2. h1 is dropped and sp1 is dropped
+// 3. h1 is recreated with handler for 1305, calls sp1 which doesn't exist (caught)
+// 4. CALL h1 must succeed (not "h1 does not exist")
+func TestProcHandlerDropRecreate(t *testing.T) {
+	e := newProcTestExecutor(t)
+
+	// CREATE sp1 with 2 params
+	_, err := e.Execute("CREATE PROCEDURE sp1 (x int, y int) BEGIN set @y=x; END")
+	if err != nil {
+		t.Fatalf("CREATE sp1 failed: %v", err)
+	}
+
+	// CREATE h1 with handler for 1318 (wrong number of args)
+	body1 := `CREATE PROCEDURE h1 ()
+BEGIN
+    declare continue handler for 1318 set @x2 = 1;
+    set @x=0;
+  CALL sp1 (1);
+    set @x=1;
+    SELECT @x, @x2;
+END`
+	_, err = e.Execute(body1)
+	if err != nil {
+		t.Fatalf("CREATE h1 (1318 handler) failed: %v", err)
+	}
+
+	// CALL h1 - sp1(1) triggers error 1318, handler catches it with CONTINUE
+	_, err = e.Execute("CALL h1()")
+	if err != nil {
+		t.Fatalf("CALL h1 (1318 handler) failed: %v", err)
+	}
+
+	// cleanup
+	_, err = e.Execute("DROP PROCEDURE h1")
+	if err != nil {
+		t.Fatalf("DROP h1 failed: %v", err)
+	}
+	_, err = e.Execute("DROP PROCEDURE sp1")
+	if err != nil {
+		t.Fatalf("DROP sp1 failed: %v", err)
+	}
+
+	// Recreate h1 with handler for 1305 (procedure does not exist)
+	body2 := `CREATE PROCEDURE h1 ()
+BEGIN
+    declare continue handler for 1305 set @x2 = 1;
+    set @x=0;
+  CALL sp1 (1);
+    set @x=1;
+    SELECT @x, @x2;
+END`
+	_, err = e.Execute(body2)
+	if err != nil {
+		t.Fatalf("CREATE h1 (1305 handler) failed: %v", err)
+	}
+
+	// CALL h1 - sp1 doesn't exist → error 1305 → handler catches it with CONTINUE
+	_, err = e.Execute("CALL h1()")
+	if err != nil {
+		t.Fatalf("CALL h1 (1305 handler) failed: %v", err)
+	}
+
+	// cleanup
+	_, err = e.Execute("DROP PROCEDURE h1")
+	if err != nil {
+		t.Fatalf("DROP h1 (final) failed: %v", err)
+	}
+}
