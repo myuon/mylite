@@ -2493,6 +2493,57 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				seen[key] = true
 			}
 		}
+		// For RANGE partitions, validate that VALUES LESS THAN bounds are strictly increasing.
+		if po.Type == sqlparser.RangeType && len(def.PartitionDefs) > 1 {
+			prevBound := int64(-1 << 62) // sentinel: less than any real value
+			prevIsMaxvalue := false
+			for _, pd := range def.PartitionDefs {
+				vr := strings.TrimSpace(pd.ValueRange)
+				if strings.EqualFold(vr, "LESS THAN MAXVALUE") {
+					if prevIsMaxvalue {
+						return nil, mysqlError(1493, "HY000", "VALUES LESS THAN value must be strictly increasing for each partition")
+					}
+					prevIsMaxvalue = true
+				} else if strings.HasPrefix(strings.ToUpper(vr), "LESS THAN (") {
+					if prevIsMaxvalue {
+						return nil, mysqlError(1493, "HY000", "VALUES LESS THAN value must be strictly increasing for each partition")
+					}
+					inner := strings.TrimSpace(vr[len("LESS THAN (") : len(vr)-1])
+					bound, parseErr := strconv.ParseInt(inner, 10, 64)
+					if parseErr != nil {
+						if f, fErr := strconv.ParseFloat(inner, 64); fErr == nil {
+							bound = int64(f)
+						}
+						// If we can't parse, skip validation for this partition
+					} else if bound <= prevBound {
+						return nil, mysqlError(1493, "HY000", "VALUES LESS THAN value must be strictly increasing for each partition")
+					}
+					if parseErr == nil {
+						prevBound = bound
+					}
+				}
+			}
+		}
+		// For LIST partitions, validate that no constant value appears in more than one partition.
+		if po.Type == sqlparser.ListType && len(def.PartitionDefs) > 0 {
+			seenListVals := make(map[string]bool)
+			for _, pd := range def.PartitionDefs {
+				vr := strings.TrimSpace(pd.ValueRange)
+				if !strings.HasPrefix(strings.ToUpper(vr), "IN (") {
+					continue
+				}
+				inner := vr[len("IN (") : len(vr)-1]
+				values := splitListValues(inner)
+				for _, v := range values {
+					v = strings.TrimSpace(v)
+					key := strings.ToLower(v)
+					if seenListVals[key] {
+						return nil, mysqlError(1495, "HY000", "Multiple definition of same constant in list partitioning")
+					}
+					seenListVals[key] = true
+				}
+			}
+		}
 		// For KEY partitions, check for duplicate column names in the partition key.
 		if po.Type == sqlparser.KeyType && len(po.ColList) > 0 {
 			seenCols := make(map[string]bool, len(po.ColList))
