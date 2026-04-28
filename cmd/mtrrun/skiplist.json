@@ -2689,14 +2689,6 @@
       "reason": "timeout in mtrrun"
     },
     {
-      "test": "other/concurrent_innodb_safelog",
-      "reason": "timeout in mtrrun"
-    },
-    {
-      "test": "other/concurrent_innodb_unsafelog",
-      "reason": "timeout in mtrrun"
-    },
-    {
       "test": "other/dirty_close",
       "reason": "timeout in mtrrun"
     },
@@ -2753,10 +2745,6 @@
       "reason": "timeout in mtrrun"
     },
     {
-      "test": "other/innodb_mysql_lock",
-      "reason": "timeout in mtrrun"
-    },
-    {
       "test": "other/innodb_pk_extension_off",
       "reason": "timeout in mtrrun"
     },
@@ -2786,10 +2774,6 @@
     },
     {
       "test": "other/join_nested_bka_nixbnl",
-      "reason": "timeout in mtrrun"
-    },
-    {
-      "test": "other/lock_multi",
       "reason": "timeout in mtrrun"
     },
     {
@@ -3427,10 +3411,6 @@
     {
       "test": "innodb/innodb-alter-nullable",
       "reason": "failures"
-    },
-    {
-      "test": "innodb/iodku",
-      "reason": "timeout"
     },
     {
       "test": "other/func_weight_string",
@@ -4591,6 +4571,26 @@
     {
       "test": "innodb/partition_autoinc",
       "reason": "WIP: first-diff-line improved from 54 to 192, but DROP PARTITION data deletion not yet implemented"
+    },
+    {
+      "test": "other/innodb_mysql_lock",
+      "reason": "multi-connection lock contention with innodb_trx LOCK WAIT"
+    },
+    {
+      "test": "other/lock_multi",
+      "reason": "MyISAM table lock / multi-connection test"
+    },
+    {
+      "test": "innodb/iodku",
+      "reason": "ODKU multi-connection lock contention with innodb_trx"
+    },
+    {
+      "test": "other/concurrent_innodb_safelog",
+      "reason": "multi-connection InnoDB concurrent UPDATE"
+    },
+    {
+      "test": "other/concurrent_innodb_unsafelog",
+      "reason": "multi-connection InnoDB concurrent UPDATE"
     }
   ]
 }
