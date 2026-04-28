@@ -3137,10 +3137,6 @@
       "reason": "fails"
     },
     {
-      "test": "sys_vars/all_vars",
-      "reason": "LOAD DATA not fully supported"
-    },
-    {
       "test": "sys_vars/autocommit_func2",
       "reason": "still failing"
     },

@@ -1249,6 +1249,10 @@ func (e *Executor) populatePerfSchemaTable(tbl *storage.Table, tableName string)
 		// Sort by name for deterministic output
 		names := make([]string, 0, len(vars))
 		for name := range vars {
+			// Exclude session-only variables from global_variables
+			if sysVarSessionOnly[name] {
+				continue
+			}
 			names = append(names, name)
 		}
 		sort.Strings(names)

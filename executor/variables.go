@@ -1282,9 +1282,14 @@ func (e *Executor) handleRawSet(raw string) error {
 					val = mapped
 				}
 			}
-			// Store directly in both globalScopeVars and startupVars.
-			e.setGlobalVar(varName, val)
+			// Store in startupVars regardless (for getSysVarSession fallback).
+			// Only propagate to globalScopeVars if this is a known system variable
+			// (i.e., has a compiled default). Unknown startup options like --loose-skip-ndbinfo
+			// should not pollute the SHOW VARIABLES / performance_schema output.
 			e.startupVars[varName] = val
+			if _, isKnownVar := e.getCompiledDefault(varName); isKnownVar {
+				e.setGlobalVar(varName, val)
+			}
 			// When character_set_server is set and collation_server was not explicitly
 			// set in startup options, update collation_server to the default collation
 			// for that charset (MySQL behavior).
@@ -2794,6 +2799,8 @@ var sysVarSessionOnly = map[string]bool{
 	"immediate_server_version":   true,
 	"timestamp":                  true,
 	"rbr_exec_mode":              true,
+	"resultset_metadata":         true, // session-only in MySQL 8.0
+	"use_secondary_engine":       true, // session-only in MySQL 8.0
 }
 
 // sysVarBothScope contains system variables that exist at both SESSION and GLOBAL scope.
@@ -4120,6 +4127,14 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"ft_query_expansion_limit": "20",
 		"ft_stopword_file":         "(built-in)",
 
+		// MySQL 8.0 variables added for completeness
+		"activate_all_roles_on_login":   "OFF",
+		"group_replication_consistency": "EVENTUAL",
+		"keyring_operations":            "ON",
+		"mandatory_roles":               "",
+		"resultset_metadata":            "FULL",
+		"sql_require_primary_key":       "OFF",
+
 		// Misc variables
 		"big_tables":                        "OFF",
 		"block_encryption_mode":             "aes-128-ecb",
@@ -4423,6 +4438,12 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 			name == "performance_schema_instrument" {
 			continue
 		}
+		// Only apply startup vars that are known system variables (already in the
+		// compiled defaults map). Unknown startup options like --loose-skip-ndbinfo
+		// should not appear in SHOW VARIABLES / performance_schema.global_variables.
+		if _, isKnown := vars[name]; !isKnown {
+			continue
+		}
 		// Apply minimum/maximum constraints for known variables
 		if name == "innodb_stats_transient_sample_pages" || name == "innodb_stats_persistent_sample_pages" {
 			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n < 1 {
@@ -4473,6 +4494,11 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		// performance_schema_consumer_* are startup-only, not system variables
 		if strings.HasPrefix(name, "performance_schema_consumer_") ||
 			name == "performance_schema_instrument" {
+			continue
+		}
+		// Skip variables not in the compiled defaults (e.g. unknown startup options
+		// like skip_ndbinfo that should not appear in SHOW VARIABLES output).
+		if _, isKnown := vars[name]; !isKnown {
 			continue
 		}
 		if !globalOnly && !sysVarGlobalOnly[name] && !sysVarBothScope[name] {

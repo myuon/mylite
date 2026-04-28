@@ -241,6 +241,7 @@ func (r *Runner) RunFile(testPath string) TestResult {
 				"$MYSQL_DUMP":         mysqldumpCmd,
 				"$MYSQL":              mysqlCmd,
 				"$MYSQLADMIN":         mysqladminCmd,
+				"$MYSQLTEST_FILE":     testPath,
 			}
 		}(),
 	}
