@@ -4281,8 +4281,21 @@ func (e *Executor) perfSchemaSetupThreads() []storage.Row {
 
 	rows := make([]storage.Row, 0, len(threads))
 	for _, t := range threads {
+		enabled := "YES"
+		history := "YES"
+		// Apply any in-memory overrides from UPDATE statements
+		if e.psSetupThreadsOverride != nil {
+			if overrides, ok := e.psSetupThreadsOverride[strings.ToLower(t.name)]; ok {
+				if v, ok2 := overrides["enabled"]; ok2 {
+					enabled = v
+				}
+				if v, ok2 := overrides["history"]; ok2 {
+					history = v
+				}
+			}
+		}
 		rows = append(rows, storage.Row{
-			"NAME": t.name, "ENABLED": "YES", "HISTORY": "YES",
+			"NAME": t.name, "ENABLED": enabled, "HISTORY": history,
 			"PROPERTIES": t.properties, "VOLATILITY": int64(0), "DOCUMENTATION": nil,
 		})
 	}
@@ -4903,7 +4916,73 @@ func (e *Executor) execPerfSchemaUpdate(stmt *sqlparser.Update, tableName string
 		return &Result{AffectedRows: affected}, nil
 	}
 
-	// For setup_instruments, setup_threads - silently succeed
+	// For setup_instruments: persist column overrides in-memory
+	if tableName == "setup_instruments" {
+		if e.psSetupInstrumentsOverride == nil {
+			e.psSetupInstrumentsOverride = make(map[string]map[string]string)
+		}
+		// Apply to all instruments (no WHERE support needed for these tests;
+		// use wildcard key "" to represent "all rows updated").
+		// If WHERE is present, apply per-row; otherwise apply globally.
+		currentRows := e.perfSchemaSetupInstruments()
+		affected := uint64(0)
+		for _, row := range currentRows {
+			name := strings.ToLower(fmt.Sprintf("%v", row["NAME"]))
+			match := true
+			if stmt.Where != nil {
+				m, err := e.evalWhere(stmt.Where.Expr, row)
+				if err != nil {
+					return nil, err
+				}
+				match = m
+			}
+			if match {
+				if e.psSetupInstrumentsOverride[name] == nil {
+					e.psSetupInstrumentsOverride[name] = make(map[string]string)
+				}
+				for _, expr := range stmt.Exprs {
+					colName := strings.ToLower(expr.Name.Name.String())
+					val, _ := e.evalExpr(expr.Expr)
+					e.psSetupInstrumentsOverride[name][colName] = strings.ToUpper(fmt.Sprintf("%v", val))
+				}
+				affected++
+			}
+		}
+		return &Result{AffectedRows: affected}, nil
+	}
+
+	// For setup_threads: persist column overrides in-memory
+	if tableName == "setup_threads" {
+		if e.psSetupThreadsOverride == nil {
+			e.psSetupThreadsOverride = make(map[string]map[string]string)
+		}
+		currentRows := e.perfSchemaSetupThreads()
+		affected := uint64(0)
+		for _, row := range currentRows {
+			name := strings.ToLower(fmt.Sprintf("%v", row["NAME"]))
+			match := true
+			if stmt.Where != nil {
+				m, err := e.evalWhere(stmt.Where.Expr, row)
+				if err != nil {
+					return nil, err
+				}
+				match = m
+			}
+			if match {
+				if e.psSetupThreadsOverride[name] == nil {
+					e.psSetupThreadsOverride[name] = make(map[string]string)
+				}
+				for _, expr := range stmt.Exprs {
+					colName := strings.ToLower(expr.Name.Name.String())
+					val, _ := e.evalExpr(expr.Expr)
+					e.psSetupThreadsOverride[name][colName] = strings.ToUpper(fmt.Sprintf("%v", val))
+				}
+				affected++
+			}
+		}
+		return &Result{AffectedRows: affected}, nil
+	}
+
 	return &Result{AffectedRows: 0}, nil
 }
 
@@ -5094,6 +5173,17 @@ func (e *Executor) perfSchemaSetupInstruments() []storage.Row {
 		enabled, timed := inst.enabled, inst.timed
 		if patterns != "" {
 			enabled, timed = applyPsInstrumentPatterns(patterns, inst.name, enabled, timed)
+		}
+		// Apply any in-memory overrides from UPDATE statements
+		if e.psSetupInstrumentsOverride != nil {
+			if overrides, ok := e.psSetupInstrumentsOverride[strings.ToLower(inst.name)]; ok {
+				if v, ok2 := overrides["enabled"]; ok2 {
+					enabled = v
+				}
+				if v, ok2 := overrides["timed"]; ok2 {
+					timed = v
+				}
+			}
 		}
 		rows = append(rows, storage.Row{
 			"NAME": inst.name, "ENABLED": enabled, "TIMED": timed,
