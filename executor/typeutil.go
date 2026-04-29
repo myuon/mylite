@@ -551,7 +551,73 @@ func isTruthy(v interface{}) bool {
 	case AvgResult:
 		return val.Value != 0
 	case string:
-		return val != "" && val != "0"
+		if val == "" || val == "0" {
+			return false
+		}
+		// DATETIME/DATE/TIME values are stored as strings in mylite.
+		// In MySQL, when a typed temporal value is used in a boolean context,
+		// it is coerced to its numeric representation (e.g.,
+		// '2002-04-10 14:25:30' -> 20020410142530, '0000-00-00 00:00:00' -> 0).
+		// Detect the temporal string format and treat zero values as falsy.
+		if isTemporalLikeString(val) {
+			return toDateTimeStringAsFloat(val) != 0
+		}
+		return true
+	}
+	return false
+}
+
+// isTemporalLikeString reports whether s looks like a DATE, DATETIME or TIME literal.
+// Used by isTruthy to detect when string values that originate from temporal
+// columns should be coerced to their numeric form for boolean evaluation.
+func isTemporalLikeString(s string) bool {
+	// TIME format: [-]HH:MM:SS[.frac]
+	if strings.Count(s, ":") == 2 {
+		// strip optional leading '-' and optional fractional part
+		t := s
+		if strings.HasPrefix(t, "-") {
+			t = t[1:]
+		}
+		if dot := strings.IndexByte(t, '.'); dot >= 0 {
+			t = t[:dot]
+		}
+		parts := strings.Split(t, ":")
+		if len(parts) == 3 && len(parts[0]) > 0 && len(parts[1]) > 0 && len(parts[2]) > 0 {
+			if _, err := strconv.Atoi(parts[0]); err == nil {
+				if _, err := strconv.Atoi(parts[1]); err == nil {
+					if _, err := strconv.Atoi(parts[2]); err == nil {
+						return true
+					}
+				}
+			}
+		}
+	}
+	// DATE: YYYY-MM-DD ; DATETIME: YYYY-MM-DD HH:MM:SS[.frac]
+	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
+		if _, err := strconv.Atoi(s[0:4]); err != nil {
+			return false
+		}
+		if _, err := strconv.Atoi(s[5:7]); err != nil {
+			return false
+		}
+		if _, err := strconv.Atoi(s[8:10]); err != nil {
+			return false
+		}
+		if len(s) == 10 {
+			return true
+		}
+		if len(s) >= 19 && s[10] == ' ' && s[13] == ':' && s[16] == ':' {
+			if _, err := strconv.Atoi(s[11:13]); err != nil {
+				return false
+			}
+			if _, err := strconv.Atoi(s[14:16]); err != nil {
+				return false
+			}
+			if _, err := strconv.Atoi(s[17:19]); err != nil {
+				return false
+			}
+			return true
+		}
 	}
 	return false
 }

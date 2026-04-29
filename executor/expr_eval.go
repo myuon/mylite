@@ -7780,7 +7780,19 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 	case DivisionResult:
 		return x.Value != 0, nil
 	case string:
-		return strings.TrimSpace(x) != "" && x != "0", nil
+		s := strings.TrimSpace(x)
+		if s == "" || s == "0" {
+			return false, nil
+		}
+		// DATETIME/DATE/TIME values are stored as strings in mylite.
+		// In MySQL, when a typed temporal value is used in a boolean context
+		// (e.g. JOIN ... ON it2.datetime_key, WHERE date_col), it is coerced
+		// to its numeric representation: '2002-04-10 14:25:30' -> 20020410142530,
+		// '0000-00-00 00:00:00' -> 0 (falsy).
+		if isTemporalLikeString(s) {
+			return toDateTimeStringAsFloat(s) != 0, nil
+		}
+		return true, nil
 	default:
 		return toInt64(val) != 0, nil
 	}
