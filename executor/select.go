@@ -188,6 +188,47 @@ func extractJoinUsingCols(expr sqlparser.TableExpr) []string {
 	return nil
 }
 
+// extractNaturalJoinCols collects columns common to both sides of any
+// NATURAL JOIN in the given table expression. NATURAL JOIN merges these
+// columns just like JOIN ... USING(...), so star expansion should output
+// them only once.
+func (e *Executor) extractNaturalJoinCols(expr sqlparser.TableExpr) []string {
+	jt, ok := expr.(*sqlparser.JoinTableExpr)
+	if !ok {
+		return nil
+	}
+	var cols []string
+	// Recurse first so nested NATURAL JOINs are picked up.
+	cols = append(cols, e.extractNaturalJoinCols(jt.LeftExpr)...)
+	cols = append(cols, e.extractNaturalJoinCols(jt.RightExpr)...)
+	if jt.Join == sqlparser.NaturalJoinType || jt.Join == sqlparser.NaturalLeftJoinType {
+		leftDefs, _ := e.collectTableDefsWithAliases(jt.LeftExpr)
+		rightDefs, _ := e.collectTableDefsWithAliases(jt.RightExpr)
+		rightSet := make(map[string]bool)
+		for _, td := range rightDefs {
+			if td == nil {
+				continue
+			}
+			for _, c := range td.Columns {
+				rightSet[strings.ToLower(c.Name)] = true
+			}
+		}
+		seen := make(map[string]bool)
+		for _, td := range leftDefs {
+			if td == nil {
+				continue
+			}
+			for _, c := range td.Columns {
+				if rightSet[strings.ToLower(c.Name)] && !seen[strings.ToLower(c.Name)] {
+					cols = append(cols, c.Name)
+					seen[strings.ToLower(c.Name)] = true
+				}
+			}
+		}
+	}
+	return cols
+}
+
 func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error) {
 	switch te := expr.(type) {
 	case *sqlparser.AliasedTableExpr:
@@ -380,10 +421,11 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 				e.userVars["__active_roles"] = savedActiveRoles
 				e.currentQuery = savedCurrentQuery
 				if err != nil {
-					// For INVOKER and DEFINER views, wrap privilege errors into MySQL error 1356
-					// "View references invalid table(s) or column(s) or definer/invoker lacks rights"
-					// Only wrap privilege denial (1142) errors, not table-not-found or other errors.
-					if isMySQLError(err, 1142) || isMySQLError(err, 1356) {
+					// For INVOKER and DEFINER views, wrap privilege errors and missing-table/column
+					// errors into MySQL error 1356 "View references invalid table(s) or column(s) or
+					// definer/invoker lacks rights". This matches MySQL's behavior when a view's
+					// underlying objects are no longer reachable.
+					if isMySQLError(err, 1142) || isMySQLError(err, 1356) || isMySQLError(err, 1146) || isMySQLError(err, 1054) {
 						return nil, mysqlError(1356, "HY000", fmt.Sprintf("View '%s.%s' references invalid table(s) or column(s) or function(s) or definer/invoker of view lack rights to use them", lookupDB, lookupTable))
 					}
 					return nil, err
@@ -2549,7 +2591,15 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// isExplicitLock is true for SELECT ... FOR UPDATE / FOR SHARE / LOCK IN SHARE MODE.
 	// In autocommit mode, explicit locks are released at statement end (MySQL auto-commit behavior).
 	isExplicitLock := stmt.Lock == sqlparser.ForUpdateLock || stmt.Lock == sqlparser.ShareModeLock || stmt.Lock == sqlparser.ForShareLock
-	if needsRowLock && e.rowLockManager != nil && len(allRows) > 0 {
+	// MySQL acquires gap locks for explicit FOR UPDATE / FOR SHARE in REPEATABLE READ
+	// even when the WHERE clause filters out all rows. We don't implement gap locks
+	// in general, but when another connection asks for NOWAIT / SKIP LOCKED we still
+	// need to surface the conflict. As a narrow approximation, when the result set is
+	// empty and the user explicitly asked for FOR UPDATE / FOR SHARE inside an active
+	// transaction, lock the entire scanned range so a subsequent NOWAIT statement
+	// from another connection observes the conflict and fails immediately.
+	emptyResultGapLock := len(allRows) == 0 && isExplicitLock && e.inTransaction && len(preWhereRows) > 0
+	if needsRowLock && e.rowLockManager != nil && (len(allRows) > 0 || emptyResultGapLock) {
 		filteredRows, err := e.acquireRowLocksForSelect(stmt, allRows, preWhereRows)
 		if err != nil {
 			return nil, err
@@ -2804,10 +2854,12 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	}
 
 	// Extract USING columns from JOIN for proper star expansion
-	// In MySQL, JOIN ... USING(col) merges the col and shows it only once in SELECT *
+	// In MySQL, JOIN ... USING(col) merges the col and shows it only once in SELECT *.
+	// NATURAL JOIN behaves the same way for columns common to both sides.
 	var joinUsingCols []string
 	if len(stmt.From) > 0 {
 		joinUsingCols = extractJoinUsingCols(stmt.From[0])
+		joinUsingCols = append(joinUsingCols, e.extractNaturalJoinCols(stmt.From[0])...)
 	}
 	// For column name resolution in SELECT *, use preWhereRows when allRows is empty
 	// and no tableDefs are available (e.g. derived tables like FROM (SELECT ...) AS d1).
@@ -6301,7 +6353,12 @@ func (e *Executor) execUnion(stmt *sqlparser.Union) (*Result, error) {
 	}
 
 	// Execute left side directly from AST so nested UNION semantics stay intact.
+	// Temporarily override currentQuery with just the left side's SQL so that
+	// column name extraction (extractRawSelectExprs) doesn't see the UNION clause.
+	savedCurrentQueryForUnion := e.currentQuery
+	e.currentQuery = sqlparser.String(stmt.Left)
 	leftResult, err := e.execTableStmtForUnion(stmt.Left)
+	e.currentQuery = savedCurrentQueryForUnion
 	if err != nil {
 		return nil, err
 	}
