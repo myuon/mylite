@@ -306,3 +306,75 @@ func collectSelectTypes(rows [][]interface{}) []string {
 	}
 	return types
 }
+
+// TestExplainSemijoinMaterialization_Deterministic verifies that the planner
+// produces a stable EXPLAIN strategy choice for non-correlated IN subqueries
+// nested inside a DEPENDENT SUBQUERY.
+//
+// Regression: previously the rule "IN subquery inside DEPENDENT SUBQUERY context
+// → DEPENDENT SUBQUERY" was applied unconditionally, which produced an output
+// missing the MATERIALIZED inner-subquery row when firstmatch=off and
+// materialization=on. See GitHub issue #261.
+func TestExplainSemijoinMaterialization_Deterministic(t *testing.T) {
+	cases := []struct {
+		name     string
+		switches string
+		// expected select_type strings (in id order)
+		want []string
+	}{
+		{
+			name:     "firstmatch_off_materialization_on",
+			switches: "firstmatch=off,materialization=on,subquery_materialization_cost_based=off",
+			want:     []string{"PRIMARY", "DEPENDENT SUBQUERY", "DEPENDENT SUBQUERY", "MATERIALIZED"},
+		},
+		{
+			name:     "firstmatch_on_materialization_on",
+			switches: "firstmatch=on,materialization=on,subquery_materialization_cost_based=off",
+			want:     []string{"PRIMARY", "DEPENDENT SUBQUERY", "DEPENDENT SUBQUERY"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newTestExecutor(t)
+			if _, err := e.Execute("CREATE TABLE t_sjmat(a INT)"); err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			if _, err := e.Execute("INSERT INTO t_sjmat VALUES (0),(1)"); err != nil {
+				t.Fatalf("insert: %v", err)
+			}
+			if _, err := e.Execute("SET optimizer_switch='" + tc.switches + "'"); err != nil {
+				t.Fatalf("set: %v", err)
+			}
+			query := "EXPLAIN SELECT (SELECT MAX(y.a) FROM t_sjmat y WHERE a IN (SELECT a FROM t_sjmat z) AND a < x.a) AS s FROM t_sjmat x"
+			// Run multiple times to detect non-determinism / AST-walk side effects.
+			var prev []string
+			for i := 0; i < 5; i++ {
+				res, err := e.Execute(query)
+				if err != nil {
+					t.Fatalf("explain (run %d): %v", i, err)
+				}
+				got := collectSelectTypes(res.Rows)
+				if i == 0 {
+					prev = got
+				} else if !equalStringSlice(prev, got) {
+					t.Fatalf("flaky EXPLAIN output: run0=%v run%d=%v", prev, i, got)
+				}
+				if !equalStringSlice(got, tc.want) {
+					t.Fatalf("run %d: expected select_type %v, got %v", i, tc.want, got)
+				}
+			}
+		})
+	}
+}
+
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
