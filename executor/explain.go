@@ -289,13 +289,15 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 														if len(idx.Columns) > 0 && strings.EqualFold(idx.Columns[0], outerJoinColForRef) {
 															// Change range → ref with <subquery>.col as ref
 															// Change range to ref with <subquery>.col as ref.
-															// Also clear "Using index condition" if present: when the ref is
-															// via a materialized subquery, range conditions are applied at the
-															// <subqueryN> placeholder level, not as ICP on this table.
+															// Also clear "Using index condition" / "Using where" if present:
+															// when the ref is via a materialized subquery, range conditions
+															// are applied at the <subqueryN> placeholder level, not as ICP
+															// or attached_condition on this table.
 															simpleRows[i].accessType = "ref"
 															simpleRows[i].ref = subqueryRef + "." + outerJoinColForRef
 															if simpleRows[i].extra != nil {
-																if extraStr := fmt.Sprintf("%v", simpleRows[i].extra); extraStr == "Using index condition" {
+																extraStr := fmt.Sprintf("%v", simpleRows[i].extra)
+																if extraStr == "Using index condition" || extraStr == "Using where" {
 																	simpleRows[i].extra = nil
 																}
 															}
@@ -2056,13 +2058,26 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 				}
 			}
 			if extra == nil && !refViaSubquery && (accessInfo.accessType == "ref" || accessInfo.accessType == "range") {
-				if sel.Where != nil {
+				if sel.Where != nil && e.isOptimizerSwitchEnabled("index_condition_pushdown") {
 					wcs := explainExtractWhereConditions(sel.Where.Expr, tblName)
 					for _, wc := range wcs {
 						if wc.isNull || wc.isRange {
 							extra = "Using index condition"
 							break
 						}
+					}
+				}
+			}
+
+			// When ICP is off, range access on indexed column with a WHERE filter
+			// should produce "Using where" instead of "Using index condition".
+			if extra == nil && !refViaSubquery && accessInfo.accessType == "range" &&
+				sel.Where != nil && !e.isOptimizerSwitchEnabled("index_condition_pushdown") {
+				wcs := explainExtractWhereConditions(sel.Where.Expr, tblName)
+				for _, wc := range wcs {
+					if wc.isNull || wc.isRange {
+						extra = "Using where"
+						break
 					}
 				}
 			}
@@ -3062,8 +3077,11 @@ func hasNonINRangeConditionOnCol(expr sqlparser.Expr, colName string) bool {
 // inSubqueryTypesCompatibleForMat returns true if the outer join column type
 // and inner select column type are compatible for materialization (same type class).
 // When types are incompatible (e.g., INT vs DATE), MySQL falls back to DuplicateWeedout.
-// Also returns false when BLOB/TEXT columns are involved, since materialization requires
-// indexing the temp table and BLOBs/TEXTs cannot be indexed.
+//
+// BLOB/TEXT columns: MySQL materializes BLOB/TEXT IN-subqueries (via a hash-based
+// <auto_key> on the temp table) when firstmatch is OFF. When firstmatch is ON,
+// MySQL prefers the inline FirstMatch strategy for BLOB/TEXT columns. So we
+// exclude BLOB/TEXT here only when firstmatch is enabled.
 func (e *Executor) inSubqueryTypesCompatibleForMat(outerSel *sqlparser.Select, inner *sqlparser.Select, subNode *sqlparser.Subquery) bool {
 	if e.Storage == nil || e.Catalog == nil {
 		return true // assume compatible if we can't check
@@ -3112,8 +3130,13 @@ func (e *Executor) inSubqueryTypesCompatibleForMat(outerSel *sqlparser.Select, i
 		}, outerSel.Where.Expr)
 	}
 
-	// For tuple IN, check if any tuple column is BLOB/TEXT → not materializable
+	// For tuple IN: BLOB/TEXT columns are materializable in MySQL when firstmatch is off.
+	// When firstmatch is on, MySQL prefers inline FirstMatch for BLOB/TEXT columns.
 	if len(outerColNames) > 0 {
+		if !e.isOptimizerSwitchEnabled("firstmatch") {
+			return true
+		}
+		// firstmatch=on: exclude tuple IN where any column is BLOB/TEXT.
 		db, err := e.Catalog.GetDatabase(e.CurrentDB)
 		if err != nil {
 			return true
@@ -3133,14 +3156,14 @@ func (e *Executor) inSubqueryTypesCompatibleForMat(outerSel *sqlparser.Select, i
 					for _, outerCol := range outerColNames {
 						if strings.EqualFold(col.Name, outerCol) {
 							if matTypeClass(col.Type) == "blob" {
-								return false // BLOB/TEXT cannot be materialized
+								return false
 							}
 						}
 					}
 				}
 			}
 		}
-		return true // tuple columns are not BLOBs → compatible
+		return true
 	}
 
 	if outerColName == "" {
@@ -3222,11 +3245,12 @@ func (e *Executor) inSubqueryTypesCompatibleForMat(outerSel *sqlparser.Select, i
 		return true // can't determine type, assume compatible
 	}
 
-	// Check if type classes are the same
+	// Check if type classes are the same.
+	// BLOB/TEXT columns: materializable when firstmatch is off; otherwise MySQL
+	// prefers FirstMatch over materialization for BLOB/TEXT IN-subqueries.
 	outerClass := matTypeClass(outerColType)
 	innerClass := matTypeClass(innerColType)
-	// BLOB/TEXT columns cannot be indexed → materialization is not possible
-	if outerClass == "blob" || innerClass == "blob" {
+	if (outerClass == "blob" || innerClass == "blob") && e.isOptimizerSwitchEnabled("firstmatch") {
 		return false
 	}
 	return outerClass == innerClass || outerClass == "other" || innerClass == "other"
