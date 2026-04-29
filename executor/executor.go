@@ -3144,6 +3144,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 		return &Result{}, nil
 	case *sqlparser.DropView:
+		// DROP VIEW is not allowed when LOCK TABLES is active (ER_LOCK_OR_ACTIVE_TRANSACTION).
+		if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
+			return nil, mysqlError(1192, "HY000", "Can't execute the given command because you have active locked tables or an active transaction")
+		}
 		// Remove view definitions
 		for _, name := range s.FromTables {
 			viewName := name.Name.String()
@@ -3176,6 +3180,31 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 		return e.execRenameTable(s)
 	case *sqlparser.Flush:
+		// FLUSH TABLES WITH READ LOCK: always fails when LOCK TABLES is active (ER_LOCK_OR_ACTIVE_TRANSACTION)
+		if s.WithLock && e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
+			return nil, mysqlError(1192, "HY000", "Can't execute the given command because you have active locked tables or an active transaction")
+		}
+		// FLUSH TABLES (no specific table names) when LOCK TABLES is active:
+		// all locked tables must have WRITE lock; READ-locked tables produce 1099.
+		if !s.WithLock && len(s.TableNames) == 0 && e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
+			locks := e.tableLockManager.GetLocks(e.connectionID)
+			for _, mode := range locks {
+				if mode == "READ" {
+					// Find the table name for the error message
+					for lockedKey, m := range locks {
+						if m == "READ" {
+							parts := strings.SplitN(lockedKey, ".", 2)
+							tblName := lockedKey
+							if len(parts) == 2 {
+								tblName = parts[1]
+							}
+							return nil, mysqlError(1099, "HY000", fmt.Sprintf("Table '%s' was locked with a READ lock and can't be updated", tblName))
+						}
+					}
+					break
+				}
+			}
+		}
 		// FLUSH TABLES WITH READ LOCK: acquire global read lock
 		if s.WithLock && e.globalReadLock != nil {
 			// Implicitly commit any active transaction first (MySQL behavior)
@@ -3211,6 +3240,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		// FLUSH PRIVILEGES: reload grant store from mysql.db and mysql.tables_priv
 		for _, opt := range s.FlushOptions {
 			if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(opt)), "PRIVILEGES") {
+				// When LOCK TABLES is active, FLUSH PRIVILEGES fails because mysql.user is not locked.
+				if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
+					return nil, mysqlError(1100, "HY000", "Table 'user' was not locked with LOCK TABLES")
+				}
 				if e.grantStore != nil {
 					e.reloadGrantStoreFromStorage()
 				}
@@ -4034,6 +4067,15 @@ func (e *Executor) checkTableLockRestrictions(stmt sqlparser.Statement) error {
 			targetKey := targetDB + "." + targetName
 			introducedByChain[targetKey] = true
 		}
+	case *sqlparser.Select:
+		// When LOCK TABLES is active, every table referenced in FROM must be:
+		// (a) explicitly locked, (b) a temp table, (c) an IS/PS table, or
+		// (d) a base table of an explicitly locked view (implicit prelocking).
+		for _, te := range s.From {
+			if err := e.checkTableExprLocked(te); err != nil {
+				return err
+			}
+		}
 	case *sqlparser.CreateTable:
 		// CREATE TABLE when LOCK TABLES is active: the new table must be locked
 		tableName := s.Table.Name.String()
@@ -4084,6 +4126,72 @@ func (e *Executor) checkTableLockRestrictions(stmt sqlparser.Statement) error {
 				if !e.isTableImplicitlyLockedViaView(dbName, tableName) {
 					return mysqlError(1100, "HY000", fmt.Sprintf("Table '%s' was not locked with LOCK TABLES", tableName))
 				}
+			}
+		}
+	}
+	return nil
+}
+
+// checkTableExprLocked checks if a single TableExpr is accessible under LOCK TABLES.
+// Subqueries (derived tables) and JoinTableExpr are recursively checked.
+// Returns a MySQL error if the table is not accessible.
+func (e *Executor) checkTableExprLocked(te sqlparser.TableExpr) error {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		switch inner := t.Expr.(type) {
+		case sqlparser.TableName:
+			tableName := inner.Name.String()
+			dbName := e.CurrentDB
+			if !inner.Qualifier.IsEmpty() {
+				dbName = inner.Qualifier.String()
+			}
+			// "dual" is a synthetic table inserted by the parser for SELECTs without
+			// a real FROM clause (e.g. SELECT @@var). It does not require a lock.
+			if strings.EqualFold(tableName, "dual") {
+				return nil
+			}
+			// Temp tables are always accessible under LOCK TABLES.
+			if e.tempTables != nil && (e.tempTables[tableName] || e.tempTables[strings.ToLower(tableName)]) {
+				return nil
+			}
+			// information_schema, performance_schema, and mysql metadata are always accessible.
+			if strings.EqualFold(dbName, "information_schema") || strings.EqualFold(dbName, "performance_schema") || strings.EqualFold(dbName, "mysql") || strings.EqualFold(dbName, "sys") {
+				return nil
+			}
+			// Check explicit lock (use alias name if present, else table name).
+			checkName := tableName
+			if !t.As.IsEmpty() {
+				checkName = t.As.String()
+			}
+			key := dbName + "." + checkName
+			locked, _ := e.tableLockManager.IsLocked(e.connectionID, key)
+			if locked {
+				return nil
+			}
+			// Also check by base table name (when alias was used for locking but table itself is referenced).
+			keyBase := dbName + "." + tableName
+			lockedBase, _ := e.tableLockManager.IsLocked(e.connectionID, keyBase)
+			if lockedBase {
+				return nil
+			}
+			// Check if the table is a base table of a locked view (implicit prelocking).
+			if e.isTableImplicitlyLockedViaView(dbName, tableName) {
+				return nil
+			}
+			return mysqlError(1100, "HY000", fmt.Sprintf("Table '%s' was not locked with LOCK TABLES", tableName))
+		case *sqlparser.DerivedTable:
+			// Derived tables (subqueries in FROM) don't require an explicit lock.
+			return nil
+		}
+	case *sqlparser.JoinTableExpr:
+		if err := e.checkTableExprLocked(t.LeftExpr); err != nil {
+			return err
+		}
+		return e.checkTableExprLocked(t.RightExpr)
+	case *sqlparser.ParenTableExpr:
+		for _, inner := range t.Exprs {
+			if err := e.checkTableExprLocked(inner); err != nil {
+				return err
 			}
 		}
 	}
@@ -4141,52 +4249,62 @@ func (e *Executor) isTableImplicitlyLockedViaView(dbName, tableName string) bool
 		lockedName := parts[1]
 
 		// Case 1: Locked entity is a view that directly or indirectly references target table.
+		// Look up the view SQL from local map first, then from the shared viewStore.
+		viewSQLForLocked := ""
 		if e.views != nil {
 			for vname, vsql := range e.views {
-				if !strings.EqualFold(vname, lockedName) {
-					continue
+				if strings.EqualFold(vname, lockedName) {
+					viewSQLForLocked = vsql
+					break
 				}
-				// Direct check: parse view SQL for table references
-				parsed, err := e.parser().Parse(vsql)
-				if err == nil {
-					found := false
-					_ = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
-						if tn, ok := node.(sqlparser.TableName); ok {
-							if strings.EqualFold(tn.Name.String(), target) {
-								found = true
-								return false, nil
-							}
+			}
+		}
+		if viewSQLForLocked == "" && e.viewStore != nil {
+			if sql, found := e.viewStore.Lookup(lockedDB, lockedName); found {
+				viewSQLForLocked = sql
+			}
+		}
+		if viewSQLForLocked != "" {
+			vsql := viewSQLForLocked
+			// Direct check: parse view SQL for table references
+			parsed, err := e.parser().Parse(vsql)
+			if err == nil {
+				found := false
+				_ = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
+					if tn, ok := node.(sqlparser.TableName); ok {
+						if strings.EqualFold(tn.Name.String(), target) {
+							found = true
+							return false, nil
 						}
-						return true, nil
-					}, parsed)
-					if found {
-						return true
 					}
-					// Indirect check: view calls a function that references target table.
-					// Collect function names from view SQL and check their bodies.
-					_ = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
-						if fc, ok := node.(*sqlparser.FuncExpr); ok {
-							fnName := fc.Name.Lowered()
-							db2, dbErr := e.Catalog.GetDatabase(lockedDB)
-							if dbErr != nil {
-								db2, _ = e.Catalog.GetDatabase(e.CurrentDB)
-							}
-							if db2 != nil {
-								if fn := db2.GetFunction(fnName); fn != nil {
-									if sqlContainsTable(fn.Body) {
-										found = true
-										return false, nil
-									}
+					return true, nil
+				}, parsed)
+				if found {
+					return true
+				}
+				// Indirect check: view calls a function that references target table.
+				// Collect function names from view SQL and check their bodies.
+				_ = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
+					if fc, ok := node.(*sqlparser.FuncExpr); ok {
+						fnName := fc.Name.Lowered()
+						db2, dbErr := e.Catalog.GetDatabase(lockedDB)
+						if dbErr != nil {
+							db2, _ = e.Catalog.GetDatabase(e.CurrentDB)
+						}
+						if db2 != nil {
+							if fn := db2.GetFunction(fnName); fn != nil {
+								if sqlContainsTable(fn.Body) {
+									found = true
+									return false, nil
 								}
 							}
 						}
-						return true, nil
-					}, parsed)
-					if found {
-						return true
 					}
+					return true, nil
+				}, parsed)
+				if found {
+					return true
 				}
-				break
 			}
 		}
 
