@@ -4776,11 +4776,19 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 				} else if (correlated || innerHasNoSemijoin) && !existsCanDecorrelate && !inCanDecorrelate {
 					selectType = "DEPENDENT SUBQUERY"
 				} else if inContext || existsCanDecorrelate {
-					if inContext && outerSelectTypeOuter == "DEPENDENT SUBQUERY" && e.isSemijoinEnabled() {
-						// IN subquery inside a DEPENDENT SUBQUERY context: MySQL uses FirstMatch
-						// within the dependent context (the inner table is transitively dependent).
-						// Don't use MATERIALIZED here — produce a DEPENDENT SUBQUERY row merged
-						// at the outer id level instead of a new MATERIALIZED subquery.
+					// IN subquery inside a DEPENDENT SUBQUERY context: MySQL's strategy choice
+					// depends on optimizer_switch:
+					//   - firstmatch=on  → FirstMatch within the dependent context, so the inner
+					//                      table is shown as DEPENDENT SUBQUERY merged at the
+					//                      outer (dependent) id (no MATERIALIZED row).
+					//   - firstmatch=off → MySQL materializes the non-correlated inner subquery
+					//                      once and accesses it via a <subqueryN> placeholder
+					//                      from the dependent parent — falls through to the
+					//                      general MATERIALIZED branch below.
+					// The correlated case is already handled by the
+					// (correlated || innerHasNoSemijoin) branch above.
+					if inContext && outerSelectTypeOuter == "DEPENDENT SUBQUERY" && e.isSemijoinEnabled() &&
+						e.isOptimizerSwitchEnabled("firstmatch") {
 						selectType = "DEPENDENT SUBQUERY"
 					} else if e.isSemijoinEnabled() && outerCanSemijoin {
 						bigTables := false
