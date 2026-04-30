@@ -580,7 +580,11 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 			})
 			return result, nil
 		}
-		rawAll := tbl.Scan()
+		// Default to a full scan; if the optimizer registered an
+		// IndexAccessSpec for this table alias, route the read through
+		// the new index-based path. Falls back to Scan() automatically
+		// when the spec describes a full scan or the index is unknown.
+		rawAll := e.scanTableForFrom(tbl, alias, lookupTable)
 		// MySQL's InnoDB stores mysql.engine_cost in clustered PK order (cost_name, engine_name, device_type).
 		// Sort here to match MySQL's natural row ordering when no ORDER BY is specified.
 		// MySQL uses latin1_swedish_ci collation for these columns, which is case-insensitive.

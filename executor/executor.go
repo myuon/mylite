@@ -659,6 +659,18 @@ type Executor struct {
 	// "Row N was cut by GROUP_CONCAT()" where N is the position of the value that triggered
 	// the truncation. Reset at the start of each SELECT execution.
 	groupConcatRowCount int
+	// indexAccessSpecs holds per-table storage.IndexAccessSpec entries for the
+	// current top-level SELECT, keyed by lowercase table alias / table name.
+	// When buildFromExpr scans a regular base table whose alias appears here,
+	// it routes the read through Table.ScanByIndex instead of Table.Scan().
+	//
+	// Phase 5 (issue #263) scaffolding: the map is only populated when
+	// useIndexAccessSpecs is true. The map is reset between top-level queries.
+	indexAccessSpecs map[string]storage.IndexAccessSpec
+	// useIndexAccessSpecs gates the new index-based execution path. Default
+	// false (legacy full scan + filter). Tests / EXPLAIN integration can
+	// flip this on per-query.
+	useIndexAccessSpecs bool
 }
 
 // Warning represents a MySQL warning.
