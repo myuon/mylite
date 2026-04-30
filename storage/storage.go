@@ -264,6 +264,42 @@ func (t *Table) Lock()                     { t.Mu.Lock() }
 func (t *Table) Unlock()                   { t.Mu.Unlock() }
 func (t *Table) AutoIncrementValue() int64 { return t.AutoIncrement.Load() }
 
+// MaxAutoIncColValue returns the maximum integer value currently stored in
+// the AUTO_INCREMENT column of the table (0 if no AI column or no rows).
+// This is used to clamp ALTER TABLE ... AUTO_INCREMENT = N requests so they
+// never go below the existing maximum row value.
+func (t *Table) MaxAutoIncColValue() int64 {
+	t.Mu.RLock()
+	defer t.Mu.RUnlock()
+	var aiCol string
+	for _, c := range t.Def.Columns {
+		if c.AutoIncrement {
+			aiCol = c.Name
+			break
+		}
+	}
+	if aiCol == "" {
+		return 0
+	}
+	var maxVal int64
+	for _, row := range t.Rows {
+		v := rowGetCI(row, aiCol)
+		if v == nil {
+			continue
+		}
+		if uv, ok := v.(uint64); ok {
+			if uv <= math.MaxInt64 && int64(uv) > maxVal {
+				maxVal = int64(uv)
+			}
+			continue
+		}
+		if iv, ok := toInt64(v); ok && iv > maxVal {
+			maxVal = iv
+		}
+	}
+	return maxVal
+}
+
 // IsHeap reports whether this table uses the HEAP or MEMORY storage engine.
 func (t *Table) IsHeap() bool {
 	if t.Def == nil {

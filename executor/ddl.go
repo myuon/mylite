@@ -2708,7 +2708,13 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		if strings.ToUpper(opt.Name) == "AUTO_INCREMENT" {
 			if val, err := strconv.ParseInt(opt.Value.Val, 10, 64); err == nil {
 				if tbl, err := e.Storage.GetTable(dbName, tableName); err == nil {
-					tbl.AutoIncrement.Store(val - 1) // Store val-1 because next insert increments first
+					// Clamp to existing max(AI col) + 1 so SHOW CREATE never
+					// reports a value lower than already-stored rows.
+					newAI := val - 1
+					if existing := tbl.MaxAutoIncColValue(); existing > newAI {
+						newAI = existing
+					}
+					tbl.AutoIncrement.Store(newAI)
 					tbl.AIExplicitlySet = true
 				}
 			}
@@ -4946,7 +4952,14 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					}
 				case "AUTO_INCREMENT":
 					if val, err := strconv.ParseInt(to.Value.Val, 10, 64); err == nil {
-						tbl.AutoIncrement.Store(val - 1)
+						// MySQL clamps ALTER TABLE ... AUTO_INCREMENT = N so it can
+						// never be reduced below the existing max(AI column) + 1.
+						// We store val-1 because next insert increments first.
+						newAI := val - 1
+						if existing := tbl.MaxAutoIncColValue(); existing > newAI {
+							newAI = existing
+						}
+						tbl.AutoIncrement.Store(newAI)
 						tbl.AIExplicitlySet = true
 					}
 				case "COMMENT":

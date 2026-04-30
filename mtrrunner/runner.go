@@ -5862,7 +5862,44 @@ func normalizeExpected(s string) string {
 	// Strip /*!50100 PARTITION BY ... */ blocks from SHOW CREATE TABLE output
 	// since mylite does not support partitions.
 	out = stripExpectedPartitionComment(out)
+	// Strip /*!50100 TABLESPACE `innodb_system` */ markers from MySQL 8.x
+	// SHOW CREATE TABLE output. mylite does not model the system tablespace
+	// vs file-per-table distinction, so we treat these annotations as noise.
+	out = stripExpectedTablespaceComment(out)
 	return strings.TrimRight(out, "\n")
+}
+
+// stripExpectedTablespaceComment removes /*!50100 TABLESPACE `xxx` */ comment
+// blocks from expected output. MySQL 8.0 emits these in SHOW CREATE TABLE for
+// tables stored in shared tablespaces (e.g. innodb_system). mylite does not
+// model the file-per-table vs system-tablespace distinction, so the marker is
+// stripped from expected output before comparison.
+func stripExpectedTablespaceComment(s string) string {
+	for {
+		idx := strings.Index(s, "/*!50100 TABLESPACE")
+		if idx == -1 {
+			break
+		}
+		end := strings.Index(s[idx:], "*/")
+		if end == -1 {
+			s = s[:idx]
+			break
+		}
+		endAbs := idx + end + 2
+		// Strip a single leading space (the marker normally appears as " /*!50100 TABLESPACE ... */"
+		// between ")" and "ENGINE=").
+		start := idx
+		if start > 0 && s[start-1] == ' ' {
+			start--
+		}
+		// And drop a trailing space before the next token (typically " ENGINE=").
+		for endAbs < len(s) && s[endAbs] == ' ' {
+			endAbs++
+		}
+		// Reinsert a single space so the line stays well-formed.
+		s = s[:start] + " " + s[endAbs:]
+	}
+	return s
 }
 
 // stripExpectedPartitionComment removes /*!50100 PARTITION BY ... */ comment
