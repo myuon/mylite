@@ -42,6 +42,8 @@ type ColumnDef struct {
 	Collation               string // column-level collation override; empty means inherit table default
 	CharsetExplicit         bool   // true when charset was explicitly specified by user (not inferred from collation or table default)
 	SRIDConstraint          *uint32 // SRID constraint for spatial columns; nil means no constraint
+	IsInstantAdded          bool    // true when this column was added by ALTER TABLE ... ADD COLUMN with INSTANT semantics
+	InstantDefault          string  // hex-encoded InnoDB row-format representation of the default for instant-added columns
 }
 
 // IndexDef represents an index definition.
@@ -87,6 +89,7 @@ type TableDef struct {
 	PartitionCount        int                 // PARTITIONS N (0 = unset/implicit)
 	PartitionSubpartition *PartitionSubpart   // subpartition definition (nil if none)
 	PartitionDefs         []PartitionDef      // individual PARTITION definitions
+	InstantCols           int                 // number of columns at the time the first INSTANT ADD COLUMN was applied (0 = no instant cols)
 }
 
 // PartitionSubpart holds the SUBPARTITION BY clause details.

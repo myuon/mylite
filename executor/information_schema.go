@@ -87,10 +87,10 @@ var infoSchemaColumnOrder = map[string][]string{
 	"statistics":               {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "NON_UNIQUE", "INDEX_SCHEMA", "INDEX_NAME", "SEQ_IN_INDEX", "COLUMN_NAME", "COLLATION", "CARDINALITY", "SUB_PART", "PACKED", "NULLABLE", "INDEX_TYPE", "COMMENT", "INDEX_COMMENT", "IS_VISIBLE", "EXPRESSION"},
 	"column_statistics":        {"SCHEMA_NAME", "TABLE_NAME", "COLUMN_NAME", "HISTOGRAM"},
 	"engines":                  {"ENGINE", "SUPPORT", "COMMENT", "TRANSACTIONS", "XA", "SAVEPOINTS"},
-	"innodb_tables":            {"TABLE_ID", "NAME", "SPACE", "FLAG", "N_COLS", "ROW_FORMAT", "ZIP_PAGE_SIZE", "SPACE_TYPE"},
+	"innodb_tables":            {"TABLE_ID", "NAME", "FLAG", "N_COLS", "SPACE", "ROW_FORMAT", "ZIP_PAGE_SIZE", "SPACE_TYPE", "INSTANT_COLS"},
 	"innodb_tablespaces":       {"SPACE", "NAME", "ROW_FORMAT", "PAGE_SIZE", "ZIP_PAGE_SIZE", "SPACE_TYPE"},
 	"innodb_datafiles":         {"SPACE", "PATH"},
-	"innodb_columns":           {"TABLE_ID", "NAME", "POS", "MTYPE", "PRTYPE", "LEN"},
+	"innodb_columns":           {"TABLE_ID", "NAME", "POS", "MTYPE", "PRTYPE", "LEN", "HAS_DEFAULT", "DEFAULT_VALUE"},
 	"innodb_virtual":           {"TABLE_ID", "POS", "BASE_POS"},
 	"innodb_foreign":           {"ID", "FOR_NAME", "REF_NAME", "N_COLS", "TYPE"},
 	"innodb_metrics":           {"NAME", "COUNT", "TYPE", "STATUS", "SUBSYSTEM", "COMMENT"},
@@ -546,7 +546,6 @@ var emptyStubTables = map[string]bool{
 // singleRowStubTables maps table names to their single stub row definition.
 // These are InnoDB metadata tables that return one row of zero/empty values.
 var singleRowStubTables = map[string]storage.Row{
-	"innodb_columns":        {"TABLE_ID": int64(0), "NAME": "", "POS": int64(0), "MTYPE": int64(0), "PRTYPE": int64(0), "LEN": int64(0)},
 	"innodb_virtual":        {"TABLE_ID": int64(0), "POS": int64(0), "BASE_POS": int64(0)},
 	"innodb_buffer_page_lru": {"POOL_ID": int64(0), "LRU_POSITION": int64(0), "SPACE": int64(0), "PAGE_NUMBER": int64(0)},
 	"innodb_buffer_pool_stats": {"POOL_ID": int64(0), "POOL_SIZE": int64(0)},
@@ -776,6 +775,8 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.infoSchemaInnoDBMetrics()
 	case "innodb_indexes":
 		rawRows = e.infoSchemaInnoDBIndexes()
+	case "innodb_columns":
+		rawRows = e.infoSchemaInnoDBColumns()
 	case "innodb_cached_indexes":
 		rawRows = e.infoSchemaInnoDBCachedIndexes()
 	case "innodb_foreign":
@@ -1284,6 +1285,7 @@ func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 				"ROW_FORMAT":    "Dynamic",
 				"ZIP_PAGE_SIZE": int64(0),
 				"SPACE_TYPE":    "Single",
+				"INSTANT_COLS":  int64(0),
 			})
 			tableID++
 			space++
@@ -1312,6 +1314,10 @@ func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 			// For partitioned tables, emit one entry per partition (MySQL behavior).
 			// Partition names follow the pattern: db/table#p#partname
 			// Subpartition names: db/table#p#partname#sp#subpartname
+			instantCols := int64(0)
+			if def != nil {
+				instantCols = int64(def.InstantCols)
+			}
 			if def != nil && def.PartitionType != "" {
 				partNames := innodbPartitionNames(def)
 				for _, partName := range partNames {
@@ -1324,6 +1330,7 @@ func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 						"ROW_FORMAT":    rowFmt,
 						"ZIP_PAGE_SIZE": zipPageSize,
 						"SPACE_TYPE":    "Single",
+						"INSTANT_COLS":  instantCols,
 					})
 					tableID++
 					space++
@@ -1338,6 +1345,7 @@ func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 					"ROW_FORMAT":    rowFmt,
 					"ZIP_PAGE_SIZE": zipPageSize,
 					"SPACE_TYPE":    "Single",
+					"INSTANT_COLS":  instantCols,
 				})
 				tableID++
 				space++
@@ -1345,7 +1353,7 @@ func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 		}
 	}
 	if len(rows) == 0 {
-		return []storage.Row{{"TABLE_ID": int64(0), "NAME": "", "SPACE": int64(0), "FLAG": int64(33), "N_COLS": int64(0), "ROW_FORMAT": "Dynamic", "ZIP_PAGE_SIZE": int64(0), "SPACE_TYPE": "Single"}}
+		return []storage.Row{{"TABLE_ID": int64(0), "NAME": "", "SPACE": int64(0), "FLAG": int64(33), "N_COLS": int64(0), "ROW_FORMAT": "Dynamic", "ZIP_PAGE_SIZE": int64(0), "SPACE_TYPE": "Single", "INSTANT_COLS": int64(0)}}
 	}
 	return rows
 }
@@ -1446,6 +1454,219 @@ func (e *Executor) infoSchemaInnoDBIndexes() []storage.Row {
 			tableID++
 			space++
 		}
+	}
+	return rows
+}
+
+// innodbColumnMTYPE maps a MySQL column type to the InnoDB internal mtype enum.
+// See dict0types.h: DATA_VARCHAR=1, DATA_CHAR=2, DATA_FIXBINARY=3, DATA_BINARY=4,
+// DATA_INT=6, DATA_FLOAT=10, DATA_DOUBLE=11, DATA_DECIMAL=12, DATA_VARMYSQL=13, DATA_MYSQL=14, DATA_GEOMETRY=15.
+func innodbColumnMTYPE(colType string) int64 {
+	t := strings.ToLower(strings.TrimSpace(colType))
+	// strip type length/precision suffix
+	if i := strings.Index(t, "("); i > 0 {
+		t = t[:i]
+	}
+	t = strings.TrimSpace(t)
+	switch t {
+	case "tinyint", "smallint", "mediumint", "int", "integer", "bigint", "year", "bool", "boolean", "bit":
+		return 6
+	case "float":
+		return 10
+	case "double", "real":
+		return 11
+	case "decimal", "numeric":
+		return 12
+	case "char":
+		return 2
+	case "varchar":
+		return 13
+	case "text", "tinytext", "mediumtext", "longtext":
+		return 13
+	case "binary":
+		return 3
+	case "varbinary":
+		return 4
+	case "blob", "tinyblob", "mediumblob", "longblob":
+		return 4
+	case "date", "time", "datetime", "timestamp":
+		return 6
+	case "json":
+		return 13
+	case "geometry", "point", "linestring", "polygon", "multipoint", "multilinestring", "multipolygon", "geometrycollection":
+		return 15
+	case "enum", "set":
+		return 6
+	}
+	return 6
+}
+
+// innodbColumnPRTYPE encodes the InnoDB precise-type bit-field for a column.
+// Layout (low to high): 8 bits MySQL type, 1 bit NOT NULL, 1 bit UNSIGNED, charset/collation in upper bits.
+// We follow MySQL's convention: NOT NULL = bit 8 (0x100), UNSIGNED = bit 9 (0x200) for integer types.
+func innodbColumnPRTYPE(col catalogPkg.ColumnDef) int64 {
+	t := strings.ToLower(strings.TrimSpace(col.Type))
+	upper := strings.ToUpper(t)
+	prtype := int64(0)
+	if !col.Nullable {
+		prtype |= 0x100
+	}
+	if strings.Contains(upper, "UNSIGNED") {
+		prtype |= 0x200
+	}
+	return prtype
+}
+
+// innodbColumnLEN returns the byte-length InnoDB stores for a column type.
+func innodbColumnLEN(colType string) int64 {
+	t := strings.ToLower(strings.TrimSpace(colType))
+	base := t
+	if i := strings.Index(base, "("); i > 0 {
+		base = strings.TrimSpace(base[:i])
+	}
+	switch base {
+	case "tinyint", "bool", "boolean":
+		return 1
+	case "smallint":
+		return 2
+	case "mediumint":
+		return 3
+	case "int", "integer", "year", "float":
+		return 4
+	case "bigint", "double", "real":
+		return 8
+	case "date":
+		return 3
+	case "time":
+		return 3
+	case "datetime", "timestamp":
+		return 5
+	}
+	// Try to extract (N) for char/varchar/binary/varbinary/bit
+	if i := strings.Index(t, "("); i > 0 {
+		var n int
+		if _, err := fmt.Sscanf(t[i:], "(%d)", &n); err == nil {
+			switch base {
+			case "char", "binary":
+				return int64(n)
+			case "varchar", "varbinary":
+				return int64(n)
+			case "bit":
+				return int64((n + 7) / 8)
+			case "decimal", "numeric":
+				// decimal(M,D) packed length depends on M and D; approximate
+				return int64((n / 9) * 4)
+			}
+		}
+	}
+	return 0
+}
+
+// innodbInstantDefaultHex returns the hex-encoded InnoDB row representation of
+// the column's DEFAULT value, used for INSTANT-added columns. Returns "" when
+// the column is not INSTANT-added or has no default that needs encoding.
+func innodbInstantDefaultHex(col catalogPkg.ColumnDef) string {
+	if !col.IsInstantAdded {
+		return ""
+	}
+	if col.InstantDefault != "" {
+		return col.InstantDefault
+	}
+	return ""
+}
+
+// infoSchemaInnoDBColumns returns rows for information_schema.INNODB_COLUMNS.
+// Columns: TABLE_ID, NAME, POS, MTYPE, PRTYPE, LEN, HAS_DEFAULT, DEFAULT_VALUE.
+func (e *Executor) infoSchemaInnoDBColumns() []storage.Row {
+	rows := make([]storage.Row, 0)
+	dbNames := e.Catalog.ListDatabases()
+	sort.Strings(dbNames)
+	tableID := int64(1)
+	for _, dbName := range dbNames {
+		switch strings.ToLower(dbName) {
+		case "information_schema", "mysql", "performance_schema":
+			continue
+		case "sys":
+			// Emit the columns of sys.sys_config (variable, value, set_time, set_by).
+			sysCols := []struct {
+				name    string
+				mtype   int64
+				prtype  int64
+				lenByte int64
+			}{
+				{"variable", 13, 0x100, 128},
+				{"value", 13, 0, 128},
+				{"set_time", 6, 0x100, 5},
+				{"set_by", 13, 0, 128},
+			}
+			for i, c := range sysCols {
+				rows = append(rows, storage.Row{
+					"TABLE_ID":      tableID,
+					"NAME":          c.name,
+					"POS":           int64(i),
+					"MTYPE":         c.mtype,
+					"PRTYPE":        c.prtype,
+					"LEN":           c.lenByte,
+					"HAS_DEFAULT":   int64(0),
+					"DEFAULT_VALUE": nil,
+				})
+			}
+			tableID++
+			continue
+		}
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		tableNames := db.ListTables()
+		sort.Strings(tableNames)
+		for _, tblName := range tableNames {
+			def, err := db.GetTable(tblName)
+			if err != nil || def == nil {
+				tableID++
+				continue
+			}
+			// Determine partition fan-out (one TABLE_ID per partition entry, mirroring innodb_tables).
+			partCount := 1
+			if def.PartitionType != "" {
+				partCount = len(innodbPartitionNames(def))
+				if partCount == 0 {
+					partCount = 1
+				}
+			}
+			for p := 0; p < partCount; p++ {
+				for i, col := range def.Columns {
+					hasDefault := int64(0)
+					var defaultValue interface{} = nil
+					// Only INSTANT-added columns have their default tracked in INNODB_COLUMNS.
+					if col.IsInstantAdded {
+						hasDefault = 1
+						if col.Nullable && col.Default == nil {
+							// Nullable column without explicit default: default is SQL NULL.
+							defaultValue = "NULL"
+						} else if hex := innodbInstantDefaultHex(col); hex != "" {
+							defaultValue = hex
+						} else {
+							defaultValue = "NULL"
+						}
+					}
+					rows = append(rows, storage.Row{
+						"TABLE_ID":      tableID,
+						"NAME":          col.Name,
+						"POS":           int64(i),
+						"MTYPE":         innodbColumnMTYPE(col.Type),
+						"PRTYPE":        innodbColumnPRTYPE(col),
+						"LEN":           innodbColumnLEN(col.Type),
+						"HAS_DEFAULT":   hasDefault,
+						"DEFAULT_VALUE": defaultValue,
+					})
+				}
+				tableID++
+			}
+		}
+	}
+	if len(rows) == 0 {
+		return []storage.Row{{"TABLE_ID": int64(0), "NAME": "", "POS": int64(0), "MTYPE": int64(0), "PRTYPE": int64(0), "LEN": int64(0), "HAS_DEFAULT": int64(0), "DEFAULT_VALUE": nil}}
 	}
 	return rows
 }
