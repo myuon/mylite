@@ -1273,6 +1273,203 @@ func isBinaryColType(colType string) bool {
 	return false
 }
 
+// isOrderingOrEqualityOp returns true for =, !=, <, >, <=, >= operators
+// where FLOAT-column comparison rounding is applicable.
+func isOrderingOrEqualityOp(op sqlparser.ComparisonExprOperator) bool {
+	switch op {
+	case sqlparser.EqualOp, sqlparser.NotEqualOp,
+		sqlparser.LessThanOp, sqlparser.GreaterThanOp,
+		sqlparser.LessEqualOp, sqlparser.GreaterEqualOp:
+		return true
+	}
+	return false
+}
+
+// strictFloat64ComparisonResult performs a strict float64 comparison of two
+// values for the given operator and returns 1 / 0 / nil (NULL) as the
+// MySQL-style truth value. Used by FLOAT-column comparison rounding.
+func strictFloat64ComparisonResult(left, right interface{}, op sqlparser.ComparisonExprOperator) (interface{}, error) {
+	if left == nil || right == nil {
+		return nil, nil
+	}
+	lf, okL := toFloat64Strict(left)
+	rf, okR := toFloat64Strict(right)
+	if !okL || !okR {
+		// Fall back to standard comparison if conversion failed.
+		match, err := compareValues(left, right, op)
+		if err != nil {
+			return nil, err
+		}
+		if match {
+			return int64(1), nil
+		}
+		return int64(0), nil
+	}
+	var match bool
+	switch op {
+	case sqlparser.EqualOp:
+		match = lf == rf
+	case sqlparser.NotEqualOp:
+		match = lf != rf
+	case sqlparser.LessThanOp:
+		match = lf < rf
+	case sqlparser.GreaterThanOp:
+		match = lf > rf
+	case sqlparser.LessEqualOp:
+		match = lf <= rf
+	case sqlparser.GreaterEqualOp:
+		match = lf >= rf
+	}
+	if match {
+		return int64(1), nil
+	}
+	return int64(0), nil
+}
+
+// toFloat64Strict converts a value to float64, returning false if the
+// conversion would lose precision in a way that's unsafe for strict
+// numeric comparison. Used for FLOAT-column-vs-literal comparison.
+func toFloat64Strict(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case uint64:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case string:
+		if f, err := strconv.ParseFloat(n, 64); err == nil {
+			return f, true
+		}
+	}
+	return 0, false
+}
+
+// isFloatColRef returns true if expr is a column reference to a bare FLOAT
+// column (FLOAT without (M,D)). Used to detect FLOAT-vs-literal comparisons
+// that need single-precision rounding applied to the literal side, modelling
+// MySQL's single-precision storage semantics.
+func (e *Executor) isFloatColRef(expr sqlparser.Expr) bool {
+	if e.queryTableDef == nil {
+		return false
+	}
+	colExpr, ok := expr.(*sqlparser.ColName)
+	if !ok {
+		return false
+	}
+	colName := colExpr.Name.String()
+	for _, col := range e.queryTableDef.Columns {
+		if !strings.EqualFold(col.Name, colName) {
+			continue
+		}
+		t := strings.ToUpper(strings.TrimSpace(col.Type))
+		// Strip trailing UNSIGNED/ZEROFILL.
+		for {
+			prev := t
+			t = strings.TrimSuffix(t, " UNSIGNED")
+			t = strings.TrimSpace(t)
+			t = strings.TrimSuffix(t, " ZEROFILL")
+			t = strings.TrimSpace(t)
+			if t == prev {
+				break
+			}
+		}
+		// Bare FLOAT (no precision/scale spec): MySQL uses single-precision.
+		// FLOAT(M,D) (with scale) is treated by mylite's coerce path which
+		// already rounds to D decimal places, so no extra adjustment needed.
+		return t == "FLOAT"
+	}
+	return false
+}
+
+// applyFloatColComparisonRounding adjusts the literal side of a FLOAT-column
+// comparison to model MySQL's single-precision storage semantics. When a
+// FLOAT column is compared with a literal value, MySQL stores the column's
+// value at float32 precision (so e.g. 12.34 becomes 12.340000152587891 in
+// float64-equivalent), while the literal stays exact. mylite normalizes
+// stored FLOAT values to 6 significant digits so they display correctly,
+// which means stored "12.34" compares equal to literal 12.34 — incorrect
+// per MySQL semantics. This helper applies float32 rounding to the literal
+// side and to the column side, then converts both to float64 strings for
+// strict numeric comparison, exposing the imprecision distinction.
+//
+// Returns (modifiedLeft, modifiedRight, true) if the comparison is between
+// a FLOAT column and a non-FLOAT-column expression; otherwise returns the
+// original values and false.
+func (e *Executor) applyFloatColComparisonRounding(leftExpr, rightExpr sqlparser.Expr, left, right interface{}) (interface{}, interface{}, bool) {
+	if e.queryTableDef == nil {
+		return left, right, false
+	}
+	leftIsFloat := e.isFloatColRef(leftExpr)
+	rightIsFloat := e.isFloatColRef(rightExpr)
+	if leftIsFloat == rightIsFloat {
+		return left, right, false
+	}
+	// Round the literal (non-FLOAT-column) side to float32 precision so it
+	// has the same imprecision shape as a FLOAT-stored value would, but
+	// based on the literal's exact value. Convert both sides into float64
+	// for direct strict comparison via FloatComparison wrappers.
+	asFloat64 := func(v interface{}) (float64, bool) {
+		switch n := v.(type) {
+		case float64:
+			return n, true
+		case float32:
+			return float64(n), true
+		case int64:
+			return float64(n), true
+		case uint64:
+			return float64(n), true
+		case string:
+			if f, err := strconv.ParseFloat(n, 64); err == nil {
+				return f, true
+			}
+		}
+		return 0, false
+	}
+	if leftIsFloat {
+		// Apply float32 rounding to the literal (right) so that
+		// e.g. literal 12.34 becomes 12.340000152587891.
+		if rf, ok := asFloat64(right); ok && (containsDecimalShape(right)) {
+			right = float64(float32(rf))
+			// The column (left) was stored as a 6-sig-digit-rounded value
+			// like exact 12.34. Promote to the same imprecision-aware form
+			// by leaving it as float64. Then strict float64 comparison
+			// distinguishes 12.34 (stored, exact) from 12.340000152587891
+			// (literal-rounded). They'll not match, matching MySQL.
+			if lf, ok2 := asFloat64(left); ok2 {
+				left = lf
+			}
+			return left, right, true
+		}
+	} else if rightIsFloat {
+		if lf, ok := asFloat64(left); ok && containsDecimalShape(left) {
+			left = float64(float32(lf))
+			if rf, ok2 := asFloat64(right); ok2 {
+				right = rf
+			}
+			return left, right, true
+		}
+	}
+	return left, right, false
+}
+
+// containsDecimalShape returns true if v looks like an approximate value
+// (has a decimal point or scientific exponent in its textual form). Plain
+// integer literals don't need float32 rounding.
+func containsDecimalShape(v interface{}) bool {
+	switch n := v.(type) {
+	case float32, float64:
+		return true
+	case string:
+		return strings.ContainsAny(n, ".eE")
+	}
+	return false
+}
+
 // lookupColumnCollation returns the effective collation for a named column in a table definition.
 // Returns "" if the column is not found or is not a string/binary type.
 func (e *Executor) lookupColumnCollation(colName string, td *catalog.TableDef) string {
@@ -2008,6 +2205,16 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 	// NULL comparison returns NULL (except for NULL-safe equal <=>)
 	if (left == nil || right == nil) && v.Operator != sqlparser.NullSafeEqualOp {
 		return nil, nil
+	}
+	// FLOAT-column-vs-literal: model MySQL's single-precision storage
+	// semantics by rounding the literal through float32 and then comparing
+	// strictly as float64. e.g. `WHERE float_col = 12.34` compared against a
+	// row where the column was inserted with literal 12.34 must NOT match,
+	// because MySQL stores float32(12.34) = 12.340000152587891.
+	if isOrderingOrEqualityOp(v.Operator) {
+		if l2, r2, applied := e.applyFloatColComparisonRounding(leftExpr, rightExpr, left, right); applied {
+			return strictFloat64ComparisonResult(l2, r2, v.Operator)
+		}
 	}
 	// Handle LIKE/NOT LIKE with optional ESCAPE and optional COLLATE
 	if v.Operator == sqlparser.LikeOp || v.Operator == sqlparser.NotLikeOp {
@@ -6350,6 +6557,25 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 		if err != nil {
 			return nil, err
 		}
+		// FLOAT-column-vs-literal: see evalComparisonExpr for rationale.
+		if isOrderingOrEqualityOp(v.Operator) {
+			if l2, r2, applied := e.applyFloatColComparisonRounding(leftExpr2, rightExpr2, left, right); applied {
+				match, fcErr := strictFloat64ComparisonResult(l2, r2, v.Operator)
+				if fcErr != nil {
+					return nil, fcErr
+				}
+				if match == nil {
+					return nil, nil
+				}
+				if b, ok := match.(bool); ok {
+					if b {
+						return int64(1), nil
+					}
+					return int64(0), nil
+				}
+				return match, nil
+			}
+		}
 		// Handle LIKE/NOT LIKE with optional ESCAPE and optional COLLATE
 		if v.Operator == sqlparser.LikeOp || v.Operator == sqlparser.NotLikeOp {
 			// NULL comparison: x LIKE NULL = NULL = false in WHERE context
@@ -7505,6 +7731,28 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 		}
 		if rightWhereOvErr != nil {
 			e.addWarning("Warning", 1292, formatOverflowWarningMsg(rightWhereOvErr))
+		}
+		// FLOAT-column-vs-literal: model MySQL's single-precision storage
+		// semantics. e.g. `WHERE float_col = 12.34` does not match a row that
+		// stored 12.34, because MySQL stores float32(12.34) = 12.340000152...
+		// but mylite stores the value at 6-significant-digit precision.
+		if isOrderingOrEqualityOp(v.Operator) {
+			if l2, r2, applied := e.applyFloatColComparisonRounding(leftExprW, rightExprW, left, right); applied {
+				match, fcErr := strictFloat64ComparisonResult(l2, r2, v.Operator)
+				if fcErr != nil {
+					return false, fcErr
+				}
+				if match == nil {
+					return false, nil
+				}
+				if iv, ok := match.(int64); ok {
+					return iv == 1, nil
+				}
+				if b, ok := match.(bool); ok {
+					return b, nil
+				}
+				return false, nil
+			}
 		}
 		// Collation-aware LIKE/NOT LIKE or LIKE with ESCAPE clause
 		if v.Operator == sqlparser.LikeOp || v.Operator == sqlparser.NotLikeOp {

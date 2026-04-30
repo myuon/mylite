@@ -5741,6 +5741,11 @@ func evalAggregateExpr(expr sqlparser.Expr, groupRows []storage.Row, repRow stor
 		if err != nil {
 			return nil, err
 		}
+		// NULL comparison returns NULL (except for NULL-safe equal <=>).
+		// e.g. COUNT(*) = MAX(a) over zero rows: 0 = NULL -> NULL.
+		if (left == nil || right == nil) && e.Operator != sqlparser.NullSafeEqualOp {
+			return nil, nil
+		}
 		result, err := compareValues(left, right, e.Operator)
 		if err != nil {
 			return nil, err
