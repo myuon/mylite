@@ -3509,10 +3509,6 @@
       "reason": "timeout"
     },
     {
-      "test": "innodb/autoinc_persist",
-      "reason": "internally skipped"
-    },
-    {
       "test": "funcs_1/is_cml_myisam",
       "reason": "failures"
     },
@@ -3651,10 +3647,6 @@
     {
       "test": "innodb/innodb_bug42419",
       "reason": "timeout"
-    },
-    {
-      "test": "innodb/innodb-autoinc",
-      "reason": "auto_increment errors"
     },
     {
       "test": "sys_vars/net_buffer_length_basic",
@@ -4567,6 +4559,30 @@
     {
       "test": "innodb/innodb-wl5522",
       "reason": "InnoDB transportable tablespace + restart_mysqld (#71)"
+    },
+    {
+      "test": "innodb/innodb-autoinc",
+      "reason": "auto_increment_increment/offset session vars not applied"
+    },
+    {
+      "test": "innodb/blob_redo",
+      "reason": "kill_and_restart_mysqld semantics not fully simulated"
+    },
+    {
+      "test": "innodb/innodb_bug-13628249",
+      "reason": "kill_and_restart_mysqld semantics not fully simulated"
+    },
+    {
+      "test": "innodb/update_time",
+      "reason": "I_S TABLES.update_time tracking; previously skipped via kill_and_restart_mysqld.inc"
+    },
+    {
+      "test": "innodb/xa_recovery",
+      "reason": "XA recovery requires real restart"
+    },
+    {
+      "test": "innodb/autoinc_persist",
+      "reason": "remaining: auto warning emission + ROLLBACK restoration semantics (Refs #255)"
     }
   ]
 }

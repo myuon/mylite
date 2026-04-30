@@ -1559,7 +1559,13 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		return true, false, nil
 
 	case "shutdown_server":
-		// Server restart is not supported - skip remaining lines in this block
+		// Server restart is not supported - skip remaining lines in this block.
+		// Note: when inside the recognised restart_mysqld.inc /
+		// kill_and_restart_mysqld.inc include files we intercept and short-
+		// circuit those includes earlier (see sourceFile) so the include
+		// body — which is what would have hit this case — never runs.  Direct
+		// uses of --shutdown_server in a .test file therefore still skip the
+		// rest of the test, matching prior behaviour.
 		return true, true, nil
 
 	case "exec", "execw":
@@ -4291,7 +4297,11 @@ func (ctx *execContext) sourceFile(filename string) error {
 		return nil
 	}
 	// Treat proc-control include as no-op in this single-node runner.
-	if baseName == "restart_mysqld.inc" {
+	// kill_and_restart_mysqld.inc is the kill-then-restart variant.  In our
+	// runner we have no separate process to kill; the in-memory engine just
+	// continues, which still matches the persistence semantics of InnoDB's
+	// AUTO_INCREMENT counter (kept in catalog memory across the "restart").
+	if baseName == "restart_mysqld.inc" || baseName == "kill_and_restart_mysqld.inc" {
 		// MySQL MTR result files include "# $restart_parameters" when server is restarted.
 		restartParams := ctx.variables["$restart_parameters"]
 		if restartParams == "" {
@@ -4301,7 +4311,13 @@ func (ctx *execContext) sourceFile(filename string) error {
 		if len(restartParams) >= 2 && restartParams[0] == '"' && restartParams[len(restartParams)-1] == '"' {
 			restartParams = restartParams[1 : len(restartParams)-1]
 		}
-		ctx.output.WriteString("# " + restartParams + "\n")
+		// kill_and_restart_mysqld.inc emits "# Kill and $restart_parameters"
+		// rather than just "# $restart_parameters".
+		if baseName == "kill_and_restart_mysqld.inc" {
+			ctx.output.WriteString("# Kill and " + restartParams + "\n")
+		} else {
+			ctx.output.WriteString("# " + restartParams + "\n")
+		}
 		// Apply any startup parameters to the session (e.g. --sort_buffer_size=9999999)
 		// Support both "restart:--foo=bar" and "restart: --foo=bar" (with optional space)
 		restartParamsNorm := strings.Replace(restartParams, "restart: --", "restart:--", 1)
@@ -4332,6 +4348,19 @@ func (ctx *execContext) sourceFile(filename string) error {
 	// (it never returns an error, so $mysql_errno stays 0 and the loop never
 	// terminates naturally).  Treat it as a no-op.
 	if baseName == "wait_until_disconnected.inc" {
+		return nil
+	}
+	// wait_until_connected_again.inc waits for the test connection to come
+	// back after a restart.  In our single-node runner there is no real
+	// reconnect step (the engine never goes down), so treat as a no-op
+	// otherwise the loop spins waiting for $mysql_errno to flip.
+	if baseName == "wait_until_connected_again.inc" {
+		return nil
+	}
+	// xplugin_wait_for_interfaces.inc waits for X-Plugin sockets which we
+	// don't run; sourced from kill_and_restart_mysqld.inc when xplugin is
+	// active (it isn't, in our runner, but be defensive).
+	if baseName == "xplugin_wait_for_interfaces.inc" {
 		return nil
 	}
 	// running_event_scheduler.inc waits for the event_scheduler daemon to
