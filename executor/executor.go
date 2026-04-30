@@ -3372,9 +3372,24 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		if s.WithLock && e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
 			return nil, mysqlError(1192, "HY000", "Can't execute the given command because you have active locked tables or an active transaction")
 		}
+		// FLUSH PRIVILEGES under active LOCK TABLES needs to surface
+		// ER_TABLE_NOT_LOCKED ("Table 'user' was not locked with LOCK TABLES")
+		// rather than the generic READ-lock 1099. Detect it before the
+		// generic FLUSH TABLES guard below.
+		flushPrivilegesUnderLock := false
+		if !s.WithLock && len(s.TableNames) == 0 && e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
+			for _, opt := range s.FlushOptions {
+				if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(opt)), "PRIVILEGES") {
+					flushPrivilegesUnderLock = true
+					break
+				}
+			}
+		}
 		// FLUSH TABLES (no specific table names) when LOCK TABLES is active:
 		// all locked tables must have WRITE lock; READ-locked tables produce 1099.
-		if !s.WithLock && len(s.TableNames) == 0 && e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
+		// Skip this when the flush is FLUSH PRIVILEGES — that case is handled
+		// further below with its own error code.
+		if !s.WithLock && len(s.TableNames) == 0 && !flushPrivilegesUnderLock && e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
 			locks := e.tableLockManager.GetLocks(e.connectionID)
 			for _, mode := range locks {
 				if mode == "READ" {

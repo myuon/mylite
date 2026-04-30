@@ -176,6 +176,18 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 	if err := e.checkTablespaceDiscarded(updateDB, tableName); err != nil {
 		return nil, err
 	}
+
+	// MySQL error 1442: can't modify a table inside a trigger if the triggering statement is
+	// already modifying that table (re-entrancy guard preventing infinite recursion).
+	if e.functionOrTriggerDepth > 0 && strings.EqualFold(e.modifyingTable, tableName) {
+		return nil, mysqlError(1442, "HY000",
+			fmt.Sprintf("Can't update table '%s' in stored function/trigger because it is already used by statement which invoked this stored function/trigger.", tableName))
+	}
+	// Track the table being modified so nested trigger calls can detect recursive modifications.
+	prevModifyingTable := e.modifyingTable
+	e.modifyingTable = tableName
+	defer func() { e.modifyingTable = prevModifyingTable }()
+
 	// If updating through a view, validate that SET targets are updatable columns (direct col refs).
 	if viewColMap != nil {
 		for _, upd := range stmt.Exprs {
