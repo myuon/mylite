@@ -2693,14 +2693,21 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 	case *sqlparser.Use:
 		return e.execUse(s)
 	case *sqlparser.CreateTable:
-		if err := e.waitForInstanceBackupLock(); err != nil {
-			return nil, err
+		// LOCK INSTANCE FOR BACKUP does not block CREATE TEMPORARY TABLE because
+		// temporary tables are session-local and not part of the on-disk backup.
+		if !s.Temp {
+			if err := e.waitForInstanceBackupLock(); err != nil {
+				return nil, err
+			}
 		}
 		e.ddlImplicitCommit()
 		return e.execCreateTable(s)
 	case *sqlparser.DropTable:
-		if err := e.waitForInstanceBackupLock(); err != nil {
-			return nil, err
+		// DROP TEMPORARY TABLE is also exempt from the backup lock for the same reason.
+		if !s.Temp {
+			if err := e.waitForInstanceBackupLock(); err != nil {
+				return nil, err
+			}
 		}
 		e.ddlImplicitCommit()
 		return e.execDropTable(s)
@@ -2999,6 +3006,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 		return &Result{}, nil
 	case *sqlparser.Analyze:
+		// ANALYZE TABLE is DDL-like: blocked while another connection holds LOCK INSTANCE FOR BACKUP.
+		if err := e.waitForInstanceBackupLock(); err != nil {
+			return nil, err
+		}
 		tableName := s.Table.Name.String()
 		msgText := "Table is already up to date"
 		if db, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
@@ -3069,13 +3080,26 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 	case *sqlparser.DeallocateStmt:
 		return e.execDeallocate(s)
 	case *sqlparser.AlterDatabase:
+		if err := e.waitForInstanceBackupLock(); err != nil {
+			return nil, err
+		}
 		return e.execAlterDatabase(s)
 	case *sqlparser.DropProcedure:
+		if err := e.waitForInstanceBackupLock(); err != nil {
+			return nil, err
+		}
 		return e.execDropProcedureAST(s)
 	case *sqlparser.CreateProcedure:
+		if err := e.waitForInstanceBackupLock(); err != nil {
+			return nil, err
+		}
 		// Simple CREATE PROCEDURE without BEGIN...END body (already handled above for complex ones)
 		return &Result{}, nil
 	case *sqlparser.CreateView:
+		// CREATE VIEW is DDL: blocked while another connection holds LOCK INSTANCE FOR BACKUP.
+		if err := e.waitForInstanceBackupLock(); err != nil {
+			return nil, err
+		}
 		// Store view definition
 		viewName := s.ViewName.Name.String()
 		viewDB := e.CurrentDB
@@ -3144,6 +3168,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 		return &Result{}, nil
 	case *sqlparser.DropView:
+		// DROP VIEW is DDL: blocked while another connection holds LOCK INSTANCE FOR BACKUP.
+		if err := e.waitForInstanceBackupLock(); err != nil {
+			return nil, err
+		}
 		// DROP VIEW is not allowed when LOCK TABLES is active (ER_LOCK_OR_ACTIVE_TRANSACTION).
 		if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
 			return nil, mysqlError(1192, "HY000", "Can't execute the given command because you have active locked tables or an active transaction")
@@ -3271,6 +3299,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 	case *sqlparser.OtherAdmin:
 		return e.execOtherAdmin(query)
 	case *sqlparser.AlterView:
+		// ALTER VIEW is DDL: blocked while another connection holds LOCK INSTANCE FOR BACKUP.
+		if err := e.waitForInstanceBackupLock(); err != nil {
+			return nil, err
+		}
 		viewName := s.ViewName.Name.String()
 		viewDB := e.CurrentDB
 		if !s.ViewName.Qualifier.IsEmpty() {
