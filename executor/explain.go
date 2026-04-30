@@ -8140,7 +8140,7 @@ func (e *Executor) explainJSONDocument(query string) string {
 		switch parsed[i].selectType {
 		case "SIMPLE", "PRIMARY":
 			primaryRows = append(primaryRows, parsed[i])
-		case "SUBQUERY":
+		case "SUBQUERY", "DEPENDENT SUBQUERY":
 			subqueryRows = append(subqueryRows, parsed[i])
 		case "DERIVED":
 			derivedRows = append(derivedRows, parsed[i])
@@ -8252,15 +8252,206 @@ func (e *Executor) explainJSONDocument(query string) string {
 		return nl
 	}
 
+	// Helper: extract attached_condition strings for outer/inner tables of an
+	// IN-subquery semijoin from the original query text.  Returns a map
+	// tableName -> condition string.  When MySQL semijoin-flattens
+	//   WHERE outer.col IN (SELECT inner.col FROM inner_t WHERE <cond>)
+	// the inner WHERE conditions are split by table reference and propagated
+	// across the IN equality, so each side gets the conditions that mention
+	// its columns.  We approximate this by:
+	//   1. Walking the inner SELECT's WHERE clause and extracting per-table
+	//      equality/range predicates (using the existing extractTableCondition).
+	//   2. Substituting outer-referencing predicates onto the inner table's
+	//      column when it shares a name with the outer (the IN equality case).
+	semijoinAttachedConditions := func() map[string]string {
+		out := map[string]string{}
+		stmt, err := e.parser().Parse(query)
+		if err != nil {
+			return out
+		}
+		sel, ok := stmt.(*sqlparser.Select)
+		if !ok || sel.Where == nil {
+			return out
+		}
+		dbName := e.CurrentDB
+		if dbName == "" {
+			dbName = "test"
+		}
+		// Locate the first IN subquery in the WHERE clause.
+		var inExpr *sqlparser.ComparisonExpr
+		_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+			if cmp, ok := n.(*sqlparser.ComparisonExpr); ok && cmp.Operator == sqlparser.InOp {
+				if _, ok := cmp.Right.(*sqlparser.Subquery); ok && inExpr == nil {
+					inExpr = cmp
+					return false, nil
+				}
+			}
+			return true, nil
+		}, sel.Where.Expr)
+		if inExpr == nil {
+			return out
+		}
+		// Outer column / table from the left side.
+		var outerCol, outerTbl string
+		if c, ok := inExpr.Left.(*sqlparser.ColName); ok {
+			outerCol = c.Name.String()
+			outerTbl = c.Qualifier.Name.String()
+		}
+		if outerTbl == "" {
+			// Default to the first non-dual table from the outer FROM.
+			for _, te := range sel.From {
+				for _, tn := range e.extractAllTableNames(te) {
+					if !strings.EqualFold(tn, "dual") {
+						outerTbl = tn
+						break
+					}
+				}
+				if outerTbl != "" {
+					break
+				}
+			}
+		}
+		// Inner SELECT.
+		sub, ok := inExpr.Right.(*sqlparser.Subquery)
+		if !ok {
+			return out
+		}
+		innerSel, ok := sub.Select.(*sqlparser.Select)
+		if !ok || innerSel.Where == nil {
+			return out
+		}
+		// Inner table name (first one).
+		innerTbl := ""
+		for _, te := range innerSel.From {
+			for _, tn := range e.extractAllTableNames(te) {
+				if !strings.EqualFold(tn, "dual") {
+					innerTbl = tn
+					break
+				}
+			}
+			if innerTbl != "" {
+				break
+			}
+		}
+		// Inner select column on the right of IN (e.g. SELECT col FROM ...).
+		innerCol := ""
+		if innerSel.SelectExprs != nil && len(innerSel.SelectExprs.Exprs) > 0 {
+			if ae, ok := innerSel.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok {
+				if c, ok := ae.Expr.(*sqlparser.ColName); ok {
+					innerCol = c.Name.String()
+				}
+			}
+		}
+		// Extract the per-table conditions from the inner WHERE.
+		if outerTbl != "" {
+			c := e.extractTableCondition(innerSel.Where.Expr, outerTbl, dbName)
+			if c != "" {
+				out[outerTbl] = c
+			}
+		}
+		if innerTbl != "" {
+			c := e.extractTableCondition(innerSel.Where.Expr, innerTbl, dbName)
+			if c != "" {
+				out[innerTbl] = c
+			}
+		}
+		// Constant-equality propagation across the IN equality
+		// (`outer.col` = `inner.col`):
+		// If outer side has `outer.col = K` (literal) and inner side has no
+		// condition on `inner.col`, propagate `inner.col = K` to inner side.
+		// And vice-versa.
+		propagate := func(srcTbl, srcCol, dstTbl, dstCol string) {
+			if srcTbl == "" || srcCol == "" || dstTbl == "" || dstCol == "" {
+				return
+			}
+			if _, ok := out[dstTbl]; ok {
+				return
+			}
+			// Search inner WHERE for `srcTbl.srcCol = <literal>` and
+			// reformulate as `dstTbl.dstCol = <literal>`.
+			var lit string
+			_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+				if cmp, ok := n.(*sqlparser.ComparisonExpr); ok && cmp.Operator == sqlparser.EqualOp {
+					var col *sqlparser.ColName
+					var other sqlparser.Expr
+					if c, ok := cmp.Left.(*sqlparser.ColName); ok {
+						col = c
+						other = cmp.Right
+					} else if c, ok := cmp.Right.(*sqlparser.ColName); ok {
+						col = c
+						other = cmp.Left
+					}
+					if col == nil {
+						return true, nil
+					}
+					if !strings.EqualFold(col.Name.String(), srcCol) {
+						return true, nil
+					}
+					qual := col.Qualifier.Name.String()
+					if qual != "" && !strings.EqualFold(qual, srcTbl) {
+						return true, nil
+					}
+					if _, ok := other.(*sqlparser.Literal); ok {
+						lit = sqlparser.String(other)
+						return false, nil
+					}
+				}
+				return true, nil
+			}, innerSel.Where.Expr)
+			if lit != "" {
+				out[dstTbl] = fmt.Sprintf("(`%s`.`%s`.`%s` = %s)", dbName, dstTbl, dstCol, lit)
+			}
+		}
+		propagate(outerTbl, outerCol, innerTbl, innerCol)
+		propagate(innerTbl, innerCol, outerTbl, outerCol)
+		return out
+	}
+
+	// Helper: append attached_condition to a table block when not already present
+	// and when the conditions map provides one for the table.
+	appendAttachedCondition := func(block []orderedKV, conds map[string]string) []orderedKV {
+		if len(conds) == 0 {
+			return block
+		}
+		// Find table_name to look up condition.
+		tblName := ""
+		for _, kv := range block {
+			if kv.Key == "table_name" {
+				if s, ok := kv.Value.(string); ok {
+					tblName = s
+				}
+				break
+			}
+		}
+		if tblName == "" {
+			return block
+		}
+		c, ok := conds[tblName]
+		if !ok || c == "" {
+			return block
+		}
+		// Skip if attached_condition already present.
+		for _, kv := range block {
+			if kv.Key == "attached_condition" {
+				return block
+			}
+		}
+		return append(block, orderedKV{"attached_condition", c})
+	}
+
 	// Helper: build nested_loop with first_match annotation
-	// The first_match field is added to non-first tables when firstmatch strategy is used
+	// The first_match field is added to non-first tables when firstmatch strategy is used.
+	// When the inner table uses ALL access, MySQL also adds using_join_buffer:"Block Nested Loop"
+	// because the FirstMatch nested-loop join uses a join buffer to scan the inner side.
 	buildFirstMatchNestedLoop := func(rows []parsedRow) []interface{} {
 		var nl []interface{}
 		if len(rows) == 0 {
 			return nl
 		}
+		conds := semijoinAttachedConditions()
 		// First table has no first_match annotation
 		firstTbl := e.explainJSONTableBlock(rows[0].row, query)
+		firstTbl = appendAttachedCondition(firstTbl, conds)
 		nl = append(nl, []orderedKV{{"table", firstTbl}})
 		// Subsequent tables get first_match pointing to the first table's name
 		if len(rows) > 1 {
@@ -8270,7 +8461,12 @@ func (e *Executor) explainJSONDocument(query string) string {
 			}
 			for _, pr := range rows[1:] {
 				tblBlock := e.explainJSONTableBlock(pr.row, query)
-				// Insert first_match after "filtered" field (before cost_info and used_columns)
+				// Determine inner table's access type to decide if join buffer applies.
+				accessType := ""
+				if pr.row[4] != nil {
+					accessType = fmt.Sprintf("%v", pr.row[4])
+				}
+				// Insert first_match after "filtered" field (before cost_info and used_columns).
 				insertPos := len(tblBlock) // default: append at end
 				for i, kv := range tblBlock {
 					if kv.Key == "filtered" {
@@ -8278,11 +8474,26 @@ func (e *Executor) explainJSONDocument(query string) string {
 						break
 					}
 				}
-				// Insert first_match at insertPos
-				newBlock := make([]orderedKV, 0, len(tblBlock)+1)
+				// Insert first_match at insertPos.
+				// Insert using_join_buffer immediately after first_match when inner uses ALL.
+				newBlock := make([]orderedKV, 0, len(tblBlock)+2)
 				newBlock = append(newBlock, tblBlock[:insertPos]...)
 				newBlock = append(newBlock, orderedKV{"first_match", firstTableName})
+				if accessType == "ALL" {
+					// Avoid duplicating if explainJSONTableBlock already inserted using_join_buffer.
+					alreadyHas := false
+					for _, kv := range tblBlock {
+						if kv.Key == "using_join_buffer" {
+							alreadyHas = true
+							break
+						}
+					}
+					if !alreadyHas {
+						newBlock = append(newBlock, orderedKV{"using_join_buffer", "Block Nested Loop"})
+					}
+				}
 				newBlock = append(newBlock, tblBlock[insertPos:]...)
+				newBlock = appendAttachedCondition(newBlock, conds)
 				nl = append(nl, []orderedKV{{"table", newBlock}})
 			}
 		}
@@ -8901,6 +9112,34 @@ func (e *Executor) explainJSONDocument(query string) string {
 					tblBlock = wrapDerived(tblBlock, tableName)
 				}
 
+				// Build attached_subqueries list (if any) so we can attach them
+				// either inline to this primary table block (when the subqueries are
+				// dependent IN/EXISTS subqueries that filter this table) or at the
+				// query_block level otherwise.
+				var attachedSubs []interface{}
+				hasDependentSubs := false
+				for _, s := range subqueryRows {
+					qb := e.explainJSONQueryBlockForRow(s.row, query)
+					if s.selectType == "DEPENDENT SUBQUERY" {
+						hasDependentSubs = true
+						attachedSubs = append(attachedSubs, []orderedKV{
+							{"dependent", true},
+							{"cacheable", false},
+							{"query_block", qb},
+						})
+					} else {
+						attachedSubs = append(attachedSubs, qb)
+					}
+				}
+				// When the subqueries are dependent (IN/EXISTS attached to this table's
+				// WHERE filter), MySQL embeds attached_subqueries inside the table block
+				// (right after attached_condition) rather than at query_block level.
+				if hasDependentSubs && len(attachedSubs) > 0 {
+					tblBlock = append(tblBlock, orderedKV{"attached_subqueries", attachedSubs})
+					// Mark consumed so the query_block-level attachment loop below skips them.
+					subqueryRows = nil
+				}
+
 				// Outer query: always emit as "table" (not grouping_operation),
 				// even if the query string contains GROUP BY (which might be inside a subquery).
 				if hasGroupBy && hasFilesort {
@@ -8916,11 +9155,20 @@ func (e *Executor) explainJSONDocument(query string) string {
 			}
 		}
 
-		// Attached subqueries
+		// Attached subqueries (residual non-dependent ones at query_block level).
 		if len(subqueryRows) > 0 {
 			var attachedSubs []interface{}
 			for _, s := range subqueryRows {
-				attachedSubs = append(attachedSubs, e.explainJSONQueryBlockForRow(s.row, query))
+				qb := e.explainJSONQueryBlockForRow(s.row, query)
+				if s.selectType == "DEPENDENT SUBQUERY" {
+					attachedSubs = append(attachedSubs, []orderedKV{
+						{"dependent", true},
+						{"cacheable", false},
+						{"query_block", qb},
+					})
+				} else {
+					attachedSubs = append(attachedSubs, qb)
+				}
 			}
 			queryBlock = append(queryBlock, orderedKV{"attached_subqueries", attachedSubs})
 		}
