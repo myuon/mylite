@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"golang.org/x/text/unicode/norm"
@@ -5819,12 +5820,28 @@ func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, er
 				e.processList.ResetHostTotals()
 			}
 		case "events_statements_summary_by_digest", "events_statements_histogram_by_digest":
-			// Clear digests and mark as truncated so new statements are recorded
+			// Clear digests and mark as truncated so new statements are recorded.
+			// recordStatementDigest already added a TRUNCATE entry before
+			// reaching here; clearing the slice removes it. MySQL records the
+			// TRUNCATE statement itself in the table after the truncation, so
+			// we re-add a synthesized TRUNCATE entry here.
 			e.psDigests = nil
 			if e.psTruncated == nil {
 				e.psTruncated = make(map[string]bool)
 			}
 			e.psTruncated[lowerTable] = true
+			synth := fmt.Sprintf("TRUNCATE TABLE performance_schema.%s", lowerTable)
+			digest, digestText := normalizeStatementDigest(synth)
+			now := time.Now().UTC().Format("2006-01-02 15:04:05.000000")
+			e.psDigests = append(e.psDigests, psDigestEntry{
+				SchemaName:      e.CurrentDB,
+				Digest:          digest,
+				DigestText:      digestText,
+				CountStar:       1,
+				FirstSeen:       now,
+				LastSeen:        now,
+				QuerySampleText: synth,
+			})
 		default:
 			// Track truncated PS tables so they return empty result sets
 			if e.psTruncated == nil {

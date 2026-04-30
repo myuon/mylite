@@ -1,0 +1,471 @@
+package executor
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"strings"
+	"unicode"
+)
+
+// normalizeStatementDigest computes a MySQL-style statement digest from a SQL
+// query. It returns:
+//   - digest: SHA-256 hex string of the normalized token stream (64 chars)
+//   - digestText: human-readable normalized form with literals replaced by `?`
+//
+// The normalization rules approximate MySQL's behavior:
+//   - Comments are stripped (-- ..., # ..., /* ... */)
+//   - Strings, numbers, and NULL are replaced with `?`
+//   - Identifiers are quoted with backticks
+//   - Keywords are uppercased
+//   - Whitespace is collapsed to single spaces around tokens
+//   - Repeating value tuples like `(1,2),(3,4),...` are collapsed to `(...) /* , ... */`
+//
+// This is a best-effort approximation; exact byte-for-byte equality with
+// MySQL's digest is not guaranteed because MySQL's tokenizer applies many
+// dialect-specific rules (PARSER_TOKEN_*) that are out of scope.
+func normalizeStatementDigest(query string) (digest string, digestText string) {
+	tokens := tokenizeForDigest(query)
+	tokens = collapseInsideParenLiterals(tokens)
+	tokens = collapseValueLists(tokens)
+	tokens = collapseTopLevelLiteralList(tokens)
+	digestText = strings.TrimSpace(joinDigestTokens(tokens))
+	h := sha256.Sum256([]byte(digestText))
+	digest = hex.EncodeToString(h[:])
+	return digest, digestText
+}
+
+// collapseInsideParenLiterals replaces "(L , L , L [, L]*)" — where each L is
+// a literal token (number/string/null already) — with "(...)". The single-
+// element form "(L)" is left intact ("(?)").
+func collapseInsideParenLiterals(tokens []digestToken) []digestToken {
+	out := make([]digestToken, 0, len(tokens))
+	i := 0
+	for i < len(tokens) {
+		if tokens[i].kind == tokPunct && tokens[i].text == "(" {
+			// Scan inner tokens until matching ')'
+			depth := 1
+			j := i + 1
+			ok := true
+			litCount := 0
+			commaCount := 0
+			for j < len(tokens) && depth > 0 {
+				t := tokens[j]
+				if t.kind == tokPunct {
+					if t.text == "(" {
+						depth++
+						ok = false
+					} else if t.text == ")" {
+						depth--
+						if depth == 0 {
+							break
+						}
+					} else if t.text == "," && depth == 1 {
+						commaCount++
+					} else {
+						ok = false
+					}
+				} else if t.kind == tokNumber || t.kind == tokString || t.kind == tokNull {
+					if depth == 1 {
+						litCount++
+					}
+				} else {
+					ok = false
+				}
+				j++
+			}
+			if ok && depth == 0 && commaCount >= 1 && litCount >= 2 && litCount == commaCount+1 {
+				// "(L,L,...,L)" -> "(...)"
+				out = append(out, digestToken{kind: tokPunct, text: "("})
+				out = append(out, digestToken{kind: tokKeyword, text: "..."})
+				out = append(out, digestToken{kind: tokPunct, text: ")"})
+				i = j + 1
+				continue
+			}
+		}
+		out = append(out, tokens[i])
+		i++
+	}
+	return out
+}
+
+// collapseTopLevelLiteralList replaces a top-level run of "L , L [, L]*" (not
+// inside parens) with "L , ...", matching MySQL's behaviour for things like
+// "SELECT 1, 2, 3 FROM t1" -> "SELECT ?, ... FROM `t1`".
+func collapseTopLevelLiteralList(tokens []digestToken) []digestToken {
+	out := make([]digestToken, 0, len(tokens))
+	depth := 0
+	i := 0
+	for i < len(tokens) {
+		t := tokens[i]
+		if t.kind == tokPunct && t.text == "(" {
+			depth++
+			out = append(out, t)
+			i++
+			continue
+		}
+		if t.kind == tokPunct && t.text == ")" {
+			if depth > 0 {
+				depth--
+			}
+			out = append(out, t)
+			i++
+			continue
+		}
+		if depth == 0 && isLiteralTok(t) {
+			// Try to extend: literal , literal , ...
+			j := i + 1
+			litCount := 1
+			for j+1 < len(tokens) && tokens[j].kind == tokPunct && tokens[j].text == "," && isLiteralTok(tokens[j+1]) {
+				litCount++
+				j += 2
+			}
+			if litCount >= 2 {
+				out = append(out, t) // first literal
+				out = append(out, digestToken{kind: tokPunct, text: ","})
+				out = append(out, digestToken{kind: tokKeyword, text: "..."})
+				i = j
+				continue
+			}
+		}
+		out = append(out, t)
+		i++
+	}
+	return out
+}
+
+func isLiteralTok(t digestToken) bool {
+	return t.kind == tokNumber || t.kind == tokString || t.kind == tokNull
+}
+
+// digestToken represents a single SQL token classified for digest purposes.
+type digestToken struct {
+	kind digestTokKind
+	text string // textual form for digest_text rendering
+}
+
+type digestTokKind int
+
+const (
+	tokKeyword digestTokKind = iota
+	tokIdent           // backtick-quoted identifier (the `text` is the unescaped name)
+	tokNumber          // becomes `?`
+	tokString          // becomes `?`
+	tokNull            // becomes `?`
+	tokPunct           // ( ) , ; . etc.
+	tokOperator        // + - * / = < > etc.
+	tokWhitespace
+)
+
+// sqlKeywords is a small set of common MySQL keywords. Tokens matching this
+// set (case-insensitive) are uppercased and not backtick-quoted.
+var sqlKeywords = map[string]bool{
+	"SELECT": true, "FROM": true, "WHERE": true, "AND": true, "OR": true, "NOT": true,
+	"INSERT": true, "INTO": true, "VALUES": true, "VALUE": true, "UPDATE": true,
+	"DELETE": true, "SET": true, "AS": true, "ON": true, "USING": true,
+	"INNER": true, "OUTER": true, "LEFT": true, "RIGHT": true, "FULL": true,
+	"JOIN": true, "CROSS": true, "STRAIGHT_JOIN": true,
+	"GROUP": true, "BY": true, "ORDER": true, "HAVING": true, "LIMIT": true, "OFFSET": true,
+	"UNION": true, "ALL": true, "DISTINCT": true, "ANY": true, "SOME": true, "EXISTS": true,
+	"CASE": true, "WHEN": true, "THEN": true, "ELSE": true, "END": true,
+	"IF": true, "IFNULL": true, "NULLIF": true, "COALESCE": true,
+	"CREATE": true, "DROP": true, "ALTER": true, "TABLE": true, "DATABASE": true,
+	"SCHEMA": true, "INDEX": true, "VIEW": true, "TRIGGER": true, "PROCEDURE": true,
+	"FUNCTION": true, "EVENT": true, "USER": true, "ROLE": true,
+	"PRIMARY": true, "KEY": true, "UNIQUE": true, "FOREIGN": true, "REFERENCES": true,
+	"CHECK": true, "CONSTRAINT": true, "DEFAULT": true, "AUTO_INCREMENT": true,
+	"NULL": true, "TRUE": true, "FALSE": true, "UNKNOWN": true,
+	"INT": true, "INTEGER": true, "BIGINT": true, "SMALLINT": true, "TINYINT": true,
+	"MEDIUMINT": true, "DECIMAL": true, "NUMERIC": true, "FLOAT": true, "DOUBLE": true,
+	"REAL": true, "BIT": true, "BOOLEAN": true, "BOOL": true, "DATE": true, "TIME": true,
+	"DATETIME": true, "TIMESTAMP": true, "YEAR": true, "CHAR": true, "VARCHAR": true,
+	"BINARY": true, "VARBINARY": true, "BLOB": true, "TEXT": true, "ENUM": true, "SET_": true,
+	"CHARACTER": true, "JSON": true, "GEOMETRY": true, "POINT": true,
+	"USE": true, "BEGIN": true, "COMMIT": true, "ROLLBACK": true, "SAVEPOINT": true,
+	"START": true, "TRANSACTION": true, "WORK": true, "CHAIN": true, "RELEASE": true,
+	"GRANT": true, "REVOKE": true, "WITH": true, "RECURSIVE": true,
+	"PREPARE": true, "EXECUTE": true, "DEALLOCATE": true,
+	"CALL": true, "RETURN": true, "RETURNS": true, "DECLARE": true,
+	"BETWEEN": true, "LIKE": true, "ILIKE": true, "IN": true, "IS": true, "REGEXP": true, "RLIKE": true,
+	"DESC": true, "ASC": true, "ESCAPE": true, "EXPLAIN": true, "ANALYZE": true,
+	"TRUNCATE": true, "RENAME": true, "REPLACE": true, "MODIFY": true, "ADD": true, "COLUMN": true,
+	"FOR": true, "EACH": true, "ROW": true, "BEFORE": true, "AFTER": true, "OF": true,
+	"SHOW": true, "VARIABLES": true, "STATUS": true, "GLOBAL": true, "SESSION": true, "LOCAL": true,
+	"IGNORE": true, "DUPLICATE": true, "DELAYED": true, "LOW_PRIORITY": true, "HIGH_PRIORITY": true,
+	"DIV": true, "MOD": true, "XOR": true,
+}
+
+// tokenizeForDigest splits a SQL string into digest tokens, stripping comments.
+func tokenizeForDigest(q string) []digestToken {
+	var out []digestToken
+	r := []rune(q)
+	n := len(r)
+	i := 0
+	for i < n {
+		c := r[i]
+		// Whitespace
+		if unicode.IsSpace(c) {
+			i++
+			continue
+		}
+		// Line comment "-- "
+		if c == '-' && i+1 < n && r[i+1] == '-' && (i+2 >= n || unicode.IsSpace(r[i+2])) {
+			for i < n && r[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		// Hash comment
+		if c == '#' {
+			for i < n && r[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		// Block comment
+		if c == '/' && i+1 < n && r[i+1] == '*' {
+			i += 2
+			for i+1 < n && !(r[i] == '*' && r[i+1] == '/') {
+				i++
+			}
+			if i+1 < n {
+				i += 2
+			} else {
+				i = n
+			}
+			continue
+		}
+		// Backtick identifier
+		if c == '`' {
+			j := i + 1
+			for j < n && r[j] != '`' {
+				j++
+			}
+			name := string(r[i+1 : j])
+			out = append(out, digestToken{kind: tokIdent, text: name})
+			if j < n {
+				j++
+			}
+			i = j
+			continue
+		}
+		// String literal
+		if c == '\'' || c == '"' {
+			quote := c
+			j := i + 1
+			for j < n {
+				if r[j] == '\\' && j+1 < n {
+					j += 2
+					continue
+				}
+				if r[j] == quote {
+					if j+1 < n && r[j+1] == quote {
+						j += 2
+						continue
+					}
+					break
+				}
+				j++
+			}
+			if j < n {
+				j++
+			}
+			out = append(out, digestToken{kind: tokString})
+			i = j
+			continue
+		}
+		// Number (incl decimals, exponent, optional negative handled at op level)
+		if unicode.IsDigit(c) || (c == '.' && i+1 < n && unicode.IsDigit(r[i+1])) {
+			j := i
+			for j < n && (unicode.IsDigit(r[j]) || r[j] == '.') {
+				j++
+			}
+			if j < n && (r[j] == 'e' || r[j] == 'E') {
+				j++
+				if j < n && (r[j] == '+' || r[j] == '-') {
+					j++
+				}
+				for j < n && unicode.IsDigit(r[j]) {
+					j++
+				}
+			}
+			out = append(out, digestToken{kind: tokNumber})
+			i = j
+			continue
+		}
+		// Identifier / keyword (letters, digits, underscore, $, also unicode letters)
+		if unicode.IsLetter(c) || c == '_' || c == '$' {
+			j := i
+			for j < n && (unicode.IsLetter(r[j]) || unicode.IsDigit(r[j]) || r[j] == '_' || r[j] == '$') {
+				j++
+			}
+			word := string(r[i:j])
+			upper := strings.ToUpper(word)
+			if upper == "NULL" {
+				out = append(out, digestToken{kind: tokNull})
+			} else if sqlKeywords[upper] {
+				out = append(out, digestToken{kind: tokKeyword, text: upper})
+			} else {
+				out = append(out, digestToken{kind: tokIdent, text: word})
+			}
+			i = j
+			continue
+		}
+		// Punctuation single chars
+		switch c {
+		case '(', ')', ',', ';', '.':
+			out = append(out, digestToken{kind: tokPunct, text: string(c)})
+			i++
+			continue
+		}
+		// Multi-char operators
+		if c == '<' && i+1 < n && (r[i+1] == '=' || r[i+1] == '>') {
+			out = append(out, digestToken{kind: tokOperator, text: string(r[i : i+2])})
+			i += 2
+			continue
+		}
+		if c == '>' && i+1 < n && r[i+1] == '=' {
+			out = append(out, digestToken{kind: tokOperator, text: ">="})
+			i += 2
+			continue
+		}
+		if c == '!' && i+1 < n && r[i+1] == '=' {
+			out = append(out, digestToken{kind: tokOperator, text: "!="})
+			i += 2
+			continue
+		}
+		if c == ':' && i+1 < n && r[i+1] == '=' {
+			out = append(out, digestToken{kind: tokOperator, text: ":="})
+			i += 2
+			continue
+		}
+		if c == '|' && i+1 < n && r[i+1] == '|' {
+			out = append(out, digestToken{kind: tokOperator, text: "||"})
+			i += 2
+			continue
+		}
+		if c == '&' && i+1 < n && r[i+1] == '&' {
+			out = append(out, digestToken{kind: tokOperator, text: "&&"})
+			i += 2
+			continue
+		}
+		// Single-char operator fallback
+		out = append(out, digestToken{kind: tokOperator, text: string(c)})
+		i++
+	}
+	return out
+}
+
+// collapseValueLists collapses repeating "(...) , (...) , ..." patterns into
+// a single "(...) /* , ... */" group, mirroring MySQL's digest reduction.
+func collapseValueLists(tokens []digestToken) []digestToken {
+	// Find each group sequence: '(' ... ')' ',' '(' ... ')' [ ',' '(' ... ')' ]*
+	// When length >= 2 groups, replace with first group + " /* , ... */".
+	out := make([]digestToken, 0, len(tokens))
+	i := 0
+	for i < len(tokens) {
+		if tokens[i].kind == tokPunct && tokens[i].text == "(" {
+			// Try to find the matching ")"
+			depth := 1
+			j := i + 1
+			for j < len(tokens) && depth > 0 {
+				if tokens[j].kind == tokPunct && tokens[j].text == "(" {
+					depth++
+				} else if tokens[j].kind == tokPunct && tokens[j].text == ")" {
+					depth--
+					if depth == 0 {
+						break
+					}
+				}
+				j++
+			}
+			if depth != 0 {
+				out = append(out, tokens[i])
+				i++
+				continue
+			}
+			// We have a (...) group from i..j inclusive.
+			// Look for repeating ", (..." pattern.
+			groupCount := 1
+			k := j + 1
+			for k < len(tokens) && tokens[k].kind == tokPunct && tokens[k].text == "," {
+				if k+1 < len(tokens) && tokens[k+1].kind == tokPunct && tokens[k+1].text == "(" {
+					// Find matching ")"
+					d := 1
+					m := k + 2
+					for m < len(tokens) && d > 0 {
+						if tokens[m].kind == tokPunct && tokens[m].text == "(" {
+							d++
+						} else if tokens[m].kind == tokPunct && tokens[m].text == ")" {
+							d--
+							if d == 0 {
+								break
+							}
+						}
+						m++
+					}
+					if d != 0 {
+						break
+					}
+					groupCount++
+					k = m + 1
+					continue
+				}
+				break
+			}
+			if groupCount >= 2 {
+				// Append the first group, then a synthetic " /* , ... */ " marker.
+				out = append(out, tokens[i:j+1]...)
+				out = append(out, digestToken{kind: tokKeyword, text: "/* , ... */"})
+				i = k
+				continue
+			}
+		}
+		out = append(out, tokens[i])
+		i++
+	}
+	return out
+}
+
+// joinDigestTokens renders the token stream as the final digest_text string.
+// Spacing rules:
+//   - No space before ',' ';' ')' '.'
+//   - No space after '(' '.'
+//   - Single space between most other tokens
+func joinDigestTokens(tokens []digestToken) string {
+	var b strings.Builder
+	for i, t := range tokens {
+		var rendered string
+		switch t.kind {
+		case tokKeyword:
+			rendered = t.text
+		case tokIdent:
+			rendered = "`" + strings.ReplaceAll(t.text, "`", "``") + "`"
+		case tokNumber, tokString, tokNull:
+			rendered = "?"
+		case tokPunct:
+			rendered = t.text
+		case tokOperator:
+			rendered = t.text
+		}
+		if i > 0 {
+			prev := tokens[i-1]
+			if needsSpace(prev, t) {
+				b.WriteByte(' ')
+			}
+		}
+		b.WriteString(rendered)
+	}
+	return b.String()
+}
+
+func needsSpace(prev, cur digestToken) bool {
+	// No space after '('
+	if prev.kind == tokPunct && prev.text == "(" {
+		return false
+	}
+	// No space before ',' ';' ')'
+	if cur.kind == tokPunct && (cur.text == "," || cur.text == ";" || cur.text == ")") {
+		return false
+	}
+	return true
+}
