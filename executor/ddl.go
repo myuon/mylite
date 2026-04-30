@@ -3079,6 +3079,69 @@ func implicitDefaultForType(colType string) interface{} {
 	}
 }
 
+// encodeInstantDefault encodes the DEFAULT value of an instant-added column
+// in InnoDB's on-disk byte format and returns it as a lowercase hex string.
+// Returns "" when no default is meaningful (e.g. nullable column with no
+// explicit default — InnoDB stores NULL as the default, surfaced as the
+// string "NULL" in INFORMATION_SCHEMA.INNODB_COLUMNS.DEFAULT_VALUE).
+func encodeInstantDefault(col catalog.ColumnDef) string {
+	if col.Default == nil {
+		// Nullable column without explicit default: caller treats as NULL.
+		return ""
+	}
+	defStr := *col.Default
+	upper := strings.ToUpper(strings.TrimSpace(col.Type))
+	base := upper
+	if i := strings.IndexByte(base, '('); i >= 0 {
+		base = strings.TrimSpace(base[:i])
+	}
+	isUnsigned := strings.Contains(upper, "UNSIGNED")
+	switch base {
+	case "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT":
+		var width int
+		switch base {
+		case "TINYINT":
+			width = 1
+		case "SMALLINT":
+			width = 2
+		case "MEDIUMINT":
+			width = 3
+		case "INT", "INTEGER":
+			width = 4
+		case "BIGINT":
+			width = 8
+		}
+		var n uint64
+		if isUnsigned {
+			v, err := strconv.ParseUint(strings.TrimSpace(defStr), 10, 64)
+			if err != nil {
+				return ""
+			}
+			n = v
+		} else {
+			v, err := strconv.ParseInt(strings.TrimSpace(defStr), 10, 64)
+			if err != nil {
+				return ""
+			}
+			// InnoDB flips the sign bit of signed integers for big-endian sortability.
+			signBit := uint64(1) << (uint(width)*8 - 1)
+			n = uint64(v) ^ signBit
+			// Mask to width
+			if width < 8 {
+				n &= (uint64(1) << (uint(width) * 8)) - 1
+			}
+		}
+		buf := make([]byte, width)
+		for i := width - 1; i >= 0; i-- {
+			buf[i] = byte(n & 0xff)
+			n >>= 8
+		}
+		return fmt.Sprintf("%x", buf)
+	}
+	// For non-integer types we don't yet produce the InnoDB hex encoding.
+	return ""
+}
+
 func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 	colDef := catalog.ColumnDef{
 		Name:     col.Name.String(),
@@ -3456,17 +3519,29 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 	// Pre-check: ALGORITHM=INPLACE rejection for operations that require COPY
 	alterIsInplace := false
+	alterIsInstant := false
 	{
 		isInplace := false
+		isInstant := false
 		hasStoredGcolAdd := false
+		hasNonAddOp := false   // any op other than ADD COLUMN (rejects INSTANT)
+		hasPKChange := false   // PK alteration (rejects INSTANT)
+		hasFirstOrAfter := false // ADD COLUMN with FIRST/AFTER position (INSTANT requires last)
 		for _, opt := range stmt.AlterOptions {
 			switch av := opt.(type) {
 			case sqlparser.AlgorithmValue:
-				if strings.EqualFold(string(av), "INPLACE") {
+				switch strings.ToUpper(string(av)) {
+				case "INPLACE":
 					isInplace = true
 					alterIsInplace = true
+				case "INSTANT":
+					isInstant = true
+					alterIsInstant = true
 				}
 			case *sqlparser.AddColumns:
+				if av.First || av.After != nil {
+					hasFirstOrAfter = true
+				}
 				for _, col := range av.Columns {
 					if col.Type.Options != nil && col.Type.Options.As != nil {
 						colTypeStr := strings.ToUpper(sqlparser.String(col.Type))
@@ -3474,7 +3549,26 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 							hasStoredGcolAdd = true
 						}
 					}
+					// ADD COLUMN that is itself a primary key inhibits INSTANT.
+					if col.Type.Options != nil && col.Type.Options.KeyOpt == sqlparser.ColKeyPrimary {
+						hasPKChange = true
+					}
 				}
+			case *sqlparser.DropColumn, *sqlparser.ModifyColumn, *sqlparser.ChangeColumn,
+				*sqlparser.RenameColumn, *sqlparser.AlterColumn:
+				hasNonAddOp = true
+			case *sqlparser.AddIndexDefinition:
+				// ADD PRIMARY KEY blocks INSTANT.
+				if av.IndexDefinition != nil && av.IndexDefinition.Info != nil &&
+					av.IndexDefinition.Info.Type == sqlparser.IndexTypePrimary {
+					hasPKChange = true
+				}
+				hasNonAddOp = true
+			case *sqlparser.DropKey:
+				if av.Type == sqlparser.PrimaryKeyType {
+					hasPKChange = true
+				}
+				hasNonAddOp = true
 			}
 		}
 		if isInplace && hasStoredGcolAdd {
@@ -3485,7 +3579,21 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		if isInplace && withValidation {
 			return nil, mysqlError(1846, "0A000", "ALGORITHM=INPLACE is not supported for this operation. Try ALGORITHM=COPY.")
 		}
+		// ALGORITHM=INSTANT only supports ADD COLUMN (at the end of the table) and a few other ops.
+		// Reject when accompanied by DROP/MODIFY/CHANGE/PK alteration.
+		if isInstant {
+			if hasNonAddOp || hasPKChange {
+				return nil, mysqlError(1845, "0A000", "ALGORITHM=INSTANT is not supported for this operation. Try ALGORITHM=INPLACE.")
+			}
+			if hasFirstOrAfter {
+				return nil, mysqlError(1845, "0A000", "ALGORITHM=INSTANT is not supported. Reason: Cannot add a column at this position. Try ALGORITHM=INPLACE.")
+			}
+			if hasStoredGcolAdd {
+				return nil, mysqlError(1845, "0A000", "ALGORITHM=INSTANT is not supported. Reason: Cannot add a stored generated column. Try ALGORITHM=INPLACE.")
+			}
+		}
 	}
+	_ = alterIsInstant
 
 	// Pre-check: CSV engine requires all columns to be NOT NULL (ER_CHECK_NOT_IMPLEMENTED = 1178)
 	// This applies to ADD COLUMN, MODIFY COLUMN, and CHANGE COLUMN on CSV tables.
@@ -3820,11 +3928,49 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 						}
 					}
 				}
+				// Determine whether this ADD COLUMN should be treated as INSTANT.
+				// MySQL 8.0.29+ defaults to INSTANT when possible. We treat it as
+				// INSTANT either when ALGORITHM=INSTANT was explicitly requested,
+				// or by default for plain ADD COLUMN at the end of the table on
+				// non-MyISAM/CSV tables (mirrors MySQL's "instant by default").
+				if !alterIsInplace {
+					instantEligible := position == "" && !colDef.PrimaryKey
+					if instantEligible {
+						genExprPre := generatedColumnExpr(colDef.Type)
+						if genExprPre != "" && strings.Contains(strings.ToUpper(colDef.Type), "STORED") {
+							instantEligible = false
+						}
+						if colDef.AutoIncrement {
+							instantEligible = false
+						}
+					}
+					if instantEligible {
+						colDef.IsInstantAdded = true
+						colDef.InstantDefault = encodeInstantDefault(colDef)
+					}
+				}
 				if addErr := db.AddColumnAt(tableName, colDef, position, afterCol); addErr != nil {
 					if strings.Contains(addErr.Error(), "already exists") {
 						return nil, mysqlError(1060, "42S21", fmt.Sprintf("Duplicate column name '%s'", colDef.Name))
 					}
 					return nil, addErr
+				}
+				// Update InstantCols on the table when the first INSTANT-added
+				// column is recorded (snapshot of column count before this add).
+				if colDef.IsInstantAdded {
+					if tableDef, tdErr := db.GetTable(tableName); tdErr == nil && tableDef != nil {
+						if tableDef.InstantCols == 0 {
+							// Set to the number of "regular" columns just before this add
+							// (i.e. columns that existed prior to this INSTANT).
+							n := 0
+							for _, c := range tableDef.Columns {
+								if !c.IsInstantAdded {
+									n++
+								}
+							}
+							tableDef.InstantCols = n
+						}
+					}
 				}
 				// If the new column is a primary key (inline KEY or PRIMARY KEY), set it
 				if colDef.PrimaryKey {
@@ -3913,6 +4059,35 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 		case *sqlparser.ModifyColumn:
 			colDef := columnDefFromAST(op.NewColDefinition)
+			// MODIFY COLUMN cannot make a primary-key column explicitly nullable.
+			// Only reject when NULL was explicitly written in the definition; if
+			// the user omitted it, MySQL silently keeps the column NOT NULL.
+			// MySQL: ER_PRIMARY_CANT_HAVE_NULL (1171, SQLSTATE 42000).
+			if op.NewColDefinition.Type.Options != nil &&
+				op.NewColDefinition.Type.Options.Null != nil &&
+				*op.NewColDefinition.Type.Options.Null {
+				if modDef, _ := db.GetTable(tableName); modDef != nil {
+					targetName := strings.ToLower(op.NewColDefinition.Name.String())
+					for _, pk := range modDef.PrimaryKey {
+						if strings.ToLower(stripPrefixLengthFromCol(pk)) == targetName {
+							return nil, mysqlError(1171, "42000", "All parts of a PRIMARY KEY must be NOT NULL; if you need NULL in a key, use UNIQUE instead")
+						}
+					}
+				}
+			}
+			// If the target column is part of the primary key and NULL was not
+			// explicitly requested, silently keep it NOT NULL (MySQL behavior).
+			if colDef.Nullable {
+				if modDef, _ := db.GetTable(tableName); modDef != nil {
+					targetName := strings.ToLower(op.NewColDefinition.Name.String())
+					for _, pk := range modDef.PrimaryKey {
+						if strings.ToLower(stripPrefixLengthFromCol(pk)) == targetName {
+							colDef.Nullable = false
+							break
+						}
+					}
+				}
+			}
 			// Extract and validate SRID constraint for MODIFY COLUMN.
 			if sridErr := e.alterApplySRID(op.NewColDefinition, &colDef); sridErr != nil {
 				return nil, sridErr
@@ -4048,6 +4223,34 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		case *sqlparser.ChangeColumn:
 			oldName := op.OldColumn.Name.String()
 			colDef := columnDefFromAST(op.NewColDefinition)
+			// CHANGE COLUMN cannot make a primary-key column explicitly nullable.
+			// Only reject when NULL was explicitly written in the definition; if
+			// the user omitted it, MySQL silently keeps the column NOT NULL.
+			if op.NewColDefinition.Type.Options != nil &&
+				op.NewColDefinition.Type.Options.Null != nil &&
+				*op.NewColDefinition.Type.Options.Null {
+				if chgDef, _ := db.GetTable(tableName); chgDef != nil {
+					targetName := strings.ToLower(oldName)
+					for _, pk := range chgDef.PrimaryKey {
+						if strings.ToLower(stripPrefixLengthFromCol(pk)) == targetName {
+							return nil, mysqlError(1171, "42000", "All parts of a PRIMARY KEY must be NOT NULL; if you need NULL in a key, use UNIQUE instead")
+						}
+					}
+				}
+			}
+			// If the target column is part of the primary key and NULL was not
+			// explicitly requested, silently keep it NOT NULL (MySQL behavior).
+			if colDef.Nullable {
+				if chgDef, _ := db.GetTable(tableName); chgDef != nil {
+					targetName := strings.ToLower(oldName)
+					for _, pk := range chgDef.PrimaryKey {
+						if strings.ToLower(stripPrefixLengthFromCol(pk)) == targetName {
+							colDef.Nullable = false
+							break
+						}
+					}
+				}
+			}
 			// Extract and validate SRID constraint for CHANGE COLUMN.
 			if sridErr := e.alterApplySRID(op.NewColDefinition, &colDef); sridErr != nil {
 				return nil, sridErr
