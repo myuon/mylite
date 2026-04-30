@@ -1,5 +1,7 @@
 package executor
 
+import "fmt"
+
 // PlanExplainer converts a logical PlanNode tree to EXPLAIN output rows.
 // This is Phase 1 scaffolding; actual output still uses the existing explain path.
 type PlanExplainer struct {
@@ -113,11 +115,41 @@ func (pe *PlanExplainer) collectRows(node PlanNode, rows *[][]interface{}, extra
 			"Using temporary",
 		})
 
+	case *QueryWithSubqueries:
+		// Emit the main plan first, then each non-FROM subquery's rows.
+		// MySQL conventionally orders WHERE-clause subqueries before
+		// FROM-clause derived tables, but DerivedTableNode rows are already
+		// part of n.Main, so we just append SubqueryNode rows at the end.
+		pe.collectRows(n.Main, rows, extraAccum)
+		for _, sub := range n.Subqueries {
+			pe.collectRows(sub, rows, nil)
+		}
+
 	case *SubqueryNode:
 		pe.collectRows(n.Plan, rows, extraAccum)
 
 	case *DerivedTableNode:
-		pe.collectRows(n.Plan, rows, extraAccum)
+		// Emit a "<derivedN>" placeholder row at the parent's id/select_type level.
+		// This represents the materialized derived table seen by the outer query.
+		// When ParentSelectType is empty (e.g. derived table is nested inside a JOIN
+		// or another derived table), fall back to recursive emission only.
+		if n.ParentSelectType != "" {
+			placeholderExtra := buildExtraString(append([]string(nil), extraAccum...))
+			derivedRef := fmt.Sprintf("<derived%d>", n.ID)
+			*rows = append(*rows, []interface{}{
+				n.ParentID,
+				n.ParentSelectType,
+				derivedRef,
+				nil, // partitions
+				"ALL",
+				nil, nil, nil, nil,
+				int64(2), // rows estimate (MySQL default 2 unless materialized count known)
+				"100.00",
+				placeholderExtra,
+			})
+		}
+		// Recurse into the inner plan; it will emit DERIVED rows with the inner ID.
+		pe.collectRows(n.Plan, rows, nil)
 	}
 }
 
