@@ -3144,9 +3144,241 @@ func encodeInstantDefault(col catalog.ColumnDef) string {
 			n >>= 8
 		}
 		return fmt.Sprintf("%x", buf)
+	case "FLOAT":
+		// IEEE-754 32-bit, stored little-endian on disk.
+		v, err := strconv.ParseFloat(strings.TrimSpace(defStr), 32)
+		if err != nil {
+			return ""
+		}
+		bits := math.Float32bits(float32(v))
+		buf := make([]byte, 4)
+		for i := 0; i < 4; i++ {
+			buf[i] = byte(bits & 0xff)
+			bits >>= 8
+		}
+		return fmt.Sprintf("%x", buf)
+	case "DOUBLE", "REAL":
+		// IEEE-754 64-bit, stored little-endian on disk.
+		v, err := strconv.ParseFloat(strings.TrimSpace(defStr), 64)
+		if err != nil {
+			return ""
+		}
+		bits := math.Float64bits(v)
+		buf := make([]byte, 8)
+		for i := 0; i < 8; i++ {
+			buf[i] = byte(bits & 0xff)
+			bits >>= 8
+		}
+		return fmt.Sprintf("%x", buf)
+	case "DECIMAL", "NUMERIC", "DEC", "FIXED":
+		// Parse precision/scale from the original type string, e.g. DECIMAL(5,2).
+		precision, scale := 10, 0
+		if i := strings.IndexByte(upper, '('); i >= 0 {
+			if j := strings.IndexByte(upper[i:], ')'); j > 0 {
+				inner := upper[i+1 : i+j]
+				parts := strings.Split(inner, ",")
+				if p, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil {
+					precision = p
+				}
+				if len(parts) > 1 {
+					if s, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil {
+						scale = s
+					}
+				}
+			}
+		}
+		return encodeMySQLDecimal(strings.TrimSpace(defStr), precision, scale)
+	case "BIT":
+		// BIT(M) default like b'101010' or numeric/string. InnoDB stores it as
+		// big-endian bytes of the bit value, ceil(M/8) wide.
+		width := 1
+		if i := strings.IndexByte(upper, '('); i >= 0 {
+			if j := strings.IndexByte(upper[i:], ')'); j > 0 {
+				if m, err := strconv.Atoi(strings.TrimSpace(upper[i+1 : i+j])); err == nil && m > 0 {
+					width = (m + 7) / 8
+				}
+			}
+		}
+		bitStr := strings.TrimSpace(defStr)
+		var n uint64
+		// Accept b'...' / B'...' / 0b... / 0x... / decimal.
+		switch {
+		case len(bitStr) >= 3 && (bitStr[0] == 'b' || bitStr[0] == 'B') && bitStr[1] == '\'' && bitStr[len(bitStr)-1] == '\'':
+			v, err := strconv.ParseUint(bitStr[2:len(bitStr)-1], 2, 64)
+			if err != nil {
+				return ""
+			}
+			n = v
+		case len(bitStr) >= 2 && bitStr[0] == '0' && (bitStr[1] == 'b' || bitStr[1] == 'B'):
+			v, err := strconv.ParseUint(bitStr[2:], 2, 64)
+			if err != nil {
+				return ""
+			}
+			n = v
+		case len(bitStr) >= 2 && bitStr[0] == '0' && (bitStr[1] == 'x' || bitStr[1] == 'X'):
+			v, err := strconv.ParseUint(bitStr[2:], 16, 64)
+			if err != nil {
+				return ""
+			}
+			n = v
+		default:
+			v, err := strconv.ParseUint(bitStr, 10, 64)
+			if err != nil {
+				return ""
+			}
+			n = v
+		}
+		buf := make([]byte, width)
+		for i := width - 1; i >= 0; i-- {
+			buf[i] = byte(n & 0xff)
+			n >>= 8
+		}
+		return fmt.Sprintf("%x", buf)
 	}
 	// For non-integer types we don't yet produce the InnoDB hex encoding.
 	return ""
+}
+
+// encodeMySQLDecimal encodes a decimal literal (like "100.00") in MySQL's
+// packed DECIMAL on-disk format for a given (precision, scale).
+//
+// MySQL stores DECIMAL as: integer-digits packed left-to-right and
+// fractional-digits packed left-to-right. Each group of 9 digits occupies
+// 4 bytes; remaining (<9) digits use a smaller width per the lookup table
+// {0:0, 1:1, 2:1, 3:2, 4:2, 5:3, 6:3, 7:4, 8:4}. The high bit of the first
+// byte is XOR'd with 0x80 for big-endian sortability so that positive
+// numbers compare greater than negatives. Negatives flip every byte.
+func encodeMySQLDecimal(literal string, precision, scale int) string {
+	if precision <= 0 || scale < 0 || scale > precision {
+		return ""
+	}
+	intDigits := precision - scale
+
+	digitsPerByteLeftover := []int{0, 1, 1, 2, 2, 3, 3, 4, 4}
+	intFullGroups := intDigits / 9
+	intLeftover := intDigits % 9
+	fracFullGroups := scale / 9
+	fracLeftover := scale % 9
+	totalBytes := intFullGroups*4 + digitsPerByteLeftover[intLeftover] + fracFullGroups*4 + digitsPerByteLeftover[fracLeftover]
+	if totalBytes == 0 {
+		return ""
+	}
+
+	// Parse sign, integer and fractional parts as digit strings.
+	neg := false
+	s := literal
+	if len(s) > 0 && (s[0] == '+' || s[0] == '-') {
+		neg = s[0] == '-'
+		s = s[1:]
+	}
+	intPart, fracPart := s, ""
+	if dot := strings.IndexByte(s, '.'); dot >= 0 {
+		intPart = s[:dot]
+		fracPart = s[dot+1:]
+	}
+	// Strip leading zeros on integer (but keep at least nothing — "" means 0).
+	intPart = strings.TrimLeft(intPart, "0")
+	// Validate digit-only.
+	for i := 0; i < len(intPart); i++ {
+		if intPart[i] < '0' || intPart[i] > '9' {
+			return ""
+		}
+	}
+	for i := 0; i < len(fracPart); i++ {
+		if fracPart[i] < '0' || fracPart[i] > '9' {
+			return ""
+		}
+	}
+	// Pad/truncate to (intDigits, scale).
+	if len(intPart) > intDigits {
+		// Out of range; we can't safely encode.
+		return ""
+	}
+	intPadded := strings.Repeat("0", intDigits-len(intPart)) + intPart
+	fracPadded := fracPart
+	if len(fracPadded) > scale {
+		fracPadded = fracPadded[:scale]
+	} else {
+		fracPadded = fracPadded + strings.Repeat("0", scale-len(fracPadded))
+	}
+
+	buf := make([]byte, 0, totalBytes)
+
+	// Encode integer part: leftover group first (high-order), then full 9-digit groups.
+	pos := 0
+	if intLeftover > 0 {
+		group := intPadded[pos : pos+intLeftover]
+		v, err := strconv.ParseUint(group, 10, 32)
+		if err != nil {
+			return ""
+		}
+		w := digitsPerByteLeftover[intLeftover]
+		tmp := make([]byte, w)
+		x := uint32(v)
+		for i := w - 1; i >= 0; i-- {
+			tmp[i] = byte(x & 0xff)
+			x >>= 8
+		}
+		buf = append(buf, tmp...)
+		pos += intLeftover
+	}
+	for g := 0; g < intFullGroups; g++ {
+		group := intPadded[pos : pos+9]
+		v, err := strconv.ParseUint(group, 10, 32)
+		if err != nil {
+			return ""
+		}
+		x := uint32(v)
+		tmp := []byte{byte(x >> 24), byte(x >> 16), byte(x >> 8), byte(x)}
+		buf = append(buf, tmp...)
+		pos += 9
+	}
+
+	// Encode fractional part: full 9-digit groups first, then leftover (low-order).
+	pos = 0
+	for g := 0; g < fracFullGroups; g++ {
+		group := fracPadded[pos : pos+9]
+		v, err := strconv.ParseUint(group, 10, 32)
+		if err != nil {
+			return ""
+		}
+		x := uint32(v)
+		tmp := []byte{byte(x >> 24), byte(x >> 16), byte(x >> 8), byte(x)}
+		buf = append(buf, tmp...)
+		pos += 9
+	}
+	if fracLeftover > 0 {
+		group := fracPadded[pos : pos+fracLeftover]
+		v, err := strconv.ParseUint(group, 10, 32)
+		if err != nil {
+			return ""
+		}
+		w := digitsPerByteLeftover[fracLeftover]
+		// Fractional leftover groups left-align: pad on the right with zeros so the
+		// number "100.5" with scale=2 stores "50" not "05". But our `fracPadded`
+		// is already right-padded (e.g. "00" for scale=2 of 100.00), so we treat
+		// it as the integer value of the digits.
+		tmp := make([]byte, w)
+		x := uint32(v)
+		for i := w - 1; i >= 0; i-- {
+			tmp[i] = byte(x & 0xff)
+			x >>= 8
+		}
+		buf = append(buf, tmp...)
+	}
+
+	if len(buf) == 0 {
+		return ""
+	}
+	if neg {
+		for i := range buf {
+			buf[i] ^= 0xff
+		}
+	} else {
+		// Flip the sign bit of the high byte for sortability.
+		buf[0] ^= 0x80
+	}
+	return fmt.Sprintf("%x", buf)
 }
 
 func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
