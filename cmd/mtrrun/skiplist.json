@@ -3441,10 +3441,6 @@
       "reason": "failures"
     },
     {
-      "test": "innodb/innodb-autoinc-44030",
-      "reason": "auto_increment errors"
-    },
-    {
       "test": "innodb/innodb_misc1",
       "reason": "duplicate key with PAD SPACE collation"
     },
