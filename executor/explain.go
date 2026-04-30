@@ -6911,8 +6911,16 @@ func (e *Executor) explainJSONUsedColumns(tableName string, query string) []stri
 			}
 			return cols
 		}
-		// Table is only in a subquery: hasStar from outer SELECT doesn't apply.
-		// Fall through to use referencedCols from the subquery references.
+		// Table is only in a subquery: hasStar from outer SELECT doesn't apply,
+		// but a `*` in an INNER SELECT whose FROM contains this table does apply.
+		if e.explainJSONStarReachesTable(stmt, tableName) {
+			cols := make([]string, len(td.Columns))
+			for i, c := range td.Columns {
+				cols[i] = c.Name
+			}
+			return cols
+		}
+		// Otherwise fall through to use referencedCols from explicit references.
 	}
 
 	// If query has window functions, also include primary key columns (MySQL needs them for row ordering)
@@ -6940,6 +6948,44 @@ func (e *Executor) explainJSONUsedColumns(tableName string, query string) []stri
 	// If no columns matched, return nil (no used_columns for this table).
 	// This is correct for joined tables with no column references (e.g., t2 in a cross join).
 	return result
+}
+
+// explainJSONStarReachesTable reports whether some SELECT inside `stmt` has a
+// `*` star expression and that SELECT's FROM (transitively through derived
+// tables) references `tableName`. This is used by `explainJSONUsedColumns` so
+// that nested derived tables of the form `(SELECT * FROM t1) a1` correctly
+// expand `*` to the columns of `t1`.
+func (e *Executor) explainJSONStarReachesTable(stmt sqlparser.SQLNode, tableName string) bool {
+	found := false
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if found {
+			return false, nil
+		}
+		sel, ok := node.(*sqlparser.Select)
+		if !ok || sel.SelectExprs == nil {
+			return true, nil
+		}
+		hasStar := false
+		for _, expr := range sel.SelectExprs.Exprs {
+			if _, ok := expr.(*sqlparser.StarExpr); ok {
+				hasStar = true
+				break
+			}
+		}
+		if !hasStar {
+			return true, nil
+		}
+		for _, te := range sel.From {
+			for _, tn := range e.extractAllTableNames(te) {
+				if strings.EqualFold(tn, tableName) {
+					found = true
+					return false, nil
+				}
+			}
+		}
+		return true, nil
+	}, stmt)
+	return found
 }
 
 // explainJSONBuildConditionFromQuery reconstructs the WHERE condition from the original query.
@@ -7646,14 +7692,27 @@ func (e *Executor) explainJSONExtractDerivedAlias(query string, derivedID int64)
 // findDerivedAliasInExpr recursively searches for a derived table alias by its sequential order.
 // counter starts at 1 and is incremented for each derived table found; when counter matches derivedID-1,
 // the next derived table's alias is returned.
+//
+// This recurses into nested DerivedTable.Select.From so deeply-nested aliases can
+// be located. The traversal order is depth-first matching MySQL's select_id assignment
+// (outer derived gets id=2, then its inner derived gets id=3, etc.).
 func (e *Executor) findDerivedAliasInExpr(te sqlparser.TableExpr, derivedID int64, counter *int64) string {
 	switch t := te.(type) {
 	case *sqlparser.AliasedTableExpr:
-		if _, ok := t.Expr.(*sqlparser.DerivedTable); ok {
+		if dt, ok := t.Expr.(*sqlparser.DerivedTable); ok {
 			*counter++
 			if *counter == derivedID {
 				if !t.As.IsEmpty() {
 					return t.As.String()
+				}
+				return ""
+			}
+			// Recurse into the derived table's SELECT to find nested derived tables.
+			if inner, ok := dt.Select.(*sqlparser.Select); ok {
+				for _, fe := range inner.From {
+					if alias := e.findDerivedAliasInExpr(fe, derivedID, counter); alias != "" {
+						return alias
+					}
 				}
 			}
 		}
@@ -7696,6 +7755,10 @@ func (e *Executor) explainJSONExtractDerivedColumns(query string, derivedID int6
 
 // findDerivedColumnsInExpr recursively finds the SELECT expressions of a derived table
 // with the given select_id, returning them as formatted strings.
+//
+// This recurses into nested DerivedTable.Select.From so deeply-nested derived
+// tables can be located. The traversal order matches MySQL's select_id
+// assignment (depth-first, outer derived first).
 func (e *Executor) findDerivedColumnsInExpr(te sqlparser.TableExpr, derivedID int64, counter *int64) []string {
 	switch t := te.(type) {
 	case *sqlparser.AliasedTableExpr:
@@ -7703,7 +7766,16 @@ func (e *Executor) findDerivedColumnsInExpr(te sqlparser.TableExpr, derivedID in
 			*counter++
 			if *counter == derivedID {
 				if inner, ok := dt.Select.(*sqlparser.Select); ok {
-					return explainJSONSelectExprNames(inner.SelectExprs)
+					return e.explainJSONResolveSelectExprNames(inner)
+				}
+				return nil
+			}
+			// Recurse into nested derived tables.
+			if inner, ok := dt.Select.(*sqlparser.Select); ok {
+				for _, fe := range inner.From {
+					if cols := e.findDerivedColumnsInExpr(fe, derivedID, counter); cols != nil {
+						return cols
+					}
 				}
 			}
 		}
@@ -7746,6 +7818,119 @@ func explainJSONSelectExprNames(exprs *sqlparser.SelectExprs) []string {
 		}
 	}
 	return result
+}
+
+// explainJSONResolveSelectExprNames returns the display names for a SELECT list,
+// expanding `*` star expressions to the underlying columns by inspecting the FROM
+// clause. For each FROM entry that is a real table, the table's columns are added.
+// For derived tables, this recursively resolves the inner SELECT.
+//
+// If a star is qualified (e.g., t1.*), only that table's columns are added.
+func (e *Executor) explainJSONResolveSelectExprNames(sel *sqlparser.Select) []string {
+	if sel == nil || sel.SelectExprs == nil {
+		return nil
+	}
+	var result []string
+	for _, expr := range sel.SelectExprs.Exprs {
+		switch ae := expr.(type) {
+		case *sqlparser.AliasedExpr:
+			if !ae.As.IsEmpty() {
+				result = append(result, ae.As.String())
+			} else {
+				// For column references like t.col or col, just use the column name
+				if col, ok := ae.Expr.(*sqlparser.ColName); ok {
+					result = append(result, col.Name.String())
+				} else {
+					s := sqlparser.String(ae.Expr)
+					s = explainJSONUppercaseSQLKeywords(s)
+					result = append(result, s)
+				}
+			}
+		case *sqlparser.StarExpr:
+			// Expand * by walking FROM clause
+			qual := ""
+			if !ae.TableName.Name.IsEmpty() {
+				qual = ae.TableName.Name.String()
+			}
+			cols := e.explainJSONExpandStarFromFrom(sel.From, qual)
+			if len(cols) == 0 {
+				// Fallback: if expansion fails, keep the literal *
+				result = append(result, "*")
+			} else {
+				result = append(result, cols...)
+			}
+		}
+	}
+	return result
+}
+
+// explainJSONExpandStarFromFrom walks the FROM clause and returns the columns
+// that a `*` expression would refer to. If qualifier is non-empty, only the
+// matching table's columns are returned.
+func (e *Executor) explainJSONExpandStarFromFrom(fromExprs sqlparser.TableExprs, qualifier string) []string {
+	var cols []string
+	for _, te := range fromExprs {
+		cols = append(cols, e.explainJSONExpandStarFromTableExpr(te, qualifier)...)
+	}
+	return cols
+}
+
+// explainJSONExpandStarFromTableExpr expands `*` for one TableExpr.
+// If qualifier is non-empty, only the table matching that qualifier (alias or name)
+// contributes columns.
+func (e *Executor) explainJSONExpandStarFromTableExpr(te sqlparser.TableExpr, qualifier string) []string {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		alias := ""
+		if !t.As.IsEmpty() {
+			alias = t.As.String()
+		}
+		// Determine the effective name for qualifier matching
+		effName := alias
+		if dt, isDerived := t.Expr.(*sqlparser.DerivedTable); isDerived {
+			if effName == "" {
+				return nil
+			}
+			if qualifier != "" && !strings.EqualFold(qualifier, effName) {
+				return nil
+			}
+			// Recursively resolve the inner SELECT
+			if inner, ok := dt.Select.(*sqlparser.Select); ok {
+				return e.explainJSONResolveSelectExprNames(inner)
+			}
+			return nil
+		}
+		if tn, ok := t.Expr.(sqlparser.TableName); ok {
+			tblName := tn.Name.String()
+			if effName == "" {
+				effName = tblName
+			}
+			if qualifier != "" && !strings.EqualFold(qualifier, effName) {
+				return nil
+			}
+			td := e.explainGetTableDef(tblName)
+			if td == nil {
+				return nil
+			}
+			cols := make([]string, 0, len(td.Columns))
+			for _, c := range td.Columns {
+				cols = append(cols, c.Name)
+			}
+			return cols
+		}
+	case *sqlparser.JoinTableExpr:
+		var out []string
+		out = append(out, e.explainJSONExpandStarFromTableExpr(t.LeftExpr, qualifier)...)
+		out = append(out, e.explainJSONExpandStarFromTableExpr(t.RightExpr, qualifier)...)
+		return out
+	case *sqlparser.ParenTableExpr:
+		var out []string
+		for _, expr := range t.Exprs {
+			out = append(out, e.explainJSONExpandStarFromTableExpr(expr, qualifier)...)
+		}
+		return out
+	}
+	return nil
 }
 
 // explainJSONUppercaseSQLKeywords uppercases SQL function names and keywords in an
@@ -8572,16 +8757,17 @@ func (e *Executor) explainJSONDocument(query string) string {
 		if len(primaryRows) > 0 {
 			p := primaryRows[0]
 			if p.row[2] != nil {
-				tblBlock := e.explainJSONTableBlock(p.row, query)
-
-				// Check if the primary table references a derived table
-				tableName := fmt.Sprintf("%v", p.row[2])
-				if strings.HasPrefix(tableName, "<derived") {
-					// Extract the derived table ID (e.g., 2 from "<derived2>")
+				// Recursive helper: given a tblBlock referring to a <derivedN> table,
+				// look up the matching DERIVED rows and wrap with materialized_from_subquery.
+				// If those inner rows are themselves <derivedM>, recurse.
+				var wrapDerived func(tblBlock []orderedKV, tableName string) []orderedKV
+				wrapDerived = func(tblBlock []orderedKV, tableName string) []orderedKV {
+					if !strings.HasPrefix(tableName, "<derived") {
+						return tblBlock
+					}
 					var derivedID int64
 					fmt.Sscanf(tableName, "<derived%d>", &derivedID)
 
-					// Collect all DERIVED rows with matching select_id
 					var matchedDerived []parsedRow
 					for _, d := range derivedRows {
 						if d.id != nil {
@@ -8590,125 +8776,129 @@ func (e *Executor) explainJSONDocument(query string) string {
 							}
 						}
 					}
-					// Fallback: if no id match, use all derived rows
 					if len(matchedDerived) == 0 {
-						matchedDerived = derivedRows
+						return tblBlock
 					}
 
-					if len(matchedDerived) > 0 {
-						// Build the inner query block for the derived table.
-						// Detect if the inner derived query has GROUP BY (Using temporary; Using filesort in Extra).
-						innerHasGroupBy := false
-						innerHasFilesort := false
-						for _, d := range matchedDerived {
-							if d.row[11] != nil {
-								extraStr := fmt.Sprintf("%v", d.row[11])
-								if strings.Contains(extraStr, "Using temporary") {
-									innerHasGroupBy = true
-								}
-								if strings.Contains(extraStr, "Using filesort") {
-									innerHasFilesort = true
-								}
+					innerHasGroupBy := false
+					innerHasFilesort := false
+					for _, d := range matchedDerived {
+						if d.row[11] != nil {
+							extraStr := fmt.Sprintf("%v", d.row[11])
+							if strings.Contains(extraStr, "Using temporary") {
+								innerHasGroupBy = true
+							}
+							if strings.Contains(extraStr, "Using filesort") {
+								innerHasFilesort = true
 							}
 						}
+					}
 
-						// For multi-table joins with filesort, the sort operates on the JOIN result
-						// (product of all joined rows), not just the row count of the table with filesort.
-						innerSortRows := int64(1)
-						if innerHasFilesort {
-							for _, d := range matchedDerived {
-								rc := explainJSONRowCount(d.row)
-								innerSortRows *= rc
-							}
-						}
-
-						// Compute inner query cost
-						innerCost := 0.0
-						innerSortCost := 0.0
+					innerSortRows := int64(1)
+					if innerHasFilesort {
 						for _, d := range matchedDerived {
 							rc := explainJSONRowCount(d.row)
-							innerCost += float64(rc)*0.10 + 0.25
+							innerSortRows *= rc
 						}
+					}
+
+					innerCost := 0.0
+					innerSortCost := 0.0
+					for _, d := range matchedDerived {
+						rc := explainJSONRowCount(d.row)
+						innerCost += float64(rc)*0.10 + 0.25
+					}
+					if innerHasFilesort {
+						innerSortCost = float64(innerSortRows) * 1.0
+						innerCost += innerSortCost
+					}
+
+					// Build a single inner table block, recursively wrapping if it
+					// itself references another <derived> table.
+					buildInnerTbl := func(d parsedRow) []orderedKV {
+						b := e.explainJSONTableBlock(d.row, query)
+						if d.row[2] != nil {
+							inner := fmt.Sprintf("%v", d.row[2])
+							if strings.HasPrefix(inner, "<derived") {
+								b = wrapDerived(b, inner)
+							}
+						}
+						return b
+					}
+
+					var innerQB []orderedKV
+					innerQB = append(innerQB, orderedKV{"select_id", derivedID})
+					innerQB = append(innerQB, orderedKV{"cost_info", []orderedKV{
+						{"query_cost", fmt.Sprintf("%.2f", innerCost)},
+					}})
+
+					if innerHasGroupBy {
+						var groupOp []orderedKV
+						groupOp = append(groupOp, orderedKV{"using_temporary_table", true})
 						if innerHasFilesort {
-							innerSortCost = float64(innerSortRows) * 1.0
-							innerCost += innerSortCost
+							groupOp = append(groupOp, orderedKV{"using_filesort", true})
+							groupOp = append(groupOp, orderedKV{"cost_info", []orderedKV{
+								{"sort_cost", fmt.Sprintf("%.2f", innerSortCost)},
+							}})
 						}
-
-						// Build inner table blocks
-						var innerQB []orderedKV
-						innerQB = append(innerQB, orderedKV{"select_id", derivedID})
-						innerQB = append(innerQB, orderedKV{"cost_info", []orderedKV{
-							{"query_cost", fmt.Sprintf("%.2f", innerCost)},
-						}})
-
-						if innerHasGroupBy {
-							// Wrap in grouping_operation
-							var groupOp []orderedKV
-							groupOp = append(groupOp, orderedKV{"using_temporary_table", true})
-							if innerHasFilesort {
-								groupOp = append(groupOp, orderedKV{"using_filesort", true})
-								groupOp = append(groupOp, orderedKV{"cost_info", []orderedKV{
-									{"sort_cost", fmt.Sprintf("%.2f", innerSortCost)},
-								}})
-							}
-							// Build nested_loop or single table inside grouping_operation
-							if len(matchedDerived) == 1 {
-								innerTblBlock := e.explainJSONTableBlock(matchedDerived[0].row, query)
-								groupOp = append(groupOp, orderedKV{"table", innerTblBlock})
-							} else {
-								var innerLoop []interface{}
-								for _, d := range matchedDerived {
-									innerTblBlock := e.explainJSONTableBlock(d.row, query)
-									innerLoop = append(innerLoop, []orderedKV{{"table", innerTblBlock}})
-								}
-								groupOp = append(groupOp, orderedKV{"nested_loop", innerLoop})
-							}
-							innerQB = append(innerQB, orderedKV{"grouping_operation", groupOp})
-						} else if len(matchedDerived) == 1 {
-							innerTblBlock := e.explainJSONTableBlock(matchedDerived[0].row, query)
-							innerQB = append(innerQB, orderedKV{"table", innerTblBlock})
+						if len(matchedDerived) == 1 {
+							groupOp = append(groupOp, orderedKV{"table", buildInnerTbl(matchedDerived[0])})
 						} else {
 							var innerLoop []interface{}
 							for _, d := range matchedDerived {
-								innerTblBlock := e.explainJSONTableBlock(d.row, query)
-								innerLoop = append(innerLoop, []orderedKV{{"table", innerTblBlock}})
+								innerLoop = append(innerLoop, []orderedKV{{"table", buildInnerTbl(d)}})
 							}
-							innerQB = append(innerQB, orderedKV{"nested_loop", innerLoop})
+							groupOp = append(groupOp, orderedKV{"nested_loop", innerLoop})
 						}
-
-						derivedBlock := []orderedKV{
-							{"using_temporary_table", true},
-							{"dependent", false},
-							{"cacheable", true},
-							{"query_block", innerQB},
+						innerQB = append(innerQB, orderedKV{"grouping_operation", groupOp})
+					} else if len(matchedDerived) == 1 {
+						innerQB = append(innerQB, orderedKV{"table", buildInnerTbl(matchedDerived[0])})
+					} else {
+						var innerLoop []interface{}
+						for _, d := range matchedDerived {
+							innerLoop = append(innerLoop, []orderedKV{{"table", buildInnerTbl(d)}})
 						}
-
-						// Use the alias as table_name in tblBlock instead of <derivedN>.
-						// Parse the FROM clause to find the alias.
-						alias := e.explainJSONExtractDerivedAlias(query, derivedID)
-						if alias != "" {
-							// Replace the table_name field in tblBlock with the alias.
-							for i, kv := range tblBlock {
-								if kv.Key == "table_name" {
-									tblBlock[i] = orderedKV{"table_name", alias}
-									break
-								}
-							}
-						}
-
-						// Add used_columns for the derived table: these are the SELECT expressions
-						// of the inner derived query that appear as columns in the outer context.
-						derivedCols := e.explainJSONExtractDerivedColumns(query, derivedID)
-						if len(derivedCols) > 0 {
-							arr := make([]interface{}, len(derivedCols))
-							for i, c := range derivedCols {
-								arr[i] = c
-							}
-							tblBlock = append(tblBlock, orderedKV{"used_columns", arr})
-						}
-
-						tblBlock = append(tblBlock, orderedKV{"materialized_from_subquery", derivedBlock})
+						innerQB = append(innerQB, orderedKV{"nested_loop", innerLoop})
 					}
+
+					derivedBlock := []orderedKV{
+						{"using_temporary_table", true},
+						{"dependent", false},
+						{"cacheable", true},
+						{"query_block", innerQB},
+					}
+
+					// Use the alias as table_name in tblBlock instead of <derivedN>.
+					alias := e.explainJSONExtractDerivedAlias(query, derivedID)
+					if alias != "" {
+						for i, kv := range tblBlock {
+							if kv.Key == "table_name" {
+								tblBlock[i] = orderedKV{"table_name", alias}
+								break
+							}
+						}
+					}
+
+					// used_columns: SELECT expressions of the derived query.
+					derivedCols := e.explainJSONExtractDerivedColumns(query, derivedID)
+					if len(derivedCols) > 0 {
+						arr := make([]interface{}, len(derivedCols))
+						for i, c := range derivedCols {
+							arr[i] = c
+						}
+						tblBlock = append(tblBlock, orderedKV{"used_columns", arr})
+					}
+
+					tblBlock = append(tblBlock, orderedKV{"materialized_from_subquery", derivedBlock})
+					return tblBlock
+				}
+
+				tblBlock := e.explainJSONTableBlock(p.row, query)
+
+				// Check if the primary table references a derived table
+				tableName := fmt.Sprintf("%v", p.row[2])
+				if strings.HasPrefix(tableName, "<derived") {
+					tblBlock = wrapDerived(tblBlock, tableName)
 				}
 
 				// Outer query: always emit as "table" (not grouping_operation),
@@ -8793,6 +8983,9 @@ func (e *Executor) explainJSONWriteWithMarkers(b *strings.Builder, v interface{}
 			b.WriteString("\n")
 		}
 		b.WriteString(prefix + "]")
+		if endMarkers && keyName != "" {
+			b.WriteString(fmt.Sprintf(" /* %s */", keyName))
+		}
 	case string:
 		b.WriteString(fmt.Sprintf("%q", val))
 	case int64:
