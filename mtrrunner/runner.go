@@ -2211,6 +2211,12 @@ func (ctx *execContext) restoreTableSnapshot(dbName, tableName string) {
 	if !ok {
 		return
 	}
+	// If the table's tablespace has been discarded (ALTER TABLE ... DISCARD
+	// TABLESPACE), DML would fail with ER_TABLESPACE_DISCARDED.  Clear the
+	// flag via IMPORT TABLESPACE first so the snapshot restore can proceed.
+	// MTR tests issue IMPORT TABLESPACE explicitly afterwards; that becomes a
+	// no-op since the flag is already cleared.
+	_, _ = ctx.getActiveConn().ExecContext(context.Background(), fmt.Sprintf("ALTER TABLE `%s`.`%s` IMPORT TABLESPACE", dbName, tableName))
 	if _, err := ctx.getActiveConn().ExecContext(context.Background(), fmt.Sprintf("DELETE FROM `%s`.`%s`", dbName, tableName)); err != nil {
 		return
 	}

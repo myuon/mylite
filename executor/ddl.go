@@ -8954,3 +8954,86 @@ foundClose:
 	}
 	return result
 }
+
+// checkTablespaceDiscarded returns ER_TABLESPACE_DISCARDED (1814) if the
+// given table has had its tablespace discarded via ALTER TABLE ... DISCARD
+// TABLESPACE.  Callers in DML paths use this to reject access until IMPORT
+// TABLESPACE re-enables the table.  Returns nil for unknown databases or
+// tables (lookup errors are surfaced by the regular table-resolution code).
+func (e *Executor) checkTablespaceDiscarded(dbName, tableName string) error {
+	if dbName == "" || tableName == "" {
+		return nil
+	}
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		return nil
+	}
+	def, err := db.GetTable(tableName)
+	if err != nil || def == nil {
+		return nil
+	}
+	if def.Discarded {
+		return mysqlError(1814, "HY000", fmt.Sprintf("Tablespace has been discarded for table '%s'", tableName))
+	}
+	return nil
+}
+
+// execAlterDiscardImport handles ALTER TABLE ... DISCARD/IMPORT TABLESPACE.
+// MySQL's transportable tablespace feature is not implemented; instead we
+// toggle a Discarded flag on the TableDef so subsequent DML returns
+// ER_TABLESPACE_DISCARDED (1814) until IMPORT TABLESPACE clears the flag.
+// Returns nil result if the statement could not be parsed (caller treats as no-op).
+func (e *Executor) execAlterDiscardImport(query, upper string) (*Result, error) {
+	idx := strings.Index(upper, "ALTER TABLE ")
+	if idx < 0 {
+		return nil, nil
+	}
+	rest := strings.TrimSpace(query[idx+len("ALTER TABLE "):])
+	restUpper := strings.ToUpper(rest)
+	cutIdx := strings.Index(restUpper, " DISCARD TABLESPACE")
+	isImport := false
+	if cutIdx < 0 {
+		cutIdx = strings.Index(restUpper, " IMPORT TABLESPACE")
+		isImport = true
+	}
+	if cutIdx < 0 {
+		return nil, nil
+	}
+	tableRef := strings.TrimSpace(rest[:cutIdx])
+	tableRef = strings.TrimSuffix(tableRef, ";")
+	tableRef = strings.TrimSpace(tableRef)
+	if tableRef == "" {
+		return nil, nil
+	}
+	dbName := e.CurrentDB
+	tblName := tableRef
+	if dotIdx := strings.Index(tableRef, "."); dotIdx >= 0 {
+		dbName = strings.Trim(tableRef[:dotIdx], "`")
+		tblName = strings.Trim(tableRef[dotIdx+1:], "`")
+	} else {
+		tblName = strings.Trim(tableRef, "`")
+	}
+	if dbName == "" {
+		return nil, mysqlError(1046, "3D000", "No database selected")
+	}
+	if _, err := e.Storage.GetTable(dbName, tblName); err != nil {
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", dbName, tblName))
+	}
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
+	}
+	def, err := db.GetTable(tblName)
+	if err != nil {
+		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", dbName, tblName))
+	}
+	if def.Engine != "" && !strings.EqualFold(def.Engine, "InnoDB") {
+		return nil, mysqlError(1031, "HY000", fmt.Sprintf("Table storage engine for '%s' doesn't have this option", tblName))
+	}
+	if isImport {
+		def.Discarded = false
+	} else {
+		def.Discarded = true
+	}
+	return &Result{}, nil
+}

@@ -164,6 +164,11 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		viewCheckExpr = e.getViewCheckCondition(originalViewName)
 		tableName = baseTable
 	}
+	// Reject DML on tables whose tablespace has been discarded via
+	// ALTER TABLE ... DISCARD TABLESPACE.
+	if err := e.checkTablespaceDiscarded(insertDB, tableName); err != nil {
+		return nil, err
+	}
 	// When inserting through a view, check that all specified columns are updatable (direct col refs).
 	if isInsertThroughView && len(stmt.Columns) > 0 {
 		viewColMap := e.getViewExprMapping(originalViewName)

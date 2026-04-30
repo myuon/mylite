@@ -3923,7 +3923,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"socket":                  "/var/run/mysqld/mysqld.sock",
 		"pid_file":                "/var/run/mysqld/mysqld.pid",
 		"basedir":                 "/usr/",
-		"datadir":                 "/var/lib/mysql/",
+		"datadir":                 e.effectiveDataDir(),
 		"tmpdir":                  "/tmp",
 		"plugin_dir":              "/usr/lib/mysql/plugin/",
 		"log_error":               "stderr",
