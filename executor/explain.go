@@ -10184,11 +10184,32 @@ func (e *Executor) explainTreeText(query string) string {
 //
 // Falls back for queries with subqueries or derived tables.
 // Simple and JOIN queries are handled by the plan-based path (Phase 3).
+//
+// Refs #262: the new path is structurally capable of expressing DerivedTableNode
+// and SubqueryNode (see plan_explain.collectRows), but the live gate keeps
+// falling back to explainMultiRows because the new path is missing parity with
+// these existing features:
+//   - "no matching row in const table" detection for empty-derived tables and
+//     for subqueries that resolve to const-empty (see queryHasComplexParts and
+//     whereHasSingleSubquery branches in explainSelect, ~line 1909-1957).
+//   - "Range checked for each record (index map: 0xN)" annotation for
+//     multi-table joins where an indexed column is constrained by a range
+//     condition referencing another table's column (~line 1968-1991).
+//   - "Using join buffer (Block Nested Loop)" annotation for non-driving ALL-scan
+//     tables in multi-table joins (~line 1989-1991) and the materialized-subquery
+//     placeholders (~line 248-310, 367-384).
+//   - Semijoin/materialization plan reordering: <subqueryN> placeholder rows,
+//     SIMPLE+MATERIALIZED conversion to PRIMARY+FirstMatch, etc. (~line 92-200).
+//   - Non-merge view detection: PRIMARY+DERIVED rows for view-derived tables.
+//   - Multi-semijoin column reordering and IMPOSSIBLE WHERE collapse logic.
+//
+// Until parity is complete, leaving the gate off is safer than partial-flipping.
+// See PR #291 for the scaffolding (DerivedTableNode, QueryWithSubqueries) and
+// the optimizer pass that already feeds AccessPath into TableScanNodes inside
+// derived blocks.
 func (e *Executor) tryPlanBasedExplainTraditional(sel *sqlparser.Select) ([][]interface{}, bool) {
 	// Fall back for queries with complex parts (subqueries / derived tables).
-	// Phase 4 adds plan-based DerivedTableNode support, but the existing path
-	// has additional logic (empty-derived detection, multi-semijoin, etc.) we
-	// have not yet replicated, so we keep falling back to it.
+	// See doc-comment above for the full list of pending parity items.
 	if e.queryHasComplexParts(sel) {
 		return nil, false
 	}
