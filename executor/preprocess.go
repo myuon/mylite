@@ -11,6 +11,50 @@ import (
 	"github.com/myuon/mylite/catalog"
 )
 
+// isPreprocessDDLForBackupLock reports whether a query (already uppercased and
+// with leading whitespace removed) is a DDL statement handled at the preprocess
+// layer that should be blocked while another connection holds LOCK INSTANCE FOR
+// BACKUP. Statements handled by the AST-level switch (CREATE/ALTER/DROP
+// TABLE/DATABASE/VIEW, TRUNCATE, RENAME TABLE) are guarded separately and are
+// intentionally not included here.
+func isPreprocessDDLForBackupLock(upper string) bool {
+	prefixes := []string{
+		"CREATE INDEX", "DROP INDEX",
+		"CREATE UNIQUE INDEX", "CREATE FULLTEXT INDEX", "CREATE SPATIAL INDEX",
+		"CREATE SERVER", "ALTER SERVER", "DROP SERVER",
+		"CREATE TRIGGER", "DROP TRIGGER",
+		"CREATE EVENT", "ALTER EVENT", "DROP EVENT",
+		"CREATE TABLESPACE", "ALTER TABLESPACE", "DROP TABLESPACE",
+		"CREATE PROCEDURE", "ALTER PROCEDURE", "DROP PROCEDURE",
+		"CREATE FUNCTION", "ALTER FUNCTION", "DROP FUNCTION",
+		"CREATE LOGFILE GROUP", "ALTER LOGFILE GROUP", "DROP LOGFILE GROUP",
+		"CREATE RESOURCE GROUP", "ALTER RESOURCE GROUP", "DROP RESOURCE GROUP",
+		// ALTER DATABASE / CREATE DATABASE with CHARACTER SET/COLLATE clauses are
+		// handled in preprocess (vitess can't parse them) and otherwise bypass
+		// the AST-level guard.
+		"ALTER DATABASE", "ALTER SCHEMA",
+		"ANALYZE TABLE",
+		"OPTIMIZE TABLE",
+		"REPAIR TABLE",
+		"INSTALL PLUGIN", "UNINSTALL PLUGIN",
+	}
+	// Handle CREATE DEFINER=... PROCEDURE/FUNCTION/EVENT/TRIGGER/VIEW
+	if strings.HasPrefix(upper, "CREATE DEFINER") {
+		if strings.Contains(upper, " PROCEDURE") ||
+			strings.Contains(upper, " FUNCTION") ||
+			strings.Contains(upper, " EVENT") ||
+			strings.Contains(upper, " TRIGGER") {
+			return true
+		}
+	}
+	for _, p := range prefixes {
+		if strings.HasPrefix(upper, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // preprocessQuery performs pre-parse processing on the query string before
 // it is handed to the SQL parser. It handles three cases:
 //   - Query rewrite: returns (rewritten, nil, nil)
@@ -519,6 +563,20 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		return "", &Result{}, nil
 	}
 
+	// Block DDL statements that go through preprocess-level handling
+	// (CREATE INDEX, CREATE SERVER, CREATE TRIGGER, CREATE EVENT, CREATE TABLESPACE,
+	//  CREATE PROCEDURE, CREATE FUNCTION, ALTER/DROP variants of the above, RENAME,
+	//  ANALYZE TABLE) when LOCK INSTANCE FOR BACKUP is held by another connection.
+	// CREATE/ALTER/DROP TABLE/DATABASE/VIEW are handled in the AST-level switch
+	// (executor.go) which has its own waitForInstanceBackupLock guards.
+	// CREATE TEMPORARY TABLE is exempted because temporary tables are session-local
+	// and not part of the on-disk backup.
+	if isPreprocessDDLForBackupLock(upper) {
+		if err := e.waitForInstanceBackupLock(); err != nil {
+			return "", nil, err
+		}
+	}
+
 	// Handle CREATE/ALTER/DROP/SET RESOURCE GROUP
 	if strings.HasPrefix(upper, "CREATE RESOURCE GROUP") {
 		// Extract group name (first word after "CREATE RESOURCE GROUP")
@@ -782,6 +840,16 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	if strings.HasPrefix(upper, "CREATE TABLESPACE") ||
 		strings.HasPrefix(upper, "ALTER TABLESPACE") ||
 		strings.HasPrefix(upper, "DROP TABLESPACE") {
+		return "", &Result{}, nil
+	}
+
+	// Handle CREATE/ALTER/DROP SERVER as a silent no-op. mylite does not
+	// implement federated tables, but accepting the syntax keeps tests that
+	// touch CREATE SERVER as part of a larger flow (e.g. lock_backup_ddl)
+	// working.
+	if strings.HasPrefix(upper, "CREATE SERVER") ||
+		strings.HasPrefix(upper, "ALTER SERVER") ||
+		strings.HasPrefix(upper, "DROP SERVER") {
 		return "", &Result{}, nil
 	}
 
