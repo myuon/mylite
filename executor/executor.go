@@ -1321,6 +1321,44 @@ func ErrUnsupported(feature string) error {
 	return fmt.Errorf("ERROR 50001 (HY000): Feature not supported: %s", feature)
 }
 
+// firstTempTableInSelect walks a view's SELECT statement looking for any
+// TableName that resolves to a session-local temporary table. Returns the
+// first such table name (in its as-written form), or "" if none. Only the
+// session-local temp-table set on the executor is consulted; cross-database
+// qualified references are not considered temporary unless the qualifier
+// matches the current database (temp tables are not cataloged per database
+// in mylite, so we treat unqualified names as referring to the session set).
+func (e *Executor) firstTempTableInSelect(stmt sqlparser.SQLNode) string {
+	if e == nil || e.tempTables == nil || len(e.tempTables) == 0 || stmt == nil {
+		return ""
+	}
+	var found string
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
+		if found != "" {
+			return false, nil
+		}
+		tn, ok := node.(sqlparser.TableName)
+		if !ok {
+			return true, nil
+		}
+		// Skip qualified names that reference a different database — temp
+		// tables live in the session, not in any specific schema.
+		if !tn.Qualifier.IsEmpty() && !strings.EqualFold(tn.Qualifier.String(), e.CurrentDB) {
+			return true, nil
+		}
+		name := tn.Name.String()
+		if name == "" {
+			return true, nil
+		}
+		if e.tempTables[name] || e.tempTables[strings.ToLower(name)] {
+			found = name
+			return false, nil
+		}
+		return true, nil
+	}, stmt)
+	return found
+}
+
 // isMySQLError checks if err is a MySQL error with the given error code.
 func isMySQLError(err error, code int) bool {
 	if err == nil {
@@ -2159,8 +2197,14 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			e.questions = 0
 			return &Result{}, nil
 		}
-		// HANDLER ... OPEN/READ/CLOSE: unsupported feature
+		// HANDLER ... OPEN/READ/CLOSE: unsupported feature.
+		// Under LOCK TABLES, MySQL rejects HANDLER with ER_LOCK_OR_ACTIVE_TRANSACTION (1192)
+		// before any feature check; surface that to callers so the test for "HANDLER inside
+		// LOCK TABLES" sees the correct error rather than our generic "feature unsupported".
 		if strings.HasPrefix(upper, "HANDLER ") {
+			if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
+				return nil, mysqlError(1192, "HY000", "Can't execute the given command because you have active locked tables or an active transaction")
+			}
 			return nil, ErrUnsupported("HANDLER statement")
 		}
 		// Reject CREATE EVENT with MICROSECOND intervals (MySQL error 1235)
@@ -2983,6 +3027,35 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 				}
 			}
 		}
+		// ER_CANT_REOPEN_TABLE (1137): a TEMPORARY table cannot appear more than once
+		// in a single LOCK TABLES statement (either repeated by name or aliased).
+		// MySQL rejects "LOCK TABLES tmp WRITE, tmp AS a READ" because TEMPORARY tables
+		// only have one table handle per session.
+		if e.tempTables != nil && len(e.tempTables) > 0 {
+			seenTemp := make(map[string]int)
+			for _, tl := range s.Tables {
+				ate, ok := tl.Table.(*sqlparser.AliasedTableExpr)
+				if !ok {
+					continue
+				}
+				tn, ok := ate.Expr.(sqlparser.TableName)
+				if !ok {
+					continue
+				}
+				name := tn.Name.String()
+				if name == "" {
+					continue
+				}
+				lower := strings.ToLower(name)
+				if !(e.tempTables[name] || e.tempTables[lower]) {
+					continue
+				}
+				seenTemp[lower]++
+				if seenTemp[lower] > 1 {
+					return nil, mysqlError(1137, "HY000", fmt.Sprintf("Can't reopen table: '%s'", name))
+				}
+			}
+		}
 		// Release any previously held table locks (MySQL behavior: LOCK TABLES implicitly unlocks)
 		if e.tableLockManager != nil {
 			e.tableLockManager.UnlockAll(e.connectionID)
@@ -3150,6 +3223,12 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		// CREATE VIEW is DDL: blocked while another connection holds LOCK INSTANCE FOR BACKUP.
 		if err := e.waitForInstanceBackupLock(); err != nil {
 			return nil, err
+		}
+		// Reject CREATE VIEW that references a TEMPORARY table — MySQL forbids this
+		// (ER_VIEW_SELECT_TMPTABLE / 1352). Walk the SELECT to find any TableName whose
+		// unqualified (or current-db-qualified) name matches a session temp table.
+		if tmp := e.firstTempTableInSelect(s.Select); tmp != "" {
+			return nil, mysqlError(1352, "HY000", fmt.Sprintf("View's SELECT refers to a temporary table '%s'", tmp))
 		}
 		// Store view definition
 		viewName := s.ViewName.Name.String()
@@ -3368,6 +3447,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		// ALTER VIEW is DDL: blocked while another connection holds LOCK INSTANCE FOR BACKUP.
 		if err := e.waitForInstanceBackupLock(); err != nil {
 			return nil, err
+		}
+		// Reject ALTER VIEW that references a TEMPORARY table — same restriction as CREATE VIEW.
+		if tmp := e.firstTempTableInSelect(s.Select); tmp != "" {
+			return nil, mysqlError(1352, "HY000", fmt.Sprintf("View's SELECT refers to a temporary table '%s'", tmp))
 		}
 		viewName := s.ViewName.Name.String()
 		viewDB := e.CurrentDB
@@ -4174,6 +4257,15 @@ func (e *Executor) checkTableLockRestrictions(stmt sqlparser.Statement) error {
 				return err
 			}
 		}
+		// Subqueries with explicit FOR UPDATE / FOR SHARE require WRITE lock on
+		// their referenced tables, matching MySQL's behavior:
+		//   LOCK TABLES t1 WRITE, t2 READ;
+		//   SELECT * FROM t1 WHERE 1 IN (SELECT * FROM t2 FOR UPDATE);
+		//     -> ER_TABLE_NOT_LOCKED_FOR_WRITE on t2.
+		// Plain (non-locking) subselects don't need write access — they are read-only.
+		if err := e.checkSubquerySelectLocks(s); err != nil {
+			return err
+		}
 	case *sqlparser.CreateTable:
 		// CREATE TABLE when LOCK TABLES is active: the new table must be locked
 		tableName := s.Table.Name.String()
@@ -4224,6 +4316,127 @@ func (e *Executor) checkTableLockRestrictions(stmt sqlparser.Statement) error {
 				if !e.isTableImplicitlyLockedViaView(dbName, tableName) {
 					return mysqlError(1100, "HY000", fmt.Sprintf("Table '%s' was not locked with LOCK TABLES", tableName))
 				}
+			}
+		}
+	}
+	return nil
+}
+
+// checkSubquerySelectLocks walks the SELECT (and any subselects in WHERE/HAVING/SELECT list)
+// looking for nested SELECTs with explicit FOR UPDATE / FOR SHARE / LOCK IN SHARE MODE. Such
+// subqueries promote their referenced tables from read- to write-mode under LOCK TABLES, so
+// any READ-locked table inside them must surface as ER_TABLE_NOT_LOCKED_FOR_WRITE (1099).
+//
+// The outer SELECT itself is the caller's responsibility — we only inspect *nested* selects
+// reached via Subquery nodes. We do not descend into derived tables in FROM since those are
+// validated by checkTableExprLocked already.
+func (e *Executor) checkSubquerySelectLocks(outer *sqlparser.Select) error {
+	if outer == nil {
+		return nil
+	}
+	if e.tableLockManager == nil || len(e.tableLockManager.GetLocks(e.connectionID)) == 0 {
+		return nil
+	}
+
+	var walkErr error
+	walk := func(node sqlparser.SQLNode) {
+		_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+			if walkErr != nil {
+				return false, nil
+			}
+			sub, ok := n.(*sqlparser.Subquery)
+			if !ok {
+				return true, nil
+			}
+			inner, ok := sub.Select.(*sqlparser.Select)
+			if !ok || inner == nil {
+				return true, nil
+			}
+			if inner.Lock != sqlparser.ForUpdateLock && inner.Lock != sqlparser.ForShareLock && inner.Lock != sqlparser.ShareModeLock {
+				return true, nil
+			}
+			// Nested locking subquery: each From table must be writable under
+			// the current LOCK TABLES set.
+			for _, te := range inner.From {
+				if err := e.checkTableExprWriteLocked(te); err != nil {
+					walkErr = err
+					return false, nil
+				}
+			}
+			return true, nil
+		}, node)
+	}
+
+	if outer.Where != nil {
+		walk(outer.Where)
+	}
+	if walkErr != nil {
+		return walkErr
+	}
+	if outer.Having != nil {
+		walk(outer.Having)
+	}
+	if walkErr != nil {
+		return walkErr
+	}
+	if outer.SelectExprs != nil {
+		walk(outer.SelectExprs)
+	}
+	return walkErr
+}
+
+// checkTableExprWriteLocked is like checkTableExprLocked but additionally requires the lock
+// to be WRITE (returns ER_TABLE_NOT_LOCKED_FOR_WRITE / 1099 when only READ is held).
+func (e *Executor) checkTableExprWriteLocked(te sqlparser.TableExpr) error {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		inner, ok := t.Expr.(sqlparser.TableName)
+		if !ok {
+			return nil
+		}
+		tableName := inner.Name.String()
+		dbName := e.CurrentDB
+		if !inner.Qualifier.IsEmpty() {
+			dbName = inner.Qualifier.String()
+		}
+		if strings.EqualFold(tableName, "dual") {
+			return nil
+		}
+		if e.tempTables != nil && (e.tempTables[tableName] || e.tempTables[strings.ToLower(tableName)]) {
+			return nil
+		}
+		// IS/PS/mysql/sys metadata tables are read-only fixtures; they cannot be
+		// write-locked, so a FOR UPDATE on them always errors.
+		checkName := tableName
+		if !t.As.IsEmpty() {
+			checkName = t.As.String()
+		}
+		key := dbName + "." + checkName
+		locked, mode := e.tableLockManager.IsLocked(e.connectionID, key)
+		if !locked {
+			keyBase := dbName + "." + tableName
+			locked, mode = e.tableLockManager.IsLocked(e.connectionID, keyBase)
+		}
+		if locked {
+			if mode == "READ" {
+				return mysqlError(1099, "HY000", fmt.Sprintf("Table '%s' was locked with a READ lock and can't be updated", tableName))
+			}
+			return nil
+		}
+		// Implicitly locked via view? Treat as read-only for the purposes of this check.
+		if e.isTableImplicitlyLockedViaView(dbName, tableName) {
+			return mysqlError(1099, "HY000", fmt.Sprintf("Table '%s' was locked with a READ lock and can't be updated", tableName))
+		}
+		return mysqlError(1100, "HY000", fmt.Sprintf("Table '%s' was not locked with LOCK TABLES", tableName))
+	case *sqlparser.JoinTableExpr:
+		if err := e.checkTableExprWriteLocked(t.LeftExpr); err != nil {
+			return err
+		}
+		return e.checkTableExprWriteLocked(t.RightExpr)
+	case *sqlparser.ParenTableExpr:
+		for _, inner := range t.Exprs {
+			if err := e.checkTableExprWriteLocked(inner); err != nil {
+				return err
 			}
 		}
 	}
@@ -6403,12 +6616,14 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 				}
 			}
 		}
-		// Check table lock restrictions for CHECK/REPAIR when LOCK TABLES is active
+		// Check table lock restrictions for CHECK/REPAIR when LOCK TABLES is active.
+		// Tables implicitly locked via a view (or routine/trigger) are also accessible —
+		// MySQL allows DDL/admin commands like ALTER, REPAIR, FLUSH on such tables.
 		if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
 			bareTable := t
 			lockKey := e.CurrentDB + "." + bareTable
 			locked, _ := e.tableLockManager.IsLocked(e.connectionID, lockKey)
-			if !locked {
+			if !locked && !e.isTableImplicitlyLockedViaView(e.CurrentDB, bareTable) {
 				rows = append(rows, []interface{}{tableName, op, "Error", fmt.Sprintf("Table '%s' was not locked with LOCK TABLES", bareTable)})
 				rows = append(rows, []interface{}{tableName, op, "status", "Operation failed"})
 				continue
@@ -6515,7 +6730,13 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 					}
 				}
 			}
-			rows = append(rows, []interface{}{tableName, op, "status", "OK"})
+			if op == "repair" && isInnoDB {
+				// InnoDB (and most non-MyISAM engines) doesn't support REPAIR;
+				// MySQL outputs a single "note" row and no status line.
+				rows = append(rows, []interface{}{tableName, op, "note", "The storage engine for the table doesn't support repair"})
+			} else {
+				rows = append(rows, []interface{}{tableName, op, "status", "OK"})
+			}
 		}
 	}
 	return &Result{
