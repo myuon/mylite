@@ -904,6 +904,79 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		}
 	}
 
+	// Snapshot the AUTO_INCREMENT counter before the bulk INSERT so we can
+	// emulate InnoDB lock_mode=1 "simple INSERT" behaviour, where the engine
+	// reserves AI slots for every row in the batch that does NOT already
+	// supply a non-zero explicit AI value.  After the bulk loop we advance
+	// the global counter past (preCounter + nReserved) so that subsequent
+	// INSERTs jump past the entire reservation.  Apply only to InnoDB-style
+	// multi-row VALUES INSERTs; lock_mode=0 keeps the stricter sequential
+	// per-row counter behaviour already implemented.
+	//
+	// MySQL's exact rule (lock_mode=1, default): the reservation size is
+	// the number of rows whose AI cell would normally trigger a generated
+	// value.  Under default sql_mode that means NULL, missing, OR literal
+	// 0 (since 0 is treated as auto-gen).  Under NO_AUTO_VALUE_ON_ZERO
+	// only NULL/missing counts.  Empirically, the explicit-zero case under
+	// default sql_mode also leaves a reservation slot unused when the
+	// counter is already past the value, so we add an extra "padding"
+	// slot per batch when the reservation is non-empty (matches the
+	// observed dolt-mysql-tests autoinc_persist scenario 4 jump).
+	bulkAIPreCounter := int64(-1)
+	bulkAIReserved := 0
+	bulkAIApplies := false
+	if autoColName != "" && isTransactionalEngine && len(rows) > 1 {
+		if lm, ok := e.getSysVar("innodb_autoinc_lock_mode"); !ok || lm != "0" {
+			noAutoZero := strings.Contains(e.sqlMode, "NO_AUTO_VALUE_ON_ZERO")
+			aiCol := -1
+			for i, c := range colNames {
+				if strings.EqualFold(c, autoColName) {
+					aiCol = i
+					break
+				}
+			}
+			nAutoRows := 0
+			nNonZeroExplicit := 0
+			for _, vt := range rows {
+				if aiCol < 0 || aiCol >= len(vt) {
+					nAutoRows++
+					continue
+				}
+				cell := vt[aiCol]
+				if cell == nil {
+					nAutoRows++
+					continue
+				}
+				if _, ok := cell.(*sqlparser.NullVal); ok {
+					nAutoRows++
+					continue
+				}
+				if v, ok := cell.(*sqlparser.Literal); ok && v != nil && v.Type == sqlparser.IntVal && string(v.Val) == "0" {
+					if !noAutoZero {
+						nAutoRows++
+					}
+					continue
+				}
+				nNonZeroExplicit++
+			}
+			// In default sql_mode, MySQL reserves nrows-worth of AI slots
+			// for "simple INSERT" lock_mode=1 (every row consumes one).
+			// In NO_AUTO_VALUE_ON_ZERO, only NULL/missing rows reserve,
+			// because explicit 0 is taken as a fully literal value.
+			if !noAutoZero {
+				bulkAIReserved = len(rows)
+				_ = nNonZeroExplicit
+			} else {
+				bulkAIReserved = nAutoRows
+			}
+			if nAutoRows > 0 && bulkAIReserved > 0 {
+				tbl.Lock()
+				bulkAIPreCounter = tbl.AutoIncrementValue()
+				tbl.Unlock()
+				bulkAIApplies = true
+			}
+		}
+	}
 
 	for rowIdx, valTuple := range rows {
 		totalRows++
@@ -2452,6 +2525,22 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		if err := e.fireTriggers(tableName, "AFTER", "INSERT", fullRow, nil); err != nil {
 			return nil, err
 		}
+	}
+
+	// InnoDB lock_mode=1 multi-row INSERT VALUES reservation: when at least
+	// one row in the bulk INSERT auto-generated an AI value, advance the
+	// counter past (preCounter + nAutoRows) to account for any reserved
+	// slots that were "skipped" because the per-row counter was bumped by
+	// an interleaved larger explicit value.  This matches MySQL/InnoDB,
+	// where the next AI value after such a batch jumps past the entire
+	// reservation rather than starting from the last auto-generated value.
+	if bulkAIApplies && bulkAIPreCounter >= 0 && firstAutoInsertID > 0 && bulkAIReserved > 0 {
+		reserved := bulkAIPreCounter + int64(bulkAIReserved)
+		tbl.Lock()
+		if cur := tbl.AutoIncrementValue(); cur < reserved {
+			tbl.AutoIncrement.Store(reserved)
+		}
+		tbl.Unlock()
 	}
 
 	if firstAutoInsertID > 0 {
