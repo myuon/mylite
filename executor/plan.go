@@ -124,6 +124,8 @@ func (n *UnionNode) NodeType() string     { return "Union" }
 // ---- Subquery nodes ----
 
 // SubqueryNode wraps a subquery that appears in WHERE / SELECT etc.
+// SelectType describes how MySQL labels the subquery in EXPLAIN
+// ("SUBQUERY", "DEPENDENT SUBQUERY", "MATERIALIZED" etc.).
 type SubqueryNode struct {
 	Plan         PlanNode
 	SelectType   string
@@ -131,14 +133,42 @@ type SubqueryNode struct {
 	IsCorrelated bool
 }
 
+// QueryWithSubqueries pairs a main plan with the SUBQUERY / DEPENDENT
+// SUBQUERY plans referenced from the outer query's WHERE / SELECT-list /
+// HAVING / JOIN-ON clauses. Plan_explain emits the main rows first, then the
+// subquery rows in declared order.
+type QueryWithSubqueries struct {
+	Main       PlanNode
+	Subqueries []*SubqueryNode
+}
+
+func (n *QueryWithSubqueries) Children() []PlanNode {
+	out := []PlanNode{n.Main}
+	for _, s := range n.Subqueries {
+		out = append(out, s)
+	}
+	return out
+}
+func (n *QueryWithSubqueries) NodeType() string { return "QueryWithSubqueries" }
+
 func (n *SubqueryNode) Children() []PlanNode { return []PlanNode{n.Plan} }
 func (n *SubqueryNode) NodeType() string     { return "Subquery" }
 
 // DerivedTableNode wraps a derived table (subquery in FROM clause).
+// ParentID and ParentSelectType describe the outer query block that owns this
+// derived table; the EXPLAIN placeholder row uses those values, while the inner
+// plan rows use ID with selectType="DERIVED".
 type DerivedTableNode struct {
-	Alias string
-	Plan  PlanNode
-	ID    int64
+	Alias            string
+	Plan             PlanNode
+	ID               int64
+	ParentID         int64
+	ParentSelectType string
+	Extra            []string
+	// InnerSelect holds the original AST for the derived subquery, used by the
+	// optimizer pass to feed access-type detection for tables inside the derived
+	// query block. Nil for UNION-based derived tables.
+	InnerSelect *sqlparser.Select
 }
 
 func (n *DerivedTableNode) Children() []PlanNode { return []PlanNode{n.Plan} }

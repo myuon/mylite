@@ -38,8 +38,89 @@ func (p *Planner) BuildPlan(stmt sqlparser.Statement) (PlanNode, error) {
 
 // buildSelectPlan builds a logical plan for a SELECT statement.
 // The returned plan tree is (bottom-up): Source → Filter → Aggregate → Project → Sort → Limit
+//
+// When the SELECT references SUBQUERY-style nested SELECTs (e.g. inside
+// WHERE / SELECT list), the returned plan is wrapped in a
+// QueryWithSubqueries node. Subqueries are recorded in declared order with
+// their own child plans, so plan_explain can emit them as separate rows.
 func (p *Planner) buildSelectPlan(sel *sqlparser.Select, selectType string) (PlanNode, error) {
-	id := p.nextID()
+	main, err := p.buildSelectPlanWithID(sel, selectType, p.nextID())
+	if err != nil {
+		return nil, err
+	}
+	subs := p.collectSelectSubqueries(sel)
+	if len(subs) == 0 {
+		return main, nil
+	}
+	return &QueryWithSubqueries{Main: main, Subqueries: subs}, nil
+}
+
+// collectSelectSubqueries walks a SELECT's WHERE / SELECT-list / HAVING /
+// JOIN-ON clauses and builds SubqueryNode entries for each non-FROM
+// subquery encountered. Each subquery is given a fresh query-block id and a
+// SUBQUERY-or-DEPENDENT-SUBQUERY label depending on whether it references
+// an outer column.
+func (p *Planner) collectSelectSubqueries(sel *sqlparser.Select) []*SubqueryNode {
+	var subs []*SubqueryNode
+	outerTables := p.executor.extractTableNamesAndAliases(sel)
+	collect := func(node sqlparser.SQLNode) {
+		_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+			sq, ok := n.(*sqlparser.Subquery)
+			if !ok {
+				return true, nil
+			}
+			isCorrelated := p.executor.isCorrelatedSubquery(sq.Select, outerTables)
+			label := "SUBQUERY"
+			if isCorrelated {
+				label = "DEPENDENT SUBQUERY"
+			}
+			subID := p.nextID()
+			var inner PlanNode
+			var err error
+			switch s := sq.Select.(type) {
+			case *sqlparser.Select:
+				inner, err = p.buildSelectPlanWithID(s, label, subID)
+			case *sqlparser.Union:
+				inner, err = p.buildUnionPlan(s, false)
+			default:
+				return true, nil
+			}
+			if err != nil || inner == nil {
+				return true, nil
+			}
+			subs = append(subs, &SubqueryNode{
+				Plan:         inner,
+				SelectType:   label,
+				ID:           subID,
+				IsCorrelated: isCorrelated,
+			})
+			// Don't recurse into the subquery body — its own subqueries are
+			// emitted by its own buildSelectPlan invocation.
+			return false, nil
+		}, node)
+	}
+	collect(sel.SelectExprs)
+	if sel.Where != nil {
+		collect(sel.Where.Expr)
+	}
+	if sel.Having != nil {
+		collect(sel.Having.Expr)
+	}
+	for _, te := range sel.From {
+		var onNodes []sqlparser.SQLNode
+		p.executor.collectJoinOnConditions(te, &onNodes)
+		for _, on := range onNodes {
+			collect(on)
+		}
+	}
+	return subs
+}
+
+// buildSelectPlanWithID is like buildSelectPlan but uses an explicit id (used by
+// derived tables to share an id with their parent placeholder row). Note: the
+// caller is responsible for wrapping the result with QueryWithSubqueries if
+// SUBQUERY rows should be emitted alongside the main plan.
+func (p *Planner) buildSelectPlanWithID(sel *sqlparser.Select, selectType string, id int64) (PlanNode, error) {
 
 	// Promote selectType from SIMPLE to PRIMARY when query has complex parts
 	// (subqueries, derived tables, etc.)
@@ -145,12 +226,23 @@ func (p *Planner) buildTableExprPlan(te sqlparser.TableExpr, selectType string, 
 	case *sqlparser.AliasedTableExpr:
 		// Check if this is a derived table (subquery in FROM)
 		if dt, ok := t.Expr.(*sqlparser.DerivedTable); ok {
+			// Promote parent's selectType: the outer block becomes PRIMARY whenever
+			// it owns a DERIVED subquery (MySQL prints PRIMARY, not SIMPLE).
+			parentSelectType := selectType
+			if parentSelectType == "SIMPLE" {
+				parentSelectType = "PRIMARY"
+			}
+			// MySQL numbers derived tables sequentially starting from the next
+			// query block id. We reserve that id and pass it down so the inner
+			// SELECT's "DERIVED" row uses the same number.
 			derivedID := p.nextID()
 			var innerPlan PlanNode
+			var innerSel *sqlparser.Select
 			var err error
 			switch inner := dt.Select.(type) {
 			case *sqlparser.Select:
-				innerPlan, err = p.buildSelectPlan(inner, "DERIVED")
+				innerSel = inner
+				innerPlan, err = p.buildSelectPlanWithID(inner, "DERIVED", derivedID)
 			case *sqlparser.Union:
 				innerPlan, err = p.buildUnionPlan(inner, false)
 			default:
@@ -164,9 +256,12 @@ func (p *Planner) buildTableExprPlan(te sqlparser.TableExpr, selectType string, 
 				alias = t.As.String()
 			}
 			return &DerivedTableNode{
-				Alias: alias,
-				Plan:  innerPlan,
-				ID:    derivedID,
+				Alias:            alias,
+				Plan:             innerPlan,
+				ID:               derivedID,
+				ParentID:         id,
+				ParentSelectType: parentSelectType,
+				InnerSelect:      innerSel,
 			}, nil
 		}
 
@@ -409,9 +504,19 @@ func (p *Planner) optimizeNode(node PlanNode, sel *sqlparser.Select, hasSortAbov
 			p.optimizeNode(branch, nil, false, false, false)
 		}
 
+	case *QueryWithSubqueries:
+		// Optimize main plan with the outer SELECT context, then each
+		// subquery with its own context.
+		p.optimizeNode(n.Main, sel, hasSortAbove, hasAggAbove, hasFilterAbove)
+		for _, sub := range n.Subqueries {
+			p.optimizeNode(sub, nil, false, false, false)
+		}
+
 	case *DerivedTableNode:
-		// Derived table inner plan has its own SELECT context.
-		p.optimizeNode(n.Plan, nil, false, false, false)
+		// Derived table inner plan has its own SELECT context. Forward the
+		// inner SELECT so access-type detection works for tables inside the
+		// derived query block. UNION-based derived tables fall back to nil.
+		p.optimizeNode(n.Plan, n.InnerSelect, false, false, false)
 
 	case *SubqueryNode:
 		p.optimizeNode(n.Plan, nil, false, false, false)

@@ -9745,6 +9745,9 @@ func (e *Executor) explainTreeText(query string) string {
 // Simple and JOIN queries are handled by the plan-based path (Phase 3).
 func (e *Executor) tryPlanBasedExplainTraditional(sel *sqlparser.Select) ([][]interface{}, bool) {
 	// Fall back for queries with complex parts (subqueries / derived tables).
+	// Phase 4 adds plan-based DerivedTableNode support, but the existing path
+	// has additional logic (empty-derived detection, multi-semijoin, etc.) we
+	// have not yet replicated, so we keep falling back to it.
 	if e.queryHasComplexParts(sel) {
 		return nil, false
 	}
