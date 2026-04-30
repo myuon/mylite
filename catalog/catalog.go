@@ -89,7 +89,12 @@ type TableDef struct {
 	PartitionCount        int                 // PARTITIONS N (0 = unset/implicit)
 	PartitionSubpartition *PartitionSubpart   // subpartition definition (nil if none)
 	PartitionDefs         []PartitionDef      // individual PARTITION definitions
+	// Discarded indicates that the InnoDB tablespace has been discarded via
+	// ALTER TABLE ... DISCARD TABLESPACE.  While true, DML on the table
+	// returns ER_TABLESPACE_DISCARDED until ALTER TABLE ... IMPORT
+	// TABLESPACE clears the flag.
 	InstantCols           int                 // number of columns at the time the first INSTANT ADD COLUMN was applied (0 = no instant cols)
+	Discarded bool
 }
 
 // PartitionSubpart holds the SUBPARTITION BY clause details.

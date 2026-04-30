@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -786,6 +788,23 @@ func (e *Executor) rangeGlobalVars(f func(name, val string)) {
 		f(k, v)
 	}
 	e.globalVarsMu.RUnlock()
+}
+
+// effectiveDataDir returns the data directory path that should be exposed
+// via @@datadir.  If the executor has a non-empty DataDir (typical when
+// running under mtrrun), it is returned with a trailing slash so that test
+// scripts which concatenate "$MYSQLD_DATADIR/test/t1.ibd" produce a valid
+// absolute path.  Otherwise, the historical default "/var/lib/mysql/" is
+// returned for compatibility with code that does not configure DataDir.
+func (e *Executor) effectiveDataDir() string {
+	if e.DataDir == "" {
+		return "/var/lib/mysql/"
+	}
+	d := e.DataDir
+	if !strings.HasSuffix(d, "/") {
+		d += "/"
+	}
+	return d
 }
 
 // getSysVar reads a system variable with proper scope resolution:
@@ -2076,16 +2095,48 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 				}
 			}
 		}
-		// FLUSH TABLE(S) ... FOR EXPORT on non-InnoDB engines returns an error
+		// FLUSH TABLE(S) ... FOR EXPORT on non-InnoDB engines returns an error.
+		// For InnoDB tables, write empty stub .cfg/.ibd files into the data
+		// directory so MTR import tests' subsequent --copy_file directives find
+		// them.  This path is the regex fallback for queries the vitess parser
+		// did not handle (the AST-based handler in the *sqlparser.Flush case
+		// has the equivalent logic).
 		if strings.HasPrefix(upper, "FLUSH TABLE") && strings.Contains(upper, "FOR EXPORT") {
-			// Extract table name: FLUSH TABLE t1 FOR EXPORT or FLUSH TABLES t1 FOR EXPORT
-			parts := strings.Fields(trimmed)
-			if len(parts) >= 3 {
-				tblName := strings.TrimRight(parts[2], ";")
-				if tbl, err := e.Storage.GetTable(e.CurrentDB, tblName); err == nil {
-					eng := strings.ToLower(tbl.Def.Engine)
-					if eng != "" && eng != "innodb" {
-						return nil, mysqlError(1031, "HY000", fmt.Sprintf("Table storage engine for '%s' doesn't have this option", tblName))
+			rest := ""
+			if strings.HasPrefix(upper, "FLUSH TABLES ") {
+				rest = trimmed[len("FLUSH TABLES "):]
+			} else if strings.HasPrefix(upper, "FLUSH TABLE ") {
+				rest = trimmed[len("FLUSH TABLE "):]
+			}
+			restUpper := strings.ToUpper(rest)
+			if idx := strings.LastIndex(restUpper, "FOR EXPORT"); idx >= 0 {
+				rest = strings.TrimSpace(rest[:idx])
+			}
+			rest = strings.TrimRight(strings.TrimSpace(rest), ";")
+			for _, ts := range strings.Split(rest, ",") {
+				ts = strings.TrimSpace(strings.Trim(strings.TrimSpace(ts), "`"))
+				if ts == "" {
+					continue
+				}
+				flushDB := e.CurrentDB
+				flushTable := ts
+				if dotIdx := strings.Index(ts, "."); dotIdx >= 0 {
+					flushDB = strings.Trim(ts[:dotIdx], "`")
+					flushTable = strings.Trim(ts[dotIdx+1:], "`")
+				}
+				tbl, err := e.Storage.GetTable(flushDB, flushTable)
+				if err != nil {
+					continue
+				}
+				eng := strings.ToLower(tbl.Def.Engine)
+				if eng != "" && eng != "innodb" {
+					return nil, mysqlError(1031, "HY000", fmt.Sprintf("Table storage engine for '%s' doesn't have this option", flushTable))
+				}
+				if e.DataDir != "" {
+					dir := filepath.Join(e.DataDir, flushDB)
+					if mkErr := os.MkdirAll(dir, 0755); mkErr == nil {
+						_ = os.WriteFile(filepath.Join(dir, flushTable+".cfg"), nil, 0644)
+						_ = os.WriteFile(filepath.Join(dir, flushTable+".ibd"), nil, 0644)
 					}
 				}
 			}
@@ -3253,14 +3304,29 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			}
 			return &Result{}, nil
 		}
-		// FLUSH TABLE ... FOR EXPORT on non-InnoDB engines returns an error
+		// FLUSH TABLE ... FOR EXPORT on non-InnoDB engines returns an error.
+		// For InnoDB tables, write empty stub .cfg/.ibd files so MTR import
+		// tests' subsequent --copy_file directives succeed.
 		if s.ForExport && len(s.TableNames) > 0 {
 			for _, tn := range s.TableNames {
+				flushDB := tn.Qualifier.String()
+				if flushDB == "" {
+					flushDB = e.CurrentDB
+				}
 				tblName := tn.Name.String()
-				if tbl, err := e.Storage.GetTable(e.CurrentDB, tblName); err == nil {
-					eng := strings.ToLower(tbl.Def.Engine)
-					if eng != "" && eng != "innodb" {
-						return nil, mysqlError(1031, "HY000", fmt.Sprintf("Table storage engine for '%s' doesn't have this option", tblName))
+				tbl, err := e.Storage.GetTable(flushDB, tblName)
+				if err != nil {
+					continue
+				}
+				eng := strings.ToLower(tbl.Def.Engine)
+				if eng != "" && eng != "innodb" {
+					return nil, mysqlError(1031, "HY000", fmt.Sprintf("Table storage engine for '%s' doesn't have this option", tblName))
+				}
+				if e.DataDir != "" {
+					dir := filepath.Join(e.DataDir, flushDB)
+					if mkErr := os.MkdirAll(dir, 0755); mkErr == nil {
+						_ = os.WriteFile(filepath.Join(dir, tblName+".cfg"), nil, 0644)
+						_ = os.WriteFile(filepath.Join(dir, tblName+".ibd"), nil, 0644)
 					}
 				}
 			}

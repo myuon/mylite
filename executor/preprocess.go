@@ -1078,9 +1078,16 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		return "", nil, ErrUnsupported("RESOURCE GROUP hint")
 	}
 
-	// Handle ALTER TABLE ... DISCARD/IMPORT TABLESPACE (InnoDB transportable tablespace, no-op)
+	// Handle ALTER TABLE ... DISCARD/IMPORT TABLESPACE.
+	// The InnoDB transportable tablespace feature is not implemented; we accept
+	// the syntax and toggle a Discarded flag on the TableDef so that DML on a
+	// discarded table fails with ER_TABLESPACE_DISCARDED.  IMPORT TABLESPACE
+	// clears the flag and is otherwise a no-op (no real .ibd is read).
 	if strings.HasPrefix(upper, "ALTER TABLE") &&
 		(strings.Contains(upper, "DISCARD TABLESPACE") || strings.Contains(upper, "IMPORT TABLESPACE")) {
+		if result, err := e.execAlterDiscardImport(trimmed, upper); err != nil || result != nil {
+			return "", result, err
+		}
 		return "", &Result{}, nil
 	}
 

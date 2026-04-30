@@ -58,7 +58,6 @@ var directiveIncludeCategory = map[string]string{
 	"wait_condition.inc":        "out_of_scope", // P_S sync wait, see #15
 	"wait_condition_sp.inc":     "out_of_scope", // SP wait, see #92
 	"idx_explain_test.inc":      "out_of_scope", // P_S idx, see #15
-	"import.inc":                "out_of_scope", // InnoDB import, see #71
 	"deadlock.inc":              "out_of_scope", // InnoDB lock, see #71
 }
 

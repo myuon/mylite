@@ -172,6 +172,10 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		tableName = baseTable
 		viewWhereExpr = viewWhere
 	}
+	// Reject UPDATE on tables whose tablespace has been discarded.
+	if err := e.checkTablespaceDiscarded(updateDB, tableName); err != nil {
+		return nil, err
+	}
 	// If updating through a view, validate that SET targets are updatable columns (direct col refs).
 	if viewColMap != nil {
 		for _, upd := range stmt.Exprs {

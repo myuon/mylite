@@ -4563,6 +4563,14 @@
     {
       "test": "other/concurrent_innodb_unsafelog",
       "reason": "multi-connection InnoDB concurrent UPDATE"
+    },
+    {
+      "test": "innodb/default_row_format_compatibility",
+      "reason": "InnoDB transportable tablespace data preservation not implemented (#71)"
+    },
+    {
+      "test": "innodb/innodb-wl5522",
+      "reason": "InnoDB transportable tablespace + restart_mysqld (#71)"
     }
   ]
 }

@@ -175,6 +175,10 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		tableName = baseTable
 		viewWhereExpr = viewWhere
 	}
+	// Reject DELETE on tables whose tablespace has been discarded.
+	if err := e.checkTablespaceDiscarded(deleteDB, tableName); err != nil {
+		return nil, err
+	}
 	// Merge view's WHERE condition into the DELETE's WHERE clause.
 	if viewWhereExpr != nil {
 		if stmt.Where == nil {

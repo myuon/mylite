@@ -864,7 +864,7 @@ func (e *Executor) evalVariableExpr(v *sqlparser.Variable) (interface{}, error) 
 	case "innodb_fill_factor":
 		return int64(100), nil
 	case "datadir":
-		return "/var/lib/mysql/", nil
+		return e.effectiveDataDir(), nil
 	case "lower_case_table_names":
 		return int64(0), nil
 	case "default_storage_engine":
