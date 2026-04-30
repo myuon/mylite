@@ -7480,12 +7480,28 @@ func (e *Executor) perfSchemaESMSByDigest() []storage.Row {
 	}
 	rows := make([]storage.Row, 0, len(e.psDigests))
 	for _, d := range e.psDigests {
+		firstSeen := d.FirstSeen
+		if firstSeen == "" {
+			firstSeen = "2024-01-01 00:00:00.000000"
+		}
+		lastSeen := d.LastSeen
+		if lastSeen == "" {
+			lastSeen = firstSeen
+		}
+		var schemaCol any = d.SchemaName
+		if d.SchemaName == "" {
+			schemaCol = nil
+		}
+		sampleText := d.QuerySampleText
+		if sampleText == "" {
+			sampleText = d.DigestText
+		}
 		rows = append(rows, storage.Row{
-			"SCHEMA_NAME":                  d.SchemaName,
+			"SCHEMA_NAME":                  schemaCol,
 			"DIGEST":                       d.Digest,
-			"DIGEST_TEXT":                   d.DigestText,
-			"COUNT_STAR":                    d.CountStar,
-			"SUM_TIMER_WAIT":               int64(0),
+			"DIGEST_TEXT":                  d.DigestText,
+			"COUNT_STAR":                   d.CountStar,
+			"SUM_TIMER_WAIT":               d.SumTimerWait,
 			"MIN_TIMER_WAIT":               int64(0),
 			"AVG_TIMER_WAIT":               int64(0),
 			"MAX_TIMER_WAIT":               int64(0),
@@ -7508,13 +7524,13 @@ func (e *Executor) perfSchemaESMSByDigest() []storage.Row {
 			"SUM_SORT_SCAN":                int64(0),
 			"SUM_NO_INDEX_USED":            int64(0),
 			"SUM_NO_GOOD_INDEX_USED":       int64(0),
-			"FIRST_SEEN":                   "2024-01-01 00:00:00.000000",
-			"LAST_SEEN":                    "2024-01-01 00:00:00.000000",
+			"FIRST_SEEN":                   firstSeen,
+			"LAST_SEEN":                    lastSeen,
 			"QUANTILE_95":                  int64(0),
 			"QUANTILE_99":                  int64(0),
 			"QUANTILE_999":                 int64(0),
-			"QUERY_SAMPLE_TEXT":            d.DigestText,
-			"QUERY_SAMPLE_SEEN":            "2024-01-01 00:00:00.000000",
+			"QUERY_SAMPLE_TEXT":            sampleText,
+			"QUERY_SAMPLE_SEEN":            lastSeen,
 			"QUERY_SAMPLE_TIMER_WAIT":      int64(0),
 		})
 	}

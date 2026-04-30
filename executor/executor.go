@@ -2,8 +2,6 @@ package executor
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -320,10 +318,14 @@ type EnumValue string
 
 // psDigestEntry tracks a statement digest for performance_schema tables.
 type psDigestEntry struct {
-	SchemaName string
-	Digest     string
-	DigestText string
-	CountStar  int64
+	SchemaName      string
+	Digest          string
+	DigestText      string
+	CountStar       int64
+	SumTimerWait    int64  // accumulated wait time in picoseconds (always 0 in this impl)
+	FirstSeen       string // YYYY-MM-DD HH:MM:SS.uuuuuu
+	LastSeen        string
+	QuerySampleText string
 }
 
 // savedPermTable holds the state of a permanent table that was shadowed by a temporary table.
@@ -1852,43 +1854,59 @@ func (e *Executor) logToGeneralLog(query string) {
 
 // recordStatementDigest records a statement digest for performance_schema
 // events_statements_summary_by_digest and histogram tables.
+//
+// Digests are accumulated for every executed client statement (subject to the
+// performance_schema_digests_size cap). Truncation of the table only resets
+// in-memory entries; subsequent statements keep being recorded.
 func (e *Executor) recordStatementDigest(query string) {
-	// Only record if digest tables have been truncated (i.e., test is tracking digests)
-	if e.psTruncated == nil {
+	trimmed := strings.TrimSpace(query)
+	if trimmed == "" {
 		return
 	}
-	if !e.psTruncated["events_statements_summary_by_digest"] && !e.psTruncated["events_statements_histogram_by_digest"] {
+	// Skip SELECT/SHOW queries that target performance_schema itself to avoid
+	// the act of observation polluting the digest table. TRUNCATE on a
+	// performance_schema digest table IS recorded (matches MySQL behavior).
+	upperQ := strings.ToUpper(trimmed)
+	if strings.Contains(upperQ, "PERFORMANCE_SCHEMA") &&
+		(strings.HasPrefix(upperQ, "SELECT") || strings.HasPrefix(upperQ, "SHOW") ||
+			strings.HasPrefix(upperQ, "(SELECT") || strings.HasPrefix(upperQ, "DESC")) {
 		return
 	}
-	// Skip queries to performance_schema itself to avoid recursive recording
-	upperQ := strings.ToUpper(query)
-	if strings.Contains(upperQ, "PERFORMANCE_SCHEMA") {
+	// Honor performance_schema_digests_size = 0 (disabled).
+	if v, ok := e.startupVars["performance_schema_digests_size"]; ok && v == "0" {
 		return
 	}
-	// Skip TRUNCATE, USE, and other non-data statements
-	if strings.HasPrefix(upperQ, "TRUNCATE") || strings.HasPrefix(upperQ, "USE ") {
-		return
+	maxSize := int64(10000)
+	if v, ok := e.startupVars["performance_schema_digests_size"]; ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			maxSize = n
+		}
 	}
-	// Compute a simple digest
-	h := sha256.Sum256([]byte(strings.TrimSpace(query)))
-	digest := hex.EncodeToString(h[:16]) // 32-char hex digest
-
+	digest, digestText := normalizeStatementDigest(trimmed)
 	schemaName := e.CurrentDB
-	if schemaName == "" {
-		schemaName = "test"
-	}
-	// Check if we already have this digest+schema
+	now := time.Now().UTC().Format("2006-01-02 15:04:05.000000")
 	for i := range e.psDigests {
 		if e.psDigests[i].Digest == digest && e.psDigests[i].SchemaName == schemaName {
 			e.psDigests[i].CountStar++
+			e.psDigests[i].LastSeen = now
+			e.psDigests[i].QuerySampleText = trimmed
 			return
 		}
 	}
+	if int64(len(e.psDigests)) >= maxSize {
+		// Buffer is full: drop the new entry (MySQL records overflow under a
+		// NULL-row, which the rendering layer synthesises). We still update
+		// the LAST_SEEN of an existing match if we ever find one.
+		return
+	}
 	e.psDigests = append(e.psDigests, psDigestEntry{
-		SchemaName: schemaName,
-		Digest:     digest,
-		DigestText: strings.TrimSpace(query),
-		CountStar:  1,
+		SchemaName:      schemaName,
+		Digest:          digest,
+		DigestText:      digestText,
+		CountStar:       1,
+		FirstSeen:       now,
+		LastSeen:        now,
+		QuerySampleText: trimmed,
 	})
 }
 
