@@ -1206,19 +1206,71 @@ func (t *Table) Scan() []Row {
 		for idx, pk := range pkCols {
 			pkCollations[idx] = effectivePKCollation(t.Def, pk)
 		}
-		sort.SliceStable(result, func(i, j int) bool {
-			ri, rj := result[i], result[j]
-			for idx, pk := range pkCols {
-				cmp := compareRowValueWithCollation(ri[pk], rj[pk], pkCollations[idx])
-				if cmp < 0 {
-					return true
+		// For HASH-partitioned tables with a simple column expression and a known
+		// partition count, MySQL/InnoDB iterates partitions in order p0, p1, ...,
+		// returning the rows of each partition (clustered by PK) sequentially.
+		// Pair each row with its partition index so the sort key follows the row
+		// across swaps.
+		type rowPart struct {
+			row     Row
+			partIdx int64
+			hasPart bool
+		}
+		usePartitionOrder := t.Def.PartitionType == "HASH" &&
+			len(t.Def.PartitionColumns) == 1 &&
+			t.Def.PartitionCount > 0
+		paired := make([]rowPart, len(result))
+		if usePartitionOrder {
+			partCol := t.Def.PartitionColumns[0]
+			pc := int64(t.Def.PartitionCount)
+			for i, r := range result {
+				v, ok := toComparableFloat(r[partCol])
+				if !ok {
+					usePartitionOrder = false
+					break
 				}
-				if cmp > 0 {
-					return false
+				n := int64(v)
+				if n < 0 {
+					n = -n
 				}
+				paired[i] = rowPart{row: r, partIdx: n % pc, hasPart: true}
 			}
-			return false
-		})
+		}
+		if usePartitionOrder {
+			sort.SliceStable(paired, func(i, j int) bool {
+				if paired[i].partIdx != paired[j].partIdx {
+					return paired[i].partIdx < paired[j].partIdx
+				}
+				ri, rj := paired[i].row, paired[j].row
+				for idx, pk := range pkCols {
+					cmp := compareRowValueWithCollation(ri[pk], rj[pk], pkCollations[idx])
+					if cmp < 0 {
+						return true
+					}
+					if cmp > 0 {
+						return false
+					}
+				}
+				return false
+			})
+			for i := range paired {
+				result[i] = paired[i].row
+			}
+		} else {
+			sort.SliceStable(result, func(i, j int) bool {
+				ri, rj := result[i], result[j]
+				for idx, pk := range pkCols {
+					cmp := compareRowValueWithCollation(ri[pk], rj[pk], pkCollations[idx])
+					if cmp < 0 {
+						return true
+					}
+					if cmp > 0 {
+						return false
+					}
+				}
+				return false
+			})
+		}
 	} else if t.Def != nil && len(t.Def.PrimaryKey) == 0 && len(t.Def.PartitionColumns) > 0 &&
 		t.Def.PartitionType == "RANGE" && len(result) > 1 {
 		// For RANGE-partitioned tables without a PRIMARY KEY, MySQL returns

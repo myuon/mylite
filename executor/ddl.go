@@ -2393,9 +2393,9 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		case sqlparser.KeyType:
 			def.PartitionType = "KEY"
 		}
-		// For RANGE partitions with a simple column expression, record the
+		// For RANGE/HASH partitions with a simple column expression, record the
 		// column so that Scan can sort rows in partition order.
-		if po.Type == sqlparser.RangeType && po.Expr != nil {
+		if (po.Type == sqlparser.RangeType || po.Type == sqlparser.HashType) && po.Expr != nil {
 			if col, ok := po.Expr.(*sqlparser.ColName); ok {
 				def.PartitionColumns = []string{col.Name.String()}
 			}
