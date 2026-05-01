@@ -1660,16 +1660,71 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 			output, exitErr := ctx.runExternalCommand(cmdStr)
 			expectedErr := ctx.expectedError
 			ctx.expectedError = ""
+			// Apply --replace_regex and --replace_result to exec output, then
+			// consume them. MySQL's mysqltest applies these directives to the
+			// next command's output (including --exec output). See e.g.
+			// bug47671 which uses --replace_regex to filter `mysql -e "status"`.
+			// Note: regex patterns are applied per line to be consistent with
+			// SQL result handling. mysqltest's `/^\n//` idiom (collapse empty
+			// lines) is supported by detecting "match-everything" results and
+			// dropping the resulting blank lines from output.
+			applyExecFilters := func(s string) string {
+				if s == "" {
+					return s
+				}
+				if len(ctx.replaceResult) > 0 {
+					lines := strings.Split(s, "\n")
+					for i, l := range lines {
+						lines[i] = applyReplaceResult(l, ctx.replaceResult)
+					}
+					s = strings.Join(lines, "\n")
+				}
+				if len(ctx.replaceRegex) > 0 {
+					// Detect whether any pattern targets newlines or empty
+					// lines. mysqltest uses patterns like `^\n` to drop blank
+					// lines; emulate by removing empty lines after substitution.
+					dropEmpty := false
+					for _, rr := range ctx.replaceRegex {
+						p := rr.re.String()
+						if strings.Contains(p, "\\n") || strings.HasPrefix(p, "^") {
+							if rr.repl == "" {
+								dropEmpty = true
+								break
+							}
+						}
+					}
+					lines := strings.Split(s, "\n")
+					for i, l := range lines {
+						lines[i] = applyReplaceRegex(l, ctx.replaceRegex)
+					}
+					if dropEmpty {
+						kept := lines[:0]
+						for _, l := range lines {
+							if l == "" {
+								continue
+							}
+							kept = append(kept, l)
+						}
+						lines = kept
+					}
+					s = strings.Join(lines, "\n")
+				}
+				return s
+			}
 			if exitErr != nil {
 				// Command failed - check if error was expected
 				if expectedErr != "" {
 					// Error expected, output stderr content if any
 					if output != "" && ctx.resultLogEnabled {
-						ctx.output.WriteString(output)
+						ctx.output.WriteString(applyExecFilters(output))
 					}
+					ctx.replaceResult = nil
+					ctx.replaceRegex = nil
 					return true, false, nil
 				}
 				// Unexpected error - ignore (don't fail the test for unsupported commands)
+				ctx.replaceResult = nil
+				ctx.replaceRegex = nil
 				return true, false, nil
 			}
 			if output != "" && ctx.resultLogEnabled {
@@ -1685,8 +1740,10 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 					}
 					filteredLines = append(filteredLines, line)
 				}
-				ctx.output.WriteString(strings.Join(filteredLines, "\n"))
+				ctx.output.WriteString(applyExecFilters(strings.Join(filteredLines, "\n")))
 			}
+			ctx.replaceResult = nil
+			ctx.replaceRegex = nil
 			return true, false, nil
 		}
 		return true, false, nil
