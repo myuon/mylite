@@ -3399,6 +3399,70 @@ func exprHasColEqColEquality(expr sqlparser.Expr) bool {
 	return false
 }
 
+// joinExprHasAnyLeftJoin returns true if the table expression contains any
+// LEFT JOIN (equi or non-equi).  Used to detect cases where DuplicateWeedout
+// is inappropriate for NOT IN anti-joins because LEFT JOIN preserves NULL-
+// extended rows.
+func joinExprHasAnyLeftJoin(te sqlparser.TableExpr) bool {
+	jte, ok := te.(*sqlparser.JoinTableExpr)
+	if !ok {
+		if pte, isParen := te.(*sqlparser.ParenTableExpr); isParen {
+			for _, sub := range pte.Exprs {
+				if joinExprHasAnyLeftJoin(sub) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if jte.Join == sqlparser.LeftJoinType || jte.Join == sqlparser.NaturalLeftJoinType {
+		return true
+	}
+	if joinExprHasAnyLeftJoin(jte.LeftExpr) {
+		return true
+	}
+	return joinExprHasAnyLeftJoin(jte.RightExpr)
+}
+
+// nestedINSubqueryHasLeftJoin returns true if any nested IN subquery
+// (recursively walking inner.Where) has a FROM clause that contains any
+// LEFT JOIN.  This signals that DuplicateWeedout is unsafe in NOT IN /
+// anti-join contexts: a LEFT JOIN can NULL-extend rows, and weeding out
+// duplicates by primary key would erase those preserved rows.  MySQL falls
+// back to MATERIALIZED for the entire NOT IN body in that case.
+func nestedINSubqueryHasLeftJoin(inner *sqlparser.Select) bool {
+	if inner == nil || inner.Where == nil {
+		return false
+	}
+	found := false
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if found {
+			return false, nil
+		}
+		if cmp, ok := n.(*sqlparser.ComparisonExpr); ok {
+			if cmp.Operator == sqlparser.InOp || cmp.Operator == sqlparser.NotInOp {
+				if sub, ok := cmp.Right.(*sqlparser.Subquery); ok {
+					if nestedSel, ok := sub.Select.(*sqlparser.Select); ok {
+						for _, te := range nestedSel.From {
+							if joinExprHasAnyLeftJoin(te) {
+								found = true
+								return false, nil
+							}
+						}
+						if nestedINSubqueryHasLeftJoin(nestedSel) {
+							found = true
+							return false, nil
+						}
+					}
+					return false, nil
+				}
+			}
+		}
+		return true, nil
+	}, inner.Where)
+	return found
+}
+
 // nestedINSubqueryHasNonEquiLeftJoin returns true if any nested IN subquery
 // (recursively walking inner.Where) has a FROM clause whose JOIN tree contains
 // a LEFT JOIN with a non-equi ON condition. See joinExprHasNonEquiLeftJoin.
@@ -5041,6 +5105,25 @@ func hasImpossibleNullComparison(expr sqlparser.Expr) bool {
 	return found
 }
 
+// isSubqueryInNotInContext checks if a Subquery node is used as the right-hand
+// side of a NOT IN or != ANY (= ALL via NotEqualOp ANY) comparison.  This is a
+// strict subset of isSubqueryInINContext: only NOT-IN-style anti-join forms.
+func isSubqueryInNotInContext(node sqlparser.SQLNode, sub *sqlparser.Subquery) bool {
+	found := false
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if cmp, ok := n.(*sqlparser.ComparisonExpr); ok {
+			if cmp.Operator == sqlparser.NotInOp {
+				if subR, ok := cmp.Right.(*sqlparser.Subquery); ok && subR == sub {
+					found = true
+					return false, nil
+				}
+			}
+		}
+		return true, nil
+	}, node)
+	return found
+}
+
 // isSubqueryInINContext checks if a Subquery node is used in an IN, NOT IN, or = ANY / != ANY context.
 // Note: plain scalar equality like "col = (SELECT 1 FROM t2)" (without ANY/ALL) is NOT IN context;
 // those are SUBQUERY not semijoin-flattenable.
@@ -6161,7 +6244,14 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 				}
 				tablePulloutWeedout := selectType == "MATERIALIZED" && e.isSemijoinEnabled() &&
 					e.innerHasCorrelatedPKWithOuter(inner, outerTablesList)
-				if selectType == "MATERIALIZED" && (e.shouldUseDuplicateWeedout(inner) || tablePulloutWeedout) {
+				// NOT IN anti-join exception: when the outer comparison is NOT IN
+				// and the nested IN subquery's body contains a LEFT JOIN, MySQL keeps
+				// the entire body MATERIALIZED rather than flattening to DuplicateWeedout.
+				// Anti-joins must preserve NULL-extended rows from the LEFT JOIN, so
+				// DuplicateWeedout (which weeds duplicates by primary key) would discard them.
+				notInLeftJoinBlocksWeedout := selectType == "MATERIALIZED" &&
+					isSubqueryInNotInContext(node, sub) && nestedINSubqueryHasLeftJoin(inner)
+				if selectType == "MATERIALIZED" && !notInLeftJoinBlocksWeedout && (e.shouldUseDuplicateWeedout(inner) || tablePulloutWeedout) {
 					// Collect all tables from the nested IN chain (or the inner FROM list
 					// when the trigger is table-pullout rather than nested IN).
 					var allTables []string
