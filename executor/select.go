@@ -2469,8 +2469,11 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 				if stepExpr != nil && len(allRows) > 0 && len(rightRows) > 0 {
 					scratch = make(storage.Row, len(allRows[0])+len(rightRows[0]))
 				}
-				for _, leftRow := range allRows {
-					for _, rightRow := range rightRows {
+				// MySQL cross-join ordering: the rightmost (new) table is the outer loop
+				// and the accumulated left rows are the inner loop. This matches MySQL's
+				// natural row ordering for "FROM t1, t2" (t2 is outer, t1 is inner).
+				for _, rightRow := range rightRows {
+					for _, leftRow := range allRows {
 						if stepExpr != nil {
 							// Reuse scratch map: clear and repopulate
 							for k := range scratch {
