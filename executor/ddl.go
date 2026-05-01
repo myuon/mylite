@@ -5012,6 +5012,19 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			if chgErr := db.ChangeColumn(tableName, oldName, colDef); chgErr != nil {
 				return nil, chgErr
 			}
+			// CHANGE COLUMN forces a table rebuild in MySQL: clear any INSTANT
+			// metadata so subsequent ADD COLUMN ... INSTANT starts from a clean
+			// slate (matches information_schema.innodb_tables.instant_cols=0).
+			if tableDef, tdErr := db.GetTable(tableName); tdErr == nil && tableDef != nil {
+				if tableDef.InstantCols != 0 {
+					tableDef.InstantCols = 0
+					for i := range tableDef.Columns {
+						tableDef.Columns[i].IsInstantAdded = false
+						tableDef.Columns[i].InstantDefault = ""
+					}
+					tableDef.RebuildSeq++
+				}
+			}
 			// Rename the key in all existing rows if the column name changed.
 			if oldName != colDef.Name {
 				tbl.RenameColumn(oldName, colDef.Name)
