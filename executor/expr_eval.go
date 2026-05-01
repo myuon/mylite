@@ -7732,6 +7732,27 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 		if rightWhereOvErr != nil {
 			e.addWarning("Warning", 1292, formatOverflowWarningMsg(rightWhereOvErr))
 		}
+		// VARBINARY/BINARY-column vs HexNum literal: in MySQL, `0xNN` is a
+		// hexadecimal literal that defaults to a binary string. When compared
+		// to a binary column, the bytes should match directly. Vitess parses
+		// `0xNN` as an integer (HexNum), so we explicitly convert it back to
+		// its big-endian byte representation when the other side is a binary
+		// column. This applies to =, !=, <, >, <=, >= operators.
+		if isOrderingOrEqualityOp(v.Operator) || v.Operator == sqlparser.NullSafeEqualOp {
+			if e.isBinaryExpr(leftExprW) && isHexNumLiteral(rightExprW) {
+				if _, isStr := left.(string); isStr {
+					if conv, ok := hexIntToBytes(right).(string); ok {
+						right = conv
+					}
+				}
+			} else if e.isBinaryExpr(rightExprW) && isHexNumLiteral(leftExprW) {
+				if _, isStr := right.(string); isStr {
+					if conv, ok := hexIntToBytes(left).(string); ok {
+						left = conv
+					}
+				}
+			}
+		}
 		// FLOAT-column-vs-literal: model MySQL's single-precision storage
 		// semantics. e.g. `WHERE float_col = 12.34` does not match a row that
 		// stored 12.34, because MySQL stores float32(12.34) = 12.340000152...
