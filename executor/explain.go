@@ -2224,6 +2224,29 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 				ref = accessInfo.ref
 			}
 
+			// Promote ALL → system for sole-table SELECTs whose target table is known to
+			// hold exactly 1 row.  MySQL's optimizer detects this from storage stats and
+			// reports "system" (a special case of const) regardless of whether the WHERE
+			// references the table — the single row is read once and treated as a constant.
+			// Restrict to len(allTableNames) == 1 to avoid disturbing multi-table joins
+			// where mylite's optimizer ordering may not match MySQL's.
+			if accessType == "ALL" && len(allTableNames) == 1 && idx == 0 && !rangeCheckedForEachRecord &&
+				!tableIsEmpty && rowCount == int64(1) {
+				accessType = "system"
+				possibleKeys = nil
+				key = nil
+				keyLen = nil
+				ref = nil
+				// MySQL drops "Using where" / "Using join buffer" for system-access tables;
+				// any prior assignment in this iteration was based on accessType==ALL, so reset.
+				if extra != nil {
+					extraStr := fmt.Sprintf("%v", extra)
+					if extraStr == "Using where" || extraStr == "Using join buffer (Block Nested Loop)" {
+						extra = nil
+					}
+				}
+			}
+
 			if accessInfo.accessType == "const" || accessInfo.accessType == "eq_ref" || accessInfo.accessType == "ref" {
 				rowCount = int64(1)
 			} else if accessInfo.accessType == "range" && sel.Where != nil && e.Storage != nil {
@@ -2294,7 +2317,9 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 
 			// Add "Using where" for ALL-access tables that have WHERE conditions filtering them.
 			// MySQL adds "Using where" when the engine applies a WHERE filter during a full scan.
-			if accessInfo.accessType == "ALL" && sel.Where != nil {
+			// Skip when we have promoted accessType to "system" (1-row table) — MySQL drops
+			// "Using where" for system access since the WHERE is evaluated against the constant row.
+			if accessInfo.accessType == "ALL" && accessType != "system" && sel.Where != nil {
 				dbName := e.CurrentDB
 				if dbName == "" {
 					dbName = "test"
