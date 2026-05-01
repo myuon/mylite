@@ -4794,6 +4794,20 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				return nil, dropErr
 			}
 			tbl.DropColumn(colName)
+			// DROP COLUMN forces a table rebuild in MySQL: clear any INSTANT
+			// metadata so subsequent ADD COLUMN ... INSTANT starts from a clean
+			// slate, and bump RebuildSeq so information_schema reports a new
+			// TABLE_ID (matches MySQL "Table ID differed" semantics).
+			if tableDef, tdErr := db.GetTable(tableName); tdErr == nil && tableDef != nil {
+				if tableDef.InstantCols != 0 {
+					tableDef.InstantCols = 0
+					for i := range tableDef.Columns {
+						tableDef.Columns[i].IsInstantAdded = false
+						tableDef.Columns[i].InstantDefault = ""
+					}
+				}
+				tableDef.RebuildSeq++
+			}
 
 		case *sqlparser.ModifyColumn:
 			colDef := columnDefFromAST(op.NewColDefinition)
