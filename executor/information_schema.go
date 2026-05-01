@@ -1318,11 +1318,18 @@ func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 			if def != nil {
 				instantCols = int64(def.InstantCols)
 			}
+			// Offset TABLE_ID by RebuildSeq*10000 so a rebuilt table reports
+			// a different TABLE_ID, mirroring MySQL behavior where rebuilds
+			// allocate a new internal id.
+			displayedTableID := tableID
+			if def != nil && def.RebuildSeq != 0 {
+				displayedTableID = tableID + int64(def.RebuildSeq)*10000
+			}
 			if def != nil && def.PartitionType != "" {
 				partNames := innodbPartitionNames(def)
 				for _, partName := range partNames {
 					rows = append(rows, storage.Row{
-						"TABLE_ID":      tableID,
+						"TABLE_ID":      displayedTableID,
 						"NAME":          prefix + "#p#" + partName,
 						"SPACE":         space,
 						"FLAG":          flag,
@@ -1333,11 +1340,16 @@ func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 						"INSTANT_COLS":  instantCols,
 					})
 					tableID++
+					if def != nil && def.RebuildSeq != 0 {
+						displayedTableID = tableID + int64(def.RebuildSeq)*10000
+					} else {
+						displayedTableID = tableID
+					}
 					space++
 				}
 			} else {
 				rows = append(rows, storage.Row{
-					"TABLE_ID":      tableID,
+					"TABLE_ID":      displayedTableID,
 					"NAME":          prefix,
 					"SPACE":         space,
 					"FLAG":          flag,
@@ -1429,10 +1441,14 @@ func (e *Executor) infoSchemaInnoDBIndexes() []storage.Row {
 			if len(def.PrimaryKey) > 0 {
 				pkName = "PRIMARY"
 			}
+			displayedTableID := tableID
+			if def.RebuildSeq != 0 {
+				displayedTableID = tableID + int64(def.RebuildSeq)*10000
+			}
 			rows = append(rows, storage.Row{
 				"INDEX_ID": indexID,
 				"NAME":     pkName,
-				"TABLE_ID": tableID,
+				"TABLE_ID": displayedTableID,
 				"TYPE":     int64(3), // clustered
 				"SPACE":    space,
 			})
@@ -1445,7 +1461,7 @@ func (e *Executor) infoSchemaInnoDBIndexes() []storage.Row {
 				rows = append(rows, storage.Row{
 					"INDEX_ID": indexID,
 					"NAME":     idx.Name,
-					"TABLE_ID": tableID,
+					"TABLE_ID": displayedTableID,
 					"TYPE":     int64(0),
 					"SPACE":    space,
 				})
@@ -1654,6 +1670,10 @@ func (e *Executor) infoSchemaInnoDBColumns() []storage.Row {
 				}
 			}
 			for p := 0; p < partCount; p++ {
+				displayedTableID := tableID
+				if def.RebuildSeq != 0 {
+					displayedTableID = tableID + int64(def.RebuildSeq)*10000
+				}
 				for i, col := range def.Columns {
 					hasDefault := int64(0)
 					var defaultValue interface{} = nil
@@ -1682,7 +1702,7 @@ func (e *Executor) infoSchemaInnoDBColumns() []storage.Row {
 						}
 					}
 					rows = append(rows, storage.Row{
-						"TABLE_ID":      tableID,
+						"TABLE_ID":      displayedTableID,
 						"NAME":          col.Name,
 						"POS":           int64(i),
 						"MTYPE":         innodbColumnMTYPE(col.Type),

@@ -94,6 +94,10 @@ type TableDef struct {
 	// returns ER_TABLESPACE_DISCARDED until ALTER TABLE ... IMPORT
 	// TABLESPACE clears the flag.
 	InstantCols           int                 // number of columns at the time the first INSTANT ADD COLUMN was applied (0 = no instant cols)
+	// RebuildSeq counts the number of table rebuilds (non-instant ALTERs that
+	// would change InnoDB's internal table_id). Used so information_schema
+	// reports a different TABLE_ID after a rebuild, mirroring MySQL behavior.
+	RebuildSeq int
 	Discarded bool
 }
 

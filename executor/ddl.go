@@ -4171,7 +4171,15 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 	// Pre-check: ALGORITHM=INPLACE rejection for operations that require COPY
 	alterIsInplace := false
 	alterIsInstant := false
+	alterHasNonAddOp := false // exposed to inner ADD COLUMN handling (e.g. ADD KEY alongside ADD COLUMN forces rebuild)
+	alterHasForce := false    // FORCE keyword forces rebuild even with only ADD COLUMN
 	{
+		// Detect FORCE keyword by re-rendering the statement; vitess preserves
+		// the keyword in its output even when it doesn't expose it on the AST.
+		upperRaw := strings.ToUpper(sqlparser.String(stmt))
+		if strings.Contains(upperRaw, ", FORCE") || strings.HasSuffix(strings.TrimSpace(upperRaw), " FORCE") || strings.Contains(upperRaw, ",FORCE") {
+			alterHasForce = true
+		}
 		isInplace := false
 		isInstant := false
 		hasStoredGcolAdd := false
@@ -4222,6 +4230,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				hasNonAddOp = true
 			}
 		}
+		alterHasNonAddOp = hasNonAddOp
 		if isInplace && hasStoredGcolAdd {
 			return nil, mysqlError(1846, "0A000", "ALGORITHM=INPLACE is not supported for this operation. Try ALGORITHM=COPY.")
 		}
@@ -4580,12 +4589,14 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					}
 				}
 				// Determine whether this ADD COLUMN should be treated as INSTANT.
-				// MySQL 8.0.29+ defaults to INSTANT when possible. We treat it as
-				// INSTANT either when ALGORITHM=INSTANT was explicitly requested,
-				// or by default for plain ADD COLUMN at the end of the table on
-				// non-MyISAM/CSV tables (mirrors MySQL's "instant by default").
+				// MySQL 8.0.29+ defaults to INSTANT when possible. INSTANT works
+				// for ADD COLUMN at the end of the table, and for adds at any
+				// position (FIRST/AFTER) when no INSTANT-added column is already
+				// present. Once an INSTANT add at a mid-position has been applied
+				// to the table (InstantCols > 0), subsequent mid-position adds
+				// fall back to a copy/rebuild.
 				if !alterIsInplace {
-					instantEligible := position == "" && !colDef.PrimaryKey
+					instantEligible := !colDef.PrimaryKey
 					if instantEligible {
 						genExprPre := generatedColumnExpr(colDef.Type)
 						if genExprPre != "" && strings.Contains(strings.ToUpper(colDef.Type), "STORED") {
@@ -4593,6 +4604,19 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 						}
 						if colDef.AutoIncrement {
 							instantEligible = false
+						}
+						// Multi-op ALTER (ADD COLUMN combined with ADD KEY/DROP/etc.)
+						// or explicit FORCE forces a rebuild, so the new column is
+						// not INSTANT-added.
+						if alterHasNonAddOp || alterHasForce {
+							instantEligible = false
+						}
+						if position != "" {
+							// FIRST/AFTER: only the first INSTANT mid-position add per
+							// table is allowed; subsequent mid-position adds rebuild.
+							if tableDef0, _ := db.GetTable(tableName); tableDef0 != nil && tableDef0.InstantCols != 0 {
+								instantEligible = false
+							}
 						}
 					}
 					if instantEligible {
@@ -4608,8 +4632,14 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				}
 				// Update InstantCols on the table when the first INSTANT-added
 				// column is recorded (snapshot of column count before this add).
-				if colDef.IsInstantAdded {
-					if tableDef, tdErr := db.GetTable(tableName); tdErr == nil && tableDef != nil {
+				// When the add was NOT instant but would have been at end-of-table
+				// (i.e. position is FIRST/AFTER and we already had INSTANT cols),
+				// model the underlying rebuild: clear InstantCols, mark all
+				// previously-INSTANT columns as no-longer-instant (their defaults
+				// are now physically materialized), and bump RebuildSeq so
+				// information_schema reports a new TABLE_ID.
+				if tableDef, tdErr := db.GetTable(tableName); tdErr == nil && tableDef != nil {
+					if colDef.IsInstantAdded {
 						if tableDef.InstantCols == 0 {
 							// Set to the number of "regular" columns just before this add
 							// (i.e. columns that existed prior to this INSTANT).
@@ -4621,6 +4651,17 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 							}
 							tableDef.InstantCols = n
 						}
+					} else if position != "" || alterHasNonAddOp || alterHasForce || alterIsInplace {
+						// Non-instant add (mid-position with prior INSTANTs, multi-op
+						// ALTER, FORCE keyword, or ALGORITHM=INPLACE): rebuild.
+						if tableDef.InstantCols != 0 {
+							tableDef.InstantCols = 0
+							for i := range tableDef.Columns {
+								tableDef.Columns[i].IsInstantAdded = false
+								tableDef.Columns[i].InstantDefault = ""
+							}
+						}
+						tableDef.RebuildSeq++
 					}
 				}
 				// If the new column is a primary key (inline KEY or PRIMARY KEY), set it
