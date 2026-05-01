@@ -870,8 +870,12 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		query = "REPLACE " + query[len("REPLACE DELAYED "):]
 	}
 
-	// Handle ALTER TABLE ... REORGANIZE PARTITION as no-op
+	// Handle ALTER TABLE ... REORGANIZE PARTITION as no-op for execution,
+	// but apply minimal catalog updates first so information_schema reflects
+	// partial-rebuild semantics on instant_cols (only the new partitions
+	// reset instant_cols; sibling partitions retain it).
 	if strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, "REORGANIZE PARTITION") {
+		e.applyReorganizePartitionCatalog(query)
 		return "", &Result{}, nil
 	}
 
@@ -2503,6 +2507,18 @@ func (e *Executor) handleMultiAddPartition(query string) (*Result, error, bool) 
 			return nil, tblErr, true
 		}
 		tableDef.PartitionCount += n
+		// HASH/KEY ADD PARTITION PARTITIONS n requires a full table rebuild
+		// to redistribute rows; any INSTANT-added columns are physically
+		// materialized and information_schema.innodb_tables reports
+		// instant_cols=0 across every partition afterwards.
+		if tableDef.InstantCols != 0 {
+			tableDef.InstantCols = 0
+			for ci := range tableDef.Columns {
+				tableDef.Columns[ci].IsInstantAdded = false
+				tableDef.Columns[ci].InstantDefault = ""
+			}
+			tableDef.RebuildSeq++
+		}
 		return &Result{}, nil, true
 	}
 
@@ -2562,6 +2578,81 @@ func (e *Executor) handleMultiAddPartition(query string) (*Result, error, bool) 
 	}
 
 	return &Result{}, nil, true
+}
+
+// reReorganizePartitionStmt captures the table reference, source partition
+// list, and the new-partition definitions body for an
+// ALTER TABLE ... REORGANIZE PARTITION ... INTO (...) statement.
+var reReorganizePartitionStmt = regexp.MustCompile(`(?is)ALTER\s+TABLE\s+` +
+	`(` + "`[^`]*`" + `|[A-Za-z0-9_]+(?:\.(?:` + "`[^`]*`" + `|[A-Za-z0-9_]+))?` + `)` +
+	`\s+(?:[^,]*?,\s*)*REORGANIZE\s+PARTITION\s+([^()]+?)\s+INTO\s*\((.*)\)\s*$`)
+
+// applyReorganizePartitionCatalog updates the catalog for an
+// ALTER TABLE ... REORGANIZE PARTITION ... INTO (...) statement so that
+// information_schema.innodb_tables reports instant_cols correctly: the new
+// partitions get instant_cols=0 (they are freshly written), while sibling
+// partitions retain the table-level InstantCols.
+func (e *Executor) applyReorganizePartitionCatalog(query string) {
+	m := reReorganizePartitionStmt.FindStringSubmatch(query)
+	if m == nil {
+		return
+	}
+	tableRef := strings.TrimSpace(m[1])
+	sourceList := strings.TrimSpace(m[2])
+	newDefsBody := strings.TrimSpace(m[3])
+
+	dbName, tableName := e.splitTableRef(strings.Trim(tableRef, "`"))
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		return
+	}
+	tableDef, err := db.GetTable(tableName)
+	if err != nil || tableDef == nil {
+		return
+	}
+
+	sourceSet := make(map[string]bool)
+	for _, name := range strings.Split(sourceList, ",") {
+		nm := strings.Trim(strings.TrimSpace(name), "`")
+		if nm != "" {
+			sourceSet[strings.ToLower(nm)] = true
+		}
+	}
+
+	defStrs := splitPartitionDefs(newDefsBody)
+	if len(defStrs) == 0 {
+		return
+	}
+	zero := 0
+	var newDefs []catalog.PartitionDef
+	for _, ds := range defStrs {
+		pdef := parsePartitionDef(strings.TrimSpace(ds))
+		if pdef.Name == "" {
+			continue
+		}
+		pdef.InstantColsOverride = &zero
+		newDefs = append(newDefs, pdef)
+	}
+	if len(newDefs) == 0 {
+		return
+	}
+
+	var rebuilt []catalog.PartitionDef
+	inserted := false
+	for _, pd := range tableDef.PartitionDefs {
+		if sourceSet[strings.ToLower(pd.Name)] {
+			if !inserted {
+				rebuilt = append(rebuilt, newDefs...)
+				inserted = true
+			}
+			continue
+		}
+		rebuilt = append(rebuilt, pd)
+	}
+	if !inserted {
+		rebuilt = append(rebuilt, newDefs...)
+	}
+	tableDef.PartitionDefs = rebuilt
 }
 
 // splitTableRef splits a [db.]tableName reference into (dbName, tableName).
