@@ -2263,8 +2263,17 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 			// full EXPLAIN plan even when the outer table is empty (InnoDB Bug#42742 behavior).
 			// Exception: MATERIALIZED subqueries always show the real table name with 0 rows.
 			isSimpleTopLevel := selectType == "SIMPLE" && (!e.queryHasComplexParts(sel) || e.whereHasSingleSubquery(sel))
+			// DEPENDENT SUBQUERY with a single empty inner table: MySQL's IN→EXISTS rewrite
+			// resolves column references against the empty inner table to NULL, producing an
+			// impossible WHERE (e.g. "<cache>(outer.col) = NULL"). MySQL then detects the
+			// inner subquery as having no matching rows and emits "no matching row in const
+			// table" instead of a full table block. Restricted to single-table inner SELECTs
+			// without their own WHERE/JOIN (the impossibility comes from the rewritten cache
+			// condition), and only when the inner SELECT references the empty table.
+			isDependentSubqueryEmptyInner := selectType == "DEPENDENT SUBQUERY" && tableIsEmpty &&
+				len(allTableNames) == 1 && idx == 0 && sel.Where == nil
 			if tableIsEmpty && len(allTableNames) == 1 && idx == 0 && selectType != "MATERIALIZED" &&
-				(isSimpleTopLevel || accessInfo.accessType == "const" || accessInfo.accessType == "system") {
+				(isSimpleTopLevel || accessInfo.accessType == "const" || accessInfo.accessType == "system" || isDependentSubqueryEmptyInner) {
 				result = append(result, explainSelectType{
 					id:         myID,
 					selectType: selectType,
