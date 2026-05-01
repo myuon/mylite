@@ -1354,7 +1354,17 @@ func mysqlGenExprNode(expr sqlparser.Expr, colCharset string) string {
 	case *sqlparser.ColName:
 		return "`" + e.Name.String() + "`"
 	case *sqlparser.BinaryExpr:
-		return fmt.Sprintf("%s %s %s", mysqlGenExprNode(e.Left, colCharset), e.Operator.ToString(), mysqlGenExprNode(e.Right, colCharset))
+		// MySQL wraps nested binary subexpressions in parens in SHOW CREATE TABLE
+		// generated column display (e.g. ((`a` * 2) + `b`)).
+		leftStr := mysqlGenExprNode(e.Left, colCharset)
+		if _, ok := e.Left.(*sqlparser.BinaryExpr); ok {
+			leftStr = "(" + leftStr + ")"
+		}
+		rightStr := mysqlGenExprNode(e.Right, colCharset)
+		if _, ok := e.Right.(*sqlparser.BinaryExpr); ok {
+			rightStr = "(" + rightStr + ")"
+		}
+		return fmt.Sprintf("%s %s %s", leftStr, e.Operator.ToString(), rightStr)
 	case *sqlparser.FuncExpr:
 		args := make([]string, len(e.Exprs))
 		for i, arg := range e.Exprs {
