@@ -6062,6 +6062,20 @@ func isVarbinaryType(colType string) bool {
 	return strings.HasPrefix(lower, "varbinary(")
 }
 
+// isBlobColType returns true if the column type is one of the BLOB family
+// (BLOB, TINYBLOB, MEDIUMBLOB, LONGBLOB), with or without a length spec.
+func isBlobColType(colType string) bool {
+	lower := strings.ToLower(strings.TrimSpace(colType))
+	if i := strings.IndexByte(lower, '('); i >= 0 {
+		lower = strings.TrimSpace(lower[:i])
+	}
+	switch lower {
+	case "blob", "tinyblob", "mediumblob", "longblob":
+		return true
+	}
+	return false
+}
+
 // looksLikeBinaryData returns true if s contains bytes that are unlikely to appear
 // in a normal text string (null bytes or bytes < 0x09), indicating it's binary data
 // from a BINARY/VARBINARY column.

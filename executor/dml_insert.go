@@ -998,6 +998,20 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				}
 			}
 			v, err := e.evalExpr(val)
+			// For BLOB family columns, hex-number literals (0xNN) are stored as the
+			// raw bytes they encode (matching VARBINARY behaviour), so HEX(col)
+			// round-trips to the original digits including any leading zero byte.
+			// Plain integer/decimal literals retain their string representation.
+			if err == nil && v != nil && isHexNumLiteral(val) {
+				for _, col := range tbl.Def.Columns {
+					if col.Name == colNames[i] {
+						if isBlobColType(col.Type) {
+							v = hexIntToBytes(v)
+						}
+						break
+					}
+				}
+			}
 			// For INSERT ... SET col1=val1, col2=col1 — if the expression is a bare
 			// column name reference and that column was already assigned in this same
 			// INSERT SET clause, use the previously-assigned value (left-to-right
