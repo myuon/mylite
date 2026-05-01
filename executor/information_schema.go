@@ -1575,6 +1575,25 @@ func innodbInstantDefaultHex(col catalogPkg.ColumnDef) string {
 	return ""
 }
 
+// innodbInstantImplicitEmptyDefault returns true when a NOT NULL column without an
+// explicit DEFAULT clause should use the empty-string implicit default in
+// information_schema.INNODB_COLUMNS.DEFAULT_VALUE. Applies to variable-length
+// string and binary types (CHAR/VARCHAR/BINARY/VARBINARY/BLOB/TEXT family) where
+// MySQL stores zero-length bytes as the implicit default for INSTANT-added cols.
+func innodbInstantImplicitEmptyDefault(col catalogPkg.ColumnDef) bool {
+	t := strings.ToUpper(strings.TrimSpace(col.Type))
+	if i := strings.IndexByte(t, '('); i >= 0 {
+		t = strings.TrimSpace(t[:i])
+	}
+	switch t {
+	case "CHAR", "VARCHAR", "BINARY", "VARBINARY",
+		"TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT",
+		"TINYBLOB", "BLOB", "MEDIUMBLOB", "LONGBLOB":
+		return true
+	}
+	return false
+}
+
 // infoSchemaInnoDBColumns returns rows for information_schema.INNODB_COLUMNS.
 // Columns: TABLE_ID, NAME, POS, MTYPE, PRTYPE, LEN, HAS_DEFAULT, DEFAULT_VALUE.
 func (e *Executor) infoSchemaInnoDBColumns() []storage.Row {
@@ -1646,6 +1665,10 @@ func (e *Executor) infoSchemaInnoDBColumns() []storage.Row {
 							defaultValue = "NULL"
 						} else if hex := innodbInstantDefaultHex(col); hex != "" {
 							defaultValue = hex
+						} else if !col.Nullable && col.Default == nil && innodbInstantImplicitEmptyDefault(col) {
+							// NOT NULL variable-length string/binary/blob/text without explicit default:
+							// MySQL uses the empty string as implicit default, encoded as zero bytes.
+							defaultValue = ""
 						} else {
 							defaultValue = "NULL"
 						}
