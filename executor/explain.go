@@ -7988,6 +7988,440 @@ func (e *Executor) explainJSONQueryBlockForRow(row []interface{}, query string) 
 	return qb
 }
 
+// explainJSONInExistsInfo holds the per-IN-subquery markers used in EXPLAIN
+// FORMAT=JSON when MySQL rewrites `outer.col IN (SELECT ...)` into
+// `<in_optimizer>(outer.col, <exists>(SELECT 1 FROM ... WHERE <cond>))` form.
+// It exposes both the outer-table attached_condition fragment (the full
+// <in_optimizer>(...) expression) and the per-inner-table attached_condition
+// (the `<inner_where> AND (<cache>(outer.col) = inner.col)` body).
+type explainJSONInExistsInfo struct {
+	// OuterCond is the textual attached_condition for the outer (PRIMARY) table.
+	// When multiple IN subqueries are joined by OR, the fragments are wrapped
+	// in `(... or ...)`.  Empty if no IN subquery is found.
+	OuterCond string
+	// InnerCondBySelectID maps each IN-subquery's assigned select_id to the
+	// attached_condition for that subquery's inner table.
+	InnerCondBySelectID map[int64]string
+	// InnerTableBySelectID maps select_id -> inner table name (lower-case match).
+	InnerTableBySelectID map[int64]string
+}
+
+// explainJSONBuildInExistsInfo walks the outer query's WHERE clause and
+// reconstructs the IN→EXISTS rewriter's textual markers (<in_optimizer>,
+// <exists>, <cache>) that MySQL emits in EXPLAIN FORMAT=JSON's
+// attached_condition fields.  IN-subqueries are numbered in textual order
+// starting at select_id=2 (the outer query is always select_id=1).
+func (e *Executor) explainJSONBuildInExistsInfo(query string) *explainJSONInExistsInfo {
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		return nil
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok || sel.Where == nil {
+		return nil
+	}
+	dbName := e.CurrentDB
+	if dbName == "" {
+		dbName = "test"
+	}
+	// Infer the default outer table name (used when the IN's left operand
+	// is unqualified, e.g. `WHERE i IN ...`).
+	outerDefaultTbl := ""
+	for _, te := range sel.From {
+		for _, tn := range e.extractAllTableNames(te) {
+			if !strings.EqualFold(tn, "dual") {
+				outerDefaultTbl = tn
+				break
+			}
+		}
+		if outerDefaultTbl != "" {
+			break
+		}
+	}
+	info := &explainJSONInExistsInfo{
+		InnerCondBySelectID:  map[int64]string{},
+		InnerTableBySelectID: map[int64]string{},
+	}
+	// Counter for assigning select_ids to IN-subqueries in textual order.
+	// MySQL numbers the outer SELECT as #1 and increments from #2 for each
+	// nested SELECT in textual order.
+	nextSelectID := int64(2)
+	// Build the outer attached_condition by walking the WHERE expression.
+	// We treat each IN-subquery as a leaf <in_optimizer>(...) fragment, and
+	// recurse into AND/OR expressions to combine them.
+	var build func(expr sqlparser.Expr) string
+	build = func(expr sqlparser.Expr) string {
+		switch ex := expr.(type) {
+		case *sqlparser.AndExpr:
+			l := build(ex.Left)
+			r := build(ex.Right)
+			if l == "" && r == "" {
+				return ""
+			}
+			if l == "" {
+				return r
+			}
+			if r == "" {
+				return l
+			}
+			return fmt.Sprintf("(%s and %s)", l, r)
+		case *sqlparser.OrExpr:
+			l := build(ex.Left)
+			r := build(ex.Right)
+			if l == "" && r == "" {
+				return ""
+			}
+			if l == "" {
+				return r
+			}
+			if r == "" {
+				return l
+			}
+			return fmt.Sprintf("(%s or %s)", l, r)
+		case *sqlparser.ComparisonExpr:
+			if ex.Operator == sqlparser.InOp {
+				if sub, ok := ex.Right.(*sqlparser.Subquery); ok {
+					if innerSel, ok := sub.Select.(*sqlparser.Select); ok {
+						selectID := nextSelectID
+						nextSelectID++
+						return e.explainJSONBuildInOptimizerFragment(ex, innerSel, selectID, dbName, outerDefaultTbl, info)
+					}
+				}
+			}
+			// Non-IN comparisons inside the WHERE that don't involve subqueries:
+			// fall back to standard formatter (used when an IN expression is
+			// joined with AND to additional predicates on the outer table).
+			return e.explainJSONFormatExprQualifiedWithDefault(expr, dbName, outerDefaultTbl)
+		}
+		// Default: try qualified formatter; if it fails, return empty so the
+		// expression is omitted from the marker fragment.
+		return e.explainJSONFormatExprQualifiedWithDefault(expr, dbName, outerDefaultTbl)
+	}
+	info.OuterCond = build(sel.Where.Expr)
+	if info.OuterCond == "" && len(info.InnerCondBySelectID) == 0 {
+		return nil
+	}
+	return info
+}
+
+// explainJSONBuildInOptimizerFragment builds a single `<in_optimizer>(outer,
+// <exists>(SELECT 1 FROM inner WHERE ...))` fragment for an IN-subquery and,
+// as a side effect, records the inner attached_condition into info.
+func (e *Executor) explainJSONBuildInOptimizerFragment(inExpr *sqlparser.ComparisonExpr, innerSel *sqlparser.Select, selectID int64, dbName string, outerDefaultTbl string, info *explainJSONInExistsInfo) string {
+	// Outer column reference (left side of IN).
+	outerCol, _ := inExpr.Left.(*sqlparser.ColName)
+	if outerCol == nil {
+		return ""
+	}
+	outerColName := outerCol.Name.String()
+	outerTbl := outerCol.Qualifier.Name.String()
+	if outerTbl == "" {
+		outerTbl = outerDefaultTbl
+	}
+	// Inner table name (first FROM table that's not dual).
+	innerTbl := ""
+	if len(innerSel.From) > 0 {
+		for _, te := range innerSel.From {
+			for _, tn := range e.extractAllTableNames(te) {
+				if !strings.EqualFold(tn, "dual") {
+					innerTbl = tn
+					break
+				}
+			}
+			if innerTbl != "" {
+				break
+			}
+		}
+	}
+	// Inner select column (first expression of SELECT list).
+	innerColName := ""
+	if innerSel.SelectExprs != nil && len(innerSel.SelectExprs.Exprs) > 0 {
+		if ae, ok := innerSel.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok {
+			if c, ok := ae.Expr.(*sqlparser.ColName); ok {
+				innerColName = c.Name.String()
+			}
+		}
+	}
+	// Format the outer column reference in canonical form.
+	var outerColRef string
+	if outerTbl != "" {
+		outerColRef = fmt.Sprintf("`%s`.`%s`.`%s`", dbName, outerTbl, outerColName)
+	} else {
+		outerColRef = fmt.Sprintf("`%s`.`%s`", dbName, outerColName)
+	}
+	// Build the inner attached_condition body: "((<inner_where>) and (<cache>(outerColRef) = innerColRef))"
+	// where <inner_where> is the inner SELECT's WHERE clause formatted in
+	// canonical qualified form.  When the inner WHERE is missing, the cache
+	// equality stands alone.
+	var innerColRef string
+	if innerTbl != "" && innerColName != "" {
+		innerColRef = fmt.Sprintf("`%s`.`%s`.`%s`", dbName, innerTbl, innerColName)
+	}
+	cacheEq := ""
+	if innerColRef != "" {
+		// When the inner side is empty (e.g. SELECT i FROM t4 with no rows in
+		// const table), MySQL emits `(<cache>(outer) = NULL)` instead.  Detect
+		// this by checking if the inner table is constant-empty: we approximate
+		// by checking if the inner table has zero rows.
+		if e.explainJSONIsEmptyConstTable(innerTbl) {
+			cacheEq = fmt.Sprintf("(<cache>(%s) = NULL)", outerColRef)
+		} else {
+			cacheEq = fmt.Sprintf("(<cache>(%s) = %s)", outerColRef, innerColRef)
+		}
+	}
+	innerWhere := ""
+	if innerSel.Where != nil {
+		innerWhere = e.explainJSONFormatExprQualified(innerSel.Where.Expr, dbName)
+	}
+	var innerCond string
+	if innerWhere != "" && cacheEq != "" {
+		innerCond = fmt.Sprintf("(%s and %s)", innerWhere, cacheEq)
+	} else if cacheEq != "" {
+		innerCond = cacheEq
+	} else {
+		innerCond = innerWhere
+	}
+	// Record inner condition for this select_id.
+	if innerCond != "" {
+		info.InnerCondBySelectID[selectID] = innerCond
+	}
+	if innerTbl != "" {
+		info.InnerTableBySelectID[selectID] = innerTbl
+	}
+	// Format the inner FROM clause: only the inner table, qualified by db.
+	innerFromText := ""
+	if innerTbl != "" {
+		innerFromText = fmt.Sprintf("`%s`.`%s`", dbName, innerTbl)
+	}
+	// Build the full <exists>(...) body: "/* select#N */ select 1 from db.inner_tbl where <innerCond>"
+	var existsBody string
+	if innerCond != "" {
+		existsBody = fmt.Sprintf("/* select#%d */ select 1 from %s where %s", selectID, innerFromText, innerCond)
+	} else if innerFromText != "" {
+		existsBody = fmt.Sprintf("/* select#%d */ select 1 from %s", selectID, innerFromText)
+	} else {
+		return ""
+	}
+	return fmt.Sprintf("<in_optimizer>(%s,<exists>(%s))", outerColRef, existsBody)
+}
+
+// explainJSONIsEmptyConstTable returns true if the table is known to be empty
+// (zero rows), in which case MySQL's IN→EXISTS rewriter folds the inner column
+// reference into a NULL constant inside the <cache>(...) = NULL pattern.
+func (e *Executor) explainJSONIsEmptyConstTable(tableName string) bool {
+	if tableName == "" || e.Storage == nil {
+		return false
+	}
+	dbName := e.CurrentDB
+	if dbName == "" {
+		dbName = "test"
+	}
+	tbl, err := e.Storage.GetTable(dbName, tableName)
+	if err != nil {
+		return false
+	}
+	return len(tbl.Rows) == 0
+}
+
+// explainJSONFormatExprQualifiedWithDefault is like
+// explainJSONFormatExprQualified but uses defaultTbl when a column has no
+// explicit qualifier.  This is used to format outer-side predicates
+// (e.g. `(test.t1.i = 10)`) that appear as part of the IN→EXISTS markers.
+func (e *Executor) explainJSONFormatExprQualifiedWithDefault(expr sqlparser.Expr, dbName, defaultTbl string) string {
+	if expr == nil {
+		return ""
+	}
+	formatCol := func(c *sqlparser.ColName) string {
+		qual := c.Qualifier.Name.String()
+		if qual == "" {
+			qual = defaultTbl
+		}
+		if qual != "" {
+			return fmt.Sprintf("`%s`.`%s`.`%s`", dbName, qual, c.Name.String())
+		}
+		return fmt.Sprintf("`%s`", c.Name.String())
+	}
+	formatRight := func(right sqlparser.Expr) string {
+		if c, ok := right.(*sqlparser.ColName); ok {
+			return formatCol(c)
+		}
+		return sqlparser.String(right)
+	}
+	switch ex := expr.(type) {
+	case *sqlparser.AndExpr:
+		l := e.explainJSONFormatExprQualifiedWithDefault(ex.Left, dbName, defaultTbl)
+		r := e.explainJSONFormatExprQualifiedWithDefault(ex.Right, dbName, defaultTbl)
+		if l == "" {
+			return r
+		}
+		if r == "" {
+			return l
+		}
+		return fmt.Sprintf("(%s and %s)", l, r)
+	case *sqlparser.OrExpr:
+		l := e.explainJSONFormatExprQualifiedWithDefault(ex.Left, dbName, defaultTbl)
+		r := e.explainJSONFormatExprQualifiedWithDefault(ex.Right, dbName, defaultTbl)
+		if l == "" {
+			return r
+		}
+		if r == "" {
+			return l
+		}
+		return fmt.Sprintf("(%s or %s)", l, r)
+	case *sqlparser.ComparisonExpr:
+		left, leftOK := ex.Left.(*sqlparser.ColName)
+		if !leftOK {
+			return ""
+		}
+		op := ""
+		switch ex.Operator {
+		case sqlparser.EqualOp:
+			op = "="
+		case sqlparser.NotEqualOp:
+			op = "<>"
+		case sqlparser.LessThanOp:
+			op = "<"
+		case sqlparser.LessEqualOp:
+			op = "<="
+		case sqlparser.GreaterThanOp:
+			op = ">"
+		case sqlparser.GreaterEqualOp:
+			op = ">="
+		default:
+			return ""
+		}
+		return fmt.Sprintf("(%s %s %s)", formatCol(left), op, formatRight(ex.Right))
+	case *sqlparser.IsExpr:
+		col, ok := ex.Left.(*sqlparser.ColName)
+		if !ok {
+			return ""
+		}
+		switch ex.Right {
+		case sqlparser.IsNullOp:
+			return fmt.Sprintf("(%s is null)", formatCol(col))
+		case sqlparser.IsNotNullOp:
+			return fmt.Sprintf("(%s is not null)", formatCol(col))
+		}
+		return ""
+	}
+	return ""
+}
+
+// explainJSONFormatExprQualified formats a WHERE expression with full
+// `db`.`tbl`.`col` qualifiers.  Unlike explainFormatExpr (which assumes a
+// single table context), this walks the expression and uses each ColName's
+// own qualifier; unqualified columns fall back to a heuristic table lookup.
+func (e *Executor) explainJSONFormatExprQualified(expr sqlparser.Expr, dbName string) string {
+	if expr == nil {
+		return ""
+	}
+	formatCol := func(c *sqlparser.ColName) string {
+		qual := c.Qualifier.Name.String()
+		if qual != "" {
+			return fmt.Sprintf("`%s`.`%s`.`%s`", dbName, qual, c.Name.String())
+		}
+		return fmt.Sprintf("`%s`", c.Name.String())
+	}
+	formatRight := func(right sqlparser.Expr) string {
+		if c, ok := right.(*sqlparser.ColName); ok {
+			return formatCol(c)
+		}
+		return sqlparser.String(right)
+	}
+	switch ex := expr.(type) {
+	case *sqlparser.AndExpr:
+		l := e.explainJSONFormatExprQualified(ex.Left, dbName)
+		r := e.explainJSONFormatExprQualified(ex.Right, dbName)
+		if l == "" {
+			return r
+		}
+		if r == "" {
+			return l
+		}
+		return fmt.Sprintf("(%s and %s)", l, r)
+	case *sqlparser.OrExpr:
+		l := e.explainJSONFormatExprQualified(ex.Left, dbName)
+		r := e.explainJSONFormatExprQualified(ex.Right, dbName)
+		if l == "" {
+			return r
+		}
+		if r == "" {
+			return l
+		}
+		return fmt.Sprintf("(%s or %s)", l, r)
+	case *sqlparser.ComparisonExpr:
+		left, leftOK := ex.Left.(*sqlparser.ColName)
+		if !leftOK {
+			return ""
+		}
+		op := ""
+		switch ex.Operator {
+		case sqlparser.EqualOp:
+			op = "="
+		case sqlparser.NotEqualOp:
+			op = "<>"
+		case sqlparser.LessThanOp:
+			op = "<"
+		case sqlparser.LessEqualOp:
+			op = "<="
+		case sqlparser.GreaterThanOp:
+			op = ">"
+		case sqlparser.GreaterEqualOp:
+			op = ">="
+		default:
+			return ""
+		}
+		return fmt.Sprintf("(%s %s %s)", formatCol(left), op, formatRight(ex.Right))
+	case *sqlparser.IsExpr:
+		col, ok := ex.Left.(*sqlparser.ColName)
+		if !ok {
+			return ""
+		}
+		switch ex.Right {
+		case sqlparser.IsNullOp:
+			return fmt.Sprintf("(%s is null)", formatCol(col))
+		case sqlparser.IsNotNullOp:
+			return fmt.Sprintf("(%s is not null)", formatCol(col))
+		}
+		return ""
+	}
+	return ""
+}
+
+// explainJSONInjectInnerAttachedCondition rewrites a query_block's table sub-block
+// to include the supplied attached_condition (replacing any existing one).  It
+// also propagates through grouping_operation/buffer_result wrappers when used.
+// The returned slice is the modified query_block.
+func explainJSONInjectInnerAttachedCondition(qb []orderedKV, cond string) []orderedKV {
+	if cond == "" {
+		return qb
+	}
+	for i, kv := range qb {
+		if kv.Key != "table" {
+			continue
+		}
+		tbl, ok := kv.Value.([]orderedKV)
+		if !ok {
+			continue
+		}
+		// Replace existing attached_condition or append at end of table block.
+		replaced := false
+		for j, sub := range tbl {
+			if sub.Key == "attached_condition" {
+				tbl[j] = orderedKV{"attached_condition", cond}
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			tbl = append(tbl, orderedKV{"attached_condition", cond})
+		}
+		qb[i] = orderedKV{"table", tbl}
+		return qb
+	}
+	return qb
+}
+
 // extractFirstINSubquerySQL extracts the first IN (SELECT ...) subquery from a SQL query string.
 // Returns the SELECT part (e.g., "SELECT a FROM t11") for use in analyzing which columns
 // are referenced in the subquery (for used_columns in EXPLAIN FORMAT=JSON).
@@ -9112,6 +9546,38 @@ func (e *Executor) explainJSONDocument(query string) string {
 					tblBlock = wrapDerived(tblBlock, tableName)
 				}
 
+				// Determine whether any subquery rows are DEPENDENT SUBQUERY
+				// (IN→EXISTS rewriter case).  If so, build the <in_optimizer> /
+				// <exists> / <cache> markers for the outer attached_condition and
+				// per-inner-table attached_condition, and inject them.
+				hasDependentSubsForMarker := false
+				for _, s := range subqueryRows {
+					if s.selectType == "DEPENDENT SUBQUERY" {
+						hasDependentSubsForMarker = true
+						break
+					}
+				}
+				var inExistsInfo *explainJSONInExistsInfo
+				if hasDependentSubsForMarker {
+					inExistsInfo = e.explainJSONBuildInExistsInfo(query)
+					if inExistsInfo != nil && inExistsInfo.OuterCond != "" {
+						// Replace any existing attached_condition (from
+						// explainJSONTableBlock's standard formatter) with the
+						// IN→EXISTS marker form.
+						replaced := false
+						for i, kv := range tblBlock {
+							if kv.Key == "attached_condition" {
+								tblBlock[i] = orderedKV{"attached_condition", inExistsInfo.OuterCond}
+								replaced = true
+								break
+							}
+						}
+						if !replaced {
+							tblBlock = append(tblBlock, orderedKV{"attached_condition", inExistsInfo.OuterCond})
+						}
+					}
+				}
+
 				// Build attached_subqueries list (if any) so we can attach them
 				// either inline to this primary table block (when the subqueries are
 				// dependent IN/EXISTS subqueries that filter this table) or at the
@@ -9120,6 +9586,16 @@ func (e *Executor) explainJSONDocument(query string) string {
 				hasDependentSubs := false
 				for _, s := range subqueryRows {
 					qb := e.explainJSONQueryBlockForRow(s.row, query)
+					// If we have IN→EXISTS marker info and this row is a
+					// DEPENDENT SUBQUERY, inject the inner attached_condition
+					// into the inner table's block (if present).
+					if inExistsInfo != nil && s.selectType == "DEPENDENT SUBQUERY" {
+						if id, ok := s.row[0].(int64); ok {
+							if cond, found := inExistsInfo.InnerCondBySelectID[id]; found && cond != "" {
+								qb = explainJSONInjectInnerAttachedCondition(qb, cond)
+							}
+						}
+					}
 					if s.selectType == "DEPENDENT SUBQUERY" {
 						hasDependentSubs = true
 						attachedSubs = append(attachedSubs, []orderedKV{
