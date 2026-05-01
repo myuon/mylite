@@ -6078,6 +6078,26 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 	for i, m := range matches {
 		possibleKeyNames[i] = m.index.Name
 	}
+	// Also include indexes that cover the SELECT projection (covering-index candidates).
+	// MySQL lists these in possible_keys even when they don't match the WHERE clause.
+	if sel.SelectExprs != nil {
+		selectCols, isStar := explainExtractSelectColumns(sel.SelectExprs, tableName)
+		if !isStar && len(selectCols) > 0 {
+			already := map[string]bool{}
+			for _, n := range possibleKeyNames {
+				already[strings.ToLower(n)] = true
+			}
+			for _, idx := range td.Indexes {
+				if already[strings.ToLower(idx.Name)] {
+					continue
+				}
+				if explainIndexCoversColumns(td, idx.Name, selectCols) {
+					possibleKeyNames = append(possibleKeyNames, idx.Name)
+					already[strings.ToLower(idx.Name)] = true
+				}
+			}
+		}
+	}
 	result.possibleKeys = strings.Join(possibleKeyNames, ",")
 
 	// Choose the best index: prefer const > eq_ref > ref > range
@@ -6895,7 +6915,8 @@ func (e *Executor) explainJSONTableBlock(row []interface{}, query string) []orde
 							break
 						}
 						accum += explainKeyLen(colDef, td.Charset)
-						usedKeyParts = append(usedKeyParts, col)
+						// Use the original-case column name from the table definition.
+						usedKeyParts = append(usedKeyParts, colDef.Name)
 						if accum >= keyLenVal {
 							break
 						}
@@ -6903,7 +6924,12 @@ func (e *Executor) explainJSONTableBlock(row []interface{}, query string) []orde
 				} else if len(idxCols) > 0 {
 					// No key_len, use all index columns
 					for _, col := range idxCols {
-						usedKeyParts = append(usedKeyParts, col)
+						colDef := findColumnDef(td, col)
+						if colDef != nil {
+							usedKeyParts = append(usedKeyParts, colDef.Name)
+						} else {
+							usedKeyParts = append(usedKeyParts, col)
+						}
 					}
 				}
 			}

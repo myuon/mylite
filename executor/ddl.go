@@ -1607,6 +1607,16 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 		var idxCols []string
 		var idxOrders []string
+		var idxColOrigNames []string // resolved-case column names for auto-named indexes
+		// Helper: find the column name as defined in the table (preserves CREATE TABLE case).
+		resolveColCase := func(name string) string {
+			for _, c := range columns {
+				if strings.EqualFold(c.Name, name) {
+					return c.Name
+				}
+			}
+			return name
+		}
 		for _, idxCol := range idx.Columns {
 			if err := validateArrayIndexExpression(idxCol.Expression); err != nil {
 				return nil, err
@@ -1614,11 +1624,16 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			if hasArrayCastExpr(idxCol.Expression) {
 				hasArrayMVIIndex = true
 			}
-			colStr := strings.ToLower(idxCol.Column.String())
+			refName := idxCol.Column.String()
+			colStr := strings.ToLower(refName)
 			if idxCol.Expression != nil {
 				colStr = fmt.Sprintf("(%s)", strings.TrimSpace(sqlparser.String(idxCol.Expression)))
+				idxColOrigNames = append(idxColOrigNames, colStr)
 			} else if idxCol.Length != nil {
 				colStr += fmt.Sprintf("(%d)", *idxCol.Length)
+				idxColOrigNames = append(idxColOrigNames, fmt.Sprintf("%s(%d)", resolveColCase(refName), *idxCol.Length))
+			} else {
+				idxColOrigNames = append(idxColOrigNames, resolveColCase(refName))
 			}
 			idxCols = append(idxCols, colStr)
 			if idxCol.Direction == sqlparser.DescOrder {
@@ -1858,8 +1873,14 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				if cn := idx.Info.ConstraintName.String(); cn != "" {
 					idxName = cn
 				} else {
-					// Use column name without prefix length for default index name
-					idxName = stripPrefixLengthFromCol(idxCols[0])
+					// Use column name without prefix length for default index name.
+					// Preserve original case from the CREATE TABLE definition (MySQL uses
+					// the column identifier as written for the auto-generated index name).
+					if len(idxColOrigNames) > 0 {
+						idxName = stripPrefixLengthFromCol(idxColOrigNames[0])
+					} else {
+						idxName = stripPrefixLengthFromCol(idxCols[0])
+					}
 				}
 			}
 			idxComment := ""
