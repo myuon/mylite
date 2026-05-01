@@ -1657,8 +1657,16 @@ func (e *Executor) infoSchemaInnoDBColumns() []storage.Row {
 				for i, col := range def.Columns {
 					hasDefault := int64(0)
 					var defaultValue interface{} = nil
+					// VIRTUAL generated columns are not physically stored, so they
+					// never carry an InnoDB-level default value (the value is
+					// computed from the expression on read). MySQL reports
+					// has_default=0 for them in INNODB_COLUMNS even when added
+					// via INSTANT.
+					genExpr := generatedColumnExpr(col.Type)
+					isStoredGen := genExpr != "" && strings.Contains(strings.ToUpper(col.Type), "STORED")
+					isVirtualGen := genExpr != "" && !isStoredGen
 					// Only INSTANT-added columns have their default tracked in INNODB_COLUMNS.
-					if col.IsInstantAdded {
+					if col.IsInstantAdded && !isVirtualGen {
 						hasDefault = 1
 						if col.Nullable && col.Default == nil {
 							// Nullable column without explicit default: default is SQL NULL.
