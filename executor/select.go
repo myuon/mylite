@@ -4278,12 +4278,27 @@ func (e *Executor) execSelectGroupBy(stmt *sqlparser.Select, allRows []storage.R
 				groups = append(groups, group{key: key, rows: []storage.Row{row}})
 			}
 		}
-		// Sort GROUP BY groups by key so that NULL rows appear before non-NULL rows,
-		// matching MySQL/InnoDB behavior where rows are returned in index/PK order.
-		// This applies both for regular GROUP BY and WITH ROLLUP.
-		sort.SliceStable(groups, func(i, j int) bool {
-			return compareGroupKeys(groups[i].key, groups[j].key) < 0
-		})
+		// MySQL 8.0 GROUP BY ordering: when there are no aggregates in SELECT
+		// (i.e. GROUP BY is acting as DISTINCT), no ORDER BY clause, and no
+		// ROLLUP, MySQL preserves the row encounter order from the underlying
+		// scan (which is index/PK order for InnoDB). For aggregate queries we
+		// continue to sort by GROUP BY key to keep deterministic behaviour for
+		// tests like sum_distinct and aggregate cross joins.
+		hasAggsInSelect := selectExprsHaveAggregates(stmt.SelectExprs.Exprs)
+		if !hasAggsInSelect && stmt.Having != nil {
+			hasAggsInSelect = containsAggregate(stmt.Having.Expr)
+		}
+		preserveEncounterOrder := !hasAggsInSelect &&
+			(stmt.OrderBy == nil || len(stmt.OrderBy) == 0) &&
+			!stmt.GroupBy.WithRollup
+		if !preserveEncounterOrder {
+			// Sort GROUP BY groups by key so that NULL rows appear before non-NULL rows,
+			// matching MySQL/InnoDB behavior where rows are returned in index/PK order.
+			// This applies both for regular GROUP BY and WITH ROLLUP.
+			sort.SliceStable(groups, func(i, j int) bool {
+				return compareGroupKeys(groups[i].key, groups[j].key) < 0
+			})
+		}
 	} else {
 		// No GROUP BY but has aggregates: treat all rows as one group
 		groups = []group{{key: "", rows: allRows}}
