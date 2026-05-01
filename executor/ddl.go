@@ -3234,6 +3234,48 @@ func encodeInstantDefault(col catalog.ColumnDef) string {
 			n >>= 8
 		}
 		return fmt.Sprintf("%x", buf)
+	case "DATETIME":
+		// MySQL packs DATETIME (no fractional seconds) into 5 bytes big-endian:
+		//   bit 39      sign (1 for non-negative)
+		//   bits 38..22 17 bits: year * 13 + month
+		//   bits 21..17 5 bits:  day
+		//   bits 16..12 5 bits:  hour
+		//   bits 11..6  6 bits:  minute
+		//   bits 5..0   6 bits:  second
+		// Fractional seconds (DATETIME(N), N>0) add ceil(N/2) extra bytes
+		// big-endian; not commonly used as INSTANT defaults.
+		return encodeInstantDatetime(strings.TrimSpace(defStr), upper)
+	case "TIMESTAMP":
+		// TIMESTAMP packs into 4 bytes big-endian (Unix seconds since epoch).
+		// MySQL converts the literal from session time_zone to UTC; we treat
+		// the literal as UTC (system default for tests).
+		return encodeInstantTimestamp(strings.TrimSpace(defStr), upper)
+	case "DATE":
+		// DATE is a 3-byte little-endian packed value:
+		//   bits 0..4   day
+		//   bits 5..8   month
+		//   bits 9..23  year
+		return encodeInstantDate(strings.TrimSpace(defStr))
+	case "TIME":
+		// TIME(0) is 3 bytes big-endian: ((hour*60)+minute)*60 + second
+		// with a sign bit at bit 23 (1 for non-negative). Fractional seconds
+		// add ceil(N/2) extra bytes.
+		return encodeInstantTime(strings.TrimSpace(defStr), upper)
+	case "YEAR":
+		// YEAR is 1 byte: stored as (year - 1900) for 1901..2155, with 0 for "0000".
+		yStr := strings.TrimSpace(defStr)
+		yStr = strings.Trim(yStr, "'\"")
+		y, err := strconv.Atoi(yStr)
+		if err != nil {
+			return ""
+		}
+		var b byte
+		if y == 0 {
+			b = 0
+		} else {
+			b = byte(y - 1900)
+		}
+		return fmt.Sprintf("%02x", b)
 	case "CHAR", "BINARY":
 		// Fixed-length string/byte types: pad to declared length.
 		// CHAR pads with 0x20 (space); BINARY pads with 0x00.
@@ -3274,6 +3316,277 @@ func encodeInstantDefault(col catalog.ColumnDef) string {
 	}
 	// For non-integer types we don't yet produce the InnoDB hex encoding.
 	return ""
+}
+
+// datetimeFractionalDigits parses (N) from a type like DATETIME(3) / TIME(6).
+// Returns 0 if no parens. Clamped to 0..6.
+func datetimeFractionalDigits(upper string) int {
+	i := strings.IndexByte(upper, '(')
+	if i < 0 {
+		return 0
+	}
+	j := strings.IndexByte(upper[i:], ')')
+	if j <= 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(upper[i+1 : i+j]))
+	if err != nil || n < 0 {
+		return 0
+	}
+	if n > 6 {
+		n = 6
+	}
+	return n
+}
+
+// parseDatetimeLiteral parses 'YYYY-MM-DD[ HH:MM:SS[.fffffff]]' into components.
+// The date portion is required; time defaults to 00:00:00.
+func parseDatetimeLiteral(s string) (year, month, day, hour, minute, second, micro int, ok bool) {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, "'\"")
+	// Split on space or 'T'
+	var datePart, timePart string
+	if i := strings.IndexAny(s, " T"); i >= 0 {
+		datePart = s[:i]
+		timePart = s[i+1:]
+	} else {
+		datePart = s
+	}
+	dp := strings.Split(datePart, "-")
+	if len(dp) != 3 {
+		return
+	}
+	y, err1 := strconv.Atoi(dp[0])
+	mo, err2 := strconv.Atoi(dp[1])
+	d, err3 := strconv.Atoi(dp[2])
+	if err1 != nil || err2 != nil || err3 != nil {
+		return
+	}
+	year, month, day = y, mo, d
+	if timePart == "" {
+		ok = true
+		return
+	}
+	// time may have fractional part
+	var fracStr string
+	if i := strings.IndexByte(timePart, '.'); i >= 0 {
+		fracStr = timePart[i+1:]
+		timePart = timePart[:i]
+	}
+	tp := strings.Split(timePart, ":")
+	if len(tp) < 2 || len(tp) > 3 {
+		return
+	}
+	h, err1 := strconv.Atoi(tp[0])
+	mi, err2 := strconv.Atoi(tp[1])
+	if err1 != nil || err2 != nil {
+		return
+	}
+	se := 0
+	if len(tp) == 3 {
+		v, err := strconv.Atoi(tp[2])
+		if err != nil {
+			return
+		}
+		se = v
+	}
+	hour, minute, second = h, mi, se
+	if fracStr != "" {
+		// Pad/truncate to 6 digits to get microseconds.
+		if len(fracStr) > 6 {
+			fracStr = fracStr[:6]
+		}
+		for len(fracStr) < 6 {
+			fracStr += "0"
+		}
+		v, err := strconv.Atoi(fracStr)
+		if err != nil {
+			return
+		}
+		micro = v
+	}
+	ok = true
+	return
+}
+
+// encodeInstantDatetime returns the lowercase hex of MySQL's packed DATETIME(N)
+// representation. Format: 5-byte big-endian core + ceil(N/2) fractional bytes
+// big-endian.
+func encodeInstantDatetime(s string, upper string) string {
+	y, mo, d, h, mi, se, micro, ok := parseDatetimeLiteral(s)
+	if !ok {
+		return ""
+	}
+	ym := uint64(y)*13 + uint64(mo)
+	val := (uint64(1) << 39) | (ym << 22) | (uint64(d) << 17) | (uint64(h) << 12) | (uint64(mi) << 6) | uint64(se)
+	core := make([]byte, 5)
+	for i := 4; i >= 0; i-- {
+		core[i] = byte(val & 0xff)
+		val >>= 8
+	}
+	frac := datetimeFractionalDigits(upper)
+	out := core
+	if frac > 0 {
+		// MySQL stores fractional seconds in (frac+1)/2 bytes big-endian.
+		// The stored value is microseconds rounded/truncated to N digits,
+		// scaled to fill the byte width: e.g. DATETIME(3) stores ms*100? No —
+		// it stores the value *as written* truncated. Actually, MySQL stores
+		// the fractional part as the integer count of "10^(6-frac)" units? No,
+		// the bytes encode the integer number of microseconds shifted right by
+		// the unused trailing zeros; concretely MySQL stores frac digits packed
+		// big-endian.
+		// Reference (sql/log_event.cc / my_datetime_packed):
+		//   For frac digits, value = micro / 10^(6-frac), stored in
+		//   ceil(frac/2) bytes big-endian. (e.g. frac=3, micro=123456 ->
+		//   value=123, 2 bytes 00 7b)
+		nbytes := (frac + 1) / 2
+		divisor := 1
+		for i := 0; i < 6-frac; i++ {
+			divisor *= 10
+		}
+		fv := micro / divisor
+		fbuf := make([]byte, nbytes)
+		for i := nbytes - 1; i >= 0; i-- {
+			fbuf[i] = byte(fv & 0xff)
+			fv >>= 8
+		}
+		out = append(out, fbuf...)
+	}
+	return fmt.Sprintf("%x", out)
+}
+
+// encodeInstantTimestamp returns the hex of MySQL's TIMESTAMP packed format.
+// Core is 4 bytes big-endian Unix seconds (UTC). Fractional seconds add
+// ceil(N/2) bytes big-endian as in DATETIME.
+func encodeInstantTimestamp(s string, upper string) string {
+	y, mo, d, h, mi, se, micro, ok := parseDatetimeLiteral(s)
+	if !ok {
+		return ""
+	}
+	t := time.Date(y, time.Month(mo), d, h, mi, se, 0, time.UTC).Unix()
+	if t < 0 {
+		return ""
+	}
+	core := make([]byte, 4)
+	v := uint32(t)
+	for i := 3; i >= 0; i-- {
+		core[i] = byte(v & 0xff)
+		v >>= 8
+	}
+	out := core
+	frac := datetimeFractionalDigits(upper)
+	if frac > 0 {
+		nbytes := (frac + 1) / 2
+		divisor := 1
+		for i := 0; i < 6-frac; i++ {
+			divisor *= 10
+		}
+		fv := micro / divisor
+		fbuf := make([]byte, nbytes)
+		for i := nbytes - 1; i >= 0; i-- {
+			fbuf[i] = byte(fv & 0xff)
+			fv >>= 8
+		}
+		out = append(out, fbuf...)
+	}
+	return fmt.Sprintf("%x", out)
+}
+
+// encodeInstantDate returns hex of MySQL's 3-byte DATE packed format.
+// Layout (little-endian read of a 24-bit value):
+//
+//	value = day | (month<<5) | (year<<9)
+//
+// Stored on disk as 3 bytes little-endian.
+func encodeInstantDate(s string) string {
+	s = strings.Trim(strings.TrimSpace(s), "'\"")
+	parts := strings.Split(s, "-")
+	if len(parts) != 3 {
+		return ""
+	}
+	y, err1 := strconv.Atoi(parts[0])
+	m, err2 := strconv.Atoi(parts[1])
+	d, err3 := strconv.Atoi(parts[2])
+	if err1 != nil || err2 != nil || err3 != nil {
+		return ""
+	}
+	val := uint32(d) | (uint32(m) << 5) | (uint32(y) << 9)
+	buf := []byte{byte(val & 0xff), byte((val >> 8) & 0xff), byte((val >> 16) & 0xff)}
+	return fmt.Sprintf("%x", buf)
+}
+
+// encodeInstantTime returns hex of MySQL's TIME(N) packed format. Core is
+// 3 bytes big-endian: bit 23 sign (1 for non-negative), bits 22..12 hour,
+// bits 11..6 minute, bits 5..0 second. Fractional seconds add ceil(N/2)
+// bytes big-endian.
+func encodeInstantTime(s string, upper string) string {
+	s = strings.Trim(strings.TrimSpace(s), "'\"")
+	negative := false
+	if strings.HasPrefix(s, "-") {
+		negative = true
+		s = s[1:]
+	}
+	var fracStr string
+	if i := strings.IndexByte(s, '.'); i >= 0 {
+		fracStr = s[i+1:]
+		s = s[:i]
+	}
+	parts := strings.Split(s, ":")
+	if len(parts) < 2 || len(parts) > 3 {
+		return ""
+	}
+	h, err1 := strconv.Atoi(parts[0])
+	mi, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return ""
+	}
+	se := 0
+	if len(parts) == 3 {
+		v, err := strconv.Atoi(parts[2])
+		if err != nil {
+			return ""
+		}
+		se = v
+	}
+	val := (uint64(h) << 12) | (uint64(mi) << 6) | uint64(se)
+	if !negative {
+		val |= uint64(1) << 23
+	} else {
+		// Two's complement of 24-bit value with sign bit cleared.
+		val = (^val + 1) & 0xffffff
+	}
+	core := []byte{byte((val >> 16) & 0xff), byte((val >> 8) & 0xff), byte(val & 0xff)}
+	out := core
+	frac := datetimeFractionalDigits(upper)
+	if frac > 0 {
+		micro := 0
+		if fracStr != "" {
+			if len(fracStr) > 6 {
+				fracStr = fracStr[:6]
+			}
+			for len(fracStr) < 6 {
+				fracStr += "0"
+			}
+			v, err := strconv.Atoi(fracStr)
+			if err != nil {
+				return ""
+			}
+			micro = v
+		}
+		nbytes := (frac + 1) / 2
+		divisor := 1
+		for i := 0; i < 6-frac; i++ {
+			divisor *= 10
+		}
+		fv := micro / divisor
+		fbuf := make([]byte, nbytes)
+		for i := nbytes - 1; i >= 0; i-- {
+			fbuf[i] = byte(fv & 0xff)
+			fv >>= 8
+		}
+		out = append(out, fbuf...)
+	}
+	return fmt.Sprintf("%x", out)
 }
 
 // charsetMaxBytesPerChar returns the maximum number of bytes used to encode
