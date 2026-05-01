@@ -5622,10 +5622,41 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 					// path above), MySQL merges its tables into the outer subquery's id level rather
 					// than creating a new subquery id. Use outerIDBeforeIncrement instead.
 					mergedDependent := selectType == "DEPENDENT SUBQUERY" && outerSelectTypeOuter == "DEPENDENT SUBQUERY" && inContext
+					// MATERIALIZED merge: when the parent context is itself MATERIALIZED and the
+					// nested IN subquery also chooses MATERIALIZED, MySQL absorbs the nested
+					// subquery's tables into the parent's MATERIALIZED block (same id),
+					// instead of allocating a new <subqueryN> placeholder.
+					// E.g. EMPNUM: SELECT FROM staff WHERE EMPNUM IN
+					//        (SELECT EMPNUM FROM works WHERE PNUM IN (SELECT PNUM FROM proj))
+					// → both works (id=2 MATERIALIZED) and proj (also id=2 MATERIALIZED, NOT id=3)
+					// share <subquery2>.
+					mergedMaterialized := selectType == "MATERIALIZED" && outerSelectTypeOuter == "MATERIALIZED" && inContext
+					if mergedMaterialized {
+						// Roll back the id allocation: the merged rows reuse the parent's
+						// MATERIALIZED id (outerIDBeforeIncrement), so this subquery does not
+						// consume a new id slot.
+						*idCounter = outerIDBeforeIncrement
+					}
 					subRows := e.explainSelect(inner, idCounter, selectType)
 					if len(subRows) > 0 {
 						if mergedDependent {
 							subRows[0].id = outerIDBeforeIncrement
+						} else if mergedMaterialized {
+							// Force the first row's id to the parent's MATERIALIZED id.
+							// Any deeper-merged MATERIALIZED rows in subRows already share
+							// this id because explainSelect was invoked with idCounter rolled back.
+							subRows[0].id = outerIDBeforeIncrement
+							// Any MATERIALIZED rows that were emitted at the rolled-back id
+							// cascade up automatically (recursive calls see outerSelectType="MATERIALIZED"
+							// and propagate the merge). Force any stray MATERIALIZED rows that still
+							// hold the old subQueryID to use outerIDBeforeIncrement.
+							for i := range subRows {
+								if subRows[i].selectType == "MATERIALIZED" {
+									if id, ok := subRows[i].id.(int64); ok && id == subQueryID {
+										subRows[i].id = outerIDBeforeIncrement
+									}
+								}
+							}
 						} else {
 							subRows[0].id = subQueryID
 						}
