@@ -25,7 +25,7 @@ import (
 // returns ok=false so the caller stays on the legacy scan-and-filter
 // path until those cases are integrated end-to-end.
 func (e *Executor) buildIndexAccessSpec(sel *sqlparser.Select, tableName string) (storage.IndexAccessSpec, bool) {
-	if sel == nil || sel.Where == nil {
+	if sel == nil {
 		return storage.IndexAccessSpec{}, false
 	}
 	td := e.explainGetTableDef(tableName)
@@ -36,6 +36,19 @@ func (e *Executor) buildIndexAccessSpec(sel *sqlparser.Select, tableName string)
 	ai := e.explainDetectAccessType(sel, tableName)
 	at := strings.ToLower(ai.accessType)
 	keyName := stringify(ai.key)
+	// Full covering-index scan ("Using index" with no WHERE filter): the
+	// planner has already verified the chosen index covers the SELECT
+	// projection. We just need to plumb it through to storage so the
+	// scan returns rows in index order.
+	if at == "index" && keyName != "" {
+		return storage.IndexAccessSpec{
+			Type:      "index",
+			IndexName: keyName,
+		}, true
+	}
+	if sel.Where == nil {
+		return storage.IndexAccessSpec{}, false
+	}
 	if keyName == "" || at == "" || at == "all" || at == "index" {
 		return storage.IndexAccessSpec{}, false
 	}
@@ -453,21 +466,32 @@ func (e *Executor) installIndexAccessSpecForSelect(sel *sqlparser.Select) func()
 			return restore
 		}
 	}
-	if sel.Where == nil {
+	if sel.Where != nil && exprHasSubquery(sel.Where.Expr) {
 		return restore
 	}
-	if exprHasSubquery(sel.Where.Expr) {
-		return restore
+	// The covering-index "index" path also requires no GROUP BY / HAVING /
+	// ORDER BY / DISTINCT / LIMIT — those would either re-order the
+	// result or imply additional access semantics we have not validated.
+	hasNoWhere := sel.Where == nil
+	if hasNoWhere {
+		if sel.GroupBy != nil || sel.Having != nil || sel.OrderBy != nil ||
+			sel.Distinct || sel.Limit != nil {
+			return restore
+		}
 	}
 	spec, ok := e.buildIndexAccessSpec(sel, tableName)
 	if !ok {
 		return restore
 	}
-	// Narrow scope: only flip the gate for "const" / "eq_ref" lookups —
-	// the safest single-row PK case. "ref" and "range" remain on the
-	// legacy scan path until follow-up work validates them end-to-end.
+	// Narrow scope: flip the gate for "const" / "eq_ref" / "index" only.
+	// "ref" and "range" remain on the legacy scan path. "index" is the
+	// covering-index full-scan case; it must come from a no-WHERE SELECT
+	// per the buildIndexAccessSpec contract.
 	t := strings.ToLower(spec.Type)
-	if t != "const" && t != "eq_ref" {
+	if t != "const" && t != "eq_ref" && t != "index" {
+		return restore
+	}
+	if t == "index" && !hasNoWhere {
 		return restore
 	}
 	alias, _, _ := extractTableAliasFromAliased(ate)
