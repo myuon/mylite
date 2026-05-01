@@ -3077,6 +3077,99 @@ func (e *Executor) shouldUseDuplicateWeedout(inner *sqlparser.Select) bool {
 	return false
 }
 
+// innerHasCorrelatedPKWithOuter returns true when the inner SELECT has multiple tables
+// in its FROM clause and at least one inner table has a correlated equality between
+// its PRIMARY KEY column and a column of one of the outer tables (e.g.
+// `WHERE t2.a = t0.a` where t2.a is the PRIMARY KEY of inner table t2 and t0 is an
+// outer table).  In MySQL this triggers semi-join "table pullout" which converts
+// the IN subquery into a regular join — the EXPLAIN output is rendered as
+// DuplicateWeedout-style (all SIMPLE rows with Start/End temporary), even when
+// the duplicateweedout optimizer switch is off (it is the strategy MySQL falls
+// back to once the materialized inner subquery is collapsed by table pullout).
+//
+// This addresses BUG#35160 from subquery_sj.inc:
+//
+//	explain select * from t0
+//	where t0.a in (select t1.a from t1, t2 where t2.a=t0.a and t1.b=t2.b);
+//
+// where t2 has PRIMARY KEY (a).
+func (e *Executor) innerHasCorrelatedPKWithOuter(inner *sqlparser.Select, outerTables []string) bool {
+	if inner == nil || inner.Where == nil || e.Storage == nil {
+		return false
+	}
+	if len(outerTables) == 0 {
+		return false
+	}
+	// Collect inner table names (must have 2+ for "table pullout" to kick in).
+	var innerTables []string
+	for _, te := range inner.From {
+		for _, tn := range e.extractAllTableNames(te) {
+			if !strings.EqualFold(tn, "dual") {
+				innerTables = append(innerTables, tn)
+			}
+		}
+	}
+	if len(innerTables) < 2 {
+		return false
+	}
+	// Build a quick set of outer table names (case-insensitive).
+	outerSet := make(map[string]bool)
+	for _, ot := range outerTables {
+		outerSet[strings.ToLower(ot)] = true
+	}
+	// Walk inner WHERE looking for "innerTable.col = outerTable.col" where
+	// innerTable.col is the first column of innerTable's PRIMARY KEY.
+	found := false
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		cmp, ok := n.(*sqlparser.ComparisonExpr)
+		if !ok || cmp.Operator != sqlparser.EqualOp {
+			return true, nil
+		}
+		left, lok := cmp.Left.(*sqlparser.ColName)
+		right, rok := cmp.Right.(*sqlparser.ColName)
+		if !lok || !rok {
+			return true, nil
+		}
+		check := func(innerCol, outerCol *sqlparser.ColName) bool {
+			innerTbl := innerCol.Qualifier.Name.String()
+			outerTbl := outerCol.Qualifier.Name.String()
+			if innerTbl == "" || outerTbl == "" {
+				return false
+			}
+			// Require innerTbl to be one of inner FROM tables (case-insensitive).
+			isInner := false
+			for _, it := range innerTables {
+				if strings.EqualFold(it, innerTbl) {
+					isInner = true
+					break
+				}
+			}
+			if !isInner {
+				return false
+			}
+			// Require outerTbl to be one of outer tables.
+			if !outerSet[strings.ToLower(outerTbl)] {
+				return false
+			}
+			// Require innerCol to be the first PK column of innerTbl.
+			tbl, terr := e.Storage.GetTable(e.CurrentDB, innerTbl)
+			if terr != nil || tbl.Def == nil {
+				return false
+			}
+			if len(tbl.Def.PrimaryKey) == 0 {
+				return false
+			}
+			return strings.EqualFold(tbl.Def.PrimaryKey[0], innerCol.Name.String())
+		}
+		if check(left, right) || check(right, left) {
+			found = true
+			return false, nil
+		}
+		return true, nil
+	}, inner.Where.Expr)
+	return found
+}
+
 // allInnerINJoinColsIndexed returns true when every nested IN subquery in
 // `inner`'s WHERE chain has its join column backed by a PRIMARY KEY or
 // UNIQUE / leading secondary index. This indicates MySQL can flatten cheaply
@@ -5942,9 +6035,31 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 				// The first inner table gets "Start temporary", subsequent inner tables get
 				// "Using where; Using join buffer (BNL)", and the outer table (handled separately
 				// by explainMultiRows) gets "Using where; End temporary; Using join buffer (BNL)".
-				if selectType == "MATERIALIZED" && e.shouldUseDuplicateWeedout(inner) {
-					// Collect all tables from the nested IN chain
-					allTables := e.collectAllTablesForDuplicateWeedout(inner)
+				// Table-pullout DuplicateWeedout fallback: even with no nested IN,
+				// when the inner subquery has multiple tables and one of them has a
+				// correlated PRIMARY KEY equality with an outer column, MySQL pulls
+				// that table out and renders the plan as DuplicateWeedout (BUG#35160).
+				outerTablesList := make([]string, 0, len(outerTables))
+				for ot := range outerTables {
+					outerTablesList = append(outerTablesList, ot)
+				}
+				tablePulloutWeedout := selectType == "MATERIALIZED" && e.isSemijoinEnabled() &&
+					e.innerHasCorrelatedPKWithOuter(inner, outerTablesList)
+				if selectType == "MATERIALIZED" && (e.shouldUseDuplicateWeedout(inner) || tablePulloutWeedout) {
+					// Collect all tables from the nested IN chain (or the inner FROM list
+					// when the trigger is table-pullout rather than nested IN).
+					var allTables []string
+					if tablePulloutWeedout && !e.shouldUseDuplicateWeedout(inner) {
+						for _, te := range inner.From {
+							for _, tn := range e.extractAllTableNames(te) {
+								if !strings.EqualFold(tn, "dual") {
+									allTables = append(allTables, tn)
+								}
+							}
+						}
+					} else {
+						allTables = e.collectAllTablesForDuplicateWeedout(inner)
+					}
 					for i, tblName := range allTables {
 						var rowCount int64 = 1
 						if e.Storage != nil {
