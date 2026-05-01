@@ -187,11 +187,64 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 					// Determine access type based on outer tables:
 					// - If the outer IN expression uses a constant literal (e.g. "11 IN (subquery)"),
 					//   MySQL uses const access on the materialized hash table.
+					// - If the outer IN/NOT IN column belongs to a single-row "system" table,
+					//   the value is effectively constant and MySQL uses const access too.
 					// - If any outer SIMPLE row has non-ALL access (eq_ref, ref, const),
 					//   the outer table is a probe → <subqueryN> is the driver (ALL access)
 					// - If all outer SIMPLE rows have ALL access (scan), they drive the join
 					//   → <subqueryN> is the probe (eq_ref with <auto_key>)
 					outerINIsConst := inSubqueryOuterIsConst(s)
+					// Detect whether the outer comparison is NOT IN (anti-join). When the outer
+					// is NOT IN and treated as const (system table), MySQL adds "Not exists" to
+					// the placeholder's Extra and emits not_exists:true in EXPLAIN JSON.
+					_, _, outerIsNotIn, _ := extractINOrNotInOuterCol(s)
+					// outerINColIsSystem: true when the outer IN/NOT IN column owns a table
+					// whose access_type is "system" (single-row constant table). Treat the
+					// outer value as constant in that case.
+					outerINColIsSystem := false
+					if !outerINIsConst {
+						inCol, inQual, _, hasIn := extractINOrNotInOuterCol(s)
+						if hasIn && inCol != "" {
+							ownerTable := inQual
+							if ownerTable == "" {
+								// Unqualified column: find the simpleRow whose table has this column.
+								for _, sr := range result {
+									if sr.table == nil {
+										continue
+									}
+									tn := fmt.Sprintf("%v", sr.table)
+									if strings.HasPrefix(tn, "<subquery") || strings.HasPrefix(tn, "<derived") {
+										continue
+									}
+									if td := e.explainGetTableDef(tn); td != nil {
+										for _, cd := range td.Columns {
+											if strings.EqualFold(cd.Name, inCol) {
+												ownerTable = tn
+												break
+											}
+										}
+									}
+									if ownerTable != "" {
+										break
+									}
+								}
+							}
+							if ownerTable != "" {
+								for _, sr := range result {
+									if sr.table == nil {
+										continue
+									}
+									tn := fmt.Sprintf("%v", sr.table)
+									if strings.EqualFold(tn, ownerTable) {
+										if at := fmt.Sprintf("%v", sr.accessType); at == "system" {
+											outerINColIsSystem = true
+										}
+										break
+									}
+								}
+							}
+						}
+					}
 					outerHasNonAll := false
 					outerHasAllScan := false // any ALL-scan outer table (potential driver of <subquery> via BNL)
 					outerJoinColForRef := extractINSubqueryOuterCol(s)
@@ -229,9 +282,16 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 						if id, ok := rawID.(int64); ok {
 							subqueryRef := fmt.Sprintf("<subquery%d>", id)
 							var ph explainSelectType
-							if outerINIsConst {
-								// Constant IN expression (e.g. "11 IN (subquery)"): MySQL does a
-								// const lookup on the materialized hash table.
+							if outerINIsConst || outerINColIsSystem {
+								// Constant IN expression (e.g. "11 IN (subquery)") or the outer
+								// IN/NOT IN column belongs to a single-row "system" table: MySQL
+								// does a const lookup on the materialized hash table. For NOT IN
+								// (anti-join) over a system outer, MySQL also adds "Not exists" to
+								// indicate the placeholder is checked for non-existence.
+								var phExtra interface{} = nil
+								if outerINColIsSystem && outerIsNotIn {
+									phExtra = "Using where; Not exists"
+								}
 								ph = explainSelectType{
 									id:           int64(1),
 									selectType:   "SIMPLE",
@@ -243,7 +303,7 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 									ref:          "const",
 									rows:         int64(1),
 									filtered:     "100.00",
-									extra:        nil,
+									extra:        phExtra,
 								}
 							} else if outerHasNonAll && outerHasAllScan {
 								// Mixed case: some outer tables are ALL-scan (drivers) and some use
@@ -3611,6 +3671,36 @@ func extractINTableFromExpr(expr sqlparser.Expr) string {
 		return extractINTableFromExpr(e.Right)
 	}
 	return ""
+}
+
+// extractINOrNotInOuterCol returns the outer column name and qualifier of the
+// first IN or NOT IN comparison whose right-hand side is a subquery in the
+// SELECT's WHERE clause. The qualifier may be "" for unqualified column refs.
+// Returns ("", "", false, false) if no such comparison is found.
+func extractINOrNotInOuterCol(sel *sqlparser.Select) (col string, qualifier string, isNotIn bool, found bool) {
+	if sel == nil || sel.Where == nil {
+		return "", "", false, false
+	}
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if found {
+			return false, nil
+		}
+		if cmp, ok := n.(*sqlparser.ComparisonExpr); ok {
+			if cmp.Operator == sqlparser.InOp || cmp.Operator == sqlparser.NotInOp {
+				if _, ok := cmp.Right.(*sqlparser.Subquery); ok {
+					if c, ok := cmp.Left.(*sqlparser.ColName); ok {
+						col = c.Name.String()
+						qualifier = c.Qualifier.Name.String()
+						isNotIn = cmp.Operator == sqlparser.NotInOp
+						found = true
+						return false, nil
+					}
+				}
+			}
+		}
+		return true, nil
+	}, sel.Where.Expr)
+	return col, qualifier, isNotIn, found
 }
 
 // extractINColFromNode finds the outer column name for a specific IN subquery `sub`
@@ -8195,8 +8285,12 @@ func (e *Executor) explainJSONBuildMaterializedCondition(query string, subqueryN
 		}
 	}
 
-	// Find the IN subquery condition to extract column name
+	// Find the IN/NOT IN subquery condition to extract column name.
 	col := extractINColFromExpr(sel.Where.Expr)
+	if col == "" {
+		// Also handle NOT IN: extract column from the first NOT IN subquery comparison.
+		col, _, _, _ = extractINOrNotInOuterCol(sel)
+	}
 	if col == "" {
 		return ""
 	}
@@ -10203,6 +10297,12 @@ func (e *Executor) explainJSONDocument(query string) string {
 					}
 				}
 				subqueryTblBlock = append(subqueryTblBlock, orderedKV{"rows_examined_per_scan", rowCount})
+				// "Not exists" in Extra signals an anti-join (NOT IN). MySQL emits
+				// not_exists:true between rows_examined_per_scan and attached_condition
+				// in EXPLAIN JSON for these placeholders.
+				if strings.Contains(extraStr, "Not exists") {
+					subqueryTblBlock = append(subqueryTblBlock, orderedKV{"not_exists", true})
+				}
 				if strings.Contains(extraStr, "Using where") {
 					cond := e.explainJSONBuildMaterializedCondition(query, tblName)
 					if cond != "" {
