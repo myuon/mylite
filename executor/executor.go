@@ -314,7 +314,20 @@ type cteTable struct {
 // can avoid the generic "non-numeric string → 0" coercion that MySQL applies
 // to plain strings.  The dolt test suite expects ENUM-vs-integer comparisons
 // to use the ENUM index rather than string coercion.
-type EnumValue string
+//
+// Value is the textual ENUM label (e.g. "value1"). Index is the 1-based ENUM
+// position when known (1 for the first enum element). Index is 0 for the
+// special "empty" enum value (assigned when an out-of-range integer is
+// inserted) and may be 0 when the index is not available, in which case
+// ENUM-vs-integer comparisons fall back to string coercion (false).
+type EnumValue struct {
+	Value string
+	Index int
+}
+
+// String implements fmt.Stringer so that fmt.Sprintf("%v", EnumValue) emits
+// just the underlying label (matching the previous EnumValue-as-string behavior).
+func (e EnumValue) String() string { return e.Value }
 
 // psDigestEntry tracks a statement digest for performance_schema tables.
 type psDigestEntry struct {

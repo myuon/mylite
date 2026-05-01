@@ -334,7 +334,7 @@ func toString(v interface{}) string {
 	case HexBytes:
 		return string(val)
 	case EnumValue:
-		return string(val)
+		return val.Value
 	case []byte:
 		return string(val)
 	case int64:
