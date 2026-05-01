@@ -396,6 +396,111 @@ func (e *Executor) scanTableForFrom(tbl *storage.Table, alias, tableName string)
 	return rows
 }
 
+// installIndexAccessSpecForSelect inspects the SELECT to decide whether the
+// new index-based execution path can be safely engaged for it. When all
+// guard conditions are met it builds a storage.IndexAccessSpec from the
+// WHERE clause (via buildIndexAccessSpec) and stores it under the table's
+// alias and bare-table name in e.indexAccessSpecs, then enables the gate.
+//
+// The function returns a restore closure the caller must defer to put the
+// previous indexAccessSpecs / useIndexAccessSpecs state back before
+// returning to its parent. This keeps subquery-driven nested execSelect
+// calls isolated from each other.
+//
+// Guard conditions (intentionally narrow — see issue #263 follow-up):
+//   - exactly one FROM expression (no JOINs, no implicit cross joins)
+//   - the FROM is an AliasedTableExpr whose Expr is a plain TableName
+//     (not a DerivedTable / subquery / parenthesised join)
+//   - the WHERE clause contains no Subquery (correlated or otherwise)
+//   - the planner-selected AccessPath is "const" (single-row PK lookup) —
+//     "ref" / "range" are deferred to follow-ups
+func (e *Executor) installIndexAccessSpecForSelect(sel *sqlparser.Select) func() {
+	prevSpecs := e.indexAccessSpecs
+	prevGate := e.useIndexAccessSpecs
+	restore := func() {
+		e.indexAccessSpecs = prevSpecs
+		e.useIndexAccessSpecs = prevGate
+	}
+	if sel == nil || len(sel.From) != 1 {
+		return restore
+	}
+	ate, ok := sel.From[0].(*sqlparser.AliasedTableExpr)
+	if !ok {
+		return restore
+	}
+	tn, ok := ate.Expr.(sqlparser.TableName)
+	if !ok {
+		return restore
+	}
+	tableName := tn.Name.String()
+	if tableName == "" || strings.EqualFold(tableName, "dual") {
+		return restore
+	}
+	// Decline information_schema / cross-database tables: their reads go
+	// through buildInformationSchemaRows and never reach scanTableForFrom.
+	if !tn.Qualifier.IsEmpty() {
+		q := tn.Qualifier.String()
+		if strings.EqualFold(q, "information_schema") ||
+			strings.EqualFold(q, "performance_schema") ||
+			strings.EqualFold(q, "sys") ||
+			strings.EqualFold(q, "mysql") {
+			return restore
+		}
+	}
+	// CTE-resolved names also bypass scanTableForFrom.
+	if e.cteMap != nil {
+		if _, ok := e.cteMap[tableName]; ok {
+			return restore
+		}
+	}
+	if sel.Where == nil {
+		return restore
+	}
+	if exprHasSubquery(sel.Where.Expr) {
+		return restore
+	}
+	spec, ok := e.buildIndexAccessSpec(sel, tableName)
+	if !ok {
+		return restore
+	}
+	// Narrow scope: only flip the gate for "const" / "eq_ref" lookups —
+	// the safest single-row PK case. "ref" and "range" remain on the
+	// legacy scan path until follow-up work validates them end-to-end.
+	t := strings.ToLower(spec.Type)
+	if t != "const" && t != "eq_ref" {
+		return restore
+	}
+	alias, _, _ := extractTableAliasFromAliased(ate)
+	newSpecs := make(map[string]storage.IndexAccessSpec, 2)
+	if alias != "" {
+		newSpecs[strings.ToLower(alias)] = spec
+	}
+	newSpecs[strings.ToLower(tableName)] = spec
+	e.indexAccessSpecs = newSpecs
+	e.useIndexAccessSpecs = true
+	return restore
+}
+
+// exprHasSubquery reports whether expr contains any subquery node, so the
+// caller can refuse to engage the index access path when the WHERE clause
+// has correlated / IN-subquery / EXISTS predicates that the new path
+// hasn't been validated against.
+func exprHasSubquery(expr sqlparser.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	found := false
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		switch node.(type) {
+		case *sqlparser.Subquery, *sqlparser.ExistsExpr:
+			found = true
+			return false, nil
+		}
+		return true, nil
+	}, expr)
+	return found
+}
+
 // literalGoValue converts a sqlparser.Literal into an int64/float64/string
 // matching the broad semantics of how rows store values.
 func literalGoValue(lit *sqlparser.Literal) interface{} {

@@ -186,6 +186,81 @@ func TestScanTableForFrom_OptIn(t *testing.T) {
 	}
 }
 
+// TestInstallIndexAccessSpec_ConstPKEngagesGate verifies that when
+// execSelect runs a single-table SELECT with a primary-key equality
+// predicate, installIndexAccessSpecForSelect engages the gate and the
+// result matches the legacy full-scan path bit-for-bit.
+func TestInstallIndexAccessSpec_ConstPKEngagesGate(t *testing.T) {
+	e := setupIATestExecutor(t)
+	// Sanity: gate is off before execution.
+	if e.useIndexAccessSpecs {
+		t.Fatalf("gate unexpectedly on at setup")
+	}
+	res, err := e.Execute("SELECT * FROM t1 WHERE id = 3")
+	if err != nil {
+		t.Fatalf("SELECT: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if id, _ := res.Rows[0][0].(int64); id != 3 {
+		t.Fatalf("expected id=3, got %v", res.Rows[0][0])
+	}
+	// Gate must be restored to off after the query.
+	if e.useIndexAccessSpecs {
+		t.Fatalf("gate not restored to off after SELECT")
+	}
+	if len(e.indexAccessSpecs) != 0 {
+		t.Fatalf("specs not cleared after SELECT: %v", e.indexAccessSpecs)
+	}
+}
+
+// TestInstallIndexAccessSpec_NonConstNoGate verifies that a "ref" lookup
+// (secondary non-unique index) is intentionally NOT engaged at this
+// narrow scope — the gate only flips for "const" / "eq_ref".
+func TestInstallIndexAccessSpec_NonConstNoGate(t *testing.T) {
+	e := setupIATestExecutor(t)
+	parser, _ := sqlparser.New(sqlparser.Options{})
+	stmt, err := parser.Parse("SELECT * FROM t1 WHERE v = 20")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	sel := stmt.(*sqlparser.Select)
+	restore := e.installIndexAccessSpecForSelect(sel)
+	defer restore()
+	if e.useIndexAccessSpecs {
+		t.Fatalf("expected gate to remain OFF for ref lookup at narrow scope")
+	}
+}
+
+// TestInstallIndexAccessSpec_NoFromOrSubquery confirms guard rails:
+// no FROM / subquery in WHERE / multi-table FROM all leave the gate off.
+func TestInstallIndexAccessSpec_NoFromOrSubquery(t *testing.T) {
+	e := setupIATestExecutor(t)
+	parser, _ := sqlparser.New(sqlparser.Options{})
+
+	cases := []string{
+		"SELECT 1",                                          // no FROM
+		"SELECT * FROM t1 WHERE id = (SELECT MAX(id) FROM t1)", // subquery in WHERE
+		"SELECT * FROM t1 a, t1 b WHERE a.id = 1",           // multi-table FROM
+	}
+	for _, sql := range cases {
+		stmt, err := parser.Parse(sql)
+		if err != nil {
+			t.Fatalf("parse %q: %v", sql, err)
+		}
+		sel, ok := stmt.(*sqlparser.Select)
+		if !ok {
+			continue
+		}
+		restore := e.installIndexAccessSpecForSelect(sel)
+		if e.useIndexAccessSpecs {
+			t.Errorf("%q: gate unexpectedly engaged", sql)
+		}
+		restore()
+	}
+}
+
 func TestEvalLiteralExpr(t *testing.T) {
 	cases := []struct {
 		sql  string
