@@ -426,24 +426,38 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 											filtered:   "100.00",
 											extra:      nil,
 										}
-										// Update outer ALL-scan table to use eq_ref with <subqueryN>.joinCol as ref
+										// Update outer ALL-scan/index-scan table to use eq_ref with <subqueryN>.joinCol as ref.
+										// "index" here means a covering full-index scan: when the materialized
+										// subquery provides an equality on the join column, MySQL replaces
+										// the full scan with an eq_ref lookup on the PRIMARY/secondary key.
+										innerJoinCol := extractINSubqueryInnerCol(s)
 										for i, sr := range simpleRows {
 											if sr.table == nil || strings.HasPrefix(fmt.Sprintf("%v", sr.table), "<subquery") {
 												continue
 											}
 											at := fmt.Sprintf("%v", sr.accessType)
-											if at == "ALL" || at == "" {
+											// Only convert the outer table that owns the IN condition to eq_ref;
+											// other tables keep their access type.
+											tblName := fmt.Sprintf("%v", sr.table)
+											if !strings.EqualFold(tblName, outerTableNameForRef) {
+												continue
+											}
+											if at == "ALL" || at == "" || at == "index" {
 												// Check if this outer table has an index on the join column
-												tblName := fmt.Sprintf("%v", sr.table)
 												if e.Storage != nil {
 													if tbl, err := e.Storage.GetTable(e.CurrentDB, tblName); err == nil && tbl.Def != nil {
 														// Find the specific key to use
 														keyName := ""
-														keyLen := "5"
+														var keyCol *catalog.ColumnDef
 														for _, pk := range tbl.Def.PrimaryKey {
 															if strings.EqualFold(pk, outerJoinColForRef) {
 																keyName = "PRIMARY"
-																keyLen = "4"
+																for ci := range tbl.Def.Columns {
+																	if strings.EqualFold(tbl.Def.Columns[ci].Name, pk) {
+																		keyCol = &tbl.Def.Columns[ci]
+																		break
+																	}
+																}
 																break
 															}
 														}
@@ -452,6 +466,12 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 																for _, col := range idx.Columns {
 																	if strings.EqualFold(col, outerJoinColForRef) {
 																		keyName = idx.Name
+																		for ci := range tbl.Def.Columns {
+																			if strings.EqualFold(tbl.Def.Columns[ci].Name, col) {
+																				keyCol = &tbl.Def.Columns[ci]
+																				break
+																			}
+																		}
 																		break
 																	}
 																}
@@ -461,13 +481,72 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 															}
 														}
 														if keyName != "" {
+															// Compute possible_keys: PRIMARY + any other index whose
+															// first column matches the join column or is referenced
+															// by an additional WHERE predicate on this table (e.g.
+															// "Population > 100000" makes index "Population" usable).
+															possibleKeys := keyName
+															seen := map[string]bool{strings.ToLower(keyName): true}
+															// Also collect columns of this table referenced in WHERE
+															// (besides the IN join column) for possible_keys.
+															refCols := whereColRefsForTable(s, tblName)
+															for _, idx := range tbl.Def.Indexes {
+																if len(idx.Columns) == 0 {
+																	continue
+																}
+																first := idx.Columns[0]
+																lname := strings.ToLower(idx.Name)
+																if seen[lname] {
+																	continue
+																}
+																if strings.EqualFold(first, outerJoinColForRef) {
+																	possibleKeys += "," + idx.Name
+																	seen[lname] = true
+																	continue
+																}
+																if refCols[strings.ToLower(first)] {
+																	possibleKeys += "," + idx.Name
+																	seen[lname] = true
+																}
+															}
+															// Compute key_length from column type definition.
+															keyLen := "5"
+															if keyCol != nil {
+																kl := explainKeyLen(keyCol, tbl.Def.Charset)
+																keyLen = fmt.Sprintf("%d", kl)
+															}
+															// ref column: the materialized subquery exposes the
+															// inner SELECT's projection column (e.g. Country).
+															refCol := innerJoinCol
+															if refCol == "" {
+																refCol = outerJoinColForRef
+															}
 															simpleRows[i].accessType = "eq_ref"
-															simpleRows[i].possibleKeys = keyName
+															simpleRows[i].possibleKeys = possibleKeys
 															simpleRows[i].key = keyName
 															simpleRows[i].keyLen = keyLen
-															simpleRows[i].ref = subqueryRef + "." + outerJoinColForRef
+															simpleRows[i].ref = subqueryRef + "." + refCol
 															simpleRows[i].rows = int64(1)
 															simpleRows[i].filtered = "100.00"
+															// "Using index" Extra (from full index scan) becomes irrelevant
+															// once converted to eq_ref. If there's an additional non-IN
+															// predicate on this table (e.g. "Population > 100000"),
+															// MySQL emits "Using where" instead.
+															hasExtraPredicate := false
+															for c := range refCols {
+																if !strings.EqualFold(c, outerJoinColForRef) {
+																	hasExtraPredicate = true
+																	break
+																}
+															}
+															if hasExtraPredicate {
+																simpleRows[i].extra = "Using where"
+															} else if simpleRows[i].extra != nil {
+																extraStr := fmt.Sprintf("%v", simpleRows[i].extra)
+																if extraStr == "Using index" {
+																	simpleRows[i].extra = nil
+																}
+															}
 														}
 													}
 												}
@@ -3178,6 +3257,68 @@ func extractINColFromExpr(expr sqlparser.Expr) string {
 			return col
 		}
 		return extractINColFromExpr(e.Right)
+	}
+	return ""
+}
+
+// whereColRefsForTable returns a set of lower-cased column names of `tableName`
+// referenced anywhere in the SELECT's WHERE clause (including inside subquery
+// correlations from outer queries). This is used to expand possible_keys for
+// indexes covering predicates beyond the IN join condition.
+func whereColRefsForTable(sel *sqlparser.Select, tableName string) map[string]bool {
+	result := map[string]bool{}
+	if sel == nil || sel.Where == nil {
+		return result
+	}
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if col, ok := n.(*sqlparser.ColName); ok {
+			q := col.Qualifier.Name.String()
+			if q == "" || strings.EqualFold(q, tableName) {
+				result[strings.ToLower(col.Name.String())] = true
+			}
+		}
+		return true, nil
+	}, sel.Where.Expr)
+	return result
+}
+
+// extractINSubqueryInnerCol returns the inner SELECT's first projection
+// column name for the first "col IN (SELECT ...)" condition in WHERE.
+// For "WHERE t.Code IN (SELECT Country FROM ...)" returns "Country".
+func extractINSubqueryInnerCol(sel *sqlparser.Select) string {
+	if sel == nil || sel.Where == nil {
+		return ""
+	}
+	return extractINInnerColFromExpr(sel.Where.Expr)
+}
+
+func extractINInnerColFromExpr(expr sqlparser.Expr) string {
+	if expr == nil {
+		return ""
+	}
+	switch e := expr.(type) {
+	case *sqlparser.ComparisonExpr:
+		if e.Operator == sqlparser.InOp {
+			if sub, ok := e.Right.(*sqlparser.Subquery); ok {
+				if innerSel, ok := sub.Select.(*sqlparser.Select); ok {
+					if innerSel.SelectExprs != nil && len(innerSel.SelectExprs.Exprs) > 0 {
+						if ae, ok := innerSel.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok {
+							if !ae.As.IsEmpty() {
+								return ae.As.String()
+							}
+							if col, ok := ae.Expr.(*sqlparser.ColName); ok {
+								return col.Name.String()
+							}
+						}
+					}
+				}
+			}
+		}
+	case *sqlparser.AndExpr:
+		if col := extractINInnerColFromExpr(e.Left); col != "" {
+			return col
+		}
+		return extractINInnerColFromExpr(e.Right)
 	}
 	return ""
 }
