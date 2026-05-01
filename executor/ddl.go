@@ -3234,9 +3234,87 @@ func encodeInstantDefault(col catalog.ColumnDef) string {
 			n >>= 8
 		}
 		return fmt.Sprintf("%x", buf)
+	case "CHAR", "BINARY":
+		// Fixed-length string/byte types: pad to declared length.
+		// CHAR pads with 0x20 (space); BINARY pads with 0x00.
+		// For CHAR under multi-byte charsets (utf8mb4 default), the storage
+		// width is N * max_byte_length_per_char, e.g. CHAR(50) utf8mb4 → 200 bytes.
+		width := 1
+		if i := strings.IndexByte(upper, '('); i >= 0 {
+			if j := strings.IndexByte(upper[i:], ')'); j > 0 {
+				if w, err := strconv.Atoi(strings.TrimSpace(upper[i+1 : i+j])); err == nil && w > 0 {
+					width = w
+				}
+			}
+		}
+		raw := decodeStringOrHexLiteral(defStr)
+		if base == "CHAR" {
+			byteWidth := width * charsetMaxBytesPerChar(col.Charset)
+			if len(raw) < byteWidth {
+				raw = raw + strings.Repeat(" ", byteWidth-len(raw))
+			} else if len(raw) > byteWidth {
+				raw = raw[:byteWidth]
+			}
+		} else { // BINARY
+			if len(raw) < width {
+				raw = raw + strings.Repeat("\x00", width-len(raw))
+			} else if len(raw) > width {
+				raw = raw[:width]
+			}
+		}
+		return fmt.Sprintf("%x", []byte(raw))
+	case "VARCHAR", "VARBINARY",
+		"TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT",
+		"TINYBLOB", "BLOB", "MEDIUMBLOB", "LONGBLOB":
+		// Variable-length: store the literal bytes without padding or truncation.
+		// (MySQL truncates to the declared length on insert, but for the catalog
+		// default we surface the literal as written.)
+		raw := decodeStringOrHexLiteral(defStr)
+		return fmt.Sprintf("%x", []byte(raw))
 	}
 	// For non-integer types we don't yet produce the InnoDB hex encoding.
 	return ""
+}
+
+// charsetMaxBytesPerChar returns the maximum number of bytes used to encode
+// a single character under the given charset name. Defaults to 4 (utf8mb4)
+// when empty.
+func charsetMaxBytesPerChar(charset string) int {
+	switch strings.ToLower(strings.TrimSpace(charset)) {
+	case "ascii", "latin1", "latin2", "latin5", "latin7",
+		"cp1250", "cp1251", "cp1256", "cp1257", "cp850", "cp852", "cp866",
+		"hp8", "keybcs2", "macce", "macroman", "swe7", "armscii8", "geostd8",
+		"dec8", "tis620", "binary":
+		return 1
+	case "ucs2", "utf16", "utf16le", "ujis":
+		return 2
+	case "big5", "euckr", "gb2312", "sjis", "cp932", "eucjpms", "gbk":
+		return 2
+	case "utf8", "utf8mb3":
+		return 3
+	case "utf32":
+		return 4
+	case "", "utf8mb4", "gb18030":
+		return 4
+	}
+	return 4
+}
+
+// decodeStringOrHexLiteral interprets a DEFAULT literal as either a quoted
+// string (already unquoted by the caller) or a 0xNN-style hex byte sequence.
+// Returns the raw bytes as a string.
+func decodeStringOrHexLiteral(s string) string {
+	if len(s) >= 2 && (s[0] == '0') && (s[1] == 'x' || s[1] == 'X') {
+		hexStr := s[2:]
+		if len(hexStr)%2 == 1 {
+			hexStr = "0" + hexStr
+		}
+		decoded, err := hex.DecodeString(hexStr)
+		if err == nil {
+			return string(decoded)
+		}
+	}
+	return s
 }
 
 // encodeMySQLDecimal encodes a decimal literal (like "100.00") in MySQL's
@@ -5688,6 +5766,16 @@ func looksLikeBinaryData(s string) bool {
 // big-endian byte string representation, stripping leading zero bytes.
 // Returns the original value unchanged if it is not an integer type.
 func hexIntToBytes(val interface{}) interface{} {
+	// String-form "0x..." literal: decode to raw bytes (no leading-zero strip).
+	if s, ok := val.(string); ok && len(s) >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+		hexStr := s[2:]
+		if len(hexStr)%2 == 1 {
+			hexStr = "0" + hexStr
+		}
+		if decoded, err := hex.DecodeString(hexStr); err == nil {
+			return string(decoded)
+		}
+	}
 	switch tv := val.(type) {
 	case int64:
 		if tv == 0 {
@@ -5775,6 +5863,23 @@ func padBinaryValue(val interface{}, padLen int) interface{} {
 			s = s[:padLen]
 		}
 		return s
+	}
+	// Handle string-form "0x..." hex literal (e.g. when a DEFAULT 0x11223344 is
+	// stored as the string "0x11223344"): decode to raw bytes before padding.
+	if s, ok := val.(string); ok && len(s) >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+		hexStr := s[2:]
+		if len(hexStr)%2 == 1 {
+			hexStr = "0" + hexStr
+		}
+		if decoded, err := hex.DecodeString(hexStr); err == nil {
+			ds := string(decoded)
+			if len(ds) < padLen {
+				ds = ds + strings.Repeat("\x00", padLen-len(ds))
+			} else if len(ds) > padLen {
+				ds = ds[:padLen]
+			}
+			return ds
+		}
 	}
 	// Convert integer hex literals to byte strings first
 	converted := hexIntToBytes(val)
