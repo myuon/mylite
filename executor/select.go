@@ -7188,6 +7188,11 @@ func (e *Executor) evalInSubquery(leftVal interface{}, leftExpr sqlparser.Expr, 
 	// Check if left is a tuple: (a,b) IN (SELECT x,y FROM ...)
 	if leftTuple, ok := leftExpr.(sqlparser.ValTuple); ok {
 		if len(result.Columns) != len(leftTuple) {
+			// MySQL reports unknown-column errors on the LHS tuple BEFORE
+			// reporting "Operand should contain N column(s)". Mirror that.
+			if colErr := e.findUnknownColInTupleForIN([]sqlparser.Expr(leftTuple), nil); colErr != nil {
+				return nil, colErr
+			}
 			return nil, mysqlError(1241, "21000", fmt.Sprintf("Operand should contain %d column(s)", len(leftTuple)))
 		}
 		leftVals := make([]interface{}, len(leftTuple))
