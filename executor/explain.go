@@ -1490,6 +1490,69 @@ func (e *Executor) whereHasSingleSubquery(sel *sqlparser.Select) bool {
 	return count == 1
 }
 
+// exprHasSubqueryUnderOr reports whether expr contains an IN/NOT IN/EXISTS
+// (or bare) subquery anywhere underneath an OrExpr. MySQL cannot apply
+// semijoin flattening to subqueries combined with OR — they stay as
+// DEPENDENT SUBQUERY using the EXISTS strategy.
+func exprHasSubqueryUnderOr(expr sqlparser.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	var found bool
+	var walk func(n sqlparser.SQLNode, underOr bool)
+	walk = func(n sqlparser.SQLNode, underOr bool) {
+		if found || n == nil {
+			return
+		}
+		switch x := n.(type) {
+		case *sqlparser.OrExpr:
+			walk(x.Left, true)
+			walk(x.Right, true)
+			return
+		case *sqlparser.Subquery:
+			if underOr {
+				found = true
+			}
+			return
+		case *sqlparser.AndExpr:
+			walk(x.Left, underOr)
+			walk(x.Right, underOr)
+			return
+		case *sqlparser.NotExpr:
+			walk(x.Expr, underOr)
+			return
+		case *sqlparser.ComparisonExpr:
+			walk(x.Left, underOr)
+			walk(x.Right, underOr)
+			return
+		case *sqlparser.ExistsExpr:
+			walk(x.Subquery, underOr)
+			return
+		}
+		// Fallback: walk children using sqlparser.Walk
+		visited := false
+		_ = sqlparser.Walk(func(child sqlparser.SQLNode) (bool, error) {
+			if !visited {
+				visited = true
+				return true, nil
+			}
+			if _, ok := child.(*sqlparser.Subquery); ok {
+				if underOr {
+					found = true
+				}
+				return false, nil
+			}
+			if _, ok := child.(*sqlparser.OrExpr); ok {
+				walk(child, true)
+				return false, nil
+			}
+			return true, nil
+		}, n)
+	}
+	walk(expr, false)
+	return found
+}
+
 // queryCanBeSemijoinFlattened returns true if the SELECT's WHERE-clause subqueries
 // can all be flattened into a single SIMPLE query block (MySQL anti-join / semi-join
 // optimization). The rules:
@@ -1740,6 +1803,20 @@ func (e *Executor) queryCanBeSemijoinFlattened(sel *sqlparser.Select) bool {
 	// Walk JOIN ON conditions
 	for _, onCond := range onConditions {
 		_ = sqlparser.Walk(walkFn, onCond)
+	}
+
+	// IN/EXISTS subqueries directly under an OR expression cannot be semijoin-flattened.
+	// e.g. `WHERE i IN (SELECT i FROM t2) OR i IN (SELECT i FROM t3)` keeps both as
+	// DEPENDENT SUBQUERY (EXISTS strategy) and the outer becomes PRIMARY.
+	if sel.Where != nil && exprHasSubqueryUnderOr(sel.Where.Expr) {
+		return false
+	}
+	for _, onCond := range onConditions {
+		if e2, ok := onCond.(sqlparser.Expr); ok {
+			if exprHasSubqueryUnderOr(e2) {
+				return false
+			}
+		}
 	}
 
 	if !hasAny || !allFlattenable {
@@ -5242,6 +5319,71 @@ func isSubqueryInNotInContext(node sqlparser.SQLNode, sub *sqlparser.Subquery) b
 // isSubqueryInINContext checks if a Subquery node is used in an IN, NOT IN, or = ANY / != ANY context.
 // Note: plain scalar equality like "col = (SELECT 1 FROM t2)" (without ANY/ALL) is NOT IN context;
 // those are SUBQUERY not semijoin-flattenable.
+// isSubqueryUnderOrInNode reports whether `sub` appears beneath an OrExpr in `node`.
+// Used to detect IN subqueries combined with OR (e.g. `a IN (...) OR b IN (...)`)
+// which MySQL handles via IN-to-EXISTS rewrite (DEPENDENT SUBQUERY) rather than semijoin.
+func isSubqueryUnderOrInNode(node sqlparser.SQLNode, sub *sqlparser.Subquery) bool {
+	if node == nil || sub == nil {
+		return false
+	}
+	var found bool
+	var walk func(n sqlparser.SQLNode, underOr bool)
+	walk = func(n sqlparser.SQLNode, underOr bool) {
+		if found || n == nil {
+			return
+		}
+		switch x := n.(type) {
+		case *sqlparser.OrExpr:
+			walk(x.Left, true)
+			walk(x.Right, true)
+			return
+		case *sqlparser.AndExpr:
+			walk(x.Left, underOr)
+			walk(x.Right, underOr)
+			return
+		case *sqlparser.NotExpr:
+			walk(x.Expr, underOr)
+			return
+		case *sqlparser.ComparisonExpr:
+			walk(x.Left, underOr)
+			walk(x.Right, underOr)
+			return
+		case *sqlparser.ExistsExpr:
+			walk(x.Subquery, underOr)
+			return
+		case *sqlparser.Subquery:
+			if x == sub && underOr {
+				found = true
+			}
+			return
+		case *sqlparser.Where:
+			walk(x.Expr, underOr)
+			return
+		}
+		// Generic descent for other node types — track OrExpr through Walk.
+		visited := false
+		_ = sqlparser.Walk(func(child sqlparser.SQLNode) (bool, error) {
+			if !visited {
+				visited = true
+				return true, nil
+			}
+			if _, ok := child.(*sqlparser.OrExpr); ok {
+				walk(child, underOr)
+				return false, nil
+			}
+			if s, ok := child.(*sqlparser.Subquery); ok {
+				if s == sub && underOr {
+					found = true
+				}
+				return false, nil
+			}
+			return true, nil
+		}, n)
+	}
+	walk(node, false)
+	return found
+}
+
 func isSubqueryInINContext(node sqlparser.SQLNode, sub *sqlparser.Subquery) bool {
 	found := false
 	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
@@ -5854,6 +5996,13 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 			*idCounter++
 			correlated := e.isCorrelatedSubquery(sub.Select, outerTables)
 			inContext := isSubqueryInINContext(node, sub)
+			// IN/EXISTS subqueries combined with OR (e.g. `WHERE a IN (...) OR b IN (...)`)
+			// are NOT semijoin-flattenable. MySQL falls back to IN-to-EXISTS rewrite,
+			// which makes the inner subqueries DEPENDENT SUBQUERY (correlated to the outer).
+			subqueryUnderOr := isSubqueryUnderOrInNode(node, sub)
+			if subqueryUnderOr {
+				correlated = true
+			}
 
 			switch inner := sub.Select.(type) {
 			case *sqlparser.Union:
