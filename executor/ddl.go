@@ -3112,7 +3112,12 @@ func implicitDefaultForType(colType string) interface{} {
 // Returns "" when no default is meaningful (e.g. nullable column with no
 // explicit default — InnoDB stores NULL as the default, surfaced as the
 // string "NULL" in INFORMATION_SCHEMA.INNODB_COLUMNS.DEFAULT_VALUE).
-func encodeInstantDefault(col catalog.ColumnDef) string {
+//
+// rowFormat selects InnoDB's on-disk encoding for fixed-length CHAR. Under
+// REDUNDANT, CHAR is padded to N * charset_max_bytes_per_char (e.g. CHAR(50)
+// utf8mb4 → 200 bytes). Under DYNAMIC/COMPACT/COMPRESSED, CHAR is padded only
+// to the literal byte length up to N bytes (effectively N for ASCII defaults).
+func encodeInstantDefault(col catalog.ColumnDef, rowFormat string) string {
 	if col.Default == nil {
 		// Nullable column without explicit default: caller treats as NULL.
 		return ""
@@ -3312,7 +3317,13 @@ func encodeInstantDefault(col catalog.ColumnDef) string {
 		}
 		raw := decodeStringOrHexLiteral(defStr)
 		if base == "CHAR" {
-			byteWidth := width * charsetMaxBytesPerChar(col.Charset)
+			// Determine padding width based on InnoDB row format.
+			// REDUNDANT pads CHAR to N * charset_max_bytes_per_char on disk.
+			// DYNAMIC/COMPACT/COMPRESSED pad only to N bytes (literal length).
+			byteWidth := width
+			if strings.EqualFold(strings.TrimSpace(rowFormat), "REDUNDANT") {
+				byteWidth = width * charsetMaxBytesPerChar(col.Charset)
+			}
 			if len(raw) < byteWidth {
 				raw = raw + strings.Repeat(" ", byteWidth-len(raw))
 			} else if len(raw) > byteWidth {
@@ -4658,7 +4669,18 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					}
 					if instantEligible {
 						colDef.IsInstantAdded = true
-						colDef.InstantDefault = encodeInstantDefault(colDef)
+						// Resolve the table's effective row format so CHAR
+						// defaults get padded correctly (REDUNDANT pads to
+						// N*max_bytes_per_char, DYNAMIC/COMPACT pad to N).
+						rowFmt := ""
+						if tableDef0, _ := db.GetTable(tableName); tableDef0 != nil {
+							if tableDef0.EffectiveRowFormat != "" {
+								rowFmt = tableDef0.EffectiveRowFormat
+							} else if tableDef0.RowFormat != "" {
+								rowFmt = tableDef0.RowFormat
+							}
+						}
+						colDef.InstantDefault = encodeInstantDefault(colDef, rowFmt)
 					}
 				}
 				if addErr := db.AddColumnAt(tableName, colDef, position, afterCol); addErr != nil {

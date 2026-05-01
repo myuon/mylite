@@ -3177,10 +3177,6 @@
       "reason": "stored procedure error"
     },
     {
-      "test": "innodb/instant_add_column_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/admin_address_basic",
       "reason": "uses --expr directive"
     },
