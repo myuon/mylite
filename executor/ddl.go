@@ -4281,6 +4281,15 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					if colDef.Default != nil {
 						// Parse the default string as a literal if possible.
 						defVal = *colDef.Default
+						// Coerce the parsed default literal through the column's
+						// type so that, e.g., BIT(M) DEFAULT b'010101' is stored
+						// as int64(0x15) (the bit value) rather than the literal
+						// 8-character string "b'010101'". Without coercion the
+						// raw literal survives backfill and comparisons like
+						// `WHERE col = b'010101'` mismatch the stored string.
+						if defVal != nil {
+							defVal = coerceColumnValue(colDef.Type, defVal)
+						}
 					} else if !colDef.Nullable {
 						// NOT NULL column without explicit DEFAULT gets the type's zero value
 						defVal = implicitDefaultForType(colDef.Type)
