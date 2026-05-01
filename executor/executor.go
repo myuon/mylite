@@ -6703,6 +6703,22 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 				// InnoDB doesn't support optimize; MySQL outputs a note then status OK
 				rows = append(rows, []interface{}{tableName, op, "note", "Table does not support optimize, doing recreate + analyze instead"})
 				rows = append(rows, []interface{}{tableName, op, "status", "OK"})
+				// MySQL implements OPTIMIZE TABLE on InnoDB as a recreate + analyze.
+				// The recreate is a full table rebuild, so any INSTANT-added columns
+				// are physically materialized and information_schema.innodb_tables
+				// reports instant_cols=0 afterwards.
+				if dbObj, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
+					if tblDef, err := dbObj.GetTable(bareTable); err == nil && tblDef != nil {
+						if tblDef.InstantCols != 0 {
+							tblDef.InstantCols = 0
+							for ci := range tblDef.Columns {
+								tblDef.Columns[ci].IsInstantAdded = false
+								tblDef.Columns[ci].InstantDefault = ""
+							}
+							tblDef.RebuildSeq++
+						}
+					}
+				}
 			} else {
 				// Non-InnoDB engines (MyISAM, etc.): return "OK" if the table was modified
 				// (INSERT/UPDATE/DELETE/ALTER) since last OPTIMIZE TABLE; otherwise "Table is already up to date".

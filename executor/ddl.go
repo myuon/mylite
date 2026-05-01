@@ -4003,8 +4003,28 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			// MySQL returns ER_CHECK_NO_SUCH_TABLE (1177) when the target is a view.
 			if !stmt.PartitionSpec.TableName.IsEmpty() {
 				exchangeTableName := stmt.PartitionSpec.TableName.Name.String()
+				exchangeDBName := dbName
+				if !stmt.PartitionSpec.TableName.Qualifier.IsEmpty() {
+					exchangeDBName = stmt.PartitionSpec.TableName.Qualifier.String()
+				}
 				if _, _, isView := e.lookupView(exchangeTableName); isView {
 					return nil, mysqlError(1177, "42000", "Can't open table")
+				}
+				// Compare instant_cols of the partitioned table and the source table.
+				// MySQL rejects EXCHANGE PARTITION when either side has INSTANT-added
+				// columns and the values do not match, with
+				// ER_PARTITION_EXCHANGE_DIFFERENT_OPTION (1736).
+				if partDB, err := e.Catalog.GetDatabase(dbName); err == nil {
+					if partTbl, err := partDB.GetTable(tableName); err == nil && partTbl != nil {
+						if srcDB, err := e.Catalog.GetDatabase(exchangeDBName); err == nil {
+							if srcTbl, err := srcDB.GetTable(exchangeTableName); err == nil && srcTbl != nil {
+								if partTbl.InstantCols != srcTbl.InstantCols {
+									return nil, mysqlError(1736, "HY000",
+										"Non matching attribute 'INSTANT COLUMN(s)' between partition and table")
+								}
+							}
+						}
+					}
 				}
 			}
 			// Not fully implemented; ignore silently.
