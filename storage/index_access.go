@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/myuon/mylite/catalog"
@@ -178,8 +179,18 @@ func (t *Table) ScanByIndex(spec IndexAccessSpec) ([]Row, error) {
 		return nil, fmt.Errorf("ScanByIndex: nil table")
 	}
 	switch strings.ToLower(spec.Type) {
-	case "", "all", "index":
+	case "", "all":
 		return t.Scan(), nil
+	case "index":
+		// Full index scan: return all rows in the order of the named
+		// index. Mirrors MySQL's covering-index full-scan behaviour
+		// (Extra="Using index"), where the result set is implicitly
+		// sorted by the index's leading columns.
+		idxCols, ok := t.resolveIndexColumns(spec.IndexName)
+		if !ok || len(idxCols) == 0 {
+			return t.Scan(), nil
+		}
+		return t.scanByIndexOrder(idxCols), nil
 	}
 
 	idxCols, ok := t.resolveIndexColumns(spec.IndexName)
@@ -261,6 +272,60 @@ func (t *Table) ScanByIndex(spec IndexAccessSpec) ([]Row, error) {
 	}
 
 	return t.Scan(), nil
+}
+
+// scanByIndexOrder returns all rows sorted by the supplied index
+// column list (in declaration order). Used to simulate a covering
+// secondary-index full scan: rows come back in index-key order rather
+// than primary-key order.
+//
+// Ties are broken by the table's primary key (when present), matching
+// InnoDB's secondary-index physical layout where each leaf entry is
+// (idx_cols..., pk_cols...).
+func (t *Table) scanByIndexOrder(idxCols []string) []Row {
+	t.Mu.RLock()
+	defer t.Mu.RUnlock()
+	out := make([]Row, len(t.Rows))
+	for i, row := range t.Rows {
+		out[i] = cloneRowSnapshot(row)
+	}
+	if len(out) <= 1 {
+		return out
+	}
+	bare := make([]string, len(idxCols))
+	for i, c := range idxCols {
+		bare[i] = stripPrefixLength(c)
+	}
+	var pkCols []string
+	if t.Def != nil {
+		pkCols = make([]string, len(t.Def.PrimaryKey))
+		for i, c := range t.Def.PrimaryKey {
+			pkCols[i] = stripPrefixLength(c)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		ri, rj := out[i], out[j]
+		for _, c := range bare {
+			cmp := compareRowValue(rowGetCI(ri, c), rowGetCI(rj, c))
+			if cmp < 0 {
+				return true
+			}
+			if cmp > 0 {
+				return false
+			}
+		}
+		for _, c := range pkCols {
+			cmp := compareRowValue(rowGetCI(ri, c), rowGetCI(rj, c))
+			if cmp < 0 {
+				return true
+			}
+			if cmp > 0 {
+				return false
+			}
+		}
+		return false
+	})
+	return out
 }
 
 // inRange reports whether v lies within the lower/upper bounds for the
