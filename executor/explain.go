@@ -11679,6 +11679,159 @@ func (e *Executor) explainResultForType(explainType sqlparser.ExplainType, expla
 	}
 }
 
+// validateInSubqueryLHSColRefs checks the LHS of any IN/NOT IN predicate
+// whose right side is a subquery and verifies that bare (unqualified) column
+// references on the LHS exist in some FROM table of the outer SELECT.
+//
+// MySQL resolves names during query preparation and reports
+// "Unknown column 'X' in 'IN/ALL/ANY subquery'" before EXPLAIN produces any
+// plan output. Mirror that behavior so EXPLAIN doesn't silently succeed.
+//
+// This is conservative: if any FROM entry is non-resolvable (derived table,
+// CTE, or table not in catalog) we skip the check to avoid false positives.
+func (e *Executor) validateInSubqueryLHSColRefs(sel *sqlparser.Select) error {
+	if sel == nil || sel.Where == nil || len(sel.From) == 0 {
+		return nil
+	}
+	// Build the union of column names across all FROM tables.
+	// Returns (columns, ok). If ok==false, we cannot determine columns
+	// reliably (derived/CTE/missing-from-catalog) and skip validation.
+	cols, ok := e.collectFromTableColumns(sel.From)
+	if !ok {
+		return nil
+	}
+	if len(cols) == 0 {
+		return nil
+	}
+
+	var walk func(expr sqlparser.Expr) error
+	walk = func(expr sqlparser.Expr) error {
+		if expr == nil {
+			return nil
+		}
+		switch x := expr.(type) {
+		case *sqlparser.ComparisonExpr:
+			if x.Operator == sqlparser.InOp || x.Operator == sqlparser.NotInOp {
+				if _, isSub := x.Right.(*sqlparser.Subquery); isSub {
+					if err := e.checkInLHSColRefs(x.Left, cols); err != nil {
+						return err
+					}
+				}
+			}
+			if err := walk(x.Left); err != nil {
+				return err
+			}
+			return walk(x.Right)
+		case *sqlparser.AndExpr:
+			if err := walk(x.Left); err != nil {
+				return err
+			}
+			return walk(x.Right)
+		case *sqlparser.OrExpr:
+			if err := walk(x.Left); err != nil {
+				return err
+			}
+			return walk(x.Right)
+		case *sqlparser.NotExpr:
+			return walk(x.Expr)
+		case *sqlparser.IsExpr:
+			return walk(x.Left)
+		case *sqlparser.BetweenExpr:
+			if err := walk(x.Left); err != nil {
+				return err
+			}
+			if err := walk(x.From); err != nil {
+				return err
+			}
+			return walk(x.To)
+		}
+		return nil
+	}
+	return walk(sel.Where.Expr)
+}
+
+// checkInLHSColRefs walks a single LHS expression of an IN/NOT IN predicate
+// and reports the first bare ColName that does not appear in cols.
+func (e *Executor) checkInLHSColRefs(expr sqlparser.Expr, cols map[string]bool) error {
+	switch x := expr.(type) {
+	case *sqlparser.ColName:
+		if !x.Qualifier.IsEmpty() {
+			return nil
+		}
+		name := strings.ToLower(x.Name.String())
+		if !cols[name] {
+			return mysqlError(1054, "42S22",
+				fmt.Sprintf("Unknown column '%s' in 'IN/ALL/ANY subquery'", x.Name.String()))
+		}
+	case sqlparser.ValTuple:
+		for _, e2 := range x {
+			if err := e.checkInLHSColRefs(e2, cols); err != nil {
+				return err
+			}
+		}
+	case *sqlparser.BinaryExpr:
+		if err := e.checkInLHSColRefs(x.Left, cols); err != nil {
+			return err
+		}
+		return e.checkInLHSColRefs(x.Right, cols)
+	case *sqlparser.UnaryExpr:
+		return e.checkInLHSColRefs(x.Expr, cols)
+	}
+	return nil
+}
+
+// collectFromTableColumns returns the set of column names (lowercased)
+// across all real (catalog-backed) tables in the FROM clause. The second
+// return value is false if any FROM entry is non-resolvable (derived table,
+// CTE, or table not in catalog), in which case validation should be skipped.
+func (e *Executor) collectFromTableColumns(from sqlparser.TableExprs) (map[string]bool, bool) {
+	cols := make(map[string]bool)
+	var ok = true
+	var visit func(te sqlparser.TableExpr)
+	visit = func(te sqlparser.TableExpr) {
+		if !ok {
+			return
+		}
+		switch t := te.(type) {
+		case *sqlparser.AliasedTableExpr:
+			switch inner := t.Expr.(type) {
+			case sqlparser.TableName:
+				name := inner.Name.String()
+				td := e.explainGetTableDef(name)
+				if td == nil {
+					ok = false
+					return
+				}
+				for _, c := range td.Columns {
+					cols[strings.ToLower(c.Name)] = true
+				}
+			default:
+				// DerivedTable or other unrecognized expression
+				_ = inner
+				ok = false
+				return
+			}
+		case *sqlparser.JoinTableExpr:
+			visit(t.LeftExpr)
+			visit(t.RightExpr)
+		case *sqlparser.ParenTableExpr:
+			for _, e2 := range t.Exprs {
+				visit(e2)
+			}
+		default:
+			ok = false
+			return
+		}
+	}
+	for _, te := range from {
+		visit(te)
+		if !ok {
+			return nil, false
+		}
+	}
+	return cols, true
+}
+
 // execExplainStmt handles EXPLAIN SELECT ... statements.
 // Returns a simplified explain result set for compatibility.
 func (e *Executor) execExplainStmt(s *sqlparser.ExplainStmt, query string) (*Result, error) {
@@ -11723,6 +11876,14 @@ func (e *Executor) execExplainStmt(s *sqlparser.ExplainStmt, query string) (*Res
 			if err := e.validateDerivedTableColRefs(sel); err != nil {
 				return nil, err
 			}
+		}
+	}
+	// Validate IN-subquery LHS column references against FROM tables.
+	// MySQL reports ER_BAD_FIELD_ERROR ("Unknown column 'X' in 'IN/ALL/ANY
+	// subquery'") during query preparation, before EXPLAIN can produce a plan.
+	if sel, ok := s.Statement.(*sqlparser.Select); ok {
+		if err := e.validateInSubqueryLHSColRefs(sel); err != nil {
+			return nil, err
 		}
 	}
 	// Phase 2: use plan-based EXPLAIN Traditional for simple SELECT queries.
