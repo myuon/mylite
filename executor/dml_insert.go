@@ -352,6 +352,44 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		var firstAutoInsertID int64
 		var affected uint64
 
+		// InnoDB lock_mode=1 bulk-INSERT...SELECT reservation: when the source
+		// row count is N, MySQL's "bulk INSERT" mode (used for INSERT...SELECT
+		// because the engine doesn't know N upfront) reserves AI values in
+		// power-of-2 chunks (1, 2, 4, 8, ...) until enough are reserved to
+		// cover N. After the statement, any unused reservation is left as a
+		// gap, so the global AI counter advances by 2^ceil(log2(N+1)) - 1
+		// rather than N. We snapshot the counter before the bulk loop and
+		// advance it past the reservation after the loop completes. This
+		// matches MySQL's lock_mode=1 default behaviour and is required by
+		// tests like innodb/instant_add_column_basic and innodb/autoinc_persist.
+		isInnoDBLikeEngine := func() bool {
+			eng := strings.ToUpper(tbl.Def.Engine)
+			if eng == "" {
+				if v, ok := e.getSysVar("default_storage_engine"); ok && v != "" {
+					eng = strings.ToUpper(v)
+				}
+			}
+			return eng != "MYISAM" && eng != "MRG_MYISAM" && eng != "MEMORY" && eng != "ARCHIVE" && eng != "CSV"
+		}()
+		bulkAISelPreCounter := int64(-1)
+		bulkAISelReserved := 0
+		bulkAISelApplies := false
+		if autoColName != "" && isInnoDBLikeEngine && len(selResult.Rows) > 0 {
+			if lm, ok := e.getSysVar("innodb_autoinc_lock_mode"); !ok || lm != "0" {
+				n := len(selResult.Rows)
+				// reservation = smallest 2^k - 1 >= n, i.e. 1+2+4+...+2^(k-1).
+				reserved := 1
+				for reserved < n {
+					reserved = reserved*2 + 1
+				}
+				bulkAISelReserved = reserved
+				tbl.Lock()
+				bulkAISelPreCounter = tbl.AutoIncrementValue()
+				tbl.Unlock()
+				bulkAISelApplies = true
+			}
+		}
+
 		// Pre-allocate bulk rows
 		bulkRows := make([]storage.Row, 0, len(selResult.Rows))
 
@@ -517,6 +555,19 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				}
 				affected++
 			}
+		}
+
+		// Apply InnoDB lock_mode=1 bulk-INSERT...SELECT reservation: advance
+		// the global AI counter past (preCounter + reserved). Only meaningful
+		// when at least one row auto-generated an AI value (firstAutoInsertID
+		// > 0); otherwise the source rows all carried explicit AI values.
+		if bulkAISelApplies && bulkAISelPreCounter >= 0 && firstAutoInsertID > 0 && bulkAISelReserved > 0 {
+			reserved := bulkAISelPreCounter + int64(bulkAISelReserved)
+			tbl.Lock()
+			if cur := tbl.AutoIncrementValue(); cur < reserved {
+				tbl.AutoIncrement.Store(reserved)
+			}
+			tbl.Unlock()
 		}
 
 		if firstAutoInsertID > 0 {
