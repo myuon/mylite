@@ -4615,6 +4615,144 @@ func (e *Executor) collectJoinOnConditions(te sqlparser.TableExpr, nodes *[]sqlp
 	}
 }
 
+// expandMergeViewInInnerSelect rewrites the given inner SELECT by inlining a single
+// merge view referenced as a top-level table in its FROM clause, but ONLY when the
+// view body's WHERE clause contains a subquery. This is the case where the existing
+// resolveViewToBaseTable / SIMPLE-flattening path can't surface the body's nested
+// subquery into the outer semijoin chain — the view ends up as an opaque MATERIALIZED
+// row in EXPLAIN even though MySQL inlines the merge view and produces additional
+// SIMPLE rows for the body's tables.
+//
+// Simple views like `CREATE VIEW v AS SELECT * FROM t` (no subquery in WHERE) are
+// NOT expanded here: those are already handled correctly by the existing flow, which
+// produces a SIMPLE row at id=1 with the view name as the table label.
+//
+// The rewrite preserves the alias used by the inner SELECT, substitutes the view's
+// underlying base table in FROM, and ANDs the view body's WHERE into the inner
+// SELECT's WHERE. Returns the rewritten SELECT, or nil if no expansion was performed.
+func (e *Executor) expandMergeViewInInnerSelect(inner *sqlparser.Select) *sqlparser.Select {
+	if inner == nil || len(inner.From) == 0 {
+		return nil
+	}
+	// Bail if the FROM clause contains anything other than top-level
+	// AliasedTableExpr nodes (JOINs, derived subqueries, parenthesized exprs).
+	for _, te := range inner.From {
+		if _, ok := te.(*sqlparser.AliasedTableExpr); !ok {
+			return nil
+		}
+	}
+	// Find the first merge view in FROM whose body has a subquery in WHERE.
+	var ate *sqlparser.AliasedTableExpr
+	var ateIdx int
+	var viewName string
+	for i, te := range inner.From {
+		ateCand := te.(*sqlparser.AliasedTableExpr)
+		tn, ok := ateCand.Expr.(sqlparser.TableName)
+		if !ok {
+			continue
+		}
+		name := tn.Name.String()
+		if name == "" {
+			continue
+		}
+		if e.isViewNonMerge(name) {
+			continue
+		}
+		if _, _, isView := e.lookupView(name); !isView {
+			continue
+		}
+		ate = ateCand
+		ateIdx = i
+		viewName = name
+		break
+	}
+	if ate == nil {
+		return nil
+	}
+	viewSQL, _, ok := e.lookupView(viewName)
+	if !ok {
+		return nil
+	}
+	stmt, err := e.parser().Parse(viewSQL)
+	if err != nil {
+		return nil
+	}
+	body, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return nil
+	}
+	// Only handle simple mergeable shape: single base TableName in FROM, no JOIN,
+	// no DISTINCT/GROUP BY/HAVING/LIMIT/ORDER BY, no aggregate in SELECT.
+	if body.Distinct || body.Limit != nil || (body.GroupBy != nil && len(body.GroupBy.Exprs) > 0) ||
+		body.Having != nil || len(body.OrderBy) > 0 {
+		return nil
+	}
+	if len(body.From) != 1 {
+		return nil
+	}
+	bodyAte, ok := body.From[0].(*sqlparser.AliasedTableExpr)
+	if !ok {
+		return nil
+	}
+	bodyTN, ok := bodyAte.Expr.(sqlparser.TableName)
+	if !ok {
+		return nil
+	}
+	// Reject if the view body's base name is itself a non-merge view; treating
+	// it as opaque is safer.
+	if e.isViewNonMerge(bodyTN.Name.String()) {
+		return nil
+	}
+	// Gate: only expand when the body's WHERE contains a subquery. Without this
+	// gate, simple SELECT-* views regress because the existing flow produces
+	// the view name as a SIMPLE row at id=1.
+	if body.Where == nil || !exprHasSubquery(body.Where.Expr) {
+		return nil
+	}
+	// Reject aggregate in SELECT exprs.
+	if body.SelectExprs != nil {
+		for _, sexpr := range body.SelectExprs.Exprs {
+			if ae, ok := sexpr.(*sqlparser.AliasedExpr); ok {
+				if containsAggregate(ae.Expr) {
+					return nil
+				}
+			}
+		}
+	}
+	// Build rewritten FROM: substitute base table for the view, preserving the
+	// alias used by the inner SELECT or the view body (or fall back to the view
+	// name so that the body's WHERE references like `a.col` still resolve when
+	// the view body aliased its single FROM table as `a`).
+	newAte := &sqlparser.AliasedTableExpr{
+		Expr:       bodyTN,
+		Partitions: ate.Partitions,
+		As:         ate.As,
+		Hints:      ate.Hints,
+		Columns:    ate.Columns,
+	}
+	if newAte.As.IsEmpty() {
+		if !bodyAte.As.IsEmpty() {
+			newAte.As = bodyAte.As
+		} else {
+			newAte.As = sqlparser.NewIdentifierCS(viewName)
+		}
+	}
+	rewritten := sqlparser.CloneRefOfSelect(inner)
+	rewritten.From = append([]sqlparser.TableExpr(nil), inner.From...)
+	rewritten.From[ateIdx] = newAte
+	if body.Where != nil && body.Where.Expr != nil {
+		if rewritten.Where == nil {
+			rewritten.Where = &sqlparser.Where{Type: sqlparser.WhereClause, Expr: body.Where.Expr}
+		} else {
+			rewritten.Where = &sqlparser.Where{
+				Type: sqlparser.WhereClause,
+				Expr: &sqlparser.AndExpr{Left: rewritten.Where.Expr, Right: body.Where.Expr},
+			}
+		}
+	}
+	return rewritten
+}
+
 // walkForSubqueries walks a node tree to find subqueries (not descending into FROM).
 // outerCanSemijoin indicates whether the outer SELECT can use semijoin flattening.
 // When false, IN subqueries become SUBQUERY (not MATERIALIZED) since MATERIALIZED
@@ -4742,6 +4880,16 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 				}
 				*result = append(*result, unionRows...)
 			case *sqlparser.Select:
+				// Inline-expand a merge view referenced in the IN-subquery's FROM clause
+				// when its body contains a subquery in WHERE. This lets the body's tables
+				// (and the body's nested IN-subquery) participate in the outer semijoin
+				// chain, instead of the view being rendered as an opaque MATERIALIZED row.
+				// MySQL's optimizer folds merge views the same way before semijoin /
+				// materialization decisions are made.
+				if expanded := e.expandMergeViewInInnerSelect(inner); expanded != nil {
+					inner = expanded
+					sub.Select = expanded
+				}
 				selectType := "SUBQUERY"
 				// Check if the inner SELECT has a NO_SEMIJOIN optimizer hint.
 				// When NO_SEMIJOIN is present, MySQL uses the EXISTS strategy (DEPENDENT SUBQUERY),
