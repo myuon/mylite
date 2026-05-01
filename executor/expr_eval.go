@@ -8213,9 +8213,20 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 		if errL == nil && errR == nil {
 			return false, nil
 		}
-		// ENUM values compared with integers: do not coerce via string→0 rule.
-		_, leftIsEnum := left.(EnumValue)
-		_, rightIsEnum := right.(EnumValue)
+		// ENUM values compared with integers: MySQL compares using the ENUM's
+		// 1-based index (so q1 = 1 matches the first enum element).
+		leftEnum, leftIsEnum := left.(EnumValue)
+		rightEnum, rightIsEnum := right.(EnumValue)
+		if leftIsEnum && errR == nil && isNativeNumericType(right) {
+			if leftEnum.Index > 0 {
+				return float64(leftEnum.Index) == fr, nil
+			}
+		}
+		if rightIsEnum && errL == nil && isNativeNumericType(left) {
+			if rightEnum.Index > 0 {
+				return fl == float64(rightEnum.Index), nil
+			}
+		}
 		// MySQL type coercion: when one operand is a DATE/TIME-like string
 		// and the other is a native integer, convert the integer to DATE/TIME
 		// format for comparison (e.g., 19830907 → "1983-09-07", 000400 → "00:04:00").
@@ -8387,8 +8398,19 @@ func compareValues(left, right interface{}, op sqlparser.ComparisonExprOperator)
 		if errL == nil && errR == nil {
 			return true, nil
 		}
-		_, leftIsEnum := left.(EnumValue)
-		_, rightIsEnum := right.(EnumValue)
+		leftEnum, leftIsEnum := left.(EnumValue)
+		rightEnum, rightIsEnum := right.(EnumValue)
+		// ENUM compared with integer uses the ENUM's 1-based index.
+		if leftIsEnum && errR == nil && isNativeNumericType(right) {
+			if leftEnum.Index > 0 {
+				return float64(leftEnum.Index) != fr, nil
+			}
+		}
+		if rightIsEnum && errL == nil && isNativeNumericType(left) {
+			if rightEnum.Index > 0 {
+				return fl != float64(rightEnum.Index), nil
+			}
+		}
 		// MySQL type coercion: when one operand is a native numeric type
 		// and the other is a non-numeric string, try DATE/TIME coercion first.
 		if errL == nil && errR != nil && isNativeNumericType(left) {

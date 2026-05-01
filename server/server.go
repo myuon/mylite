@@ -494,7 +494,7 @@ func normalizeRows(rows [][]interface{}) [][]interface{} {
 			} else if ar, ok := val.(executor.AvgResult); ok {
 				rows[i][j] = ar.String()
 			} else if ev, ok := val.(executor.EnumValue); ok {
-				rows[i][j] = string(ev)
+				rows[i][j] = ev.Value
 			} else if hb, ok := val.(executor.HexBytes); ok {
 				// HexBytes stores hex-encoded data (e.g. "31" for x'31').
 				// Decode to raw bytes for the wire protocol.

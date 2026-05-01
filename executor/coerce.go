@@ -1140,9 +1140,9 @@ func implicitZeroValue(colType string) interface{} {
 		inner := colType[5 : len(colType)-1]
 		vals := splitEnumValues(inner)
 		if len(vals) > 0 {
-			return EnumValue(strings.Trim(vals[0], "'"))
+			return EnumValue{Value: strings.Trim(vals[0], "'"), Index: 1}
 		}
-		return EnumValue("")
+		return EnumValue{Value: "", Index: 0}
 	}
 	// Default for string types (including SET which defaults to empty)
 	return ""
@@ -2921,10 +2921,10 @@ func validateEnumSetValue(colType string, v interface{}) interface{} {
 			// ENUM: index 1..N maps to the Nth element; index 0 = empty string (valid).
 			// Out-of-range indices are left as int64 for the INSERT path to reject.
 			if iv == 0 {
-				return EnumValue("")
+				return EnumValue{Value: "", Index: 0}
 			}
 			if iv >= 1 && int(iv) <= len(allowed) {
-				return EnumValue(allowed[iv-1])
+				return EnumValue{Value: allowed[iv-1], Index: int(iv)}
 			}
 			// Out of range: leave as int64 for strict mode to handle
 			return v
@@ -2961,24 +2961,24 @@ func validateEnumSetValue(colType string, v interface{}) interface{} {
 	}
 	if isEnum {
 		if s == "" {
-			return EnumValue(s)
+			return EnumValue{Value: "", Index: 0}
 		}
 		// Check if the string is a numeric index (stored as string representation of int)
 		if idx, err := strconv.ParseInt(s, 10, 64); err == nil {
 			if idx == 0 {
-				return EnumValue("")
+				return EnumValue{Value: "", Index: 0}
 			}
 			if idx >= 1 && int(idx) <= len(allowed) {
-				return EnumValue(allowed[idx-1])
+				return EnumValue{Value: allowed[idx-1], Index: int(idx)}
 			}
-			return EnumValue("")
+			return EnumValue{Value: "", Index: 0}
 		}
-		for _, a := range allowed {
+		for i, a := range allowed {
 			if strings.EqualFold(s, a) {
-				return EnumValue(a)
+				return EnumValue{Value: a, Index: i + 1}
 			}
 		}
-		return EnumValue("")
+		return EnumValue{Value: "", Index: 0}
 	}
 	// SET validation
 	if s == "" {

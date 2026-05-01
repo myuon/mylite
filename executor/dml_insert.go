@@ -2155,7 +2155,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						sv, isStr := rv.(string)
 						if !isStr {
 							if ev, isEnum := rv.(EnumValue); isEnum {
-								sv = string(ev)
+								sv = ev.Value
 								isStr = true
 							}
 						}
@@ -2165,7 +2165,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 								if os, ok3 := ov.(string); ok3 {
 									origStr = os
 								} else if oev, ok3 := ov.(EnumValue); ok3 {
-									origStr = string(oev)
+									origStr = oev.Value
 								}
 							}
 							// ENUM: empty string is invalid unless '' is explicitly in the allowed list
