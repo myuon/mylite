@@ -7133,6 +7133,67 @@ func (e *Executor) evalHaving(expr sqlparser.Expr, havingRow storage.Row, groupR
 	return e.evalWhere(expr, enrichedRow)
 }
 
+// findUnknownColInTupleForIN walks the LHS expressions of an IN/ANY/ALL
+// predicate looking for bare ColName references that resolve to neither the
+// current row nor any correlated outer row. If found, it returns a
+// MySQL-compatible "Unknown column 'X' in 'IN/ALL/ANY subquery'" error so
+// callers can report it BEFORE the column-count mismatch error fires.
+//
+// MySQL resolves names during query preparation, so an unknown column in the
+// IN's LHS is reported before the column-count mismatch between LHS and
+// subquery. We mirror that ordering by checking the tuple here.
+//
+// Only unqualified ColName references are checked. Qualified references
+// (table.col) require deeper schema context that this lightweight pass
+// intentionally avoids.
+func (e *Executor) findUnknownColInTupleForIN(exprs []sqlparser.Expr, row storage.Row) error {
+	for _, ex := range exprs {
+		col, ok := ex.(*sqlparser.ColName)
+		if !ok {
+			continue
+		}
+		if !col.Qualifier.IsEmpty() {
+			continue
+		}
+		name := col.Name.String()
+		if row != nil {
+			if _, found := row[name]; found {
+				continue
+			}
+			upper := strings.ToUpper(name)
+			matched := false
+			for k := range row {
+				if strings.ToUpper(k) == upper {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				continue
+			}
+		}
+		// Check correlatedRow (outer query columns)
+		if e.correlatedRow != nil {
+			if _, found := e.correlatedRow[name]; found {
+				continue
+			}
+			upper := strings.ToUpper(name)
+			outerMatched := false
+			for k := range e.correlatedRow {
+				if strings.ToUpper(k) == upper {
+					outerMatched = true
+					break
+				}
+			}
+			if outerMatched {
+				continue
+			}
+		}
+		return mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'IN/ALL/ANY subquery'", name))
+	}
+	return nil
+}
+
 // evalWhere evaluates a WHERE predicate against a row.
 func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error) {
 	switch v := expr.(type) {
@@ -7147,6 +7208,13 @@ func (e *Executor) evalWhere(expr sqlparser.Expr, row storage.Row) (bool, error)
 				}
 				// Check if left side is a tuple: (a,b) IN (SELECT x,y FROM ...)
 				if leftTuple, ok := v.Left.(sqlparser.ValTuple); ok {
+					// MySQL resolves names during query preparation, so an
+					// unresolved column on the LHS surfaces as
+					// "Unknown column 'X' in 'IN/ALL/ANY subquery'" before any
+					// row evaluation. Mirror that ordering.
+					if colErr := e.findUnknownColInTupleForIN([]sqlparser.Expr(leftTuple), row); colErr != nil {
+						return false, colErr
+					}
 					result, err := e.execSubquery(sub, row)
 					if err != nil {
 						return false, err
