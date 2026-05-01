@@ -1017,6 +1017,12 @@ func (ctx *execContext) executeLines(lines []string) error {
 		inDoubleQuote := false  // track if we're inside a double-quoted string literal
 		inBlockComment := false // track if we're inside a /* ... */ block comment
 		inStringLiteral := false // combined: true when inside either quote type
+		// prevLineEndedWithQuote: tracks whether the previous line's last
+		// non-whitespace character was a closing quote ('"', "'", or '`').
+		// MySQL's mysqltest preserves leading whitespace on a line when the
+		// previous line ended with a closed quoted string literal (see
+		// convert_to_format_v1 in client/mysqltest.cc — `last_c_was_quote`).
+		prevLineEndedWithQuote := false
 		for i < len(lines) {
 			l := lines[i]
 			t := strings.TrimSpace(l)
@@ -1036,10 +1042,12 @@ func (ctx *execContext) executeLines(lines []string) error {
 			}
 
 			// For echoing: if inside a string literal, preserve leading whitespace.
-			// Otherwise, trim leading whitespace (mysqltest behavior).
+			// Also preserve leading whitespace when the previous line ended with
+			// a closed quote (mysqltest convert_to_format_v1 last_c_was_quote behavior).
+			// Otherwise, trim leading whitespace (mysqltest default behavior).
 			var rawEcho string
 			stmtLine := t
-			if inStringLiteral {
+			if inStringLiteral || prevLineEndedWithQuote {
 				rawEcho = stripCommentAfterDelimiter(strings.TrimRight(l, " \t\r\n"), delim)
 				stmtLine = strings.TrimRight(l, " \t\r\n")
 			} else {
@@ -1111,6 +1119,17 @@ func (ctx *execContext) executeLines(lines []string) error {
 				}
 			}
 			inStringLiteral = inSingleQuote || inDoubleQuote
+			// Update prevLineEndedWithQuote for the NEXT iteration:
+			// true iff the line's last non-whitespace character is a closing
+			// quote (not currently inside an open quote). MySQL preserves
+			// leading whitespace on a line when this is set.
+			lineForCheck := strings.TrimRight(l, " \t\r\n")
+			if !inStringLiteral && len(lineForCheck) > 0 {
+				lastCh := lineForCheck[len(lineForCheck)-1]
+				prevLineEndedWithQuote = lastCh == '\'' || lastCh == '"' || lastCh == '`'
+			} else {
+				prevLineEndedWithQuote = false
+			}
 			// Strip inline comments (# outside quotes) for SQL processing
 			if !inStringLiteral {
 				t = stripInlineComment(t)
