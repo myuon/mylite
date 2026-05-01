@@ -119,6 +119,11 @@ type PartitionDef struct {
 	MinRows           *int
 	Engine            string   // e.g. "InnoDB"
 	SubPartitionNames []string // names of subpartitions within this partition (if subpartitioned)
+	// InstantColsOverride, when non-nil, overrides the table-level InstantCols
+	// when reporting information_schema.innodb_tables. Used for partial-rebuild
+	// operations like REORGANIZE PARTITION which reset instant_cols only on the
+	// reorganized partitions while leaving the others intact.
+	InstantColsOverride *int
 }
 
 // ColType returns the type string for a column by name (case-insensitive).

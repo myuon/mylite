@@ -1326,18 +1326,18 @@ func (e *Executor) infoSchemaInnoDBTables() []storage.Row {
 				displayedTableID = tableID + int64(def.RebuildSeq)*10000
 			}
 			if def != nil && def.PartitionType != "" {
-				partNames := innodbPartitionNames(def)
-				for _, partName := range partNames {
+				partEntries := innodbPartitionEntries(def, instantCols)
+				for _, pe := range partEntries {
 					rows = append(rows, storage.Row{
 						"TABLE_ID":      displayedTableID,
-						"NAME":          prefix + "#p#" + partName,
+						"NAME":          prefix + "#p#" + pe.name,
 						"SPACE":         space,
 						"FLAG":          flag,
 						"N_COLS":        nCols,
 						"ROW_FORMAT":    rowFmt,
 						"ZIP_PAGE_SIZE": zipPageSize,
 						"SPACE_TYPE":    "Single",
-						"INSTANT_COLS":  instantCols,
+						"INSTANT_COLS":  pe.instantCols,
 					})
 					tableID++
 					if def != nil && def.RebuildSeq != 0 {
@@ -1393,6 +1393,50 @@ func innodbPartitionNames(def *catalogPkg.TableDef) []string {
 		}
 	}
 	return names
+}
+
+// partitionEntry pairs a partition name suffix with its effective instant_cols.
+type partitionEntry struct {
+	name        string
+	instantCols int64
+}
+
+// innodbPartitionEntries returns each partition's name suffix paired with its
+// effective INSTANT_COLS value. Per-partition InstantColsOverride takes
+// precedence; otherwise the table-level default is used. This lets partial
+// rebuild operations (REORGANIZE PARTITION) reset instant_cols only on the
+// rebuilt partitions while leaving siblings untouched.
+func innodbPartitionEntries(def *catalogPkg.TableDef, defaultInstantCols int64) []partitionEntry {
+	var entries []partitionEntry
+	if len(def.PartitionDefs) > 0 {
+		for _, pd := range def.PartitionDefs {
+			ic := defaultInstantCols
+			if pd.InstantColsOverride != nil {
+				ic = int64(*pd.InstantColsOverride)
+			}
+			if len(pd.SubPartitionNames) > 0 {
+				for _, sp := range pd.SubPartitionNames {
+					entries = append(entries, partitionEntry{
+						name:        strings.ToLower(pd.Name) + "#sp#" + strings.ToLower(sp),
+						instantCols: ic,
+					})
+				}
+			} else {
+				entries = append(entries, partitionEntry{
+					name:        strings.ToLower(pd.Name),
+					instantCols: ic,
+				})
+			}
+		}
+	} else if def.PartitionCount > 0 {
+		for i := 0; i < def.PartitionCount; i++ {
+			entries = append(entries, partitionEntry{
+				name:        fmt.Sprintf("p%d", i),
+				instantCols: defaultInstantCols,
+			})
+		}
+	}
+	return entries
 }
 
 // infoSchemaInnoDBIndexes returns rows for information_schema.INNODB_INDEXES.
