@@ -3060,6 +3060,16 @@ func (e *Executor) shouldUseDuplicateWeedout(inner *sqlparser.Select) bool {
 	if !selectWhereHasINSubquery(inner) {
 		return false
 	}
+	// Bug#12603183 / non-equi LEFT JOIN inside nested IN: when the nested IN's
+	// FROM has a LEFT JOIN whose ON clause is purely non-equality
+	// (e.g. ON (a > b)), MySQL's optimizer prefers MATERIALIZED over
+	// DuplicateWeedout because the LEFT JOIN preserves rows independently of
+	// the ON predicate, making duplicate elimination by SQL_BIG_RESULT-style
+	// temporary tables more expensive than materializing the entire inner
+	// result set.
+	if nestedINSubqueryHasNonEquiLeftJoin(inner) {
+		return false
+	}
 	// When the duplicateweedout switch is enabled, keep the original behaviour:
 	// flatten any nested IN subquery chain into id=1 SIMPLE rows.
 	if e.isOptimizerSwitchEnabled("duplicateweedout") {
@@ -3318,6 +3328,112 @@ func countTablesInTableExpr(te sqlparser.TableExpr) int {
 		return n
 	}
 	return 0
+}
+
+// joinExprHasNonEquiLeftJoin returns true if the table expression contains
+// a LEFT JOIN whose ON clause contains no equality condition between columns.
+// Examples:
+//
+//	t1 LEFT JOIN t2 ON (t1.a > t2.b)         → true (only inequality)
+//	t1 LEFT JOIN t2 ON (t1.a = t2.b)         → false
+//	t1 LEFT JOIN t2 ON (t1.a = t2.b AND ...) → false
+//
+// MySQL prefers MATERIALIZED over DuplicateWeedout when the nested IN's
+// inner subquery has such a non-equi LEFT JOIN, because DuplicateWeedout
+// would have to enumerate all preserved rows from the cartesian-ish output.
+func joinExprHasNonEquiLeftJoin(te sqlparser.TableExpr) bool {
+	jte, ok := te.(*sqlparser.JoinTableExpr)
+	if !ok {
+		if pte, isParen := te.(*sqlparser.ParenTableExpr); isParen {
+			for _, sub := range pte.Exprs {
+				if joinExprHasNonEquiLeftJoin(sub) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	// Recurse first; an inner level may already have a non-equi LEFT JOIN.
+	if joinExprHasNonEquiLeftJoin(jte.LeftExpr) {
+		return true
+	}
+	if joinExprHasNonEquiLeftJoin(jte.RightExpr) {
+		return true
+	}
+	if jte.Join == sqlparser.LeftJoinType || jte.Join == sqlparser.NaturalLeftJoinType {
+		// Check the ON condition: if no equality between two ColNames, it's
+		// considered non-equi.
+		if jte.Condition.On == nil {
+			// USING / NATURAL: implicit equality → equi.
+			return false
+		}
+		if !exprHasColEqColEquality(jte.Condition.On) {
+			return true
+		}
+	}
+	return false
+}
+
+// exprHasColEqColEquality returns true if the expression contains at least one
+// column-to-column equality (ColName = ColName), traversing AND/OR boundaries.
+func exprHasColEqColEquality(expr sqlparser.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	switch e := expr.(type) {
+	case *sqlparser.ComparisonExpr:
+		if e.Operator == sqlparser.EqualOp {
+			_, lOK := e.Left.(*sqlparser.ColName)
+			_, rOK := e.Right.(*sqlparser.ColName)
+			if lOK && rOK {
+				return true
+			}
+		}
+	case *sqlparser.AndExpr:
+		return exprHasColEqColEquality(e.Left) || exprHasColEqColEquality(e.Right)
+	case *sqlparser.OrExpr:
+		// OR-branches: only count if BOTH sides have equality (otherwise the
+		// OR can produce non-matching rows). Conservatively require all.
+		return exprHasColEqColEquality(e.Left) && exprHasColEqColEquality(e.Right)
+	}
+	return false
+}
+
+// nestedINSubqueryHasNonEquiLeftJoin returns true if any nested IN subquery
+// (recursively walking inner.Where) has a FROM clause whose JOIN tree contains
+// a LEFT JOIN with a non-equi ON condition. See joinExprHasNonEquiLeftJoin.
+func nestedINSubqueryHasNonEquiLeftJoin(inner *sqlparser.Select) bool {
+	if inner == nil || inner.Where == nil {
+		return false
+	}
+	found := false
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if found {
+			return false, nil
+		}
+		if cmp, ok := n.(*sqlparser.ComparisonExpr); ok {
+			if cmp.Operator == sqlparser.InOp {
+				if sub, ok := cmp.Right.(*sqlparser.Subquery); ok {
+					if nestedSel, ok := sub.Select.(*sqlparser.Select); ok {
+						for _, te := range nestedSel.From {
+							if joinExprHasNonEquiLeftJoin(te) {
+								found = true
+								return false, nil
+							}
+						}
+						// Recurse deeper through nested IN chain.
+						if nestedINSubqueryHasNonEquiLeftJoin(nestedSel) {
+							found = true
+							return false, nil
+						}
+					}
+					return false, nil
+				}
+			}
+		}
+		return true, nil
+	}, inner.Where)
+	return found
 }
 
 // shouldMaterializeSubquery returns true if an IN subquery should use the MATERIALIZED strategy.
