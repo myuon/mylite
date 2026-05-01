@@ -4595,6 +4595,18 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				// present. Once an INSTANT add at a mid-position has been applied
 				// to the table (InstantCols > 0), subsequent mid-position adds
 				// fall back to a copy/rebuild.
+				// Detect tables with FULLTEXT indexes; INSTANT cannot be used
+				// when the table contains a FULLTEXT index, so the ADD COLUMN
+				// must rebuild the table.
+				tableHasFulltext := false
+				if tableDef0, _ := db.GetTable(tableName); tableDef0 != nil {
+					for _, idx := range tableDef0.Indexes {
+						if strings.EqualFold(idx.Type, "FULLTEXT") {
+							tableHasFulltext = true
+							break
+						}
+					}
+				}
 				if !alterIsInplace {
 					instantEligible := !colDef.PrimaryKey
 					if instantEligible {
@@ -4617,6 +4629,11 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 							if tableDef0, _ := db.GetTable(tableName); tableDef0 != nil && tableDef0.InstantCols != 0 {
 								instantEligible = false
 							}
+						}
+						// Tables with a FULLTEXT index cannot use INSTANT for
+						// ADD COLUMN; MySQL falls back to a rebuild.
+						if tableHasFulltext {
+							instantEligible = false
 						}
 					}
 					if instantEligible {
@@ -4651,7 +4668,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 							}
 							tableDef.InstantCols = n
 						}
-					} else if position != "" || alterHasNonAddOp || alterHasForce || alterIsInplace {
+					} else if position != "" || alterHasNonAddOp || alterHasForce || alterIsInplace || tableHasFulltext {
 						// Non-instant add (mid-position with prior INSTANTs, multi-op
 						// ALTER, FORCE keyword, or ALGORITHM=INPLACE): rebuild.
 						if tableDef.InstantCols != 0 {
