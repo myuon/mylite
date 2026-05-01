@@ -486,6 +486,28 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 			}
 		}
 
+		// Record undo entries (in ascending original-index order) for transaction rollback.
+		if e.inTransaction && len(deleteSet) > 0 {
+			delIdxOrder := make([]int, 0, len(deleteSet))
+			for idx := range deleteSet {
+				delIdxOrder = append(delIdxOrder, idx)
+			}
+			sort.Ints(delIdxOrder)
+			// Compute rowIndex relative to the surviving rows so that reverse replay
+			// inserts back into the correct position. After all deletes, the run-time
+			// rowIndex of the i-th deleted row (in ascending original order) equals
+			// origIdx - (number of earlier deletes) = origIdx - i.
+			for i, origIdx := range delIdxOrder {
+				row := tbl.Rows[origIdx]
+				e.txnUndoLog = append(e.txnUndoLog, undoEntry{
+					op:       "DELETE",
+					db:       deleteDB,
+					table:    tableName,
+					rowIndex: origIdx - i,
+					oldRow:   storage.CloneRow(row),
+				})
+			}
+		}
 		newRows := make([]storage.Row, 0, len(tbl.Rows)-len(deleteSet))
 		for i, row := range tbl.Rows {
 			if !deleteSet[i] {
@@ -604,9 +626,11 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		// Use pointer identity: storage.Row is a map, so we compare the map header.
 		newRows := make([]storage.Row, 0, len(tbl.Rows))
 		rowRemoved := false
-		for _, r := range tbl.Rows {
+		removedAt := -1
+		for idx, r := range tbl.Rows {
 			if !rowRemoved && rowPtrEqual(r, row) {
 				rowRemoved = true
+				removedAt = idx
 				continue
 			}
 			newRows = append(newRows, r)
@@ -614,6 +638,16 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		tbl.Rows = newRows
 		tbl.InvalidateIndexes()
 		affected++
+		// Record undo entry for transaction rollback.
+		if e.inTransaction && rowRemoved {
+			e.txnUndoLog = append(e.txnUndoLog, undoEntry{
+				op:       "DELETE",
+				db:       deleteDB,
+				table:    tableName,
+				rowIndex: removedAt,
+				oldRow:   storage.CloneRow(row),
+			})
+		}
 
 		// Fire AFTER DELETE trigger immediately after removing this row.
 		// This matches MySQL semantics: AFTER DELETE sees the row already gone.

@@ -920,6 +920,16 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		matchedRows++
 		if rowChanged {
 			affected++
+			// Record undo entry for transaction rollback.
+			if e.inTransaction {
+				e.txnUndoLog = append(e.txnUndoLog, undoEntry{
+					op:       "UPDATE",
+					db:       updateDB,
+					table:    tableName,
+					rowIndex: i,
+					oldRow:   storage.CloneRow(oldRow),
+				})
+			}
 			// Apply ON UPDATE CURRENT_TIMESTAMP for columns not explicitly set
 			for _, col := range tbl.Def.Columns {
 				if col.OnUpdateCurrentTimestamp {
