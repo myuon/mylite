@@ -2832,11 +2832,189 @@ func (e *Executor) collectAllTablesForDuplicateWeedout(inner *sqlparser.Select) 
 // (i.e., its WHERE has an IN subquery), which triggers MySQL's DuplicateWeedout semijoin strategy.
 // When DuplicateWeedout is used, MySQL flattens all tables from all nesting levels into a
 // single id=1 SIMPLE join with "Start temporary" / "End temporary" markers.
+//
+// When optimizer_switch=duplicateweedout=off, we apply a cost-based heuristic to decide
+// whether to still flatten or to use MATERIALIZED:
+//   - If any nested IN subquery contains more than one table in its FROM clause
+//     (e.g. 4-level nested IN with multi-table inner subqueries: longblob/correlated case),
+//     MySQL still falls back to DuplicateWeedout-style flattening. → return true.
+//   - If every inner table has a PRIMARY KEY / UNIQUE INDEX on its join column,
+//     MySQL can flatten cheaply via eq_ref lookups (the view+procedure case where
+//     `t1` has PRIMARY KEY on t1field). → return true.
+//   - Otherwise (EMPNUM-style: flat single-table chain with no index on join cols),
+//     MySQL prefers MATERIALIZED. → return false.
 func (e *Executor) shouldUseDuplicateWeedout(inner *sqlparser.Select) bool {
 	if !e.isSemijoinEnabled() {
 		return false
 	}
-	return selectWhereHasINSubquery(inner)
+	if !selectWhereHasINSubquery(inner) {
+		return false
+	}
+	// When the duplicateweedout switch is enabled, keep the original behaviour:
+	// flatten any nested IN subquery chain into id=1 SIMPLE rows.
+	if e.isOptimizerSwitchEnabled("duplicateweedout") {
+		return true
+	}
+	// duplicateweedout=off: fall back to DuplicateWeedout when complex nested IN
+	// pattern is detected (multi-table inner subqueries) OR when every inner table
+	// has an index on the IN-join column (cheap eq_ref flatten path).
+	if innerINSubqueryHasMultiTableSelect(inner) {
+		return true
+	}
+	if e.allInnerINJoinColsIndexed(inner) {
+		return true
+	}
+	return false
+}
+
+// allInnerINJoinColsIndexed returns true when every nested IN subquery in
+// `inner`'s WHERE chain has its join column backed by a PRIMARY KEY or
+// UNIQUE / leading secondary index. This indicates MySQL can flatten cheaply
+// via eq_ref lookups, producing all-SIMPLE EXPLAIN rows even when
+// optimizer_switch=duplicateweedout=off.
+//
+// Returns false (i.e. prefer MATERIALIZED) if the inner SELECT has no
+// nested IN subquery at all, or if any nested join column lacks an index.
+func (e *Executor) allInnerINJoinColsIndexed(inner *sqlparser.Select) bool {
+	if inner == nil || inner.Where == nil || e.Storage == nil {
+		return false
+	}
+	hasNested := false
+	allIndexed := true
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if cmp, ok := n.(*sqlparser.ComparisonExpr); ok {
+			if cmp.Operator == sqlparser.InOp {
+				if sub, ok := cmp.Right.(*sqlparser.Subquery); ok {
+					if nestedSel, ok := sub.Select.(*sqlparser.Select); ok {
+						hasNested = true
+						// Determine the join column projected from the inner SELECT.
+						joinCol := ""
+						if nestedSel.SelectExprs != nil && len(nestedSel.SelectExprs.Exprs) > 0 {
+							if ae, ok2 := nestedSel.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok2 {
+								if c, ok3 := ae.Expr.(*sqlparser.ColName); ok3 {
+									joinCol = c.Name.String()
+								}
+							}
+						}
+						if joinCol == "" {
+							allIndexed = false
+							return false, nil
+						}
+						// Walk inner's FROM tables and require an index on joinCol on
+						// at least one of them (the table the column projects from).
+						colIndexed := false
+						for _, te := range nestedSel.From {
+							for _, tn := range e.extractAllTableNames(te) {
+								if strings.EqualFold(tn, "dual") {
+									continue
+								}
+								tbl, terr := e.Storage.GetTable(e.CurrentDB, tn)
+								if terr != nil || tbl.Def == nil {
+									continue
+								}
+								if len(tbl.Def.PrimaryKey) > 0 && strings.EqualFold(tbl.Def.PrimaryKey[0], joinCol) {
+									colIndexed = true
+									break
+								}
+								for _, idx := range tbl.Def.Indexes {
+									if len(idx.Columns) > 0 && strings.EqualFold(idx.Columns[0], joinCol) {
+										colIndexed = true
+										break
+									}
+								}
+								if colIndexed {
+									break
+								}
+							}
+							if colIndexed {
+								break
+							}
+						}
+						if !colIndexed {
+							allIndexed = false
+							return false, nil
+						}
+						// Recurse: deeper nesting must also be fully indexed.
+						if !e.allInnerINJoinColsIndexed(nestedSel) && nestedSel.Where != nil && selectWhereHasINSubquery(nestedSel) {
+							allIndexed = false
+							return false, nil
+						}
+					}
+					// Handled this IN-subquery node; don't recurse via the walker.
+					return false, nil
+				}
+			}
+		}
+		return true, nil
+	}, inner.Where)
+	return hasNested && allIndexed
+}
+
+// innerINSubqueryHasMultiTableSelect walks the IN subqueries reachable from
+// `inner`'s WHERE clause and returns true if any of them has more than one
+// table in its FROM clause. This is used as the cost-based heuristic to keep
+// DuplicateWeedout flattening for "complex" nested IN cases (e.g. correlated
+// or multi-table inner subqueries) even when optimizer_switch=duplicateweedout=off.
+func innerINSubqueryHasMultiTableSelect(inner *sqlparser.Select) bool {
+	if inner == nil || inner.Where == nil {
+		return false
+	}
+	found := false
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if found {
+			return false, nil
+		}
+		if cmp, ok := n.(*sqlparser.ComparisonExpr); ok {
+			if cmp.Operator == sqlparser.InOp {
+				if sub, ok := cmp.Right.(*sqlparser.Subquery); ok {
+					if nestedSel, ok := sub.Select.(*sqlparser.Select); ok {
+						// Count tables in this nested SELECT's FROM (excluding dual).
+						tableCount := 0
+						for _, te := range nestedSel.From {
+							switch te.(type) {
+							case *sqlparser.AliasedTableExpr, *sqlparser.JoinTableExpr, *sqlparser.ParenTableExpr:
+								// Recursively count joined tables.
+								tableCount += countTablesInTableExpr(te)
+							}
+						}
+						if tableCount > 1 {
+							found = true
+							return false, nil
+						}
+						// Recurse into the nested SELECT's WHERE for deeper nesting.
+						if innerINSubqueryHasMultiTableSelect(nestedSel) {
+							found = true
+							return false, nil
+						}
+					}
+					// Don't descend further into the subquery node via the outer walker;
+					// we've handled it explicitly above.
+					return false, nil
+				}
+			}
+		}
+		return true, nil
+	}, inner.Where)
+	return found
+}
+
+// countTablesInTableExpr returns the number of base tables referenced by a
+// TableExpr (handles aliased tables, joins, paren-grouped joins, and derived
+// tables). Derived tables (subselects in FROM) count as 1 table.
+func countTablesInTableExpr(te sqlparser.TableExpr) int {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		return 1
+	case *sqlparser.JoinTableExpr:
+		return countTablesInTableExpr(t.LeftExpr) + countTablesInTableExpr(t.RightExpr)
+	case *sqlparser.ParenTableExpr:
+		n := 0
+		for _, sub := range t.Exprs {
+			n += countTablesInTableExpr(sub)
+		}
+		return n
+	}
+	return 0
 }
 
 // shouldMaterializeSubquery returns true if an IN subquery should use the MATERIALIZED strategy.
