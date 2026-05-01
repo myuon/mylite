@@ -643,6 +643,137 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 							}
 						}
 					}
+					// Post-process: secondary IN subqueries whose inner table has a
+					// multi-column PRIMARY KEY where the first column matches the
+					// inner SELECT's projected join column AND the remaining PK
+					// columns are pinned to constants by the inner WHERE → MySQL
+					// converts that inner-table SIMPLE row to eq_ref on PRIMARY,
+					// with ref = "<subqueryN>.<firstINInnerCol>, const, ...".
+					// Example: t2.Code IN (SELECT Country FROM t3 WHERE Language='English' ...)
+					// where t3 has PRIMARY KEY (Country, Language). t3 should become eq_ref.
+					if len(placeholders) > 0 && e.Storage != nil {
+						inDescriptors := collectTopLevelINSubqueries(e, s)
+						if len(inDescriptors) >= 2 {
+							subqueryRef := fmt.Sprintf("%v", placeholders[0].table)
+							// The first IN's innerCol is the materialized projection column.
+							firstInnerCol := inDescriptors[0].innerCol
+							for k := 1; k < len(inDescriptors); k++ {
+								desc := inDescriptors[k]
+								if desc.innerTable == "" || desc.innerCol == "" {
+									continue
+								}
+								// Skip if this inner table was actually materialized
+								// (would already appear as MATERIALIZED row).
+								wasMaterialized := false
+								for _, mr := range materializedRows {
+									if mr.table != nil &&
+										strings.EqualFold(fmt.Sprintf("%v", mr.table), desc.innerTable) {
+										wasMaterialized = true
+										break
+									}
+								}
+								if wasMaterialized {
+									continue
+								}
+								tbl, err := e.Storage.GetTable(e.CurrentDB, desc.innerTable)
+								if err != nil || tbl == nil || tbl.Def == nil {
+									continue
+								}
+								// Need a multi-column PK
+								if len(tbl.Def.PrimaryKey) < 2 {
+									continue
+								}
+								// First PK col must match inner projection col
+								if !strings.EqualFold(tbl.Def.PrimaryKey[0], desc.innerCol) {
+									continue
+								}
+								// Remaining PK cols must be pinned to constants in inner WHERE
+								constCols := constEqualityColsInWhere(desc.innerWhere, desc.innerTable)
+								allPinned := true
+								for _, pkCol := range tbl.Def.PrimaryKey[1:] {
+									if !constCols[strings.ToLower(pkCol)] {
+										allPinned = false
+										break
+									}
+								}
+								if !allPinned {
+									continue
+								}
+								// Find this table's SIMPLE row to convert.
+								for i, sr := range simpleRows {
+									if sr.table == nil {
+										continue
+									}
+									if !strings.EqualFold(fmt.Sprintf("%v", sr.table), desc.innerTable) {
+										continue
+									}
+									at := fmt.Sprintf("%v", sr.accessType)
+									if at == "eq_ref" || at == "const" || at == "ref" {
+										// Already a key-based access; leave it alone.
+										break
+									}
+									// Build PRIMARY key length sum.
+									pkKeyLen := 0
+									for _, pkCol := range tbl.Def.PrimaryKey {
+										if cd := findColumnDef(tbl.Def, pkCol); cd != nil {
+											pkKeyLen += explainKeyLen(cd, tbl.Def.Charset)
+										}
+									}
+									// Build possible_keys: PRIMARY + indexes whose first column
+									// is referenced in the inner WHERE for this table.
+									possibleKeys := "PRIMARY"
+									seen := map[string]bool{"primary": true}
+									innerRefCols := map[string]bool{}
+									innerRefCols[strings.ToLower(desc.innerCol)] = true
+									if desc.innerWhere != nil {
+										_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+											if c2, ok := n.(*sqlparser.ColName); ok {
+												q := c2.Qualifier.Name.String()
+												if q == "" || strings.EqualFold(q, desc.innerTable) {
+													innerRefCols[strings.ToLower(c2.Name.String())] = true
+												}
+											}
+											return true, nil
+										}, desc.innerWhere)
+									}
+									for _, idx := range tbl.Def.Indexes {
+										if len(idx.Columns) == 0 {
+											continue
+										}
+										lname := strings.ToLower(idx.Name)
+										if seen[lname] {
+											continue
+										}
+										if innerRefCols[strings.ToLower(idx.Columns[0])] {
+											possibleKeys += "," + idx.Name
+											seen[lname] = true
+										}
+									}
+									// Build ref string: <subqueryN>.<firstInnerCol> + const for each
+									// remaining PK column.
+									refStr := subqueryRef + "." + firstInnerCol
+									for range tbl.Def.PrimaryKey[1:] {
+										refStr += ",const"
+									}
+									simpleRows[i].accessType = "eq_ref"
+									simpleRows[i].possibleKeys = possibleKeys
+									simpleRows[i].key = "PRIMARY"
+									simpleRows[i].keyLen = fmt.Sprintf("%d", pkKeyLen)
+									simpleRows[i].ref = refStr
+									simpleRows[i].rows = int64(1)
+									// Preserve filtered if set; default to 100.00.
+									if simpleRows[i].filtered == nil {
+										simpleRows[i].filtered = "100.00"
+									}
+									// Extra: MySQL emits "Using where" because the constant
+									// equality predicates and any range filters become attached
+									// conditions on the eq_ref lookup.
+									simpleRows[i].extra = "Using where"
+									break
+								}
+							}
+						}
+					}
 					// Apply derived table merging for the SIMPLE <derivedN> rows:
 					// When a SIMPLE row has table "<derivedN>" and there's a corresponding DERIVED row,
 					// replace <derivedN> with the DERIVED row's base table and drop the DERIVED row.
@@ -3321,6 +3452,142 @@ func extractINInnerColFromExpr(expr sqlparser.Expr) string {
 		return extractINInnerColFromExpr(e.Right)
 	}
 	return ""
+}
+
+// inSubqueryDescriptor captures the salient info about one "outerCol IN (SELECT innerCol FROM innerTable WHERE ...)"
+// expression at top level of a WHERE clause. innerTable is set only when the IN subquery has a
+// single non-DUAL table in FROM. innerWhere is the inner SELECT's WHERE expression (may be nil).
+type inSubqueryDescriptor struct {
+	outerCol     string
+	outerTable   string
+	innerCol     string
+	innerTable   string
+	innerWhere   sqlparser.Expr
+}
+
+// collectTopLevelINSubqueries walks the conjunction of WHERE and returns one descriptor
+// per top-level "col IN (SELECT col FROM single_table ...)" condition. Tuple-IN and
+// nested-OR cases are skipped.
+func collectTopLevelINSubqueries(e *Executor, sel *sqlparser.Select) []inSubqueryDescriptor {
+	if sel == nil || sel.Where == nil {
+		return nil
+	}
+	var out []inSubqueryDescriptor
+	var walk func(expr sqlparser.Expr)
+	walk = func(expr sqlparser.Expr) {
+		if expr == nil {
+			return
+		}
+		switch ex := expr.(type) {
+		case *sqlparser.AndExpr:
+			walk(ex.Left)
+			walk(ex.Right)
+		case *sqlparser.ComparisonExpr:
+			if ex.Operator != sqlparser.InOp {
+				return
+			}
+			col, ok := ex.Left.(*sqlparser.ColName)
+			if !ok {
+				return
+			}
+			sub, ok := ex.Right.(*sqlparser.Subquery)
+			if !ok {
+				return
+			}
+			innerSel, ok := sub.Select.(*sqlparser.Select)
+			if !ok {
+				return
+			}
+			// Inner projection column
+			innerColName := ""
+			if innerSel.SelectExprs != nil && len(innerSel.SelectExprs.Exprs) > 0 {
+				if ae, ok := innerSel.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok {
+					if !ae.As.IsEmpty() {
+						innerColName = ae.As.String()
+					} else if c2, ok := ae.Expr.(*sqlparser.ColName); ok {
+						innerColName = c2.Name.String()
+					}
+				}
+			}
+			// Inner FROM: require single non-DUAL real table
+			var innerTbls []string
+			if e != nil {
+				for _, te := range innerSel.From {
+					for _, tn := range e.extractAllTableNames(te) {
+						if !strings.EqualFold(tn, "dual") {
+							innerTbls = append(innerTbls, tn)
+						}
+					}
+				}
+			}
+			innerTblName := ""
+			if len(innerTbls) == 1 {
+				innerTblName = innerTbls[0]
+			}
+			var innerWhere sqlparser.Expr
+			if innerSel.Where != nil {
+				innerWhere = innerSel.Where.Expr
+			}
+			out = append(out, inSubqueryDescriptor{
+				outerCol:   col.Name.String(),
+				outerTable: col.Qualifier.Name.String(),
+				innerCol:   innerColName,
+				innerTable: innerTblName,
+				innerWhere: innerWhere,
+			})
+		}
+	}
+	walk(sel.Where.Expr)
+	return out
+}
+
+// constEqualityColsInWhere returns lower-cased column names that appear in
+// equality conditions against a constant (or SQL literal) value in a top-level
+// AND-chain of `expr`. Only columns belonging to `tableName` (or with no
+// qualifier) are reported. The set is used to determine which key parts of a
+// multi-column primary key are pinned to constants.
+func constEqualityColsInWhere(expr sqlparser.Expr, tableName string) map[string]bool {
+	out := map[string]bool{}
+	var walk func(e sqlparser.Expr)
+	walk = func(e sqlparser.Expr) {
+		if e == nil {
+			return
+		}
+		switch x := e.(type) {
+		case *sqlparser.AndExpr:
+			walk(x.Left)
+			walk(x.Right)
+		case *sqlparser.ComparisonExpr:
+			if x.Operator != sqlparser.EqualOp {
+				return
+			}
+			// Look for col = <literal>
+			isLiteral := func(node sqlparser.Expr) bool {
+				switch node.(type) {
+				case *sqlparser.Literal:
+					return true
+				case *sqlparser.NullVal:
+					return true
+				case sqlparser.BoolVal:
+					return true
+				}
+				return false
+			}
+			if col, ok := x.Left.(*sqlparser.ColName); ok && isLiteral(x.Right) {
+				q := col.Qualifier.Name.String()
+				if q == "" || strings.EqualFold(q, tableName) {
+					out[strings.ToLower(col.Name.String())] = true
+				}
+			} else if col, ok := x.Right.(*sqlparser.ColName); ok && isLiteral(x.Left) {
+				q := col.Qualifier.Name.String()
+				if q == "" || strings.EqualFold(q, tableName) {
+					out[strings.ToLower(col.Name.String())] = true
+				}
+			}
+		}
+	}
+	walk(expr)
+	return out
 }
 
 // matTypeClass returns the "materialization type class" for a MySQL column type.
