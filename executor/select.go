@@ -2378,6 +2378,14 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		}
 	}
 
+	// Engage the optimizer's index access path (issue #263) when the
+	// SELECT meets the narrow set of guard conditions. The returned
+	// closure restores any prior spec / gate state when execSelect
+	// returns, so nested subquery executions stay isolated.
+	if restoreIA := e.installIndexAccessSpecForSelect(stmt); restoreIA != nil {
+		defer restoreIA()
+	}
+
 	allRows, err := e.buildFromExpr(stmt.From[0])
 	if err != nil {
 		return nil, err
