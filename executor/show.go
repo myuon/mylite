@@ -1,12 +1,14 @@
 package executor
 
 import (
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
@@ -2185,6 +2187,12 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 			// MySQL SHOW CREATE TABLE quotes default values
 			if defVal == "NULL" || defVal == "null" {
 				parts = append(parts, "DEFAULT NULL")
+			} else if formatted, ok := formatBitTypeDefault(col.Type, defVal); ok {
+				// BIT(N) DEFAULT b'...' is shown unquoted as b'...'
+				parts = append(parts, fmt.Sprintf("DEFAULT %s", formatted))
+			} else if formatted, ok := formatBinaryHexDefault(col.Type, defVal); ok {
+				// BINARY(N)/VARBINARY(N) DEFAULT 0x... is shown as a quoted byte string
+				parts = append(parts, fmt.Sprintf("DEFAULT %s", formatted))
 			} else if strings.HasPrefix(defVal, "'") {
 				// Already quoted - pad BINARY default values.
 				if padLen := binaryPadLength(col.Type); padLen > 0 {
@@ -3173,4 +3181,110 @@ func (e *Executor) showCreateTrigger(triggerName string) (*Result, error) {
 		Rows:        [][]interface{}{{tr.Name, sqlMode, createSQL, "utf8mb4", "utf8mb4_0900_ai_ci", dbColl, nil}},
 		IsResultSet: true,
 	}, nil
+}
+
+// formatBitTypeDefault formats a BIT(N) column default for SHOW CREATE TABLE.
+// MySQL renders BIT defaults using the b'...' literal syntax (unquoted).
+// Returns the formatted string and true if the column is BIT and the default
+// can be rendered as b'...'; otherwise returns "" and false.
+func formatBitTypeDefault(colType, defVal string) (string, bool) {
+	lower := strings.ToLower(strings.TrimSpace(colType))
+	if !strings.HasPrefix(lower, "bit(") && lower != "bit" {
+		return "", false
+	}
+	// Default could be "0b101010", "b'101010'", or a numeric value like "42".
+	bits := ""
+	switch {
+	case strings.HasPrefix(defVal, "0b") || strings.HasPrefix(defVal, "0B"):
+		bits = defVal[2:]
+		for _, r := range bits {
+			if r != '0' && r != '1' {
+				return "", false
+			}
+		}
+	case (strings.HasPrefix(defVal, "b'") || strings.HasPrefix(defVal, "B'")) && strings.HasSuffix(defVal, "'"):
+		bits = defVal[2 : len(defVal)-1]
+		for _, r := range bits {
+			if r != '0' && r != '1' {
+				return "", false
+			}
+		}
+	default:
+		return "", false
+	}
+	return "b'" + bits + "'", true
+}
+
+// formatBinaryHexDefault formats a BINARY(N)/VARBINARY(N) column default that was
+// supplied as a hex literal (0x...) for SHOW CREATE TABLE.
+// MySQL decodes the hex literal to bytes, pads BINARY(N) defaults to the column
+// width with NULs, and shows the bytes as a quoted string with escapes for
+// non-printable characters (e.g. NUL becomes \0). High-bit bytes that are not
+// valid UTF-8 are rendered as '?' to match MySQL's client output for non-utf8
+// bytes.
+// Returns the formatted DEFAULT clause body (including quotes) and true on
+// success; otherwise returns "" and false.
+func formatBinaryHexDefault(colType, defVal string) (string, bool) {
+	lower := strings.ToLower(strings.TrimSpace(colType))
+	isBinary := strings.HasPrefix(lower, "binary(") && !strings.HasPrefix(lower, "varbinary")
+	isVarBinary := strings.HasPrefix(lower, "varbinary(")
+	if !isBinary && !isVarBinary {
+		return "", false
+	}
+	if !(strings.HasPrefix(defVal, "0x") || strings.HasPrefix(defVal, "0X")) {
+		return "", false
+	}
+	hexStr := defVal[2:]
+	// Pad odd-length hex with a leading 0 (MySQL pads to whole bytes).
+	if len(hexStr)%2 != 0 {
+		hexStr = "0" + hexStr
+	}
+	raw, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return "", false
+	}
+	// Pad BINARY(N) to the declared width with NULs.
+	if isBinary {
+		if padLen := binaryPadLength(colType); padLen > 0 && len(raw) < padLen {
+			raw = append(raw, make([]byte, padLen-len(raw))...)
+		}
+	}
+	return "'" + escapeBytesForDefault(raw) + "'", true
+}
+
+// escapeBytesForDefault escapes a byte slice for MySQL's SHOW CREATE TABLE
+// rendering of a binary default. NUL becomes "\0", backslash becomes "\\",
+// single-quote becomes "''" (SQL doubled), and high-bit bytes that don't form
+// valid UTF-8 are rendered as '?'. All other bytes are emitted as-is.
+func escapeBytesForDefault(raw []byte) string {
+	var b strings.Builder
+	i := 0
+	for i < len(raw) {
+		c := raw[i]
+		switch {
+		case c == 0x00:
+			b.WriteString(`\0`)
+			i++
+		case c == '\\':
+			b.WriteString(`\\`)
+			i++
+		case c == '\'':
+			b.WriteString(`''`)
+			i++
+		case c < 0x80:
+			b.WriteByte(c)
+			i++
+		default:
+			// High-bit byte: try to decode as UTF-8.
+			r, size := utf8.DecodeRune(raw[i:])
+			if r == utf8.RuneError && size <= 1 {
+				b.WriteByte('?')
+				i++
+			} else {
+				b.Write(raw[i : i+size])
+				i += size
+			}
+		}
+	}
+	return b.String()
 }
