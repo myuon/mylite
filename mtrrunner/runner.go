@@ -1545,21 +1545,38 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 				// For eval: trim leading whitespace, remove trailing semicolon preserving any
 				// trailing space before it (e.g. "ENGINE=INNODB ;" echoes as "ENGINE=INNODB ;").
 				args = strings.TrimLeft(args, " \t\r\n")
-				// Strip trailing newlines but not trailing spaces (preserve "word ;"-style spacing)
-				args = strings.TrimRight(args, "\r\n")
+				// Detect whether the original directive ended with `;` on its own line
+				// (i.e. args has a trailing newline because the bare-directive collector
+				// stripped a `;` that lived on its own line). In that case mysqltest
+				// preserves the source line break so the synthesized `;` lands on its own
+				// line in the echoed output, sometimes with a blank line ahead of it
+				// when the substituted variable also contributed a trailing newline.
+				preserveTrailingNL := strings.HasSuffix(args, "\n")
 				// Strip trailing whitespace that appears AFTER a semicolon
 				// (e.g. "EXPLAIN ... colA < 256;   " left after comment stripping → "EXPLAIN ... colA < 256;")
 				// but NOT spaces before the semicolon (e.g. "ENGINE=INNODB ;" should preserve the space).
-				if strings.HasSuffix(strings.TrimRight(args, " \t"), ";") {
-					args = strings.TrimRight(args, " \t")
+				if strings.HasSuffix(strings.TrimRight(args, " \t\r\n"), ";") {
+					args = strings.TrimRight(args, " \t\r\n")
+				} else if !preserveTrailingNL {
+					// No trailing `;` and no trailing newline marker: strip trailing
+					// newlines to mirror prior behaviour for single-line eval.
+					args = strings.TrimRight(args, "\r\n")
 				}
 				// Strip only semicolons at the end (any trailing space before ';' was preserved)
 				args = strings.TrimSuffix(args, ";")
 				// In eval context, undefined variables expand to empty string
 				args = ctx.substituteVars(args)
 				args = stripUndefinedVars(args)
-				// Trim only trailing newlines (not spaces) to preserve trailing " " before ";"
-				args = strings.TrimRight(args, "\r\n")
+				if !preserveTrailingNL {
+					// Trim only trailing newlines (not spaces) to preserve trailing " " before ";"
+					args = strings.TrimRight(args, "\r\n")
+				} else if !strings.HasSuffix(args, "\n") {
+					// When the source had `;` on its own line, ensure args still ends with
+					// at least one newline so executeSQL's appended `;` lands on a separate
+					// line. The substituted variable value may have already contributed a
+					// trailing newline (producing the blank line that mysqltest emits).
+					args = args + "\n"
+				}
 			} else {
 				args = strings.TrimSpace(args)
 				args = strings.TrimSuffix(args, ";")
