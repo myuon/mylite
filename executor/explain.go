@@ -194,6 +194,14 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 							r.selectType = "SUBQUERY"
 							simpleRows = append(simpleRows, r)
 							hasNestedSubquery = true
+						} else if r.selectType == "NESTED_DEPENDENT_SUBQUERY" {
+							// Same as NESTED_SUBQUERY, but the original row was a
+							// DEPENDENT SUBQUERY (correlated) — restore that distinction
+							// so MySQL's "DEPENDENT SUBQUERY" select_type label is preserved
+							// rather than collapsed to plain SUBQUERY.
+							r.selectType = "DEPENDENT SUBQUERY"
+							simpleRows = append(simpleRows, r)
+							hasNestedSubquery = true
 						} else if r.selectType != "SIMPLE" {
 							// Non-SIMPLE, non-MATERIALIZED, non-DERIVED rows (e.g. DEPENDENT SUBQUERY for EXISTS)
 							// become id=1, SIMPLE (anti-join / FirstMatch strategy)
@@ -6222,17 +6230,32 @@ func (e *Executor) explainSubqueries(sel *sqlparser.Select, idCounter *int64, re
 		e.walkForSubqueries(node, idCounter, result, outerTables, outerCanSemijoin, outerHasOnlyDerived, sel, outerST)
 		// MySQL displays DEPENDENT SUBQUERY rows from the WHERE clause in reverse order
 		// (higher ids first) because it processes them in reverse during optimization.
-		// Reverse the newly-added rows if they are all DEPENDENT SUBQUERY.
+		// Reverse the newly-added rows if they are all DEPENDENT SUBQUERY, or — when
+		// processing the body of an IN-subquery (outerST == "DEPENDENT SUBQUERY")
+		// whose WHERE has multiple direct subqueries — when at least one of the
+		// nested rows is DEPENDENT SUBQUERY and the rest are plain SUBQUERY.
+		// MySQL emits the DEPENDENT (correlated) block first, then the cacheable
+		// SUBQUERY block.  This covers queries such as
+		//   t1.a IN (SELECT c FROM t2 WHERE (SELECT e FROM t3) < SOME(SELECT e FROM t3 WHERE t1.b))
+		// where the SOME subquery (DEPENDENT SUBQUERY) appears before the scalar
+		// SUBQUERY in MySQL's EXPLAIN output.
 		newRows := (*result)[startIdx:]
 		if len(newRows) > 1 {
 			allDependent := true
+			allSubqueryFamily := true
+			anyDependent := false
 			for _, r := range newRows {
 				if r.selectType != "DEPENDENT SUBQUERY" {
 					allDependent = false
-					break
+				}
+				if r.selectType == "DEPENDENT SUBQUERY" {
+					anyDependent = true
+				}
+				if r.selectType != "DEPENDENT SUBQUERY" && r.selectType != "SUBQUERY" {
+					allSubqueryFamily = false
 				}
 			}
-			if allDependent {
+			if allDependent || (outerST == "DEPENDENT SUBQUERY" && allSubqueryFamily && anyDependent) {
 				for i, j := 0, len(newRows)-1; i < j; i, j = i+1, j-1 {
 					newRows[i], newRows[j] = newRows[j], newRows[i]
 				}
@@ -7155,7 +7178,20 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 					// transitively dependent (selectType = "DEPENDENT SUBQUERY" from the merged-level
 					// path above), MySQL merges its tables into the outer subquery's id level rather
 					// than creating a new subquery id. Use outerIDBeforeIncrement instead.
-					mergedDependent := selectType == "DEPENDENT SUBQUERY" && outerSelectTypeOuter == "DEPENDENT SUBQUERY" && inContext
+					//
+					// However, the merge must only happen when this Subquery is the FIRST nested
+					// subquery at the current level — i.e., outerIDBeforeIncrement still equals
+					// the parent IN-subquery's id (captured as outerQueryID at function entry).
+					// If a previous SIBLING subquery has already consumed an id slot at this
+					// level, outerIDBeforeIncrement points to that sibling, not the parent.
+					// In that case the nested IN deserves its own freshly allocated id, exactly
+					// like MySQL does for queries such as
+					//   t1.a IN (SELECT c FROM t2 WHERE (SELECT e FROM t3) < SOME(SELECT e FROM t3 WHERE t1.b))
+					// where MySQL emits id=4 DEPENDENT SUBQUERY t3 (the SOME subquery) and
+					// id=3 SUBQUERY t3 (the scalar subquery) as separate blocks instead of
+					// collapsing them onto the same id.
+					mergedDependent := selectType == "DEPENDENT SUBQUERY" && outerSelectTypeOuter == "DEPENDENT SUBQUERY" && inContext &&
+						outerIDBeforeIncrement == outerQueryID
 					// MATERIALIZED merge: when the parent context is itself MATERIALIZED and the
 					// nested IN subquery also chooses MATERIALIZED, MySQL absorbs the nested
 					// subquery's tables into the parent's MATERIALIZED block (same id),
@@ -7213,7 +7249,11 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 							}
 							if id, ok := subRows[i].id.(int64); ok {
 								if firstID, ok2 := subRows[0].id.(int64); !ok2 || id != firstID {
-									subRows[i].selectType = "NESTED_SUBQUERY"
+									if st == "DEPENDENT SUBQUERY" {
+										subRows[i].selectType = "NESTED_DEPENDENT_SUBQUERY"
+									} else {
+										subRows[i].selectType = "NESTED_SUBQUERY"
+									}
 								}
 							}
 						}
