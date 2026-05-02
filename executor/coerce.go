@@ -98,6 +98,18 @@ func coerceDateTimeValueWithSessionEx(colType string, v interface{}, sessionTime
 		if parsed != "" {
 			return parsed
 		}
+		// MySQL accepts ':' as a date delimiter when the value is being stored
+		// into a DATE/DATETIME column (e.g. INSERT INTO t (d DATE) VALUES ('97:02:03')
+		// is parsed as 1997-02-03). This is a DATE-context-only behaviour: outside
+		// of a DATE column, '97:02:03' would be parsed as a TIME value. Try again
+		// with colons replaced by dashes to handle this case.
+		if strings.Contains(s, ":") {
+			altered := strings.ReplaceAll(s, ":", "-")
+			parsed = parseMySQLDateValue(altered)
+			if parsed != "" {
+				return parsed
+			}
+		}
 		// Invalid date value -> zero date
 		return "0000-00-00"
 	case "TIME":
