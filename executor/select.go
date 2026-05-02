@@ -6991,8 +6991,13 @@ func (e *Executor) execRecursiveCTE(cteName string, subquery sqlparser.TableStat
 	// iterations are exhausted without the recursion terminating on its own.
 	// We detect this by checking whether the loop completed all maxDepth iterations
 	// AND the last working table was non-empty (i.e., recursion did not terminate).
+	// MySQL counts the iteration that triggered the abort, so the reported count is
+	// maxDepth + 1 (e.g. cte_max_recursion_depth=1000 reports "after 1001 iterations").
+	// When maxDepth=0, even a single recursive step is disallowed: the loop body never
+	// runs, but the anchor's working table is non-empty so the same condition fires
+	// and reports "after 1 iterations".
 	if depth == maxDepth && len(cteMap[cteName].rows) > 0 {
-		return nil, mysqlError(3636, "HY000", fmt.Sprintf("Recursive query aborted after %d iterations. Try increasing @@cte_max_recursion_depth to a larger value.", maxDepth))
+		return nil, mysqlError(3636, "HY000", fmt.Sprintf("Recursive query aborted after %d iterations. Try increasing @@cte_max_recursion_depth to a larger value.", maxDepth+1))
 	}
 
 	return &Result{
