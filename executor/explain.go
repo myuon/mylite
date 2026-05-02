@@ -2077,6 +2077,82 @@ func (e *Executor) tableExprHasSubquery(te sqlparser.TableExpr) bool {
 	return false
 }
 
+// isPureTwoTableCartesianFrom reports whether the FROM clause expresses a
+// pure two-table Cartesian product: a single NormalJoinType JoinTableExpr
+// (or NormalJoinType chain wrapped in ParenTableExpr) over two AliasedTableExprs
+// pointing at base tables, with no ON or USING condition and no STRAIGHT_JOIN
+// hint anywhere in the tree.
+//
+// We use this to decide whether MySQL's row-count-based join-order swap would
+// apply.  Stays deliberately narrow: any LEFT/RIGHT/STRAIGHT/NATURAL join,
+// non-empty JoinCondition, derived table, or third table makes us bail out.
+func (e *Executor) isPureTwoTableCartesianFrom(from sqlparser.TableExprs) bool {
+	if len(from) == 1 {
+		return e.isPureTwoTableCartesianExpr(from[0])
+	}
+	// Comma-separated FROM (legacy implicit cross join): "FROM t1, t2".
+	if len(from) == 2 {
+		return e.isPlainBaseTable(from[0]) && e.isPlainBaseTable(from[1])
+	}
+	return false
+}
+
+// isPureTwoTableCartesianExpr handles the recursive single-expression case.
+func (e *Executor) isPureTwoTableCartesianExpr(te sqlparser.TableExpr) bool {
+	switch t := te.(type) {
+	case *sqlparser.JoinTableExpr:
+		if t.Join != sqlparser.NormalJoinType {
+			return false
+		}
+		if t.Condition != nil && (t.Condition.On != nil || len(t.Condition.Using) > 0) {
+			return false
+		}
+		return e.isPlainBaseTable(t.LeftExpr) && e.isPlainBaseTable(t.RightExpr)
+	case *sqlparser.ParenTableExpr:
+		if len(t.Exprs) == 1 {
+			return e.isPureTwoTableCartesianExpr(t.Exprs[0])
+		}
+		if len(t.Exprs) == 2 {
+			return e.isPlainBaseTable(t.Exprs[0]) && e.isPlainBaseTable(t.Exprs[1])
+		}
+	}
+	return false
+}
+
+// isPlainBaseTable reports whether te is an AliasedTableExpr referring to a
+// real (non-derived, non-view-non-merge) table, with no STRAIGHT_JOIN-style
+// hint and no nested join structure.
+func (e *Executor) isPlainBaseTable(te sqlparser.TableExpr) bool {
+	at, ok := te.(*sqlparser.AliasedTableExpr)
+	if !ok {
+		return false
+	}
+	if _, ok := at.Expr.(*sqlparser.DerivedTable); ok {
+		return false
+	}
+	tn, ok := at.Expr.(sqlparser.TableName)
+	if !ok {
+		return false
+	}
+	if e.isViewNonMerge(tn.Name.String()) {
+		return false
+	}
+	return true
+}
+
+// explainGetRowCount returns the (non-negative) stored row count of tbl.
+// The bool reports whether the lookup succeeded.
+func (e *Executor) explainGetRowCount(tbl string) (int64, bool) {
+	if e.Storage == nil {
+		return 0, false
+	}
+	t, err := e.Storage.GetTable(e.CurrentDB, tbl)
+	if err != nil || t == nil {
+		return 0, false
+	}
+	return int64(len(t.Rows)), true
+}
+
 // tableExprHasStraightJoin returns true if any JoinTableExpr in the tree uses StraightJoinType.
 func (e *Executor) tableExprHasStraightJoin(te sqlparser.TableExpr) bool {
 	switch t := te.(type) {
@@ -2400,6 +2476,23 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 			}
 			allTableNames = append(drivers, inners...)
 			displayNames = append(driversDisp, innersDisp...)
+		}
+
+		// For a two-table pure Cartesian product (no ON / USING / WHERE / STRAIGHT_JOIN),
+		// MySQL's optimizer drives the join from the smaller table so the BNL inner
+		// loop iterates fewer times.  Swap to match when the second table is smaller.
+		// This is intentionally narrow: we only act when there is literally no
+		// predicate that ties the two tables together, leaving multi-table joins
+		// and any join with conditions in their FROM-clause order.
+		if len(allTableNames) == 2 && len(rangeCheckedTables) == 0 &&
+			sel.Where == nil && e.Storage != nil &&
+			e.isPureTwoTableCartesianFrom(sel.From) {
+			r0, ok0 := e.explainGetRowCount(allTableNames[0])
+			r1, ok1 := e.explainGetRowCount(allTableNames[1])
+			if ok0 && ok1 && r1 > 0 && r0 > 0 && r1 < r0 {
+				allTableNames[0], allTableNames[1] = allTableNames[1], allTableNames[0]
+				displayNames[0], displayNames[1] = displayNames[1], displayNames[0]
+			}
 		}
 
 		for idx, tblName := range allTableNames {
@@ -8476,24 +8569,87 @@ func (e *Executor) explainJSONUsedColumns(tableName string, query string) []stri
 	referencedCols := map[string]bool{}
 	hasStar := false
 	tableNameLower := strings.ToLower(tableName)
-	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
-		switch n := node.(type) {
-		case *sqlparser.ColName:
-			colName := strings.ToLower(n.Name.String())
-			qualifier := strings.ToLower(n.Qualifier.Name.String())
-			if qualifier == "" {
-				// Unqualified column: could belong to any table, include it
-				referencedCols[colName] = true
-			} else if qualifier == tableNameLower {
-				// Qualified with this table's name
-				referencedCols[colName] = true
-			}
-			// If qualified with a DIFFERENT table name, skip it for this table
-		case *sqlparser.StarExpr:
-			hasStar = true
+	// scope-aware walk: an unqualified column should only be attributed to
+	// tableName when the enclosing SELECT scope's FROM list contains tableName.
+	// A column qualified with tableName always applies (covers correlated refs).
+	// We pass the AST tree manually so we can track scope without losing
+	// ColName walks elsewhere.
+	var walkScoped func(node sqlparser.SQLNode, tableInScope bool)
+	walkScoped = func(node sqlparser.SQLNode, tableInScope bool) {
+		if node == nil {
+			return
 		}
-		return true, nil
-	}, stmt)
+		switch n := node.(type) {
+		case *sqlparser.Select:
+			selScope := tableInScope
+			for _, te := range n.From {
+				for _, tn := range e.extractAllTableNames(te) {
+					if strings.EqualFold(tn, tableName) {
+						selScope = true
+						break
+					}
+				}
+				if selScope {
+					break
+				}
+			}
+			// Visit children with the (possibly updated) scope flag.
+			_ = sqlparser.Walk(func(child sqlparser.SQLNode) (bool, error) {
+				switch c := child.(type) {
+				case *sqlparser.Select:
+					if c == n {
+						return true, nil
+					}
+					walkScoped(c, selScope)
+					return false, nil
+				case *sqlparser.Union:
+					walkScoped(c, selScope)
+					return false, nil
+				case *sqlparser.ColName:
+					colName := strings.ToLower(c.Name.String())
+					qualifier := strings.ToLower(c.Qualifier.Name.String())
+					if qualifier == tableNameLower && qualifier != "" {
+						referencedCols[colName] = true
+					} else if qualifier == "" && selScope {
+						referencedCols[colName] = true
+					}
+					return false, nil
+				case *sqlparser.StarExpr:
+					hasStar = true
+				}
+				return true, nil
+			}, n)
+		case *sqlparser.Union:
+			// UNION scope: each branch is independent.
+			walkScoped(n.Left, tableInScope)
+			walkScoped(n.Right, tableInScope)
+		default:
+			// Other nodes: pre-order walk, descending into sub-Selects/Unions.
+			_ = sqlparser.Walk(func(child sqlparser.SQLNode) (bool, error) {
+				switch c := child.(type) {
+				case *sqlparser.Select:
+					walkScoped(c, tableInScope)
+					return false, nil
+				case *sqlparser.Union:
+					walkScoped(c, tableInScope)
+					return false, nil
+				case *sqlparser.ColName:
+					colName := strings.ToLower(c.Name.String())
+					qualifier := strings.ToLower(c.Qualifier.Name.String())
+					if qualifier == tableNameLower && qualifier != "" {
+						referencedCols[colName] = true
+					} else if qualifier == "" && tableInScope {
+						referencedCols[colName] = true
+					}
+					return false, nil
+				case *sqlparser.StarExpr:
+					hasStar = true
+				}
+				return true, nil
+			}, n)
+		}
+	}
+	walkScoped(stmt, false)
 
 	// If SELECT *, return all columns — but only if the table is in the outer FROM clause.
 	// When the table is only referenced inside an IN subquery (not in the outer FROM),
@@ -8512,8 +8668,13 @@ func (e *Executor) explainJSONUsedColumns(tableName string, query string) []stri
 					break
 				}
 			}
+		} else if u, ok := stmt.(*sqlparser.Union); ok {
+			// UNION: walk each branch.  A `*` in branch B applies to tableName
+			// only when B's FROM contains tableName.  This matches MySQL, where
+			// each UNION branch is planned independently.
+			outerTableInFrom = e.unionBranchHasStarOverTable(u, tableName)
 		} else {
-			// Not a simple SELECT (e.g. UNION): conservative fallback
+			// Other compound statement types: conservative fallback
 			outerTableInFrom = true
 		}
 		if outerTableInFrom {
@@ -8560,6 +8721,58 @@ func (e *Executor) explainJSONUsedColumns(tableName string, query string) []stri
 	// If no columns matched, return nil (no used_columns for this table).
 	// This is correct for joined tables with no column references (e.g., t2 in a cross join).
 	return result
+}
+
+// unionBranchHasStarOverTable reports whether some UNION branch (Select)
+// reachable from u contains a `*` AND its own FROM clause references tableName.
+// A `*` in another branch should not pull in columns of a table that branch does
+// not query.
+func (e *Executor) unionBranchHasStarOverTable(u *sqlparser.Union, tableName string) bool {
+	if u == nil {
+		return false
+	}
+	check := func(node sqlparser.TableStatement) bool {
+		switch s := node.(type) {
+		case *sqlparser.Select:
+			hasStar := false
+			if s.SelectExprs != nil {
+				for _, expr := range s.SelectExprs.Exprs {
+					if _, ok := expr.(*sqlparser.StarExpr); ok {
+						hasStar = true
+						break
+					}
+				}
+			}
+			if !hasStar {
+				return false
+			}
+			for _, te := range s.From {
+				for _, tn := range e.extractAllTableNames(te) {
+					if strings.EqualFold(tn, tableName) {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+	if check(u.Left) {
+		return true
+	}
+	if leftU, ok := u.Left.(*sqlparser.Union); ok {
+		if e.unionBranchHasStarOverTable(leftU, tableName) {
+			return true
+		}
+	}
+	if check(u.Right) {
+		return true
+	}
+	if rightU, ok := u.Right.(*sqlparser.Union); ok {
+		if e.unionBranchHasStarOverTable(rightU, tableName) {
+			return true
+		}
+	}
+	return false
 }
 
 // explainJSONStarReachesTable reports whether some SELECT inside `stmt` has a
