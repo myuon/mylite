@@ -12132,7 +12132,11 @@ func (e *Executor) explainJSONDocument(query string) string {
 								{"query_block", qb},
 							})
 						} else {
-							attachedSubs = append(attachedSubs, qb)
+							attachedSubs = append(attachedSubs, []orderedKV{
+								{"dependent", false},
+								{"cacheable", true},
+								{"query_block", qb},
+							})
 						}
 					}
 				}
@@ -12219,6 +12223,54 @@ func (e *Executor) explainJSONDocument(query string) string {
 					}
 					queryBlock = append(queryBlock, orderedKV{"ordering_operation", orderingOp})
 					subqueryRows = residualSubs
+				} else if len(primaryRows) > 1 && isFirstmatchEnabled {
+					// Multi-primary semijoin (FirstMatch) with subqueries:
+					// MySQL emits a nested_loop wrapping all primary tables
+					// (the first-match driver + subsequent semijoin inner tables),
+					// not a single `table`.  The first table's block already has
+					// attached_condition / attached_subqueries injected above; we
+					// add it as the first nested_loop entry, then build the rest
+					// with first_match annotation.
+					var nl []interface{}
+					nl = append(nl, []orderedKV{{"table", tblBlock}})
+					firstTableName := ""
+					if primaryRows[0].row[2] != nil {
+						firstTableName = fmt.Sprintf("%v", primaryRows[0].row[2])
+					}
+					conds := semijoinAttachedConditions()
+					for _, pr := range primaryRows[1:] {
+						innerTbl := e.explainJSONTableBlock(pr.row, query)
+						accessType := ""
+						if pr.row[4] != nil {
+							accessType = fmt.Sprintf("%v", pr.row[4])
+						}
+						insertPos := len(innerTbl)
+						for i, kv := range innerTbl {
+							if kv.Key == "filtered" {
+								insertPos = i + 1
+								break
+							}
+						}
+						newBlock := make([]orderedKV, 0, len(innerTbl)+2)
+						newBlock = append(newBlock, innerTbl[:insertPos]...)
+						newBlock = append(newBlock, orderedKV{"first_match", firstTableName})
+						if accessType == "ALL" {
+							alreadyHas := false
+							for _, kv := range innerTbl {
+								if kv.Key == "using_join_buffer" {
+									alreadyHas = true
+									break
+								}
+							}
+							if !alreadyHas {
+								newBlock = append(newBlock, orderedKV{"using_join_buffer", "Block Nested Loop"})
+							}
+						}
+						newBlock = append(newBlock, innerTbl[insertPos:]...)
+						newBlock = appendAttachedCondition(newBlock, conds)
+						nl = append(nl, []orderedKV{{"table", newBlock}})
+					}
+					queryBlock = append(queryBlock, orderedKV{"nested_loop", nl})
 				} else {
 					queryBlock = append(queryBlock, orderedKV{"table", tblBlock})
 				}
