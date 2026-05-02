@@ -3851,6 +3851,116 @@ func extractExplicitStringAlias(raw string) (string, bool) {
 	return "", false
 }
 
+// extractUnionLeftRaw returns the raw text of the LEFT side of a top-level
+// UNION/INTERSECT/EXCEPT expression in the given query. It tracks string
+// literals, identifier-quoted backticks, line and block comments, and
+// parenthesis nesting so that only top-level UNION/INTERSECT/EXCEPT keywords
+// are matched. Returns "" if no top-level UNION-like keyword is found.
+//
+// This is used to preserve original alias quoting (e.g. AS "") that is lost
+// when reconstructing a query from the Vitess AST: vitess sets
+// AliasedExpr.As.IsEmpty()==true for an explicit empty alias, so
+// sqlparser.String() drops the alias entirely.
+func extractUnionLeftRaw(query string) string {
+	q := strings.TrimSpace(query)
+	if q == "" {
+		return ""
+	}
+	upper := strings.ToUpper(q)
+	depth := 0
+	i := 0
+	for i < len(q) {
+		c := q[i]
+		switch c {
+		case '\'', '"':
+			// Skip string literal
+			quote := c
+			i++
+			for i < len(q) {
+				if q[i] == '\\' && i+1 < len(q) {
+					i += 2
+					continue
+				}
+				if q[i] == quote {
+					if i+1 < len(q) && q[i+1] == quote {
+						// Doubled quote = escaped quote
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		case '`':
+			// Skip backtick-quoted identifier
+			i++
+			for i < len(q) && q[i] != '`' {
+				i++
+			}
+			if i < len(q) {
+				i++
+			}
+			continue
+		case '/':
+			if i+1 < len(q) && q[i+1] == '*' {
+				// Skip block comment
+				i += 2
+				for i+1 < len(q) {
+					if q[i] == '*' && q[i+1] == '/' {
+						i += 2
+						break
+					}
+					i++
+				}
+				continue
+			}
+		case '-':
+			if i+2 < len(q) && q[i+1] == '-' && (q[i+2] == ' ' || q[i+2] == '\t' || q[i+2] == '\n') {
+				// Line comment
+				for i < len(q) && q[i] != '\n' {
+					i++
+				}
+				continue
+			}
+		case '#':
+			// MySQL line comment
+			for i < len(q) && q[i] != '\n' {
+				i++
+			}
+			continue
+		case '(':
+			depth++
+			i++
+			continue
+		case ')':
+			depth--
+			i++
+			continue
+		}
+		// Match top-level UNION/INTERSECT/EXCEPT keyword: must be at
+		// word boundary (preceded and followed by whitespace or punctuation).
+		if depth == 0 {
+			for _, kw := range []string{"UNION", "INTERSECT", "EXCEPT"} {
+				if i+len(kw) <= len(upper) &&
+					(i == 0 || isWordBoundary(upper[i-1])) &&
+					upper[i:i+len(kw)] == kw &&
+					(i+len(kw) >= len(upper) || isWordBoundary(upper[i+len(kw)])) {
+					return strings.TrimSpace(q[:i])
+				}
+			}
+		}
+		i++
+	}
+	return ""
+}
+
+func isWordBoundary(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+		c == '(' || c == ')' || c == ';' || c == ','
+}
+
 func extractRawSelectExprs(query string) []string {
 	q := strings.TrimSpace(query)
 	lq := strings.ToLower(q)

@@ -41,4 +41,19 @@ func TestEmptyStringAlias(t *testing.T) {
 	if res2.Columns[0] != "" {
 		t.Errorf("expected empty column name for AS '', got %q", res2.Columns[0])
 	}
+
+	// Test SELECT @var AS "" UNION SELECT ...
+	// Vitess reconstructs the left side from AST, which loses the explicit AS "".
+	// Verify that the column name is still preserved as empty.
+	res3, err3 := e.Execute(`SELECT @utf8_message AS "" UNION SELECT REPEAT('-', 80)`)
+	if err3 != nil {
+		t.Fatalf("select3: %v", err3)
+	}
+	t.Logf("Columns for AS \"\" UNION ...: %v", res3.Columns)
+	if len(res3.Columns) == 0 {
+		t.Fatal("no columns3")
+	}
+	if res3.Columns[0] != "" {
+		t.Errorf("expected empty column name for AS \"\" UNION, got %q", res3.Columns[0])
+	}
 }

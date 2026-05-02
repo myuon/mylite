@@ -6390,8 +6390,16 @@ func (e *Executor) execUnion(stmt *sqlparser.Union) (*Result, error) {
 	// Execute left side directly from AST so nested UNION semantics stay intact.
 	// Temporarily override currentQuery with just the left side's SQL so that
 	// column name extraction (extractRawSelectExprs) doesn't see the UNION clause.
+	// Prefer the original raw left text (extracted from the saved currentQuery)
+	// over reconstructing from AST: AST reconstruction loses information such as
+	// `AS ""` (Vitess treats empty alias as IsEmpty()=true), and we rely on the
+	// raw query text to recover explicit empty aliases for correct column names.
 	savedCurrentQueryForUnion := e.currentQuery
-	e.currentQuery = sqlparser.String(stmt.Left)
+	if leftRaw := extractUnionLeftRaw(savedCurrentQueryForUnion); leftRaw != "" {
+		e.currentQuery = leftRaw
+	} else {
+		e.currentQuery = sqlparser.String(stmt.Left)
+	}
 	leftResult, err := e.execTableStmtForUnion(stmt.Left)
 	e.currentQuery = savedCurrentQueryForUnion
 	if err != nil {
