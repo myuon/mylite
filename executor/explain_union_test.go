@@ -129,3 +129,60 @@ func TestExplain_UnionAll_JSON(t *testing.T) {
 		t.Errorf("expected nested_loop for JOIN branch; got:\n%s", jsonStr)
 	}
 }
+
+// TestExplain_CrossJoin_SmallerTableDrives_JSON: for a pure two-table
+// Cartesian product with no ON/WHERE, MySQL drives the join from the smaller
+// table.  In our fixture t1 has 7 rows, t2 has 2 rows; the JSON nested_loop
+// must list t2 first (outer driver) and t1 second with using_join_buffer:BNL.
+func TestExplain_CrossJoin_SmallerTableDrives_JSON(t *testing.T) {
+	e := newUnionExec(t)
+	res, err := e.Execute(`EXPLAIN FORMAT=JSON (SELECT t1.i FROM t1 JOIN t2) UNION ALL (SELECT * FROM t3 WHERE i IN (SELECT i FROM t4 ORDER BY RAND()))`)
+	if err != nil {
+		t.Fatalf("EXPLAIN FORMAT=JSON failed: %v", err)
+	}
+	jsonStr, _ := res.Rows[0][0].(string)
+	idxT2 := strings.Index(jsonStr, `"table_name": "t2"`)
+	idxT1 := strings.Index(jsonStr, `"table_name": "t1"`)
+	if idxT2 < 0 || idxT1 < 0 {
+		t.Fatalf("expected both table_name entries; got:\n%s", jsonStr)
+	}
+	if idxT2 > idxT1 {
+		t.Errorf("expected smaller t2 before t1 in nested_loop; got t1 at %d before t2 at %d:\n%s", idxT1, idxT2, jsonStr)
+	}
+	// t1 (inner) should have using_join_buffer; t2 (outer driver) should not.
+	idxBNL := strings.Index(jsonStr, `"using_join_buffer": "Block Nested Loop"`)
+	if idxBNL < idxT1 {
+		t.Errorf("expected using_join_buffer to appear under t1 (after %d); got at %d:\n%s", idxT1, idxBNL, jsonStr)
+	}
+}
+
+// TestExplain_CrossJoin_OuterTable_NoUsedColumns_JSON: when only one table's
+// column is selected (here `t1.i`), the OUTER table (t2) emits no
+// used_columns block.  An unqualified column reference inside a separate
+// UNION branch's subquery (e.g. `i IN (SELECT i FROM t4 …)`) must NOT pull
+// `i` into t2's used_columns.
+func TestExplain_CrossJoin_OuterTable_NoUsedColumns_JSON(t *testing.T) {
+	e := newUnionExec(t)
+	res, err := e.Execute(`EXPLAIN FORMAT=JSON (SELECT t1.i FROM t1 JOIN t2) UNION ALL (SELECT * FROM t3 WHERE i IN (SELECT i FROM t4 ORDER BY RAND()))`)
+	if err != nil {
+		t.Fatalf("EXPLAIN FORMAT=JSON failed: %v", err)
+	}
+	jsonStr, _ := res.Rows[0][0].(string)
+	idxT2 := strings.Index(jsonStr, `"table_name": "t2"`)
+	idxT1 := strings.Index(jsonStr, `"table_name": "t1"`)
+	if idxT2 < 0 || idxT1 < 0 || idxT2 > idxT1 {
+		t.Fatalf("expected nested_loop with t2 before t1; got:\n%s", jsonStr)
+	}
+	// The slice between t2's table_name and t1's table_name describes the
+	// t2 entry. It must not contain a used_columns block.
+	t2Block := jsonStr[idxT2:idxT1]
+	if strings.Contains(t2Block, "used_columns") {
+		t.Errorf("outer table t2 must not emit used_columns when only t1.i is selected; got:\n%s", t2Block)
+	}
+	// t1 (the inner table that supplies the selected column) should still
+	// list `i` in used_columns.
+	t1Block := jsonStr[idxT1:]
+	if !strings.Contains(t1Block, `"used_columns": [`) || !strings.Contains(t1Block, `"i"`) {
+		t.Errorf("inner table t1 should emit used_columns:[i]; got:\n%s", t1Block)
+	}
+}
