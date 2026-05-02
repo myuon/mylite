@@ -10742,6 +10742,79 @@ func explainJSONInjectAttachedSubqueriesIntoTable(qb []orderedKV, children []int
 	return qb
 }
 
+// explainJSONCollectMaterializedINColumns walks the outer query's WHERE clause
+// and returns a map of lower-cased outer-table-name -> ordered, deduplicated
+// list of columns that appear as the LHS of any `col IN (SELECT ...)` predicate.
+// Used to inject `(col is not null)` into the outer table's attached_condition
+// when MySQL materializes the IN-subquery into `<subqueryN>` and probes via
+// eq_ref on `<auto_key>`.  Only top-level IN-subqueries (combined with AND) are
+// considered; OR / nested-subquery IN predicates are ignored to avoid emitting
+// spurious not-null conditions.
+func (e *Executor) explainJSONCollectMaterializedINColumns(query string) map[string][]string {
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		return nil
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok || sel.Where == nil {
+		return nil
+	}
+	defaultTbl := ""
+	for _, te := range sel.From {
+		for _, tn := range e.extractAllTableNames(te) {
+			if !strings.EqualFold(tn, "dual") {
+				defaultTbl = strings.ToLower(tn)
+				break
+			}
+		}
+		if defaultTbl != "" {
+			break
+		}
+	}
+	result := map[string][]string{}
+	seen := map[string]bool{}
+	var walk func(expr sqlparser.Expr)
+	walk = func(expr sqlparser.Expr) {
+		switch ex := expr.(type) {
+		case *sqlparser.AndExpr:
+			walk(ex.Left)
+			walk(ex.Right)
+		case *sqlparser.ComparisonExpr:
+			if ex.Operator != sqlparser.InOp {
+				return
+			}
+			// RHS must be a SELECT subquery (not a value list).
+			if _, ok := ex.Right.(*sqlparser.Subquery); !ok {
+				return
+			}
+			col, ok := ex.Left.(*sqlparser.ColName)
+			if !ok {
+				return
+			}
+			tbl := col.Qualifier.Name.String()
+			if tbl == "" {
+				tbl = defaultTbl
+			}
+			tbl = strings.ToLower(tbl)
+			if tbl == "" {
+				return
+			}
+			colName := col.Name.String()
+			key := tbl + "." + strings.ToLower(colName)
+			if seen[key] {
+				return
+			}
+			seen[key] = true
+			result[tbl] = append(result[tbl], colName)
+		}
+	}
+	walk(sel.Where.Expr)
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
 // extractFirstINSubquerySQL extracts the first IN (SELECT ...) subquery from a SQL query string.
 // Returns the SELECT part (e.g., "SELECT a FROM t11") for use in analyzing which columns
 // are referenced in the subquery (for used_columns in EXPLAIN FORMAT=JSON).
@@ -11582,6 +11655,38 @@ func (e *Executor) explainJSONDocument(query string) string {
 			subqueryIsDriving[name] = isDriver
 		}
 
+		// Collect (table, column) pairs that appear as the LHS of any
+		// `col IN (SELECT ...)` predicate in the outer query.  When MySQL
+		// materializes such an IN-subquery into `<subqueryN>` and probes via
+		// eq_ref on `<auto_key>`, the outer table block carries an
+		// `attached_condition: (col is not null)` because the eq_ref probe
+		// drops NULL outer values.
+		matINCols := e.explainJSONCollectMaterializedINColumns(query)
+		matDBName := e.CurrentDB
+		if matDBName == "" {
+			matDBName = "test"
+		}
+		injectMatINNotNull := func(tblName string, tblBlock []orderedKV) []orderedKV {
+			cols := matINCols[strings.ToLower(tblName)]
+			if len(cols) == 0 {
+				return tblBlock
+			}
+			for _, kv := range tblBlock {
+				if kv.Key == "attached_condition" {
+					return tblBlock
+				}
+			}
+			parts := make([]string, 0, len(cols))
+			for _, c := range cols {
+				parts = append(parts, fmt.Sprintf("(`%s`.`%s`.`%s` is not null)", matDBName, tblName, c))
+			}
+			cond := parts[0]
+			for i := 1; i < len(parts); i++ {
+				cond = fmt.Sprintf("(%s and %s)", cond, parts[i])
+			}
+			return append(tblBlock, orderedKV{"attached_condition", cond})
+		}
+
 		// Collect non-subquery primary table blocks.
 		var outerTableBlocks []interface{}
 		for _, p := range primaryRows {
@@ -11593,6 +11698,7 @@ func (e *Executor) explainJSONDocument(query string) string {
 				continue
 			}
 			tblBlock := e.explainJSONTableBlock(p.row, query)
+			tblBlock = injectMatINNotNull(tblName, tblBlock)
 			outerTableBlocks = append(outerTableBlocks, []orderedKV{{"table", tblBlock}})
 		}
 
@@ -11674,6 +11780,7 @@ func (e *Executor) explainJSONDocument(query string) string {
 				// In the non-BNL (eq_ref probe) case: all outer tables come BEFORE the subquery
 				isDependent := anySubqueryBNL && (accessType == "ref" || accessType == "eq_ref" || accessType == "const")
 				tblBlock := e.explainJSONTableBlock(p.row, query)
+				tblBlock = injectMatINNotNull(tblName, tblBlock)
 				if isDependent {
 					dependentTables = append(dependentTables, []orderedKV{{"table", tblBlock}})
 				} else {
