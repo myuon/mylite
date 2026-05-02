@@ -2793,10 +2793,6 @@
       "reason": "timeout in mtrrun"
     },
     {
-      "test": "other/big_packets",
-      "reason": "timeout in mtrrun"
-    },
-    {
       "test": "other/locking_part",
       "reason": "timeout in mtrrun"
     },
@@ -3195,10 +3191,6 @@
     {
       "test": "sys_vars/max_join_size_func",
       "reason": "output mismatch"
-    },
-    {
-      "test": "other/sp-fib",
-      "reason": "timeout"
     },
     {
       "test": "other/func_math",
