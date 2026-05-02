@@ -10854,6 +10854,274 @@ func (e *Executor) explainJSONCollectMaterializedINColumns(query string) map[str
 	return result
 }
 
+// extractAllINSubquerySQLs returns the SELECT body of every `IN (SELECT ...)`
+// subquery that appears at any nesting depth in the query string. Each entry
+// is a substring like "SELECT t2.a FROM t2 WHERE t2.a > 0". Order is by
+// position in the source. Used to map materialized <subqueryN> placeholders to
+// the original IN-subquery SQL when multiple sibling IN-subqueries exist.
+func (e *Executor) extractAllINSubquerySQLs(query string) []string {
+	upper := strings.ToUpper(query)
+	var results []string
+	// Walk the string character by character, looking for " IN " or "\nIN "
+	// followed by an opening parenthesis whose first non-whitespace token is
+	// SELECT. We extract everything between SELECT and the matching ')'.
+	i := 0
+	for i < len(query) {
+		// Find next "IN" keyword preceded by whitespace and followed by '(' or whitespace then '('.
+		idx := strings.Index(upper[i:], "IN")
+		if idx < 0 {
+			break
+		}
+		pos := i + idx
+		// Require previous char to be whitespace (word boundary).
+		if pos == 0 || !isExplainSpace(query[pos-1]) {
+			i = pos + 2
+			continue
+		}
+		// Require next char to be whitespace or '(' (followed by '(' eventually).
+		after := pos + 2
+		if after >= len(query) {
+			break
+		}
+		// Skip whitespace after IN.
+		j := after
+		for j < len(query) && isExplainSpace(query[j]) {
+			j++
+		}
+		if j >= len(query) || query[j] != '(' {
+			i = after
+			continue
+		}
+		// Inside the paren, skip whitespace and look for SELECT.
+		k := j + 1
+		for k < len(query) && isExplainSpace(query[k]) {
+			k++
+		}
+		if k+6 > len(query) || !strings.EqualFold(query[k:k+6], "SELECT") {
+			i = after
+			continue
+		}
+		// Find the matching ')'.
+		depth := 1
+		end := -1
+		for m := j + 1; m < len(query); m++ {
+			switch query[m] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 {
+					end = m
+				}
+			}
+			if end >= 0 {
+				break
+			}
+		}
+		if end < 0 {
+			break
+		}
+		results = append(results, query[k:end])
+		// Continue scanning AFTER the IN to catch nested INs inside the body too.
+		i = k
+	}
+	return results
+}
+
+func isExplainSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
+// explainJSONNestedINJoinInfo describes the equality condition that joins the
+// outer-IN table to the inner-IN table after MySQL flattens a nested
+//
+//	WHERE outer_t.col IN (SELECT inner_t.col FROM inner_t WHERE ...)
+//
+// inside a materialized subquery body. The "second" table in the inner
+// nested_loop receives `using_join_buffer: Block Nested Loop` and an
+// `attached_condition` of `(db.outer_t.col = db.inner_t.col)`.
+type explainJSONNestedINJoinInfo struct {
+	dbName   string
+	outerTbl string
+	outerCol string
+	innerTbl string
+	innerCol string
+	// innerSQL is the SELECT body of the nested IN subquery (e.g.
+	// "SELECT t4.a FROM t4 WHERE a > 0").  Used as the query string for the
+	// inner_t (driver) table block so its attached_condition reflects the
+	// nested filter rather than the surrounding outer IN expression.
+	innerSQL string
+}
+
+// explainJSONReorderNestedINMatRows detects the nested-IN semijoin pattern
+// inside a materialized subquery and, when matched, swaps the row order so the
+// inner-IN table (the driver after semijoin flattening) comes first.  Returns
+// the (possibly reordered) rows and a non-nil join info struct describing the
+// equality condition between outer_t.col and inner_t.col.  When the pattern is
+// not detected, returns the rows unchanged and nil.
+func (e *Executor) explainJSONReorderNestedINMatRows(rows [][]interface{}, innerSQL string) ([][]interface{}, *explainJSONNestedINJoinInfo) {
+	if len(rows) != 2 {
+		return rows, nil
+	}
+	stmt, err := e.parser().Parse(innerSQL)
+	if err != nil {
+		return rows, nil
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok || sel.Where == nil {
+		return rows, nil
+	}
+	// Look for `outerCol IN (SELECT innerCol FROM innerTbl ...)` at the top level
+	// of the WHERE clause.  Walk both sides of any AND nodes.
+	var outerCol *sqlparser.ColName
+	var innerSel *sqlparser.Select
+	var walk func(expr sqlparser.Expr)
+	walk = func(expr sqlparser.Expr) {
+		if outerCol != nil && innerSel != nil {
+			return
+		}
+		switch x := expr.(type) {
+		case *sqlparser.AndExpr:
+			walk(x.Left)
+			walk(x.Right)
+		case *sqlparser.ComparisonExpr:
+			if x.Operator != sqlparser.InOp {
+				return
+			}
+			lhs, lok := x.Left.(*sqlparser.ColName)
+			if !lok {
+				return
+			}
+			sub, sok := x.Right.(*sqlparser.Subquery)
+			if !sok {
+				return
+			}
+			s, sselok := sub.Select.(*sqlparser.Select)
+			if !sselok {
+				return
+			}
+			outerCol = lhs
+			innerSel = s
+		}
+	}
+	walk(sel.Where.Expr)
+	if outerCol == nil || innerSel == nil {
+		return rows, nil
+	}
+	// Identify outer table from the outer SELECT's FROM list.
+	outerTbl := ""
+	for _, te := range sel.From {
+		for _, n := range e.extractAllTableNames(te) {
+			outerTbl = n
+			break
+		}
+		if outerTbl != "" {
+			break
+		}
+	}
+	// Identify inner SELECT's first SELECT-list ColName for innerCol; identify
+	// inner table from the inner SELECT's FROM list.
+	innerTbl := ""
+	for _, te := range innerSel.From {
+		for _, n := range e.extractAllTableNames(te) {
+			innerTbl = n
+			break
+		}
+		if innerTbl != "" {
+			break
+		}
+	}
+	if outerTbl == "" || innerTbl == "" {
+		return rows, nil
+	}
+	// Inner col: prefer the SELECT-list ColName of the inner SELECT.
+	var innerCol *sqlparser.ColName
+	if innerSel.SelectExprs != nil && len(innerSel.SelectExprs.Exprs) > 0 {
+		if ae, aok := innerSel.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); aok {
+			if cn, cok := ae.Expr.(*sqlparser.ColName); cok {
+				innerCol = cn
+			}
+		}
+	}
+	if innerCol == nil {
+		return rows, nil
+	}
+	dbName := e.CurrentDB
+	if dbName == "" {
+		dbName = "test"
+	}
+	innerSQLStr := sqlparser.String(innerSel)
+	info := &explainJSONNestedINJoinInfo{
+		dbName:   dbName,
+		outerTbl: outerTbl,
+		outerCol: outerCol.Name.String(),
+		innerTbl: innerTbl,
+		innerCol: innerCol.Name.String(),
+		innerSQL: innerSQLStr,
+	}
+	// Find which row corresponds to outer_t and inner_t and reorder so inner_t
+	// comes first.
+	rowName := func(r []interface{}) string {
+		if r[2] == nil {
+			return ""
+		}
+		return strings.ToLower(fmt.Sprintf("%v", r[2]))
+	}
+	outerLower := strings.ToLower(outerTbl)
+	innerLower := strings.ToLower(innerTbl)
+	r0 := rowName(rows[0])
+	r1 := rowName(rows[1])
+	if r0 == outerLower && r1 == innerLower {
+		return [][]interface{}{rows[1], rows[0]}, info
+	}
+	if r0 == innerLower && r1 == outerLower {
+		// Already in MySQL order; still attach join info for the second row.
+		return rows, info
+	}
+	// Could not match by name; bail out without rewriting.
+	return rows, nil
+}
+
+// explainJSONInjectBNLEqJoin rewrites a table block to add
+// `using_join_buffer: "Block Nested Loop"` (after `filtered`, before
+// `cost_info`) and to replace any existing `attached_condition` with
+// `(db.outerTbl.outerCol = db.innerTbl.innerCol)` reflecting the semijoin
+// equality after the nested-IN flattening.  This matches MySQL's JSON shape
+// for the second table inside a materialized subquery's nested IN.
+func explainJSONInjectBNLEqJoin(block []orderedKV, info *explainJSONNestedINJoinInfo) []orderedKV {
+	if info == nil {
+		return block
+	}
+	cond := fmt.Sprintf("(`%s`.`%s`.`%s` = `%s`.`%s`.`%s`)",
+		info.dbName, info.outerTbl, info.outerCol,
+		info.dbName, info.innerTbl, info.innerCol)
+	out := make([]orderedKV, 0, len(block)+2)
+	hasJoinBuf := false
+	hasAttached := false
+	for _, kv := range block {
+		switch kv.Key {
+		case "using_join_buffer":
+			hasJoinBuf = true
+			out = append(out, orderedKV{"using_join_buffer", "Block Nested Loop"})
+		case "attached_condition":
+			hasAttached = true
+			out = append(out, orderedKV{"attached_condition", cond})
+		case "cost_info":
+			if !hasJoinBuf {
+				out = append(out, orderedKV{"using_join_buffer", "Block Nested Loop"})
+				hasJoinBuf = true
+			}
+			out = append(out, kv)
+		default:
+			out = append(out, kv)
+		}
+	}
+	if !hasAttached {
+		out = append(out, orderedKV{"attached_condition", cond})
+	}
+	return out
+}
+
 // extractFirstINSubquerySQL extracts the first IN (SELECT ...) subquery from a SQL query string.
 // Returns the SELECT part (e.g., "SELECT a FROM t11") for use in analyzing which columns
 // are referenced in the subquery (for used_columns in EXPLAIN FORMAT=JSON).
@@ -11532,9 +11800,34 @@ func (e *Executor) explainJSONDocument(query string) string {
 		// <subqueryN> placeholder rows with their materialized subquery blocks in-place.
 		// This preserves MySQL's join order (as shown in the tabular EXPLAIN).
 
-		// Extract the IN-subquery SQL for used_columns analysis (so we only show
-		// the columns referenced in the subquery, not all columns from outer SELECT *).
+		// Extract every IN-subquery body in the outer query so we can pick the
+		// matching one per materialized id (used for used_columns and condition
+		// extraction). Falls back to the first IN-subquery for legacy callers.
+		allINSubSQLs := e.extractAllINSubquerySQLs(query)
 		inSubquerySQL := e.extractFirstINSubquerySQL(query)
+
+		// pickInnerSQL returns the IN-subquery SQL whose FROM clause contains the
+		// given table name. If none match, returns the first IN-subquery SQL or
+		// (if there are no IN-subqueries) the outer query itself.
+		pickInnerSQL := func(tblName string) string {
+			lower := strings.ToLower(tblName)
+			for _, s := range allINSubSQLs {
+				us := strings.ToLower(s)
+				// Quick word-boundary check for "from <tbl>" or "from `<tbl>`".
+				if strings.Contains(us, " "+lower+" ") ||
+					strings.Contains(us, " "+lower+",") ||
+					strings.Contains(us, " "+lower+"\n") ||
+					strings.Contains(us, " "+lower+"\t") ||
+					strings.Contains(us, "`"+lower+"`") ||
+					strings.HasSuffix(us, " "+lower) {
+					return s
+				}
+			}
+			if inSubquerySQL != "" {
+				return inSubquerySQL
+			}
+			return query
+		}
 
 		// First, build a map from subquery name -> materialized block ([]orderedKV)
 		matBlockByName := make(map[string][]orderedKV)
@@ -11543,9 +11836,14 @@ func (e *Executor) explainJSONDocument(query string) string {
 				continue
 			}
 			// Use the subquery SQL (if available) for used_columns analysis in inner tables.
+			// Prefer per-id inner SQL based on the first row's table name.
 			innerQuery := query
-			if inSubquerySQL != "" {
-				innerQuery = inSubquerySQL
+			if len(matRows) > 0 {
+				if firstTbl, ok := matRows[0].row[2].(string); ok && firstTbl != "" {
+					innerQuery = pickInnerSQL(firstTbl)
+				} else if inSubquerySQL != "" {
+					innerQuery = inSubquerySQL
+				}
 			}
 			// Build the inner query_block for the materialized subquery
 			var innerQB []orderedKV
@@ -11555,10 +11853,37 @@ func (e *Executor) explainJSONDocument(query string) string {
 				innerTblBlock := e.explainJSONTableBlock(m.row, innerQuery)
 				innerQB = append(innerQB, orderedKV{"table", innerTblBlock})
 			} else {
-				// Multiple tables: nested_loop in inner query_block
-				var innerLoop []interface{}
+				// Multiple tables: nested_loop in inner query_block.
+				// Detect the nested-IN semijoin pattern: when the inner SQL is
+				//   SELECT outer_t.col FROM outer_t WHERE outer_t.col IN (
+				//       SELECT inner_t.col FROM inner_t WHERE ...
+				//   )
+				// MySQL's optimizer flattens the inner IN via semijoin and emits
+				// the inner_t row first (driver, with the inner-WHERE filter as
+				// attached_condition), followed by outer_t with
+				//   using_join_buffer: Block Nested Loop
+				//   attached_condition: (outer_t.col = inner_t.col)
+				// The tabular EXPLAIN lists outer_t first, inner_t second; we
+				// must reorder to match MySQL's JSON output.
+				rawRows := make([][]interface{}, 0, len(matRows))
 				for _, m := range matRows {
-					innerTblBlock := e.explainJSONTableBlock(m.row, innerQuery)
+					rawRows = append(rawRows, m.row)
+				}
+				orderedRowsRaw, joinInfo := e.explainJSONReorderNestedINMatRows(rawRows, innerQuery)
+				var innerLoop []interface{}
+				for idx, r := range orderedRowsRaw {
+					rowQuery := innerQuery
+					if joinInfo != nil && idx == 0 && joinInfo.innerSQL != "" {
+						// Driver row in a nested-IN semijoin: use the nested
+						// SELECT's SQL so attached_condition reflects its own
+						// WHERE filter (e.g. "(t4.a > 0)") rather than the
+						// surrounding outer IN expression.
+						rowQuery = joinInfo.innerSQL
+					}
+					innerTblBlock := e.explainJSONTableBlock(r, rowQuery)
+					if joinInfo != nil && idx == 1 {
+						innerTblBlock = explainJSONInjectBNLEqJoin(innerTblBlock, joinInfo)
+					}
 					innerLoop = append(innerLoop, []orderedKV{{"table", innerTblBlock}})
 				}
 				innerQB = append(innerQB, orderedKV{"nested_loop", innerLoop})
