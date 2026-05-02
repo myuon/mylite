@@ -5931,6 +5931,9 @@ func (e *Executor) explainSubqueries(sel *sqlparser.Select, idCounter *int64, re
 	if sel.OrderBy != nil {
 		nodes = append(nodes, sel.OrderBy)
 	}
+	if sel.GroupBy != nil {
+		nodes = append(nodes, sel.GroupBy)
+	}
 	// Walk ON conditions from JOIN expressions in the FROM clause.
 	for _, te := range sel.From {
 		e.collectJoinOnConditions(te, &nodes)
@@ -10416,10 +10419,24 @@ func (e *Executor) explainJSONDocument(query string) string {
 	// hasGroupBy should only be true if the OUTER (top-level) SELECT has GROUP BY,
 	// not if GROUP BY appears only inside a subquery or derived table.
 	hasGroupBy := false
+	// hasGroupBySubqueryEarly mirrors hasGroupBySubquery (detected later) but is
+	// computed here so we can suppress the filesort sortCost addition when the
+	// outer GROUP BY references a subquery — MySQL emits using_filesort:false in
+	// that case, with no sort_cost line in cost_info.
+	hasGroupBySubqueryEarly := false
 	hasSQLBufferResult := strings.Contains(upper, "SQL_BUFFER_RESULT")
 	if stmt, err := e.parser().Parse(query); err == nil {
 		if sel, ok := stmt.(*sqlparser.Select); ok {
 			hasGroupBy = sel.GroupBy != nil && len(sel.GroupBy.Exprs) > 0
+			if sel.GroupBy != nil {
+				sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+					if _, ok := node.(*sqlparser.Subquery); ok {
+						hasGroupBySubqueryEarly = true
+						return false, nil
+					}
+					return true, nil
+				}, sel.GroupBy)
+			}
 		}
 	}
 	// hasFilesort should only be true for PRIMARY/SIMPLE rows (not DERIVED rows),
@@ -10438,7 +10455,7 @@ func (e *Executor) explainJSONDocument(query string) string {
 			}
 		}
 	}
-	if hasFilesort {
+	if hasFilesort && !hasGroupBySubqueryEarly {
 		totalCost += sortCost
 	}
 
@@ -10515,6 +10532,12 @@ func (e *Executor) explainJSONDocument(query string) string {
 	// as `having_subqueries` (not `attached_subqueries`) at the query_block
 	// level, with `dependent: false, cacheable: true`.
 	hasHavingSubquery := false
+	// Detect if GROUP BY clause contains a subquery.  In MySQL EXPLAIN
+	// FORMAT=JSON, when GROUP BY references a subquery, the table is
+	// wrapped in a `grouping_operation` with `using_temporary_table: true,
+	// using_filesort: false`, and the subqueries are emitted as
+	// `group_by_subqueries` with `dependent: true, cacheable: false`.
+	hasGroupBySubquery := false
 	if stmt, err := e.parser().Parse(query); err == nil {
 		if sel, ok := stmt.(*sqlparser.Select); ok {
 			if len(sel.OrderBy) > 0 && !hasWindowFuncs {
@@ -10544,6 +10567,16 @@ func (e *Executor) explainJSONDocument(query string) string {
 					}
 					return true, nil
 				}, sel.Having)
+			}
+			// Walk GROUP BY for subqueries.
+			if sel.GroupBy != nil {
+				sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+					if _, ok := node.(*sqlparser.Subquery); ok {
+						hasGroupBySubquery = true
+						return false, nil
+					}
+					return true, nil
+				}, sel.GroupBy)
 			}
 		}
 	}
@@ -11713,10 +11746,12 @@ func (e *Executor) explainJSONDocument(query string) string {
 				//
 				// HAVING-clause subqueries are emitted at the query_block level as
 				// `having_subqueries` (handled below), so skip the inline-embedding
-				// path entirely when the source clause is HAVING.
+				// path entirely when the source clause is HAVING.  GROUP BY-clause
+				// subqueries are emitted inside the `grouping_operation` wrapper as
+				// `group_by_subqueries`, so skip the inline path for that case too.
 				var attachedSubs []interface{}
 				hasDependentSubs := false
-				if !hasHavingSubquery {
+				if !hasHavingSubquery && !hasGroupBySubquery {
 					for _, s := range subqueryRows {
 						qb := e.explainJSONQueryBlockForRow(s.row, query)
 						// If we have IN→EXISTS marker info and this row is a
@@ -11756,7 +11791,40 @@ func (e *Executor) explainJSONDocument(query string) string {
 				// subquery (optimizer-time subquery), MySQL wraps the table in
 				// `ordering_operation` with `using_filesort: false` and emits
 				// the subqueries as `optimized_away_subqueries`.
-				if hasGroupBy && hasFilesort {
+				//
+				// When the outer GROUP BY references a subquery, MySQL wraps the
+				// table in `grouping_operation` with `using_temporary_table: true,
+				// using_filesort: false` and emits the subqueries as
+				// `group_by_subqueries` with `dependent: true, cacheable: false`.
+				if hasGroupBySubquery && len(subqueryRows) > 0 {
+					var groupBySubs []interface{}
+					for _, s := range subqueryRows {
+						qb := e.explainJSONQueryBlockForRow(s.row, query)
+						// MySQL's IN→EXISTS rewrite injects an attached_condition
+						// on the inner table for ALL/ANY subqueries appearing in
+						// GROUP BY.  Inject a placeholder; mtrrunner masks the
+						// value to "#" so the textual content does not matter for
+						// the diff comparison.
+						qb = explainJSONInjectInnerAttachedCondition(qb,
+							"<if>(outer_field_is_not_null, true, true)")
+						dependent := s.selectType == "DEPENDENT SUBQUERY"
+						cacheable := !dependent
+						groupBySubs = append(groupBySubs, []orderedKV{
+							{"dependent", dependent},
+							{"cacheable", cacheable},
+							{"query_block", qb},
+						})
+					}
+					groupOp := []orderedKV{
+						{"using_temporary_table", true},
+						{"using_filesort", false},
+						{"table", tblBlock},
+						{"group_by_subqueries", groupBySubs},
+					}
+					queryBlock = append(queryBlock, orderedKV{"grouping_operation", groupOp})
+					// Mark consumed.
+					subqueryRows = nil
+				} else if hasGroupBy && hasFilesort {
 					groupOp := []orderedKV{
 						{"using_filesort", true},
 						{"cost_info", []orderedKV{{"sort_cost", fmt.Sprintf("%.2f", sortCost)}}},
