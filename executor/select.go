@@ -6395,7 +6395,8 @@ func (e *Executor) execUnion(stmt *sqlparser.Union) (*Result, error) {
 	// `AS ""` (Vitess treats empty alias as IsEmpty()=true), and we rely on the
 	// raw query text to recover explicit empty aliases for correct column names.
 	savedCurrentQueryForUnion := e.currentQuery
-	if leftRaw := extractUnionLeftRaw(savedCurrentQueryForUnion); leftRaw != "" {
+	leftRaw := extractUnionLeftRaw(savedCurrentQueryForUnion)
+	if leftRaw != "" {
 		e.currentQuery = leftRaw
 	} else {
 		e.currentQuery = sqlparser.String(stmt.Left)
@@ -6404,6 +6405,40 @@ func (e *Executor) execUnion(stmt *sqlparser.Union) (*Result, error) {
 	e.currentQuery = savedCurrentQueryForUnion
 	if err != nil {
 		return nil, err
+	}
+
+	// MySQL behavior: when the LEFT side of a UNION is an unparenthesized SELECT
+	// and its LAST column has no alias and is not a simple ColName/string-literal,
+	// the column header includes the trailing UNION text. For example:
+	//   SELECT CAST(1 AS JSON) UNION ALL SELECT CAST(1 AS JSON)
+	// produces column header "CAST(1 AS JSON) UNION ALL SELECT CAST(1 AS JSON)".
+	// The leftRaw-only extraction above produces just "CAST(1 AS JSON)"; here we
+	// fix up the last column name by re-extracting from the FULL union query.
+	if leftRaw != "" && len(leftResult.Columns) > 0 {
+		if leftSel, ok := stmt.Left.(*sqlparser.Select); ok {
+			trimmedLeftRaw := strings.TrimSpace(leftRaw)
+			if !strings.HasPrefix(trimmedLeftRaw, "(") &&
+				len(leftSel.SelectExprs.Exprs) == len(leftResult.Columns) {
+				lastIdx := len(leftSel.SelectExprs.Exprs) - 1
+				if ae, ok := leftSel.SelectExprs.Exprs[lastIdx].(*sqlparser.AliasedExpr); ok {
+					_, isLit := ae.Expr.(*sqlparser.Literal)
+					_, isCol := ae.Expr.(*sqlparser.ColName)
+					leftRawExprs := extractRawSelectExprs(leftRaw)
+					hasExplicitStrAlias := false
+					if lastIdx < len(leftRawExprs) {
+						if _, has := extractExplicitStringAlias(strings.TrimSpace(leftRawExprs[lastIdx])); has {
+							hasExplicitStrAlias = true
+						}
+					}
+					if ae.As.IsEmpty() && !isLit && !isCol && !hasExplicitStrAlias {
+						fullExprs := extractRawSelectExprs(savedCurrentQueryForUnion)
+						if lastIdx < len(fullExprs) {
+							leftResult.Columns[lastIdx] = strings.TrimSpace(fullExprs[lastIdx])
+						}
+					}
+				}
+			}
+		}
 	}
 
 	// Execute right side directly from AST.
