@@ -3465,10 +3465,6 @@
       "reason": "log file not found"
     },
     {
-      "test": "sys_vars/innodb_autoinc_lock_mode_func",
-      "reason": "auto_increment value wrong"
-    },
-    {
       "test": "sys_vars/key_buffer_size_basic",
       "reason": "failures"
     },
@@ -3607,10 +3603,6 @@
     {
       "test": "json/json_conversions",
       "reason": "stack overrun on complex expression"
-    },
-    {
-      "test": "sys_vars/auto_increment_increment_func",
-      "reason": "auto_increment_increment not affecting IDs correctly"
     },
     {
       "test": "sys_vars/autocommit_func",
