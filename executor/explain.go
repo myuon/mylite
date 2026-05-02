@@ -10651,6 +10651,28 @@ func (e *Executor) explainJSONFormatExprQualified(expr sqlparser.Expr, dbName st
 	return ""
 }
 
+// explainJSONTableHasAttachedCondition reports whether a query_block's table
+// sub-block already carries an attached_condition.  Used to avoid clobbering
+// an existing condition when injecting placeholders for nested subqueries.
+func explainJSONTableHasAttachedCondition(qb []orderedKV) bool {
+	for _, kv := range qb {
+		if kv.Key != "table" {
+			continue
+		}
+		tbl, ok := kv.Value.([]orderedKV)
+		if !ok {
+			continue
+		}
+		for _, sub := range tbl {
+			if sub.Key == "attached_condition" {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
 // explainJSONInjectInnerAttachedCondition rewrites a query_block's table sub-block
 // to include the supplied attached_condition (replacing any existing one).  It
 // also propagates through grouping_operation/buffer_result wrappers when used.
@@ -12257,6 +12279,32 @@ func (e *Executor) explainJSONDocument(query string) string {
 						if en.parentID > 1 && existsByID[en.parentID] {
 							childrenByParent[en.parentID] = append(childrenByParent[en.parentID], i)
 						}
+					}
+					// For DEPENDENT subquery entries that are nested inside another
+					// subquery's body (e.g. SOME/ANY/ALL inside an IN-subquery's
+					// WHERE), MySQL emits an `attached_condition` containing
+					// IN→EXISTS markers like `<if>(outer_field_is_not_null, ..., true)`.
+					// This applies whether the immediate parent is still a subquery
+					// row or has been flattened (e.g. semijoin'd into PRIMARY) — the
+					// rewriter still wraps the inner correlated WHERE.  mylite doesn't
+					// reconstruct the exact textual marker for nested subqueries, but
+					// mtrrun masks `attached_condition` values to "#" — so injecting
+					// a placeholder is sufficient to match MySQL's structural output.
+					// Skip the entry if its table block already has an
+					// attached_condition (e.g. from explainJSONTableBlock or the
+					// inExistsInfo path above).
+					for i := range entries {
+						if !entries[i].dependent {
+							continue
+						}
+						if entries[i].parentID <= 1 {
+							continue
+						}
+						if explainJSONTableHasAttachedCondition(entries[i].qb) {
+							continue
+						}
+						entries[i].qb = explainJSONInjectInnerAttachedCondition(entries[i].qb,
+							"<if>(outer_field_is_not_null, true, true)")
 					}
 					// For parents that have nested children, inject those into
 					// the parent qb's table block as attached_subqueries.

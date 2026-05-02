@@ -78,4 +78,11 @@ func TestExplain_NestedSomeNoSemijoin_JSON(t *testing.T) {
 	if !(idx4 < idx3) {
 		t.Errorf("expected DEPENDENT select#4 to appear before cacheable select#3 in attached_subqueries, got 3=%d 4=%d", idx3, idx4)
 	}
+	// select#4's t3 block must carry an attached_condition (the IN→EXISTS
+	// rewriter's `<if>(outer_field_is_not_null, ...)` marker).  mtrrun masks
+	// the value to "#" so the textual content does not matter, but the field
+	// must be present.
+	if !strings.Contains(js, "outer_field_is_not_null") {
+		t.Errorf("expected select#4 t3 block to carry an attached_condition with outer_field_is_not_null marker, got:\n%s", js)
+	}
 }
