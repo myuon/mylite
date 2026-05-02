@@ -2785,8 +2785,20 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 			// references the table — the single row is read once and treated as a constant.
 			// Restrict to len(allTableNames) == 1 to avoid disturbing multi-table joins
 			// where mylite's optimizer ordering may not match MySQL's.
+			//
+			// Skip when the table was created with an explicit ENGINE=InnoDB clause:
+			// InnoDB row counts come from probabilistic statistics that are never exact
+			// at compile time, so MySQL's optimizer cannot prove the table has exactly
+			// one row and keeps `ALL`.  When the user did not specify an engine the
+			// default in MySQL's mtr environment is MyISAM (force_myisam_default.inc),
+			// for which the row count is exact and the promotion matches.
+			engineExplicitInnoDB := false
+			if td := e.explainGetTableDef(tblName); td != nil &&
+				strings.EqualFold(td.Engine, "InnoDB") {
+				engineExplicitInnoDB = true
+			}
 			if accessType == "ALL" && len(allTableNames) == 1 && idx == 0 && !rangeCheckedForEachRecord &&
-				!tableIsEmpty && rowCount == int64(1) {
+				!tableIsEmpty && rowCount == int64(1) && !engineExplicitInnoDB {
 				accessType = "system"
 				possibleKeys = nil
 				key = nil
