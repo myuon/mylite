@@ -10503,12 +10503,32 @@ func (e *Executor) explainJSONDocument(query string) string {
 
 	// Detect if query has an external ORDER BY (outside window specs)
 	hasExternalOrderBy := false
+	// Detect if outer ORDER BY contains a subquery (e.g.
+	//   SELECT ... FROM t1 ORDER BY (SELECT ... FROM t2 LIMIT 1)
+	// ).  In MySQL EXPLAIN FORMAT=JSON, such non-correlated subqueries
+	// are evaluated at optimizer time, the table is wrapped in
+	// `ordering_operation` with `using_filesort: false`, and the
+	// subqueries become `optimized_away_subqueries`.
+	hasOrderBySubquery := false
 	if stmt, err := e.parser().Parse(query); err == nil {
 		if sel, ok := stmt.(*sqlparser.Select); ok {
 			if len(sel.OrderBy) > 0 && !hasWindowFuncs {
 				// ORDER BY without window funcs is handled by filesort
 			} else if len(sel.OrderBy) > 0 && hasWindowFuncs {
 				hasExternalOrderBy = true
+			}
+			// Walk ORDER BY exprs for subqueries.
+			for _, ob := range sel.OrderBy {
+				sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+					if _, ok := node.(*sqlparser.Subquery); ok {
+						hasOrderBySubquery = true
+						return false, nil
+					}
+					return true, nil
+				}, ob.Expr)
+				if hasOrderBySubquery {
+					break
+				}
 			}
 		}
 	}
@@ -11711,6 +11731,10 @@ func (e *Executor) explainJSONDocument(query string) string {
 
 				// Outer query: always emit as "table" (not grouping_operation),
 				// even if the query string contains GROUP BY (which might be inside a subquery).
+				// However, when the outer ORDER BY references a non-correlated
+				// subquery (optimizer-time subquery), MySQL wraps the table in
+				// `ordering_operation` with `using_filesort: false` and emits
+				// the subqueries as `optimized_away_subqueries`.
 				if hasGroupBy && hasFilesort {
 					groupOp := []orderedKV{
 						{"using_filesort", true},
@@ -11718,6 +11742,34 @@ func (e *Executor) explainJSONDocument(query string) string {
 						{"table", tblBlock},
 					}
 					queryBlock = append(queryBlock, orderedKV{"grouping_operation", groupOp})
+				} else if hasOrderBySubquery && !hasFilesort && len(subqueryRows) > 0 {
+					// Build optimized_away_subqueries from the (non-dependent)
+					// subqueries.  Dependent subqueries continue to use the
+					// existing inline embedding above.
+					var optAway []interface{}
+					var residualSubs []parsedRow
+					for _, s := range subqueryRows {
+						qb := e.explainJSONQueryBlockForRow(s.row, query)
+						dependent := s.selectType == "DEPENDENT SUBQUERY"
+						if dependent {
+							residualSubs = append(residualSubs, s)
+							continue
+						}
+						optAway = append(optAway, []orderedKV{
+							{"dependent", false},
+							{"cacheable", true},
+							{"query_block", qb},
+						})
+					}
+					orderingOp := []orderedKV{
+						{"using_filesort", false},
+						{"table", tblBlock},
+					}
+					if len(optAway) > 0 {
+						orderingOp = append(orderingOp, orderedKV{"optimized_away_subqueries", optAway})
+					}
+					queryBlock = append(queryBlock, orderedKV{"ordering_operation", orderingOp})
+					subqueryRows = residualSubs
 				} else {
 					queryBlock = append(queryBlock, orderedKV{"table", tblBlock})
 				}
