@@ -2029,6 +2029,9 @@ func (e *Executor) tableExprHasStraightJoin(te sqlparser.TableExpr) bool {
 
 // extractAllTableNames collects all real table names from a table expression tree.
 // Non-merge views (which will be shown as derived tables in EXPLAIN) are excluded.
+//
+// NOTE: this function returns the table NAME (not alias). For EXPLAIN row display
+// where MySQL uses the alias when present, use extractAllTableDisplayNames instead.
 func (e *Executor) extractAllTableNames(te sqlparser.TableExpr) []string {
 	switch t := te.(type) {
 	case *sqlparser.AliasedTableExpr:
@@ -2055,6 +2058,72 @@ func (e *Executor) extractAllTableNames(te sqlparser.TableExpr) []string {
 		return names
 	}
 	return nil
+}
+
+// extractAllTableDisplayNames collects display names (alias when present, otherwise
+// the table name) from a table expression tree. This matches MySQL's EXPLAIN output
+// behavior, where the table column reflects the alias used in the query.
+//
+// Non-merge views are excluded (treated as derived tables in EXPLAIN).
+func (e *Executor) extractAllTableDisplayNames(te sqlparser.TableExpr) []string {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if _, ok := t.Expr.(*sqlparser.DerivedTable); ok {
+			return nil
+		}
+		if tn, ok := t.Expr.(sqlparser.TableName); ok {
+			name := tn.Name.String()
+			if e.isViewNonMerge(name) {
+				return nil
+			}
+			if !t.As.IsEmpty() {
+				return []string{t.As.String()}
+			}
+			return []string{name}
+		}
+	case *sqlparser.JoinTableExpr:
+		left := e.extractAllTableDisplayNames(t.LeftExpr)
+		right := e.extractAllTableDisplayNames(t.RightExpr)
+		return append(left, right...)
+	case *sqlparser.ParenTableExpr:
+		var names []string
+		for _, expr := range t.Exprs {
+			names = append(names, e.extractAllTableDisplayNames(expr)...)
+		}
+		return names
+	}
+	return nil
+}
+
+// resolveDisplayToRealTable maps a display name (alias or table name) back to
+// the real table name by walking the table expression tree. Returns the input
+// unchanged if no mapping is found (i.e. the input is already the real name).
+func (e *Executor) resolveDisplayToRealTable(te sqlparser.TableExpr, displayName string) string {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if tn, ok := t.Expr.(sqlparser.TableName); ok {
+			if !t.As.IsEmpty() && strings.EqualFold(t.As.String(), displayName) {
+				return tn.Name.String()
+			}
+			if strings.EqualFold(tn.Name.String(), displayName) {
+				return tn.Name.String()
+			}
+		}
+	case *sqlparser.JoinTableExpr:
+		if r := e.resolveDisplayToRealTable(t.LeftExpr, displayName); r != displayName {
+			return r
+		}
+		if r := e.resolveDisplayToRealTable(t.RightExpr, displayName); r != displayName {
+			return r
+		}
+	case *sqlparser.ParenTableExpr:
+		for _, expr := range t.Exprs {
+			if r := e.resolveDisplayToRealTable(expr, displayName); r != displayName {
+				return r
+			}
+		}
+	}
+	return displayName
 }
 
 // tableExprHasNonMergeView returns true if any table in the expression is a non-merge view.
@@ -2107,13 +2176,37 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 	var result []explainSelectType
 
 	// Collect all real table names from FROM clause (skip synthesized "dual").
+	// We use real names for storage/catalog lookups and access-type detection.
+	// At row emission time, the display name (alias when set, otherwise the
+	// table name) is substituted to match MySQL's EXPLAIN output behavior.
+	//
+	// We track display names in a parallel slice (rather than a map) so that
+	// multiple aliases of the same physical table are preserved correctly,
+	// e.g. FROM t1 AS x JOIN t1 AS y.
 	var allTableNames []string
+	var displayNames []string
 	for _, te := range sel.From {
-		for _, tn := range e.extractAllTableNames(te) {
-			if strings.ToLower(tn) != "dual" {
-				allTableNames = append(allTableNames, tn)
+		realNames := e.extractAllTableNames(te)
+		dispNames := e.extractAllTableDisplayNames(te)
+		for i, rn := range realNames {
+			if strings.ToLower(rn) == "dual" {
+				continue
 			}
+			allTableNames = append(allTableNames, rn)
+			disp := rn
+			if i < len(dispNames) && dispNames[i] != "" {
+				disp = dispNames[i]
+			}
+			displayNames = append(displayNames, disp)
 		}
+	}
+	// Helper: resolve a real table name (looked up by index in allTableNames)
+	// back to the display name. Falls back to the input if not found.
+	displayName := func(idx int, real string) string {
+		if idx >= 0 && idx < len(displayNames) {
+			return displayNames[idx]
+		}
+		return real
 	}
 
 	// Count direct derived tables in FROM clause (including non-merge views)
@@ -2222,14 +2315,23 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 		if len(rangeCheckedTables) > 0 {
 			var drivers []string
 			var inners []string
-			for _, tbl := range allTableNames {
+			var driversDisp []string
+			var innersDisp []string
+			for i, tbl := range allTableNames {
+				disp := tbl
+				if i < len(displayNames) {
+					disp = displayNames[i]
+				}
 				if rangeCheckedTables[tbl] {
 					inners = append(inners, tbl)
+					innersDisp = append(innersDisp, disp)
 				} else {
 					drivers = append(drivers, tbl)
+					driversDisp = append(driversDisp, disp)
 				}
 			}
 			allTableNames = append(drivers, inners...)
+			displayNames = append(driversDisp, innersDisp...)
 		}
 
 		for idx, tblName := range allTableNames {
@@ -2495,7 +2597,7 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 			result = append(result, explainSelectType{
 				id:           myID,
 				selectType:   selectType,
-				table:        tblName,
+				table:        displayName(idx, tblName),
 				extra:        extra,
 				rows:         rowCount,
 				filtered:     filtered,
