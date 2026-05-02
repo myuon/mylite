@@ -1504,7 +1504,7 @@ func (e *Executor) queryHasComplexParts(sel *sqlparser.Select) bool {
 	if hasComplex {
 		return true
 	}
-	// Check for subqueries in SELECT expressions, WHERE, HAVING
+	// Check for subqueries in SELECT expressions, WHERE, HAVING, ORDER BY, GROUP BY
 	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
 		switch n := node.(type) {
 		case *sqlparser.Subquery:
@@ -1513,7 +1513,7 @@ func (e *Executor) queryHasComplexParts(sel *sqlparser.Select) bool {
 			return false, nil
 		}
 		return true, nil
-	}, sel.SelectExprs, sel.Where, sel.Having)
+	}, sel.SelectExprs, sel.Where, sel.Having, sel.OrderBy, sel.GroupBy)
 	if hasComplex {
 		return true
 	}
@@ -7008,11 +7008,22 @@ func (e *Executor) explainUnion(u *sqlparser.Union, idCounter *int64, isTopLevel
 			unionTableParts[i] = strconv.FormatInt(id, 10)
 		}
 		unionTable := "<union" + strings.Join(unionTableParts, ",") + ">"
+		// Detect ORDER BY on the union itself (excluding `ORDER BY NULL`).
+		// MySQL adds "Using filesort" to UNION RESULT extra and wraps
+		// union_result inside ordering_operation in JSON EXPLAIN.
+		hasUnionOrderBy := unionHasNonNullOrderBy(u)
 		extra := "Using temporary"
 		if !hasDistinctUnion {
 			// Marker so that text EXPLAIN can suppress this row but JSON
 			// EXPLAIN can still build a union_result block.
 			extra = ""
+		}
+		if hasUnionOrderBy {
+			if extra != "" {
+				extra = extra + "; Using filesort"
+			} else {
+				extra = "Using filesort"
+			}
 		}
 		result = append(result, explainSelectType{
 			id:         nil,
@@ -7024,9 +7035,75 @@ func (e *Executor) explainUnion(u *sqlparser.Union, idCounter *int64, isTopLevel
 			accessType: "ALL",
 			isUnionAll: !hasDistinctUnion,
 		})
+
+		// Walk the top-level union's ORDER BY for subqueries and emit
+		// SUBQUERY/DEPENDENT SUBQUERY rows.  For a UNION, an unqualified
+		// column reference in an ORDER BY subquery resolves against the
+		// first SELECT of the UNION (so it is treated as correlated /
+		// DEPENDENT SUBQUERY).
+		if isTopLevel && len(u.OrderBy) > 0 && hasUnionOrderBy {
+			outerTables := e.unionOuterTables(u)
+			startIdx := len(result)
+			// walkForSubqueries reserves an id for the (notional) outer
+			// query at *idCounter and uses *idCounter+1 for the subquery
+			// itself.  For a top-level UNION there is no separate outer
+			// query, so roll back one id slot first to make the subquery
+			// id start at the next available value (e.g. 3 for a 2-branch
+			// UNION).
+			*idCounter--
+			e.walkForSubqueries(u.OrderBy, idCounter, &result, outerTables, false, false, nil, "")
+			// Note: subquery rows for a UNION's outer ORDER BY default to
+			// DEPENDENT SUBQUERY because the subquery references the
+			// outer UNION's columns.
+			for i := startIdx; i < len(result); i++ {
+				if result[i].selectType == "SUBQUERY" {
+					result[i].selectType = "DEPENDENT SUBQUERY"
+				}
+			}
+		}
 	}
 
 	return result
+}
+
+// unionHasNonNullOrderBy reports whether u (or any nested Union in its
+// left/right chain) has an ORDER BY clause whose first expression is not
+// NULL.  MySQL skips filesort for `ORDER BY NULL`.
+func unionHasNonNullOrderBy(u *sqlparser.Union) bool {
+	if u == nil {
+		return false
+	}
+	if len(u.OrderBy) > 0 {
+		// `ORDER BY NULL` is a single-element NullVal expression.
+		if len(u.OrderBy) == 1 {
+			if _, ok := u.OrderBy[0].Expr.(*sqlparser.NullVal); ok {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// unionOuterTables collects the set of outer table names/aliases visible to
+// subqueries within the top-level UNION's ORDER BY.  These are the tables
+// referenced by the first SELECT of the union (which is what MySQL uses to
+// resolve unqualified column references in such subqueries).
+func (e *Executor) unionOuterTables(u *sqlparser.Union) map[string]bool {
+	outer := map[string]bool{}
+	if u == nil {
+		return outer
+	}
+	selects := e.flattenUnion(u)
+	if len(selects) == 0 {
+		return outer
+	}
+	if first, ok := selects[0].(*sqlparser.Select); ok {
+		for k, v := range e.extractTableNamesAndAliases(first) {
+			outer[k] = v
+		}
+	}
+	return outer
 }
 
 // unionChainHasDistinct reports whether any Union node in the chain rooted at
@@ -11279,10 +11356,12 @@ func (e *Executor) explainJSONDocument(query string) string {
 		// (set in explainUnion).  In MySQL's EXPLAIN FORMAT=JSON, such
 		// queries emit `using_temporary_table: false` and omit table_name
 		// and access_type from the union_result block.
-		isUnionAll := false
-		if unionResultRow.row[11] == nil || fmt.Sprintf("%v", unionResultRow.row[11]) == "" {
-			isUnionAll = true
+		extraStr := ""
+		if unionResultRow.row[11] != nil {
+			extraStr = fmt.Sprintf("%v", unionResultRow.row[11])
 		}
+		isUnionAll := extraStr == ""
+		hasUnionFilesort := strings.Contains(extraStr, "Using filesort")
 		var unionResult []orderedKV
 		if isUnionAll {
 			unionResult = []orderedKV{
@@ -11301,7 +11380,34 @@ func (e *Executor) explainJSONDocument(query string) string {
 		}
 		unionResult = append(unionResult, orderedKV{"query_specifications", querySpecs})
 
-		queryBlock = append(queryBlock, orderedKV{"union_result", unionResult})
+		if hasUnionFilesort {
+			// Wrap union_result inside ordering_operation, matching MySQL's
+			// EXPLAIN FORMAT=JSON output for `<UNION> ORDER BY <expr>`.
+			orderingOp := []orderedKV{
+				{"using_filesort", true},
+				{"union_result", unionResult},
+			}
+			// Attach order_by_subqueries: any SUBQUERY/DEPENDENT SUBQUERY
+			// rows that appeared after the UNION RESULT row are subqueries
+			// referenced from the outer ORDER BY clause.
+			if len(subqueryRows) > 0 {
+				var orderBySubs []interface{}
+				for _, s := range subqueryRows {
+					qb := e.explainJSONQueryBlockForRow(s.row, query)
+					dependent := s.selectType == "DEPENDENT SUBQUERY"
+					spec := []orderedKV{
+						{"dependent", dependent},
+						{"cacheable", !dependent},
+						{"query_block", qb},
+					}
+					orderBySubs = append(orderBySubs, spec)
+				}
+				orderingOp = append(orderingOp, orderedKV{"order_by_subqueries", orderBySubs})
+			}
+			queryBlock = append(queryBlock, orderedKV{"ordering_operation", orderingOp})
+		} else {
+			queryBlock = append(queryBlock, orderedKV{"union_result", unionResult})
+		}
 	} else {
 		// Complex query with subqueries and/or derived tables
 		queryBlock = append(queryBlock, orderedKV{"cost_info", []orderedKV{
