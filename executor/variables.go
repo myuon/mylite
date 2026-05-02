@@ -2814,6 +2814,16 @@ var sysVarSessionReadOnly = map[string]bool{
 	"max_allowed_packet":   true,
 }
 
+// sysVarSessionInit contains system variables whose SESSION value is fixed at
+// connection time (MySQL "Session, Init" scope).  Subsequent SET GLOBAL changes
+// do not affect the SESSION value of an existing connection.  This is a strict
+// subset of sysVarSessionReadOnly: e.g. max_user_connections is read-only at
+// SESSION but its session value still tracks the current global value.
+var sysVarSessionInit = map[string]bool{
+	"max_allowed_packet": true,
+	"net_buffer_length":  true,
+}
+
 // sysVarDeprecated maps deprecated system variable names to their deprecation warning message.
 // When these variables are read (SELECT @@var), a deprecation warning (code 1287) is emitted.
 var sysVarDeprecated = map[string]string{
@@ -4476,6 +4486,15 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 			continue
 		}
 		if !globalOnly && !sysVarGlobalOnly[name] && !sysVarBothScope[name] {
+			continue
+		}
+		// For session-init variables (e.g. max_allowed_packet, net_buffer_length),
+		// the SESSION value is fixed at connection time and is unaffected by subsequent
+		// SET GLOBAL changes.  performance_schema.session_variables must therefore show
+		// the connection-time value (the compiled-in default), not the current global.
+		// Note: not all session-read-only variables are session-init; max_user_connections
+		// is read-only at SESSION but its session value tracks the global value.
+		if !globalOnly && sysVarSessionInit[name] {
 			continue
 		}
 		if name == "innodb_stats_transient_sample_pages" || name == "innodb_stats_persistent_sample_pages" {
