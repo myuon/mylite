@@ -1925,10 +1925,6 @@
       "reason": "=== encryption suite === === large_tests suite === === binlog_nogtid suite === === innodb_undo suite === === innodb_zip suite === === gcol_ndb suite === === innodb_gis suite ==="
     },
     {
-      "test": "innodb_gis/row_format",
-      "reason": "=== encryption suite === === large_tests suite === === binlog_nogtid suite === === innodb_undo suite === === innodb_zip suite === === gcol_ndb suite === === innodb_gis suite ==="
-    },
-    {
       "test": "innodb_gis/rtree",
       "reason": "=== encryption suite === === large_tests suite === === binlog_nogtid suite === === innodb_undo suite === === innodb_zip suite === === gcol_ndb suite === === innodb_gis suite ==="
     },
@@ -4245,10 +4241,6 @@
       "reason": "out of scope: binary log not needed for embedded test DB"
     },
     {
-      "test": "innodb_gis/*",
-      "reason": "out of scope: GIS/spatial features not needed for test DB"
-    },
-    {
       "test": "secondary_engine/*",
       "reason": "out of scope: secondary engine not needed for embedded test DB"
     },
@@ -4335,6 +4327,18 @@
     {
       "test": "innodb/autoinc_persist",
       "reason": "remaining: auto warning emission + ROLLBACK restoration semantics (Refs #255)"
+    },
+    {
+      "test": "innodb_gis/rtree_compress",
+      "reason": "spatial/rtree feature not implemented"
+    },
+    {
+      "test": "innodb_gis/rtree_compress2",
+      "reason": "spatial/rtree feature not implemented"
+    },
+    {
+      "test": "innodb_gis/rtree_purge",
+      "reason": "spatial/rtree feature not implemented"
     }
   ]
 }
