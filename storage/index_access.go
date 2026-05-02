@@ -2,7 +2,9 @@ package storage
 
 import (
 	"fmt"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/myuon/mylite/catalog"
@@ -86,6 +88,15 @@ func valuesEqualLoose(a, b interface{}) bool {
 	if a == nil || b == nil {
 		return false
 	}
+	// Prefer exact integer comparison when both values are integral. Float
+	// conversion loses precision near the int64/uint64 limits — e.g.
+	// float64(MaxInt64-1) == float64(MaxInt64), causing PK lookups for
+	// large BIGINT values to either miss or alias their neighbour.
+	if ai, aok := toComparableInt64(a); aok {
+		if bi, bok := toComparableInt64(b); bok {
+			return ai == bi
+		}
+	}
 	// Try numeric comparison first to avoid 1 vs "1" mismatches caused
 	// by literal-vs-stored type differences.
 	if af, ok := toComparableFloat(a); ok {
@@ -94,6 +105,43 @@ func valuesEqualLoose(a, b interface{}) bool {
 		}
 	}
 	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
+}
+
+// toComparableInt64 returns the int64 value when v is an integer
+// (signed or unsigned, or a string holding an integer literal). Floats
+// are rejected because they may not round-trip exactly.
+func toComparableInt64(v interface{}) (int64, bool) {
+	switch n := v.(type) {
+	case int:
+		return int64(n), true
+	case int8:
+		return int64(n), true
+	case int16:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	case int64:
+		return n, true
+	case uint:
+		if n <= math.MaxInt64 {
+			return int64(n), true
+		}
+	case uint8:
+		return int64(n), true
+	case uint16:
+		return int64(n), true
+	case uint32:
+		return int64(n), true
+	case uint64:
+		if n <= math.MaxInt64 {
+			return int64(n), true
+		}
+	case string:
+		if i, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64); err == nil {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 // resolveIndexColumns returns the column list for the given index name,
