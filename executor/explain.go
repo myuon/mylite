@@ -166,6 +166,11 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 					var simpleRows []explainSelectType
 					var materializedRows []explainSelectType
 					var derivedRows []explainSelectType
+					// hasNestedSubquery is set when a NESTED_SUBQUERY marker is seen,
+					// meaning the outer query has scalar SUBQUERY blocks that survive
+					// outside the semijoin merger.  In that case the outer SIMPLE rows
+					// must be promoted to PRIMARY to match MySQL's EXPLAIN.
+					hasNestedSubquery := false
 					// Track which unique MATERIALIZED subquery IDs we've seen, to create placeholders later
 					insertedPlaceholder := map[interface{}]bool{}
 					var materializedIDs []interface{} // track insertion order of IDs
@@ -179,6 +184,16 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 						} else if r.selectType == "DERIVED" {
 							// DERIVED rows (from FROM-clause derived tables) are preserved as-is
 							derivedRows = append(derivedRows, r)
+						} else if r.selectType == "NESTED_SUBQUERY" {
+							// Internal marker: a SUBQUERY row that originated INSIDE an
+							// IN-subquery's body (e.g.
+							//   `t1.a IN (SELECT c FROM t2 WHERE c < (SELECT e FROM t3))`).
+							// MySQL keeps these as a separate SUBQUERY block, not part of
+							// the semijoin merger.  Restore the visible select_type and
+							// preserve the row's id.
+							r.selectType = "SUBQUERY"
+							simpleRows = append(simpleRows, r)
+							hasNestedSubquery = true
 						} else if r.selectType != "SIMPLE" {
 							// Non-SIMPLE, non-MATERIALIZED, non-DERIVED rows (e.g. DEPENDENT SUBQUERY for EXISTS)
 							// become id=1, SIMPLE (anti-join / FirstMatch strategy)
@@ -187,6 +202,19 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 							simpleRows = append(simpleRows, r)
 						} else {
 							simpleRows = append(simpleRows, r)
+						}
+					}
+					// When we preserved nested SUBQUERY rows above, promote outer
+					// SIMPLE rows to PRIMARY (MySQL's convention: a query with one or
+					// more separate SUBQUERY blocks shows the outer as PRIMARY, not
+					// SIMPLE).  Only the outer-table simpleRows are promoted —
+					// MATERIALIZED placeholders (`<subqueryN>` rows added later) keep
+					// SIMPLE.
+					if hasNestedSubquery {
+						for i := range simpleRows {
+							if simpleRows[i].selectType == "SIMPLE" {
+								simpleRows[i].selectType = "PRIMARY"
+							}
 						}
 					}
 					// Now create the <subqueryN> placeholder rows.
@@ -7165,6 +7193,29 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 							}
 						} else {
 							subRows[0].id = subQueryID
+						}
+					}
+					// Mark nested scalar subquery rows (those NOT belonging to the IN
+					// subquery's own merged row, i.e. id != subQueryID) so the outer
+					// post-processing in explainMultiRows preserves them as separate
+					// SUBQUERY blocks instead of flattening them into the semijoin.
+					// This handles cases like
+					//   `t1.a IN (SELECT c FROM t2 WHERE c < (SELECT e FROM t3))`
+					// where the inner `(SELECT e FROM t3)` is a scalar subquery that
+					// MySQL keeps as id=N SUBQUERY t3, not part of the outer's id=1.
+					// Both SUBQUERY (non-correlated) and DEPENDENT SUBQUERY (correlated)
+					// nested scalar subqueries are preserved.
+					if outerCanSemijoin && !mergedMaterialized && !mergedDependent {
+						for i := 1; i < len(subRows); i++ {
+							st := subRows[i].selectType
+							if st != "SUBQUERY" && st != "DEPENDENT SUBQUERY" {
+								continue
+							}
+							if id, ok := subRows[i].id.(int64); ok {
+								if firstID, ok2 := subRows[0].id.(int64); !ok2 || id != firstID {
+									subRows[i].selectType = "NESTED_SUBQUERY"
+								}
+							}
 						}
 					}
 					*result = append(*result, subRows...)
