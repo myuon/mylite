@@ -3157,10 +3157,6 @@
       "reason": "still failing"
     },
     {
-      "test": "sys_vars/cte_max_recursion_depth_func",
-      "reason": "still failing"
-    },
-    {
       "test": "sys_vars/identity_func",
       "reason": "still failing"
     },
