@@ -1139,13 +1139,72 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 			}
 		}
 	case *sqlparser.Update:
-		// EXPLAIN UPDATE: first table gets select_type="UPDATE", subsequent tables get "SIMPLE".
-		// Collect all table names from the UPDATE's TableExprs.
-		var tableNames []string
-		for _, te := range s.TableExprs {
-			tableNames = append(tableNames, e.extractAllTableNames(te)...)
+		// EXPLAIN UPDATE: tables actually being updated (those referenced in SET clause)
+		// get select_type="UPDATE", others get "SIMPLE". Updated tables come first.
+		// Collect all table names and their aliases from TableExprs.
+		type updTblEntry struct {
+			name    string
+			aliases []string
 		}
-		for i, tblName := range tableNames {
+		var entries []updTblEntry
+		for _, te := range s.TableExprs {
+			realNames := e.extractAllTableNames(te)
+			displayNames := e.extractAllTableDisplayNames(te)
+			for i, n := range realNames {
+				entry := updTblEntry{name: n}
+				entry.aliases = append(entry.aliases, strings.ToLower(n))
+				if i < len(displayNames) {
+					entry.aliases = append(entry.aliases, strings.ToLower(displayNames[i]))
+				}
+				entries = append(entries, entry)
+			}
+		}
+		// Determine which tables are SET targets by inspecting Exprs qualifiers.
+		// A SET target column "tbl.col" or "alias.col" identifies tbl/alias as updated.
+		// If the SET has no qualifier (single-table UPDATE), all tables are targets.
+		updatedSet := make(map[int]bool)
+		hasQualifier := false
+		for _, ue := range s.Exprs {
+			qualStr := strings.Trim(sqlparser.String(ue.Name.Qualifier), "`")
+			if qualStr == "" {
+				continue
+			}
+			hasQualifier = true
+			// qualStr may be "db.tbl" or "tbl" or alias
+			qualLower := strings.ToLower(qualStr)
+			tail := qualLower
+			if idx := strings.LastIndex(qualLower, "."); idx >= 0 {
+				tail = qualLower[idx+1:]
+			}
+			for i, en := range entries {
+				for _, a := range en.aliases {
+					if a == qualLower || a == tail {
+						updatedSet[i] = true
+						break
+					}
+				}
+			}
+		}
+		// If no qualifiers (e.g. single-table UPDATE), all entries are targets.
+		if !hasQualifier {
+			for i := range entries {
+				updatedSet[i] = true
+			}
+		}
+		// Reorder: updated tables first (preserving relative order), then others.
+		var ordered []int
+		for i := range entries {
+			if updatedSet[i] {
+				ordered = append(ordered, i)
+			}
+		}
+		for i := range entries {
+			if !updatedSet[i] {
+				ordered = append(ordered, i)
+			}
+		}
+		for outIdx, idx := range ordered {
+			tblName := entries[idx].name
 			var rowCount int64 = 1
 			if e.Storage != nil {
 				if tbl, err := e.Storage.GetTable(e.CurrentDB, tblName); err == nil {
@@ -1155,11 +1214,11 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 				}
 			}
 			st := "SIMPLE"
-			if i == 0 {
+			if updatedSet[idx] {
 				st = "UPDATE"
 			}
 			var updateExtra interface{} = nil
-			if i == 0 && s.Where != nil {
+			if outIdx == 0 && s.Where != nil {
 				updateExtra = "Using where"
 			}
 			result = append(result, explainSelectType{
