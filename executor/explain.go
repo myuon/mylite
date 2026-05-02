@@ -10510,6 +10510,11 @@ func (e *Executor) explainJSONDocument(query string) string {
 	// `ordering_operation` with `using_filesort: false`, and the
 	// subqueries become `optimized_away_subqueries`.
 	hasOrderBySubquery := false
+	// Detect if HAVING clause contains a subquery.  In MySQL EXPLAIN
+	// FORMAT=JSON, non-correlated subqueries appearing in HAVING are emitted
+	// as `having_subqueries` (not `attached_subqueries`) at the query_block
+	// level, with `dependent: false, cacheable: true`.
+	hasHavingSubquery := false
 	if stmt, err := e.parser().Parse(query); err == nil {
 		if sel, ok := stmt.(*sqlparser.Select); ok {
 			if len(sel.OrderBy) > 0 && !hasWindowFuncs {
@@ -10529,6 +10534,16 @@ func (e *Executor) explainJSONDocument(query string) string {
 				if hasOrderBySubquery {
 					break
 				}
+			}
+			// Walk HAVING for subqueries.
+			if sel.Having != nil {
+				sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+					if _, ok := node.(*sqlparser.Subquery); ok {
+						hasHavingSubquery = true
+						return false, nil
+					}
+					return true, nil
+				}, sel.Having)
 			}
 		}
 	}
@@ -11695,29 +11710,35 @@ func (e *Executor) explainJSONDocument(query string) string {
 				// either inline to this primary table block (when the subqueries are
 				// dependent IN/EXISTS subqueries that filter this table) or at the
 				// query_block level otherwise.
+				//
+				// HAVING-clause subqueries are emitted at the query_block level as
+				// `having_subqueries` (handled below), so skip the inline-embedding
+				// path entirely when the source clause is HAVING.
 				var attachedSubs []interface{}
 				hasDependentSubs := false
-				for _, s := range subqueryRows {
-					qb := e.explainJSONQueryBlockForRow(s.row, query)
-					// If we have IN→EXISTS marker info and this row is a
-					// DEPENDENT SUBQUERY, inject the inner attached_condition
-					// into the inner table's block (if present).
-					if inExistsInfo != nil && s.selectType == "DEPENDENT SUBQUERY" {
-						if id, ok := s.row[0].(int64); ok {
-							if cond, found := inExistsInfo.InnerCondBySelectID[id]; found && cond != "" {
-								qb = explainJSONInjectInnerAttachedCondition(qb, cond)
+				if !hasHavingSubquery {
+					for _, s := range subqueryRows {
+						qb := e.explainJSONQueryBlockForRow(s.row, query)
+						// If we have IN→EXISTS marker info and this row is a
+						// DEPENDENT SUBQUERY, inject the inner attached_condition
+						// into the inner table's block (if present).
+						if inExistsInfo != nil && s.selectType == "DEPENDENT SUBQUERY" {
+							if id, ok := s.row[0].(int64); ok {
+								if cond, found := inExistsInfo.InnerCondBySelectID[id]; found && cond != "" {
+									qb = explainJSONInjectInnerAttachedCondition(qb, cond)
+								}
 							}
 						}
-					}
-					if s.selectType == "DEPENDENT SUBQUERY" {
-						hasDependentSubs = true
-						attachedSubs = append(attachedSubs, []orderedKV{
-							{"dependent", true},
-							{"cacheable", false},
-							{"query_block", qb},
-						})
-					} else {
-						attachedSubs = append(attachedSubs, qb)
+						if s.selectType == "DEPENDENT SUBQUERY" {
+							hasDependentSubs = true
+							attachedSubs = append(attachedSubs, []orderedKV{
+								{"dependent", true},
+								{"cacheable", false},
+								{"query_block", qb},
+							})
+						} else {
+							attachedSubs = append(attachedSubs, qb)
+						}
 					}
 				}
 				// When the subqueries are dependent (IN/EXISTS attached to this table's
@@ -11777,11 +11798,23 @@ func (e *Executor) explainJSONDocument(query string) string {
 		}
 
 		// Attached subqueries (residual non-dependent ones at query_block level).
+		// When the subqueries originate from a HAVING clause, MySQL emits them
+		// as `having_subqueries` with dependent/cacheable flags on every entry.
+		// MySQL evaluates non-correlated HAVING ALL/ANY subqueries at optimizer
+		// time, so they always show as `dependent: false, cacheable: true`.
+		// (Our engine sometimes mis-classifies them as DEPENDENT SUBQUERY in
+		// the row-level select_type; we override here for correctness.)
 		if len(subqueryRows) > 0 {
 			var attachedSubs []interface{}
 			for _, s := range subqueryRows {
 				qb := e.explainJSONQueryBlockForRow(s.row, query)
-				if s.selectType == "DEPENDENT SUBQUERY" {
+				if hasHavingSubquery {
+					attachedSubs = append(attachedSubs, []orderedKV{
+						{"dependent", false},
+						{"cacheable", true},
+						{"query_block", qb},
+					})
+				} else if s.selectType == "DEPENDENT SUBQUERY" {
 					attachedSubs = append(attachedSubs, []orderedKV{
 						{"dependent", true},
 						{"cacheable", false},
@@ -11791,7 +11824,11 @@ func (e *Executor) explainJSONDocument(query string) string {
 					attachedSubs = append(attachedSubs, qb)
 				}
 			}
-			queryBlock = append(queryBlock, orderedKV{"attached_subqueries", attachedSubs})
+			key := "attached_subqueries"
+			if hasHavingSubquery {
+				key = "having_subqueries"
+			}
+			queryBlock = append(queryBlock, orderedKV{key, attachedSubs})
 		}
 	}
 
