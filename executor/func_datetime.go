@@ -1365,7 +1365,20 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 		if ctzToLoc == nil {
 			return nil, true, nil
 		}
-		ctzT, ctzParseErr := parseDateTimeValue(toString(ctzVal))
+		ctzInputStr := toString(ctzVal)
+		// Validate date components for YYYY-MM-DD form to reject invalid calendar
+		// dates like "2004-11-31" (Nov has only 30 days). MySQL returns NULL with
+		// a warning instead of normalizing to the next month.
+		if len(ctzInputStr) >= 10 && ctzInputStr[4] == '-' && ctzInputStr[7] == '-' {
+			cy, eyErr := strconv.Atoi(ctzInputStr[:4])
+			cm, emErr := strconv.Atoi(ctzInputStr[5:7])
+			cd, edErr := strconv.Atoi(ctzInputStr[8:10])
+			if eyErr == nil && emErr == nil && edErr == nil && !isValidDate(cy, cm, cd) {
+				e.addWarning("Warning", 1292, "Incorrect datetime value: '"+ctzInputStr+"'")
+				return nil, true, nil
+			}
+		}
+		ctzT, ctzParseErr := parseDateTimeValue(ctzInputStr)
 		if ctzParseErr != nil {
 			return nil, true, nil
 		}
