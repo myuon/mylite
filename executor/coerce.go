@@ -3864,15 +3864,16 @@ func formatDecimalValue(colType string, v interface{}) interface{} {
 			return applyZerofillStr(fmt.Sprintf("%.*f", d, f))
 		}
 		// FLOAT/DOUBLE/REAL(M,D): round to d decimal places.
-		// For FLOAT(M,D), apply single-precision rounding via float32 cast first so that
-		// the value reflects what single-precision arithmetic produces (e.g. 4294967295 →
-		// 4294967296.0 because float32 cannot represent 4294967295 exactly).
-		// For d <= 2, use fmt.Sprintf directly on the float64 value, which correctly
-		// handles tie-breaking (e.g. 999.985 → 999.99) by using the full float64 binary
-		// representation rather than scaled multiplication which loses precision.
+		// For d <= 2, round half-away-from-zero on the original float64 first so that
+		// tie-breaking cases like 999.985 → 999.99 are handled correctly (rather than
+		// 999.98 which would result from float32 casting first, since float32(999.985)
+		// is 999.9849...). After rounding, apply the float32 cast for FLOAT(M,D) so
+		// that out-of-range values like 4294967295 → 4294967296.0 reflect single-
+		// precision arithmetic.
 		// For d > 2, use banker's rounding (RoundToEven) which matches MySQL behavior
 		// for values like FLOAT(5,4) with -9.12345 → -9.1234 (RoundToEven(-91234.5) = -91234).
 		if d <= 2 {
+			f = roundHalfAwayFromZero(f, d)
 			if prefix == "float" {
 				f = float64(float32(f))
 			}
@@ -3897,6 +3898,23 @@ func roundToEvenScale(f float64, d int) float64 {
 		factor *= 10
 	}
 	return math.RoundToEven(f*factor) / factor
+}
+
+// roundHalfAwayFromZero rounds f to d decimal places using half-away-from-zero
+// rounding (e.g. 999.985 → 999.99, -999.985 → -999.99). MySQL uses this rule
+// when storing values into FLOAT/DOUBLE/DECIMAL(M,D) columns.
+func roundHalfAwayFromZero(f float64, d int) float64 {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return f
+	}
+	factor := 1.0
+	for i := 0; i < d; i++ {
+		factor *= 10
+	}
+	if f >= 0 {
+		return math.Floor(f*factor+0.5) / factor
+	}
+	return math.Ceil(f*factor-0.5) / factor
 }
 
 // normalizeFloatSignificant rounds f to n significant digits.
