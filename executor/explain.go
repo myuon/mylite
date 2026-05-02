@@ -11317,6 +11317,70 @@ func (e *Executor) explainJSONDocument(query string) string {
 			appendByID(p)
 		}
 
+		// Identify "optimized away" subqueries belonging to a UNION branch.
+		// When a UNION branch is collapsed to "no matching row in const table"
+		// because its outer table is empty, the inner subqueries from its
+		// WHERE/SELECT/HAVING are emitted as SUBQUERY rows with extra
+		// "Not optimized, outer query is empty" right after the branch row
+		// and before the UNION RESULT row.  In EXPLAIN FORMAT=JSON these are
+		// nested under that branch's query_block as `optimized_away_subqueries`,
+		// not as outer-level attached_subqueries / order_by_subqueries.
+		//
+		// Walk the parsed rows in order, tracking the most recently-seen
+		// PRIMARY/UNION branch id; any SUBQUERY appearing before the UNION
+		// RESULT row is associated with that branch.
+		optimizedAwayByBranch := map[int64][]parsedRow{}
+		// Track parsed indexes of subqueries that were consumed as branch-local
+		// optimized_away_subqueries, so they aren't re-emitted at the outer
+		// level (e.g. attached_subqueries or order_by_subqueries).
+		consumedParsedIdx := map[int]bool{}
+		{
+			currentBranchID := int64(-1)
+			for i := range parsed {
+				switch parsed[i].selectType {
+				case "PRIMARY", "UNION":
+					if id, ok := parsed[i].id.(int64); ok {
+						currentBranchID = id
+					}
+				case "UNION RESULT":
+					// Subqueries after this point are outer-level (e.g.
+					// ORDER BY subqueries), not branch-local.
+					currentBranchID = -1
+				case "SUBQUERY", "DEPENDENT SUBQUERY":
+					if currentBranchID > 0 {
+						extra := ""
+						if parsed[i].row[11] != nil {
+							extra = fmt.Sprintf("%v", parsed[i].row[11])
+						}
+						if strings.Contains(extra, "Not optimized, outer query is empty") {
+							optimizedAwayByBranch[currentBranchID] = append(optimizedAwayByBranch[currentBranchID], parsed[i])
+							consumedParsedIdx[i] = true
+						}
+					}
+				}
+			}
+		}
+		// Filter consumed subqueries from subqueryRows so they aren't re-emitted
+		// at the outer level.  subqueryRows is built in the same order as the
+		// SUBQUERY/DEPENDENT SUBQUERY rows appear in `parsed`, so we walk both
+		// in lock-step using `parsed`.
+		if len(consumedParsedIdx) > 0 {
+			var filtered []parsedRow
+			subIdx := 0
+			for j := range parsed {
+				if parsed[j].selectType != "SUBQUERY" && parsed[j].selectType != "DEPENDENT SUBQUERY" {
+					continue
+				}
+				if !consumedParsedIdx[j] {
+					if subIdx < len(subqueryRows) {
+						filtered = append(filtered, subqueryRows[subIdx])
+					}
+				}
+				subIdx++
+			}
+			subqueryRows = filtered
+		}
+
 		appendSpec := func(g idGroup) {
 			var qb []orderedKV
 			if len(g.rows) == 1 {
@@ -11339,6 +11403,21 @@ func (e *Executor) explainJSONDocument(query string) string {
 					nl = append(nl, []orderedKV{{"table", tblBlock}})
 				}
 				qb = append(qb, orderedKV{"nested_loop", nl})
+			}
+			// Attach optimized_away_subqueries to this branch's query_block,
+			// if any inner subqueries were classified as belonging to it.
+			if subs, ok := optimizedAwayByBranch[g.id]; ok && len(subs) > 0 {
+				var optAway []interface{}
+				for _, s := range subs {
+					innerQB := e.explainJSONQueryBlockForRow(s.row, query)
+					dependent := s.selectType == "DEPENDENT SUBQUERY"
+					optAway = append(optAway, []orderedKV{
+						{"dependent", dependent},
+						{"cacheable", !dependent},
+						{"query_block", innerQB},
+					})
+				}
+				qb = append(qb, orderedKV{"optimized_away_subqueries", optAway})
 			}
 			spec := []orderedKV{
 				{"dependent", false},
