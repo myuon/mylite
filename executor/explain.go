@@ -3618,6 +3618,33 @@ func (e *Executor) collectAllTablesForDuplicateWeedout(inner *sqlparser.Select) 
 	return result
 }
 
+// countTopLevelINSubqueries returns the number of top-level `col IN (SELECT ...)`
+// predicates in the given expression, considering only AND-combined predicates
+// (not OR or nested subqueries).  Tuple IN subqueries are also counted.
+//
+// Used to detect when the outer query combines multiple sibling IN subqueries
+// via AND.  In that case MySQL's planner cannot use DuplicateWeedout for an
+// individual sibling because DW would force flattening all tables into id=1,
+// which is incompatible with multiple `<subqueryN>` placeholders coexisting at
+// the outer query level (each sibling needs its own materialized placeholder).
+func countTopLevelINSubqueries(expr sqlparser.Expr) int {
+	if expr == nil {
+		return 0
+	}
+	switch ex := expr.(type) {
+	case *sqlparser.AndExpr:
+		return countTopLevelINSubqueries(ex.Left) + countTopLevelINSubqueries(ex.Right)
+	case *sqlparser.ComparisonExpr:
+		if ex.Operator != sqlparser.InOp {
+			return 0
+		}
+		if _, ok := ex.Right.(*sqlparser.Subquery); ok {
+			return 1
+		}
+	}
+	return 0
+}
+
 // shouldUseDuplicateWeedout returns true when the inner SELECT has nested IN subqueries
 // (i.e., its WHERE has an IN subquery), which triggers MySQL's DuplicateWeedout semijoin strategy.
 // When DuplicateWeedout is used, MySQL flattens all tables from all nesting levels into a
@@ -7079,7 +7106,19 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 				// DuplicateWeedout (which weeds duplicates by primary key) would discard them.
 				notInLeftJoinBlocksWeedout := selectType == "MATERIALIZED" &&
 					isSubqueryInNotInContext(node, sub) && nestedINSubqueryHasLeftJoin(inner)
-				if selectType == "MATERIALIZED" && !notInLeftJoinBlocksWeedout && (e.shouldUseDuplicateWeedout(inner) || tablePulloutWeedout) {
+				// Sibling-IN exception: when the outer query's WHERE combines multiple
+				// top-level `col IN (SELECT ...)` predicates via AND, MySQL keeps each
+				// IN subquery as its own materialized `<subqueryN>` placeholder rather
+				// than flattening one of them via DuplicateWeedout (which would force
+				// all tables onto id=1 SIMPLE rows, incompatible with multiple sibling
+				// placeholders).  Detect this via the outer SELECT's WHERE expression.
+				multipleSiblingINs := false
+				if outerSel != nil && outerSel.Where != nil {
+					if countTopLevelINSubqueries(outerSel.Where.Expr) >= 2 {
+						multipleSiblingINs = true
+					}
+				}
+				if selectType == "MATERIALIZED" && !notInLeftJoinBlocksWeedout && !multipleSiblingINs && (e.shouldUseDuplicateWeedout(inner) || tablePulloutWeedout) {
 					// Collect all tables from the nested IN chain (or the inner FROM list
 					// when the trigger is table-pullout rather than nested IN).
 					var allTables []string
@@ -11572,7 +11611,18 @@ func (e *Executor) explainJSONDocument(query string) string {
 						parts := strings.Split(refStr, ",")
 						arr := make([]interface{}, len(parts))
 						for i, pp := range parts {
-							arr[i] = strings.TrimSpace(pp)
+							s := strings.TrimSpace(pp)
+							// JSON EXPLAIN renders ref entries fully qualified
+							// with the database name (e.g. "test.t1.a") when the
+							// ref is "table.col" without a leading database.
+							// Special tokens like "func" or "const" are kept as-is.
+							if s != "" && s != "func" && s != "const" && e.CurrentDB != "" {
+								dotCount := strings.Count(s, ".")
+								if dotCount == 1 && !strings.HasPrefix(s, "<") {
+									s = e.CurrentDB + "." + s
+								}
+							}
+							arr[i] = s
 						}
 						subqueryTblBlock = append(subqueryTblBlock, orderedKV{"ref", arr})
 					}
@@ -11787,15 +11837,44 @@ func (e *Executor) explainJSONDocument(query string) string {
 					driverTables = append(driverTables, []orderedKV{{"table", tblBlock}})
 				}
 			}
-			// Build: driver tables, then subqueries (sorted by ID), then dependent tables
+			// Build: driver tables, then subqueries, then dependent tables.
+			// Subquery ordering: when there are multiple sibling materialized
+			// subqueries, MySQL's optimizer chooses the join order based on
+			// cost.  As a coarse cost proxy we order by descending number of
+			// tables inside each materialization (multi-table subqueries first,
+			// matching MySQL's choice of joining the most selective subquery
+			// earliest).  Single-table-only subqueries fall back to ID order.
 			nestedLoop = append(nestedLoop, driverTables...)
 			var matIDs []int64
 			for matID := range materializedRowsByID {
 				matIDs = append(matIDs, matID)
 			}
+			// Compute per-id table count from materializedRowsByID.
+			matTableCount := make(map[int64]int, len(matIDs))
+			for matID, rows := range materializedRowsByID {
+				matTableCount[matID] = len(rows)
+			}
+			anyMultiTable := false
+			for _, c := range matTableCount {
+				if c > 1 {
+					anyMultiTable = true
+					break
+				}
+			}
 			for i := 0; i < len(matIDs); i++ {
 				for j := i + 1; j < len(matIDs); j++ {
-					if matIDs[i] > matIDs[j] {
+					less := false
+					if anyMultiTable {
+						// Sort by descending table count, then ascending ID.
+						if matTableCount[matIDs[i]] != matTableCount[matIDs[j]] {
+							less = matTableCount[matIDs[i]] < matTableCount[matIDs[j]]
+						} else {
+							less = matIDs[i] > matIDs[j]
+						}
+					} else {
+						less = matIDs[i] > matIDs[j]
+					}
+					if less {
 						matIDs[i], matIDs[j] = matIDs[j], matIDs[i]
 					}
 				}
