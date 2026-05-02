@@ -67,6 +67,12 @@ type explainSelectType struct {
 	key          interface{} // string or nil
 	keyLen       interface{} // string or nil
 	ref          interface{} // string (comma-separated) or nil
+	// isUnionAll is true on a UNION RESULT row when the chain is pure UNION ALL
+	// (no DISTINCT step).  In MySQL such queries don't materialize a temporary
+	// table, so text EXPLAIN suppresses the UNION RESULT row entirely while
+	// EXPLAIN FORMAT=JSON emits a union_result block with
+	// using_temporary_table:false and no table_name/access_type keys.
+	isUnionAll bool
 }
 
 // explainMultiRows returns one or more EXPLAIN rows, detecting subqueries,
@@ -1255,7 +1261,10 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 		return [][]interface{}{e.dummyExplainRow(query)}
 	}
 
-	// Convert to row format
+	// Convert to row format.  We keep UNION RESULT rows for pure UNION ALL
+	// chains here so the EXPLAIN FORMAT=JSON path can still build a
+	// union_result block; tabular EXPLAIN strips these rows in
+	// explainResultForType (see the empty-extra check there).
 	rows := make([][]interface{}, len(result))
 	for i, r := range result {
 		rows[i] = []interface{}{
@@ -2374,8 +2383,17 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 			// condition), and only when the inner SELECT references the empty table.
 			isDependentSubqueryEmptyInner := selectType == "DEPENDENT SUBQUERY" && tableIsEmpty &&
 				len(allTableNames) == 1 && idx == 0 && sel.Where == nil
+			// UNION branch over a single empty table: MySQL detects the branch as
+			// having no matching rows and emits "no matching row in const table"
+			// (e.g. `UNION SELECT * FROM t3` where t3 is empty).  Also fires when the
+			// branch's WHERE has a single subquery whose semijoin-flattening collapses
+			// after const-table elimination of the empty outer table (e.g.
+			// `UNION ALL SELECT * FROM t3 WHERE i IN (SELECT i FROM t4 ...)`).
+			isUnionBranchEmpty := selectType == "UNION" && tableIsEmpty &&
+				len(allTableNames) == 1 && idx == 0 &&
+				(sel.Where == nil || (!e.queryHasComplexParts(sel) || e.whereHasSingleSubquery(sel)))
 			if tableIsEmpty && len(allTableNames) == 1 && idx == 0 && selectType != "MATERIALIZED" &&
-				(isSimpleTopLevel || accessInfo.accessType == "const" || accessInfo.accessType == "system" || isDependentSubqueryEmptyInner) {
+				(isSimpleTopLevel || accessInfo.accessType == "const" || accessInfo.accessType == "system" || isDependentSubqueryEmptyInner || isUnionBranchEmpty) {
 				result = append(result, explainSelectType{
 					id:         myID,
 					selectType: selectType,
@@ -2389,6 +2407,16 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 				// (SIMPLE), return immediately without processing subqueries. MySQL collapses the
 				// entire result to 1 NULL row in this case.
 				if selectType == "SIMPLE" {
+					return result
+				}
+				// UNION branch over empty outer: if the WHERE has a subquery that
+				// cannot be semijoin-flattened (because semijoin is off / not
+				// applicable), MySQL still emits the inner SUBQUERY with extra
+				// "Not optimized, outer query is empty".  Skip them otherwise.
+				if isUnionBranchEmpty {
+					if sel.Where != nil && !e.queryCanBeSemijoinFlattened(sel) {
+						e.explainSubqueriesNotOptimized(sel, idCounter, &result)
+					}
 					return result
 				}
 				continue
@@ -6812,26 +6840,64 @@ func (e *Executor) explainUnion(u *sqlparser.Union, idCounter *int64, isTopLevel
 		}
 	}
 
-	// Add UNION RESULT row
+	// Add UNION RESULT row.
+	// MySQL only emits a UNION RESULT row in tabular EXPLAIN when at least one
+	// UNION (DISTINCT) step in the chain requires a temporary table to
+	// deduplicate.  Pure UNION ALL chains don't materialize, so MySQL skips
+	// the UNION RESULT row in text EXPLAIN.  In EXPLAIN FORMAT=JSON, however,
+	// MySQL still emits a `union_result` block (with using_temporary_table:
+	// false), so we keep an internal UNION RESULT row in either case and let
+	// the renderers decide whether to display it.
 	if isTopLevel || len(selects) > 1 {
+		hasDistinctUnion := unionChainHasDistinct(u)
 		// Build <unionN,M,...> table name
 		unionTableParts := make([]string, len(unionIDs))
 		for i, id := range unionIDs {
 			unionTableParts[i] = strconv.FormatInt(id, 10)
 		}
 		unionTable := "<union" + strings.Join(unionTableParts, ",") + ">"
+		extra := "Using temporary"
+		if !hasDistinctUnion {
+			// Marker so that text EXPLAIN can suppress this row but JSON
+			// EXPLAIN can still build a union_result block.
+			extra = ""
+		}
 		result = append(result, explainSelectType{
 			id:         nil,
 			selectType: "UNION RESULT",
 			table:      unionTable,
-			extra:      "Using temporary",
+			extra:      extra,
 			rows:       nil,
 			filtered:   nil,
 			accessType: "ALL",
+			isUnionAll: !hasDistinctUnion,
 		})
 	}
 
 	return result
+}
+
+// unionChainHasDistinct reports whether any Union node in the chain rooted at
+// u (or u itself) is a DISTINCT union (i.e. requires deduplication).  It
+// recurses into Left/Right Union children to walk the full UNION chain.
+func unionChainHasDistinct(u *sqlparser.Union) bool {
+	if u == nil {
+		return false
+	}
+	if u.Distinct {
+		return true
+	}
+	if leftU, ok := u.Left.(*sqlparser.Union); ok {
+		if unionChainHasDistinct(leftU) {
+			return true
+		}
+	}
+	if rightU, ok := u.Right.(*sqlparser.Union); ok {
+		if unionChainHasDistinct(rightU) {
+			return true
+		}
+	}
+	return false
 }
 
 // flattenUnion flattens a UNION tree into a slice of TableStatement.
@@ -10428,16 +10494,19 @@ func (e *Executor) explainJSONDocument(query string) string {
 	// Build the query_block with ordered keys
 	var queryBlock []orderedKV
 
-	// select_id
-	if parsed[0].id != nil {
-		switch v := parsed[0].id.(type) {
-		case int64:
-			queryBlock = append(queryBlock, orderedKV{"select_id", v})
-		default:
+	// select_id (skip for top-level UNION queries: MySQL's outer query_block for
+	// a UNION at the top level contains only union_result, no select_id/cost_info)
+	if unionResultRow == nil {
+		if parsed[0].id != nil {
+			switch v := parsed[0].id.(type) {
+			case int64:
+				queryBlock = append(queryBlock, orderedKV{"select_id", v})
+			default:
+				queryBlock = append(queryBlock, orderedKV{"select_id", int64(1)})
+			}
+		} else {
 			queryBlock = append(queryBlock, orderedKV{"select_id", int64(1)})
 		}
-	} else {
-		queryBlock = append(queryBlock, orderedKV{"select_id", int64(1)})
 	}
 
 	// Build the main content based on structure
@@ -10866,28 +10935,98 @@ func (e *Executor) explainJSONDocument(query string) string {
 			queryBlock = append(queryBlock, orderedKV{"nested_loop", nl})
 		}
 	} else if unionResultRow != nil {
-		// UNION query
-		queryBlock = append(queryBlock, orderedKV{"cost_info", []orderedKV{
-			{"query_cost", fmt.Sprintf("%.2f", totalCost)},
-		}})
+		// UNION query: outer query_block contains only union_result (no
+		// select_id/cost_info at this level — MySQL emits those inside each
+		// query_specifications entry).
 		var querySpecs []interface{}
 
+		// Group rows by id, preserving the order the rows appear in `parsed`.
+		// A UNION branch may have multiple tables (a JOIN) sharing one id; we
+		// build a single query_block with a nested_loop in that case.
+		type idGroup struct {
+			id   int64
+			rows []parsedRow
+		}
+		var groups []idGroup
+		groupIndex := map[int64]int{}
+		appendByID := func(p parsedRow) {
+			id, ok := p.id.(int64)
+			if !ok {
+				return
+			}
+			if gi, exists := groupIndex[id]; exists {
+				groups[gi].rows = append(groups[gi].rows, p)
+				return
+			}
+			groupIndex[id] = len(groups)
+			groups = append(groups, idGroup{id: id, rows: []parsedRow{p}})
+		}
 		for _, p := range primaryRows {
-			querySpecs = append(querySpecs, e.explainJSONQueryBlockForRow(p.row, query))
+			appendByID(p)
 		}
 		for _, p := range unionRows {
-			querySpecs = append(querySpecs, e.explainJSONQueryBlockForRow(p.row, query))
+			appendByID(p)
 		}
 
-		unionResult := []orderedKV{
-			{"using_temporary_table", true},
-			{"table_name", fmt.Sprintf("%v", unionResultRow.row[2])},
+		appendSpec := func(g idGroup) {
+			var qb []orderedKV
+			if len(g.rows) == 1 {
+				qb = e.explainJSONQueryBlockForRow(g.rows[0].row, query)
+			} else {
+				// JOIN inside a UNION branch: build a query_block with a
+				// nested_loop of all rows for this id.
+				qb = append(qb, orderedKV{"select_id", g.id})
+				totalCost := 0.0
+				for _, r := range g.rows {
+					rc := explainJSONRowCount(r.row)
+					totalCost += float64(rc)*0.10 + 0.25
+				}
+				qb = append(qb, orderedKV{"cost_info", []orderedKV{
+					{"query_cost", fmt.Sprintf("%.2f", totalCost)},
+				}})
+				var nl []interface{}
+				for _, r := range g.rows {
+					tblBlock := e.explainJSONTableBlock(r.row, query)
+					nl = append(nl, []orderedKV{{"table", tblBlock}})
+				}
+				qb = append(qb, orderedKV{"nested_loop", nl})
+			}
+			spec := []orderedKV{
+				{"dependent", false},
+				{"cacheable", true},
+				{"query_block", qb},
+			}
+			querySpecs = append(querySpecs, spec)
 		}
-		accessType := "ALL"
-		if unionResultRow.row[4] != nil {
-			accessType = fmt.Sprintf("%v", unionResultRow.row[4])
+		for _, g := range groups {
+			appendSpec(g)
 		}
-		unionResult = append(unionResult, orderedKV{"access_type", accessType})
+
+		// UNION ALL chains don't materialize a temporary table.  The
+		// internal UNION RESULT row carries an empty Extra in that case
+		// (set in explainUnion).  In MySQL's EXPLAIN FORMAT=JSON, such
+		// queries emit `using_temporary_table: false` and omit table_name
+		// and access_type from the union_result block.
+		isUnionAll := false
+		if unionResultRow.row[11] == nil || fmt.Sprintf("%v", unionResultRow.row[11]) == "" {
+			isUnionAll = true
+		}
+		var unionResult []orderedKV
+		if isUnionAll {
+			unionResult = []orderedKV{
+				{"using_temporary_table", false},
+			}
+		} else {
+			unionResult = []orderedKV{
+				{"using_temporary_table", true},
+				{"table_name", fmt.Sprintf("%v", unionResultRow.row[2])},
+			}
+			accessType := "ALL"
+			if unionResultRow.row[4] != nil {
+				accessType = fmt.Sprintf("%v", unionResultRow.row[4])
+			}
+			unionResult = append(unionResult, orderedKV{"access_type", accessType})
+		}
 		unionResult = append(unionResult, orderedKV{"query_specifications", querySpecs})
 
 		queryBlock = append(queryBlock, orderedKV{"union_result", unionResult})
@@ -12262,9 +12401,24 @@ func (e *Executor) explainResultForType(explainType sqlparser.ExplainType, expla
 		}
 	default:
 		rows := e.explainMultiRows(explainedQuery)
+		// Drop UNION RESULT rows for pure UNION ALL chains (no temporary
+		// table needed to deduplicate).  These rows have empty Extra; we
+		// keep them in the rowset for the JSON renderer to detect a UNION
+		// query, but MySQL doesn't emit them in tabular EXPLAIN.
+		filtered := make([][]interface{}, 0, len(rows))
+		for _, r := range rows {
+			if len(r) >= 12 {
+				if st, ok := r[1].(string); ok && st == "UNION RESULT" {
+					if r[11] == nil || fmt.Sprintf("%v", r[11]) == "" {
+						continue
+					}
+				}
+			}
+			filtered = append(filtered, r)
+		}
 		return &Result{
 			Columns:     []string{"id", "select_type", "table", "partitions", "type", "possible_keys", "key", "key_len", "ref", "rows", "filtered", "Extra"},
-			Rows:        rows,
+			Rows:        filtered,
 			IsResultSet: true,
 		}
 	}
