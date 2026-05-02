@@ -11273,6 +11273,16 @@ func (e *Executor) explainJSONDocument(query string) string {
 		}
 		propagate(outerTbl, outerCol, innerTbl, innerCol)
 		propagate(innerTbl, innerCol, outerTbl, outerCol)
+		// FirstMatch semijoin equality: when no other condition was derived for the
+		// inner table, MySQL emits the IN-equality itself as the inner table's
+		// attached_condition (e.g. `(test.t2.c = test.t1.a)`).  This represents
+		// the join predicate that the FirstMatch strategy uses to match rows.
+		if innerTbl != "" && innerCol != "" && outerTbl != "" && outerCol != "" {
+			if _, ok := out[innerTbl]; !ok {
+				out[innerTbl] = fmt.Sprintf("(`%s`.`%s`.`%s` = `%s`.`%s`.`%s`)",
+					dbName, innerTbl, innerCol, dbName, outerTbl, outerCol)
+			}
+		}
 		return out
 	}
 
