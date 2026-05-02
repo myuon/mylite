@@ -108,6 +108,12 @@ func TestExplainSelectType_SubqueryInSelect(t *testing.T) {
 
 func TestExplainSelectType_DerivedTable(t *testing.T) {
 	e := newTestExecutor(t)
+	// Insert a row so t1 is not empty: an empty single-table inner select
+	// triggers the "derived table optimized out" collapse and would emit a
+	// single SIMPLE row, which is a separate code path covered elsewhere.
+	if _, err := e.Execute("INSERT INTO t1 (id, val) VALUES (1, 'a')"); err != nil {
+		t.Fatalf("insert t1: %v", err)
+	}
 	res, err := e.Execute("EXPLAIN SELECT * FROM (SELECT id FROM t1) AS dt")
 	if err != nil {
 		t.Fatalf("EXPLAIN failed: %v", err)
@@ -128,6 +134,33 @@ func TestExplainSelectType_DerivedTable(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected a DERIVED row, got types: %v", types)
+	}
+}
+
+// TestExplainSelectType_DerivedTableOptimizedOut covers the case where a
+// FROM-clause derived table is mergeable and its inner SELECT scans a single
+// empty base table. MySQL collapses the plan to a single SIMPLE row with
+// "no matching row in const table" and suppresses the inner DERIVED row.
+func TestExplainSelectType_DerivedTableOptimizedOut(t *testing.T) {
+	e := newTestExecutor(t)
+	// t1 is empty by default in the test executor.
+	res, err := e.Execute("EXPLAIN SELECT 1 FROM (SELECT 1 AS x FROM t1) tt WHERE x")
+	if err != nil {
+		t.Fatalf("EXPLAIN failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %+v", len(res.Rows), res.Rows)
+	}
+	row := res.Rows[0]
+	if row[1] != "SIMPLE" {
+		t.Errorf("expected select_type=SIMPLE, got %v", row[1])
+	}
+	if row[2] != nil {
+		t.Errorf("expected table=NULL, got %v", row[2])
+	}
+	extra, _ := row[11].(string)
+	if extra != "no matching row in const table" {
+		t.Errorf("expected extra=\"no matching row in const table\", got %q", extra)
 	}
 }
 

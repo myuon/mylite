@@ -2460,6 +2460,31 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 		for _, te := range sel.From {
 			e.collectDerivedSelects(te, &derivedSelects)
 		}
+		// "Derived table optimized out": when the outer FROM consists of a single
+		// mergeable derived table whose inner SELECT scans a single empty base
+		// table, MySQL merges the derived table away and emits a single
+		// "1 SIMPLE NULL ... no matching row in const table" row in EXPLAIN
+		// (regardless of FORMAT). The inner DERIVED row is suppressed because
+		// after merging there is no separate derived select.
+		// Example: `EXPLAIN SELECT 1 FROM (SELECT 1 AS x FROM t1) tt WHERE x`
+		// where t1 is empty.
+		if numDerived == 1 && len(derivedSelects) == 1 &&
+			e.derivedSelectIsMergeable(sel, derivedSelects[0]) &&
+			e.derivedInnerHasOnlyEmptyTable(derivedSelects[0]) {
+			// Consume the derived id assignment that explainFromExpr would have
+			// produced, so subsequent ids stay aligned with the rest of the plan.
+			*idCounter++
+			result = append(result, explainSelectType{
+				id:         int64(1),
+				selectType: "SIMPLE",
+				table:      nil,
+				extra:      "no matching row in const table",
+				rows:       nil,
+				filtered:   nil,
+				accessType: nil,
+			})
+			return result
+		}
 		for i := 0; i < numDerived; i++ {
 			derivedRef := fmt.Sprintf("<derived%d>", nextID)
 			// Check if this derived table would produce 0 rows (e.g., cross-table NULL comparison).
@@ -5235,6 +5260,87 @@ func (e *Executor) collectDerivedSelects(te sqlparser.TableExpr, selects *[]*sql
 			e.collectDerivedSelects(expr, selects)
 		}
 	}
+}
+
+// derivedSelectIsMergeable returns true if a FROM-clause derived table is
+// eligible for derived_merge: no aggregation, GROUP BY, DISTINCT, HAVING,
+// LIMIT, window functions, or set operations. The outer SELECT must also be
+// simple enough that merging yields a single combined query block (no GROUP
+// BY / aggregation / DISTINCT in the outer either, since merging would
+// otherwise require pulling those constructs through the derived projection).
+func (e *Executor) derivedSelectIsMergeable(outer *sqlparser.Select, inner *sqlparser.Select) bool {
+	if inner == nil {
+		return false
+	}
+	if !e.isOptimizerSwitchEnabled("derived_merge") {
+		return false
+	}
+	if (inner.GroupBy != nil && len(inner.GroupBy.Exprs) > 0) || inner.Having != nil || inner.Distinct {
+		return false
+	}
+	if inner.Limit != nil {
+		return false
+	}
+	// Reject aggregate or window functions anywhere in the inner select list.
+	hasAgg := false
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if expr, ok := n.(sqlparser.Expr); ok {
+			if isAggregateExpr(expr) {
+				hasAgg = true
+				return false, nil
+			}
+		}
+		if oc, ok := n.(*sqlparser.OverClause); ok {
+			_ = oc
+			hasAgg = true
+			return false, nil
+		}
+		return true, nil
+	}, inner.SelectExprs)
+	if hasAgg {
+		return false
+	}
+	if outer != nil {
+		if (outer.GroupBy != nil && len(outer.GroupBy.Exprs) > 0) || outer.Having != nil || outer.Distinct {
+			return false
+		}
+		if outer.Limit != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// derivedInnerHasOnlyEmptyTable returns true when the derived table's inner
+// SELECT is a single-table scan (no JOINs, no further derived tables) over a
+// real base table that currently has zero rows. This corresponds to MySQL's
+// "derived table that is optimized out" case: after const-table elimination
+// the merged outer query reduces to a scan of an empty table, producing the
+// "no matching row in const table" message.
+func (e *Executor) derivedInnerHasOnlyEmptyTable(inner *sqlparser.Select) bool {
+	if inner == nil || e.Storage == nil {
+		return false
+	}
+	if len(inner.From) != 1 {
+		return false
+	}
+	at, ok := inner.From[0].(*sqlparser.AliasedTableExpr)
+	if !ok {
+		return false
+	}
+	tn, ok := at.Expr.(sqlparser.TableName)
+	if !ok {
+		return false
+	}
+	tblName := tn.Name.String()
+	if tblName == "" || strings.EqualFold(tblName, "dual") {
+		return false
+	}
+	tbl, err := e.Storage.GetTable(e.CurrentDB, tblName)
+	if err != nil || tbl == nil {
+		return false
+	}
+	return len(tbl.Rows) == 0
 }
 
 // explainDerivedTableHasZeroRows returns true if the inner SELECT of a derived table would
