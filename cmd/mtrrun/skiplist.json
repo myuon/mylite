@@ -3153,10 +3153,6 @@
       "reason": "still failing"
     },
     {
-      "test": "sys_vars/group_concat_max_len_func",
-      "reason": "still failing"
-    },
-    {
       "test": "sys_vars/completion_type_func",
       "reason": "still failing"
     },
