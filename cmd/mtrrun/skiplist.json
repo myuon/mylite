@@ -4433,10 +4433,6 @@
       "reason": "needs special session tracking behavior"
     },
     {
-      "test": "sys_vars/max_allowed_packet_basic",
-      "reason": "single-line diff at comparison query"
-    },
-    {
       "test": "sys_vars/binlog_row_event_max_size_basic",
       "reason": "needs persist support"
     },
