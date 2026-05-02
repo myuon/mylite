@@ -10207,6 +10207,50 @@ func (e *Executor) explainJSONQueryBlockForRow(row []interface{}, query string) 
 	return qb
 }
 
+// explainJSONComputeSubqueryParents walks the parsed query and assigns each
+// nested SELECT statement a textual select_id (matching MySQL's numbering),
+// returning a map from select_id -> immediate parent select_id.  The outer
+// SELECT is select_id=1 with no parent (omitted from the map).  IDs are
+// assigned in textual (depth-first) order, mirroring MySQL's optimizer.
+//
+// This is used to attach attached_subqueries to the right query_block when a
+// subquery's body itself contains nested subqueries (e.g. SOME/ANY/ALL or a
+// scalar subquery within an IN-subquery's WHERE).  Without this distinction,
+// all subqueries would flatly attach to the outermost table block.
+func (e *Executor) explainJSONComputeSubqueryParents(query string) map[int64]int64 {
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		return nil
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return nil
+	}
+	parents := map[int64]int64{}
+	nextID := int64(2)
+	var visit func(s *sqlparser.Select, parentID int64)
+	visit = func(s *sqlparser.Select, parentID int64) {
+		// Assign IDs to all nested SELECTs found by walking this select.
+		// We must NOT recurse INTO nested SELECTs from this Walk (we'll
+		// recurse explicitly), so we stop traversal at each Subquery boundary.
+		_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+			if sub, ok := n.(*sqlparser.Subquery); ok {
+				if inner, ok := sub.Select.(*sqlparser.Select); ok {
+					id := nextID
+					nextID++
+					parents[id] = parentID
+					visit(inner, id)
+				}
+				// Stop: we've handled the inner SELECT via the recursive call.
+				return false, nil
+			}
+			return true, nil
+		}, s)
+	}
+	visit(sel, 1)
+	return parents
+}
+
 // explainJSONInExistsInfo holds the per-IN-subquery markers used in EXPLAIN
 // FORMAT=JSON when MySQL rewrites `outer.col IN (SELECT ...)` into
 // `<in_optimizer>(outer.col, <exists>(SELECT 1 FROM ... WHERE <cond>))` form.
@@ -10634,6 +10678,41 @@ func explainJSONInjectInnerAttachedCondition(qb []orderedKV, cond string) []orde
 		}
 		if !replaced {
 			tbl = append(tbl, orderedKV{"attached_condition", cond})
+		}
+		qb[i] = orderedKV{"table", tbl}
+		return qb
+	}
+	return qb
+}
+
+// explainJSONInjectAttachedSubqueriesIntoTable rewrites a query_block's table
+// sub-block to append an attached_subqueries entry containing the supplied
+// child blocks.  Used when subqueries are nested inside another subquery's
+// body (e.g. SOME/ANY/ALL or scalar subquery within an IN-subquery's WHERE).
+// The returned slice is the modified query_block.
+func explainJSONInjectAttachedSubqueriesIntoTable(qb []orderedKV, children []interface{}) []orderedKV {
+	if len(children) == 0 {
+		return qb
+	}
+	for i, kv := range qb {
+		if kv.Key != "table" {
+			continue
+		}
+		tbl, ok := kv.Value.([]orderedKV)
+		if !ok {
+			continue
+		}
+		// Replace existing attached_subqueries or append at end of table block.
+		replaced := false
+		for j, sub := range tbl {
+			if sub.Key == "attached_subqueries" {
+				tbl[j] = orderedKV{"attached_subqueries", children}
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			tbl = append(tbl, orderedKV{"attached_subqueries", children})
 		}
 		qb[i] = orderedKV{"table", tbl}
 		return qb
@@ -12112,11 +12191,22 @@ func (e *Executor) explainJSONDocument(query string) string {
 				var attachedSubs []interface{}
 				hasDependentSubs := false
 				if !hasHavingSubquery && !hasGroupBySubquery {
+					// Compute parent select_id for each subquery; subqueries
+					// nested inside another subquery's body must attach to the
+					// parent subquery's table block, not the outer t1 block.
+					parentByID := e.explainJSONComputeSubqueryParents(query)
+					// Build qb for each subquery first (in textual order) so
+					// children can be merged into their parents.
+					type subEntry struct {
+						id        int64
+						selectID  int64
+						parentID  int64
+						dependent bool
+						qb        []orderedKV
+					}
+					entries := make([]subEntry, 0, len(subqueryRows))
 					for _, s := range subqueryRows {
 						qb := e.explainJSONQueryBlockForRow(s.row, query)
-						// If we have IN→EXISTS marker info and this row is a
-						// DEPENDENT SUBQUERY, inject the inner attached_condition
-						// into the inner table's block (if present).
 						if inExistsInfo != nil && s.selectType == "DEPENDENT SUBQUERY" {
 							if id, ok := s.row[0].(int64); ok {
 								if cond, found := inExistsInfo.InnerCondBySelectID[id]; found && cond != "" {
@@ -12124,20 +12214,90 @@ func (e *Executor) explainJSONDocument(query string) string {
 								}
 							}
 						}
-						if s.selectType == "DEPENDENT SUBQUERY" {
-							hasDependentSubs = true
-							attachedSubs = append(attachedSubs, []orderedKV{
+						selID := int64(0)
+						if id, ok := s.row[0].(int64); ok {
+							selID = id
+						}
+						entries = append(entries, subEntry{
+							selectID:  selID,
+							parentID:  parentByID[selID],
+							dependent: s.selectType == "DEPENDENT SUBQUERY",
+							qb:        qb,
+						})
+					}
+					// Build a wrap-helper that mirrors what we do for top-level.
+					wrap := func(en subEntry) []orderedKV {
+						if en.dependent {
+							return []orderedKV{
 								{"dependent", true},
 								{"cacheable", false},
-								{"query_block", qb},
-							})
-						} else {
-							attachedSubs = append(attachedSubs, []orderedKV{
-								{"dependent", false},
-								{"cacheable", true},
-								{"query_block", qb},
-							})
+								{"query_block", en.qb},
+							}
 						}
+						return []orderedKV{
+							{"dependent", false},
+							{"cacheable", true},
+							{"query_block", en.qb},
+						}
+					}
+					// Group children by parent select_id.  A subquery is
+					// "nested" only if its parent is itself a subquery row
+					// (still present as DEPENDENT SUBQUERY/SUBQUERY at this
+					// level).  When the parent has been flattened (e.g. by
+					// semijoin into PRIMARY), its children re-attach to the
+					// outer table block instead.
+					existsByID := map[int64]bool{}
+					for _, en := range entries {
+						if en.selectID > 0 {
+							existsByID[en.selectID] = true
+						}
+					}
+					childrenByParent := map[int64][]int{}
+					for i, en := range entries {
+						if en.parentID > 1 && existsByID[en.parentID] {
+							childrenByParent[en.parentID] = append(childrenByParent[en.parentID], i)
+						}
+					}
+					// For parents that have nested children, inject those into
+					// the parent qb's table block as attached_subqueries.
+					for pid, childIdxs := range childrenByParent {
+						// Find the entry index for the parent select_id.
+						parentIdx := -1
+						for i, en := range entries {
+							if en.selectID == pid {
+								parentIdx = i
+								break
+							}
+						}
+						if parentIdx == -1 {
+							continue
+						}
+						// Order children: DEPENDENT first, then non-DEPENDENT
+						// (matches MySQL's display order for nested attached_subqueries).
+						var depChildren, nondepChildren []interface{}
+						for _, ci := range childIdxs {
+							if entries[ci].dependent {
+								depChildren = append(depChildren, wrap(entries[ci]))
+							} else {
+								nondepChildren = append(nondepChildren, wrap(entries[ci]))
+							}
+						}
+						childWrapped := append(depChildren, nondepChildren...)
+						entries[parentIdx].qb = explainJSONInjectAttachedSubqueriesIntoTable(entries[parentIdx].qb, childWrapped)
+					}
+					// Now build attachedSubs from top-level entries only:
+					// either parent==1 (direct child of outer) or parent
+					// flattened (not in subqueryRows, e.g. semijoin'd into
+					// PRIMARY, in which case the child attaches to outer too).
+					// Preserve textual order from subqueryRows.
+					for _, en := range entries {
+						if en.parentID > 1 && existsByID[en.parentID] {
+							continue
+						}
+						if en.dependent {
+							hasDependentSubs = true
+						}
+						attachedSubs = append(attachedSubs, wrap(en))
 					}
 				}
 				// When the subqueries are dependent (IN/EXISTS attached to this table's
