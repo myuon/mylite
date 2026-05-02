@@ -2345,10 +2345,6 @@
       "reason": "=== encryption suite === === large_tests suite === === binlog_nogtid suite === === innodb_undo suite === === innodb_zip suite === === gcol_ndb suite === === innodb_gis suite === === innodb_stress suite === === max_parts suite === === opt_trace suite === === auth_sec suite === === binlog suite === collations suite: partially supported via Vitess UCA 0900 weight tables Remaining failures require multi-character contraction tie-breaking === query_rewrite_plugins suite === (requires rewriter plugin)"
     },
     {
-      "test": "funcs_1/myisam_cursors",
-      "reason": "FK/SP feature gaps remaining"
-    },
-    {
       "test": "funcs_1/myisam_storedproc_02",
       "reason": "FK/SP feature gaps remaining"
     },
@@ -3173,10 +3169,6 @@
       "reason": "complex query failures"
     },
     {
-      "test": "gcol/gcol_view_myisam",
-      "reason": "view update failures"
-    },
-    {
       "test": "gcol/gcol_keys_innodb",
       "reason": "failures"
     },
@@ -3282,10 +3274,6 @@
     },
     {
       "test": "funcs_1/is_tables_myisam",
-      "reason": "failures"
-    },
-    {
-      "test": "funcs_1/myisam_bitdata",
       "reason": "failures"
     },
     {
@@ -4263,10 +4251,6 @@
     {
       "test": "funcs_1/charset_collation",
       "reason": "column order mismatch in collation result - flaky in full suite"
-    },
-    {
-      "test": "other/filter_single_col_idx_big_myisam",
-      "reason": "MyISAM force-default test with FULLTEXT, times out due to MyISAM/FULLTEXT not pursued"
     },
     {
       "test": "gis/srs",
