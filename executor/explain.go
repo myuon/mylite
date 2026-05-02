@@ -1320,6 +1320,72 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 		return [][]interface{}{e.dummyExplainRow(query)}
 	}
 
+	// Post-process SELECT-list subqueries: when a subquery in the outer
+	// SELECT list contains nondeterministic content (e.g. ORDER BY RAND()),
+	// MySQL labels the EXPLAIN row "UNCACHEABLE SUBQUERY" instead of
+	// "SUBQUERY".  When the inner subquery has ORDER BY + LIMIT, MySQL also
+	// adds "Using temporary; Using filesort" to the Extra column because the
+	// inner SELECT must materialise an ordered set before applying LIMIT.
+	if topSel, ok := stmt.(*sqlparser.Select); ok {
+		selSubs := explainSelectListSubqueries(topSel)
+		if len(selSubs) > 0 {
+			// Map each SELECT-list subquery's body (a *sqlparser.Select) to
+			// its uncacheable / ordering metadata.
+			for _, sub := range selSubs {
+				inner, isSel := sub.Select.(*sqlparser.Select)
+				if !isSel {
+					continue
+				}
+				uncacheable := subqueryIsNondeterministic(sub)
+				innerHasOrderByLimit := len(inner.OrderBy) > 0 && inner.Limit != nil
+				if !uncacheable && !innerHasOrderByLimit {
+					continue
+				}
+				// Find the row in `result` corresponding to this subquery.
+				// We match on the inner table name and a SUBQUERY-class
+				// selectType.  When multiple SELECT-list subqueries reference
+				// the same table, we mark the first un-mutated one.
+				var innerTbl string
+				for _, te := range inner.From {
+					for _, tn := range e.extractAllTableNames(te) {
+						if !strings.EqualFold(tn, "dual") {
+							innerTbl = tn
+							break
+						}
+					}
+					if innerTbl != "" {
+						break
+					}
+				}
+				for i := range result {
+					r := &result[i]
+					if r.selectType != "SUBQUERY" {
+						continue
+					}
+					if tblStr, ok := r.table.(string); !ok || !strings.EqualFold(tblStr, innerTbl) {
+						continue
+					}
+					if uncacheable {
+						r.selectType = "UNCACHEABLE SUBQUERY"
+					}
+					if innerHasOrderByLimit {
+						extraStr := ""
+						if r.extra != nil {
+							extraStr = fmt.Sprintf("%v", r.extra)
+						}
+						addition := "Using temporary; Using filesort"
+						if extraStr == "" {
+							r.extra = addition
+						} else if !strings.Contains(extraStr, "Using filesort") {
+							r.extra = extraStr + "; " + addition
+						}
+					}
+					break
+				}
+			}
+		}
+	}
+
 	// Convert to row format.  We keep UNION RESULT rows for pure UNION ALL
 	// chains here so the EXPLAIN FORMAT=JSON path can still build a
 	// union_result block; tabular EXPLAIN strips these rows in
@@ -5868,6 +5934,53 @@ func outerINExprIsConstant(node sqlparser.SQLNode, sub *sqlparser.Subquery) bool
 		return true, nil
 	}, node)
 	return isConst
+}
+
+// subqueryIsNondeterministic returns true when the subquery body contains
+// nondeterministic functions (e.g. RAND(), UUID(), NOW(), CONNECTION_ID(),
+// USER()) that prevent MySQL from caching its result across the outer rows.
+// Such subqueries are labelled "UNCACHEABLE SUBQUERY" in EXPLAIN.
+func subqueryIsNondeterministic(node sqlparser.SQLNode) bool {
+	found := false
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if found {
+			return false, nil
+		}
+		if fe, ok := n.(*sqlparser.FuncExpr); ok {
+			name := strings.ToLower(fe.Name.String())
+			switch name {
+			case "rand", "uuid", "uuid_short", "sysdate", "connection_id",
+				"user", "session_user", "system_user", "current_user",
+				"sleep", "release_lock", "get_lock", "release_all_locks",
+				"last_insert_id", "found_rows", "row_count", "version",
+				"benchmark", "load_file":
+				found = true
+				return false, nil
+			}
+		}
+		return true, nil
+	}, node)
+	return found
+}
+
+// explainSelectListSubqueries returns the top-level subqueries appearing in
+// the SELECT list of `sel`.  Only direct subqueries are returned (not those
+// nested inside WHERE/HAVING/etc).
+func explainSelectListSubqueries(sel *sqlparser.Select) []*sqlparser.Subquery {
+	var subs []*sqlparser.Subquery
+	if sel == nil || sel.SelectExprs == nil {
+		return nil
+	}
+	for _, se := range sel.SelectExprs.Exprs {
+		_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+			if sub, ok := n.(*sqlparser.Subquery); ok {
+				subs = append(subs, sub)
+				return false, nil // don't descend into nested subqueries
+			}
+			return true, nil
+		}, se)
+	}
+	return subs
 }
 
 // explainSubqueriesNotOptimized walks subqueries in WHERE/SELECT/HAVING and emits
@@ -10497,7 +10610,7 @@ func (e *Executor) explainJSONDocument(query string) string {
 		switch parsed[i].selectType {
 		case "SIMPLE", "PRIMARY":
 			primaryRows = append(primaryRows, parsed[i])
-		case "SUBQUERY", "DEPENDENT SUBQUERY":
+		case "SUBQUERY", "DEPENDENT SUBQUERY", "UNCACHEABLE SUBQUERY":
 			subqueryRows = append(subqueryRows, parsed[i])
 		case "DERIVED":
 			derivedRows = append(derivedRows, parsed[i])
@@ -10538,6 +10651,16 @@ func (e *Executor) explainJSONDocument(query string) string {
 	// using_filesort: false`, and the subqueries are emitted as
 	// `group_by_subqueries` with `dependent: true, cacheable: false`.
 	hasGroupBySubquery := false
+	// Detect if the SELECT list contains a subquery.  In MySQL EXPLAIN
+	// FORMAT=JSON, such subqueries are emitted as `select_list_subqueries`
+	// (not `attached_subqueries`) at the query_block level.  When the
+	// subquery is nondeterministic (e.g. ORDER BY RAND()), MySQL marks it
+	// with `dependent: false, cacheable: false`.
+	hasSelectListSubquery := false
+	// selectListSubqueryIDs collects the inner subquery select_ids whose
+	// body has ORDER BY + LIMIT, so the JSON path can wrap their table in
+	// an `ordering_operation` block.
+	selectListSubqueryIDs := map[int64]bool{}
 	if stmt, err := e.parser().Parse(query); err == nil {
 		if sel, ok := stmt.(*sqlparser.Select); ok {
 			if len(sel.OrderBy) > 0 && !hasWindowFuncs {
@@ -10577,6 +10700,46 @@ func (e *Executor) explainJSONDocument(query string) string {
 					}
 					return true, nil
 				}, sel.GroupBy)
+			}
+			// Walk SELECT list for subqueries.
+			if selSubs := explainSelectListSubqueries(sel); len(selSubs) > 0 {
+				hasSelectListSubquery = true
+				// For each SELECT-list subquery, find the matching parsed row
+				// (by inner table name + UNCACHEABLE/SUBQUERY selectType) and
+				// record its select_id when the inner has ORDER BY + LIMIT.
+				for _, sub := range selSubs {
+					inner, isSel := sub.Select.(*sqlparser.Select)
+					if !isSel {
+						continue
+					}
+					if !(len(inner.OrderBy) > 0 && inner.Limit != nil) {
+						continue
+					}
+					var innerTbl string
+					for _, te := range inner.From {
+						for _, tn := range e.extractAllTableNames(te) {
+							if !strings.EqualFold(tn, "dual") {
+								innerTbl = tn
+								break
+							}
+						}
+						if innerTbl != "" {
+							break
+						}
+					}
+					for _, p := range parsed {
+						if p.selectType != "SUBQUERY" && p.selectType != "UNCACHEABLE SUBQUERY" {
+							continue
+						}
+						if tblStr, ok := p.row[2].(string); !ok || !strings.EqualFold(tblStr, innerTbl) {
+							continue
+						}
+						if id, ok := p.id.(int64); ok && !selectListSubqueryIDs[id] {
+							selectListSubqueryIDs[id] = true
+							break
+						}
+					}
+				}
 			}
 		}
 	}
@@ -11872,11 +12035,31 @@ func (e *Executor) explainJSONDocument(query string) string {
 		// time, so they always show as `dependent: false, cacheable: true`.
 		// (Our engine sometimes mis-classifies them as DEPENDENT SUBQUERY in
 		// the row-level select_type; we override here for correctness.)
+		// When the subqueries are in the SELECT list (e.g.
+		//   SELECT (SELECT ... FROM t LIMIT 1), c FROM t1
+		// ), MySQL emits them as `select_list_subqueries` with
+		// `dependent: false, cacheable: false` (uncacheable when the inner
+		// has nondeterministic content like RAND()).  When the inner has
+		// ORDER BY + LIMIT, the inner query_block wraps its table in an
+		// `ordering_operation` block.
 		if len(subqueryRows) > 0 {
 			var attachedSubs []interface{}
 			for _, s := range subqueryRows {
 				qb := e.explainJSONQueryBlockForRow(s.row, query)
-				if hasHavingSubquery {
+				// SELECT-list subquery whose inner has ORDER BY + LIMIT:
+				// wrap the table in an ordering_operation block.
+				if hasSelectListSubquery {
+					if id, ok := s.id.(int64); ok && selectListSubqueryIDs[id] {
+						qb = explainJSONWrapTableInOrderingOperation(qb)
+					}
+				}
+				if hasSelectListSubquery {
+					attachedSubs = append(attachedSubs, []orderedKV{
+						{"dependent", false},
+						{"cacheable", false},
+						{"query_block", qb},
+					})
+				} else if hasHavingSubquery {
 					attachedSubs = append(attachedSubs, []orderedKV{
 						{"dependent", false},
 						{"cacheable", true},
@@ -11887,14 +12070,15 @@ func (e *Executor) explainJSONDocument(query string) string {
 						{"dependent", true},
 						{"cacheable", false},
 						{"query_block", qb},
-					})
-				} else {
+					})} else {
 					attachedSubs = append(attachedSubs, qb)
 				}
 			}
 			key := "attached_subqueries"
 			if hasHavingSubquery {
 				key = "having_subqueries"
+			} else if hasSelectListSubquery {
+				key = "select_list_subqueries"
 			}
 			queryBlock = append(queryBlock, orderedKV{key, attachedSubs})
 		}
@@ -11907,6 +12091,27 @@ func (e *Executor) explainJSONDocument(query string) string {
 type orderedKV struct {
 	Key   string
 	Value interface{}
+}
+
+// explainJSONWrapTableInOrderingOperation rewrites a query_block so the
+// `table` entry is wrapped inside an `ordering_operation` block with
+// `using_temporary_table: true, using_filesort: true`.  Used for SELECT-list
+// subqueries whose inner SELECT has ORDER BY + LIMIT.
+func explainJSONWrapTableInOrderingOperation(qb []orderedKV) []orderedKV {
+	out := make([]orderedKV, 0, len(qb))
+	for _, kv := range qb {
+		if kv.Key == "table" {
+			orderingOp := []orderedKV{
+				{"using_temporary_table", true},
+				{"using_filesort", true},
+				{"table", kv.Value},
+			}
+			out = append(out, orderedKV{"ordering_operation", orderingOp})
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 // explainJSONMarshal marshals an ordered structure to a pretty-printed JSON string.
