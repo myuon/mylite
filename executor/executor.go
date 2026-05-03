@@ -1149,6 +1149,33 @@ func (e *Executor) parser() *sqlparser.Parser {
 	return e.sqlParser
 }
 
+// collapseUpperWhitespace collapses runs of ASCII whitespace (space, tab,
+// newline, carriage return) into a single space. Used on the UPPER-cased
+// query so that prefix-based fallbacks tolerate "ALTER  USER" (multiple
+// spaces) the same as "ALTER USER". MySQL is tokenized at whitespace, so
+// arbitrary whitespace between keywords is semantically identical.
+func collapseUpperWhitespace(s string) string {
+	if !strings.ContainsAny(s, "\t\n\r") && !strings.Contains(s, "  ") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	prevWS := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			if !prevWS {
+				b.WriteByte(' ')
+				prevWS = true
+			}
+			continue
+		}
+		b.WriteByte(c)
+		prevWS = false
+	}
+	return b.String()
+}
+
 func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	// MySQL test suite (MTR) defaults to timezone GMT-3 (= UTC+3).
 	// We mirror this so SET TIMESTAMP + CURRENT_TIME() match expected results.
@@ -2084,6 +2111,11 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 
 	stmt, err := e.parser().Parse(query)
 	if err != nil {
+		// Normalize whitespace runs inside `upper` so that statements with extra
+		// whitespace (e.g. "ALTER  USER ...") still match prefix-based fallbacks.
+		// MySQL accepts arbitrary whitespace between keywords, so the prefix-match
+		// table below should be tolerant of repeated spaces/tabs/newlines.
+		upper = collapseUpperWhitespace(upper)
 		// Accept statements that Vitess parser doesn't support
 		if strings.HasPrefix(upper, "EXPLAIN ") || strings.HasPrefix(upper, "DESC ") || strings.HasPrefix(upper, "DESCRIBE ") {
 			explainType := sqlparser.TraditionalType
