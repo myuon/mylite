@@ -7370,8 +7370,20 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 					// where MySQL emits id=4 DEPENDENT SUBQUERY t3 (the SOME subquery) and
 					// id=3 SUBQUERY t3 (the scalar subquery) as separate blocks instead of
 					// collapsing them onto the same id.
+					// `mergedDependent` collapses a nested DEPENDENT SUBQUERY onto its
+					// parent DEPENDENT SUBQUERY's id slot.  This is correct only when the
+					// inner subquery is INHERENTLY correlated to a real outer table (the
+					// `correlated` flag captured from isCorrelatedSubquery before any
+					// IN→EXISTS rewrite).  When the inner is a plain non-correlated IN
+					// subquery that only becomes "DEPENDENT SUBQUERY" because the outer
+					// IN was rewritten via IN→EXISTS (e.g. `t3.a IN (SELECT t4.a FROM t4
+					// WHERE a > 0)` under semijoin=off,materialization=off), MySQL keeps
+					// it on its own freshly allocated id rather than merging it.  See
+					// other/explain_json_none "complex subqueries" / "semi-join
+					// materialization (if enabled)" — MySQL emits `4 DEPENDENT SUBQUERY t4`
+					// nested inside `3 DEPENDENT SUBQUERY t3` rather than two rows at id=3.
 					mergedDependent := selectType == "DEPENDENT SUBQUERY" && outerSelectTypeOuter == "DEPENDENT SUBQUERY" && inContext &&
-						outerIDBeforeIncrement == outerQueryID
+						outerIDBeforeIncrement == outerQueryID && correlated
 					// MATERIALIZED merge: when the parent context is itself MATERIALIZED and the
 					// nested IN subquery also chooses MATERIALIZED, MySQL absorbs the nested
 					// subquery's tables into the parent's MATERIALIZED block (same id),
