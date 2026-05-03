@@ -7733,6 +7733,59 @@ func (e *Executor) explainGetTableDef(tableName string) *catalog.TableDef {
 	return td
 }
 
+// explainResolveAliasInQuery walks the query AST (including all nested SELECTs
+// and derived tables) looking for a table aliased as displayName. Returns the
+// real (catalog) table name if a matching alias is found, otherwise returns
+// displayName unchanged.
+//
+// This is needed for EXPLAIN FORMAT=JSON where row[2] is the alias used in the
+// query (e.g. "parent1" for "FROM t1 AS parent1") but catalog lookups need the
+// real name (e.g. "t1").
+func (e *Executor) explainResolveAliasInQuery(query string, displayName string) string {
+	if displayName == "" || query == "" {
+		return displayName
+	}
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		return displayName
+	}
+	resolved := displayName
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		ate, ok := node.(*sqlparser.AliasedTableExpr)
+		if !ok {
+			return true, nil
+		}
+		tn, ok := ate.Expr.(sqlparser.TableName)
+		if !ok {
+			return true, nil
+		}
+		// Match against alias if present, otherwise against the table name.
+		if !ate.As.IsEmpty() {
+			if strings.EqualFold(ate.As.String(), displayName) {
+				resolved = tn.Name.String()
+				return false, nil
+			}
+		}
+		return true, nil
+	}, stmt)
+	return resolved
+}
+
+// explainGetTableDefByAlias resolves an alias to its real catalog name (using
+// the supplied query as context) and returns the corresponding TableDef. If
+// direct lookup of displayName succeeds it is preferred; otherwise the alias
+// resolver is consulted.
+func (e *Executor) explainGetTableDefByAlias(displayName, query string) *catalog.TableDef {
+	if td := e.explainGetTableDef(displayName); td != nil {
+		return td
+	}
+	real := e.explainResolveAliasInQuery(query, displayName)
+	if real == displayName {
+		return nil
+	}
+	return e.explainGetTableDef(real)
+}
+
 // charsetBytesPerChar returns the maximum bytes per character for a given charset.
 func charsetBytesPerChar(charset string) int {
 	switch strings.ToLower(charset) {
@@ -9314,11 +9367,15 @@ func decimalPackLength(precision, scale int) int {
 
 // explainJSONUsedColumns returns the list of column names used in the query for a given table.
 // It analyzes the query AST to find only the columns actually referenced.
+//
+// `tableName` may be an alias used in the query (e.g. "parent1" for
+// "FROM t1 AS parent1"). The catalog lookup is performed via the alias-aware
+// helper so that aliases resolve to their real underlying table.
 func (e *Executor) explainJSONUsedColumns(tableName string, query string) []string {
 	if tableName == "" {
 		return nil
 	}
-	td := e.explainGetTableDef(tableName)
+	td := e.explainGetTableDefByAlias(tableName, query)
 	if td == nil {
 		return nil
 	}
@@ -9695,6 +9752,10 @@ func (e *Executor) explainJSONBuildConditionFromQuery(query string, tableName st
 // that belong to a specific table (by table qualifier). This is used to generate
 // the attached_condition for tables in EXPLAIN FORMAT=JSON.
 // Returns the formatted condition string, or "" if no conditions found for this table.
+//
+// `tableName` may be an alias (e.g. "parent1" for "FROM t1 AS parent1"); the
+// catalog lookup performed inside extractTableCondition uses an alias-aware
+// helper so unqualified column membership checks work for aliased tables.
 func (e *Executor) explainJSONBuildTableFilterCondition(query string, tableName string) string {
 	stmt, err := e.parser().Parse(query)
 	if err != nil {
@@ -9712,8 +9773,16 @@ func (e *Executor) explainJSONBuildTableFilterCondition(query string, tableName 
 		dbName = "test"
 	}
 	// Extract conditions that reference this table
-	cond := e.extractTableCondition(sel.Where.Expr, tableName, dbName)
+	cond := e.extractTableConditionWithQuery(sel.Where.Expr, tableName, dbName, query)
 	return cond
+}
+
+// extractTableConditionWithQuery is a wrapper around extractTableCondition that
+// performs alias→real-name resolution against the supplied query so unqualified
+// column membership checks succeed even when tableName is an alias.
+func (e *Executor) extractTableConditionWithQuery(expr sqlparser.Expr, tableName, dbName, query string) string {
+	td := e.explainGetTableDefByAlias(tableName, query)
+	return e.extractTableConditionWithDef(expr, tableName, dbName, td)
 }
 
 // explainJSONBuildSubqueryRangeCondition builds the attached_condition for a
@@ -9814,13 +9883,21 @@ func (e *Executor) buildSubqueryRangeCondFromExpr(expr sqlparser.Expr, colName s
 // only the sub-expressions that reference columns from the given table.
 // Returns "" if no conditions for this table are found.
 func (e *Executor) extractTableCondition(expr sqlparser.Expr, tableName string, dbName string) string {
+	td := e.explainGetTableDef(tableName)
+	return e.extractTableConditionWithDef(expr, tableName, dbName, td)
+}
+
+// extractTableConditionWithDef is the implementation of extractTableCondition
+// that takes a pre-resolved TableDef. Use this when the caller has already
+// performed alias→real-name lookup.
+func (e *Executor) extractTableConditionWithDef(expr sqlparser.Expr, tableName string, dbName string, td *catalog.TableDef) string {
 	if expr == nil {
 		return ""
 	}
 	switch ex := expr.(type) {
 	case *sqlparser.AndExpr:
-		left := e.extractTableCondition(ex.Left, tableName, dbName)
-		right := e.extractTableCondition(ex.Right, tableName, dbName)
+		left := e.extractTableConditionWithDef(ex.Left, tableName, dbName, td)
+		right := e.extractTableConditionWithDef(ex.Right, tableName, dbName, td)
 		if left != "" && right != "" {
 			return fmt.Sprintf("(%s and %s)", left, right)
 		}
@@ -9829,8 +9906,8 @@ func (e *Executor) extractTableCondition(expr sqlparser.Expr, tableName string, 
 		}
 		return right
 	case *sqlparser.OrExpr:
-		left := e.extractTableCondition(ex.Left, tableName, dbName)
-		right := e.extractTableCondition(ex.Right, tableName, dbName)
+		left := e.extractTableConditionWithDef(ex.Left, tableName, dbName, td)
+		right := e.extractTableConditionWithDef(ex.Right, tableName, dbName, td)
 		if left != "" && right != "" {
 			return fmt.Sprintf("(%s or %s)", left, right)
 		}
@@ -9858,7 +9935,7 @@ func (e *Executor) extractTableCondition(expr sqlparser.Expr, tableName string, 
 		}
 		if qual == "" {
 			// Unqualified: check if this table has this column
-			if td := e.explainGetTableDef(tableName); td != nil {
+			if td != nil {
 				found := false
 				for _, c := range td.Columns {
 					if strings.EqualFold(c.Name, colName) {
