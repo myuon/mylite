@@ -11297,6 +11297,99 @@ func explainJSONInjectAttachedSubqueriesIntoTable(qb []orderedKV, children []int
 	return qb
 }
 
+// explainJSONMergeQueryBlocksAsNestedLoop merges multiple query_blocks (each
+// shaped as `{select_id, cost_info, table:{...}}`) that share the same
+// select_id into a single query_block whose body is a `nested_loop` containing
+// the per-row table entries.  Used when an EXISTS / IN subquery's body has
+// multiple FROM tables and shows up as multiple rows with the same id in
+// EXPLAIN.  MySQL emits these as a single dependent/cacheable subquery block
+// with a nested_loop array, not as multiple separate attached_subqueries
+// entries.
+//
+// The result preserves the first qb's select_id and cost_info; per-row tables
+// are reordered so driver tables (access_type=ALL) come first and probe tables
+// (access_type=ref/eq_ref/ref_or_null) come last (stable within group).  The
+// driver's `using_join_buffer` is stripped (MySQL doesn't show that field on
+// the outer driver of a 2-table EXISTS/IN body chain).
+func explainJSONMergeQueryBlocksAsNestedLoop(qbs [][]orderedKV) []orderedKV {
+	if len(qbs) == 0 {
+		return nil
+	}
+	if len(qbs) == 1 {
+		return qbs[0]
+	}
+	// Extract the table block out of each input qb, preserving structure.
+	type tableEntry struct {
+		access string
+		block  []orderedKV
+	}
+	var tables []tableEntry
+	for _, qb := range qbs {
+		for _, kv := range qb {
+			if kv.Key != "table" {
+				continue
+			}
+			tbl, ok := kv.Value.([]orderedKV)
+			if !ok {
+				continue
+			}
+			access := ""
+			for _, t := range tbl {
+				if t.Key == "access_type" {
+					if s, ok := t.Value.(string); ok {
+						access = s
+					}
+					break
+				}
+			}
+			tables = append(tables, tableEntry{access: access, block: tbl})
+		}
+	}
+	if len(tables) < 2 {
+		return qbs[0]
+	}
+	// Stable partition: drivers (ALL, index, range, etc.) first, probes (ref/
+	// eq_ref/ref_or_null) last.
+	var drivers, probes []tableEntry
+	for _, t := range tables {
+		switch t.access {
+		case "ref", "eq_ref", "ref_or_null":
+			probes = append(probes, t)
+		default:
+			drivers = append(drivers, t)
+		}
+	}
+	ordered := append(drivers, probes...)
+	// Strip `using_join_buffer` from the FIRST table (the driver of the
+	// nested-loop chain) — MySQL doesn't display it there.
+	if len(ordered) > 0 {
+		filtered := ordered[0].block[:0]
+		for _, kv := range ordered[0].block {
+			if kv.Key == "using_join_buffer" {
+				continue
+			}
+			filtered = append(filtered, kv)
+		}
+		ordered[0].block = filtered
+	}
+	// Build the nested_loop array.
+	var nl []interface{}
+	for _, t := range ordered {
+		nl = append(nl, []orderedKV{{"table", t.block}})
+	}
+	// Build the merged query_block: take select_id and cost_info from qbs[0]
+	// (they are identical across rows of the same id), then nested_loop.
+	var merged []orderedKV
+	for _, kv := range qbs[0] {
+		if kv.Key == "table" {
+			continue
+		}
+		merged = append(merged, kv)
+	}
+	merged = append(merged, orderedKV{"nested_loop", nl})
+	return merged
+}
+
 // explainJSONCollectMaterializedINColumns walks the outer query's WHERE clause
 // and returns a map of lower-cased outer-table-name -> ordered, deduplicated
 // list of columns that appear as the LHS of any `col IN (SELECT ...)` predicate.
@@ -13411,14 +13504,62 @@ func (e *Executor) explainJSONDocument(query string) string {
 					// flattened (not in subqueryRows, e.g. semijoin'd into
 					// PRIMARY, in which case the child attaches to outer too).
 					// Preserve textual order from subqueryRows.
+					//
+					// When multiple top-level entries share the same select_id
+					// (e.g. an EXISTS / IN subquery body with multiple FROM
+					// tables produces one row per inner table at that id), MySQL
+					// emits a SINGLE attached_subqueries entry whose query_block
+					// has a `nested_loop` array, not multiple separate entries.
+					// Group same-id top-level entries and merge them.
+					type topEntry struct {
+						en       subEntry
+						emitted  bool
+					}
+					top := make([]topEntry, 0, len(entries))
 					for _, en := range entries {
 						if en.parentID > 1 && existsByID[en.parentID] {
 							continue
 						}
-						if en.dependent {
+						top = append(top, topEntry{en: en})
+					}
+					for i := range top {
+						if top[i].emitted {
+							continue
+						}
+						curID := top[i].en.selectID
+						// Collect all subsequent entries with the same selectID.
+						group := []int{i}
+						for j := i + 1; j < len(top); j++ {
+							if top[j].emitted {
+								continue
+							}
+							if top[j].en.selectID == curID && top[j].en.dependent == top[i].en.dependent {
+								group = append(group, j)
+							}
+						}
+						if len(group) == 1 {
+							en := top[i].en
+							if en.dependent {
+								hasDependentSubs = true
+							}
+							attachedSubs = append(attachedSubs, wrap(en))
+							top[i].emitted = true
+							continue
+						}
+						// Merge: build a single qb with nested_loop containing all
+						// per-row tables for this id.
+						qbs := make([][]orderedKV, 0, len(group))
+						for _, gi := range group {
+							qbs = append(qbs, top[gi].en.qb)
+							top[gi].emitted = true
+						}
+						merged := explainJSONMergeQueryBlocksAsNestedLoop(qbs)
+						mergedEn := top[i].en
+						mergedEn.qb = merged
+						if mergedEn.dependent {
 							hasDependentSubs = true
 						}
-						attachedSubs = append(attachedSubs, wrap(en))
+						attachedSubs = append(attachedSubs, wrap(mergedEn))
 					}
 				}
 				// When the subqueries are dependent (IN/EXISTS attached to this table's
