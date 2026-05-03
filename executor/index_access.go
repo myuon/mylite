@@ -518,6 +518,31 @@ func normalizeLiteralForColumnType(v interface{}, colName string, td *catalog.Ta
 				return normalized + " 00:00:00"
 			}
 		}
+
+	case "YEAR":
+		// For YEAR columns, normalize 2-digit values to 4-digit form so that
+		// index lookups match the stored value. E.g. '05' -> "2005", 70 -> "1970".
+		if coerced := coerceYearValue(v); coerced != nil {
+			if s, ok := coerced.(string); ok && s != "" {
+				return s
+			}
+		}
+
+	case "TIME":
+		// For TIME columns, normalize integer HHMMSS literals and other time
+		// formats to "HH:MM:SS" so that index lookups match the stored value.
+		// E.g. int64(111127) -> "11:11:27", "080808" -> "08:08:08".
+		switch val := v.(type) {
+		case int64:
+			return parseMySQLTimeValue(strconv.FormatInt(val, 10))
+		case float64:
+			return parseMySQLTimeValue(strconv.FormatFloat(val, 'f', -1, 64))
+		case string:
+			// Only normalize if not already in HH:MM:SS format.
+			if !strings.Contains(val, ":") {
+				return parseMySQLTimeValue(val)
+			}
+		}
 	}
 
 	return v
