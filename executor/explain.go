@@ -6632,6 +6632,33 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 								}
 							}
 						}
+						// Issue #403: MySQL's optimizer reorders the EXISTS body's
+						// FROM tables so the table accessed via key lookup (ref /
+						// eq_ref) becomes the inner of the join — i.e. it appears
+						// AFTER the driver in the EXPLAIN output.  Without this
+						// reorder, mylite emits tables in textual order, which can
+						// place a `ref`-access table before its driving (`ALL`-scan)
+						// table.  Move ALL-access tables to the front and ref/eq_ref
+						// tables to the back, preserving relative order within each
+						// group (stable partition).  Only applies for plain EXISTS
+						// (NOT EXISTS antijoin keeps textual order).
+						if !existsNegated && len(innerFromTables) > 1 {
+							var drivers, probes []string
+							for _, tn := range innerFromTables {
+								ai := e.explainDetectAccessType(inner, tn)
+								switch ai.accessType {
+								case "ref", "eq_ref", "ref_or_null":
+									probes = append(probes, tn)
+								default:
+									drivers = append(drivers, tn)
+								}
+							}
+							// Only reorder when both groups are non-empty (otherwise
+							// the order is unchanged anyway).
+							if len(drivers) > 0 && len(probes) > 0 {
+								innerFromTables = append(drivers, probes...)
+							}
+						}
 						for idx, tblName := range innerFromTables {
 							var rowCount int64 = 1
 							if e.Storage != nil {
@@ -10936,6 +10963,67 @@ func (e *Executor) explainJSONExistsBodyDecorrelate(query string, outerTblName s
 	}
 }
 
+// explainJSONExistsBodyDriverName returns the table name of the EXISTS body's
+// "driver" — the inner table that scans first in the body's nested loop —
+// when the outer query's WHERE contains an EXISTS whose body has 2+ FROM
+// tables. The driver is the inner table whose detected access type is NOT
+// `ref`/`eq_ref`/`ref_or_null` (i.e. an ALL-scan or other non-keyed access).
+//
+// Returns "" when no such EXISTS body exists or the driver cannot be
+// determined unambiguously.  Used by the EXPLAIN FORMAT=JSON nested_loop
+// builder to suppress `using_join_buffer: Block Nested Loop` on the EXISTS
+// body driver (issue #403): MySQL does not annotate a sub-chain's own
+// driver with BNL even when the table is accessed via ALL.
+func (e *Executor) explainJSONExistsBodyDriverName(query string) string {
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		return ""
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok || sel.Where == nil {
+		return ""
+	}
+	driverName := ""
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		ex, ok := n.(*sqlparser.ExistsExpr)
+		if !ok {
+			return true, nil
+		}
+		// Skip negated EXISTS — antijoin keeps textual order.
+		if isExistsExprNegated(sel.Where, ex) {
+			return true, nil
+		}
+		inner, ok := ex.Subquery.Select.(*sqlparser.Select)
+		if !ok {
+			return true, nil
+		}
+		var innerTbls []string
+		for _, te := range inner.From {
+			for _, tn := range e.extractAllTableNames(te) {
+				if !strings.EqualFold(tn, "dual") {
+					innerTbls = append(innerTbls, tn)
+				}
+			}
+		}
+		if len(innerTbls) < 2 {
+			return true, nil
+		}
+		// Identify the driver: first table whose access is NOT ref/eq_ref.
+		for _, tn := range innerTbls {
+			ai := e.explainDetectAccessType(inner, tn)
+			switch ai.accessType {
+			case "ref", "eq_ref", "ref_or_null":
+				continue
+			default:
+				driverName = tn
+				return false, nil
+			}
+		}
+		return false, nil
+	}, sel.Where)
+	return driverName
+}
+
 // explainJSONFormatExprQualifiedWithDefault is like
 // explainJSONFormatExprQualified but uses defaultTbl when a column has no
 // explicit qualifier.  This is used to format outer-side predicates
@@ -13440,6 +13528,12 @@ func (e *Executor) explainJSONDocument(query string) string {
 						firstTableName = fmt.Sprintf("%v", primaryRows[0].row[2])
 					}
 					conds := semijoinAttachedConditions()
+					// Issue #403: detect the EXISTS body driver. When the outer
+					// WHERE has an EXISTS whose body has ≥2 FROM tables, MySQL
+					// treats the body's driver as a nested-chain driver and does
+					// NOT add `using_join_buffer: Block Nested Loop` to it (even
+					// though it appears at primaryRows[1] in the flattened plan).
+					existsBodyDriverName := e.explainJSONExistsBodyDriverName(query)
 					// Issue #404: only the LAST semijoin inner table gets first_match.
 					lastIdx := len(primaryRows) - 1
 					for i, pr := range primaryRows[1:] {
@@ -13448,6 +13542,27 @@ func (e *Executor) explainJSONDocument(query string) string {
 						accessType := ""
 						if pr.row[4] != nil {
 							accessType = fmt.Sprintf("%v", pr.row[4])
+						}
+						tblNameStr := ""
+						if pr.row[2] != nil {
+							tblNameStr = fmt.Sprintf("%v", pr.row[2])
+						}
+						isExistsBodyDriver := existsBodyDriverName != "" && strings.EqualFold(tblNameStr, existsBodyDriverName)
+						// Issue #403: the EXISTS body driver receives no
+						// attached_condition in MySQL's EXPLAIN — the body's
+						// JOIN ON condition becomes the `ref` on the probe
+						// side, and there is no per-table filter to attach.
+						// Strip any attached_condition that explainJSONTableBlock
+						// added based on the synthetic "Using where" extra.
+						if isExistsBodyDriver {
+							filtered := innerTbl[:0]
+							for _, kv := range innerTbl {
+								if kv.Key == "attached_condition" {
+									continue
+								}
+								filtered = append(filtered, kv)
+							}
+							innerTbl = filtered
 						}
 						insertPos := len(innerTbl)
 						for j, kv := range innerTbl {
@@ -13461,7 +13576,7 @@ func (e *Executor) explainJSONDocument(query string) string {
 						if isLast {
 							newBlock = append(newBlock, orderedKV{"first_match", firstTableName})
 						}
-						if accessType == "ALL" {
+						if accessType == "ALL" && !isExistsBodyDriver {
 							alreadyHas := false
 							for _, kv := range innerTbl {
 								if kv.Key == "using_join_buffer" {
