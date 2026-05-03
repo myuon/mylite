@@ -13407,6 +13407,15 @@ func (e *Executor) explainJSONDocument(query string) string {
 				// When the subqueries are dependent (IN/EXISTS attached to this table's
 				// WHERE filter), MySQL embeds attached_subqueries inside the table block
 				// (right after attached_condition) rather than at query_block level.
+				// existsAttachedForLast captures the attached_subqueries entries for
+				// non-correlated EXISTS-body scalar subqueries.  When EXISTS-body
+				// decorrelation applies, MySQL duplicates the non-correlated scalar
+				// subquery onto BOTH the outer driver table AND the inner ref-access
+				// "probe" table (the one carrying the `inner.col = (scalar_subq)`
+				// predicate after IN→EXISTS rewrite).  We attach it to the outer
+				// here, and re-use the same payload for the LAST primary table in
+				// the FirstMatch nested_loop builder below (issue #410-followup).
+				var existsAttachedForLast []interface{}
 				if hasDependentSubs && len(attachedSubs) > 0 {
 					tblBlock = append(tblBlock, orderedKV{"attached_subqueries", attachedSubs})
 					// Mark consumed so the query_block-level attachment loop below skips them.
@@ -13436,6 +13445,7 @@ func (e *Executor) explainJSONDocument(query string) string {
 					if len(existsAttached) > 0 {
 						tblBlock = append(tblBlock, orderedKV{"attached_subqueries", existsAttached})
 						subqueryRows = residual
+						existsAttachedForLast = existsAttached
 					}
 				}
 
@@ -13590,6 +13600,31 @@ func (e *Executor) explainJSONDocument(query string) string {
 						}
 						newBlock = append(newBlock, innerTbl[insertPos:]...)
 						newBlock = appendAttachedCondition(newBlock, conds)
+						// EXISTS-body decorrelation: when the non-correlated scalar
+						// subquery has been attached to the outer driver, MySQL also
+						// duplicates it onto the LAST inner ref-access table (the one
+						// carrying the `inner.col = (scalar_subq)` predicate after the
+						// IN→EXISTS rewrite).  Mirror that here.  The existing attached_condition
+						// added by appendAttachedCondition above is the IN→EXISTS body
+						// marker text; mtrrun masks attached_condition to "#" so its
+						// content is not load-bearing for the diff.
+						if isLast && len(existsAttachedForLast) > 0 {
+							hasAttachedCond := false
+							for _, kv := range newBlock {
+								if kv.Key == "attached_condition" {
+									hasAttachedCond = true
+									break
+								}
+							}
+							if !hasAttachedCond {
+								// Synthesize a placeholder so the structure matches MySQL
+								// (which always emits an attached_condition before the
+								// attached_subqueries on the inner probe table).
+								newBlock = append(newBlock, orderedKV{"attached_condition",
+									"<exists_body_inner_scalar_eq>"})
+							}
+							newBlock = append(newBlock, orderedKV{"attached_subqueries", existsAttachedForLast})
+						}
 						nl = append(nl, []orderedKV{{"table", newBlock}})
 					}
 					queryBlock = append(queryBlock, orderedKV{"nested_loop", nl})
