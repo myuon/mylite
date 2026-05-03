@@ -323,14 +323,18 @@ func splitTriggerBody(body string) []string {
 				// END can appear at statement start or inside UNTIL condition (e.g. UNTIL done END REPEAT)
 				if !prevIsAlpha && strings.HasPrefix(remaining, "END") && (i+3 >= len(words) || !isAlphaNum(words[i+3])) && depth > 0 {
 					depth--
+				} else if !prevIsAlpha && strings.HasPrefix(remaining, "BEGIN") && (i+5 >= len(words) || !isAlphaNum(words[i+5])) {
+					// BEGIN is always a block opener in stored routines/triggers — it has no
+					// function-call form. Accept it whenever it appears as a standalone word
+					// (not just at "statement start"), so deeply nested "BEGIN BEGIN BEGIN ..."
+					// on a single line increments depth for each occurrence.
+					depth++
 				} else if isStmtStart {
 					// Check for block openers (only if not part of an END xxx pattern)
 					// Helper: check if preceded by "END " or "END\n" or "END\t" (this keyword follows END)
 					isAfterEnd := i >= 4 && strings.ToUpper(words[i-4:i-1]) == "END" && (words[i-1] == ' ' || words[i-1] == '\n' || words[i-1] == '\t')
 					if !isAfterEnd {
-						if strings.HasPrefix(remaining, "BEGIN") && (i+5 >= len(words) || !isAlphaNum(words[i+5])) {
-							depth++
-						} else if strings.HasPrefix(remaining, "IF") && (i+2 >= len(words) || words[i+2] == ' ' || words[i+2] == '\t' || words[i+2] == '\n') {
+						if strings.HasPrefix(remaining, "IF") && (i+2 >= len(words) || words[i+2] == ' ' || words[i+2] == '\t' || words[i+2] == '\n') {
 							// Skip ELSEIF (preceded by ELSE)
 							isElseIf := i >= 4 && strings.ToUpper(words[i-4:i]) == "ELSE"
 							if !isElseIf {
@@ -3681,8 +3685,10 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 			eqIdx := strings.Index(setPart, "=")
 			if eqIdx >= 0 {
 				varName := strings.TrimSpace(setPart[:eqIdx])
-				// Handle := assignment operator (MySQL stored routine syntax): strip trailing colon.
-				varName = strings.TrimSuffix(varName, ":")
+				// Handle := assignment operator (MySQL stored routine syntax): strip trailing colon
+				// (e.g. "NEW.b :" → "NEW.b"). The colon may be separated from the name by
+				// whitespace, so TrimSpace once more after the colon is removed.
+				varName = strings.TrimSpace(strings.TrimSuffix(varName, ":"))
 				valStr := strings.TrimSpace(setPart[eqIdx+1:])
 				// User variables (@var) have no declared type, so string-to-number truncation
 				// is only a warning (not an error) even inside strict-mode stored functions.
