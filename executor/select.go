@@ -271,6 +271,12 @@ func (e *Executor) buildFromExpr(expr sqlparser.TableExpr) ([]storage.Row, error
 				row["__column_order__"] = order
 				rows[i] = row
 			}
+			// When the derived table is empty, store the column order so that
+			// SELECT * FROM (subquery) AS t WHERE ... can still resolve column
+			// names even when the subquery produces no rows.
+			if len(rows) == 0 && len(colNames) > 0 {
+				e.emptyDerivedTableColOrder = strings.Join(colNames, "\x00")
+			}
 			return rows, nil
 		}
 
@@ -6109,6 +6115,7 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 			} else {
 				// Empty result set: try to resolve column names from the query's FROM table
 				// by looking up known info schema / performance schema column orders.
+				resolvedEmpty := false
 				tableName := e.extractStarTableName(se, exprs)
 				if tableName != "" {
 					lowerTable := strings.ToLower(tableName)
@@ -6117,7 +6124,19 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 							cols = append(cols, colName)
 							colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(colName)})
 						}
+						resolvedEmpty = true
 					}
+				}
+				// If the FROM clause is a derived table (subquery) that produced zero rows,
+				// use the column order stored when the empty derived table was processed.
+				if !resolvedEmpty && e.emptyDerivedTableColOrder != "" {
+					for _, colName := range strings.Split(e.emptyDerivedTableColOrder, "\x00") {
+						if colName != "" {
+							cols = append(cols, colName)
+							colExprs = append(colExprs, &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(colName)})
+						}
+					}
+					e.emptyDerivedTableColOrder = "" // consume after use
 				}
 			}
 			rawExprIdx++
@@ -6217,25 +6236,51 @@ func (e *Executor) resolveSelectExprs(exprs []sqlparser.SelectExpr, rows []stora
 						// For regular (non-IS, non-PS) user tables with empty results,
 						// validate that the column exists in the table definition.
 						// This catches cases like SELECT f3 FROM t after ALTER TABLE DROP COLUMN f3.
-						upperName := strings.ToUpper(name)
-						found := false
-						for _, td := range tableDefs {
-							if td == nil {
-								continue
-							}
-							for _, col := range td.Columns {
-								if strings.ToUpper(col.Name) == upperName {
-									name = col.Name
-									found = true
+						// Exception: if the column is qualified with a table alias that does NOT
+						// match any of the tableDefs (e.g. a derived table alias like "subq"),
+						// skip the validation — the column is from a derived table whose schema
+						// is not tracked in tableDefs.
+						qualifierName := ""
+						if colName != nil && !colName.Qualifier.IsEmpty() {
+							qualifierName = strings.ToLower(colName.Qualifier.Name.String())
+						}
+						qualifierIsKnown := qualifierName == ""
+						if !qualifierIsKnown {
+							for ti, td := range tableDefs {
+								if td == nil {
+									continue
+								}
+								tdAlias := strings.ToLower(td.Name)
+								if ti < len(e.selectTableAliases) && e.selectTableAliases[ti] != "" {
+									tdAlias = strings.ToLower(e.selectTableAliases[ti])
+								}
+								if qualifierName == tdAlias || qualifierName == strings.ToLower(td.Name) {
+									qualifierIsKnown = true
 									break
 								}
 							}
-							if found {
-								break
-							}
 						}
-						if !found {
-							return nil, nil, mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'field list'", name))
+						if qualifierIsKnown {
+							upperName := strings.ToUpper(name)
+							found := false
+							for _, td := range tableDefs {
+								if td == nil {
+									continue
+								}
+								for _, col := range td.Columns {
+									if strings.ToUpper(col.Name) == upperName {
+										name = col.Name
+										found = true
+										break
+									}
+								}
+								if found {
+									break
+								}
+							}
+							if !found {
+								return nil, nil, mysqlError(1054, "42S22", fmt.Sprintf("Unknown column '%s' in 'field list'", name))
+							}
 						}
 					}
 				}
