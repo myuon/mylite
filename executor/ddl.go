@@ -381,6 +381,11 @@ func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error)
 			newKey := p.targetDB + "." + p.newName
 			e.tableLockManager.RenameTableLock(e.connectionID, oldKey, newKey)
 		}
+		// Mark renamed table as "file-instance dirty" so perfSchemaFileInstances
+		// emits MyISAM rows in MYI/MYD/sdi order (matches MySQL's post-rename
+		// file creation timestamp ordering).
+		e.clearFileInstanceDirty(p.srcDB, p.oldName)
+		e.markFileInstanceDirty(p.targetDB, p.newName)
 		// Handle temporary table tracking: if the renamed table was a temp table,
 		// update the tempTables map and restore any saved permanent table.
 		if e.tempTables != nil && e.tempTables[p.oldName] {
@@ -2965,6 +2970,9 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 		if isMySQLLogTable(dbName, tableName) && e.isLogTableLoggingEnabled(tableName) {
 			return nil, mysqlError(1580, "HY000", "You cannot 'DROP' a log table if logging is enabled")
 		}
+		// Clear any file-instance dirty flag for this table so a CREATE-DROP-CREATE
+		// cycle yields fresh ordering on the second CREATE.
+		e.clearFileInstanceDirty(dbName, tableName)
 		// For DROP TEMPORARY TABLE with IF EXISTS, skip non-temp tables with a warning.
 		if stmt.Temp && stmt.IfExists {
 			if _, isTemp := e.tempTables[tableName]; !isTemp {
@@ -3982,6 +3990,11 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 	if strings.EqualFold(dbName, "performance_schema") {
 		return nil, mysqlError(1044, "42000", "Access denied for user 'root'@'localhost' to database 'performance_schema'")
 	}
+	// Mark the table as file-instance dirty so perfSchemaFileInstances reorders
+	// MyISAM rows (MYI/MYD/sdi) — see comment in perfSchemaFileInstances.
+	if !stmt.Table.IsEmpty() {
+		e.markFileInstanceDirty(dbName, stmt.Table.Name.String())
+	}
 
 	tableName := stmt.Table.Name.String()
 
@@ -4010,6 +4023,27 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			qualTable := tableName
 			if dbName != "" {
 				qualTable = dbName + "." + tableName
+			}
+			// MySQL rejects partition maintenance on a non-partitioned table with
+			// "Partition management on a not partitioned table is not possible" /
+			// "Operation failed".
+			isPartitioned := false
+			if db, dbErr := e.Catalog.GetDatabase(dbName); dbErr == nil {
+				if tdef, terr := db.GetTable(tableName); terr == nil && tdef != nil {
+					if tdef.PartitionType != "" || len(tdef.PartitionDefs) > 0 {
+						isPartitioned = true
+					}
+				}
+			}
+			if !isPartitioned {
+				return &Result{
+					Columns: []string{"Table", "Op", "Msg_type", "Msg_text"},
+					Rows: [][]interface{}{
+						{qualTable, opStr, "Error", "Partition management on a not partitioned table is not possible"},
+						{qualTable, opStr, "status", "Operation failed"},
+					},
+					IsResultSet: true,
+				}, nil
 			}
 			return &Result{
 				Columns:     []string{"Table", "Op", "Msg_type", "Msg_text"},
