@@ -6022,6 +6022,70 @@ func isSubqueryInExistsContext(node sqlparser.SQLNode, sub *sqlparser.Subquery) 
 	return found
 }
 
+// isExistsExprNegated returns true if the given ExistsExpr appears under an
+// odd number of NotExpr wrappers within node (i.e. it's a NOT EXISTS, not a
+// plain EXISTS). NOT EXISTS implies an anti-join semantics; plain EXISTS is
+// a semijoin. The walk tracks the negation state through Not/And/Or/Where
+// nodes and stops once the target ExistsExpr is found.
+func isExistsExprNegated(node sqlparser.SQLNode, target *sqlparser.ExistsExpr) bool {
+	if node == nil || target == nil {
+		return false
+	}
+	var found, negated bool
+	var walk func(n sqlparser.SQLNode, neg bool)
+	walk = func(n sqlparser.SQLNode, neg bool) {
+		if found || n == nil {
+			return
+		}
+		switch x := n.(type) {
+		case *sqlparser.ExistsExpr:
+			if x == target {
+				found = true
+				negated = neg
+			}
+			return
+		case *sqlparser.NotExpr:
+			walk(x.Expr, !neg)
+			return
+		case *sqlparser.AndExpr:
+			walk(x.Left, neg)
+			walk(x.Right, neg)
+			return
+		case *sqlparser.OrExpr:
+			// OR doesn't flip the negation state for direct children, but the
+			// EXISTS under it is still considered the same negation context.
+			walk(x.Left, neg)
+			walk(x.Right, neg)
+			return
+		case *sqlparser.Where:
+			walk(x.Expr, neg)
+			return
+		}
+		// Generic descent for other node types — the negation state is preserved
+		// since we only special-case Not/And/Or above.
+		visited := false
+		_ = sqlparser.Walk(func(child sqlparser.SQLNode) (bool, error) {
+			if !visited {
+				visited = true
+				return true, nil
+			}
+			if found {
+				return false, nil
+			}
+			// Recurse into children to handle nested Not/And/Or properly.
+			switch child.(type) {
+			case *sqlparser.NotExpr, *sqlparser.AndExpr, *sqlparser.OrExpr,
+				*sqlparser.ExistsExpr, *sqlparser.Where:
+				walk(child, neg)
+				return false, nil
+			}
+			return true, nil
+		}, n)
+	}
+	walk(node, false)
+	return found && negated
+}
+
 // isSemiJoinDecorrelatable checks if a correlated subquery can be converted to a semijoin.
 // This is true when the correlation consists only of simple equality conditions
 // between outer and inner table columns (e.g., WHERE outer.col = inner.col).
@@ -6509,16 +6573,22 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
 		switch sub := n.(type) {
 		case *sqlparser.ExistsExpr:
-			// Handle NOT EXISTS / EXISTS anti-join pattern: only when the EXISTS inner SELECT
-			// contains nested scalar subqueries. In that case, MySQL cannot use a simple
-			// semijoin/anti-join and instead emits the inner tables at the outer query id
-			// level (id=outerQueryID, PRIMARY/SIMPLE) with "Using where; Not exists",
+			// Handle EXISTS / NOT EXISTS body when the inner SELECT contains nested
+			// scalar subqueries. In that case, MySQL cannot fully flatten the inner
+			// SELECT into a single anti-join/semi-join row, so it emits the inner
+			// tables at the outer query id level (id=outerQueryID, PRIMARY/SIMPLE)
 			// while the nested scalar subquery gets a new id.
-			// A simple EXISTS without nested subqueries is NOT handled here — it falls
-			// through to the regular Subquery case via return true, nil.
+			//
+			// The Extra annotation differs based on EXISTS context:
+			//   - NOT EXISTS (anti-join): "Using where; Not exists"
+			//   - plain EXISTS (semi-join): "Using where; FirstMatch(<outer>)"
+			// (See issue #405.)
+			//
+			// A simple EXISTS without nested subqueries is NOT handled here — it
+			// falls through to the regular Subquery case via return true, nil.
 			if !outerCanSemijoin {
 				if inner, ok := sub.Subquery.Select.(*sqlparser.Select); ok {
-					// Only apply anti-join handling if the EXISTS inner SELECT has nested subqueries.
+					// Only apply this handling if the EXISTS inner SELECT has nested subqueries.
 					innerHasNestedSubquery := false
 					_ = sqlparser.Walk(func(n2 sqlparser.SQLNode) (bool, error) {
 						if _, ok2 := n2.(*sqlparser.Subquery); ok2 {
@@ -6530,6 +6600,7 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 					if !innerHasNestedSubquery {
 						return true, nil
 					}
+					existsNegated := isExistsExprNegated(node, sub)
 					var innerFromTables []string
 					for _, te := range inner.From {
 						for _, tn := range e.extractAllTableNames(te) {
@@ -6545,7 +6616,23 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 						if outerST == "" {
 							outerST = "PRIMARY"
 						}
-						for _, tblName := range innerFromTables {
+						// For plain EXISTS (semijoin), MySQL annotates only the LAST
+						// inner row with FirstMatch(<outerTable>). Find the outer
+						// table reference by inspecting existing result rows that
+						// belong to the outer query id.
+						firstMatchOuter := ""
+						if !existsNegated {
+							for _, r := range *result {
+								if r.id == outerQueryID && r.table != nil {
+									tn := fmt.Sprintf("%v", r.table)
+									if !strings.HasPrefix(tn, "<subquery") && !strings.HasPrefix(tn, "<derived") {
+										firstMatchOuter = tn
+										break
+									}
+								}
+							}
+						}
+						for idx, tblName := range innerFromTables {
 							var rowCount int64 = 1
 							if e.Storage != nil {
 								if tbl, err2 := e.Storage.GetTable(e.CurrentDB, tblName); err2 == nil && len(tbl.Rows) > 0 {
@@ -6553,7 +6640,22 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 								}
 							}
 							ai := e.explainDetectAccessType(inner, tblName)
-							var extra interface{} = "Using where; Not exists"
+							var extra interface{}
+							if existsNegated {
+								// NOT EXISTS: anti-join marker on every inner row.
+								extra = "Using where; Not exists"
+							} else {
+								// Plain EXISTS: semijoin marker only on the LAST inner row.
+								if idx == len(innerFromTables)-1 {
+									if firstMatchOuter != "" {
+										extra = fmt.Sprintf("Using where; FirstMatch(%s)", firstMatchOuter)
+									} else {
+										extra = "Using where; FirstMatch"
+									}
+								} else {
+									extra = "Using where"
+								}
+							}
 							*result = append(*result, explainSelectType{
 								id:           outerQueryID,
 								selectType:   outerST,
