@@ -73,6 +73,16 @@ type explainSelectType struct {
 	// EXPLAIN FORMAT=JSON emits a union_result block with
 	// using_temporary_table:false and no table_name/access_type keys.
 	isUnionAll bool
+	// inlineNestedIN marks a SUBQUERY/DEPENDENT SUBQUERY row that represents
+	// the body of a nested IN-subquery whose parent IN-subquery is itself
+	// being inlined (semijoin-flattened) into the outer query.  When set, the
+	// outer walkForSubqueries skips the NESTED_SUBQUERY marking, allowing the
+	// row to fall into the catch-all "non-SIMPLE → id=1 SIMPLE" branch in
+	// explainMultiRows post-processing, so MySQL-style 3+ table semijoin
+	// chains (e.g. `t1.a IN (SELECT pk FROM t10 WHERE t10.a IN (SELECT pk FROM t12))`)
+	// emit all tables as id=1 SIMPLE rather than splitting into separate
+	// SUBQUERY blocks.
+	inlineNestedIN bool
 }
 
 // explainMultiRows returns one or more EXPLAIN rows, detecting subqueries,
@@ -7427,6 +7437,17 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 						} else {
 							subRows[0].id = subQueryID
 						}
+						// Mark this row as a nested IN-subquery body when the parent IN
+						// is itself being inlined (selectType "SUBQUERY"/"DEPENDENT SUBQUERY"
+						// with no MATERIALIZED row).  This lets the outer walkForSubqueries
+						// skip the NESTED_SUBQUERY marker so the nested body inlines into
+						// the same id=1 SIMPLE chain (MySQL FirstMatch semijoin behavior
+						// for chained IN subqueries with eq_ref-able inner tables).
+						if inContext && !mergedMaterialized && !mergedDependent &&
+							(selectType == "SUBQUERY" || selectType == "DEPENDENT SUBQUERY") &&
+							outerCanSemijoin && e.isSemijoinEnabled() {
+							subRows[0].inlineNestedIN = true
+						}
 					}
 					// Mark nested scalar subquery rows (those NOT belonging to the IN
 					// subquery's own merged row, i.e. id != subQueryID) so the outer
@@ -7442,6 +7463,12 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 						for i := 1; i < len(subRows); i++ {
 							st := subRows[i].selectType
 							if st != "SUBQUERY" && st != "DEPENDENT SUBQUERY" {
+								continue
+							}
+							// Skip NESTED marking for rows tagged as nested-IN bodies —
+							// those should inline into the outer semijoin chain (id=1
+							// SIMPLE) via the catch-all post-processing branch.
+							if subRows[i].inlineNestedIN {
 								continue
 							}
 							if id, ok := subRows[i].id.(int64); ok {
