@@ -2302,6 +2302,18 @@ var sysVarGlobalOnly = map[string]bool{
 	"init_replica":                        true,
 	"ssl_session_cache_mode":              true,
 	"ssl_session_cache_timeout":           true,
+	// InnoDB doublewrite / redo log / dedicated / parallel-read GLOBAL-only vars (issue #392, MySQL 8.0)
+	"innodb_dedicated_server":       true,
+	"innodb_doublewrite":            true,
+	"innodb_doublewrite_batch_size": true,
+	"innodb_doublewrite_dir":        true,
+	"innodb_doublewrite_files":      true,
+	"innodb_doublewrite_pages":      true,
+	"innodb_extend_and_initialize":  true,
+	"innodb_idle_flush_pct":         true,
+	"innodb_log_group_home_dir":     true,
+	"innodb_redo_log_capacity":      true,
+	"innodb_segment_reserve_factor": true,
 }
 
 // sysVarEnumSet contains system variables that are ENUM types where ON/OFF
@@ -3060,10 +3072,11 @@ var sysVarBoolean = map[string]bool{
 	"default_table_encryption": true, "table_encryption_privilege_check": true,
 	"local_infile": true, "myisam_use_mmap": true,
 	"temptable_use_mmap": true, "sql_log_off": true,
-	"innodb_doublewrite":         true,
-	"automatic_sp_privileges":    true,
-	"mysqlx_enable_hello_notice": true,
-	"partial_revokes":            true,
+	"innodb_doublewrite":           true,
+	"automatic_sp_privileges":      true,
+	"mysqlx_enable_hello_notice":   true,
+	"partial_revokes":              true,
+	"innodb_extend_and_initialize": true,
 }
 
 func isBooleanVariable(name string) bool {
@@ -3102,6 +3115,7 @@ var sysVarBoolAcceptNegative = map[string]bool{
 	"innodb_buffer_pool_in_core_file":     true,
 	"innodb_buffer_pool_load_abort":       true,
 	"innodb_buffer_pool_load_now":         true,
+	"innodb_extend_and_initialize":        true,
 }
 
 // sqlReservedKeywords contains SQL reserved keywords that cannot be used as unquoted
@@ -3333,6 +3347,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"innodb_log_spin_cpu_pct_hwm":        {Min: 0, Max: 100, IsUnsigned: true},
 	"innodb_log_wait_for_flush_spin_hwm": {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
 	"innodb_parallel_read_threads":       {Min: 1, Max: 256, IsUnsigned: true},
+	"innodb_idle_flush_pct":              {Min: 0, Max: 100, IsUnsigned: true},
 	"innodb_sort_buffer_size":            {Min: 65536, Max: 67108864, IsUnsigned: true},
 	// innodb_commit_concurrency: special behavior in MySQL (cannot change from 0 to non-zero)
 	// Not adding to generic range check to avoid regression with innodb_bug42101
@@ -3519,6 +3534,7 @@ type floatVarRange struct {
 var sysVarFloatRange = map[string]floatVarRange{
 	"innodb_max_dirty_pages_pct":      {Min: 0, Max: 99.999},
 	"innodb_max_dirty_pages_pct_lwm":  {Min: 0, Max: 99.999},
+	"innodb_segment_reserve_factor":   {Min: 0.03, Max: 40},
 	"long_query_time":                 {Min: 0, Max: 31536000},
 	"secondary_engine_cost_threshold": {Min: 0, Max: math.MaxFloat64},
 }
@@ -3987,6 +4003,9 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"innodb_flushing_avg_loops":                "30",
 		"innodb_force_load_corrupted":              "OFF",
 		"innodb_force_recovery":                    "0",
+		"innodb_extend_and_initialize":             "ON",
+		"innodb_idle_flush_pct":                    "100",
+		"innodb_segment_reserve_factor":            "12.500000",
 		"innodb_ft_aux_table":                      "",
 		"innodb_ft_cache_size":                     "8000000",
 		"innodb_ft_enable_diag_print":              "OFF",
