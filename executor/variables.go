@@ -2285,6 +2285,23 @@ var sysVarGlobalOnly = map[string]bool{
 	"rpl_stop_replica_timeout":      true,
 	"slave_load_tmpdir":             true,
 	"source_verify_checksum":        true,
+	// Misc server vars (issue #393): plugin loading, keyring, protocol, auth, group replication
+	"plugin_load":                         true,
+	"plugin_load_add":                     true,
+	"keyring_operations":                  true,
+	"protocol_compression_algorithms":     true,
+	"xa_detach_on_prepare":                true,
+	"activate_all_roles_on_login":         true,
+	"group_replication_consistency":       true,
+	"mandatory_roles":                     true,
+	"sql_require_primary_key":             true,
+	"caching_sha2_password_digest_rounds": true,
+	"authentication_policy":               true,
+	"binlog_expire_logs_auto_purge":       true,
+	"terminology_use_previous":            true,
+	"init_replica":                        true,
+	"ssl_session_cache_mode":              true,
+	"ssl_session_cache_timeout":           true,
 }
 
 // sysVarEnumSet contains system variables that are ENUM types where ON/OFF
@@ -2925,6 +2942,7 @@ var sysVarSessionOnly = map[string]bool{
 	"immediate_server_version":   true,
 	"timestamp":                  true,
 	"rbr_exec_mode":              true,
+	"resultset_metadata":         true,
 }
 
 // sysVarBothScope contains system variables that exist at both SESSION and GLOBAL scope.
@@ -4504,6 +4522,26 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"replica_transaction_retries":  "10",
 		"rpl_stop_replica_timeout":     "31536000",
 		"source_verify_checksum":       "OFF",
+
+		// Misc server vars (issue #393): plugin loading, keyring, protocol, auth, group replication
+		"plugin_load":                         "",
+		"plugin_load_add":                     "",
+		"keyring_operations":                  "ON",
+		"protocol_compression_algorithms":     "zlib,zstd,uncompressed",
+		"xa_detach_on_prepare":                "ON",
+		"activate_all_roles_on_login":         "OFF",
+		"group_replication_consistency":       "EVENTUAL",
+		"mandatory_roles":                     "",
+		"sql_require_primary_key":             "OFF",
+		"caching_sha2_password_digest_rounds": "5000",
+		"authentication_policy":               "*,,",
+		"binlog_expire_logs_auto_purge":       "ON",
+		"terminology_use_previous":            "NONE",
+		"init_replica":                        "",
+		"ssl_session_cache_mode":              "ON",
+		"ssl_session_cache_timeout":           "300",
+		"resultset_metadata":                  "FULL",
+
 		"slow_launch_time":                       "2",
 		"sql_log_off":                            "OFF",
 		"sql_slave_skip_counter":                 "0",
