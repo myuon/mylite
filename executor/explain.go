@@ -11711,9 +11711,12 @@ func (e *Executor) explainJSONDocument(query string) string {
 	}
 
 	// Helper: build nested_loop with first_match annotation
-	// The first_match field is added to non-first tables when firstmatch strategy is used.
-	// When the inner table uses ALL access, MySQL also adds using_join_buffer:"Block Nested Loop"
-	// because the FirstMatch nested-loop join uses a join buffer to scan the inner side.
+	// MySQL convention: in a chain of semijoin inner tables, only the LAST one
+	// carries `first_match: <outer_table>`. Non-last semijoin inner tables do
+	// not get the first_match marker. (Issue #404)
+	// When the inner table uses ALL access, MySQL still adds
+	// using_join_buffer:"Block Nested Loop" on every non-first table because
+	// the join buffer applies independently of the first_match marker.
 	buildFirstMatchNestedLoop := func(rows []parsedRow) []interface{} {
 		var nl []interface{}
 		if len(rows) == 0 {
@@ -11724,13 +11727,16 @@ func (e *Executor) explainJSONDocument(query string) string {
 		firstTbl := e.explainJSONTableBlock(rows[0].row, query)
 		firstTbl = appendAttachedCondition(firstTbl, conds)
 		nl = append(nl, []orderedKV{{"table", firstTbl}})
-		// Subsequent tables get first_match pointing to the first table's name
+		// Subsequent tables: only the LAST one gets first_match.
 		if len(rows) > 1 {
 			firstTableName := ""
 			if rows[0].row[2] != nil {
 				firstTableName = fmt.Sprintf("%v", rows[0].row[2])
 			}
-			for _, pr := range rows[1:] {
+			lastIdx := len(rows) - 1
+			for i, pr := range rows[1:] {
+				// rows[1:][i] corresponds to rows[i+1]; isLast checks against lastIdx.
+				isLast := (i + 1) == lastIdx
 				tblBlock := e.explainJSONTableBlock(pr.row, query)
 				// Determine inner table's access type to decide if join buffer applies.
 				accessType := ""
@@ -11739,17 +11745,19 @@ func (e *Executor) explainJSONDocument(query string) string {
 				}
 				// Insert first_match after "filtered" field (before cost_info and used_columns).
 				insertPos := len(tblBlock) // default: append at end
-				for i, kv := range tblBlock {
+				for j, kv := range tblBlock {
 					if kv.Key == "filtered" {
-						insertPos = i + 1
+						insertPos = j + 1
 						break
 					}
 				}
-				// Insert first_match at insertPos.
-				// Insert using_join_buffer immediately after first_match when inner uses ALL.
+				// Insert first_match (only on the last table) and
+				// using_join_buffer (whenever access is ALL) at insertPos.
 				newBlock := make([]orderedKV, 0, len(tblBlock)+2)
 				newBlock = append(newBlock, tblBlock[:insertPos]...)
-				newBlock = append(newBlock, orderedKV{"first_match", firstTableName})
+				if isLast {
+					newBlock = append(newBlock, orderedKV{"first_match", firstTableName})
+				}
 				if accessType == "ALL" {
 					// Avoid duplicating if explainJSONTableBlock already inserted using_join_buffer.
 					alreadyHas := false
@@ -12979,22 +12987,27 @@ func (e *Executor) explainJSONDocument(query string) string {
 						firstTableName = fmt.Sprintf("%v", primaryRows[0].row[2])
 					}
 					conds := semijoinAttachedConditions()
-					for _, pr := range primaryRows[1:] {
+					// Issue #404: only the LAST semijoin inner table gets first_match.
+					lastIdx := len(primaryRows) - 1
+					for i, pr := range primaryRows[1:] {
+						isLast := (i + 1) == lastIdx
 						innerTbl := e.explainJSONTableBlock(pr.row, query)
 						accessType := ""
 						if pr.row[4] != nil {
 							accessType = fmt.Sprintf("%v", pr.row[4])
 						}
 						insertPos := len(innerTbl)
-						for i, kv := range innerTbl {
+						for j, kv := range innerTbl {
 							if kv.Key == "filtered" {
-								insertPos = i + 1
+								insertPos = j + 1
 								break
 							}
 						}
 						newBlock := make([]orderedKV, 0, len(innerTbl)+2)
 						newBlock = append(newBlock, innerTbl[:insertPos]...)
-						newBlock = append(newBlock, orderedKV{"first_match", firstTableName})
+						if isLast {
+							newBlock = append(newBlock, orderedKV{"first_match", firstTableName})
+						}
 						if accessType == "ALL" {
 							alreadyHas := false
 							for _, kv := range innerTbl {
