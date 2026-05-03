@@ -143,23 +143,30 @@ func (e *Executor) syntheticTableDefFromViewSQL(viewName, viewSQL string) *catal
 						}
 					}
 				}
-				// For named column lists, synthesize from SELECT expressions (alias or ColName only).
-				var synCols []catalog.ColumnDef
+				// For named column lists, synthesize from SELECT expressions.
+				// We must produce one synthetic column per SELECT expression so that
+				// the column count is correct (e.g. SELECT SUM(c), c FROM t produces
+				// two columns, not one). For any expression we cannot cleanly name
+				// here (computed exprs without an explicit alias), bail out and
+				// return nil so the caller falls back to the actual view-scan
+				// result columns — those preserve MySQL's exact display name
+				// (e.g. "b+1" with no spaces, "SUM(col_int)" with original case).
+				synCols := make([]catalog.ColumnDef, 0, len(sel.SelectExprs.Exprs))
 				for _, se := range sel.SelectExprs.Exprs {
-					switch s := se.(type) {
-					case *sqlparser.StarExpr:
-						return nil // can't handle qualified star here
-					case *sqlparser.AliasedExpr:
-						name := ""
-						if !s.As.IsEmpty() {
-							name = s.As.String()
-						} else if col, ok := s.Expr.(*sqlparser.ColName); ok {
-							name = col.Name.String()
-						}
-						if name != "" {
-							synCols = append(synCols, catalog.ColumnDef{Name: name})
-						}
+					ae, ok := se.(*sqlparser.AliasedExpr)
+					if !ok {
+						return nil
 					}
+					name := ""
+					if !ae.As.IsEmpty() {
+						name = ae.As.String()
+					} else if col, ok := ae.Expr.(*sqlparser.ColName); ok {
+						name = col.Name.String()
+					}
+					if name == "" {
+						return nil
+					}
+					synCols = append(synCols, catalog.ColumnDef{Name: name})
 				}
 				if len(synCols) > 0 {
 					return &catalog.TableDef{Name: viewName, Columns: synCols}

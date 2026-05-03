@@ -41,16 +41,16 @@ same scoping work.
 - **Risk**: High — could regress many GROUP BY tests that depend on current
   sort order.
 
-### 4. `json/json_innodb` — diff 13 lines
-- **First diff line 241**: `SUM(col_int)\tcol_int` (expected header) vs
-  `col_int` (actual header — only one column). The `SUM(col_int)` aggregate is
-  silently being dropped from the SELECT list when combined with another column
-  selected from JSON-typed source.
-- **Fix sketch**: Investigate `executor/select.go` aggregate column detection
-  when the source row has JSON-typed values. The actual `SUM(col_int)` value
-  also returns `null` instead of `4572643328` — could be JSON→numeric coercion
-  failure.
-- **Risk**: Low-medium — narrow to JSON+aggregate path.
+### 4. `json/json_innodb` — FIXED
+- Root cause was in `syntheticTableDefFromViewSQL` (`executor/select.go`):
+  when a view's SELECT mixed an unnamed computed expression with a direct
+  column ref (e.g. `SELECT SUM(col_int), col_int FROM ...`), the computed
+  expr was silently dropped, leaving the synthetic view def with one fewer
+  column. `SELECT * FROM view` then returned only `col_int`, hiding the
+  `SUM(col_int)` column entirely. Not actually JSON-related.
+- Fix: bail out of the synthesizer when any expr lacks a clean name; let
+  the caller fall back to the actual view-scan column names (which preserve
+  MySQL's exact display style like `SUM(col_int)` and `b+1`).
 
 ### 5. `other/endspace` — diff 55 lines
 - **First diff line 8**: `1  0  0` (expected) vs `0  1  0` (actual) for
