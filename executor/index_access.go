@@ -240,6 +240,69 @@ func (e *Executor) buildIndexAccessSpec(sel *sqlparser.Select, tableName string)
 	return storage.IndexAccessSpec{}, false
 }
 
+// indexColumnsAreIntegerTyped reports whether every column of the named
+// index on td is declared with an integer-family type (TINYINT / SMALLINT
+// / MEDIUMINT / INT / BIGINT, signed or unsigned). String / decimal /
+// date columns return false so the caller can keep them on the legacy
+// scan-and-filter path where executor.compareValues honours collation
+// and decimal precision.
+//
+// This is the conservative gate used to widen ref-access activation
+// without re-implementing executor's full comparison semantics in
+// storage.valuesEqualLoose.
+func indexColumnsAreIntegerTyped(td *catalog.TableDef, indexName string) bool {
+	if td == nil {
+		return false
+	}
+	var cols []string
+	if strings.EqualFold(indexName, "PRIMARY") {
+		cols = td.PrimaryKey
+	} else {
+		for _, idx := range td.Indexes {
+			if strings.EqualFold(idx.Name, indexName) {
+				cols = idx.Columns
+				break
+			}
+		}
+	}
+	if len(cols) == 0 {
+		return false
+	}
+	for _, c := range cols {
+		bare := stripIndexPrefixLength(c)
+		var coldef *catalog.ColumnDef
+		for i := range td.Columns {
+			if strings.EqualFold(td.Columns[i].Name, bare) {
+				coldef = &td.Columns[i]
+				break
+			}
+		}
+		if coldef == nil {
+			return false
+		}
+		if !isIntegerColumnType(coldef.Type) {
+			return false
+		}
+	}
+	return true
+}
+
+// isIntegerColumnType reports whether the supplied MySQL type string is
+// one of the integer family types — case-insensitive, ignoring trailing
+// "(N)" display widths and "UNSIGNED"/"ZEROFILL" qualifiers.
+func isIntegerColumnType(typ string) bool {
+	t := strings.ToUpper(strings.TrimSpace(typ))
+	if i := strings.Index(t, "("); i >= 0 {
+		t = t[:i]
+	}
+	t = strings.TrimSpace(t)
+	switch t {
+	case "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT", "BOOL", "BOOLEAN":
+		return true
+	}
+	return false
+}
+
 // stripIndexPrefixLength strips the prefix-length suffix from an index
 // column name (e.g., "name(20)" -> "name"). Mirrors storage's helper
 // so the executor doesn't need to import the storage internal helper.
@@ -483,15 +546,30 @@ func (e *Executor) installIndexAccessSpecForSelect(sel *sqlparser.Select) func()
 	if !ok {
 		return restore
 	}
-	// Narrow scope: flip the gate for "const" / "eq_ref" / "index" only.
-	// "ref" and "range" remain on the legacy scan path. "index" is the
+	// Narrow scope: flip the gate for "const" / "eq_ref" / "ref" / "index" only.
+	// "range" remains on the legacy scan path. "index" is the
 	// covering-index full-scan case; it must come from a no-WHERE SELECT
 	// per the buildIndexAccessSpec contract.
+	//
+	// "ref" widening (Refs #263 follow-up to #304): single-table SELECTs
+	// whose WHERE resolves to a non-unique-index equality lookup now
+	// route through Table.ScanByIndex. The same single-table /
+	// no-subquery / no-CTE / no-info-schema guard rails as const apply.
+	//
+	// Additionally, "ref" is restricted to integer-typed index columns:
+	// storage.valuesEqualLoose does case-sensitive byte comparison for
+	// strings, but executor's compareValues honours collation (varchar
+	// columns are typically case-insensitive in MySQL). Restricting to
+	// integer columns keeps the new path correct without re-implementing
+	// the executor's collation logic in storage.
 	t := strings.ToLower(spec.Type)
-	if t != "const" && t != "eq_ref" && t != "index" {
+	if t != "const" && t != "eq_ref" && t != "ref" && t != "index" {
 		return restore
 	}
 	if t == "index" && !hasNoWhere {
+		return restore
+	}
+	if t == "ref" && !indexColumnsAreIntegerTyped(e.explainGetTableDef(tableName), spec.IndexName) {
 		return restore
 	}
 	alias, _, _ := extractTableAliasFromAliased(ate)

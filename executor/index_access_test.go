@@ -215,13 +215,52 @@ func TestInstallIndexAccessSpec_ConstPKEngagesGate(t *testing.T) {
 	}
 }
 
-// TestInstallIndexAccessSpec_NonConstNoGate verifies that a "ref" lookup
-// (secondary non-unique index) is intentionally NOT engaged at this
-// narrow scope — the gate only flips for "const" / "eq_ref".
-func TestInstallIndexAccessSpec_NonConstNoGate(t *testing.T) {
+// TestInstallIndexAccessSpec_RefEngagesGate verifies that a "ref" lookup
+// (secondary non-unique index) is engaged after the post-#304 widening.
+// The result must still match the legacy full-scan path bit-for-bit.
+func TestInstallIndexAccessSpec_RefEngagesGate(t *testing.T) {
 	e := setupIATestExecutor(t)
+	if e.useIndexAccessSpecs {
+		t.Fatalf("gate unexpectedly on at setup")
+	}
+	res, err := e.Execute("SELECT * FROM t1 WHERE v = 20")
+	if err != nil {
+		t.Fatalf("SELECT: %v", err)
+	}
+	// Two rows have v=20 (id=2 and id=3 from setupIATestExecutor).
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d (%+v)", len(res.Rows), res.Rows)
+	}
+	// Gate must be restored to off after the query.
+	if e.useIndexAccessSpecs {
+		t.Fatalf("gate not restored to off after SELECT")
+	}
+	if len(e.indexAccessSpecs) != 0 {
+		t.Fatalf("specs not cleared after SELECT: %v", e.indexAccessSpecs)
+	}
+}
+
+// TestInstallIndexAccessSpec_RefStringNoGate verifies that a "ref"
+// lookup on a VARCHAR (non-integer) index column is intentionally NOT
+// engaged. Storage's valuesEqualLoose does case-sensitive byte
+// comparison; varchar columns in MySQL typically use case-insensitive
+// collations, so we keep them on the legacy scan path.
+func TestInstallIndexAccessSpec_RefStringNoGate(t *testing.T) {
+	cat := catalog.New()
+	store := storage.NewEngine()
+	e := New(cat, store)
+	if _, err := e.Execute("CREATE DATABASE IF NOT EXISTS test"); err != nil {
+		t.Fatalf("CREATE DATABASE: %v", err)
+	}
+	e.CurrentDB = "test"
+	if _, err := e.Execute("CREATE TABLE ts (id INT PRIMARY KEY, name VARCHAR(40), KEY idx_name(name))"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if _, err := e.Execute("INSERT INTO ts VALUES (1,'foo'),(2,'bar')"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
 	parser, _ := sqlparser.New(sqlparser.Options{})
-	stmt, err := parser.Parse("SELECT * FROM t1 WHERE v = 20")
+	stmt, err := parser.Parse("SELECT * FROM ts WHERE name = 'foo'")
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -229,7 +268,24 @@ func TestInstallIndexAccessSpec_NonConstNoGate(t *testing.T) {
 	restore := e.installIndexAccessSpecForSelect(sel)
 	defer restore()
 	if e.useIndexAccessSpecs {
-		t.Fatalf("expected gate to remain OFF for ref lookup at narrow scope")
+		t.Fatalf("expected gate to remain OFF for VARCHAR ref lookup")
+	}
+}
+
+// TestInstallIndexAccessSpec_RangeStillNoGate verifies that a "range"
+// lookup remains on the legacy scan path — the widening only added "ref".
+func TestInstallIndexAccessSpec_RangeStillNoGate(t *testing.T) {
+	e := setupIATestExecutor(t)
+	parser, _ := sqlparser.New(sqlparser.Options{})
+	stmt, err := parser.Parse("SELECT * FROM t1 WHERE id BETWEEN 2 AND 3")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	sel := stmt.(*sqlparser.Select)
+	restore := e.installIndexAccessSpecForSelect(sel)
+	defer restore()
+	if e.useIndexAccessSpecs {
+		t.Fatalf("expected gate to remain OFF for range lookup")
 	}
 }
 
