@@ -2270,6 +2270,21 @@ var sysVarGlobalOnly = map[string]bool{
 	"temptable_use_mmap":                       true,
 	"partial_revokes":                          true,
 	"innodb_default_row_format":                true,
+	// Replication: replica_* / log_replica_updates / source_verify_checksum aliases (MySQL 8.0)
+	"log_replica_updates":           true,
+	"log_slave_updates":             true,
+	"replica_allow_batching":        true,
+	"replica_compressed_protocol":   true,
+	"replica_exec_mode":             true,
+	"replica_load_tmpdir":           true,
+	"replica_max_allowed_packet":    true,
+	"replica_pending_jobs_size_max": true,
+	"replica_preserve_commit_order": true,
+	"replica_sql_verify_checksum":   true,
+	"replica_transaction_retries":   true,
+	"rpl_stop_replica_timeout":      true,
+	"slave_load_tmpdir":             true,
+	"source_verify_checksum":        true,
 }
 
 // sysVarEnumSet contains system variables that are ENUM types where ON/OFF
@@ -4472,6 +4487,23 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"slave_sql_verify_checksum":              "ON",
 		"slave_transaction_retries":              "10",
 		"slave_type_conversions":                 "",
+		"slave_load_tmpdir":                      "/tmp",
+
+		// Replication: replica_* / source_* / log_replica_updates aliases
+		// (MySQL 8.0 introduced replica_* names alongside slave_*)
+		"log_replica_updates":          "ON",
+		"log_slave_updates":            "ON",
+		"replica_allow_batching":       "OFF",
+		"replica_compressed_protocol":  "OFF",
+		"replica_exec_mode":            "STRICT",
+		"replica_load_tmpdir":          "/tmp",
+		"replica_max_allowed_packet":   "1073741824",
+		"replica_pending_jobs_size_max": "134217728",
+		"replica_preserve_commit_order": "ON",
+		"replica_sql_verify_checksum":  "ON",
+		"replica_transaction_retries":  "10",
+		"rpl_stop_replica_timeout":     "31536000",
+		"source_verify_checksum":       "OFF",
 		"slow_launch_time":                       "2",
 		"sql_log_off":                            "OFF",
 		"sql_slave_skip_counter":                 "0",
