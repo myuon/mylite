@@ -459,7 +459,17 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				if isGlobal {
 					e.deleteSysVar(name, true)
 				} else {
-					if gv, ok := e.getGlobalVar(name); ok {
+					// For session-scope DEFAULT on character_set_database, MySQL resets to
+					// the current database's default charset (compiled default for test db).
+					if name == "character_set_database" {
+						if def, ok := e.getCompiledDefault(name); ok {
+							e.sessionScopeVars[name] = def
+						} else if gv, ok := e.getGlobalVar(name); ok {
+							e.sessionScopeVars[name] = gv
+						} else {
+							delete(e.sessionScopeVars, name)
+						}
+					} else if gv, ok := e.getGlobalVar(name); ok {
 						e.sessionScopeVars[name] = gv
 					} else {
 						delete(e.sessionScopeVars, name)
@@ -467,6 +477,20 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				}
 			} else {
 				csVal := strings.ToLower(val)
+				// MySQL's parser rejects unquoted multi-token expressions like `utf 8` (two
+				// identifiers separated by whitespace) with a parse error. Our parser may
+				// happily render the SET value back as "utf 8". Detect that shape and
+				// surface the parser-style error. Quoted string literals are NOT parser
+				// errors (they're just unknown charsets).
+				isQuotedLiteral := false
+				if lit, ok := expr.Expr.(*sqlparser.Literal); ok {
+					if lit.Type == sqlparser.StrVal {
+						isQuotedLiteral = true
+					}
+				}
+				if !isQuotedLiteral && strings.Contains(strings.TrimSpace(val), " ") {
+					return nil, mysqlError(1064, "42000", "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '<normalized>' at line 1")
+				}
 				// Float values are an incorrect argument type
 				if strings.ContainsAny(csVal, ".eE") {
 					if _, fErr := strconv.ParseFloat(csVal, 64); fErr == nil {
@@ -494,7 +518,16 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				if name == "character_set_client" && isNonClientCharset(csVal) {
 					return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", name, csVal))
 				}
+				// MySQL 8.0 emits warning 3719 when 'utf8' alias is used (it now means UTF8MB3
+				// and may change to UTF8MB4 in a future release).
+				if strings.EqualFold(val, "utf8") || strings.EqualFold(val, "utf8mb3") {
+					e.addWarning("Warning", 3719, "'utf8' is currently an alias for the character set UTF8MB3, but will be an alias for UTF8MB4 in a future release. Please consider using UTF8MB4 in order to be unambiguous.")
+				}
 				e.setSysVar(name, csVal, isGlobal)
+			}
+			// MySQL 8.0 marks character_set_database as deprecated (will be made read-only).
+			if name == "character_set_database" {
+				e.addWarning("Warning", 1681, "Updating 'character_set_database' is deprecated. It will be made read-only in a future release.")
 			}
 		case "lc_time_names":
 			isGlobal := scope == sqlparser.GlobalScope
@@ -562,13 +595,65 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					}
 				}
 			}
-		case "collation_connection", "collation_server", "collation_database":
+		case "default_collation_for_utf8mb4":
 			isGlobal := scope == sqlparser.GlobalScope
 			if strings.ToUpper(val) == "DEFAULT" {
 				if isGlobal {
 					e.deleteSysVar(name, true)
 				} else {
 					if gv, ok := e.getGlobalVar(name); ok {
+						e.sessionScopeVars[name] = gv
+					} else {
+						delete(e.sessionScopeVars, name)
+					}
+				}
+				e.addWarning("Warning", 1681, "Updating 'default_collation_for_utf8mb4' is deprecated. It will be made read-only in a future release.")
+				break
+			}
+			collVal := strings.ToLower(val)
+			// Float values are an incorrect argument type
+			if strings.ContainsAny(collVal, ".eE") {
+				if _, fErr := strconv.ParseFloat(collVal, 64); fErr == nil {
+					return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+				}
+			}
+			// Resolve numeric collation ID to name
+			if id, err := strconv.ParseInt(collVal, 10, 64); err == nil {
+				if collName, ok := resolveCollationID(id); ok {
+					collVal = collName
+				} else {
+					return nil, mysqlError(1273, "HY000", fmt.Sprintf("Unknown collation: '%s'", truncateErrVal(val)))
+				}
+			}
+			// Validate collation name first (utf8mb4 alone is not a collation -> Unknown collation).
+			if !isKnownCollation(collVal) {
+				return nil, mysqlError(1273, "HY000", fmt.Sprintf("Unknown collation: '%s'", truncateErrVal(val)))
+			}
+			// Only utf8mb4_0900_ai_ci or utf8mb4_general_ci are valid for this variable.
+			if collVal != "utf8mb4_0900_ai_ci" && collVal != "utf8mb4_general_ci" {
+				return nil, mysqlError(3727, "HY000", fmt.Sprintf("Invalid default collation %s: utf8mb4_0900_ai_ci or utf8mb4_general_ci expected", collVal))
+			}
+			e.setSysVar(name, collVal, isGlobal)
+			e.addWarning("Warning", 1681, "Updating 'default_collation_for_utf8mb4' is deprecated. It will be made read-only in a future release.")
+		case "collation_connection", "collation_server", "collation_database":
+			isGlobal := scope == sqlparser.GlobalScope
+			if strings.ToUpper(val) == "DEFAULT" {
+				if isGlobal {
+					e.deleteSysVar(name, true)
+				} else {
+					// For session-scope DEFAULT on collation_database, MySQL resets to the
+					// current database's default collation (which is the compiled default
+					// utf8mb4_0900_ai_ci for the test database). For other vars, fall back to
+					// the global value (or delete if absent).
+					if name == "collation_database" {
+						if def, ok := e.getCompiledDefault(name); ok {
+							e.sessionScopeVars[name] = def
+						} else if gv, ok := e.getGlobalVar(name); ok {
+							e.sessionScopeVars[name] = gv
+						} else {
+							delete(e.sessionScopeVars, name)
+						}
+					} else if gv, ok := e.getGlobalVar(name); ok {
 						e.sessionScopeVars[name] = gv
 					} else {
 						delete(e.sessionScopeVars, name)
@@ -598,7 +683,28 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				if !isKnownCollation(collVal) {
 					return nil, mysqlError(1273, "HY000", fmt.Sprintf("Unknown collation: '%s'", truncateErrVal(val)))
 				}
+				// MySQL 8.0 emits warning 3778 when a UTF8MB3 collation is used.
+				if strings.HasPrefix(collVal, "utf8_") {
+					e.addWarning("Warning", 3778, fmt.Sprintf("'%s' is a collation of the deprecated character set UTF8MB3. Please consider using UTF8MB4 with an appropriate collation instead.", collVal))
+				}
 				e.setSysVar(name, collVal, isGlobal)
+				// MySQL also auto-updates the corresponding character_set_* variable
+				// to the charset that the collation belongs to. This is observable via
+				// SHOW CREATE DATABASE/TABLE that reads character_set_server etc.
+				if cs, ok := catalog.CharsetForCollation(collVal); ok {
+					switch name {
+					case "collation_server":
+						e.setSysVar("character_set_server", cs, isGlobal)
+					case "collation_database":
+						e.setSysVar("character_set_database", cs, isGlobal)
+					case "collation_connection":
+						e.setSysVar("character_set_connection", cs, isGlobal)
+					}
+				}
+			}
+			// MySQL 8.0 marks collation_database as deprecated.
+			if name == "collation_database" {
+				e.addWarning("Warning", 1681, "Updating 'collation_database' is deprecated. It will be made read-only in a future release.")
 			}
 		default:
 			// Store any SET GLOBAL/SESSION variable for later retrieval
@@ -1614,6 +1720,16 @@ func (e *Executor) handleRawSet(raw string) error {
 		}
 		// Resolve numeric IDs and validate charset/collation variables
 		if isCharsetVar(varName) {
+			// MySQL's parser rejects unquoted multi-token expressions like `utf 8`.
+			// Our raw-set fallback receives the original raw RHS (after trim quotes); detect
+			// the multi-token shape and surface as parser-style error.
+			rawRHS := strings.TrimSpace(rest[eqIdx+1:])
+			rawRHS = strings.TrimSuffix(rawRHS, ";")
+			rawRHS = strings.TrimSpace(rawRHS)
+			if !strings.HasPrefix(rawRHS, "'") && !strings.HasPrefix(rawRHS, "\"") &&
+				strings.Contains(rawRHS, " ") {
+				return mysqlError(1064, "42000", "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '<normalized>' at line 1")
+			}
 			csVal := strings.ToLower(val)
 			if strings.ContainsAny(csVal, ".eE") {
 				if _, fErr := strconv.ParseFloat(csVal, 64); fErr == nil {

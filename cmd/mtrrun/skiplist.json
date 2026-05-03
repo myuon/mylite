@@ -3421,16 +3421,8 @@
       "reason": "charset conversion not yet implemented"
     },
     {
-      "test": "sys_vars/character_set_database_basic",
-      "reason": "character_set_database default charset mismatch"
-    },
-    {
       "test": "sys_vars/character_set_results_basic",
       "reason": "@@session.character_set_results casing issue"
-    },
-    {
-      "test": "sys_vars/collation_database_basic",
-      "reason": "collation_database for new db returns utf8_unicode_ci not utf8mb4_0900_ai_ci"
     },
     {
       "test": "sys_vars/character_set_client_basic",
@@ -3438,10 +3430,6 @@
     },
     {
       "test": "sys_vars/collation_connection_func",
-      "reason": "still failing"
-    },
-    {
-      "test": "sys_vars/collation_server_func",
       "reason": "still failing"
     },
     {
