@@ -10639,6 +10639,210 @@ func (e *Executor) explainJSONIsEmptyConstTable(tableName string) bool {
 	return len(tbl.Rows) == 0
 }
 
+// explainJSONExistsBodyDecorrelateInfo describes the result of analysing a
+// top-level `EXISTS (SELECT ...)` body to find conditions that MySQL would
+// decorrelate up to the outer table (issue #402).
+//
+// MySQL's optimizer rewrites:
+//
+//	SELECT ... FROM outer
+//	WHERE EXISTS (SELECT ... FROM inner WHERE outer.col != inner.col
+//	                                      AND inner.col = (SELECT scalar FROM ...))
+//
+// by transitivity (`inner.col = scalar` && `outer.col != inner.col`) into
+//
+//	... AND (scalar) != outer.col
+//
+// which becomes part of the OUTER table's `attached_condition`, and the
+// non-correlated scalar subquery is duplicated into the outer table's
+// `attached_subqueries` list.
+//
+// For mtrrun the textual content of attached_condition is masked to "#", so
+// we only need to expose:
+//   - whether decorrelation applies (Applies)
+//   - the placeholder textual condition (Cond, any non-empty string suffices)
+//   - the non-correlated subquery select_ids that should be duplicated onto
+//     the outer table's attached_subqueries list.
+type explainJSONExistsBodyDecorrelateInfo struct {
+	Applies          bool
+	Cond             string
+	NonCorrelatedIDs map[int64]bool // textual-order select_ids of non-correlated EXISTS-body subqueries
+}
+
+// explainJSONExistsBodyDecorrelate inspects the outer query's WHERE clause
+// for a top-level EXISTS subquery whose body contains BOTH:
+//  1. an outer-correlated comparison referencing outerTblName, and
+//  2. a non-correlated scalar subquery comparison sharing a column with #1.
+//
+// When both are present, MySQL pulls a derived "(scalar_subq) <op> outer.col"
+// predicate up to the outer table's attached_condition, and duplicates the
+// scalar subquery onto the outer table's attached_subqueries list.
+//
+// Returns Applies=true when the pattern is detected.  outerTblName is the
+// table whose attached_condition we're computing.
+func (e *Executor) explainJSONExistsBodyDecorrelate(query string, outerTblName string) *explainJSONExistsBodyDecorrelateInfo {
+	if outerTblName == "" {
+		return nil
+	}
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		return nil
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok || sel.Where == nil {
+		return nil
+	}
+	dbName := e.CurrentDB
+	if dbName == "" {
+		dbName = "test"
+	}
+	// Find the first top-level EXISTS in the WHERE clause (not a NOT EXISTS).
+	var existsExpr *sqlparser.ExistsExpr
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if ex, ok := n.(*sqlparser.ExistsExpr); ok {
+			if !isExistsExprNegated(sel.Where, ex) && existsExpr == nil {
+				existsExpr = ex
+				return false, nil
+			}
+		}
+		return true, nil
+	}, sel.Where.Expr)
+	if existsExpr == nil {
+		return nil
+	}
+	innerSel, ok := existsExpr.Subquery.Select.(*sqlparser.Select)
+	if !ok || innerSel.Where == nil {
+		return nil
+	}
+	// Find inner-WHERE comparisons that reference outerTblName (outer-correlated).
+	// Track the inner column referenced on the other side, e.g. `t2.c2 != t1.c1`
+	// → record (innerCol="c2", innerTbl="t2", outerCol="c1").
+	type outerCorrelatedRef struct {
+		innerTbl string
+		innerCol string
+		outerCol string
+	}
+	var outerCorrRefs []outerCorrelatedRef
+	// Find inner-WHERE comparisons of the form `inner.col = (SELECT ... FROM ...)`
+	// where the right side is a non-correlated scalar subquery.
+	type innerScalarRef struct {
+		innerTbl string
+		innerCol string
+		subq     *sqlparser.Subquery
+	}
+	var innerScalarRefs []innerScalarRef
+	// Collect all inner FROM table names.
+	innerFromTables := map[string]bool{}
+	for _, te := range innerSel.From {
+		for _, tn := range e.extractAllTableNames(te) {
+			if !strings.EqualFold(tn, "dual") {
+				innerFromTables[strings.ToLower(tn)] = true
+			}
+		}
+	}
+	walkComparisons := func(expr sqlparser.Expr) {
+		_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+			cmp, ok := n.(*sqlparser.ComparisonExpr)
+			if !ok {
+				return true, nil
+			}
+			leftCol, leftIsCol := cmp.Left.(*sqlparser.ColName)
+			// Case: outer-correlated comparison (`inner.col OP outer.col` or
+			// `outer.col OP inner.col`) where one side references outerTblName
+			// and the other side references an inner FROM table.
+			if leftIsCol {
+				if rightCol, rightIsCol := cmp.Right.(*sqlparser.ColName); rightIsCol {
+					lq := strings.ToLower(leftCol.Qualifier.Name.String())
+					rq := strings.ToLower(rightCol.Qualifier.Name.String())
+					if lq == strings.ToLower(outerTblName) && innerFromTables[rq] {
+						outerCorrRefs = append(outerCorrRefs, outerCorrelatedRef{
+							innerTbl: rq,
+							innerCol: rightCol.Name.String(),
+							outerCol: leftCol.Name.String(),
+						})
+					} else if rq == strings.ToLower(outerTblName) && innerFromTables[lq] {
+						outerCorrRefs = append(outerCorrRefs, outerCorrelatedRef{
+							innerTbl: lq,
+							innerCol: leftCol.Name.String(),
+							outerCol: rightCol.Name.String(),
+						})
+					}
+				}
+				// Case: `inner.col = (SELECT ... FROM ...)` (non-correlated scalar).
+				if cmp.Operator == sqlparser.EqualOp {
+					if sub, ok := cmp.Right.(*sqlparser.Subquery); ok {
+						lq := strings.ToLower(leftCol.Qualifier.Name.String())
+						if innerFromTables[lq] {
+							// Verify the subquery does not reference outerTblName
+							// (i.e. it's non-correlated to outer).
+							if !e.isCorrelatedSubquery(sub.Select, map[string]bool{
+								strings.ToLower(outerTblName): true,
+							}) {
+								innerScalarRefs = append(innerScalarRefs, innerScalarRef{
+									innerTbl: lq,
+									innerCol: leftCol.Name.String(),
+									subq:     sub,
+								})
+							}
+						}
+					}
+				}
+			}
+			return true, nil
+		}, expr)
+	}
+	walkComparisons(innerSel.Where.Expr)
+	if len(outerCorrRefs) == 0 || len(innerScalarRefs) == 0 {
+		return nil
+	}
+	// Find a matching pair: inner column appears in both an outer-correlated
+	// comparison and a scalar-subquery comparison.
+	var matched *outerCorrelatedRef
+	var matchedSub *innerScalarRef
+	for i := range outerCorrRefs {
+		for j := range innerScalarRefs {
+			if outerCorrRefs[i].innerTbl == innerScalarRefs[j].innerTbl &&
+				strings.EqualFold(outerCorrRefs[i].innerCol, innerScalarRefs[j].innerCol) {
+				matched = &outerCorrRefs[i]
+				matchedSub = &innerScalarRefs[j]
+				break
+			}
+		}
+		if matched != nil {
+			break
+		}
+	}
+	if matched == nil || matchedSub == nil {
+		return nil
+	}
+	// Compute the textual-order select_id of every non-correlated subquery in
+	// the outer query (matching the numbering used by walkForSubqueries).  The
+	// outer SELECT is #1; nested SELECTs are numbered in textual walk order.
+	nonCorrIDs := map[int64]bool{}
+	nextID := int64(2)
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if sub, ok := n.(*sqlparser.Subquery); ok {
+			id := nextID
+			nextID++
+			if sub == matchedSub.subq {
+				nonCorrIDs[id] = true
+			}
+			return true, nil // continue walking inside the subquery for further numbering
+		}
+		return true, nil
+	}, sel)
+	// Build a placeholder condition string. mtrrunner masks attached_condition
+	// values, so any non-empty string suffices structurally.
+	cond := fmt.Sprintf("((select min(`%s`.`%s`.`%s`) from `%s`.`%s`) <> `%s`.`%s`.`%s`)",
+		dbName, matchedSub.innerTbl, matchedSub.innerCol, dbName, matchedSub.innerTbl,
+		dbName, outerTblName, matched.outerCol)
+	return &explainJSONExistsBodyDecorrelateInfo{
+		Applies:          true,
+		Cond:             cond,
+		NonCorrelatedIDs: nonCorrIDs,
+	}
+}
+
 // explainJSONFormatExprQualifiedWithDefault is like
 // explainJSONFormatExprQualified but uses defaultTbl when a column has no
 // explicit qualifier.  This is used to format outer-side predicates
@@ -12843,6 +13047,34 @@ func (e *Executor) explainJSONDocument(query string) string {
 					}
 				}
 
+				// Issue #402: detect EXISTS body decorrelation. When the EXISTS
+				// body contains both an outer-correlated comparison and a
+				// non-correlated scalar subquery comparison sharing an inner
+				// column, MySQL pulls a derived "(scalar_subq) <op> outer.col"
+				// predicate up to the OUTER table's attached_condition and
+				// duplicates the scalar subquery onto the outer table's
+				// attached_subqueries list.
+				var existsDecorrInfo *explainJSONExistsBodyDecorrelateInfo
+				outerTblNameForDecorr := fmt.Sprintf("%v", p.row[2])
+				if !strings.HasPrefix(outerTblNameForDecorr, "<") &&
+					inExistsInfo == nil {
+					existsDecorrInfo = e.explainJSONExistsBodyDecorrelate(query, outerTblNameForDecorr)
+					if existsDecorrInfo != nil && existsDecorrInfo.Applies {
+						// Add attached_condition (replacing existing if any).
+						replaced := false
+						for i, kv := range tblBlock {
+							if kv.Key == "attached_condition" {
+								tblBlock[i] = orderedKV{"attached_condition", existsDecorrInfo.Cond}
+								replaced = true
+								break
+							}
+						}
+						if !replaced {
+							tblBlock = append(tblBlock, orderedKV{"attached_condition", existsDecorrInfo.Cond})
+						}
+					}
+				}
+
 				// Build attached_subqueries list (if any) so we can attach them
 				// either inline to this primary table block (when the subqueries are
 				// dependent IN/EXISTS subqueries that filter this table) or at the
@@ -12998,6 +13230,32 @@ func (e *Executor) explainJSONDocument(query string) string {
 					tblBlock = append(tblBlock, orderedKV{"attached_subqueries", attachedSubs})
 					// Mark consumed so the query_block-level attachment loop below skips them.
 					subqueryRows = nil
+				} else if existsDecorrInfo != nil && existsDecorrInfo.Applies &&
+					len(existsDecorrInfo.NonCorrelatedIDs) > 0 && len(subqueryRows) > 0 {
+					// Issue #402: when EXISTS body decorrelation applies, embed the
+					// non-correlated scalar subquery (from the EXISTS body) into the
+					// outer table's attached_subqueries, with dependent: false /
+					// cacheable: true.  Mark those subqueries consumed so they aren't
+					// re-emitted at query_block level.
+					var existsAttached []interface{}
+					var residual []parsedRow
+					for _, s := range subqueryRows {
+						sid, _ := s.id.(int64)
+						if sid > 0 && existsDecorrInfo.NonCorrelatedIDs[sid] && s.selectType == "SUBQUERY" {
+							qb := e.explainJSONQueryBlockForRow(s.row, query)
+							existsAttached = append(existsAttached, []orderedKV{
+								{"dependent", false},
+								{"cacheable", true},
+								{"query_block", qb},
+							})
+						} else {
+							residual = append(residual, s)
+						}
+					}
+					if len(existsAttached) > 0 {
+						tblBlock = append(tblBlock, orderedKV{"attached_subqueries", existsAttached})
+						subqueryRows = residual
+					}
 				}
 
 				// Outer query: always emit as "table" (not grouping_operation),
