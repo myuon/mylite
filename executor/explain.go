@@ -6586,7 +6586,12 @@ func (e *Executor) walkForSubqueries(node sqlparser.SQLNode, idCounter *int64, r
 			//
 			// A simple EXISTS without nested subqueries is NOT handled here — it
 			// falls through to the regular Subquery case via return true, nil.
-			if !outerCanSemijoin {
+			//
+			// This anti-/semi-join flattening of the EXISTS body only applies when
+			// MySQL's semijoin transformation is enabled (optimizer_switch=semijoin=on).
+			// When semijoin=off, MySQL keeps the EXISTS as a separate DEPENDENT
+			// SUBQUERY block (no FirstMatch / Not exists annotations on the outer).
+			if !outerCanSemijoin && e.isOptimizerSwitchEnabled("semijoin") {
 				if inner, ok := sub.Subquery.Select.(*sqlparser.Select); ok {
 					// Only apply this handling if the EXISTS inner SELECT has nested subqueries.
 					innerHasNestedSubquery := false
