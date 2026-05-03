@@ -3397,10 +3397,6 @@
       "reason": "timeout"
     },
     {
-      "test": "sys_vars/net_buffer_length_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "innodb/innodb_bug30919",
       "reason": "failures"
     },
