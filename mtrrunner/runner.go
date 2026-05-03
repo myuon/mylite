@@ -5498,10 +5498,13 @@ func normalizeExplainJSON(s string) string {
 		}
 		// Normalize attached_condition values: these are optimizer-specific condition
 		// strings that vary between MySQL and our engine. Normalize to a placeholder.
-		// Single-quoted key form: 'attached_condition': "..."
+		// Single-quoted key form with double-quoted value: 'attached_condition': "..."
 		if strings.Contains(trimmed, `'attached_condition'`) {
 			re := regexp.MustCompile(`'attached_condition':\s*"[^"]*"`)
 			trimmed = re.ReplaceAllString(trimmed, `'attached_condition': "#"`)
+			// Single-quoted key form with single-quoted value: 'attached_condition': '...'
+			re2 := regexp.MustCompile(`'attached_condition':\s*'[^']*'`)
+			trimmed = re2.ReplaceAllString(trimmed, `'attached_condition': "#"`)
 		}
 		// Double-quoted key form: "attached_condition": "..."
 		if strings.Contains(trimmed, `"attached_condition"`) {

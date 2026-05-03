@@ -1248,16 +1248,66 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 		for outIdx, idx := range ordered {
 			tblName := entries[idx].name
 			var rowCount int64 = 1
+			// Single-table UPDATE always uses ALL access type (MySQL scans the
+			// target for updates even if it has 0 or 1 rows).  Multi-table UPDATE
+			// can use system/const for small constant tables (both targets and
+			// non-targets), because MySQL reads them as constant reference tables.
+			isUpdateTarget := updatedSet[idx]
+			isMultiTable := len(entries) > 1
+			accessType := "ALL"
 			if e.Storage != nil {
 				if tbl, err := e.Storage.GetTable(e.CurrentDB, tblName); err == nil {
-					if n := len(tbl.Rows); n > 0 {
-						rowCount = int64(n)
+					switch len(tbl.Rows) {
+					case 0:
+						rowCount = 0
+						if isMultiTable {
+							accessType = "const"
+						}
+					case 1:
+						rowCount = 1
+						if isMultiTable {
+							accessType = "system"
+						}
+					default:
+						rowCount = int64(len(tbl.Rows))
 					}
 				}
 			}
+			// Detect whether the UPDATE has subqueries in its SET/WHERE clause.
+			// MySQL only uses PRIMARY (not SIMPLE) for non-target tables when there
+			// are subqueries involved.
+			multiTableUpdateHasSubqueries := false
+			if isMultiTable {
+				hasSubqInUpdate := func(expr sqlparser.Expr) bool {
+					if expr == nil {
+						return false
+					}
+					found := false
+					_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+						if _, ok := node.(*sqlparser.Subquery); ok {
+							found = true
+							return false, nil
+						}
+						return true, nil
+					}, expr)
+					return found
+				}
+				for _, ue := range s.Exprs {
+					if hasSubqInUpdate(ue.Expr) {
+						multiTableUpdateHasSubqueries = true
+						break
+					}
+				}
+				if !multiTableUpdateHasSubqueries && s.Where != nil {
+					multiTableUpdateHasSubqueries = hasSubqInUpdate(s.Where.Expr)
+				}
+			}
 			st := "SIMPLE"
-			if updatedSet[idx] {
+			if isUpdateTarget {
 				st = "UPDATE"
+			} else if isMultiTable && multiTableUpdateHasSubqueries {
+				// In multi-table UPDATE with subqueries, non-updated tables have select_type "PRIMARY"
+				st = "PRIMARY"
 			}
 			var updateExtra interface{} = nil
 			if outIdx == 0 && s.Where != nil {
@@ -1269,9 +1319,74 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 				table:      tblName,
 				rows:       rowCount,
 				filtered:   "100.00",
-				accessType: "ALL",
+				accessType: accessType,
 				extra:      updateExtra,
 			})
+		}
+		// Scan SET expressions and WHERE for subqueries; add SUBQUERY rows.
+		// MySQL assigns select_id=2,3,... to subqueries found in the SET clause
+		// and WHERE clause of an UPDATE statement (in textual order).
+		subSelectID := idCounter + 1
+		addUpdateSubqueryRows := func(expr sqlparser.Expr) {
+			if expr == nil {
+				return
+			}
+			_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+				sub, ok := node.(*sqlparser.Subquery)
+				if !ok {
+					return true, nil
+				}
+				innerSel, ok := sub.Select.(*sqlparser.Select)
+				if !ok {
+					subSelectID++
+					return false, nil
+				}
+				// Get the first real table from the inner SELECT.
+				innerTblName := ""
+				for _, te := range innerSel.From {
+					for _, tn := range e.extractAllTableNames(te) {
+						if !strings.EqualFold(tn, "dual") {
+							innerTblName = tn
+							break
+						}
+					}
+					if innerTblName != "" {
+						break
+					}
+				}
+				var innerRowCount int64 = 1
+				accessType := "ALL"
+				if innerTblName != "" && e.Storage != nil {
+					if tbl, err := e.Storage.GetTable(e.CurrentDB, innerTblName); err == nil {
+						switch len(tbl.Rows) {
+						case 0:
+							accessType = "const"
+							innerRowCount = 0
+						case 1:
+							accessType = "system"
+							innerRowCount = 1
+						default:
+							innerRowCount = int64(len(tbl.Rows))
+						}
+					}
+				}
+				result = append(result, explainSelectType{
+					id:         subSelectID,
+					selectType: "SUBQUERY",
+					table:      innerTblName,
+					rows:       innerRowCount,
+					filtered:   "100.00",
+					accessType: accessType,
+				})
+				subSelectID++
+				return false, nil // don't recurse into subquery's body
+			}, expr)
+		}
+		for _, ue := range s.Exprs {
+			addUpdateSubqueryRows(ue.Expr)
+		}
+		if s.Where != nil {
+			addUpdateSubqueryRows(s.Where.Expr)
 		}
 		if len(result) == 0 {
 			return [][]interface{}{e.dummyExplainRow(query)}
@@ -1347,10 +1462,147 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 			filtered:   nil,
 			accessType: "ALL",
 		})
-		// For INSERT/REPLACE ... SELECT, also include the SELECT subquery (same id as INSERT/REPLACE)
+		// For INSERT/REPLACE ... SELECT, also include the SELECT subquery (same id as INSERT/REPLACE).
+		// MySQL uses "PRIMARY" as the select_type for the SELECT part of INSERT...SELECT.
 		if rows, ok := s.Rows.(*sqlparser.Select); ok {
-			innerRows := e.explainSelect(rows, &idCounter, "SIMPLE")
+			innerRows := e.explainSelect(rows, &idCounter, "PRIMARY")
 			result = append(result, innerRows...)
+		}
+		// For ON DUPLICATE KEY UPDATE with subqueries, add SUBQUERY rows.
+		if len(s.OnDup) > 0 {
+			subSelectID := idCounter + 1
+			addOnDupSubqueryRows := func(expr sqlparser.Expr) {
+				if expr == nil {
+					return
+				}
+				_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+					sub, ok := node.(*sqlparser.Subquery)
+					if !ok {
+						return true, nil
+					}
+					innerSel, ok := sub.Select.(*sqlparser.Select)
+					if !ok {
+						subSelectID++
+						return false, nil
+					}
+					innerTblName := ""
+					for _, te := range innerSel.From {
+						for _, tn := range e.extractAllTableNames(te) {
+							if !strings.EqualFold(tn, "dual") {
+								innerTblName = tn
+								break
+							}
+						}
+						if innerTblName != "" {
+							break
+						}
+					}
+					var innerRowCount int64 = 1
+					accessType := "ALL"
+					if innerTblName != "" && e.Storage != nil {
+						if tbl, err := e.Storage.GetTable(e.CurrentDB, innerTblName); err == nil {
+							switch len(tbl.Rows) {
+							case 0:
+								accessType = "const"
+								innerRowCount = 0
+							case 1:
+								accessType = "system"
+								innerRowCount = 1
+							default:
+								innerRowCount = int64(len(tbl.Rows))
+							}
+						}
+					}
+					result = append(result, explainSelectType{
+						id:         subSelectID,
+						selectType: "SUBQUERY",
+						table:      innerTblName,
+						rows:       innerRowCount,
+						filtered:   "100.00",
+						accessType: accessType,
+					})
+					subSelectID++
+					return false, nil
+				}, expr)
+			}
+			for _, ue := range s.OnDup {
+				addOnDupSubqueryRows(ue.Expr)
+			}
+		}
+		// For INSERT...VALUES with subqueries in the VALUES clause.
+		// MySQL scans VALUES rows in reverse order, assigning IDs largest-first.
+		if vals, ok := s.Rows.(sqlparser.Values); ok {
+			// Collect all subqueries from VALUES rows.
+			var valSubs []*sqlparser.Subquery
+			for _, valRow := range vals {
+				for _, expr := range valRow {
+					_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+						if sub, ok2 := node.(*sqlparser.Subquery); ok2 {
+							valSubs = append(valSubs, sub)
+							return false, nil
+						}
+						return true, nil
+					}, expr)
+				}
+			}
+			// MySQL assigns subquery IDs sequentially (first VALUES subquery gets ID idCounter+1,
+			// second gets idCounter+2, etc.) but emits them in reverse order in EXPLAIN output
+			// (highest ID first). The JSON insert_values_subqueries also lists highest ID first.
+			if len(valSubs) > 0 {
+				type valSubRow struct {
+					id         int64
+					tblName    string
+					rowCount   int64
+					accessType string
+				}
+				var rows []valSubRow
+				for i, sub := range valSubs {
+					subID := idCounter + int64(i) + 1
+					innerTblName := ""
+					if innerSel, ok2 := sub.Select.(*sqlparser.Select); ok2 {
+						for _, te := range innerSel.From {
+							for _, tn := range e.extractAllTableNames(te) {
+								if !strings.EqualFold(tn, "dual") {
+									innerTblName = tn
+									break
+								}
+							}
+							if innerTblName != "" {
+								break
+							}
+						}
+					}
+					var innerRowCount int64 = 1
+					accessType := "ALL"
+					if innerTblName != "" && e.Storage != nil {
+						if tbl, err := e.Storage.GetTable(e.CurrentDB, innerTblName); err == nil {
+							switch len(tbl.Rows) {
+							case 0:
+								accessType = "const"
+								innerRowCount = 0
+							case 1:
+								accessType = "system"
+								innerRowCount = 1
+							default:
+								innerRowCount = int64(len(tbl.Rows))
+							}
+						}
+					}
+					rows = append(rows, valSubRow{subID, innerTblName, innerRowCount, accessType})
+				}
+				// Emit in reverse order (highest ID first) to match MySQL's EXPLAIN output.
+				for i := len(rows) - 1; i >= 0; i-- {
+					r := rows[i]
+					result = append(result, explainSelectType{
+						id:         r.id,
+						selectType: "SUBQUERY",
+						table:      r.tblName,
+						rows:       r.rowCount,
+						filtered:   "100.00",
+						accessType: r.accessType,
+					})
+				}
+			}
 		}
 	default:
 		return [][]interface{}{e.dummyExplainRow(query)}
@@ -1426,12 +1678,17 @@ func (e *Executor) explainMultiRows(query string) [][]interface{} {
 	// chains here so the EXPLAIN FORMAT=JSON path can still build a
 	// union_result block; tabular EXPLAIN strips these rows in
 	// explainResultForType (see the empty-extra check there).
-	rows := make([][]interface{}, len(result))
-	for i, r := range result {
-		rows[i] = []interface{}{
+	// Filter out "__REDUCED__" rows: these are pass-through wrapper subqueries
+	// (SELECT (SELECT ...) with no FROM/WHERE/etc.) that MySQL reduces away.
+	var rows [][]interface{}
+	for _, r := range result {
+		if r.selectType == "__REDUCED__" {
+			continue
+		}
+		rows = append(rows, []interface{}{
 			r.id, r.selectType, r.table, nil, r.accessType,
 			r.possibleKeys, r.key, r.keyLen, r.ref, r.rows, r.filtered, r.extra,
-		}
+		})
 	}
 	return rows
 }
@@ -2470,10 +2727,29 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 	}()
 
 	if len(allTableNames) == 0 && numDerived == 0 {
-		// No tables at all
+		// No tables at all.
+		// Special case: if the SELECT list consists of exactly one expression that is
+		// itself a scalar subquery (and there is no FROM/WHERE/GROUP BY/etc.),
+		// MySQL reduces this wrapper away ("Select N was reduced during optimization").
+		// We mark it with "__REDUCED__" so the outer caller can filter it from output
+		// while still keeping the inner subquery's rows.
+		isPassThroughWrapper := false
+		if sel.Where == nil && sel.GroupBy == nil && len(sel.OrderBy) == 0 && sel.Having == nil {
+			if len(sel.SelectExprs.Exprs) == 1 {
+				if ae, ok := sel.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok {
+					if _, ok2 := ae.Expr.(*sqlparser.Subquery); ok2 {
+						isPassThroughWrapper = true
+					}
+				}
+			}
+		}
+		emittedSelectType := selectType
+		if isPassThroughWrapper {
+			emittedSelectType = "__REDUCED__"
+		}
 		result = append(result, explainSelectType{
 			id:         myID,
-			selectType: selectType,
+			selectType: emittedSelectType,
 			table:      nil,
 			extra:      "No tables used",
 			rows:       nil,
@@ -2526,14 +2802,30 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 			// Check if this derived table would produce 0 rows (e.g., cross-table NULL comparison).
 			// MySQL shows "no matching row in const table" for the outer row and NULL filtered.
 			derivedIsEmpty := false
+			// Detect if the derived table is guaranteed to produce exactly 1 row.
+			// MySQL uses "system" access type in that case (e.g., LIMIT 1).
+			derivedIsSingleRow := false
 			if i < len(derivedSelects) && derivedSelects[i] != nil {
-				derivedIsEmpty = e.explainDerivedTableHasZeroRows(derivedSelects[i])
+				innerSel := derivedSelects[i]
+				derivedIsEmpty = e.explainDerivedTableHasZeroRows(innerSel)
+				// LIMIT 1 guarantees the derived table produces at most 1 row → system access type.
+				if innerSel.Limit != nil && innerSel.Limit.Rowcount != nil {
+					if lv, ok := innerSel.Limit.Rowcount.(*sqlparser.Literal); ok {
+						if string(lv.Val) == "1" {
+							derivedIsSingleRow = true
+						}
+					}
+				}
 			}
 			outerFiltered := "100.00"
 			var outerExtra interface{} = nil
 			if derivedIsEmpty {
 				outerFiltered = ""
 				outerExtra = "no matching row in const table"
+			}
+			derivedAccessType := "ALL"
+			if derivedIsSingleRow {
+				derivedAccessType = "system"
 			}
 			result = append(result, explainSelectType{
 				id:           myID,
@@ -2542,7 +2834,7 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 				extra:        outerExtra,
 				rows:         int64(1),
 				filtered:     nilIfEmptyStr(outerFiltered),
-				accessType:   "ALL",
+				accessType:   derivedAccessType,
 				possibleKeys: nil,
 				key:          nil,
 				keyLen:       nil,
@@ -3368,41 +3660,120 @@ func (e *Executor) isCorrelatedSubquery(subSelect sqlparser.TableStatement, oute
 		}
 	}
 
-	correlated := false
-	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
-		if cn, ok := node.(*sqlparser.ColName); ok {
-			qualifier := strings.ToLower(cn.Qualifier.Name.String())
-			if qualifier != "" && outerTables[qualifier] && !innerTables[qualifier] {
-				// Qualified reference to outer table: clearly correlated
-				correlated = true
+	// scanSelect checks if a SELECT (and its children) reference outerTables correlatively.
+	// shadowed tracks which outer table names are hidden by the current SELECT's own FROM.
+	var scanSelect func(sel *sqlparser.Select, shadowed map[string]bool, localHasReal bool) bool
+	scanSelect = func(sel *sqlparser.Select, shadowed map[string]bool, localHasReal bool) bool {
+		// Compute the new shadowed map for this SELECT's scope.
+		newShad := make(map[string]bool, len(shadowed))
+		for k, v := range shadowed {
+			newShad[k] = v
+		}
+		newHasReal := localHasReal
+		for _, te := range sel.From {
+			for _, tn := range e.extractAllTableNames(te) {
+				tnLower := strings.ToLower(tn)
+				if outerTables[tnLower] {
+					newShad[tnLower] = true
+				}
+				if !strings.EqualFold(tn, "dual") {
+					newHasReal = true
+				}
+			}
+		}
+		found := false
+		_ = sqlparser.Walk(func(child sqlparser.SQLNode) (bool, error) {
+			if found {
 				return false, nil
 			}
-			if qualifier == "" && !hasRealInnerTables {
-				// Unqualified column reference with no real inner tables (e.g. FROM DUAL):
-				// the column must come from the outer scope → correlated
-				colName := strings.ToLower(cn.Name.String())
-				// Check if this column name exists in any outer table
-				for outerTbl := range outerTables {
-					if strings.EqualFold(outerTbl, "dual") {
-						continue
+			switch n := child.(type) {
+			case *sqlparser.Select:
+				if n == sel {
+					return true, nil // continue into this SELECT's children
+				}
+				// Nested SELECT: recurse with new scope.
+				if scanSelect(n, newShad, newHasReal) {
+					found = true
+				}
+				return false, nil // don't let outer walk descend into the nested Select
+			case *sqlparser.Union:
+				// Recurse into each union branch.
+				selects := e.flattenUnion(n)
+				for _, branch := range selects {
+					if bsel, ok := branch.(*sqlparser.Select); ok {
+						if scanSelect(bsel, newShad, newHasReal) {
+							found = true
+							break
+						}
 					}
-					// Look up the table schema to check column existence
-					if e.Storage != nil {
-						if tbl, err := e.Storage.GetTable(e.CurrentDB, outerTbl); err == nil && tbl.Def != nil {
-							for _, col := range tbl.Def.Columns {
-								if strings.EqualFold(col.Name, colName) {
-									correlated = true
-									return false, nil
+				}
+				return false, nil
+			case *sqlparser.ColName:
+				qualifier := strings.ToLower(n.Qualifier.Name.String())
+				if qualifier != "" && outerTables[qualifier] && !newShad[qualifier] {
+					found = true
+					return false, nil
+				}
+				if qualifier == "" && !newHasReal {
+					colName := strings.ToLower(n.Name.String())
+					for outerTbl := range outerTables {
+						if strings.EqualFold(outerTbl, "dual") {
+							continue
+						}
+						if e.Storage != nil {
+							if tbl, err := e.Storage.GetTable(e.CurrentDB, outerTbl); err == nil && tbl.Def != nil {
+								for _, col := range tbl.Def.Columns {
+									if strings.EqualFold(col.Name, colName) {
+										found = true
+										return false, nil
+									}
 								}
 							}
 						}
 					}
 				}
 			}
+			return true, nil
+		}, sel)
+		return found
+	}
+
+	// Build initial shadow set: outer tables that are also in the direct inner scope.
+	initialShadowed := make(map[string]bool)
+	for t := range innerTables {
+		if outerTables[t] {
+			initialShadowed[t] = true
 		}
-		return true, nil
-	}, subSelect)
-	return correlated
+	}
+
+	switch s := subSelect.(type) {
+	case *sqlparser.Select:
+		return scanSelect(s, initialShadowed, hasRealInnerTables)
+	case *sqlparser.Union:
+		selects := e.flattenUnion(s)
+		for _, branch := range selects {
+			if bsel, ok := branch.(*sqlparser.Select); ok {
+				if scanSelect(bsel, initialShadowed, hasRealInnerTables) {
+					return true
+				}
+			}
+		}
+		return false
+	default:
+		// Fallback: original behavior without shadow detection.
+		correlated := false
+		_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+			if cn, ok := node.(*sqlparser.ColName); ok {
+				qualifier := strings.ToLower(cn.Qualifier.Name.String())
+				if qualifier != "" && outerTables[qualifier] && !innerTables[qualifier] {
+					correlated = true
+					return false, nil
+				}
+			}
+			return true, nil
+		}, subSelect)
+		return correlated
+	}
 }
 
 // outerTablesAreSystem returns true if all outer tables together have exactly 1 row,
@@ -8203,15 +8574,56 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 		result.accessType = "range"
 	}
 
-	// Check if the chosen key covers all selected columns → "Using index".
-	// This applies when access type is ref, eq_ref, const, range (and the key is set).
-	if result.key != nil && result.accessType != "ALL" && sel.SelectExprs != nil {
+	// Check if the chosen key covers all accessed columns → "Using index".
+	// A covering index scan means ALL columns the query needs from this table are
+	// present in the chosen index (no table row fetch needed).
+	// We determine "needed columns" as: SELECT columns + WHERE/JOIN-ON columns from this table.
+	// If the combined set is a subset of the chosen key's columns → "Using index".
+	if result.key != nil && result.accessType != "ALL" {
 		keyName := fmt.Sprintf("%v", result.key)
-		selectCols, isStar := explainExtractSelectColumns(sel.SelectExprs, tableName)
-		if !isStar && len(selectCols) > 0 && explainIndexCoversColumns(td, keyName, selectCols) {
+		// Collect all columns referenced for this table in the query.
+		neededCols := map[string]bool{}
+		// 1) SELECT columns for this table
+		if sel.SelectExprs != nil {
+			selectCols, isStar := explainExtractSelectColumns(sel.SelectExprs, tableName)
+			if isStar {
+				// SELECT * → need all columns → never a covering index unless all cols in index
+				goto skipUsingIndex
+			}
+			for c := range selectCols {
+				neededCols[c] = true
+			}
+		}
+		// 2) WHERE/JOIN-ON columns for this table (from whereCols which was built from the WHERE
+		//    clause and ON conditions earlier in this function).
+		for _, wc := range whereCols {
+			// whereCols may include columns from other tables; we already filtered to
+			// this table's join conditions via eqCols. Include all wherecols whose
+			// column is in the table definition (approximation for this table).
+			if td != nil {
+				for _, colDef := range td.Columns {
+					if strings.EqualFold(colDef.Name, wc.column) {
+						neededCols[strings.ToLower(wc.column)] = true
+					}
+				}
+			}
+		}
+		if len(neededCols) == 0 {
+			// SELECT doesn't directly reference this table (e.g. SELECT t2.c FROM t1 JOIN t2).
+			// Fall back to checking if ALL columns in the table definition are in the key,
+			// since in that case the index IS the table (nothing to fetch outside the index).
+			allTableCols := map[string]bool{}
+			for _, col := range td.Columns {
+				allTableCols[strings.ToLower(col.Name)] = true
+			}
+			if len(allTableCols) > 0 && explainIndexCoversColumns(td, keyName, allTableCols) {
+				result.usingIndex = true
+			}
+		} else if explainIndexCoversColumns(td, keyName, neededCols) {
 			result.usingIndex = true
 		}
 	}
+	skipUsingIndex:
 
 	return result
 }
@@ -8856,6 +9268,10 @@ func (e *Executor) explainJSONTableBlock(row []interface{}, query string) []orde
 		kvs = append(kvs, orderedKV{"access_type", accessType})
 		return kvs
 	}
+	// For UPDATE target tables in multi-table UPDATE: add "update": true flag first.
+	if row[1] != nil && fmt.Sprintf("%v", row[1]) == "UPDATE" {
+		kvs = append(kvs, orderedKV{"update", true})
+	}
 	if row[2] != nil {
 		kvs = append(kvs, orderedKV{"table_name", fmt.Sprintf("%v", row[2])})
 	}
@@ -8999,6 +9415,13 @@ func (e *Executor) explainJSONTableBlock(row []interface{}, query string) []orde
 			if cond != "" {
 				kvs = append(kvs, orderedKV{"index_condition", cond})
 			}
+		}
+		// using_index: true when "Using index" appears in extra (covering index scan).
+		// Emitted after filtered, before cost_info (matches MySQL EXPLAIN FORMAT=JSON field order).
+		// "Using index condition" (ICP) is a distinct extra from "Using index" (covering scan);
+		// only emit using_index when the extra contains "Using index" without "condition".
+		if strings.Contains(extraStr, "Using index") && !strings.Contains(extraStr, "Using index condition") {
+			kvs = append(kvs, orderedKV{"using_index", true})
 		}
 		// using_join_buffer: appears after filtered (before cost_info) when a join buffer is used.
 		if strings.Contains(extraStr, "Block Nested Loop") {
@@ -9254,6 +9677,11 @@ func (e *Executor) explainJSONUsedColumns(tableName string, query string) []stri
 	// A column qualified with tableName always applies (covers correlated refs).
 	// We pass the AST tree manually so we can track scope without losing
 	// ColName walks elsewhere.
+	// walkScoped traverses the AST tracking which columns from tableName are referenced.
+	// tableInScope: true when an ancestor SELECT already has tableName in its FROM.
+	// When a nested SELECT also has tableName in its own FROM (shadow), qualified
+	// t1.col references within that nested SELECT are attributed to the nested t1, not
+	// the outer one, so they should NOT be included in the outer table's used_columns.
 	var walkScoped func(node sqlparser.SQLNode, tableInScope bool)
 	walkScoped = func(node sqlparser.SQLNode, tableInScope bool) {
 		if node == nil {
@@ -9261,18 +9689,24 @@ func (e *Executor) explainJSONUsedColumns(tableName string, query string) []stri
 		}
 		switch n := node.(type) {
 		case *sqlparser.Select:
-			selScope := tableInScope
+			// Check if tableName appears in THIS SELECT's own FROM clause.
+			tableInCurrentFrom := false
 			for _, te := range n.From {
 				for _, tn := range e.extractAllTableNames(te) {
 					if strings.EqualFold(tn, tableName) {
-						selScope = true
+						tableInCurrentFrom = true
 						break
 					}
 				}
-				if selScope {
+				if tableInCurrentFrom {
 					break
 				}
 			}
+			// If tableName is already in scope from an outer SELECT AND this SELECT
+			// also has tableName in its own FROM, then this SELECT's tableName is a
+			// shadow (inner copy). Qualified t1.col refs here refer to the inner copy.
+			isShadowed := tableInScope && tableInCurrentFrom
+			selScope := tableInScope || tableInCurrentFrom
 			// Visit children with the (possibly updated) scope flag.
 			_ = sqlparser.Walk(func(child sqlparser.SQLNode) (bool, error) {
 				switch c := child.(type) {
@@ -9289,13 +9723,29 @@ func (e *Executor) explainJSONUsedColumns(tableName string, query string) []stri
 					colName := strings.ToLower(c.Name.String())
 					qualifier := strings.ToLower(c.Qualifier.Name.String())
 					if qualifier == tableNameLower && qualifier != "" {
-						referencedCols[colName] = true
-					} else if qualifier == "" && selScope {
+						// Only attribute qualified t1.col to this table when the current
+						// SELECT is NOT a shadow (i.e., not a nested SELECT that has its
+						// own copy of t1, which would shadow the outer t1).
+						if !isShadowed {
+							referencedCols[colName] = true
+						}
+					} else if qualifier == "" && selScope && !isShadowed {
+						// Unqualified column reference: attribute to this table only when
+						// the current SELECT is NOT a shadow.  If this SELECT has its own
+						// copy of tableName (isShadowed=true), the unqualified column
+						// refers to the inner copy, not the outer one.
 						referencedCols[colName] = true
 					}
 					return false, nil
 				case *sqlparser.StarExpr:
-					hasStar = true
+					// Only count SELECT * as a "star" for this table when the current
+					// SELECT directly has tableName in its own FROM clause.  A `*` inside
+					// a nested derived table (e.g. `(SELECT * FROM t1) a1`) should NOT
+					// cause the outer table (t2) to report all columns just because t2 is
+					// also present in the outer FROM.
+					if tableInCurrentFrom {
+						hasStar = true
+					}
 				}
 				return true, nil
 			}, n)
@@ -10175,9 +10625,10 @@ func (e *Executor) explainJSONWindowFuncNamesForWindow(query string, winName str
 	return funcNames
 }
 
-// explainJSONExtractDerivedAlias extracts the alias of a derived table from the query's FROM clause.
+// explainJSONExtractDerivedAlias extracts the alias of a derived table from the query's AST.
 // It returns the alias for the Nth derived table (1-indexed by select_id).
 // For example, SELECT 1 FROM (SELECT ...) AS s1 → returns "s1" for id=2.
+// The search covers FROM clauses, subqueries in WHERE/GROUP BY, and nested subqueries.
 func (e *Executor) explainJSONExtractDerivedAlias(query string, derivedID int64) string {
 	stmt, err := e.parser().Parse(query)
 	if err != nil {
@@ -10187,15 +10638,118 @@ func (e *Executor) explainJSONExtractDerivedAlias(query string, derivedID int64)
 	if !ok {
 		return ""
 	}
-	// Count derived tables in FROM to match by order (first derived = id 2, second = id 3, etc.)
+	// Count derived tables in depth-first order to match by select_id.
 	counter := int64(1)
+	return e.findDerivedAliasInSelect(sel, derivedID, &counter)
+}
+
+// findDerivedAliasInSelect searches for derived table aliases in a SELECT statement,
+// covering FROM, WHERE, HAVING, GROUP BY, ORDER BY, and SELECT expressions.
+func (e *Executor) findDerivedAliasInSelect(sel *sqlparser.Select, derivedID int64, counter *int64) string {
+	// First, search FROM clause (primary source of derived tables).
 	for _, te := range sel.From {
-		alias := e.findDerivedAliasInExpr(te, derivedID, &counter)
+		alias := e.findDerivedAliasInExpr(te, derivedID, counter)
 		if alias != "" {
 			return alias
 		}
 	}
-	return ""
+	// Then search subqueries in WHERE, HAVING, GROUP BY, ORDER BY, SELECT expressions.
+	// These may contain nested SELECTs that themselves have derived tables.
+	var subFound string
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if subFound != "" {
+			return false, nil
+		}
+		sub, ok := node.(*sqlparser.Subquery)
+		if !ok {
+			return true, nil
+		}
+		// Found a subquery — check for derived tables inside it.
+		if inner, ok := sub.Select.(*sqlparser.Select); ok {
+			// Count this subquery as a select_id.
+			*counter++
+			if a := e.findDerivedAliasInSelect(inner, derivedID, counter); a != "" {
+				subFound = a
+			}
+		}
+		return false, nil // don't recurse further; findDerivedAliasInSelect handles nesting
+	}, sel)
+	return subFound
+}
+
+// explainJSONGetDerivedSelect returns the *sqlparser.Select for the Nth derived table
+// (identified by select_id) in the query. Returns nil if not found or not a plain SELECT.
+func (e *Executor) explainJSONGetDerivedSelect(query string, derivedID int64) *sqlparser.Select {
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		return nil
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return nil
+	}
+	counter := int64(1)
+	return e.findDerivedSelectInSelect(sel, derivedID, &counter)
+}
+
+func (e *Executor) findDerivedSelectInSelect(sel *sqlparser.Select, derivedID int64, counter *int64) *sqlparser.Select {
+	for _, te := range sel.From {
+		if s := e.findDerivedSelectInExpr(te, derivedID, counter); s != nil {
+			return s
+		}
+	}
+	var found *sqlparser.Select
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if found != nil {
+			return false, nil
+		}
+		sub, ok := node.(*sqlparser.Subquery)
+		if !ok {
+			return true, nil
+		}
+		if inner, ok := sub.Select.(*sqlparser.Select); ok {
+			*counter++
+			if s := e.findDerivedSelectInSelect(inner, derivedID, counter); s != nil {
+				found = s
+			}
+		}
+		return false, nil
+	}, sel)
+	return found
+}
+
+func (e *Executor) findDerivedSelectInExpr(te sqlparser.TableExpr, derivedID int64, counter *int64) *sqlparser.Select {
+	switch t := te.(type) {
+	case *sqlparser.AliasedTableExpr:
+		if dt, ok := t.Expr.(*sqlparser.DerivedTable); ok {
+			*counter++
+			if *counter == derivedID {
+				if inner, ok := dt.Select.(*sqlparser.Select); ok {
+					return inner
+				}
+				return nil
+			}
+			if inner, ok := dt.Select.(*sqlparser.Select); ok {
+				for _, fe := range inner.From {
+					if s := e.findDerivedSelectInExpr(fe, derivedID, counter); s != nil {
+						return s
+					}
+				}
+			}
+		}
+	case *sqlparser.JoinTableExpr:
+		if s := e.findDerivedSelectInExpr(t.LeftExpr, derivedID, counter); s != nil {
+			return s
+		}
+		return e.findDerivedSelectInExpr(t.RightExpr, derivedID, counter)
+	case *sqlparser.ParenTableExpr:
+		for _, expr := range t.Exprs {
+			if s := e.findDerivedSelectInExpr(expr, derivedID, counter); s != nil {
+				return s
+			}
+		}
+	}
+	return nil
 }
 
 // findDerivedAliasInExpr recursively searches for a derived table alias by its sequential order.
@@ -10244,6 +10798,7 @@ func (e *Executor) findDerivedAliasInExpr(te sqlparser.TableExpr, derivedID int6
 // Nth derived table's SELECT list (1-indexed by select_id, so id=2 → 1st derived table).
 // Returns a slice of column name strings (e.g. ["COUNT(DISTINCT t1.a)"]) for use in
 // the outer table's used_columns field in EXPLAIN FORMAT=JSON.
+// The search covers FROM clauses, subqueries in WHERE/GROUP BY, and nested subqueries.
 func (e *Executor) explainJSONExtractDerivedColumns(query string, derivedID int64) []string {
 	stmt, err := e.parser().Parse(query)
 	if err != nil {
@@ -10254,12 +10809,37 @@ func (e *Executor) explainJSONExtractDerivedColumns(query string, derivedID int6
 		return nil
 	}
 	counter := int64(1)
+	return e.findDerivedColumnsInSelect(sel, derivedID, &counter)
+}
+
+// findDerivedColumnsInSelect searches for derived table column expressions in a SELECT statement,
+// covering FROM, WHERE, HAVING, GROUP BY, ORDER BY, and SELECT expressions.
+func (e *Executor) findDerivedColumnsInSelect(sel *sqlparser.Select, derivedID int64, counter *int64) []string {
+	// First, search FROM clause.
 	for _, te := range sel.From {
-		if cols := e.findDerivedColumnsInExpr(te, derivedID, &counter); cols != nil {
+		if cols := e.findDerivedColumnsInExpr(te, derivedID, counter); cols != nil {
 			return cols
 		}
 	}
-	return nil
+	// Then search subqueries in WHERE, HAVING, GROUP BY, ORDER BY, SELECT expressions.
+	var found []string
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if len(found) > 0 {
+			return false, nil
+		}
+		sub, ok := node.(*sqlparser.Subquery)
+		if !ok {
+			return true, nil
+		}
+		if inner, ok := sub.Select.(*sqlparser.Select); ok {
+			*counter++
+			if cols := e.findDerivedColumnsInSelect(inner, derivedID, counter); cols != nil {
+				found = cols
+			}
+		}
+		return false, nil
+	}, sel)
+	return found
 }
 
 // findDerivedColumnsInExpr recursively finds the SELECT expressions of a derived table
@@ -10276,6 +10856,13 @@ func (e *Executor) findDerivedColumnsInExpr(te sqlparser.TableExpr, derivedID in
 			if *counter == derivedID {
 				if inner, ok := dt.Select.(*sqlparser.Select); ok {
 					return e.explainJSONResolveSelectExprNames(inner)
+				}
+				// For UNION/UNION ALL: extract column names from the first SELECT branch.
+				if u, ok := dt.Select.(*sqlparser.Union); ok {
+					firstSel := explainUnionFirstSelect(u)
+					if firstSel != nil {
+						return e.explainJSONResolveSelectExprNames(firstSel)
+					}
 				}
 				return nil
 			}
@@ -10301,6 +10888,21 @@ func (e *Executor) findDerivedColumnsInExpr(te sqlparser.TableExpr, derivedID in
 		}
 	}
 	return nil
+}
+
+// explainUnionFirstSelect returns the first SELECT branch of a UNION (possibly nested).
+// This is used to extract column names when the derived table is a UNION/UNION ALL.
+func explainUnionFirstSelect(u *sqlparser.Union) *sqlparser.Select {
+	for {
+		switch left := u.Left.(type) {
+		case *sqlparser.Select:
+			return left
+		case *sqlparser.Union:
+			u = left
+		default:
+			return nil
+		}
+	}
 }
 
 // explainJSONSelectExprNames returns the display names for a set of SELECT expressions.
@@ -11855,10 +12457,24 @@ func (e *Executor) explainJSONDocument(query string) string {
 	// body has ORDER BY + LIMIT, so the JSON path can wrap their table in
 	// an `ordering_operation` block.
 	selectListSubqueryIDs := map[int64]bool{}
+	// hasOrderByWithGroupBy: outer SELECT has both ORDER BY and GROUP BY
+	// (without window functions). In this case, MySQL wraps the output in
+	// ordering_operation (for ORDER BY) wrapping grouping_operation (for GROUP BY).
+	hasOrderByWithGroupBy := false
+	// hasReducedWhereSubquery: the WHERE clause contains a scalar subquery
+	// `(SELECT X)` where X is itself a subquery and the outer SELECT has no
+	// FROM/WHERE/GROUP BY etc.  MySQL "reduces" such pass-through wrappers
+	// and emits the inner subquery as `optimized_away_subqueries` (not
+	// `attached_subqueries`) at the query_block level.
+	hasReducedWhereSubquery := false
 	if stmt, err := e.parser().Parse(query); err == nil {
 		if sel, ok := stmt.(*sqlparser.Select); ok {
 			if len(sel.OrderBy) > 0 && !hasWindowFuncs {
-				// ORDER BY without window funcs is handled by filesort
+				// ORDER BY without window funcs is handled by filesort.
+				// When combined with GROUP BY, creates two-level wrapper.
+				if hasGroupBy {
+					hasOrderByWithGroupBy = true
+				}
 			} else if len(sel.OrderBy) > 0 && hasWindowFuncs {
 				hasExternalOrderBy = true
 			}
@@ -11894,6 +12510,38 @@ func (e *Executor) explainJSONDocument(query string) string {
 					}
 					return true, nil
 				}, sel.GroupBy)
+			}
+			// Detect "reduced WHERE subquery": WHERE has a pass-through scalar
+			// subquery (SELECT (SELECT ...)) with no FROM/WHERE/GROUP BY on the
+			// outer wrapper.  MySQL reduces such wrappers away and emits the inner
+			// subquery as `optimized_away_subqueries` at the query_block level.
+			if sel.Where != nil {
+				_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+					sub, ok := node.(*sqlparser.Subquery)
+					if !ok {
+						return true, nil
+					}
+					inner, ok2 := sub.Select.(*sqlparser.Select)
+					if !ok2 {
+						return false, nil
+					}
+					// Check for pass-through pattern: no meaningful FROM (or only DUAL),
+					// no WHERE, no GROUP BY, no ORDER BY, single SELECT expression that
+					// is itself a subquery.  MySQL canonicalizes `SELECT (subq)` to
+					// `SELECT (subq) FROM dual`, so we must treat DUAL as "no FROM".
+					innerFromIsDual := len(inner.From) == 1 && isFromDual(inner.From)
+					if (len(inner.From) == 0 || innerFromIsDual) && inner.Where == nil && inner.GroupBy == nil &&
+						len(inner.OrderBy) == 0 && inner.Having == nil &&
+						len(inner.SelectExprs.Exprs) == 1 {
+						if ae, ok3 := inner.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok3 {
+							if _, ok4 := ae.Expr.(*sqlparser.Subquery); ok4 {
+								hasReducedWhereSubquery = true
+								return false, nil
+							}
+						}
+					}
+					return false, nil
+				}, sel.Where)
 			}
 			// Walk SELECT list for subqueries.
 			if selSubs := explainSelectListSubqueries(sel); len(selSubs) > 0 {
@@ -12286,9 +12934,22 @@ func (e *Executor) explainJSONDocument(query string) string {
 	// Build the query_block with ordered keys
 	var queryBlock []orderedKV
 
+	// isNestedUnionInDerived: true when the UNION RESULT belongs to a derived table
+	// (not the top-level query). This happens when:
+	// - unionResultRow != nil (UNION ALL generates an internal marker row)
+	// - But the primary row (id=1) is scanning a <derivedN> table
+	// In this case, the outer query block is NOT a UNION; it scans the derived table.
+	isNestedUnionInDerived := false
+	if unionResultRow != nil && len(primaryRows) == 1 {
+		p := primaryRows[0]
+		if p.row[2] != nil && strings.HasPrefix(fmt.Sprintf("%v", p.row[2]), "<derived") {
+			isNestedUnionInDerived = true
+		}
+	}
+
 	// select_id (skip for top-level UNION queries: MySQL's outer query_block for
 	// a UNION at the top level contains only union_result, no select_id/cost_info)
-	if unionResultRow == nil {
+	if unionResultRow == nil || isNestedUnionInDerived {
 		if parsed[0].id != nil {
 			switch v := parsed[0].id.(type) {
 			case int64:
@@ -12819,6 +13480,18 @@ func (e *Executor) explainJSONDocument(query string) string {
 				}},
 			}
 			queryBlock = append(queryBlock, orderedKV{"grouping_operation", groupOp})
+		} else if hasOrderByWithGroupBy {
+			// Both ORDER BY and GROUP BY: two-level wrapper.
+			groupOp := []orderedKV{
+				{"using_temporary_table", true},
+				{"using_filesort", false},
+				{"table", tblBlock},
+			}
+			orderingOp := []orderedKV{
+				{"using_filesort", true},
+				{"grouping_operation", groupOp},
+			}
+			queryBlock = append(queryBlock, orderedKV{"ordering_operation", orderingOp})
 		} else if hasGroupBy && hasFilesort {
 			groupOp := []orderedKV{
 				{"using_filesort", true},
@@ -12857,7 +13530,7 @@ func (e *Executor) explainJSONDocument(query string) string {
 			nl := buildNestedLoop(primaryRows)
 			queryBlock = append(queryBlock, orderedKV{"nested_loop", nl})
 		}
-	} else if unionResultRow != nil {
+	} else if unionResultRow != nil && !isNestedUnionInDerived {
 		// UNION query: outer query_block contains only union_result (no
 		// select_id/cost_info at this level — MySQL emits those inside each
 		// query_specifications entry).
@@ -13061,6 +13734,178 @@ func (e *Executor) explainJSONDocument(query string) string {
 		} else {
 			queryBlock = append(queryBlock, orderedKV{"union_result", unionResult})
 		}
+	} else if len(derivedRows) == 0 && len(unionRows) == 0 && unionResultRow == nil &&
+		len(primaryRows) >= 1 &&
+		(primaryRows[0].selectType == "UPDATE" || primaryRows[0].selectType == "DELETE") &&
+		len(subqueryRows) > 0 {
+		// UPDATE/DELETE with SET-clause subqueries: emit a special structure.
+		//
+		// Single-table case (UPDATE t1 SET i=(SELECT i FROM t2)):
+		//   MySQL FORMAT=JSON does NOT include cost_info at the query_block level.
+		//   The updated table block has just a few fields (no nested_loop).
+		//   SET-clause subqueries appear under "update_value_subqueries".
+		//
+		// Multi-table case (UPDATE t1, t2 SET t1.i=(SELECT i FROM t3)):
+		//   MySQL FORMAT=JSON DOES include cost_info at the query_block level.
+		//   All FROM-clause tables appear in a "nested_loop".
+		//   SET-clause subqueries appear under "update_value_subqueries" after the loop.
+		isMultiTableUpdate := len(primaryRows) > 1
+		if isMultiTableUpdate {
+			// Multi-table UPDATE: has cost_info, nested_loop of all FROM tables,
+			// then update_value_subqueries.
+			queryBlock = append(queryBlock, orderedKV{"cost_info", []orderedKV{
+				{"query_cost", fmt.Sprintf("%.2f", totalCost)},
+			}})
+			nl := buildNestedLoop(primaryRows)
+			queryBlock = append(queryBlock, orderedKV{"nested_loop", nl})
+		} else {
+			// Single-table UPDATE: no cost_info, single table block with trimmed fields.
+			p := primaryRows[0]
+			isUpdate := p.selectType == "UPDATE"
+			// Build a trimmed table block: just table_name, access_type,
+			// rows_examined_per_scan, filtered.  No cost_info, no used_columns,
+			// no rows_produced_per_join (MySQL omits them here).
+			var tblBlock []orderedKV
+			if isUpdate {
+				tblBlock = append(tblBlock, orderedKV{"update", true})
+			} else {
+				tblBlock = append(tblBlock, orderedKV{"delete", true})
+			}
+			if p.row[2] != nil {
+				tblBlock = append(tblBlock, orderedKV{"table_name", fmt.Sprintf("%v", p.row[2])})
+			}
+			accessType := "ALL"
+			if p.row[4] != nil {
+				accessType = fmt.Sprintf("%v", p.row[4])
+			}
+			tblBlock = append(tblBlock, orderedKV{"access_type", accessType})
+			rc := explainJSONRowCount(p.row)
+			tblBlock = append(tblBlock, orderedKV{"rows_examined_per_scan", rc})
+			filtered := "100.00"
+			if p.row[10] != nil {
+				filtered = fmt.Sprintf("%v", p.row[10])
+			}
+			tblBlock = append(tblBlock, orderedKV{"filtered", filtered})
+			queryBlock = append(queryBlock, orderedKV{"table", tblBlock})
+		}
+		// Build update_value_subqueries list (common to both single- and multi-table).
+		var valueSubs []interface{}
+		for _, s := range subqueryRows {
+			qb := e.explainJSONQueryBlockForRow(s.row, query)
+			valueSubs = append(valueSubs, []orderedKV{
+				{"dependent", false},
+				{"cacheable", true},
+				{"query_block", qb},
+			})
+		}
+		queryBlock = append(queryBlock, orderedKV{"update_value_subqueries", valueSubs})
+	} else if len(derivedRows) == 0 && len(unionRows) == 0 && unionResultRow == nil &&
+		len(primaryRows) >= 1 &&
+		(primaryRows[0].selectType == "INSERT" || primaryRows[0].selectType == "REPLACE") {
+		// INSERT/REPLACE with optional SELECT source, ON DUPLICATE KEY UPDATE
+		// subqueries, or VALUES-clause subqueries.
+		//
+		// MySQL FORMAT=JSON structures:
+		//
+		// INSERT...SELECT:
+		//   query_block:
+		//     select_id: 1
+		//     cost_info: { query_cost: N }
+		//     table: { insert: true, table_name: <target>, access_type: ALL }
+		//     insert_from: { table: {...} } (or nested_loop for multi-table SELECT)
+		//     insert_update_subqueries: [...] (if ON DUPLICATE KEY UPDATE subqueries)
+		//
+		// INSERT...VALUES with ON DUPLICATE KEY UPDATE subqueries:
+		//   query_block:
+		//     select_id: 1
+		//     table: { insert: true, table_name: <target>, access_type: ALL }
+		//     insert_update_subqueries: [...]
+		//     (NO cost_info in outer query_block)
+		//
+		// INSERT...VALUES with subqueries in VALUES clause:
+		//   query_block:
+		//     select_id: 1
+		//     table: { insert: true, table_name: <target>, access_type: ALL }
+		//     insert_values_subqueries: [...]
+		//     (NO cost_info in outer query_block)
+		insertRow := primaryRows[0]
+		selectRows := primaryRows[1:] // SELECT part rows (PRIMARY select_type)
+
+		// Determine if the original query uses ON DUPLICATE KEY UPDATE (vs VALUES subqueries).
+		// We detect this by parsing the query.
+		hasOnDupKeyUpdate := false
+		hasValuesSubqueries := false
+		if stmt2, err2 := e.parser().Parse(query); err2 == nil {
+			if ins, ok := stmt2.(*sqlparser.Insert); ok {
+				if len(ins.OnDup) > 0 && len(selectRows) == 0 {
+					// VALUES with ON DUPLICATE KEY UPDATE containing subqueries
+					hasOnDupKeyUpdate = true
+					_ = hasOnDupKeyUpdate
+				} else if len(ins.OnDup) == 0 {
+					// Check if VALUES clause has subqueries
+					if _, isValues := ins.Rows.(sqlparser.Values); isValues {
+						hasValuesSubqueries = len(subqueryRows) > 0
+					}
+				}
+			}
+		}
+		_ = hasValuesSubqueries
+
+		// Only emit outer cost_info when there's a SELECT part (INSERT...SELECT).
+		if len(selectRows) > 0 {
+			sourceCost := 0.0
+			for _, r := range selectRows {
+				rc := explainJSONRowCount(r.row)
+				sourceCost += float64(rc)*0.10 + 0.25
+			}
+			queryBlock = append(queryBlock, orderedKV{"cost_info", []orderedKV{
+				{"query_cost", fmt.Sprintf("%.2f", sourceCost)},
+			}})
+		}
+
+		// The INSERT/REPLACE target table block.
+		insertTblBlock := e.explainJSONTableBlock(insertRow.row, query)
+		queryBlock = append(queryBlock, orderedKV{"table", insertTblBlock})
+
+		// insert_from: wraps the SELECT source rows (INSERT...SELECT only).
+		if len(selectRows) > 0 {
+			var insertFrom []orderedKV
+			if len(selectRows) == 1 {
+				tblBlock := e.explainJSONTableBlock(selectRows[0].row, query)
+				insertFrom = append(insertFrom, orderedKV{"table", tblBlock})
+			} else {
+				// JOIN: build nested_loop.
+				var nl []interface{}
+				for _, r := range selectRows {
+					tblBlock := e.explainJSONTableBlock(r.row, query)
+					nl = append(nl, []orderedKV{{"table", tblBlock}})
+				}
+				insertFrom = append(insertFrom, orderedKV{"nested_loop", nl})
+			}
+			queryBlock = append(queryBlock, orderedKV{"insert_from", insertFrom})
+		}
+
+		// Subqueries: either from ON DUPLICATE KEY UPDATE or VALUES clause or both.
+		if len(subqueryRows) > 0 {
+			var subs []interface{}
+			for _, s := range subqueryRows {
+				qb := e.explainJSONQueryBlockForRow(s.row, query)
+				subs = append(subs, []orderedKV{
+					{"dependent", false},
+					{"cacheable", true},
+					{"query_block", qb},
+				})
+			}
+			// Determine which key to use:
+			// - INSERT...SELECT + ON DUPLICATE KEY UPDATE → insert_update_subqueries
+			// - INSERT...VALUES + ON DUPLICATE KEY UPDATE → insert_update_subqueries
+			// - INSERT...VALUES with subqueries in VALUES clause → insert_values_subqueries
+			insertSubKey := "insert_update_subqueries"
+			if hasValuesSubqueries {
+				insertSubKey = "insert_values_subqueries"
+			}
+			queryBlock = append(queryBlock, orderedKV{insertSubKey, subs})
+		}
 	} else {
 		// Complex query with subqueries and/or derived tables
 		queryBlock = append(queryBlock, orderedKV{"cost_info", []orderedKV{
@@ -13125,17 +13970,137 @@ func (e *Executor) explainJSONDocument(query string) string {
 						innerCost += innerSortCost
 					}
 
+					// Get the inner derived SELECT AST for used_columns computation
+					// (needed later for ordering_operation/grouping_operation detection).
+					innerSel := e.explainJSONGetDerivedSelect(query, derivedID)
+					// innerSelStr is the inner SELECT as a SQL string, used to correctly
+					// compute used_columns for inner DERIVED rows. By using the inner
+					// query context (not the full outer query), we avoid scope shadowing issues
+					// where the same table name at outer and inner level causes columns to be
+					// incorrectly attributed.
+					innerSelStr := query
+					if innerSel != nil {
+						innerSelStr = sqlparser.String(innerSel)
+					}
+
 					// Build a single inner table block, recursively wrapping if it
 					// itself references another <derived> table.
 					buildInnerTbl := func(d parsedRow) []orderedKV {
-						b := e.explainJSONTableBlock(d.row, query)
+						tblNameForRow := ""
 						if d.row[2] != nil {
-							inner := fmt.Sprintf("%v", d.row[2])
-							if strings.HasPrefix(inner, "<derived") {
-								b = wrapDerived(b, inner)
+							tblNameForRow = fmt.Sprintf("%v", d.row[2])
+						}
+						// Use innerSelStr for used_columns computation when the table
+						// appears in the inner derived SELECT (not a further nested derived).
+						tblQueryCtx := query
+						if innerSel != nil && !strings.HasPrefix(tblNameForRow, "<derived") {
+							// Check if this table exists in innerSel's FROM clause.
+							for _, te := range innerSel.From {
+								for _, tn := range e.extractAllTableNames(te) {
+									if strings.EqualFold(tn, tblNameForRow) {
+										tblQueryCtx = innerSelStr
+										break
+									}
+								}
 							}
 						}
+						b := e.explainJSONTableBlock(d.row, tblQueryCtx)
+						if tblNameForRow != "" && strings.HasPrefix(tblNameForRow, "<derived") {
+							b = wrapDerived(b, tblNameForRow)
+						}
 						return b
+					}
+
+					// Detect if the derived table is a UNION ALL:
+					// This is the case when the DERIVED row(s) have no table ("No tables used")
+					// and there are UNION rows available (they form the branches of the UNION ALL).
+					isDerivedUnionAll := false
+					if len(matchedDerived) > 0 && len(unionRows) > 0 {
+						// Check if the first DERIVED row has no table (it's a UNION branch)
+						isDerivedUnionAll = matchedDerived[0].row[2] == nil
+					}
+
+					if isDerivedUnionAll {
+						// Build union_result structure for UNION ALL inside derived table.
+						// The first branch is the DERIVED row (id=derivedID),
+						// subsequent branches are UNION rows.
+						var querySpecs []interface{}
+						// First branch: the DERIVED row
+						for _, d := range matchedDerived {
+							extraStr := ""
+							if d.row[11] != nil {
+								extraStr = fmt.Sprintf("%v", d.row[11])
+							}
+							var branchQB []orderedKV
+							if d.id != nil {
+								if id, ok := d.id.(int64); ok {
+									branchQB = append(branchQB, orderedKV{"select_id", id})
+								}
+							}
+							if extraStr != "" {
+								branchQB = append(branchQB, orderedKV{"message", extraStr})
+							}
+							querySpecs = append(querySpecs, []orderedKV{
+								{"dependent", false},
+								{"cacheable", true},
+								{"query_block", branchQB},
+							})
+						}
+						// UNION branches
+						for _, u := range unionRows {
+							extraStr := ""
+							if u.row[11] != nil {
+								extraStr = fmt.Sprintf("%v", u.row[11])
+							}
+							var branchQB []orderedKV
+							if u.id != nil {
+								if id, ok := u.id.(int64); ok {
+									branchQB = append(branchQB, orderedKV{"select_id", id})
+								}
+							}
+							if extraStr != "" {
+								branchQB = append(branchQB, orderedKV{"message", extraStr})
+							}
+							querySpecs = append(querySpecs, []orderedKV{
+								{"dependent", false},
+								{"cacheable", true},
+								{"query_block", branchQB},
+							})
+						}
+						unionResultBlock := []orderedKV{
+							{"using_temporary_table", false},
+							{"query_specifications", querySpecs},
+						}
+						innerQBUnion := []orderedKV{
+							{"union_result", unionResultBlock},
+						}
+						derivedBlock := []orderedKV{
+							{"using_temporary_table", true},
+							{"dependent", false},
+							{"cacheable", true},
+							{"query_block", innerQBUnion},
+						}
+						// Use the alias as table_name in tblBlock instead of <derivedN>.
+						alias := e.explainJSONExtractDerivedAlias(query, derivedID)
+						if alias != "" {
+							for i, kv := range tblBlock {
+								if kv.Key == "table_name" {
+									tblBlock[i] = orderedKV{"table_name", alias}
+									break
+								}
+							}
+						}
+						// used_columns for the outer derived scan
+						derivedCols := e.explainJSONExtractDerivedColumns(query, derivedID)
+						if len(derivedCols) > 0 {
+							arr := make([]interface{}, len(derivedCols))
+							for i, c := range derivedCols {
+								arr[i] = c
+							}
+							tblBlock = append(tblBlock, orderedKV{"used_columns", arr})
+						}
+						tblBlock = append(tblBlock, orderedKV{"materialized_from_subquery", derivedBlock})
+						return tblBlock
 					}
 
 					var innerQB []orderedKV
@@ -13144,7 +14109,21 @@ func (e *Executor) explainJSONDocument(query string) string {
 						{"query_cost", fmt.Sprintf("%.2f", innerCost)},
 					}})
 
-					if innerHasGroupBy {
+					// Check the inner derived query's AST to determine if it has a GROUP BY
+					// (grouping_operation) or just ORDER BY on a join (ordering_operation).
+					// "Using temporary; Using filesort" in Extra can mean either case.
+					// innerSel is already defined above (for buildInnerTbl context).
+					innerHasRealGroupBy := false
+					innerHasOrderBy := false
+					if innerSel != nil {
+						innerHasRealGroupBy = innerSel.GroupBy != nil && len(innerSel.GroupBy.Exprs) > 0
+						innerHasOrderBy = len(innerSel.OrderBy) > 0
+					}
+					// If not detected from Extra but AST shows ORDER BY on a join
+					// (multiple matchedDerived rows = join), treat as ordering_operation.
+					innerHasJoinWithOrderBy := !innerHasGroupBy && innerHasOrderBy && len(matchedDerived) > 1
+
+					if innerHasGroupBy && innerHasRealGroupBy {
 						var groupOp []orderedKV
 						groupOp = append(groupOp, orderedKV{"using_temporary_table", true})
 						if innerHasFilesort {
@@ -13163,6 +14142,22 @@ func (e *Executor) explainJSONDocument(query string) string {
 							groupOp = append(groupOp, orderedKV{"nested_loop", innerLoop})
 						}
 						innerQB = append(innerQB, orderedKV{"grouping_operation", groupOp})
+					} else if (innerHasGroupBy && !innerHasRealGroupBy && innerHasOrderBy) || innerHasJoinWithOrderBy {
+						// ORDER BY on a join (with or without Extra "Using temporary; Using filesort")
+						// should produce ordering_operation wrapper.
+						var orderOp []orderedKV
+						orderOp = append(orderOp, orderedKV{"using_temporary_table", true})
+						orderOp = append(orderOp, orderedKV{"using_filesort", true})
+						if len(matchedDerived) == 1 {
+							orderOp = append(orderOp, orderedKV{"table", buildInnerTbl(matchedDerived[0])})
+						} else {
+							var innerLoop []interface{}
+							for _, d := range matchedDerived {
+								innerLoop = append(innerLoop, []orderedKV{{"table", buildInnerTbl(d)}})
+							}
+							orderOp = append(orderOp, orderedKV{"nested_loop", innerLoop})
+						}
+						innerQB = append(innerQB, orderedKV{"ordering_operation", orderOp})
 					} else if len(matchedDerived) == 1 {
 						innerQB = append(innerQB, orderedKV{"table", buildInnerTbl(matchedDerived[0])})
 					} else {
@@ -13285,7 +14280,7 @@ func (e *Executor) explainJSONDocument(query string) string {
 				// `group_by_subqueries`, so skip the inline path for that case too.
 				var attachedSubs []interface{}
 				hasDependentSubs := false
-				if !hasHavingSubquery && !hasGroupBySubquery {
+				if !hasHavingSubquery && !hasGroupBySubquery && !hasOrderBySubquery {
 					// Compute parent select_id for each subquery; subqueries
 					// nested inside another subquery's body must attach to the
 					// parent subquery's table block, not the outer t1 block.
@@ -13319,6 +14314,271 @@ func (e *Executor) explainJSONDocument(query string) string {
 							dependent: s.selectType == "DEPENDENT SUBQUERY",
 							qb:        qb,
 						})
+					}
+					// Issue #264: merge multi-table DEPENDENT SUBQUERY groups into a
+					// single attached_subqueries block with a nested_loop.
+					// When the EXISTS body has multiple FROM tables (e.g.
+					//   EXISTS (SELECT t2.c1 FROM t2 INNER JOIN t3 ON t3.c1 = t2.c1 WHERE ...)
+					// ), semijoin=off causes each table to appear as a separate
+					// DEPENDENT SUBQUERY row with the same select_id.  MySQL emits
+					// these as ONE attached_subqueries entry with a nested_loop
+					// (driver=ALL-scan first, probe=ref last).  Without merging,
+					// mylite would emit two separate attached_subqueries entries each
+					// with only one table, which is wrong.
+					{
+						// Count how many entries share each select_id.
+						idCount := map[int64]int{}
+						for _, en := range entries {
+							idCount[en.selectID]++
+						}
+						// Helper: extract the table block from a single-table qb.
+						extractTbl := func(qb []orderedKV) []orderedKV {
+							for _, kv := range qb {
+								if kv.Key == "table" {
+									if tbl, ok := kv.Value.([]orderedKV); ok {
+										return tbl
+									}
+								}
+							}
+							return nil
+						}
+						// Helper: detect if a table block uses ref/eq_ref access (probe side).
+						isRefAccess := func(tbl []orderedKV) bool {
+							for _, kv := range tbl {
+								if kv.Key == "access_type" {
+									at := fmt.Sprintf("%v", kv.Value)
+									return at == "ref" || at == "eq_ref" || at == "ref_or_null"
+								}
+							}
+							return false
+						}
+						// Identify select_ids that need merging.
+						needsMerge := map[int64]bool{}
+						for id, cnt := range idCount {
+							if cnt > 1 {
+								needsMerge[id] = true
+							}
+						}
+						if len(needsMerge) > 0 {
+							// Group entries indices by select_id (for multi-row groups).
+							idxsByID := map[int64][]int{}
+							for i, en := range entries {
+								if needsMerge[en.selectID] {
+									idxsByID[en.selectID] = append(idxsByID[en.selectID], i)
+								}
+							}
+							// Track which entry indices are consumed (merged or children).
+							consumed := map[int]bool{}
+							// Build merged entries: iterate in original order, emit merged
+							// entry at the first occurrence of each merged select_id.
+							var mergedEntries []subEntry
+							for i, en := range entries {
+								if consumed[i] {
+									continue
+								}
+								if !needsMerge[en.selectID] {
+									mergedEntries = append(mergedEntries, en)
+									continue
+								}
+								// This is the first occurrence of a multi-row select_id.
+								// Mark all other entries with the same select_id as consumed.
+								idxs := idxsByID[en.selectID]
+								for _, idx := range idxs {
+									consumed[idx] = true
+								}
+								// Collect table blocks in original order, then reorder:
+								// ALL-scan (drivers) first, ref/eq_ref (probes) last.
+								var driverTbls, probeTbls [][]orderedKV
+								for _, idx := range idxs {
+									tbl := extractTbl(entries[idx].qb)
+									if tbl == nil {
+										continue
+									}
+									if isRefAccess(tbl) {
+										probeTbls = append(probeTbls, tbl)
+									} else {
+										driverTbls = append(driverTbls, tbl)
+									}
+								}
+								allTbls := append(driverTbls, probeTbls...)
+								// Strip using_join_buffer from driver table blocks: when the
+								// probe uses ref/eq_ref access, the join is done via key lookup
+								// (not a BNL buffer), so the driver should not carry
+								// using_join_buffer even if the original EXPLAIN row had it
+								// (the BNL annotation was emitted because the row was originally
+								// listed as the INNER of the pre-reordering join).
+								if len(probeTbls) > 0 {
+									for i := range driverTbls {
+										var stripped []orderedKV
+										for _, kv := range driverTbls[i] {
+											if kv.Key != "using_join_buffer" {
+												stripped = append(stripped, kv)
+											}
+										}
+										driverTbls[i] = stripped
+										allTbls[i] = stripped
+									}
+								}
+								// Strip attached_condition from probe table blocks in the
+								// nested_loop.  For IN-subquery nested loops (semijoin=off),
+								// MySQL puts the IN correlation condition (e.g.
+								// "<cache>(outer.c) = inner.c") only on the DRIVER (ALL-scan)
+								// table, not on the ref-access probe table.  The entry building
+								// loop injected it on all rows for the same select_id (via
+								// inExistsInfo.InnerCondBySelectID), so we strip it from the
+								// probes here.  Exception: EXISTS body decorrelation (handled
+								// below) wants attached_condition on the probe too.
+								if !((existsDecorrInfo != nil) && existsDecorrInfo.Applies) {
+									for i := range probeTbls {
+										probeIdx := len(driverTbls) + i
+										var stripped []orderedKV
+										for _, kv := range allTbls[probeIdx] {
+											if kv.Key != "attached_condition" {
+												stripped = append(stripped, kv)
+											}
+										}
+										allTbls[probeIdx] = stripped
+									}
+								}
+								// When EXISTS body decorrelation applies, inject an
+								// attached_condition onto the driver table block(s).  MySQL
+								// places the "(scalar_subq) <op> outer.col" predicate on the
+								// driver (ALL-scan) table inside the nested_loop, matching the
+								// attached_condition it placed on the outer table.  The text
+								// is masked to "#" by mtrrun, so any non-empty placeholder
+								// suffices; use existsDecorrInfo.Cond if available.
+								if existsDecorrInfo != nil && existsDecorrInfo.Applies && len(driverTbls) > 0 && len(probeTbls) > 0 {
+									driverCond := existsDecorrInfo.Cond
+									if driverCond == "" {
+										driverCond = "<exists_body_driver_cond>"
+									}
+									for i := range driverTbls {
+										hasAC := false
+										for _, kv := range driverTbls[i] {
+											if kv.Key == "attached_condition" {
+												hasAC = true
+												break
+											}
+										}
+										if !hasAC {
+											driverTbls[i] = append(driverTbls[i], orderedKV{"attached_condition", driverCond})
+											allTbls[i] = driverTbls[i]
+										}
+									}
+								}
+								// When EXISTS body decorrelation applies, also add a
+								// placeholder attached_condition to probe table blocks that
+								// don't already have one.  MySQL places the join-ON equality
+								// or scalar-subquery condition on the probe (ref-access) table.
+								// mtrrun masks attached_condition values to "#", so any
+								// non-empty string matches.
+								if existsDecorrInfo != nil && existsDecorrInfo.Applies && len(driverTbls) > 0 && len(probeTbls) > 0 {
+									for i := range probeTbls {
+										probeIdx := len(driverTbls) + i
+										hasAC := false
+										for _, kv := range allTbls[probeIdx] {
+											if kv.Key == "attached_condition" {
+												hasAC = true
+												break
+											}
+										}
+										if !hasAC {
+											allTbls[probeIdx] = append(allTbls[probeIdx], orderedKV{"attached_condition", "<exists_body_probe_cond>"})
+										}
+									}
+								}
+								// Collect child entries (those whose parentID == en.selectID)
+								// and build their wrapped form (to attach to each table block).
+								var childEntries []subEntry
+								for _, ce := range entries {
+									if ce.parentID == en.selectID {
+										childEntries = append(childEntries, ce)
+										// Mark the child as consumed so it isn't emitted separately.
+										for j, ej := range entries {
+											if ej.selectID == ce.selectID && ej.parentID == ce.parentID {
+												consumed[j] = true
+											}
+										}
+									}
+								}
+								// Build the wrapped child blocks for attachment.
+								var childWrapped []interface{}
+								for _, ce := range childEntries {
+									if ce.dependent {
+										childWrapped = append(childWrapped, []orderedKV{
+											{"dependent", true},
+											{"cacheable", false},
+											{"query_block", ce.qb},
+										})
+									} else {
+										childWrapped = append(childWrapped, []orderedKV{
+											{"dependent", false},
+											{"cacheable", true},
+											{"query_block", ce.qb},
+										})
+									}
+								}
+								// Attach child entries to each table block in the nested_loop
+								// (MySQL attaches the scalar subquery to every table in the loop
+								// when its result is referenced in multiple tables' conditions).
+								if len(childWrapped) > 0 {
+									for j, tbl := range allTbls {
+										replaced := false
+										for k, kv := range tbl {
+											if kv.Key == "attached_subqueries" {
+												tbl[k] = orderedKV{"attached_subqueries", childWrapped}
+												replaced = true
+												break
+											}
+										}
+										if !replaced {
+											allTbls[j] = append(tbl, orderedKV{"attached_subqueries", childWrapped})
+										} else {
+											allTbls[j] = tbl
+										}
+									}
+								}
+								// Compute total cost for the merged query_block.
+								totalMergeCost := 0.0
+								for _, tbl := range allTbls {
+									for _, kv := range tbl {
+										if kv.Key == "rows_examined_per_scan" {
+											rc := int64(1)
+											switch v := kv.Value.(type) {
+											case int64:
+												rc = v
+											case float64:
+												rc = int64(v)
+											}
+											totalMergeCost += float64(rc)*0.10 + 0.25
+										}
+									}
+								}
+								if totalMergeCost == 0 {
+									totalMergeCost = float64(len(allTbls)) * 0.35
+								}
+								// Build the nested_loop slice.
+								var nl []interface{}
+								for _, tbl := range allTbls {
+									nl = append(nl, []orderedKV{{"table", tbl}})
+								}
+								// Build the merged query_block.
+								mergedQB := []orderedKV{
+									{"select_id", en.selectID},
+									{"cost_info", []orderedKV{
+										{"query_cost", fmt.Sprintf("%.2f", totalMergeCost)},
+									}},
+									{"nested_loop", nl},
+								}
+								mergedEntries = append(mergedEntries, subEntry{
+									selectID:  en.selectID,
+									parentID:  en.parentID,
+									dependent: en.dependent,
+									qb:        mergedQB,
+								})
+							}
+							entries = mergedEntries
+						}
 					}
 					// Build a wrap-helper that mirrors what we do for top-level.
 					wrap := func(en subEntry) []orderedKV {
@@ -13480,14 +14740,43 @@ func (e *Executor) explainJSONDocument(query string) string {
 				if hasGroupBySubquery && len(subqueryRows) > 0 {
 					var groupBySubs []interface{}
 					for _, s := range subqueryRows {
-						qb := e.explainJSONQueryBlockForRow(s.row, query)
-						// MySQL's IN→EXISTS rewrite injects an attached_condition
-						// on the inner table for ALL/ANY subqueries appearing in
-						// GROUP BY.  Inject a placeholder; mtrrunner masks the
-						// value to "#" so the textual content does not matter for
-						// the diff comparison.
-						qb = explainJSONInjectInnerAttachedCondition(qb,
-							"<if>(outer_field_is_not_null, true, true)")
+						// Build the query_block for this subquery row.
+						// When the subquery references a <derivedN> table, we need to:
+						// 1. Extract the derived alias and replace <derivedN> with it.
+						// 2. Add materialized_from_subquery with the inner derived rows.
+						// 3. Add used_columns for the outer scan.
+						subTblName := ""
+						if s.row[2] != nil {
+							subTblName = fmt.Sprintf("%v", s.row[2])
+						}
+						isDerivedRef := strings.HasPrefix(subTblName, "<derived")
+						var qb []orderedKV
+						if isDerivedRef {
+							// Build query_block manually with the derived alias as table_name.
+							var subID int64
+							if s.row[0] != nil {
+								if v, ok := s.row[0].(int64); ok {
+									subID = v
+								}
+							}
+							rc := explainJSONRowCount(s.row)
+							cost := float64(rc)*0.10 + 0.25
+							qb = append(qb, orderedKV{"select_id", subID})
+							qb = append(qb, orderedKV{"cost_info", []orderedKV{{"query_cost", fmt.Sprintf("%.2f", cost)}}})
+							// Build the table block, then apply wrapDerived to get alias + materialized_from_subquery.
+							subTblBlock := e.explainJSONTableBlock(s.row, query)
+							subTblBlock = wrapDerived(subTblBlock, subTblName)
+							qb = append(qb, orderedKV{"table", subTblBlock})
+						} else {
+							qb = e.explainJSONQueryBlockForRow(s.row, query)
+							// MySQL's IN→EXISTS rewrite injects an attached_condition
+							// on the inner table for ALL/ANY subqueries appearing in
+							// GROUP BY.  Inject a placeholder; mtrrunner masks the
+							// value to "#" so the textual content does not matter for
+							// the diff comparison.
+							qb = explainJSONInjectInnerAttachedCondition(qb,
+								"<if>(outer_field_is_not_null, true, true)")
+						}
 						dependent := s.selectType == "DEPENDENT SUBQUERY"
 						cacheable := !dependent
 						groupBySubs = append(groupBySubs, []orderedKV{
@@ -13505,6 +14794,20 @@ func (e *Executor) explainJSONDocument(query string) string {
 					queryBlock = append(queryBlock, orderedKV{"grouping_operation", groupOp})
 					// Mark consumed.
 					subqueryRows = nil
+				} else if hasOrderByWithGroupBy {
+					// Both ORDER BY and GROUP BY present: two-level wrapper.
+					// MySQL uses ordering_operation (for ORDER BY) wrapping
+					// grouping_operation (for GROUP BY with temp table, no filesort).
+					groupOp := []orderedKV{
+						{"using_temporary_table", true},
+						{"using_filesort", false},
+						{"table", tblBlock},
+					}
+					orderingOp := []orderedKV{
+						{"using_filesort", true},
+						{"grouping_operation", groupOp},
+					}
+					queryBlock = append(queryBlock, orderedKV{"ordering_operation", orderingOp})
 				} else if hasGroupBy && hasFilesort {
 					groupOp := []orderedKV{
 						{"using_filesort", true},
@@ -13512,34 +14815,58 @@ func (e *Executor) explainJSONDocument(query string) string {
 						{"table", tblBlock},
 					}
 					queryBlock = append(queryBlock, orderedKV{"grouping_operation", groupOp})
-				} else if hasOrderBySubquery && !hasFilesort && len(subqueryRows) > 0 {
-					// Build optimized_away_subqueries from the (non-dependent)
-					// subqueries.  Dependent subqueries continue to use the
-					// existing inline embedding above.
+				} else if hasOrderBySubquery && len(subqueryRows) > 0 {
+					// ORDER BY with subqueries.
+					// Non-dependent (optimizer-time) subqueries: emit as optimized_away_subqueries
+					// inside ordering_operation with using_filesort:false.
+					// Dependent (correlated) subqueries: emit as order_by_subqueries inside
+					// ordering_operation with using_filesort:true.
 					var optAway []interface{}
-					var residualSubs []parsedRow
+					var orderBySubs []interface{}
 					for _, s := range subqueryRows {
 						qb := e.explainJSONQueryBlockForRow(s.row, query)
 						dependent := s.selectType == "DEPENDENT SUBQUERY"
 						if dependent {
-							residualSubs = append(residualSubs, s)
-							continue
+							// When the inner table has "Using where", MySQL emits an
+							// attached_condition in the table block.  Since the outer
+							// query can't resolve the inner WHERE condition directly,
+							// inject a placeholder (mtrrun masks the value to "#").
+							if s.row[11] != nil {
+								extraStr := fmt.Sprintf("%v", s.row[11])
+								if strings.Contains(extraStr, "Using where") {
+									qb = explainJSONInjectAttachedConditionIfMissing(qb)
+								}
+							}
+							orderBySubs = append(orderBySubs, []orderedKV{
+								{"dependent", true},
+								{"cacheable", false},
+								{"query_block", qb},
+							})
+						} else {
+							optAway = append(optAway, []orderedKV{
+								{"dependent", false},
+								{"cacheable", true},
+								{"query_block", qb},
+							})
 						}
-						optAway = append(optAway, []orderedKV{
-							{"dependent", false},
-							{"cacheable", true},
-							{"query_block", qb},
-						})
 					}
+					// Determine filesort:
+					// - When only non-dependent: MySQL can precompute the subquery,
+					//   so using_filesort=false.
+					// - When any dependent: MySQL must sort per-row, so using_filesort=true.
+					hasCorrelatedOrderBy := len(orderBySubs) > 0
 					orderingOp := []orderedKV{
-						{"using_filesort", false},
+						{"using_filesort", hasCorrelatedOrderBy},
 						{"table", tblBlock},
 					}
 					if len(optAway) > 0 {
 						orderingOp = append(orderingOp, orderedKV{"optimized_away_subqueries", optAway})
 					}
+					if len(orderBySubs) > 0 {
+						orderingOp = append(orderingOp, orderedKV{"order_by_subqueries", orderBySubs})
+					}
 					queryBlock = append(queryBlock, orderedKV{"ordering_operation", orderingOp})
-					subqueryRows = residualSubs
+					subqueryRows = nil
 				} else if len(primaryRows) > 1 && isFirstmatchEnabled {
 					// Multi-primary semijoin (FirstMatch) with subqueries:
 					// MySQL emits a nested_loop wrapping all primary tables
@@ -13676,7 +15003,43 @@ func (e *Executor) explainJSONDocument(query string) string {
 						qb = explainJSONWrapTableInOrderingOperation(qb)
 					}
 				}
-				if hasSelectListSubquery {
+				if hasReducedWhereSubquery {
+					// MySQL "optimizes away" the pass-through wrapper subquery.
+					// The inner subquery (which has GROUP BY) is shown as
+					// optimized_away_subqueries with a grouping_operation wrapper.
+					// Detect if this subquery's inner SELECT has GROUP BY.
+					innerHasGroupByForOpt := false
+					var innerGroupByCols []string
+					if id, ok := s.id.(int64); ok {
+						innerSel := e.explainJSONGetDerivedSelect(query, id)
+						if innerSel == nil {
+							// Not a derived: look up the actual subquery SELECT
+							innerSel = e.explainJSONFindWhereSubqueryByID(query, id)
+						}
+						if innerSel != nil && innerSel.GroupBy != nil && len(innerSel.GroupBy.Exprs) > 0 {
+							innerHasGroupByForOpt = true
+							// Collect GROUP BY column names for used_columns injection.
+							for _, gbe := range innerSel.GroupBy.Exprs {
+								if col, ok := gbe.(*sqlparser.ColName); ok {
+									innerGroupByCols = append(innerGroupByCols, col.Name.Lowered())
+								}
+							}
+						}
+					}
+					if innerHasGroupByForOpt {
+						// Inject used_columns from GROUP BY into the inner table block.
+						if len(innerGroupByCols) > 0 {
+							qb = explainJSONInjectUsedColumnsInTable(qb, innerGroupByCols)
+						}
+						// Wrap table in grouping_operation.
+						qb = explainJSONWrapTableInGroupingOperation(qb)
+					}
+					attachedSubs = append(attachedSubs, []orderedKV{
+						{"dependent", false},
+						{"cacheable", true},
+						{"query_block", qb},
+					})
+				} else if hasSelectListSubquery {
 					attachedSubs = append(attachedSubs, []orderedKV{
 						{"dependent", false},
 						{"cacheable", false},
@@ -13698,7 +15061,9 @@ func (e *Executor) explainJSONDocument(query string) string {
 				}
 			}
 			key := "attached_subqueries"
-			if hasHavingSubquery {
+			if hasReducedWhereSubquery {
+				key = "optimized_away_subqueries"
+			} else if hasHavingSubquery {
 				key = "having_subqueries"
 			} else if hasSelectListSubquery {
 				key = "select_list_subqueries"
@@ -13735,6 +15100,163 @@ func explainJSONWrapTableInOrderingOperation(qb []orderedKV) []orderedKV {
 		out = append(out, kv)
 	}
 	return out
+}
+
+// explainJSONWrapTableInGroupingOperation rewrites a query_block so the
+// `table` entry is wrapped inside a `grouping_operation` block with
+// `using_temporary_table: true, using_filesort: false`.  Used for
+// optimized_away_subqueries that contain a GROUP BY.
+func explainJSONWrapTableInGroupingOperation(qb []orderedKV) []orderedKV {
+	out := make([]orderedKV, 0, len(qb))
+	for _, kv := range qb {
+		if kv.Key == "table" {
+			groupOp := []orderedKV{
+				{"using_temporary_table", true},
+				{"using_filesort", false},
+				{"table", kv.Value},
+			}
+			out = append(out, orderedKV{"grouping_operation", groupOp})
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+// explainJSONInjectAttachedConditionIfMissing injects a placeholder
+// "attached_condition" into the "table" block of a query_block if one is
+// not already present.  This is needed when "Using where" is in Extra but
+// the outer query context can't resolve the inner WHERE condition text.
+// mtrrun masks attached_condition values to "#", so any non-empty placeholder
+// satisfies the structural comparison.
+func explainJSONInjectAttachedConditionIfMissing(qb []orderedKV) []orderedKV {
+	for i, kv := range qb {
+		if kv.Key != "table" {
+			continue
+		}
+		tblBlock, ok := kv.Value.([]orderedKV)
+		if !ok {
+			continue
+		}
+		for _, tkv := range tblBlock {
+			if tkv.Key == "attached_condition" {
+				return qb // already present
+			}
+		}
+		newTblBlock := append(tblBlock, orderedKV{"attached_condition", "<condition>"})
+		newQb := make([]orderedKV, len(qb))
+		copy(newQb, qb)
+		newQb[i] = orderedKV{"table", newTblBlock}
+		return newQb
+	}
+	return qb
+}
+
+// explainJSONInjectUsedColumnsInTable injects a used_columns key into the
+// "table" block of a query_block.  It locates the "table" orderedKV inside qb
+// and appends a "used_columns" entry (after "cost_info") when one does not
+// already exist.  cols must be sorted in MySQL's canonical order (typically
+// the order they appear in GROUP BY).
+func explainJSONInjectUsedColumnsInTable(qb []orderedKV, cols []string) []orderedKV {
+	for i, kv := range qb {
+		if kv.Key != "table" {
+			continue
+		}
+		tblBlock, ok := kv.Value.([]orderedKV)
+		if !ok {
+			continue
+		}
+		// Check if used_columns is already present.
+		for _, tkv := range tblBlock {
+			if tkv.Key == "used_columns" {
+				return qb // already set
+			}
+		}
+		// Append used_columns at end of table block.
+		arr := make([]interface{}, len(cols))
+		for j, c := range cols {
+			arr[j] = c
+		}
+		newTblBlock := append(tblBlock, orderedKV{"used_columns", arr})
+		newQb := make([]orderedKV, len(qb))
+		copy(newQb, qb)
+		newQb[i] = orderedKV{"table", newTblBlock}
+		return newQb
+	}
+	return qb
+}
+
+// isFromDual returns true when the FROM list contains exactly one entry that is
+// the MySQL pseudo-table "dual".  MySQL rewrites `SELECT expr` (with no FROM)
+// to `SELECT expr FROM dual` during query normalization.
+func isFromDual(from sqlparser.TableExprs) bool {
+	if len(from) != 1 {
+		return false
+	}
+	ate, ok := from[0].(*sqlparser.AliasedTableExpr)
+	if !ok {
+		return false
+	}
+	tbl, ok := ate.Expr.(sqlparser.TableName)
+	if !ok {
+		return false
+	}
+	return strings.EqualFold(tbl.Name.String(), "dual")
+}
+
+// explainJSONFindWhereSubqueryByID searches the query's WHERE clause for the
+// Nth subquery (by sequential select_id order) and returns its SELECT AST.
+// Counter starts at 1 for the outer SELECT; each subquery in WHERE increments it.
+// This is used to find the inner SELECT for a "reduced" pass-through WHERE subquery.
+func (e *Executor) explainJSONFindWhereSubqueryByID(query string, targetID int64) *sqlparser.Select {
+	stmt, err := e.parser().Parse(query)
+	if err != nil {
+		return nil
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok || sel.Where == nil {
+		return nil
+	}
+	counter := int64(1)
+	var found *sqlparser.Select
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if found != nil {
+			return false, nil
+		}
+		sub, ok := node.(*sqlparser.Subquery)
+		if !ok {
+			return true, nil
+		}
+		counter++
+		inner, ok2 := sub.Select.(*sqlparser.Select)
+		if !ok2 {
+			return false, nil
+		}
+		if counter == targetID {
+			found = inner
+			return false, nil
+		}
+		// If this is a pass-through wrapper (no FROM or FROM dual, single subquery
+		// expression), continue searching inside it.  MySQL normalizes `SELECT x`
+		// to `SELECT x FROM dual`, so both forms must be handled.
+		innerIsDual := len(inner.From) == 1 && isFromDual(inner.From)
+		if (len(inner.From) == 0 || innerIsDual) && len(inner.SelectExprs.Exprs) == 1 {
+			if ae, ok3 := inner.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr); ok3 {
+				if innerSub, ok4 := ae.Expr.(*sqlparser.Subquery); ok4 {
+					// Recurse into the inner subquery
+					counter++
+					if counter == targetID {
+						if innerInner, ok5 := innerSub.Select.(*sqlparser.Select); ok5 {
+							found = innerInner
+						}
+						return false, nil
+					}
+				}
+			}
+		}
+		return false, nil
+	}, sel.Where)
+	return found
 }
 
 // explainJSONMarshal marshals an ordered structure to a pretty-printed JSON string.
