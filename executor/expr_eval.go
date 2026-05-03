@@ -18,6 +18,7 @@ import (
 	"github.com/myuon/mylite/storage"
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/transform"
 	"golang.org/x/text/unicode/norm"
 	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/mysql/collations/charset"
@@ -2516,8 +2517,19 @@ func (e *Executor) evalIntroducerExpr(v *sqlparser.IntroducerExpr) (interface{},
 			}
 			return HexBytes(strings.ToUpper(hex.EncodeToString(bs))), nil
 		default:
-			// For other charsets (latin1, sjis, etc.), return raw bytes as-is.
-			// The existing JP charset conversion tests rely on this behavior.
+			// For 8-bit charsets (latin1, koi8r, cp1250, etc.), decode raw bytes to
+			// proper UTF-8 so that comparisons against UTF-8 columns work correctly.
+			// For multi-byte JP charsets (sjis, ujis), return raw bytes as-is because
+			// the existing JP charset conversion tests rely on that behavior.
+			if cs != "sjis" && cs != "ujis" && cs != "eucjpms" && cs != "cp932" {
+				dec := charsetDecoder(cs)
+				if dec != nil {
+					decoded, _, err := transform.String(dec, string(bs))
+					if err == nil {
+						return decoded, nil
+					}
+				}
+			}
 			return string(bs), nil
 		}
 	}
