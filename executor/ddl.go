@@ -5734,6 +5734,34 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				if td, _ := db.GetTable(tableName); td != nil {
 					td.ForeignKeys = append(td.ForeignKeys, fk)
 				}
+			} else if checkDef, ok := op.ConstraintDefinition.Details.(*sqlparser.CheckConstraintDefinition); ok {
+				// ADD CHECK(expr) or ADD CONSTRAINT name CHECK(expr)
+				name := op.ConstraintDefinition.Name.String()
+				if td, _ := db.GetTable(tableName); td != nil {
+					if name == "" {
+						// Auto-generate name: tableName_chk_N (next available index)
+						nextIdx := len(td.CheckConstraints) + 1
+						for {
+							candidate := fmt.Sprintf("%s_chk_%d", tableName, nextIdx)
+							taken := false
+							for _, cc := range td.CheckConstraints {
+								if strings.EqualFold(cc.Name, candidate) {
+									taken = true
+									break
+								}
+							}
+							if !taken {
+								name = candidate
+								break
+							}
+							nextIdx++
+						}
+					}
+					td.CheckConstraints = append(td.CheckConstraints, catalog.CheckConstraint{
+						Name: name,
+						Expr: sqlparser.String(checkDef.Expr),
+					})
+				}
 			}
 
 		case *sqlparser.DropKey:
@@ -5999,6 +6027,16 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			// Rename in catalog (skip for no-op same-name renames)
 			if !isSameName {
 				def.Name = newName
+				// Rename auto-generated CHECK constraint names from oldTable_chk_N to newName_chk_N.
+				// Explicitly named constraints (those that don't match the auto-gen pattern) are preserved.
+				oldAutoPrefix := strings.ToLower(tableName) + "_chk_"
+				for i, cc := range def.CheckConstraints {
+					nameLower := strings.ToLower(cc.Name)
+					if strings.HasPrefix(nameLower, oldAutoPrefix) {
+						suffix := cc.Name[len(oldAutoPrefix):]
+						def.CheckConstraints[i].Name = newName + "_chk_" + suffix
+					}
+				}
 				db.DropTable(tableName) //nolint:errcheck
 				targetDB.CreateTable(def) //nolint:errcheck
 				// Rename in storage

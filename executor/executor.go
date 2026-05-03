@@ -2114,6 +2114,15 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		upper = strings.ToUpper(strings.TrimSpace(query))
 	}
 
+	// Vitess parser silently drops inline CHECK constraints in ALTER TABLE ADD COLUMN clauses.
+	// MySQL allows: ALTER TABLE t ADD col INT CHECK(expr), OTHER_OP
+	// But vitess only parses up to "col INT" and drops everything else.
+	// Rewrite: ADD col type [attrs] CHECK(expr)[NOT ENFORCED] -> ADD col type [attrs], ADD CHECK(expr)[NOT ENFORCED]
+	if strings.HasPrefix(upper, "ALTER TABLE ") && strings.Contains(upper, "CHECK") {
+		query = rewriteAlterTableInlineChecks(query)
+		upper = strings.ToUpper(strings.TrimSpace(query))
+	}
+
 	stmt, err := e.parser().Parse(query)
 	if err != nil {
 		// Normalize whitespace runs inside `upper` so that statements with extra
@@ -8991,4 +9000,189 @@ func parseHandlerTarget(stmt string) (string, string, bool) {
 		return "", "", false
 	}
 	return first, second, true
+}
+
+// rewriteAlterTableInlineChecks rewrites ALTER TABLE statements that contain inline CHECK
+// constraints in ADD COLUMN clauses. Vitess v0.23.3 doesn't support the MySQL syntax
+// "ADD col INT CHECK(expr)" and silently drops the CHECK and all following options.
+// This function transforms "ADD col type [attrs] CHECK(expr) [NOT ENFORCED]" into
+// "ADD col type [attrs], ADD CHECK(expr) [NOT ENFORCED]" which vitess can parse correctly.
+//
+// Example:
+//
+//	ALTER TABLE t1 ADD f2 INT CHECK (f2 < 10), RENAME TO t6
+//	  → ALTER TABLE t1 ADD f2 INT, ADD CHECK (f2 < 10), RENAME TO t6
+func rewriteAlterTableInlineChecks(sql string) string {
+	// Quick check: must contain CHECK keyword to be relevant
+	if !strings.Contains(strings.ToUpper(sql), "CHECK") {
+		return sql
+	}
+
+	// Strategy: scan for CHECK keywords that are preceded by a column ADD clause
+	// (not by CONSTRAINT or direct ADD CHECK).
+	// We look for the pattern: ADD [COLUMN] ident type [attrs] CHECK(...)
+	// and transform it to: ADD [COLUMN] ident type [attrs], ADD CHECK(...)
+
+	offset := 0
+	for {
+		upperSuffix := strings.ToUpper(sql[offset:])
+		checkIdx := strings.Index(upperSuffix, "CHECK")
+		if checkIdx < 0 {
+			break
+		}
+		absCheck := offset + checkIdx
+
+		// Verify it's a word boundary
+		if absCheck > 0 {
+			prev := sql[absCheck-1]
+			if isIdentChar(prev) {
+				offset = absCheck + 5
+				continue
+			}
+		}
+		afterCheck := absCheck + 5
+		if afterCheck < len(sql) && isIdentChar(sql[afterCheck]) {
+			offset = afterCheck
+			continue
+		}
+
+		// CHECK must be followed by optional whitespace then '('
+		afterCheckStr := sql[afterCheck:]
+		trimmedAfterCheck := strings.TrimLeft(afterCheckStr, " \t\n\r")
+		if len(trimmedAfterCheck) == 0 || trimmedAfterCheck[0] != '(' {
+			offset = absCheck + 5
+			continue
+		}
+		wsLen := len(afterCheckStr) - len(trimmedAfterCheck)
+
+		// Now determine what precedes this CHECK. Find the last ADD keyword before this CHECK
+		// that is the start of a column ADD clause (not ADD CONSTRAINT/INDEX/etc).
+		// Scan backward from absCheck through the preceding SQL.
+		preceding := sql[:absCheck]
+		precedingUpper := strings.ToUpper(preceding)
+
+		// Find the last "ADD" keyword in the preceding SQL
+		// "ADD" must be a whole word (preceded by whitespace/comma, followed by whitespace)
+		lastAddPos := -1
+		searchUpper := precedingUpper
+		for {
+			idx := strings.LastIndex(searchUpper, "ADD")
+			if idx < 0 {
+				break
+			}
+			// Check word boundaries
+			addOK := true
+			if idx > 0 && isIdentChar(searchUpper[idx-1]) {
+				addOK = false
+			}
+			if idx+3 < len(searchUpper) && isIdentChar(searchUpper[idx+3]) {
+				addOK = false
+			}
+			if addOK {
+				lastAddPos = idx
+				break
+			}
+			// Continue searching before this position
+			if idx == 0 {
+				break
+			}
+			searchUpper = searchUpper[:idx]
+		}
+
+		if lastAddPos < 0 {
+			offset = absCheck + 5
+			continue
+		}
+
+		// Get what comes after the ADD keyword
+		afterADD := strings.TrimSpace(precedingUpper[lastAddPos+3:])
+
+		// Skip if this is ADD CONSTRAINT / ADD CHECK / ADD INDEX / ADD KEY / etc.
+		// These are already correct forms or unrelated to our pattern.
+		if strings.HasPrefix(afterADD, "CONSTRAINT") || strings.HasPrefix(afterADD, "CHECK") ||
+			strings.HasPrefix(afterADD, "INDEX") || strings.HasPrefix(afterADD, "KEY") ||
+			strings.HasPrefix(afterADD, "PRIMARY") || strings.HasPrefix(afterADD, "UNIQUE") ||
+			strings.HasPrefix(afterADD, "FULLTEXT") || strings.HasPrefix(afterADD, "SPATIAL") ||
+			strings.HasPrefix(afterADD, "FOREIGN") {
+			offset = absCheck + 5
+			continue
+		}
+
+		// Skip COLUMN keyword if present
+		if strings.HasPrefix(afterADD, "COLUMN ") || strings.HasPrefix(afterADD, "COLUMN\t") {
+			afterADD = strings.TrimSpace(afterADD[6:])
+		}
+
+		// afterADD should now start with an identifier (column name).
+		// If it doesn't start with a letter/underscore/backtick, skip.
+		if len(afterADD) == 0 || (!isIdentStart(rune(afterADD[0])) && afterADD[0] != '`') {
+			offset = absCheck + 5
+			continue
+		}
+
+		// Also verify CHECK is not preceded by '(' (e.g. inside another expression)
+		trimmedBefore := strings.TrimRight(sql[:absCheck], " \t\n\r")
+		if len(trimmedBefore) > 0 && trimmedBefore[len(trimmedBefore)-1] == '(' {
+			offset = absCheck + 5
+			continue
+		}
+
+		// Find the balanced-paren expression following CHECK
+		openAt := afterCheck + wsLen // position of '(' in original sql
+		depth := 0
+		closeAt := -1
+		for i := openAt; i < len(sql); i++ {
+			ch := sql[i]
+			if ch == '(' {
+				depth++
+			} else if ch == ')' {
+				depth--
+				if depth == 0 {
+					closeAt = i
+					break
+				}
+			} else if ch == '\'' {
+				// Skip string literal
+				i++
+				for i < len(sql) && sql[i] != '\'' {
+					if sql[i] == '\\' {
+						i++
+					}
+					i++
+				}
+			}
+		}
+		if closeAt < 0 {
+			offset = absCheck + 5
+			continue
+		}
+
+		// Check for optional NOT ENFORCED after the closing paren
+		afterClose := strings.TrimLeft(sql[closeAt+1:], " \t\n\r")
+		notEnforcedSuffix := ""
+		afterNotEnforced := closeAt + 1
+		if strings.HasPrefix(strings.ToUpper(afterClose), "NOT ENFORCED") {
+			notEnforcedSuffix = " NOT ENFORCED"
+			wsBeforeNE := len(sql[closeAt+1:]) - len(afterClose)
+			afterNotEnforced = closeAt + 1 + wsBeforeNE + len("NOT ENFORCED")
+		}
+
+		// Build replacement: trim whitespace before CHECK, insert ", ADD " before CHECK
+		insertBefore := strings.TrimRight(sql[:absCheck], " \t\n\r")
+		checkPart := sql[absCheck : closeAt+1] // "CHECK (...)"
+		rest := sql[afterNotEnforced:]
+
+		// If insertBefore already ends with a comma (e.g. due to a prior rewrite pass),
+		// just add " ADD " instead of ", ADD " to avoid double commas.
+		sep := ", ADD "
+		if len(insertBefore) > 0 && insertBefore[len(insertBefore)-1] == ',' {
+			sep = " ADD "
+		}
+		sql = insertBefore + sep + checkPart + notEnforcedSuffix + rest
+
+		// Continue scanning from after the rewritten CHECK
+		offset = len(insertBefore) + len(sep) + len(checkPart) + len(notEnforcedSuffix)
+	}
+
+	return sql
 }
