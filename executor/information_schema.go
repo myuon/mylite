@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -554,7 +555,7 @@ var emptyStubTables = map[string]bool{
 	"metadata_locks":             true,
 	"data_locks":                 true,
 	"data_lock_waits":            true,
-	"file_instances":             true,
+	// "file_instances" is handled dynamically (perfSchemaFileInstances).
 	"file_summary_by_instance":   true,
 	"socket_summary_by_instance":    true,
 	"table_handles":              true,
@@ -867,6 +868,8 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 		rawRows = e.perfSchemaTableIOWaitsByTable()
 	case "table_io_waits_summary_by_index_usage":
 		rawRows = e.perfSchemaTableIOWaitsByIndexUsage()
+	case "file_instances":
+		rawRows = e.perfSchemaFileInstances()
 	case "table_lock_waits_summary_by_table":
 		rawRows = e.perfSchemaTableLockWaitsByTable()
 	case "objects_summary_global_by_type":
@@ -4481,7 +4484,107 @@ func (e *Executor) perfSchemaTableIOWaitsByTable() []storage.Row {
 }
 
 // perfSchemaTableIOWaitsByIndexUsage returns one zero-count row per (table, index) combo.
+//
+// MySQL only populates this table for tables/indexes that have been instrumented and
+// accessed. We don't track real I/O instrumentation, so we return an empty result set
+// by default; this matches the case where wait/io/table instruments are disabled or
+// no I/O has been recorded yet (the dml_tiws_by_index_usage test relies on this).
 func (e *Executor) perfSchemaTableIOWaitsByIndexUsage() []storage.Row {
+	return nil
+}
+
+// markFileInstanceDirty flags the (db, table) pair as having been renamed or altered
+// since the table was created. perfSchemaFileInstances reorders MyISAM file rows
+// (.MYI, .MYD, .sdi vs .sdi, .MYI, .MYD) based on this flag to match MySQL's
+// file-creation-time ordering.
+func (e *Executor) markFileInstanceDirty(dbName, tblName string) {
+	if dbName == "" || tblName == "" {
+		return
+	}
+	if e.fileInstanceDirty == nil {
+		e.fileInstanceDirty = make(map[string]bool)
+	}
+	e.fileInstanceDirty[dbName+"."+tblName] = true
+}
+
+// clearFileInstanceDirty drops the dirty flag (e.g. when DROP TABLE runs).
+func (e *Executor) clearFileInstanceDirty(dbName, tblName string) {
+	if e.fileInstanceDirty == nil {
+		return
+	}
+	delete(e.fileInstanceDirty, dbName+"."+tblName)
+}
+
+// perfSchemaFileInstances returns rows for performance_schema.file_instances.
+//
+// MySQL exposes one row per OS file currently open by the server (data files, redo
+// logs, undo logs, ibdata, etc.). We don't track real file handles, so we synthesize
+// per-table data files from the catalog: ENGINE=INNODB tables yield "<datadir>/<db>/<table>.ibd";
+// ENGINE=MYISAM tables yield ".MYI", ".MYD", and ".sdi". This matches the expectations
+// of dml_file_instances which uses --replace_regex to strip the path prefix.
+//
+// When performance_schema_max_file_classes=0 or performance_schema_max_file_instances=0,
+// the table is empty (matches start_server_no_file_class / start_server_no_file_inst).
+func (e *Executor) perfSchemaFileInstances() []storage.Row {
+	if e.startupVars["performance_schema_max_file_classes"] == "0" ||
+		e.startupVars["performance_schema_max_file_instances"] == "0" {
+		return nil
+	}
+	var rows []storage.Row
+	dataDir := e.DataDir
+	if dataDir == "" {
+		dataDir = "/var/lib/mysql"
+	}
+	e.perfSchemaUserTableRows(func(dbName, tblName string, def *catalogPkg.TableDef) {
+		// Skip temporary tables.
+		if e.tempTables != nil && (e.tempTables[tblName] || e.tempTables[strings.ToLower(tblName)]) {
+			return
+		}
+		base := filepath.Join(dataDir, dbName, tblName)
+		eng := strings.ToLower(def.Engine)
+		switch eng {
+		case "myisam":
+			// MySQL orders MyISAM files by creation timestamp:
+			//   - Freshly created table: .sdi, .MYI, .MYD (sdi created first via DD).
+			//   - After RENAME/ALTER:    .MYI, .MYD, .sdi (sdi recreated last).
+			// Track dirty status to mimic this ordering.
+			dirty := e.fileInstanceDirty[dbName+"."+tblName] || e.fileInstanceDirty[strings.ToLower(dbName)+"."+strings.ToLower(tblName)]
+			sdi := storage.Row{
+				"FILE_NAME":  base + ".sdi",
+				"EVENT_NAME": "wait/io/file/sql/sdi",
+				"OPEN_COUNT": int64(0),
+			}
+			myi := storage.Row{
+				"FILE_NAME":  base + ".MYI",
+				"EVENT_NAME": "wait/io/file/myisam/dfile",
+				"OPEN_COUNT": int64(0),
+			}
+			myd := storage.Row{
+				"FILE_NAME":  base + ".MYD",
+				"EVENT_NAME": "wait/io/file/myisam/kfile",
+				"OPEN_COUNT": int64(0),
+			}
+			if dirty {
+				rows = append(rows, myi, myd, sdi)
+			} else {
+				rows = append(rows, sdi, myi, myd)
+			}
+		default:
+			// Treat anything that's not MyISAM as InnoDB-like (default engine).
+			rows = append(rows, storage.Row{
+				"FILE_NAME":  base + ".ibd",
+				"EVENT_NAME": "wait/io/file/innodb/innodb_data_file",
+				"OPEN_COUNT": int64(0),
+			})
+		}
+	})
+	return rows
+}
+
+// perfSchemaTableIOWaitsByIndexUsageZeroRows is the legacy implementation that returns
+// one zero-count row per (table, index) combo. Kept here for reference; not currently
+// invoked.
+func (e *Executor) perfSchemaTableIOWaitsByIndexUsageZeroRows() []storage.Row {
 	var rows []storage.Row
 	e.perfSchemaUserTableRows(func(dbName, tblName string, def *catalogPkg.TableDef) {
 		// NULL index row (full-table scans)

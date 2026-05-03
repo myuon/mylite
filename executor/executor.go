@@ -397,6 +397,11 @@ type Executor struct {
 	preparedStmts map[string]string
 	// tempTables stores temporary tables per session (table name -> true).
 	tempTables map[string]bool
+	// fileInstanceDirty tracks tables that have been RENAMEd or ALTERed since
+	// CREATE. perfSchemaFileInstances orders MyISAM files differently for "dirty"
+	// tables (MYI, MYD, sdi) vs freshly created ones (sdi, MYI, MYD), matching
+	// MySQL's file-creation-time ordering. Key: "db.table".
+	fileInstanceDirty map[string]bool
 	// tempTableSavedPermanent stores the saved permanent table state (catalog def + storage table)
 	// for tables that were shadowed by a temporary table. When the temp table is dropped,
 	// the permanent state is restored. Key is tableName.
@@ -2279,6 +2284,16 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		if strings.HasPrefix(upper, "HANDLER ") {
 			if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
 				return nil, mysqlError(1192, "HY000", "Can't execute the given command because you have active locked tables or an active transaction")
+			}
+			// HANDLER on performance_schema.* (or information_schema.*) tables: MySQL returns
+			// ER_ILLEGAL_HA (1031) "Table storage engine for '<table>' doesn't have this option".
+			// Parse the table name from "HANDLER <db>.<table> OPEN/READ/CLOSE" or
+			// "HANDLER `db`.`table` ..." style.
+			if dbName, tblName, ok := parseHandlerTarget(trimmed); ok {
+				dbLower := strings.ToLower(dbName)
+				if dbLower == "performance_schema" || dbLower == "information_schema" {
+					return nil, mysqlError(1031, "HY000", fmt.Sprintf("Table storage engine for '%s' doesn't have this option", tblName))
+				}
 			}
 			return nil, ErrUnsupported("HANDLER statement")
 		}
@@ -8922,4 +8937,58 @@ func checkTableExprPrivSkipCTEs(tblExpr sqlparser.TableExpr, priv, currentDB str
 		}
 	}
 	return nil
+}
+
+// parseHandlerTarget parses "HANDLER <db>.<table> OPEN/READ/CLOSE" (with optional
+// backticks) and returns (db, table, true) when the target is db-qualified.
+// Returns ("", "", false) when no qualified target is found.
+func parseHandlerTarget(stmt string) (string, string, bool) {
+	s := strings.TrimSpace(stmt)
+	upper := strings.ToUpper(s)
+	if !strings.HasPrefix(upper, "HANDLER") {
+		return "", "", false
+	}
+	// Strip leading "HANDLER" keyword.
+	s = strings.TrimSpace(s[len("HANDLER"):])
+	if s == "" {
+		return "", "", false
+	}
+	// Read the table identifier (may be quoted with backticks and may have a db. prefix).
+	readIdent := func(in string) (string, string) {
+		if in == "" {
+			return "", ""
+		}
+		if in[0] == '`' {
+			// Read until next backtick.
+			end := strings.IndexByte(in[1:], '`')
+			if end < 0 {
+				return "", ""
+			}
+			return in[1 : 1+end], in[2+end:]
+		}
+		i := 0
+		for i < len(in) {
+			c := in[i]
+			if c == '.' || c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ';' || c == '(' {
+				break
+			}
+			i++
+		}
+		return in[:i], in[i:]
+	}
+	first, rest := readIdent(s)
+	if first == "" {
+		return "", "", false
+	}
+	rest = strings.TrimLeft(rest, " \t\n\r")
+	if !strings.HasPrefix(rest, ".") {
+		// No db qualifier.
+		return "", "", false
+	}
+	rest = strings.TrimLeft(rest[1:], " \t\n\r")
+	second, _ := readIdent(rest)
+	if second == "" {
+		return "", "", false
+	}
+	return first, second, true
 }

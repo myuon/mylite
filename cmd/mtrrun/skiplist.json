@@ -3525,18 +3525,6 @@
       "reason": "output mismatch, timeout, or error"
     },
     {
-      "test": "perfschema/dml_file_instances",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
-      "test": "perfschema/dml_handler",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
-      "test": "perfschema/dml_tiws_by_index_usage",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
       "test": "perfschema/error_stats_summary",
       "reason": "output mismatch, timeout, or error"
     },
