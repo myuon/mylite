@@ -38,7 +38,7 @@ func checkDecimalRange(colType string, v interface{}) error {
 		for i := 0; i < intDigits; i++ {
 			maxVal *= 10
 		}
-		if f >= maxVal {
+		if f > maxVal {
 			return fmt.Errorf("out of range")
 		}
 	}

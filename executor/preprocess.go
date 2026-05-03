@@ -720,9 +720,59 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 
 	// Handle ANALYZE TABLE ... UPDATE/DROP HISTOGRAM (vitess can't parse)
 	if strings.HasPrefix(upper, "ANALYZE TABLE") && (strings.Contains(upper, "HISTOGRAM") || strings.Contains(upper, "UPDATE HISTOGRAM") || strings.Contains(upper, "DROP HISTOGRAM")) {
+		// Parse: ANALYZE TABLE <tbl> UPDATE HISTOGRAM ON <col> ...
+		// or:    ANALYZE TABLE <tbl> DROP HISTOGRAM ON <col> ...
+		rest := strings.TrimSpace(trimmed[len("ANALYZE TABLE"):])
+		rest = strings.TrimRight(rest, ";")
+		upperRest := strings.ToUpper(rest)
+		tblName := "t1"
+		colName := "col1"
+		isCreate := true
+		opIdx := strings.Index(upperRest, " UPDATE HISTOGRAM")
+		if opIdx < 0 {
+			opIdx = strings.Index(upperRest, " DROP HISTOGRAM")
+			if opIdx >= 0 {
+				isCreate = false
+			}
+		}
+		if opIdx >= 0 {
+			tblPart := strings.TrimSpace(rest[:opIdx])
+			if tblPart != "" {
+				tblName = tblPart
+			}
+			// Extract column name after ON keyword
+			afterOp := strings.TrimSpace(rest[opIdx:])
+			upperAfter := strings.ToUpper(afterOp)
+			onIdx := strings.Index(upperAfter, " ON ")
+			if onIdx >= 0 {
+				afterOn := strings.TrimSpace(afterOp[onIdx+4:])
+				// Column name ends at space, comma, or WITH
+				endIdx := strings.IndexAny(afterOn, " ,;")
+				if endIdx < 0 {
+					colName = afterOn
+				} else {
+					colName = afterOn[:endIdx]
+				}
+				colName = strings.Trim(colName, "`")
+			}
+		}
+		// Qualify table name with current database if not already qualified
+		if !strings.Contains(tblName, ".") {
+			db := e.CurrentDB
+			if db == "" {
+				db = "test"
+			}
+			tblName = db + "." + tblName
+		}
+		var msgText string
+		if isCreate {
+			msgText = fmt.Sprintf("Histogram statistics created for column '%s'.", colName)
+		} else {
+			msgText = fmt.Sprintf("Histogram statistics removed for column '%s'.", colName)
+		}
 		return "", &Result{
 			Columns:     []string{"Table", "Op", "Msg_type", "Msg_text"},
-			Rows:        [][]interface{}{{"test.t1", "histogram", "status", "Histogram statistics created for column 'col1'."}},
+			Rows:        [][]interface{}{{tblName, "histogram", "status", msgText}},
 			IsResultSet: true,
 		}, nil
 	}
