@@ -914,6 +914,14 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 		}
 	}
 
+	// Validate DECIMAL/NUMERIC precision limits for procedure parameters.
+	// MySQL error 1426: ER_TOO_BIG_PRECISION - precision > 65 is not allowed.
+	for _, p := range params {
+		if err := validateRoutineParamType(p.Type); err != nil {
+			return nil, err
+		}
+	}
+
 	// Check for reserved keyword 'of' used as a procedure label.
 	// MySQL 8.0 added OF as a reserved word; using it as a label causes a parse error.
 	{
@@ -1107,16 +1115,26 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 	if v, ok := e.getSysVar("sql_mode"); ok {
 		currentSqlMode = v
 	}
+	currentCSClient := "utf8mb4"
+	if v, ok := e.getSysVar("character_set_client"); ok && v != "" {
+		currentCSClient = v
+	}
+	currentCollConn := "utf8mb4_0900_ai_ci"
+	if v, ok := e.getSysVar("collation_connection"); ok && v != "" {
+		currentCollConn = v
+	}
 	procDef := &catalog.ProcedureDef{
-		Name:          procName,
-		Params:        params,
-		Body:          bodyStmts,
-		BodyText:      bodyText,
-		SecurityType:  procSecurityType,
-		Comment:       procComment,
-		SqlDataAccess: procSqlDataAccess,
-		OriginalSQL:   query,
-		SqlMode:       currentSqlMode,
+		Name:                procName,
+		Params:              params,
+		Body:                bodyStmts,
+		BodyText:            bodyText,
+		SecurityType:        procSecurityType,
+		Comment:             procComment,
+		SqlDataAccess:       procSqlDataAccess,
+		OriginalSQL:         query,
+		SqlMode:             currentSqlMode,
+		CharacterSetClient:  currentCSClient,
+		CollationConnection: currentCollConn,
 	}
 	db.CreateProcedure(procDef)
 
@@ -1203,6 +1221,51 @@ func parseProcParams(paramStr string) []catalog.ProcParam {
 		params = append(params, param)
 	}
 	return params
+}
+
+// validateRoutineParamType checks that a procedure/function parameter type has valid
+// precision/scale values. Returns an error (ER_TOO_BIG_PRECISION = 1426) if DECIMAL/NUMERIC
+// has precision > 65 or scale > precision.
+func validateRoutineParamType(typeStr string) error {
+	if typeStr == "" {
+		return nil
+	}
+	upper := strings.ToUpper(strings.TrimSpace(typeStr))
+	var base string
+	if strings.HasPrefix(upper, "DECIMAL") {
+		base = "DECIMAL"
+	} else if strings.HasPrefix(upper, "NUMERIC") {
+		base = "NUMERIC"
+	} else {
+		return nil
+	}
+	// Extract M from DECIMAL(M[,D])
+	rest := strings.TrimSpace(typeStr[len(base):])
+	if !strings.HasPrefix(rest, "(") {
+		return nil
+	}
+	closeIdx := strings.Index(rest, ")")
+	if closeIdx < 0 {
+		return nil
+	}
+	inner := strings.TrimSpace(rest[1:closeIdx])
+	parts := strings.SplitN(inner, ",", 2)
+	if len(parts) == 0 {
+		return nil
+	}
+	mStr := strings.TrimSpace(parts[0])
+	m := 0
+	for _, ch := range mStr {
+		if ch >= '0' && ch <= '9' {
+			m = m*10 + int(ch-'0')
+		} else {
+			return nil // not a valid integer, skip
+		}
+	}
+	if m > 65 {
+		return mysqlError(1426, "42000", fmt.Sprintf("Too-big precision %d specified for ''. Maximum is 65.", m))
+	}
+	return nil
 }
 
 // validateRoutineBody checks for common stored routine body errors at CREATE time:
@@ -2786,6 +2849,13 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 		}
 	}
 
+	// Validate DECIMAL/NUMERIC precision limits for function parameters.
+	for _, p := range params {
+		if err := validateRoutineParamType(p.Type); err != nil {
+			return nil, err
+		}
+	}
+
 	// Extract RETURNS type and body
 	afterParams := rest[paramEnd+1:]
 	upperAfter := strings.ToUpper(afterParams)
@@ -2906,18 +2976,28 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 	if v, ok := e.getSysVar("sql_mode"); ok {
 		funcSqlMode = v
 	}
+	funcCSClient := "utf8mb4"
+	if v, ok := e.getSysVar("character_set_client"); ok && v != "" {
+		funcCSClient = v
+	}
+	funcCollConn := "utf8mb4_0900_ai_ci"
+	if v, ok := e.getSysVar("collation_connection"); ok && v != "" {
+		funcCollConn = v
+	}
 	funcDef := &catalog.FunctionDef{
-		Name:          funcName,
-		Params:        params,
-		ReturnType:    returnType,
-		Body:          bodyStmts,
-		BodyText:      bodyText,
-		Deterministic: isDeterministic,
-		SecurityType:  securityType,
-		Comment:       routineComment,
-		SqlDataAccess: sqlDataAccess,
-		OriginalSQL:   query,
-		SqlMode:       funcSqlMode,
+		Name:                funcName,
+		Params:              params,
+		ReturnType:          returnType,
+		Body:                bodyStmts,
+		BodyText:            bodyText,
+		Deterministic:       isDeterministic,
+		SecurityType:        securityType,
+		Comment:             routineComment,
+		SqlDataAccess:       sqlDataAccess,
+		OriginalSQL:         query,
+		SqlMode:             funcSqlMode,
+		CharacterSetClient:  funcCSClient,
+		CollationConnection: funcCollConn,
 	}
 	db.CreateFunction(funcDef)
 

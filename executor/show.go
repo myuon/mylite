@@ -1947,10 +1947,18 @@ func (e *Executor) showRoutineStatus(routineType string, rest string) (*Result, 
 				if secType == "" {
 					secType = "DEFINER"
 				}
+				csClient := funcDef.CharacterSetClient
+				if csClient == "" {
+					csClient = "utf8mb4"
+				}
+				collConn := funcDef.CollationConnection
+				if collConn == "" {
+					collConn = "utf8mb4_0900_ai_ci"
+				}
 				rows = append(rows, []interface{}{
 					dbName, name, "FUNCTION", "root@localhost",
 					now, now, secType, funcDef.Comment,
-					"utf8mb4", "utf8mb4_0900_ai_ci", "utf8mb4_0900_ai_ci",
+					csClient, collConn, "utf8mb4_0900_ai_ci",
 				})
 			}
 		} else {
@@ -1970,10 +1978,18 @@ func (e *Executor) showRoutineStatus(routineType string, rest string) (*Result, 
 				if secType == "" {
 					secType = "DEFINER"
 				}
+				csClient := procDef.CharacterSetClient
+				if csClient == "" {
+					csClient = "utf8mb4"
+				}
+				collConn := procDef.CollationConnection
+				if collConn == "" {
+					collConn = "utf8mb4_0900_ai_ci"
+				}
 				rows = append(rows, []interface{}{
 					dbName, name, "PROCEDURE", "root@localhost",
 					now, now, secType, procDef.Comment,
-					"utf8mb4", "utf8mb4_0900_ai_ci", "utf8mb4_0900_ai_ci",
+					csClient, collConn, "utf8mb4_0900_ai_ci",
 				})
 			}
 		}
