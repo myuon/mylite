@@ -2146,8 +2146,9 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 										rv = row[col.Name]
 										e.addWarning("Note", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 									} else if bool(stmt.Ignore) || !e.isStrictMode() {
-										// INSERT IGNORE or non-strict mode: warn but do NOT truncate
-										// (Dolt does not enforce VARCHAR length limits)
+										// INSERT IGNORE or non-strict mode: truncate with warning (MySQL behavior)
+										row[col.Name] = string([]rune(sv)[:maxLen])
+										rv = row[col.Name]
 										e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 									} else {
 										return nil, mysqlError(1406, "22001", fmt.Sprintf("Data too long for column '%s' at row 1", col.Name))
