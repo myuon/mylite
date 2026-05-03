@@ -12685,9 +12685,17 @@ func (e *Executor) explainJSONDocument(query string) string {
 		if matDBName == "" {
 			matDBName = "test"
 		}
-		injectMatINNotNull := func(tblName string, tblBlock []orderedKV) []orderedKV {
+		injectMatINNotNull := func(tblName string, accessType string, tblBlock []orderedKV) []orderedKV {
 			cols := matINCols[strings.ToLower(tblName)]
 			if len(cols) == 0 {
+				return tblBlock
+			}
+			// MySQL only emits the `(col is not null)` attached_condition when
+			// the table is scanned (ALL/range/index) — for ref/eq_ref/const
+			// access types, the join key itself filters NULL values so the
+			// predicate is redundant and MySQL omits it.
+			switch strings.ToLower(accessType) {
+			case "ref", "eq_ref", "const", "system":
 				return tblBlock
 			}
 			for _, kv := range tblBlock {
@@ -12739,8 +12747,12 @@ func (e *Executor) explainJSONDocument(query string) string {
 			if strings.HasPrefix(tblName, "<subquery") {
 				continue
 			}
+			accessType := "ALL"
+			if p.row[4] != nil {
+				accessType = fmt.Sprintf("%v", p.row[4])
+			}
 			tblBlock := e.explainJSONTableBlock(p.row, query)
-			tblBlock = injectMatINNotNull(tblName, tblBlock)
+			tblBlock = injectMatINNotNull(tblName, accessType, tblBlock)
 			outerTableBlocks = append(outerTableBlocks, []orderedKV{{"table", tblBlock}})
 		}
 
@@ -12822,7 +12834,7 @@ func (e *Executor) explainJSONDocument(query string) string {
 				// In the non-BNL (eq_ref probe) case: all outer tables come BEFORE the subquery
 				isDependent := anySubqueryBNL && (accessType == "ref" || accessType == "eq_ref" || accessType == "const")
 				tblBlock := e.explainJSONTableBlock(p.row, query)
-				tblBlock = injectMatINNotNull(tblName, tblBlock)
+				tblBlock = injectMatINNotNull(tblName, accessType, tblBlock)
 				if isDependent {
 					dependentTables = append(dependentTables, []orderedKV{{"table", tblBlock}})
 				} else {
