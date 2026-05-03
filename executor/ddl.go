@@ -4854,7 +4854,9 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		case *sqlparser.DropColumn:
 			colName := op.Name.Name.String()
 			if dropErr := db.DropColumn(tableName, colName); dropErr != nil {
-				return nil, dropErr
+				// Translate "column doesn't exist" to MySQL error 1091:
+				// Can't DROP '<col>'; check that column/key exists
+				return nil, mysqlError(1091, "42000", fmt.Sprintf("Can't DROP '%s'; check that column/key exists", colName))
 			}
 			tbl.DropColumn(colName)
 			// DROP COLUMN forces a table rebuild in MySQL: clear any INSTANT

@@ -691,6 +691,11 @@ type Executor struct {
 	// false (legacy full scan + filter). Tests / EXPLAIN integration can
 	// flip this on per-query.
 	useIndexAccessSpecs bool
+	// emptyDerivedTableColOrder stores the column order (NUL-delimited) from the
+	// most recently processed derived table (subquery in FROM) that returned zero
+	// rows. Used so that SELECT * FROM (subquery) AS t WHERE ... can still resolve
+	// column names even when the subquery produces no rows.
+	emptyDerivedTableColOrder string
 }
 
 // Warning represents a MySQL warning.
