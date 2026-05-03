@@ -46,6 +46,25 @@ func normalizeIndexColumnName(col string) string {
 	return strings.TrimSpace(col)
 }
 
+// indexColumnPrefixLen extracts the prefix length from an index column
+// specification like "a(3)". Returns 0 if no explicit prefix length is set.
+func indexColumnPrefixLen(col string) int64 {
+	open := strings.Index(col, "(")
+	if open < 0 {
+		return 0
+	}
+	close := strings.Index(col[open:], ")")
+	if close < 0 {
+		return 0
+	}
+	inner := strings.TrimSpace(col[open+1 : open+close])
+	n, err := strconv.ParseInt(inner, 10, 64)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
 func (e *Executor) informationSchemaStatsExpiryZero() bool {
 	v, ok := e.getSysVar("information_schema_stats_expiry")
 	if !ok {
@@ -3323,10 +3342,13 @@ func (e *Executor) infoSchemaStatistics() []storage.Row {
 					if (tblEngine == "MEMORY" || tblEngine == "HEAP") && indexTypeStr == "BTREE" {
 						cardinality = nil
 					}
-					// SPATIAL indexes use a 32-byte MBR key prefix
+					// SPATIAL indexes use a 32-byte MBR key prefix.
+					// Other indexes may have an explicit prefix length declared as col(N).
 					var subPart interface{}
 					if idxType == "SPATIAL" {
 						subPart = int64(32)
+					} else if pl := indexColumnPrefixLen(col); pl > 0 {
+						subPart = pl
 					}
 					rows = append(rows, storage.Row{
 						"TABLE_CATALOG": "def",

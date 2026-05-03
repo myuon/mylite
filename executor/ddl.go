@@ -234,6 +234,13 @@ func (e *Executor) isLogTableLoggingEnabled(tableName string) bool {
 }
 
 func (e *Executor) execRenameTable(stmt *sqlparser.RenameTable) (*Result, error) {
+	// MySQL: RENAME TABLE is blocked while another connection holds
+	// FLUSH TABLES WITH READ LOCK (FTWRL). Wait until the lock is released.
+	if e.globalReadLock != nil {
+		if err := e.globalReadLock.WaitIfHeldByOther(e.connectionID, 31536000); err != nil {
+			return nil, err
+		}
+	}
 	// RENAME TABLE is atomic: validate all pairs before executing any rename.
 	// We simulate the rename chain to validate that each source exists and each
 	// target doesn't conflict, accounting for intermediate renames.
