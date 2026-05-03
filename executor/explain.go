@@ -11596,7 +11596,7 @@ type explainJSONNestedINJoinInfo struct {
 // equality condition between outer_t.col and inner_t.col.  When the pattern is
 // not detected, returns the rows unchanged and nil.
 func (e *Executor) explainJSONReorderNestedINMatRows(rows [][]interface{}, innerSQL string) ([][]interface{}, *explainJSONNestedINJoinInfo) {
-	if len(rows) != 2 {
+	if len(rows) != 2 && len(rows) != 3 {
 		return rows, nil
 	}
 	stmt, err := e.parser().Parse(innerSQL)
@@ -11607,8 +11607,9 @@ func (e *Executor) explainJSONReorderNestedINMatRows(rows [][]interface{}, inner
 	if !ok || sel.Where == nil {
 		return rows, nil
 	}
-	// Look for `outerCol IN (SELECT innerCol FROM innerTbl ...)` at the top level
-	// of the WHERE clause.  Walk both sides of any AND nodes.
+	// Look for `outerCol IN (SELECT innerCol FROM innerTbl ...)` or the
+	// row-IN form `(outerCol, ...) IN (SELECT innerCol, ... FROM ...)` at
+	// the top level of the WHERE clause.  Walk both sides of any AND nodes.
 	var outerCol *sqlparser.ColName
 	var innerSel *sqlparser.Select
 	var walk func(expr sqlparser.Expr)
@@ -11624,8 +11625,18 @@ func (e *Executor) explainJSONReorderNestedINMatRows(rows [][]interface{}, inner
 			if x.Operator != sqlparser.InOp {
 				return
 			}
-			lhs, lok := x.Left.(*sqlparser.ColName)
-			if !lok {
+			var lhs *sqlparser.ColName
+			switch l := x.Left.(type) {
+			case *sqlparser.ColName:
+				lhs = l
+			case sqlparser.ValTuple:
+				if len(l) > 0 {
+					if cn, cok := l[0].(*sqlparser.ColName); cok {
+						lhs = cn
+					}
+				}
+			}
+			if lhs == nil {
 				return
 			}
 			sub, sok := x.Right.(*sqlparser.Subquery)
@@ -11644,10 +11655,11 @@ func (e *Executor) explainJSONReorderNestedINMatRows(rows [][]interface{}, inner
 	if outerCol == nil || innerSel == nil {
 		return rows, nil
 	}
-	// Identify outer table from the outer SELECT's FROM list.
+	// Identify outer table from the outer SELECT's FROM list.  Use display
+	// names (alias when present) to align with EXPLAIN row's `table` column.
 	outerTbl := ""
 	for _, te := range sel.From {
-		for _, n := range e.extractAllTableNames(te) {
+		for _, n := range e.extractAllTableDisplayNames(te) {
 			outerTbl = n
 			break
 		}
@@ -11656,15 +11668,15 @@ func (e *Executor) explainJSONReorderNestedINMatRows(rows [][]interface{}, inner
 		}
 	}
 	// Identify inner SELECT's first SELECT-list ColName for innerCol; identify
-	// inner table from the inner SELECT's FROM list.
+	// inner table(s) from the inner SELECT's FROM list (alias-aware).
 	innerTbl := ""
+	var innerTbls []string
 	for _, te := range innerSel.From {
-		for _, n := range e.extractAllTableNames(te) {
-			innerTbl = n
-			break
-		}
-		if innerTbl != "" {
-			break
+		for _, n := range e.extractAllTableDisplayNames(te) {
+			if innerTbl == "" {
+				innerTbl = n
+			}
+			innerTbls = append(innerTbls, n)
 		}
 	}
 	if outerTbl == "" || innerTbl == "" {
@@ -11704,6 +11716,40 @@ func (e *Executor) explainJSONReorderNestedINMatRows(rows [][]interface{}, inner
 		return strings.ToLower(fmt.Sprintf("%v", r[2]))
 	}
 	outerLower := strings.ToLower(outerTbl)
+
+	// 3-row case: outer_t plus a multi-table inner SELECT (e.g. inner_t LEFT
+	// JOIN inner2_t).  MySQL flattens the nested IN via semijoin and emits
+	// the inner tables first inside the materialized subquery's nested_loop,
+	// followed by the outer table that joins them via the IN equality.
+	// Reorder by table-name set; if rows do not partition cleanly into
+	// {outer_t} ∪ {innerTbls}, bail out.  Do not attach BNL joinInfo —
+	// access metadata for the 3-row case is more involved than the 2-row
+	// case and is left for a follow-up.
+	if len(rows) == 3 {
+		if len(innerTbls) != 2 {
+			return rows, nil
+		}
+		byName := map[string][]interface{}{}
+		for _, r := range rows {
+			byName[rowName(r)] = r
+		}
+		outerRow, ok1 := byName[outerLower]
+		var innerRows [][]interface{}
+		for _, t := range innerTbls {
+			r, ok := byName[strings.ToLower(t)]
+			if !ok {
+				return rows, nil
+			}
+			innerRows = append(innerRows, r)
+		}
+		if !ok1 || outerRow == nil {
+			return rows, nil
+		}
+		ordered := append([][]interface{}{}, innerRows...)
+		ordered = append(ordered, outerRow)
+		return ordered, nil
+	}
+
 	innerLower := strings.ToLower(innerTbl)
 	r0 := rowName(rows[0])
 	r1 := rowName(rows[1])
