@@ -1436,7 +1436,467 @@ func validateRoutineBody(bodyStmts []string) error {
 			}
 		}
 	}
-	return validateRoutineConditionHandlers(bodyStmts)
+	if err := validateRoutineConditionHandlers(bodyStmts); err != nil {
+		return err
+	}
+	return validateRoutineDuplicateHandlers(bodyStmts, nil)
+}
+
+// validateRoutineDuplicateHandlers detects ER_SP_DUP_HANDLER (1413): two handlers
+// declared for the same condition value within the same scope.
+//
+// Per MySQL spec, conditions are normalized as follows for duplicate detection:
+//   - DECLARE HANDLER FOR SQLEXCEPTION/SQLWARNING/NOT FOUND -> normalized to that keyword
+//   - DECLARE HANDLER FOR SQLSTATE 'XYZ' -> normalized to "SQLSTATE:XYZ"
+//   - DECLARE HANDLER FOR <number> -> normalized to "ERRNO:<number>"
+//   - DECLARE HANDLER FOR <name> where <name> is a DECLARE ... CONDITION:
+//     * If condition was declared FOR SQLSTATE 'XYZ' -> "SQLSTATE:XYZ"
+//     * If condition was declared FOR <number> -> "ERRNO:<number>"
+//
+// Each BEGIN...END block introduces a new scope. Handlers in inner scopes do not
+// conflict with handlers in outer scopes. Conditions declared in outer scopes are
+// visible to inner scopes.
+//
+// outerConds maps condition name (lowercase) -> normalized condition value, accumulated
+// from enclosing scopes.
+func validateRoutineDuplicateHandlers(bodyStmts []string, outerConds map[string]string) error {
+	// Copy outer conditions to local scope (they remain visible) and add scope-local ones.
+	scopeConds := make(map[string]string)
+	for k, v := range outerConds {
+		scopeConds[k] = v
+	}
+
+	// First pass: collect DECLARE ... CONDITION definitions in this scope.
+	for _, stmt := range bodyStmts {
+		upper := strings.ToUpper(stripLeadingLineComments(strings.TrimSpace(stmt)))
+		if !strings.HasPrefix(upper, "DECLARE") {
+			continue
+		}
+		rest := strings.TrimSpace(upper[len("DECLARE"):])
+		// Match: DECLARE <name> CONDITION FOR ...
+		words := strings.Fields(rest)
+		if len(words) >= 4 && words[1] == "CONDITION" && words[2] == "FOR" {
+			condName := strings.ToLower(words[0])
+			// Determine the condition value (SQLSTATE 'XYZ' or numeric)
+			afterFor := strings.TrimSpace(rest[strings.Index(rest, "FOR")+3:])
+			normalized := normalizeHandlerCondition(afterFor, scopeConds)
+			if normalized != "" {
+				scopeConds[condName] = normalized
+			}
+		}
+	}
+
+	// Second pass: detect duplicate handlers in this scope, and recurse into nested BEGIN...END.
+	seenHandlers := make(map[string]bool)
+	for _, stmt := range bodyStmts {
+		trimmed := strings.TrimSpace(stmt)
+		upper := strings.ToUpper(stripLeadingLineComments(trimmed))
+
+		// Handle nested BEGIN...END blocks: recurse with current scope as outer scope.
+		// A nested block typically starts with "BEGIN" or "<label>: BEGIN".
+		if isBeginBlock(upper) {
+			// Extract inner statements between BEGIN and matching END.
+			innerBody := extractBeginEndInner(trimmed)
+			if innerBody != "" {
+				innerStmts := splitTriggerBody(innerBody)
+				if err := validateRoutineDuplicateHandlers(innerStmts, scopeConds); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+
+		if !strings.HasPrefix(upper, "DECLARE") {
+			continue
+		}
+		rest := strings.TrimSpace(upper[len("DECLARE"):])
+
+		// Match handler declarations.
+		var afterFor string
+		if strings.HasPrefix(rest, "CONTINUE HANDLER FOR ") {
+			afterFor = strings.TrimSpace(rest[len("CONTINUE HANDLER FOR "):])
+		} else if strings.HasPrefix(rest, "EXIT HANDLER FOR ") {
+			afterFor = strings.TrimSpace(rest[len("EXIT HANDLER FOR "):])
+		} else if strings.HasPrefix(rest, "UNDO HANDLER FOR ") {
+			afterFor = strings.TrimSpace(rest[len("UNDO HANDLER FOR "):])
+		} else {
+			continue
+		}
+
+		// A handler can list multiple conditions separated by commas, e.g.
+		//   DECLARE EXIT HANDLER FOR SQLSTATE '42S02', 1051 ...
+		// Each listed condition must be checked for duplicate independently.
+		conditions := splitHandlerConditions(afterFor)
+		for _, condText := range conditions {
+			normalized := normalizeHandlerCondition(condText, scopeConds)
+			if normalized == "" {
+				continue
+			}
+			if seenHandlers[normalized] {
+				return mysqlError(1413, "42000", "Duplicate handler declared in the same block")
+			}
+			seenHandlers[normalized] = true
+		}
+	}
+	return nil
+}
+
+// normalizeHandlerCondition canonicalizes a handler condition spec for duplicate-detection.
+// Input is the upper-cased text immediately after "FOR" (or the condition value after
+// "CONDITION FOR" in a DECLARE CONDITION). Returns the normalized form, or "" if
+// the condition cannot be parsed.
+func normalizeHandlerCondition(afterFor string, conds map[string]string) string {
+	afterFor = strings.TrimSpace(afterFor)
+	if afterFor == "" {
+		return ""
+	}
+	// SQLEXCEPTION / SQLWARNING / NOT FOUND
+	if strings.HasPrefix(afterFor, "SQLEXCEPTION") {
+		return "SQLEXCEPTION"
+	}
+	if strings.HasPrefix(afterFor, "SQLWARNING") {
+		return "SQLWARNING"
+	}
+	if strings.HasPrefix(afterFor, "NOT FOUND") {
+		return "NOTFOUND"
+	}
+	// SQLSTATE [VALUE] 'XYZ'
+	if strings.HasPrefix(afterFor, "SQLSTATE") {
+		rest := strings.TrimSpace(afterFor[len("SQLSTATE"):])
+		// Optional VALUE keyword
+		if strings.HasPrefix(rest, "VALUE") {
+			rest = strings.TrimSpace(rest[len("VALUE"):])
+		}
+		// Extract quoted SQLSTATE
+		if len(rest) > 0 && (rest[0] == '\'' || rest[0] == '"') {
+			q := rest[0]
+			end := strings.IndexByte(rest[1:], q)
+			if end >= 0 {
+				return "SQLSTATE:" + rest[1:end+1]
+			}
+		}
+		return ""
+	}
+	// Numeric error code
+	words := strings.Fields(afterFor)
+	if len(words) == 0 {
+		return ""
+	}
+	first := strings.TrimRight(words[0], ",;")
+	if _, err := strconv.ParseInt(first, 10, 64); err == nil {
+		return "ERRNO:" + first
+	}
+	// Reference to a declared condition name.
+	condName := strings.ToLower(first)
+	if v, ok := conds[condName]; ok {
+		return v
+	}
+	return ""
+}
+
+// splitHandlerConditions splits a comma-separated list of handler conditions while
+// respecting the optional handler body that follows. Input is the text after "FOR ",
+// upper-cased. The body starts at the first non-condition token (typically a SQL
+// statement keyword like "SELECT", "BEGIN", "SET", "RESIGNAL", ... or a label).
+//
+// We split conservatively: each condition is one of
+//   SQLEXCEPTION | SQLWARNING | NOT FOUND |
+//   SQLSTATE [VALUE] 'xyz' | <integer> | <identifier>
+// followed by optional "," to chain another condition. Once we see a token that
+// doesn't match any of these patterns, the rest is the handler body.
+func splitHandlerConditions(afterFor string) []string {
+	var conds []string
+	rest := strings.TrimSpace(afterFor)
+	for {
+		if rest == "" {
+			break
+		}
+		var cond string
+		var consumed int
+		switch {
+		case strings.HasPrefix(rest, "SQLEXCEPTION"):
+			cond = "SQLEXCEPTION"
+			consumed = len("SQLEXCEPTION")
+		case strings.HasPrefix(rest, "SQLWARNING"):
+			cond = "SQLWARNING"
+			consumed = len("SQLWARNING")
+		case strings.HasPrefix(rest, "NOT FOUND"):
+			cond = "NOT FOUND"
+			consumed = len("NOT FOUND")
+		case strings.HasPrefix(rest, "SQLSTATE"):
+			// SQLSTATE [VALUE] 'xyz'
+			r := strings.TrimSpace(rest[len("SQLSTATE"):])
+			prefix := len("SQLSTATE") + (len(rest[len("SQLSTATE"):]) - len(r))
+			if strings.HasPrefix(r, "VALUE") {
+				r2 := strings.TrimSpace(r[len("VALUE"):])
+				prefix += len("VALUE") + (len(r[len("VALUE"):]) - len(r2))
+				r = r2
+			}
+			if len(r) > 0 && (r[0] == '\'' || r[0] == '"') {
+				q := r[0]
+				end := strings.IndexByte(r[1:], q)
+				if end < 0 {
+					return conds
+				}
+				cond = strings.TrimSpace(rest[:prefix+end+2])
+				consumed = prefix + end + 2
+			} else {
+				return conds
+			}
+		default:
+			// Numeric or identifier (single token, ends at space/comma/semicolon).
+			end := 0
+			for end < len(rest) {
+				c := rest[end]
+				if c == ' ' || c == '\t' || c == '\n' || c == ',' || c == ';' {
+					break
+				}
+				end++
+			}
+			if end == 0 {
+				return conds
+			}
+			tok := rest[:end]
+			// Decide if this is a condition (numeric or potential condition name) or handler body start.
+			if _, err := strconv.ParseInt(tok, 10, 64); err == nil {
+				cond = tok
+				consumed = end
+			} else {
+				// Identifier: only treat as a condition reference if followed by ','
+				// (indicating another condition) or if this is the very first token.
+				// Otherwise it's likely the handler body start (e.g. BEGIN, SELECT, SET, etc.)
+				next := strings.TrimSpace(rest[end:])
+				if len(conds) == 0 && (strings.HasPrefix(next, ",") || isLikelyConditionName(tok)) {
+					cond = tok
+					consumed = end
+				} else {
+					return conds
+				}
+			}
+		}
+		conds = append(conds, cond)
+		rest = strings.TrimSpace(rest[consumed:])
+		if !strings.HasPrefix(rest, ",") {
+			break
+		}
+		rest = strings.TrimSpace(rest[1:])
+	}
+	return conds
+}
+
+// isLikelyConditionName returns true if the token does not look like a SQL
+// statement keyword (which would indicate the start of the handler body).
+func isLikelyConditionName(tok string) bool {
+	upper := strings.ToUpper(tok)
+	stmtKeywords := map[string]bool{
+		"SELECT": true, "INSERT": true, "UPDATE": true, "DELETE": true,
+		"BEGIN": true, "SET": true, "CALL": true, "DO": true, "SIGNAL": true,
+		"RESIGNAL": true, "IF": true, "CASE": true, "WHILE": true, "REPEAT": true,
+		"LOOP": true, "LEAVE": true, "ITERATE": true, "RETURN": true, "OPEN": true,
+		"CLOSE": true, "FETCH": true, "DECLARE": true, "ROLLBACK": true, "COMMIT": true,
+		"SAVEPOINT": true, "RELEASE": true, "GET": true,
+	}
+	return !stmtKeywords[upper]
+}
+
+// isBeginBlock returns true if the upper-cased statement starts a BEGIN ... END block,
+// optionally with a leading label like "label1: BEGIN".
+func isBeginBlock(upper string) bool {
+	upper = strings.TrimSpace(upper)
+	if strings.HasPrefix(upper, "BEGIN") {
+		// Make sure it's not BEGIN; (transaction) -- a routine block always has body.
+		// In a routine context, top-level BEGIN starts a compound block.
+		return true
+	}
+	// label: BEGIN
+	if colonIdx := strings.Index(upper, ":"); colonIdx > 0 {
+		label := strings.TrimSpace(upper[:colonIdx])
+		if isSimpleIdentifier(label) {
+			afterLabel := strings.TrimSpace(upper[colonIdx+1:])
+			if strings.HasPrefix(afterLabel, "BEGIN") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// extractBeginEndInner returns the inner body of a BEGIN ... END block (with optional
+// leading label). Returns "" if the input is not a valid BEGIN...END block.
+func extractBeginEndInner(stmt string) string {
+	stmt = strings.TrimSpace(stmt)
+	upper := strings.ToUpper(stmt)
+	// Skip optional "<label>:"
+	if colonIdx := strings.Index(upper, ":"); colonIdx > 0 {
+		label := strings.TrimSpace(upper[:colonIdx])
+		if isSimpleIdentifier(label) {
+			stmt = strings.TrimSpace(stmt[colonIdx+1:])
+			upper = strings.ToUpper(stmt)
+		}
+	}
+	if !strings.HasPrefix(upper, "BEGIN") {
+		return ""
+	}
+	inner := strings.TrimSpace(stmt[len("BEGIN"):])
+	upperInner := strings.ToUpper(inner)
+	// Strip trailing "END" (with optional label).
+	if strings.HasSuffix(upperInner, "END") {
+		inner = strings.TrimSpace(inner[:len(inner)-len("END")])
+	} else {
+		// Look for trailing "END <label>" pattern.
+		idx := strings.LastIndex(upperInner, "END")
+		if idx >= 0 {
+			afterEnd := strings.TrimSpace(inner[idx+3:])
+			// Trailing label is a single identifier
+			if isSimpleIdentifier(strings.ToUpper(afterEnd)) {
+				inner = strings.TrimSpace(inner[:idx])
+			}
+		}
+	}
+	return inner
+}
+
+// isSimpleIdentifier returns true if s consists only of alphanumeric/underscore characters
+// (and is non-empty). Used to distinguish a label from a multi-token expression.
+func isSimpleIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// validateFunctionNoResultSet enforces that a stored function body contains no
+// statement that would return a result set to the client (ER_SP_NO_RETSET = 1415).
+// Statements that produce result sets and are forbidden in functions include:
+//   - bare SELECT ... (without INTO, and not as part of a cursor declaration)
+//   - SHOW ...
+//   - HANDLER ... READ
+//   - EXPLAIN ...
+//   - CALL of a procedure that itself returns a result set (cannot be checked statically here)
+//
+// We walk through bodyStmts (and recursively through nested BEGIN...END / IF / WHILE /
+// REPEAT / LOOP / CASE blocks) and check each leaf statement.
+func validateFunctionNoResultSet(bodyStmts []string) error {
+	for _, stmt := range bodyStmts {
+		if err := checkFunctionStmtNoRetSet(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkFunctionStmtNoRetSet inspects a single statement (which may be a compound block)
+// for forbidden result-set-returning statements. Recurses into nested blocks.
+func checkFunctionStmtNoRetSet(stmt string) error {
+	trimmed := strings.TrimSpace(stripLeadingLineComments(stmt))
+	if trimmed == "" {
+		return nil
+	}
+	upper := strings.ToUpper(trimmed)
+
+	// Recurse into nested BEGIN...END (with optional label).
+	if isBeginBlock(upper) {
+		inner := extractBeginEndInner(trimmed)
+		if inner == "" {
+			return nil
+		}
+		innerStmts := splitTriggerBody(inner)
+		return validateFunctionNoResultSet(innerStmts)
+	}
+
+	// DECLARE statements are local; DECLARE CURSOR FOR SELECT ... is allowed.
+	if strings.HasPrefix(upper, "DECLARE") {
+		return nil
+	}
+
+	// SHOW / EXPLAIN: always forbidden (returns a result set).
+	if strings.HasPrefix(upper, "SHOW") {
+		return mysqlError(1415, "0A000", "Not allowed to return a result set from a function")
+	}
+	if strings.HasPrefix(upper, "EXPLAIN") || strings.HasPrefix(upper, "DESCRIBE") || strings.HasPrefix(upper, "DESC ") {
+		return mysqlError(1415, "0A000", "Not allowed to return a result set from a function")
+	}
+
+	// HANDLER ... READ returns a result set; HANDLER ... OPEN/CLOSE do not.
+	if strings.HasPrefix(upper, "HANDLER ") {
+		// Look for " READ " keyword
+		if strings.Contains(upper, " READ ") || strings.HasSuffix(upper, " READ") {
+			return mysqlError(1415, "0A000", "Not allowed to return a result set from a function")
+		}
+	}
+
+	// SELECT without INTO returns a result set.
+	if strings.HasPrefix(upper, "SELECT") {
+		// Allow if it has an INTO clause at top level.
+		if !containsTopLevelInto(upper) {
+			return mysqlError(1415, "0A000", "Not allowed to return a result set from a function")
+		}
+		return nil
+	}
+
+	// IF ... THEN ... [ELSEIF ...] [ELSE ...] END IF
+	// WHILE ... DO ... END WHILE
+	// REPEAT ... UNTIL ... END REPEAT
+	// LOOP ... END LOOP
+	// CASE ... WHEN ... THEN ... [ELSE ...] END CASE
+	// For these, recurse into the embedded statements.
+	if strings.HasPrefix(upper, "IF ") || strings.HasPrefix(upper, "IF(") {
+		return validateFunctionCompoundBody(trimmed)
+	}
+	if strings.HasPrefix(upper, "WHILE ") {
+		return validateFunctionCompoundBody(trimmed)
+	}
+	if strings.HasPrefix(upper, "REPEAT ") || upper == "REPEAT" {
+		return validateFunctionCompoundBody(trimmed)
+	}
+	if strings.HasPrefix(upper, "LOOP ") || upper == "LOOP" {
+		return validateFunctionCompoundBody(trimmed)
+	}
+	if strings.HasPrefix(upper, "CASE ") || strings.HasPrefix(upper, "CASE\n") {
+		return validateFunctionCompoundBody(trimmed)
+	}
+
+	return nil
+}
+
+// validateFunctionCompoundBody recurses into a compound statement (IF/WHILE/REPEAT/LOOP/CASE)
+// to validate any embedded statements for ER_SP_NO_RETSET.
+//
+// We use a simple heuristic: split on ';' at depth 0 (ignoring nested compound blocks)
+// and validate each resulting statement.
+func validateFunctionCompoundBody(stmt string) error {
+	// Strip the leading keyword and the trailing END xxx, then split sub-statements.
+	upper := strings.ToUpper(stmt)
+	// Find the THEN/DO/LOOP body start.
+	bodyStart := -1
+	for _, kw := range []string{" THEN ", " THEN\n", " DO ", " DO\n", "REPEAT", "LOOP"} {
+		if idx := strings.Index(upper, kw); idx >= 0 {
+			candidate := idx + len(kw)
+			if candidate > bodyStart {
+				bodyStart = candidate
+			}
+		}
+	}
+	if bodyStart < 0 || bodyStart >= len(stmt) {
+		return nil
+	}
+	body := stmt[bodyStart:]
+	// Strip trailing END xxx
+	upperBody := strings.ToUpper(body)
+	for _, end := range []string{"END IF", "END WHILE", "END REPEAT", "END LOOP", "END CASE"} {
+		if idx := strings.LastIndex(upperBody, end); idx >= 0 {
+			body = body[:idx]
+			break
+		}
+	}
+	subStmts := splitTriggerBody(body)
+	return validateFunctionNoResultSet(subStmts)
 }
 
 // containsTopLevelInto checks if a SELECT statement (uppercased) contains an INTO clause
@@ -2424,6 +2884,12 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 
 	// Validate routine body: cursor-for-non-SELECT (1064) and condition handler refs (1319).
 	if err := validateRoutineBody(bodyStmts); err != nil {
+		return nil, err
+	}
+
+	// Functions cannot return result sets: forbid bare SELECT (without INTO), SHOW, etc.
+	// (ER_SP_NO_RETSET = 1415)
+	if err := validateFunctionNoResultSet(bodyStmts); err != nil {
 		return nil, err
 	}
 
