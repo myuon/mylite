@@ -4941,10 +4941,12 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			}
 			// Check for STORED<->VIRTUAL change on generated columns; also capture old column type.
 			var oldColType string
+			var oldColAutoIncrement bool
 			if tableDef, tdErr := db.GetTable(tableName); tdErr == nil {
 				for _, existCol := range tableDef.Columns {
 					if strings.EqualFold(existCol.Name, colDef.Name) {
 						oldColType = existCol.Type
+						oldColAutoIncrement = existCol.AutoIncrement
 						oldIsGen := isGeneratedColumnType(existCol.Type)
 						newIsGen := isGeneratedColumnType(colDef.Type)
 						if oldIsGen && newIsGen {
@@ -4994,6 +4996,37 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				if rangeErr != nil {
 					return nil, rangeErr
 				}
+			} else if colDef.AutoIncrement && !oldColAutoIncrement {
+				// Column is being converted to AUTO_INCREMENT for the first time.
+				// MySQL behavior: NULL and 0 values are replaced with sequential
+				// auto-generated IDs. Values > 0 are kept as-is.
+				// Under NO_AUTO_VALUE_ON_ZERO, 0 is preserved (not auto-generated).
+				noAutoValueOnZero := strings.Contains(e.sqlMode, "NO_AUTO_VALUE_ON_ZERO")
+				// First pass: find the maximum non-zero value to seed the counter.
+				var maxVal int64
+				tbl.Lock()
+				for i := range tbl.Rows {
+					cur := tbl.Rows[i][colDef.Name]
+					if cur == nil {
+						continue
+					}
+					iv := toInt64(cur)
+					if iv > maxVal {
+						maxVal = iv
+					}
+				}
+				tbl.AutoIncrement.Store(maxVal)
+				// Second pass: assign auto-increment values to NULL/0 rows.
+				for i := range tbl.Rows {
+					cur := tbl.Rows[i][colDef.Name]
+					isNull := cur == nil
+					isZero := !isNull && toInt64(cur) == 0
+					if isNull || (isZero && !noAutoValueOnZero) {
+						autoVal := tbl.AutoIncrement.Add(1)
+						tbl.Rows[i][colDef.Name] = autoVal
+					}
+				}
+				tbl.Unlock()
 			} else {
 				// VARCHAR/CHAR truncation: compute new max length once.
 				newColTypeLower := strings.ToLower(strings.TrimSpace(colDef.Type))
@@ -5089,12 +5122,14 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				}
 				colDef.Comment = mysqlTruncateChars(colDef.Comment, 1024)
 			}
-			// Capture old column type to detect CHAR→VARCHAR conversion.
+			// Capture old column type and AUTO_INCREMENT flag to detect CHAR→VARCHAR and AI conversion.
 			var oldColTypeChg string
+			var oldColAutoIncrementChg bool
 			if tableDef2, tdErr2 := db.GetTable(tableName); tdErr2 == nil {
 				for _, existCol := range tableDef2.Columns {
 					if strings.EqualFold(existCol.Name, oldName) {
 						oldColTypeChg = existCol.Type
+						oldColAutoIncrementChg = existCol.AutoIncrement
 						break
 					}
 				}
@@ -5150,6 +5185,32 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				if rangeErr2 != nil {
 					return nil, rangeErr2
 				}
+			} else if colDef.AutoIncrement && !oldColAutoIncrementChg {
+				// Column is being converted to AUTO_INCREMENT for the first time (via CHANGE COLUMN).
+				noAutoValueOnZeroChg := strings.Contains(e.sqlMode, "NO_AUTO_VALUE_ON_ZERO")
+				var maxValChg int64
+				tbl.Lock()
+				for i := range tbl.Rows {
+					cur := tbl.Rows[i][colDef.Name]
+					if cur == nil {
+						continue
+					}
+					iv := toInt64(cur)
+					if iv > maxValChg {
+						maxValChg = iv
+					}
+				}
+				tbl.AutoIncrement.Store(maxValChg)
+				for i := range tbl.Rows {
+					cur := tbl.Rows[i][colDef.Name]
+					isNullChg := cur == nil
+					isZeroChg := !isNullChg && toInt64(cur) == 0
+					if isNullChg || (isZeroChg && !noAutoValueOnZeroChg) {
+						autoVal := tbl.AutoIncrement.Add(1)
+						tbl.Rows[i][colDef.Name] = autoVal
+					}
+				}
+				tbl.Unlock()
 			} else {
 				// VARCHAR/CHAR truncation: compute new max length once.
 				newColTypeLowerChg := strings.ToLower(strings.TrimSpace(colDef.Type))
