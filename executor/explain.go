@@ -7792,6 +7792,96 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 		whereCols = append(whereCols, gcolConditions...)
 	}
 
+	// Augment with JOIN ON equi-join conditions: for tableName, an ON clause like
+	// `tA.colA = tB.colB` (where one side is a column of tableName and the other
+	// is a column of a sibling FROM-table) becomes an equality condition on the
+	// tableName side.  This lets EXISTS / semijoin body inner tables get promoted
+	// from ALL → ref when the join column matches the leading column of an index
+	// (issue #406).  joinRefByCol maps lower-cased tableName column →
+	// "<db>.<otherTable>.<otherCol>" so the resulting ref output points to the
+	// driving table rather than the default "const".
+	joinRefByCol := map[string]string{}
+	if len(sel.From) > 0 {
+		var onNodes []sqlparser.SQLNode
+		for _, te := range sel.From {
+			e.collectJoinOnConditions(te, &onNodes)
+		}
+		// Collect all FROM-table real names so we can recognise "other tables".
+		// We only add an equi-join entry when the *other* side is a column of a
+		// sibling FROM-table (not an outer-correlated column or a literal), to
+		// match MySQL's ref classification.
+		fromTables := map[string]bool{}
+		for _, te := range sel.From {
+			for _, tn := range e.extractAllTableNames(te) {
+				if !strings.EqualFold(tn, "dual") {
+					fromTables[strings.ToLower(tn)] = true
+				}
+			}
+		}
+		dbName := e.CurrentDB
+		if dbName == "" {
+			dbName = "test"
+		}
+		var visit func(expr sqlparser.Expr)
+		visit = func(expr sqlparser.Expr) {
+			if expr == nil {
+				return
+			}
+			switch ex := expr.(type) {
+			case *sqlparser.AndExpr:
+				visit(ex.Left)
+				visit(ex.Right)
+			case *sqlparser.ComparisonExpr:
+				if ex.Operator != sqlparser.EqualOp && ex.Operator != sqlparser.NullSafeEqualOp {
+					return
+				}
+				lcol, lok := ex.Left.(*sqlparser.ColName)
+				rcol, rok := ex.Right.(*sqlparser.ColName)
+				if !lok || !rok {
+					return
+				}
+				lqual := lcol.Qualifier.Name.String()
+				rqual := rcol.Qualifier.Name.String()
+				if lqual == "" || rqual == "" {
+					return
+				}
+				// Only consider equi-joins where both sides reference a sibling
+				// FROM-table — otherwise this is an outer-correlation predicate.
+				if !fromTables[strings.ToLower(lqual)] || !fromTables[strings.ToLower(rqual)] {
+					return
+				}
+				if strings.EqualFold(lqual, tableName) && !strings.EqualFold(rqual, tableName) {
+					col := strings.ToLower(lcol.Name.String())
+					if _, exists := joinRefByCol[col]; !exists {
+						joinRefByCol[col] = fmt.Sprintf("%s.%s.%s", dbName, rqual, rcol.Name.String())
+					}
+				} else if strings.EqualFold(rqual, tableName) && !strings.EqualFold(lqual, tableName) {
+					col := strings.ToLower(rcol.Name.String())
+					if _, exists := joinRefByCol[col]; !exists {
+						joinRefByCol[col] = fmt.Sprintf("%s.%s.%s", dbName, lqual, lcol.Name.String())
+					}
+				}
+			}
+		}
+		for _, n := range onNodes {
+			if expr, ok := n.(sqlparser.Expr); ok {
+				visit(expr)
+			}
+		}
+		// Inject as equality whereCols (only for columns not already in whereCols).
+		existingEq := map[string]bool{}
+		for _, wc := range whereCols {
+			if wc.isEquality {
+				existingEq[strings.ToLower(wc.column)] = true
+			}
+		}
+		for col := range joinRefByCol {
+			if !existingEq[col] {
+				whereCols = append(whereCols, explainWhereCondition{column: col, isEquality: true})
+			}
+		}
+	}
+
 	if len(whereCols) == 0 {
 		// No WHERE conditions: check if all selected columns are covered by a secondary index
 		// → "index" access type (full index scan) + "Using index".
@@ -8034,13 +8124,24 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 			break
 		}
 	}
+	// buildRef constructs the ref string for the matched index columns.
+	// For each matched column, prefer the join-driven ref when the equality
+	// originates from an equi-join ON condition; fall back to "const" otherwise.
+	buildRef := func() string {
+		refs := make([]string, best.matchedEq)
+		for i := 0; i < best.matchedEq && i < len(best.index.Columns); i++ {
+			col := strings.ToLower(best.index.Columns[i])
+			if r, ok := joinRefByCol[col]; ok {
+				refs[i] = r
+			} else {
+				refs[i] = "const"
+			}
+		}
+		return strings.Join(refs, ",")
+	}
 	if best.matchedEq > 0 && hasNullCondition && hasNonNullEqOnIndex {
 		result.accessType = "ref_or_null"
-		refs := make([]string, best.matchedEq)
-		for i := range refs {
-			refs[i] = "const"
-		}
-		result.ref = strings.Join(refs, ",")
+		result.ref = buildRef()
 	} else if best.matchedAll && best.index.Unique && !hasNullCondition {
 		if best.isPrimary || !isJoin {
 			// Use "const" for PK lookups or unique index lookups in standalone queries
@@ -8050,18 +8151,10 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 			result.accessType = "eq_ref"
 		}
 		// Build ref string
-		refs := make([]string, best.matchedEq)
-		for i := range refs {
-			refs[i] = "const"
-		}
-		result.ref = strings.Join(refs, ",")
+		result.ref = buildRef()
 	} else if best.matchedEq > 0 {
 		result.accessType = "ref"
-		refs := make([]string, best.matchedEq)
-		for i := range refs {
-			refs[i] = "const"
-		}
-		result.ref = strings.Join(refs, ",")
+		result.ref = buildRef()
 	} else if best.hasRange {
 		result.accessType = "range"
 	}
