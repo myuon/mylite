@@ -99,6 +99,10 @@ func (e *Executor) buildIndexAccessSpec(sel *sqlparser.Select, tableName string)
 			allHaveEq = false
 			break
 		}
+		// Normalize the literal value to match what is actually stored in the
+		// column. For DATE columns, a DATETIME literal like '1983-09-07 00:00:00'
+		// must be reduced to '1983-09-07' so that valuesEqualLoose can find the row.
+		v = normalizeLiteralForColumnType(v, bare, td)
 		values[i] = v
 	}
 
@@ -127,6 +131,8 @@ func (e *Executor) buildIndexAccessSpec(sel *sqlparser.Select, tableName string)
 			if !ok {
 				break
 			}
+			// Normalize the literal value to match what is stored in the column.
+			v = normalizeLiteralForColumnType(v, bare, td)
 			eqPrefix = append(eqPrefix, v)
 		}
 		if len(eqPrefix) == 0 {
@@ -429,6 +435,92 @@ func evalLiteralExpr(expr sqlparser.Expr) (interface{}, bool) {
 		}
 	}
 	return nil, false
+}
+
+// normalizeLiteralForColumnType adjusts a literal value so it matches the
+// format that is actually stored in the named column.
+//
+// For DATE columns, several input forms need to be normalized to "YYYY-MM-DD":
+//   - "YYYY-MM-DD HH:MM:SS" (DATETIME string) → strip time part
+//   - "YYYYMMDD" or "YYMMDD" (compact string, no delimiters) → parse to YYYY-MM-DD
+//   - int64(YYYYMMDD) or int64(YYMMDD) (integer date literal) → convert via parseMySQLDateValue
+//
+// For DATETIME columns, date-only strings need to be extended to DATETIME:
+//   - "YYYY-MM-DD" (10 chars, no time) → "YYYY-MM-DD 00:00:00"
+//   - "YYYYMMDD" compact → parse then extend
+//   - int64(YYYYMMDD) → parse then extend
+//
+// This ensures that valuesEqualLoose in the storage layer correctly matches
+// stored values against any of the above literal forms.
+func normalizeLiteralForColumnType(v interface{}, colName string, td *catalog.TableDef) interface{} {
+	if td == nil {
+		return v
+	}
+
+	// Find the column type.
+	var colType string
+	for _, col := range td.Columns {
+		if strings.EqualFold(col.Name, colName) {
+			upper := strings.ToUpper(strings.TrimSpace(col.Type))
+			if paren := strings.IndexByte(upper, '('); paren >= 0 {
+				upper = strings.TrimSpace(upper[:paren])
+			}
+			colType = upper
+			break
+		}
+	}
+
+	switch colType {
+	case "DATE":
+		// For DATE columns, normalize any date/datetime literal to "YYYY-MM-DD".
+		switch val := v.(type) {
+		case string:
+			// Already standard format "YYYY-MM-DD" (with optional time suffix)?
+			if len(val) >= 10 && val[4] == '-' && val[7] == '-' {
+				return val[:10]
+			}
+			// Compact all-digit formats (YYYYMMDD=8, YYYYMMDDHHMMSS=14, YYMMDD=6, etc.)
+			// and any other format parseMySQLDateValue understands.
+			if normalized := parseMySQLDateValue(val); normalized != "" {
+				return normalized
+			}
+		case int64:
+			// Integer DATE literals: 19830907 (YYYYMMDD), 830907 (YYMMDD), etc.
+			s := strconv.FormatInt(val, 10)
+			if normalized := parseMySQLDateValue(s); normalized != "" {
+				return normalized
+			}
+		}
+
+	case "DATETIME", "TIMESTAMP":
+		// For DATETIME/TIMESTAMP columns, extend date-only literals to "YYYY-MM-DD 00:00:00".
+		switch val := v.(type) {
+		case string:
+			// Already a full DATETIME string (YYYY-MM-DD HH:MM:SS)?
+			if len(val) >= 19 && val[4] == '-' && val[7] == '-' && val[10] == ' ' {
+				return val
+			}
+			// Parse any recognized date format to "YYYY-MM-DD" then extend.
+			// Use AllowInvalid variant to handle zero dates like "0000-00-00".
+			if normalized := parseMySQLDateValueAllowInvalid(val); normalized != "" {
+				// If normalized already has a time component, return as-is.
+				if len(normalized) > 10 {
+					return normalized
+				}
+				return normalized + " 00:00:00"
+			}
+		case int64:
+			s := strconv.FormatInt(val, 10)
+			if normalized := parseMySQLDateValueAllowInvalid(s); normalized != "" {
+				if len(normalized) > 10 {
+					return normalized
+				}
+				return normalized + " 00:00:00"
+			}
+		}
+	}
+
+	return v
 }
 
 // scanTableForFrom is the entry point used by buildFromExpr to read all
