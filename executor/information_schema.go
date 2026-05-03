@@ -6340,6 +6340,34 @@ func funcSqlDataAccess(f *catalogPkg.FunctionDef) string {
 	return "CONTAINS SQL"
 }
 
+func procCharSetClient(p *catalogPkg.ProcedureDef) string {
+	if p.CharacterSetClient != "" {
+		return p.CharacterSetClient
+	}
+	return "utf8mb4"
+}
+
+func procCollationConnection(p *catalogPkg.ProcedureDef) string {
+	if p.CollationConnection != "" {
+		return p.CollationConnection
+	}
+	return "utf8mb4_0900_ai_ci"
+}
+
+func funcCharSetClient(f *catalogPkg.FunctionDef) string {
+	if f.CharacterSetClient != "" {
+		return f.CharacterSetClient
+	}
+	return "utf8mb4"
+}
+
+func funcCollationConnection(f *catalogPkg.FunctionDef) string {
+	if f.CollationConnection != "" {
+		return f.CollationConnection
+	}
+	return "utf8mb4_0900_ai_ci"
+}
+
 // infoSchemaRoutines returns rows for INFORMATION_SCHEMA.ROUTINES.
 func (e *Executor) infoSchemaRoutines() []storage.Row {
 	var rows []storage.Row
@@ -6391,8 +6419,8 @@ func (e *Executor) infoSchemaRoutines() []storage.Row {
 					"SQL_MODE":                  "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
 					"ROUTINE_COMMENT":           p.Comment,
 					"DEFINER":                   "root@localhost",
-					"CHARACTER_SET_CLIENT":      "utf8mb4",
-					"COLLATION_CONNECTION":      "utf8mb4_general_ci",
+					"CHARACTER_SET_CLIENT":      procCharSetClient(p),
+					"COLLATION_CONNECTION":      procCollationConnection(p),
 					"DATABASE_COLLATION":        "utf8mb4_general_ci",
 				})
 			}
@@ -6439,8 +6467,8 @@ func (e *Executor) infoSchemaRoutines() []storage.Row {
 					"SQL_MODE":                  "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
 					"ROUTINE_COMMENT":           f.Comment,
 					"DEFINER":                   "root@localhost",
-					"CHARACTER_SET_CLIENT":      "utf8mb4",
-					"COLLATION_CONNECTION":      "utf8mb4_general_ci",
+					"CHARACTER_SET_CLIENT":      funcCharSetClient(f),
+					"COLLATION_CONNECTION":      funcCollationConnection(f),
 					"DATABASE_COLLATION":        "utf8mb4_general_ci",
 				})
 			}
