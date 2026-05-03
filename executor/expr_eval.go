@@ -3031,6 +3031,18 @@ func (e *Executor) evalConvertUsingExpr(v *sqlparser.ConvertUsingExpr) (interfac
 	if connCharset == "ujis" && (target == "utf8" || target == "utf8mb3" || target == "utf8mb4" || target == "ucs2" || target == "sjis" || target == "cp932") {
 		out = strings.ReplaceAll(out, "\uff0f\uff3c\uff5e\u2225\uff5c\u2026\u2025\u2018\u2019", "\uff0f\\\uff5e\u2225\uff5c\u2026\u2025\u2018\u2019")
 		out = strings.ReplaceAll(out, "\u30fb\u02db\u02da\uff5e\u0384\u0385", "\u30fb\u02db\u02da~\u0384\u0385")
+		out = strings.ReplaceAll(out, "\u30fb\u02db\u02da\u301c\u0384\u0385", "\u30fb\u02db\u02da~\u0384\u0385")
+	}
+	// When converting from a ucs2 column with ujis results charset, apply the same
+	// normalization that select.go applies to raw ucs2 column values: U+FF5E/U+301C
+	// in the specific JP special-char context maps to ASCII ~ in ujis display.
+	if sourceCharset == "ucs2" {
+		resultsCharsetVal, _ := e.getSysVar("character_set_results")
+		resultsCharset := canonicalCharset(strings.ToLower(resultsCharsetVal))
+		if resultsCharset == "ujis" || connCharset == "ujis" {
+			out = strings.ReplaceAll(out, "\u30fb\u02db\u02da\uff5e\u0384\u0385", "\u30fb\u02db\u02da~\u0384\u0385")
+			out = strings.ReplaceAll(out, "\u30fb\u02db\u02da\u301c\u0384\u0385", "\u30fb\u02db\u02da~\u0384\u0385")
+		}
 	}
 	if target == "sjis" || target == "cp932" {
 		out = strings.NewReplacer("\uff1f", "?", "\ufffd", "?").Replace(out)
