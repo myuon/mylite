@@ -12695,8 +12695,31 @@ func (e *Executor) explainJSONDocument(query string) string {
 					return tblBlock
 				}
 			}
-			parts := make([]string, 0, len(cols))
-			for _, c := range cols {
+			// Filter out columns that are declared NOT NULL — the
+			// `(col is not null)` predicate is trivially true for them and
+			// MySQL omits the attached_condition entirely in that case.
+			td := e.explainGetTableDef(tblName)
+			filteredCols := cols
+			if td != nil {
+				filteredCols = filteredCols[:0]
+				for _, c := range cols {
+					nullable := true
+					for _, cd := range td.Columns {
+						if strings.EqualFold(cd.Name, c) {
+							nullable = cd.Nullable
+							break
+						}
+					}
+					if nullable {
+						filteredCols = append(filteredCols, c)
+					}
+				}
+			}
+			if len(filteredCols) == 0 {
+				return tblBlock
+			}
+			parts := make([]string, 0, len(filteredCols))
+			for _, c := range filteredCols {
 				parts = append(parts, fmt.Sprintf("(`%s`.`%s`.`%s` is not null)", matDBName, tblName, c))
 			}
 			cond := parts[0]
