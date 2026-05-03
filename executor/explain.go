@@ -2923,6 +2923,37 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 				}
 			}
 
+			// MATERIALIZED inner tables: when access stays ALL with no possible_keys
+			// from the WHERE-side analysis, MySQL still annotates possible_keys with
+			// indexes whose leading column appears in the inner SELECT's projection
+			// (the materialization "join columns"), because the materialization probe
+			// turns the outer IN-equality into an implicit `tbl.col = <outer_value>`.
+			// This catches cases like
+			//   ... IN (SELECT parent1.col_int_key FROM t1 AS parent1 LEFT JOIN ... )
+			// where parent1's `col_int_key` index becomes a possible_key even though
+			// the inner SELECT has no WHERE referencing col_int_key.
+			if selectType == "MATERIALIZED" && possibleKeys == nil &&
+				accessType == "ALL" && sel.SelectExprs != nil {
+				disp := displayName(idx, tblName)
+				selCols := explainExtractSelectColumnsByDisplay(sel.SelectExprs, disp)
+				if len(selCols) > 0 {
+					if td := e.explainGetTableDef(tblName); td != nil {
+						var pks []string
+						for _, ix := range td.Indexes {
+							if len(ix.Columns) == 0 {
+								continue
+							}
+							if selCols[strings.ToLower(ix.Columns[0])] {
+								pks = append(pks, ix.Name)
+							}
+						}
+						if len(pks) > 0 {
+							possibleKeys = strings.Join(pks, ",")
+						}
+					}
+				}
+			}
+
 			result = append(result, explainSelectType{
 				id:           myID,
 				selectType:   selectType,
@@ -8241,6 +8272,38 @@ func (e *Executor) explainDetectAccessType(sel *sqlparser.Select, tableName stri
 	}
 
 	return result
+}
+
+// explainExtractSelectColumnsByDisplay returns the set of column names from
+// a SELECT projection that are explicitly qualified with the given display name
+// (alias or table name).  Unlike explainExtractSelectColumns, this version
+// narrowly accepts only column references and ignores SELECT * or non-column
+// expressions instead of treating them as an "all bets off" condition.
+//
+// Used to derive materialization-join-column possible_keys for inner tables of
+// a MATERIALIZED subquery, where the outer IN-equality is implicit and only the
+// inner SELECT's projection columns hint at which table columns participate.
+func explainExtractSelectColumnsByDisplay(exprs *sqlparser.SelectExprs, displayName string) map[string]bool {
+	if exprs == nil || displayName == "" {
+		return nil
+	}
+	cols := map[string]bool{}
+	for _, expr := range exprs.Exprs {
+		ae, ok := expr.(*sqlparser.AliasedExpr)
+		if !ok {
+			continue
+		}
+		col, ok := ae.Expr.(*sqlparser.ColName)
+		if !ok {
+			continue
+		}
+		qual := col.Qualifier.Name.String()
+		if qual == "" || !strings.EqualFold(qual, displayName) {
+			continue
+		}
+		cols[strings.ToLower(col.Name.String())] = true
+	}
+	return cols
 }
 
 // explainExtractSelectColumns returns the set of column names referenced in a SELECT
