@@ -105,3 +105,14 @@ jq -r '.tests[] | select(.name=="<test>") | .diff' .mtrrun-logs/<latest>.json | 
    - first-diff-lineが後退（改善）したテストがあるか
    - **regressionがないか**（passだったテストがfail/errorになっていないか）
 4. regressionがあれば即revert
+
+## subquery_sj_mat FDL 注意
+
+PR #366 以降、subquery_sj_mat / subquery_sj_all / opt_hints_subquery の first-diff-line が早い行 (146/142/97) に regress している。これは pass→fail regression ではなく、すでに fail していたテストの diff 視覚化が変わっただけ。
+
+PR を作る際:
+1. subquery_sj_mat first-diff が **146 以上** を維持しているか確認
+2. explain_json_all first-diff が **1355 以上** を維持しているか確認
+3. explain_json_none first-diff が **1256 以上** を維持しているか確認
+
+これら 3 つの FDL を逆行させる PR は実質 regression として扱う。
