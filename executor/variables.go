@@ -244,8 +244,30 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				e.sessionScopeVars["character_set_results"] = charset
 				// Also set collation_connection to the default collation for this charset.
 				// MySQL's SET NAMES also updates collation_connection.
-				if defColl := catalog.DefaultCollationForCharset(charset); defColl != "" {
-					e.sessionScopeVars["collation_connection"] = defColl
+				// The Vitess parser drops the COLLATE clause from `SET NAMES <cs> COLLATE <coll>`,
+				// so recover it by scanning the original raw query.
+				collation := ""
+				if e.currentQuery != "" {
+					rawUpper := strings.ToUpper(e.currentQuery)
+					if collIdx := strings.Index(rawUpper, " COLLATE "); collIdx >= 0 {
+						after := strings.TrimSpace(e.currentQuery[collIdx+len(" COLLATE "):])
+						after = strings.TrimSuffix(after, ";")
+						// Take the first whitespace-delimited token, strip quotes
+						if sp := strings.IndexAny(after, " \t\r\n"); sp >= 0 {
+							after = after[:sp]
+						}
+						after = strings.Trim(after, "'\"`")
+						after = strings.ToLower(after)
+						if isKnownCollation(after) {
+							collation = after
+						}
+					}
+				}
+				if collation == "" {
+					collation = catalog.DefaultCollationForCharset(charset)
+				}
+				if collation != "" {
+					e.sessionScopeVars["collation_connection"] = collation
 				}
 			}
 		case "charset":

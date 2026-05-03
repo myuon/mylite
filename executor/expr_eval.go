@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -2330,6 +2331,105 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 			}
 		}
 	}
+	// BINARY x op y / x op BINARY y: when one side is wrapped in BINARY,
+	// MySQL forces a binary (byte-wise) comparison of both sides.
+	// Note: comparing 'a' (1 byte) to 'a\0' (2 bytes) yields the longer string greater
+	// because the shared prefix matches and the longer side has more bytes.
+	if isOrderingOrEqualityOp(v.Operator) || v.Operator == sqlparser.NullSafeEqualOp {
+		if isBinaryConvertExpr(leftExpr) || isBinaryConvertExpr(rightExpr) {
+			if ls, lok := left.(string); lok {
+				if rs, rok := right.(string); rok {
+					cmp := bytes.Compare([]byte(ls), []byte(rs))
+					switch v.Operator {
+					case sqlparser.EqualOp, sqlparser.NullSafeEqualOp:
+						if cmp == 0 { return int64(1), nil }
+						return int64(0), nil
+					case sqlparser.NotEqualOp:
+						if cmp != 0 { return int64(1), nil }
+						return int64(0), nil
+					case sqlparser.LessThanOp:
+						if cmp < 0 { return int64(1), nil }
+						return int64(0), nil
+					case sqlparser.GreaterThanOp:
+						if cmp > 0 { return int64(1), nil }
+						return int64(0), nil
+					case sqlparser.LessEqualOp:
+						if cmp <= 0 { return int64(1), nil }
+						return int64(0), nil
+					case sqlparser.GreaterEqualOp:
+						if cmp >= 0 { return int64(1), nil }
+						return int64(0), nil
+					}
+				}
+			}
+		}
+	}
+	// String-literal vs string-literal under a connection collation:
+	// when the user has SET NAMES <cs> COLLATE <coll>, use that collation for
+	// the comparison via Vitess. This handles PAD_SPACE collations (e.g.
+	// utf8mb4_unicode_ci) where trailing NUL bytes are ignorable.
+	// Limited to string literal vs string literal to avoid disrupting numeric
+	// or column-based comparisons that compareValues already handles.
+	// Skip for numeric-looking literals: MySQL converts both to numbers when
+	// both quoted strings parse as numbers (e.g. '1' = '01' is TRUE).
+	if isOrderingOrEqualityOp(v.Operator) {
+		if leftLit, lOK := leftExpr.(*sqlparser.Literal); lOK && leftLit.Type == sqlparser.StrVal {
+			if rightLit, rOK := rightExpr.(*sqlparser.Literal); rOK && rightLit.Type == sqlparser.StrVal {
+				_, lerr := strconv.ParseFloat(leftLit.Val, 64)
+				_, rerr := strconv.ParseFloat(rightLit.Val, 64)
+				bothNumeric := lerr == nil && rerr == nil
+				connColl := ""
+				if cv, ok := e.getSysVar("collation_connection"); ok && cv != "" {
+					connColl = cv
+				}
+				if !bothNumeric && connColl != "" {
+					if vc := lookupVitessCollation(connColl); vc != nil {
+						ls := toString(left)
+						rs := toString(right)
+						// PAD SPACE collations: trim trailing spaces before comparison
+						// so 'a' compares equal to 'a   '. Vitess's Collate doesn't
+						// apply PAD SPACE automatically.
+						if isPadSpaceCollation(connColl) {
+							ls = strings.TrimRight(ls, " ")
+							rs = strings.TrimRight(rs, " ")
+						}
+						lBytes := []byte(ls)
+						rBytes := []byte(rs)
+						cs := vc.Charset()
+						if cs.Name() != "utf8mb4" && cs.Name() != "utf8mb3" && cs.Name() != "binary" {
+							if conv, convErr := charset.ConvertFromUTF8(nil, cs, lBytes); convErr == nil {
+								lBytes = conv
+							}
+							if conv, convErr := charset.ConvertFromUTF8(nil, cs, rBytes); convErr == nil {
+								rBytes = conv
+							}
+						}
+						cmp := vc.Collate(lBytes, rBytes, false)
+						switch v.Operator {
+						case sqlparser.EqualOp:
+							if cmp == 0 { return int64(1), nil }
+							return int64(0), nil
+						case sqlparser.NotEqualOp:
+							if cmp != 0 { return int64(1), nil }
+							return int64(0), nil
+						case sqlparser.LessThanOp:
+							if cmp < 0 { return int64(1), nil }
+							return int64(0), nil
+						case sqlparser.GreaterThanOp:
+							if cmp > 0 { return int64(1), nil }
+							return int64(0), nil
+						case sqlparser.LessEqualOp:
+							if cmp <= 0 { return int64(1), nil }
+							return int64(0), nil
+						case sqlparser.GreaterEqualOp:
+							if cmp >= 0 { return int64(1), nil }
+							return int64(0), nil
+						}
+					}
+				}
+			}
+		}
+	}
 	result, err := compareValues(left, right, v.Operator)
 	if err != nil {
 		return nil, err
@@ -2338,6 +2438,22 @@ func (e *Executor) evalComparisonExpr(v *sqlparser.ComparisonExpr) (interface{},
 		return int64(1), nil
 	}
 	return int64(0), nil
+}
+
+// isPadSpaceCollation returns true if the given collation uses PAD SPACE
+// semantics (trailing spaces are ignored in comparisons). This is the
+// default for almost all MySQL collations except the NO PAD ones added in
+// MySQL 8.0 (utf8mb4_0900_*, binary, *_as_cs, *_ai_ci with 0900 family).
+func isPadSpaceCollation(name string) bool {
+	low := strings.ToLower(name)
+	if low == "binary" {
+		return false
+	}
+	// utf8mb4 0900-family collations are NO PAD.
+	if strings.Contains(low, "_0900_") {
+		return false
+	}
+	return true
 }
 
 // evalTrimFuncExpr handles *sqlparser.TrimFuncExpr evaluation.
@@ -6706,6 +6822,94 @@ func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{
 				}
 			}
 		}
+		// BINARY x op y / x op BINARY y: byte-wise comparison.
+		if isOrderingOrEqualityOp(v.Operator) || v.Operator == sqlparser.NullSafeEqualOp {
+			if isBinaryConvertExpr(leftExpr2) || isBinaryConvertExpr(rightExpr2) {
+				if ls, lok := left.(string); lok {
+					if rs, rok := right.(string); rok {
+						cmp := bytes.Compare([]byte(ls), []byte(rs))
+						switch v.Operator {
+						case sqlparser.EqualOp, sqlparser.NullSafeEqualOp:
+							if cmp == 0 { return int64(1), nil }
+							return int64(0), nil
+						case sqlparser.NotEqualOp:
+							if cmp != 0 { return int64(1), nil }
+							return int64(0), nil
+						case sqlparser.LessThanOp:
+							if cmp < 0 { return int64(1), nil }
+							return int64(0), nil
+						case sqlparser.GreaterThanOp:
+							if cmp > 0 { return int64(1), nil }
+							return int64(0), nil
+						case sqlparser.LessEqualOp:
+							if cmp <= 0 { return int64(1), nil }
+							return int64(0), nil
+						case sqlparser.GreaterEqualOp:
+							if cmp >= 0 { return int64(1), nil }
+							return int64(0), nil
+						}
+					}
+				}
+			}
+		}
+		// String-literal vs string-literal under connection collation:
+		// route through Vitess to honor PAD_SPACE collations (NUL ignorable etc.).
+		// Skip when both literals parse as numbers — MySQL compares numerically.
+		if isOrderingOrEqualityOp(v.Operator) {
+			if leftLit, lOK := leftExpr2.(*sqlparser.Literal); lOK && leftLit.Type == sqlparser.StrVal {
+				if rightLit, rOK := rightExpr2.(*sqlparser.Literal); rOK && rightLit.Type == sqlparser.StrVal {
+					_, lerr := strconv.ParseFloat(leftLit.Val, 64)
+					_, rerr := strconv.ParseFloat(rightLit.Val, 64)
+					bothNumeric := lerr == nil && rerr == nil
+					connColl := ""
+					if cv, ok := e.getSysVar("collation_connection"); ok && cv != "" {
+						connColl = cv
+					}
+					if !bothNumeric && connColl != "" {
+						if vc := lookupVitessCollation(connColl); vc != nil {
+							ls := toString(left)
+							rs := toString(right)
+							if isPadSpaceCollation(connColl) {
+								ls = strings.TrimRight(ls, " ")
+								rs = strings.TrimRight(rs, " ")
+							}
+							lBytes := []byte(ls)
+							rBytes := []byte(rs)
+							cs := vc.Charset()
+							if cs.Name() != "utf8mb4" && cs.Name() != "utf8mb3" && cs.Name() != "binary" {
+								if conv, convErr := charset.ConvertFromUTF8(nil, cs, lBytes); convErr == nil {
+									lBytes = conv
+								}
+								if conv, convErr := charset.ConvertFromUTF8(nil, cs, rBytes); convErr == nil {
+									rBytes = conv
+								}
+							}
+							cmp := vc.Collate(lBytes, rBytes, false)
+							switch v.Operator {
+							case sqlparser.EqualOp:
+								if cmp == 0 { return int64(1), nil }
+								return int64(0), nil
+							case sqlparser.NotEqualOp:
+								if cmp != 0 { return int64(1), nil }
+								return int64(0), nil
+							case sqlparser.LessThanOp:
+								if cmp < 0 { return int64(1), nil }
+								return int64(0), nil
+							case sqlparser.GreaterThanOp:
+								if cmp > 0 { return int64(1), nil }
+								return int64(0), nil
+							case sqlparser.LessEqualOp:
+								if cmp <= 0 { return int64(1), nil }
+								return int64(0), nil
+							case sqlparser.GreaterEqualOp:
+								if cmp >= 0 { return int64(1), nil }
+								return int64(0), nil
+							}
+						}
+					}
+				}
+			}
+		}
 		result, err := compareValues(left, right, v.Operator)
 		if err != nil {
 			return nil, err
@@ -8802,8 +9006,31 @@ func compareByCollation(a, b interface{}, collation string) int {
 		aStr := toString(a)
 		bStr := toString(b)
 
+		// PAD SPACE: trim trailing spaces from both sides BEFORE computing
+		// weight strings so that 'a' compares equal to 'a   '. To get correct
+		// relative order between 'a' and 'a\t' (where \t < space < anything-else),
+		// pad the shorter weight key with the byte that represents space at the
+		// end so the longer side compares as if its tail extends beyond a virtual
+		// space pad on the shorter side. Space weight is below alphanumerics in
+		// MySQL's default tables, so this matches MySQL's PAD SPACE ordering.
+		if isPadSpaceCollation(collation) {
+			aStr = strings.TrimRight(aStr, " ")
+			bStr = strings.TrimRight(bStr, " ")
+		}
+
 		sa := normalizeCollationKey(aStr, collation)
 		sb := normalizeCollationKey(bStr, collation)
+		if isPadSpaceCollation(collation) {
+			// Pad the shorter weight key with the space character (0x20) so the
+			// PAD SPACE semantic holds: trailing space in one operand should be
+			// ignored, but a non-space trailing byte (e.g. \t = 0x09) compares
+			// less than a virtual space.
+			if len(sa) < len(sb) {
+				sa = sa + strings.Repeat(" ", len(sb)-len(sa))
+			} else if len(sb) < len(sa) {
+				sb = sb + strings.Repeat(" ", len(sa)-len(sb))
+			}
+		}
 		if sa < sb {
 			return -1
 		}
