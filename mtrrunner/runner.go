@@ -1606,41 +1606,67 @@ func (ctx *execContext) handleDirective(directive string) (handled bool, skip bo
 		return true, true, nil
 
 	case "exec", "execw":
-		// Handle --exec echo "..." specially to produce output
+		// Handle --exec echo "..." specially to produce output.
+		// However, if the echo is part of a pipeline (e.g. `echo "..." | $MYSQL`),
+		// fall through to runExternalCommand (via shell) so the pipeline executes.
 		if strings.HasPrefix(args, "echo ") || strings.HasPrefix(args, "echo\t") {
-			echoArg := strings.TrimSpace(args[5:])
-			// Substitute variables
-			echoArg = ctx.substituteVars(echoArg)
-			// Check for output redirections (> file means output goes to file, not stdout)
-			hasRedirect := false
-			// Check for > outside of quotes
-			inQuote := byte(0)
-			for i := 0; i < len(echoArg); i++ {
-				if echoArg[i] == '"' || echoArg[i] == '\'' {
-					if inQuote == 0 {
-						inQuote = echoArg[i]
-					} else if inQuote == echoArg[i] {
-						inQuote = 0
+			// Detect pipe outside of quotes — if present, treat as a real pipeline.
+			hasPipe := false
+			{
+				inQ := byte(0)
+				for i := 0; i < len(args); i++ {
+					c := args[i]
+					if inQ != 0 {
+						if c == inQ {
+							inQ = 0
+						}
+						continue
+					}
+					if c == '"' || c == '\'' {
+						inQ = c
+						continue
+					}
+					if c == '|' {
+						hasPipe = true
+						break
 					}
 				}
-				if inQuote == 0 && echoArg[i] == '>' {
-					hasRedirect = true
-					echoArg = strings.TrimSpace(echoArg[:i])
-					break
+			}
+			if !hasPipe {
+				echoArg := strings.TrimSpace(args[5:])
+				// Substitute variables
+				echoArg = ctx.substituteVars(echoArg)
+				// Check for output redirections (> file means output goes to file, not stdout)
+				hasRedirect := false
+				// Check for > outside of quotes
+				inQuote := byte(0)
+				for i := 0; i < len(echoArg); i++ {
+					if echoArg[i] == '"' || echoArg[i] == '\'' {
+						if inQuote == 0 {
+							inQuote = echoArg[i]
+						} else if inQuote == echoArg[i] {
+							inQuote = 0
+						}
+					}
+					if inQuote == 0 && echoArg[i] == '>' {
+						hasRedirect = true
+						echoArg = strings.TrimSpace(echoArg[:i])
+						break
+					}
 				}
-			}
-			// Strip surrounding quotes
-			if len(echoArg) >= 2 {
-				if (echoArg[0] == '"' && echoArg[len(echoArg)-1] == '"') ||
-					(echoArg[0] == '\'' && echoArg[len(echoArg)-1] == '\'') {
-					echoArg = echoArg[1 : len(echoArg)-1]
+				// Strip surrounding quotes
+				if len(echoArg) >= 2 {
+					if (echoArg[0] == '"' && echoArg[len(echoArg)-1] == '"') ||
+						(echoArg[0] == '\'' && echoArg[len(echoArg)-1] == '\'') {
+						echoArg = echoArg[1 : len(echoArg)-1]
+					}
 				}
+				// Only output if not redirected to a file
+				if !hasRedirect && ctx.resultLogEnabled {
+					ctx.output.WriteString(echoArg + "\n")
+				}
+				return true, false, nil
 			}
-			// Only output if not redirected to a file
-			if !hasRedirect && ctx.resultLogEnabled {
-				ctx.output.WriteString(echoArg + "\n")
-			}
-			return true, false, nil
 		}
 		// For non-echo exec commands, try to actually run the command if possible.
 		// This supports commands like --exec $MYSQL_DUMP ... that need real execution.
@@ -6163,6 +6189,25 @@ func (ctx *execContext) runExternalCommand(cmdStr string) (string, error) {
 		cmdStr = strings.ReplaceAll(cmdStr, "2>&1", "")
 		cmdStr = strings.TrimSpace(cmdStr)
 	}
+	// If the command contains an unquoted shell pipe '|', delegate to /bin/sh -c
+	// so the pipeline runs end-to-end. This handles patterns like
+	//   --exec echo "select ..." | $MYSQL --protocol=TCP
+	// without requiring a custom multi-process implementation.
+	if hasUnquotedPipe(cmdStr) {
+		execCtx, execCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer execCancel()
+		c := exec.CommandContext(execCtx, "/bin/sh", "-c", cmdStr)
+		var (
+			out []byte
+			err error
+		)
+		if combinedOutput {
+			out, err = c.CombinedOutput()
+		} else {
+			out, err = c.Output()
+		}
+		return string(out), err
+	}
 	// Simple tokenization: split on spaces, respect quoted strings
 	args := shellSplit(cmdStr)
 	if len(args) == 0 {
@@ -6197,6 +6242,29 @@ func (ctx *execContext) runExternalCommand(cmdStr string) (string, error) {
 		out, err = c.Output()
 	}
 	return string(out), err
+}
+
+// hasUnquotedPipe reports whether s contains a '|' character outside any
+// single- or double-quoted region. Used to detect shell pipelines in --exec.
+func hasUnquotedPipe(s string) bool {
+	inQuote := byte(0)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inQuote != 0 {
+			if c == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
+		if c == '"' || c == '\'' {
+			inQuote = c
+			continue
+		}
+		if c == '|' {
+			return true
+		}
+	}
+	return false
 }
 
 // shellSplit splits a shell command string into tokens, respecting quoted strings.
