@@ -225,6 +225,7 @@ func (r *Runner) RunFile(testPath string) TestResult {
 			return map[string]string{
 				"$ENGINE":             "InnoDB",
 				"$MYSQLTEST_VARDIR":   tmpDir,
+				"$MYSQLTEST_FILE":     testPath,
 				"$MYSQL_TMP_DIR":      filepath.Join(tmpDir, "tmp"),
 				"$MYSQL_TEST_DIR":     tmpDir,
 				"$MYSQLD_DATADIR":     filepath.Join(tmpDir, "data", "inner") + "/",
