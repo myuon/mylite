@@ -5041,13 +5041,33 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				if isVarcharOrChar {
 					newMaxLen = extractCharLength(colDef.Type)
 				}
+				// For TIMESTAMP NOT NULL columns, use current timestamp when converting
+				// NULL existing values during ALTER TABLE MODIFY. MySQL uses the session
+				// current_timestamp for all TIMESTAMP NOT NULL null-to-value conversions,
+				// regardless of the column's explicit DEFAULT value.
+				nullToTimestamp := ""
+				if !colDef.Nullable {
+					colTypeUpper := strings.ToUpper(strings.TrimSpace(colDef.Type))
+					colTypeBase := colTypeUpper
+					if idx := strings.IndexByte(colTypeBase, '('); idx >= 0 {
+						colTypeBase = colTypeBase[:idx]
+					}
+					if colTypeBase == "TIMESTAMP" {
+						nullToTimestamp = e.nowTime().Format("2006-01-02 15:04:05")
+					}
+				}
 				tbl.Lock()
 				truncWarningIssued := false
 				for i := range tbl.Rows {
 					if cur, ok := tbl.Rows[i][colDef.Name]; ok {
 						if cur == nil && !colDef.Nullable {
-							// ALTER TABLE MODIFY COLUMN x NOT NULL: convert NULL to zero value
-							tbl.Rows[i][colDef.Name] = implicitDefaultForType(colDef.Type)
+							// ALTER TABLE MODIFY COLUMN x NOT NULL: convert NULL to default value.
+							// For TIMESTAMP/DATETIME with CURRENT_TIMESTAMP default, use current time.
+							if nullToTimestamp != "" {
+								tbl.Rows[i][colDef.Name] = nullToTimestamp
+							} else {
+								tbl.Rows[i][colDef.Name] = implicitDefaultForType(colDef.Type)
+							}
 						} else {
 							val := e.coerceValueForColumnTypeForWrite(colDef, cur)
 							// CHAR → VARCHAR: strip trailing spaces from stored padded values

@@ -1102,8 +1102,10 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 								// Try to parse as expression; fallback to string
 								v = strings.Trim(defVal, "'")
 							}
-						} else if strings.HasPrefix(strings.ToUpper(col.Type), "TIMESTAMP") {
-							// TIMESTAMP columns implicitly default to CURRENT_TIMESTAMP
+						} else if strings.HasPrefix(strings.ToUpper(col.Type), "TIMESTAMP") && !col.Nullable {
+							// TIMESTAMP NOT NULL columns without explicit default: implicit CURRENT_TIMESTAMP.
+							// Nullable TIMESTAMP columns with DEFAULT NULL (col.Default==nil) fall through
+							// to the Nullable branch below which returns nil.
 							v = e.nowTime().Format("2006-01-02 15:04:05")
 						} else if col.AutoIncrement {
 							v = nil // AUTO_INCREMENT will be handled later
@@ -1116,7 +1118,8 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							e.addWarning("Warning", 1364, fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
 							v = implicitZeroValue(col.Type)
 						} else {
-							v = implicitZeroValue(col.Type)
+							// Nullable column with no explicit default: DEFAULT = NULL
+							v = nil
 						}
 						break
 					}

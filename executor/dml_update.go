@@ -755,8 +755,14 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 				colUpper := strings.ToUpper(col.Type)
 				isTimestamp := strings.HasPrefix(colUpper, "TIMESTAMP")
 				if isTimestamp {
-					// TIMESTAMP NOT NULL: MySQL converts NULL to CURRENT_TIMESTAMP
-					newRow[col.Name] = e.nowTime().Format("2006-01-02 15:04:05")
+					// TIMESTAMP NOT NULL: MySQL keeps the old value and warns when
+					// an UPDATE tries to set it to NULL in non-strict mode.
+					// Restore the old row's value.
+					if oldVal, hasOld := oldRow[col.Name]; hasOld {
+						newRow[col.Name] = oldVal
+					} else {
+						newRow[col.Name] = implicitZeroValue(col.Type)
+					}
 					if !e.isStrictMode() || bool(stmt.Ignore) {
 						e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", col.Name))
 					}
