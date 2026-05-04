@@ -523,6 +523,22 @@ func evalStringFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storag
 				}
 			}
 		}
+		// If value is an EWKT geometry string (SRID=N;WKT_GEOM), convert to MySQL's
+		// internal binary format: 4-byte LE SRID followed by ISO WKB body.
+		// MySQL stores geometries as SRID(4 bytes LE) + WKB, so HEX() must reflect that.
+		if s, ok := val.(string); ok && strings.HasPrefix(s, "SRID=") {
+			srid := geomGetSRID(s)
+			plainWKT := geomStripSRID(s)
+			if wkb := wktToWKBBody(plainWKT); wkb != nil {
+				full := make([]byte, 4+len(wkb))
+				full[0] = byte(srid)
+				full[1] = byte(srid >> 8)
+				full[2] = byte(srid >> 16)
+				full[3] = byte(srid >> 24)
+				copy(full[4:], wkb)
+				return strings.ToUpper(hex.EncodeToString(full)), true, nil
+			}
+		}
 		switch tv := val.(type) {
 		case int64:
 			// Use unsigned format to avoid negative hex output for large values
