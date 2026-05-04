@@ -2163,6 +2163,12 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		// MySQL accepts arbitrary whitespace between keywords, so the prefix-match
 		// table below should be tolerant of repeated spaces/tabs/newlines.
 		upper = collapseUpperWhitespace(upper)
+		// GROUP_CONCAT cannot be used as a window function. Vitess gives a generic
+		// syntax error for "GROUP_CONCAT(...) OVER (...)", but MySQL gives a specific
+		// error. Detect this pattern and return the MySQL-compatible error message.
+		if strings.Contains(upper, "GROUP_CONCAT") && strings.Contains(err.Error(), "near 'over'") {
+			return nil, mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'group_concat as window function'")
+		}
 		// Accept statements that Vitess parser doesn't support
 		if strings.HasPrefix(upper, "EXPLAIN ") || strings.HasPrefix(upper, "DESC ") || strings.HasPrefix(upper, "DESCRIBE ") {
 			explainType := sqlparser.TraditionalType

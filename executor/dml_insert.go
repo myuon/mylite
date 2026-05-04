@@ -1109,6 +1109,10 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							v = e.nowTime().Format("2006-01-02 15:04:05")
 						} else if col.AutoIncrement {
 							v = nil // AUTO_INCREMENT will be handled later
+						} else if !col.Nullable && strings.HasPrefix(strings.ToLower(strings.TrimSpace(col.Type)), "enum(") {
+							// ENUM NOT NULL columns always have an implicit default: the first enum value.
+							// This is true even in strict mode, so DEFAULT keyword resolves to it.
+							v = implicitZeroValue(col.Type)
 						} else if !col.Nullable && !isGeneratedColumnType(col.Type) {
 							// DEFAULT keyword used on NOT NULL column with no actual default
 							// In strict mode: error 1364; in non-strict: warning + zero value
@@ -1905,8 +1909,10 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							break
 						}
 					}
-					if !explicitlySpecified && col.Default == nil {
+					if !explicitlySpecified && col.Default == nil && !strings.HasPrefix(strings.ToLower(strings.TrimSpace(col.Type)), "enum(") {
 						// Column not specified and has no default -> error 1364
+						// Exception: ENUM NOT NULL always has an implicit default (first enum value),
+						// handled by implicitZeroValue, so skip the error for ENUM columns.
 						if bool(stmt.Ignore) {
 							e.addWarning("Warning", 1364, fmt.Sprintf("Field '%s' doesn't have a default value", col.Name))
 							row[col.Name] = implicitZeroValue(col.Type)
