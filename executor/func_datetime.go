@@ -4167,10 +4167,13 @@ func normalizeDateTimeForCompare(a, b string) (string, string) {
 		}
 	}
 
-	// DATE vs DATETIME: extend DATE to DATETIME by appending " 00:00:00"
-	if aIsDate && !aIsDatetime && bIsDatetime {
+	// DATE vs DATETIME: extend DATE to DATETIME by appending " 00:00:00".
+	// Only extend if the string is a pure DATE (exactly 10 chars), not a
+	// datetime-with-fractional-seconds like "2010-02-01 09:31:02.0" which
+	// already has a time component and must not be mangled by appending " 00:00:00".
+	if aIsDate && !aIsDatetime && bIsDatetime && len(a) == 10 {
 		a = a + " 00:00:00"
-	} else if bIsDate && !bIsDatetime && aIsDatetime {
+	} else if bIsDate && !bIsDatetime && aIsDatetime && len(b) == 10 {
 		b = b + " 00:00:00"
 	}
 
@@ -4192,6 +4195,25 @@ func normalizeDateTimeForCompare(a, b string) (string, string) {
 			} else {
 				b = b[:bDotIdx+1+len(aFrac)]
 			}
+		}
+	} else if aDotIdx > 10 && bDotIdx <= 10 {
+		// a has fractional seconds in a datetime context but b does not (e.g. a literal
+		// like '2010-02-01 09:31:02.0' compared with a plain TIMESTAMP column value).
+		// A plain TIMESTAMP is implicitly 'YYYY-MM-DD HH:MM:SS.000...0'.
+		// Extend b with zeros matching a's fractional digit count so that string
+		// comparison is correct for all fractional values:
+		//   '09:31:02.0' vs '09:31:02' → extend to '09:31:02.0' vs '09:31:02.0' → equal ✓
+		//   '09:31:02.5' vs '09:31:02' → extend to '09:31:02.5' vs '09:31:02.0' → a > b ✓
+		aFracLen := len(a) - aDotIdx - 1
+		if len(b) >= 19 && b[4] == '-' && b[10] == ' ' {
+			b = b + "." + strings.Repeat("0", aFracLen)
+		}
+	} else if bDotIdx > 10 && aDotIdx <= 10 {
+		// b has fractional seconds in a datetime context but a does not.
+		// Extend a with zeros matching b's fractional digit count.
+		bFracLen := len(b) - bDotIdx - 1
+		if len(a) >= 19 && a[4] == '-' && a[10] == ' ' {
+			a = a + "." + strings.Repeat("0", bFracLen)
 		}
 	}
 

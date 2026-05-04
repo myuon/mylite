@@ -1357,6 +1357,13 @@ func compareRowValue(a, b interface{}) int {
 	}
 	as := fmt.Sprintf("%v", a)
 	bs := fmt.Sprintf("%v", b)
+	// Normalize datetime strings with mismatched fractional-second precision.
+	// A plain TIMESTAMP/DATETIME like "2010-02-01 09:31:02" is implicitly
+	// "2010-02-01 09:31:02.000..." — extend the non-fractional side with zeros
+	// so that string comparison is lexicographically correct:
+	//   "09:31:02" vs "09:31:02.0" → extend to "09:31:02.0" vs "09:31:02.0" → equal
+	//   "09:31:02" vs "09:31:02.5" → extend to "09:31:02.0" vs "09:31:02.5" → a < b
+	as, bs = normalizeDatetimeFractionalForCompare(as, bs)
 	if as < bs {
 		return -1
 	}
@@ -1364,6 +1371,29 @@ func compareRowValue(a, b interface{}) int {
 		return 1
 	}
 	return 0
+}
+
+// normalizeDatetimeFractionalForCompare extends the datetime string that lacks
+// fractional seconds with ".0...0" to match the other's fractional digit count,
+// so that string comparison yields the correct order when one side is a plain
+// DATETIME/TIMESTAMP (no fractional seconds) and the other has ".N" fractional.
+func normalizeDatetimeFractionalForCompare(a, b string) (string, string) {
+	isDatetimeLike := func(s string) bool {
+		// Must look like YYYY-MM-DD HH:MM:SS (exactly 19 chars with correct separators)
+		return len(s) == 19 && s[4] == '-' && s[7] == '-' && s[10] == ' ' && s[13] == ':' && s[16] == ':'
+	}
+	aDotIdx := strings.LastIndex(a, ".")
+	bDotIdx := strings.LastIndex(b, ".")
+	if aDotIdx > 10 && bDotIdx <= 10 && isDatetimeLike(b) {
+		// a has fractional seconds (in datetime context), b does not — extend b
+		aFracLen := len(a) - aDotIdx - 1
+		b = b + "." + strings.Repeat("0", aFracLen)
+	} else if bDotIdx > 10 && aDotIdx <= 10 && isDatetimeLike(a) {
+		// b has fractional seconds (in datetime context), a does not — extend a
+		bFracLen := len(b) - bDotIdx - 1
+		a = a + "." + strings.Repeat("0", bFracLen)
+	}
+	return a, b
 }
 
 func toComparableFloat(v interface{}) (float64, bool) {
