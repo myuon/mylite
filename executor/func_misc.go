@@ -217,13 +217,19 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if len(v.Exprs) < 1 {
 			return nil, true, nil
 		}
+		// Handle explicit COLLATE clause: _utf8mb4 'b' COLLATE utf8mb4_0900_ai_ci
+		// is parsed as CollateExpr{Collation: "utf8mb4_0900_ai_ci", Expr: IntroducerExpr{...}}
+		// The COLLATION() function should return the explicit collation name directly.
+		if ce, ok := v.Exprs[0].(*sqlparser.CollateExpr); ok {
+			return strings.ToLower(ce.Collation), true, nil
+		}
 		if cue, ok := v.Exprs[0].(*sqlparser.ConvertUsingExpr); ok {
 			cs := strings.ToLower(cue.Type)
 			switch cs {
 			case "utf8", "utf8mb3":
 				return "utf8mb3_general_ci", true, nil
 			case "utf8mb4":
-				return "utf8mb4_0900_ai_ci", true, nil
+				return e.getDefaultCollationForCharset("utf8mb4"), true, nil
 			case "latin1":
 				return "latin1_swedish_ci", true, nil
 			case "binary":
@@ -239,7 +245,7 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 			case "utf8", "utf8mb3":
 				return "utf8_general_ci", true, nil
 			case "utf8mb4":
-				return "utf8mb4_0900_ai_ci", true, nil
+				return e.getDefaultCollationForCharset("utf8mb4"), true, nil
 			case "latin1":
 				return "latin1_swedish_ci", true, nil
 			case "binary":
@@ -262,7 +268,7 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 				case "utf8", "utf8mb3":
 					return "utf8mb3_general_ci", true, nil
 				case "utf8mb4":
-					return "utf8mb4_0900_ai_ci", true, nil
+					return e.getDefaultCollationForCharset("utf8mb4"), true, nil
 				case "latin1":
 					return "latin1_swedish_ci", true, nil
 				case "binary":
@@ -281,7 +287,7 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 				return "utf8_general_ci", true, nil
 			}
 		}
-		return "utf8mb4_0900_ai_ci", true, nil
+		return e.getDefaultCollationForCharset("utf8mb4"), true, nil
 	case "least":
 		if len(v.Exprs) < 2 {
 			return nil, true, fmt.Errorf("LEAST requires at least 2 arguments")

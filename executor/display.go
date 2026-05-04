@@ -117,13 +117,14 @@ func normalizeSQLDisplayName(s string) string {
 
 // normalizeCharsetIntroducers normalizes charset introducers in column display names.
 // The sqlparser converts _utf8 to _utf8mb3 and adds a space before the literal.
-// MySQL displays these as _utf8'...' without space.
+// MySQL displays these as _utf8'...' without space for _utf8mb3.
+// However, _utf8mb4 preserves any space that was in the original SQL query.
 func normalizeCharsetIntroducers(s string) string {
-	// Replace _utf8mb3 ' with _utf8'
+	// Replace _utf8mb3 ' with _utf8' (sqlparser always adds space; MySQL shows no space)
 	s = strings.ReplaceAll(s, "_utf8mb3 '", "_utf8'")
 	s = strings.ReplaceAll(s, "_utf8mb3'", "_utf8'")
-	// Also handle other common alias pairs
-	s = strings.ReplaceAll(s, "_utf8mb4 '", "_utf8mb4'")
+	// NOTE: Do NOT strip the space from "_utf8mb4 '" here.
+	// MySQL preserves the space in COLLATION(_utf8mb4 'a') column headers.
 	return s
 }
 

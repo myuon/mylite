@@ -1267,8 +1267,29 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		query = "DROP TEMPORARY TABLE " + query[len("DROP TEMPORARY TABLES "):]
 	}
 
+	// The vitess parser drops the COLLATE clause from "SET NAMES charset COLLATE coll".
+	// Detect this pattern, strip the COLLATE part so vitess can parse it, and save the
+	// explicit collation in pendingNamesCollation for execSet to apply afterwards.
+	e.pendingNamesCollation = ""
+	if strings.HasPrefix(upper, "SET NAMES ") {
+		if m := reSetNamesCollate.FindStringSubmatch(upper); m != nil {
+			// m[1] is the collation name
+			e.pendingNamesCollation = strings.ToLower(m[1])
+			// Strip the " COLLATE <coll>" suffix from the query
+			collateIdx := strings.Index(upper, " COLLATE ")
+			if collateIdx >= 0 {
+				query = strings.TrimSpace(trimmed[:collateIdx])
+				upper = strings.ToUpper(query)
+				trimmed = query
+			}
+		}
+	}
+
 	return query, nil, nil
 }
+
+// reSetNamesCollate matches "SET NAMES <charset> COLLATE <collation>" and captures the collation name.
+var reSetNamesCollate = regexp.MustCompile(`(?i)^SET\s+NAMES\s+\S+\s+COLLATE\s+(\S+)$`)
 
 // extractFunctionArgList finds the first occurrence of fnName( in query (case-insensitive)
 // and returns the string between the opening and matching closing parentheses.

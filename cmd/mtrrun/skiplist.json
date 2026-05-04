@@ -3469,10 +3469,6 @@
       "reason": "needs charset conversion for result encoding"
     },
     {
-      "test": "sys_vars/default_collation_for_utf8mb4",
-      "reason": "collation function differences"
-    },
-    {
       "test": "perfschema/all_tests",
       "reason": "output mismatch, timeout, or error"
     },
