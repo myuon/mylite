@@ -510,11 +510,12 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 					canonicalColName = col.Name
 						if val != nil {
 						colUpper := strings.ToUpper(col.Type)
-						// In non-strict mode, invalid numeric strings are coerced to 0 with warning.
-						isNumericType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "NUMERIC") ||
-							strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || strings.Contains(colUpper, "REAL") ||
-							strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER")
-						if !e.isStrictMode() && isNumericType {
+						// In non-strict mode or strict mode + IGNORE, invalid numeric strings are coerced to 0 with warning.
+						// MySQL's IGNORE clause converts strict errors to warnings even in strict mode.
+						isIntegerType := strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER")
+						isNumericType := isIntegerType || strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "NUMERIC") ||
+							strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || strings.Contains(colUpper, "REAL")
+						if (!e.isStrictMode() || bool(stmt.Ignore)) && isNumericType {
 							if sv, ok := val.(string); ok {
 								if _, err := strconv.ParseFloat(strings.TrimSpace(sv), 64); err != nil {
 									// If the string looks like a TIME value (HH:MM:SS) or DATETIME value
@@ -525,7 +526,12 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 										(len(sv) >= 19 && sv[4] == '-' && sv[7] == '-' && sv[10] == ' ') {
 										// TIME/DATETIME-like string: skip numeric prefix parse; coerceIntegerValue handles it.
 									} else {
-										e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row %d", sv, col.Name, i+1))
+										// For integer columns: "Incorrect integer value"; for decimal/float: "Incorrect decimal value".
+										if isIntegerType {
+											e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect integer value: '%s' for column '%s' at row %d", sv, col.Name, i+1))
+										} else {
+											e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect decimal value: '%s' for column '%s' at row %d", sv, col.Name, i+1))
+										}
 										if pv, ok := parseNumericPrefixMySQL(sv); ok {
 											val = pv
 										} else {

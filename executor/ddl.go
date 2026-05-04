@@ -490,6 +490,10 @@ func (e *Executor) execDropDatabase(stmt *sqlparser.DropDatabase) (*Result, erro
 	err := e.Catalog.DropDatabase(name)
 	if err != nil {
 		if stmt.IfExists {
+			// MySQL emits Note 1008 when IF EXISTS is used and the database doesn't exist.
+			if e.sqlNotesEnabled() {
+				e.addWarning("Note", 1008, fmt.Sprintf("Can't drop database '%s'; database doesn't exist", name))
+			}
 			return &Result{}, nil
 		}
 		return nil, mysqlError(1008, "HY000", fmt.Sprintf("Can't drop database '%s'; database doesn't exist", name))
@@ -1093,10 +1097,12 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 		if !recoveredFromPartition {
 			// This happens when vitess accepts invalid syntax that MySQL rejects
-			// (e.g. CHECK without parentheses, bare CONSTRAINT without key type).
-			// Return a parse error to match MySQL behaviour.
+			// (e.g. CHECK without parentheses, bare CONSTRAINT without key type,
+			// column definition without a type like "CREATE TABLE t (i)").
+			// Return a parse error with MySQL-compatible "near" text.
+			near := extractNearForInvalidColDef(e.currentQuery)
 			return nil, mysqlError(1064, "42000",
-				"You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '' at line 1")
+				fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", near))
 		}
 	}
 
@@ -2170,6 +2176,40 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		}
 	}
 
+	// Validate: if there is no explicit PRIMARY KEY, MySQL promotes the first NOT NULL
+	// UNIQUE index to be the implicit primary key. A primary key index cannot be INVISIBLE.
+	// Ref: ER_PK_INDEX_CANT_BE_INVISIBLE = 3895.
+	if len(primaryKeys) == 0 {
+		// Find the first UNIQUE NOT NULL index
+		for _, idx := range indexes {
+			if !idx.Unique {
+				continue
+			}
+			// Check if all indexed columns are NOT NULL
+			allNotNull := true
+			for _, col := range idx.Columns {
+				baseCol := strings.TrimSpace(col)
+				for _, c := range columns {
+					if strings.EqualFold(c.Name, baseCol) {
+						if c.Nullable {
+							allNotNull = false
+						}
+						break
+					}
+				}
+			}
+			if !allNotNull {
+				continue
+			}
+			// This is the first NOT NULL UNIQUE index (would become implicit PK)
+			if idx.Invisible {
+				return nil, mysqlError(3895, "HY000", "A primary key index cannot be invisible")
+			}
+			// Only check the first NOT NULL UNIQUE index
+			break
+		}
+	}
+
 	// Validate key length for inline PRIMARY KEY column definitions.
 	// Explicit index PRIMARY KEY entries are checked in the index loop above.
 	// Inline column-level "PRIMARY KEY" (ColKeyPrimary) bypasses that loop,
@@ -2719,6 +2759,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	err = db.CreateTable(def)
 	if err != nil {
 		if stmt.IfNotExists {
+			// MySQL emits Note 1050 "Table already exists" when IF NOT EXISTS is used
+			// and the table already exists. This sets the warning count to 1.
+			if e.sqlNotesEnabled() {
+				e.addWarning("Note", 1050, fmt.Sprintf("Table '%s' already exists", tableName))
+			}
 			return &Result{}, nil
 		}
 		// If a TEMP table exists with this name and we're creating a PERMANENT table,
@@ -6278,7 +6323,18 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			}
 		}
 	}
-	if requiresRowRewrite && tbl != nil {
+	// Determine if ALGORITHM=COPY was explicitly specified.
+	isCopyAlgorithm := false
+	for _, opt := range stmt.AlterOptions {
+		if av, ok := opt.(sqlparser.AlgorithmValue); ok {
+			if strings.EqualFold(string(av), "COPY") {
+				isCopyAlgorithm = true
+			}
+		}
+	}
+	// When ALGORITHM=COPY is explicitly specified, MySQL rebuilds the table and reports
+	// all rows as affected regardless of the operation type.
+	if (requiresRowRewrite || isCopyAlgorithm) && tbl != nil {
 		alterAffected = uint64(len(tbl.Scan()))
 	}
 
@@ -6288,14 +6344,6 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 	// If ALGORITHM=INPLACE, preserve the existing format.
 	// If ROW_FORMAT was explicitly set in this ALTER, EffectiveRowFormat was already updated above.
 	{
-		isCopyAlgorithm := false
-		for _, opt := range stmt.AlterOptions {
-			if av, ok := opt.(sqlparser.AlgorithmValue); ok {
-				if strings.EqualFold(string(av), "COPY") {
-					isCopyAlgorithm = true
-				}
-			}
-		}
 		// A "rebuild" happens for ALGORITHM=COPY or for operations that require row rewrite
 		// (unless INPLACE was specified).
 		isRebuild := isCopyAlgorithm || (requiresRowRewrite && !alterIsInplace)
@@ -9768,6 +9816,104 @@ func isZeroInDateValue(val string) bool {
 		}
 	}
 	return false
+}
+
+// extractNearForInvalidColDef extracts the MySQL-compatible "near" text from a
+// CREATE TABLE statement where vitess parsed it but returned TableSpec=nil,
+// indicating an invalid column definition (e.g. column without a type name).
+// MySQL reports the text starting right after the problematic column name
+// (e.g. "create table t (i)" → near ")" because ")" follows the bare name "i").
+func extractNearForInvalidColDef(query string) string {
+	query = strings.TrimRight(strings.TrimSpace(query), ";")
+
+	// Find the first '(' that starts the column list.
+	parenStart := strings.Index(query, "(")
+	if parenStart < 0 {
+		return ""
+	}
+
+	// Find the matching close paren (tracking depth, skipping string literals).
+	depth := 1
+	closePos := -1
+	for i := parenStart + 1; i < len(query); i++ {
+		ch := query[i]
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				closePos = i
+			}
+		case '\'':
+			i++
+			for i < len(query) && query[i] != '\'' {
+				if query[i] == '\\' {
+					i++
+				}
+				i++
+			}
+		}
+		if closePos >= 0 {
+			break
+		}
+	}
+	if closePos < 0 {
+		return ")"
+	}
+
+	innerContent := query[parenStart+1 : closePos]
+
+	// Split by top-level commas to get individual column definitions.
+	var colParts []string
+	depth = 0
+	start := 0
+	for i := 0; i < len(innerContent); i++ {
+		switch innerContent[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				colParts = append(colParts, innerContent[start:i])
+				start = i + 1
+			}
+		}
+	}
+	colParts = append(colParts, innerContent[start:])
+
+	// Find the first column part that is a bare identifier (single token, no type).
+	for _, part := range colParts {
+		trimmed := strings.TrimSpace(part)
+		// Strip backtick quoting for the word count check.
+		stripped := strings.Trim(trimmed, "`")
+		if stripped == "" {
+			continue
+		}
+		words := strings.Fields(stripped)
+		if len(words) == 1 {
+			// Bare identifier: find where it ends in the original query,
+			// then return the text from that position onward.
+			search := trimmed // the identifier as it appears (possibly backtick-quoted)
+			pos := strings.Index(query[parenStart+1:], search)
+			if pos >= 0 {
+				afterPos := parenStart + 1 + pos + len(search)
+				near := strings.TrimLeft(query[afterPos:], " \t\r\n")
+				if len(near) > 80 {
+					near = near[:80]
+				}
+				return near
+			}
+		}
+	}
+
+	// Default: return the text starting at the closing ')'.
+	near := query[closePos:]
+	if len(near) > 80 {
+		near = near[:80]
+	}
+	return near
 }
 
 // normalizeCurrentTimestampDefault normalizes CURRENT_TIMESTAMP synonyms (now(), current_timestamp())
