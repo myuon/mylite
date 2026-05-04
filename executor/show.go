@@ -531,6 +531,40 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 			if !basic.DbName.IsEmpty() {
 				targetDB = basic.DbName.String()
 			}
+			// Handle WHERE filter: if a WHERE expression is provided, evaluate it.
+			// If evaluation raises an error (e.g., function call fails with dup key),
+			// propagate that error. If the expression evaluates to false, return empty.
+			// This is a simplified implementation: the WHERE expression is evaluated
+			// once (not per-row), which is correct when the expression doesn't reference
+			// the result column (Tables_in_db). Per-row filtering is handled by LIKE.
+			// If the WHERE expression references the result column (producing error 1054
+			// "Unknown column"), we skip evaluation and fall through to no filtering
+			// (the column-based WHERE is not yet supported for SHOW TABLES).
+			whereFilter := true // default: no WHERE means include all
+			if basic.Filter != nil && basic.Filter.Filter != nil {
+				val, err := e.evalExpr(basic.Filter.Filter)
+				if err != nil {
+					// If the error is "Unknown column" (1054), the WHERE clause likely
+					// references the result column (e.g. Tables_in_db != 'foo'), which
+					// requires per-row evaluation. Fall through with no filtering.
+					if strings.Contains(err.Error(), "1054") || strings.Contains(err.Error(), "Unknown column") {
+						whereFilter = true // no filtering; treat as unrecognized WHERE
+					} else {
+						return nil, err
+					}
+				} else {
+					whereFilter = isTruthy(val)
+				}
+			}
+			if !whereFilter {
+				// WHERE evaluated to false: return empty result
+				colName := fmt.Sprintf("Tables_in_%s", targetDB)
+				return &Result{
+					Columns:     []string{colName},
+					Rows:        nil,
+					IsResultSet: true,
+				}, nil
+			}
 			var tables []string
 			if !strings.EqualFold(targetDB, "information_schema") && !strings.EqualFold(targetDB, "performance_schema") {
 				db, err := e.Catalog.GetDatabase(targetDB)

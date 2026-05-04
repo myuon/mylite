@@ -3,6 +3,7 @@ package executor
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -327,7 +328,9 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		!strings.HasPrefix(upper, "SHOW COUNT(*) WARNINGS") &&
 		!strings.HasPrefix(upper, "SHOW ERRORS") &&
 		!strings.HasPrefix(upper, "SHOW COUNT(*) ERRORS") {
-		e.lastWarningCount = int64(len(e.warnings))
+		// Use warningActualCount (total generated) rather than len(e.warnings) (stored count
+		// capped by max_error_count). MySQL's @@warning_count reflects the actual total.
+		e.lastWarningCount = e.warningActualCount
 		var errCnt int64
 		for _, w := range e.warnings {
 			if strings.ToUpper(w.Level) == "ERROR" {
@@ -337,6 +340,7 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		e.lastErrorCount = errCnt
 		e.warnings = nil
 		e.postErrorWarnings = nil
+		e.warningActualCount = 0
 	}
 
 	// Handle SHOW COUNT(*) WARNINGS / SHOW COUNT(*) ERRORS before parser
@@ -869,19 +873,65 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 		return "SHOW CREATE SCHEMA " + rest, nil, nil
 	}
 
-	// Handle SHOW WARNINGS LIMIT / SHOW ERRORS LIMIT (vitess can't parse)
+	// Handle SHOW WARNINGS LIMIT / SHOW ERRORS LIMIT (vitess can't parse these).
+	// Parse the LIMIT clause and apply it to the warning list.
 	if strings.HasPrefix(upper, "SHOW WARNINGS LIMIT") || strings.HasPrefix(upper, "SHOW ERRORS LIMIT") {
-		// Return empty warnings/errors as simplified response
-		if strings.HasPrefix(upper, "SHOW WARNINGS") {
-			return "", &Result{
-				Columns:     []string{"Level", "Code", "Message"},
-				Rows:        nil,
-				IsResultSet: true,
-			}, nil
+		limitStr := ""
+		if strings.HasPrefix(upper, "SHOW WARNINGS LIMIT") {
+			limitStr = strings.TrimSpace(trimmed[len("SHOW WARNINGS LIMIT"):])
+		} else {
+			limitStr = strings.TrimSpace(trimmed[len("SHOW ERRORS LIMIT"):])
+		}
+		// Strip trailing semicolon (queries may arrive with or without it).
+		limitStr = strings.TrimRight(limitStr, ";")
+		// Parse "offset, count" or just "count"
+		offset := int64(0)
+		count := int64(-1) // -1 means unlimited
+		if idx := strings.Index(limitStr, ","); idx >= 0 {
+			if n, err2 := strconv.ParseInt(strings.TrimSpace(limitStr[:idx]), 10, 64); err2 == nil {
+				offset = n
+			}
+			if n, err2 := strconv.ParseInt(strings.TrimSpace(limitStr[idx+1:]), 10, 64); err2 == nil {
+				count = n
+			}
+		} else {
+			if n, err2 := strconv.ParseInt(limitStr, 10, 64); err2 == nil {
+				count = n
+			}
+		}
+
+		// Build the source list (warnings or errors only)
+		isErrors := strings.HasPrefix(upper, "SHOW ERRORS LIMIT")
+		src := e.warnings
+		if isErrors {
+			var errOnly []Warning
+			for _, w := range e.warnings {
+				if strings.EqualFold(w.Level, "Error") {
+					errOnly = append(errOnly, w)
+				}
+			}
+			src = errOnly
+		}
+
+		// Apply LIMIT offset, count
+		if offset >= int64(len(src)) {
+			src = nil
+		} else {
+			src = src[offset:]
+		}
+		if count == 0 {
+			src = nil
+		} else if count > 0 && int64(len(src)) > count {
+			src = src[:count]
+		}
+
+		rows := make([][]interface{}, 0, len(src))
+		for _, w := range src {
+			rows = append(rows, []interface{}{w.Level, int64(w.Code), w.Message})
 		}
 		return "", &Result{
 			Columns:     []string{"Level", "Code", "Message"},
-			Rows:        nil,
+			Rows:        rows,
 			IsResultSet: true,
 		}, nil
 	}
