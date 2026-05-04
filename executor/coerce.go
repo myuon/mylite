@@ -1058,6 +1058,26 @@ func (e *Executor) coerceColumnValueWithSession(colType string, val interface{})
 	} else if isVarbinaryType(colType) && val != nil {
 		val = hexIntToBytes(val)
 	}
+	// For CHAR/VARCHAR columns, convert DivisionResult/ScaledValue to their full-precision
+	// float string representation so that subsequent CHAR(N) truncation yields the correct
+	// stored value (e.g. 1/3 in CHAR(10) → "0.33333333").
+	// Note: int64/uint64/float64 are intentionally NOT converted here — converting them would
+	// break HEX() behavior (e.g. HEX(253) should return "FD", not HEX of the string "253").
+	if val != nil {
+		colUp := strings.ToUpper(strings.TrimSpace(colType))
+		colBase := colUp
+		if idx := strings.IndexByte(colBase, '('); idx >= 0 {
+			colBase = colBase[:idx]
+		}
+		if colBase == "CHAR" || colBase == "VARCHAR" {
+			switch v := val.(type) {
+			case DivisionResult:
+				val = strconv.FormatFloat(v.Value, 'f', -1, 64)
+			case ScaledValue:
+				val = strconv.FormatFloat(v.Value, 'f', -1, 64)
+			}
+		}
+	}
 	if val != nil {
 		val = formatDecimalValue(colType, val)
 		val = validateEnumSetValue(colType, val)
@@ -1091,6 +1111,26 @@ func (e *Executor) coerceValueForColumnTypeWithSession(col catalog.ColumnDef, va
 		val = padBinaryValue(val, padLen)
 	} else if isVarbinaryType(col.Type) {
 		val = hexIntToBytes(val)
+	}
+	// For CHAR/VARCHAR columns, convert DivisionResult/ScaledValue to their full-precision
+	// float string representation. MySQL stores the underlying float value with maximum
+	// precision into string columns, allowing subsequent CHAR(N) truncation to produce
+	// the correct result (e.g. 1/3 in CHAR(10) → "0.33333333" after truncation).
+	{
+		colUp := strings.ToUpper(strings.TrimSpace(col.Type))
+		colBase := colUp
+		if idx := strings.IndexByte(colBase, '('); idx >= 0 {
+			colBase = colBase[:idx]
+		}
+		isStrCol := colBase == "CHAR" || colBase == "VARCHAR"
+		if isStrCol {
+			switch v := val.(type) {
+			case DivisionResult:
+				val = strconv.FormatFloat(v.Value, 'f', -1, 64)
+			case ScaledValue:
+				val = strconv.FormatFloat(v.Value, 'f', -1, 64)
+			}
+		}
 	}
 	val = formatDecimalValue(col.Type, val)
 	val = validateEnumSetValue(col.Type, val)
@@ -3522,6 +3562,12 @@ func coerceColumnValue(colType string, val interface{}) interface{} {
 			case float64:
 				// Format without trailing zeros (e.g., 1.0 → "1")
 				val = strconv.FormatFloat(v, 'f', -1, 64)
+			case DivisionResult:
+				// Use full float64 precision for string storage; CHAR(N) truncation
+				// will then limit the result to the column width.
+				val = strconv.FormatFloat(v.Value, 'f', -1, 64)
+			case ScaledValue:
+				val = strconv.FormatFloat(v.Value, 'f', -1, 64)
 			}
 		}
 	}

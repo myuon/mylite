@@ -472,6 +472,63 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				return nil, err
 			}
 
+			// Non-strict mode: truncate CHAR(N) strings that exceed the declared column width.
+			// Only fixed-width CHAR columns are truncated; VARCHAR is excluded to match Dolt behavior.
+			if !e.isStrictMode() && tbl.Def != nil {
+				for _, col := range tbl.Def.Columns {
+					rv, exists := row[col.Name]
+					if !exists || rv == nil {
+						continue
+					}
+					colUpper := strings.ToUpper(strings.TrimSpace(col.Type))
+					colBase := colUpper
+					if idx := strings.IndexByte(colBase, '('); idx >= 0 {
+						colBase = colBase[:idx]
+					}
+					if colBase != "CHAR" {
+						continue
+					}
+					// Determine effective column charset.
+					effectiveCs := strings.ToLower(col.Charset)
+					if effectiveCs == "" && tbl.Def != nil {
+						effectiveCs = strings.ToLower(tbl.Def.Charset)
+					}
+					// For single-byte non-ASCII charsets (e.g. hebrew, latin1), integer values
+					// represent character code points — do NOT convert to decimal string.
+					// Only UTF-8 / ASCII compatible charsets treat numeric values as decimal digits.
+					isSpecialSingleByte := effectiveCs != "" && effectiveCs != "ascii" &&
+						effectiveCs != "utf8" && effectiveCs != "utf8mb4" && effectiveCs != "utf8mb3" &&
+						isSingleByteCharset(effectiveCs)
+					// Convert non-string numerics to their decimal string representation for
+					// UTF-8 compatible columns so that CHAR(N) truncation can be applied.
+					sv, ok := rv.(string)
+					if !ok && !isSpecialSingleByte {
+						switch v := rv.(type) {
+						case int64:
+							sv = fmt.Sprintf("%d", v)
+							ok = true
+						case uint64:
+							sv = fmt.Sprintf("%d", v)
+							ok = true
+						case float64:
+							sv = strconv.FormatFloat(v, 'f', -1, 64)
+							ok = true
+						}
+					}
+					if !ok {
+						continue
+					}
+					maxLen := extractCharLength(col.Type)
+					if maxLen <= 0 {
+						continue
+					}
+					if utf8.ValidString(sv) && len([]rune(sv)) > maxLen {
+						row[col.Name] = string([]rune(sv)[:maxLen])
+						e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
+					}
+				}
+			}
+
 			bulkRows = append(bulkRows, row)
 		}
 
@@ -2305,25 +2362,25 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 		}
 
-		// Non-strict mode: warn about strings that exceed column length but do NOT truncate
-		// (Dolt does not enforce VARCHAR/CHAR length limits)
+		// Non-strict mode: truncate CHAR strings that exceed column length and warn.
+		// MySQL truncates fixed-width CHAR(N) values in non-strict mode (Warning 1265).
+		// Note: VARCHAR(N) is intentionally excluded – the Dolt-generated test results
+		// expect variable-length columns to store the full value (matching Dolt behavior).
 		if !e.isStrictMode() {
 			for _, col := range tbl.Def.Columns {
 				rv, exists := row[col.Name]
 				if !exists || rv == nil {
 					continue
 				}
-				colUpper := strings.ToUpper(col.Type)
-				isCharType := strings.Contains(colUpper, "CHAR") || strings.Contains(colUpper, "BINARY")
-				if !isCharType {
+				colUpper := strings.ToUpper(strings.TrimSpace(col.Type))
+				colBase := colUpper
+				if idx := strings.IndexByte(colBase, '('); idx >= 0 {
+					colBase = colBase[:idx]
+				}
+				// Only truncate fixed-width CHAR(N) columns; skip VARCHAR, BINARY, etc.
+				if colBase != "CHAR" {
 					continue
 				}
-				sv, ok := rv.(string)
-				if !ok {
-					continue
-				}
-				maxLen := extractCharLength(col.Type)
-				runeLen := 0
 				effectiveCs := col.Charset
 				if effectiveCs == "" && tbl.Def != nil {
 					effectiveCs = tbl.Def.Charset
@@ -2335,10 +2392,40 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				isUtf8Cs := effectiveCs == "utf8" || effectiveCs == "utf8mb4" ||
 					effectiveCs == "utf8mb3" || effectiveCs == "ascii" ||
 					effectiveCs == "" || isSingleByteCharset(effectiveCs)
-				if isUtf8Cs && utf8.ValidString(sv) {
-					runeLen = len([]rune(sv))
+				// For special single-byte non-ASCII charsets (e.g. hebrew, latin1), integer values
+				// represent character code points — do NOT convert to decimal string.
+				// ASCII and UTF-8 family treat numbers as decimal digits.
+				isSpecialSingleByte := effectiveCs != "" && effectiveCs != "ascii" &&
+					effectiveCs != "utf8" && effectiveCs != "utf8mb4" && effectiveCs != "utf8mb3" &&
+					isSingleByteCharset(effectiveCs)
+				sv, ok := rv.(string)
+				if !ok && !isSpecialSingleByte {
+					switch v := rv.(type) {
+					case int64:
+						sv = fmt.Sprintf("%d", v)
+						ok = true
+					case uint64:
+						sv = fmt.Sprintf("%d", v)
+						ok = true
+					case float64:
+						sv = strconv.FormatFloat(v, 'f', -1, 64)
+						ok = true
+					}
 				}
-				if maxLen > 0 && runeLen > maxLen {
+				if !ok {
+					continue
+				}
+				maxLen := extractCharLength(col.Type)
+				if maxLen <= 0 {
+					continue
+				}
+				if !isUtf8Cs || !utf8.ValidString(sv) {
+					continue
+				}
+				runeLen := len([]rune(sv))
+				if runeLen > maxLen {
+					// Truncate to column width and emit warning (MySQL behavior in non-strict mode)
+					row[col.Name] = string([]rune(sv)[:maxLen])
 					e.addWarning("Warning", 1265, fmt.Sprintf("Data truncated for column '%s' at row 1", col.Name))
 				}
 			}
