@@ -4257,10 +4257,6 @@
       "reason": "InnoDB transportable tablespace + restart_mysqld (#71)"
     },
     {
-      "test": "innodb/innodb-autoinc",
-      "reason": "auto_increment_increment/offset session vars not applied"
-    },
-    {
       "test": "innodb/blob_redo",
       "reason": "kill_and_restart_mysqld semantics not fully simulated"
     },
@@ -4277,10 +4273,6 @@
       "reason": "XA recovery requires real restart"
     },
     {
-      "test": "innodb/autoinc_persist",
-      "reason": "remaining: auto warning emission + ROLLBACK restoration semantics (Refs #255)"
-    },
-    {
       "test": "innodb_gis/rtree_compress",
       "reason": "spatial/rtree feature not implemented"
     },
@@ -4291,6 +4283,10 @@
     {
       "test": "innodb_gis/rtree_purge",
       "reason": "spatial/rtree feature not implemented"
+    },
+    {
+      "test": "innodb/innodb-autoinc",
+      "reason": "lock_mode=0 bulk reservation not yet implemented"
     }
   ]
 }
