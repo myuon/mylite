@@ -3065,22 +3065,6 @@
       "reason": "still failing"
     },
     {
-      "test": "innodb/high_prio_trx_1",
-      "reason": "still failing"
-    },
-    {
-      "test": "innodb/high_prio_trx_2",
-      "reason": "still failing"
-    },
-    {
-      "test": "innodb/high_prio_trx_3",
-      "reason": "still failing"
-    },
-    {
-      "test": "innodb/high_prio_trx_4",
-      "reason": "still failing"
-    },
-    {
       "test": "innodb/high_prio_trx_6",
       "reason": "still failing"
     },
@@ -3127,10 +3111,6 @@
     {
       "test": "sys_vars/session_track_gtids_basic",
       "reason": "engine does not support session_track_gtids default OFF"
-    },
-    {
-      "test": "innodb/high_prio_trx_fk",
-      "reason": "Requires multi-connection high-priority transaction testing"
     },
     {
       "test": "gcol/gcol_rejected_myisam",
@@ -4287,6 +4267,11 @@
     {
       "test": "innodb/innodb-autoinc",
       "reason": "lock_mode=0 bulk reservation not yet implemented"
+    },
+    {
+      "suite": "innodb",
+      "test": "innodb/high_prio_trx_fk",
+      "reason": "FK constraint check sees deleted parent row from other transaction (MVCC isolation issue)"
     }
   ]
 }

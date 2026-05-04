@@ -251,6 +251,15 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 	tbl.Lock()
 	defer tbl.Unlock()
 
+	// High-priority transaction: preempt all connections holding locks on this table
+	// BEFORE evaluating the WHERE clause, so that their undo logs are replayed first
+	// and the table rows are visible in their pre-modification state.
+	if e.isHighPriority && e.highPrioTxn != nil && e.rowLockManager != nil {
+		tbl.Unlock()
+		e.highPrioTxn.PreemptTableConflicts(updateDB, tableName, e.connectionID, e.rowLockManager)
+		tbl.Lock()
+	}
+
 	// SQL_SAFE_UPDATES: reject UPDATE without WHERE using a KEY column (unless LIMIT present).
 	if err := e.checkSafeUpdate(tbl.Def, func() sqlparser.Expr {
 		if stmt.Where != nil {
@@ -429,7 +438,12 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		}
 		if len(lockIndices) > 0 {
 			tbl.Unlock() // release table lock while waiting for row locks
-			err := e.acquireRowLocksForRows(updateDB, tableName, tbl.Def, tbl.Rows, lockIndices)
+			var err error
+			if e.isHighPriority && e.highPrioTxn != nil {
+				err = e.acquireRowLocksForRowsHighPrio(updateDB, tableName, tbl.Def, tbl.Rows, lockIndices)
+			} else {
+				err = e.acquireRowLocksForRows(updateDB, tableName, tbl.Def, tbl.Rows, lockIndices)
+			}
 			tbl.Lock() // re-acquire table lock
 			if err != nil {
 				return nil, err

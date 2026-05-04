@@ -747,6 +747,22 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					// Fall through to the normal setSysVar path (validates and stores the value).
 					// The restoration happens in execCommit/execRollback via prevSessionIsolation.
 				}
+				// Handle SET [GLOBAL] DEBUG = '+d,flag' / '-d,flag' for high-priority transaction support.
+				// This implements the MySQL debug facility used by start_transaction_high_prio.inc.
+				if cleanName == "debug" && e.highPrioTxn != nil {
+					debugVal := val
+					if evalVal, evalErr := e.evalExpr(expr.Expr); evalErr == nil && evalVal != nil {
+						debugVal = fmt.Sprintf("%v", evalVal)
+					}
+					e.highPrioTxn.SetDebugFlag(debugVal)
+					// Also store the value normally so it's retrievable.
+					e.sessionScopeVars[cleanName] = debugVal
+					if isGlobal {
+						e.setGlobalVar(cleanName, debugVal)
+					}
+					continue
+				}
+
 				// Enforce SUPER or SYSTEM_VARIABLES_ADMIN privilege for setting global variables.
 				// Non-privileged users get ER_SPECIFIC_ACCESS_DENIED_ERROR (1227).
 				if isGlobal {
@@ -2044,6 +2060,11 @@ var superOnlyGlobalVars = map[string]bool{
 var sysVarGlobalOnly = map[string]bool{
 	"automatic_sp_privileges":                 true,
 	"avoid_temporal_upgrade":                  true,
+	// version is a read-only, global-only variable (cannot be set per session).
+	// Adding it here ensures @@version falls back to globalScopeVars for consistency
+	// with @@GLOBAL.version and performance_schema.global_variables.
+	"version": true, "version_comment": true, "version_compile_machine": true,
+	"version_compile_os": true,
 	"relay_log_purge":                         true,
 	"stored_program_cache":                    true,
 	"slow_query_log":                          true,
@@ -4125,7 +4146,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"collation_connection":     "utf8mb4_0900_ai_ci",
 
 		// Server identity
-		"version":                 "8.4.0-mylite",
+		"version":                 "8.4.0-mylite-debug",
 		"version_comment":         "mylite",
 		"version_compile_machine": "x86_64",
 		"version_compile_os":      "Linux",

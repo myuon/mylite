@@ -700,6 +700,14 @@ type Executor struct {
 	// rows. Used so that SELECT * FROM (subquery) AS t WHERE ... can still resolve
 	// column names even when the subquery produces no rows.
 	emptyDerivedTableColOrder string
+
+	// highPrioTxn manages high-priority transaction state (SET GLOBAL DEBUG facility).
+	// Shared across all executor instances.
+	highPrioTxn *HighPrioTxnManager
+
+	// isHighPriority marks this session's current transaction as high-priority.
+	// Set when START TRANSACTION runs while dbug_set_high_prio_trx debug flag is active.
+	isHighPriority bool
 }
 
 // Warning represents a MySQL warning.
@@ -1234,6 +1242,11 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 			"general_log":                     "ON",
 			"slow_query_log":                  "ON",
 			"log_bin_trust_function_creators": "ON",
+			// version must be in globalScopeVars so that @@GLOBAL.version and
+			// performance_schema.global_variables both return the same value.
+			// Without this, getSysVarGlobal falls through to expr_eval.go's hardcoded
+			// "8.4.0-mylite" fallback, causing a mismatch with buildVariablesMapScoped.
+			"version": "8.4.0-mylite-debug",
 		},
 		globalVarsMu:     &sync.RWMutex{},
 		sessionScopeVars: make(map[string]string),
@@ -1248,6 +1261,7 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	e.lockManager = NewLockManager()
 	e.rowLockManager = NewRowLockManager()
 	e.txnActiveSet = NewTxnActiveSet()
+	e.highPrioTxn = NewHighPrioTxnManager()
 	e.tableLockManager = NewTableLockManager()
 	e.globalReadLock = NewGlobalReadLock()
 	e.instanceBackupLock = NewInstanceBackupLock()
@@ -1349,6 +1363,7 @@ func (e *Executor) Clone() *Executor {
 		knownUsersMu:            e.knownUsersMu,
 		grantStore:              e.grantStore,
 		viewStore:               e.viewStore,
+		highPrioTxn:             e.highPrioTxn,
 	}
 }
 
@@ -2083,6 +2098,24 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 
 	trimmed := strings.TrimSpace(query)
 	upper := strings.ToUpper(trimmed)
+
+	// If this connection's transaction was killed by a high-priority transaction,
+	// return ER_LOCK_DEADLOCK for any DML/DDL statement until the session is reset.
+	// COMMIT and ROLLBACK are handled separately in execCommit/execRollback.
+	if e.highPrioTxn != nil && e.highPrioTxn.IsKilled(e.connectionID) {
+		upperTrim := strings.TrimSpace(upper)
+		// Allow COMMIT (triggers ER_ERROR_DURING_COMMIT) and ROLLBACK (clears killed state)
+		isCommit := strings.HasPrefix(upperTrim, "COMMIT") ||
+			strings.HasPrefix(upperTrim, "ROLLBACK") ||
+			strings.HasPrefix(upperTrim, "SHOW") ||
+			strings.HasPrefix(upperTrim, "SELECT") ||
+			strings.HasPrefix(upperTrim, "SET") ||
+			strings.HasPrefix(upperTrim, "START TRANSACTION") ||
+			strings.HasPrefix(upperTrim, "BEGIN")
+		if !isCommit {
+			return nil, mysqlError(1213, "40001", "Deadlock found when trying to get lock; try restarting transaction")
+		}
+	}
 
 	// KILL [CONNECTION | QUERY] thread_id — unregister the target connection from
 	// the process list so that tests waiting on "COUNT(*) = 0 WHERE id = X" can

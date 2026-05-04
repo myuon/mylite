@@ -143,6 +143,19 @@ func (e *Executor) execBegin() (*Result, error) {
 	e.txnHasWrites = false
 	e.namedSavepoints = make(map[string]bool)
 	e.inTransaction = true
+
+	// Mark as high-priority if dbug_set_high_prio_trx debug flag is active.
+	e.isHighPriority = false
+	if e.highPrioTxn != nil && e.highPrioTxn.IsDebugFlagSet("dbug_set_high_prio_trx") {
+		e.isHighPriority = true
+		// Register this executor so high-priority preemption can undo our changes
+		// if we become a blocker in a future scenario.
+	}
+	// Register this executor for possible preemption by other high-priority transactions.
+	if e.highPrioTxn != nil {
+		e.highPrioTxn.RegisterExecutor(e.connectionID, e)
+	}
+
 	if e.txnActiveSet != nil {
 		iso, uq, fk := e.txnSessionMeta()
 		e.txnActiveSet.Begin(e.connectionID, iso, uq, fk)
@@ -237,6 +250,24 @@ func (e *Executor) execCommit() (*Result, error) {
 	if e.rowLockManager != nil {
 		e.rowLockManager.ReleaseRowLocks(e.connectionID)
 	}
+	// Check if this transaction was killed by a high-priority transaction.
+	// Return ER_ERROR_DURING_COMMIT (1180): "Got error 149 - 'Lock deadlock; Retry transaction' during COMMIT"
+	if e.highPrioTxn != nil && e.highPrioTxn.IsKilled(e.connectionID) {
+		e.highPrioTxn.ClearKilled(e.connectionID)
+		if e.highPrioTxn != nil {
+			e.highPrioTxn.UnregisterExecutor(e.connectionID)
+		}
+		e.inTransaction = false
+		e.savepoint = nil
+		e.txnUndoLog = nil
+		e.txnHasWrites = false
+		e.isHighPriority = false
+		if e.txnActiveSet != nil {
+			e.txnActiveSet.End(e.connectionID)
+		}
+		e.restoreNextTxnIsolation()
+		return nil, mysqlError(1180, "HY000", "Got error 149 - 'Lock deadlock; Retry transaction' during COMMIT")
+	}
 	if !e.inTransaction {
 		// End implicit autocommit=0 transaction tracking if present.
 		e.endImplicitTxnTracked()
@@ -266,6 +297,10 @@ func (e *Executor) execCommit() (*Result, error) {
 	e.savepoint = nil
 	e.txnUndoLog = nil
 	e.txnHasWrites = false
+	e.isHighPriority = false
+	if e.highPrioTxn != nil {
+		e.highPrioTxn.UnregisterExecutor(e.connectionID)
+	}
 	if e.txnActiveSet != nil {
 		e.txnActiveSet.End(e.connectionID)
 	}
@@ -360,6 +395,12 @@ func (e *Executor) execRollback() (*Result, error) {
 	if e.rowLockManager != nil {
 		e.rowLockManager.ReleaseRowLocks(e.connectionID)
 	}
+	// Clear any killed status and unregister executor on rollback.
+	if e.highPrioTxn != nil {
+		e.highPrioTxn.ClearKilled(e.connectionID)
+		e.highPrioTxn.UnregisterExecutor(e.connectionID)
+	}
+	e.isHighPriority = false
 	if !e.inTransaction {
 		// End implicit autocommit=0 transaction tracking if present.
 		e.endImplicitTxnTracked()
@@ -488,6 +529,21 @@ func (e *Executor) replayUndoLog(log []undoEntry) {
 		}
 		tbl.Unlock()
 	}
+}
+
+// replayUndoLogExternal undoes this executor's current transaction changes from another
+// connection's context (high-priority preemption). It clears the undo log and resets
+// the transaction state after replaying.
+func (e *Executor) replayUndoLogExternal() {
+	if len(e.txnUndoLog) == 0 {
+		return
+	}
+	e.replayUndoLog(e.txnUndoLog)
+	e.txnUndoLog = nil
+	e.txnHasWrites = false
+	// Note: we do NOT set e.inTransaction = false or call txnActiveSet.End()
+	// because the connection still thinks it's in a transaction.
+	// The connection will discover it was killed on its next COMMIT attempt.
 }
 
 // rowsEqualByMap checks if two storage rows have the same key-value pairs.

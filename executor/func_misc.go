@@ -48,7 +48,7 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 	case "database", "schema":
 		return e.CurrentDB, true, nil
 	case "version":
-		return "8.4.0-mylite", true, nil
+		return "8.4.0-mylite-debug", true, nil
 	case "ifnull", "nvl":
 		if len(v.Exprs) < 2 {
 			return nil, true, fmt.Errorf("IFNULL requires 2 arguments")

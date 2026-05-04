@@ -228,6 +228,14 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 	tbl.Lock()
 	defer tbl.Unlock()
 
+	// High-priority transaction: preempt all connections holding locks on this table
+	// BEFORE evaluating the WHERE clause, so undo logs are replayed first.
+	if e.isHighPriority && e.highPrioTxn != nil && e.rowLockManager != nil {
+		tbl.Unlock()
+		e.highPrioTxn.PreemptTableConflicts(deleteDB, tableName, e.connectionID, e.rowLockManager)
+		tbl.Lock()
+	}
+
 	// Validate WHERE clause column references against table columns.
 	// This catches unknown columns even when the table has no rows.
 	if stmt.Where != nil {
@@ -458,7 +466,12 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 				delIndices = append(delIndices, idx)
 			}
 			tbl.Unlock()
-			lockErr := e.acquireRowLocksForRows(deleteDB, tableName, def, tbl.Rows, delIndices)
+			var lockErr error
+			if e.isHighPriority && e.highPrioTxn != nil {
+				lockErr = e.acquireRowLocksForRowsHighPrio(deleteDB, tableName, def, tbl.Rows, delIndices)
+			} else {
+				lockErr = e.acquireRowLocksForRows(deleteDB, tableName, def, tbl.Rows, delIndices)
+			}
 			tbl.Lock()
 			if lockErr != nil {
 				return nil, lockErr
@@ -544,7 +557,12 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		}
 		if len(matchIndices) > 0 {
 			tbl.Unlock()
-			lockErr := e.acquireRowLocksForRows(deleteDB, tableName, tbl.Def, tbl.Rows, matchIndices)
+			var lockErr error
+			if e.isHighPriority && e.highPrioTxn != nil {
+				lockErr = e.acquireRowLocksForRowsHighPrio(deleteDB, tableName, tbl.Def, tbl.Rows, matchIndices)
+			} else {
+				lockErr = e.acquireRowLocksForRows(deleteDB, tableName, tbl.Def, tbl.Rows, matchIndices)
+			}
 			tbl.Lock()
 			if lockErr != nil {
 				return nil, lockErr

@@ -248,6 +248,27 @@ func (rlm *RowLockManager) SetDeadlockDetect(enabled bool) {
 	}
 }
 
+// GetBlockersByTablePrefix returns all connection IDs (other than selfConnID) that
+// hold row locks on keys with the given prefix. Used for high-priority preemption.
+func (rlm *RowLockManager) GetBlockersByTablePrefix(selfConnID int64, prefix string) []int64 {
+	rlm.mu.Lock()
+	defer rlm.mu.Unlock()
+	seen := make(map[int64]bool)
+	var blockers []int64
+	for key, entry := range rlm.locks {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		for ownerID := range entry.owners {
+			if ownerID != selfConnID && !seen[ownerID] {
+				seen[ownerID] = true
+				blockers = append(blockers, ownerID)
+			}
+		}
+	}
+	return blockers
+}
+
 // AcquireRowLock tries to acquire an exclusive lock on a row identified by key.
 // If the lock is held by another connection, it blocks until the lock is released
 // or the timeout expires. Returns nil on success, error on timeout.
@@ -258,6 +279,63 @@ func (rlm *RowLockManager) AcquireRowLock(connID int64, key string, timeoutSec f
 // AcquireSharedRowLock tries to acquire a shared lock on a row identified by key.
 // Shared locks are compatible with other shared locks but block on exclusive locks.
 func (rlm *RowLockManager) AcquireSharedRowLock(connID int64, key string, timeoutSec float64) error {
+	return rlm.acquireRowLockInner(connID, key, false, timeoutSec)
+}
+
+// AcquireRowLockHighPrio acquires an exclusive lock with high-priority preemption.
+// If the lock is held by another connection, it preempts that connection (rolls back
+// its transaction and releases its locks) instead of waiting. Returns nil on success.
+func (rlm *RowLockManager) AcquireRowLockHighPrio(connID int64, key string, timeoutSec float64, hptm *HighPrioTxnManager) error {
+	if hptm == nil {
+		return rlm.acquireRowLockInner(connID, key, true, timeoutSec)
+	}
+
+	// Find all blocker connections for this key and preempt them.
+	rlm.mu.Lock()
+	existing, exists := rlm.locks[key]
+	var blockers []int64
+	if exists {
+		for ownerID := range existing.owners {
+			if ownerID != connID {
+				blockers = append(blockers, ownerID)
+			}
+		}
+	}
+	rlm.mu.Unlock()
+
+	// Preempt each blocker (roll back their changes and release their locks).
+	for _, blockerID := range blockers {
+		hptm.PreemptConnection(blockerID, rlm)
+	}
+
+	// Now acquire the lock normally (should succeed immediately since blockers were released).
+	return rlm.acquireRowLockInner(connID, key, true, timeoutSec)
+}
+
+// AcquireSharedRowLockHighPrio acquires a shared lock with high-priority preemption.
+// If an exclusive lock is held by another connection, it preempts that connection.
+func (rlm *RowLockManager) AcquireSharedRowLockHighPrio(connID int64, key string, timeoutSec float64, hptm *HighPrioTxnManager) error {
+	if hptm == nil {
+		return rlm.acquireRowLockInner(connID, key, false, timeoutSec)
+	}
+
+	// Only need to preempt if there's an exclusive lock held by another connection.
+	rlm.mu.Lock()
+	existing, exists := rlm.locks[key]
+	var blockers []int64
+	if exists && existing.exclusive {
+		for ownerID := range existing.owners {
+			if ownerID != connID {
+				blockers = append(blockers, ownerID)
+			}
+		}
+	}
+	rlm.mu.Unlock()
+
+	for _, blockerID := range blockers {
+		hptm.PreemptConnection(blockerID, rlm)
+	}
+
 	return rlm.acquireRowLockInner(connID, key, false, timeoutSec)
 }
 
