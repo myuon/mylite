@@ -857,11 +857,18 @@ func (e *Executor) buildJoinedRowsFromJoinWithWhere(join *sqlparser.JoinTableExp
 	leftAlias, _, _ := extractTableAlias(join.LeftExpr)
 	rightAlias, _, _ := extractTableAlias(join.RightExpr)
 
-	// Classify WHERE predicates into left-only, right-only, and cross-table
+	// Classify WHERE predicates into left-only, right-only, and cross-table.
+	// Only push predicates to the right side for INNER JOINs (NormalJoinType/CrossJoinType).
+	// For LEFT/RIGHT outer joins, right-side predicates like "right.col IS NULL" implement
+	// anti-join patterns and must be evaluated AFTER the join, not before.
+	isOuterJoin := join.Join == sqlparser.LeftJoinType ||
+		join.Join == sqlparser.RightJoinType ||
+		join.Join == sqlparser.NaturalLeftJoinType ||
+		join.Join == sqlparser.NaturalRightJoinType
 	if where != nil {
 		leftPreds, rightPreds := classifyPredsForJoinSides(where, leftAlias, rightAlias)
 
-		// Pre-filter left rows
+		// Pre-filter left rows (safe for all join types including LEFT JOIN).
 		if len(leftPreds) > 0 {
 			filtered := make([]storage.Row, 0, len(leftRows)/2)
 			for _, row := range leftRows {
@@ -884,8 +891,9 @@ func (e *Executor) buildJoinedRowsFromJoinWithWhere(join *sqlparser.JoinTableExp
 			leftRows = filtered
 		}
 
-		// Pre-filter right rows
-		if len(rightPreds) > 0 {
+		// Pre-filter right rows only for inner joins.
+		// For outer joins, right-side WHERE predicates must be applied post-join.
+		if len(rightPreds) > 0 && !isOuterJoin {
 			filtered := make([]storage.Row, 0, len(rightRows)/2)
 			for _, row := range rightRows {
 				allMatch := true
@@ -2399,7 +2407,17 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 		defer restoreIA()
 	}
 
-	allRows, err := e.buildFromExpr(stmt.From[0])
+	var allRows []storage.Row
+	var err error
+	if stmt.Where != nil {
+		// Use WHERE-aware builder to push single-table predicates into the join
+		// before materializing. This dramatically reduces the join size when a
+		// WHERE condition filters one of the joined tables early (e.g. WHERE m.table_name='db'
+		// on an IS JOIN reduces one side from hundreds of rows to a handful).
+		allRows, err = e.buildFromExprWithWhere(stmt.From[0], stmt.Where)
+	} else {
+		allRows, err = e.buildFromExpr(stmt.From[0])
+	}
 	if err != nil {
 		return nil, err
 	}

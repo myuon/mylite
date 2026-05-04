@@ -236,6 +236,11 @@ func (e *Executor) execCreateTrigger(query string) (*Result, error) {
 		}
 	}
 
+	// Validate trigger body for disallowed statements (DDL, LOCK/UNLOCK TABLES, etc.)
+	if err := validateRoutineBody(bodyStatements, "trigger"); err != nil {
+		return nil, err
+	}
+
 	trigDef := &catalog.TriggerDef{
 		Name:   triggerName,
 		Timing: timing,
@@ -852,11 +857,6 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 	if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
 		return nil, mysqlError(1192, "HY000", "Can't execute the given command because you have active locked tables or an active transaction")
 	}
-	db, err := e.Catalog.GetDatabase(e.CurrentDB)
-	if err != nil {
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
-	}
-
 	// Parse: CREATE PROCEDURE name (params) [characteristics] BEGIN ... END
 	upper := strings.ToUpper(query)
 	rest := strings.TrimSpace(query[len("CREATE PROCEDURE "):])
@@ -869,15 +869,18 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 	procName := strings.TrimSpace(rest[:parenIdx])
 	procName = strings.Trim(procName, "`")
 
-	// Handle qualified name (schema.procedure) - use the specified database
+	// Determine target database: use qualified name if present, else CurrentDB.
+	// This must be done BEFORE the CurrentDB lookup so that qualified names like
+	// "CREATE PROCEDURE mysqltest2.p1()" work even when CurrentDB is empty.
+	dbName := e.CurrentDB
 	if dotIdx := strings.Index(procName, "."); dotIdx >= 0 {
-		qualDBName := strings.Trim(procName[:dotIdx], "`")
+		dbName = strings.Trim(procName[:dotIdx], "`")
 		procName = strings.Trim(procName[dotIdx+1:], "`")
-		targetDB, dbErr := e.Catalog.GetDatabase(qualDBName)
-		if dbErr != nil {
-			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", qualDBName))
-		}
-		db = targetDB
+	}
+
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
 	}
 
 	// MySQL enforces a 64-character limit on identifier names (error 1059).
@@ -1070,7 +1073,7 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 	}
 
 	// Validate routine body: cursor-for-non-SELECT (1064) and condition handler refs (1319).
-	if err := validateRoutineBody(bodyStmts); err != nil {
+	if err := validateRoutineBody(bodyStmts, "procedure"); err != nil {
 		return nil, err
 	}
 
@@ -1108,6 +1111,21 @@ func (e *Executor) execCreateProcedure(query string) (*Result, error) {
 					procComment = commentRest[1 : end+1]
 				}
 			}
+		}
+	}
+
+	// Validate comment length (max 65535 bytes per MySQL spec, ER_TOO_LONG_ROUTINE_COMMENT = 3995).
+	if len(procComment) > 65535 {
+		truncated := procComment
+		if len(truncated) > 64 {
+			truncated = truncated[:64]
+		}
+		return nil, mysqlError(3995, "HY000", fmt.Sprintf("Comment for routine '%s' is too long (max = 65535)", truncated))
+	}
+	// Validate comment charset (utf8/utf8mb3: no 4-byte sequences, ER_INVALID_CHARACTER_STRING 1300).
+	if cs, _ := e.getSysVar("character_set_client"); strings.ToLower(cs) == "utf8" || strings.ToLower(cs) == "utf8mb3" {
+		if err := validateUTF8StringForDDL(procComment); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1280,7 +1298,13 @@ func validateRoutineParamType(typeStr string) error {
 //   - Variable/condition after cursor/handler declaration (error 1337)
 //   - Cursor after handler declaration (error 1338)
 //   - DECLARE HANDLER FOR references to undeclared condition names (error 1319)
-func validateRoutineBody(bodyStmts []string) error {
+//   - DDL with implicit commit inside function/trigger (ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG = 1422)
+//   - LOCK/UNLOCK TABLES inside function/trigger (ER_SP_BADSTATEMENT = 1295)
+//   - DROP FUNCTION/PROCEDURE inside function/trigger (ER_SP_NO_DROP_SP = 1893)
+//   - Recursive CREATE TRIGGER/FUNCTION/PROCEDURE inside function/trigger (ER_SP_NO_RECURSIVE_CREATE = 1215)
+//
+// routineKind is "procedure", "function", or "trigger".
+func validateRoutineBody(bodyStmts []string, routineKind string) error {
 	// First pass: collect all declared names (for dup checks and FETCH INTO validation)
 	declaredVars := make(map[string]bool)
 	declaredConds := make(map[string]bool)
@@ -1423,6 +1447,102 @@ func validateRoutineBody(bodyStmts []string) error {
 			return mysqlError(1295, "0A000", "LOAD DATA is not allowed in stored procedures")
 		}
 
+		// Error ER_VIEW_SELECT_CLAUSE (1250): CREATE VIEW inside routine must not have SELECT INTO.
+		// In MySQL, a view's SELECT cannot contain INTO @var, INTO DUMPFILE, or INTO OUTFILE.
+		// Validate at CREATE ROUTINE time (not just at runtime).
+		if strings.HasPrefix(upper, "CREATE VIEW ") || strings.HasPrefix(upper, "CREATE OR REPLACE VIEW ") {
+			// Find the AS SELECT part
+			upperNoComment := upper
+			asSelectRe := regexp.MustCompile(`\bAS\s+SELECT\b`)
+			asLoc := asSelectRe.FindStringIndex(upperNoComment)
+			if asLoc != nil {
+				afterSelect := upperNoComment[asLoc[0]:]
+				// Check for SELECT INTO (without FROM)
+				// A SELECT with INTO @var, INTO DUMPFILE, INTO OUTFILE is invalid in a view.
+				intoRe := regexp.MustCompile(`\bINTO\s+(@|\bDUMPFILE\b|\bOUTFILE\b)`)
+				if intoRe.MatchString(afterSelect) {
+					return mysqlError(1250, "HY000", "The target table  of the SELECT is not updatable")
+				}
+			}
+		}
+
+		// For functions and triggers only: disallow DDL and other statements that
+		// cause implicit commit (ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG = 1422) or
+		// are simply not allowed (ER_SP_BADSTATEMENT = 1295).
+		//
+		// NOTE: TEMPORARY TABLE variants (CREATE TEMPORARY TABLE, DROP TEMPORARY TABLE)
+		// do NOT cause implicit commit and are explicitly allowed.
+		if routineKind == "function" || routineKind == "trigger" {
+			// ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG (1422): implicit-commit DDL
+			isTempTable := false
+			if strings.HasPrefix(upper, "CREATE TEMPORARY TABLE") ||
+				strings.HasPrefix(upper, "DROP TEMPORARY TABLE") {
+				isTempTable = true
+			}
+			if !isTempTable {
+				// DDL that causes implicit commit
+				implicitCommitPrefixes := []string{
+					"CREATE TABLE ", "CREATE TABLE\t",
+					"DROP TABLE ", "DROP TABLE\t",
+					"ALTER TABLE ", "ALTER TABLE\t",
+					"RENAME TABLE ", "RENAME TABLE\t",
+					"TRUNCATE TABLE ", "TRUNCATE\t", "TRUNCATE ",
+					"CREATE INDEX ", "CREATE INDEX\t",
+					"CREATE UNIQUE INDEX ", "CREATE UNIQUE INDEX\t",
+					"DROP INDEX ", "DROP INDEX\t",
+					"CREATE DATABASE ", "CREATE DATABASE\t",
+					"DROP DATABASE ", "DROP DATABASE\t",
+					"CREATE SCHEMA ", "CREATE SCHEMA\t",
+					"DROP SCHEMA ", "DROP SCHEMA\t",
+					"CREATE VIEW ", "CREATE VIEW\t",
+					"DROP VIEW ", "DROP VIEW\t",
+					"CREATE USER ", "CREATE USER\t",
+					"DROP USER ", "DROP USER\t",
+					"RENAME USER ", "RENAME USER\t",
+					"GRANT ", "GRANT\t",
+					"REVOKE ", "REVOKE\t",
+					"DROP TRIGGER ", "DROP TRIGGER\t",
+				}
+				for _, pfx := range implicitCommitPrefixes {
+					if strings.HasPrefix(upper, pfx) {
+						return mysqlError(1422, "HY000", "Explicit or implicit commit is not allowed in stored function or trigger.")
+					}
+				}
+			}
+			// ER_SP_BADSTATEMENT (1295): disallowed statements in functions/triggers
+			badStmtPrefixes := []string{
+				"LOCK TABLE ", "LOCK TABLE\t", "LOCK TABLES ", "LOCK TABLES\t",
+				"UNLOCK TABLES", "UNLOCK TABLE",
+				"ALTER VIEW ", "ALTER VIEW\t",
+			}
+			for _, pfx := range badStmtPrefixes {
+				if strings.HasPrefix(upper, pfx) {
+					return mysqlError(1295, "0A000", "Not allowed to use a stored procedure")
+				}
+			}
+			// ER_SP_NO_DROP_SP (1357): dropping a stored routine inside a function/trigger
+			dropSpPrefixes := []string{
+				"DROP FUNCTION ", "DROP FUNCTION\t",
+				"DROP PROCEDURE ", "DROP PROCEDURE\t",
+			}
+			for _, pfx := range dropSpPrefixes {
+				if strings.HasPrefix(upper, pfx) {
+					return mysqlError(1357, "HY000", "Can't drop or alter a FUNCTION/PROCEDURE from within another stored routine")
+				}
+			}
+			// ER_SP_NO_RECURSIVE_CREATE (1303): creating routines/triggers inside a function/trigger
+			recursiveCreatePrefixes := []string{
+				"CREATE TRIGGER ", "CREATE TRIGGER\t",
+				"CREATE FUNCTION ", "CREATE FUNCTION\t",
+				"CREATE PROCEDURE ", "CREATE PROCEDURE\t",
+			}
+			for _, pfx := range recursiveCreatePrefixes {
+				if strings.HasPrefix(upper, pfx) {
+					return mysqlError(1303, "2F003", "Can't create a stored routine from within another stored routine")
+				}
+			}
+		}
+
 		// Check OPEN/CLOSE/FETCH for undeclared cursor names (error 1324)
 		var opCursorName string
 		if strings.HasPrefix(upper, "OPEN ") {
@@ -1461,6 +1581,20 @@ func validateRoutineBody(bodyStmts []string) error {
 		}
 		if opCursorName != "" && !declaredCursors[opCursorName] {
 			return mysqlError(1324, "42000", fmt.Sprintf("Undefined CURSOR: %s", opCursorName))
+		}
+
+		// Error 1247 (ER_WRONG_COLUMN_NAME): DEFAULT(x) where x is a declared local variable.
+		// MySQL rejects DEFAULT() with an unqualified bare identifier that matches a declared
+		// local variable name. DEFAULT() is only valid for table column references.
+		// Qualified names like DEFAULT(tbl.col) are allowed; bare names matching locals are not.
+		if len(declaredVars) > 0 {
+			defaultArgRe := regexp.MustCompile(`(?i)\bDEFAULT\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)`)
+			for _, m := range defaultArgRe.FindAllStringSubmatch(stmt, -1) {
+				argName := strings.ToLower(m[1])
+				if declaredVars[argName] {
+					return mysqlError(1247, "42000", fmt.Sprintf("Incorrect column name '%s'", m[1]))
+				}
+			}
 		}
 
 		if !strings.HasPrefix(upper, "DECLARE") {
@@ -2795,10 +2929,6 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 	if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
 		return nil, mysqlError(1192, "HY000", "Can't execute the given command because you have active locked tables or an active transaction")
 	}
-	db, err := e.Catalog.GetDatabase(e.CurrentDB)
-	if err != nil {
-		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", e.CurrentDB))
-	}
 
 	rest := strings.TrimSpace(query[len("CREATE FUNCTION "):])
 
@@ -2810,14 +2940,15 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 	funcName := strings.TrimSpace(rest[:parenIdx])
 	funcName = strings.Trim(funcName, "`")
 
-	// Handle schema-qualified function names (e.g. test.f or `test`.`f`)
+	// Determine target database: use qualified name if present, else CurrentDB.
+	dbName := e.CurrentDB
 	if dotIdx := strings.Index(funcName, "."); dotIdx >= 0 {
-		schemaName := strings.Trim(funcName[:dotIdx], "`")
+		dbName = strings.Trim(funcName[:dotIdx], "`")
 		funcName = strings.Trim(funcName[dotIdx+1:], "`")
-		db, err = e.Catalog.GetDatabase(schemaName)
-		if err != nil {
-			return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", schemaName))
-		}
+	}
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
 	}
 
 	// Extract params between first '(' and matching ')'
@@ -2866,6 +2997,15 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 	if returnsIdx >= 0 {
 		afterReturns := strings.TrimSpace(afterParams[returnsIdx+len("RETURNS "):])
 		returnType = extractFuncReturnType(afterReturns)
+		// ER_NOT_SUPPORTED_YET (1235): RETURNS type BINARY is not supported.
+		// The BINARY keyword after the type name (as a collation specifier) is
+		// deprecated/unsupported. MySQL 8 rejects "RETURNS varchar(25) BINARY" at CREATE time.
+		// returnType includes "BINARY" when it's included in the type text.
+		rtUpper := strings.ToUpper(returnType)
+		// Match "typename BINARY" or "typename(n) BINARY" — BINARY at end of type
+		if regexp.MustCompile(`\bBINARY\s*$`).MatchString(rtUpper) {
+			return nil, mysqlError(1235, "42000", "This version of MySQL doesn't yet support 'feature x'")
+		}
 	}
 
 	// Parse characteristics (DETERMINISTIC, SQL SECURITY, COMMENT, etc.) from afterParams.
@@ -2902,6 +3042,21 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 					routineComment = commentRest[1 : end+1]
 				}
 			}
+		}
+	}
+
+	// Validate comment length (max 65535 bytes per MySQL spec, ER_TOO_LONG_ROUTINE_COMMENT = 3995).
+	if len(routineComment) > 65535 {
+		truncated := routineComment
+		if len(truncated) > 64 {
+			truncated = truncated[:64]
+		}
+		return nil, mysqlError(3995, "HY000", fmt.Sprintf("Comment for routine '%s' is too long (max = 65535)", truncated))
+	}
+	// Validate comment charset (utf8/utf8mb3: no 4-byte sequences, ER_INVALID_CHARACTER_STRING 1300).
+	if cs, _ := e.getSysVar("character_set_client"); strings.ToLower(cs) == "utf8" || strings.ToLower(cs) == "utf8mb3" {
+		if err := validateUTF8StringForDDL(routineComment); err != nil {
+			return nil, err
 		}
 	}
 
@@ -2957,7 +3112,7 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 	}
 
 	// Validate routine body: cursor-for-non-SELECT (1064) and condition handler refs (1319).
-	if err := validateRoutineBody(bodyStmts); err != nil {
+	if err := validateRoutineBody(bodyStmts, "function"); err != nil {
 		return nil, err
 	}
 
