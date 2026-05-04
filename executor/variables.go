@@ -232,7 +232,15 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				delete(e.sessionScopeVars, "character_set_client")
 				delete(e.sessionScopeVars, "character_set_connection")
 				delete(e.sessionScopeVars, "character_set_results")
-				delete(e.sessionScopeVars, "collation_connection")
+				// For SET NAMES DEFAULT, we need to check if default_collation_for_utf8mb4
+				// overrides the default utf8mb4 collation for collation_connection.
+				// The default charset for SET NAMES DEFAULT is utf8mb4.
+				if dcfu := e.getDefaultCollationForCharset("utf8mb4"); dcfu != "utf8mb4_0900_ai_ci" {
+					// Override: use default_collation_for_utf8mb4 instead of compiled default
+					e.sessionScopeVars["collation_connection"] = dcfu
+				} else {
+					delete(e.sessionScopeVars, "collation_connection")
+				}
 			} else if charset != "binary" && !isKnownCharset(charset) {
 				return nil, mysqlError(1115, "42000", fmt.Sprintf("Unknown character set: '%s'", charset))
 			} else if isNonClientCharset(charset) {
@@ -244,8 +252,16 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				e.sessionScopeVars["character_set_results"] = charset
 				// Also set collation_connection to the default collation for this charset.
 				// MySQL's SET NAMES also updates collation_connection.
-				if defColl := catalog.DefaultCollationForCharset(charset); defColl != "" {
+				// For utf8mb4, respect the current default_collation_for_utf8mb4 setting.
+				if defColl := e.getDefaultCollationForCharset(charset); defColl != "" {
 					e.sessionScopeVars["collation_connection"] = defColl
+				}
+				// If SET NAMES had an explicit COLLATE clause (e.g. SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci),
+				// override collation_connection with the explicit collation.
+				// The vitess parser drops the COLLATE clause, so it was saved in pendingNamesCollation.
+				if e.pendingNamesCollation != "" {
+					e.sessionScopeVars["collation_connection"] = e.pendingNamesCollation
+					e.pendingNamesCollation = ""
 				}
 			}
 		case "charset":

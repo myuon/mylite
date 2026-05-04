@@ -450,7 +450,7 @@ func (e *Executor) execCreateDatabase(stmt *sqlparser.CreateDatabase) (*Result, 
 	// - When charset came from character_set_server: use collation_server (preserving server defaults).
 	if collation == "" {
 		if explicitCharset && charset != "" {
-			collation = catalog.DefaultCollationForCharset(charset)
+			collation = e.getDefaultCollationForCharset(charset)
 		}
 		if collation == "" {
 			if collVal, ok := e.getSysVarSession("collation_server"); ok && collVal != "" {
@@ -529,7 +529,7 @@ func (e *Executor) execAlterDatabase(stmt *sqlparser.AlterDatabase) (*Result, er
 			}
 			db.CharacterSet = csVal
 			// Update collation to default for the new charset
-			db.CollationName = catalog.DefaultCollationForCharset(csVal)
+			db.CollationName = e.getDefaultCollationForCharset(csVal)
 		case sqlparser.CollateType:
 			collVal := strings.ToLower(strings.Trim(opt.Value, "'\""))
 			if !isKnownCollation(collVal) {
@@ -718,7 +718,7 @@ func (e *Executor) execAlterDatabaseRaw(query string) (*Result, error) {
 		if len(csFields) > 0 {
 			charset := strings.ToLower(csFields[0])
 			db.CharacterSet = charset
-			db.CollationName = catalog.DefaultCollationForCharset(charset)
+			db.CollationName = e.getDefaultCollationForCharset(charset)
 		}
 	}
 	// Extract COLLATE
@@ -1355,7 +1355,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			csLower := strings.ToLower(col.Type.Charset.Name)
 			if csLower != "binary" {
 				colDef.Charset = csLower
-				colDef.Collation = catalog.DefaultCollationForCharset(colDef.Charset)
+				colDef.Collation = e.getDefaultCollationForCharset(colDef.Charset)
 				colDef.CharsetExplicit = true // user explicitly wrote CHARACTER SET
 			}
 		} else if col.Type.Charset.Binary {
@@ -1403,8 +1403,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			colDef.Collation = collLower
 			// If no charset was set explicitly, derive it from the collation.
 			// Only set charset for character types; numeric/temporal types don't carry charset.
+			// When charset is derived from an explicit COLLATE clause, treat it as explicit
+			// so that SHOW CREATE TABLE always shows CHARACTER SET + COLLATE (MySQL behavior).
 			if colDef.Charset == "" && columnTypeSupportsCharset(colDef.Type) {
 				colDef.Charset = collCharset
+				colDef.CharsetExplicit = true // charset derived from explicit COLLATE clause
 			}
 		}
 		if tUpper := strings.ToUpper(strings.TrimSpace(colDef.Type)); strings.HasPrefix(tUpper, "BIT(") {
@@ -2324,9 +2327,9 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	}
 	// If charset was set but collation was not, always derive collation for that charset.
 	if charsetSpecified && !collationSpecified {
-		def.Collation = catalog.DefaultCollationForCharset(def.Charset)
+		def.Collation = e.getDefaultCollationForCharset(def.Charset)
 	} else if def.Charset != "" && def.Collation == "" {
-		def.Collation = catalog.DefaultCollationForCharset(def.Charset)
+		def.Collation = e.getDefaultCollationForCharset(def.Charset)
 	}
 
 	// Validate maximum row size (ER_TOO_BIG_ROWSIZE = 1118).
@@ -3849,6 +3852,7 @@ func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 		if colDef.Charset == "" {
 			if collCharset, ok := catalog.CharsetForCollation(collLower); ok {
 				colDef.Charset = collCharset
+				colDef.CharsetExplicit = true // charset derived from explicit COLLATE clause
 			}
 		}
 	}
@@ -4589,6 +4593,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					}
 				}
 				colDef := columnDefFromAST(col)
+				e.applyDefaultCollationToColDef(&colDef)
 				// Extract and validate SRID constraint for ADD COLUMN.
 				if sridErr := e.alterApplySRID(col, &colDef); sridErr != nil {
 					return nil, sridErr
@@ -4876,6 +4881,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 		case *sqlparser.ModifyColumn:
 			colDef := columnDefFromAST(op.NewColDefinition)
+			e.applyDefaultCollationToColDef(&colDef)
 			// MODIFY COLUMN cannot make a primary-key column explicitly nullable.
 			// Only reject when NULL was explicitly written in the definition; if
 			// the user omitted it, MySQL silently keeps the column NOT NULL.
@@ -5073,6 +5079,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		case *sqlparser.ChangeColumn:
 			oldName := op.OldColumn.Name.String()
 			colDef := columnDefFromAST(op.NewColDefinition)
+			e.applyDefaultCollationToColDef(&colDef)
 			// CHANGE COLUMN cannot make a primary-key column explicitly nullable.
 			// Only reject when NULL was explicitly written in the definition; if
 			// the user omitted it, MySQL silently keeps the column NOT NULL.
@@ -5926,7 +5933,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 						}
 						tableDef.Charset = newCharset
 						// Reset collation to default for the new charset (may be overridden by COLLATE option).
-						tableDef.Collation = catalog.DefaultCollationForCharset(newCharset)
+						tableDef.Collation = e.getDefaultCollationForCharset(newCharset)
 					}
 				case "COLLATE":
 					// ALTER TABLE ... COLLATE=newcoll

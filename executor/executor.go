@@ -469,6 +469,10 @@ type Executor struct {
 	// "SHOW CREATE DATABASE IF NOT EXISTS db", so that execShow can include the
 	// /*!32312 IF NOT EXISTS*/ comment in the Create Database column value.
 	showCreateDBIfNotExists bool
+	// pendingNamesCollation holds the explicit COLLATE clause from "SET NAMES charset COLLATE coll".
+	// The vitess parser drops the COLLATE clause, so preprocessQuery extracts it and stores
+	// it here. execSet then applies it to collation_connection after setting NAMES.
+	pendingNamesCollation string
 	// onDupValuesRow holds the candidate INSERT row while evaluating
 	// ON DUPLICATE KEY UPDATE expressions (for VALUES(col) support).
 	onDupValuesRow storage.Row
@@ -854,6 +858,32 @@ func (e *Executor) getSysVar(name string) (string, bool) {
 		return v, true
 	}
 	return "", false
+}
+
+// getDefaultCollationForCharset returns the default collation for a charset,
+// respecting the current session's default_collation_for_utf8mb4 setting.
+// For utf8mb4, if default_collation_for_utf8mb4 is set to utf8mb4_general_ci,
+// that value is returned instead of the compiled default utf8mb4_0900_ai_ci.
+func (e *Executor) getDefaultCollationForCharset(charset string) string {
+	defColl := catalog.DefaultCollationForCharset(charset)
+	if strings.ToLower(charset) == "utf8mb4" {
+		if dcfu, ok := e.getSysVar("default_collation_for_utf8mb4"); ok && dcfu != "" {
+			defColl = dcfu
+		}
+	}
+	return defColl
+}
+
+// applyDefaultCollationToColDef updates a ColumnDef's collation to respect the current
+// default_collation_for_utf8mb4 setting. This is needed for ALTER TABLE column operations
+// where columnDefFromAST (a standalone function) uses the catalog default directly.
+func (e *Executor) applyDefaultCollationToColDef(colDef *catalog.ColumnDef) {
+	if strings.ToLower(colDef.Charset) == "utf8mb4" && colDef.Collation != "" {
+		// Only override if the collation is the catalog default (i.e., not explicitly set by user)
+		if strings.EqualFold(colDef.Collation, catalog.DefaultCollationForCharset("utf8mb4")) {
+			colDef.Collation = e.getDefaultCollationForCharset("utf8mb4")
+		}
+	}
 }
 
 // getSysVarGlobal reads a global-scoped system variable.
