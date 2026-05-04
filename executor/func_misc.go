@@ -817,8 +817,8 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		result, err := e.evalAESDecrypt(v, row)
 		return result, true, err
 	case "uuid_to_bin":
-		if len(v.Exprs) == 0 {
-			return nil, true, nil
+		if len(v.Exprs) == 0 || len(v.Exprs) > 2 {
+			return nil, true, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'uuid_to_bin'")
 		}
 		utbVal, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {
@@ -861,8 +861,8 @@ func evalMiscFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		}
 		return string(decoded), true, nil
 	case "bin_to_uuid":
-		if len(v.Exprs) == 0 {
-			return nil, true, nil
+		if len(v.Exprs) == 0 || len(v.Exprs) > 2 {
+			return nil, true, mysqlError(1582, "42000", "Incorrect parameter count in the call to native function 'bin_to_uuid'")
 		}
 		btuVal, isNull, err := e.evalArg1Quiet(v.Exprs, row)
 		if err != nil {

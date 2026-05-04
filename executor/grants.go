@@ -581,6 +581,8 @@ func (gs *GrantStore) ListAllRoles() []UserHostEntry {
 // ListAllUserHosts returns all known user@host pairs in the grant store,
 // including users registered via CREATE USER and users with grant entries.
 // Roles (stored in gs.roles) are excluded.
+// Anonymous users (empty username) are also excluded because MySQL 8.0 does not
+// include anonymous users in mysql.user or other user enumeration contexts.
 func (gs *GrantStore) ListAllUserHosts() []UserHostEntry {
 	gs.mu.RLock()
 	defer gs.mu.RUnlock()
@@ -594,11 +596,21 @@ func (gs *GrantStore) ListAllUserHosts() []UserHostEntry {
 		if _, isRole := gs.roles[key]; isRole {
 			continue
 		}
+		// Skip anonymous users (empty username before '@')
+		atIdx := strings.LastIndex(key, "@")
+		if atIdx == 0 {
+			continue
+		}
 		seen[key] = true
 	}
 	// Include all users with grant entries
 	for key := range gs.entries {
 		if _, isRole := gs.roles[key]; isRole {
+			continue
+		}
+		// Skip anonymous users (empty username before '@')
+		atIdx := strings.LastIndex(key, "@")
+		if atIdx == 0 {
 			continue
 		}
 		seen[key] = true
