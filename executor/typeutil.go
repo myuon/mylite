@@ -741,11 +741,15 @@ func normalizeYearComparisonTyped(ls, rs string, origLeft, origRight interface{}
 	hasFractionalPart := func(f float64) bool {
 		return f != math.Trunc(f)
 	}
-	if isYearIntString(ls) && strings.ContainsRune(rs, '.') && hasFractionalPart(rf) {
+	// Only apply YEAR-rounding when the year-like side is an original string
+	// (i.e. came from a YEAR column). Native integer columns (TINYINT, INT, etc.)
+	// must NOT be rounded — e.g. TINYINT 0 vs 0.00001 should compare as 0 < 0.00001,
+	// not as the incorrectly rounded 0 == 0.
+	if isYearIntString(ls) && strings.ContainsRune(rs, '.') && hasFractionalPart(rf) && isOrigString(origLeft) {
 		rounded := int(math.Round(rf))
 		return ls, fmt.Sprintf("%d", rounded)
 	}
-	if isYearIntString(rs) && strings.ContainsRune(ls, '.') && hasFractionalPart(lf) {
+	if isYearIntString(rs) && strings.ContainsRune(ls, '.') && hasFractionalPart(lf) && isOrigString(origRight) {
 		rounded := int(math.Round(lf))
 		return fmt.Sprintf("%d", rounded), rs
 	}
