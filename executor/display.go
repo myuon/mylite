@@ -121,11 +121,11 @@ func normalizeSQLDisplayName(s string) string {
 // However, _utf8mb4 preserves any space that was in the original SQL query.
 func normalizeCharsetIntroducers(s string) string {
 	// Replace _utf8mb3 ' with _utf8' (sqlparser always adds space; MySQL shows no space)
-	s = strings.ReplaceAll(s, "_utf8mb3 '", "_utf8'")
-	s = strings.ReplaceAll(s, "_utf8mb3'", "_utf8'")
+	result := strings.ReplaceAll(s, "_utf8mb3 '", "_utf8'")
+	result = strings.ReplaceAll(result, "_utf8mb3'", "_utf8'")
 	// NOTE: Do NOT strip the space from "_utf8mb4 '" here.
 	// MySQL preserves the space in COLLATION(_utf8mb4 'a') column headers.
-	return s
+	return result
 }
 
 // stripCharsetIntroducerForColName strips charset introducers from an expression
@@ -135,7 +135,7 @@ func normalizeCharsetIntroducers(s string) string {
 // Examples: _utf8'abc' -> 'abc', n'abc' -> 'abc', _utf8mb4'abc' -> 'abc'
 func stripCharsetIntroducerForColName(s string) string {
 	// Handle national charset: n'...' or N'...'
-	if len(s) >= 3 && (s[0] == 'n' || s[0] == 'N') && s[1] == '\'' && s[len(s)-1] == '\'' {
+	if len(s) >= 3 && (s[0] == 'n' || s[0] == 'N') && s[1] == '\'' && isSimpleStringLiteral(s[1:]) {
 		return s[1:]
 	}
 	// Handle _charset'...' pattern (e.g. _utf8'abc', _latin1'hello')
@@ -156,7 +156,7 @@ func stripCharsetIntroducerForColName(s string) string {
 				break // space, operator, etc. → not a charset introducer
 			}
 		}
-		if quotePos > 0 && s[len(s)-1] == '\'' {
+		if quotePos > 0 && isSimpleStringLiteral(s[quotePos:]) {
 			isCharsetIntroducer = true
 		}
 		if isCharsetIntroducer {
