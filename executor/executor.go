@@ -2523,31 +2523,6 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			if e.tableLockManager != nil && e.tableLockManager.HasLocks(e.connectionID) {
 				return nil, mysqlError(1192, "HY000", "Can't execute the given command because you have active locked tables or an active transaction")
 			}
-			// Validate COMMENT if present: length (ER_TOO_LONG_ROUTINE_COMMENT=3995) and charset (ER_INVALID_CHARACTER_STRING=1300).
-			if commentIdx := strings.Index(upper, "COMMENT "); commentIdx >= 0 {
-				commentRest := strings.TrimSpace(trimmed[commentIdx+len("COMMENT "):])
-				if len(commentRest) > 0 && (commentRest[0] == '\'' || commentRest[0] == '"') {
-					q := commentRest[0]
-					end := strings.IndexByte(commentRest[1:], q)
-					if end >= 0 {
-						commentVal := commentRest[1 : end+1]
-						if len(commentVal) > 65535 {
-							truncated := commentVal
-							if len(truncated) > 64 {
-								truncated = truncated[:64]
-							}
-							return nil, mysqlError(3995, "HY000", fmt.Sprintf("Comment for routine '%s' is too long (max = 65535)", truncated))
-						}
-						// Validate charset (utf8/utf8mb3: no 4-byte sequences).
-						if cs, _ := e.getSysVar("character_set_client"); strings.ToLower(cs) == "utf8" || strings.ToLower(cs) == "utf8mb3" {
-							if err := validateUTF8StringForDDL(commentVal); err != nil {
-								return nil, err
-							}
-						}
-					}
-				}
-			}
-			return &Result{}, nil
 		}
 		// Track CREATE USER / DROP USER in knownUsers for SET PASSWORD FOR validation.
 		if strings.HasPrefix(upper, "CREATE USER") {
@@ -2721,6 +2696,8 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			strings.HasPrefix(upper, "RESIGNAL") ||
 			strings.HasPrefix(upper, "GET DIAGNOSTICS") ||
 			strings.HasPrefix(upper, "XA ") ||
+			strings.HasPrefix(upper, "ALTER PROCEDURE") ||
+			strings.HasPrefix(upper, "ALTER FUNCTION") ||
 			strings.HasPrefix(upper, "CHANGE ") ||
 			strings.HasPrefix(upper, "START ") ||
 			strings.HasPrefix(upper, "STOP ") ||

@@ -2661,6 +2661,10 @@
       "reason": "timeout in mtrrun"
     },
     {
+      "test": "other/sp-error",
+      "reason": "timeout in mtrrun"
+    },
+    {
       "test": "other/status",
       "reason": "timeout in mtrrun"
     },
@@ -2979,6 +2983,10 @@
     {
       "test": "other/sp",
       "reason": "test file is 9787 lines, takes >20s to run"
+    },
+    {
+      "test": "other/sp-vars",
+      "reason": "timeout in mtrrun"
     },
     {
       "test": "other/subquery_sj_none",
@@ -4287,10 +4295,6 @@
     {
       "test": "innodb_gis/rtree_purge",
       "reason": "spatial/rtree feature not implemented"
-    },
-    {
-      "test": "other/sp-vars",
-      "reason": "timeout in mtrrun"
     }
   ]
 }
