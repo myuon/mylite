@@ -1249,6 +1249,16 @@ func evalSpatialFunc(e *Executor, name string, exprs []sqlparser.Expr) (interfac
 				if geomStr == "" {
 					return nil, true, mysqlError(3516, "22023", "Invalid GIS data provided to function st_srid.")
 				}
+			} else if hb, ok := val.(HexBytes); ok {
+				// Hex literal (x'...'): decode hex digits to raw bytes, then validate as WKB
+				decoded, decErr := hex.DecodeString(string(hb))
+				if decErr != nil {
+					return nil, true, mysqlError(3516, "22023", "Invalid GIS data provided to function st_srid.")
+				}
+				geomStr = wkbToWKT(decoded)
+				if geomStr == "" {
+					return nil, true, mysqlError(3516, "22023", "Invalid GIS data provided to function st_srid.")
+				}
 			} else {
 				geomStr = toString(val)
 				if geomStr == "" {
