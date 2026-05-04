@@ -8256,6 +8256,9 @@ func (e *Executor) inferExprType(expr sqlparser.Expr) string {
 		case "inet6_aton":
 			// INET6_ATON returns varbinary(16)
 			return "varbinary(16)"
+		case "uuid_to_bin":
+			// UUID_TO_BIN returns varbinary(16)
+			return "varbinary(16)"
 		case "uuid_short":
 			// UUID_SHORT returns a 64-bit unsigned integer
 			return "bigint unsigned"
