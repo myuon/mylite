@@ -3101,7 +3101,7 @@ func implicitDefaultForType(colType string) interface{} {
 	base = strings.TrimSpace(base)
 
 	switch base {
-	case "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT", "BIT":
+	case "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT", "BIT", "BOOL", "BOOLEAN":
 		return int64(0)
 	case "FLOAT", "DOUBLE", "REAL":
 		return float64(0)
