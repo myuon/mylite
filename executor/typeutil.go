@@ -722,6 +722,33 @@ func normalizeYearComparisonTyped(ls, rs string, origLeft, origRight interface{}
 		li = convertSmallYear(li)
 		return fmt.Sprintf("%d", li), rs
 	}
+
+	// MySQL rounds float/decimal values when comparing with YEAR columns.
+	// e.g., YEAR_col = 1999.1 → compare as 1999, YEAR_col = 1998.9 → compare as 1999.
+	// This applies when one side is a YEAR-like 4-digit integer string (from column)
+	// and the other side is a decimal literal string with fractional part.
+	isYearIntString := func(s string) bool {
+		// Must be a pure integer string (no decimal point, no sign complications)
+		if strings.ContainsAny(s, ".eE") {
+			return false
+		}
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return false
+		}
+		return isYearLike(n)
+	}
+	hasFractionalPart := func(f float64) bool {
+		return f != math.Trunc(f)
+	}
+	if isYearIntString(ls) && strings.ContainsRune(rs, '.') && hasFractionalPart(rf) {
+		rounded := int(math.Round(rf))
+		return ls, fmt.Sprintf("%d", rounded)
+	}
+	if isYearIntString(rs) && strings.ContainsRune(ls, '.') && hasFractionalPart(lf) {
+		rounded := int(math.Round(lf))
+		return fmt.Sprintf("%d", rounded), rs
+	}
 	return ls, rs
 }
 
