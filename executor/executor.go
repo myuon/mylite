@@ -8593,7 +8593,7 @@ func (e *Executor) checkGrantPrivilege(privs, object string, isRoleGrant bool) e
 			}
 			if !e.grantStore.HasAdminOption(user, host, roleName, rh, activeRoles) {
 				// ER_SPECIFIC_ACCESS_DENIED_ERROR
-				return mysqlError(1227, "42000", fmt.Sprintf("Access denied; you need (at least one of) the WITH GRANT OPTION privilege(s) for this operation"))
+				return mysqlError(1227, "42000", "Access denied; you need (at least one of) the WITH ADMIN, ROLE_ADMIN, SUPER privilege(s) for this operation")
 			}
 		}
 		return nil
