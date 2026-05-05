@@ -954,8 +954,8 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		matchedRows++
 		if rowChanged {
 			affected++
-			// Record undo entry for transaction rollback.
-			if e.inTransaction {
+			// Record undo entry for transaction rollback (explicit or autocommit=0 implicit).
+			if e.inTransaction || e.isAutocommitOff() {
 				e.txnUndoLog = append(e.txnUndoLog, undoEntry{
 					op:       "UPDATE",
 					db:       updateDB,

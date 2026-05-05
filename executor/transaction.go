@@ -155,6 +155,18 @@ func (e *Executor) execBegin() (*Result, error) {
 	return &Result{}, nil
 }
 
+// isAutocommitOff returns true when the autocommit session variable is 0/OFF.
+// This is used to determine whether to record undo log entries for implicit
+// (autocommit=0) transactions so that ROLLBACK can undo them.
+func (e *Executor) isAutocommitOff() bool {
+	v, ok := e.getSysVar("autocommit")
+	if !ok {
+		return false
+	}
+	upper := strings.ToUpper(v)
+	return upper == "0" || upper == "OFF"
+}
+
 // ensureImplicitTxnTracked registers the current connection in TxnActiveSet when
 // autocommit=0 is active. MySQL treats autocommit=0 as starting an implicit
 // transaction on the first DML, so we need it to show in INNODB_TRX.
@@ -239,6 +251,8 @@ func (e *Executor) execCommit() (*Result, error) {
 	}
 	if !e.inTransaction {
 		// End implicit autocommit=0 transaction tracking if present.
+		// Discard any pending undo log (data is committed).
+		e.txnUndoLog = nil
 		e.endImplicitTxnTracked()
 		e.restoreNextTxnIsolation()
 		return &Result{}, nil
@@ -363,6 +377,12 @@ func (e *Executor) execRollback() (*Result, error) {
 		e.rowLockManager.ReleaseRowLocks(e.connectionID)
 	}
 	if !e.inTransaction {
+		// For autocommit=0 implicit transactions, apply any accumulated undo log.
+		if len(e.txnUndoLog) > 0 {
+			undoLog := e.txnUndoLog
+			e.txnUndoLog = nil
+			e.replayUndoLog(undoLog)
+		}
 		// End implicit autocommit=0 transaction tracking if present.
 		e.endImplicitTxnTracked()
 		e.restoreNextTxnIsolation()

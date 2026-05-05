@@ -486,8 +486,8 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 			}
 		}
 
-		// Record undo entries (in ascending original-index order) for transaction rollback.
-		if e.inTransaction && len(deleteSet) > 0 {
+		// Record undo entries (in ascending original-index order) for transaction rollback (explicit or autocommit=0 implicit).
+		if (e.inTransaction || e.isAutocommitOff()) && len(deleteSet) > 0 {
 			delIdxOrder := make([]int, 0, len(deleteSet))
 			for idx := range deleteSet {
 				delIdxOrder = append(delIdxOrder, idx)
@@ -638,8 +638,8 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		tbl.Rows = newRows
 		tbl.InvalidateIndexes()
 		affected++
-		// Record undo entry for transaction rollback.
-		if e.inTransaction && rowRemoved {
+		// Record undo entry for transaction rollback (explicit or autocommit=0 implicit).
+		if (e.inTransaction || e.isAutocommitOff()) && rowRemoved {
 			e.txnUndoLog = append(e.txnUndoLog, undoEntry{
 				op:       "DELETE",
 				db:       deleteDB,
