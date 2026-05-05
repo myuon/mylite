@@ -4479,6 +4479,29 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		}
 	}
 
+	// Pre-check: duplicate MODIFY/CHANGE operations targeting the same column are not allowed.
+	// MySQL returns ER_BAD_FIELD_ERROR (1054) "Unknown column 'X' in 't'" when the same column
+	// is listed in multiple MODIFY or CHANGE clauses in a single ALTER TABLE statement.
+	{
+		seenModifyCols := map[string]bool{}
+		for _, opt := range stmt.AlterOptions {
+			var targetColName string
+			switch op := opt.(type) {
+			case *sqlparser.ModifyColumn:
+				targetColName = strings.ToLower(op.NewColDefinition.Name.String())
+			case *sqlparser.ChangeColumn:
+				targetColName = strings.ToLower(op.OldColumn.Name.String())
+			}
+			if targetColName != "" {
+				if seenModifyCols[targetColName] {
+					return nil, mysqlError(1054, "42S22",
+						fmt.Sprintf("Unknown column '%s' in '%s'", targetColName, tableName))
+				}
+				seenModifyCols[targetColName] = true
+			}
+		}
+	}
+
 	// Pre-validate all ADD COLUMN operations: in strict mode with NO_ZERO_DATE, adding a NOT NULL
 	// date/datetime/timestamp column without a default to a non-empty table fails. We must check
 	// ALL AddColumns opcodes before processing any, so partial application doesn't occur.
@@ -4636,6 +4659,34 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			// Also update the in-memory row store to drop the column value.
 			for colName := range readdedCols {
 				tbl.DropColumn(colName)
+			}
+		}
+	}
+
+	// preModifyColDefs captures the existing column definitions for MODIFY/CHANGE targets
+	// BEFORE the main processing loop runs. This allows no-op detection in the affected-rows
+	// calculation after the loop: if a MODIFY/CHANGE results in the same definition, it's
+	// a no-op and affected rows should be 0 (InnoDB metadata-only change).
+	preModifyColDefs := map[string]catalog.ColumnDef{} // keyed by lowercased old column name
+	{
+		existTblDef, _ := db.GetTable(tableName)
+		if existTblDef != nil {
+			for _, opt := range stmt.AlterOptions {
+				var targetName string
+				switch op := opt.(type) {
+				case *sqlparser.ModifyColumn:
+					targetName = strings.ToLower(op.NewColDefinition.Name.String())
+				case *sqlparser.ChangeColumn:
+					targetName = strings.ToLower(op.OldColumn.Name.String())
+				}
+				if targetName != "" {
+					for _, col := range existTblDef.Columns {
+						if strings.EqualFold(col.Name, targetName) {
+							preModifyColDefs[targetName] = col
+							break
+						}
+					}
+				}
 			}
 		}
 	}
@@ -6456,8 +6507,30 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				// InnoDB: Regular column addition uses instant/inplace DDL (affected rows = 0)
 			}
 		case *sqlparser.ModifyColumn:
+			// Check if this is a no-op (column definition didn't actually change).
+			// If so, MySQL performs a metadata-only operation with affected rows = 0.
+			newColDef := columnDefFromAST(op.NewColDefinition)
+			e.applyDefaultCollationToColDef(&newColDef)
+			oldColName := strings.ToLower(op.NewColDefinition.Name.String())
+			if oldDef, ok := preModifyColDefs[oldColName]; ok {
+				if !isColumnDefChanged(oldDef, newColDef) {
+					// True no-op: type and nullability are the same
+					break
+				}
+			}
 			requiresRowRewrite = true
 		case *sqlparser.ChangeColumn:
+			// Check if this is a no-op (column definition and name didn't change).
+			newColDef := columnDefFromAST(op.NewColDefinition)
+			e.applyDefaultCollationToColDef(&newColDef)
+			oldColName := strings.ToLower(op.OldColumn.Name.String())
+			newColName := strings.ToLower(op.NewColDefinition.Name.String())
+			if oldDef, ok := preModifyColDefs[oldColName]; ok {
+				if strings.EqualFold(oldColName, newColName) && !isColumnDefChanged(oldDef, newColDef) {
+					// True no-op: same name, same type and nullability
+					break
+				}
+			}
 			requiresRowRewrite = true
 		case *sqlparser.AlterColumn:
 			// ALTER COLUMN SET DEFAULT doesn't require row rewrite
@@ -6479,7 +6552,9 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 	}
 	// When ALGORITHM=COPY is explicitly specified, MySQL rebuilds the table and reports
 	// all rows as affected regardless of the operation type.
-	if (requiresRowRewrite || isCopyAlgorithm) && tbl != nil {
+	// When ALGORITHM=INPLACE is specified, MySQL performs an in-place operation and
+	// reports affected rows = 0 regardless of the operation type (no table copy).
+	if (requiresRowRewrite && !alterIsInplace || isCopyAlgorithm) && tbl != nil {
 		alterAffected = uint64(len(tbl.Scan()))
 	}
 
@@ -6509,6 +6584,26 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 	}
 
 	return &Result{AffectedRows: alterAffected}, nil
+}
+
+// isColumnDefChanged returns true if the column definition has materially changed
+// in a way that requires a row rewrite. It compares the core properties that affect
+// data representation: type, nullable, and auto_increment. Other properties like
+// comments, defaults, etc. are metadata-only and don't require a row rewrite.
+func isColumnDefChanged(old, newDef catalog.ColumnDef) bool {
+	if !strings.EqualFold(old.Type, newDef.Type) {
+		return true
+	}
+	if old.Nullable != newDef.Nullable {
+		return true
+	}
+	if old.AutoIncrement != newDef.AutoIncrement {
+		return true
+	}
+	// Default changes are metadata-only in InnoDB (no row rewrite needed)
+	// Charset/collation changes may require row rewrite in real MySQL but for
+	// simplicity we treat them as no-ops in our affected-rows computation.
+	return false
 }
 
 // buildColumnTypeString builds a type string from a sqlparser.ColumnType,
