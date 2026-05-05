@@ -2773,14 +2773,6 @@
       "reason": "LOAD DATA not fully supported"
     },
     {
-      "test": "sys_vars/autocommit_func4",
-      "reason": "still failing"
-    },
-    {
-      "test": "sys_vars/autocommit_func5",
-      "reason": "still failing"
-    },
-    {
       "test": "sys_vars/completion_type_func",
       "reason": "still failing"
     },
