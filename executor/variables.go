@@ -963,6 +963,14 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", cleanName, rawVal))
 						}
 					}
+					// sql_slave_skip_counter (and its alias sql_replica_skip_counter) cannot
+					// be set when @@GLOBAL.GTID_MODE = ON.
+					if cleanName == "sql_slave_skip_counter" || cleanName == "sql_replica_skip_counter" {
+						gtidMode, _ := e.getGlobalVar("gtid_mode")
+						if strings.ToUpper(gtidMode) == "ON" {
+							return nil, mysqlError(1695, "HY000", "sql_slave_skip_counter can not be set when the server is running with @@GLOBAL.GTID_MODE = ON. Instead, for each transaction that you want to skip, generate an empty transaction with the same GTID as the transaction")
+						}
+					}
 					e.sessionScopeVars[cleanName] = clamped
 					// When max_join_size is set, update sql_big_selects accordingly.
 					// Non-default value -> sql_big_selects = OFF; default -> ON.
