@@ -486,6 +486,10 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		}
 		for _, upd := range stmt.Exprs {
 			colName := upd.Name.Name.String()
+			// Track whether the RHS is a 0xNN hex-number literal so that we can
+			// convert the evaluated integer to raw bytes when storing into a string
+			// or blob column (matching MySQL BINARY-typed hex literal semantics).
+			updExprIsHexNum := isHexNumLiteral(upd.Expr)
 			// MySQL evaluates SET clauses left-to-right; each clause sees
 			// values already updated by preceding clauses, so use newRow.
 			val, err := e.evalRowExpr(upd.Expr, newRow)
@@ -623,6 +627,22 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 									rawBytes, hasRawBytes = decoded, true
 									isHexLiteral = true
 								}
+							} else if updExprIsHexNum {
+								// 0xNN hex-number literal evaluated to int64/uint64;
+								// convert to raw bytes so UTF-8 validation applies.
+								// Only do this for utf8/utf8mb4 charsets; multi-byte charsets
+								// (utf32, ucs2, utf16) need the integer for code point conversion.
+								colCs := strings.ToLower(col.Charset)
+								if colCs == "" && tbl.Def != nil {
+									colCs = strings.ToLower(tbl.Def.Charset)
+								}
+								if colCs == "utf8" || colCs == "utf8mb4" || colCs == "utf8mb3" || colCs == "" {
+									if converted, ok := hexIntToBytes(val).(string); ok {
+										rawBytes, hasRawBytes = []byte(converted), true
+										isHexLiteral = true
+										val = converted
+									}
+								}
 							}
 							if hasRawBytes {
 								sv := string(rawBytes)
@@ -693,6 +713,8 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 											return nil, mysqlError(1300, "HY000", fmt.Sprintf("Incorrect string value: '%s' for column '%s' at row %d", formatBytesForWarning(sv), col.Name, i+1))
 										}
 										e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect string value: '%s' for column '%s' at row %d", formatBytesForWarning(sv), col.Name, i+1))
+										// Invalid UTF-8 byte sequence: MySQL stores empty string (non-strict mode).
+										val = ""
 									} else if colCsLower == "ascii" && !isValidAsciiString(sv) {
 										e.addWarning("Warning", 1300, fmt.Sprintf("Invalid ascii character string: '%s'", formatAsciiInvalidBytes(sv)))
 									}
