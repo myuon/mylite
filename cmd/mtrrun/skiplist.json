@@ -4093,10 +4093,6 @@
       "reason": "out of range value for geometry column"
     },
     {
-      "test": "sys_vars/init_connect_basic",
-      "reason": "failing"
-    },
-    {
       "test": "sys_vars/binlog_checksum_basic",
       "reason": "output mismatch"
     },

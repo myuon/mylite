@@ -171,6 +171,11 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			if sysVarStringType[cleanVarName] {
 				return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of 'NULL'", cleanVarName))
 			}
+			// init_connect accepts NULL and stores empty string (clears the init SQL)
+			if cleanVarName == "init_connect" {
+				e.setGlobalVar(cleanVarName, "")
+				continue
+			}
 		}
 		val := sqlparser.String(expr.Expr)
 		val = strings.Trim(val, "'\"")
@@ -2438,6 +2443,7 @@ var sysVarGlobalOnly = map[string]bool{
 	"lock_order_trace_missing_key":             true,
 	"lock_order_trace_missing_unlock":          true,
 	"init_slave":                               true,
+	"init_connect":                             true,
 	"master_info_repository":                   true,
 	"master_verify_checksum":                   true,
 	"max_binlog_cache_size":                    true,
@@ -2530,7 +2536,6 @@ var sysVarGlobalOnly = map[string]bool{
 	"log_statements_unsafe_for_binlog":         true,
 	"delay_key_write":                          true,
 	"ft_boolean_syntax":                        true,
-	"init_connect":                             true,
 	"innodb_log_file_size":                     true,
 	"innodb_log_files_in_group":                true,
 	"key_buffer_size":                          true,
@@ -2662,9 +2667,10 @@ var sysVarEnumSet = map[string]bool{
 	"binlog_transaction_dependency_tracking":   true,
 	"replica_exec_mode":                        true,
 	"replica_type_conversions":                 true,
-	// init_slave/init_replica are pure-string vars; ON should be stored as "ON" (not converted to 1)
-	"init_slave":   true,
-	"init_replica": true,
+	// init_slave/init_replica/init_connect are pure-string vars; ON should be stored as "ON" (not converted to 1)
+	"init_slave":    true,
+	"init_replica":  true,
+	"init_connect":  true,
 }
 
 // mysqlLocaleByID maps numeric locale IDs (0-110) to locale names in MySQL 8.4.
@@ -2769,9 +2775,10 @@ var sysVarAcceptIdentifier = map[string]bool{
 	"innodb_monitor_enable":    true,
 	"innodb_monitor_reset":     true,
 	"innodb_monitor_reset_all": true,
-	// init_slave/init_replica accept bare identifiers as string values (any string is valid)
+	// init_slave/init_replica/init_connect accept bare identifiers as string values (any string is valid)
 	"init_slave":   true,
 	"init_replica": true,
+	"init_connect": true,
 }
 
 // sysVarStringType contains system variables that are string types and reject NULL values.
@@ -2865,9 +2872,10 @@ var sysVarPureStringType = map[string]bool{
 	// SSL path variables: reject numeric literals with ER_WRONG_TYPE_FOR_VAR
 	"ssl_ca": true, "ssl_capath": true, "ssl_cert": true, "ssl_cipher": true,
 	"ssl_key": true, "ssl_crl": true, "ssl_crlpath": true,
-	// init_slave / init_replica: GLOBAL-only string variables that reject numeric literals/booleans
+	// init_slave / init_replica / init_connect: GLOBAL-only string variables that reject numeric literals/booleans
 	"init_slave":   true,
 	"init_replica": true,
+	"init_connect": true,
 }
 
 // checkIntVarType checks if the expression is a valid integer type for integer-range
