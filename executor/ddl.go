@@ -4304,9 +4304,11 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		isInplace := false
 		isInstant := false
 		hasStoredGcolAdd := false
-		hasNonAddOp := false   // any op other than ADD COLUMN (rejects INSTANT)
-		hasPKChange := false   // PK alteration (rejects INSTANT)
+		hasNonAddOp := false     // any op other than ADD COLUMN (rejects INSTANT)
+		hasPKChange := false     // PK alteration (rejects INSTANT)
 		hasFirstOrAfter := false // ADD COLUMN with FIRST/AFTER position (INSTANT requires last)
+		lockIsNone := false
+		hasAutoIncrAdd := false
 		for _, opt := range stmt.AlterOptions {
 			switch av := opt.(type) {
 			case sqlparser.AlgorithmValue:
@@ -4317,6 +4319,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				case "INSTANT":
 					isInstant = true
 					alterIsInstant = true
+				}
+			case *sqlparser.LockOption:
+				if av.Type == sqlparser.NoneType {
+					lockIsNone = true
 				}
 			case *sqlparser.AddColumns:
 				if av.First || av.After != nil {
@@ -4332,6 +4338,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					// ADD COLUMN that is itself a primary key inhibits INSTANT.
 					if col.Type.Options != nil && col.Type.Options.KeyOpt == sqlparser.ColKeyPrimary {
 						hasPKChange = true
+					}
+					// ADD COLUMN with AUTO_INCREMENT requires a lock (not compatible with LOCK=NONE).
+					if col.Type.Options != nil && col.Type.Options.Autoincrement {
+						hasAutoIncrAdd = true
 					}
 				}
 			case *sqlparser.DropColumn, *sqlparser.ModifyColumn, *sqlparser.ChangeColumn,
@@ -4350,6 +4360,11 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				}
 				hasNonAddOp = true
 			}
+		}
+		// LOCK=NONE is not allowed when adding an AUTO_INCREMENT column.
+		// MySQL error: ER_ALTER_OPERATION_NOT_SUPPORTED_REASON (1846)
+		if lockIsNone && hasAutoIncrAdd {
+			return nil, mysqlError(1846, "0A000", "LOCK=NONE is not supported. Reason: Adding an auto-increment column requires a lock. Try LOCK=SHARED.")
 		}
 		alterHasNonAddOp = hasNonAddOp
 		if isInplace && hasStoredGcolAdd {
@@ -4420,19 +4435,21 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		}
 	}
 
-	// Pre-check: AUTO_INCREMENT columns must have an accompanying index
+	// Pre-check: AUTO_INCREMENT columns must be the leftmost (first) column of a key.
+	// MySQL rule: an AUTO_INCREMENT column must be the first column in at least one index.
 	{
 		autoIncrCols := map[string]bool{}
-		indexedCols := map[string]bool{}
-		// Collect existing indexed columns
+		// firstKeyedCols: columns that are the leftmost column of some key/index.
+		firstKeyedCols := map[string]bool{}
+		// Collect existing first-keyed columns from table definition
 		tableDef, _ := db.GetTable(tableName)
 		if tableDef != nil {
-			for _, pk := range tableDef.PrimaryKey {
-				indexedCols[strings.ToLower(stripPrefixLengthFromCol(pk))] = true
+			if len(tableDef.PrimaryKey) > 0 {
+				firstKeyedCols[strings.ToLower(stripPrefixLengthFromCol(tableDef.PrimaryKey[0]))] = true
 			}
 			for _, idx := range tableDef.Indexes {
-				for _, c := range idx.Columns {
-					indexedCols[strings.ToLower(stripPrefixLengthFromCol(c))] = true
+				if len(idx.Columns) > 0 {
+					firstKeyedCols[strings.ToLower(stripPrefixLengthFromCol(idx.Columns[0]))] = true
 				}
 			}
 		}
@@ -4443,18 +4460,20 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					if col.Type.Options != nil && col.Type.Options.Autoincrement {
 						autoIncrCols[strings.ToLower(col.Name.String())] = true
 					}
+					// A column with KeyOpt (e.g. PRIMARY KEY, UNIQUE KEY) is its own first key.
 					if col.Type.Options != nil && col.Type.Options.KeyOpt != sqlparser.ColKeyNone {
-						indexedCols[strings.ToLower(col.Name.String())] = true
+						firstKeyedCols[strings.ToLower(col.Name.String())] = true
 					}
 				}
 			case *sqlparser.AddIndexDefinition:
-				for _, idxCol := range op.IndexDefinition.Columns {
-					indexedCols[strings.ToLower(idxCol.Column.String())] = true
+				// Only the first column of the index counts.
+				if len(op.IndexDefinition.Columns) > 0 {
+					firstKeyedCols[strings.ToLower(op.IndexDefinition.Columns[0].Column.String())] = true
 				}
 			}
 		}
 		for col := range autoIncrCols {
-			if !indexedCols[col] {
+			if !firstKeyedCols[col] {
 				return nil, mysqlError(1075, "42000", "Incorrect table definition; there can be only one auto column and it must be defined as a key")
 			}
 		}
@@ -4563,6 +4582,69 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			}
 		}
 	}
+
+	// Detect whether this ALTER TABLE has a "column replacement" pattern:
+	// ADD col X + DROP COLUMN X in the same statement. MySQL allows this (column re-definition).
+	// To handle it correctly we need DROP ops to run before ADD ops.
+	// Build a set of column names being re-added so the main loop can skip them.
+	readdedCols := map[string]bool{} // columns that are both ADDed and DROPped
+	preDroppedPK := false             // true if DROP PRIMARY KEY was pre-executed
+	{
+		addedColNames := map[string]bool{}
+		for _, opt := range stmt.AlterOptions {
+			if ac, ok := opt.(*sqlparser.AddColumns); ok {
+				for _, col := range ac.Columns {
+					addedColNames[strings.ToLower(col.Name.String())] = true
+				}
+			}
+		}
+		for _, opt := range stmt.AlterOptions {
+			if dc, ok := opt.(*sqlparser.DropColumn); ok {
+				colName := strings.ToLower(dc.Name.Name.String())
+				if addedColNames[colName] {
+					readdedCols[colName] = true
+				}
+			}
+		}
+	}
+	if len(readdedCols) > 0 {
+		// Column-replacement pattern detected. Pre-execute DropKey (PRIMARY KEY) first,
+		// then remove only the column definition (not indexes/PK references) for re-added cols.
+		// This allows: DROP PK → remove old col → ADD new col (with PK) → old indexes still valid.
+		// The main loop will skip these pre-executed ops to avoid double-execution.
+		for _, opt := range stmt.AlterOptions {
+			if dk, ok := opt.(*sqlparser.DropKey); ok && dk.Type == sqlparser.PrimaryKeyType {
+				// Execute DROP PRIMARY KEY now so PK metadata is cleared before column drop.
+				if td, tdErr := db.GetTable(tableName); tdErr == nil && td != nil && len(td.PrimaryKey) > 0 {
+					db.DropPrimaryKey(tableName)
+					preDroppedPK = true
+				}
+			}
+		}
+		// Remove only the column definition (not indexes or PK) for re-added columns.
+		// We do NOT call db.DropColumn here because that cascades index and PK removal.
+		// Instead directly remove the column from the table's column list so ADD COLUMN
+		// won't conflict, while indexes referencing that column remain valid for the new column.
+		if td, tdErr := db.GetTable(tableName); tdErr == nil && td != nil {
+			newCols := make([]catalog.ColumnDef, 0, len(td.Columns))
+			for _, c := range td.Columns {
+				if !readdedCols[strings.ToLower(c.Name)] {
+					newCols = append(newCols, c)
+				}
+			}
+			td.Columns = newCols
+			// Also update the in-memory row store to drop the column value.
+			for colName := range readdedCols {
+				tbl.DropColumn(colName)
+			}
+		}
+	}
+
+	// autoIncrOptionConsumedByPreFill is set to true when ADD COLUMN AUTO_INCREMENT
+	// pre-fills existing rows using the AUTO_INCREMENT=N table option. In that case,
+	// the main loop should skip the AUTO_INCREMENT option to avoid overwriting the
+	// correctly set counter.
+	autoIncrOptionConsumedByPreFill := false
 
 	for _, opt := range stmt.AlterOptions {
 		switch op := opt.(type) {
@@ -4871,11 +4953,59 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					}
 					tbl.Mu.Unlock()
 				} else if colDef.AutoIncrement {
-					// For AUTO_INCREMENT columns, fill existing rows with sequential values
+					// For AUTO_INCREMENT columns, fill existing rows with sequential values.
+					// If the same ALTER TABLE specifies AUTO_INCREMENT=N, pre-seed the counter
+					// so that existing rows get values aligned to auto_increment_increment/offset.
+					// Track that we pre-filled so the main loop skips the AUTO_INCREMENT option.
+					autoIncrOptionConsumedByPreFill = true
+					{
+						for _, sopt := range stmt.AlterOptions {
+							if tblOpts, ok := sopt.(sqlparser.TableOptions); ok {
+								for _, to := range tblOpts {
+									if strings.EqualFold(to.Name, "AUTO_INCREMENT") {
+										if val, err := strconv.ParseInt(to.Value.Val, 10, 64); err == nil && val > 0 {
+											tbl.AutoIncrement.Store(val - 1)
+										}
+									}
+								}
+							}
+						}
+					}
 					tbl.AddColumn(colDef.Name, nil)
 					tbl.Mu.Lock()
+					aiIncrement := int64(1)
+					aiOffset := int64(1)
+					if v, ok := e.getSysVar("auto_increment_increment"); ok {
+						if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+							aiIncrement = n
+						}
+					}
+					if v, ok := e.getSysVar("auto_increment_offset"); ok {
+						if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+							aiOffset = n
+						}
+					}
 					for i := range tbl.Rows {
-						autoVal := tbl.AutoIncrement.Add(1)
+						var autoVal int64
+						if aiIncrement > 1 || aiOffset != 1 {
+							cur := tbl.AutoIncrementValue()
+							nextAI := cur + 1
+							base := aiOffset
+							if nextAI > base {
+								rem := (nextAI - base) % aiIncrement
+								if rem != 0 {
+									nextAI = nextAI + (aiIncrement - rem)
+								}
+							} else {
+								nextAI = base
+							}
+							// Store the next-to-be-assigned aligned value so SHOW CREATE TABLE
+							// reports the correct "next AI" (current + increment, aligned).
+							tbl.AutoIncrement.Store(nextAI + aiIncrement - 1)
+							autoVal = nextAI
+						} else {
+							autoVal = tbl.AutoIncrement.Add(1)
+						}
 						tbl.Rows[i][colDef.Name] = autoVal
 					}
 					tbl.Mu.Unlock()
@@ -4903,6 +5033,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 		case *sqlparser.DropColumn:
 			colName := op.Name.Name.String()
+			// Skip if this column was already pre-dropped in the column-replacement pre-pass.
+			if readdedCols[strings.ToLower(colName)] {
+				break
+			}
 			if dropErr := db.DropColumn(tableName, colName); dropErr != nil {
 				// Translate "column doesn't exist" to MySQL error 1091:
 				// Can't DROP '<col>'; check that column/key exists
@@ -5873,6 +6007,11 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 
 		case *sqlparser.DropKey:
 			if op.Type == sqlparser.PrimaryKeyType {
+				// Skip if already pre-executed in the column-replacement pre-pass.
+				if preDroppedPK {
+					preDroppedPK = false // consume the flag
+					break
+				}
 				// Check that a primary key actually exists before dropping
 				if td, tdErr := db.GetTable(tableName); tdErr == nil && td != nil && len(td.PrimaryKey) == 0 {
 					return nil, mysqlError(1091, "42000", "Can't DROP 'PRIMARY'; check that column/key exists")
@@ -5908,6 +6047,12 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 						tableDef.Engine = tableOptionString(to)
 					}
 				case "AUTO_INCREMENT":
+					// Skip if already applied by ADD COLUMN AUTO_INCREMENT pre-fill.
+					if autoIncrOptionConsumedByPreFill {
+						autoIncrOptionConsumedByPreFill = false // consume flag
+						tbl.AIExplicitlySet = true
+						break
+					}
 					if val, err := strconv.ParseInt(to.Value.Val, 10, 64); err == nil {
 						// MySQL clamps ALTER TABLE ... AUTO_INCREMENT = N so it can
 						// never be reduced below the existing max(AI column) + 1.

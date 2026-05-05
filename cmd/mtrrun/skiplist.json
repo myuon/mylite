@@ -2737,10 +2737,6 @@
       "reason": "still failing"
     },
     {
-      "test": "innodb/innodb-alter-autoinc",
-      "reason": "still failing"
-    },
-    {
       "test": "sys_vars/default_table_encryption_basic",
       "reason": "output mismatch or execution error"
     },
