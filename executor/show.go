@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -2502,7 +2503,34 @@ func (e *Executor) showCreateTable(tableName string) (*Result, error) {
 	}
 	trailer := fmt.Sprintf(") ENGINE=%s", engineName)
 	if autoIncVal > 0 {
-		trailer += fmt.Sprintf(" AUTO_INCREMENT=%d", autoIncVal+1)
+		// Compute the next AUTO_INCREMENT value. With non-default auto_increment_increment,
+		// the displayed value is the next aligned value, not just counter+1.
+		nextAutoIncVal := autoIncVal + 1
+		aiIncrement := int64(1)
+		aiOffset := int64(1)
+		if v, ok := e.getSysVar("auto_increment_increment"); ok {
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 1 {
+				aiIncrement = n
+			}
+		}
+		if v, ok := e.getSysVar("auto_increment_offset"); ok {
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+				aiOffset = n
+			}
+		}
+		if aiIncrement > 1 {
+			// Align to the next value that satisfies (val - offset) % increment == 0.
+			base := aiOffset
+			if nextAutoIncVal > base {
+				rem := (nextAutoIncVal - base) % aiIncrement
+				if rem != 0 {
+					nextAutoIncVal = nextAutoIncVal + (aiIncrement - rem)
+				}
+			} else {
+				nextAutoIncVal = base
+			}
+		}
+		trailer += fmt.Sprintf(" AUTO_INCREMENT=%d", nextAutoIncVal)
 	}
 	charset := "utf8mb4"
 	collation := "utf8mb4_0900_ai_ci"
