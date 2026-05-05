@@ -3781,10 +3781,6 @@
       "reason": "result file has literal $var from eval echo behavior"
     },
     {
-      "test": "sys_vars/session_track_system_variables_basic",
-      "reason": "needs special session tracking behavior"
-    },
-    {
       "test": "sys_vars/binlog_row_event_max_size_basic",
       "reason": "needs persist support"
     },
