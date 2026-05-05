@@ -2421,10 +2421,6 @@
       "reason": "timeout - takes >20s"
     },
     {
-      "test": "innodb/innodb_64k",
-      "reason": "SHOW WARNINGS output mismatch for COMPRESSED tables"
-    },
-    {
       "test": "innodb/log_encrypt_3",
       "reason": "timeout"
     },
@@ -2825,19 +2821,7 @@
       "reason": "output mismatch or execution error"
     },
     {
-      "test": "sys_vars/sql_big_selects_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/sql_buffer_result_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/sql_mode_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/sql_select_limit_func",
       "reason": "output mismatch or execution error"
     },
     {
@@ -3187,10 +3171,6 @@
     {
       "test": "innodb/innodb_bug59641",
       "reason": "internally skipped by test itself"
-    },
-    {
-      "test": "innodb/innodb_rename_index",
-      "reason": "failures"
     },
     {
       "test": "innodb/innodb_misc1",
@@ -4273,8 +4253,24 @@
       "reason": "spatial/rtree feature not implemented"
     },
     {
+      "test": "innodb/innodb_rename_index",
+      "reason": "ERROR: ALTER TABLE RENAME INDEX with DROP INDEX"
+    },
+    {
       "test": "innodb/innodb-autoinc",
       "reason": "lock_mode=0 bulk reservation not yet implemented"
+    },
+    {
+      "test": "sys_vars/sql_big_selects_func",
+      "reason": "output mismatch or execution error"
+    },
+    {
+      "test": "sys_vars/sql_buffer_result_func",
+      "reason": "output mismatch or execution error"
+    },
+    {
+      "test": "sys_vars/sql_select_limit_func",
+      "reason": "output mismatch or execution error"
     }
   ]
 }
