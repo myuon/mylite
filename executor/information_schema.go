@@ -2096,18 +2096,22 @@ func (e *Executor) infoSchemaReferentialConstraints() []storage.Row {
 					}
 				}
 
-				deleteRule := "RESTRICT"
+				// MySQL reports NO ACTION (not RESTRICT) when no action is specified.
+				// RESTRICT and NO ACTION behave identically at runtime, but
+				// INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS distinguishes them:
+				// explicit RESTRICT → "RESTRICT", explicit NO ACTION or unspecified → "NO ACTION".
+				deleteRule := "NO ACTION"
 				if fk.OnDelete != "" {
 					deleteRule = strings.ToUpper(fk.OnDelete)
 					if deleteRule == "" {
-						deleteRule = "RESTRICT"
+						deleteRule = "NO ACTION"
 					}
 				}
-				updateRule := "RESTRICT"
+				updateRule := "NO ACTION"
 				if fk.OnUpdate != "" {
 					updateRule = strings.ToUpper(fk.OnUpdate)
 					if updateRule == "" {
-						updateRule = "RESTRICT"
+						updateRule = "NO ACTION"
 					}
 				}
 
