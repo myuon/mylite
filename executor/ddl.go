@@ -2347,13 +2347,26 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	}
 	// In InnoDB strict mode with page size > 16k, reject ROW_FORMAT=COMPRESSED
 	// and KEY_BLOCK_SIZE since they're not supported at larger page sizes.
-	if e.isInnoDBStrictMode() {
+	// In non-strict mode, warn and fall back to DYNAMIC.
+	{
 		pageSize := e.getInnoDBPageSize()
 		if pageSize > 16384 {
 			isCompressed := strings.EqualFold(def.RowFormat, "COMPRESSED")
 			hasKeyBlockSize := def.KeyBlockSize != nil && *def.KeyBlockSize > 0
 			if isCompressed || hasKeyBlockSize {
-				return nil, mysqlError(1031, "HY000", fmt.Sprintf("Table storage engine for '%s' doesn't have this option", tableName))
+				if e.isInnoDBStrictMode() {
+					e.addWarning("Warning", 1478, "InnoDB: Cannot create a COMPRESSED table when innodb_page_size > 16k.")
+					return nil, mysqlError(1031, "HY000", fmt.Sprintf("Table storage engine for '%s' doesn't have this option", tableName))
+				} else {
+					// Non-strict: succeed with warning, fall back to DYNAMIC
+					e.addWarning("Warning", 1478, "InnoDB: Cannot create a COMPRESSED table when innodb_page_size > 16k. Assuming ROW_FORMAT=DYNAMIC.")
+					def.RowFormat = "DYNAMIC"
+					def.EffectiveRowFormat = "DYNAMIC"
+					if def.KeyBlockSize != nil {
+						zero := 0
+						def.KeyBlockSize = &zero
+					}
+				}
 			}
 		}
 	}
@@ -4697,6 +4710,54 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 	// correctly set counter.
 	autoIncrOptionConsumedByPreFill := false
 
+	// Pre-scan: detect ROW_FORMAT=COMPRESSED or KEY_BLOCK_SIZE in table options.
+	// In InnoDB strict mode with page size > 16k, these must be rejected.
+	// In non-strict mode, fall back to DYNAMIC with a warning.
+	{
+		pageSize := e.getInnoDBPageSize()
+		if pageSize > 16384 {
+			var alterHasCompressed, alterHasKeyBlockSize bool
+			for _, opt := range stmt.AlterOptions {
+				if topts, ok := opt.(sqlparser.TableOptions); ok {
+					for _, to := range topts {
+						switch strings.ToUpper(to.Name) {
+						case "ROW_FORMAT":
+							if strings.EqualFold(tableOptionString(to), "COMPRESSED") {
+								alterHasCompressed = true
+							}
+						case "KEY_BLOCK_SIZE":
+							if v := parseTableOptionInt(to); v != nil && *v > 0 {
+								alterHasKeyBlockSize = true
+							}
+						}
+					}
+				}
+			}
+			if alterHasCompressed || alterHasKeyBlockSize {
+				if e.isInnoDBStrictMode() {
+					e.addWarning("Warning", 1478, "InnoDB: Cannot create a COMPRESSED table when innodb_page_size > 16k.")
+					if alterHasKeyBlockSize {
+						return nil, mysqlError(1478, "HY000", "Table storage engine 'InnoDB' does not support the create option 'KEY_BLOCK_SIZE'")
+					}
+					return nil, mysqlError(1478, "HY000", "Table storage engine 'InnoDB' does not support the create option 'ROW_TYPE'")
+				}
+				// Non-strict: add warning, but continue and let the options process.
+				// The ROW_FORMAT will be adjusted in the main loop case.
+				if alterHasCompressed {
+					e.addWarning("Warning", 1478, "InnoDB: Cannot create a COMPRESSED table when innodb_page_size > 16k. Assuming ROW_FORMAT=DYNAMIC.")
+				} else if alterHasKeyBlockSize {
+					// KEY_BLOCK_SIZE without COMPRESSED
+					existTD, _ := db.GetTable(tableName)
+					if existTD == nil || !strings.EqualFold(existTD.RowFormat, "COMPRESSED") {
+						e.addWarning("Warning", 1478, "InnoDB: ignoring KEY_BLOCK_SIZE=4 as ROW_FORMAT is not COMPRESSED.")
+					} else {
+						e.addWarning("Warning", 1478, "InnoDB: Cannot create a COMPRESSED table when innodb_page_size > 16k. Assuming ROW_FORMAT=DYNAMIC.")
+					}
+				}
+			}
+		}
+	}
+
 	for _, opt := range stmt.AlterOptions {
 		switch op := opt.(type) {
 
@@ -6130,8 +6191,13 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				case "ROW_FORMAT":
 					tableDef, _ := db.GetTable(tableName)
 					if tableDef != nil {
-						tableDef.RowFormat = strings.ToUpper(tableOptionString(to))
-						tableDef.EffectiveRowFormat = tableDef.RowFormat
+						rowFmt := strings.ToUpper(tableOptionString(to))
+						// In non-strict mode with page_size > 16k, COMPRESSED falls back to DYNAMIC
+						if rowFmt == "COMPRESSED" && e.getInnoDBPageSize() > 16384 && !e.isInnoDBStrictMode() {
+							rowFmt = "DYNAMIC"
+						}
+						tableDef.RowFormat = rowFmt
+						tableDef.EffectiveRowFormat = rowFmt
 					}
 				case "KEY_BLOCK_SIZE":
 					tableDef, _ := db.GetTable(tableName)
