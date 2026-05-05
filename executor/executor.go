@@ -7436,6 +7436,15 @@ func (e *Executor) estimateTableExprRows(tableExpr sqlparser.TableExpr) int {
 	case *sqlparser.JoinTableExpr:
 		left := e.estimateTableExprRows(t.LeftExpr)
 		right := e.estimateTableExprRows(t.RightExpr)
+		// When the join has an ON or USING condition, MySQL uses index lookups
+		// and examines at most max(left, right) rows, not the full product.
+		// For cross joins (no condition), the full product applies.
+		if t.Condition != nil && (t.Condition.On != nil || len(t.Condition.Using) > 0) {
+			if left < right {
+				return left
+			}
+			return right
+		}
 		return left * right
 	case *sqlparser.ParenTableExpr:
 		total := 1

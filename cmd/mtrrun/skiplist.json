@@ -4001,10 +4001,6 @@
       "reason": "MULTIPOINT inside GEOMETRYCOLLECTION not normalized; ST_ function names in errors; parameter count errors"
     },
     {
-      "test": "sys_vars/max_join_size_func",
-      "reason": "output mismatch"
-    },
-    {
       "test": "innodb/default_row_format_tablespace",
       "reason": "failures"
     },
@@ -4083,10 +4079,6 @@
     {
       "test": "sys_vars/log_error_suppression_list_basic",
       "reason": "complex validation logic needed"
-    },
-    {
-      "test": "sys_vars/sql_big_selects_func",
-      "reason": "execution error"
     },
     {
       "test": "sys_vars/sql_buffer_result_func",
