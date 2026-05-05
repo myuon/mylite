@@ -1728,8 +1728,23 @@ func (e *Executor) handleRawSet(raw string) error {
 		}
 		// If the value is an unquoted SQL reserved keyword, vitess rejected it for good reason.
 		// Propagate as syntax error, but only for non-enum variables (enum vars often use reserved words as values).
-		if !strings.HasPrefix(val, "'") && !strings.HasPrefix(val, "\"") && sqlReservedKeywords[strings.ToUpper(val)] && !sysVarEnumSet[varName] && !sysVarAcceptIdentifier[varName] {
-			return mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", val))
+		// For enum variables, also reject reserved keywords that are NOT valid enum values.
+		if !strings.HasPrefix(val, "'") && !strings.HasPrefix(val, "\"") && sqlReservedKeywords[strings.ToUpper(val)] && !sysVarAcceptIdentifier[varName] {
+			isValidForEnum := false
+			if sysVarEnumSet[varName] {
+				if enumMap, isEnum := sysVarEnumValues[varName]; isEnum {
+					upVal := strings.ToUpper(val)
+					if _, ok := enumMap[upVal]; ok {
+						isValidForEnum = true
+					}
+				} else {
+					// Enum set but no enum map: allow (legacy behavior)
+					isValidForEnum = true
+				}
+			}
+			if !isValidForEnum {
+				return mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", val))
+			}
 		}
 		val = strings.Trim(val, "'\"")
 		// Handle identity/last_insert_id special cases (type checking + update e.lastInsertID)
