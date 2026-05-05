@@ -3021,10 +3021,6 @@
       "reason": "engine does not support gtid_purged"
     },
     {
-      "test": "sys_vars/immediate_server_version_basic",
-      "reason": "engine returns wrong value for immediate_server_version max"
-    },
-    {
       "test": "sys_vars/original_server_version_basic",
       "reason": "engine returns wrong value for original_server_version max"
     },

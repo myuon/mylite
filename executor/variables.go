@@ -776,6 +776,33 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						}
 					}
 				}
+				// Enforce SUPER, SYSTEM_VARIABLES_ADMIN, or SESSION_VARIABLES_ADMIN privilege
+				// for session-only variables that require elevated access (e.g. immediate_server_version).
+				if !isGlobal && superOnlySessionVars[cleanName] {
+					cuStr := ""
+					if cu, ok := e.userVars["__current_user"]; ok {
+						if s, ok2 := cu.(string); ok2 {
+							cuStr = s
+						}
+					}
+					isNonRoot := cuStr != "" && !strings.EqualFold(cuStr, "root")
+					if isNonRoot {
+						hasPriv := false
+						if e.superUsersMu != nil {
+							e.superUsersMu.RLock()
+							hasPriv = e.superUsers[strings.ToLower(cuStr)]
+							e.superUsersMu.RUnlock()
+						}
+						if !hasPriv && e.sysVarsAdminUsersMu != nil {
+							e.sysVarsAdminUsersMu.RLock()
+							hasPriv = e.sysVarsAdminUsers[strings.ToLower(cuStr)]
+							e.sysVarsAdminUsersMu.RUnlock()
+						}
+						if !hasPriv {
+							return nil, mysqlError(1227, "42000", "Access denied; you need (at least one of) the SUPER, SYSTEM_VARIABLES_ADMIN or SESSION_VARIABLES_ADMIN privilege(s) for this operation")
+						}
+					}
+				}
 				// Save previous session value before SET GLOBAL overwrites it.
 				savedSessionVal := map[string]string{}
 				if isGlobal {
@@ -2039,6 +2066,14 @@ var sysVarNonPersistReadOnly = map[string]bool{
 var superOnlyGlobalVars = map[string]bool{
 	"read_only":       true,
 	"super_read_only": true,
+}
+
+// superOnlySessionVars lists session-only system variables that require SUPER,
+// SYSTEM_VARIABLES_ADMIN, or SESSION_VARIABLES_ADMIN privilege to set.
+// Non-privileged users get ER_SPECIFIC_ACCESS_DENIED_ERROR (1227).
+var superOnlySessionVars = map[string]bool{
+	"original_server_version":  true,
+	"immediate_server_version": true,
 }
 
 var sysVarGlobalOnly = map[string]bool{
@@ -3391,8 +3426,8 @@ var sysVarIntRange = map[string]intVarRange{
 	"rand_seed1":                {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
 	"rand_seed2":                {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
 	"original_commit_timestamp": {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
-	"original_server_version":   {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
-	"immediate_server_version":  {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"original_server_version":   {Min: 0, Max: 999999, IsUnsigned: true},
+	"immediate_server_version":  {Min: 0, Max: 999999, IsUnsigned: true},
 }
 
 func parseStrictIntegerAssignment(expr sqlparser.Expr, evalVal interface{}) (int64, uint64, bool, string, error) {
