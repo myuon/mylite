@@ -2805,10 +2805,6 @@
       "reason": "output mismatch or execution error"
     },
     {
-      "test": "sys_vars/transaction_allow_batching_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/updatable_views_with_limit_func",
       "reason": "output mismatch or execution error"
     },

@@ -3150,6 +3150,7 @@ var sysVarBoolean = map[string]bool{
 	"mysqlx_enable_hello_notice":   true,
 	"partial_revokes":              true,
 	"innodb_extend_and_initialize": true,
+	"transaction_allow_batching":   true,
 }
 
 func isBooleanVariable(name string) bool {
