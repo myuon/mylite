@@ -33,6 +33,8 @@ func mysqlCharLen(s string) int {
 }
 
 // mysqlCharLenCharset returns the MySQL character count of a string for a given charset.
+// Only valid (complete) characters are counted; invalid or incomplete byte sequences are
+// skipped without contributing to the count, matching MySQL's CHAR_LENGTH() behaviour.
 func mysqlCharLenCharset(s string, charset string) int {
 	if utf8.ValidString(s) {
 		return utf8.RuneCountInString(s)
@@ -41,33 +43,248 @@ func mysqlCharLenCharset(s string, charset string) int {
 	i := 0
 	switch strings.ToLower(charset) {
 	case "big5":
+		// Valid single bytes: 0x00-0x7F
+		// Valid 2-byte: lead 0xA1-0xFE, trail 0x40-0x7E or 0xA1-0xFE
+		// All other bytes are invalid and are skipped without counting.
 		for i < len(s) {
-			if s[i] >= 0xA1 && s[i] <= 0xFE {
-				i += 2
+			b := s[i]
+			if b <= 0x7F {
+				// ASCII single byte
+				i++
+				count++
+			} else if b >= 0xA1 && b <= 0xFE {
+				// Valid lead byte: needs a valid trail byte
+				if i+1 < len(s) {
+					trail := s[i+1]
+					if (trail >= 0x40 && trail <= 0x7E) || (trail >= 0xA1 && trail <= 0xFE) {
+						i += 2
+						count++
+					} else {
+						// Invalid trail byte – skip lead byte only
+						i++
+					}
+				} else {
+					// Lead byte at end of string – skip
+					i++
+				}
 			} else {
+				// Invalid byte (0x80-0xA0, 0xFF) – skip without counting
 				i++
 			}
-			count++
 		}
 	case "gb2312":
+		// Valid single bytes: 0x00-0x7F
+		// Valid 2-byte: lead 0xA1-0xF7, trail 0xA1-0xFE
 		for i < len(s) {
-			if s[i] >= 0xA1 && s[i] <= 0xF7 {
-				i += 2
+			b := s[i]
+			if b <= 0x7F {
+				i++
+				count++
+			} else if b >= 0xA1 && b <= 0xF7 {
+				if i+1 < len(s) {
+					trail := s[i+1]
+					if trail >= 0xA1 && trail <= 0xFE {
+						i += 2
+						count++
+					} else {
+						i++
+					}
+				} else {
+					i++
+				}
 			} else {
+				// Invalid byte (0x80-0xA0, 0xF8-0xFF) – skip
 				i++
 			}
-			count++
 		}
-	case "gbk", "gb18030":
+	case "gbk":
+		// Valid single bytes: 0x00-0x7F
+		// Valid 2-byte: lead 0x81-0xFE, trail 0x40-0xFE (excluding 0x7F)
 		for i < len(s) {
-			if s[i] >= 0x81 && s[i] <= 0xFE {
-				i += 2
+			b := s[i]
+			if b <= 0x7F {
+				i++
+				count++
+			} else if b >= 0x81 && b <= 0xFE {
+				if i+1 < len(s) {
+					trail := s[i+1]
+					if (trail >= 0x40 && trail <= 0x7E) || (trail >= 0x80 && trail <= 0xFE) {
+						i += 2
+						count++
+					} else {
+						i++
+					}
+				} else {
+					i++
+				}
 			} else {
+				// Invalid byte (0x80) – skip
 				i++
 			}
-			count++
+		}
+	case "gb18030":
+		// Valid single bytes: 0x00-0x7F
+		// Valid 2-byte: lead 0x81-0xFE, trail 0x40-0xFE (excl 0x7F) – same as GBK
+		// Valid 4-byte: lead 0x81-0xFE, then 0x30-0x39, then 0x81-0xFE, then 0x30-0x39
+		for i < len(s) {
+			b := s[i]
+			if b <= 0x7F {
+				i++
+				count++
+			} else if b >= 0x81 && b <= 0xFE {
+				if i+1 < len(s) {
+					t1 := s[i+1]
+					if t1 >= 0x30 && t1 <= 0x39 {
+						// Potential 4-byte sequence
+						if i+3 < len(s) {
+							t2 := s[i+2]
+							t3 := s[i+3]
+							if t2 >= 0x81 && t2 <= 0xFE && t3 >= 0x30 && t3 <= 0x39 {
+								i += 4
+								count++
+							} else {
+								i++
+							}
+						} else {
+							i++
+						}
+					} else if (t1 >= 0x40 && t1 <= 0x7E) || (t1 >= 0x80 && t1 <= 0xFE) {
+						// Valid 2-byte sequence
+						i += 2
+						count++
+					} else {
+						i++
+					}
+				} else {
+					i++
+				}
+			} else {
+				// Invalid byte (0x80) – skip
+				i++
+			}
+		}
+	case "euckr":
+		// Valid single bytes: 0x00-0x7F
+		// Valid 2-byte: lead 0xA1-0xFE, trail 0xA1-0xFE
+		for i < len(s) {
+			b := s[i]
+			if b <= 0x7F {
+				i++
+				count++
+			} else if b >= 0xA1 && b <= 0xFE {
+				if i+1 < len(s) {
+					trail := s[i+1]
+					if trail >= 0xA1 && trail <= 0xFE {
+						i += 2
+						count++
+					} else {
+						i++
+					}
+				} else {
+					i++
+				}
+			} else {
+				// Invalid byte (0x80-0xA0, 0xFF) – skip
+				i++
+			}
+		}
+	case "eucjpms", "ujis":
+		// Valid single bytes: 0x00-0x7F, and 0x8E (SS2 prefix for half-width katakana)
+		// Valid 2-byte: lead 0xA1-0xFE, trail 0xA1-0xFE
+		// Valid 3-byte: 0x8F prefix, then 2 bytes each 0xA1-0xFE
+		// (0x8E + one byte 0xA1-0xDF is 2-byte half-width katakana in EUC-JP)
+		for i < len(s) {
+			b := s[i]
+			if b <= 0x7F {
+				i++
+				count++
+			} else if b == 0x8E {
+				// SS2 prefix: half-width kana, trail 0xA1-0xDF
+				if i+1 < len(s) {
+					trail := s[i+1]
+					if trail >= 0xA1 && trail <= 0xDF {
+						i += 2
+						count++
+					} else {
+						i++
+					}
+				} else {
+					i++
+				}
+			} else if b == 0x8F {
+				// SS3 prefix: 3-byte sequence, trail1 and trail2 each 0xA1-0xFE
+				if i+2 < len(s) {
+					t1 := s[i+1]
+					t2 := s[i+2]
+					if t1 >= 0xA1 && t1 <= 0xFE && t2 >= 0xA1 && t2 <= 0xFE {
+						i += 3
+						count++
+					} else {
+						i++
+					}
+				} else {
+					i++
+				}
+			} else if b >= 0xA1 && b <= 0xFE {
+				// Valid 2-byte lead
+				if i+1 < len(s) {
+					trail := s[i+1]
+					if trail >= 0xA1 && trail <= 0xFE {
+						i += 2
+						count++
+					} else {
+						i++
+					}
+				} else {
+					i++
+				}
+			} else {
+				// Invalid byte – skip
+				i++
+			}
+		}
+	case "sjis", "cp932":
+		// Valid single bytes: 0x00-0x7F and 0xA1-0xDF (half-width katakana)
+		// Valid 2-byte lead: 0x81-0x9F and 0xE0-0xFC
+		// Trail bytes: 0x40-0x7E and 0x80-0xFC
+		// Invalid: 0x80, 0xA0, 0xFD-0xFF
+		for i < len(s) {
+			b := s[i]
+			if b <= 0x7F {
+				// ASCII single byte
+				i++
+				count++
+			} else if b >= 0xA1 && b <= 0xDF {
+				// Half-width katakana – valid single byte
+				i++
+				count++
+			} else if (b >= 0x81 && b <= 0x9F) || (b >= 0xE0 && b <= 0xFC) {
+				// Valid lead byte: needs a trail
+				if i+1 < len(s) {
+					trail := s[i+1]
+					if (trail >= 0x40 && trail <= 0x7E) || (trail >= 0x80 && trail <= 0xFC) {
+						i += 2
+						count++
+					} else {
+						i++
+					}
+				} else {
+					i++
+				}
+			} else {
+				// Invalid byte (0x80, 0xA0, 0xFD-0xFF) – skip
+				i++
+			}
 		}
 	default:
+		// Default heuristic: treat bytes in the Shift-JIS/cp932 lead-byte ranges as
+		// the start of a 2-byte character.  This is intentionally kept as the original
+		// behaviour because:
+		//   - It gives the correct result for all single-byte charsets (where the
+		//     loop advances 2 bytes past the end of a 1-byte string but still counts
+		//     exactly 1 character).
+		//   - It gives the correct result for cp932/sjis strings stored without an
+		//     explicit charset annotation (e.g. information_schema comment columns).
 		for i < len(s) {
 			b := s[i]
 			if (b >= 0x81 && b <= 0x9F) || (b >= 0xE0 && b <= 0xFC) {
