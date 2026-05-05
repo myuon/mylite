@@ -2411,8 +2411,9 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 							e.grantStore.AddRoleGrant(roleName, rh, toUser, toHost, adminOption)
 						}
 					}
-				} else if privs != "" && object != "" && toUser != "" {
+				} else if privs != "" && object != "" && (toUser != "" || toHost != "") {
 					// Handle multiple users: "GRANT privs ON obj TO u1, u2"
+					// Note: toUser may be "" for anonymous user (''@'host')
 					// Privilege check: non-root must have SUPER or WITH GRANT OPTION for the priv
 					grantUser, grantHost, grantActiveRoles := e.getCurrentUserAndRoles()
 					if grantUser != "" {
@@ -2690,7 +2691,7 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 				}
 				// REVOKE role FROM user — remove the role membership grant
 				e.grantStore.RevokeRoleGrant(fromUser, fromHost, privs)
-			} else if !isRoleRevoke && privs != "" && object != "" && fromUser != "" {
+			} else if !isRoleRevoke && privs != "" && object != "" && (fromUser != "" || fromHost != "") {
 				if strings.ToUpper(privs) == "ALL PRIVILEGES" && object == "*.*" {
 					// REVOKE ALL PRIVILEGES, GRANT OPTION FROM user — revoke everything
 					e.grantStore.RevokeAllPrivGrants(fromUser, fromHost)
