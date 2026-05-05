@@ -2097,8 +2097,9 @@ var superOnlyGlobalVars = map[string]bool{
 // SYSTEM_VARIABLES_ADMIN, or SESSION_VARIABLES_ADMIN privilege to set.
 // Non-privileged users get ER_SPECIFIC_ACCESS_DENIED_ERROR (1227).
 var superOnlySessionVars = map[string]bool{
-	"original_server_version":  true,
-	"immediate_server_version": true,
+	"original_server_version":    true,
+	"immediate_server_version":   true,
+	"original_commit_timestamp":  true,
 }
 
 var sysVarGlobalOnly = map[string]bool{
@@ -3451,7 +3452,7 @@ var sysVarIntRange = map[string]intVarRange{
 	"pseudo_thread_id":          {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
 	"rand_seed1":                {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
 	"rand_seed2":                {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
-	"original_commit_timestamp": {Min: 0, Max: 18446744073709551615, IsUnsigned: true},
+	"original_commit_timestamp": {Min: 0, Max: 36028797018963968, IsUnsigned: true},
 	"original_server_version":   {Min: 0, Max: 999999, IsUnsigned: true},
 	"immediate_server_version":  {Min: 0, Max: 999999, IsUnsigned: true},
 }
