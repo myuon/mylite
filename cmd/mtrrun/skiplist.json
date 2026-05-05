@@ -4223,10 +4223,6 @@
     {
       "test": "sys_vars/windowing_use_high_precision_basic",
       "reason": "float formatting and EXPLAIN output mismatch"
-    },
-    {
-      "test": "sys_vars/histogram_generation_max_mem_size_basic",
-      "reason": "needs user privilege checking"
     }
   ]
 }

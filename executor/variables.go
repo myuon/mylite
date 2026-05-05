@@ -2097,9 +2097,10 @@ var superOnlyGlobalVars = map[string]bool{
 // SYSTEM_VARIABLES_ADMIN, or SESSION_VARIABLES_ADMIN privilege to set.
 // Non-privileged users get ER_SPECIFIC_ACCESS_DENIED_ERROR (1227).
 var superOnlySessionVars = map[string]bool{
-	"original_server_version":    true,
-	"immediate_server_version":   true,
-	"original_commit_timestamp":  true,
+	"original_server_version":            true,
+	"immediate_server_version":           true,
+	"original_commit_timestamp":          true,
+	"histogram_generation_max_mem_size":  true,
 }
 
 var sysVarGlobalOnly = map[string]bool{
