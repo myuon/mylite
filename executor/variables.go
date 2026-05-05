@@ -1346,6 +1346,43 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						}
 					}
 					continue
+				} else if cleanName == "session_track_system_variables" {
+					// session_track_system_variables accepts NULL or a comma-separated list of
+					// variable names. NULL is stored as "\x00" sentinel to distinguish from "".
+					// Duplicate entries in the list are rejected with ER_DUP_LIST_ENTRY (1465).
+					evalVal, _ := e.evalExpr(expr.Expr)
+					if evalVal == nil {
+						// SET … = NULL → use sentinel to represent NULL.
+						e.sessionScopeVars[cleanName] = "\x00"
+					} else {
+						stsvVal := strings.TrimSpace(toString(evalVal))
+						// Validate no duplicate entries in the comma-separated list.
+						if stsvVal != "" {
+							entries := strings.Split(stsvVal, ",")
+							seen := make(map[string]bool, len(entries))
+							for _, entry := range entries {
+								trimmed := strings.TrimSpace(entry)
+								lower := strings.ToLower(trimmed)
+								if seen[lower] {
+									return nil, mysqlError(1465, "HY000", fmt.Sprintf("Duplicate entry '%s'.", trimmed))
+								}
+								seen[lower] = true
+							}
+						}
+						e.sessionScopeVars[cleanName] = stsvVal
+					}
+					// Move to global if SET GLOBAL / SET PERSIST
+					if isGlobal {
+						if v, ok := e.sessionScopeVars[cleanName]; ok {
+							e.setGlobalVar(cleanName, v)
+						}
+						if prevVal, had := savedSessionVal[cleanName]; had {
+							e.sessionScopeVars[cleanName] = prevVal
+						} else {
+							delete(e.sessionScopeVars, cleanName)
+						}
+					}
+					continue
 				} else {
 					// Evaluate expression
 					evalVal, err := e.evalExpr(expr.Expr)
@@ -4146,7 +4183,8 @@ var sysVarNullableEmpty = map[string]bool{
 // These variables can hold both NULL and empty-string as distinct states, so a dedicated
 // sentinel is needed to distinguish NULL (not set / SET … = NULL) from "" (SET … = '').
 var sysVarNullSentinel = map[string]bool{
-	"innodb_redo_log_archive_dirs": true,
+	"innodb_redo_log_archive_dirs":    true,
+	"session_track_system_variables":  true,
 }
 
 // validateRedoLogArchiveDirs checks the format of innodb_redo_log_archive_dirs.
