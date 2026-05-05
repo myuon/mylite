@@ -2744,6 +2744,34 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	// Validate FK parent index before creating the table (when foreign_key_checks=1).
 	// This prevents the table from being created when the referenced parent table
 	// does not have the required index (ER_FK_NO_INDEX_PARENT = 1215).
+	// Also prevents creating tables that reference non-existent parent tables (ER_FK_CANNOT_OPEN_PARENT = 1824).
+	// Note: FK enforcement only applies to InnoDB (not MyISAM/MEMORY/etc.) per MySQL behavior.
+	if e.foreignKeyChecksEnabled() && strings.EqualFold(def.Engine, "INNODB") {
+		for _, constraint := range stmt.TableSpec.Constraints {
+			fkDef, ok := constraint.Details.(*sqlparser.ForeignKeyDefinition)
+			if !ok || fkDef.ReferenceDefinition == nil {
+				continue
+			}
+			refTable := fkDef.ReferenceDefinition.ReferencedTable
+			// Only validate same-database references (no qualifier = current db)
+			if !refTable.Qualifier.IsEmpty() {
+				continue
+			}
+			parentTableName := refTable.Name.String()
+			if parentTableName == "" {
+				continue
+			}
+			// Self-referential FK is always allowed during CREATE TABLE.
+			if strings.EqualFold(parentTableName, tableName) {
+				continue
+			}
+			// Check parent table exists in current database.
+			parentDef, _ := db.GetTable(parentTableName)
+			if parentDef == nil {
+				return nil, mysqlError(1824, "HY000", fmt.Sprintf("Failed to open the referenced table '%s'", parentTableName))
+			}
+		}
+	}
 	if e.foreignKeyChecksEnabled() {
 		for _, fk := range foreignKeys {
 			if fk.ReferencedTable != "" && len(fk.ReferencedColumns) > 0 {
@@ -6083,6 +6111,25 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				//  Missing index for constraint '...' in the foreign table '...'")
 				if err := e.validateFKChildIndex(db, tableName, fkName, fkCols); err != nil {
 					return nil, err
+				}
+				// When foreign_key_checks=1, validate that the parent (referenced) table
+				// exists in the current database (for same-db, non-self-referential InnoDB FK).
+				// Error 1824 (ER_FK_CANNOT_OPEN_PARENT): "Failed to open the referenced table 'X'"
+				if e.foreignKeyChecksEnabled() && fkDef.ReferenceDefinition != nil {
+					// Only enforce for InnoDB tables.
+					existingTD, _ := db.GetTable(tableName)
+					isInnoDB := existingTD != nil && strings.EqualFold(existingTD.Engine, "INNODB")
+					if isInnoDB {
+						refTable := fkDef.ReferenceDefinition.ReferencedTable
+						parentName := refTable.Name.String()
+						isSelfRef := strings.EqualFold(parentName, tableName)
+						if refTable.Qualifier.IsEmpty() && parentName != "" && !isSelfRef {
+							parentDef, _ := db.GetTable(parentName)
+							if parentDef == nil {
+								return nil, mysqlError(1824, "HY000", fmt.Sprintf("Failed to open the referenced table '%s'", parentName))
+							}
+						}
+					}
 				}
 				// Validate that the parent (referenced) table has an index covering the
 				// referenced columns. MySQL requires this even when foreign_key_checks=0.

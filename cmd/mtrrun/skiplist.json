@@ -2425,32 +2425,8 @@
       "reason": "timeout"
     },
     {
-      "test": "innodb/table_compress",
-      "reason": "CREATE TABLE LIKE cross-database issue"
-    },
-    {
       "test": "innodb/temp_table_savepoint",
       "reason": "stored procedure creates duplicate table"
-    },
-    {
-      "test": "innodb_fts/fic",
-      "reason": "output mismatch"
-    },
-    {
-      "test": "innodb_fts/subexpr",
-      "reason": "output mismatch"
-    },
-    {
-      "test": "innodb_fts/transaction",
-      "reason": "output mismatch"
-    },
-    {
-      "test": "innodb_fts/savepoint",
-      "reason": "output mismatch"
-    },
-    {
-      "test": "parts/partition_engine_innodb",
-      "reason": "output mismatch"
     },
     {
       "test": "other/big_packets_boundary",
@@ -2829,10 +2805,6 @@
       "reason": "output mismatch or execution error"
     },
     {
-      "test": "sys_vars/sql_warnings_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/table_encryption_privilege_check_basic",
       "reason": "output mismatch or execution error"
     },
@@ -3001,39 +2973,11 @@
       "reason": "collation sort order issue"
     },
     {
-      "test": "gis/st_x",
-      "reason": "failing"
-    },
-    {
       "test": "gis/st_y",
       "reason": "failing"
     },
     {
       "test": "gis/wkt",
-      "reason": "failing"
-    },
-    {
-      "test": "innodb_fts/ddl",
-      "reason": "failing"
-    },
-    {
-      "test": "innodb_fts/fulltext_var",
-      "reason": "failing"
-    },
-    {
-      "test": "innodb_fts/opt",
-      "reason": "failing"
-    },
-    {
-      "test": "innodb_fts/misc_1",
-      "reason": "failing"
-    },
-    {
-      "test": "auth_sec/anonymous_grants",
-      "reason": "failing"
-    },
-    {
-      "test": "auth_sec/mandatory_roles",
       "reason": "failing"
     },
     {
@@ -3078,10 +3022,6 @@
     },
     {
       "test": "sys_vars/binlog_checksum_basic",
-      "reason": "output mismatch"
-    },
-    {
-      "test": "sys_vars/insert_id_func",
       "reason": "output mismatch"
     },
     {
@@ -3167,18 +3107,6 @@
     {
       "test": "parts/part_exch_valid_range_innodb",
       "reason": "failures"
-    },
-    {
-      "test": "innodb/innodb_bug59641",
-      "reason": "internally skipped by test itself"
-    },
-    {
-      "test": "innodb/innodb_misc1",
-      "reason": "duplicate key with PAD SPACE collation"
-    },
-    {
-      "test": "innodb/innodb-alter",
-      "reason": "EXPLAIN output differences"
     },
     {
       "test": "innodb/innodb_lock_wait_timeout_1",
@@ -3281,10 +3209,6 @@
       "reason": "timeout"
     },
     {
-      "test": "innodb/innodb_bug21704",
-      "reason": "SHOW CREATE TABLE ordering issues"
-    },
-    {
       "test": "other/cast",
       "reason": "timeout"
     },
@@ -3333,10 +3257,6 @@
       "reason": "LOAD DATA with column list not supported"
     },
     {
-      "test": "innodb_fts/foreign_key_check",
-      "reason": "SHOW CREATE TABLE missing FOREIGN KEY clause"
-    },
-    {
       "test": "innodb_fts/misc",
       "reason": "fulltext proximity search not supported"
     },
@@ -3357,20 +3277,8 @@
       "reason": "SUBQUERY vs MATERIALIZED in EXPLAIN select_type"
     },
     {
-      "test": "innodb/instant_add_column_clear",
-      "reason": "duplicate key errors"
-    },
-    {
       "test": "innodb/innodb_bug42419",
       "reason": "timeout"
-    },
-    {
-      "test": "innodb/innodb_bug30919",
-      "reason": "failures"
-    },
-    {
-      "test": "json/json_table",
-      "reason": "failing"
     },
     {
       "test": "json/array_index",
@@ -3378,10 +3286,6 @@
     },
     {
       "test": "gcol/gcol_keys_myisam",
-      "reason": "output mismatch"
-    },
-    {
-      "test": "innodb_fts/basic",
       "reason": "output mismatch"
     },
     {
@@ -4253,10 +4157,6 @@
       "reason": "spatial/rtree feature not implemented"
     },
     {
-      "test": "innodb/innodb_rename_index",
-      "reason": "ERROR: ALTER TABLE RENAME INDEX with DROP INDEX"
-    },
-    {
       "test": "innodb/innodb-autoinc",
       "reason": "lock_mode=0 bulk reservation not yet implemented"
     },
@@ -4271,6 +4171,102 @@
     {
       "test": "sys_vars/sql_select_limit_func",
       "reason": "output mismatch or execution error"
+    },
+    {
+      "test": "innodb/innodb_bug21704",
+      "reason": "SHOW CREATE TABLE ordering issues; affected rows differs for online ALTER TABLE CHANGE"
+    },
+    {
+      "test": "innodb/innodb_misc1",
+      "reason": "duplicate key with PAD SPACE collation; also DROP TABLE FK error"
+    },
+    {
+      "test": "json/json_table",
+      "reason": "JSON_TABLE with complex subquery and STRAIGHT_JOIN; ORDER BY column number issue"
+    },
+    {
+      "test": "innodb/innodb-alter",
+      "reason": "EXPLAIN output differences; also ALTER TABLE CHANGE column not found"
+    },
+    {
+      "test": "innodb/innodb_rename_index",
+      "reason": "ERROR: ALTER TABLE RENAME INDEX with DROP INDEX"
+    },
+    {
+      "test": "innodb_fts/fic",
+      "reason": "timeout"
+    },
+    {
+      "test": "innodb_fts/basic",
+      "reason": "fulltext search result ordering differs from MySQL"
+    },
+    {
+      "test": "innodb/table_compress",
+      "reason": "CREATE TABLE LIKE cross-database issue"
+    },
+    {
+      "test": "gis/st_x",
+      "reason": "ST_X setter with NULL arg, latitude/longitude range validation, type checking"
+    },
+    {
+      "test": "innodb/instant_add_column_clear",
+      "reason": "duplicate key errors"
+    },
+    {
+      "test": "innodb/innodb_bug30919",
+      "reason": "complex partitioned table + stored procedure"
+    },
+    {
+      "test": "auth_sec/anonymous_grants",
+      "reason": "GRANT SHOW GRANTS missing all privileges list"
+    },
+    {
+      "test": "sys_vars/insert_id_func",
+      "reason": "INSERT_ID variable affects auto_increment differently from MySQL"
+    },
+    {
+      "test": "innodb/innodb_bug59641",
+      "reason": "internally skipped by test itself; XA recovery + restart"
+    },
+    {
+      "test": "innodb_fts/subexpr",
+      "reason": "full-text search result ordering differs from MySQL"
+    },
+    {
+      "test": "innodb_fts/transaction",
+      "reason": "timeout"
+    },
+    {
+      "test": "innodb_fts/savepoint",
+      "reason": "fulltext search savepoint/rollback interaction"
+    },
+    {
+      "test": "innodb_fts/ddl",
+      "reason": "fulltext search result ordering + LOCK=NONE not implemented"
+    },
+    {
+      "test": "sys_vars/sql_warnings_func",
+      "reason": "sql_warnings variable not controlling info line output"
+    },
+    {
+      "test": "parts/partition_engine_innodb",
+      "reason": "output mismatch"
+    },
+    {
+      "test": "auth_sec/mandatory_roles",
+      "reason": "SHOW GRANTS FOR PUBLIC not implemented"
+    },
+    {
+      "test": "innodb_fts/fulltext_var",
+      "reason": "fulltext search boolean syntax error mismatch"
+    },
+    {
+      "test": "innodb_fts/opt",
+      "reason": "internally skipped by test itself"
+    },
+    {
+      "test": "innodb_fts/misc_1",
+      "reason": "timeout"
     }
   ]
 }
