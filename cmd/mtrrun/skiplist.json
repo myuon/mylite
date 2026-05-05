@@ -4113,14 +4113,6 @@
       "reason": "out of range value for geometry column"
     },
     {
-      "test": "sys_vars/max_delayed_threads_basic",
-      "reason": "session-scope SET should give ER_WRONG_VALUE_FOR_VAR not ER_GLOBAL_VARIABLE"
-    },
-    {
-      "test": "sys_vars/max_insert_delayed_threads_basic",
-      "reason": "session-scope SET should give ER_WRONG_VALUE_FOR_VAR not ER_GLOBAL_VARIABLE"
-    },
-    {
       "test": "sys_vars/ft_boolean_syntax_basic",
       "reason": "needs value validation"
     },
