@@ -2717,10 +2717,6 @@
       "reason": "output mismatch or execution error"
     },
     {
-      "test": "sys_vars/max_prepared_stmt_count_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/myisam_data_pointer_size_func",
       "reason": "output mismatch or execution error"
     },

@@ -5129,6 +5129,7 @@ func (e *Executor) showStatus(upper string) (*Result, error) {
 		{Name: "Opened_tables", Value: "0"},
 		{Name: "Queries", Value: fmt.Sprintf("%d", e.questions)},
 		{Name: "Questions", Value: fmt.Sprintf("%d", e.questions)},
+		{Name: "Prepared_stmt_count", Value: fmt.Sprintf("%d", len(e.preparedStmts))},
 		{Name: "Slow_queries", Value: "0"},
 		{Name: "Sort_merge_passes", Value: "0"},
 		{Name: "Sort_range", Value: fmt.Sprintf("%d", e.sortRange)},

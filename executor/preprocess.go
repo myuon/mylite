@@ -1215,7 +1215,9 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 			// The variable may contain raw bytes from CONVERT(str USING utf16/utf32).
 			// Decode multi-byte encodings back to UTF-8 so the SQL parser can handle it.
 			queryStr = decodeMultiByteToUTF8(queryStr)
-			e.preparedStmts[stmtName] = queryStr
+			if err := e.storePreparedStmt(stmtName, queryStr); err != nil {
+				return "", nil, err
+			}
 			return "", &Result{}, nil
 		}
 		// Handle PREPARE stmt FROM 'string' or PREPARE stmt FROM "string" where the
@@ -1234,7 +1236,9 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 					return "", nil, syntaxErr
 				}
 			}
-			e.preparedStmts[strings.ToLower(stmtName)] = queryStr
+			if err := e.storePreparedStmt(strings.ToLower(stmtName), queryStr); err != nil {
+				return "", nil, err
+			}
 			return "", &Result{}, nil
 		}
 	}

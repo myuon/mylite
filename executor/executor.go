@@ -4896,6 +4896,28 @@ func (e *Executor) isTableImplicitlyLockedViaView(dbName, tableName string) bool
 	return false
 }
 
+// storePreparedStmt stores a prepared statement enforcing max_prepared_stmt_count.
+// MySQL behavior (Bug#35389): if a statement with the same name already exists,
+// it is deleted first, then the limit is checked against the reduced count.
+func (e *Executor) storePreparedStmt(name, query string) error {
+	if _, alreadyExists := e.preparedStmts[name]; alreadyExists {
+		delete(e.preparedStmts, name)
+	}
+	maxStmtStr, ok := e.getGlobalVar("max_prepared_stmt_count")
+	if !ok {
+		maxStmtStr = "16382"
+	}
+	maxStmt, err := strconv.ParseInt(maxStmtStr, 10, 64)
+	if err != nil {
+		maxStmt = 16382
+	}
+	if int64(len(e.preparedStmts)) >= maxStmt {
+		return mysqlError(1461, "42000", fmt.Sprintf("Can't create more than max_prepared_stmt_count statements (current value: %d)", maxStmt))
+	}
+	e.preparedStmts[name] = query
+	return nil
+}
+
 // execPrepare handles PREPARE stmt_name FROM 'query'.
 func (e *Executor) execPrepare(stmt *sqlparser.PrepareStmt) (*Result, error) {
 	name := strings.ToLower(stmt.Name.String())
@@ -4920,7 +4942,9 @@ func (e *Executor) execPrepare(stmt *sqlparser.PrepareStmt) (*Result, error) {
 			return nil, syntaxErr
 		}
 	}
-	e.preparedStmts[name] = query
+	if err := e.storePreparedStmt(name, query); err != nil {
+		return nil, err
+	}
 	return &Result{}, nil
 }
 
