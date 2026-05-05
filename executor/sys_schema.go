@@ -2263,6 +2263,63 @@ func (e *Executor) evalSysSchemaFunc(name string, args []sqlparser.Expr) (interf
 		// Unknown connection ID -> NULL
 		return nil, true, nil
 
+	case "ps_thread_account":
+		// ps_thread_account(in_thread_id BIGINT UNSIGNED) — returns 'user@host' for the given thread_id,
+		// or NULL if not found or if in_thread_id is NULL.
+		// Raises ER_WARN_DATA_OUT_OF_RANGE (1264, 22003) for negative values (UNSIGNED parameter).
+		if len(args) < 1 {
+			return nil, true, nil
+		}
+		threadIDVal, err := e.evalExpr(args[0])
+		if err != nil {
+			return nil, true, err
+		}
+		if threadIDVal == nil {
+			return nil, true, nil
+		}
+		// Check for out-of-range (negative values are invalid for BIGINT UNSIGNED)
+		threadID := toInt64(threadIDVal)
+		if threadID < 0 {
+			return nil, true, mysqlError(1264, "22003", "Out of range value for column 'in_thread_id' at row 1")
+		}
+		// Look up by thread_id (= connectionID + 1 for foreground threads)
+		if e.processList != nil {
+			for _, proc := range e.processList.Snapshot() {
+				if proc.ID+1 == threadID {
+					user := proc.User
+					host := proc.Host
+					if host == "" {
+						host = "localhost"
+					}
+					if user == "" {
+						user = "root"
+					}
+					return user + "@" + host, true, nil
+				}
+			}
+		}
+		// Also check if it's the current connection
+		if e.connectionID+1 == threadID {
+			user := "root"
+			host := "localhost"
+			if e.processList != nil {
+				for _, proc := range e.processList.Snapshot() {
+					if proc.ID == e.connectionID {
+						if proc.User != "" {
+							user = proc.User
+						}
+						if proc.Host != "" {
+							host = proc.Host
+						}
+						break
+					}
+				}
+			}
+			return user + "@" + host, true, nil
+		}
+		// Unknown thread_id -> NULL
+		return nil, true, nil
+
 	default:
 		return nil, false, nil
 	}
