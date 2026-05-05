@@ -1055,15 +1055,26 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				}
 			}
 			v, err := e.evalExpr(val)
-			// For BLOB family columns, hex-number literals (0xNN) are stored as the
-			// raw bytes they encode (matching VARBINARY behaviour), so HEX(col)
-			// round-trips to the original digits including any leading zero byte.
+			// For BLOB family and UTF-8 string (CHAR/VARCHAR/TEXT) columns, hex-number
+			// literals (0xNN) are stored as the raw bytes they encode, matching
+			// MySQL behaviour where 0xNN is a BINARY-typed hex literal.
+			// For multi-byte charsets (utf32, ucs2, utf16, etc.) the integer value
+			// is used directly so the engine can convert the code point correctly.
 			// Plain integer/decimal literals retain their string representation.
 			if err == nil && v != nil && isHexNumLiteral(val) {
 				for _, col := range tbl.Def.Columns {
 					if col.Name == colNames[i] {
 						if isBlobColType(col.Type) {
 							v = hexIntToBytes(v)
+						} else if isStringColType(col.Type) {
+							// Only convert to bytes for utf8/utf8mb4 (single-byte-compatible) charsets.
+							colCs := strings.ToLower(col.Charset)
+							if colCs == "" && tbl.Def != nil {
+								colCs = strings.ToLower(tbl.Def.Charset)
+							}
+							if colCs == "utf8" || colCs == "utf8mb4" || colCs == "utf8mb3" || colCs == "" {
+								v = hexIntToBytes(v)
+							}
 						}
 						break
 					}
@@ -2311,8 +2322,9 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 		}
 
-		// Non-strict mode: warn about strings that exceed column length but do NOT truncate
-		// (Dolt does not enforce VARCHAR/CHAR length limits)
+		// Non-strict mode: warn about strings that exceed column length but do NOT truncate.
+		// Also validate UTF-8 charset: invalid byte sequences cause warning 1366 and empty string
+		// stored (matching MySQL non-strict mode behaviour).
 		if !e.isStrictMode() {
 			for _, col := range tbl.Def.Columns {
 				rv, exists := row[col.Name]
@@ -2321,15 +2333,15 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				}
 				colUpper := strings.ToUpper(col.Type)
 				isCharType := strings.Contains(colUpper, "CHAR") || strings.Contains(colUpper, "BINARY")
-				if !isCharType {
+				isTextType := colUpper == "TEXT" || colUpper == "TINYTEXT" || colUpper == "MEDIUMTEXT" || colUpper == "LONGTEXT"
+				if !isCharType && !isTextType {
 					continue
 				}
 				sv, ok := rv.(string)
 				if !ok {
 					continue
 				}
-				maxLen := extractCharLength(col.Type)
-				runeLen := 0
+				isBinaryColType := strings.Contains(colUpper, "BINARY")
 				effectiveCs := col.Charset
 				if effectiveCs == "" && tbl.Def != nil {
 					effectiveCs = tbl.Def.Charset
@@ -2338,10 +2350,20 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					effectiveCs = "utf8mb4"
 				}
 				effectiveCs = strings.ToLower(effectiveCs)
-				isUtf8Cs := effectiveCs == "utf8" || effectiveCs == "utf8mb4" ||
+				// UTF-8 charset validation: invalid bytes get warning 1366 and empty value.
+				isUtf8Cs := effectiveCs == "utf8" || effectiveCs == "utf8mb4" || effectiveCs == "utf8mb3"
+				if isUtf8Cs && !isBinaryColType && !utf8.ValidString(sv) {
+					e.addWarning("Warning", 1366, fmt.Sprintf("Incorrect string value: '%s' for column '%s' at row 1", formatBytesForWarning(sv), col.Name))
+					row[col.Name] = ""
+					rv = ""
+					sv = ""
+				}
+				maxLen := extractCharLength(col.Type)
+				runeLen := 0
+				isUtf8Compatible := effectiveCs == "utf8" || effectiveCs == "utf8mb4" ||
 					effectiveCs == "utf8mb3" || effectiveCs == "ascii" ||
 					effectiveCs == "" || isSingleByteCharset(effectiveCs)
-				if isUtf8Cs && utf8.ValidString(sv) {
+				if isUtf8Compatible && utf8.ValidString(sv) {
 					runeLen = len([]rune(sv))
 				}
 				if maxLen > 0 && runeLen > maxLen {
