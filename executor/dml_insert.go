@@ -561,8 +561,8 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					delete(row, "__txn_conn_id__")
 					return nil, err
 				}
-				// Record undo entry for transaction rollback
-				if e.inTransaction {
+				// Record undo entry for transaction rollback (explicit or autocommit=0 implicit)
+				if e.inTransaction || e.isAutocommitOff() {
 					e.txnUndoLog = append(e.txnUndoLog, undoEntry{
 						op:     "INSERT",
 						db:     insertDB,
@@ -2681,8 +2681,8 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 			return nil, err
 		}
-		// Record undo entry for transaction rollback
-		if e.inTransaction {
+		// Record undo entry for transaction rollback (explicit or autocommit=0 implicit)
+		if e.inTransaction || e.isAutocommitOff() {
 			e.txnUndoLog = append(e.txnUndoLog, undoEntry{
 				op:     "INSERT",
 				db:     insertDB,
