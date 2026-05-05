@@ -3769,10 +3769,6 @@
       "reason": "requires concurrent metadata locking which is not implemented"
     },
     {
-      "test": "sys_vars/innodb_redo_log_archive_dirs_basic",
-      "reason": "needs format validation and nullable-empty interaction fix"
-    },
-    {
       "test": "sys_vars/innodb_monitor_enable_basic",
       "reason": "innodb_metrics ordering/set mismatch"
     },
