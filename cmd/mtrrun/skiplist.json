@@ -4113,10 +4113,6 @@
       "reason": "output mismatch or execution error"
     },
     {
-      "test": "sys_vars/optimizer_trace_features_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/time_zone_func",
       "reason": "output mismatch or execution error"
     },
