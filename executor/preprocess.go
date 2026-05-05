@@ -175,6 +175,17 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 	e.subqueryValCache = nil
 	upper := strings.ToUpper(trimmed)
 
+	// Detect `SELECT @@global X` / `@@session X` / `@@local X` without a dot separator,
+	// e.g. `SELECT @@global init_slave`. MySQL returns ER_PARSE_ERROR (1064/42000) for these.
+	// Vitess happily parses them as `SELECT @@global AS init_slave` so we must catch them here.
+	// Strip string literals first to avoid false matches inside quoted strings.
+	{
+		stripped := stripStringLiterals(trimmed)
+		if m := atAtScopeNoDotReCapture.FindStringSubmatch(stripped); m != nil {
+			return "", nil, mysqlError(1064, "42000", "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '"+m[1]+"' at line 1")
+		}
+	}
+
 	// Check for PS function parameter count errors before parsing.
 	// Only match unqualified calls (no schema prefix like "test.ps_thread_id").
 	// Strip string literals first to avoid false matches inside strings.
@@ -1344,6 +1355,11 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 
 // reSetNamesCollate matches "SET NAMES <charset> COLLATE <collation>" and captures the collation name.
 var reSetNamesCollate = regexp.MustCompile(`(?i)^SET\s+NAMES\s+\S+\s+COLLATE\s+(\S+)$`)
+
+// atAtScopeNoDotReCapture matches @@global/@@session/@@local followed by whitespace then a word
+// (no dot). E.g. `@@global init_slave` is a parse error in MySQL.
+// Captures the identifier after the scope keyword.
+var atAtScopeNoDotReCapture = regexp.MustCompile(`(?i)@@(?:global|session|local)\s+([a-zA-Z_][a-zA-Z0-9_]*)`)
 
 // extractFunctionArgList finds the first occurrence of fnName( in query (case-insensitive)
 // and returns the string between the opening and matching closing parentheses.

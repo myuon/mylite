@@ -1349,8 +1349,14 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						}
 						e.sessionScopeVars[cleanName] = sv
 					} else if err == nil && evalVal == nil {
-						// nil means NULL - store empty or delete
-						delete(e.sessionScopeVars, cleanName)
+						// nil means NULL.
+						// For pure-string variables (e.g. init_slave), NULL resets to "" (empty string).
+						// For other variables, delete from session scope (falls back to default).
+						if sysVarPureStringType[cleanName] {
+							e.sessionScopeVars[cleanName] = ""
+						} else {
+							delete(e.sessionScopeVars, cleanName)
+						}
 					} else {
 						sv := val
 						if cleanName == "optimizer_switch" {
@@ -2566,6 +2572,9 @@ var sysVarEnumSet = map[string]bool{
 	"binlog_transaction_dependency_tracking":   true,
 	"replica_exec_mode":                        true,
 	"replica_type_conversions":                 true,
+	// init_slave/init_replica are pure-string vars; ON should be stored as "ON" (not converted to 1)
+	"init_slave":   true,
+	"init_replica": true,
 }
 
 // mysqlLocaleByID maps numeric locale IDs (0-110) to locale names in MySQL 8.4.
@@ -2670,6 +2679,9 @@ var sysVarAcceptIdentifier = map[string]bool{
 	"innodb_monitor_enable":    true,
 	"innodb_monitor_reset":     true,
 	"innodb_monitor_reset_all": true,
+	// init_slave/init_replica accept bare identifiers as string values (any string is valid)
+	"init_slave":   true,
+	"init_replica": true,
 }
 
 // sysVarStringType contains system variables that are string types and reject NULL values.
@@ -2728,6 +2740,10 @@ func isInvalidStringVarExpr(varName string, expr sqlparser.Expr) bool {
 	if isNumericLiteralExpr(expr) {
 		return true
 	}
+	// Boolean literals (true/false) are invalid for pure-string variables.
+	if _, isBool := expr.(sqlparser.BoolVal); isBool {
+		return true
+	}
 	// Bare identifier like `mytest.log` parses as ColName; only reject for
 	// filename-type variables (not for enum-like vars that accept bare identifiers).
 	if sysVarFilenameType[varName] {
@@ -2759,6 +2775,9 @@ var sysVarPureStringType = map[string]bool{
 	// SSL path variables: reject numeric literals with ER_WRONG_TYPE_FOR_VAR
 	"ssl_ca": true, "ssl_capath": true, "ssl_cert": true, "ssl_cipher": true,
 	"ssl_key": true, "ssl_crl": true, "ssl_crlpath": true,
+	// init_slave / init_replica: GLOBAL-only string variables that reject numeric literals/booleans
+	"init_slave":   true,
+	"init_replica": true,
 }
 
 // checkIntVarType checks if the expression is a valid integer type for integer-range

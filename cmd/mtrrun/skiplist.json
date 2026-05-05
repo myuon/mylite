@@ -4177,10 +4177,6 @@
       "reason": "complex scope handling"
     },
     {
-      "test": "sys_vars/init_slave_basic",
-      "reason": "type validation for string-type vars"
-    },
-    {
       "test": "sys_vars/windowing_use_high_precision_basic",
       "reason": "float formatting and EXPLAIN output mismatch"
     }
