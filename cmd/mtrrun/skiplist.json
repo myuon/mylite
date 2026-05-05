@@ -2917,10 +2917,6 @@
       "reason": "uses slow_log table"
     },
     {
-      "test": "sys_vars/max_join_size_func",
-      "reason": "output mismatch"
-    },
-    {
       "test": "other/func_math",
       "reason": "timeout"
     },
@@ -2975,14 +2971,6 @@
     {
       "test": "gis/st_y",
       "reason": "failing"
-    },
-    {
-      "test": "gis/wkt",
-      "reason": "failing"
-    },
-    {
-      "test": "innodb/alter_rename_existing",
-      "reason": "still failing"
     },
     {
       "test": "innodb/high_prio_trx_1",
@@ -3113,26 +3101,6 @@
       "reason": "lock timeout test failures"
     },
     {
-      "test": "innodb/strict_mode",
-      "reason": "failures"
-    },
-    {
-      "test": "innodb/skip_locked_nowait",
-      "reason": "failures"
-    },
-    {
-      "test": "innodb/truncate",
-      "reason": "failures"
-    },
-    {
-      "test": "innodb/default_row_format_16k",
-      "reason": "failures"
-    },
-    {
-      "test": "innodb/default_row_format_tablespace",
-      "reason": "failures"
-    },
-    {
       "test": "sys_vars/event_scheduler_basic",
       "reason": "failures"
     },
@@ -3229,20 +3197,8 @@
       "reason": "timeout"
     },
     {
-      "test": "engine_funcs/jp_comment_older_compatibility1",
-      "reason": "row ordering issue in result"
-    },
-    {
-      "test": "engine_iuds/update_delete_calendar",
-      "reason": "column duplication in output"
-    },
-    {
       "test": "collations/german",
       "reason": "collation ordering difference"
-    },
-    {
-      "test": "gcol/gcol_select_innodb",
-      "reason": "only_full_group_by error"
     },
     {
       "test": "gcol/gcol_bugfixes",
@@ -3303,14 +3259,6 @@
     {
       "test": "sys_vars/collation_connection_func",
       "reason": "still failing"
-    },
-    {
-      "test": "funcs_1/is_basics_mixed",
-      "reason": "needs DROP USER support"
-    },
-    {
-      "test": "funcs_1/is_tables_innodb",
-      "reason": "table_collation and user_comment differences"
     },
     {
       "test": "funcs_1/is_tables_memory",
@@ -3977,10 +3925,6 @@
       "reason": "requires concurrent metadata locking which is not implemented"
     },
     {
-      "test": "sys_vars/delay_key_write_basic",
-      "reason": "needs invalid enum value rejection"
-    },
-    {
       "test": "sys_vars/explicit_defaults_for_timestamp_basic",
       "reason": "needs user privilege checking"
     },
@@ -4097,10 +4041,6 @@
       "reason": "requires full WKT parameter validation, projection parameter checking, and multi-line error message formatting not yet implemented"
     },
     {
-      "test": "innodb/partition_autoinc",
-      "reason": "WIP: first-diff-line improved from 54 to 192, but DROP PARTITION data deletion not yet implemented"
-    },
-    {
       "test": "other/innodb_mysql_lock",
       "reason": "multi-connection lock contention with innodb_trx LOCK WAIT"
     },
@@ -4157,10 +4097,6 @@
       "reason": "spatial/rtree feature not implemented"
     },
     {
-      "test": "innodb/innodb-autoinc",
-      "reason": "lock_mode=0 bulk reservation not yet implemented"
-    },
-    {
       "test": "sys_vars/sql_big_selects_func",
       "reason": "output mismatch or execution error"
     },
@@ -4177,20 +4113,12 @@
       "reason": "SHOW CREATE TABLE ordering issues; affected rows differs for online ALTER TABLE CHANGE"
     },
     {
-      "test": "innodb/innodb_misc1",
-      "reason": "duplicate key with PAD SPACE collation; also DROP TABLE FK error"
-    },
-    {
       "test": "json/json_table",
       "reason": "JSON_TABLE with complex subquery and STRAIGHT_JOIN; ORDER BY column number issue"
     },
     {
       "test": "innodb/innodb-alter",
       "reason": "EXPLAIN output differences; also ALTER TABLE CHANGE column not found"
-    },
-    {
-      "test": "innodb/innodb_rename_index",
-      "reason": "ERROR: ALTER TABLE RENAME INDEX with DROP INDEX"
     },
     {
       "test": "innodb_fts/fic",
@@ -4201,24 +4129,12 @@
       "reason": "fulltext search result ordering differs from MySQL"
     },
     {
-      "test": "innodb/table_compress",
-      "reason": "CREATE TABLE LIKE cross-database issue"
-    },
-    {
       "test": "gis/st_x",
       "reason": "ST_X setter with NULL arg, latitude/longitude range validation, type checking"
     },
     {
-      "test": "innodb/instant_add_column_clear",
-      "reason": "duplicate key errors"
-    },
-    {
       "test": "innodb/innodb_bug30919",
       "reason": "complex partitioned table + stored procedure"
-    },
-    {
-      "test": "auth_sec/anonymous_grants",
-      "reason": "GRANT SHOW GRANTS missing all privileges list"
     },
     {
       "test": "sys_vars/insert_id_func",
@@ -4267,6 +4183,86 @@
     {
       "test": "innodb_fts/misc_1",
       "reason": "timeout"
+    },
+    {
+      "test": "innodb/innodb_rename_index",
+      "reason": "ERROR: ALTER TABLE RENAME INDEX with DROP INDEX; requires ER_DUP_KEYNAME for ADD INDEX with existing name; also uses innodb_tables/innodb_indexes/innodb_fields IS tables and mysql.innodb_index_stats"
+    },
+    {
+      "test": "innodb/default_row_format_16k",
+      "reason": "failures: tables with complex key/varchar constraints cause t1 not found errors"
+    },
+    {
+      "test": "innodb/skip_locked_nowait",
+      "reason": "failures: internally skipped by test, SKIP_LOCKED/NOWAIT semantics"
+    },
+    {
+      "test": "innodb/alter_rename_existing",
+      "reason": "still failing: requires filesystem file manipulation --exec, --list_files, MYSQLD_DATADIR"
+    },
+    {
+      "test": "innodb/table_compress",
+      "reason": "CREATE TABLE LIKE cross-database issue (fixed), but COMPRESSION attribute not stored/displayed and test uses restart_mysqld"
+    },
+    {
+      "test": "sys_vars/delay_key_write_basic",
+      "reason": "needs invalid enum value rejection: OF should parse error but doesn't"
+    },
+    {
+      "test": "innodb/instant_add_column_clear",
+      "reason": "duplicate key errors from multiple --source runs not cleaning up between row format tests"
+    },
+    {
+      "test": "funcs_1/is_tables_innodb",
+      "reason": "table_collation and user_comment differences"
+    },
+    {
+      "test": "gis/wkt",
+      "reason": "MULTIPOINT inside GEOMETRYCOLLECTION not normalized; ST_ function names in errors; parameter count errors"
+    },
+    {
+      "test": "sys_vars/max_join_size_func",
+      "reason": "output mismatch"
+    },
+    {
+      "test": "innodb/default_row_format_tablespace",
+      "reason": "failures"
+    },
+    {
+      "test": "gcol/gcol_select_innodb",
+      "reason": "only_full_group_by error"
+    },
+    {
+      "test": "innodb/innodb-autoinc",
+      "reason": "lock_mode=0 bulk reservation not yet implemented"
+    },
+    {
+      "test": "auth_sec/anonymous_grants",
+      "reason": "GRANT SHOW GRANTS missing all privileges list"
+    },
+    {
+      "test": "engine_funcs/jp_comment_older_compatibility1",
+      "reason": "row ordering issue in result"
+    },
+    {
+      "test": "engine_iuds/update_delete_calendar",
+      "reason": "column duplication in output; also WHERE clause date validation errors instead of returning 0 rows"
+    },
+    {
+      "test": "innodb/truncate",
+      "reason": "failures: tablespace name format mismatch and TRUNCATE partition data retention issues"
+    },
+    {
+      "test": "innodb/innodb_misc1",
+      "reason": "duplicate key with PAD SPACE collation; also DROP TABLE FK error; also FK on temp table not rejected"
+    },
+    {
+      "test": "funcs_1/is_basics_mixed",
+      "reason": "needs DROP USER support"
+    },
+    {
+      "test": "innodb/partition_autoinc",
+      "reason": "still failing"
     }
   ]
 }

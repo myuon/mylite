@@ -3689,9 +3689,18 @@ func (ctx *execContext) executeExecWithExpectedError(stmt string) error {
 					ctx.output.WriteString("Got one of the listed errors\n")
 				}
 			} else {
-				ctx.output.WriteString(formatMySQLError(execErr) + "\n")
+				errLine := formatMySQLError(execErr)
+				if len(ctx.replaceRegex) > 0 {
+					errLine = applyReplaceRegex(errLine, ctx.replaceRegex)
+				}
+				if len(ctx.replaceResult) > 0 {
+					errLine = applyReplaceResult(errLine, ctx.replaceResult)
+				}
+				ctx.output.WriteString(errLine + "\n")
 			}
 		}
+		ctx.replaceRegex = nil
+		ctx.replaceResult = nil
 		return nil
 	}
 
