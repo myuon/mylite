@@ -19,12 +19,14 @@ import (
 //   - Keywords are uppercased
 //   - Whitespace is collapsed to single spaces around tokens
 //   - Repeating value tuples like `(1,2),(3,4),...` are collapsed to `(...) /* , ... */`
+//   - NULL in IS NULL / IS NOT NULL and NOT NULL constraints is kept as a keyword
 //
 // This is a best-effort approximation; exact byte-for-byte equality with
 // MySQL's digest is not guaranteed because MySQL's tokenizer applies many
 // dialect-specific rules (PARSER_TOKEN_*) that are out of scope.
 func normalizeStatementDigest(query string) (digest string, digestText string) {
 	tokens := tokenizeForDigest(query)
+	tokens = reclassifyNullTokens(tokens)
 	tokens = collapseInsideParenLiterals(tokens)
 	tokens = collapseValueLists(tokens)
 	tokens = collapseTopLevelLiteralList(tokens)
@@ -32,6 +34,26 @@ func normalizeStatementDigest(query string) (digest string, digestText string) {
 	h := sha256.Sum256([]byte(digestText))
 	digest = hex.EncodeToString(h[:])
 	return digest, digestText
+}
+
+// reclassifyNullTokens changes tokNull tokens to tokKeyword when they appear
+// in IS NULL, IS NOT NULL, or NOT NULL column-constraint contexts. In MySQL
+// digests, the NULL keyword in these constructs is kept as-is rather than
+// replaced with '?'.
+func reclassifyNullTokens(tokens []digestToken) []digestToken {
+	for i, t := range tokens {
+		if t.kind != tokNull {
+			continue
+		}
+		// Look backwards for IS or NOT keyword
+		j := i - 1
+		// Skip over any other tokens to find IS or NOT
+		if j >= 0 && tokens[j].kind == tokKeyword &&
+			(tokens[j].text == "IS" || tokens[j].text == "NOT") {
+			tokens[i] = digestToken{kind: tokKeyword, text: "NULL"}
+		}
+	}
+	return tokens
 }
 
 // collapseInsideParenLiterals replaces "(L , L , L [, L]*)" — where each L is
@@ -121,7 +143,7 @@ func collapseTopLevelLiteralList(tokens []digestToken) []digestToken {
 			}
 			if litCount >= 2 {
 				out = append(out, t) // first literal
-				out = append(out, digestToken{kind: tokPunct, text: ","})
+				out = append(out, digestToken{kind: tokCompactComma, text: ","})
 				out = append(out, digestToken{kind: tokKeyword, text: "..."})
 				i = j
 				continue
@@ -147,13 +169,14 @@ type digestTokKind int
 
 const (
 	tokKeyword digestTokKind = iota
-	tokIdent           // backtick-quoted identifier (the `text` is the unescaped name)
-	tokNumber          // becomes `?`
-	tokString          // becomes `?`
-	tokNull            // becomes `?`
-	tokPunct           // ( ) , ; . etc.
-	tokOperator        // + - * / = < > etc.
+	tokIdent         // backtick-quoted identifier (the `text` is the unescaped name)
+	tokNumber        // becomes `?`
+	tokString        // becomes `?`
+	tokNull          // becomes `?`
+	tokPunct         // ( ) , ; . etc.
+	tokOperator      // + - * / = < > etc.
 	tokWhitespace
+	tokCompactComma  // a comma from a collapsed literal list; renders without leading space
 )
 
 // sqlKeywords is a small set of common MySQL keywords. Tokens matching this
@@ -192,6 +215,7 @@ var sqlKeywords = map[string]bool{
 	"SHOW": true, "VARIABLES": true, "STATUS": true, "GLOBAL": true, "SESSION": true, "LOCAL": true,
 	"IGNORE": true, "DUPLICATE": true, "DELAYED": true, "LOW_PRIORITY": true, "HIGH_PRIORITY": true,
 	"DIV": true, "MOD": true, "XOR": true,
+	"DUAL": true,
 }
 
 // tokenizeForDigest splits a SQL string into digest tokens, stripping comments.
@@ -428,16 +452,69 @@ func collapseValueLists(tokens []digestToken) []digestToken {
 
 // joinDigestTokens renders the token stream as the final digest_text string.
 // Spacing rules:
-//   - No space before ',' ';' ')' '.'
-//   - No space after '(' '.'
+//   - No space after '(' or '.'
+//   - No space before ';' or '.'
+//   - No space before/after tokCompactComma (collapsed literal-list comma)
+//   - Space before ',' and ')' when inside a CREATE TABLE column list
 //   - Single space between most other tokens
 func joinDigestTokens(tokens []digestToken) string {
+	// Detect CREATE TABLE DDL to apply column-list spacing inside its outer parens.
+	isCreateTableDDL := len(tokens) >= 2 &&
+		tokens[0].kind == tokKeyword && tokens[0].text == "CREATE"
+	if isCreateTableDDL {
+		found := false
+		end := len(tokens)
+		if end > 4 {
+			end = 4
+		}
+		for _, t := range tokens[1:end] {
+			if t.kind == tokKeyword && t.text == "TABLE" {
+				found = true
+				break
+			}
+		}
+		isCreateTableDDL = found
+	}
+
+	// Find the outer paren range for CREATE TABLE column definitions.
+	outerParenOpen := -1
+	outerParenClose := -1
+	if isCreateTableDDL {
+		for i, t := range tokens {
+			if t.kind == tokPunct && t.text == "(" {
+				outerParenOpen = i
+				depth := 1
+				for j := i + 1; j < len(tokens); j++ {
+					if tokens[j].kind == tokPunct && tokens[j].text == "(" {
+						depth++
+					} else if tokens[j].kind == tokPunct && tokens[j].text == ")" {
+						depth--
+						if depth == 0 {
+							outerParenClose = j
+							break
+						}
+					}
+				}
+				break
+			}
+		}
+	}
+
+	// intTypeAliases maps type aliases that MySQL normalizes to INTEGER in digests.
+	intTypeAliases := map[string]string{
+		"INT": "INTEGER",
+	}
+
 	var b strings.Builder
 	for i, t := range tokens {
 		var rendered string
 		switch t.kind {
 		case tokKeyword:
-			rendered = t.text
+			if norm, ok := intTypeAliases[t.text]; ok {
+				rendered = norm
+			} else {
+				rendered = t.text
+			}
 		case tokIdent:
 			rendered = "`" + strings.ReplaceAll(t.text, "`", "``") + "`"
 		case tokNumber, tokString, tokNull:
@@ -446,10 +523,27 @@ func joinDigestTokens(tokens []digestToken) string {
 			rendered = t.text
 		case tokOperator:
 			rendered = t.text
+		case tokCompactComma:
+			rendered = ","
 		}
 		if i > 0 {
 			prev := tokens[i-1]
-			if needsSpace(prev, t) {
+			inColList := outerParenOpen >= 0 && i > outerParenOpen && i <= outerParenClose
+			if inColList {
+				// Inside CREATE TABLE column list: space after '(', before ')' and ','
+				if i == outerParenOpen+1 {
+					// First token after outer '(': add space
+					b.WriteByte(' ')
+				} else if t.kind == tokPunct && t.text == ")" && i == outerParenClose {
+					// Closing outer ')': add space before it
+					b.WriteByte(' ')
+				} else if t.kind == tokPunct && t.text == "," {
+					// Comma between column definitions: space before ','
+					b.WriteByte(' ')
+				} else if needsSpace(prev, t) {
+					b.WriteByte(' ')
+				}
+			} else if needsSpace(prev, t) {
 				b.WriteByte(' ')
 			}
 		}
@@ -459,12 +553,16 @@ func joinDigestTokens(tokens []digestToken) string {
 }
 
 func needsSpace(prev, cur digestToken) bool {
+	// No space before tokCompactComma (it glues directly to preceding token)
+	if cur.kind == tokCompactComma {
+		return false
+	}
 	// No space after '('
 	if prev.kind == tokPunct && prev.text == "(" {
 		return false
 	}
-	// No space before ',' ';' ')'
-	if cur.kind == tokPunct && (cur.text == "," || cur.text == ";" || cur.text == ")") {
+	// No space before ';' ')'
+	if cur.kind == tokPunct && (cur.text == ";" || cur.text == ")") {
 		return false
 	}
 	return true
