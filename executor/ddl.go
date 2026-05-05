@@ -953,7 +953,10 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		// CREATE TABLE ... LIKE
 		if stmt.OptLike != nil {
 			srcName := stmt.OptLike.LikeTable.Name.String()
-			srcDB := dbName
+			// When the LIKE source has no qualifier, look it up in the current database,
+			// not the target table's database (MySQL behavior: LIKE resolves against
+			// the current USE-d database when no qualifier is specified).
+			srcDB := e.CurrentDB
 			if !stmt.OptLike.LikeTable.Qualifier.IsEmpty() {
 				srcDB = stmt.OptLike.LikeTable.Qualifier.String()
 			}
@@ -2741,6 +2744,15 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		delete(e.tempTables, tableName)
 	}
 
+	// MySQL does not allow FOREIGN KEY constraints on TEMPORARY tables (ER_CANNOT_ADD_FOREIGN = 1005).
+	if stmt.Temp && stmt.TableSpec != nil {
+		for _, constraint := range stmt.TableSpec.Constraints {
+			if _, ok := constraint.Details.(*sqlparser.ForeignKeyDefinition); ok {
+				return nil, mysqlError(1005, "HY000", "Cannot add foreign key constraint")
+			}
+		}
+	}
+
 	// Validate FK parent index before creating the table (when foreign_key_checks=1).
 	// This prevents the table from being created when the referenced parent table
 	// does not have the required index (ER_FK_NO_INDEX_PARENT = 1215).
@@ -4066,6 +4078,84 @@ func (e *Executor) validateExistingDataSRID(tbl *storage.Table, oldColName, newC
 	return nil
 }
 
+// innodbCompactRowSize computes the approximate inline row size for an InnoDB
+// COMPACT (or REDUNDANT) row format table. TEXT/BLOB columns contribute a
+// 768-byte inline prefix. Fixed-length types contribute their storage size.
+// This mirrors MySQL's ROW_TOO_BIG check for innodb_strict_mode.
+func innodbCompactRowSize(def *catalog.TableDef) int {
+	total := 0
+	for _, col := range def.Columns {
+		baseType := strings.ToUpper(col.Type)
+		lparen := strings.IndexByte(baseType, '(')
+		if lparen >= 0 {
+			baseType = strings.TrimSpace(baseType[:lparen])
+		}
+		switch baseType {
+		case "TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT",
+			"BLOB", "TINYBLOB", "MEDIUMBLOB", "LONGBLOB":
+			// Each LOB column contributes a 768-byte inline prefix in COMPACT format.
+			total += 768
+		case "VARCHAR", "VARBINARY":
+			// Inline if ≤ 768 bytes, otherwise 768-byte prefix + 20-byte off-page pointer.
+			colLen := 0
+			if lparen2 := strings.IndexByte(col.Type, '('); lparen2 >= 0 {
+				rparen := strings.IndexByte(col.Type, ')')
+				if rparen > lparen2 {
+					lenStr := col.Type[lparen2+1 : rparen]
+					colLen, _ = strconv.Atoi(strings.TrimSpace(lenStr))
+				}
+			}
+			// Simplified: count full column length inline (worst-case).
+			total += colLen + 2
+		case "INT":
+			total += 4
+		case "TINYINT":
+			total += 1
+		case "SMALLINT":
+			total += 2
+		case "MEDIUMINT":
+			total += 3
+		case "BIGINT":
+			total += 8
+		case "FLOAT":
+			total += 4
+		case "DOUBLE", "REAL":
+			total += 8
+		case "DECIMAL", "NUMERIC":
+			total += 9 // conservative estimate
+		case "DATE":
+			total += 3
+		case "DATETIME":
+			total += 5
+		case "TIMESTAMP":
+			total += 4
+		case "TIME":
+			total += 3
+		case "YEAR":
+			total += 1
+		case "CHAR":
+			colLen := 0
+			if lparen2 := strings.IndexByte(col.Type, '('); lparen2 >= 0 {
+				rparen := strings.IndexByte(col.Type, ')')
+				if rparen > lparen2 {
+					colLen, _ = strconv.Atoi(strings.TrimSpace(col.Type[lparen2+1 : rparen]))
+				}
+			}
+			if colLen == 0 {
+				colLen = 1
+			}
+			total += colLen
+		case "BIT":
+			total += 1
+		case "ENUM":
+			total += 2
+		case "SET":
+			total += 8
+		}
+	}
+	return total
+}
+
 func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 	dbName := e.CurrentDB
 	if !stmt.Table.Qualifier.IsEmpty() {
@@ -4623,6 +4713,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				switch op := opt.(type) {
 				case *sqlparser.RenameIndex:
 					oldName := strings.ToLower(op.OldName.String())
+					// Reject renaming to GEN_CLUST_INDEX (reserved InnoDB internal index name)
+					if strings.EqualFold(op.NewName.String(), "GEN_CLUST_INDEX") {
+						return nil, mysqlError(1280, "42000", "Incorrect index name 'GEN_CLUST_INDEX'")
+					}
 					if !origIdxNames[oldName] {
 						return nil, mysqlError(1176, "42000", fmt.Sprintf("Key '%s' doesn't exist in table '%s'", op.OldName.String(), tableName))
 					}
@@ -6203,7 +6297,30 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				case "ENGINE":
 					tableDef, _ := db.GetTable(tableName)
 					if tableDef != nil {
-						tableDef.Engine = tableOptionString(to)
+						newEngine := tableOptionString(to)
+						tableDef.Engine = newEngine
+						// innodb_strict_mode: reject ALTER TABLE ... ENGINE=InnoDB when the
+						// table uses COMPACT or REDUNDANT row format and the inline row size
+						// would exceed the InnoDB per-page limit (≈ 8126 bytes for 16 KB pages).
+						if e.isInnoDBStrictMode() && strings.EqualFold(newEngine, "InnoDB") {
+							// Determine effective row format (COMPACT is the old default).
+							rowFmt := strings.ToUpper(tableDef.EffectiveRowFormat)
+							if rowFmt == "" {
+								rowFmt = strings.ToUpper(tableDef.RowFormat)
+							}
+							if rowFmt == "" {
+								rowFmt = "COMPACT" // historical default
+							}
+							if rowFmt == "COMPACT" || rowFmt == "REDUNDANT" {
+								// InnoDB COMPACT/REDUNDANT: max inline row size ≈ 8126 bytes.
+								// Each LOB (TEXT/BLOB) column stores a 768-byte prefix inline.
+								maxInlineRowBytes := 8126
+								if rowSize := innodbCompactRowSize(tableDef); rowSize > maxInlineRowBytes {
+									return nil, mysqlError(1118, "42000",
+										fmt.Sprintf("Row size too large. The maximum row size for the used table type, not counting BLOBs, is %d. This includes storage overhead, check the manual. You have to change some columns to TEXT or BLOBs", maxInlineRowBytes))
+								}
+							}
+						}
 					}
 				case "AUTO_INCREMENT":
 					// Skip if already applied by ADD COLUMN AUTO_INCREMENT pre-fill.
