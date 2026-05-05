@@ -2244,6 +2244,7 @@ var superOnlySessionVars = map[string]bool{
 	"immediate_server_version":           true,
 	"original_commit_timestamp":          true,
 	"histogram_generation_max_mem_size":  true,
+	"explicit_defaults_for_timestamp":    true,
 }
 
 var sysVarGlobalOnly = map[string]bool{
@@ -3269,6 +3270,7 @@ var sysVarDeprecated = map[string]string{
 	"rpl_stop_slave_timeout":           "'@@rpl_stop_slave_timeout' is deprecated and will be removed in a future release. Please use rpl_stop_replica_timeout instead.",
 	"sync_master_info":                 "'@@sync_master_info' is deprecated and will be removed in a future release. Please use sync_source_info instead.",
 	"sql_slave_skip_counter":           "'@@sql_slave_skip_counter' is deprecated and will be removed in a future release. Please use sql_replica_skip_counter instead.",
+	"explicit_defaults_for_timestamp":  "'explicit_defaults_for_timestamp' is deprecated and will be removed in a future release.",
 }
 
 // sysVarBoolean contains system variables that are boolean type (ON/OFF).
