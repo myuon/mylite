@@ -757,6 +757,47 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					// Fall through to the normal setSysVar path (validates and stores the value).
 					// The restoration happens in execCommit/execRollback via prevSessionIsolation.
 				}
+				// gtid_next special handling: NULL rejection and GTID ownership checks.
+				if cleanName == "gtid_next" {
+					// NULL is never valid for gtid_next.
+					if _, isNull := expr.Expr.(*sqlparser.NullVal); isNull {
+						return nil, mysqlError(1231, "42000", "Variable 'gtid_next' can't be set to the value of 'NULL'")
+					}
+					if strings.ToUpper(val) == "NULL" {
+						return nil, mysqlError(1231, "42000", "Variable 'gtid_next' can't be set to the value of 'NULL'")
+					}
+					// If the session currently owns a GTID (gtid_next was set to ANONYMOUS
+					// without an intervening COMMIT or ROLLBACK), reject any change.
+					if owns, ok := e.sessionScopeVars["__owns_anonymous_gtid"]; ok && owns == "1" {
+						return nil, mysqlError(1765, "HY000", "@@SESSION.GTID_NEXT cannot be changed by a client that owns a GTID. The client owns ANONYMOUS. Ownership is released on COMMIT or ROLLBACK.")
+					}
+					// Determine the normalized value.
+					var newGtidVal string
+					if _, isDefault := expr.Expr.(*sqlparser.Default); isDefault {
+						newGtidVal = "AUTOMATIC"
+					} else {
+						evalVal, _ := e.evalExpr(expr.Expr)
+						if evalVal != nil {
+							newGtidVal = strings.TrimSpace(fmt.Sprintf("%v", evalVal))
+						} else {
+							newGtidVal = strings.TrimSpace(val)
+						}
+					}
+					upperGtid := strings.ToUpper(newGtidVal)
+					if upperGtid == "ANONYMOUS" {
+						// Setting to ANONYMOUS means the session now owns this GTID slot.
+						e.sessionScopeVars["__owns_anonymous_gtid"] = "1"
+						e.sessionScopeVars["gtid_next"] = "ANONYMOUS"
+					} else if upperGtid == "AUTOMATIC" {
+						delete(e.sessionScopeVars, "__owns_anonymous_gtid")
+						e.sessionScopeVars["gtid_next"] = "AUTOMATIC"
+					} else {
+						// UUID:NUMBER format or other values - clear ownership.
+						delete(e.sessionScopeVars, "__owns_anonymous_gtid")
+						e.sessionScopeVars["gtid_next"] = newGtidVal
+					}
+					continue
+				}
 				// Enforce SUPER or SYSTEM_VARIABLES_ADMIN privilege for setting global variables.
 				// Non-privileged users get ER_SPECIFIC_ACCESS_DENIED_ERROR (1227).
 				if isGlobal {
