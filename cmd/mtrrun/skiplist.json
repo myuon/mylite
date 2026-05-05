@@ -2721,26 +2721,6 @@
       "reason": "output mismatch or execution error"
     },
     {
-      "test": "sys_vars/init_slave_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/innodb_cmp_per_index_enabled_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/log_error_suppression_list_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/max_delayed_threads_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/max_insert_delayed_threads_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/max_prepared_stmt_count_func",
       "reason": "output mismatch or execution error"
     },
@@ -2769,27 +2749,7 @@
       "reason": "output mismatch or execution error"
     },
     {
-      "test": "sys_vars/print_identified_with_as_hex_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/rpl_read_size_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/slow_launch_time_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/slow_query_log_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/sql_mode_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/sql_slave_skip_counter_basic",
       "reason": "output mismatch or execution error"
     },
     {
@@ -2997,10 +2957,6 @@
       "reason": "engine does not support gtid_purged"
     },
     {
-      "test": "sys_vars/original_server_version_basic",
-      "reason": "engine returns wrong value for original_server_version max"
-    },
-    {
       "test": "sys_vars/session_track_gtids_basic",
       "reason": "engine does not support session_track_gtids default OFF"
     },
@@ -3039,10 +2995,6 @@
     {
       "test": "gcol/gcol_keys_innodb",
       "reason": "failures"
-    },
-    {
-      "test": "sysschema/fn_ps_thread_account",
-      "reason": "ps_thread_account function not implemented"
     },
     {
       "test": "parts/part_blocked_sql_func_innodb",
@@ -3147,10 +3099,6 @@
     {
       "test": "gcol/gcol_bugfixes",
       "reason": "INSERT IGNORE not ignoring generated column null constraint"
-    },
-    {
-      "test": "innodb/zlob_geom",
-      "reason": "out of range value for geometry column"
     },
     {
       "test": "funcs_1/row_count_func",
@@ -4021,18 +3969,6 @@
       "reason": "spatial/rtree feature not implemented"
     },
     {
-      "test": "sys_vars/sql_big_selects_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/sql_buffer_result_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/sql_select_limit_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "innodb/innodb_bug21704",
       "reason": "SHOW CREATE TABLE ordering issues; affected rows differs for online ALTER TABLE CHANGE"
     },
@@ -4169,10 +4105,6 @@
       "reason": "@@session.character_set_results casing issue"
     },
     {
-      "test": "sys_vars/windowing_use_high_precision_basic",
-      "reason": "float formatting and EXPLAIN output mismatch"
-    },
-    {
       "test": "sys_vars/optimizer_switch_basic",
       "reason": "complex SET optimizer_switch parsing not supported"
     },
@@ -4237,16 +4169,76 @@
       "reason": "fulltext boolean syntax variable validation issues"
     },
     {
-      "test": "innodb/alter_rename_existing",
-      "reason": "alter rename table not working"
-    },
-    {
       "test": "engine_funcs/jp_comment_older_compatibility1",
       "reason": "EUC-JP character ordering mismatch"
     },
     {
       "test": "sys_vars/pseudo_slave_mode_basic",
       "reason": "complex: warnings + transaction blocking required"
+    },
+    {
+      "test": "sys_vars/max_delayed_threads_basic",
+      "reason": "session-scope SET should give ER_WRONG_VALUE_FOR_VAR not ER_GLOBAL_VARIABLE"
+    },
+    {
+      "test": "sys_vars/max_insert_delayed_threads_basic",
+      "reason": "session-scope SET should give ER_WRONG_VALUE_FOR_VAR not ER_GLOBAL_VARIABLE"
+    },
+    {
+      "test": "sys_vars/innodb_cmp_per_index_enabled_basic",
+      "reason": "error"
+    },
+    {
+      "test": "sys_vars/log_error_suppression_list_basic",
+      "reason": "complex validation logic needed"
+    },
+    {
+      "test": "sys_vars/print_identified_with_as_hex_basic",
+      "reason": "error"
+    },
+    {
+      "test": "sys_vars/rpl_read_size_basic",
+      "reason": "complex scope handling"
+    },
+    {
+      "test": "sys_vars/init_slave_basic",
+      "reason": "type validation for string-type vars"
+    },
+    {
+      "test": "sys_vars/sql_slave_skip_counter_basic",
+      "reason": "GTID mode interaction needed"
+    },
+    {
+      "test": "sys_vars/windowing_use_high_precision_basic",
+      "reason": "float formatting and EXPLAIN output mismatch"
+    },
+    {
+      "test": "sys_vars/sql_big_selects_func",
+      "reason": "execution error"
+    },
+    {
+      "test": "sys_vars/sql_buffer_result_func",
+      "reason": "Created_tmp_tables not tracking correctly"
+    },
+    {
+      "test": "sys_vars/sql_select_limit_func",
+      "reason": "affected rows mismatch"
+    },
+    {
+      "test": "sys_vars/slow_launch_time_func",
+      "reason": "subtest mechanism failure"
+    },
+    {
+      "test": "sys_vars/slow_query_log_func",
+      "reason": "slow log query count mismatch"
+    },
+    {
+      "test": "innodb/alter_rename_existing",
+      "reason": "filesystem operations and tablespace handling needed"
+    },
+    {
+      "test": "innodb/zlob_geom",
+      "reason": "out of range value for geometry column"
     }
   ]
 }
