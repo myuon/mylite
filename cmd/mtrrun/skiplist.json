@@ -4113,10 +4113,6 @@
       "reason": "out of range value for geometry column"
     },
     {
-      "test": "sys_vars/ft_boolean_syntax_basic",
-      "reason": "needs value validation"
-    },
-    {
       "test": "sys_vars/explicit_defaults_for_timestamp_basic",
       "reason": "needs SUPER privilege check for SET GLOBAL"
     },

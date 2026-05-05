@@ -1170,10 +1170,34 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						e.sessionScopeVars[cleanName] = normalized
 					}
 				} else if cleanName == "ft_boolean_syntax" {
-					// ft_boolean_syntax must be exactly 14 characters with no duplicates
-					// (except the phrase delimiter pair at positions 10-11, which may be equal).
+					// ft_boolean_syntax must be exactly 14 characters with specific constraints.
+					// Type check: integer/boolean values are not allowed (ER_WRONG_TYPE_FOR_VAR).
+					if _, isUnary := expr.Expr.(*sqlparser.UnaryExpr); isUnary {
+						return nil, mysqlError(1232, "42000", "Incorrect argument type to variable 'ft_boolean_syntax'")
+					}
+					if _, isBool := expr.Expr.(sqlparser.BoolVal); isBool {
+						return nil, mysqlError(1232, "42000", "Incorrect argument type to variable 'ft_boolean_syntax'")
+					}
+					// Determine the expression type to decide how to validate.
+					rawExprStr := sqlparser.String(expr.Expr)
+					isStringLiteral := strings.HasPrefix(rawExprStr, "'") || strings.HasPrefix(rawExprStr, "\"")
+					isVarRef := strings.HasPrefix(rawExprStr, "@") // user variable or system variable
+					isColName := false
+					if _, ok := expr.Expr.(*sqlparser.ColName); ok {
+						isColName = true
+					}
+					if !isStringLiteral && !isVarRef && isColName {
+						// Bare identifier like ON, ENABLE → always invalid, use identifier name in error.
+						colNameExpr := expr.Expr.(*sqlparser.ColName)
+						displayVal := colNameExpr.Name.String()
+						return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'ft_boolean_syntax' can't be set to the value of '%s'", displayVal))
+					}
+					// Get the evaluated string value (resolves string literals, @vars, @@vars).
+					var ftBoolVal string
 					evalVal, _ := e.evalExpr(expr.Expr)
-					ftBoolVal := toString(evalVal)
+					if evalVal != nil {
+						ftBoolVal = toString(evalVal)
+					}
 					if ftBoolVal == "" {
 						ftBoolVal = strings.Trim(val, "'\"")
 					}
@@ -1181,21 +1205,32 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					if len(runes) != 14 {
 						return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'ft_boolean_syntax' can't be set to the value of '%s'", ftBoolVal))
 					}
-					// Check for duplicate characters (positions 10 and 11 may be equal as phrase pair)
-					charCount := make(map[rune]int)
+					// Check: no alphanumeric characters allowed.
 					for _, r := range runes {
-						charCount[r]++
-					}
-					invalid := false
-					for r, cnt := range charCount {
-						if cnt > 1 {
-							// Allowed only if the duplicates are exactly at positions 10 and 11
-							if cnt == 2 && runes[10] == r && runes[11] == r {
-								continue
-							}
-							invalid = true
-							break
+						if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+							return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'ft_boolean_syntax' can't be set to the value of '%s'", ftBoolVal))
 						}
+					}
+					// Check: space (0x20) is only allowed at positions 0 or 1.
+					for i, r := range runes {
+						if r == ' ' && i > 1 {
+							return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'ft_boolean_syntax' can't be set to the value of '%s'", ftBoolVal))
+						}
+					}
+					// Check for duplicate characters (positions 10 and 11 may be equal as phrase pair)
+					seen := make(map[rune]int)
+					invalid := false
+					for i, r := range runes {
+						if prev, exists := seen[r]; exists {
+							// Allowed only if both occurrences are at positions 10 and 11
+							if i == 11 && prev == 10 {
+								// OK: phrase delimiter pair
+							} else {
+								invalid = true
+								break
+							}
+						}
+						seen[r] = i
 					}
 					if invalid {
 						return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'ft_boolean_syntax' can't be set to the value of '%s'", ftBoolVal))
@@ -1773,6 +1808,11 @@ func (e *Executor) handleRawSet(raw string) error {
 		// Reject NULL for string-type system variables
 		if strings.ToUpper(val) == "NULL" && sysVarStringType[varName] {
 			return mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of 'NULL'", varName))
+		}
+		// ft_boolean_syntax requires a quoted string value. handleRawSet is called when vitess
+		// already failed to parse the expression; if the value is unquoted, propagate as parse error.
+		if varName == "ft_boolean_syntax" && !strings.HasPrefix(val, "'") && !strings.HasPrefix(val, "\"") {
+			return mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", val))
 		}
 		// If the value is an unquoted SQL reserved keyword, vitess rejected it for good reason.
 		// Propagate as syntax error, but only for non-enum variables (enum vars often use reserved words as values).
