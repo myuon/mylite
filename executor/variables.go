@@ -545,7 +545,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			if name == "character_set_database" {
 				e.addWarning("Warning", 1681, "Updating 'character_set_database' is deprecated. It will be made read-only in a future release.")
 			}
-		case "lc_time_names":
+		case "lc_time_names", "lc_messages":
 			isGlobal := scope == sqlparser.GlobalScope
 			locVal := val
 			if strings.ToUpper(locVal) == "DEFAULT" {
@@ -583,10 +583,20 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						locVal = strings.ToUpper(rawName)
 					}
 				}
-				// Floats are ER_WRONG_TYPE_FOR_VAR
+				// Floats are ER_WRONG_TYPE_FOR_VAR.
+				// Also check the original expression for scientific notation (1e1) which
+				// evaluates to an integer string but is semantically a float literal.
+				if lit, isLit := expr.Expr.(*sqlparser.Literal); isLit {
+					litStr := sqlparser.String(lit)
+					if strings.ContainsAny(litStr, ".eE") {
+						if _, fErr := strconv.ParseFloat(litStr, 64); fErr == nil {
+							return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
+						}
+					}
+				}
 				if strings.ContainsAny(locVal, ".eE") {
 					if _, fErr := strconv.ParseFloat(locVal, 64); fErr == nil {
-						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable 'lc_time_names'"))
+						return nil, mysqlError(1232, "42000", fmt.Sprintf("Incorrect argument type to variable '%s'", name))
 					}
 				}
 				// Numeric locale ID: 0-110 are valid.

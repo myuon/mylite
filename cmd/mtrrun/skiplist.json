@@ -2729,10 +2729,6 @@
       "reason": "output mismatch or execution error"
     },
     {
-      "test": "sys_vars/lc_messages_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/log_error_suppression_list_basic",
       "reason": "output mismatch or execution error"
     },
@@ -2766,10 +2762,6 @@
     },
     {
       "test": "sys_vars/mysql_native_password_proxy_users_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/optimizer_switch_basic",
       "reason": "output mismatch or execution error"
     },
     {
@@ -2917,14 +2909,6 @@
       "reason": "uses slow_log table"
     },
     {
-      "test": "other/func_math",
-      "reason": "timeout"
-    },
-    {
-      "test": "other/derived",
-      "reason": "timeout"
-    },
-    {
       "test": "other/sp",
       "reason": "test file is 9787 lines, takes >20s to run"
     },
@@ -3057,10 +3041,6 @@
       "reason": "partition failures"
     },
     {
-      "test": "other/func_weight_string",
-      "reason": "timeout"
-    },
-    {
       "test": "gcol/gcol_select_myisam",
       "reason": "complex query failures"
     },
@@ -3181,10 +3161,6 @@
       "reason": "timeout"
     },
     {
-      "test": "other/insert",
-      "reason": "timeout"
-    },
-    {
       "test": "other/rollback",
       "reason": "timeout"
     },
@@ -3243,10 +3219,6 @@
     {
       "test": "sys_vars/character_set_client_func",
       "reason": "charset conversion not yet implemented"
-    },
-    {
-      "test": "sys_vars/character_set_results_basic",
-      "reason": "@@session.character_set_results casing issue"
     },
     {
       "test": "sys_vars/character_set_client_basic",
@@ -3921,10 +3893,6 @@
       "reason": "requires concurrent metadata locking which is not implemented"
     },
     {
-      "test": "sys_vars/explicit_defaults_for_timestamp_basic",
-      "reason": "needs user privilege checking"
-    },
-    {
       "test": "sys_vars/windowing_use_high_precision_basic",
       "reason": "needs window functions"
     },
@@ -4237,10 +4205,6 @@
       "reason": "GRANT SHOW GRANTS missing all privileges list"
     },
     {
-      "test": "engine_funcs/jp_comment_older_compatibility1",
-      "reason": "row ordering issue in result"
-    },
-    {
       "test": "engine_iuds/update_delete_calendar",
       "reason": "column duplication in output; also WHERE clause date validation errors instead of returning 0 rows"
     },
@@ -4259,6 +4223,38 @@
     {
       "test": "innodb/partition_autoinc",
       "reason": "still failing"
+    },
+    {
+      "test": "other/func_math",
+      "reason": "complex - floor/rand/pi/format issues"
+    },
+    {
+      "test": "other/insert",
+      "reason": "view is not updatable error"
+    },
+    {
+      "test": "other/derived",
+      "reason": "mysqltest user access denied"
+    },
+    {
+      "test": "sys_vars/explicit_defaults_for_timestamp_basic",
+      "reason": "requires multi-connection + privilege check"
+    },
+    {
+      "test": "other/func_weight_string",
+      "reason": "timeout/memory issue"
+    },
+    {
+      "test": "engine_funcs/jp_comment_older_compatibility1",
+      "reason": "Japanese string ordering issue"
+    },
+    {
+      "test": "sys_vars/character_set_results_basic",
+      "reason": "@@session.character_set_results casing issue"
+    },
+    {
+      "test": "sys_vars/optimizer_switch_basic",
+      "reason": "output mismatch or execution error"
     }
   ]
 }
