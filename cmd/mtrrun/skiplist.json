@@ -4141,10 +4141,6 @@
       "reason": "needs SUPER privilege check for SET GLOBAL"
     },
     {
-      "test": "sys_vars/event_scheduler_basic",
-      "reason": "needs global-only var enforcement"
-    },
-    {
       "test": "sys_vars/init_connect_basic",
       "reason": "failing"
     },

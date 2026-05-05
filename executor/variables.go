@@ -2398,6 +2398,8 @@ var sysVarGlobalOnly = map[string]bool{
 	"innodb_log_group_home_dir":     true,
 	"innodb_redo_log_capacity":      true,
 	"innodb_segment_reserve_factor": true,
+	// event_scheduler is GLOBAL-only; session-scope SET/SELECT returns ER_GLOBAL_VARIABLE.
+	"event_scheduler": true,
 }
 
 // sysVarEnumSet contains system variables that are ENUM types where ON/OFF
