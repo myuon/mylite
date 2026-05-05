@@ -1715,15 +1715,25 @@ func (gs *GrantStore) BuildShowGrants(user, host string, usingRoles []string) []
 
 	var rows []string
 
-	// Always first: GRANT USAGE ON *.* (or ALL PRIVILEGES if they have everything)
+	// Always first: GRANT USAGE ON *.* (or expanded list if they have ALL PRIVILEGES)
 	globalKey := privKey{"*.*", GrantTypeGlobal}
 	if ps := privMap[globalKey]; ps != nil && len(ps.privs) > 0 {
-		privStr := formatPrivList(ps.privs)
 		suffix := ""
 		if ps.grantOption {
 			suffix = " WITH GRANT OPTION"
 		}
-		rows = append(rows, fmt.Sprintf("GRANT %s ON *.* TO `%s`@`%s`%s", privStr, user, host, suffix))
+		if ps.privs["ALL PRIVILEGES"] {
+			// Expand ALL PRIVILEGES to the full static list + a separate dynamic privileges line.
+			// MySQL 8.0 format: static privs use backtick quoting, dynamic privs use single-quote
+			// for the user part when user is empty (anonymous user).
+			rows = append(rows, fmt.Sprintf("GRANT %s ON *.* TO `%s`@`%s`%s", allStaticPrivsStr, user, host, suffix))
+			// Dynamic privileges line: use single-quote quoting for user (MySQL 8.0 format)
+			dynUserStr := "'" + user + "'"
+			rows = append(rows, fmt.Sprintf("GRANT %s ON *.* TO %s@`%s`%s", allDynamicPrivsStr, dynUserStr, host, suffix))
+		} else {
+			privStr := formatPrivList(ps.privs)
+			rows = append(rows, fmt.Sprintf("GRANT %s ON *.* TO `%s`@`%s`%s", privStr, user, host, suffix))
+		}
 		hasGlobal = true
 	}
 	if !hasGlobal {
@@ -2015,6 +2025,13 @@ var privOrder = []string{
 	"SHOW VIEW", "CREATE ROUTINE", "ALTER ROUTINE", "CREATE USER",
 	"EVENT", "TRIGGER", "CREATE TABLESPACE",
 }
+
+// allStaticPrivsStr is the expanded static privilege list shown when ALL PRIVILEGES is granted.
+// Matches MySQL 8.0 SHOW GRANTS output order.
+const allStaticPrivsStr = "SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, SHUTDOWN, PROCESS, FILE, REFERENCES, INDEX, ALTER, SHOW DATABASES, SUPER, CREATE TEMPORARY TABLES, LOCK TABLES, EXECUTE, REPLICATION SLAVE, REPLICATION CLIENT, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, CREATE USER, EVENT, TRIGGER, CREATE TABLESPACE, CREATE ROLE, DROP ROLE"
+
+// allDynamicPrivsStr is the dynamic privilege list shown when ALL PRIVILEGES is granted.
+const allDynamicPrivsStr = "APPLICATION_PASSWORD_ADMIN,AUDIT_ADMIN,BACKUP_ADMIN,BINLOG_ADMIN,BINLOG_ENCRYPTION_ADMIN,CLONE_ADMIN,CONNECTION_ADMIN,ENCRYPTION_KEY_ADMIN,GROUP_REPLICATION_ADMIN,INNODB_REDO_LOG_ARCHIVE,PERSIST_RO_VARIABLES_ADMIN,REPLICATION_SLAVE_ADMIN,RESOURCE_GROUP_ADMIN,RESOURCE_GROUP_USER,ROLE_ADMIN,SERVICE_CONNECTION_ADMIN,SESSION_VARIABLES_ADMIN,SET_USER_ID,SYSTEM_USER,SYSTEM_VARIABLES_ADMIN,TABLE_ENCRYPTION_ADMIN,XA_RECOVER_ADMIN"
 
 func formatPrivList(privs map[string]bool) string {
 	if privs["ALL PRIVILEGES"] {

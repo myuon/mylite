@@ -4025,10 +4025,6 @@
       "reason": "lock_mode=0 bulk reservation not yet implemented"
     },
     {
-      "test": "auth_sec/anonymous_grants",
-      "reason": "GRANT SHOW GRANTS missing all privileges list"
-    },
-    {
       "test": "engine_iuds/update_delete_calendar",
       "reason": "column duplication in output; also WHERE clause date validation errors instead of returning 0 rows"
     },
