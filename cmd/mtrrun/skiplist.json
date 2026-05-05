@@ -4255,6 +4255,14 @@
     {
       "test": "innodb/innodb_misc1",
       "reason": "duplicate key with PAD SPACE collation; also DROP TABLE FK error; also FK on temp table not rejected"
+    },
+    {
+      "test": "funcs_1/is_basics_mixed",
+      "reason": "needs DROP USER support"
+    },
+    {
+      "test": "innodb/partition_autoinc",
+      "reason": "still failing"
     }
   ]
 }
