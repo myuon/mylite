@@ -2773,10 +2773,6 @@
       "reason": "output mismatch or execution error"
     },
     {
-      "test": "sys_vars/pseudo_slave_mode_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/rpl_read_size_basic",
       "reason": "output mismatch or execution error"
     },
@@ -3073,10 +3069,6 @@
       "reason": "lock timeout test failures"
     },
     {
-      "test": "sys_vars/event_scheduler_basic",
-      "reason": "failures"
-    },
-    {
       "test": "sys_vars/delay_key_write_func",
       "reason": "failures"
     },
@@ -3145,22 +3137,6 @@
       "reason": "failures"
     },
     {
-      "test": "parts/partition_auto_increment_innodb",
-      "reason": "timeout"
-    },
-    {
-      "test": "other/cast",
-      "reason": "timeout"
-    },
-    {
-      "test": "other/update",
-      "reason": "timeout"
-    },
-    {
-      "test": "other/rollback",
-      "reason": "timeout"
-    },
-    {
       "test": "other/wl3836",
       "reason": "timeout"
     },
@@ -3189,10 +3165,6 @@
       "reason": "query expansion not supported"
     },
     {
-      "test": "json/json_conversions",
-      "reason": "stack overrun on complex expression"
-    },
-    {
       "test": "sys_vars/autocommit_func",
       "reason": "multi-connection test failure"
     },
@@ -3203,10 +3175,6 @@
     {
       "test": "innodb/innodb_bug42419",
       "reason": "timeout"
-    },
-    {
-      "test": "json/array_index",
-      "reason": "failing"
     },
     {
       "test": "gcol/gcol_keys_myisam",
@@ -3889,10 +3857,6 @@
       "reason": "requires concurrent metadata locking which is not implemented"
     },
     {
-      "test": "sys_vars/windowing_use_high_precision_basic",
-      "reason": "needs window functions"
-    },
-    {
       "test": "sys_vars/histogram_generation_max_mem_size_basic",
       "reason": "needs user privilege checking"
     },
@@ -4073,10 +4037,6 @@
       "reason": "SHOW CREATE TABLE ordering issues; affected rows differs for online ALTER TABLE CHANGE"
     },
     {
-      "test": "json/json_table",
-      "reason": "JSON_TABLE with complex subquery and STRAIGHT_JOIN; ORDER BY column number issue"
-    },
-    {
       "test": "innodb/innodb-alter",
       "reason": "EXPLAIN output differences; also ALTER TABLE CHANGE column not found"
     },
@@ -4133,10 +4093,6 @@
       "reason": "SHOW GRANTS FOR PUBLIC not implemented"
     },
     {
-      "test": "innodb_fts/fulltext_var",
-      "reason": "fulltext search boolean syntax error mismatch"
-    },
-    {
       "test": "innodb_fts/opt",
       "reason": "internally skipped by test itself"
     },
@@ -4157,16 +4113,8 @@
       "reason": "failures: internally skipped by test, SKIP_LOCKED/NOWAIT semantics"
     },
     {
-      "test": "innodb/alter_rename_existing",
-      "reason": "still failing: requires filesystem file manipulation --exec, --list_files, MYSQLD_DATADIR"
-    },
-    {
       "test": "innodb/table_compress",
       "reason": "CREATE TABLE LIKE cross-database issue (fixed), but COMPRESSION attribute not stored/displayed and test uses restart_mysqld"
-    },
-    {
-      "test": "sys_vars/delay_key_write_basic",
-      "reason": "needs invalid enum value rejection: OF should parse error but doesn't"
     },
     {
       "test": "innodb/instant_add_column_clear",
@@ -4187,10 +4135,6 @@
     {
       "test": "innodb/default_row_format_tablespace",
       "reason": "failures"
-    },
-    {
-      "test": "gcol/gcol_select_innodb",
-      "reason": "only_full_group_by error"
     },
     {
       "test": "innodb/innodb-autoinc",
@@ -4221,36 +4165,88 @@
       "reason": "still failing"
     },
     {
-      "test": "other/func_math",
-      "reason": "complex - floor/rand/pi/format issues"
+      "test": "sys_vars/character_set_results_basic",
+      "reason": "@@session.character_set_results casing issue"
     },
     {
-      "test": "other/insert",
-      "reason": "view is not updatable error"
+      "test": "sys_vars/windowing_use_high_precision_basic",
+      "reason": "float formatting and EXPLAIN output mismatch"
     },
     {
-      "test": "other/derived",
-      "reason": "mysqltest user access denied"
+      "test": "sys_vars/optimizer_switch_basic",
+      "reason": "complex SET optimizer_switch parsing not supported"
     },
     {
       "test": "sys_vars/explicit_defaults_for_timestamp_basic",
-      "reason": "requires multi-connection + privilege check"
+      "reason": "needs SUPER privilege check for SET GLOBAL"
+    },
+    {
+      "test": "sys_vars/event_scheduler_basic",
+      "reason": "needs global-only var enforcement"
+    },
+    {
+      "test": "other/cast",
+      "reason": "execution error with binary string insert"
+    },
+    {
+      "test": "other/func_math",
+      "reason": "multiple math func issues"
+    },
+    {
+      "test": "other/derived",
+      "reason": "access denied for user mysqltest_1"
+    },
+    {
+      "test": "other/insert",
+      "reason": "updatable view insert error"
+    },
+    {
+      "test": "gcol/gcol_select_innodb",
+      "reason": "generated column ordering issues"
     },
     {
       "test": "other/func_weight_string",
       "reason": "timeout/memory issue"
     },
     {
+      "test": "json/json_conversions",
+      "reason": "timeout"
+    },
+    {
+      "test": "json/array_index",
+      "reason": "JSON column default value not supported"
+    },
+    {
+      "test": "json/json_table",
+      "reason": "ORDER BY ordinal column reference not supported"
+    },
+    {
+      "test": "other/update",
+      "reason": "timeout"
+    },
+    {
+      "test": "other/rollback",
+      "reason": "timeout"
+    },
+    {
+      "test": "parts/partition_auto_increment_innodb",
+      "reason": "timeout"
+    },
+    {
+      "test": "innodb_fts/fulltext_var",
+      "reason": "fulltext boolean syntax variable validation issues"
+    },
+    {
+      "test": "innodb/alter_rename_existing",
+      "reason": "alter rename table not working"
+    },
+    {
       "test": "engine_funcs/jp_comment_older_compatibility1",
-      "reason": "Japanese string ordering issue"
+      "reason": "EUC-JP character ordering mismatch"
     },
     {
-      "test": "sys_vars/character_set_results_basic",
-      "reason": "@@session.character_set_results casing issue"
-    },
-    {
-      "test": "sys_vars/optimizer_switch_basic",
-      "reason": "output mismatch or execution error"
+      "test": "sys_vars/pseudo_slave_mode_basic",
+      "reason": "complex: warnings + transaction blocking required"
     }
   ]
 }
