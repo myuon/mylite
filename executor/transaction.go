@@ -271,6 +271,8 @@ func (e *Executor) execCommit() (*Result, error) {
 	}
 	// Restore session isolation level if it was temporarily overridden by a NextTxScope set.
 	e.restoreNextTxnIsolation()
+	// Release GTID ownership acquired by SET SESSION gtid_next = 'ANONYMOUS'.
+	delete(e.sessionScopeVars, "__owns_anonymous_gtid")
 	return &Result{}, nil
 }
 
@@ -364,6 +366,8 @@ func (e *Executor) execRollback() (*Result, error) {
 		// End implicit autocommit=0 transaction tracking if present.
 		e.endImplicitTxnTracked()
 		e.restoreNextTxnIsolation()
+		// Release GTID ownership acquired by SET SESSION gtid_next = 'ANONYMOUS'.
+		delete(e.sessionScopeVars, "__owns_anonymous_gtid")
 		return &Result{}, nil
 	}
 	sp := e.savepoint
@@ -377,6 +381,8 @@ func (e *Executor) execRollback() (*Result, error) {
 	}
 	// Restore session isolation level if it was temporarily overridden by a NextTxScope set.
 	e.restoreNextTxnIsolation()
+	// Release GTID ownership acquired by SET SESSION gtid_next = 'ANONYMOUS'.
+	delete(e.sessionScopeVars, "__owns_anonymous_gtid")
 
 	// If we have an undo log, use it for precise per-connection rollback
 	// instead of the snapshot-based approach which can clobber other connections' data.
