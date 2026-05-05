@@ -3153,10 +3153,6 @@
       "reason": "partition failures"
     },
     {
-      "test": "innodb/innodb-alter-nullable",
-      "reason": "failures"
-    },
-    {
       "test": "other/func_weight_string",
       "reason": "timeout"
     },
