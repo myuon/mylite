@@ -1162,6 +1162,101 @@ func (e *Executor) normalizeOptimizerTrace(newValue string, expr sqlparser.Expr,
 	return "", mysqlError(1231, "42000", fmt.Sprintf("Variable 'optimizer_trace' can't be set to the value of '%s'", newValue))
 }
 
+// optimizerTraceFeaturesBitmaskToText converts an integer bitmask for optimizer_trace_features
+// to the canonical key=value text form. Bits: 0=greedy_search, 1=range_optimizer,
+// 2=dynamic_range, 3=repeated_subselect.
+func optimizerTraceFeaturesBitmaskToText(n int64) string {
+	onOff := func(bit int64) string {
+		if n&bit != 0 {
+			return "on"
+		}
+		return "off"
+	}
+	return fmt.Sprintf("greedy_search=%s,range_optimizer=%s,dynamic_range=%s,repeated_subselect=%s",
+		onOff(1), onOff(2), onOff(4), onOff(8))
+}
+
+// normalizeOptimizerTraceFeatures normalizes a SET value for optimizer_trace_features.
+// Accepts integer bitmask or key=value pairs; rejects floats and invalid strings.
+func (e *Executor) normalizeOptimizerTraceFeatures(newValue string, expr sqlparser.Expr, evalVal interface{}) (string, error) {
+	const defaultFeatures = "greedy_search=on,range_optimizer=on,dynamic_range=on,repeated_subselect=on"
+	validKeys := map[string]bool{
+		"greedy_search": true, "range_optimizer": true,
+		"dynamic_range": true, "repeated_subselect": true,
+	}
+
+	// Reject float/scientific notation literals
+	if lit, isLit := expr.(*sqlparser.Literal); isLit {
+		litStr := sqlparser.String(lit)
+		isQuoted := strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"")
+		if !isQuoted && strings.ContainsAny(litStr, ".eE") {
+			return "", mysqlError(1232, "42000", "Incorrect argument type to variable 'optimizer_trace_features'")
+		}
+	}
+
+	upper := strings.ToUpper(strings.TrimSpace(newValue))
+	if upper == "DEFAULT" {
+		return defaultFeatures, nil
+	}
+
+	// If numeric integer, convert bitmask to text
+	if n, err := strconv.ParseInt(strings.TrimSpace(newValue), 10, 64); err == nil {
+		return optimizerTraceFeaturesBitmaskToText(n), nil
+	}
+
+	// Handle key=value format
+	if strings.Contains(newValue, "=") {
+		// Get current value for merging
+		currentValue := defaultFeatures
+		if cv, ok := e.getSysVar("optimizer_trace_features"); ok {
+			currentValue = cv
+		}
+		type flagEntry struct{ key, val string }
+		var flags []flagEntry
+		flagIndex := map[string]int{}
+		for _, part := range strings.Split(currentValue, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			kv := strings.SplitN(part, "=", 2)
+			if len(kv) == 2 {
+				k, v := strings.TrimSpace(kv[0]), strings.TrimSpace(kv[1])
+				flagIndex[k] = len(flags)
+				flags = append(flags, flagEntry{k, v})
+			}
+		}
+		for _, part := range strings.Split(newValue, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			kv := strings.SplitN(part, "=", 2)
+			if len(kv) != 2 {
+				return "", mysqlError(1231, "42000", fmt.Sprintf("Variable 'optimizer_trace_features' can't be set to the value of '%s'", newValue))
+			}
+			k, v := strings.ToLower(strings.TrimSpace(kv[0])), strings.ToLower(strings.TrimSpace(kv[1]))
+			if !validKeys[k] {
+				return "", mysqlError(1231, "42000", fmt.Sprintf("Variable 'optimizer_trace_features' can't be set to the value of '%s'", newValue))
+			}
+			if v != "on" && v != "off" {
+				return "", mysqlError(1231, "42000", fmt.Sprintf("Variable 'optimizer_trace_features' can't be set to the value of '%s'", newValue))
+			}
+			if idx, exists := flagIndex[k]; exists {
+				flags[idx].val = v
+			}
+		}
+		parts := make([]string, len(flags))
+		for i, f := range flags {
+			parts[i] = f.key + "=" + f.val
+		}
+		return strings.Join(parts, ","), nil
+	}
+
+	// Unknown string value
+	return "", mysqlError(1231, "42000", fmt.Sprintf("Variable 'optimizer_trace_features' can't be set to the value of '%s'", newValue))
+}
+
 // deleteSysVar deletes a system variable from the appropriate scope map (for DEFAULT).
 func (e *Executor) deleteSysVar(name string, isGlobal bool) {
 	if isGlobal {

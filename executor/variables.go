@@ -1406,6 +1406,17 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							return nil, traceErr
 						}
 						e.sessionScopeVars[cleanName] = traceVal
+					} else if cleanName == "optimizer_trace_features" {
+						// optimizer_trace_features uses bitmask or key=value format.
+						sv := val
+						if evalVal != nil {
+							sv = fmt.Sprintf("%v", evalVal)
+						}
+						featVal, featErr := e.normalizeOptimizerTraceFeatures(sv, expr.Expr, evalVal)
+						if featErr != nil {
+							return nil, featErr
+						}
+						e.sessionScopeVars[cleanName] = featVal
 					} else if isBooleanVariable(cleanName) {
 						boolVal, bErr := normalizeBooleanSetValue(cleanName, expr.Expr, evalVal)
 						if bErr != nil {
