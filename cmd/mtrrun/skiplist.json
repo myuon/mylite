@@ -2705,10 +2705,6 @@
       "reason": "still failing"
     },
     {
-      "test": "sys_vars/default_table_encryption_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/enforce_gtid_consistency_basic",
       "reason": "output mismatch or execution error"
     },
@@ -2725,10 +2721,6 @@
       "reason": "output mismatch or execution error"
     },
     {
-      "test": "sys_vars/max_sort_length_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/myisam_data_pointer_size_func",
       "reason": "output mismatch or execution error"
     },
@@ -2741,27 +2733,7 @@
       "reason": "output mismatch or execution error"
     },
     {
-      "test": "sys_vars/mysql_native_password_proxy_users_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/optimizer_trace_features_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/sql_mode_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/table_encryption_privilege_check_basic",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/time_zone_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
-      "test": "sys_vars/updatable_views_with_limit_func",
       "reason": "output mismatch or execution error"
     },
     {
@@ -2881,10 +2853,6 @@
       "reason": "timeout in mtrrun"
     },
     {
-      "test": "sys_vars/init_connect_basic",
-      "reason": "failing"
-    },
-    {
       "test": "collations/croatian",
       "reason": "collation sort order issue"
     },
@@ -2943,10 +2911,6 @@
     {
       "test": "max_parts/partition_max_parts_inv_innodb",
       "reason": "still failing"
-    },
-    {
-      "test": "sys_vars/binlog_checksum_basic",
-      "reason": "output mismatch"
     },
     {
       "test": "sys_vars/binlog_encryption",
@@ -3805,14 +3769,6 @@
       "reason": "requires concurrent metadata locking which is not implemented"
     },
     {
-      "test": "sys_vars/histogram_generation_max_mem_size_basic",
-      "reason": "needs user privilege checking"
-    },
-    {
-      "test": "sys_vars/ft_boolean_syntax_basic",
-      "reason": "needs value validation"
-    },
-    {
       "test": "sys_vars/innodb_redo_log_archive_dirs_basic",
       "reason": "needs format validation and nullable-empty interaction fix"
     },
@@ -3831,10 +3787,6 @@
     {
       "test": "sys_vars/innodb_monitor_reset_all_basic",
       "reason": "innodb_metrics ordering/set mismatch"
-    },
-    {
-      "test": "sys_vars/original_commit_timestamp_basic",
-      "reason": "off-by-one in value computation and needs privilege checking"
     },
     {
       "test": "sys_vars/slave_parallel_workers_basic",
@@ -3967,10 +3919,6 @@
     {
       "test": "innodb_gis/rtree_purge",
       "reason": "spatial/rtree feature not implemented"
-    },
-    {
-      "test": "innodb/innodb_bug21704",
-      "reason": "SHOW CREATE TABLE ordering issues; affected rows differs for online ALTER TABLE CHANGE"
     },
     {
       "test": "innodb/innodb-alter",
@@ -4109,22 +4057,6 @@
       "reason": "complex SET optimizer_switch parsing not supported"
     },
     {
-      "test": "sys_vars/explicit_defaults_for_timestamp_basic",
-      "reason": "needs SUPER privilege check for SET GLOBAL"
-    },
-    {
-      "test": "sys_vars/event_scheduler_basic",
-      "reason": "needs global-only var enforcement"
-    },
-    {
-      "test": "other/cast",
-      "reason": "execution error with binary string insert"
-    },
-    {
-      "test": "other/func_math",
-      "reason": "multiple math func issues"
-    },
-    {
       "test": "other/derived",
       "reason": "access denied for user mysqltest_1"
     },
@@ -4145,14 +4077,6 @@
       "reason": "timeout"
     },
     {
-      "test": "json/array_index",
-      "reason": "JSON column default value not supported"
-    },
-    {
-      "test": "json/json_table",
-      "reason": "ORDER BY ordinal column reference not supported"
-    },
-    {
       "test": "other/update",
       "reason": "timeout"
     },
@@ -4169,48 +4093,12 @@
       "reason": "fulltext boolean syntax variable validation issues"
     },
     {
-      "test": "engine_funcs/jp_comment_older_compatibility1",
-      "reason": "EUC-JP character ordering mismatch"
-    },
-    {
       "test": "sys_vars/pseudo_slave_mode_basic",
       "reason": "complex: warnings + transaction blocking required"
     },
     {
-      "test": "sys_vars/max_delayed_threads_basic",
-      "reason": "session-scope SET should give ER_WRONG_VALUE_FOR_VAR not ER_GLOBAL_VARIABLE"
-    },
-    {
-      "test": "sys_vars/max_insert_delayed_threads_basic",
-      "reason": "session-scope SET should give ER_WRONG_VALUE_FOR_VAR not ER_GLOBAL_VARIABLE"
-    },
-    {
-      "test": "sys_vars/innodb_cmp_per_index_enabled_basic",
-      "reason": "error"
-    },
-    {
       "test": "sys_vars/log_error_suppression_list_basic",
       "reason": "complex validation logic needed"
-    },
-    {
-      "test": "sys_vars/print_identified_with_as_hex_basic",
-      "reason": "error"
-    },
-    {
-      "test": "sys_vars/rpl_read_size_basic",
-      "reason": "complex scope handling"
-    },
-    {
-      "test": "sys_vars/init_slave_basic",
-      "reason": "type validation for string-type vars"
-    },
-    {
-      "test": "sys_vars/sql_slave_skip_counter_basic",
-      "reason": "GTID mode interaction needed"
-    },
-    {
-      "test": "sys_vars/windowing_use_high_precision_basic",
-      "reason": "float formatting and EXPLAIN output mismatch"
     },
     {
       "test": "sys_vars/sql_big_selects_func",
@@ -4239,6 +4127,114 @@
     {
       "test": "innodb/zlob_geom",
       "reason": "out of range value for geometry column"
+    },
+    {
+      "test": "sys_vars/max_delayed_threads_basic",
+      "reason": "session-scope SET should give ER_WRONG_VALUE_FOR_VAR not ER_GLOBAL_VARIABLE"
+    },
+    {
+      "test": "sys_vars/max_insert_delayed_threads_basic",
+      "reason": "session-scope SET should give ER_WRONG_VALUE_FOR_VAR not ER_GLOBAL_VARIABLE"
+    },
+    {
+      "test": "sys_vars/ft_boolean_syntax_basic",
+      "reason": "needs value validation"
+    },
+    {
+      "test": "sys_vars/explicit_defaults_for_timestamp_basic",
+      "reason": "needs SUPER privilege check for SET GLOBAL"
+    },
+    {
+      "test": "sys_vars/event_scheduler_basic",
+      "reason": "needs global-only var enforcement"
+    },
+    {
+      "test": "sys_vars/init_connect_basic",
+      "reason": "failing"
+    },
+    {
+      "test": "sys_vars/binlog_checksum_basic",
+      "reason": "output mismatch"
+    },
+    {
+      "test": "sys_vars/default_table_encryption_basic",
+      "reason": "output mismatch or execution error"
+    },
+    {
+      "test": "sys_vars/updatable_views_with_limit_func",
+      "reason": "output mismatch or execution error"
+    },
+    {
+      "test": "sys_vars/sql_mode_func",
+      "reason": "output mismatch or execution error"
+    },
+    {
+      "test": "sys_vars/optimizer_trace_features_basic",
+      "reason": "output mismatch or execution error"
+    },
+    {
+      "test": "sys_vars/time_zone_func",
+      "reason": "output mismatch or execution error"
+    },
+    {
+      "test": "sys_vars/max_sort_length_func",
+      "reason": "output mismatch or execution error"
+    },
+    {
+      "test": "sys_vars/mysql_native_password_proxy_users_func",
+      "reason": "output mismatch or execution error"
+    },
+    {
+      "test": "other/cast",
+      "reason": "execution error with binary string insert"
+    },
+    {
+      "test": "other/func_math",
+      "reason": "multiple math func issues"
+    },
+    {
+      "test": "innodb/innodb_bug21704",
+      "reason": "SHOW CREATE TABLE ordering issues; affected rows differs for online ALTER TABLE CHANGE"
+    },
+    {
+      "test": "json/json_table",
+      "reason": "ORDER BY ordinal column reference not supported"
+    },
+    {
+      "test": "json/array_index",
+      "reason": "JSON column default value not supported"
+    },
+    {
+      "test": "sys_vars/innodb_cmp_per_index_enabled_basic",
+      "reason": "error"
+    },
+    {
+      "test": "sys_vars/print_identified_with_as_hex_basic",
+      "reason": "error"
+    },
+    {
+      "test": "engine_funcs/jp_comment_older_compatibility1",
+      "reason": "EUC-JP character ordering mismatch"
+    },
+    {
+      "test": "sys_vars/rpl_read_size_basic",
+      "reason": "complex scope handling"
+    },
+    {
+      "test": "sys_vars/init_slave_basic",
+      "reason": "type validation for string-type vars"
+    },
+    {
+      "test": "sys_vars/sql_slave_skip_counter_basic",
+      "reason": "GTID mode interaction needed"
+    },
+    {
+      "test": "sys_vars/windowing_use_high_precision_basic",
+      "reason": "float formatting and EXPLAIN output mismatch"
+    },
+    {
+      "test": "sys_vars/histogram_generation_max_mem_size_basic",
+      "reason": "needs user privilege checking"
     }
   ]
 }
