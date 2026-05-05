@@ -4085,10 +4085,6 @@
       "reason": "out of range value for geometry column"
     },
     {
-      "test": "sys_vars/binlog_checksum_basic",
-      "reason": "output mismatch"
-    },
-    {
       "test": "sys_vars/default_table_encryption_basic",
       "reason": "output mismatch or execution error"
     },

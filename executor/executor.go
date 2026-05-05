@@ -353,6 +353,7 @@ type Executor struct {
 	Storage        *storage.Engine
 	CurrentDB      string
 	inTransaction  bool
+	inXATransaction bool // true while an XA transaction is active (XA START ... XA END/COMMIT/ROLLBACK)
 	savepoint      *txSavepoint
 	// namedSavepoints tracks savepoint names set in the current transaction.
 	// DDL statements (implicit commit) clears this map, so ROLLBACK TO SAVEPOINT fails.
@@ -2810,6 +2811,19 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		if strings.HasPrefix(upper, "CHECKSUM TABLE ") || upper == "CHECKSUM TABLE" {
 			return e.execOtherAdmin(query)
 		}
+		// XA transaction tracking: XA START sets inXATransaction; XA END/COMMIT/ROLLBACK clears it.
+		if strings.HasPrefix(upper, "XA ") {
+			rest := strings.TrimSpace(upper[3:])
+			if strings.HasPrefix(rest, "START ") || strings.HasPrefix(rest, "BEGIN ") {
+				e.inXATransaction = true
+			} else if strings.HasPrefix(rest, "END ") ||
+				strings.HasPrefix(rest, "COMMIT ") ||
+				strings.HasPrefix(rest, "ROLLBACK ") ||
+				rest == "END" || rest == "COMMIT" || rest == "ROLLBACK" {
+				e.inXATransaction = false
+			}
+			return &Result{}, nil
+		}
 		if strings.HasPrefix(upper, "CREATE EVENT") ||
 			strings.HasPrefix(upper, "DROP EVENT") ||
 			strings.HasPrefix(upper, "CREATE USER") ||
@@ -2834,7 +2848,6 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			strings.HasPrefix(upper, "SIGNAL ") ||
 			strings.HasPrefix(upper, "RESIGNAL") ||
 			strings.HasPrefix(upper, "GET DIAGNOSTICS") ||
-			strings.HasPrefix(upper, "XA ") ||
 			strings.HasPrefix(upper, "ALTER PROCEDURE") ||
 			strings.HasPrefix(upper, "ALTER FUNCTION") ||
 			strings.HasPrefix(upper, "CHANGE ") ||
