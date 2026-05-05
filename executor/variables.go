@@ -792,13 +792,16 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 					if upperGtid == "ANONYMOUS" {
 						// Setting to ANONYMOUS means the session now owns this GTID slot.
 						e.sessionScopeVars["__owns_anonymous_gtid"] = "1"
+						delete(e.sessionScopeVars, "__owns_specific_gtid")
 						e.sessionScopeVars["gtid_next"] = "ANONYMOUS"
 					} else if upperGtid == "AUTOMATIC" {
 						delete(e.sessionScopeVars, "__owns_anonymous_gtid")
+						delete(e.sessionScopeVars, "__owns_specific_gtid")
 						e.sessionScopeVars["gtid_next"] = "AUTOMATIC"
 					} else {
-						// UUID:NUMBER format or other values - clear ownership.
+						// UUID:NUMBER format: session now owns this specific GTID.
 						delete(e.sessionScopeVars, "__owns_anonymous_gtid")
+						e.sessionScopeVars["__owns_specific_gtid"] = newGtidVal
 						e.sessionScopeVars["gtid_next"] = newGtidVal
 					}
 					continue
@@ -857,6 +860,17 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						if !hasPriv {
 							return nil, mysqlError(1227, "42000", "Access denied; you need (at least one of) the SUPER, SYSTEM_VARIABLES_ADMIN or SESSION_VARIABLES_ADMIN privilege(s) for this operation")
 						}
+					}
+				}
+				// binlog_checksum cannot be changed when there is an ongoing transaction or
+				// when the session owns a GTID (GTID_NEXT is set to ANONYMOUS or UUID:NUMBER).
+				if isGlobal && cleanName == "binlog_checksum" {
+					if e.inTransaction || e.inXATransaction {
+						return nil, mysqlError(1238, "HY000", "The system variable binlog_checksum cannot be set when there is an ongoing transaction.")
+					}
+					if ownedGtid, ok := e.sessionScopeVars["__owns_specific_gtid"]; ok && ownedGtid != "" {
+						lowerGtid := strings.ToLower(ownedGtid)
+						return nil, mysqlError(1238, "HY000", fmt.Sprintf("Variable binlog_checksum cannot be changed by a client that owns a GTID. The client owns %s. Ownership is released on COMMIT or ROLLBACK.", lowerGtid))
 					}
 				}
 				// Save previous session value before SET GLOBAL overwrites it.
