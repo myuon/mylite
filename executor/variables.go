@@ -898,6 +898,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				} else if rng, ok := sysVarIntRange[cleanName]; ok {
 					var clamped string
 					var err error
+					savedWarningsLen := len(e.warnings)
 					if rng.BlockSize > 0 {
 						clamped, err = e.clampIntVar(cleanName, expr.Expr, rng.Min, rng.Max, rng.IsUnsigned, rng.BlockSize)
 					} else {
@@ -944,6 +945,22 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 									}
 								}
 							}
+						}
+					}
+					// max_delayed_threads and max_insert_delayed_threads at session scope
+					// only allow values of 0 or the current global value (MySQL deprecated behavior).
+					// Any in-range value that doesn't equal 0 or global gives ER_WRONG_VALUE_FOR_VAR.
+					if !isGlobal && (cleanName == "max_delayed_threads" || cleanName == "max_insert_delayed_threads") {
+						globalVal := "20" // compiled default
+						if gv, ok := e.getGlobalVar(cleanName); ok {
+							globalVal = gv
+						}
+						if clamped != "0" && clamped != globalVal {
+							// Undo any clamping warnings and return ER_WRONG_VALUE_FOR_VAR.
+							e.warnings = e.warnings[:savedWarningsLen]
+							rawVal := strings.TrimSpace(sqlparser.String(expr.Expr))
+							rawVal = strings.Trim(rawVal, "'\"")
+							return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", cleanName, rawVal))
 						}
 					}
 					e.sessionScopeVars[cleanName] = clamped
