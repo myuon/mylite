@@ -3165,10 +3165,6 @@
       "reason": "output mismatch, timeout, or error"
     },
     {
-      "test": "perfschema/digest_null_literal",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
       "test": "perfschema/digest_table_full",
       "reason": "output mismatch, timeout, or error"
     },
