@@ -1214,6 +1214,37 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						}
 						e.sessionScopeVars[cleanName] = strings.ToLower(ftVal)
 					}
+				} else if cleanName == "innodb_redo_log_archive_dirs" {
+					// innodb_redo_log_archive_dirs accepts NULL, empty string, or a
+					// semicolon-separated list of "label:path" pairs.
+					// NULL and "" are distinct: NULL means "not configured", "" means empty list.
+					evalVal, _ := e.evalExpr(expr.Expr)
+					if evalVal == nil {
+						// SET … = NULL → use sentinel to represent NULL in global vars.
+						e.sessionScopeVars[cleanName] = "\x00"
+					} else {
+						rdVal := toString(evalVal)
+						if rdVal != "" && !validateRedoLogArchiveDirs(rdVal) {
+							displayVal := rdVal
+							if len(displayVal) > 200 {
+								displayVal = displayVal[:200]
+							}
+							return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of '%s'", cleanName, displayVal))
+						}
+						e.sessionScopeVars[cleanName] = rdVal
+					}
+					// Move to global if SET GLOBAL / SET PERSIST
+					if isGlobal {
+						if v, ok := e.sessionScopeVars[cleanName]; ok {
+							e.setGlobalVar(cleanName, v)
+						}
+						if prevVal, had := savedSessionVal[cleanName]; had {
+							e.sessionScopeVars[cleanName] = prevVal
+						} else {
+							delete(e.sessionScopeVars, cleanName)
+						}
+					}
+					continue
 				} else {
 					// Evaluate expression
 					evalVal, err := e.evalExpr(expr.Expr)
@@ -3984,11 +4015,63 @@ var sysVarNullableEmpty = map[string]bool{
 	"innodb_tmpdir": true, // NULL means "use tmpdir"; empty string is returned as NULL in SELECT
 }
 
+// sysVarNullSentinel lists system variables that use "\x00" as a sentinel for NULL.
+// These variables can hold both NULL and empty-string as distinct states, so a dedicated
+// sentinel is needed to distinguish NULL (not set / SET … = NULL) from "" (SET … = '').
+var sysVarNullSentinel = map[string]bool{
+	"innodb_redo_log_archive_dirs": true,
+}
+
+// validateRedoLogArchiveDirs checks the format of innodb_redo_log_archive_dirs.
+// The value is a semicolon-separated list of "label:path" pairs.
+// Rules:
+//   - Empty string is valid (no entries).
+//   - Each entry is parsed by finding the first ':' (splits label from path).
+//   - The path must be non-empty.
+//   - A single trailing ';' (which produces no further entries) is allowed.
+//   - Entries with no ':' are invalid.
+func validateRedoLogArchiveDirs(val string) bool {
+	if val == "" {
+		return true
+	}
+	remaining := val
+	for len(remaining) > 0 {
+		// Find the colon that splits label from path within this entry.
+		colonIdx := strings.Index(remaining, ":")
+		if colonIdx < 0 {
+			// No colon found — this entry (or trailing fragment) is invalid.
+			return false
+		}
+		// Skip past the colon; what follows is the path portion.
+		remaining = remaining[colonIdx+1:]
+		// Find the semicolon that ends this entry.
+		semiIdx := strings.Index(remaining, ";")
+		var path string
+		if semiIdx < 0 {
+			// No semicolon — path extends to end of string.
+			path = remaining
+			remaining = ""
+		} else {
+			path = remaining[:semiIdx]
+			remaining = remaining[semiIdx+1:]
+		}
+		// Path must be non-empty.
+		if path == "" {
+			return false
+		}
+	}
+	return true
+}
+
 // sysVarStringToSelectValueForVar converts with variable name awareness.
 // For enum-type variables, ON/OFF strings are preserved; for booleans they become 0/1.
 func sysVarStringToSelectValueForVar(val string, varName string) interface{} {
 	// Nullable-empty variables return NULL when their value is empty string.
 	if val == "" && sysVarNullableEmpty[varName] {
+		return nil
+	}
+	// Sentinel-NULL variables use "\x00" to distinguish NULL from empty string.
+	if val == "\x00" && sysVarNullSentinel[varName] {
 		return nil
 	}
 	upper := strings.ToUpper(val)
@@ -4679,7 +4762,7 @@ func (e *Executor) buildVariablesMapScoped(globalOnly bool) map[string]string {
 		"innodb_log_files_in_group":              "2",
 		"innodb_log_group_home_dir":              "./",
 		"innodb_page_cleaners":                   "1",
-		"innodb_redo_log_archive_dirs":           "",
+		"innodb_redo_log_archive_dirs":           "\x00", // NULL sentinel: default is NULL, not empty string
 		"innodb_fsync_threshold":                 "0",
 		"innodb_version":                         "8.0.32",
 
@@ -4903,6 +4986,11 @@ func (e *Executor) showVariables(upper string) (*Result, error) {
 		}
 		if likePattern != "" && !matchLike(name, likePattern) {
 			continue
+		}
+		// Translate NULL-sentinel values to empty string for SHOW VARIABLES display.
+		// (MySQL shows NULL-default variables as empty in SHOW VARIABLES output.)
+		if val == "\x00" && sysVarNullSentinel[name] {
+			val = ""
 		}
 		rows = append(rows, []interface{}{name, val})
 	}
