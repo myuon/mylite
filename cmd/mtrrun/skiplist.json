@@ -3917,10 +3917,6 @@
       "reason": "complex partitioned table + stored procedure"
     },
     {
-      "test": "sys_vars/insert_id_func",
-      "reason": "INSERT_ID variable affects auto_increment differently from MySQL"
-    },
-    {
       "test": "innodb/innodb_bug59641",
       "reason": "internally skipped by test itself; XA recovery + restart"
     },
