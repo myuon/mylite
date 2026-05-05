@@ -436,8 +436,20 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						defUpper := strings.ToUpper(defVal)
 						if defUpper == "CURRENT_TIMESTAMP" || defUpper == "CURRENT_TIMESTAMP()" || defUpper == "NOW()" {
 							defVal = e.nowTime().Format("2006-01-02 15:04:05")
+							row[col.Name] = defVal
+						} else if strings.HasPrefix(defVal, "(") {
+							// Expression default: evaluate against current row values
+							if v, err := e.evalGeneratedColumnExpr(defVal, row); err == nil {
+								if v != nil {
+									v = coerceColumnValue(col.Type, v)
+								}
+								row[col.Name] = v
+							} else {
+								row[col.Name] = nil
+							}
+						} else {
+							row[col.Name] = defVal
 						}
-						row[col.Name] = defVal
 					} else if !col.Nullable {
 						row[col.Name] = implicitZeroValue(col.Type)
 					}
@@ -1501,6 +1513,16 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							row[col.Name] = e.nowTime().Format("2006-01-02 15:04:05")
 						} else if defUpper == "NULL" {
 							row[col.Name] = nil
+						} else if strings.HasPrefix(defVal, "(") {
+							// Expression default: evaluate against current row values
+							if v, err := e.evalGeneratedColumnExpr(defVal, row); err == nil {
+								if v != nil {
+									v = coerceColumnValue(col.Type, v)
+								}
+								row[col.Name] = v
+							} else {
+								row[col.Name] = nil
+							}
 						} else {
 							row[col.Name] = strings.Trim(defVal, "'")
 						}
@@ -1514,12 +1536,22 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		}
 
 		// Check NOT NULL constraint on generated columns after computing their values
+		genColNullViolated := false
 		for _, col := range tbl.Def.Columns {
 			if isGeneratedColumnType(col.Type) && !col.Nullable {
 				if val, ok := row[col.Name]; ok && val == nil {
+					if bool(stmt.Ignore) {
+						// INSERT IGNORE: skip this row with a warning instead of failing
+						e.addWarning("Warning", 1048, fmt.Sprintf("Column '%s' cannot be null", col.Name))
+						genColNullViolated = true
+						break
+					}
 					return nil, mysqlError(1048, "23000", fmt.Sprintf("Column '%s' cannot be null", col.Name))
 				}
 			}
+		}
+		if genColNullViolated {
+			continue
 		}
 
 		// Check explicit NULL on NOT NULL columns (always an error, even non-strict)
@@ -1828,8 +1860,20 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					if defUpper == "CURRENT_TIMESTAMP" || defUpper == "CURRENT_TIMESTAMP()" ||
 						defUpper == "NOW()" {
 						defVal = e.nowTime().Format("2006-01-02 15:04:05")
+						fullRow[col.Name] = defVal
+					} else if strings.HasPrefix(defVal, "(") {
+						// Expression default: evaluate against current row values
+						if v, err := e.evalGeneratedColumnExpr(defVal, fullRow); err == nil {
+							if v != nil {
+								v = coerceColumnValue(col.Type, v)
+							}
+							fullRow[col.Name] = v
+						} else {
+							fullRow[col.Name] = nil
+						}
+					} else {
+						fullRow[col.Name] = defVal
 					}
-					fullRow[col.Name] = defVal
 				} else if !col.Nullable {
 					// NOT NULL columns without default get the type's zero value
 					fullRow[col.Name] = implicitZeroValue(col.Type)
@@ -1942,7 +1986,10 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 				rv, exists := row[col.Name]
 				if exists && rv != nil {
 					colUpper := strings.ToUpper(col.Type)
-					isSpatialType := strings.Contains(colUpper, "POINT") || strings.Contains(colUpper, "LINESTRING") || strings.Contains(colUpper, "POLYGON") || strings.Contains(colUpper, "GEOMETRY") || strings.Contains(colUpper, "GEOMCOLLECTION")
+					// Use the base type (stripping GENERATED ALWAYS AS expression) for type checks
+					// to avoid false positives from keywords in the expression (e.g. "INTERVAL" contains "INT").
+					colBaseUpper := strings.ToUpper(baseColumnType(col.Type))
+					isSpatialType := strings.Contains(colBaseUpper, "POINT") || strings.Contains(colBaseUpper, "LINESTRING") || strings.Contains(colBaseUpper, "POLYGON") || strings.Contains(colBaseUpper, "GEOMETRY") || strings.Contains(colBaseUpper, "GEOMCOLLECTION")
 					// SRID constraint validation for spatial columns
 					if isSpatialType && col.SRIDConstraint != nil {
 						geomStr := toString(rv)
@@ -1956,10 +2003,11 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							}
 						}
 					}
-					isIntType := !isSpatialType && (strings.Contains(colUpper, "INT") || strings.Contains(colUpper, "INTEGER"))
-					isDecimalType := strings.Contains(colUpper, "DECIMAL") || strings.Contains(colUpper, "FLOAT") || strings.Contains(colUpper, "DOUBLE") || colUpper == "REAL" || strings.HasPrefix(colUpper, "REAL ")
+					isIntType := !isSpatialType && (strings.Contains(colBaseUpper, "INT") || strings.Contains(colBaseUpper, "INTEGER"))
+					isDecimalType := strings.Contains(colBaseUpper, "DECIMAL") || strings.Contains(colBaseUpper, "FLOAT") || strings.Contains(colBaseUpper, "DOUBLE") || colBaseUpper == "REAL" || strings.HasPrefix(colBaseUpper, "REAL ")
 					isNumericType := isIntType || isDecimalType
-					isUnsigned := strings.Contains(colUpper, "UNSIGNED") || strings.Contains(colUpper, "ZEROFILL") // ZEROFILL implies UNSIGNED
+					isUnsigned := strings.Contains(colBaseUpper, "UNSIGNED") || strings.Contains(colBaseUpper, "ZEROFILL") // ZEROFILL implies UNSIGNED
+					_ = colUpper // kept for compatibility with code below that still uses colUpper
 					if isNumericType {
 						switch val := rv.(type) {
 						case int64:
@@ -1968,7 +2016,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 								outOfRange = true
 							} else if isIntType {
 								// Check signed/unsigned range by integer type
-								min, max := insertIntTypeRange(colUpper)
+								min, max := insertIntTypeRange(colBaseUpper)
 								if val < min || val > max {
 									outOfRange = true
 								}
@@ -1976,7 +2024,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							if outOfRange {
 								if bool(stmt.Ignore) {
 									e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
-									row[col.Name] = insertClampToIntTypeRange(val, colUpper)
+									row[col.Name] = insertClampToIntTypeRange(val, colBaseUpper)
 								} else {
 									return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
 								}
@@ -1987,7 +2035,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 								outOfRangeF = true
 							} else if isIntType {
 								minF, maxF := float64(math.MinInt64), float64(math.MaxInt64)
-								rMin, rMax := insertIntTypeRange(colUpper)
+								rMin, rMax := insertIntTypeRange(colBaseUpper)
 								minF, maxF = float64(rMin), float64(rMax)
 								if val < minF || val > maxF {
 									outOfRangeF = true
@@ -1996,7 +2044,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 							if outOfRangeF {
 								if bool(stmt.Ignore) {
 									e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
-									row[col.Name] = insertClampToIntTypeRangeFloat(val, colUpper)
+									row[col.Name] = insertClampToIntTypeRangeFloat(val, colBaseUpper)
 								} else {
 									return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
 								}
@@ -2027,11 +2075,11 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 									}
 								} else {
 									// Check range for the specific integer type
-									rMin, rMax := insertIntTypeRange(colUpper)
+									rMin, rMax := insertIntTypeRange(colBaseUpper)
 									if parsedInt < rMin || parsedInt > rMax {
 										if bool(stmt.Ignore) {
 											e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
-											row[col.Name] = insertClampToIntTypeRange(parsedInt, colUpper)
+											row[col.Name] = insertClampToIntTypeRange(parsedInt, colBaseUpper)
 											break
 										}
 										return nil, mysqlError(1264, "22003", fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
@@ -2097,7 +2145,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 								}
 							}
 						}
-						if isDecimalType && strings.Contains(colUpper, "DECIMAL") {
+						if isDecimalType && strings.Contains(colBaseUpper, "DECIMAL") {
 							if derr := checkDecimalRange(col.Type, rv); derr != nil {
 								if bool(stmt.Ignore) {
 									e.addWarning("Warning", 1264, fmt.Sprintf("Out of range value for column '%s' at row 1", col.Name))
@@ -2108,17 +2156,17 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 						}
 					}
 					// String length check (use original value before padding/formatting)
-					isCharType := strings.Contains(colUpper, "CHAR") || strings.Contains(colUpper, "BINARY")
-					isBlobType := colUpper == "BLOB" || colUpper == "TINYBLOB" || colUpper == "MEDIUMBLOB" || colUpper == "LONGBLOB"
-					isTextType := colUpper == "TEXT" || colUpper == "TINYTEXT" || colUpper == "MEDIUMTEXT" || colUpper == "LONGTEXT"
+					isCharType := strings.Contains(colBaseUpper, "CHAR") || strings.Contains(colBaseUpper, "BINARY")
+					isBlobType := colBaseUpper == "BLOB" || colBaseUpper == "TINYBLOB" || colBaseUpper == "MEDIUMBLOB" || colBaseUpper == "LONGBLOB"
+					isTextType := colBaseUpper == "TEXT" || colBaseUpper == "TINYTEXT" || colBaseUpper == "MEDIUMTEXT" || colBaseUpper == "LONGTEXT"
 					if isCharType || isBlobType || isTextType {
 						checkVal := rv
 						if ov, ok := origValues[col.Name]; ok && ov != nil {
 							checkVal = ov
 						}
 						// For BINARY/VARBINARY columns, convert integer hex literals to bytes
-						isBinaryColType := strings.Contains(colUpper, "BINARY") || isBlobType
-						if strings.Contains(colUpper, "BINARY") {
+						isBinaryColType := strings.Contains(colBaseUpper, "BINARY") || isBlobType
+						if strings.Contains(colBaseUpper, "BINARY") {
 							if converted := hexIntToBytes(checkVal); converted != checkVal {
 								checkVal = converted
 							}

@@ -3853,10 +3853,6 @@
       "reason": "out of scope: query rewrite plugins not needed for embedded test DB"
     },
     {
-      "test": "funcs_1/charset_collation",
-      "reason": "column order mismatch in collation result - flaky in full suite"
-    },
-    {
       "test": "gis/srs",
       "reason": "requires full WKT parameter validation, projection parameter checking, and multi-line error message formatting not yet implemented"
     },

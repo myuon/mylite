@@ -183,16 +183,19 @@ func (e *Executor) execCreateTrigger(query string) (*Result, error) {
 		bodyStatements = []string{strings.TrimSpace(body)}
 	}
 
-	// Validate: trigger body must not be empty
-	hasBody := false
-	for _, stmt := range bodyStatements {
-		if strings.TrimSpace(stmt) != "" {
-			hasBody = true
-			break
+	// Validate: trigger body must not be empty unless it came from BEGIN...END (which is valid).
+	// MySQL allows empty compound statements: CREATE TRIGGER t BEFORE INSERT ON tbl FOR EACH ROW BEGIN END
+	if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(body)), "BEGIN") {
+		hasBody := false
+		for _, stmt := range bodyStatements {
+			if strings.TrimSpace(stmt) != "" {
+				hasBody = true
+				break
+			}
 		}
-	}
-	if !hasBody {
-		return nil, syntaxError(rest, 1)
+		if !hasBody {
+			return nil, syntaxError(rest, 1)
+		}
 	}
 
 	// Validate: BEFORE/AFTER DELETE triggers cannot reference NEW (including SET NEW.)

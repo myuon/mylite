@@ -1487,26 +1487,35 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 							colDef.Default = &defStr
 						}
 					} else {
-						// Strip surrounding quotes from default values (vitess adds them)
-						if len(defStr) >= 2 && defStr[0] == '\'' && defStr[len(defStr)-1] == '\'' {
-							defStr = defStr[1 : len(defStr)-1]
-						}
-						// MySQL strips trailing spaces from SET/ENUM default values
-						colTypeLower := strings.ToLower(col.Type.Type)
-						if colTypeLower == "set" || colTypeLower == "enum" {
-							defStr = strings.TrimRight(defStr, " ")
-						}
-						// Normalize now() / current_timestamp() to CURRENT_TIMESTAMP
-						defStr = normalizeCurrentTimestampDefault(defStr)
-						// CURRENT_TIMESTAMP is only valid as DEFAULT for DATETIME and TIMESTAMP columns.
-						// For all other types (BIT, INT, TINYINT, etc.), it's invalid.
-						if strings.Contains(strings.ToUpper(defStr), "CURRENT_TIMESTAMP") || strings.EqualFold(defStr, "NOW()") {
-							colTypeUpper := strings.ToUpper(strings.TrimSpace(col.Type.Type))
-							if colTypeUpper != "TIMESTAMP" && colTypeUpper != "DATETIME" {
-								return nil, mysqlError(1067, "42000", fmt.Sprintf("Invalid default value for '%s'", colDef.Name))
+						// Check if default is an expression (non-literal), e.g. DEFAULT (a + 1)
+						_, isLiteralDefault2 := col.Type.Options.Default.(*sqlparser.Literal)
+						_, isCurTimeFunc := col.Type.Options.Default.(*sqlparser.CurTimeFuncExpr)
+						if !isLiteralDefault2 && !isCurTimeFunc {
+							// Expression default: store with parentheses so INSERT can detect and evaluate it
+							defStr = "(" + defStr + ")"
+							colDef.Default = &defStr
+						} else {
+							// Strip surrounding quotes from default values (vitess adds them)
+							if len(defStr) >= 2 && defStr[0] == '\'' && defStr[len(defStr)-1] == '\'' {
+								defStr = defStr[1 : len(defStr)-1]
 							}
+							// MySQL strips trailing spaces from SET/ENUM default values
+							colTypeLower := strings.ToLower(col.Type.Type)
+							if colTypeLower == "set" || colTypeLower == "enum" {
+								defStr = strings.TrimRight(defStr, " ")
+							}
+							// Normalize now() / current_timestamp() to CURRENT_TIMESTAMP
+							defStr = normalizeCurrentTimestampDefault(defStr)
+							// CURRENT_TIMESTAMP is only valid as DEFAULT for DATETIME and TIMESTAMP columns.
+							// For all other types (BIT, INT, TINYINT, etc.), it's invalid.
+							if strings.Contains(strings.ToUpper(defStr), "CURRENT_TIMESTAMP") || strings.EqualFold(defStr, "NOW()") {
+								colTypeUpper := strings.ToUpper(strings.TrimSpace(col.Type.Type))
+								if colTypeUpper != "TIMESTAMP" && colTypeUpper != "DATETIME" {
+									return nil, mysqlError(1067, "42000", fmt.Sprintf("Invalid default value for '%s'", colDef.Name))
+								}
+							}
+							colDef.Default = &defStr
 						}
-						colDef.Default = &defStr
 					}
 				}
 			}
@@ -3963,12 +3972,19 @@ func columnDefFromAST(col *sqlparser.ColumnDefinition) catalog.ColumnDef {
 		}
 		if col.Type.Options.Default != nil {
 			defStr := sqlparser.String(col.Type.Options.Default)
-			// Strip surrounding quotes from default values (vitess adds them)
-			if len(defStr) >= 2 && defStr[0] == '\'' && defStr[len(defStr)-1] == '\'' {
-				defStr = defStr[1 : len(defStr)-1]
+			_, isLiteralDefault3 := col.Type.Options.Default.(*sqlparser.Literal)
+			_, isCurTimeFunc3 := col.Type.Options.Default.(*sqlparser.CurTimeFuncExpr)
+			if !isLiteralDefault3 && !isCurTimeFunc3 && !strings.EqualFold(defStr, "null") {
+				// Expression default: store with parentheses so INSERT can detect and evaluate it
+				defStr = "(" + defStr + ")"
+			} else {
+				// Strip surrounding quotes from default values (vitess adds them)
+				if len(defStr) >= 2 && defStr[0] == '\'' && defStr[len(defStr)-1] == '\'' {
+					defStr = defStr[1 : len(defStr)-1]
+				}
+				// Normalize now() / current_timestamp() to CURRENT_TIMESTAMP
+				defStr = normalizeCurrentTimestampDefault(defStr)
 			}
-			// Normalize now() / current_timestamp() to CURRENT_TIMESTAMP
-			defStr = normalizeCurrentTimestampDefault(defStr)
 			colDef.Default = &defStr
 		}
 		if col.Type.Options.OnUpdate != nil {
@@ -6453,7 +6469,14 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 							tableDef.Columns[i].DefaultDropped = true
 						} else if op.DefaultVal != nil {
 							defStr := sqlparser.String(op.DefaultVal)
-							defStr = strings.Trim(defStr, "'")
+							_, isLiteralDefAlt := op.DefaultVal.(*sqlparser.Literal)
+							_, isCurTimeFuncAlt := op.DefaultVal.(*sqlparser.CurTimeFuncExpr)
+							if !isLiteralDefAlt && !isCurTimeFuncAlt && !strings.EqualFold(defStr, "null") {
+								// Expression default: store with parentheses so INSERT can detect and evaluate it
+								defStr = "(" + defStr + ")"
+							} else {
+								defStr = strings.Trim(defStr, "'")
+							}
 							// Validate: NOT NULL ENUM/SET cannot have NULL default
 							if strings.EqualFold(defStr, "null") && !col.Nullable {
 								colTypeLower2 := strings.ToLower(strings.TrimSpace(col.Type))

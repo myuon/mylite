@@ -5946,13 +5946,22 @@ func (e *Executor) infoSchemaCollations() []storage.Row {
 }
 
 // infoSchemaCollCharSetAppl returns rows for INFORMATION_SCHEMA.COLLATION_CHARACTER_SET_APPLICABILITY.
+// Rows use lowercase column keys (collation_name, character_set_name) intentionally:
+// this prevents the non-deterministic best-match heuristic in SELECT * expansion
+// (which only does exact-case key lookup against infoSchemaColumnOrder entries) from
+// picking an incorrect column order. The __column_order__ metadata key carries the
+// canonical COLLATION_NAME, CHARACTER_SET_NAME order. When evalRowExpr fetches values
+// it uses case-insensitive fallback so the data is still returned correctly.
 func (e *Executor) infoSchemaCollCharSetAppl() []storage.Row {
 	colls := e.infoSchemaCollations()
 	rows := make([]storage.Row, 0, len(colls))
 	for _, c := range colls {
 		rows = append(rows, storage.Row{
-			"COLLATION_NAME":     c["COLLATION_NAME"],
-			"CHARACTER_SET_NAME": c["CHARACTER_SET_NAME"],
+			"collation_name":     c["COLLATION_NAME"],
+			"character_set_name": c["CHARACTER_SET_NAME"],
+			// __column_order__ signals SELECT * expansion to use this canonical column order
+			// instead of the non-deterministic best-match heuristic.
+			"__column_order__": "COLLATION_NAME\x00CHARACTER_SET_NAME",
 		})
 	}
 	return rows
