@@ -4468,6 +4468,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		hasFirstOrAfter := false // ADD COLUMN with FIRST/AFTER position (INSTANT requires last)
 		lockIsNone := false
 		hasAutoIncrAdd := false
+		newVirtualColNames := map[string]bool{} // tracks newly added virtual column names (lowercase)
+		addedIndexOnNewVirtualCol := false       // true if ADD INDEX references a newly added virtual column
+		hasDropColumn := false                   // true if any DROP COLUMN operation is present
+		hasNewRegularColAdd := false             // true if any non-virtual, non-stored ADD COLUMN is present
 		for _, opt := range stmt.AlterOptions {
 			switch av := opt.(type) {
 			case sqlparser.AlgorithmValue:
@@ -4492,7 +4496,13 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 						colTypeStr := strings.ToUpper(sqlparser.String(col.Type))
 						if strings.Contains(colTypeStr, "STORED") {
 							hasStoredGcolAdd = true
+						} else {
+							// Track newly added virtual columns
+							newVirtualColNames[strings.ToLower(col.Name.String())] = true
 						}
+					} else {
+						// Regular (non-generated) column
+						hasNewRegularColAdd = true
 					}
 					// ADD COLUMN that is itself a primary key inhibits INSTANT.
 					if col.Type.Options != nil && col.Type.Options.KeyOpt == sqlparser.ColKeyPrimary {
@@ -4503,7 +4513,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 						hasAutoIncrAdd = true
 					}
 				}
-			case *sqlparser.DropColumn, *sqlparser.ModifyColumn, *sqlparser.ChangeColumn,
+			case *sqlparser.DropColumn:
+				hasNonAddOp = true
+				hasDropColumn = true
+			case *sqlparser.ModifyColumn, *sqlparser.ChangeColumn,
 				*sqlparser.RenameColumn, *sqlparser.AlterColumn:
 				hasNonAddOp = true
 			case *sqlparser.AddIndexDefinition:
@@ -4520,6 +4533,27 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				hasNonAddOp = true
 			}
 		}
+		// Second pass: check if any ADD INDEX references a newly added virtual column.
+		// MySQL rejects ALGORITHM=INPLACE when:
+		//   (a) DROP COLUMN is present alongside ADD virtual + ADD INDEX on that new virtual col, or
+		//   (b) LOCK=NONE is specified alongside ADD virtual + ADD INDEX on that new virtual col.
+		if (hasDropColumn || lockIsNone) && len(newVirtualColNames) > 0 {
+			for _, opt := range stmt.AlterOptions {
+				if av, ok := opt.(*sqlparser.AddIndexDefinition); ok {
+					if av.IndexDefinition != nil {
+						for _, idxCol := range av.IndexDefinition.Columns {
+							if newVirtualColNames[strings.ToLower(idxCol.Column.String())] {
+								addedIndexOnNewVirtualCol = true
+								break
+							}
+						}
+					}
+					if addedIndexOnNewVirtualCol {
+						break
+					}
+				}
+			}
+		}
 		// LOCK=NONE is not allowed when adding an AUTO_INCREMENT column.
 		// MySQL error: ER_ALTER_OPERATION_NOT_SUPPORTED_REASON (1846)
 		if lockIsNone && hasAutoIncrAdd {
@@ -4527,6 +4561,16 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		}
 		alterHasNonAddOp = hasNonAddOp
 		if isInplace && hasStoredGcolAdd {
+			return nil, mysqlError(1846, "0A000", "ALGORITHM=INPLACE is not supported for this operation. Try ALGORITHM=COPY.")
+		}
+		// ALGORITHM=INPLACE does not support combining ADD virtual column with ADD INDEX on
+		// that new virtual column when DROP COLUMN or LOCK=NONE is also present.
+		if isInplace && addedIndexOnNewVirtualCol {
+			return nil, mysqlError(1846, "0A000", "ALGORITHM=INPLACE is not supported for this operation. Try ALGORITHM=COPY.")
+		}
+		// ALGORITHM=INPLACE does not support adding a virtual column alongside a regular
+		// (non-virtual) column. Use ALGORITHM=INSTANT for this combination.
+		if isInplace && len(newVirtualColNames) > 0 && hasNewRegularColAdd {
 			return nil, mysqlError(1846, "0A000", "ALGORITHM=INPLACE is not supported for this operation. Try ALGORITHM=COPY.")
 		}
 		// WITH VALIDATION + ALGORITHM=INPLACE is not supported for virtual generated columns
@@ -6858,6 +6902,23 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				// If explicit RowFormat exists, EffectiveRowFormat should match RowFormat
 				// (already updated in the ROW_FORMAT table option case above)
 			}
+		}
+	}
+
+	// Update innodb_index_stats after ALTER TABLE operations that affect index metadata
+	// (ADD INDEX, DROP INDEX, ADD COLUMN, DROP COLUMN). The stats table is read directly
+	// by queries like "SELECT ... FROM mysql.innodb_index_stats" in test suites.
+	{
+		hasIndexChange := false
+		for _, opt := range stmt.AlterOptions {
+			switch opt.(type) {
+			case *sqlparser.AddIndexDefinition, *sqlparser.DropKey,
+				*sqlparser.AddColumns, *sqlparser.DropColumn:
+				hasIndexChange = true
+			}
+		}
+		if hasIndexChange {
+			e.upsertInnoDBStatsRows(dbName, tableName, e.tableRowCount(dbName, tableName))
 		}
 	}
 
