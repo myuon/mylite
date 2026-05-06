@@ -4207,7 +4207,7 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 		// Handle CALL inside routine body (nested SP call with local var substitution)
 		if strings.HasPrefix(stmtUpper, "CALL ") {
 			resolvedSQL := e.substituteLocalVars(stmtStr, localVars)
-			_, err := e.Execute(resolvedSQL)
+			callResult, err := e.Execute(resolvedSQL)
 			if err != nil {
 				// Check if a handler can catch this error
 				handled, exitFlag := e.tryHandler(err, ctx)
@@ -4224,6 +4224,14 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 					continue
 				}
 				return nil, err
+			}
+			// Propagate result sets from nested CALL into the parent's result set collection.
+			// A nested procedure may produce multiple result sets (first + ExtraResultSets).
+			if callResult != nil && callResult.IsResultSet && ctx.resultSets != nil {
+				*ctx.resultSets = append(*ctx.resultSets, callResult)
+				if len(callResult.ExtraResultSets) > 0 {
+					*ctx.resultSets = append(*ctx.resultSets, callResult.ExtraResultSets...)
+				}
 			}
 			continue
 		}
@@ -4251,6 +4259,9 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 		if ctx.triggerNewRow != nil || ctx.triggerOldRow != nil {
 			resolvedSQL = e.resolveNewOldRefs(resolvedSQL, ctx.triggerNewRow, ctx.triggerOldRow)
 		}
+		// Before substitution, record which SELECT columns are bare variable references
+		// so we can restore their names after execution (MySQL returns param name as column name).
+		varColAliases := selectColumnVarAliases(resolvedSQL, localVars)
 		resolvedSQL = e.substituteLocalVars(resolvedSQL, localVars)
 		stmtResult, err := e.Execute(resolvedSQL)
 		if err != nil {
@@ -4270,6 +4281,16 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 				continue
 			}
 			return nil, err
+		}
+		// Restore column names for bare variable references in SELECT statements.
+		// e.g. "SELECT a" where a=2 executes as "SELECT 2" giving column name "2";
+		// MySQL returns "a" as the column name (the parameter name).
+		if stmtResult != nil && stmtResult.IsResultSet && varColAliases != nil {
+			for idx, varName := range varColAliases {
+				if idx < len(stmtResult.Columns) {
+					stmtResult.Columns[idx] = varName
+				}
+			}
 		}
 		// Store result sets produced by SELECT statements inside the routine body.
 		// They will be returned if an EXIT HANDLER fires, or from the routine call itself.
@@ -4747,6 +4768,165 @@ func (e *Executor) substituteLocalVars(sql string, vars map[string]interface{}) 
 		if strings.Contains(result, backtickForm) {
 			result = strings.ReplaceAll(result, backtickForm, valStr)
 		}
+	}
+	return result
+}
+
+// selectColumnVarAliases examines a SELECT statement (before variable substitution) and
+// returns a map from column index to the original variable name for each select-list expression
+// that is a bare local variable reference (e.g. "SELECT a, b+1" where a is a local var returns {0: "a"}).
+// This is used to restore column names after substituteLocalVars turns "SELECT a" into "SELECT 2".
+func selectColumnVarAliases(stmtStr string, localVars map[string]interface{}) map[int]string {
+	// Only handle SELECT statements (not SELECT INTO, which is handled separately)
+	upper := strings.ToUpper(strings.TrimSpace(stmtStr))
+	if !strings.HasPrefix(upper, "SELECT") {
+		return nil
+	}
+	// Skip past "SELECT" keyword
+	body := strings.TrimSpace(stmtStr[6:])
+	if len(body) == 0 {
+		return nil
+	}
+	// Strip optional DISTINCT/ALL/SQL_NO_CACHE etc.
+	for _, kw := range []string{"DISTINCT ", "ALL ", "SQL_NO_CACHE ", "SQL_CACHE ", "HIGH_PRIORITY "} {
+		if strings.HasPrefix(strings.ToUpper(body), kw) {
+			body = strings.TrimSpace(body[len(kw):])
+		}
+	}
+
+	// Find the end of the select-list: the top-level FROM keyword (outside parens/quotes)
+	selectListEnd := len(body)
+	depth := 0
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	for i := 0; i < len(body); i++ {
+		ch := body[i]
+		if inSingle {
+			if ch == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '`':
+			inBacktick = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+		default:
+			if depth == 0 && i+4 < len(body) {
+				rem := strings.ToUpper(body[i:])
+				if (strings.HasPrefix(rem, "FROM ") || strings.HasPrefix(rem, "FROM\t") || strings.HasPrefix(rem, "FROM\n")) {
+					// Make sure it's a word boundary (not e.g. "TRANSFORM")
+					if i == 0 || !isAlphaNum(body[i-1]) {
+						selectListEnd = i
+					}
+				}
+			}
+		}
+	}
+
+	selectList := strings.TrimSpace(body[:selectListEnd])
+	if selectList == "" {
+		return nil
+	}
+
+	// Split select list by top-level commas
+	var exprs []string
+	depth = 0
+	inSingle = false
+	inDouble = false
+	inBacktick = false
+	start := 0
+	for i := 0; i < len(selectList); i++ {
+		ch := selectList[i]
+		if inSingle {
+			if ch == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '`':
+			inBacktick = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				exprs = append(exprs, strings.TrimSpace(selectList[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	exprs = append(exprs, strings.TrimSpace(selectList[start:]))
+
+	result := make(map[int]string)
+	for idx, expr := range exprs {
+		expr = strings.TrimSpace(expr)
+		// Check for explicit alias: "expr AS alias" or "expr alias" — skip those
+		exprUpper := strings.ToUpper(expr)
+		if strings.Contains(exprUpper, " AS ") {
+			continue
+		}
+		// A bare variable reference is a single identifier (no dots, spaces, operators, parens)
+		// that matches a local variable name (case-insensitive)
+		isIdentifier := len(expr) > 0
+		for _, c := range expr {
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+				isIdentifier = false
+				break
+			}
+		}
+		if !isIdentifier {
+			continue
+		}
+		// Must start with a letter or underscore (not a digit)
+		if expr[0] >= '0' && expr[0] <= '9' {
+			continue
+		}
+		// Check if this identifier is a local variable
+		if _, ok := localVars[strings.ToLower(expr)]; ok {
+			result[idx] = expr
+		}
+	}
+	if len(result) == 0 {
+		return nil
 	}
 	return result
 }
