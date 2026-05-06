@@ -525,6 +525,20 @@ func (e *Executor) computeWindowFunc(wf windowFuncInfo, allRows []storage.Row, r
 		ws = &sqlparser.WindowSpecification{}
 	}
 
+	// Check windowing_use_high_precision: when OFF and SUM with ROWS frame,
+	// use sliding window (incremental add/subtract) to match MySQL's behavior.
+	useSliding := false
+	if sumExpr, ok := wf.expr.(*sqlparser.Sum); ok {
+		if ws.FrameClause != nil && ws.FrameClause.Unit == sqlparser.FrameRowsType {
+			if v, ok2 := e.getSysVarSession("windowing_use_high_precision"); ok2 {
+				useSliding = strings.EqualFold(v, "off") || v == "0"
+			} else if v, ok2 := e.getSysVar("windowing_use_high_precision"); ok2 {
+				useSliding = strings.EqualFold(v, "off") || v == "0"
+			}
+		}
+		_ = sumExpr
+	}
+
 	// Partition rows by PARTITION BY
 	partitions := e.buildPartitions(allRows, ws.PartitionClause)
 
@@ -538,6 +552,48 @@ func (e *Executor) computeWindowFunc(wf windowFuncInfo, allRows []storage.Row, r
 		for i, idx := range part.indices {
 			partRows[i] = allRows[idx]
 			orderByVals[i] = e.orderByValuesForRow(ws.OrderClause, allRows[idx])
+		}
+
+		if useSliding {
+			// Sliding window (incremental) SUM: subtract outgoing rows, add incoming rows.
+			// This matches MySQL's windowing_use_high_precision=OFF behavior which may
+			// produce different results than exact recomputation due to FP precision.
+			sumExpr := wf.expr.(*sqlparser.Sum)
+			n := len(partRows)
+			runningSum := float64(0)
+			prevStart, prevEnd := -1, -1
+			for localIdx, globalIdx := range part.indices {
+				start, end := e.computeFrameBounds(ws.FrameClause, ws.OrderClause, partRows, localIdx, orderByVals)
+				if start < 0 { start = 0 }
+				if end >= n { end = n - 1 }
+				if prevStart < 0 {
+					// Initialize: compute sum from scratch for first frame
+					for i := start; i <= end; i++ {
+						val, _ := e.evalRowExpr(sumExpr.Arg, partRows[i])
+						if val != nil {
+							runningSum += windowToFloat64(val)
+						}
+					}
+				} else {
+					// Subtract rows that left the frame
+					for i := prevStart; i < start; i++ {
+						val, _ := e.evalRowExpr(sumExpr.Arg, partRows[i])
+						if val != nil {
+							runningSum -= windowToFloat64(val)
+						}
+					}
+					// Add rows that entered the frame
+					for i := prevEnd + 1; i <= end; i++ {
+						val, _ := e.evalRowExpr(sumExpr.Arg, partRows[i])
+						if val != nil {
+							runningSum += windowToFloat64(val)
+						}
+					}
+				}
+				prevStart, prevEnd = start, end
+				resultRows[globalIdx][wf.colIdx] = formatWindowSumFloat(runningSum)
+			}
+			continue
 		}
 
 		// Compute the window function value for each row in the partition
@@ -1560,12 +1616,13 @@ func (e *Executor) evalWindowFuncOverSyntheticRow(expr sqlparser.Expr) (interfac
 // formatWindowSumFloat formats a float64 SUM result for display.
 // MySQL displays whole-number DOUBLE results as integers (0, not 0.0).
 func formatWindowSumFloat(v float64) interface{} {
-	if v == math.Trunc(v) && !math.IsInf(v, 0) && !math.IsNaN(v) {
-		if v >= 0 && v <= float64(^uint64(0)) {
+	if !math.IsInf(v, 0) && !math.IsNaN(v) && v == math.Trunc(v) {
+		if v >= math.MinInt64 && v < float64(math.MaxInt64) {
 			return int64(v)
 		}
 	}
-	return fmt.Sprintf("%.1f", v)
+	// For large or non-integer floats, use DOUBLE precision formatting.
+	return formatMySQLFloatString(v)
 }
 
 // windowCompareOrderByVals compares two sets of ORDER BY values taking direction into account.

@@ -368,25 +368,18 @@ func formatMySQLFloatString(v float64) string {
 	if math.IsInf(v, -1) {
 		return "-inf"
 	}
-	abs := math.Abs(v)
-	if abs != 0 && (abs >= 1e14 || abs < 1e-4) {
-		s := strconv.FormatFloat(v, 'e', 5, 64)
+	// Use the shortest representation that round-trips (Go 'g', -1).
+	// This correctly handles both FLOAT columns (already normalized to 6 sig figs,
+	// so the round-trip representation uses ≤6 digits) and DOUBLE columns (which
+	// need up to 17 significant digits for full precision).
+	s := strconv.FormatFloat(v, 'g', -1, 64)
+	if strings.ContainsAny(s, "eE") {
+		// Normalize exponent: e+307 -> e307, e-05 -> e-5, e+0 -> e0 -> e, etc.
 		s = strings.Replace(s, "e+0", "e", 1)
 		s = strings.Replace(s, "e-0", "e-", 1)
 		s = strings.Replace(s, "e+", "e", 1)
-		// Strip trailing zeros from the mantissa (MySQL omits them, e.g. 1.00000e43 -> 1e43)
-		if eIdx := strings.IndexByte(s, 'e'); eIdx > 0 {
-			mantissa := s[:eIdx]
-			exp := s[eIdx:]
-			if strings.Contains(mantissa, ".") {
-				mantissa = strings.TrimRight(mantissa, "0")
-				mantissa = strings.TrimRight(mantissa, ".")
-			}
-			s = mantissa + exp
-		}
-		return s
 	}
-	return strconv.FormatFloat(v, 'f', -1, 64)
+	return s
 }
 
 // FormatMySQLFloat formats a float64 value using MySQL's scientific notation style
