@@ -2273,6 +2273,23 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 	if trimmedForCount != "" && e.routineDepth == 0 {
 		e.questions++
 	}
+	// Update ROW_COUNT() tracking (MySQL semantics) for all statements, including those
+	// inside stored routines and triggers. MySQL's ROW_COUNT() returns the affected-row count
+	// of the most recent DML statement, even when called inside a stored function/procedure.
+	// - After SELECT: -1
+	// - After failed DML: -1 (remains unchanged)
+	// - After successful DML: AffectedRows
+	defer func() {
+		if retErr == nil && res != nil {
+			if res.Columns != nil {
+				// SELECT result: set to -1
+				e.lastAffectedRows = -1
+			} else {
+				// DML result: set to affected rows
+				e.lastAffectedRows = int64(res.AffectedRows)
+			}
+		}
+	}()
 	// Track execution errors in the diagnostics area (for SHOW ERRORS / SHOW WARNINGS).
 	// Only track for client-level statements (not internal routine calls).
 	if e.routineDepth == 0 {
@@ -2298,20 +2315,6 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 				}
 				e.postErrorWarnings = nil
 			}
-			// Update ROW_COUNT() tracking (MySQL semantics):
-			// - After SELECT: -1
-			// - After failed DML: -1 (remains unchanged since it was already -1 or a previous value)
-			// - After successful DML: AffectedRows
-			if retErr == nil && res != nil {
-				if res.Columns != nil {
-					// SELECT result: set to -1
-					e.lastAffectedRows = -1
-				} else {
-					// DML result: set to affected rows
-					e.lastAffectedRows = int64(res.AffectedRows)
-				}
-			}
-			// On error, leave lastAffectedRows as -1 (MySQL returns -1 after failed statements)
 		}()
 	}
 
