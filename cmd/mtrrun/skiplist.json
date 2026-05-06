@@ -3633,10 +3633,6 @@
       "reason": "output mismatch, timeout, or error"
     },
     {
-      "test": "perfschema/unary_digest",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
       "test": "perfschema/view_table_io",
       "reason": "output mismatch, timeout, or error"
     },

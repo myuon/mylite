@@ -27,6 +27,7 @@ import (
 func normalizeStatementDigest(query string) (digest string, digestText string) {
 	tokens := tokenizeForDigest(query)
 	tokens = reclassifyNullTokens(tokens)
+	tokens = collapseUnaryOperators(tokens)
 	tokens = collapseInsideParenLiterals(tokens)
 	tokens = collapseValueLists(tokens)
 	tokens = collapseTopLevelLiteralList(tokens)
@@ -34,6 +35,76 @@ func normalizeStatementDigest(query string) (digest string, digestText string) {
 	h := sha256.Sum256([]byte(digestText))
 	digest = hex.EncodeToString(h[:])
 	return digest, digestText
+}
+
+// collapseUnaryOperators strips unary '+' and '-' operators that immediately
+// precede a literal (number/string/null) in a unary-operator context.
+//
+// A '+'/'-' operator is considered unary when the preceding non-operator token
+// (looking back past any chain of +/- operators) is one of:
+//   - start of the token stream (implicit: after SELECT, etc.)
+//   - a '(' punctuation
+//   - a ',' punctuation
+//   - another operator (!=, <=, >= etc. — but not +/- themselves in binary context)
+//   - a keyword such as SELECT, WHERE, AND, OR, NOT, BY, HAVING, SET, RETURN, THEN, ELSE
+//
+// Crucially, unary stripping only applies when the operator directly precedes a
+// LITERAL token (number/string/null). When it precedes an identifier (e.g. -a),
+// the operator is kept.
+func collapseUnaryOperators(tokens []digestToken) []digestToken {
+	// We make multiple passes until no changes occur (handles chains like +++1).
+	for {
+		changed := false
+		out := make([]digestToken, 0, len(tokens))
+		i := 0
+		for i < len(tokens) {
+			t := tokens[i]
+			// Check if this is a '+' or '-' operator followed by a literal
+			if t.kind == tokOperator && (t.text == "+" || t.text == "-") && i+1 < len(tokens) && isLiteralTok(tokens[i+1]) {
+				// Look back at the last non-unary-op token in `out` to determine context
+				if isUnaryContext(out) {
+					// Strip this unary operator
+					changed = true
+					i++ // skip the operator, keep the literal
+					continue
+				}
+			}
+			out = append(out, t)
+			i++
+		}
+		tokens = out
+		if !changed {
+			break
+		}
+	}
+	return tokens
+}
+
+// isUnaryContext returns true if the given token sequence (already emitted)
+// indicates that a following '+'/'-' operator is in unary position.
+func isUnaryContext(out []digestToken) bool {
+	if len(out) == 0 {
+		return true
+	}
+	prev := out[len(out)-1]
+	switch prev.kind {
+	case tokPunct:
+		return prev.text == "(" || prev.text == ","
+	case tokOperator:
+		// Any binary comparison operator or logical operator puts next +/- in unary context
+		// But NOT a preceding literal (binary context): that's handled by caller checking isLiteralTok
+		return true
+	case tokKeyword:
+		// These keywords put the next token in an "expression start" context
+		switch prev.text {
+		case "SELECT", "WHERE", "AND", "OR", "NOT", "BY", "HAVING",
+			"SET", "RETURN", "THEN", "ELSE", "ON", "WHEN",
+			"BETWEEN", "IN", "EXISTS", "CASE", "UNION", "ALL",
+			"VALUES", "VALUE":
+			return true
+		}
+	}
+	return false
 }
 
 // reclassifyNullTokens changes tokNull tokens to tokKeyword when they appear
