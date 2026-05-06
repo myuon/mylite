@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -74,11 +75,20 @@ func indexDefsForStats(def *catalog.TableDef) []catalog.IndexDef {
 	indexDefs := make([]catalog.IndexDef, 0, len(def.Indexes)+1)
 	if len(def.PrimaryKey) > 0 {
 		indexDefs = append(indexDefs, catalog.IndexDef{Name: "PRIMARY", Columns: append([]string(nil), def.PrimaryKey...)})
-	}
-	indexDefs = append(indexDefs, def.Indexes...)
-	if len(indexDefs) == 0 {
+	} else {
+		// InnoDB always has an implicit clustered index (GEN_CLUST_INDEX) when there is no
+		// explicit PRIMARY KEY. MySQL always lists it first in innodb_index_stats, regardless
+		// of whether the table has other secondary indexes.
 		indexDefs = append(indexDefs, catalog.IndexDef{Name: "GEN_CLUST_INDEX", Columns: []string{"DB_ROW_ID"}})
 	}
+	// Secondary indexes are listed in alphabetical order by name in innodb_index_stats
+	// (matching MySQL's behavior where stats rows are stored in index_name order).
+	secondary := make([]catalog.IndexDef, len(def.Indexes))
+	copy(secondary, def.Indexes)
+	sort.Slice(secondary, func(i, j int) bool {
+		return strings.ToLower(secondary[i].Name) < strings.ToLower(secondary[j].Name)
+	})
+	indexDefs = append(indexDefs, secondary...)
 	return indexDefs
 }
 
@@ -394,11 +404,15 @@ func (e *Executor) refreshInnoDBStatsTables() {
 			indexDefs := make([]catalog.IndexDef, 0, len(def.Indexes)+1)
 			if len(def.PrimaryKey) > 0 {
 				indexDefs = append(indexDefs, catalog.IndexDef{Name: "PRIMARY", Columns: append([]string(nil), def.PrimaryKey...)})
-			}
-			indexDefs = append(indexDefs, def.Indexes...)
-			if len(indexDefs) == 0 {
+			} else {
 				indexDefs = append(indexDefs, catalog.IndexDef{Name: "GEN_CLUST_INDEX", Columns: []string{"DB_ROW_ID"}})
 			}
+			secondary := make([]catalog.IndexDef, len(def.Indexes))
+			copy(secondary, def.Indexes)
+			sort.Slice(secondary, func(i, j int) bool {
+				return strings.ToLower(secondary[i].Name) < strings.ToLower(secondary[j].Name)
+			})
+			indexDefs = append(indexDefs, secondary...)
 			for _, idx := range indexDefs {
 				indexName := idx.Name
 				if indexName == "" {

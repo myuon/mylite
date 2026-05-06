@@ -212,6 +212,9 @@ func (e *Executor) handleParentRowRemoval(dbName, tableName string, parentRow st
 						for _, col := range fk.Columns {
 							childRow[col] = nil
 						}
+						// Re-evaluate virtual generated columns that may depend on the
+						// nullified FK columns (e.g. fld2 INT AS (fld1) VIRTUAL).
+						_ = e.populateGeneratedColumns(childRow, childDef.Columns)
 						modifiedRows = append(modifiedRows, oldChild)
 					}
 				}
@@ -313,6 +316,9 @@ func (e *Executor) handleParentRowUpdate(dbName, tableName string, oldRow, newRo
 						for i, col := range fk.Columns {
 							childRow[col] = newRow[fk.ReferencedColumns[i]]
 						}
+						// Re-evaluate virtual generated columns that may depend on the
+						// updated FK columns (e.g. fld2 INT AS (fld1) VIRTUAL).
+						_ = e.populateGeneratedColumns(childRow, childDef.Columns)
 						newChild := make(storage.Row)
 						for k, v := range childRow {
 							newChild[k] = v
@@ -344,6 +350,9 @@ func (e *Executor) handleParentRowUpdate(dbName, tableName string, oldRow, newRo
 						for _, col := range fk.Columns {
 							childRow[col] = nil
 						}
+						// Re-evaluate virtual generated columns that may depend on the
+						// updated FK columns (e.g. fld2 INT AS (fld1) VIRTUAL).
+						_ = e.populateGeneratedColumns(childRow, childDef.Columns)
 						newChild := make(storage.Row)
 						for k, v := range childRow {
 							newChild[k] = v
