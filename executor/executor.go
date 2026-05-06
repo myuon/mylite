@@ -3322,7 +3322,8 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		res, err := e.execSelect(s)
 		// Apply SQL_SELECT_LIMIT when no explicit LIMIT clause is present.
 		// MySQL applies sql_select_limit as the maximum rows returned to the client.
-		if err == nil && res != nil && s.Limit == nil {
+		// Inside stored procedures (routineDepth > 0), sql_select_limit is bypassed.
+		if err == nil && res != nil && s.Limit == nil && e.routineDepth == 0 {
 			if limitStr, ok := e.sessionScopeVars["sql_select_limit"]; ok {
 				if limit, convErr := strconv.ParseInt(limitStr, 10, 64); convErr == nil && limit >= 0 {
 					if int64(len(res.Rows)) > limit {

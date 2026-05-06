@@ -3845,10 +3845,6 @@
       "reason": "fulltext search result ordering + LOCK=NONE not implemented"
     },
     {
-      "test": "sys_vars/sql_warnings_func",
-      "reason": "sql_warnings variable not controlling info line output"
-    },
-    {
       "test": "parts/partition_engine_innodb",
       "reason": "output mismatch"
     },
@@ -3971,10 +3967,6 @@
     {
       "test": "sys_vars/sql_buffer_result_func",
       "reason": "Created_tmp_tables not tracking correctly"
-    },
-    {
-      "test": "sys_vars/sql_select_limit_func",
-      "reason": "affected rows mismatch"
     },
     {
       "test": "sys_vars/slow_launch_time_func",

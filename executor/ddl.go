@@ -1001,10 +1001,14 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			// Strategy: execute the SELECT first, then swap tables.
 			if stmt.Temp {
 				if _, alreadyTemp := e.tempTables[tableName]; !alreadyTemp {
-					// Execute SELECT while permanent table is still visible
+					// Execute SELECT while permanent table is still visible.
+					// Increment routineDepth so that sql_select_limit is not applied (CREATE ... SELECT
+					// is not subject to sql_select_limit, matching MySQL behavior).
 					prevInsideDML := e.insideDML
 					e.insideDML = true
+					e.routineDepth++
 					selResult, selErr := e.Execute(selectSQL)
+					e.routineDepth--
 					e.insideDML = prevInsideDML
 					// Release any row locks acquired by the inner SELECT (insideDML=true causes
 					// shared locks to be acquired; release them since CREATE TEMPORARY TABLE is not transactional).
@@ -1068,7 +1072,10 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 					}
 					e.upsertInnoDBStatsRows(dbName, tableName, e.tableRowCount(dbName, tableName))
 					e.tempTables[tableName] = true
-					return &Result{}, nil
+					rowCount := uint64(len(selResult.Rows))
+					infoMsg := fmt.Sprintf("Records: %d  Duplicates: 0  Warnings: 0", rowCount)
+					e.lastInsertInfo = infoMsg
+					return &Result{AffectedRows: rowCount, InfoMessage: infoMsg}, nil
 				}
 			}
 			result, err := e.execCreateTableSelect(dbName, tableName, selectSQL)
@@ -2903,7 +2910,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 				}
 			}
 		}
+		// Increment routineDepth so that sql_select_limit is not applied to the SELECT
+		// (MySQL's CREATE TABLE ... SELECT is not subject to sql_select_limit).
+		e.routineDepth++
 		selResult, selErr := e.Execute(selectSQL)
+		e.routineDepth--
 		if selErr != nil {
 			return nil, selErr
 		}
@@ -3005,6 +3016,14 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	// Use FromCreate variant so that SHOW INDEX cardinality returns NULL
 	// for freshly created tables (no ANALYZE run yet). MySQL behavior.
 	e.upsertInnoDBStatsRowsFromCreate(dbName, tableName, e.tableRowCount(dbName, tableName))
+
+	// For CREATE TABLE ... SELECT, return the row count as AffectedRows and set lastInsertInfo.
+	if stmt.Select != nil {
+		rowCount := uint64(e.tableRowCount(dbName, tableName))
+		infoMsg := fmt.Sprintf("Records: %d  Duplicates: 0  Warnings: 0", rowCount)
+		e.lastInsertInfo = infoMsg
+		return &Result{AffectedRows: rowCount, InfoMessage: infoMsg}, nil
+	}
 
 	return &Result{}, nil
 }
@@ -10310,9 +10329,13 @@ func (e *Executor) execCreateTableSelect(targetDB, newTableName, selectSQL strin
 		}
 	}
 	// Mark as DML context so that overflow in strict mode raises errors (not warnings).
+	// Also increment routineDepth so that sql_select_limit is not applied to the SELECT
+	// (MySQL's CREATE TABLE ... SELECT is not subject to sql_select_limit).
 	prevInsideDML := e.insideDML
 	e.insideDML = true
+	e.routineDepth++
 	result, err := e.Execute(selectSQL)
+	e.routineDepth--
 	e.insideDML = prevInsideDML
 	// Release any row locks acquired by the inner SELECT (insideDML=true causes shared
 	// locks to be acquired on source rows; those locks must not outlive this call since
@@ -10369,7 +10392,10 @@ func (e *Executor) execCreateTableSelect(targetDB, newTableName, selectSQL strin
 		tbl.Insert(sRow) //nolint:errcheck
 	}
 	e.upsertInnoDBStatsRows(targetDB, newTableName, e.tableRowCount(targetDB, newTableName))
-	return &Result{}, nil
+	rowCount := uint64(len(result.Rows))
+	infoMsg := fmt.Sprintf("Records: %d  Duplicates: 0  Warnings: 0", rowCount)
+	e.lastInsertInfo = infoMsg
+	return &Result{AffectedRows: rowCount, InfoMessage: infoMsg}, nil
 }
 
 // hasPrimaryKey returns true if the table has an explicit primary key defined.
