@@ -492,13 +492,22 @@ func normalizeStorageClause(query string) string {
 	return re.ReplaceAllString(query, "")
 }
 
-// normalizeStatsSamplePages strips STATS_SAMPLE_PAGES=default from table
-// options. The vitess parser cannot handle "default" as a table option value.
-// For numeric values, only strip valid ones (1-65535) so that invalid values
-// still trigger parse errors.
+// normalizeStatsSamplePages rewrites STATS_SAMPLE_PAGES values that the vitess
+// parser cannot handle. STATS_SAMPLE_PAGES=default is replaced with a sentinel:
+// stripped for CREATE TABLE (results in nil field) and replaced with 65537 for
+// ALTER TABLE (DDL handler clears the field). Negative values are replaced with
+// 65537 so the DDL range check produces a proper single-line error instead of
+// a multi-line vitess parse error.
 func normalizeStatsSamplePages(query string) string {
-	re := regexp.MustCompile(`(?i)\bSTATS_SAMPLE_PAGES\s*=\s*default\b`)
-	return re.ReplaceAllString(query, "")
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	reDefault := regexp.MustCompile(`(?i)\bSTATS_SAMPLE_PAGES\s*=\s*default\b`)
+	reNeg := regexp.MustCompile(`(?i)\bSTATS_SAMPLE_PAGES\s*=\s*-\s*\d+`)
+	if strings.HasPrefix(upper, "ALTER TABLE") {
+		query = reDefault.ReplaceAllString(query, "STATS_SAMPLE_PAGES=65537")
+	} else {
+		query = reDefault.ReplaceAllString(query, "")
+	}
+	return reNeg.ReplaceAllString(query, "STATS_SAMPLE_PAGES=65538")
 }
 
 // normalizeStartTransaction strips "START TRANSACTION" from CREATE TABLE

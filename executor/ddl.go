@@ -2340,6 +2340,10 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 		case "STATS_AUTO_RECALC":
 			def.StatsAutoRecalc = parseTableOptionInt(opt)
 		case "STATS_SAMPLE_PAGES":
+			rawSsp := strings.TrimSpace(tableOptionString(opt))
+			if sspVal, err := strconv.Atoi(rawSsp); err == nil && (sspVal < 1 || sspVal > 65535) {
+				return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 2", rawSsp))
+			}
 			def.StatsSamplePages = parseTableOptionInt(opt)
 		case "MAX_ROWS":
 			def.MaxRows = parseTableOptionUint64Clamped(opt)
@@ -6403,9 +6407,22 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 						tableDef.StatsAutoRecalc = parseTableOptionInt(to)
 					}
 				case "STATS_SAMPLE_PAGES":
-					tableDef, _ := db.GetTable(tableName)
-					if tableDef != nil {
-						tableDef.StatsSamplePages = parseTableOptionInt(to)
+					rawSsp := strings.TrimSpace(tableOptionString(to))
+					if sspVal, err := strconv.Atoi(rawSsp); err == nil {
+						if sspVal == 65537 {
+							// Sentinel: STATS_SAMPLE_PAGES=default → clear the field
+							tableDef, _ := db.GetTable(tableName)
+							if tableDef != nil {
+								tableDef.StatsSamplePages = nil
+							}
+						} else if sspVal < 1 || sspVal > 65535 {
+							return nil, mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 2", rawSsp))
+						} else {
+							tableDef, _ := db.GetTable(tableName)
+							if tableDef != nil {
+								tableDef.StatsSamplePages = parseTableOptionInt(to)
+							}
+						}
 					}
 				case "MAX_ROWS":
 					tableDef, _ := db.GetTable(tableName)
