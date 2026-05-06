@@ -624,7 +624,9 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 		}
 
-		return &Result{AffectedRows: affected, InsertID: uint64(lastInsertID)}, nil
+		infoMsgFast := fmt.Sprintf("Records: %d  Duplicates: 0  Warnings: 0", affected)
+		e.lastInsertInfo = infoMsgFast
+		return &Result{AffectedRows: affected, InsertID: uint64(lastInsertID), InfoMessage: infoMsgFast}, nil
 	}
 
 	// odkvExtSourceRows holds per-row source context (all columns from the FROM clause)

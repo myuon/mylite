@@ -2999,10 +2999,12 @@ func (ctx *execContext) executeQuery(stmt string) error {
 
 	// Collect result rows
 	var resultLines []string
+	var rowCount int // actual number of rows (for affected rows output)
 	// Track per-column cell strings for Max_length computation when metadata is enabled.
 	colMaxLen := make([]int, len(columns))
 	var resultCells [][]string // only populated when metadataEnabled
 	for rows.Next() {
+		rowCount++
 		values := make([]interface{}, len(columns))
 		valuePtrs := make([]interface{}, len(columns))
 		for i := range values {
@@ -3134,6 +3136,11 @@ func (ctx *execContext) executeQuery(stmt string) error {
 	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(stmt)), "EXPLAIN") &&
 		strings.Contains(strings.ToUpper(stmt), "FORMAT=TREE") {
 		ctx.output.WriteString("\n")
+	}
+
+	// --enable_info: output "affected rows: N" for SELECT (N = number of rows returned)
+	if ctx.infoEnabled {
+		ctx.output.WriteString(fmt.Sprintf("affected rows: %d\n", rowCount))
 	}
 
 	return nil
@@ -3484,6 +3491,10 @@ func (ctx *execContext) executeQueryOrExec(stmt string) error {
 			for _, line := range resultLines {
 				ctx.output.WriteString(line + "\n")
 			}
+			// --enable_info: output "affected rows: N" for each result set returned by CALL
+			if ctx.infoEnabled {
+				ctx.output.WriteString(fmt.Sprintf("affected rows: %d\n", len(resultLines)))
+			}
 		}
 
 		// Advance to next result set
@@ -3496,6 +3507,13 @@ func (ctx *execContext) executeQueryOrExec(stmt string) error {
 	ctx.replaceColumns = nil
 	ctx.replaceResult = nil
 	ctx.replaceRegex = nil
+
+	// --enable_info: CALL statements emit "affected rows: 0" for the CALL itself
+	// after all result sets from the procedure body have been output.
+	upper2 := strings.ToUpper(strings.TrimSpace(stmt))
+	if ctx.infoEnabled && strings.HasPrefix(upper2, "CALL ") {
+		ctx.output.WriteString("affected rows: 0\n")
+	}
 
 	return nil
 }
@@ -3560,23 +3578,46 @@ func (ctx *execContext) executeExec(stmt string) error {
 		if strings.HasPrefix(upper, "ALTER TABLE") || strings.HasPrefix(upper, "LOAD DATA") ||
 			strings.HasPrefix(upper, "CREATE INDEX") || strings.HasPrefix(upper, "DROP INDEX") {
 			ctx.output.WriteString(fmt.Sprintf("info: Records: %d  Duplicates: 0  Warnings: 0\n", affected))
-		} else if strings.HasPrefix(upper, "INSERT") || strings.HasPrefix(upper, "REPLACE") {
-			// Query the server for INSERT/REPLACE info (Records/Duplicates/Warnings)
+		} else if (strings.HasPrefix(upper, "CREATE TABLE") || strings.HasPrefix(upper, "CREATE TEMPORARY TABLE")) &&
+			strings.Contains(upper, " SELECT ") {
+			// CREATE TABLE ... SELECT: treat like INSERT, use LAST_INSERT_INFO for Records count.
 			var info string
 			if activeConn != nil {
 				row := activeConn.QueryRowContext(context.Background(), "MYLITE LAST_INSERT_INFO")
-				if err := row.Scan(&info); err == nil && info != "" {
-					ctx.output.WriteString(fmt.Sprintf("info: %s\n", info))
-				} else {
-					ctx.output.WriteString(fmt.Sprintf("info: Records: %d  Duplicates: 0  Warnings: 0\n", affected))
+				if err := row.Scan(&info); err != nil || info == "" {
+					info = fmt.Sprintf("Records: %d  Duplicates: 0  Warnings: 0", affected)
 				}
 			} else {
 				row := ctx.db.QueryRow("MYLITE LAST_INSERT_INFO")
-				if err := row.Scan(&info); err == nil && info != "" {
-					ctx.output.WriteString(fmt.Sprintf("info: %s\n", info))
-				} else {
-					ctx.output.WriteString(fmt.Sprintf("info: Records: %d  Duplicates: 0  Warnings: 0\n", affected))
+				if err := row.Scan(&info); err != nil || info == "" {
+					info = fmt.Sprintf("Records: %d  Duplicates: 0  Warnings: 0", affected)
 				}
+			}
+			ctx.output.WriteString(fmt.Sprintf("info: %s\n", info))
+		} else if strings.HasPrefix(upper, "INSERT") || strings.HasPrefix(upper, "REPLACE") {
+			// Get actual warning count BEFORE calling MYLITE LAST_INSERT_INFO, because
+			// each server call shifts lastWarningCount and clears the previous one.
+			actualWarnings := ctx.getWarningCount(activeConn)
+			// Query the server for INSERT/REPLACE info (Records/Duplicates/Warnings).
+			var info string
+			if activeConn != nil {
+				row := activeConn.QueryRowContext(context.Background(), "MYLITE LAST_INSERT_INFO")
+				if err := row.Scan(&info); err != nil || info == "" {
+					info = fmt.Sprintf("Records: %d  Duplicates: 0  Warnings: 0", affected)
+				}
+			} else {
+				row := ctx.db.QueryRow("MYLITE LAST_INSERT_INFO")
+				if err := row.Scan(&info); err != nil || info == "" {
+					info = fmt.Sprintf("Records: %d  Duplicates: 0  Warnings: 0", affected)
+				}
+			}
+			// Patch Warnings value in info string to reflect actual warning count.
+			if actualWarnings > 0 {
+				info = patchWarningsCount(info, actualWarnings)
+			}
+			// Only output info line when there are no warnings, or when sql_warnings=1.
+			if actualWarnings == 0 || ctx.getSQLWarnings(activeConn) {
+				ctx.output.WriteString(fmt.Sprintf("info: %s\n", info))
 			}
 		} else if strings.HasPrefix(upper, "UPDATE") {
 			// Query the server for the update info message (Rows matched/Changed)
@@ -3778,6 +3819,76 @@ func (ctx *execContext) getActiveConn() *sql.Conn {
 		return ctx.defaultConn
 	}
 	return ctx.connByName[strings.ToLower(ctx.currentConn)]
+}
+
+// extractWarningsCount parses the Warnings value from an info string like
+// "Records: 1  Duplicates: 0  Warnings: 1" and returns it as an integer.
+func extractWarningsCount(info string) int {
+	const prefix = "Warnings: "
+	idx := strings.Index(info, prefix)
+	if idx < 0 {
+		return 0
+	}
+	rest := strings.TrimSpace(info[idx+len(prefix):])
+	// rest may have trailing content; take first token
+	end := strings.IndexByte(rest, ' ')
+	if end >= 0 {
+		rest = rest[:end]
+	}
+	n, err := strconv.Atoi(rest)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// patchWarningsCount replaces the Warnings value in an info string with the given count.
+func patchWarningsCount(info string, count int) string {
+	const prefix = "Warnings: "
+	idx := strings.Index(info, prefix)
+	if idx < 0 {
+		return info
+	}
+	start := idx + len(prefix)
+	end := start
+	for end < len(info) && info[end] >= '0' && info[end] <= '9' {
+		end++
+	}
+	return info[:start] + strconv.Itoa(count) + info[end:]
+}
+
+// getWarningCount returns the server's current @@warning_count value.
+func (ctx *execContext) getWarningCount(activeConn *sql.Conn) int {
+	var val int
+	if activeConn != nil {
+		row := activeConn.QueryRowContext(context.Background(), "SELECT @@warning_count")
+		if err := row.Scan(&val); err == nil {
+			return val
+		}
+	} else {
+		row := ctx.db.QueryRow("SELECT @@warning_count")
+		if err := row.Scan(&val); err == nil {
+			return val
+		}
+	}
+	return 0
+}
+
+// getSQLWarnings returns true if @@sql_warnings is non-zero on the active connection.
+func (ctx *execContext) getSQLWarnings(activeConn *sql.Conn) bool {
+	var val int
+	if activeConn != nil {
+		row := activeConn.QueryRowContext(context.Background(), "SELECT @@sql_warnings")
+		if err := row.Scan(&val); err == nil {
+			return val != 0
+		}
+	} else {
+		row := ctx.db.QueryRow("SELECT @@sql_warnings")
+		if err := row.Scan(&val); err == nil {
+			return val != 0
+		}
+	}
+	return false
 }
 
 // queryRows executes a SQL query and returns the results as a slice of string slices.
