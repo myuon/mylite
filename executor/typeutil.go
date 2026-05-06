@@ -707,12 +707,45 @@ func normalizeYearComparisonTyped(ls, rs string, origLeft, origRight interface{}
 		return ok
 	}
 
-	if isYearLike(li) && isSmallYear(ri) && !isYearLike(ri) && (isOrigString(origLeft) || isOrigString(origRight)) {
-		ri = convertSmallYear(ri)
+	// isYearColumnString checks if a string looks like a YEAR column value: exactly
+	// 4 digits representing 0000 or 1901-2155.
+	isYearColumnStr := func(s string) bool {
+		if len(s) != 4 {
+			return false
+		}
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return false
+		}
+		return n == 0 || (n >= 1901 && n <= 2155)
+	}
+
+	// For string '0', '00', '000' vs YEAR column: these short-zero strings represent
+	// year 2000 in MySQL (2-digit year mapping), but '0000' represents the zero year.
+	// Integer literal 0 represents the zero year sentinel (stays 0000).
+	// This conversion only triggers when one side is a 4-digit YEAR column string (like "2000").
+	convertSmallYearStr := func(n int, orig interface{}, s string) int {
+		if n == 0 && isOrigString(orig) && len(strings.TrimLeft(s, "0")) == 0 && len(s) < 4 {
+			return 2000
+		}
+		return convertSmallYear(n)
+	}
+	// canConvertSmall: like !isYearLike but also allows n==0 from a short string literal.
+	canConvertSmall := func(n int, orig interface{}, s string, otherSide string) bool {
+		if n == 0 {
+			// Convert string '0'/'00'/'000' to 2000 only when other side is a 4-digit YEAR string.
+			return isOrigString(orig) && len(strings.TrimLeft(s, "0")) == 0 && len(s) < 4 &&
+				isYearColumnStr(otherSide)
+		}
+		return !isYearLike(n)
+	}
+
+	if isYearLike(li) && isSmallYear(ri) && canConvertSmall(ri, origRight, rs, ls) && (isOrigString(origLeft) || isOrigString(origRight)) {
+		ri = convertSmallYearStr(ri, origRight, rs)
 		return ls, fmt.Sprintf("%d", ri)
 	}
-	if isYearLike(ri) && isSmallYear(li) && !isYearLike(li) && (isOrigString(origLeft) || isOrigString(origRight)) {
-		li = convertSmallYear(li)
+	if isYearLike(ri) && isSmallYear(li) && canConvertSmall(li, origLeft, ls, rs) && (isOrigString(origLeft) || isOrigString(origRight)) {
+		li = convertSmallYearStr(li, origLeft, ls)
 		return fmt.Sprintf("%d", li), rs
 	}
 

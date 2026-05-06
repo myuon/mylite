@@ -127,12 +127,61 @@ func validatePartitionExpr(expr sqlparser.Expr) (disallowed bool, wrongExpr bool
 	case *sqlparser.LocateExpr:
 		// locate(substr, str) and position(substr IN str) - always disallowed
 		return true, false
+	case *sqlparser.TimestampDiffExpr:
+		// TIMESTAMPDIFF is not allowed in partition expressions
+		return true, false
 	case *sqlparser.ColName:
 		// Column references are always allowed
 	case *sqlparser.Literal:
 		// Literal values are always allowed
 	}
 	return false, false
+}
+
+// validateUnixTimestampPartitionExpr checks that unix_timestamp(col) in a partition expression
+// uses only TIMESTAMP columns. DATE/DATETIME columns are not allowed (error 1486).
+func validateUnixTimestampPartitionExpr(expr sqlparser.Expr, cols []*sqlparser.ColumnDefinition) error {
+	// Build map of column name -> type (lowercase)
+	colTypes := make(map[string]string, len(cols))
+	for _, col := range cols {
+		colTypes[strings.ToLower(col.Name.String())] = strings.ToLower(col.Type.Type)
+	}
+	return validateUnixTimestampExprWalk(expr, colTypes)
+}
+
+func validateUnixTimestampExprWalk(expr sqlparser.Expr, colTypes map[string]string) error {
+	if expr == nil {
+		return nil
+	}
+	switch e := expr.(type) {
+	case *sqlparser.FuncExpr:
+		name := strings.ToLower(e.Name.String())
+		if name == "unix_timestamp" && len(e.Exprs) == 1 {
+			// unix_timestamp(col): check the argument is a TIMESTAMP column
+			if col, ok := e.Exprs[0].(*sqlparser.ColName); ok {
+				colType := colTypes[strings.ToLower(col.Name.String())]
+				// Allow only TIMESTAMP; DATE and DATETIME are not allowed
+				if colType != "timestamp" {
+					return mysqlError(1486, "HY000", "Constant, random or timezone-dependent expressions in (sub)partitioning function are not allowed")
+				}
+			}
+		}
+		for _, arg := range e.Exprs {
+			if err := validateUnixTimestampExprWalk(arg, colTypes); err != nil {
+				return err
+			}
+		}
+	case *sqlparser.BinaryExpr:
+		if err := validateUnixTimestampExprWalk(e.Left, colTypes); err != nil {
+			return err
+		}
+		if err := validateUnixTimestampExprWalk(e.Right, colTypes); err != nil {
+			return err
+		}
+	case *sqlparser.UnaryExpr:
+		return validateUnixTimestampExprWalk(e.Expr, colTypes)
+	}
+	return nil
 }
 
 // validateUTF8StringForDDL checks if a string contains valid utf8mb3 (3-byte UTF-8) when character_set_client=binary.
@@ -2512,6 +2561,11 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			if po.Type != sqlparser.KeyType {
 				if disallowed, _ := validatePartitionExpr(po.Expr); disallowed {
 					return nil, mysqlError(1491, "HY000", "This partition function is not allowed")
+				}
+				// Validate unix_timestamp(col): col must be TIMESTAMP type.
+				// DATE/DATETIME columns raise error 1486.
+				if err := validateUnixTimestampPartitionExpr(po.Expr, stmt.TableSpec.Columns); err != nil {
+					return nil, err
 				}
 			}
 		}
