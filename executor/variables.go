@@ -114,6 +114,12 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		cleanVarName := strings.TrimPrefix(name, "global.")
 		cleanVarName = strings.TrimPrefix(cleanVarName, "session.")
 		cleanVarName = strings.TrimPrefix(cleanVarName, "local.")
+		// @@persist.var is parsed by vitess with name="persist.var", scope=SessionScope.
+		// Strip the "persist." prefix so it's treated like a global variable.
+		isPersistScope := strings.HasPrefix(name, "persist.")
+		if isPersistScope {
+			cleanVarName = strings.TrimPrefix(name, "persist.")
+		}
 		// performance_schema_consumer_* are startup-only options, not settable variables.
 		if strings.HasPrefix(cleanVarName, "performance_schema_consumer_") ||
 			cleanVarName == "performance_schema_instrument" {
@@ -140,11 +146,13 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 		}
 		// Check if GLOBAL-only variable is being set at SESSION scope
 		scope := expr.Var.Scope
-		if sysVarGlobalOnly[cleanVarName] && !sysVarBothScope[cleanVarName] && scope != sqlparser.GlobalScope {
+		// @@persist.var (isPersistScope) is treated as global scope for all purposes.
+		effectivelyGlobal := scope == sqlparser.GlobalScope || isPersistScope
+		if sysVarGlobalOnly[cleanVarName] && !sysVarBothScope[cleanVarName] && !effectivelyGlobal {
 			return nil, mysqlError(1228, "HY000", fmt.Sprintf("Variable '%s' is a GLOBAL variable and should be set with SET GLOBAL", cleanVarName))
 		}
 		// Check if SESSION-only variable is being set at GLOBAL scope
-		if sysVarSessionOnly[cleanVarName] && scope == sqlparser.GlobalScope {
+		if sysVarSessionOnly[cleanVarName] && effectivelyGlobal {
 			return nil, mysqlError(1229, "HY000", fmt.Sprintf("Variable '%s' is a SESSION variable and can't be used with SET GLOBAL", cleanVarName))
 		}
 		// Type validation for int-range and float-range variables must happen BEFORE
@@ -159,7 +167,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			}
 		}
 		// Check if session-read-only variable is being set at SESSION scope
-		if sysVarSessionReadOnly[cleanVarName] && scope != sqlparser.GlobalScope {
+		if sysVarSessionReadOnly[cleanVarName] && !effectivelyGlobal {
 			return nil, mysqlError(1238, "HY000", fmt.Sprintf("SESSION variable '%s' is read-only. Use SET GLOBAL to assign the value", cleanVarName))
 		}
 		// Emit deprecation warning for deprecated variables
@@ -744,7 +752,11 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				cleanName := strings.TrimPrefix(name, "global.")
 				cleanName = strings.TrimPrefix(cleanName, "session.")
 				cleanName = strings.TrimPrefix(cleanName, "local.")
-				isGlobal := scope == sqlparser.GlobalScope
+				// @@persist.var: strip "persist." prefix and treat as global.
+				if strings.HasPrefix(cleanName, "persist.") {
+					cleanName = strings.TrimPrefix(cleanName, "persist.")
+				}
+				isGlobal := scope == sqlparser.GlobalScope || isPersistScope
 				// SET TRANSACTION ISOLATION LEVEL (NextTxScope) and SET @@transaction_isolation
 				// in MySQL apply only to the NEXT transaction. We store the value in
 				// sessionScopeVars (so getSysVar returns it for locking/isolation checks),
@@ -1510,6 +1522,22 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 						}
 					}
 				}
+				// For SET @@persist.var=val, also update the in-memory persisted vars map.
+				if isPersistScope {
+					_, isDefault := expr.Expr.(*sqlparser.Default)
+					if isDefault || strings.ToUpper(val) == "DEFAULT" {
+						e.deletePersistedVar(cleanName)
+					} else {
+						// Read back the actual value now stored in global scope.
+						if gv, ok := e.getGlobalVar(cleanName); ok {
+							e.setPersistedVar(cleanName, gv)
+						} else if sv, ok2 := e.sessionScopeVars[cleanName]; ok2 {
+							e.setPersistedVar(cleanName, sv)
+						} else {
+							e.setPersistedVar(cleanName, val)
+						}
+					}
+				}
 			}
 		}
 	}
@@ -1869,7 +1897,8 @@ func (e *Executor) handleRawSet(raw string) error {
 	rest := strings.TrimSpace(trimmed[4:])
 	restUpper := strings.ToUpper(rest)
 	isPersistOnly := strings.HasPrefix(restUpper, "PERSIST_ONLY ")
-	isGlobalScope := strings.HasPrefix(restUpper, "GLOBAL ") || strings.HasPrefix(restUpper, "@@GLOBAL.") || strings.HasPrefix(restUpper, "PERSIST ") || isPersistOnly
+	isRawPersist := strings.HasPrefix(restUpper, "PERSIST ") && !isPersistOnly
+	isGlobalScope := strings.HasPrefix(restUpper, "GLOBAL ") || strings.HasPrefix(restUpper, "@@GLOBAL.") || isRawPersist || isPersistOnly
 	// Use case-insensitive prefix stripping for scope keywords
 	if strings.HasPrefix(restUpper, "GLOBAL ") {
 		rest = rest[len("GLOBAL "):]
@@ -1925,6 +1954,14 @@ func (e *Executor) handleRawSet(raw string) error {
 			e.addWarning("Warning", 1287, msg)
 		}
 		val := strings.TrimSpace(rest[eqIdx+1:])
+		// Handle comma-separated var=val pairs: "max_heap_table_size=999424, slave_net_timeout=124"
+		// If the value contains ", identifier=" pattern, this is a multi-var SET.
+		// Process the first var now and recurse for the rest.
+		remainingPairs := ""
+		if commaIdx := findRawSetVarSeparator(val); commaIdx >= 0 {
+			remainingPairs = strings.TrimSpace(val[commaIdx+1:])
+			val = strings.TrimSpace(val[:commaIdx])
+		}
 		val = strings.TrimSuffix(val, ";")
 		val = strings.TrimSpace(val)
 		// Reject NULL for string-type system variables
@@ -2060,6 +2097,14 @@ func (e *Executor) handleRawSet(raw string) error {
 				}
 			}
 			e.setSysVar(varName, val, isGlobalScope)
+			// For SET PERSIST var=val, track the value in persistedVars.
+			if isRawPersist {
+				if gv, ok := e.getGlobalVar(varName); ok {
+					e.setPersistedVar(varName, gv)
+				} else {
+					e.setPersistedVar(varName, val)
+				}
+			}
 		} else {
 			// For SET GLOBAL var = DEFAULT, use the compiled default when
 			// startupVars would otherwise shadow it.
@@ -2083,10 +2128,26 @@ func (e *Executor) handleRawSet(raw string) error {
 			} else {
 				e.deleteSysVar(varName, false)
 			}
+			// For SET PERSIST var=DEFAULT, remove from persistedVars.
+			if isRawPersist {
+				e.deletePersistedVar(varName)
+			}
 		}
 		// Trigger variables reset to OFF immediately after being set
 		if triggerSysVars[varName] {
 			e.setSysVar(varName, "OFF", isGlobalScope)
+		}
+		// Process remaining comma-separated var=val pairs (e.g. "SET PERSIST a=1, b=2").
+		if remainingPairs != "" {
+			var scopePrefix string
+			if isRawPersist {
+				scopePrefix = "PERSIST "
+			} else if isGlobalScope {
+				scopePrefix = "GLOBAL "
+			}
+			if err := e.handleRawSet("SET " + scopePrefix + remainingPairs); err != nil {
+				return err
+			}
 		}
 	}
 	if strings.HasPrefix(upper, "SET NAMES ") {
@@ -3941,6 +4002,52 @@ func (e *Executor) clampFloatVar(name string, expr sqlparser.Expr, min, max floa
 		f = max
 	}
 	return strconv.FormatFloat(f, 'f', 6, 64), nil
+}
+
+// findRawSetVarSeparator finds the index of a comma that separates two var=val pairs
+// in a raw SET value string like "999424, slave_net_timeout=124".
+// Returns -1 if no such separator is found (the whole string is a single value).
+// Only looks for comma followed by an identifier that has a subsequent "=".
+func findRawSetVarSeparator(val string) int {
+	// Quick path: if no comma exists, no separator.
+	if !strings.Contains(val, ",") {
+		return -1
+	}
+	i := 0
+	inQuote := byte(0)
+	for i < len(val) {
+		ch := val[i]
+		if inQuote != 0 {
+			if ch == inQuote {
+				inQuote = 0
+			} else if ch == '\\' {
+				i++ // skip escaped char
+			}
+			i++
+			continue
+		}
+		if ch == '\'' || ch == '"' {
+			inQuote = ch
+			i++
+			continue
+		}
+		if ch == ',' {
+			// Check if what follows the comma (after optional whitespace) looks like "identifier="
+			rest := strings.TrimSpace(val[i+1:])
+			// An identifier starts with a letter, digit, or underscore, and must be followed by '='
+			// somewhere (optionally after more identifier chars).
+			j := 0
+			for j < len(rest) && (rest[j] == '_' || (rest[j] >= 'a' && rest[j] <= 'z') ||
+				(rest[j] >= 'A' && rest[j] <= 'Z') || (rest[j] >= '0' && rest[j] <= '9')) {
+				j++
+			}
+			if j > 0 && j < len(rest) && rest[j] == '=' {
+				return i
+			}
+		}
+		i++
+	}
+	return -1
 }
 
 func normalizeBooleanToken(raw string) (int64, bool, bool) {
