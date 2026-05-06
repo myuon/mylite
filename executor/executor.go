@@ -563,6 +563,11 @@ type Executor struct {
 	// Key is lowercase thread name; value maps lowercase column name to new value.
 	// nil means no overrides have been applied.
 	psSetupThreadsOverride map[string]map[string]string
+	// persistedVars stores in-memory persisted variable values set via SET PERSIST / SET @@persist.
+	// Shared across all executor instances (connections).
+	persistedVars map[string]string
+	// persistedVarsMu protects concurrent access to persistedVars.
+	persistedVarsMu *sync.RWMutex
 	// processList is a shared registry of active connections and their states.
 	// It is shared across all executor instances (connections).
 	processList *ProcessList
@@ -837,6 +842,57 @@ func (e *Executor) rangeGlobalVars(f func(name, val string)) {
 		f(k, v)
 	}
 	e.globalVarsMu.RUnlock()
+}
+
+// setPersistedVar writes a value to persistedVars under Lock.
+func (e *Executor) setPersistedVar(name, value string) {
+	if e.persistedVarsMu == nil {
+		if e.persistedVars == nil {
+			e.persistedVars = make(map[string]string)
+		}
+		e.persistedVars[name] = value
+		return
+	}
+	e.persistedVarsMu.Lock()
+	e.persistedVars[name] = value
+	e.persistedVarsMu.Unlock()
+}
+
+// deletePersistedVar removes a key from persistedVars under Lock.
+func (e *Executor) deletePersistedVar(name string) {
+	if e.persistedVarsMu == nil {
+		delete(e.persistedVars, name)
+		return
+	}
+	e.persistedVarsMu.Lock()
+	delete(e.persistedVars, name)
+	e.persistedVarsMu.Unlock()
+}
+
+// clearPersistedVars removes all entries from persistedVars under Lock.
+func (e *Executor) clearPersistedVars() {
+	if e.persistedVarsMu == nil {
+		e.persistedVars = make(map[string]string)
+		return
+	}
+	e.persistedVarsMu.Lock()
+	e.persistedVars = make(map[string]string)
+	e.persistedVarsMu.Unlock()
+}
+
+// rangePersistedVars calls f for each (name, value) pair in persistedVars under RLock.
+func (e *Executor) rangePersistedVars(f func(name, val string)) {
+	if e.persistedVarsMu == nil {
+		for k, v := range e.persistedVars {
+			f(k, v)
+		}
+		return
+	}
+	e.persistedVarsMu.RLock()
+	for k, v := range e.persistedVars {
+		f(k, v)
+	}
+	e.persistedVarsMu.RUnlock()
 }
 
 // effectiveDataDir returns the data directory path that should be exposed
@@ -1364,6 +1420,8 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	e.sysVarsAdminUsersMu = &sync.RWMutex{}
 	e.knownUsers = make(map[string]bool)
 	e.knownUsersMu = &sync.RWMutex{}
+	e.persistedVars = make(map[string]string)
+	e.persistedVarsMu = &sync.RWMutex{}
 	e.grantStore = NewGrantStore()
 	e.viewStore = NewViewStore()
 	e.initSystemTables()
@@ -1433,6 +1491,8 @@ func (e *Executor) Clone() *Executor {
 		psTruncated:             e.psTruncated,
 		nextConnID:              e.nextConnID,
 		connectionID:            connID,
+		persistedVars:           e.persistedVars,
+		persistedVarsMu:         e.persistedVarsMu,
 		lockManager:             e.lockManager,
 		rowLockManager:          e.rowLockManager,
 		processList:             e.processList,
@@ -2825,6 +2885,16 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 				strings.HasPrefix(rest, "ROLLBACK ") ||
 				rest == "END" || rest == "COMMIT" || rest == "ROLLBACK" {
 				e.inXATransaction = false
+			}
+			return &Result{}, nil
+		}
+		// RESET PERSIST [var_name] clears in-memory persisted variables.
+		if upper == "RESET PERSIST" || strings.HasPrefix(upper, "RESET PERSIST ") {
+			rest := strings.TrimSpace(trimmed[len("RESET PERSIST"):])
+			if rest == "" {
+				e.clearPersistedVars()
+			} else {
+				e.deletePersistedVar(strings.ToLower(rest))
 			}
 			return &Result{}, nil
 		}

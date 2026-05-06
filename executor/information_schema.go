@@ -540,7 +540,7 @@ var emptyStubTables = map[string]bool{
 	"innodb_ft_being_deleted": true,
 	"innodb_ft_deleted":      true,
 	// "column_privileges" is handled dynamically via infoSchemaColumnPrivileges.
-	"persisted_variables":    true,
+	// "persisted_variables" is handled dynamically via perfSchemaPersistedVariables.
 	// "variables_by_thread" is handled dynamically
 	// "status_by_thread" is handled dynamically
 	// "user_variables_by_thread" is handled dynamically
@@ -874,6 +874,8 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 			{"value": "when"}, {"value": "where"}, {"value": "who"}, {"value": "will"},
 			{"value": "with"}, {"value": "und"}, {"value": "the"}, {"value": "www"},
 		}
+	case "persisted_variables":
+		rawRows = e.perfSchemaPersistedVariables()
 	case "global_variables":
 		rawRows = e.perfSchemaVariablesScoped(true)
 	case "session_variables":
@@ -3957,6 +3959,44 @@ func (e *Executor) perfSchemaVariables() []storage.Row {
 }
 
 // perfSchemaVariablesScoped returns sorted rows scoped to global or session.
+// perfSchemaPersistedVariables returns rows for performance_schema.persisted_variables.
+// It reflects the in-memory map of variables set via SET PERSIST / SET @@persist.
+func (e *Executor) perfSchemaPersistedVariables() []storage.Row {
+	// Take a snapshot of all persisted vars under the lock.
+	snapshot := make(map[string]string)
+	e.rangePersistedVars(func(name, val string) {
+		snapshot[name] = val
+	})
+	names := make([]string, 0, len(snapshot))
+	for n := range snapshot {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	rows := make([]storage.Row, 0, len(names))
+	for _, n := range names {
+		val := snapshot[n]
+		// Normalize boolean values (0→OFF, 1→ON) based on the compiled default.
+		if defaultVal, ok := e.getCompiledDefault(n); ok {
+			upperDefault := strings.ToUpper(defaultVal)
+			if upperDefault == "ON" || upperDefault == "OFF" {
+				upperVal := strings.ToUpper(val)
+				if upperVal == "1" || upperVal == "ON" || upperVal == "TRUE" || upperVal == "YES" {
+					val = "ON"
+				} else if upperVal == "0" || upperVal == "OFF" || upperVal == "FALSE" || upperVal == "NO" {
+					val = "OFF"
+				}
+			}
+		}
+		rows = append(rows, storage.Row{
+			"VARIABLE_NAME":  n,
+			"variable_name":  n,
+			"VARIABLE_VALUE": val,
+			"variable_value": val,
+		})
+	}
+	return rows
+}
+
 func (e *Executor) perfSchemaVariablesScoped(globalOnly bool) []storage.Row {
 	vars := e.buildVariablesMapScoped(globalOnly)
 	names := make([]string, 0, len(vars))

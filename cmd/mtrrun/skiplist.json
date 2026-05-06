@@ -3305,10 +3305,6 @@
       "reason": "output mismatch, timeout, or error"
     },
     {
-      "test": "perfschema/persisted_variables",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
       "test": "perfschema/pfs_example",
       "reason": "output mismatch, timeout, or error"
     },
