@@ -3109,10 +3109,6 @@
       "reason": "output mismatch, timeout, or error"
     },
     {
-      "test": "perfschema/column_privilege",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
       "test": "perfschema/connect_attrs",
       "reason": "output mismatch, timeout, or error"
     },
