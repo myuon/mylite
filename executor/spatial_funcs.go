@@ -1761,24 +1761,13 @@ func mbrDimContains(oMin, oMax, iMin, iMax float64) bool {
 }
 
 // mbrContainsBoxes returns true if outer MBR box [ox1,oy1,ox2,oy2] contains inner
-// MBR box [ix1,iy1,ix2,iy2] according to MySQL 5.7 MBRCONTAINS semantics:
-//   - Exact equality → true (handles degenerate equal MBRs like POINT=POINT)
-//   - Inner weakly contained in outer (all coordinates), AND for each dimension,
-//     inner must strictly intersect the open interior of outer in that dimension
-//     (or exactly equal a degenerate outer dimension).
+// MBR box [ix1,iy1,ix2,iy2] using closed-interval (inclusive boundary) containment.
+// A point on the boundary of the outer MBR is considered "within" it.
+// This matches MySQL 8.0 MBRCONTAINS / MBRWITHIN semantics.
 func mbrContainsBoxes(outer, inner []float64) bool {
 	ox1, oy1, ox2, oy2 := outer[0], outer[1], outer[2], outer[3]
 	ix1, iy1, ix2, iy2 := inner[0], inner[1], inner[2], inner[3]
-	// Weak containment
-	if !(ox1 <= ix1 && oy1 <= iy1 && ox2 >= ix2 && oy2 >= iy2) {
-		return false
-	}
-	// Exact equality
-	if ox1 == ix1 && oy1 == iy1 && ox2 == ix2 && oy2 == iy2 {
-		return true
-	}
-	// Per-dimension containment check
-	return mbrDimContains(ox1, ox2, ix1, ix2) && mbrDimContains(oy1, oy2, iy1, iy2)
+	return ox1 <= ix1 && oy1 <= iy1 && ox2 >= ix2 && oy2 >= iy2
 }
 
 // mbrContains returns true if outer geometry's MBR contains inner geometry's MBR
