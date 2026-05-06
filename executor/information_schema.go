@@ -1005,8 +1005,18 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 			}
 		}
 	case "events_waits_current":
-		rawRows = []storage.Row{
-			{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "wait/lock/table/sql/handler", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "SPINS": nil, "OBJECT_SCHEMA": nil, "OBJECT_NAME": nil, "INDEX_NAME": nil, "OBJECT_TYPE": nil, "OBJECT_INSTANCE_BEGIN": int64(0), "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil, "OPERATION": "lock", "NUMBER_OF_BYTES": nil, "FLAGS": nil},
+		if e.psEventsStore != nil {
+			waitRows := e.psEventsStore.Rows("events_waits_current")
+			rawRows = psEventRowsToStorageRows(waitRows, map[string]interface{}{
+				"SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0),
+				"SPINS": nil, "OBJECT_SCHEMA": nil, "OBJECT_NAME": nil, "INDEX_NAME": nil,
+				"OBJECT_TYPE": "TABLE", "OBJECT_INSTANCE_BEGIN": int64(0), "NESTING_EVENT_ID": nil,
+				"NESTING_EVENT_TYPE": nil, "OPERATION": "lock", "NUMBER_OF_BYTES": nil, "FLAGS": nil,
+			})
+		} else {
+			rawRows = []storage.Row{
+				{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "wait/lock/table/sql/handler", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "SPINS": nil, "OBJECT_SCHEMA": nil, "OBJECT_NAME": nil, "INDEX_NAME": nil, "OBJECT_TYPE": nil, "OBJECT_INSTANCE_BEGIN": int64(0), "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil, "OPERATION": "lock", "NUMBER_OF_BYTES": nil, "FLAGS": nil},
+			}
 		}
 	case "events_waits_history":
 		if e.startupVars["performance_schema_events_waits_history_size"] == "0" {
@@ -1122,6 +1132,12 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 	case "events_stages_current":
 		if e.psClassDisabled("stage") {
 			rawRows = []storage.Row{}
+		} else if e.psEventsStore != nil {
+			stageRows := e.psEventsStore.Rows("events_stages_current")
+			rawRows = psEventRowsToStorageRows(stageRows, map[string]interface{}{
+				"SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0),
+				"WORK_COMPLETED": nil, "WORK_ESTIMATED": nil, "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil,
+			})
 		} else {
 			rawRows = []storage.Row{
 				{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "stage/sql/executing", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "WORK_COMPLETED": nil, "WORK_ESTIMATED": nil, "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil},
@@ -1138,6 +1154,15 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 	case "events_statements_current":
 		if e.psClassDisabled("statement") {
 			rawRows = []storage.Row{}
+		} else if e.psEventsStore != nil {
+			stmtRows := e.psEventsStore.Rows("events_statements_current")
+			rawRows = psEventRowsToStorageRows(stmtRows, map[string]interface{}{
+				"SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0),
+				"SQL_TEXT": nil, "DIGEST": nil, "DIGEST_TEXT": nil, "CURRENT_SCHEMA": nil,
+				"ROWS_AFFECTED": int64(0), "ROWS_SENT": int64(0), "ROWS_EXAMINED": int64(0),
+				"CREATED_TMP_DISK_TABLES": int64(0), "CREATED_TMP_TABLES": int64(0),
+				"ERRORS": int64(0), "WARNINGS": int64(0), "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil,
+			})
 		} else {
 			rawRows = []storage.Row{
 				{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "statement/sql/select", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "SQL_TEXT": nil, "DIGEST": nil, "DIGEST_TEXT": nil, "CURRENT_SCHEMA": nil, "ROWS_AFFECTED": int64(0), "ROWS_SENT": int64(0), "ROWS_EXAMINED": int64(0), "CREATED_TMP_DISK_TABLES": int64(0), "CREATED_TMP_TABLES": int64(0), "ERRORS": int64(0), "WARNINGS": int64(0), "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil},
@@ -1146,14 +1171,36 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 	case "events_statements_history":
 		if e.psClassDisabled("statement") || e.startupVars["performance_schema_events_statements_history_size"] == "0" {
 			rawRows = []storage.Row{}
+		} else if e.psEventsStore != nil {
+			histRows := e.psEventsStore.Rows("events_statements_history")
+			rawRows = psEventRowsToStorageRows(histRows, map[string]interface{}{
+				"SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0),
+				"SQL_TEXT": nil, "DIGEST": nil, "DIGEST_TEXT": nil, "CURRENT_SCHEMA": nil,
+				"ROWS_AFFECTED": int64(0), "ROWS_SENT": int64(0), "ROWS_EXAMINED": int64(0),
+				"CREATED_TMP_DISK_TABLES": int64(0), "CREATED_TMP_TABLES": int64(0),
+				"ERRORS": int64(0), "WARNINGS": int64(0), "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil,
+			})
 		} else {
 			rawRows = []storage.Row{
 				{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "statement/sql/select", "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "SQL_TEXT": nil, "DIGEST": nil, "DIGEST_TEXT": nil, "CURRENT_SCHEMA": nil, "ROWS_AFFECTED": int64(0), "ROWS_SENT": int64(0), "ROWS_EXAMINED": int64(0), "CREATED_TMP_DISK_TABLES": int64(0), "CREATED_TMP_TABLES": int64(0), "ERRORS": int64(0), "WARNINGS": int64(0), "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil},
 			}
 		}
 	case "events_transactions_current":
-		rawRows = []storage.Row{
-			{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "transaction", "STATE": "COMMITTED", "TRX_ID": nil, "GTID": "", "XID_FORMAT_ID": nil, "XID_GTRID": nil, "XID_BQUAL": nil, "XA_STATE": nil, "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "ACCESS_MODE": "READ WRITE", "ISOLATION_LEVEL": "REPEATABLE READ", "AUTOCOMMIT": "YES", "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil},
+		if e.psClassDisabled("transaction") {
+			rawRows = []storage.Row{}
+		} else if e.psEventsStore != nil {
+			txnRows := e.psEventsStore.Rows("events_transactions_current")
+			rawRows = psEventRowsToStorageRows(txnRows, map[string]interface{}{
+				"STATE": "ACTIVE", "TRX_ID": nil, "GTID": "", "XID_FORMAT_ID": nil, "XID_GTRID": nil,
+				"XID_BQUAL": nil, "XA_STATE": nil, "SOURCE": "", "TIMER_START": int64(0),
+				"TIMER_END": nil, "TIMER_WAIT": nil, "ACCESS_MODE": "READ WRITE",
+				"ISOLATION_LEVEL": "REPEATABLE READ", "AUTOCOMMIT": "YES",
+				"NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil,
+			})
+		} else {
+			rawRows = []storage.Row{
+				{"THREAD_ID": e.connectionID + 1, "EVENT_ID": int64(1), "END_EVENT_ID": int64(1), "EVENT_NAME": "transaction", "STATE": "COMMITTED", "TRX_ID": nil, "GTID": "", "XID_FORMAT_ID": nil, "XID_GTRID": nil, "XID_BQUAL": nil, "XA_STATE": nil, "SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0), "ACCESS_MODE": "READ WRITE", "ISOLATION_LEVEL": "REPEATABLE READ", "AUTOCOMMIT": "YES", "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil},
+			}
 		}
 	case "events_transactions_history":
 		if e.startupVars["performance_schema_events_transactions_history_size"] == "0" {

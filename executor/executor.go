@@ -536,6 +536,10 @@ type Executor struct {
 	// psTruncated tracks performance_schema tables that have been TRUNCATED.
 	// These tables return empty result sets until data is re-inserted.
 	psTruncated map[string]bool
+	// psEventsStore is the shared performance_schema events store.
+	// All connections (Executor clones) share this pointer so that
+	// events recorded by one connection are visible to others.
+	psEventsStore *PSEventsStore
 	// psSetupActors holds the in-memory rows for performance_schema.setup_actors.
 	// nil means "use default rows"; non-nil means the rows have been modified.
 	psSetupActors []storage.Row
@@ -1428,6 +1432,7 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	e.grantStore = NewGrantStore()
 	e.viewStore = NewViewStore()
 	e.psShared = NewPerfSchemaShared()
+	e.psEventsStore = NewPSEventsStore()
 	// Note: the New() executor is a factory; real connections come from Clone().
 	// We do NOT register the factory connection itself in psShared.
 	e.initSystemTables()
@@ -1495,6 +1500,7 @@ func (e *Executor) Clone() *Executor {
 		DataDir:                 e.DataDir,
 		SearchPaths:             e.SearchPaths,
 		psTruncated:             e.psTruncated,
+		psEventsStore:           e.psEventsStore,
 		nextConnID:              e.nextConnID,
 		connectionID:            connID,
 		persistedVars:           e.persistedVars,
@@ -2266,6 +2272,9 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 
 	// Record statement digest for performance_schema digest tables
 	e.recordStatementDigest(query)
+
+	// Record statement in the shared PS events store (events_statements_current/history).
+	e.recordPSStatementEvent(query)
 
 	trimmed := strings.TrimSpace(query)
 	upper := strings.ToUpper(trimmed)

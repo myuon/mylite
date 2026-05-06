@@ -231,6 +231,8 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					}
 				}
 				// Wait up to timeout, checking periodically
+				// Record a stage event so PS events_stages_current shows lock wait.
+				e.recordPSStageEventLockWait()
 				deadline := time.Now().Add(time.Duration(timeout * float64(time.Second)))
 				for time.Now().Before(deadline) {
 					if !e.checkGapLockForInsert(insertDB, tableName, stmt) {
@@ -238,6 +240,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					}
 					time.Sleep(50 * time.Millisecond)
 				}
+				e.removePSStageEvent()
 				if e.checkGapLockForInsert(insertDB, tableName, stmt) {
 					return nil, mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
 				}
@@ -2516,7 +2519,13 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 			}
 			if len(lockKeyCols) > 0 {
 				lockKey := buildRowLockKey(insertDB, tableName, lockKeyCols, row)
-				if rlErr := e.rowLockManager.AcquireRowLock(e.connectionID, lockKey, lockTimeout); rlErr != nil {
+				// Record a PS stage event before potentially blocking on a row lock.
+				if e.rowLockManager.HasOtherLocks(e.connectionID, lockKey) {
+					e.recordPSStageEventLockWait()
+				}
+				rlErr := e.rowLockManager.AcquireRowLock(e.connectionID, lockKey, lockTimeout)
+				e.removePSStageEvent()
+				if rlErr != nil {
 					e.handleRollbackOnTimeout()
 					return nil, mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
 				}
