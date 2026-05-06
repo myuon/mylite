@@ -926,6 +926,10 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	if !stmt.Table.Qualifier.IsEmpty() {
 		dbName = stmt.Table.Qualifier.String()
 	}
+	// Creating tables directly in performance_schema is not allowed
+	if strings.EqualFold(dbName, "performance_schema") {
+		return nil, mysqlError(1044, "42000", "Access denied for user 'root'@'localhost' to database 'performance_schema'")
+	}
 	db, err := e.Catalog.GetDatabase(dbName)
 	if err != nil {
 		return nil, mysqlError(1049, "42000", fmt.Sprintf("Unknown database '%s'", dbName))
@@ -1134,6 +1138,10 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 			}
 		}
 		engineUpper := strings.ToUpper(engine)
+		// PERFORMANCE_SCHEMA engine is not allowed for user-created tables
+		if engineUpper == "PERFORMANCE_SCHEMA" {
+			return nil, mysqlError(1683, "HY000", "Invalid performance_schema usage.")
+		}
 		// FEDERATED is compiled in but disabled
 		if engineUpper == "FEDERATED" {
 			return nil, mysqlError(1286, "42000", fmt.Sprintf("Unknown storage engine '%s'", engine))
@@ -9964,6 +9972,10 @@ func mergeColumnTypes(types []string) string {
 
 // execCreateTableLike handles CREATE TABLE t2 LIKE t1.
 func (e *Executor) execCreateTableLike(targetDBName, newTableName, srcDBName, srcTableName string) (*Result, error) {
+	// CREATE TABLE ... LIKE performance_schema.* is not allowed (ER_WRONG_PERFSCHEMA_USAGE)
+	if strings.EqualFold(srcDBName, "performance_schema") {
+		return nil, mysqlError(1683, "HY000", "Invalid performance_schema usage.")
+	}
 	// Privilege check: user needs SELECT on the source table.
 	// MySQL returns "SELECT command denied" even if the table doesn't exist
 	// (to avoid revealing whether the table exists).

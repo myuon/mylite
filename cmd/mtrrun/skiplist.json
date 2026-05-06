@@ -3277,10 +3277,6 @@
       "reason": "output mismatch, timeout, or error"
     },
     {
-      "test": "perfschema/misc",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
       "test": "perfschema/multi_table_io",
       "reason": "output mismatch, timeout, or error"
     },
@@ -3338,10 +3334,6 @@
     },
     {
       "test": "perfschema/privilege_table_io",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
-      "test": "perfschema/read_only",
       "reason": "output mismatch, timeout, or error"
     },
     {
@@ -3650,10 +3642,6 @@
     },
     {
       "test": "perfschema/table_plugin_lifecycle",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
-      "test": "perfschema/table_schema",
       "reason": "output mismatch, timeout, or error"
     },
     {

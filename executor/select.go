@@ -2703,7 +2703,7 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	allowImplicitIndexOrder := false
 	if stmt.OrderBy == nil && len(selectTableDefs) == 1 {
 		engineName := strings.ToUpper(selectTableDefs[0].Engine)
-		if engineName != "MEMORY" && engineName != "HEAP" {
+		if engineName != "MEMORY" && engineName != "HEAP" && engineName != "PERFORMANCE_SCHEMA" {
 			allowImplicitIndexOrder = true
 			// Keep insertion order for JSON conversion probes.
 			for _, se := range stmt.SelectExprs.Exprs {
