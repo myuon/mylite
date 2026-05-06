@@ -205,6 +205,14 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 			}
 		}
 	}
+	// Check updatable_views_with_limit: when updating through a view with a LIMIT clause,
+	// and the view does not contain the complete primary key of the underlying table,
+	// enforce the system variable setting.
+	if viewColMap != nil && stmt.Limit != nil {
+		if err := e.checkUpdatableViewsWithLimit(originalTableName, tableName, updateDB, viewColMap); err != nil {
+			return nil, err
+		}
+	}
 	// Merge view's WHERE condition into the UPDATE's WHERE clause.
 	// If the view has a WHERE clause, AND it with the UPDATE's WHERE clause.
 	if viewWhereExpr != nil {
@@ -506,6 +514,14 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 					// else: non-strict, just store NULL (fall through with val=nil)
 				} else {
 					return nil, err
+				}
+			}
+			// When updating through a view with renamed columns, translate the view alias
+			// (e.g. "x") to the underlying base table column name (e.g. "a") so that the
+			// SET value is stored under the correct base column name.
+			if viewColMap != nil {
+				if m, found := viewColMap[strings.ToLower(colName)]; found && m.baseColName != "" {
+					colName = m.baseColName
 				}
 			}
 			canonicalColName := colName // will be overwritten with schema-defined case if found
@@ -1041,6 +1057,60 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 		ChangedRows:  affected,
 		InfoMessage:  infoMsg,
 	}, nil
+}
+
+// checkUpdatableViewsWithLimit enforces the updatable_views_with_limit system variable.
+// When updating through a view with a LIMIT clause, if the view does not contain the
+// complete primary key of the underlying table, MySQL either warns (YES) or errors (NO).
+// MySQL error 1288 / Note 1355 are used for this purpose.
+func (e *Executor) checkUpdatableViewsWithLimit(viewName, baseTableName, db string, viewColMap map[string]viewColumnMapping) error {
+	// Get the base table definition to check its primary key.
+	tbl, err := e.Storage.GetTable(db, baseTableName)
+	if err != nil {
+		return nil // table not found; will be caught later
+	}
+
+	// Collect primary key columns of the base table.
+	pkCols := make([]string, 0, len(tbl.Def.PrimaryKey))
+	if len(tbl.Def.PrimaryKey) > 0 {
+		pkCols = append(pkCols, tbl.Def.PrimaryKey...)
+	} else {
+		for _, col := range tbl.Def.Columns {
+			if col.PrimaryKey {
+				pkCols = append(pkCols, col.Name)
+			}
+		}
+	}
+	if len(pkCols) == 0 {
+		// No primary key: no restriction applies.
+		return nil
+	}
+
+	// Build a set of base column names exposed by the view.
+	viewBaseColNames := make(map[string]bool, len(viewColMap))
+	for _, m := range viewColMap {
+		if m.baseColName != "" {
+			viewBaseColNames[strings.ToLower(m.baseColName)] = true
+		}
+	}
+
+	// Check if all PK columns are present in the view.
+	for _, pkCol := range pkCols {
+		basePk := strings.ToLower(stripPrefixLengthFromCol(pkCol))
+		if !viewBaseColNames[basePk] {
+			// View does not contain the complete key of the underlying table.
+			setting, _ := e.getSysVar("updatable_views_with_limit")
+			if strings.EqualFold(setting, "NO") || setting == "0" {
+				return mysqlError(1288, "HY000",
+					fmt.Sprintf("The target table %s of the UPDATE is not updatable", viewName))
+			}
+			// YES (default): add Note 1355 and allow update.
+			e.addWarning("Note", 1355, "View being updated does not have complete key of underlying table in it")
+			return nil
+		}
+	}
+	// All PK columns are present: no restriction needed.
+	return nil
 }
 
 func isMultiTableUpdate(stmt *sqlparser.Update) bool {
