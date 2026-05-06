@@ -3090,6 +3090,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		if err := e.checkMaxJoinSize(s); err != nil {
 			return nil, err
 		}
+		// Check for correlated aggregates in WHERE subqueries (ER_INVALID_GROUP_FUNC_USE).
+		if err := checkCorrelatedAggInWhereSubqueries(s); err != nil {
+			return nil, err
+		}
 		res, err := e.execSelect(s)
 		// Apply SQL_SELECT_LIMIT when no explicit LIMIT clause is present.
 		// MySQL applies sql_select_limit as the maximum rows returned to the client.
@@ -4754,6 +4758,83 @@ func (e *Executor) checkSubquerySelectLocks(outer *sqlparser.Select) error {
 	if outer.SelectExprs != nil {
 		walk(outer.SelectExprs)
 	}
+	return walkErr
+}
+
+// checkCorrelatedAggInWhereSubqueries validates that no subquery in the WHERE
+// clause uses an aggregate function whose arguments reference columns from an
+// outer table (i.e., a table not in the subquery's own FROM clause). MySQL
+// raises ER_INVALID_GROUP_FUNC_USE (1111 / HY000) for such queries.
+// Example: SELECT * FROM t1 WHERE t1.a IN (SELECT MAX(t1.b) FROM t2)
+// Here MAX(t1.b) references t1 which is not in the subquery's FROM.
+func checkCorrelatedAggInWhereSubqueries(outer *sqlparser.Select) error {
+	if outer == nil || outer.Where == nil {
+		return nil
+	}
+	var walkErr error
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if walkErr != nil {
+			return false, nil
+		}
+		sub, ok := node.(*sqlparser.Subquery)
+		if !ok {
+			return true, nil
+		}
+		sel, ok := sub.Select.(*sqlparser.Select)
+		if !ok {
+			return true, nil
+		}
+		// Collect FROM table names / aliases for this subquery.
+		fromTables := map[string]bool{}
+		for _, te := range sel.From {
+			if ate, ok2 := te.(*sqlparser.AliasedTableExpr); ok2 {
+				if tn, ok3 := ate.Expr.(sqlparser.TableName); ok3 {
+					fromTables[strings.ToLower(tn.Name.String())] = true
+					if !ate.As.IsEmpty() {
+						fromTables[strings.ToLower(ate.As.String())] = true
+					}
+				}
+			}
+		}
+		if len(fromTables) == 0 {
+			return true, nil
+		}
+		// Check each SELECT expression for aggregate with correlated arg.
+		for _, se := range sel.SelectExprs.Exprs {
+			ae, ok2 := se.(*sqlparser.AliasedExpr)
+			if !ok2 {
+				continue
+			}
+			var aggArg sqlparser.Expr
+			switch a := ae.Expr.(type) {
+			case *sqlparser.Max:
+				aggArg = a.Arg
+			case *sqlparser.Min:
+				aggArg = a.Arg
+			case *sqlparser.Sum:
+				aggArg = a.Arg
+			case *sqlparser.Avg:
+				aggArg = a.Arg
+			case *sqlparser.Count:
+				if len(a.Args) > 0 {
+					aggArg = a.Args[0]
+				}
+			}
+			if aggArg == nil {
+				continue
+			}
+			if col, ok3 := aggArg.(*sqlparser.ColName); ok3 {
+				if !col.Qualifier.Name.IsEmpty() {
+					tbl := strings.ToLower(col.Qualifier.Name.String())
+					if !fromTables[tbl] {
+						walkErr = mysqlError(1111, "HY000", "Invalid use of group function")
+						return false, nil
+					}
+				}
+			}
+		}
+		return true, nil
+	}, outer.Where)
 	return walkErr
 }
 

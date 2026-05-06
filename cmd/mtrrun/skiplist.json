@@ -4073,10 +4073,6 @@
       "reason": "output mismatch or execution error"
     },
     {
-      "test": "sys_vars/sql_mode_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/time_zone_func",
       "reason": "output mismatch or execution error"
     },
