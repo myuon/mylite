@@ -7349,6 +7349,10 @@ func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, er
 				e.psTruncated = make(map[string]bool)
 			}
 			e.psTruncated[lowerTable] = true
+			// Also clear the shared PS events store for events tables
+			if e.psEventsStore != nil {
+				e.psEventsStore.Truncate(lowerTable)
+			}
 		}
 		return &Result{AffectedRows: 0, IsResultSet: false}, nil
 	}

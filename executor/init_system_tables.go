@@ -231,7 +231,8 @@ func (e *Executor) initSystemTables() {
 		},
 	})
 	ensure("performance_schema", &catalog.TableDef{
-		Name: "events_stages_history",
+		Name:       "events_stages_history",
+		PrimaryKey: []string{"THREAD_ID", "EVENT_ID"},
 		Columns: []catalog.ColumnDef{
 			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
 			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
@@ -248,7 +249,8 @@ func (e *Executor) initSystemTables() {
 		},
 	})
 	ensure("performance_schema", &catalog.TableDef{
-		Name: "events_stages_current",
+		Name:       "events_stages_current",
+		PrimaryKey: []string{"THREAD_ID", "EVENT_ID"},
 		Columns: []catalog.ColumnDef{
 			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
 			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
@@ -303,7 +305,8 @@ func (e *Executor) initSystemTables() {
 		},
 	})
 	ensure("performance_schema", &catalog.TableDef{
-		Name: "events_waits_current",
+		Name:       "events_waits_current",
+		PrimaryKey: []string{"THREAD_ID", "EVENT_ID"},
 		Columns: []catalog.ColumnDef{
 			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
 			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
@@ -327,7 +330,8 @@ func (e *Executor) initSystemTables() {
 		},
 	})
 	ensure("performance_schema", &catalog.TableDef{
-		Name: "events_statements_history_long",
+		Name:       "events_statements_history_long",
+		PrimaryKey: []string{"THREAD_ID", "EVENT_ID"},
 		Columns: []catalog.ColumnDef{
 			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
 			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
@@ -340,6 +344,86 @@ func (e *Executor) initSystemTables() {
 			{Name: "SQL_TEXT", Type: "LONGTEXT"},
 			{Name: "DIGEST", Type: "VARCHAR(64)"},
 			{Name: "DIGEST_TEXT", Type: "LONGTEXT"},
+		},
+	})
+	ensure("performance_schema", &catalog.TableDef{
+		Name:       "events_statements_current",
+		PrimaryKey: []string{"THREAD_ID", "EVENT_ID"},
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "SOURCE", Type: "VARCHAR(64)", Nullable: true},
+			{Name: "TIMER_START", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "TIMER_END", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "SQL_TEXT", Type: "LONGTEXT", Nullable: true},
+			{Name: "DIGEST", Type: "VARCHAR(64)", Nullable: true},
+			{Name: "DIGEST_TEXT", Type: "LONGTEXT", Nullable: true},
+			{Name: "CURRENT_SCHEMA", Type: "VARCHAR(64)", Nullable: true},
+			{Name: "ROWS_AFFECTED", Type: "BIGINT UNSIGNED"},
+			{Name: "ROWS_SENT", Type: "BIGINT UNSIGNED"},
+			{Name: "ROWS_EXAMINED", Type: "BIGINT UNSIGNED"},
+			{Name: "CREATED_TMP_DISK_TABLES", Type: "BIGINT UNSIGNED"},
+			{Name: "CREATED_TMP_TABLES", Type: "BIGINT UNSIGNED"},
+			{Name: "ERRORS", Type: "BIGINT UNSIGNED"},
+			{Name: "WARNINGS", Type: "BIGINT UNSIGNED"},
+			{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "NESTING_EVENT_TYPE", Type: "ENUM('TRANSACTION','STATEMENT','STAGE','WAIT')", Nullable: true},
+		},
+	})
+	ensure("performance_schema", &catalog.TableDef{
+		Name:       "events_statements_history",
+		PrimaryKey: []string{"THREAD_ID", "EVENT_ID"},
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "SOURCE", Type: "VARCHAR(64)", Nullable: true},
+			{Name: "TIMER_START", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "TIMER_END", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "SQL_TEXT", Type: "LONGTEXT", Nullable: true},
+			{Name: "DIGEST", Type: "VARCHAR(64)", Nullable: true},
+			{Name: "DIGEST_TEXT", Type: "LONGTEXT", Nullable: true},
+			{Name: "CURRENT_SCHEMA", Type: "VARCHAR(64)", Nullable: true},
+			{Name: "ROWS_AFFECTED", Type: "BIGINT UNSIGNED"},
+			{Name: "ROWS_SENT", Type: "BIGINT UNSIGNED"},
+			{Name: "ROWS_EXAMINED", Type: "BIGINT UNSIGNED"},
+			{Name: "CREATED_TMP_DISK_TABLES", Type: "BIGINT UNSIGNED"},
+			{Name: "CREATED_TMP_TABLES", Type: "BIGINT UNSIGNED"},
+			{Name: "ERRORS", Type: "BIGINT UNSIGNED"},
+			{Name: "WARNINGS", Type: "BIGINT UNSIGNED"},
+			{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "NESTING_EVENT_TYPE", Type: "ENUM('TRANSACTION','STATEMENT','STAGE','WAIT')", Nullable: true},
+		},
+	})
+	ensure("performance_schema", &catalog.TableDef{
+		Name:       "events_transactions_current",
+		PrimaryKey: []string{"THREAD_ID", "EVENT_ID"},
+		Columns: []catalog.ColumnDef{
+			{Name: "THREAD_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "EVENT_ID", Type: "BIGINT UNSIGNED"},
+			{Name: "END_EVENT_ID", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "EVENT_NAME", Type: "VARCHAR(128)"},
+			{Name: "STATE", Type: "ENUM('ACTIVE','COMMITTED','ROLLED BACK')", Nullable: true},
+			{Name: "TRX_ID", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "GTID", Type: "VARCHAR(64)", Nullable: true},
+			{Name: "XID_FORMAT_ID", Type: "INT", Nullable: true},
+			{Name: "XID_GTRID", Type: "VARCHAR(130)", Nullable: true},
+			{Name: "XID_BQUAL", Type: "VARCHAR(130)", Nullable: true},
+			{Name: "XA_STATE", Type: "VARCHAR(64)", Nullable: true},
+			{Name: "SOURCE", Type: "VARCHAR(64)", Nullable: true},
+			{Name: "TIMER_START", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "TIMER_END", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "TIMER_WAIT", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "ACCESS_MODE", Type: "ENUM('READ ONLY','READ WRITE')", Nullable: true},
+			{Name: "ISOLATION_LEVEL", Type: "VARCHAR(64)", Nullable: true},
+			{Name: "AUTOCOMMIT", Type: "ENUM('YES','NO')"},
+			{Name: "NESTING_EVENT_ID", Type: "BIGINT UNSIGNED", Nullable: true},
+			{Name: "NESTING_EVENT_TYPE", Type: "ENUM('TRANSACTION','STATEMENT','STAGE','WAIT')", Nullable: true},
 		},
 	})
 	ensure("performance_schema", &catalog.TableDef{

@@ -459,6 +459,23 @@ func (rlm *RowLockManager) ReleaseRowLocks(connID int64) {
 	}
 }
 
+// HasOtherLocks checks if any other connection holds a lock on the exact key.
+// Used to detect potential blocking before calling AcquireRowLock.
+func (rlm *RowLockManager) HasOtherLocks(connID int64, key string) bool {
+	rlm.mu.Lock()
+	defer rlm.mu.Unlock()
+	entry, exists := rlm.locks[key]
+	if !exists {
+		return false
+	}
+	for ownerID := range entry.owners {
+		if ownerID != connID {
+			return true
+		}
+	}
+	return false
+}
+
 // HasOtherLocksWithPrefix checks if any other connection holds locks with keys
 // matching the given prefix. Used for gap lock simulation.
 func (rlm *RowLockManager) HasOtherLocksWithPrefix(connID int64, prefix string) bool {

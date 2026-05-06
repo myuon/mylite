@@ -3189,26 +3189,6 @@
       "reason": "output mismatch, timeout, or error"
     },
     {
-      "test": "perfschema/idx_events_stages_current",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
-      "test": "perfschema/idx_events_statements_current",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
-      "test": "perfschema/idx_events_statements_history",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
-      "test": "perfschema/idx_events_transactions_current",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
-      "test": "perfschema/idx_events_waits_current",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
       "test": "perfschema/indexed_table_io",
       "reason": "output mismatch, timeout, or error"
     },

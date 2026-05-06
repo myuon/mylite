@@ -1312,6 +1312,48 @@ func (e *Executor) populatePerfSchemaTable(tbl *storage.Table, tableName string)
 			tbl.Rows = append(tbl.Rows, r)
 		}
 		tbl.Mu.Unlock()
+	case "events_statements_current", "events_statements_history":
+		// Populate from the shared PS events store so that cross-connection
+		// visibility works (e.g. con1 seeing default connection's events).
+		if e.psEventsStore != nil && !e.psClassDisabled("statement") {
+			rows := e.psEventsStore.Rows(lower)
+			tbl.Mu.Lock()
+			tbl.Rows = psEventRowsToStorageRows(rows, map[string]interface{}{
+				"SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0),
+				"SQL_TEXT": nil, "DIGEST": nil, "DIGEST_TEXT": nil, "CURRENT_SCHEMA": nil,
+				"ROWS_AFFECTED": int64(0), "ROWS_SENT": int64(0), "ROWS_EXAMINED": int64(0),
+				"CREATED_TMP_DISK_TABLES": int64(0), "CREATED_TMP_TABLES": int64(0),
+				"ERRORS": int64(0), "WARNINGS": int64(0), "NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil,
+			})
+			tbl.Mu.Unlock()
+		}
+	case "events_waits_current":
+		// Populate from the shared PS events store.
+		if e.psEventsStore != nil {
+			rows := e.psEventsStore.Rows(lower)
+			tbl.Mu.Lock()
+			tbl.Rows = psEventRowsToStorageRows(rows, map[string]interface{}{
+				"SOURCE": "", "TIMER_START": int64(0), "TIMER_END": int64(0), "TIMER_WAIT": int64(0),
+				"SPINS": nil, "OBJECT_SCHEMA": nil, "OBJECT_NAME": nil, "INDEX_NAME": nil,
+				"OBJECT_TYPE": "TABLE", "OBJECT_INSTANCE_BEGIN": int64(0), "NESTING_EVENT_ID": nil,
+				"NESTING_EVENT_TYPE": nil, "OPERATION": "lock", "NUMBER_OF_BYTES": nil, "FLAGS": nil,
+			})
+			tbl.Mu.Unlock()
+		}
+	case "events_transactions_current":
+		// Populate from the shared PS events store.
+		if e.psEventsStore != nil {
+			rows := e.psEventsStore.Rows(lower)
+			tbl.Mu.Lock()
+			tbl.Rows = psEventRowsToStorageRows(rows, map[string]interface{}{
+				"STATE": "ACTIVE", "TRX_ID": nil, "GTID": "", "XID_FORMAT_ID": nil, "XID_GTRID": nil,
+				"XID_BQUAL": nil, "XA_STATE": nil, "SOURCE": "", "TIMER_START": int64(0),
+				"TIMER_END": nil, "TIMER_WAIT": nil, "ACCESS_MODE": "READ WRITE",
+				"ISOLATION_LEVEL": "REPEATABLE READ", "AUTOCOMMIT": "YES",
+				"NESTING_EVENT_ID": nil, "NESTING_EVENT_TYPE": nil,
+			})
+			tbl.Mu.Unlock()
+		}
 	}
 }
 

@@ -441,7 +441,14 @@ func (p *Planner) optimizeNode(node PlanNode, sel *sqlparser.Select, hasSortAbov
 	case *TableScanNode:
 		// Fill AccessPath from explainDetectAccessType if we have a SELECT context.
 		if sel != nil {
+			// For PS tables (database qualifier is "performance_schema"), temporarily
+			// switch CurrentDB so that explainDetectAccessType finds the table definition.
+			savedDB := p.executor.CurrentDB
+			if n.DatabaseName != "" && !strings.EqualFold(n.DatabaseName, savedDB) {
+				p.executor.CurrentDB = n.DatabaseName
+			}
 			ai := p.executor.explainDetectAccessType(sel, n.TableName)
+			p.executor.CurrentDB = savedDB
 			n.AccessPath = AccessPath{
 				Type:         ai.accessType,
 				PossibleKeys: stringify(ai.possibleKeys),
@@ -454,6 +461,17 @@ func (p *Planner) optimizeNode(node PlanNode, sel *sqlparser.Select, hasSortAbov
 			}
 			if ai.usingIndex {
 				n.Extra = appendUnique(n.Extra, "Using index")
+			}
+			// Performance-schema events tables use a hash index that only supports
+			// equality lookups (=). When the optimizer would choose "range" access
+			// (>, <, BETWEEN), downgrade to "ALL" while keeping possible_keys visible.
+			if strings.EqualFold(n.DatabaseName, "performance_schema") &&
+				isPSEventsTable(n.TableName) &&
+				n.AccessPath.Type == "range" {
+				n.AccessPath.Type = "ALL"
+				n.AccessPath.Key = ""
+				n.AccessPath.KeyLen = ""
+				n.AccessPath.Ref = ""
 			}
 		} else {
 			if n.AccessPath.Type == "" {
@@ -569,6 +587,19 @@ func planTableCount(node PlanNode) int {
 		}
 	})
 	return count
+}
+
+// isPSEventsTable returns true when the table name is a performance_schema
+// events_* table that uses a hash-only index (only supports equality lookups).
+func isPSEventsTable(tableName string) bool {
+	switch strings.ToLower(tableName) {
+	case "events_statements_current", "events_statements_history", "events_statements_history_long",
+		"events_stages_current", "events_stages_history", "events_stages_history_long",
+		"events_waits_current", "events_waits_history", "events_waits_history_long",
+		"events_transactions_current", "events_transactions_history", "events_transactions_history_long":
+		return true
+	}
+	return false
 }
 
 // planNodeTypeNames collects NodeType strings in depth-first order.
