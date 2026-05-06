@@ -2609,6 +2609,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 							e.superUsers[strings.ToLower(toUser)] = true
 							e.superUsersMu.Unlock()
 						}
+						// SUPER privilege is deprecated in MySQL 8.0 — emit deprecation warning.
+						if strings.Contains(upperPrivs, "SUPER") {
+							e.addWarning("Warning", 1287, "The SUPER privilege identifier is deprecated")
+						}
 					}
 					if strings.Contains(upperPrivs, "SYSTEM_VARIABLES_ADMIN") {
 						if toUser != "" && e.sysVarsAdminUsersMu != nil {
@@ -2948,10 +2952,56 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 	}
 
-	// Enforce super_read_only: blocks ALL users including SUPER (only TEMP tables exempt).
+	// stmtTargetsPerfSchema returns true if this DML targets only performance_schema tables.
+	// performance_schema DML is always allowed even under read_only/super_read_only.
+	stmtTargetsPerfSchema := func() bool {
+		switch s := stmt.(type) {
+		case *sqlparser.Update:
+			for _, tblExpr := range s.TableExprs {
+				if aliased, ok := tblExpr.(*sqlparser.AliasedTableExpr); ok {
+					if tn, ok2 := aliased.Expr.(sqlparser.TableName); ok2 {
+						db := e.CurrentDB
+						if !tn.Qualifier.IsEmpty() {
+							db = tn.Qualifier.String()
+						}
+						if strings.EqualFold(db, "performance_schema") {
+							return true
+						}
+					}
+				}
+			}
+		case *sqlparser.Insert:
+			if tn, ok := s.Table.Expr.(sqlparser.TableName); ok {
+				db := e.CurrentDB
+				if !tn.Qualifier.IsEmpty() {
+					db = tn.Qualifier.String()
+				}
+				if strings.EqualFold(db, "performance_schema") {
+					return true
+				}
+			}
+		case *sqlparser.Delete:
+			for _, tblExpr := range s.TableExprs {
+				if aliased, ok := tblExpr.(*sqlparser.AliasedTableExpr); ok {
+					if tn, ok2 := aliased.Expr.(sqlparser.TableName); ok2 {
+						db := e.CurrentDB
+						if !tn.Qualifier.IsEmpty() {
+							db = tn.Qualifier.String()
+						}
+						if strings.EqualFold(db, "performance_schema") {
+							return true
+						}
+					}
+				}
+			}
+		}
+		return false
+	}
+
+	// Enforce super_read_only: blocks ALL users including SUPER (only TEMP tables and P_S exempt).
 	if superROVal, ok := e.getGlobalVar("super_read_only"); ok {
 		superROOn := superROVal == "1" || strings.EqualFold(superROVal, "ON")
-		if superROOn {
+		if superROOn && !stmtTargetsPerfSchema() {
 			switch s := stmt.(type) {
 			case *sqlparser.Insert, *sqlparser.Update, *sqlparser.Delete,
 				*sqlparser.DropTable, *sqlparser.AlterTable,
@@ -2967,9 +3017,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 
 	// Enforce read_only: when read_only=ON, block write statements from non-SUPER users.
 	// SUPER users (root) can bypass read_only but not super_read_only.
+	// performance_schema DML is always exempt from read_only checks.
 	if readOnlyVal, ok := e.getGlobalVar("read_only"); ok {
 		readOnlyOn := readOnlyVal == "1" || strings.EqualFold(readOnlyVal, "ON")
-		if readOnlyOn {
+		if readOnlyOn && !stmtTargetsPerfSchema() {
 			// Check if current user is root/SUPER
 			isSuper := true
 			if cu, ok2 := e.userVars["__current_user"]; ok2 {
@@ -8149,6 +8200,64 @@ func (e *Executor) reloadGrantStoreFromStorage() {
 			e.grantStore.AddPrivGrant(user, host, tablePrivStr, object, false)
 		}
 		tblPriv.Mu.RUnlock()
+	}
+
+	// Reload global grants from mysql.user
+	userTbl, err := e.Storage.GetTable("mysql", "user")
+	if err == nil {
+		userTbl.Mu.RLock()
+		globalPrivMap := []struct {
+			priv string
+			col  string
+		}{
+			{"SELECT", "Select_priv"},
+			{"INSERT", "Insert_priv"},
+			{"UPDATE", "Update_priv"},
+			{"DELETE", "Delete_priv"},
+			{"CREATE", "Create_priv"},
+			{"DROP", "Drop_priv"},
+			{"RELOAD", "Reload_priv"},
+			{"SHUTDOWN", "Shutdown_priv"},
+			{"PROCESS", "Process_priv"},
+			{"FILE", "File_priv"},
+			{"REFERENCES", "References_priv"},
+			{"INDEX", "Index_priv"},
+			{"ALTER", "Alter_priv"},
+			{"SHOW DATABASES", "Show_db_priv"},
+			{"SUPER", "Super_priv"},
+			{"CREATE TEMPORARY TABLES", "Create_tmp_table_priv"},
+			{"LOCK TABLES", "Lock_tables_priv"},
+			{"EXECUTE", "Execute_priv"},
+			{"REPLICATION SLAVE", "Repl_slave_priv"},
+			{"REPLICATION CLIENT", "Repl_client_priv"},
+			{"CREATE VIEW", "Create_view_priv"},
+			{"SHOW VIEW", "Show_view_priv"},
+			{"CREATE ROUTINE", "Create_routine_priv"},
+			{"ALTER ROUTINE", "Alter_routine_priv"},
+			{"CREATE USER", "Create_user_priv"},
+			{"EVENT", "Event_priv"},
+			{"TRIGGER", "Trigger_priv"},
+			{"CREATE TABLESPACE", "Create_tablespace_priv"},
+		}
+		for _, row := range userTbl.Rows {
+			user := toString(row["User"])
+			host := toString(row["Host"])
+			if user == "" {
+				continue
+			}
+			var privs []string
+			for _, pm := range globalPrivMap {
+				if toString(row[pm.col]) == "Y" {
+					privs = append(privs, pm.priv)
+				}
+			}
+			if len(privs) == 0 {
+				continue
+			}
+			grantOption := toString(row["Grant_priv"]) == "Y"
+			e.grantStore.AddPrivGrant(user, host, strings.Join(privs, ","), "*.*", grantOption)
+		}
+		userTbl.Mu.RUnlock()
 	}
 }
 

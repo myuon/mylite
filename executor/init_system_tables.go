@@ -1,8 +1,12 @@
 package executor
 
 import (
+	"sort"
+	"strings"
+
 	"github.com/myuon/mylite/catalog"
 	"github.com/myuon/mylite/storage"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 func (e *Executor) initSystemTables() {
@@ -47,6 +51,107 @@ func (e *Executor) initSystemTables() {
 		if _, err := db.GetTable(def.Name); err != nil {
 			db.CreateTable(def) //nolint:errcheck
 			e.Storage.CreateTable(dbName, def)
+		}
+	}
+
+	// Register all performance_schema virtual tables from perfSchemaCreateTable.
+	// This populates IS.COLUMNS for all PS tables with correct column definitions.
+	// Must run before the hand-coded ensures below so they are no-ops (ensure skips existing tables).
+	{
+		psTableNames := make([]string, 0, len(perfSchemaCreateTable))
+		for name := range perfSchemaCreateTable {
+			psTableNames = append(psTableNames, name)
+		}
+		sort.Strings(psTableNames)
+		for _, tblName := range psTableNames {
+			ddl := perfSchemaCreateTable[tblName]
+			parsed, parseErr := e.parser().Parse(ddl)
+			if parseErr != nil {
+				continue
+			}
+			ct, ok := parsed.(*sqlparser.CreateTable)
+			if !ok || ct.TableSpec == nil {
+				continue
+			}
+			pkCols := map[string]bool{}
+			// uniCols tracks columns that are the sole column of a UNIQUE KEY
+			uniCols := map[string]bool{}
+			var pkNames []string
+			var idxDefs []catalog.IndexDef
+			for _, idx := range ct.TableSpec.Indexes {
+				var idxColNames []string
+				for _, col := range idx.Columns {
+					idxColNames = append(idxColNames, col.Column.String())
+				}
+				if idx.Info.Type == sqlparser.IndexTypePrimary {
+					for _, name := range idxColNames {
+						pkCols[strings.ToLower(name)] = true
+					}
+					pkNames = idxColNames
+				} else {
+					isUnique := idx.Info.Type == sqlparser.IndexTypeUnique
+					if isUnique && len(idxColNames) == 1 {
+						uniCols[strings.ToLower(idxColNames[0])] = true
+					}
+					idxDefs = append(idxDefs, catalog.IndexDef{
+						Name:    idx.Info.Name.String(),
+						Columns: idxColNames,
+						Unique:  isUnique,
+					})
+				}
+			}
+			tableCharset := "utf8mb4"
+			tableCollation := "utf8mb4_0900_ai_ci"
+			for _, opt := range ct.TableSpec.Options {
+				if strings.EqualFold(opt.Name, "CHARACTER SET") || strings.EqualFold(opt.Name, "CHARSET") {
+					tableCharset = opt.String
+				} else if strings.EqualFold(opt.Name, "COLLATE") {
+					tableCollation = opt.String
+				}
+			}
+			cols := make([]catalog.ColumnDef, 0, len(ct.TableSpec.Columns))
+			for _, col := range ct.TableSpec.Columns {
+				nullable := true
+				if col.Type.Options != nil && col.Type.Options.Null != nil {
+					nullable = *col.Type.Options.Null
+				}
+				colDef := catalog.ColumnDef{
+					Name:       col.Name.String(),
+					Type:       buildColumnTypeString(col.Type, tableCharset),
+					Nullable:   nullable,
+					PrimaryKey: pkCols[strings.ToLower(col.Name.String())],
+					Unique:     uniCols[strings.ToLower(col.Name.String())],
+				}
+				if col.Type.Charset.Name != "" {
+					colDef.Charset = strings.ToLower(col.Type.Charset.Name)
+				}
+				if col.Type.Options != nil && col.Type.Options.Collate != "" {
+					colDef.Collation = strings.ToLower(col.Type.Options.Collate)
+				}
+				if col.Type.Options != nil && col.Type.Options.Default != nil {
+					defStr := sqlparser.String(col.Type.Options.Default)
+					if !strings.EqualFold(defStr, "null") {
+						// Strip surrounding single quotes from literal defaults
+						if len(defStr) >= 2 && defStr[0] == '\'' && defStr[len(defStr)-1] == '\'' {
+							defStr = defStr[1 : len(defStr)-1]
+						}
+						colDef.Default = &defStr
+					}
+				}
+				if col.Type.Options != nil && col.Type.Options.Comment != nil {
+					colDef.Comment = col.Type.Options.Comment.Val
+				}
+				cols = append(cols, colDef)
+			}
+			ensure("performance_schema", &catalog.TableDef{
+				Name:       tblName,
+				Columns:    cols,
+				PrimaryKey: pkNames,
+				Indexes:    idxDefs,
+				Engine:     "PERFORMANCE_SCHEMA",
+				Charset:    tableCharset,
+				Collation:  tableCollation,
+			})
 		}
 	}
 
@@ -971,4 +1076,5 @@ func (e *Executor) initSystemTables() {
 			}
 		}(),
 	})
+
 }
