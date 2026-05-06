@@ -2769,7 +2769,7 @@ func extractNearFromParseError(query string, parseErr error) string {
 			}
 			for i := searchFrom; i >= 0; i-- {
 				if i+len(tokenStr) <= len(query) && query[i:i+len(tokenStr)] == tokenStr {
-					near := query[i:]
+					near := strings.SplitN(query[i:], "\n", 2)[0]
 					if len(near) > 80 {
 						near = near[:80]
 					}
@@ -2781,7 +2781,7 @@ func extractNearFromParseError(query string, parseErr error) string {
 			if start < 0 {
 				start = 0
 			}
-			near := query[start:]
+			near := strings.SplitN(query[start:], "\n", 2)[0]
 			if len(near) > 80 {
 				near = near[:80]
 			}
