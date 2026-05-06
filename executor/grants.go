@@ -905,7 +905,7 @@ var tablePrivileges = map[string]bool{
 	"SELECT": true, "INSERT": true, "UPDATE": true, "DELETE": true,
 	"CREATE": true, "DROP": true, "ALTER": true, "INDEX": true,
 	"ALL PRIVILEGES": true, "ALL": true,
-	"CREATE TEMPORARY TABLES": true,
+	"CREATE TEMPORARY TABLES": true, "LOCK TABLES": true,
 }
 
 // HasRoleWithAdminOption checks if a user (with active roles) has WITH ADMIN OPTION

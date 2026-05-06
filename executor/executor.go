@@ -8920,6 +8920,13 @@ func (e *Executor) checkTablePrivilege(stmt sqlparser.Statement) error {
 				return err
 			}
 		}
+		// FOR UPDATE / FOR SHARE requires UPDATE privilege in addition to SELECT.
+		// MySQL 8.0: "SELECT with locking clause command denied to user '%s'@'%s' for table '%s'"
+		// This applies to the top-level SELECT and to any locking subqueries embedded in
+		// WHERE/HAVING/SELECT-list/derived-table expressions.
+		if err := e.checkLockingSubqueryPriv(s, user, host, checkAccess); err != nil {
+			return err
+		}
 	case *sqlparser.Insert:
 		dbName := e.CurrentDB
 		tblName := s.Table.TableNameString()
@@ -9410,6 +9417,149 @@ func (e *Executor) checkSelectPrivRecursive(sel *sqlparser.Select, user, host st
 		}
 	}
 	return nil
+}
+
+// checkLockingSubqueryPriv checks UPDATE privilege for any SELECT with a locking clause
+// (FOR UPDATE / FOR SHARE) found in sel or any of its subqueries. It walks the entire
+// statement tree so that locking SELECTs in WHERE, HAVING, SELECT-list, and derived tables
+// are all covered.
+// MySQL 8.0 requires UPDATE privilege for SELECT ... FOR UPDATE/SHARE even when the locking
+// SELECT is nested inside an outer query.
+func (e *Executor) checkLockingSubqueryPriv(sel *sqlparser.Select, user, host string, checkAccess func(priv, dbName, tableName string) error) error {
+	if sel == nil {
+		return nil
+	}
+
+	isLockingSel := func(s *sqlparser.Select) bool {
+		return s != nil && (s.Lock == sqlparser.ForUpdateLock || s.Lock == sqlparser.ForUpdateLockNoWait || s.Lock == sqlparser.ForUpdateLockSkipLocked ||
+			s.Lock == sqlparser.ForShareLock || s.Lock == sqlparser.ForShareLockNoWait || s.Lock == sqlparser.ForShareLockSkipLocked)
+	}
+
+	// MySQL FOR UPDATE/SHARE requires SELECT plus one of: UPDATE, DELETE, or LOCK TABLES.
+	checkLockingAccess := func(dbName, tableName string) error {
+		// Accept if any of the three privileges is granted.
+		if checkAccess("UPDATE", dbName, tableName) == nil {
+			return nil
+		}
+		if checkAccess("DELETE", dbName, tableName) == nil {
+			return nil
+		}
+		if checkAccess("LOCK TABLES", dbName, tableName) == nil {
+			return nil
+		}
+		return mysqlError(1142, "42000", fmt.Sprintf("SELECT with locking clause command denied to user '%s'@'%s' for table '%s'",
+			user, host, tableName))
+	}
+
+	// checkInnerSel checks a SELECT found inside a subquery expression (not the top-level).
+	// For inner SELECTs, we must check SELECT privilege first (it may not have been checked yet),
+	// then check UPDATE if the SELECT has a locking clause.
+	var checkInnerSel func(s *sqlparser.Select) error
+	checkInnerSel = func(s *sqlparser.Select) error {
+		if s == nil {
+			return nil
+		}
+		cteNames := make(map[string]bool)
+		if s.With != nil {
+			for _, cte := range s.With.CTEs {
+				cteNames[strings.ToLower(cte.ID.String())] = true
+			}
+		}
+		// Check SELECT privilege on this inner SELECT's FROM tables.
+		for _, tblExpr := range s.From {
+			if err := checkTableExprPrivSkipCTEs(tblExpr, "SELECT", e.CurrentDB, cteNames, checkAccess); err != nil {
+				return err
+			}
+		}
+		// If this inner SELECT has a locking clause, also check UPDATE privilege.
+		if isLockingSel(s) {
+			for _, tblExpr := range s.From {
+				if err := checkTableExprPrivSkipCTEs(tblExpr, "UPDATE", e.CurrentDB, cteNames, func(priv, dbName, tableName string) error {
+					return checkLockingAccess(dbName, tableName)
+				}); err != nil {
+					return err
+				}
+			}
+		}
+		// Recurse into subqueries embedded in WHERE/HAVING/SELECT-list/ORDER-BY/GROUP-BY.
+		// Handle both *Subquery (scalar/IN subqueries) and *DerivedTable (FROM (...) alias).
+		var walkErr error
+		_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+			if walkErr != nil {
+				return false, nil
+			}
+			switch t := n.(type) {
+			case *sqlparser.Subquery:
+				inner, ok2 := t.Select.(*sqlparser.Select)
+				if !ok2 || inner == nil {
+					return true, nil
+				}
+				if err := checkInnerSel(inner); err != nil {
+					walkErr = err
+					return false, nil
+				}
+			case *sqlparser.DerivedTable:
+				inner, ok2 := t.Select.(*sqlparser.Select)
+				if !ok2 || inner == nil {
+					return true, nil
+				}
+				if err := checkInnerSel(inner); err != nil {
+					walkErr = err
+					return false, nil
+				}
+			}
+			return true, nil
+		}, s)
+		return walkErr
+	}
+
+	// For the top-level sel: SELECT privilege was already checked by the caller.
+	// Only check the locking (UPDATE) privilege for the top-level, then recurse into subqueries.
+	if isLockingSel(sel) {
+		cteNames := make(map[string]bool)
+		if sel.With != nil {
+			for _, cte := range sel.With.CTEs {
+				cteNames[strings.ToLower(cte.ID.String())] = true
+			}
+		}
+		for _, tblExpr := range sel.From {
+			if err := checkTableExprPrivSkipCTEs(tblExpr, "UPDATE", e.CurrentDB, cteNames, func(priv, dbName, tableName string) error {
+				return checkLockingAccess(dbName, tableName)
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	// Walk subqueries embedded in WHERE/HAVING/SELECT-list/ORDER-BY/GROUP-BY of top-level sel.
+	// Also handle DerivedTable (FROM (SELECT ...) a) and *Subquery (scalar/IN subqueries).
+	var walkErr error
+	_ = sqlparser.Walk(func(n sqlparser.SQLNode) (bool, error) {
+		if walkErr != nil {
+			return false, nil
+		}
+		switch t := n.(type) {
+		case *sqlparser.Subquery:
+			inner, ok2 := t.Select.(*sqlparser.Select)
+			if !ok2 || inner == nil {
+				return true, nil
+			}
+			if err := checkInnerSel(inner); err != nil {
+				walkErr = err
+				return false, nil
+			}
+		case *sqlparser.DerivedTable:
+			inner, ok2 := t.Select.(*sqlparser.Select)
+			if !ok2 || inner == nil {
+				return true, nil
+			}
+			if err := checkInnerSel(inner); err != nil {
+				walkErr = err
+				return false, nil
+			}
+		}
+		return true, nil
+	}, sel)
+	return walkErr
 }
 
 // checkColumnAccessForTable checks column-level SELECT privilege for a specific table reference
