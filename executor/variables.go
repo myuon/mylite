@@ -51,6 +51,10 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 				val = sd.Value
 			}
 			e.userVars[varName] = val
+			// Sync user variable to shared perf schema state (skips internal __ vars).
+			if e.psShared != nil {
+				e.psShared.SetUserVar(e.connectionID, varName, val)
+			}
 			// When __current_user is set (e.g. on --connect), activate the user's default roles
 			// and update the ProcessList user entry so threads/processlist queries reflect the real user.
 			if varName == "__current_user" {
@@ -66,6 +70,14 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							userName = cuStr[:atIdx]
 						}
 						e.processList.SetUser(e.connectionID, userName)
+					}
+				}
+				// Update the username tracked in psShared for session_account_connect_attrs filtering.
+				if e.psShared != nil {
+					if cuStr == "" {
+						e.psShared.UpdateConnectionUser(e.connectionID, "root")
+					} else {
+						e.psShared.UpdateConnectionUser(e.connectionID, cuStr)
 					}
 				}
 				if e.grantStore != nil {

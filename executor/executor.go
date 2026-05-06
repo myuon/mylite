@@ -710,6 +710,9 @@ type Executor struct {
 	// rows. Used so that SELECT * FROM (subquery) AS t WHERE ... can still resolve
 	// column names even when the subquery produces no rows.
 	emptyDerivedTableColOrder string
+	// psShared holds multi-connection shared state for performance_schema tables
+	// (user_variables_by_thread, session_connect_attrs, etc.). Shared across all Clone()d executors.
+	psShared *PerfSchemaShared
 }
 
 // Warning represents a MySQL warning.
@@ -1424,6 +1427,9 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	e.persistedVarsMu = &sync.RWMutex{}
 	e.grantStore = NewGrantStore()
 	e.viewStore = NewViewStore()
+	e.psShared = NewPerfSchemaShared()
+	// Note: the New() executor is a factory; real connections come from Clone().
+	// We do NOT register the factory connection itself in psShared.
 	e.initSystemTables()
 	return e
 }
@@ -1471,7 +1477,7 @@ func (e *Executor) Clone() *Executor {
 	if e.globalVarsMu != nil {
 		e.globalVarsMu.RUnlock()
 	}
-	return &Executor{
+	ne := &Executor{
 		Catalog:                 e.Catalog,
 		Storage:                 e.Storage,
 		CurrentDB:               "test",
@@ -1512,7 +1518,12 @@ func (e *Executor) Clone() *Executor {
 		knownUsersMu:            e.knownUsersMu,
 		grantStore:              e.grantStore,
 		viewStore:               e.viewStore,
+		psShared:                e.psShared,
 	}
+	if e.psShared != nil {
+		e.psShared.RegisterConnection(connID, defaultConnectAttrs(), "root")
+	}
+	return ne
 }
 
 // OnDisconnect releases all named locks and row locks held by this executor's connection.
@@ -1531,6 +1542,9 @@ func (e *Executor) OnDisconnect() {
 	}
 	if e.instanceBackupLock != nil {
 		e.instanceBackupLock.Release(e.connectionID)
+	}
+	if e.psShared != nil {
+		e.psShared.UnregisterConnection(e.connectionID)
 	}
 }
 
@@ -1558,6 +1572,15 @@ func (e *Executor) checkBackupAdminPrivilege() error {
 		}
 	}
 	return mysqlError(1227, "42000", "Access denied; you need (at least one of) the BACKUP_ADMIN privilege(s) for this operation")
+}
+
+// setUserVar sets a user variable and syncs it to psShared for performance_schema tracking.
+// Internal variables (names starting with "__") are stored locally but not tracked in psShared.
+func (e *Executor) setUserVar(name string, value interface{}) {
+	e.userVars[name] = value
+	if e.psShared != nil {
+		e.psShared.SetUserVar(e.connectionID, name, value)
+	}
 }
 
 // SetStartupVar sets a variable as a startup default. This is used by the test

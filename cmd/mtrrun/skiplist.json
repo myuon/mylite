@@ -3109,10 +3109,6 @@
       "reason": "output mismatch, timeout, or error"
     },
     {
-      "test": "perfschema/connect_attrs",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
       "test": "perfschema/connection_3a",
       "reason": "output mismatch, timeout, or error"
     },
@@ -3658,10 +3654,6 @@
     },
     {
       "test": "perfschema/unary_digest",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
-      "test": "perfschema/user_var_func",
       "reason": "output mismatch, timeout, or error"
     },
     {

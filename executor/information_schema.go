@@ -753,6 +753,29 @@ func (e *Executor) isInformationSchemaTable(qualifier, tableName string) bool {
 	return false
 }
 
+// checkPerfSchemaTableAccess checks if the current user has access to a performance_schema
+// table that requires PROCESS privilege (e.g. session_connect_attrs).
+// Returns an error if access is denied; nil if allowed.
+func (e *Executor) checkPerfSchemaTableAccess(tableName string) error {
+	user, host, _ := e.getCurrentUserAndRoles()
+	if user == "" {
+		return nil // root or no user context
+	}
+	// Non-root users need PROCESS privilege (or SUPER) to see session_connect_attrs.
+	// session_connect_attrs shows ALL connections, so PROCESS is required.
+	if e.superUsersMu != nil {
+		e.superUsersMu.RLock()
+		isSuper := e.superUsers[strings.ToLower(user)]
+		e.superUsersMu.RUnlock()
+		if isSuper {
+			return nil
+		}
+	}
+	// No PROCESS privilege → deny.
+	return fmt.Errorf("ERROR 1142 (42000): SELECT command denied to user '%s'@'%s' for table '%s'",
+		user, host, tableName)
+}
+
 // buildInformationSchemaRows returns virtual rows for an INFORMATION_SCHEMA table.
 // The alias is used to add prefixed keys so WHERE/ORDER BY work normally.
 func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storage.Row, error) {
@@ -1197,8 +1220,14 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 			}
 			rawRows = append(rawRows, storage.Row{"NAME": c, "ENABLED": enabled})
 		}
-	case "session_connect_attrs", "session_account_connect_attrs":
+	case "session_connect_attrs":
+		// session_connect_attrs requires PROCESS privilege for non-root users.
+		if privErr := e.checkPerfSchemaTableAccess("session_connect_attrs"); privErr != nil {
+			return nil, privErr
+		}
 		rawRows = e.perfSchemaSessionConnectAttrs()
+	case "session_account_connect_attrs":
+		rawRows = e.perfSchemaAccountConnectAttrs()
 	case "socket_summary_by_event_name":
 		rawRows = perfSchemaSocketSummaryByEventName()
 	case "status_by_thread":
@@ -7656,27 +7685,74 @@ func perfSchemaSeedHistogramGlobal() []storage.Row {
 }
 
 // perfSchemaSessionConnectAttrs returns rows for session_connect_attrs / session_account_connect_attrs.
-// These tables expose connection attributes (like _os, _platform, _client_name, etc.) for the current session.
+// tableType distinguishes: "session_connect_attrs" shows all connections (requires PROCESS priv),
+// "session_account_connect_attrs" shows only same-account connections.
 func (e *Executor) perfSchemaSessionConnectAttrs() []storage.Row {
-	attrs := []struct {
-		Name  string
-		Value string
-	}{
-		{"_os", "Linux"},
-		{"_client_name", "libmysql"},
-		{"_pid", "1"},
-		{"_client_version", "8.0.0"},
-		{"_platform", "x86_64"},
-		{"program_name", "mysql"},
+	if e.psShared == nil {
+		// Fallback: single-connection mode
+		attrs := defaultConnectAttrs()
+		rows := make([]storage.Row, 0, len(attrs))
+		for _, a := range attrs {
+			rows = append(rows, storage.Row{
+				"PROCESSLIST_ID":   e.connectionID,
+				"ATTR_NAME":        a.Name,
+				"ATTR_VALUE":       a.Value,
+				"ORDINAL_POSITION": int64(a.Ordinal),
+			})
+		}
+		return rows
 	}
-	rows := make([]storage.Row, 0, len(attrs))
-	for i, a := range attrs {
-		rows = append(rows, storage.Row{
-			"PROCESSLIST_ID":   e.connectionID,
-			"ATTR_NAME":        a.Name,
-			"ATTR_VALUE":       a.Value,
-			"ORDINAL_POSITION": int64(i),
-		})
+	allConns := e.psShared.AllConnectAttrs()
+	var rows []storage.Row
+	for _, conn := range allConns {
+		for _, a := range conn.Attrs {
+			rows = append(rows, storage.Row{
+				"PROCESSLIST_ID":   conn.ConnID,
+				"ATTR_NAME":        a.Name,
+				"ATTR_VALUE":       a.Value,
+				"ORDINAL_POSITION": int64(a.Ordinal),
+			})
+		}
+	}
+	return rows
+}
+
+// perfSchemaAccountConnectAttrs returns rows for session_account_connect_attrs.
+// Unlike session_connect_attrs, this shows only connections from the current user's account.
+func (e *Executor) perfSchemaAccountConnectAttrs() []storage.Row {
+	if e.psShared == nil {
+		return e.perfSchemaSessionConnectAttrs()
+	}
+	// Determine current user
+	currentUser := "root"
+	if cu, ok := e.userVars["__current_user"]; ok {
+		if cuStr, ok2 := cu.(string); ok2 && cuStr != "" {
+			currentUser = cuStr
+			// Strip @host if present
+			if idx := strings.Index(currentUser, "@"); idx >= 0 {
+				currentUser = currentUser[:idx]
+			}
+		}
+	}
+	allConns := e.psShared.AllConnectAttrs()
+	var rows []storage.Row
+	for _, conn := range allConns {
+		// Only include connections from the same user
+		connUser := conn.Username
+		if idx := strings.Index(connUser, "@"); idx >= 0 {
+			connUser = connUser[:idx]
+		}
+		if connUser != currentUser {
+			continue
+		}
+		for _, a := range conn.Attrs {
+			rows = append(rows, storage.Row{
+				"PROCESSLIST_ID":   conn.ConnID,
+				"ATTR_NAME":        a.Name,
+				"ATTR_VALUE":       a.Value,
+				"ORDINAL_POSITION": int64(a.Ordinal),
+			})
+		}
 	}
 	return rows
 }
@@ -7731,17 +7807,39 @@ func (e *Executor) perfSchemaStatusByThread() []storage.Row {
 }
 
 // perfSchemaUserVariablesByThread returns rows for user_variables_by_thread.
+// When psShared is available, rows from ALL connections are returned.
 func (e *Executor) perfSchemaUserVariablesByThread() []storage.Row {
-	threadID := e.connectionID + 1
-	rows := make([]storage.Row, 0, len(e.userVars))
-	for name, val := range e.userVars {
+	if e.psShared == nil {
+		// Fallback: single-connection mode (filter internal vars)
+		threadID := e.connectionID + 1
+		rows := make([]storage.Row, 0)
+		for name, val := range e.userVars {
+			if len(name) >= 2 && name[0] == '_' && name[1] == '_' {
+				continue // skip internal variables
+			}
+			valStr := "NULL"
+			if val != nil {
+				valStr = fmt.Sprintf("%v", val)
+			}
+			rows = append(rows, storage.Row{
+				"THREAD_ID":      threadID,
+				"VARIABLE_NAME":  name,
+				"VARIABLE_VALUE": valStr,
+			})
+		}
+		return rows
+	}
+	allVars := e.psShared.AllUserVars()
+	rows := make([]storage.Row, 0, len(allVars))
+	for _, entry := range allVars {
+		threadID := entry.ConnID + 1
 		valStr := "NULL"
-		if val != nil {
-			valStr = fmt.Sprintf("%v", val)
+		if entry.Value != nil {
+			valStr = fmt.Sprintf("%v", entry.Value)
 		}
 		rows = append(rows, storage.Row{
 			"THREAD_ID":      threadID,
-			"VARIABLE_NAME":  name,
+			"VARIABLE_NAME":  entry.Name,
 			"VARIABLE_VALUE": valStr,
 		})
 	}
