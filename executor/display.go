@@ -656,7 +656,7 @@ func normalizeAggColNameFunctions(s string) string {
 func isKnownSQLFunction(name string) bool {
 	known := map[string]bool{
 		"DISTINCT": true,
-		"CAST": true, "CONVERT": true, "COALESCE": true, "IF": true, "IFNULL": true,
+		"CAST": true, "CONVERT": true, "COALESCE": true, "IF": true, "IFNULL": true, "ISNULL": true,
 		"NULLIF": true, "CONCAT": true, "CONCAT_WS": true, "LENGTH": true, "CHAR_LENGTH": true,
 		"UPPER": true, "LOWER": true, "TRIM": true, "LTRIM": true, "RTRIM": true,
 		"REPLACE": true, "SUBSTRING": true, "LEFT": true, "RIGHT": true, "REVERSE": true,

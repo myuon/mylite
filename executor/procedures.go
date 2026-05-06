@@ -2441,7 +2441,7 @@ func (e *Executor) callProcedureByNameInDB(dbName string, procName string, argSt
 				if e.userVars == nil {
 					e.userVars = make(map[string]interface{})
 				}
-				e.userVars[userVar] = val
+				e.setUserVar(userVar, val)
 			}
 			return &Result{}, nil
 		}
@@ -2454,7 +2454,7 @@ func (e *Executor) callProcedureByNameInDB(dbName string, procName string, argSt
 		if e.userVars == nil {
 			e.userVars = make(map[string]interface{})
 		}
-		e.userVars[userVar] = val
+		e.setUserVar(userVar, val)
 	}
 
 	// If multiple result sets were collected, return them all.
@@ -2636,7 +2636,7 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 				if e.userVars == nil {
 					e.userVars = make(map[string]interface{})
 				}
-				e.userVars[userVar] = val
+				e.setUserVar(userVar, val)
 			}
 			return &Result{}, nil
 		}
@@ -2649,7 +2649,7 @@ func (e *Executor) callProcedureByName(procName string, argStrs []string) (*Resu
 		if e.userVars == nil {
 			e.userVars = make(map[string]interface{})
 		}
-		e.userVars[userVar] = val
+		e.setUserVar(userVar, val)
 	}
 
 	// If the routine body produced a result set (e.g. from EXIT HANDLER or SELECT), return it.
@@ -3798,7 +3798,7 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 						if e.userVars == nil {
 							e.userVars = make(map[string]interface{})
 						}
-						e.userVars[strings.TrimPrefix(varName, "@")] = val
+						e.setUserVar(strings.TrimPrefix(varName, "@"), val)
 					}
 					continue
 				}
@@ -3817,7 +3817,7 @@ func (e *Executor) execRoutineBodyWithContext(body []string, ctx *routineContext
 						if e.userVars == nil {
 							e.userVars = make(map[string]interface{})
 						}
-						e.userVars[strings.TrimPrefix(varName, "@")] = val
+						e.setUserVar(strings.TrimPrefix(varName, "@"), val)
 					} else if strings.HasPrefix(varName, "@@") {
 						// System variable assignment: must go through Execute for proper validation
 						// (e.g., sql_mode bitmask validation, pseudo_slave_mode checks, etc.)
@@ -4955,7 +4955,7 @@ func (e *Executor) execSelectIntoForRoutine(stmtStr string, localVars map[string
 					if e.userVars == nil {
 						e.userVars = make(map[string]interface{})
 					}
-					e.userVars[strings.TrimPrefix(vn, "@")] = row[j]
+					e.setUserVar(strings.TrimPrefix(vn, "@"), row[j])
 				} else {
 					localVars[vn] = row[j]
 				}
@@ -5014,7 +5014,7 @@ func (e *Executor) execSelectIntoLocal(stmtStr string, localVars map[string]inte
 					if e.userVars == nil {
 						e.userVars = make(map[string]interface{})
 					}
-					e.userVars[strings.TrimPrefix(vn, "@")] = row[j]
+					e.setUserVar(strings.TrimPrefix(vn, "@"), row[j])
 				} else {
 					localVars[vn] = row[j]
 				}
