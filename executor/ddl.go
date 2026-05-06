@@ -7378,6 +7378,7 @@ func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, er
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", dbName, tableName))
 	}
 	tbl.Truncate()
+	e.markTableUpdated(dbName, tableName)
 	return &Result{AffectedRows: 0, IsResultSet: false}, nil
 }
 

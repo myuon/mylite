@@ -622,6 +622,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 					e.maybeRecalcStats(insertDB, tableName, int64(affected))
 				}
 			}
+			e.markTableUpdated(insertDB, tableName)
 		}
 
 		return &Result{AffectedRows: affected, InsertID: uint64(lastInsertID)}, nil
@@ -2799,6 +2800,9 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	}
 	e.lastInsertInfo = infoMsg
 
+	if affected > 0 {
+		e.markTableUpdated(insertDB, tableName)
+	}
 	return &Result{
 		AffectedRows: affected,
 		InsertID:     uint64(lastInsertID),

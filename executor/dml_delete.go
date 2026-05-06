@@ -523,6 +523,9 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 			}
 		}
 		tbl.InvalidateIndexes()
+		if len(deleteSet) > 0 {
+			e.markTableUpdated(deleteDB, tableName)
+		}
 		return &Result{AffectedRows: uint64(len(deleteSet))}, nil
 	}
 
@@ -664,6 +667,9 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		tbl.HeapInsertFront = true
 	}
 
+	if affected > 0 {
+		e.markTableUpdated(deleteDB, tableName)
+	}
 	return &Result{AffectedRows: affected}, nil
 }
 

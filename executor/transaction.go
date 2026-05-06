@@ -254,6 +254,8 @@ func (e *Executor) execCommit() (*Result, error) {
 		// Discard any pending undo log (data is committed).
 		e.txnUndoLog = nil
 		e.endImplicitTxnTracked()
+		// Commit any pending UPDATE_TIME entries (autocommit=0 implicit transaction).
+		e.commitPendingUpdateTimes()
 		e.restoreNextTxnIsolation()
 		return &Result{}, nil
 	}
@@ -283,6 +285,8 @@ func (e *Executor) execCommit() (*Result, error) {
 	if e.txnActiveSet != nil {
 		e.txnActiveSet.End(e.connectionID)
 	}
+	// Commit pending UPDATE_TIME entries to the shared map.
+	e.commitPendingUpdateTimes()
 	// Restore session isolation level if it was temporarily overridden by a NextTxScope set.
 	e.restoreNextTxnIsolation()
 	// Release GTID ownership acquired by SET SESSION gtid_next = 'ANONYMOUS' or UUID:NUMBER.
@@ -384,6 +388,8 @@ func (e *Executor) execRollback() (*Result, error) {
 			e.txnUndoLog = nil
 			e.replayUndoLog(undoLog)
 		}
+		// Discard pending UPDATE_TIME entries (rolled back).
+		e.pendingUpdateTimes = nil
 		// End implicit autocommit=0 transaction tracking if present.
 		e.endImplicitTxnTracked()
 		e.restoreNextTxnIsolation()
@@ -401,6 +407,8 @@ func (e *Executor) execRollback() (*Result, error) {
 	if e.txnActiveSet != nil {
 		e.txnActiveSet.End(e.connectionID)
 	}
+	// Discard pending UPDATE_TIME entries (rolled back, so no update to shared map).
+	e.pendingUpdateTimes = nil
 	// Restore session isolation level if it was temporarily overridden by a NextTxScope set.
 	e.restoreNextTxnIsolation()
 	// Release GTID ownership acquired by SET SESSION gtid_next = 'ANONYMOUS' or UUID:NUMBER.

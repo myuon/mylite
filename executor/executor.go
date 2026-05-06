@@ -717,6 +717,15 @@ type Executor struct {
 	// psShared holds multi-connection shared state for performance_schema tables
 	// (user_variables_by_thread, session_connect_attrs, etc.). Shared across all Clone()d executors.
 	psShared *PerfSchemaShared
+	// tableUpdateTimes tracks the last DML commit time for each InnoDB table.
+	// Key: "db:table" (lowercase). Shared across all connections so that
+	// INFORMATION_SCHEMA.TABLES.UPDATE_TIME reflects cross-connection DML.
+	tableUpdateTimes   map[string]time.Time
+	tableUpdateTimesMu *sync.RWMutex
+	// pendingUpdateTimes holds tables modified in the current explicit/implicit
+	// transaction that have not yet been committed. Committed to tableUpdateTimes
+	// on COMMIT; discarded on ROLLBACK. Per-session, not shared.
+	pendingUpdateTimes map[string]time.Time
 }
 
 // Warning represents a MySQL warning.
@@ -739,6 +748,41 @@ func (e *Executor) viewDefinitionForDisplay(viewName string) string {
 		return e.views[viewName]
 	}
 	return ""
+}
+
+// markTableUpdated records that db.table was modified by DML.
+// Only tracks tables modified within explicit transactions (BEGIN/START TRANSACTION)
+// or autocommit=OFF implicit transactions. The timestamp is buffered in
+// pendingUpdateTimes and committed to the shared tableUpdateTimes map at COMMIT
+// (mimicking MySQL: UPDATE_TIME reflects commit time, not DML time).
+// Pure autocommit DML (no explicit transaction, autocommit=ON) is not tracked
+// because MySQL's InnoDB UPDATE_TIME is only meaningful after an explicit commit.
+func (e *Executor) markTableUpdated(db, table string) {
+	if !e.inTransaction && !e.isAutocommitOff() {
+		return
+	}
+	key := strings.ToLower(db) + ":" + strings.ToLower(table)
+	now := time.Now()
+	if e.pendingUpdateTimes == nil {
+		e.pendingUpdateTimes = make(map[string]time.Time)
+	}
+	e.pendingUpdateTimes[key] = now
+}
+
+// commitPendingUpdateTimes moves pendingUpdateTimes into the shared tableUpdateTimes.
+// Called at COMMIT.
+func (e *Executor) commitPendingUpdateTimes() {
+	if len(e.pendingUpdateTimes) == 0 {
+		return
+	}
+	if e.tableUpdateTimesMu != nil {
+		e.tableUpdateTimesMu.Lock()
+		for k, t := range e.pendingUpdateTimes {
+			e.tableUpdateTimes[k] = t
+		}
+		e.tableUpdateTimesMu.Unlock()
+	}
+	e.pendingUpdateTimes = nil
 }
 
 // addWarning adds a warning to the current statement's warning list.
@@ -1433,6 +1477,8 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 	e.viewStore = NewViewStore()
 	e.psShared = NewPerfSchemaShared()
 	e.psEventsStore = NewPSEventsStore()
+	e.tableUpdateTimes = make(map[string]time.Time)
+	e.tableUpdateTimesMu = &sync.RWMutex{}
 	// Note: the New() executor is a factory; real connections come from Clone().
 	// We do NOT register the factory connection itself in psShared.
 	e.initSystemTables()
@@ -1525,6 +1571,8 @@ func (e *Executor) Clone() *Executor {
 		grantStore:              e.grantStore,
 		viewStore:               e.viewStore,
 		psShared:                e.psShared,
+		tableUpdateTimes:        e.tableUpdateTimes,
+		tableUpdateTimesMu:      e.tableUpdateTimesMu,
 	}
 	if e.psShared != nil {
 		e.psShared.RegisterConnection(connID, defaultConnectAttrs(), "root")

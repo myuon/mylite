@@ -2512,6 +2512,20 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 				dataFree = int64(0)
 			}
 
+			// UPDATE_TIME: return the last DML commit time for InnoDB tables (NULL for MyISAM/MEMORY).
+			var updateTime interface{} = nil
+			isInnoDBEngine := !strings.EqualFold(engine, "MYISAM") && !strings.EqualFold(engine, "MRG_MYISAM") &&
+				!strings.EqualFold(engine, "MEMORY") && !strings.EqualFold(engine, "HEAP") &&
+				!strings.EqualFold(engine, "ARCHIVE") && !strings.EqualFold(engine, "CSV")
+			if isInnoDBEngine && e.tableUpdateTimes != nil && e.tableUpdateTimesMu != nil {
+				key := strings.ToLower(dbName) + ":" + strings.ToLower(tblName)
+				e.tableUpdateTimesMu.RLock()
+				if t, ok := e.tableUpdateTimes[key]; ok {
+					updateTime = t.Format("2006-01-02 15:04:05")
+				}
+				e.tableUpdateTimesMu.RUnlock()
+			}
+
 			rows = append(rows, storage.Row{
 				"TABLE_CATALOG":   "def",
 				"TABLE_SCHEMA":    dbName,
@@ -2528,7 +2542,7 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 				"DATA_FREE":       dataFree,
 				"AUTO_INCREMENT":  autoIncrement,
 				"CREATE_TIME":     nil,
-				"UPDATE_TIME":     nil,
+				"UPDATE_TIME":     updateTime,
 				"CHECK_TIME":      nil,
 				"TABLE_COLLATION": tableCollation,
 				"CHECKSUM":        nil,
