@@ -9280,6 +9280,12 @@ func (e *Executor) validateSelectLockClauses(stmt *sqlparser.Select) error {
 	if len(clauses) == 0 {
 		return nil
 	}
+	// Skip validation when this SELECT has no locking clause itself.
+	// The OF-clause tables belong to a nested locking SELECT (subquery), not this one.
+	// The inner SELECT will be validated when execSelect is called for it.
+	if stmt.Lock == sqlparser.NoLock {
+		return nil
+	}
 
 	// Collect FROM table refs.
 	var fromRefs []fromTableRef
