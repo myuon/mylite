@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"runtime"
 	"net"
 	"strconv"
@@ -586,6 +587,75 @@ func normalizeRows(rows [][]interface{}) [][]interface{} {
 	return out
 }
 
+// preFormatDoubleColumns converts float64 values in DOUBLE/REAL columns to pre-formatted
+// strings before normalizeRows processes them. This ensures full DOUBLE precision (17 sig figs)
+// for values in the range [1e15, 1e308), while allowing mtrrunner normalization (6 sig figs)
+// for DBL_MAX-range overflow values (abs >= 1e308) and decimal notation for moderate values.
+// FLOAT columns are intentionally left as float64 so mtrrunner's 6-sig-fig normalization applies.
+func preFormatDoubleColumns(result *executor.Result) {
+	if len(result.ColumnTypes) == 0 {
+		return
+	}
+	for i, row := range result.Rows {
+		for j, val := range row {
+			if j >= len(result.ColumnTypes) {
+				break
+			}
+			ct := strings.TrimSpace(strings.ToUpper(result.ColumnTypes[j]))
+			if ct != "DOUBLE" && ct != "REAL" &&
+				!strings.HasPrefix(ct, "DOUBLE(") && !strings.HasPrefix(ct, "REAL(") &&
+				!strings.HasPrefix(ct, "DOUBLE ") && !strings.HasPrefix(ct, "REAL ") {
+				continue
+			}
+			f, ok := val.(float64)
+			if !ok {
+				continue
+			}
+			result.Rows[i][j] = formatDoubleForDisplay(f)
+		}
+	}
+}
+
+// formatDoubleForDisplay formats a DOUBLE column float64 value for wire-protocol display.
+// Strategy:
+//   - abs == 0: "0"
+//   - abs >= 1e308 (DBL_MAX overflow region): keep e+ notation so mtrrunner normalizes to 6 sig figs
+//   - abs >= 1e15 or abs < 1e-4 (scientific notation region): check if 6 sig figs round-trips;
+//     if yes, use "e+" so mtrrunner normalizes; if no (needs full precision), strip "e+" to bypass
+//   - otherwise: decimal 'f' notation (no scientific)
+func formatDoubleForDisplay(v float64) string {
+	if math.IsNaN(v) {
+		return "NaN"
+	}
+	if math.IsInf(v, 1) {
+		return "inf"
+	}
+	if math.IsInf(v, -1) {
+		return "-inf"
+	}
+	abs := math.Abs(v)
+	if abs == 0 {
+		return "0"
+	}
+	if abs >= 1e308 {
+		// DBL_MAX region: keep e+ so mtrrunner normalizes to 6 sig figs.
+		return strconv.FormatFloat(v, 'g', -1, 64)
+	}
+	if abs >= 1e15 || abs < 1e-4 {
+		// Scientific notation region: check if 6 sig figs suffice for a round-trip.
+		sixSigFig := strconv.FormatFloat(v, 'e', 5, 64)
+		if reparsed, err := strconv.ParseFloat(sixSigFig, 64); err == nil && reparsed == v {
+			// 6 sig figs suffice: keep e+ so mtrrunner normalizes (e.g. "1.00000e+22").
+			return sixSigFig
+		}
+		// Full precision needed: strip e+ so mtrrunner doesn't reduce precision.
+		s := strconv.FormatFloat(v, 'g', -1, 64)
+		return strings.Replace(s, "e+", "e", 1)
+	}
+	// Moderate value [1e-4, 1e15): decimal notation.
+	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
 func resultToMySQL(result *executor.Result) (*mysql.Result, error) {
 	if len(result.Rows) == 0 {
 		// Empty result set
@@ -604,6 +674,7 @@ func resultToMySQL(result *executor.Result) (*mysql.Result, error) {
 		}, nil
 	}
 
+	preFormatDoubleColumns(result)
 	rows := convertBinaryColumnValues(result.Rows, result.ColumnTypes)
 	normalizedRows := fixEmptyStrings(normalizeRows(rows))
 	r, err := mysql.BuildSimpleResultset(

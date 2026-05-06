@@ -12253,6 +12253,15 @@ func (e *Executor) explainJSONDocument(query string) string {
 	isFirstmatchEnabled := strings.Contains(optimizerSwitch, "firstmatch=on")
 	isLooseScanEnabled := strings.Contains(optimizerSwitch, "loosescan=on")
 
+	// Read windowing_use_high_precision: when OFF, optimized_frame_evaluation is
+	// always shown in EXPLAIN JSON (even for non-exact numeric types like DOUBLE).
+	windowingHighPrecision := true
+	if v, ok := e.getSysVarSession("windowing_use_high_precision"); ok {
+		windowingHighPrecision = !strings.EqualFold(v, "off") && v != "0"
+	} else if v, ok := e.getSysVar("windowing_use_high_precision"); ok {
+		windowingHighPrecision = !strings.EqualFold(v, "off") && v != "0"
+	}
+
 	// Helper: build a windowing block for a single table
 	buildWindowingBlock := func(tblBlock []orderedKV) []orderedKV {
 		// Build windows array
@@ -12280,8 +12289,10 @@ func (e *Executor) explainJSONDocument(query string) string {
 			// Add frame_buffer if needed
 			if info.hasFrame {
 				frameBlock := []orderedKV{{"using_temporary_table", true}}
-				// optimized_frame_evaluation is present unless a non-exact numeric aggregate disables it
-				if info.hasOptimizedFrame && !info.hasNonExactAggreg {
+				// optimized_frame_evaluation is present when:
+				// - windowingHighPrecision=ON: only for exact numeric types (not FLOAT/DOUBLE/REAL)
+				// - windowingHighPrecision=OFF: always (MySQL uses optimized but less precise evaluation)
+				if info.hasOptimizedFrame && (!info.hasNonExactAggreg || !windowingHighPrecision) {
 					frameBlock = append(frameBlock, orderedKV{"optimized_frame_evaluation", true})
 				}
 				winBlock = append(winBlock, orderedKV{"frame_buffer", frameBlock})

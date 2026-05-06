@@ -4039,10 +4039,6 @@
     {
       "test": "sys_vars/rpl_read_size_basic",
       "reason": "complex scope handling"
-    },
-    {
-      "test": "sys_vars/windowing_use_high_precision_basic",
-      "reason": "float formatting and EXPLAIN output mismatch"
     }
   ]
 }
