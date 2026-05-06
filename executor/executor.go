@@ -8839,6 +8839,35 @@ func (e *Executor) checkTablePrivilege(stmt sqlparser.Statement) error {
 				return err
 			}
 		}
+		// Column-level UPDATE enforcement for performance_schema tables with column-restricted grants.
+		// P_S tables bypass the normal checkAccess, but column-restricted GRANT UPDATE(col) must be enforced.
+		for _, tblExpr := range s.TableExprs {
+			if at, ok := tblExpr.(*sqlparser.AliasedTableExpr); ok {
+				if tn, ok2 := at.Expr.(sqlparser.TableName); ok2 {
+					dbName := e.CurrentDB
+					if !tn.Qualifier.IsEmpty() {
+						dbName = tn.Qualifier.String()
+					}
+					if strings.EqualFold(dbName, "performance_schema") {
+						tblName := tn.Name.String()
+						hasFullAccess, grantedCols := e.grantStore.GetGrantedColumnsForPriv(user, host, "UPDATE", dbName, tblName, activeRoles)
+						if !hasFullAccess && len(grantedCols) > 0 {
+							grantedSet := make(map[string]bool, len(grantedCols))
+							for _, c := range grantedCols {
+								grantedSet[strings.ToLower(c)] = true
+							}
+							for _, expr := range s.Exprs {
+								colName := strings.ToLower(expr.Name.Name.String())
+								if !grantedSet[colName] {
+									return mysqlError(1143, "42000", fmt.Sprintf("UPDATE command denied to user '%s'@'%s' for column '%s' in table '%s'",
+										user, host, strings.ToUpper(colName), tblName))
+								}
+							}
+						}
+					}
+				}
+			}
+		}
 	case *sqlparser.Delete:
 		// For multi-table DELETE (DELETE t1 FROM t1, t2 WHERE ...), tables in Targets need DELETE
 		// and tables only in TableExprs (join sources) need SELECT.
@@ -9213,7 +9242,7 @@ func (e *Executor) checkSelectPrivRecursive(sel *sqlparser.Select, user, host st
 // each referenced column is in the granted set.
 func (e *Executor) checkColumnAccessForTable(sel *sqlparser.Select, tblName, dbName, user, host string, activeRoles []string) error {
 	dbLower := strings.ToLower(dbName)
-	if dbLower == "information_schema" || dbLower == "performance_schema" {
+	if dbLower == "information_schema" {
 		return nil
 	}
 	hasFullAccess, grantedCols := e.grantStore.GetGrantedColumnsForPriv(user, host, "SELECT", dbName, tblName, activeRoles)
