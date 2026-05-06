@@ -4720,52 +4720,122 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		}
 	}
 
-	// Pre-validate RENAME INDEX and ALTER INDEX operations to detect conflicts early.
-	// Rules:
-	//   - RENAME a→x: source `a` must exist in the original schema
-	//   - ALTER INDEX n: `n` must exist in the original schema
-	//   - Any key used as a RENAME source cannot be referenced by any other operation
-	//     (AlterIndex or another RenameIndex source) in the same ALTER TABLE statement
-	//   - Any key not in the original schema cannot be referenced as RENAME source or ALTER INDEX target
+	// Pre-validate RENAME INDEX, ALTER INDEX, ADD INDEX, and DROP INDEX operations to detect conflicts
+	// early and prevent partial execution. Rules enforced here (based on original schema state):
+	//   - DROP x: `x` must exist in the original schema (1091)
+	//   - RENAME a→y: source `a` must exist in the original schema (1176)
+	//   - RENAME a→y: `a` must not also be dropped in the same statement (1176)
+	//   - RENAME a→y: target `y` must not conflict with an existing/added index (1061)
+	//   - ADD INDEX x: `x` must not already exist unless it is dropped or really renamed away (1061)
+	//   - ALTER INDEX n: `n` must exist in the original schema (1176)
+	// These maps are declared outside the block so they can be used in the index pre-drop below.
+	var preValidOrigIdxNames map[string]bool // original index names
+	var preValidAddedIdxNames map[string]bool // names being added via ADD INDEX
+	var preValidDroppedIdxNames map[string]bool // names being dropped via DROP INDEX
 	{
 		tableDef, _ := db.GetTable(tableName)
 		if tableDef != nil {
-			origIdxNames := make(map[string]bool)
+			preValidOrigIdxNames = make(map[string]bool)
 			for _, idx := range tableDef.Indexes {
-				origIdxNames[strings.ToLower(idx.Name)] = true
+				preValidOrigIdxNames[strings.ToLower(idx.Name)] = true
 			}
-			// Collect rename sources and alter-index targets separately
-			renameSources := make(map[string]bool)
+			// Pass 1: collect all relevant names across ADD/DROP/RENAME ops
+			preValidAddedIdxNames = make(map[string]bool)
+			preValidDroppedIdxNames = make(map[string]bool)
+			renamedFromNames := make(map[string]bool)     // RENAME sources (all, including no-op)
+			realRenamedFromNames := make(map[string]bool) // RENAME sources where old != new
+			for _, opt := range stmt.AlterOptions {
+				switch op := opt.(type) {
+				case *sqlparser.AddIndexDefinition:
+					n := strings.ToLower(op.IndexDefinition.Info.Name.String())
+					if n != "" {
+						preValidAddedIdxNames[n] = true
+					}
+				case *sqlparser.DropKey:
+					if op.Type != sqlparser.PrimaryKeyType && op.Type != sqlparser.ForeignKeyType && op.Type != sqlparser.CheckKeyType {
+						preValidDroppedIdxNames[strings.ToLower(op.Name.String())] = true
+					}
+				case *sqlparser.RenameIndex:
+					oldN := strings.ToLower(op.OldName.String())
+					newN := strings.ToLower(op.NewName.String())
+					renamedFromNames[oldN] = true
+					if oldN != newN {
+						realRenamedFromNames[oldN] = true
+					}
+				}
+			}
+			// Pass 2: validate each operation
 			alterTargets := make(map[string]bool)
 			for _, opt := range stmt.AlterOptions {
 				switch op := opt.(type) {
+				case *sqlparser.DropKey:
+					if op.Type != sqlparser.PrimaryKeyType && op.Type != sqlparser.ForeignKeyType && op.Type != sqlparser.CheckKeyType {
+						idxName := op.Name.String()
+						if !preValidOrigIdxNames[strings.ToLower(idxName)] {
+							return nil, mysqlError(1091, "42000", fmt.Sprintf("Can't DROP '%s'; check that column/key exists", idxName))
+						}
+					}
 				case *sqlparser.RenameIndex:
 					oldName := strings.ToLower(op.OldName.String())
+					newName := strings.ToLower(op.NewName.String())
 					// Reject renaming to GEN_CLUST_INDEX (reserved InnoDB internal index name)
 					if strings.EqualFold(op.NewName.String(), "GEN_CLUST_INDEX") {
 						return nil, mysqlError(1280, "42000", "Incorrect index name 'GEN_CLUST_INDEX'")
 					}
-					if !origIdxNames[oldName] {
+					// Source must exist in the original schema
+					if !preValidOrigIdxNames[oldName] {
 						return nil, mysqlError(1176, "42000", fmt.Sprintf("Key '%s' doesn't exist in table '%s'", op.OldName.String(), tableName))
 					}
-					renameSources[oldName] = true
+					// DROP x + RENAME x is invalid: source is also being dropped in this statement
+					if preValidDroppedIdxNames[oldName] {
+						return nil, mysqlError(1176, "42000", fmt.Sprintf("Key '%s' doesn't exist in table '%s'", op.OldName.String(), tableName))
+					}
+					// RENAME target must not conflict with an existing index that is not being removed
+					if preValidOrigIdxNames[newName] && !preValidDroppedIdxNames[newName] && !renamedFromNames[newName] {
+						return nil, mysqlError(1061, "42000", fmt.Sprintf("Duplicate key name '%s'", op.NewName.String()))
+					}
+					// RENAME target must not conflict with a name being added in the same statement
+					if preValidAddedIdxNames[newName] {
+						return nil, mysqlError(1061, "42000", fmt.Sprintf("Duplicate key name '%s'", op.NewName.String()))
+					}
 				case *sqlparser.AlterIndex:
 					idxName := strings.ToLower(op.Name.String())
 					if strings.EqualFold(idxName, "PRIMARY") {
 						break // handled later as parse error
 					}
-					if !origIdxNames[idxName] {
+					if !preValidOrigIdxNames[idxName] {
 						return nil, mysqlError(1176, "42000", fmt.Sprintf("Key '%s' doesn't exist in table '%s'", op.Name.String(), tableName))
 					}
 					alterTargets[idxName] = true
+				case *sqlparser.AddIndexDefinition:
+					n := op.IndexDefinition.Info.Name.String()
+					nLower := strings.ToLower(n)
+					if nLower == "" {
+						break
+					}
+					// ADD INDEX x where x already exists and is not being removed (dropped or real-renamed) -> ER_DUP_KEYNAME
+					if preValidOrigIdxNames[nLower] && !preValidDroppedIdxNames[nLower] && !realRenamedFromNames[nLower] {
+						return nil, mysqlError(1061, "42000", fmt.Sprintf("Duplicate key name '%s'", n))
+					}
 				}
 			}
 			// Check that no key is both a RENAME source and an ALTER INDEX target
-			for k := range renameSources {
+			for k := range renamedFromNames {
 				if alterTargets[k] {
 					return nil, mysqlError(1176, "42000", fmt.Sprintf("Key '%s' doesn't exist in table '%s'", k, tableName))
 				}
 			}
+		}
+	}
+
+	// Detect ADD INDEX x + DROP INDEX x in the same statement (index replacement pattern).
+	// To avoid the newly-added index being removed by the sequential DROP, pre-drop the original
+	// index now so ADD INDEX creates a fresh entry. The DROP in the main loop is then skipped.
+	preDroppedIdxNames := map[string]bool{} // lowercased index names already dropped here
+	for idxName := range preValidDroppedIdxNames {
+		if preValidAddedIdxNames[idxName] && preValidOrigIdxNames[idxName] {
+			_ = db.DropIndex(tableName, idxName)
+			preDroppedIdxNames[idxName] = true
 		}
 	}
 
@@ -6314,6 +6384,10 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 				// CHECK constraints: silently accept DROP.
 			} else {
 				idxName := op.Name.String()
+				// Skip if already pre-dropped in the index-replacement pre-pass.
+				if preDroppedIdxNames[strings.ToLower(idxName)] {
+					break
+				}
 				if err := db.DropIndex(tableName, idxName); err != nil {
 					return nil, mysqlError(1091, "42000", fmt.Sprintf("Can't DROP '%s'; check that column/key exists", idxName))
 				}

@@ -3877,10 +3877,6 @@
       "reason": "timeout"
     },
     {
-      "test": "innodb/innodb_rename_index",
-      "reason": "ERROR: ALTER TABLE RENAME INDEX with DROP INDEX; requires ER_DUP_KEYNAME for ADD INDEX with existing name; also uses innodb_tables/innodb_indexes/innodb_fields IS tables and mysql.innodb_index_stats"
-    },
-    {
       "test": "innodb/default_row_format_16k",
       "reason": "failures: tables with complex key/varchar constraints cause t1 not found errors"
     },
