@@ -3925,10 +3925,6 @@
       "reason": "@@session.character_set_results casing issue"
     },
     {
-      "test": "sys_vars/optimizer_switch_basic",
-      "reason": "complex SET optimizer_switch parsing not supported"
-    },
-    {
       "test": "other/derived",
       "reason": "access denied for user mysqltest_1"
     },

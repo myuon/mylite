@@ -1044,11 +1044,83 @@ func (e *Executor) setSysVar(name string, value string, isGlobal bool) {
 	}
 }
 
+// optimizerSwitchFlags is the canonical ordered list of optimizer_switch flag names.
+// Bit N corresponds to the Nth flag (0-based). This matches MySQL 8.0's bitmask order.
+var optimizerSwitchFlags = []string{
+	"index_merge", "index_merge_union", "index_merge_sort_union", "index_merge_intersection",
+	"engine_condition_pushdown", "index_condition_pushdown", "mrr", "mrr_cost_based",
+	"block_nested_loop", "batched_key_access", "materialization", "semijoin",
+	"loosescan", "firstmatch", "duplicateweedout", "subquery_materialization_cost_based",
+	"use_index_extensions", "condition_fanout_filter", "derived_merge", "use_invisible_indexes",
+	"skip_scan",
+}
+
+// normalizeOptimizerSwitchInput validates and pre-processes a raw SET optimizer_switch value.
+// It rejects float/scientific notation, converts integer bitmasks to flag=on/off strings,
+// validates string values, and expands "default"/"def".
+func (e *Executor) normalizeOptimizerSwitchInput(newValue string, expr sqlparser.Expr) (string, error) {
+	// Reject float/scientific notation (unquoted literals like 1.1 or 1e1)
+	if lit, isLit := expr.(*sqlparser.Literal); isLit {
+		litStr := sqlparser.String(lit)
+		isQuoted := strings.HasPrefix(litStr, "'") || strings.HasPrefix(litStr, "\"")
+		if !isQuoted && strings.ContainsAny(litStr, ".eE") {
+			return "", mysqlError(1232, "42000", "Incorrect argument type to variable 'optimizer_switch'")
+		}
+	}
+
+	trimmed := strings.TrimSpace(newValue)
+
+	// Integer value: treat as bitmask
+	if n, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+		parts := make([]string, len(optimizerSwitchFlags))
+		for i, flag := range optimizerSwitchFlags {
+			if (n>>uint(i))&1 == 1 {
+				parts[i] = flag + "=on"
+			} else {
+				parts[i] = flag + "=off"
+			}
+		}
+		return strings.Join(parts, ","), nil
+	}
+
+	// "default" or "def" prefix: reset to compiled default (handled in mergeOptimizerSwitch)
+	upper := strings.ToUpper(trimmed)
+	if strings.HasPrefix("DEFAULT", upper) && len(upper) >= 3 {
+		return "default", nil
+	}
+
+	// String value: validate — must contain '=' in each comma-separated part
+	// or be "default". Bare words like "index_merge" or "foobar" are invalid.
+	stripped := strings.Trim(trimmed, "'\"")
+	for _, part := range strings.Split(stripped, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if !strings.Contains(part, "=") {
+			return "", mysqlError(1231, "42000", fmt.Sprintf("Variable 'optimizer_switch' can't be set to the value of '%s'", stripped))
+		}
+	}
+	return newValue, nil
+}
+
 // mergeOptimizerSwitch merges a partial optimizer_switch setting into the current value.
 // MySQL allows SET optimizer_switch='flag=on' to only change one flag at a time.
 func (e *Executor) mergeOptimizerSwitch(newValue string, isGlobal bool) string {
-	// Special case: 'default' resets optimizer_switch to the compiled default value.
-	if strings.EqualFold(strings.TrimSpace(newValue), "default") {
+	// Special case: 'default'/'def' resets optimizer_switch.
+	// For session: reset to current global value. For global: reset to compiled default.
+	trimmed := strings.TrimSpace(newValue)
+	upper := strings.ToUpper(trimmed)
+	if upper == "DEFAULT" || (strings.HasPrefix("DEFAULT", upper) && len(upper) >= 3) {
+		if !isGlobal {
+			// Session "default" → use global value
+			if gv, ok := e.getGlobalVar("optimizer_switch"); ok {
+				return gv
+			}
+			if v, ok := e.startupVars["optimizer_switch"]; ok {
+				return v
+			}
+		}
 		if compiled, ok := e.getCompiledDefault("optimizer_switch"); ok {
 			return compiled
 		}

@@ -1460,6 +1460,17 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							return nil, featErr
 						}
 						e.sessionScopeVars[cleanName] = featVal
+					} else if cleanName == "optimizer_switch" {
+						// optimizer_switch accepts integer bitmask, key=value strings, or "default".
+						sv := val
+						if evalVal != nil {
+							sv = fmt.Sprintf("%v", evalVal)
+						}
+						normalized, swErr := e.normalizeOptimizerSwitchInput(sv, expr.Expr)
+						if swErr != nil {
+							return nil, swErr
+						}
+						e.sessionScopeVars[cleanName] = e.mergeOptimizerSwitch(normalized, isGlobal)
 					} else if isBooleanVariable(cleanName) {
 						boolVal, bErr := normalizeBooleanSetValue(cleanName, expr.Expr, evalVal)
 						if bErr != nil {
@@ -1476,9 +1487,6 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 								sv = "OFF"
 							}
 						}
-						if cleanName == "optimizer_switch" {
-							sv = e.mergeOptimizerSwitch(sv, isGlobal)
-						}
 						e.sessionScopeVars[cleanName] = sv
 					} else if err == nil && evalVal == nil {
 						// nil means NULL.
@@ -1490,11 +1498,7 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							delete(e.sessionScopeVars, cleanName)
 						}
 					} else {
-						sv := val
-						if cleanName == "optimizer_switch" {
-							sv = e.mergeOptimizerSwitch(sv, isGlobal)
-						}
-						e.sessionScopeVars[cleanName] = sv
+						e.sessionScopeVars[cleanName] = val
 					}
 				}
 				// If SET GLOBAL was used, move the newly-stored value to global scope
