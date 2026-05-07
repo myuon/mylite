@@ -336,6 +336,9 @@ type psDigestEntry struct {
 	DigestText      string
 	CountStar       int64
 	SumTimerWait    int64  // accumulated wait time in picoseconds (always 0 in this impl)
+	SumRowsAffected int64
+	SumErrors       int64
+	SumWarnings     int64
 	FirstSeen       string // YYYY-MM-DD HH:MM:SS.uuuuuu
 	LastSeen        string
 	QuerySampleText string
@@ -555,6 +558,10 @@ type Executor struct {
 	// psDigests tracks statement digests for events_statements_summary_by_digest
 	// and events_statements_histogram_by_digest tables.
 	psDigests []psDigestEntry
+	// psLastDigestIdx is the index into psDigests of the entry just recorded by
+	// recordStatementDigest. -1 means no entry was recorded for the current statement
+	// (e.g. skipped because it targets performance_schema).
+	psLastDigestIdx int
 	// psThreadInstrumented tracks per-connection INSTRUMENTED column for threads table.
 	psThreadInstrumented map[int64]string
 	// psThreadHistory tracks per-connection HISTORY column for threads table.
@@ -2203,6 +2210,16 @@ func (e *Executor) logToGeneralLog(query string) {
 // performance_schema_digests_size cap). Truncation of the table only resets
 // in-memory entries; subsequent statements keep being recorded.
 func (e *Executor) recordStatementDigest(query string) {
+	e.psLastDigestIdx = -1
+	// Don't record sub-statements from stored procedures, functions, or triggers.
+	// MySQL's performance_schema does not instrument these.
+	if e.routineDepth > 0 {
+		return
+	}
+	// Don't record the inner query from EXECUTE stmt — only the EXECUTE itself is recorded.
+	if e.executeDepth > 0 {
+		return
+	}
 	trimmed := strings.TrimSpace(query)
 	if trimmed == "" {
 		return
@@ -2212,6 +2229,13 @@ func (e *Executor) recordStatementDigest(query string) {
 	// performance_schema digest table IS recorded (matches MySQL behavior).
 	upperQ := strings.ToUpper(trimmed)
 	if strings.Contains(upperQ, "PERFORMANCE_SCHEMA") &&
+		(strings.HasPrefix(upperQ, "SELECT") || strings.HasPrefix(upperQ, "SHOW") ||
+			strings.HasPrefix(upperQ, "(SELECT") || strings.HasPrefix(upperQ, "DESC")) {
+		return
+	}
+	// Also skip when in performance_schema database and the query is a SELECT/SHOW
+	// that implicitly targets PS tables (no schema prefix in query).
+	if e.CurrentDB == "performance_schema" &&
 		(strings.HasPrefix(upperQ, "SELECT") || strings.HasPrefix(upperQ, "SHOW") ||
 			strings.HasPrefix(upperQ, "(SELECT") || strings.HasPrefix(upperQ, "DESC")) {
 		return
@@ -2234,6 +2258,7 @@ func (e *Executor) recordStatementDigest(query string) {
 			e.psDigests[i].CountStar++
 			e.psDigests[i].LastSeen = now
 			e.psDigests[i].QuerySampleText = trimmed
+			e.psLastDigestIdx = i
 			return
 		}
 	}
@@ -2243,6 +2268,7 @@ func (e *Executor) recordStatementDigest(query string) {
 		// the LAST_SEEN of an existing match if we ever find one.
 		return
 	}
+	idx := len(e.psDigests)
 	e.psDigests = append(e.psDigests, psDigestEntry{
 		SchemaName:      schemaName,
 		Digest:          digest,
@@ -2252,6 +2278,19 @@ func (e *Executor) recordStatementDigest(query string) {
 		LastSeen:        now,
 		QuerySampleText: trimmed,
 	})
+	e.psLastDigestIdx = idx
+}
+
+// updateStatementDigestStats updates the SUM_ROWS_AFFECTED, SUM_ERRORS, and
+// SUM_WARNINGS for the digest entry at the given index. It must be called
+// after the statement finishes executing so the result is known.
+func (e *Executor) updateStatementDigestStats(idx int, rowsAffected, errors, warnings int64) {
+	if idx < 0 || idx >= len(e.psDigests) {
+		return
+	}
+	e.psDigests[idx].SumRowsAffected += rowsAffected
+	e.psDigests[idx].SumErrors += errors
+	e.psDigests[idx].SumWarnings += warnings
 }
 
 func (e *Executor) Execute(query string) (res *Result, retErr error) {
@@ -2337,6 +2376,32 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 		}
 	}
 
+	// Record statement digest for performance_schema digest tables BEFORE preprocessing,
+	// so that statements handled entirely by preprocessQuery (CREATE PROCEDURE, CREATE TRIGGER,
+	// PREPARE, CALL, etc.) are also recorded. MySQL records the original query text.
+	e.recordStatementDigest(query)
+	// Update digest stats (rows affected, errors, warnings) after execution.
+	// This defer runs after the Execute function returns, so it sees the final result.
+	// Only runs for top-level client statements (not inside routines/triggers).
+	if e.routineDepth == 0 {
+		digestIdx := e.psLastDigestIdx
+		defer func() {
+			if digestIdx < 0 {
+				return
+			}
+			var rowsAffected, errs, warns int64
+			if res != nil && res.Columns == nil {
+				// DML result: AffectedRows is the rows affected count
+				rowsAffected = int64(res.AffectedRows)
+			}
+			if retErr != nil {
+				errs = 1
+			}
+			warns = int64(len(e.warnings))
+			e.updateStatementDigestStats(digestIdx, rowsAffected, errs, warns)
+		}()
+	}
+
 	query, result, err := e.preprocessQuery(query)
 	if result != nil || err != nil {
 		return result, err
@@ -2344,9 +2409,6 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 
 	// Log query to mysql.general_log if general_log is enabled
 	e.logToGeneralLog(query)
-
-	// Record statement digest for performance_schema digest tables
-	e.recordStatementDigest(query)
 
 	// Record statement in the shared PS events store (events_statements_current/history).
 	e.recordPSStatementEvent(query)

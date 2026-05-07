@@ -128,13 +128,16 @@ func reclassifyNullTokens(tokens []digestToken) []digestToken {
 }
 
 // collapseInsideParenLiterals replaces "(L , L , L [, L]*)" — where each L is
-// a literal token (number/string/null already) — with "(...)". The single-
-// element form "(L)" is left intact ("(?)").
+// a literal token (number/string/null already) — with "(...)". This also
+// handles the single-element IN-list form "(L)" when preceded by the IN keyword
+// (MySQL collapses IN (single_value) to IN (...) as well).
 func collapseInsideParenLiterals(tokens []digestToken) []digestToken {
 	out := make([]digestToken, 0, len(tokens))
 	i := 0
 	for i < len(tokens) {
 		if tokens[i].kind == tokPunct && tokens[i].text == "(" {
+			// Check if the previous token is IN keyword (for single-value IN-list collapsing)
+			prevIsIN := len(out) > 0 && out[len(out)-1].kind == tokKeyword && out[len(out)-1].text == "IN"
 			// Scan inner tokens until matching ')'
 			depth := 1
 			j := i + 1
@@ -166,7 +169,10 @@ func collapseInsideParenLiterals(tokens []digestToken) []digestToken {
 				}
 				j++
 			}
-			if ok && depth == 0 && commaCount >= 1 && litCount >= 2 && litCount == commaCount+1 {
+			// Collapse multi-literal lists: "(L,L,...,L)" -> "(...)"
+			// Also collapse single-literal IN-lists: "IN (L)" -> "IN (...)"
+			if ok && depth == 0 && litCount >= 1 && litCount == commaCount+1 &&
+				(commaCount >= 1 || (prevIsIN && litCount == 1)) {
 				// "(L,L,...,L)" -> "(...)"
 				out = append(out, digestToken{kind: tokPunct, text: "("})
 				out = append(out, digestToken{kind: tokKeyword, text: "..."})
@@ -181,30 +187,19 @@ func collapseInsideParenLiterals(tokens []digestToken) []digestToken {
 	return out
 }
 
-// collapseTopLevelLiteralList replaces a top-level run of "L , L [, L]*" (not
-// inside parens) with "L , ...", matching MySQL's behaviour for things like
-// "SELECT 1, 2, 3 FROM t1" -> "SELECT ?, ... FROM `t1`".
+// collapseTopLevelLiteralList replaces runs of "L , L [, L]*" with "L , ...",
+// matching MySQL's behaviour for things like:
+//   "SELECT 1, 2, 3 FROM t1"                  -> "SELECT ?, ... FROM `t1`"
+//   "SELECT * FROM (SELECT a, 1, 1 FROM t1)"  -> "SELECT * FROM (SELECT `a`, ?, ... FROM `t1`)"
+//
+// This applies at all nesting depths, not just the top level, because MySQL
+// collapses literal sequences inside subquery bodies as well.
 func collapseTopLevelLiteralList(tokens []digestToken) []digestToken {
 	out := make([]digestToken, 0, len(tokens))
-	depth := 0
 	i := 0
 	for i < len(tokens) {
 		t := tokens[i]
-		if t.kind == tokPunct && t.text == "(" {
-			depth++
-			out = append(out, t)
-			i++
-			continue
-		}
-		if t.kind == tokPunct && t.text == ")" {
-			if depth > 0 {
-				depth--
-			}
-			out = append(out, t)
-			i++
-			continue
-		}
-		if depth == 0 && isLiteralTok(t) {
+		if isLiteralTok(t) {
 			// Try to extend: literal , literal , ...
 			j := i + 1
 			litCount := 1
@@ -405,6 +400,24 @@ func tokenizeForDigest(q string) []digestToken {
 			i = j
 			continue
 		}
+		// User variable: @varname -> @? (MySQL normalizes user variable names)
+		if c == '@' {
+			j := i + 1
+			// Skip optional second @ (system variables like @@global.var)
+			if j < n && r[j] == '@' {
+				// System variable - not a user variable, fall through to operator
+			} else if j < n && (unicode.IsLetter(r[j]) || r[j] == '_' || r[j] == '$' || unicode.IsDigit(r[j])) {
+				// User variable @varname - consume the name and emit as literal (normalized to @?)
+				for j < n && (unicode.IsLetter(r[j]) || unicode.IsDigit(r[j]) || r[j] == '_' || r[j] == '$' || r[j] == '.') {
+					j++
+				}
+				// Emit @ followed by ? (user variable name is normalized to ?)
+				out = append(out, digestToken{kind: tokOperator, text: "@"})
+				out = append(out, digestToken{kind: tokNumber}) // renders as ?
+				i = j
+				continue
+			}
+		}
 		// Punctuation single chars
 		switch c {
 		case '(', ')', ',', ';', '.':
@@ -571,9 +584,12 @@ func joinDigestTokens(tokens []digestToken) string {
 		}
 	}
 
-	// intTypeAliases maps type aliases that MySQL normalizes to INTEGER in digests.
-	intTypeAliases := map[string]string{
-		"INT": "INTEGER",
+	// typeAliases maps keyword aliases that MySQL normalizes in digests.
+	// INT → INTEGER, CHAR → CHARACTER, DATABASE → SCHEMA.
+	typeAliases := map[string]string{
+		"INT":      "INTEGER",
+		"CHAR":     "CHARACTER",
+		"DATABASE": "SCHEMA",
 	}
 
 	var b strings.Builder
@@ -581,7 +597,7 @@ func joinDigestTokens(tokens []digestToken) string {
 		var rendered string
 		switch t.kind {
 		case tokKeyword:
-			if norm, ok := intTypeAliases[t.text]; ok {
+			if norm, ok := typeAliases[t.text]; ok {
 				rendered = norm
 			} else {
 				rendered = t.text
@@ -632,8 +648,12 @@ func needsSpace(prev, cur digestToken) bool {
 	if prev.kind == tokPunct && prev.text == "(" {
 		return false
 	}
-	// No space before ';' ')'
-	if cur.kind == tokPunct && (cur.text == ";" || cur.text == ")") {
+	// No space before ')'
+	if cur.kind == tokPunct && cur.text == ")" {
+		return false
+	}
+	// No space after '@' (user variable prefix: @? renders without space)
+	if prev.kind == tokOperator && prev.text == "@" {
 		return false
 	}
 	return true

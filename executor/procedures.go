@@ -2792,6 +2792,18 @@ func extractNearFromParseError(query string, parseErr error) string {
 	return truncateNear(query)
 }
 
+// containsIntegerDisplayWidth returns true if the type string contains an integer type
+// with a display width (e.g. "INT(11)", "BIGINT(20)"), which is deprecated in MySQL 8.0.17+.
+func containsIntegerDisplayWidth(upperType string) bool {
+	intTypes := []string{"TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT"}
+	for _, t := range intTypes {
+		if idx := strings.Index(upperType, t+"("); idx >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // execCreateFunction handles CREATE FUNCTION name(params) RETURNS type BEGIN...END
 func (e *Executor) execCreateFunction(query string) (*Result, error) {
 	// LOCK TABLES blocks function DDL.
@@ -2869,6 +2881,11 @@ func (e *Executor) execCreateFunction(query string) (*Result, error) {
 	if returnsIdx >= 0 {
 		afterReturns := strings.TrimSpace(afterParams[returnsIdx+len("RETURNS "):])
 		returnType = extractFuncReturnType(afterReturns)
+		// MySQL 8.0.17+ emits a Note when integer types have display widths (e.g. int(11)).
+		// This is a deprecation warning for the display width feature.
+		if containsIntegerDisplayWidth(strings.ToUpper(returnType)) {
+			e.addWarning("Note", 1287, "Integer display width is deprecated and will be removed in a future release.")
+		}
 	}
 
 	// Parse characteristics (DETERMINISTIC, SQL SECURITY, COMMENT, etc.) from afterParams.
