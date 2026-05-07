@@ -3117,6 +3117,12 @@ func (ctx *execContext) executeQuery(stmt string) error {
 	if !useVertical {
 		// Write column headers for regular (horizontal) results.
 		// MySQL's mysql client truncates column names to 255 bytes maximum.
+		// Exception: when a single-column pure-arithmetic expression name
+		// (consisting of only digits and operators like 1+1+1+...) exceeds 255
+		// bytes, MySQL truncates it to 252 bytes and wraps at 79/80 chars per
+		// line. This behavior is observable in .result files for tests like
+		// statement_digest_long_query. Other expression types (function calls
+		// etc.) are simply truncated to 255 bytes with no wrapping.
 		truncatedCols := make([]string, len(columns))
 		for i, col := range columns {
 			if len(col) > 255 {
@@ -3125,13 +3131,9 @@ func (ctx *execContext) executeQuery(stmt string) error {
 				truncatedCols[i] = col
 			}
 		}
-		// For single-column results where the column name exceeds 252 bytes,
-		// MySQL truncates it to 252 bytes and then wraps the output at 79 chars
-		// for the first line and 80 chars for subsequent lines (matching the
-		// mysql client terminal-width display behavior). This is only triggered
-		// when the column name exceeds the 252-byte expression-name limit.
-		if len(truncatedCols) == 1 && len(truncatedCols[0]) > 252 {
-			col := truncatedCols[0][:252]
+		if len(truncatedCols) == 1 && len(columns[0]) > 255 && isArithmeticExpr(columns[0]) {
+			// Pure arithmetic expression: truncate to 252 and wrap at 79/80.
+			col := columns[0][:252]
 			ctx.output.WriteString(col[:79] + "\n")
 			col = col[79:]
 			for len(col) > 80 {
@@ -5701,6 +5703,25 @@ func normalizeExplainTree(s string) string {
 		result = append(result, line)
 	}
 	return strings.Join(result, "\n")
+}
+
+// isArithmeticExpr reports whether s is a pure arithmetic expression:
+// it contains only ASCII digits, arithmetic operators (+, -, *, /),
+// parentheses, spaces, and dots (for decimal literals). Column names
+// matching this pattern get MySQL's 252-byte truncation + 79/80-char
+// wrapping rather than the standard 255-byte truncation.
+func isArithmeticExpr(s string) bool {
+	for _, c := range s {
+		if c >= '0' && c <= '9' {
+			continue
+		}
+		switch c {
+		case '+', '-', '*', '/', '(', ')', '.', ' ':
+			continue
+		}
+		return false
+	}
+	return len(s) > 0
 }
 
 // normalizeFuncCase normalizes SQL function names in column headers
