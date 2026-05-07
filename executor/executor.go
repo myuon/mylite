@@ -1090,11 +1090,17 @@ func (e *Executor) normalizeOptimizerSwitchInput(newValue string, expr sqlparser
 	}
 
 	// String value: validate — must contain '=' in each comma-separated part
-	// or be "default". Bare words like "index_merge" or "foobar" are invalid.
+	// or be "default"/"def". Bare words like "index_merge" or "foobar" are invalid.
+	// MySQL supports "default,flag=on" syntax which resets to default then applies overrides.
 	stripped := strings.Trim(trimmed, "'\"")
 	for _, part := range strings.Split(stripped, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
+			continue
+		}
+		// "default" or abbreviations "def","defa",... are valid reset tokens
+		partUpper := strings.ToUpper(part)
+		if strings.HasPrefix("DEFAULT", partUpper) && len(partUpper) >= 3 {
 			continue
 		}
 		if !strings.Contains(part, "=") {
@@ -1177,9 +1183,38 @@ func (e *Executor) mergeOptimizerSwitch(newValue string, isGlobal bool) string {
 	}
 
 	// Apply new flags (merge/update)
+	// MySQL supports "default" as a part within the list (e.g. "default,semijoin=off")
+	// which resets all flags to the compiled default, then applies subsequent overrides.
 	for _, part := range strings.Split(newValue, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
+			continue
+		}
+		// Handle "default" token: reset flags to compiled defaults
+		partUpper := strings.ToUpper(part)
+		if strings.HasPrefix("DEFAULT", partUpper) && len(partUpper) >= 3 {
+			compiled, ok := e.getCompiledDefault("optimizer_switch")
+			if !ok {
+				continue
+			}
+			// Reset flags and flagIndex to compiled defaults
+			flags = flags[:0]
+			flagIndex = map[string]int{}
+			for _, cp := range strings.Split(compiled, ",") {
+				cp = strings.TrimSpace(cp)
+				if cp == "" {
+					continue
+				}
+				ckv := strings.SplitN(cp, "=", 2)
+				if len(ckv) == 2 {
+					k := strings.TrimSpace(ckv[0])
+					v := strings.TrimSpace(ckv[1])
+					if _, exists := flagIndex[k]; !exists {
+						flagIndex[k] = len(flags)
+						flags = append(flags, flagEntry{k, v})
+					}
+				}
+			}
 			continue
 		}
 		kv := strings.SplitN(part, "=", 2)

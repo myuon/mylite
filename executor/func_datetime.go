@@ -1896,6 +1896,15 @@ func parseDateTimeValue(val interface{}) (time.Time, error) {
 			break
 		}
 	}
+	// Handle scientific notation (e.g. "2.02605071000002e13" from NOW()+0.2).
+	// Convert to integer string and re-try parsing.
+	if strings.ContainsAny(s, "eE") {
+		if fv, err := strconv.ParseFloat(s, 64); err == nil {
+			intStr := strconv.FormatInt(int64(fv), 10)
+			// Recurse with the integer string (avoid infinite loop – intStr has no 'e')
+			return parseDateTimeValue(intStr)
+		}
+	}
 	// Handle YYYYMMDDHHMMSS.ffffff (compact numeric with fractional seconds)
 	// Also handle YYYYMMDD.ff (8 digits + dot: treat as date, ignore fractional part)
 	if !isAllDigits {

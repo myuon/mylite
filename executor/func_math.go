@@ -110,7 +110,7 @@ func evalMathFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *storage.
 		if err != nil {
 			return nil, true, err
 		}
-		return int64(f), true, nil
+		return int64(math.Floor(f)), true, nil
 	case "ceil", "ceiling":
 		val, isNull, err := e.evalArg1(v.Exprs, "CEIL", row)
 		if err != nil {
