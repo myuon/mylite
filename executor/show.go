@@ -1770,6 +1770,8 @@ func (e *Executor) showCreateFunction(funcName string) (*Result, error) {
 	} else {
 		createSQL = normalizeCreateRoutine(createSQL, "FUNCTION", funcDef.Name)
 	}
+	// Append CHARSET/COLLATE suffix to string RETURNS types using the database charset/collation.
+	createSQL = appendCharsetToReturns(createSQL, db.CharacterSet, db.CollationName)
 	// Use the connection's current character set and collation (set via SET NAMES).
 	charSetClientFn := "utf8mb4"
 	collationConnFn := "utf8mb4_0900_ai_ci"
@@ -1784,6 +1786,74 @@ func (e *Executor) showCreateFunction(funcName string) (*Result, error) {
 		Rows:        [][]interface{}{{funcDef.Name, e.sqlMode, createSQL, charSetClientFn, collationConnFn, "utf8mb4_0900_ai_ci"}},
 		IsResultSet: true,
 	}, nil
+}
+
+// isStringReturnType returns true if the SQL type is a character string type
+// that should carry a CHARSET/COLLATE suffix in SHOW CREATE FUNCTION output.
+func isStringReturnType(t string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(t))
+	for _, prefix := range []string{"CHAR", "VARCHAR", "TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT", "ENUM", "SET"} {
+		if strings.HasPrefix(upper, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// appendCharsetToReturns rewrites the RETURNS clause of a CREATE FUNCTION SQL
+// to include CHARSET and COLLATE suffixes when the return type is a string type
+// and no CHARSET is already specified.
+func appendCharsetToReturns(createSQL, charset, collation string) string {
+	if charset == "" && collation == "" {
+		return createSQL
+	}
+	upper := strings.ToUpper(createSQL)
+	returnsIdx := strings.Index(upper, "RETURNS ")
+	if returnsIdx < 0 {
+		return createSQL
+	}
+	afterKeyword := createSQL[returnsIdx+8:]
+	afterKeywordUpper := strings.ToUpper(afterKeyword)
+	// Find end of return type (before \nBEGIN, \nRETURN, or similar)
+	endIdx := strings.Index(afterKeywordUpper, "\nBEGIN")
+	if endIdx < 0 {
+		endIdx = strings.Index(afterKeywordUpper, " BEGIN")
+	}
+	if endIdx < 0 {
+		endIdx = strings.Index(afterKeywordUpper, "\nRETURN ")
+	}
+	var returnType, afterType string
+	if endIdx >= 0 {
+		returnType = strings.TrimSpace(afterKeyword[:endIdx])
+		afterType = afterKeyword[endIdx:]
+	} else {
+		newlineIdx := strings.Index(afterKeyword, "\n")
+		if newlineIdx >= 0 {
+			returnType = strings.TrimSpace(afterKeyword[:newlineIdx])
+			afterType = afterKeyword[newlineIdx:]
+		} else {
+			returnType = strings.TrimSpace(afterKeyword)
+			afterType = ""
+		}
+	}
+	if !isStringReturnType(returnType) {
+		return createSQL
+	}
+	// Skip if charset is already specified in any form (CHARSET, CHARACTER SET, COLLATE, unicode, binary, ascii keywords)
+	retUpper := strings.ToUpper(returnType)
+	for _, kw := range []string{"CHARSET", "CHARACTER SET", "COLLATE", " UNICODE", " BINARY", " ASCII"} {
+		if strings.Contains(retUpper, kw) {
+			return createSQL
+		}
+	}
+	suffix := ""
+	if charset != "" {
+		suffix += " CHARSET " + charset
+	}
+	if collation != "" {
+		suffix += " COLLATE " + collation
+	}
+	return createSQL[:returnsIdx] + "RETURNS " + returnType + suffix + afterType
 }
 
 // normalizeReturnType converts SQL type names to MySQL canonical form.
