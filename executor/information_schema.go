@@ -7934,60 +7934,76 @@ func (e *Executor) perfSchemaVariablesByThread() []storage.Row {
 	return rows
 }
 
+// psOverflowRow builds the NULL overflow row for events_statements_summary_by_digest.
+func (e *Executor) psOverflowRow() storage.Row {
+	ov := e.psDigestOverflow
+	firstSeen := ov.FirstSeen
+	if firstSeen == "" {
+		firstSeen = "2024-01-01 00:00:00.000000"
+	}
+	lastSeen := ov.LastSeen
+	if lastSeen == "" {
+		lastSeen = firstSeen
+	}
+	return storage.Row{
+		"SCHEMA_NAME":                 nil,
+		"DIGEST":                      nil,
+		"DIGEST_TEXT":                 nil,
+		"COUNT_STAR":                  ov.CountStar,
+		"SUM_TIMER_WAIT":             int64(0),
+		"MIN_TIMER_WAIT":             int64(0),
+		"AVG_TIMER_WAIT":             int64(0),
+		"MAX_TIMER_WAIT":             int64(0),
+		"SUM_LOCK_TIME":              int64(0),
+		"SUM_ERRORS":                 ov.SumErrors,
+		"SUM_WARNINGS":               ov.SumWarnings,
+		"SUM_ROWS_AFFECTED":          ov.SumRowsAffected,
+		"SUM_ROWS_SENT":              int64(0),
+		"SUM_ROWS_EXAMINED":          int64(0),
+		"SUM_CREATED_TMP_DISK_TABLES": int64(0),
+		"SUM_CREATED_TMP_TABLES":     int64(0),
+		"SUM_SELECT_FULL_JOIN":       int64(0),
+		"SUM_SELECT_FULL_RANGE_JOIN": int64(0),
+		"SUM_SELECT_RANGE":           int64(0),
+		"SUM_SELECT_RANGE_CHECK":     int64(0),
+		"SUM_SELECT_SCAN":            int64(0),
+		"SUM_SORT_MERGE_PASSES":      int64(0),
+		"SUM_SORT_RANGE":             int64(0),
+		"SUM_SORT_ROWS":              int64(0),
+		"SUM_SORT_SCAN":              int64(0),
+		"SUM_NO_INDEX_USED":          int64(0),
+		"SUM_NO_GOOD_INDEX_USED":     int64(0),
+		"FIRST_SEEN":                 firstSeen,
+		"LAST_SEEN":                  lastSeen,
+		"QUANTILE_95":                int64(0),
+		"QUANTILE_99":                int64(0),
+		"QUANTILE_999":               int64(0),
+		"QUERY_SAMPLE_TEXT":          nil,
+		"QUERY_SAMPLE_SEEN":          lastSeen,
+		"QUERY_SAMPLE_TIMER_WAIT":    int64(0),
+	}
+}
+
 // perfSchemaESMSByDigest returns rows for events_statements_summary_by_digest.
 func (e *Executor) perfSchemaESMSByDigest() []storage.Row {
-	if e.psTruncated["events_statements_summary_by_digest"] && len(e.psDigests) == 0 {
+	if e.psTruncated["events_statements_summary_by_digest"] && len(e.psDigests) == 0 && e.psDigestOverflow.CountStar == 0 {
 		return []storage.Row{}
 	}
 	// When digests_size=0, the table is disabled — return empty.
 	if v, ok := e.startupVars["performance_schema_digests_size"]; ok && v == "0" {
 		return []storage.Row{}
 	}
-	// When digests_size=N and N is very small (e.g. 1), the table fills up
-	// immediately. Show a NULL overflow row to indicate the table is full.
+	// When digests_size=1, the table fills immediately with just a NULL overflow row.
 	if v, ok := e.startupVars["performance_schema_digests_size"]; ok {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 && n <= 1 {
-			// Table has a capacity of 1 and is already full (overflow indicator).
-			return []storage.Row{{
-				"SCHEMA_NAME":                 nil,
-				"DIGEST":                      nil,
-				"DIGEST_TEXT":                  nil,
-				"COUNT_STAR":                   int64(0),
-				"SUM_TIMER_WAIT":              int64(0),
-				"MIN_TIMER_WAIT":              int64(0),
-				"AVG_TIMER_WAIT":              int64(0),
-				"MAX_TIMER_WAIT":              int64(0),
-				"SUM_LOCK_TIME":               int64(0),
-				"SUM_ERRORS":                  int64(0),
-				"SUM_WARNINGS":                int64(0),
-				"SUM_ROWS_AFFECTED":           int64(0),
-				"SUM_ROWS_SENT":               int64(0),
-				"SUM_ROWS_EXAMINED":           int64(0),
-				"SUM_CREATED_TMP_DISK_TABLES": int64(0),
-				"SUM_CREATED_TMP_TABLES":      int64(0),
-				"SUM_SELECT_FULL_JOIN":        int64(0),
-				"SUM_SELECT_FULL_RANGE_JOIN":  int64(0),
-				"SUM_SELECT_RANGE":            int64(0),
-				"SUM_SELECT_RANGE_CHECK":      int64(0),
-				"SUM_SELECT_SCAN":             int64(0),
-				"SUM_SORT_MERGE_PASSES":       int64(0),
-				"SUM_SORT_RANGE":              int64(0),
-				"SUM_SORT_ROWS":               int64(0),
-				"SUM_SORT_SCAN":               int64(0),
-				"SUM_NO_INDEX_USED":           int64(0),
-				"SUM_NO_GOOD_INDEX_USED":      int64(0),
-				"FIRST_SEEN":                  "2024-01-01 00:00:00.000000",
-				"LAST_SEEN":                   "2024-01-01 00:00:00.000000",
-				"QUANTILE_95":                 int64(0),
-				"QUANTILE_99":                 int64(0),
-				"QUANTILE_999":                int64(0),
-				"QUERY_SAMPLE_TEXT":           nil,
-				"QUERY_SAMPLE_SEEN":           "2024-01-01 00:00:00.000000",
-				"QUERY_SAMPLE_TIMER_WAIT":     int64(0),
-			}}
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n == 1 {
+			return []storage.Row{e.psOverflowRow()}
 		}
 	}
-	rows := make([]storage.Row, 0, len(e.psDigests))
+	rows := make([]storage.Row, 0, len(e.psDigests)+1)
+	// MySQL puts the NULL overflow row FIRST in the result set.
+	if e.psDigestOverflow.CountStar > 0 {
+		rows = append(rows, e.psOverflowRow())
+	}
 	for _, d := range e.psDigests {
 		firstSeen := d.FirstSeen
 		if firstSeen == "" {
@@ -8046,23 +8062,61 @@ func (e *Executor) perfSchemaESMSByDigest() []storage.Row {
 	return rows
 }
 
+// psHistogramBuckets is the standard number of latency histogram buckets per
+// digest entry in MySQL's performance_schema (450 buckets covering 0..450).
+const psHistogramBuckets = 450
+
 // perfSchemaESMHByDigest returns rows for events_statements_histogram_by_digest.
+// Each digest entry gets psHistogramBuckets rows (one per bucket, 0-indexed).
+// When overflow exists, an additional psHistogramBuckets rows are emitted with
+// SCHEMA_NAME=NULL and DIGEST=NULL for the overflow aggregate.
 func (e *Executor) perfSchemaESMHByDigest() []storage.Row {
-	if e.psTruncated["events_statements_histogram_by_digest"] && len(e.psDigests) == 0 {
+	if e.psTruncated["events_statements_histogram_by_digest"] && len(e.psDigests) == 0 && e.psDigestOverflow.CountStar == 0 {
 		return []storage.Row{}
 	}
-	rows := make([]storage.Row, 0, len(e.psDigests))
+	numDigests := len(e.psDigests)
+	hasOverflow := e.psDigestOverflow.CountStar > 0
+	total := numDigests * psHistogramBuckets
+	if hasOverflow {
+		total += psHistogramBuckets
+	}
+	rows := make([]storage.Row, 0, total)
+	// Helper to compute bucket timer bounds (picoseconds). MySQL uses an
+	// exponential scale; we approximate with linear 10ms-per-bucket increments.
+	bucketLow := func(b int) int64 { return int64(b) * 10000000 }
+	bucketHigh := func(b int) int64 { return int64(b+1) * 10000000 }
+	// MySQL puts the NULL overflow histogram rows first (matching summary table order).
+	if hasOverflow {
+		for b := 0; b < psHistogramBuckets; b++ {
+			rows = append(rows, storage.Row{
+				"SCHEMA_NAME":            nil,
+				"DIGEST":                 nil,
+				"BUCKET_NUMBER":          int64(b),
+				"BUCKET_TIMER_LOW":       bucketLow(b),
+				"BUCKET_TIMER_HIGH":      bucketHigh(b),
+				"COUNT_BUCKET":           int64(0),
+				"COUNT_BUCKET_AND_LOWER": int64(0),
+				"BUCKET_QUANTILE":        0.0,
+			})
+		}
+	}
 	for _, d := range e.psDigests {
-		rows = append(rows, storage.Row{
-			"SCHEMA_NAME":            d.SchemaName,
-			"DIGEST":                 d.Digest,
-			"BUCKET_NUMBER":          int64(0),
-			"BUCKET_TIMER_LOW":       int64(0),
-			"BUCKET_TIMER_HIGH":      int64(1000000),
-			"COUNT_BUCKET":           d.CountStar,
-			"COUNT_BUCKET_AND_LOWER": d.CountStar,
-			"BUCKET_QUANTILE":        1.0,
-		})
+		var schemaCol any = d.SchemaName
+		if d.SchemaName == "" {
+			schemaCol = nil
+		}
+		for b := 0; b < psHistogramBuckets; b++ {
+			rows = append(rows, storage.Row{
+				"SCHEMA_NAME":            schemaCol,
+				"DIGEST":                 d.Digest,
+				"BUCKET_NUMBER":          int64(b),
+				"BUCKET_TIMER_LOW":       bucketLow(b),
+				"BUCKET_TIMER_HIGH":      bucketHigh(b),
+				"COUNT_BUCKET":           int64(0),
+				"COUNT_BUCKET_AND_LOWER": int64(0),
+				"BUCKET_QUANTILE":        0.0,
+			})
+		}
 	}
 	return rows
 }
