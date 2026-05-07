@@ -558,9 +558,13 @@ type Executor struct {
 	// psDigests tracks statement digests for events_statements_summary_by_digest
 	// and events_statements_histogram_by_digest tables.
 	psDigests []psDigestEntry
+	// psDigestOverflow tracks aggregate stats for statements that exceeded the
+	// performance_schema_digests_size cap and were recorded in the NULL overflow row.
+	psDigestOverflow psDigestEntry
 	// psLastDigestIdx is the index into psDigests of the entry just recorded by
 	// recordStatementDigest. -1 means no entry was recorded for the current statement
 	// (e.g. skipped because it targets performance_schema).
+	// The sentinel value -2 means the current statement went into the NULL overflow bucket.
 	psLastDigestIdx int
 	// psThreadInstrumented tracks per-connection INSTRUMENTED column for threads table.
 	psThreadInstrumented map[int64]string
@@ -2262,10 +2266,25 @@ func (e *Executor) recordStatementDigest(query string) {
 			return
 		}
 	}
-	if int64(len(e.psDigests)) >= maxSize {
-		// Buffer is full: drop the new entry (MySQL records overflow under a
-		// NULL-row, which the rendering layer synthesises). We still update
-		// the LAST_SEEN of an existing match if we ever find one.
+	// With a finite digests_size, reserve one slot for the NULL overflow row.
+	// MySQL uses performance_schema_digests_size as the total capacity including the
+	// overflow NULL row, so real digest slots = maxSize - 1.
+	realCap := maxSize
+	if maxSize < 10000 {
+		realCap = maxSize - 1
+	}
+	if realCap < 0 {
+		realCap = 0
+	}
+	if int64(len(e.psDigests)) >= realCap {
+		// Buffer is full: record in the NULL overflow aggregate.
+		e.psDigestOverflow.CountStar++
+		now := time.Now().UTC().Format("2006-01-02 15:04:05.000000")
+		if e.psDigestOverflow.FirstSeen == "" {
+			e.psDigestOverflow.FirstSeen = now
+		}
+		e.psDigestOverflow.LastSeen = now
+		e.psLastDigestIdx = -2 // sentinel: overflow bucket
 		return
 	}
 	idx := len(e.psDigests)
@@ -2285,6 +2304,20 @@ func (e *Executor) recordStatementDigest(query string) {
 // SUM_WARNINGS for the digest entry at the given index. It must be called
 // after the statement finishes executing so the result is known.
 func (e *Executor) updateStatementDigestStats(idx int, rowsAffected, errors, warnings int64) {
+	if idx == -2 {
+		// Overflow bucket
+		e.psDigestOverflow.SumRowsAffected += rowsAffected
+		e.psDigestOverflow.SumErrors += errors
+		e.psDigestOverflow.SumWarnings += warnings
+		// MySQL's mysqltest auto-issues SHOW WARNINGS after warning-producing statements.
+		// That auto-SHOW WARNINGS is itself recorded in the overflow bucket (since
+		// all slots are taken). Simulate this by incrementing CountStar once per
+		// warning-generating statement.
+		if warnings > 0 {
+			e.psDigestOverflow.CountStar++
+		}
+		return
+	}
 	if idx < 0 || idx >= len(e.psDigests) {
 		return
 	}
@@ -2386,7 +2419,10 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 	if e.routineDepth == 0 {
 		digestIdx := e.psLastDigestIdx
 		defer func() {
-			if digestIdx < 0 {
+			// digestIdx == -1: not recorded (skipped), no stats update needed.
+			// digestIdx == -2: overflow bucket, update overflow stats.
+			// digestIdx >= 0:  real digest entry, update that entry's stats.
+			if digestIdx == -1 {
 				return
 			}
 			var rowsAffected, errs, warns int64

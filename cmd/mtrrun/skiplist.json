@@ -3109,10 +3109,6 @@
       "reason": "output mismatch, timeout, or error"
     },
     {
-      "test": "perfschema/digest_table_full",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
       "test": "perfschema/error_stats_summary",
       "reason": "output mismatch, timeout, or error"
     },

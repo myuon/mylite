@@ -7478,6 +7478,7 @@ func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, er
 			// TRUNCATE statement itself in the table after the truncation, so
 			// we re-add a synthesized TRUNCATE entry here.
 			e.psDigests = nil
+			e.psDigestOverflow = psDigestEntry{}
 			if e.psTruncated == nil {
 				e.psTruncated = make(map[string]bool)
 			}
