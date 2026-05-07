@@ -547,53 +547,55 @@ func collapseValueLists(tokens []digestToken) []digestToken {
 }
 
 // joinDigestTokens renders the token stream as the final digest_text string.
-// Spacing rules:
-//   - No space after '(' or '.'
-//   - No space before ';' or '.'
+// Spacing rules (MySQL-compatible):
+//   - Parens with only a single literal '?' or collapsed '...' get no inner spaces: (?) (...)
+//   - All other parens get inner spaces: ( ) ( `a` , `b` ) ( SELECT ... )
 //   - No space before/after tokCompactComma (collapsed literal-list comma)
-//   - Space before ',' and ')' when inside a CREATE TABLE column list
 //   - Single space between most other tokens
 func joinDigestTokens(tokens []digestToken) string {
-	// Detect CREATE TABLE DDL to apply column-list spacing inside its outer parens.
-	isCreateTableDDL := len(tokens) >= 2 &&
-		tokens[0].kind == tokKeyword && tokens[0].text == "CREATE"
-	if isCreateTableDDL {
-		found := false
-		end := len(tokens)
-		if end > 4 {
-			end = 4
+	// Precompute which '(' tokens have "inline literal" content (no inner spaces).
+	// A paren is inline-literal if its content is exactly one token that is either
+	// a literal (renders as '?') or the collapsed '...' keyword.
+	inlineLiteralParen := make(map[int]bool) // index of '(' → true if inline
+	matchingClose := make(map[int]int)        // index of '(' → index of matching ')'
+	for i, t := range tokens {
+		if t.kind != tokPunct || t.text != "(" {
+			continue
 		}
-		for _, t := range tokens[1:end] {
-			if t.kind == tokKeyword && t.text == "TABLE" {
-				found = true
-				break
-			}
-		}
-		isCreateTableDDL = found
-	}
-
-	// Find the outer paren range for CREATE TABLE column definitions.
-	outerParenOpen := -1
-	outerParenClose := -1
-	if isCreateTableDDL {
-		for i, t := range tokens {
-			if t.kind == tokPunct && t.text == "(" {
-				outerParenOpen = i
-				depth := 1
-				for j := i + 1; j < len(tokens); j++ {
-					if tokens[j].kind == tokPunct && tokens[j].text == "(" {
-						depth++
-					} else if tokens[j].kind == tokPunct && tokens[j].text == ")" {
-						depth--
-						if depth == 0 {
-							outerParenClose = j
-							break
-						}
-					}
+		// Find matching ')'
+		depth := 1
+		j := i + 1
+		for j < len(tokens) && depth > 0 {
+			if tokens[j].kind == tokPunct && tokens[j].text == "(" {
+				depth++
+			} else if tokens[j].kind == tokPunct && tokens[j].text == ")" {
+				depth--
+				if depth == 0 {
+					break
 				}
-				break
+			}
+			j++
+		}
+		if depth != 0 {
+			continue
+		}
+		matchingClose[i] = j
+		// Check if content is exactly one inline-literal token
+		inner := tokens[i+1 : j]
+		if len(inner) == 1 {
+			tok := inner[0]
+			if tok.kind == tokNumber || tok.kind == tokString || tok.kind == tokNull {
+				inlineLiteralParen[i] = true
+			}
+			if tok.kind == tokKeyword && tok.text == "..." {
+				inlineLiteralParen[i] = true
 			}
 		}
+	}
+	// Build reverse map: closing ')' index → opening '(' index
+	closeToParen := make(map[int]int)
+	for open, close := range matchingClose {
+		closeToParen[close] = open
 	}
 
 	// typeAliases maps keyword aliases that MySQL normalizes in digests.
@@ -627,22 +629,7 @@ func joinDigestTokens(tokens []digestToken) string {
 		}
 		if i > 0 {
 			prev := tokens[i-1]
-			inColList := outerParenOpen >= 0 && i > outerParenOpen && i <= outerParenClose
-			if inColList {
-				// Inside CREATE TABLE column list: space after '(', before ')' and ','
-				if i == outerParenOpen+1 {
-					// First token after outer '(': add space
-					b.WriteByte(' ')
-				} else if t.kind == tokPunct && t.text == ")" && i == outerParenClose {
-					// Closing outer ')': add space before it
-					b.WriteByte(' ')
-				} else if t.kind == tokPunct && t.text == "," {
-					// Comma between column definitions: space before ','
-					b.WriteByte(' ')
-				} else if needsSpace(prev, t) {
-					b.WriteByte(' ')
-				}
-			} else if needsSpace(prev, t) {
+			if needsSpace(prev, t, i, tokens, inlineLiteralParen, closeToParen) {
 				b.WriteByte(' ')
 			}
 		}
@@ -651,18 +638,29 @@ func joinDigestTokens(tokens []digestToken) string {
 	return b.String()
 }
 
-func needsSpace(prev, cur digestToken) bool {
+func needsSpace(prev, cur digestToken, curIdx int, tokens []digestToken, inlineLiteralParen map[int]bool, closeToParen map[int]int) bool {
 	// No space before tokCompactComma (it glues directly to preceding token)
 	if cur.kind == tokCompactComma {
 		return false
 	}
-	// No space after '('
+	// After '(': space unless this paren has inline-literal content
 	if prev.kind == tokPunct && prev.text == "(" {
-		return false
+		// Find which '(' this is (curIdx-1)
+		openIdx := curIdx - 1
+		if inlineLiteralParen[openIdx] {
+			return false
+		}
+		// Empty paren: next token is ')' → space for ( )
+		return true
 	}
-	// No space before ')'
+	// Before ')': space unless the matching '(' was inline-literal
 	if cur.kind == tokPunct && cur.text == ")" {
-		return false
+		if openIdx, ok := closeToParen[curIdx]; ok {
+			if inlineLiteralParen[openIdx] {
+				return false
+			}
+		}
+		return true
 	}
 	// No space after '@' (user variable prefix: @? renders without space)
 	if prev.kind == tokOperator && prev.text == "@" {
