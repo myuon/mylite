@@ -22,12 +22,12 @@ func TestNormalizeStatementDigest_Basic(t *testing.T) {
 		// MySQL collapses IN (single_value) to IN (...) as well
 		{"in_list_one", "SELECT * FROM t1 WHERE a IN (1)", "SELECT * FROM `t1` WHERE `a` IN (...)"},
 		{"truncate_ps_table", "TRUNCATE TABLE performance_schema.events_statements_summary_by_digest",
-			"TRUNCATE TABLE `performance_schema` . `events_statements_summary_by_digest`"},
+			"TRUNCATE TABLE `performance_schema` . `events_statements_summary_by_digest`"}, // schema-qualified keeps both parts
 		{"whitespace_collapsed", "SELECT       1     +    1", "SELECT ? + ?"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, got := normalizeStatementDigest(tc.in)
+			_, got := normalizeStatementDigest(tc.in, 0)
 			if got != tc.want {
 				t.Errorf("normalize(%q) = %q, want %q", tc.in, got, tc.want)
 			}
@@ -36,8 +36,8 @@ func TestNormalizeStatementDigest_Basic(t *testing.T) {
 }
 
 func TestNormalizeStatementDigest_StableHash(t *testing.T) {
-	a, _ := normalizeStatementDigest("SELECT 1 FROM t1")
-	b, _ := normalizeStatementDigest("SELECT   42  FROM   t1")
+	a, _ := normalizeStatementDigest("SELECT 1 FROM t1", 0)
+	b, _ := normalizeStatementDigest("SELECT   42  FROM   t1", 0)
 	if a != b {
 		t.Errorf("hashes should match for queries that normalize identically, got %q vs %q", a, b)
 	}
@@ -71,7 +71,7 @@ func TestNormalizeStatementDigest_UnaryOperators(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, got := normalizeStatementDigest(tc.in)
+			_, got := normalizeStatementDigest(tc.in, 0)
 			if got != tc.want {
 				t.Errorf("normalize(%q)\n got  %q\nwant %q", tc.in, got, tc.want)
 			}
@@ -91,7 +91,7 @@ func TestNormalizeStatementDigest_UnaryDigestAllVariants(t *testing.T) {
 	}
 	want := "SELECT ? FROM `expect_unary`"
 	for _, q := range queries {
-		_, got := normalizeStatementDigest(q)
+		_, got := normalizeStatementDigest(q, 0)
 		if got != want {
 			t.Errorf("normalize(%q)\n got  %q\nwant %q", q, got, want)
 		}
@@ -99,11 +99,11 @@ func TestNormalizeStatementDigest_UnaryDigestAllVariants(t *testing.T) {
 }
 
 func TestNormalizeStatementDigest_CommentsStripped(t *testing.T) {
-	_, got := normalizeStatementDigest("SELECT 1 /* hello */ + 1")
+	_, got := normalizeStatementDigest("SELECT 1 /* hello */ + 1", 0)
 	if strings.Contains(got, "hello") {
 		t.Errorf("block comment should be stripped: %q", got)
 	}
-	_, got = normalizeStatementDigest("SELECT 1; # trailing\n")
+	_, got = normalizeStatementDigest("SELECT 1; # trailing\n", 0)
 	if strings.Contains(got, "trailing") {
 		t.Errorf("hash comment should be stripped: %q", got)
 	}

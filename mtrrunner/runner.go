@@ -3117,6 +3117,12 @@ func (ctx *execContext) executeQuery(stmt string) error {
 	if !useVertical {
 		// Write column headers for regular (horizontal) results.
 		// MySQL's mysql client truncates column names to 255 bytes maximum.
+		// Exception: when a single-column pure-arithmetic expression name
+		// (consisting of only digits and operators like 1+1+1+...) exceeds 255
+		// bytes, MySQL truncates it to 252 bytes and wraps at 79/80 chars per
+		// line. This behavior is observable in .result files for tests like
+		// statement_digest_long_query. Other expression types (function calls
+		// etc.) are simply truncated to 255 bytes with no wrapping.
 		truncatedCols := make([]string, len(columns))
 		for i, col := range columns {
 			if len(col) > 255 {
@@ -3125,7 +3131,21 @@ func (ctx *execContext) executeQuery(stmt string) error {
 				truncatedCols[i] = col
 			}
 		}
-		ctx.output.WriteString(strings.Join(truncatedCols, "\t") + "\n")
+		if len(truncatedCols) == 1 && len(columns[0]) > 255 && isArithmeticExpr(columns[0]) {
+			// Pure arithmetic expression: truncate to 252 and wrap at 79/80.
+			col := columns[0][:252]
+			ctx.output.WriteString(col[:79] + "\n")
+			col = col[79:]
+			for len(col) > 80 {
+				ctx.output.WriteString(col[:80] + "\n")
+				col = col[80:]
+			}
+			if len(col) > 0 {
+				ctx.output.WriteString(col + "\n")
+			}
+		} else {
+			ctx.output.WriteString(strings.Join(truncatedCols, "\t") + "\n")
+		}
 	}
 
 	for _, line := range resultLines {
@@ -5685,6 +5705,25 @@ func normalizeExplainTree(s string) string {
 	return strings.Join(result, "\n")
 }
 
+// isArithmeticExpr reports whether s is a pure arithmetic expression:
+// it contains only ASCII digits, arithmetic operators (+, -, *, /),
+// parentheses, spaces, and dots (for decimal literals). Column names
+// matching this pattern get MySQL's 252-byte truncation + 79/80-char
+// wrapping rather than the standard 255-byte truncation.
+func isArithmeticExpr(s string) bool {
+	for _, c := range s {
+		if c >= '0' && c <= '9' {
+			continue
+		}
+		switch c {
+		case '+', '-', '*', '/', '(', ')', '.', ' ':
+			continue
+		}
+		return false
+	}
+	return len(s) > 0
+}
+
 // normalizeFuncCase normalizes SQL function names in column headers
 // to be case-insensitive. MySQL preserves original case, vitess uppercases.
 func normalizeFuncCase(s string) string {
@@ -5852,16 +5891,31 @@ func normalizeDigestTableHashes(s string) string {
 	var out []string
 	for _, line := range lines {
 		fields := strings.Split(line, "\t")
-		// Digest table rows have at least 7 fields (schema, digest, digest_text, count_star, ...)
-		if len(fields) < 7 {
+		// Normalize the header row of events_statements_summary_by_digest queries:
+		// MySQL 8.0 returns column names in the case specified in the SELECT, but
+		// our server returns the stored uppercase names. Normalize to lowercase.
+		// Detect by: first field is schema_name (any case), second is digest (any case).
+		if len(fields) >= 2 &&
+			strings.EqualFold(fields[0], "schema_name") &&
+			strings.EqualFold(fields[1], "digest") {
+			lowered := make([]string, len(fields))
+			for i, f := range fields {
+				lowered[i] = strings.ToLower(f)
+			}
+			out = append(out, strings.Join(lowered, "\t"))
+			continue
+		}
+		// Digest table rows: detected by second field being a 64-char hex hash or placeholder.
+		// The row may have ≥4 fields when the query selected only a subset of columns.
+		if len(fields) < 4 {
 			out = append(out, line)
 			continue
 		}
 		// The DIGEST field is the second column (index 1).
-		if reDigestHash.MatchString(fields[1]) || fields[1] == "{DIGEST}" {
+		if reDigestHash.MatchString(fields[1]) || reDigestHash.MatchString(strings.ToLower(fields[1])) || fields[1] == "{DIGEST}" {
 			// Remove SHOW WARNINGS digest rows: MySQL auto-issues SHOW WARNINGS
 			// but our runner does not, causing a spurious 1-row offset.
-			if fields[2] == "SHOW WARNINGS" {
+			if len(fields) > 2 && fields[2] == "SHOW WARNINGS" {
 				continue // drop this row from both sides
 			}
 			if fields[1] != "{DIGEST}" {

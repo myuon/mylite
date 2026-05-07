@@ -21,16 +21,28 @@ import (
 //   - Repeating value tuples like `(1,2),(3,4),...` are collapsed to `(...) /* , ... */`
 //   - NULL in IS NULL / IS NOT NULL and NOT NULL constraints is kept as a keyword
 //
+// maxDigestLength mirrors performance_schema_max_digest_length: the token
+// stream is truncated to maxDigestLength/2 tokens before rendering. Pass 0
+// to disable truncation.
+//
 // This is a best-effort approximation; exact byte-for-byte equality with
 // MySQL's digest is not guaranteed because MySQL's tokenizer applies many
 // dialect-specific rules (PARSER_TOKEN_*) that are out of scope.
-func normalizeStatementDigest(query string) (digest string, digestText string) {
+func normalizeStatementDigest(query string, maxDigestLength int) (digest string, digestText string) {
 	tokens := tokenizeForDigest(query)
 	tokens = reclassifyNullTokens(tokens)
 	tokens = collapseUnaryOperators(tokens)
 	tokens = collapseInsideParenLiterals(tokens)
 	tokens = collapseValueLists(tokens)
 	tokens = collapseTopLevelLiteralList(tokens)
+	// Truncate token stream to maxDigestLength/2 tokens, matching MySQL's
+	// internal 2-bytes-per-token representation of performance_schema_max_digest_length.
+	if maxDigestLength > 0 {
+		maxTokens := maxDigestLength / 2
+		if len(tokens) > maxTokens {
+			tokens = tokens[:maxTokens]
+		}
+	}
 	digestText = strings.TrimSpace(joinDigestTokens(tokens))
 	h := sha256.Sum256([]byte(digestText))
 	digest = hex.EncodeToString(h[:])

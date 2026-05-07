@@ -7483,8 +7483,15 @@ func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, er
 				e.psTruncated = make(map[string]bool)
 			}
 			e.psTruncated[lowerTable] = true
-			synth := fmt.Sprintf("TRUNCATE TABLE performance_schema.%s", lowerTable)
-			digest, digestText := normalizeStatementDigest(synth)
+			// Build synth preserving the schema qualifier when it was specified
+			// in the original statement (e.g. TRUNCATE TABLE performance_schema.t).
+			var synth string
+			if q := stmt.Table.Qualifier.String(); q != "" {
+				synth = fmt.Sprintf("TRUNCATE TABLE %s.%s", q, lowerTable)
+			} else {
+				synth = fmt.Sprintf("TRUNCATE TABLE %s", lowerTable)
+			}
+			digest, digestText := normalizeStatementDigest(synth, 0)
 			now := time.Now().UTC().Format("2006-01-02 15:04:05.000000")
 			e.psDigests = append(e.psDigests, psDigestEntry{
 				SchemaName:      e.CurrentDB,

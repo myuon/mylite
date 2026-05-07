@@ -2239,9 +2239,16 @@ func (e *Executor) recordStatementDigest(query string) {
 	}
 	// Also skip when in performance_schema database and the query is a SELECT/SHOW
 	// that implicitly targets PS tables (no schema prefix in query).
+	// Exception: pure-computation SELECTs (no FROM clause) are always recorded,
+	// matching MySQL's behavior for queries like "SELECT 1+1+...".
 	if e.CurrentDB == "performance_schema" &&
-		(strings.HasPrefix(upperQ, "SELECT") || strings.HasPrefix(upperQ, "SHOW") ||
-			strings.HasPrefix(upperQ, "(SELECT") || strings.HasPrefix(upperQ, "DESC")) {
+		(strings.HasPrefix(upperQ, "SHOW") ||
+			strings.HasPrefix(upperQ, "DESC")) {
+		return
+	}
+	if e.CurrentDB == "performance_schema" &&
+		(strings.HasPrefix(upperQ, "SELECT") || strings.HasPrefix(upperQ, "(SELECT")) &&
+		strings.Contains(upperQ, " FROM ") {
 		return
 	}
 	// Honor performance_schema_digests_size = 0 (disabled).
@@ -2254,7 +2261,13 @@ func (e *Executor) recordStatementDigest(query string) {
 			maxSize = n
 		}
 	}
-	digest, digestText := normalizeStatementDigest(trimmed)
+	maxDigestLength := 1024 // default performance_schema_max_digest_length
+	if v, ok := e.startupVars["performance_schema_max_digest_length"]; ok {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxDigestLength = n
+		}
+	}
+	digest, digestText := normalizeStatementDigest(trimmed, maxDigestLength)
 	schemaName := e.CurrentDB
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000000")
 	for i := range e.psDigests {
