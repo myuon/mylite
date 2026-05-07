@@ -5945,15 +5945,38 @@ func (e *Executor) perfSchemaVariablesInfo() []storage.Row {
 		if _, ok := e.startupVars[n]; ok {
 			source = "COMMAND_LINE"
 		}
+		// Check if this variable was overridden via SET GLOBAL (dynamic).
+		// Variables in globalScopeVars were explicitly set at runtime.
+		if source == "COMPILED" {
+			var inGlobal bool
+			if e.globalVarsMu != nil {
+				e.globalVarsMu.RLock()
+				_, inGlobal = e.globalScopeVars[n]
+				e.globalVarsMu.RUnlock()
+			} else {
+				_, inGlobal = e.globalScopeVars[n]
+			}
+			if inGlobal {
+				source = "DYNAMIC"
+			}
+		}
+		var setTime interface{}
+		var setUser interface{}
+		var setHost interface{}
+		if source == "DYNAMIC" {
+			setTime = time.Now()
+			setUser = "root"
+			setHost = "localhost"
+		}
 		rows = append(rows, storage.Row{
 			"VARIABLE_NAME":   n,
 			"VARIABLE_SOURCE": source,
 			"VARIABLE_PATH":   "",
 			"MIN_VALUE":       "0",
 			"MAX_VALUE":       "0",
-			"SET_TIME":        nil,
-			"SET_USER":        nil,
-			"SET_HOST":        nil,
+			"SET_TIME":        setTime,
+			"SET_USER":        setUser,
+			"SET_HOST":        setHost,
 		})
 	}
 	return rows

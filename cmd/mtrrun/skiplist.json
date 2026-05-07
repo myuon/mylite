@@ -3961,10 +3961,6 @@
       "reason": "complex: warnings + transaction blocking required"
     },
     {
-      "test": "sys_vars/log_error_suppression_list_basic",
-      "reason": "complex validation logic needed"
-    },
-    {
       "test": "sys_vars/sql_buffer_result_func",
       "reason": "Created_tmp_tables not tracking correctly"
     },
