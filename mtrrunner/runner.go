@@ -3125,7 +3125,25 @@ func (ctx *execContext) executeQuery(stmt string) error {
 				truncatedCols[i] = col
 			}
 		}
-		ctx.output.WriteString(strings.Join(truncatedCols, "\t") + "\n")
+		// For single-column results where the column name exceeds 252 bytes,
+		// MySQL truncates it to 252 bytes and then wraps the output at 79 chars
+		// for the first line and 80 chars for subsequent lines (matching the
+		// mysql client terminal-width display behavior). This is only triggered
+		// when the column name exceeds the 252-byte expression-name limit.
+		if len(truncatedCols) == 1 && len(truncatedCols[0]) > 252 {
+			col := truncatedCols[0][:252]
+			ctx.output.WriteString(col[:79] + "\n")
+			col = col[79:]
+			for len(col) > 80 {
+				ctx.output.WriteString(col[:80] + "\n")
+				col = col[80:]
+			}
+			if len(col) > 0 {
+				ctx.output.WriteString(col + "\n")
+			}
+		} else {
+			ctx.output.WriteString(strings.Join(truncatedCols, "\t") + "\n")
+		}
 	}
 
 	for _, line := range resultLines {
@@ -5852,16 +5870,31 @@ func normalizeDigestTableHashes(s string) string {
 	var out []string
 	for _, line := range lines {
 		fields := strings.Split(line, "\t")
-		// Digest table rows have at least 7 fields (schema, digest, digest_text, count_star, ...)
-		if len(fields) < 7 {
+		// Normalize the header row of events_statements_summary_by_digest queries:
+		// MySQL 8.0 returns column names in the case specified in the SELECT, but
+		// our server returns the stored uppercase names. Normalize to lowercase.
+		// Detect by: first field is schema_name (any case), second is digest (any case).
+		if len(fields) >= 2 &&
+			strings.EqualFold(fields[0], "schema_name") &&
+			strings.EqualFold(fields[1], "digest") {
+			lowered := make([]string, len(fields))
+			for i, f := range fields {
+				lowered[i] = strings.ToLower(f)
+			}
+			out = append(out, strings.Join(lowered, "\t"))
+			continue
+		}
+		// Digest table rows: detected by second field being a 64-char hex hash or placeholder.
+		// The row may have ≥4 fields when the query selected only a subset of columns.
+		if len(fields) < 4 {
 			out = append(out, line)
 			continue
 		}
 		// The DIGEST field is the second column (index 1).
-		if reDigestHash.MatchString(fields[1]) || fields[1] == "{DIGEST}" {
+		if reDigestHash.MatchString(fields[1]) || reDigestHash.MatchString(strings.ToLower(fields[1])) || fields[1] == "{DIGEST}" {
 			// Remove SHOW WARNINGS digest rows: MySQL auto-issues SHOW WARNINGS
 			// but our runner does not, causing a spurious 1-row offset.
-			if fields[2] == "SHOW WARNINGS" {
+			if len(fields) > 2 && fields[2] == "SHOW WARNINGS" {
 				continue // drop this row from both sides
 			}
 			if fields[1] != "{DIGEST}" {
