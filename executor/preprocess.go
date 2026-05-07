@@ -662,6 +662,12 @@ func (e *Executor) preprocessQuery(query string) (string, *Result, error) {
 
 	// Rewrite "SOUNDS LIKE" to SOUNDEX comparison so vitess can parse it
 	if strings.Contains(upper, "SOUNDS LIKE") {
+		// Handle parenthesized variants first: (expr)SOUNDS LIKE(expr)
+		slReParen := regexp.MustCompile(`(?i)\(('(?:[^'\\]|\\.)*'|0x[0-9a-fA-F]+|\w+)\)\s*SOUNDS\s+LIKE\s*\(('(?:[^'\\]|\\.)*'|0x[0-9a-fA-F]+|\w+)\)`)
+		query = slReParen.ReplaceAllString(query, "SOUNDEX($1) = SOUNDEX($2)")
+		trimmed = strings.TrimSpace(query)
+		upper = strings.ToUpper(trimmed)
+		// Handle unparenthesized variants: expr SOUNDS LIKE expr
 		slRe := regexp.MustCompile(`(?i)('(?:[^'\\]|\\.)*'|\w+)\s+SOUNDS\s+LIKE\s+('(?:[^'\\]|\\.)*'|\w+)`)
 		query = slRe.ReplaceAllString(query, "SOUNDEX($1) = SOUNDEX($2)")
 		trimmed = strings.TrimSpace(query)

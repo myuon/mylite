@@ -115,6 +115,10 @@ func extractSpatialPointCoord(wkt string, prop sqlparser.PointPropertyType) (int
 // setSpatialPointCoord sets a coordinate on a WKT POINT and returns the modified WKT.
 // Preserves EWKT SRID prefix if present.
 func setSpatialPointCoord(wkt string, prop sqlparser.PointPropertyType, newVal interface{}) (interface{}, error) {
+	// MySQL: ST_X/ST_Y/ST_Latitude/ST_Longitude with NULL new value returns NULL
+	if newVal == nil {
+		return nil, nil
+	}
 	srid := geomGetSRID(wkt)
 	coords := parseSpatialPointCoords(wkt) // parseSpatialPointCoords strips SRID internally
 	if coords == nil {

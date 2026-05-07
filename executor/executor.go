@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1100,12 +1101,17 @@ func (e *Executor) normalizeOptimizerSwitchInput(newValue string, expr sqlparser
 		return "default", nil
 	}
 
-	// String value: validate — must contain '=' in each comma-separated part
+	// String value: validate — must contain '=' in each comma-separated part,
 	// or be "default". Bare words like "index_merge" or "foobar" are invalid.
+	// MySQL allows "default,flag=on" to reset first then apply flags.
 	stripped := strings.Trim(trimmed, "'\"")
 	for _, part := range strings.Split(stripped, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
+			continue
+		}
+		// "default" is valid: resets to compiled default before applying remaining flags
+		if strings.EqualFold(part, "default") {
 			continue
 		}
 		if !strings.Contains(part, "=") {
@@ -7394,6 +7400,12 @@ func (e *Executor) execOtherAdmin(query string) (*Result, error) {
 			}
 		}()
 		if evalErr != nil {
+			// Suppress intOverflowError (large hex literals) — MySQL would produce a warning
+			// and return NULL rather than raising a fatal error.
+			var intOvErr *intOverflowError
+			if errors.As(evalErr, &intOvErr) {
+				return &Result{AffectedRows: 0}, nil
+			}
 			return nil, evalErr
 		}
 		return &Result{AffectedRows: 0}, nil
