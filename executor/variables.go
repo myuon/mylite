@@ -757,6 +757,51 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 			if name == "collation_database" {
 				e.addWarning("Warning", 1681, "Updating 'collation_database' is deprecated. It will be made read-only in a future release.")
 			}
+		case "log_error_suppression_list":
+			// Validate comma-separated list of error code specifiers.
+			// Empty string is always valid. NULL is rejected above (sysVarStringType).
+			if !strings.EqualFold(val, "DEFAULT") && val != "" {
+				// Check if log_filter_internal is in log_error_services.
+				// If it is not, no suppression rules can be added → reject any non-empty value.
+				services, ok := e.getSysVar("log_error_services")
+				if !ok {
+					services, _ = e.getCompiledDefault("log_error_services")
+				}
+				// truncateLogErrVal truncates the value to 200 chars for error messages
+				// (MySQL caps the error message length for this variable).
+				truncateLogErrVal := func(s string) string {
+					if len(s) > 200 {
+						return s[:200]
+					}
+					return s
+				}
+				if !strings.Contains(strings.ToLower(services), "log_filter_internal") {
+					e.addWarning("Warning", 3735, fmt.Sprintf(`log_error_suppression_list: Could not add suppression rule for code "%s". Rule-set may be full, or code may not correspond to an error-log message.`, val))
+					return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'log_error_suppression_list' can't be set to the value of '%s'", truncateLogErrVal(val)))
+				}
+				entries := strings.Split(val, ",")
+				// Enforce 509-item limit (511 total slots minus 2 built-in rules).
+				if len(entries) > 509 {
+					return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'log_error_suppression_list' can't be set to the value of '%s'", truncateLogErrVal(val)))
+				}
+				// Find the first invalid entry.
+				hasInvalid := false
+				for _, raw := range entries {
+					if !isValidLogErrSuppressionEntry(strings.TrimSpace(raw)) {
+						hasInvalid = true
+						break
+					}
+				}
+				if hasInvalid {
+					badCode := logErrSuppressionBadCode(val)
+					e.addWarning("Warning", 3735, fmt.Sprintf(`log_error_suppression_list: Could not add suppression rule for code "%s". Rule-set may be full, or code may not correspond to an error-log message.`, badCode))
+					return nil, mysqlError(1231, "42000", fmt.Sprintf("Variable 'log_error_suppression_list' can't be set to the value of '%s'", truncateLogErrVal(val)))
+				}
+			}
+			if strings.EqualFold(val, "DEFAULT") {
+				val = ""
+			}
+			e.setSysVar(cleanVarName, val, scope == sqlparser.GlobalScope || isPersistScope)
 		default:
 			// Store any SET GLOBAL/SESSION variable for later retrieval
 			if name != "" {
@@ -1980,6 +2025,29 @@ func (e *Executor) handleRawSet(raw string) error {
 		}
 		val = strings.TrimSuffix(val, ";")
 		val = strings.TrimSpace(val)
+		// log_error_suppression_list: detect unquoted comma-separated identifiers (e.g.,
+		// SET ... = ER_PARSER_TRACE,ER_SERVER_SHUTDOWN_INFO). MySQL's parser sees the comma
+		// as a SET-item separator and fails because what follows lacks "= value".
+		// Return ER_PARSE_ERROR to match MySQL behavior.
+		if varName == "log_error_suppression_list" && strings.Contains(val, ",") &&
+			!strings.HasPrefix(val, "'") && !strings.HasPrefix(val, "\"") &&
+			!strings.HasPrefix(val, "`") {
+			// If findRawSetVarSeparator found no multi-var separator (commaIdx was -1),
+			// but the value has a comma with a following identifier (no '='), it's a parse error.
+			commaIdx := strings.Index(val, ",")
+			if commaIdx >= 0 {
+				after := strings.TrimSpace(val[commaIdx+1:])
+				// Check if what follows looks like a bare identifier without '='
+				j := 0
+				for j < len(after) && (after[j] == '_' || (after[j] >= 'a' && after[j] <= 'z') ||
+					(after[j] >= 'A' && after[j] <= 'Z') || (after[j] >= '0' && after[j] <= '9')) {
+					j++
+				}
+				if j > 0 && (j >= len(after) || after[j] != '=') {
+					return mysqlError(1064, "42000", fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '%s' at line 1", after[:j]))
+				}
+			}
+		}
 		// Reject NULL for string-type system variables
 		if strings.ToUpper(val) == "NULL" && sysVarStringType[varName] {
 			return mysqlError(1231, "42000", fmt.Sprintf("Variable '%s' can't be set to the value of 'NULL'", varName))
@@ -2870,6 +2938,8 @@ var sysVarAcceptIdentifier = map[string]bool{
 	"init_slave":   true,
 	"init_replica": true,
 	"init_connect": true,
+	// log_error_suppression_list accepts bare identifiers like ER_PARSER_TRACE as error code names
+	"log_error_suppression_list": true,
 }
 
 // sysVarStringType contains system variables that are string types and reject NULL values.
@@ -2967,6 +3037,9 @@ var sysVarPureStringType = map[string]bool{
 	"init_slave":   true,
 	"init_replica": true,
 	"init_connect": true,
+	// log_error_suppression_list rejects numeric literals (e.g., SET ... = 10000) with ER_WRONG_TYPE_FOR_VAR
+	// but accepts quoted strings and bare identifiers like ER_PARSER_TRACE.
+	"log_error_suppression_list": true,
 }
 
 // checkIntVarType checks if the expression is a valid integer type for integer-range
@@ -4384,6 +4457,97 @@ func validateRedoLogArchiveDirs(val string) bool {
 	return true
 }
 
+// isValidLogErrSuppressionEntry returns true if a single (already-trimmed) entry
+// from log_error_suppression_list is a valid error code specifier.
+// Valid forms:
+//   - "MY-<digits>" where numeric value is 1-99 (globerrs) or 10000-99999 (server range)
+//   - Pure digits where numeric value is 1-99 or 10000-99999
+//   - "ER_<IDENT>" — named MySQL error code (accepted as-is without table lookup)
+func isValidLogErrSuppressionEntry(entry string) bool {
+	if entry == "" {
+		return false
+	}
+	upper := strings.ToUpper(entry)
+	// MY-<digits> form
+	if strings.HasPrefix(upper, "MY-") {
+		digits := entry[3:]
+		if len(digits) == 0 {
+			return false
+		}
+		for _, c := range digits {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		n, err := strconv.ParseInt(digits, 10, 64)
+		if err != nil {
+			return false
+		}
+		return (n >= 1 && n <= 99) || (n >= 10000 && n <= 99999)
+	}
+	// ER_<IDENT> named error code form
+	if strings.HasPrefix(upper, "ER_") {
+		rest := entry[3:]
+		if len(rest) == 0 {
+			return false
+		}
+		for _, c := range rest {
+			if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+				return false
+			}
+		}
+		return true
+	}
+	// Pure digits form
+	for _, c := range entry {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	n, err := strconv.ParseInt(entry, 10, 64)
+	if err != nil {
+		return false
+	}
+	return (n >= 1 && n <= 99) || (n >= 10000 && n <= 99999)
+}
+
+// logErrSuppressionBadCode computes the "bad code" string for warning 3735 when
+// log_error_suppression_list validation fails. It returns the suffix of val starting
+// at the first invalid entry, or the part after the first whitespace for space-in-entry cases.
+func logErrSuppressionBadCode(val string) string {
+	entries := strings.Split(val, ",")
+	pos := 0 // byte offset in val pointing to the start of the current entry
+	for _, raw := range entries {
+		trimmed := strings.TrimSpace(raw)
+		if !isValidLogErrSuppressionEntry(trimmed) {
+			// For entries with internal whitespace (e.g., "10000 10001"), MySQL reports
+			// the token after the first space as the bad code (when the prefix is valid).
+			if strings.ContainsAny(trimmed, " \t") {
+				spaceIdx := strings.IndexAny(raw, " \t")
+				if spaceIdx >= 0 {
+					prefix := strings.TrimSpace(raw[:spaceIdx])
+					if isValidLogErrSuppressionEntry(prefix) {
+						return strings.TrimSpace(raw[spaceIdx+1:])
+					}
+				}
+			}
+			// Normal case: return the suffix of val from the position of this entry.
+			return val[pos:]
+		}
+		pos += len(raw) + 1 // +1 for the separating comma
+	}
+	return val
+}
+
+// sysVarForceStringDisplay contains system variables whose values must always
+// be displayed as strings (no integer/float conversion), even when the value
+// looks like a number. This preserves leading zeros and string semantics.
+var sysVarForceStringDisplay = map[string]bool{
+	// log_error_suppression_list stores numeric codes with optional leading zeros.
+	// "0000000000000010000" must display verbatim, not as integer 10000.
+	"log_error_suppression_list": true,
+}
+
 // sysVarStringToSelectValueForVar converts with variable name awareness.
 // For enum-type variables, ON/OFF strings are preserved; for booleans they become 0/1.
 func sysVarStringToSelectValueForVar(val string, varName string) interface{} {
@@ -4394,6 +4558,10 @@ func sysVarStringToSelectValueForVar(val string, varName string) interface{} {
 	// Sentinel-NULL variables use "\x00" to distinguish NULL from empty string.
 	if val == "\x00" && sysVarNullSentinel[varName] {
 		return nil
+	}
+	// Force-string variables always return the raw string without numeric conversion.
+	if sysVarForceStringDisplay[varName] {
+		return val
 	}
 	upper := strings.ToUpper(val)
 	// For enum variables, don't convert ON/OFF to 0/1
