@@ -19,7 +19,8 @@ func TestNormalizeStatementDigest_Basic(t *testing.T) {
 		{"insert_multi_rows", "INSERT INTO t1 VALUES (1), (2), (3)", "INSERT INTO `t1` VALUES (?) /* , ... */"},
 		{"insert_paired_rows", "INSERT INTO t3 VALUES (1, 2), (3, 4)", "INSERT INTO `t3` VALUES (...) /* , ... */"},
 		{"in_list", "SELECT * FROM t1 WHERE a IN (1, 2, 3)", "SELECT * FROM `t1` WHERE `a` IN (...)"},
-		{"in_list_one", "SELECT * FROM t1 WHERE a IN (1)", "SELECT * FROM `t1` WHERE `a` IN (?)"},
+		// MySQL collapses IN (single_value) to IN (...) as well
+		{"in_list_one", "SELECT * FROM t1 WHERE a IN (1)", "SELECT * FROM `t1` WHERE `a` IN (...)"},
 		{"truncate_ps_table", "TRUNCATE TABLE performance_schema.events_statements_summary_by_digest",
 			"TRUNCATE TABLE `performance_schema` . `events_statements_summary_by_digest`"},
 		{"whitespace_collapsed", "SELECT       1     +    1", "SELECT ? + ?"},

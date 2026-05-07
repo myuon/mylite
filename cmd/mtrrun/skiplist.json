@@ -3385,10 +3385,6 @@
       "reason": "output mismatch, timeout, or error"
     },
     {
-      "test": "perfschema/statement_digest",
-      "reason": "output mismatch, timeout, or error"
-    },
-    {
       "test": "perfschema/statement_digest_consumers",
       "reason": "output mismatch, timeout, or error"
     },
