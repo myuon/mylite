@@ -1700,6 +1700,13 @@ func isClusterPreferredUniqueIndex(idx catalog.IndexDef, cols []catalog.ColumnDe
 	return true
 }
 
+func databaseCollationForShow(db *catalog.Database) string {
+	if db.CollationName != "" {
+		return db.CollationName
+	}
+	return "utf8mb4_0900_ai_ci"
+}
+
 func (e *Executor) showCreateProcedure(procName string) (*Result, error) {
 	dbName := e.CurrentDB
 	if strings.Contains(procName, ".") {
@@ -1738,7 +1745,7 @@ func (e *Executor) showCreateProcedure(procName string) (*Result, error) {
 	}
 	return &Result{
 		Columns:     []string{"Procedure", "sql_mode", "Create Procedure", "character_set_client", "collation_connection", "Database Collation"},
-		Rows:        [][]interface{}{{procDef.Name, e.sqlMode, createSQL, charSetClient, collationConn, "utf8mb4_0900_ai_ci"}},
+		Rows:        [][]interface{}{{procDef.Name, e.sqlMode, createSQL, charSetClient, collationConn, databaseCollationForShow(db)}},
 		IsResultSet: true,
 	}, nil
 }
@@ -1781,7 +1788,7 @@ func (e *Executor) showCreateFunction(funcName string) (*Result, error) {
 	}
 	return &Result{
 		Columns:     []string{"Function", "sql_mode", "Create Function", "character_set_client", "collation_connection", "Database Collation"},
-		Rows:        [][]interface{}{{funcDef.Name, e.sqlMode, createSQL, charSetClientFn, collationConnFn, "utf8mb4_0900_ai_ci"}},
+		Rows:        [][]interface{}{{funcDef.Name, e.sqlMode, createSQL, charSetClientFn, collationConnFn, databaseCollationForShow(db)}},
 		IsResultSet: true,
 	}, nil
 }
@@ -2035,7 +2042,7 @@ func (e *Executor) showRoutineStatus(routineType string, rest string) (*Result, 
 				rows = append(rows, []interface{}{
 					dbName, name, "FUNCTION", "root@localhost",
 					now, now, secType, funcDef.Comment,
-					csClient, collConn, "utf8mb4_0900_ai_ci",
+					csClient, collConn, databaseCollationForShow(db),
 				})
 			}
 		} else {
@@ -2066,7 +2073,7 @@ func (e *Executor) showRoutineStatus(routineType string, rest string) (*Result, 
 				rows = append(rows, []interface{}{
 					dbName, name, "PROCEDURE", "root@localhost",
 					now, now, secType, procDef.Comment,
-					csClient, collConn, "utf8mb4_0900_ai_ci",
+					csClient, collConn, databaseCollationForShow(db),
 				})
 			}
 		}
