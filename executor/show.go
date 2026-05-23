@@ -1063,7 +1063,7 @@ func (e *Executor) execShow(stmt *sqlparser.Show, query string) (*Result, error)
 				nil,
 				"Daemon",
 				int64(0),
-				"Waiting for next activation",
+				"Waiting on empty queue",
 				nil,
 			}}, rows...)
 		}
