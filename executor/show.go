@@ -1732,7 +1732,7 @@ func (e *Executor) showCreateProcedure(procName string) (*Result, error) {
 		body := strings.Join(procDef.Body, ";\n")
 		createSQL = fmt.Sprintf("CREATE DEFINER=`root`@`localhost` PROCEDURE `%s`(%s)\nBEGIN\n%s;\nEND", procDef.Name, strings.Join(paramParts, ", "), body)
 	} else {
-		createSQL = normalizeCreateRoutine(createSQL, "PROCEDURE", procDef.Name)
+		createSQL = normalizeCreateRoutine(createSQL, "PROCEDURE", procDef.Name, "", "")
 	}
 	// Use the connection's current character set and collation (set via SET NAMES).
 	charSetClient := "utf8mb4"
@@ -1775,7 +1775,11 @@ func (e *Executor) showCreateFunction(funcName string) (*Result, error) {
 		body := strings.Join(funcDef.Body, ";\n")
 		createSQL = fmt.Sprintf("CREATE DEFINER=`root`@`localhost` FUNCTION `%s`(%s) RETURNS %s\nBEGIN\n%s;\nEND", funcDef.Name, strings.Join(paramParts, ", "), funcDef.ReturnType, body)
 	} else {
-		createSQL = normalizeCreateRoutine(createSQL, "FUNCTION", funcDef.Name)
+		dbCharset := db.CharacterSet
+		if dbCharset == "" {
+			dbCharset = "utf8mb4"
+		}
+		createSQL = normalizeCreateRoutine(createSQL, "FUNCTION", funcDef.Name, dbCharset, databaseCollationForShow(db))
 	}
 	// Use the connection's current character set and collation (set via SET NAMES).
 	charSetClientFn := "utf8mb4"
@@ -1850,9 +1854,20 @@ func normalizeReturnType(t string) string {
 	return strings.ToLower(t)
 }
 
+func isStringReturnType(t string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(t))
+	for _, prefix := range []string{"CHAR", "VARCHAR", "TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT", "ENUM", "SET"} {
+		if strings.HasPrefix(upper, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // normalizeCreateRoutine transforms a user-provided CREATE FUNCTION/PROCEDURE SQL
 // into MySQL's canonical SHOW CREATE output format.
-func normalizeCreateRoutine(originalSQL string, routineType string, routineName string) string {
+// dbCharset and dbCollation are used to append CHARSET/COLLATE suffix to string RETURNS types.
+func normalizeCreateRoutine(originalSQL string, routineType string, routineName string, dbCharset, dbCollation string) string {
 	// Remove leading/trailing whitespace
 	sql := strings.TrimSpace(originalSQL)
 
@@ -1923,6 +1938,9 @@ func normalizeCreateRoutine(originalSQL string, routineType string, routineName 
 			}
 			// Normalize type
 			returnType = normalizeReturnType(returnType)
+			if dbCharset != "" && dbCollation != "" && isStringReturnType(returnType) && !strings.Contains(strings.ToUpper(returnType), "CHARSET") {
+				returnType += fmt.Sprintf(" CHARSET %s COLLATE %s", dbCharset, dbCollation)
+			}
 			rest = beforeReturns + "RETURNS " + returnType + afterType
 		}
 	}
