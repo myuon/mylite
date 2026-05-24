@@ -49,6 +49,37 @@ func normalizePartitionName(name string) string {
 	return string(result)
 }
 
+// alterTableOptionsDropBeforeAdd reorders ALTER TABLE options so every DROP COLUMN
+// runs before any ADD COLUMN when both appear in the same statement. MySQL allows
+// column replacement in one ALTER (e.g. DROP COLUMN d, ADD COLUMN c) and also accepts
+// ADD before DROP in the SQL text but executes drops first.
+func alterTableOptionsDropBeforeAdd(opts []sqlparser.AlterOption) []sqlparser.AlterOption {
+	hasDropCol, hasAddCol := false, false
+	for _, opt := range opts {
+		switch opt.(type) {
+		case *sqlparser.DropColumn:
+			hasDropCol = true
+		case *sqlparser.AddColumns:
+			hasAddCol = true
+		}
+	}
+	if !hasDropCol || !hasAddCol {
+		return opts
+	}
+	ordered := make([]sqlparser.AlterOption, 0, len(opts))
+	for _, opt := range opts {
+		if _, ok := opt.(*sqlparser.DropColumn); ok {
+			ordered = append(ordered, opt)
+		}
+	}
+	for _, opt := range opts {
+		if _, ok := opt.(*sqlparser.DropColumn); !ok {
+			ordered = append(ordered, opt)
+		}
+	}
+	return ordered
+}
+
 // disallowedPartitionFunctions is the set of function names not allowed in partition expressions.
 // MySQL allows only a specific subset of functions; these are explicitly disallowed.
 var disallowedPartitionFunctions = map[string]bool{
@@ -5038,7 +5069,7 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 		}
 	}
 
-	for _, opt := range stmt.AlterOptions {
+	for _, opt := range alterTableOptionsDropBeforeAdd(stmt.AlterOptions) {
 		switch op := opt.(type) {
 
 		case *sqlparser.AddColumns:
