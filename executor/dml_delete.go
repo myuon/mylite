@@ -666,6 +666,8 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 
 	if affected > 0 {
 		e.touchTableUpdateTime(deleteDB, tableName)
+		e.bumpInnoDBMetric("dml_deletes", int64(affected))
+		e.bumpInnoDBDMLReads(2)
 	}
 	return &Result{AffectedRows: affected}, nil
 }

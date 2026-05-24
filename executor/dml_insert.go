@@ -618,6 +618,8 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 
 		if affected > 0 {
 			e.touchTableUpdateTime(insertDB, tableName)
+			e.bumpInnoDBMetric("dml_inserts", 1)
+			e.touchInnoDBBufferPageWritten(insertDB, tableName, int64(affected))
 			if db, dbErr := e.Catalog.GetDatabase(insertDB); dbErr == nil {
 				if def, defErr := db.GetTable(tableName); defErr == nil && e.innodbStatsAutoRecalcEnabled(def) && e.innodbStatsPersistentEnabled(def) {
 					e.maybeRecalcStats(insertDB, tableName, int64(affected))
@@ -2780,6 +2782,8 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	// Auto-recalc InnoDB persistent stats after DML (MySQL 10% threshold)
 	if affected > 0 {
 		e.touchTableUpdateTime(insertDB, tableName)
+		e.bumpInnoDBMetric("dml_inserts", 1)
+		e.touchInnoDBBufferPageWritten(insertDB, tableName, int64(affected))
 		if db, dbErr := e.Catalog.GetDatabase(insertDB); dbErr == nil {
 			if def, defErr := db.GetTable(tableName); defErr == nil && e.innodbStatsAutoRecalcEnabled(def) && e.innodbStatsPersistentEnabled(def) {
 				e.maybeRecalcStats(insertDB, tableName, int64(affected))

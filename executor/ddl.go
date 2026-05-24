@@ -3070,6 +3070,7 @@ func (e *Executor) execCreateTable(stmt *sqlparser.CreateTable) (*Result, error)
 	// Use FromCreate variant so that SHOW INDEX cardinality returns NULL
 	// for freshly created tables (no ANALYZE run yet). MySQL behavior.
 	e.upsertInnoDBStatsRowsFromCreate(dbName, tableName, e.tableRowCount(dbName, tableName))
+	e.touchInnoDBTableHandleOpened(dbName, tableName)
 
 	// For CREATE TABLE ... SELECT, return the row count as AffectedRows and set lastInsertInfo.
 	if stmt.Select != nil {
@@ -6226,6 +6227,8 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 					Comment:   idxComment,
 					Invisible: idxInvisible,
 				})
+				e.touchInnoDBTableHandleClosed(dbName, tableName)
+				e.touchInnoDBTableHandleOpened(dbName, tableName)
 
 			}
 
@@ -10195,6 +10198,7 @@ func (e *Executor) execCreateTableLike(targetDBName, newTableName, srcDBName, sr
 		return nil, mysqlError(1050, "42S01", fmt.Sprintf("Table '%s' already exists", newTableName))
 	}
 	e.Storage.CreateTable(targetDBName, newDef)
+	e.touchInnoDBTableHandleOpened(targetDBName, newTableName)
 	e.upsertInnoDBStatsRows(targetDBName, newTableName, 0)
 	return &Result{}, nil
 }

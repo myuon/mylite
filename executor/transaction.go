@@ -147,6 +147,7 @@ func (e *Executor) execBegin() (*Result, error) {
 		iso, uq, fk := e.txnSessionMeta()
 		e.txnActiveSet.Begin(e.connectionID, iso, uq, fk)
 	}
+	e.recordInnoDBTrxActive()
 	// nextTxnIsolationPrev stays set until the transaction ends (execCommit/execRollback),
 	// at which point we restore sessionScopeVars["transaction_isolation"] to the saved
 	// previous value. While the transaction is active, sessionScopeVars still holds the
@@ -283,6 +284,7 @@ func (e *Executor) execCommit() (*Result, error) {
 	if e.txnActiveSet != nil {
 		e.txnActiveSet.End(e.connectionID)
 	}
+	e.recordInnoDBTrxActive()
 	// Restore session isolation level if it was temporarily overridden by a NextTxScope set.
 	e.restoreNextTxnIsolation()
 	// Release GTID ownership acquired by SET SESSION gtid_next = 'ANONYMOUS' or UUID:NUMBER.
@@ -401,6 +403,8 @@ func (e *Executor) execRollback() (*Result, error) {
 	if e.txnActiveSet != nil {
 		e.txnActiveSet.End(e.connectionID)
 	}
+	e.bumpInnoDBMetric("trx_rollbacks", 1)
+	e.recordInnoDBTrxActive()
 	// Restore session isolation level if it was temporarily overridden by a NextTxScope set.
 	e.restoreNextTxnIsolation()
 	// Release GTID ownership acquired by SET SESSION gtid_next = 'ANONYMOUS' or UUID:NUMBER.
