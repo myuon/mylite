@@ -214,7 +214,10 @@ func (e *Executor) handleParentRowRemoval(dbName, tableName string, parentRow st
 						}
 						// Re-evaluate virtual generated columns that may depend on the
 						// nullified FK columns (e.g. fld2 INT AS (fld1) VIRTUAL).
-						_ = e.populateGeneratedColumns(childRow, childDef.Columns)
+						if err := e.populateGeneratedColumns(childRow, childDef.Columns); err != nil {
+							childTbl.Unlock()
+							return err
+						}
 						modifiedRows = append(modifiedRows, oldChild)
 					}
 				}
@@ -318,7 +321,10 @@ func (e *Executor) handleParentRowUpdate(dbName, tableName string, oldRow, newRo
 						}
 						// Re-evaluate virtual generated columns that may depend on the
 						// updated FK columns (e.g. fld2 INT AS (fld1) VIRTUAL).
-						_ = e.populateGeneratedColumns(childRow, childDef.Columns)
+						if err := e.populateGeneratedColumns(childRow, childDef.Columns); err != nil {
+							childTbl.Unlock()
+							return err
+						}
 						newChild := make(storage.Row)
 						for k, v := range childRow {
 							newChild[k] = v
@@ -352,7 +358,10 @@ func (e *Executor) handleParentRowUpdate(dbName, tableName string, oldRow, newRo
 						}
 						// Re-evaluate virtual generated columns that may depend on the
 						// updated FK columns (e.g. fld2 INT AS (fld1) VIRTUAL).
-						_ = e.populateGeneratedColumns(childRow, childDef.Columns)
+						if err := e.populateGeneratedColumns(childRow, childDef.Columns); err != nil {
+							childTbl.Unlock()
+							return err
+						}
 						newChild := make(storage.Row)
 						for k, v := range childRow {
 							newChild[k] = v
