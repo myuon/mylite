@@ -689,6 +689,7 @@ type Executor struct {
 	// innodbBufferPages tracks InnoDB tables cached in the buffer pool.
 	innodbBufferPages   map[string]struct{}
 	innodbBufferPagesMu sync.RWMutex
+	innodbMetrics *innoDBMetricsRuntime
 	// xaModifiedTables records InnoDB tables modified inside the current XA transaction.
 	xaModifiedTables map[string]struct{}
 	// sessionDbPrivCache caches the database-level privileges for the current user
@@ -1482,6 +1483,7 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		snapshots:               make(map[string]*fullSnapshot),
 		innodbBufferPages:       make(map[string]struct{}),
 		xaModifiedTables:        make(map[string]struct{}),
+		innodbMetrics:           newInnoDBMetricsRuntime(),
 		userVars:                make(map[string]interface{}),
 		preparedStmts:           make(map[string]string),
 		tempTables:              make(map[string]bool),
@@ -1613,6 +1615,7 @@ func (e *Executor) Clone() *Executor {
 		knownUsers:              e.knownUsers,
 		knownUsersMu:            e.knownUsersMu,
 		grantStore:              e.grantStore,
+		innodbMetrics:           e.innodbMetrics,
 		viewStore:               e.viewStore,
 		psShared:                e.psShared,
 	}

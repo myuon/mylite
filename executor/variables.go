@@ -1516,7 +1516,18 @@ func (e *Executor) execSet(stmt *sqlparser.Set) (*Result, error) {
 							return nil, swErr
 						}
 						e.sessionScopeVars[cleanName] = e.mergeOptimizerSwitch(normalized, isGlobal)
-					} else if isBooleanVariable(cleanName) {
+					} else if isGlobal && (cleanName == "innodb_monitor_enable" || cleanName == "innodb_monitor_disable" || cleanName == "innodb_monitor_reset" || cleanName == "innodb_monitor_reset_all") {
+					sv := val
+					if evalVal != nil {
+						sv = fmt.Sprintf("%v", evalVal)
+					}
+					if !strings.EqualFold(strings.TrimSpace(sv), "default") {
+						if err := e.handleInnoDBMonitorSet(cleanName, sv); err != nil {
+							return nil, err
+						}
+					}
+					e.sessionScopeVars[cleanName] = sv
+				} else if isBooleanVariable(cleanName) {
 						boolVal, bErr := normalizeBooleanSetValue(cleanName, expr.Expr, evalVal)
 						if bErr != nil {
 							return nil, bErr
@@ -2178,6 +2189,11 @@ func (e *Executor) handleRawSet(raw string) error {
 				upVal := strings.ToUpper(strings.Trim(val, "'\""))
 				if enumVal, ok := enumMap[upVal]; ok {
 					val = enumVal
+				}
+			}
+			if isGlobalScope && (varName == "innodb_monitor_enable" || varName == "innodb_monitor_disable" || varName == "innodb_monitor_reset" || varName == "innodb_monitor_reset_all") {
+				if err := e.handleInnoDBMonitorSet(varName, val); err != nil {
+					return err
 				}
 			}
 			e.setSysVar(varName, val, isGlobalScope)

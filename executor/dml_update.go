@@ -1053,6 +1053,8 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 	e.lastUpdateInfo = infoMsg
 	if affected > 0 {
 		e.touchTableUpdateTime(updateDB, tableName)
+		e.bumpInnoDBMetric("dml_updates", int64(affected))
+		e.bumpInnoDBDMLReads(int64(matchedRows) * 2)
 	}
 	return &Result{
 		AffectedRows: affected,
