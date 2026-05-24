@@ -354,7 +354,7 @@ func (t *Table) scanByIndexOrder(idxCols []string) []Row {
 	sort.SliceStable(out, func(i, j int) bool {
 		ri, rj := out[i], out[j]
 		for _, c := range bare {
-			cmp := compareRowValue(rowGetCI(ri, c), rowGetCI(rj, c))
+			cmp := t.compareIndexKeyColumn(rowGetCI(ri, c), rowGetCI(rj, c), c)
 			if cmp < 0 {
 				return true
 			}
@@ -363,7 +363,7 @@ func (t *Table) scanByIndexOrder(idxCols []string) []Row {
 			}
 		}
 		for _, c := range pkCols {
-			cmp := compareRowValue(rowGetCI(ri, c), rowGetCI(rj, c))
+			cmp := t.compareIndexKeyColumn(rowGetCI(ri, c), rowGetCI(rj, c), c)
 			if cmp < 0 {
 				return true
 			}
@@ -374,6 +374,37 @@ func (t *Table) scanByIndexOrder(idxCols []string) []Row {
 		return false
 	})
 	return out
+}
+
+// compareIndexKeyColumn compares two index-key values the way InnoDB orders
+// B-tree entries: numeric types by value, string types by table/column collation.
+func (t *Table) compareIndexKeyColumn(a, b interface{}, colName string) int {
+	if t.Def != nil && !hasNonSortableCharset(t.Def.Charset) &&
+		isStringIndexColumnType(columnTypeForName(t.Def, colName)) {
+		return compareRowValueWithCollation(a, b, effectivePKCollation(t.Def, colName))
+	}
+	return compareRowValue(a, b)
+}
+
+func columnTypeForName(def *catalog.TableDef, colName string) string {
+	if def == nil {
+		return ""
+	}
+	for _, col := range def.Columns {
+		if strings.EqualFold(col.Name, colName) {
+			return col.Type
+		}
+	}
+	return ""
+}
+
+func isStringIndexColumnType(colType string) bool {
+	upper := strings.ToUpper(colType)
+	if idx := strings.Index(upper, " GENERATED"); idx >= 0 {
+		upper = upper[:idx]
+	}
+	return strings.HasPrefix(upper, "CHAR") || strings.HasPrefix(upper, "VARCHAR") ||
+		strings.HasPrefix(upper, "TEXT")
 }
 
 // inRange reports whether v lies within the lower/upper bounds for the
