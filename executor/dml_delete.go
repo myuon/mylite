@@ -452,7 +452,7 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		}
 
 		// Acquire row locks for rows to be deleted (blocks if rows are locked by another connection)
-		if e.rowLockManager != nil && len(deleteSet) > 0 && e.shouldAcquireRowLocks() {
+		if e.rowLockManager != nil && len(deleteSet) > 0 && e.shouldAcquireRowLocksForDML() {
 			delIndices := make([]int, 0, len(deleteSet))
 			for idx := range deleteSet {
 				delIndices = append(delIndices, idx)
@@ -527,7 +527,7 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 	}
 
 	// Acquire row locks for matching rows (blocks if rows are locked by another connection)
-	if e.rowLockManager != nil && e.shouldAcquireRowLocks() {
+	if e.rowLockManager != nil && e.shouldAcquireRowLocksForDML() {
 		var matchIndices []int
 		for i, row := range tbl.Rows {
 			match := true

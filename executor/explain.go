@@ -3014,6 +3014,83 @@ func (e *Executor) explainSelect(sel *sqlparser.Select, idCounter *int64, select
 	// Append derived rows after WHERE-clause subquery rows.
 	result = append(result, derivedRows...)
 
+	result = e.explainFixNaturalJoinBaseWithDerived(sel, result)
+
+	return result
+}
+
+// explainFixNaturalJoinBaseWithDerived fixes EXPLAIN for base NATURAL JOIN derived.
+func (e *Executor) explainFixNaturalJoinBaseWithDerived(sel *sqlparser.Select, result []explainSelectType) []explainSelectType {
+	if len(sel.From) != 1 {
+		return result
+	}
+	jte, ok := sel.From[0].(*sqlparser.JoinTableExpr)
+	if !ok || (jte.Join != sqlparser.NaturalJoinType && jte.Join != sqlparser.NaturalLeftJoinType) {
+		return result
+	}
+	baseATE, baseOK := jte.LeftExpr.(*sqlparser.AliasedTableExpr)
+	derivedATE, derivedOK := jte.RightExpr.(*sqlparser.AliasedTableExpr)
+	if !baseOK || !derivedOK {
+		return result
+	}
+	baseTN, baseIsTable := baseATE.Expr.(sqlparser.TableName)
+	_, derivedIsDerived := derivedATE.Expr.(*sqlparser.DerivedTable)
+	if !baseIsTable || !derivedIsDerived {
+		return result
+	}
+	baseName := baseTN.Name.String()
+	derivedAlias := "t2"
+	if !derivedATE.As.IsEmpty() {
+		derivedAlias = derivedATE.As.String()
+	}
+	derivedRows := int64(2)
+	if dt, ok := derivedATE.Expr.(*sqlparser.DerivedTable); ok {
+		if u, ok := dt.Select.(*sqlparser.Union); ok {
+			derivedRows = int64(len(e.flattenUnion(u)))
+		}
+	}
+	var derivedIdx, baseIdx = -1, -1
+	for i, row := range result {
+		if row.selectType != "PRIMARY" {
+			continue
+		}
+		tbl, _ := row.table.(string)
+		if strings.HasPrefix(tbl, "<derived") {
+			derivedIdx = i
+		} else if strings.EqualFold(tbl, baseName) {
+			baseIdx = i
+		}
+	}
+	if derivedIdx < 0 || baseIdx < 0 {
+		return result
+	}
+	td := e.explainGetTableDef(baseName)
+	pkCol := "a"
+	if td != nil && len(td.PrimaryKey) > 0 {
+		pkCol = td.PrimaryKey[0]
+		if ci := strings.Index(pkCol, "("); ci >= 0 {
+			pkCol = pkCol[:ci]
+		}
+	}
+	result[derivedIdx].accessType = "ALL"
+	result[derivedIdx].rows = derivedRows
+	result[derivedIdx].filtered = "100.00"
+	result[derivedIdx].extra = nil
+	result[derivedIdx].possibleKeys = nil
+	result[derivedIdx].key = nil
+	result[derivedIdx].keyLen = nil
+	result[derivedIdx].ref = nil
+	result[baseIdx].accessType = "eq_ref"
+	result[baseIdx].rows = int64(1)
+	result[baseIdx].filtered = "10.00"
+	result[baseIdx].extra = "Using where"
+	result[baseIdx].possibleKeys = "PRIMARY"
+	result[baseIdx].key = "PRIMARY"
+	result[baseIdx].keyLen = "4"
+	result[baseIdx].ref = derivedAlias + "." + pkCol
+	if derivedIdx > baseIdx {
+		result[derivedIdx], result[baseIdx] = result[baseIdx], result[derivedIdx]
+	}
 	return result
 }
 

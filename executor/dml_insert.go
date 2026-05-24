@@ -214,7 +214,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 	// Gap lock simulation: in REPEATABLE READ (or stricter), if another
 	// connection holds row locks on this table, the INSERT may be blocked
 	// by gap locks when the new row's PK falls between two locked PKs.
-	if e.rowLockManager != nil && e.shouldAcquireRowLocks() {
+	if e.rowLockManager != nil && e.shouldAcquireRowLocksForDML() {
 		isoLevel, _ := e.getSysVar("transaction_isolation")
 		if isoLevel == "" {
 			isoLevel, _ = e.getSysVar("tx_isolation")
@@ -224,12 +224,7 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		if !isReadCommitted && !isReadUncommitted {
 			// Check if the new row's PK falls between locked PKs (gap lock)
 			if blocked := e.checkGapLockForInsert(insertDB, tableName, stmt); blocked {
-				timeout := 50.0
-				if v, ok := e.getSysVar("innodb_lock_wait_timeout"); ok {
-					if t, err := strconv.ParseFloat(v, 64); err == nil {
-						timeout = t
-					}
-				}
+				timeout := e.innodbLockWaitTimeoutSec()
 				// Wait up to timeout, checking periodically
 				// Record a stage event so PS events_stages_current shows lock wait.
 				e.recordPSStageEventLockWait()
@@ -2509,13 +2504,8 @@ func (e *Executor) execInsert(stmt *sqlparser.Insert) (*Result, error) {
 		// Acquire row lock on the PK (or unique key) value being inserted.
 		// This blocks if another transaction already holds a lock on the same
 		// key (e.g., another uncommitted INSERT with the same PK/unique value).
-		if e.rowLockManager != nil && e.shouldAcquireRowLocks() {
-			lockTimeout := 50.0
-			if v, ok := e.getSysVar("innodb_lock_wait_timeout"); ok {
-				if t, tErr := strconv.ParseFloat(v, 64); tErr == nil {
-					lockTimeout = t
-				}
-			}
+		if e.rowLockManager != nil && e.shouldAcquireRowLocksForDML() {
+			lockTimeout := e.innodbLockWaitTimeoutSec()
 			// Use PK if available; fall back to first unique key column.
 			// This mirrors InnoDB's implicit lock on the clustered index record.
 			lockKeyCols := pkCols
