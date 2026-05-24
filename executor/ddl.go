@@ -4851,6 +4851,15 @@ func (e *Executor) execAlterTable(stmt *sqlparser.AlterTable) (*Result, error) {
 			for _, idx := range tableDef.Indexes {
 				origIdxNames[strings.ToLower(idx.Name)] = true
 			}
+			// Indexes added in this ALTER are valid RENAME/ALTER INDEX sources.
+			for _, opt := range stmt.AlterOptions {
+				if addIdx, ok := opt.(*sqlparser.AddIndexDefinition); ok {
+					name := strings.ToLower(addIdx.IndexDefinition.Info.Name.String())
+					if name != "" {
+						origIdxNames[name] = true
+					}
+				}
+			}
 			// Collect rename sources and alter-index targets separately
 			renameSources := make(map[string]bool)
 			alterTargets := make(map[string]bool)
