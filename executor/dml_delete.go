@@ -664,6 +664,9 @@ func (e *Executor) execDelete(stmt *sqlparser.Delete) (*Result, error) {
 		tbl.HeapInsertFront = true
 	}
 
+	if affected > 0 {
+		e.touchTableUpdateTime(deleteDB, tableName)
+	}
 	return &Result{AffectedRows: affected}, nil
 }
 

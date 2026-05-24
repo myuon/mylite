@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	"golang.org/x/text/unicode/norm"
@@ -99,6 +100,7 @@ type TableDef struct {
 	// reports a different TABLE_ID after a rebuild, mirroring MySQL behavior.
 	RebuildSeq int
 	Discarded bool
+	UpdateTime *time.Time // last DML update time for INFORMATION_SCHEMA.TABLES.UPDATE_TIME
 }
 
 // PartitionSubpart holds the SUBPARTITION BY clause details.
@@ -217,12 +219,44 @@ type Database struct {
 // Catalog is the top-level catalog managing databases.
 type Catalog struct {
 	Databases map[string]*Database
-	mu        sync.RWMutex
+	// preparedXAModified holds InnoDB tables modified by a prepared XA transaction.
+	preparedXAModified map[string]struct{}
+	mu                 sync.RWMutex
+}
+
+
+
+// SetPreparedXAModified records tables modified by a prepared XA transaction.
+func (c *Catalog) SetPreparedXAModified(tables map[string]struct{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if tables == nil {
+		c.preparedXAModified = make(map[string]struct{})
+		return
+	}
+	copyMap := make(map[string]struct{}, len(tables))
+	for k := range tables {
+		copyMap[k] = struct{}{}
+	}
+	c.preparedXAModified = copyMap
+}
+
+// TakePreparedXAModified returns and clears prepared XA modified tables.
+func (c *Catalog) TakePreparedXAModified() map[string]struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := c.preparedXAModified
+	c.preparedXAModified = make(map[string]struct{})
+	if out == nil {
+		return make(map[string]struct{})
+	}
+	return out
 }
 
 func New() *Catalog {
 	c := &Catalog{
-		Databases: make(map[string]*Database),
+		Databases:          make(map[string]*Database),
+		preparedXAModified: make(map[string]struct{}),
 	}
 	// Create default databases (matching MySQL)
 	for _, name := range []string{"information_schema", "mtr", "mysql", "performance_schema", "sys", "test"} {
@@ -468,6 +502,31 @@ func (db *Database) GetTable(name string) (*TableDef, error) {
 		return nil, fmt.Errorf("table '%s.%s' doesn't exist", db.Name, name)
 	}
 	return t, nil
+}
+
+// TouchUpdateTime records the last DML modification time for InnoDB tables.
+func (db *Database) TouchUpdateTime(tableName string, t time.Time) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tbl, ok := db.Tables[tableName]
+	if !ok {
+		for n, def := range db.Tables {
+			if strings.EqualFold(n, tableName) {
+				tbl = def
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok {
+		return
+	}
+	engine := tbl.Engine
+	if engine != "" && !strings.EqualFold(engine, "InnoDB") {
+		return
+	}
+	tt := t
+	tbl.UpdateTime = &tt
 }
 
 func (db *Database) DropTable(name string) error {

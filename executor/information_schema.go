@@ -843,7 +843,7 @@ func (e *Executor) buildInformationSchemaRows(tableName, alias string) ([]storag
 	case "innodb_foreign_cols":
 		rawRows = e.infoSchemaInnoDBForeignCols()
 	case "innodb_buffer_page":
-		rawRows = []storage.Row{} // empty stub - no buffer pool tracking
+		rawRows = e.infoSchemaInnoDBBufferPage()
 	case "innodb_trx":
 		rawRows = e.infoSchemaInnoDBTrx()
 	case "processlist":
@@ -2398,6 +2398,29 @@ func (e *Executor) infoSchemaSchemata() []storage.Row {
 	return rows
 }
 
+
+// infoSchemaInnoDBBufferPage returns rows for INFORMATION_SCHEMA.INNODB_BUFFER_PAGE.
+func (e *Executor) infoSchemaInnoDBBufferPage() []storage.Row {
+	e.innodbBufferPagesMu.RLock()
+	keys := make([]string, 0, len(e.innodbBufferPages))
+	for k := range e.innodbBufferPages {
+		keys = append(keys, k)
+	}
+	e.innodbBufferPagesMu.RUnlock()
+	sort.Strings(keys)
+	rows := make([]storage.Row, 0, len(keys))
+	for _, tableName := range keys {
+		rows = append(rows, storage.Row{
+			"SPACE":          int64(0),
+			"PAGE_NUMBER":    int64(0),
+			"PAGE_TYPE":      "INDEX",
+			"NUMBER_RECORDS": int64(0),
+			"TABLE_NAME":     tableName,
+		})
+	}
+	return rows
+}
+
 // infoSchemaTables returns rows for INFORMATION_SCHEMA.TABLES.
 func (e *Executor) infoSchemaTables() []storage.Row {
 	tableStatsByKey := map[string]storage.Row{}
@@ -2512,6 +2535,11 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 				dataFree = int64(0)
 			}
 
+			var updateTime interface{}
+			if tblDef != nil && tblDef.UpdateTime != nil && strings.EqualFold(engine, "InnoDB") {
+				updateTime = tblDef.UpdateTime.Format("2006-01-02 15:04:05")
+			}
+
 			rows = append(rows, storage.Row{
 				"TABLE_CATALOG":   "def",
 				"TABLE_SCHEMA":    dbName,
@@ -2528,7 +2556,7 @@ func (e *Executor) infoSchemaTables() []storage.Row {
 				"DATA_FREE":       dataFree,
 				"AUTO_INCREMENT":  autoIncrement,
 				"CREATE_TIME":     nil,
-				"UPDATE_TIME":     nil,
+				"UPDATE_TIME":     updateTime,
 				"CHECK_TIME":      nil,
 				"TABLE_COLLATION": tableCollation,
 				"CHECKSUM":        nil,

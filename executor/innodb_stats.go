@@ -121,6 +121,109 @@ func (e *Executor) removeInnoDBStatsRows(dbName, tableName string) {
 	}
 }
 
+// touchTableUpdateTime updates INFORMATION_SCHEMA.TABLES.UPDATE_TIME for InnoDB tables.
+
+func innodbBufferPageTableName(dbName, tableName string) string {
+	return fmt.Sprintf("`%s`.`%s`", dbName, tableName)
+}
+
+// touchInnoDBBufferPage records that an InnoDB table has pages in the buffer pool.
+func (e *Executor) touchInnoDBBufferPage(dbName, tableName string) {
+	if dbName == "" || tableName == "" {
+		return
+	}
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		return
+	}
+	def, err := db.GetTable(tableName)
+	if err != nil || def == nil {
+		return
+	}
+	engine := def.Engine
+	if engine != "" && !strings.EqualFold(engine, "InnoDB") {
+		return
+	}
+	key := innodbBufferPageTableName(dbName, tableName)
+	e.innodbBufferPagesMu.Lock()
+	if e.innodbBufferPages == nil {
+		e.innodbBufferPages = make(map[string]struct{})
+	}
+	e.innodbBufferPages[key] = struct{}{}
+	e.innodbBufferPagesMu.Unlock()
+}
+
+func (e *Executor) clearInnoDBBufferPool() {
+	e.innodbBufferPagesMu.Lock()
+	e.innodbBufferPages = make(map[string]struct{})
+	e.innodbBufferPagesMu.Unlock()
+}
+
+// clearInnoDBUpdateTimes clears in-memory UPDATE_TIME values (not persisted pre-WL#6917).
+func xaModifiedTableKey(dbName, tableName string) string {
+	return dbName + "\x00" + tableName
+}
+
+func (e *Executor) recordXAModifiedTable(dbName, tableName string) {
+	if !e.inXATransaction || dbName == "" || tableName == "" {
+		return
+	}
+	if e.xaModifiedTables == nil {
+		e.xaModifiedTables = make(map[string]struct{})
+	}
+	e.xaModifiedTables[xaModifiedTableKey(dbName, tableName)] = struct{}{}
+}
+
+func (e *Executor) applyPreparedXAUpdateTimes() {
+	for key := range e.Catalog.TakePreparedXAModified() {
+		parts := strings.SplitN(key, "\x00", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		e.touchTableUpdateTime(parts[0], parts[1])
+	}
+}
+
+func (e *Executor) applyXAModifiedUpdateTimes() {
+	for key := range e.xaModifiedTables {
+		parts := strings.SplitN(key, "\x00", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		e.touchTableUpdateTime(parts[0], parts[1])
+	}
+	e.xaModifiedTables = make(map[string]struct{})
+}
+
+func (e *Executor) clearInnoDBUpdateTimes() {
+	for _, dbName := range e.Catalog.ListDatabases() {
+		db, err := e.Catalog.GetDatabase(dbName)
+		if err != nil {
+			continue
+		}
+		for _, tblName := range db.ListTables() {
+			def, err := db.GetTable(tblName)
+			if err != nil || def == nil {
+				continue
+			}
+			def.UpdateTime = nil
+		}
+	}
+}
+
+func (e *Executor) touchTableUpdateTime(dbName, tableName string) {
+	if dbName == "" || tableName == "" {
+		return
+	}
+	db, err := e.Catalog.GetDatabase(dbName)
+	if err != nil {
+		return
+	}
+	db.TouchUpdateTime(tableName, e.nowTime())
+	e.touchInnoDBBufferPage(dbName, tableName)
+	e.recordXAModifiedTable(dbName, tableName)
+}
+
 // maybeRecalcStats implements MySQL's InnoDB auto-recalc threshold:
 // stats are recomputed only when the cumulative DML change count exceeds
 // 10% of the row count at the time stats were last calculated (minimum 200).
