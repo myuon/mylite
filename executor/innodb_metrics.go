@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/myuon/mylite/storage"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 // innoDBMetricDef defines a single InnoDB metric entry for INFORMATION_SCHEMA.INNODB_METRICS.
@@ -313,6 +314,170 @@ func (e *Executor) recordInnoDBTrxActive() {
 
 func (e *Executor) bumpInnoDBDMLReads(n int64) {
 	e.bumpInnoDBMetric("dml_reads", n)
+}
+
+func (e *Executor) bumpInnoDBBufferPageWrittenIndexLeaf(n int64) {
+	e.bumpInnoDBMetric("buffer_page_written_index_leaf", n)
+}
+
+func (e *Executor) touchInnoDBBufferPageWritten(dbName, tableName string, rows int64) {
+	if rows <= 0 || !e.tableUsesInnoDB(dbName, tableName) {
+		return
+	}
+	e.bumpInnoDBBufferPageWrittenIndexLeaf(rows)
+}
+
+func (e *Executor) recordInnoDBICPForSelect(stmt *sqlparser.Select, rows []storage.Row) {
+	if stmt == nil || stmt.Where == nil || len(rows) == 0 || len(stmt.From) != 1 {
+		return
+	}
+	if !e.isOptimizerSwitchEnabled("index_condition_pushdown") {
+		return
+	}
+	ate, ok := stmt.From[0].(*sqlparser.AliasedTableExpr)
+	if !ok {
+		return
+	}
+	tn, ok := ate.Expr.(sqlparser.TableName)
+	if !ok {
+		return
+	}
+	tableName := tn.Name.String()
+	if tableName == "" || strings.EqualFold(tableName, "dual") {
+		return
+	}
+	ai := e.explainDetectAccessType(stmt, tableName)
+	at := strings.ToLower(ai.accessType)
+	if at != "range" && at != "ref" {
+		return
+	}
+	if ai.ref != nil {
+		if refStr, ok := ai.ref.(string); ok && strings.Contains(refStr, "<subquery") {
+			return
+		}
+	}
+	wcs := explainExtractWhereConditions(stmt.Where.Expr, tableName)
+	hasICPCond := false
+	for _, wc := range wcs {
+		if wc.isNull || wc.isRange {
+			hasICPCond = true
+			break
+		}
+	}
+	if !hasICPCond {
+		return
+	}
+	rangeCol := innodbICPRangeColumn(wcs)
+	if rangeCol == "" {
+		return
+	}
+	for _, row := range rows {
+		e.bumpInnoDBMetric("icp_attempts", 1)
+		match, err := e.evalWhere(stmt.Where.Expr, row)
+		if err != nil {
+			continue
+		}
+		if match {
+			e.bumpInnoDBMetric("icp_match", 1)
+			continue
+		}
+		if e.icpRowOutsideIndexRange(row, stmt.Where.Expr, tableName, rangeCol) {
+			e.bumpInnoDBMetric("icp_out_of_range", 1)
+		} else {
+			e.bumpInnoDBMetric("icp_no_match", 1)
+		}
+	}
+}
+
+func innodbICPRangeColumn(wcs []explainWhereCondition) string {
+	for _, wc := range wcs {
+		if wc.isRange || wc.isNull {
+			return wc.column
+		}
+	}
+	return ""
+}
+
+func (e *Executor) icpRowOutsideIndexRange(row storage.Row, where sqlparser.Expr, tableName, rangeCol string) bool {
+	if where == nil || rangeCol == "" {
+		return false
+	}
+	outside := false
+	var walk func(expr sqlparser.Expr)
+	walk = func(expr sqlparser.Expr) {
+		if outside || expr == nil {
+			return
+		}
+		switch x := expr.(type) {
+		case *sqlparser.AndExpr:
+			walk(x.Left)
+			walk(x.Right)
+		case *sqlparser.ComparisonExpr:
+			colName, valExpr, swapped := extractColAndValue(x.Left, x.Right, tableName)
+			if colName == "" || !strings.EqualFold(colName, rangeCol) {
+				return
+			}
+			op := x.Operator
+			if swapped {
+				op = flipComparisonOp(op)
+			}
+			switch op {
+			case sqlparser.EqualOp, sqlparser.NullSafeEqualOp, sqlparser.InOp:
+				return
+			}
+			colVal, err1 := e.evalRowExpr(&sqlparser.ColName{Name: sqlparser.NewIdentifierCI(colName)}, row)
+			if err1 != nil {
+				return
+			}
+			boundVal, ok := evalLiteralExpr(valExpr)
+			if !ok {
+				boundVal, err1 = e.evalRowExpr(valExpr, row)
+				if err1 != nil {
+					return
+				}
+			}
+			match, err := compareValues(colVal, boundVal, op)
+			if err == nil && !match {
+				outside = true
+			}
+		case *sqlparser.BetweenExpr:
+			col, ok := x.Left.(*sqlparser.ColName)
+			if !ok || !strings.EqualFold(col.Name.String(), rangeCol) {
+				return
+			}
+			colVal, err1 := e.evalRowExpr(x.Left, row)
+			if err1 != nil {
+				return
+			}
+			fromVal, ok1 := evalLiteralExpr(x.From)
+			toVal, ok2 := evalLiteralExpr(x.To)
+			if !ok1 || !ok2 {
+				return
+			}
+			ge, _ := compareValues(colVal, fromVal, sqlparser.GreaterEqualOp)
+			le, _ := compareValues(colVal, toVal, sqlparser.LessEqualOp)
+			if !ge || !le {
+				outside = true
+			}
+		}
+	}
+	walk(where)
+	return outside
+}
+
+func flipComparisonOp(op sqlparser.ComparisonExprOperator) sqlparser.ComparisonExprOperator {
+	switch op {
+	case sqlparser.GreaterThanOp:
+		return sqlparser.LessThanOp
+	case sqlparser.GreaterEqualOp:
+		return sqlparser.LessEqualOp
+	case sqlparser.LessThanOp:
+		return sqlparser.GreaterThanOp
+	case sqlparser.LessEqualOp:
+		return sqlparser.GreaterEqualOp
+	default:
+		return op
+	}
 }
 
 func (e *Executor) infoSchemaInnoDBMetrics() []storage.Row {

@@ -2571,6 +2571,8 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// Save pre-WHERE rows for REPEATABLE READ full-scan locking
 	preWhereRows := allRows
 
+	e.recordInnoDBICPForSelect(stmt, preWhereRows)
+
 	// Apply WHERE filter (skip if already applied during streaming cross join)
 	if stmt.Where != nil && !whereApplied {
 		filtered := make([]storage.Row, 0)
