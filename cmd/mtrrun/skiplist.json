@@ -2925,10 +2925,6 @@
       "reason": "failures"
     },
     {
-      "test": "innodb/innodb_lock_wait_timeout_1",
-      "reason": "lock timeout test failures"
-    },
-    {
       "test": "sys_vars/delay_key_write_func",
       "reason": "failures"
     },

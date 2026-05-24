@@ -419,7 +419,7 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 	// Acquire row locks for UPDATE.
 	// In REPEATABLE READ with full table scan (no PK lookup), lock ALL rows.
 	// In READ COMMITTED or with PK lookup, lock only matching rows.
-	if e.rowLockManager != nil && len(tbl.Rows) > 0 && e.shouldAcquireRowLocks() {
+	if e.rowLockManager != nil && len(tbl.Rows) > 0 && e.shouldAcquireRowLocksForDML() {
 		isoLevel, _ := e.getSysVar("transaction_isolation")
 		if isoLevel == "" {
 			isoLevel, _ = e.getSysVar("tx_isolation")

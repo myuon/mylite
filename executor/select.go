@@ -2629,7 +2629,24 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 	// transaction, lock the entire scanned range so a subsequent NOWAIT statement
 	// from another connection observes the conflict and fails immediately.
 	emptyResultGapLock := len(allRows) == 0 && isExplicitLock && e.inTransaction && len(preWhereRows) > 0
-	if needsRowLock && e.rowLockManager != nil && (len(allRows) > 0 || emptyResultGapLock) {
+	joinExaminedLock := false
+	if len(allRows) == 0 && isExplicitLock && e.inTransaction && selectFromHasJoin(stmt.From) {
+		for _, tr := range collectLockableBaseTables(stmt.From, e.CurrentDB) {
+			db, dbErr := e.Catalog.GetDatabase(tr.db)
+			if dbErr != nil {
+				continue
+			}
+			def, defErr := db.GetTable(tr.name)
+			if defErr != nil || def == nil {
+				continue
+			}
+			if examined := e.rowsExaminedByJoinForTable(stmt, tr.db, tr.name, def.PrimaryKey); len(examined) > 0 {
+				joinExaminedLock = true
+				break
+			}
+		}
+	}
+	if needsRowLock && e.rowLockManager != nil && (len(allRows) > 0 || emptyResultGapLock || joinExaminedLock) {
 		filteredRows, err := e.acquireRowLocksForSelect(stmt, allRows, preWhereRows)
 		if err != nil {
 			return nil, err
@@ -3313,12 +3330,7 @@ func buildColumnTypes(colNames []string, tableDefs []*catalog.TableDef) []string
 // Otherwise returns (nil, nil) on success (caller keeps original rows).
 func (e *Executor) acquireRowLocksForSelect(stmt *sqlparser.Select, rows []storage.Row, preWhereRows []storage.Row) ([]storage.Row, error) {
 	// Determine timeout from innodb_lock_wait_timeout
-	timeout := 50.0 // default
-	if v, ok := e.getSysVar("innodb_lock_wait_timeout"); ok {
-		if t, err := strconv.ParseFloat(v, 64); err == nil {
-			timeout = t
-		}
-	}
+	timeout := e.innodbLockWaitTimeoutSec()
 
 	skipLocked := e.selectSkipLocked
 	nowait := e.selectNowait
@@ -3338,21 +3350,10 @@ func (e *Executor) acquireRowLocksForSelect(stmt *sqlparser.Select, rows []stora
 	}
 	isReadCommitted := strings.EqualFold(isoLevel, "READ-COMMITTED") || strings.EqualFold(isoLevel, "READ COMMITTED")
 
-	// Extract table name(s) from FROM clause to get PK columns
-	for _, fromExpr := range stmt.From {
-		tbl, ok := fromExpr.(*sqlparser.AliasedTableExpr)
-		if !ok {
-			continue
-		}
-		tn, ok := tbl.Expr.(sqlparser.TableName)
-		if !ok {
-			continue
-		}
-		dbName := e.CurrentDB
-		if !tn.Qualifier.IsEmpty() {
-			dbName = tn.Qualifier.String()
-		}
-		tableName := tn.Name.String()
+	// Extract table name(s) from FROM clause (including joins) to get PK columns.
+	for _, tr := range collectLockableBaseTables(stmt.From, e.CurrentDB) {
+		dbName := tr.db
+		tableName := tr.name
 
 		// Per-table lock override from "FOR SHARE/UPDATE OF table" clauses
 		tableExclusive := exclusive
@@ -3411,6 +3412,11 @@ func (e *Executor) acquireRowLocksForSelect(stmt *sqlparser.Select, rows []stora
 		hasLimit := stmt.Limit != nil && stmt.Limit.Rowcount != nil
 		isPKLookup := len(pkCols) > 0 && isWherePKEquality(stmt, pkCols)
 		lockAll := !isReadCommitted && !hasLimit && !isPKLookup
+		// In READ COMMITTED, SELECT ... FOR UPDATE on a join still locks every row
+		// examined on each base table (e.g. a row that fails the join predicate).
+		if exclusive && isReadCommitted && selectFromHasJoin(stmt.From) {
+			lockAll = true
+		}
 
 		// Track lock keys that couldn't be acquired (for SKIP LOCKED)
 		var failedLockKeys map[string]bool
@@ -3421,7 +3427,23 @@ func (e *Executor) acquireRowLocksForSelect(stmt *sqlparser.Select, rows []stora
 		if len(pkCols) > 0 {
 			// Has PK: lock rows by PK value
 			lockRows := rows
-			if lockAll {
+			// READ COMMITTED join scans: always lock rows examined on the base table
+			// even when they are not in the result set (InnoDB join_read_key behavior).
+			if exclusive && isReadCommitted && selectFromHasJoin(stmt.From) {
+				if examined := e.rowsExaminedByJoinForTable(stmt, dbName, tableName, pkCols); len(examined) > 0 {
+					for _, row := range examined {
+						lockKey := buildRowLockKey(dbName, tableName, pkCols, row)
+						if err := e.rowLockManager.AcquireRowLock(e.connectionID, lockKey, tableTimeout); err != nil {
+							return nil, mysqlError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
+						}
+					}
+				}
+				if len(rows) > 0 {
+					lockRows = rows
+				} else {
+					lockRows = nil
+				}
+			} else if lockAll {
 				lockRows = preWhereRows
 			} else if hasLimit && stmt.Limit != nil && stmt.Limit.Rowcount != nil && !tableSkipLocked {
 				// When LIMIT is present (and not SKIP LOCKED), lock only up to
@@ -3571,12 +3593,7 @@ func (e *Executor) acquireRowLocksForSelect(stmt *sqlparser.Select, rows []stora
 // their indices in the table's row slice. Used by UPDATE/DELETE to lock rows
 // within a transaction.
 func (e *Executor) acquireRowLocksForRows(dbName, tableName string, def *catalog.TableDef, rows []storage.Row, indices []int) error {
-	timeout := 50.0
-	if v, ok := e.getSysVar("innodb_lock_wait_timeout"); ok {
-		if t, err := strconv.ParseFloat(v, 64); err == nil {
-			timeout = t
-		}
-	}
+	timeout := e.innodbLockWaitTimeoutSec()
 
 	pkCols := def.PrimaryKey
 
@@ -3650,6 +3667,20 @@ func (e *Executor) shouldAcquireRowLocks() bool {
 		}
 	}
 	return false
+}
+
+// shouldAcquireRowLocksForDML reports whether DML should acquire (and wait on) row locks.
+// InnoDB takes row locks for the statement duration even in autocommit mode.
+func (e *Executor) shouldAcquireRowLocksForDML() bool {
+	if e.shouldAcquireRowLocks() {
+		return true
+	}
+	v, ok := e.getSysVar("autocommit")
+	if !ok {
+		return true
+	}
+	upper := strings.ToUpper(v)
+	return upper == "1" || upper == "ON"
 }
 
 // isWherePKEquality checks if the WHERE clause is a simple equality (or AND of equalities)
