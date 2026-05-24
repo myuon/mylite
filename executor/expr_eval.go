@@ -5638,89 +5638,88 @@ func (e *Executor) evalRowExprTupleAware(expr sqlparser.Expr, row storage.Row) (
 	return e.evalRowExpr(expr, row)
 }
 
+func (e *Executor) lookupColValue(v *sqlparser.ColName, row storage.Row) (interface{}, bool) {
+	colName := v.Name.String()
+	// Handle _rowid: MySQL alias for the single-column integer primary key
+	if strings.EqualFold(colName, "_rowid") {
+		pkCol := e.findRowIDColumn(row)
+		if pkCol != "" {
+			if val, ok := row[pkCol]; ok {
+				return val, true
+			}
+		}
+		return nil, false
+	}
+	// Try qualified lookup first (alias.col) if qualifier is set
+	if !v.Qualifier.IsEmpty() {
+		qualified := v.Qualifier.Name.String() + "." + colName
+		if val, ok := row[qualified]; ok {
+			return val, true
+		}
+		// Try full qualifier (db.table.col) for multi-database references
+		fullQualified := sqlparser.String(v.Qualifier) + "." + colName
+		fullQualified = strings.Trim(fullQualified, "`")
+		if val, ok := row[fullQualified]; ok {
+			return val, true
+		}
+		// Try case-insensitive qualified lookup (handles t1.A when key is t1.a)
+		upperQualified := strings.ToUpper(qualified)
+		for k, kv := range row {
+			if strings.ToUpper(k) == upperQualified {
+				return kv, true
+			}
+		}
+		// Fall back to correlatedRow for correlated subquery references
+		if e.correlatedRow != nil {
+			if val, ok := e.correlatedRow[qualified]; ok {
+				return val, true
+			}
+			if val, ok := e.correlatedRow[fullQualified]; ok {
+				return val, true
+			}
+			upperName := strings.ToUpper(colName)
+			for k, kv := range e.correlatedRow {
+				if strings.ToUpper(k) == upperName {
+					return kv, true
+				}
+			}
+			return nil, false
+		}
+	}
+	// Fall back to un-prefixed lookup
+	if val, ok := row[colName]; ok {
+		return val, true
+	}
+	// Case-insensitive fallback (needed for information_schema columns)
+	upperName := strings.ToUpper(colName)
+	for k, rv := range row {
+		if strings.ToUpper(k) == upperName {
+			return rv, true
+		}
+	}
+	// Fall back to correlatedRow for correlated subquery
+	if e.correlatedRow != nil {
+		if val, ok := e.correlatedRow[colName]; ok {
+			return val, true
+		}
+		if !v.Qualifier.IsEmpty() {
+			qualified := v.Qualifier.Name.String() + "." + colName
+			if val, ok := e.correlatedRow[qualified]; ok {
+				return val, true
+			}
+		}
+	}
+	return nil, false
+}
+
 func (e *Executor) evalRowExpr(expr sqlparser.Expr, row storage.Row) (interface{}, error) {
 	switch v := expr.(type) {
 	case *sqlparser.ColName:
-		colName := v.Name.String()
-		// Handle _rowid: MySQL alias for the single-column integer primary key
-		if strings.EqualFold(colName, "_rowid") {
-			pkCol := e.findRowIDColumn(row)
-			if pkCol != "" {
-				if val, ok := row[pkCol]; ok {
-					return val, nil
-				}
-			}
+		val, ok := e.lookupColValue(v, row)
+		if !ok {
 			return nil, nil
 		}
-		// Try qualified lookup first (alias.col) if qualifier is set
-		if !v.Qualifier.IsEmpty() {
-			qualified := v.Qualifier.Name.String() + "." + colName
-			if val, ok := row[qualified]; ok {
-				return val, nil
-			}
-			// Try full qualifier (db.table.col) for multi-database references
-			fullQualified := sqlparser.String(v.Qualifier) + "." + colName
-			fullQualified = strings.Trim(fullQualified, "`")
-			if val, ok := row[fullQualified]; ok {
-				return val, nil
-			}
-			// Try case-insensitive qualified lookup (handles t1.A when key is t1.a)
-			upperQualified := strings.ToUpper(qualified)
-			for k, kv := range row {
-				if strings.ToUpper(k) == upperQualified {
-					return kv, nil
-				}
-			}
-			// Fall back to correlatedRow for correlated subquery references
-			if e.correlatedRow != nil {
-				if val, ok := e.correlatedRow[qualified]; ok {
-					return val, nil
-				}
-				if val, ok := e.correlatedRow[fullQualified]; ok {
-					return val, nil
-				}
-				// Try unqualified lookup in correlatedRow: handles the case where
-				// the outer row's keys are unqualified (e.g. {a:0, b:10}) but the
-				// subquery WHERE references them as t1.a.  We must look here BEFORE
-				// falling through to row[colName], otherwise we'd incorrectly return
-				// the inner table's value (e.g. t2.a) instead of the outer t1.a.
-				upperName := strings.ToUpper(colName)
-				for k, kv := range e.correlatedRow {
-					if strings.ToUpper(k) == upperName {
-						return kv, nil
-					}
-				}
-				// Qualifier was present but not resolved from correlatedRow either.
-				// Do NOT fall through to bare row[colName]: that would incorrectly
-				// match a same-named column in the inner table (e.g., t2.a when
-				// looking for t1.a in a correlated subquery).
-				return nil, nil
-			}
-		}
-		// Fall back to un-prefixed lookup
-		if val, ok := row[colName]; ok {
-			return val, nil
-		}
-		// Case-insensitive fallback (needed for information_schema columns)
-		upperName := strings.ToUpper(colName)
-		for k, v := range row {
-			if strings.ToUpper(k) == upperName {
-				return v, nil
-			}
-		}
-		// Fall back to correlatedRow for correlated subquery
-		if e.correlatedRow != nil {
-			if val, ok := e.correlatedRow[colName]; ok {
-				return val, nil
-			}
-			if !v.Qualifier.IsEmpty() {
-				qualified := v.Qualifier.Name.String() + "." + colName
-				if val, ok := e.correlatedRow[qualified]; ok {
-					return val, nil
-				}
-			}
-		}
-		return nil, nil
+		return val, nil
 	case *sqlparser.Subquery:
 		// Scalar subquery in row context (correlated)
 		return e.execSubqueryScalar(v, row)

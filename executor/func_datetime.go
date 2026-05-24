@@ -188,22 +188,44 @@ func evalDatetimeFunc(e *Executor, name string, v *sqlparser.FuncExpr, row *stor
 			// Return as integer when called with no arguments
 			return int64(e.nowTime().Unix()), true, nil
 		}
-		val, err := e.evalExprMaybeRow(v.Exprs[0], row)
-		if err != nil {
-			return nil, true, err
+		var val interface{}
+		var err error
+		useUTCInstant := false
+		if col, ok := v.Exprs[0].(*sqlparser.ColName); ok && e.hasExplicitSessionTimeZone() && e.columnTypeForColName(col) == "TIMESTAMP" && row != nil {
+			useUTCInstant = true
+			var found bool
+			val, found = e.lookupColValue(col, *row)
+			if !found {
+				val = nil
+			}
+		} else {
+			val, err = e.evalExprMaybeRow(v.Exprs[0], row)
+			if err != nil {
+				return nil, true, err
+			}
 		}
-		t, err := parseDateTimeValue(val)
+		var t time.Time
+		if useUTCInstant {
+			t, err = parseDateTimeAsUTC(val)
+		} else {
+			t, err = parseDateTimeValue(val)
+		}
 		if err != nil {
 			return nil, true, nil
 		}
-		// Re-interpret the parsed wall-clock time in the session timezone so that
-		// UNIX_TIMESTAMP('1998-09-16 09:26:00') with time_zone='+03:00' correctly
-		// treats the datetime as being in +03:00, not UTC.
-		loc := e.timeZone
-		if loc == nil {
-			loc = time.Local
+		var tInZone time.Time
+		if useUTCInstant {
+			tInZone = t
+		} else {
+			// Re-interpret the parsed wall-clock time in the session timezone so that
+			// UNIX_TIMESTAMP('1998-09-16 09:26:00') with time_zone='+03:00' correctly
+			// treats the datetime as being in +03:00, not UTC.
+			loc := e.timeZone
+			if loc == nil {
+				loc = time.Local
+			}
+			tInZone = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), loc)
 		}
-		tInZone := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), loc)
 		unixSec := tInZone.Unix()
 		// MySQL returns 0 for timestamps outside the valid UNIX_TIMESTAMP range:
 		// [1970-01-01 00:00:01 UTC, 2038-01-19 03:14:07 UTC]
@@ -1857,6 +1879,101 @@ func mysqlToDays(t time.Time) int64 {
 	}
 	days := 365*y + y/4 - y/100 + y/400 + (153*(m-3)+2)/5 + d + 1721119 - 1
 	return days - 1721059
+}
+
+func columnBaseTypeFromDef(typeStr string) string {
+	ct := strings.ToUpper(strings.TrimSpace(typeStr))
+	if paren := strings.IndexByte(ct, '('); paren >= 0 {
+		ct = strings.TrimSpace(ct[:paren])
+	}
+	return ct
+}
+
+func (e *Executor) columnTypeForColName(col *sqlparser.ColName) string {
+	colName := col.Name.String()
+	if e.queryTableDef != nil {
+		for _, c := range e.queryTableDef.Columns {
+			if strings.EqualFold(c.Name, colName) {
+				return columnBaseTypeFromDef(c.Type)
+			}
+		}
+	}
+	if e.Catalog != nil && e.CurrentDB != "" {
+		if db, err := e.Catalog.GetDatabase(e.CurrentDB); err == nil {
+			tableName := ""
+			if !col.Qualifier.IsEmpty() {
+				tableName = col.Qualifier.Name.String()
+			}
+			var tables []string
+			if tableName != "" {
+				tables = []string{tableName}
+			} else {
+				tables = db.ListTables()
+			}
+			for _, tbl := range tables {
+				tDef, _ := db.GetTable(tbl)
+				if tDef == nil {
+					continue
+				}
+				for _, c := range tDef.Columns {
+					if strings.EqualFold(c.Name, colName) {
+						return columnBaseTypeFromDef(c.Type)
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func parseDateTimeAsUTC(val interface{}) (time.Time, error) {
+	t, err := parseDateTimeValue(val)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC), nil
+}
+
+func (e *Executor) formatTimestampUTCForSession(val interface{}) interface{} {
+	if val == nil {
+		return nil
+	}
+	s := toString(val)
+	if strings.HasPrefix(s, "0000-00-00") {
+		return s
+	}
+	t, err := parseDateTimeAsUTC(val)
+	if err != nil {
+		return val
+	}
+	loc := e.timeZone
+	if loc == nil {
+		loc = time.Local
+	}
+	out := t.In(loc)
+	if dotIdx := strings.IndexByte(s, '.'); dotIdx > 10 {
+		frac := s[dotIdx+1:]
+		if len(frac) > 6 {
+			frac = frac[:6]
+		}
+		return out.Format("2006-01-02 15:04:05") + "." + frac
+	}
+	return out.Format("2006-01-02 15:04:05")
+}
+
+func (e *Executor) hasExplicitSessionTimeZone() bool {
+	_, ok := e.sessionScopeVars["time_zone"]
+	return ok
+}
+
+func (e *Executor) formatSelectDisplayValue(expr sqlparser.Expr, val interface{}) interface{} {
+	if !e.hasExplicitSessionTimeZone() {
+		return val
+	}
+	if col, ok := expr.(*sqlparser.ColName); ok && e.columnTypeForColName(col) == "TIMESTAMP" {
+		return e.formatTimestampUTCForSession(val)
+	}
+	return val
 }
 
 func parseDateTimeValue(val interface{}) (time.Time, error) {

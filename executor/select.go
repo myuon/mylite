@@ -3048,6 +3048,7 @@ func (e *Executor) execSelect(stmt *sqlparser.Select) (*Result, error) {
 			if err != nil {
 				return nil, err
 			}
+			val = e.formatSelectDisplayValue(expr, val)
 			if len(selectTableDefs) == 1 && strings.EqualFold(selectTableDefs[0].Charset, "ucs2") {
 				if _, isCol := expr.(*sqlparser.ColName); isCol {
 					if s, ok := val.(string); ok {

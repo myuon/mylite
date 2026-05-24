@@ -3969,10 +3969,6 @@
       "reason": "output mismatch or execution error"
     },
     {
-      "test": "sys_vars/time_zone_func",
-      "reason": "output mismatch or execution error"
-    },
-    {
       "test": "sys_vars/max_sort_length_func",
       "reason": "output mismatch or execution error"
     },
