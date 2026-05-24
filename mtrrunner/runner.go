@@ -4598,6 +4598,7 @@ func (ctx *execContext) sourceFile(filename string) error {
 		}
 		// Reset $restart_parameters to default after use.
 		ctx.variables["$restart_parameters"] = "restart"
+		_ = ctx.executeSQLNoEcho("MYLITE CLEAR UPDATE_TIMES")
 		return nil
 	}
 	// wait_until_disconnected.inc waits for the current connection to be

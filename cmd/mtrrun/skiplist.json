@@ -3769,10 +3769,6 @@
       "reason": "kill_and_restart_mysqld semantics not fully simulated"
     },
     {
-      "test": "innodb/update_time",
-      "reason": "I_S TABLES.update_time tracking; previously skipped via kill_and_restart_mysqld.inc"
-    },
-    {
       "test": "innodb/xa_recovery",
       "reason": "XA recovery requires real restart"
     },

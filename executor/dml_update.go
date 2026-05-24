@@ -1051,6 +1051,9 @@ func (e *Executor) execUpdate(stmt *sqlparser.Update) (*Result, error) {
 	warnCount := len(e.warnings)
 	infoMsg := fmt.Sprintf("Rows matched: %d  Changed: %d  Warnings: %d", matchedRows, affected, warnCount)
 	e.lastUpdateInfo = infoMsg
+	if affected > 0 {
+		e.touchTableUpdateTime(updateDB, tableName)
+	}
 	return &Result{
 		AffectedRows: affected,
 		MatchedRows:  matchedRows,

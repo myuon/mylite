@@ -686,6 +686,11 @@ type Executor struct {
 	// grantStore holds all GRANT records (privileges and role memberships).
 	// Shared across all connections.
 	grantStore *GrantStore
+	// innodbBufferPages tracks InnoDB tables cached in the buffer pool.
+	innodbBufferPages   map[string]struct{}
+	innodbBufferPagesMu sync.RWMutex
+	// xaModifiedTables records InnoDB tables modified inside the current XA transaction.
+	xaModifiedTables map[string]struct{}
 	// sessionDbPrivCache caches the database-level privileges for the current user
 	// at the time USE <db> was successfully executed. This mimics MySQL's behavior
 	// where privileges are re-read on USE but cached between USE calls.
@@ -1475,6 +1480,8 @@ func New(cat *catalog.Catalog, store *storage.Engine) *Executor {
 		CurrentDB:               "test",
 		sqlMode:                 "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
 		snapshots:               make(map[string]*fullSnapshot),
+		innodbBufferPages:       make(map[string]struct{}),
+		xaModifiedTables:        make(map[string]struct{}),
 		userVars:                make(map[string]interface{}),
 		preparedStmts:           make(map[string]string),
 		tempTables:              make(map[string]bool),
@@ -3098,11 +3105,21 @@ func (e *Executor) Execute(query string) (res *Result, retErr error) {
 			rest := strings.TrimSpace(upper[3:])
 			if strings.HasPrefix(rest, "START ") || strings.HasPrefix(rest, "BEGIN ") {
 				e.inXATransaction = true
-			} else if strings.HasPrefix(rest, "END ") ||
-				strings.HasPrefix(rest, "COMMIT ") ||
-				strings.HasPrefix(rest, "ROLLBACK ") ||
-				rest == "END" || rest == "COMMIT" || rest == "ROLLBACK" {
+				e.xaModifiedTables = make(map[string]struct{})
+				e.Catalog.SetPreparedXAModified(nil)
+			} else if strings.HasPrefix(rest, "END ") {
+				// XA END leaves the transaction prepared; keep modified-table tracking.
+			} else if strings.HasPrefix(rest, "PREPARE ") {
+				e.Catalog.SetPreparedXAModified(e.xaModifiedTables)
 				e.inXATransaction = false
+			} else if strings.HasPrefix(rest, "COMMIT ") || rest == "COMMIT" {
+				e.inXATransaction = false
+				e.applyPreparedXAUpdateTimes()
+				e.xaModifiedTables = make(map[string]struct{})
+			} else if strings.HasPrefix(rest, "ROLLBACK ") || rest == "ROLLBACK" {
+				e.inXATransaction = false
+				e.xaModifiedTables = make(map[string]struct{})
+				e.Catalog.SetPreparedXAModified(nil)
 			}
 			return &Result{}, nil
 		}
@@ -6269,6 +6286,11 @@ func (e *Executor) execMyliteCommand(query string) (*Result, error) {
 		e.tempTables = make(map[string]bool)
 		e.tempTableSavedPermanent = make(map[string]*savedPermTable)
 		e.pendingPermanentWhileTemp = make(map[string]*savedPermTable)
+		return &Result{}, nil
+	}
+
+	if restUpper == "CLEAR UPDATE_TIMES" {
+		e.clearInnoDBUpdateTimes()
 		return &Result{}, nil
 	}
 

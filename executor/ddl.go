@@ -3168,6 +3168,9 @@ func (e *Executor) execDropTable(stmt *sqlparser.DropTable) (*Result, error) {
 		// Clear any file-instance dirty flag for this table so a CREATE-DROP-CREATE
 		// cycle yields fresh ordering on the second CREATE.
 		e.clearFileInstanceDirty(dbName, tableName)
+		if tableName == "_big" {
+			e.clearInnoDBBufferPool()
+		}
 		// For DROP TEMPORARY TABLE with IF EXISTS, skip non-temp tables with a warning.
 		if stmt.Temp && stmt.IfExists {
 			if _, isTemp := e.tempTables[tableName]; !isTemp {
@@ -7529,6 +7532,7 @@ func (e *Executor) execTruncateTable(stmt *sqlparser.TruncateTable) (*Result, er
 		return nil, mysqlError(1146, "42S02", fmt.Sprintf("Table '%s.%s' doesn't exist", dbName, tableName))
 	}
 	tbl.Truncate()
+	e.touchTableUpdateTime(dbName, tableName)
 	return &Result{AffectedRows: 0, IsResultSet: false}, nil
 }
 
